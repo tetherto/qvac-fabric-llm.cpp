@@ -1913,9 +1913,85 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     // per-tensor activation precision policy
     prec_policy.load(ml, *this);
 
+    if (ml.incremental_splits_tensor_load.has_value()) {
+        // Already did incremental load.
+        if (!ml.no_alloc) {
+            load_tensors_hadamard();
+        }
+        print_backend_buffers_info(n_gpu_layers);
+        return true;
+    }
+
     ml.init_mappings(true, use_mlock ? &pimpl->mlock_mmaps : nullptr);
     pimpl->mappings.reserve(ml.mappings.size());
 
+    if (!create_backend_buffers(ml.size_data, ml, use_mmap_buffer, use_mlock, n_gpu_layers)) {
+        return false;
+    }
+    if (!ml.no_alloc) {
+        load_tensors_hadamard();
+    }
+    return true;
+}
+
+bool llama_model::create_split_backend_buffers(
+    const uint16_t idx, std::map<std::pair<ggml_backend_buffer_type_t, uint16_t>, ggml_context_ptr> & ctx_split_map,
+    llama_model_loader & ml, const bool use_mmap_buffer, const bool use_mlock, const int32_t n_gpu_layers) {
+    // Move per-split contexts for this idx into ml.ctx_map so that
+    // create_backend_buffers (which iterates ml.ctx_map) can allocate
+    // backend buffers for them and transfer ownership into pimpl->ctxs_bufs.
+    for (auto it = ctx_split_map.begin(); it != ctx_split_map.end();) {
+        const auto & [buft_split_idx, ctx_ptr] = *it;
+        const auto & [buft, split_idx] = buft_split_idx;
+        if (split_idx == idx) {
+            ml.ctx_map[llama_model_loader::ctx_key { buft, /*lazy =*/ false }] = std::move(it->second);
+            it = ctx_split_map.erase(it);
+        } else {
+            ++it;
+        }
+    }
+
+    // Register this split's tensors in tensors_by_name now, while their source
+    // file is still mapped. A later TENSOR_DUPLICATED reference (e.g. a model
+    // with tied embeddings, where output.weight aliases token_embd.weight) is
+    // resolved by looking the original up here (see create_tensor in
+    // load_tensors); without this, the duplicate would instead be (re)created
+    // against this split after release_split() freed its file, failing with
+    // "file not found for tensor ... at split-index N". Capture the pointers
+    // before create_backend_buffers moves the contexts into ctxs_bufs (the
+    // tensor pointers stay valid across that ownership transfer).
+    for (const auto & [buft, ctx_ptr] : ml.ctx_map) {
+        for (auto * cur = ggml_get_first_tensor(ctx_ptr.get()); cur != nullptr;
+             cur = ggml_get_next_tensor(ctx_ptr.get(), cur)) {
+            tensors_by_name.emplace_back(ggml_get_name(cur), cur);
+        }
+    }
+
+    const std::size_t split_data_size = ml.incremental_splits_tensor_load->get_split_data_size(idx);
+    LLAMA_LOG_CMAKE_DEBUG("%s: creating backend buffers for split %d with size %zu\n", __func__, idx, split_data_size);
+    constexpr bool do_print_backend_buffers_info = false;
+    const bool     creation_success = create_backend_buffers(split_data_size, ml, use_mmap_buffer, use_mlock,
+                                                             n_gpu_layers, do_print_backend_buffers_info);
+
+    // Note: create_backend_buffers moves the contexts into ctxs_bufs, taking ownership
+    // The contexts in ctx_map are now empty after the move, which is expected
+    for (auto it = ml.ctx_map.begin(); it != ml.ctx_map.end();) {
+        if (!it->second) {
+            it = ml.ctx_map.erase(it);
+        } else {
+            ++it;
+        }
+    }
+
+    return creation_success;
+}
+
+bool llama_model::create_backend_buffers(std::size_t size_data,
+                                         llama_model_loader & ml,
+                                         const bool use_mmap_buffer,
+                                         const bool use_mlock,
+                                         const int32_t n_gpu_layers,
+                                         bool do_print_backend_buffers_info) {
     // create the backend buffers
     // note: the buffers are owned by pimpl->ctxs_bufs, this is a raw-pointer view used to load the data
     std::vector<std::pair<ggml_context *, std::vector<ggml_backend_buffer_t>>> ctx_bufs;
@@ -2021,7 +2097,41 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         ctx_bufs.emplace_back(ctx, std::move(buf_ptrs));
     }
 
+    if(do_print_backend_buffers_info) {
+        print_backend_buffers_info(n_gpu_layers);
+    }
+
+    if (ml.no_alloc) {
+        return true;
+    }
+
+    // without mmap, load non-host buffers first: their tensors go through a staging buffer, which is cheapest while the fewest weights are resident
+    if (!ml.use_mmap) {
+        std::stable_partition(ctx_bufs.begin(), ctx_bufs.end(), [](const auto & x) {
+            const auto & bufs = x.second;
+            return !bufs.empty() && !ggml_backend_buffer_is_host(bufs[0]);
+        });
+    }
+
+    // load tensor data
+    for (auto & [ctx, bufs] : ctx_bufs) {
+        if (!ml.load_all_data(size_data, ctx, bufs, use_mlock ? &pimpl->mlock_mmaps : NULL, params.progress_callback, params.progress_callback_user_data)) {
+            return false;
+        }
+    }
+
+    if (use_mmap_buffer) {
+        for (auto & mapping : ml.mappings) {
+            pimpl->mappings.emplace_back(std::move(mapping));
+        }
+    }
+
+    return true;
+}
+
+void llama_model::print_backend_buffers_info(const int32_t n_gpu_layers) {
     if (llama_supports_gpu_offload()) {
+        const int n_layer_all = hparams.n_layer_all;
         const int n_gpu = std::min(n_gpu_layers, n_layer_all);
 
         int n_repeating = n_gpu;
@@ -2044,35 +2154,6 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                 __func__, ggml_backend_buffer_name(buf.get()), ggml_backend_buffer_get_size(buf.get()) / 1024.0 / 1024.0);
         }
     }
-
-    if (ml.no_alloc) {
-        return true;
-    }
-
-    // without mmap, load non-host buffers first: their tensors go through a staging buffer, which is cheapest while the fewest weights are resident
-    if (!ml.use_mmap) {
-        std::stable_partition(ctx_bufs.begin(), ctx_bufs.end(), [](const auto & x) {
-            const auto & bufs = x.second;
-            return !bufs.empty() && !ggml_backend_buffer_is_host(bufs[0]);
-        });
-    }
-
-    // load tensor data
-    for (auto & [ctx, bufs] : ctx_bufs) {
-        if (!ml.load_all_data(ctx, bufs, use_mlock ? &pimpl->mlock_mmaps : NULL, params.progress_callback, params.progress_callback_user_data)) {
-            return false;
-        }
-    }
-
-    if (use_mmap_buffer) {
-        for (auto & mapping : ml.mappings) {
-            pimpl->mappings.emplace_back(std::move(mapping));
-        }
-    }
-
-    load_tensors_hadamard();
-
-    return true;
 }
 
 // read and check the prism.hadamard metadata, and record the folded weights (load_tensors_hadamard makes the tensors)
@@ -2412,9 +2493,57 @@ ggml_tensor * llama_model_base::create_tensor(llama_model_loader & ml, const LLM
         // blocks that are not model layers (e.g. the blocks of a head) go with the output
         buft_list_layer = (size_t) tn.bid < pimpl->dev_layer.size() ? pimpl->dev_layer.at(tn.bid).buft_list : pimpl->dev_output.buft_list;
     }
-    return ml.create_tensor(
+    const std::string& tensor_name = tn.str();
+
+    // Bringing back some parameters from llama_model_base::load_tensors before b9019 refactor
+    const bool use_mlock = params.load_mode == LLAMA_LOAD_MODE_MLOCK || params.load_mode == LLAMA_LOAD_MODE_MMAP_MLOCK;
+    constexpr bool use_mmap_buffer = true;
+    const int n_gpu_layers = this->n_gpu_layers();
+
+    // With incremental split loading, a TENSOR_DUPLICATED reference
+    // (e.g. rope_freqs.weight shared across every layer) may be
+    // requested after its owning split has already been uploaded and
+    // released.  The original tensor still lives in tensors_by_name
+    // (populated by create_split_backend_buffers), so look it up there
+    // before touching the incremental loader — this avoids
+    // double-counting loaded tensors and accessing a released file.
+    if ((flags & TENSOR_DUPLICATED) && ml.incremental_splits_tensor_load.has_value()) {
+        for (auto & [name, tensor] : tensors_by_name) {
+            if (name == tensor_name) {
+                return tensor;
+            }
+        }
+    }
+
+    ggml_tensor * t_meta = ml.get_tensor_meta(tensor_name.c_str());
+    std::optional<uint16_t> split_idx;
+    if (!ml.files.empty() && !t_meta && (flags & TENSOR_NOT_REQUIRED) &&
+        IncrementalSplitsTensorLoad::tensor_ignored(ml.incremental_splits_tensor_load, tensor_name.c_str())) {
+        return nullptr;
+    }
+    if (ml.incremental_splits_tensor_load.has_value()) {
+        split_idx = ml.incremental_splits_tensor_load->load_tensor_metadata(ml, tn.str().c_str(), &t_meta);
+        LLAMA_LOG_CMAKE_DEBUG("split idx for tensor %s: %d\n", tn.str().c_str(), *split_idx);
+    }
+
+    std::function<ggml_context *(ggml_backend_buffer_type_t)> get_ctx_for_split_buft = [&](ggml_backend_buffer_type_t buft) -> ggml_context * {
+        return ml.incremental_splits_tensor_load->get_model_ctx_for_split_buft(buft, *split_idx);
+    };
+
+    struct ggml_tensor * tensor = ml.create_tensor(
         hparams, &pimpl->cpu_buft_list, pimpl->dev_input.buft_list, pimpl->dev_output.buft_list, buft_list_layer,
-        tn, ne, flags);
+        tn, ne, flags, split_idx, get_ctx_for_split_buft);
+
+    if (split_idx.has_value() && ml.incremental_splits_tensor_load->all_tensors_are_loaded(*split_idx)) {
+        // Upload right now.
+        if (!create_split_backend_buffers(*split_idx, ml.incremental_splits_tensor_load->ctx_split_map, ml,
+                                            use_mmap_buffer, use_mlock, n_gpu_layers)) {
+            throw std::runtime_error("Failed to create incremental backend buffers");
+        }
+        IncrementalSplitsTensorLoad::release_split(ml, *split_idx);
+    }
+
+    return tensor;
 }
 
 std::string llama_model::arch_name() const {

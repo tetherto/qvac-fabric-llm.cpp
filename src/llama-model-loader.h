@@ -6,6 +6,7 @@
 #include "llama-arch.h"
 #include "llama-hparams.h"
 #include "llama-mmap.h"
+#include "llama-model-load.h"
 
 #include "ggml-cpp.h"
 
@@ -122,6 +123,9 @@ struct llama_model_loader {
     llama_mmaps mappings;
 
     std::map<std::string, llama_tensor_weight, weight_name_comparer> weights_map;
+
+    std::optional<IncrementalSplitsTensorLoad> incremental_splits_tensor_load;
+
     std::unordered_map<std::string, llama_model_kv_override> kv_overrides;
     const llama_model_tensor_buft_override * tensor_buft_overrides;
 
@@ -169,12 +173,13 @@ struct llama_model_loader {
     ggml_backend_buffer_type_t first_moved_from_buft = nullptr;
     ggml_backend_buffer_type_t first_moved_to_buft = nullptr;
 
+    void process_loaded_gguf(struct ggml_context * ctx, gguf_file_load & gguf_load, uint16_t idx);
+
     llama_model_loader(
         struct gguf_context * metadata,
         llama_model_set_tensor_data_t set_tensor_data,
         void * set_tensor_data_ud,
-        const std::string & fname,
-        std::vector<std::string> & splits, // optional, only need if the split does not follow naming scheme
+        load_input_t load_input,
         FILE * file,
         llama_load_mode load_mode,
         bool check_tensors,
@@ -234,7 +239,8 @@ struct llama_model_loader {
 
     struct ggml_tensor * create_tensor(
         const llama_hparams & hparams, const buft_list_t * buft_list_cpu, const buft_list_t * buft_list_input, const buft_list_t * buft_list_output,
-        const buft_list_t * buft_list_layer, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags);
+        const buft_list_t * buft_list_layer, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags,
+        std::optional<uint16_t> split_idx, const std::function<ggml_context *(ggml_backend_buffer_type_t)> & get_ctx_for_split_buft);
 
     void done_getting_tensors(bool partial = false) const;
 
@@ -260,6 +266,7 @@ struct llama_model_loader {
 
     // Returns false if cancelled by progress_callback
     bool load_all_data(
+            size_t size_data,
             struct ggml_context * ctx,
             std::vector<ggml_backend_buffer_t> & bufs,
             llama_mlocks * lmlocks,

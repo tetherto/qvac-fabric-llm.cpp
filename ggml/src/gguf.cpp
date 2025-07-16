@@ -13,6 +13,7 @@
 #include <map>
 #include <new>
 #include <stdexcept>
+#include <streambuf>
 #include <string>
 #include <unordered_set>
 #include <vector>
@@ -229,7 +230,16 @@ struct gguf_context {
     void * data = nullptr;
 };
 
+struct gguf_bytes_reader {
+    virtual size_t read(void * buffer, size_t size, size_t count) = 0;
+    virtual ~gguf_bytes_reader() = 0;
+};
+
+gguf_bytes_reader::~gguf_bytes_reader() {}
+
 struct gguf_reader {
+    gguf_reader(gguf_bytes_reader& bytes_reader) : bytes_reader(&bytes_reader), nbytes_remain(UINT64_MAX) {}
+
     gguf_reader(
             gguf_reader_callback_t callback,
             void * userdata,
@@ -374,6 +384,24 @@ struct gguf_reader {
     }
 
     bool seek(uint64_t absolute_offset) const {
+        if (bytes_reader != nullptr) {
+            if (absolute_offset < data_offset) {
+                return false;
+            }
+
+            uint8_t tmp[4096];
+            while (data_offset < absolute_offset) {
+                const uint64_t nleft = absolute_offset - data_offset;
+                const size_t step = nleft < sizeof(tmp) ? (size_t) nleft : sizeof(tmp);
+                const size_t nread = bytes_reader->read(tmp, 1, step);
+                data_offset += nread;
+                if (nread != step) {
+                    return false;
+                }
+            }
+            return true;
+        }
+
         const uint64_t end_offset = uint64_t(data_offset) + nbytes_remain;
         if (absolute_offset > end_offset) {
             return false;
@@ -387,6 +415,12 @@ struct gguf_reader {
 
 private:
     size_t read_raw(void * dst, size_t size) const {
+        if (bytes_reader != nullptr) {
+            const size_t nread = bytes_reader->read(dst, 1, size);
+            data_offset += nread;
+            return nread;
+        }
+
         if (callback == nullptr || size == 0) {
             return 0;
         }
@@ -419,12 +453,30 @@ private:
         return total_nread;
     }
 
+    gguf_bytes_reader * bytes_reader = nullptr;
     gguf_reader_callback_t callback = nullptr;
     void * userdata = nullptr;
     size_t max_chunk_read = 0;
     uint64_t start_offset = 0;
     mutable uint64_t data_offset = 0;
     mutable uint64_t nbytes_remain = 0;
+};
+
+struct gguf_bytes_buffer_reader : public gguf_bytes_reader {
+    gguf_bytes_buffer_reader(std::basic_streambuf<char> & streambuf) : streambuf(streambuf), offset(0) {}
+
+    ~gguf_bytes_buffer_reader() {}
+
+    size_t read(void * buffer, size_t size, size_t count) override {
+        size_t total_size = size * count;
+        auto   bytes_read = streambuf.sgetn(static_cast<char*>(buffer), total_size);
+        offset += bytes_read;
+        return bytes_read;
+    }
+
+  private:
+    std::basic_streambuf<char> & streambuf;
+    size_t                       offset;
 };
 
 struct gguf_context * gguf_init_empty(void) {
@@ -1013,6 +1065,13 @@ struct gguf_context * gguf_init_from_buffer(const void * data, size_t size, stru
     const struct gguf_reader gr(gguf_buffer_reader_callback, &reader, SIZE_MAX, 0, size);
     return gguf_init_from_reader(gr, params);
 }
+
+struct gguf_context * gguf_init_from_buffer(std::basic_streambuf<char> & streambuf, struct gguf_init_params params) {
+    gguf_bytes_buffer_reader bytes_reader(streambuf);
+    gguf_reader              reader(bytes_reader);
+    return gguf_init_from_reader(reader, params);
+}
+
 
 struct gguf_context * gguf_init_from_file(const char * fname, struct gguf_init_params params) {
     FILE * file = ggml_fopen(fname, "rb");

@@ -5,6 +5,7 @@
 #endif
 
 #include <memory>
+#include <vector>
 
 #include "llama.h"
 
@@ -33,3 +34,8 @@ typedef std::unique_ptr<llama_context, llama_context_deleter> llama_context_ptr;
 typedef std::unique_ptr<llama_sampler, llama_sampler_deleter> llama_sampler_ptr;
 typedef std::unique_ptr<llama_adapter_lora, llama_adapter_lora_deleter> llama_adapter_lora_ptr;
 typedef std::unique_ptr<llama_batch_ext, llama_batch_ext_deleter> llama_batch_ext_ptr;
+
+LLAMA_API struct llama_model * llama_model_load_from_buffer(std::vector<uint8_t> &&   data,
+                                                            struct llama_model_params params);
+LLAMA_API bool                 llama_model_load_fulfill_split_future(const char * path, const char * context,
+                                                                     std::unique_ptr<std::basic_streambuf<char>> && streambuf);
