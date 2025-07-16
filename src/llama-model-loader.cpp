@@ -500,7 +500,7 @@ llama_model_loader::llama_model_loader(
     get_key(llm_kv(LLM_KV_GENERAL_ARCHITECTURE), arch_name, false);
     llm_kv = LLM_KV(llm_arch_from_string(arch_name));
 
-    files.emplace_back(new llama_file(fname.c_str(), "rb"));
+    files.emplace_back(new llama_file_disk(fname.c_str(), "rb"));
     contexts.emplace_back(ctx);
 
     // Save tensors data offset of the main file.
@@ -568,7 +568,7 @@ llama_model_loader::llama_model_loader(
                 }
             }
 
-            files.emplace_back(new llama_file(fname_split, "rb"));
+            files.emplace_back(new llama_file_disk(fname_split, "rb"));
             contexts.emplace_back(ctx);
 
             // Save tensors data offset info of the shard.

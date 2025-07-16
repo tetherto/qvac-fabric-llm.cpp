@@ -1644,7 +1644,7 @@ size_t llama_context::state_seq_set_data(llama_seq_id seq_id, const uint8_t * sr
 }
 
 bool llama_context::state_load_file(const char * filepath, llama_token * tokens_out, size_t n_token_capacity, size_t * n_token_count_out) {
-    llama_file file(filepath, "rb");
+    llama_file_disk file(filepath, "rb");
 
     // sanity checks
     {
@@ -1687,7 +1687,7 @@ bool llama_context::state_load_file(const char * filepath, llama_token * tokens_
 }
 
 bool llama_context::state_save_file(const char * filepath, const llama_token * tokens, size_t n_token_count) {
-    llama_file file(filepath, "wb");
+    llama_file_disk file(filepath, "wb");
 
     file.write_u32(LLAMA_SESSION_MAGIC);
     file.write_u32(LLAMA_SESSION_VERSION);
@@ -1704,7 +1704,7 @@ bool llama_context::state_save_file(const char * filepath, const llama_token * t
 }
 
 size_t llama_context::state_seq_load_file(llama_seq_id seq_id, const char * filepath, llama_token * tokens_out, size_t n_token_capacity, size_t * n_token_count_out) {
-    llama_file file(filepath, "rb");
+    llama_file_disk file(filepath, "rb");
 
     // version checks
     {
@@ -1747,7 +1747,7 @@ size_t llama_context::state_seq_load_file(llama_seq_id seq_id, const char * file
 }
 
 size_t llama_context::state_seq_save_file(llama_seq_id seq_id, const char * filepath, const llama_token * tokens, size_t n_token_count) {
-    llama_file file(filepath, "wb");
+    llama_file_disk file(filepath, "wb");
 
     file.write_u32(LLAMA_STATE_SEQ_MAGIC);
     file.write_u32(LLAMA_STATE_SEQ_VERSION);

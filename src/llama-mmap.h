@@ -13,21 +13,36 @@ using llama_mmaps  = std::vector<std::unique_ptr<llama_mmap>>;
 using llama_mlocks = std::vector<std::unique_ptr<llama_mlock>>;
 
 struct llama_file {
-    llama_file(const char * fname, const char * mode);
-    ~llama_file();
+    virtual ~llama_file() = default;
 
-    size_t tell() const;
-    size_t size() const;
+    virtual size_t tell() const = 0;
+    virtual size_t size() const = 0;
+    virtual int file_id() const = 0;
 
-    int file_id() const; // fileno overload
+    virtual void seek(size_t offset, int whence) const = 0;
 
-    void seek(size_t offset, int whence) const;
+    virtual void read_raw(void * ptr, size_t len) const = 0;
+    virtual uint32_t read_u32() const = 0;
 
-    void read_raw(void * ptr, size_t len) const;
-    uint32_t read_u32() const;
+    virtual void write_raw(const void * ptr, size_t len) const = 0;
+    virtual void write_u32(uint32_t val) const = 0;
+};
 
-    void write_raw(const void * ptr, size_t len) const;
-    void write_u32(uint32_t val) const;
+struct llama_file_disk : public llama_file {
+    llama_file_disk(const char * fname, const char * mode);
+    ~llama_file_disk() override;
+
+    size_t tell() const override;
+    size_t size() const override;
+    int file_id() const override;
+
+    void seek(size_t offset, int whence) const override;
+
+    void read_raw(void * ptr, size_t len) const override;
+    uint32_t read_u32() const override;
+
+    void write_raw(const void * ptr, size_t len) const override;
+    void write_u32(uint32_t val) const override;
 
 private:
     struct impl;
