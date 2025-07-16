@@ -3,7 +3,7 @@ find_package(Threads REQUIRED)
 llama_add_compile_flags()
 
 # Optional args:
-# - LINK: libraries to link against (defaults to llama-common, which also brings llama)
+# - LINK: libraries to link against (defaults to llama-common + llama-common-test, which also bring llama)
 function(llama_build source)
     set(options)
     set(oneValueArgs)
@@ -13,7 +13,7 @@ function(llama_build source)
     set(TEST_SOURCES ${source} ${LLAMA_BUILD_UNPARSED_ARGUMENTS})
 
     if (NOT LLAMA_BUILD_LINK)
-        set(LLAMA_BUILD_LINK llama-common)
+        set(LLAMA_BUILD_LINK llama-common llama-common-test)
     endif()
 
     if (DEFINED LLAMA_TEST_NAME)
@@ -94,7 +94,7 @@ endfunction()
 # - LABEL: label for the test (defaults to main)
 # - ARGS: arguments to pass to the test executable
 # - WORKING_DIRECTORY
-# - LINK: libraries to link against (defaults to llama-common, which also brings llama)
+# - LINK: libraries to link against (defaults to llama-common + llama-common-test, which also bring llama)
 function(llama_build_and_test source)
     include(CMakeParseArguments)
     set(options)
@@ -105,7 +105,7 @@ function(llama_build_and_test source)
     set(TEST_SOURCES ${source} ${LLAMA_TEST_UNPARSED_ARGUMENTS})
 
     if (NOT LLAMA_TEST_LINK)
-        set(LLAMA_TEST_LINK llama-common)
+        set(LLAMA_TEST_LINK llama-common llama-common-test)
     endif()
 
     if (NOT DEFINED LLAMA_TEST_LABEL)
@@ -377,6 +377,9 @@ endif()
 
 llama_build_and_test(test-tiled-mulmat.cpp  LABEL "main behavior backend"  LINK ggml)
 llama_build_and_test(test-model-load-cancel.cpp LABEL "model behavior")
+llama_build_and_test(test-model-load-disk.cpp   LABEL "model behavior")
+llama_build_and_test(test-model-load-memory.cpp LABEL "model behavior")
+llama_build_and_test(test-model-load-memory-split.cpp LABEL "model behavior")
 llama_build_and_test(test-autorelease.cpp       LABEL "model behavior")
 llama_build_and_test(test-backend-sampler.cpp   LABEL "model behavior backend")
 
