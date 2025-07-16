@@ -1,6 +1,7 @@
 #include "llama-mmap.h"
 
 #include "llama-impl.h"
+#include "uint8-buff-stream.h"
 
 #include "ggml.h"
 
@@ -9,6 +10,7 @@
 #include <stdexcept>
 #include <cerrno>
 #include <algorithm>
+#include <map>
 
 #ifdef __has_include
     #if __has_include(<unistd.h>)
@@ -264,6 +266,80 @@ uint32_t llama_file_disk::read_u32() const { return pimpl->read_u32(); }
 
 void llama_file_disk::write_raw(const void * ptr, size_t len) const { pimpl->write_raw(ptr, len); }
 void llama_file_disk::write_u32(uint32_t val) const { pimpl->write_u32(val); }
+
+template <bool Writable>
+llama_file_buffer<Writable>::llama_file_buffer(std::unique_ptr<std::basic_streambuf<uint8_t>> && streambuf) :
+    streambuf(std::move(streambuf)) {}
+
+template <bool Writable> llama_file_buffer<Writable>::~llama_file_buffer() = default;
+
+template <bool Writable> size_t llama_file_buffer<Writable>::tell() const {
+    return streambuf->pubseekoff(0, std::ios_base::cur);
+}
+
+template <bool Writable> size_t llama_file_buffer<Writable>::size() const {
+    auto current_pos = streambuf->pubseekoff(0, std::ios_base::cur);
+    auto end_pos     = streambuf->pubseekoff(0, std::ios_base::end);
+    streambuf->pubseekpos(current_pos);
+    return end_pos;
+}
+
+template <bool Writable> int llama_file_buffer<Writable>::file_id() const {
+    return -1;
+}
+
+template <bool Writable> void llama_file_buffer<Writable>::seek(size_t offset, int whence) const {
+    static std::map<int, std::ios_base::seekdir> whence_to_dir = {
+        { SEEK_SET, std::ios_base::beg },
+        { SEEK_CUR, std::ios_base::cur },
+        { SEEK_END, std::ios_base::end }
+    };
+    auto result = streambuf->pubseekoff(offset, whence_to_dir.at(whence));
+    if (result == std::streampos(-1)) {
+        throw std::runtime_error("seek failed");
+    }
+}
+
+template <bool Writable> void llama_file_buffer<Writable>::read_raw(void * ptr, size_t len) const {
+    auto bytes_read = streambuf->sgetn(static_cast<uint8_t *>(ptr), len);
+    if (bytes_read != static_cast<std::streamsize>(len)) {
+        throw std::runtime_error("read beyond end of buffer");
+    }
+}
+
+template <bool Writable> uint32_t llama_file_buffer<Writable>::read_u32() const {
+    uint32_t val;
+    read_raw(&val, sizeof(val));
+    return val;
+}
+
+template <> void llama_file_buffer<false>::write_raw([[maybe_unused]] const void * ptr, size_t len) const {
+    if (len > 0) {
+        throw std::runtime_error("buffer is not writable");
+    }
+}
+
+template <> void llama_file_buffer<false>::write_u32(uint32_t val) const {
+    if (val > 0) {
+        // Cannot directly set [[noreturn]] for a function since it was defined without it.
+        throw std::runtime_error("buffer is not writable");
+    }
+}
+
+template <> void llama_file_buffer<true>::write_raw(const void * ptr, size_t len) const {
+    auto bytes_written = streambuf->sputn(static_cast<const uint8_t *>(ptr), len);
+    if (bytes_written != static_cast<std::streamsize>(len)) {
+        throw std::runtime_error("write beyond end of buffer");
+    }
+}
+
+template <> void llama_file_buffer<true>::write_u32(uint32_t val) const {
+    write_raw(&val, sizeof(val));
+}
+
+// Explicit instantiations
+template struct llama_file_buffer<false>;
+template struct llama_file_buffer<true>;
 
 // llama_mmap
 
