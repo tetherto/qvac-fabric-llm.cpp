@@ -95,8 +95,7 @@ struct llama_model_loader {
     void process_loaded_gguf(struct ggml_context * ctx, gguf_file_load & gguf_load, uint16_t idx);
 
     llama_model_loader(
-        const std::string & fname,
-        std::vector<std::string> & splits, // optional, only need if the split does not follow naming scheme
+        load_input_t load_input,
         bool use_mmap,
         bool check_tensors,
         const llama_model_kv_override * param_overrides_p,

@@ -8,6 +8,7 @@
 #include <cinttypes>
 #include <cstring>
 #include <future>
+#include <stdexcept>
 
 static const size_t kiB = 1024;
 static const size_t MiB = 1024*kiB;
@@ -493,8 +494,7 @@ namespace GGUFMeta {
     }
 
 llama_model_loader::llama_model_loader(
-        const std::string & fname,
-        std::vector<std::string> & splits,
+        load_input_t load_input,
         bool use_mmap,
         bool check_tensors,
         const llama_model_kv_override * param_overrides_p,
@@ -513,7 +513,7 @@ llama_model_loader::llama_model_loader(
     tensor_buft_overrides = param_tensor_buft_overrides_p;
 
     struct ggml_context * ctx = NULL;
-    gguf_file_load main_gguf(&ctx, load_input_variant::fname_load_input{fname, splits});
+    gguf_file_load main_gguf(&ctx, load_input);
     process_loaded_gguf(ctx, main_gguf, 0);
 
     meta = std::move(main_gguf.meta);
@@ -525,18 +525,21 @@ llama_model_loader::llama_model_loader(
     get_key(llm_kv(LLM_KV_SPLIT_COUNT), n_split, false);
 
     // Load additional GGML contexts
-    if (n_split > 1) {
+    if (load_input_variant::variant_supports_split_load(load_input) && n_split > 1) {
+        load_input_variant::fname_load_input base_split = load_input_variant::split_name_from_variant(load_input);
+        std::vector<std::string> &           splits     = base_split.splits;
+
         // make sure the main file is loaded first
         uint16_t idx = 0;
         const std::string kv_split_no = llm_kv(LLM_KV_SPLIT_NO);
         get_key(kv_split_no, idx);
         if (idx != 0) {
-            throw std::runtime_error(format("illegal split file idx: %d (file: %s), model must be loaded with the first split", idx, fname.c_str()));
+            throw std::runtime_error(format("illegal split file idx: %d (file: %s), model must be loaded with the first split", idx, base_split.fname.c_str()));
         }
 
         // generate list of splits if needed
         if (splits.empty()) {
-            splits = llama_get_list_splits(fname, idx, n_split);
+            splits = llama_get_list_splits(base_split.fname, idx, n_split);
         }
 
         // in case user give a custom list of splits, check if it matches the expected number
@@ -589,7 +592,7 @@ llama_model_loader::llama_model_loader(
     fver = (enum llama_fver) gguf_get_version(meta.get());
 
     LLAMA_LOG_INFO("%s: loaded meta data with %d key-value pairs and %d tensors from %s (version %s)\n",
-            __func__, n_kv, n_tensors, fname.c_str(), llama_file_version_name(fver));
+            __func__, n_kv, n_tensors, load_input_variant::identifier(load_input), llama_file_version_name(fver));
 
     // determine file type based on the number of tensors for each quantization and print meta data
     // TODO: make optional
