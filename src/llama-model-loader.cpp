@@ -1,6 +1,8 @@
 #include "llama-model-loader.h"
 
 #include "ggml.h"
+#include "llama-model-load-input.h"
+#include "llama-model-load.h"
 
 #include <array>
 #include <cinttypes>
@@ -485,22 +487,14 @@ llama_model_loader::llama_model_loader(
 
     tensor_buft_overrides = param_tensor_buft_overrides_p;
 
-    // Load the main GGUF
     struct ggml_context * ctx = NULL;
-    struct gguf_init_params params = {
-        /*.no_alloc = */ true,
-        /*.ctx      = */ &ctx,
-    };
-
-    meta.reset(gguf_init_from_file(fname.c_str(), params));
-    if (!meta) {
-        throw std::runtime_error(format("%s: failed to load model from %s", __func__, fname.c_str()));
-    }
+    gguf_file_load main_gguf(&ctx, load_input_variant::fname_load_input{fname, splits});
+    meta = std::move(main_gguf.meta);
 
     get_key(llm_kv(LLM_KV_GENERAL_ARCHITECTURE), arch_name, false);
     llm_kv = LLM_KV(llm_arch_from_string(arch_name));
 
-    files.emplace_back(new llama_file_disk(fname.c_str(), "rb"));
+    files.emplace_back(std::move(main_gguf.file));
     contexts.emplace_back(ctx);
 
     // Save tensors data offset of the main file.
@@ -547,28 +541,22 @@ llama_model_loader::llama_model_loader(
         for (idx = 1; idx < n_split; idx++) {
             const char * fname_split = splits[idx].c_str();
 
-            struct gguf_init_params split_params = {
-                /*.no_alloc = */ true,
-                /*.ctx      = */ &ctx,
-            };
-            gguf_context_ptr ctx_gguf { gguf_init_from_file(fname_split, split_params) };
-            if (!ctx_gguf) {
-                throw std::runtime_error(format("%s: failed to load GGUF split from %s", __func__, fname_split));
-            }
+            gguf_file_load split_gguf(&ctx, load_input_variant::fname_load_input{fname_split, splits});
+            gguf_context_ptr& split_meta = split_gguf.meta;
 
             // check idx
             {
-                const int kid = gguf_find_key(ctx_gguf.get(), kv_split_no.c_str());
+                const int kid = gguf_find_key(split_meta.get(), kv_split_no.c_str());
                 if (kid < 0) {
                     throw std::runtime_error(format("missing key %s in GGUF split %s", kv_split_no.c_str(), fname_split));
                 }
-                int idx_gguf = gguf_get_val_u16(ctx_gguf.get(), kid);
+                int idx_gguf = gguf_get_val_u16(split_meta.get(), kid);
                 if (idx_gguf != idx) {
                     throw std::runtime_error(format("invalid split file idx: %d (file: %s), expected %d", idx_gguf, fname_split, idx));
                 }
             }
 
-            files.emplace_back(new llama_file_disk(fname_split, "rb"));
+            files.emplace_back(std::move(split_gguf.file));
             contexts.emplace_back(ctx);
 
             // Save tensors data offset info of the shard.
@@ -580,7 +568,7 @@ llama_model_loader::llama_model_loader(
                 }
                 n_elements += ggml_nelements(cur);
                 n_bytes    += ggml_nbytes(cur);
-                weights_map.emplace(tensor_name, llama_tensor_weight(files.back().get(), idx, ctx_gguf.get(), cur));
+                weights_map.emplace(tensor_name, llama_tensor_weight(files.back().get(), idx, split_meta.get(), cur));
             }
         }
 
