@@ -200,6 +200,7 @@ add_library(ggml-base
             ../include/ggml-cpp.h
             ../include/ggml-opt.h
             ../include/gguf.h
+            ../include/ggml-binary-stream-buffer.h
             ggml.c
             ggml.cpp
             ggml-alloc.c
@@ -209,7 +210,8 @@ add_library(ggml-base
             ggml-threading.h
             ggml-quants.c
             ggml-quants.h
-            gguf.cpp)
+            gguf.cpp
+            ggml-binary-stream-buffer.cpp)
 
 target_include_directories(ggml-base PRIVATE .)
 if (GGML_BACKEND_DL)
