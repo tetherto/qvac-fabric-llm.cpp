@@ -18,6 +18,7 @@
 #include <cstring>
 #include <ctime>
 #include <stdexcept>
+#include <streambuf>
 
 #if defined(_MSC_VER)
 #pragma warning(disable: 4244 4267) // possible loss of data
@@ -296,6 +297,28 @@ struct llama_model * llama_model_load_from_splits(const char ** paths, size_t n_
     }
     llama_model_loader ml = create_disk_fileloader(splits.front().c_str(), splits, params);
     return llama_model_load_from_file_impl(ml, params);
+}
+
+struct llama_model * llama_model_load_from_split_futures(const char ** paths, size_t n_paths, const char * context,
+                                                         const char *              tensor_list_file,
+                                                         struct llama_model_params params) {
+    std::vector<std::string> splits = splits_from_c_paths(paths, n_paths);
+    if (splits.empty()) {
+        return nullptr;
+    }
+    std::string tensor_list_file_str(tensor_list_file);
+
+    load_input_variant::buffer_future_load_input loader_input{ splits.front(), context, splits, tensor_list_file_str };
+    override_and_disable_mmap(params);
+    llama_model_loader ml(loader_input, params.use_mmap, params.check_tensors, params.kv_overrides,
+                          params.tensor_buft_overrides);
+    return llama_model_load_from_file_impl(ml, params);
+}
+
+bool llama_model_load_fulfill_split_future(const char * path, const char * context,
+                                           std::unique_ptr<std::basic_streambuf<uint8_t>> && streambuf) {
+    return llama_future_file_buffer_ro::fulfill_promise(path, context,
+                                                        std::make_unique<llama_file_buffer_ro>(std::move(streambuf)));
 }
 
 void llama_model_save_to_file(const struct llama_model * model, const char * path_model) {
