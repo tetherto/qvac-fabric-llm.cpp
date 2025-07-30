@@ -22,6 +22,7 @@ add_library(llama
             llama-io.cpp
             llama-kv-cache-unified.cpp
             llama-kv-cache-unified-iswa.cpp
+            llama-lora-training.cpp
             llama-memory.cpp
             llama-memory-hybrid.cpp
             llama-memory-recurrent.cpp
