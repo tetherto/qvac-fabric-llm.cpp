@@ -7,6 +7,7 @@
 #include "llama-memory.h"
 #include "llama-vocab.h"
 
+#include <cstdint>
 #include <map>
 #include <memory>
 #include <string>
@@ -399,6 +400,13 @@ struct llama_layer {
     struct llama_layer_nextn nextn;
 };
 
+// define a comparator for the buft -> ctx maps to ensure that the order is well-defined:
+struct ggml_backend_buft_comparator {
+    bool operator()(const ggml_backend_buffer_type_t & lhs, const ggml_backend_buffer_type_t & rhs) const {
+        return ggml_backend_buft_name(lhs) < ggml_backend_buft_name(rhs);
+    }
+};
+
 struct llama_model {
     llm_type type = LLM_TYPE_UNKNOWN;
     llm_arch arch = LLM_ARCH_UNKNOWN;
@@ -463,6 +471,18 @@ struct llama_model {
 
     explicit llama_model(const struct llama_model_params & params);
     ~llama_model();
+
+    /// @brief Create backend buffers for all tensors
+    bool create_backend_buffers(
+        std::size_t                                                                            size_data,
+        std::map<ggml_backend_buffer_type_t, ggml_context_ptr, ggml_backend_buft_comparator> & ctx_map,
+        llama_model_loader &                                                                   ml,
+        bool                                                                                   use_mmap_buffer,
+        bool                                                                                   use_mlock,
+        int32_t                                                                                n_gpu_layers,
+        bool do_print_backend_buffers_info = true);
+
+    void print_backend_buffers_info(int32_t n_gpu_layers);
 
     void load_stats  (llama_model_loader & ml);
     void load_arch   (llama_model_loader & ml);
