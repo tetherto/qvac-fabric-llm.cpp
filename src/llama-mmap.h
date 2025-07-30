@@ -3,6 +3,10 @@
 #include <cstdint>
 #include <memory>
 #include <vector>
+#include "uint8-buff-stream.h"
+#include <future>
+#include <string>
+#include <map>
 
 struct llama_file;
 struct llama_mmap;
@@ -74,9 +78,43 @@ template <bool Writable> struct llama_file_buffer : public llama_file {
     std::unique_ptr<std::basic_streambuf<uint8_t>> streambuf;
 };
 
+template <bool Writable> struct llama_future_file_buffer {
+    /// @brief A file buffer object whose operations will block
+    /// until the given promise key is set with a file buffer.
+    /// @param promise_key The key to use for the promise (e.g. a file path).
+    /// @param context The context to use for the promise, used to distinguish same promise key (e.g. for a same file opened twice).
+    llama_future_file_buffer(const std::string & promise_key, const std::string & context);
+
+    // Delete copy constructor and copy assignment operator
+    llama_future_file_buffer(const llama_future_file_buffer &)             = delete;
+    llama_future_file_buffer & operator=(const llama_future_file_buffer &) = delete;
+
+    llama_future_file_buffer(llama_future_file_buffer && other) noexcept;
+    llama_future_file_buffer & operator=(llama_future_file_buffer && other) noexcept;
+
+    ~llama_future_file_buffer();
+
+    /// @brief Sets the given key and context with a file buffer so that
+    /// operations can resume/start.
+    static bool fulfill_promise(const std::string & promise_key, const std::string & context,
+                                std::unique_ptr<llama_file_buffer<Writable>> && value);
+
+    /// @brief Waits for future buffer or obtains current if already
+    /// fulfilled and moves the future contents outside the registry.
+    std::unique_ptr<llama_file_buffer<Writable>> extract() const;
+
+  private:
+    typename std::map<std::string, std::promise<std::unique_ptr<llama_file_buffer<Writable>>>>::iterator
+                                                                      file_buffer_promise_iterator;
+    mutable std::future<std::unique_ptr<llama_file_buffer<Writable>>> file_buffer_future;
+    mutable std::unique_ptr<llama_file_buffer<Writable>>              file_buffer;
+};
+
 // Type aliases for convenience
 using llama_file_buffer_ro = llama_file_buffer<false>;
 using llama_file_buffer_rw = llama_file_buffer<true>;
+using llama_future_file_buffer_ro = llama_future_file_buffer<false>;
+using llama_future_file_buffer_rw = llama_future_file_buffer<true>;
 
 struct llama_mmap {
     llama_mmap(const llama_mmap &) = delete;

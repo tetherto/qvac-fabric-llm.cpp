@@ -341,6 +341,112 @@ template <> void llama_file_buffer<true>::write_u32(uint32_t val) const {
 template struct llama_file_buffer<false>;
 template struct llama_file_buffer<true>;
 
+// llama_future_file_buffer implementation
+
+namespace {
+std::string final_key(const std::string & promise_key, const std::string & context) {
+    return promise_key + ":" + context;
+}
+
+std::mutex promise_registry_mutex;
+
+std::map<std::string, std::promise<std::unique_ptr<llama_file_buffer<false>>>> promise_registry_ro;
+std::map<std::string, std::promise<std::unique_ptr<llama_file_buffer<true>>>>  promise_registry_rw;
+
+template <bool Writable>
+std::map<std::string, std::promise<std::unique_ptr<llama_file_buffer<Writable>>>> & promise_registry() {
+    if constexpr (Writable) {
+        return promise_registry_rw;
+    } else {
+        return promise_registry_ro;
+    }
+}
+
+/// @brief Ensures a promise exists in the registry for the given key.
+/// If it doesn't exist, creates it. Returns an iterator to the promise.
+/// Thread-safe.
+template <bool Writable>
+typename std::map<std::string, std::promise<std::unique_ptr<llama_file_buffer<Writable>>>>::iterator
+ensure_promise_registry(const std::string & key) {
+    std::lock_guard<std::mutex> lock(promise_registry_mutex);
+    auto                        it = promise_registry<Writable>().find(key);
+    if (it != promise_registry<Writable>().end()) {
+        return it;
+    }
+    auto result =
+        promise_registry<Writable>().emplace(key, std::promise<std::unique_ptr<llama_file_buffer<Writable>>>());
+    LLAMA_LOG_CMAKE_DEBUG("%s: created future file buffer %p for %s\n", __func__, (void *) &(*it), key.c_str());
+    return result.first;
+}
+}  // namespace
+
+template <bool Writable>
+llama_future_file_buffer<Writable>::llama_future_file_buffer(const std::string & promise_key,
+                                                             const std::string & context) :
+    file_buffer_future(),
+    file_buffer() {
+    std::string key              = final_key(promise_key, context);
+    file_buffer_promise_iterator = ensure_promise_registry<Writable>(key);
+    file_buffer_future           = file_buffer_promise_iterator->second.get_future();
+}
+
+template <bool Writable>
+llama_future_file_buffer<Writable>::llama_future_file_buffer(llama_future_file_buffer && other) noexcept :
+    file_buffer_promise_iterator(std::move(other.file_buffer_promise_iterator)),
+    file_buffer_future(std::move(other.file_buffer_future)),
+    file_buffer(std::move(other.file_buffer)) {
+    // Set the other object's iterator to end() to mark it as moved from
+    // to avoid early erasure at destruction of the moved other object
+    other.file_buffer_promise_iterator = promise_registry<Writable>().end();
+}
+
+template <bool Writable>
+llama_future_file_buffer<Writable> & llama_future_file_buffer<Writable>::operator=(
+    llama_future_file_buffer && other) noexcept {
+    if (this != &other) {
+        file_buffer_promise_iterator       = std::move(other.file_buffer_promise_iterator);
+        file_buffer_future                 = std::move(other.file_buffer_future);
+        file_buffer                        = std::move(other.file_buffer);
+        other.file_buffer_promise_iterator = promise_registry<Writable>().end();
+    }
+    return *this;
+}
+
+template <bool Writable> llama_future_file_buffer<Writable>::~llama_future_file_buffer() {
+    std::lock_guard<std::mutex> lock(promise_registry_mutex);
+    if (file_buffer_promise_iterator != promise_registry<Writable>().end()) {
+        promise_registry<Writable>().erase(file_buffer_promise_iterator);
+    }
+}
+
+template <bool Writable>
+bool llama_future_file_buffer<Writable>::fulfill_promise(const std::string & promise_key, const std::string & context,
+                                                         std::unique_ptr<llama_file_buffer<Writable>> && value) {
+    std::string key = final_key(promise_key, context);
+    auto        it  = ensure_promise_registry<Writable>(key);
+    if (it != promise_registry<Writable>().end()) {
+        LLAMA_LOG_CMAKE_DEBUG("fulfilling future file buffer %p for %s\n", (void *) &(*it), key.c_str());
+        it->second.set_value(std::move(value));
+        return true;
+    }
+    return false;
+}
+
+template <bool Writable>
+std::unique_ptr<llama_file_buffer<Writable>> llama_future_file_buffer<Writable>::extract() const {
+    if (file_buffer) {
+        return std::move(file_buffer);
+    }
+
+    auto future_result = file_buffer_future.get();
+    file_buffer        = std::move(future_result);
+    return std::move(file_buffer);
+}
+
+// Explicit instantiations for llama_future_file_buffer
+template struct llama_future_file_buffer<false>;
+template struct llama_future_file_buffer<true>;
+
 // llama_mmap
 
 struct llama_mmap::impl {
