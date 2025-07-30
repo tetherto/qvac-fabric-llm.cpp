@@ -1,5 +1,9 @@
 #include "llama-model-load-input.h"
 
+#include <sstream>
+
+#include "llama-mmap.h"
+
 namespace load_input_variant {
 
 const char * identifier(load_input_t & load_input) {
@@ -12,12 +16,44 @@ const char * identifier(load_input_t & load_input) {
 }
 
 llama_fname_load_input split_name_from_variant(load_input_t & load_input) {
+    if (std::holds_alternative<llama_buffer_future_load_input>(load_input)) {
+        auto future_input = std::get<llama_buffer_future_load_input>(load_input);
+        return llama_fname_load_input{ future_input.promise_key, future_input.splits };
+    }
     auto file_input = std::get<llama_fname_load_input>(load_input);
     return file_input;
 }
 
 bool variant_supports_split_load(load_input_t & load_input) {
-    return std::holds_alternative<llama_fname_load_input>(load_input);
+    return std::holds_alternative<llama_fname_load_input>(load_input) ||
+           std::holds_alternative<llama_buffer_future_load_input>(load_input);
+}
+
+bool variant_supports_split_load_from_memory(load_input_t & load_input) {
+    return std::holds_alternative<llama_buffer_future_load_input>(load_input);
+}
+
+std::optional<std::set<std::string>> parse_tensor_list_from_future(load_input_t & load_input) {
+    std::set<std::string> tensor_names;
+
+    if (!std::holds_alternative<llama_buffer_future_load_input>(load_input)) {
+        return std::nullopt;
+    }
+
+    const auto & future_input = std::get<llama_buffer_future_load_input>(load_input);
+
+    // Open and read the tensor list file
+    llama_future_file_buffer_ro           tensor_file(future_input.tensor_list_file, future_input.context);
+    std::unique_ptr<llama_file_buffer_ro> file_buffer = tensor_file.extract();
+
+    // Read directly from the stream
+    std::basic_istream<char> stream(file_buffer->streambuf.get());
+    std::string              line;
+    while (std::getline(stream, line)) {
+        tensor_names.insert(line);
+    }
+
+    return tensor_names;
 }
 
 }  // namespace load_input_variant
