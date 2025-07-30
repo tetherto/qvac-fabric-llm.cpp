@@ -50,7 +50,8 @@ static void split_print_usage(const char * executable) {
     printf("\n");
     printf("usage: %s [options] GGUF_IN GGUF_OUT\n", executable);
     printf("\n");
-    printf("Apply a GGUF operation on IN to OUT.");
+    printf("Apply a GGUF operation on IN to OUT.\n");
+    printf("When splitting, also creates GGUF_OUT.tensors.txt with all tensor names.\n");
     printf("\n");
     printf("options:\n");
     printf("  -h, --help              show this help message and exit\n");
@@ -303,6 +304,30 @@ struct split_strategy {
         }
     }
 
+    void write_tensor_list() {
+        // Create a .txt file with all tensor names from all splits
+        std::string   tensor_list_path = params.output + ".tensors.txt";
+        std::ofstream tensor_file(tensor_list_path);
+        if (!tensor_file.is_open()) {
+            fprintf(stderr, "warning: failed to create tensor list file %s\n", tensor_list_path.c_str());
+            return;
+        }
+
+        printf("Writing tensor list to %s ... ", tensor_list_path.c_str());
+        fflush(stdout);
+
+        // Write all tensor names from all splits
+        for (auto & ctx_out : ctx_outs) {
+            for (int i = 0; i < gguf_get_n_tensors(ctx_out); ++i) {
+                const char * t_name = gguf_get_tensor_name(ctx_out, i);
+                tensor_file << t_name << "\n";
+            }
+        }
+
+        tensor_file.close();
+        printf("done\n");
+    }
+
     void write() {
         int i_split = 0;
         int n_split = ctx_outs.size();
@@ -381,6 +406,9 @@ static void gguf_split(const split_params & split_params) {
     split_strategy strategy(split_params, f_input, ctx_gguf, ctx_meta);
     int n_split = strategy.ctx_outs.size();
     strategy.print_info();
+
+    // Write tensor list file
+    strategy.write_tensor_list();
 
     if (!split_params.dry_run) {
         // write all output splits
