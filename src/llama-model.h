@@ -423,6 +423,11 @@ struct llama_model {
                                 llama_model_loader & ml, bool use_mmap_buffer, bool use_mlock, int32_t n_gpu_layers,
                                 bool do_print_backend_buffers_info = true);
 
+    /// @brief Create backend buffers for tensors on a split file idenfified by `idx`. Removes the split from the map.
+    bool create_split_backend_buffers(
+        uint16_t idx, std::map<std::pair<ggml_backend_buffer_type_t, uint16_t>, ggml_context *> & ctx_split_map,
+        llama_model_loader & ml, bool use_mmap_buffer, bool use_mlock, int32_t n_gpu_layers);
+
     void print_backend_buffers_info(int32_t n_gpu_layers);
 
     void load_stats  (llama_model_loader & ml);
