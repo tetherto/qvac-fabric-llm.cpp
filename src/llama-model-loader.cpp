@@ -904,12 +904,9 @@ void llama_model_loader::load_data_for(struct ggml_tensor * cur) const {
     }
 }
 
-bool llama_model_loader::load_all_data(
-        struct ggml_context * ctx,
-        llama_buf_map & bufs,
-        llama_mlocks * lmlocks,
-        llama_progress_callback progress_callback,
-        void * progress_callback_user_data) {
+bool llama_model_loader::load_all_data(size_t size_data, struct ggml_context * ctx, llama_buf_map & bufs,
+                                       llama_mlocks * lmlocks, llama_progress_callback progress_callback,
+                                       void * progress_callback_user_data) {
     GGML_ASSERT(size_data != 0 && "call init_mappings() first");
 
     std::vector<no_init<uint8_t>> read_buf;
@@ -1049,6 +1046,12 @@ bool llama_model_loader::load_all_data(
             }
         } else {
             const auto & file = files.at(weight->idx);
+            if (file == nullptr) {
+                throw std::runtime_error(
+                    format("file not found for tensor '%s' at split-index %d", ggml_get_name(cur), weight->idx));
+            }
+            LLAMA_LOG_CMAKE_DEBUG("%s: uploading tensor %s from file at split-index %d\n", __func__, ggml_get_name(cur),
+                                  weight->idx);
             if (ggml_backend_buffer_is_host(cur->buffer)) {
                 file->seek(weight->offs, SEEK_SET);
                 file->read_raw(cur->data, n_size);

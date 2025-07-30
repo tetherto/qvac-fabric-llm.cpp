@@ -158,12 +158,8 @@ struct llama_model_loader {
     void load_data_for(struct ggml_tensor * cur) const;
 
     // Returns false if cancelled by progress_callback
-    bool load_all_data(
-            struct ggml_context * ctx,
-            llama_buf_map & bufs,
-            llama_mlocks * lmlocks,
-            llama_progress_callback progress_callback,
-            void * progress_callback_user_data);
+    bool load_all_data(size_t size_data, struct ggml_context * ctx, llama_buf_map & bufs, llama_mlocks * lmlocks,
+                       llama_progress_callback progress_callback, void * progress_callback_user_data);
 
     std::string ftype_name() const;
 
