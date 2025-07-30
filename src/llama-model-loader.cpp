@@ -465,7 +465,32 @@ namespace GGUFMeta {
 
     // TODO: this is not very clever - figure out something better
     template bool llama_model_loader::get_key_or_arr<std::array<int, 4>>(enum llm_kv kid, std::array<int, 4> & result, uint32_t n, bool required);
-    template bool llama_model_loader::get_key_or_arr<std::array<uint32_t, 512>>(enum llm_kv kid, std::array<uint32_t, 512> & result, uint32_t n, bool required);
+    template bool llama_model_loader::get_key_or_arr<std::array<uint32_t, 512>>(enum llm_kv                 kid,
+                                                                                std::array<uint32_t, 512> & result,
+                                                                                uint32_t n, bool required);
+
+    // Save tensors data offset of the main file.
+    // For subsidiary files, `meta` tensor data offset must not be used,
+    // so we build a unified tensors index for weights.
+    void llama_model_loader::process_loaded_gguf(struct ggml_context * ctx, gguf_file_load & gguf_load, uint16_t idx) {
+        contexts.emplace_back(ctx);
+        files.emplace_back(std::move(gguf_load.file));
+        llama_file * raw_file_ptr = files.back().get();
+
+        // Save tensors data offset info of the shard.
+        for (ggml_tensor * cur = ggml_get_first_tensor(ctx); cur; cur = ggml_get_next_tensor(ctx, cur)) {
+            std::string tensor_name = std::string(cur->name);
+            LLAMA_LOG_CMAKE_DEBUG("%s: loaded tensor %s at split %d\n", tensor_name.c_str(), __func__, idx);
+            // make sure there is no duplicated tensor names
+            if (weights_map.find(tensor_name) != weights_map.end()) {
+                throw std::runtime_error(format("invalid model: tensor '%s' is duplicated", ggml_get_name(cur)));
+            }
+            n_elements += ggml_nelements(cur);
+            n_bytes += ggml_nbytes(cur);
+            weights_map.emplace(tensor_name,
+                                llama_model_loader::llama_tensor_weight(raw_file_ptr, idx, gguf_load.meta.get(), cur));
+        }
+    }
 
 llama_model_loader::llama_model_loader(
         const std::string & fname,
@@ -489,27 +514,13 @@ llama_model_loader::llama_model_loader(
 
     struct ggml_context * ctx = NULL;
     gguf_file_load main_gguf(&ctx, load_input_variant::fname_load_input{fname, splits});
+    process_loaded_gguf(ctx, main_gguf, 0);
+
     meta = std::move(main_gguf.meta);
 
     get_key(llm_kv(LLM_KV_GENERAL_ARCHITECTURE), arch_name, false);
     llm_kv = LLM_KV(llm_arch_from_string(arch_name));
 
-    files.emplace_back(std::move(main_gguf.file));
-    contexts.emplace_back(ctx);
-
-    // Save tensors data offset of the main file.
-    // For subsidiary files, `meta` tensor data offset must not be used,
-    // so we build a unified tensors index for weights.
-    for (ggml_tensor * cur = ggml_get_first_tensor(ctx); cur; cur = ggml_get_next_tensor(ctx, cur)) {
-        std::string tensor_name = std::string(cur->name);
-        // make sure there is no duplicated tensor names
-        if (weights_map.find(tensor_name) != weights_map.end()) {
-            throw std::runtime_error(format("invalid model: tensor '%s' is duplicated", ggml_get_name(cur)));
-        }
-        n_elements += ggml_nelements(cur);
-        n_bytes    += ggml_nbytes(cur);
-        weights_map.emplace(tensor_name, llama_tensor_weight(files.back().get(), 0, meta.get(), cur));
-    }
     uint16_t n_split = 0;
     get_key(llm_kv(LLM_KV_SPLIT_COUNT), n_split, false);
 
@@ -556,20 +567,7 @@ llama_model_loader::llama_model_loader(
                 }
             }
 
-            files.emplace_back(std::move(split_gguf.file));
-            contexts.emplace_back(ctx);
-
-            // Save tensors data offset info of the shard.
-            for (ggml_tensor * cur = ggml_get_first_tensor(ctx); cur; cur = ggml_get_next_tensor(ctx, cur)) {
-                std::string tensor_name = std::string(cur->name);
-                // make sure there is no duplicated tensor names
-                if (weights_map.find(tensor_name) != weights_map.end()) {
-                    throw std::runtime_error(format("invalid model: tensor '%s' is duplicated", ggml_get_name(cur)));
-                }
-                n_elements += ggml_nelements(cur);
-                n_bytes    += ggml_nbytes(cur);
-                weights_map.emplace(tensor_name, llama_tensor_weight(files.back().get(), idx, split_meta.get(), cur));
-            }
+            process_loaded_gguf(ctx, split_gguf, idx);
         }
 
         get_key(llm_kv(LLM_KV_SPLIT_TENSORS_COUNT), n_tensors);

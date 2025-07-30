@@ -5,6 +5,7 @@
 #include "llama-impl.h"
 #include "llama-arch.h"
 #include "llama-mmap.h"
+#include "llama-model-load.h"
 
 #include "ggml-cpp.h"
 
@@ -90,6 +91,8 @@ struct llama_model_loader {
     size_t size_done = 0;
     size_t size_data = 0;
     std::vector<std::pair<size_t, size_t>> mmaps_used;
+
+    void process_loaded_gguf(struct ggml_context * ctx, gguf_file_load & gguf_load, uint16_t idx);
 
     llama_model_loader(
         const std::string & fname,
