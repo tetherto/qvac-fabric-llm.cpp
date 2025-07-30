@@ -58,6 +58,16 @@ int main(int argc, char ** argv) {
         LOG_INF("%s\n", common_params_get_system_info(params).c_str());
     }
 
+    // Check if LoRA adapters are loaded?
+    bool has_existing_lora = !params.lora_adapters.empty();
+    if (has_existing_lora) {
+        LOG_INF("Finetuning existing LoRA adapters\n");
+        LOG_INF("Found %zu existing LoRA adapters to train\n", params.lora_adapters.size());
+    } else {
+        LOG_INF("Training full model");
+    }
+
+
     std::vector<llama_token> tokens  = common_tokenize(ctx, params.prompt, true);
     ggml_opt_dataset_t       dataset = common_opt_dataset_init(ctx, tokens, llama_n_ctx(ctx) / 2);
 
@@ -68,7 +78,8 @@ int main(int argc, char ** argv) {
 
     struct llama_opt_params lopt_params{
         /*n_ctx_train     =*/0,
-        /*param_filter    =*/llama_opt_param_filter_all,
+        // /*param_filter    =*/llama_opt_param_filter_all,
+                              llama_opt_param_filter_lora,
         /*param_filter_ud =*/nullptr,
         /*get_opt_pars    =*/common_opt_lr_pars,
         /*get_opt_pars_ud =*/&params.lr,
