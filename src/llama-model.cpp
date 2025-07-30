@@ -5164,6 +5164,13 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
     ml.init_mappings(true, use_mlock ? &pimpl->mlock_mmaps : nullptr);
     pimpl->mappings.reserve(ml.mappings.size());
 
+    return create_backend_buffers(ml.size_data, ctx_map, ml, use_mmap_buffer, use_mlock, n_gpu_layers);
+}
+
+bool llama_model::create_backend_buffers(std::size_t                                                  size_data,
+                                         const std::map<ggml_backend_buffer_type_t, ggml_context *> & ctx_map,
+                                         llama_model_loader & ml, const bool use_mmap_buffer, const bool use_mlock,
+                                         const int32_t n_gpu_layers, bool do_print_backend_buffers_info) {
     // create the backend buffers
     std::vector<std::pair<ggml_context *, llama_buf_map>> ctx_bufs;
     ctx_bufs.reserve(ctx_map.size());
@@ -5172,7 +5179,7 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
     const size_t n_max_backend_buffer = ctx_map.size() * ml.files.size();
     pimpl->bufs.reserve(n_max_backend_buffer);
 
-    for (auto & it : ctx_map) {
+    for (const auto & it : ctx_map) {
         ggml_backend_buffer_type_t buft = it.first;
         ggml_context * ctx              = it.second;
 
@@ -5248,23 +5255,8 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
         ctx_bufs.emplace_back(ctx, buf_map);
     }
 
-    if (llama_supports_gpu_offload()) {
-        const int n_gpu = std::min(n_gpu_layers, int(hparams.n_layer));
-
-        LLAMA_LOG_INFO("%s: offloading %d repeating layers to GPU\n", __func__, n_gpu);
-        if (n_gpu_layers > (int) hparams.n_layer) {
-            LLAMA_LOG_INFO("%s: offloading output layer to GPU\n", __func__);
-        }
-
-        const int max_backend_supported_layers = hparams.n_layer + 1;
-        const int max_offloadable_layers       = hparams.n_layer + 1;
-
-        LLAMA_LOG_INFO("%s: offloaded %d/%d layers to GPU\n", __func__, std::min(n_gpu_layers, max_offloadable_layers), max_backend_supported_layers);
-    }
-
-    // print memory requirements per buffer type
-    for (auto & buf : pimpl->bufs) {
-        LLAMA_LOG_INFO("%s: %12s model buffer size = %8.2f MiB\n", __func__, ggml_backend_buffer_name(buf.get()), ggml_backend_buffer_get_size(buf.get()) / 1024.0 / 1024.0);
+    if(do_print_backend_buffers_info) {
+        print_backend_buffers_info(n_gpu_layers);
     }
 
     // populate tensors_by_name
@@ -5290,6 +5282,29 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
     }
 
     return true;
+}
+
+void llama_model::print_backend_buffers_info(const int32_t n_gpu_layers) {
+    if (llama_supports_gpu_offload()) {
+        const int n_gpu = std::min(n_gpu_layers, int(hparams.n_layer));
+
+        LLAMA_LOG_INFO("%s: offloading %d repeating layers to GPU\n", __func__, n_gpu);
+        if (n_gpu_layers > (int) hparams.n_layer) {
+            LLAMA_LOG_INFO("%s: offloading output layer to GPU\n", __func__);
+        }
+
+        const int max_backend_supported_layers = hparams.n_layer + 1;
+        const int max_offloadable_layers       = hparams.n_layer + 1;
+
+        LLAMA_LOG_INFO("%s: offloaded %d/%d layers to GPU\n", __func__, std::min(n_gpu_layers, max_offloadable_layers),
+                       max_backend_supported_layers);
+    }
+
+    // print memory requirements per buffer type
+    for (auto & buf : pimpl->bufs) {
+        LLAMA_LOG_INFO("%s: %12s model buffer size = %8.2f MiB\n", __func__, ggml_backend_buffer_name(buf.get()),
+                       ggml_backend_buffer_get_size(buf.get()) / 1024.0 / 1024.0);
+    }
 }
 
 std::string llama_model::arch_name() const {
