@@ -58,16 +58,6 @@ int main(int argc, char ** argv) {
         LOG_INF("%s\n", common_params_get_system_info(params).c_str());
     }
 
-    // Check if LoRA adapters are loaded?
-    bool has_existing_lora = !params.lora_adapters.empty();
-    if (has_existing_lora) {
-        LOG_INF("Finetuning existing LoRA adapters\n");
-        LOG_INF("Found %zu existing LoRA adapters to train\n", params.lora_adapters.size());
-    } else {
-        LOG_INF("Training full model");
-    }
-
-
     std::vector<llama_token> tokens  = common_tokenize(ctx, params.prompt, true);
     ggml_opt_dataset_t       dataset = common_opt_dataset_init(ctx, tokens, llama_n_ctx(ctx) / 2);
 
