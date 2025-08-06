@@ -55,43 +55,17 @@ int main(int argc, char ** argv) {
         LOG_INF("%s\n", common_params_get_system_info(params).c_str());
     }
 
-    struct llama_lora_training_params lora_params = {
-        /*target_modules =*/ LLAMA_LORA_TARGET_ATTN_Q | LLAMA_LORA_TARGET_ATTN_V,  // Train Q and V attention
-        /*rank          =*/ 16,        // LoRA rank
-        /*alpha         =*/ 32.0f,     // LoRA alpha (often 2 * rank)
-        /*dropout       =*/ 0.0f,      // No dropout for now
-        /*init_std      =*/ 0.02f,     // Weight initialization std
-    };
-
-    // Check if LoRA adapters are loaded?
-    bool has_existing_lora = !params.lora_adapters.empty();
-    if (has_existing_lora) {
-        LOG_INF("Finetuning existing LoRA adapters\n");
-        LOG_INF("Found %zu existing LoRA adapters to train\n", params.lora_adapters.size());
-    } else {
-        LOG_INF("Target modules: Q=%s, V=%s, rank=%d, alpha=%.1f\n",
-            (lora_params.target_modules & LLAMA_LORA_TARGET_ATTN_Q) ? "yes" : "no",
-            (lora_params.target_modules & LLAMA_LORA_TARGET_ATTN_V) ? "yes" : "no",
-            lora_params.rank, lora_params.alpha);
-        // Initialize new LoRA adapters
-        if (!llama_lora_training_init(ctx.get(), model.get(), &lora_params)) {
-            LOG_ERR("%s: LoRA training initialization failed\n", __func__);
-            return 1;
-        }
-    }
-
     constexpr float val_split = 0.05f;
 
     std::vector<llama_token> tokens = common_tokenize(ctx.get(), params.prompt, true);
     ggml_opt_dataset_t dataset = common_opt_dataset_init(ctx.get(), tokens, llama_n_ctx(ctx.get())/2);
 
     struct ggml_opt_optimizer_params optimizer_params = ggml_opt_get_default_optimizer_params(nullptr);
-    optimizer_params.adamw.alpha = 1e-5f; // learning rate
+    optimizer_params.adamw.alpha = 1e-7f; // learning rate
 
     struct llama_opt_params lopt_params {
         /*n_ctx_train     =*/ 0,
-        // /*param_filter    =*/ llama_opt_param_filter_all, 
-                              llama_opt_param_filter_lora,
+        /*param_filter    =*/ llama_opt_param_filter_all,
         /*param_filter_ud =*/ nullptr,
         /*get_opt_pars    =*/ ggml_opt_get_constant_optimizer_params,
         /*get_opt_pars_ud =*/ &optimizer_params,
@@ -114,7 +88,7 @@ int main(int argc, char ** argv) {
     ggml_opt_result_free(result_train);
     ggml_opt_result_free(result_eval);
 
-    llama_model_save_to_file(model.get(), "finetuned-model-lora.gguf");
+    llama_model_save_to_file(model.get(), "finetuned-model.gguf");
 
     llama_backend_free();
 
