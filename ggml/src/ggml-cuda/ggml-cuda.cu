@@ -5870,7 +5870,15 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                 }
             }
         case GGML_OP_OUT_PROD:
-            return op->type == GGML_TYPE_F32 && op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32;
+            {
+                // ggml_cuda_out_prod dequantizes any non-F32 src to F32 via ggml_get_to_fp32_cuda
+                // before the f32-only cuBLAS GEMM. Only claim support for src types the kernel can
+                // actually handle, otherwise it aborts on e.g. TQ2_0 which has no CUDA dequantizer.
+                auto src_ok = [](const ggml_tensor * src) {
+                    return src->type == GGML_TYPE_F32 || ggml_get_to_fp32_cuda(src->type) != nullptr;
+                };
+                return op->type == GGML_TYPE_F32 && src_ok(op->src[0]) && src_ok(op->src[1]);
+            }
         case GGML_OP_GET_ROWS:
             {
                 switch (op->src[0]->type) {
