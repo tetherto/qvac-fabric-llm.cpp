@@ -104,6 +104,27 @@ if (NOT GGML_SHARED_LIB)
             list(APPEND GGML_SYCL_INTERFACE_LINK_LIBRARIES IntelSYCL::SYCL_CXX MKL::MKL MKL::MKL_SYCL)
         endif()
     endif()
+
+    if (GGML_OPENCL)
+        # OpenCL::OpenCL, from the find_dependency(OpenCL) above, is the canonical
+        # target. pkg-config can contribute extra transitive flags that matter when
+        # linking statically, so consult it when it is available - but do not make it
+        # a hard requirement. A static consumer on a system with a working CMake
+        # OpenCL package but no pkg-config (common on Windows and in minimal build
+        # images) would otherwise fail find_package(ggml) outright, for a lookup that
+        # only supplements one already done.
+        # The probe also uses its own prefix: pkg_check_modules(OpenCL ...) writes
+        # OpenCL_FOUND / OpenCL_LIBRARIES etc., clobbering the values that
+        # find_dependency(OpenCL) just set.
+        find_package(PkgConfig QUIET)
+        if (PKG_CONFIG_FOUND)
+            pkg_check_modules(GGML_PC_OPENCL QUIET IMPORTED_TARGET OpenCL)
+            if (TARGET PkgConfig::GGML_PC_OPENCL)
+                list(APPEND GGML_OPENCL_INTERFACE_LINK_LIBRARIES PkgConfig::GGML_PC_OPENCL)
+            endif()
+        endif()
+    endif()
+
 endif()
 
 set_and_check(GGML_INCLUDE_DIR "@PACKAGE_GGML_INCLUDE_INSTALL_DIR@")
