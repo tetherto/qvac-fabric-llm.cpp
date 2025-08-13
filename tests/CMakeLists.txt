@@ -379,7 +379,9 @@ if (NOT GGML_BACKEND_DL AND GGML_CPU)
 endif()
 
 # libmtmd
-llama_build_and_test(test-mtmd-c-api.c  LABEL behavior  LINK mtmd)
+if (LLAMA_MTMD)
+    llama_build_and_test(test-mtmd-c-api.c  LABEL behavior  LINK mtmd)
+endif()
 
 llama_build_and_test(test-mtmd-impl.cpp  LABEL behavior  LINK mtmd)
 

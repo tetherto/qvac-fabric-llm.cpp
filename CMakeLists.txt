@@ -141,6 +141,9 @@ option(LLAMA_CONNECT         "llama: include the llama-connect tool (downloads a
 option(LLAMA_TOOLS_INSTALL "llama: install tools" ${LLAMA_TOOLS_INSTALL_DEFAULT})
 option(LLAMA_TESTS_INSTALL "llama: install tests" ON)
 
+# specific extras
+option(LLAMA_MTMD "llama: multimodal support" ${LLAMA_BUILD_TOOLS})
+
 # 3rd party libs
 option(LLAMA_OPENSSL    "llama: use openssl to support HTTPS" ON)
 option(LLAMA_SUBPROCESS "llama-common: use subprocess, required by server tools and server router mode" ${LLAMA_SUBPROCESS_DEFAULT})
@@ -262,6 +265,8 @@ endif()
 
 if (LLAMA_BUILD_COMMON AND LLAMA_BUILD_TOOLS)
     add_subdirectory(tools)
+elseif (LLAMA_MTMD)
+    add_subdirectory(tools/mtmd)
 endif()
 
 if (LLAMA_BUILD_APP)
@@ -331,6 +336,26 @@ if (LLAMA_BUILD_COMMON)
     EXPORT llama-targets
     PUBLIC_HEADER
       DESTINATION ${LLAMA_INCLUDE_INSTALL_DIR}/common)
+
+endif()
+
+if (LLAMA_MTMD)
+
+  # a static mtmd records its PRIVATE vendor deps as $<LINK_ONLY:...> usage
+  # requirements, so they must be part of the export set as well
+  install(
+      TARGETS vendor-hash miniaudio stb
+      EXPORT llama-targets)
+
+  if (NOT LLAMA_BUILD_COMMON) # otherwise already exported above
+    install(TARGETS sheredom EXPORT llama-targets)
+  endif()
+
+  install(
+    TARGETS mtmd
+    EXPORT llama-targets
+    PUBLIC_HEADER
+      DESTINATION ${LLAMA_INCLUDE_INSTALL_DIR}/mtmd)
 
 endif()
 
