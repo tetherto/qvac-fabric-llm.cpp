@@ -236,6 +236,10 @@ add_subdirectory(src)
 # utils, programs, examples and tests
 #
 
+# vendor/ and common/ expand $<INSTALL_INTERFACE:${LLAMA_INCLUDE_INSTALL_DIR}> at configure time
+include(GNUInstallDirs)
+set(LLAMA_INCLUDE_INSTALL_DIR ${CMAKE_INSTALL_INCLUDEDIR}/llama CACHE PATH "Location of header files")
+
 add_subdirectory(vendor)
 
 if (LLAMA_BUILD_COMMON)
@@ -279,7 +283,7 @@ llama_apply_app_manifests()
 include(GNUInstallDirs)
 include(CMakePackageConfigHelpers)
 
-set(LLAMA_INCLUDE_INSTALL_DIR ${CMAKE_INSTALL_INCLUDEDIR} CACHE PATH "Location of header  files")
+set(LLAMA_INCLUDE_INSTALL_DIR ${CMAKE_INSTALL_INCLUDEDIR}/llama CACHE PATH "Location of header  files")
 set(LLAMA_LIB_INSTALL_DIR     ${CMAKE_INSTALL_LIBDIR}     CACHE PATH "Location of library files")
 set(LLAMA_BIN_INSTALL_DIR     ${CMAKE_INSTALL_BINDIR}     CACHE PATH "Location of binary  files")
 
@@ -291,19 +295,51 @@ set_target_properties(llama
     PROPERTIES
         PUBLIC_HEADER "${LLAMA_PUBLIC_HEADERS}")
 
-install(TARGETS llama LIBRARY PUBLIC_HEADER)
+install(
+  TARGETS llama
+  EXPORT llama-targets
+  PUBLIC_HEADER
+    DESTINATION ${LLAMA_INCLUDE_INSTALL_DIR})
 
 if (LLAMA_BUILD_COMMON)
-    install(TARGETS llama-common LIBRARY)
+
+  install(
+      TARGETS cpp-httplib
+      EXPORT llama-targets)
+
+  # llama-common links these PUBLIC, so they must be exported regardless of
+  # LLAMA_CURL
+  install(
+      TARGETS nlohmann sheredom
+      EXPORT llama-targets)
+
+  install(FILES
+      ${CMAKE_CURRENT_SOURCE_DIR}/vendor/nlohmann/json.hpp
+      ${CMAKE_CURRENT_SOURCE_DIR}/vendor/nlohmann/json_fwd.hpp
+    DESTINATION ${LLAMA_INCLUDE_INSTALL_DIR}/nlohmann)
+
+  install(FILES
+      ${CMAKE_CURRENT_SOURCE_DIR}/vendor/sheredom/subprocess.h
+    DESTINATION ${LLAMA_INCLUDE_INSTALL_DIR}/sheredom)
+
+  install(
+    TARGETS llama-common llama-common-base
+    EXPORT llama-targets
+    PUBLIC_HEADER
+      DESTINATION ${LLAMA_INCLUDE_INSTALL_DIR}/common)
+
 endif()
 
+install(
+  EXPORT llama-targets
+  FILE llama-targets.cmake
+  NAMESPACE llama::
+  DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/llama)
+
 configure_package_config_file(
-        ${CMAKE_CURRENT_SOURCE_DIR}/cmake/llama-config.cmake.in
-        ${CMAKE_CURRENT_BINARY_DIR}/llama-config.cmake
-    INSTALL_DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/llama
-    PATH_VARS LLAMA_INCLUDE_INSTALL_DIR
-              LLAMA_LIB_INSTALL_DIR
-              LLAMA_BIN_INSTALL_DIR )
+  ${CMAKE_CURRENT_SOURCE_DIR}/cmake/llama-config.cmake.in
+  ${CMAKE_CURRENT_BINARY_DIR}/llama-config.cmake
+  INSTALL_DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/llama)
 
 write_basic_package_version_file(
         ${CMAKE_CURRENT_BINARY_DIR}/llama-config-version.cmake
@@ -312,7 +348,7 @@ write_basic_package_version_file(
 
 install(FILES ${CMAKE_CURRENT_BINARY_DIR}/llama-config.cmake
               ${CMAKE_CURRENT_BINARY_DIR}/llama-config-version.cmake
-        DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/llama)
+        DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/llama)
 
 configure_file(cmake/llama.pc.in
         "${CMAKE_CURRENT_BINARY_DIR}/llama.pc"
