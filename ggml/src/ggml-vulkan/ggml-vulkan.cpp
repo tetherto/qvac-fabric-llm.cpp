@@ -9300,7 +9300,6 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
     case GGML_OP_L2_NORM:
     case GGML_OP_SOFT_MAX:
     case GGML_OP_SOFT_MAX_BACK:
-    case GGML_OP_CROSS_ENTROPY_LOSS_BACK:
     case GGML_OP_SUM_ROWS:
     case GGML_OP_CUMSUM:
     case GGML_OP_MEAN:
@@ -9329,6 +9328,7 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
         break;
     case GGML_OP_CROSS_ENTROPY_LOSS_BACK:
         {
+            // For cross entropy loss back, we need one workgroup per row of logits (src1)
             const uint32_t nr = ggml_nrows(src1);
             if (nr > 262144) {
                 elements = { 512, 512, CEIL_DIV(nr, 262144) };
