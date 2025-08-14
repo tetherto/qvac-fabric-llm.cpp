@@ -3994,9 +3994,9 @@ static void ggml_vk_load_shaders(vk_device& device) {
 
     ggml_vk_create_pipeline(device, device->pipeline_diag_mask_inf_f32, "diag_mask_inf_f32", diag_mask_inf_f32_len, diag_mask_inf_f32_data, "main", 2, sizeof(vk_op_diag_mask_push_constants), {1, 512, 1}, {}, 1, true);
 
-    ggml_vk_create_pipeline(device, device->pipeline_cross_entropy_loss_back_f32, "cross_entropy_loss_back_f32", cross_entropy_loss_back_f32_len, cross_entropy_loss_back_f32_data, "main", 4, sizeof(vk_op_push_constants), {256, 1, 1}, { device->subgroup_size }, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_cross_entropy_loss_back_f32, "cross_entropy_loss_back_f32", cross_entropy_loss_back_f32_len, cross_entropy_loss_back_f32_data, "main", 4, sizeof(vk_op_push_constants), {1, 1, 1}, { device->subgroup_size }, 1);
 
-    ggml_vk_create_pipeline(device, device->pipeline_cross_entropy_loss_back_f32, "cross_entropy_loss_back_f32", cross_entropy_loss_back_f32_len, cross_entropy_loss_back_f32_data, "main", 4, sizeof(vk_op_push_constants), {256, 1, 1}, { device->subgroup_size }, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_cross_entropy_loss_back_f32, "cross_entropy_loss_back_f32", cross_entropy_loss_back_f32_len, cross_entropy_loss_back_f32_data, "main", 4, sizeof(vk_op_push_constants), {1, 1, 1}, { device->subgroup_size }, 1);
 
     ggml_vk_create_pipeline(device, device->pipeline_soft_max_f32, "soft_max_f32", soft_max_f32_len, soft_max_f32_data, "main", 4, sizeof(vk_op_soft_max_push_constants), {1, 1, 1}, { device->subgroup_size }, 1);
     ggml_vk_create_pipeline(device, device->pipeline_soft_max_f32_wg512, "soft_max_f32_wg512", soft_max_f32_len, soft_max_f32_data, "main", 4, sizeof(vk_op_soft_max_push_constants), {1, 1, 1}, { 512 }, 1);
@@ -9029,7 +9029,6 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
     case GGML_OP_L2_NORM:
     case GGML_OP_SOFT_MAX:
     case GGML_OP_SOFT_MAX_BACK:
-    case GGML_OP_CROSS_ENTROPY_LOSS_BACK:
     case GGML_OP_SUM_ROWS:
     case GGML_OP_CUMSUM:
     case GGML_OP_MEAN:
@@ -11813,74 +11812,7 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
             if (ctx->prealloc_size_add_rms_partials_offset + size <= ctx->prealloc_size_add_rms_partials) {
                 ctx->do_add_rms_partials = true;
             }
-<<<<<<< HEAD
         }
-=======
-        } break;
-    case GGML_OP_REPEAT:
-    case GGML_OP_REPEAT_BACK:
-    case GGML_OP_GET_ROWS:
-    case GGML_OP_ADD_ID:
-    case GGML_OP_ACC:
-    case GGML_OP_SUB:
-    case GGML_OP_MUL:
-    case GGML_OP_DIV:
-    case GGML_OP_CONCAT:
-    case GGML_OP_UPSCALE:
-    case GGML_OP_SCALE:
-    case GGML_OP_SQR:
-    case GGML_OP_SQRT:
-    case GGML_OP_SIN:
-    case GGML_OP_COS:
-    case GGML_OP_CLAMP:
-    case GGML_OP_PAD:
-    case GGML_OP_ROLL:
-    case GGML_OP_CPY:
-    case GGML_OP_SET_ROWS:
-    case GGML_OP_CONT:
-    case GGML_OP_DUP:
-    case GGML_OP_SILU_BACK:
-    case GGML_OP_NORM:
-    case GGML_OP_GROUP_NORM:
-    case GGML_OP_RMS_NORM:
-    case GGML_OP_RMS_NORM_BACK:
-    case GGML_OP_L2_NORM:
-    case GGML_OP_DIAG_MASK_INF:
-    case GGML_OP_CROSS_ENTROPY_LOSS_BACK:
-    case GGML_OP_SOFT_MAX:
-    case GGML_OP_SOFT_MAX_BACK:
-    case GGML_OP_ROPE:
-    case GGML_OP_ROPE_BACK:
-    case GGML_OP_MUL_MAT:
-    case GGML_OP_MUL_MAT_ID:
-    case GGML_OP_OUT_PROD:
-    case GGML_OP_ARGSORT:
-    case GGML_OP_SUM:
-    case GGML_OP_SUM_ROWS:
-    case GGML_OP_MEAN:
-    case GGML_OP_ARGMAX:
-    case GGML_OP_COUNT_EQUAL:
-    case GGML_OP_IM2COL:
-    case GGML_OP_IM2COL_3D:
-    case GGML_OP_TIMESTEP_EMBEDDING:
-    case GGML_OP_CONV_TRANSPOSE_1D:
-    case GGML_OP_POOL_2D:
-    case GGML_OP_CONV_2D:
-    case GGML_OP_CONV_TRANSPOSE_2D:
-    case GGML_OP_CONV_2D_DW:
-    case GGML_OP_RWKV_WKV6:
-    case GGML_OP_RWKV_WKV7:
-    case GGML_OP_SSM_SCAN:
-    case GGML_OP_SSM_CONV:
-    case GGML_OP_LEAKY_RELU:
-    case GGML_OP_FLASH_ATTN_EXT:
-    case GGML_OP_OPT_STEP_ADAMW:
-    case GGML_OP_OPT_STEP_SGD:
-        break;
-    default:
-        std::cerr << "ggml_vulkan: Error: Missing op: " << ggml_op_name(node->op) << std::endl;
-        GGML_ABORT("fatal error");
->>>>>>> 69f5557a3 (vulkan: Add initial cross entropy loss backward shader)
     }
 
     vk_context compute_ctx;
