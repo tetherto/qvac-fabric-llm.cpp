@@ -34,7 +34,7 @@ void main() {
 
             for (uint k = 0; k < p.ne01; k += 1) {
                 const uint a_block_base = get_aoffset() + (i3 / broadcast3) * p.nb03 + (i2 / broadcast2) * p.nb02 + k * p.nb01;
-                const uint ib = a_block_base + (i0 / QUANT_K);
+                const uint ib = a_block_base + (i0 / QUANT_K) * p.nb00;
                 const uint iqs = (i0 % QUANT_K) / QUANT_R;
 
                 const vec2 v = dequantize(ib, iqs, 0);
