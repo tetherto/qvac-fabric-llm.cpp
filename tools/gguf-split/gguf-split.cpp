@@ -13,6 +13,7 @@
 #include <fstream>
 #include <string>
 #include <vector>
+#include <set>
 
 #if defined(_WIN32)
     #include <windows.h>
@@ -43,6 +44,7 @@ struct split_params {
     std::string output;
     bool no_tensor_first_split = false;
     bool dry_run = false;
+    std::set<std::string> must_be_followed_layers;
 };
 
 static void split_print_usage(const char * executable) {
@@ -61,6 +63,7 @@ static void split_print_usage(const char * executable) {
     printf("  --split-max-tensors     max tensors in each split (default: %d)\n", default_params.n_split_tensors);
     printf("  --split-max-size N(M|G) max size per split\n");
     printf("  --no-tensor-first-split do not add tensors to the first split (disabled by default)\n");
+    printf("  --must-be-followed LAYER ensure LAYER is not the last tensor in a split and will not be released when loading after any tensor is created (can be used multiple times)\n");
     printf("  --dry-run               only print out a split plan and exit, without writing any new files\n");
     printf("\n");
 }
@@ -144,6 +147,13 @@ static void split_params_parse_ex(int argc, const char ** argv, split_params & p
             }
             params.mode = MODE_SIZE;
             params.n_bytes_split = split_str_to_n_bytes(argv[arg_idx]);
+        } else if (arg == "--must-be-followed") {
+            if (++arg_idx >= argc) {
+                invalid_param = true;
+                break;
+            }
+            arg_found = true;
+            params.must_be_followed_layers.insert(argv[arg_idx]);
         }
 
         if (!arg_found) {
@@ -276,7 +286,19 @@ struct split_strategy {
         }
     }
 
+    bool must_be_followed(int i_tensor) {
+        if (i_tensor > 0 && i_tensor < n_tensors) {
+            const char* tensor_name = gguf_get_tensor_name(ctx_gguf, i_tensor);
+            return params.must_be_followed_layers.find(tensor_name) != params.must_be_followed_layers.end();
+        }
+        return false;
+    }
+
     bool should_split(int i_tensor, size_t next_size) {
+        if (must_be_followed(i_tensor) || must_be_followed(i_tensor - 1)) {
+            return false;
+        }
+
         if (params.mode == MODE_SIZE) {
             // split by max size per file
             return next_size > params.n_bytes_split;
