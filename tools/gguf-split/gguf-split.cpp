@@ -44,6 +44,7 @@ struct split_params {
     std::string output;
     bool no_tensor_first_split = false;
     bool dry_run = false;
+    bool verbose = false;
     std::set<std::string> must_be_followed_layers;
 };
 
@@ -65,6 +66,7 @@ static void split_print_usage(const char * executable) {
     printf("  --no-tensor-first-split do not add tensors to the first split (disabled by default)\n");
     printf("  --must-be-followed LAYER ensure LAYER is not the last tensor in a split and will not be released when loading after any tensor is created (can be used multiple times)\n");
     printf("  --dry-run               only print out a split plan and exit, without writing any new files\n");
+    printf("  --verbose               show tensor names for each split\n");
     printf("\n");
 }
 
@@ -110,6 +112,9 @@ static void split_params_parse_ex(int argc, const char ** argv, split_params & p
         } else if (arg == "--dry-run") {
             arg_found = true;
             params.dry_run = true;
+        } else if (arg == "--verbose") {
+            arg_found = true;
+            params.verbose = true;
         } else if (arg == "--no-tensor-first-split") {
             arg_found = true;
             params.no_tensor_first_split = true;
@@ -322,6 +327,13 @@ struct split_strategy {
             }
             total_size = total_size / 1000 / 1000; // convert to megabytes
             printf("split %05d: n_tensors = %" PRIi64 ", total_size = %zuM\n", i_split + 1, gguf_get_n_tensors(ctx_out), total_size);
+            
+            if (params.verbose) {
+                for (int i = 0; i < gguf_get_n_tensors(ctx_out); ++i) {
+                    const char * t_name = gguf_get_tensor_name(ctx_out, i);
+                    printf("  - %s\n", t_name);
+                }
+            }
             i_split++;
         }
     }
