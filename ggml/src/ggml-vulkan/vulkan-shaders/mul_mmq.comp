@@ -112,6 +112,20 @@ shared ACC_TYPE coopmat_stage[TM * TN * NUM_WARPS];
 
 #include "mul_mmq_funcs.comp"
 
+int dotPacked4x8(uint a, uint b) {
+    int a0 = int(a << 24) >> 24;
+    int a1 = int(a << 16) >> 24;
+    int a2 = int(a << 8)  >> 24;
+    int a3 = int(a)       >> 24;
+
+    int b0 = int(b << 24) >> 24;
+    int b1 = int(b << 16) >> 24;
+    int b2 = int(b << 8)  >> 24;
+    int b3 = int(b)       >> 24;
+
+    return a0 * b0 + a1 * b1 + a2 * b2 + a3 * b3;
+}
+
 void main() {
 #ifdef NEEDS_INIT_IQ_SHMEM
     init_iq_shmem(gl_WorkGroupSize);
@@ -352,8 +366,14 @@ void main() {
                         const uint sums_idx = (wsic * TN + cc) * (WMITER * TM) + wsir * TM + cr;
                         int32_t q_sum = 0;
                         [[unroll]] for (uint idx_k = 0; idx_k < BK / 4; idx_k++) {
+
+#if defined(ADRENO)
+                            q_sum += dotPacked4x8(cache_a_qs[cache_a_idx * (BK / 4) + idx_k],
+                                                  cache_b_qs[cc * (BK / 4) + idx_k]);
+#else
                             q_sum += dotPacked4x8EXT(cache_a_qs[cache_a_idx * (BK / 4) + idx_k],
                                                      cache_b_qs[cc * (BK / 4) + idx_k]);
+#endif
                         }
 
                         sums[sums_idx] += mul_q8_1(q_sum, cache_a_dm[cache_a_idx], cache_b_ds[cc], 1);

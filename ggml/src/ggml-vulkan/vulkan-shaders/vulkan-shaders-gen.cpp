@@ -316,7 +316,7 @@ void string_to_spv(const std::string& _name, const std::string& in_fname, const 
     compiles.push_back(std::async(string_to_spv_func, _name, in_fname, defines, fp16, coopmat, coopmat2, f16acc));
 }
 
-void matmul_shaders(bool fp16, MatMulIdType matmul_id_type, bool coopmat, bool coopmat2, bool f16acc) {
+void matmul_shaders(bool fp16, MatMulIdType matmul_id_type, bool coopmat, bool coopmat2, bool f16acc, bool adreno = false) {
     std::string load_vec = coopmat2 ? "1" : fp16 ? "8" : "4";
     std::string aligned_b_type_f32 = coopmat2 ? "float" : fp16 ? "mat2x4" : "vec4";
     std::string aligned_b_type_f16 = coopmat2 ? "float16_t" : fp16 ? "f16mat2x4" : "f16vec4";
@@ -325,6 +325,12 @@ void matmul_shaders(bool fp16, MatMulIdType matmul_id_type, bool coopmat, bool c
         {"FLOAT_TYPE_VEC2", (coopmat2 || fp16) ? "f16vec2" : "vec2"},
     };
     std::string shader_name = "matmul";
+    std::string device_prefix = "";
+
+    if (adreno) {
+        base_dict["ADRENO"] = "1";
+        device_prefix += "adreno_";
+    }
 
     if (matmul_id_type == MatMulIdType::DEFAULT) {
         base_dict["MUL_MAT_ID"] = "1";
@@ -365,11 +371,11 @@ void matmul_shaders(bool fp16, MatMulIdType matmul_id_type, bool coopmat, bool c
     };
 
     // Shaders with f16 B_TYPE
-    string_to_spv(shader_name + "_f32_f16",         source_name, merge_maps(base_dict, {{"FLOAT_TYPE", FLOAT_TYPE("f16")}, {"DATA_A_F32", "1"},                                                     {"B_TYPE", "float16_t"},                                          {"D_TYPE", "float"}, }), fp16, coopmat, coopmat2, f16acc);
-    string_to_spv(shader_name + "_f32_f16_aligned", source_name, merge_maps(base_dict, {{"FLOAT_TYPE", FLOAT_TYPE("f16")}, {"DATA_A_F32", "1"}, {"LOAD_VEC_A", load_vec}, {"LOAD_VEC_B", load_vec}, {"B_TYPE", aligned_b_type_f16}, {"B_TYPE32", aligned_b_type_f32}, {"D_TYPE", "float"}, {"ALIGNED", "1"}}), fp16, coopmat, coopmat2, f16acc);
+    string_to_spv(device_prefix + shader_name + "_f32_f16",         source_name, merge_maps(base_dict, {{"FLOAT_TYPE", FLOAT_TYPE("f16")}, {"DATA_A_F32", "1"},                                                     {"B_TYPE", "float16_t"},                                          {"D_TYPE", "float"}, }), fp16, coopmat, coopmat2, f16acc);
+    string_to_spv(device_prefix + shader_name + "_f32_f16_aligned", source_name, merge_maps(base_dict, {{"FLOAT_TYPE", FLOAT_TYPE("f16")}, {"DATA_A_F32", "1"}, {"LOAD_VEC_A", load_vec}, {"LOAD_VEC_B", load_vec}, {"B_TYPE", aligned_b_type_f16}, {"B_TYPE32", aligned_b_type_f32}, {"D_TYPE", "float"}, {"ALIGNED", "1"}}), fp16, coopmat, coopmat2, f16acc);
 
-    string_to_spv(shader_name + "_f16_aligned",     source_name, merge_maps(base_dict, {{"FLOAT_TYPE", FLOAT_TYPE("f16")}, {"DATA_A_F16", "1"}, {"LOAD_VEC_A", load_vec}, {"LOAD_VEC_B", load_vec}, {"B_TYPE", aligned_b_type_f16}, {"B_TYPE32", aligned_b_type_f32}, {"D_TYPE", "float"}, {"ALIGNED", "1"}}), fp16, coopmat, coopmat2, f16acc);
-    string_to_spv(shader_name + "_f16",             source_name, merge_maps(base_dict, {{"FLOAT_TYPE", FLOAT_TYPE("f16")}, {"DATA_A_F16", "1"},                                                     {"B_TYPE", "float16_t"},                                          {"D_TYPE", "float"}}), fp16, coopmat, coopmat2, f16acc);
+    string_to_spv(device_prefix + shader_name + "_f16_aligned",     source_name, merge_maps(base_dict, {{"FLOAT_TYPE", FLOAT_TYPE("f16")}, {"DATA_A_F16", "1"}, {"LOAD_VEC_A", load_vec}, {"LOAD_VEC_B", load_vec}, {"B_TYPE", aligned_b_type_f16}, {"B_TYPE32", aligned_b_type_f32}, {"D_TYPE", "float"}, {"ALIGNED", "1"}}), fp16, coopmat, coopmat2, f16acc);
+    string_to_spv(device_prefix + shader_name + "_f16",             source_name, merge_maps(base_dict, {{"FLOAT_TYPE", FLOAT_TYPE("f16")}, {"DATA_A_F16", "1"},                                                     {"B_TYPE", "float16_t"},                                          {"D_TYPE", "float"}}), fp16, coopmat, coopmat2, f16acc);
 
     // bf16
     {
@@ -385,8 +391,8 @@ void matmul_shaders(bool fp16, MatMulIdType matmul_id_type, bool coopmat, bool c
         if (!(coopmat || coopmat2))
 #endif
         {
-            string_to_spv(shader_name + "_bf16_aligned", source_name, merge_maps(base_dict, {{"FLOAT_TYPE", FLOAT_TYPE("bf16")}, {"TO_FLOAT_TYPE", to_float_type}, {"DATA_A_BF16", "1"}, {"LOAD_VEC_A", load_vec_a},           {"LOAD_VEC_B", "4"}, {"B_TYPE", coopmat2 ? "bfloat16_t" : "u16vec4"},   {"B_TYPE32", "vec4"}, {"D_TYPE", "float"}, {"B_IS_FLOAT", "1"}, {"DATA_B_BF16", "1"}, {"ALIGNED", "1"}}), fp16, coopmat, coopmat2, f16acc);
-            string_to_spv(shader_name + "_bf16",         source_name, merge_maps(base_dict, {{"FLOAT_TYPE", FLOAT_TYPE("bf16")}, {"TO_FLOAT_TYPE", to_float_type}, {"DATA_A_BF16", "1"}, {"LOAD_VEC_A", load_vec_a_unaligned},                      {"B_TYPE", coopmat2 ? "bfloat16_t" : "uint16_t"},                        {"D_TYPE", "float"}, {"B_IS_FLOAT", "1"}, {"DATA_B_BF16", "1"}}),                   fp16, coopmat, coopmat2, f16acc);
+            string_to_spv(device_prefix + shader_name + "_bf16_aligned", source_name, merge_maps(base_dict, {{"FLOAT_TYPE", FLOAT_TYPE("bf16")}, {"TO_FLOAT_TYPE", to_float_type}, {"DATA_A_BF16", "1"}, {"LOAD_VEC_A", load_vec_a},           {"LOAD_VEC_B", "4"}, {"B_TYPE", coopmat2 ? "bfloat16_t" : "u16vec4"},   {"B_TYPE32", "vec4"}, {"D_TYPE", "float"}, {"B_IS_FLOAT", "1"}, {"DATA_B_BF16", "1"}, {"ALIGNED", "1"}}), fp16, coopmat, coopmat2, f16acc);
+            string_to_spv(device_prefix + shader_name + "_bf16",         source_name, merge_maps(base_dict, {{"FLOAT_TYPE", FLOAT_TYPE("bf16")}, {"TO_FLOAT_TYPE", to_float_type}, {"DATA_A_BF16", "1"}, {"LOAD_VEC_A", load_vec_a_unaligned},                      {"B_TYPE", coopmat2 ? "bfloat16_t" : "uint16_t"},                        {"D_TYPE", "float"}, {"B_IS_FLOAT", "1"}, {"DATA_B_BF16", "1"}}),                   fp16, coopmat, coopmat2, f16acc);
         }
     }
 
@@ -409,18 +415,18 @@ void matmul_shaders(bool fp16, MatMulIdType matmul_id_type, bool coopmat, bool c
 
         // don't generate f32 variants for coopmat2
         if (!coopmat2) {
-            string_to_spv(shader_name + "_" + tname + "_f32",         source_name, merge_maps(base_dict, {{"FLOAT_TYPE", FLOAT_TYPE(tname)}, {data_a_key, "1"}, {"LOAD_VEC_A", load_vec_a_unaligned},                           {"B_TYPE", "float"},                                              {"D_TYPE", "float"}}), fp16, coopmat, coopmat2, f16acc);
-            string_to_spv(shader_name + "_" + tname + "_f32_aligned", source_name, merge_maps(base_dict, {{"FLOAT_TYPE", FLOAT_TYPE(tname)}, {data_a_key, "1"}, {"LOAD_VEC_A", load_vec_a},           {"LOAD_VEC_B", load_vec}, {"B_TYPE", aligned_b_type_f32}, {"B_TYPE32", aligned_b_type_f32}, {"D_TYPE", "float"}, {"ALIGNED", "1"}}), fp16, coopmat, coopmat2, f16acc);
+            string_to_spv(device_prefix + shader_name + "_" + tname + "_f32",         source_name, merge_maps(base_dict, {{"FLOAT_TYPE", FLOAT_TYPE(tname)}, {data_a_key, "1"}, {"LOAD_VEC_A", load_vec_a_unaligned},                           {"B_TYPE", "float"},                                              {"D_TYPE", "float"}}), fp16, coopmat, coopmat2, f16acc);
+            string_to_spv(device_prefix + shader_name + "_" + tname + "_f32_aligned", source_name, merge_maps(base_dict, {{"FLOAT_TYPE", FLOAT_TYPE(tname)}, {data_a_key, "1"}, {"LOAD_VEC_A", load_vec_a},           {"LOAD_VEC_B", load_vec}, {"B_TYPE", aligned_b_type_f32}, {"B_TYPE32", aligned_b_type_f32}, {"D_TYPE", "float"}, {"ALIGNED", "1"}}), fp16, coopmat, coopmat2, f16acc);
         }
 
         if (tname != "f16" && tname != "f32") {
-            string_to_spv(shader_name + "_" + tname + "_f16",         source_name,  merge_maps(base_dict, {{"FLOAT_TYPE", FLOAT_TYPE(tname)}, {data_a_key, "1"}, {"LOAD_VEC_A", load_vec_a_unaligned},                           {"B_TYPE", "float16_t"},                                          {"D_TYPE", "float"}}), fp16, coopmat, coopmat2, f16acc);
-            string_to_spv(shader_name + "_" + tname + "_f16_aligned", source_name,  merge_maps(base_dict, {{"FLOAT_TYPE", FLOAT_TYPE(tname)}, {data_a_key, "1"}, {"LOAD_VEC_A", load_vec_a},           {"LOAD_VEC_B", load_vec}, {"B_TYPE", aligned_b_type_f16}, {"B_TYPE32", aligned_b_type_f32}, {"D_TYPE", "float"}, {"ALIGNED", "1"}}), fp16, coopmat, coopmat2, f16acc);
+            string_to_spv(device_prefix + shader_name + "_" + tname + "_f16",         source_name,  merge_maps(base_dict, {{"FLOAT_TYPE", FLOAT_TYPE(tname)}, {data_a_key, "1"}, {"LOAD_VEC_A", load_vec_a_unaligned},                           {"B_TYPE", "float16_t"},                                          {"D_TYPE", "float"}}), fp16, coopmat, coopmat2, f16acc);
+            string_to_spv(device_prefix + shader_name + "_" + tname + "_f16_aligned", source_name,  merge_maps(base_dict, {{"FLOAT_TYPE", FLOAT_TYPE(tname)}, {data_a_key, "1"}, {"LOAD_VEC_A", load_vec_a},           {"LOAD_VEC_B", load_vec}, {"B_TYPE", aligned_b_type_f16}, {"B_TYPE32", aligned_b_type_f32}, {"D_TYPE", "float"}, {"ALIGNED", "1"}}), fp16, coopmat, coopmat2, f16acc);
         }
 
 #if defined(GGML_VULKAN_INTEGER_DOT_GLSLC_SUPPORT)
         if (!coopmat && !coopmat2 && matmul_id_type == MatMulIdType::NONE && is_legacy_quant(tname)) {
-            string_to_spv(shader_name + "_" + tname + "_q8_1", "mul_mmq.comp", merge_maps(base_dict, {{"FLOAT_TYPE", FLOAT_TYPE(tname)}, {data_a_key, "1"}, {"D_TYPE", "float"},}), fp16, coopmat, coopmat2, f16acc);
+            string_to_spv(device_prefix + shader_name + "_" + tname + "_q8_1", "mul_mmq.comp", merge_maps(base_dict, {{"FLOAT_TYPE", FLOAT_TYPE(tname)}, {data_a_key, "1"}, {"D_TYPE", "float"},}), fp16, coopmat, coopmat2, f16acc);
         }
 #endif
     }
@@ -770,6 +776,68 @@ void process_shaders() {
     string_to_spv("multi_add_f32", "multi_add.comp", {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}, {"RTE16", "1"}, {"ADD_RMS" , "0"}});
     string_to_spv("multi_add_rms_f32", "multi_add.comp", {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}, {"RTE16", "1"}, {"ADD_RMS" , "1"}});
 
+#ifdef GGML_VULKAN_BUILD_ADRENO_SHADERS
+    std::cout << "ggml_vulkan: Generating Adreno-supported shaders" << std::endl;
+
+    std::vector<std::string> adreno_shader_types = {"f32", "f16", "q4_0", "q4_1", "q6_k", "q8_0"};
+    std::string device_suffix = "adreno_";
+    auto adreno_base_dict = merge_maps(base_dict, {{"ADRENO", "1"}});
+
+    for (const auto& tname : adreno_shader_types) {
+        // mul mat vec
+        std::string data_a_key = "DATA_A_" + to_uppercase(tname);
+        std::string shader = (string_ends_with(tname, "_k") || string_starts_with(tname, "iq1_") || string_starts_with(tname, "iq2_") || string_starts_with(tname, "iq3_")) ? "mul_mat_vec_" + tname + ".comp" : "mul_mat_vec.comp";
+
+        string_to_spv(device_suffix + "mul_mat_vec_" + tname + "_f32_f32", shader, merge_maps(adreno_base_dict, {{data_a_key, "1"}, {"B_TYPE", "float"}, {"B_TYPE_VEC2", "vec2"}, {"B_TYPE_VEC4", "vec4"}, {"D_TYPE", "float"}}));
+        string_to_spv(device_suffix + "mul_mat_vec_" + tname + "_f16_f32", shader, merge_maps(adreno_base_dict, {{data_a_key, "1"}, {"B_TYPE", "float16_t"}, {"B_TYPE_VEC2", "f16vec2"}, {"B_TYPE_VEC4", "f16vec4"}, {"D_TYPE", "float"}}));
+
+        string_to_spv(device_suffix + "mul_mat_vec_" + tname + "_f32_f32_subgroup", shader, merge_maps(adreno_base_dict, {{data_a_key, "1"}, {"B_TYPE", "float"}, {"B_TYPE_VEC2", "vec2"}, {"B_TYPE_VEC4", "vec4"}, {"D_TYPE", "float"}, {"USE_SUBGROUP_ADD", "1"}}));
+        string_to_spv(device_suffix + "mul_mat_vec_" + tname + "_f16_f32_subgroup", shader, merge_maps(adreno_base_dict, {{data_a_key, "1"}, {"B_TYPE", "float16_t"}, {"B_TYPE_VEC2", "f16vec2"}, {"B_TYPE_VEC4", "f16vec4"}, {"D_TYPE", "float"}, {"USE_SUBGROUP_ADD", "1"}}));
+
+        string_to_spv(device_suffix + "mul_mat_vec_" + tname + "_f32_f32_subgroup_no_shmem", shader, merge_maps(adreno_base_dict, {{data_a_key, "1"}, {"B_TYPE", "float"}, {"B_TYPE_VEC2", "vec2"}, {"B_TYPE_VEC4", "vec4"}, {"D_TYPE", "float"}, {"USE_SUBGROUP_ADD_NO_SHMEM", "1"}}));
+        string_to_spv(device_suffix + "mul_mat_vec_" + tname + "_f16_f32_subgroup_no_shmem", shader, merge_maps(adreno_base_dict, {{data_a_key, "1"}, {"B_TYPE", "float16_t"}, {"B_TYPE_VEC2", "f16vec2"}, {"B_TYPE_VEC4", "f16vec4"}, {"D_TYPE", "float"}, {"USE_SUBGROUP_ADD_NO_SHMEM", "1"}}));
+
+        string_to_spv(device_suffix + "mul_mat_vec_id_" + tname + "_f32", shader, merge_maps(adreno_base_dict, {{"MUL_MAT_ID", "1"}, {data_a_key, "1"}, {"B_TYPE", "float"}, {"B_TYPE_VEC2", "vec2"}, {"B_TYPE_VEC4", "vec4"}, {"D_TYPE", "float"}}));
+
+        // mul mat vec with integer dot product
+#if defined(GGML_VULKAN_INTEGER_DOT_GLSLC_SUPPORT)
+        if (is_legacy_quant(tname)) {
+            string_to_spv(device_suffix + "mul_mat_vec_" + tname + "_q8_1_f32", "mul_mat_vecq.comp", merge_maps(adreno_base_dict, {{data_a_key, "1"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}, {"FLOAT_TYPE_VEC2", "vec2"}, {"ACC_TYPE", "float"}}));
+            string_to_spv(device_suffix + "mul_mat_vec_" + tname + "_q8_1_f32_subgroup", "mul_mat_vecq.comp", merge_maps(adreno_base_dict, {{data_a_key, "1"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}, {"FLOAT_TYPE_VEC2", "vec2"}, {"ACC_TYPE", "float"}, {"USE_SUBGROUP_ADD", "1"}}));
+            string_to_spv(device_suffix + "mul_mat_vec_" + tname + "_q8_1_f32_subgroup_no_shmem", "mul_mat_vecq.comp", merge_maps(adreno_base_dict, {{data_a_key, "1"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}, {"FLOAT_TYPE_VEC2", "vec2"}, {"ACC_TYPE", "float"}, {"USE_SUBGROUP_ADD_NO_SHMEM", "1"}}));
+        }
+#endif
+
+        if (!string_ends_with(tname, "_k")) {
+            if (!(tname == "f32" || tname == "f16" || tname == "bf16")) {
+                string_to_spv(device_suffix + "get_rows_" + tname, "get_rows_quant.comp", merge_maps(adreno_base_dict, {{data_a_key, "1"}, {"B_TYPE", "int"}, {"D_TYPE", "float16_t"}}));
+                string_to_spv(device_suffix + "get_rows_" + tname + "_f32", "get_rows_quant.comp", merge_maps(adreno_base_dict, {{data_a_key, "1"}, {"B_TYPE", "int"}, {"D_TYPE", "float"}}));
+            }
+        }
+    }
+
+    for (std::string tname : {"q4_0", "q4_1", "q8_0"}) {
+        string_to_spv(device_suffix + "cpy_" + tname + "_f32", "copy_from_quant.comp", {{"ADRENO", "1"}, {"DATA_A_" + to_uppercase(tname), "1"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}});
+    }
+
+    string_to_spv(device_suffix + "out_prod_q4_0", "out_prod_q4_0.comp", merge_maps(adreno_base_dict, {{"DATA_A_Q4_0", "1"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}}));
+    string_to_spv(device_suffix + "out_prod_q8_0", "out_prod_q8_0.comp", merge_maps(adreno_base_dict, {{"DATA_A_Q8_0", "1"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}}));
+
+    string_to_spv(device_suffix + "quantize_q8_1", "quantize_q8_1.comp", adreno_base_dict);
+    string_to_spv(device_suffix + "quantize_q8_1_x4", "quantize_q8_1.comp", merge_maps(adreno_base_dict, {{"QBLOCK_X4", "1"}}));
+
+    // matmul
+    for (const MatMulIdType& matmul_id_type : {MatMulIdType::NONE, MatMulIdType::DEFAULT}) {
+        // No coopmats
+        // fp32
+        matmul_shaders(false, matmul_id_type, false, false, false, true);
+
+        // fp16, fp32acc and fp16acc
+        matmul_shaders(true, matmul_id_type, false, false, false, true);
+        matmul_shaders(true, matmul_id_type, false, false, true, true);
+    }
+#endif
+
     for (auto &c : compiles) {
         c.wait();
     }
@@ -780,7 +848,13 @@ void write_output_files() {
     FILE* src = fopen(target_cpp.c_str(), "w");
 
     fprintf(hdr, "#include <cstdint>\n\n");
-    fprintf(src, "#include \"%s\"\n\n", basename(target_hpp).c_str());
+    fprintf(src, "#include \"%s\"\n", basename(target_hpp).c_str());
+    fprintf(src, "#include <cstdint>\n");
+    fprintf(src, "#include <cstdio>\n");
+    fprintf(src, "#include <cstddef>\n");
+    fprintf(src, "#include <cstring>\n");
+    fprintf(src, "#include <unordered_map>\n");
+    fprintf(src, "#include <utility>\n\n");
 
     std::sort(shader_fnames.begin(), shader_fnames.end());
     for (const auto& pair : shader_fnames) {
@@ -823,6 +897,35 @@ void write_output_files() {
         if (!no_clean) {
             std::remove(path.c_str());
         }
+    }
+
+    // generate a map of base pipeline name to pipeline_(data,len) if a device-specific variant exists
+    {
+        std::vector<std::string> adreno_bases;
+        adreno_bases.reserve(shader_fnames.size());
+        for (const auto &pair : shader_fnames) {
+            const std::string &nm = pair.first;
+            if (string_starts_with(nm, "adreno_")) {
+                adreno_bases.push_back(nm.substr(std::string("adreno_").size(), nm.size()));
+            }
+        }
+
+        fprintf(hdr, "bool ggml_vk_get_adreno_variant(const void * base_data, uint64_t * len_out, const void ** data_out);\n\n");
+
+        fprintf(src, "using ggml_vk_adreno_map_t = std::unordered_map<const void*, std::pair<const void*, uint64_t>>;\n");
+        fprintf(src, "static const ggml_vk_adreno_map_t ggml_vk_adreno_ptr_map = {\n");
+        for (size_t i = 0; i < adreno_bases.size(); ++i) {
+            const std::string &base = adreno_bases[i];
+            fprintf(src, "    { %s_data, { adreno_%s_data, adreno_%s_len } },\n",
+                    base.c_str(), base.c_str(), base.c_str());
+        }
+        fprintf(src, "};\n\n");
+        fprintf(src, "bool ggml_vk_get_adreno_variant(const void * base_data, uint64_t * len_out, const void ** data_out) {\n");
+        fprintf(src, "    if (!base_data || !len_out || !data_out) return false;\n");
+        fprintf(src, "    auto it = ggml_vk_adreno_ptr_map.find(base_data);\n");
+        fprintf(src, "    if (it == ggml_vk_adreno_ptr_map.end()) return false;\n");
+        fprintf(src, "    *len_out = it->second.second; *data_out = it->second.first; return true;\n");
+        fprintf(src, "}\n\n");
     }
 
     std::string suffixes[2] = {"_f32", "_f16"};
