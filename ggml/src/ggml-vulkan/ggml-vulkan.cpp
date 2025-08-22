@@ -3091,6 +3091,21 @@ static void ggml_vk_load_shaders(vk_device& device) {
             pipeline->initialized = true;
         }
 
+        // if a variant shader exists for this SPIR-V symbol base, use it instead.
+        if (device->architecture == vk_device_architecture::QUALCOMM_ADRENO) {
+            uint64_t adreno_len = 0;
+            const void * adreno_data = nullptr;
+            if (ggml_vk_get_adreno_variant(spv_data, &adreno_len, &adreno_data)) {
+                spv_size = (size_t) adreno_len;
+                spv_data = adreno_data;
+                // update pipeline name to reflect that we are using the Adreno variant
+                pipeline->name = "adreno_" + std::string(name);
+                VK_LOG_DEBUG("ggml_vk_create_pipeline(): using Adreno variant for shader " << name);
+            } else {
+                VK_LOG_DEBUG("ggml_vk_create_pipeline(): no Adreno variant found for shader " << name);
+            }
+        }
+
         if (!pipeline->needed || pipeline->compiled) {
             return;
         }

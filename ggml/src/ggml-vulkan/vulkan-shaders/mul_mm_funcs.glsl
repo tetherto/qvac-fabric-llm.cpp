@@ -54,8 +54,25 @@ void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uin
 
             const float d = float(data_a_packed16[ib].d);
             const uint vui = uint(data_a_packed16[ib].qs[2*iqs]) | (uint(data_a_packed16[ib].qs[2*iqs + 1]) << 16);
+
+#if defined(ADRENO)
+            const vec4 v0 = (vec4(
+                float((vui >> 0)  & 0xF),
+                float((vui >> 8)  & 0xF),
+                float((vui >> 16) & 0xF),
+                float((vui >> 24) & 0xF)
+            ) - 8.0) * d;
+
+            const vec4 v1 = (vec4(
+                float((vui >> 4)  & 0xF),
+                float((vui >> 12) & 0xF),
+                float((vui >> 20) & 0xF),
+                float((vui >> 28) & 0xF)
+            ) - 8.0) * d;
+#else
             const vec4 v0 = (vec4(unpack8(vui & 0x0F0F0F0F)) - 8.0f) * d;
             const vec4 v1 = (vec4(unpack8((vui >> 4) & 0x0F0F0F0F)) - 8.0f) * d;
+#endif
 
             buf_a[buf_idx    ] = FLOAT_TYPE_VEC2(v0.xy);
             buf_a[buf_idx + 1] = FLOAT_TYPE_VEC2(v0.zw);
@@ -71,8 +88,24 @@ void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uin
             const float d = float(data_a_packed16[ib].d);
             const float m = float(data_a_packed16[ib].m);
             const uint vui = uint(data_a_packed16[ib].qs[2*iqs]) | (uint(data_a_packed16[ib].qs[2*iqs + 1]) << 16);
+
+#if defined(ADRENO)
+            const vec4 v0 = vec4(
+                float((vui >> 0)  & 0xF),
+                float((vui >> 8)  & 0xF),
+                float((vui >> 16) & 0xF),
+                float((vui >> 24) & 0xF)
+            ) * d + m;
+            const vec4 v1 = vec4(
+                float((vui >> 4)  & 0xF),
+                float((vui >> 12) & 0xF),
+                float((vui >> 20) & 0xF),
+                float((vui >> 28) & 0xF)
+            ) * d + m;
+#else
             const vec4 v0 = vec4(unpack8(vui & 0x0F0F0F0F)) * d + m;
             const vec4 v1 = vec4(unpack8((vui >> 4) & 0x0F0F0F0F)) * d + m;
+#endif
 
             buf_a[buf_idx     ] = FLOAT_TYPE_VEC2(v0.xy);
             buf_a[buf_idx + 1 ] = FLOAT_TYPE_VEC2(v0.zw);
@@ -120,10 +153,20 @@ void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uin
             const uint ib = idx / 8;
             const uint iqs = idx & 0x07;
 
+#if defined(ADRENO)
+            const float d = float(data_a[ib].d);
+            const vec4 v = vec4(
+                int(data_a[ib].qs[4*iqs]),
+                int(data_a[ib].qs[4*iqs + 1]),
+                int(data_a[ib].qs[4*iqs + 2]),
+                int(data_a[ib].qs[4*iqs + 3])
+            ) * d;
+#else
             const float d = float(data_a_packed16[ib].d);
             const i8vec2 v0 = unpack8(int32_t(data_a_packed16[ib].qs[2*iqs])).xy; // vec4 used due to #12147
             const i8vec2 v1 = unpack8(int32_t(data_a_packed16[ib].qs[2*iqs + 1])).xy;
             const vec4 v = vec4(v0.x, v0.y, v1.x, v1.y) * d;
+#endif
 
             buf_a[buf_idx    ] = FLOAT_TYPE_VEC2(v.xy);
             buf_a[buf_idx + 1] = FLOAT_TYPE_VEC2(v.zw);

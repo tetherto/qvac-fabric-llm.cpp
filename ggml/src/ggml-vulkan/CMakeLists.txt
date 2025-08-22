@@ -204,16 +204,19 @@ if (Vulkan_FOUND)
               CONFIGURE_DEPENDS "${_ggml_vk_input_dir}/*.cpp"
                                 "${_ggml_vk_input_dir}/*.h")
 
+    set (_ggml_vk_common_cpp "${CMAKE_CURRENT_BINARY_DIR}/ggml-vulkan-shaders-common.cpp")
+
     add_custom_command(
-        OUTPUT ${_ggml_vk_header}
+        OUTPUT ${_ggml_vk_header} ${_ggml_vk_common_cpp}
         COMMAND ${_ggml_vk_genshaders_cmd}
             --output-dir ${_ggml_vk_output_dir}
             --target-hpp ${_ggml_vk_header}
+            --target-common-cpp ${_ggml_vk_common_cpp}
         DEPENDS ${_ggml_vk_shaders_gen_sources}
                 vulkan-shaders-gen
-        COMMENT "Generate vulkan shaders header"
+        COMMENT "Generate vulkan shaders header and common cpp"
     )
-    target_sources(ggml-vulkan PRIVATE ${_ggml_vk_header})
+    target_sources(ggml-vulkan PRIVATE ${_ggml_vk_header} ${_ggml_vk_common_cpp})
 
     foreach (file_full ${_ggml_vk_shader_files})
         get_filename_component(file ${file_full} NAME)

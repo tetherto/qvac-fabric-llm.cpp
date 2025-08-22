@@ -86,9 +86,27 @@ void quantize() {
     vals = round(vals * d_inv);
 
 #ifndef QBLOCK_X4
+#if defined(ADRENO)
+    i8vec4 q = i8vec4(round(vals));
+    data_b[ib].qs[iqs] =
+        int((uint(q.x) & 0xFFu) |
+        ((uint(q.y) & 0xFFu) << 8) |
+        ((uint(q.z) & 0xFFu) << 16) |
+        ((uint(q.w) & 0xFFu) << 24));
+#else
     data_b[ib].qs[iqs] = pack32(i8vec4(round(vals)));
+#endif
+#else
+#if defined(ADRENO)
+    i8vec4 q = i8vec4(round(vals));
+    data_b[ibx4_outer].qs[ibx4_inner * 8 + iqs] =
+        int((uint(q.x) & 0xFFu) |
+        ((uint(q.y) & 0xFFu) << 8) |
+        ((uint(q.z) & 0xFFu) << 16) |
+        ((uint(q.w) & 0xFFu) << 24));
 #else
     data_b[ibx4_outer].qs[ibx4_inner * 8 + iqs] = pack32(i8vec4(round(vals)));
+#endif
 #endif
 
 #ifndef USE_SUBGROUPS

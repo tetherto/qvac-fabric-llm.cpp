@@ -241,7 +241,6 @@ void main() {
                 [[unroll]] for (uint cr = 0; cr < TM; cr++) {
                     const uint reg_ib = wsir * TM + cr;
                     const uint buf_ib = warp_r * WM + wsir * WSUBM + tiwr * TM + cr;
-
                     block_a_to_registers(reg_ib, k_step * BM + buf_ib);
                 }
             }
