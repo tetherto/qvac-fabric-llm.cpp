@@ -1430,6 +1430,10 @@ extern "C" {
 
         ggml_opt_get_optimizer_params get_opt_pars; // callback for calculating optimizer parameters
         void * get_opt_pars_ud;                     // userdata for calculating optimizer parameters
+
+        // Optional checkpoint loading
+        const char * checkpoint_path;        // path to checkpoint file to load optimizer state from (nullptr = don't load)
+        bool load_optimizer_state;          // whether to load optimizer state from checkpoint_path
     };
 
     LLAMA_API void llama_opt_init(struct llama_context * lctx, struct llama_model * model, struct llama_opt_params lopt_params);
@@ -1441,7 +1445,8 @@ extern "C" {
             ggml_opt_result_t         result_eval,
             int64_t                   idata_split,
             ggml_opt_epoch_callback   callback_train,
-            ggml_opt_epoch_callback   callback_eval);
+            ggml_opt_epoch_callback   callback_eval,
+            int64_t                   resume_from_batch);
     
     // LoRA training parameters
     enum llama_lora_target_module {
@@ -1474,11 +1479,20 @@ extern "C" {
 
     // LoRA parameter filter (returns true for LoRA tensors only)
     LLAMA_API bool llama_opt_param_filter_lora(const struct ggml_tensor * tensor, void * userdata);
+    
+    LLAMA_API int64_t llama_opt_get_iter(struct llama_context * ctx);
 
     LLAMA_API bool llama_lora_save_adapter(
         const struct llama_adapter_lora * adapter,
         const char * filename,
         const struct llama_model * model
+    );
+    
+    LLAMA_API bool llama_lora_save_checkpoint(
+        const struct llama_adapter_lora * adapter,
+        const char * filename,
+        const struct llama_model * model,
+        struct llama_context * ctx
     );
 
 #ifdef __cplusplus

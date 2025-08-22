@@ -36,6 +36,14 @@ the base model frozen, making it memory-efficient.
 # Fine-tune existing LoRA adapter
 ./build/bin/llama-finetune-lora -m base_model.gguf -f dataset.txt --lora existing_adapter.gguf \
   --output-adapter improved_adapter.gguf -ngl 999 -c 512 -b 512 -ub 512
+
+# Training with checkpointing
+./build/bin/llama-finetune-lora -m model.gguf -f dataset.txt -ngl 999 -c 512 -b 512 -ub 512 \
+  --checkpoint-save-steps 50 --checkpoint-save-dir "./lora_checkpoints"
+
+# Resume training from checkpoint
+./build/bin/llama-finetune-lora -m model.gguf -f dataset.txt -ngl 999 -c 512 -b 512 -ub 512 \
+  --resume-from-checkpoint "./lora_checkpoints/checkpoint_step_00000150/"
 ```
 
 
@@ -53,6 +61,12 @@ the base model frozen, making it memory-efficient.
   - Default: `attn_q,attn_k,attn_v,attn_o` (attention modules)
 - `--output-adapter PATH` - Output adapter filename (default: auto-generated)
 
+#### Checkpointing
+- `--checkpoint-save-steps N` - Save checkpoint every N training steps (default: 100)
+- `--checkpoint-save-dir PATH` - Directory for checkpoints (default: `./checkpoints`)
+- `--resume-from-checkpoint PATH` - Resume training from specific checkpoint directory
+- `--auto-resume` - Automatically resume from latest checkpoint in save directory
+
 #### Standard Parameters
 - `-m MODEL` - Base model file (.gguf)
 - `-f FILE` - Training dataset
@@ -68,11 +82,28 @@ After training, you'll get a small adapter file. Use it with the original base m
 ./build/bin/llama-cli -m base_model.gguf --lora trained_adapter.gguf -ngl 999
 ```
 
+### Checkpointing
+
+The LoRA fine-tuning supports automatic checkpointing to save and resume training progress:
+
+#### Features
+- **Automatic saving**: Model and optimizer state saved every N training steps
+- **Complete state**: Includes LoRA weights, optimizer momentum, and training metadata
+- **Resume capability**: Continue training from exact step with full optimizer state
+- **Auto-resume**: Automatically find and resume from latest checkpoint
+
+#### Checkpoint Structure
+Each checkpoint directory contains:
+- `model.gguf` - LoRA adapter weights
+- `optimizer.gguf` - Optimizer state (momentum, variance, iteration)
+- `metadata.json` - Training parameters and step information
+
 ### Troubleshooting
 
 - **Out of memory**: Reduce context length (`-c 256`), lower rank, or use fewer target modules
 - **Poor quality**: Increase rank, add more target modules, or train longer
 - **Large adapter**: Reduce rank or limit target modules
+- **Checkpoint issues**: Ensure checkpoint directory contains all required files (model.gguf, optimizer.gguf, metadata.json)
 
 ### Help
 

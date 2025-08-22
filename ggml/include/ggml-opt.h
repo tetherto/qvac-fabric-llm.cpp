@@ -141,6 +141,19 @@ extern "C" {
 
     // get the gradient accumulator for a node from the forward graph
     GGML_API struct ggml_tensor * ggml_opt_grad_acc(ggml_opt_context_t opt_ctx, struct ggml_tensor * node);
+    
+    // get optimizer state tensors (momentum and variance for AdamW)
+    GGML_API int64_t ggml_opt_get_iter(ggml_opt_context_t opt_ctx);
+    GGML_API void    ggml_opt_set_iter(ggml_opt_context_t opt_ctx, int64_t iter);
+    GGML_API int32_t ggml_opt_get_nparams(ggml_opt_context_t opt_ctx);
+    GGML_API struct ggml_tensor * ggml_opt_get_grad_m(ggml_opt_context_t opt_ctx, int32_t index);
+    GGML_API struct ggml_tensor * ggml_opt_get_grad_v(ggml_opt_context_t opt_ctx, int32_t index);
+
+    // ====== Optimizer State Persistence ======
+
+    GGML_API bool ggml_opt_save_state(ggml_opt_context_t opt_ctx, const char* filename);
+    GGML_API bool ggml_opt_load_state(ggml_opt_context_t opt_ctx, const char* filename);
+    GGML_API bool ggml_opt_load_tensors(ggml_opt_context_t opt_ctx, const char* filename);
 
     // ====== Optimization Result ======
 

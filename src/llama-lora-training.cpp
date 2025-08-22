@@ -1,11 +1,8 @@
 #include "llama-lora-training.h"
 
 #include <cstring>
-#include <cmath>
 #include <random>
-#include <algorithm>
-#include <map>
-#include <stdexcept>
+#include <filesystem>
 
 
 ggml_context * llama_lora_create_context(size_t mem_size) {
@@ -302,7 +299,7 @@ bool llama_opt_param_filter_lora(const struct ggml_tensor * tensor, void * userd
         LLAMA_LOG_DEBUG("LoRA filter: including trainable params '%s'\n", name);
         return true;
     }
-
+    
     return false;
 }
 
@@ -356,4 +353,45 @@ bool llama_lora_save_adapter(
 
     gguf_free(gguf_ctx);
     return success;
+}
+
+bool llama_lora_save_checkpoint(
+    const struct llama_adapter_lora * adapter,
+    const char * checkpoint_path,
+    const struct llama_model * model,
+    struct llama_context * ctx
+) {
+    if (!adapter || !checkpoint_path || !model || !ctx) {
+        LLAMA_LOG_ERROR("llama_lora_save_checkpoint: invalid parameters\n");
+        return false;
+    }
+
+    std::filesystem::path checkpoint_dir = std::filesystem::path(checkpoint_path);
+    if (!checkpoint_dir.empty()) {
+        if (!std::filesystem::exists(checkpoint_dir)) {
+            if (!std::filesystem::create_directories(checkpoint_dir)) {
+                LLAMA_LOG_ERROR("llama_lora_save_checkpoint: failed to create checkpoint directory: %s\n", 
+                               checkpoint_dir.c_str());
+                return false;
+            }
+        }
+    }
+
+    std::filesystem::path model_path = checkpoint_dir / "model.gguf";
+    bool lora_saved = llama_lora_save_adapter(adapter, model_path.c_str(), model);
+    if (!lora_saved) {
+        LLAMA_LOG_ERROR("llama_lora_save_checkpoint: failed to save LoRA adapter weights to %s\n", 
+                        model_path.c_str());
+        return false;
+    }
+
+    std::filesystem::path optimizer_path = checkpoint_dir / "optimizer.gguf";    
+    bool optimizer_saved = ctx->opt_save_state(optimizer_path.c_str());
+    if (!optimizer_saved) {
+        LLAMA_LOG_ERROR("llama_lora_save_checkpoint: failed to save optimizer state to %s\n", 
+                        optimizer_path.c_str());
+        return false;
+    }
+
+    return true;
 }

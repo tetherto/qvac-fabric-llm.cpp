@@ -69,6 +69,8 @@ int main(int argc, char ** argv) {
         /*param_filter_ud =*/ nullptr,
         /*get_opt_pars    =*/ ggml_opt_get_constant_optimizer_params,
         /*get_opt_pars_ud =*/ &optimizer_params,
+        /*checkpoint_path =*/ nullptr,
+        /*load_optimizer_state =*/ false,
     };
     llama_opt_init(ctx.get(), model.get(), lopt_params);
 
@@ -79,7 +81,7 @@ int main(int argc, char ** argv) {
 
     for (int epoch = 0; epoch < 2; ++epoch) {
         llama_opt_epoch(ctx.get(), dataset, result_train, result_eval, idata_split,
-            ggml_opt_epoch_callback_progress_bar, ggml_opt_epoch_callback_progress_bar);
+            ggml_opt_epoch_callback_progress_bar, ggml_opt_epoch_callback_progress_bar, -1);
         fprintf(stderr, "\n");
 
         ggml_opt_result_reset(result_train);
