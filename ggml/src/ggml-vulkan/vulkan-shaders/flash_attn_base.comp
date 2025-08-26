@@ -76,12 +76,17 @@ vec4 dequantize4(uint ib, uint iqs, uint a_offset, uint binding_idx) {
 #endif
 
 #if defined(DATA_A_Q8_0)
+#define BINDING_IDX_K 0
+#define BINDING_IDX_V 1
+layout (binding = 1) readonly buffer KV_PACKED16 {A_TYPE data[];} kv_packed[2];
 #define BLOCK_BYTE_SIZE 34
 vec4 dequantize4(uint ib, uint iqs, uint a_offset, uint binding_idx) {
-    const i8vec2 v0 = unpack8(int32_t(kv_packed[binding_idx].data_packed16[a_offset + ib].qs[iqs / 2])).xy; // vec4 used due to #12147
-    const i8vec2 v1 = unpack8(int32_t(kv_packed[binding_idx].data_packed16[a_offset + ib].qs[iqs / 2 + 1])).xy;
+    const vec2 v0 = vec2(int(kv_packed[binding_idx].data[a_offset + ib].qs[iqs]),
+                         int(kv_packed[binding_idx].data[a_offset + ib].qs[iqs + 1]));
+    const vec2 v1 = vec2(int(kv_packed[binding_idx].data[a_offset + ib].qs[iqs + 2]),
+                         int(kv_packed[binding_idx].data[a_offset + ib].qs[iqs + 3]));
 
-    return float(kv_packed[binding_idx].data_packed16[a_offset + ib].d) * vec4(v0.x, v0.y, v1.x, v1.y);
+    return float(kv_packed[binding_idx].data[a_offset + ib].d) * vec4(v0.x, v0.y, v1.x, v1.y);
 }
 #endif
 

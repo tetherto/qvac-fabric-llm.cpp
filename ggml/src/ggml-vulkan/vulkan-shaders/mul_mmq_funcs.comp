@@ -76,9 +76,20 @@ ACC_TYPE mul_q8_1(int32_t q_sum, vec2 dma, vec2 dsb) {
 
 #if defined(DATA_A_Q8_0)
 int32_t repack(uint ib, uint iqs) {
+#if 0
     // Use 2-byte loads since a q8_0 block (34 bytes) is not divisible by 4
     return pack32(i16vec2(data_a[ib].qs[iqs * 2    ],
                           data_a[ib].qs[iqs * 2 + 1]));
+#else
+    int32_t u0 = int32_t(uint(data_a[ib].qs[iqs * 2]) & 0xFFu);
+    int32_t u1 = int32_t(uint(data_a[ib].qs[iqs * 2 + 1]) & 0xFFu);
+    int32_t u2 = int32_t(uint(data_a[ib].qs[iqs * 2 + 2]) & 0xFFu);
+    int32_t u3 = int32_t(uint(data_a[ib].qs[iqs * 2 + 3]) & 0xFFu);
+
+    int32_t packed32 = (u3 << 24) | (u2 << 16) | (u1 << 8) | u0;
+
+    return packed32;
+#endif
 }
 
 ACC_TYPE mul_q8_1(int32_t q_sum, float da, vec2 dsb) {

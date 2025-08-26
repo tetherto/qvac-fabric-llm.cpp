@@ -117,6 +117,17 @@ shared uint _ne1_sh;
 shared ACC_TYPE coopmat_stage[TM * TN * NUM_WARPS];
 #endif
 
+#if defined(DATA_A_Q8_0)
+vec2 dequantize(uint ib, uint iqs, uint a_offset) {
+    return vec2(int(data_a[a_offset + ib].qs[iqs]), int(data_a[a_offset + ib].qs[iqs + 1]));
+}
+vec4 dequantize4(uint ib, uint iqs, uint a_offset) {
+    const vec2 v01 = dequantize(ib, iqs, a_offset);
+    const vec2 v23 = dequantize(ib, iqs + 2, a_offset);
+    return vec4(v01.x, v01.y, v23.x, v23.y);
+}
+#endif
+
 void main() {
 #ifdef NEEDS_INIT_IQ_SHMEM
     init_iq_shmem(gl_WorkGroupSize);
@@ -404,10 +415,17 @@ void main() {
             const uint ib = idx / 8;
             const uint iqs = idx & 0x07;
 
+#if 0
             const float d = float(data_a_packed16[ib].d);
             const i8vec2 v0 = unpack8(int32_t(data_a_packed16[ib].qs[2*iqs])).xy; // vec4 used due to #12147
             const i8vec2 v1 = unpack8(int32_t(data_a_packed16[ib].qs[2*iqs + 1])).xy;
             const vec4 v = vec4(v0.x, v0.y, v1.x, v1.y) * d;
+#else
+            const float d = float(data_a[ib].d);
+            const vec2 v0 = dequantize(ib, 2*(2*iqs), 0);
+            const vec2 v1 = dequantize(ib, 2*(2*iqs + 1), 0);
+            const vec4 v = vec4(v0.x, v0.y, v1.x, v1.y) * d;
+#endif
 
             buf_a[buf_idx    ] = FLOAT_TYPE(v.x);
             buf_a[buf_idx + 1] = FLOAT_TYPE(v.y);
