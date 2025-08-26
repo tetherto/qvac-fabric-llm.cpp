@@ -14,16 +14,21 @@ void ggml_cuda_out_prod(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 
     GGML_ASSERT(dst->type  == GGML_TYPE_F32);
 
+    cudaStream_t   stream = ctx.stream();
+    ggml_cuda_pool & pool = ctx.pool();
+
     // temp buffers
     float * src0_f32 = nullptr;
     float * src1_f32 = nullptr;
     bool allocated_src0 = false;
     bool allocated_src1 = false;
-    cudaStream_t   stream = ctx.stream();
+    ggml_cuda_pool_alloc<float> src0_alloc(pool);
+    ggml_cuda_pool_alloc<float> src1_alloc(pool);
 
     if (src0_is_quantized) {
-        const size_t src0_size = ggml_nelements(src0) * sizeof(float);
-        CUDA_CHECK(cudaMallocAsync(&src0_f32, src0_size, stream));
+        const size_t src0_size = ggml_nelements(src0);
+        src0_alloc.alloc(src0_size);
+        src0_f32 = src0_alloc.ptr;
         allocated_src0 = true;
 
         // Dequantize
@@ -31,7 +36,6 @@ void ggml_cuda_out_prod(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
         if (dequantize_fn) {
             dequantize_fn(src0->data, src0_f32, ggml_nelements(src0), stream);
         } else {
-            CUDA_CHECK(cudaFreeAsync(src0_f32, stream));
             GGML_ABORT("Unsupported quant type for src0");
         }
     } else {
@@ -39,15 +43,15 @@ void ggml_cuda_out_prod(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     } 
 
     if (src1_is_quantized) {
-        const size_t src1_size = ggml_nelements(src1) * sizeof(float);
-        CUDA_CHECK(cudaMallocAsync(&src1_f32, src1_size, stream));
+        const size_t src1_size = ggml_nelements(src1);
+        src1_alloc.alloc(src1_size);
+        src1_f32 = src1_alloc.ptr;
         allocated_src1 = true;
 
         auto dequantize_fn = ggml_get_to_fp32_cuda(src1->type);
         if (dequantize_fn) {
-            dequantize_fn(src1->data, src1_f32, ggml_nelements(src0), stream);
+            dequantize_fn(src1->data, src1_f32, ggml_nelements(src1), stream);
         } else {
-            CUDA_CHECK(cudaFreeAsync(src1_f32, stream));
             GGML_ABORT("Unsupported quant type for src1");
         }
     } else {
@@ -115,10 +119,4 @@ void ggml_cuda_out_prod(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
         }
     }
 
-    if (allocated_src0) {
-        CUDA_CHECK(cudaFreeAsync(src0_f32, stream));
-    }
-    if (allocated_src1) {
-        CUDA_CHECK(cudaFreeAsync(src1_f32, stream));
-    }
 }
