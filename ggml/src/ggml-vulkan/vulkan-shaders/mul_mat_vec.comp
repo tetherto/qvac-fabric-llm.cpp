@@ -29,8 +29,16 @@ void iter(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const uint first_row, const
         const vec4 bv0 = vec4(bv02.x, bv13.x, bv02.y, bv13.y);
         const vec4 bv1 = vec4(bv02.z, bv13.z, bv02.w, bv13.w);
 #else
-        const vec4 bv0 = vec4(data_b_v4[(j*p.batch_stride_b + b_offset + iybs + iqs) / 4]);
-        const vec4 bv1 = vec4(data_b_v4[(j*p.batch_stride_b + b_offset + iybs + iqs) / 4 + 1]);
+        const FLOAT_TYPE bv00 = FLOAT_TYPE(data_b[(j*p.batch_stride_b + b_offset + iybs + iqs) ]);
+        const FLOAT_TYPE bv01 = FLOAT_TYPE(data_b[(j*p.batch_stride_b + b_offset + iybs + iqs) + 1]);
+        const FLOAT_TYPE bv02 = FLOAT_TYPE(data_b[(j*p.batch_stride_b + b_offset + iybs + iqs) + 2]);
+        const FLOAT_TYPE bv03 = FLOAT_TYPE(data_b[(j*p.batch_stride_b + b_offset + iybs + iqs) + 3]);
+        const FLOAT_TYPE bv10 = FLOAT_TYPE(data_b[(j*p.batch_stride_b + b_offset + iybs + iqs) + 4]);
+        const FLOAT_TYPE bv11 = FLOAT_TYPE(data_b[(j*p.batch_stride_b + b_offset + iybs + iqs) + 5]);
+        const FLOAT_TYPE bv12 = FLOAT_TYPE(data_b[(j*p.batch_stride_b + b_offset + iybs + iqs) + 6]);
+        const FLOAT_TYPE bv13 = FLOAT_TYPE(data_b[(j*p.batch_stride_b + b_offset + iybs + iqs) + 7]);
+        const vec4 bv0 = vec4(bv00, bv01, bv02, bv03);
+        const vec4 bv1 = vec4(bv10, bv11, bv12, bv13);
 #endif
 #else
         // Check if the second of the pair of elements is OOB, and don't fetch B or
