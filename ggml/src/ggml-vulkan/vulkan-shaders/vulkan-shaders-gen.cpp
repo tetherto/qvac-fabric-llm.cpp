@@ -1097,6 +1097,7 @@ void process_shaders() {
     string_to_spv("geglu_quick_f32","geglu_quick.comp", {{"A_TYPE", "float"},       {"D_TYPE", "float"}});
 
     string_to_spv("silu_back_f32",  "silu_back.comp",   {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}});
+    string_to_spv("geglu_back_f32", "geglu_back.comp",  {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}});
 
     string_to_spv("cross_entropy_loss_masked_back_f32", "cross_entropy_loss_masked_back.comp", {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"C_TYPE", "float"}, {"D_TYPE", "float"}, {"E_TYPE", "float"}});
     string_to_spv("count_equal_masked_i32", "count_equal_masked.comp", {{"A_TYPE", "int"}, {"B_TYPE", "int"}, {"C_TYPE", "float"}, {"D_TYPE", "int64_t"}});
