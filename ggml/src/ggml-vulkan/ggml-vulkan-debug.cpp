@@ -1037,6 +1037,8 @@ void ggml_vk_check_results_0(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph
             tensor_clone = ggml_rms_norm_back(ggml_ctx, src_clone[0], src_clone[1], eps);
         } else if (tensor->op == GGML_OP_SILU_BACK) {
             tensor_clone = ggml_silu_back(ggml_ctx, src_clone[0], src_clone[1]);
+        } else if (tensor->op == GGML_OP_GEGLU_BACK) {
+            tensor_clone = ggml_geglu_back(ggml_ctx, src_clone[0], src_clone[1]);
         } else if (tensor->op == GGML_OP_L2_NORM) {
             const float eps = ((float *) tensor->op_params)[0];
             tensor_clone = ggml_l2_norm(ggml_ctx, src_clone[0], eps);
