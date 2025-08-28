@@ -83,6 +83,9 @@ option(LLAMA_BUILD_TOOLS    "llama: build tools"          ${LLAMA_STANDALONE})
 option(LLAMA_BUILD_EXAMPLES "llama: build examples"       ${LLAMA_STANDALONE})
 option(LLAMA_BUILD_SERVER   "llama: build server example" ${LLAMA_STANDALONE})
 
+# specific extras
+option(LLAMA_MTMD "llama: multimodal support" OFF)
+
 # 3rd party libs
 option(LLAMA_CURL       "llama: use libcurl to download model from an URL" ON)
 option(LLAMA_LLGUIDANCE "llama-common: include LLGuidance library for structured output in common utils" OFF)
@@ -212,6 +215,10 @@ if (LLAMA_BUILD_COMMON AND LLAMA_BUILD_TOOLS)
     add_subdirectory(tools)
 endif()
 
+if (LLAMA_MTMD)
+  add_subdirectory(tools/mtmd)
+endif()
+
 #
 # install
 #
@@ -247,7 +254,7 @@ if (LLAMA_BUILD_COMMON)
 
 endif()
 
-if (LLAMA_BUILD_TOOLS)
+if (LLAMA_MTMD)
 
   install(
     TARGETS mtmd
