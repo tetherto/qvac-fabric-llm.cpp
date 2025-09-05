@@ -434,6 +434,30 @@ vec4 dequantize4(uint ib, uint iqs, uint a_offset) {
 }
 #endif
 
+#if defined(DATA_A_TQ2_0)
+// TQ2_0 ternary dequantization: {0,1,2} -> {-1,0,+1} via (q-1) mapping
+vec2 dequantize(uint ib, uint iqs, uint a_offset) {
+    const uint vui = uint(data_a[a_offset + ib].qs[iqs]);
+    const uint c0 = (vui >> 0) & 3;
+    const uint c1 = (vui >> 2) & 3;
+    const float q0 = float(c0) - 1.0f;
+    const float q1 = float(c1) - 1.0f;
+    return vec2(q0, q1);
+}
+vec4 dequantize4(uint ib, uint iqs, uint a_offset) {
+    const uint vui = uint(data_a[a_offset + ib].qs[iqs]);
+    const uint c0 = (vui >> 0) & 3;
+    const uint c1 = (vui >> 2) & 3;
+    const uint c2 = (vui >> 4) & 3;
+    const uint c3 = (vui >> 6) & 3;
+    const float q0 = float(c0) - 1.0f;
+    const float q1 = float(c1) - 1.0f;
+    const float q2 = float(c2) - 1.0f;
+    const float q3 = float(c3) - 1.0f;
+    return vec4(q0, q1, q2, q3);
+}
+#endif
+
 #if defined(DATA_A_F32) || defined(DATA_A_F16) || defined(DATA_A_BF16)
 vec2 get_dm(uint ib, uint a_offset) {
     return vec2(0, 0);
@@ -449,7 +473,7 @@ vec2 get_dm(uint ib, uint a_offset) {
 }
 #endif
 
-#if defined(DATA_A_Q4_0) || defined(DATA_A_Q5_0) || defined(DATA_A_Q8_0) || defined(DATA_A_IQ1_S) || defined(DATA_A_IQ2_XXS) || defined(DATA_A_IQ2_XS) || defined(DATA_A_IQ2_S) || defined(DATA_A_IQ3_XXS) || defined(DATA_A_IQ3_S) || defined(DATA_A_IQ4_XS) || defined(DATA_A_IQ4_NL)
+#if defined(DATA_A_Q4_0) || defined(DATA_A_Q5_0) || defined(DATA_A_Q8_0) || defined(DATA_A_TQ2_0) || defined(DATA_A_IQ1_S) || defined(DATA_A_IQ2_XXS) || defined(DATA_A_IQ2_XS) || defined(DATA_A_IQ2_S) || defined(DATA_A_IQ3_XXS) || defined(DATA_A_IQ3_S) || defined(DATA_A_IQ4_XS) || defined(DATA_A_IQ4_NL)
 vec2 get_dm(uint ib, uint a_offset) {
     return vec2(float(data_a[a_offset + ib].d), 0);
 }
