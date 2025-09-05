@@ -1,0 +1,66 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types : require
+
+#include "mul_mat_vec_base.glsl"
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+FLOAT_TYPE temp[NUM_COLS][NUM_ROWS];
+
+void compute_outputs(const uint32_t first_row, const uint32_t num_rows) {
+    uint a_offset, b_offset, d_offset;
+    get_offsets(a_offset, b_offset, d_offset);
+
+    const uint num_blocks_per_row = p.ncols / QUANT_K;
+
+    const uint tid = gl_LocalInvocationID.x;
+
+    [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+        [[unroll]] for (uint i = 0; i < NUM_ROWS; ++i) {
+            temp[j][i] = FLOAT_TYPE(0);
+        }
+    }
+
+    [[unroll]] for (uint i = tid; i < num_blocks_per_row; i += gl_WorkGroupSize.x) {
+
+        [[unroll]] for (uint n = 0; n < num_rows; ++n) {
+            const uint ib0 = a_offset / QUANT_K + (first_row + n) * num_blocks_per_row;
+            const float d = float(data_a[ib0 + i].d);
+            
+            [[unroll]] for (uint j = 0; j < 64; j += 32) {
+                [[unroll]] for (uint l = 0; l < 4; ++l) {
+                    [[unroll]] for (uint k = 0; k < 32; ++k) {
+                        // Extract quantized value: ((x[i].qs[j + k] >> (l*2)) & 3) - 1
+                        const uint q_byte = uint(data_a[ib0 + i].qs[j + k]);
+                        const uint shift = l * 2;
+                        const uint q = (q_byte >> shift) & 3;
+                        const FLOAT_TYPE dequant_val = FLOAT_TYPE(d * (float(q) - 1.0f));  // CPU kernel: (q-1)*d
+                        
+                        // y-data access pattern: y[i].qs[j*4 + l*32 + k]
+                        const uint b_idx = i * QUANT_K + j * 4 + l * 32 + k;
+                        if (b_idx < p.ncols) {
+                            [[unroll]] for (uint jcol = 0; jcol < NUM_COLS; ++jcol) {
+                                temp[jcol][n] += dequant_val * FLOAT_TYPE(data_b[jcol * p.batch_stride_b + b_offset + b_idx]);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    reduce_result(temp, d_offset, first_row, num_rows, tid);
+}
+
+void main() {
+    const uint first_row = NUM_ROWS * (gl_WorkGroupID.x + gl_NumWorkGroups.x * gl_WorkGroupID.z);
+
+    if (first_row + NUM_ROWS <= p.stride_d) {
+        compute_outputs(first_row, NUM_ROWS);
+    } else {
+        if (first_row >= p.stride_d) {
+            return;
+        }
+        compute_outputs(first_row, p.stride_d - first_row);
+    }
+}
