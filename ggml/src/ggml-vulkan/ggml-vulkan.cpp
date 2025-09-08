@@ -16601,42 +16601,12 @@ void vk_perf_logger::print_timings(bool force) {
         return;
     }
     print_count = 0;
-    std::stringstream ss;
-    uint64_t total_all_op_times = 0;
-    ss << "----------------\nVulkan Timings:" << std::endl;
-    for (const auto & t : timings) {
-        uint64_t total_op_times = 0;
-        for (const auto & time : t.second) {
-            total_op_times += time;
-        }
-        ss << t.first << ": " << t.second.size() << " x " << (total_op_times / t.second.size() / 1000.0)
-                  << " us = " << (total_op_times / 1000.0) << " us";
-
-        // If we have as many flops entries as timing entries for the op, then compute and log the flops/S.
-        auto it = flops.find(t.first);
-        if (it != flops.end() && (it->second).size() == t.second.size()) {
-            uint64_t total_op_flops = 0;
-            for (const auto & elem : it->second) {
-                total_op_flops += elem;
-            }
-            ss << " ("
-                      << (double(total_op_flops) / (1000.0 * 1000.0 * 1000.0)) /
-                             (double(total_op_times) / (1000.0 * 1000.0 * 1000.0))
-                      << " GFLOPS/s)";
-        }
-
-        total_all_op_times += total_op_times;
-
-        ss << std::endl;
-    }
-
-    if (timings.size() > 0) {
-        ss << "Total time: " << total_all_op_times / 1000.0 << " us." << std::endl;
-    }
-    auto ssStr = ss.str();
-    GGML_LOG_DEBUG("%s", ssStr.c_str());
+    GGML_LOG_DEBUG("================\nVulkan Profiling Results:\n================\n\n");
+    print_legacy_timings();
+    print_triplet_timings();
     timings.clear();
     flops.clear();
+    triplet_timings.clear();
 }
 
 std::string vk_perf_logger::get_node_fusion_name(const ggml_tensor * node, const char *fusion_name, uint64_t *n_flops) {
