@@ -381,6 +381,10 @@ install(FILES ${CMAKE_CURRENT_BINARY_DIR}/llama-config.cmake
               ${CMAKE_CURRENT_BINARY_DIR}/llama-config-version.cmake
         DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/llama)
 
+install(
+    PROGRAMS vulkan_profiling_analyzer.py
+    DESTINATION ${CMAKE_INSTALL_BINDIR})
+
 configure_file(cmake/llama.pc.in
         "${CMAKE_CURRENT_BINARY_DIR}/llama.pc"
         @ONLY)
