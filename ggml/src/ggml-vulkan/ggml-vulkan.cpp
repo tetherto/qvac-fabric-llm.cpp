@@ -239,6 +239,17 @@ enum FaHeadSizes {
     FA_HEAD_SIZE_COUNT = FA_HEAD_SIZE_UNSUPPORTED,
 };
 
+// XXX: Use value queried from the driver
+#if 0
+const uint64_t MAX_ADDRESS_SPACE_SIZE = 1 << 27;
+const uint64_t MAX_ADDRESS_SPACE_SIZE_MUL_MAT = 1 << 27;
+const uint64_t MAX_ADDRESS_SPACE_SIZE_OUT_PROD = 1 << 27;
+#else
+const uint64_t MAX_ADDRESS_SPACE_SIZE = 1 << 27;
+const uint64_t MAX_ADDRESS_SPACE_SIZE_MUL_MAT = 1 << 27;
+const uint64_t MAX_ADDRESS_SPACE_SIZE_OUT_PROD = 1 << 27;
+#endif
+
 static vk_device_architecture get_device_architecture(const vk::PhysicalDevice& device) {
     vk::PhysicalDeviceProperties props = device.getProperties();
 
@@ -1026,7 +1037,10 @@ struct ggml_backend_vk_context {
     size_t semaphore_idx, event_idx;
     ggml_vk_garbage_collector gc;
     size_t prealloc_size_x, prealloc_size_y, prealloc_size_split_k;
+    size_t prealloc_size_tile;
     vk_buffer prealloc_x, prealloc_y, prealloc_split_k;
+    vk_buffer prealloc_tile;
+    vk_buffer prealloc_tile_debug;
     vk::Fence fence, almost_ready_fence;
     bool almost_ready_fence_pending {};
 
@@ -1243,11 +1257,13 @@ static void ggml_vk_create_pipeline_func(vk_device& device, vk_pipeline& pipelin
 
     vk::PipelineRobustnessCreateInfoEXT rci;
 
+#if 1
     if (device->pipeline_robustness && disable_robustness) {
         rci.storageBuffers = vk::PipelineRobustnessBufferBehaviorEXT::eDisabled;
         rci.uniformBuffers = vk::PipelineRobustnessBufferBehaviorEXT::eDisabled;
         compute_pipeline_create_info.setPNext(&rci);
     }
+#endif
 
     try {
         pipeline->pipeline = device->device.createComputePipeline(VK_NULL_HANDLE, compute_pipeline_create_info).value;
@@ -1541,7 +1557,8 @@ static void ggml_vk_command_pool_cleanup(vk_device& device, vk_command_pool& p) 
     VK_LOG_DEBUG("ggml_vk_command_pool_cleanup()");
 
     // Requires command buffers to be done
-    device->device.resetCommandPool(p.pool);
+    device->device.resetCommandPool(p.pool, vk::CommandPoolResetFlagBits::eReleaseResources);
+    
     p.cmd_buffer_idx = 0;
 }
 
@@ -1665,6 +1682,7 @@ static vk_buffer ggml_vk_create_buffer_check(vk_device& device, size_t size, vk:
 }
 
 static vk_buffer ggml_vk_create_buffer_device(vk_device& device, size_t size) {
+    VK_LOG_MEMORY("ggml_vk_create_buffer_device(" << size << ")");
     vk_buffer buf;
     try {
         if (device->prefer_host_memory) {
@@ -3559,10 +3577,10 @@ static vk_device ggml_vk_get_device(size_t idx) {
                 break;
 #endif
             default:
-                device->mul_mat_l[i] = true;
+                device->mul_mat_l[i] = false;
                 device->mul_mat_m[i] = true;
                 device->mul_mat_s[i] = true;
-                device->mul_mat_id_l[i] = true;
+                device->mul_mat_id_l[i] = false;
                 device->mul_mat_id_m[i] = true;
                 device->mul_mat_id_s[i] = true;
                 break;
@@ -3973,6 +3991,7 @@ static void ggml_vk_init(ggml_backend_vk_context * ctx, size_t idx) {
     ctx->prealloc_size_x = 0;
     ctx->prealloc_size_y = 0;
     ctx->prealloc_size_split_k = 0;
+    ctx->prealloc_size_tile = 0;
 
     ctx->fence = ctx->device->device.createFence({});
     ctx->almost_ready_fence = ctx->device->device.createFence({});
@@ -4752,7 +4771,7 @@ static void ggml_vk_buffer_read(vk_buffer& src, size_t offset, void * dst, size_
 }
 
 static void ggml_vk_buffer_copy_async(vk_context& ctx, vk_buffer& dst, size_t dst_offset, vk_buffer& src, size_t src_offset, size_t size) {
-    VK_LOG_DEBUG("ggml_vk_buffer_copy_async(" << size << ")");
+    VK_LOG_DEBUG("ggml_vk_buffer_copy_async(" << "dst=" << dst << ", dst_offset=" << dst_offset << ", dst_size=" << dst->size << ", src=" << src << ", src_offset=" << src_offset << ", src_size=" << src->size << ", copy_size=" << size << ")");
     // Make sure both buffers are on same device
     GGML_ASSERT(src->device == dst->device);
 
@@ -4762,6 +4781,10 @@ static void ggml_vk_buffer_copy_async(vk_context& ctx, vk_buffer& dst, size_t ds
 }
 
 static void ggml_vk_buffer_copy(vk_buffer& dst, size_t dst_offset, vk_buffer& src, size_t src_offset, size_t size) {
+#if 0
+    std::cerr << "ggml_vk_buffer(" << dst << "dst=" << dst << ", dst_offset=" << dst_offset << ", src="
+              << src << ", src_offset=" << src_offset << ", size=" << size << ")" << std::endl;
+#endif
     if (src->device == dst->device) {
         std::lock_guard<std::recursive_mutex> guard(src->device->mutex);
         VK_LOG_DEBUG("ggml_vk_buffer_copy(SINGLE_DEVICE, " << size << ")");
@@ -4877,7 +4900,7 @@ static void ggml_vk_matmul(
         uint32_t batch_stride_a, uint32_t batch_stride_b, uint32_t batch_stride_d,
         uint32_t split_k, uint32_t batch, uint32_t ne02, uint32_t ne12, uint32_t broadcast2, uint32_t broadcast3,
         uint32_t padded_n) {
-        VK_LOG_DEBUG("ggml_vk_matmul(a: (" << a.buffer->buffer << ", " << a.offset << ", " << a.size << "), b: (" << b.buffer->buffer << ", " << b.offset << ", " << b.size << "), d: (" << d.buffer->buffer << ", " << d.offset << ", " << d.size << "), split_k: (" << (split_k_buffer.buffer != nullptr ? split_k_buffer.buffer->buffer : VK_NULL_HANDLE) << ", " << split_k_buffer.offset << ", " << split_k_buffer.size << "), m: " << m << ", n: " << n << ", k: " << k << ", stride_a: " << stride_a << ", stride_b: " << stride_b << ", stride_d: " << stride_d << ", batch_stride_a: " << batch_stride_a << ", batch_stride_b: " << batch_stride_b << ", batch_stride_d: " << batch_stride_d << ", split_k: " << split_k << ", batch: " << batch << ", ne02: " << ne02 << ", ne12: " << ne12 << ", broadcast2: " << broadcast2 << ", broadcast3: " << broadcast3 << ", padded_n: " << padded_n << ")");
+    VK_LOG_DEBUG("ggml_vk_matmul(a: (" << a.buffer->buffer << ", " << a.offset << ", " << a.size << "), b: (" << b.buffer->buffer << ", " << b.offset << ", " << b.size << "), d: (" << d.buffer->buffer << ", " << d.offset << ", " << d.size << "), split_k: (" << (split_k_buffer.buffer != nullptr ? split_k_buffer.buffer->buffer : VK_NULL_HANDLE) << ", " << split_k_buffer.offset << ", " << split_k_buffer.size << "), m: " << m << ", n: " << n << ", k: " << k << ", stride_a: " << stride_a << ", stride_b: " << stride_b << ", stride_d: " << stride_d << ", batch_stride_a: " << batch_stride_a << ", batch_stride_b: " << batch_stride_b << ", batch_stride_d: " << batch_stride_d << ", split_k: " << split_k << ", batch: " << batch << ", ne02: " << ne02 << ", ne12: " << ne12 << ", broadcast2: " << broadcast2 << ", broadcast3: " << broadcast3 << ", padded_n: " << padded_n << ")");
     ggml_vk_sync_buffers(subctx);
     if (split_k == 1) {
         const vk_mat_mat_push_constants pc = { m, n, k, stride_a, stride_b, stride_d, batch_stride_a, batch_stride_b, batch_stride_d, k, ne02, ne12, broadcast2, broadcast3, padded_n };
@@ -5091,6 +5114,142 @@ static void ggml_vk_quantize_q8_1(ggml_backend_vk_context * ctx, vk_context& sub
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { in, out }, std::array<uint32_t, 1>{ne}, { ne, 1, 1 });
 }
 
+// XXX: leave only this one, we dont need the other two functions
+static void ggml_vk_copy_2d_to_2d(vk_context& subctx, vk_buffer& dst, size_t dst_offset, vk_buffer& src, size_t src_offset, size_t width, size_t height, size_t spitch, size_t dpitch) {
+#if 1
+    VK_LOG_DEBUG("ggml_vk_copy_2d_to_2d(dst=" << dst << ", dst_offset=" << dst_offset
+            << ", src=" << src << ", src_offset=" << src_offset
+            << ", width=" << width << ", height=" << height
+            << ", spitch=" << spitch 
+            << ", dpitch=" << dpitch << ")");
+#endif
+
+    // XXX put this back in
+    std::lock_guard<std::recursive_mutex> guard(src->device->mutex);
+
+#if 1 // TEST
+    ggml_vk_ctx_end(subctx);
+    ggml_vk_submit(subctx, src->device->fence);
+    VK_CHECK(src->device->device.waitForFences({ src->device->fence }, true, UINT64_MAX), "vk wait");
+    src->device->device.resetFences({ src->device->fence });
+    ggml_vk_command_pool_cleanup(src->device, *subctx->p);
+    ggml_vk_ctx_begin(src->device, subctx);
+#endif
+    
+    // Copy within the device
+
+    VkMemoryBarrier memoryBarrier = {};
+    memoryBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+    memoryBarrier.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
+    memoryBarrier.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT;
+    
+    // XXX
+    vkCmdPipelineBarrier(subctx->s->buffer,
+        VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+        VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+        0,
+        1, &memoryBarrier,
+        0, NULL,
+        0, NULL
+    );
+
+    //int group_size = 1024;
+    int group_size = height;
+    int groups = CEIL_DIV(height, group_size);
+    // TODO: measure this
+    for (int i = 0; i < groups; i++) {
+        int group_height = std::min(group_size, (int) height - i * group_size);
+        std::vector<VkBufferCopy> copy_regions;
+        copy_regions.reserve(group_height);
+        // TODO: measure this
+        for (size_t row = i * group_size; row < i * group_size + group_height; ++row) {
+            size_t row_src_offset = src_offset + row * spitch;
+            size_t row_dst_offset = dst_offset + row * dpitch;
+
+            // Make sure both buffers are on same device
+            GGML_ASSERT(src->device == dst->device);
+
+            VkBufferCopy bc{ row_src_offset, row_dst_offset, width };
+            copy_regions.push_back(bc);
+        }
+        vkCmdCopyBuffer(subctx->s->buffer, (VkBuffer)src->buffer, (VkBuffer)dst->buffer, copy_regions.size(), copy_regions.data());
+    }
+
+    // XXX
+    vkCmdPipelineBarrier(subctx->s->buffer,
+        VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+        VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+        0,
+        1, &memoryBarrier,
+        0, NULL,
+        0, NULL
+    );
+
+#if 1 // TEST
+    ggml_vk_ctx_end(subctx);
+    ggml_vk_submit(subctx, src->device->fence);
+    VK_CHECK(src->device->device.waitForFences({ src->device->fence }, true, UINT64_MAX), "vk wait");
+    src->device->device.resetFences({ src->device->fence });
+    ggml_vk_command_pool_cleanup(src->device, *subctx->p);
+    ggml_vk_ctx_begin(src->device, subctx);
+#endif
+}
+
+// XXX: either specify that this is only for {a, b, d} ops, or make it work for ops with different # of srcs
+static uint64_t sum_buffer_sizes(uint64_t m, uint64_t n, uint64_t k, enum ggml_type m_type, enum ggml_type n_type, enum ggml_type d_type) {
+    uint64_t a_size = CEIL_DIV(m*k, ggml_blck_size(m_type)) * ggml_type_size(m_type);
+    uint64_t b_size = CEIL_DIV(n*k, ggml_blck_size(n_type)) * ggml_type_size(n_type);
+    uint64_t d_size = CEIL_DIV(m*n, ggml_blck_size(d_type)) * ggml_type_size(d_type);
+
+    return a_size + b_size + d_size;
+}
+
+// XXX: either specify that this is only for {a, b, d} ops, or make it work for ops with different # of srcs
+static void calculate_tile_dims(uint64_t m, uint64_t n, uint64_t k, uint64_t *tile_m, uint64_t *tile_n, uint64_t *m_tiles, uint64_t *n_tiles, uint64_t *num_dispatches, enum ggml_type m_type = GGML_TYPE_F32, enum ggml_type n_type = GGML_TYPE_F32, enum ggml_type d_type = GGML_TYPE_F32) {
+    // XXX minimum tile size
+    const uint64_t step = 32;
+
+    // Set starting tile size
+    uint64_t mt = std::min(step, m);
+    uint64_t nt = std::min(step, n);
+
+    // XXX The minimum tile size might be already too large (if it is, it's likely because of `k`)
+    GGML_ASSERT(sum_buffer_sizes(mt, nt, k, m_type, n_type, d_type) < MAX_ADDRESS_SPACE_SIZE);
+
+    while (nt < n || mt < m) {
+        bool nt_stopped = false;
+        bool mt_stopped = false;
+
+        if (nt < n) {
+            uint64_t next_nt = std::min(n, nt + step);
+            if (sum_buffer_sizes(mt, next_nt, k, m_type, n_type, d_type) < MAX_ADDRESS_SPACE_SIZE) {
+                nt = next_nt;
+            } else {
+                nt_stopped = true;
+            }
+        }
+
+        if (mt < m) {
+            uint64_t next_mt = std::min(m, mt + step);
+            if (sum_buffer_sizes(next_mt, nt, k, m_type, n_type, d_type) < MAX_ADDRESS_SPACE_SIZE) {
+                mt = next_mt;
+            } else {
+                mt_stopped = true;
+            }
+        }
+
+        if ((nt_stopped || nt >= n) && (mt_stopped || mt >= m)) {
+            break;
+        }
+    }
+
+    *tile_m = mt;
+    *tile_n = nt;
+    *m_tiles = CEIL_DIV(m, mt);
+    *n_tiles = CEIL_DIV(n, nt);
+    *num_dispatches = (*m_tiles) * (*n_tiles);
+}
+
 static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, bool dryrun = false) {
     VK_LOG_DEBUG("ggml_vk_mul_mat_q_f16((" << src0 << ", name=" << src0->name << ", type=" << ggml_type_name(src0->type) << ", ne0=" << src0->ne[0] << ", ne1=" << src0->ne[1] << ", ne2=" << src0->ne[2] << ", ne3=" << src0->ne[3] << ", nb0=" << src0->nb[0] << ", nb1=" << src0->nb[1] << ", nb2=" << src0->nb[2] << ", nb3=" << src0->nb[3];
     std::cerr << "), (" << src1 << ", name=" << src1->name << ", type=" << ggml_type_name(src1->type) << ", ne0=" << src1->ne[0] << ", ne1=" << src1->ne[1] << ", ne2=" << src1->ne[2] << ", ne3=" << src1->ne[3] << ", nb0=" << src1->nb[0] << ", nb1=" << src1->nb[1] << ", nb2=" << src1->nb[2] << ", nb3=" << src1->nb[3];
@@ -5111,6 +5270,8 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
 
     const uint64_t ne20 = dst->ne[0];
     const uint64_t ne21 = dst->ne[1];
+    const uint64_t ne22 = dst->ne[2];
+    const uint64_t ne23 = dst->ne[3];
 
     const uint64_t r2 = ne12 / ne02;
     const uint64_t r3 = ne13 / ne03;
@@ -5167,7 +5328,7 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
     }
 
     // Not implemented
-    GGML_ASSERT(y_non_contig || !qy_needs_dequant);  // NOLINT
+    GGML_ASSERT(y_non_contig || !qy_needs_dequant); // NOLINT
 
     const uint32_t kpad = quantize_y ? 0 : ggml_vk_align_size(ne10, ggml_vk_guess_matmul_pipeline_align(ctx, mmp, ne01, ne11, qx_needs_dequant ? f16_type : src0->type, quantize_y ? GGML_TYPE_Q8_1 : (y_f32_kernel ? GGML_TYPE_F32 : src1->type)));
     const bool aligned = !quantize_y && ne10 == kpad && ne01 > 8 && ne11 > 8;
@@ -5187,6 +5348,8 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
     const uint64_t x_sz = !qx_needs_dequant ? qx_sz : sizeof(ggml_fp16_t) * x_ne;
     const uint64_t y_sz = quantize_y ? (y_ne * ggml_type_size(GGML_TYPE_Q8_1) / ggml_blck_size(GGML_TYPE_Q8_1)) : (y_f32_kernel ? sizeof(float) * y_ne : sizeof(ggml_fp16_t) * y_ne);
     const uint64_t d_sz = sizeof(float) * d_ne;
+
+    const uint64_t d_buf_offset = vk_tensor_offset(dst) + dst->view_offs;
 
     vk_pipeline to_fp16_vk_0 = nullptr;
     vk_pipeline to_fp16_vk_1 = nullptr;
@@ -5209,10 +5372,118 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
         to_q8_1 = ggml_vk_get_quantize_pipeline(ctx, GGML_TYPE_Q8_1);
     }
 
+    // XXX: Cleanup
+    auto getenv_u32 = [](const char *name, uint32_t defval) -> uint32_t {
+        const char *v = getenv(name);
+        if (!v || !*v) return defval;
+        char *endp = nullptr;
+        unsigned long x = strtoul(v, &endp, 10);
+        if (endp == v) return defval;
+        if (x > 0xfffffffful) x = 0xfffffffful;
+        return (uint32_t)x;
+    };
+
+    // XXX: Cleanup.
+    uint32_t a_bytes_per_block, a_bytes_per_unit, a_elems_per_block;
+    if (qx_needs_dequant) {
+        a_bytes_per_block = (uint32_t) ggml_type_size(f16_type);
+        a_elems_per_block = (uint32_t) ggml_blck_size(f16_type);
+        a_bytes_per_unit = (uint32_t) a_bytes_per_block / a_elems_per_block;
+    } else {
+        a_bytes_per_block = (uint32_t) ggml_type_size(src0->type);
+        a_elems_per_block = (uint32_t) ggml_blck_size(src0->type);
+        a_bytes_per_unit = (uint32_t) a_bytes_per_block / a_elems_per_block;
+    }
+
+    uint32_t b_bytes_per_block, b_bytes_per_unit, b_elems_per_block;
+    if (quantize_y) {
+        b_bytes_per_block = ggml_type_size(GGML_TYPE_Q8_1);
+        b_elems_per_block = ggml_blck_size(GGML_TYPE_Q8_1);
+        b_bytes_per_unit = b_bytes_per_block / b_elems_per_block;
+    } else if (y_f32_kernel) {
+        b_bytes_per_block = ggml_type_size(GGML_TYPE_F32);
+        b_elems_per_block = ggml_blck_size(GGML_TYPE_F32);
+        b_bytes_per_unit = b_bytes_per_block / b_elems_per_block;
+    } else if (qy_needs_dequant) {
+        b_bytes_per_block = ggml_type_size(f16_type);
+        b_elems_per_block = ggml_blck_size(f16_type);
+        b_bytes_per_unit = b_bytes_per_block / b_elems_per_block;
+    } else {
+        b_bytes_per_block = ggml_type_size(src1->type);
+        b_elems_per_block = ggml_blck_size(src1->type);
+        b_bytes_per_unit = b_bytes_per_block / b_elems_per_block;
+    }
+
+    uint32_t d_bytes_per_block, d_bytes_per_unit, d_elems_per_block;
+    d_bytes_per_block = ggml_type_size(GGML_TYPE_F32);
+    d_elems_per_block = ggml_blck_size(GGML_TYPE_F32);
+    d_bytes_per_unit = d_bytes_per_block / d_elems_per_block;
+
+    // XXX
+    const uint64_t tiling_threshold = MAX_ADDRESS_SPACE_SIZE_MUL_MAT;
+
+    // XXX: Cleanup.
+    const bool tiling_debug = getenv_u32("GGML_TILING_DEBUG", 0);
+    const bool tiling_enabled = getenv_u32("GGML_TILING_ENABLE", 0);
+
+    // XXX: Cleanup.
+    bool do_tiling =
+        ne02 == 1 && ne03 == 1 && ne12 == 1 && ne13 == 1 && // XXX: DEBUG
+        tiling_enabled &&
+#if 0
+        ((vk_tensor_offset(src0) + src0->view_offs + x_sz * ne02 * ne03) >= tiling_threshold ||
+         (vk_tensor_offset(src1) + src1->view_offs + y_sz * ne12 * ne13) >= tiling_threshold ||
+         (d_buf_offset + d_sz * ne12 * ne13) >= tiling_threshold);
+#else
+        (x_sz * ne02 * ne03 + y_sz * ne12 * ne13 +
+         d_sz * ne12 * ne13 >= tiling_threshold);
+#endif
+
+    // XXX
+    bool do_splitting = false;
+#if 0
+    if (do_tiling && (x_sz * ne02 * ne03) + (y_sz * ne12 * ne13) + (d_sz * ne12 * ne13) < tiling_threshold) {
+        do_splitting = true;
+        do_tiling = false;
+    }
+#endif
+    if (do_splitting && tiling_debug) {
+        fprintf(stderr, "[VK] [MUL_MAT] [SPLITTING] (total sum %lu + %lu + %lu) >= %lu\n", (x_sz * ne02 * ne03), (y_sz * ne12 * ne13), (d_sz * ne12 * ne13), tiling_threshold);
+    }
+
+    uint64_t tile_m = 0, tile_n = 0;
+    uint64_t m_tiles = 0, n_tiles = 0;
+    uint64_t num_dispatches = 0;
+    if (do_tiling) {
+        // XXX
+        GGML_ASSERT(ne02 == 1);
+        GGML_ASSERT(ne03 == 1);
+        GGML_ASSERT(ne12 == 1);
+        GGML_ASSERT(ne13 == 1);
+
+        calculate_tile_dims(ne01, ne11, ne00, &tile_m, &tile_n, &m_tiles, &n_tiles, &num_dispatches);
+        if (tiling_debug) {
+            fprintf(stderr, "[VK] [TILING] tile_m=%lu, tile_n=%lu, m_tiles=%lu, n_tiles=%lu, num_dispatches=%lu\n", tile_m, tile_n, m_tiles, n_tiles, num_dispatches);
+        }
+    }
+
     if (dryrun) {
+        // XXX: Cleanup
+        // Allocate buffers for tiling (for buffers that are too large to bind fully)
+        if (do_splitting || do_tiling) {
+            ctx->prealloc_size_tile = MAX_ADDRESS_SPACE_SIZE;
+        }
+
+        if (do_tiling) {
+            ggml_pipeline_request_descriptor_sets(ctx, pipeline, num_dispatches);
+        } else {
+            ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+        }
+
         const uint64_t x_sz_upd = x_sz * ne02 * ne03;
         const uint64_t y_sz_upd = y_sz * ne12 * ne13;
         const uint64_t split_k_size = split_k > 1 ? d_sz * ne12 * ne13 * split_k : 0;
+        GGML_ASSERT(split_k <= 1);
         if (
                 (qx_needs_dequant && x_sz_upd > ctx->device->max_memory_allocation_size) ||
                 (qy_needs_dequant && y_sz_upd > ctx->device->max_memory_allocation_size) ||
@@ -5229,8 +5500,6 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
             ctx->prealloc_size_split_k = split_k_size;
         }
 
-        // Request descriptor sets
-        ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
         if (qx_needs_dequant) {
             ggml_pipeline_request_descriptor_sets(ctx, to_fp16_vk_0, 1);
         }
@@ -5240,6 +5509,8 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
         if (quantize_y) {
             ggml_pipeline_request_descriptor_sets(ctx, to_q8_1, 1);
         }
+        // XXX: TODO: test split_k
+        // XXX: TODO: maybe add !do_splitting here as well
         if (split_k > 1) {
             ggml_pipeline_request_descriptor_sets(ctx, ctx->device->pipeline_matmul_split_k_reduce, 1);
         }
@@ -5247,7 +5518,6 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
     }
 
     vk_buffer d_D = dst_buf_ctx->dev_buffer;
-    const uint64_t d_buf_offset = vk_tensor_offset(dst) + dst->view_offs;
     GGML_ASSERT(d_D != nullptr);
     GGML_ASSERT(d_D->size >= d_buf_offset + d_sz * ne02 * ne03);
     vk_buffer d_X;
@@ -5309,15 +5579,232 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
         stride_batch_y = src1->nb[0] / ggml_type_size(src1->type);
     }
 
-    // compute
-    ggml_vk_matmul(
-        ctx, subctx, pipeline,
-        { d_X, x_buf_offset, x_sz * ne02 * ne03 }, { d_Y, y_buf_offset, y_sz * ne12 * ne13 },
-        { d_D, d_buf_offset, d_sz * ne12 * ne13 }, { ctx->prealloc_split_k, 0, d_sz * ne12 * ne13 * split_k },
-        ne01, ne11, ne10,
-        ne10, ne10, ne01, stride_batch_x, stride_batch_y, ne20*ne21,
-        split_k, ne12*ne13, ne02, ne12, r2, r3, padded_n
-    );  // NOLINT
+    if (!do_tiling && !do_splitting) {
+        ggml_vk_matmul(
+            ctx, subctx, pipeline,
+            { d_X, x_buf_offset, x_sz * ne02 * ne03 }, { d_Y, y_buf_offset, y_sz * ne12 * ne13 },
+            { d_D, d_buf_offset, d_sz * ne12 * ne13 }, { ctx->prealloc_split_k, 0, d_sz * ne12 * ne13 * split_k },
+            ne01, ne11, ne10,
+            ne10, ne10, ne01, stride_batch_x, stride_batch_y, ne20*ne21,
+            split_k, ne12*ne13, ne02, ne12, r2, r3, padded_n
+        );
+    } else if (do_splitting) {
+        if (tiling_debug) {
+            std::cerr << "[VK] splitting!!" << std::endl;
+        }
+        GGML_ASSERT(false);
+
+        const uint64_t a_size = x_sz * ne02 * ne03;
+        const uint64_t b_size = y_sz * ne12 * ne13;
+        const uint64_t d_size = d_sz * ne12 * ne13;
+        const uint64_t a_off = 0;
+        const uint64_t b_off = a_size;
+        const uint64_t d_off = a_size + b_size;
+        ggml_vk_copy_2d_to_2d(subctx, ctx->prealloc_tile, 0, d_X, x_buf_offset, a_size, 1, 1, 1);
+        ggml_vk_copy_2d_to_2d(subctx, ctx->prealloc_tile, b_off, d_Y, y_buf_offset, b_size, 1, 1, 1);
+
+        // XXX TODO: account for split_k in the total buffer size sum??
+        GGML_ASSERT(split_k <= 1);
+
+#if 0
+        vk_context splitctx = ggml_vk_create_temporary_context(ctx->device->transfer_queue.cmd_pool);
+        ggml_vk_ctx_begin(ctx->device, splitctx);
+
+        ggml_vk_begin_submission(ctx->device, *splitctx->p);
+
+        ggml_vk_matmul(
+            ctx, splitctx, pipeline,
+            { ctx->prealloc_tile, 0, a_size }, { ctx->prealloc_tile, b_off, b_size },
+            { ctx->prealloc_tile, d_off, d_size }, { nullptr, 0, 0 },
+            ne01, ne11, ne10,
+            ne10, ne10, ne01, stride_batch_x, stride_batch_y, ne20*ne21,
+            1u, ne12*ne13, ne02, ne12, r2, r3, padded_n
+        );
+
+        vk::SubmitInfo submit_info{};
+        submit_info.commandBufferCount = 1;
+        submit_info.pCommandBuffers = &splitctx->s->buffer;
+
+        ggml_vk_ctx_end(splitctx);
+
+        splitctx->p->q->queue.submit(submit_info, ctx->matmul_fence);
+
+        VK_CHECK(ctx->device->device.waitForFences({ ctx->matmul_fence }, true, UINT64_MAX), "matmul_fence");
+        ctx->device->device.resetFences({ ctx->matmul_fence });
+
+        ggml_vk_copy_2d_to_2d(subctx, d_D, d_buf_offset, ctx->prealloc_tile, d_off, d_size, 1, 1, 1);
+#endif
+    } else { // tiling
+        GGML_ASSERT(ne02 == 1);
+        GGML_ASSERT(ne03 == 1);
+        GGML_ASSERT(ne12 == 1);
+        GGML_ASSERT(ne13 == 1);
+
+        // XXX TODO: account for split_k in the total buffer size sum??
+        GGML_ASSERT(split_k <= 1);
+
+        // XXX which value to use? is 1 good enough?
+        const uint32_t align = 1;
+#if 0
+        const uint32_t off_align = 256;
+#else
+        const uint32_t off_align = 1;
+#endif
+
+        if (tiling_debug) {
+            std::cerr << "[VK] mul_mat tiled: M=" << ne01 << " N=" << ne11 << " K=" << ne10 << " tile_m=" << tile_m << " tile_n=" << tile_n << " batches=" << (ne12*ne13) << " split_k=1" << std::endl;
+        }
+
+        // XXX make it work for n12 > 1
+        for (uint32_t n0 = 0; n0 < ne11; n0 += tile_n) {
+            const uint32_t nt = (uint32_t) std::min(tile_n, ne11 - n0);
+            // XXX I think these shouldn't have CEIL_DIV
+            const uint64_t b_off_bytes = y_buf_offset + CEIL_DIV(((uint64_t)n0 * (uint64_t)ne10), b_elems_per_block) * (uint64_t)b_bytes_per_block;
+            const uint64_t d_off_bytes_n = d_buf_offset + CEIL_DIV(((uint64_t)n0 * (uint64_t)ne20), d_elems_per_block) * (uint64_t)d_bytes_per_block;
+
+            // How many are safe to read within the current n-tile.
+            // XXX
+#if 1
+            const uint32_t padded_n_tile = 0;
+#else
+            const uint32_t padded_n_tile = nt;
+#endif
+
+            // XXX make it work for n02 > 1
+            for (uint32_t m0 = 0; m0 < ne01; m0 += tile_m) {
+                const uint32_t mt = (uint32_t) std::min(tile_m, ne01 - m0);
+                // XXX I think these shouldn't have CEIL_DIV
+                const uint64_t a_off_bytes = x_buf_offset + CEIL_DIV(((uint64_t)m0 * (uint64_t)ne00), a_elems_per_block) * (uint64_t)a_bytes_per_block;
+                const uint64_t d_off_bytes = d_off_bytes_n + CEIL_DIV((uint64_t)m0, d_elems_per_block) * (uint64_t)d_bytes_per_block;
+
+                if (tiling_debug) {
+                    std::cerr << "[VK]  tile m=[" << m0 << "," << (m0+mt) << ") n=[" << n0 << "," << (n0+nt) << ") padded_n_tile=" << padded_n_tile << std::endl;
+                }
+
+                const uint64_t a_k_bytes = CEIL_DIV(ne00, a_elems_per_block) * a_bytes_per_block;
+                const uint64_t b_k_bytes = CEIL_DIV(ne10, b_elems_per_block) * b_bytes_per_block;
+                const uint64_t orig_stride_a_bytes = a_k_bytes;
+                const uint64_t orig_stride_b_bytes = b_k_bytes;
+                const uint64_t orig_stride_d_bytes = CEIL_DIV(ne20, d_elems_per_block) * d_bytes_per_block;
+                const uint64_t tile_stride_a_bytes = ggml_vk_align_size(orig_stride_a_bytes, align);
+                const uint64_t tile_stride_b_bytes = ggml_vk_align_size(orig_stride_b_bytes, align);
+                const uint64_t tile_stride_d_bytes = ggml_vk_align_size(CEIL_DIV(mt, d_elems_per_block) * d_bytes_per_block, align);
+
+                const uint32_t tile_stride_a_elems = (tile_stride_a_bytes / a_bytes_per_block) * a_elems_per_block;
+                const uint32_t tile_stride_b_elems = (tile_stride_b_bytes / b_bytes_per_block) * b_elems_per_block;
+                const uint32_t tile_stride_d_elems = (tile_stride_d_bytes / d_bytes_per_block) * d_elems_per_block;
+                const uint64_t dst_copy_row_size = CEIL_DIV(mt, d_elems_per_block) * d_bytes_per_block;
+
+                const uint64_t a_size_elems = tile_stride_a_elems * mt;
+                const uint64_t b_size_elems = tile_stride_b_elems * nt;
+                const uint64_t d_size_elems = tile_stride_d_elems * nt;
+
+                const uint64_t a_size_bytes = tile_stride_a_bytes * mt;
+                const uint64_t b_size_bytes = tile_stride_b_bytes * nt;
+                const uint64_t d_size_bytes = tile_stride_d_bytes * nt;
+#if 0
+                const uint64_t a_off = ggml_vk_align_size(a_off, off_align);
+                const uint64_t b_off = ggml_vk_align_size(a_off + a_size_bytes, off_align);
+                const uint64_t d_off = ggml_vk_align_size(b_off + b_size_bytes, off_align);
+#else
+                const uint64_t a_off = 0;
+                const uint64_t b_off = a_off + a_size_bytes;
+                const uint64_t d_off = b_off + b_size_bytes;
+#endif
+
+                GGML_ASSERT(a_size_bytes + b_size_bytes + d_size_bytes < MAX_ADDRESS_SPACE_SIZE_MUL_MAT);
+                GGML_ASSERT(d_off + d_size_bytes < MAX_ADDRESS_SPACE_SIZE_MUL_MAT);
+
+                //ggml_vk_sync_buffers(subctx);
+                
+                // XXX
+                VkMemoryBarrier memoryBarrier = {};
+                memoryBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+                memoryBarrier.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
+                memoryBarrier.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT;
+                
+                // XXX
+                vkCmdPipelineBarrier(subctx->s->buffer,
+                    VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                    VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                    0,
+                    1, &memoryBarrier,
+                    0, NULL,
+                    0, NULL
+                );
+
+                // Copy data to tile buffers
+                ggml_vk_sync_buffers(subctx);
+                ggml_vk_copy_2d_to_2d(subctx, ctx->prealloc_tile, a_off, d_X, a_off_bytes, a_k_bytes, mt, orig_stride_a_bytes, tile_stride_a_bytes);
+                ggml_vk_sync_buffers(subctx);
+                ggml_vk_copy_2d_to_2d(subctx, ctx->prealloc_tile, b_off, d_Y, b_off_bytes, b_k_bytes, nt, orig_stride_b_bytes, tile_stride_b_bytes);
+                ggml_vk_sync_buffers(subctx);
+
+                if (tiling_debug) {
+                    std::cerr << "[VK] "
+                        << " tile_stride_a_elems = " << tile_stride_a_elems << " | tile_stride_a_bytes = " << tile_stride_a_bytes << "\n"
+                        << " tile_stride_b_elems = " << tile_stride_b_elems << " | tile_stride_b_bytes = " << tile_stride_b_bytes << "\n"
+                        << " tile_stride_d_elems = " << tile_stride_d_elems << " | tile_stride_d_bytes = " << tile_stride_d_bytes << "\n"
+                        << " m = " << ne01 << " | n = " << ne11 << " | k = " << ne00 << "\n"
+                        << " mt = " << mt << " | nt = " << nt << " | kt = " << ne00 << "\n"
+                        << " a_orig_off = " << a_off_bytes << " | b_orig_off = " << b_off_bytes << " | d_orig_off = " << d_off_bytes << "\n"
+                        << " a_tile_off = " << a_off << " | b_tile_off = " << b_off << " | d_tile_off = " << d_off << "\n"
+                        << " a_tile_size = " << a_size_bytes << " | b_tile_size = " << b_size_bytes << " | d_tile_size = " << d_size_bytes << "\n"
+                        << " a_k_bytes = " << a_k_bytes << " | b_k_bytes = " << b_k_bytes << "\n"
+                        << " dst_copy_row_size = " << dst_copy_row_size << "\n"
+                        << std::endl;
+                }
+
+                // XXX
+                vkCmdPipelineBarrier(subctx->s->buffer,
+                    VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                    VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                    0,
+                    1, &memoryBarrier,
+                    0, NULL,
+                    0, NULL
+                );
+
+                // XXX
+                ggml_vk_matmul(
+                    ctx, subctx, pipeline,
+                    { ctx->prealloc_tile, a_off, a_size_bytes }, { ctx->prealloc_tile, b_off, b_size_bytes },
+                    { ctx->prealloc_tile, d_off, d_size_bytes }, { nullptr, 0, 0 },
+                    mt, nt, (uint32_t)ne00,
+                    tile_stride_a_elems, tile_stride_b_elems, tile_stride_d_elems,
+                    tile_stride_a_elems*mt, tile_stride_b_elems*nt, tile_stride_d_elems*nt,
+                    1u, (uint32_t)(ne12*ne13), (uint32_t)ne02, (uint32_t)ne12, (uint32_t)r2, (uint32_t)r3, padded_n_tile
+                );
+
+                // XXX
+                vkCmdPipelineBarrier(subctx->s->buffer,
+                    VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                    VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                    0,
+                    1, &memoryBarrier,
+                    0, NULL,
+                    0, NULL
+                );
+
+                ggml_vk_sync_buffers(subctx);
+
+                // Copy results back to dst buffer
+                ggml_vk_copy_2d_to_2d(subctx, d_D, d_off_bytes, ctx->prealloc_tile, d_off, dst_copy_row_size, nt, tile_stride_d_bytes, orig_stride_d_bytes);
+
+                ggml_vk_sync_buffers(subctx);
+
+                // XXX
+                vkCmdPipelineBarrier(subctx->s->buffer,
+                    VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                    VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                    0,
+                    1, &memoryBarrier,
+                    0, NULL,
+                    0, NULL
+                );
+            }
+        }
+    }
 }
 
 static void ggml_vk_mul_mat_vec_q_f16(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, bool dryrun = false) {
@@ -5379,7 +5866,7 @@ static void ggml_vk_mul_mat_vec_q_f16(ggml_backend_vk_context * ctx, vk_context&
     const bool qy_needs_dequant = (src1->type != GGML_TYPE_F16 && !f16_f32_kernel) || y_non_contig;
 
     // Not implemented
-    GGML_ASSERT(y_non_contig || !qy_needs_dequant);  // NOLINT
+    GGML_ASSERT(y_non_contig || !qy_needs_dequant); // NOLINT
 
     const uint64_t x_ne = ne01 * ne00;
     const uint64_t y_ne = ne11 * ne10;
@@ -6992,6 +7479,19 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
     const uint64_t ned3 = dst->ne[3];
     const uint64_t ned = ned0 * ned1;
 
+
+    // XXX: Cleanup
+    auto getenv_u32 = [](const char *name, uint32_t defval) -> uint32_t {
+        const char *v = getenv(name);
+        if (!v || !*v) return defval;
+        char *endp = nullptr;
+        unsigned long x = strtoul(v, &endp, 10);
+        if (endp == v) return defval;
+        if (x > 0xfffffffful) x = 0xfffffffful;
+        return (uint32_t)x;
+    };
+
+
     init_pushconst_fastdiv(pc);
 
     vk_pipeline pipeline = ggml_vk_op_get_pipeline(ctx, src0, src1, src2, dst, op);
@@ -7006,6 +7506,9 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
     }
 
     if (dryrun) {
+        // XXX should've been short-circuited in build_graph()
+        GGML_ASSERT(op != GGML_OP_OUT_PROD);
+
         ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
         return;
     }
@@ -7077,6 +7580,7 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
     z_buf_offset &= ~(ctx->device->properties.limits.minStorageBufferOffsetAlignment - 1);
     d_buf_offset &= ~(ctx->device->properties.limits.minStorageBufferOffsetAlignment - 1);
 
+    // XXX: should we worry about incontiguous?
     if (op_supports_incontiguous) {
         x_sz = ggml_nbytes(src0);
         y_sz = use_src1 ? ggml_nbytes(src1) : 0;
@@ -7101,6 +7605,72 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
 
     // Single call if dimension 2 is contiguous
     GGML_ASSERT(op_supports_incontiguous || (ggml_is_contiguous(src0) && (src1 == nullptr || ggml_is_contiguous(src1))));
+
+
+    // XXX: Cleanup.
+    // XXX: TODO: be aware of integer division, and where this is used
+    // XXX: TODO: make this work for use_src2 ops and for !use_src1 ops
+    uint32_t a_bytes_per_block, a_bytes_per_unit, a_elems_per_block;
+    a_bytes_per_block = (uint32_t) ggml_type_size(src0->type);
+    a_elems_per_block = (uint32_t) ggml_blck_size(src0->type);
+    a_bytes_per_unit = (uint32_t) a_bytes_per_block / a_elems_per_block;
+
+    uint32_t b_bytes_per_block = 0, b_bytes_per_unit = 0, b_elems_per_block = 0;
+    if (use_src1) {
+        b_bytes_per_block = ggml_type_size(src1->type);
+        b_elems_per_block = ggml_blck_size(src1->type);
+        b_bytes_per_unit = b_bytes_per_block / b_elems_per_block;
+    }
+
+    uint32_t d_bytes_per_block, d_bytes_per_unit, d_elems_per_block;
+    d_bytes_per_block = ggml_type_size(dst->type);
+    d_elems_per_block = ggml_blck_size(dst->type);
+    d_bytes_per_unit = d_bytes_per_block / d_elems_per_block;
+
+    const uint64_t tiling_threshold = MAX_ADDRESS_SPACE_SIZE_OUT_PROD;
+
+    // XXX: Cleanup.
+    const bool tiling_debug = getenv_u32("GGML_TILING_DEBUG", 0);
+    const bool tiling_enabled = getenv_u32("GGML_TILING_ENABLE", 0);
+
+    // XXX: Cleanup.
+    bool do_tiling =
+        (op == GGML_OP_OUT_PROD && tiling_enabled && use_src1 && !use_src2) &&
+#if 0
+        ((vk_tensor_offset(src0) + src0->view_offs + x_sz * ne02 * ne03) >= tiling_threshold ||
+        (vk_tensor_offset(src1) + src1->view_offs + y_sz * ne12 * ne13) >= tiling_threshold ||
+        (d_buf_offset + d_sz * ne12 * ne13) >= tiling_threshold);
+#else
+        ((x_sz * ne02 * ne03) + (y_sz * ne12 * ne13) +
+        (d_sz * ne12 * ne13) >= tiling_threshold);
+#endif
+
+    // XXX
+    bool do_splitting = false;
+#if 0
+    if (use_src1 && !use_src2 && do_tiling && (x_sz * ne02 * ne03) + (y_sz * ne12 * ne13) + (d_sz * ne12 * ne13) < tiling_threshold) {
+        do_splitting = true;
+        do_tiling = false;
+    }
+#endif
+    if (do_splitting && tiling_debug) {
+        fprintf(stderr, "[VK] [%s] [SPLITTING] (total sum %lu) >= %lu\n", ggml_op_name(op), (x_sz * ne02 * ne03) + (y_sz * ne12 * ne13) + (d_sz * ne12 * ne13), tiling_threshold);
+    }
+
+    // XXX: TODO: enable this for other operators
+    do_tiling = do_tiling && op == GGML_OP_OUT_PROD;
+    do_splitting = do_splitting && op == GGML_OP_OUT_PROD;
+
+    // XXX: Cleanup.
+    uint64_t tile_m = 0, tile_n = 0;
+    uint64_t m_tiles = 0, n_tiles = 0;
+    uint64_t num_dispatches = 0;
+    if (do_tiling) {
+        calculate_tile_dims(ne00, ne10, ne01, &tile_m, &tile_n, &m_tiles, &n_tiles, &num_dispatches, src0->type);
+        if (tiling_debug) {
+            fprintf(stderr, "[VK] %s [TILING] [tile_and_dispatch] tile_m=%lu, tile_n=%lu, m_tiles=%lu, n_tiles=%lu, num_dispatches=%lu\n", ggml_op_name(op), tile_m, tile_n, m_tiles, n_tiles, num_dispatches);
+        }
+    }
 
     switch (op) {
     case GGML_OP_NORM:
@@ -7274,7 +7844,257 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
         }
     }
 
-    if (op == GGML_OP_SOFT_MAX || op == GGML_OP_GLU) {
+    // XXX which value to use?
+    const uint32_t align = 1;
+
+    // XXX: TODO: enable this for other ops
+    if (do_splitting && op == GGML_OP_OUT_PROD) {
+        if (tiling_debug) {
+            std::cerr << "[VK] " << ggml_op_name(op) << " splitting!!" << std::endl;
+        }
+
+        GGML_ASSERT(ne02 == 1);
+        GGML_ASSERT(ne03 == 1);
+        GGML_ASSERT(ne12 == 1);
+        GGML_ASSERT(ne13 == 1);
+        GGML_ASSERT(ned2 == 1);
+        GGML_ASSERT(ned3 == 1);
+
+        GGML_ASSERT(false);
+
+        // XXX
+#if 0
+        // XXX: check this for ne02/ne03/... > 1
+        const uint64_t a_size = CEIL_DIV(ne0, ggml_blck_size(src0->type)) * ggml_type_size(src0->type);
+        const uint64_t b_size = ggml_type_size(src1->type) * ne1;
+        const uint64_t d_size = ggml_type_size(dst->type) * ned;
+        const uint64_t a_off = 0;
+        const uint64_t b_off = a_size;
+        const uint64_t d_off = a_size + b_size;
+        ggml_vk_copy_2d_to_2d(subctx, ctx->prealloc_tile, 0, d_X, x_buf_offset, a_size, 1, 1, 1);
+        ggml_vk_copy_2d_to_2d(subctx, ctx->prealloc_tile, b_off, d_Y, y_buf_offset, b_size, 1, 1, 1);
+
+        vk_context splitctx = ggml_vk_create_temporary_context(ctx->device->transfer_queue.cmd_pool);
+        ggml_vk_ctx_begin(ctx->device, splitctx);
+
+        ggml_vk_begin_submission(ctx->device, *splitctx->p);
+
+        ggml_vk_dispatch_pipeline(ctx, splitctx, pipeline,
+            { vk_subbuffer{ ctx->prealloc_tile, 0, a_size }, 
+              vk_subbuffer{ ctx->prealloc_tile, b_off, b_size },
+              vk_subbuffer{ ctx->prealloc_tile, d_off, d_size } }, pc, elements);
+
+        vk::SubmitInfo submit_info{};
+        submit_info.commandBufferCount = 1;
+        submit_info.pCommandBuffers = &splitctx->s->buffer;
+
+        ggml_vk_ctx_end(splitctx);
+
+        splitctx->p->q->queue.submit(submit_info, ctx->split_fence);
+
+        VK_CHECK(ctx->device->device.waitForFences({ ctx->split_fence }, true, UINT64_MAX), "split_fence");
+        ctx->device->device.resetFences({ ctx->split_fence });
+
+        ggml_vk_copy_2d_to_2d(subctx, d_D, d_buf_offset, ctx->prealloc_tile, d_off, d_size, 1, 1, 1);
+#endif
+    // XXX: TODO: enable this for other ops
+    } else if (do_tiling && op == GGML_OP_OUT_PROD) {
+        if constexpr (std::is_same_v<PC, vk_op_binary_push_constants>) {
+            // XXX
+            GGML_ASSERT(ne02 == 1);
+            GGML_ASSERT(ne03 == 1);
+            GGML_ASSERT(ne12 == 1);
+            GGML_ASSERT(ne13 == 1);
+            GGML_ASSERT(ned2 == 1);
+            GGML_ASSERT(ned3 == 1);
+
+            // XXX make it work for n12 > 1
+            for (uint32_t n0 = 0; n0 < ne10; n0 += tile_n) {
+                const uint32_t nt = (uint32_t) std::min(tile_n, ne10 - n0);
+
+                uint64_t b_off_bytes = y_buf_offset + ((uint64_t)n0 / b_elems_per_block) * (uint64_t)b_bytes_per_block;
+                const uint64_t d_off_bytes_n = d_buf_offset + CEIL_DIV(((uint64_t)n0 * (uint64_t)ned0), d_elems_per_block) * (uint64_t)d_bytes_per_block;
+
+                // XXX make it work for n02 > 1
+                for (uint32_t m0 = 0; m0 < ne00; m0 += tile_m) {
+                    const uint32_t mt = (uint32_t) std::min(tile_m, ne00 - m0);
+                    uint64_t a_off_bytes = x_buf_offset + ((uint64_t)m0 / a_elems_per_block) * (uint64_t)a_bytes_per_block;
+                    uint64_t d_off_bytes = d_off_bytes_n + CEIL_DIV((uint64_t)m0, d_elems_per_block) * (uint64_t)d_bytes_per_block;
+
+                    if (tiling_debug) {
+                        std::cerr << "[VK]  tile m=[" << m0 << "," << (m0+mt) << ") n=[" << n0 << "," << (n0+nt) << ")" << std::endl;
+                    }
+
+                    const uint64_t orig_stride_a_bytes = CEIL_DIV(ne00, a_elems_per_block) * a_bytes_per_block;
+                    const uint64_t orig_stride_b_bytes = CEIL_DIV(ne10, b_elems_per_block) * b_bytes_per_block;
+                    const uint64_t orig_stride_d_bytes = CEIL_DIV(ned0, d_elems_per_block) * d_bytes_per_block;
+
+                    const uint64_t tile_stride_a_bytes = ggml_vk_align_size(CEIL_DIV(mt, a_elems_per_block) * a_bytes_per_block, align);
+                    const uint64_t tile_stride_b_bytes = ggml_vk_align_size(CEIL_DIV(nt, b_elems_per_block) * b_bytes_per_block, align);
+                    const uint64_t tile_stride_d_bytes = ggml_vk_align_size(CEIL_DIV(mt, d_elems_per_block) * d_bytes_per_block, align);
+
+                    const uint64_t a_mt_bytes = CEIL_DIV(mt, a_elems_per_block) * a_bytes_per_block;
+                    const uint64_t b_nt_bytes = CEIL_DIV(nt, b_elems_per_block) * b_bytes_per_block;
+
+                    const uint64_t a_size = tile_stride_a_bytes * ne01;
+                    const uint64_t b_size = tile_stride_b_bytes * ne11;
+                    const uint64_t d_size = tile_stride_d_bytes * nt;
+                    const uint64_t a_off = 0;
+                    const uint64_t b_off = a_size;
+                    const uint64_t d_off = a_size + b_size;
+
+                    const uint32_t tile_stride_a_elems = (tile_stride_a_bytes / a_bytes_per_block) * a_elems_per_block;
+                    const uint32_t tile_stride_b_elems = (tile_stride_b_bytes / b_bytes_per_block) * b_elems_per_block;
+                    const uint32_t tile_stride_d_elems = (tile_stride_d_bytes / d_bytes_per_block) * d_elems_per_block;
+                    const uint64_t dst_copy_row_size = CEIL_DIV(mt, d_elems_per_block) * d_bytes_per_block;
+
+                    GGML_ASSERT(a_size + b_size + d_size < MAX_ADDRESS_SPACE_SIZE_OUT_PROD);
+                    GGML_ASSERT(d_off + d_size < MAX_ADDRESS_SPACE_SIZE_OUT_PROD);
+
+                    GGML_ASSERT(ne01 == ne11);
+
+                    // XXX
+                    VkMemoryBarrier memoryBarrier = {};
+                    memoryBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+                    memoryBarrier.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
+                    memoryBarrier.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT;
+
+                    // XXX
+                    vkCmdPipelineBarrier(subctx->s->buffer,
+                        VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                        VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                        0,
+                        1, &memoryBarrier,
+                        0, NULL,
+                        0, NULL
+                    );
+
+                    if (tiling_debug) {
+                        std::cerr << "[VK] "
+                            << " tile_stride_a_elems = " << tile_stride_a_elems << " | tile_stride_a_bytes = " << tile_stride_a_bytes << "\n"
+                            << " tile_stride_b_elems = " << tile_stride_b_elems << " | tile_stride_b_bytes = " << tile_stride_b_bytes << "\n"
+                            << " tile_stride_d_elems = " << tile_stride_d_elems << " | tile_stride_d_bytes = " << tile_stride_d_bytes << "\n"
+                            << " m = " << ne00 << " | n = " << ne10 << " | k = " << ne01 << "\n"
+                            << " mt = " << mt << " | nt = " << nt << " | kt = " << ne11 << "\n"
+                            << " a_off_bytes = " << a_off_bytes << " | b_off_bytes = " << b_off_bytes << " | d_off_bytes = " << d_off_bytes << "\n"
+                            << " a_mt_bytes = " << a_mt_bytes << " | b_nt_bytes = " << b_nt_bytes << "\n"
+                            << " orig_stride_a_bytes = " << orig_stride_a_bytes << " | orig_stride_b_bytes = " << orig_stride_b_bytes << " | orig_stride_d_bytes = " << orig_stride_d_bytes << "\n"
+                            << " dst_copy_row_size = " << dst_copy_row_size << "\n"
+                            << std::endl;
+                    }
+
+                    // Copy data to tile buffers
+                    ggml_vk_copy_2d_to_2d(subctx, ctx->prealloc_tile, a_off, d_X, a_off_bytes, a_mt_bytes, ne01, orig_stride_a_bytes, tile_stride_a_bytes);
+                    ggml_vk_copy_2d_to_2d(subctx, ctx->prealloc_tile, b_off, d_Y, b_off_bytes, b_nt_bytes, ne11, orig_stride_b_bytes, tile_stride_b_bytes);
+
+
+                    // XXX: TODO: account for batch sizes?
+                    uint32_t ne = std::min((uint32_t) ggml_nelements(dst), mt * nt);
+                    if (ne > 262144) {
+                        elements = { 512, 512, CEIL_DIV(ne, 262144) };
+                    } else if (ne > 512) {
+                        elements = { 512, CEIL_DIV(ne, 512), 1 };
+                    } else {
+                        elements = { ne, 1, 1 };
+                    }
+                    
+                    GGML_ASSERT(ne02 == 1);
+                    GGML_ASSERT(ne03 == 1);
+                    GGML_ASSERT(ne12 == 1);
+                    GGML_ASSERT(ne13 == 1);
+                    GGML_ASSERT(ne01 == ne11);
+                    GGML_ASSERT(pc.param2 >= 0.9f && pc.param2 <= 1.1f);
+                    GGML_ASSERT(pc.param3 == 1);
+
+                    uint32_t a_row_bytes = CEIL_DIV(mt, a_elems_per_block) * a_bytes_per_block;
+                    // XXX?
+                    uint32_t a_row_elems = a_row_bytes / a_bytes_per_unit;
+
+                    // XXX: account for batches
+                    pc.ne = mt * nt;
+
+                    // XXX: account for batches
+                    pc.ne00 = mt; pc.ne01 = ne01;
+#if 0
+                    pc.nb00 = a_bytes_per_unit;
+                    pc.nb01 = a_row_bytes;
+#else
+                    pc.nb00 = pc.nb00;
+                    //pc.nb01 = a_row_elems;
+                    //pc.nb01 = mt;
+                    pc.nb01 = mt / a_elems_per_block;
+#endif
+                    pc.nb02 = pc.nb01 * pc.ne01;
+                    pc.nb03 = pc.nb02 * pc.ne02;
+
+                    // XXX: account for batches
+                    pc.ne10 = nt; pc.ne11 = ne11;
+                    pc.nb10 = pc.nb10;
+                    pc.nb11 = pc.nb10 * pc.ne10;
+                    pc.nb12 = pc.nb11 * pc.ne11;
+                    pc.nb13 = pc.nb12 * pc.ne12;
+
+                    // XXX: account for non-src2 dst?
+                    // XXX: account for batches
+                    // XXX: do we need to divide nt by b_elems_per_block?
+                    pc.ne20 = mt; pc.ne21 = nt;
+                    pc.nb20 = pc.nb20;
+                    pc.nb21 = pc.nb20 * pc.ne20;
+                    pc.nb22 = pc.nb21 * pc.ne21;
+                    pc.nb23 = pc.nb22 * pc.ne22;
+
+                    ggml_vk_sync_buffers(subctx);
+
+                    // XXX
+                    vkCmdPipelineBarrier(subctx->s->buffer,
+                        VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                        VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                        0,
+                        1, &memoryBarrier,
+                        0, NULL,
+                        0, NULL
+                    );
+
+                    vk_subbuffer a = { ctx->prealloc_tile, 0, a_size };
+                    vk_subbuffer b = { ctx->prealloc_tile, b_off, b_size };
+                    vk_subbuffer d = { ctx->prealloc_tile, d_off, d_size };
+                    if (tiling_debug) {
+                        fprintf(stderr, "[VK] [DEBUG] a = (0x%p, %lu, %lu)\n", ctx->prealloc_tile->buffer, 0, a_size);
+                        fprintf(stderr, "             b = (0x%p, %lu, %lu)\n", ctx->prealloc_tile->buffer, b_off, b_size);
+                        fprintf(stderr, "             d = (0x%p, %lu, %lu)\n", ctx->prealloc_tile->buffer, d_off, d_size);
+                    }
+                    ggml_vk_dispatch_pipeline(
+                        ctx, subctx, pipeline, { a, b, d }, pc, elements
+                    );
+
+                    // XXX
+                    vkCmdPipelineBarrier(subctx->s->buffer,
+                        VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                        VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                        0,
+                        1, &memoryBarrier,
+                        0, NULL,
+                        0, NULL
+                    );
+
+                    ggml_vk_sync_buffers(subctx);
+
+                    // Copy results back to dst buffer
+                    ggml_vk_copy_2d_to_2d(subctx, d_D, d_off_bytes, ctx->prealloc_tile, d_off, dst_copy_row_size, nt, tile_stride_d_bytes, orig_stride_d_bytes);
+
+                    // XXX
+                    vkCmdPipelineBarrier(subctx->s->buffer,
+                        VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                        VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                        0,
+                        1, &memoryBarrier,
+                        0, NULL,
+                        0, NULL
+                    );
+                }
+            }
+        }
+    } else if (op == GGML_OP_SOFT_MAX || op == GGML_OP_GLU) {
         // Empty src1 is possible in soft_max, but the shader needs a buffer
         vk_subbuffer subbuf_y;
         if (use_src1) {
@@ -9056,6 +9876,22 @@ static void ggml_vk_preallocate_buffers(ggml_backend_vk_context * ctx) {
         }
         ctx->prealloc_split_k = ggml_vk_create_buffer_device(ctx->device, ctx->prealloc_size_split_k);
     }
+    if (ctx->prealloc_tile_debug == nullptr || (ctx->prealloc_size_tile > 0 && ctx->prealloc_tile_debug->size < ctx->prealloc_size_tile)) {
+        VK_LOG_MEMORY("ggml_vk_preallocate_buffers(debug_tile_size: " << ctx->prealloc_size_tile * 4 << ")");
+        // Resize buffer
+        if (ctx->prealloc_tile_debug != nullptr) {
+            ggml_vk_destroy_buffer(ctx->prealloc_tile_debug);
+        }
+        ctx->prealloc_tile_debug = ggml_vk_create_buffer_device(ctx->device, ctx->prealloc_size_tile * 4);
+    }
+    if (ctx->prealloc_tile == nullptr || (ctx->prealloc_size_tile > 0 && ctx->prealloc_tile->size < ctx->prealloc_size_tile)) {
+        VK_LOG_MEMORY("ggml_vk_preallocate_buffers(tile_size: " << ctx->prealloc_size_tile << ")");
+        // Resize buffer
+        if (ctx->prealloc_tile != nullptr) {
+            ggml_vk_destroy_buffer(ctx->prealloc_tile);
+        }
+        ctx->prealloc_tile = ggml_vk_create_buffer_device(ctx->device, ctx->prealloc_size_tile);
+    }
 }
 
 static bool ggml_vk_compute_forward(ggml_backend_vk_context* ctx, ggml_cgraph * cgraph, ggml_tensor* tensor, int tensor_idx, bool use_fence, bool almost_ready);
@@ -9075,6 +9911,7 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
     const ggml_tensor * src1 = node->src[1];
     const ggml_tensor * src2 = node->src[2];
     const ggml_tensor * src3 = node->src[3];
+    const ggml_tensor * dst = node;
 
     switch (node->op) {
     // Return on empty ops to avoid generating a compute_ctx and setting exit_tensor
@@ -9230,8 +10067,112 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
             {
                 // These operations all go through ggml_vk_op_f32, so short-circuit and
                 // do the only thing needed for the dryrun.
+
                 vk_pipeline pipeline = ggml_vk_op_get_pipeline(ctx, src0, src1, src2, node, node->op);
+
+                const bool use_src1 = src1 != nullptr;
+                const bool use_src2 = src2 != nullptr;
+
+                // XXX: currently not accounting for use_src2 ops
+                // XXX: currently only really enabled for GGML_OP_OUT_PROD
+                if (use_src1 && !use_src2 && node->op == GGML_OP_OUT_PROD) {
+
+                    const uint64_t ne00 = src0->ne[0];
+                    const uint64_t ne01 = src0->ne[1];
+                    const uint64_t ne02 = src0->ne[2];
+                    const uint64_t ne03 = src0->ne[3];
+                    const uint64_t ne0 = ne00 * ne01;
+
+                    const uint64_t ne10 = use_src1 ? src1->ne[0] : 0;
+                    const uint64_t ne11 = use_src1 ? src1->ne[1] : 0;
+                    const uint64_t ne12 = use_src1 ? src1->ne[2] : 0;
+                    const uint64_t ne13 = use_src1 ? src1->ne[3] : 0;
+                    const uint64_t ne1 = ne10 * ne11;
+
+                    const uint64_t ne20 = use_src2 ? src2->ne[0] : 0;
+                    const uint64_t ne21 = use_src2 ? src2->ne[1] : 0;
+                    const uint64_t ne22 = use_src2 ? src2->ne[2] : 0;
+                    const uint64_t ne23 = use_src2 ? src2->ne[3] : 0;
+                    const uint64_t ne2 = ne20 * ne21;
+
+                    const uint64_t ned0 = dst->ne[0];
+                    const uint64_t ned1 = dst->ne[1];
+                    const uint64_t ned2 = dst->ne[2];
+                    const uint64_t ned3 = dst->ne[3];
+                    const uint64_t ned = ned0 * ned1;
+
+                    uint64_t x_sz = CEIL_DIV(ne0, ggml_blck_size(src0->type)) * ggml_type_size(src0->type);
+                    uint64_t y_sz = use_src1 ? ggml_type_size(src1->type) * ne1 : 0;
+                    uint64_t z_sz = use_src2 ? ggml_type_size(src2->type) * ne2 : 0;
+                    uint64_t d_sz = ggml_type_size(dst->type) * ned;
+
+                    const uint64_t tiling_threshold = MAX_ADDRESS_SPACE_SIZE_OUT_PROD;
+
+                    // XXX: Cleanup
+                    auto getenv_u32 = [](const char *name, uint32_t defval) -> uint32_t {
+                        const char *v = getenv(name);
+                        if (!v || !*v) return defval;
+                        char *endp = nullptr;
+                        unsigned long x = strtoul(v, &endp, 10);
+                        if (endp == v) return defval;
+                        if (x > 0xfffffffful) x = 0xfffffffful;
+                        return (uint32_t)x;
+                    };
+
+                    // XXX: Cleanup.
+                    const bool tiling_debug = getenv_u32("GGML_TILING_DEBUG", 0);
+                    const bool tiling_enabled = getenv_u32("GGML_TILING_ENABLE", 0);
+
+                    // XXX: TODO: use a better way to detect high buffer range?
+                    bool do_tiling =
+                        tiling_enabled &&
+#if 0
+                        ((vk_tensor_offset(src0) + src0->view_offs + x_sz * ne02 * ne03) >= tiling_threshold ||
+                         (vk_tensor_offset(src1) + src1->view_offs + y_sz * ne12 * ne13) >= tiling_threshold ||
+                         (vk_tensor_offset(dst) + dst->view_offs + d_sz * ne12 * ne13) >= tiling_threshold);
+#else
+                        (x_sz * ne02 * ne03 + y_sz * ne12 * ne13 +
+                         d_sz * ne12 * ne13 >= tiling_threshold);
+#endif
+
+                    bool do_splitting = false;
+#if 0
+                    if (do_tiling && (x_sz * ne02 * ne03) + (y_sz * ne12 * ne13) + (d_sz * ne12 * ne13) < tiling_threshold) {
+                        do_splitting = true;
+                        do_tiling = false;
+                    }
+#endif
+                    if (do_splitting && tiling_debug) {
+                        fprintf(stderr, "[VK] [%s] [SPLITTING] (total sum %lu) >= %lu\n", ggml_op_name(node->op), (x_sz * ne02 * ne03) + (y_sz * ne12 * ne13) + (d_sz * ne12 * ne13), tiling_threshold);
+                    }
+
+                    uint64_t tile_m = 0, tile_n = 0;
+                    uint64_t m_tiles = 0, n_tiles = 0;
+                    uint64_t num_dispatches = 0;
+                    if (do_tiling) {
+                        calculate_tile_dims(ne00, ne10, ne01, &tile_m, &tile_n, &m_tiles, &n_tiles, &num_dispatches, src0->type);
+                        if (tiling_debug) {
+                            fprintf(stderr, "[VK] %s [TILING] [request_descriptor_sets] tile_m=%lu, tile_n=%lu, m_tiles=%lu, n_tiles=%lu, num_dispatches=%lu\n", ggml_op_name(node->op), tile_m, tile_n, m_tiles, n_tiles, num_dispatches);
+                        }
+                    }
+
+                    // XXX: Cleanup
+                    // Allocate buffers for tiling (for buffers that are too large to bind fully)
+                    if (node->op == GGML_OP_OUT_PROD) {
+                        if (do_splitting) {
+                            ctx->prealloc_size_tile = MAX_ADDRESS_SPACE_SIZE;
+                            ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+                            return false;
+                        } else if (do_tiling) {
+                            ctx->prealloc_size_tile = MAX_ADDRESS_SPACE_SIZE;
+                            ggml_pipeline_request_descriptor_sets(ctx, pipeline, num_dispatches);
+                            return false;
+                        }
+                    }
+                }
+
                 ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+
                 return false;
             }
         default:
@@ -9719,6 +10660,8 @@ static void ggml_vk_cleanup(ggml_backend_vk_context * ctx) {
     ggml_vk_destroy_buffer(ctx->prealloc_x);
     ggml_vk_destroy_buffer(ctx->prealloc_y);
     ggml_vk_destroy_buffer(ctx->prealloc_split_k);
+    ggml_vk_destroy_buffer(ctx->prealloc_tile);
+    ggml_vk_destroy_buffer(ctx->prealloc_tile_debug);
 
     for (auto& buffer : ctx->buffer_pool) {
         ggml_vk_destroy_buffer(buffer);
@@ -11031,6 +11974,7 @@ size_t check_counter = 0;
 static void ggml_vk_check_results_0(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, int tensor_idx) {
     ggml_tensor * tensor = cgraph->nodes[tensor_idx];
     if (tensor->op == GGML_OP_TRANSPOSE || tensor->op == GGML_OP_SET_ROWS) {
+        fprintf(stderr, "[WARNING] ggml_vk_check_results_0 unimplemented op %s\n", ggml_op_name(tensor->op));
         return;
     }
 
@@ -11142,6 +12086,8 @@ static void ggml_vk_check_results_0(ggml_backend_vk_context * ctx, ggml_cgraph *
         } else {
             tensor_clone = ggml_mul(ggml_ctx, src_clone[0], src_clone[1]);
         }
+    } else if (tensor->op == GGML_OP_CROSS_ENTROPY_LOSS_BACK) {
+        tensor_clone = ggml_cross_entropy_loss_back(ggml_ctx, src_clone[0], src_clone[1], src_clone[2]);
     } else if (tensor->op == GGML_OP_DIV) {
         tensor_clone = ggml_div(ggml_ctx, src_clone[0], src_clone[1]);
     } else if (tensor->op == GGML_OP_CONCAT) {
@@ -11363,6 +12309,7 @@ static void ggml_vk_check_results_0(ggml_backend_vk_context * ctx, ggml_cgraph *
 static void ggml_vk_check_results_1(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, int tensor_idx) {
     ggml_tensor * tensor = cgraph->nodes[tensor_idx];
     if (tensor->op == GGML_OP_TRANSPOSE || tensor->op == GGML_OP_SET_ROWS) {
+        fprintf(stderr, "[WARNING] ggml_vk_check_results_1 unimplemented op %s\n", ggml_op_name(tensor->op));
         return;
     }
     bool fused_rms_norm_mul = false;
@@ -11464,6 +12411,27 @@ static void ggml_vk_check_results_1(ggml_backend_vk_context * ctx, ggml_cgraph *
                         ggml_vk_print_graph_origin(tensor, done);
                         GGML_ABORT("fatal error");
                     }
+
+                    // XXX just for debugging, on release builds this might not be an actual error
+                    if (std::isnan(result)) {
+                        std::cerr << std::endl << "[VK] [ERROR] NAN Result:" << std::endl;
+                        ggml_vk_print_tensor_area(tensor, tensor_data, i0, i1, i2, i3);
+                        std::cerr << std::endl;
+                        std::vector<const ggml_tensor *> done;
+                        ggml_vk_print_graph_origin(tensor, done);
+                        GGML_ABORT("fatal error");
+                    }
+
+                    // XXX just for debugging, on release builds this might not be an actual error
+                    if (std::isinf(result)) {
+                        std::cerr << std::endl << "[VK] [ERROR] INF Result:" << std::endl;
+                        ggml_vk_print_tensor_area(tensor, tensor_data, i0, i1, i2, i3);
+                        std::cerr << std::endl;
+                        std::vector<const ggml_tensor *> done;
+                        ggml_vk_print_graph_origin(tensor, done);
+                        GGML_ABORT("fatal error");
+                    }
+
                     const double denom = std::fabs(correct) > 1.0f ? (std::fabs(correct) > 1e-8 ? std::fabs(correct) : 1e-8) : 1.0f;
                     if (first_error[0] == -1 && std::fabs(correct - result) / denom > 0.5) {
                         first_error[0] = i0;
