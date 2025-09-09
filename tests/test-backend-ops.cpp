@@ -2952,6 +2952,40 @@ struct test_mul_mat : public test_case {
 
         return out;
     }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type == GGML_TYPE_F32) {
+                if (t->name[0] == 'o') {
+                    for (int64_t r = 0; r < ggml_nrows(t); r++) {
+                        std::vector<float> data(t->ne[0]);
+                        for (int i = 0; i < t->ne[0]; i++) {
+                            data[i] = -13.0f;
+                        }
+                        ggml_backend_tensor_set(t, data.data(), r * t->nb[1], t->ne[0] * sizeof(float));
+                    }
+                } else if (t->name[0] == 'a') {
+                    for (int64_t r = 0; r < ggml_nrows(t); r++) {
+                        std::vector<float> data(t->ne[0]);
+                        for (int i = 0; i < t->ne[0]; i++) {
+                            data[i] = (3.50f * i + r) / (t->ne[0] + t->ne[1] * 0.5); 
+                        }
+                        ggml_backend_tensor_set(t, data.data(), r * t->nb[1], t->ne[0] * sizeof(float));
+                    }
+                } else {
+                    for (int64_t r = 0; r < ggml_nrows(t); r++) {
+                        std::vector<float> data(t->ne[0]);
+                        for (int i = 0; i < t->ne[0]; i++) {
+                            data[i] = (1.33f * i + r) / (t->ne[0] + t->ne[1] * 1.2);
+                        }
+                        ggml_backend_tensor_set(t, data.data(), r * t->nb[1], t->ne[0] * sizeof(float));
+                    }
+                }
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
 };
 
 // GGML_OP_MUL_MAT_ID
