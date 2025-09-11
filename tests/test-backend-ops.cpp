@@ -1154,9 +1154,9 @@ struct test_case {
             double err = nmse(f1.data(), f2.data(), f1.size());
             if (err > ud->max_err) {
                 printf("[%s] NMSE = %.9f > %.9f ", ggml_op_desc(t1), err, ud->max_err);
-                //for (int i = 0; i < (int) f1.size(); i++) {
-                //    printf("%5d %9.6f %9.6f, diff = %9.6f\n", i, f1[i], f2[i], f1[i] - f2[i]);
-                //}
+                for (int i = 0; i < (int) f1.size(); i++) {
+                    printf("%5d %9.6f %9.6f, diff = %9.6f\n", i, f1[i], f2[i], f1[i] - f2[i]);
+                }
                 printf("\n");
                 //exit(1);
                 ud->ok = false;
@@ -2953,6 +2953,7 @@ struct test_mul_mat : public test_case {
         return out;
     }
 
+#if 0
     void initialize_tensors(ggml_context * ctx) override {
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
             if (t->type == GGML_TYPE_F32) {
@@ -2976,16 +2977,30 @@ struct test_mul_mat : public test_case {
                     for (int64_t r = 0; r < ggml_nrows(t); r++) {
                         std::vector<float> data(t->ne[0]);
                         for (int i = 0; i < t->ne[0]; i++) {
-                            data[i] = (1.33f * i + r) / (t->ne[0] + t->ne[1] * 1.2);
+                            //data[i] = (1.33f * i + r) / (t->ne[0] + t->ne[1] * 1.2);
+                            data[i] = 1.0f;
                         }
                         ggml_backend_tensor_set(t, data.data(), r * t->nb[1], t->ne[0] * sizeof(float));
                     }
                 }
-            } else {
+            } /* else if (t->type == GGML_TYPE_Q8_0) {
+                if (t->name[0] == 'a') {
+                    for (int64_t r = 0; r < ggml_nrows(t); r++) {
+                        std::vector<uint8_t> data(t->ne[0]);
+                        for (int i = 0; i < t->ne[0]; i++) {
+                            //data[i] = (4 * i + r) / (t->ne[0] + t->ne[1] * 0.5); 
+                            //data[i] = std::min(i, 32); 
+                            data[i] = 128; 
+                        }
+                        ggml_backend_tensor_set(t, data.data(), r * t->nb[1], t->ne[0] * sizeof(uint8_t));
+                    }
+                }
+            } */ else {
                 init_tensor_uniform(t);
             }
         }
     }
+#endif
 };
 
 // GGML_OP_MUL_MAT_ID
@@ -3107,6 +3122,56 @@ struct test_out_prod : public test_case {
 
         return out;
     }
+
+#if 0
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type == GGML_TYPE_F32) {
+                if (t->name[0] == 'o') {
+                    for (int64_t r = 0; r < ggml_nrows(t); r++) {
+                        std::vector<float> data(t->ne[0]);
+                        for (int i = 0; i < t->ne[0]; i++) {
+                            data[i] = -13.0f;
+                        }
+                        ggml_backend_tensor_set(t, data.data(), r * t->nb[1], t->ne[0] * sizeof(float));
+                    }
+                } else if (t->name[0] == 'a') {
+                    for (int64_t r = 0; r < ggml_nrows(t); r++) {
+                        std::vector<float> data(t->ne[0]);
+                        for (int i = 0; i < t->ne[0]; i++) {
+                            data[i] = (3.50f * i + r) / (t->ne[0] + t->ne[1] * 0.5); 
+                        }
+                        ggml_backend_tensor_set(t, data.data(), r * t->nb[1], t->ne[0] * sizeof(float));
+                    }
+                } else {
+                    for (int64_t r = 0; r < ggml_nrows(t); r++) {
+                        std::vector<float> data(t->ne[0]);
+                        for (int i = 0; i < t->ne[0]; i++) {
+                            //data[i] = (1.33f * i + r) / (t->ne[0] + t->ne[1] * 1.2);
+                            data[i] = i+1;
+                        }
+                        ggml_backend_tensor_set(t, data.data(), r * t->nb[1], t->ne[0] * sizeof(float));
+                    }
+                }
+            } else if (t->type == GGML_TYPE_Q8_0) {
+                if (t->name[0] == 'a') {
+                    for (int64_t r = 0; r < ggml_nrows(t); r++) {
+                        std::vector<uint8_t> data(t->ne[0]);
+                        for (int i = 0; i < t->ne[0]; i++) {
+                            //data[i] = (4 * i + r) / (t->ne[0] + t->ne[1] * 0.5); 
+                            //data[i] = std::min(i, 32); 
+                            data[i] = 100 + i; 
+                        }
+                        ggml_backend_tensor_set(t, data.data(), r * t->nb[1], t->ne[0] * sizeof(uint8_t));
+                    }
+                }
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+#endif
+    
 };
 
 // GGML_OP_SQR
@@ -4856,7 +4921,8 @@ struct test_falcon : public test_llm {
 // ###########################################
 static const ggml_type all_types[] = {
     GGML_TYPE_F32, GGML_TYPE_F16, // GGML_TYPE_BF16,
-//    GGML_TYPE_Q4_0, GGML_TYPE_Q4_1,
+    GGML_TYPE_Q4_0,
+//    GGML_TYPE_Q4_1,
 //    GGML_TYPE_Q5_0, GGML_TYPE_Q5_1,
     GGML_TYPE_Q8_0,
 //    GGML_TYPE_Q2_K, GGML_TYPE_Q3_K,
@@ -4871,13 +4937,14 @@ static const ggml_type all_types[] = {
 static const ggml_type base_types[] = {
     GGML_TYPE_F32, GGML_TYPE_F16,
     GGML_TYPE_Q8_0, // for I8MM tests
-//    GGML_TYPE_Q4_0,
+    GGML_TYPE_Q4_0,
 //    GGML_TYPE_Q4_1, // for I8MM tests
 //    GGML_TYPE_Q4_K,
 //    GGML_TYPE_IQ2_XXS
 };
 
 static const ggml_type other_types[] = {
+    GGML_TYPE_Q4_0,
 //    GGML_TYPE_Q4_1,
 //    GGML_TYPE_Q5_0, GGML_TYPE_Q5_1,
     GGML_TYPE_Q8_0,
@@ -5231,13 +5298,58 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gla(GGML_TYPE_F32, 32, 64, 32, 4));
     test_cases.emplace_back(new test_gla(GGML_TYPE_F32, 32, 64, 128, 4));
 
-    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 32, 2, 2, {1,  1}, {1, 1}));
-    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 4096*2, 256, 1024, {1,  1}, {1, 1}));
-    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 4096*20, 256, 1024, {1,  1}, {1, 1}));
-    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 4096*30, 256, 1024, {1,  1}, {1, 1}));
-
+    test_cases.emplace_back(new test_out_prod(GGML_TYPE_F32, GGML_TYPE_F32, 4096*20, 256, 1024, {1,  1}, {1, 1}));
+    test_cases.emplace_back(new test_out_prod(GGML_TYPE_Q8_0, GGML_TYPE_F32, 4096*20, 256, 1024, {1,  1}, {1, 1}));
+    test_cases.emplace_back(new test_out_prod(GGML_TYPE_F32, GGML_TYPE_F32, 1024, 256, 4096*40, {1,  1}, {1, 1}));
+    test_cases.emplace_back(new test_out_prod(GGML_TYPE_Q8_0, GGML_TYPE_F32, 1024, 256, 4096*40, {1,  1}, {1, 1}));
 
 #if 0
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 2, 2, 32, {1,  1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 4, 4, 32, {1,  1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 2, 2, 32, {1,  1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 4, 4, 32, {1,  1}, {1, 1}));
+
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 4096*20, 256, 1024, {1,  1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 4096*20, 256, 1024, {1,  1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 1024, 256, 4096*20, {1,  1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 1024, 256, 4096*20, {1,  1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 1024, 256, 4096*40, {1,  1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 1024, 256, 4096*40, {1,  1}, {1, 1}));
+#endif
+    
+#if 0
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 2, 2, 1024, {1,  1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 1024, 2, 2, {1,  1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 2, 1024, 2, {1,  1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 2, 1, 4096, {1,  1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 1, 2, 4096, {1,  1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 2, 2, 4096, {1,  1}, {1, 1}));
+
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 2, 2, 32, {1,  1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 4, 4, 32, {1,  1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 4, 4, 64, {1,  1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 8, 8, 128, {1,  1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 32, 2, 2, {1,  1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 64, 16, 2, {1,  1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 16, 64, 2, {1,  1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 64, 16, 4, {1,  1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 16, 64, 4, {1,  1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 4, 16, 32, {1,  1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 16, 4, 32, {1,  1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 4, 16, 64, {1,  1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 16, 4, 64, {1,  1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 32, 32, 32, {1,  1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 32, 64, 64, {1,  1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 64, 32, 64, {1,  1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 64, 64, 32, {1,  1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 64, 64, 64, {1,  1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 128, 64, 2, {1,  1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 256, 128, 32, {1,  1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 256, 128, 64, {1,  1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 512, 256, 1024, {1,  1}, {1, 1}));
+#endif
+    
+#if 1
     for (ggml_type type_a : all_types) {
         for (int i = 1; i < 10; ++i) {
             test_cases.emplace_back(new test_mul_mat(type_a,    GGML_TYPE_F32, 16,  i, 256, { 1,  1}, {1, 1}));
@@ -5328,12 +5440,6 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 128, 45,  64, { 8,  1}, {4, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 1056, 1, 193, {1,  1}, {4, 1}, {0, 2, 1, 3}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 1056, 1, 67,  {1,  1}, {4, 1}, {0, 2, 1, 3}));
-
-    // XXX
-    //test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 151936, 256, 1024, {1,  1}, {1, 1}));
-    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 128, 256, 1024, {1,  1}, {1, 1}));
-    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 4096*8, 256, 1024, {1,  1}, {1, 1}));
-    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 4096*16, 256, 1024, {1,  1}, {1, 1}));
 
     for (auto bs : {1,2,4,8}) {
         for (auto nr : {1,4}) {
