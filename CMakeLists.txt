@@ -84,7 +84,7 @@ option(LLAMA_BUILD_EXAMPLES "llama: build examples"       ${LLAMA_STANDALONE})
 option(LLAMA_BUILD_SERVER   "llama: build server example" ${LLAMA_STANDALONE})
 
 # specific extras
-option(LLAMA_MTMD "llama: multimodal support" OFF)
+option(LLAMA_MTMD "llama: multimodal support" ${LLAMA_BUILD_TOOLS})
 
 # 3rd party libs
 option(LLAMA_CURL       "llama: use libcurl to download model from an URL" ON)
