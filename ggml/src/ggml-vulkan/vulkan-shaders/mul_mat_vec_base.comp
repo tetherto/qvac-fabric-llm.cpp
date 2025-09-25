@@ -10,7 +10,7 @@
 
 layout (binding = 0) readonly buffer A {A_TYPE data_a[];};
 layout (binding = 1) readonly buffer B {B_TYPE data_b[];};
-#if !defined(DATA_A_Q8_0) && !defined(DATA_A_Q4_0)
+#if !defined(DATA_A_Q8_0) && !defined(DATA_A_Q4_0) && !defined(DATA_A_Q4_1)
 layout (binding = 1) readonly buffer BV2 {B_TYPE_VEC2 data_b_v2[];};
 layout (binding = 1) readonly buffer BV4 {B_TYPE_VEC4 data_b_v4[];};
 #endif

@@ -140,6 +140,18 @@ vec4 dequantize4(uint ib, uint iqs, uint a_offset) {
 }
 #endif
 
+#if defined(DATA_A_Q4_1)
+vec2 dequantize(uint ib, uint iqs, uint a_offset) {
+    const uint vui = uint(data_a[a_offset + ib].qs[iqs]);
+    return vec2(vui & 0xF, vui >> 4);
+}
+vec4 dequantize4(uint ib, uint iqs, uint a_offset) {
+    const vec2 v01 = dequantize(ib, iqs, a_offset);
+    const vec2 v23 = dequantize(ib, iqs + 1, a_offset);
+    return vec4(v01.x, v01.y, v23.x, v23.y);
+}
+#endif
+
 void main() {
 #ifdef NEEDS_INIT_IQ_SHMEM
     init_iq_shmem(gl_WorkGroupSize);
@@ -382,6 +394,7 @@ void main() {
             const uint ib = idx / 4;
             const uint iqs = idx & 0x03;
 
+#if 0
             const float d = float(data_a_packed16[ib].d);
             const float m = float(data_a_packed16[ib].m);
             const uint vui = uint(data_a_packed16[ib].qs[2*iqs]) | (uint(data_a_packed16[ib].qs[2*iqs + 1]) << 16);
@@ -396,6 +409,21 @@ void main() {
             buf_a[buf_idx + 17] = FLOAT_TYPE(v1.y);
             buf_a[buf_idx + 18] = FLOAT_TYPE(v1.z);
             buf_a[buf_idx + 19] = FLOAT_TYPE(v1.w);
+#else
+            const float d = float(data_a[ib].d);
+            const float m = float(data_a[ib].m);
+            const vec4 vxy = dequantize4(ib, 4*iqs, 0) * d + m;
+            const vec4 vzw = dequantize4(ib, 4*iqs + 2, 0) * d + m;
+
+            buf_a[buf_idx     ] = FLOAT_TYPE(vxy.x);
+            buf_a[buf_idx + 1 ] = FLOAT_TYPE(vxy.z);
+            buf_a[buf_idx + 2 ] = FLOAT_TYPE(vzw.x);
+            buf_a[buf_idx + 3 ] = FLOAT_TYPE(vzw.z);
+            buf_a[buf_idx + 16] = FLOAT_TYPE(vxy.y);
+            buf_a[buf_idx + 17] = FLOAT_TYPE(vxy.w);
+            buf_a[buf_idx + 18] = FLOAT_TYPE(vzw.y);
+            buf_a[buf_idx + 19] = FLOAT_TYPE(vzw.w);
+#endif
 #elif defined(DATA_A_Q5_0)
             const uint idx = pos_a + (loadc_a + l) * p.stride_a / LOAD_VEC_A + loadr_a;
             const uint buf_idx = (loadc_a + l) * SHMEM_STRIDE + 2 * loadr_a;

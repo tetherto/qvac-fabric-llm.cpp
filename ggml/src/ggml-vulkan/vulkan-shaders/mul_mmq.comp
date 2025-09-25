@@ -24,7 +24,7 @@
 
 layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
 
-#if defined(DATA_A_Q8_0) || defined(DATA_A_Q4_0)
+#if defined(DATA_A_Q8_0) || defined(DATA_A_Q4_0) || defined(DATA_A_Q4_1)
 layout (binding = 0) readonly buffer A {A_TYPE data_a[];};
 #else
 layout (binding = 0) readonly buffer A {A_TYPE_PACKED16 data_a[];};
