@@ -8,12 +8,32 @@
 
 #if defined(DATA_A_Q4_0)
 i32vec2 repack(uint ib, uint iqs) {
+#if 0
     // Use 2-byte loads since a q4_0 block (18 bytes) is not divisible by 4
     const u16vec2 quants = u16vec2(data_a[ib].qs[iqs * 2    ],
                                    data_a[ib].qs[iqs * 2 + 1]);
     const uint32_t vui = pack32(quants);
     return i32vec2( vui       & 0x0F0F0F0F,
                    (vui >> 4) & 0x0F0F0F0F);
+#else
+    int32_t u0 = int32_t(uint(data_a[ib].qs[iqs * 4]));
+    int32_t u1 = int32_t(uint(data_a[ib].qs[iqs * 4 + 1]));
+    int32_t u2 = int32_t(uint(data_a[ib].qs[iqs * 4 + 2]));
+    int32_t u3 = int32_t(uint(data_a[ib].qs[iqs * 4 + 3]));
+
+    int32_t v0 = int32_t(
+            (u0 & 0xF) |
+            ((u1 & 0xF) << 8) |
+            ((u2 & 0xF) << 16) |
+            ((u3 & 0xF) << 24));
+    int32_t v1 = int32_t(
+            ((u0 >> 4) & 0xF) |
+            (((u1 >> 4) & 0xF) << 8) |
+            (((u2 >> 4) & 0xF) << 16) |
+            (((u3 >> 4) & 0xF) << 24));
+    
+    return i32vec2(v0, v1);
+#endif
 }
 
 ACC_TYPE mul_q8_1(int32_t q_sum, float da, vec2 dsb) {

@@ -62,16 +62,33 @@ layout (binding = 1) readonly buffer KV_PACKED16 {A_TYPE_PACKED16 data_packed16[
 #endif
 
 #if defined(DATA_A_Q4_0)
+#define BINDING_IDX_K 0
+#define BINDING_IDX_V 1
+layout (binding = 1) readonly buffer KV_PACKED16 {A_TYPE data[];} kv_packed[2];
 #define BLOCK_BYTE_SIZE 18
 
 vec4 dequantize4(uint ib, uint iqs, uint a_offset, uint binding_idx) {
-    uint vui_lo = uint(kv_packed[binding_idx].data_packed16[a_offset + ib].qs[(iqs & 0xF) / 2 + 0]);
-    uint vui_hi = uint(kv_packed[binding_idx].data_packed16[a_offset + ib].qs[(iqs & 0xF) / 2 + 1]);
-    uint shift = (iqs & 0x10) >> 2;
-    vui_lo >>= shift;
-    vui_hi >>= shift;
+    uint v00 =
+        uint(kv_packed[binding_idx].data[a_offset + ib].qs[(iqs & 0xF) + 0]);
+    uint v01 =
+        uint(kv_packed[binding_idx].data[a_offset + ib].qs[(iqs & 0xF) + 1]);
+    uint v10 =
+        uint(kv_packed[binding_idx].data[a_offset + ib].qs[(iqs & 0xF) + 2]);
+    uint v11 =
+        uint(kv_packed[binding_idx].data[a_offset + ib].qs[(iqs & 0xF) + 3]);
 
-    return float(kv_packed[binding_idx].data_packed16[a_offset + ib].d) * (vec4(vui_lo & 0xF, (vui_lo >> 8) & 0xF, vui_hi & 0xF, (vui_hi >> 8) & 0xF) - 8.0f);
+    uint shift = (iqs & 0x10) >> 2;
+    v00 >>= shift;
+    v01 >>= shift;
+    v10 >>= shift;
+    v11 >>= shift;
+
+    v00 = v00 & 0xF;
+    v01 = v01 & 0xF;
+    v10 = v10 & 0xF;
+    v11 = v11 & 0xF;
+
+    return float(kv_packed[binding_idx].data[a_offset + ib].d) * (vec4(v00, v01, v10, v11) - 8.0f);
 }
 #endif
 
