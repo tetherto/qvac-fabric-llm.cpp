@@ -61,6 +61,8 @@ add_library(${TARGET} STATIC
     json-partial.h
     json-schema-to-grammar.cpp
     llguidance.cpp
+    load-into-memory.h
+    load-into-memory.cpp
     log.cpp
     log.h
     ngram-cache.cpp
