@@ -240,14 +240,14 @@ enum FaHeadSizes {
 };
 
 // XXX: Use value queried from the driver
-#if 0
+#if 1
 const uint64_t MAX_ADDRESS_SPACE_SIZE = 1 << 27;
 const uint64_t MAX_ADDRESS_SPACE_SIZE_MUL_MAT = 1 << 27;
 const uint64_t MAX_ADDRESS_SPACE_SIZE_OUT_PROD = 1 << 27;
 #else
-const uint64_t MAX_ADDRESS_SPACE_SIZE = 1 << 27;
-const uint64_t MAX_ADDRESS_SPACE_SIZE_MUL_MAT = 1 << 27;
-const uint64_t MAX_ADDRESS_SPACE_SIZE_OUT_PROD = 1 << 27;
+const uint64_t MAX_ADDRESS_SPACE_SIZE = 1 << 26;
+const uint64_t MAX_ADDRESS_SPACE_SIZE_MUL_MAT = 1 << 26;
+const uint64_t MAX_ADDRESS_SPACE_SIZE_OUT_PROD = 1 << 26;
 #endif
 
 static vk_device_architecture get_device_architecture(const vk::PhysicalDevice& device) {
@@ -4415,11 +4415,13 @@ static void ggml_vk_dispatch_pipeline(ggml_backend_vk_context* ctx, vk_context& 
     const uint32_t wg0 = CEIL_DIV(elements[0], pipeline->wg_denoms[0]);
     const uint32_t wg1 = CEIL_DIV(elements[1], pipeline->wg_denoms[1]);
     const uint32_t wg2 = CEIL_DIV(elements[2], pipeline->wg_denoms[2]);
-    VK_LOG_DEBUG("ggml_vk_dispatch_pipeline(" << pipeline->name << ", {";
+#if 0
+    std::cerr << "ggml_vk_dispatch_pipeline(" << pipeline->name << ", {";
     for (auto& buffer : descriptor_buffer_infos) {
         std::cerr << "(" << buffer.buffer << ", " << buffer.offset << ", " << buffer.range << "), ";
     }
-    std::cerr << "}, (" << wg0 << "," << wg1 << "," << wg2 << "))");
+    std::cerr << "}, (" << wg0 << "," << wg1 << "," << wg2 << "))" << std::endl;
+#endif
     GGML_ASSERT(ctx->descriptor_set_idx < ctx->descriptor_sets.size());
     GGML_ASSERT(descriptor_buffer_infos.size() <= MAX_PARAMETER_COUNT);
 
@@ -5439,6 +5441,10 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
          d_sz * ne12 * ne13 >= tiling_threshold);
 #endif
 
+    if (tiling_debug) {
+        fprintf(stderr, "tiling enabled ? %d (%lu > %lu ?)\n", do_tiling, x_sz * ne02 * ne03 + y_sz * ne12 * ne13 + d_sz * ne12 * ne13, tiling_threshold);
+    }
+
     // XXX
     bool do_splitting = false;
 #if 0
@@ -5980,7 +5986,9 @@ static void ggml_vk_mul_mat_vec_q_f16(ggml_backend_vk_context * ctx, vk_context&
 
     if (ne01 > max_groups_x) {
         groups_z = 64;
+        //groups_z = 96;
         groups_x = CEIL_DIV(groups_x, groups_z);
+        GGML_ASSERT(max_groups_x > groups_x);
     }
 
     // compute
