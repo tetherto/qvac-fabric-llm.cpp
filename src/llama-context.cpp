@@ -1390,7 +1390,7 @@ uint32_t llama_context::graph_max_nodes() const {
     if (model.arch == LLM_ARCH_QWEN3NEXT) {
         return std::max<uint32_t>(8192u, 32u*model.n_tensors());
     }
-    return std::max<uint32_t>(1024u, 8u*model.n_tensors());
+    return std::max<uint32_t>(2048u, 32u*model.n_tensors());
 }
 
 llm_graph_result * llama_context::get_gf_res_reserve() const {
