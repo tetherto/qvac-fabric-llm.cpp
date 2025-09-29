@@ -1,0 +1,148 @@
+#version 450
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+// Buffers for fluid simulation
+layout(std430, binding = 0) buffer VelocityField {
+    vec2 velocities[];
+};
+
+layout(std430, binding = 1) buffer PressureField {
+    float pressures[];
+};
+
+layout(std430, binding = 2) buffer DensityField {
+    float densities[];
+};
+
+// Simulation parameters
+layout(push_constant) uniform Params {
+    float deltaTime;
+    float diffusion;
+    float viscosity;
+    int gridSize;
+    int iterations;
+} params;
+
+// Helper function to get index in 1D array from 2D coordinates
+int getIndex(ivec2 pos) {
+    // Clamp to grid boundaries
+    pos = clamp(pos, ivec2(0), ivec2(params.gridSize - 1));
+    return pos.y * params.gridSize + pos.x;
+}
+
+// Function to perform diffusion step
+vec2 diffuse(ivec2 pos) {
+    vec2 sum = vec2(0.0);
+    float centralWeight = 1.0 + 4.0 * params.diffusion;
+    
+    // 5-point stencil for diffusion
+    sum += velocities[getIndex(pos + ivec2(1, 0))];
+    sum += velocities[getIndex(pos + ivec2(-1, 0))];
+    sum += velocities[getIndex(pos + ivec2(0, 1))];
+    sum += velocities[getIndex(pos + ivec2(0, -1))];
+    
+    // Central point with weight
+    return sum * params.diffusion / centralWeight;
+}
+
+// Function to compute divergence
+float divergence(ivec2 pos) {
+    // Calculate velocity divergence at this point
+    float div = 0.0;
+    div += velocities[getIndex(pos + ivec2(1, 0))].x - velocities[getIndex(pos + ivec2(-1, 0))].x;
+    div += velocities[getIndex(pos + ivec2(0, 1))].y - velocities[getIndex(pos + ivec2(0, -1))].y;
+    return div * 0.5;
+}
+
+// Advection step
+vec2 advect(ivec2 pos) {
+    // Trace particle backward
+    vec2 velocity = velocities[getIndex(pos)];
+    vec2 pos_f = vec2(pos) - velocity * params.deltaTime;
+    
+    // Bilinear interpolation
+    ivec2 pos0 = ivec2(floor(pos_f));
+    ivec2 pos1 = pos0 + ivec2(1);
+    
+    vec2 frac = pos_f - vec2(pos0);
+    
+    vec2 vel00 = velocities[getIndex(pos0)];
+    vec2 vel10 = velocities[getIndex(ivec2(pos1.x, pos0.y))];
+    vec2 vel01 = velocities[getIndex(ivec2(pos0.x, pos1.y))];
+    vec2 vel11 = velocities[getIndex(pos1)];
+    
+    vec2 vel0 = mix(vel00, vel10, frac.x);
+    vec2 vel1 = mix(vel01, vel11, frac.x);
+    
+    return mix(vel0, vel1, frac.y);
+}
+
+// Main computation
+void main() {
+    // Get current position
+    ivec2 pos = ivec2(gl_GlobalInvocationID.xy);
+    
+    // Skip if outside grid bounds
+    if (pos.x >= params.gridSize || pos.y >= params.gridSize) {
+        return;
+    }
+    
+    int idx = getIndex(pos);
+    
+    // Apply multiple steps of simulation
+    
+    // 1. Apply diffusion
+    vec2 diffusedVel = diffuse(pos);
+    
+    // 2. Calculate pressure to enforce incompressibility
+    float div = divergence(pos);
+    float newPressure = 0.0;
+    
+    // Jacobi iteration for pressure solving
+    for (int i = 0; i < params.iterations; i++) {
+        float sum = 0.0;
+        sum += pressures[getIndex(pos + ivec2(1, 0))];
+        sum += pressures[getIndex(pos + ivec2(-1, 0))];
+        sum += pressures[getIndex(pos + ivec2(0, 1))];
+        sum += pressures[getIndex(pos + ivec2(0, -1))];
+        newPressure = (div + sum) * 0.25;
+        // Use barrier for more accurate simulation (simplified here)
+        memoryBarrierBuffer();
+        pressures[idx] = newPressure;
+    }
+    
+    // 3. Apply pressure gradient to velocity
+    vec2 gradP;
+    gradP.x = (pressures[getIndex(pos + ivec2(1, 0))] - pressures[getIndex(pos + ivec2(-1, 0))]) * 0.5;
+    gradP.y = (pressures[getIndex(pos + ivec2(0, 1))] - pressures[getIndex(pos + ivec2(0, -1))]) * 0.5;
+    
+    // Remove gradient component from velocity
+    diffusedVel -= gradP;
+    
+    // 4. Advect velocities
+    vec2 advectedVel = advect(pos);
+    
+    // Update velocity field
+    velocities[idx] = mix(diffusedVel, advectedVel, params.viscosity);
+    
+    // 5. Update density based on velocity (simplified dye advection)
+    float currentDensity = densities[idx];
+    vec2 samplePos = vec2(pos) - velocities[idx] * params.deltaTime;
+    
+    ivec2 samplePos0 = ivec2(floor(samplePos));
+    ivec2 samplePos1 = samplePos0 + ivec2(1);
+    vec2 t = samplePos - vec2(samplePos0);
+    
+    float d00 = densities[getIndex(samplePos0)];
+    float d10 = densities[getIndex(ivec2(samplePos1.x, samplePos0.y))];
+    float d01 = densities[getIndex(ivec2(samplePos0.x, samplePos1.y))];
+    float d11 = densities[getIndex(samplePos1)];
+    
+    float d0 = mix(d00, d10, t.x);
+    float d1 = mix(d01, d11, t.x);
+    
+    densities[idx] = mix(d0, d1, t.y);
+    
+    // Apply some density dissipation
+    densities[idx] *= (1.0 - 0.01 * params.deltaTime);
+} 

@@ -1,8 +1,76 @@
 #include "llama-cpp.h"
 #include "llama.h"
+
 #include <cstdio>
 #include <cstring>
 #include <string>
+
+#ifdef USE_VULKAN_WRAPPERS
+#    include "AbstractIpcClientArray.hpp"
+
+#    include <chrono>
+#    include <iostream>
+#    include <mutex>
+#    include <thread>
+#    include <atomic>
+
+// Memory polling configuration
+const int MEMORY_POLL_INTERVAL_MS = 100; // Poll every 100ms
+const int MEMORY_USAGE_REQUEST = 86;     // Request type for memory usage (from gpu_info_server.hpp)
+//
+// Global variables for memory polling
+std::atomic<bool>   shouldStopMemoryPolling{ false };
+std::atomic<double> maxMemoryUsage{ 0.0 };
+std::thread         memoryPollingThread;
+
+// Memory polling thread function
+static void memoryPollingFunction() {
+    try {
+        // Create IPC client array to connect to GPU info servers
+        qvac_lib_abstract_ipc::AbstractIpcClientArray clientArray("vulkan_hooks.gpu_info_server",
+                                                                  4);  // Check up to 4 backends
+
+        {
+            std::cout << "Memory polling thread started. Found " << clientArray.getCount() << " GPU info backends."
+                      << std::endl;
+        }
+
+        double currentMax = 0.0;
+
+        while (!shouldStopMemoryPolling.load()) {
+            try {
+                // Poll memory usage from all available backends
+                // Request type 86 is MEMORY_USAGE for device 0
+                double memoryUsage = clientArray.sum(MEMORY_USAGE_REQUEST);
+
+                if (memoryUsage > currentMax) {
+                    currentMax = memoryUsage;
+                    maxMemoryUsage.store(currentMax);
+
+                    {
+                        std::cout << "New max memory usage detected: " << memoryUsage << " bytes" << std::endl;
+                    }
+                }
+
+            } catch (const std::exception & e) {
+                // If all backends fail, continue polling
+                std::this_thread::sleep_for(std::chrono::milliseconds(MEMORY_POLL_INTERVAL_MS));
+                continue;
+            }
+
+            std::this_thread::sleep_for(std::chrono::milliseconds(MEMORY_POLL_INTERVAL_MS));
+        }
+
+        {
+            std::cout << "Memory polling thread stopped. Final max memory usage: " << maxMemoryUsage.load() << " bytes"
+                      << std::endl;
+        }
+
+    } catch (const std::exception & e) {
+        std::cerr << "Memory polling thread error: " << e.what() << std::endl;
+    }
+}
+#endif
 
 static void print_usage(int, char ** argv) {
     printf("\nexample usage:\n");
@@ -12,18 +80,18 @@ static void print_usage(int, char ** argv) {
 }
 
 #ifdef LLAMA_COMMON_TEST_HEADERS
-#include "load_into_memory.h"
+#    include "load_into_memory.h"
 #endif
 
 int main(int argc, char ** argv) {
     // path to the model gguf file
     std::string model_path;
     // prompt to generate text from
-    std::string prompt = "Hello my name is";
+    std::string prompt    = "Hello my name is";
     // number of layers to offload to the GPU
-    int ngl = 99;
+    int         ngl       = 99;
     // number of tokens to predict
-    int n_predict = 32;
+    int         n_predict = 32;
 
     // parse command line arguments
 
@@ -83,10 +151,15 @@ int main(int argc, char ** argv) {
 
     ggml_backend_load_all();
 
-    // initialize the model
+    // Start memory polling thread
+#ifdef USE_VULKAN_WRAPPERS
+    shouldStopMemoryPolling.store(false);
+    memoryPollingThread = std::thread(memoryPollingFunction);
+#endif
 
+    // initialize the model
     llama_model_params model_params = llama_model_default_params();
-    model_params.n_gpu_layers = ngl;
+    model_params.n_gpu_layers       = ngl;
 
 #ifdef LLAMA_COMMON_TEST_HEADERS
     llama_model * model = memory_configuration_env_is_set() ?
@@ -104,7 +177,8 @@ int main(int argc, char ** argv) {
 
     // allocate space for the tokens and tokenize the prompt
     std::vector<llama_token> prompt_tokens(n_prompt);
-    if (llama_tokenize(vocab, prompt.c_str(), prompt.size(), prompt_tokens.data(), prompt_tokens.size(), true, true) < 0) {
+    if (llama_tokenize(vocab, prompt.c_str(), prompt.size(), prompt_tokens.data(), prompt_tokens.size(), true, true) <
+        0) {
         fprintf(stderr, "%s: error: failed to tokenize the prompt\n", __func__);
         return 1;
     }
@@ -113,23 +187,23 @@ int main(int argc, char ** argv) {
 
     llama_context_params ctx_params = llama_context_default_params();
     // n_ctx is the context size
-    ctx_params.n_ctx = n_prompt + n_predict - 1;
+    ctx_params.n_ctx                = n_prompt + n_predict - 1;
     // n_batch is the maximum number of tokens that can be processed in a single call to llama_decode
-    ctx_params.n_batch = n_prompt;
+    ctx_params.n_batch              = n_prompt;
     // enable performance counters
-    ctx_params.no_perf = false;
+    ctx_params.no_perf              = false;
 
     llama_context * ctx = llama_init_from_model(model, ctx_params);
 
     if (ctx == NULL) {
-        fprintf(stderr , "%s: error: failed to create the llama_context\n" , __func__);
+        fprintf(stderr, "%s: error: failed to create the llama_context\n", __func__);
         return 1;
     }
 
     // initialize the sampler
 
-    auto sparams = llama_sampler_chain_default_params();
-    sparams.no_perf = false;
+    auto sparams         = llama_sampler_chain_default_params();
+    sparams.no_perf      = false;
     llama_sampler * smpl = llama_sampler_chain_init(sparams);
 
     llama_sampler_chain_add(smpl, llama_sampler_init_greedy());
@@ -138,7 +212,7 @@ int main(int argc, char ** argv) {
 
     for (auto id : prompt_tokens) {
         char buf[128];
-        int n = llama_token_to_piece(vocab, id, buf, sizeof(buf), 0, true);
+        int  n = llama_token_to_piece(vocab, id, buf, sizeof(buf), 0, true);
         if (n < 0) {
             fprintf(stderr, "%s: error: failed to convert token to piece\n", __func__);
             return 1;
@@ -153,11 +227,11 @@ int main(int argc, char ** argv) {
 
     // main loop
 
-    const auto t_main_start = ggml_time_us();
-    int n_decode = 0;
+    const auto  t_main_start = ggml_time_us();
+    int         n_decode     = 0;
     llama_token new_token_id;
 
-    for (int n_pos = 0; n_pos + batch.n_tokens < n_prompt + n_predict; ) {
+    for (int n_pos = 0; n_pos + batch.n_tokens < n_prompt + n_predict;) {
         // evaluate the current batch with the transformer model
         if (llama_decode(ctx, batch)) {
             fprintf(stderr, "%s : failed to eval, return code %d\n", __func__, 1);
@@ -176,7 +250,7 @@ int main(int argc, char ** argv) {
             }
 
             char buf[128];
-            int n = llama_token_to_piece(vocab, new_token_id, buf, sizeof(buf), 0, true);
+            int  n = llama_token_to_piece(vocab, new_token_id, buf, sizeof(buf), 0, true);
             if (n < 0) {
                 fprintf(stderr, "%s: error: failed to convert token to piece\n", __func__);
                 return 1;
@@ -196,8 +270,8 @@ int main(int argc, char ** argv) {
 
     const auto t_main_end = ggml_time_us();
 
-    fprintf(stderr, "%s: decoded %d tokens in %.2f s, speed: %.2f t/s\n",
-            __func__, n_decode, (t_main_end - t_main_start) / 1000000.0f, n_decode / ((t_main_end - t_main_start) / 1000000.0f));
+    fprintf(stderr, "%s: decoded %d tokens in %.2f s, speed: %.2f t/s\n", __func__, n_decode,
+            (t_main_end - t_main_start) / 1000000.0f, n_decode / ((t_main_end - t_main_start) / 1000000.0f));
 
     fprintf(stderr, "\n");
     llama_perf_sampler_print(smpl);
@@ -207,6 +281,14 @@ int main(int argc, char ** argv) {
     llama_sampler_free(smpl);
     llama_free(ctx);
     llama_model_free(model);
+
+#ifdef USE_VULKAN_WRAPPERS
+    // Stop memory polling and wait for it to finish
+    shouldStopMemoryPolling.store(true);
+    if (memoryPollingThread.joinable()) {
+        memoryPollingThread.join();
+    }
+#endif
 
     return 0;
 }

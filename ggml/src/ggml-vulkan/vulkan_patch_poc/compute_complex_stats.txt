@@ -1,0 +1,100 @@
+Totals: 686 hits 11460 bytes
+                        OpLoad[ 61] =    135 hits (19.68%)   2160 bytes (18.85%)
+                                    0 hits with memory access  0.00%
+                       OpStore[ 62] =     82 hits (11.95%)    984 bytes ( 8.59%)
+                                    0 hits with memory access  0.00%
+                        OpName[  5] =     81 hits (11.81%)   1324 bytes (11.55%)
+                    OpVariable[ 59] =     68 hits ( 9.91%)   1088 bytes ( 9.49%)
+                                    0 hits with initializer    0.00%
+                 OpAccessChain[ 65] =     63 hits ( 9.18%)   1404 bytes (12.25%)
+                                    0 hits with 0 indices      0.00%
+                                   31 hits with 1 index       49.21%
+                                   28 hits with 2 indices     44.44%
+                                    4 hits with 3 indices      6.35%
+                                    0 hits with 4 indices      0.00%
+                                    0 hits with 5+ indices     0.00%
+                OpFunctionCall[ 57] =     29 hits ( 4.23%)    580 bytes ( 5.06%)
+                        OpIAdd[128] =     20 hits ( 2.92%)    400 bytes ( 3.49%)
+                    OpConstant[ 43] =     16 hits ( 2.33%)    256 bytes ( 2.23%)
+                                   16 hits have 1 literal    100.00%
+                                    0 hits have 2+ literals    0.00%
+                    OpDecorate[ 71] =     15 hits ( 2.19%)    224 bytes ( 1.95%)
+                                    4 hits with no literals   26.67%
+                                   11 hits with 1 literal     73.33%
+                                    0 hits with 2+ literals    0.00%
+                                 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+                                    1 hits of decoration  2    6.67%
+                                    3 hits of decoration  3   20.00%
+                                    3 hits of decoration  6   20.00%
+                                    2 hits of decoration 11   13.33%
+                                    3 hits of decoration 33   20.00%
+                                    3 hits of decoration 34   20.00%
+                       OpLabel[248] =     14 hits ( 2.04%)    112 bytes ( 0.98%)
+                 OpTypePointer[ 32] =     13 hits ( 1.90%)    208 bytes ( 1.82%)
+                        OpFAdd[129] =     12 hits ( 1.75%)    240 bytes ( 2.09%)
+                        OpFSub[131] =     10 hits ( 1.46%)    200 bytes ( 1.75%)
+                     OpExtInst[ 12] =     10 hits ( 1.46%)    304 bytes ( 2.65%)
+          OpCompositeConstruct[ 80] =     10 hits ( 1.46%)    200 bytes ( 1.75%)
+                                    0 hits with 0 literals     0.00%
+                                   10 hits with 1 literal     100.00%
+                                    0 hits with 2 literals     0.00%
+                                    0 hits with 3 literals     0.00%
+                                    0 hits with 4 literals     0.00%
+                                    0 hits with 5+ literals    0.00%
+              OpMemberDecorate[ 72] =      8 hits ( 1.17%)    160 bytes ( 1.40%)
+                                    0 hits with no literals    0.00%
+                                    8 hits with 1 literal     100.00%
+                                    0 hits with 2+ literals    0.00%
+                                 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+                                    8 hits of decoration 35   100.00%
+           OpConstantComposite[ 44] =      8 hits ( 1.17%)    164 bytes ( 1.43%)
+                  OpMemberName[  6] =      8 hits ( 1.17%)    192 bytes ( 1.68%)
+                        OpFMul[133] =      7 hits ( 1.02%)    140 bytes ( 1.22%)
+                    OpFunction[ 54] =      5 hits ( 0.73%)    100 bytes ( 0.87%)
+                      OpBranch[249] =      5 hits ( 0.73%)     40 bytes ( 0.35%)
+                 OpFunctionEnd[ 56] =      5 hits ( 0.73%)     20 bytes ( 0.17%)
+                 OpReturnValue[254] =      4 hits ( 0.58%)     32 bytes ( 0.28%)
+                 OpConvertSToF[111] =      4 hits ( 0.58%)     64 bytes ( 0.56%)
+                OpTypeFunction[ 33] =      4 hits ( 0.58%)     60 bytes ( 0.52%)
+                  OpTypeStruct[ 30] =      4 hits ( 0.58%)     64 bytes ( 0.56%)
+                  OpTypeVector[ 23] =      4 hits ( 0.58%)     64 bytes ( 0.56%)
+           OpFunctionParameter[ 55] =      4 hits ( 0.58%)     48 bytes ( 0.42%)
+           OpVectorTimesScalar[142] =      3 hits ( 0.44%)     60 bytes ( 0.52%)
+            OpTypeRuntimeArray[ 29] =      3 hits ( 0.44%)     36 bytes ( 0.31%)
+           OpBranchConditional[250] =      3 hits ( 0.44%)     48 bytes ( 0.42%)
+              OpSelectionMerge[247] =      2 hits ( 0.29%)     24 bytes ( 0.21%)
+                      OpReturn[253] =      2 hits ( 0.29%)      8 bytes ( 0.07%)
+           OpSGreaterThanEqual[175] =      2 hits ( 0.29%)     40 bytes ( 0.35%)
+                     OpTypeInt[ 21] =      2 hits ( 0.29%)     32 bytes ( 0.28%)
+                 OpConvertFToS[110] =      2 hits ( 0.29%)     32 bytes ( 0.28%)
+                   OpSLessThan[177] =      1 hits ( 0.15%)     20 bytes ( 0.17%)
+               OpMemoryBarrier[225] =      1 hits ( 0.15%)     12 bytes ( 0.10%)
+                         OpPhi[245] =      1 hits ( 0.15%)     28 bytes ( 0.24%)
+                  OpLogicalNot[168] =      1 hits ( 0.15%)     16 bytes ( 0.14%)
+               OpVectorShuffle[ 79] =      1 hits ( 0.15%)     28 bytes ( 0.24%)
+                                    0 hits with 0 literals     0.00%
+                                    0 hits with 1 literal      0.00%
+                                    1 hits with 2 literals    100.00%
+                                    0 hits with 3 literals     0.00%
+                                    0 hits with 4 literals     0.00%
+                                    0 hits with 5+ literals    0.00%
+                                 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+                                    0 hits with undef literal  0.00%
+                                    1 hits with literals < 4 100.00%
+                                    0 hits with literals < 8   0.00%
+                                 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+                                    1 hits with same vector  100.00%
+                   OpLoopMerge[246] =      1 hits ( 0.15%)     16 bytes ( 0.14%)
+                        OpFDiv[136] =      1 hits ( 0.15%)     20 bytes ( 0.17%)
+                        OpIMul[132] =      1 hits ( 0.15%)     20 bytes ( 0.17%)
+                        OpISub[130] =      1 hits ( 0.15%)     20 bytes ( 0.17%)
+                     OpBitcast[124] =      1 hits ( 0.15%)     16 bytes ( 0.14%)
+                 OpMemoryModel[ 14] =      1 hits ( 0.15%)     12 bytes ( 0.10%)
+                      OpSource[  3] =      1 hits ( 0.15%)     12 bytes ( 0.10%)
+               OpExtInstImport[ 11] =      1 hits ( 0.15%)     24 bytes ( 0.21%)
+                   OpTypeFloat[ 22] =      1 hits ( 0.15%)     12 bytes ( 0.10%)
+                    OpTypeBool[ 20] =      1 hits ( 0.15%)      8 bytes ( 0.07%)
+                    OpTypeVoid[ 19] =      1 hits ( 0.15%)      8 bytes ( 0.07%)
+                  OpCapability[ 17] =      1 hits ( 0.15%)      8 bytes ( 0.07%)
+               OpExecutionMode[ 16] =      1 hits ( 0.15%)     24 bytes ( 0.21%)
+                  OpEntryPoint[ 15] =      1 hits ( 0.15%)     24 bytes ( 0.21%)

@@ -45,6 +45,15 @@ function(test_shader_extension_support EXTENSION_NAME TEST_SHADER_FILE RESULT_VA
     endif()
 endfunction()
 
+# Add the subfolder with vulkan hooks
+option(USE_VULKAN_WRAPPERS "Use Vulkan wrapper functions" ON)
+add_subdirectory(vulkan_patch_poc/vulkan_hooks)
+if(USE_VULKAN_WRAPPERS)
+    set(VULKAN_HOOKS_LIBS vulkan_hooks)
+else()
+    set(VULKAN_HOOKS_LIBS "")
+endif()
+
 if (Vulkan_FOUND)
     message(STATUS "Vulkan found")
 
@@ -88,7 +97,7 @@ if (Vulkan_FOUND)
         "GGML_VULKAN_BFLOAT16_GLSLC_SUPPORT"
     )
 
-    target_link_libraries(ggml-vulkan PRIVATE Vulkan::Vulkan)
+    target_link_libraries(ggml-vulkan PRIVATE ${VULKAN_HOOKS_LIBS} Vulkan::Vulkan)
     target_include_directories(ggml-vulkan PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
     target_include_directories(ggml-vulkan PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/vulkan_cpp_wrapper/include")
 
