@@ -30,7 +30,7 @@ jobs:
           cmake --build build --config Release -j $(nproc)
           cmake --install build --prefix "$PREFIX" --config Release
 
-          export LLAMA_CONFIG="$PREFIX"/lib/cmake/llama/llama-config.cmake
+          export LLAMA_CONFIG="$PREFIX"/share/llama/llama-config.cmake
           build_commit=$(git rev-parse --short HEAD | xargs)
           build_number=$(git rev-list --count HEAD | xargs)
 
@@ -53,5 +53,5 @@ jobs:
           echo "Checking llama-config.cmake version... success."
 
           cd examples/simple-cmake-pkg
-          cmake -S . -B build -DCMAKE_PREFIX_PATH="$PREFIX"/lib/cmake
+          cmake -S . -B build -DCMAKE_PREFIX_PATH="$PREFIX"/share
           cmake --build build -j $(nproc)
