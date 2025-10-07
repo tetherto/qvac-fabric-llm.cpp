@@ -363,6 +363,10 @@ void mtmd_free(mtmd_context * ctx) {
     }
 }
 
+void mtmd_log_set_llama_callback(ggml_log_callback llama_cb, void * llama_user_data) {
+    clip_log_set_callback(llama_cb, llama_user_data);
+}
+
 struct mtmd_tokenizer {
     mtmd_context * ctx;
     std::vector<const mtmd_bitmap *> bitmaps;

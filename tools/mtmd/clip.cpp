@@ -28,7 +28,11 @@
 #include <numeric>
 #include <functional>
 
-struct clip_logger_state g_logger_state = {GGML_LOG_LEVEL_CONT, clip_log_callback_default, NULL};
+struct clip_logger_state g_logger_state = {
+    GGML_LOG_LEVEL_CONT,           // verbosity_thold
+    clip_log_callback_default,     // log_callback
+    NULL                           // log_callback_user_data
+};
 
 enum ffn_op_type {
     FFN_GELU,
