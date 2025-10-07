@@ -52,9 +52,19 @@ static std::shared_ptr<ggml_threadpool> mtmd_threadpool_init(int n_threads) {
     return std::shared_ptr<ggml_threadpool>(threadpool, free_fn);
 }
 
-ggml_backend_dev_t mtmd_select_device(bool use_gpu, ggml_backend_dev_t device) {
+ggml_backend_dev_t mtmd_select_device(bool use_gpu, ggml_backend_dev_t device, const char * backend_name) {
     if (!use_gpu) {
         return nullptr;
+    }
+    if (backend_name == nullptr) {
+        backend_name = std::getenv("MTMD_BACKEND_DEVICE");
+    }
+    if (backend_name != nullptr) {
+        ggml_backend_dev_t dev = ggml_backend_dev_by_name(backend_name);
+        if (dev != nullptr) {
+            return dev;
+        }
+        LOG_WRN("%s: Warning: Failed to find \"%s\" backend, falling back to default GPU backend\n", __func__, backend_name);
     }
     if (device != nullptr) {
         return device;

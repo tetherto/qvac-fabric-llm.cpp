@@ -30,7 +30,8 @@ struct mtmd_subctx_params {
 };
 
 // the device the weights and the graphs are placed on, nullptr means CPU
-ggml_backend_dev_t mtmd_select_device(bool use_gpu, ggml_backend_dev_t device);
+// backend_name (or the MTMD_BACKEND_DEVICE env var) takes precedence over device, falling back if not found
+ggml_backend_dev_t mtmd_select_device(bool use_gpu, ggml_backend_dev_t device, const char * backend_name = nullptr);
 
 // shared by the subcontexts, not thread-safe
 struct mtmd_backends {

@@ -133,6 +133,7 @@ struct mtmd_context_params {
     // If it returns false, model loading is immediately aborted.
     mtmd_progress_callback progress_callback;
     void * progress_callback_user_data;
+    const char * backend_device; // optional GPU backend name (e.g. "CUDA", "Metal", "Vulkan"), if null will use env var or default
 };
 
 MTMD_API const char * mtmd_default_marker(void);
@@ -146,6 +147,15 @@ MTMD_API mtmd_context * mtmd_init_from_file(const char * mmproj_fname,
                                             const struct mtmd_context_params ctx_params);
 
 MTMD_API void mtmd_free(mtmd_context * ctx);
+
+// Set up logging to use llama's logging callback
+// This redirects all mtmd logging through llama's logging system
+// Call this after llama_log_set to ensure mtmd uses the same logging callback
+// Kept for backward compatibility, equivalent to mtmd_log_set()
+// Example:
+//   llama_log_set(my_log_callback, my_user_data);
+//   mtmd_log_set_llama_callback(my_log_callback, my_user_data);
+MTMD_API void mtmd_log_set_llama_callback(ggml_log_callback llama_cb, void * llama_user_data);
 
 // whether we need to set non-causal mask before llama_decode
 // if chunk is nullptr, we assume the default case where chunk is an image chunk

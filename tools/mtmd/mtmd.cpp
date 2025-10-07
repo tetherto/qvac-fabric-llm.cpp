@@ -604,6 +604,7 @@ mtmd_context_params mtmd_context_params_default() {
         /* batch_max_tokens  */ 1024,
         /* progress_callback */ nullptr,
         /* progress_callback_user_data */ nullptr,
+        /* backend_device    */ nullptr,
     };
     return params;
 }
@@ -717,7 +718,7 @@ struct mtmd_context {
             }
         }
 
-        ggml_backend_dev_t device = mtmd_select_device(ctx_params.use_gpu, ctx_params.device);
+        ggml_backend_dev_t device = mtmd_select_device(ctx_params.use_gpu, ctx_params.device, ctx_params.backend_device);
 
         mtmd_model_params model_params;
         model_params.image_min_tokens            = ctx_params.image_min_tokens;
@@ -1429,6 +1430,10 @@ std::vector<std::vector<const mtmd_bitmap *>> mtmd_group_mergeable_bitmaps(std::
         output.push_back({parts[i].bitmap});
     }
     return output;
+}
+
+void mtmd_log_set_llama_callback(ggml_log_callback llama_cb, void * llama_user_data) {
+    mtmd_log_set(llama_cb, llama_user_data);
 }
 
 struct mtmd_tokenizer {
