@@ -5283,7 +5283,11 @@ void ggml_vk_instance_init() {
         vk_instance.pfn_vkCmdInsertDebugUtilsLabelEXT = (PFN_vkCmdInsertDebugUtilsLabelEXT) vkGetInstanceProcAddr(vk_instance.instance, "vkCmdInsertDebugUtilsLabelEXT");
     }
 
+#ifndef FORCE_GGML_VK_PERF_LOGGER
     vk_perf_logger_enabled = getenv("GGML_VK_PERF_LOGGER") != nullptr;
+#else
+    vk_perf_logger_enabled = true;
+#endif
     vk_perf_logger_concurrent = getenv("GGML_VK_PERF_LOGGER_CONCURRENT") != nullptr;
     vk_enable_sync_logger = getenv("GGML_VK_SYNC_LOGGER") != nullptr;
     vk_memory_logger_enabled = getenv("GGML_VK_MEMORY_LOGGER") != nullptr;
@@ -16597,14 +16601,15 @@ void vk_perf_logger::print_timings(bool force) {
         return;
     }
     print_count = 0;
+    std::stringstream ss;
     uint64_t total_all_op_times = 0;
-    std::cerr << "----------------\nVulkan Timings:" << std::endl;
+    ss << "----------------\nVulkan Timings:" << std::endl;
     for (const auto & t : timings) {
         uint64_t total_op_times = 0;
         for (const auto & time : t.second) {
             total_op_times += time;
         }
-        std::cerr << t.first << ": " << t.second.size() << " x " << (total_op_times / t.second.size() / 1000.0)
+        ss << t.first << ": " << t.second.size() << " x " << (total_op_times / t.second.size() / 1000.0)
                   << " us = " << (total_op_times / 1000.0) << " us";
 
         // If we have as many flops entries as timing entries for the op, then compute and log the flops/S.
@@ -16614,7 +16619,7 @@ void vk_perf_logger::print_timings(bool force) {
             for (const auto & elem : it->second) {
                 total_op_flops += elem;
             }
-            std::cerr << " ("
+            ss << " ("
                       << (double(total_op_flops) / (1000.0 * 1000.0 * 1000.0)) /
                              (double(total_op_times) / (1000.0 * 1000.0 * 1000.0))
                       << " GFLOPS/s)";
@@ -16622,13 +16627,14 @@ void vk_perf_logger::print_timings(bool force) {
 
         total_all_op_times += total_op_times;
 
-        std::cerr << std::endl;
+        ss << std::endl;
     }
 
     if (timings.size() > 0) {
-        std::cerr << "Total time: " << total_all_op_times / 1000.0 << " us." << std::endl;
+        ss << "Total time: " << total_all_op_times / 1000.0 << " us." << std::endl;
     }
-
+    auto ssStr = ss.str();
+    GGML_LOG_DEBUG("%s", ssStr.c_str());
     timings.clear();
     flops.clear();
 }

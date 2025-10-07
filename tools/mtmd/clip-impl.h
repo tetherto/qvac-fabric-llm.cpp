@@ -939,11 +939,19 @@ static void clip_log_callback_default(enum ggml_log_level level, const char * te
 }
 
 struct clip_logger_state {
+    enum ggml_log_level verbosity_thold;
     ggml_log_callback log_callback;
     void * log_callback_user_data;
 };
 
 extern struct clip_logger_state g_logger_state;
+
+// Function to set logging callback (can be used to redirect to llama's logging)
+// If not called, will use the default callback (logs to stderr)
+static inline void clip_log_set_callback(ggml_log_callback callback, void * user_data) {
+    g_logger_state.log_callback = callback;
+    g_logger_state.log_callback_user_data = user_data;
+}
 
 static void clip_log_internal_v(enum ggml_log_level level, const char * format, va_list args) {
     if (format == NULL) {

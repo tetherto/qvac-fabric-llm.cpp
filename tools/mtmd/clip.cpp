@@ -27,7 +27,12 @@
 #include <functional>
 #include <float.h>
 
-struct clip_logger_state g_logger_state = {clip_log_callback_default, NULL};
+// TODO: allow to pass callback from user code
+struct clip_logger_state g_logger_state = {
+    GGML_LOG_LEVEL_CONT,           // verbosity_thold
+    clip_log_callback_default,     // log_callback
+    NULL                           // log_callback_user_data
+};
 
 //#define CLIP_DEBUG_FUNCTIONS
 
@@ -182,13 +187,21 @@ struct clip_ctx {
             throw std::runtime_error("failed to initialize CPU backend");
         }
         if (ctx_params.use_gpu) {
-            if (ctx_params.device != nullptr) {
+            auto * backend_name = ctx_params.backend_device ? ctx_params.backend_device : std::getenv("MTMD_BACKEND_DEVICE");
+            if (backend_name != nullptr) {
+                backend = ggml_backend_init_by_name(backend_name, nullptr);
+                if (!backend) {
+                    LOG_WRN("%s: Warning: Failed to initialize \"%s\" backend, falling back to default GPU backend\n", __func__, backend_name);
+                }
+            }
+            if (!backend && ctx_params.device != nullptr) {
                 backend = ggml_backend_dev_init(ctx_params.device, nullptr);
                 if (!backend) {
                     throw std::runtime_error(string_format("%s: failed to initialize \"%s\" backend\n",
                                                            __func__, ggml_backend_dev_name(ctx_params.device)));
                 }
-            } else {
+            }
+            if (!backend) {
                 backend = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_GPU, nullptr);
                 backend = backend ? backend : ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_IGPU, nullptr);
             }

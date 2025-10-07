@@ -60,6 +60,7 @@ struct clip_context_params {
     bool no_alloc;
     mtmd_progress_callback progress_callback;
     void * progress_callback_user_data;
+    const char * backend_device; // optional, if null will use env var or default GPU backend
 };
 
 struct clip_init_result {

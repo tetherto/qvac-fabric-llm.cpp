@@ -2577,6 +2577,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples(mmproj_examples).set_env("MTMD_BACKEND_DEVICE")); // no LLAMA_ARG_ prefix for backward compatibility reason
     add_opt(common_arg(
+        {"--mmproj-backend"}, "NAME",
+        "GPU backend for multimodal projector (e.g. CUDA, Metal, Vulkan)\n"
+        "if not specified, will use MTMD_BACKEND_DEVICE env var or default GPU backend",
+        [](common_params & params, const std::string & value) {
+            params.mmproj_backend = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_MTMD, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
         {"--image", "--audio", "--video"}, "FILE",
         "path to an image, audio, or video file. use with multimodal models, use comma-separated values for multiple files\n",
         [](common_params & params, const std::string & value) {
