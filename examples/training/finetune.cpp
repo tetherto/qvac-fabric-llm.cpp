@@ -62,14 +62,15 @@ int main(int argc, char ** argv) {
             ggml_opt_optimizer_name(params.optimizer), (double) lr.lr0, (double) lr.wd, (double) lr.lr_min, (double) lr.decay_epochs,
             (unsigned) lr.epochs, (double) params.n_batch / params.n_ubatch, (double) params.val_split);
 
-    struct llama_opt_params lopt_params{
-        /*n_ctx_train     =*/0,
-        // /*param_filter    =*/llama_opt_param_filter_all,
-                              llama_opt_param_filter_lora,
-        /*param_filter_ud =*/nullptr,
-        /*get_opt_pars    =*/common_opt_lr_pars,
-        /*get_opt_pars_ud =*/&params.lr,
-        /*optimizer_type  =*/params.optimizer,
+    struct llama_opt_params lopt_params {
+        /*n_ctx_train     =*/ 0,
+        /*param_filter    =*/ llama_opt_param_filter_all,
+        /*param_filter_ud =*/ nullptr,
+        /*get_opt_pars    =*/ common_opt_lr_pars,
+        /*get_opt_pars_ud =*/ &params.lr,
+        /*optimizer_type  =*/ params.optimizer,
+        /*checkpoint_path =*/ nullptr,
+        /*load_optimizer_state =*/ false,
     };
     llama_opt_init(ctx.get(), model.get(), lopt_params);
 
@@ -80,7 +81,7 @@ int main(int argc, char ** argv) {
 
     for (lr.epoch = 0; lr.epoch < lr.epochs; ++lr.epoch) {
         llama_opt_epoch(ctx.get(), dataset, result_train, result_eval, idata_split,
-                        ggml_opt_epoch_callback_progress_bar, ggml_opt_epoch_callback_progress_bar);
+            ggml_opt_epoch_callback_progress_bar, ggml_opt_epoch_callback_progress_bar, -1);
         fprintf(stderr, "\n");
 
         ggml_opt_result_reset(result_train);
