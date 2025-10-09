@@ -371,25 +371,25 @@ bool llama_lora_save_checkpoint(
         if (!std::filesystem::exists(checkpoint_dir)) {
             if (!std::filesystem::create_directories(checkpoint_dir)) {
                 LLAMA_LOG_ERROR("llama_lora_save_checkpoint: failed to create checkpoint directory: %s\n", 
-                               checkpoint_dir.c_str());
+                               checkpoint_dir.string().c_str());
                 return false;
             }
         }
     }
 
     std::filesystem::path model_path = checkpoint_dir / "model.gguf";
-    bool lora_saved = llama_lora_save_adapter(adapter, model_path.c_str(), model);
+    bool lora_saved = llama_lora_save_adapter(adapter, model_path.string().c_str(), model);
     if (!lora_saved) {
         LLAMA_LOG_ERROR("llama_lora_save_checkpoint: failed to save LoRA adapter weights to %s\n", 
-                        model_path.c_str());
+                        model_path.string().c_str());
         return false;
     }
 
     std::filesystem::path optimizer_path = checkpoint_dir / "optimizer.gguf";    
-    bool optimizer_saved = ctx->opt_save_state(optimizer_path.c_str());
+    bool optimizer_saved = ctx->opt_save_state(optimizer_path.string().c_str());
     if (!optimizer_saved) {
         LLAMA_LOG_ERROR("llama_lora_save_checkpoint: failed to save optimizer state to %s\n", 
-                        optimizer_path.c_str());
+                        optimizer_path.string().c_str());
         return false;
     }
 
