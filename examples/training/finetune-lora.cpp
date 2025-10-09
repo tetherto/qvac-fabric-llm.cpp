@@ -259,7 +259,7 @@ static void checkpoint_progress_callback(
         std::string checkpoint_path = get_checkpoint_filename(cb_data->checkpoint_save_dir, cb_data->global_step);
         
         if (!save_checkpoint(cb_data->ctx, cb_data->adapter, meta, checkpoint_path)) {
-            LOG_ERR("Failed to save checkpoint at step %ld\n", cb_data->global_step);
+            LOG_ERR("Failed to save checkpoint at step %lld\n", (long long)cb_data->global_step);
         }
     }
 }
@@ -547,7 +547,7 @@ int main(int argc, char ** argv) {
     ggml_opt_result_t result_eval  = ggml_opt_result_init();
 
     for (int epoch = start_epoch; epoch < ft_params.num_epochs; ++epoch) {
-        LOG_INF("Starting epoch %d (step %ld)\n", epoch, cb_data.global_step);
+    LOG_INF("Starting epoch %d (step %lld)\n", epoch, (long long)cb_data.global_step);
         cb_data.current_epoch = epoch;
         
         int64_t resume_batch = 0;
@@ -561,7 +561,7 @@ int main(int argc, char ** argv) {
             ggml_opt_epoch_callback_progress_bar : checkpoint_progress_callback;
 
         if (resume_batch > 0) {
-            LOG_INF("Resuming training from epoch %d, step %ld \n", epoch, resume_batch);
+            LOG_INF("Resuming training from epoch %d, step %lld \n", epoch, (long long)resume_batch);
         } else if (ft_params.checkpoint_save_steps > 0) {
             LOG_INF("Checkpointing enabled, saving every %d steps\n", ft_params.checkpoint_save_steps);
         } else {
