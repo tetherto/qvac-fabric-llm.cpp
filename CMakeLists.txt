@@ -99,6 +99,9 @@ option(LLAMA_HTTPLIB    "llama: if libcurl is disabled, use httplib to download 
 option(LLAMA_OPENSSL    "llama: use openssl to support HTTPS" OFF)
 option(LLAMA_LLGUIDANCE "llama-common: include LLGuidance library for structured output in common utils" OFF)
 
+# profiling
+option(FORCE_GGML_VK_PERF_LOGGER "Force vk performance logging in ggml" OFF)
+
 # Required for relocatable CMake package
 include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/build-info.cmake)
 include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/common.cmake)
