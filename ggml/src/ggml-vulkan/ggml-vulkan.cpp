@@ -1964,6 +1964,21 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         }
 
         vk_pipeline *ptr = &base_pipeline;
+        std::string effective_name = name;
+
+        // if a variant shader exists for this SPIR-V symbol base, use it instead.
+        if (device->vendor_id == VK_VENDOR_ID_QUALCOMM) {
+            uint64_t adreno_len = 0;
+            const void * adreno_data = nullptr;
+            if (ggml_vk_get_adreno_variant(spv_data, &adreno_len, &adreno_data)) {
+                spv_size = (size_t) adreno_len;
+                spv_data = adreno_data;
+                effective_name = "adreno_" + std::string(name);
+                VK_LOG_DEBUG("ggml_vk_create_pipeline(): using Adreno variant for shader " << name);
+            } else {
+                VK_LOG_DEBUG("ggml_vk_create_pipeline(): no Adreno variant found for shader " << name);
+            }
+        }
 
         int num_pipelines = 1;
 #if defined(VK_EXT_shader_64bit_indexing)
@@ -1977,7 +1992,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                 pipeline = std::make_shared<vk_pipeline_struct>();
             }
             if (!pipeline->initialized) {
-                pipeline->name = name;
+                pipeline->name = effective_name;
                 pipeline->parameter_count = parameter_count;
                 pipeline->push_constant_size = push_constant_size;
                 pipeline->wg_denoms = wg_denoms;
@@ -2891,7 +2906,8 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     };
     uint32_t rm_iq = 2 * rm_kq;
 
-    const bool use_subgroups = device->subgroup_arithmetic;
+    const bool use_subgroups = device->subgroup_arithmetic &&
+        device->vendor_id != VK_VENDOR_ID_QUALCOMM;
     // The Imagination proprietary compiler rejects the subgroup-only dequant mul_mat_vec
     // shaders that require a subgroup size >= 16; fall back to shared-memory reduction.
     const bool is_imagination_proprietary =
@@ -4927,7 +4943,8 @@ vk_device ggml_vk_get_device(size_t idx) {
 
         device->serialize_submissions = getenv("GGML_VK_SERIALIZE_SUBMISSIONS") != nullptr;
 
-        device->disable_fusion = getenv("GGML_VK_DISABLE_FUSION") != nullptr;
+        device->disable_fusion = getenv("GGML_VK_DISABLE_FUSION") != nullptr ||
+                                 device->vendor_id == VK_VENDOR_ID_QUALCOMM;
 
         device->disable_descriptor_reuse = getenv("GGML_VK_DISABLE_DESCRIPTOR_REUSE") != nullptr;
 

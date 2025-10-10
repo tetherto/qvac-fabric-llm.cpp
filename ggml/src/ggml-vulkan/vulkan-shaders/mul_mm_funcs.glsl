@@ -355,8 +355,25 @@ void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uin
 
         const float d = float(a_q4_0_p16.data[ib].d);
         const uint vui = uint(a_q4_0_p16.data[ib].qs[2*iqs]) | (uint(a_q4_0_p16.data[ib].qs[2*iqs + 1]) << 16);
+
+#if defined(ADRENO)
+        const vec4 v0 = (vec4(
+            float((vui >> 0)  & 0xF),
+            float((vui >> 8)  & 0xF),
+            float((vui >> 16) & 0xF),
+            float((vui >> 24) & 0xF)
+        ) - 8.0) * d;
+
+        const vec4 v1 = (vec4(
+            float((vui >> 4)  & 0xF),
+            float((vui >> 12) & 0xF),
+            float((vui >> 20) & 0xF),
+            float((vui >> 28) & 0xF)
+        ) - 8.0) * d;
+#else
         const vec4 v0 = (vec4(unpack8(vui & 0x0F0F0F0F)) - 8.0f) * d;
         const vec4 v1 = (vec4(unpack8((vui >> 4) & 0x0F0F0F0F)) - 8.0f) * d;
+#endif
 
         store_a(col, k_pair, FLOAT_TYPEV2(v0.xy));
         store_a(col, k_pair + 1, FLOAT_TYPEV2(v0.zw));
@@ -371,8 +388,23 @@ void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uin
 
         const vec2 dm = vec2(a_q4_1_p32.data[ib].dm);
         const uint vui = a_q4_1_p32.data[ib].qs[iqs];
+#if defined(ADRENO)
+        const vec4 v0 = vec4(
+            float((vui >> 0)  & 0xF),
+            float((vui >> 8)  & 0xF),
+            float((vui >> 16) & 0xF),
+            float((vui >> 24) & 0xF)
+        ) * dm.x + dm.y;
+        const vec4 v1 = vec4(
+            float((vui >> 4)  & 0xF),
+            float((vui >> 12) & 0xF),
+            float((vui >> 20) & 0xF),
+            float((vui >> 28) & 0xF)
+        ) * dm.x + dm.y;
+#else
         const vec4 v0 = vec4(unpack8(vui & 0x0F0F0F0F)) * dm.x + dm.y;
         const vec4 v1 = vec4(unpack8((vui >> 4) & 0x0F0F0F0F)) * dm.x + dm.y;
+#endif
 
         store_a(col, k_pair, FLOAT_TYPEV2(v0.xy));
         store_a(col, k_pair + 1, FLOAT_TYPEV2(v0.zw));
@@ -424,10 +456,20 @@ void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uin
         const uint ib = idx / 8;
         const uint iqs = idx & 0x07;
 
+#if defined(ADRENO)
+        const float d = float(a_q8_0.data[ib].d);
+        const vec4 v = vec4(
+            int(a_q8_0.data[ib].qs[4*iqs]),
+            int(a_q8_0.data[ib].qs[4*iqs + 1]),
+            int(a_q8_0.data[ib].qs[4*iqs + 2]),
+            int(a_q8_0.data[ib].qs[4*iqs + 3])
+        ) * d;
+#else
         const float d = float(a_q8_0_p16.data[ib].d);
         const i8vec2 v0 = unpack8(int32_t(a_q8_0_p16.data[ib].qs[2*iqs])).xy; // vec4 used due to #12147
         const i8vec2 v1 = unpack8(int32_t(a_q8_0_p16.data[ib].qs[2*iqs + 1])).xy;
         const vec4 v = vec4(v0.x, v0.y, v1.x, v1.y) * d;
+#endif
 
         store_a(col, k_pair, FLOAT_TYPEV2(v.xy));
         store_a(col, k_pair + 1, FLOAT_TYPEV2(v.zw));
