@@ -102,6 +102,9 @@ layout (binding = 0) readonly buffer BUF_Q3_K     { block_q3_K data[];     } a_q
 layout (binding = 0) readonly buffer BUF_Q4_K     { block_q4_K data[];     } a_q4_k;
 layout (binding = 0) readonly buffer BUF_Q5_K     { block_q5_K data[];     } a_q5_k;
 layout (binding = 0) readonly buffer BUF_Q6_K     { block_q6_K data[];     } a_q6_k;
+#if defined(ADRENO)
+layout (binding = 0) readonly buffer BUF_Q8_0     { block_q8_0 data[];     } a_q8_0;
+#endif
 layout (binding = 0) readonly buffer BUF_TQ1_0    { block_tq1_0 data[];    } a_tq1_0;
 layout (binding = 0) readonly buffer BUF_TQ2_0    { block_tq2_0 data[];    } a_tq2_0;
 // Packed16 aliases
