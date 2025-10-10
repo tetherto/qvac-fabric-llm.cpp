@@ -92,6 +92,7 @@ static bool is_pow2(uint32_t x) { return x > 1 && (x & (x-1)) == 0; }
 #define VK_VENDOR_ID_APPLE 0x106b
 #define VK_VENDOR_ID_INTEL 0x8086
 #define VK_VENDOR_ID_NVIDIA 0x10de
+#define VK_VENDOR_ID_QUALCOMM 0x5143
 
 #define VK_DEVICE_DESCRIPTOR_POOL_SIZE 256
 
@@ -253,6 +254,7 @@ enum vk_device_architecture {
     AMD_RDNA3,
     INTEL_XE2,
     NVIDIA_PRE_TURING,
+    QUALCOMM_ADRENO,
 };
 
 static vk_device_architecture get_device_architecture(const vk::PhysicalDevice& device) {
@@ -347,6 +349,8 @@ static vk_device_architecture get_device_architecture(const vk::PhysicalDevice& 
         if (!cooperative_matrix) {
             return vk_device_architecture::NVIDIA_PRE_TURING;
         }
+    } else if (props.vendorID == VK_VENDOR_ID_QUALCOMM) {
+        return vk_device_architecture::QUALCOMM_ADRENO;
     }
     return vk_device_architecture::OTHER;
 }
