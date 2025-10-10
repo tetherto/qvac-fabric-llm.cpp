@@ -5037,6 +5037,7 @@ static vk_device ggml_vk_get_device(size_t idx) {
 #ifndef GGML_VULKAN_RUN_TESTS
             case VK_VENDOR_ID_AMD:
             case VK_VENDOR_ID_INTEL:
+            case VK_VENDOR_ID_QUALCOMM:
                 device->mul_mat_l[i] = false;
                 device->mul_mat_m[i] = true;
                 device->mul_mat_s[i] = true;
