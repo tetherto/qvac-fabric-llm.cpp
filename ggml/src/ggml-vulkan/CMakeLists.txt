@@ -119,6 +119,11 @@ if (Vulkan_FOUND)
         add_compile_definitions(GGML_VULKAN_DEBUG)
     endif()
 
+    if (GGML_VULKAN_BUILD_ADRENO_SHADERS)
+        add_compile_definitions(GGML_VULKAN_BUILD_ADRENO_SHADERS)
+        list(APPEND VULKAN_SHADER_GEN_CMAKE_ARGS -DGGML_VULKAN_BUILD_ADRENO_SHADERS=ON)
+    endif()
+
     if (GGML_VULKAN_MEMORY_DEBUG)
         add_compile_definitions(GGML_VULKAN_MEMORY_DEBUG)
     endif()
