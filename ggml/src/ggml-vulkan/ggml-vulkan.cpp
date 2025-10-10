@@ -5102,7 +5102,8 @@ static vk_device ggml_vk_get_device(size_t idx) {
 
         device->idx = idx;
 
-        device->disable_fusion = getenv("GGML_VK_DISABLE_FUSION") != nullptr;
+        device->disable_fusion = getenv("GGML_VK_DISABLE_FUSION") != nullptr ||
+                                 device->vendor_id == VK_VENDOR_ID_QUALCOMM;
 
         device->add_rms_fusion = !device->disable_fusion &&
                                  device->subgroup_arithmetic &&
