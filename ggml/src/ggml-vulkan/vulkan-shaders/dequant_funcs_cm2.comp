@@ -663,13 +663,12 @@ float16_t dequantFuncTQ2_0(const in decodeBufTQ2_0 bl, const in uint blockCoords
 {
     const float16_t d = bl.block.d;
     const uint idx = coordInBlock[1];
-    const uint iqs = idx / 4;
-    const uint iqs_offset = idx % 4;
-    const uint vui = uint(bl.block.qs[iqs]);
-    const uint c = (vui >> (2 * iqs_offset)) & 3;
-    const float q = float(c) - 1.0f;
-    float16_t ret = d * float16_t(q);
-    return ret;
+
+    const uint byte_idx = ((idx >> 7) << 5) + (idx & 31u);
+    const uint qsshift = (((idx & 127u) >> 5) << 1);
+
+    const uint c = (uint(bl.block.qs[byte_idx]) >> qsshift) & 3u;
+    return d * float16_t(float(c) - 1.0f);
 }
 #endif
 
