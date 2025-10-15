@@ -1661,6 +1661,626 @@ template [[host_name("kernel_repeat_bf16")]] kernel kernel_repeat_t kernel_repea
 template [[host_name("kernel_repeat_i32")]] kernel kernel_repeat_t kernel_repeat<int>;
 template [[host_name("kernel_repeat_i16")]] kernel kernel_repeat_t kernel_repeat<short>;
 
+template<typename src0_t, typename src1_t>
+kernel void kernel_out_prod_impl(
+    constant ggml_metal_kargs_out_prod & args,
+    device const char * src0,
+    device const char * src1,
+    device       char * dst,
+    uint3   tgpig[[threadgroup_position_in_grid]],
+    ushort3 tpitg[[thread_position_in_threadgroup]],
+    ushort3   ntg[[threads_per_threadgroup]]) {
+    const int i3 = tgpig.z;
+    const int i2 = tgpig.y;
+    const int i1 = tgpig.x;
+
+    const int dps2 = args.ne02 > 0 ? args.ne2 / args.ne02 : 1;
+    const int dps3 = args.ne03 > 0 ? args.ne3 / args.ne03 : 1;
+
+    const int i02 = args.ne02 > 0 ? i2 / dps2 : 0;
+    const int i03 = args.ne03 > 0 ? i3 / dps3 : 0;
+
+    device const char * src0_base = src0 + i02*args.nb02 + i03*args.nb03;
+    device const char * src1_base = src1 + i1*args.nb10 + i2*args.nb12 + i3*args.nb13;
+    device       char * dst_base  = dst  + i1*args.nb1  + i2*args.nb2  + i3*args.nb3;
+
+    for (int i0 = tpitg.x; i0 < args.ne0; i0 += ntg.x) {
+        float acc = 0.0f;
+
+        for (int i01 = 0; i01 < args.ne01; ++i01) {
+            device const char * src0_row = src0_base + i01*args.nb01;
+            const float v0 = (float) *((device const src0_t *)(src0_row + i0*args.nb00));
+            const float v1 = (float) *((device const src1_t *)(src1_base + i01*args.nb11));
+
+            acc += v0 * v1;
+        }
+
+        *((device float *)(dst_base + i0*args.nb0)) = acc;
+    }
+}
+
+typedef decltype(kernel_out_prod_impl<float, float>) kernel_out_prod_f32_t;
+typedef decltype(kernel_out_prod_impl<half,  float>) kernel_out_prod_f16_f32_t;
+typedef decltype(kernel_out_prod_impl<float, half >) kernel_out_prod_f32_f16_t;
+typedef decltype(kernel_out_prod_impl<half,  half >) kernel_out_prod_f16_t;
+
+template [[host_name("kernel_out_prod_f32")]]      kernel kernel_out_prod_f32_t      kernel_out_prod_impl<float, float>;
+template [[host_name("kernel_out_prod_f16_f32")]]  kernel kernel_out_prod_f16_f32_t  kernel_out_prod_impl<half,  float>;
+template [[host_name("kernel_out_prod_f32_f16")]]  kernel kernel_out_prod_f32_f16_t  kernel_out_prod_impl<float, half>;
+template [[host_name("kernel_out_prod_f16")]]      kernel kernel_out_prod_f16_t      kernel_out_prod_impl<half,  half>;
+
+template <typename src1_t>
+kernel void kernel_out_prod_q8_0_impl(
+    constant ggml_metal_kargs_out_prod & args,
+    device const char * src0,
+    device const char * src1,
+    device       char * dst,
+    uint3   tgpig[[threadgroup_position_in_grid]],
+    ushort3 tpitg[[thread_position_in_threadgroup]],
+    ushort3   ntg[[threads_per_threadgroup]]) {
+    const int i3 = tgpig.z;
+    const int i2 = tgpig.y;
+    const int i1 = tgpig.x;
+
+    const int dps2 = args.ne02 > 0 ? args.ne2 / args.ne02 : 1;
+    const int dps3 = args.ne03 > 0 ? args.ne3 / args.ne03 : 1;
+
+    const int i02 = args.ne02 > 0 ? i2 / dps2 : 0;
+    const int i03 = args.ne03 > 0 ? i3 / dps3 : 0;
+
+    device const char * src0_base = src0 + i02*args.nb02 + i03*args.nb03;
+    device const char * src1_base = src1 + i1*args.nb10 + i2*args.nb12 + i3*args.nb13;
+    device       char * dst_base  = dst  + i1*args.nb1  + i2*args.nb2  + i3*args.nb3;
+
+    for (int i0 = tpitg.x; i0 < args.ne0; i0 += ntg.x) {
+        const int ib = i0 / QK8_0;
+        const int ix = i0 % QK8_0;
+
+        float acc = 0.0f;
+
+        for (int i01 = 0; i01 < args.ne01; ++i01) {
+            device const char * src0_row_char = src0_base + i01*args.nb01;
+            device const block_q8_0 * src0_row = (device const block_q8_0 *) src0_row_char;
+            const block_q8_0 blk = src0_row[ib];
+
+            const float v0 = (float) blk.d * (float) blk.qs[ix];
+
+            device const src1_t * src1_row = (device const src1_t *)(src1_base + i01*args.nb11);
+            const float v1 = (float) src1_row[0];
+
+            acc += v0 * v1;
+        }
+
+        *((device float *)(dst_base + i0*args.nb0)) = acc;
+    }
+}
+
+typedef decltype(kernel_out_prod_q8_0_impl<float>) kernel_out_prod_q8_0_f32_t;
+typedef decltype(kernel_out_prod_q8_0_impl<half >) kernel_out_prod_q8_0_f16_t;
+
+template [[host_name("kernel_out_prod_q8_0_f32")]] kernel kernel_out_prod_q8_0_f32_t kernel_out_prod_q8_0_impl<float>;
+template [[host_name("kernel_out_prod_q8_0_f16")]] kernel kernel_out_prod_q8_0_f16_t kernel_out_prod_q8_0_impl<half>;
+
+template <typename src1_t>
+kernel void kernel_out_prod_q4_0_impl(
+    constant ggml_metal_kargs_out_prod & args,
+    device const char * src0,
+    device const char * src1,
+    device       char * dst,
+    uint3   tgpig[[threadgroup_position_in_grid]],
+    ushort3 tpitg[[thread_position_in_threadgroup]],
+    ushort3   ntg[[threads_per_threadgroup]]) {
+    const int i3 = tgpig.z;
+    const int i2 = tgpig.y;
+    const int i1 = tgpig.x;
+
+    const int dps2 = args.ne02 > 0 ? args.ne2 / args.ne02 : 1;
+    const int dps3 = args.ne03 > 0 ? args.ne3 / args.ne03 : 1;
+
+    const int i02 = args.ne02 > 0 ? i2 / dps2 : 0;
+    const int i03 = args.ne03 > 0 ? i3 / dps3 : 0;
+
+    device const char * src0_base = src0 + i02*args.nb02 + i03*args.nb03;
+    device const char * src1_base = src1 + i1*args.nb10 + i2*args.nb12 + i3*args.nb13;
+    device       char * dst_base  = dst  + i1*args.nb1  + i2*args.nb2  + i3*args.nb3;
+
+    for (int i0 = tpitg.x; i0 < args.ne0; i0 += ntg.x) {
+        const int ib = i0 / QK4_0;
+        const int ix = i0 % QK4_0;
+        const int iq = ix % (QK4_0 / 2);
+        const bool upper = ix >= (QK4_0 / 2);
+
+        float acc = 0.0f;
+
+        for (int i01 = 0; i01 < args.ne01; ++i01) {
+            device const char * src0_row_char = src0_base + i01*args.nb01;
+            device const block_q4_0 * src0_row = (device const block_q4_0 *) src0_row_char;
+            const block_q4_0 blk = src0_row[ib];
+
+            const uint8_t q = blk.qs[iq];
+            const int nibble = upper ? (q >> 4) : (q & 0x0F);
+            const float v0 = ((float) blk.d) * ((float) nibble - 8.0f);
+
+            device const src1_t * src1_row = (device const src1_t *)(src1_base + i01*args.nb11);
+            const float v1 = (float) src1_row[0];
+
+            acc += v0 * v1;
+        }
+
+        *((device float *)(dst_base + i0*args.nb0)) = acc;
+    }
+}
+
+typedef decltype(kernel_out_prod_q4_0_impl<float>) kernel_out_prod_q4_0_f32_t;
+typedef decltype(kernel_out_prod_q4_0_impl<half >) kernel_out_prod_q4_0_f16_t;
+
+template [[host_name("kernel_out_prod_q4_0_f32")]] kernel kernel_out_prod_q4_0_f32_t kernel_out_prod_q4_0_impl<float>;
+template [[host_name("kernel_out_prod_q4_0_f16")]] kernel kernel_out_prod_q4_0_f16_t kernel_out_prod_q4_0_impl<half>;
+
+// assumption: src1 is a row
+// broadcast src1 into src0
+template <short F>
+kernel void kernel_add_row_c4_fuse_impl(
+        constant ggml_metal_kargs_bin & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        uint tpig[[thread_position_in_grid]]) {
+    const uint nb = args.ne00/4;
+    const uint i  = tpig % nb;
+
+    device const float4 * src0_row = (device const float4 *) (src0);
+    device       float4 *  dst_row = (device       float4 *) (dst);
+
+    float4 res = src0_row[tpig];
+
+#pragma unroll(F)
+    for (short j = 0; j < F; ++j) {
+        res += ((device const float4 *) (src1 + args.o1[j]))[i];
+    }
+
+    dst_row[tpig] = res;
+}
+
+typedef decltype(kernel_add_row_c4_fuse_impl<1>) kernel_add_row_c4_fuse_t;
+
+template [[host_name("kernel_add_row_c4_fuse_1")]] kernel kernel_add_row_c4_fuse_t kernel_add_row_c4_fuse_impl<1>;
+template [[host_name("kernel_add_row_c4_fuse_2")]] kernel kernel_add_row_c4_fuse_t kernel_add_row_c4_fuse_impl<2>;
+template [[host_name("kernel_add_row_c4_fuse_3")]] kernel kernel_add_row_c4_fuse_t kernel_add_row_c4_fuse_impl<3>;
+template [[host_name("kernel_add_row_c4_fuse_4")]] kernel kernel_add_row_c4_fuse_t kernel_add_row_c4_fuse_impl<4>;
+template [[host_name("kernel_add_row_c4_fuse_5")]] kernel kernel_add_row_c4_fuse_t kernel_add_row_c4_fuse_impl<5>;
+template [[host_name("kernel_add_row_c4_fuse_6")]] kernel kernel_add_row_c4_fuse_t kernel_add_row_c4_fuse_impl<6>;
+template [[host_name("kernel_add_row_c4_fuse_7")]] kernel kernel_add_row_c4_fuse_t kernel_add_row_c4_fuse_impl<7>;
+template [[host_name("kernel_add_row_c4_fuse_8")]] kernel kernel_add_row_c4_fuse_t kernel_add_row_c4_fuse_impl<8>;
+
+template <short F>
+kernel void kernel_sub_row_c4_fuse_impl(
+        constant ggml_metal_kargs_bin & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        uint tpig[[thread_position_in_grid]]) {
+
+    const uint nb = args.ne00/4;
+    const uint i  = tpig % nb;
+
+    device const float4 * src0_row = (device const float4 *) (src0);
+    device       float4 *  dst_row = (device       float4 *) (dst);
+
+    device const float4 * src1_row[F];
+    for (short j = 0; j < F; ++j) {
+        src1_row[j] = (device const float4 *) (src1 + args.o1[j]);
+    }
+
+    float4 res = src0_row[tpig];
+
+#pragma unroll(F)
+    for (short j = 0; j < F; ++j) {
+        res -= src1_row[j][i];
+    }
+
+    dst_row[tpig] = res;
+}
+
+typedef decltype(kernel_sub_row_c4_fuse_impl<1>) kernel_sub_row_c4_fuse_t;
+
+template [[host_name("kernel_sub_row_c4_fuse_1")]] kernel kernel_sub_row_c4_fuse_t kernel_sub_row_c4_fuse_impl<1>;
+
+template <short F>
+kernel void kernel_mul_row_c4_fuse_impl(
+        constant ggml_metal_kargs_bin & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        uint tpig[[thread_position_in_grid]]) {
+
+    const uint nb = args.ne00/4;
+    const uint i  = tpig % nb;
+
+    device const float4 * src0_row = (device const float4 *) (src0);
+    device       float4 *  dst_row = (device       float4 *) (dst);
+
+    device const float4 * src1_row[F];
+    for (short j = 0; j < F; ++j) {
+        src1_row[j] = (device const float4 *) (src1 + args.o1[j]);
+    }
+
+    float4 res = src0_row[tpig];
+
+#pragma unroll(F)
+    for (short j = 0; j < F; ++j) {
+        res *= src1_row[j][i];
+    }
+
+    dst_row[tpig] = res;
+}
+
+typedef decltype(kernel_mul_row_c4_fuse_impl<1>) kernel_mul_row_c4_fuse_t;
+
+template [[host_name("kernel_mul_row_c4_fuse_1")]] kernel kernel_mul_row_c4_fuse_t kernel_mul_row_c4_fuse_impl<1>;
+
+template <short F>
+kernel void kernel_div_row_c4_fuse_impl(
+        constant ggml_metal_kargs_bin & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        uint tpig[[thread_position_in_grid]]) {
+
+    const uint nb = args.ne00/4;
+    const uint i  = tpig % nb;
+
+    device const float4 * src0_row = (device const float4 *) (src0);
+    device       float4 *  dst_row = (device       float4 *) (dst);
+
+    device const float4 * src1_row[F];
+    for (short j = 0; j < F; ++j) {
+        src1_row[j] = (device const float4 *) (src1 + args.o1[j]);
+    }
+
+    float4 res = src0_row[tpig];
+
+#pragma unroll(F)
+    for (short j = 0; j < F; ++j) {
+        res /= src1_row[j][i];
+    }
+
+    dst_row[tpig] = res;
+}
+
+typedef decltype(kernel_div_row_c4_fuse_impl<1>) kernel_div_row_c4_fuse_t;
+
+template [[host_name("kernel_div_row_c4_fuse_1")]] kernel kernel_div_row_c4_fuse_t kernel_div_row_c4_fuse_impl<1>;
+
+kernel void kernel_relu_f32(
+        device const float * src0,
+        device       float * dst,
+        uint tpig[[thread_position_in_grid]]) {
+    dst[tpig] = max(0.0f, src0[tpig]);
+}
+
+kernel void kernel_relu_f32_4(
+        device const float4 * src0,
+        device       float4 * dst,
+        uint tpig[[thread_position_in_grid]]) {
+    dst[tpig] = max(0.0f, src0[tpig]);
+}
+
+kernel void kernel_sigmoid_f32(
+        device const float * src0,
+        device       float * dst,
+        uint tpig[[thread_position_in_grid]]) {
+    dst[tpig] = 1.0f / (1.0f + exp(-src0[tpig]));
+}
+
+kernel void kernel_sigmoid_f32_4(
+        device const float4 * src0,
+        device       float4 * dst,
+        uint tpig[[thread_position_in_grid]]) {
+    dst[tpig] = 1.0f / (1.0f + exp(-src0[tpig]));
+}
+
+kernel void kernel_tanh_f32(
+        device const float * src0,
+        device       float * dst,
+        uint tpig[[thread_position_in_grid]]) {
+    dst[tpig] = precise::tanh(src0[tpig]);
+}
+
+kernel void kernel_tanh_f32_4(
+        device const float4 * src0,
+        device       float4 * dst,
+        uint tpig[[thread_position_in_grid]]) {
+    dst[tpig] = precise::tanh(src0[tpig]);
+}
+
+kernel void kernel_gelu_f32(
+    device const float * src0,
+    device       float * dst,
+    uint tpig[[thread_position_in_grid]]) {
+    device const float & x = src0[tpig];
+
+    dst[tpig] = 0.5f*x*(1.0f + precise::tanh(SQRT_2_OVER_PI*x*(1.0f + GELU_COEF_A*x*x)));
+}
+
+kernel void kernel_gelu_f32_4(
+    device const float4 * src0,
+    device       float4 * dst,
+    uint tpig[[thread_position_in_grid]]) {
+    device const float4 & x = src0[tpig];
+
+    // BEWARE !!!
+    // Simply using "tanh" instead of "precise::tanh" will sometimes results in NaNs!
+    // This was observed with Falcon 7B and 40B models
+    //
+    dst[tpig] = 0.5f*x*(1.0f + precise::tanh(SQRT_2_OVER_PI*x*(1.0f + GELU_COEF_A*x*x)));
+}
+
+kernel void kernel_gelu_quick_f32(
+    device const float * src0,
+    device       float * dst,
+    uint tpig[[thread_position_in_grid]]) {
+    device const float & x = src0[tpig];
+
+    dst[tpig] = x*(1.0f/(1.0f+exp(GELU_QUICK_COEF*x)));
+}
+
+kernel void kernel_gelu_quick_f32_4(
+    device const float4 * src0,
+    device       float4 * dst,
+    uint tpig[[thread_position_in_grid]]) {
+    device const float4 & x = src0[tpig];
+
+    dst[tpig] = x*(1.0f/(1.0f+exp(GELU_QUICK_COEF*x)));
+}
+
+kernel void kernel_gelu_erf_f32(
+    device const float * src0,
+    device       float * dst,
+    uint tpig[[thread_position_in_grid]]) {
+    device const float & x = src0[tpig];
+
+    dst[tpig] = 0.5f*x*(1.0f+erf_approx<float>(x*SQRT_2_INV));
+}
+
+kernel void kernel_gelu_erf_f32_4(
+    device const float4 * src0,
+    device       float4 * dst,
+    uint tpig[[thread_position_in_grid]]) {
+    device const float4 & x = src0[tpig];
+
+    dst[tpig] = 0.5f*x*(1.0f+erf_approx<float4>(x*SQRT_2_INV));
+}
+
+kernel void kernel_silu_f32(
+        device const float * src0,
+        device       float * dst,
+        uint tpig[[thread_position_in_grid]]) {
+    device const float & x = src0[tpig];
+    dst[tpig] = x / (1.0f + exp(-x));
+}
+
+kernel void kernel_silu_f32_4(
+        device const float4 * src0,
+        device       float4 * dst,
+        uint tpig[[thread_position_in_grid]]) {
+    device const float4 & x = src0[tpig];
+    dst[tpig] = x / (1.0f + exp(-x));
+}
+
+kernel void kernel_silu_back(
+        device const float * grad,
+        device const float * src1,
+        device       float * dst,
+        uint tpig[[thread_position_in_grid]]) {
+    const float dy = grad[tpig];
+    const float x  = src1[tpig];
+    const float s  = 1.0f/(1.0f + exp(-x));
+    dst[tpig] = dy*s*(1.0f + x*(1.0f - s));
+}
+
+kernel void kernel_silu_back_4(
+        device const float4 * grad,
+        device const float4 * src1,
+        device       float4 * dst,
+        uint tpig[[thread_position_in_grid]]) {
+    const float4 dy = grad[tpig];
+    const float4 x  = src1[tpig];
+    const float4 s  = 1.0f/(1.0f + exp(-x));
+    dst[tpig] = dy*s*(1.0f + x*(1.0f - s));
+}
+
+kernel void kernel_elu_f32(
+        device const float * src0,
+        device       float * dst,
+        uint tpig[[thread_position_in_grid]]) {
+    const float x = src0[tpig];
+    dst[tpig] = (x > 0.0f) ? x : (exp(x) - 1.0f);
+}
+
+kernel void kernel_elu_f32_4(
+        device const float4 * src0,
+        device       float4 * dst,
+        uint tpig[[thread_position_in_grid]]) {
+    const float4 x = src0[tpig];
+    dst[tpig][0] = (x[0] > 0.0f) ? x[0] : (exp(x[0]) - 1.0f);
+    dst[tpig][1] = (x[1] > 0.0f) ? x[1] : (exp(x[1]) - 1.0f);
+    dst[tpig][2] = (x[2] > 0.0f) ? x[2] : (exp(x[2]) - 1.0f);
+    dst[tpig][3] = (x[3] > 0.0f) ? x[3] : (exp(x[3]) - 1.0f);
+}
+
+kernel void kernel_sqr_f32(
+        device const float * src0,
+        device       float * dst,
+        uint tpig[[thread_position_in_grid]]) {
+    dst[tpig] = src0[tpig] * src0[tpig];
+}
+
+kernel void kernel_sqr_f32_4(
+        device const float4 * src0,
+        device       float4 * dst,
+        uint tpig[[thread_position_in_grid]]) {
+    dst[tpig] = src0[tpig] * src0[tpig];
+}
+
+kernel void kernel_sqrt_f32(
+        device const float * src0,
+        device       float * dst,
+        uint tpig[[thread_position_in_grid]]) {
+    dst[tpig] = sqrt(src0[tpig]);
+}
+
+kernel void kernel_sqrt_f32_4(
+        device const float4 * src0,
+        device       float4 * dst,
+        uint tpig[[thread_position_in_grid]]) {
+    dst[tpig] = sqrt(src0[tpig]);
+}
+
+kernel void kernel_sin_f32(
+        device const float * src0,
+        device       float * dst,
+        uint tpig[[thread_position_in_grid]]) {
+    dst[tpig] = sin(src0[tpig]);
+}
+
+kernel void kernel_sin_f32_4(
+        device const float4 * src0,
+        device       float4 * dst,
+        uint tpig[[thread_position_in_grid]]) {
+    dst[tpig] = sin(src0[tpig]);
+}
+
+kernel void kernel_cos_f32(
+        device const float * src0,
+        device       float * dst,
+        uint tpig[[thread_position_in_grid]]) {
+    dst[tpig] = cos(src0[tpig]);
+}
+
+kernel void kernel_cos_f32_4(
+        device const float4 * src0,
+        device       float4 * dst,
+        uint tpig[[thread_position_in_grid]]) {
+    dst[tpig] = cos(src0[tpig]);
+}
+
+kernel void kernel_log_f32(
+        device const float * src0,
+        device       float * dst,
+        uint tpig[[thread_position_in_grid]]) {
+    dst[tpig] = log(src0[tpig]);
+}
+
+kernel void kernel_log_f32_4(
+        device const float4 * src0,
+        device       float4 * dst,
+        uint tpig[[thread_position_in_grid]]) {
+    dst[tpig] = log(src0[tpig]);
+}
+
+kernel void kernel_neg_f32(
+        device const float * src0,
+        device       float * dst,
+        uint tpig[[thread_position_in_grid]]) {
+    dst[tpig] = -src0[tpig];
+}
+
+kernel void kernel_neg_f32_4(
+        device const float4 * src0,
+        device       float4 * dst,
+        uint tpig[[thread_position_in_grid]]) {
+    dst[tpig] = -src0[tpig];
+}
+
+kernel void kernel_abs_f32(
+        device const float * src0,
+        device       float * dst,
+        uint tpig[[thread_position_in_grid]]) {
+    dst[tpig] = fabs(src0[tpig]);
+}
+
+kernel void kernel_abs_f32_4(
+        device const float4 * src0,
+        device       float4 * dst,
+        uint tpig[[thread_position_in_grid]]) {
+    dst[tpig] = fabs(src0[tpig]);
+}
+
+kernel void kernel_sgn_f32(
+        device const float * src0,
+        device       float * dst,
+        uint tpig[[thread_position_in_grid]]) {
+    dst[tpig] = sign(src0[tpig]);
+}
+
+kernel void kernel_sgn_f32_4(
+        device const float4 * src0,
+        device       float4 * dst,
+        uint tpig[[thread_position_in_grid]]) {
+    dst[tpig] = sign(src0[tpig]);
+}
+
+kernel void kernel_step_f32(
+        device const float * src0,
+        device       float * dst,
+        uint tpig[[thread_position_in_grid]]) {
+    dst[tpig] = step(0.0f, src0[tpig]);
+}
+
+kernel void kernel_step_f32_4(
+        device const float4 * src0,
+        device       float4 * dst,
+        uint tpig[[thread_position_in_grid]]) {
+    dst[tpig] = step(0.0f, src0[tpig]);
+}
+
+kernel void kernel_hardswish_f32(
+        device const float * src0,
+        device       float * dst,
+        uint tpig[[thread_position_in_grid]]) {
+    const float x = src0[tpig];
+    dst[tpig] = x * fmin(1.0f, fmax(0.0f, (x + 3.0f) / 6.0f));
+}
+
+kernel void kernel_hardswish_f32_4(
+        device const float4 * src0,
+        device       float4 * dst,
+        uint tpig[[thread_position_in_grid]]) {
+    const float4 x = src0[tpig];
+    dst[tpig] = x * fmin(1.0f, fmax(0.0f, (x + 3.0f) / 6.0f));
+}
+
+kernel void kernel_hardsigmoid_f32(
+        device const float * src0,
+        device       float * dst,
+        uint tpig[[thread_position_in_grid]]) {
+    const float x = src0[tpig];
+    dst[tpig] = fmin(1.0f, fmax(0.0f, (x + 3.0f) / 6.0f));
+}
+
+kernel void kernel_hardsigmoid_f32_4(
+        device const float4 * src0,
+        device       float4 * dst,
+        uint tpig[[thread_position_in_grid]]) {
+    const float4 x = src0[tpig];
+    dst[tpig] = fmin(1.0f, fmax(0.0f, (x + 3.0f) / 6.0f));
+}
+
+kernel void kernel_exp_f32(
+        device const float * src0,
+        device       float * dst,
+        uint tpig[[thread_position_in_grid]]) {
+    dst[tpig] = exp(src0[tpig]);
+}
+
+kernel void kernel_exp_f32_4(
+        device const float4 * src0,
+        device       float4 * dst,
+        uint tpig[[thread_position_in_grid]]) {
+    dst[tpig] = exp(src0[tpig]);
+}
+
 template<typename T>
 kernel void kernel_reglu(
         constant ggml_metal_kargs_glu & args,
@@ -3368,6 +3988,73 @@ template [[host_name("kernel_rms_norm_mul_add_f32")]] kernel kernel_rms_norm_fus
 template [[host_name("kernel_rms_norm_f32_4")]]         kernel kernel_rms_norm_fuse_t kernel_rms_norm_fuse_impl<float4, 1>;
 template [[host_name("kernel_rms_norm_mul_f32_4")]]     kernel kernel_rms_norm_fuse_t kernel_rms_norm_fuse_impl<float4, 2>;
 template [[host_name("kernel_rms_norm_mul_add_f32_4")]] kernel kernel_rms_norm_fuse_t kernel_rms_norm_fuse_impl<float4, 3>;
+
+kernel void kernel_rms_norm_back(
+        constant ggml_metal_kargs_rms_norm_back & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        threadgroup float * shmem_f32 [[threadgroup(0)]],
+        uint3   tgpig[[threadgroup_position_in_grid]],
+        ushort3 tpitg[[thread_position_in_threadgroup]],
+        ushort  sgitg[[simdgroup_index_in_threadgroup]],
+        ushort  tiisg[[thread_index_in_simdgroup]],
+        ushort3   ntg[[threads_per_threadgroup]]) {
+    threadgroup float * shmem_xx  = shmem_f32;
+    threadgroup float * shmem_xdz = shmem_f32 + 32;
+
+    if (sgitg == 0) {
+        shmem_xx[tiisg]  = 0.0f;
+        shmem_xdz[tiisg] = 0.0f;
+    }
+
+    const int i01 = tgpig.x;
+    const int i02 = tgpig.y;
+    const int i03 = tgpig.z;
+
+    device const float4 * dz = (device const float4 *) (src0 + i03*args.nb03 + i02*args.nb02 + i01*args.nb01);
+    device const float4 * x  = (device const float4 *) (src1 + i03*args.nb13 + i02*args.nb12 + i01*args.nb11);
+
+    float sum_xx  = 0.0f;
+    float sum_xdz = 0.0f;
+
+    for (int i00 = tpitg.x; i00 < args.ne00_4; i00 += ntg.x) {
+        const float4 x4  = x[i00];
+        const float4 dz4 = dz[i00];
+        sum_xx  += dot(x4, x4);
+        sum_xdz += dot(x4, dz4);
+    }
+
+    sum_xx  = simd_sum(sum_xx);
+    sum_xdz = simd_sum(sum_xdz);
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (tiisg == 0) {
+        shmem_xx[sgitg]  = sum_xx;
+        shmem_xdz[sgitg] = sum_xdz;
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    sum_xx  = shmem_xx[tiisg];
+    sum_xdz = shmem_xdz[tiisg];
+
+    sum_xx  = simd_sum(sum_xx);
+    sum_xdz = simd_sum(sum_xdz);
+
+    const float mean_eps = sum_xx/args.ne00 + args.eps;
+    const float rrms     = rsqrt(mean_eps);
+    const float sum_eps  = sum_xx + args.eps*args.ne00;
+    const float scale    = -sum_xdz/sum_eps;
+
+    device float4 * y = (device float4 *) (dst + i03*args.nb3 + i02*args.nb2 + i01*args.nb1);
+
+    for (int i00 = tpitg.x; i00 < args.ne00_4; i00 += ntg.x) {
+        float4 dx = dz[i00] + x[i00]*scale;
+        y[i00] = dx*rrms;
+    }
+}
 
 template <typename T0, typename T>
 kernel void kernel_l2_norm_impl(
