@@ -898,10 +898,12 @@ class TensorNameMap:
 
         MODEL_TENSOR.ATTN_SUB_NORM: (
             "model.layers.{bid}.self_attn.inner_attn_ln",  # bitnet
+            "model.layers.{bid}.self_attn.attn_sub_norm",  # microsoft-bitnet
         ),
 
         MODEL_TENSOR.FFN_SUB_NORM: (
             "model.layers.{bid}.mlp.ffn_layernorm",  # bitnet
+            "model.layers.{bid}.mlp.ffn_sub_norm",   # microsoft-bitnet
         ),
 
         MODEL_TENSOR.DEC_ATTN_NORM: (
