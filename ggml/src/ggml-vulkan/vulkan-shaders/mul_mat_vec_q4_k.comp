@@ -22,8 +22,25 @@ void calc_superblock(const uint a_offset, const uint b_offset, const uint v_im, 
 
         const uint32_t scale_0_4_l = (scale4_u32 << 16) | scale0_u32;
         const uint32_t scale_0_4_h = (scale_0_4_l & 0xC0C0C0C0) >> 2;
+
+#if defined(ADRENO)
+        const vec4 scale_0_4_l_f = vec4(
+            float((scale_0_4_l >> 0)  & 0x3Fu),
+            float((scale_0_4_l >> 8)  & 0x3Fu),
+            float((scale_0_4_l >> 16) & 0x3Fu),
+            float((scale_0_4_l >> 24) & 0x3Fu)
+        );
+
+        const vec4 scale8_f = vec4(
+            float(((((scale8_u32 << 12) | scale8_u32) & 0x0F0F0F0Fu) | scale_0_4_h) >> 0  & 0xFFu),
+            float(((((scale8_u32 << 12) | scale8_u32) & 0x0F0F0F0Fu) | scale_0_4_h) >> 8  & 0xFFu),
+            float(((((scale8_u32 << 12) | scale8_u32) & 0x0F0F0F0Fu) | scale_0_4_h) >> 16 & 0xFFu),
+            float(((((scale8_u32 << 12) | scale8_u32) & 0x0F0F0F0Fu) | scale_0_4_h) >> 24 & 0xFFu)
+        );
+#else
         const vec4 scale_0_4_l_f = vec4(unpack8(scale_0_4_l & 0x3F3F3F3F));
         const vec4 scale8_f = vec4(unpack8((((scale8_u32 << 12) | scale8_u32) & 0x0F0F0F0F) | scale_0_4_h));
+#endif
 
         const FLOAT_TYPE sc0 = scale_0_4_l_f.x;
         const FLOAT_TYPE sc1 = scale_0_4_l_f.y;
@@ -42,10 +59,17 @@ void calc_superblock(const uint a_offset, const uint b_offset, const uint v_im, 
         const uint32_t qs64_u32_lo4 = qs64_u32 & 0x0F0F0F0F;
         const uint32_t qs64_u32_hi4 = (qs64_u32 >> 4) & 0x0F0F0F0F;
 
+#if defined(ADRENO)
+        const vec4 qs0_lo4  = vec4(float(qs0_u32_lo4 & 0xFFu), float((qs0_u32_lo4 >> 8) & 0xFFu), float((qs0_u32_lo4 >> 16) & 0xFFu), float((qs0_u32_lo4 >> 24) & 0xFFu));
+        const vec4 qs64_lo4 = vec4(float(qs64_u32_lo4 & 0xFFu), float((qs64_u32_lo4 >> 8) & 0xFFu), float((qs64_u32_lo4 >> 16) & 0xFFu), float((qs64_u32_lo4 >> 24) & 0xFFu));
+        const vec4 qs0_hi4  = vec4(float(qs0_u32_hi4 & 0xFFu), float((qs0_u32_hi4 >> 8) & 0xFFu), float((qs0_u32_hi4 >> 16) & 0xFFu), float((qs0_u32_hi4 >> 24) & 0xFFu));
+        const vec4 qs64_hi4 = vec4(float(qs64_u32_hi4 & 0xFFu), float((qs64_u32_hi4 >> 8) & 0xFFu), float((qs64_u32_hi4 >> 16) & 0xFFu), float((qs64_u32_hi4 >> 24) & 0xFFu));
+#else
         const vec4 qs0_lo4 = vec4(unpack8(qs0_u32_lo4));
         const vec4 qs64_lo4 = vec4(unpack8(qs64_u32_lo4));
         const vec4 qs0_hi4 = vec4(unpack8(qs0_u32_hi4));
         const vec4 qs64_hi4 = vec4(unpack8(qs64_u32_hi4));
+#endif
 
         const FLOAT_TYPE q4_0  = qs0_lo4.x;
         const FLOAT_TYPE q4_1  = qs0_lo4.y;
@@ -64,7 +88,11 @@ void calc_superblock(const uint a_offset, const uint b_offset, const uint v_im, 
         const FLOAT_TYPE q4_14 = qs64_hi4.z;
         const FLOAT_TYPE q4_15 = qs64_hi4.w;
 
+#if defined(ADRENO)
+        for (uint j = 0; j < NUM_COLS; ++j) {
+#else
         [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+#endif
             vec4 by10 =  vec4(data_b_v4[(j*p.batch_stride_b + b_offset + y1_idx) / 4    ]);
             vec4 by132 = vec4(data_b_v4[(j*p.batch_stride_b + b_offset + y1_idx) / 4 + 8]);
             vec4 by20 =  vec4(data_b_v4[(j*p.batch_stride_b + b_offset + y2_idx) / 4    ]);

@@ -1003,7 +1003,7 @@ void process_shaders() {
     string_to_spv("topk_moe_f32", "topk_moe.comp", {});
 
 #ifdef GGML_VULKAN_BUILD_ADRENO_SHADERS
-    std::vector<std::string> adreno_shader_types = {"f32", "f16", "q4_0", "q4_1", "q6_k", "q8_0"};
+    std::vector<std::string> adreno_shader_types = {"f32", "f16", "q4_0", "q4_k", "q4_1", "q5_k", "q6_k", "q8_0"};
     std::string device_pfix = "adreno_";
     auto adreno_base_dict = merge_maps(base_dict, {{"ADRENO", "1"}});
 
