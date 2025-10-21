@@ -82,6 +82,7 @@ struct mtmd_context_params {
     enum ggml_log_level verbosity;
     const char * image_marker; // deprecated, use media_marker instead
     const char * media_marker;
+    const char * backend_device; // optional GPU backend name (e.g. "CUDA", "Metal", "Vulkan"), if null will use env var or default
 };
 
 MTMD_API const char * mtmd_default_marker(void);

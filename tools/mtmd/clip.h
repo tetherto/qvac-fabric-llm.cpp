@@ -25,6 +25,7 @@ enum clip_modality {
 struct clip_context_params {
     bool use_gpu;
     enum ggml_log_level verbosity;
+    const char * backend_device; // optional, if null will use env var or default GPU backend
 };
 
 struct clip_init_result {
