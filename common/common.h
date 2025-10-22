@@ -758,3 +758,10 @@ ggml_opt_dataset_t common_opt_dataset_init(struct llama_context * ctx, const std
 
 // "adamw" or "sgd" (case insensitive)
 enum ggml_opt_optimizer_type common_opt_get_optimizer(const char *);
+
+//
+// device detection utils
+//
+
+// Check if any GPU devices are available
+bool common_has_gpu_devices(void);

@@ -1628,3 +1628,18 @@ float lr_opt::get_lr(float epoch) const {
     LOG_INF("epoch %.2g lr=%.2g\n", epoch, r);
     return r;
 }
+
+//
+// device detection utils
+//
+
+bool common_has_gpu_devices(void) {
+    int dev_count = ggml_backend_dev_count();
+    for (int i = 0; i < dev_count; ++i) {
+        auto * dev = ggml_backend_dev_get(i);
+        if (dev && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+            return true;
+        }
+    }
+    return false;
+}
