@@ -13176,16 +13176,16 @@ static void ggml_vk_check_results_0(ggml_backend_vk_context * ctx, ggml_cgraph *
     } else if (tensor->op == GGML_OP_IM2COL_3D) {
         const int32_t s0 = tensor->op_params[0];
         const int32_t s1 = tensor->op_params[1];
-        const int32_t s1 = tensor->op_params[2];
+        const int32_t s2 = tensor->op_params[2];
         const int32_t p0 = tensor->op_params[3];
         const int32_t p1 = tensor->op_params[4];
-        const int32_t p1 = tensor->op_params[5];
+        const int32_t p2 = tensor->op_params[5];
         const int32_t d0 = tensor->op_params[6];
         const int32_t d1 = tensor->op_params[7];
-        const int32_t d1 = tensor->op_params[8];
+        const int32_t d2 = tensor->op_params[8];
         const int32_t IC = tensor->op_params[9];
 
-        tensor_clone = ggml_im2col(ggml_ctx, src_clone[0], src_clone[1], IC, s0, s1, s2, p0, p1, p2, d0, d1, d2, tensor->type);
+        tensor_clone = ggml_im2col_3d(ggml_ctx, src_clone[0], src_clone[1], IC, s0, s1, s2, p0, p1, p2, d0, d1, d2, tensor->type);
     } else if (tensor->op == GGML_OP_TIMESTEP_EMBEDDING) {
         const int32_t dim = tensor->op_params[0];
         const int32_t max_period = tensor->op_params[1];
