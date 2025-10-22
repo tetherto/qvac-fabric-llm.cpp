@@ -56,6 +56,7 @@ struct llama_cparams {
     bool kv_unified;
     bool pipeline_parallel;
     bool training;           // set by llama_opt_init()
+    bool training_ctx;       // from llama_context_params: the context is built for training
 
     size_t moe_cache_size;
 
