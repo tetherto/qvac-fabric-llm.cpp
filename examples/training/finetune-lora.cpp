@@ -462,6 +462,7 @@ int main(int argc, char ** argv) {
     common_init();
     llama_backend_init();
     llama_numa_init(params.numa);
+    params.training = true;
 
     common_init_result llama_init = common_init_from_params(params);
     llama_model_ptr   & model = llama_init.model;

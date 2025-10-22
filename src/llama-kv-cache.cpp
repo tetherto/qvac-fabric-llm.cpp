@@ -1131,6 +1131,33 @@ ggml_tensor * llama_kv_cache::cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggm
     return ggml_set_rows(ctx, v_view, v_cur, v_idxs);
 }
 
+ggml_tensor * llama_kv_cache::get_k_lora(ggml_context * ctx, ggml_tensor * k_cur, int32_t il, uint32_t n_kv, const slot_info & sinfo) const {
+    if (sinfo.s0 == 0) {
+        return k_cur;
+    }
+    
+    slot_info past_sinfo = sinfo;
+    past_sinfo.s0 = 0;
+    past_sinfo.s1 = sinfo.s0 - 1;
+
+    ggml_tensor * k_past = get_k(ctx, il, n_kv, past_sinfo);
+    
+    return ggml_concat(ctx, k_past, k_cur, 2);
+}
+
+ggml_tensor * llama_kv_cache::get_v_lora(ggml_context * ctx, ggml_tensor * v_cur, int32_t il, uint32_t n_kv, const slot_info & sinfo) const {
+    if (sinfo.s0 == 0) {
+        return v_cur;
+    }
+    
+    slot_info past_sinfo = sinfo;
+    past_sinfo.s0 = 0;
+    past_sinfo.s1 = sinfo.s0 - 1;
+    ggml_tensor * v_past = get_v(ctx, il, n_kv, past_sinfo);
+    
+    return ggml_concat(ctx, v_past, v_cur, 2);
+}
+
 ggml_tensor * llama_kv_cache::build_input_k_idxs(ggml_context * ctx, const llama_ubatch & ubatch) const {
     const uint32_t n_tokens = ubatch.n_tokens;
 
@@ -2021,6 +2048,14 @@ ggml_tensor * llama_kv_cache_context::cpy_k(ggml_context * ctx, ggml_tensor * k_
 
 ggml_tensor * llama_kv_cache_context::cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, int32_t il) const {
     return kv->cpy_v(ctx, v_cur, v_idxs, il, sinfos[i_cur]);
+}
+
+ggml_tensor * llama_kv_cache_context::get_k_lora(ggml_context * ctx, ggml_tensor * k_cur, int32_t il) const {
+    return kv->get_k_lora(ctx, k_cur, il, n_kv, sinfos[i_cur]);
+}
+
+ggml_tensor * llama_kv_cache_context::get_v_lora(ggml_context * ctx, ggml_tensor * v_cur, int32_t il) const {
+    return kv->get_v_lora(ctx, v_cur, il, n_kv, sinfos[i_cur]);
 }
 
 ggml_tensor * llama_kv_cache_context::build_input_k_idxs(ggml_context * ctx, const llama_ubatch & ubatch) const {
