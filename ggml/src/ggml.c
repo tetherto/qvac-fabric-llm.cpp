@@ -1026,6 +1026,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "MEAN",
     "ARGMAX",
     "COUNT_EQUAL",
+    "COUNT_EQUAL_MASKED",
     "REPEAT",
     "REPEAT_BACK",
     "CONCAT",
@@ -1112,13 +1113,15 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
 
     "CROSS_ENTROPY_LOSS",
     "CROSS_ENTROPY_LOSS_BACK",
+    "CROSS_ENTROPY_LOSS_MASKED",
+    "CROSS_ENTROPY_LOSS_MASKED_BACK",
     "OPT_STEP_ADAMW",
     "OPT_STEP_SGD",
 
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+static_assert(GGML_OP_COUNT == 105, "GGML_OP_COUNT != 105");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1142,6 +1145,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "Σx/n",
     "argmax(x)",
     "count_equal(x)",
+    "count_equal_masked(x)",
     "repeat(x)",
     "repeat_back(x)",
     "concat(x, y)",
@@ -1228,13 +1232,15 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
 
     "cross_entropy_loss(x,y)",
     "cross_entropy_loss_back(x,y)",
+    "cross_entropy_loss_masked(x,y)",
+    "cross_entropy_loss_masked_back(x,y)",
     "adamw(x)",
     "sgd(x)",
 
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+static_assert(GGML_OP_COUNT == 105, "GGML_OP_COUNT != 105");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -2590,6 +2596,26 @@ struct ggml_tensor * ggml_count_equal(
     result->op     = GGML_OP_COUNT_EQUAL;
     result->src[0] = a;
     result->src[1] = b;
+
+    return result;
+}
+
+// ggml_count_equal_masked
+
+struct ggml_tensor * ggml_count_equal_masked(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * b,
+        struct ggml_tensor  * c) {
+    GGML_ASSERT(ggml_are_same_shape(a, b));
+    GGML_ASSERT(c->type == GGML_TYPE_F32);
+
+    struct ggml_tensor * result = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, 1);
+
+    result->op     = GGML_OP_COUNT_EQUAL_MASKED;
+    result->src[0] = a;
+    result->src[1] = b;
+    result->src[2] = c;
 
     return result;
 }
@@ -6314,6 +6340,9 @@ struct ggml_tensor * ggml_cross_entropy_loss(
     result->op     = GGML_OP_CROSS_ENTROPY_LOSS;
     result->src[0] = a;
     result->src[1] = b;
+    
+    // Initialize op_params to 0 (no masking)
+    *(int32_t *)(result->op_params) = 0;
 
     // Initialize op_params to 0 (no masking)
     *(int32_t *)(result->op_params) = 0;
@@ -6337,6 +6366,51 @@ struct ggml_tensor * ggml_cross_entropy_loss_back(
     result->src[0] = a;
     result->src[1] = b;
     result->src[2] = c;
+
+    return result;
+}
+
+// ggml_cross_entropy_loss_masked
+
+struct ggml_tensor * ggml_cross_entropy_loss_masked(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * b,
+        struct ggml_tensor  * c) {
+    GGML_ASSERT(ggml_are_same_shape(a, b));
+    GGML_ASSERT(ggml_are_same_shape(a, c));
+    GGML_ASSERT(c->type == GGML_TYPE_F32);
+
+    struct ggml_tensor * result = ggml_new_tensor_1d(ctx, a->type, 1);
+
+    result->op     = GGML_OP_CROSS_ENTROPY_LOSS_MASKED;
+    result->src[0] = a;
+    result->src[1] = b;
+    result->src[2] = c;
+
+    return result;
+}
+
+// ggml_cross_entropy_loss_masked_back
+
+struct ggml_tensor * ggml_cross_entropy_loss_masked_back(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * b,
+        struct ggml_tensor  * c,
+        struct ggml_tensor  * d) {
+    GGML_ASSERT(ggml_is_scalar(d));
+    GGML_ASSERT(ggml_are_same_shape(a, b));
+    GGML_ASSERT(ggml_are_same_shape(a, c));
+    GGML_ASSERT(c->type == GGML_TYPE_F32);
+
+    struct ggml_tensor * result = ggml_dup_tensor(ctx, a);
+
+    result->op     = GGML_OP_CROSS_ENTROPY_LOSS_MASKED_BACK;
+    result->src[0] = d;
+    result->src[1] = a;
+    result->src[2] = b;
+    result->src[3] = c;
 
     return result;
 }
@@ -7307,6 +7381,13 @@ static void ggml_compute_backward(
         case GGML_OP_CROSS_ENTROPY_LOSS: {
             if (src0_needs_grads) {
                 ggml_add_or_set(ctx, cgraph, isrc0, ggml_cross_entropy_loss_back(ctx, grad, src0, src1));
+            }
+            GGML_ASSERT(!src1_needs_grads && "backward pass for labels not implemented");
+        } break;
+        case GGML_OP_CROSS_ENTROPY_LOSS_MASKED: {
+            if (src0_needs_grads) {
+                struct ggml_tensor * mask_tensor = tensor->src[2];
+                ggml_add_or_set(ctx, cgraph, isrc0, ggml_cross_entropy_loss_masked_back(ctx, src0, src1, mask_tensor, grad));
             }
             GGML_ASSERT(!src1_needs_grads && "backward pass for labels not implemented");
         } break;
