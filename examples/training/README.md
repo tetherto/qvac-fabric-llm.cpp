@@ -27,11 +27,11 @@ the base model frozen, making it memory-efficient.
 
 ```sh
 # Create new LoRA adapter with default settings (rank=8, alpha=16, attention modules)
-./build/bin/llama-finetune-lora -m model.gguf -f dataset.txt -ngl 999 -c 512 -b 512 -ub 512
+./build/bin/llama-finetune-lora -m model.gguf -f dataset.txt -ngl 999 -c 512 -b 512 -ub 512 -fa off
 
 # Custom LoRA parameters(creates new lora adapter and trains it from scratch)
 ./build/bin/llama-finetune-lora -m model.gguf -f dataset.txt -ngl 999 -c 512 -b 512 -ub 512 \
-  --lora-rank 16 --lora-alpha 32 --lora-modules "attn_q,attn_k,attn_v,attn_o"
+  --lora-rank 16 --lora-alpha 32 --lora-modules "attn_q,attn_k,attn_v,attn_o" -fa off
 
 # Fine-tune existing LoRA adapter
 ./build/bin/llama-finetune-lora -m base_model.gguf -f dataset.txt --lora existing_adapter.gguf \
@@ -44,8 +44,17 @@ the base model frozen, making it memory-efficient.
 # Resume training from checkpoint
 ./build/bin/llama-finetune-lora -m model.gguf -f dataset.txt -ngl 999 -c 512 -b 512 -ub 512 \
   --resume-from "./lora_checkpoints/checkpoint_step_00000150/"
+  --output-adapter improved_adapter.gguf -ngl 999 -c 512 -b 512 -ub 512 -fa off
+
+# Supervised FineTuning with Assistant only loss
+./build/bin/llama-finetune-lora -m model.gguf -f dataset.jsonl -ngl 999 -c 512 -b 512 -ub 512 \
+  --lora-modules "attn_q,attn_k,attn_v,attn_o" --assistant-loss-only -fa off
 ```
 
+### SFT(Instruction Fine Tuning) with Assistant Only Loss
+- Masks the system and user tokens and only computes loss on assistant tokens
+- Requires the dataset to be in json format just like huggingface with `role` and `content` for each role
+- Allows users to optionally pass a jinja chat template with `--chat-template chat-ml-template.jinja`
 
 ### Parameters
 
@@ -60,6 +69,8 @@ the base model frozen, making it memory-efficient.
   - Available: `attn_q`, `attn_k`, `attn_v`, `attn_o`, `ffn_gate`, `ffn_up`, `ffn_down`, `embed`, `output`, `all`
   - Default: `attn_q,attn_k,attn_v,attn_o` (attention modules)
 - `--output-adapter PATH` - Output adapter filename (default: auto-generated)
+- `--assistant-loss-only` - Trains only on assistant tokens
+- `--chat-template` - Jinja chat template for chat ML formatting to train on assistant tokens only
 
 #### Checkpointing
 - `--checkpoint-save-steps N` - Save checkpoint every N training steps (default: 100)

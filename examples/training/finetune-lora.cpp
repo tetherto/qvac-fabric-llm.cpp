@@ -132,6 +132,9 @@ static void print_lora_usage() {
     printf("  --output-adapter PATH      Output path for trained adapter (default: auto-generated)\n");
     printf("\nTraining Options:\n");
     printf("  --num-epochs N             Number of training epochs (default: 1)\n");
+    printf("  --assistant-loss-only      Use JSON dataset format with masked loss (ChatML/conversation format)\n");
+    printf("                             Only computes loss on assistant responses, not system/user prompts\n");
+    printf("  --chat-template PATH  Optional Jinja chat template to render JSON dataset (matches HF apply_chat_template)\n");
     printf("\nCheckpointing Options:\n");
     printf("  --checkpoint-save-steps N  Save checkpoint every N training steps (default: 100)\n");
     printf("  --checkpoint-save-dir PATH Directory for checkpoints (default: ./checkpoints)\n");
@@ -142,6 +145,8 @@ static void print_lora_usage() {
     printf("  %s -m model.gguf -f dataset.txt --lora-rank 16 --lora-alpha 32 --lora-modules attn_q,attn_k,attn_v,attn_o\n", "finetune-lora");
     printf("\n  # Fine-tune existing adapter with all modules\n");
     printf("  %s -m model.gguf -f dataset.txt --lora existing.gguf --output-adapter improved.gguf\n", "finetune-lora");
+    printf("\n  # Instruction fine-tuning with ChatML format\n");
+    printf("  %s -m model.gguf -f conversations.jsonl --assistant-loss-only --lora-rank 16\n", "finetune-lora");
     printf("\n");
 }
 
@@ -343,6 +348,8 @@ struct finetune_params {
     std::string checkpoint_save_dir = "./checkpoints";
     std::string resume_from_checkpoint;
     bool auto_resume = false;
+    std::string chat_template_path;
+    bool assistant_loss_only = false;
 };
 
 static bool parse_finetune_args(int& argc, char** argv, finetune_params& ft_params) {
@@ -352,6 +359,21 @@ static bool parse_finetune_args(int& argc, char** argv, finetune_params& ft_para
         }
         argc -= 2;
     };
+
+    auto remove_arg_single = [&](int i) {
+        for (int j = i; j < argc - 1; j++) {
+            argv[j] = argv[j + 1];
+        }
+        argc -= 1;
+    };
+
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--assistant-loss-only") == 0) {
+            ft_params.assistant_loss_only = true;
+            remove_arg_single(i);
+            i--;
+        }
+    }
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--lora-rank") == 0 && i + 1 < argc) {
@@ -393,6 +415,10 @@ static bool parse_finetune_args(int& argc, char** argv, finetune_params& ft_para
             }
             argc--;
             i--;
+        } else if (strcmp(argv[i], "--chat-template") == 0) {
+            ft_params.chat_template_path = argv[i + 1];
+            remove_arg_pair(i);
+            i--;
         }
     }
 
@@ -426,6 +452,10 @@ int main(int argc, char ** argv) {
             ft_params.resume_from_checkpoint = latest_checkpoint;
             LOG_INF("Auto-resume: found checkpoint %s\n", ft_params.resume_from_checkpoint.c_str());
         }
+    }
+    
+    if (!ft_params.resume_from_checkpoint.empty()) {
+        params.warmup = false;
     }
     
     // Load checkpoint LoRA adapter from directory structure (model.gguf)
@@ -512,9 +542,9 @@ int main(int argc, char ** argv) {
             (lora_params.target_modules & LLAMA_LORA_TARGET_FFN_UP) ? "yes" : "no",
             (lora_params.target_modules & LLAMA_LORA_TARGET_FFN_DOWN) ? "yes" : "no",
             (lora_params.target_modules & LLAMA_LORA_TARGET_OUTPUT) ? "yes" : "no");
-
+        
         LOG_INF("LoRA configuration: rank=%d, alpha=%.1f (scaling=%.3f)\n",
-            lora_params.rank, lora_params.alpha, lora_params.alpha / lora_params.rank);
+                lora_params.rank, lora_params.alpha, lora_params.alpha / lora_params.rank);
 
         trained_adapter = llama_lora_training_init(ctx.get(), model.get(), &lora_params);
         if (!trained_adapter) {
@@ -525,8 +555,21 @@ int main(int argc, char ** argv) {
 
     constexpr float val_split = 0.05f;
 
-    std::vector<llama_token> tokens = common_tokenize(ctx.get(), params.prompt, true);
-    ggml_opt_dataset_t dataset = common_opt_dataset_init(ctx.get(), tokens, llama_n_ctx(ctx.get())/2);
+    ggml_opt_dataset_t dataset;
+    
+    if (ft_params.assistant_loss_only) {
+        LOG_INF("Using JSON dataset with chat template and assistant-only loss\n");
+        dataset = common_opt_sft_dataset_init(ctx.get(), params.prompt, llama_n_ctx(ctx.get())/2, ft_params.chat_template_path);
+    } else {
+        std::vector<llama_token> tokens = common_tokenize(ctx.get(), params.prompt, true);
+        LOG_INF("Using standard next-token prediction mode\n");
+        dataset = common_opt_dataset_init(ctx.get(), tokens, llama_n_ctx(ctx.get())/2);
+    }
+    
+    if (dataset == nullptr) {
+        LOG_ERR("Failed to create dataset. Please check your input file and parameters.\n");
+        return 1;
+    }
 
     int start_epoch = 0;
     int64_t start_step = 0;
@@ -557,9 +600,10 @@ int main(int argc, char ** argv) {
             LOG_ERR("Failed to load checkpoint, starting from scratch\n");
         }
     }
-    
+
     struct ggml_opt_optimizer_params optimizer_params = ggml_opt_get_default_optimizer_params(nullptr);
     optimizer_params.adamw.alpha = 1e-5f; // learning rate
+    optimizer_params.adamw.wd = 0.01f;
 
     std::string optimizer_checkpoint_path;
     if (checkpoint_loaded && !ft_params.resume_from_checkpoint.empty()) {
@@ -576,6 +620,7 @@ int main(int argc, char ** argv) {
         /*optimizer_type       =*/  GGML_OPT_OPTIMIZER_TYPE_ADAMW,
         /*checkpoint_path      =*/  checkpoint_loaded ? optimizer_checkpoint_path.c_str() : nullptr,
         /*load_optimizer_state =*/  checkpoint_loaded,
+        /*assistant_loss_only  =*/  ft_params.assistant_loss_only,
     };
     
     llama_opt_init(ctx.get(), model.get(), lopt_params);

@@ -133,14 +133,15 @@ int main(int argc, char ** argv) {
             (unsigned) lr.epochs, (double) params.n_batch / params.n_ubatch, (double) params.val_split);
 
     struct llama_opt_params lopt_params {
-        /*n_ctx_train     =*/ 0,
-        /*param_filter    =*/ llama_opt_param_filter_all,
-        /*param_filter_ud =*/ nullptr,
-        /*get_opt_pars    =*/ common_opt_lr_pars,
-        /*get_opt_pars_ud =*/ &params.lr,
-        /*optimizer_type  =*/ params.optimizer,
-        /*checkpoint_path =*/ nullptr,
+        /*n_ctx_train          =*/ 0,
+        /*param_filter         =*/ llama_opt_param_filter_all,
+        /*param_filter_ud      =*/ nullptr,
+        /*get_opt_pars         =*/ common_opt_lr_pars,
+        /*get_opt_pars_ud      =*/ &params.lr,
+        /*optimizer_type       =*/ params.optimizer,
+        /*checkpoint_path      =*/ nullptr,
         /*load_optimizer_state =*/ false,
+        /*assistant_loss_only  =*/ false,
     };
     llama_opt_init(ctx.get(), model.get(), lopt_params);
 
