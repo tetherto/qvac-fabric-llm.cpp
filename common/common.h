@@ -391,6 +391,7 @@ struct common_params {
     bool warmup            = true;  // warmup run
     bool check_tensors     = false; // validate tensor data
     bool no_op_offload     = false; // globally disable offload host tensor operations to device
+    bool training          = false; // enable training mode (affects LoRA K/V gradient flow)
     bool no_extra_bufts    = false; // disable extra buffer types (used for weight repacking)
 
     bool single_turn       = false; // single turn chat conversation
