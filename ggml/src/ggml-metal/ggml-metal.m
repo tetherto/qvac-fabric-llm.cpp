@@ -250,6 +250,8 @@ enum ggml_metal_kernel_type {
     GGML_METAL_KERNEL_TYPE_SOFT_MAX_F16_4,
     GGML_METAL_KERNEL_TYPE_SOFT_MAX_F32,
     GGML_METAL_KERNEL_TYPE_SOFT_MAX_F32_4,
+    GGML_METAL_KERNEL_TYPE_SOFT_MAX_BACK,
+    GGML_METAL_KERNEL_TYPE_SOFT_MAX_BACK_4,
     GGML_METAL_KERNEL_TYPE_DIAG_MASK_INF,
     GGML_METAL_KERNEL_TYPE_DIAG_MASK_INF_8,
     GGML_METAL_KERNEL_TYPE_GET_ROWS_F32,
@@ -1183,6 +1185,8 @@ static struct ggml_backend_metal_context * ggml_metal_init(ggml_backend_dev_t de
         GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_SOFT_MAX_F16_4,                  soft_max_f16_4,                  has_simdgroup_reduction);
         GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_SOFT_MAX_F32,                    soft_max_f32,                    has_simdgroup_reduction);
         GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_SOFT_MAX_F32_4,                  soft_max_f32_4,                  has_simdgroup_reduction);
+    GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_SOFT_MAX_BACK,                   soft_max_back,                   has_simdgroup_reduction);
+    GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_SOFT_MAX_BACK_4,                 soft_max_back_4,                 has_simdgroup_reduction);
         GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_DIAG_MASK_INF,                   diag_mask_inf,                   true);
         GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_DIAG_MASK_INF_8,                 diag_mask_inf_8,                 true);
         GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_GET_ROWS_F32,                    get_rows_f32,                    true);
@@ -1935,6 +1939,27 @@ static bool ggml_metal_supports_op(const struct ggml_backend_metal_device_contex
         case GGML_OP_SOFT_MAX:
         case GGML_OP_GROUP_NORM:
             return has_simdgroup_reduction && ggml_is_contiguous_rows(op->src[0]);
+        case GGML_OP_SOFT_MAX_BACK:
+            if (!has_simdgroup_reduction ||
+                op->type != GGML_TYPE_F32 ||
+                op->src[0] == NULL || op->src[1] == NULL ||
+                op->src[0]->type != GGML_TYPE_F32 ||
+                op->src[1]->type != GGML_TYPE_F32 ||
+                !ggml_is_contiguous_1(op->src[0]) ||
+                !ggml_is_contiguous_1(op->src[1]) ||
+                !ggml_is_contiguous_1(op) ||
+                !ggml_are_same_shape(op, op->src[0]) ||
+                !ggml_are_same_shape(op, op->src[1])) {
+                return false;
+            }
+
+            float max_bias = 0.0f;
+            memcpy(&max_bias, ((const float *) op->op_params) + 1, sizeof(float));
+            if (max_bias != 0.0f) {
+                return false;
+            }
+
+            return true;
         case GGML_OP_RMS_NORM:
         case GGML_OP_L2_NORM:
             return has_simdgroup_reduction && (op->ne[0] % 4 == 0 && ggml_is_contiguous_1(op->src[0]));
@@ -1955,6 +1980,7 @@ static bool ggml_metal_supports_op(const struct ggml_backend_metal_device_contex
         case GGML_OP_NORM:
             return has_simdgroup_reduction && (op->ne[0] % 4 == 0 && ggml_is_contiguous_1(op->src[0]));
         case GGML_OP_ROPE:
+        case GGML_OP_ROPE_BACK:
             return true;
         case GGML_OP_IM2COL:
             return ggml_is_contiguous(op->src[1]) && op->src[1]->type == GGML_TYPE_F32 && (op->type == GGML_TYPE_F16 || op->type == GGML_TYPE_F32);
@@ -3292,6 +3318,76 @@ static int ggml_metal_encode_node(
                 }
                 [encoder setBuffer:id_dst offset:offs_dst       atIndex:3];
                 [encoder setBytes:&args   length:sizeof(args)   atIndex:4];
+
+                [encoder setThreadgroupMemoryLength:32*sizeof(float) atIndex:0];
+
+                [encoder dispatchThreadgroups:MTLSizeMake(ne01, ne02, ne03) threadsPerThreadgroup:MTLSizeMake(nth, 1, 1)];
+            } break;
+        case GGML_OP_SOFT_MAX_BACK:
+            {
+                GGML_ASSERT(src0 != NULL);
+                GGML_ASSERT(src1 != NULL);
+                GGML_ASSERT(dstt  == GGML_TYPE_F32);
+                GGML_ASSERT(src0t == GGML_TYPE_F32);
+                GGML_ASSERT(src1t == GGML_TYPE_F32);
+                GGML_ASSERT(ggml_are_same_shape(dst, src0));
+                GGML_ASSERT(ggml_are_same_shape(dst, src1));
+                GGML_ASSERT(ggml_is_contiguous_1(src0));
+                GGML_ASSERT(ggml_is_contiguous_1(src1));
+                GGML_ASSERT(ggml_is_contiguous_1(dst));
+
+                float scale    = 1.0f;
+                float max_bias = 0.0f;
+
+                memcpy(&scale,    ((const int32_t *) dst->op_params) + 0, sizeof(scale));
+                memcpy(&max_bias, ((const int32_t *) dst->op_params) + 1, sizeof(max_bias));
+
+                GGML_ASSERT(max_bias == 0.0f);
+
+                const bool use_vec4 = (ne00 % 4) == 0;
+
+                id<MTLComputePipelineState> pipeline = use_vec4 ?
+                    ctx->kernels[GGML_METAL_KERNEL_TYPE_SOFT_MAX_BACK_4].pipeline :
+                    ctx->kernels[GGML_METAL_KERNEL_TYPE_SOFT_MAX_BACK   ].pipeline;
+
+                int nth = 32; // SIMD width
+
+                if (use_vec4) {
+                    const int ne00_4 = ne00/4;
+                    while (nth < ne00_4 && nth < (int) pipeline.maxTotalThreadsPerThreadgroup) {
+                        nth *= 2;
+                    }
+                    nth = MIN(nth, ne00_4);
+                } else {
+                    while (nth < ne00 && nth < (int) pipeline.maxTotalThreadsPerThreadgroup) {
+                        nth *= 2;
+                    }
+                    nth = MIN(nth, ne00);
+                }
+
+                nth = MAX(1, nth);
+                nth = MIN(nth, (int) pipeline.maxTotalThreadsPerThreadgroup);
+
+                ggml_metal_kargs_soft_max_back args = {
+                    /*.ne00   =*/ ne00,
+                    /*.ne00_4 =*/ ne00/4,
+                    /*.nb01   =*/ nb01,
+                    /*.nb02   =*/ nb02,
+                    /*.nb03   =*/ nb03,
+                    /*.nb11   =*/ nb11,
+                    /*.nb12   =*/ nb12,
+                    /*.nb13   =*/ nb13,
+                    /*.nb1    =*/ nb1,
+                    /*.nb2    =*/ nb2,
+                    /*.nb3    =*/ nb3,
+                    /*.scale  =*/ scale,
+                };
+
+                [encoder setComputePipelineState:pipeline];
+                [encoder setBytes:&args   length:sizeof(args) atIndex:0];
+                [encoder setBuffer:id_src0 offset:offs_src0    atIndex:1];
+                [encoder setBuffer:id_src1 offset:offs_src1    atIndex:2];
+                [encoder setBuffer:id_dst  offset:offs_dst     atIndex:3];
 
                 [encoder setThreadgroupMemoryLength:32*sizeof(float) atIndex:0];
 
@@ -4854,7 +4950,9 @@ static int ggml_metal_encode_node(
                 [encoder dispatchThreadgroups:MTLSizeMake(nrows, 1, 1) threadsPerThreadgroup:MTLSizeMake(nth, 1, 1)];
             } break;
         case GGML_OP_ROPE:
+        case GGML_OP_ROPE_BACK:
             {
+                const bool is_backward = dst->op == GGML_OP_ROPE_BACK;
 
                 // make sure we have one or more position id(ne10) per token(ne02)
                 GGML_ASSERT(ne10 % ne02 == 0);
@@ -4891,6 +4989,8 @@ static int ggml_metal_encode_node(
                 const int sect_1 = ((const int32_t *) dst->op_params)[12];
                 const int sect_2 = ((const int32_t *) dst->op_params)[13];
                 const int sect_3 = ((const int32_t *) dst->op_params)[14];
+
+                const float sin_sign = is_backward ? -1.0f : 1.0f;
 
                 id<MTLComputePipelineState> pipeline = nil;
 
@@ -4952,6 +5052,7 @@ static int ggml_metal_encode_node(
                     /* sect_1      =*/ sect_1,
                     /* sect_2      =*/ sect_2,
                     /* sect_3      =*/ sect_3,
+                    /* sin_sign    =*/ sin_sign,
                 };
 
                 [encoder setComputePipelineState:pipeline];

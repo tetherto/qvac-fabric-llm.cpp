@@ -256,6 +256,7 @@ typedef struct {
     int32_t  sect_1;
     int32_t  sect_2;
     int32_t  sect_3;
+    float    sin_sign;
 } ggml_metal_kargs_rope;
 
 typedef struct {
@@ -588,6 +589,21 @@ typedef struct {
     float    m1;
     int32_t  n_head_log2;
 } ggml_metal_kargs_soft_max;
+
+typedef struct {
+    int32_t  ne00;
+    int32_t  ne00_4;
+    uint64_t nb01;
+    uint64_t nb02;
+    uint64_t nb03;
+    uint64_t nb11;
+    uint64_t nb12;
+    uint64_t nb13;
+    uint64_t nb1;
+    uint64_t nb2;
+    uint64_t nb3;
+    float    scale;
+} ggml_metal_kargs_soft_max_back;
 
 typedef struct {
     int64_t  ne00;
