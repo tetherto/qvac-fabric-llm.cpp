@@ -808,3 +808,8 @@ ggml_opt_dataset_t common_opt_dataset_init(struct llama_context * ctx, const std
 
 // "adamw" or "sgd" (case insensitive)
 enum ggml_opt_optimizer_type common_opt_get_optimizer(const char *);
+ggml_opt_dataset_t common_opt_sft_dataset_init(
+        struct llama_context * ctx,
+        const std::string    & json_content,
+        int64_t                stride,
+        const std::string    & chat_template_path = "");

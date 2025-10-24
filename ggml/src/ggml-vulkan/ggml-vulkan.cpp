@@ -730,6 +730,9 @@ struct vk_device_struct {
     vk_pipeline pipeline_leaky_relu_f32;
     vk_pipeline pipeline_silu_back_f32;
     vk_pipeline pipeline_diag_mask_inf_f32;
+    vk_pipeline pipeline_cross_entropy_loss_back_f32;
+    vk_pipeline pipeline_cross_entropy_loss_masked_back_f32;
+    vk_pipeline pipeline_count_equal_masked_i32;
     vk_pipeline pipeline_soft_max_f32, pipeline_soft_max_f32_f16;
     vk_pipeline pipeline_soft_max_f32_wg512, pipeline_soft_max_f32_f16_wg512;
     vk_pipeline pipeline_soft_max_back_f32;
@@ -4201,6 +4204,10 @@ static void ggml_vk_load_shaders(vk_device& device) {
     ggml_vk_create_pipeline(device, device->pipeline_silu_back_f32, "silu_back_f32", silu_back_f32_len, silu_back_f32_data, "main", 3, sizeof(vk_op_push_constants), {512, 1, 1}, {}, 1);
 
     ggml_vk_create_pipeline(device, device->pipeline_diag_mask_inf_f32, "diag_mask_inf_f32", diag_mask_inf_f32_len, diag_mask_inf_f32_data, "main", 2, sizeof(vk_op_diag_mask_push_constants), {1, 512, 1}, {}, 1, true);
+
+    ggml_vk_create_pipeline(device, device->pipeline_cross_entropy_loss_back_f32, "cross_entropy_loss_back_f32", cross_entropy_loss_back_f32_len, cross_entropy_loss_back_f32_data, "main", 4, sizeof(vk_op_push_constants), {1, 1, 1}, { device->subgroup_size }, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_cross_entropy_loss_masked_back_f32, "cross_entropy_loss_masked_back_f32", cross_entropy_loss_masked_back_f32_len, cross_entropy_loss_masked_back_f32_data, "main", 5, sizeof(vk_op_push_constants), {1, 1, 1}, { 32 }, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_count_equal_masked_i32, "count_equal_masked_i32", count_equal_masked_i32_len, count_equal_masked_i32_data, "main", 4, sizeof(vk_op_push_constants), {1, 1, 1}, { 512 }, 1);
 
     ggml_vk_create_pipeline(device, device->pipeline_soft_max_f32, "soft_max_f32", soft_max_f32_len, soft_max_f32_data, "main", 4, sizeof(vk_op_soft_max_push_constants), {1, 1, 1}, { device->subgroup_size }, 1);
     ggml_vk_create_pipeline(device, device->pipeline_soft_max_f32_wg512, "soft_max_f32_wg512", soft_max_f32_len, soft_max_f32_data, "main", 4, sizeof(vk_op_soft_max_push_constants), {1, 1, 1}, { 512 }, 1);
@@ -8833,6 +8840,21 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
             return ctx->device->pipeline_diag_mask_inf_f32;
         }
         return nullptr;
+    case GGML_OP_CROSS_ENTROPY_LOSS_BACK:
+        if (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 && src2->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
+            return ctx->device->pipeline_cross_entropy_loss_back_f32;
+        }
+        return nullptr;
+    case GGML_OP_CROSS_ENTROPY_LOSS_MASKED_BACK:
+        if (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 && src2->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
+            return ctx->device->pipeline_cross_entropy_loss_masked_back_f32;
+        }
+        return nullptr;
+    case GGML_OP_COUNT_EQUAL_MASKED:
+        if (src0->type == GGML_TYPE_I32 && src1->type == GGML_TYPE_I32 && src2->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_I64) {
+            return ctx->device->pipeline_count_equal_masked_i32;
+        }
+        return nullptr;
     case GGML_OP_SOFT_MAX:
         GGML_ASSERT(!src1 || src1->type == GGML_TYPE_F32 || src1->type == GGML_TYPE_F16);
         GGML_ASSERT(!src2 || src2->type == GGML_TYPE_F32);
@@ -9282,6 +9304,31 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
             }
         }
         break;
+    case GGML_OP_CROSS_ENTROPY_LOSS_BACK:
+        {
+            const uint32_t nr = ggml_nrows(src1);
+            if (nr > 262144) {
+                elements = { 512, 512, CEIL_DIV(nr, 262144) };
+            } else if (nr > 512) {
+                elements = { 512, CEIL_DIV(nr, 512), 1 };
+            } else {
+                elements = { nr, 1, 1 };
+            }
+        }
+        break;
+    case GGML_OP_CROSS_ENTROPY_LOSS_MASKED_BACK:
+        {
+            const uint32_t nr = ggml_nrows(src1);
+            elements = { nr, 1, 1 };
+        }
+        break;
+    case GGML_OP_COUNT_EQUAL_MASKED:
+        {
+            const uint32_t n_elements = ggml_nelements(src0);
+            const uint32_t chunk_size = 512;
+            elements = { CEIL_DIV(n_elements, chunk_size), 1, 1 };
+        }
+        break;
     case GGML_OP_RMS_NORM:
         if (ctx->do_add_rms_partials) {
             // Run one element per thread, 128 threads per workgroup
@@ -9505,6 +9552,11 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
         ggml_vk_buffer_memset_async(subctx, dst_buf.buffer, dst_buf.offset, 0, dst_buf.size);
         ggml_vk_sync_buffers(ctx, subctx);
         ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { src0_buf, src1_buf, dst_buf }, pc, elements);
+    } else if (op == GGML_OP_COUNT_EQUAL_MASKED) {
+        // count_equal_masked assumes that destination buffer is initialized with zeroes
+        ggml_vk_buffer_memset_async(subctx, dst_buf.buffer, dst_buf.offset, 0, dst_buf.size);
+        ggml_vk_sync_buffers(ctx, subctx);
+        ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { src0_buf, src1_buf, src2_buf, dst_buf }, pc, elements);
     } else if (op == GGML_OP_OPT_STEP_SGD) {
         // OPT_STEP_SGD works on src0, it does not need dst
         ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { src0_buf, src1_buf, src2_buf }, pc, elements);
@@ -10385,6 +10437,85 @@ static void ggml_vk_glu(ggml_backend_vk_context * ctx, vk_context& subctx, const
 static void ggml_vk_diag_mask_inf(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, ggml_tensor * dst) {
     int32_t * op_params = (int32_t *)dst->op_params;
     ggml_vk_op_f32<vk_op_diag_mask_push_constants>(ctx, subctx, src0, nullptr, nullptr, nullptr, dst, GGML_OP_DIAG_MASK_INF, { (uint32_t)src0->ne[0], (uint32_t)src0->ne[1], op_params[0] });
+}
+
+static void ggml_vk_cross_entropy_loss_back(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * src2, ggml_tensor * dst) {
+    const int64_t nclasses = src1->ne[0];
+    const int64_t nrows = ggml_nrows(src1);
+
+    ggml_vk_op_f32<vk_op_push_constants>(ctx, subctx, src0, src1, src2, nullptr, dst, GGML_OP_CROSS_ENTROPY_LOSS_BACK, {
+        (uint32_t)nclasses,
+        (uint32_t)nrows,
+        0.0f,
+        0.0f
+    });
+}
+
+static void ggml_vk_op_f32_cross_entropy_loss_masked_back(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst, const vk_op_push_constants&& pc) {
+    const ggml_tensor * grad  = dst->src[0];  // gradient of forward pass output
+    const ggml_tensor * logits = dst->src[1]; // logits
+    const ggml_tensor * labels = dst->src[2]; // targets
+    const ggml_tensor * mask = dst->src[3];   // mask
+
+    GGML_ASSERT(grad->type == GGML_TYPE_F32);
+    GGML_ASSERT(logits->type == GGML_TYPE_F32);
+    GGML_ASSERT(labels->type == GGML_TYPE_F32);
+    GGML_ASSERT(mask->type == GGML_TYPE_F32);
+    GGML_ASSERT(dst->buffer != nullptr);
+    GGML_ASSERT(ggml_is_contiguous(grad));
+    GGML_ASSERT(ggml_is_contiguous(logits));
+    GGML_ASSERT(ggml_is_contiguous(labels));
+    GGML_ASSERT(ggml_is_contiguous(mask));
+    GGML_ASSERT(ggml_are_same_shape(logits, labels));
+    GGML_ASSERT(ggml_are_same_shape(logits, dst));
+
+    vk_pipeline pipeline = ggml_vk_op_get_pipeline(ctx, logits, labels, mask, dst, GGML_OP_CROSS_ENTROPY_LOSS_MASKED_BACK);
+    GGML_ASSERT(pipeline != nullptr);
+
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+
+    vk_subbuffer grad_buf = ggml_vk_tensor_subbuffer(ctx, grad);
+    vk_subbuffer logits_buf = ggml_vk_tensor_subbuffer(ctx, logits);
+    vk_subbuffer labels_buf = ggml_vk_tensor_subbuffer(ctx, labels);
+    vk_subbuffer mask_buf = ggml_vk_tensor_subbuffer(ctx, mask);
+    vk_subbuffer dst_buf = ggml_vk_tensor_subbuffer(ctx, dst);
+
+    std::array<uint32_t, 3> elements = { (uint32_t)ggml_nrows(logits), 1, 1 };
+
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, {
+        grad_buf,
+        logits_buf,
+        labels_buf,
+        mask_buf,
+        dst_buf,
+    }, pc, elements);
+}
+
+static void ggml_vk_cross_entropy_loss_masked_back(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
+    const ggml_tensor * logits = dst->src[1];
+
+    const int64_t nclasses = logits->ne[0];
+    const int64_t nrows = ggml_nrows(logits);
+
+    float upstream_grad = 1.0f;
+    ggml_vk_op_f32_cross_entropy_loss_masked_back(ctx, subctx, dst, {
+        (uint32_t)nclasses,
+        (uint32_t)nrows,
+        upstream_grad,
+        0.0f
+    });
+}
+
+static void ggml_vk_count_equal_masked(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * predictions, const ggml_tensor * targets, const ggml_tensor * mask, ggml_tensor * dst) {
+    const int64_t n_elements = ggml_nelements(predictions);
+    const int64_t vocab_size = mask->ne[0];
+
+    ggml_vk_op_f32<vk_op_push_constants>(ctx, subctx, predictions, targets, mask, nullptr, dst, GGML_OP_COUNT_EQUAL_MASKED, {
+        (uint32_t)n_elements,
+        (uint32_t)vocab_size,
+        0.0f,
+        0.0f
+    });
 }
 
 static void ggml_vk_soft_max(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * src2, ggml_tensor * dst) {
@@ -12302,6 +12433,16 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
     case GGML_OP_DIAG_MASK_INF:
         ggml_vk_diag_mask_inf(ctx, compute_ctx, src0, node);
 
+        break;
+
+    case GGML_OP_CROSS_ENTROPY_LOSS_BACK:
+        ggml_vk_cross_entropy_loss_back(ctx, compute_ctx, src0, src1, src2, node);
+        break;
+    case GGML_OP_CROSS_ENTROPY_LOSS_MASKED_BACK:
+        ggml_vk_cross_entropy_loss_masked_back(ctx, compute_ctx, node);
+        break;
+    case GGML_OP_COUNT_EQUAL_MASKED:
+        ggml_vk_count_equal_masked(ctx, compute_ctx, src0, src1, src2, node);
         break;
     case GGML_OP_SOFT_MAX:
         if (ctx->num_additional_fused_ops) {
@@ -14513,6 +14654,10 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                     ggml_is_contiguous(op->src[1]) &&
                     ggml_is_contiguous(op));
             }
+        case GGML_OP_CROSS_ENTROPY_LOSS_MASKED_BACK:
+            return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 && op->src[2]->type == GGML_TYPE_F32 && op->src[3]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32;
+        case GGML_OP_COUNT_EQUAL_MASKED:
+            return op->src[0]->type == GGML_TYPE_I32 && op->src[1]->type == GGML_TYPE_I32 && op->src[2]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_I64;
         default:
             return false;
     }
