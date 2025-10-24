@@ -450,22 +450,6 @@ void main() {
             buf_a[buf_idx + 1] = FLOAT_TYPE(v.y);
             buf_a[buf_idx + 2] = FLOAT_TYPE(v.z);
             buf_a[buf_idx + 3] = FLOAT_TYPE(v.w);
-#elif defined(DATA_A_TQ2_0)
-            const uint idx = pos_a + (loadc_a + l) * p.stride_a / LOAD_VEC_A + loadr_a;
-            const uint buf_idx = (loadc_a + l) * SHMEM_STRIDE + loadr_a * LOAD_VEC_A;
-
-            const uint ib = idx / 128;                              // 2 values per idx (like Q2_K)
-            const uint iqs = idx % 128;                             // 0..127
-            const uint qsi = (iqs / 64) * 32 + (iqs % 16) * 2;      // Q2_K indexing pattern
-            const uint qsshift = ((iqs % 64) / 16) * 2;             // Q2_K shift: 0,2,4,6
-
-            const float d = float(data_a[ib].d);
-
-            const uvec2 qs = uvec2(data_a[ib].qs[qsi], data_a[ib].qs[qsi + 1]);
-            const vec2 v = d * (vec2((qs >> qsshift) & 3) - 1.0f);  // (q-1)*d
-
-            buf_a[buf_idx    ] = FLOAT_TYPE(v.x);
-            buf_a[buf_idx + 1] = FLOAT_TYPE(v.y);
 #elif defined(DATA_A_Q2_K)
             const uint idx = pos_a + (loadc_a + l) * p.stride_a / LOAD_VEC_A + loadr_a;
             const uint buf_idx = (loadc_a + l) * SHMEM_STRIDE + loadr_a * LOAD_VEC_A;

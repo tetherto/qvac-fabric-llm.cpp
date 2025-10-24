@@ -100,15 +100,12 @@ static bool try_parse_ftype(const std::string & ftype_str_in, llama_ftype & ftyp
         }
     }
     try {
-        size_t consumed = 0;
-        int ftype_int = std::stoi(ftype_str, &consumed);
-        if (consumed == ftype_str.size()) {
-            for (const auto & it : QUANT_OPTIONS) {
-                if (it.ftype == ftype_int) {
-                    ftype = it.ftype;
-                    ftype_str_out = it.name;
-                    return true;
-                }
+        int ftype_int = std::stoi(ftype_str);
+        for (const auto & it : QUANT_OPTIONS) {
+            if (it.ftype == ftype_int) {
+                ftype = it.ftype;
+                ftype_str_out = it.name;
+                return true;
             }
         }
     }
