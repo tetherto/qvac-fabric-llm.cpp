@@ -1213,6 +1213,8 @@ kernel void kernel_out_prod_q4_0_impl(
     for (int i0 = tpitg.x; i0 < args.ne0; i0 += ntg.x) {
         const int ib = i0 / QK4_0;
         const int ix = i0 % QK4_0;
+        const int iq = ix % (QK4_0 / 2);
+        const bool upper = ix >= (QK4_0 / 2);
 
         float acc = 0.0f;
 
@@ -1221,8 +1223,8 @@ kernel void kernel_out_prod_q4_0_impl(
             device const block_q4_0 * src0_row = (device const block_q4_0 *) src0_row_char;
             const block_q4_0 blk = src0_row[ib];
 
-            const uint8_t q = blk.qs[ix / 2];
-            const int nibble = (ix & 1) ? (q >> 4) : (q & 0x0F);
+            const uint8_t q = blk.qs[iq];
+            const int nibble = upper ? (q >> 4) : (q & 0x0F);
             const float v0 = ((float) blk.d) * ((float) nibble - 8.0f);
 
             device const src1_t * src1_row = (device const src1_t *)(src1_base + i01*args.nb11);
