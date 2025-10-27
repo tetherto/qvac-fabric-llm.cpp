@@ -4088,7 +4088,7 @@ void llama_context::opt_epoch(
     std::vector<llama_token> labels_sparse(n_ctx);
     std::vector<int32_t>      masks_sparse(n_ctx);
 
-    int64_t idata = (resume_from_batch >= 0) ? resume_from_batch + 1 : 0;
+    int64_t idata = (resume_from_batch > 0) ? resume_from_batch + 1 : 0;
 
     int64_t t_loop_start = ggml_time_us();
     int64_t ndata_in_loop = idata_split*ubatch_per_ctx;
