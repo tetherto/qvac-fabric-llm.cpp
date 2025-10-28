@@ -131,11 +131,11 @@ static struct ggml_opt_optimizer_params lora_scheduler_get_optimizer_params(void
         return params;
     }
 
-    const float lr = lora_scheduler_lr_for_step(*scheduler, scheduler->current_step);
+    const float lr = lora_scheduler_lr_for_step(*scheduler, scheduler->current_step+1);
     scheduler->last_lr = lr;
 
     params.adamw.alpha = lr;
-    params.adamw.wd = scheduler->weight_decay;
+        params.adamw.wd = scheduler->weight_decay;
 
     params.sgd.alpha = lr;
     params.sgd.wd = scheduler->weight_decay;
@@ -444,7 +444,7 @@ static void checkpoint_progress_callback(
     }
 
     if (cb_data->lr_scheduler) {
-        cb_data->learning_rate = lora_scheduler_lr_for_step(*cb_data->lr_scheduler, cb_data->lr_scheduler->current_step);
+        cb_data->learning_rate = lora_scheduler_lr_for_step(*cb_data->lr_scheduler, cb_data->lr_scheduler->current_step+1);
     }
 
     if (cb_data->checkpoint_save_steps <= 0) {
@@ -919,7 +919,7 @@ int main(int argc, char ** argv) {
 
     for (int epoch = start_epoch; epoch < ft_params.num_epochs; ++epoch) {
         if (cb_data.lr_scheduler) {
-            cb_data.learning_rate = lora_scheduler_lr_for_step(*cb_data.lr_scheduler, cb_data.lr_scheduler->current_step);
+            cb_data.learning_rate = lora_scheduler_lr_for_step(*cb_data.lr_scheduler, cb_data.lr_scheduler->current_step+1);
         }
         LOG_INF("Starting epoch %d (step %lld, lr=%.4e)\n", epoch, (long long)cb_data.global_step, cb_data.learning_rate);
         cb_data.current_epoch = epoch;
