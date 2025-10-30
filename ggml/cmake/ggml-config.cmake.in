@@ -141,6 +141,9 @@ if (NOT GGML_SHARED_LIB AND GGML_CPU_KLEIDIAI)
     list(APPEND GGML_CPU_INTERFACE_LINK_LIBRARIES ${KLEIDIAI_LIBRARY})
 endif()
 
+# Include the exported targets file
+include("${CMAKE_CURRENT_LIST_DIR}/ggml-targets.cmake")
+
 if(NOT TARGET ggml::ggml)
     find_package(Threads REQUIRED)
 
@@ -232,6 +235,30 @@ if(NOT TARGET ggml::ggml)
         PROPERTIES
             INTERFACE_LINK_LIBRARIES "${_ggml_all_targets}")
 
+endif()
+
+# ggml::all aggregates every backend target the package ships. The hand-rolled
+# branch above builds it while discovering the backends itself, but that branch
+# only runs when ggml-targets.cmake did NOT define ggml::ggml. Now that the
+# exported targets file is included unconditionally above, the common install
+# takes the other path and would leave ggml::all undefined, so any consumer
+# linking it fails at generate time with
+#   Target ... links to: ggml::all but the target was not found
+# Rebuild the aggregate here from the backend list recorded at install time.
+if(NOT TARGET ggml::all)
+    set(_ggml_all_targets "")
+    if (NOT GGML_BACKEND_DL)
+        foreach(_ggml_backend ${GGML_AVAILABLE_BACKENDS})
+            if (TARGET ggml::${_ggml_backend})
+                list(APPEND _ggml_all_targets ggml::${_ggml_backend})
+            endif()
+        endforeach()
+    endif()
+
+    add_library(ggml::all INTERFACE IMPORTED)
+    set_target_properties(ggml::all
+        PROPERTIES
+            INTERFACE_LINK_LIBRARIES "${_ggml_all_targets}")
 endif()
 
 check_required_components(ggml)
