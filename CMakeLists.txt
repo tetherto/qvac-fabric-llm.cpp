@@ -313,6 +313,10 @@ install(
         WORLD_EXECUTE
     DESTINATION ${CMAKE_INSTALL_BINDIR})
 
+install(
+    PROGRAMS vulkan_profiling_analyzer.py
+    DESTINATION ${CMAKE_INSTALL_BINDIR})
+
 configure_file(cmake/llama.pc.in
         "${CMAKE_CURRENT_BINARY_DIR}/llama.pc"
         @ONLY)
