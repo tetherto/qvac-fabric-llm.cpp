@@ -1423,6 +1423,57 @@ jobs:
           path: llama-${{ steps.tag.outputs.name }}-bin-android-build.zip
           name: llama-bin-android-build.zip
 
+  android-ndk-build:
+    runs-on: ubuntu-latest
+
+    env:
+      VULKAN_SDK_VERSION: 1.4.328.1
+
+    strategy:
+      matrix:
+        include:
+          - build: 'arm64-snapdragon-vulkan'
+            defines: '--preset arm64-android-snapdragon-vulkan-release'
+
+    steps:
+      - name: Clone
+        id: checkout
+        uses: actions/checkout@v4
+
+      - name: Install Vulkan Headers
+        id: install_vulkan
+        if: ${{ matrix.build == 'arm64-snapdragon-vulkan' }}
+        run: |
+          curl -L -o vulkansdk-linux-x86_64.tar.xz https://sdk.lunarg.com/sdk/download/${VULKAN_SDK_VERSION}/linux/vulkansdk-linux-x86_64-${VULKAN_SDK_VERSION}.tar.xz
+          mkdir vulkansdk-linux-x86_64
+          tar -xaf vulkansdk-linux-x86_64.tar.xz -C vulkansdk-linux-x86_64
+          sudo cp -r vulkansdk-linux-x86_64/${VULKAN_SDK_VERSION}/x86_64/include/vulkan/* ${ANDROID_NDK_ROOT}/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include/vulkan
+          sudo cp -r vulkansdk-linux-x86_64/${VULKAN_SDK_VERSION}/x86_64/include/vk_video ${ANDROID_NDK_ROOT}/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include
+
+      - name: Build
+        id: ndk_build
+        run: |
+          # set PATH for `glslc`
+          export PATH=$PATH:${ANDROID_NDK_ROOT}/shader-tools/linux-x86_64/
+          cmake ${{ matrix.defines }} -B build
+          cmake --build build
+
+      - name: Determine tag name
+        id: tag
+        uses: ./.github/actions/get-tag-name
+
+      - name: Pack artifacts
+        id: pack_artifacts
+        run: |
+          cp LICENSE ./build/bin/
+          zip -r llama-${{ steps.tag.outputs.name }}-bin-android-ndk-build-${{ matrix.build }}.zip ./build/bin/*
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          path: llama-${{ steps.tag.outputs.name }}-bin-android-ndk-build-${{ matrix.build }}.zip
+          name: llama-bin-android-ndk-build-${{ matrix.build }}.zip
+
   openEuler-latest-cmake-cann:
     if: ${{ github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'Ascend NPU') }}
     defaults:
