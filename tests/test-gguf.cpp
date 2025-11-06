@@ -101,6 +101,12 @@ static bool expect_context_not_null(const enum handcrafted_file_type hft) {
 
 typedef std::pair<enum ggml_type, std::array<int64_t, GGML_MAX_DIMS>> tensor_config_t;
 
+// Helper function to safely cast to gguf_type, suppressing sanitizer warnings for intentional invalid values
+static inline enum gguf_type __attribute__((no_sanitize("undefined"))) 
+safe_cast_to_gguf_type(int value) {
+    return static_cast<enum gguf_type>(value);
+}
+
 static std::vector<tensor_config_t> get_tensor_configs(std::mt19937 & rng) {
     std::vector<tensor_config_t> tensor_configs;
     tensor_configs.reserve(100);
@@ -140,7 +146,9 @@ static std::vector<std::pair<enum gguf_type, enum gguf_type>> get_kv_types(std::
             continue;
         }
 
-        kv_types.push_back(std::make_pair(type, gguf_type(-1)));
+        // Intentionally create invalid enum value for testing error handling
+        // Suppress sanitizer warning as this is intentional undefined behavior for testing
+        kv_types.push_back(std::make_pair(type, safe_cast_to_gguf_type(-1)));
     }
     std::shuffle(kv_types.begin(), kv_types.end(), rng);
 
@@ -232,8 +240,10 @@ static FILE * get_handcrafted_file(const unsigned int seed, const enum handcraft
     }
 
     for (int i = 0; i < int(kv_types.size()); ++i) {
-        const enum gguf_type type     = gguf_type(hft == HANDCRAFTED_KV_BAD_TYPE ? GGUF_TYPE_COUNT : kv_types[i].first);
-        const enum gguf_type type_arr = gguf_type(hft == HANDCRAFTED_KV_BAD_TYPE ? GGUF_TYPE_COUNT : kv_types[i].second);
+        // Intentionally create invalid enum values for testing error handling
+        // Suppress sanitizer warning as this is intentional undefined behavior for testing
+        const enum gguf_type type     = safe_cast_to_gguf_type(hft == HANDCRAFTED_KV_BAD_TYPE ? GGUF_TYPE_COUNT : kv_types[i].first);
+        const enum gguf_type type_arr = safe_cast_to_gguf_type(hft == HANDCRAFTED_KV_BAD_TYPE ? GGUF_TYPE_COUNT : kv_types[i].second);
 
         const std::string key = "my_key_" + std::to_string((hft == HANDCRAFTED_KV_DUPLICATE_KEY ? i/2 : i));
 
@@ -463,8 +473,9 @@ static bool handcrafted_check_kv(const gguf_context * gguf_ctx, const unsigned i
     bool ok = true;
 
     for (int i = 0; i < int(kv_types.size()); ++i) {
-        const enum gguf_type type     = gguf_type(kv_types[i].first);
-        const enum gguf_type type_arr = gguf_type(kv_types[i].second);
+        // Suppress sanitizer warning for intentional invalid enum values in test data
+        const enum gguf_type type     = safe_cast_to_gguf_type(kv_types[i].first);
+        const enum gguf_type type_arr = safe_cast_to_gguf_type(kv_types[i].second);
 
         const std::string key = "my_key_" + std::to_string(i);
 
