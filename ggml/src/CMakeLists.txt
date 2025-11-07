@@ -13,7 +13,6 @@ if (NOT MSVC)
         add_compile_options(-fsanitize=thread)
         link_libraries     (-fsanitize=thread)
     endif()
-
     if (GGML_SANITIZE_ADDRESS)
         add_compile_options(-fsanitize=address -fno-omit-frame-pointer)
         link_libraries     (-fsanitize=address)
@@ -239,13 +238,13 @@ function(ggml_add_backend_library backend)
         if (GGML_BACKEND_DIR)
             install(TARGETS ${backend}
                     EXPORT ggml-targets
-                    LIBRARY DESTINATION ${GGML_BACKEND_DIR}
+                    LIBRARY DESTINATION ${GGML_BACKEND_LIBDIR}
                     RUNTIME DESTINATION ${GGML_BACKEND_DIR})
         else()
             install(TARGETS ${backend}
                     EXPORT ggml-targets
-                    LIBRARY DESTINATION ${CMAKE_BINARY_DIR}
-                    RUNTIME DESTINATION ${CMAKE_BINARY_DIR})
+                    LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+                    RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
         endif()
     else()
         add_library(${backend} ${ARGN})
