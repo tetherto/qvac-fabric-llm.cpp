@@ -30,7 +30,7 @@ void iter(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const uint first_row, const
         const uint b_block_idx_inner = b_block_idx % 4;
         cache_b_ds = vec2(data_b[b_block_idx_outer].ds[b_block_idx_inner]);
 
-#if QUANT_R == 2
+#if QUANT_R == 2 || QUANT_R == 4
         cache_b_qs[0] = data_b[b_block_idx_outer].qs[b_block_idx_inner * 8 + b_qs_idx];
         cache_b_qs[1] = data_b[b_block_idx_outer].qs[b_block_idx_inner * 8 + b_qs_idx + 4];
 #else
@@ -40,12 +40,19 @@ void iter(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const uint first_row, const
 
         uint ibi = first_row*p.ncols;
         [[unroll]] for (uint n = 0; n < num_rows; ++n) {
-            const uint a_block_idx = (ibi + col)/QUANT_K + a_offset;
-            ibi += p.ncols;
+            const uint cur_ibi = ibi;
+            const uint a_block_idx = (cur_ibi + col)/QUANT_K + a_offset;
 
             int32_t q_sum = 0;
-#if QUANT_R == 2
+#if QUANT_R == 2 || QUANT_R == 4
+#if defined(DATA_A_TQ2_0)
+            // For TQ2_0 (QUANT_K=256), repack needs the within-block K base to select
+            // the correct half (k<128 or k>=128) and 32-wide quarter. Pass k_base+b_qs_idx.
+            const uint k_base = (cur_ibi + col) % QUANT_K;
+            const i32vec2 data_a_qs = repack(a_block_idx, k_base + b_qs_idx);
+#else
             const i32vec2 data_a_qs = repack(a_block_idx, b_qs_idx);
+#endif
             q_sum += dotPacked4x8EXT(data_a_qs.x,
                                      cache_b_qs[0]);
             q_sum += dotPacked4x8EXT(data_a_qs.y,
@@ -59,11 +66,14 @@ void iter(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const uint first_row, const
                                      cache_b_qs[1]);
 #endif
 
-#if QUANT_AUXF == 1
+#if QUANT_AUXF == 1 && QUANT_R <= 2
+            temp[j][n] += mul_q8_1(q_sum,  get_d(a_block_idx), cache_b_ds, 4);
+#elif QUANT_AUXF == 1 && QUANT_R == 4
             temp[j][n] += mul_q8_1(q_sum,  get_d(a_block_idx), cache_b_ds, 4);
 #else
             temp[j][n] += mul_q8_1(q_sum, get_dm(a_block_idx), cache_b_ds, 4);
 #endif
+            ibi += p.ncols;
         }
     }
 }
