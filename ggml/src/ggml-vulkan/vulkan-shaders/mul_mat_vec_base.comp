@@ -13,7 +13,7 @@
 
 #include "types.comp"
 
-#ifndef MMQ
+#if !defined(MMQ) || !defined(A_TYPE_PACKED16)
 layout (binding = 0) readonly buffer A {A_TYPE data_a[];};
 #else
 layout (binding = 0) readonly buffer A {A_TYPE_PACKED16 data_a[];};
