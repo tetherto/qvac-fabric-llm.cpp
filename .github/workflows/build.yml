@@ -447,11 +447,20 @@ jobs:
         id: checkout
         uses: actions/checkout@v4
 
+<<<<<<< HEAD
       - name: ccache
         uses: ggml-org/ccache-action@v1.2.16
         with:
           key: ubuntu-24-cmake-vulkan
           evict-old-files: 1d
+=======
+      # Reduce false pass/failure on CI
+      # - name: ccache
+      #   uses: ggml-org/ccache-action@v1.2.16
+      #   with:
+      #     key: ubuntu-22-cmake-vulkan
+      #     evict-old-files: 1d
+>>>>>>> 58e64df80 (remove_cache)
 
       - name: Dependencies
         id: depends
