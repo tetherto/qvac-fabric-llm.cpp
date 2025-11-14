@@ -120,15 +120,15 @@ void ggml_vk_test_matmul(ggml_backend_vk_context * ctx, size_t m, size_t n, size
             if (ctx->prealloc_split_k != nullptr) {
                 ggml_vk_destroy_buffer(ctx->prealloc_split_k);
             }
-            ctx->prealloc_split_k = ggml_vk_create_buffer_check(ctx->device, sizeof(float) * d_ne * split_k, {vk::MemoryPropertyFlagBits::eDeviceLocal});
+            ctx->prealloc_split_k = ggml_vk_create_buffer_device(ctx->device, sizeof(float) * d_ne * split_k);
         }
     }
 
     ggml_pipeline_allocate_descriptor_sets(ctx);
 
-    vk_buffer d_X = ggml_vk_create_buffer_check(ctx->device, sizeof(X_TYPE) * x_ne, {vk::MemoryPropertyFlagBits::eDeviceLocal});
-    vk_buffer d_Y = ggml_vk_create_buffer_check(ctx->device, sizeof(Y_TYPE) * y_ne, {vk::MemoryPropertyFlagBits::eDeviceLocal});
-    vk_buffer d_D = ggml_vk_create_buffer_check(ctx->device, sizeof(float) * d_ne, {vk::MemoryPropertyFlagBits::eDeviceLocal});
+    vk_buffer d_X = ggml_vk_create_buffer_device(ctx->device, sizeof(X_TYPE) * x_ne);
+    vk_buffer d_Y = ggml_vk_create_buffer_device(ctx->device, sizeof(Y_TYPE) * y_ne);
+    vk_buffer d_D = ggml_vk_create_buffer_device(ctx->device, sizeof(float) * d_ne);
 
     X_TYPE* x = (X_TYPE *) malloc(sizeof(X_TYPE) * x_ne);
     Y_TYPE* y = (Y_TYPE *) malloc(sizeof(Y_TYPE) * y_ne);
@@ -356,8 +356,8 @@ void ggml_vk_test_dequant(ggml_backend_vk_context * ctx, size_t ne, ggml_type qu
     const size_t qx_sz = ne * ggml_type_size(quant)/ggml_blck_size(quant);
     float * x = (float *) malloc(x_sz);
     void * qx = malloc(qx_sz);
-    vk_buffer qx_buf = ggml_vk_create_buffer_check(ctx->device, qx_sz, {vk::MemoryPropertyFlagBits::eDeviceLocal});
-    vk_buffer x_buf = ggml_vk_create_buffer_check(ctx->device, x_sz_f16, {vk::MemoryPropertyFlagBits::eDeviceLocal});
+    vk_buffer qx_buf = ggml_vk_create_buffer_device(ctx->device, qx_sz);
+    vk_buffer x_buf = ggml_vk_create_buffer_device(ctx->device, x_sz_f16);
     float * x_ref = (float *) malloc(x_sz);
     ggml_fp16_t * x_chk = (ggml_fp16_t *) malloc(x_sz_f16);
 
@@ -458,8 +458,8 @@ void ggml_vk_test_dequant(ggml_backend_vk_context * ctx, size_t ne, ggml_type qu
 //     float * x = (float *) malloc(x_sz);
 //     block_q8_1 * qx     = (block_q8_1 *)malloc(qx_sz);
 //     block_q8_1 * qx_res = (block_q8_1 *)malloc(qx_sz);
-//     vk_buffer x_buf = ggml_vk_create_buffer_check(ctx->device, x_sz, {vk::MemoryPropertyFlagBits::eDeviceLocal});
-//     vk_buffer qx_buf = ggml_vk_create_buffer_check(ctx->device, qx_sz, {vk::MemoryPropertyFlagBits::eDeviceLocal});
+//     vk_buffer x_buf = ggml_vk_create_buffer_device(ctx->device, x_sz, {vk::MemoryPropertyFlagBits::eDeviceLocal});
+//     vk_buffer qx_buf = ggml_vk_create_buffer_device(ctx->device, qx_sz, {vk::MemoryPropertyFlagBits::eDeviceLocal});
 //
 //     for (size_t i = 0; i < ne; i++) {
 //         x[i] = rand() / (float)RAND_MAX;
@@ -590,10 +590,10 @@ void ggml_vk_test_dequant_matmul(ggml_backend_vk_context * ctx, size_t m, size_t
     float * x = (float *) malloc(x_sz);
     float * y = (float *) malloc(y_sz);
     void * qx = malloc(qx_sz);
-    vk_buffer qx_buf = ggml_vk_create_buffer_check(ctx->device, qx_sz, {vk::MemoryPropertyFlagBits::eDeviceLocal});
-    vk_buffer y_buf = ggml_vk_create_buffer_check(ctx->device, y_sz, {vk::MemoryPropertyFlagBits::eDeviceLocal});
-    vk_buffer qy_buf = ggml_vk_create_buffer_check(ctx->device, qy_sz, {vk::MemoryPropertyFlagBits::eDeviceLocal});
-    vk_buffer d_buf = ggml_vk_create_buffer_check(ctx->device, d_sz, {vk::MemoryPropertyFlagBits::eDeviceLocal});
+    vk_buffer qx_buf = ggml_vk_create_buffer_device(ctx->device, qx_sz);
+    vk_buffer y_buf = ggml_vk_create_buffer_device(ctx->device, y_sz);
+    vk_buffer qy_buf = ggml_vk_create_buffer_device(ctx->device, qy_sz);
+    vk_buffer d_buf = ggml_vk_create_buffer_device(ctx->device, d_sz);
     float * d = (float *) malloc(d_sz);
     float * d_chk = (float *) malloc(d_sz);
 
@@ -619,7 +619,7 @@ void ggml_vk_test_dequant_matmul(ggml_backend_vk_context * ctx, size_t m, size_t
             if (ctx->prealloc_split_k != nullptr) {
                 ggml_vk_destroy_buffer(ctx->prealloc_split_k);
             }
-            ctx->prealloc_split_k = ggml_vk_create_buffer_check(ctx->device, sizeof(float) * d_ne * split_k, {vk::MemoryPropertyFlagBits::eDeviceLocal});
+            ctx->prealloc_split_k = ggml_vk_create_buffer_device(ctx->device, sizeof(float) * d_ne * split_k);
         }
     }
     if (mmq) {

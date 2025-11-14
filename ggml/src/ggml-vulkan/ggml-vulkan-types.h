@@ -47,6 +47,13 @@ typedef struct VkPhysicalDeviceCooperativeMatrixDecodeVectorFeaturesNV {
 #    include <spirv/unified1/spirv.hpp>
 #endif
 
+#define VMA_VULKAN_VERSION 1004000
+#if defined(ANDROID)
+#define VMA_STATIC_VULKAN_FUNCTIONS 0
+#define VMA_DYNAMIC_VULKAN_FUNCTIONS 1
+#endif
+#include "vma/VmaUsage.h"
+
 #include <algorithm>
 #include <cmath>
 #include <functional>
@@ -676,6 +683,8 @@ struct vk_device_struct {
 
     uint32_t debug_cmdbuf_idx {};
 
+    VmaAllocator allocator;
+
     vk::PhysicalDevice physical_device;
     vk::PhysicalDeviceProperties properties;
     std::string name;
@@ -1013,8 +1022,6 @@ struct vk_device_struct {
     bool disable_fusion;
     bool disable_descriptor_reuse;
     std::atomic<uint64_t> buffer_destroy_count {};
-    bool disable_host_visible_vidmem;
-    bool allow_sysmem_fallback;
     bool disable_graph_optimize;
 
     std::unique_ptr<vk_memory_logger> memory_logger;
@@ -1041,9 +1048,9 @@ inline void vk_command_pool::destroy(vk::Device& device) {
 
 struct vk_buffer_struct {
     vk::Buffer buffer = VK_NULL_HANDLE;
-    vk::DeviceMemory device_memory = VK_NULL_HANDLE;
     vk::MemoryPropertyFlags memory_property_flags;
-    void * ptr;
+    VmaAllocation allocation;
+    VmaAllocationInfo info;
     size_t size = 0;
     vk::DeviceAddress bda_addr {};
 
@@ -1057,8 +1064,7 @@ struct vk_buffer_struct {
 
         // bump before destroying, so a thread that sees the buffer gone also sees the new count
         device->buffer_destroy_count.fetch_add(1, std::memory_order_release);
-        device->device.freeMemory(device_memory);
-        device->device.destroyBuffer(buffer);
+        vmaDestroyBuffer(device->allocator, buffer, allocation);
     }
 };
 
