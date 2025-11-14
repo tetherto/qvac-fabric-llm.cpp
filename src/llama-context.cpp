@@ -2370,6 +2370,9 @@ void llama_context::opt_epoch(
 }
 
 int64_t llama_context::opt_get_iter() {
+    if (!opt_ctx) {
+        return 0;  // Return 0 if optimizer not initialized
+    }
     return ggml_opt_get_iter(opt_ctx);
 }
 
@@ -2385,6 +2388,16 @@ bool llama_context::opt_load_state(const char* filename) {
         return false;
     }
     return ggml_opt_load_state(opt_ctx, filename);
+}
+
+void llama_context::opt_cleanup() {
+    if (opt_ctx) {
+        ggml_opt_free(opt_ctx);
+        opt_ctx = nullptr;
+        should_load_optimizer_tensors = false;
+        optimizer_tensors_loaded = false;
+        pending_optimizer_checkpoint_path.clear();
+    }
 }
 
 //
@@ -3092,4 +3105,16 @@ void llama_opt_epoch(
 
 int64_t llama_opt_get_iter(struct llama_context * ctx) {
     return ctx->opt_get_iter();
+}
+
+bool llama_opt_save_state(struct llama_context * ctx, const char* filename) {
+    return ctx->opt_save_state(filename);
+}
+
+bool llama_opt_load_state(struct llama_context * ctx, const char* filename) {
+    return ctx->opt_load_state(filename);
+}
+
+void llama_opt_cleanup(struct llama_context * ctx) {
+    ctx->opt_cleanup();
 }

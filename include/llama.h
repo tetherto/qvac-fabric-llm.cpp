@@ -1438,6 +1438,14 @@ extern "C" {
             ggml_opt_epoch_callback   callback_eval,
             int64_t                   resume_from_batch);
     
+    // Optimizer state persistence
+    LLAMA_API bool llama_opt_save_state(struct llama_context * lctx, const char* filename);
+    LLAMA_API bool llama_opt_load_state(struct llama_context * lctx, const char* filename);
+    
+    // Clean up optimizer context to free memory and allow reinitialization
+    // Call this before calling llama_opt_init() again on the same context
+    LLAMA_API void llama_opt_cleanup(struct llama_context * lctx);
+    
     // LoRA training parameters
     enum llama_lora_target_module {
         LLAMA_LORA_TARGET_ATTN_Q    = 1 << 0,

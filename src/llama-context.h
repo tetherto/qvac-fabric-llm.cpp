@@ -176,6 +176,9 @@ struct llama_context {
     // Optimizer state persistence
     bool opt_save_state(const char* filename);
     bool opt_load_state(const char* filename);
+    
+    // Clean up optimizer context to free memory and allow reinitialization
+    void opt_cleanup();
 
     void opt_epoch_iter(
             ggml_opt_dataset_t               dataset,
