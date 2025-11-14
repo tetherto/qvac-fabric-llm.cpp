@@ -341,7 +341,7 @@ if (LLAMA_BUILD_COMMON)
 
 endif()
 
-if (LLAMA_MTMD)
+if (LLAMA_MTMD AND TARGET mtmd)
 
   # a static mtmd records its PRIVATE vendor deps as $<LINK_ONLY:...> usage
   # requirements, so they must be part of the export set as well

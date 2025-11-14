@@ -42,7 +42,7 @@ bool ggml_vk_flash_attn_scalar_shmem_support(const vk_device& device, const vk_f
 bool ggml_vk_flash_attn_coopmat_shmem_support(const vk_device& device, const vk_fa_tuning_params& params, uint32_t hsk, uint32_t hsv, bool f32acc, ggml_type k_type = GGML_TYPE_F16, ggml_type v_type = GGML_TYPE_F16);
 
 // buffers
-vk_buffer ggml_vk_create_buffer_check(vk_device& device, size_t size, vk::MemoryPropertyFlags req_flags, vk::MemoryPropertyFlags fallback_flags = vk::MemoryPropertyFlags(0));
+vk_buffer ggml_vk_create_buffer_check(vk_device& device, size_t size);
 vk_buffer ggml_vk_create_buffer_device(vk_device& device, size_t size);
 void ggml_vk_destroy_buffer(vk_buffer& buf);
 void * ggml_vk_host_malloc(size_t size);
