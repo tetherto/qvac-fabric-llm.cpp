@@ -1412,6 +1412,14 @@ extern "C" {
     // Call this before calling llama_opt_init() again on the same context
     LLAMA_API void llama_opt_cleanup(struct llama_context * lctx);
     
+    // Request early exit from training epoch (thread-safe)
+    // Call this from a callback or another thread to stop training after the current batch
+    LLAMA_API void llama_opt_request_stop(struct llama_context * lctx);
+    
+    // Reset the stop flag to allow training to continue
+    // Call this before resuming training after a pause
+    LLAMA_API void llama_opt_reset_stop(struct llama_context * lctx);
+    
     // LoRA training parameters
     enum llama_lora_target_module {
         LLAMA_LORA_TARGET_ATTN_Q    = 1 << 0,
