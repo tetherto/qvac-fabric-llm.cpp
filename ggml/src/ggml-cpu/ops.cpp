@@ -3517,14 +3517,12 @@ void ggml_compute_forward_silu_back(
 static void ggml_compute_forward_geglu_back_f32(
         const ggml_compute_params * params,
         const struct ggml_tensor * grad,
-        const struct ggml_tensor * x,
         const struct ggml_tensor * g,
         struct ggml_tensor * dst) {
 
     GGML_ASSERT(ggml_can_repeat(grad, dst));
-    GGML_ASSERT(ggml_are_same_shape(x, g));
+    GGML_ASSERT(ggml_are_same_shape(g, dst));
     GGML_ASSERT(grad->type == GGML_TYPE_F32);
-    GGML_ASSERT(x->type == GGML_TYPE_F32);
     GGML_ASSERT(g->type == GGML_TYPE_F32);
     GGML_ASSERT(dst->type == GGML_TYPE_F32);
 
@@ -3532,8 +3530,6 @@ static void ggml_compute_forward_geglu_back_f32(
     const int nth = params->nth;
 
     const int nc = dst->ne[0];
-
-    GGML_ASSERT(nc % 2 == 0);
 
     const size_t nb1 = dst->nb[1];
     const size_t nb2 = dst->nb[2];
@@ -3544,15 +3540,8 @@ static void ggml_compute_forward_geglu_back_f32(
             for (int i1 = ith; i1 < dst->ne[1]; i1 += nth) {
                 float * dst_ptr = (float *)((char *) dst->data + i3*nb3 + i2*nb2 + i1*nb1);
                 const float * grad_ptr = (const float *)((char *) grad->data + i3*grad->nb[3] + i2*grad->nb[2] + i1*grad->nb[1]);
-                const float * x_ptr = (const float *)((char *) x->data + i3*x->nb[3] + i2*x->nb[2] + i1*x->nb[1]);
                 const float * g_ptr = (const float *)((char *) g->data + i3*g->nb[3] + i2*g->nb[2] + i1*g->nb[1]);
-
-                const int half = nc / 2;
-                ggml_vec_gelu_f32(half, dst_ptr, g_ptr);
-                ggml_vec_mul_f32(half, dst_ptr, dst_ptr, grad_ptr);
-                float * temp = (float *)alloca(half * sizeof(float));
-                ggml_vec_gelu_backward_f32(half, temp, g_ptr, grad_ptr);
-                ggml_vec_mul_f32(half, dst_ptr + half, temp, x_ptr);
+                ggml_vec_gelu_backward_f32(nc, dst_ptr, g_ptr, grad_ptr);
             }
         }
     }
@@ -3563,13 +3552,12 @@ void ggml_compute_forward_geglu_back(
         ggml_tensor * dst) {
 
     const struct ggml_tensor * grad = dst->src[0];
-    const struct ggml_tensor * x = dst->src[1];
-    const struct ggml_tensor * g = dst->src[2];
+    const struct ggml_tensor * g = dst->src[1];
 
     switch (dst->type) {
         case GGML_TYPE_F32:
             {
-                ggml_compute_forward_geglu_back_f32(params, grad, x, g, dst);
+                ggml_compute_forward_geglu_back_f32(params, grad, g, dst);
             } break;
         default:
             {

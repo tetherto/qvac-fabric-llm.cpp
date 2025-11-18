@@ -2696,14 +2696,12 @@ struct ggml_tensor * ggml_silu_back(
 struct ggml_tensor * ggml_geglu_back(
         struct ggml_context * ctx,
         struct ggml_tensor  * grad,
-        struct ggml_tensor  * x,
         struct ggml_tensor  * g) {
-    struct ggml_tensor * result = ggml_dup_tensor(ctx, x);
+    struct ggml_tensor * result = ggml_dup_tensor(ctx, g);
 
     result->op     = GGML_OP_GEGLU_BACK;
     result->src[0] = grad;
-    result->src[1] = x;
-    result->src[2] = g;
+    result->src[1] = g;
 
     return result;
 }
@@ -6488,11 +6486,11 @@ static void ggml_compute_backward(
                 case GGML_GLU_OP_GEGLU: {
                     if (src0_needs_grads) {
                         GGML_ASSERT(src1 && "backward pass only implemented for split geglu");
-                        ggml_add_or_set(ctx, cgraph, isrc0, ggml_mul(ctx, grad, ggml_gelu(ctx, src1)));
+                        struct ggml_tensor * grad_mul_src1 = ggml_mul(ctx, grad, src1);
+                        ggml_add_or_set(ctx, cgraph, isrc0, ggml_geglu_back(ctx, grad_mul_src1, src0));
                     }
                     if (src1_needs_grads) {
-                        struct ggml_tensor * grad_mul_src0 = ggml_mul(ctx, grad, src0);
-                        ggml_add_or_set(ctx, cgraph, isrc1, ggml_geglu_back(ctx, grad_mul_src0, src1, src1));
+                        ggml_add_or_set(ctx, cgraph, isrc1, ggml_mul(ctx, grad, ggml_gelu(ctx, src0)));
                     }
                 } break;
                 default: {
