@@ -1182,6 +1182,10 @@ extern "C" {
             struct ggml_tensor  * a,
             struct ggml_tensor  * b);
 
+   GGML_API struct ggml_tensor * ggml_geglu_back(
+           struct ggml_context * ctx,
+           struct ggml_tensor  * grad,
+           struct ggml_tensor  * g);
     // hardswish(x) = x * relu6(x + 3) / 6
     GGML_API struct ggml_tensor * ggml_hardswish(
             struct ggml_context * ctx,

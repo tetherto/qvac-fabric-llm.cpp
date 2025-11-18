@@ -2771,6 +2771,19 @@ struct ggml_tensor * ggml_silu_back(
     return result;
 }
 
+// ggml_geglu_back
+struct ggml_tensor * ggml_geglu_back(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * grad,
+        struct ggml_tensor  * g) {
+    struct ggml_tensor * result = ggml_dup_tensor(ctx, g);
+
+    result->op     = GGML_OP_GEGLU_BACK;
+    result->src[0] = grad;
+    result->src[1] = g;
+
+    return result;
+}
 // ggml hardswish
 
 struct ggml_tensor * ggml_hardswish(
@@ -6730,6 +6743,16 @@ static void ggml_compute_backward(
                     }
                     if (src1_needs_grads) {
                         ggml_add_or_set(ctx, cgraph, isrc1, ggml_mul(ctx, ggml_silu(ctx, src0), grad));
+                    }
+                } break;
+                case GGML_GLU_OP_GEGLU: {
+                    if (src0_needs_grads) {
+                        GGML_ASSERT(src1 && "backward pass only implemented for split geglu");
+                        struct ggml_tensor * grad_mul_src1 = ggml_mul(ctx, grad, src1);
+                        ggml_add_or_set(ctx, cgraph, isrc0, ggml_geglu_back(ctx, grad_mul_src1, src0));
+                    }
+                    if (src1_needs_grads) {
+                        ggml_add_or_set(ctx, cgraph, isrc1, ggml_mul(ctx, grad, ggml_gelu(ctx, src0)));
                     }
                 } break;
                 default: {

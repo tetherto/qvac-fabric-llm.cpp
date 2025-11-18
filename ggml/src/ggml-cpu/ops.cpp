@@ -2866,6 +2866,57 @@ void ggml_compute_forward_silu_back(
     }
 }
 
+static void ggml_compute_forward_geglu_back_f32(
+        const ggml_compute_params * params,
+        const struct ggml_tensor * grad,
+        const struct ggml_tensor * g,
+        struct ggml_tensor * dst) {
+
+    GGML_ASSERT(ggml_can_repeat(grad, dst));
+    GGML_ASSERT(ggml_are_same_shape(g, dst));
+    GGML_ASSERT(grad->type == GGML_TYPE_F32);
+    GGML_ASSERT(g->type == GGML_TYPE_F32);
+    GGML_ASSERT(dst->type == GGML_TYPE_F32);
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    const int nc = dst->ne[0];
+
+    const size_t nb1 = dst->nb[1];
+    const size_t nb2 = dst->nb[2];
+    const size_t nb3 = dst->nb[3];
+
+    for (int i3 = 0; i3 < dst->ne[3]; i3++) {
+        for (int i2 = 0; i2 < dst->ne[2]; i2++) {
+            for (int i1 = ith; i1 < dst->ne[1]; i1 += nth) {
+                float * dst_ptr = (float *)((char *) dst->data + i3*nb3 + i2*nb2 + i1*nb1);
+                const float * grad_ptr = (const float *)((char *) grad->data + i3*grad->nb[3] + i2*grad->nb[2] + i1*grad->nb[1]);
+                const float * g_ptr = (const float *)((char *) g->data + i3*g->nb[3] + i2*g->nb[2] + i1*g->nb[1]);
+                ggml_vec_gelu_backward_f32(nc, dst_ptr, g_ptr, grad_ptr);
+            }
+        }
+    }
+}
+
+void ggml_compute_forward_geglu_back(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+
+    const struct ggml_tensor * grad = dst->src[0];
+    const struct ggml_tensor * g = dst->src[1];
+
+    switch (dst->type) {
+        case GGML_TYPE_F32:
+            {
+                ggml_compute_forward_geglu_back_f32(params, grad, g, dst);
+            } break;
+        default:
+            {
+                GGML_ABORT("fatal error");
+            }
+    }
+}
 // ggml_compute_forward_reglu
 
 static void ggml_compute_forward_reglu_f32(
