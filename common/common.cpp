@@ -2599,11 +2599,21 @@ ggml_opt_dataset_t common_opt_sft_dataset_init(
         } else {
             chat_template_source.assign(std::istreambuf_iterator<char>(tmpl_file), std::istreambuf_iterator<char>());
             tmpl_file.close();
-            try {
-                chat_templates = common_chat_templates_init(llama_get_model(ctx), chat_template_source);
-            } catch (const std::exception & e) {
-                LOG_ERR("Warning: Failed to parse chat template '%s': %s\n", chat_template_path.c_str(), e.what());
-            }
+        }
+    }
+
+    try {
+        chat_templates = common_chat_templates_init(llama_get_model(ctx), chat_template_source);
+        if (chat_template_source.empty()) {
+            LOG_INF("Using model's built-in chat template\n");
+        } else {
+            LOG_INF("Using custom chat template from: %s\n", chat_template_path.c_str());
+        }
+    } catch (const std::exception & e) {
+        if (!chat_template_path.empty()) {
+            LOG_ERR("Warning: Failed to parse chat template '%s': %s\n", chat_template_path.c_str(), e.what());
+        } else {
+            LOG_ERR("Warning: Failed to initialize chat template: %s\n", e.what());
         }
     }
 
@@ -2719,33 +2729,53 @@ ggml_opt_dataset_t common_opt_sft_dataset_init(
         std::vector<Span> assistant_spans;
 
         {
-            size_t from = 0;
-            while (true) {
-                size_t open = render.find(START_AST, from);
-                if (open == std::string::npos) break;
+            bool is_gemma = render.find("<start_of_turn>model\n") != std::string::npos;
 
-                // Include the role token ("assistant") and everything through the closing tag/newlines
-                size_t lo = open + START_TAG.size();
-                if (lo > render.size()) {
-                    lo = render.size();
+            if (is_gemma) {
+                const std::string GEMMA_START = "<start_of_turn>model\n";
+                const std::string GEMMA_END = "<end_of_turn>";
+
+                size_t from = 0;
+                while (true) {
+                    size_t open = render.find(GEMMA_START, from);
+                    if (open == std::string::npos) break;
+                    // Skip past "<start_of_turn>model\n" — supervise content only, not the role header
+                    size_t lo = open + GEMMA_START.size();
+                    size_t close = render.find(GEMMA_END, lo);
+                    if (close == std::string::npos) {
+                        assistant_spans.push_back({lo, render.size()});
+                        break;
+                    }
+
+                    size_t hi = close + GEMMA_END.size();
+                    assistant_spans.push_back({lo, std::min(hi, render.size())});
+
+                    from = hi;
                 }
+            } else {
+                size_t from = 0;
+                while (true) {
+                    size_t open = render.find(START_AST, from);
+                    if (open == std::string::npos) break;
 
-                size_t close = render.find(END_TAG, open + START_AST.size());
-                if (close == std::string::npos) {
-                    assistant_spans.push_back({lo, render.size()});
-                    break;
+                    // Skip past "<|im_start|>assistant\n" — supervise content only, not the role header
+                    size_t lo = open + START_AST.size();
+                    if (lo > render.size()) {
+                        lo = render.size();
+                    }
+
+                    size_t close = render.find(END_TAG, open + START_AST.size());
+                    if (close == std::string::npos) {
+                        assistant_spans.push_back({lo, render.size()});
+                        break;
+                    }
+
+                    size_t hi = close + END_TAG.size();
+
+                    assistant_spans.push_back({lo, std::min(hi, render.size())});
+
+                    from = hi;
                 }
-
-                size_t hi = close + END_TAG.size();
-                if (hi <= lo) {
-                    lo = open;
-                    hi = close + END_TAG.size();
-                }
-
-                assistant_spans.push_back({lo, std::min(hi, render.size())});
-
-                size_t next_from = hi;
-                from = next_from;
             }
         }
 
