@@ -2225,7 +2225,7 @@ void llama_context::opt_epoch_iter(
             if (training_should_stop.load(std::memory_order_acquire)) {
                 break;
             }
-            
+
             const auto & ubatch = mctx->get_ubatch();
 
             n_outputs = ubatch.n_tokens;
@@ -2315,7 +2315,7 @@ void llama_context::opt_epoch_iter(
             ggml_free(ctx_compute_opt);
 
             pos_batch += ubatch.n_tokens;
-            
+
             // Check for early exit request after processing ubatch
             if (training_should_stop.load(std::memory_order_acquire)) {
                 break;
@@ -2334,7 +2334,7 @@ void llama_context::opt_epoch(
         int64_t                   resume_from_batch) {
     // Reset stop flag at the start of each epoch to ensure clean state
     training_should_stop.store(false, std::memory_order_release);
-    
+
     const uint32_t n_ctx    = this->n_ctx();
     const uint32_t n_batch  = std::min(cparams.n_batch,  n_ctx);
     const uint32_t n_ubatch = std::min(cparams.n_ubatch, n_batch);
@@ -2359,7 +2359,7 @@ void llama_context::opt_epoch(
         if (training_should_stop.load(std::memory_order_acquire)) {
             break;
         }
-        
+
         constexpr bool train = true;
         const int64_t idata_in_loop = idata*ubatch_per_ctx;
 
@@ -2371,7 +2371,7 @@ void llama_context::opt_epoch(
         }
         opt_epoch_iter(dataset, result_train, tokens, labels_sparse, masks_sparse, batch,
             callback_train, train, idata_in_loop, ndata_in_loop, t_loop_start);
-        
+
         // Check again after iteration in case it was set during processing
         if (training_should_stop.load(std::memory_order_acquire)) {
             break;
@@ -2385,7 +2385,7 @@ void llama_context::opt_epoch(
         if (training_should_stop.load(std::memory_order_acquire)) {
             break;
         }
-        
+
         constexpr bool train = false;
         const int64_t idata_in_loop = (idata - idata_split)*ubatch_per_ctx;
 
@@ -2396,7 +2396,7 @@ void llama_context::opt_epoch(
         }
         opt_epoch_iter(dataset, result_eval, tokens, labels_sparse, masks_sparse, batch,
             callback_eval, train, idata_in_loop, ndata_in_loop, t_loop_start);
-        
+
         // Check again after iteration in case it was set during processing
         if (training_should_stop.load(std::memory_order_acquire)) {
             break;
@@ -2430,9 +2430,9 @@ bool llama_context::opt_load_state(const char* filename) {
 void llama_context::opt_cleanup() {
     if (opt_ctx) {
         ggml_opt_free(opt_ctx);
-        opt_ctx = nullptr;
+        opt_ctx                       = nullptr;
         should_load_optimizer_tensors = false;
-        optimizer_tensors_loaded = false;
+        optimizer_tensors_loaded      = false;
         pending_optimizer_checkpoint_path.clear();
     }
 }
@@ -3152,11 +3152,11 @@ int64_t llama_opt_get_iter(struct llama_context * ctx) {
     return ctx->opt_get_iter();
 }
 
-bool llama_opt_save_state(struct llama_context * ctx, const char* filename) {
+bool llama_opt_save_state(struct llama_context * ctx, const char * filename) {
     return ctx->opt_save_state(filename);
 }
 
-bool llama_opt_load_state(struct llama_context * ctx, const char* filename) {
+bool llama_opt_load_state(struct llama_context * ctx, const char * filename) {
     return ctx->opt_load_state(filename);
 }
 

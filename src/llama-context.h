@@ -1,12 +1,11 @@
 #pragma once
 
-#include "llama.h"
-#include "llama-cparams.h"
-#include "llama-graph.h"
-#include "llama-adapter.h"
-
 #include "ggml-cpp.h"
 #include "ggml-opt.h"
+#include "llama-adapter.h"
+#include "llama-cparams.h"
+#include "llama-graph.h"
+#include "llama.h"
 
 #include <atomic>
 #include <map>
@@ -177,13 +176,13 @@ struct llama_context {
     // Optimizer state persistence
     bool opt_save_state(const char* filename);
     bool opt_load_state(const char* filename);
-    
+
     // Clean up optimizer context to free memory and allow reinitialization
     void opt_cleanup();
-    
+
     // Request early exit from training epoch (thread-safe)
     void opt_request_stop();
-    
+
     // Reset the stop flag to allow training to continue
     void opt_reset_stop();
 
@@ -297,9 +296,9 @@ private:
     bool should_load_optimizer_tensors = false;
     bool optimizer_tensors_loaded = false;
     ggml_opt_loss_type opt_loss_type = GGML_OPT_LOSS_TYPE_CROSS_ENTROPY;
-    
+
     // early exit flag for training epochs (thread-safe)
-    std::atomic<bool> training_should_stop{false};
+    std::atomic<bool> training_should_stop{ false };
 
     ggml_threadpool_t threadpool       = nullptr;
     ggml_threadpool_t threadpool_batch = nullptr;
