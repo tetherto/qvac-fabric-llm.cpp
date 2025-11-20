@@ -295,6 +295,7 @@ struct common_params {
 
     // offload params
     std::vector<ggml_backend_dev_t> devices; // devices to use for offloading
+    std::string path_tunable_config;
 
     int32_t n_gpu_layers      = -1;  // number of layers to store in VRAM (-1 - use default)
     int32_t main_gpu          = 0;   // the GPU that is used for scratch and small tensors

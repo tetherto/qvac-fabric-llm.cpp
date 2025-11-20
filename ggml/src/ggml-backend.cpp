@@ -20,7 +20,11 @@
 #include <stdlib.h>
 #include <string.h>
 #include <algorithm>
+#include <fstream>
+#include <iostream>
 #include <vector>
+
+#include <nlohmann/json.hpp>
 
 #ifdef __APPLE__
 #include <sys/types.h>
@@ -675,6 +679,20 @@ struct ggml_backend_sched_split {
     struct ggml_cgraph graph;
 };
 
+struct ggml_backend_sched_op_tunable_constraints {
+    std::vector<std::string> types;
+    std::vector<int64_t> min_sizes;
+    std::vector<int64_t> max_sizes;
+    std::vector<std::vector<int64_t>> sizes;
+};
+
+struct ggml_backend_sched_op_tunable_config {
+    ggml_backend_sched_op_tunable_constraints constraints;
+    std::string backend;
+};
+
+using ggml_backend_sched_op_tunable_configs_t = std::map<std::string, std::vector<struct ggml_backend_sched_op_tunable_config>>;
+
 struct ggml_backend_sched {
     bool is_reset; // true if the scheduler has been reset since the last graph split
     bool is_alloc;
@@ -684,6 +702,8 @@ struct ggml_backend_sched {
     ggml_backend_t backends[GGML_SCHED_MAX_BACKENDS];
     ggml_backend_buffer_type_t bufts[GGML_SCHED_MAX_BACKENDS];
     ggml_gallocr_t galloc;
+
+    ggml_backend_sched_op_tunable_configs_t op_tunable_configs;
 
     // hash map of the nodes in the graph
     struct ggml_hash_set  hash_set;
@@ -908,6 +928,73 @@ static void ggml_backend_sched_set_if_supported(ggml_backend_sched_t sched, stru
     }
 }
 
+using json = nlohmann::ordered_json;
+
+static ggml_backend_sched_op_tunable_configs_t ggml_backend_sched_parse_tunable_config(json tunable_config_j) {
+    GGML_LOG_DEBUG("%s: parsing tunable config\n", __func__);
+    if (!tunable_config_j.contains("tunable_ops")) {
+        GGML_LOG_ERROR("%s: error parsing tunable config - no 'tunable_ops' top-level entry found\n", __func__);
+        return ggml_backend_sched_op_tunable_configs_t();
+    }
+
+    ggml_backend_sched_op_tunable_configs_t op_tunable_configs;
+
+    auto tunable_ops_j = tunable_config_j["tunable_ops"];
+    for (auto& [op_name, op_tunable_configs_j] : tunable_ops_j.items()) {
+        if (op_tunable_configs.find(op_name) != op_tunable_configs.end()) {
+            GGML_LOG_DEBUG("%s: tunable config for op %s already defined, overriding\n", __func__, op_name.c_str());
+        }
+
+        for (auto& op_tunable_config_j : op_tunable_configs_j) {
+            if (!op_tunable_config_j.contains("backend")) {
+                GGML_LOG_DEBUG("%s: no 'backend' set on tunable config for op %s, ignoring\n", __func__, op_name.c_str());
+                continue;
+            }
+            if (!op_tunable_config_j.contains("constraints")) {
+                GGML_LOG_DEBUG("%s: no 'constraints' set on tunable config for op %s, ignoring\n", __func__, op_name.c_str());
+                continue;
+            }
+
+            struct ggml_backend_sched_op_tunable_config op_tunable_config;
+
+            auto op_tunable_config_constraints_j = op_tunable_config_j["constraints"];
+            if (op_tunable_config_constraints_j.contains("types")) {
+                op_tunable_config.constraints.types = op_tunable_config_constraints_j["types"];
+            }
+            if (op_tunable_config_constraints_j.contains("sizes")) {
+                op_tunable_config.constraints.sizes = op_tunable_config_constraints_j["sizes"].get<std::vector<std::vector<int64_t>>>();
+            }
+            if (op_tunable_config_constraints_j.contains("min_sizes")) {
+                op_tunable_config.constraints.min_sizes = op_tunable_config_constraints_j["min_sizes"].get<std::vector<int64_t>>();
+            }
+            if (op_tunable_config_constraints_j.contains("max_sizes")) {
+                op_tunable_config.constraints.max_sizes = op_tunable_config_constraints_j["max_sizes"].get<std::vector<int64_t>>();
+            }
+
+            // TODO: add assert if sizes and either min_sizes/max_sizes is defined
+            GGML_ASSERT(op_tunable_config.constraints.min_sizes.size() == op_tunable_config.constraints.max_sizes.size() ||
+                        op_tunable_config.constraints.min_sizes.size() == 0 || op_tunable_config.constraints.max_sizes.size() == 0);
+
+            op_tunable_config.backend = op_tunable_config_j["backend"];
+
+            op_tunable_configs[op_name].push_back(op_tunable_config);
+        }
+    }
+    return op_tunable_configs;
+}
+
+void ggml_backend_sched_set_tunable_config_from_file(ggml_backend_sched_t sched, const char *path_tunable_config) {
+    GGML_LOG_DEBUG("%s: loading tunable config from %s\n", __func__, path_tunable_config);
+    std::ifstream file(path_tunable_config);
+    if (!file) {
+        GGML_LOG_ERROR("%s: Failed to open file '%s' for reading\n", __func__, path_tunable_config);
+        return;
+    }
+
+    json tunable_config = json::parse(file);
+    sched->op_tunable_configs = ggml_backend_sched_parse_tunable_config(tunable_config);
+}
+
 // assigns backends to ops and splits the graph into subgraphs that can be computed on the same backend
 void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
     // reset splits
@@ -1106,13 +1193,133 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
         }
     }
 
-    // pass 4: assign backends to remaining src from dst and view_src
+    // pass 4: check tunable config and assign backends where applicable
+    if (sched->op_tunable_configs.size() > 0) {
+        for (int i = 0; i < graph->n_nodes; i++) {
+            struct ggml_tensor * node = graph->nodes[i];
+            if (ggml_is_view_op(node->op)) {
+                continue;
+            }
+            int * node_backend_id = &tensor_backend_id(node);
+
+            if (sched->op_tunable_configs.find(ggml_op_name(node->op)) == sched->op_tunable_configs.end()) {
+                continue;
+            }
+
+            auto op_tunable_configs = sched->op_tunable_configs[ggml_op_name(node->op)];
+
+            for (auto& op_tunable_config : op_tunable_configs) {
+                auto types = op_tunable_config.constraints.types;
+                auto sizes = op_tunable_config.constraints.sizes;
+                auto min_sizes = op_tunable_config.constraints.min_sizes;
+                auto max_sizes = op_tunable_config.constraints.max_sizes;
+                bool match = true;
+
+                for (size_t j = 0; j < GGML_MAX_SRC; j++) {
+                    struct ggml_tensor * src = node->src[j];
+                    if (src == NULL) {
+                        continue;
+                    }
+
+                    if (types.size() > j) {
+                        if (strcmp(ggml_type_name(src->type), types[j].c_str()) != 0) {
+                            match = false;
+                            break;
+                        }
+                    } else {
+                        match = false;
+                        break;
+                    }
+
+                    if (sizes.size() > j) {
+                        std::vector<int64_t> src_sizes(std::begin(src->ne), std::end(src->ne));
+                        if (sizes[j] != src_sizes) {
+                            match = false;
+                            break;
+                        }
+                    } else if (sizes.size() > 0) {
+                        match = false;
+                        break;
+                    } else {
+                        for (size_t k = 0; k < GGML_MAX_DIMS; k++) {
+                            GGML_ASSERT(min_sizes.size() == max_sizes.size() ||
+                                        min_sizes.size() == 0 ||
+                                        max_sizes.size() == 0);
+
+                            if (min_sizes.size() > k) {
+                                if (src->ne[k] < min_sizes[k]) {
+                                    match = false;
+                                    break;
+                                }
+                            }
+
+                            if (max_sizes.size() > k) {
+                                if (src->ne[k] > max_sizes[k]) {
+                                    match = false;
+                                    break;
+                                }
+                            }
+
+                            if (min_sizes.size() <= k && max_sizes.size() <= k && src->ne[k] != 1) {
+                                match = false;
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                if (match) {
+                    GGML_LOG_DEBUG("%s: found tunable config for op %s\n", __func__, ggml_op_name(node->op));
+
+                    int match_backend_id = -1;
+                    for (int b = 0; b < sched->n_backends; b++) {
+                        ggml_backend_t backend = sched->backends[b];
+                        std::string backend_name = ggml_backend_reg_name(backend->device->reg);
+
+                        // case insensitive string comparison
+                        auto str_iequals = [](const std::string &s1, const std::string &s2) -> bool {
+                            if (s1.size() != s2.size()) {
+                                return false;
+                            }
+
+                            return std::equal(s1.begin(), s1.end(), s2.begin(),
+                                [](unsigned char a, unsigned char b) {
+                                    return std::tolower(a) == std::tolower(b);
+                                });
+                        };
+
+                        if (match && str_iequals(backend_name, op_tunable_config.backend)) {
+                            if (!ggml_backend_supports_op(backend, node)) {
+                                break;
+                            }
+
+                            match_backend_id = b;
+                            break;
+                        }
+                    }
+                    if (match_backend_id != -1) {
+                        ggml_backend_t backend = ggml_backend_sched_get_backend(sched, match_backend_id);
+                        GGML_LOG_DEBUG("%s: found matching backend %s for tunable config for op %s, using it\n",
+                            __func__, ggml_backend_name(backend), ggml_op_name(node->op));
+                        *node_backend_id = match_backend_id;
+                        SET_CAUSE(node, "4.tun");
+                        break;
+                    } else {
+                        GGML_LOG_DEBUG("%s: no matching backend found for tunable config for op %s\n",
+                            __func__, ggml_op_name(node->op));
+                    }
+                }
+            }
+        }
+    }
+
+    // pass 5: assign backends to remaining src from dst and view_src
     for (int i = 0; i < graph->n_nodes; i++) {
         struct ggml_tensor * node = graph->nodes[i];
         int * cur_backend_id = &tensor_backend_id(node);
         if (node->view_src != NULL && *cur_backend_id == -1) {
             *cur_backend_id = tensor_backend_id(node->view_src);
-            SET_CAUSE(node, "4.vsrc");
+            SET_CAUSE(node, "5.vsrc");
         }
         for (int j = 0; j < GGML_MAX_SRC; j++) {
             struct ggml_tensor * src = node->src[j];
@@ -1124,10 +1331,10 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                 if (src->view_src != NULL) {
                     // views are always on the same backend as the source
                     *src_backend_id = tensor_backend_id(src->view_src);
-                    SET_CAUSE(src, "4.vsrc");
+                    SET_CAUSE(src, "5.vsrc");
                 } else {
                     *src_backend_id = *cur_backend_id;
-                    SET_CAUSE(src, "4.cur");
+                    SET_CAUSE(src, "5.cur");
                 }
             }
         }
@@ -1138,7 +1345,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
         GGML_ASSERT(*cur_backend_id != -1);
     }
 
-    // pass 5: split graph, find tensors that need to be copied
+    // pass 6: split graph, find tensors that need to be copied
     {
         int i_split = 0;
         struct ggml_backend_sched_split * split = &sched->splits[0];
@@ -1239,7 +1446,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                                 ggml_set_output(tensor_copy); // prevent ggml-alloc from overwriting the tensor
                             }
                             tensor_id_copy(src_id, src_backend_id, c) = tensor_copy;
-                            SET_CAUSE(tensor_copy, "4.cpy");
+                            SET_CAUSE(tensor_copy, "6.cpy");
                         }
                         int n_graph_inputs = sched->n_graph_inputs++;
                         GGML_ASSERT(n_graph_inputs < GGML_SCHED_MAX_SPLIT_INPUTS);
@@ -1259,7 +1466,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                                 ggml_set_output(tensor_copy); // prevent ggml-alloc from overwriting the tensor
                             }
                             tensor_id_copy(src_id, cur_backend_id, c) = tensor_copy;
-                            SET_CAUSE(tensor_copy, "4.cpy");
+                            SET_CAUSE(tensor_copy, "6.cpy");
                         }
                         int n_inputs = split->n_inputs++;
                         GGML_ASSERT(n_inputs < GGML_SCHED_MAX_SPLIT_INPUTS);

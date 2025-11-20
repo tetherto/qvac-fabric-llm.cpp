@@ -402,6 +402,9 @@ extern "C" {
     //optional:
     LLAMA_API void llama_numa_init(enum ggml_numa_strategy numa);
 
+    // Optional: set a tunable config
+    LLAMA_API void llama_set_tunable_config_from_file(struct llama_context *ctx, const char *path_tunable_config);
+
     // Optional: an auto threadpool gets created in ggml if not passed explicitly
     LLAMA_API void llama_attach_threadpool(
             struct llama_context * ctx,

@@ -2537,6 +2537,12 @@ const llama_model * llama_get_model(const llama_context * ctx) {
     return &ctx->get_model();
 }
 
+void llama_set_tunable_config_from_file(struct llama_context *ctx, const char *path_tunable_config)
+{
+    ggml_backend_sched_t sched = ctx->get_sched();
+    ggml_backend_sched_set_tunable_config_from_file(sched, path_tunable_config);
+}
+
 enum llama_pooling_type llama_pooling_type(const llama_context * ctx) {
     return ctx->pooling_type();
 }
