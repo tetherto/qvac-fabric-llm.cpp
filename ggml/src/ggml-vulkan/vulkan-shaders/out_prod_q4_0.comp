@@ -17,41 +17,39 @@ void get_dst_indices(uint idx, out uint i20, out uint i21, out uint i22, out uin
 }
 
 void main() {
-    // num_threads * num_iter must equal 512 to match the wg_denoms and get_idx
-    const uint num_iter = 2;
-
     const uint broadcast2 = uint(p.param2);
     const uint broadcast3 = p.param3;
 
-    uint idx = get_idx();
+    uint idx_base = gl_GlobalInvocationID.z * 262144 + gl_GlobalInvocationID.y * 512;
+    uint idx = idx_base + (gl_GlobalInvocationID.x / 16) * 16 + gl_GlobalInvocationID.x;
 
-    [[unroll]] for (uint it = 0; it < num_iter; ++it) {
-        if (idx < p.ne) {
-            uint i0, i1, i2, i3;
-            get_dst_indices(idx, i0, i1, i2, i3);
+    if (idx < p.ne) {
+        uint i0, i1, i2, i3;
+        get_dst_indices(idx, i0, i1, i2, i3);
 
-            float acc = 0.0f;
+        vec2 acc = vec2(0.0f);
 
-            for (uint k = 0; k < p.ne01; k += 1) {
+        if (i0 + 16 < p.ne20) { // XXX
+            [[unroll]] for (uint k = 0; k < p.ne01; k += 1) {
+
                 const uint a_block_base = get_aoffset() + (i3 / broadcast3) * p.nb03 + (i2 / broadcast2) * p.nb02 + k * p.nb01;
                 const uint ib = a_block_base + (i0 / QUANT_K);
                 const uint iqs = i0 % (QUANT_K / QUANT_R);
-                const uint upper = (i0 % QUANT_K) / (QUANT_K / QUANT_R);
-                const uint lower = 1 - upper;
 
                 const vec2 v = dequantize(ib, iqs, 0);
                 const vec2 dm = get_dm(ib, 0);
 
-                const float a_val = (v.x * lower + v.y * upper) * dm.x + dm.y;
+                const vec2 a_vals = v * dm.x + dm.y;
 
                 const uint b_idx = src1_idx(i1, k, i2, i3);
                 const float b = data_b[get_boffset() + b_idx];
-                acc += a_val * b;
+                acc += a_vals * b;
             }
 
-            uint d_idx = dst_idx(i0, i1, i2, i3);
-            data_d[get_doffset() + d_idx] = acc;
+            uint d_idx_0 = dst_idx(i0, i1, i2, i3);
+            data_d[get_doffset() + d_idx_0] = acc.x;
+            uint d_idx_1 = dst_idx(i0 + 16, i1, i2, i3);
+            data_d[get_doffset() + d_idx_1] = acc.y;
         }
-        idx += num_threads;
     }
 }
