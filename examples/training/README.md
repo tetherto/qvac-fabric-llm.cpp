@@ -1,4 +1,9 @@
+
 # llama.cpp/examples/training
+
+## What is LoRA Fine-Tuning?
+
+LoRA (Low-Rank Adaptation) is a parameter-efficient fine-tuning technique for large models. Instead of updating all model weights, LoRA injects a pair of small, trainable low-rank matrices (A and B) into selected layers of the model. During training, only these matrices are updated, while the original model weights remain frozen. After training, the LoRA adapters can be merged with the base model for inference or kept separate for modularity.
 
 ## finetune
 This directory contains examples related to language model training using llama.cpp/GGML.
@@ -6,6 +11,9 @@ So far finetuning is technically functional (for FP32 models and limited hardwar
 Finetuning of Stories 260K and LLaMA 3.2 1b seems to work with 24 GB of memory.
 **For CPU training, compile llama.cpp without any additional backends such as CUDA.**
 **For CUDA training, use the maximum number of GPU layers.**
+
+---
+
 
 Proof of concept:
 

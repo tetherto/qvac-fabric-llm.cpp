@@ -516,6 +516,20 @@ To learn more about model quantization, [read this documentation](tools/quantize
 
     </details>
 
+#### LoRA Fine-Tuning
+
+llama.cpp includes native LoRA (Low-Rank Adaptation) fine-tuning across CPU, Vulkan, Metal and CUDA backends.
+
+LoRA fine-tuning updates only a small set of low-rank matrices while keeping the base model frozen. This makes training possible on devices with very limited memory, including phones and integrated GPUs. Key capabilities include:
+
+- Train LoRA adapters on any GPU (NVIDIA, AMD, Intel, Apple, Mali, Adreno)
+- Full support for FP32/FP16/Q8/Q4 training paths
+- Instruction-tuning via assistant-only masked loss
+- Checkpointing + resumable training
+- Merge LoRA adapters back into a standalone .gguf
+- Compatible with Qwen3, Gemma, LLaMA, TinyLlama, and other GGUF models
+
+The [Finetuning Guide](examples/training//README.md) has more details.
 
 ## Contributing
 
