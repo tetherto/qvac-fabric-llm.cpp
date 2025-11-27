@@ -112,6 +112,21 @@ All standard llama.cpp functionality, models, and APIs remain fully compatible. 
 
 qvac-fabric-llm.cpp supports all models compatible with llama.cpp. Models must be in GGUF format. Convert from other formats using the provided Python scripts or use pre-converted models from [Hugging Face](https://huggingface.co/models?library=gguf).
 
+## LoRA Fine-Tuning
+
+llama.cpp includes native [LoRA](https://arxiv.org/abs/2106.09685) (Low-Rank Adaptation) fine-tuning across CPU, Vulkan, Metal and CUDA backends.
+
+LoRA fine-tuning represents the weight updates with two smaller matrices through low-rank decomposition while keeping the base model frozen. These new matrices can be trained to adapt to the new data while keeping the overall number of changes low. This makes training possible on devices with very limited memory, including phones and integrated GPUs. Key capabilities include:
+
+- Train LoRA adapters on any GPU (NVIDIA, AMD, Intel, Apple, Mali, Adreno)
+- Full support for FP32/FP16/Q8/Q4 training paths
+- Instruction-tuning via assistant-only masked loss
+- Checkpointing + resumable training
+- Merge LoRA adapters back into a base model `model.gguf`
+- Compatible with Qwen3, Gemma, LLaMA, TinyLlama, and other GGUF models
+
+The [Finetuning Guide](examples/training//README.md) has more details.
+
 ---
 
 ## Contributing
