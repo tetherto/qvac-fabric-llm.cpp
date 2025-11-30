@@ -169,6 +169,100 @@ This file manages the complete lifecycle of LoRA adapters:
 - State tensors: `opt_state_m` and `opt_state_v` for each adapter matrix
 - Checkpoint format includes full optimizer state for seamless resumption
 
+### Adding Support for a New Model Architecture in llama.cpp
+
+Supporting a new Transformer model in llama.cpp is not automatic — it requires
+implementing missing operators, adding tokenizer + prompt formatting, and
+validating training/inference parity with a reference framework. The process is
+repeatable and model families like Gemma, Qwen, Mistral, Grok, Phi can be
+onboarded by following a consistent workflow.
+
+Below is a generalized end-to-end porting procedure, derived from our work enabling
+Gemma/Qwen inference and LoRA finetuning across CPU, Vulkan, Metal, and CUDA backends.
+
+#### Step 1 — Analyze the Architecture
+
+| Component           | Example Differences Across Models                     |
+| ------------------- | ----------------------------------------------------- |
+| Attention structure | Grouped-QKV, Multi-query, Sliding-window, Flash-attn  |
+| FFN type            | SiLU-MLP (LLaMA), GEGLU (Gemma), SWIGLU/MoE (Mixtral) |
+| Positional encoding | RoPE, XPos, ALiBi                                     |
+| Tokenizer format    | BPE, SentencePiece, Unigram                           |
+| Chat/Prompt style   | ChatML, Gemini-style blocks, Turn-format              |
+
+If the model deviates from LLaMA in any FFN or attention component — new ops will be required.
+
+#### Step 2 — Implement Missing Operators
+
+Almost all new model bring at least one of these requirements:
+
+| Op Type                  | Purpose                         | Required for           |
+| ------------------------ | ------------------------------- | ---------------------- |
+| Feed-forward activations | GEGLU, SWIGLU, MoE dispatch     | inference + training   |
+| Loss + grad kernels      | CROSS_ENTROPY_BACK, MASKED_LOSS | LoRA/SFT training      |
+| Matrix update ops        | OUT_PROD, OUT_PROD_BACK         | LoRA parameter updates |
+
+#### Step 3 — Backend Kernel Extension
+
+Each operator must exist in at least one backend to work — but training must support
+Vulkan, CUDA, CPU, optionally Metal.
+
+| Backend | Required For                                               |
+| ------- | ---------------------------------------------------------- |
+| CPU     | reference correctness + unit tests                         |
+| Vulkan  | cross-platform inference + LoRA (Adreno, Mali, AMD, Intel) |
+| CUDA    | high throughput training                                   |
+| Metal   | iOS / Apple Silicon finetuning                             |
+
+Special attention for mobile Vulkan:
+
+- operators must tile to fit GPU SSBO memory windows
+- OUT_PROD + MUL_MAT need dynamic splitting
+- quantized INT4/INT8 variants reduce VRAM footprint dramatically
+
+#### Step 4 — Add Tokenizer, Prompt Format, Chat Template
+
+Even if inference works, instruction finetuning will fail without chat formatting.
+
+You must implement:
+
+```
+tokenizer.json / spm.model: convert to tokenizer.gguf
+default chat.jinja: system/user/assistant roles
+assistant-only masking: loss applies only to assistant tokens
+```
+
+Then train:
+
+```bash
+./llama-finetune-lora -m newmodel.gguf -f data.jsonl \
+    --assistant-loss-only --chat-template template.jinja \
+    --lora-rank 16 -ngl 999
+```
+
+#### Step 5 — Validation Workflow
+
+Before claiming model support:
+
+| Test                      | Pass Criteria                                   |
+| ------------------------- | ----------------------------------------------- |
+| Generate text             | No NaNs, stable token distribution              |
+| Forward-only parity       | Output ≈ PyTorch within float tolerance         |
+| 50–200 step LoRA run      | Loss decreases consistently                     |
+| Merge-adapter → inference | identical behavior to runtime adapter injection |
+| Finetune resumption       | checkpoint restore reproducible                 |
+
+If inference works but training diverges, most of the time it's a missing backward op.
+
+#### Example — Adding Support for Gemma (Inference + LoRA)
+
+Gemma is a non-LLaMA architecture requiring GEGLU feed-forward layers, which means
+new forward + backward operators must be implemented before LoRA finetuning becomes
+functional. The reference implementation for this exists in the [Gemma integration
+PR](https://github.com/tetherto/qvac-ext-lib-llama.cpp/pull/63).
+
+This PR demonstrates a complete integration path: inference, instruction fine-tuning,
+adapter merging, making it an ideal template when porting additional architectures.
 
 ### Troubleshooting
 
