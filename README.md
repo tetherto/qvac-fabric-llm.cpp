@@ -1,6 +1,6 @@
-# llama.cpp
+# fabric-llm-finetune
 
-![llama](https://user-images.githubusercontent.com/1991296/230134379-7181e485-c521-4d23-a0d6-f7b3b61ba524.png)
+![qvac fabric llm](https://raw.githubusercontent.com/tetherto/qvac-fabric-llm.cpp/db93fc7425e72b1bb375c5b9dd33f5fcc072dac6/media/qvac-fabric-llm.png)
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 [![Release](https://img.shields.io/github/v/release/ggml-org/llama.cpp)](https://github.com/ggml-org/llama.cpp/releases)
