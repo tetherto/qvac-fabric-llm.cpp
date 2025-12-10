@@ -50,6 +50,11 @@ void iter(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const uint first_row, const
             // the correct half (k<128 or k>=128) and 32-wide quarter. Pass k_base+b_qs_idx.
             const uint k_base = (cur_ibi + col) % QUANT_K;
             const i32vec2 data_a_qs = repack(a_block_idx, k_base + b_qs_idx);
+#elif defined(DATA_A_TQ1_0)
+            // For TQ1_0 (QUANT_K=256), repack decodes ternary values by element index.
+            // Pass the within-block K base + lane offset to gather 4 consecutive elements.
+            const uint k_base = (cur_ibi + col) % QUANT_K;
+            const i32vec2 data_a_qs = repack(a_block_idx, k_base + b_qs_idx);
 #else
             const i32vec2 data_a_qs = repack(a_block_idx, b_qs_idx);
 #endif
