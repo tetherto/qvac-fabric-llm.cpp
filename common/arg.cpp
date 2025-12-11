@@ -1671,6 +1671,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_MAIN}));
     add_opt(common_arg(
+        {"--dump-ops-file"}, "",
+        string_format("set a file to dump all ops (default: none)"),
+        [](common_params & params, const std::string & value) {
+            params.path_dump_ops_file = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_MAIN}));
+    add_opt(common_arg(
         {"--tunable-config"}, "",
         string_format("set tunable config file (default: none)"),
         [](common_params & params, const std::string & value) {

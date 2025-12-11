@@ -241,6 +241,10 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
+    if (!params.path_dump_ops_file.empty()) {
+        llama_set_dump_ops_file(ctx, params.path_dump_ops_file.c_str());
+    }
+
     if (!params.path_tunable_config.empty()) {
         llama_set_tunable_config_from_file(ctx, params.path_tunable_config.c_str());
     }

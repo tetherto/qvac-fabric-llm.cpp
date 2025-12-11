@@ -292,6 +292,9 @@ extern "C" {
     GGML_API ggml_backend_sched_t ggml_backend_sched_new(ggml_backend_t * backends, ggml_backend_buffer_type_t * bufts, int n_backends, size_t graph_size, bool parallel, bool op_offload);
     GGML_API void                 ggml_backend_sched_free(ggml_backend_sched_t sched);
 
+    // Set a file to dump all ops
+    GGML_API void                 ggml_backend_sched_set_dump_ops_file(ggml_backend_sched_t sched, const char *path_dump_ops_file);
+
     // Set a tunable config file
     GGML_API void                 ggml_backend_sched_set_tunable_config_from_file(ggml_backend_sched_t sched, const char *path_tunable_config);
 

@@ -703,6 +703,7 @@ struct ggml_backend_sched {
     ggml_backend_buffer_type_t bufts[GGML_SCHED_MAX_BACKENDS];
     ggml_gallocr_t galloc;
 
+    std::string path_dump_ops_file;
     ggml_backend_sched_op_tunable_configs_t op_tunable_configs;
 
     // hash map of the nodes in the graph
@@ -983,6 +984,10 @@ static ggml_backend_sched_op_tunable_configs_t ggml_backend_sched_parse_tunable_
     return op_tunable_configs;
 }
 
+void ggml_backend_sched_set_dump_ops_file(ggml_backend_sched_t sched, const char *path_dump_ops_file) {
+    sched->path_dump_ops_file = path_dump_ops_file;
+}
+
 void ggml_backend_sched_set_tunable_config_from_file(ggml_backend_sched_t sched, const char *path_tunable_config) {
     GGML_LOG_DEBUG("%s: loading tunable config from %s\n", __func__, path_tunable_config);
     std::ifstream file(path_tunable_config);
@@ -1013,6 +1018,53 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
     sched->ctx = ggml_init(params);
     if (sched->ctx == NULL) {
         GGML_ABORT("%s: failed to initialize context\n", __func__);
+    }
+
+    if (!sched->path_dump_ops_file.empty()) {
+        std::ifstream cur_dump_ops_file(sched->path_dump_ops_file);
+
+        json cur_ops_config_j;
+        try
+        {
+            cur_ops_config_j = json::parse(cur_dump_ops_file);
+        }
+        catch (const json::parse_error& e)
+        {
+            // TODO: only ignore if error is due to empty file
+            ; // std::cout << "error parsing dump ops file: " << e.what() << std::endl;
+        }
+
+        json ops_config_j;
+        std::vector<json> ops_config;
+        for (int i = 0; i < graph->n_nodes; i++) {
+            struct ggml_tensor * node = graph->nodes[i];
+            if (ggml_is_view_op(node->op)) {
+                continue;
+            }
+
+            json op_config_j;
+            std::vector<std::string> types;
+            std::vector<std::vector<int64_t>> sizes;
+            for (int j = 0; j < GGML_MAX_SRC; j++) {
+                struct ggml_tensor * src = node->src[j];
+                if (src == NULL) {
+                    continue;
+                }
+                types.push_back(ggml_type_name(src->type));
+                sizes.push_back(std::vector<int64_t>(src->ne, src->ne + GGML_MAX_DIMS));
+            }
+            op_config_j["name"] = ggml_op_name(node->op);
+            op_config_j["types"] = types;
+            op_config_j["sizes"] = sizes;
+            ops_config.push_back(op_config_j);
+        }
+        ops_config_j["ops"] = ops_config;
+        // merge configs
+        cur_ops_config_j.update(ops_config_j, true);
+
+        std::ofstream out_dump_ops_file(sched->path_dump_ops_file);
+        // save updated config
+        out_dump_ops_file << cur_ops_config_j.dump(2);
     }
 
     // pass 1: assign backends to ops with pre-allocated inputs
