@@ -99,7 +99,12 @@ if (Vulkan_FOUND)
     )
 
     target_link_libraries(ggml-vulkan PRIVATE Vulkan::Vulkan)
-    target_include_directories(ggml-vulkan PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
+    target_include_directories(ggml-vulkan
+        PRIVATE
+            ${CMAKE_CURRENT_BINARY_DIR}
+            ../../../vendor
+
+    )
     target_include_directories(ggml-vulkan PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/vulkan_cpp_wrapper/include")
 
     if (FORCE_GGML_VK_PERF_LOGGER)
