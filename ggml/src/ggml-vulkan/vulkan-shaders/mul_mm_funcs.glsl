@@ -26,6 +26,7 @@ void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uin
                 buf_a[buf_idx] = FLOAT_TYPE_VEC2(0.0f);
             }
 #endif
+// TEST: this patch does nothing, I'm just checking the CI status
 #elif defined(DATA_A_BF16)
 #if LOAD_VEC_A == 4
             const uint idx = pos_a + col * p.stride_a / LOAD_VEC_A + row;
