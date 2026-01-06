@@ -23,6 +23,9 @@
 #define N_R0_Q8_0 2
 #define N_SG_Q8_0 4
 
+#define N_R0_Q8_1 2
+#define N_SG_Q8_1 4
+
 #define N_R0_MXFP4 2
 #define N_SG_MXFP4 2
 
@@ -40,6 +43,9 @@
 
 #define N_R0_Q6_K 2
 #define N_SG_Q6_K 2
+
+#define N_R0_TQ2_0 4
+#define N_SG_TQ2_0 2
 
 #define N_R0_IQ1_S 4
 #define N_SG_IQ1_S 2

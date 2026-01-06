@@ -250,6 +250,7 @@ static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
     },
     [GGML_TYPE_Q8_1] = {
         .from_float               = quantize_row_q8_1,
+        .vec_dot                  = ggml_vec_dot_q8_1_q8_1,
         .vec_dot_type             = GGML_TYPE_Q8_1,
         .nrows                    = 1,
     },
@@ -380,6 +381,38 @@ static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
 
 const struct ggml_type_traits_cpu * ggml_get_type_traits_cpu(enum ggml_type type) {
     return &type_traits_cpu[type];
+}
+
+static void ggml_cpu_select_vec_dot(
+        const struct ggml_tensor * src0,
+        const struct ggml_tensor * src1,
+        ggml_vec_dot_t * vec_dot,
+        enum ggml_type * vec_dot_type) {
+
+    if (vec_dot != NULL) {
+        *vec_dot = type_traits_cpu[src0->type].vec_dot;
+    }
+    if (vec_dot_type != NULL) {
+        *vec_dot_type = type_traits_cpu[src0->type].vec_dot_type;
+    }
+
+    if (src0->type == GGML_TYPE_TQ2_0 && src1 != NULL) {
+        if (src1->type == GGML_TYPE_Q8_1) {
+            if (vec_dot != NULL) {
+                *vec_dot = ggml_vec_dot_tq2_0_q8_1;
+            }
+            if (vec_dot_type != NULL) {
+                *vec_dot_type = GGML_TYPE_Q8_1;
+            }
+        } else if (src1->type == GGML_TYPE_Q8_0) {
+            if (vec_dot != NULL) {
+                *vec_dot = ggml_vec_dot_tq2_0_q8_0;
+            }
+            if (vec_dot_type != NULL) {
+                *vec_dot_type = GGML_TYPE_Q8_0;
+            }
+        }
+    }
 }
 
 //
@@ -1112,7 +1145,8 @@ void ggml_set_f32_nd(const struct ggml_tensor * tensor, int i0, int i1, int i2, 
 static void ggml_compute_forward_mul_mat_one_chunk(
     const struct ggml_compute_params * params,
     struct ggml_tensor * dst,
-    const enum ggml_type type,
+    ggml_vec_dot_t vec_dot,
+    enum ggml_type vec_dot_type,
     const int64_t num_rows_per_vec_dot,
     const int64_t ir0_start,
     const int64_t ir0_end,
@@ -1125,10 +1159,6 @@ static void ggml_compute_forward_mul_mat_one_chunk(
     GGML_TENSOR_BINARY_OP_LOCALS
 
     const bool src1_cont = ggml_is_contiguous(src1);
-
-    ggml_vec_dot_t const vec_dot      = type_traits_cpu[type].vec_dot;
-    enum ggml_type const vec_dot_type = type_traits_cpu[type].vec_dot_type;
-
     // broadcast factors
     const int64_t r2 = ne12 / ne02;
     const int64_t r3 = ne13 / ne03;
@@ -1211,9 +1241,11 @@ void ggml_compute_forward_mul_mat(
     const int ith = params->ith;
     const int nth = params->nth;
 
-    enum ggml_type           const vec_dot_type         = type_traits_cpu[src0->type].vec_dot_type;
-    ggml_from_float_t        const from_float           = type_traits_cpu[vec_dot_type].from_float;
-    int64_t                  const vec_dot_num_rows     = type_traits_cpu[src0->type].nrows;
+    ggml_vec_dot_t vec_dot;
+    enum ggml_type vec_dot_type;
+    ggml_cpu_select_vec_dot(src0, src1, &vec_dot, &vec_dot_type);
+    ggml_from_float_t const from_float = type_traits_cpu[vec_dot_type].from_float;
+    int64_t const vec_dot_num_rows = type_traits_cpu[src0->type].nrows;
 
     GGML_ASSERT(ne0 == ne01);
     GGML_ASSERT(ne1 == ne11);
@@ -1383,7 +1415,7 @@ UseGgmlGemm2:;
         if ((nr0 % 2 != 0) || (ne11 % 2 != 0) || ((ir0_end - ir0_start) % 2 != 0) || ((ir1_end - ir1_start) % 2 != 0)) {
             num_rows_per_vec_dot = 1;
         }
-        ggml_compute_forward_mul_mat_one_chunk(params, dst, src0->type, num_rows_per_vec_dot, ir0_start, ir0_end, ir1_start, ir1_end);
+        ggml_compute_forward_mul_mat_one_chunk(params, dst, vec_dot, vec_dot_type, num_rows_per_vec_dot, ir0_start, ir0_end, ir1_start, ir1_end);
 
         if (nth >= nchunk0 * nchunk1) {
             break;
@@ -1406,6 +1438,8 @@ static void ggml_compute_forward_mul_mat_id_one_chunk(
     struct ggml_tensor * dst,
     const struct ggml_tensor * src0,
     const struct ggml_tensor * src1,
+    ggml_vec_dot_t vec_dot,
+    enum ggml_type vec_dot_type,
     const struct ggml_tensor * ids,
     const int64_t cur_a,
     const int64_t ir0_start,
@@ -1419,11 +1453,6 @@ static void ggml_compute_forward_mul_mat_id_one_chunk(
     const void * wdata) {
 
     GGML_TENSOR_BINARY_OP_LOCALS
-
-    const enum ggml_type type = src0->type;
-
-    ggml_vec_dot_t    const vec_dot      = type_traits_cpu[type].vec_dot;
-    enum ggml_type    const vec_dot_type = type_traits_cpu[type].vec_dot_type;
 
     const int64_t blck_0 = 16;
     const int64_t blck_1 = 16;
@@ -1490,7 +1519,9 @@ static void ggml_compute_forward_mul_mat_id(
 
     const bool src1_cont = ggml_is_contiguous(src1);
 
-    enum ggml_type    const vec_dot_type    = type_traits_cpu[type].vec_dot_type;
+    ggml_vec_dot_t vec_dot;
+    enum ggml_type vec_dot_type;
+    ggml_cpu_select_vec_dot(src0, src1, &vec_dot, &vec_dot_type);
     ggml_from_float_t const from_float      = type_traits_cpu[vec_dot_type].from_float;
 
     // we don't support permuted src0 or src1
@@ -1634,7 +1665,7 @@ static void ggml_compute_forward_mul_mat_id(
             const int64_t ir1_end = MIN(ir1_start + dr1, nr1);
 
             ggml_compute_forward_mul_mat_id_one_chunk(
-                dst, src0, src1, ids, cur_a,
+                dst, src0, src1, vec_dot, vec_dot_type, ids, cur_a,
                 ir0_start, ir0_end, ir1_start, ir1_end,
                 src0_cur, matrix_rows, row_size, src1_cont, wdata
             );
@@ -2755,7 +2786,10 @@ struct ggml_cplan ggml_graph_plan(
                     } break;
                 case GGML_OP_MUL_MAT:
                     {
-                        const enum ggml_type vec_dot_type = type_traits_cpu[node->src[0]->type].vec_dot_type;
+                        ggml_vec_dot_t vec_dot_tmp;
+                        enum ggml_type vec_dot_type;
+                        ggml_cpu_select_vec_dot(node->src[0], node->src[1], &vec_dot_tmp, &vec_dot_type);
+                        GGML_UNUSED(vec_dot_tmp);
 
                         if (node->src[1]->type != vec_dot_type) {
                             cur = ggml_row_size(vec_dot_type, ggml_nelements(node->src[1]));
@@ -2767,7 +2801,10 @@ struct ggml_cplan ggml_graph_plan(
                         const struct ggml_tensor * src0 = node->src[0];
                         const struct ggml_tensor * src1 = node->src[1];
                         const struct ggml_tensor * ids = node->src[2];
-                        const enum ggml_type vec_dot_type = type_traits_cpu[src0->type].vec_dot_type;
+                        ggml_vec_dot_t vec_dot_tmp;
+                        enum ggml_type vec_dot_type;
+                        ggml_cpu_select_vec_dot(src0, src1, &vec_dot_tmp, &vec_dot_type);
+                        GGML_UNUSED(vec_dot_tmp);
                         const int n_as = src0->ne[2];
                         // src1
                         if (src1->type != vec_dot_type) {
