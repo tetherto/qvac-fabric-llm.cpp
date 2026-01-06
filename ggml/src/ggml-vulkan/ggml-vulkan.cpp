@@ -6348,7 +6348,7 @@ static void ggml_vk_buffer_read(vk_buffer& src, size_t offset, void * dst, size_
     // If the device is not an UMA device the memory is host-accessible through rebar. While writing
     // through PCIe is sufficient fast reading back data from PCIe is slower than going through
     // the HW device to host copy path.
-    if(src->memory_property_flags & vk::MemoryPropertyFlagBits::eHostVisible && src->device->uma) {
+    if(src->memory_property_flags & vk::MemoryPropertyFlagBits::eHostVisible) {
         GGML_ASSERT(src->memory_property_flags & vk::MemoryPropertyFlagBits::eHostCoherent);
 
         memcpy(dst, (uint8_t *) src->info.pMappedData + offset, size);
@@ -6411,8 +6411,7 @@ static void ggml_vk_buffer_copy(vk_buffer& dst, size_t dst_offset, vk_buffer& sr
 static void ggml_vk_buffer_memset_async(vk_context& ctx, vk_buffer& dst, size_t offset, uint32_t c, size_t size) {
     VK_LOG_DEBUG("ggml_vk_buffer_memset_async(" << offset << ", " << c << ", " << size << ")");
 
-    if (dst->memory_property_flags & vk::MemoryPropertyFlagBits::eHostVisible &&
-        dst->device->uma) {
+    if (dst->memory_property_flags & vk::MemoryPropertyFlagBits::eHostVisible) {
         deferred_memset((uint8_t*)dst->info.pMappedData + offset, c, size, &ctx->memsets);
         return;
     }
