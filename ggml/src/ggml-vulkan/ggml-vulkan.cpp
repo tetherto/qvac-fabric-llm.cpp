@@ -12692,17 +12692,22 @@ static void ggml_backend_vk_host_buffer_free_buffer(ggml_backend_buffer_t buffer
 static ggml_backend_buffer_t ggml_backend_vk_host_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
     VK_LOG_MEMORY("ggml_backend_vk_host_buffer_type_alloc_buffer(" << size << ")");
 
-    size += 32;  // Behave like the CPU buffer type
+    size_t alloc_size = size + 32 + TENSOR_ALIGNMENT - 1;
     void * ptr = nullptr;
     try {
-        ptr = ggml_vk_host_malloc(vk_instance.devices[0], size);
+        ptr = ggml_vk_host_malloc(vk_instance.devices[0], alloc_size);
     } catch (vk::SystemError& e) {
         GGML_LOG_WARN("ggml_vulkan: Failed to allocate pinned memory (%s)\n", e.what());
-        // fallback to cpu buffer
         return ggml_backend_buft_alloc_buffer(ggml_backend_cpu_buffer_type(), size);
     }
 
-    ggml_backend_buffer_t buffer = ggml_backend_cpu_buffer_from_ptr(ptr, size);
+    uintptr_t ptr_uint = (uintptr_t)ptr;
+    uintptr_t aligned_ptr_uint = GGML_PAD(ptr_uint, TENSOR_ALIGNMENT);
+    size_t alignment_offset = aligned_ptr_uint - ptr_uint;
+    void * aligned_ptr = (void *)aligned_ptr_uint;
+    size_t aligned_size = alloc_size - alignment_offset;
+
+    ggml_backend_buffer_t buffer = ggml_backend_cpu_buffer_from_ptr(aligned_ptr, aligned_size);
     buffer->buft = buft;
     buffer->iface.free_buffer = ggml_backend_vk_host_buffer_free_buffer;
 
