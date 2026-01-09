@@ -12692,7 +12692,8 @@ static void ggml_backend_vk_host_buffer_free_buffer(ggml_backend_buffer_t buffer
 static ggml_backend_buffer_t ggml_backend_vk_host_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
     VK_LOG_MEMORY("ggml_backend_vk_host_buffer_type_alloc_buffer(" << size << ")");
 
-    size_t alloc_size = size + 32 + TENSOR_ALIGNMENT - 1;
+    size += 32;
+    size_t alloc_size = size + TENSOR_ALIGNMENT - 1;
     void * ptr = nullptr;
     try {
         ptr = ggml_vk_host_malloc(vk_instance.devices[0], alloc_size);
