@@ -2556,7 +2556,44 @@ static vk_buffer ggml_vk_create_buffer_check(vk_device& device, size_t size) {
         std::cerr << "ggml_vulkan: Memory allocation of size " << size << " failed." << std::endl;
         std::cerr << "ggml_vulkan: " << e.what() << std::endl;
         throw e;
-    }}
+    }
+}
+
+static vk_buffer ggml_vk_create_buffer_aligned(vk_device& device, const vk::BufferCreateInfo& buffer_info, const VmaAllocationCreateInfo& alloc_info, VkDeviceSize alignment) {
+    VK_LOG_DEBUG("ggml_vk_create_buffer_aligned(" << device->name << ", " << buffer_info.size << ", " << alignment << " )");
+    if (buffer_info.size > device->max_buffer_size) {
+        throw vk::OutOfDeviceMemoryError("Requested buffer size exceeds device buffer size limit");
+    }
+
+    vk_buffer buf = std::make_shared<vk_buffer_struct>();
+
+    if (buffer_info.size == 0) {
+        buf->size = 0;
+        return buf;
+    }
+
+    VkResult res = vmaCreateBufferWithAlignment(device->allocator, reinterpret_cast<const VkBufferCreateInfo *>(&buffer_info), &alloc_info, alignment, reinterpret_cast<VkBuffer *>(&buf->buffer), &buf->allocation, &buf->info);
+    if (res != VK_SUCCESS) {
+        throw vk::SystemError(static_cast<vk::Result>(res), "vmaCreateBufferWithAlignment failed");
+    }
+
+    vmaGetAllocationMemoryProperties(device->allocator, buf->allocation, reinterpret_cast<VkMemoryPropertyFlags *>(&buf->memory_property_flags));
+
+    buf->device = device;
+    buf->size = buffer_info.size;
+
+    if (device->buffer_device_address && (buffer_info.usage & vk::BufferUsageFlagBits::eShaderDeviceAddress)) {
+        const vk::BufferDeviceAddressInfo addressInfo(buf->buffer);
+        buf->bda_addr = device->device.getBufferAddress(addressInfo);
+    }
+
+#ifdef GGML_VULKAN_MEMORY_DEBUG
+    device->memory_logger->log_allocation(buf, buf->size);
+#endif
+    VK_LOG_DEBUG("ggml_vk_create_buffer_aligned(buffer " << buf->buffer << ", usage " << to_string(buffer_info.usage) << ", memory property " << to_string(buf->memory_property_flags) << ")");
+
+    return buf;
+}
 
 static vk_buffer ggml_vk_create_buffer_device(vk_device& device, size_t size) {
     VK_LOG_MEMORY("ggml_vk_create_buffer_device(" << size << ")");
@@ -5897,7 +5934,7 @@ static void * ggml_vk_host_malloc(vk_device& device, size_t size) {
     alloc_info.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT |
         VMA_ALLOCATION_CREATE_MAPPED_BIT;
 
-    vk_buffer buf = ggml_vk_create_buffer(device, buffer_info, alloc_info);
+    vk_buffer buf = ggml_vk_create_buffer_aligned(device, buffer_info, alloc_info, TENSOR_ALIGNMENT);
     if(!(buf->memory_property_flags & vk::MemoryPropertyFlagBits::eHostVisible)) {
         fprintf(stderr, "WARNING: failed to allocate %.2f MB of pinned memory\n",
             size/1024.0/1024.0);
@@ -12692,7 +12729,6 @@ static void ggml_backend_vk_host_buffer_free_buffer(ggml_backend_buffer_t buffer
 static ggml_backend_buffer_t ggml_backend_vk_host_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
     VK_LOG_MEMORY("ggml_backend_vk_host_buffer_type_alloc_buffer(" << size << ")");
 
-    size += 32;  // Behave like the CPU buffer type
     void * ptr = nullptr;
     try {
         ptr = ggml_vk_host_malloc(vk_instance.devices[0], size);
