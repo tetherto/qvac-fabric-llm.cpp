@@ -2563,10 +2563,15 @@ static vk_buffer ggml_vk_create_buffer_device(vk_device& device, size_t size) {
 
     vk_buffer buf;
 
+    vk::BufferUsageFlags usage = vk::BufferUsageFlagBits::eStorageBuffer | vk::BufferUsageFlagBits::eTransferSrc | vk::BufferUsageFlagBits::eTransferDst;
+    if (device->buffer_device_address) {
+        usage |= vk::BufferUsageFlagBits::eShaderDeviceAddress;
+    }
+
     const vk::BufferCreateInfo buffer_create_info{
         vk::BufferCreateFlags(),
         size,
-        vk::BufferUsageFlagBits::eStorageBuffer | vk::BufferUsageFlagBits::eTransferSrc | vk::BufferUsageFlagBits::eTransferDst,
+        usage,
         vk::SharingMode::eExclusive,
         0,
         nullptr,
