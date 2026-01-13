@@ -12863,9 +12863,30 @@ static void ggml_backend_vk_get_tensor_async(ggml_backend_t backend, const ggml_
         buffer_cpy.dstOffset = 0;
         buffer_cpy.size = size;
 
+        // print pMappedData first 8 float values for debugging
+        GGML_LOG_DEBUG("staging buffer data: ");
+        for (int i = 0; i < 8; ++i) {
+            GGML_LOG_DEBUG("%f ", ((float*)ctx->sync_staging->info.pMappedData)[i]);
+        }
+        GGML_LOG_DEBUG("\n");
+        
+        // print data first 8 float values for debugging
+        GGML_LOG_DEBUG("destination data before copy: ");
+        for (int i = 0; i < 8; ++i) {
+            GGML_LOG_DEBUG("%f ", ((float*)data)[i]);
+        }
+        GGML_LOG_DEBUG("\n");
+
         transfer_ctx->s->buffer.copyBuffer(buf->buffer, ctx->sync_staging->buffer, { buffer_cpy });
         deferred_memcpy(data, ctx->sync_staging->info.pMappedData, size, &transfer_ctx->out_memcpys);
         ggml_vk_synchronize(ctx);
+
+        // print data first 8 float values for debugging
+        GGML_LOG_DEBUG("destination data after copy: ");
+        for (int i = 0; i < 8; ++i) {
+            GGML_LOG_DEBUG("%f ", ((float*)data)[i]);
+        }
+        GGML_LOG_DEBUG("\n");
     }
 }
 

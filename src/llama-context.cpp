@@ -1175,6 +1175,11 @@ int llama_context::decode(const llama_batch & batch_inp) {
             ggml_backend_t backend_embd = ggml_backend_sched_get_tensor_backend(sched.get(), t_embd);
             GGML_ASSERT(backend_embd != nullptr);
 
+            LLAMA_LOG_DEBUG("POOLING TYPE: %d\n", cparams.pooling_type);
+            LLAMA_LOG_DEBUG("N_EMBD: %d\n", n_embd);
+            LLAMA_LOG_DEBUG("N_OUTPUTS: %d\n", n_outputs);
+            LLAMA_LOG_DEBUG("N_OUTPUTS_PREV: %d\n", n_outputs_prev);
+            LLAMA_LOG_DEBUG("N_OUTPUTS_ALL: %d\n", n_outputs_all);
             switch (cparams.pooling_type) {
                 case LLAMA_POOLING_TYPE_NONE:
                     {
