@@ -95,6 +95,22 @@ jobs:
           cd build
           ctest -L 'main|curl' --verbose --timeout 900
 
+      - name: Determine tag name
+        id: tag
+        uses: ./.github/actions/get-tag-name
+
+      - name: Pack artifacts
+        id: pack_artifacts
+        run: |
+          cp LICENSE ./build/bin/
+          zip -r llama-${{ steps.tag.outputs.name }}-bin-macos-latest-cmake-arm64.zip ./build/bin/*
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          path: llama-${{ steps.tag.outputs.name }}-bin-macos-latest-cmake-arm64.zip
+          name: llama-bin-macos-latest-cmake-arm64.zip
+
   macOS-latest-cmake-x64:
     runs-on: macos-13
 
@@ -135,6 +151,22 @@ jobs:
         run: |
           cd build
           ctest -L main --verbose --timeout 900
+
+      - name: Determine tag name
+        id: tag
+        uses: ./.github/actions/get-tag-name
+
+      - name: Pack artifacts
+        id: pack_artifacts
+        run: |
+          cp LICENSE ./build/bin/
+          zip -r llama-${{ steps.tag.outputs.name }}-bin-macos-latest-cmake-x64.zip ./build/bin/*
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          path: llama-${{ steps.tag.outputs.name }}-bin-macos-latest-cmake-x64.zip
+          name: llama-bin-macos-latest-cmake-x64.zip
 
   macOS-latest-cmake-arm64-webgpu:
     runs-on: macos-14
@@ -182,6 +214,22 @@ jobs:
         run: |
           cd build
           ctest -L main --verbose --timeout 900
+
+      - name: Determine tag name
+        id: tag
+        uses: ./.github/actions/get-tag-name
+
+      - name: Pack artifacts
+        id: pack_artifacts
+        run: |
+          cp LICENSE ./build/bin/
+          zip -r llama-${{ steps.tag.outputs.name }}-bin-macos-latest-cmake-arm64-webgpu.zip ./build/bin/*
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          path: llama-${{ steps.tag.outputs.name }}-bin-macos-latest-cmake-arm64-webgpu.zip
+          name: llama-bin-macos-latest-cmake-arm64-webgpu.zip
 
   ubuntu-cpu-cmake:
     strategy:
@@ -235,6 +283,22 @@ jobs:
           wget https://huggingface.co/karpathy/tinyllamas/resolve/main/stories260K/stories260K.bin
           ./bin/llama-convert-llama2c-to-ggml --copy-vocab-from-model ./tok512.bin --llama2c-model stories260K.bin --llama2c-output-model stories260K.gguf
           ./bin/llama-cli -m stories260K.gguf -p "One day, Lily met a Shoggoth" -n 500 -c 256
+
+      - name: Determine tag name
+        id: tag
+        uses: ./.github/actions/get-tag-name
+
+      - name: Pack artifacts
+        id: pack_artifacts
+        run: |
+          cp LICENSE ./build/bin/
+          zip -r llama-${{ steps.tag.outputs.name }}-bin-ubuntu-cpu-cmake-${{ matrix.build }}.zip ./build/bin/*
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          path: llama-${{ steps.tag.outputs.name }}-bin-ubuntu-cpu-cmake-${{ matrix.build }}.zip
+          name: llama-bin-ubuntu-cpu-cmake-${{ matrix.build }}.zip
 
   ubuntu-latest-cmake-sanitizer:
     runs-on: ubuntu-latest
@@ -320,6 +384,22 @@ jobs:
           cd build
           ctest -L main --verbose --timeout 900
 
+      - name: Determine tag name
+        id: tag
+        uses: ./.github/actions/get-tag-name
+
+      - name: Pack artifacts
+        id: pack_artifacts
+        run: |
+          cp LICENSE ./build/bin/
+          zip -r llama-${{ steps.tag.outputs.name }}-bin-ubuntu-latest-cmake-sanitizer.zip ./build/bin/*
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          path: llama-${{ steps.tag.outputs.name }}-bin-ubuntu-latest-llguidance.zip
+          name: llama-bin-ubuntu-latest-llguidance.zip
+
   ubuntu-latest-cmake-rpc:
     runs-on: ubuntu-latest
 
@@ -354,6 +434,22 @@ jobs:
         run: |
           cd build
           ctest -L main --verbose
+
+      - name: Determine tag name
+        id: tag
+        uses: ./.github/actions/get-tag-name
+
+      - name: Pack artifacts
+        id: pack_artifacts
+        run: |
+          cp LICENSE ./build/bin/
+          zip -r llama-${{ steps.tag.outputs.name }}-bin-ubuntu-latest-cmake-rpc.zip ./build/bin/*
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          path: llama-${{ steps.tag.outputs.name }}-bin-ubuntu-latest-cmake-rpc.zip
+          name: llama-bin-ubuntu-latest-cmake-rpc.zip
 
   ubuntu-22-cmake-vulkan:
     runs-on: ubuntu-22.04
@@ -391,6 +487,22 @@ jobs:
           export GGML_VK_VISIBLE_DEVICES=0
           # This is using llvmpipe and runs slower than other backends
           ctest -L main --verbose --timeout 10000
+
+      - name: Determine tag name
+        id: tag
+        uses: ./.github/actions/get-tag-name
+
+      - name: Pack artifacts
+        id: pack_artifacts
+        run: |
+          cp LICENSE ./build/bin/
+          zip -r llama-${{ steps.tag.outputs.name }}-bin-ubuntu-22-cmake-vulkan.zip ./build/bin/*
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          path: llama-${{ steps.tag.outputs.name }}-bin-ubuntu-22-cmake-vulkan.zip
+          name: llama-bin-ubuntu-22-cmake-vulkan.zip
 
   ubuntu-22-cmake-webgpu:
     runs-on: ubuntu-22.04
@@ -441,6 +553,22 @@ jobs:
           cd build
           # This is using llvmpipe and runs slower than other backends
           ctest -L main --verbose --timeout 3600
+
+      - name: Determine tag name
+        id: tag
+        uses: ./.github/actions/get-tag-name
+
+      - name: Pack artifacts
+        id: pack_artifacts
+        run: |
+          cp LICENSE ./build/bin/
+          zip -r llama-${{ steps.tag.outputs.name }}-bin-ubuntu-22-cmake-webgpu.zip ./build/bin/*
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          path: llama-${{ steps.tag.outputs.name }}-bin-ubuntu-22-cmake-webgpu.zip
+          name: llama-bin-ubuntu-22-cmake-webgpu.zip
 
   ubuntu-22-cmake-hip:
     runs-on: ubuntu-22.04
@@ -548,6 +676,22 @@ jobs:
             -DCMAKE_CXX_COMPILER=icpx
           cmake --build build --config Release -j $(nproc)
 
+      - name: Determine tag name
+        id: tag
+        uses: ./.github/actions/get-tag-name
+
+      - name: Pack artifacts
+        id: pack_artifacts
+        run: |
+          cp LICENSE ./build/bin/
+          zip -r llama-${{ steps.tag.outputs.name }}-bin-ubuntu-22-cmake-sycl.zip ./build/bin/*
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          path: llama-${{ steps.tag.outputs.name }}-bin-ubuntu-22-cmake-sycl.zip
+          name: llama-bin-ubuntu-22-cmake-sycl.zip
+
   ubuntu-22-cmake-sycl-fp16:
     runs-on: ubuntu-22.04
 
@@ -597,6 +741,22 @@ jobs:
             -DGGML_SYCL_F16=ON
           cmake --build build --config Release -j $(nproc)
 
+      - name: Determine tag name
+        id: tag
+        uses: ./.github/actions/get-tag-name
+
+      - name: Pack artifacts
+        id: pack_artifacts
+        run: |
+          cp LICENSE ./build/bin/
+          zip -r llama-${{ steps.tag.outputs.name }}-bin-ubuntu-22-cmake-sycl-fp16.zip ./build/bin/*
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          path: llama-${{ steps.tag.outputs.name }}-bin-ubuntu-22-cmake-sycl-fp16.zip
+          name: llama-bin-ubuntu-22-cmake-sycl-fp16.zip
+
   build-linux-cross:
     uses: ./.github/workflows/build-linux-cross.yml
 
@@ -640,6 +800,22 @@ jobs:
             -DCMAKE_XCODE_ATTRIBUTE_DEVELOPMENT_TEAM=ggml
           cmake --build build --config Release -j $(sysctl -n hw.logicalcpu) -- CODE_SIGNING_ALLOWED=NO
 
+      - name: Determine tag name
+        id: tag
+        uses: ./.github/actions/get-tag-name
+
+      - name: Pack artifacts
+        id: pack_artifacts
+        run: |
+          cp LICENSE ./build/bin/
+          zip -r llama-${{ steps.tag.outputs.name }}-bin-macos-latest-cmake-ios.zip ./build/bin/*
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          path: llama-${{ steps.tag.outputs.name }}-bin-macos-latest-cmake-ios.zip
+          name: llama-bin-macos-latest-cmake-ios.zip
+
   macOS-latest-cmake-tvos:
     runs-on: macos-latest
 
@@ -677,6 +853,22 @@ jobs:
             -DCMAKE_XCODE_ATTRIBUTE_DEVELOPMENT_TEAM=ggml
           cmake --build build --config Release -j $(sysctl -n hw.logicalcpu) -- CODE_SIGNING_ALLOWED=NO
 
+      - name: Determine tag name
+        id: tag
+        uses: ./.github/actions/get-tag-name
+
+      - name: Pack artifacts
+        id: pack_artifacts
+        run: |
+          cp LICENSE ./build/bin/
+          zip -r llama-${{ steps.tag.outputs.name }}-bin-macos-latest-cmake-tvos.zip ./build/bin/*
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          path: llama-${{ steps.tag.outputs.name }}-bin-macos-latest-cmake-tvos.zip
+          name: llama-bin-macos-latest-cmake-tvos.zip
+
   macOS-latest-cmake-visionos:
     runs-on: macos-latest
 
@@ -707,6 +899,22 @@ jobs:
             -DCMAKE_OSX_DEPLOYMENT_TARGET=1.0 \
             -DCMAKE_XCODE_ATTRIBUTE_DEVELOPMENT_TEAM=ggml
           cmake --build build --config Release -j $(sysctl -n hw.logicalcpu) -- CODE_SIGNING_ALLOWED=NO
+
+      - name: Determine tag name
+        id: tag
+        uses: ./.github/actions/get-tag-name
+
+      - name: Pack artifacts
+        id: pack_artifacts
+        run: |
+          cp LICENSE ./build/bin/
+          zip -r llama-${{ steps.tag.outputs.name }}-bin-macos-latest-cmake-visionos.zip ./build/bin/*
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          path: llama-${{ steps.tag.outputs.name }}-bin-macos-latest-cmake-visionos.zip
+          name: llama-bin-macos-latest-cmake-visionos.zip
 
   macOS-latest-swift:
     runs-on: macos-latest
@@ -1198,6 +1406,73 @@ jobs:
         run: |
           cd examples/llama.android
           ./gradlew build --no-daemon
+
+      - name: Determine tag name
+        id: tag
+        uses: ./.github/actions/get-tag-name
+
+      - name: Pack artifacts
+        id: pack_artifacts
+        run: |
+          cp LICENSE ./examples/llama.android/app/build
+          zip -r llama-${{ steps.tag.outputs.name }}-bin-android-build.zip ./examples/llama.android/app/build/*
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          path: llama-${{ steps.tag.outputs.name }}-bin-android-build.zip
+          name: llama-bin-android-build.zip
+
+  android-ndk-build:
+    runs-on: ubuntu-latest
+
+    env:
+      VULKAN_SDK_VERSION: 1.4.328.1
+
+    strategy:
+      matrix:
+        include:
+          - build: 'arm64-snapdragon-vulkan'
+            defines: '--preset arm64-android-snapdragon-vulkan-release'
+
+    steps:
+      - name: Clone
+        id: checkout
+        uses: actions/checkout@v4
+
+      - name: Install Vulkan Headers
+        id: install_vulkan
+        if: ${{ matrix.build == 'arm64-snapdragon-vulkan' }}
+        run: |
+          curl -L -o vulkansdk-linux-x86_64.tar.xz https://sdk.lunarg.com/sdk/download/${VULKAN_SDK_VERSION}/linux/vulkansdk-linux-x86_64-${VULKAN_SDK_VERSION}.tar.xz
+          mkdir vulkansdk-linux-x86_64
+          tar -xaf vulkansdk-linux-x86_64.tar.xz -C vulkansdk-linux-x86_64
+          sudo cp -r vulkansdk-linux-x86_64/${VULKAN_SDK_VERSION}/x86_64/include/vulkan/* ${ANDROID_NDK_ROOT}/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include/vulkan
+          sudo cp -r vulkansdk-linux-x86_64/${VULKAN_SDK_VERSION}/x86_64/include/vk_video ${ANDROID_NDK_ROOT}/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include
+
+      - name: Build
+        id: ndk_build
+        run: |
+          # set PATH for `glslc`
+          export PATH=$PATH:${ANDROID_NDK_ROOT}/shader-tools/linux-x86_64/
+          cmake ${{ matrix.defines }} -B build
+          cmake --build build
+
+      - name: Determine tag name
+        id: tag
+        uses: ./.github/actions/get-tag-name
+
+      - name: Pack artifacts
+        id: pack_artifacts
+        run: |
+          cp LICENSE ./build/bin/
+          zip -r llama-${{ steps.tag.outputs.name }}-bin-android-ndk-build-${{ matrix.build }}.zip ./build/bin/*
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          path: llama-${{ steps.tag.outputs.name }}-bin-android-ndk-build-${{ matrix.build }}.zip
+          name: llama-bin-android-ndk-build-${{ matrix.build }}.zip
 
   openEuler-latest-cmake-cann:
     if: ${{ github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'Ascend NPU') }}
