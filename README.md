@@ -11,10 +11,9 @@
 LLM inference in C/C++
 
 ## News
-**January 22, 2026:** BitNet fine tuning is now officially supported!  
-Read our full announcement and technical deep dive in these blog posts:  
-- [Fabric-LLM-Finetune: General Overview](https://huggingface.co/blog/qvac/fabric-llm-finetune)
-- [Fabric-LLM-Finetune with BitNet Support](https://huggingface.co/blog/qvac/fabric-llm-finetune-bitnet)
+- [2026.01.22] BitNet fine tuning is now officially supported! Read our full announcement and technical deep dive in these blog posts:  
+    - [Fabric-LLM-Finetune: General Overview](https://huggingface.co/blog/qvac/fabric-llm-finetune)
+    - [Fabric-LLM-Finetune with BitNet Support](https://huggingface.co/blog/qvac/fabric-llm-finetune-bitnet)
 
 
 
