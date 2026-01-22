@@ -10,6 +10,14 @@
 
 LLM inference in C/C++
 
+## News
+**January 22, 2026:** BitNet fine tuning is now officially supported!  
+Read our full announcement and technical deep dive in these blog posts:  
+- [Fabric-LLM-Finetune: General Overview](https://huggingface.co/blog/qvac/fabric-llm-finetune)
+- [Fabric-LLM-Finetune with BitNet Support](https://huggingface.co/blog/qvac/fabric-llm-finetune-bitnet)
+
+
+
 ## LoRA Fine-Tuning
 
 llama.cpp includes native [LoRA](https://arxiv.org/abs/2106.09685) (Low-Rank Adaptation) fine-tuning across CPU, Vulkan, Metal and CUDA backends.
