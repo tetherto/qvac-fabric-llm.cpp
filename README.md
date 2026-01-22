@@ -25,6 +25,10 @@ LoRA fine-tuning represents the weight updates with two smaller matrices through
 
 The [Finetuning Guide](examples/training//README.md) has more details.
 
+### BitNet Support 
+BitNet introduced an extreme quantization scheme that represents weights using only 1.58 bits. BitNet's quantization technique greatly reduces memory constraint and makes fine tuning possible on edge devices. This branch presents the world's first framework to enable fine-tuning of BitNet models using Low-Rank Adaptation (LoRA) on GPUs. Built on llama.cpp with a Vulkan backend, the framework supports BitNet model fine-tuning with LoRA across heterogeneous consumer GPUs. By bringing BitNet to GPUs, the framework enables fine-tuning on edge devices and achieves substantial performance improvements over CPU-based implementations.
+
+
 ## Contributing
 
 - Contributors can open PRs
