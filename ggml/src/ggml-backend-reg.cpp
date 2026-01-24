@@ -663,6 +663,8 @@ int minAdrenoVersion(ggml_backend_reg_t vulkanBackend) {
 #endif
 
 void ggml_backend_load_all_from_path(const char * dir_path) {
+#ifdef GGML_BACKEND_DL
+    // Only attempt to dlopen backends when built with dynamic backend support
 #ifdef NDEBUG
     bool silent = true;
 #else
@@ -713,5 +715,9 @@ void ggml_backend_load_all_from_path(const char * dir_path) {
     if (backend_path) {
         ggml_backend_load(backend_path);
     }
-
+#else
+    // When built without GGML_BACKEND_DL, backends are statically linked
+    // No dynamic loading needed - avoids potential conflicts with system libraries
+    GGML_UNUSED(dir_path);
+#endif
 }
