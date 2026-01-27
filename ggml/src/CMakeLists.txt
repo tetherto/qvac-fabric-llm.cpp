@@ -249,7 +249,10 @@ function(ggml_add_backend_library backend)
     if (GGML_BACKEND_DL)
         add_library(${backend} MODULE ${ARGN})
         # write the shared library to the output directory
-        set_target_properties(${backend} PROPERTIES LIBRARY_OUTPUT_DIRECTORY ${CMAKE_RUNTIME_OUTPUT_DIRECTORY})
+        # Set output name with qvac- prefix to match backend_filename_prefix() in ggml-backend-reg.cpp
+        set_target_properties(${backend} PROPERTIES
+            LIBRARY_OUTPUT_DIRECTORY ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}
+            OUTPUT_NAME "qvac-${backend}")
         target_compile_definitions(${backend} PRIVATE GGML_BACKEND_DL)
         # Do not add dependency, the User will have to explicitely build and install
         # the available `ggml::ggml-*` backend targets. This is for better integration
