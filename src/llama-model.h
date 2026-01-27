@@ -8,6 +8,7 @@
 #include "llama-vocab.h"
 
 #include <cstdint>
+#include <cstring>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -30,6 +31,7 @@ enum llm_type {
     LLM_TYPE_80M,
     LLM_TYPE_109M,
     LLM_TYPE_137M,
+    LLM_TYPE_140M,
     LLM_TYPE_160M,
     LLM_TYPE_190M,
     LLM_TYPE_220M,
@@ -38,12 +40,15 @@ enum llm_type {
     LLM_TYPE_270M,
     LLM_TYPE_335M,
     LLM_TYPE_350M,
+    LLM_TYPE_360M,
     LLM_TYPE_410M,
     LLM_TYPE_450M,
     LLM_TYPE_475M,
+    LLM_TYPE_558M,
     LLM_TYPE_700M,
     LLM_TYPE_770M,
     LLM_TYPE_780M,
+    LLM_TYPE_950M,
     LLM_TYPE_0_3B,
     LLM_TYPE_0_5B,
     LLM_TYPE_0_6B,
@@ -56,6 +61,7 @@ enum llm_type {
     LLM_TYPE_1_7B,
     LLM_TYPE_1_8B,
     LLM_TYPE_2B,
+    LLM_TYPE_2_6B,
     LLM_TYPE_2_8B,
     LLM_TYPE_2_9B,
     LLM_TYPE_3B,
@@ -72,14 +78,17 @@ enum llm_type {
     LLM_TYPE_15B,
     LLM_TYPE_16B,
     LLM_TYPE_20B,
+    LLM_TYPE_26B,
     LLM_TYPE_27B,
     LLM_TYPE_30B,
     LLM_TYPE_32B,
     LLM_TYPE_34B,
     LLM_TYPE_35B,
+    LLM_TYPE_36B,
     LLM_TYPE_40B,
     LLM_TYPE_65B,
     LLM_TYPE_70B,
+    LLM_TYPE_120B,
     LLM_TYPE_142B,
     LLM_TYPE_236B,
     LLM_TYPE_290B,
@@ -101,10 +110,18 @@ enum llm_type {
     LLM_TYPE_17B_16E, // llama4 Scout
     LLM_TYPE_17B_128E, // llama4 Maverick
     LLM_TYPE_A13B,
+    LLM_TYPE_7B_A1B,
+    LLM_TYPE_8B_A1B, // lfm2moe
+    LLM_TYPE_16B_A1B,
     LLM_TYPE_21B_A3B, // Ernie MoE small
     LLM_TYPE_30B_A3B,
+    LLM_TYPE_80B_A3B, // Qwen3 Next
+    LLM_TYPE_100B_A6B,
+    LLM_TYPE_106B_A12B, // GLM-4.5-Air
+    LLM_TYPE_230B_A10B, // Minimax M2
     LLM_TYPE_235B_A22B,
     LLM_TYPE_300B_A47B, // Ernie MoE big
+    LLM_TYPE_355B_A32B, // GLM-4.5
     LLM_TYPE_E2B,
     LLM_TYPE_E4B,
 };
@@ -168,6 +185,15 @@ struct llama_layer_shortconv {
     struct ggml_tensor * out_proj = nullptr;
 };
 
+struct llama_layer_nextn {
+    struct ggml_tensor * eh_proj          = nullptr;
+    struct ggml_tensor * embed_tokens     = nullptr;
+    struct ggml_tensor * enorm            = nullptr;
+    struct ggml_tensor * hnorm            = nullptr;
+    struct ggml_tensor * shared_head_head = nullptr;
+    struct ggml_tensor * shared_head_norm = nullptr;
+};
+
 struct llama_layer {
     // normalization
     struct ggml_tensor * attn_norm       = nullptr;
@@ -212,6 +238,7 @@ struct llama_layer {
     struct ggml_tensor * wk_enc    = nullptr;
     struct ggml_tensor * wv_enc    = nullptr;
     struct ggml_tensor * wo_enc    = nullptr;
+    struct ggml_tensor * wqkv_gate = nullptr;
 
     // attention bias
     struct ggml_tensor * bq   = nullptr;
@@ -243,16 +270,25 @@ struct llama_layer {
     struct ggml_tensor * ffn_up_enc   = nullptr;
 
     // ff MoE
-    struct ggml_tensor * ffn_gate_inp  = nullptr;
-    struct ggml_tensor * ffn_gate_exps = nullptr;
-    struct ggml_tensor * ffn_down_exps = nullptr;
-    struct ggml_tensor * ffn_up_exps   = nullptr;
+    struct ggml_tensor * ffn_gate_inp    = nullptr;
+    struct ggml_tensor * ffn_gate_exps   = nullptr;
+    struct ggml_tensor * ffn_down_exps   = nullptr;
+    struct ggml_tensor * ffn_up_exps     = nullptr;
+    struct ggml_tensor * ffn_gate_inp_b  = nullptr;
+    struct ggml_tensor * ffn_gate_exps_b = nullptr;
+    struct ggml_tensor * ffn_down_exps_b = nullptr;
+    struct ggml_tensor * ffn_up_exps_b   = nullptr;
 
     // ff shared expert (shexp)
     struct ggml_tensor * ffn_gate_inp_shexp = nullptr;
     struct ggml_tensor * ffn_gate_shexp     = nullptr;
     struct ggml_tensor * ffn_down_shexp     = nullptr;
     struct ggml_tensor * ffn_up_shexp       = nullptr;
+
+    // ff adjugate experts (chexps)
+    struct ggml_tensor * ffn_gate_chexps     = nullptr;
+    struct ggml_tensor * ffn_down_chexps     = nullptr;
+    struct ggml_tensor * ffn_up_chexps       = nullptr;
 
     // ff bias
     struct ggml_tensor * ffn_gate_b = nullptr;
@@ -275,6 +311,9 @@ struct llama_layer {
     // mamba bias
     struct ggml_tensor * ssm_conv1d_b = nullptr;
     struct ggml_tensor * ssm_dt_b     = nullptr;
+
+    // qwen3next
+    struct ggml_tensor * ssm_beta_alpha = nullptr;
 
     // rwkv
     struct ggml_tensor * time_mix_w1         = nullptr;
@@ -351,11 +390,36 @@ struct llama_layer {
     struct ggml_tensor * laurel_r             = nullptr;
     struct ggml_tensor * laurel_post_norm     = nullptr;
 
+    // openai-moe
+    struct ggml_tensor * attn_sinks = nullptr;
+
+    // cogvlm
+    struct ggml_tensor * visexp_attn_wqkv = nullptr;
+    struct ggml_tensor * visexp_attn_wo   = nullptr;
+    struct ggml_tensor * visexp_ffn_gate  = nullptr;
+    struct ggml_tensor * visexp_ffn_down  = nullptr;
+    struct ggml_tensor * visexp_ffn_up    = nullptr;
+
+    // xIELU activation parameters for Apertus
+    struct ggml_tensor * ffn_act_alpha_n = nullptr;
+    struct ggml_tensor * ffn_act_alpha_p = nullptr;
+    struct ggml_tensor * ffn_act_beta    = nullptr;
+    struct ggml_tensor * ffn_act_eps     = nullptr;
+
     struct llama_layer_posnet posnet;
 
     struct llama_layer_convnext convnext;
 
     struct llama_layer_shortconv shortconv;
+
+    struct llama_layer_nextn nextn;
+};
+
+// define a comparator for the buft -> ctx map to ensure that the order is well-defined:
+struct ggml_backend_buft_comparator {
+    bool operator()(const ggml_backend_buffer_type_t & lhs, const ggml_backend_buffer_type_t & rhs) const {
+        return strcmp(ggml_backend_buft_name(lhs), ggml_backend_buft_name(rhs)) < 0;
+    }
 };
 
 struct llama_model {
@@ -400,6 +464,12 @@ struct llama_model {
 
     std::vector<llama_layer> layers;
 
+    //Dense linear projections for SentenceTransformers models like embeddinggemma
+    // For Sentence Transformers models structure see
+    // https://sbert.net/docs/sentence_transformer/usage/custom_models.html#structure-of-sentence-transformer-models
+    struct ggml_tensor * dense_2_out_layers = nullptr;
+    struct ggml_tensor * dense_3_out_layers = nullptr;
+
     llama_model_params params;
 
     // gguf metadata
@@ -419,13 +489,13 @@ struct llama_model {
 
     /// @brief Create backend buffers for all tensors
     bool create_backend_buffers(std::size_t                                                  size_data,
-                                const std::map<ggml_backend_buffer_type_t, ggml_context *> & ctx_map,
+                                std::map<ggml_backend_buffer_type_t, ggml_context_ptr, ggml_backend_buft_comparator> & ctx_map,
                                 llama_model_loader & ml, bool use_mmap_buffer, bool use_mlock, int32_t n_gpu_layers,
                                 bool do_print_backend_buffers_info = true);
 
     /// @brief Create backend buffers for tensors on a split file idenfified by `idx`. Removes the split from the map.
     bool create_split_backend_buffers(
-        uint16_t idx, std::map<std::pair<ggml_backend_buffer_type_t, uint16_t>, ggml_context *> & ctx_split_map,
+        uint16_t idx, std::map<std::pair<ggml_backend_buffer_type_t, uint16_t>, ggml_context_ptr> & ctx_split_map,
         llama_model_loader & ml, bool use_mmap_buffer, bool use_mlock, int32_t n_gpu_layers);
 
     void print_backend_buffers_info(int32_t n_gpu_layers);
@@ -441,9 +511,11 @@ struct llama_model {
 
     std::string desc() const;
 
-    size_t size() const;
+    size_t size() const; // file size
     size_t n_tensors() const;
     size_t n_devices() const;
+
+    std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const;
 
     // total number of parameters in the model
     uint64_t n_elements() const;
@@ -464,9 +536,8 @@ struct llama_model {
 
     ggml_tensor * get_rope_factors(const llama_cparams & cparams, int il) const;
 
-    // note: can mutate `cparams`
     // TODO: move this to new llm_arch_model_i interface
-    llama_memory_i * create_memory(const llama_memory_params & params, llama_cparams & cparams) const;
+    llama_memory_i * create_memory(const llama_memory_params & params, const llama_cparams & cparams) const;
 
     // TODO: move this to new llm_arch_model_i interface
     ggml_cgraph * build_graph(const llm_graph_params & params) const;

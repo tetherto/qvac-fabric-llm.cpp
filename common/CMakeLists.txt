@@ -60,14 +60,21 @@ set(${TARGET}_HEADERS
   speculative.h
 )
 
-list(TRANSFORM ${TARGET}_HEADERS PREPEND ${CMAKE_SOURCE_DIR}/common/)
+list(TRANSFORM ${TARGET}_HEADERS PREPEND ${CMAKE_CURRENT_SOURCE_DIR}/)
 
 add_library(${TARGET} STATIC
     arg.cpp
     chat-parser.cpp
+    chat-parser.h
+    chat-parser-xml-toolcall.h
+    chat-parser-xml-toolcall.cpp
     chat.cpp
     common.cpp
     console.cpp
+    console.h
+    download.cpp
+    download.h
+    http.h
     json-partial.cpp
     json-schema-to-grammar.cpp
     llguidance.cpp
@@ -85,10 +92,11 @@ if (BUILD_SHARED_LIBS)
     set_target_properties(${TARGET} PROPERTIES POSITION_INDEPENDENT_CODE ON)
 endif()
 
+# TODO: use list(APPEND LLAMA_COMMON_EXTRA_LIBS ...)
 set(LLAMA_COMMON_EXTRA_LIBS build_info)
 
-# Use curl to download model url
 if (LLAMA_CURL)
+    # Use curl to download model url
     find_package(CURL)
     if (NOT CURL_FOUND)
         message(FATAL_ERROR "Could NOT find CURL. Hint: to disable this feature, set -DLLAMA_CURL=OFF")
@@ -96,7 +104,11 @@ if (LLAMA_CURL)
     target_compile_definitions(${TARGET} PUBLIC LLAMA_USE_CURL)
     include_directories(${CURL_INCLUDE_DIRS})
     set(LLAMA_COMMON_EXTRA_LIBS ${LLAMA_COMMON_EXTRA_LIBS} ${CURL_LIBRARIES})
-endif ()
+elseif (LLAMA_HTTPLIB)
+    # otherwise, use cpp-httplib
+    target_compile_definitions(${TARGET} PUBLIC LLAMA_USE_HTTPLIB)
+    set(LLAMA_COMMON_EXTRA_LIBS ${LLAMA_COMMON_EXTRA_LIBS} cpp-httplib)
+endif()
 
 if (LLAMA_LLGUIDANCE)
     include(ExternalProject)

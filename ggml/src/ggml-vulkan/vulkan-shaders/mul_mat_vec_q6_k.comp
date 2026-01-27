@@ -2,7 +2,7 @@
 
 #extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
 
-#include "mul_mat_vec_base.comp"
+#include "mul_mat_vec_base.glsl"
 
 layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
 
@@ -46,10 +46,17 @@ void calc_superblock(const uint a_offset, const uint b_offset, const uint itid, 
         const uint32_t q2_u32 = ql0_u32_hi4  | qh4_u32;
         const uint32_t q3_u32 = ql32_u32_hi4 | qh6_u32;
 
+#if defined(ADRENO)
+        const vec4 q0 = vec4(float(q0_u32 & 0xFF), float((q0_u32 >> 8) & 0xFF), float((q0_u32 >> 16) & 0xFF), float(q0_u32 >> 24)) - 32;
+        const vec4 q1 = vec4(float(q1_u32 & 0xFF), float((q1_u32 >> 8) & 0xFF), float((q1_u32 >> 16) & 0xFF), float(q1_u32 >> 24)) - 32;
+        const vec4 q2 = vec4(float(q2_u32 & 0xFF), float((q2_u32 >> 8) & 0xFF), float((q2_u32 >> 16) & 0xFF), float(q2_u32 >> 24)) - 32;
+        const vec4 q3 = vec4(float(q3_u32 & 0xFF), float((q3_u32 >> 8) & 0xFF), float((q3_u32 >> 16) & 0xFF), float(q3_u32 >> 24)) - 32;
+#else
         const vec4 q0 = vec4(unpack8(q0_u32)) - 32;
         const vec4 q1 = vec4(unpack8(q1_u32)) - 32;
         const vec4 q2 = vec4(unpack8(q2_u32)) - 32;
         const vec4 q3 = vec4(unpack8(q3_u32)) - 32;
+#endif
 
         if (all_threads) {
             sccache[csel][ix][itid] = FLOAT_TYPE(data_a[ib0 + i].scales[itid]);

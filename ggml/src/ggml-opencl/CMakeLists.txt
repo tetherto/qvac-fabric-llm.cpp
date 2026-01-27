@@ -55,6 +55,7 @@ endfunction()
 
 set(GGML_OPENCL_KERNELS
     add
+    add_id
     argsort
     clamp
     cpy
@@ -69,6 +70,7 @@ set(GGML_OPENCL_KERNELS
     group_norm
     im2col_f32
     im2col_f16
+    mean
     mul_mat_Ab_Bi_8x4
     mul_mv_f16_f16
     mul_mv_f16_f32_1row
@@ -81,7 +83,20 @@ set(GGML_OPENCL_KERNELS
     mul_mv_q4_0_f32_1d_8x_flat
     mul_mv_q4_0_f32_1d_16x_flat
     mul_mv_q6_k
+    mul_mv_q8_0_f32
+    mul_mv_q8_0_f32_flat
+    mul_mv_mxfp4_f32
+    mul_mv_mxfp4_f32_flat
     mul_mv_id_q4_0_f32_8x_flat
+    mul_mv_id_q8_0_f32
+    mul_mv_id_q8_0_f32_flat
+    mul_mv_id_mxfp4_f32
+    mul_mv_id_mxfp4_f32_flat
+    gemm_moe_mxfp4_f32
+    gemv_moe_mxfp4_f32
+    mul_mm_f32_f32_l4_lm
+    mul_mm_f16_f32_l4_lm
+    mul_mm_q8_0_f32_l4_lm
     mul
     norm
     relu
@@ -95,6 +110,9 @@ set(GGML_OPENCL_KERNELS
     softmax_4_f16
     softmax_f32
     softmax_f16
+    sqr
+    sqrt
+    ssm_conv
     sub
     sum_rows
     transpose
@@ -105,6 +123,12 @@ set(GGML_OPENCL_KERNELS
     pad
     repeat
     mul_mat_f16_f32
+    mul_mm_f16_f32_kq_kqv
+    conv2d
+    conv2d_f16_f32
+    flash_attn_f32_f16
+    flash_attn_f16
+    flash_attn_f32
 )
 
 foreach (K ${GGML_OPENCL_KERNELS})

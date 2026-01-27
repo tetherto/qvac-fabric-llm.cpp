@@ -114,6 +114,9 @@ message(STATUS "GGML_SYSTEM_ARCH: ${GGML_SYSTEM_ARCH}")
 
 if (NOT MSVC)
     if (GGML_STATIC)
+        if (UNIX AND NOT APPLE)
+            set(CMAKE_FIND_LIBRARY_SUFFIXES ".a;.so")
+        endif()
         add_link_options(-static)
         if (MINGW)
             add_link_options(-static-libgcc -static-libstdc++)
@@ -142,6 +145,9 @@ endif()
 # which was introduced in POSIX.1-2008, forcing us to go higher
 if (CMAKE_SYSTEM_NAME MATCHES "OpenBSD")
     add_compile_definitions(_XOPEN_SOURCE=700)
+elseif (CMAKE_SYSTEM_NAME MATCHES "AIX")
+    # Don't define _XOPEN_SOURCE.  We need _ALL_SOURCE, which is the default,
+    # in order to define _SC_PHYS_PAGES.
 else()
     add_compile_definitions(_XOPEN_SOURCE=600)
 endif()
@@ -183,10 +189,6 @@ endif()
 
 # ggml
 
-if (GGML_BACKEND_DL AND NOT BUILD_SHARED_LIBS)
-    message(FATAL_ERROR "GGML_BACKEND_DL requires BUILD_SHARED_LIBS")
-endif()
-
 add_library(ggml-base
             ../include/ggml.h
             ../include/ggml-alloc.h
@@ -207,14 +209,35 @@ add_library(ggml-base
             gguf.cpp
             uint8-buff-stream.cpp)
 
+set_target_properties(ggml-base PROPERTIES
+    VERSION ${GGML_VERSION}
+    SOVERSION ${GGML_VERSION_MAJOR}
+)
+
 target_include_directories(ggml-base PRIVATE .)
 if (GGML_BACKEND_DL)
     target_compile_definitions(ggml-base PUBLIC GGML_BACKEND_DL)
 endif()
 
+if (GGML_SCHED_NO_REALLOC)
+    target_compile_definitions(ggml-base PUBLIC GGML_SCHED_NO_REALLOC)
+endif()
+
 add_library(ggml
             ggml-backend-reg.cpp)
 add_library(ggml::ggml ALIAS ggml)
+
+set_target_properties(ggml PROPERTIES
+    VERSION ${GGML_VERSION}
+    SOVERSION ${GGML_VERSION_MAJOR}
+)
+
+if (GGML_BACKEND_DIR)
+    if (NOT GGML_BACKEND_DL)
+        message(FATAL_ERROR "GGML_BACKEND_DIR requires GGML_BACKEND_DL")
+    endif()
+    target_compile_definitions(ggml PUBLIC GGML_BACKEND_DIR="${GGML_BACKEND_DIR}")
+endif()
 
 target_link_libraries(ggml PUBLIC ggml-base)
 
@@ -228,8 +251,22 @@ function(ggml_add_backend_library backend)
         # write the shared library to the output directory
         set_target_properties(${backend} PROPERTIES LIBRARY_OUTPUT_DIRECTORY ${CMAKE_RUNTIME_OUTPUT_DIRECTORY})
         target_compile_definitions(${backend} PRIVATE GGML_BACKEND_DL)
-        add_dependencies(ggml ${backend})
-        install(TARGETS ${backend} LIBRARY DESTINATION ${CMAKE_INSTALL_BINDIR})
+        # Do not add dependency, the User will have to explicitely build and install
+        # the available `ggml::ggml-*` backend targets. This is for better integration
+        # with cmake-bare
+        # add_dependencies(ggml ${backend})
+
+        if (GGML_BACKEND_DIR)
+            install(TARGETS ${backend}
+                    EXPORT ggml-targets
+                    LIBRARY DESTINATION ${GGML_BACKEND_DIR}
+                    RUNTIME DESTINATION ${GGML_BACKEND_DIR})
+        else()
+            install(TARGETS ${backend}
+                    EXPORT ggml-targets
+                    LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+                    RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+        endif()
     else()
         add_library(${backend} ${ARGN})
         target_link_libraries(ggml PUBLIC ${backend})
@@ -239,9 +276,18 @@ function(ggml_add_backend_library backend)
     target_link_libraries(${backend} PRIVATE ggml-base)
     target_include_directories(${backend} PRIVATE ..)
 
-    if (${BUILD_SHARED_LIBS})
+    if (${BUILD_SHARED_LIBS} OR GGML_BACKEND_DL)
         target_compile_definitions(${backend} PRIVATE GGML_BACKEND_BUILD)
         target_compile_definitions(${backend} PUBLIC  GGML_BACKEND_SHARED)
+    endif()
+
+    # Set versioning properties for all backend libraries
+    # Building a MODULE library with a version is not supported on macOS (https://gitlab.kitware.com/cmake/cmake/-/issues/20782)
+    if (NOT (APPLE AND GGML_BACKEND_DL))
+        set_target_properties(${backend} PROPERTIES
+            VERSION ${GGML_VERSION}
+            SOVERSION ${GGML_VERSION_MAJOR}
+        )
     endif()
 
     if(NOT GGML_AVAILABLE_BACKENDS)
@@ -289,6 +335,22 @@ function(ggml_add_cpu_backend_variant tag_name)
             set(GGML_INTERNAL_${feat} ON)
         endforeach()
     elseif (GGML_SYSTEM_ARCH STREQUAL "PowerPC")
+        foreach (feat ${ARGN})
+            set(GGML_INTERNAL_${feat} ON)
+        endforeach()
+    elseif (GGML_SYSTEM_ARCH STREQUAL "s390x")
+        foreach (feat VXE2 NNPA)
+            set(GGML_INTERNAL_${feat} OFF)
+        endforeach()
+
+        foreach (feat ${ARGN})
+            set(GGML_INTERNAL_${feat} ON)
+        endforeach()
+    elseif (GGML_SYSTEM_ARCH STREQUAL "riscv64")
+        foreach (feat RVV)
+            set(GGML_INTERNAL_${feat} OFF)
+        endforeach()
+
         foreach (feat ${ARGN})
             set(GGML_INTERNAL_${feat} ON)
         endforeach()
@@ -356,6 +418,20 @@ if (GGML_CPU_ALL_VARIANTS)
         else()
             message(FATAL_ERROR "Unsupported PowerPC target OS: ${CMAKE_SYSTEM_NAME}")
         endif()
+    elseif (GGML_SYSTEM_ARCH STREQUAL "s390x")
+        if (CMAKE_SYSTEM_NAME MATCHES "Linux")
+            ggml_add_cpu_backend_variant(z15    Z15 VXE2)
+            ggml_add_cpu_backend_variant(z16    Z16 VXE2 NNPA)
+        else()
+            message(FATAL_ERROR "Unsupported s390x target OS: ${CMAKE_SYSTEM_NAME}")
+        endif()
+    elseif (GGML_SYSTEM_ARCH STREQUAL "riscv64")
+        if (CMAKE_SYSTEM_NAME MATCHES "Linux")
+            ggml_add_cpu_backend_variant(riscv64_0)
+            ggml_add_cpu_backend_variant(riscv64_v   RVV)
+        else()
+            message(FATAL_ERROR "Unsupported RISC-V target OS: ${CMAKE_SYSTEM_NAME}")
+        endif()
     else()
         message(FATAL_ERROR "GGML_CPU_ALL_VARIANTS not yet supported with ${GGML_SYSTEM_ARCH} on ${CMAKE_SYSTEM_NAME}")
     endif()
@@ -373,7 +449,9 @@ ggml_add_backend(RPC)
 ggml_add_backend(SYCL)
 ggml_add_backend(Vulkan)
 ggml_add_backend(WebGPU)
+ggml_add_backend(zDNN)
 ggml_add_backend(OpenCL)
+ggml_add_backend(Hexagon)
 
 foreach (target ggml-base ggml)
     target_include_directories(${target} PUBLIC    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../include> $<INSTALL_INTERFACE:include>)
@@ -397,7 +475,7 @@ if(CMAKE_SYSTEM_NAME MATCHES "visionOS")
     target_compile_definitions(ggml-base PUBLIC _DARWIN_C_SOURCE)
 endif()
 
-if (BUILD_SHARED_LIBS)
+if (BUILD_SHARED_LIBS OR GGML_BACKEND_DL)
     foreach (target ggml-base ggml)
         set_target_properties(${target} PROPERTIES POSITION_INDEPENDENT_CODE ON)
         target_compile_definitions(${target} PRIVATE GGML_BUILD)

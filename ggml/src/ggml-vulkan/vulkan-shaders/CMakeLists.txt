@@ -1,6 +1,8 @@
 cmake_minimum_required(VERSION 3.19)
 project("vulkan-shaders-gen" C CXX)
 
+option(GGML_VULKAN_BUILD_ADRENO_SHADERS "Build Adreno-specific shader variants" ON)
+
 find_package (Threads REQUIRED)
 
 if (GGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
@@ -22,6 +24,10 @@ endif()
 if (GGML_VULKAN_SHADER_DEBUG_INFO)
     add_compile_definitions(GGML_VULKAN_SHADER_DEBUG_INFO)
     message(STATUS "Enabling shader debug info")
+endif()
+if (GGML_VULKAN_BUILD_ADRENO_SHADERS)
+    add_compile_definitions(GGML_VULKAN_BUILD_ADRENO_SHADERS)
+    message(STATUS "Building Adreno-specific shaders")
 endif()
 
 set(TARGET vulkan-shaders-gen)

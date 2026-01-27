@@ -200,7 +200,7 @@ extern "C" {
 }
 #endif
 
-#ifdef __cplusplus
-#include <ios>
-GGML_API struct gguf_context * gguf_init_from_buffer(std::basic_streambuf<uint8_t>& streambuf, struct gguf_init_params params);
+#if defined(__cplusplus)
+#include <streambuf>
+GGML_API struct gguf_context * gguf_init_from_buffer(std::basic_streambuf<char>& streambuf, struct gguf_init_params params);
 #endif

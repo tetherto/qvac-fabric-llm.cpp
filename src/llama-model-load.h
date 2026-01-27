@@ -6,6 +6,7 @@
 #include "ggml-cpp.h"
 #include "llama-mmap.h"
 #include "llama-model-load-input.h"
+#include "llama-impl.h"
 
 struct llama_model_loader;
 
@@ -74,8 +75,7 @@ struct IncrementalSplitsTensorLoad {
     /// same type of an individual split. The context can be used to instantiate the
     /// final model tensors and and attach to them backend buffers.
     /// @tparam impl The model implementation type where the context will be stored.
-    template <typename impl>
-    ggml_context * get_model_ctx_for_split_buft(ggml_backend_buffer_type_t buft, uint16_t split, impl * model_impl) {
+    ggml_context * get_model_ctx_for_split_buft(ggml_backend_buffer_type_t buft, uint16_t split) {
         auto key = std::make_pair(buft, split);
         auto it  = ctx_split_map.find(key);
         if (it == ctx_split_map.end()) {
@@ -96,16 +96,17 @@ struct IncrementalSplitsTensorLoad {
                 throw std::runtime_error("failed to create ggml context for split-file");
             }
 
-            ctx_split_map[key] = ctx;
-            model_impl->ctxs.emplace_back(ctx);
+            ctx_split_map[key] = ggml_context_ptr(ctx);
+            // Contexts are cleaned up when create_split_backend_buffers is called
+            // Review: this will be an issue if this ctx_split_map is used after create_split_backend_buffers is called
 
             return ctx;
         }
-        return it->second;
+        return it->second.get();
     }
 
     // public so that it can be processed by the backend storage allocator
-    std::map<std::pair<ggml_backend_buffer_type_t, uint16_t>, ggml_context *> ctx_split_map;
+    std::map<std::pair<ggml_backend_buffer_type_t, uint16_t>, ggml_context_ptr> ctx_split_map;
 
   private:
     struct TensorInfo {

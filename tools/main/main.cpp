@@ -147,10 +147,14 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
-    auto * mem = llama_get_memory(ctx);
-
+    llama_memory_t mem = llama_get_memory(ctx);
     const llama_vocab * vocab = llama_model_get_vocab(model);
+
+    // note: the time for chat template initialization is not negligible:
     auto chat_templates = common_chat_templates_init(model, params.chat_template);
+
+    // start measuring performance timings from here
+    llama_perf_context_reset(ctx);
 
     LOG_INF("%s: llama threadpool init, n_threads = %d\n", __func__, (int) params.cpuparams.n_threads);
 
@@ -178,7 +182,7 @@ int main(int argc, char ** argv) {
             return 1;
         }
 
-        // Start the non-batch threadpool in the paused state
+        // start the non-batch threadpool in the paused state
         tpp.paused = true;
     }
 
@@ -220,7 +224,7 @@ int main(int argc, char ** argv) {
                 LOG_WRN("*** User-specified prompt will pre-start conversation, did you mean to set --system-prompt (-sys) instead?\n");
             }
 
-            LOG_INF("%s: chat template example:\n%s\n", __func__, common_chat_format_example(chat_templates.get(), params.use_jinja).c_str());
+            LOG_INF("%s: chat template example:\n%s\n", __func__, common_chat_format_example(chat_templates.get(), params.use_jinja, params.default_template_kwargs).c_str());
         } else {
             LOG_INF("%s: in-suffix/prefix is specified, chat template will be disabled\n", __func__);
         }
@@ -354,7 +358,11 @@ int main(int argc, char ** argv) {
         }
 
         // remove any "future" tokens that we might have inherited from the previous session
-        llama_memory_seq_rm(mem, -1, n_matching_session_tokens, -1);
+        if (!llama_memory_seq_rm(mem, -1, n_matching_session_tokens, -1)) {
+            LOG_INF("%s: unable to resuse common prefix\n", __func__);
+            n_matching_session_tokens = 0;
+            llama_memory_seq_rm(mem, -1, -1, -1);
+        }
     }
 
     LOG_DBG("recalculate the cached logits (check): embd_inp.size() %zu, n_matching_session_tokens %zu, embd_inp.size() %zu, session_tokens.size() %zu\n",
@@ -513,6 +521,12 @@ int main(int argc, char ** argv) {
         is_interacting = params.interactive_first;
     }
 
+    LOG_WRN("*****************************\n");
+    LOG_WRN("IMPORTANT: The current llama-cli will be moved to llama-completion in the near future\n");
+    LOG_WRN("  New llama-cli will have enhanced features and improved user experience\n");
+    LOG_WRN("  More info: https://github.com/ggml-org/llama.cpp/discussions/17618\n");
+    LOG_WRN("*****************************\n");
+
     bool is_antiprompt        = false;
     bool input_echo           = true;
     bool display              = true;
@@ -587,12 +601,12 @@ int main(int argc, char ** argv) {
 
                 if (n_past + (int) embd.size() >= n_ctx) {
                     if (!params.ctx_shift){
-                        LOG_DBG("\n\n%s: context full and context shift is disabled => stopping\n", __func__);
+                        LOG_WRN("\n\n%s: context full and context shift is disabled => stopping\n", __func__);
                         break;
                     }
 
                     if (params.n_predict == -2) {
-                        LOG_DBG("\n\n%s: context full and n_predict == -%d => stopping\n", __func__, params.n_predict);
+                        LOG_WRN("\n\n%s: context full and n_predict == %d => stopping\n", __func__, params.n_predict);
                         break;
                     }
 
@@ -707,6 +721,10 @@ int main(int argc, char ** argv) {
 
             embd.push_back(id);
 
+            if (params.conversation_mode && !waiting_for_first_input && !llama_vocab_is_eog(vocab, id)) {
+                assistant_ss << common_token_to_piece(ctx, id, false);
+            }
+
             // echo this to console
             input_echo = true;
 
@@ -785,14 +803,17 @@ int main(int argc, char ** argv) {
                 }
 
                 // check for reverse prompt using special tokens
-                llama_token last_token = common_sampler_last(smpl);
-                for (auto token : antiprompt_token) {
-                    if (token == last_token) {
-                        if (params.interactive) {
-                            is_interacting = true;
+                // avoid calling common_sampler_last() if last_output is empty
+                if (!last_output.empty()) {
+                    llama_token last_token = common_sampler_last(smpl);
+                    for (auto token : antiprompt_token) {
+                        if (token == last_token) {
+                            if (params.interactive) {
+                                is_interacting = true;
+                            }
+                            is_antiprompt = true;
+                            break;
                         }
-                        is_antiprompt = true;
-                        break;
                     }
                 }
 
@@ -821,11 +842,7 @@ int main(int argc, char ** argv) {
                 }
             }
 
-            // if current token is not EOG, we add it to current assistant message
             if (params.conversation_mode && !waiting_for_first_input) {
-                const auto id = common_sampler_last(smpl);
-                assistant_ss << common_token_to_piece(ctx, id, false);
-
                 if (!prompt.empty()) {
                     prompt.clear();
                     is_interacting = false;

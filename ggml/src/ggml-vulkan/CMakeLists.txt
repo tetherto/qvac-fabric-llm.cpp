@@ -1,7 +1,17 @@
 cmake_minimum_required(VERSION 3.19)
 cmake_policy(SET CMP0114 NEW)
+cmake_policy(SET CMP0116 NEW)
+if (POLICY CMP0147)
+    # Parallel build custom build steps
+    cmake_policy(SET CMP0147 NEW)
+endif()
 
 find_package(Vulkan COMPONENTS glslc REQUIRED)
+
+if (CMAKE_CXX_COMPILER_ID STREQUAL "MSVC")
+    # Parallel build object files
+    add_definitions(/MP)
+endif()
 
 # Add options to disable cooperative matrix support
 option(GGML_VULKAN_DISABLE_COOPMAT "Disable VK_KHR_cooperative_matrix support" OFF)
@@ -59,7 +69,7 @@ if (Vulkan_FOUND)
     if (NOT GGML_VULKAN_DISABLE_COOPMAT)
         test_shader_extension_support(
             "GL_KHR_cooperative_matrix"
-            "${CMAKE_CURRENT_SOURCE_DIR}/vulkan-shaders/test_coopmat_support.comp"
+            "${CMAKE_CURRENT_SOURCE_DIR}/vulkan-shaders/feature-tests/coopmat.comp"
             "GGML_VULKAN_COOPMAT_GLSLC_SUPPORT"
         )
     else()
@@ -69,7 +79,7 @@ if (Vulkan_FOUND)
     if (NOT GGML_VULKAN_DISABLE_COOPMAT2)
         test_shader_extension_support(
             "GL_NV_cooperative_matrix2"
-            "${CMAKE_CURRENT_SOURCE_DIR}/vulkan-shaders/test_coopmat2_support.comp"
+            "${CMAKE_CURRENT_SOURCE_DIR}/vulkan-shaders/feature-tests/coopmat2.comp"
             "GGML_VULKAN_COOPMAT2_GLSLC_SUPPORT"
         )
     else()
@@ -78,20 +88,28 @@ if (Vulkan_FOUND)
 
     test_shader_extension_support(
         "GL_EXT_integer_dot_product"
-        "${CMAKE_CURRENT_SOURCE_DIR}/vulkan-shaders/test_integer_dot_support.comp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/vulkan-shaders/feature-tests/integer_dot.comp"
         "GGML_VULKAN_INTEGER_DOT_GLSLC_SUPPORT"
     )
 
     test_shader_extension_support(
         "GL_EXT_bfloat16"
-        "${CMAKE_CURRENT_SOURCE_DIR}/vulkan-shaders/test_bfloat16_support.comp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/vulkan-shaders/feature-tests/bfloat16.comp"
         "GGML_VULKAN_BFLOAT16_GLSLC_SUPPORT"
     )
 
     target_link_libraries(ggml-vulkan PRIVATE Vulkan::Vulkan)
-    target_include_directories(ggml-vulkan PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
+    target_include_directories(ggml-vulkan
+        PRIVATE
+            ${CMAKE_CURRENT_BINARY_DIR}
+            ../../../vendor
+
+    )
     target_include_directories(ggml-vulkan PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/vulkan_cpp_wrapper/include")
 
+    if (FORCE_GGML_VK_PERF_LOGGER)
+      add_compile_definitions(FORCE_GGML_VK_PERF_LOGGER)
+    endif()
     # Workaround to the "can't dereference invalidated vector iterator" bug in clang-cl debug build
     # Posssibly relevant: https://stackoverflow.com/questions/74748276/visual-studio-no-displays-the-correct-length-of-stdvector
     if (MSVC AND CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
@@ -104,6 +122,11 @@ if (Vulkan_FOUND)
 
     if (GGML_VULKAN_DEBUG)
         add_compile_definitions(GGML_VULKAN_DEBUG)
+    endif()
+
+    if (GGML_VULKAN_BUILD_ADRENO_SHADERS)
+        add_compile_definitions(GGML_VULKAN_BUILD_ADRENO_SHADERS)
+        list(APPEND VULKAN_SHADER_GEN_CMAKE_ARGS -DGGML_VULKAN_BUILD_ADRENO_SHADERS=ON)
     endif()
 
     if (GGML_VULKAN_MEMORY_DEBUG)
@@ -173,7 +196,6 @@ if (Vulkan_FOUND)
     set (_ggml_vk_genshaders_dir "${CMAKE_BINARY_DIR}/$<CONFIG>")
     set (_ggml_vk_genshaders_cmd "${_ggml_vk_genshaders_dir}/vulkan-shaders-gen${_ggml_vk_host_suffix}")
     set (_ggml_vk_header     "${CMAKE_CURRENT_BINARY_DIR}/ggml-vulkan-shaders.hpp")
-    set (_ggml_vk_source     "${CMAKE_CURRENT_BINARY_DIR}/ggml-vulkan-shaders.cpp")
     set (_ggml_vk_input_dir  "${CMAKE_CURRENT_SOURCE_DIR}/vulkan-shaders")
     set (_ggml_vk_output_dir "${CMAKE_CURRENT_BINARY_DIR}/vulkan-shaders.spv")
 
@@ -187,26 +209,40 @@ if (Vulkan_FOUND)
               CONFIGURE_DEPENDS "${_ggml_vk_input_dir}/*.cpp"
                                 "${_ggml_vk_input_dir}/*.h")
 
-    add_custom_command(
-        OUTPUT ${_ggml_vk_header}
-               ${_ggml_vk_source}
+    set (_ggml_vk_common_cpp "${CMAKE_CURRENT_BINARY_DIR}/ggml-vulkan-shaders-common.cpp")
 
+    add_custom_command(
+        OUTPUT ${_ggml_vk_header} ${_ggml_vk_common_cpp}
         COMMAND ${_ggml_vk_genshaders_cmd}
-            --glslc      ${Vulkan_GLSLC_EXECUTABLE}
-            --input-dir  ${_ggml_vk_input_dir}
             --output-dir ${_ggml_vk_output_dir}
             --target-hpp ${_ggml_vk_header}
-            --target-cpp ${_ggml_vk_source}
-            --no-clean
-
-        DEPENDS ${_ggml_vk_shader_files}
-                ${_ggml_vk_shaders_gen_sources}
+            --target-common-cpp ${_ggml_vk_common_cpp}
+        DEPENDS ${_ggml_vk_shaders_gen_sources}
                 vulkan-shaders-gen
-
-        COMMENT "Generate vulkan shaders"
+        COMMENT "Generate vulkan shaders header and common cpp"
     )
+    target_sources(ggml-vulkan PRIVATE ${_ggml_vk_header} ${_ggml_vk_common_cpp})
 
-    target_sources(ggml-vulkan PRIVATE ${_ggml_vk_source} ${_ggml_vk_header})
+    foreach (file_full ${_ggml_vk_shader_files})
+        get_filename_component(file ${file_full} NAME)
+        set (_ggml_vk_target_cpp "${CMAKE_CURRENT_BINARY_DIR}/${file}.cpp")
+
+        add_custom_command(
+            OUTPUT  ${_ggml_vk_target_cpp}
+            DEPFILE ${_ggml_vk_target_cpp}.d
+            COMMAND ${_ggml_vk_genshaders_cmd}
+                --glslc      ${Vulkan_GLSLC_EXECUTABLE}
+                --source     ${file_full}
+                --output-dir ${_ggml_vk_output_dir}
+                --target-hpp ${_ggml_vk_header}
+                --target-cpp ${_ggml_vk_target_cpp}
+            DEPENDS ${file_full}
+                    ${_ggml_vk_shaders_gen_sources}
+                    vulkan-shaders-gen
+            COMMENT "Generate vulkan shaders for ${file}"
+        )
+        target_sources(ggml-vulkan PRIVATE ${_ggml_vk_target_cpp})
+    endforeach()
 
 else()
     message(WARNING "Vulkan not found")

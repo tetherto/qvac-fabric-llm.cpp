@@ -4,15 +4,50 @@
 #include <condition_variable>
 #include <cstdarg>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <mutex>
 #include <sstream>
 #include <thread>
 #include <vector>
 
+#if defined(_WIN32)
+#    include <io.h>
+#    include <windows.h>
+#    define isatty _isatty
+#    define fileno _fileno
+#else
+#    include <unistd.h>
+#endif // defined(_WIN32)
+
 int common_log_verbosity_thold = LOG_DEFAULT_LLAMA;
 
 void common_log_set_verbosity_thold(int verbosity) {
     common_log_verbosity_thold = verbosity;
+}
+
+// Auto-detect if colors should be enabled based on terminal and environment
+static bool common_log_should_use_colors_auto() {
+    // Check NO_COLOR environment variable (https://no-color.org/)
+    if (const char * no_color = std::getenv("NO_COLOR")) {
+        if (no_color[0] != '\0') {
+            return false;
+        }
+    }
+
+    // Check TERM environment variable
+    if (const char * term = std::getenv("TERM")) {
+        if (std::strcmp(term, "dumb") == 0) {
+            return false;
+        }
+    }
+
+    // Check if stdout and stderr are connected to a terminal
+    // We check both because log messages can go to either
+    bool stdout_is_tty = isatty(fileno(stdout));
+    bool stderr_is_tty = isatty(fileno(stderr));
+
+    return stdout_is_tty || stderr_is_tty;
 }
 
 static int64_t t_us() {
@@ -57,7 +92,14 @@ struct common_log_entry {
     // signals the worker thread to stop
     bool is_end;
 
-    void print(FILE * file = nullptr) const {
+    void print(FILE * file = nullptr, ggml_log_callback callback = nullptr, void * callback_user_data = nullptr) const {
+        // if callback is provided, use it instead of printing
+        if (callback != nullptr) {
+            callback(level, msg.data(), callback_user_data);
+            return;
+        }
+
+
         FILE * fcur = file;
         if (!fcur) {
             // stderr displays DBG messages only when their verbosity level is not higher than the threshold
@@ -115,6 +157,8 @@ struct common_log {
         timestamps = false;
         running = false;
         t_start = t_us();
+        callback = nullptr;
+        callback_user_data = nullptr;
 
         // initial message size - will be expanded if longer messages arrive
         entries.resize(capacity);
@@ -155,6 +199,10 @@ private:
 
     // worker thread copies into this
     common_log_entry cur;
+
+    // custom callback for log messages
+    ggml_log_callback callback;
+    void * callback_user_data;
 
 public:
     void add(enum ggml_log_level level, const char * fmt, va_list args) {
@@ -246,11 +294,15 @@ public:
 
         thrd = std::thread([this]() {
             while (true) {
+                ggml_log_callback cb = nullptr;
+                void * cb_user_data = nullptr;
                 {
                     std::unique_lock<std::mutex> lock(mtx);
                     cv.wait(lock, [this]() { return head != tail; });
 
                     cur = entries[head];
+                    cb = callback;
+                    cb_user_data = callback_user_data;
 
                     head = (head + 1) % entries.size();
                 }
@@ -259,7 +311,7 @@ public:
                     break;
                 }
 
-                cur.print(); // stdout and stderr
+                cur.print(nullptr, cb, cb_user_data); // stdout and stderr or callback
 
                 if (file) {
                     cur.print(file);
@@ -341,6 +393,15 @@ public:
 
         this->timestamps = timestamps;
     }
+
+    void set_callback(ggml_log_callback cb, void * user_data) {
+        pause();
+
+        this->callback = cb;
+        this->callback_user_data = user_data;
+
+        resume();
+    }
 };
 
 //
@@ -353,6 +414,11 @@ struct common_log * common_log_init() {
 
 struct common_log * common_log_main() {
     static struct common_log log;
+    static std::once_flag    init_flag;
+    std::call_once(init_flag, [&]() {
+        // Set default to auto-detect colors
+        log.set_colors(common_log_should_use_colors_auto());
+    });
 
     return &log;
 }
@@ -380,8 +446,19 @@ void common_log_set_file(struct common_log * log, const char * file) {
     log->set_file(file);
 }
 
-void common_log_set_colors(struct common_log * log, bool colors) {
-    log->set_colors(colors);
+void common_log_set_colors(struct common_log * log, log_colors colors) {
+    if (colors == LOG_COLORS_AUTO) {
+        log->set_colors(common_log_should_use_colors_auto());
+        return;
+    }
+
+    if (colors == LOG_COLORS_DISABLED) {
+        log->set_colors(false);
+        return;
+    }
+
+    GGML_ASSERT(colors == LOG_COLORS_ENABLED);
+    log->set_colors(true);
 }
 
 void common_log_set_prefix(struct common_log * log, bool prefix) {
@@ -390,4 +467,28 @@ void common_log_set_prefix(struct common_log * log, bool prefix) {
 
 void common_log_set_timestamps(struct common_log * log, bool timestamps) {
     log->set_timestamps(timestamps);
+}
+
+static int common_get_verbosity(enum ggml_log_level level) {
+    switch (level) {
+        case GGML_LOG_LEVEL_DEBUG: return LOG_LEVEL_DEBUG;
+        case GGML_LOG_LEVEL_INFO:  return LOG_LEVEL_INFO;
+        case GGML_LOG_LEVEL_WARN:  return LOG_LEVEL_WARN;
+        case GGML_LOG_LEVEL_ERROR: return LOG_LEVEL_ERROR;
+        case GGML_LOG_LEVEL_CONT:  return LOG_LEVEL_INFO; // same as INFO
+        case GGML_LOG_LEVEL_NONE:
+        default:
+            return LOG_LEVEL_OUTPUT;
+    }
+}
+
+void common_log_default_callback(enum ggml_log_level level, const char * text, void * /*user_data*/) {
+    auto verbosity = common_get_verbosity(level);
+    if (verbosity <= common_log_verbosity_thold) {
+        common_log_add(common_log_main(), level, "%s", text);
+    }
+}
+
+void common_log_set_callback(struct common_log * log, ggml_log_callback callback, void * user_data) {
+    log->set_callback(callback, user_data);
 }

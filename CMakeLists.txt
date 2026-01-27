@@ -12,6 +12,8 @@ if (NOT XCODE AND NOT MSVC AND NOT CMAKE_BUILD_TYPE)
     set_property(CACHE CMAKE_BUILD_TYPE PROPERTY STRINGS "Debug" "Release" "MinSizeRel" "RelWithDebInfo")
 endif()
 
+message("CMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE}")
+
 # Add path to modules
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake/")
 
@@ -31,10 +33,24 @@ endif()
 
 option(LLAMA_USE_SYSTEM_GGML "Use system libggml" OFF)
 
+option(LLAMA_WASM_MEM64 "llama: use 64-bit memory in WASM builds" ON)
+
 if (EMSCRIPTEN)
     set(BUILD_SHARED_LIBS_DEFAULT OFF)
 
-    option(LLAMA_WASM_SINGLE_FILE "llama: embed WASM inside the generated llama.js" ON)
+    # Use 64-bit memory to support backend_get_memory queries
+    # TODO: analyze performance impact, see https://spidermonkey.dev/blog/2025/01/15/is-memory64-actually-worth-using
+    if (LLAMA_WASM_MEM64)
+      add_compile_options("-sMEMORY64=1")
+      add_link_options("-sMEMORY64=1")
+    endif()
+    add_link_options("-sALLOW_MEMORY_GROWTH=1")
+
+    option(LLAMA_WASM_SINGLE_FILE "llama: embed WASM inside the generated llama.js" OFF)
+    option(LLAMA_BUILD_HTML "llama: build HTML file" ON)
+    if (LLAMA_BUILD_HTML)
+        set(CMAKE_EXECUTABLE_SUFFIX ".html")
+    endif()
 else()
     if (MINGW)
         set(BUILD_SHARED_LIBS_DEFAULT OFF)
@@ -54,6 +70,12 @@ if (MSVC)
     add_compile_options("$<$<COMPILE_LANGUAGE:CXX>:/utf-8>")
     add_compile_options("$<$<COMPILE_LANGUAGE:C>:/bigobj>")
     add_compile_options("$<$<COMPILE_LANGUAGE:CXX>:/bigobj>")
+endif()
+
+if (CMAKE_SYSTEM_NAME STREQUAL "iOS")
+    set(LLAMA_TOOLS_INSTALL_DEFAULT OFF)
+else()
+    set(LLAMA_TOOLS_INSTALL_DEFAULT ${LLAMA_STANDALONE})
 endif()
 
 #
@@ -80,13 +102,19 @@ option(LLAMA_BUILD_TESTS    "llama: build tests"          ${LLAMA_STANDALONE})
 option(LLAMA_BUILD_TOOLS    "llama: build tools"          ${LLAMA_STANDALONE})
 option(LLAMA_BUILD_EXAMPLES "llama: build examples"       ${LLAMA_STANDALONE})
 option(LLAMA_BUILD_SERVER   "llama: build server example" ${LLAMA_STANDALONE})
+option(LLAMA_TOOLS_INSTALL  "llama: install tools"        ${LLAMA_TOOLS_INSTALL_DEFAULT})
 
 # specific extras
-option(LLAMA_MTMD "llama: multimodal support" OFF)
+option(LLAMA_MTMD "llama: multimodal support" ${LLAMA_BUILD_TOOLS})
 
 # 3rd party libs
 option(LLAMA_CURL       "llama: use libcurl to download model from an URL" ON)
+option(LLAMA_HTTPLIB    "llama: if libcurl is disabled, use httplib to download model from an URL" ON)
+option(LLAMA_OPENSSL    "llama: use openssl to support HTTPS" OFF)
 option(LLAMA_LLGUIDANCE "llama-common: include LLGuidance library for structured output in common utils" OFF)
+
+# profiling
+option(FORCE_GGML_VK_PERF_LOGGER "Force vk performance logging in ggml" OFF)
 
 # Required for relocatable CMake package
 include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/build-info.cmake)
@@ -193,6 +221,9 @@ endif()
 
 if (LLAMA_BUILD_COMMON)
     add_subdirectory(common)
+    if (LLAMA_HTTPLIB)
+        add_subdirectory(vendor/cpp-httplib)
+    endif()
 endif()
 
 if(LLAMA_BUILD_EXAMPLES OR LLAMA_BUILD_TESTS)
@@ -211,10 +242,8 @@ endif()
 
 if (LLAMA_BUILD_COMMON AND LLAMA_BUILD_TOOLS)
     add_subdirectory(tools)
-endif()
-
-if (LLAMA_MTMD)
-  add_subdirectory(tools/mtmd)
+elseif (LLAMA_MTMD)
+    add_subdirectory(tools/mtmd)
 endif()
 
 #
@@ -243,6 +272,12 @@ install(
     DESTINATION ${LLAMA_INCLUDE_INSTALL_DIR})
 
 if (LLAMA_BUILD_COMMON)
+
+  if (NOT LLAMA_CURL)
+    install(
+      TARGETS cpp-httplib
+      EXPORT llama-targets)
+  endif()
 
   install(
     TARGETS common build_info
@@ -296,6 +331,10 @@ install(
         GROUP_EXECUTE
         WORLD_READ
         WORLD_EXECUTE
+    DESTINATION ${CMAKE_INSTALL_BINDIR})
+
+install(
+    PROGRAMS vulkan_profiling_analyzer.py
     DESTINATION ${CMAKE_INSTALL_BINDIR})
 
 configure_file(cmake/llama.pc.in

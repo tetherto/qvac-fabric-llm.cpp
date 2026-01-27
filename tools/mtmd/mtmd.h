@@ -79,9 +79,16 @@ struct mtmd_context_params {
     bool use_gpu;
     bool print_timings;
     int n_threads;
-    enum ggml_log_level verbosity;
     const char * image_marker; // deprecated, use media_marker instead
     const char * media_marker;
+    enum llama_flash_attn_type flash_attn_type;
+    bool warmup; // whether to run a warmup encode pass after initialization
+
+    // limit number of image tokens, only for vision models with dynamic resolution
+    int image_min_tokens; // minimum number of tokens for image input (default: read from metadata)
+    int image_max_tokens; // maximum number of tokens for image input (default: read from metadata)
+
+    const char * backend_device; // optional GPU backend name (e.g. "CUDA", "Metal", "Vulkan"), if null will use env var or default
 };
 
 MTMD_API const char * mtmd_default_marker(void);
@@ -95,6 +102,14 @@ MTMD_API mtmd_context * mtmd_init_from_file(const char * mmproj_fname,
                                             const struct mtmd_context_params ctx_params);
 
 MTMD_API void mtmd_free(mtmd_context * ctx);
+
+// Set up logging to use llama's logging callback
+// This redirects all mtmd/clip logging through llama's logging system
+// Call this after llama_log_set to ensure mtmd uses the same logging callback
+// Example:
+//   llama_log_set(my_log_callback, my_user_data);
+//   mtmd_log_set_llama_callback(my_log_callback, my_user_data);
+MTMD_API void mtmd_log_set_llama_callback(ggml_log_callback llama_cb, void * llama_user_data);
 
 // whether we need to set non-causal mask before llama_decode
 MTMD_API bool mtmd_decode_use_non_causal(mtmd_context * ctx);
@@ -153,7 +168,7 @@ MTMD_API const mtmd_image_tokens *  mtmd_input_chunk_get_tokens_image(const mtmd
 MTMD_API size_t                     mtmd_input_chunk_get_n_tokens    (const mtmd_input_chunk * chunk);
 // returns nullptr for ID on text chunk
 MTMD_API const char *               mtmd_input_chunk_get_id          (const mtmd_input_chunk * chunk);
-// number of temporal positions (always 1 for M-RoPE, n_tokens otherwise)
+// number of temporal positions (equals to max(t,h,w) for M-RoPE; equals to n_tokens otherwise)
 MTMD_API llama_pos                  mtmd_input_chunk_get_n_pos       (const mtmd_input_chunk * chunk);
 
 // in case you want to use custom logic to handle the chunk (i.e. KV cache management)
@@ -171,7 +186,7 @@ MTMD_API size_t       mtmd_image_tokens_get_n_tokens(const mtmd_image_tokens * i
 MTMD_API size_t       mtmd_image_tokens_get_nx      (const mtmd_image_tokens * image_tokens);
 MTMD_API size_t       mtmd_image_tokens_get_ny      (const mtmd_image_tokens * image_tokens);
 MTMD_API const char * mtmd_image_tokens_get_id      (const mtmd_image_tokens * image_tokens); // TODO: deprecate
-// number of temporal positions (always 1 for M-RoPE, n_tokens otherwise)
+// number of temporal positions (equals to max(t,h,w) for M-RoPE; equals to n_tokens otherwise)
 MTMD_API llama_pos    mtmd_image_tokens_get_n_pos   (const mtmd_image_tokens * image_tokens); // TODO: deprecate
 
 // tokenize an input text prompt and a list of bitmaps (images/audio)
@@ -209,6 +224,10 @@ MTMD_API int32_t mtmd_encode_chunk(mtmd_context * ctx,
 // the reading size (in bytes) is equal to:
 // llama_model_n_embd(model) * mtmd_input_chunk_get_n_tokens(chunk) * sizeof(float)
 MTMD_API float * mtmd_get_output_embd(mtmd_context * ctx);
+
+// Set callback for all future logging events.
+// If this is not called, or NULL is supplied, everything is output on stderr.
+MTMD_API void mtmd_log_set(ggml_log_callback log_callback, void * user_data);
 
 /////////////////////////////////////////
 

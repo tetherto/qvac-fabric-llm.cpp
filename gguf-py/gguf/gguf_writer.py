@@ -4,6 +4,7 @@ import logging
 import os
 import shutil
 import struct
+import sys
 import tempfile
 from dataclasses import dataclass
 from enum import Enum, auto
@@ -138,8 +139,9 @@ class GGUFWriter:
                 size = prod(shape)
 
                 if "_exps." in name:
-                    expert_params += (size // shape[-3])
-                    expert_sum += shape[-3]
+                    expert_count = shape[-2 if ".bias" in name else -3]
+                    expert_params += (size // expert_count)
+                    expert_sum += expert_count
                     n_expert_tensors += 1
                 else:
                     shared_params += size
@@ -369,10 +371,15 @@ class GGUFWriter:
 
     def add_tensor(
         self, name: str, tensor: np.ndarray[Any, Any], raw_shape: Sequence[int] | None = None,
-        raw_dtype: GGMLQuantizationType | None = None,
+        raw_dtype: GGMLQuantizationType | None = None, tensor_endianess: GGUFEndian | None = None
     ) -> None:
-        if self.endianess == GGUFEndian.BIG:
-            tensor.byteswap(inplace=True)
+        # if tensor endianness is not passed, assume it's native to system
+        if tensor_endianess is None:
+            tensor_endianess = GGUFEndian.BIG if sys.byteorder == 'big' else GGUFEndian.LITTLE
+
+        if tensor_endianess != self.endianess:
+            # Don't byteswap inplace since lazy copies cannot handle it
+            tensor = tensor.byteswap(inplace=False)
         if self.use_temp_file and self.temp_file is None:
             fp = tempfile.SpooledTemporaryFile(mode="w+b", max_size=256 * 1024 * 1024)
             fp.seek(0)
@@ -393,13 +400,18 @@ class GGUFWriter:
         if pad != 0:
             fp.write(bytes([0] * pad))
 
-    def write_tensor_data(self, tensor: np.ndarray[Any, Any]) -> None:
+    def write_tensor_data(self, tensor: np.ndarray[Any, Any], tensor_endianess: GGUFEndian | None = None) -> None:
         if self.state is not WriterState.TI_DATA and self.state is not WriterState.WEIGHTS:
             raise ValueError(f'Expected output file to contain tensor info or weights, got {self.state}')
         assert self.fout is not None
 
-        if self.endianess == GGUFEndian.BIG:
-            tensor.byteswap(inplace=True)
+        # if tensor endianness is not passed, assume it's native to system
+        if tensor_endianess is None:
+            tensor_endianess = GGUFEndian.BIG if sys.byteorder == 'big' else GGUFEndian.LITTLE
+
+        if tensor_endianess != self.endianess:
+            # Don't byteswap inplace since lazy copies cannot handle it
+            tensor = tensor.byteswap(inplace=False)
 
         file_id = -1
         for i, tensors in enumerate(self.tensors):
@@ -494,6 +506,42 @@ class GGUFWriter:
 
     def add_file_type(self, ftype: int) -> None:
         self.add_uint32(Keys.General.FILE_TYPE, ftype)
+
+    def add_sampling_sequence(self, sequence: str) -> None:
+        self.add_string(Keys.General.SAMPLING_SEQUENCE, sequence)
+
+    def add_sampling_top_k(self, top_k: int) -> None:
+        self.add_int32(Keys.General.SAMPLING_TOP_K, top_k)
+
+    def add_sampling_top_p(self, top_p: float) -> None:
+        self.add_float32(Keys.General.SAMPLING_TOP_P, top_p)
+
+    def add_sampling_min_p(self, min_p: float) -> None:
+        self.add_float32(Keys.General.SAMPLING_MIN_P, min_p)
+
+    def add_sampling_xtc_probability(self, xtc_probability: float) -> None:
+        self.add_float32(Keys.General.SAMPLING_XTC_PROBABILITY, xtc_probability)
+
+    def add_sampling_xtc_threshold(self, xtc_threshold: float) -> None:
+        self.add_float32(Keys.General.SAMPLING_XTC_THRESHOLD, xtc_threshold)
+
+    def add_sampling_temp(self, temp: float) -> None:
+        self.add_float32(Keys.General.SAMPLING_TEMP, temp)
+
+    def add_sampling_penalty_last_n(self, penalty_last_n: int) -> None:
+        self.add_int32(Keys.General.SAMPLING_PENALTY_LAST_N, penalty_last_n)
+
+    def add_sampling_penalty_repeat(self, penalty_repeat: float) -> None:
+        self.add_float32(Keys.General.SAMPLING_PENALTY_REPEAT, penalty_repeat)
+
+    def add_sampling_mirostat(self, mirostat: int) -> None:
+        self.add_int32(Keys.General.SAMPLING_MIROSTAT, mirostat)
+
+    def add_sampling_mirostat_tau(self, mirostat_tau: float) -> None:
+        self.add_float32(Keys.General.SAMPLING_MIROSTAT_TAU, mirostat_tau)
+
+    def add_sampling_mirostat_eta(self, mirostat_eta: float) -> None:
+        self.add_float32(Keys.General.SAMPLING_MIROSTAT_ETA, mirostat_eta)
 
     def add_name(self, name: str) -> None:
         self.add_string(Keys.General.NAME, name)
@@ -669,11 +717,17 @@ class GGUFWriter:
     def add_expert_shared_feed_forward_length(self, length: int) -> None:
         self.add_uint32(Keys.LLM.EXPERT_SHARED_FEED_FORWARD_LENGTH.format(arch=self.arch), length)
 
+    def add_expert_chunk_feed_forward_length(self, length: int) -> None:
+        self.add_uint32(Keys.LLM.EXPERT_CHUNK_FEED_FORWARD_LENGTH.format(arch=self.arch), length)
+
     def add_parallel_residual(self, use: bool) -> None:
         self.add_bool(Keys.LLM.USE_PARALLEL_RESIDUAL.format(arch=self.arch), use)
 
     def add_decoder_start_token_id(self, id: int) -> None:
         self.add_uint32(Keys.LLM.DECODER_START_TOKEN_ID.format(arch=self.arch), id)
+
+    def add_decoder_block_count(self, value: int) -> None:
+        self.add_uint32(Keys.LLM.DECODER_BLOCK_COUNT.format(arch=self.arch), value)
 
     def add_embedding_length_per_layer_input(self, value: int) -> None:
         self.add_uint32(Keys.LLM.EMBD_LENGTH_PER_LAYER_INP.format(arch=self.arch), value)
@@ -723,11 +777,18 @@ class GGUFWriter:
     def add_sliding_window_pattern(self, value: Sequence[bool]) -> None:
         self.add_array(Keys.Attention.SLIDING_WINDOW_PATTERN.format(arch=self.arch), value)
 
+    def add_dense_features_dims(self, dense:str, in_f:int, out_f:int) -> None:
+        self.add_uint32(Keys.LLM.DENSE_FEAT_IN_SIZE.format(arch=self.arch, dense=dense), in_f)
+        self.add_uint32(Keys.LLM.DENSE_FEAT_OUT_SIZE.format(arch=self.arch, dense=dense), out_f)
+
     def add_logit_scale(self, value: float) -> None:
         self.add_float32(Keys.LLM.LOGIT_SCALE.format(arch=self.arch), value)
 
     def add_attn_logit_softcapping(self, value: float) -> None:
         self.add_float32(Keys.LLM.ATTN_LOGIT_SOFTCAPPING.format(arch=self.arch), value)
+
+    def add_router_logit_softcapping(self, value: float) -> None:
+        self.add_float32(Keys.LLM.ROUTER_LOGIT_SOFTCAPPING.format(arch=self.arch), value)
 
     def add_final_logit_softcapping(self, value: float) -> None:
         self.add_float32(Keys.LLM.FINAL_LOGIT_SOFTCAPPING.format(arch=self.arch), value)
@@ -741,6 +802,12 @@ class GGUFWriter:
     def add_expert_shared_count(self, count: int) -> None:
         self.add_uint32(Keys.LLM.EXPERT_SHARED_COUNT.format(arch=self.arch), count)
 
+    def add_expert_group_count(self, count: int) -> None:
+        self.add_uint32(Keys.LLM.EXPERT_GROUP_COUNT.format(arch=self.arch), count)
+
+    def add_expert_group_used_count(self, count: int) -> None:
+        self.add_uint32(Keys.LLM.EXPERT_GROUP_USED_COUNT.format(arch=self.arch), count)
+
     def add_expert_weights_scale(self, value: float) -> None:
         self.add_float32(Keys.LLM.EXPERT_WEIGHTS_SCALE.format(arch=self.arch), value)
 
@@ -750,8 +817,17 @@ class GGUFWriter:
     def add_expert_gating_func(self, value: ExpertGatingFuncType) -> None:
         self.add_uint32(Keys.LLM.EXPERT_GATING_FUNC.format(arch=self.arch), value.value)
 
+    def add_expert_group_scale(self, value: float) -> None:
+        self.add_float32(Keys.LLM.EXPERT_GROUP_SCALE.format(arch=self.arch), value)
+
+    def add_experts_per_group(self, count: int) -> None:
+        self.add_uint32(Keys.LLM.EXPERTS_PER_GROUP.format(arch=self.arch), count)
+
     def add_moe_every_n_layers(self, value: int) -> None:
         self.add_uint32(Keys.LLM.MOE_EVERY_N_LAYERS.format(arch=self.arch), value)
+
+    def add_nextn_predict_layers(self, count: int) -> None:
+        self.add_uint32(Keys.LLM.NEXTN_PREDICT_LAYERS.format(arch=self.arch), count)
 
     def add_swin_norm(self, value: bool) -> None:
         self.add_bool(Keys.LLM.SWIN_NORM.format(arch=self.arch), value)
@@ -822,8 +898,20 @@ class GGUFWriter:
     def add_attention_scale(self, value: float) -> None:
         self.add_float32(Keys.Attention.SCALE.format(arch=self.arch), value)
 
+    def add_attn_output_scale(self, value: float) -> None:
+        self.add_float32(Keys.Attention.OUTPUT_SCALE.format(arch=self.arch), value)
+
+    def add_attn_temperature_length(self, value: int) -> None:
+        self.add_uint32(Keys.Attention.TEMPERATURE_LENGTH.format(arch=self.arch), value)
+
+    def add_attn_temperature_scale(self, value: float) -> None:
+        self.add_float32(Keys.Attention.TEMPERATURE_SCALE.format(arch=self.arch), value)
+
     def add_pooling_type(self, value: PoolingType) -> None:
         self.add_uint32(Keys.LLM.POOLING_TYPE.format(arch=self.arch), value.value)
+
+    def add_num_deepstack_layers(self, count: int) -> None:
+        self.add_uint32(Keys.LLM.NUM_DEEPSTACK_LAYERS.format(arch=self.arch), count)
 
     def add_rope_dimension_count(self, count: int) -> None:
         self.add_uint32(Keys.Rope.DIMENSION_COUNT.format(arch=self.arch), count)
@@ -851,6 +939,18 @@ class GGUFWriter:
 
     def add_rope_scaling_yarn_log_mul(self, value: float) -> None:
         self.add_float32(Keys.Rope.SCALING_YARN_LOG_MUL.format(arch=self.arch), value)
+
+    def add_rope_scaling_yarn_ext_factor(self, value: float) -> None:
+        self.add_float32(Keys.Rope.SCALING_YARN_EXT_FACTOR.format(arch=self.arch), value)
+
+    def add_rope_scaling_yarn_attn_factor(self, value: float) -> None:
+        self.add_float32(Keys.Rope.SCALING_YARN_ATTN_FACTOR.format(arch=self.arch), value)
+
+    def add_rope_scaling_yarn_beta_fast(self, value: float) -> None:
+        self.add_float32(Keys.Rope.SCALING_YARN_BETA_FAST.format(arch=self.arch), value)
+
+    def add_rope_scaling_yarn_beta_slow(self, value: float) -> None:
+        self.add_float32(Keys.Rope.SCALING_YARN_BETA_SLOW.format(arch=self.arch), value)
 
     def add_ssm_conv_kernel(self, value: int) -> None:
         self.add_uint32(Keys.SSM.CONV_KERNEL.format(arch=self.arch), value)
@@ -1000,6 +1100,9 @@ class GGUFWriter:
     def add_vision_image_size(self, value: int) -> None:
         self.add_uint32(Keys.ClipVision.IMAGE_SIZE, value)
 
+    def add_vision_preproc_image_size(self, value: int) -> None:
+        self.add_uint32(Keys.ClipVision.PREPROC_IMAGE_SIZE, value)
+
     def add_vision_image_mean(self, values: Sequence[float]) -> None:
         self.add_array(Keys.ClipVision.IMAGE_MEAN, values)
 
@@ -1020,6 +1123,9 @@ class GGUFWriter:
 
     def add_vision_n_wa_pattern(self, value: int) -> None:
         self.add_uint32(Keys.ClipVision.N_WA_PATTERN, value)
+
+    def add_vision_is_deepstack_layers(self, layers: Sequence[bool]) -> None:
+        self.add_array(Keys.ClipVision.IS_DEEPSTACK_LAYERS, layers)
 
     # audio models
 
@@ -1046,6 +1152,23 @@ class GGUFWriter:
 
     def add_audio_stack_factor(self, value: int) -> None:
         self.add_uint32(Keys.ClipAudio.Projector.STACK_FACTOR, value)
+
+    def add_xielu_alpha_p(self, values: Sequence[float]):
+        self.add_array(Keys.xIELU.ALPHA_P, values)
+
+    def add_xielu_alpha_n(self, values: Sequence[float]):
+        self.add_array(Keys.xIELU.ALPHA_N, values)
+
+    def add_xielu_beta(self, values: Sequence[float]):
+        self.add_array(Keys.xIELU.BETA, values)
+
+    def add_xielu_eps(self, values: Sequence[float]):
+        self.add_array(Keys.xIELU.EPS, values)
+
+    # diffusion models
+
+    def add_diffusion_shift_logits(self, value: bool) -> None:
+        self.add_bool(Keys.Diffusion.SHIFT_LOGITS, value)
 
     def _pack(self, fmt: str, value: Any, skip_pack_prefix: bool = False) -> bytes:
         pack_prefix = ''
