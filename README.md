@@ -10,6 +10,13 @@
 
 LLM inference in C/C++
 
+## News
+- [2026.01.22] BitNet fine tuning is now officially supported! Read our full announcement and technical deep dive in these blog posts:  
+    - [Fabric-LLM-Finetune: General Overview](https://huggingface.co/blog/qvac/fabric-llm-finetune)
+    - [Fabric-LLM-Finetune with BitNet Support](https://huggingface.co/blog/qvac/fabric-llm-finetune-bitnet)
+
+
+
 ## LoRA Fine-Tuning
 
 llama.cpp includes native [LoRA](https://arxiv.org/abs/2106.09685) (Low-Rank Adaptation) fine-tuning across CPU, Vulkan, Metal and CUDA backends.
@@ -24,6 +31,10 @@ LoRA fine-tuning represents the weight updates with two smaller matrices through
 - Compatible with Qwen3, Gemma, LLaMA, TinyLlama, and other GGUF models
 
 The [Finetuning Guide](examples/training//README.md) has more details.
+
+### BitNet Support 
+BitNet introduced an extreme quantization scheme that represents weights using only 1.58 bits. BitNet's quantization technique greatly reduces memory constraint and makes fine tuning possible on edge devices. This branch presents the world's first framework to enable fine-tuning of BitNet models using Low-Rank Adaptation (LoRA) on GPUs. Built on llama.cpp with a Vulkan backend, the framework supports BitNet model fine-tuning with LoRA across heterogeneous consumer GPUs. By bringing BitNet to GPUs, the framework enables fine-tuning on edge devices and achieves substantial performance improvements over CPU-based implementations.
+
 
 ## Contributing
 
