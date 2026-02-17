@@ -273,7 +273,7 @@ install(
 
 if (LLAMA_BUILD_COMMON)
 
-  if (NOT LLAMA_CURL)
+  if (NOT LLAMA_CURL AND LLAMA_HTTPLIB)
     install(
       TARGETS cpp-httplib
       EXPORT llama-targets)
