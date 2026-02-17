@@ -136,8 +136,8 @@ void dequantize_tq2_0(device const block_tq2_0 * xb, short il, thread type4x4 & 
 
     il = (il/2)%4;
 
-    constant half  coef_lut[4] = { 1.h, 1/4.h, 1/16.h, 1/64.h };
-    constant uchar mask_lut[4] = { 3, 12, 48, 192 };
+    const half  coef_lut[4] = { 1.h, 1/4.h, 1/16.h, 1/64.h };
+    const uchar mask_lut[4] = { 3, 12, 48, 192 };
     half  coef = coef_lut[il];
     uchar mask = mask_lut[il];
     const half dl = d * coef;
