@@ -383,36 +383,31 @@ const struct ggml_type_traits_cpu * ggml_get_type_traits_cpu(enum ggml_type type
     return &type_traits_cpu[type];
 }
 
-static void ggml_cpu_select_vec_dot(
-        const struct ggml_tensor * src0,
-        const struct ggml_tensor * src1,
-        ggml_vec_dot_t * vec_dot,
-        enum ggml_type * vec_dot_type) {
+struct vec_dot_selection {
+    ggml_vec_dot_t vec_dot;
+    enum ggml_type vec_dot_type;
+};
 
-    if (vec_dot != NULL) {
-        *vec_dot = type_traits_cpu[src0->type].vec_dot;
-    }
-    if (vec_dot_type != NULL) {
-        *vec_dot_type = type_traits_cpu[src0->type].vec_dot_type;
-    }
+static struct vec_dot_selection ggml_cpu_select_vec_dot(
+        const struct ggml_tensor * src0,
+        const struct ggml_tensor * src1) {
+
+    struct vec_dot_selection selection = {
+        .vec_dot      = type_traits_cpu[src0->type].vec_dot,
+        .vec_dot_type = type_traits_cpu[src0->type].vec_dot_type,
+    };
 
     if (src0->type == GGML_TYPE_TQ2_0 && src1 != NULL) {
         if (src1->type == GGML_TYPE_Q8_1) {
-            if (vec_dot != NULL) {
-                *vec_dot = ggml_vec_dot_tq2_0_q8_1;
-            }
-            if (vec_dot_type != NULL) {
-                *vec_dot_type = GGML_TYPE_Q8_1;
-            }
+            selection.vec_dot      = ggml_vec_dot_tq2_0_q8_1;
+            selection.vec_dot_type = GGML_TYPE_Q8_1;
         } else if (src1->type == GGML_TYPE_Q8_0) {
-            if (vec_dot != NULL) {
-                *vec_dot = ggml_vec_dot_tq2_0_q8_0;
-            }
-            if (vec_dot_type != NULL) {
-                *vec_dot_type = GGML_TYPE_Q8_0;
-            }
+            selection.vec_dot      = ggml_vec_dot_tq2_0_q8_0;
+            selection.vec_dot_type = GGML_TYPE_Q8_0;
         }
     }
+
+    return selection;
 }
 
 //
@@ -1241,9 +1236,9 @@ void ggml_compute_forward_mul_mat(
     const int ith = params->ith;
     const int nth = params->nth;
 
-    ggml_vec_dot_t vec_dot;
-    enum ggml_type vec_dot_type;
-    ggml_cpu_select_vec_dot(src0, src1, &vec_dot, &vec_dot_type);
+    struct vec_dot_selection vds = ggml_cpu_select_vec_dot(src0, src1);
+    ggml_vec_dot_t    vec_dot      = vds.vec_dot;
+    enum ggml_type    vec_dot_type = vds.vec_dot_type;
     ggml_from_float_t const from_float = type_traits_cpu[vec_dot_type].from_float;
     int64_t const vec_dot_num_rows = type_traits_cpu[src0->type].nrows;
 
@@ -1521,7 +1516,11 @@ static void ggml_compute_forward_mul_mat_id(
 
     ggml_vec_dot_t vec_dot;
     enum ggml_type vec_dot_type;
-    ggml_cpu_select_vec_dot(src0, src1, &vec_dot, &vec_dot_type);
+    {
+        struct vec_dot_selection vds = ggml_cpu_select_vec_dot(src0, src1);
+        vec_dot      = vds.vec_dot;
+        vec_dot_type = vds.vec_dot_type;
+    }
     ggml_from_float_t const from_float      = type_traits_cpu[vec_dot_type].from_float;
 
     // we don't support permuted src0 or src1
@@ -2786,10 +2785,8 @@ struct ggml_cplan ggml_graph_plan(
                     } break;
                 case GGML_OP_MUL_MAT:
                     {
-                        ggml_vec_dot_t vec_dot_tmp;
-                        enum ggml_type vec_dot_type;
-                        ggml_cpu_select_vec_dot(node->src[0], node->src[1], &vec_dot_tmp, &vec_dot_type);
-                        GGML_UNUSED(vec_dot_tmp);
+                        struct vec_dot_selection vds = ggml_cpu_select_vec_dot(node->src[0], node->src[1]);
+                        enum ggml_type vec_dot_type = vds.vec_dot_type;
 
                         if (node->src[1]->type != vec_dot_type) {
                             cur = ggml_row_size(vec_dot_type, ggml_nelements(node->src[1]));
@@ -2801,10 +2798,8 @@ struct ggml_cplan ggml_graph_plan(
                         const struct ggml_tensor * src0 = node->src[0];
                         const struct ggml_tensor * src1 = node->src[1];
                         const struct ggml_tensor * ids = node->src[2];
-                        ggml_vec_dot_t vec_dot_tmp;
-                        enum ggml_type vec_dot_type;
-                        ggml_cpu_select_vec_dot(src0, src1, &vec_dot_tmp, &vec_dot_type);
-                        GGML_UNUSED(vec_dot_tmp);
+                        struct vec_dot_selection vds = ggml_cpu_select_vec_dot(src0, src1);
+                        enum ggml_type vec_dot_type = vds.vec_dot_type;
                         const int n_as = src0->ne[2];
                         // src1
                         if (src1->type != vec_dot_type) {
