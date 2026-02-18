@@ -287,7 +287,7 @@ if (LLAMA_BUILD_COMMON)
 
 endif()
 
-if (LLAMA_MTMD)
+if (LLAMA_MTMD AND TARGET mtmd)
 
   install(
     TARGETS mtmd
