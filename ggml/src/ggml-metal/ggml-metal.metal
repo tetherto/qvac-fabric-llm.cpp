@@ -1948,28 +1948,6 @@ kernel void kernel_silu_f32_4(
     dst[tpig] = x / (1.0f + exp(-x));
 }
 
-kernel void kernel_silu_back(
-        device const float * grad,
-        device const float * src1,
-        device       float * dst,
-        uint tpig[[thread_position_in_grid]]) {
-    const float dy = grad[tpig];
-    const float x  = src1[tpig];
-    const float s  = 1.0f/(1.0f + exp(-x));
-    dst[tpig] = dy*s*(1.0f + x*(1.0f - s));
-}
-
-kernel void kernel_silu_back_4(
-        device const float4 * grad,
-        device const float4 * src1,
-        device       float4 * dst,
-        uint tpig[[thread_position_in_grid]]) {
-    const float4 dy = grad[tpig];
-    const float4 x  = src1[tpig];
-    const float4 s  = 1.0f/(1.0f + exp(-x));
-    dst[tpig] = dy*s*(1.0f + x*(1.0f - s));
-}
-
 kernel void kernel_elu_f32(
         device const float * src0,
         device       float * dst,
