@@ -597,6 +597,12 @@ ggml_metal_pipeline_t ggml_metal_library_get_pipeline_mul_mv(ggml_metal_library_
                 nr0 = N_R0_Q8_0;
                 smem = 32*sizeof(float)*N_R0_Q8_0;
             } break;
+        case GGML_TYPE_TQ2_0:
+            {
+                nsg = N_SG_TQ2_0;
+                nr0 = N_R0_TQ2_0;
+                smem = 32*sizeof(float)*N_R0_TQ2_0;
+            } break;
         case GGML_TYPE_MXFP4:
             {
                 nsg = N_SG_MXFP4;
@@ -816,6 +822,12 @@ ggml_metal_pipeline_t ggml_metal_library_get_pipeline_mul_mv_id(ggml_metal_libra
                 nsg = N_SG_Q8_0;
                 nr0 = N_R0_Q8_0;
                 smem = 32*sizeof(float)*N_R0_Q8_0;
+            } break;
+        case GGML_TYPE_TQ2_0:
+            {
+                nsg = N_SG_TQ2_0;
+                nr0 = N_R0_TQ2_0;
+                smem = 32*sizeof(float)*N_R0_TQ2_0;
             } break;
         case GGML_TYPE_MXFP4:
             {
