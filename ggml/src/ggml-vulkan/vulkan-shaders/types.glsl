@@ -1374,6 +1374,40 @@ struct block_iq4_nl_packed16
 #define A_TYPE_PACKED16 block_iq4_nl_packed16
 #endif
 
+// TQ1_0
+#define QUANT_K_TQ1_0 256
+#define QUANT_R_TQ1_0 5
+
+struct block_tq1_0 {
+    uint8_t qs[(QUANT_K_TQ1_0 - 4 * QUANT_K_TQ1_0 / 64) / QUANT_R_TQ1_0]; // 5 elements per byte (3^5 = 243 < 256)
+    uint8_t qh[QUANT_K_TQ1_0/64]; // 4 elements per byte
+    float16_t d;
+};
+
+#if defined(DATA_A_TQ1_0)
+#define QUANT_K QUANT_K_TQ1_0
+#define QUANT_R QUANT_R_TQ1_0
+#define QUANT_AUXF 1
+#define A_TYPE block_tq1_0
+#endif
+
+// TQ2_0
+#define QUANT_K_TQ2_0 256
+#define QUANT_R_TQ2_0 4
+
+struct block_tq2_0
+{
+    uint8_t qs[QUANT_K_TQ2_0/QUANT_R_TQ2_0];  // 256/4 = 64 bytes
+    float16_t d;
+};
+
+#if defined(DATA_A_TQ2_0)
+#define QUANT_K QUANT_K_TQ2_0
+#define QUANT_R QUANT_R_TQ2_0
+#define QUANT_AUXF 1
+#define A_TYPE block_tq2_0
+#endif
+
 #define QUANT_K_MXFP4 32
 #define QUANT_R_MXFP4 2
 
