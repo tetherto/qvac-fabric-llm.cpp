@@ -5,6 +5,7 @@
 #endif
 
 #include <memory>
+#include <streambuf>
 #include <vector>
 
 #include "llama.h"
@@ -34,3 +35,8 @@ LLAMA_API struct llama_model * llama_model_load_from_buffer(std::vector<uint8_t>
                                                             struct llama_model_params params);
 LLAMA_API bool                 llama_model_load_fulfill_split_future(const char * path, const char * context,
                                                                      std::unique_ptr<std::basic_streambuf<char>> && streambuf);
+
+// Read uint32 metadata directly from GGUF metadata without loading tensors.
+LLAMA_API bool llama_model_meta_get_u32_from_file(const char * path_model, const char * key, uint32_t * value);
+LLAMA_API bool llama_model_meta_get_u32_from_splits(const char ** paths, size_t n_paths, const char * key, uint32_t * value);
+LLAMA_API bool llama_model_meta_get_u32_from_streambuf(std::basic_streambuf<char> & streambuf, const char * key, uint32_t * value);
