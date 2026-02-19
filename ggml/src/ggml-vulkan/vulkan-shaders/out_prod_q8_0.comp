@@ -1,8 +1,8 @@
 #version 450
 
-#include "types.comp"
-#include "generic_binary_head.comp"
-#include "dequant_funcs.comp"
+#include "types.glsl"
+#include "generic_binary_head.glsl"
+#include "dequant_funcs.glsl"
 
 const uint quant_group_sz = 2;
 const uint num_threads = 512 / quant_group_sz;

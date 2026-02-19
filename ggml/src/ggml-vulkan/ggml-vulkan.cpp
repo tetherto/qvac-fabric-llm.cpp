@@ -12427,7 +12427,7 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
 
         break;
     case GGML_OP_GEGLU_BACK:
-        ggml_vk_geglu_back(ctx, compute_ctx, src0, src1, node, dryrun);
+        ggml_vk_geglu_back(ctx, compute_ctx, src0, src1, node);
 
         break;
     case GGML_OP_NORM:
