@@ -135,7 +135,8 @@ FLOAT_TYPE mul_q8_1(const int32_t q_sum, const float da, const vec2 dsb, const i
 #if defined(DATA_A_QUANT_LEGACY) || defined(DATA_A_MXFP4)
 FLOAT_TYPE mmvq_dot_product(const uint ib_a, const uint iqs) {
     int32_t q_sum = 0;
-#if QUANT_R == 2
+
+#if QUANT_R == 2 || QUANT_R == 4
     const i32vec2 data_a_qs = repack(ib_a, iqs);
     q_sum += dotPacked4x8EXT(data_a_qs.x,
                              cache_b_qs[0]);
