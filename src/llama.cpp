@@ -333,24 +333,6 @@ struct llama_model * llama_model_load_from_buffer(std::vector<uint8_t> && data, 
     return llama_model_load_from_file_impl(ml, params);
 }
 
-namespace {
-bool llama_model_meta_get_u32_impl(
-        const struct gguf_context * meta,
-        const char * key,
-        uint32_t * value) {
-    if (meta == nullptr || key == nullptr || value == nullptr) {
-        return false;
-    }
-
-    const int key_id = gguf_find_key(meta, key);
-    if (key_id < 0 || gguf_get_kv_type(meta, key_id) != GGUF_TYPE_UINT32) {
-        return false;
-    }
-
-    *value = gguf_get_val_u32(meta, key_id);
-    return true;
-}
-
 std::vector<std::string> splits_from_c_paths(const char ** paths, size_t n_paths) {
     std::vector<std::string> splits;
     if (n_paths == 0) {
@@ -363,11 +345,29 @@ std::vector<std::string> splits_from_c_paths(const char ** paths, size_t n_paths
     }
     return splits;
 }
-}  // namespace
 
-bool llama_model_meta_get_u32_from_file(const char * path_model, const char * key, uint32_t * value) {
+MetaResultStatus llama_model_meta_get_u32(
+        metadata_handle_ptr meta_handle,
+        const char * key,
+        uint32_t * value) {
+    const struct gguf_context * meta = (struct gguf_context *) meta_handle;
+
+    if (meta == nullptr || key == nullptr || value == nullptr) {
+        return MetaResultStatus::INVALID_ARG;
+    }
+
+    const int key_id = gguf_find_key(meta, key);
+    if (key_id < 0 || gguf_get_kv_type(meta, key_id) != GGUF_TYPE_UINT32) {
+        return MetaResultStatus::KV_TYPE_NOT_UINT32;
+    }
+
+    *value = gguf_get_val_u32(meta, key_id);
+    return MetaResultStatus::SUCCESS;
+}
+
+MetaResultStatus llama_model_meta_from_file(const char * path_model, metadata_handle_ptr* out_meta_handle) {
     if (path_model == nullptr) {
-        return false;
+        return MetaResultStatus::INVALID_ARG;
     }
 
     struct gguf_init_params params = {
@@ -377,25 +377,18 @@ bool llama_model_meta_get_u32_from_file(const char * path_model, const char * ke
 
     gguf_context_ptr meta(gguf_init_from_file(path_model, params));
     if (!meta) {
-        return false;
+        return MetaResultStatus::GGUF_INIT_FAILED;
     }
 
-    return llama_model_meta_get_u32_impl(meta.get(), key, value);
+    *out_meta_handle = (metadata_handle_ptr) meta.get();
+
+    return MetaResultStatus::SUCCESS;
 }
 
-bool llama_model_meta_get_u32_from_splits(const char ** paths, size_t n_paths, const char * key, uint32_t * value) {
-    std::vector<std::string> splits = splits_from_c_paths(paths, n_paths);
-    if (splits.empty()) {
-        return false;
-    }
-
-    return llama_model_meta_get_u32_from_file(splits.front().c_str(), key, value);
-}
-
-bool llama_model_meta_get_u32_from_streambuf(std::basic_streambuf<char> & streambuf, const char * key, uint32_t * value) {
+MetaResultStatus llama_model_meta_from_streambuf(std::basic_streambuf<char> & streambuf, metadata_handle_ptr* out_meta_handle) {
     const auto current_pos = streambuf.pubseekoff(0, std::ios_base::cur, std::ios_base::in);
     if (streambuf.pubseekoff(0, std::ios_base::beg, std::ios_base::in) == std::streampos(std::streamoff(-1))) {
-        return false;
+        return MetaResultStatus::INVALID_ARG;
     }
 
     struct gguf_init_params params = {
@@ -404,13 +397,17 @@ bool llama_model_meta_get_u32_from_streambuf(std::basic_streambuf<char> & stream
     };
 
     gguf_context_ptr meta(gguf_init_from_buffer(streambuf, params));
-    const bool ok = meta && llama_model_meta_get_u32_impl(meta.get(), key, value);
 
     if (current_pos != std::streampos(std::streamoff(-1))) {
         streambuf.pubseekpos(current_pos, std::ios_base::in);
     }
 
-    return ok;
+    if (!meta) {
+        return MetaResultStatus::GGUF_INIT_FAILED;
+    }
+
+    *out_meta_handle = (metadata_handle_ptr) meta.get();
+    return MetaResultStatus::SUCCESS;
 }
 
 struct llama_model * llama_model_load_from_splits(const char ** paths, size_t n_paths,
