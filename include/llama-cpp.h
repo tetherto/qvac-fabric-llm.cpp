@@ -39,11 +39,23 @@ LLAMA_API bool                 llama_model_load_fulfill_split_future(const char 
 // Read uint32 metadata directly from GGUF metadata without loading tensors.
 enum MetaResultStatus {
     SUCCESS = 0,
-    INVALID_ARG = 1,
-    KV_TYPE_NOT_UINT32 = 2,
+    PATH_NULL = 1,
+    NULL_OUT_META_HANDLE = 2,
     GGUF_INIT_FAILED = 3,
+    META_HANDLE_NULL = 4,
+    KEY_NULL = 5,
+    VALUE_NULL = 6,
+    KEY_NOT_FOUND = 7,
+    KV_TYPE_NOT_UINT32 = 8,
+    STREAMBUF_SEEK_FAILED = 9,
 };
-typedef struct llama_metadata_handle * metadata_handle_ptr;
-LLAMA_API MetaResultStatus llama_model_meta_get_u32(metadata_handle_ptr meta_handle, const char * key, uint32_t * value);
-LLAMA_API MetaResultStatus llama_model_meta_from_file(const char * path_model, metadata_handle_ptr* out_meta_handle);
-LLAMA_API MetaResultStatus llama_model_meta_from_streambuf(std::basic_streambuf<char> & streambuf, metadata_handle_ptr* out_meta_handle);
+
+struct llama_metadata_handle;
+struct metadata_handle_deleter {
+    void operator()(struct llama_metadata_handle * ctx) const;
+};
+typedef std::unique_ptr<struct llama_metadata_handle, metadata_handle_deleter> metadata_handle_ptr;
+
+LLAMA_API MetaResultStatus llama_model_meta_get_u32(metadata_handle_ptr const & meta_handle, const char * key, uint32_t * value);
+LLAMA_API MetaResultStatus llama_model_meta_from_file(const char * path_model, metadata_handle_ptr * out_meta_handle);
+LLAMA_API MetaResultStatus llama_model_meta_from_streambuf(std::basic_streambuf<char> & streambuf, metadata_handle_ptr * out_meta_handle);
