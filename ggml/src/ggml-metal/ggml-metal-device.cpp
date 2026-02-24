@@ -1778,6 +1778,7 @@ ggml_metal_pipeline_t ggml_metal_library_get_pipeline_soft_max_back(ggml_metal_l
 
 ggml_metal_pipeline_t ggml_metal_library_get_pipeline_rms_norm_back(ggml_metal_library_t lib, const ggml_tensor * op) {
     assert(op->op == GGML_OP_RMS_NORM_BACK);
+    GGML_UNUSED(op);
 
     char base[256];
     char name[256];
