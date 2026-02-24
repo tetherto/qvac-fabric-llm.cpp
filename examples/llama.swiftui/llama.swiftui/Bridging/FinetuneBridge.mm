@@ -507,7 +507,8 @@ extern "C" enum llama_swift_finetune_error llama_swift_run_lora_finetune(
                         result_eval,
                         idata_split,
                         finetune_epoch_progress_callback,
-                        (idata_split < total_samples) ? finetune_epoch_progress_callback : nullptr);
+                        (idata_split < total_samples) ? finetune_epoch_progress_callback : nullptr,
+                        0);
 
         double train_loss = 0.0;
         double train_unc = 0.0;
