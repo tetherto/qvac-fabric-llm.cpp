@@ -513,6 +513,7 @@ static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
             ggml_set_name(opt_ctx->labels, "labels");
             opt_ctx->masks = ggml_new_tensor(ctx_results, GGML_TYPE_F32, GGML_MAX_DIMS, opt_ctx->outputs->ne);
             ggml_set_input(opt_ctx->masks);
+            ggml_set_output(opt_ctx->masks);
             ggml_set_name(opt_ctx->masks, "masks");
             opt_ctx->loss = ggml_cross_entropy_loss_masked(ctx_results, opt_ctx->outputs, opt_ctx->labels, opt_ctx->masks);
             ggml_set_name(opt_ctx->loss, "loss_cross_entropy_masked");

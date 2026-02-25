@@ -956,6 +956,11 @@ struct vk_device_struct {
     vk_pipeline pipeline_cumsum_small_f32;
     vk_pipeline pipeline_cumsum_multipass1_f32;
     vk_pipeline pipeline_cumsum_multipass2_f32;
+    vk_pipeline pipeline_out_prod_f32;
+    vk_pipeline pipeline_out_prod_f16_f32;
+    vk_pipeline pipeline_out_prod_q4_0;
+    vk_pipeline pipeline_out_prod_q8_0;
+    vk_pipeline pipeline_out_prod_tq2_0;
     vk_pipeline pipeline_argmax_f32;
     vk_pipeline pipeline_count_equal_i32;
     vk_pipeline pipeline_dsv4_hc_comb_f32;
@@ -971,10 +976,6 @@ struct vk_device_struct {
     vk_pipeline pipeline_col2im_1d_f32;
     vk_pipeline pipeline_col2im_1d_f16;
     vk_pipeline pipeline_col2im_1d_bf16;
-    vk_pipeline pipeline_out_prod_f32;
-    vk_pipeline pipeline_out_prod_f16_f32;
-    vk_pipeline pipeline_out_prod_q4_0;
-    vk_pipeline pipeline_out_prod_q8_0;
     vk_pipeline pipeline_snake_f32;
     vk_pipeline pipeline_snake_f16;
     vk_pipeline pipeline_snake_bf16;
