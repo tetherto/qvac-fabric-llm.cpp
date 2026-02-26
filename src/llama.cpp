@@ -385,8 +385,9 @@ MetaResultStatus llama_model_meta_from_file(const char * path_model, metadata_ha
         return MetaResultStatus::NULL_OUT_META_HANDLE;
     }
     struct gguf_init_params params = {
-        /*.no_alloc = */ true,
-        /*.ctx      = */ nullptr,
+        /*.no_alloc  = */ true,
+        /*.ctx       = */ nullptr,
+        /*.kv_only   = */ true,
     };
 
     gguf_context_ptr meta(gguf_init_from_file(path_model, params));
@@ -407,8 +408,9 @@ MetaResultStatus llama_model_meta_from_streambuf(std::basic_streambuf<char> & st
         return MetaResultStatus::STREAMBUF_SEEK_FAILED;
     }
     struct gguf_init_params params = {
-        /*.no_alloc = */ true,
-        /*.ctx      = */ nullptr,
+        /*.no_alloc  = */ true,
+        /*.ctx       = */ nullptr,
+        /*.kv_only   = */ true,
     };
 
     gguf_context_ptr meta(gguf_init_from_buffer(streambuf, params));
