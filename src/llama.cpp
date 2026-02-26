@@ -333,6 +333,7 @@ struct llama_model * llama_model_load_from_buffer(std::vector<uint8_t> && data, 
     return llama_model_load_from_file_impl(ml, params);
 }
 
+namespace {
 std::vector<std::string> splits_from_c_paths(const char ** paths, size_t n_paths) {
     std::vector<std::string> splits;
     if (n_paths == 0) {
@@ -345,6 +346,7 @@ std::vector<std::string> splits_from_c_paths(const char ** paths, size_t n_paths
     }
     return splits;
 }
+}  // namespace
 
 void metadata_handle_deleter::operator()(struct llama_metadata_handle * ctx) const {
     gguf_free(reinterpret_cast<struct gguf_context *>(ctx));
