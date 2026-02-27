@@ -37,7 +37,7 @@ LLAMA_API bool                 llama_model_load_fulfill_split_future(const char 
                                                                      std::unique_ptr<std::basic_streambuf<char>> && streambuf);
 
 // Read uint32 metadata directly from GGUF metadata without loading tensors.
-enum MetaResultStatus {
+enum class MetaResultStatus {
     SUCCESS = 0,
     PATH_NULL = 1,
     NULL_OUT_META_HANDLE = 2,
