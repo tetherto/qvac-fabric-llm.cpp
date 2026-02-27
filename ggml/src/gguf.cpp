@@ -688,6 +688,10 @@ static struct gguf_context * gguf_init_from_reader(const struct gguf_reader & gr
         }
     }
 
+    if (params.kv_only) {
+        return ctx;
+    }
+
     // read the tensor info
     std::unordered_set<std::string> seen_tensor_names;
 
