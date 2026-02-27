@@ -228,7 +228,7 @@ void * ggml_vk_host_malloc(size_t size) {
 
     VmaAllocationCreateInfo alloc_info = {};
     alloc_info.usage = (dev0->prefer_host_memory ? VMA_MEMORY_USAGE_AUTO_PREFER_HOST : VMA_MEMORY_USAGE_AUTO);
-    alloc_info.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT |
+    alloc_info.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT |
         VMA_ALLOCATION_CREATE_MAPPED_BIT;
 
     vk_buffer buf;
