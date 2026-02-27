@@ -117,13 +117,17 @@ llama_context::llama_context(
     }
 
     // ref: https://github.com/ggml-org/llama.cpp/pull/17046#discussion_r2503085732
-    cparams.n_ctx = GGML_PAD(cparams.n_ctx, 256);
+    if (!cparams.training) {
+        cparams.n_ctx = GGML_PAD(cparams.n_ctx, 256);
+    }
 
     if (cparams.kv_unified) {
         cparams.n_ctx_seq = cparams.n_ctx;
     } else {
         cparams.n_ctx_seq = cparams.n_ctx / cparams.n_seq_max;
-        cparams.n_ctx_seq = GGML_PAD(cparams.n_ctx_seq, 256);
+        if (!cparams.training) {
+            cparams.n_ctx_seq = GGML_PAD(cparams.n_ctx_seq, 256);
+        }
 
         if (cparams.n_ctx_seq == 0) {
             throw std::runtime_error("n_ctx_seq == 0");
@@ -234,8 +238,7 @@ llama_context::llama_context(
             auto * buft = ggml_backend_get_default_buffer_type(backend.get());
             auto backend_type = ggml_backend_dev_type(ggml_backend_get_device(backend.get()));
 
-            if (backend_type == GGML_BACKEND_DEVICE_TYPE_CPU && !model.devices.empty()) {
-                // use the host buffer of the first device CPU for faster transfer of the intermediate state
+            if (backend_type == GGML_BACKEND_DEVICE_TYPE_CPU && !model.devices.empty() && !cparams.training) {
                 auto * dev = model.devices[0];
                 auto * host_buft = ggml_backend_dev_host_buffer_type(dev);
                 if (host_buft) {
@@ -721,7 +724,7 @@ void llama_context::set_adapter_lora(
             llama_adapter_lora * adapter,
             float scale) {
     LLAMA_LOG_DEBUG("%s: adapter = %p, scale = %f\n", __func__, (void *) adapter, scale);
-    
+
     loras[adapter] = scale;
 }
 
@@ -1334,10 +1337,12 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
 
         auto * buft = ggml_backend_cpu_buffer_type();
         // try to use the host buffer of the device where the output tensor is allocated for faster transfer to system memory
-        auto * output_dev = model.dev_output();
-        auto * output_dev_host_buft = output_dev ? ggml_backend_dev_host_buffer_type(output_dev) : nullptr;
-        if (output_dev_host_buft) {
-            buft = output_dev_host_buft;
+        if (!cparams.training) {
+            auto * output_dev = model.dev_output();
+            auto * output_dev_host_buft = output_dev ? ggml_backend_dev_host_buffer_type(output_dev) : nullptr;
+            if (output_dev_host_buft) {
+                buft = output_dev_host_buft;
+            }
         }
         buf_output.reset(ggml_backend_buft_alloc_buffer(buft, new_size));
         if (buf_output == nullptr) {
@@ -2099,7 +2104,7 @@ void llama_context::opt_init(struct llama_model * model, struct llama_opt_params
     GGML_ASSERT(model->hparams.n_ctx_train % n_batch  == 0);
     GGML_ASSERT(n_batch                    % n_ubatch == 0);
 
-    opt_loss_type = lopt_params.assistant_loss_only ? 
+    opt_loss_type = lopt_params.assistant_loss_only ?
         GGML_OPT_LOSS_TYPE_CROSS_ENTROPY_MASKED : GGML_OPT_LOSS_TYPE_CROSS_ENTROPY;
 
     ggml_opt_params opt_params = ggml_opt_default_params(sched.get(), opt_loss_type);
@@ -2150,7 +2155,7 @@ void llama_context::opt_init(struct llama_model * model, struct llama_opt_params
         }
     }
 
-    if (lopt_params.load_optimizer_state && lopt_params.checkpoint_path) {        
+    if (lopt_params.load_optimizer_state && lopt_params.checkpoint_path) {
         if (opt_load_state(lopt_params.checkpoint_path)) {
             pending_optimizer_checkpoint_path = lopt_params.checkpoint_path;
             should_load_optimizer_tensors = true;
@@ -2177,7 +2182,7 @@ void llama_context::opt_epoch_iter(
     const uint32_t n_ctx    = llama_model_n_ctx_train(&model);
     const uint32_t n_batch  = std::min(this->n_batch(),  n_ctx);
     const uint32_t n_ubatch = std::min(this->n_ubatch(), n_batch);
-    
+
     memory->clear(true);
 
     for (uint32_t pos_ctx = 0; pos_ctx < n_ctx; pos_ctx += n_batch) {
@@ -2256,7 +2261,7 @@ void llama_context::opt_epoch_iter(
             }
             ggml_opt_prepare_alloc(opt_ctx, ctx_compute_opt, gf, res->get_tokens(), res->get_logits());
             ggml_opt_alloc(opt_ctx, train);
-            
+
             // Load optimizer tensors on first training iteration if pending
             if (train && should_load_optimizer_tensors && !optimizer_tensors_loaded) {
                 if (ggml_opt_load_tensors(opt_ctx, pending_optimizer_checkpoint_path.c_str())) {
@@ -2282,11 +2287,11 @@ void llama_context::opt_epoch_iter(
                 const float onef = 1.0f;
                 for (uint32_t pos_ubatch = 0; pos_ubatch < n_ubatch; ++pos_ubatch) {
                     const uint32_t ilabel = pos_ctx + pos_batch + pos_ubatch;
-                    const uint32_t imask = pos_ctx + pos_batch + pos_ubatch;                    
+                    const uint32_t imask = pos_ctx + pos_batch + pos_ubatch;
                     if (masks && imask < masks_sparse.size() && masks_sparse[imask] == 0) {
                         continue;
                     }
-                    
+
                     GGML_ASSERT(labels_sparse[ilabel] < labels->ne[0]);
                     ggml_backend_tensor_set(labels, &onef, (pos_ubatch*labels->ne[0] + labels_sparse[ilabel])*sizeof(float), sizeof(float));
                 }
@@ -2298,7 +2303,7 @@ void llama_context::opt_epoch_iter(
                     const float onef = 1.0f;
                     for (uint32_t pos_ubatch = 0; pos_ubatch < n_ubatch; ++pos_ubatch) {
                         const uint32_t imask = pos_ctx + pos_batch + pos_ubatch;
-                        
+
                         if (imask < masks_sparse.size() && masks_sparse[imask] == 1) {
                             const size_t offset = (pos_ubatch * masks->ne[0] + 0) * sizeof(float);
                             ggml_backend_tensor_set(masks, &onef, offset, sizeof(float));
@@ -2371,7 +2376,7 @@ void llama_context::opt_epoch(
 
         if (opt_loss_type == GGML_OPT_LOSS_TYPE_CROSS_ENTROPY_MASKED && ggml_opt_dataset_masks(dataset)) {
             ggml_opt_dataset_get_batch_host_with_masks(dataset, tokens.data(), n_ctx*sizeof(llama_token), labels_sparse.data(), masks_sparse.data(), idata);
-            
+
         } else {
             ggml_opt_dataset_get_batch_host(dataset, tokens.data(), n_ctx*sizeof(llama_token), labels_sparse.data(), idata);
         }
