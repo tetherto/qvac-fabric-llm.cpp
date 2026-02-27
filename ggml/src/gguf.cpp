@@ -251,7 +251,7 @@ struct gguf_bytes_buffer_reader : public gguf_bytes_reader {
         size_t new_offset  = GGML_PAD(offset, alignment);
         size_t seek_offset = new_offset - offset;
 
-        auto result = streambuf.pubseekoff(seek_offset, std::ios_base::cur);
+        auto result = streambuf.pubseekoff(seek_offset, std::ios_base::cur, std::ios_base::in);
         if (result == std::streampos(-1)) {
             return 0;
         }
@@ -549,6 +549,10 @@ struct gguf_context * gguf_init_from_reader_impl(const struct gguf_reader& gr, s
             gguf_free(ctx);
             return nullptr;
         }
+    }
+
+    if (params.kv_only) {
+        return ctx;
     }
 
     // read the tensor info

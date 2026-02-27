@@ -15,7 +15,7 @@ int main(int argc, char * argv[]) {
     fclose(file);
 
     llama_backend_init();
-    auto params              = llama_model_params{};
+    auto params              = llama_model_default_params();
     params.use_mmap          = false;
     params.progress_callback = [](float progress, void * ctx) {
         (void) ctx;

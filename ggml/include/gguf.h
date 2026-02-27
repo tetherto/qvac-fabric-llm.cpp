@@ -74,6 +74,14 @@ extern "C" {
 
         // if not NULL, create a ggml_context and allocate the tensor data in it
         struct ggml_context ** ctx;
+
+        // if true, stop parsing immediately after the KV pairs and skip tensor info entirely;
+        // ctx is ignored when this flag is set
+#ifdef __cplusplus
+        bool kv_only = false;
+#else
+        bool kv_only;
+#endif
     };
 
     GGML_API struct gguf_context * gguf_init_empty(void);
