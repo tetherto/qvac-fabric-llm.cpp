@@ -375,15 +375,44 @@ void block_a_to_shmem(const uint buf_ib, const uint ib, const uint iqs) {
     const uint qh_idx = (iqs_k / 32) * 8 + iqs;
     const uint qh_shift = ((iqs_k % 32) / 8) * 2;
 
+#if defined(ADRENO)
+    uint16_t ql00 = (data_a_packed16[ib_k].ql[ql_idx * 2] >> ql_shift) & uint16_t(0x0F0F);
+    uint16_t qh00 = ((data_a_packed16[ib_k].qh[qh_idx * 2] >> qh_shift) & uint16_t(0x0303)) << 4;
+    int8_t lo00_0 = int8_t((ql00 & 0x00FF) | (qh00 & 0x00FF));
+    int8_t lo00_1 = int8_t(((ql00 >> 8) & 0x00FF) | ((qh00 >> 8) & 0x00FF));
+    const i8vec2 vals00 = i8vec2(lo00_0, lo00_1) - int8_t(32);
+
+    uint16_t ql01 = (data_a_packed16[ib_k].ql[ql_idx * 2 + 1] >> ql_shift) & uint16_t(0x0F0F);
+    uint16_t qh01 = ((data_a_packed16[ib_k].qh[qh_idx * 2 + 1] >> qh_shift) & uint16_t(0x0303)) << 4;
+    int8_t lo01_0 = int8_t((ql01 & 0x00FF) | (qh01 & 0x00FF));
+    int8_t lo01_1 = int8_t(((ql01 >> 8) & 0x00FF) | ((qh01 >> 8) & 0x00FF));
+    const i8vec2 vals01 = i8vec2(lo01_0, lo01_1) - int8_t(32);
+
+    uint32_t packed =
+        (uint32_t(uint8_t(vals00.x))      )
+        | (uint32_t(uint8_t(vals00.y)) <<  8)
+        | (uint32_t(uint8_t(vals01.x)) << 16)
+        | (uint32_t(uint8_t(vals01.y)) << 24);
+    buf_a[buf_ib].qs[iqs] = int32_t(packed);
+#else
     const i8vec2 vals00 = (unpack8(int32_t((data_a_packed16[ib_k].ql[ql_idx * 2    ] >> ql_shift) & uint16_t(0x0F0F))).xy |
                           unpack8(int32_t(((data_a_packed16[ib_k].qh[qh_idx * 2    ] >> qh_shift) & uint16_t(0x0303)) << 4)).xy) - int8_t(32);
     const i8vec2 vals01 = (unpack8(int32_t((data_a_packed16[ib_k].ql[ql_idx * 2 + 1] >> ql_shift) & uint16_t(0x0F0F))).xy |
                           unpack8(int32_t(((data_a_packed16[ib_k].qh[qh_idx * 2 + 1] >> qh_shift) & uint16_t(0x0303)) << 4)).xy) - int8_t(32);
     buf_a[buf_ib].qs[iqs] = pack32(i8vec4(vals00.x, vals00.y, vals01.x, vals01.y));
+#endif
 
     if (iqs == 0) {
         const uint is = iqs_k / 4;
+
+#if defined(ADRENO)
+        uint32_t packed = uint32_t(data_a_packed16[ib_k].scales[is / 2]);
+        int8_t s0 = int8_t(packed & 0xFF);
+        int8_t s1 = int8_t((packed >> 8) & 0xFF);
+        const i8vec2 scales = i8vec2(s0, s1);
+#else
         const i8vec2 scales = unpack8(int32_t(data_a_packed16[ib_k].scales[is / 2])).xy;
+#endif
 
         buf_a[buf_ib].d_scales = FLOAT_TYPE(data_a_packed16[ib_k].d) * FLOAT_TYPE_VEC2(scales);
     }
