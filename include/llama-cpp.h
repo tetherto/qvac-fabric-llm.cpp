@@ -6,6 +6,7 @@
 
 #include <memory>
 #include <streambuf>
+#include <string>
 #include <vector>
 
 #include "llama.h"
@@ -48,6 +49,7 @@ enum class MetaResultStatus {
     KEY_NOT_FOUND = 7,
     KV_TYPE_NOT_UINT32 = 8,
     STREAMBUF_SEEK_FAILED = 9,
+    KV_TYPE_NOT_STRING = 10,
 };
 
 struct llama_metadata_handle;
@@ -57,5 +59,6 @@ struct metadata_handle_deleter {
 typedef std::unique_ptr<struct llama_metadata_handle, metadata_handle_deleter> metadata_handle_ptr;
 
 LLAMA_API MetaResultStatus llama_model_meta_get_u32(metadata_handle_ptr const & meta_handle, const char * key, uint32_t * value);
+LLAMA_API MetaResultStatus llama_model_meta_get_str(metadata_handle_ptr const & meta_handle, const char * key, std::string * value);
 LLAMA_API MetaResultStatus llama_model_meta_from_file(const char * path_model, metadata_handle_ptr * out_meta_handle);
 LLAMA_API MetaResultStatus llama_model_meta_from_streambuf(std::basic_streambuf<char> & streambuf, metadata_handle_ptr * out_meta_handle);
