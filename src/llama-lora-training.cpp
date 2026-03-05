@@ -65,8 +65,13 @@ bool llama_lora_create_tensor_pair(
     const int64_t d1 = base_tensor->ne[1]; // output dim
     
     char lora_a_name[256], lora_b_name[256];
-    snprintf(lora_a_name, sizeof(lora_a_name), "%s.lora_a", base_name);
-    snprintf(lora_b_name, sizeof(lora_b_name), "%s.lora_b", base_name);
+    int ret_a = snprintf(lora_a_name, sizeof(lora_a_name), "%s.lora_a", base_name);
+    int ret_b = snprintf(lora_b_name, sizeof(lora_b_name), "%s.lora_b", base_name);
+    if (ret_a < 0 || ret_a >= (int) sizeof(lora_a_name) ||
+        ret_b < 0 || ret_b >= (int) sizeof(lora_b_name)) {
+        LLAMA_LOG_ERROR("LoRA tensor name too long: '%s'\n", base_name);
+        return false;
+    }
     
     // LoRA A: [d0, rank] - projects input to low rank
     *lora_a = ggml_new_tensor_2d(lora_ctx, GGML_TYPE_F32, d0, rank);
@@ -113,12 +118,15 @@ static void init_tensor_zeros(struct ggml_tensor * tensor) {
     }
 }
 
-void llama_lora_init_tensor_weights(struct ggml_tensor * lora_a, struct ggml_tensor * lora_b, float init_std) {
-    if (!lora_a || !lora_b) return;
+bool llama_lora_init_tensor_weights(struct ggml_tensor * lora_a, struct ggml_tensor * lora_b, float init_std) {
+    if (!lora_a || !lora_b || !lora_a->data || !lora_b->data) {
+        return false;
+    }
     
     // LoRA initialization: A ~ N(0, init_std), B = 0
     init_tensor_guassian(lora_a, init_std);
     init_tensor_zeros(lora_b);
+    return true;
 }
 
 bool llama_lora_allocate_buffers(
@@ -165,7 +173,6 @@ struct llama_adapter_lora * llama_lora_create_adapter(
         struct llama_model * model, 
         const struct llama_lora_training_params * params) {
 
-    // Create a new LoRA adapter instance
     llama_adapter_lora * adapter = new llama_adapter_lora();
     try {
         adapter->alpha = params->alpha;
@@ -238,9 +245,7 @@ struct llama_adapter_lora * llama_lora_create_adapter(
             const std::string & tensor_name = ab_pair.first;
             const llama_adapter_lora_weight & weight = ab_pair.second;
 
-            if (weight.a && weight.b && weight.a->data && weight.b->data) {
-                llama_lora_init_tensor_weights(weight.a, weight.b, params->init_std);
-            } else {
+            if (!llama_lora_init_tensor_weights(weight.a, weight.b, params->init_std)) {
                 throw std::runtime_error("LoRA tensor initialization failed for " + tensor_name);
             }
         }
