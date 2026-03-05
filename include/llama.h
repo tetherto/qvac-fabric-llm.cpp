@@ -1745,6 +1745,8 @@ extern "C" {
         bool assistant_loss_only;
     };
 
+    LLAMA_API struct llama_opt_params llama_opt_default_params(void);
+
     LLAMA_API void llama_opt_init(struct llama_context * lctx, struct llama_model * model, struct llama_opt_params lopt_params);
 
     LLAMA_API void llama_opt_epoch(
@@ -1801,6 +1803,7 @@ extern "C" {
         float    alpha;
         float    dropout;
         float    init_std;
+        uint32_t seed;       // seed for reproducible weight initialization (0 = non-deterministic)
     };
 
     // Initialize LoRA training with the given parameters

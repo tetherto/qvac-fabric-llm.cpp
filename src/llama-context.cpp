@@ -4920,6 +4920,20 @@ bool llama_opt_param_filter_all(const struct ggml_tensor * tensor, void * userda
     return true;
 }
 
+struct llama_opt_params llama_opt_default_params(void) {
+    return {
+        /*n_ctx_train          =*/ 0,
+        /*param_filter         =*/ llama_opt_param_filter_all,
+        /*param_filter_ud      =*/ nullptr,
+        /*get_opt_pars         =*/ nullptr,
+        /*get_opt_pars_ud      =*/ nullptr,
+        /*optimizer_type       =*/ GGML_OPT_OPTIMIZER_TYPE_ADAMW,
+        /*checkpoint_path      =*/ nullptr,
+        /*load_optimizer_state =*/ false,
+        /*assistant_loss_only  =*/ false,
+    };
+}
+
 void llama_opt_init(struct llama_context * ctx, struct llama_model * model, struct llama_opt_params lopt_params) {
     ctx->opt_init(model, lopt_params);
 }
