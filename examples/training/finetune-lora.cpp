@@ -940,7 +940,7 @@ int main(int argc, char ** argv) {
             LOG_INF("Checkpointing disabled, using standard progress callback\n");
         }
 
-        llama_opt_epoch(ctx, dataset, result_train, result_eval, idata_split,
+        llama_opt_epoch_resume(ctx, dataset, result_train, result_eval, idata_split,
             epoch_callback, epoch_callback, resume_batch);
         fprintf(stderr, "\n");
 
