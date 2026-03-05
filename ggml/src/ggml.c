@@ -6234,9 +6234,6 @@ struct ggml_tensor * ggml_cross_entropy_loss(
     // Initialize op_params to 0 (no masking)
     *(int32_t *)(result->op_params) = 0;
 
-    // Initialize op_params to 0 (no masking)
-    *(int32_t *)(result->op_params) = 0;
-
     return result;
 }
 

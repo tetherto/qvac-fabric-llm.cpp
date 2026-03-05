@@ -5323,6 +5323,20 @@ bool llama_opt_param_filter_all(const struct ggml_tensor * tensor, void * userda
     return true;
 }
 
+struct llama_opt_params llama_opt_default_params(void) {
+    return {
+        /*n_ctx_train          =*/ 0,
+        /*param_filter         =*/ llama_opt_param_filter_all,
+        /*param_filter_ud      =*/ nullptr,
+        /*get_opt_pars         =*/ nullptr,
+        /*get_opt_pars_ud      =*/ nullptr,
+        /*optimizer_type       =*/ GGML_OPT_OPTIMIZER_TYPE_ADAMW,
+        /*checkpoint_path      =*/ nullptr,
+        /*load_optimizer_state =*/ false,
+        /*assistant_loss_only  =*/ false,
+    };
+}
+
 void llama_opt_init(struct llama_context * ctx, struct llama_model * model, struct llama_opt_params lopt_params) {
     ctx->opt_init(model, lopt_params);
 }
@@ -5334,9 +5348,26 @@ void llama_opt_epoch(
         ggml_opt_result_t         result_eval,
         int64_t                   idata_split,
         ggml_opt_epoch_callback   callback_train,
+        ggml_opt_epoch_callback   callback_eval) {
+    ctx->opt_epoch(
+        dataset,
+        result_train,
+        result_eval,
+        idata_split,
+        callback_train,
+        callback_eval,
+        /*resume_from_batch=*/ -1);
+}
+
+void llama_opt_epoch_resume(
+        struct llama_context    * ctx,
+        ggml_opt_dataset_t        dataset,
+        ggml_opt_result_t         result_train,
+        ggml_opt_result_t         result_eval,
+        int64_t                   idata_split,
+        ggml_opt_epoch_callback   callback_train,
         ggml_opt_epoch_callback   callback_eval,
         int64_t                   resume_from_batch) {
-    // Use the unified API that handles both normal and resume cases
     ctx->opt_epoch(
         dataset,
         result_train,

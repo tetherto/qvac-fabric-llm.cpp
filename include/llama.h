@@ -1743,9 +1743,20 @@ extern "C" {
         bool assistant_loss_only;
     };
 
+    LLAMA_API struct llama_opt_params llama_opt_default_params(void);
+
     LLAMA_API void llama_opt_init(struct llama_context * lctx, struct llama_model * model, struct llama_opt_params lopt_params);
 
     LLAMA_API void llama_opt_epoch(
+            struct llama_context    * lctx,
+            ggml_opt_dataset_t        dataset,
+            ggml_opt_result_t         result_train,
+            ggml_opt_result_t         result_eval,
+            int64_t                   idata_split,
+            ggml_opt_epoch_callback   callback_train,
+            ggml_opt_epoch_callback   callback_eval);
+
+    LLAMA_API void llama_opt_epoch_resume(
             struct llama_context    * lctx,
             ggml_opt_dataset_t        dataset,
             ggml_opt_result_t         result_train,
@@ -1781,7 +1792,7 @@ extern "C" {
         LLAMA_LORA_TARGET_FFN_UP    = 1 << 5,
         LLAMA_LORA_TARGET_FFN_DOWN  = 1 << 6,
         LLAMA_LORA_TARGET_OUTPUT    = 1 << 7,
-        LLAMA_LORA_TARGET_ALL       = 0x1FF,
+        LLAMA_LORA_TARGET_ALL       = -1
     };
 
     struct llama_lora_training_params {
@@ -1790,6 +1801,7 @@ extern "C" {
         float    alpha;
         float    dropout;
         float    init_std;
+        uint32_t seed;       // seed for reproducible weight initialization (0 = non-deterministic)
     };
 
     // Initialize LoRA training with the given parameters
