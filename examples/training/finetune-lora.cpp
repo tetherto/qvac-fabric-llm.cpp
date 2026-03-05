@@ -502,6 +502,7 @@ struct finetune_params {
     bool auto_resume = false;
     std::string chat_template_path;
     bool assistant_loss_only = false;
+    uint32_t lora_seed = 42;
 };
 
 static bool parse_finetune_args(int& argc, char** argv, finetune_params& ft_params) {
@@ -534,6 +535,10 @@ static bool parse_finetune_args(int& argc, char** argv, finetune_params& ft_para
             i--;
         } else if (strcmp(argv[i], "--lora-alpha") == 0 && i + 1 < argc) {
             ft_params.lora_alpha = std::atof(argv[i + 1]);
+            remove_arg_pair(i);
+            i--;
+        } else if (strcmp(argv[i], "--lora-seed") == 0 && i + 1 < argc) {
+            ft_params.lora_seed = std::strtoul(argv[i + 1], nullptr, 10);
             remove_arg_pair(i);
             i--;
         } else if (strcmp(argv[i], "--lora-modules") == 0 && i + 1 < argc) {
@@ -650,7 +655,7 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
-    LOG_INF("Using LoRA parameters: rank=%d, alpha=%.1f\n", ft_params.lora_rank, ft_params.lora_alpha);
+    LOG_INF("Using LoRA parameters: rank=%d, alpha=%.1f, seed=%u\n", ft_params.lora_rank, ft_params.lora_alpha, ft_params.lora_seed);
     LOG_INF("Training for %d epochs\n", ft_params.num_epochs);
 
     // Handle checkpoint auto-resume before model initialization
@@ -727,6 +732,7 @@ int main(int argc, char ** argv) {
         /*alpha          =*/ ft_params.lora_alpha,
         /*dropout        =*/ 0.0f,
         /*init_std       =*/ 0.02f,
+        /*seed           =*/ ft_params.lora_seed,
     };
 
     bool has_existing_lora = !params.lora_adapters.empty();

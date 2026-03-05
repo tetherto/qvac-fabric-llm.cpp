@@ -88,12 +88,17 @@ static bool is_tensor_on_device(const struct ggml_tensor * tensor) {
     return tensor->buffer && !ggml_backend_buffer_is_host(tensor->buffer);
 }
 
-static void init_tensor_guassian(struct ggml_tensor * tensor, float std_dev) {
+static void init_tensor_guassian(struct ggml_tensor * tensor, float std_dev, uint32_t seed) {
     const size_t n_elements = ggml_nelements(tensor);
     std::vector<float> data(n_elements);
 
-    std::random_device rd;
-    std::mt19937 gen(rd());
+    std::mt19937 gen;
+    if (seed != 0) {
+        gen.seed(seed);
+    } else {
+        std::random_device rd;
+        gen.seed(rd());
+    }
     std::normal_distribution<float> dist(0.0f, std_dev);
     
     for (size_t i = 0; i < n_elements; i++) {
@@ -118,13 +123,13 @@ static void init_tensor_zeros(struct ggml_tensor * tensor) {
     }
 }
 
-bool llama_lora_init_tensor_weights(struct ggml_tensor * lora_a, struct ggml_tensor * lora_b, float init_std) {
+bool llama_lora_init_tensor_weights(struct ggml_tensor * lora_a, struct ggml_tensor * lora_b, float init_std, uint32_t seed) {
     if (!lora_a || !lora_b || !lora_a->data || !lora_b->data) {
         return false;
     }
     
     // LoRA initialization: A ~ N(0, init_std), B = 0
-    init_tensor_guassian(lora_a, init_std);
+    init_tensor_guassian(lora_a, init_std, seed);
     init_tensor_zeros(lora_b);
     return true;
 }
@@ -196,26 +201,17 @@ struct llama_adapter_lora * llama_lora_create_adapter(
                 continue;
             }
 
-            bool should_create_lora = false;
-            if (tensor_name.find("blk.") != std::string::npos) {
-                if ((params->target_modules & LLAMA_LORA_TARGET_ATTN_Q) && tensor_name.find("attn_q") != std::string::npos) {
-                    should_create_lora = true;
-                } else if ((params->target_modules & LLAMA_LORA_TARGET_ATTN_K) && tensor_name.find("attn_k") != std::string::npos) {
-                    should_create_lora = true;
-                } else if ((params->target_modules & LLAMA_LORA_TARGET_ATTN_V) && tensor_name.find("attn_v") != std::string::npos) {
-                    should_create_lora = true;
-                } else if ((params->target_modules & LLAMA_LORA_TARGET_ATTN_O) && tensor_name.find("attn_output") != std::string::npos) {
-                    should_create_lora = true;
-                } else if ((params->target_modules & LLAMA_LORA_TARGET_FFN_GATE) && tensor_name.find("ffn_gate") != std::string::npos) {
-                    should_create_lora = true;
-                } else if ((params->target_modules & LLAMA_LORA_TARGET_FFN_UP) && tensor_name.find("ffn_up") != std::string::npos) {
-                    should_create_lora = true;
-                } else if ((params->target_modules & LLAMA_LORA_TARGET_FFN_DOWN) && tensor_name.find("ffn_down") != std::string::npos) {
-                    should_create_lora = true;
-                }
-            } else if ((params->target_modules & LLAMA_LORA_TARGET_OUTPUT) && tensor_name.find("output") != std::string::npos) {
-                should_create_lora = true;
-            }
+            const bool is_blk = tensor_name.find("blk.") != std::string::npos;
+
+            const bool should_create_lora =
+                (is_blk && (params->target_modules & LLAMA_LORA_TARGET_ATTN_Q)    && tensor_name.find("attn_q")      != std::string::npos) ||
+                (is_blk && (params->target_modules & LLAMA_LORA_TARGET_ATTN_K)    && tensor_name.find("attn_k")      != std::string::npos) ||
+                (is_blk && (params->target_modules & LLAMA_LORA_TARGET_ATTN_V)    && tensor_name.find("attn_v")      != std::string::npos) ||
+                (is_blk && (params->target_modules & LLAMA_LORA_TARGET_ATTN_O)    && tensor_name.find("attn_output") != std::string::npos) ||
+                (is_blk && (params->target_modules & LLAMA_LORA_TARGET_FFN_GATE)  && tensor_name.find("ffn_gate")    != std::string::npos) ||
+                (is_blk && (params->target_modules & LLAMA_LORA_TARGET_FFN_UP)    && tensor_name.find("ffn_up")      != std::string::npos) ||
+                (is_blk && (params->target_modules & LLAMA_LORA_TARGET_FFN_DOWN)  && tensor_name.find("ffn_down")    != std::string::npos) ||
+                (          (params->target_modules & LLAMA_LORA_TARGET_OUTPUT)     && tensor_name.find("output")      != std::string::npos);
 
             if (should_create_lora && base_tensor->ne[1] > 0) {
                 struct ggml_tensor * lora_a = nullptr;
@@ -245,7 +241,7 @@ struct llama_adapter_lora * llama_lora_create_adapter(
             const std::string & tensor_name = ab_pair.first;
             const llama_adapter_lora_weight & weight = ab_pair.second;
 
-            if (!llama_lora_init_tensor_weights(weight.a, weight.b, params->init_std)) {
+            if (!llama_lora_init_tensor_weights(weight.a, weight.b, params->init_std, params->seed)) {
                 throw std::runtime_error("LoRA tensor initialization failed for " + tensor_name);
             }
         }

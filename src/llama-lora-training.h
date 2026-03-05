@@ -23,7 +23,8 @@ bool llama_lora_create_tensor_pair(
 bool llama_lora_init_tensor_weights(
     struct ggml_tensor * lora_a, 
     struct ggml_tensor * lora_b, 
-    float init_std);
+    float init_std,
+    uint32_t seed);
 
 struct llama_adapter_lora * llama_lora_create_adapter(
     struct llama_model * model, 

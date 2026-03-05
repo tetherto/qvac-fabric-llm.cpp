@@ -69,6 +69,7 @@ the base model frozen, making it memory-efficient.
   - Available: `attn_q`, `attn_k`, `attn_v`, `attn_o`, `ffn_gate`, `ffn_up`, `ffn_down`, `embed`, `output`, `all`
   - Default: `attn_q,attn_k,attn_v,attn_o` (attention modules)
 - `--output-adapter PATH` - Output adapter filename (default: auto-generated)
+- `--lora-seed N` - Seed for reproducible LoRA weight initialization (default: 0 = non-deterministic)
 
 #### Checkpointing
 - `--checkpoint-save-steps N` - Save checkpoint every N training steps (default: 100)
@@ -131,6 +132,7 @@ This file manages the complete lifecycle of LoRA adapters:
   - Matrix B: Initialized to zeros
   - This ensures ΔW = BA starts at zero (no adaptation initially)
   - Supports both CPU and GPU tensors via `ggml_backend_tensor_set()`
+  - Use `--lora-seed N` for reproducible initialization (0 = non-deterministic)
 
 3. **Buffer Allocation (`llama_lora_allocate_buffers()`):**
   - Auto-detects backend from base model (CPU/CUDA/Vulkan)
