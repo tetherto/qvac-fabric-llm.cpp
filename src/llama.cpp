@@ -346,16 +346,12 @@ std::vector<std::string> splits_from_c_paths(const char ** paths, size_t n_paths
     }
     return splits;
 }
-}  // namespace
 
-void metadata_handle_deleter::operator()(struct llama_metadata_handle * ctx) const {
-    gguf_free(reinterpret_cast<struct gguf_context *>(ctx));
-}
-
-MetaResultStatus llama_model_meta_get_u32(
-        metadata_handle_ptr const & meta_handle,
-        const char * key,
-        uint32_t * value) {
+template <gguf_type ExpectedType, MetaResultStatus TypeMismatchErr, typename T, typename F>
+MetaResultStatus llama_model_meta_get_impl(const metadata_handle_ptr & meta_handle,
+                                           const char *                key,
+                                           T *                         value,
+                                           F &&                        getter) {
     if (meta_handle.get() == nullptr) {
         return MetaResultStatus::META_HANDLE_NULL;
     }
@@ -365,16 +361,33 @@ MetaResultStatus llama_model_meta_get_u32(
     if (value == nullptr) {
         return MetaResultStatus::VALUE_NULL;
     }
-    const struct gguf_context * meta = reinterpret_cast<const struct gguf_context *>(meta_handle.get());
-    const int key_id = gguf_find_key(meta, key);
+    const struct gguf_context * meta   = reinterpret_cast<const struct gguf_context *>(meta_handle.get());
+    const int                   key_id = gguf_find_key(meta, key);
     if (key_id < 0) {
         return MetaResultStatus::KEY_NOT_FOUND;
     }
-    if (gguf_get_kv_type(meta, key_id) != GGUF_TYPE_UINT32) {
-        return MetaResultStatus::KV_TYPE_NOT_UINT32;
+    if (gguf_get_kv_type(meta, key_id) != ExpectedType) {
+        return TypeMismatchErr;
     }
-    *value = gguf_get_val_u32(meta, key_id);
+    *value = getter(meta, key_id);
     return MetaResultStatus::SUCCESS;
+}
+}  // namespace
+
+void metadata_handle_deleter::operator()(struct llama_metadata_handle * ctx) const {
+    gguf_free(reinterpret_cast<struct gguf_context *>(ctx));
+}
+
+MetaResultStatus llama_model_meta_get_u32(const metadata_handle_ptr & meta_handle, const char * key, uint32_t * value) {
+    return llama_model_meta_get_impl<GGUF_TYPE_UINT32, MetaResultStatus::KV_TYPE_NOT_UINT32>(meta_handle, key, value,
+                                                                                             gguf_get_val_u32);
+}
+
+MetaResultStatus llama_model_meta_get_str(const metadata_handle_ptr & meta_handle,
+                                          const char *                key,
+                                          std::string *               value) {
+    return llama_model_meta_get_impl<GGUF_TYPE_STRING, MetaResultStatus::KV_TYPE_NOT_STRING>(meta_handle, key, value,
+                                                                                             gguf_get_val_str);
 }
 
 MetaResultStatus llama_model_meta_from_file(const char * path_model, metadata_handle_ptr * out_meta_handle) {
