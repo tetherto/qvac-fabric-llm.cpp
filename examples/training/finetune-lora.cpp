@@ -341,8 +341,8 @@ static bool save_checkpoint(llama_context* ctx, llama_adapter_lora* adapter,  co
         LOG_ERR("Failed to save LoRA checkpoint\n");
         return false;
     }
-    
-    std::string meta_path = checkpoint_dir + "/metadata.json";
+
+    std::string meta_path = checkpoint_dir + "/metadata.txt";
     std::ofstream meta_file(meta_path);
     if (meta_file.is_open()) {
         meta_file << "epoch=" << metadata.epoch << "\n";
@@ -368,8 +368,8 @@ static bool validate_checkpoint_metadata(const std::string& checkpoint_path, che
     }
     
     LOG_INF("Loading checkpoint from: %s\n", checkpoint_dir.c_str());
-    
-    std::string meta_path = checkpoint_dir + "/metadata.json";
+
+    std::string meta_path = checkpoint_dir + "/metadata.txt";
     if (std::filesystem::exists(meta_path)) {
         std::ifstream meta_file(meta_path);
         if (meta_file.is_open()) {
