@@ -112,7 +112,7 @@ The LoRA fine-tuning supports automatic checkpointing to save and resume trainin
 Each checkpoint directory contains:
 - `model.gguf` - LoRA adapter weights
 - `optimizer.gguf` - Optimizer state (momentum, variance, iteration)
-- `metadata.json` - Training parameters and step information
+- `metadata.txt` - Training parameters and step information
 
 ### Architecture Overview
 
@@ -271,7 +271,7 @@ adapter merging, making it an ideal template when porting additional architectur
 - **Out of memory**: Reduce context length (`-c 256`), lower rank, or use fewer target modules
 - **Poor quality**: Increase rank, add more target modules, or train longer
 - **Large adapter**: Reduce rank or limit target modules
-- **Checkpoint issues**: Ensure checkpoint directory contains all required files (model.gguf, optimizer.gguf, metadata.json)
+- **Checkpoint issues**: Ensure checkpoint directory contains all required files (`model.gguf`, `optimizer.gguf`, `metadata.txt`)
 
 ### Help
 

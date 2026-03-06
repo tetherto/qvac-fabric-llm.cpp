@@ -1816,6 +1816,12 @@ ggml_opt_dataset_t common_opt_sft_dataset_init(
         return t.size();
     };
 
+    // TODO: The masking logic currently relies on string searching for specific role tags.
+    // While chat templates render appropriately, we must parse the rendered string to find
+    // the boundaries of the "assistant" role to calculate loss gracefully.
+    // Currently, this only supports ChatML (Qwen, etc.) and Gemma formats.
+    // A more reliable, model-agnostic method would require common_chat_templates_apply to 
+    // return token role spans directly, which is not yet supported in common/chat.cpp.
     const std::string START_TAG = "<|im_start|>";
     const std::string START_SYS = "<|im_start|>system\n";
     const std::string START_USR = "<|im_start|>user\n";
