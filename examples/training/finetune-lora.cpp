@@ -30,6 +30,9 @@ enum class lora_lr_schedule_type : std::uint8_t {
     LINEAR,
 };
 
+// TODO: Ideally, training configuration variables should be added to common.h and 
+// parsed using the existing common_params_parse (or loaded from a config file) 
+// to reuse the existing parser and reduce boilerplate CLI parsing code.
 struct lora_lr_scheduler_state {
     lora_lr_schedule_type schedule = lora_lr_schedule_type::CONSTANT;
     float lr_init = 1e-5f;
