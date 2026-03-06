@@ -12,19 +12,13 @@ bool llama_lora_validate_training_params(const struct llama_lora_training_params
 
 ggml_context * llama_lora_create_context(size_t mem_size);
 
-bool llama_lora_create_tensor_pair(
+void llama_lora_create_tensor_pair(
     struct ggml_context * lora_ctx,
     const char * base_name,
     const struct ggml_tensor * base_tensor,
     int32_t rank,
     struct ggml_tensor ** lora_a,
     struct ggml_tensor ** lora_b);
-
-bool llama_lora_init_tensor_weights(
-    struct ggml_tensor * lora_a, 
-    struct ggml_tensor * lora_b, 
-    float init_std,
-    uint32_t seed);
 
 struct llama_adapter_lora * llama_lora_create_adapter(
     struct llama_model * model, 

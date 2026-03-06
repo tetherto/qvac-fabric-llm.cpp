@@ -48,7 +48,7 @@ bool llama_lora_validate_training_params(const struct llama_lora_training_params
     return true;
 }
 
-bool llama_lora_create_tensor_pair(
+void llama_lora_create_tensor_pair(
         struct ggml_context * lora_ctx,
         const char * base_name,
         const struct ggml_tensor * base_tensor,
@@ -57,31 +57,28 @@ bool llama_lora_create_tensor_pair(
         struct ggml_tensor ** lora_b) {
     
     if (!lora_ctx || !base_name || !base_tensor || !lora_a || !lora_b) {
-        return false;
+        throw std::invalid_argument("Invalid null arguments provided to llama_lora_create_tensor_pair");
     }
-    
+
     // Get base tensor dim
     const int64_t d0 = base_tensor->ne[0]; // input dim
     const int64_t d1 = base_tensor->ne[1]; // output dim
-    
+
     char lora_a_name[256], lora_b_name[256];
     int ret_a = snprintf(lora_a_name, sizeof(lora_a_name), "%s.lora_a", base_name);
     int ret_b = snprintf(lora_b_name, sizeof(lora_b_name), "%s.lora_b", base_name);
     if (ret_a < 0 || ret_a >= (int) sizeof(lora_a_name) ||
         ret_b < 0 || ret_b >= (int) sizeof(lora_b_name)) {
-        LLAMA_LOG_ERROR("LoRA tensor name too long: '%s'\n", base_name);
-        return false;
+        throw std::runtime_error(std::string("LoRA tensor name too long or formatting failed: ") + base_name);
     }
-    
+
     // LoRA A: [d0, rank] - projects input to low rank
     *lora_a = ggml_new_tensor_2d(lora_ctx, GGML_TYPE_F32, d0, rank);
     ggml_set_name(*lora_a, lora_a_name);
-    
+
     // LoRA B: [rank, d1] - projects from low rank to output
     *lora_b = ggml_new_tensor_2d(lora_ctx, GGML_TYPE_F32, rank, d1);
     ggml_set_name(*lora_b, lora_b_name);
-    
-    return true;
 }
 
 static bool is_tensor_on_device(const struct ggml_tensor * tensor) {
@@ -123,15 +120,14 @@ static void init_tensor_zeros(struct ggml_tensor * tensor) {
     }
 }
 
-bool llama_lora_init_tensor_weights(struct ggml_tensor * lora_a, struct ggml_tensor * lora_b, float init_std, uint32_t seed) {
+static void llama_lora_init_tensor_weights(struct ggml_tensor * lora_a, struct ggml_tensor * lora_b, float init_std, uint32_t seed) {
     if (!lora_a || !lora_b || !lora_a->data || !lora_b->data) {
-        return false;
+        throw std::invalid_argument("Invalid null tensors or data pointers passed to llama_lora_init_tensor_weights");
     }
     
     // LoRA initialization: A ~ N(0, init_std), B = 0
     init_tensor_guassian(lora_a, init_std, seed);
     init_tensor_zeros(lora_b);
-    return true;
 }
 
 bool llama_lora_allocate_buffers(
@@ -184,6 +180,7 @@ struct llama_adapter_lora * llama_lora_create_adapter(
 
         // Create LoRA tensors and populate ab_map
         // Create GGML context for LoRA tensors
+        // TODO (makaveli10): Remove hard-coded memory size
         const size_t estimated_lora_mem = 256 * 1024 * 1024; // 256MB should be enough for most LoRA configs
         ggml_context * lora_ctx = llama_lora_create_context(estimated_lora_mem);
         if (!lora_ctx) {
@@ -217,15 +214,9 @@ struct llama_adapter_lora * llama_lora_create_adapter(
                 struct ggml_tensor * lora_a = nullptr;
                 struct ggml_tensor * lora_b = nullptr;
 
-                if (llama_lora_create_tensor_pair(lora_ctx, tensor_name.c_str(), base_tensor, params->rank, &lora_a, &lora_b)) {
-                    if (!lora_a || !lora_b) {
-                        throw std::runtime_error("Created null LoRA tensors for " + tensor_name);
-                    }                    
-                    created_count++;
-                    adapter->ab_map[tensor_name] = llama_adapter_lora_weight(lora_a, lora_b);
-                } else {
-                    throw std::runtime_error("Failed to create LoRA tensor pair for " + tensor_name);
-                }
+                llama_lora_create_tensor_pair(lora_ctx, tensor_name.c_str(), base_tensor, params->rank, &lora_a, &lora_b);
+                created_count++;
+                adapter->ab_map[tensor_name] = llama_adapter_lora_weight(lora_a, lora_b);
             }
         }
 
@@ -241,9 +232,7 @@ struct llama_adapter_lora * llama_lora_create_adapter(
             const std::string & tensor_name = ab_pair.first;
             const llama_adapter_lora_weight & weight = ab_pair.second;
 
-            if (!llama_lora_init_tensor_weights(weight.a, weight.b, params->init_std, params->seed)) {
-                throw std::runtime_error("LoRA tensor initialization failed for " + tensor_name);
-            }
+            llama_lora_init_tensor_weights(weight.a, weight.b, params->init_std, params->seed);
         }
         return adapter;
     } catch (const std::exception & err) {
