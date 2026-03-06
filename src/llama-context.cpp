@@ -2133,6 +2133,8 @@ void llama_context::opt_init(struct llama_model * model, struct llama_opt_params
     llama_set_param(model->cls_out_b,       param_filter, param_filter_ud);
 
     for (struct llama_layer & layer : model->layers) {
+        static_assert(sizeof(llama_layer) % sizeof(ggml_tensor *) == 0,
+            "llama_layer has unexpected padding — reinterpret_cast iteration is unsafe");
         for (size_t i = 0; i < sizeof(layer)/sizeof(struct ggml_tensor *); ++i) {
             llama_set_param(reinterpret_cast<struct ggml_tensor **>(&layer)[i], param_filter, param_filter_ud);
         }
