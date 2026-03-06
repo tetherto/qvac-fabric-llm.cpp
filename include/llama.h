@@ -1801,7 +1801,7 @@ extern "C" {
         uint32_t target_modules;
         int32_t  rank;
         float    alpha;
-        float    dropout;
+        float    dropout;    // reserved, not yet implemented 
         float    init_std;
         uint32_t seed;       // seed for reproducible weight initialization (0 = non-deterministic)
     };
