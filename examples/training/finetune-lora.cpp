@@ -598,7 +598,7 @@ static bool parse_finetune_args(int& argc, char** argv, finetune_params& ft_para
             }
             argc--;
             i--;
-        } else if (strcmp(argv[i], "--chat-template") == 0) {
+        } else if (strcmp(argv[i], "--chat-template") == 0 && i + 1 < argc) {
             ft_params.chat_template_path = argv[i + 1];
             remove_arg_pair(i);
             i--;
@@ -740,7 +740,7 @@ int main(int argc, char ** argv) {
 
     if (has_existing_lora) {
         LOG_INF("Finetuning existing LoRA adapters\n");
-        LOG_INF("Found %zu existing LoRA adapters to train\n", params.lora_adapters.size());\
+        LOG_INF("Found %zu existing LoRA adapters to train\n", params.lora_adapters.size());
         trained_adapter = params.lora_adapters[0].ptr;
         if (!trained_adapter) {
             LOG_ERR("Existing LoRA adapter is null\n");
