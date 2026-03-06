@@ -126,7 +126,7 @@ LoRA fine-tuning represents the weight updates with two smaller matrices through
 - Merge LoRA adapters back into a base model `model.gguf`
 - Compatible with Qwen3, Gemma, LLaMA, TinyLlama, and other GGUF models
 
-The [Finetuning Guide](examples/training//README.md) has more details.
+The [Finetuning Guide](examples/training/README.md) has more details.
 
 ---
 
