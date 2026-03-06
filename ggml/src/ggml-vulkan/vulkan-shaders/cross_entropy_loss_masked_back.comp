@@ -53,6 +53,8 @@ void main() {
             }
         }
         
+        // Supplied as a push constant by the host. Reading it from data_a[0] instead
+        // breaks MoE LoRA finetuning.
         const FLOAT_TYPE upstream_grad = FLOAT_TYPE(p.param1);
         d_by_valid = valid_tokens > 0.0 ? upstream_grad / valid_tokens : FLOAT_TYPE(0.0);
         
