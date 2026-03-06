@@ -11312,6 +11312,8 @@ static void ggml_vk_op_f32_cross_entropy_loss_masked_back(ggml_backend_vk_contex
 
     ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
 
+    ggml_vk_sync_buffers(ctx, subctx);
+
     vk_subbuffer grad_buf = ggml_vk_tensor_subbuffer(ctx, grad);
     vk_subbuffer logits_buf = ggml_vk_tensor_subbuffer(ctx, logits);
     vk_subbuffer labels_buf = ggml_vk_tensor_subbuffer(ctx, labels);
