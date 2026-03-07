@@ -1302,10 +1302,9 @@ bool ggml_opt_load_state(ggml_opt_context_t opt_ctx, const char* filename) {
         return false;
     }
 
-    struct ggml_context * gguf_ctx = nullptr;
     struct gguf_init_params gguf_params = {
-        /* .no_alloc = */ false,
-        /* .ctx      = */ &gguf_ctx,
+        /* .no_alloc = */ true,
+        /* .ctx      = */ nullptr,
     };
 
     struct gguf_context * gguf_context = gguf_init_from_file(filename, gguf_params);
@@ -1346,6 +1345,7 @@ bool ggml_opt_load_tensors(ggml_opt_context_t opt_ctx, const char* filename) {
 
     int tensor_count = gguf_get_n_tensors(gguf_context);
     int grad_m_loaded = 0, grad_v_loaded = 0;
+    const int32_t n_params = ggml_opt_get_nparams(opt_ctx);
 
     for (int i = 0; i < tensor_count; ++i) {
         const char* tensor_name = gguf_get_tensor_name(gguf_context, i);
@@ -1353,8 +1353,6 @@ bool ggml_opt_load_tensors(ggml_opt_context_t opt_ctx, const char* filename) {
 
         struct ggml_tensor* gguf_tensor = ggml_get_tensor(gguf_ctx, tensor_name);
         if (!gguf_tensor) continue;
-
-        int32_t n_params = ggml_opt_get_nparams(opt_ctx);
 
         for (int32_t param_idx = 0; param_idx < n_params; ++param_idx) {
             struct ggml_tensor* grad_m = ggml_opt_get_grad_m(opt_ctx, param_idx);
@@ -1380,9 +1378,9 @@ bool ggml_opt_load_tensors(ggml_opt_context_t opt_ctx, const char* filename) {
                 break;
             }
         }
-
     }
 
+    ggml_free(gguf_ctx);
     gguf_free(gguf_context);
     return (grad_m_loaded > 0 || grad_v_loaded > 0);
 }
