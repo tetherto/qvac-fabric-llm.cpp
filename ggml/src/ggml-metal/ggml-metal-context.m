@@ -748,6 +748,7 @@ void ggml_metal_set_n_cb(ggml_metal_t ctx, int n_cb) {
     }
 
     ctx->encode_async = Block_copy(^(size_t iter) {
+      @autoreleasepool {
         const int cb_idx = iter;
         const int n_cb_l = ctx->n_cb;
 
@@ -791,6 +792,7 @@ void ggml_metal_set_n_cb(ggml_metal_t ctx, int n_cb) {
         if (cb_idx < 2 || ctx->abort_callback == NULL) {
             [cmd_buf commit];
         }
+      } // @autoreleasepool
     });
 }
 
