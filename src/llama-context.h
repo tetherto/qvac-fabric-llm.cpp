@@ -290,6 +290,7 @@ private:
 
     // training
     ggml_opt_context_t opt_ctx = nullptr;
+    uint32_t original_n_ctx_train = 0;
     
     // optimizer state loading (deferred until after ggml_opt_build)
     std::string pending_optimizer_checkpoint_path;
