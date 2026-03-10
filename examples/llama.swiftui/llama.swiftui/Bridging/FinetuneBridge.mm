@@ -19,6 +19,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <iomanip>
 #include <limits>
 #include <optional>
 #include <sstream>
@@ -93,6 +94,144 @@ struct Logger {
         callback(heap_buffer.data(), user);
     }
 };
+
+struct checkpoint_metadata {
+    int32_t epoch;
+    int32_t lora_rank;
+    float lora_alpha;
+    uint32_t target_modules;
+};
+
+struct checkpoint_callback_data {
+    llama_context* ctx;
+    llama_adapter_lora* adapter;
+    int32_t checkpoint_save_steps;
+    std::string checkpoint_save_dir;
+    int64_t global_step;
+    int64_t initial_step;
+    int32_t current_epoch;
+    int32_t lora_rank;
+    float lora_alpha;
+    uint32_t target_modules;
+    const Logger* logger;
+};
+
+static checkpoint_callback_data* g_checkpoint_data = nullptr;
+
+static std::string get_checkpoint_filename(const std::string& checkpoint_dir, int64_t step) {
+    std::ostringstream oss;
+    oss << checkpoint_dir << "/checkpoint_step_" << std::setfill('0') << std::setw(8) << step;
+    return oss.str();
+}
+
+static std::string find_latest_checkpoint(const std::string& checkpoint_dir) {
+    if (!std::filesystem::exists(checkpoint_dir)) {
+        return "";
+    }
+
+    std::string latest_checkpoint;
+    int64_t latest_step = -1;
+
+    for (const auto& entry : std::filesystem::directory_iterator(checkpoint_dir)) {
+        if (entry.is_directory()) {
+            std::string dirname = entry.path().filename().string();
+            if (dirname.find("checkpoint_step_") == 0 && dirname.size() >= 16) {
+                std::string step_str = dirname.substr(16, 8);
+                try {
+                    int64_t step = std::stoll(step_str);
+                    if (step > latest_step) {
+                        latest_step = step;
+                        latest_checkpoint = entry.path().string();
+                    }
+                } catch (const std::exception&) {
+                    continue;
+                }
+            }
+        }
+    }
+
+    return latest_checkpoint;
+}
+
+static bool save_checkpoint(
+        llama_context* ctx,
+        llama_adapter_lora* adapter,
+        const checkpoint_metadata& meta,
+        const std::string& checkpoint_dir,
+        const Logger& logger) {
+
+    try {
+        std::filesystem::create_directories(checkpoint_dir);
+    } catch (const std::exception& e) {
+        logger.logf("Failed to create checkpoint directory: %s\n", e.what());
+        return false;
+    }
+
+    std::string adapter_path = checkpoint_dir + "/model.gguf";
+    if (!llama_lora_save_adapter(adapter, adapter_path.c_str(), llama_get_model(ctx))) {
+        logger.logf("Failed to save LoRA adapter to %s\n", adapter_path.c_str());
+        return false;
+    }
+
+    std::string optimizer_path = checkpoint_dir + "/optimizer.gguf";
+    if (!llama_opt_save_state(ctx, optimizer_path.c_str())) {
+        logger.logf("Failed to save optimizer state to %s\n", optimizer_path.c_str());
+        return false;
+    }
+
+    std::string meta_path = checkpoint_dir + "/metadata.txt";
+    std::ofstream meta_file(meta_path);
+    if (meta_file.is_open()) {
+        meta_file << "epoch=" << meta.epoch << "\n";
+        meta_file << "lora_rank=" << meta.lora_rank << "\n";
+        meta_file << "lora_alpha=" << meta.lora_alpha << "\n";
+        meta_file << "target_modules=" << meta.target_modules << "\n";
+        meta_file.close();
+    } else {
+        logger.logf("Failed to save checkpoint metadata to %s\n", meta_path.c_str());
+        return false;
+    }
+
+    logger.logf("Checkpoint saved to %s\n", checkpoint_dir.c_str());
+    return true;
+}
+
+static bool load_checkpoint_metadata(const std::string& checkpoint_dir, checkpoint_metadata& metadata, const Logger& logger) {
+    std::string meta_path = checkpoint_dir + "/metadata.txt";
+
+    if (std::filesystem::exists(meta_path)) {
+        std::ifstream meta_file(meta_path);
+        if (meta_file.is_open()) {
+            std::string line;
+            while (std::getline(meta_file, line)) {
+                size_t eq_pos = line.find('=');
+                if (eq_pos != std::string::npos) {
+                    std::string key = line.substr(0, eq_pos);
+                    std::string value = line.substr(eq_pos + 1);
+
+                    if (key == "epoch") {
+                        metadata.epoch = std::stoi(value);
+                    } else if (key == "lora_rank") {
+                        metadata.lora_rank = std::stoi(value);
+                    } else if (key == "lora_alpha") {
+                        metadata.lora_alpha = std::stof(value);
+                    } else if (key == "target_modules") {
+                        metadata.target_modules = std::stoul(value);
+                    }
+                }
+            }
+            meta_file.close();
+            logger.logf("Checkpoint metadata loaded successfully\n");
+            return true;
+        } else {
+            logger.logf("Failed to open checkpoint metadata file\n");
+            return false;
+        }
+    } else {
+        logger.logf("Checkpoint metadata file not found: %s\n", meta_path.c_str());
+        return false;
+    }
+}
 
 std::optional<std::string> read_file(const char * path, std::string & error_message) {
     std::ifstream stream(path, std::ios::binary);
@@ -265,6 +404,70 @@ static void finetune_epoch_progress_callback(
         static_cast<long long>(eta_hms.minutes),
         static_cast<long long>(eta_hms.seconds),
         progress);
+}
+
+static void checkpoint_progress_callback(
+        bool train,
+        ggml_opt_context_t opt_ctx,
+        ggml_opt_dataset_t dataset,
+        ggml_opt_result_t result,
+        int64_t ibatch,
+        int64_t ibatch_max,
+        int64_t t_start_us) {
+
+    finetune_epoch_progress_callback(train, opt_ctx, dataset, result, ibatch, ibatch_max, t_start_us);
+
+    if (!train) {
+        return;
+    }
+
+    checkpoint_callback_data* cb_data = g_checkpoint_data;
+    if (!cb_data) {
+        return;
+    }
+
+    if (cb_data->checkpoint_save_steps <= 0) {
+        return;
+    }
+
+    cb_data->global_step++;
+
+    if (cb_data->global_step % cb_data->checkpoint_save_steps == 0) {
+        if (!cb_data->ctx) {
+            if (cb_data->logger) {
+                cb_data->logger->logf("ERROR: Context is null in checkpoint callback!\n");
+            }
+            return;
+        }
+
+        if (!cb_data->adapter) {
+            if (cb_data->logger) {
+                cb_data->logger->logf("ERROR: LoRA adapter is null in checkpoint callback!\n");
+            }
+            return;
+        }
+
+        checkpoint_metadata meta = {
+            /*epoch          =*/ cb_data->current_epoch,
+            /*lora_rank      =*/ cb_data->lora_rank,
+            /*lora_alpha     =*/ cb_data->lora_alpha,
+            /*target_modules =*/ cb_data->target_modules,
+        };
+
+        std::string checkpoint_path = get_checkpoint_filename(cb_data->checkpoint_save_dir, cb_data->global_step);
+
+        if (cb_data->logger) {
+            cb_data->logger->logf("Saving checkpoint at step %lld to %s\n",
+                (long long)cb_data->global_step, checkpoint_path.c_str());
+        }
+
+        if (!save_checkpoint(cb_data->ctx, cb_data->adapter, meta, checkpoint_path, *cb_data->logger)) {
+            if (cb_data->logger) {
+                cb_data->logger->logf("ERROR: Failed to save checkpoint at step %lld\n",
+                    (long long)cb_data->global_step);
+            }
+        }
+    }
 }
 
 } // namespace
@@ -470,16 +673,65 @@ extern "C" enum llama_swift_finetune_error llama_swift_run_lora_finetune(
         return LLAMA_SWIFT_FINETUNE_ERROR_TRAINING_INIT;
     }
 
+    bool checkpoint_loaded = false;
+    int32_t start_epoch = 0;
+    int64_t start_step = 0;
+    std::string checkpoint_dir = opts.checkpoint_save_dir ? opts.checkpoint_save_dir : "./checkpoints";
+    std::string resume_from_checkpoint;
+
+    if (opts.auto_resume) {
+        logger.logf("Auto-resume enabled, searching for latest checkpoint in %s\n", checkpoint_dir.c_str());
+        resume_from_checkpoint = find_latest_checkpoint(checkpoint_dir);
+        if (!resume_from_checkpoint.empty()) {
+            logger.logf("Found latest checkpoint: %s\n", resume_from_checkpoint.c_str());
+        } else {
+            logger.logf("No existing checkpoint found, starting from scratch\n");
+        }
+    } else if (opts.resume_from_checkpoint && opts.resume_from_checkpoint[0] != '\0') {
+        resume_from_checkpoint = opts.resume_from_checkpoint;
+        logger.logf("Resuming from specified checkpoint: %s\n", resume_from_checkpoint.c_str());
+    }
+
+    if (!resume_from_checkpoint.empty()) {
+        checkpoint_metadata checkpoint_meta{};
+        if (load_checkpoint_metadata(resume_from_checkpoint, checkpoint_meta, logger)) {
+            if (checkpoint_meta.lora_rank != opts.lora_rank) {
+                logger.logf("Warning: Checkpoint LoRA rank (%d) doesn't match current rank (%d)\n",
+                    checkpoint_meta.lora_rank, opts.lora_rank);
+            }
+            if (checkpoint_meta.lora_alpha != opts.lora_alpha) {
+                logger.logf("Warning: Checkpoint LoRA alpha (%.3f) doesn't match current alpha (%.3f)\n",
+                    checkpoint_meta.lora_alpha, opts.lora_alpha);
+            }
+            if (checkpoint_meta.target_modules != opts.target_modules) {
+                logger.logf("Warning: Checkpoint target_modules doesn't match current target_modules\n");
+            }
+
+            start_epoch = checkpoint_meta.epoch;
+            checkpoint_loaded = true;
+        } else {
+            logger.logf("Failed to load checkpoint metadata, starting from scratch\n");
+        }
+    }
+
+    std::string optimizer_checkpoint_path;
+    if (checkpoint_loaded && !resume_from_checkpoint.empty()) {
+        optimizer_checkpoint_path = resume_from_checkpoint + "/optimizer.gguf";
+    }
+
     ggml_opt_optimizer_params optimizer_params = ggml_opt_get_default_optimizer_params(nullptr);
     optimizer_params.adamw.alpha = opts.learning_rate;
 
     llama_opt_params opt_params{
-        /*n_ctx_train     =*/ 0,
-        /*param_filter    =*/ llama_opt_param_filter_lora,
-        /*param_filter_ud =*/ nullptr,
-        /*get_opt_pars    =*/ ggml_opt_get_constant_optimizer_params,
-        /*get_opt_pars_ud =*/ &optimizer_params,
-        /*optimizer_type  =*/ GGML_OPT_OPTIMIZER_TYPE_ADAMW,
+        /*n_ctx_train            =*/ 0,
+        /*param_filter           =*/ llama_opt_param_filter_lora,
+        /*param_filter_ud        =*/ nullptr,
+        /*get_opt_pars           =*/ ggml_opt_get_constant_optimizer_params,
+        /*get_opt_pars_ud        =*/ &optimizer_params,
+        /*optimizer_type         =*/ GGML_OPT_OPTIMIZER_TYPE_ADAMW,
+        /*checkpoint_path        =*/ checkpoint_loaded ? optimizer_checkpoint_path.c_str() : nullptr,
+        /*load_optimizer_state   =*/ checkpoint_loaded,
+        /*assistant_loss_only    =*/ false,
     };
 
     llama_opt_init(ctx, model, opt_params);
@@ -496,19 +748,54 @@ extern "C" enum llama_swift_finetune_error llama_swift_run_lora_finetune(
         idata_split = proposed;
     }
 
+    checkpoint_callback_data cb_data{};
+    cb_data.ctx = ctx;
+    cb_data.adapter = adapter;
+    cb_data.checkpoint_save_steps = opts.checkpoint_save_steps;
+    cb_data.checkpoint_save_dir = checkpoint_dir;
+    cb_data.global_step = start_step;
+    cb_data.initial_step = start_step;
+    cb_data.current_epoch = start_epoch;
+    cb_data.lora_rank = opts.lora_rank;
+    cb_data.lora_alpha = opts.lora_alpha;
+    cb_data.target_modules = opts.target_modules;
+    cb_data.logger = &logger;
+
+    g_checkpoint_data = &cb_data;
+
+    ggml_opt_epoch_callback train_callback = opts.checkpoint_save_steps > 0
+        ? checkpoint_progress_callback
+        : finetune_epoch_progress_callback;
+
+    ggml_opt_epoch_callback eval_callback = (idata_split < total_samples)
+        ? finetune_epoch_progress_callback
+        : nullptr;
+
+    if (opts.checkpoint_save_steps > 0) {
+        logger.logf("Checkpointing enabled, saving every %d steps to %s\n",
+            opts.checkpoint_save_steps, checkpoint_dir.c_str());
+    } else {
+        logger.logf("Checkpointing disabled\n");
+    }
+
     logger.logf("Starting LoRA finetuning for %d epoch(s)\n", opts.epochs);
 
-    for (int32_t epoch = 0; epoch < opts.epochs; ++epoch) {
+    for (int32_t epoch = start_epoch; epoch < opts.epochs; ++epoch) {
         logger.logf("Epoch %d/%d\n", epoch + 1, opts.epochs);
         EpochLoggerScope epoch_scope(logger, epoch, opts.epochs);
-        llama_opt_epoch(ctx,
+
+        cb_data.current_epoch = epoch;
+
+        int64_t resume_batch = 0;
+
+        llama_opt_epoch_resume(ctx,
                         dataset,
                         result_train,
                         result_eval,
                         idata_split,
-                        finetune_epoch_progress_callback,
-                        (idata_split < total_samples) ? finetune_epoch_progress_callback : nullptr,
-                        0);
+                        train_callback,
+                        eval_callback,
+                        resume_batch);
 
         double train_loss = 0.0;
         double train_unc = 0.0;
@@ -525,6 +812,8 @@ extern "C" enum llama_swift_finetune_error llama_swift_run_lora_finetune(
             logger.logf("  train loss: %.6f\n", train_loss);
         }
     }
+
+    g_checkpoint_data = nullptr;
 
     std::filesystem::path output_path(output_adapter_path);
     if (output_path.has_parent_path()) {
