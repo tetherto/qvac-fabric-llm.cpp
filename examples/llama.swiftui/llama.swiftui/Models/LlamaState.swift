@@ -845,7 +845,11 @@ class LlamaState: ObservableObject {
             target_modules: 0,
             seed: Int32(optionSeed),
             flash_attn: optionFlashAttention,
-            n_gpu_layers: ngl
+            n_gpu_layers: ngl,
+            checkpoint_save_steps: 0,
+            checkpoint_save_dir: nil,
+            resume_from_checkpoint: nil,
+            auto_resume: false
         )
 
         isFinetuning = true
