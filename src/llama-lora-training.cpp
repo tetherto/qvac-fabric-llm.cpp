@@ -229,7 +229,6 @@ struct llama_adapter_lora * llama_lora_create_adapter(
         }
 
         for (const auto & ab_pair : adapter->ab_map) {
-            const std::string & tensor_name = ab_pair.first;
             const llama_adapter_lora_weight & weight = ab_pair.second;
 
             llama_lora_init_tensor_weights(weight.a, weight.b, params->init_std, params->seed);
