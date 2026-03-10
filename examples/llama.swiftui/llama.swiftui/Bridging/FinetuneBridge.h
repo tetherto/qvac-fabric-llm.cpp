@@ -33,6 +33,11 @@ struct llama_swift_finetune_options {
     int32_t  seed;
     bool     flash_attn;
     int32_t  n_gpu_layers;
+
+    int32_t     checkpoint_save_steps;
+    const char* checkpoint_save_dir;
+    const char* resume_from_checkpoint;
+    bool        auto_resume;
 };
 
 typedef void (*llama_swift_finetune_log_callback)(const char * message, void * user_data);
