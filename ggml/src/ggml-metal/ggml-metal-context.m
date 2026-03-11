@@ -8,6 +8,7 @@
 #import "ggml-metal-ops.h"
 
 #import <Foundation/Foundation.h>
+#import <TargetConditionals.h>
 
 #import <Metal/Metal.h>
 
@@ -126,6 +127,12 @@ ggml_metal_t ggml_metal_init(ggml_metal_device_t dev) {
 
     res->use_fusion      = getenv("GGML_METAL_FUSION_DISABLE") == nil;
     res->use_concurrency = getenv("GGML_METAL_CONCURRENCY_DISABLE") == nil;
+
+#if TARGET_OS_IPHONE
+    if (getenv("GGML_METAL_CONCURRENCY_DISABLE") == nil) {
+        res->use_concurrency = false;
+    }
+#endif
 
     {
         const char * val = getenv("GGML_METAL_GRAPH_DEBUG");
@@ -536,6 +543,7 @@ void ggml_metal_set_n_cb(ggml_metal_t ctx, int n_cb) {
     }
 
     ctx->encode_async = Block_copy(^(size_t iter) {
+      @autoreleasepool {
         const int cb_idx = iter;
         const int n_cb_l = ctx->n_cb;
 
@@ -580,6 +588,7 @@ void ggml_metal_set_n_cb(ggml_metal_t ctx, int n_cb) {
         if (cb_idx < 2 || ctx->abort_callback == NULL) {
             [cmd_buf commit];
         }
+      } // @autoreleasepool
     });
 }
 

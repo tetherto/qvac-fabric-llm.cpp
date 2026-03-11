@@ -12,6 +12,10 @@
 
 #include "ggml-cpp.h"
 
+#ifdef __APPLE__
+#include <TargetConditionals.h>
+#endif
+
 #include "models/models.h"
 
 #include <algorithm>
@@ -2357,7 +2361,13 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
         throw std::runtime_error(format("%s: no CPU backend found", __func__));
     }
     const int i_gpu_start = std::max((int) hparams.n_layer - n_gpu_layers, (int) 0);
-    const int act_gpu_layers = devices.empty() ? 0 : std::min(n_gpu_layers, (int)n_layer + 1);
+    #if TARGET_OS_IPHONE
+    const int max_gpu_layers = (int)n_layer;
+    #else
+    const int max_gpu_layers = (int)n_layer + 1;
+    #endif
+    const int act_gpu_layers = devices.empty() ? 0 : std::min(n_gpu_layers, max_gpu_layers);
+
     auto get_layer_buft_list = [&](int il) -> llama_model::impl::layer_dev {
         const bool is_swa = il < (int) hparams.n_layer && hparams.is_swa(il);
         if (il < i_gpu_start || (il - i_gpu_start) >= act_gpu_layers) {
@@ -2446,6 +2456,22 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
 
         auto create_tensor = [&](const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) -> ggml_tensor * {
             const std::string& tensor_name = tn.str();
+
+            // With incremental split loading, a TENSOR_DUPLICATED reference
+            // (e.g. rope_freqs.weight shared across every layer) may be
+            // requested after its owning split has already been uploaded and
+            // released.  The original tensor still lives in tensors_by_name
+            // (populated by create_split_backend_buffers), so look it up there
+            // before touching the incremental loader — this avoids
+            // double-counting loaded tensors and accessing a released file.
+            if ((flags & TENSOR_DUPLICATED) && ml.incremental_splits_tensor_load.has_value()) {
+                for (auto & [name, tensor] : tensors_by_name) {
+                    if (name == tensor_name) {
+                        return tensor;
+                    }
+                }
+            }
+
             ggml_tensor * t_meta = ml.get_tensor_meta(tensor_name.c_str());
             std::optional<uint16_t> split_idx;
             if (!t_meta && (flags & TENSOR_NOT_REQUIRED) &&

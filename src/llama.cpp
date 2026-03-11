@@ -346,7 +346,99 @@ std::vector<std::string> splits_from_c_paths(const char ** paths, size_t n_paths
     }
     return splits;
 }
+
+template <gguf_type ExpectedType, MetaResultStatus TypeMismatchErr, typename T, typename F>
+MetaResultStatus llama_model_meta_get_impl(const metadata_handle_ptr & meta_handle,
+                                           const char *                key,
+                                           T *                         value,
+                                           F &&                        getter) {
+    if (meta_handle.get() == nullptr) {
+        return MetaResultStatus::META_HANDLE_NULL;
+    }
+    if (key == nullptr) {
+        return MetaResultStatus::KEY_NULL;
+    }
+    if (value == nullptr) {
+        return MetaResultStatus::VALUE_NULL;
+    }
+    const struct gguf_context * meta   = reinterpret_cast<const struct gguf_context *>(meta_handle.get());
+    const int                   key_id = gguf_find_key(meta, key);
+    if (key_id < 0) {
+        return MetaResultStatus::KEY_NOT_FOUND;
+    }
+    if (gguf_get_kv_type(meta, key_id) != ExpectedType) {
+        return TypeMismatchErr;
+    }
+    *value = getter(meta, key_id);
+    return MetaResultStatus::SUCCESS;
+}
 }  // namespace
+
+void metadata_handle_deleter::operator()(struct llama_metadata_handle * ctx) const {
+    gguf_free(reinterpret_cast<struct gguf_context *>(ctx));
+}
+
+MetaResultStatus llama_model_meta_get_u32(const metadata_handle_ptr & meta_handle, const char * key, uint32_t * value) {
+    return llama_model_meta_get_impl<GGUF_TYPE_UINT32, MetaResultStatus::KV_TYPE_NOT_UINT32>(meta_handle, key, value,
+                                                                                             gguf_get_val_u32);
+}
+
+MetaResultStatus llama_model_meta_get_str(const metadata_handle_ptr & meta_handle,
+                                          const char *                key,
+                                          std::string *               value) {
+    return llama_model_meta_get_impl<GGUF_TYPE_STRING, MetaResultStatus::KV_TYPE_NOT_STRING>(meta_handle, key, value,
+                                                                                             gguf_get_val_str);
+}
+
+MetaResultStatus llama_model_meta_from_file(const char * path_model, metadata_handle_ptr * out_meta_handle) {
+    if (path_model == nullptr) {
+        return MetaResultStatus::PATH_NULL;
+    }
+    if (out_meta_handle == nullptr) {
+        return MetaResultStatus::NULL_OUT_META_HANDLE;
+    }
+    struct gguf_init_params params = {
+        /*.no_alloc  = */ true,
+        /*.ctx       = */ nullptr,
+        /*.kv_only   = */ true,
+    };
+
+    gguf_context_ptr meta(gguf_init_from_file(path_model, params));
+    if (!meta) {
+        return MetaResultStatus::GGUF_INIT_FAILED;
+    }
+
+    *out_meta_handle = metadata_handle_ptr(reinterpret_cast<struct llama_metadata_handle *>(meta.release()));
+    return MetaResultStatus::SUCCESS;
+}
+
+MetaResultStatus llama_model_meta_from_streambuf(std::basic_streambuf<char> & streambuf, metadata_handle_ptr * out_meta_handle) {
+    if (out_meta_handle == nullptr) {
+        return MetaResultStatus::NULL_OUT_META_HANDLE;
+    }
+    const auto current_pos = streambuf.pubseekoff(0, std::ios_base::cur, std::ios_base::in);
+    if (streambuf.pubseekoff(0, std::ios_base::beg, std::ios_base::in) == std::streampos(std::streamoff(-1))) {
+        return MetaResultStatus::STREAMBUF_SEEK_FAILED;
+    }
+    struct gguf_init_params params = {
+        /*.no_alloc  = */ true,
+        /*.ctx       = */ nullptr,
+        /*.kv_only   = */ true,
+    };
+
+    gguf_context_ptr meta(gguf_init_from_buffer(streambuf, params));
+
+    if (current_pos != std::streampos(std::streamoff(-1))) {
+        streambuf.pubseekpos(current_pos, std::ios_base::in);
+    }
+
+    if (!meta) {
+        return MetaResultStatus::GGUF_INIT_FAILED;
+    }
+
+    *out_meta_handle = metadata_handle_ptr(reinterpret_cast<struct llama_metadata_handle *>(meta.release()));
+    return MetaResultStatus::SUCCESS;
+}
 
 struct llama_model * llama_model_load_from_splits(const char ** paths, size_t n_paths,
                                                   struct llama_model_params params) {

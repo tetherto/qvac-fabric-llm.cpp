@@ -83,8 +83,12 @@ int ggml_metal_op_argmax            (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_argsort           (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_top_k             (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_leaky_relu        (ggml_metal_op_t ctx, int idx);
-int ggml_metal_op_opt_step_adamw    (ggml_metal_op_t ctx, int idx);
-int ggml_metal_op_opt_step_sgd      (ggml_metal_op_t ctx, int idx);
+int ggml_metal_op_out_prod           (ggml_metal_op_t ctx, int idx);
+int ggml_metal_op_silu_back          (ggml_metal_op_t ctx, int idx);
+int ggml_metal_op_soft_max_back      (ggml_metal_op_t ctx, int idx);
+int ggml_metal_op_rms_norm_back      (ggml_metal_op_t ctx, int idx);
+int ggml_metal_op_opt_step_adamw     (ggml_metal_op_t ctx, int idx);
+int ggml_metal_op_opt_step_sgd       (ggml_metal_op_t ctx, int idx);
 
 #ifdef __cplusplus
 }

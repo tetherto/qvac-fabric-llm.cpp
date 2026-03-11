@@ -479,10 +479,12 @@ extern "C" {
         GGML_OP_MEAN,
         GGML_OP_ARGMAX,
         GGML_OP_COUNT_EQUAL,
+        GGML_OP_COUNT_EQUAL_MASKED,
         GGML_OP_REPEAT,
         GGML_OP_REPEAT_BACK,
         GGML_OP_CONCAT,
         GGML_OP_SILU_BACK,
+        GGML_OP_GEGLU_BACK,
         GGML_OP_NORM, // normalize
         GGML_OP_RMS_NORM,
         GGML_OP_RMS_NORM_BACK,
@@ -558,6 +560,8 @@ extern "C" {
 
         GGML_OP_CROSS_ENTROPY_LOSS,
         GGML_OP_CROSS_ENTROPY_LOSS_BACK,
+        GGML_OP_CROSS_ENTROPY_LOSS_MASKED,
+        GGML_OP_CROSS_ENTROPY_LOSS_MASKED_BACK,
         GGML_OP_OPT_STEP_ADAMW,
         GGML_OP_OPT_STEP_SGD,
 
@@ -1033,6 +1037,13 @@ extern "C" {
             struct ggml_tensor  * a,
             struct ggml_tensor  * b);
 
+    // count number of equal elements in a and b, but only where mask=1
+    GGML_API struct ggml_tensor * ggml_count_equal_masked(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,  // predictions
+            struct ggml_tensor  * b,  // targets
+            struct ggml_tensor  * c); // mask (1 for positions to count, 0 to skip)
+
     // if a is the same shape as b, and a is not parameter, return a
     // otherwise, return a new tensor: repeat(a) to fit in b
     GGML_API struct ggml_tensor * ggml_repeat(
@@ -1172,6 +1183,10 @@ extern "C" {
             struct ggml_tensor  * a,
             struct ggml_tensor  * b);
 
+   GGML_API struct ggml_tensor * ggml_geglu_back(
+           struct ggml_context * ctx,
+           struct ggml_tensor  * grad,
+           struct ggml_tensor  * g);
     // hardswish(x) = x * relu6(x + 3) / 6
     GGML_API struct ggml_tensor * ggml_hardswish(
             struct ggml_context * ctx,
@@ -2529,6 +2544,19 @@ extern "C" {
             struct ggml_tensor  * a,  // logits
             struct ggml_tensor  * b,  // labels
             struct ggml_tensor  * c); // gradients of cross_entropy_loss result
+
+    // Masked cross-entropy loss for instruction fine-tuning (assistant-only loss)
+    GGML_API struct ggml_tensor * ggml_cross_entropy_loss_masked(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,  // logits
+            struct ggml_tensor  * b,  // labels  
+            struct ggml_tensor  * c); // mask (1 for assistant tokens, 0 for masked)
+    GGML_API struct ggml_tensor * ggml_cross_entropy_loss_masked_back(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,  // logits
+            struct ggml_tensor  * b,  // labels
+            struct ggml_tensor  * c,  // mask
+            struct ggml_tensor  * d); // gradients of cross_entropy_loss result
 
     // AdamW optimizer step
     // Paper: https://arxiv.org/pdf/1711.05101v3.pdf

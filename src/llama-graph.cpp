@@ -1605,11 +1605,26 @@ ggml_tensor * llm_graph_context::build_attn(
         ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il));
     }
 
-    const auto & kq_mask = inp->get_kq_mask();
+    ggml_tensor * kq_mask = inp->get_kq_mask();
 
     ggml_tensor * q = q_cur;
-    ggml_tensor * k = mctx_cur->get_k(ctx0, il);
-    ggml_tensor * v = mctx_cur->get_v(ctx0, il);
+    ggml_tensor * k, * v;
+
+    if (loras && !loras->empty() && k_cur && v_cur && cparams.training) {
+        k = mctx_cur->get_k_lora(ctx0, k_cur, il);
+        v = mctx_cur->get_v_lora(ctx0, v_cur, il);
+    } else {
+        k = mctx_cur->get_k(ctx0, il);
+        v = mctx_cur->get_v(ctx0, il);
+    }
+
+    if (kq_mask->ne[0] != k->ne[2]) {
+        GGML_ASSERT(k->ne[2] <= kq_mask->ne[0]);
+        kq_mask = ggml_view_4d(ctx0, kq_mask,
+                k->ne[2], kq_mask->ne[1], kq_mask->ne[2], kq_mask->ne[3],
+                kq_mask->nb[1], kq_mask->nb[2], kq_mask->nb[3], 0);
+        kq_mask = ggml_cont(ctx0, kq_mask);
+    }
 
     ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il);
     cb(cur, "kqv_out", il);
@@ -1672,11 +1687,27 @@ ggml_tensor * llm_graph_context::build_attn(
         ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il));
     }
 
-    const auto & kq_mask = is_swa ? inp->get_kq_mask_swa() : inp->get_kq_mask();
+    ggml_tensor * kq_mask = is_swa ? inp->get_kq_mask_swa() : inp->get_kq_mask();
 
     ggml_tensor * q = q_cur;
-    ggml_tensor * k = mctx_cur->get_k(ctx0, il);
-    ggml_tensor * v = mctx_cur->get_v(ctx0, il);
+    ggml_tensor * k, * v;
+
+    if (loras && !loras->empty() && k_cur && v_cur && cparams.training) {
+        k = mctx_cur->get_k_lora(ctx0, k_cur, il);
+        v = mctx_cur->get_v_lora(ctx0, v_cur, il);
+    } else {
+        k = mctx_cur->get_k(ctx0, il);
+        v = mctx_cur->get_v(ctx0, il);
+    }
+
+    // Same rationale as above for the ISWA path.
+    if (kq_mask->ne[0] != k->ne[2]) {
+        GGML_ASSERT(k->ne[2] <= kq_mask->ne[0]);
+        kq_mask = ggml_view_4d(ctx0, kq_mask,
+                k->ne[2], kq_mask->ne[1], kq_mask->ne[2], kq_mask->ne[3],
+                kq_mask->nb[1], kq_mask->nb[2], kq_mask->nb[3], 0);
+        kq_mask = ggml_cont(ctx0, kq_mask);
+    }
 
     ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il);
     cb(cur, "kqv_out", il);

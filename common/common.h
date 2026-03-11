@@ -415,6 +415,7 @@ struct common_params {
     bool warmup            = true;  // warmup run
     bool check_tensors     = false; // validate tensor data
     bool no_op_offload     = false; // globally disable offload host tensor operations to device
+    bool training          = false; // enable training mode (affects LoRA K/V gradient flow)
     bool no_extra_bufts    = false; // disable extra buffer types (used for weight repacking)
     bool no_host           = false; // bypass host buffer allowing extra buffers to be used
 
@@ -807,3 +808,8 @@ ggml_opt_dataset_t common_opt_dataset_init(struct llama_context * ctx, const std
 
 // "adamw" or "sgd" (case insensitive)
 enum ggml_opt_optimizer_type common_opt_get_optimizer(const char *);
+ggml_opt_dataset_t common_opt_sft_dataset_init(
+        struct llama_context * ctx,
+        const std::string    & json_content,
+        int64_t                stride,
+        const std::string    & chat_template_path = "");

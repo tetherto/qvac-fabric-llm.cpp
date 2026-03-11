@@ -23,6 +23,9 @@
 #define N_R0_Q8_0 2
 #define N_SG_Q8_0 4
 
+#define N_R0_Q8_1 2
+#define N_SG_Q8_1 4
+
 #define N_R0_MXFP4 2
 #define N_SG_MXFP4 2
 
@@ -40,6 +43,9 @@
 
 #define N_R0_Q6_K 2
 #define N_SG_Q6_K 2
+
+#define N_R0_TQ2_0 4
+#define N_SG_TQ2_0 2
 
 #define N_R0_IQ1_S 4
 #define N_SG_IQ1_S 2
@@ -208,6 +214,33 @@ typedef struct {
 } ggml_metal_kargs_cpy;
 
 typedef struct {
+    int32_t  ne00;
+    int32_t  ne01;
+    int32_t  ne02;
+    int32_t  ne03;
+    uint64_t nb00;
+    uint64_t nb01;
+    uint64_t nb02;
+    uint64_t nb03;
+    int32_t  ne10;
+    int32_t  ne11;
+    int32_t  ne12;
+    int32_t  ne13;
+    uint64_t nb10;
+    uint64_t nb11;
+    uint64_t nb12;
+    uint64_t nb13;
+    int32_t  ne0;
+    int32_t  ne1;
+    int32_t  ne2;
+    int32_t  ne3;
+    uint64_t nb0;
+    uint64_t nb1;
+    uint64_t nb2;
+    uint64_t nb3;
+} ggml_metal_kargs_out_prod;
+
+typedef struct {
     int64_t  ne10;
     int64_t  ne11;
     int64_t  ne12;
@@ -253,6 +286,7 @@ typedef struct {
     int32_t  sect_2;
     int32_t  sect_3;
     bool     src2;
+    float    sin_sign;
 } ggml_metal_kargs_rope;
 
 typedef struct {
@@ -492,6 +526,21 @@ typedef struct {
     int32_t  ne00;
     int32_t  ne00_4;
     uint64_t nb01;
+    uint64_t nb02;
+    uint64_t nb03;
+    uint64_t nb11;
+    uint64_t nb12;
+    uint64_t nb13;
+    uint64_t nb1;
+    uint64_t nb2;
+    uint64_t nb3;
+    float    eps;
+} ggml_metal_kargs_rms_norm_back;
+
+typedef struct {
+    int32_t  ne00;
+    int32_t  ne00_4;
+    uint64_t nb01;
     float    eps;
 } ggml_metal_kargs_l2_norm;
 
@@ -673,6 +722,21 @@ typedef struct {
     float    m1;
     int32_t  n_head_log2;
 } ggml_metal_kargs_soft_max;
+
+typedef struct {
+    int32_t  ne00;
+    int32_t  ne00_4;
+    uint64_t nb01;
+    uint64_t nb02;
+    uint64_t nb03;
+    uint64_t nb11;
+    uint64_t nb12;
+    uint64_t nb13;
+    uint64_t nb1;
+    uint64_t nb2;
+    uint64_t nb3;
+    float    scale;
+} ggml_metal_kargs_soft_max_back;
 
 typedef struct {
     int64_t  ne00;

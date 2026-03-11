@@ -332,6 +332,35 @@ void ggml_vec_dot_q8_0_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, c
     *s = sumf;
 }
 
+void ggml_vec_dot_q8_1_q8_1_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    const int qk = QK8_1;
+    const int nb = n / qk;
+
+    assert(n % qk == 0);
+    assert(nrc == 1);
+    UNUSED(nrc);
+    UNUSED(bx);
+    UNUSED(by);
+    UNUSED(bs);
+
+    const block_q8_1 * GGML_RESTRICT x = vx;
+    const block_q8_1 * GGML_RESTRICT y = vy;
+
+    float sumf = 0;
+
+    for (int ib = 0; ib < nb; ++ib) {
+        int sumi = 0;
+
+        for (int j = 0; j < qk; ++j) {
+            sumi += x[ib].qs[j]*y[ib].qs[j];
+        }
+
+        sumf += sumi*(GGML_CPU_FP16_TO_FP32(x[ib].d)*GGML_CPU_FP16_TO_FP32(y[ib].d));
+    }
+
+    *s = sumf;
+}
+
 void ggml_vec_dot_tq1_0_q8_K_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
     assert(nrc == 1);
     UNUSED(nrc);
@@ -411,6 +440,90 @@ void ggml_vec_dot_tq2_0_q8_K_generic(int n, float * GGML_RESTRICT s, size_t bs, 
         const float d = y[i].d * GGML_CPU_FP16_TO_FP32(x[i].d);
 
         sumf += (float) sumi * d;
+    }
+
+    *s = sumf;
+}
+
+void ggml_vec_dot_tq2_0_q8_0_generic(
+        int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx,
+        const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    assert(nrc == 1);
+    UNUSED(nrc);
+    UNUSED(bx);
+    UNUSED(by);
+    UNUSED(bs);
+
+    GGML_ASSERT(n % QK_K == 0);
+    const int nb = n / QK_K;
+    const int q8_blocks = QK_K / QK8_0;
+
+    const block_tq2_0 * GGML_RESTRICT x = vx;
+    const block_q8_0  * GGML_RESTRICT y = vy;
+
+    float sumf = 0.0f;
+
+    for (int ib = 0; ib < nb; ++ib) {
+        const float dx = GGML_CPU_FP16_TO_FP32(x[ib].d);
+        const block_q8_0 * y_blocks = y + ib * q8_blocks;
+
+        size_t block_index = 0;
+        for (size_t j = 0; j < sizeof(x[ib].qs); j += 32) {
+            for (int l = 0; l < 4; ++l) {
+                const block_q8_0 * yb = &y_blocks[block_index++];
+                const float dy = GGML_CPU_FP16_TO_FP32(yb->d);
+
+                int32_t sumi = 0;
+                for (int k = 0; k < QK8_0; ++k) {
+                    const int8_t xv = ((x[ib].qs[j + k] >> (l*2)) & 3) - 1;
+                    sumi += xv * yb->qs[k];
+                }
+
+                sumf += (float) sumi * dx * dy;
+            }
+        }
+    }
+
+    *s = sumf;
+}
+
+void ggml_vec_dot_tq2_0_q8_1_generic(
+        int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx,
+        const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    assert(nrc == 1);
+    UNUSED(nrc);
+    UNUSED(bx);
+    UNUSED(by);
+    UNUSED(bs);
+
+    GGML_ASSERT(n % QK_K == 0);
+    const int nb = n / QK_K;
+    const int q8_blocks = QK_K / QK8_1;
+
+    const block_tq2_0 * GGML_RESTRICT x = vx;
+    const block_q8_1  * GGML_RESTRICT y = vy;
+
+    float sumf = 0.0f;
+
+    for (int ib = 0; ib < nb; ++ib) {
+        const float dx = GGML_CPU_FP16_TO_FP32(x[ib].d);
+        const block_q8_1 * y_blocks = y + ib * q8_blocks;
+
+        size_t block_index = 0;
+        for (size_t j = 0; j < sizeof(x[ib].qs); j += 32) {
+            for (int l = 0; l < 4; ++l) {
+                const block_q8_1 * yb = &y_blocks[block_index++];
+                const float dy = GGML_CPU_FP16_TO_FP32(yb->d);
+
+                int32_t sumi = 0;
+                for (int k = 0; k < QK8_1; ++k) {
+                    const int8_t xv = ((x[ib].qs[j + k] >> (l*2)) & 3) - 1;
+                    sumi += xv * yb->qs[k];
+                }
+
+                sumf += (float) sumi * dx * dy;
+            }
+        }
     }
 
     *s = sumf;

@@ -1,0 +1,26 @@
+#version 450
+
+#include "dequant_head.glsl"
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout (binding = 0) readonly buffer A {A_TYPE data_a[];};
+layout (binding = 1) writeonly buffer D {D_TYPE data_b[];};
+
+#include "tq_utils.comp"
+
+void main() {
+    [[unroll]] for (uint wgy = 0; wgy < 256; wgy += gl_WorkGroupSize.x) {
+        const uint ib = gl_WorkGroupID.x;
+
+        if (ib >= p.nel / QUANT_K) {
+            return;
+        }
+
+        const uint e = wgy + gl_LocalInvocationID.x;
+
+        const FLOAT_TYPE d = FLOAT_TYPE(data_a[ib].d);
+
+        data_b[ib * QUANT_K + e] = D_TYPE(d * FLOAT_TYPE(tq2_dequantize(ib, e)));
+    }
+}
