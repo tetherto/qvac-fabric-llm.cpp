@@ -7399,17 +7399,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_TQ1_0, GGML_TYPE_F32, 16, 2, 1024, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_TQ1_0, GGML_TYPE_F32, 16, 4, 1024, {1, 1}, {1, 1}));
 
-    // TQ2_0 tests disabled due to llvmpipe (software Vulkan) bug
-    // Tests pass on all real Vulkan hardware (Nvidia, ARM GPUs)
-    // TODO: Re-enable when llvmpipe bug is fixed
-    // test_cases.emplace_back(new test_mul_mat(GGML_TYPE_TQ2_0, GGML_TYPE_F32, 16, 1, 256, {1, 1}, {1, 1}));
-    // test_cases.emplace_back(new test_mul_mat(GGML_TYPE_TQ2_0, GGML_TYPE_F32, 16, 2, 256, {1, 1}, {1, 1}));
-    // test_cases.emplace_back(new test_mul_mat(GGML_TYPE_TQ2_0, GGML_TYPE_F32, 16, 4, 256, {1, 1}, {1, 1}));
-    // test_cases.emplace_back(new test_mul_mat(GGML_TYPE_TQ2_0, GGML_TYPE_F32, 16, 8, 256, {1, 1}, {1, 1}));
-    // test_cases.emplace_back(new test_mul_mat(GGML_TYPE_TQ2_0, GGML_TYPE_F32, 32, 32, 256, {1, 1}, {1, 1}));
-    // test_cases.emplace_back(new test_mul_mat(GGML_TYPE_TQ2_0, GGML_TYPE_F32, 16, 1, 1024, {1, 1}, {1, 1}));
-    // test_cases.emplace_back(new test_mul_mat(GGML_TYPE_TQ2_0, GGML_TYPE_F32, 16, 2, 1024, {1, 1}, {1, 1}));
-    // test_cases.emplace_back(new test_mul_mat(GGML_TYPE_TQ2_0, GGML_TYPE_F32, 16, 4, 1024, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_TQ2_0, GGML_TYPE_F32, 16, 1, 256, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_TQ2_0, GGML_TYPE_F32, 16, 2, 256, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_TQ2_0, GGML_TYPE_F32, 16, 4, 256, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_TQ2_0, GGML_TYPE_F32, 16, 8, 256, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_TQ2_0, GGML_TYPE_F32, 32, 32, 256, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_TQ2_0, GGML_TYPE_F32, 16, 1, 1024, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_TQ2_0, GGML_TYPE_F32, 16, 2, 1024, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_TQ2_0, GGML_TYPE_F32, 16, 4, 1024, {1, 1}, {1, 1}));
 
     for (ggml_type type_a : all_types) {
         for (int i = 1; i < 10; ++i) {
