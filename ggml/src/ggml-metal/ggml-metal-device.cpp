@@ -597,6 +597,12 @@ ggml_metal_pipeline_t ggml_metal_library_get_pipeline_mul_mv(ggml_metal_library_
                 nr0 = N_R0_Q8_0;
                 smem = 32*sizeof(float)*N_R0_Q8_0;
             } break;
+        case GGML_TYPE_TQ2_0:
+            {
+                nsg = N_SG_TQ2_0;
+                nr0 = N_R0_TQ2_0;
+                smem = 32*sizeof(float)*N_R0_TQ2_0;
+            } break;
         case GGML_TYPE_MXFP4:
             {
                 nsg = N_SG_MXFP4;
@@ -816,6 +822,12 @@ ggml_metal_pipeline_t ggml_metal_library_get_pipeline_mul_mv_id(ggml_metal_libra
                 nsg = N_SG_Q8_0;
                 nr0 = N_R0_Q8_0;
                 smem = 32*sizeof(float)*N_R0_Q8_0;
+            } break;
+        case GGML_TYPE_TQ2_0:
+            {
+                nsg = N_SG_TQ2_0;
+                nr0 = N_R0_TQ2_0;
+                smem = 32*sizeof(float)*N_R0_TQ2_0;
             } break;
         case GGML_TYPE_MXFP4:
             {
@@ -1677,6 +1689,111 @@ ggml_metal_pipeline_t ggml_metal_library_get_pipeline_timestep_embedding(ggml_me
     }
 
     res = ggml_metal_library_compile_pipeline(lib, base, name, nullptr);
+
+    return res;
+}
+
+ggml_metal_pipeline_t ggml_metal_library_get_pipeline_out_prod(ggml_metal_library_t lib, const ggml_tensor * op) {
+    assert(op->op == GGML_OP_OUT_PROD);
+    assert(op->type == GGML_TYPE_F32);
+
+    char base[256];
+    char name[256];
+
+    const ggml_type src0t = op->src[0]->type;
+    const ggml_type src1t = op->src[1]->type;
+
+    if (src0t == GGML_TYPE_Q8_0) {
+        snprintf(base, 256, "kernel_out_prod_q8_0_%s", ggml_type_name(src1t));
+    } else if (src0t == GGML_TYPE_Q4_0) {
+        snprintf(base, 256, "kernel_out_prod_q4_0_%s", ggml_type_name(src1t));
+    } else if (src0t == GGML_TYPE_F16 && src1t == GGML_TYPE_F32) {
+        snprintf(base, 256, "kernel_out_prod_f16_f32");
+    } else if (src0t == GGML_TYPE_F32 && src1t == GGML_TYPE_F32) {
+        snprintf(base, 256, "kernel_out_prod_f32");
+    } else if (src0t == GGML_TYPE_F32 && src1t == GGML_TYPE_F16) {
+        snprintf(base, 256, "kernel_out_prod_f32_f16");
+    } else if (src0t == GGML_TYPE_F16 && src1t == GGML_TYPE_F16) {
+        snprintf(base, 256, "kernel_out_prod_f16");
+    } else {
+        GGML_ABORT("fatal error");
+    }
+
+    snprintf(name, 256, "%s", base);
+
+    ggml_metal_pipeline_t res = ggml_metal_library_get_pipeline(lib, name);
+    if (res) {
+        return res;
+    }
+
+    res = ggml_metal_library_compile_pipeline(lib, base, name, nullptr);
+
+    return res;
+}
+
+ggml_metal_pipeline_t ggml_metal_library_get_pipeline_silu_back(ggml_metal_library_t lib, const ggml_tensor * op) {
+    assert(op->op == GGML_OP_SILU_BACK);
+
+    char base[256];
+    char name[256];
+
+    const int64_t n = ggml_nelements(op);
+    const char * suffix = (n % 4 == 0) ? "_4" : "";
+
+    snprintf(base, 256, "kernel_silu_back%s", suffix);
+    snprintf(name, 256, "%s", base);
+
+    ggml_metal_pipeline_t res = ggml_metal_library_get_pipeline(lib, name);
+    if (res) {
+        return res;
+    }
+
+    res = ggml_metal_library_compile_pipeline(lib, base, name, nullptr);
+
+    return res;
+}
+
+ggml_metal_pipeline_t ggml_metal_library_get_pipeline_soft_max_back(ggml_metal_library_t lib, const ggml_tensor * op) {
+    assert(op->op == GGML_OP_SOFT_MAX_BACK);
+
+    char base[256];
+    char name[256];
+
+    const char * suffix = (op->src[0]->ne[0] % 4 == 0) ? "_4" : "";
+
+    snprintf(base, 256, "kernel_soft_max_back%s", suffix);
+    snprintf(name, 256, "%s", base);
+
+    ggml_metal_pipeline_t res = ggml_metal_library_get_pipeline(lib, name);
+    if (res) {
+        return res;
+    }
+
+    res = ggml_metal_library_compile_pipeline(lib, base, name, nullptr);
+
+    ggml_metal_pipeline_set_smem(res, 32*sizeof(float));
+
+    return res;
+}
+
+ggml_metal_pipeline_t ggml_metal_library_get_pipeline_rms_norm_back(ggml_metal_library_t lib, const ggml_tensor * op) {
+    assert(op->op == GGML_OP_RMS_NORM_BACK);
+    GGML_UNUSED(op);
+
+    char base[256];
+    char name[256];
+
+    snprintf(base, 256, "kernel_rms_norm_back");
+    snprintf(name, 256, "%s", base);
+
+    ggml_metal_pipeline_t res = ggml_metal_library_get_pipeline(lib, name);
+    if (res) {
+        return res;
+    }
+
+    res = ggml_metal_library_compile_pipeline(lib, base, name, nullptr);
+
+    ggml_metal_pipeline_set_smem(res, 2*32*sizeof(float));
 
     return res;
 }

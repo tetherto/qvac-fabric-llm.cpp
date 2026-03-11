@@ -12,6 +12,10 @@
 
 #include "ggml-cpp.h"
 
+#ifdef __APPLE__
+#include <TargetConditionals.h>
+#endif
+
 #include "models/models.h"
 
 #include <algorithm>
@@ -2357,7 +2361,13 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
         throw std::runtime_error(format("%s: no CPU backend found", __func__));
     }
     const int i_gpu_start = std::max((int) hparams.n_layer - n_gpu_layers, (int) 0);
-    const int act_gpu_layers = devices.empty() ? 0 : std::min(n_gpu_layers, (int)n_layer + 1);
+    #if TARGET_OS_IPHONE
+    const int max_gpu_layers = (int)n_layer;
+    #else
+    const int max_gpu_layers = (int)n_layer + 1;
+    #endif
+    const int act_gpu_layers = devices.empty() ? 0 : std::min(n_gpu_layers, max_gpu_layers);
+
     auto get_layer_buft_list = [&](int il) -> llama_model::impl::layer_dev {
         const bool is_swa = il < (int) hparams.n_layer && hparams.is_swa(il);
         if (il < i_gpu_start || (il - i_gpu_start) >= act_gpu_layers) {

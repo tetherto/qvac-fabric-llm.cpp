@@ -236,6 +236,11 @@ function gg_run_ctest_release {
     # Check cmake, make and ctest are installed
     gg_check_build_requirements
 
+    # Disable native CPU optimizations for low-perf builds to ensure compatibility
+    if [ ! -z ${GG_BUILD_LOW_PERF} ]; then
+        CMAKE_EXTRA="${CMAKE_EXTRA} -DGGML_NATIVE=OFF"
+    fi
+
     (time cmake -DCMAKE_BUILD_TYPE=Release ${CMAKE_EXTRA} .. ) 2>&1 | tee -a $OUT/${ci}-cmake.log
     (time make -j$(nproc)                                    ) 2>&1 | tee -a $OUT/${ci}-make.log
 

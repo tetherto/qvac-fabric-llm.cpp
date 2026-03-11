@@ -1,0 +1,46 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_EXT_shader_atomic_int64 : enable
+
+#include "types.glsl"
+#include "generic_head.glsl"
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+layout (binding = 0) readonly buffer X {A_TYPE data_a[];};  // predictions
+layout (binding = 1) readonly buffer Y {B_TYPE data_b[];};  // targets
+layout (binding = 2) readonly buffer M {C_TYPE data_m[];};  // masks (float, 1.0 for positions to count, 0.0 to skip)
+layout (binding = 3) buffer D {D_TYPE data_d[];};           // output count
+
+const uint CHUNK_SIZE = 512;
+
+void main() {
+    const uint base = gl_WorkGroupID.x * CHUNK_SIZE;
+    const uint col = gl_LocalInvocationID.x;
+
+    if (gl_WorkGroupID.x == 0 && gl_LocalInvocationID.x == 0) {
+        data_d[0] = D_TYPE(0);
+    }
+
+    barrier();
+
+    uint count = 0;
+    [[unroll]]
+    for (uint i = 0; i < CHUNK_SIZE; i += gl_WorkGroupSize.x) {
+        const uint idx = base + i + col;
+        if (idx >= p.KX) {
+            break;
+        }
+
+        uint position = idx;
+        uint mask_offset = 0 + position * p.KY + 0;
+        float mask_value = data_m[mask_offset];
+
+        if (mask_value > 0.5 && data_a[idx] == data_b[idx]) {
+            count += 1;
+        }
+    }
+
+    atomicAdd(data_d[0], D_TYPE(count));
+}

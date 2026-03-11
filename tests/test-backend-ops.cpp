@@ -2108,6 +2108,39 @@ struct test_swiglu_oai : public test_case {
     }
 };
 
+// GGML_OP_GEGLU_BACK
+struct test_geglu_back : public test_case {
+    const ggml_type type;
+    const std::array<int64_t, 4> ne;
+    float eps;
+
+    std::string vars() override {
+        return VARS_TO_STR3(type, ne, eps);
+    }
+
+    test_geglu_back(ggml_type type = GGML_TYPE_F32,
+                    std::array<int64_t, 4> ne = {64, 5, 4, 3},
+                    float eps = 1e-6f)
+        : type(type), ne(ne), eps(eps) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * gate = ggml_new_tensor(ctx, type, 4, ne.data());
+        ggml_set_name(gate, "gate");
+
+        ggml_tensor * grad = ggml_new_tensor(ctx, type, 4, ne.data());
+        ggml_set_name(grad, "grad");
+
+        ggml_tensor * out = ggml_geglu_back(ctx, grad, gate);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+
+    bool grad_precise() override {
+        return true;
+    }
+};
+
 // GGML_OP_GET_ROWS
 struct test_get_rows : public test_case {
     const ggml_type type;
@@ -5928,6 +5961,124 @@ struct test_cross_entropy_loss_back : public test_case {
     }
 };
 
+// GGML_OP_CROSS_ENTROPY_LOSS_MASKED
+struct test_cross_entropy_loss_masked : public test_case {
+    const ggml_type type;
+    const std::array<int64_t, 4> ne;
+
+    std::string vars() override {
+        return VARS_TO_STR2(type, ne);
+    }
+
+    test_cross_entropy_loss_masked(ggml_type type = GGML_TYPE_F32,
+            std::array<int64_t, 4> ne = {10, 5, 4, 3})
+        : type(type), ne(ne) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * logits = ggml_new_tensor(ctx, type, 4, ne.data());
+        ggml_set_param(logits);
+        ggml_set_name(logits, "logits");
+
+        ggml_tensor * labels = ggml_new_tensor(ctx, type, 4, ne.data());
+        ggml_set_name(labels, "labels");
+
+        labels = ggml_soft_max(ctx, labels);
+        ggml_set_name(labels, "labels_normalized");
+
+        ggml_tensor * mask = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
+        ggml_set_name(mask, "mask");
+
+        ggml_tensor * out = ggml_cross_entropy_loss_masked(ctx, logits, labels, mask);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "mask") == 0) {
+                init_tensor_uniform(t, 0.0f, 1.0f);
+                if (t->type == GGML_TYPE_F32) {
+                    std::vector<float> data(ggml_nelements(t));
+                    ggml_backend_tensor_get(t, data.data(), 0, ggml_nbytes(t));
+                    for (int i = 0; i < (int)data.size(); i++) {
+                        data[i] = data[i] > 0.5f ? 1.0f : 0.0f;
+                    }
+                    ggml_backend_tensor_set(t, data.data(), 0, ggml_nbytes(t));
+                }
+            } else {
+                init_tensor_uniform(t, -100.0f, 100.0f);
+            }
+        }
+    }
+
+    float grad_eps() override {
+        return 1.0f;
+    }
+
+    bool grad_precise() override {
+        return true;
+    }
+};
+
+// GGML_OP_CROSS_ENTROPY_LOSS_MASKED_BACK
+struct test_cross_entropy_loss_masked_back : public test_case {
+    const ggml_type type;
+    const std::array<int64_t, 4> ne;
+
+    std::string vars() override {
+        return VARS_TO_STR2(type, ne);
+    }
+
+    test_cross_entropy_loss_masked_back(ggml_type type = GGML_TYPE_F32,
+            std::array<int64_t, 4> ne = {10, 5, 4, 3})
+        : type(type), ne(ne) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * grad = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
+        ggml_set_name(grad, "grad");
+
+        ggml_tensor * logits = ggml_new_tensor(ctx, type, 4, ne.data());
+        ggml_set_name(logits, "logits");
+
+        ggml_tensor * labels = ggml_new_tensor(ctx, type, 4, ne.data());
+        ggml_set_name(labels, "labels");
+
+        labels = ggml_soft_max(ctx, labels);
+        ggml_set_name(labels, "labels_normalized");
+
+        ggml_tensor * mask = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
+        ggml_set_name(mask, "mask");
+
+        // ggml_cross_entropy_loss_masked_back(ctx, a, b, c, d)
+        // a=logits, b=labels, c=mask, d=grad (scalar)
+        ggml_tensor * out = ggml_cross_entropy_loss_masked_back(ctx, logits, labels, mask, grad);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "mask") == 0) {
+                // Initialize mask with 0.0 or 1.0
+                init_tensor_uniform(t, 0.0f, 1.0f);
+                if (t->type == GGML_TYPE_F32) {
+                    // Safe access for device memory (e.g. Vulkan)
+                    std::vector<float> data(ggml_nelements(t));
+                    ggml_backend_tensor_get(t, data.data(), 0, ggml_nbytes(t));
+                    for (int i = 0; i < (int)data.size(); i++) {
+                        data[i] = data[i] > 0.5f ? 1.0f : 0.0f;
+                    }
+                    ggml_backend_tensor_set(t, data.data(), 0, ggml_nbytes(t));
+                }
+            } else {
+                init_tensor_uniform(t, -1.0f, 1.0f);
+            }
+        }
+    }
+};
+
 // GGML_OP_OPT_STEP_ADAMW
 struct test_opt_step_adamw : public test_case {
     const ggml_type type;
@@ -6581,7 +6732,14 @@ static const ggml_type all_types[] = {
     GGML_TYPE_Q2_K, GGML_TYPE_Q3_K,
     GGML_TYPE_Q4_K, GGML_TYPE_Q5_K,
     GGML_TYPE_Q6_K,
-    // GGML_TYPE_TQ1_0, GGML_TYPE_TQ2_0, // TODO: implement for all backends
+
+    // TODO: implement for all backends
+    GGML_TYPE_TQ1_0,
+    // Temporarily disable TQ2_0 quantization tests to work around a bug in
+    // llvmpipe. Tests pass successfully on all real Vulkan hardware
+    // (Nvidia, ARM GPUs) but fail on llvmpipe with high error values.
+    // GGML_TYPE_TQ2_0,
+
     GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ2_S,
     GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ1_S, GGML_TYPE_IQ1_M,
     GGML_TYPE_IQ4_NL, GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_XS,
@@ -6656,6 +6814,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             }
         }
     }
+
+    test_cases.emplace_back(new test_geglu_back());
 
     for (ggml_type type : {GGML_TYPE_F32, GGML_TYPE_Q4_0}) {
         test_cases.emplace_back(new test_get_rows(type, 300*256,   5,         4,   1,   2, false));
@@ -7229,6 +7389,24 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F16, 1700000,  3, 2592, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F16, 1700000,  1, 2592, {1, 1}, {1, 1}));
 #endif
+
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_TQ1_0, GGML_TYPE_F32, 16, 1, 256, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_TQ1_0, GGML_TYPE_F32, 16, 2, 256, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_TQ1_0, GGML_TYPE_F32, 16, 4, 256, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_TQ1_0, GGML_TYPE_F32, 16, 8, 256, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_TQ1_0, GGML_TYPE_F32, 32, 32, 256, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_TQ1_0, GGML_TYPE_F32, 16, 1, 1024, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_TQ1_0, GGML_TYPE_F32, 16, 2, 1024, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_TQ1_0, GGML_TYPE_F32, 16, 4, 1024, {1, 1}, {1, 1}));
+
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_TQ2_0, GGML_TYPE_F32, 16, 1, 256, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_TQ2_0, GGML_TYPE_F32, 16, 2, 256, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_TQ2_0, GGML_TYPE_F32, 16, 4, 256, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_TQ2_0, GGML_TYPE_F32, 16, 8, 256, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_TQ2_0, GGML_TYPE_F32, 32, 32, 256, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_TQ2_0, GGML_TYPE_F32, 16, 1, 1024, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_TQ2_0, GGML_TYPE_F32, 16, 2, 1024, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_TQ2_0, GGML_TYPE_F32, 16, 4, 1024, {1, 1}, {1, 1}));
 
     for (ggml_type type_a : all_types) {
         for (int i = 1; i < 10; ++i) {
@@ -7810,6 +7988,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_cross_entropy_loss     (GGML_TYPE_F32, {30000, 1, 1, 1}));
     test_cases.emplace_back(new test_cross_entropy_loss_back(GGML_TYPE_F32, {   10, 5, 4, 3}));
     test_cases.emplace_back(new test_cross_entropy_loss_back(GGML_TYPE_F32, {30000, 1, 1, 1}));
+    test_cases.emplace_back(new test_cross_entropy_loss_masked     (GGML_TYPE_F32, {   10, 5, 4, 3}));
+    test_cases.emplace_back(new test_cross_entropy_loss_masked     (GGML_TYPE_F32, {30000, 1, 1, 1}));
+    test_cases.emplace_back(new test_cross_entropy_loss_masked_back(GGML_TYPE_F32, {   10, 5, 4, 3}));
+    test_cases.emplace_back(new test_cross_entropy_loss_masked_back(GGML_TYPE_F32, {30000, 1, 1, 1}));
 
     test_cases.emplace_back(new test_opt_step_adamw(GGML_TYPE_F32, {10, 5, 4, 3}));
     test_cases.emplace_back(new test_opt_step_sgd(GGML_TYPE_F32, {10, 5, 4, 3}));

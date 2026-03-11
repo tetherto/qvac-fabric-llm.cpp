@@ -666,6 +666,62 @@ float16_t dequantFuncIQ4_NL(const in decodeBufIQ4_NL bl, const in uint blockCoor
 }
 #endif
 
+#if defined(DATA_A_TQ2_0)
+layout(buffer_reference, std430, buffer_reference_align = 2) buffer decodeBufTQ2_0 {
+   block_tq2_0 block;
+};
+
+#define TQ2_CM2 1
+#include "tq_utils.comp"
+#undef TQ2_CM2
+
+float16_t dequantFuncTQ2_0(const in decodeBufTQ2_0 bl, const in uint blockCoords[2], const in uint coordInBlock[2])
+{
+    const float16_t d = bl.block.d;
+    const uint idx = coordInBlock[1];
+
+    const int val = tq2_dequantize(bl, idx);
+
+    return d * float16_t(val);
+}
+#endif
+
+#if defined(DATA_A_TQ1_0)
+layout(buffer_reference, std430, buffer_reference_align = 2) buffer decodeBufTQ1_0 {
+   block_tq1_0 block;
+};
+
+float16_t dequantFuncTQ1_0(const in decodeBufTQ1_0 bl, const in uint blockCoords[2], const in uint coordInBlock[2])
+{
+    const float16_t d = bl.block.d;
+    const uint idx = coordInBlock[1];
+
+    const uint pow3[6] = uint[6](1u, 3u, 9u, 27u, 81u, 243u);
+
+    uint xi;
+    if (idx < 160u) {
+        const uint n = idx / 32u;
+        const uint m = idx % 32u;
+        const uint q = uint(bl.block.qs[m]);
+        xi = (((q * pow3[n]) & 255u) * 3u) >> 8u;
+    } else if (idx < 240u) {
+        const uint ee = idx - 160u;
+        const uint n = ee / 16u;
+        const uint m = ee % 16u;
+        const uint q = uint(bl.block.qs[32u + m]);
+        xi = (((q * pow3[n]) & 255u) * 3u) >> 8u;
+    } else {
+        const uint ee = idx - 240u;
+        const uint n = ee / 4u;
+        const uint j = ee % 4u;
+        const uint q = uint(bl.block.qh[j]);
+        xi = (((q * pow3[n]) & 255u) * 3u) >> 8u;
+    }
+
+    return d * float16_t(float(xi) - 1.0f);
+}
+#endif
+
 #if defined(DATA_A_MXFP4)
 layout(buffer_reference, std430, buffer_reference_align = 2) buffer decodeBufMXFP4 {
    block_mxfp4 block;
@@ -695,6 +751,8 @@ float16_t dequantFuncMXFP4(const in decodeBufMXFP4 bl, const in uint blockCoords
 #define dequantFuncA dequantFuncQ5_1
 #elif defined(DATA_A_Q8_0)
 #define dequantFuncA dequantFuncQ8_0
+#elif defined(DATA_A_TQ2_0)
+#define dequantFuncA dequantFuncTQ2_0
 #elif defined(DATA_A_Q2_K)
 #define dequantFuncA dequantFuncQ2_K
 #elif defined(DATA_A_Q3_K)
@@ -727,6 +785,10 @@ float16_t dequantFuncMXFP4(const in decodeBufMXFP4 bl, const in uint blockCoords
 #define dequantFuncA dequantFuncIQ4_XS
 #elif defined(DATA_A_IQ4_NL)
 #define dequantFuncA dequantFuncIQ4_NL
+#elif defined(DATA_A_TQ2_0)
+#define dequantFuncA dequantFuncTQ2_0
+#elif defined(DATA_A_TQ1_0)
+#define dequantFuncA dequantFuncTQ1_0
 #elif defined(DATA_A_MXFP4)
 #define dequantFuncA dequantFuncMXFP4
 #elif defined(DATA_A_F32)

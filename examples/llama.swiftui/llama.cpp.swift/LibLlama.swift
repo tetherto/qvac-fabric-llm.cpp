@@ -5,6 +5,16 @@ enum LlamaError: Error {
     case couldNotInitializeContext
 }
 
+struct LlamaRuntimeOptions {
+    var contextLength: Int32
+    var nGpuLayers: Int32
+    var seed: UInt32
+    var temperature: Float
+    var topP: Float
+    var topK: Int32
+    var flashAttention: Bool
+}
+
 func llama_batch_clear(_ batch: inout llama_batch) {
     batch.n_tokens = 0
 }
@@ -25,9 +35,10 @@ actor LlamaContext {
     private var model: OpaquePointer
     private var context: OpaquePointer
     private var vocab: OpaquePointer
-    private var sampling: UnsafeMutablePointer<llama_sampler>
+    private var sampling: UnsafeMutablePointer<llama_sampler>?
     private var batch: llama_batch
     private var tokens_list: [llama_token]
+    private var runtimeOptions: LlamaRuntimeOptions
     var is_done: Bool = false
 
     /// This variable is used to store temporarily invalid cchars
@@ -38,34 +49,80 @@ actor LlamaContext {
 
     var n_decode: Int32 = 0
 
-    init(model: OpaquePointer, context: OpaquePointer) {
+    init(model: OpaquePointer, context: OpaquePointer, options: LlamaRuntimeOptions) {
         self.model = model
         self.context = context
         self.tokens_list = []
-        self.batch = llama_batch_init(512, 0, 1)
+    self.batch = llama_batch_init(max(Int32(512), options.contextLength), 0, 1)
         self.temporary_invalid_cchars = []
-        let sparams = llama_sampler_chain_default_params()
-        self.sampling = llama_sampler_chain_init(sparams)
-        llama_sampler_chain_add(self.sampling, llama_sampler_init_temp(0.4))
-        llama_sampler_chain_add(self.sampling, llama_sampler_init_dist(1234))
+        self.runtimeOptions = options
+        self.n_len = options.contextLength
         vocab = llama_model_get_vocab(model)
+
+        let chainParams = llama_sampler_chain_default_params()
+        let initialChain = llama_sampler_chain_init(chainParams)
+
+        if options.topK > 0 {
+            llama_sampler_chain_add(initialChain, llama_sampler_init_top_k(options.topK))
+        }
+
+        let clampedTopP = max(0.0, min(Double(options.topP), 1.0))
+        llama_sampler_chain_add(initialChain, llama_sampler_init_top_p(Float(clampedTopP), 1))
+
+    let clampedTemp = max(0.0, Double(options.temperature))
+        llama_sampler_chain_add(initialChain, llama_sampler_init_temp(Float(clampedTemp)))
+
+        let seed = options.seed == 0 ? UInt32.max : options.seed
+        llama_sampler_chain_add(initialChain, llama_sampler_init_dist(seed))
+
+        sampling = initialChain
     }
 
     deinit {
-        llama_sampler_free(sampling)
+        if let sampling {
+            llama_sampler_free(sampling)
+        }
         llama_batch_free(batch)
         llama_model_free(model)
         llama_free(context)
         llama_backend_free()
     }
 
-    static func create_context(path: String) throws -> LlamaContext {
+    private func rebuildSamplerChain() {
+        let chainParams = llama_sampler_chain_default_params()
+        let newChain = llama_sampler_chain_init(chainParams)
+
+        if runtimeOptions.topK > 0 {
+            llama_sampler_chain_add(newChain, llama_sampler_init_top_k(runtimeOptions.topK))
+        }
+
+        let clampedTopP = max(0.0, min(runtimeOptions.topP, 1.0))
+        llama_sampler_chain_add(newChain, llama_sampler_init_top_p(clampedTopP, 1))
+
+    let clampedTemp = max(0.0, Double(runtimeOptions.temperature))
+        llama_sampler_chain_add(newChain, llama_sampler_init_temp(Float(clampedTemp)))
+
+        let seed = runtimeOptions.seed == 0 ? UInt32.max : runtimeOptions.seed
+        llama_sampler_chain_add(newChain, llama_sampler_init_dist(seed))
+
+        if let sampling {
+            llama_sampler_free(sampling)
+        }
+
+        sampling = newChain
+    }
+
+    static func create_context(path: String, options: LlamaRuntimeOptions) throws -> LlamaContext {
         llama_backend_init()
         var model_params = llama_model_default_params()
 
 #if targetEnvironment(simulator)
         model_params.n_gpu_layers = 0
         print("Running on simulator, force use n_gpu_layers = 0")
+#else
+        if options.nGpuLayers >= 0 {
+            model_params.n_gpu_layers = options.nGpuLayers
+        }
 #endif
         let model = llama_model_load_from_file(path, model_params)
         guard let model else {
@@ -77,9 +134,10 @@ actor LlamaContext {
         print("Using \(n_threads) threads")
 
         var ctx_params = llama_context_default_params()
-        ctx_params.n_ctx = 2048
+        ctx_params.n_ctx = UInt32(options.contextLength)
         ctx_params.n_threads       = Int32(n_threads)
         ctx_params.n_threads_batch = Int32(n_threads)
+        ctx_params.flash_attn_type = options.flashAttention ? LLAMA_FLASH_ATTN_TYPE_ENABLED : LLAMA_FLASH_ATTN_TYPE_DISABLED
 
         let context = llama_init_from_model(model, ctx_params)
         guard let context else {
@@ -87,7 +145,13 @@ actor LlamaContext {
             throw LlamaError.couldNotInitializeContext
         }
 
-        return LlamaContext(model: model, context: context)
+        return LlamaContext(model: model, context: context, options: options)
+    }
+
+    func updateSampler(options: LlamaRuntimeOptions) {
+        runtimeOptions = options
+        n_len = options.contextLength
+        rebuildSamplerChain()
     }
 
     func model_info() -> String {
@@ -150,6 +214,10 @@ actor LlamaContext {
 
     func completion_loop() -> String {
         var new_token_id: llama_token = 0
+
+        guard let sampling else {
+            return ""
+        }
 
         new_token_id = llama_sampler_sample(sampling, context, batch.n_tokens - 1)
 
