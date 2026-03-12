@@ -2371,13 +2371,7 @@ void llama_context::opt_epoch(
         }
 
         constexpr bool train = true;
-        // When resuming, adjust idata_in_loop to account for skipped batches.
-        // The callback expects ibatch to be relative to the start of the epoch (batch 0),
-        // not relative to the resume point. So if we resume from batch 2, the first
-        // callback should receive ibatch for batch 2, not batch 3.
-        // Since idata starts at resume_from_batch+1 when resuming, we subtract 1 to get
-        // the correct batch number. When not resuming, idata starts at 0, so we use idata directly.
-        const int64_t  idata_in_loop = (resume_from_batch >= 0) ? (idata - 1) * ubatch_per_ctx : idata * ubatch_per_ctx;
+        const int64_t idata_in_loop = idata * ubatch_per_ctx;
 
         if (opt_loss_type == GGML_OPT_LOSS_TYPE_CROSS_ENTROPY_MASKED && ggml_opt_dataset_masks(dataset)) {
             ggml_opt_dataset_get_batch_host_with_masks(dataset, tokens.data(), n_ctx*sizeof(llama_token), labels_sparse.data(), masks_sparse.data(), idata);
