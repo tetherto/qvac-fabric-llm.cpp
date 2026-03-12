@@ -1,45 +1,69 @@
 # qvac-fabric-llm.cpp
 
-AI inference engine for embedded and mobile platforms**
+**AI inference and training engine for desktop and mobile platforms.**
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 [![Based on llama.cpp](https://img.shields.io/badge/based%20on-llama.cpp%20b7248-orange.svg)](https://github.com/ggml-org/llama.cpp)
 
-qvac-fabric-llm.cpp is a specialized fork of [llama.cpp](https://github.com/ggml-org/llama.cpp) optimized for embedded systems, mobile devices, and enterprise deployment scenarios. It extends the excellent foundation of llama.cpp with additional capabilities focused on memory-based model loading, mobile GPU optimization, and flexible integration patterns.
+`qvac-fabric-llm.cpp` is a specialized fork of [llama.cpp](https://github.com/ggml-org/llama.cpp) optimized for embedded systems, mobile devices, and enterprise deployment scenarios. It extends the excellent foundation of llama.cpp with additional capabilities focused on memory-based model loading, mobile GPU optimization, and flexible integration patterns.
 
 
 ## Key Features
 
-### Memory-Based Model Loading
+The following capabilities are developed and maintained as part of qvac-fabric-llm.cpp. Features marked as *exclusive* are not available in upstream llama.cpp.
 
-Load models directly from memory buffers instead of files - essential for:
-- **Embedded systems** where filesystem access is limited or unavailable
-- **WebAssembly** deployments where models are fetched over network
-- **Encrypted model storage** where models are decrypted in memory
-- **Streaming scenarios** where models are received over network connections
+### LoRA Fine-Tuning *(exclusive)*
+
+`qvac-fabric-llm.cpp` provides native [LoRA](https://arxiv.org/abs/2106.09685) (Low-Rank Adaptation) fine-tuning across CPU, Vulkan, and Metal backends. The training pipeline runs directly on consumer hardware, including mobile phones and integrated GPUs.
+
+- Multi-backend GPU training (NVIDIA, AMD, Intel, Apple, Mali, Adreno)
+- FP32, FP16, Q8, and Q4 training paths
+- Supervised instruction-tuning via assistant-only masked loss (SFT)
+- Checkpoint saving and resumable training
+- Learning rate schedulers (constant, cosine, linear) with warmup support
+- LoRA adapter merging into base models via **llama-export-lora**
+- Verified compatibility with Qwen3 and Gemma3 model architectures
+
+For usage details and CLI reference, see the [Finetuning Guide](examples/training/README.md).
+
+### BitNet Inference and Fine-Tuning *(exclusive)*
+
+Native support for [BitNet](https://arxiv.org/abs/2402.17764) ternary quantized models via the TQ2_0 data type, enabling efficient inference and LoRA fine-tuning of models such as [bitnet_b1_58-xl](https://huggingface.co/gianni-cor/bitnet_b1_58-xl-TQ2_0) on resource-constrained devices.
+
+The official [microsoft/BitNet](https://github.com/microsoft/BitNet) inference framework provides optimized CPU kernels and GPU support limited to CUDA. `qvac-fabric-llm.cpp` **extends** BitNet to all major GPU backends -- Vulkan, Metal, and CPU -- bringing cross-platform GPU-accelerated BitNet inference and on-device fine-tuning to hardware not covered by the upstream framework, including Apple Silicon, mobile GPUs (Adreno, Mali), and AMD/Intel discrete GPUs. Compatible with models such as [bitnet_b1_58-3B](https://huggingface.co/1bitLLM/bitnet_b1_58-3B).
+
+- **Backends**: Vulkan, Metal and CPU TQ2_0 quantization support
+- **Training**: LoRA fine-tuning of BitNet models on Vulkan, Metal, and CPU backends
+- **Conversion**: HuggingFace-to-GGUF conversion for BitNet model architectures
+- Cooperative matrix (coopmat) support for Vulkan devices that expose the extension
+
+### Memory-Based Model Loading *(exclusive)*
+
+Load models directly from memory buffers instead of the filesystem, enabling deployment in environments where disk access is restricted or unavailable.
+
+- Embedded systems with limited or no filesystem access
+- WebAssembly deployments where models are fetched over the network
+- Encrypted model storage where models are decrypted in memory
+- Streaming scenarios where models arrive over network connections
 
 ```cpp
 #include "llama-cpp.h"
 
-// Load model from memory buffer
 std::vector<uint8_t> model_data = /* load from network, decrypt, etc. */;
 auto model = llama_model_load_from_buffer(std::move(model_data), params);
 
-// Or use split model loading with async fulfillment
 auto model = llama_model_load_from_split_futures(paths, n_paths, context, tensor_list, params);
-
-// ... later, fulfill splits as they become available
 llama_model_load_fulfill_split_future(path, context, std::move(streambuf));
 ```
 
-### Optimized Vulkan & OpenCL Backend for Mobile GPUs
+### Mobile GPU Optimization *(exclusive)*
 
-Enhanced GPU support with specific optimizations for **Qualcomm Adreno GPUs**:
-- **Support for running quantized LLMs (Q4_0, Q8) on Adreno 700+ GPUs**
-- **Both Vulkan and OpenCL backends supported on Adreno GPUs**
-- Adreno-specific shader variants for improved performance
-- Q4_K optimized `mul_mat_vec` operations
-- Vulkan Memory Allocator (VMA) integration for efficient memory management, with specific improvements for **Google Pixel** devices
+Enhanced GPU support with targeted optimizations for Qualcomm Adreno GPUs.
+
+- **Vulkan on Adreno 800+**: quantized inference (Q4_0, Q8) and LoRA fine-tuning for Gemma3, Qwen3, and BitNet (TQ2_0) model architectures.
+- **OpenCL on Adreno**: inference support for all other model architectures.
+- Adreno-specific Vulkan shader variants for improved throughput.
+- Vulkan Memory Allocator (VMA) integration for efficient GPU memory management.
 
 
 ## Quick Start
@@ -86,49 +110,28 @@ For more detailed build instructions, see [docs/build.md](docs/build.md).
 
 ## Relationship with llama.cpp
 
-qvac-fabric-llm.cpp is built on top of [llama.cpp](https://github.com/ggml-org/llama.cpp), an excellent open-source LLM inference engine. We regularly synchronize with upstream llama.cpp releases to incorporate the latest improvements, bug fixes, and model support.
+qvac-fabric-llm.cpp is a maintained fork of [llama.cpp](https://github.com/ggml-org/llama.cpp). The project regularly synchronizes with upstream releases to incorporate improvements, bug fixes, and new model support, while extending the engine with capabilities not present in the upstream project.
 
-**Current upstream version:** b7248
+**Current upstream baseline:** llama.cpp b7248
 
-### What We Add
+### Exclusive Features
 
-- Memory-based model loading API
-- Vulkan Memory Allocator (VMA) integration (optimized for Pixel 9 devices)
-- Adreno 700+ GPU support for quantized LLMs (Q4_0, Q8)
-- Vulkan and OpenCL backends for Adreno GPUs
-- Adreno GPU-specific shader optimizations
-- Performance profiling tools
-- Native LoRA fine-tuning across CPU, Vulkan, Metal, and CUDA backends
+The following features are developed in qvac-fabric-llm.cpp and are not available in upstream llama.cpp:
+
+| Feature | Description |
+|---------|-------------|
+| LoRA fine-tuning | On-device training across CPU, Vulkan, and Metal with SFT, checkpointing, and LR scheduling |
+| BitNet inference and training | TQ2_0 quantization on Vulkan, Metal, and CPU for inference and LoRA fine-tuning; extends [microsoft/BitNet](https://github.com/microsoft/BitNet) beyond its CUDA-only GPU support |
+| Memory-based model loading | Load models from in-memory buffers with split-model and async fulfillment support |
+| Mobile GPU optimization | Adreno 800+ quantized inference (Q4_0, Q8), Adreno-specific Vulkan shader variants, VMA integration |
 
 ### Upstream Compatibility
 
-All standard llama.cpp functionality, models, and APIs remain fully compatible. You can:
-- Use any GGUF model supported by llama.cpp
-- Use all standard CLI tools (`llama-cli`, `llama-server`, etc.)
-- Follow llama.cpp documentation for general usage
+All standard llama.cpp functionality, models, and APIs remain fully compatible.
 
----
+- Any GGUF model supported by llama.cpp is supported by qvac-fabric-llm.cpp
+- Existing llama.cpp documentation applies to all non-exclusive features
 
-## Model Support
-
-qvac-fabric-llm.cpp supports all models compatible with llama.cpp. Models must be in GGUF format. Convert from other formats using the provided Python scripts or use pre-converted models from [Hugging Face](https://huggingface.co/models?library=gguf).
-
-## LoRA Fine-Tuning
-
-llama.cpp includes native [LoRA](https://arxiv.org/abs/2106.09685) (Low-Rank Adaptation) fine-tuning across CPU, Vulkan, Metal and CUDA backends.
-
-LoRA fine-tuning represents the weight updates with two smaller matrices through low-rank decomposition while keeping the base model frozen. These new matrices can be trained to adapt to the new data while keeping the overall number of changes low. This makes training possible on devices with very limited memory, including phones and integrated GPUs. Key capabilities include:
-
-- Train LoRA adapters on any GPU (NVIDIA, AMD, Intel, Apple, Mali, Adreno)
-- Full support for FP32/FP16/Q8/Q4 training paths
-- Instruction-tuning via assistant-only masked loss
-- Checkpointing + resumable training
-- Merge LoRA adapters back into a base model `model.gguf`
-- Compatible with Qwen3, Gemma, LLaMA, TinyLlama, and other GGUF models
-
-The [Finetuning Guide](examples/training/README.md) has more details.
-
----
 
 ## Contributing
 
@@ -138,7 +141,6 @@ We welcome contributions! Please see our development workflow:
 2. Create a feature branch from `master`
 3. Submit a pull request
 
----
 
 ## License
 
