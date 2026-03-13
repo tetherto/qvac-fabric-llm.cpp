@@ -686,6 +686,47 @@ jobs:
           path: llama-${{ steps.tag.outputs.name }}-bin-${{ matrix.chip_type }}-openEuler-${{ matrix.arch }}.tar.gz
           name: llama-bin-${{ matrix.chip_type }}-openEuler-${{ matrix.arch }}.tar.gz
 
+  android-build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Clone
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up JDK
+        uses: actions/setup-java@v3
+        with:
+          java-version: 17
+          distribution: zulu
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          log-accepted-android-sdk-licenses: false
+
+      - name: Build
+        run: |
+          cd examples/llama.android
+          ./gradlew build --no-daemon
+
+      - name: Determine tag name
+        id: tag
+        uses: ./.github/actions/get-tag-name
+
+      - name: Pack artifacts
+        id: pack_artifacts
+        run: |
+          cp LICENSE ./examples/llama.android/app/build/
+          zip -r llama-${{ steps.tag.outputs.name }}-bin-android.zip ./examples/llama.android/app/build/*
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          path: llama-${{ steps.tag.outputs.name }}-bin-android.zip
+          name: llama-bin-android.zip
+
   release:
     if: ${{ ( github.event_name == 'push' && github.ref == 'refs/heads/master' ) || github.event.inputs.create_release == 'true' }}
 
@@ -707,6 +748,7 @@ jobs:
       - macOS-x64
       - ios-xcode-build
       - openEuler-cann
+      - android-build
 
     steps:
       - name: Clone
@@ -795,6 +837,9 @@ jobs:
             - [Windows x64 (Vulkan)](https://github.com/ggml-org/llama.cpp/releases/download/${{ steps.tag.outputs.name }}/llama-${{ steps.tag.outputs.name }}-bin-win-vulkan-x64.zip)
             - [Windows x64 (SYCL)](https://github.com/ggml-org/llama.cpp/releases/download/${{ steps.tag.outputs.name }}/llama-${{ steps.tag.outputs.name }}-bin-win-sycl-x64.zip)
             - [Windows x64 (HIP)](https://github.com/ggml-org/llama.cpp/releases/download/${{ steps.tag.outputs.name }}/llama-${{ steps.tag.outputs.name }}-bin-win-hip-radeon-x64.zip)
+
+            **Android:**
+            - [Android](https://github.com/ggml-org/llama.cpp/releases/download/${{ steps.tag.outputs.name }}/llama-${{ steps.tag.outputs.name }}-bin-android.zip)
 
             **openEuler:**
             - [openEuler x86 (310p)](https://github.com/ggml-org/llama.cpp/releases/download/${{ steps.tag.outputs.name }}/llama-${{ steps.tag.outputs.name }}-bin-310p-openEuler-x86.tar.gz)
