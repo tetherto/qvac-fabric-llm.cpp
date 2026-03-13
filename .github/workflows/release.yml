@@ -148,8 +148,6 @@ jobs:
         include:
           - build: 'x64'
             os: ubuntu-22.04
-          - build: 's390x'
-            os: ubuntu-24.04-s390x
           # GGML_BACKEND_DL and GGML_CPU_ALL_VARIANTS are not currently supported on arm
           # - build: 'arm64'
           #   os: ubuntu-22.04-arm
@@ -348,10 +346,6 @@ jobs:
             arch: 'x64'
             defines: '-DGGML_VULKAN=ON'
             target: 'ggml-vulkan'
-          - backend: 'opencl-adreno'
-            arch: 'arm64'
-            defines: '-G "Ninja Multi-Config" -D CMAKE_TOOLCHAIN_FILE=cmake/arm64-windows-llvm.cmake -DCMAKE_PREFIX_PATH="$env:RUNNER_TEMP/opencl-arm64-release" -DGGML_OPENCL=ON -DGGML_OPENCL_USE_ADRENO_KERNELS=ON'
-            target: 'ggml-opencl'
 
     steps:
       - name: Clone
@@ -379,26 +373,6 @@ jobs:
         run: |
           choco install ninja
 
-      - name: Install OpenCL Headers and Libs
-        id: install_opencl
-        if: ${{ matrix.backend == 'opencl-adreno' && matrix.arch == 'arm64' }}
-        run: |
-          git clone https://github.com/KhronosGroup/OpenCL-Headers
-          cd OpenCL-Headers
-          cmake -B build `
-            -DBUILD_TESTING=OFF `
-            -DOPENCL_HEADERS_BUILD_TESTING=OFF `
-            -DOPENCL_HEADERS_BUILD_CXX_TESTS=OFF `
-            -DCMAKE_INSTALL_PREFIX="$env:RUNNER_TEMP/opencl-arm64-release"
-          cmake --build build --target install
-          git clone https://github.com/KhronosGroup/OpenCL-ICD-Loader
-          cd OpenCL-ICD-Loader
-          cmake -B build-arm64-release `
-            -A arm64 `
-            -DCMAKE_PREFIX_PATH="$env:RUNNER_TEMP/opencl-arm64-release" `
-            -DCMAKE_INSTALL_PREFIX="$env:RUNNER_TEMP/opencl-arm64-release"
-          cmake --build build-arm64-release --target install --config release
-
       - name: Build
         id: cmake_build
         run: |
@@ -415,74 +389,6 @@ jobs:
         with:
           path: llama-bin-win-${{ matrix.backend }}-${{ matrix.arch }}.zip
           name: llama-bin-win-${{ matrix.backend }}-${{ matrix.arch }}.zip
-
-  windows-cuda:
-    runs-on: windows-2022
-
-    strategy:
-      matrix:
-        cuda: ['12.4']
-
-    steps:
-      - name: Clone
-        id: checkout
-        uses: actions/checkout@v4
-
-      - name: Install ccache
-        uses: ggml-org/ccache-action@v1.2.16
-        with:
-          key: windows-cuda-${{ matrix.cuda }}
-          variant: ccache
-          evict-old-files: 1d
-
-      - name: Install Cuda Toolkit
-        uses: ./.github/actions/windows-setup-cuda
-        with:
-          cuda_version: ${{ matrix.cuda }}
-
-      - name: Install Ninja
-        id: install_ninja
-        run: |
-          choco install ninja
-
-      - name: Build
-        id: cmake_build
-        shell: cmd
-        run: |
-          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64
-          cmake -S . -B build -G "Ninja Multi-Config" ^
-            -DGGML_BACKEND_DL=ON ^
-            -DGGML_NATIVE=OFF ^
-            -DGGML_CPU=OFF ^
-            -DGGML_CUDA=ON ^
-            -DLLAMA_CURL=OFF
-          set /A NINJA_JOBS=%NUMBER_OF_PROCESSORS%-1
-          cmake --build build --config Release -j %NINJA_JOBS% --target ggml-cuda
-
-      - name: Pack artifacts
-        id: pack_artifacts
-        run: |
-          7z a -snl llama-bin-win-cuda-${{ matrix.cuda }}-x64.zip .\build\bin\Release\ggml-cuda.dll
-
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          path: llama-bin-win-cuda-${{ matrix.cuda }}-x64.zip
-          name: llama-bin-win-cuda-${{ matrix.cuda }}-x64.zip
-
-      - name: Copy and pack Cuda runtime
-        run: |
-          echo "Cuda install location: ${{ env.CUDA_PATH }}"
-          $dst='.\build\bin\cudart\'
-          robocopy "${{env.CUDA_PATH}}\bin" $dst cudart64_*.dll cublas64_*.dll cublasLt64_*.dll
-          robocopy "${{env.CUDA_PATH}}\lib" $dst cudart64_*.dll cublas64_*.dll cublasLt64_*.dll
-          7z a cudart-llama-bin-win-cuda-${{ matrix.cuda }}-x64.zip $dst\*
-
-      - name: Upload Cuda runtime
-        uses: actions/upload-artifact@v4
-        with:
-          path: cudart-llama-bin-win-cuda-${{ matrix.cuda }}-x64.zip
-          name: cudart-llama-bin-win-cuda-${{ matrix.cuda }}-x64.zip
 
   windows-sycl:
     runs-on: windows-2022
@@ -793,7 +699,6 @@ jobs:
     needs:
       - windows
       - windows-cpu
-      - windows-cuda
       - windows-sycl
       - windows-hip
       - ubuntu-22-cpu
@@ -883,12 +788,10 @@ jobs:
             **Linux:**
             - [Ubuntu x64 (CPU)](https://github.com/ggml-org/llama.cpp/releases/download/${{ steps.tag.outputs.name }}/llama-${{ steps.tag.outputs.name }}-bin-ubuntu-x64.tar.gz)
             - [Ubuntu x64 (Vulkan)](https://github.com/ggml-org/llama.cpp/releases/download/${{ steps.tag.outputs.name }}/llama-${{ steps.tag.outputs.name }}-bin-ubuntu-vulkan-x64.tar.gz)
-            - [Ubuntu s390x (CPU)](https://github.com/ggml-org/llama.cpp/releases/download/${{ steps.tag.outputs.name }}/llama-${{ steps.tag.outputs.name }}-bin-ubuntu-s390x.tar.gz)
 
             **Windows:**
             - [Windows x64 (CPU)](https://github.com/ggml-org/llama.cpp/releases/download/${{ steps.tag.outputs.name }}/llama-${{ steps.tag.outputs.name }}-bin-win-cpu-x64.zip)
             - [Windows arm64 (CPU)](https://github.com/ggml-org/llama.cpp/releases/download/${{ steps.tag.outputs.name }}/llama-${{ steps.tag.outputs.name }}-bin-win-cpu-arm64.zip)
-            - [Windows x64 (CUDA)](https://github.com/ggml-org/llama.cpp/releases/download/${{ steps.tag.outputs.name }}/llama-${{ steps.tag.outputs.name }}-bin-win-cuda-12.4-x64.zip)
             - [Windows x64 (Vulkan)](https://github.com/ggml-org/llama.cpp/releases/download/${{ steps.tag.outputs.name }}/llama-${{ steps.tag.outputs.name }}-bin-win-vulkan-x64.zip)
             - [Windows x64 (SYCL)](https://github.com/ggml-org/llama.cpp/releases/download/${{ steps.tag.outputs.name }}/llama-${{ steps.tag.outputs.name }}-bin-win-sycl-x64.zip)
             - [Windows x64 (HIP)](https://github.com/ggml-org/llama.cpp/releases/download/${{ steps.tag.outputs.name }}/llama-${{ steps.tag.outputs.name }}-bin-win-hip-radeon-x64.zip)
