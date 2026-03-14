@@ -40,7 +40,7 @@ void ggml_cuda_out_prod(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
         }
     } else {
         src0_f32 = (float *) src0->data;
-    } 
+    }
 
     if (src1_is_quantized) {
         const size_t src1_size = ggml_nelements(src1);
@@ -56,8 +56,8 @@ void ggml_cuda_out_prod(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
         }
     } else {
         src1_f32 = (float *) src1->data;
-    } 
-    
+    }
+
 
     GGML_ASSERT(ne01 == ne11);
     GGML_ASSERT(ne0 == ne00);
@@ -86,10 +86,10 @@ void ggml_cuda_out_prod(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 
     const bool src1_T = ggml_is_transposed(src1);
     const cublasOperation_t src1_cublas_op =  src1_T ? CUBLAS_OP_N : CUBLAS_OP_T;
-    const int64_t           ldb            = allocated_src1 ? 
+    const int64_t           ldb            = allocated_src1 ?
                                              (src1_T ? ne10 : ne11) :
                                              ((src1_T ?        nb10 :        nb11) /  sizeof(float));
-                                
+
     // Only assert for non dequantized src1
     if (!allocated_src1) {
         GGML_ASSERT((src1_T ? nb11 : nb10) == sizeof(float));

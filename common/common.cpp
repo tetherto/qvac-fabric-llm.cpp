@@ -1783,7 +1783,7 @@ ggml_opt_dataset_t common_opt_sft_dataset_init(
 
     std::vector<json> conversations;
     std::istringstream content_stream(json_content);
-    
+
     std::string line;
     while (std::getline(content_stream, line)) {
         if (line.empty() || line[0] == '#') continue;
@@ -1820,7 +1820,7 @@ ggml_opt_dataset_t common_opt_sft_dataset_init(
     // While chat templates render appropriately, we must parse the rendered string to find
     // the boundaries of the "assistant" role to calculate loss gracefully.
     // Currently, this only supports ChatML (Qwen, etc.) and Gemma formats.
-    // A more reliable, model-agnostic method would require common_chat_templates_apply to 
+    // A more reliable, model-agnostic method would require common_chat_templates_apply to
     // return token role spans directly, which is not yet supported in common/chat.cpp.
     const std::string START_TAG = "<|im_start|>";
     const std::string START_SYS = "<|im_start|>system\n";
@@ -1855,7 +1855,7 @@ ggml_opt_dataset_t common_opt_sft_dataset_init(
                 inputs.use_jinja = true;
                 try {
                     render = common_chat_templates_apply(chat_templates.get(), inputs).prompt;
-                    
+
                     size_t last_im_end = render.rfind("<|im_end|>");
                     if (last_im_end != std::string::npos) {
                         size_t end_pos = last_im_end + 10; // length of "<|im_end|>"
@@ -1972,8 +1972,8 @@ ggml_opt_dataset_t common_opt_sft_dataset_init(
             size_t t_hi = token_count_prefix(render, sp.hi);
             if (t_lo > tokens_full.size()) t_lo = tokens_full.size();
             if (t_hi > tokens_full.size()) t_hi = tokens_full.size();
-            
-            
+
+
             for (size_t t = t_lo; t < t_hi; ++t) {
                 assistant_mask[t] = 1;
                 ++assistant_token_count;
@@ -1996,26 +1996,26 @@ ggml_opt_dataset_t common_opt_sft_dataset_init(
 
     std::vector<std::vector<llama_token>> final_samples;
     std::vector<std::vector<int32_t>> final_masks;
-        
+
     llama_token pad_token = llama_vocab_pad(vocab);
     if (pad_token == LLAMA_TOKEN_NULL) {
         pad_token = llama_vocab_eos(vocab);
     }
-    
+
     for (size_t i = 0; i < all_tokenized_data.size(); ++i) {
         const auto& conv_tokens = all_tokenized_data[i];
         const auto& conv_mask = all_assistant_masks[i];
-        
+
         if ((int64_t)conv_tokens.size() > ne_datapoint) {
             LOG_WRN("Skipping conversation %zu: too long (%zu tokens > %lld)\n", i, conv_tokens.size(), (long long)ne_datapoint);
             continue;
         }
-        
+
         size_t conv_assistant_tokens = 0;
         for (int32_t mask_val : conv_mask) {
             if (mask_val == 1) conv_assistant_tokens++;
         }
-        
+
         if (conv_assistant_tokens == 0) {
             LOG_WRN("Skipping conversation %zu: no assistant tokens\n", i);
             continue;
@@ -2023,14 +2023,14 @@ ggml_opt_dataset_t common_opt_sft_dataset_init(
 
         std::vector<llama_token> sample_tokens = conv_tokens;
         std::vector<int32_t> sample_mask = conv_mask;
-        
+
         sample_tokens.resize(ne_datapoint, pad_token);
         sample_mask.resize(ne_datapoint, 0); // Padding tokens are not trained on
-        
+
         final_samples.push_back(sample_tokens);
         final_masks.push_back(sample_mask);
     }
-    
+
     all_tokenized_data = std::move(final_samples);
     all_assistant_masks = std::move(final_masks);
 
@@ -2040,7 +2040,7 @@ ggml_opt_dataset_t common_opt_sft_dataset_init(
         GGML_TYPE_I32, GGML_TYPE_I32, GGML_TYPE_I32,
         /*ne_datapoint=*/ne_datapoint, /*ne_label=*/ne_datapoint, /*ne_mask=*/ne_datapoint,
         /*ndata=*/ndata, /*ndata_shard=*/1);
-    
+
     if (result == nullptr) {
         return nullptr;
     }

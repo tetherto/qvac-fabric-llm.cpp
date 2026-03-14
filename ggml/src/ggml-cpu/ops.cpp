@@ -1729,7 +1729,7 @@ static void ggml_compute_forward_count_equal_masked_i32(
         for (int64_t i00 = 0; i00 < ne00; ++i00) {
             const int32_t val0 = *((const int32_t *) (data0 + i00*nb00));
             const int32_t val1 = *((const int32_t *) (data1 + i00*nb10));
-            
+
             float mask_val;
             if (ggml_are_same_shape(src0, src2)) {
                 mask_val = *((const float *) (data2 + i00*src2->nb[0]));
@@ -1737,7 +1737,7 @@ static void ggml_compute_forward_count_equal_masked_i32(
                 const char * mask_ptr = (const char *) src2->data + 0*src2->nb[0] + i00*src2->nb[1] + 0*src2->nb[2];
                 mask_val = *((const float *) mask_ptr);
             }
-            
+
             const bool mask = mask_val > 0.5f;
 
             if (mask == 1) {
@@ -10552,7 +10552,7 @@ static void ggml_compute_forward_cross_entropy_loss_masked_f32(
         ggml_tensor * dst) {
 
     const ggml_tensor * src0 = dst->src[0];  // logits
-    const ggml_tensor * src1 = dst->src[1];  // targets 
+    const ggml_tensor * src1 = dst->src[1];  // targets
     const ggml_tensor * src2 = dst->src[2];  // mask (1 for assistant tokens, 0 for masked)
 
     GGML_ASSERT(src0->type == GGML_TYPE_F32);
@@ -10594,21 +10594,21 @@ static void ggml_compute_forward_cross_entropy_loss_masked_f32(
 
         float max = -INFINITY;
         ggml_vec_max_f32(nc, &max, s0);
-        
+
         const ggml_float sum_softmax = ggml_vec_log_soft_max_f32(nc, st, s0, max);
         assert(sum_softmax >= 0.0);
 
         ggml_vec_add1_f32(nc, st, st, -sum_softmax);
-        
+
         float sum_st = 0.0f;
         for (int64_t i = 0; i < nc; i++) {
             sum_st += st[i] * s1[i];
         }
-        
+
         sum_thread += sum_st;
         valid_tokens_thread++;
     }
-    
+
     sums[ith] = sum_thread;
     valid_counts[ith] = valid_tokens_thread;
     ggml_barrier(params->threadpool);
@@ -10616,12 +10616,12 @@ static void ggml_compute_forward_cross_entropy_loss_masked_f32(
     if (ith == 0) {
         float total_loss = 0.0f;
         int64_t total_valid = 0;
-        
+
         for (int i = 0; i < nth; i++) {
             total_loss += sums[i];
             total_valid += valid_counts[i];
         }
-        
+
         float * dp = (float *) dst->data;
         if (total_valid > 0) {
             float final_loss = -total_loss / (float)total_valid;
@@ -10670,7 +10670,7 @@ static void ggml_compute_forward_cross_entropy_loss_masked_back_f32(
     const int64_t ir1 = MIN(ir0 + dr, nr);
 
     const float upstream_grad = ((const float *) grad->data)[0];
-    
+
     float d_scale = 0.0f;
     if (total_valid > 0) {
         d_scale = upstream_grad / (float) total_valid;
@@ -10694,7 +10694,7 @@ static void ggml_compute_forward_cross_entropy_loss_masked_back_f32(
             ggml_vec_scale_f32(nc, ds0, d_scale);
         } else {
             ggml_vec_set_f32(nc, ds0, 0.0f);
-            
+
         }
     }
 }

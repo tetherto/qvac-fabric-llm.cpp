@@ -14883,7 +14883,7 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
         case GGML_OP_SUB:
         case GGML_OP_MUL:
         case GGML_OP_DIV:
-	        return (op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_F16) &&
+            return (op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_F16) &&
                    (op->src[1]->type == GGML_TYPE_F32 || op->src[1]->type == GGML_TYPE_F16) &&
                    (op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16);
         case GGML_OP_ADD_ID:

@@ -87,7 +87,7 @@ void compute_outputs(const uint32_t first_row, const uint32_t num_rows) {
                     }
                 }
             }
-            temp[jcol][n] = acc; 
+            temp[jcol][n] = acc;
         }
     }
 

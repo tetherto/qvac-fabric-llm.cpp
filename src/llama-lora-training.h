@@ -21,10 +21,10 @@ void llama_lora_create_tensor_pair(
     struct ggml_tensor ** lora_b);
 
 struct llama_adapter_lora * llama_lora_create_adapter(
-    struct llama_model * model, 
+    struct llama_model * model,
     const struct llama_lora_training_params * params);
 
 bool llama_lora_allocate_buffers(
-    struct llama_adapter_lora * adapter, 
+    struct llama_adapter_lora * adapter,
     struct llama_model * model);
 

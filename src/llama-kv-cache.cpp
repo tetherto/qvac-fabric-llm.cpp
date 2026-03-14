@@ -1135,13 +1135,13 @@ ggml_tensor * llama_kv_cache::get_k_lora(ggml_context * ctx, ggml_tensor * k_cur
     if (sinfo.s0 == 0) {
         return k_cur;
     }
-    
+
     slot_info past_sinfo = sinfo;
     past_sinfo.s0 = 0;
     past_sinfo.s1 = sinfo.s0 - 1;
 
     ggml_tensor * k_past = get_k(ctx, il, n_kv, past_sinfo);
-    
+
     return ggml_concat(ctx, k_past, k_cur, 2);
 }
 
@@ -1149,12 +1149,12 @@ ggml_tensor * llama_kv_cache::get_v_lora(ggml_context * ctx, ggml_tensor * v_cur
     if (sinfo.s0 == 0) {
         return v_cur;
     }
-    
+
     slot_info past_sinfo = sinfo;
     past_sinfo.s0 = 0;
     past_sinfo.s1 = sinfo.s0 - 1;
     ggml_tensor * v_past = get_v(ctx, il, n_kv, past_sinfo);
-    
+
     return ggml_concat(ctx, v_past, v_cur, 2);
 }
 

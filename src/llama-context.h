@@ -172,7 +172,7 @@ struct llama_context {
 
     // Optimizer state access for checkpointing (delegated to ggml_opt API)
     int64_t opt_get_iter();
-    
+
     // Optimizer state persistence
     bool opt_save_state(const char* filename);
     bool opt_load_state(const char* filename);
@@ -291,7 +291,7 @@ private:
     // training
     ggml_opt_context_t opt_ctx = nullptr;
     uint32_t original_n_ctx_train = 0;
-    
+
     // optimizer state loading (deferred until after ggml_opt_build)
     std::string pending_optimizer_checkpoint_path;
     bool should_load_optimizer_tensors = false;

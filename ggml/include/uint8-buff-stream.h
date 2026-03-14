@@ -20,7 +20,7 @@
 #    define GGML_CLASS_API
 #endif
 
-/// @brief Custom basic_streambuf<char> for uint8_t input data, that owns the underlying data. 
+/// @brief Custom basic_streambuf<char> for uint8_t input data, that owns the underlying data.
 /// @note basic_streambuf<char> has more support on different platforms than basic_streambuf<uint8_t>
 /// which is missing on some platforms (e.g. MacOS, newer NDKs). C++ 17 provides additional guarantees for char.
 class GGML_CLASS_API Uint8BufferStreamBuf : public std::basic_streambuf<char> {

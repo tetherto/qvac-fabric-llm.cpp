@@ -1422,7 +1422,7 @@ extern "C" {
         // Optional checkpoint loading
         const char * checkpoint_path;        // path to checkpoint file to load optimizer state from (nullptr = don't load)
         bool load_optimizer_state;          // whether to load optimizer state from checkpoint_path
-        
+
         bool assistant_loss_only;
     };
 
@@ -1482,7 +1482,7 @@ extern "C" {
         uint32_t target_modules;
         int32_t  rank;
         float    alpha;
-        float    dropout;    // reserved, not yet implemented 
+        float    dropout;    // reserved, not yet implemented
         float    init_std;
         uint32_t seed;       // seed for reproducible weight initialization (0 = non-deterministic)
     };
@@ -1497,7 +1497,7 @@ extern "C" {
 
     // LoRA parameter filter (returns true for LoRA tensors only)
     LLAMA_API bool llama_opt_param_filter_lora(const struct ggml_tensor * tensor, void * userdata);
-    
+
     LLAMA_API int64_t llama_opt_get_iter(struct llama_context * ctx);
 
     LLAMA_API bool llama_lora_save_adapter(
@@ -1505,7 +1505,7 @@ extern "C" {
         const char * filename,
         const struct llama_model * model
     );
-    
+
     LLAMA_API bool llama_lora_save_checkpoint(
         const struct llama_adapter_lora * adapter,
         const char * filename,
