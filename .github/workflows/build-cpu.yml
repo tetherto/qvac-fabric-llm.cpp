@@ -72,9 +72,17 @@ jobs:
         id: checkout
         uses: actions/checkout@v6
 
+      - name: CPU feature hash
+        id: cpu_info
+        run: |
+          CPU_HASH=$(echo | gcc -march=native -dM -E - 2>/dev/null | sort | md5sum | cut -d' ' -f1)
+          echo "cpu_hash=${CPU_HASH}" >> "$GITHUB_OUTPUT"
+          echo "CPU feature hash: ${CPU_HASH}"
+
       - name: ccache
         uses: ggml-org/ccache-action@v1.2.24
         with:
+          key: cpu-${{ matrix.os }}-${{ steps.cpu_info.outputs.cpu_hash }}
           restore: false
           save: false
 
