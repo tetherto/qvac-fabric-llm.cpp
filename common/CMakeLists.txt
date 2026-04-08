@@ -203,8 +203,8 @@ endif()
 target_include_directories(
   ${TARGET}
   PUBLIC
-    $<BUILD_INTERFACE:${CMAKE_SOURCE_DIR}/common$<SEMICOLON>${CMAKE_SOURCE_DIR}/vendor>
-    $<INSTALL_INTERFACE:${LLAMA_INCLUDE_INSTALL_DIR}/common>)
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}$<SEMICOLON>${CMAKE_CURRENT_SOURCE_DIR}/../vendor>
+    $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
 
 target_compile_features   (${TARGET} PUBLIC cxx_std_17)
 target_link_libraries     (${TARGET} PRIVATE ${LLAMA_COMMON_EXTRA_LIBS} PUBLIC llama Threads::Threads)
