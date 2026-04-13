@@ -140,18 +140,14 @@ bool llama_lora_allocate_buffers(
     
     std::map<ggml_backend_buffer_type_t, ggml_context *> ctx_map;
     
-    ggml_backend_buffer_type_t buft = ggml_backend_cpu_buffer_type(); // fallback to CPU
-    
-    // Find any layer tensor to determine the correct backend  
-    for (const auto & tensor_pair : model->tensors_by_name) {
-        const std::string & name = tensor_pair.first;
-        struct ggml_tensor * tensor = tensor_pair.second;
-        
-        if (name.find("blk.") != std::string::npos && tensor && tensor->buffer) {
-            buft = ggml_backend_buffer_get_type(tensor->buffer);
-            break;
-        }
-    }
+    // LoRA tensors are F32/F16 and need a buffer type that:
+    //  1. Supports training ops (OPT_STEP_ADAMW, gradient accumulation)
+    //  2. Can handle set_tensor for floating-point types
+    // CPU_REPACK buffers crash on F32/F16 (NULL repack traits), and GPU
+    // buffers may not support OPT_STEP_ADAMW on all devices. Use a plain
+    // host-accessible CPU buffer — the scheduler handles cross-backend
+    // copies for forward/backward passes automatically.
+    ggml_backend_buffer_type_t buft = ggml_backend_cpu_buffer_type();
     
     if (adapter->ctxs.empty()) {
         LLAMA_LOG_ERROR("No contexts found in adapter\n");
