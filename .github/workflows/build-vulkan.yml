@@ -182,6 +182,8 @@ jobs:
           if nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | grep -q "T4"; then
             IS_T4=true
             echo "::notice::Detected NVIDIA T4 -- will tolerate segfault-on-exit (known driver bug)"
+            # FLASH_ATTN_EXT causes GPU shader hangs on T4 (Turing) FlashAttention path
+            export GGML_SKIP_FLASH_ATTN=1
           fi
           ctest -L main --verbose --timeout 900 2>&1 | tee ctest_output.log
           CTEST_EXIT=${PIPESTATUS[0]}

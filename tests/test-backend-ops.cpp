@@ -12160,69 +12160,72 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
-    // prefill-shaped cases with long KV (nb >= 32, kv >= 1024): covers the
-    // XMX/GEMM-accelerated SYCL FA path which only activates for these shapes.
-    for (int kv : { 1024, 2048, }) {
-        for (int hs : { 64, 128, 256, }) {
-            for (int nb : { 32, 64, }) {
-                for (ggml_type type_KV : { GGML_TYPE_F16, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, }) {
-                    test_cases.emplace_back(new test_flash_attn_ext(hs, hs, 8, {4, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV));
+    // FLASH_ATTN_EXT causes GPU shader hangs on NVIDIA T4 (Turing) scalar FA path
+    if (!getenv("GGML_SKIP_FLASH_ATTN")) {
+        // prefill-shaped cases with long KV (nb >= 32, kv >= 1024): covers the
+        // XMX/GEMM-accelerated SYCL FA path which only activates for these shapes.
+        for (int kv : { 1024, 2048, }) {
+            for (int hs : { 64, 128, 256, }) {
+                for (int nb : { 32, 64, }) {
+                    for (ggml_type type_KV : { GGML_TYPE_F16, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, }) {
+                        test_cases.emplace_back(new test_flash_attn_ext(hs, hs, 8, {4, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV));
+                    }
                 }
             }
         }
-    }
 
-    // KV-head counts that do not divide the device count
-    for (int hs : { 128, 256, 512, }) {
-        for (int nh : { 1, 2, 6, }) {
-            for (int nr2 : { 4, 8, }) {
-                for (int nb : { 75, 1024, }) {
-                    test_cases.emplace_back(new test_flash_attn_ext(hs, hs, nh, {nr2, 1}, 1024, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+        // KV-head counts that do not divide the device count
+        for (int hs : { 128, 256, 512, }) {
+            for (int nh : { 1, 2, 6, }) {
+                for (int nr2 : { 4, 8, }) {
+                    for (int nb : { 75, 1024, }) {
+                        test_cases.emplace_back(new test_flash_attn_ext(hs, hs, nh, {nr2, 1}, 1024, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+                    }
                 }
             }
         }
-    }
 
-    for (int hsk : { 40, 64, 72, 80, 96, 128, 192, 256, 320, 512, 576 }) {
-        for (int hsv : { 40, 64, 72, 80, 96, 128, 192, 256, 512 }) {
-            if (hsk != 96 && hsk != 192 && hsk != 320 && hsk != 576 && hsk != hsv) continue;
-            if (hsk ==  96 && (hsv !=  64 && hsv !=  96)) continue; // MiniCPM3
-            if (hsk == 192 && (hsv != 128 && hsv != 192)) continue;
-            if (hsk == 576 && hsv != 512) continue; // DeepSeek MLA
-            if (hsk == 320 && hsv != 256) continue; // Mistral4 MLA
+        for (int hsk : { 40, 64, 72, 80, 96, 128, 192, 256, 320, 512, 576 }) {
+            for (int hsv : { 40, 64, 72, 80, 96, 128, 192, 256, 512 }) {
+                if (hsk != 96 && hsk != 192 && hsk != 320 && hsk != 576 && hsk != hsv) continue;
+                if (hsk ==  96 && (hsv !=  64 && hsv !=  96)) continue; // MiniCPM3
+                if (hsk == 192 && (hsv != 128 && hsv != 192)) continue;
+                if (hsk == 576 && hsv != 512) continue; // DeepSeek MLA
+                if (hsk == 320 && hsv != 256) continue; // Mistral4 MLA
 
-            for (bool mask : { true, false } ) {
-                for (bool sinks : { true, false } ) {
-                    for (float max_bias : { 0.0f, 8.0f }) {
-                        if (!mask && max_bias > 0.0f) continue;
-                        for (float logit_softcap : {0.0f, 10.0f}) {
-                            if (hsk != 128 && logit_softcap != 0.0f) continue;
-                            for (int nh : { 1, 4 }) {
-                                if (nh == 1 && hsk != 320 && hsk != 576) continue;
-                                for (int nr3 : { 1, 3, }) {
-                                    if (hsk > 64 && nr3 > 1) continue; // skip broadcast for large head sizes
-                                    for (int nr2 : { 1, 4, 8, 12, 16, 20, 32 }) {
-                                        if (nr2 ==  8 && hsk != 192) continue;
-                                        if (nr2 == 12 && hsk != 128) continue;
-                                        if (nr2 == 16 && hsk != 192) continue;
-                                        if (nr2 == 20 && (nh != 1 || hsk != 576)) continue;
-                                        if (nr2 == 32 && (nh != 1 || hsk != 320)) continue;
-                                        //for (int kv : { 1, 17, 31, 33, 61, 113, 65, 127, 129, 130, 255, 260, 371, 380, 407, 512, 1024, }) {
-                                        for (int kv : { 113, 512, 1024, }) {
-                                            if (nr2 != 1 && kv != 512) continue;
-                                            for (int nb : { 1, 3, 32, 75, }) {
-                                                for (ggml_prec prec : {GGML_PREC_F32, GGML_PREC_DEFAULT}) {
-                                                    if (hsk != 128 && prec == GGML_PREC_DEFAULT) continue;
-                                                    for (ggml_type type_KV : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16, GGML_TYPE_Q8_0, GGML_TYPE_Q5_1, GGML_TYPE_Q5_0, GGML_TYPE_Q4_1, GGML_TYPE_Q4_0, GGML_TYPE_IQ4_NL}) {
-                                                        if (type_KV != GGML_TYPE_F16 && hsk != 64 && hsk != 72) continue;
-                                                        // DeepSeek MLA: the V cache is a sub-view of the K cache
-                                                        const bool v_is_view_of_k = hsk == 576;
-                                                        test_cases.emplace_back(new test_flash_attn_ext(
-                                                                    hsk, hsv, nh, {nr2, nr3}, kv, nb, mask, sinks, max_bias, logit_softcap, prec, type_KV, type_KV, {0, 1, 2, 3}, true, v_is_view_of_k));
-                                                        // run fewer test cases permuted
-                                                        if (mask == true && max_bias == 0.0f && logit_softcap == 0 && kv == 512) {
+                for (bool mask : { true, false } ) {
+                    for (bool sinks : { true, false } ) {
+                        for (float max_bias : { 0.0f, 8.0f }) {
+                            if (!mask && max_bias > 0.0f) continue;
+                            for (float logit_softcap : {0.0f, 10.0f}) {
+                                if (hsk != 128 && logit_softcap != 0.0f) continue;
+                                for (int nh : { 1, 4 }) {
+                                    if (nh == 1 && hsk != 320 && hsk != 576) continue;
+                                    for (int nr3 : { 1, 3, }) {
+                                        if (hsk > 64 && nr3 > 1) continue; // skip broadcast for large head sizes
+                                        for (int nr2 : { 1, 4, 8, 12, 16, 20, 32 }) {
+                                            if (nr2 ==  8 && hsk != 192) continue;
+                                            if (nr2 == 12 && hsk != 128) continue;
+                                            if (nr2 == 16 && hsk != 192) continue;
+                                            if (nr2 == 20 && (nh != 1 || hsk != 576)) continue;
+                                            if (nr2 == 32 && (nh != 1 || hsk != 320)) continue;
+                                            //for (int kv : { 1, 17, 31, 33, 61, 113, 65, 127, 129, 130, 255, 260, 371, 380, 407, 512, 1024, }) {
+                                            for (int kv : { 113, 512, 1024, }) {
+                                                if (nr2 != 1 && kv != 512) continue;
+                                                for (int nb : { 1, 3, 32, 75, }) {
+                                                    for (ggml_prec prec : {GGML_PREC_F32, GGML_PREC_DEFAULT}) {
+                                                        if (hsk != 128 && prec == GGML_PREC_DEFAULT) continue;
+                                                        for (ggml_type type_KV : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16, GGML_TYPE_Q8_0, GGML_TYPE_Q5_1, GGML_TYPE_Q5_0, GGML_TYPE_Q4_1, GGML_TYPE_Q4_0, GGML_TYPE_IQ4_NL}) {
+                                                            if (type_KV != GGML_TYPE_F16 && hsk != 64 && hsk != 72) continue;
+                                                            // DeepSeek MLA: the V cache is a sub-view of the K cache
+                                                            const bool v_is_view_of_k = hsk == 576;
                                                             test_cases.emplace_back(new test_flash_attn_ext(
-                                                                        hsk, hsv, nh, {nr2, nr3}, kv, nb, mask, sinks, max_bias, logit_softcap, prec, type_KV, type_KV, {0, 2, 1, 3}, true, v_is_view_of_k));
+                                                                        hsk, hsv, nh, {nr2, nr3}, kv, nb, mask, sinks, max_bias, logit_softcap, prec, type_KV, type_KV, {0, 1, 2, 3}, true, v_is_view_of_k));
+                                                            // run fewer test cases permuted
+                                                            if (mask == true && max_bias == 0.0f && logit_softcap == 0 && kv == 512) {
+                                                                test_cases.emplace_back(new test_flash_attn_ext(
+                                                                            hsk, hsv, nh, {nr2, nr3}, kv, nb, mask, sinks, max_bias, logit_softcap, prec, type_KV, type_KV, {0, 2, 1, 3}, true, v_is_view_of_k));
+                                                            }
                                                         }
                                                     }
                                                 }
@@ -12236,7 +12239,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                 }
             }
         }
-    }
+    } // !GGML_SKIP_FLASH_ATTN
 
     // asymmetric head_dim (hsk != hsv) with one or both sides not 64-aligned
     test_cases.emplace_back(new test_flash_attn_ext(72, 64, 4, {1, 1}, 256, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
