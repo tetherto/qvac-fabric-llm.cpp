@@ -4847,6 +4847,11 @@ vk_device ggml_vk_get_device(size_t idx) {
             allocatorCreateInfo.device = device->device;
             allocatorCreateInfo.instance = vk_instance.instance;
 
+            // Use smaller VMA block size on integrated/UMA GPUs.
+            if (device->uma) {
+                allocatorCreateInfo.preferredLargeHeapBlockSize = 64 * 1024 * 1024; // 64MB
+            }
+
 #ifdef VMA_DYNAMIC_VULKAN_FUNCTIONS
             static VmaVulkanFunctions vulkanFunctions = {};
             vulkanFunctions.vkGetInstanceProcAddr = &vkGetInstanceProcAddr;
