@@ -964,6 +964,11 @@ struct vk_device_struct {
     vk_pipeline pipeline_out_prod_q4_0;
     vk_pipeline pipeline_out_prod_q8_0;
     vk_pipeline pipeline_out_prod_tq2_0;
+    vk_pipeline pipeline_out_prod_tiled_f32;
+    vk_pipeline pipeline_out_prod_tiled_f16_f32;
+    vk_pipeline pipeline_out_prod_tiled_q4_0;
+    vk_pipeline pipeline_out_prod_tiled_q8_0;
+    vk_pipeline pipeline_out_prod_tiled_tq2_0;
     vk_pipeline pipeline_argmax_f32;
     vk_pipeline pipeline_count_equal_i32;
     vk_pipeline pipeline_dsv4_hc_comb_f32;

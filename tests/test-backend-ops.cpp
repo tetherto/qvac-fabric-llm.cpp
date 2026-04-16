@@ -11839,6 +11839,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                                                   256, 16, 16, {1, 1}, {nr2, 1}));
     }
 
+    for (ggml_type type_a : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_TQ2_0}) {
+        for (ggml_type type_b : {GGML_TYPE_F32, GGML_TYPE_F16}) {
+            test_cases.emplace_back(new test_out_prod(type_a, type_b, 1024, 128, 151936, {1, 1}, {1, 1}));
+            test_cases.emplace_back(new test_out_prod(type_a, type_b, 3072, 128, 1024, {1, 1}, {1, 1}));
+        }
+    }
+
     // add_id
     for (ggml_type type_a : {GGML_TYPE_F32}) {
         for (ggml_type type_b : {GGML_TYPE_F32}) {
