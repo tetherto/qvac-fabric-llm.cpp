@@ -194,6 +194,7 @@ static bool is_pow2(uint32_t x) { return x > 1 && (x & (x-1)) == 0; }
 #define VK_VENDOR_ID_NVIDIA 0x10de
 
 #define VK_VENDOR_ID_QUALCOMM 0x5143
+#define VK_VENDOR_ID_ARM 0x13B5
 
 #define VK_VENDOR_ID_SAMSUNG 0x144d
 

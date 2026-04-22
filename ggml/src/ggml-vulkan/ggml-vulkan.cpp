@@ -6147,6 +6147,8 @@ static bool ggml_vk_get_mul_mat_mat_f16acc(ggml_backend_vk_context * ctx, ggml_t
     if (src0_type == GGML_TYPE_F32 || src0_type == GGML_TYPE_BF16) return false;
     if (src1_type == GGML_TYPE_Q8_1) return false;
     const bool prec_allows_f16 = ggml_vk_prec_allows_f16acc(acc_prec);
+    // f16 accumulation gives NaN for TQ1/TQ2, so always accumulate in f32
+    if (src0_type == GGML_TYPE_TQ1_0 || src0_type == GGML_TYPE_TQ2_0) return false;
     if (src0_type == GGML_TYPE_F16) {
         return prec_allows_f16 && ctx->device->fp16 && !(ctx->device->coopmat_support && !ctx->device->coopmat_acc_f16_support);
     }
@@ -6162,6 +6164,12 @@ static bool ggml_vk_get_mul_mat_mat_f16acc(ggml_backend_vk_context * ctx, ggml_t
 
 static const std::vector<vk_matmul_pipeline_pair>* ggml_vk_get_mul_mat_mat_pipeline_map(
         ggml_backend_vk_context * ctx, ggml_type src0_type, ggml_type src1_type, ggml_prec prec, bool mul_mat_id = false) {
+    // the _cm1 f32 x f32 shader casts to fp16 inside, which loses precision and
+    // times out on Mali. Force a dequant to f16 for both inputs instead.
+    if (!mul_mat_id && src0_type == GGML_TYPE_F32 && src1_type == GGML_TYPE_F32 &&
+        ctx->device->vendor_id == VK_VENDOR_ID_ARM && ctx->device->coopmat_support && !ctx->device->coopmat2) {
+        return nullptr;
+    }
     bool f16acc = ggml_vk_get_mul_mat_mat_f16acc(ctx, src0_type, src1_type, prec);
     vk_matmul_pipeline_key key{src0_type, src1_type, mul_mat_id, f16acc};
     auto it = ctx->device->pipeline_matmul.find(key);
@@ -6177,20 +6185,27 @@ static const std::vector<vk_matmul_pipeline_pair>* ggml_vk_get_mul_mat_mat_pipel
     return &it->second;
 }
 
+static bool ggml_vk_force_large_tile(ggml_backend_vk_context * ctx, ggml_type src0_type, bool mul_mat_id) {
+    return !mul_mat_id && src0_type == GGML_TYPE_F16 &&
+           ctx->device->vendor_id == VK_VENDOR_ID_ARM && ctx->device->coopmat_support && !ctx->device->coopmat2;
+}
+
 static vk_pipeline ggml_vk_guess_matmul_pipeline_map(ggml_backend_vk_context * ctx,
         const std::vector<vk_matmul_pipeline_pair>& configs,
-        uint32_t m, uint32_t n, bool aligned, bool mul_mat_id) {
+        uint32_t m, uint32_t n, bool aligned, bool mul_mat_id, ggml_type src0_type) {
     auto& selector = mul_mat_id ? ctx->device->matmul_id_tile_selector : ctx->device->matmul_tile_selector;
-    uint32_t idx = selector(m, n, 0, ctx->device->shader_core_count, configs);
+    uint32_t idx = ggml_vk_force_large_tile(ctx, src0_type, mul_mat_id) ? (uint32_t)configs.size() - 1
+                                                                        : selector(m, n, 0, ctx->device->shader_core_count, configs);
     if (idx >= configs.size()) idx = (uint32_t)configs.size() - 1;
     return (aligned && configs[idx].aligned) ? configs[idx].aligned : configs[idx].unaligned;
 }
 
 static uint32_t ggml_vk_guess_matmul_pipeline_align_map(ggml_backend_vk_context * ctx,
         const std::vector<vk_matmul_pipeline_pair>& configs,
-        uint32_t m, uint32_t n, bool mul_mat_id) {
+        uint32_t m, uint32_t n, bool mul_mat_id, ggml_type src0_type) {
     auto& selector = mul_mat_id ? ctx->device->matmul_id_tile_selector : ctx->device->matmul_tile_selector;
-    uint32_t idx = selector(m, n, 0, ctx->device->shader_core_count, configs);
+    uint32_t idx = ggml_vk_force_large_tile(ctx, src0_type, mul_mat_id) ? (uint32_t)configs.size() - 1
+                                                                        : selector(m, n, 0, ctx->device->shader_core_count, configs);
     if (idx >= configs.size()) idx = (uint32_t)configs.size() - 1;
     return configs[idx].align;
 }
@@ -6768,7 +6783,12 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
     // coopmat shaders are fast enough that memory bandwidth reduction from f16 activations helps
     const bool prefer_f16_b = is_coopmat && ggml_is_quantized(src0->type) && src1->type == GGML_TYPE_F32;
 
-    const ggml_type y_kernel_type = ggml_vk_mul_mat_b_type(ctx, src0->type, src1, f16_type,
+    // Mali KHR_coopmat1 workaround: F16 x F16 path is the only safe coopmat path.
+    // Force both inputs to be dequantized/casted to F16.
+    const bool is_tq = src0->type == GGML_TYPE_TQ1_0 || src0->type == GGML_TYPE_TQ2_0;
+    const bool mali_f16_only = ctx->device->vendor_id == VK_VENDOR_ID_ARM && ctx->device->coopmat_support && !ctx->device->coopmat2 && !is_tq;
+
+    const ggml_type y_kernel_type = mali_f16_only ? f16_type : ggml_vk_mul_mat_b_type(ctx, src0->type, src1, f16_type,
                                         ggml_prec_get_acc(dst), false, can_quantize_y, prefer_f16_b);
 
     const bool quantize_y       = y_kernel_type == GGML_TYPE_Q8_1;
@@ -6778,8 +6798,12 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
     const std::vector<vk_matmul_pipeline_pair>* mmp_map =
         ggml_vk_get_mul_mat_mat_pipeline_map(ctx, src0->type, y_kernel_type, ggml_prec_get_acc(dst));
 
-    const bool qx_needs_dequant = mmp_map == nullptr || x_non_contig;
+    bool qx_needs_dequant = mmp_map == nullptr || x_non_contig;
     const bool qy_needs_dequant = y_needs_reformat;
+
+    if (src0->type == GGML_TYPE_F32 && ctx->device->vendor_id == VK_VENDOR_ID_ARM && ctx->device->coopmat_support && !ctx->device->coopmat2) {
+        qx_needs_dequant = true;
+    }
 
     if (qx_needs_dequant) {
         // dequant src0 to f16
@@ -6788,10 +6812,10 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
 
     GGML_ASSERT(mmp_map != nullptr);
 
-    const uint32_t kpad = quantize_y ? 0 : ggml_vk_align_size(ne10, ggml_vk_guess_matmul_pipeline_align_map(ctx, *mmp_map, ne01, ne11, false));
+    const uint32_t kpad = quantize_y ? 0 : ggml_vk_align_size(ne10, ggml_vk_guess_matmul_pipeline_align_map(ctx, *mmp_map, ne01, ne11, false, qx_needs_dequant ? f16_type : src0->type));
     const bool aligned = !quantize_y && ne10 == kpad && ne01 > 8 && ne11 > 8;
 
-    vk_pipeline pipeline = ggml_vk_guess_matmul_pipeline_map(ctx, *mmp_map, ne01, ne11, aligned, false);
+    vk_pipeline pipeline = ggml_vk_guess_matmul_pipeline_map(ctx, *mmp_map, ne01, ne11, aligned, false, qx_needs_dequant ? f16_type : src0->type);
 
     if (ggml_nbytes(src0) > ctx->device->properties.limits.maxStorageBufferRange) {
         pipeline = ggml_vk_get_64b_indexing_pipeline(ctx, pipeline);
@@ -7883,10 +7907,10 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
                                                   y_decode_vector_staging || y_needs_k_padding);
     const bool qy_needs_dequant = y_needs_reformat;
 
-    const uint32_t kpad = quantize_y ? 0 : ggml_vk_align_size(ne10, ggml_vk_guess_matmul_pipeline_align_map(ctx, *mmp_map, ne01, nei1, true));
+    const uint32_t kpad = quantize_y ? 0 : ggml_vk_align_size(ne10, ggml_vk_guess_matmul_pipeline_align_map(ctx, *mmp_map, ne01, nei1, true, qx_needs_dequant ? f16_type : src0->type));
     const bool aligned = !quantize_y && ne10 == kpad && ne01 > 8 && nei1 > 8;
 
-    vk_pipeline pipeline = ggml_vk_guess_matmul_pipeline_map(ctx, *mmp_map, ne01, nei1, aligned, true);
+    vk_pipeline pipeline = ggml_vk_guess_matmul_pipeline_map(ctx, *mmp_map, ne01, nei1, aligned, true, qx_needs_dequant ? f16_type : src0->type);
 
     const uint32_t bn = pipeline->wg_denoms[1];
     const uint64_t max_tiles = ggml_vk_mul_mat_id_max_tiles(n_as, nei0 * nei1, bn);
