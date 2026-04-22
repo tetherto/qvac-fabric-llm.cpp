@@ -6165,9 +6165,10 @@ static bool ggml_vk_get_mul_mat_mat_f16acc(ggml_backend_vk_context * ctx, ggml_t
 static const std::vector<vk_matmul_pipeline_pair>* ggml_vk_get_mul_mat_mat_pipeline_map(
         ggml_backend_vk_context * ctx, ggml_type src0_type, ggml_type src1_type, ggml_prec prec, bool mul_mat_id = false) {
     // the _cm1 f32 x f32 shader casts to fp16 inside, which loses precision and
-    // times out on Mali. Force a dequant to f16 for both inputs instead.
+    // times out on Mali and Adreno. Force a dequant to f16 for both inputs instead.
     if (!mul_mat_id && src0_type == GGML_TYPE_F32 && src1_type == GGML_TYPE_F32 &&
-        ctx->device->vendor_id == VK_VENDOR_ID_ARM && ctx->device->coopmat_support && !ctx->device->coopmat2) {
+        (ctx->device->vendor_id == VK_VENDOR_ID_ARM || ctx->device->vendor_id == VK_VENDOR_ID_QUALCOMM) &&
+        ctx->device->coopmat_support && !ctx->device->coopmat2) {
         return nullptr;
     }
     bool f16acc = ggml_vk_get_mul_mat_mat_f16acc(ctx, src0_type, src1_type, prec);
@@ -6187,7 +6188,8 @@ static const std::vector<vk_matmul_pipeline_pair>* ggml_vk_get_mul_mat_mat_pipel
 
 static bool ggml_vk_force_large_tile(ggml_backend_vk_context * ctx, ggml_type src0_type, bool mul_mat_id) {
     return !mul_mat_id && src0_type == GGML_TYPE_F16 &&
-           ctx->device->vendor_id == VK_VENDOR_ID_ARM && ctx->device->coopmat_support && !ctx->device->coopmat2;
+           (ctx->device->vendor_id == VK_VENDOR_ID_ARM || ctx->device->vendor_id == VK_VENDOR_ID_QUALCOMM) &&
+           ctx->device->coopmat_support && !ctx->device->coopmat2;
 }
 
 static vk_pipeline ggml_vk_guess_matmul_pipeline_map(ggml_backend_vk_context * ctx,
@@ -6783,12 +6785,12 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
     // coopmat shaders are fast enough that memory bandwidth reduction from f16 activations helps
     const bool prefer_f16_b = is_coopmat && ggml_is_quantized(src0->type) && src1->type == GGML_TYPE_F32;
 
-    // Mali KHR_coopmat1 workaround: F16 x F16 path is the only safe coopmat path.
+    // Mali/Adreno KHR_coopmat1 workaround: F16 x F16 path is the only safe coopmat path.
     // Force both inputs to be dequantized/casted to F16.
     const bool is_tq = src0->type == GGML_TYPE_TQ1_0 || src0->type == GGML_TYPE_TQ2_0;
-    const bool mali_f16_only = ctx->device->vendor_id == VK_VENDOR_ID_ARM && ctx->device->coopmat_support && !ctx->device->coopmat2 && !is_tq;
+    const bool cm1_f16_only = (ctx->device->vendor_id == VK_VENDOR_ID_ARM || ctx->device->vendor_id == VK_VENDOR_ID_QUALCOMM) && ctx->device->coopmat_support && !ctx->device->coopmat2 && !is_tq;
 
-    const ggml_type y_kernel_type = mali_f16_only ? f16_type : ggml_vk_mul_mat_b_type(ctx, src0->type, src1, f16_type,
+    const ggml_type y_kernel_type = cm1_f16_only ? f16_type : ggml_vk_mul_mat_b_type(ctx, src0->type, src1, f16_type,
                                         ggml_prec_get_acc(dst), false, can_quantize_y, prefer_f16_b);
 
     const bool quantize_y       = y_kernel_type == GGML_TYPE_Q8_1;
@@ -6801,7 +6803,7 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
     bool qx_needs_dequant = mmp_map == nullptr || x_non_contig;
     const bool qy_needs_dequant = y_needs_reformat;
 
-    if (src0->type == GGML_TYPE_F32 && ctx->device->vendor_id == VK_VENDOR_ID_ARM && ctx->device->coopmat_support && !ctx->device->coopmat2) {
+    if (src0->type == GGML_TYPE_F32 && (ctx->device->vendor_id == VK_VENDOR_ID_ARM || ctx->device->vendor_id == VK_VENDOR_ID_QUALCOMM) && ctx->device->coopmat_support && !ctx->device->coopmat2) {
         qx_needs_dequant = true;
     }
 
