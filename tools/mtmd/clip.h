@@ -55,6 +55,7 @@ struct clip_context_params {
     int image_min_tokens;
     int image_max_tokens;
     bool warmup;
+    bool has_bf16_weights;
     ggml_backend_sched_eval_callback cb_eval;
     void * cb_eval_user_data;
     bool no_alloc;

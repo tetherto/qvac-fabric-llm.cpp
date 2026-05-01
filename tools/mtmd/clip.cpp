@@ -179,6 +179,10 @@ struct clip_ctx {
 
     bool support_batch = false;
 
+    // When the GPU backend lacks bf16 support but the GGUF has bf16 weights,
+    // we declare the in-context tensors as f16 and convert on disk-load.
+    bool convert_bf16_to_f16 = false;
+
     clip_ctx(clip_context_params & ctx_params) {
         flash_attn_type = ctx_params.flash_attn_type;
         no_alloc = ctx_params.no_alloc;
@@ -204,6 +208,25 @@ struct clip_ctx {
             if (!backend) {
                 backend = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_GPU, nullptr);
                 backend = backend ? backend : ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_IGPU, nullptr);
+            }
+        }
+
+        // When the GPU backend can't host bf16 weights (e.g. Metal on M1 / older
+        // GPUs without bfloat support), convert bf16 tensors to f16 on load.
+        // This keeps the projector running on the GPU instead of falling back
+        // to CPU. Without this, ggml_backend_sched_reserve aborts on the first
+        // bf16 leaf tensor with "buffer that cannot run the operation (NONE)".
+        if (backend && backend != backend_cpu && ctx_params.has_bf16_weights) {
+            ggml_init_params probe_params = { /*.mem_size=*/ ggml_tensor_overhead(), /*.mem_buffer=*/ nullptr, /*.no_alloc=*/ true };
+            ggml_context * probe_ctx = ggml_init(probe_params);
+            ggml_tensor * probe = ggml_new_tensor_1d(probe_ctx, GGML_TYPE_BF16, 1);
+            const bool gpu_supports_bf16 = ggml_backend_supports_op(backend, probe);
+            ggml_free(probe_ctx);
+
+            if (!gpu_supports_bf16) {
+                LOG_WRN("%s: GPU backend %s does not support bf16; converting bf16 weights to f16 on load\n",
+                        __func__, ggml_backend_name(backend));
+                convert_bf16_to_f16 = true;
             }
         }
 
@@ -1282,6 +1305,17 @@ struct clip_model_loader {
     std::string fname;
 
     size_t model_size = 0; // in bytes
+
+    // Returns true if any weight tensor in the GGUF is stored as bf16.
+    bool has_bf16_weights() const {
+        const int n = gguf_get_n_tensors(ctx_gguf.get());
+        for (int i = 0; i < n; ++i) {
+            if (gguf_get_tensor_type(ctx_gguf.get(), i) == GGML_TYPE_BF16) {
+                return true;
+            }
+        }
+        return false;
+    }
 
     bool has_vision    = false;
     bool has_audio     = false;
@@ -2535,7 +2569,15 @@ struct clip_model_loader {
             }
             if (cur) {
                 tensors_to_load.push_back(cur);
-                ggml_tensor * data_tensor = ggml_dup_tensor(ctx_clip.ctx_data.get(), cur);
+                ggml_tensor * data_tensor;
+                if (ctx_clip.convert_bf16_to_f16 && cur->type == GGML_TYPE_BF16) {
+                    // Allocate the in-context tensor as F16; the actual values
+                    // get converted from BF16 in the load loop below.
+                    data_tensor = ggml_new_tensor(ctx_clip.ctx_data.get(), GGML_TYPE_F16,
+                                                  ggml_n_dims(cur), cur->ne);
+                } else {
+                    data_tensor = ggml_dup_tensor(ctx_clip.ctx_data.get(), cur);
+                }
                 ggml_set_name(data_tensor, cur->name);
                 loaded_tensor_names.insert(name);
                 cur = data_tensor;
@@ -4229,6 +4271,8 @@ struct clip_model_loader {
             // read the weight from file
             if (!ctx_clip.no_alloc) {
                 size_t data_loaded = 0;
+                std::vector<float>       conv_f32;
+                std::vector<ggml_fp16_t> conv_f16;
                 for (auto & t : tensors_to_load) {
                     ggml_tensor * cur = ggml_get_tensor(ctx_clip.ctx_data.get(), t->name);
                     GGML_ASSERT(cur && "tensor not found in ctx_data");
@@ -4238,6 +4282,36 @@ struct clip_model_loader {
                     fin.seekg(offset, std::ios::beg);
                     if (!fin) {
                         throw std::runtime_error(string_format("%s: failed to seek for tensor %s\n", __func__, t->name));
+                    }
+                    const bool need_bf16_to_f16 =
+                        ctx_clip.convert_bf16_to_f16 &&
+                        t->type == GGML_TYPE_BF16 &&
+                        cur->type == GGML_TYPE_F16;
+                    if (need_bf16_to_f16) {
+                        // Read raw bf16 from disk, convert to f32 then to f16, write to tensor.
+                        const int64_t n = ggml_nelements(cur);
+                        const size_t  src_bytes = ggml_nbytes(t);  // bf16 layout
+                        read_buf.resize(src_bytes);
+                        fin.read(reinterpret_cast<char *>(read_buf.data()), src_bytes);
+                        conv_f32.resize(n);
+                        conv_f16.resize(n);
+                        ggml_bf16_to_fp32_row(reinterpret_cast<const ggml_bf16_t *>(read_buf.data()),
+                                              conv_f32.data(), n);
+                        ggml_fp32_to_fp16_row(conv_f32.data(), conv_f16.data(), n);
+                        const size_t dst_bytes = ggml_nbytes(cur); // f16 layout
+                        if (ggml_backend_buft_is_host(buft)) {
+                            memcpy(cur->data, conv_f16.data(), dst_bytes);
+                        } else {
+                            ggml_backend_tensor_set(cur, conv_f16.data(), 0, dst_bytes);
+                        }
+                        data_loaded += dst_bytes;
+                        if (progress_callback && total_data_size > 0) {
+                            const float progress = (float)data_loaded / (float)total_data_size;
+                            if (!progress_callback(progress, progress_callback_user_data)) {
+                                throw std::runtime_error(string_format("%s: model loading cancelled by progress_callback\n", __func__));
+                            }
+                        }
+                        continue;
                     }
                     size_t num_bytes = ggml_nbytes(cur);
                     if (ggml_backend_buft_is_host(buft)) {
@@ -4591,6 +4665,8 @@ struct clip_init_result clip_init(const char * fname, struct clip_context_params
             ctx_params.progress_callback,
             ctx_params.progress_callback_user_data);
         bool skip_audio = false;
+
+        ctx_params.has_bf16_weights = loader.has_bf16_weights();
 
         if (loader.has_vision) {
             ctx_vision = new clip_ctx(ctx_params);

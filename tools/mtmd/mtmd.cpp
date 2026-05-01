@@ -650,6 +650,7 @@ struct mtmd_context {
             /* image_min_tokens  */ ctx_params.image_min_tokens,
             /* image_max_tokens  */ ctx_params.image_max_tokens,
             /* warmup            */ ctx_params.warmup,
+            /* has_bf16_weights  */ false, // set by clip_init after scanning the GGUF
             /* cb_eval           */ ctx_params.cb_eval,
             /* cb_eval_user_data */ ctx_params.cb_eval_user_data,
             /* no_alloc          */ no_alloc,
