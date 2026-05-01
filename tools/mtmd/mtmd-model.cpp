@@ -1389,7 +1389,7 @@ struct mtmd_model_loader {
         }
     }
 
-    void load_tensors(mtmd_model & model, ggml_backend_buffer_type_t buft, bool no_alloc) {
+    void load_tensors(mtmd_model & model, ggml_backend_buffer_type_t buft, bool no_alloc, bool convert_bf16_to_f16 = false) {
         auto & hparams = model.hparams;
         std::map<std::string, size_t> tensor_offset;
         std::vector<ggml_tensor *> tensors_to_load;
@@ -1434,7 +1434,14 @@ struct mtmd_model_loader {
             }
             if (cur) {
                 tensors_to_load.push_back(cur);
-                ggml_tensor * data_tensor = ggml_dup_tensor(model.ctx_data.get(), cur);
+                ggml_tensor * data_tensor;
+                if (convert_bf16_to_f16 && cur->type == GGML_TYPE_BF16) {
+                    // Allocate the in-context tensor as F16; the actual values
+                    // get converted from BF16 in the load loop below.
+                    data_tensor = ggml_new_tensor(model.ctx_data.get(), GGML_TYPE_F16, ggml_n_dims(cur), cur->ne);
+                } else {
+                    data_tensor = ggml_dup_tensor(model.ctx_data.get(), cur);
+                }
                 ggml_set_name(data_tensor, cur->name);
                 loaded_tensor_names.insert(name);
                 cur = data_tensor;
@@ -3801,6 +3808,9 @@ struct mtmd_model_loader {
             // read the weight from file
             if (!no_alloc) {
                 size_t data_loaded = 0;
+                size_t n_converted = 0;
+                std::vector<float>       conv_f32;
+                std::vector<ggml_fp16_t> conv_f16;
                 for (auto & t : tensors_to_load) {
                     ggml_tensor * cur = ggml_get_tensor(model.ctx_data.get(), t->name);
                     GGML_ASSERT(cur && "tensor not found in ctx_data");
@@ -3810,6 +3820,35 @@ struct mtmd_model_loader {
                     fin.seekg(offset, std::ios::beg);
                     if (!fin) {
                         throw std::runtime_error(mtmd_format("%s: failed to seek for tensor %s\n", __func__, t->name));
+                    }
+                    const bool need_bf16_to_f16 =
+                        convert_bf16_to_f16 &&
+                        t->type == GGML_TYPE_BF16 &&
+                        cur->type == GGML_TYPE_F16;
+                    if (need_bf16_to_f16) {
+                        // Read raw bf16 from disk, convert to f32 then to f16, write to tensor.
+                        const int64_t n = ggml_nelements(cur);
+                        read_buf.resize(ggml_nbytes(t)); // bf16 layout
+                        fin.read(reinterpret_cast<char *>(read_buf.data()), read_buf.size());
+                        conv_f32.resize(n);
+                        conv_f16.resize(n);
+                        ggml_bf16_to_fp32_row(reinterpret_cast<const ggml_bf16_t *>(read_buf.data()), conv_f32.data(), n);
+                        ggml_fp32_to_fp16_row(conv_f32.data(), conv_f16.data(), n);
+                        const size_t dst_bytes = ggml_nbytes(cur); // f16 layout
+                        if (ggml_backend_buft_is_host(buft)) {
+                            memcpy(cur->data, conv_f16.data(), dst_bytes);
+                        } else {
+                            ggml_backend_tensor_set(cur, conv_f16.data(), 0, dst_bytes);
+                        }
+                        n_converted++;
+                        data_loaded += dst_bytes;
+                        if (progress_callback && total_data_size > 0) {
+                            const float progress = (float)data_loaded / (float)total_data_size;
+                            if (!progress_callback(progress, progress_callback_user_data)) {
+                                throw std::runtime_error(mtmd_format("%s: model loading cancelled by progress_callback\n", __func__));
+                            }
+                        }
+                        continue;
                     }
                     size_t num_bytes = ggml_nbytes(cur);
                     if (ggml_backend_buft_is_host(buft)) {
@@ -3828,6 +3867,10 @@ struct mtmd_model_loader {
                             throw std::runtime_error(mtmd_format("%s: model loading cancelled by progress_callback\n", __func__));
                         }
                     }
+                }
+                if (n_converted > 0) {
+                    LOG_WRN("%s: %s does not support bf16; converted %zu bf16 weights to f16 on load\n",
+                            __func__, ggml_backend_buft_name(buft), n_converted);
                 }
                 LOG_DBG("%s: loaded %zu tensors from %s\n", __func__, tensors_to_load.size(), fname.c_str());
             } else {
@@ -4003,7 +4046,7 @@ mtmd_models mtmd_model_load(const char * fname, const mtmd_model_params & params
         model->hparams.custom_image_min_tokens = params.image_min_tokens;
         model->hparams.custom_image_max_tokens = params.image_max_tokens;
         loader.load_hparams(*model, modality);
-        loader.load_tensors(*model, buft, params.no_alloc);
+        loader.load_tensors(*model, buft, params.no_alloc, params.convert_bf16_to_f16);
         const std::string & def = model->hparams.gen_default_voice;
         if (!def.empty() && model->gen_voices.find(def) == model->gen_voices.end()) {
             throw std::runtime_error(mtmd_format("%s: default voice \"%s\" is not a predefined voice\n", __func__, def.c_str()));

@@ -1384,6 +1384,8 @@ struct mtmd_model_params {
     int32_t image_min_tokens = -1;
     int32_t image_max_tokens = -1;
     bool no_alloc = false; // only create the tensors, do not read their data
+    // the device can't use bf16 weights: declare them as f16 and convert on load
+    bool convert_bf16_to_f16 = false;
     mtmd_progress_callback progress_callback = nullptr;
     void * progress_callback_user_data = nullptr;
 };

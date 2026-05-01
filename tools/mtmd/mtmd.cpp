@@ -727,6 +727,18 @@ struct mtmd_context {
         model_params.progress_callback           = ctx_params.progress_callback;
         model_params.progress_callback_user_data = ctx_params.progress_callback_user_data;
 
+        // When the GPU device can't host bf16 weights (e.g. Metal on M1 / older
+        // GPUs without bfloat support), convert bf16 tensors to f16 on load.
+        // This keeps the projector running on the GPU instead of falling back
+        // to CPU. Without this, ggml_backend_sched_reserve aborts on the first
+        // bf16 leaf tensor with "buffer that cannot run the operation (NONE)".
+        if (device && ggml_backend_dev_type(device) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+            ggml_init_params probe_params = { /*.mem_size=*/ ggml_tensor_overhead(), /*.mem_buffer=*/ nullptr, /*.no_alloc=*/ true };
+            ggml_context_ptr probe_ctx(ggml_init(probe_params));
+            ggml_tensor * probe = ggml_new_tensor_1d(probe_ctx.get(), GGML_TYPE_BF16, 1);
+            model_params.convert_bf16_to_f16 = !ggml_backend_dev_supports_op(device, probe);
+        }
+
         ggml_backend_buffer_type_t buft = device
             ? ggml_backend_dev_buffer_type(device)
             : ggml_backend_dev_buffer_type(ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU));
