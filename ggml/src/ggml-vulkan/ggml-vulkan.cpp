@@ -6149,7 +6149,13 @@ static bool ggml_vk_get_mul_mat_mat_f16acc(ggml_backend_vk_context * ctx, ggml_t
     const bool prec_allows_f16 = ggml_vk_prec_allows_f16acc(acc_prec);
     // f16 accumulation gives NaN for TQ1/TQ2, so always accumulate in f32
     if (src0_type == GGML_TYPE_TQ1_0 || src0_type == GGML_TYPE_TQ2_0) return false;
-    if (src0_type == GGML_TYPE_F16) {
+    if (src0_type == GGML_TYPE_F16) {        
+        // Mali / Adreno KHR_coopmat1: f16 accumulation overflows on wide reductions
+        // (e.g. bert encoder graphs at large batch). Force f32 accumulation.
+        if ((ctx->device->vendor_id == VK_VENDOR_ID_ARM || ctx->device->vendor_id == VK_VENDOR_ID_QUALCOMM) &&
+            ctx->device->coopmat_support && !ctx->device->coopmat2) {
+            return false;
+        }
         return prec_allows_f16 && ctx->device->fp16 && !(ctx->device->coopmat_support && !ctx->device->coopmat_acc_f16_support);
     }
     // quant types
