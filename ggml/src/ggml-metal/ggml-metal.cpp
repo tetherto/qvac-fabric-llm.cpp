@@ -1121,6 +1121,15 @@ ggml_backend_reg_t ggml_backend_metal_reg(void) {
 
             for (int i = 0; i < g_devices; ++i) {
                 auto * dev = ggml_backend_metal_device_init(&reg, i);
+
+                // Skip unusable devices (e.g. paravirtualized GPUs with no working simdgroup
+                // intrinsics).
+                if (!ggml_metal_device_get_props((ggml_metal_device_t)dev->context)->has_simdgroup_reduction) {
+                    GGML_LOG_WARN("%s: skipping Metal device %d (no simdgroup reduction support)\n", __func__, i);
+                    ggml_backend_metal_device_free(dev);
+                    continue;
+                }
+
                 devs.emplace_back(dev);
 
                 reg_ctx->devices.push_back(dev);
