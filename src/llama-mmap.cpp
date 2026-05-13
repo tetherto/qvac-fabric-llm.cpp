@@ -443,7 +443,11 @@ void llama_file_disk::read_raw_unsafe(void * ptr, size_t len) { pimpl->read_raw(
 void llama_file_disk::read_raw_unsafe(void * ptr, size_t len) { pimpl->read_raw_unsafe(ptr, len); }
 #endif
 
+#ifdef _WIN32
+void llama_file_disk::read_aligned_chunk(void * dest, size_t size) { pimpl->read_raw(dest, size); }
+#else
 void llama_file_disk::read_aligned_chunk(void * dest, size_t size) { pimpl->read_aligned_chunk(dest, size); }
+#endif
 
 uint32_t llama_file_disk::read_u32() { return pimpl->read_u32(); }
 
