@@ -64,8 +64,8 @@ struct llama_file_disk : public llama_file {
     void write_raw(const void * ptr, size_t len) const override;
     void write_u32(uint32_t val) const override;
 
-    size_t read_alignment() const;
-    bool has_direct_io() const;
+    size_t read_alignment() const override;
+    bool has_direct_io() const override;
 private:
     struct impl;
     std::unique_ptr<impl> pimpl;
