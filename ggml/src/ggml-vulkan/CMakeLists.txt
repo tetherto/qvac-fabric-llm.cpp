@@ -138,7 +138,9 @@ if (Vulkan_FOUND)
             ../../../vendor
 
     )
-    target_include_directories(ggml-vulkan PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/vulkan_cpp_wrapper/include")
+    if (ANDROID)
+        target_include_directories(ggml-vulkan PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/vulkan_cpp_wrapper/include")
+    endif()
 
     if (FORCE_GGML_VK_PERF_LOGGER)
       add_compile_definitions(FORCE_GGML_VK_PERF_LOGGER)
