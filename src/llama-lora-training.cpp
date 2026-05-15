@@ -19,32 +19,32 @@ bool llama_lora_validate_training_params(const struct llama_lora_training_params
         LLAMA_LOG_ERROR("LoRA training validation: params is null\n");
         return false;
     }
-    
+
     if (params->rank <= 0 || params->rank > 1024) {
         LLAMA_LOG_ERROR("LoRA training validation: invalid rank %d (must be 1-1024)\n", params->rank);
         return false;
     }
-    
+
     if (params->alpha <= 0.0f) {
         LLAMA_LOG_ERROR("LoRA training validation: invalid alpha %f (must be > 0)\n", params->alpha);
         return false;
     }
-    
+
     if (params->dropout < 0.0f || params->dropout > 1.0f) {
         LLAMA_LOG_ERROR("LoRA training validation: invalid dropout %f (must be [0, 1])\n", params->dropout);
         return false;
     }
-    
+
     if (params->init_std <= 0.0f || params->init_std > 1.0f) {
         LLAMA_LOG_ERROR("LoRA training validation: invalid init_std %f (must be (0, 1])\n", params->init_std);
         return false;
     }
-    
+
     if (params->target_modules == 0) {
         LLAMA_LOG_ERROR("LoRA training validation: no target modules specified\n");
         return false;
     }
-    
+
     return true;
 }
 
@@ -55,7 +55,7 @@ void llama_lora_create_tensor_pair(
         int32_t rank,
         struct ggml_tensor ** lora_a,
         struct ggml_tensor ** lora_b) {
-    
+
     if (!lora_ctx || !base_name || !base_tensor || !lora_a || !lora_b) {
         throw std::invalid_argument("Invalid null arguments provided to llama_lora_create_tensor_pair");
     }
@@ -97,7 +97,7 @@ static void init_tensor_guassian(struct ggml_tensor * tensor, float std_dev, uin
         gen.seed(rd());
     }
     std::normal_distribution<float> dist(0.0f, std_dev);
-    
+
     for (size_t i = 0; i < n_elements; i++) {
         data[i] = dist(gen);
     }
@@ -124,22 +124,22 @@ static void llama_lora_init_tensor_weights(struct ggml_tensor * lora_a, struct g
     if (!lora_a || !lora_b || !lora_a->data || !lora_b->data) {
         throw std::invalid_argument("Invalid null tensors or data pointers passed to llama_lora_init_tensor_weights");
     }
-    
+
     // LoRA initialization: A ~ N(0, init_std), B = 0
     init_tensor_guassian(lora_a, init_std, seed);
     init_tensor_zeros(lora_b);
 }
 
 bool llama_lora_allocate_buffers(
-        struct llama_adapter_lora * adapter, 
+        struct llama_adapter_lora * adapter,
         struct llama_model * model) {
-        
+
     if (!adapter || !model) {
         return false;
     }
-    
+
     std::map<ggml_backend_buffer_type_t, ggml_context *> ctx_map;
-    
+
     // LoRA tensors are F32/F16 and need a buffer type that:
     //  1. Supports training ops (OPT_STEP_ADAMW, gradient accumulation)
     //  2. Can handle set_tensor for floating-point types
@@ -148,7 +148,7 @@ bool llama_lora_allocate_buffers(
     // host-accessible CPU buffer — the scheduler handles cross-backend
     // copies for forward/backward passes automatically.
     ggml_backend_buffer_type_t buft = ggml_backend_cpu_buffer_type();
-    
+
     if (adapter->ctxs.empty()) {
         LLAMA_LOG_ERROR("No contexts found in adapter\n");
         return false;
@@ -162,12 +162,12 @@ bool llama_lora_allocate_buffers(
     }
     LLAMA_LOG_INFO("LoRA buffer size = %.2f MiB\n", ggml_backend_buffer_get_size(buf.get())/1024.0/1024.0);
     adapter->bufs.emplace_back(std::move(buf));
-    
+
     return true;
 }
 
 struct llama_adapter_lora * llama_lora_create_adapter(
-        struct llama_model * model, 
+        struct llama_model * model,
         const struct llama_lora_training_params * params) {
 
     llama_adapter_lora * adapter = new llama_adapter_lora(model);
@@ -182,7 +182,7 @@ struct llama_adapter_lora * llama_lora_create_adapter(
         if (!lora_ctx) {
             throw std::runtime_error("Failed to create LoRA context");
         }
-        
+
         adapter->ctxs.emplace_back(lora_ctx);
         int created_count = 0;
 
@@ -229,6 +229,8 @@ struct llama_adapter_lora * llama_lora_create_adapter(
 
             llama_lora_init_tensor_weights(weight.a, weight.b, params->init_std, params->seed);
         }
+
+        model->loras.insert(adapter);
         return adapter;
     } catch (const std::exception & err) {
         LLAMA_LOG_ERROR("Failed to create LoRA adapter: %s\n", err.what());
@@ -241,7 +243,7 @@ struct llama_adapter_lora * llama_lora_training_init(
         struct llama_context * ctx,
         struct llama_model * model,
         const struct llama_lora_training_params * params) {
-    
+
     if (!ctx || !model || !params) {
         LLAMA_LOG_ERROR("LoRA training init: invalid parameters\n");
         return nullptr;
@@ -250,7 +252,7 @@ struct llama_adapter_lora * llama_lora_training_init(
     if (!llama_lora_validate_training_params(params)) {
         return nullptr;
     }
-    
+
     struct llama_adapter_lora * adapter = llama_lora_create_adapter(model, params);
     if (!adapter) {
         return nullptr;
@@ -262,7 +264,7 @@ struct llama_adapter_lora * llama_lora_training_init(
         delete adapter;
         return nullptr;
     }
-    
+
     LLAMA_LOG_INFO("LoRA adapter contains %zu tensor pairs and is now registered with context\n", adapter->ab_map.size());
 
     return adapter;
@@ -276,7 +278,7 @@ bool llama_opt_param_filter_lora(const struct ggml_tensor * tensor, void * userd
     }
 
     const char * name = tensor->name;
-    
+
     // Check if tensor is LoRA A or B
     // LoRA tensor naming convention: blk.{layer}.{module}.lora_a or .lora_b
     if (strstr(name, ".lora_a") || strstr(name, ".lora_b")) {
@@ -288,7 +290,7 @@ bool llama_opt_param_filter_lora(const struct ggml_tensor * tensor, void * userd
 }
 
 bool llama_lora_save_adapter(
-    const struct llama_adapter_lora * adapter, 
+    const struct llama_adapter_lora * adapter,
     const char * filename,
     const struct llama_model * model) {
 
@@ -329,7 +331,7 @@ bool llama_lora_save_adapter(
 
     bool success = gguf_write_to_file(gguf_ctx, filename, false);
     if (success) {
-        LLAMA_LOG_INFO("Successfully saved LoRA adapter with %d tensors to: %s\n", 
+        LLAMA_LOG_INFO("Successfully saved LoRA adapter with %d tensors to: %s\n",
                        tensor_count, filename);
     } else {
         LLAMA_LOG_ERROR("Failed to write LoRA adapter to: %s\n", filename);
@@ -354,7 +356,7 @@ bool llama_lora_save_checkpoint(
     if (!checkpoint_dir.empty()) {
         if (!std::filesystem::exists(checkpoint_dir)) {
             if (!std::filesystem::create_directories(checkpoint_dir)) {
-                LLAMA_LOG_ERROR("llama_lora_save_checkpoint: failed to create checkpoint directory: %s\n", 
+                LLAMA_LOG_ERROR("llama_lora_save_checkpoint: failed to create checkpoint directory: %s\n",
                                checkpoint_dir.string().c_str());
                 return false;
             }
@@ -364,7 +366,7 @@ bool llama_lora_save_checkpoint(
     std::filesystem::path model_path = checkpoint_dir / "model.gguf";
     bool lora_saved = llama_lora_save_adapter(adapter, model_path.string().c_str(), model);
     if (!lora_saved) {
-        LLAMA_LOG_ERROR("llama_lora_save_checkpoint: failed to save LoRA adapter weights to %s\n", 
+        LLAMA_LOG_ERROR("llama_lora_save_checkpoint: failed to save LoRA adapter weights to %s\n",
                         model_path.string().c_str());
         return false;
     }
@@ -372,7 +374,7 @@ bool llama_lora_save_checkpoint(
     std::filesystem::path optimizer_path = checkpoint_dir / "optimizer.gguf";
     bool optimizer_saved = ctx->opt_save_state(optimizer_path.string().c_str());
     if (!optimizer_saved) {
-        LLAMA_LOG_ERROR("llama_lora_save_checkpoint: failed to save optimizer state to %s\n", 
+        LLAMA_LOG_ERROR("llama_lora_save_checkpoint: failed to save optimizer state to %s\n",
                         optimizer_path.string().c_str());
         return false;
     }
