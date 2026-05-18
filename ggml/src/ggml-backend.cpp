@@ -1473,6 +1473,11 @@ static void ggml_backend_sched_set_if_supported(ggml_backend_sched_t sched, stru
 
 // assigns backends to ops and splits the graph into subgraphs that can be computed on the same backend
 void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
+    // Invariants the inlined hash-set bitset accesses below assume; observed NULL on iOS
+    // (iPhone 17 Gemma 4 mtmd path) crashing at ggml_bitset_get's ldr [used + idx*4].
+    GGML_ASSERT(sched->hash_set.used != NULL);
+    GGML_ASSERT(sched->hash_set.keys != NULL);
+
     // reset splits
     sched->n_splits = 0;
     sched->n_graph_inputs = 0;
@@ -2341,6 +2346,10 @@ void ggml_backend_sched_reserve_size(ggml_backend_sched_t sched, struct ggml_cgr
 bool ggml_backend_sched_reserve(ggml_backend_sched_t sched, struct ggml_cgraph * measure_graph) {
     GGML_ASSERT(sched);
     GGML_ASSERT((int)sched->hash_set.size >= measure_graph->n_nodes + measure_graph->n_leafs);
+    // size > 0 but used == NULL means the hash_set was freed or never (re-)initialised;
+    // catch that before split_graph dereferences `used` via the inlined bitset accesses.
+    GGML_ASSERT(sched->hash_set.used != NULL);
+    GGML_ASSERT(sched->hash_set.keys != NULL);
 
     ggml_backend_sched_synchronize(sched);
 

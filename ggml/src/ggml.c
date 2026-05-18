@@ -6814,6 +6814,9 @@ struct ggml_hash_set ggml_hash_set_new(size_t size) {
 }
 
 void ggml_hash_set_reset(struct ggml_hash_set * hash_set) {
+    // memset(NULL, ...) would crash with the same KERN_INVALID_ADDRESS as the inlined bitset reads
+    // in ggml_backend_sched_split_graph; assert here so we can tell the two sites apart.
+    GGML_ASSERT(hash_set->used != NULL);
     memset(hash_set->used, 0, sizeof(ggml_bitset_t) * ggml_bitset_size(hash_set->size));
 }
 
