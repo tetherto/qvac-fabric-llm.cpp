@@ -2520,20 +2520,34 @@ enum ggml_status ggml_backend_view_init(struct ggml_tensor * tensor) {
 }
 
 enum ggml_status ggml_backend_tensor_alloc(ggml_backend_buffer_t buffer, struct ggml_tensor * tensor, void * addr) {
-    // Emit a single descriptive log line and assert in one shot, instead of four bare
-    // GGML_ASSERTs that strip away the offending tensor's identity. Observed on iOS
-    // Heavy9-Gemma4 / iPhone 16: an assert fires inside this function during the CLIP
-    // image-encode graph allocation, but the bare GGML_ASSERT line doesn't tell us
-    // which precondition failed or which tensor was involved.
-    if (tensor == NULL || tensor->buffer != NULL || tensor->data != NULL || tensor->view_src != NULL) {
-        GGML_LOG_ERROR("%s: precondition violation: tensor=%p name=%s op=%s buffer=%p data=%p view_src=%s\n",
+    // Diagnostic logging before the GGML_ASSERTs - the bare assert lines strip away the
+    // offending tensor's identity and the addr/size geometry, which makes iOS Heavy9-Gemma4
+    // aborts (CLIP image-encode graph allocation) impossible to triage from a crash report.
+    const bool bad_tensor = (tensor == NULL) ||
+                            (tensor->buffer != NULL) ||
+                            (tensor->data   != NULL) ||
+                            (tensor->view_src != NULL);
+    void * buf_base          = bad_tensor ? NULL : ggml_backend_buffer_get_base(buffer);
+    const size_t buf_size    = bad_tensor ? 0    : ggml_backend_buffer_get_size(buffer);
+    const size_t alloc_size  = bad_tensor ? 0    : ggml_backend_buffer_get_alloc_size(buffer, tensor);
+    const bool is_meta       = bad_tensor ? false : ggml_backend_buffer_is_meta(buffer);
+    const bool bad_addr_lo   = !bad_tensor && (addr < buf_base);
+    const bool bad_addr_hi   = !bad_tensor && !is_meta &&
+                               ((char *) addr + alloc_size > (char *) buf_base + buf_size);
+    if (bad_tensor || bad_addr_lo || bad_addr_hi) {
+        GGML_LOG_ERROR(
+            "%s: precondition violation: tensor=%p name=%s op=%s buffer=%p data=%p view_src=%s | "
+            "buf=%p buf_base=%p buf_size=%zu addr=%p alloc_size=%zu is_meta=%d "
+            "(bad_tensor=%d bad_addr_lo=%d bad_addr_hi=%d)\n",
             __func__,
             (void *) tensor,
             tensor ? tensor->name : "(null)",
             tensor ? ggml_op_name(tensor->op) : "(null)",
             tensor ? (void *) tensor->buffer : NULL,
             tensor ? tensor->data : NULL,
-            (tensor && tensor->view_src) ? tensor->view_src->name : "(null)");
+            (tensor && tensor->view_src) ? tensor->view_src->name : "(null)",
+            (void *) buffer, buf_base, buf_size, addr, alloc_size, is_meta ? 1 : 0,
+            bad_tensor ? 1 : 0, bad_addr_lo ? 1 : 0, bad_addr_hi ? 1 : 0);
     }
     GGML_ASSERT(tensor);
     GGML_ASSERT(tensor->buffer == NULL);
