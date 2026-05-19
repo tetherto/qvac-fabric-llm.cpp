@@ -8,8 +8,10 @@
 
 #include <cassert>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 struct ggml_metal_device_deleter {
     void operator()(ggml_metal_device_t ctx) {
@@ -20,11 +22,30 @@ struct ggml_metal_device_deleter {
 typedef std::unique_ptr<ggml_metal_device, ggml_metal_device_deleter> ggml_metal_device_ptr;
 
 ggml_metal_device_t ggml_metal_device_get(int device, int n_devices) {
+    // Cache one ggml_metal_device per device index. Each ggml_metal_device_init
+    // compiles the entire embedded ggml-metal source through MTLCompilerService,
+    // which is a sizeable. Two concurrent library compiles inside MTLCompilerService blow
+    // through its 100 MB ActiveSoft cap on iOS and the kernel jetsam-corpses it,
+    // leaving the addon unable to build pipelines for the mmproj graph.
+    static std::mutex mutex;
     static std::vector<ggml_metal_device_ptr> devs;
 
-    devs.emplace_back(ggml_metal_device_init(device, n_devices));
+    std::lock_guard<std::mutex> lock(mutex);
 
-    return devs.back().get();
+    if (device < 0) {
+        return nullptr;
+    }
+
+    while ((int) devs.size() <= device) {
+        devs.emplace_back(nullptr);
+    }
+
+    if (devs[device] == nullptr) {
+        GGML_LOG_INFO("ggml_metal_device_get: initialising device %d (this triggers a single newLibraryWithSource compile)\n", device);
+        devs[device].reset(ggml_metal_device_init(device, n_devices));
+    }
+
+    return devs[device].get();
 }
 
 struct ggml_metal_pipelines {
