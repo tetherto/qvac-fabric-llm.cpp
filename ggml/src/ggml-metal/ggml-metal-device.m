@@ -973,8 +973,13 @@ ggml_metal_rsets_t ggml_metal_rsets_init(ggml_metal_device_t dev) {
     res->lock = [[NSLock alloc] init];
     res->data = [[NSMutableArray alloc] init];
 
-    // by default keep the memory wired for 3 minutes
-    res->keep_alive_s = 3*60;
+    // Default to a 1-second heartbeat to emulate the pre-c41bde6fb behavior (no
+    // ongoing requestResidency re-issuance) on memory-constrained targets like
+    // iOS, where holding Metal buffers wired for minutes pushes the app past
+    // jetsam under workloads like the embed-llamacpp 4096-batch stress test.
+    // Set GGML_METAL_RESIDENCY_KEEP_ALIVE_S=180 to restore the upstream default
+    // when running interactive workloads on desktop where wired memory is free.
+    res->keep_alive_s = 1;
 
     const char * GGML_METAL_RESIDENCY_KEEP_ALIVE_S = getenv("GGML_METAL_RESIDENCY_KEEP_ALIVE_S");
     if (GGML_METAL_RESIDENCY_KEEP_ALIVE_S) {
@@ -982,7 +987,7 @@ ggml_metal_rsets_t ggml_metal_rsets_init(ggml_metal_device_t dev) {
     }
 
     if (res->keep_alive_s <= 0) {
-        res->keep_alive_s = 3*60;
+        res->keep_alive_s = 1;
     }
 
     res->time_per_loop_ms = 5;
