@@ -4740,6 +4740,15 @@ vk_device ggml_vk_get_device(size_t idx) {
 
             pfn_vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR(device->physical_device, &cm_props_num, cm_props.data());
 
+            constexpr const auto make_coop_mat_key = [](const auto& p) {
+                return std::make_tuple(uint64_t(p.MSize) * p.NSize * p.KSize,
+                                       p.KSize, p.NSize, p.MSize,
+                                       uint32_t(p.AType), uint32_t(p.BType), uint32_t(p.CType), uint32_t(p.ResultType));
+            };
+            std::sort(cm_props.begin(), cm_props.end(), [&](const auto& lhs, const auto& rhs) {
+                return make_coop_mat_key(lhs) > make_coop_mat_key(rhs);
+            });
+
             VK_LOG_DEBUG("ggml_vulkan: Cooperative Matrix Shapes: " << cm_props.size());
 
             for (auto& prop : cm_props) {
