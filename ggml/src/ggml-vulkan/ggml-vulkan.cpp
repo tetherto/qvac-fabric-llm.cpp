@@ -1462,7 +1462,8 @@ static bool ggml_vk_matmul_shmem_support(const vk_device& device, const std::vec
     const bool intel_shmem_stride_pad_zero = device->vendor_id == VK_VENDOR_ID_INTEL && device->coopmat_support &&
                                               device->driver_id == vk::DriverId::eIntelProprietaryWindows;
     const uint32_t bank_conflict_offset = intel_shmem_stride_pad_zero ? 0 : (device->coopmat_support ? 8 : 1);
-    const uint32_t type_size = device->fp16 ? sizeof(ggml_fp16_t) : sizeof(float);
+    const bool     f32_only             = (src0_type == GGML_TYPE_F32 && device->coopmat_f32_support_16x16x16_f32acc);
+    const uint32_t type_size = device->fp16 && !f32_only ? sizeof(ggml_fp16_t) : sizeof(float);
     const uint32_t warps = warptile[0] / warptile[10];
 
     const uint32_t load_bufs = (warptile[1] + warptile[2]) * (warptile[3] + bank_conflict_offset) * type_size;
@@ -1704,6 +1705,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     //   [10]    : WARP / required_subgroup_size (read via WARP_SIZE_IDX)
     static constexpr size_t WARP_SIZE_IDX = 10;
     std::vector<uint32_t> l_warptile, m_warptile, s_warptile,
+                          l_warptile_f32, m_warptile_f32, s_warptile_f32,
                           l_warptile_id, m_warptile_id, s_warptile_id,
                           l_warptile_mmq, m_warptile_mmq, s_warptile_mmq,
                           l_warptile_mmq_int, m_warptile_mmq_int, s_warptile_mmq_int,
@@ -1789,9 +1791,26 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         const uint32_t itn = device->coopmat_int_n;
         const uint32_t itk = device->coopmat_int_k;
 
+        const bool coopmat_support_f32 = device->coopmat_f32_support_16x16x16_f32acc;
+        const uint32_t tm_l_f32 = coopmat_support_f32 ? device->coopmat_f32_m : 4;
+        const uint32_t tm_m_f32 = coopmat_support_f32 ? device->coopmat_f32_m : 4;
+        const uint32_t tm_s_f32 = coopmat_support_f32 ? device->coopmat_f32_m : 2;
+        const uint32_t tn_l_f32 = coopmat_support_f32 ? device->coopmat_f32_n : 4;
+        const uint32_t tn_m_f32 = coopmat_support_f32 ? device->coopmat_f32_n : 2;
+        const uint32_t tn_s_f32 = coopmat_support_f32 ? device->coopmat_f32_n : 2;
+        const uint32_t tk_l_f32 = coopmat_support_f32 ? device->coopmat_f32_k : 1;
+        const uint32_t tk_m_f32 = coopmat_support_f32 ? device->coopmat_f32_k : 1;
+        const uint32_t tk_s_f32 = coopmat_support_f32 ? device->coopmat_f32_k : 1;
+
+        const uint32_t s_warptile_wm_f32 = std::clamp(device->subgroup_size, 16u, 32u);
+
         l_warptile = { 128,             128, 128, 16, mm_warp_8 * 2, 64, 2, tm_l, tn_l, tk_l, mm_warp_8 };
         m_warptile = { 128,              64,  64, 16, mm_warp_8,     32, 2, tm_m, tn_m, tk_m, mm_warp_8 };
         s_warptile = { subgroup_size_32, 32,  32, 16, s_warptile_wm_8, 32, 2, tm_s, tn_s, tk_s, subgroup_size_8 };
+
+        l_warptile_f32 = { 128,             128, 128, 32, mm_warp_8 * 2,     64, 2, tm_l_f32, tn_l_f32, tk_l_f32, mm_warp_8 };
+        m_warptile_f32 = { 128,              64,  64, 32, mm_warp_8,         32, 2, tm_m_f32, tn_m_f32, tk_m_f32, mm_warp_8 };
+        s_warptile_f32 = { subgroup_size_32, 32,  32, 32, s_warptile_wm_f32, 32, 2, tm_s_f32, tn_s_f32, tk_s_f32, subgroup_size_8 };
 
         l_warptile_mmq = { 128,             128, 128, 32, mm_warp_8 * 2, 64, 2, tm_l, tn_l, tk_l, mm_warp_8 };
         m_warptile_mmq = { 128,              64,  64, 32, mm_warp_8,     32, 2, tm_m, tn_m, tk_m, mm_warp_8 };
@@ -1951,6 +1970,20 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                 device->mul_mat_id_l_int[i] = false;
             } else if (!int_shmem_support(l_intid, true)) {
                 device->mul_mat_id_l_int[i] = false;
+            }
+
+            // The following block keeps mul_mat_l disabled on Adreno
+            if (t == GGML_TYPE_F32 && device->coopmat_f32_support_16x16x16_f32acc) {
+                if (!ggml_vk_matmul_shmem_support(device, s_warptile_f32, false, t)) {
+                    device->mul_mat_s[i] = false;
+                    device->mul_mat_m[i] = false;
+                    device->mul_mat_l[i] = false;
+                } else if (!ggml_vk_matmul_shmem_support(device, m_warptile_f32, false, t)) {
+                    device->mul_mat_m[i] = false;
+                    device->mul_mat_l[i] = false;
+                } else if (!ggml_vk_matmul_shmem_support(device, l_warptile_f32, false, t)) {
+                    device->mul_mat_l[i] = false;
+                }
             }
         }
     }
@@ -2437,7 +2470,12 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         const bool rdna3 = device->architecture == AMD_RDNA3;
         const bool rdna4 = device->architecture == AMD_RDNA4;
 
-        cm1_create({GGML_TYPE_F32, GGML_TYPE_F32, false, false}, tc_mm, "matmul_f32_f32",     matmul_f32_f32_cm1_len,     matmul_f32_f32_cm1_data,     sizeof(vk_mat_mat_push_constants), 3);
+        if (device->coopmat_f32_support_16x16x16_f32acc) {
+            std::vector<vk_tile_config> tc_mm_f32 = {{s_warptile_f32, s_wg_denoms, s_align}, {m_warptile_f32, m_wg_denoms, m_align}, {l_warptile_f32, l_wg_denoms, l_align}};
+            cm1_create({GGML_TYPE_F32, GGML_TYPE_F32, false, false}, tc_mm_f32, "matmul_f32_f32", matmul_f32_f32_cm1_fp32_len, matmul_f32_f32_cm1_fp32_data, sizeof(vk_mat_mat_push_constants), 3);
+        } else {
+            cm1_create({GGML_TYPE_F32, GGML_TYPE_F32, false, false}, tc_mm, "matmul_f32_f32",     matmul_f32_f32_cm1_len,     matmul_f32_f32_cm1_data,     sizeof(vk_mat_mat_push_constants), 3);
+        }
         cm1_create({GGML_TYPE_F32, GGML_TYPE_F16, false, false}, tc_mm, "matmul_f32_f16",     matmul_f32_f16_cm1_len,     matmul_f32_f16_cm1_data,     sizeof(vk_mat_mat_push_constants), 3);
         if (device->coopmat_acc_f16_support) {
             cm1_create({GGML_TYPE_F16, GGML_TYPE_F16, false, true},  tc_mm, "matmul_f16_f16acc", matmul_f16_f16acc_cm1_len, matmul_f16_f16acc_cm1_data, sizeof(vk_mat_mat_push_constants), 3);
@@ -4097,6 +4135,12 @@ vk_device ggml_vk_get_device(size_t idx) {
         bool pipeline_executable_properties_support = false;
         bool internally_sync_support = false;
         device->coopmat_support = false;
+        device->coopmat_f32_m = 0;
+        device->coopmat_f32_n = 0;
+        device->coopmat_f32_k = 0;
+        device->coopmat_f32_support = false;
+        device->coopmat_f32_acc_f32_support = false;
+        device->coopmat_f32_support_16x16x16_f32acc = false;
         device->integer_dot_product = false;
         device->shader_64b_indexing = false;
         bool bfloat16_support = false;
@@ -4755,10 +4799,31 @@ vk_device ggml_vk_get_device(size_t idx) {
                 if (prop.MSize > 16 || prop.NSize > 16 || prop.KSize > 16) {
                     continue;
                 }
-                
+
                 VK_LOG_DEBUG("ggml_vulkan: M: " << prop.MSize << " N: " << prop.NSize << " K: " << prop.KSize << " A: " << vk::to_string((vk::ComponentTypeKHR)prop.AType) << " B: " << vk::to_string((vk::ComponentTypeKHR)prop.BType) << " C: " << vk::to_string((vk::ComponentTypeKHR)prop.CType) << " Result: " << vk::to_string((vk::ComponentTypeKHR)prop.ResultType) << " saturatingAccumulation: " << prop.saturatingAccumulation << " scope: " << vk::to_string((vk::ScopeKHR)prop.scope));
 
-                if ((vk::ComponentTypeKHR)prop.AType == vk::ComponentTypeKHR::eFloat16 &&
+                if ((vk::ComponentTypeKHR)prop.AType == vk::ComponentTypeKHR::eFloat32 &&
+                    (vk::ComponentTypeKHR)prop.BType == vk::ComponentTypeKHR::eFloat32 &&
+                    (vk::ScopeKHR)prop.scope == vk::ScopeKHR::eSubgroup
+                ) {
+                    if ((vk::ComponentTypeKHR)prop.CType == vk::ComponentTypeKHR::eFloat32 &&
+                        (vk::ComponentTypeKHR)prop.ResultType == vk::ComponentTypeKHR::eFloat32) {
+                        // coopmat sizes not set yet
+                        if (device->coopmat_f32_m == 0) {
+                            device->coopmat_f32_support = true;
+                            device->coopmat_f32_acc_f32_support = true;
+                            device->coopmat_f32_m = prop.MSize;
+                            device->coopmat_f32_n = prop.NSize;
+                            device->coopmat_f32_k = prop.KSize;
+                        } else if (device->coopmat_f32_m == prop.MSize && device->coopmat_f32_n == prop.NSize && device->coopmat_f32_k == prop.KSize) {
+                            // Only enable if shape is identical
+                            device->coopmat_f32_acc_f32_support = true;
+                        }
+                        if (prop.MSize == 16 && prop.NSize == 16 && prop.KSize == 16) {
+                            device->coopmat_f32_support_16x16x16_f32acc = true;
+                        }
+                    }
+                } else if ((vk::ComponentTypeKHR)prop.AType == vk::ComponentTypeKHR::eFloat16 &&
                     (vk::ComponentTypeKHR)prop.BType == vk::ComponentTypeKHR::eFloat16 &&
                     (vk::ScopeKHR)prop.scope == vk::ScopeKHR::eSubgroup
                 ) {
@@ -4833,14 +4898,22 @@ vk_device ggml_vk_get_device(size_t idx) {
                 device->coopmat_support = false;
             }
 
+            if (!device->coopmat_support || device->coopmat_f32_m == 0 || !device->coopmat_f32_support_16x16x16_f32acc) {
+                device->coopmat_f32_support_16x16x16_f32acc = false;
+                device->coopmat_f32_acc_f32_support = false;
+                device->coopmat_f32_support = false;
+            }
+
             VK_LOG_DEBUG("ggml_vulkan: Cooperative Matrix:" <<
                            "\n\tSupport:             " << device->coopmat_support       <<
+                           "\n\tF32 Support:       " << device->coopmat_f32_support     <<
                            "\n\tBF16 Support:      " << device->coopmat_bf16_support    <<
                            "\n\tInt8 Support:      " << device->coopmat_int_support     <<
                            "\n\tAccum F16 Support: " << device->coopmat_acc_f16_support <<
                            "\n\tAccum F32 Support: " << device->coopmat_acc_f32_support <<
                            "\n\t16x16x16 F32 Acc Support: " << device->coopmat_support_16x16x16_f32acc <<
                            "\n\t16x16x16 F16 Acc Support: " << device->coopmat_support_16x16x16_f16acc <<
+                           "\n\tF32 Shape:  M=" << device->coopmat_f32_m << " N=" << device->coopmat_f32_n << " K=" << device->coopmat_f32_k <<
                            "\n\tF16 Shape:  M=" << device->coopmat_m     << " N=" << device->coopmat_n     << " K=" << device->coopmat_k     <<
                            "\n\tInt8 Shape: M=" << device->coopmat_int_m << " N=" << device->coopmat_int_n << " K=" << device->coopmat_int_k << '\n');
         }
@@ -6194,7 +6267,8 @@ static const std::vector<vk_matmul_pipeline_pair>* ggml_vk_get_mul_mat_mat_pipel
     // times out on Mali and Adreno. Force a dequant to f16 for both inputs instead.
     if (!mul_mat_id && src0_type == GGML_TYPE_F32 && src1_type == GGML_TYPE_F32 &&
         (ctx->device->vendor_id == VK_VENDOR_ID_ARM || ctx->device->vendor_id == VK_VENDOR_ID_QUALCOMM) &&
-        ctx->device->coopmat_support && !ctx->device->coopmat2) {
+        ctx->device->coopmat_support && !ctx->device->coopmat2 &&
+        !ctx->device->coopmat_f32_support_16x16x16_f32acc) {
         return nullptr;
     }
     bool f16acc = ggml_vk_get_mul_mat_mat_f16acc(ctx, src0_type, src1_type, prec);
@@ -6800,6 +6874,9 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
         src1_uma = d_Qy != nullptr;
     }
 
+    const bool use_f32_cm1 = src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 &&
+                            ctx->device->coopmat_f32_support_16x16x16_f32acc;
+
     const bool x_non_contig = (ctx->device->coopmat2 && src0->type == GGML_TYPE_F32) ||
                               !ggml_vk_dim01_contiguous(src0);
     // If src0 is BF16, try to use a BF16 x BF16 multiply
@@ -6814,7 +6891,7 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
     // Mali/Adreno KHR_coopmat1 workaround: F16 x F16 path is the only safe coopmat path.
     // Force both inputs to be dequantized/casted to F16.
     const bool is_tq = src0->type == GGML_TYPE_TQ1_0 || src0->type == GGML_TYPE_TQ2_0;
-    const bool cm1_f16_only = (ctx->device->vendor_id == VK_VENDOR_ID_ARM || ctx->device->vendor_id == VK_VENDOR_ID_QUALCOMM) && ctx->device->coopmat_support && !ctx->device->coopmat2 && !is_tq;
+    const bool cm1_f16_only = (ctx->device->vendor_id == VK_VENDOR_ID_ARM || ctx->device->vendor_id == VK_VENDOR_ID_QUALCOMM) && ctx->device->coopmat_support && !ctx->device->coopmat2 && !is_tq && !use_f32_cm1;
 
     const ggml_type y_kernel_type = cm1_f16_only ? f16_type : ggml_vk_mul_mat_b_type(ctx, src0->type, src1, f16_type,
                                         ggml_prec_get_acc(dst), false, can_quantize_y, prefer_f16_b);
@@ -6829,7 +6906,8 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
     bool qx_needs_dequant = mmp_map == nullptr || x_non_contig;
     const bool qy_needs_dequant = y_needs_reformat;
 
-    if (src0->type == GGML_TYPE_F32 && (ctx->device->vendor_id == VK_VENDOR_ID_ARM || ctx->device->vendor_id == VK_VENDOR_ID_QUALCOMM) && ctx->device->coopmat_support && !ctx->device->coopmat2) {
+    if (src0->type == GGML_TYPE_F32 && (ctx->device->vendor_id == VK_VENDOR_ID_ARM || ctx->device->vendor_id == VK_VENDOR_ID_QUALCOMM) &&
+        ctx->device->coopmat_support && !ctx->device->coopmat2 && !use_f32_cm1) {
         qx_needs_dequant = true;
     }
 

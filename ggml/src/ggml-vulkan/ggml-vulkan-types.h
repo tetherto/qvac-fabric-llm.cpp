@@ -763,6 +763,13 @@ struct vk_device_struct {
     uint32_t coopmat_int_n;
     uint32_t coopmat_int_k;
 
+    bool coopmat_f32_support {};
+    bool coopmat_f32_acc_f32_support {};
+    bool coopmat_f32_support_16x16x16_f32acc {};
+    uint32_t coopmat_f32_m {};
+    uint32_t coopmat_f32_n {};
+    uint32_t coopmat_f32_k {};
+
     bool coopmat2;
     bool coopmat2_bf16_support {};
     bool coopmat2_decode_vector;
