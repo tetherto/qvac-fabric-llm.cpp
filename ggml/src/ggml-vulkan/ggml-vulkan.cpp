@@ -4732,15 +4732,11 @@ vk_device ggml_vk_get_device(size_t idx) {
             PFN_vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR pfn_vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR =
                 (PFN_vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR)vkGetInstanceProcAddr(vk_instance.instance, "vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR");
 
-            uint32_t cm_props_num;
+            uint32_t cm_props_num = 0;
 
             pfn_vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR(device->physical_device, &cm_props_num, nullptr);
 
-            cm_props.resize(cm_props_num);
-
-            for (auto& prop : cm_props) {
-                prop.sType = VK_STRUCTURE_TYPE_COOPERATIVE_MATRIX_PROPERTIES_KHR;
-            }
+            cm_props.resize(cm_props_num, vk::CooperativeMatrixPropertiesKHR{});
 
             pfn_vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR(device->physical_device, &cm_props_num, cm_props.data());
 
@@ -4823,6 +4819,17 @@ vk_device ggml_vk_get_device(size_t idx) {
                 GGML_LOG_DEBUG("ggml_vulkan: WARNING: No suitable matrix core mode found. Disabling matrix cores.\n");
                 device->coopmat_support = false;
             }
+
+            VK_LOG_DEBUG("ggml_vulkan: Cooperative Matrix:" <<
+                           "\n\tSupport:             " << device->coopmat_support       <<
+                           "\n\tBF16 Support:      " << device->coopmat_bf16_support    <<
+                           "\n\tInt8 Support:      " << device->coopmat_int_support     <<
+                           "\n\tAccum F16 Support: " << device->coopmat_acc_f16_support <<
+                           "\n\tAccum F32 Support: " << device->coopmat_acc_f32_support <<
+                           "\n\t16x16x16 F32 Acc Support: " << device->coopmat_support_16x16x16_f32acc <<
+                           "\n\t16x16x16 F16 Acc Support: " << device->coopmat_support_16x16x16_f16acc <<
+                           "\n\tF16 Shape:  M=" << device->coopmat_m     << " N=" << device->coopmat_n     << " K=" << device->coopmat_k     <<
+                           "\n\tInt8 Shape: M=" << device->coopmat_int_m << " N=" << device->coopmat_int_n << " K=" << device->coopmat_int_k << '\n');
         }
 
         if (device->coopmat_support) {
