@@ -89,39 +89,32 @@ class ModelDef:
     path: str
     tokenizer: str
     label: str
-    family: str  # "7B-q4", "7B-f16", "14B-q4", etc.
+    family: str  # one bucket per model so the cross-model aggregation in
+                 # format_table() degenerates to per-model rows (we keep the
+                 # field for back-compat with the existing aggregation code).
 
 
+# Three q8 models mirroring tests/test-kv-cache-quantization-perp.sh's presets.
+# Keeping the same matrix across RULER / LongBench / ZeroSCROLLS / L-Eval / perp
+# / perf means every cell can be cross-referenced cell-by-cell.
 MODELS_DEFAULT = [
     ModelDef(
-        path="models/Mistral-7B-Instruct-v0.3-Q4_K_M.gguf",
+        path="models/Mistral-7B-Instruct-v0.3-Q8_0.gguf",
         tokenizer="mistralai/Mistral-7B-Instruct-v0.3",
-        label="Mistral-7B-Q4",
-        family="7B-q4",
+        label="Mistral-7B",
+        family="Mistral-7B",
     ),
     ModelDef(
-        path="models/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf",
+        path="models/Llama-3.1-8B-Instruct-Q8_0.gguf",
         tokenizer="NousResearch/Meta-Llama-3.1-8B-Instruct",
-        label="Llama-8B-Q4",
-        family="7B-q4",
+        label="Llama-3.1-8B",
+        family="Llama-3.1-8B",
     ),
     ModelDef(
-        path="models/Mistral-7B-Instruct-v0.3.fp16.gguf",
-        tokenizer="mistralai/Mistral-7B-Instruct-v0.3",
-        label="Mistral-7B-F16",
-        family="7B-f16",
-    ),
-    ModelDef(
-        path="models/Llama-3.1-8B-Instruct-f16.gguf",
-        tokenizer="NousResearch/Meta-Llama-3.1-8B-Instruct",
-        label="Llama-8B-F16",
-        family="7B-f16",
-    ),
-    ModelDef(
-        path="models/Qwen2.5-14B-Instruct-Q4_K_M.gguf",
-        tokenizer="Qwen/Qwen2.5-14B-Instruct",
-        label="Qwen-14B-Q4",
-        family="14B-q4",
+        path="models/Qwen3.5-4B-Q8_0.gguf",
+        tokenizer="unsloth/Qwen3.5-4B",
+        label="Qwen3.5-4B",
+        family="Qwen3.5-4B",
     ),
 ]
 
