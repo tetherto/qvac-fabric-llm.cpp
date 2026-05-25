@@ -293,7 +293,7 @@ _ruler_infer_single() {
 
     if (( print_cmd == 1 )); then
         printf '  command: ' >&2
-        printf '%q ' "$cli_bin" -m "$model" -ctk "$ctk" -ctv "$ctv" -c $((ctx_len + tokens_to_gen + 256)) -n "$tokens_to_gen" --temp 0 -f "$tmp_prompt" --no-display-prompt --no-conversation >&2
+        printf '%q ' "$cli_bin" -m "$model" -ctk "$ctk" -ctv "$ctv" -c $((ctx_len + tokens_to_gen + 256)) -n "$tokens_to_gen" --temp 0 -f "$tmp_prompt" --no-display-prompt -no-cnv >&2
         printf '%q ' "${extra_args[@]}" >&2
         printf '\n' >&2
     fi
@@ -307,7 +307,7 @@ _ruler_infer_single() {
         --temp 0 \
         -f "$tmp_prompt" \
         --no-display-prompt \
-        --no-conversation \
+        -no-cnv \
         "${extra_args[@]}" 2>"$tmp_stderr"
     ) || rc=$?
 
@@ -382,7 +382,7 @@ _ruler_detect_tokenizer() {
 
 # ── main benchmark function ─────────────────────────────────────────────────
 ruler_bench() {
-    local cli_bin="build/bin/llama-cli"
+    local cli_bin="build/bin/llama-completion"
     local model=""
     local ctk="f16"
     local ctv="f16"
