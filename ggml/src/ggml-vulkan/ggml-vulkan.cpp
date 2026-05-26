@@ -1802,19 +1802,30 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         const uint32_t tk_m_f32 = coopmat_support_f32 ? device->coopmat_f32_k : 1;
         const uint32_t tk_s_f32 = coopmat_support_f32 ? device->coopmat_f32_k : 1;
 
+        const auto calc_tile = [&](uint32_t base_bm, uint32_t base_bn, uint32_t block_tk, uint32_t base_wm,
+                             uint32_t base_wn, uint32_t tm, uint32_t tn, uint32_t tk, uint32_t warp_unit) -> std::vector<uint32_t>{
+            const uint32_t wm = std::max(base_wm, tm);
+            const uint32_t wn = std::max(base_wn, tn);
+            const uint32_t bm = base_bm * wm / base_wm;
+            const uint32_t bn = base_bn * wn / base_wn;
+            const uint32_t num_warps = (bm / wm) * (bn / wn);
+            const uint32_t block_size = num_warps * warp_unit;
+            return { block_size, bm, bn, block_tk, wm, wn, 2, tm, tn, tk, warp_unit };
+        };
+
         const uint32_t s_warptile_wm_f32 = std::clamp(device->subgroup_size, 16u, 32u);
 
-        l_warptile = { 128,             128, 128, 16, mm_warp_8 * 2, 64, 2, tm_l, tn_l, tk_l, mm_warp_8 };
-        m_warptile = { 128,              64,  64, 16, mm_warp_8,     32, 2, tm_m, tn_m, tk_m, mm_warp_8 };
-        s_warptile = { subgroup_size_32, 32,  32, 16, s_warptile_wm_8, 32, 2, tm_s, tn_s, tk_s, subgroup_size_8 };
+        l_warptile = calc_tile(128, 128, 16, mm_warp_8 * 2, 64, tm_l, tn_l, tk_l, mm_warp_8);
+        m_warptile = calc_tile( 64,  64, 16, mm_warp_8,     32, tm_m, tn_m, tk_m, mm_warp_8);
+        s_warptile = calc_tile( 32,  32, 16, s_warptile_wm_8, 32, tm_s, tn_s, tk_s, subgroup_size_8);
 
-        l_warptile_f32 = { 128,             128, 128, 32, mm_warp_8 * 2,     64, 2, tm_l_f32, tn_l_f32, tk_l_f32, mm_warp_8 };
-        m_warptile_f32 = { 128,              64,  64, 32, mm_warp_8,         32, 2, tm_m_f32, tn_m_f32, tk_m_f32, mm_warp_8 };
-        s_warptile_f32 = { subgroup_size_32, 32,  32, 32, s_warptile_wm_f32, 32, 2, tm_s_f32, tn_s_f32, tk_s_f32, subgroup_size_8 };
+        l_warptile_f32 = calc_tile(128, 128, 32, mm_warp_8 * 2,     64, tm_l_f32, tn_l_f32, tk_l_f32, mm_warp_8);
+        m_warptile_f32 = calc_tile( 64,  64, 32, mm_warp_8,         32, tm_m_f32, tn_m_f32, tk_m_f32, mm_warp_8);
+        s_warptile_f32 = calc_tile( 32,  32, 32, s_warptile_wm_f32, 32, tm_s_f32, tn_s_f32, tk_s_f32, subgroup_size_8);
 
-        l_warptile_mmq = { 128,             128, 128, 32, mm_warp_8 * 2, 64, 2, tm_l, tn_l, tk_l, mm_warp_8 };
-        m_warptile_mmq = { 128,              64,  64, 32, mm_warp_8,     32, 2, tm_m, tn_m, tk_m, mm_warp_8 };
-        s_warptile_mmq = { subgroup_size_32, 32,  32, 32, s_warptile_wm_8, 32, 2, tm_s, tn_s, tk_s, subgroup_size_8 };
+        l_warptile_mmq = calc_tile(128, 128, 32, mm_warp_8 * 2, 64, tm_l, tn_l, tk_l, mm_warp_8);
+        m_warptile_mmq = calc_tile( 64,  64, 32, mm_warp_8,     32, tm_m, tn_m, tk_m, mm_warp_8);
+        s_warptile_mmq = calc_tile( 32,  32, 32, s_warptile_wm_8, 32, tm_s, tn_s, tk_s, subgroup_size_8);
 
         // Integer MMQ has a smaller shared memory profile, but heavier register use
         l_warptile_mmq_int = { 128,             128, 128, 32, mm_warp_8 * 2, 64, 2, 4, 4, 1, mm_warp_8 };
@@ -1872,9 +1883,12 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             m_warptile_mmq = { 64, 64, 64, 32, 64, 64, 1, tm_m, tn_m, tk_m, 64 };
         }
 
-        l_mmq_wg_denoms = l_wg_denoms = {128, 128, 1 };
-        m_mmq_wg_denoms = m_wg_denoms = { 64,  64, 1 };
-        s_mmq_wg_denoms = s_wg_denoms = { 32,  32, 1 };
+        l_wg_denoms     = { l_warptile[1],     l_warptile[2],     1 };
+        m_wg_denoms     = { m_warptile[1],     m_warptile[2],     1 };
+        s_wg_denoms     = { s_warptile[1],     s_warptile[2],     1 };
+        l_mmq_wg_denoms = { l_warptile_mmq[1], l_warptile_mmq[2], 1 };
+        m_mmq_wg_denoms = { m_warptile_mmq[1], m_warptile_mmq[2], 1 };
+        s_mmq_wg_denoms = { s_warptile_mmq[1], s_warptile_mmq[2], 1 };
         l_align = 128;
         m_align =  64;
         s_align =  32;
@@ -4796,10 +4810,6 @@ vk_device ggml_vk_get_device(size_t idx) {
             VK_LOG_DEBUG("ggml_vulkan: Cooperative Matrix Shapes: " << cm_props.size());
 
             for (auto& prop : cm_props) {
-                if (prop.MSize > 16 || prop.NSize > 16 || prop.KSize > 16) {
-                    continue;
-                }
-
                 VK_LOG_DEBUG("ggml_vulkan: M: " << prop.MSize << " N: " << prop.NSize << " K: " << prop.KSize << " A: " << vk::to_string((vk::ComponentTypeKHR)prop.AType) << " B: " << vk::to_string((vk::ComponentTypeKHR)prop.BType) << " C: " << vk::to_string((vk::ComponentTypeKHR)prop.CType) << " Result: " << vk::to_string((vk::ComponentTypeKHR)prop.ResultType) << " saturatingAccumulation: " << prop.saturatingAccumulation << " scope: " << vk::to_string((vk::ScopeKHR)prop.scope));
 
                 if ((vk::ComponentTypeKHR)prop.AType == vk::ComponentTypeKHR::eFloat32 &&
