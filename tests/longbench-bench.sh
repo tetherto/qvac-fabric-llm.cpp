@@ -30,6 +30,9 @@
 #   longbench_task_scores    - assoc array of task -> mean% (no stdev)
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=kv_cache_bench_common.sh
+source "${SCRIPT_DIR}/kv_cache_bench_common.sh"
+
 LB_DIR="${SCRIPT_DIR}/longbench"
 LB_REPO="https://github.com/THUDM/LongBench.git"
 LB_DATA_URL="https://huggingface.co/datasets/THUDM/LongBench/resolve/main/data.zip"
@@ -38,10 +41,6 @@ LB_VENV="${LB_DIR}/.venv"
 LB_PREPARE="${SCRIPT_DIR}/longbench-prepare.py"
 LB_SCORE="${SCRIPT_DIR}/longbench-score.py"
 LB_DATA_DIR=""  # set per-tokenizer/preset combination in longbench_bench()
-LB_SERVER_PORT=""  # random per cell, picked in _lb_start_server
-LB_SERVER_PID=""
-LB_SERVER_URL=""
-LB_SERVER_LOG=""
 
 # The 13 LongBench-E tasks, paper order, English only (Chinese tasks dropped
 # to match Llama-3.1-8B-Instruct's training language).
@@ -141,85 +140,21 @@ _lb_ensure_repo() {
     fi
 }
 
-# ── ensure uv (bootstrap a vendored copy if needed) ─────────────────────────
-_lb_ensure_uv() {
-    local uv_dir="${LB_DIR}/.uv"
-    local uv_bin="${uv_dir}/uv"
-    if [[ -x "$uv_bin" ]]; then
-        return 0
-    fi
-    echo "Installing uv into ${uv_dir} ..."
-    UV_INSTALL_DIR="$uv_dir" curl -LsSf https://astral.sh/uv/install.sh | sh 2>&1 | tail -3
-    [[ -x "$uv_bin" ]]
-}
-
-# ── ensure venv ──────────────────────────────────────────────────────────────
-# Serialise creation with flock: the orchestrator spawns multiple cells in
-# parallel, and on a fresh tests/longbench/ dir they all race to create the
-# same venv. Without the lock the loser fails with "venv already exists".
-# The TOCTOU check inside the lock (test bin/activate again) means only the
-# first holder actually creates; the rest see the venv and just `source` it.
-_lb_ensure_venv() {
-    mkdir -p "${LB_DIR}"
-    local lock="${LB_DIR}/.venv.lock"
-    (
-        flock -x 9
-        if [[ -f "${LB_VENV}/bin/activate" ]]; then
-            exit 0  # another cell already created it while we waited
-        fi
-        echo "Creating Python venv at ${LB_VENV} ..."
-        local uv_bin="${LB_DIR}/.uv/uv"
-        if [[ "${LB_USE_UV:-0}" == "1" ]]; then
-            if command -v uv &>/dev/null; then
-                uv venv "${LB_VENV}"
-            elif _lb_ensure_uv; then
-                "$uv_bin" venv "${LB_VENV}"
-            else
-                echo "ERROR: LB_USE_UV=1 but failed to install uv" >&2
-                exit 1
-            fi
-        elif python3 -m venv "${LB_VENV}" 2>/dev/null; then
-            : # success
-        elif command -v uv &>/dev/null; then
-            echo "python3 -m venv unavailable, using uv ..."
-            uv venv "${LB_VENV}"
-        elif _lb_ensure_uv; then
-            echo "python3 -m venv unavailable, using local uv ..."
-            "$uv_bin" venv "${LB_VENV}"
-        else
-            echo "ERROR: cannot create a Python venv (no python3-venv, no uv)" >&2
-            exit 1
-        fi
-    ) 9>"$lock"
-    local rc=$?
-    if (( rc != 0 )); then return $rc; fi
-    # shellcheck disable=SC1091
-    source "${LB_VENV}/bin/activate"
-}
-
 # ── ensure pip deps ──────────────────────────────────────────────────────────
+# Minimal subset of upstream's requirements.txt — we load JSONL directly
+# (the `datasets` package's script-loader API was removed in v3, so the
+# upstream `load_dataset('THUDM/LongBench', ...)` recipe no longer works).
+# `rouge` here is the original Python package used by upstream metrics.py,
+# NOT the similarly named `rouge-score` package (different API/scores).
+# jinja2 is needed by transformers' apply_chat_template (soft dep upstream).
+# jieba is imported unconditionally by upstream's metrics.py at module load
+# even though we only use the English metric subset — pulling it in is
+# cheaper than patching the import.
 _lb_ensure_deps() {
-    _lb_ensure_venv
-
-    # Minimal subset of upstream's requirements.txt — we load JSONL directly
-    # (the `datasets` package's script-loader API was removed in v3, so the
-    # upstream `load_dataset('THUDM/LongBench', ...)` recipe no longer works).
-    # `rouge` here is the original Python package used by upstream metrics.py,
-    # NOT the similarly named `rouge-score` package (different API/scores).
-    local missing=0
-    for pkg in rouge fuzzywuzzy numpy transformers jinja2 jieba; do
-        python3 -c "import ${pkg}" 2>/dev/null || missing=1
-    done
-    if (( missing )); then
-        echo "Installing LongBench Python dependencies into venv ..."
-        # jinja2 is needed by transformers' apply_chat_template (soft dep
-        # upstream). jieba is imported unconditionally by upstream's
-        # metrics.py at module load even though we only use the English
-        # metric subset — pulling it in is cheaper than patching the import.
-        python3 -m pip install --quiet \
-            rouge fuzzywuzzy python-Levenshtein numpy transformers jinja2 jieba \
-            2>&1 | tail -5
-    fi
+    _kv_ensure_venv "${LB_VENV}" "${LB_USE_UV:-0}" "${LB_DIR}/.uv"
+    _kv_ensure_pip_deps "LongBench" \
+        "rouge fuzzywuzzy numpy transformers jinja2 jieba" \
+        "rouge fuzzywuzzy python-Levenshtein numpy transformers jinja2 jieba"
 }
 
 # ── ensure unzipped data is on disk ──────────────────────────────────────────
@@ -255,29 +190,6 @@ _lb_ensure_data() {
     [[ -f "$marker" ]]
 }
 
-# ── auto-detect HF tokenizer from model filename ────────────────────────────
-_lb_detect_tokenizer() {
-    local model_path=$1
-    local base
-    base=$(basename "$model_path" | tr '[:upper:]' '[:lower:]')
-    case "$base" in
-        *llama-3.1-8b*|*llama-3-8b*|*llama-3.1*|*meta-llama*)
-            # NousResearch mirror is un-gated; identical tokenizer to the
-            # official meta-llama repo (same SHA on tokenizer.json).
-            echo "NousResearch/Meta-Llama-3.1-8B-Instruct" ;;
-        *ministral*)
-            echo "mistralai/Ministral-8B-Instruct-2410" ;;
-        *mistral*)
-            echo "mistralai/Mistral-7B-Instruct-v0.3" ;;
-        *qwen2.5*)
-            echo "Qwen/Qwen2.5-7B-Instruct" ;;
-        *qwen*)
-            echo "Qwen/Qwen2-7B-Instruct" ;;
-        *)
-            echo "NousResearch/Meta-Llama-3.1-8B-Instruct" ;;
-    esac
-}
-
 # ── prepare one task's data via the Python helper ───────────────────────────
 _lb_prepare_task() {
     local task=$1 tokenizer=$2 max_length=$3 num_samples=$4 seed=$5
@@ -304,129 +216,8 @@ _lb_prepare_task() {
         2>&1 | tail -3
 }
 
-# ── pick a free TCP port in the high-ephemeral range ────────────────────────
-# Random in [20000, 60000). Two parallel cells from the orchestrator each
-# pick their own port; collision probability is ~2/40000 per pair so we
-# don't bother with retry logic. If the bind fails the server log will say
-# so and the calling code raises an error.
-_lb_pick_port() {
-    awk -v seed="$$$(date +%N)" 'BEGIN { srand(seed); printf "%d\n", 20000 + int(rand() * 40000) }'
-}
-
-# ── start one persistent llama-server for this cell ─────────────────────────
-# Loaded once per (model, ctk, ctv) cell; reused across all 650-ish samples,
-# saving the ~3s/sample model-reload overhead that previously dominated
-# wall-clock when this script spawned llama-completion per sample. The
-# server takes the same -ngl/-fa/--split-mode forwarded args.
-_lb_start_server() {
-    local server_bin=$1 model=$2 ctk=$3 ctv=$4 max_length=$5
-    shift 5
-    local -a extra=("$@")
-
-    LB_SERVER_PORT=$(_lb_pick_port)
-    LB_SERVER_URL="http://127.0.0.1:${LB_SERVER_PORT}"
-    LB_SERVER_LOG=$(mktemp)
-
-    # Server context budget: longest prompt (max_length) + the largest
-    # generation budget across LongBench-E tasks (512 tokens, for the
-    # summarization tasks per upstream dataset2maxlen.json) + slack for any
-    # chat-template / BOS overhead. 1024 of slack is generous but cheap.
-    local n_ctx=$(( max_length + 512 + 1024 ))
-
-    echo "Starting llama-server (port=${LB_SERVER_PORT}, n_ctx=${n_ctx}, K=${ctk}, V=${ctv}) ..."
-    "$server_bin" \
-        -m "$model" \
-        -ctk "$ctk" -ctv "$ctv" \
-        -c "$n_ctx" \
-        --host 127.0.0.1 \
-        --port "$LB_SERVER_PORT" \
-        --no-webui \
-        "${extra[@]}" \
-        >"$LB_SERVER_LOG" 2>&1 &
-    LB_SERVER_PID=$!
-
-    # Poll /health up to 120s. Vulkan first-load on a cold cache can be
-    # slow; the pipeline cache from earlier runs makes this ~5s in practice.
-    local i
-    for ((i=0; i<120; i++)); do
-        if ! kill -0 "$LB_SERVER_PID" 2>/dev/null; then
-            echo "ERROR: llama-server died during startup (see $LB_SERVER_LOG):" >&2
-            tail -20 "$LB_SERVER_LOG" >&2
-            return 1
-        fi
-        if curl -sf "${LB_SERVER_URL}/health" >/dev/null 2>&1; then
-            echo "Server ready after ${i}s."
-            return 0
-        fi
-        sleep 1
-    done
-    echo "ERROR: llama-server did not become healthy within 120s." >&2
-    tail -20 "$LB_SERVER_LOG" >&2
-    return 1
-}
-
-# ── stop the server (called via trap) ────────────────────────────────────────
-_lb_stop_server() {
-    if [[ -n "$LB_SERVER_PID" ]] && kill -0 "$LB_SERVER_PID" 2>/dev/null; then
-        kill "$LB_SERVER_PID" 2>/dev/null
-        # Give it 5s to shut down gracefully, then SIGKILL.
-        local i
-        for ((i=0; i<5; i++)); do
-            kill -0 "$LB_SERVER_PID" 2>/dev/null || break
-            sleep 1
-        done
-        kill -9 "$LB_SERVER_PID" 2>/dev/null || true
-    fi
-    [[ -n "$LB_SERVER_LOG" && -f "$LB_SERVER_LOG" ]] && rm -f "$LB_SERVER_LOG"
-}
-
-# ── run inference on a single prepared prompt via the persistent server ─────
-# The prompt is already chat-template-wrapped (by longbench-prepare.py) and
-# is sent as a raw completion request to llama-server's /completion
-# endpoint. cache_prompt=false guarantees each sample is a fresh context —
-# LongBench samples are independent, so we don't want the server's prefix
-# cache to carry tokens across samples.
-_lb_infer_single() {
-    local tokens_to_gen=$1 prompt=$2
-
-    # Build the request body with jq so weird characters in `prompt` (quotes,
-    # newlines, the chat template's literal "<|...|>" tokens) survive
-    # serialisation intact. Inlining shell-quoted JSON would silently corrupt
-    # the prompt on any task containing a quote, which several LongBench
-    # tasks do.
-    #
-    # add_special=false because longbench-prepare.py already runs the prompt
-    # through tokenizer.apply_chat_template, which emits a leading
-    # <|begin_of_text|>. With the server's default add_special=true we'd
-    # double-BOS every request (verified via /tokenize), which is
-    # technically off-distribution input to the model. HF's upstream
-    # LongBench pred.py exhibits the same default-double-BOS, so cells
-    # collected with this flag flipped are *not* directly comparable
-    # against cells collected without it — keep the flag consistent across
-    # all cells of any single comparison run.
-    local body
-    body=$(jq -nc \
-        --arg p "$prompt" \
-        --argjson n "$tokens_to_gen" \
-        '{prompt: $p, n_predict: $n, temperature: 0, cache_prompt: false, add_special: false}')
-
-    # --max-time covers worst-case: 16k prompt prefill on quantized KV at
-    # ~80 t/s ≈ 200s, plus 512-token generation ≈ another 60s, plus
-    # margin. 600s is comfortable; we'd rather time out than block forever
-    # if the server hangs.
-    local resp rc=0
-    resp=$(curl -sf --max-time 600 \
-        -X POST "${LB_SERVER_URL}/completion" \
-        -H "Content-Type: application/json" \
-        -d "$body") || rc=$?
-
-    if (( rc != 0 )); then
-        echo "ERROR: /completion request failed (curl rc=$rc)" >&2
-        return 1
-    fi
-    # llama-server's native /completion returns {"content": "...", ...}.
-    jq -r '.content' <<<"$resp"
-}
+# Server lifecycle (_kv_pick_port / _kv_start_server / _kv_stop_server) and
+# /completion inference (_kv_infer_completion) live in kv_cache_bench_common.sh.
 
 # ── score one prediction using upstream metrics via longbench-score.py ─────
 _lb_score() {
@@ -443,18 +234,6 @@ print(json.dumps({
         "$task" "$prediction" "$references_json" "$all_classes_json")
 
     python3 "$LB_SCORE" --stdin <<<"$payload"
-}
-
-# ── per-task mean / stdev (same arithmetic as ruler-bench.sh) ────────────────
-_lb_mean_stdev() {
-    echo "$1" | awk '{
-        n = NF; if (n == 0) { print "- -"; exit }
-        sum = 0; for (i = 1; i <= n; i++) sum += $i
-        mean = sum / n
-        sumsq = 0; for (i = 1; i <= n; i++) sumsq += ($i - mean)^2
-        sd = (n > 1) ? sqrt(sumsq / (n - 1)) : 0
-        printf "%.1f %.1f", mean * 100, sd * 100
-    }'
 }
 
 # ── main benchmark function ──────────────────────────────────────────────────
@@ -511,7 +290,7 @@ longbench_bench() {
     fi
 
     if [[ -z "$tokenizer" ]]; then
-        tokenizer=$(_lb_detect_tokenizer "$model")
+        tokenizer=$(_kv_detect_tokenizer "$model")
         echo "Auto-detected tokenizer: $tokenizer"
     fi
 
@@ -541,8 +320,14 @@ longbench_bench() {
     # Spin up the persistent server for this cell and tear it down on any
     # exit path (normal return, error, ^C). All sample inferences below
     # reuse the same loaded model.
-    trap '_lb_stop_server' EXIT INT TERM
-    _lb_start_server "$server_bin" "$model" "$ctk" "$ctv" "$max_length" "${extra_args[@]}" || return 1
+    # Server context budget: longest prompt (max_length) + the largest
+    # generation budget across LongBench-E tasks (512 tokens, for the
+    # summarization tasks per upstream dataset2maxlen.json) + slack for any
+    # chat-template / BOS overhead. 1024 of slack is generous but cheap.
+    local n_ctx=$(( max_length + 512 + 1024 ))
+
+    trap '_kv_stop_server' EXIT INT TERM
+    _kv_start_server "$server_bin" "$model" "$ctk" "$ctv" "$n_ctx" "${extra_args[@]}" || return 1
 
     # ── banner ──────────────────────────────────────────────────────────────
     echo ""
@@ -606,7 +391,7 @@ longbench_bench() {
             fi
 
             local prediction
-            prediction=$(_lb_infer_single "$max_gen" "$input_text") || {
+            prediction=$(_kv_infer_completion "$max_gen" "$input_text" "$KV_SERVER_URL") || {
                 echo "ERROR: inference failed for $task sample $sample_idx" >&2
                 sample_idx=$((sample_idx + 1))
                 continue
@@ -637,9 +422,16 @@ longbench_bench() {
                 # below: flatten newlines → cut to 80 bytes → iconv strips
                 # any trailing partial-codepoint bytes. Result is valid
                 # UTF-8, <= 80 bytes.
+                # Append `|| true` so that an iconv non-zero exit code (which
+                # happens when the 80-byte head -c cut lands inside a
+                # multi-byte codepoint -- common with Qwen3.5 which emits a
+                # lot of Unicode) doesn't kill the whole bench under
+                # `set -eo pipefail`. `-c` already silently drops invalid
+                # bytes; we just don't want a partial-trail-byte error to
+                # propagate. 2>/dev/null hides the cosmetic stderr line.
                 local short_pred
                 short_pred=$(printf '%s' "$prediction" | tr '\n' ' ' \
-                    | head -c 80 | iconv -c -f UTF-8 -t UTF-8)
+                    | head -c 80 | iconv -c -f UTF-8 -t UTF-8 2>/dev/null || true)
                 printf "  [%s] sample %d: %s%%  got=%s\n" \
                     "$task" "$sample_idx" "$pct" "$short_pred"
             fi
@@ -686,7 +478,7 @@ longbench_bench() {
         local scores_list="${task_score_list[$task]:-}"
         local ms cell_mean cell_sd
         if (( cnt > 0 )); then
-            ms=$(_lb_mean_stdev "$scores_list")
+            ms=$(_kv_mean_stdev "$scores_list")
             cell_mean="${ms% *}"
             cell_sd="${ms#* }"
             printf "%-24s %12d %14s\n" "$task" "$cnt" "${cell_mean}±${cell_sd}%"

@@ -23,6 +23,9 @@ RULER_REPO="https://github.com/NVIDIA/RULER.git"
 RULER_DATA_DIR=""  # set per-tokenizer in ruler_bench()
 RULER_VENV="${RULER_DIR}/.venv"
 
+# shellcheck source=kv_cache_bench_common.sh
+source "${SCRIPT_DIR}/kv_cache_bench_common.sh"
+
 ruler_usage() {
     cat <<'EOF'
 RULER benchmark for KV cache quantization quality evaluation
@@ -73,65 +76,8 @@ _ruler_ensure_repo() {
 }
 
 # ── ensure venv + Python dependencies ────────────────────────────────────────
-_ruler_ensure_uv() {
-    local uv_dir="${RULER_DIR}/.uv"
-    local uv_bin="${uv_dir}/uv"
-    if [[ -x "$uv_bin" ]]; then
-        return 0
-    fi
-    echo "Installing uv into ${uv_dir} ..."
-    UV_INSTALL_DIR="$uv_dir" curl -LsSf https://astral.sh/uv/install.sh | sh 2>&1 | tail -3
-    [[ -x "$uv_bin" ]]
-}
-
-_ruler_ensure_venv() {
-    if [[ ! -f "${RULER_VENV}/bin/activate" ]]; then
-        echo "Creating Python venv at ${RULER_VENV} ..."
-        local uv_bin="${RULER_DIR}/.uv/uv"
-        if [[ "${RULER_USE_UV:-0}" == "1" ]]; then
-            if command -v uv &>/dev/null; then
-                echo "RULER_USE_UV=1, using uv ..."
-                uv venv "${RULER_VENV}"
-            elif _ruler_ensure_uv; then
-                echo "RULER_USE_UV=1, using local uv ..."
-                "$uv_bin" venv "${RULER_VENV}"
-            else
-                echo "ERROR: RULER_USE_UV=1 but failed to install uv" >&2
-                return 1
-            fi
-        elif python3 -m venv "${RULER_VENV}" 2>/dev/null; then
-            : # success
-        elif command -v uv &>/dev/null; then
-            echo "python3 -m venv unavailable, using uv ..."
-            uv venv "${RULER_VENV}"
-        elif _ruler_ensure_uv; then
-            echo "python3 -m venv unavailable, using local uv ..."
-            "$uv_bin" venv "${RULER_VENV}"
-        else
-            echo "python3 -m venv unavailable, creating manual venv ..."
-            local py_bin
-            py_bin="$(command -v python3)"
-            mkdir -p "${RULER_VENV}/bin"
-            ln -sf "$py_bin" "${RULER_VENV}/bin/python3"
-            ln -sf "$py_bin" "${RULER_VENV}/bin/python"
-            cat > "${RULER_VENV}/bin/activate" <<'ACTIVATE'
-VIRTUAL_ENV="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-export VIRTUAL_ENV
-export PATH="${VIRTUAL_ENV}/bin:${PATH}"
-unset PYTHONHOME
-ACTIVATE
-            # shellcheck disable=SC1091
-            source "${RULER_VENV}/bin/activate"
-            echo "Bootstrapping pip via get-pip.py ..."
-            curl -sS https://bootstrap.pypa.io/get-pip.py | python3 - 2>&1 | tail -3
-        fi
-    fi
-    # shellcheck disable=SC1091
-    source "${RULER_VENV}/bin/activate"
-}
-
 _ruler_ensure_deps() {
-    _ruler_ensure_venv
+    _kv_ensure_venv "${RULER_VENV}" "${RULER_USE_UV:-0}" "${RULER_DIR}/.uv"
 
     local missing=0
     for pkg in wonderwords nltk numpy transformers yaml html2text tenacity; do
@@ -347,38 +293,6 @@ _ruler_score() {
     fi
 }
 
-# ── compute mean±stdev from space-separated values ──────────────────────────
-_ruler_mean_stdev() {
-    echo "$1" | awk '{
-        n = NF; if (n == 0) { print "- -"; exit }
-        sum = 0; for (i = 1; i <= n; i++) sum += $i
-        mean = sum / n
-        sumsq = 0; for (i = 1; i <= n; i++) sumsq += ($i - mean)^2
-        sd = (n > 1) ? sqrt(sumsq / (n - 1)) : 0
-        printf "%.1f %.1f", mean * 100, sd * 100
-    }'
-}
-
-# ── auto-detect tokenizer from model path ───────────────────────────────────
-_ruler_detect_tokenizer() {
-    local model_path=$1
-    local model_base
-    model_base=$(basename "$model_path" | tr '[:upper:]' '[:lower:]')
-
-    if [[ "$model_base" == *mistral* ]]; then
-        echo "mistralai/Mistral-7B-Instruct-v0.3"
-    elif [[ "$model_base" == *llama*3* ]] || [[ "$model_base" == *meta-llama* ]]; then
-        echo "meta-llama/Meta-Llama-3.1-8B-Instruct"
-    elif [[ "$model_base" == *llama*2* ]]; then
-        echo "meta-llama/Llama-2-7b-chat-hf"
-    elif [[ "$model_base" == *qwen* ]]; then
-        echo "Qwen/Qwen2-7B-Instruct"
-    elif [[ "$model_base" == *phi* ]]; then
-        echo "microsoft/Phi-3-mini-128K-instruct"
-    else
-        echo "mistralai/Mistral-7B-Instruct-v0.3"
-    fi
-}
 
 # ── main benchmark function ─────────────────────────────────────────────────
 ruler_bench() {
@@ -430,7 +344,7 @@ ruler_bench() {
     fi
 
     if [[ -z "$tokenizer" ]]; then
-        tokenizer=$(_ruler_detect_tokenizer "$model")
+        tokenizer=$(_kv_detect_tokenizer "$model")
         echo "Auto-detected tokenizer: $tokenizer"
     fi
 
@@ -622,7 +536,7 @@ for o in d['outputs']:
             local scores_list="${task_score_list[$cell_key]:-}"
             if (( cnt > 0 )); then
                 local ms
-                ms=$(_ruler_mean_stdev "$scores_list")
+                ms=$(_kv_mean_stdev "$scores_list")
                 local cell_mean="${ms% *}"
                 local cell_sd="${ms#* }"
                 printf "%15s%%" "${cell_mean}±${cell_sd}"
@@ -638,7 +552,7 @@ for o in d['outputs']:
         local row_avg
         if [[ -n "$row_scores" ]]; then
             local rms
-            rms=$(_ruler_mean_stdev "$row_scores")
+            rms=$(_kv_mean_stdev "$row_scores")
             row_avg="${rms% *}±${rms#* }"
         else
             row_avg="-"
