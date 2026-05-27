@@ -3509,7 +3509,15 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
 }
 
 ggml_cgraph * llama_model::build_graph(const llm_graph_params & params) const {
+    // qvac: dispatch via the polymorphic build_arch_graph defined per arch in
+    // src/models/<arch>.cpp. The post-processing (pooling/sampling/dense-out)
+    // is independent of the arch and stays here.
     std::unique_ptr<llm_graph_context> llm = build_arch_graph(params);
+
+    if (!llm) {
+        GGML_ABORT("qvac: arch '%s' has no polymorphic build_arch_graph implementation (src/models/<arch>.cpp not migrated yet)",
+                   llm_arch_name(arch));
+    }
 
     // add on pooling layer
     llm->build_pooling(cls, cls_b, cls_out, cls_out_b, cls_norm);

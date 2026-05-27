@@ -67,8 +67,8 @@ set(${TARGET}_HEADERS
     console.h
     debug.h
     download.h
-    fit.h
-    file-lock.h
+    fit.h   # qvac: declarations for the fit helpers (memory_breakdown_print, get_device_memory_data)
+    file-lock.h    
     hf-cache.h
     http.h
     imatrix-loader.h
@@ -217,6 +217,13 @@ target_include_directories(
 
 target_compile_features   (${TARGET} PUBLIC cxx_std_17)
 target_link_libraries     (${TARGET} PRIVATE ${LLAMA_COMMON_EXTRA_LIBS} PUBLIC llama Threads::Threads)
+
+# qvac: rebase onto upstream b9341 renamed the common target to `llama-common`.
+# Keep both names addressable so qvac-side CMakeLists (target `common`) and
+# upstream/example/tool CMakeLists (target `llama-common`) both link.
+if (NOT TARGET common)
+    add_library(common ALIAS ${TARGET})
+endif()
 
 
 #

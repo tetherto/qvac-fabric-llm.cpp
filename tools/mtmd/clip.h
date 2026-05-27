@@ -5,8 +5,9 @@
 
 #include <stddef.h>
 #include <stdint.h>
-
+#ifdef __cplusplus
 #include <map>
+#endif
 
 // !!! Internal header, to be used by mtmd only !!!
 
@@ -147,12 +148,18 @@ bool clip_is_llava(const struct clip_ctx * ctx);
 
 bool clip_has_vision_encoder(const struct clip_ctx * ctx);
 bool clip_has_audio_encoder(const struct clip_ctx * ctx);
+bool clip_has_whisper_encoder(const struct clip_ctx * ctx);
 
 bool clip_support_batch(const struct clip_ctx * ctx);
 
 int clip_model_n_temporal_merge(const struct clip_ctx * ctx); // TODO @ngxson : remove, refactor this
 
+#ifdef __cplusplus
+// qvac: per-device memory usage of an initialised clip_ctx — weight buffers
+// summed with the scheduler's compute reservations. Used by mtmd_get_memory_usage
+// (and ultimately by common/fit.cpp's heuristic). Restored from upstream b9341.
 std::map<ggml_backend_dev_t, size_t> clip_get_mem_usage(const struct clip_ctx * ctx);
+#endif
 
 struct clip_cap {
     bool has_vision;

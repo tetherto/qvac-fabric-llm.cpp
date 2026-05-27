@@ -474,3 +474,7 @@ private:
 
     mutable int32_t n_reused = 0; // number of times the previous graph was reused
 };
+
+// qvac: defined in llama-context.cpp but was missing a declaration after the rebase
+// onto upstream b9341 — llama.cpp calls it for debug-log memory accounting.
+void llama_memory_breakdown_print(const struct llama_context * ctx);

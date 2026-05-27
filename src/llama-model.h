@@ -319,6 +319,14 @@ struct llama_layer {
     struct ggml_tensor * attn_v_gate_b = nullptr;
     struct ggml_tensor * attn_v_exps   = nullptr;
 
+    // attention biases (qvac-restored; upstream b9341 dropped these flat names in favor
+    // of class-per-arch loaders that hold their own bias state)
+    struct ggml_tensor * bq        = nullptr;
+    struct ggml_tensor * bk        = nullptr;
+    struct ggml_tensor * bv        = nullptr;
+    struct ggml_tensor * bo        = nullptr;
+    struct ggml_tensor * bqkv      = nullptr;
+
     // relative position bias
     struct ggml_tensor * attn_rel_b       = nullptr;
     struct ggml_tensor * attn_rel_b_enc   = nullptr;
@@ -960,15 +968,27 @@ struct llama_model {
 
     ggml_cgraph * build_graph(const llm_graph_params & params) const;
 
-    virtual void load_stats  (llama_model_loader & ml) = 0;
-    virtual void load_hparams(llama_model_loader & ml) = 0;
-    virtual void load_vocab  (llama_model_loader & ml) = 0;
-    virtual bool load_tensors(llama_model_loader & ml) = 0; // returns false if cancelled by progress_callback
+    // qvac: kept these as overridable but not pure virtual — the qvac fork uses a
+    // monolithic llama_model with switch(arch) dispatch in load_hparams/load_tensors,
+    // while upstream b9341 moved to a per-architecture subclass model. The default
+    // no-op overrides below let qvac compile against the new polymorphic interface
+    // without requiring every architecture to be split into its own subclass yet.
+    virtual void load_stats  (llama_model_loader & ml) { (void)ml; }
+    virtual void load_hparams(llama_model_loader & ml) { (void)ml; }
+    virtual void load_vocab  (llama_model_loader & ml) { (void)ml; }
+    virtual bool load_tensors(llama_model_loader & ml) { (void)ml; return true; } // returns false if cancelled by progress_callback
 
-    // model must define these
-    virtual void load_arch_hparams(llama_model_loader & ml) = 0;
-    virtual void load_arch_tensors(llama_model_loader & ml) = 0;
-    virtual std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const = 0;
+    // qvac: unified arch loader - used by llama.cpp to fault-in architecture metadata
+    // before load_hparams. Upstream split this into load_arch_hparams + load_arch_tensors
+    // when it switched to polymorphic models; the unified entry is kept for qvac's
+    // monolithic dispatch.
+    virtual void load_arch(llama_model_loader & ml) { (void)ml; }
+
+    // model must define these (upstream b9341 polymorphic interface; qvac stubs them
+    // out by default since the monolithic load_arch + arch-switch already covers it)
+    virtual void load_arch_hparams(llama_model_loader & ml) { (void)ml; }
+    virtual void load_arch_tensors(llama_model_loader & ml) { (void)ml; }
+    virtual std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const { (void)params; return nullptr; }
 
 protected:
     llama_model_params params;
@@ -1034,10 +1054,12 @@ struct llama_model_base : public llama_model {
     void load_vocab  (llama_model_loader & ml) override;
     bool load_tensors(llama_model_loader & ml) override;
 
-    // model must define these
-    void load_arch_hparams(llama_model_loader & ml) override = 0;
-    void load_arch_tensors(llama_model_loader & ml) override = 0;
-    std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override = 0;
+    // qvac: drop the pure-virtual constraint — derived classes can opt in to
+    // per-arch load/build methods, but the qvac monolithic dispatch path doesn't
+    // need them.
+    void load_arch_hparams(llama_model_loader & ml) override { (void)ml; }
+    void load_arch_tensors(llama_model_loader & ml) override { (void)ml; }
+    std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override { (void)params; return nullptr; }
 };
 
 const char * llm_type_name(llm_type type);
