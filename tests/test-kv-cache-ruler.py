@@ -24,8 +24,6 @@ import logging
 import os
 import subprocess
 import sys
-import threading
-import time
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
@@ -38,24 +36,13 @@ logger = logging.getLogger(__name__)
 SCRIPT_DIR = Path(__file__).resolve().parent
 RULER_BENCH = SCRIPT_DIR / "ruler-bench.sh"
 
-# ── Bits-per-weight for KV cache types ──────────────────────────────────────
-
-BPW = {
-    "f16":    16.0,
-    "q8_0":   8.5,
-    "q4_0":   4.5,
-    "tbq3_0": 4.25,
-    "tbq4_0": 5.25,
-    "pq3_0":  3.25,
-    "pq4_0":  4.25,
-}
-
-
-def bpw_label(k_type: str, v_type: str) -> str:
-    k_bpw = BPW.get(k_type, "?")
-    v_bpw = BPW.get(v_type, "?")
-    return f"K:{k_bpw} V:{v_bpw}"
-
+sys.path.insert(0, str(SCRIPT_DIR))
+import kv_cache_eval_common as kv_common
+from kv_cache_eval_common import (
+    BPW, bpw_label, ModelDef, MODELS_DEFAULT,
+    ProgressTracker, _print_lock, _fmt_duration,
+    _next_available_dir, _find_latest_dir,
+)
 
 # ── Quant configurations ───────────────────────────────────────────────────
 
@@ -70,6 +57,7 @@ QUANT_CONFIGS_ALL = [
 ]
 
 QUANT_CONFIGS_SUBSET = [
+    ("f16",    "f16"),
     ("tbq4_0", "pq4_0"),
     ("tbq3_0", "pq3_0"),
     ("tbq4_0", "q4_0"),
@@ -80,43 +68,6 @@ QUANT_CONFIGS_SUBSET = [
 
 TASKS_MAIN = "niah_single_1 niah_mk_k8q4_noise vt"
 TASKS_V2   = "niah_mk_k8q4v2_noise"
-
-# ── Model definitions ─────────────────────────────────────────────────────
-
-
-@dataclass
-class ModelDef:
-    path: str
-    tokenizer: str
-    label: str
-    family: str  # one bucket per model so the cross-model aggregation in
-                 # format_table() degenerates to per-model rows (we keep the
-                 # field for back-compat with the existing aggregation code).
-
-
-# Three q8 models mirroring tests/test-kv-cache-quantization-perp.sh's presets.
-# Keeping the same matrix across RULER / LongBench / ZeroSCROLLS / L-Eval / perp
-# / perf means every cell can be cross-referenced cell-by-cell.
-MODELS_DEFAULT = [
-    ModelDef(
-        path="models/Mistral-7B-Instruct-v0.3-Q8_0.gguf",
-        tokenizer="mistralai/Mistral-7B-Instruct-v0.3",
-        label="Mistral-7B",
-        family="Mistral-7B",
-    ),
-    ModelDef(
-        path="models/Llama-3.1-8B-Instruct-Q8_0.gguf",
-        tokenizer="NousResearch/Meta-Llama-3.1-8B-Instruct",
-        label="Llama-3.1-8B",
-        family="Llama-3.1-8B",
-    ),
-    ModelDef(
-        path="models/Qwen3.5-4B-Q8_0.gguf",
-        tokenizer="unsloth/Qwen3.5-4B",
-        label="Qwen3.5-4B",
-        family="Qwen3.5-4B",
-    ),
-]
 
 # ── Config presets ─────────────────────────────────────────────────────────
 
@@ -156,41 +107,6 @@ class Job:
 
 # ── Run a single ruler-bench job ───────────────────────────────────────────
 
-_print_lock = threading.Lock()
-
-
-class ProgressTracker:
-    def __init__(self, total: int):
-        self.total = total
-        self.completed = 0
-        self.start_time = time.time()
-        self.lock = threading.Lock()
-
-    def tick(self) -> str:
-        with self.lock:
-            self.completed += 1
-            elapsed = time.time() - self.start_time
-            if self.completed > 0:
-                avg = elapsed / self.completed
-                remaining = self.total - self.completed
-                eta_secs = avg * remaining
-                eta_str = _fmt_duration(eta_secs)
-            else:
-                eta_str = "?"
-            elapsed_str = _fmt_duration(elapsed)
-            return f"[{self.completed}/{self.total}] elapsed {elapsed_str}, ETA {eta_str}"
-
-
-def _fmt_duration(secs: float) -> str:
-    m, s = divmod(int(secs), 60)
-    h, m = divmod(m, 60)
-    if h > 0:
-        return f"{h}h{m:02d}m"
-    return f"{m}m{s:02d}s"
-
-
-_progress: Optional[ProgressTracker] = None
-
 
 def run_job(job: Job, extra_args: list[str], output_dir: Path) -> Optional[str]:
     jobs_dir = output_dir / "jobs"
@@ -219,39 +135,14 @@ def run_job(job: Job, extra_args: list[str], output_dir: Path) -> Optional[str]:
     cmd.extend(extra_args)
 
     label = f"[GPU{job.gpu_id}] {job.model.label} K={job.k_type} V={job.v_type} ({job.tag})"
-    cmd_str = " ".join(cmd)
     log_path = csv_path.replace(".csv", ".txt")
-    with _print_lock:
-        logger.info("  START: %s", label)
-        logger.info("  $ %s", cmd_str)
-        logger.info("  log: %s", log_path)
-        logger.info("")
-
-    try:
-        result = subprocess.run(
-            cmd, env=env, capture_output=True, text=True, timeout=7200
-        )
-        if result.returncode != 0:
-            with _print_lock:
-                logger.info("  FAIL:  %s", label)
-                logger.info("         stderr: %s", result.stderr[-500:])
-            return None
-    except subprocess.TimeoutExpired:
-        with _print_lock:
-            logger.info("  TIMEOUT: %s", label)
-        return None
-
-    # Extract overall accuracy from output
-    accuracy = "?"
-    for line in result.stdout.splitlines():
-        if "Overall accuracy:" in line:
-            accuracy = line.strip().split("Overall accuracy:")[1].strip()
-            break
-
-    progress_str = _progress.tick() if _progress else ""
-    with _print_lock:
-        logger.info("  DONE:  %s  =>  %s  %s", label, accuracy, progress_str)
-    return csv_path
+    ok = kv_common.run_bench_subprocess(
+        cmd, env, label, log_path,
+        timeout=7200,
+        score_marker="Overall accuracy:",
+        errors=None,
+    )
+    return csv_path if ok else None
 
 
 # ── Collect all CSV results ────────────────────────────────────────────────
@@ -440,34 +331,6 @@ def write_combined_csv(results: list[CellResult], path: str):
 # ── Output directory helpers ───────────────────────────────────────────────
 
 
-def _next_available_dir(base: Path) -> Path:
-    """Return base, base1, base2, ... — first that doesn't exist or is empty."""
-    if not base.exists() or not any(base.iterdir()):
-        return base
-    i = 1
-    while True:
-        candidate = base.parent / f"{base.name}{i}"
-        if not candidate.exists() or not any(candidate.iterdir()):
-            return candidate
-        i += 1
-
-
-def _find_latest_dir(base: Path) -> Optional[Path]:
-    """Find the latest existing results dir (base, base1, base2, ...)."""
-    latest = None
-    if base.exists() and any(base.iterdir()):
-        latest = base
-    i = 1
-    while True:
-        candidate = base.parent / f"{base.name}{i}"
-        if candidate.exists() and any(candidate.iterdir()):
-            latest = candidate
-            i += 1
-        else:
-            break
-    return latest
-
-
 def _job_csv_path(output_dir: Path, job: "Job") -> Path:
     job_name = f"{job.model.label}_{job.k_type}_{job.v_type}_{job.tag}"
     job_name = job_name.replace("/", "_").replace(" ", "_")
@@ -628,8 +491,7 @@ def main():
 
     # Execute remaining jobs with GPU parallelism
     if all_jobs:
-        global _progress
-        _progress = ProgressTracker(len(all_jobs))
+        kv_common.set_progress(ProgressTracker(len(all_jobs)))
         logger.info("\nRunning %s jobs across %s GPU(s)...\n", len(all_jobs), len(gpu_ids))
 
         max_workers = len(gpu_ids)

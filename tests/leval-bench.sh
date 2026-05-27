@@ -25,6 +25,9 @@
 #   leval_bench -m model.gguf -ctk tbq3_0 -ctv pq3_0 -ngl 99 -fa 1
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=kv_cache_bench_common.sh
+source "${SCRIPT_DIR}/kv_cache_bench_common.sh"
+
 LV_DIR="${SCRIPT_DIR}/leval"
 LV_REPO="https://github.com/OpenLMLab/LEval.git"
 LV_VENV="${LV_DIR}/.venv"
@@ -32,10 +35,6 @@ LV_PREPARE="${SCRIPT_DIR}/leval-prepare.py"
 LV_SCORE="${SCRIPT_DIR}/leval-score.py"
 LV_DATA_SRC=""   # set after clone (LEval-data/Closed-ended-tasks)
 LV_DATA_DIR=""
-LV_SERVER_PORT=""
-LV_SERVER_PID=""
-LV_SERVER_URL=""
-LV_SERVER_LOG=""
 
 LV_TASKS_ALL=(
     tpo quality coursera
@@ -95,27 +94,6 @@ L-Eval closed-ended tasks:
 EOF
 }
 
-# ── auto-detect HF tokenizer ───────────────────────────────────────────────
-_lv_detect_tokenizer() {
-    local model_path=$1
-    local base
-    base=$(basename "$model_path" | tr '[:upper:]' '[:lower:]')
-    case "$base" in
-        *llama-3.1-8b*|*llama-3-8b*|*llama-3.1*|*meta-llama*)
-            echo "NousResearch/Meta-Llama-3.1-8B-Instruct" ;;
-        *ministral*)
-            echo "mistralai/Ministral-8B-Instruct-2410" ;;
-        *mistral*)
-            echo "mistralai/Mistral-7B-Instruct-v0.3" ;;
-        *qwen2.5*)
-            echo "Qwen/Qwen2.5-7B-Instruct" ;;
-        *qwen*)
-            echo "Qwen/Qwen2-7B-Instruct" ;;
-        *)
-            echo "NousResearch/Meta-Llama-3.1-8B-Instruct" ;;
-    esac
-}
-
 # ── ensure upstream repo cloned (for the JSONL data files) ─────────────────
 _lv_ensure_repo() {
     if [[ -d "${LV_DIR}/LEval-data/Closed-ended-tasks" ]]; then
@@ -135,111 +113,18 @@ _lv_ensure_repo() {
     [[ -d "${LV_DIR}/LEval-data/Closed-ended-tasks" ]]
 }
 
-# ── venv + deps (same shape as longbench, smaller dep list) ────────────────
-_lv_ensure_uv() {
-    local uv_dir="${LV_DIR}/.uv"
-    local uv_bin="${uv_dir}/uv"
-    if [[ -x "$uv_bin" ]]; then return 0; fi
-    UV_INSTALL_DIR="$uv_dir" curl -LsSf https://astral.sh/uv/install.sh | sh 2>&1 | tail -3
-    [[ -x "$uv_bin" ]]
-}
-
-# See longbench-bench.sh for the flock rationale.
-_lv_ensure_venv() {
-    mkdir -p "${LV_DIR}"
-    local lock="${LV_DIR}/.venv.lock"
-    (
-        flock -x 9
-        if [[ -f "${LV_VENV}/bin/activate" ]]; then exit 0; fi
-        echo "Creating Python venv at ${LV_VENV} ..."
-        local uv_bin="${LV_DIR}/.uv/uv"
-        if [[ "${LV_USE_UV:-0}" == "1" ]]; then
-            if command -v uv &>/dev/null; then uv venv "${LV_VENV}"
-            elif _lv_ensure_uv; then "$uv_bin" venv "${LV_VENV}"
-            else echo "ERROR: LV_USE_UV=1 but failed to install uv" >&2; exit 1; fi
-        elif python3 -m venv "${LV_VENV}" 2>/dev/null; then :
-        elif command -v uv &>/dev/null; then uv venv "${LV_VENV}"
-        elif _lv_ensure_uv; then "$uv_bin" venv "${LV_VENV}"
-        else
-            echo "ERROR: cannot create a Python venv (no python3-venv, no uv)" >&2
-            exit 1
-        fi
-    ) 9>"$lock"
-    local rc=$?
-    if (( rc != 0 )); then return $rc; fi
-    # shellcheck disable=SC1091
-    source "${LV_VENV}/bin/activate"
-}
-
+# ── venv + deps (smaller dep list — closed-ended scoring is pure Python) ──
+# No `rouge` / `fuzzywuzzy` / `jieba` — closed-ended scoring is pure-Python
+# (regex + string ops).
 _lv_ensure_deps() {
-    _lv_ensure_venv
-    local missing=0
-    # No `rouge` / `fuzzywuzzy` / `jieba` — closed-ended scoring is
-    # pure-Python (regex + string ops).
-    for pkg in numpy transformers jinja2; do
-        python3 -c "import ${pkg}" 2>/dev/null || missing=1
-    done
-    if (( missing )); then
-        echo "Installing L-Eval Python dependencies into venv ..."
-        python3 -m pip install --quiet numpy transformers jinja2 2>&1 | tail -5
-    fi
+    _kv_ensure_venv "${LV_VENV}" "${LV_USE_UV:-0}" "${LV_DIR}/.uv"
+    _kv_ensure_pip_deps "L-Eval" \
+        "numpy transformers jinja2" \
+        "numpy transformers jinja2"
 }
 
-# ── server lifecycle (same shape) ──────────────────────────────────────────
-_lv_pick_port() {
-    awk -v seed="$$$(date +%N)" 'BEGIN { srand(seed); printf "%d\n", 20000 + int(rand() * 40000) }'
-}
-
-_lv_start_server() {
-    local server_bin=$1 model=$2 ctk=$3 ctv=$4 max_length=$5
-    shift 5
-    local -a extra=("$@")
-    LV_SERVER_PORT=$(_lv_pick_port)
-    LV_SERVER_URL="http://127.0.0.1:${LV_SERVER_PORT}"
-    LV_SERVER_LOG=$(mktemp)
-    # L-Eval per-task max_gen tops out at 64; +512 slack for safety.
-    local n_ctx=$(( max_length + 64 + 512 ))
-    echo "Starting llama-server (port=${LV_SERVER_PORT}, n_ctx=${n_ctx}, K=${ctk}, V=${ctv}) ..."
-    "$server_bin" \
-        -m "$model" \
-        -ctk "$ctk" -ctv "$ctv" \
-        -c "$n_ctx" \
-        --host 127.0.0.1 \
-        --port "$LV_SERVER_PORT" \
-        --no-webui \
-        "${extra[@]}" \
-        >"$LV_SERVER_LOG" 2>&1 &
-    LV_SERVER_PID=$!
-    local i
-    for ((i=0; i<120; i++)); do
-        if ! kill -0 "$LV_SERVER_PID" 2>/dev/null; then
-            echo "ERROR: llama-server died during startup:" >&2
-            tail -20 "$LV_SERVER_LOG" >&2
-            return 1
-        fi
-        if curl -sf "${LV_SERVER_URL}/health" >/dev/null 2>&1; then
-            echo "Server ready after ${i}s."
-            return 0
-        fi
-        sleep 1
-    done
-    echo "ERROR: llama-server did not become healthy within 120s." >&2
-    tail -20 "$LV_SERVER_LOG" >&2
-    return 1
-}
-
-_lv_stop_server() {
-    if [[ -n "$LV_SERVER_PID" ]] && kill -0 "$LV_SERVER_PID" 2>/dev/null; then
-        kill "$LV_SERVER_PID" 2>/dev/null
-        local i
-        for ((i=0; i<5; i++)); do
-            kill -0 "$LV_SERVER_PID" 2>/dev/null || break
-            sleep 1
-        done
-        kill -9 "$LV_SERVER_PID" 2>/dev/null || true
-    fi
-    [[ -n "$LV_SERVER_LOG" && -f "$LV_SERVER_LOG" ]] && rm -f "$LV_SERVER_LOG"
-}
+# Server lifecycle (_kv_pick_port / _kv_start_server / _kv_stop_server) and
+# /completion inference (_kv_infer_completion) live in kv_cache_bench_common.sh.
 
 # ── prep one task ──────────────────────────────────────────────────────────
 _lv_prepare_task() {
@@ -262,26 +147,7 @@ _lv_prepare_task() {
         2>&1 | tail -3
 }
 
-# ── inference + scoring (same shape as ZeroSCROLLS) ────────────────────────
-_lv_infer_single() {
-    local tokens_to_gen=$1 prompt=$2
-    local body
-    body=$(jq -nc \
-        --arg p "$prompt" \
-        --argjson n "$tokens_to_gen" \
-        '{prompt: $p, n_predict: $n, temperature: 0, cache_prompt: false, add_special: false}')
-    local resp rc=0
-    resp=$(curl -sf --max-time 600 \
-        -X POST "${LV_SERVER_URL}/completion" \
-        -H "Content-Type: application/json" \
-        -d "$body") || rc=$?
-    if (( rc != 0 )); then
-        echo "ERROR: /completion request failed (curl rc=$rc)" >&2
-        return 1
-    fi
-    jq -r '.content' <<<"$resp"
-}
-
+# ── scoring ────────────────────────────────────────────────────────────────
 _lv_score() {
     local task=$1 prediction=$2 references_json=$3
     local payload
@@ -291,17 +157,6 @@ print(json.dumps({"task": sys.argv[1], "prediction": sys.argv[2],
                   "references": json.loads(sys.argv[3])}))' \
         "$task" "$prediction" "$references_json")
     python3 "$LV_SCORE" --stdin <<<"$payload"
-}
-
-_lv_mean_stdev() {
-    echo "$1" | awk '{
-        n = NF; if (n == 0) { print "- -"; exit }
-        sum = 0; for (i = 1; i <= n; i++) sum += $i
-        mean = sum / n
-        sumsq = 0; for (i = 1; i <= n; i++) sumsq += ($i - mean)^2
-        sd = (n > 1) ? sqrt(sumsq / (n - 1)) : 0
-        printf "%.1f %.1f", mean * 100, sd * 100
-    }'
 }
 
 leval_bench() {
@@ -351,7 +206,7 @@ leval_bench() {
         return 1
     fi
     if [[ -z "$tokenizer" ]]; then
-        tokenizer=$(_lv_detect_tokenizer "$model")
+        tokenizer=$(_kv_detect_tokenizer "$model")
         echo "Auto-detected tokenizer: $tokenizer"
     fi
 
@@ -400,8 +255,11 @@ leval_bench() {
     done
     echo ""
 
-    trap '_lv_stop_server' EXIT INT TERM
-    _lv_start_server "$server_bin" "$model" "$ctk" "$ctv" "$max_length" "${extra_args[@]}" || return 1
+    # L-Eval per-task max_gen tops out at 64; +512 slack for safety.
+    local n_ctx=$(( max_length + 64 + 512 ))
+
+    trap '_kv_stop_server' EXIT INT TERM
+    _kv_start_server "$server_bin" "$model" "$ctk" "$ctv" "$n_ctx" "${extra_args[@]}" || return 1
 
     declare -A task_score_list task_counts
     local global_count=0
@@ -427,7 +285,7 @@ leval_bench() {
                 continue
             fi
             local prediction
-            prediction=$(_lv_infer_single "$max_gen" "$input_text") || {
+            prediction=$(_kv_infer_completion "$max_gen" "$input_text" "$KV_SERVER_URL") || {
                 echo "ERROR: inference failed for $task sample $sample_idx" >&2
                 sample_idx=$((sample_idx + 1))
                 continue
@@ -494,7 +352,7 @@ leval_bench() {
         local scores_list="${task_score_list[$task]:-}"
         if (( cnt > 0 )); then
             local ms
-            ms=$(_lv_mean_stdev "$scores_list")
+            ms=$(_kv_mean_stdev "$scores_list")
             local cell_mean="${ms% *}"
             local cell_sd="${ms#* }"
             printf "%-30s %10d %14s\n" "$task" "$cnt" "${cell_mean}±${cell_sd}%"

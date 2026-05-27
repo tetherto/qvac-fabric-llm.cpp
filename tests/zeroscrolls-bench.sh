@@ -31,6 +31,9 @@
 #   zeroscrolls_task_scores  - assoc array of task -> mean% (no stdev)
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=kv_cache_bench_common.sh
+source "${SCRIPT_DIR}/kv_cache_bench_common.sh"
+
 ZS_DIR="${SCRIPT_DIR}/zeroscrolls"
 ZS_DATA_BASE_URL="https://huggingface.co/datasets/tau/zero_scrolls/resolve/main"
 ZS_RAW_DIR="${ZS_DIR}/_raw"        # per-task ZIPs + extracted JSONL files
@@ -38,10 +41,6 @@ ZS_VENV="${ZS_DIR}/.venv"
 ZS_PREPARE="${SCRIPT_DIR}/zeroscrolls-prepare.py"
 ZS_SCORE="${SCRIPT_DIR}/zeroscrolls-score.py"
 ZS_DATA_DIR=""  # set per-tokenizer/preset combination in zeroscrolls_bench()
-ZS_SERVER_PORT=""
-ZS_SERVER_PID=""
-ZS_SERVER_URL=""
-ZS_SERVER_LOG=""
 
 # The 8 ZeroSCROLLS tasks we score offline.
 ZS_TASKS_ALL=(
@@ -101,87 +100,15 @@ Example:
 EOF
 }
 
-# ── auto-detect HF tokenizer from model filename (same as longbench) ────────
-_zs_detect_tokenizer() {
-    local model_path=$1
-    local base
-    base=$(basename "$model_path" | tr '[:upper:]' '[:lower:]')
-    case "$base" in
-        *llama-3.1-8b*|*llama-3-8b*|*llama-3.1*|*meta-llama*)
-            echo "NousResearch/Meta-Llama-3.1-8B-Instruct" ;;
-        *ministral*)
-            echo "mistralai/Ministral-8B-Instruct-2410" ;;
-        *mistral*)
-            echo "mistralai/Mistral-7B-Instruct-v0.3" ;;
-        *qwen2.5*)
-            echo "Qwen/Qwen2.5-7B-Instruct" ;;
-        *qwen*)
-            echo "Qwen/Qwen2-7B-Instruct" ;;
-        *)
-            echo "NousResearch/Meta-Llama-3.1-8B-Instruct" ;;
-    esac
-}
-
-# ── ensure venv (verbatim from longbench-bench.sh, paths swapped) ──────────
-_zs_ensure_uv() {
-    local uv_dir="${ZS_DIR}/.uv"
-    local uv_bin="${uv_dir}/uv"
-    if [[ -x "$uv_bin" ]]; then return 0; fi
-    echo "Installing uv into ${uv_dir} ..."
-    UV_INSTALL_DIR="$uv_dir" curl -LsSf https://astral.sh/uv/install.sh | sh 2>&1 | tail -3
-    [[ -x "$uv_bin" ]]
-}
-
-# See longbench-bench.sh for the flock rationale (parallel-cell race on
-# fresh dirs creating the same venv twice).
-_zs_ensure_venv() {
-    mkdir -p "${ZS_DIR}"
-    local lock="${ZS_DIR}/.venv.lock"
-    (
-        flock -x 9
-        if [[ -f "${ZS_VENV}/bin/activate" ]]; then exit 0; fi
-        echo "Creating Python venv at ${ZS_VENV} ..."
-        local uv_bin="${ZS_DIR}/.uv/uv"
-        if [[ "${ZS_USE_UV:-0}" == "1" ]]; then
-            if command -v uv &>/dev/null; then
-                uv venv "${ZS_VENV}"
-            elif _zs_ensure_uv; then
-                "$uv_bin" venv "${ZS_VENV}"
-            else
-                echo "ERROR: ZS_USE_UV=1 but failed to install uv" >&2
-                exit 1
-            fi
-        elif python3 -m venv "${ZS_VENV}" 2>/dev/null; then
-            :
-        elif command -v uv &>/dev/null; then
-            echo "python3 -m venv unavailable, using uv ..."
-            uv venv "${ZS_VENV}"
-        elif _zs_ensure_uv; then
-            "$uv_bin" venv "${ZS_VENV}"
-        else
-            echo "ERROR: cannot create a Python venv (no python3-venv, no uv)" >&2
-            exit 1
-        fi
-    ) 9>"$lock"
-    local rc=$?
-    if (( rc != 0 )); then return $rc; fi
-    # shellcheck disable=SC1091
-    source "${ZS_VENV}/bin/activate"
-}
-
+# ── ensure venv + pip deps ─────────────────────────────────────────────────
+# `rouge` (original Python pkg, not rouge-score) for the summarization
+# tasks. transformers + jinja2 for tokenizer + apply_chat_template.
+# No jieba/fuzzywuzzy needed (no Chinese tasks, no code tasks here).
 _zs_ensure_deps() {
-    _zs_ensure_venv
-    local missing=0
-    # `rouge` (original Python pkg, not rouge-score) for the summarization
-    # tasks. transformers + jinja2 for tokenizer + apply_chat_template.
-    # No jieba/fuzzywuzzy needed (no Chinese tasks, no code tasks here).
-    for pkg in rouge numpy transformers jinja2; do
-        python3 -c "import ${pkg}" 2>/dev/null || missing=1
-    done
-    if (( missing )); then
-        echo "Installing ZeroSCROLLS Python dependencies into venv ..."
-        python3 -m pip install --quiet rouge numpy transformers jinja2 2>&1 | tail -5
-    fi
+    _kv_ensure_venv "${ZS_VENV}" "${ZS_USE_UV:-0}" "${ZS_DIR}/.uv"
+    _kv_ensure_pip_deps "ZeroSCROLLS" \
+        "rouge numpy transformers jinja2" \
+        "rouge numpy transformers jinja2"
 }
 
 # ── download + unzip per-task data ──────────────────────────────────────────
@@ -211,66 +138,8 @@ _zs_ensure_task_data() {
     [[ -f "$marker" ]]
 }
 
-# ── server lifecycle (verbatim shape from longbench-bench.sh) ──────────────
-_zs_pick_port() {
-    awk -v seed="$$$(date +%N)" 'BEGIN { srand(seed); printf "%d\n", 20000 + int(rand() * 40000) }'
-}
-
-_zs_start_server() {
-    local server_bin=$1 model=$2 ctk=$3 ctv=$4 max_length=$5
-    shift 5
-    local -a extra=("$@")
-
-    ZS_SERVER_PORT=$(_zs_pick_port)
-    ZS_SERVER_URL="http://127.0.0.1:${ZS_SERVER_PORT}"
-    ZS_SERVER_LOG=$(mktemp)
-
-    # max_length input + 1024 max_gen (upstream run_hf_model.py default) +
-    # 512 slack for any chat-template / BOS overhead.
-    local n_ctx=$(( max_length + 1024 + 512 ))
-
-    echo "Starting llama-server (port=${ZS_SERVER_PORT}, n_ctx=${n_ctx}, K=${ctk}, V=${ctv}) ..."
-    "$server_bin" \
-        -m "$model" \
-        -ctk "$ctk" -ctv "$ctv" \
-        -c "$n_ctx" \
-        --host 127.0.0.1 \
-        --port "$ZS_SERVER_PORT" \
-        --no-webui \
-        "${extra[@]}" \
-        >"$ZS_SERVER_LOG" 2>&1 &
-    ZS_SERVER_PID=$!
-
-    local i
-    for ((i=0; i<120; i++)); do
-        if ! kill -0 "$ZS_SERVER_PID" 2>/dev/null; then
-            echo "ERROR: llama-server died during startup (see $ZS_SERVER_LOG):" >&2
-            tail -20 "$ZS_SERVER_LOG" >&2
-            return 1
-        fi
-        if curl -sf "${ZS_SERVER_URL}/health" >/dev/null 2>&1; then
-            echo "Server ready after ${i}s."
-            return 0
-        fi
-        sleep 1
-    done
-    echo "ERROR: llama-server did not become healthy within 120s." >&2
-    tail -20 "$ZS_SERVER_LOG" >&2
-    return 1
-}
-
-_zs_stop_server() {
-    if [[ -n "$ZS_SERVER_PID" ]] && kill -0 "$ZS_SERVER_PID" 2>/dev/null; then
-        kill "$ZS_SERVER_PID" 2>/dev/null
-        local i
-        for ((i=0; i<5; i++)); do
-            kill -0 "$ZS_SERVER_PID" 2>/dev/null || break
-            sleep 1
-        done
-        kill -9 "$ZS_SERVER_PID" 2>/dev/null || true
-    fi
-    [[ -n "$ZS_SERVER_LOG" && -f "$ZS_SERVER_LOG" ]] && rm -f "$ZS_SERVER_LOG"
-}
+# Server lifecycle (_kv_pick_port / _kv_start_server / _kv_stop_server) and
+# /completion inference (_kv_infer_completion) live in kv_cache_bench_common.sh.
 
 # ── prepare one task's data via the Python helper ───────────────────────────
 _zs_prepare_task() {
@@ -297,28 +166,6 @@ _zs_prepare_task() {
         2>&1 | tail -3
 }
 
-# ── single-sample inference via the persistent server ──────────────────────
-_zs_infer_single() {
-    local tokens_to_gen=$1 prompt=$2
-
-    local body
-    body=$(jq -nc \
-        --arg p "$prompt" \
-        --argjson n "$tokens_to_gen" \
-        '{prompt: $p, n_predict: $n, temperature: 0, cache_prompt: false, add_special: false}')
-
-    local resp rc=0
-    resp=$(curl -sf --max-time 600 \
-        -X POST "${ZS_SERVER_URL}/completion" \
-        -H "Content-Type: application/json" \
-        -d "$body") || rc=$?
-    if (( rc != 0 )); then
-        echo "ERROR: /completion request failed (curl rc=$rc)" >&2
-        return 1
-    fi
-    jq -r '.content' <<<"$resp"
-}
-
 # ── score one prediction via zeroscrolls-score.py ──────────────────────────
 _zs_score() {
     local task=$1 prediction=$2 references_json=$3
@@ -332,17 +179,6 @@ print(json.dumps({
 }))' "$task" "$prediction" "$references_json")
 
     python3 "$ZS_SCORE" --stdin <<<"$payload"
-}
-
-_zs_mean_stdev() {
-    echo "$1" | awk '{
-        n = NF; if (n == 0) { print "- -"; exit }
-        sum = 0; for (i = 1; i <= n; i++) sum += $i
-        mean = sum / n
-        sumsq = 0; for (i = 1; i <= n; i++) sumsq += ($i - mean)^2
-        sd = (n > 1) ? sqrt(sumsq / (n - 1)) : 0
-        printf "%.1f %.1f", mean * 100, sd * 100
-    }'
 }
 
 zeroscrolls_bench() {
@@ -394,7 +230,7 @@ zeroscrolls_bench() {
         return 1
     fi
     if [[ -z "$tokenizer" ]]; then
-        tokenizer=$(_zs_detect_tokenizer "$model")
+        tokenizer=$(_kv_detect_tokenizer "$model")
         echo "Auto-detected tokenizer: $tokenizer"
     fi
 
@@ -456,8 +292,12 @@ zeroscrolls_bench() {
     echo ""
 
     # Start persistent server for this cell ----------------------------------
-    trap '_zs_stop_server' EXIT INT TERM
-    _zs_start_server "$server_bin" "$model" "$ctk" "$ctv" "$max_length" "${extra_args[@]}" || return 1
+    # max_length input + 1024 max_gen (upstream run_hf_model.py default) +
+    # 512 slack for any chat-template / BOS overhead.
+    local n_ctx=$(( max_length + 1024 + 512 ))
+
+    trap '_kv_stop_server' EXIT INT TERM
+    _kv_start_server "$server_bin" "$model" "$ctk" "$ctv" "$n_ctx" "${extra_args[@]}" || return 1
 
     # Inference + scoring ----------------------------------------------------
     declare -A task_score_list task_counts
@@ -486,7 +326,7 @@ zeroscrolls_bench() {
                 continue
             fi
             local prediction
-            prediction=$(_zs_infer_single "$max_gen" "$input_text") || {
+            prediction=$(_kv_infer_completion "$max_gen" "$input_text" "$KV_SERVER_URL") || {
                 echo "ERROR: inference failed for $task sample $sample_idx" >&2
                 sample_idx=$((sample_idx + 1))
                 continue
@@ -556,7 +396,7 @@ zeroscrolls_bench() {
         local scores_list="${task_score_list[$task]:-}"
         if (( cnt > 0 )); then
             local ms
-            ms=$(_zs_mean_stdev "$scores_list")
+            ms=$(_kv_mean_stdev "$scores_list")
             local cell_mean="${ms% *}"
             local cell_sd="${ms#* }"
             printf "%-24s %12d %14s\n" "$task" "$cnt" "${cell_mean}±${cell_sd}%"

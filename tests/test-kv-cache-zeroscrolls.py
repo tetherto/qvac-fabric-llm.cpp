@@ -27,8 +27,6 @@ import logging
 import os
 import subprocess
 import sys
-import threading
-import time
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
@@ -41,22 +39,15 @@ logger = logging.getLogger(__name__)
 SCRIPT_DIR = Path(__file__).resolve().parent
 ZS_BENCH = SCRIPT_DIR / "zeroscrolls-bench.sh"
 
-# ── BPW + quant configs (same shape as LongBench orchestrator) ──────────────
+sys.path.insert(0, str(SCRIPT_DIR))
+import kv_cache_eval_common as kv_common
+from kv_cache_eval_common import (
+    BPW, bpw_label, ModelDef, MODELS_DEFAULT,
+    ProgressTracker, _print_lock, _fmt_duration,
+    _next_available_dir, _find_latest_dir,
+)
 
-BPW = {
-    "f16":    16.0,
-    "q8_0":   8.5,
-    "q4_0":   4.5,
-    "tbq3_0": 4.25,
-    "tbq4_0": 5.25,
-    "pq3_0":  3.25,
-    "pq4_0":  4.25,
-}
-
-
-def bpw_label(k: str, v: str) -> str:
-    return f"K:{BPW.get(k, '?')} V:{BPW.get(v, '?')}"
-
+# ── Quant configs (same shape as LongBench orchestrator) ────────────────────
 
 QUANT_CONFIGS_ALL = [
     ("f16",    "f16"),
@@ -75,32 +66,6 @@ QUANT_CONFIGS_SUBSET = [
     ("tbq3_0", "pq3_0"),
     ("tbq4_0", "q4_0"),
     ("q4_0",   "q4_0"),
-]
-
-# ── Model registry (Llama-3.1-8B primary, Ministral-8B secondary) ──────────
-
-
-@dataclass
-class ModelDef:
-    path: str
-    tokenizer: str
-    label: str
-    family: str
-
-
-MODELS_DEFAULT = [
-    ModelDef(
-        path="models/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf",
-        tokenizer="NousResearch/Meta-Llama-3.1-8B-Instruct",
-        label="Llama-3.1-8B",
-        family="Llama-3.1-8B",
-    ),
-    ModelDef(
-        path="models/Ministral-8B-Instruct-2410-Q4_K_M.gguf",
-        tokenizer="mistralai/Ministral-8B-Instruct-2410",
-        label="Ministral-8B",
-        family="Ministral-8B",
-    ),
 ]
 
 # ── Config presets ─────────────────────────────────────────────────────────
@@ -147,37 +112,6 @@ class Job:
     csv_file: str = ""
 
 
-_print_lock = threading.Lock()
-
-
-class ProgressTracker:
-    def __init__(self, total: int):
-        self.total = total
-        self.completed = 0
-        self.start_time = time.time()
-        self.lock = threading.Lock()
-
-    def tick(self) -> str:
-        with self.lock:
-            self.completed += 1
-            elapsed = time.time() - self.start_time
-            avg = elapsed / self.completed if self.completed else 0
-            rem = max(0, self.total - self.completed)
-            eta = _fmt_duration(avg * rem) if self.completed else "?"
-            return f"[{self.completed}/{self.total}] elapsed {_fmt_duration(elapsed)}, ETA {eta}"
-
-
-def _fmt_duration(secs: float) -> str:
-    m, s = divmod(int(secs), 60)
-    h, m = divmod(m, 60)
-    if h > 0:
-        return f"{h}h{m:02d}m"
-    return f"{m}m{s:02d}s"
-
-
-_progress: Optional[ProgressTracker] = None
-
-
 def run_job(job: Job, extra_args: list[str], output_dir: Path) -> Optional[str]:
     jobs_dir = output_dir / "jobs"
     jobs_dir.mkdir(parents=True, exist_ok=True)
@@ -204,38 +138,13 @@ def run_job(job: Job, extra_args: list[str], output_dir: Path) -> Optional[str]:
 
     label = f"[GPU{job.gpu_id}] {job.model.label} K={job.k_type} V={job.v_type}"
     log_path = csv_path.replace(".csv", ".txt")
-    with _print_lock:
-        logger.info("  START: %s", label)
-        logger.info("  $ %s", " ".join(cmd))
-        logger.info("  log: %s", log_path)
-        logger.info("")
-
-    try:
-        # `errors="replace"` — see longbench orchestrator for rationale.
-        result = subprocess.run(
-            cmd, env=env, capture_output=True, text=True,
-            errors="replace", timeout=12 * 3600,
-        )
-        if result.returncode != 0:
-            with _print_lock:
-                logger.info("  FAIL:  %s", label)
-                logger.info("         stderr: %s", result.stderr[-500:])
-            return None
-    except subprocess.TimeoutExpired:
-        with _print_lock:
-            logger.info("  TIMEOUT: %s", label)
-        return None
-
-    cat_avg = "?"
-    for line in result.stdout.splitlines():
-        if "Category-avg score:" in line:
-            cat_avg = line.strip().split("Category-avg score:")[1].strip()
-            break
-
-    progress_str = _progress.tick() if _progress else ""
-    with _print_lock:
-        logger.info("  DONE:  %s  =>  %s  %s", label, cat_avg, progress_str)
-    return csv_path
+    ok = kv_common.run_bench_subprocess(
+        cmd, env, label, log_path,
+        timeout=12 * 3600,
+        score_marker="Category-avg score:",
+        errors="replace",
+    )
+    return csv_path if ok else None
 
 
 # ── Results collection + tables ────────────────────────────────────────────
@@ -362,32 +271,6 @@ def write_combined_csv(results, path):
                         r.task, r.category, r.samples, r.mean_pct, r.stdev_pct])
 
 
-def _next_available_dir(base):
-    if not base.exists() or not any(base.iterdir()):
-        return base
-    i = 1
-    while True:
-        c = base.parent / f"{base.name}{i}"
-        if not c.exists() or not any(c.iterdir()):
-            return c
-        i += 1
-
-
-def _find_latest_dir(base):
-    latest = None
-    if base.exists() and any(base.iterdir()):
-        latest = base
-    i = 1
-    while True:
-        c = base.parent / f"{base.name}{i}"
-        if c.exists() and any(c.iterdir()):
-            latest = c
-            i += 1
-        else:
-            break
-    return latest
-
-
 def _job_csv_path(output_dir, job):
     name = f"{job.model.label}_{job.k_type}_{job.v_type}".replace("/", "_").replace(" ", "_")
     return output_dir / "jobs" / f"{name}.csv"
@@ -507,8 +390,7 @@ def main():
 
     csv_paths = list(skipped)
     if all_jobs:
-        global _progress
-        _progress = ProgressTracker(len(all_jobs))
+        kv_common.set_progress(ProgressTracker(len(all_jobs)))
         logger.info("\nRunning %d jobs across %d GPU(s)...\n", len(all_jobs), len(gpu_ids))
         with ThreadPoolExecutor(max_workers=len(gpu_ids)) as pool:
             futures = {pool.submit(run_job, j, extra_args, output_dir): j for j in all_jobs}
