@@ -14683,6 +14683,23 @@ bool ggml_vk_can_fuse_topk_qsa(ggml_backend_vk_context * ctx, const struct ggml_
 
 bool ggml_vk_can_fuse_rope_set_rows(ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph,
                                            int node_idx) {
+    // qvac: Mali/Adreno KHR_coopmat1 disable. The ROPE+VIEW+SET_ROWS fusion
+    // makes the ROPE shader write directly into the KV cache buffer (a
+    // permuted view 6+ MiB long) instead of a small intermediate compute
+    // buffer + a separate SET_ROWS. On Mali-G715 this fused dispatch
+    // corrupts subsequent GPU state — the next op's descriptor-pool submit
+    // (e.g. attention Q@K^T mul_mat_q_f16) fence-waits and gets
+    // ErrorDeviceLost. Pre-b9341 the unfused two-op sequence (ROPE → compute
+    // buf, then SET_ROWS → cache) ran cleanly on the same hardware
+    // (verified end-to-end with f686a1324 source at 19.6 t/s). Disabling the
+    // fusion on Mali/Adreno coopmat1 restores the un-fused path while
+    // leaving the optimization on for desktop GPUs / coopmat2 hardware.
+    const vk_device & device = ctx->device;
+    if ((device->vendor_id == VK_VENDOR_ID_ARM || device->vendor_id == VK_VENDOR_ID_QUALCOMM) &&
+        device->coopmat_support && !device->coopmat2) {
+        return false;
+    }
+
     const ggml_tensor *rope = cgraph->nodes[node_idx + 0];
     const ggml_tensor *view = cgraph->nodes[node_idx + 1];
     const ggml_tensor *set_rows = cgraph->nodes[node_idx + 2];
