@@ -42,8 +42,8 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 NH_BENCH = SCRIPT_DIR / "niah-bench.sh"
 
 sys.path.insert(0, str(SCRIPT_DIR))
-import kv_cache_eval_common as kv_common
-from kv_cache_eval_common import (
+import kv_cache_eval_common as kv_common  # noqa: E402
+from kv_cache_eval_common import (  # noqa: E402
     BPW, bpw_label, ModelDef, MODELS_DEFAULT,
     ProgressTracker,
     _next_available_dir, _find_latest_dir,
@@ -204,8 +204,10 @@ def heatmap_table(results, title):
                     if hits:
                         s = hits[0].score
                         row += f"  {int(round(s)):>3}"
-                        row_sum += s; row_n += 1
-                        grid_sum += s; grid_n += 1
+                        row_sum += s
+                        row_n += 1
+                        grid_sum += s
+                        grid_n += 1
                     else:
                         row += f"  {'-':>3}"
                 if row_n > 0:
@@ -254,7 +256,8 @@ def cross_config_table(results, title):
                 if hits:
                     avg = sum(h.score for h in hits) / len(hits)
                     row += f"{avg:>{col_w}.1f}"
-                    all_sum += sum(h.score for h in hits); all_n += len(hits)
+                    all_sum += sum(h.score for h in hits)
+                    all_n += len(hits)
                 else:
                     row += f"{'--':>{col_w}}"
             if all_n > 0:
@@ -306,7 +309,7 @@ def corners_only_table(results, title):
         lines.append(f"  Model: {model_name}  ({len(mod_cells)} interesting cells)")
         header = f"  {'ctx':>6}  {'depth':>6}"
         for k, v in quants:
-            header += f"  {k+'/'+v:>14}"
+            header += f"  {k + '/' + v:>14}"
         lines.append(header)
         lines.append("  " + "-" * (len(header) - 2))
         for (_, ctx, d) in mod_cells:

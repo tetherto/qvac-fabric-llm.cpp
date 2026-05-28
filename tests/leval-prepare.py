@@ -39,7 +39,6 @@ import logging
 import os
 import random
 import sys
-from typing import Optional
 
 logger = logging.getLogger(__name__)
 

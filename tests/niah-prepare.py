@@ -188,6 +188,7 @@ def prepare(
     logger.info("Loaded haystack: %d chars", len(haystack_text))
 
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_name, trust_remote_code=True)
+    assert tokenizer is not None, f"Failed to load tokenizer: {tokenizer_name}"
 
     os.makedirs(os.path.dirname(output_file) or ".", exist_ok=True)
     n_written = 0

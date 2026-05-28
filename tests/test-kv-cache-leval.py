@@ -24,24 +24,21 @@ import argparse
 import csv
 import logging
 import os
-import subprocess
 import sys
-from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
 
 logger = logging.getLogger(__name__)
 SCRIPT_DIR = Path(__file__).resolve().parent
 LV_BENCH = SCRIPT_DIR / "leval-bench.sh"
 
 sys.path.insert(0, str(SCRIPT_DIR))
-import kv_cache_eval_common as kv_common
-from kv_cache_eval_common import (
+import kv_cache_eval_common as kv_common  # noqa: E402
+from kv_cache_eval_common import (  # noqa: E402
     BPW, bpw_label, ModelDef, MODELS_DEFAULT,
-    ProgressTracker, _print_lock, _fmt_duration,
+    ProgressTracker,
     _next_available_dir, _find_latest_dir,
 )
 
@@ -230,7 +227,7 @@ def per_task_table(results, title):
         lines.append(f"  Model: {model_name}")
         header = f"  {'KV Config':<22}"
         for t in ALL_TASKS:
-            header += f"{t[:col_w-1]:>{col_w}}"
+            header += f"{t[:col_w - 1]:>{col_w}}"
         lines.append(header)
         lines.append("  " + "-" * (len(header) - 2))
         for k, v in quants:

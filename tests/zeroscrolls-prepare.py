@@ -46,7 +46,6 @@ import os
 import random
 import sys
 from collections import defaultdict
-from typing import Optional
 
 logger = logging.getLogger(__name__)
 

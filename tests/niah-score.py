@@ -57,7 +57,7 @@ def main() -> int:
 
     if args.prediction is not None:
         if args.references is None:
-            print("ERROR: --references required with --prediction", file=sys.stderr)
+            sys.stderr.write("ERROR: --references required with --prediction\n")
             return 2
         payload = {
             "prediction": args.prediction,
@@ -66,12 +66,12 @@ def main() -> int:
     else:
         data = sys.stdin.read()
         if not data.strip():
-            print("ERROR: no JSON on stdin", file=sys.stderr)
+            sys.stderr.write("ERROR: no JSON on stdin\n")
             return 2
         payload = json.loads(data)
 
     score = score_one(payload["prediction"], payload["references"])
-    print(f"{score:.6f}")
+    sys.stdout.write(f"{score:.6f}\n")
     return 0
 
 
