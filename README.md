@@ -13,6 +13,33 @@
 
 The following capabilities are developed and maintained as part of qvac-fabric-llm.cpp. Features marked as *exclusive* are not available in upstream llama.cpp.
 
+### TurboQuant KV Cache Quantization *(exclusive)*
+
+TurboQuant adds low-bit KV-cache quantization formats for long-context inference while preserving token-generation quality close to higher-bit caches. It supports:
+
+- **TBQ3_0 / TBQ4_0**: TurboQuant 3-bit and 4-bit formats with QJL Stage 2 correction.
+- **PQ3_0 / PQ4_0**: PolarQuant 3-bit and 4-bit Stage 1-only formats.
+- **64-wide variants**: `tbq3_0_64`, `tbq4_0_64`, `pq3_0_64`, and `pq4_0_64` for models with smaller attention head dimensions.
+- **Backend support**: CPU quantization/dequantization and Vulkan inference kernels, including attention paths and mixed K/V cache configurations. CUDA and Metal do not include TurboQuant kernels in this release.
+- **Test coverage**: performance coverage via [test-kv-cache-quantization-perf.sh](tests/test-kv-cache-quantization-perf.sh), perplexity coverage via [test-kv-cache-quantization-perp.sh](tests/test-kv-cache-quantization-perp.sh), and eval coverage via [test-kv-cache-ruler.py](tests/test-kv-cache-ruler.py), [test-kv-cache-niah.py](tests/test-kv-cache-niah.py), [test-kv-cache-longbench.py](tests/test-kv-cache-longbench.py), [test-kv-cache-zeroscrolls.py](tests/test-kv-cache-zeroscrolls.py), and [test-kv-cache-leval.py](tests/test-kv-cache-leval.py).
+
+Qwen3.5-4B Q8_0 benchmark highlights:
+
+| Context | Cache config | BPW | RTX 5090 pp | RTX 5090 tg | Strix Halo pp | Strix Halo tg |
+| :-- | :-- | --: | --: | --: | --: | --: |
+| 2k | `f16/f16` | 16.00 | 14,538 t/s (baseline) | 236.02 t/s (baseline) | 1,750 t/s (baseline) | 42.30 t/s (baseline) |
+| 2k | `pq4_0/pq4_0` | 4.25 | 0.96x | 0.96x | 0.94x | 0.99x |
+| 2k | `pq3_0/pq3_0` | 3.25 | 0.96x | 0.96x | 0.95x | 0.99x |
+| 2k | `tbq4_0/pq4_0` | 4.75 | 0.71x | 0.94x | 0.60x | 0.97x |
+| 2k | `tbq3_0/pq3_0` | 3.75 | 0.71x | 0.94x | 0.60x | 0.98x |
+| 8k | `f16/f16` | 16.00 | 13,981 t/s (baseline) | 236.67 t/s (baseline) | 1,585 t/s (baseline) | 42.46 t/s (baseline) |
+| 8k | `pq4_0/pq4_0` | 4.25 | 0.89x | 0.96x | 0.82x | 0.99x |
+| 8k | `pq3_0/pq3_0` | 3.25 | 0.89x | 0.96x | 0.85x | 0.99x |
+| 8k | `tbq4_0/pq4_0` | 4.75 | 0.42x | 0.94x | 0.32x | 0.97x |
+| 8k | `tbq3_0/pq3_0` | 3.75 | 0.43x | 0.94x | 0.32x | 0.97x |
+
+Quality checks on Qwen3.5-4B Q8_0 show `tbq4_0/pq4_0` at -0.03% perplexity delta versus `f16/f16`, with 94.8% RULER main score and 37.04 LongBench average versus 37.52 for `f16/f16`. See the full [TurboQuant benchmark report](docs/turboquant-benchmarks.md) for all measured models, contexts, and quality results.
+
 ### LoRA Fine-Tuning *(exclusive)*
 
 `qvac-fabric-llm.cpp` provides native [LoRA](https://arxiv.org/abs/2106.09685) (Low-Rank Adaptation) fine-tuning across CPU, Vulkan, and Metal backends. The training pipeline runs directly on consumer hardware, including mobile phones and integrated GPUs.
@@ -121,6 +148,7 @@ The following features are developed in qvac-fabric-llm.cpp and are not availabl
 
 | Feature | Description |
 |---------|-------------|
+| TurboQuant KV cache quantization | TBQ3_0/TBQ4_0 with QJL correction plus PQ3_0/PQ4_0 Stage 1 formats; CPU quantization/dequantization and Vulkan inference kernels for low-bit KV-cache inference |
 | LoRA fine-tuning | On-device training across CPU, Vulkan, and Metal with SFT, checkpointing, and LR scheduling |
 | BitNet inference and training | TQ2_0 quantization on Vulkan, Metal, and CPU for inference and LoRA fine-tuning; extends [microsoft/BitNet](https://github.com/microsoft/BitNet) beyond its CUDA-only GPU support |
 | Memory-based model loading | Load models from in-memory buffers with split-model and async fulfillment support |
