@@ -22,7 +22,6 @@ import argparse
 import csv
 import logging
 import os
-import subprocess
 import sys
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -37,10 +36,10 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 RULER_BENCH = SCRIPT_DIR / "ruler-bench.sh"
 
 sys.path.insert(0, str(SCRIPT_DIR))
-import kv_cache_eval_common as kv_common
-from kv_cache_eval_common import (
+import kv_cache_eval_common as kv_common  # noqa: E402
+from kv_cache_eval_common import (  # noqa: E402
     BPW, bpw_label, ModelDef, MODELS_DEFAULT,
-    ProgressTracker, _print_lock, _fmt_duration,
+    ProgressTracker,
     _next_available_dir, _find_latest_dir,
 )
 

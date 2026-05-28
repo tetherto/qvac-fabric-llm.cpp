@@ -35,7 +35,7 @@ UPSTREAM_DIR = os.path.join(SCRIPT_DIR, "longbench", "LongBench")
 if UPSTREAM_DIR not in sys.path:
     sys.path.insert(0, UPSTREAM_DIR)
 
-from metrics import (  # noqa: E402 — upstream import after sys.path fix
+from metrics import (  # noqa: E402  # ty: ignore[unresolved-import]
     qa_f1_score,
     rouge_score,
     classification_score,
@@ -125,7 +125,7 @@ def main() -> int:
 
     if args.prediction is not None:
         if args.task is None or args.references is None:
-            print("ERROR: --task and --references required with --prediction", file=sys.stderr)
+            sys.stderr.write("ERROR: --task and --references required with --prediction\n")
             return 2
         payload = {
             "task": args.task,
@@ -136,17 +136,17 @@ def main() -> int:
     else:
         data = sys.stdin.read()
         if not data.strip():
-            print("ERROR: no JSON on stdin", file=sys.stderr)
+            sys.stderr.write("ERROR: no JSON on stdin\n")
             return 2
         payload = json.loads(data)
 
     score = score_one(
-        payload["task"],
-        payload["prediction"],
+        str(payload["task"]),
+        str(payload["prediction"]),
         payload["references"],
         payload.get("all_classes"),
     )
-    print(f"{score:.6f}")
+    sys.stdout.write(f"{score:.6f}\n")
     return 0
 
 

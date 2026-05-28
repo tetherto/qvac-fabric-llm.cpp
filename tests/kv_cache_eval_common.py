@@ -46,9 +46,10 @@ class ModelDef:
     path: str
     tokenizer: str
     label: str
-    family: str  # Used by RULER to bucket cross-model aggregations.
-                 # Non-RULER orchestrators set family=label, which makes the
-                 # aggregation degenerate to per-model rows.
+    # family: used by RULER to bucket cross-model aggregations.
+    # Non-RULER orchestrators set family=label, which makes the
+    # aggregation degenerate to per-model rows.
+    family: str
 
 
 # Three q8 models mirroring tests/test-kv-cache-quantization-perp.sh's presets.

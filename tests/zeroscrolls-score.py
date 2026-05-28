@@ -84,7 +84,7 @@ def qa_f1(prediction: str, ground_truth: str, **_) -> float:
 # ── ROUGE-L F1, via the same `rouge` package upstream LongBench uses ───────
 def rouge_l(prediction: str, ground_truth: str, **_) -> float:
     # Local import so the script still imports / --help works without `rouge`.
-    from rouge import Rouge
+    from rouge import Rouge  # ty: ignore[unresolved-import]
 
     rouge = Rouge()
     # The `rouge` package crashes on empty strings; pad with a sentinel so
@@ -179,7 +179,7 @@ def main() -> int:
 
     if args.prediction is not None:
         if args.task is None or args.references is None:
-            print("ERROR: --task and --references required with --prediction", file=sys.stderr)
+            sys.stderr.write("ERROR: --task and --references required with --prediction\n")
             return 2
         payload = {
             "task": args.task,
@@ -189,7 +189,7 @@ def main() -> int:
     else:
         data = sys.stdin.read()
         if not data.strip():
-            print("ERROR: no JSON on stdin", file=sys.stderr)
+            sys.stderr.write("ERROR: no JSON on stdin\n")
             return 2
         payload = json.loads(data)
 
@@ -199,7 +199,7 @@ def main() -> int:
         payload["references"],
         payload.get("all_classes"),
     )
-    print(f"{score:.6f}")
+    sys.stdout.write(f"{score:.6f}\n")
     return 0
 
 
