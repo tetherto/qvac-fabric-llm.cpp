@@ -108,6 +108,13 @@ _kv_infer_completion() {
     # the prompt on any task containing a quote, which several LongBench
     # tasks do.
     #
+    # The prompt is fed to jq via --rawfile + stdin instead of --arg because
+    # at ctx ≥ ~32k tokens under Llama-3.1 / Qwen tokenizers the decoded
+    # prompt text crosses Linux's execve(2) per-arg ceiling (~128 KB) and
+    # bash returns "Argument list too long" before jq runs. Piping via stdin
+    # is unbounded. Pre-refactor evals capped max_length at 16k so never hit
+    # this; NIAH at 32k is what surfaced it.
+    #
     # add_special=false because the prepare script already runs the prompt
     # through tokenizer.apply_chat_template, which emits a leading
     # <|begin_of_text|>. With the server's default add_special=true we'd
@@ -117,9 +124,13 @@ _kv_infer_completion() {
     # collected with this flag flipped are *not* directly comparable
     # against cells collected without it — keep the flag consistent across
     # all cells of any single comparison run.
+    # `printf '%s'` (NOT bash <<<, which appends a trailing newline) so the
+    # bytes jq sees are byte-identical to what --arg would have produced.
+    # Without this the JSON would include a spurious "\n" at the end of the
+    # prompt vs. the pre-fix path, breaking cross-comparability of cells.
     local body
-    body=$(jq -nc \
-        --arg p "$prompt" \
+    body=$(printf '%s' "$prompt" | jq -nc \
+        --rawfile p /dev/stdin \
         --argjson n "$tokens_to_gen" \
         '{prompt: $p, n_predict: $n, temperature: 0, cache_prompt: false, add_special: false}')
 
@@ -127,11 +138,18 @@ _kv_infer_completion() {
     # ~80 t/s ≈ 200s, plus 512-token generation ≈ another 60s, plus
     # margin. 600s is comfortable; we'd rather time out than block forever
     # if the server hangs.
+    #
+    # `--data-binary @-` (NOT `-d "$body"`) for the same execve(2) ARG_MAX
+    # reason as the jq stdin trick above: at 32k+ ctx the JSON body itself
+    # crosses the per-argv limit and curl would fail with "Argument list
+    # too long". `printf` is a bash builtin so the body never traverses
+    # execve(2); it's piped to curl which reads it from stdin unbounded.
+    # `--data-binary` (not `--data`) preserves the body bytes verbatim.
     local resp rc=0
-    resp=$(curl -sf --max-time 600 \
+    resp=$(printf '%s' "$body" | curl -sf --max-time 600 \
         -X POST "${server_url}/completion" \
         -H "Content-Type: application/json" \
-        -d "$body") || rc=$?
+        --data-binary @-) || rc=$?
 
     if (( rc != 0 )); then
         echo "ERROR: /completion request failed (curl rc=$rc)" >&2
