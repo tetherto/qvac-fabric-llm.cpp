@@ -433,7 +433,15 @@ extern "C" {
         GGML_TYPE_Q1_0    = 41,
         GGML_TYPE_Q2_0    = 42,
         GGML_TYPE_F8_E4M3 = 43,
-        GGML_TYPE_COUNT   = 44,
+        GGML_TYPE_TBQ3_0    = 44, // TurboQuant 3-bit + QJL Stage 2, block=128 (4.25 bpw)
+        GGML_TYPE_TBQ4_0    = 45, // TurboQuant 4-bit + QJL Stage 2, block=128 (5.25 bpw)
+        GGML_TYPE_TBQ3_0_64 = 46, // TurboQuant 3-bit + QJL Stage 2, block=64  (4.5 bpw)
+        GGML_TYPE_TBQ4_0_64 = 47, // TurboQuant 4-bit + QJL Stage 2, block=64  (5.5 bpw)
+        GGML_TYPE_PQ3_0     = 48, // PolarQuant 3-bit (Stage 1 only), block=128 (3.125 bpw)
+        GGML_TYPE_PQ3_0_64  = 49, // PolarQuant 3-bit (Stage 1 only), block=64  (3.25 bpw)
+        GGML_TYPE_PQ4_0     = 50, // PolarQuant 4-bit (Stage 1 only), block=128 (4.125 bpw)
+        GGML_TYPE_PQ4_0_64  = 51, // PolarQuant 4-bit (Stage 1 only), block=64  (4.25 bpw)
+        GGML_TYPE_COUNT     = 52,
     };
 
     // [TAG_GGML_PREC]
@@ -816,6 +824,11 @@ extern "C" {
 
     // true if the elements in dimension 0 are contiguous, or there is just 1 block of elements
     GGML_API bool ggml_is_contiguous_rows(const struct ggml_tensor * tensor);
+
+    GGML_API bool ggml_is_tbq_or_pq_64(enum ggml_type type);
+    GGML_API bool ggml_is_tbq_or_pq(enum ggml_type type);
+    GGML_API bool ggml_is_tbq_64(enum ggml_type type);
+    GGML_API bool ggml_is_tbq(enum ggml_type type);
 
     GGML_API bool ggml_are_same_shape (const struct ggml_tensor * t0, const struct ggml_tensor * t1);
     GGML_API bool ggml_are_same_stride(const struct ggml_tensor * t0, const struct ggml_tensor * t1);

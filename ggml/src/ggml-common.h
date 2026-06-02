@@ -459,6 +459,8 @@ typedef struct {
 } block_iq4_xs;
 static_assert(sizeof(block_iq4_xs) == sizeof(ggml_half) + sizeof(uint16_t) + QK_K/64 + QK_K/2, "wrong iq4_xs block size/padding");
 
+#include "ggml-tbq-types.h"
+
 #endif // GGML_COMMON_DECL
 #endif // GGML_COMMON_DECL
 

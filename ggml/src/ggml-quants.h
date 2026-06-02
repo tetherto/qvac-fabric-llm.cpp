@@ -5,6 +5,8 @@
 
 #include "ggml.h"
 
+#include "ggml-tbq-quants.h"
+
 // GGML internal header
 
 #ifdef __cplusplus

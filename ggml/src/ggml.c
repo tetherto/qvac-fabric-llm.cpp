@@ -959,6 +959,70 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .type_size                = 0,
         .is_quantized             = false,
     },
+    [GGML_TYPE_TBQ3_0] = {
+        .type_name                = "tbq3_0",
+        .blck_size                = QK_TQ,
+        .type_size                = sizeof(block_tbq3_0),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_tbq3_0,
+        .from_float_ref           = (ggml_from_float_t) quantize_row_tbq3_0_ref,
+    },
+    [GGML_TYPE_TBQ4_0] = {
+        .type_name                = "tbq4_0",
+        .blck_size                = QK_TQ,
+        .type_size                = sizeof(block_tbq4_0),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_tbq4_0,
+        .from_float_ref           = (ggml_from_float_t) quantize_row_tbq4_0_ref,
+    },
+    [GGML_TYPE_TBQ3_0_64] = {
+        .type_name                = "tbq3_0_64",
+        .blck_size                = QK_TQ_64,
+        .type_size                = sizeof(block_tbq3_0_64),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_tbq3_0_64,
+        .from_float_ref           = (ggml_from_float_t) quantize_row_tbq3_0_64_ref,
+    },
+    [GGML_TYPE_TBQ4_0_64] = {
+        .type_name                = "tbq4_0_64",
+        .blck_size                = QK_TQ_64,
+        .type_size                = sizeof(block_tbq4_0_64),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_tbq4_0_64,
+        .from_float_ref           = (ggml_from_float_t) quantize_row_tbq4_0_64_ref,
+    },
+    [GGML_TYPE_PQ3_0] = {
+        .type_name                = "pq3_0",
+        .blck_size                = QK_TQ,
+        .type_size                = sizeof(block_pq3_0),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_pq3_0,
+        .from_float_ref           = (ggml_from_float_t) quantize_row_pq3_0_ref,
+    },
+    [GGML_TYPE_PQ3_0_64] = {
+        .type_name                = "pq3_0_64",
+        .blck_size                = QK_TQ_64,
+        .type_size                = sizeof(block_pq3_0_64),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_pq3_0_64,
+        .from_float_ref           = (ggml_from_float_t) quantize_row_pq3_0_64_ref,
+    },
+    [GGML_TYPE_PQ4_0] = {
+        .type_name                = "pq4_0",
+        .blck_size                = QK_TQ,
+        .type_size                = sizeof(block_pq4_0),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_pq4_0,
+        .from_float_ref           = (ggml_from_float_t) quantize_row_pq4_0_ref,
+    },
+    [GGML_TYPE_PQ4_0_64] = {
+        .type_name                = "pq4_0_64",
+        .blck_size                = QK_TQ_64,
+        .type_size                = sizeof(block_pq4_0_64),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_pq4_0_64,
+        .from_float_ref           = (ggml_from_float_t) quantize_row_pq4_0_64_ref,
+    },
 };
 
 const struct ggml_type_traits * ggml_get_type_traits(enum ggml_type type) {
@@ -8326,6 +8390,14 @@ size_t ggml_quantize_chunk(
         case GGML_TYPE_IQ1_M:   result = quantize_iq1_m  (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_IQ4_NL:  result = quantize_iq4_nl (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_IQ4_XS:  result = quantize_iq4_xs (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
+        case GGML_TYPE_TBQ3_0:    result = quantize_tbq3_0   (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
+        case GGML_TYPE_TBQ4_0:    result = quantize_tbq4_0   (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
+        case GGML_TYPE_TBQ3_0_64: result = quantize_tbq3_0_64(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
+        case GGML_TYPE_TBQ4_0_64: result = quantize_tbq4_0_64(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
+        case GGML_TYPE_PQ3_0:     result = quantize_pq3_0    (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
+        case GGML_TYPE_PQ3_0_64:  result = quantize_pq3_0_64 (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
+        case GGML_TYPE_PQ4_0:     result = quantize_pq4_0    (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
+        case GGML_TYPE_PQ4_0_64:  result = quantize_pq4_0_64 (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_F16:
             {
                 size_t elemsize = sizeof(ggml_fp16_t);
@@ -8386,4 +8458,56 @@ bool ggml_threadpool_params_match(const struct ggml_threadpool_params * p0, cons
     if (p0->poll       != p1->poll       ) return false;
     if (p0->strict_cpu != p1->strict_cpu ) return false;
     return memcmp(p0->cpumask, p1->cpumask, GGML_MAX_N_THREADS) == 0;
+}
+
+////////////////////////////////////////////////////////////////////////////////
+
+bool ggml_is_tbq_or_pq_64(enum ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_TBQ3_0_64:
+        case GGML_TYPE_TBQ4_0_64:
+        case GGML_TYPE_PQ3_0_64:
+        case GGML_TYPE_PQ4_0_64:
+            return true;
+        default:
+            return false;
+    }
+}
+
+bool ggml_is_tbq_or_pq(enum ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_TBQ3_0:
+        case GGML_TYPE_TBQ4_0:
+        case GGML_TYPE_PQ3_0:
+        case GGML_TYPE_PQ4_0:
+        case GGML_TYPE_TBQ3_0_64:
+        case GGML_TYPE_TBQ4_0_64:
+        case GGML_TYPE_PQ3_0_64:
+        case GGML_TYPE_PQ4_0_64:
+            return true;
+        default:
+            return false;
+    }
+}
+
+bool ggml_is_tbq_64(enum ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_TBQ3_0_64:
+        case GGML_TYPE_TBQ4_0_64:
+            return true;
+        default:
+            return false;
+    }
+}
+
+bool ggml_is_tbq(enum ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_TBQ3_0:
+        case GGML_TYPE_TBQ4_0:
+        case GGML_TYPE_TBQ3_0_64:
+        case GGML_TYPE_TBQ4_0_64:
+            return true;
+        default:
+            return false;
+    }
 }

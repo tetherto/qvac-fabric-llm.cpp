@@ -4338,6 +4338,32 @@ llama_context * llama_init_from_model(
         }
     }
 
+    // TurboQuant: auto-select block=64 variant when head_dim=64
+    // TODO(tbq-rebase): PR used `model->hparams.n_embd_head_k() == 64` as a plain scalar comparison;
+    // upstream qvac-b8828 made n_embd_head_k/_v indexed accessors. The simple unindexed compare
+    // below may not compile or may always be false on the new API. If TBQ_*_64 auto-selection is
+    // needed at runtime, replace these with the per-layer accessor (e.g. n_embd_head_k(0)).
+    if (params.type_k == GGML_TYPE_TBQ3_0 && model->hparams.n_embd_head_k() == 64) { params.type_k = GGML_TYPE_TBQ3_0_64; }
+    if (params.type_k == GGML_TYPE_TBQ4_0 && model->hparams.n_embd_head_k() == 64) { params.type_k = GGML_TYPE_TBQ4_0_64; }
+    if (params.type_k == GGML_TYPE_PQ3_0 && model->hparams.n_embd_head_k() == 64) { params.type_k = GGML_TYPE_PQ3_0_64; }
+    if (params.type_v == GGML_TYPE_TBQ3_0 && model->hparams.n_embd_head_v() == 64) { params.type_v = GGML_TYPE_TBQ3_0_64; }
+    if (params.type_v == GGML_TYPE_TBQ4_0 && model->hparams.n_embd_head_v() == 64) { params.type_v = GGML_TYPE_TBQ4_0_64; }
+    if (params.type_v == GGML_TYPE_PQ3_0 && model->hparams.n_embd_head_v() == 64) { params.type_v = GGML_TYPE_PQ3_0_64; }
+    if (params.type_k == GGML_TYPE_PQ4_0 && model->hparams.n_embd_head_k() == 64) { params.type_k = GGML_TYPE_PQ4_0_64; }
+    if (params.type_v == GGML_TYPE_PQ4_0 && model->hparams.n_embd_head_v() == 64) { params.type_v = GGML_TYPE_PQ4_0_64; }
+
+    // TurboQuant V cache: GPU FA now supports TQ types (optRot moved Hadamard to graph level,
+    // FA shader does inline codebook dequant). No downgrade needed.
+
+    if (params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_AUTO && ggml_is_quantized(params.type_k)) {
+        const uint32_t blck_size = ggml_blck_size(params.type_k);
+        if (model->hparams.n_embd_head_k() % blck_size != 0) {
+            LLAMA_LOG_ERROR("%s: K cache type %s with block size %u does not divide n_embd_head_k=%u\n",
+                __func__, ggml_type_name(params.type_k), blck_size, model->hparams.n_embd_head_k());
+            return nullptr;
+        }
+    }
+
     if (params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_DISABLED && ggml_is_quantized(params.type_k)) {
         const uint32_t blck_size = ggml_blck_size(params.type_k);
         for (uint32_t il = 0; il < model->hparams.n_layer(); ++il) {
