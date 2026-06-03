@@ -1012,6 +1012,12 @@ struct common_init_result {
     std::vector<llama_adapter_lora_ptr> & lora();
 
 private:
+    // Empty result: no model is loaded from params.model.path. Used by the
+    // externally-loaded-model overload of common_init_from_model_and_params so
+    // it can adopt a caller-provided model without first building (and then
+    // freeing) a throwaway file-loaded model and its dependent context.
+    common_init_result();
+
     struct impl;
     std::unique_ptr<impl> pimpl;
 
