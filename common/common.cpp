@@ -1458,13 +1458,13 @@ static void common_batch_set_zero_state(common_batch & batch, const llama_model 
 }
 
 common_init_result_ptr common_init_from_model_and_params(llama_model* model, common_init_result_ptr res, common_params & params) {
+    const llama_vocab * vocab = llama_model_get_vocab(model);
+
     llama_context * lctx = res->context();
     if (lctx == NULL) {
         COM_ERR("failed to create context with model '%s'\n", params.model.path.c_str());
         return res;
     }
-
-    const llama_vocab * vocab = llama_model_get_vocab(model);
 
     if (params.ctx_shift && !llama_memory_can_shift(llama_get_memory(lctx))) {
         COM_WRN("%s", "KV cache shifting is not supported for this context, disabling KV cache shifting\n");
@@ -1586,7 +1586,12 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
 // and don't have a params.model.path the file-based constructor can open.
 common_init_result_ptr common_init_from_model_and_params(llama_model * model, common_params & params) {
     if (model == nullptr) {
-        return common_init_result_ptr();
+        // Mirror common_init_from_params: on load failure return a *valid* empty
+        // result (model()/context() == nullptr), never a null pointer. Callers
+        // adopt this result and inspect model()/context() to detect failure
+        // (e.g. and then throw); returning a null common_init_result_ptr here
+        // makes those callers dereference null and crash.
+        return common_init_result_ptr(new common_init_result());
     }
 
     // Adopt the externally-loaded model into an empty result. Do NOT use the
