@@ -1346,7 +1346,7 @@ void process_shaders() {
     string_to_spv("sigmoid_back_f32", "sigmoid_back.comp", {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}});
 
     string_to_spv("cross_entropy_loss_masked_back_f32", "cross_entropy_loss_masked_back.comp", {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"C_TYPE", "float"}, {"D_TYPE", "float"}, {"E_TYPE", "float"}});
-    string_to_spv("count_equal_masked_i32", "count_equal_masked.comp", {{"A_TYPE", "int"}, {"B_TYPE", "int"}, {"C_TYPE", "float"}, {"D_TYPE", "int64_t"}});
+    string_to_spv("count_equal_masked_i32", "count_equal_masked.comp", {{"A_TYPE", "int"}, {"B_TYPE", "int"}, {"C_TYPE", "float"}});
 
     string_to_spv("soft_max_f32", "soft_max.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}}));
     string_to_spv("soft_max_f32_f16", "soft_max.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"B_TYPE", "float16_t"}, {"D_TYPE", "float"}}));
