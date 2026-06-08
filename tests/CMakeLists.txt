@@ -227,6 +227,9 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
 
     # llama_build_and_test(test-double-float.cpp) # SLOW
 
+    llama_build_and_test(test-kv-cells.cpp)
+    target_include_directories(test-kv-cells PRIVATE ${PROJECT_SOURCE_DIR}/src)
+    # test-kv-cache is registered above (LABEL behavior); it holds both upstream's and the fork's cases
 endif()
 
 llama_build(test-llama-archs.cpp)

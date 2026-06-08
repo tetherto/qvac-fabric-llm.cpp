@@ -210,6 +210,10 @@ public:
     ggml_tensor * get_k_scale(int32_t il) const;
     ggml_tensor * get_v_scale(int32_t il) const;
 
+    // smallest K-row width that covers the rotated dims and is a whole number of quant blocks
+    // (the K-shift graph itself rewrites whole rows of quantized caches)
+    int64_t get_k_shift_width(uint32_t il) const;
+
     // store k_cur and v_cur in the cache based on the provided head location
     ggml_tensor * cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il, const slot_info & sinfo) const;
     ggml_tensor * cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, int32_t il, const slot_info & sinfo) const;
@@ -246,6 +250,7 @@ public:
     void set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ubatch, const slot_info & sinfo) const;
 
     void set_input_k_shift(ggml_tensor * dst) const;
+    void set_input_k_shift_data(int32_t * data) const;
 
     void set_input_attn_mask (const llm_attn_mask & attn_mask, const llama_ubatch * ubatch, bool causal_attn) const;
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
