@@ -18,6 +18,10 @@ static bool ggml_is_power_of_2(int n) {
     return (n & (n - 1)) == 0;
 }
 
+static bool llama_kv_cache_uses_mrope_shift(const llama_hparams & hparams) {
+    return hparams.rope_type == LLAMA_ROPE_TYPE_MROPE || hparams.rope_type == LLAMA_ROPE_TYPE_IMROPE;
+}
+
 // orthonormal Walsh-Hadamard rotation matrix
 // note: res^2 == I
 static void ggml_gen_hadamard(ggml_tensor * tensor) {
@@ -670,24 +674,25 @@ void llama_kv_cache::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, ll
     v_cells[s1].reset();
     for (uint32_t i = 0; i < v_cells[s0].size(); ++i) {
         if (v_cells[s0].seq_has(i, seq_id_src)) {
-            llama_pos pos   = v_cells[s0].pos_get(i);
-            llama_pos shift = v_cells[s0].get_shift(i);
+            llama_pos pos = v_cells[s0].pos_get(i);
+            const llama_kv_cell_shift shift = v_cells[s0].get_shift_ext(i);
 
             llama_kv_cell_ext ext = v_cells[s0].ext_get(i);
 
-            if (shift != 0) {
-                pos -= shift;
+            if (!shift.is_zero()) {
+                pos   -= shift.t();
+                ext.y -= shift.y();
+                ext.x -= shift.x();
                 assert(pos >= 0);
             }
 
             v_cells[s1].pos_set(i, pos);
+            v_cells[s1].ext_set(i, ext);
             v_cells[s1].seq_add(i, seq_id_dst);
 
-            if (shift != 0) {
-                v_cells[s1].pos_add(i, shift);
+            if (!shift.is_zero()) {
+                v_cells[s1].pos_shift(i, shift);
             }
-
-            v_cells[s1].ext_set(i, ext);
         }
     }
 
@@ -732,7 +737,7 @@ void llama_kv_cache::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, ll
     }
 
     GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < seq_to_stream.size());
-    GGML_ASSERT(hparams.n_pos_per_embd() == 1 && "seq_add() is only supported for n_pos_per_embd() == 1");
+    GGML_ASSERT(get_can_shift() && "seq_add() is not supported for this model");
 
     auto & cells = v_cells[seq_to_stream[seq_id]];
     auto & head  = v_heads[seq_to_stream[seq_id]];
@@ -762,7 +767,7 @@ void llama_kv_cache::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, ll
         }
 
         if (cells.seq_has(i, seq_id)) {
-            if (cells.pos_add(i, shift)) {
+            if (cells.pos_add(i, shift, llama_kv_cache_uses_mrope_shift(hparams))) {
                 if (new_head == cells.size()) {
                     new_head = i;
                 }
@@ -782,13 +787,15 @@ void llama_kv_cache::seq_div(llama_seq_id seq_id, llama_pos p0, llama_pos p1, in
     }
 
     GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < seq_to_stream.size());
-    GGML_ASSERT(hparams.n_pos_per_embd() == 1 && "seq_div() is only supported for n_pos_per_embd() == 1");
+    GGML_ASSERT(get_can_shift() && "seq_div() is not supported for this model");
 
     auto & cells = v_cells[seq_to_stream[seq_id]];
 
     if (d == 1) {
         return;
     }
+
+    GGML_ASSERT(!llama_kv_cache_uses_mrope_shift(hparams) && "seq_div() is not supported for multi-axis M-RoPE shifts");
 
     if (p0 < 0) {
         p0 = 0;
@@ -1339,13 +1346,11 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
 
 bool llama_kv_cache::get_can_shift() const {
     // Step35 uses per-layer RoPE dims; K-shift assumes a single global n_rot.
-    if (model.arch == LLM_ARCH_STEP35) {
-        return false;
-    }
-    if (hparams.n_pos_per_embd() > 1) {
-        return false;
-    }
-    return true;
+    const int n_pos_per_embd = hparams.n_pos_per_embd();
+
+    return model.arch != LLM_ARCH_STEP35 &&
+        (n_pos_per_embd <= 1 ||
+         (n_pos_per_embd == 4 && llama_kv_cache_uses_mrope_shift(hparams)));
 }
 
 uint32_t llama_kv_cache::get_size() const {
@@ -1423,6 +1428,27 @@ uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {
     }
 
     return result;
+}
+
+int64_t llama_kv_cache::get_k_shift_width(uint32_t il) const {
+    const auto & layer = layers.at(map_layer_ids.at(il));
+
+    const auto n_rot         = hparams.n_rot(il);
+    const auto n_embd_head_k = hparams.n_embd_head_k(il);
+    const auto n_embd_nope   = hparams.n_lora_kv > 0 ? n_embd_head_k - n_rot : 0;
+
+    // Quantized CPU writeback requires complete quantization rows. Some
+    // M-RoPE models rotate fewer dimensions than the TBQ/PQ block size
+    // (e.g. n_rot=64 with 128-wide cache blocks), so include the whole
+    // block and let RoPE copy the unrotated tail unchanged.
+    int64_t n_k_shift = n_rot;
+    if (ggml_is_quantized(layer.k->type)) {
+        n_k_shift = std::min<int64_t>(
+                n_embd_head_k - n_embd_nope,
+                GGML_PAD(n_rot, ggml_blck_size(layer.k->type)));
+    }
+
+    return n_k_shift;
 }
 
 ggml_tensor * llama_kv_cache::get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const {
@@ -1664,13 +1690,27 @@ void llama_kv_cache::set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ub
 void llama_kv_cache::set_input_k_shift(ggml_tensor * dst) const {
     GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
 
-    int32_t * data = (int32_t *) dst->data;
+    set_input_k_shift_data((int32_t *) dst->data);
+}
+
+void llama_kv_cache::set_input_k_shift_data(int32_t * data) const {
+    const bool is_mrope_shift = llama_kv_cache_uses_mrope_shift(hparams);
+    const int64_t n_kv = (int64_t) get_size()*n_stream;
 
     for (uint32_t s = 0; s < n_stream; ++s) {
         const auto & cells = v_cells[s];
 
         for (uint32_t i = 0; i < cells.size(); ++i) {
-            data[s*cells.size() + i] = cells.is_empty(i) ? 0 : cells.get_shift(i);
+            const int64_t idx = (int64_t) s*cells.size() + i;
+
+            if (is_mrope_shift) {
+                // M-RoPE/iM-RoPE decoder K-shift layout is [t, y, x, other] planes.
+                for (uint32_t dim = 0; dim < 4; ++dim) {
+                    data[dim*n_kv + idx] = cells.is_empty(i) ? 0 : cells.get_shift(i, dim);
+                }
+            } else {
+                data[idx] = cells.is_empty(i) ? 0 : cells.get_shift(i);
+            }
         }
     }
 }
@@ -2064,35 +2104,56 @@ ggml_tensor * llama_kv_cache::build_rope_shift(
     const auto & yarn_attn_factor = cparams.yarn_attn_factor;
 
     const auto & n_rot     = hparams.n_rot(il);
-    const auto & rope_type = hparams.rope_type == LLAMA_ROPE_TYPE_MROPE || hparams.rope_type == LLAMA_ROPE_TYPE_IMROPE
-                                // @ngxson : this is a workaround
-                                // for M-RoPE, we want to rotate the whole vector when doing KV shift
-                                // a normal RoPE should work, we just need to use the correct ordering
-                                // ref: https://github.com/ggml-org/llama.cpp/pull/13870
-                                ? LLAMA_ROPE_TYPE_NEOX
-                                : hparams.rope_type;
+    const auto & rope_type = hparams.rope_type;
+    const bool is_mrope_shift = llama_kv_cache_uses_mrope_shift(hparams);
+
+    int rope_sections[GGML_MROPE_SECTIONS] = {
+        hparams.rope_sections[0],
+        hparams.rope_sections[1],
+        hparams.rope_sections[2],
+        hparams.rope_sections[3],
+    };
+
     ggml_tensor * tmp;
 
     if (ggml_is_quantized(cur->type)) {
         // dequantize to f32 -> RoPE -> quantize back
         tmp = ggml_cast(ctx, cur, GGML_TYPE_F32);
 
-        // rotate back
-        tmp = llama_mul_mat_hadamard(ctx, tmp, rot);
+        // rotate back for TurboQuant/PolarQuant cache formats that use an
+        // auxiliary attention rotation matrix; standard quantized types such
+        // as q8_0 do not configure one.
+        if (rot) {
+            tmp = llama_mul_mat_hadamard(ctx, tmp, rot);
+        }
 
-        tmp = ggml_rope_ext(ctx, tmp,
-                shift, factors, n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
-                yarn_ext_factor, yarn_attn_factor, yarn_beta_fast, yarn_beta_slow);
+        if (is_mrope_shift) {
+            tmp = ggml_rope_multi(ctx, tmp,
+                    shift, factors, n_rot, rope_sections, rope_type, n_ctx_orig, freq_base, freq_scale,
+                    yarn_ext_factor, yarn_attn_factor, yarn_beta_fast, yarn_beta_slow);
+        } else {
+            tmp = ggml_rope_ext(ctx, tmp,
+                    shift, factors, n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
+                    yarn_ext_factor, yarn_attn_factor, yarn_beta_fast, yarn_beta_slow);
+        }
 
-        // rotate fwd
-        tmp = llama_mul_mat_hadamard(ctx, tmp, rot);
+        // rotate fwd, matching the optional inverse rotation above.
+        if (rot) {
+            tmp = llama_mul_mat_hadamard(ctx, tmp, rot);
+        }
 
         tmp = ggml_cpy(ctx, tmp, cur);
     } else {
         // we rotate only the first n_rot dimensions
-        tmp = ggml_rope_ext_inplace(ctx, cur,
-                shift, factors, n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
-                yarn_ext_factor, yarn_attn_factor, yarn_beta_fast, yarn_beta_slow);
+        if (is_mrope_shift) {
+            tmp = ggml_rope_multi_inplace(ctx, cur,
+                    shift, factors, n_rot, rope_sections, rope_type, n_ctx_orig, freq_base, freq_scale,
+                    yarn_ext_factor, yarn_attn_factor, yarn_beta_fast, yarn_beta_slow);
+        } else {
+            tmp = ggml_rope_ext_inplace(ctx, cur,
+                    shift, factors, n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
+                    yarn_ext_factor, yarn_attn_factor, yarn_beta_fast, yarn_beta_slow);
+        }
     }
 
     return tmp;
@@ -2105,7 +2166,7 @@ public:
 
     void set_input(const llama_ubatch * ubatch) override;
 
-    ggml_tensor * k_shift; // I32 [kv_size*n_stream]
+    ggml_tensor * k_shift; // I32 [kv_size*n_stream] or [4*kv_size*n_stream] for M-RoPE
 
     const llama_kv_cache * kv_self;
 };
@@ -2127,7 +2188,9 @@ ggml_cgraph * llama_kv_cache::build_graph_shift(llm_graph_result * res, llama_co
 
     auto inp = std::make_unique<llm_graph_input_k_shift>(this);
 
-    inp->k_shift = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, (int64_t) get_size()*n_stream);
+    const int64_t n_kv_shift = (int64_t) get_size()*n_stream*(llama_kv_cache_uses_mrope_shift(hparams) ? 4 : 1);
+
+    inp->k_shift = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_kv_shift);
     ggml_set_input(inp->k_shift);
 
     const auto & cparams = lctx->get_cparams();
@@ -2146,6 +2209,8 @@ ggml_cgraph * llama_kv_cache::build_graph_shift(llm_graph_result * res, llama_co
         const auto n_embd_head_k = hparams.n_embd_head_k(il);
         const auto n_embd_nope   = hparams.n_lora_kv > 0 ? n_embd_head_k - n_rot : 0;
 
+        const int64_t n_k_shift = get_k_shift_width(il);
+
         const float freq_base_l  = model.get_rope_freq_base (cparams, il);
         const float freq_scale_l = model.get_rope_freq_scale(cparams, il);
 
@@ -2153,7 +2218,7 @@ ggml_cgraph * llama_kv_cache::build_graph_shift(llm_graph_result * res, llama_co
 
         ggml_tensor * k =
             ggml_view_3d(ctx, layer.k,
-                n_rot, n_head_kv, get_size()*n_stream,
+                n_k_shift, n_head_kv, get_size()*n_stream,
                 ggml_row_size(layer.k->type, n_embd_head_k),
                 ggml_row_size(layer.k->type, n_embd_k_gqa),
                 ggml_row_size(layer.k->type, n_embd_nope));
@@ -2548,9 +2613,8 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
             }
         }
 
-        // note: apply_ubatch() rebuilds llama_kv_cell_ext from the ubatch
-        //       only ext.tok and the M-RoPE 2D position round-trip through it
-        //       see: https://github.com/ggml-org/llama.cpp/pull/16825#issuecomment-3460868350
+        // Preserve M-RoPE spatial metadata by passing ext.y/ext.x through the
+        // ubatch position planes; apply_ubatch() writes them back via ext_set().
         apply_ubatch(sinfo, ubatch);
 
         // apply_ubatch() takes the 2D position from the ubatch, and that ubatch is built with this
