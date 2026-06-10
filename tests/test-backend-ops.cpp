@@ -10718,6 +10718,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_conv_2d_dw({17, 34, 9, 1}, {3, 3, 1, 9},  GGML_TYPE_F16, 1, 0, 1, true));
     test_cases.emplace_back(new test_conv_2d_dw({32, 8, 64, 1}, {3, 3, 1, 64}, GGML_TYPE_F16, 2, 1, 1, false));
     test_cases.emplace_back(new test_conv_2d_dw({32, 8, 64, 1}, {3, 3, 1, 64}, GGML_TYPE_F16, 2, 1, 1, true));
+    // 5x5 kernels (MobileNetV3-style), dilation > 1, and batched inputs — both
+    // memory layouts. Exercises the K/stride/dilation/batch handling that the
+    // 3x3/dilation=1 cases above don't reach.
+    test_cases.emplace_back(new test_conv_2d_dw({17, 34, 9, 1}, {5, 5, 1, 9}, GGML_TYPE_F32, 1, 2, 1, false));
+    test_cases.emplace_back(new test_conv_2d_dw({17, 34, 9, 1}, {5, 5, 1, 9}, GGML_TYPE_F32, 1, 2, 1, true));
+    test_cases.emplace_back(new test_conv_2d_dw({28, 28, 40, 2}, {5, 5, 1, 40}, GGML_TYPE_F32, 2, 2, 1, false));
+    test_cases.emplace_back(new test_conv_2d_dw({28, 28, 40, 2}, {5, 5, 1, 40}, GGML_TYPE_F32, 2, 2, 1, true));
+    test_cases.emplace_back(new test_conv_2d_dw({17, 34, 9, 1}, {3, 3, 1, 9}, GGML_TYPE_F32, 1, 2, 2, false));
+    test_cases.emplace_back(new test_conv_2d_dw({17, 34, 9, 1}, {3, 3, 1, 9}, GGML_TYPE_F32, 1, 2, 2, true));
+    test_cases.emplace_back(new test_conv_2d_dw({24, 24, 16, 3}, {3, 3, 1, 16}, GGML_TYPE_F32, 1, 1, 1, false));
+    test_cases.emplace_back(new test_conv_2d_dw({24, 24, 16, 3}, {3, 3, 1, 16}, GGML_TYPE_F32, 1, 1, 1, true));
 
     // CONV_3D
     auto calc_conv_output_size_3d = [](int64_t ins, int64_t ks, int s, int p, int d) -> int64_t {
