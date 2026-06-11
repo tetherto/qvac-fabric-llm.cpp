@@ -1,0 +1,17 @@
+{
+  "benchmark": "llama-finetune-lora",
+  "models": [
+    { "hf_repo": "unsloth/Qwen3-0.6B-GGUF", "file": "Qwen3-0.6B-Q8_0.gguf" },
+    { "hf_repo": "unsloth/gemma-3-1b-it-GGUF", "file": "gemma-3-1b-it-Q8_0.gguf" },
+    { "hf_repo": "gianni-cor/bitnet_b1_58-large-TQ2_0", "file": "bitnet_b1_58-large-TQ2_0.gguf" }
+  ],
+  "builds": [
+    { "repo": "https://github.com/tetherto/qvac-fabric-llm.cpp.git", "branch": "temp-8828", "backend": "vulkan" },
+    { "repo": "https://github.com/zoq/qvac-ext-lib-llama.cpp.git", "branch": "qvac-b9341", "backend": "vulkan" }
+  ],
+  "options": {
+  },
+  "report_options": {
+    "reference": "temp-8828-vulkan"
+  }
+}

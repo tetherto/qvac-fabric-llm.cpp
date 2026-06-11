@@ -1,0 +1,16 @@
+{
+  "benchmark": "llama-mtmd-cli",
+  "models": [
+    { "hf_repo": "unsloth/Qwen3.5-0.8B-GGUF", "file": "Qwen3.5-0.8B-Q8_0.gguf", "mmproj": "mmproj-F16.gguf" },
+    { "hf_repo": "ggml-org/SmolVLM-500M-Instruct-GGUF", "file": "SmolVLM-500M-Instruct-Q8_0.gguf", "mmproj": "mmproj-SmolVLM-500M-Instruct-Q8_0.gguf" }
+  ],
+  "builds": [
+    { "repo": "https://github.com/tetherto/qvac-fabric-llm.cpp.git", "branch": "temp-8828", "backend": "vulkan" },
+    { "repo": "https://github.com/zoq/qvac-ext-lib-llama.cpp.git", "branch": "qvac-b9341", "backend": "vulkan" }
+  ],
+  "options": {
+  },
+  "report_options": {
+    "reference": "temp-8828-vulkan"
+  }
+}

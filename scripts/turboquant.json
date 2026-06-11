@@ -1,0 +1,17 @@
+{
+  "benchmark": "turboquant",
+  "models": [
+    { "hf_repo": "unsloth/Qwen3.5-4B-GGUF", "file": "Qwen3.5-4B-Q8_0.gguf" },
+    { "hf_repo": "bartowski/Mistral-7B-Instruct-v0.3-GGUF", "file": "Mistral-7B-Instruct-v0.3-Q8_0.gguf" },
+    { "hf_repo": "second-state/Meta-Llama-3.1-8B-Instruct-GGUF", "file": "Llama-3.1-8B-Instruct-Q8_0.gguf", "tokenizer": "NousResearch/Meta-Llama-3.1-8B-Instruct" }
+  ],
+  "builds": [
+    { "repo": "https://github.com/tetherto/qvac-fabric-llm.cpp.git", "branch": "temp-8828", "backend": "vulkan" },
+    { "repo": "https://github.com/zoq/qvac-ext-lib-llama.cpp.git", "branch": "qvac-b9341", "backend": "vulkan" }
+  ],
+  "options": {
+  },
+  "report_options": {
+  }
+}
+
