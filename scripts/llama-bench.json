@@ -1,0 +1,24 @@
+{
+  "benchmark": "llama-bench",
+  "models": [
+    { "hf_repo": "unsloth/Llama-3.2-1B-Instruct-GGUF", "file": "Llama-3.2-1B-Instruct-Q4_0.gguf" },
+    { "hf_repo": "unsloth/Qwen3-0.6B-GGUF", "file": "Qwen3-0.6B-Q8_0.gguf" },
+    { "hf_repo": "unsloth/Qwen3-1.7B-GGUF", "file": "Qwen3-1.7B-Q4_0.gguf" },
+    { "hf_repo": "unsloth/Qwen3-1.7B-GGUF", "file": "Qwen3-1.7B-Q8_0.gguf" },
+    { "hf_repo": "unsloth/Qwen3-4B-GGUF", "file": "Qwen3-4B-Q4_K_M.gguf" },
+    { "hf_repo": "unsloth/Qwen3-4B-GGUF", "file": "Qwen3-4B-Q8_0.gguf" },
+    { "hf_repo": "unsloth/gemma-3-4b-it-GGUF", "file": "gemma-3-4b-it-Q8_0.gguf" },
+    { "hf_repo": "unsloth/Qwen3.5-0.8B-GGUF", "file": "Qwen3.5-0.8B-Q8_0.gguf" },
+    { "hf_repo": "unsloth/Qwen3.5-2B-GGUF", "file": "Qwen3.5-2B-Q4_K_M.gguf" },
+    { "hf_repo": "gianni-cor/bitnet_b1_58-large-TQ2_0", "file": "bitnet_b1_58-large-TQ2_0.gguf" }
+  ],
+  "builds": [
+    { "repo": "https://github.com/tetherto/qvac-fabric-llm.cpp.git", "branch": "temp-8828", "backend": "vulkan" },
+    { "repo": "https://github.com/zoq/qvac-ext-lib-llama.cpp.git", "branch": "qvac-b9341", "backend": "vulkan" }
+  ],
+  "options": {
+  },
+  "report_options": {
+    "reference": "temp-8828-vulkan"
+  }
+}
