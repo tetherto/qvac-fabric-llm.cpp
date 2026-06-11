@@ -80,7 +80,14 @@ if (NOT GGML_SHARED_LIB)
         set(GGML_OPENCL_INTERFACE_LINK_LIBRARIES $<LINK_ONLY:OpenCL::OpenCL>)
     endif()
 
-    if (GGML_VULKAN)
+    # Under GGML_BACKEND_DL the Vulkan backend ships as a standalone module that
+    # is dlopen'd at runtime; the consumer links only ggml/ggml-base and never
+    # references Vulkan::Vulkan (the backend foreach below is skipped entirely
+    # when GGML_BACKEND_DL is set). Hard-requiring the Vulkan SDK at the
+    # consumer's configure time is therefore spurious for DL builds and breaks
+    # CPU-only consumers (e.g. @qvac/classification-ggml) on build hosts without
+    # a Vulkan SDK. Keep the dependency for non-DL builds, which link it directly.
+    if (GGML_VULKAN AND NOT GGML_BACKEND_DL)
         find_dependency(Vulkan)
         set(GGML_VULKAN_INTERFACE_LINK_LIBRARIES $<LINK_ONLY:Vulkan::Vulkan>)
     endif()
