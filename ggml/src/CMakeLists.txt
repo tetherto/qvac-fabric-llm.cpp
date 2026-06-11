@@ -547,14 +547,24 @@ if (GGML_CPU_ALL_VARIANTS)
             # Many of these features are optional so we build versions with popular
             # combinations and name the backends based on the version they were
             # first released with
+            # qvac: SVE/SVE2 CPU-variant kernels are numerically broken on real
+            # linux-arm64 hardware (Graviton3/Neoverse-V1) — vla/pi05 integration
+            # diverges from the PyTorch reference (cos ~0.77 vs ~0.999) only when
+            # an SVE-enabled variant is runtime-selected; the same model on a
+            # non-SVE variant matches at ~0.999. Strip *only* SVE/SVE2 here (keep
+            # DOTPROD/FP16/i8mm and SME, which are not implicated). armv9.2_1 gets
+            # explicit NOSVE because ARMv9-A mandates SVE2, so -march=armv9.2-a+sme
+            # would otherwise re-enable SVE code paths even with SVE off the
+            # feature list (mirrors the apple_m4 NOSVE+SME variant). armv8.6_1
+            # needs no NOSVE — ARMv8 does not imply SVE. Variants that collapse to
+            # an already-listed feature set after the strip are dropped
+            # (armv8.2_3->8.2_2, armv8.6_2->8.6_1, armv9.2_2->9.2_1).
+            # Android / Apple / other platforms are intentionally untouched.
             ggml_add_cpu_backend_variant(armv8.0_1)
             ggml_add_cpu_backend_variant(armv8.2_1    DOTPROD)
             ggml_add_cpu_backend_variant(armv8.2_2    DOTPROD FP16_VECTOR_ARITHMETIC)
-            ggml_add_cpu_backend_variant(armv8.2_3    DOTPROD FP16_VECTOR_ARITHMETIC SVE)
-            ggml_add_cpu_backend_variant(armv8.6_1    DOTPROD FP16_VECTOR_ARITHMETIC SVE MATMUL_INT8)
-            ggml_add_cpu_backend_variant(armv8.6_2    DOTPROD FP16_VECTOR_ARITHMETIC SVE MATMUL_INT8 SVE2)
-            ggml_add_cpu_backend_variant(armv9.2_1    DOTPROD FP16_VECTOR_ARITHMETIC SVE MATMUL_INT8 SME)
-            ggml_add_cpu_backend_variant(armv9.2_2    DOTPROD FP16_VECTOR_ARITHMETIC SVE MATMUL_INT8 SVE2 SME)
+            ggml_add_cpu_backend_variant(armv8.6_1    DOTPROD FP16_VECTOR_ARITHMETIC MATMUL_INT8)
+            ggml_add_cpu_backend_variant(armv9.2_1    DOTPROD FP16_VECTOR_ARITHMETIC MATMUL_INT8 NOSVE SME)
         elseif (CMAKE_SYSTEM_NAME MATCHES "Android")
             # Android-specific backends with SoC-compatible feature sets
             ggml_add_cpu_backend_variant(android_armv8.0_1)
