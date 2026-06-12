@@ -232,9 +232,14 @@ void * ggml_vk_host_malloc(size_t size) {
         VMA_ALLOCATION_CREATE_MAPPED_BIT;
     alloc_info.requiredFlags = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
 
+    // host buffer type advertises minMemoryMapAlignment; make the mapped ptr honour it
+    // so the tallocr base-align (ggml-alloc.c:71) consumes no unreserved slack
+    // This issue is upstream, at least until b9518. And it is triggered by VMA
+    // and possibility of buffer misalignment.
+    const size_t host_align = std::max<size_t>(TENSOR_ALIGNMENT, dev0->properties.limits.minMemoryMapAlignment);
     vk_buffer buf;
     try {
-        buf = ggml_vk_create_buffer_aligned(dev0, buffer_info, alloc_info, TENSOR_ALIGNMENT);
+        buf = ggml_vk_create_buffer_aligned(dev0, buffer_info, alloc_info, host_align);
     } catch (vk::SystemError& e) {
         GGML_LOG_WARN("ggml_vulkan: Failed to allocate pinned memory (%s)\n", e.what());
         return nullptr;
