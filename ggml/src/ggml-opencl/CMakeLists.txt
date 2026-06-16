@@ -297,6 +297,7 @@ set(GGML_OPENCL_KERNELS
     mul
     neg
     norm
+    pool_2d
     relu
     l2_norm
     rms_norm

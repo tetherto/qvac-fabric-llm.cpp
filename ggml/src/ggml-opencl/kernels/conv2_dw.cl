@@ -1,5 +1,8 @@
 #pragma OPENCL EXTENSION cl_khr_fp16 : enable
 
+// All nb* are element strides (nb / type size), so the kernels are layout-agnostic
+// and handle both WHCN and CWHN (channel-contiguous) depthwise conv layouts.
+
 kernel void kernel_conv2d_dw_f32_f32(
         global const float * weights,
         long                 weights_offset,
@@ -21,11 +24,14 @@ kernel void kernel_conv2d_dw_f32_f32(
         int p1,
         int d0,
         int d1,
+        long nb00,
         long nb01,
         long nb03,
+        long nb10,
         long nb11,
         long nb12,
         long nb13,
+        long nb0,
         long nb1,
         long nb2,
         long nb3
@@ -59,13 +65,13 @@ kernel void kernel_conv2d_dw_f32_f32(
             if (iw < 0 || iw >= W) {
                 continue;
             }
-            const long weight_idx = kw + kh * nb01 + c * nb03;
-            const long input_idx = iw + ih * nb11 + c * nb12 + n * nb13;
+            const long weight_idx = kw * nb00 + kh * nb01 + c * nb03;
+            const long input_idx = iw * nb10 + ih * nb11 + c * nb12 + n * nb13;
             sum += weights[weight_idx] * input[input_idx];
         }
     }
 
-    const long output_idx = ow + oh * nb1 + c * nb2 + n * nb3;
+    const long output_idx = ow * nb0 + oh * nb1 + c * nb2 + n * nb3;
     output[output_idx] = sum;
 }
 
@@ -90,11 +96,14 @@ kernel void kernel_conv2d_dwf16_f32(
         int p1,
         int d0,
         int d1,
+        long nb00,
         long nb01,
         long nb03,
+        long nb10,
         long nb11,
         long nb12,
         long nb13,
+        long nb0,
         long nb1,
         long nb2,
         long nb3
@@ -128,12 +137,12 @@ kernel void kernel_conv2d_dwf16_f32(
             if (iw < 0 || iw >= W) {
                 continue;
             }
-            const long weight_idx = kw + kh * nb01 + c * nb03;
-            const long input_idx = iw + ih * nb11 + c * nb12 + n * nb13;
+            const long weight_idx = kw * nb00 + kh * nb01 + c * nb03;
+            const long input_idx = iw * nb10 + ih * nb11 + c * nb12 + n * nb13;
             sum += (float) weights[weight_idx] * input[input_idx];
         }
     }
 
-    const long output_idx = ow + oh * nb1 + c * nb2 + n * nb3;
+    const long output_idx = ow * nb0 + oh * nb1 + c * nb2 + n * nb3;
     output[output_idx] = sum;
 }
