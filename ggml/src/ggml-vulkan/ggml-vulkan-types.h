@@ -961,6 +961,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_leaky_relu[2];
     vk_pipeline pipeline_silu_back_f32;
     vk_pipeline pipeline_geglu_back_f32;
+    vk_pipeline pipeline_sigmoid_back_f32;
     vk_pipeline pipeline_diag_mask_inf_f32;
     vk_pipeline pipeline_cross_entropy_loss_masked_back_f32;
     vk_pipeline pipeline_count_equal_masked_i32;
