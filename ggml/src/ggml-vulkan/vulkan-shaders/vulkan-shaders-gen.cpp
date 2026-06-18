@@ -1328,6 +1328,7 @@ void process_shaders() {
     string_to_spv("geglu_quick_f32","geglu_quick.comp", {{"A_TYPE", "float"},       {"D_TYPE", "float"}});
 
     string_to_spv("silu_back_f32",  "silu_back.comp",   {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}});
+    string_to_spv("gelu_back_f32",  "gelu_back.comp",   {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}});
     string_to_spv("geglu_back_f32", "geglu_back.comp",  {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}});
     string_to_spv("sigmoid_back_f32", "sigmoid_back.comp", {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}});
 
