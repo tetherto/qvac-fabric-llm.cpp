@@ -167,9 +167,9 @@ float tq_wg_add(float x) {
 void quantize(uint dst_idx, uint src_idx)
 {
 #if defined(DATA_A_ANY_TBQ3_OR_PQ3_0)
-    #define TBQ_CODEBOOK TBQ4_CB
-#elif defined(DATA_A_ANY_TBQ4_OR_PQ4_0)
     #define TBQ_CODEBOOK TBQ3_CB
+#elif defined(DATA_A_ANY_TBQ4_OR_PQ4_0)
+    #define TBQ_CODEBOOK TBQ4_CB
 #endif
 
   const uint BK = QUANT_K;
