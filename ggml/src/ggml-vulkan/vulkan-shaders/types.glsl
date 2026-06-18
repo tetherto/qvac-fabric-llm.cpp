@@ -1824,6 +1824,8 @@ struct block_iq4_nl_packed16
 #define A_TYPE_PACKED16 block_iq4_nl_packed16
 #endif
 
+#include "turbo-quant/types.glsl"
+
 #define QUANT_K_MXFP4 32
 #define QUANT_R_MXFP4 2
 

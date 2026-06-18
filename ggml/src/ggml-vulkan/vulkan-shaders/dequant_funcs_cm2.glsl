@@ -1412,6 +1412,8 @@ f16vec4 dequantFuncNVFP4_v(const in decodeBufNVFP4 bl, const in uint blockCoords
 }
 #endif
 
+#include "turbo-quant/dequant_funcs_cm2.glsl"
+
 #if defined(DATA_A_Q1_0)
 #define dequantFuncA dequantFuncQ1_0
 #define dequantFuncA_v dequantFuncQ1_0_v
@@ -1490,6 +1492,14 @@ f16vec4 dequantFuncNVFP4_v(const in decodeBufNVFP4 bl, const in uint blockCoords
 #elif defined(DATA_A_NVFP4)
 #define dequantFuncA dequantFuncNVFP4
 #define dequantFuncA_v dequantFuncNVFP4_v
+#elif defined(DATA_A_TBQ3_0) || defined(DATA_A_TBQ3_0_64)
+#define dequantFuncA dequantFuncTBQ3_0
+#elif defined(DATA_A_TBQ4_0) || defined(DATA_A_TBQ4_0_64)
+#define dequantFuncA dequantFuncTBQ4_0
+#elif defined(DATA_A_PQ3_0) || defined(DATA_A_PQ3_0_64)
+#define dequantFuncA dequantFuncPQ3_0
+#elif defined(DATA_A_PQ4_0) || defined(DATA_A_PQ4_0_64)
+#define dequantFuncA dequantFuncPQ4_0
 #elif defined(DATA_A_F32)
 #define dequantFuncA dequantFuncF32
 #endif
