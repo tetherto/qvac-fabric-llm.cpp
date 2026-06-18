@@ -1,0 +1,63 @@
+#version 450
+
+#include "generic_head.glsl"
+#include "types.glsl"
+
+#extension GL_EXT_control_flow_attributes : enable
+#define BLOCK_SIZE 512
+
+layout(local_size_x = BLOCK_SIZE, local_size_y = 1, local_size_z = 1) in;
+
+layout (binding = 0) readonly buffer G {A_TYPE data_a[];};
+layout (binding = 1) readonly buffer X {B_TYPE data_b[];};
+layout (binding = 2) writeonly buffer D {D_TYPE data_d[];};
+
+shared FLOAT_TYPE sum_xx[BLOCK_SIZE];
+shared FLOAT_TYPE sum_xg[BLOCK_SIZE];
+
+void main() {
+    const uint row = gl_WorkGroupID.z * 262144 + gl_WorkGroupID.y * 512 + gl_WorkGroupID.x;
+    const uint tid = gl_LocalInvocationID.x;
+
+    // Derivative of x[i]/max(norm(x), eps), with norm(x) = sqrt(dot(x,x)):
+    //   dx = scale*g - scale^3 * x * dot(x,g)   (norm > eps)
+    //   dx = scale*g                            (norm <= eps, scale is constant)
+
+    sum_xx[tid] = FLOAT_TYPE(0.0f);
+    sum_xg[tid] = FLOAT_TYPE(0.0f);
+
+    [[unroll]] for (uint col = tid; col < p.KX; col += BLOCK_SIZE) {
+        const FLOAT_TYPE gi = FLOAT_TYPE(data_a[row*p.KX + col]);
+        const FLOAT_TYPE xi = FLOAT_TYPE(data_b[row*p.KX + col]);
+        sum_xx[tid] += xi * xi;
+        sum_xg[tid] += xi * gi;
+    }
+
+    barrier();
+    [[unroll]] for (int s = BLOCK_SIZE / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            sum_xx[tid] += sum_xx[tid + s];
+            sum_xg[tid] += sum_xg[tid + s];
+        }
+        barrier();
+    }
+
+    const FLOAT_TYPE eps  = FLOAT_TYPE(p.param1);
+    const FLOAT_TYPE norm = sqrt(sum_xx[0]);
+
+    FLOAT_TYPE scale_g;
+    FLOAT_TYPE scale_x;
+    if (norm > eps) {
+        scale_g = FLOAT_TYPE(1.0f) / norm;
+        scale_x = -scale_g * scale_g * scale_g * sum_xg[0];
+    } else {
+        scale_g = FLOAT_TYPE(1.0f) / eps;
+        scale_x = FLOAT_TYPE(0.0f);
+    }
+
+    [[unroll]] for (uint col = tid; col < p.KX; col += BLOCK_SIZE) {
+        data_d[row*p.KX + col] = D_TYPE(
+            scale_g * FLOAT_TYPE(data_a[row*p.KX + col]) +
+            scale_x * FLOAT_TYPE(data_b[row*p.KX + col]));
+    }
+}

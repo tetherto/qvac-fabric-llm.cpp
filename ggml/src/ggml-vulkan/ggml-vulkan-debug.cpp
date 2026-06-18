@@ -1048,6 +1048,9 @@ void ggml_vk_check_results_0(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph
         } else if (tensor->op == GGML_OP_L2_NORM) {
             const float eps = ((float *) tensor->op_params)[0];
             tensor_clone = ggml_l2_norm(ggml_ctx, src_clone[0], eps);
+        } else if (tensor->op == GGML_OP_L2_NORM_BACK) {
+            const float eps = ((float *) tensor->op_params)[0];
+            tensor_clone = ggml_l2_norm_back(ggml_ctx, src_clone[0], src_clone[1], eps);
         } else if (tensor->op == GGML_OP_SOFT_MAX) {
             if (tensor->src[1] != nullptr) {
                 const float * params = (const float *)tensor->op_params;
