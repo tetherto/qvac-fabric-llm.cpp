@@ -162,6 +162,21 @@ struct mtmd_image_preprocessor_glm5v : mtmd_image_preprocessor {
     mtmd_image_preproc_out preprocess(const clip_image_u8 & img) const override;
 };
 
+// Qwen3VL tiling preprocessor: splits image into an NxM grid of equal-size tiles
+// (tile size = hparams.image_size), packed row-major into the batch. Falls back to
+// dyn_size when the image fits in one tile.
+struct mtmd_image_preprocessor_qwen3vl : mtmd_image_preprocessor {
+    int max_tiles;
+
+    mtmd_image_preprocessor_qwen3vl(const clip_ctx * ctx)
+        : mtmd_image_preprocessor(ctx),
+          max_tiles(hparams.preproc_max_tiles > 0 ? hparams.preproc_max_tiles : 4) {
+        GGML_ASSERT(clip_get_tile_mode(ctx) != CLIP_IMAGE_TILE_MODE_DISABLED);
+    }
+    mtmd_image_preproc_out preprocess(const clip_image_u8 & img) const override;
+    mtmd_image_preproc_out preprocess_video_frame(const clip_image_u8 & img) const override;
+};
+
 // similar to mtmd_image_preprocessor_dyn_size, but cap the longest edge at hparams.image_longest_edge, while preserving aspect ratio
 struct mtmd_image_preprocessor_longest_edge : mtmd_image_preprocessor {
     mtmd_image_preprocessor_longest_edge(const clip_ctx * ctx) : mtmd_image_preprocessor(ctx) {}

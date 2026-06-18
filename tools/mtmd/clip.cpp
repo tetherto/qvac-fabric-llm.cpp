@@ -171,6 +171,7 @@ struct clip_ctx {
     bool is_allocated = false;
 
     bool debug_output_embeddings = false;
+    clip_image_tile_mode tile_mode = CLIP_IMAGE_TILE_MODE_BATCHED;
 
     // for measuring memory usage
     bool no_alloc = false;
@@ -258,6 +259,11 @@ struct clip_ctx {
         }
 
         debug_output_embeddings = std::getenv("MTMD_DEBUG_EMBEDDINGS") != nullptr;
+        if (ctx_params.image_tile_mode < 0 || ctx_params.image_tile_mode > 2) {
+            GGML_ABORT("invalid image_tile_mode %d; valid: 0=batched, 1=sequential, 2=disabled",
+                       ctx_params.image_tile_mode);
+        }
+        tile_mode = static_cast<clip_image_tile_mode>(ctx_params.image_tile_mode);
     }
 
     ~clip_ctx() {
@@ -1014,6 +1020,7 @@ ggml_tensor * clip_graph::build_patch_merge_permute(ggml_tensor * cur, int scale
 
 static std::unique_ptr<clip_graph> clip_get_graph_builder(clip_ctx * ctx, const clip_image_f32_batch & imgs,
                                                             const clip_encode_params * params = nullptr) {
+    GGML_ASSERT(!imgs.entries.empty());
     const clip_image_f32 & img = imgs.entries[0];
     std::unique_ptr<clip_graph> builder;
 
@@ -1929,6 +1936,8 @@ struct clip_model_loader {
                         hparams.image_round_half_even = true; // smart_resize uses Python round()
                         get_u32(KEY_SPATIAL_MERGE_SIZE, hparams.n_merge, false);
                         get_u32(KEY_WIN_ATTN_PATTERN, hparams.n_wa_pattern, model.proj_type == PROJECTOR_TYPE_QWEN25VL); // only 2.5 requires it
+                        // optional multi-tile cap; absent in GGUF means it stays 0 and the qwen3vl preprocessor falls back to 4
+                        get_u32(KEY_PREPROC_MAX_TILES, hparams.preproc_max_tiles, false);
                         // ref: https://huggingface.co/Qwen/Qwen2.5-VL-7B-Instruct/blob/main/preprocessor_config.json
                         hparams.set_limit_image_tokens(8, 4096);
                         // optional limits of the model, the custom values take precedence
@@ -1938,7 +1947,7 @@ struct clip_model_loader {
                         if (hparams.custom_image_max_tokens <= 0) {
                             get_u32(KEY_IMAGE_MAX_PIXELS, hparams.image_max_pixels, false);
                         }
-                        hparams.set_warmup_n_tokens(46*46); // avoid OOM on warmup
+                        hparams.warmup_image_size = hparams.image_size; // warmup at actual tile size to match inference graph shape
                         const int warn_min_pixels = 1024 * hparams.n_merge * hparams.n_merge * hparams.patch_size * hparams.patch_size;
                         if (hparams.image_min_pixels < warn_min_pixels) {
                             LOG_WRN("%s: Qwen-VL models require at minimum 1024 image tokens to function correctly on grounding tasks\n", __func__);
@@ -5319,10 +5328,70 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
     const clip_image_f32_batch & imgs = *params->imgs;
     int n_batch_cur = imgs.entries.size();
 
-    // [QWEN_VIDEO] for video models, the batch dimension is used as temporal dimension for merged frames
+    if (n_batch_cur == 0) {
+        return false;
+    }
+
+    // [QWEN_VIDEO] for video models, the batch dimension is used as temporal dimension for merged frames.
     if (!ctx->support_batch && n_batch_cur > clip_model_n_temporal_merge(ctx)) {
         LOG_ERR("%s: batch size %d exceeds maximum supported batch/temporal-merge size %d\n", __func__, n_batch_cur, clip_model_n_temporal_merge(ctx));
         return false;
+    }
+
+    LOG_INF("%s: encoding %d tile(s), grid=%dx%d, tile_size=%dx%d\n", __func__,
+            n_batch_cur,
+            imgs.grid_x, imgs.grid_y,
+            imgs.entries[0].nx(), imgs.entries[0].ny());
+
+    // Validate that all tiles share the same dimensions; logs an error and returns false if not.
+    auto validate_tile_sizes = [&](const char * tag) -> bool {
+        const int tile_nx = imgs.entries[0].nx();
+        const int tile_ny = imgs.entries[0].ny();
+        for (int b = 1; b < n_batch_cur; b++) {
+            if (imgs.entries[b].nx() != tile_nx || imgs.entries[b].ny() != tile_ny) {
+                LOG_ERR("%s: %s tile %d size %dx%d != expected %dx%d; all tiles must be the same size\n",
+                        __func__, tag, b, imgs.entries[b].nx(), imgs.entries[b].ny(), tile_nx, tile_ny);
+                return false;
+            }
+        }
+        return true;
+    };
+
+    // Encode tiles one by one. Used for SEQUENTIAL tile mode and as OOM fallback from BATCHED mode.
+    auto do_encode_sequential = [&]() -> bool {
+        if (!validate_tile_sizes("sequential mode")) { return false; }
+        const int n_tokens_per_tile = clip_n_output_tokens(ctx, &imgs.entries[0]);
+        const int out_embd          = clip_n_mmproj_embd(ctx);
+        const size_t tile_size      = (size_t)n_tokens_per_tile * out_embd;
+        // reused across iterations: same-size tiles, so the buffers are allocated once
+        clip_image_f32_batch single;
+        single.entries.resize(1);
+        single.grid_x = 1;
+        single.grid_y = 1;
+        std::vector<float> single_out;
+        const bool has_out = params->out_embd != nullptr && !params->out_embd->empty();
+        for (int b = 0; b < n_batch_cur; b++) {
+            single.entries[0] = imgs.entries[b];
+            if (has_out) {
+                single_out.resize(tile_size);
+            }
+            bool ok = clip_image_batch_encode(ctx, params->n_threads, &single, single_out);
+            if (!ok) {
+                return false;
+            }
+            if (has_out) {
+                auto & out_batch_embd = *params->out_embd;
+                const size_t offset = (size_t)b * tile_size;
+                GGML_ASSERT(offset + single_out.size() <= out_batch_embd.size());
+                std::copy(single_out.begin(), single_out.end(), out_batch_embd.begin() + offset);
+            }
+        }
+        return true;
+    };
+
+    // Explicit sequential mode.
+    if (ctx->proj_type() == PROJECTOR_TYPE_QWEN3VL && n_batch_cur > 1 && !imgs.is_video && ctx->tile_mode == CLIP_IMAGE_TILE_MODE_SEQUENTIAL) {
+        return do_encode_sequential();
     }
 
     // if buffers are not allocated, we need to do a warmup run to allocate them
@@ -5344,6 +5413,11 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
     ggml_tensor * embeddings = params->out_embd ? ggml_graph_node(gf, -1) : nullptr;
 
     if (!ggml_backend_sched_alloc_graph(ctx->sched.get(), gf)) {
+        if (ctx->proj_type() == PROJECTOR_TYPE_QWEN3VL && n_batch_cur > 1 && !imgs.is_video) {
+            // Allocation failed (OOM), so fall back to sequential.
+            LOG_WRN("%s: batched graph alloc failed (OOM), retrying with sequential encoding\n", __func__);
+            return do_encode_sequential();
+        }
         LOG_ERR("%s: failed to allocate compute graph\n", __func__);
         return false;
     }
@@ -5465,7 +5539,7 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
     if (!imgs.is_audio) {
         size_t nelem = 0;
         for (const auto & img : imgs.entries) {
-            nelem += img.nx() * img.ny() * 3;
+            nelem += (size_t)img.nx() * (size_t)img.ny() * 3;
         }
         std::vector<float> inp_raw(nelem);
 
@@ -5480,25 +5554,23 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
         // └─────┘ │
         //   ──────┘ x B
 
-        // IMPORTANT: [QWEN_VIDEO] the batch dim is currently used for temporal dim in Qwen-VL models
-        // All entries must have the same spatial size (enforced by can_batch_with() during merging)
-        {
-            const int nx = imgs.entries[0].nx();
-            const int ny = imgs.entries[0].ny();
-            const int n  = nx * ny;
-
-            for (int b = 0; b < n_batch_cur; b++) {
-                LOG_DBG("%s: copying image %d/%d to input buffer (nx=%d, ny=%d)\n", __func__, b+1, n_batch_cur, nx, ny);
-                const auto & buf = imgs.entries[b].get_ro_buf();
-                float * batch_entry = inp_raw.data() + b * (3*n);
-                for (int y = 0; y < ny; y++) {
-                    for (int x = 0; x < nx; x++) {
-                        size_t base_src = 3*(y * nx + x);
-                        size_t base_dst =    y * nx + x;
-                        batch_entry[      base_dst] = buf[base_src    ];
-                        batch_entry[1*n + base_dst] = buf[base_src + 1];
-                        batch_entry[2*n + base_dst] = buf[base_src + 2];
-                    }
+        // Layout: [nx, ny, 3, n_batch_cur] - channel-first per tile, tiles packed along last dim.
+        // All tiles must be the same size (ensured by the Qwen3VL tiling preprocessor).
+        GGML_ASSERT(n_batch_cur > 0);
+        if (!validate_tile_sizes("batched")) { return false; }
+        for (int b = 0; b < n_batch_cur; b++) {
+            const int    nx = imgs.entries[b].nx();
+            const int    ny = imgs.entries[b].ny();
+            const size_t n  = (size_t)nx * (size_t)ny;
+            const auto & buf = imgs.entries[b].get_ro_buf();
+            float * tile_entry = inp_raw.data() + (size_t)b * 3 * n;
+            for (int y = 0; y < ny; y++) {
+                for (int x = 0; x < nx; x++) {
+                    size_t base_src = 3 * (y * nx + x);
+                    size_t base_dst =      y * nx + x;
+                    tile_entry[      base_dst] = buf[base_src    ];
+                    tile_entry[1*n + base_dst] = buf[base_src + 1];
+                    tile_entry[2*n + base_dst] = buf[base_src + 2];
                 }
             }
         }
@@ -5779,7 +5851,6 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
                 set_input_i32("positions", positions);
             } break;
         case PROJECTOR_TYPE_QWEN2VL:
-        case PROJECTOR_TYPE_QWEN3VL:
         case PROJECTOR_TYPE_LING3VL:
         case PROJECTOR_TYPE_GLM4V:
         case PROJECTOR_TYPE_GLM5V:
@@ -5799,6 +5870,41 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
                                 positions[    num_patches + ptr] = x;
                                 positions[2 * num_patches + ptr] = y;
                                 positions[3 * num_patches + ptr] = x;
+                                ptr++;
+                            }
+                        }
+                    }
+                }
+
+                set_input_i32("positions", positions);
+            } break;
+        case PROJECTOR_TYPE_QWEN3VL:
+            {
+                // Per-tile M-RoPE positions use *local* patch coordinates (origin at each tile's
+                // top-left). Attention is computed per-tile and RoPE scores depend only on the
+                // relative position pos_i - pos_j, so any per-tile absolute offset would cancel
+                // exactly and have no effect on the encoder. Every tile therefore gets the same
+                // local-coordinate block. Absolute tile placement reaches the LM via decoder
+                // positions (mtmd_image_tokens_get_decoder_pos in mtmd.cpp), not here.
+                const int merge_ratio  = hparams.n_merge;
+                GGML_ASSERT(merge_ratio > 0);
+                const int pw           = image_size_width  / patch_size; // per-tile width in patches
+                const int ph           = image_size_height / patch_size; // per-tile height in patches
+                GGML_ASSERT(pw % merge_ratio == 0 && ph % merge_ratio == 0 &&
+                            "tile dimensions must be divisible by n_merge");
+                const int n_pos_tile   = pw * ph; // raw patches per tile == n_patches (graph sequence length)
+                // single local-coordinate block [y,x,y,x]; the graph passes the same
+                // positions tensor to every tile's rope (see clip_graph_qwen3vl)
+                std::vector<int32_t> positions((size_t)n_pos_tile * 4);
+                int ptr = 0;
+                for (int y = 0; y < ph; y += merge_ratio) {
+                    for (int x = 0; x < pw; x += merge_ratio) {
+                        for (int dy = 0; dy < merge_ratio; dy++) {
+                            for (int dx = 0; dx < merge_ratio; dx++) {
+                                positions[ptr]                          = y + dy;
+                                positions[(size_t)n_pos_tile + ptr]     = x + dx;
+                                positions[(size_t)2 * n_pos_tile + ptr] = y + dy;
+                                positions[(size_t)3 * n_pos_tile + ptr] = x + dx;
                                 ptr++;
                             }
                         }
@@ -6792,8 +6898,8 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
                 const int n           = image_side / window_side;
                 const int new_side    = n * query_side;
 
-                // Builds the raster→window permutation indices for a
-                // (side, side) grid split into (n × n) windows of (win × win)
+                // Builds the raster->window permutation indices for a
+                // (side, side) grid split into (n x n) windows of (win x win)
                 // tokens each.  dst[w * win*win + p] = source raster index.
                 auto make_win_idx = [](int side, int win) {
                     const int nn = side / win;
@@ -6884,11 +6990,11 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
     }
 
     if (embeddings != nullptr) {
-        // sanity check (assuming that all images in batch have the same number of tokens, so we only check the first one)
+        // sanity check: ne[1] = tokens per tile, ne[2] = batch size (1 for non-batched models)
         const int n_tokens_out = embeddings->ne[1];
         const int expected_n_tokens_out = clip_n_output_tokens(ctx, &imgs.entries[0]);
         if (n_tokens_out != expected_n_tokens_out) {
-            LOG_ERR("%s: expected output %d tokens, got %d\n", __func__, expected_n_tokens_out, n_tokens_out);
+            LOG_ERR("%s: expected output %d tokens (per tile), got %d\n", __func__, expected_n_tokens_out, n_tokens_out);
             GGML_ABORT("Invalid number of output tokens");
         }
 
@@ -7004,11 +7110,12 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
     if (ctx->debug_output_embeddings && embeddings != nullptr) {
         const int64_t n_embd = embeddings->ne[0];
         const int64_t n_tokens = embeddings->ne[1];
+        const int64_t n_tiles  = embeddings->ne[2];
         std::vector<float> emb_data(ggml_nelements(embeddings));
         ggml_backend_tensor_get(embeddings, emb_data.data(), 0, ggml_nbytes(embeddings));
 
         LOG_INF("\n=== MTMD_DEBUG_EMBEDDINGS ===\n");
-        LOG_INF("Shape: [%lld, %lld]\n", (long long)n_embd, (long long)n_tokens);
+        LOG_INF("Shape: [%lld, %lld, %lld]\n", (long long)n_embd, (long long)n_tokens, (long long)n_tiles);
 
         // TEMP debugging (parity validation), will be removed before merge
         // when the env var holds a path, dump the raw data: [int32 n_tokens][int32 n_embd][f32 data]
@@ -7232,6 +7339,10 @@ std::map<ggml_backend_dev_t, size_t> clip_get_mem_usage(const struct clip_ctx * 
         result[dev] += size;
     }
     return result;
+}
+
+clip_image_tile_mode clip_get_tile_mode(const struct clip_ctx * ctx) {
+    return ctx->tile_mode;
 }
 
 //

@@ -49,6 +49,12 @@ enum clip_flash_attn_type {
     CLIP_FLASH_ATTN_TYPE_ENABLED  = 1,
 };
 
+enum clip_image_tile_mode {
+    CLIP_IMAGE_TILE_MODE_BATCHED    = 0,
+    CLIP_IMAGE_TILE_MODE_SEQUENTIAL = 1,
+    CLIP_IMAGE_TILE_MODE_DISABLED   = 2,
+};
+
 struct clip_context_params {
     bool use_gpu;
     ggml_backend_dev_t device;
@@ -63,6 +69,7 @@ struct clip_context_params {
     mtmd_progress_callback progress_callback;
     void * progress_callback_user_data;
     const char * backend_device; // optional, if null will use env var or default GPU backend
+    int image_tile_mode; // 0=batched (default), 1=sequential, 2=disabled
 };
 
 struct clip_init_result {

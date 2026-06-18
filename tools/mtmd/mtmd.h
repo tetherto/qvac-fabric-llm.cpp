@@ -133,6 +133,9 @@ struct mtmd_context_params {
     mtmd_progress_callback progress_callback;
     void * progress_callback_user_data;
     const char * backend_device; // optional GPU backend name (e.g. "CUDA", "Metal", "Vulkan"), if null will use env var or default
+
+    // tile encoding mode for multi-tile vision models (Qwen3VL): 0=batched (default), 1=sequential, 2=disabled
+    int image_tile_mode;
 };
 
 MTMD_API const char * mtmd_default_marker(void);

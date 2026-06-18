@@ -423,6 +423,13 @@ struct common_params_diffusion {
     bool    add_gumbel_noise = false; // add gumbel noise to the logits if temp > 0.0
 };
 
+// tile encoding mode for multi-tile vision models (e.g. Qwen3VL)
+enum common_image_tile_mode {
+    COMMON_IMAGE_TILE_MODE_BATCHED    = 0, // all tiles in one forward pass (default)
+    COMMON_IMAGE_TILE_MODE_SEQUENTIAL = 1, // encode tiles one-by-one (benchmarking)
+    COMMON_IMAGE_TILE_MODE_DISABLED   = 2, // tiling disabled - single tile only
+};
+
 // reasoning API response format (not to be confused as chat template's reasoning format)
 // only used by server
 enum common_reasoning_format {
@@ -611,6 +618,7 @@ struct common_params {
     std::vector<std::string> image;             // path to image file(s) ; TODO: change the name to "media"
     int image_min_tokens = -1;
     int image_max_tokens = -1;
+    common_image_tile_mode image_tile_mode = COMMON_IMAGE_TILE_MODE_BATCHED;
     int mtmd_batch_max_tokens = 1024;
 
     // for video input

@@ -5,15 +5,36 @@ ggml_cgraph * clip_graph_qwen3vl::build() {
     GGML_ASSERT(model.position_embeddings != nullptr);
     GGML_ASSERT(model.class_embedding == nullptr);
 
-    const int batch_size       = 1;
-    const int n_pos            = n_patches;
-    const int num_position_ids = n_pos * 4; // m-rope requires 4 dim per position
+    // [QWEN_VIDEO] a video batch is a pair of frames merged along the temporal axis
+    // into a single output tile; otherwise the batch holds same-size image tiles.
+    const bool is_video        = img_batch != nullptr && img_batch->is_video;
+    const int batch_size       = is_video ? 1 : n_batch;
+    // batch_size > 1 encodes multiple same-size tiles in a single forward pass.
+    // QKV/FFN run fully batched; attention is per-tile (each tile attends only to its own tokens).
+    // M-RoPE offsets are mathematically inert in the vision encoder: relative attention cancels
+    // any per-tile absolute offset. Tile arrangement reaches the LM via decoder positions in mtmd.cpp.
+    const int n_pos            = n_patches;   // patches per tile
+    // M-RoPE: 4 coords per patch. Positions are local tile coordinates and
+    // identical for every tile, so all tiles share one positions block.
+    const int num_position_ids = n_pos * 4;
 
     norm_type norm_t = NORM_TYPE_NORMAL;
 
     int mrope_sections[4] = {d_head/4, d_head/4, d_head/4, d_head/4};
 
-    ggml_tensor * inp = build_inp_temporal_merge();
+    ggml_tensor * inp = nullptr;
+    if (is_video) {
+        inp = build_inp_temporal_merge();
+    } else {
+        // still image tiles: both temporal kernels see the same frame, per tile
+        ggml_tensor * inp_raw = build_inp_raw();
+        inp = ggml_add(ctx0,
+                ggml_conv_2d(ctx0, model.patch_embeddings_0, inp_raw, patch_size, patch_size, 0, 0, 1, 1),
+                ggml_conv_2d(ctx0, model.patch_embeddings_1, inp_raw, patch_size, patch_size, 0, 0, 1, 1));
+
+        GGML_ASSERT(img.nx() % (patch_size * 2) == 0);
+        GGML_ASSERT(img.ny() % (patch_size * 2) == 0);
+    }
 
     // spatial merge
     {
@@ -36,18 +57,19 @@ ggml_cgraph * clip_graph_qwen3vl::build() {
         cb(inp, "patch_bias", -1);
     }
 
-    // calculate absolute position embedding and apply
+    // absolute position embedding: same local positions for every tile, broadcast over batch_size
     ggml_tensor * learned_pos_embd = resize_position_embeddings(GGML_SCALE_MODE_BILINEAR | GGML_SCALE_FLAG_ALIGN_CORNERS);
     learned_pos_embd = ggml_cont_4d(
         ctx0, learned_pos_embd,
-        n_embd * 2, n_patches_x / 2, n_patches_y, batch_size);
+        n_embd * 2, n_patches_x / 2, n_patches_y, 1);
     learned_pos_embd = ggml_reshape_4d(
         ctx0, learned_pos_embd,
-        n_embd * 2, n_patches_x / 2, 2, batch_size * (n_patches_y / 2));
+        n_embd * 2, n_patches_x / 2, 2, n_patches_y / 2);
     learned_pos_embd = ggml_permute(ctx0, learned_pos_embd, 0, 2, 1, 3);
     learned_pos_embd = ggml_cont_3d(
         ctx0, learned_pos_embd,
-        n_embd, n_patches_x * n_patches_y, batch_size);
+        n_embd, n_patches_x * n_patches_y, 1);
+    // broadcast-add: learned_pos_embd is [n_embd, n_pos, 1], inp is [n_embd, n_pos, batch_size]
     inp = ggml_add(ctx0, inp, learned_pos_embd);
     cb(inp, "inp_pos_emb", -1);
 
@@ -78,42 +100,72 @@ ggml_cgraph * clip_graph_qwen3vl::build() {
 
         // self-attention
         {
-            cur = build_mm(layer.qkv_w, cur);
+            cur = build_mm(layer.qkv_w, cur);   // [3*n_embd, n_pos, batch_size]
             cur = ggml_add(ctx0, cur, layer.qkv_b);
 
-            ggml_tensor * Qcur = ggml_view_3d(ctx0, cur, d_head, n_head, n_pos,
-                    /* nb1    */ ggml_row_size(cur->type, d_head),
-                    /* nb2    */ cur->nb[1],
-                    /* offset */ 0);
-
-            ggml_tensor * Kcur = ggml_view_3d(ctx0, cur, d_head, n_head, n_pos,
-                    /* nb1    */ ggml_row_size(cur->type, d_head),
-                    /* nb2    */ cur->nb[1],
-                    /* offset */ ggml_row_size(cur->type, n_embd));
-
-            ggml_tensor * Vcur = ggml_view_3d(ctx0, cur, d_head, n_head, n_pos,
-                    /* nb1    */ ggml_row_size(cur->type, d_head),
-                    /* nb2    */ cur->nb[1],
-                    /* offset */ ggml_row_size(cur->type, 2 * n_embd));
+            // Extract Q/K/V as 4D views [d_head, n_head, n_pos, batch_size].
+            // QKV and FFN projections run fully batched; attention is per-tile (each tile
+            // attends only to its own n_pos patches - no cross-tile attention).
+            ggml_tensor * Qcur = ggml_view_4d(ctx0, cur, d_head, n_head, n_pos, batch_size,
+                    /* nb1 */ ggml_row_size(cur->type, d_head),
+                    /* nb2 */ cur->nb[1],
+                    /* nb3 */ cur->nb[2],
+                    /* off */ 0);
+            ggml_tensor * Kcur = ggml_view_4d(ctx0, cur, d_head, n_head, n_pos, batch_size,
+                    /* nb1 */ ggml_row_size(cur->type, d_head),
+                    /* nb2 */ cur->nb[1],
+                    /* nb3 */ cur->nb[2],
+                    /* off */ ggml_row_size(cur->type, n_embd));
+            ggml_tensor * Vcur = ggml_view_4d(ctx0, cur, d_head, n_head, n_pos, batch_size,
+                    /* nb1 */ ggml_row_size(cur->type, d_head),
+                    /* nb2 */ cur->nb[1],
+                    /* nb3 */ cur->nb[2],
+                    /* off */ ggml_row_size(cur->type, 2 * n_embd));
 
             cb(Qcur, "Qcur", il);
             cb(Kcur, "Kcur", il);
             cb(Vcur, "Vcur", il);
 
-            // apply M-RoPE
-            Qcur = ggml_rope_multi(
-                ctx0, Qcur, positions, nullptr,
-                d_head/2, mrope_sections, GGML_ROPE_TYPE_VISION, 32768, 10000, 1, 0, 1, 32, 1);
-            Kcur = ggml_rope_multi(
-                ctx0, Kcur, positions, nullptr,
-                d_head/2, mrope_sections, GGML_ROPE_TYPE_VISION, 32768, 10000, 1, 0, 1, 32, 1);
+            // Per-tile attention: each tile attends only to its own n_pos tokens.
+            // QKV/FFN linear layers above are fully batched and run in parallel.
+            ggml_tensor * attn_out = nullptr;
+            for (int b = 0; b < batch_size; b++) {
+                ggml_tensor * Q_b = ggml_view_3d(ctx0, Qcur, d_head, n_head, n_pos,
+                    Qcur->nb[1], Qcur->nb[2], (size_t)b * Qcur->nb[3]);
+                ggml_tensor * K_b = ggml_view_3d(ctx0, Kcur, d_head, n_head, n_pos,
+                    Kcur->nb[1], Kcur->nb[2], (size_t)b * Kcur->nb[3]);
+                ggml_tensor * V_b = ggml_view_3d(ctx0, Vcur, d_head, n_head, n_pos,
+                    Vcur->nb[1], Vcur->nb[2], (size_t)b * Vcur->nb[3]);
 
-            cb(Qcur, "Qcur_rope", il);
-            cb(Kcur, "Kcur_rope", il);
+                Q_b = ggml_rope_multi(ctx0, Q_b, positions, nullptr,
+                    d_head/2, mrope_sections, GGML_ROPE_TYPE_VISION, 32768, 10000, 1, 0, 1, 32, 1);
+                K_b = ggml_rope_multi(ctx0, K_b, positions, nullptr,
+                    d_head/2, mrope_sections, GGML_ROPE_TYPE_VISION, 32768, 10000, 1, 0, 1, 32, 1);
 
-            cur = build_attn(layer.o_w, layer.o_b,
-                Qcur, Kcur, Vcur, nullptr, kq_scale, il);
-            cb(cur, "attn_out", il);
+                cb(Q_b, "Qcur_rope", il);
+                cb(K_b, "Kcur_rope", il);
+
+                ggml_tensor * out_b = build_attn(layer.o_w, layer.o_b,
+                    Q_b, K_b, V_b, nullptr, kq_scale, il);
+                out_b = ggml_reshape_2d(ctx0, out_b, n_embd, n_pos);
+
+                if (batch_size == 1) {
+                    attn_out = out_b;
+                } else {
+                    if (attn_out == nullptr) {
+                        attn_out = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd, n_pos * batch_size);
+                    }
+                    // in-place set: copies only this tile's slice instead of
+                    // duplicating the whole accumulator on every iteration
+                    attn_out = ggml_set_2d_inplace(ctx0, attn_out, out_b,
+                        n_embd * sizeof(float),
+                        (size_t)b * n_embd * n_pos * sizeof(float));
+                }
+            }
+            cb(attn_out, "attn_out", il);
+
+            // [n_embd, n_pos * batch_size] -> [n_embd, n_pos, batch_size]
+            cur = ggml_reshape_3d(ctx0, attn_out, n_embd, n_pos, batch_size);
         }
 
         // re-add the layer input, e.g., residual
