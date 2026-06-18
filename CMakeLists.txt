@@ -405,7 +405,7 @@ install(FILES ${CMAKE_CURRENT_BINARY_DIR}/llama-config.cmake
         DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/llama)
 
 install(
-    PROGRAMS vulkan_profiling_analyzer.py
+    PROGRAMS convert_hf_to_gguf.py vulkan_profiling_analyzer.py
     DESTINATION ${CMAKE_INSTALL_BINDIR})
 
 configure_file(cmake/llama.pc.in
