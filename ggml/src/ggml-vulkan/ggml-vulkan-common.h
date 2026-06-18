@@ -39,7 +39,7 @@ vk_fa_pipeline_state get_fa_pipeline_state(const vk_device& device, const vk_fa_
 uint32_t get_subgroup_size(const std::string &pipeline_name, const vk_device_architecture &arch);
 void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested = nullptr);
 bool ggml_vk_flash_attn_scalar_shmem_support(const vk_device& device, const vk_fa_tuning_params& params, uint32_t hsk, uint32_t hsv, bool f32acc, ggml_type k_type, ggml_type v_type);
-bool ggml_vk_flash_attn_coopmat_shmem_support(const vk_device& device, const vk_fa_tuning_params& params, uint32_t hsk, uint32_t hsv, bool f32acc, ggml_type k_type = GGML_TYPE_F16, ggml_type v_type = GGML_TYPE_F16);
+bool ggml_vk_flash_attn_coopmat_shmem_support(const vk_device& device, const vk_fa_tuning_params& params, uint32_t hsk, uint32_t hsv, bool f32acc, ggml_type k_type = GGML_TYPE_F16, ggml_type v_type = GGML_TYPE_F16, uint32_t qjl_quant_k = 0, bool qjl_full_proj = false);
 
 // buffers
 vk_buffer ggml_vk_create_buffer_check(vk_device& device, size_t size);

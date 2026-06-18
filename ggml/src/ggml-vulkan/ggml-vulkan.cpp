@@ -1197,6 +1197,12 @@ void ggml_vk_wait_events(vk_context& ctx, std::vector<vk::Event>&& events) {
     );
 }
 
+// QJL (Stage 2) projection block size for TurboQuant K cache (0 for PQ / non-TBQ).
+// Drives the FA QJL-correction shared-memory accounting and shader gating.
+static uint32_t ggml_vk_flash_attn_qjl_quant_k(ggml_type kv_type) {
+    return ggml_is_tbq(kv_type) ? static_cast<uint32_t>(ggml_blck_size(kv_type)) : 0;
+}
+
 static vk_fa_tuning_params get_fa_tuning_params_scalar(const vk_device& device, uint32_t hsk, uint32_t hsv, uint32_t n_rows, uint32_t n_kv, ggml_type k_type, ggml_type v_type, bool f32acc) {
 
     vk_fa_tuning_params result{};
@@ -1275,9 +1281,6 @@ static vk_fa_tuning_params get_fa_tuning_params_scalar(const vk_device& device, 
 static vk_fa_tuning_params get_fa_tuning_params_coopmat1(const vk_device& device, uint32_t hsk, uint32_t hsv, uint32_t n_rows, uint32_t n_kv, ggml_type k_type, ggml_type v_type, bool f32acc) {
     GGML_UNUSED(n_rows);
     GGML_UNUSED(n_kv);
-    GGML_UNUSED(k_type);
-    GGML_UNUSED(v_type);
-    GGML_UNUSED(f32acc);
 
     vk_fa_tuning_params result{};
     result.path = FA_COOPMAT1;
@@ -1300,12 +1303,21 @@ static vk_fa_tuning_params get_fa_tuning_params_coopmat1(const vk_device& device
 
     result.shmem_staging = (device->vendor_id == VK_VENDOR_ID_NVIDIA && hsk < 256 && hsv < 256) ? 1 : 0;
 
+    const uint32_t qjl_quant_k = ggml_vk_flash_attn_qjl_quant_k(k_type);
+    if (qjl_quant_k > 0 && hsk > qjl_quant_k) {
+        vk_fa_tuning_params fast = result;
+        fast.qjl_full_proj = true;
+
+        if (ggml_vk_flash_attn_coopmat_shmem_support(device, fast, hsk, hsv, f32acc, k_type, v_type, qjl_quant_k, true)) {
+            result = fast;
+        }
+    }
+
     return result;
 }
 
 static vk_fa_tuning_params get_fa_tuning_params_coopmat2(const vk_device& device, uint32_t hsk, uint32_t hsv, uint32_t n_rows, uint32_t n_kv, ggml_type k_type, ggml_type v_type, bool f32acc) {
     GGML_UNUSED(n_kv);
-    GGML_UNUSED(f32acc);
 
     vk_fa_tuning_params result{};
     result.path = FA_COOPMAT2;
@@ -1327,6 +1339,20 @@ static vk_fa_tuning_params get_fa_tuning_params_coopmat2(const vk_device& device
 
     result.subgroup_size = device->subgroup_size;
     result.workgroup_size = (small_rows && (D % 32) == 0) ? 256 : 128;
+
+    const uint32_t qjl_quant_k = ggml_vk_flash_attn_qjl_quant_k(k_type);
+    if (!small_rows && qjl_quant_k > 0 && hsk > qjl_quant_k) {
+        vk_fa_tuning_params multi_block = result;
+        multi_block.block_rows = 32;
+        multi_block.block_cols = 32;
+
+        // On the NV coopmat2 path, QJL_FULL_PROJ corrupts TBQ correction for
+        // multi-block heads such as Qwen3.5's head_dim=256. Keep the smaller
+        // coopmat2 tile, but recompute the per-128 QJL projection per block.
+        if (ggml_vk_flash_attn_coopmat_shmem_support(device, multi_block, hsk, hsv, f32acc, k_type, v_type, qjl_quant_k, false)) {
+            result = multi_block;
+        }
+    }
 
     return result;
 }
@@ -1351,7 +1377,7 @@ vk_fa_tuning_params get_fa_tuning_params(const vk_device& device, uint32_t hsk, 
         bool shape_ok = (f32acc && device->coopmat_support_16x16x16_f32acc) ||
                         (!f32acc && device->coopmat_support_16x16x16_f16acc);
         const vk_fa_tuning_params params = get_fa_tuning_params_coopmat1(device, hsk, hsv, n_rows, n_kv, k_type, v_type, f32acc);
-        bool shmem_ok = ggml_vk_flash_attn_coopmat_shmem_support(device, params, hsk, hsv, f32acc, k_type, v_type);
+        bool shmem_ok = ggml_vk_flash_attn_coopmat_shmem_support(device, params, hsk, hsv, f32acc, k_type, v_type, ggml_vk_flash_attn_qjl_quant_k(k_type), params.qjl_full_proj);
 
         if (!shape_ok || !shmem_ok) {
             path = FA_SCALAR;
@@ -1375,6 +1401,11 @@ vk_fa_tuning_params get_fa_tuning_params(const vk_device& device, uint32_t hsk, 
     }
 }
 
+// Bit 16 is upstream's USE_SPARSE; QJL takes the next free bit. Both are read
+// by the same Flags spec constant in flash_attn_base.glsl, and a TBQ FA module
+// compiles the sparse gather path too, so they must not overlap.
+static constexpr uint32_t GGML_VK_FA_FLAG_QJL_FULL_PROJ = 32;
+
 vk_fa_pipeline_state get_fa_pipeline_state(const vk_device& device, const vk_fa_tuning_params& params, uint32_t hsk, uint32_t hsv, bool aligned, bool f32acc,
                                                   bool use_mask, bool use_mask_opt, bool use_logit_softcap, bool use_sparse, ggml_type k_type, ggml_type v_type) {
     const bool old_amd_windows = device->vendor_id == VK_VENDOR_ID_AMD && device->driver_id == vk::DriverId::eAmdProprietary &&
@@ -1384,7 +1415,8 @@ vk_fa_pipeline_state get_fa_pipeline_state(const vk_device& device, const vk_fa_
                      (use_mask          ? 2 : 0) |
                      (use_logit_softcap ? 4 : 0) |
                      (old_amd_windows   ? 8 : 0) |
-                     (use_sparse        ? 16 : 0);
+                     (use_sparse        ? 16 : 0) |
+                     (params.qjl_full_proj ? GGML_VK_FA_FLAG_QJL_FULL_PROJ : 0);
 
     const uint32_t subgroup_size = params.disable_subgroups ? 0 : params.subgroup_size;
 
@@ -1648,28 +1680,19 @@ uint32_t get_subgroup_size(const std::string &pipeline_name, const vk_device_arc
     return 0; // If no matching configuration is found
 }
 
-static bool ggml_vk_fa_type_needs_shmem(ggml_type type) {
-    switch (type) {
-    case GGML_TYPE_IQ4_NL:
-        return true;
-    default:
-        return false;
-    }
-}
-
 static bool ggml_vk_fa_scalar_uses_mmq(const vk_device& device, ggml_type k_type, ggml_type v_type) {
-#if defined(GGML_VULKAN_INTEGER_DOT_GLSLC_SUPPORT)
-    return device->integer_dot_product && device->subgroup_clustered &&
-           !ggml_vk_fa_type_needs_shmem(v_type) &&
-           (k_type == GGML_TYPE_Q4_0 || k_type == GGML_TYPE_Q4_1 ||
-            k_type == GGML_TYPE_Q5_0 || k_type == GGML_TYPE_Q5_1 ||
-            k_type == GGML_TYPE_Q8_0);
-#else
+    // qvac: scalar FlashAttn MMQ (_int8) variants are disabled on this fork. The
+    // TurboQuant import replaced the scalar shader's MMQ path with the compile-time
+    // turbo-quant decode; flash_attn_mmq_funcs.glsl now references macros
+    // (QUANT_R_MMQ / BLOCK_SIZE / get_k_dm) that only exist on the per-type path, so
+    // the generic _int8 module no longer compiles. The non-MMQ dequant path covers
+    // Q4_0/Q4_1/Q5_0/Q5_1/Q8_0 FA on every backend; other integer-dot paths
+    // (mul_mat_mat_q8_1, mul_mat_vec_q8_1) are unaffected. Keep this gated off and the
+    // matching _int8 shader emission / symbol references disabled in lockstep.
     GGML_UNUSED(device);
     GGML_UNUSED(k_type);
     GGML_UNUSED(v_type);
     return false;
-#endif
 }
 
 void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
@@ -1695,6 +1718,54 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     const uint32_t s_warptile_wm_8          = 32 * subgroup_size_8 / subgroup_size_32;
     const uint32_t mul_mat_s_warptile_wm_8  = 32 * mul_mat_subgroup_size_8 / mul_mat_subgroup_size_32;
     const uint32_t mul_mat_s_warptile_wm_16 = 32 * mul_mat_subgroup_size_16 / mul_mat_subgroup_size_32;
+    // TBQ / PQ cooperative copy_to_quant: the shader (copy_to_quant.comp) is
+    // parameterized by spec constant `SG_SIZE` (constant_id=1; id 0 is already
+    // used by generic_binary_head.glsl for `norepeat`). At SG_SIZE >=
+    // workgroup size (32) it takes the single-subgroup fast path; at SG_SIZE
+    // in {4, 8, 16} it takes a shared-memory stitch path. To keep the
+    // SG_SIZE spec constant in sync with gl_SubgroupSize at runtime we also
+    // set requiredSubgroupSize on the pipeline (when VK_EXT_subgroup_size_
+    // control is available).
+    //
+    // - If GGML_VK_TBQ_COPY_SG_SIZE was set and is valid, use that (test
+    //   knob, lets a 32-lane device exercise the SG=8 / SG=16 stitch paths).
+    // - Otherwise, if size control is supported, pick the subgroup size that
+    //   the device will actually run the shader at. On Intel we match
+    //   mul_mat_subgroup_size (which uses subgroup_min_size to reach the
+    //   16-lane wave).
+    // - Otherwise, specialize SG_SIZE to the device's native subgroup size,
+    //   but leave requiredSubgroupSize at 0 because size control is unavailable.
+    uint32_t tbq_copy_sg_spec = 0;
+    uint32_t tbq_copy_sg_req  = 0;
+    if (device->subgroup_size_control) {
+        if (device->tbq_copy_sg_size != 0) {
+            tbq_copy_sg_spec = device->tbq_copy_sg_size;
+            tbq_copy_sg_req  = device->tbq_copy_sg_size;
+        } else {
+            tbq_copy_sg_spec = mul_mat_subgroup_size;
+            tbq_copy_sg_req  = mul_mat_subgroup_size;
+        }
+    } else {
+        tbq_copy_sg_spec = device->subgroup_size;
+    }
+    // Two-element spec const vector for CPY f32->TBQ/PQ:
+    //   slot 0: unused for the CPY entrypoint (generic_unary_head.glsl declares no
+    //           constant_id=0, and unused spec map entries are ignored per spec).
+    //   slot 1: SG_SIZE for copy_to_quant.comp's TQ_COOP path.
+    const std::vector<uint32_t> tbq_copy_spec_consts =
+        tbq_copy_sg_spec ? std::vector<uint32_t>{0u, tbq_copy_sg_spec} : std::vector<uint32_t>{};
+    // Three-element variant for the SET_ROWS entrypoint: slot 0 is the
+    // `norepeat` spec const from generic_binary_head.glsl (we always pass 1 to
+    // match the existing SET_ROWS_TQ wiring), slot 1 is SG_SIZE. We never need
+    // slot 2 today, but kept symmetrical for readability.
+    const std::vector<uint32_t> tbq_set_rows_spec_consts =
+        tbq_copy_sg_spec ? std::vector<uint32_t>{1u, tbq_copy_sg_spec} : std::vector<uint32_t>{1u};
+    if (tbq_copy_sg_spec != 0 &&
+        !(tbq_copy_sg_spec >= 4u && (tbq_copy_sg_spec & (tbq_copy_sg_spec - 1u)) == 0u)) {
+        GGML_ABORT("ggml_vulkan: unsupported subgroup size %u for TBQ/PQ "
+                   "cooperative kernels (requires >= 4 and power of two)",
+                   tbq_copy_sg_spec);
+    }
 
     const bool subgroup_min_size_16 = (!device->subgroup_size_control && device->subgroup_size >= 16) ||
                                       (device->subgroup_size_control && device->subgroup_max_size >= 16);
@@ -2093,6 +2164,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 
     for (auto &fa : device->pipeline_flash_attn_f32_f16) {
         if (fa.first.path != FA_SCALAR) continue;
+        if (ggml_is_tbq_or_pq(fa.first.k_type)) continue; // TBQ/PQ use per-type modules below
         const uint32_t Br = fa.first.Br;
         const uint32_t Bc = fa.first.Bc;
         const bool aligned = fa.first.aligned;
@@ -2110,16 +2182,10 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             spv_size = flash_attn_f32_f16_fp32_len;
             name = aligned ? "flash_attn_f32_bf16_aligned" : "flash_attn_f32_bf16";
         } else if (use_mmq) {
-#if defined(GGML_VULKAN_INTEGER_DOT_GLSLC_SUPPORT)
-            if (device->fp16) {
-                if (f32acc) { spv_data = flash_attn_f32_f16_int8_data;        spv_size = flash_attn_f32_f16_int8_len; }
-                else        { spv_data = flash_attn_f32_f16_f16acc_int8_data; spv_size = flash_attn_f32_f16_f16acc_int8_len; }
-            } else {
-                spv_data = flash_attn_f32_f16_fp32_int8_data;
-                spv_size = flash_attn_f32_f16_fp32_int8_len;
-            }
-#endif
-            name = aligned ? "flash_attn_f32_f16_aligned" : "flash_attn_f32_f16";
+            // qvac: FA MMQ (_int8) disabled — ggml_vk_fa_scalar_uses_mmq() always
+            // returns false, so this branch is dead. The _int8 shaders are no longer
+            // emitted (see vulkan-shaders-gen.cpp), so do not reference their symbols.
+            GGML_ABORT("scalar FA MMQ path is disabled on this build");
         } else {
             if (device->fp16) {
                 if (device->dot2_f16) {
@@ -2145,6 +2211,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     if (device->coopmat1_fa_support) {
         for (auto &fa : device->pipeline_flash_attn_f32_f16) {
             if (fa.first.path != FA_COOPMAT1) continue;
+            if (ggml_is_tbq_or_pq(fa.first.k_type)) continue; // TBQ/PQ use per-type modules below
             const uint32_t Br = fa.first.Br;
             const uint32_t Bc = fa.first.Bc;
             const bool aligned = fa.first.aligned;
@@ -2183,6 +2250,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     if (device->coopmat2) {
         for (auto &fa : device->pipeline_flash_attn_f32_f16) {
             if (fa.first.path != FA_COOPMAT2) continue;
+            if (ggml_is_tbq_or_pq(fa.first.k_type)) continue; // TBQ/PQ use per-type modules below
             const uint32_t Br = fa.first.Br;
             const uint32_t Bc = fa.first.Bc;
             const bool aligned = fa.first.aligned;
@@ -2214,6 +2282,105 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         }
     }
 #endif
+
+    // ===== TurboQuant / PolarQuant per-type FA pipeline creation =====
+    // b9518 keeps a single std::map<vk_fa_pipeline_state, vk_pipeline>, so unlike the
+    // upstream TBQ branch's [GGML_TYPE_COUNT] array we filter by (k_type, v_type) here.
+    // Each (K,V) combination selects the dedicated compile-time SPIR-V module emitted
+    // by vulkan-shaders-gen.cpp (flash_attn_f32_f16_<k>[_<v>][_cm1|_cm2]).
+#define CREATE_FA_TBQ(K_TYPE, V_TYPE, NAMELC, FAPATH, SUFFIX) \
+        for (auto &fa : device->pipeline_flash_attn_f32_f16) { \
+            if (fa.first.k_type != K_TYPE || fa.first.v_type != V_TYPE || fa.first.path != FAPATH) continue; \
+            const uint32_t Br = fa.first.Br; \
+            const uint32_t Bc = fa.first.Bc; \
+            const bool aligned = fa.first.aligned; \
+            const bool f32acc = fa.first.f32acc; \
+            const uint32_t fa_sgs = fa.first.subgroup_size; \
+            const bool fa_ds = fa.first.subgroup_size == 0; \
+            if (aligned) { \
+                if (f32acc) { ggml_vk_create_pipeline(device, fa.second, "flash_attn_f32_f16_aligned_f32acc" #NAMELC, flash_attn_f32_f16_ ## NAMELC ##            SUFFIX ## _len, flash_attn_f32_f16_ ## NAMELC ##            SUFFIX ## _data, "main", 8, sizeof(vk_flash_attn_push_constants), {Br, 1, 1}, get_fa_spec_constants(fa.first), Bc, true, (!fa_ds && (FAPATH!=FA_COOPMAT2)), ((!fa_ds && (FAPATH!=FA_COOPMAT2)) ? fa_sgs : 0)); } \
+                else        { ggml_vk_create_pipeline(device, fa.second, "flash_attn_f32_f16_aligned_f16acc" #NAMELC, flash_attn_f32_f16_ ## NAMELC ## _f16acc ## SUFFIX ## _len, flash_attn_f32_f16_ ## NAMELC ## _f16acc ## SUFFIX ## _data, "main", 8, sizeof(vk_flash_attn_push_constants), {Br, 1, 1}, get_fa_spec_constants(fa.first), Bc, true, (!fa_ds && (FAPATH!=FA_COOPMAT2)), ((!fa_ds && (FAPATH!=FA_COOPMAT2)) ? fa_sgs : 0)); } \
+            } else { \
+                if (f32acc) { ggml_vk_create_pipeline(device, fa.second, "flash_attn_f32_f16_f32acc" #NAMELC, flash_attn_f32_f16_ ## NAMELC ##            SUFFIX ## _len, flash_attn_f32_f16_ ## NAMELC ##            SUFFIX ## _data, "main", 8, sizeof(vk_flash_attn_push_constants), {Br, 1, 1}, get_fa_spec_constants(fa.first), 1, true, (!fa_ds && (FAPATH!=FA_COOPMAT2)), ((!fa_ds && (FAPATH!=FA_COOPMAT2)) ? fa_sgs : 0)); } \
+                else        { ggml_vk_create_pipeline(device, fa.second, "flash_attn_f32_f16_f16acc" #NAMELC, flash_attn_f32_f16_ ## NAMELC ## _f16acc ## SUFFIX ## _len, flash_attn_f32_f16_ ## NAMELC ## _f16acc ## SUFFIX ## _data, "main", 8, sizeof(vk_flash_attn_push_constants), {Br, 1, 1}, get_fa_spec_constants(fa.first), 1, true, (!fa_ds && (FAPATH!=FA_COOPMAT2)), ((!fa_ds && (FAPATH!=FA_COOPMAT2)) ? fa_sgs : 0)); } \
+            } \
+        }
+
+// The _cm1 / _cm2 per-type SPIR-V modules only exist when the corresponding
+// cooperative-matrix GLSLC support was compiled in (else shader-gen never emits
+// them). Gate the symbol references at compile time — a runtime device->coopmat*
+// check is not enough, since the symbol must still resolve at link time.
+#if defined(VK_KHR_cooperative_matrix) && defined(GGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
+#define CREATE_FA_TBQ_CM1(K_TYPE, V_TYPE, NAMELC) if (device->coopmat1_fa_support) { CREATE_FA_TBQ(K_TYPE, V_TYPE, NAMELC, FA_COOPMAT1, _cm1) }
+#else
+#define CREATE_FA_TBQ_CM1(K_TYPE, V_TYPE, NAMELC)
+#endif
+#if defined(VK_NV_cooperative_matrix2) && defined(GGML_VULKAN_COOPMAT2_GLSLC_SUPPORT)
+#define CREATE_FA_TBQ_CM2(K_TYPE, V_TYPE, NAMELC) if (device->coopmat2) { CREATE_FA_TBQ(K_TYPE, V_TYPE, NAMELC, FA_COOPMAT2, _cm2) }
+#else
+#define CREATE_FA_TBQ_CM2(K_TYPE, V_TYPE, NAMELC)
+#endif
+
+#define CREATE_FA_TBQ_ALLPATHS(K_TYPE, V_TYPE, NAMELC) \
+        CREATE_FA_TBQ(K_TYPE, V_TYPE, NAMELC, FA_SCALAR, ) \
+        CREATE_FA_TBQ_CM1(K_TYPE, V_TYPE, NAMELC) \
+        CREATE_FA_TBQ_CM2(K_TYPE, V_TYPE, NAMELC)
+
+    // Same-type K==V (block 128 + 64).
+    CREATE_FA_TBQ_ALLPATHS(GGML_TYPE_TBQ3_0,    GGML_TYPE_TBQ3_0,    tbq3_0)
+    CREATE_FA_TBQ_ALLPATHS(GGML_TYPE_TBQ4_0,    GGML_TYPE_TBQ4_0,    tbq4_0)
+    CREATE_FA_TBQ_ALLPATHS(GGML_TYPE_PQ3_0,     GGML_TYPE_PQ3_0,     pq3_0)
+    CREATE_FA_TBQ_ALLPATHS(GGML_TYPE_PQ4_0,     GGML_TYPE_PQ4_0,     pq4_0)
+    CREATE_FA_TBQ_ALLPATHS(GGML_TYPE_TBQ3_0_64, GGML_TYPE_TBQ3_0_64, tbq3_0_64)
+    CREATE_FA_TBQ_ALLPATHS(GGML_TYPE_TBQ4_0_64, GGML_TYPE_TBQ4_0_64, tbq4_0_64)
+    CREATE_FA_TBQ_ALLPATHS(GGML_TYPE_PQ3_0_64,  GGML_TYPE_PQ3_0_64,  pq3_0_64)
+    CREATE_FA_TBQ_ALLPATHS(GGML_TYPE_PQ4_0_64,  GGML_TYPE_PQ4_0_64,  pq4_0_64)
+
+    // Mixed K/V: TBQ/PQ on K, {PQ,Q4_0,Q8_0,F16} on V (no TBQ on V). Block 128.
+    // Keep this pair list in sync with the fa_mixed table in
+    // vulkan-shaders-gen.cpp and the is_fa_mixed_v gate in supports_op.
+    CREATE_FA_TBQ_ALLPATHS(GGML_TYPE_TBQ3_0, GGML_TYPE_PQ3_0, tbq3_0_pq3_0)
+    CREATE_FA_TBQ_ALLPATHS(GGML_TYPE_TBQ3_0, GGML_TYPE_PQ4_0, tbq3_0_pq4_0)
+    CREATE_FA_TBQ_ALLPATHS(GGML_TYPE_TBQ3_0, GGML_TYPE_Q4_0,  tbq3_0_q4_0)
+    CREATE_FA_TBQ_ALLPATHS(GGML_TYPE_TBQ3_0, GGML_TYPE_Q8_0,  tbq3_0_q8_0)
+    CREATE_FA_TBQ_ALLPATHS(GGML_TYPE_TBQ3_0, GGML_TYPE_F16,   tbq3_0_f16)
+    CREATE_FA_TBQ_ALLPATHS(GGML_TYPE_TBQ4_0, GGML_TYPE_PQ3_0, tbq4_0_pq3_0)
+    CREATE_FA_TBQ_ALLPATHS(GGML_TYPE_TBQ4_0, GGML_TYPE_PQ4_0, tbq4_0_pq4_0)
+    CREATE_FA_TBQ_ALLPATHS(GGML_TYPE_TBQ4_0, GGML_TYPE_Q4_0,  tbq4_0_q4_0)
+    CREATE_FA_TBQ_ALLPATHS(GGML_TYPE_TBQ4_0, GGML_TYPE_Q8_0,  tbq4_0_q8_0)
+    CREATE_FA_TBQ_ALLPATHS(GGML_TYPE_TBQ4_0, GGML_TYPE_F16,   tbq4_0_f16)
+    CREATE_FA_TBQ_ALLPATHS(GGML_TYPE_PQ3_0,  GGML_TYPE_PQ4_0, pq3_0_pq4_0)
+    CREATE_FA_TBQ_ALLPATHS(GGML_TYPE_PQ3_0,  GGML_TYPE_Q4_0,  pq3_0_q4_0)
+    CREATE_FA_TBQ_ALLPATHS(GGML_TYPE_PQ3_0,  GGML_TYPE_Q8_0,  pq3_0_q8_0)
+    CREATE_FA_TBQ_ALLPATHS(GGML_TYPE_PQ3_0,  GGML_TYPE_F16,   pq3_0_f16)
+    CREATE_FA_TBQ_ALLPATHS(GGML_TYPE_PQ4_0,  GGML_TYPE_PQ3_0, pq4_0_pq3_0)
+    CREATE_FA_TBQ_ALLPATHS(GGML_TYPE_PQ4_0,  GGML_TYPE_Q4_0,  pq4_0_q4_0)
+    CREATE_FA_TBQ_ALLPATHS(GGML_TYPE_PQ4_0,  GGML_TYPE_Q8_0,  pq4_0_q8_0)
+    CREATE_FA_TBQ_ALLPATHS(GGML_TYPE_PQ4_0,  GGML_TYPE_F16,   pq4_0_f16)
+
+    // Mixed K/V block 64.
+    CREATE_FA_TBQ_ALLPATHS(GGML_TYPE_TBQ3_0_64, GGML_TYPE_PQ3_0_64, tbq3_0_64_pq3_0_64)
+    CREATE_FA_TBQ_ALLPATHS(GGML_TYPE_TBQ3_0_64, GGML_TYPE_PQ4_0_64, tbq3_0_64_pq4_0_64)
+    CREATE_FA_TBQ_ALLPATHS(GGML_TYPE_TBQ3_0_64, GGML_TYPE_Q4_0,     tbq3_0_64_q4_0)
+    CREATE_FA_TBQ_ALLPATHS(GGML_TYPE_TBQ3_0_64, GGML_TYPE_Q8_0,     tbq3_0_64_q8_0)
+    CREATE_FA_TBQ_ALLPATHS(GGML_TYPE_TBQ3_0_64, GGML_TYPE_F16,      tbq3_0_64_f16)
+    CREATE_FA_TBQ_ALLPATHS(GGML_TYPE_TBQ4_0_64, GGML_TYPE_PQ3_0_64, tbq4_0_64_pq3_0_64)
+    CREATE_FA_TBQ_ALLPATHS(GGML_TYPE_TBQ4_0_64, GGML_TYPE_PQ4_0_64, tbq4_0_64_pq4_0_64)
+    CREATE_FA_TBQ_ALLPATHS(GGML_TYPE_TBQ4_0_64, GGML_TYPE_Q4_0,     tbq4_0_64_q4_0)
+    CREATE_FA_TBQ_ALLPATHS(GGML_TYPE_TBQ4_0_64, GGML_TYPE_Q8_0,     tbq4_0_64_q8_0)
+    CREATE_FA_TBQ_ALLPATHS(GGML_TYPE_TBQ4_0_64, GGML_TYPE_F16,      tbq4_0_64_f16)
+    CREATE_FA_TBQ_ALLPATHS(GGML_TYPE_PQ3_0_64,  GGML_TYPE_PQ4_0_64, pq3_0_64_pq4_0_64)
+    CREATE_FA_TBQ_ALLPATHS(GGML_TYPE_PQ3_0_64,  GGML_TYPE_Q4_0,     pq3_0_64_q4_0)
+    CREATE_FA_TBQ_ALLPATHS(GGML_TYPE_PQ3_0_64,  GGML_TYPE_Q8_0,     pq3_0_64_q8_0)
+    CREATE_FA_TBQ_ALLPATHS(GGML_TYPE_PQ3_0_64,  GGML_TYPE_F16,      pq3_0_64_f16)
+    CREATE_FA_TBQ_ALLPATHS(GGML_TYPE_PQ4_0_64,  GGML_TYPE_PQ3_0_64, pq4_0_64_pq3_0_64)
+    CREATE_FA_TBQ_ALLPATHS(GGML_TYPE_PQ4_0_64,  GGML_TYPE_Q4_0,     pq4_0_64_q4_0)
+    CREATE_FA_TBQ_ALLPATHS(GGML_TYPE_PQ4_0_64,  GGML_TYPE_Q8_0,     pq4_0_64_q8_0)
+    CREATE_FA_TBQ_ALLPATHS(GGML_TYPE_PQ4_0_64,  GGML_TYPE_F16,      pq4_0_64_f16)
+#undef CREATE_FA_TBQ_ALLPATHS
+#undef CREATE_FA_TBQ_CM1
+#undef CREATE_FA_TBQ_CM2
+#undef CREATE_FA_TBQ
 
     auto const &ggml_vk_mul_mm_spec = [&device](std::vector<uint32_t> spec, bool aligned) {
         spec.push_back(aligned ? 1u : 0u);  // constantID=11: ALIGNED
@@ -2257,6 +2424,28 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 #define FOR_EACH_LUT_TYPE(X) \
     FOR_EACH_LUT_TYPE_NONFP4(X)  \
     FOR_EACH_LUT_FP4_TYPE(X)
+
+    // TurboQuant / PolarQuant FHT types (block = 128 elements). They are not in
+    // non_lut_quant_types: the FHT layout has no runtime branch in the shared
+    // MmTypeA quant shader, so each type keeps its own per-type SPIR-V (see
+    // is_tq_fht() in vulkan-shaders-gen.cpp) and must be named explicitly here.
+#define FOR_EACH_TQ_FHT_TYPE_128(X) \
+    X(GGML_TYPE_TBQ3_0, tbq3_0) \
+    X(GGML_TYPE_PQ3_0,  pq3_0)  \
+    X(GGML_TYPE_TBQ4_0, tbq4_0) \
+    X(GGML_TYPE_PQ4_0,  pq4_0)
+    // head_dim=64 variants: same standalone MUL_MAT path as their _128 siblings;
+    // required when llama.cpp auto-downgrades TBQ/PQ K/V to _64 for models with
+    // n_embd_head_k/v == 64 (see src/llama-context.cpp:2533+). No _dot2 SPIR-V
+    // is generated for them, so the dot2-selecting macros cannot be reused.
+#define FOR_EACH_TQ_FHT_TYPE_64(X) \
+    X(GGML_TYPE_TBQ3_0_64, tbq3_0_64) \
+    X(GGML_TYPE_PQ3_0_64,  pq3_0_64)  \
+    X(GGML_TYPE_TBQ4_0_64, tbq4_0_64) \
+    X(GGML_TYPE_PQ4_0_64,  pq4_0_64)
+#define FOR_EACH_TQ_FHT_TYPE(X) \
+    FOR_EACH_TQ_FHT_TYPE_128(X)  \
+    FOR_EACH_TQ_FHT_TYPE_64(X)
 
     const int mul_mat_id_param_count = 5;
 
@@ -2373,6 +2562,11 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
               create_mm_pipelines({TYPE, GGML_TYPE_F16, false, false}, tc, "matmul_" #tstr "_f16",        matmul_##tstr##_f16_cm2_len,        matmul_##tstr##_f16_cm2_data,        sizeof(vk_mat_mat_push_constants), 3, cm2_spec, true); \
           } }
         FOR_EACH_LUT_TYPE_NONFP4(X_CM2)
+        // TBQ/PQ deliberately have no cm2 entry: there is no coopmat2 variant of
+        // their per-type shader. ggml_vk_get_mul_mat_mat_pipeline_map() returns
+        // nullptr for them on a coopmat2 device, so the caller dequantizes to f16
+        // and uses the f16 x f16 matmul - the same fall-through the old empty
+        // pipeline_dequant_mul_mat_mat_f16[] slot produced.
 #if defined(GGML_VULKAN_FLOAT_E2M1_GLSLC_SUPPORT) && defined(GGML_VULKAN_FLOAT_E4M3_GLSLC_SUPPORT)
         if (device->ocp_fp4) {
 #define X_CM2_OCP(TYPE, tstr) \
@@ -2525,6 +2719,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             cm1_create({TYPE, GGML_TYPE_F16, false, false}, tc_mmq, "matmul_" #tstr "_f16",        matmul_##tstr##_f16_cm1_len,        matmul_##tstr##_f16_cm1_data,        sizeof(vk_mat_mat_push_constants), 3); \
         }
         FOR_EACH_LUT_TYPE_NONFP4(X_CM1)
+        FOR_EACH_TQ_FHT_TYPE(X_CM1)
 #if defined(GGML_VULKAN_FLOAT_E2M1_GLSLC_SUPPORT) && defined(GGML_VULKAN_FLOAT_E4M3_GLSLC_SUPPORT)
         if (device->ocp_fp4) {
 #define X_CM1_OCP(TYPE, tstr) \
@@ -2691,7 +2886,15 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             sg_create({TYPE, GGML_TYPE_F32, false, true},  tc_mmq, "matmul_" #tstr "_f32_f16acc", SPV_DOT2_F16ACC(matmul_##tstr##_f32), sizeof(vk_mat_mat_push_constants), 3); \
             sg_create({TYPE, GGML_TYPE_F32, false, false}, tc_mmq, "matmul_" #tstr "_f32",        SPV_DOT2(matmul_##tstr##_f32),        sizeof(vk_mat_mat_push_constants), 3);
             FOR_EACH_LUT_TYPE(X_SG)
+            FOR_EACH_TQ_FHT_TYPE_128(X_SG)
 #undef X_SG
+            // TBQ/PQ head_dim=64: no _dot2 SPIR-V variant is generated for these
+            // types, so reference the plain symbols instead of SPV_DOT2().
+    #define X_SG_NODOT2(TYPE, tstr) \
+            sg_create({TYPE, GGML_TYPE_F32, false, true},  tc_mmq, "matmul_" #tstr "_f32_f16acc", matmul_##tstr##_f32_f16acc_len, matmul_##tstr##_f32_f16acc_data, sizeof(vk_mat_mat_push_constants), 3); \
+            sg_create({TYPE, GGML_TYPE_F32, false, false}, tc_mmq, "matmul_" #tstr "_f32",        matmul_##tstr##_f32_len,        matmul_##tstr##_f32_data,        sizeof(vk_mat_mat_push_constants), 3);
+            FOR_EACH_TQ_FHT_TYPE_64(X_SG_NODOT2)
+#undef X_SG_NODOT2
 
 #if defined(GGML_VULKAN_INTEGER_DOT_GLSLC_SUPPORT)
             if (device->integer_dot_product) {
@@ -2805,6 +3008,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     #define X_SG_FP32(TYPE, tstr) \
             sg_create({TYPE, GGML_TYPE_F32, false, false}, tc_mmq, "matmul_" #tstr "_f32", matmul_##tstr##_f32_fp32_len, matmul_##tstr##_f32_fp32_data, sizeof(vk_mat_mat_push_constants), 3);
             FOR_EACH_LUT_TYPE(X_SG_FP32)
+            FOR_EACH_TQ_FHT_TYPE(X_SG_FP32)
 #undef X_SG_FP32
 
 #if defined(GGML_VULKAN_INTEGER_DOT_GLSLC_SUPPORT)
@@ -2857,6 +3061,9 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 #undef FOR_EACH_LUT_TYPE
 #undef FOR_EACH_LUT_TYPE_NONFP4
 #undef FOR_EACH_LUT_FP4_TYPE
+#undef FOR_EACH_TQ_FHT_TYPE
+#undef FOR_EACH_TQ_FHT_TYPE_128
+#undef FOR_EACH_TQ_FHT_TYPE_64
     // BF16 fallback for coopmat devices without bf16 coopmat support
     if ((device->coopmat2 || device->coopmat_support)
 #if defined(GGML_VULKAN_BFLOAT16_GLSLC_SUPPORT)
@@ -3006,6 +3213,17 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f32_f32[w][GGML_TYPE_Q5_0][i], "mul_mat_vec_q5_0_f32_f32", arr_dmmv_q5_0_f32_f32_len[reduc], arr_dmmv_q5_0_f32_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {2*rm_stdq, 1, 1}, {wg_size_subgroup, 2*rm_stdq, i+1}, 1, true, use_subgroups, force_subgroup_size);
             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f32_f32[w][GGML_TYPE_Q5_1][i], "mul_mat_vec_q5_1_f32_f32", arr_dmmv_q5_1_f32_f32_len[reduc], arr_dmmv_q5_1_f32_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {2*rm_stdq, 1, 1}, {wg_size_subgroup, 2*rm_stdq, i+1}, 1, true, use_subgroups, force_subgroup_size);
             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f32_f32[w][GGML_TYPE_Q8_0][i], "mul_mat_vec_q8_0_f32_f32", arr_dmmv_q8_0_f32_f32_len[reduc], arr_dmmv_q8_0_f32_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {1*rm_stdq, 1, 1}, {wg_size_subgroup, 1*rm_stdq, i+1}, 1, true, use_subgroups, force_subgroup_size);
+
+            // TQ3/TQ4 need BLOCK_SIZE=128 (== QUANT_K), which exceeds the subgroup size on most GPUs.
+            // Use hybrid reduction (subgroup + shmem) to correctly reduce across all subgroups.
+            {
+                const shader_reduction_mode reduc_tq = use_subgroups ? SHADER_REDUCTION_MODE_HYBRID : SHADER_REDUCTION_MODE_SHMEM;
+                ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f32_f32[w][GGML_TYPE_TBQ3_0][i], "mul_mat_vec_tbq3_0_f32_f32", arr_dmmv_tbq3_0_f32_f32_len[reduc_tq], arr_dmmv_tbq3_0_f32_f32_data[reduc_tq], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {1*rm_stdq, 1, 1}, {128, 1*rm_stdq, i+1}, 1, true, use_subgroups, force_subgroup_size);
+                ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f32_f32[w][GGML_TYPE_PQ3_0][i], "mul_mat_vec_pq3_0_f32_f32", arr_dmmv_pq3_0_f32_f32_len[reduc_tq], arr_dmmv_pq3_0_f32_f32_data[reduc_tq], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {1*rm_stdq, 1, 1}, {128, 1*rm_stdq, i+1}, 1, true, use_subgroups, force_subgroup_size);
+                ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f32_f32[w][GGML_TYPE_TBQ4_0][i], "mul_mat_vec_tbq4_0_f32_f32", arr_dmmv_tbq4_0_f32_f32_len[reduc_tq], arr_dmmv_tbq4_0_f32_f32_data[reduc_tq], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {1*rm_stdq, 1, 1}, {128, 1*rm_stdq, i+1}, 1, true, use_subgroups, force_subgroup_size);
+                ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f32_f32[w][GGML_TYPE_PQ4_0][i], "mul_mat_vec_pq4_0_f32_f32", arr_dmmv_pq4_0_f32_f32_len[reduc_tq], arr_dmmv_pq4_0_f32_f32_data[reduc_tq], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {1*rm_stdq, 1, 1}, {128, 1*rm_stdq, i+1}, 1, true, use_subgroups, force_subgroup_size);
+            }
+
             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f32_f32[w][GGML_TYPE_Q2_K][i], "mul_mat_vec_q2_k_f32_f32", arr_dmmv_q2_k_f32_f32_len[reduc16], arr_dmmv_q2_k_f32_f32_data[reduc16], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rm_kq, 1, 1}, {wg_size_subgroup16, rm_kq, i+1}, 1, true, use_subgroups16, force_subgroup_size16);
             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f32_f32[w][GGML_TYPE_Q3_K][i], "mul_mat_vec_q3_k_f32_f32", arr_dmmv_q3_k_f32_f32_len[reduc16], arr_dmmv_q3_k_f32_f32_data[reduc16], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rm_kq, 1, 1}, {wg_size_subgroup16, rm_kq, i+1}, 1, true, use_subgroups16, force_subgroup_size16);
             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f32_f32[w][GGML_TYPE_Q4_K][i], "mul_mat_vec_q4_k_f32_f32", arr_dmmv_q4_k_f32_f32_len[reduc16], arr_dmmv_q4_k_f32_f32_data[reduc16], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rm_kq, 1, 1}, {wg_size_subgroup16, rm_kq, i+1}, 1, true, use_subgroups16, force_subgroup_size16);
@@ -3035,8 +3253,17 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f16_f32[w][GGML_TYPE_Q5_0][i], "mul_mat_vec_q5_0_f16_f32", arr_dmmv_q5_0_f16_f32_len[reduc], arr_dmmv_q5_0_f16_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {2*rm_stdq, 1, 1}, {wg_size_subgroup, 2*rm_stdq, i+1}, 1, true, use_subgroups, force_subgroup_size);
             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f16_f32[w][GGML_TYPE_Q5_1][i], "mul_mat_vec_q5_1_f16_f32", arr_dmmv_q5_1_f16_f32_len[reduc], arr_dmmv_q5_1_f16_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {2*rm_stdq, 1, 1}, {wg_size_subgroup, 2*rm_stdq, i+1}, 1, true, use_subgroups, force_subgroup_size);
             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f16_f32[w][GGML_TYPE_Q8_0][i], "mul_mat_vec_q8_0_f16_f32", arr_dmmv_q8_0_f16_f32_len[reduc], arr_dmmv_q8_0_f16_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {1*rm_stdq, 1, 1}, {wg_size_subgroup, 1*rm_stdq, i+1}, 1, true, use_subgroups, force_subgroup_size);
+
+            {
+                const shader_reduction_mode reduc_tq = use_subgroups ? SHADER_REDUCTION_MODE_HYBRID : SHADER_REDUCTION_MODE_SHMEM;
+                ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f16_f32[w][GGML_TYPE_TBQ3_0][i], "mul_mat_vec_tbq3_0_f16_f32", arr_dmmv_tbq3_0_f16_f32_len[reduc_tq], arr_dmmv_tbq3_0_f16_f32_data[reduc_tq], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {1*rm_stdq, 1, 1}, {128, 1*rm_stdq, i+1}, 1, true, use_subgroups, force_subgroup_size);
+                ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f16_f32[w][GGML_TYPE_PQ3_0][i], "mul_mat_vec_pq3_0_f16_f32", arr_dmmv_pq3_0_f16_f32_len[reduc_tq], arr_dmmv_pq3_0_f16_f32_data[reduc_tq], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {1*rm_stdq, 1, 1}, {128, 1*rm_stdq, i+1}, 1, true, use_subgroups, force_subgroup_size);
+                ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f16_f32[w][GGML_TYPE_TBQ4_0][i], "mul_mat_vec_tbq4_0_f16_f32", arr_dmmv_tbq4_0_f16_f32_len[reduc_tq], arr_dmmv_tbq4_0_f16_f32_data[reduc_tq], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {1*rm_stdq, 1, 1}, {128, 1*rm_stdq, i+1}, 1, true, use_subgroups, force_subgroup_size);
+                ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f16_f32[w][GGML_TYPE_PQ4_0][i], "mul_mat_vec_pq4_0_f16_f32", arr_dmmv_pq4_0_f16_f32_len[reduc_tq], arr_dmmv_pq4_0_f16_f32_data[reduc_tq], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {1*rm_stdq, 1, 1}, {128, 1*rm_stdq, i+1}, 1, true, use_subgroups, force_subgroup_size);
+            }
             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f16_f32[w][GGML_TYPE_Q2_K][i], "mul_mat_vec_q2_k_f16_f32", arr_dmmv_q2_k_f16_f32_len[reduc16], arr_dmmv_q2_k_f16_f32_data[reduc16], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rm_kq, 1, 1}, {wg_size_subgroup16, rm_kq, i+1}, 1, true, use_subgroups16, force_subgroup_size16);
             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f16_f32[w][GGML_TYPE_Q3_K][i], "mul_mat_vec_q3_k_f16_f32", arr_dmmv_q3_k_f16_f32_len[reduc16], arr_dmmv_q3_k_f16_f32_data[reduc16], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rm_kq, 1, 1}, {wg_size_subgroup16, rm_kq, i+1}, 1, true, use_subgroups16, force_subgroup_size16);
+
             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f16_f32[w][GGML_TYPE_Q4_K][i], "mul_mat_vec_q4_k_f16_f32", arr_dmmv_q4_k_f16_f32_len[reduc16], arr_dmmv_q4_k_f16_f32_data[reduc16], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rm_kq, 1, 1}, {wg_size_subgroup16, rm_kq, i+1}, 1, true, use_subgroups16, force_subgroup_size16);
             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f16_f32[w][GGML_TYPE_Q5_K][i], "mul_mat_vec_q5_k_f16_f32", arr_dmmv_q5_k_f16_f32_len[reduc16], arr_dmmv_q5_k_f16_f32_data[reduc16], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rm_kq, 1, 1}, {wg_size_subgroup16, rm_kq, i+1}, 1, true, use_subgroups16, force_subgroup_size16);
             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f16_f32[w][GGML_TYPE_Q6_K][i], "mul_mat_vec_q6_k_f16_f32", arr_dmmv_q6_k_f16_f32_len[reduc16], arr_dmmv_q6_k_f16_f32_data[reduc16], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rm_kq, 1, 1}, {wg_size_subgroup16, rm_kq, i+1}, 1, true, use_subgroups16, force_subgroup_size16);
@@ -3187,6 +3414,14 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     ggml_vk_create_pipeline(device, device->pipeline_dequant[GGML_TYPE_IQ4_NL],  "dequant_iq4_nl",  dequant_iq4_nl_len,  dequant_iq4_nl_data,  "main", 2, 5 * sizeof(uint32_t), {256 * 16, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_dequant[GGML_TYPE_MXFP4],   "dequant_mxfp4",   dequant_mxfp4_len,   dequant_mxfp4_data,   "main", 2, 5 * sizeof(uint32_t), {256 * 16, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_dequant[GGML_TYPE_NVFP4],   "dequant_nvfp4",   dequant_nvfp4_len,   dequant_nvfp4_data,   "main", 2, 5 * sizeof(uint32_t), {256 * 16, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_dequant[GGML_TYPE_TBQ3_0],  "dequant_tbq3_0",   dequant_tbq3_0_len,   dequant_tbq3_0_data,   "main", 2, 5 * sizeof(uint32_t), {128, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_dequant[GGML_TYPE_PQ3_0],  "dequant_pq3_0",   dequant_pq3_0_len,   dequant_pq3_0_data,   "main", 2, 5 * sizeof(uint32_t), {128, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_dequant[GGML_TYPE_TBQ4_0],  "dequant_tbq4_0",   dequant_tbq4_0_len,   dequant_tbq4_0_data,   "main", 2, 5 * sizeof(uint32_t), {128, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_dequant[GGML_TYPE_PQ4_0],  "dequant_pq4_0",   dequant_pq4_0_len,   dequant_pq4_0_data,   "main", 2, 5 * sizeof(uint32_t), {128, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_dequant[GGML_TYPE_TBQ3_0_64],  "dequant_tbq3_0_64",   dequant_tbq3_0_64_len,   dequant_tbq3_0_64_data,   "main", 2, 5 * sizeof(uint32_t), {64, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_dequant[GGML_TYPE_PQ3_0_64],  "dequant_pq3_0_64",   dequant_pq3_0_64_len,   dequant_pq3_0_64_data,   "main", 2, 5 * sizeof(uint32_t), {64, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_dequant[GGML_TYPE_TBQ4_0_64],  "dequant_tbq4_0_64",   dequant_tbq4_0_64_len,   dequant_tbq4_0_64_data,   "main", 2, 5 * sizeof(uint32_t), {64, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_dequant[GGML_TYPE_PQ4_0_64],  "dequant_pq4_0_64",   dequant_pq4_0_64_len,   dequant_pq4_0_64_data,   "main", 2, 5 * sizeof(uint32_t), {64, 1, 1}, {}, 1);
 
     // get_rows
     ggml_vk_create_pipeline(device, device->pipeline_get_rows[GGML_TYPE_F32 ], "get_rows_f32",  get_rows_f32_len,  get_rows_f32_data,  "main", 3, sizeof(vk_op_binary_push_constants), { 512, 1, 1}, {}, 1);
@@ -3312,8 +3547,24 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             ggml_vk_create_pipeline(device, device->pipeline_fa_sparse_compact_subgroup, "fa_sparse_compact_subgroup", fa_sparse_compact_subgroup_len, fa_sparse_compact_subgroup_data, "main", 2, sizeof(vk_op_flash_attn_sparse_compact_push_constants), {1, 1, 1}, {compact_wg, compact_num_sg}, 1, true, true, device->subgroup_size);
         } else {
             ggml_vk_create_pipeline(device, device->pipeline_fa_sparse_compact, "fa_sparse_compact", fa_sparse_compact_len, fa_sparse_compact_data, "main", 2, sizeof(vk_op_flash_attn_sparse_compact_push_constants), {1, 1, 1}, {compact_max}, 1, true);
+
         }
     }
+    const uint32_t tbq_qjl_sg_spec = tbq_copy_sg_spec ? tbq_copy_sg_spec : device->subgroup_size;
+    const std::vector<uint32_t> tbq_qjl_spec_consts = { tbq_qjl_sg_spec };
+    // TBQ standalone MUL_MAT QJL (Stage 2) correction pass: one workgroup per
+    // (row, col, batch), QUANT_K threads running the same Walsh-Hadamard + QJL
+    // epilogue as mul_mat_vec_tbq*_0.comp. SG_SIZE matches copy_to_quant.comp's
+    // subgroup stitching strategy for 4/8/16/32/64-lane devices.
+    ggml_vk_create_pipeline(device, device->pipeline_mul_mm_tbq_qjl[GGML_TYPE_TBQ3_0][0], "mul_mm_qjl_tbq3_0_f32", mul_mm_qjl_tbq3_0_f32_len, mul_mm_qjl_tbq3_0_f32_data, "main", 3, sizeof(vk_mat_mat_qjl_push_constants), {1, 1, 1}, tbq_qjl_spec_consts, 1, false, false, tbq_copy_sg_req);
+    ggml_vk_create_pipeline(device, device->pipeline_mul_mm_tbq_qjl[GGML_TYPE_TBQ3_0][1], "mul_mm_qjl_tbq3_0_f16", mul_mm_qjl_tbq3_0_f16_len, mul_mm_qjl_tbq3_0_f16_data, "main", 3, sizeof(vk_mat_mat_qjl_push_constants), {1, 1, 1}, tbq_qjl_spec_consts, 1, false, false, tbq_copy_sg_req);
+    ggml_vk_create_pipeline(device, device->pipeline_mul_mm_tbq_qjl[GGML_TYPE_TBQ4_0][0], "mul_mm_qjl_tbq4_0_f32", mul_mm_qjl_tbq4_0_f32_len, mul_mm_qjl_tbq4_0_f32_data, "main", 3, sizeof(vk_mat_mat_qjl_push_constants), {1, 1, 1}, tbq_qjl_spec_consts, 1, false, false, tbq_copy_sg_req);
+    ggml_vk_create_pipeline(device, device->pipeline_mul_mm_tbq_qjl[GGML_TYPE_TBQ4_0][1], "mul_mm_qjl_tbq4_0_f16", mul_mm_qjl_tbq4_0_f16_len, mul_mm_qjl_tbq4_0_f16_data, "main", 3, sizeof(vk_mat_mat_qjl_push_constants), {1, 1, 1}, tbq_qjl_spec_consts, 1, false, false, tbq_copy_sg_req);
+    // head_dim=64 QJL correction variants (same shader source, QUANT_K=64 via DATA_A_TBQ*_0_64).
+    ggml_vk_create_pipeline(device, device->pipeline_mul_mm_tbq_qjl[GGML_TYPE_TBQ3_0_64][0], "mul_mm_qjl_tbq3_0_64_f32", mul_mm_qjl_tbq3_0_64_f32_len, mul_mm_qjl_tbq3_0_64_f32_data, "main", 3, sizeof(vk_mat_mat_qjl_push_constants), {1, 1, 1}, tbq_qjl_spec_consts, 1, false, false, tbq_copy_sg_req);
+    ggml_vk_create_pipeline(device, device->pipeline_mul_mm_tbq_qjl[GGML_TYPE_TBQ3_0_64][1], "mul_mm_qjl_tbq3_0_64_f16", mul_mm_qjl_tbq3_0_64_f16_len, mul_mm_qjl_tbq3_0_64_f16_data, "main", 3, sizeof(vk_mat_mat_qjl_push_constants), {1, 1, 1}, tbq_qjl_spec_consts, 1, false, false, tbq_copy_sg_req);
+    ggml_vk_create_pipeline(device, device->pipeline_mul_mm_tbq_qjl[GGML_TYPE_TBQ4_0_64][0], "mul_mm_qjl_tbq4_0_64_f32", mul_mm_qjl_tbq4_0_64_f32_len, mul_mm_qjl_tbq4_0_64_f32_data, "main", 3, sizeof(vk_mat_mat_qjl_push_constants), {1, 1, 1}, tbq_qjl_spec_consts, 1, false, false, tbq_copy_sg_req);
+    ggml_vk_create_pipeline(device, device->pipeline_mul_mm_tbq_qjl[GGML_TYPE_TBQ4_0_64][1], "mul_mm_qjl_tbq4_0_64_f16", mul_mm_qjl_tbq4_0_64_f16_len, mul_mm_qjl_tbq4_0_64_f16_data, "main", 3, sizeof(vk_mat_mat_qjl_push_constants), {1, 1, 1}, tbq_qjl_spec_consts, 1, false, false, tbq_copy_sg_req);
 
     if (device->subgroup_clustered && device->subgroup_require_full_support) {
         ggml_vk_create_pipeline(device, device->pipeline_quantize_q8_1_x4, "quantize_q8_1_x4", quantize_q8_1_x4_subgroup_len, quantize_q8_1_x4_subgroup_data, "main", 2, sizeof(vk_quantize_q8_1_push_constants), {32 * device->subgroup_size / 8, 1, 1}, { device->subgroup_size }, 1, true, true);
@@ -3390,7 +3641,14 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     ggml_vk_create_pipeline(device, device->pipeline_cpy_transpose_02_32, "cpy_transpose_02_32", cpy_transpose_02_32_len, cpy_transpose_02_32_data, "main", 2, sizeof(vk_op_unary_push_constants), {1, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_cpy_transpose_02_16, "cpy_transpose_02_16", cpy_transpose_02_16_len, cpy_transpose_02_16_data, "main", 2, sizeof(vk_op_unary_push_constants), {1, 1, 1}, {}, 1);
 
+    // TODO(tbq-rebase): HEAD adds Q1_0 pipelines for cpy_f32_quant and set_rows; PR rewrites
+    // these into a more elaborate RTE / TQ_NC macro structure that doesn't include Q1_0.
+    // The Q1_0 cpy/set_rows pipelines are not registered in this merged path. Add them
+    // back if Q1_0 quantization is needed at runtime.
     ggml_vk_create_pipeline(device, device->pipeline_cpy_f32_quant[GGML_TYPE_Q1_0], "cpy_f32_q1_0", cpy_f32_q1_0_len, cpy_f32_q1_0_data, "main", 2, sizeof(vk_op_unary_push_constants), {32, 1, 1}, {}, 1);
+    const char * tq_nc_env = getenv("GGML_TQ_NORM_CORRECTION");
+    const bool tq_nc = (tq_nc_env && tq_nc_env[0] == '1');
+
     ggml_vk_create_pipeline(device, device->pipeline_cpy_f32_quant[GGML_TYPE_Q2_0], "cpy_f32_q2_0", cpy_f32_q2_0_len, cpy_f32_q2_0_data, "main", 2, sizeof(vk_op_unary_push_constants), {32, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_cpy_f32_quant[GGML_TYPE_Q4_0], "cpy_f32_q4_0", cpy_f32_q4_0_len, cpy_f32_q4_0_data, "main", 2, sizeof(vk_op_unary_push_constants), {32, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_cpy_f32_quant[GGML_TYPE_Q4_1], "cpy_f32_q4_1", cpy_f32_q4_1_len, cpy_f32_q4_1_data, "main", 2, sizeof(vk_op_unary_push_constants), {32, 1, 1}, {}, 1);
@@ -3398,6 +3656,25 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     ggml_vk_create_pipeline(device, device->pipeline_cpy_f32_quant[GGML_TYPE_Q5_1], "cpy_f32_q5_1", cpy_f32_q5_1_len, cpy_f32_q5_1_data, "main", 2, sizeof(vk_op_unary_push_constants), {32, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_cpy_f32_quant[GGML_TYPE_Q8_0], "cpy_f32_q8_0", cpy_f32_q8_0_len, cpy_f32_q8_0_data, "main", 2, sizeof(vk_op_unary_push_constants), {32, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_cpy_f32_quant[GGML_TYPE_IQ4_NL], "cpy_f32_iq4_nl", cpy_f32_iq4_nl_len, cpy_f32_iq4_nl_data, "main", 2, sizeof(vk_op_unary_push_constants), {32, 1, 1}, {}, 1);
+    if (tq_nc) {
+        ggml_vk_create_pipeline(device, device->pipeline_cpy_f32_quant[GGML_TYPE_TBQ3_0],    "cpy_f32_tbq3_0_nc",    cpy_f32_tbq3_0_nc_len,    cpy_f32_tbq3_0_nc_data,    "main", 2, sizeof(vk_op_unary_push_constants), {1, 1, 1}, tbq_copy_spec_consts, 1, false, false, tbq_copy_sg_req);
+        ggml_vk_create_pipeline(device, device->pipeline_cpy_f32_quant[GGML_TYPE_PQ3_0],     "cpy_f32_pq3_0_nc",     cpy_f32_pq3_0_nc_len,     cpy_f32_pq3_0_nc_data,     "main", 2, sizeof(vk_op_unary_push_constants), {1, 1, 1}, tbq_copy_spec_consts, 1, false, false, tbq_copy_sg_req);
+        ggml_vk_create_pipeline(device, device->pipeline_cpy_f32_quant[GGML_TYPE_TBQ4_0],    "cpy_f32_tbq4_0_nc",    cpy_f32_tbq4_0_nc_len,    cpy_f32_tbq4_0_nc_data,    "main", 2, sizeof(vk_op_unary_push_constants), {1, 1, 1}, tbq_copy_spec_consts, 1, false, false, tbq_copy_sg_req);
+        ggml_vk_create_pipeline(device, device->pipeline_cpy_f32_quant[GGML_TYPE_PQ4_0],     "cpy_f32_pq4_0_nc",     cpy_f32_pq4_0_nc_len,     cpy_f32_pq4_0_nc_data,     "main", 2, sizeof(vk_op_unary_push_constants), {1, 1, 1}, tbq_copy_spec_consts, 1, false, false, tbq_copy_sg_req);
+        ggml_vk_create_pipeline(device, device->pipeline_cpy_f32_quant[GGML_TYPE_TBQ3_0_64], "cpy_f32_tbq3_0_64_nc", cpy_f32_tbq3_0_64_nc_len, cpy_f32_tbq3_0_64_nc_data, "main", 2, sizeof(vk_op_unary_push_constants), {1, 1, 1}, tbq_copy_spec_consts, 1, false, false, tbq_copy_sg_req);
+        ggml_vk_create_pipeline(device, device->pipeline_cpy_f32_quant[GGML_TYPE_PQ3_0_64],  "cpy_f32_pq3_0_64_nc",  cpy_f32_pq3_0_64_nc_len,  cpy_f32_pq3_0_64_nc_data,  "main", 2, sizeof(vk_op_unary_push_constants), {1, 1, 1}, tbq_copy_spec_consts, 1, false, false, tbq_copy_sg_req);
+        ggml_vk_create_pipeline(device, device->pipeline_cpy_f32_quant[GGML_TYPE_TBQ4_0_64], "cpy_f32_tbq4_0_64_nc", cpy_f32_tbq4_0_64_nc_len, cpy_f32_tbq4_0_64_nc_data, "main", 2, sizeof(vk_op_unary_push_constants), {1, 1, 1}, tbq_copy_spec_consts, 1, false, false, tbq_copy_sg_req);
+        ggml_vk_create_pipeline(device, device->pipeline_cpy_f32_quant[GGML_TYPE_PQ4_0_64],  "cpy_f32_pq4_0_64_nc",  cpy_f32_pq4_0_64_nc_len,  cpy_f32_pq4_0_64_nc_data,  "main", 2, sizeof(vk_op_unary_push_constants), {1, 1, 1}, tbq_copy_spec_consts, 1, false, false, tbq_copy_sg_req);
+    } else {
+        ggml_vk_create_pipeline(device, device->pipeline_cpy_f32_quant[GGML_TYPE_TBQ3_0],    "cpy_f32_tbq3_0",    cpy_f32_tbq3_0_len,    cpy_f32_tbq3_0_data,    "main", 2, sizeof(vk_op_unary_push_constants), {1, 1, 1}, tbq_copy_spec_consts, 1, false, false, tbq_copy_sg_req);
+        ggml_vk_create_pipeline(device, device->pipeline_cpy_f32_quant[GGML_TYPE_PQ3_0],     "cpy_f32_pq3_0",     cpy_f32_pq3_0_len,     cpy_f32_pq3_0_data,     "main", 2, sizeof(vk_op_unary_push_constants), {1, 1, 1}, tbq_copy_spec_consts, 1, false, false, tbq_copy_sg_req);
+        ggml_vk_create_pipeline(device, device->pipeline_cpy_f32_quant[GGML_TYPE_TBQ4_0],    "cpy_f32_tbq4_0",    cpy_f32_tbq4_0_len,    cpy_f32_tbq4_0_data,    "main", 2, sizeof(vk_op_unary_push_constants), {1, 1, 1}, tbq_copy_spec_consts, 1, false, false, tbq_copy_sg_req);
+        ggml_vk_create_pipeline(device, device->pipeline_cpy_f32_quant[GGML_TYPE_PQ4_0],     "cpy_f32_pq4_0",     cpy_f32_pq4_0_len,     cpy_f32_pq4_0_data,     "main", 2, sizeof(vk_op_unary_push_constants), {1, 1, 1}, tbq_copy_spec_consts, 1, false, false, tbq_copy_sg_req);
+        ggml_vk_create_pipeline(device, device->pipeline_cpy_f32_quant[GGML_TYPE_TBQ3_0_64], "cpy_f32_tbq3_0_64", cpy_f32_tbq3_0_64_len, cpy_f32_tbq3_0_64_data, "main", 2, sizeof(vk_op_unary_push_constants), {1, 1, 1}, tbq_copy_spec_consts, 1, false, false, tbq_copy_sg_req);
+        ggml_vk_create_pipeline(device, device->pipeline_cpy_f32_quant[GGML_TYPE_PQ3_0_64],  "cpy_f32_pq3_0_64",  cpy_f32_pq3_0_64_len,  cpy_f32_pq3_0_64_data,  "main", 2, sizeof(vk_op_unary_push_constants), {1, 1, 1}, tbq_copy_spec_consts, 1, false, false, tbq_copy_sg_req);
+        ggml_vk_create_pipeline(device, device->pipeline_cpy_f32_quant[GGML_TYPE_TBQ4_0_64], "cpy_f32_tbq4_0_64", cpy_f32_tbq4_0_64_len, cpy_f32_tbq4_0_64_data, "main", 2, sizeof(vk_op_unary_push_constants), {1, 1, 1}, tbq_copy_spec_consts, 1, false, false, tbq_copy_sg_req);
+        ggml_vk_create_pipeline(device, device->pipeline_cpy_f32_quant[GGML_TYPE_PQ4_0_64],  "cpy_f32_pq4_0_64",  cpy_f32_pq4_0_64_len,  cpy_f32_pq4_0_64_data,  "main", 2, sizeof(vk_op_unary_push_constants), {1, 1, 1}, tbq_copy_spec_consts, 1, false, false, tbq_copy_sg_req);
+    }
 
 #define SET_ROWS(src_idx, src, itype) \
         ggml_vk_create_pipeline(device, device->pipeline_set_rows ## itype [src_idx][GGML_TYPE_F32],  "set_rows_" #src "_f32" #itype,  set_rows_ ## src ## _f32 ## itype ## _len,  set_rows_ ## src ## _f32 ## itype ## _data,  "main", 3, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {1}, 1, true); \
@@ -3412,11 +3689,26 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         ggml_vk_create_pipeline(device, device->pipeline_set_rows ## itype [src_idx][GGML_TYPE_Q8_0], "set_rows_" #src "_q8_0" #itype, set_rows_ ## src ## _q8_0 ## itype ## _len, set_rows_ ## src ## _q8_0 ## itype ## _data, "main", 3, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {1}, 1, true); \
         ggml_vk_create_pipeline(device, device->pipeline_set_rows ## itype [src_idx][GGML_TYPE_IQ4_NL], "set_rows_" #src "_iq4_nl" #itype, set_rows_ ## src ## _iq4_nl ## itype ## _len, set_rows_ ## src ## _iq4_nl ## itype ## _data, "main", 3, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {1}, 1, true);
 
+    // TBQ/PQ set_rows shaders use no source prefix for f32 and f16_ for f16.
+#define SET_ROWS_TQ(src_idx, srcpfx, itype, tsuf, ncsuf) \
+        ggml_vk_create_pipeline(device, device->pipeline_set_rows ## itype [src_idx][GGML_TYPE_TBQ3_0 ## tsuf], "set_rows_" #srcpfx "tbq3_0" #tsuf #itype #ncsuf, set_rows_ ## srcpfx ## tbq3_0 ## tsuf ## itype ## ncsuf ## _len, set_rows_ ## srcpfx ## tbq3_0 ## tsuf ## itype ## ncsuf ## _data, "main", 3, sizeof(vk_op_binary_push_constants), {1, 1, 1}, tbq_set_rows_spec_consts, 1, true, false, tbq_copy_sg_req); \
+        ggml_vk_create_pipeline(device, device->pipeline_set_rows ## itype [src_idx][GGML_TYPE_PQ3_0 ## tsuf],  "set_rows_" #srcpfx "pq3_0"  #tsuf #itype #ncsuf, set_rows_ ## srcpfx ## pq3_0  ## tsuf ## itype ## ncsuf ## _len, set_rows_ ## srcpfx ## pq3_0  ## tsuf ## itype ## ncsuf ## _data, "main", 3, sizeof(vk_op_binary_push_constants), {1, 1, 1}, tbq_set_rows_spec_consts, 1, true, false, tbq_copy_sg_req); \
+        ggml_vk_create_pipeline(device, device->pipeline_set_rows ## itype [src_idx][GGML_TYPE_TBQ4_0 ## tsuf], "set_rows_" #srcpfx "tbq4_0" #tsuf #itype #ncsuf, set_rows_ ## srcpfx ## tbq4_0 ## tsuf ## itype ## ncsuf ## _len, set_rows_ ## srcpfx ## tbq4_0 ## tsuf ## itype ## ncsuf ## _data, "main", 3, sizeof(vk_op_binary_push_constants), {1, 1, 1}, tbq_set_rows_spec_consts, 1, true, false, tbq_copy_sg_req); \
+        ggml_vk_create_pipeline(device, device->pipeline_set_rows ## itype [src_idx][GGML_TYPE_PQ4_0 ## tsuf],  "set_rows_" #srcpfx "pq4_0"  #tsuf #itype #ncsuf, set_rows_ ## srcpfx ## pq4_0  ## tsuf ## itype ## ncsuf ## _len, set_rows_ ## srcpfx ## pq4_0  ## tsuf ## itype ## ncsuf ## _data, "main", 3, sizeof(vk_op_binary_push_constants), {1, 1, 1}, tbq_set_rows_spec_consts, 1, true, false, tbq_copy_sg_req);
+
     SET_ROWS(0, f32, _i32)
     SET_ROWS(0, f32, _i64)
     SET_ROWS(1, f16, _i32)
     SET_ROWS(1, f16, _i64)
+    if (tq_nc) {
+        SET_ROWS_TQ(0,     , _i32,    , _nc) SET_ROWS_TQ(0,     , _i64,    , _nc) SET_ROWS_TQ(0,     , _i32, _64, _nc) SET_ROWS_TQ(0,     , _i64, _64, _nc)
+        SET_ROWS_TQ(1, f16_, _i32,    , _nc) SET_ROWS_TQ(1, f16_, _i64,    , _nc) SET_ROWS_TQ(1, f16_, _i32, _64, _nc) SET_ROWS_TQ(1, f16_, _i64, _64, _nc)
+    } else {
+        SET_ROWS_TQ(0,     , _i32,    , )    SET_ROWS_TQ(0,     , _i64,    , )    SET_ROWS_TQ(0,     , _i32, _64, )    SET_ROWS_TQ(0,     , _i64, _64, )
+        SET_ROWS_TQ(1, f16_, _i32,    , )    SET_ROWS_TQ(1, f16_, _i64,    , )    SET_ROWS_TQ(1, f16_, _i32, _64, )    SET_ROWS_TQ(1, f16_, _i64, _64, )
+    }
 #undef SET_ROWS
+#undef SET_ROWS_TQ
 
 
     ggml_vk_create_pipeline(device, device->pipeline_cpy_quant_f32[GGML_TYPE_Q1_0], "cpy_q1_0_f32", cpy_q1_0_f32_len, cpy_q1_0_f32_data, "main", 2, sizeof(vk_op_unary_push_constants), {(uint32_t)ggml_blck_size(GGML_TYPE_Q1_0), 1, 1}, {}, 1);
@@ -3427,6 +3719,30 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     ggml_vk_create_pipeline(device, device->pipeline_cpy_quant_f32[GGML_TYPE_Q5_1], "cpy_q5_1_f32", cpy_q5_1_f32_len, cpy_q5_1_f32_data, "main", 2, sizeof(vk_op_unary_push_constants), {(uint32_t)ggml_blck_size(GGML_TYPE_Q5_1), 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_cpy_quant_f32[GGML_TYPE_Q8_0], "cpy_q8_0_f32", cpy_q8_0_f32_len, cpy_q8_0_f32_data, "main", 2, sizeof(vk_op_unary_push_constants), {(uint32_t)ggml_blck_size(GGML_TYPE_Q8_0), 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_cpy_quant_f32[GGML_TYPE_IQ4_NL], "cpy_iq4_nl_f32", cpy_iq4_nl_f32_len, cpy_iq4_nl_f32_data, "main", 2, sizeof(vk_op_unary_push_constants), {(uint32_t)ggml_blck_size(GGML_TYPE_IQ4_NL), 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_cpy_quant_f32[GGML_TYPE_TBQ3_0], "cpy_tbq3_0_f32", cpy_tbq3_0_f32_len, cpy_tbq3_0_f32_data, "main", 2, sizeof(vk_op_unary_push_constants), {(uint32_t)ggml_blck_size(GGML_TYPE_TBQ3_0), 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_cpy_quant_f32[GGML_TYPE_PQ3_0], "cpy_pq3_0_f32", cpy_pq3_0_f32_len, cpy_pq3_0_f32_data, "main", 2, sizeof(vk_op_unary_push_constants), {(uint32_t)ggml_blck_size(GGML_TYPE_PQ3_0), 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_cpy_quant_f32[GGML_TYPE_TBQ4_0], "cpy_tbq4_0_f32", cpy_tbq4_0_f32_len, cpy_tbq4_0_f32_data, "main", 2, sizeof(vk_op_unary_push_constants), {(uint32_t)ggml_blck_size(GGML_TYPE_TBQ4_0), 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_cpy_quant_f32[GGML_TYPE_PQ4_0], "cpy_pq4_0_f32", cpy_pq4_0_f32_len, cpy_pq4_0_f32_data, "main", 2, sizeof(vk_op_unary_push_constants), {(uint32_t)ggml_blck_size(GGML_TYPE_PQ4_0), 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_cpy_quant_f32[GGML_TYPE_TBQ3_0_64], "cpy_tbq3_0_64_f32", cpy_tbq3_0_64_f32_len, cpy_tbq3_0_64_f32_data, "main", 2, sizeof(vk_op_unary_push_constants), {(uint32_t)ggml_blck_size(GGML_TYPE_TBQ3_0_64), 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_cpy_quant_f32[GGML_TYPE_PQ3_0_64], "cpy_pq3_0_64_f32", cpy_pq3_0_64_f32_len, cpy_pq3_0_64_f32_data, "main", 2, sizeof(vk_op_unary_push_constants), {(uint32_t)ggml_blck_size(GGML_TYPE_PQ3_0_64), 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_cpy_quant_f32[GGML_TYPE_TBQ4_0_64], "cpy_tbq4_0_64_f32", cpy_tbq4_0_64_f32_len, cpy_tbq4_0_64_f32_data, "main", 2, sizeof(vk_op_unary_push_constants), {(uint32_t)ggml_blck_size(GGML_TYPE_TBQ4_0_64), 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_cpy_quant_f32[GGML_TYPE_PQ4_0_64], "cpy_pq4_0_64_f32", cpy_pq4_0_64_f32_len, cpy_pq4_0_64_f32_data, "main", 2, sizeof(vk_op_unary_push_constants), {(uint32_t)ggml_blck_size(GGML_TYPE_PQ4_0_64), 1, 1}, {}, 1);
+
+    // Quant -> f16 cpy (used by MUL_MAT when src0 is quantized and non-dim01-contiguous).
+    ggml_vk_create_pipeline(device, device->pipeline_cpy_quant_f16[GGML_TYPE_Q4_0], "cpy_q4_0_f16", cpy_q4_0_f16_len, cpy_q4_0_f16_data, "main", 2, sizeof(vk_op_unary_push_constants), {(uint32_t)ggml_blck_size(GGML_TYPE_Q4_0), 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_cpy_quant_f16[GGML_TYPE_Q4_1], "cpy_q4_1_f16", cpy_q4_1_f16_len, cpy_q4_1_f16_data, "main", 2, sizeof(vk_op_unary_push_constants), {(uint32_t)ggml_blck_size(GGML_TYPE_Q4_1), 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_cpy_quant_f16[GGML_TYPE_Q5_0], "cpy_q5_0_f16", cpy_q5_0_f16_len, cpy_q5_0_f16_data, "main", 2, sizeof(vk_op_unary_push_constants), {(uint32_t)ggml_blck_size(GGML_TYPE_Q5_0), 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_cpy_quant_f16[GGML_TYPE_Q5_1], "cpy_q5_1_f16", cpy_q5_1_f16_len, cpy_q5_1_f16_data, "main", 2, sizeof(vk_op_unary_push_constants), {(uint32_t)ggml_blck_size(GGML_TYPE_Q5_1), 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_cpy_quant_f16[GGML_TYPE_Q8_0], "cpy_q8_0_f16", cpy_q8_0_f16_len, cpy_q8_0_f16_data, "main", 2, sizeof(vk_op_unary_push_constants), {(uint32_t)ggml_blck_size(GGML_TYPE_Q8_0), 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_cpy_quant_f16[GGML_TYPE_IQ4_NL], "cpy_iq4_nl_f16", cpy_iq4_nl_f16_len, cpy_iq4_nl_f16_data, "main", 2, sizeof(vk_op_unary_push_constants), {(uint32_t)ggml_blck_size(GGML_TYPE_IQ4_NL), 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_cpy_quant_f16[GGML_TYPE_TBQ3_0], "cpy_tbq3_0_f16", cpy_tbq3_0_f16_len, cpy_tbq3_0_f16_data, "main", 2, sizeof(vk_op_unary_push_constants), {(uint32_t)ggml_blck_size(GGML_TYPE_TBQ3_0), 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_cpy_quant_f16[GGML_TYPE_PQ3_0], "cpy_pq3_0_f16", cpy_pq3_0_f16_len, cpy_pq3_0_f16_data, "main", 2, sizeof(vk_op_unary_push_constants), {(uint32_t)ggml_blck_size(GGML_TYPE_PQ3_0), 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_cpy_quant_f16[GGML_TYPE_TBQ4_0], "cpy_tbq4_0_f16", cpy_tbq4_0_f16_len, cpy_tbq4_0_f16_data, "main", 2, sizeof(vk_op_unary_push_constants), {(uint32_t)ggml_blck_size(GGML_TYPE_TBQ4_0), 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_cpy_quant_f16[GGML_TYPE_PQ4_0], "cpy_pq4_0_f16", cpy_pq4_0_f16_len, cpy_pq4_0_f16_data, "main", 2, sizeof(vk_op_unary_push_constants), {(uint32_t)ggml_blck_size(GGML_TYPE_PQ4_0), 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_cpy_quant_f16[GGML_TYPE_TBQ3_0_64], "cpy_tbq3_0_64_f16", cpy_tbq3_0_64_f16_len, cpy_tbq3_0_64_f16_data, "main", 2, sizeof(vk_op_unary_push_constants), {(uint32_t)ggml_blck_size(GGML_TYPE_TBQ3_0_64), 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_cpy_quant_f16[GGML_TYPE_PQ3_0_64], "cpy_pq3_0_64_f16", cpy_pq3_0_64_f16_len, cpy_pq3_0_64_f16_data, "main", 2, sizeof(vk_op_unary_push_constants), {(uint32_t)ggml_blck_size(GGML_TYPE_PQ3_0_64), 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_cpy_quant_f16[GGML_TYPE_TBQ4_0_64], "cpy_tbq4_0_64_f16", cpy_tbq4_0_64_f16_len, cpy_tbq4_0_64_f16_data, "main", 2, sizeof(vk_op_unary_push_constants), {(uint32_t)ggml_blck_size(GGML_TYPE_TBQ4_0_64), 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_cpy_quant_f16[GGML_TYPE_PQ4_0_64], "cpy_pq4_0_64_f16", cpy_pq4_0_64_f16_len, cpy_pq4_0_64_f16_data, "main", 2, sizeof(vk_op_unary_push_constants), {(uint32_t)ggml_blck_size(GGML_TYPE_PQ4_0_64), 1, 1}, {}, 1);
 
     auto get_suffix = [](bool src0_f16, bool src1_f16, bool dst_f16) {
         std::string s;
@@ -4658,6 +4974,83 @@ vk_device ggml_vk_get_device(size_t idx) {
 
         device->subgroup_require_full_support = subgroup_size_control_features.computeFullSubgroups;
 
+        // TBQ/PQ cooperative copy_to_quant subgroup size override. Zero means
+        // "no override" (the pipeline is created without a required subgroup
+        // size and with the SG_SIZE spec constant left at its default of 32,
+        // matching the pre-generalization behaviour). A non-zero value forces
+        // the pipeline to use that subgroup size via
+        // VK_EXT_subgroup_size_control and passes the same value as the
+        // SG_SIZE spec constant, which exercises the shared-memory stitch
+        // path for SG_SIZE < 32. Used by tests/test-copy-tbq-subgroups.cpp to
+        // verify the generalized shader on hosts that only expose one native
+        // subgroup size.
+        //
+        // Accepted values: SG_SIZE >= 4 and power of two. Rationale:
+        //   * The shader's TQ_WG is 32, and NSG = TQ_WG / SG_SIZE must fit in
+        //     the tq_sh_red scratch array sized TQ_WG/4 = 8. That caps NSG at
+        //     8, i.e. SG_SIZE >= 4.
+        //   * SG_SIZE > TQ_WG is handled as the fast path (NSG=1 via clamp)
+        //     and is accepted up to the device's subgroup_max_size (AMD
+        //     wave64 at 64, any hypothetical wider native subgroup also).
+        //   * SG_SIZE of 1 or 2 would overflow tq_sh_red, so we reject those
+        //     even though they are nominally powers of two within some
+        //     devices' [subgroup_min_size, subgroup_max_size] range.
+        //   * Non-powers-of-two produce fractional NSG and would corrupt
+        //     the reduction; rejected even if in the device's range.
+        // Values failing either check, or outside the device's supported
+        // range, are rejected with a warning and the override is left at 0.
+        device->tbq_copy_sg_size = 0;
+        {
+            const char * env = getenv("GGML_VK_TBQ_COPY_SG_SIZE");
+            if (env && *env) {
+                // Reason codes for the structured status line below. Kept
+                // short and stable so tests can grep for them.
+                const char * reason = "applied";  // default if accepted
+                const uint32_t requested = (uint32_t) std::atoi(env);
+                if (!device->subgroup_size_control) {
+                    GGML_LOG_WARN("ggml_vulkan: GGML_VK_TBQ_COPY_SG_SIZE=%s ignored: "
+                                  "VK_EXT_subgroup_size_control not available on this device\n",
+                                  env);
+                    reason = "no_size_control";
+                } else {
+                    const bool in_range =
+                        requested >= device->subgroup_min_size && requested <= device->subgroup_max_size;
+                    // copy_to_quant.comp requires SG >= 4 and a power of two.
+                    // SG >= 4 because `tq_sh_red` is sized TQ_WG/4 = 8; any
+                    // smaller SG would make NSG = TQ_WG / SG exceed that
+                    // and overflow the stitch scratch array.
+                    // Power of two because NSG is computed by integer
+                    // division and the FHT/QJL packing fan-out is power-of-
+                    // two-indexed; 3, 5, 6 etc. would produce a fractional
+                    // NSG and corrupt the reduction.
+                    const bool supported_by_shader =
+                        requested >= 4u && (requested & (requested - 1u)) == 0u;
+                    if (in_range && supported_by_shader) {
+                        device->tbq_copy_sg_size = requested;
+                    } else if (!supported_by_shader) {
+                        GGML_LOG_WARN("ggml_vulkan: GGML_VK_TBQ_COPY_SG_SIZE=%s not supported by "
+                                      "copy_to_quant.comp (requires >= 4 and power of two); ignoring\n",
+                                      env);
+                        reason = "unsupported_by_shader";
+                    } else {
+                        GGML_LOG_WARN("ggml_vulkan: GGML_VK_TBQ_COPY_SG_SIZE=%s outside device "
+                                      "subgroup range [%u, %u]; ignoring\n",
+                                      env, device->subgroup_min_size, device->subgroup_max_size);
+                        reason = "out_of_range";
+                    }
+                }
+                // Structured, machine-parseable status. Always emitted when the
+                // env var is set so tests can distinguish "override applied" from
+                // "override requested but rejected -> ran at default". Prefix is
+                // stable; keys are: requested=<int>, applied=<int>, reason=<word>.
+                // applied=0 means the override was rejected and the pipeline will
+                // be created with the shader default (SG_SIZE=32, no required
+                // subgroup size).
+                GGML_LOG_INFO("ggml_vulkan: tbq_copy_sg_size_status requested=%u applied=%u reason=%s\n",
+                              requested, device->tbq_copy_sg_size, reason);
+            }
+        }
+
 #if defined(VK_KHR_cooperative_matrix)
         device->coopmat_support = device->coopmat_support && coopmat_features.cooperativeMatrix;
         device->coopmat1_fa_support = device->coopmat_support && device->subgroup_require_full_support;
@@ -5510,6 +5903,15 @@ void ggml_vk_instance_init() {
             return;
         }
 
+        // Opt-in: tests (notably test-copy-tbq-subgroups with lavapipe) need
+        // to use CPU-type Vulkan implementations (lavapipe, SwiftShader) to
+        // exercise paths that require small native subgroup sizes which real
+        // GPUs don't expose. Production never sets this.
+        const bool allow_cpu_devices = []() {
+            const char * e = getenv("GGML_VK_ALLOW_CPU_DEVICES");
+            return e && *e && e[0] != '0';
+        }();
+
         // Default to using all dedicated GPUs
         for (size_t i = 0; i < devices.size(); i++) {
             vk::PhysicalDeviceProperties2 new_props;
@@ -5519,7 +5921,11 @@ void ggml_vk_instance_init() {
             new_driver.pNext = &new_id;
             devices[i].getProperties2(&new_props);
 
-            if ((new_props.properties.deviceType == vk::PhysicalDeviceType::eDiscreteGpu || new_props.properties.deviceType == vk::PhysicalDeviceType::eIntegratedGpu) && ggml_vk_device_is_supported(devices[i])) {
+            const bool type_ok =
+                new_props.properties.deviceType == vk::PhysicalDeviceType::eDiscreteGpu ||
+                new_props.properties.deviceType == vk::PhysicalDeviceType::eIntegratedGpu ||
+                (allow_cpu_devices && new_props.properties.deviceType == vk::PhysicalDeviceType::eCpu);
+            if (type_ok && ggml_vk_device_is_supported(devices[i])) {
                 // Check if there are two physical devices corresponding to the same GPU
                 // This handles the case where the same GPU appears with different drivers (e.g., RADV + AMDVLK on Linux),
                 // see https://github.com/ggml-org/llama.cpp/pull/7582 for original deduplication.
@@ -5743,6 +6149,14 @@ vk_pipeline ggml_vk_get_to_fp16(ggml_backend_vk_context * ctx, ggml_type type) {
         case GGML_TYPE_NVFP4:
         case GGML_TYPE_TQ1_0:
         case GGML_TYPE_TQ2_0:
+        case GGML_TYPE_TBQ3_0:
+        case GGML_TYPE_PQ3_0:
+        case GGML_TYPE_TBQ4_0:
+        case GGML_TYPE_PQ4_0:
+        case GGML_TYPE_TBQ3_0_64:
+        case GGML_TYPE_PQ3_0_64:
+        case GGML_TYPE_TBQ4_0_64:
+        case GGML_TYPE_PQ4_0_64:
             break;
         default:
             return nullptr;
@@ -5792,6 +6206,10 @@ static vk_pipeline ggml_vk_get_dequantize_mul_mat_vec(ggml_backend_vk_context * 
         case GGML_TYPE_Q5_0:
         case GGML_TYPE_Q5_1:
         case GGML_TYPE_Q8_0:
+        case GGML_TYPE_TBQ3_0:
+        case GGML_TYPE_PQ3_0:
+        case GGML_TYPE_TBQ4_0:
+        case GGML_TYPE_PQ4_0:
         case GGML_TYPE_Q2_K:
         case GGML_TYPE_Q3_K:
         case GGML_TYPE_Q4_K:
@@ -5883,6 +6301,10 @@ static vk_pipeline ggml_vk_get_dequantize_mul_mat_vec_id(ggml_backend_vk_context
         case GGML_TYPE_Q5_0:
         case GGML_TYPE_Q5_1:
         case GGML_TYPE_Q8_0:
+        case GGML_TYPE_TBQ3_0:
+        case GGML_TYPE_PQ3_0:
+        case GGML_TYPE_TBQ4_0:
+        case GGML_TYPE_PQ4_0:
         case GGML_TYPE_Q2_K:
         case GGML_TYPE_Q3_K:
         case GGML_TYPE_Q4_K:
@@ -6105,10 +6527,19 @@ void deferred_memset(void * dst, uint32_t val, size_t size, std::vector<vk_stagi
     }
 }
 
-static uint32_t ggml_vk_guess_split_k(ggml_backend_vk_context * ctx, uint32_t m, uint32_t n, uint32_t k, bool disable_split_k, const vk_pipeline& pipeline) {
+static uint32_t ggml_vk_guess_split_k(ggml_backend_vk_context * ctx, uint32_t m, uint32_t n, uint32_t k, bool disable_split_k, const vk_pipeline& pipeline, ggml_type src0_type = GGML_TYPE_COUNT) {
     VK_LOG_DEBUG("ggml_vk_guess_split_k(" << m << ", " << n << ", " << k << ", " << disable_split_k << ")");
 
     if (disable_split_k) {
+        return 1;
+    }
+
+    // Standalone MUL_MAT on TBQ needs a QJL correction pass that reads the
+    // full pre-split K to compute per-block Hadamard sums. The current pass
+    // runs after ggml_vk_matmul and isn't split_k-aware, so keep k un-split
+    // for TBQ. Cost is minor since TBQ is mostly used in Flash Attention.
+    if (src0_type == GGML_TYPE_TBQ3_0    || src0_type == GGML_TYPE_TBQ4_0 ||
+        src0_type == GGML_TYPE_TBQ3_0_64 || src0_type == GGML_TYPE_TBQ4_0_64) {
         return 1;
     }
 
@@ -6250,8 +6681,14 @@ static bool ggml_vk_get_mul_mat_mat_f16acc(ggml_backend_vk_context * ctx, ggml_t
     if (src0_type == GGML_TYPE_F32 || src0_type == GGML_TYPE_BF16) return false;
     if (src1_type == GGML_TYPE_Q8_1) return false;
     const bool prec_allows_f16 = ggml_vk_prec_allows_f16acc(acc_prec);
-    // f16 accumulation gives NaN for TQ1/TQ2, so always accumulate in f32
-    if (src0_type == GGML_TYPE_TQ1_0 || src0_type == GGML_TYPE_TQ2_0) return false;
+    // Force F32 accumulation for TQ1/TQ2 to prevent NaN loss on Mali. Only
+    // there: the NaN loss was observed on Mali (lora finetuning), and f32acc
+    // runs at half the f16acc tensor rate on NVIDIA GeForce, so other vendors
+    // keep the default accumulator selection like upstream.
+    if ((src0_type == GGML_TYPE_TQ1_0 || src0_type == GGML_TYPE_TQ2_0) &&
+        ctx->device->vendor_id == VK_VENDOR_ID_ARM) {
+        return false;
+    }
     if (src0_type == GGML_TYPE_F16) {
         return prec_allows_f16 && ctx->device->fp16 && !(ctx->device->coopmat_support && !ctx->device->coopmat_acc_f16_support);
     }
@@ -6422,6 +6859,14 @@ vk_pipeline ggml_vk_get_cpy_pipeline(ggml_backend_vk_context * ctx, const ggml_t
         case GGML_TYPE_Q5_1:
         case GGML_TYPE_Q8_0:
         case GGML_TYPE_IQ4_NL:
+        case GGML_TYPE_TBQ3_0:
+        case GGML_TYPE_PQ3_0:
+        case GGML_TYPE_TBQ4_0:
+        case GGML_TYPE_PQ4_0:
+        case GGML_TYPE_TBQ3_0_64:
+        case GGML_TYPE_PQ3_0_64:
+        case GGML_TYPE_TBQ4_0_64:
+        case GGML_TYPE_PQ4_0_64:
             return ctx->device->pipeline_cpy_f32_quant[to];
         default:
             break;
@@ -6438,7 +6883,41 @@ vk_pipeline ggml_vk_get_cpy_pipeline(ggml_backend_vk_context * ctx, const ggml_t
         case GGML_TYPE_Q5_1:
         case GGML_TYPE_Q8_0:
         case GGML_TYPE_IQ4_NL:
+        case GGML_TYPE_TBQ3_0:
+        case GGML_TYPE_PQ3_0:
+        case GGML_TYPE_TBQ4_0:
+        case GGML_TYPE_PQ4_0:
+        case GGML_TYPE_TBQ3_0_64:
+        case GGML_TYPE_PQ3_0_64:
+        case GGML_TYPE_TBQ4_0_64:
+        case GGML_TYPE_PQ4_0_64:
             return ctx->device->pipeline_cpy_quant_f32[src->type];
+        default:
+            break;
+        }
+    }
+
+    // Dequant directly to f16. This path is taken by MUL_MAT when src0 is
+    // quantized and not dim01-contiguous (e.g. the permuted K tensor fed into
+    // K*Q when flash attention is disabled). Without it, supports_op would
+    // have to reject these cases and they'd fall back to CPU.
+    if (to == GGML_TYPE_F16) {
+        switch (src->type) {
+        case GGML_TYPE_Q4_0:
+        case GGML_TYPE_Q4_1:
+        case GGML_TYPE_Q5_0:
+        case GGML_TYPE_Q5_1:
+        case GGML_TYPE_Q8_0:
+        case GGML_TYPE_IQ4_NL:
+        case GGML_TYPE_TBQ3_0:
+        case GGML_TYPE_PQ3_0:
+        case GGML_TYPE_TBQ4_0:
+        case GGML_TYPE_PQ4_0:
+        case GGML_TYPE_TBQ3_0_64:
+        case GGML_TYPE_PQ3_0_64:
+        case GGML_TYPE_TBQ4_0_64:
+        case GGML_TYPE_PQ4_0_64:
+            return ctx->device->pipeline_cpy_quant_f16[src->type];
         default:
             break;
         }
@@ -6822,7 +7301,10 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
     std::cerr << "), (" << src1 << ", name=" << src1->name << ", type=" << ggml_type_name(src1->type) << ", ne0=" << src1->ne[0] << ", ne1=" << src1->ne[1] << ", ne2=" << src1->ne[2] << ", ne3=" << src1->ne[3] << ", nb0=" << src1->nb[0] << ", nb1=" << src1->nb[1] << ", nb2=" << src1->nb[2] << ", nb3=" << src1->nb[3];
     std::cerr << "), (" << dst << ", name=" << dst->name << ", type=" << ggml_type_name(dst->type) << ", ne0=" << dst->ne[0] << ", ne1=" << dst->ne[1] << ", ne2=" << dst->ne[2] << ", ne3=" << dst->ne[3] << ", nb0=" << dst->nb[0] << ", nb1=" << dst->nb[1] << ", nb2=" << dst->nb[2] << ", nb3=" << dst->nb[3];
     std::cerr << "))");
-    GGML_ASSERT(ggml_vk_dim01_contiguous(src0) || src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 || src0->type == GGML_TYPE_BF16);  // NOLINT
+    // Non-dim01-contiguous quantized src0 is allowed when we have a quant->f16 cpy pipeline
+    // (used for the permuted K tensor in the no-FA attention path). The code below drives
+    // it through ggml_vk_get_cpy_pipeline(..., f16_type) when x_non_contig is true.
+    GGML_ASSERT(ggml_vk_dim01_contiguous(src0) || src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 || src0->type == GGML_TYPE_BF16 || ctx->device->pipeline_cpy_quant_f16[src0->type] != nullptr);  // NOLINT
     GGML_ASSERT(ggml_vk_dim01_contiguous(src1) || src1->type == GGML_TYPE_F32 || src1->type == GGML_TYPE_F16);  // NOLINT
 
     const uint64_t ne00 = src0->ne[0];
@@ -6869,7 +7351,7 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
 
     const bool is_coopmat = ctx->device->coopmat_support || ctx->device->coopmat2;
     const bool can_quantize_y = (ctx->device->integer_dot_product || ctx->device->coopmat_int_support) &&
-                                src1->type == GGML_TYPE_F32 && ggml_is_contiguous(src1) && (ne11 * ne10) % 4 == 0 && ggml_vk_src1_prec_allows_q8(dst);
+                                src1->type == GGML_TYPE_F32 && ggml_is_contiguous(src1) && (ne11 * ne10) % 4 == 0 && ggml_vk_src1_prec_allows_q8(dst) && !x_non_contig;
     // coopmat shaders are fast enough that memory bandwidth reduction from f16 activations helps
     const bool prefer_f16_b = is_coopmat && ggml_is_quantized(src0->type) && src1->type == GGML_TYPE_F32;
 
@@ -6909,7 +7391,7 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
     const uint64_t y_ne = padded_n * ne10 * ne12 * ne13;
     const uint64_t d_ne = ggml_nelements(dst);
 
-    const uint32_t split_k = ggml_vk_guess_split_k(ctx, ne01, ne11, ne10, disable_split_k, pipeline);
+    const uint32_t split_k = ggml_vk_guess_split_k(ctx, ne01, ne11, ne10, disable_split_k, pipeline, src0->type);
 
     const uint64_t qx_sz = ggml_type_size(src0->type) * x_ne / ggml_blck_size(src0->type);
     const uint64_t qy_sz = ggml_type_size(src1->type) * y_ne / ggml_blck_size(src1->type);
@@ -6953,6 +7435,29 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
             << ", num_dispatches=" << num_dispatches);
     }
 
+    // TBQ QJL (Stage 2) correction pass gate, computed once and shared by the
+    // descriptor pre-request and the dispatch after ggml_vk_matmul below: if
+    // the two diverged, the dispatched pipeline could end up without a
+    // descriptor set and the push-constants call would crash with
+    // VK_NULL_HANDLE layout.
+    //
+    // For _128 TBQ the vec shader (small n path) embeds QJL inline, so we
+    // need this extra pass when n is large or when a non-contiguous src0
+    // forced the matrix path. For _64 TBQ we route *all* n through
+    // mul_mm.comp (see the vec gate above), so QJL must run for every n.
+    const bool tbq_qjl_pass = ggml_is_tbq(src0->type) && !do_tiling &&
+        (ggml_is_tbq_64(src0->type) || ne11 > mul_mat_vec_max_cols || qx_needs_dequant) &&
+        split_k == 1 && !quantize_y;
+    // Choice of B source for the QJL pass: on coopmat2 with F32 src1 the main
+    // matmul reads B from prealloc_y (converted to F16 via to_fp16_vk_1);
+    // however the QJL correction has only been validated with an F32 B
+    // source, so prefer to read B directly from the original F32 src1 when it
+    // is contiguous. This keeps the QJL pass on the f32 code path across cm1
+    // and cm2 devices. Otherwise follow the main matmul's f32/f16 selection.
+    const bool qjl_use_f32_b_from_src1 =
+        src1->type == GGML_TYPE_F32 && ggml_vk_dim01_contiguous(src1);
+    const int qjl_b_is_f16 = qjl_use_f32_b_from_src1 ? 0 : (y_f32_kernel ? 0 : 1);
+
     {
         if (do_tiling) {
             ctx->prealloc_size_tile = ctx->device->tiling_threshold;
@@ -6994,6 +7499,11 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
         }
         if (split_k > 1) {
             ggml_pipeline_request_descriptor_sets(ctx, ctx->device->pipeline_matmul_split_k_reduce, 1);
+        }
+        // Pre-request the QJL correction pass descriptor set; see matching
+        // dispatch after ggml_vk_matmul below.
+        if (tbq_qjl_pass) {
+            ggml_pipeline_request_descriptor_sets(ctx, ctx->device->pipeline_mul_mm_tbq_qjl[src0->type][qjl_b_is_f16], 1);
         }
     }
 
@@ -7120,6 +7630,70 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
             split_k, ne12*ne13, ne02, ne12, r2, r3, padded_n,
             b_col_bytes, (uint64_t)dst->nb[1]
         );  // NOLINT
+
+        // TBQ3_0 / TBQ4_0 QJL (Stage 2) correction pass.
+        //
+        // `mul_mm.comp` only applies the centroid part of TBQ dequantization
+        // (`tbq*_dequant_raw(qs) * d`), matching what `mul_mat_vec_tbq*_0.comp`
+        // does *before* its QJL epilogue. The vec shader is selected for
+        // n <= mul_mat_vec_max_cols and applies the QJL correction in the same
+        // kernel; for n > mul_mat_vec_max_cols we run this separate pass that
+        // reads the raw TBQ block (d_r, qjl bitmask) plus the original B and
+        // accumulates `d_r * sqrt(pi/2) / QUANT_K * sum_qjl(H(B))` into D.
+        //
+        // Gated to non-tiling, non-split-k paths; other code paths are
+        // excluded from supports_op for TBQ.
+        if (tbq_qjl_pass) {
+            // NOTE: `qx_needs_dequant` is allowed here. On cm2 the main
+            // matmul dequantizes src0 to f16 (via to_fp16_vk_0) and runs a
+            // plain f16 x f16 kernel, which matches what the centroid-only
+            // TBQ dequant produces. The QJL correction still reads the
+            // *original* TBQ blocks from d_Qx (pre-dequant buffer), so it is
+            // unaffected by the dequant path. If we gated this out, cm2
+            // would silently skip QJL and produce ~0.05 relative error.
+            //
+            // Likewise, `x_non_contig` is allowed: on the -fa off attention
+            // path src0 is a permuted view of the KV cache (shape
+            // [hsk, kv, nh]), but d_Qx still points at the original TBQ
+            // blocks. The correct in-memory strides are passed in
+            // qjl_stride_a / qjl_stride_batch_a below so the shader can
+            // locate each (row_a, batch) block regardless of layout.
+            vk_pipeline qjl_pipeline = ctx->device->pipeline_mul_mm_tbq_qjl[src0->type][qjl_b_is_f16];
+            GGML_ASSERT(qjl_pipeline != nullptr);
+
+            ggml_vk_sync_buffers(ctx, subctx);
+
+            // src0 (the TBQ K tensor) may be a non dim01-contiguous view
+            // (permuted KV cache on the -fa off attention path); the QJL
+            // correction still reads the original TBQ blocks from d_Qx, so
+            // it needs the real in-memory block strides from src0->nb[1..3],
+            // not just "num_blocks_per_row" derived from K.
+            const size_t blk_bytes = ggml_type_size(src0->type);
+            const uint32_t qjl_stride_a       = (uint32_t)(src0->nb[1] / blk_bytes);
+            const uint32_t qjl_stride_batch_a = (uint32_t)(src0->nb[2] / blk_bytes);
+            const uint32_t qjl_stride_batch3_a = (uint32_t)(src0->nb[3] / blk_bytes);
+
+            const vk_mat_mat_qjl_push_constants qjl_pc = {
+                (uint32_t)ne01, (uint32_t)ne11, (uint32_t)ne10,
+                qjl_stride_a, (uint32_t)ne10, stride_d,
+                qjl_stride_batch_a, stride_batch_y, stride_batch_d,
+                qjl_stride_batch3_a,
+                (uint32_t)ne02, (uint32_t)ne12, (uint32_t)r2, (uint32_t)r3,
+                padded_n,
+            };
+
+            vk_buffer d_B = qjl_use_f32_b_from_src1 ? d_Qy : d_Y;
+            uint64_t  b_off = qjl_use_f32_b_from_src1 ? qy_buf_offset : y_buf_offset;
+            uint64_t  b_sz  = qjl_use_f32_b_from_src1 ? qy_sz : y_sz;
+
+            ggml_vk_dispatch_pipeline(
+                ctx, subctx, qjl_pipeline,
+                { vk_subbuffer{ d_Qx, qx_buf_offset, qx_sz },
+                  vk_subbuffer{ d_B,  b_off,         b_sz  },
+                  (vk::DescriptorBufferInfo)ggml_vk_subbuffer(ctx, d_D, d_buf_offset) },
+                qjl_pc,
+                { (uint32_t)ne01, (uint32_t)ne11, (uint32_t)(ne12*ne13) });
+        }
     }
 
     if (x_non_contig || qx_needs_dequant) {
@@ -7223,6 +7797,10 @@ static void ggml_vk_mul_mat_vec_q_f16(ggml_backend_vk_context * ctx, vk_context&
     std::cerr << "), (" << src1 << ", name=" << src1->name << ", type=" << src1->type << ", ne0=" << src1->ne[0] << ", ne1=" << src1->ne[1] << ", ne2=" << src1->ne[2] << ", ne3=" << src1->ne[3] << ", nb0=" << src1->nb[0] << ", nb1=" << src1->nb[1] << ", nb2=" << src1->nb[2] << ", nb3=" << src1->nb[3];
     std::cerr << "), (" << dst << ", name=" << dst->name << ", type=" << dst->type << ", ne0=" << dst->ne[0] << ", ne1=" << dst->ne[1] << ", ne2=" << dst->ne[2] << ", ne3=" << dst->ne[3] << ", nb0=" << dst->nb[0] << ", nb1=" << dst->nb[1] << ", nb2=" << dst->nb[2] << ", nb3=" << dst->nb[3];
     std::cerr << ")),)");
+    // Vec path only supports dim01-contiguous quantized src0 (it does not run
+    // the pipeline_cpy_quant_f16 dequant step that the matrix path has). Keep
+    // this in lock-step with the dispatch gate in ggml_vk_mul_mat above, which
+    // routes non-dim01-contiguous quantized src0 to ggml_vk_mul_mat_q_f16.
     GGML_ASSERT(ggml_vk_dim01_contiguous(src0) || src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 || src0->type == GGML_TYPE_BF16);  // NOLINT
     GGML_ASSERT(ggml_vk_dim01_contiguous(src1) || src1->type == GGML_TYPE_F32 || src1->type == GGML_TYPE_F16);  // NOLINT
 
@@ -7876,8 +8454,18 @@ void ggml_vk_mul_mat(ggml_backend_vk_context * ctx, vk_context& subctx, const st
         ggml_vk_mul_mat_vec_q_f16(ctx, subctx, cgraph, node_idx, true);
     // mul_mat_vec supports batching ne12*ne13 when ne11==1, or treating ne11 as the batch size (up to four)
     // when ne12 and ne13 are one.
+    //
+    // Non-dim01-contiguous quantized src0 (e.g. the permuted K view fed to
+    // kq = mul_mat(K, Q) on the -fa off attention path) must go through the
+    // matrix path, because only ggml_vk_mul_mat_q_f16 knows how to dequantize
+    // src0 to f16 via pipeline_cpy_quant_f16 before the matmul. The vec path
+    // expects dim01-contiguous quantized src0 and would assert. supports_op
+    // advertises these cases as supported via has_quant_f16_cpy, so we must
+    // keep them on the GPU here rather than fall back to CPU.
     } else if ((dst->ne[1] == 1 || (dst->ne[1] <= mul_mat_vec_max_cols && src1->ne[2] * src1->ne[3] == 1)) &&
-               (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 || src0->type == GGML_TYPE_BF16 || ggml_is_quantized(src0->type))) {
+               (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 || src0->type == GGML_TYPE_BF16 || ggml_is_quantized(src0->type)) &&
+               !ggml_is_tbq_or_pq_64(src0->type) &&
+               (!ggml_is_quantized(src0->type) || ggml_vk_dim01_contiguous(src0))) {
         ggml_vk_mul_mat_vec_q_f16(ctx, subctx, cgraph, node_idx);
     } else {
         ggml_vk_mul_mat_q_f16(ctx, subctx, src0, src1, dst, false);
@@ -8540,15 +9128,18 @@ bool ggml_vk_flash_attn_scalar_shmem_support(const vk_device& device, const vk_f
         kblocksh_size = 0;
     }
 
-    const uint32_t total_size = tmpsh + tmpshv4 + masksh + iq_shmem + Qf + kvsh + kblocksh_size;
+    const uint32_t qjl_quant_k = ggml_vk_flash_attn_qjl_quant_k(k_type);
+    const uint32_t qjl_proj = qjl_quant_k ? Br * qjl_quant_k * sizeof(float) : 0;
+
+    const uint32_t total_size = tmpsh + tmpshv4 + masksh + iq_shmem + Qf + kvsh + kblocksh_size + qjl_proj;
     const bool supported = total_size <= device->properties.limits.maxComputeSharedMemorySize;
 
-    VK_LOG_DEBUG("ggml_vk_flash_attn_scalar_shmem_support(HSK=" << hsk << ", HSV=" << hsv << ", mmq=" << mmq << ", total_size=" << total_size << ", supported=" << supported);
+    VK_LOG_DEBUG("ggml_vk_flash_attn_scalar_shmem_support(HSK=" << hsk << ", HSV=" << hsv << ", mmq=" << mmq << ", qjl_quant_k=" << qjl_quant_k << ", total_size=" << total_size << ", supported=" << supported);
 
     return supported;
 }
 
-bool ggml_vk_flash_attn_coopmat_shmem_support(const vk_device& device, const vk_fa_tuning_params& params, uint32_t hsk, uint32_t hsv, bool f32acc, ggml_type k_type, ggml_type v_type) {
+bool ggml_vk_flash_attn_coopmat_shmem_support(const vk_device& device, const vk_fa_tuning_params& params, uint32_t hsk, uint32_t hsv, bool f32acc, ggml_type k_type, ggml_type v_type, uint32_t qjl_quant_k, bool qjl_full_proj) {
     GGML_UNUSED(v_type);
     // Needs to be kept up to date on shader changes
     const uint32_t Br = params.block_rows;
@@ -8588,10 +9179,14 @@ bool ggml_vk_flash_attn_coopmat_shmem_support(const vk_device& device, const vk_
 
     const uint32_t slope = Br * acctype;
 
-    const uint32_t total_size = tmpsh + iq_shmem + Qf + Psh + sfsh + ksh + pvsh + slope;
+    const uint32_t qjl_proj_k = qjl_full_proj ? hsk : qjl_quant_k;
+    const uint32_t qjl_proj = qjl_quant_k ? Br * qjl_proj_k * sizeof(float) : 0;
+    const uint32_t qjl_corr = (qjl_quant_k && params.path == FA_COOPMAT2) ? Br * Bc * sizeof(float) : 0;
+
+    const uint32_t total_size = tmpsh + iq_shmem + Qf + Psh + sfsh + ksh + pvsh + slope + qjl_proj + qjl_corr;
     const bool supported = total_size <= device->properties.limits.maxComputeSharedMemorySize;
 
-    VK_LOG_DEBUG("ggml_vk_flash_attn_coopmat_shmem_support(HSK=" << hsk << ", HSV=" << hsv << ", f32acc=" << f32acc << ", total_size=" << total_size << ", supported=" << supported);
+    VK_LOG_DEBUG("ggml_vk_flash_attn_coopmat_shmem_support(HSK=" << hsk << ", HSV=" << hsv << ", f32acc=" << f32acc << ", qjl_quant_k=" << qjl_quant_k << ", qjl_full_proj=" << qjl_full_proj << ", total_size=" << total_size << ", supported=" << supported);
 
     return supported;
 }
@@ -8730,8 +9325,10 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
         return (t->type != GGML_TYPE_F16 && t->type != GGML_TYPE_BF16) ||
                (t->nb[1] | t->nb[2] | t->nb[3]) % (4 * sizeof(ggml_fp16_t)) == 0;
     };
+    // TBQ/PQ FA modules decode K/V densely (no sparse gather), so they stay on the dense path.
     const bool use_sparse = !disable_sparse && n_kv_max > 0 && mask &&
                             max_bias == 0.0f && logit_softcap == 0.0f &&
+                            !ggml_is_tbq_or_pq(k_type_eff) && !ggml_is_tbq_or_pq(v_type_eff) &&
                             (tuning_params.path != FA_COOPMAT2 || (sparse_gather_aligned(k) && sparse_gather_aligned(v))) &&
                             nem0 == KV &&
                             (int64_t)KV >= std::max<int64_t>(4096, min_ratio * (int64_t)n_kv_max) &&
@@ -10367,8 +10964,24 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
         {
             uint32_t ne = ggml_nelements(src0);
             if (ggml_is_quantized(dst->type)) {
-                // quants run 32 threads each doing QUANT_K elements
-                ne = CEIL_DIV(ne, 32 * ggml_blck_size(dst->type));
+                // TBQ/PQ use a cooperative shader: one workgroup = one block of QUANT_K
+                // elements. Other quantized types share 32 threads per workgroup across 32
+                // independent blocks.
+                switch (dst->type) {
+                    case GGML_TYPE_TBQ3_0:
+                    case GGML_TYPE_TBQ4_0:
+                    case GGML_TYPE_PQ3_0:
+                    case GGML_TYPE_PQ4_0:
+                    case GGML_TYPE_TBQ3_0_64:
+                    case GGML_TYPE_TBQ4_0_64:
+                    case GGML_TYPE_PQ3_0_64:
+                    case GGML_TYPE_PQ4_0_64:
+                        ne = CEIL_DIV(ne, ggml_blck_size(dst->type));
+                        break;
+                    default:
+                        ne = CEIL_DIV(ne, 32 * ggml_blck_size(dst->type));
+                        break;
+                }
             } else {
                 // scalar types do one element per thread, running 512 threads
                 ne = CEIL_DIV(ne, 512);
@@ -16245,6 +16858,9 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                             return false;
                         }
                     }
+                    if (ggml_is_tbq_or_pq(src0_type)) {
+                        return false;
+                    }
                     if (!device->mul_mat_id_s[src0_type] && !device->mul_mat_id_m[src0_type] && !device->mul_mat_id_l[src0_type]) {
                         // If there's not enough shared memory for row_ids and the result tile, fallback to CPU
                         return false;
@@ -16264,6 +16880,14 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                     case GGML_TYPE_Q5_0:
                     case GGML_TYPE_Q5_1:
                     case GGML_TYPE_Q8_0:
+                    case GGML_TYPE_TBQ3_0:
+                    case GGML_TYPE_PQ3_0:
+                    case GGML_TYPE_TBQ4_0:
+                    case GGML_TYPE_PQ4_0:
+                    case GGML_TYPE_TBQ3_0_64:
+                    case GGML_TYPE_PQ3_0_64:
+                    case GGML_TYPE_TBQ4_0_64:
+                    case GGML_TYPE_PQ4_0_64:
                     case GGML_TYPE_Q2_K:
                     case GGML_TYPE_Q3_K:
                     case GGML_TYPE_Q4_K:
@@ -16290,7 +16914,35 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                 if (op->op == GGML_OP_MUL_MAT_ID && op->src[2]->ne[3] != op->src[1]->ne[3]) {
                     return false;
                 }
-                if (!(ggml_vk_dim01_contiguous(op->src[0]) || op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_F16 || op->src[0]->type == GGML_TYPE_BF16) ||
+                // src0: allow dim01-contiguous, or f32/f16/bf16 (handled by the
+                // generic cpy shaders), or any quantized type that has a
+                // quant->f16 cpy pipeline (used to dequantize the non-contig
+                // buffer on the GPU before the matmul). This last case is what
+                // lets the -fa off path keep K*Q on the GPU when K is tbq/pq/q*_0.
+                auto has_quant_f16_cpy = [ctx](ggml_type t) {
+                    switch (t) {
+                    case GGML_TYPE_Q4_0:
+                    case GGML_TYPE_Q4_1:
+                    case GGML_TYPE_Q5_0:
+                    case GGML_TYPE_Q5_1:
+                    case GGML_TYPE_Q8_0:
+                    case GGML_TYPE_IQ4_NL:
+                    case GGML_TYPE_TBQ3_0:
+                    case GGML_TYPE_PQ3_0:
+                    case GGML_TYPE_TBQ4_0:
+                    case GGML_TYPE_PQ4_0:
+                    case GGML_TYPE_TBQ3_0_64:
+                    case GGML_TYPE_PQ3_0_64:
+                    case GGML_TYPE_TBQ4_0_64:
+                    case GGML_TYPE_PQ4_0_64: {
+                        auto device = ggml_vk_get_device(ctx->device);
+                        return device->pipeline_cpy_quant_f16[t] != nullptr;
+                    }
+                    default:
+                        return false;
+                    }
+                };
+                if (!(ggml_vk_dim01_contiguous(op->src[0]) || op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_F16 || op->src[0]->type == GGML_TYPE_BF16 || has_quant_f16_cpy(op->src[0]->type)) ||
                     !(ggml_vk_dim01_contiguous(op->src[1]) || op->src[1]->type == GGML_TYPE_F32 || op->src[1]->type == GGML_TYPE_F16)) {
                     return false;
                 }
@@ -16326,27 +16978,72 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                 if (op->src[3] && op->src[3]->type != GGML_TYPE_F16) {
                     return false;
                 }
-                auto fa_kv_ok = [](ggml_type t) {
-                    switch (t) {
-                    case GGML_TYPE_F32:
-                    case GGML_TYPE_F16:
-                    case GGML_TYPE_BF16:
-                    case GGML_TYPE_Q8_0:
-                    case GGML_TYPE_Q5_1:
-                    case GGML_TYPE_Q5_0:
-                    case GGML_TYPE_Q4_1:
-                    case GGML_TYPE_Q4_0:
-                    case GGML_TYPE_IQ4_NL:
+                // K/V type validation. Plain K/V follows HEAD: any pair from the
+                // quant-KV list, BF16 only paired with BF16. TBQ/PQ is the fork's
+                // and mixes more narrowly (TBQ/PQ on K, Q4_0/Q8_0/F16/PQ on V).
+                const ggml_type k_type = op->src[1]->type;
+                const ggml_type v_type = op->src[2]->type;
+                auto valid_tq_head_dim = [](ggml_type type, uint32_t head_dim) {
+                    if (!ggml_is_tbq_or_pq(type)) {
                         return true;
-                    default:
-                        return false;
                     }
+                    return ggml_is_tbq_or_pq_64(type) ? head_dim == 64 : head_dim % 128 == 0;
                 };
-                if (!fa_kv_ok(op->src[1]->type) || !fa_kv_ok(op->src[2]->type)) {
+                if (!valid_tq_head_dim(k_type, HSK) || !valid_tq_head_dim(v_type, HSV)) {
                     return false;
                 }
-                if ((op->src[1]->type == GGML_TYPE_BF16) != (op->src[2]->type == GGML_TYPE_BF16)) {
-                    return false;
+                if (ggml_is_tbq_or_pq(k_type) || ggml_is_tbq_or_pq(v_type)) {
+                    if (!device->fp16) {
+                        // TBQ/PQ FA shaders are fp16-only; reject so the scheduler falls back to CPU.
+                        return false;
+                    }
+                    // K carries the TBQ/PQ quant, never V alone.
+                    if (!ggml_is_tbq_or_pq(k_type)) {
+                        return false;
+                    }
+                    if (k_type != v_type) {
+                        auto any = [](ggml_type t, std::initializer_list<ggml_type> s) {
+                            return std::any_of(s.begin(), s.end(), [t](ggml_type v) { return v == t; });
+                        };
+                        auto is_fa_mixed_v = [&](ggml_type t) {
+                            return any(t, { GGML_TYPE_PQ3_0, GGML_TYPE_PQ4_0,
+                                            GGML_TYPE_PQ3_0_64, GGML_TYPE_PQ4_0_64,
+                                            GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_F16 });
+                        };
+                        if (ggml_is_tbq(v_type) || !is_fa_mixed_v(v_type)) {
+                            return false;
+                        }
+                        if (ggml_is_tbq_or_pq(v_type) &&
+                            ggml_is_tbq_or_pq_64(k_type) != ggml_is_tbq_or_pq_64(v_type)) {
+                            return false;
+                        }
+                        if (!(device->subgroup_shuffle && device->subgroup_vote)) {
+                            return false;
+                        }
+                    }
+                } else {
+                    auto fa_kv_ok = [](ggml_type t) {
+                        switch (t) {
+                        case GGML_TYPE_F32:
+                        case GGML_TYPE_F16:
+                        case GGML_TYPE_BF16:
+                        case GGML_TYPE_Q8_0:
+                        case GGML_TYPE_Q5_1:
+                        case GGML_TYPE_Q5_0:
+                        case GGML_TYPE_Q4_1:
+                        case GGML_TYPE_Q4_0:
+                        case GGML_TYPE_IQ4_NL:
+                            return true;
+                        default:
+                            return false;
+                        }
+                    };
+                    if (!fa_kv_ok(k_type) || !fa_kv_ok(v_type)) {
+                        return false;
+                    }
+                    if ((k_type == GGML_TYPE_BF16) != (v_type == GGML_TYPE_BF16)) {
+                        return false;
+                    }
                 }
                 if (!coopmat2 && !(device->subgroup_shuffle && device->subgroup_vote)) {
                     // scalar/coopmat1 FA uses subgroupShuffle/subgroupAll
@@ -16412,6 +17109,18 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                     case GGML_TYPE_Q8_0:
                     case GGML_TYPE_IQ4_NL:
                         return true;
+                    case GGML_TYPE_TBQ3_0:
+                    case GGML_TYPE_PQ3_0:
+                    case GGML_TYPE_TBQ4_0:
+                    case GGML_TYPE_PQ4_0:
+                    case GGML_TYPE_TBQ3_0_64:
+                    case GGML_TYPE_PQ3_0_64:
+                    case GGML_TYPE_TBQ4_0_64:
+                    case GGML_TYPE_PQ4_0_64: {
+                        return device->subgroup_basic &&
+                               device->subgroup_arithmetic &&
+                               (!ggml_is_tbq(op->type) || device->subgroup_ballot);
+                    }
                     default:
                         return false;
                 }
@@ -16436,6 +17145,14 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                     case GGML_TYPE_Q5_1:
                     case GGML_TYPE_Q8_0:
                     case GGML_TYPE_IQ4_NL:
+                    case GGML_TYPE_TBQ3_0:
+                    case GGML_TYPE_PQ3_0:
+                    case GGML_TYPE_TBQ4_0:
+                    case GGML_TYPE_PQ4_0:
+                    case GGML_TYPE_TBQ3_0_64:
+                    case GGML_TYPE_PQ3_0_64:
+                    case GGML_TYPE_TBQ4_0_64:
+                    case GGML_TYPE_PQ4_0_64:
                         return true;
                     default:
                         break;

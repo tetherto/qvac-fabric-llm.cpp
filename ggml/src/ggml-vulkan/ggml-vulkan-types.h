@@ -55,6 +55,8 @@ typedef struct VkPhysicalDeviceCooperativeMatrixDecodeVectorFeaturesNV {
 #include "vma/VmaUsage.h"
 
 #include <algorithm>
+#include <array>
+
 #include <cmath>
 #include <functional>
 #include <iomanip>
@@ -744,6 +746,17 @@ struct vk_device_struct {
     uint32_t subgroup_max_size;
     bool subgroup_require_full_support;
 
+    // TurboQuant / PolarQuant cooperative copy_to_quant pipelines run at
+    // workgroup size 32 and use subgroupAdd / subgroupBallot. The shader is
+    // generalized over gl_SubgroupSize via the SG_SIZE spec constant (see
+    // copy_to_quant.comp): SG_SIZE >= 32 takes the original one-subgroup fast
+    // path, SG_SIZE in {4,8,16} takes a shared-memory stitch path. This field
+    // holds the value we pass to the pipeline. 0 means "use the device's
+    // natural subgroup size" (original behaviour, no required_subgroup_size).
+    // Populated from GGML_VK_TBQ_COPY_SG_SIZE at device init; tests override
+    // this to exercise the stitch path on hardware that only has one SG size.
+    uint32_t tbq_copy_sg_size;
+
     // floor(log2(maxComputeWorkGroupInvocations))
     uint32_t max_workgroup_size_log2 {};
 
@@ -812,6 +825,11 @@ struct vk_device_struct {
     matmul_tile_selector_t matmul_tile_selector;
     matmul_tile_selector_t matmul_id_tile_selector;
 
+    // QJL (Stage 2) correction pass applied after mul_mm.comp for standalone
+    // MUL_MAT on TBQ3_0/TBQ4_0 when n > mul_mat_vec_max_cols. Indexed as
+    // [src0_type][src1_is_f16]. Only TBQ3_0 and TBQ4_0 slots are populated.
+    vk_pipeline pipeline_mul_mm_tbq_qjl[GGML_TYPE_COUNT][2];
+
     vk_pipeline pipeline_matmul_split_k_reduce;
     vk_pipeline pipeline_quantize_q8_1_x4;
 
@@ -866,6 +884,10 @@ struct vk_device_struct {
     vk_pipeline pipeline_contig_cpy_32, pipeline_contig_cpy_f32_f16, pipeline_contig_cpy_16, pipeline_contig_cpy_f16_f32, pipeline_contig_cpy_f32_bf16, pipeline_contig_cpy_bf16_f32, pipeline_contig_cpy_bf16_f16, pipeline_contig_cpy_f32_i32, pipeline_contig_cpy_i32_f32;
     vk_pipeline pipeline_cpy_f32_quant[GGML_TYPE_COUNT];
     vk_pipeline pipeline_cpy_quant_f32[GGML_TYPE_COUNT];
+    // f16 dequant output used by MUL_MAT to handle non-dim01-contiguous
+    // quantized src0 entirely on the GPU (the f32 pipeline would require an
+    // extra f32->f16 pass, and the prior behaviour was to fall back to CPU).
+    vk_pipeline pipeline_cpy_quant_f16[GGML_TYPE_COUNT];
     vk_pipeline pipeline_cpy_transpose_16, pipeline_cpy_transpose_32;
     vk_pipeline pipeline_cpy_transpose_02_16, pipeline_cpy_transpose_02_32;
     // [src0 0=fp32,1=fp16][dst]
@@ -1124,6 +1146,20 @@ struct vk_submission {
 };
 
 typedef std::vector<vk_submission> vk_sequence;
+
+// Push constants for the TBQ QJL (Stage 2) correction pass
+// (mul_mm_tbq_qjl_correction.comp). It used to borrow vk_mat_mat_push_constants,
+// but that is upstream's struct and it grows fields in the middle, so the QJL
+// pass carries its own layout. src0 strides are in BLOCK units; dim2 and dim3
+// are kept separate because a permuted TBQ view has nb[3] != ne[2] * nb[2].
+struct vk_mat_mat_qjl_push_constants {
+    uint32_t M; uint32_t N; uint32_t K;
+    uint32_t stride_a; uint32_t stride_b; uint32_t stride_d;
+    uint32_t batch_stride_a; uint32_t batch_stride_b; uint32_t batch_stride_d;
+    uint32_t batch_stride3_a;
+    uint32_t ne02; uint32_t ne12; uint32_t broadcast2; uint32_t broadcast3;
+    uint32_t padded_N;
+};
 
 #define MAT_VEC_FUSION_FLAGS_BIAS0 0x1
 
@@ -1577,12 +1613,14 @@ struct vk_fa_tuning_params {
     uint32_t row_split;
     bool shmem_staging;
     bool disable_subgroups;
+    bool qjl_full_proj;
     uint32_t limit_occupancy_shmem;
 
     void print() const {
         std::cerr << "path=" << path << " workgroup_size=" << workgroup_size << " subgroup_size=" << subgroup_size <<
                      " block_rows=" << block_rows << " block_cols=" << block_cols << " d_split=" << d_split <<
                      " row_split=" << row_split << " shmem_staging=" << shmem_staging << " disable_subgroups=" << disable_subgroups <<
+                     " qjl_full_proj=" << qjl_full_proj <<
                      " limit_occupancy_shmem=" << limit_occupancy_shmem << std::endl;
     }
 };

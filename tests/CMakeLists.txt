@@ -358,6 +358,13 @@ llama_build(test-backend-ops.cpp LINK ggml)
 llama_build_and_test(test-backend-tensor.cpp LINK ggml)
 
 llama_build_and_test(test-tiled-mulmat.cpp  LABEL "main behavior backend"  LINK ggml)
+
+# Vulkan TBQ/PQ copy-to-quant subgroup-size sweep. Spawns itself with different
+# GGML_VK_TBQ_COPY_SG_SIZE values to exercise the shader's cross-subgroup stitch
+# path on hardware that only exposes one native subgroup size. Auto-skips when no
+# GPU backend is available.
+llama_build_and_test(test-copy-tbq-subgroups.cpp)
+
 llama_build_and_test(test-model-load-cancel.cpp LABEL "model behavior")
 llama_build_and_test(test-model-load-disk.cpp   LABEL "model behavior")
 llama_build_and_test(test-model-load-memory.cpp LABEL "model behavior")
@@ -373,6 +380,7 @@ if (NOT GGML_BACKEND_DL AND GGML_CPU)
     # these tests use the backends directly and cannot be built with dynamic loading
     llama_build_and_test(test-barrier.cpp  LABEL "main behavior"  LINK ggml)
     llama_build_and_test(test-quantize-fns.cpp  LABEL "main behavior"  LINK ggml)
+    target_include_directories(test-quantize-fns PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
     llama_build_and_test(test-quantize-perf.cpp  LABEL "main behavior backend"  LINK ggml)
     llama_build_and_test(test-rope.cpp  LABEL "main behavior backend"  LINK ggml)
     llama_build_and_test(test-col2im-1d.cpp  LABEL "main behavior backend"  LINK ggml)

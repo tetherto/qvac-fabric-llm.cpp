@@ -459,7 +459,15 @@ typedef struct {
 } block_iq4_xs;
 static_assert(sizeof(block_iq4_xs) == sizeof(ggml_half) + sizeof(uint16_t) + QK_K/64 + QK_K/2, "wrong iq4_xs block size/padding");
 
+// TurboQuant/PolarQuant block layouts are only consumed by host C/C++ code (CPU
+// quant + type traits). The GPU-shader DECL contexts (Metal/CUDA/HIP/SYCL/MUSA)
+// define their own quant layouts and must not pull in this standalone host header
+// — e.g. the Metal shader compile of ggml-metal.metal would fail to find it.
+#if !defined(GGML_COMMON_DECL_METAL) && !defined(GGML_COMMON_DECL_CUDA) && \
+    !defined(GGML_COMMON_DECL_HIP)   && !defined(GGML_COMMON_DECL_SYCL) && \
+    !defined(GGML_COMMON_DECL_MUSA)
 #include "ggml-tbq-types.h"
+#endif
 
 #endif // GGML_COMMON_DECL
 #endif // GGML_COMMON_DECL

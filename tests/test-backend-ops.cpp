@@ -2783,6 +2783,9 @@ struct test_set_rows : public test_case {
     }
 
     double max_nmse_err() override {
+        if (ggml_is_tbq_or_pq(type_dst)) {
+            return 1e-6;
+        }
         if (type_dst == GGML_TYPE_Q2_0 || type_dst == GGML_TYPE_Q4_0 || type_dst == GGML_TYPE_Q4_1 ||
             type_dst == GGML_TYPE_IQ4_NL ||
             type_dst == GGML_TYPE_Q5_0 || type_dst == GGML_TYPE_Q5_1 || type_dst == GGML_TYPE_Q8_0) {
@@ -10420,6 +10423,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             }
         }
     }
+    for (ggml_type type : {
+            GGML_TYPE_TBQ3_0,    GGML_TYPE_TBQ4_0,    GGML_TYPE_PQ3_0,    GGML_TYPE_PQ4_0,
+            GGML_TYPE_TBQ3_0_64, GGML_TYPE_TBQ4_0_64, GGML_TYPE_PQ3_0_64, GGML_TYPE_PQ4_0_64}) {
+        for (ggml_type index_type : {GGML_TYPE_I32, GGML_TYPE_I64}) {
+            test_cases.emplace_back(new test_set_rows(
+                GGML_TYPE_F16, type, index_type, {3*ggml_blck_size(type), 3, 1, 1}, {2, 3}, 2, false));
+        }
+    }
     test_cases.emplace_back(new test_set_rows(GGML_TYPE_F16, GGML_TYPE_F16, GGML_TYPE_I64, { 1, 8, 1, 3 }, { 1, 1 }, 2, false));
     test_cases.emplace_back(new test_set_rows(GGML_TYPE_F16, GGML_TYPE_F16, GGML_TYPE_I32, { 1, 8, 1, 3 }, { 1, 1 }, 2, false));
     test_cases.emplace_back(new test_set_rows(GGML_TYPE_F16, GGML_TYPE_F16, GGML_TYPE_I64, { 1, 8, 1, 3 }, { 1, 1 }, 2, true));
@@ -11586,6 +11597,39 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                              GGML_TYPE_IQ3_S, GGML_TYPE_IQ1_S, GGML_TYPE_IQ1_M, GGML_TYPE_IQ4_XS}) {
         test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 16, 10, 256, {1, 1}, {1, 1}));
     }
+
+    // TurboQuant / PolarQuant MUL_MAT coverage.
+    // Intentionally exercises the standalone MUL_MAT path (not fused into FLASH_ATTN_EXT),
+    // which is the path that reports `supports_op == yes` on NV coopmat2 but has no
+    // matching pipeline created in `pipeline_dequant_mul_mat_mat_f16[]` — see
+    // ggml-vulkan.cpp:3412 ("TBQ/PQ cm2 matmul shaders not yet generated") and the
+    // supports_op switch that still lists TBQ/PQ for MUL_MAT.
+    {
+        const ggml_type tbq_pq_all[] = {
+            GGML_TYPE_TBQ3_0,    GGML_TYPE_TBQ4_0,    GGML_TYPE_PQ3_0,    GGML_TYPE_PQ4_0,
+            GGML_TYPE_TBQ3_0_64, GGML_TYPE_TBQ4_0_64, GGML_TYPE_PQ3_0_64, GGML_TYPE_PQ4_0_64,
+        };
+        for (ggml_type type_a : tbq_pq_all) {
+            const int64_t k = 2*ggml_blck_size(type_a);
+            for (ggml_type type_b : { GGML_TYPE_F32, GGML_TYPE_F16 }) {
+                // mul_mat_vec path (n small, e.g. decode-like)
+                test_cases.emplace_back(new test_mul_mat(type_a, type_b, 16,  1, k, {1, 1}, {1, 1}));
+                test_cases.emplace_back(new test_mul_mat(type_a, type_b, 16,  8, k, {1, 1}, {1, 1}));
+                // mat-mat path (n > 8, e.g. prefill — routes through dequant + f16 matmul on Vulkan)
+                test_cases.emplace_back(new test_mul_mat(type_a, type_b, 16, 16, k, {1, 1}, {1, 1}));
+                test_cases.emplace_back(new test_mul_mat(type_a, type_b, 16, 32, k, {1, 1}, {1, 1}));
+            }
+        }
+        // Non-dim01-contiguous small-n TBQ/PQ routes away from the vec path.
+        // TBQ still needs the standalone QJL correction there; PQ is the control.
+        for (ggml_type type_a : tbq_pq_all) {
+            const int64_t k = 2*ggml_blck_size(type_a);
+            for (ggml_type type_b : { GGML_TYPE_F32, GGML_TYPE_F16 }) {
+                test_cases.emplace_back(new test_mul_mat(type_a, type_b, 16, 1, k, {2, 3}, {1, 1}, {0, 2, 1, 3}));
+                test_cases.emplace_back(new test_mul_mat(type_a, type_b, 16, 8, k, {2, 3}, {1, 1}, {0, 2, 1, 3}));
+            }
+        }
+    }
 #else
     // m = a rows
     // n = b rows
@@ -12569,6 +12613,108 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext_large_logits(256, 256,  4, {4, 1}, 1024, 75, true, false, 0, 10.0f, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext_large_logits(256, 256,  4, {4, 1}, 1024, 75, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_BF16, GGML_TYPE_BF16));
 
+    // Mixed K/V type flash attention (at least one side is TBQ/PQ)
+    {
+        const ggml_type mixed[]  = { GGML_TYPE_TBQ3_0, GGML_TYPE_TBQ4_0, GGML_TYPE_PQ3_0, GGML_TYPE_PQ4_0, GGML_TYPE_Q8_0, GGML_TYPE_F16 };
+        const ggml_type mixed_64[] = { GGML_TYPE_TBQ3_0_64, GGML_TYPE_TBQ4_0_64, GGML_TYPE_PQ3_0_64, GGML_TYPE_PQ4_0_64, GGML_TYPE_Q8_0, GGML_TYPE_F16 };
+
+        for (ggml_type tk : mixed) {
+            for (ggml_type tv : mixed) {
+                if (tk == tv) continue;
+                if (!ggml_is_tbq_or_pq(tk) && !ggml_is_tbq_or_pq(tv)) continue;
+                for (int hs : { 64, 128 }) {
+                    for (int kv : { 113, 512 }) {
+                        for (int nb : { 1, 32 }) {
+                            test_cases.emplace_back(new test_flash_attn_ext(
+                                hs, hs, 4, {1, 1}, kv, nb, true, false, 0.0f, 0.0f, GGML_PREC_F32, tk, tv));
+                        }
+                    }
+                }
+            }
+        }
+        for (ggml_type tk : mixed_64) {
+            for (ggml_type tv : mixed_64) {
+                if (tk == tv) continue;
+                if (!ggml_is_tbq_or_pq(tk) && !ggml_is_tbq_or_pq(tv)) continue;
+                for (int kv : { 113, 512 }) {
+                    for (int nb : { 1, 32 }) {
+                        test_cases.emplace_back(new test_flash_attn_ext(
+                            64, 64, 4, {1, 1}, kv, nb, true, false, 0.0f, 0.0f, GGML_PREC_F32, tk, tv));
+                    }
+                }
+            }
+        }
+
+        // Sparse-hinted (n_kv_max) decode with TBQ/PQ K/V: the TBQ/PQ modules
+        // have no sparse gather, so the backend must keep them on the dense path.
+        for (ggml_type t : { GGML_TYPE_TBQ3_0, GGML_TYPE_PQ4_0 }) {
+            test_cases.emplace_back(new test_flash_attn_ext(
+                128, 128, 2, {8, 1}, 4096, 1, true, false, 0.0f, 0.0f, GGML_PREC_F32, t, t,
+                {0, 1, 2, 3}, true, false, 256));
+        }
+
+        // Cross-family pairs have no generated Vulkan pipeline and must fall back.
+        test_cases.emplace_back(new test_flash_attn_ext(
+            128, 64, 4, {1, 1}, 113, 2, true, false, 0.0f, 0.0f, GGML_PREC_F32,
+            GGML_TYPE_TBQ3_0, GGML_TYPE_PQ3_0_64));
+        test_cases.emplace_back(new test_flash_attn_ext(
+            64, 128, 4, {1, 1}, 113, 2, true, false, 0.0f, 0.0f, GGML_PREC_F32,
+            GGML_TYPE_TBQ3_0_64, GGML_TYPE_PQ3_0));
+
+        // Multi-block 128-wide TBQ/PQ heads. These exercise the base TBQ/PQ
+        // layouts with two consecutive blocks per head (head_dim=256).
+        const ggml_type multi_block_same[] = { GGML_TYPE_TBQ3_0, GGML_TYPE_TBQ4_0, GGML_TYPE_PQ3_0, GGML_TYPE_PQ4_0 };
+        const ggml_type multi_block_tbq_k[] = { GGML_TYPE_TBQ3_0, GGML_TYPE_TBQ4_0 };
+        const ggml_type multi_block_v[] = { GGML_TYPE_PQ3_0, GGML_TYPE_PQ4_0, GGML_TYPE_Q8_0, GGML_TYPE_F16 };
+
+        for (ggml_type t : multi_block_same) {
+            for (int kv : { 113, 512 }) {
+                for (int nb : { 1, 32 }) {
+                    test_cases.emplace_back(new test_flash_attn_ext(
+                        256, 256, 4, {1, 1}, kv, nb, true, false, 0.0f, 0.0f, GGML_PREC_F32, t, t));
+                }
+            }
+        }
+        for (ggml_type tk : multi_block_tbq_k) {
+            for (ggml_type tv : multi_block_v) {
+                for (int kv : { 113, 512 }) {
+                    for (int nb : { 1, 32 }) {
+                        test_cases.emplace_back(new test_flash_attn_ext(
+                            256, 256, 4, {1, 1}, kv, nb, true, false, 0.0f, 0.0f, GGML_PREC_F32, tk, tv));
+                    }
+                }
+            }
+        }
+    }
+
+    // Homogeneous PQ K/V flash attention. Regression coverage for backends that
+    // gate PQ FA pipelines on fp16 support: with GGML_VK_DISABLE_F16=1 the
+    // Vulkan scalar FA pipelines for tk == tv (PQ3/PQ3, PQ4/PQ4) must either be
+    // registered, or supports_op must reject the op so the scheduler falls back
+    // to CPU. Without that gate, dispatch hits an uninitialized lazy pipeline
+    // and asserts (Br == pipeline->wg_denoms[0]).
+    {
+        const ggml_type pq_homo[]    = { GGML_TYPE_PQ3_0,    GGML_TYPE_PQ4_0 };
+        const ggml_type pq_homo_64[] = { GGML_TYPE_PQ3_0_64, GGML_TYPE_PQ4_0_64 };
+
+        for (ggml_type t : pq_homo) {
+            for (int kv : { 113, 512 }) {
+                for (int nb : { 1, 32 }) {
+                    test_cases.emplace_back(new test_flash_attn_ext(
+                        128, 128, 4, {1, 1}, kv, nb, true, false, 0.0f, 0.0f, GGML_PREC_F32, t, t));
+                }
+            }
+        }
+        for (ggml_type t : pq_homo_64) {
+            for (int kv : { 113, 512 }) {
+                for (int nb : { 1, 32 }) {
+                    test_cases.emplace_back(new test_flash_attn_ext(
+                        64, 64, 4, {1, 1}, kv, nb, true, false, 0.0f, 0.0f, GGML_PREC_F32, t, t));
+                }
+            }
+        }
+    }
+
     test_cases.emplace_back(new test_cross_entropy_loss     (GGML_TYPE_F32, {   10, 5, 4, 3}));
     test_cases.emplace_back(new test_cross_entropy_loss     (GGML_TYPE_F32, {30000, 1, 1, 1}));
     test_cases.emplace_back(new test_cross_entropy_loss_back(GGML_TYPE_F32, {   10, 5, 4, 3}));
@@ -13169,6 +13315,45 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     for (int col : {8192, 16384, 32768, 65536, 131072, 262144, 524288}) {
         for (int rows : {1, 4, 16}){
             test_cases.emplace_back(new test_soft_max(GGML_TYPE_F32, {col, rows, 1, 1}, false,  false,  GGML_TYPE_F32, {1, 1}, 1.0f, 0.0f));
+        }
+    }
+
+    // Mixed-type TurboQuant/PolarQuant Flash-Attention performance probes.
+    // Filters with "tbq|pq" should now match these paths in MODE_PERF.
+    {
+        const ggml_type mixed[]  = { GGML_TYPE_TBQ3_0, GGML_TYPE_TBQ4_0, GGML_TYPE_PQ3_0, GGML_TYPE_PQ4_0, GGML_TYPE_Q8_0, GGML_TYPE_F16 };
+
+        for (ggml_type tk : mixed) {
+            for (ggml_type tv : mixed) {
+                if (tk == tv) {
+                    continue;
+                }
+                if (!ggml_is_tbq_or_pq(tk) && !ggml_is_tbq_or_pq(tv)) {
+                    continue;
+                }
+                for (int hs : { 64, 128 }) {
+                    for (int kv : { 113, 512 }) {
+                        for (int nb : { 1, 32 }) {
+                            test_cases.emplace_back(new test_flash_attn_ext(
+                                hs, hs, 4, {1, 1}, kv, nb, true, false, 0.0f, 0.0f, GGML_PREC_F32, tk, tv));
+                        }
+                    }
+                }
+            }
+        }
+
+        const ggml_type multi_block_tbq_k[] = { GGML_TYPE_TBQ3_0, GGML_TYPE_TBQ4_0 };
+        const ggml_type multi_block_v[] = { GGML_TYPE_PQ3_0, GGML_TYPE_PQ4_0, GGML_TYPE_Q8_0, GGML_TYPE_F16 };
+
+        for (ggml_type tk : multi_block_tbq_k) {
+            for (ggml_type tv : multi_block_v) {
+                for (int kv : { 113, 512 }) {
+                    for (int nb : { 1, 32 }) {
+                        test_cases.emplace_back(new test_flash_attn_ext(
+                            256, 256, 4, {1, 1}, kv, nb, true, false, 0.0f, 0.0f, GGML_PREC_F32, tk, tv));
+                    }
+                }
+            }
         }
     }
 

@@ -2009,12 +2009,12 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                 ggml_metal_op_mul_mat_use_fwht(op, dev->props.max_theadgroup_memory_size)) {
                 return has_simdgroup_reduction;
             }
-            return op->src[0]->type != GGML_TYPE_TQ1_0 &&
+            return op->src[0]->type != GGML_TYPE_TQ1_0 && !ggml_is_tbq_or_pq(op->src[0]->type) &&
                 ggml_metal_supports_mul_mat_op(
                     has_simdgroup_reduction, op, true,
                     ggml_metal_op_mul_mat_use_mm(op, has_simdgroup_mm));
         case GGML_OP_MUL_MAT_ID:
-            return op->src[0]->type != GGML_TYPE_TQ1_0 && has_simdgroup_reduction && op->src[0]->type != GGML_TYPE_NVFP4;
+            return op->src[0]->type != GGML_TYPE_TQ1_0 && has_simdgroup_reduction && op->src[0]->type != GGML_TYPE_NVFP4 && !ggml_is_tbq_or_pq(op->src[0]->type);
         case GGML_OP_SET:
         case GGML_OP_CPY:
         case GGML_OP_DUP:
