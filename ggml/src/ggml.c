@@ -1093,6 +1093,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "REPEAT_BACK",
     "CONCAT",
     "SILU_BACK",
+    "GELU_BACK",
     "GEGLU_BACK",
     "SIGMOID_BACK",
     "NORM",
@@ -1103,6 +1104,8 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
 
     "MUL_MAT",
     "MUL_MAT_ID",
+    "MUL_MAT_ID_BACK_A",
+    "MUL_MAT_ID_BACK_B",
     "OUT_PROD",
 
     "SCALE",
@@ -1183,7 +1186,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
+static_assert(GGML_OP_COUNT == 107, "GGML_OP_COUNT != 107");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1211,6 +1214,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "repeat_back(x)",
     "concat(x, y)",
     "silu_back(x)",
+    "gelu_back(x)",
     "geglu_back(x)",
     "sigmoid_back(x)",
     "norm(x)",
@@ -1221,6 +1225,8 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
 
     "X*Y",
     "X[i]*Y",
+    "back_a(X[i]*Y)",
+    "back_b(X[i]*Y)",
     "X*Y",
 
     "x*v",
@@ -1301,7 +1307,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 104 , "GGML_OP_COUNT != 104");
+static_assert(GGML_OP_COUNT == 107 , "GGML_OP_COUNT != 107");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -2954,6 +2960,21 @@ struct ggml_tensor * ggml_silu_back(
     return result;
 }
 
+// ggml_gelu_back
+
+struct ggml_tensor * ggml_gelu_back(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * b) {
+    struct ggml_tensor * result = ggml_dup_tensor(ctx, a);
+
+    result->op     = GGML_OP_GELU_BACK;
+    result->src[0] = a;
+    result->src[1] = b;
+
+    return result;
+}
+
 // ggml_geglu_back
 struct ggml_tensor * ggml_geglu_back(
         struct ggml_context * ctx,
@@ -3549,6 +3570,72 @@ struct ggml_tensor * ggml_mul_mat_id(
     return result;
 }
 
+// ggml_mul_mat_id_back_a
+
+/*
+    grad_as = ggml_mul_mat_id_back_a(ctx, grad_out, b, ids, as_like);
+
+    grad_out -> [rows, n_expert_used, n_tokens]
+    b        -> [cols, n_expert_used, n_tokens]
+    ids      -> [n_expert_used, n_tokens] (i32)
+    as_like  -> [cols, rows, n_expert]
+    grad_as  -> [cols, rows, n_expert]
+*/
+struct ggml_tensor * ggml_mul_mat_id_back_a(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * grad_out,
+        struct ggml_tensor  * b,
+        struct ggml_tensor  * ids,
+        struct ggml_tensor  * as_like) {
+    GGML_ASSERT(ids->type == GGML_TYPE_I32);
+    GGML_ASSERT(as_like->ne[3] == 1);
+    GGML_ASSERT(grad_out->ne[0] == as_like->ne[1]);
+    GGML_ASSERT(b->ne[0]        == as_like->ne[0]);
+
+    const int64_t ne[4] = { as_like->ne[0], as_like->ne[1], as_like->ne[2], 1 };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+
+    result->op     = GGML_OP_MUL_MAT_ID_BACK_A;
+    result->src[0] = grad_out;
+    result->src[1] = b;
+    result->src[2] = ids;
+
+    return result;
+}
+
+// ggml_mul_mat_id_back_b
+
+/*
+    grad_b = ggml_mul_mat_id_back_b(ctx, as, grad_out, ids, b_like);
+
+    as       -> [cols, rows, n_expert]
+    grad_out -> [rows, n_expert_used, n_tokens]
+    ids      -> [n_expert_used, n_tokens] (i32)
+    b_like   -> [cols, n_expert_used_or_1, n_tokens]
+    grad_b   -> [cols, n_expert_used_or_1, n_tokens]
+*/
+struct ggml_tensor * ggml_mul_mat_id_back_b(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * as,
+        struct ggml_tensor  * grad_out,
+        struct ggml_tensor  * ids,
+        struct ggml_tensor  * b_like) {
+    GGML_ASSERT(ids->type == GGML_TYPE_I32);
+    GGML_ASSERT(as->ne[3] == 1);
+    GGML_ASSERT(grad_out->ne[0] == as->ne[1]);
+    GGML_ASSERT(b_like->ne[0]   == as->ne[0]);
+
+    const int64_t ne[4] = { b_like->ne[0], b_like->ne[1], b_like->ne[2], b_like->ne[3] };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+
+    result->op     = GGML_OP_MUL_MAT_ID_BACK_B;
+    result->src[0] = as;
+    result->src[1] = grad_out;
+    result->src[2] = ids;
+
+    return result;
+}
+
 // ggml_out_prod
 
 static inline bool ggml_can_out_prod(const struct ggml_tensor * t0, const struct ggml_tensor * t1) {
@@ -4110,12 +4197,16 @@ struct ggml_tensor * ggml_get_rows_back(
         struct ggml_tensor  * a,
         struct ggml_tensor  * b,
         struct ggml_tensor  * c) {
-    GGML_ASSERT(ggml_is_matrix(a) && ggml_is_vector(b) && b->type == GGML_TYPE_I32);
-    GGML_ASSERT(ggml_is_matrix(c) && (a->ne[0] == c->ne[0]));
+    GGML_ASSERT(b->type == GGML_TYPE_I32);
+    GGML_ASSERT(b->ne[3] == 1);
+    GGML_ASSERT(a->ne[0] == c->ne[0]);
+    GGML_ASSERT(a->ne[1] == b->ne[0]);
+    GGML_ASSERT(a->ne[2] == b->ne[1]);
+    GGML_ASSERT(a->ne[3] == b->ne[2]);
+    GGML_ASSERT(c->ne[2] == b->ne[1]);
+    GGML_ASSERT(c->ne[3] == b->ne[2]);
 
-    // TODO: implement non F32 return
-    //struct ggml_tensor * result = ggml_new_tensor_2d(ctx, a->type, a->ne[0], b->ne[0]);
-    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, c->ne[0], c->ne[1]);
+    struct ggml_tensor * result = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, c->ne[0], c->ne[1], c->ne[2], c->ne[3]);
 
     result->op     = GGML_OP_GET_ROWS_BACK;
     result->src[0] = a;
@@ -7079,6 +7170,16 @@ static void ggml_compute_backward(
                                 grad)));        // [m,p,qq,rr]
             }
         } break;
+        case GGML_OP_MUL_MAT_ID: {
+            if (src0_needs_grads) {
+                ggml_add_or_set(ctx, cgraph, isrc0,
+                    ggml_mul_mat_id_back_a(ctx, grad, src1, src2, src0));
+            }
+            if (src1_needs_grads) {
+                ggml_add_or_set(ctx, cgraph, isrc1,
+                    ggml_mul_mat_id_back_b(ctx, src0, grad, src2, src1));
+            }
+        } break;
         case GGML_OP_SCALE: {
             if (src0_needs_grads) {
                 float s;
@@ -7296,6 +7397,11 @@ static void ggml_compute_backward(
                         ggml_add_or_set(ctx, cgraph, isrc0, ggml_silu_back(ctx, grad, src0));
                     }
                 } break;
+                case GGML_UNARY_OP_GELU: {
+                    if (src0_needs_grads) {
+                        ggml_add_or_set(ctx, cgraph, isrc0, ggml_gelu_back(ctx, grad, src0));
+                    }
+                } break;
                 case GGML_UNARY_OP_SIGMOID: {
                     if (src0_needs_grads) {
                         ggml_add_or_set(ctx, cgraph, isrc0, ggml_sigmoid_back(ctx, grad, src0));
@@ -7314,6 +7420,13 @@ static void ggml_compute_backward(
                 case GGML_UNARY_OP_SOFTPLUS: {
                     if (src0_needs_grads) {
                         ggml_add_or_set(ctx, cgraph, isrc0, ggml_mul(ctx, grad, ggml_sigmoid(ctx, src0)));
+                    }
+                } break;
+                case GGML_UNARY_OP_TANH: {
+                    if (src0_needs_grads) {
+                        struct ggml_tensor * tanh_sq  = ggml_sqr(ctx, tensor);
+                        struct ggml_tensor * one_m_sq = ggml_scale_bias(ctx, tanh_sq, -1.0f, 1.0f);
+                        ggml_add_or_set(ctx, cgraph, isrc0, ggml_mul(ctx, grad, one_m_sq));
                     }
                 } break;
                 default: {
@@ -7360,6 +7473,47 @@ static void ggml_compute_backward(
                 default: {
                     GGML_ABORT("unsupported glu op for backward pass: %s", ggml_glu_op_name(ggml_get_glu_op(tensor)));
                 } //break;
+            }
+        } break;
+        case GGML_OP_CONCAT: {
+            const int32_t dim = ggml_get_op_params_i32(tensor, 0);
+            if (src0_needs_grads) {
+                size_t offset = 0;
+                struct ggml_tensor * grad_a = ggml_view_4d(ctx, grad,
+                    src0->ne[0], src0->ne[1], src0->ne[2], src0->ne[3],
+                    grad->nb[1], grad->nb[2], grad->nb[3], offset);
+                ggml_add_or_set(ctx, cgraph, isrc0, ggml_cont(ctx, grad_a));
+            }
+            if (src1_needs_grads) {
+                size_t offset = src0->ne[dim] * grad->nb[dim];
+                struct ggml_tensor * grad_b = ggml_view_4d(ctx, grad,
+                    src1->ne[0], src1->ne[1], src1->ne[2], src1->ne[3],
+                    grad->nb[1], grad->nb[2], grad->nb[3], offset);
+                ggml_add_or_set(ctx, cgraph, isrc1, ggml_cont(ctx, grad_b));
+            }
+        } break;
+        case GGML_OP_SSM_CONV:
+        case GGML_OP_GATED_DELTA_NET:
+        case GGML_OP_L2_NORM: {
+            // Stop-gradient: analytical backward not implemented for SSM/recurrent ops.
+            // Inputs receive zero gradient. Residual bypass in hybrid archs
+            // (Qwen3Next, Mamba-attn hybrids) preserves loss propagation to upstream
+            // layers via the residual connection. Affected projections on recurrent
+            // layers do not train; FFN and non-recurrent attn layers train normally.
+            for (int j = 0; j < GGML_MAX_SRC; ++j) {
+                struct ggml_tensor * srcj = tensor->src[j];
+                if (!srcj) {
+                    continue;
+                }
+                const size_t isrcj = ggml_hash_find(hash_set, srcj);
+                if (isrcj == GGML_HASHSET_FULL || !ggml_bitset_get(hash_set->used, isrcj) || !grads_needed[isrcj]) {
+                    continue;
+                }
+                // ggml_scale requires padded-1d input; SSM inputs are often views/non-contig.
+                struct ggml_tensor * zero_grad = ggml_is_padded_1d(srcj)
+                    ? ggml_scale(ctx, srcj, 0.0f)
+                    : ggml_scale(ctx, ggml_cont(ctx, srcj), 0.0f);
+                ggml_add_or_set(ctx, cgraph, isrcj, zero_grad);
             }
         } break;
         case GGML_OP_NONE: {
@@ -7544,6 +7698,11 @@ void ggml_build_backward_expand(
             case GGML_OP_SET_ROWS:
                 ignore_src[0] = true;
                 ignore_src[1] = true;
+                break;
+            case GGML_OP_MUL_MAT_ID:
+            case GGML_OP_MUL_MAT_ID_BACK_A:
+            case GGML_OP_MUL_MAT_ID_BACK_B:
+                ignore_src[2] = true;
                 break;
 
             default:
