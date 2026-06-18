@@ -1095,6 +1095,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "REPEAT_BACK",
     "CONCAT",
     "SILU_BACK",
+    "GELU_BACK",
     "GEGLU_BACK",
     "SIGMOID_BACK",
     "NORM",
@@ -1187,7 +1188,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 107, "GGML_OP_COUNT != 107");
+static_assert(GGML_OP_COUNT == 108, "GGML_OP_COUNT != 108");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1216,6 +1217,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "repeat_back(x)",
     "concat(x, y)",
     "silu_back(x)",
+    "gelu_back(x)",
     "geglu_back(x)",
     "sigmoid_back(x)",
     "norm(x)",
@@ -1309,7 +1311,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
 };
 
 
-static_assert(GGML_OP_COUNT == 107, "GGML_OP_COUNT != 107");
+static_assert(GGML_OP_COUNT == 108, "GGML_OP_COUNT != 108");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -2989,6 +2991,21 @@ struct ggml_tensor * ggml_silu_back(
     struct ggml_tensor * result = ggml_dup_tensor(ctx, a);
 
     result->op     = GGML_OP_SILU_BACK;
+    result->src[0] = a;
+    result->src[1] = b;
+
+    return result;
+}
+
+// ggml_gelu_back
+
+struct ggml_tensor * ggml_gelu_back(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * b) {
+    struct ggml_tensor * result = ggml_dup_tensor(ctx, a);
+
+    result->op     = GGML_OP_GELU_BACK;
     result->src[0] = a;
     result->src[1] = b;
 
@@ -7453,6 +7470,11 @@ static void ggml_compute_backward(
                 case GGML_UNARY_OP_SILU: {
                     if (src0_needs_grads) {
                         ggml_add_or_set(ctx, cgraph, isrc0, ggml_silu_back(ctx, grad, src0));
+                    }
+                } break;
+                case GGML_UNARY_OP_GELU: {
+                    if (src0_needs_grads) {
+                        ggml_add_or_set(ctx, cgraph, isrc0, ggml_gelu_back(ctx, grad, src0));
                     }
                 } break;
                 case GGML_UNARY_OP_SIGMOID: {

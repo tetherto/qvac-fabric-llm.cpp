@@ -14,10 +14,10 @@ extern "C" {
 // HELLO fields are uint8_t on the wire, so the value must stay <= 255.
 #define RPC_PROTO_MAJOR_VERSION    108
 #define RPC_PROTO_MINOR_VERSION    0
-#define RPC_PROTO_PATCH_VERSION    1
+#define RPC_PROTO_PATCH_VERSION    2
 
 #ifdef  __cplusplus
-static_assert(GGML_OP_COUNT == 107, "GGML_OP_COUNT has changed - update RPC_PROTO_PATCH_VERSION");
+static_assert(GGML_OP_COUNT == 108, "GGML_OP_COUNT has changed - update RPC_PROTO_PATCH_VERSION");
 #endif
 
 #define GGML_RPC_MAX_SERVERS       16
