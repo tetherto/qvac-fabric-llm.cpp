@@ -536,6 +536,7 @@ extern "C" {
         GGML_OP_RMS_NORM_BACK,
         GGML_OP_GROUP_NORM,
         GGML_OP_L2_NORM,
+        GGML_OP_L2_NORM_BACK,
 
         GGML_OP_MUL_MAT,
         GGML_OP_MUL_MAT_ID,
@@ -1483,6 +1484,14 @@ extern "C" {
     GGML_API struct ggml_tensor * ggml_l2_norm_inplace(
             struct ggml_context * ctx,
             struct ggml_tensor  * a,
+            float                 eps);
+
+    // a - dy
+    // b - x
+    GGML_API struct ggml_tensor * ggml_l2_norm_back(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * b,
             float                 eps);
 
     // a - x
