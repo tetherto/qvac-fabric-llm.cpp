@@ -2747,17 +2747,18 @@ ggml_opt_dataset_t common_opt_sft_dataset_init(
         std::vector<Span> assistant_spans;
 
         {
-            bool is_gemma = render.find("<start_of_turn>model\n") != std::string::npos;
+            bool is_gemma3 = render.find("<start_of_turn>model\n") != std::string::npos;
+            bool is_gemma4 = render.find("<|turn>model\n") != std::string::npos;
 
-            if (is_gemma) {
-                const std::string GEMMA_START = "<start_of_turn>model\n";
-                const std::string GEMMA_END = "<end_of_turn>";
+            if (is_gemma3 || is_gemma4) {
+                const std::string GEMMA_START = is_gemma4 ? "<|turn>model\n"   : "<start_of_turn>model\n";
+                const std::string GEMMA_END   = is_gemma4 ? "<turn|>"          : "<end_of_turn>";
 
                 size_t from = 0;
                 while (true) {
                     size_t open = render.find(GEMMA_START, from);
                     if (open == std::string::npos) break;
-                    // Skip past "<start_of_turn>model\n" — supervise content only, not the role header
+                    // Skip past model-turn header — supervise content only, not the role header
                     size_t lo = open + GEMMA_START.size();
                     size_t close = render.find(GEMMA_END, lo);
                     if (close == std::string::npos) {
