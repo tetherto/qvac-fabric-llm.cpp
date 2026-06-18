@@ -7521,6 +7521,30 @@ static void ggml_compute_backward(
                 } //break;
             }
         } break;
+        case GGML_OP_SSM_CONV:
+        case GGML_OP_GATED_DELTA_NET:
+        case GGML_OP_L2_NORM: {
+            // Stop-gradient: analytical backward not implemented for SSM/recurrent ops.
+            // Inputs receive zero gradient. Residual bypass in hybrid archs
+            // (Qwen3Next, Mamba-attn hybrids) preserves loss propagation to upstream
+            // layers via the residual connection. Affected projections on recurrent
+            // layers do not train; FFN and non-recurrent attn layers train normally.
+            for (int j = 0; j < GGML_MAX_SRC; ++j) {
+                struct ggml_tensor * srcj = tensor->src[j];
+                if (!srcj) {
+                    continue;
+                }
+                const size_t isrcj = ggml_hash_find(hash_set, srcj);
+                if (isrcj == GGML_HASHSET_FULL || !ggml_bitset_get(hash_set->used, isrcj) || !grads_needed[isrcj]) {
+                    continue;
+                }
+                // ggml_scale requires padded-1d input; SSM inputs are often views/non-contig.
+                struct ggml_tensor * zero_grad = ggml_is_padded_1d(srcj)
+                    ? ggml_scale(ctx, srcj, 0.0f)
+                    : ggml_scale(ctx, ggml_cont(ctx, srcj), 0.0f);
+                ggml_add_or_set(ctx, cgraph, isrcj, zero_grad);
+            }
+        } break;
         case GGML_OP_NONE: {
             // noop
         } break;
