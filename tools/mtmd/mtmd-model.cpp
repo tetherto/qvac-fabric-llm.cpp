@@ -678,6 +678,8 @@ struct mtmd_model_loader {
                             throw std::runtime_error(mtmd_format("%s: spatial_merge_size (%d) must be 2\n", __func__, hparams.n_merge));
                         }
                         get_u32(KEY_WIN_ATTN_PATTERN, hparams.n_wa_pattern, model.proj_type == PROJECTOR_TYPE_QWEN25VL); // only 2.5 requires it
+                        // optional multi-tile cap; absent in GGUF means it stays 0 and the qwen3vl preprocessor falls back to 4
+                        get_u32(KEY_PREPROC_MAX_TILES, hparams.preproc_max_tiles, false);
                         // ref: https://huggingface.co/Qwen/Qwen2.5-VL-7B-Instruct/blob/main/preprocessor_config.json
                         hparams.set_limit_image_tokens(8, 4096);
                         // optional limits of the model, the custom values take precedence
@@ -687,7 +689,7 @@ struct mtmd_model_loader {
                         if (hparams.custom_image_max_tokens <= 0) {
                             get_u32(KEY_IMAGE_MAX_PIXELS, hparams.image_max_pixels, false);
                         }
-                        hparams.set_warmup_n_tokens(46*46); // avoid OOM on warmup
+                        hparams.warmup_image_size = hparams.image_size; // warmup at actual tile size to match inference graph shape
                         const int warn_min_pixels = 1024 * hparams.n_merge * hparams.n_merge * hparams.patch_size * hparams.patch_size;
                         if (hparams.image_min_pixels < warn_min_pixels) {
                             LOG_WRN("%s: Qwen-VL models require at minimum 1024 image tokens to function correctly on grounding tasks\n", __func__);
@@ -4051,10 +4053,16 @@ mtmd_models mtmd_model_load(const char * fname, const mtmd_model_params & params
         params.progress_callback,
         params.progress_callback_user_data);
 
+    if (params.image_tile_mode < 0 || params.image_tile_mode > 2) {
+        GGML_ABORT("invalid image_tile_mode %d; valid: 0=batched, 1=sequential, 2=disabled",
+                   params.image_tile_mode);
+    }
+
     auto load = [&](mtmd_modality modality) {
         auto model = std::make_unique<mtmd_model>();
         model->hparams.custom_image_min_tokens = params.image_min_tokens;
         model->hparams.custom_image_max_tokens = params.image_max_tokens;
+        model->hparams.image_tile_mode         = static_cast<mtmd_image_tile_mode>(params.image_tile_mode);
         loader.load_hparams(*model, modality);
         loader.load_tensors(*model, buft, params.no_alloc, params.convert_bf16_to_f16);
         const std::string & def = model->hparams.gen_default_voice;

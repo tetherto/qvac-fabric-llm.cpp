@@ -15,6 +15,8 @@ struct mtmd_image_preproc_out {
     mtmd_image_f32 overview; // overview image (downscaled image)
     int grid_x = 0;
     int grid_y = 0;
+    // when true, entries[0] is an overview thumbnail and entries[1..] are the grid_x*grid_y tiles
+    bool overview_in_entries = false;
 
     void append(const mtmd_hparams & hparams, const mtmd_image_u8 & img, bool normalized = true);
     void append(const mtmd_hparams & hparams, const std::vector<mtmd_image_u8> & imgs, bool normalized = true);
@@ -171,6 +173,21 @@ struct mtmd_image_preprocessor_lfm3vl : mtmd_image_preprocessor_qwen3vl {
 // GLM 5.3 flash, similar to dyn_size, but each edge is aligned up to patch_size*n_merge, and max budget is met by a search over the height with the width scaled proportionally
 struct mtmd_image_preprocessor_glm5v : mtmd_image_preprocessor {
     mtmd_image_preprocessor_glm5v(const mtmd_model * model) : mtmd_image_preprocessor(model) {}
+    mtmd_image_preproc_out preprocess(const mtmd_image_u8 & img) const override;
+};
+
+// Qwen3VL tiling preprocessor: splits image into an NxM grid of equal-size tiles
+// (tile size = hparams.image_size), packed row-major into the batch. Falls back to
+// the qwen3vl (dyn_size) path when the image fits in one tile. Video frames keep the
+// inherited qwen3vl sizing and stay a single untiled entry.
+struct mtmd_image_preprocessor_qwen3vl_tiled : mtmd_image_preprocessor_qwen3vl {
+    int max_tiles;
+
+    mtmd_image_preprocessor_qwen3vl_tiled(const mtmd_model * model)
+        : mtmd_image_preprocessor_qwen3vl(model),
+          max_tiles(hparams.preproc_max_tiles > 0 ? hparams.preproc_max_tiles : 4) {
+        GGML_ASSERT(hparams.image_tile_mode != MTMD_IMAGE_TILE_MODE_DISABLED);
+    }
     mtmd_image_preproc_out preprocess(const mtmd_image_u8 & img) const override;
 };
 

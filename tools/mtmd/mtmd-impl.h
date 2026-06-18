@@ -1031,13 +1031,15 @@ struct mtmd_image_f32_batch {
     std::vector<mtmd_image_f32> entries;
     bool is_audio = false;
     bool is_video = false;
+    int grid_x = 0;
+    int grid_y = 0;
 
     mtmd_image_f32_batch clone() const {
-        mtmd_image_f32_batch new_batch{
-            /* entries  */ {},
-            /* is_audio */ is_audio,
-            /* is_video */ is_video,
-        };
+        mtmd_image_f32_batch new_batch;
+        new_batch.is_audio = is_audio;
+        new_batch.is_video = is_video;
+        new_batch.grid_x   = grid_x;
+        new_batch.grid_y   = grid_y;
         new_batch.entries.reserve(entries.size());
         for (const auto & entry : entries) {
             new_batch.entries.emplace_back(entry); // copy

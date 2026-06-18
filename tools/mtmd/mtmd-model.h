@@ -18,6 +18,12 @@ enum mtmd_modality {
     MTMD_MODALITY_GEN_AUDIO,
 };
 
+enum mtmd_image_tile_mode {
+    MTMD_IMAGE_TILE_MODE_BATCHED    = 0,
+    MTMD_IMAGE_TILE_MODE_SEQUENTIAL = 1,
+    MTMD_IMAGE_TILE_MODE_DISABLED   = 2,
+};
+
 // gen-side voice reference (chatterbox): speech tokens, mel-rate features and the speaker vector
 struct mtmd_gen_ref {
     std::vector<int32_t> tokens;
@@ -246,6 +252,7 @@ struct mtmd_hparams {
     // custom value provided by user, can be undefined if not set
     int32_t custom_image_min_tokens = -1;
     int32_t custom_image_max_tokens = -1;
+    mtmd_image_tile_mode image_tile_mode = MTMD_IMAGE_TILE_MODE_BATCHED;
 
     void set_image_resize_algo(resize_algo algo, bool torch = false) {
         GGML_ASSERT(!(torch && algo == RESIZE_ALGO_LANCZOS) && "torchvision has no lanczos");
@@ -1383,6 +1390,7 @@ struct mtmd_model_params {
     // custom value provided by user, -1 if not set
     int32_t image_min_tokens = -1;
     int32_t image_max_tokens = -1;
+    int image_tile_mode = MTMD_IMAGE_TILE_MODE_BATCHED; // 0=batched, 1=sequential, 2=disabled
     bool no_alloc = false; // only create the tensors, do not read their data
     // the device can't use bf16 weights: declare them as f16 and convert on load
     bool convert_bf16_to_f16 = false;

@@ -748,6 +748,7 @@ ggml_tensor * mtmd_graph::build_patch_merge_permute(ggml_tensor * cur, int scale
 
 std::unique_ptr<mtmd_graph> mtmd_get_graph_builder(mtmd_subcontext * ctx, const mtmd_image_f32_batch & imgs,
                                                    const mtmd_subctx_encode_params * params) {
+    GGML_ASSERT(!imgs.entries.empty());
     const mtmd_image_f32 & img = imgs.entries[0];
     std::unique_ptr<mtmd_graph> builder;
 

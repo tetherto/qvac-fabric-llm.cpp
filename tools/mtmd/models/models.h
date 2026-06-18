@@ -64,6 +64,7 @@ struct mtmd_graph_qwen2vl : mtmd_graph {
 struct mtmd_graph_qwen3vl : mtmd_graph_qwen2vl {
     mtmd_graph_qwen3vl(mtmd_subcontext * ctx, const mtmd_image_f32 & img) : mtmd_graph_qwen2vl(ctx, img) {}
     ggml_cgraph * build() override;
+    bool support_batch() const override { return true; }
 };
 
 struct mtmd_graph_magevl : mtmd_graph {
