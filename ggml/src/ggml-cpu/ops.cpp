@@ -6142,21 +6142,26 @@ static void ggml_compute_forward_get_rows_back_f32(
 
     memset(dst->data, 0, ggml_nbytes(dst));
 
-    const int nc = src0->ne[0];
-    const int nr = ggml_nelements(src1);
+    GGML_TENSOR_BINARY_OP_LOCALS
 
-    GGML_ASSERT( dst->ne[0] == nc);
-    GGML_ASSERT(src0->nb[0] == sizeof(float));
+    const int64_t nc = ne00;
+    GGML_ASSERT(ne0  == nc);
+    GGML_ASSERT(nb00 == sizeof(float));
 
-    for (int i = 0; i < nr; ++i) {
-        const int r = ((int32_t *) src1->data)[i];
+    for (int64_t i12 = 0; i12 < ne12; ++i12) {
+        for (int64_t i11 = 0; i11 < ne11; ++i11) {
+            for (int64_t i10 = 0; i10 < ne10; ++i10) {
+                const int32_t idx = *(const int32_t *)
+                    ((const char *) src1->data + i10*nb10 + i11*nb11 + i12*nb12);
 
-        GGML_ASSERT(r >= 0 && r < dst->ne[1]);
+                GGML_ASSERT(idx >= 0 && idx < ne1);
 
-        ggml_vec_add_f32(nc,
-                (float *) ((char *)  dst->data + r*dst->nb[1]),
-                (float *) ((char *)  dst->data + r*dst->nb[1]),
-                (float *) ((char *) src0->data + i*src0->nb[1]));
+                ggml_vec_add_f32(nc,
+                        (float *) ((char *)  dst->data + idx*nb1  + i11*nb2  + i12*nb3),
+                        (float *) ((char *)  dst->data + idx*nb1  + i11*nb2  + i12*nb3),
+                        (float *) ((char *) src0->data + i10*nb01 + i11*nb02 + i12*nb03));
+            }
+        }
     }
 }
 
