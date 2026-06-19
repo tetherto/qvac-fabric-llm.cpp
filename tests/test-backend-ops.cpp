@@ -5884,6 +5884,61 @@ struct test_mul_mat_id_w4a4 : public test_mul_mat_id {
     }
 };
 
+// GGML_OP_MUL_MAT_ID_BACK_A
+struct test_mul_mat_id_back_a : public test_case {
+    const ggml_type type;
+    const int n_mats;
+    const int n_used;
+    const bool b; // broadcast b matrix
+    const int64_t m; // rows of each expert  (grad_out->ne[0])
+    const int64_t n; // tokens
+    const int64_t k; // cols of each expert
+
+    std::string vars() override {
+        return VARS_TO_STR7(type, n_mats, n_used, b, m, n, k);
+    }
+
+    uint64_t op_flops(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return 2 * m * k * n * n_used;
+    }
+
+    test_mul_mat_id_back_a(ggml_type type = GGML_TYPE_F32,
+            int n_mats = 8, int n_used = 2, bool b = false,
+            int64_t m = 32, int64_t n = 32, int64_t k = 32)
+        : type(type), n_mats(n_mats), n_used(n_used), b(b),
+            m(m), n(n), k(k) {
+            GGML_ASSERT(n_used <= n_mats);
+        }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * grad_out = ggml_new_tensor_3d(ctx, type, m, n_used, n);
+        ggml_set_name(grad_out, "grad_out");
+
+        ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_mats, n);
+        ggml_set_name(ids, "ids");
+        if (n_used != n_mats) {
+            ids = ggml_view_2d(ctx, ids, n_used, n, ids->nb[1], 0);
+            ggml_set_name(ids, "view_of_ids");
+        }
+
+        ggml_tensor * b = ggml_new_tensor_3d(ctx, type, k, this->b ? 1 : n_used, n);
+        ggml_set_name(b, "b");
+
+        ggml_tensor * as_like = ggml_new_tensor_3d(ctx, type, k, m, n_mats);
+        ggml_set_name(as_like, "as_like");
+
+        ggml_tensor * out = ggml_mul_mat_id_back_a(ctx, grad_out, b, ids, as_like);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        init_mul_mat_id_tensors(ctx, n_mats);
+    }
+};
+
 // GGML_OP_MUL_MAT_ID + GGML_OP_ADD or GGML_OP_MUL
 struct test_mul_mat_id_fusion : public test_case {
     const ggml_type type_a;
@@ -11864,6 +11919,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         for (int64_t n : { 1, 2, 3, 4, 8, 9 }) {
             test_cases.emplace_back(new test_mul_mat_id_shared(type, n));
         }
+    }
+
+    for (bool b : {false, true}) {
+        test_cases.emplace_back(new test_mul_mat_id_back_a(GGML_TYPE_F32, 8,  2,  b, 32, 32, 32));
+        test_cases.emplace_back(new test_mul_mat_id_back_a(GGML_TYPE_F32, 16, 16, b, 50, 200, 64));
+        test_cases.emplace_back(new test_mul_mat_id_back_a(GGML_TYPE_F32, 4,  1,  b, 16, 17, 31));
     }
 
     // gpt-oss issue with Vulkan mmq_id
