@@ -1795,15 +1795,19 @@ extern "C" {
 
     // LoRA training parameters
     enum llama_lora_target_module {
-        LLAMA_LORA_TARGET_ATTN_Q    = 1 << 0,
-        LLAMA_LORA_TARGET_ATTN_K    = 1 << 1,
-        LLAMA_LORA_TARGET_ATTN_V    = 1 << 2,
-        LLAMA_LORA_TARGET_ATTN_O    = 1 << 3,
-        LLAMA_LORA_TARGET_FFN_GATE  = 1 << 4,
-        LLAMA_LORA_TARGET_FFN_UP    = 1 << 5,
-        LLAMA_LORA_TARGET_FFN_DOWN  = 1 << 6,
-        LLAMA_LORA_TARGET_OUTPUT    = 1 << 7,
-        LLAMA_LORA_TARGET_ALL       = -1
+        LLAMA_LORA_TARGET_ATTN_Q            = 1 << 0,
+        LLAMA_LORA_TARGET_ATTN_K            = 1 << 1,
+        LLAMA_LORA_TARGET_ATTN_V            = 1 << 2,
+        LLAMA_LORA_TARGET_ATTN_O            = 1 << 3,
+        LLAMA_LORA_TARGET_FFN_GATE          = 1 << 4,
+        LLAMA_LORA_TARGET_FFN_UP            = 1 << 5,
+        LLAMA_LORA_TARGET_FFN_DOWN          = 1 << 6,
+        LLAMA_LORA_TARGET_OUTPUT            = 1 << 7,
+        LLAMA_LORA_TARGET_FFN_GATE_EXPS     = 1 << 8,
+        LLAMA_LORA_TARGET_FFN_UP_EXPS       = 1 << 9,
+        LLAMA_LORA_TARGET_FFN_DOWN_EXPS     = 1 << 10,
+        LLAMA_LORA_TARGET_FFN_GATE_UP_EXPS  = 1 << 11,
+        LLAMA_LORA_TARGET_ALL               = -1
     };
 
     struct llama_lora_training_params {
