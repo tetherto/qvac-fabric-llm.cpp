@@ -13468,6 +13468,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         }
     }
 
+    // mul_mat_id backward
+    for (int bs : {1, 8, 64, 512}) {
+        test_cases.emplace_back(new test_mul_mat_id_back_a(GGML_TYPE_F32, 128, 8, false, 768, bs, 2048));
+        test_cases.emplace_back(new test_mul_mat_id_back_b(GGML_TYPE_F32, 128, 8, false, 768, bs, 2048));
+        test_cases.emplace_back(new test_mul_mat_id_back_b(GGML_TYPE_Q8_0, 128, 8, false, 768, bs, 2048));
+    }
+
     for (int K : {3, 5}) {
         for (int IC : {256, 2560}) {
             for (int IW_IH : {32, 64, 256}) {
