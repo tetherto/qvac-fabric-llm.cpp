@@ -3940,6 +3940,8 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     ggml_vk_create_pipeline(device, device->pipeline_out_prod_tiled_q8_0, "out_prod_tiled_q8_0", out_prod_tiled_q8_0_len, out_prod_tiled_q8_0_data, "main", 3, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {}, 1, true);
     ggml_vk_create_pipeline(device, device->pipeline_out_prod_tiled_tq2_0, "out_prod_tiled_tq2_0", out_prod_tiled_tq2_0_len, out_prod_tiled_tq2_0_data, "main", 3, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {}, 1, true);
 
+    ggml_vk_create_pipeline(device, device->pipeline_mul_mat_id_back_a_f32, "mul_mat_id_back_a_f32", mul_mat_id_back_a_f32_len, mul_mat_id_back_a_f32_data, "main", 4, sizeof(vk_op_mul_mat_id_back_a_push_constants), {1, 1, 1}, {}, 1);
+
     for (uint32_t i = 0; i < num_argsort_pipelines; ++i) {
         uint32_t BLOCK_SIZE = 1u << std::min(i, device->max_workgroup_size_log2);
         if (i <= device->max_workgroup_size_log2 &&
@@ -10298,6 +10300,12 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
             return ctx->device->pipeline_out_prod_f16_f32;
         }
         return nullptr;
+    case GGML_OP_MUL_MAT_ID_BACK_A:
+        if (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 &&
+            src2->type == GGML_TYPE_I32 && dst->type == GGML_TYPE_F32) {
+            return ctx->device->pipeline_mul_mat_id_back_a_f32;
+        }
+        return nullptr;
     case GGML_OP_SUM:
     case GGML_OP_SUM_ROWS:
     case GGML_OP_MEAN:
@@ -10979,6 +10987,11 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
         {
             elements = { (uint32_t)ne01, (uint32_t)ne02, 1 };
         } break;
+    case GGML_OP_MUL_MAT_ID_BACK_A:
+        {
+            // one workgroup per (n, e), local invocations stride over k
+            elements = { (uint32_t)dst->ne[1], (uint32_t)dst->ne[2], 1 };
+        } break;
     case GGML_OP_SET_ROWS:
         {
             uint32_t ne = ggml_nelements(src0);
@@ -11374,6 +11387,26 @@ void ggml_vk_add_id(ggml_backend_vk_context * ctx, vk_context& subctx, const ggm
         (uint32_t)src0->nb[2] / src0_type_size,
         (uint32_t)src1->nb[1] / src1_type_size,
         (uint32_t)src2->nb[1] / src2_type_size,
+    });
+}
+
+static void ggml_vk_mul_mat_id_back_a(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * grad_out, const ggml_tensor * b, const ggml_tensor * ids, ggml_tensor * dst) {
+    const uint32_t g_type_size   = ggml_type_size(grad_out->type);
+    const uint32_t b_type_size   = ggml_type_size(b->type);
+    const uint32_t ids_type_size = ggml_type_size(ids->type);
+    const uint32_t d_type_size   = ggml_type_size(dst->type);
+
+    ggml_vk_op_f32<vk_op_mul_mat_id_back_a_push_constants>(ctx, subctx, grad_out, b, ids, nullptr, dst, GGML_OP_MUL_MAT_ID_BACK_A, {
+        (uint32_t)dst->ne[0],  // K
+        (uint32_t)dst->ne[1],  // N
+        (uint32_t)dst->ne[2],  // n_expert
+        (uint32_t)ids->ne[0],  // n_used
+        (uint32_t)ids->ne[1],  // n_tok
+        (uint32_t)b->ne[1],    // b_ne1
+        (uint32_t)(grad_out->nb[1] / g_type_size), (uint32_t)(grad_out->nb[2] / g_type_size),
+        (uint32_t)(b->nb[1] / b_type_size),        (uint32_t)(b->nb[2] / b_type_size),
+        (uint32_t)(ids->nb[1] / ids_type_size),
+        (uint32_t)(dst->nb[1] / d_type_size),      (uint32_t)(dst->nb[2] / d_type_size),
     });
 }
 
@@ -13824,6 +13857,10 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
         break;
     case GGML_OP_ADD_ID:
         ggml_vk_add_id(ctx, compute_ctx, src0, src1, src2, node);
+
+        break;
+    case GGML_OP_MUL_MAT_ID_BACK_A:
+        ggml_vk_mul_mat_id_back_a(ctx, compute_ctx, src0, src1, src2, node);
 
         break;
     case GGML_OP_CONCAT:
@@ -17288,6 +17325,9 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                    (op->src[1]->type == GGML_TYPE_F32 || op->src[1]->type == GGML_TYPE_F16) &&
                    (op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16);
         case GGML_OP_ADD_ID:
+            return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 && op->src[2]->type == GGML_TYPE_I32 &&
+                   op->type == GGML_TYPE_F32;
+        case GGML_OP_MUL_MAT_ID_BACK_A:
             return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 && op->src[2]->type == GGML_TYPE_I32 &&
                    op->type == GGML_TYPE_F32;
         case GGML_OP_SILU_BACK:
