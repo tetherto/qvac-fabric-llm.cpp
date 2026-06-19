@@ -157,15 +157,23 @@ static uint32_t parse_lora_modules(const std::string& modules_str) {
     }
     
     static const std::map<std::string, uint32_t> module_map = {
-        {"attn_q",    LLAMA_LORA_TARGET_ATTN_Q},
-        {"attn_k",    LLAMA_LORA_TARGET_ATTN_K},  
-        {"attn_v",    LLAMA_LORA_TARGET_ATTN_V},
-        {"attn_o",    LLAMA_LORA_TARGET_ATTN_O},
-        {"ffn_gate",  LLAMA_LORA_TARGET_FFN_GATE},
-        {"ffn_up",    LLAMA_LORA_TARGET_FFN_UP},
-        {"ffn_down",  LLAMA_LORA_TARGET_FFN_DOWN},
-        {"output",    LLAMA_LORA_TARGET_OUTPUT},
-        {"all",       LLAMA_LORA_TARGET_ALL}
+        {"attn_q",           LLAMA_LORA_TARGET_ATTN_Q},
+        {"attn_k",           LLAMA_LORA_TARGET_ATTN_K},
+        {"attn_v",           LLAMA_LORA_TARGET_ATTN_V},
+        {"attn_o",           LLAMA_LORA_TARGET_ATTN_O},
+        {"ffn_gate",         LLAMA_LORA_TARGET_FFN_GATE},
+        {"ffn_up",           LLAMA_LORA_TARGET_FFN_UP},
+        {"ffn_down",         LLAMA_LORA_TARGET_FFN_DOWN},
+        {"output",           LLAMA_LORA_TARGET_OUTPUT},
+        {"ffn_gate_exps",    LLAMA_LORA_TARGET_FFN_GATE_EXPS},
+        {"ffn_up_exps",      LLAMA_LORA_TARGET_FFN_UP_EXPS},
+        {"ffn_down_exps",    LLAMA_LORA_TARGET_FFN_DOWN_EXPS},
+        {"ffn_gate_up_exps", LLAMA_LORA_TARGET_FFN_GATE_UP_EXPS},
+        {"moe_experts",      LLAMA_LORA_TARGET_FFN_GATE_EXPS |
+                             LLAMA_LORA_TARGET_FFN_UP_EXPS |
+                             LLAMA_LORA_TARGET_FFN_DOWN_EXPS |
+                             LLAMA_LORA_TARGET_FFN_GATE_UP_EXPS},
+        {"all",              LLAMA_LORA_TARGET_ALL}
     };
     
     uint32_t target_modules = 0;
@@ -182,7 +190,7 @@ static uint32_t parse_lora_modules(const std::string& modules_str) {
             LOG_INF("Added target module: %s\n", module.c_str());
         } else {
             LOG_ERR("Unknown LoRA target module: %s\n", module.c_str());
-            LOG_ERR("Available modules: attn_q, attn_k, attn_v, attn_o, ffn_gate, ffn_up, ffn_down, output, all\n");
+            LOG_ERR("Available modules: attn_q, attn_k, attn_v, attn_o, ffn_gate, ffn_up, ffn_down, output, ffn_gate_exps, ffn_up_exps, ffn_down_exps, ffn_gate_up_exps, moe_experts, all\n");
             return 0;
         }
     }
@@ -261,8 +269,10 @@ static void print_lora_usage() {
     printf("  --lora-rank N              LoRA rank (default: 8, range: 1-512)\n");
     printf("  --lora-alpha N             LoRA alpha scaling factor (default: 16.0, range: 0.1-1000.0)\n");
     printf("  --lora-modules MODULES     Target modules as comma-separated list (default: attn_q,attn_k,attn_v,attn_o)\n");
-    printf("                             Available modules: attn_q, attn_k, attn_v, attn_o, ffn_gate, ffn_up, ffn_down, output, all\n");
+    printf("                             Available modules: attn_q, attn_k, attn_v, attn_o, ffn_gate, ffn_up, ffn_down, output,\n");
+    printf("                                                ffn_gate_exps, ffn_up_exps, ffn_down_exps, ffn_gate_up_exps, moe_experts, all\n");
     printf("                             Examples: \"attn_q,attn_v\" or \"all\" or \"attn_q,attn_k,attn_v,attn_o,ffn_gate,ffn_up,ffn_down\"\n");
+    printf("                                       \"attn_q,attn_v,moe_experts\" (MoE expert LoRA)\n");
     printf("  --output-adapter PATH      Output path for trained adapter (default: auto-generated)\n");
     printf("\nTraining Options:\n");
     printf("  --num-epochs N             Number of training epochs (default: 1)\n");
@@ -749,7 +759,8 @@ int main(int argc, char ** argv) {
             return 1;
         }
     } else {
-        LOG_INF("Target modules: Q=%s, K=%s, V=%s, O=%s, GATE=%s, UP=%s, DOWN=%s, OUTPUT=%s\n",
+        LOG_INF("Target modules: Q=%s, K=%s, V=%s, O=%s, GATE=%s, UP=%s, DOWN=%s, OUTPUT=%s, "
+                "GATE_EXPS=%s, UP_EXPS=%s, DOWN_EXPS=%s, GATE_UP_EXPS=%s\n",
             (lora_params.target_modules & LLAMA_LORA_TARGET_ATTN_Q) ? "yes" : "no",
             (lora_params.target_modules & LLAMA_LORA_TARGET_ATTN_K) ? "yes" : "no",
             (lora_params.target_modules & LLAMA_LORA_TARGET_ATTN_V) ? "yes" : "no",
@@ -757,7 +768,11 @@ int main(int argc, char ** argv) {
             (lora_params.target_modules & LLAMA_LORA_TARGET_FFN_GATE) ? "yes" : "no",
             (lora_params.target_modules & LLAMA_LORA_TARGET_FFN_UP) ? "yes" : "no",
             (lora_params.target_modules & LLAMA_LORA_TARGET_FFN_DOWN) ? "yes" : "no",
-            (lora_params.target_modules & LLAMA_LORA_TARGET_OUTPUT) ? "yes" : "no");
+            (lora_params.target_modules & LLAMA_LORA_TARGET_OUTPUT) ? "yes" : "no",
+            (lora_params.target_modules & LLAMA_LORA_TARGET_FFN_GATE_EXPS) ? "yes" : "no",
+            (lora_params.target_modules & LLAMA_LORA_TARGET_FFN_UP_EXPS) ? "yes" : "no",
+            (lora_params.target_modules & LLAMA_LORA_TARGET_FFN_DOWN_EXPS) ? "yes" : "no",
+            (lora_params.target_modules & LLAMA_LORA_TARGET_FFN_GATE_UP_EXPS) ? "yes" : "no");
         
         LOG_INF("LoRA configuration: rank=%d, alpha=%.1f (scaling=%.3f)\n",
                 lora_params.rank, lora_params.alpha, lora_params.alpha / lora_params.rank);
