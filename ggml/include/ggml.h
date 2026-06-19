@@ -539,6 +539,8 @@ extern "C" {
 
         GGML_OP_MUL_MAT,
         GGML_OP_MUL_MAT_ID,
+        GGML_OP_MUL_MAT_ID_BACK_A,
+        GGML_OP_MUL_MAT_ID_BACK_B,
         GGML_OP_OUT_PROD,
 
         GGML_OP_SCALE,
@@ -1569,6 +1571,22 @@ extern "C" {
             struct ggml_tensor  * as,
             struct ggml_tensor  * b,
             struct ggml_tensor  * ids);
+
+    // Backward of ggml_mul_mat_id w.r.t. `as` (expert weight stack).
+    GGML_API struct ggml_tensor * ggml_mul_mat_id_back_a(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * grad_out,
+            struct ggml_tensor  * b,
+            struct ggml_tensor  * ids,
+            struct ggml_tensor  * as_like);
+
+    // Backward of ggml_mul_mat_id w.r.t. `b` (per-token activations).
+    GGML_API struct ggml_tensor * ggml_mul_mat_id_back_b(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * as,
+            struct ggml_tensor  * grad_out,
+            struct ggml_tensor  * ids,
+            struct ggml_tensor  * b_like);
 
     // A: m columns, n rows,
     // B: p columns, n rows,

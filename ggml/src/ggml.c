@@ -1106,6 +1106,8 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
 
     "MUL_MAT",
     "MUL_MAT_ID",
+    "MUL_MAT_ID_BACK_A",
+    "MUL_MAT_ID_BACK_B",
     "OUT_PROD",
 
     "SCALE",
@@ -1188,7 +1190,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 108, "GGML_OP_COUNT != 108");
+static_assert(GGML_OP_COUNT == 110, "GGML_OP_COUNT != 110");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1228,6 +1230,8 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
 
     "X*Y",
     "X[i]*Y",
+    "back_a(X[i]*Y)",
+    "back_b(X[i]*Y)",
     "X*Y",
 
     "x*v",
@@ -1310,8 +1314,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-
-static_assert(GGML_OP_COUNT == 108, "GGML_OP_COUNT != 108");
+static_assert(GGML_OP_COUNT == 110 , "GGML_OP_COUNT != 110");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -3612,6 +3615,72 @@ struct ggml_tensor * ggml_mul_mat_id(
     result->op     = GGML_OP_MUL_MAT_ID;
     result->src[0] = as;
     result->src[1] = b;
+    result->src[2] = ids;
+
+    return result;
+}
+
+// ggml_mul_mat_id_back_a
+
+/*
+    grad_as = ggml_mul_mat_id_back_a(ctx, grad_out, b, ids, as_like);
+
+    grad_out -> [rows, n_expert_used, n_tokens]
+    b        -> [cols, n_expert_used, n_tokens]
+    ids      -> [n_expert_used, n_tokens] (i32)
+    as_like  -> [cols, rows, n_expert]
+    grad_as  -> [cols, rows, n_expert]
+*/
+struct ggml_tensor * ggml_mul_mat_id_back_a(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * grad_out,
+        struct ggml_tensor  * b,
+        struct ggml_tensor  * ids,
+        struct ggml_tensor  * as_like) {
+    GGML_ASSERT(ids->type == GGML_TYPE_I32);
+    GGML_ASSERT(as_like->ne[3] == 1);
+    GGML_ASSERT(grad_out->ne[0] == as_like->ne[1]);
+    GGML_ASSERT(b->ne[0]        == as_like->ne[0]);
+
+    const int64_t ne[4] = { as_like->ne[0], as_like->ne[1], as_like->ne[2], 1 };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+
+    result->op     = GGML_OP_MUL_MAT_ID_BACK_A;
+    result->src[0] = grad_out;
+    result->src[1] = b;
+    result->src[2] = ids;
+
+    return result;
+}
+
+// ggml_mul_mat_id_back_b
+
+/*
+    grad_b = ggml_mul_mat_id_back_b(ctx, as, grad_out, ids, b_like);
+
+    as       -> [cols, rows, n_expert]
+    grad_out -> [rows, n_expert_used, n_tokens]
+    ids      -> [n_expert_used, n_tokens] (i32)
+    b_like   -> [cols, n_expert_used_or_1, n_tokens]
+    grad_b   -> [cols, n_expert_used_or_1, n_tokens]
+*/
+struct ggml_tensor * ggml_mul_mat_id_back_b(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * as,
+        struct ggml_tensor  * grad_out,
+        struct ggml_tensor  * ids,
+        struct ggml_tensor  * b_like) {
+    GGML_ASSERT(ids->type == GGML_TYPE_I32);
+    GGML_ASSERT(as->ne[3] == 1);
+    GGML_ASSERT(grad_out->ne[0] == as->ne[1]);
+    GGML_ASSERT(b_like->ne[0]   == as->ne[0]);
+
+    const int64_t ne[4] = { b_like->ne[0], b_like->ne[1], b_like->ne[2], b_like->ne[3] };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+
+    result->op     = GGML_OP_MUL_MAT_ID_BACK_B;
+    result->src[0] = as;
+    result->src[1] = grad_out;
     result->src[2] = ids;
 
     return result;
@@ -7246,6 +7315,16 @@ static void ggml_compute_backward(
                                 grad)));        // [m,p,qq,rr]
             }
         } break;
+        case GGML_OP_MUL_MAT_ID: {
+            if (src0_needs_grads) {
+                ggml_add_or_set(ctx, cgraph, isrc0,
+                    ggml_mul_mat_id_back_a(ctx, grad, src1, src2, src0));
+            }
+            if (src1_needs_grads) {
+                ggml_add_or_set(ctx, cgraph, isrc1,
+                    ggml_mul_mat_id_back_b(ctx, src0, grad, src2, src1));
+            }
+        } break;
         case GGML_OP_SCALE: {
             if (src0_needs_grads) {
                 float s;
@@ -7773,6 +7852,11 @@ void ggml_build_backward_expand(
             case GGML_OP_SET_ROWS:
                 ignore_src[0] = true;
                 ignore_src[1] = true;
+                break;
+            case GGML_OP_MUL_MAT_ID:
+            case GGML_OP_MUL_MAT_ID_BACK_A:
+            case GGML_OP_MUL_MAT_ID_BACK_B:
+                ignore_src[2] = true;
                 break;
 
             default:
