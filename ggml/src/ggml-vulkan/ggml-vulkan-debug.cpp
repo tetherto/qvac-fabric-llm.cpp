@@ -973,6 +973,9 @@ void ggml_vk_check_results_0(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph
         } else if (tensor->op == GGML_OP_MUL_MAT_ID_BACK_A) {
             ggml_tensor * as_like = ggml_new_tensor(ggml_ctx, GGML_TYPE_F32, 4, tensor->ne);
             tensor_clone = ggml_mul_mat_id_back_a(ggml_ctx, src_clone[0], src_clone[1], src_clone[2], as_like);
+        } else if (tensor->op == GGML_OP_MUL_MAT_ID_BACK_B) {
+            ggml_tensor * b_like = ggml_new_tensor(ggml_ctx, GGML_TYPE_F32, 4, tensor->ne);
+            tensor_clone = ggml_mul_mat_id_back_b(ggml_ctx, src_clone[0], src_clone[1], src_clone[2], b_like);
         } else if (tensor->op == GGML_OP_SUB) {
             tensor_clone = ggml_sub(ggml_ctx, src_clone[0], src_clone[1]);
         } else if (tensor->op == GGML_OP_MUL) {

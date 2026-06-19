@@ -467,6 +467,19 @@ struct vk_op_mul_mat_id_back_a_push_constants {
     uint32_t d_nb1; uint32_t d_nb2;
 };
 
+struct vk_op_mul_mat_id_back_b_push_constants {
+    uint32_t K;
+    uint32_t N;
+    uint32_t n_used;
+    uint32_t n_tok;
+    uint32_t n_expert;
+    uint32_t dst_ne1;
+    uint32_t as_nb1; uint32_t as_nb2;
+    uint32_t g_nb1;  uint32_t g_nb2;
+    uint32_t ids_nb1;
+    uint32_t d_nb1;  uint32_t d_nb2;
+};
+
 struct vk_op_diag_mask_push_constants {
     uint32_t ncols;
     uint32_t rows_per_channel;

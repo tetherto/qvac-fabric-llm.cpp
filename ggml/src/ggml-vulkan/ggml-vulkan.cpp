@@ -3941,6 +3941,8 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     ggml_vk_create_pipeline(device, device->pipeline_out_prod_tiled_tq2_0, "out_prod_tiled_tq2_0", out_prod_tiled_tq2_0_len, out_prod_tiled_tq2_0_data, "main", 3, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {}, 1, true);
 
     ggml_vk_create_pipeline(device, device->pipeline_mul_mat_id_back_a_f32, "mul_mat_id_back_a_f32", mul_mat_id_back_a_f32_len, mul_mat_id_back_a_f32_data, "main", 4, sizeof(vk_op_mul_mat_id_back_a_push_constants), {1, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_mul_mat_id_back_b_f32, "mul_mat_id_back_b_f32", mul_mat_id_back_b_f32_len, mul_mat_id_back_b_f32_data, "main", 4, sizeof(vk_op_mul_mat_id_back_b_push_constants), {1, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_mul_mat_id_back_b_q8_0, "mul_mat_id_back_b_q8_0", mul_mat_id_back_b_q8_0_len, mul_mat_id_back_b_q8_0_data, "main", 4, sizeof(vk_op_mul_mat_id_back_b_push_constants), {1, 1, 1}, {}, 1, true);
 
     for (uint32_t i = 0; i < num_argsort_pipelines; ++i) {
         uint32_t BLOCK_SIZE = 1u << std::min(i, device->max_workgroup_size_log2);
@@ -10306,6 +10308,12 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
             return ctx->device->pipeline_mul_mat_id_back_a_f32;
         }
         return nullptr;
+    case GGML_OP_MUL_MAT_ID_BACK_B:
+        if (src1->type == GGML_TYPE_F32 && src2->type == GGML_TYPE_I32 && dst->type == GGML_TYPE_F32) {
+            if (src0->type == GGML_TYPE_F32)  return ctx->device->pipeline_mul_mat_id_back_b_f32;
+            if (src0->type == GGML_TYPE_Q8_0) return ctx->device->pipeline_mul_mat_id_back_b_q8_0;
+        }
+        return nullptr;
     case GGML_OP_SUM:
     case GGML_OP_SUM_ROWS:
     case GGML_OP_MEAN:
@@ -10656,7 +10664,7 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
     }
     std::cerr << "), (" << dst << ", name=" << dst->name << ", type=" << dst->type << ", ne0=" << dst->ne[0] << ", ne1=" << dst->ne[1] << ", ne2=" << dst->ne[2] << ", ne3=" << dst->ne[3] << ", nb0=" << dst->nb[0] << ", nb1=" << dst->nb[1] << ", nb2=" << dst->nb[2] << ", nb3=" << dst->nb[3];
     std::cerr << "), " << ggml_op_name(op) << ")");
-    GGML_ASSERT(op == GGML_OP_GET_ROWS || op == GGML_OP_CPY || op == GGML_OP_CONCAT || op == GGML_OP_OUT_PROD || (!ggml_is_quantized(src0->type) && (src1 == nullptr || !ggml_is_quantized(src1->type))));  // NOLINT
+    GGML_ASSERT(op == GGML_OP_GET_ROWS || op == GGML_OP_CPY || op == GGML_OP_CONCAT || op == GGML_OP_OUT_PROD || op == GGML_OP_MUL_MAT_ID_BACK_B || (!ggml_is_quantized(src0->type) && (src1 == nullptr || !ggml_is_quantized(src1->type))));  // NOLINT
     GGML_ASSERT(dst->buffer != nullptr);
     const uint64_t ne00 = src0->ne[0];
     const uint64_t ne01 = src0->ne[1];
@@ -10990,6 +10998,11 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
     case GGML_OP_MUL_MAT_ID_BACK_A:
         {
             // one workgroup per (n, e), local invocations stride over k
+            elements = { (uint32_t)dst->ne[1], (uint32_t)dst->ne[2], 1 };
+        } break;
+    case GGML_OP_MUL_MAT_ID_BACK_B:
+        {
+            // one workgroup per (slot, token); local invocations stride over k
             elements = { (uint32_t)dst->ne[1], (uint32_t)dst->ne[2], 1 };
         } break;
     case GGML_OP_SET_ROWS:
@@ -11405,6 +11418,32 @@ static void ggml_vk_mul_mat_id_back_a(ggml_backend_vk_context * ctx, vk_context&
         (uint32_t)b->ne[1],    // b_ne1
         (uint32_t)(grad_out->nb[1] / g_type_size), (uint32_t)(grad_out->nb[2] / g_type_size),
         (uint32_t)(b->nb[1] / b_type_size),        (uint32_t)(b->nb[2] / b_type_size),
+        (uint32_t)(ids->nb[1] / ids_type_size),
+        (uint32_t)(dst->nb[1] / d_type_size),      (uint32_t)(dst->nb[2] / d_type_size),
+    });
+}
+
+static void ggml_vk_mul_mat_id_back_b(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * as, const ggml_tensor * grad_out, const ggml_tensor * ids, ggml_tensor * dst) {
+    const uint32_t as_type_size  = ggml_type_size(as->type);
+    const uint32_t as_blck_size  = ggml_blck_size(as->type);
+    const uint32_t g_type_size   = ggml_type_size(grad_out->type);
+    const uint32_t ids_type_size = ggml_type_size(ids->type);
+    const uint32_t d_type_size   = ggml_type_size(dst->type);
+
+    // f32 path reads `as` with element strides; the quantized path computes
+    // block indices from K/N directly and ignores these.
+    const uint32_t as_nb1 = (as_blck_size == 1) ? (uint32_t)(as->nb[1] / as_type_size) : 0;
+    const uint32_t as_nb2 = (as_blck_size == 1) ? (uint32_t)(as->nb[2] / as_type_size) : 0;
+
+    ggml_vk_op_f32<vk_op_mul_mat_id_back_b_push_constants>(ctx, subctx, as, grad_out, ids, nullptr, dst, GGML_OP_MUL_MAT_ID_BACK_B, {
+        (uint32_t)dst->ne[0],  // K
+        (uint32_t)as->ne[1],   // N
+        (uint32_t)ids->ne[0],  // n_used
+        (uint32_t)ids->ne[1],  // n_tok
+        (uint32_t)as->ne[2],   // n_expert
+        (uint32_t)dst->ne[1],  // dst_ne1
+        as_nb1, as_nb2,
+        (uint32_t)(grad_out->nb[1] / g_type_size), (uint32_t)(grad_out->nb[2] / g_type_size),
         (uint32_t)(ids->nb[1] / ids_type_size),
         (uint32_t)(dst->nb[1] / d_type_size),      (uint32_t)(dst->nb[2] / d_type_size),
     });
@@ -13861,6 +13900,10 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
         break;
     case GGML_OP_MUL_MAT_ID_BACK_A:
         ggml_vk_mul_mat_id_back_a(ctx, compute_ctx, src0, src1, src2, node);
+
+        break;
+    case GGML_OP_MUL_MAT_ID_BACK_B:
+        ggml_vk_mul_mat_id_back_b(ctx, compute_ctx, src0, src1, src2, node);
 
         break;
     case GGML_OP_CONCAT:
@@ -17329,6 +17372,10 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                    op->type == GGML_TYPE_F32;
         case GGML_OP_MUL_MAT_ID_BACK_A:
             return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 && op->src[2]->type == GGML_TYPE_I32 &&
+                   op->type == GGML_TYPE_F32;
+        case GGML_OP_MUL_MAT_ID_BACK_B:
+            return (op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_Q8_0) &&
+                   op->src[1]->type == GGML_TYPE_F32 && op->src[2]->type == GGML_TYPE_I32 &&
                    op->type == GGML_TYPE_F32;
         case GGML_OP_SILU_BACK:
         case GGML_OP_GELU_BACK:
