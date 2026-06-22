@@ -682,6 +682,53 @@ typedef struct {
 
 typedef struct {
     int32_t  ne00;
+    int32_t  ne00_4;
+    uint64_t nb01;
+    uint64_t nb02;
+    uint64_t nb03;
+    uint64_t nb11;
+    uint64_t nb12;
+    uint64_t nb13;
+    uint64_t nb1;
+    uint64_t nb2;
+    uint64_t nb3;
+    float    eps;
+} ggml_metal_kargs_l2_norm_back;
+
+typedef struct {
+    int32_t  K;
+    int32_t  N;
+    int32_t  n_expert;
+    int32_t  n_used;
+    int32_t  n_tok;
+    int32_t  b_ne1;
+    uint64_t g_nb1;
+    uint64_t g_nb2;
+    uint64_t b_nb1;
+    uint64_t b_nb2;
+    uint64_t ids_nb1;
+    uint64_t d_nb1;
+    uint64_t d_nb2;
+} ggml_metal_kargs_mul_mat_id_back_a;
+
+typedef struct {
+    int32_t  K;
+    int32_t  N;
+    int32_t  n_used;
+    int32_t  n_tok;
+    int32_t  n_expert;
+    int32_t  dst_ne1;
+    uint64_t as_nb1;
+    uint64_t as_nb2;
+    uint64_t g_nb1;
+    uint64_t g_nb2;
+    uint64_t ids_nb1;
+    uint64_t d_nb1;
+    uint64_t d_nb2;
+} ggml_metal_kargs_mul_mat_id_back_b;
+
+typedef struct {
+    int32_t  ne00;
     int32_t  ne01;
     int32_t  ne02;
     int32_t  ne03;

@@ -1948,6 +1948,36 @@ kernel void kernel_silu_f32_4(
     dst[tpig] = x / (1.0f + exp(-x));
 }
 
+static inline float ggml_metal_gelu_back(float x, float dy) {
+    const float GELU_COEF_A    = 0.044715f;
+    const float SQRT_2_OVER_PI = 0.79788456080286535587989211986876f;
+    const float t  = precise::tanh(SQRT_2_OVER_PI*x*(1.0f + GELU_COEF_A*x*x));
+    const float dt = SQRT_2_OVER_PI*(1.0f + 3.0f*GELU_COEF_A*x*x)*(1.0f - t*t);
+    return dy*0.5f*(1.0f + t + x*dt);
+}
+
+kernel void kernel_gelu_back(
+        device const float * grad,
+        device const float * src1,
+        device       float * dst,
+        uint tpig[[thread_position_in_grid]]) {
+    dst[tpig] = ggml_metal_gelu_back(src1[tpig], grad[tpig]);
+}
+
+kernel void kernel_gelu_back_4(
+        device const float4 * grad,
+        device const float4 * src1,
+        device       float4 * dst,
+        uint tpig[[thread_position_in_grid]]) {
+    const float4 x  = src1[tpig];
+    const float4 dy = grad[tpig];
+    dst[tpig] = float4(
+        ggml_metal_gelu_back(x[0], dy[0]),
+        ggml_metal_gelu_back(x[1], dy[1]),
+        ggml_metal_gelu_back(x[2], dy[2]),
+        ggml_metal_gelu_back(x[3], dy[3]));
+}
+
 kernel void kernel_elu_f32(
         device const float * src0,
         device       float * dst,
@@ -4012,6 +4042,194 @@ kernel void kernel_rms_norm_back(
     for (int i00 = tpitg.x; i00 < args.ne00_4; i00 += ntg.x) {
         float4 dx = dz[i00] + x[i00]*scale;
         y[i00] = dx*rrms;
+    }
+}
+
+kernel void kernel_l2_norm_back(
+        constant ggml_metal_kargs_l2_norm_back & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        threadgroup float * shmem_f32 [[threadgroup(0)]],
+        uint3   tgpig[[threadgroup_position_in_grid]],
+        ushort3 tpitg[[thread_position_in_threadgroup]],
+        ushort  sgitg[[simdgroup_index_in_threadgroup]],
+        ushort  tiisg[[thread_index_in_simdgroup]],
+        ushort3   ntg[[threads_per_threadgroup]]) {
+    threadgroup float * shmem_xx = shmem_f32;
+    threadgroup float * shmem_xg = shmem_f32 + 32;
+
+    if (sgitg == 0) {
+        shmem_xx[tiisg] = 0.0f;
+        shmem_xg[tiisg] = 0.0f;
+    }
+
+    const int i01 = tgpig.x;
+    const int i02 = tgpig.y;
+    const int i03 = tgpig.z;
+
+    device const float4 * dy = (device const float4 *) (src0 + i03*args.nb03 + i02*args.nb02 + i01*args.nb01);
+    device const float4 * x  = (device const float4 *) (src1 + i03*args.nb13 + i02*args.nb12 + i01*args.nb11);
+
+    float sum_xx = 0.0f;
+    float sum_xg = 0.0f;
+
+    for (int i00 = tpitg.x; i00 < args.ne00_4; i00 += ntg.x) {
+        const float4 x4  = x[i00];
+        const float4 dy4 = dy[i00];
+        sum_xx += dot(x4, x4);
+        sum_xg += dot(x4, dy4);
+    }
+
+    sum_xx = simd_sum(sum_xx);
+    sum_xg = simd_sum(sum_xg);
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (tiisg == 0) {
+        shmem_xx[sgitg] = sum_xx;
+        shmem_xg[sgitg] = sum_xg;
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    sum_xx = shmem_xx[tiisg];
+    sum_xg = shmem_xg[tiisg];
+
+    sum_xx = simd_sum(sum_xx);
+    sum_xg = simd_sum(sum_xg);
+
+    const float eps  = args.eps;
+    const float norm = sqrt(sum_xx);
+
+    float scale_g;
+    float scale_x;
+    if (norm > eps) {
+        scale_g = 1.0f/norm;
+        scale_x = -scale_g*scale_g*scale_g*sum_xg;
+    } else {
+        scale_g = 1.0f/eps;
+        scale_x = 0.0f;
+    }
+
+    device float4 * y = (device float4 *) (dst + i03*args.nb3 + i02*args.nb2 + i01*args.nb1);
+
+    for (int i00 = tpitg.x; i00 < args.ne00_4; i00 += ntg.x) {
+        y[i00] = scale_g*dy[i00] + scale_x*x[i00];
+    }
+}
+
+kernel void kernel_mul_mat_id_back_a(
+        constant ggml_metal_kargs_mul_mat_id_back_a & args,
+        device const char * g_in,    // grad_out [N, n_used, n_tok]  f32
+        device const char * b_in,    // b        [K, b_ne1, n_tok]   f32
+        device const char * ids_in,  // ids      [n_used, n_tok]     i32
+        device       char * dst,     // grad_as  [K, N, n_expert]    f32
+        uint3   tgpig[[threadgroup_position_in_grid]],
+        ushort3 tpitg[[thread_position_in_threadgroup]],
+        ushort3   ntg[[threads_per_threadgroup]]) {
+    device const float   * data_g = (device const float   *) g_in;
+    device const float   * data_b = (device const float   *) b_in;
+    device const int32_t * data_i = (device const int32_t *) ids_in;
+    device       float   * data_d = (device       float   *) dst;
+
+    const int n = tgpig.x;
+    const int e = tgpig.y;
+
+    for (int k = tpitg.x; k < args.K; k += ntg.x) {
+        float acc = 0.0f;
+
+        for (int t = 0; t < args.n_tok; ++t) {
+            for (int u = 0; u < args.n_used; ++u) {
+                if (data_i[u + t*args.ids_nb1] != e) {
+                    continue;
+                }
+                const float gv = data_g[n + u*args.g_nb1 + t*args.g_nb2];
+                const int   bu = (args.b_ne1 == 1) ? 0 : u;
+                const float bv = data_b[k + bu*args.b_nb1 + t*args.b_nb2];
+                acc += gv*bv;
+            }
+        }
+
+        data_d[k + n*args.d_nb1 + e*args.d_nb2] = acc;
+    }
+}
+
+kernel void kernel_mul_mat_id_back_b_f32(
+        constant ggml_metal_kargs_mul_mat_id_back_b & args,
+        device const char * as_in,   // as       [K, N, n_expert]            f32
+        device const char * g_in,    // grad_out [N, n_used, n_tok]          f32
+        device const char * ids_in,  // ids      [n_used, n_tok]             i32
+        device       char * dst,     // grad_b   [K, dst_ne1, n_tok]         f32
+        uint3   tgpig[[threadgroup_position_in_grid]],
+        ushort3 tpitg[[thread_position_in_threadgroup]],
+        ushort3   ntg[[threads_per_threadgroup]]) {
+    device const float   * data_a = (device const float   *) as_in;
+    device const float   * data_g = (device const float   *) g_in;
+    device const int32_t * data_i = (device const int32_t *) ids_in;
+    device       float   * data_d = (device       float   *) dst;
+
+    const int slot = tgpig.x;
+    const int t    = tgpig.y;
+
+    const int u0 = (args.dst_ne1 == 1) ? 0          : slot;
+    const int u1 = (args.dst_ne1 == 1) ? args.n_used : (slot + 1);
+
+    for (int k = tpitg.x; k < args.K; k += ntg.x) {
+        float acc = 0.0f;
+
+        for (int u = u0; u < u1; ++u) {
+            const int e = data_i[u + t*args.ids_nb1];
+            for (int n = 0; n < args.N; ++n) {
+                const float gv = data_g[n + u*args.g_nb1 + t*args.g_nb2];
+                const float av = data_a[k + n*args.as_nb1 + e*args.as_nb2];
+                acc += av*gv;
+            }
+        }
+
+        data_d[k + slot*args.d_nb1 + t*args.d_nb2] = acc;
+    }
+}
+
+kernel void kernel_mul_mat_id_back_b_q8_0(
+        constant ggml_metal_kargs_mul_mat_id_back_b & args,
+        device const char * as_in,   // as       [K, N, n_expert]            q8_0
+        device const char * g_in,    // grad_out [N, n_used, n_tok]          f32
+        device const char * ids_in,  // ids      [n_used, n_tok]             i32
+        device       char * dst,     // grad_b   [K, dst_ne1, n_tok]         f32
+        uint3   tgpig[[threadgroup_position_in_grid]],
+        ushort3 tpitg[[thread_position_in_threadgroup]],
+        ushort3   ntg[[threads_per_threadgroup]]) {
+    device const block_q8_0 * data_a = (device const block_q8_0 *) as_in;
+    device const float      * data_g = (device const float      *) g_in;
+    device const int32_t    * data_i = (device const int32_t    *) ids_in;
+    device       float      * data_d = (device       float      *) dst;
+
+    const int slot = tgpig.x;
+    const int t    = tgpig.y;
+
+    const int u0 = (args.dst_ne1 == 1) ? 0          : slot;
+    const int u1 = (args.dst_ne1 == 1) ? args.n_used : (slot + 1);
+
+    const int blocks_per_row = args.K / QK8_0;
+
+    for (int k = tpitg.x; k < args.K; k += ntg.x) {
+        const int ib = k / QK8_0;
+        const int ix = k % QK8_0;
+
+        float acc = 0.0f;
+
+        for (int u = u0; u < u1; ++u) {
+            const int e = data_i[u + t*args.ids_nb1];
+            for (int n = 0; n < args.N; ++n) {
+                const float gv = data_g[n + u*args.g_nb1 + t*args.g_nb2];
+                device const block_q8_0 & blk = data_a[(e*args.N + n)*blocks_per_row + ib];
+                const float av = (float) blk.d * (float) blk.qs[ix];
+                acc += av*gv;
+            }
+        }
+
+        data_d[k + slot*args.d_nb1 + t*args.d_nb2] = acc;
     }
 }
 

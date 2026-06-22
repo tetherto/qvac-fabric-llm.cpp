@@ -109,6 +109,10 @@ int ggml_metal_op_count_equal       (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_out_prod          (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_soft_max_back     (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_rms_norm_back     (ggml_metal_op_t ctx, int idx);
+int ggml_metal_op_gelu_back         (ggml_metal_op_t ctx, int idx);
+int ggml_metal_op_l2_norm_back      (ggml_metal_op_t ctx, int idx);
+int ggml_metal_op_mul_mat_id_back_a (ggml_metal_op_t ctx, int idx);
+int ggml_metal_op_mul_mat_id_back_b (ggml_metal_op_t ctx, int idx);
 
 #ifdef __cplusplus
 }
