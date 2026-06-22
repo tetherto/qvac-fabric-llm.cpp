@@ -765,6 +765,20 @@ struct vk_op_ssm_conv_push_constants {
     uint32_t nc, ncs, nr, n_t, n_s;
 };
 
+struct vk_op_ssm_conv_back_sx_push_constants {
+    uint32_t grad_nb0, grad_nb1, grad_nb2;
+    uint32_t c_nb1;
+    uint32_t dst_nb0, dst_nb1, dst_nb2;
+    uint32_t nc, ncs, nr, n_t, n_s;
+};
+
+struct vk_op_ssm_conv_back_c_push_constants {
+    uint32_t grad_nb0, grad_nb1, grad_nb2;
+    uint32_t sx_nb0, sx_nb1, sx_nb2;
+    uint32_t dst_nb1;
+    uint32_t nc, ncs, nr, n_t, n_s;
+};
+
 struct vk_op_conv2d_push_constants {
     uint32_t Cout;
     uint32_t Cin;
