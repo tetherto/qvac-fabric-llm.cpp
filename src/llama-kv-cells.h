@@ -373,6 +373,22 @@ public:
         return ext[(--it)->second].tok;
     }
 
+    // number of cache cells that contain seq_id.
+    // seq_id < 0 counts all non-empty cells.
+    uint32_t seq_token_count(llama_seq_id seq_id) const {
+        if (seq_id < 0) {
+            return get_used();
+        }
+
+        uint32_t result = 0;
+        for (const uint32_t i : used) {
+            if (seq[i].test(seq_id)) {
+                ++result;
+            }
+        }
+        return result;
+    }
+
     // note: call only if the cell is not empty and the seq_id is not in the cell
     void seq_add(uint32_t i, llama_seq_id seq_id) {
         assert(i < pos.size());

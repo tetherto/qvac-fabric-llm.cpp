@@ -824,6 +824,15 @@ extern "C" {
             llama_memory_t mem,
               llama_seq_id seq_id);
 
+    // Returns the number of memory cells currently associated with the
+    // specified sequence. This differs from pos_max - pos_min + 1 for models
+    // that can map multiple cache cells to the same logical position, such as
+    // M-RoPE multimodal image embeddings.
+    // seq_id < 0 : count all non-empty cells
+    LLAMA_API uint32_t llama_memory_seq_token_count(
+            llama_memory_t mem,
+              llama_seq_id seq_id);
+
     // Check if the memory supports shifting
     LLAMA_API bool llama_memory_can_shift(llama_memory_t mem);
 

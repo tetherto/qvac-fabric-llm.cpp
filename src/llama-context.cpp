@@ -4764,6 +4764,16 @@ llama_pos llama_memory_seq_pos_max(
     return mem->seq_pos_max(seq_id);
 }
 
+uint32_t llama_memory_seq_token_count(
+        llama_memory_t mem,
+          llama_seq_id seq_id) {
+    if (!mem) {
+        return 0;
+    }
+
+    return mem->seq_token_count(seq_id);
+}
+
 bool llama_memory_can_shift(llama_memory_t mem) {
     if (!mem) {
         return false;

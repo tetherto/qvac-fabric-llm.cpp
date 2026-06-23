@@ -847,6 +847,22 @@ llama_pos llama_kv_cache::seq_pos_max(llama_seq_id seq_id) const {
     return cells.seq_pos_max(seq_id);
 }
 
+uint32_t llama_kv_cache::seq_token_count(llama_seq_id seq_id) const {
+    if (seq_id < 0) {
+        uint32_t result = 0;
+        for (const auto & cells : v_cells) {
+            result += cells.seq_token_count(seq_id);
+        }
+        return result;
+    }
+
+    GGML_ASSERT((size_t) seq_id < seq_to_stream.size());
+
+    const auto & cells = v_cells[seq_to_stream[seq_id]];
+
+    return cells.seq_token_count(seq_id);
+}
+
 std::map<ggml_backend_buffer_type_t, size_t> llama_kv_cache::memory_breakdown() const {
     auto ret = ctxs_bufs.memory_breakdown();
 
