@@ -45,10 +45,20 @@
 #include <vector>
 #include <unordered_map>
 
+static unsigned int ggml_test_n_threads() {
+    if (const char * env = getenv("GGML_TEST_N_THREADS")) {
+        const int n = atoi(env);
+        if (n > 0) {
+            return (unsigned int) n;
+        }
+    }
+    return std::thread::hardware_concurrency();
+}
+
 #ifdef __EMSCRIPTEN__
 #   define N_THREADS 1
 #else
-#   define N_THREADS std::thread::hardware_concurrency()
+#   define N_THREADS ggml_test_n_threads()
 #endif
 
 static void init_tensor_uniform(ggml_tensor * tensor, float min = -1.0f, float max = 1.0f) {
@@ -5220,6 +5230,7 @@ struct test_gated_delta_net : public test_case {
     const bool    permuted;
     const bool    kda;
     const int64_t K; // snapshot slot count: 1 = final-only, >1 = last K states
+    const bool    check_grad;
 
     std::string vars() override {
         return VARS_TO_STR9(type, head_count, head_size, n_seq_tokens, n_seqs, v_repeat, permuted, kda, K);
@@ -5227,11 +5238,15 @@ struct test_gated_delta_net : public test_case {
 
     test_gated_delta_net(ggml_type type = GGML_TYPE_F32,
             int64_t head_count = 4, int64_t head_size = 16, int64_t n_seq_tokens = 1, int64_t n_seqs = 1,
-            int v_repeat = 1, bool permuted = false, bool kda = false, int64_t K = 1)
+            int v_repeat = 1, bool permuted = false, bool kda = false, int64_t K = 1, bool check_grad = false)
         : type(type), head_count(head_count), head_size(head_size), n_seq_tokens(n_seq_tokens), n_seqs(n_seqs),
-          v_repeat(v_repeat), permuted(permuted), kda(kda), K(K) {}
+          v_repeat(v_repeat), permuted(permuted), kda(kda), K(K), check_grad(check_grad) {}
+
+    bool   grad_precise() override { return true; }
+    double max_maa_err()  override { return 2e-2; }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
+        const bool grad = (mode == MODE_GRAD) && !permuted && check_grad;
         ggml_tensor * q;
         ggml_tensor * k;
         ggml_tensor * v;
@@ -5255,22 +5270,32 @@ struct test_gated_delta_net : public test_case {
         ggml_set_name(g,     "g");
         ggml_set_name(beta,  "beta");
         ggml_set_name(state, "state");
-        // q/k are L2-normalised in qwen35/kimi-linear before delta_net
-        q = ggml_l2_norm(ctx, q, 1e-6f);
-        k = ggml_l2_norm(ctx, k, 1e-6f);
+        if (grad) {
+            ggml_set_param(q);
+            ggml_set_param(k);
+            ggml_set_param(v);
+            ggml_set_param(g);
+            ggml_set_param(beta);
+            ggml_set_param(state);
+        } else {
+            // q/k are L2-normalised in qwen35/kimi-linear before delta_net
+            q = ggml_l2_norm(ctx, q, 1e-6f);
+            k = ggml_l2_norm(ctx, k, 1e-6f);
+        }
         ggml_tensor * out   = ggml_gated_delta_net(ctx, q, k, v, g, beta, state, K);
         return out;
     }
 
     void initialize_tensors(ggml_context * ctx) override {
+        const bool grad = (mode == MODE_GRAD);
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
             if (ggml_is_view_op(t->op)) { continue; }
             if (strcmp(t->name, "g") == 0) {
-                init_tensor_uniform(t, -20.0f, -1e-4f);
+                init_tensor_uniform(t, grad ? -0.5f : -20.0f, grad ? -0.05f : -1e-4f);
             } else if (strcmp(t->name, "beta") == 0) {
                 init_tensor_uniform(t, 0.0f, 1.0f);
             } else if (strcmp(t->name, "v") == 0) {
-                init_tensor_uniform(t, -0.3f, 5.0f);
+                init_tensor_uniform(t, grad ? -1.0f : -0.3f, grad ? 1.0f : 5.0f);
             } else {
                 init_tensor_uniform(t);
             }
@@ -13144,6 +13169,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 2048, 1, 2));
     // Keep the WebGPU dispatch below 65535 workgroups (32 per token for this shape).
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 2047, 2, 3));
+    
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32,  2, 32, 4, 1, 1, false, false, 1, true));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32,  2, 32, 4, 1, 1, false, true,  1, true));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32,  2, 32, 4, 1, 1, false, false, 2, true));
 
     // K > 1: output keeps the last min(n_tokens, K) per-token snapshots, ordered most-recent-first
     // (slot 0 = final state, slot s = state s tokens back).
