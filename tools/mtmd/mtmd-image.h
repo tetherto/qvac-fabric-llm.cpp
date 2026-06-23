@@ -15,6 +15,8 @@ struct mtmd_image_preproc_out {
     clip_image_f32 overview; // overview image (downscaled image)
     int grid_x = 0;
     int grid_y = 0;
+    // when true, entries[0] is an overview thumbnail and entries[1..] are the grid_x*grid_y tiles
+    bool overview_in_entries = false;
 
     void append(const clip_hparams & hparams, const clip_image_u8 & img, bool normalized = true);
     void append(const clip_hparams & hparams, const std::vector<clip_image_u8> & imgs, bool normalized = true);

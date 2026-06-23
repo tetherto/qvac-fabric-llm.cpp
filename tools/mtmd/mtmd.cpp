@@ -258,6 +258,9 @@ struct mtmd_image_tokens {
             }
             return n;
         }
+        if (pos == MTMD_POS_TYPE_MROPE && (grid_x > 1 || grid_y > 1)) {
+            return nx * ny;
+        }
         uint32_t nz = batch_f32.entries.size();
         if (n_temporal_merge > 1) {
             // [QWEN_VIDEO] this logic is quite ugly, it's mostly to make qwen-vl temporal merge work, can be improved in the future
@@ -1617,6 +1620,7 @@ struct mtmd_tokenizer {
                     preproc_out.grid_x = tmp_preproc_out.grid_x;
                     preproc_out.grid_y = tmp_preproc_out.grid_y;
                     preproc_out.overview = std::move(tmp_preproc_out.overview);
+                    preproc_out.overview_in_entries = tmp_preproc_out.overview_in_entries;
                 }
             }
 
@@ -1626,8 +1630,7 @@ struct mtmd_tokenizer {
 
             // handle llava-uhd style preprocessing
             // (output either a grid, or overview-only)
-            const bool has_tiling_grid = (preproc_out.grid_x > 0 && preproc_out.grid_y > 0)
-                || preproc_out.has_overview();
+            const bool has_tiling_grid = preproc_out.has_overview();
 
             if (has_tiling_grid && ctx->proj_type_v() == PROJECTOR_TYPE_MINICPMV4_7) {
                 GGML_ASSERT(bitmaps.size() == 1);
@@ -1728,72 +1731,91 @@ struct mtmd_tokenizer {
                     preproc_out.entries[0].lead_pad = align - 1 - (int32_t)(n_past % align);
                 }
 
-                size_t n_tokens = 0;
-                for (auto & e : preproc_out.entries) {
-                    n_tokens += clip_n_output_tokens(ctx->ctx_v, &e);
-                    if (clip_model_n_temporal_merge(ctx->ctx_v) == 2) {
-                        // [QWEN_VIDEO] pair input is merged to the same embd, so only count as one image
-                        break;
-                    }
-                }
-
-                mtmd_image_tokens_ptr image_tokens(new mtmd_image_tokens);
-
-                // [QWEN_VIDEO] improve this in the future
-                image_tokens->n_temporal_merge = clip_model_n_temporal_merge(ctx->ctx_v);
-
-                if (mtmd_decode_use_mrope(ctx)) {
-                    // for Qwen2VL/Qwen3VL, set full-image grid dims for M-RoPE decoding
-                    const int tile_nx = clip_n_output_tokens_x(ctx->ctx_v, &preproc_out.entries[0]);
-                    const int tile_ny = clip_n_output_tokens_y(ctx->ctx_v, &preproc_out.entries[0]);
-                    const int gx = preproc_out.grid_x > 0 ? preproc_out.grid_x : 1;
-                    const int gy = preproc_out.grid_y > 0 ? preproc_out.grid_y : 1;
-                    image_tokens->nx     = tile_nx * gx;
-                    image_tokens->ny     = tile_ny * gy;
-                    image_tokens->grid_x = gx;
-                    image_tokens->grid_y = gy;
-                } else {
-                    // other models, we only need the total number of tokens
-                    image_tokens->nx = n_tokens;
-                    image_tokens->ny = 1;
-                }
-                image_tokens->pos = ctx->pos_type;
-                // U1 uses M-RoPE, but unlike Qwen its image H/W coordinates are
-                // zero-based and the whole image occupies one temporal position.
-                if (ctx->proj_type_v() == PROJECTOR_TYPE_SENSENOVA_U1) {
-                    image_tokens->pos = MTMD_POS_TYPE_SENSENOVA_U1;
-                }
-                // HunyuanVL wraps the image grid with BOI/EOI and adds one newline per row,
-                // and uses XD-RoPE (dim-3 = image index). Override the position type so that
-                // n_tokens() and mtmd_image_tokens_get_decoder_pos pick the HunyuanVL layout.
-                else if (ctx->proj_type_v() == PROJECTOR_TYPE_HUNYUANVL) {
-                    image_tokens->pos       = MTMD_POS_TYPE_HUNYUANVL;
-                    image_tokens->image_idx = n_images_added;
-                    GGML_ASSERT(n_tokens == (size_t)image_tokens->n_tokens());
-                }
-
                 clip_image_f32_batch batch_f32;
                 batch_f32.is_audio = false;
                 batch_f32.is_video = bitmaps[0]->is_video_frame();
                 batch_f32.grid_x = preproc_out.grid_x;
                 batch_f32.grid_y = preproc_out.grid_y;
+                // qwen3vl multi-tile: the preprocessor prepends the overview thumbnail as entries[0]
+                const bool has_overview_entry = preproc_out.overview_in_entries;
                 batch_f32.entries = std::move(preproc_out.entries);
-                // do NOT use preproc_out from this point on, it's moved
+                // do NOT use preproc_out from this point on, it is moved
 
-                image_tokens->batch_f32 = std::move(batch_f32);
-                image_tokens->id = bitmaps[0]->id; // optional
+                // Build one image chunk from a batch with explicit grid dims, then append it.
+                auto emit_image_chunk = [&](clip_image_f32_batch && b, int gx, int gy) {
+                    GGML_ASSERT(!b.entries.empty());
+                    size_t n_tokens = 0;
+                    for (const auto & entry : b.entries) {
+                        n_tokens += clip_n_output_tokens(ctx->ctx_v, &entry);
+                        if (clip_model_n_temporal_merge(ctx->ctx_v) == 2 && gx == 1 && gy == 1) {
+                            // [QWEN_VIDEO] pair input is merged to the same embd, so only count as one image
+                            break;
+                        }
+                    }
 
-                LOG_DBG("image_tokens->nx = %d\n", image_tokens->nx);
-                LOG_DBG("image_tokens->ny = %d\n", image_tokens->ny);
-                LOG_DBG("batch_f32 size = %d\n", (int)image_tokens->batch_f32.entries.size());
+                    mtmd_image_tokens_ptr image_tokens(new mtmd_image_tokens);
+                    // [QWEN_VIDEO] improve this in the future
+                    image_tokens->n_temporal_merge = clip_model_n_temporal_merge(ctx->ctx_v);
 
-                mtmd_input_chunk chunk{
-                    MTMD_INPUT_CHUNK_TYPE_IMAGE,
-                    {}, // text tokens
-                    std::move(image_tokens),
-                    nullptr, // audio tokens
+                    if (mtmd_decode_use_mrope(ctx)) {
+                        // for Qwen2VL/Qwen3VL, set full-image grid dims for M-RoPE decoding
+                        const int tile_nx = clip_n_output_tokens_x(ctx->ctx_v, &b.entries[0]);
+                        const int tile_ny = clip_n_output_tokens_y(ctx->ctx_v, &b.entries[0]);
+                        image_tokens->nx     = tile_nx * gx;
+                        image_tokens->ny     = tile_ny * gy;
+                        image_tokens->grid_x = gx;
+                        image_tokens->grid_y = gy;
+                    } else {
+                        // other models, we only need the total number of tokens
+                        image_tokens->nx = n_tokens;
+                        image_tokens->ny = 1;
+                    }
+                    image_tokens->pos = ctx->pos_type;
+                    // U1 uses M-RoPE, but unlike Qwen its image H/W coordinates are
+                    // zero-based and the whole image occupies one temporal position.
+                    if (ctx->proj_type_v() == PROJECTOR_TYPE_SENSENOVA_U1) {
+                        image_tokens->pos = MTMD_POS_TYPE_SENSENOVA_U1;
+                    }
+                    // HunyuanVL wraps the image grid with BOI/EOI and adds one newline per row,
+                    // and uses XD-RoPE (dim-3 = image index). Override the position type so that
+                    // n_tokens() and mtmd_image_tokens_get_decoder_pos pick the HunyuanVL layout.
+                    else if (ctx->proj_type_v() == PROJECTOR_TYPE_HUNYUANVL) {
+                        image_tokens->pos       = MTMD_POS_TYPE_HUNYUANVL;
+                        image_tokens->image_idx = n_images_added;
+                        GGML_ASSERT(n_tokens == (size_t)image_tokens->n_tokens());
+                    }
+                    image_tokens->batch_f32 = std::move(b);
+                    image_tokens->id = bitmaps[0]->id; // optional
+
+                    LOG_DBG("image_tokens->nx = %d\n", image_tokens->nx);
+                    LOG_DBG("image_tokens->ny = %d\n", image_tokens->ny);
+                    LOG_DBG("batch_f32 size = %d\n", (int)image_tokens->batch_f32.entries.size());
+
+                    mtmd_input_chunk chunk{
+                        MTMD_INPUT_CHUNK_TYPE_IMAGE,
+                        {}, // text tokens
+                        std::move(image_tokens),
+                        nullptr, // audio tokens
+                    };
+                    cur.entries.emplace_back(std::move(chunk));
                 };
-                cur.entries.emplace_back(std::move(chunk));
+
+                const int gx = batch_f32.grid_x > 0 ? batch_f32.grid_x : 1;
+                const int gy = batch_f32.grid_y > 0 ? batch_f32.grid_y : 1;
+                if (has_overview_entry) {
+                    // Qwen3VL multi-tile with a global overview: emit the downscaled full image
+                    // (entries[0]) as its own 1x1 chunk first, then the tile grid as a second chunk.
+                    GGML_ASSERT(!batch_f32.entries.empty());
+                    clip_image_f32_batch ov_batch;
+                    ov_batch.entries.push_back(std::move(batch_f32.entries.front()));
+                    batch_f32.entries.erase(batch_f32.entries.begin());
+                    GGML_ASSERT((int) batch_f32.entries.size() == gx * gy &&
+                                "overview split left an unexpected tile count");
+                    emit_image_chunk(std::move(ov_batch), 1, 1);
+                    emit_image_chunk(std::move(batch_f32), gx, gy);
+                } else {
+                    emit_image_chunk(std::move(batch_f32), gx, gy);
+                }
             }
 
             if (!ctx->img_end.empty()) {

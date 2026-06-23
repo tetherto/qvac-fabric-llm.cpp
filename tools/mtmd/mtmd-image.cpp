@@ -910,46 +910,46 @@ static mtmd_image_preproc_out preprocess_qwen3vl_untiled(const clip_hparams & hp
 
 mtmd_image_preproc_out mtmd_image_preprocessor_qwen3vl::preprocess(const clip_image_u8 & img) const {
     mtmd_image_preproc_out output;
-    const clip_image_size img_size = img.get_size();
 
     // Tile size comes from the model's image_size (e.g. 768 for Qwen3VL-2B, patch_size=16).
     const int tile_px = hparams.image_size;
     GGML_ASSERT(tile_px > 0 && "image_size not set in model hparams");
 
-    // Determine tile grid: choose n_col x n_row (with n_col*n_row <= max_tiles) whose
-    // aspect ratio is closest to the image's aspect ratio (log-ratio distance).
-    // Minimising distortion means the stretched resize needed to fill the tile canvas is small.
-    int best_col = 1, best_row = 1;
+    GGML_ASSERT(hparams.patch_size > 0);
 
-    // Small image: fits in one tile, so fall back to dyn_size behaviour.
-    // qwen3vl always produces tile_px x tile_px (576 tokens) even for a 1x1 grid,
-    // whereas dyn_size scales to the image's natural size (~247 tokens for elephant).
-    // No tiling benefit exists here, so use the cheaper, undistorted path.
-    if (img_size.width <= tile_px && img_size.height <= tile_px) {
-        LOG_INF("%s: small image (%dx%d <= tile %d) - falling back to dyn_size\n", __func__, img_size.width, img_size.height, tile_px);
-        output = preprocess_qwen3vl_untiled(hparams, img);
-        // grid_x/grid_y left at 0: single-tile path; tokenizer treats this as 1x1
-        return output;
-    }
+    const clip_image_size img_size = img.get_size();
 
-    // Pick the grid whose aspect ratio is closest to the image's aspect ratio.
-    // This minimises distortion when resizing the image to fill the tile canvas.
-    // Using log-ratio so that e.g. 2:1 and 1:2 are symmetric around 1:1.
+    // Pick the grid (n_col x n_row with n_col*n_row <= max_tiles, excluding 1x1) whose aspect
+    // ratio is closest to the image aspect ratio (log-ratio distance), minimising the stretch needed to
+    // fill the tile canvas. Using log-ratio so e.g. 2:1 and 1:2 are symmetric around 1:1.
     std::vector<clip_image_size> candidate_grids;
     for (int col = 1; col <= max_tiles; col++) {
         for (int row = 1; col * row <= max_tiles; row++) {
-            if (col == 1 && row == 1) { continue; } // 1x1 handled by small-image early return
+            if (col == 1 && row == 1) { continue; } // 1x1 == the dyn_size fallback below
             candidate_grids.push_back({col, row});
         }
     }
     const float img_log_ratio = std::log((float)img_size.width / (float)img_size.height);
     const clip_image_size best_grid = pick_grid_by_log_ratio(candidate_grids, img_log_ratio);
-    best_col = best_grid.width;
-    best_row = best_grid.height;
+    const int best_col = best_grid.width;
+    const int best_row = best_grid.height;
 
     const int target_w = best_col * tile_px;
     const int target_h = best_row * tile_px;
-    GGML_ASSERT(hparams.patch_size > 0);
+
+    // Only tile when the canvas DOWNSCALES the image. If the chosen tile canvas is larger than
+    // the image in either dimension, tiling would upscale it - no real detail is gained, it just
+    // spends several full-tile embeddings (plus an overview) on an image a single dyn_size pass
+    // represents fully and more cheaply. This subsumes the old "fits in one tile" check (any such
+    // image maps to a canvas that upscales it) and avoids the medium-image token blow-up, while
+    // large images the canvas downscales still tile to preserve local detail.
+    if (target_w > img_size.width || target_h > img_size.height) {
+        LOG_INF("%s: %dx%d would upscale into a %dx%d tile canvas - using dyn_size instead\n",
+                __func__, img_size.width, img_size.height, target_w, target_h);
+        output = preprocess_qwen3vl_untiled(hparams, img);
+        // grid_x/grid_y left at 0: single-tile path; tokenizer treats this as 1x1
+        return output;
+    }
 
     // Resize to the tile canvas by stretching. With aspect-ratio-aware grid selection the chosen
     // grid's ratio is close to the image's ratio, so the residual stretch is small.
@@ -974,6 +974,23 @@ mtmd_image_preproc_out mtmd_image_preprocessor_qwen3vl::preprocess(const clip_im
             tile_f32.normalize(hparams.image_mean, hparams.image_std);
             output.entries.push_back(std::move(tile_f32));
         }
+    }
+
+    // LLaVA-style global overview (thumbnail): a downscaled full image (tile_px x tile_px) prepended
+    // as entries[0]. It carries the whole image uncut, so text split across a tile seam stays
+    // readable; on DocVQA this recovers seam-truncated text for a sizeable ANLS gain. Encoded as a
+    // separate 1x1 chunk in mtmd.cpp; the tiles are untouched (no resolution cost to them).
+    {
+        clip_image_u8 thumb_u8;
+        img_tool::resize(img, thumb_u8, {tile_px, tile_px},
+                         hparams.image_resize_algo,
+                         /* pad */ PAD_NONE,
+                         hparams.image_pad_color);
+        clip_image_f32 thumb_f32;
+        thumb_f32.from_u8(thumb_u8);
+        thumb_f32.normalize(hparams.image_mean, hparams.image_std);
+        output.entries.insert(output.entries.begin(), std::move(thumb_f32));
+        output.overview_in_entries = true;
     }
 
     output.grid_x = best_col;

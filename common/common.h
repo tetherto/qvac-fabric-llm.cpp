@@ -425,8 +425,8 @@ struct common_params_diffusion {
 
 // tile encoding mode for multi-tile vision models (e.g. Qwen3VL)
 enum common_image_tile_mode {
-    COMMON_IMAGE_TILE_MODE_BATCHED    = 0, // all tiles in one forward pass (default)
-    COMMON_IMAGE_TILE_MODE_SEQUENTIAL = 1, // encode tiles one-by-one (benchmarking)
+    COMMON_IMAGE_TILE_MODE_BATCHED    = 0, // all tiles in one forward pass
+    COMMON_IMAGE_TILE_MODE_SEQUENTIAL = 1, // encode tiles one-by-one (default)
     COMMON_IMAGE_TILE_MODE_DISABLED   = 2, // tiling disabled - single tile only
 };
 
@@ -618,7 +618,7 @@ struct common_params {
     std::vector<std::string> image;             // path to image file(s) ; TODO: change the name to "media"
     int image_min_tokens = -1;
     int image_max_tokens = -1;
-    common_image_tile_mode image_tile_mode = COMMON_IMAGE_TILE_MODE_BATCHED;
+    common_image_tile_mode image_tile_mode = COMMON_IMAGE_TILE_MODE_SEQUENTIAL;
     int mtmd_batch_max_tokens = 1024;
 
     // for video input

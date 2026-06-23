@@ -2614,8 +2614,8 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     add_opt(common_arg(
         {"--image-tile-mode"}, "MODE",
         "tile encoding mode for multi-tile vision models (e.g. Qwen3VL):\n"
-        "  batched    - all tiles in one forward pass (default)\n"
-        "  sequential - tiles encoded one-by-one (benchmarking)\n"
+        "  batched    - all tiles in one forward pass\n"
+        "  sequential - tiles encoded one-by-one (default)\n"
         "  disabled   - tiling disabled, single tile only",
         [](common_params & params, const std::string & value) {
             if (value == "batched")         { params.image_tile_mode = COMMON_IMAGE_TILE_MODE_BATCHED; }
