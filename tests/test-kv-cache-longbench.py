@@ -361,7 +361,7 @@ def main():
                         help="Print scheduled jobs without launching")
     parser.add_argument("--rerun-missing", action="store_true",
                         help="Reuse latest output dir; skip jobs whose CSV already exists")
-    parser.add_argument("--extra", nargs="*", default=[],
+    parser.add_argument("--extra", nargs=argparse.REMAINDER, default=[],
                         help="Extra args forwarded to longbench-bench.sh / llama-server")
     args = parser.parse_args()
 

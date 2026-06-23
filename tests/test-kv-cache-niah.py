@@ -349,7 +349,7 @@ def main():
     parser.add_argument("--output-dir", default="results-niah")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--rerun-missing", action="store_true")
-    parser.add_argument("--extra", nargs="*", default=[])
+    parser.add_argument("--extra", nargs=argparse.REMAINDER, default=[])
     args = parser.parse_args()
 
     preset = PRESETS[args.config]
