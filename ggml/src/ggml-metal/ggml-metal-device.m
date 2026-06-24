@@ -1872,6 +1872,27 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                    (op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_Q8_0) &&
                    op->src[1]->type == GGML_TYPE_F32 &&
                    op->src[2]->type == GGML_TYPE_I32;
+        case GGML_OP_SSM_CONV_BACK_SX:
+        case GGML_OP_SSM_CONV_BACK_C:
+            return op->type == GGML_TYPE_F32 &&
+                   op->src[0]->type == GGML_TYPE_F32 &&
+                   op->src[1]->type == GGML_TYPE_F32 &&
+                   op->src[0]->nb[0] == ggml_type_size(op->src[0]->type) &&
+                   op->src[1]->nb[0] == ggml_type_size(op->src[1]->type);
+        case GGML_OP_GATED_DELTA_NET_BACK:
+            {
+                if (!has_simdgroup_reduction || op->type != GGML_TYPE_F32) {
+                    return false;
+                }
+                for (int i = 0; i < 7; ++i) {
+                    if (op->src[i] == NULL || op->src[i]->type != GGML_TYPE_F32 ||
+                        op->src[i]->nb[0] != ggml_type_size(op->src[i]->type)) {
+                        return false;
+                    }
+                }
+                const int64_t S_v = op->src[2]->ne[0];
+                return S_v > 0 && S_v <= 256 && (S_v & (S_v - 1)) == 0;
+            }
         case GGML_OP_ROPE:
         case GGML_OP_ROPE_BACK:
             return true;

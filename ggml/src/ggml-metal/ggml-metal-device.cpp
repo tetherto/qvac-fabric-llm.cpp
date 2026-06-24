@@ -2847,6 +2847,69 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mat_id_back_
     return res;
 }
 
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_ssm_conv_back_sx(ggml_metal_library_t lib, const ggml_tensor * op) {
+    assert(op->op == GGML_OP_SSM_CONV_BACK_SX);
+    GGML_UNUSED(op);
+
+    char base[256];
+    char name[256];
+
+    snprintf(base, 256, "kernel_ssm_conv_back_sx_f32");
+    snprintf(name, 256, "%s", base);
+
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        res = ggml_metal_library_compile_pipeline(lib, base, name, nullptr);
+    }
+
+    return res;
+}
+
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_ssm_conv_back_c(ggml_metal_library_t lib, const ggml_tensor * op) {
+    assert(op->op == GGML_OP_SSM_CONV_BACK_C);
+    GGML_UNUSED(op);
+
+    char base[256];
+    char name[256];
+
+    snprintf(base, 256, "kernel_ssm_conv_back_c_f32");
+    snprintf(name, 256, "%s", base);
+
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        res = ggml_metal_library_compile_pipeline(lib, base, name, nullptr);
+    }
+
+    return res;
+}
+
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_gated_delta_net_back(ggml_metal_library_t lib, const ggml_tensor * op) {
+    assert(op->op == GGML_OP_GATED_DELTA_NET_BACK);
+
+    char base[256];
+    char name[256];
+
+    const int S_v = op->src[2]->ne[0]; // v: {S_v, H, n_tokens, n_seqs}
+    const int kda = (op->src[3]->ne[0] == S_v) ? 1 : 0; // g: ne0 == S_v -> KDA, else 1
+
+    snprintf(base, 256, "kernel_gated_delta_net_back");
+    snprintf(name, 256, "%s_S_v=%d_kda=%d", base, S_v, kda);
+
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        ggml_metal_cv_t cv = ggml_metal_cv_init();
+
+        ggml_metal_cv_set_int16(cv, S_v, FC_GATED_DELTA_NET + 10);
+        ggml_metal_cv_set_int16(cv, kda, FC_GATED_DELTA_NET + 11);
+
+        res = ggml_metal_library_compile_pipeline(lib, base, name, cv);
+
+        ggml_metal_cv_free(cv);
+    }
+
+    return res;
+}
+
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_opt_step_adamw(ggml_metal_library_t lib, const ggml_tensor * op) {
     assert(op->op == GGML_OP_OPT_STEP_ADAMW);
 
