@@ -11784,9 +11784,27 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
             return op->src[0]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32;
         case GGML_OP_UPSCALE: {
             ggml_scale_mode mode = (ggml_scale_mode)(ggml_get_op_params_i32(op, 0) & 0xFF);
-            const bool antialias = (ggml_scale_mode)(ggml_get_op_params_i32(op, 0) & GGML_SCALE_FLAG_ANTIALIAS);
-            return op->src[0]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
-                   (mode == GGML_SCALE_MODE_NEAREST || mode == GGML_SCALE_MODE_BILINEAR) && !antialias;
+            const bool antialias = (ggml_get_op_params_i32(op, 0) & GGML_SCALE_FLAG_ANTIALIAS) != 0;
+            if (op->src[0]->type != GGML_TYPE_F32 || op->type != GGML_TYPE_F32) {
+                return false;
+            }
+            if (mode == GGML_SCALE_MODE_NEAREST) {
+                return !antialias;
+            }
+            if (mode == GGML_SCALE_MODE_BILINEAR) {
+                if (!antialias) {
+                    return true;
+                }
+                // Antialiasing only changes results when downsampling; for
+                // upsampling it is a mathematical no-op, so the plain bilinear
+                // kernel is numerically exact. Qwen3-VL interpolates its
+                // position embeddings with BILINEAR|ANTIALIAS and upsamples
+                // (trained grid -> e.g. 92x92), so accept that here to keep the
+                // whole CLIP graph on OpenCL instead of splitting UPSCALE to CPU.
+                return op->ne[0] >= op->src[0]->ne[0] &&
+                       op->ne[1] >= op->src[0]->ne[1];
+            }
+            return false;
         }
         case GGML_OP_POOL_2D: {
             const int pool_op = ggml_get_op_params_i32(op, 0);
