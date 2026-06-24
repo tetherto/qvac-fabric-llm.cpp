@@ -25,6 +25,22 @@ The perplexity value of the finetuned model should be lower after training on th
 LoRA (Low-Rank Adaptation) fine-tuning for efficient model training. This approach trains only a small set of additional parameters while keeping
 the base model frozen, making it memory-efficient.
 
+### Supported Architectures
+
+Beyond LLaMA, LoRA finetuning now covers the newer dense and Mixture-of-Experts
+families.
+
+| Family  | `general.architecture` | Type                        | Notes                                                                            |
+| ------- | ---------------------- | --------------------------- | -------------------------------------------------------------------------------- |
+| Qwen3   | `qwen3`                | Dense                       |                                                                                  |
+| Qwen3.5 | `qwen35`               | Dense (gated-delta-net)     | Train with `-fa off` — the recurrent layers have no flash-attn backward          |
+| Qwen3.6 | `qwen35moe`            | MoE (gated-delta-net)       | Target experts via `ffn_gate_exps,ffn_down_exps` (or `moe_experts`); also `-fa off` |
+| Gemma 3 | `gemma3`               | Dense                       |                                                                                  |
+| Gemma 4 | `gemma4`               | Dense (gemma-3n MatFormer)  | `n_expert=0` — *not* a Mixture-of-Experts model despite the E2B/E4B naming        |
+
+- MoE expert weights are trained only when you select the `ffn_*_exps` modules; on a
+  dense model those targets simply match no tensors.
+
 ### Basic Usage
 
 ```sh
@@ -68,7 +84,9 @@ the base model frozen, making it memory-efficient.
   - Controls adaptation strength
   - Common rule: alpha = 2 × rank
 - `--lora-modules MODULES` - Target modules as comma-separated list
-  - Available: `attn_q`, `attn_k`, `attn_v`, `attn_o`, `ffn_gate`, `ffn_up`, `ffn_down`, `embed`, `output`, `all`
+  - Dense: `attn_q`, `attn_k`, `attn_v`, `attn_o`, `ffn_gate`, `ffn_up`, `ffn_down`, `output`
+  - MoE experts: `ffn_gate_exps`, `ffn_up_exps`, `ffn_down_exps`, `ffn_gate_up_exps`, or `moe_experts` (all four)
+  - `all` selects every supported module
   - Default: `attn_q,attn_k,attn_v,attn_o` (attention modules)
 - `--output-adapter PATH` - Output adapter filename (default: auto-generated)
 - `--lora-seed N` - Seed for reproducible LoRA weight initialization (default: 0 = non-deterministic)
@@ -143,8 +161,9 @@ This file manages the complete lifecycle of LoRA adapters:
 
 4. **Module Selection:**
   - Scans tensor names for patterns: `attn_q`, `attn_k`, `attn_v`, `attn_output`
-  - FFN modules: `ffn_gate`, `ffn_up`, `ffn_down`
-  - Controlled by `target_modules` bitmask (lines 194-211)
+  - Dense FFN modules: `ffn_gate`, `ffn_up`, `ffn_down`
+  - MoE expert modules: `ffn_gate_exps`, `ffn_up_exps`, `ffn_down_exps`, `ffn_gate_up_exps`
+  - Controlled by `target_modules` bitmask
 
 5. **Optimizer Integration (`llama_opt_param_filter_lora()`):**
   - Filter function for `ggml-opt` to identify trainable parameters
