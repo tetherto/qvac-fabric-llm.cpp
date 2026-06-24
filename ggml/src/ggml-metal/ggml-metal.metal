@@ -3115,6 +3115,73 @@ kernel void kernel_ssm_conv_f32_f32_batched_4(
     x[0] = sumf;
 }
 
+// ref: ggml.c:ggml_compute_forward_ssm_conv_back_sx_f32
+kernel void kernel_ssm_conv_back_sx_f32(
+        constant ggml_metal_kargs_ssm_conv_back_sx & args,
+        device const char * g_in,    // grad_out {d_inner, n_t, n_s}
+        device const char * c_in,    // c        {d_conv, d_inner}
+        device       char * dst,     // grad_sx  {ncs, d_inner, n_s}
+        uint3 tpig[[thread_position_in_grid]]) {
+    const int p  = tpig.x;
+    const int i1 = tpig.y;
+    const int i3 = tpig.z;
+
+    if (p >= args.ncs || i1 >= args.nr || i3 >= args.n_s) {
+        return;
+    }
+
+    device const float * grad = (device const float *) g_in;
+    device const float * c    = (device const float *) c_in;
+    device       float * d    = (device       float *) dst;
+
+    float sumf = 0.0f;
+
+    if (args.n_t > 0) {
+        const uint64_t grad_base = i1*args.grad_nb0 + i3*args.grad_nb2;
+        const uint64_t c_base    = i1*args.c_nb1;
+
+        const int t0 = (p + 1 > args.nc) ? (p + 1 - args.nc) : 0;
+        const int t1 = min(args.n_t - 1, p);
+
+        for (int t = t0; t <= t1; ++t) {
+            sumf += grad[grad_base + t*args.grad_nb1] * c[c_base + (p - t)];
+        }
+    }
+
+    d[p*args.dst_nb0 + i1*args.dst_nb1 + i3*args.dst_nb2] = sumf;
+}
+
+// ref: ggml.c:ggml_compute_forward_ssm_conv_back_c_f32
+kernel void kernel_ssm_conv_back_c_f32(
+        constant ggml_metal_kargs_ssm_conv_back_c & args,
+        device const char * g_in,    // grad_out {d_inner, n_t, n_s}
+        device const char * sx_in,   // sx       {ncs, d_inner, n_s}
+        device       char * dst,     // grad_c   {d_conv, d_inner}
+        uint3 tpig[[thread_position_in_grid]]) {
+    const int i0 = tpig.x;
+    const int i1 = tpig.y;
+
+    if (i0 >= args.nc || i1 >= args.nr) {
+        return;
+    }
+
+    device const float * grad = (device const float *) g_in;
+    device const float * sx   = (device const float *) sx_in;
+    device       float * d    = (device       float *) dst;
+
+    float sumf = 0.0f;
+
+    for (int i3 = 0; i3 < args.n_s; ++i3) {
+        const uint64_t grad_base = i1*args.grad_nb0 + i3*args.grad_nb2;
+        const uint64_t sx_base   = i0*args.sx_nb0 + i1*args.sx_nb1 + i3*args.sx_nb2;
+        for (int i2 = 0; i2 < args.n_t; ++i2) {
+            sumf += grad[grad_base + i2*args.grad_nb1] * sx[sx_base + i2*args.sx_nb0];
+        }
+    }
+
+    d[i0 + i1*args.dst_nb1] = sumf;
+}
+
 // ref: ggml.c:ggml_compute_forward_ssm_scan_f32, Mamba-2 part
 // Optimized version: reduces redundant memory loads by having one thread load shared values
 kernel void kernel_ssm_scan_f32(
@@ -3670,6 +3737,241 @@ template [[host_name("kernel_gated_delta_net_f32_1")]] kernel kernel_gated_delta
 template [[host_name("kernel_gated_delta_net_f32_2")]] kernel kernel_gated_delta_net_t kernel_gated_delta_net_impl<float2, 2>;
 template [[host_name("kernel_gated_delta_net_f32_4")]] kernel kernel_gated_delta_net_t kernel_gated_delta_net_impl<float4, 4>;
 #endif
+
+// Backward of gated_delta_net.
+constant short FC_gdn_back_S_v [[function_constant(FC_GATED_DELTA_NET + 10)]];
+constant short FC_gdn_back_kda [[function_constant(FC_GATED_DELTA_NET + 11)]];
+
+kernel void kernel_gated_delta_net_back(
+        constant ggml_metal_kargs_gated_delta_net_back & args,
+        device const float * data_q,
+        device const float * data_k,
+        device const float * data_v,
+        device const float * data_g,
+        device const float * data_beta,
+        device const float * data_state,
+        device const float * data_d,
+        device       float * data_dst,
+        uint3 tgpig[[threadgroup_position_in_grid]],
+        uint3 tpitg[[thread_position_in_threadgroup]]) {
+    const uint S_v = (uint) FC_gdn_back_S_v;
+    const bool kda = FC_gdn_back_kda != 0;
+
+    threadgroup float sh_k  [256];
+    threadgroup float sh_q  [256];
+    threadgroup float sh_eg [256];
+    threadgroup float sh_red[256];
+
+    const uint tid = tpitg.x;
+    const uint iq1 = tgpig.x; // q/k head
+    const uint iq3 = tgpig.y; // q/k seq
+
+    const uint H        = args.H;
+    const uint n_tokens = args.n_tokens;
+    const uint K        = args.K;
+    const uint neq1     = args.neq1;
+    const uint rq3      = args.rq3;
+    const uint group    = H / neq1;
+    const float scale   = args.scale;
+
+    const uint  state_size = S_v * S_v;
+    const uint  wg_id      = iq1 + neq1 * iq3;
+    const ulong sc_base    = args.off_scratch + (ulong) wg_id * args.wg_stride;
+    const ulong sc_S       = sc_base;
+    const ulong sc_A       = sc_S     + (ulong) n_tokens * state_size;
+    const ulong sc_delta   = sc_A     + (ulong) n_tokens * state_size;
+    const ulong sc_w       = sc_delta + (ulong) n_tokens * S_v;
+    const ulong sc_carry   = sc_w     + (ulong) n_tokens * S_v;
+
+    const uint state_size_per_snap = state_size * H * args.n_seqs;
+    const int  shift = (int) n_tokens - (int) K;
+
+    const uint j = tid; // column (phase A) / row (phase B)
+
+    // zero d_q / d_k for this (iq1, iq3); they accumulate over the v-head group
+    for (uint t = 0; t < n_tokens; t++) {
+        const ulong row = (ulong)(iq1 + neq1 * (t + n_tokens * iq3)) * S_v + tid;
+        data_dst[row]               = 0.0f;
+        data_dst[args.off_dk + row] = 0.0f;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint gi = 0; gi < group; gi++) {
+        const uint iv1 = iq1 + gi * neq1; // v-head
+        for (uint sgi = 0; sgi < rq3; sgi++) {
+            const uint  iv3 = iq3 * rq3 + sgi; // v-seq
+            const ulong state_in_base  = (ulong)(iv3 * K * H + iv1) * state_size;
+            const ulong state_out_base = (ulong)(iv3 * H + iv1) * state_size;
+
+            for (uint t = 0; t < n_tokens; t++) {
+                const ulong k_off  = (ulong) iq3 * args.sq3 + (ulong) t * args.sq2 + (ulong) iq1 * args.sq1;
+                const ulong v_off  = (ulong) iv3 * args.sv3 + (ulong) t * args.sv2 + (ulong) iv1 * args.sv1;
+                const ulong gb_off = (ulong) iv3 * args.sb3 + (ulong) t * args.sb2 + (ulong) iv1 * args.sb1;
+                const float beta_val = data_beta[gb_off];
+
+                sh_k [tid] = data_k[k_off + tid];
+                sh_eg[tid] = kda ? exp(data_g[gb_off * S_v + tid]) : exp(data_g[gb_off]);
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+
+                const ulong sprev = (t == 0) ? state_in_base : (sc_S + (ulong)(t - 1) * state_size);
+                const bool sprev_state = (t == 0);
+
+                float kv = 0.0f;
+                for (uint i = 0; i < S_v; i++) {
+                    const float sprev_ij = sprev_state ? data_state[sprev + j * S_v + i]
+                                                       : data_dst  [sprev + j * S_v + i];
+                    kv += sh_eg[i] * sprev_ij * sh_k[i];
+                }
+                const float delta_j = (data_v[v_off + j] - kv) * beta_val;
+                for (uint i = 0; i < S_v; i++) {
+                    const float sprev_ij = sprev_state ? data_state[sprev + j * S_v + i]
+                                                       : data_dst  [sprev + j * S_v + i];
+                    data_dst[sc_S + (ulong) t * state_size + j * S_v + i] = sh_eg[i] * sprev_ij + sh_k[i] * delta_j;
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
+
+            threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
+
+            for (uint i = 0; i < S_v; i++) {
+                data_dst[sc_carry + j * S_v + i] = 0.0f;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            for (int t = (int) n_tokens - 1; t >= 0; t--) {
+                const uint  ut     = (uint) t;
+                const ulong q_off  = (ulong) iq3 * args.sq3 + (ulong) ut * args.sq2 + (ulong) iq1 * args.sq1;
+                const ulong k_off  = q_off;
+                const ulong v_off  = (ulong) iv3 * args.sv3 + (ulong) ut * args.sv2 + (ulong) iv1 * args.sv1;
+                const ulong gb_off = (ulong) iv3 * args.sb3 + (ulong) ut * args.sb2 + (ulong) iv1 * args.sb1;
+                const float beta_val = data_beta[gb_off];
+
+                sh_k [tid] = data_k[k_off + tid];
+                sh_q [tid] = data_q[q_off + tid];
+                sh_eg[tid] = kda ? exp(data_g[gb_off * S_v + tid]) : exp(data_g[gb_off]);
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+
+                const ulong do_off = (ulong)(iv3 * n_tokens * H + iv1) * S_v + (ulong) ut * S_v * H;
+                const float do_j = data_d[do_off + j];
+
+                for (uint i = 0; i < S_v; i++) {
+                    data_dst[sc_carry + j * S_v + i] += scale * sh_q[i] * do_j;
+                }
+                const int target_slot = t - shift;
+                if (target_slot >= 0 && target_slot < (int) K) {
+                    const ulong dss = args.s_off + (ulong) target_slot * state_size_per_snap + state_out_base;
+                    for (uint i = 0; i < S_v; i++) {
+                        data_dst[sc_carry + j * S_v + i] += data_d[dss + j * S_v + i];
+                    }
+                }
+                for (uint i = 0; i < S_v; i++) {
+                    data_dst[sc_A + (ulong) ut * state_size + j * S_v + i] = data_dst[sc_carry + j * S_v + i];
+                }
+
+                const ulong sprev = (ut == 0) ? state_in_base : (sc_S + (ulong)(ut - 1) * state_size);
+                const bool sprev_state = (ut == 0);
+                float su = 0.0f;
+                float sd = 0.0f;
+                for (uint i = 0; i < S_v; i++) {
+                    const float sprev_ij = sprev_state ? data_state[sprev + j * S_v + i]
+                                                       : data_dst  [sprev + j * S_v + i];
+                    su += sh_eg[i] * sprev_ij * sh_k[i];
+                    sd += data_dst[sc_carry + j * S_v + i] * sh_k[i];
+                }
+                const float u_j = data_v[v_off + j] - su;
+                const float w_j = beta_val * sd;
+                data_dst[sc_delta + (ulong) ut * S_v + j] = beta_val * u_j;
+                data_dst[sc_w     + (ulong) ut * S_v + j] = w_j;
+                data_dst[args.off_dv + (ulong)(iv1 + H * (ut + n_tokens * iv3)) * S_v + j] = w_j;
+
+                // d_beta = reduce_sum(sd * u_j)
+                sh_red[tid] = sd * u_j;
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                for (uint s = S_v / 2; s > 0; s >>= 1) {
+                    if (tid < s) {
+                        sh_red[tid] += sh_red[tid + s];
+                    }
+                    threadgroup_barrier(mem_flags::mem_threadgroup);
+                }
+                if (tid == 0) {
+                    data_dst[args.off_db + iv1 + H * (ut + n_tokens * iv3)] = sh_red[0];
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+
+                // propagate A_{t-1} = diag(exp(g)) (A - k w^T)
+                for (uint i = 0; i < S_v; i++) {
+                    const float a = data_dst[sc_carry + j * S_v + i];
+                    data_dst[sc_carry + j * S_v + i] = sh_eg[i] * (a - sh_k[i] * w_j);
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
+
+            // initial-state gradient (forward reads only slot 0)
+            for (uint i = 0; i < S_v; i++) {
+                data_dst[args.off_ds + (ulong) iv1 * state_size + (ulong)(state_size * H) * (K * iv3) + j * S_v + i] =
+                    data_dst[sc_carry + j * S_v + i];
+            }
+            for (uint slot = 1; slot < K; slot++) {
+                for (uint i = 0; i < S_v; i++) {
+                    data_dst[args.off_ds + (ulong) iv1 * state_size + (ulong)(state_size * H) * (slot + K * iv3) + j * S_v + i] = 0.0f;
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
+
+            const uint i = tid; // row
+            for (uint t = 0; t < n_tokens; t++) {
+                const ulong k_off  = (ulong) iq3 * args.sq3 + (ulong) t * args.sq2 + (ulong) iq1 * args.sq1;
+                const ulong gb_off = (ulong) iv3 * args.sb3 + (ulong) t * args.sb2 + (ulong) iv1 * args.sb1;
+                const ulong do_off = (ulong)(iv3 * n_tokens * H + iv1) * S_v + (ulong) t * S_v * H;
+
+                const float k_i  = data_k[k_off + i];
+                const float eg_i = kda ? exp(data_g[gb_off * S_v + i]) : exp(data_g[gb_off]);
+
+                const ulong sprev = (t == 0) ? state_in_base : (sc_S + (ulong)(t - 1) * state_size);
+                const bool sprev_state = (t == 0);
+
+                float dq = 0.0f;
+                float dk = 0.0f;
+                float dg = 0.0f;
+                for (uint jj = 0; jj < S_v; jj++) {
+                    const float st_ij    = data_dst[sc_S + (ulong) t * state_size + jj * S_v + i];
+                    const float a_ij     = data_dst[sc_A + (ulong) t * state_size + jj * S_v + i];
+                    const float delta_j  = data_dst[sc_delta + (ulong) t * S_v + jj];
+                    const float w_j      = data_dst[sc_w     + (ulong) t * S_v + jj];
+                    const float do_j     = data_d[do_off + jj];
+                    const float sprev_ij = sprev_state ? data_state[sprev + jj * S_v + i]
+                                                       : data_dst  [sprev + jj * S_v + i];
+                    const float sp_ij = eg_i * sprev_ij;
+                    dq += st_ij * do_j;
+                    dk += a_ij * delta_j - sp_ij * w_j;
+                    dg += (a_ij - k_i * w_j) * sp_ij;
+                }
+                const ulong row = (ulong)(iq1 + neq1 * (t + n_tokens * iq3)) * S_v + i;
+                data_dst[row]               += scale * dq;
+                data_dst[args.off_dk + row] += dk;
+
+                if (kda) {
+                    data_dst[args.off_dg + (ulong)(iv1 + H * (t + n_tokens * iv3)) * S_v + i] = dg;
+                } else {
+                    sh_red[tid] = dg;
+                    threadgroup_barrier(mem_flags::mem_threadgroup);
+                    for (uint s = S_v / 2; s > 0; s >>= 1) {
+                        if (tid < s) {
+                            sh_red[tid] += sh_red[tid + s];
+                        }
+                        threadgroup_barrier(mem_flags::mem_threadgroup);
+                    }
+                    if (tid == 0) {
+                        data_dst[args.off_dg + iv1 + H * (t + n_tokens * iv3)] = sh_red[0];
+                    }
+                    threadgroup_barrier(mem_flags::mem_threadgroup);
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
+        }
+    }
+}
 
 constant short FC_solve_tri_nsg [[function_constant(FC_SOLVE_TRI + 0)]];
 constant short FC_solve_tri_n   [[function_constant(FC_SOLVE_TRI + 1)]];
