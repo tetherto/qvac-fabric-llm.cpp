@@ -1251,6 +1251,7 @@ private:
             mparams.image_min_tokens = params_base.image_min_tokens;
             mparams.image_max_tokens = params_base.image_max_tokens;
             mparams.batch_max_tokens = params_base.mtmd_batch_max_tokens;
+            mparams.image_tile_mode  = (int) params_base.image_tile_mode;
             mparams.media_marker     = get_media_marker();
             // progress callback
             mparams.progress_callback           = load_progress_callback;
