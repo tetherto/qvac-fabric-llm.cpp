@@ -11,7 +11,14 @@ find_package(Vulkan COMPONENTS glslc REQUIRED)
 if (DEFINED ENV{VULKAN_SDK})
     list(APPEND CMAKE_PREFIX_PATH "$ENV{VULKAN_SDK}")
 endif()
-find_package(SPIRV-Headers CONFIG REQUIRED)
+# Desktop builds get SPIRV-Headers (and Vulkan-Hpp) from the Vulkan SDK. The
+# Android NDK ships neither, so on Android they are fetched in the ANDROID block
+# below; don't hard-require the system package there.
+if (ANDROID)
+    find_package(SPIRV-Headers CONFIG QUIET)
+else()
+    find_package(SPIRV-Headers CONFIG REQUIRED)
+endif()
 
 if (CMAKE_CXX_COMPILER_ID STREQUAL "MSVC")
     # Parallel build object files
@@ -139,7 +146,34 @@ if (Vulkan_FOUND)
 
     )
     if (ANDROID)
-        target_include_directories(ggml-vulkan PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/vulkan_cpp_wrapper/include")
+        # The Android NDK ships only the C Vulkan headers (vulkan/vulkan.h). The
+        # ggml Vulkan backend additionally needs the C++ bindings
+        # (vulkan/vulkan.hpp) and SPIRV-Headers (spirv/unified1/spirv.hpp), which
+        # the NDK does not provide. Fetch pinned, header-only copies so the
+        # Android Vulkan build works out of the box.
+        include(FetchContent)
+        # SOURCE_SUBDIR points at a directory without a CMakeLists.txt so that
+        # FetchContent only downloads the headers and does NOT add_subdirectory()
+        # their projects (Vulkan-Headers would otherwise re-declare the
+        # Vulkan::Headers target already created by find_package(Vulkan)).
+        FetchContent_Declare(
+            vulkan_headers
+            GIT_REPOSITORY https://github.com/KhronosGroup/Vulkan-Headers.git
+            GIT_TAG        vulkan-sdk-1.4.350.1
+            GIT_SHALLOW    TRUE
+            SOURCE_SUBDIR  headers-only-no-build
+        )
+        FetchContent_Declare(
+            spirv_headers
+            GIT_REPOSITORY https://github.com/KhronosGroup/SPIRV-Headers.git
+            GIT_TAG        vulkan-sdk-1.4.350.1
+            GIT_SHALLOW    TRUE
+            SOURCE_SUBDIR  headers-only-no-build
+        )
+        FetchContent_MakeAvailable(vulkan_headers spirv_headers)
+        target_include_directories(ggml-vulkan PRIVATE
+            "${vulkan_headers_SOURCE_DIR}/include"
+            "${spirv_headers_SOURCE_DIR}/include")
     endif()
 
     if (FORCE_GGML_VK_PERF_LOGGER)

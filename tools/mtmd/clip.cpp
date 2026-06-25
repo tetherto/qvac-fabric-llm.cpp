@@ -4930,9 +4930,16 @@ int clip_n_output_tokens(const clip_ctx * ctx, const clip_image_f32 * img) {
         case PROJECTOR_TYPE_NEMOTRON_OMNI:
         case PROJECTOR_TYPE_LLAMA4:
             {
-                // both X and Y are downscaled by the scale factor
+                // both X and Y are downscaled by the scale factor; round per
+                // dimension to match the encoder's 2D pooling, i.e.
+                // floor(W/p/s) * floor(H/p/s). This differs from
+                // floor(W/p * H/p / s^2) when a side is not divisible by s,
+                // which would otherwise mismatch the actual graph output and
+                // trip the token-count sanity check in clip_image_batch_encode.
                 int scale_factor = ctx->model.hparams.n_merge;
-                n_patches /= (scale_factor * scale_factor);
+                int x_patch = (img->nx() / patch_size) / scale_factor;
+                int y_patch = (img->ny() / patch_size) / scale_factor;
+                n_patches = x_patch * y_patch;
             } break;
         case PROJECTOR_TYPE_GEMMA3NV:
             {
