@@ -4622,6 +4622,31 @@ struct clip_model_loader {
     static void warmup(clip_ctx & ctx_clip, const clip_image_f32_batch & batch) {
         support_info_graph info;
 
+        // Disable FA on GPU projectors that lack efficient (coopmat) flash attention.
+        // Without coopmat, Vulkan uses FA_SCALAR which is ~2.6x slower than the matmul path
+        // for CLIP encoder attention (Mali-G715: 38 vs ~100 GFLOPS/s). Coopmat-capable GPUs
+        // keep FA enabled. Resolved at runtime via proc_address — no compile-time backend dep.
+        // Only acts on AUTO; an explicit user choice (ENABLED/DISABLED) is respected.
+        if (ctx_clip.flash_attn_type == CLIP_FLASH_ATTN_TYPE_AUTO &&
+            ctx_clip.backend && ctx_clip.backend != ctx_clip.backend_cpu) {
+            bool efficient_fa = true;
+            ggml_backend_dev_t dev = ggml_backend_get_device(ctx_clip.backend);
+            if (dev) {
+                ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+                if (reg) {
+                    typedef bool (*supports_efficient_fa_t)(ggml_backend_t);
+                    auto fn = (supports_efficient_fa_t)ggml_backend_reg_get_proc_address(
+                        reg, "ggml_backend_supports_efficient_fa");
+                    if (fn) {
+                        efficient_fa = fn(ctx_clip.backend);
+                    }
+                }
+            }
+            if (!efficient_fa) {
+                ctx_clip.flash_attn_type = CLIP_FLASH_ATTN_TYPE_DISABLED;
+            }
+        }
+
         if (ctx_clip.flash_attn_type == CLIP_FLASH_ATTN_TYPE_AUTO) {
             // Probe flash-attention support by forcing it on for the warmup
             // graph, then restore AUTO so the per-image budget heuristic in

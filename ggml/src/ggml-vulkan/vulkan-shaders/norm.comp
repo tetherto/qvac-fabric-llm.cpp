@@ -1,44 +1,84 @@
 #version 450
 
+#define NORM_MUL_ADD_FUSION 1
+
+#include "generic_binary_head.glsl"
 #include "types.glsl"
-#include "generic_unary_head.glsl"
 
 #extension GL_EXT_control_flow_attributes : enable
 #define BLOCK_SIZE 512
 
+// Spec constant 0 (norepeat) is declared in generic_binary_head.glsl.
+layout (constant_id = 1) const bool do_multiply = false;
+layout (constant_id = 2) const bool do_add      = false;
+
 layout(local_size_x = BLOCK_SIZE, local_size_y = 1, local_size_z = 1) in;
 
-shared vec2 sum[BLOCK_SIZE];
+// Bindings: 0=input(A), 1=weight(B), 2=bias(C), 3=output(D).
+// When NORM_MUL_ADD_FUSION is set, generic_binary_head.glsl does not declare
+// any bindings, so we declare all four here. The weight/bias buffers are only
+// read when do_multiply/do_add are true; otherwise they may alias the input.
+layout (binding = 0) readonly  buffer A {A_TYPE data_a[];};
+layout (binding = 1) readonly  buffer B {B_TYPE data_b[];};
+layout (binding = 2) readonly  buffer C {B_TYPE data_c[];};
+layout (binding = 3) writeonly buffer D {D_TYPE data_d[];};
+
+shared vec2 sumsh[BLOCK_SIZE];
 
 void main() {
-    const uint row = gl_WorkGroupID.z * 262144 + gl_WorkGroupID.y * 512 + gl_WorkGroupID.x;
-    const uint tid = gl_LocalInvocationID.x;
+    const uint ncols     = p.ne00;
+    const uint nrows     = gl_NumWorkGroups.x;
+    const uint nchannels = gl_NumWorkGroups.y;
 
-    const uint a_base = get_aoffset() + src0_idx(row * p.ne00);
-    const uint d_base = get_doffset() + dst_idx(row * p.ne10);
+    const uint row       = gl_WorkGroupID.x;
+    const uint channel   = gl_WorkGroupID.y;
+    const uint samp      = gl_WorkGroupID.z;
+    const uint tid       = gl_LocalInvocationID.x;
 
-    sum[tid] = vec2(0.0f, 0.0f);
+    const uint stride_row     = p.nb01;
+    const uint stride_channel = p.nb02;
+    const uint stride_sample  = p.nb03;
 
-    [[unroll]] for (uint i0 = tid; i0 < p.ne00; i0 += BLOCK_SIZE) {
-        const float xi = float(data_a[a_base + i0*p.nb00]);
-        sum[tid].x += xi;
-        sum[tid].y += xi * xi;
+    // Input offset mirrors rms_norm.comp's stride-based scheme.
+    uint32_t a_offset = samp*stride_sample + channel*stride_channel + row*stride_row + get_aoffset();
+    uint32_t b_offset = get_boffset();
+    // Bias (C) is required to be aligned (misalign==0) by the fusion gate.
+    uint32_t c_offset = 0;
+    // Output is contiguous per row (CLIP layernorm dst), matching rms_norm.comp.
+    uint32_t d_offset = ((samp*nchannels + channel)*nrows + row)*ncols + get_doffset();
+
+    vec2 sum = vec2(0.0f, 0.0f);
+
+    [[unroll]] for (uint col = tid; col < ncols; col += BLOCK_SIZE) {
+        const float xi = float(data_a[a_offset + col]);
+        sum.x += xi;
+        sum.y += xi * xi;
     }
 
+    sumsh[tid] = sum;
     // sum up partial sums and write back result
     barrier();
     [[unroll]] for (int s = BLOCK_SIZE / 2; s > 0; s >>= 1) {
         if (tid < s) {
-            sum[tid] += sum[tid + s];
+            sum += sumsh[tid + s];
+            sumsh[tid] = sum;
         }
         barrier();
     }
+    sum = sumsh[0];
 
-    const float mean = sum[0].x / p.ne00;
-    const float var = sum[0].y / p.ne00 - mean * mean;
+    const float mean    = sum.x / float(ncols);
+    const float var     = sum.y / float(ncols) - mean * mean;
     const float inv_std = inversesqrt(var + p.param1);
 
-    [[unroll]] for (uint i0 = tid; i0 < p.ne00; i0 += BLOCK_SIZE) {
-        data_d[d_base + i0*p.nb10] = D_TYPE((float(data_a[a_base + i0*p.nb00]) - mean) * inv_std);
+    [[unroll]] for (uint col = tid; col < ncols; col += BLOCK_SIZE) {
+        float result = (float(data_a[a_offset + col]) - mean) * inv_std;
+        if (do_multiply) {
+            result *= float(data_b[b_offset + col]);
+        }
+        if (do_add) {
+            result += float(data_c[c_offset + col]);
+        }
+        data_d[d_offset + col] = D_TYPE(result);
     }
 }

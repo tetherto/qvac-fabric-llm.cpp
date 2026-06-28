@@ -19,7 +19,7 @@ layout (push_constant) uniform parameter
 #endif
 } p;
 
-#if !RMS_NORM_ROPE_FUSION
+#if !RMS_NORM_ROPE_FUSION && !NORM_MUL_ADD_FUSION
 layout (binding = 0) readonly buffer A {A_TYPE data_a[];};
 #if defined(A_TYPE_PACKED16)
 layout (binding = 0) readonly buffer A_PACKED16 {A_TYPE_PACKED16 data_a_packed16[];};

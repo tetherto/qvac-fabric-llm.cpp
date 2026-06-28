@@ -2092,6 +2092,16 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         } else if (device->vendor_id == VK_VENDOR_ID_QUALCOMM && device->coopmat_support) {
             m_warptile     = { 64, 64, 64, 16, 64, 64, 1, tm_l, tn_l, tk_l, 64 };
             m_warptile_mmq = { 64, 64, 64, 32, 64, 64, 1, tm_m, tn_m, tk_m, 64 };
+        } else if (device->vendor_id == VK_VENDOR_ID_ARM &&
+                   device->properties.limits.maxComputeWorkGroupInvocations >= 512 &&
+                   device->properties.limits.maxComputeWorkGroupSize[0] >= 512) {
+            // QVAC-21257 iter2: Mali/Valhall (16-wide subgroup, no coopmat). The q8_0 MMQ matmuls
+            // dominate the CLIP vision-encode (~65 %, ~90 GFLOPS/s, run #80). The generic large MMQ
+            // tile uses only 8 warps/workgroup (block_size 128); widen to a 32-warp shape (block_size
+            // 512, wm=16/wn=32) to raise GPU occupancy on the dominant matmul path. Falls back
+            // automatically (shmem check below) if it doesn't fit. Float MMQ path only (q8_0 goes
+            // through mul_mat_q_f16).
+            l_warptile_mmq = { 512, 128, 128, 32, mm_warp_8, 32, 2, tm_m, tn_m, tk_m, mm_warp_8 };
         }
 
         l_wg_denoms     = { l_warptile[1],     l_warptile[2],     1 };
@@ -3721,7 +3731,11 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     }
     ggml_vk_create_pipeline(device, device->pipeline_mul_mat_vec_nc_f16_f32, "mul_mat_vec_nc_f16_f32", mul_mat_vec_nc_f16_f32_len, mul_mat_vec_nc_f16_f32_data, "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_nc_push_constants), {1, 1, 1}, {}, 1);
 
-    ggml_vk_create_pipeline(device, device->pipeline_norm_f32, "norm_f32", norm_f32_len, norm_f32_data, "main", 2, sizeof(vk_op_unary_push_constants), {1, 1, 1}, {}, 1);
+    // norm.comp now uses the binary head (4 bindings: input, weight, bias, output) and
+    // spec constants {norepeat, do_multiply, do_add}. Plain norm sets both to 0; the fused
+    // NORM+MUL+ADD path sets both to 1. Same bytecode for both, mirroring rms_norm.
+    ggml_vk_create_pipeline(device, device->pipeline_norm_f32, "norm_f32", norm_f32_len, norm_f32_data, "main", 4, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {0, 0, 0}, 1, true);
+    ggml_vk_create_pipeline(device, device->pipeline_norm_mul_add_f32, "norm_mul_add_f32", norm_f32_len, norm_f32_data, "main", 4, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {0, 1, 1}, 1, true);
     ggml_vk_create_pipeline(device, device->pipeline_group_norm_f32, "group_norm_f32", group_norm_f32_len, group_norm_f32_data, "main", 2, sizeof(vk_op_push_constants), {1, 1, 1}, {}, 1);
 
     const bool rms_subgroups = (device->vendor_id == VK_VENDOR_ID_INTEL || device->vendor_id == VK_VENDOR_ID_NVIDIA || device->vendor_id == VK_VENDOR_ID_AMD) && device->subgroup_arithmetic && device->subgroup_require_full_support;
@@ -10281,7 +10295,8 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
         return nullptr;
     case GGML_OP_NORM:
         if (src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
-            return ctx->device->pipeline_norm_f32;
+            // num_additional_fused_ops == 2 means fused NORM+MUL+ADD (layernorm scale+bias).
+            return ctx->num_additional_fused_ops == 2 ? ctx->device->pipeline_norm_mul_add_f32 : ctx->device->pipeline_norm_f32;
         }
         return nullptr;
     case GGML_OP_GROUP_NORM:
@@ -10937,6 +10952,10 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
 
     switch (op) {
     case GGML_OP_NORM:
+        // One workgroup per row/channel/sample, matching norm.comp's stride-based
+        // indexing (gl_WorkGroupID.{x,y,z} = {row, channel, sample}).
+        elements = { (uint32_t)ne01, (uint32_t)ne02, (uint32_t)ne03 };
+        break;
     case GGML_OP_RMS_NORM_BACK:
     case GGML_OP_L2_NORM:
     case GGML_OP_L2_NORM_BACK:
@@ -12407,12 +12426,51 @@ static void ggml_vk_sigmoid_back(ggml_backend_vk_context * ctx, vk_context& subc
     ggml_vk_op_f32<vk_op_push_constants>(ctx, subctx, src0, src1, nullptr, nullptr, dst, GGML_OP_SIGMOID_BACK, { (uint32_t)ggml_nelements(src0), 0, 0.0f, 0.0f, 0.0f, 0.0f });
 }
 
-void ggml_vk_norm(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, ggml_tensor * dst) {
-    float * op_params = (float *)dst->op_params;
-    vk_op_unary_push_constants p = vk_op_unary_push_constants_init(src0, dst);
-    p.param1 = op_params[0];
+void ggml_vk_norm(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx) {
+    ggml_tensor * norm = cgraph->nodes[node_idx];
+    float * op_params = (float *)norm->op_params;
 
-    ggml_vk_op_f32(ctx, subctx, src0, nullptr, nullptr, nullptr, dst, GGML_OP_NORM, std::move(p));
+    ggml_tensor * dst;
+    const ggml_tensor * src0; // norm input (A)
+    const ggml_tensor * src1; // weight   (B)
+    const ggml_tensor * src2; // bias     (C)
+
+    if (ctx->num_additional_fused_ops == 2) {
+        // fused NORM + MUL + ADD (layernorm scale + bias)
+        ggml_tensor * mul = cgraph->nodes[node_idx + 1];
+        ggml_tensor * add = cgraph->nodes[node_idx + 2];
+        ggml_tensor * weight = mul->src[0] == norm ? mul->src[1] : mul->src[0];
+        ggml_tensor * bias   = add->src[0] == mul  ? add->src[1] : add->src[0];
+        // shader uses plain col indexing (no stride), requires zero misalignment
+        GGML_ASSERT(get_misalign_bytes(ctx, weight) == 0);
+        GGML_ASSERT(get_misalign_bytes(ctx, bias)   == 0);
+        dst  = add;
+        src0 = norm->src[0];
+        src1 = weight;
+        src2 = bias;
+    } else {
+        dst  = norm;
+        // plain norm: bind weight/bias to the input so all 4 descriptors are valid.
+        // do_multiply/do_add spec constants are false, so they are never read.
+        src0 = norm->src[0];
+        src1 = norm->src[0];
+        src2 = norm->src[0];
+    }
+
+    const uint32_t src0_type_size = ggml_type_size(src0->type);
+    const uint32_t src1_type_size = ggml_type_size(src1->type);
+    const uint32_t src2_type_size = ggml_type_size(src2->type);
+
+    vk_op_binary_push_constants bin {
+        (uint32_t)ggml_nelements(src0),
+        (uint32_t)src0->ne[0], (uint32_t)src0->ne[1], (uint32_t)src0->ne[2], (uint32_t)src0->ne[3], (uint32_t)src0->nb[0] / src0_type_size, (uint32_t)src0->nb[1] / src0_type_size, (uint32_t)src0->nb[2] / src0_type_size, (uint32_t)src0->nb[3] / src0_type_size,
+        (uint32_t)src1->ne[0], (uint32_t)src1->ne[1], (uint32_t)src1->ne[2], (uint32_t)src1->ne[3], (uint32_t)src1->nb[0] / src1_type_size, (uint32_t)src1->nb[1] / src1_type_size, (uint32_t)src1->nb[2] / src1_type_size, (uint32_t)src1->nb[3] / src1_type_size,
+        (uint32_t)src2->ne[0], (uint32_t)src2->ne[1], (uint32_t)src2->ne[2], (uint32_t)src2->ne[3], (uint32_t)src2->nb[0] / src2_type_size, (uint32_t)src2->nb[1] / src2_type_size, (uint32_t)src2->nb[2] / src2_type_size, (uint32_t)src2->nb[3] / src2_type_size,
+        0,
+        op_params[0], 0.0f, 0,
+    };
+
+    ggml_vk_op_f32<vk_op_binary_push_constants>(ctx, subctx, src0, src1, src2, nullptr, dst, GGML_OP_NORM, std::move(bin));
 }
 
 void ggml_vk_group_norm(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, ggml_tensor * dst) {
@@ -14338,7 +14396,7 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
 
         break;
     case GGML_OP_NORM:
-        ggml_vk_norm(ctx, compute_ctx, src0, node);
+        ggml_vk_norm(ctx, compute_ctx, cgraph, node_idx);
 
         break;
     case GGML_OP_GROUP_NORM:
@@ -15462,6 +15520,49 @@ bool ggml_vk_can_fuse(const ggml_backend_vk_context * ctx, const struct ggml_cgr
             }
         }
     }
+    if (ops.size() == 3 && ops.begin()[0] == GGML_OP_NORM && ops.begin()[1] == GGML_OP_MUL && ops.begin()[2] == GGML_OP_ADD) {
+        // fused layernorm (NORM) + MUL (scale) + ADD (bias)
+        const ggml_tensor *norm = cgraph->nodes[node_idx];
+        const ggml_tensor *mul  = cgraph->nodes[node_idx + 1];
+        const ggml_tensor *add  = cgraph->nodes[node_idx + 2];
+
+        // f32-only
+        if (norm->src[0]->type != GGML_TYPE_F32 || norm->type != GGML_TYPE_F32 ||
+            mul->type  != GGML_TYPE_F32 ||
+            add->type  != GGML_TYPE_F32) {
+            return false;
+        }
+        // MUL must consume the NORM result as src[0], ADD must consume the MUL result as src[0].
+        if (mul->src[0] != norm || add->src[0] != mul) {
+            return false;
+        }
+        const ggml_tensor *weight = mul->src[1];
+        const ggml_tensor *bias   = add->src[1];
+        if (weight->type != GGML_TYPE_F32 || bias->type != GGML_TYPE_F32) {
+            return false;
+        }
+        // weight/bias must be 1-D row vectors broadcast over rows, matching norm->ne[0].
+        if (weight->ne[0] != norm->ne[0] || bias->ne[0] != norm->ne[0]) {
+            return false;
+        }
+        if (ggml_nrows(weight) != 1 || ggml_nrows(bias) != 1) {
+            return false;
+        }
+        // mul/add outputs must match norm input shape (no broadcast batch dims)
+        if (!ggml_are_same_shape(norm->src[0], add)) {
+            return false;
+        }
+        // contiguous and aligned (shader assumes contiguous rows and zero misalignment)
+        if (!ggml_is_contiguous(weight) || !ggml_is_contiguous(bias)) {
+            return false;
+        }
+        if (!ggml_is_contiguous_rows(norm->src[0])) {
+            return false;
+        }
+        if (get_misalign_bytes(ctx, weight) != 0 || get_misalign_bytes(ctx, bias) != 0) {
+            return false;
+        }
+    }
 
     auto const &mm_add_ok = [&](const ggml_tensor *mul, const ggml_tensor *add) {
         const ggml_tensor *bias = add->src[0] == mul ? add->src[1] : add->src[0];
@@ -16368,6 +16469,14 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 fusion_string = "SSM_CONV_SILU";
                 op_srcs_fused_elementwise[0] = false;
                 op_srcs_fused_elementwise[1] = true;
+            } else if (ggml_vk_can_fuse(ctx, cgraph, i, { GGML_OP_NORM, GGML_OP_MUL, GGML_OP_ADD })) {
+                ctx->num_additional_fused_ops = 2;
+                fusion_string = "NORM_MUL_ADD";
+                // norm is not elementwise, but whole rows are consumed by one workgroup per
+                // row and the mean/variance are computed before output is written. So close enough.
+                op_srcs_fused_elementwise[0] = true;
+                op_srcs_fused_elementwise[1] = true;
+                op_srcs_fused_elementwise[2] = true;
             } else if (ggml_can_fuse_subgraph(cgraph, i, rope_view_set_rows_pattern, { i + 2 }) &&
                        ggml_check_edges(cgraph, i, rope_view_set_rows_edges) &&
                        ggml_vk_can_fuse_rope_set_rows(ctx, cgraph, i)) {
@@ -16809,6 +16918,10 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
                     is_src_of(graph->nodes[j], graph->nodes[c]) &&
                     !(c == current_set.back() && graph->nodes[c]->op == GGML_OP_RMS_NORM && graph->nodes[j]->op == GGML_OP_MUL && empty_or_scheduled_between(c+1, j)) &&
                     !(c == current_set.back() && graph->nodes[c]->op == GGML_OP_UNARY && graph->nodes[j]->op == GGML_OP_MUL && empty_or_scheduled_between(c+1, j)) &&
+                    !(j == c+1 && c == current_set.back() && graph->nodes[c]->op == GGML_OP_NORM && graph->nodes[j]->op == GGML_OP_MUL) &&
+                    // Keep NORM->MUL->ADD consecutive: allow MUL->ADD only when MUL follows a NORM.
+                    !(j == c+1 && c == current_set.back() && graph->nodes[c]->op == GGML_OP_MUL && graph->nodes[j]->op == GGML_OP_ADD &&
+                      current_set.size() >= 2 && graph->nodes[current_set[current_set.size() - 2]]->op == GGML_OP_NORM) &&
                     !(j == c+1 && c == current_set.back() && graph->nodes[c]->op == GGML_OP_MUL_MAT && graph->nodes[j]->op == GGML_OP_ADD) &&
                     !(j == c+1 && c == current_set.back() && graph->nodes[c]->op == GGML_OP_MUL_MAT_ID && graph->nodes[j]->op == GGML_OP_ADD_ID) &&
                     !(j == c+1 && c == current_set.back() && graph->nodes[c]->op == GGML_OP_MUL_MAT_ID && graph->nodes[j]->op == GGML_OP_MUL) &&
@@ -18226,11 +18339,24 @@ static ggml_backend_dev_t ggml_backend_vk_reg_get_device(ggml_backend_reg_t reg,
     return devices[device];
 }
 
+static bool ggml_backend_vk_supports_efficient_fa(ggml_backend_t backend) {
+    ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
+    return ctx->device->coopmat2 || ctx->device->coopmat1_fa_support;
+}
+
+static void * ggml_backend_vk_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
+    GGML_UNUSED(reg);
+    if (strcmp(name, "ggml_backend_supports_efficient_fa") == 0) {
+        return (void *)ggml_backend_vk_supports_efficient_fa;
+    }
+    return NULL;
+}
+
 static const struct ggml_backend_reg_i ggml_backend_vk_reg_i = {
     /* .get_name         = */ ggml_backend_vk_reg_get_name,
     /* .get_device_count = */ ggml_backend_vk_reg_get_device_count,
     /* .get_device       = */ ggml_backend_vk_reg_get_device,
-    /* .get_proc_address = */ NULL,
+    /* .get_proc_address = */ ggml_backend_vk_reg_get_proc_address,
 };
 
 ggml_backend_reg_t ggml_backend_vk_reg() {
