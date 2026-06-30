@@ -158,7 +158,18 @@ struct mtmd_subcontext {
 
     int max_nodes = 8192;
     mtmd_flash_attn_type flash_attn_type = MTMD_FLASH_ATTN_TYPE_AUTO;
+    // Whether the active backend can run GGML_OP_FLASH_ATTN_EXT at all. Probed
+    // once at warmup; in AUTO mode the per-image decision falls back to the
+    // explicit attention path when this is false.
+    bool flash_attn_supported = true;
     bool is_allocated = false;
+
+    // Inputs to the AUTO flash-attn budget decision, resolved once (getenv +
+    // Mali detection + device-memory query) and cached, since none of them
+    // change between images. Populated lazily on the first AUTO resolve.
+    bool   fa_budget_cached = false;
+    int    fa_auto_min_kv   = 0;   // explicit-attention cutoff (n_patches); <=0 disables it
+    size_t fa_mem_capacity  = 0;   // device memory used to cap the cutoff (0 = unknown)
 
     bool debug_output_embeddings = false;
 

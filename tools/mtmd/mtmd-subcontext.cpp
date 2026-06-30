@@ -187,9 +187,13 @@ void mtmd_subcontext::warmup(const mtmd_image_f32_batch & batch) {
     support_info_graph info;
 
     if (flash_attn_type == MTMD_FLASH_ATTN_TYPE_AUTO) {
-        // try to enable flash attention to see if it's supported
+        // Probe flash-attention support by forcing it on for the warmup
+        // graph, then restore AUTO so the per-image budget heuristic in
+        // mtmd_resolve_flash_attn_type() decides at encode time.
         flash_attn_type = MTMD_FLASH_ATTN_TYPE_ENABLED;
         info = reserve_compute_meta(batch);
+        flash_attn_supported = info.fattn;
+        flash_attn_type = MTMD_FLASH_ATTN_TYPE_AUTO;
         if (!info.fattn && info.fattn_op) {
             auto op = info.fattn_op;
             LOG_WRN("%s: *****************************************************************\n", __func__);
@@ -208,10 +212,12 @@ void mtmd_subcontext::warmup(const mtmd_image_f32_batch & batch) {
             LOG_WRN("%s: please report this on github as an issue\n", __func__);
             LOG_WRN("%s: *****************************************************************\n", __func__);
             flash_attn_type = MTMD_FLASH_ATTN_TYPE_DISABLED;
-            reserve_compute_meta(batch);
+            // re-measure with FA now resolving to DISABLED (unsupported)
+            info = reserve_compute_meta(batch);
         }
     } else {
         info = reserve_compute_meta(batch);
+        flash_attn_supported = info.fattn;
         if (!info.fattn && flash_attn_type == MTMD_FLASH_ATTN_TYPE_ENABLED) {
             LOG_WRN("%s: flash attention is not supported by the current backend; falling back to CPU (performance will be degraded)\n", __func__);
         }
@@ -219,8 +225,11 @@ void mtmd_subcontext::warmup(const mtmd_image_f32_batch & batch) {
 
     is_allocated = true; // mark buffers as allocated
 
-    LOG_INF("%s: flash attention is %s\n", __func__,
-        (flash_attn_type == MTMD_FLASH_ATTN_TYPE_ENABLED) ? "enabled" : "disabled");
+    const char * fa_state =
+        flash_attn_type == MTMD_FLASH_ATTN_TYPE_ENABLED  ? "enabled"  :
+        flash_attn_type == MTMD_FLASH_ATTN_TYPE_DISABLED ? "disabled" :
+        flash_attn_supported ? "auto (per-image)" : "auto -> disabled (unsupported)";
+    LOG_INF("%s: flash attention is %s\n", __func__, fa_state);
 
     // print ops that are not supported by the GPU backend (if there is one)
     if (backends.backend != backends.backend_cpu) {
@@ -630,13 +639,43 @@ bool mtmd_subcontext::encode(mtmd_subctx_encode_params * params) {
     ggml_tensor * embeddings = params->out_embd ? ggml_graph_node(gf, -1) : nullptr;
 
     if (!ggml_backend_sched_alloc_graph(backends.sched.get(), gf)) {
-        if (model.proj_type == PROJECTOR_TYPE_QWEN3VL && n_batch_cur > 1 && !imgs.is_video) {
-            // Allocation failed (OOM), so fall back to sequential.
-            LOG_WRN("%s: batched graph alloc failed (OOM), retrying with sequential encoding\n", __func__);
-            return do_encode_sequential();
+        // The explicit-attention path that AUTO selects for short sequences needs
+        // O(n_patches^2) scratch and can OOM on memory-constrained devices. If
+        // flash-attention is available, rebuild this image with FA (which never
+        // materializes the full scores) and retry before falling back to slower
+        // sequential tiling. This is a no-op when FA was already the chosen path.
+        bool allocated = false;
+        if (flash_attn_type == MTMD_FLASH_ATTN_TYPE_AUTO && flash_attn_supported) {
+            LOG_WRN("%s: explicit-attention graph alloc failed (OOM); retrying with flash-attention\n", __func__);
+            const mtmd_flash_attn_type saved = flash_attn_type;
+            flash_attn_type = MTMD_FLASH_ATTN_TYPE_ENABLED; // force FA for this rebuild
+            ggml_backend_sched_reset(backends.sched.get());
+            gf = mtmd_get_graph_builder(this, imgs, params)->build();
+            // the rebuilt graph has a new output node; re-read it before scheduling
+            embeddings = params->out_embd ? ggml_graph_node(gf, -1) : nullptr;
+            allocated = ggml_backend_sched_alloc_graph(backends.sched.get(), gf);
+            flash_attn_type = saved; // restore AUTO for subsequent images
         }
-        LOG_ERR("%s: failed to allocate compute graph\n", __func__);
-        return false;
+        if (!allocated) {
+            if (model.proj_type == PROJECTOR_TYPE_QWEN3VL && n_batch_cur > 1 && !imgs.is_video) {
+                // Still failing (or FA unavailable) — fall back to sequential. We
+                // already know the batched explicit path OOMs here, so force
+                // flash-attention (the memory-frugal path) for the whole sequential
+                // run when it's supported; otherwise each tile would re-resolve to
+                // explicit, re-OOM and rebuild (up to N x2 allocations). Restore the
+                // prior mode afterwards for subsequent images.
+                LOG_WRN("%s: graph alloc failed (OOM), retrying with sequential encoding\n", __func__);
+                const mtmd_flash_attn_type saved = flash_attn_type;
+                if (flash_attn_supported) {
+                    flash_attn_type = MTMD_FLASH_ATTN_TYPE_ENABLED;
+                }
+                const bool ok = do_encode_sequential();
+                flash_attn_type = saved;
+                return ok;
+            }
+            LOG_ERR("%s: ggml_backend_sched_alloc_graph failed\n", __func__);
+            return false;
+        }
     }
 
     // set inputs

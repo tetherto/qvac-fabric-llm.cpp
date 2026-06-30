@@ -4276,22 +4276,34 @@ int mtmd_model::n_output_tokens(const mtmd_image_f32 * img) const {
         case PROJECTOR_TYPE_GEMMA3:
         case PROJECTOR_TYPE_GEMMA4V:
         case PROJECTOR_TYPE_GEMMA4UV:
-        case PROJECTOR_TYPE_IDEFICS3:
-        case PROJECTOR_TYPE_COHERE2V:
         case PROJECTOR_TYPE_INTERNVL:
-        case PROJECTOR_TYPE_NEMOTRON_V2_VL:
-        case PROJECTOR_TYPE_NEMOTRON_OMNI:
         case PROJECTOR_TYPE_LLAMA4:
             {
-                // both X and Y are downscaled by the scale factor; round per
-                // dimension to match the encoder's 2D pooling, i.e.
-                // floor(W/p/s) * floor(H/p/s). This differs from
-                // floor(W/p * H/p / s^2) when a side is not divisible by s,
-                // which would otherwise mismatch the actual graph output and
+                // These pool/reshape per dimension (ggml_pool_2d with pad 0, or a
+                // reshape that requires divisibility), so the graph emits
+                // floor(W/p/s) * floor(H/p/s). Round per dimension to match; this
+                // differs from floor(W/p * H/p / s^2) when a side is not divisible
+                // by s, which would otherwise mismatch the actual graph output and
                 // trip the token-count sanity check in mtmd_subcontext::encode.
                 int scale_factor = hparams.n_merge;
                 int x_patch = (img->nx() / patch_size) / scale_factor;
                 int y_patch = (img->ny() / patch_size) / scale_factor;
+                n_patches = x_patch * y_patch;
+            } break;
+        case PROJECTOR_TYPE_IDEFICS3:
+        case PROJECTOR_TYPE_COHERE2V:
+        case PROJECTOR_TYPE_NEMOTRON_V2_VL:
+        case PROJECTOR_TYPE_NEMOTRON_OMNI:
+            {
+                // These merge via build_patch_merge_permute(), which pads each
+                // dimension up to a multiple of the scale factor (MTMD_ALIGN)
+                // before the merge, so the graph emits
+                // ceil(W/p/s) * ceil(H/p/s). Match that rounding (mirrors the
+                // LFM2/KIMIVL and PaddleOCR merge cases below); floor would
+                // under-count on non-divisible grids and trip the sanity check.
+                int scale_factor = hparams.n_merge;
+                int x_patch = MTMD_ALIGN(img->nx() / patch_size, scale_factor) / scale_factor;
+                int y_patch = MTMD_ALIGN(img->ny() / patch_size, scale_factor) / scale_factor;
                 n_patches = x_patch * y_patch;
             } break;
         case PROJECTOR_TYPE_GEMMA3NV:
