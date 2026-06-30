@@ -168,6 +168,10 @@ struct clip_ctx {
     int max_nodes = 8192;
     ggml_backend_sched_ptr sched;
     clip_flash_attn_type flash_attn_type = CLIP_FLASH_ATTN_TYPE_AUTO;
+    // Whether the active backend can run GGML_OP_FLASH_ATTN_EXT at all. Probed
+    // once at warmup; in AUTO mode the per-image decision falls back to the
+    // explicit attention path when this is false.
+    bool flash_attn_supported = true;
     bool is_allocated = false;
 
     bool debug_output_embeddings = false;
@@ -283,6 +287,98 @@ struct clip_ctx {
 // clip_graph
 //
 
+// Whether the active GPU is an Arm Mali. Mali has no cooperative-matrix units,
+// so the Vulkan flash-attention kernel runs a slow scalar path; the explicit
+// mul_mat attention is faster there for short sequences. Detected from the
+// backend device description (e.g. "Mali-G715"). Safe-fails to false (which just
+// keeps the legacy flash-attention behavior), so a missed match never crashes.
+static bool clip_backend_is_mali(const clip_ctx * ctx) {
+    if (!ctx->backend || ctx->backend == ctx->backend_cpu) {
+        return false;
+    }
+    ggml_backend_dev_t dev = ggml_backend_get_device(ctx->backend);
+    if (!dev) {
+        return false;
+    }
+    const char * strs[2] = { ggml_backend_dev_description(dev), ggml_backend_dev_name(dev) };
+    for (const char * s : strs) {
+        for (; s && *s; ++s) {
+            if ((s[0] == 'M' || s[0] == 'm') && (s[1] == 'a' || s[1] == 'A') &&
+                (s[2] == 'l' || s[2] == 'L') && (s[3] == 'i' || s[3] == 'I')) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+// Default explicit-attention cutoff (n_patches) applied on Mali when the user
+// hasn't set MTMD_CLIP_AUTO_FA_MIN_KV. Tuned for the Gemma 4 E2B vision encoder
+// on Pixel 9 Pro: 196-tok (1764) and 400-tok (3600) use explicit, 784-tok
+// (7056) uses flash-attention (explicit would OOM there).
+static const int CLIP_AUTO_FA_MIN_KV_MALI_DEFAULT = 4096;
+
+// Resolve the effective flash-attention mode for a single image graph.
+//
+// ENABLED/DISABLED are explicit user choices and are honored as-is. AUTO is
+// budget-aware: flash-attention is the memory-frugal path and is required for
+// long sequences, but on backends without cooperative-matrix (notably Arm
+// Mali) its scalar kernel is slower than the explicit mul_mat + softmax path
+// for short sequences. When MTMD_CLIP_AUTO_FA_MIN_KV is set (>0), AUTO uses
+// the explicit path below that attention length (n_patches) and flash-attention
+// at/above it. Unset (the default) preserves the legacy behavior: use
+// flash-attention whenever the backend supports it.
+static clip_flash_attn_type clip_resolve_flash_attn_type(const clip_ctx * ctx, int n_patches) {
+    if (ctx->flash_attn_type != CLIP_FLASH_ATTN_TYPE_AUTO) {
+        return ctx->flash_attn_type;
+    }
+    if (!ctx->flash_attn_supported) {
+        return CLIP_FLASH_ATTN_TYPE_DISABLED;
+    }
+    // Explicit-attention cutoff. The env var overrides on any backend (set to 0
+    // to disable); otherwise it defaults on for Mali (where explicit is faster)
+    // and off everywhere else (where flash-attention is already better).
+    int auto_fa_min_kv;
+    const char * env_min_kv = std::getenv("MTMD_CLIP_AUTO_FA_MIN_KV");
+    if (env_min_kv && env_min_kv[0]) {
+        auto_fa_min_kv = atoi(env_min_kv);
+    } else {
+        auto_fa_min_kv = clip_backend_is_mali(ctx) ? CLIP_AUTO_FA_MIN_KV_MALI_DEFAULT : 0;
+    }
+
+    // Cutoff disabled => legacy behavior: flash-attention whenever supported.
+    if (auto_fa_min_kv <= 0) {
+        return CLIP_FLASH_ATTN_TYPE_ENABLED;
+    }
+
+    // Explicit attention (mul_mat + softmax) is faster than the scalar FA kernel
+    // on no-coopmat GPUs for short sequences, but it materializes an
+    // O(n_patches^2 * n_head) score matrix. Memory-constrained devices can't
+    // hold that, so cap the "use explicit" cutoff by how much device memory is
+    // available: the effective cutoff is the smaller of the configured threshold
+    // and the largest n_patches whose explicit scratch (scores + softmax/kqv
+    // temporaries, ~3x) fits in ~half of device memory. This only ever lowers
+    // the cutoff, so low-memory devices fall back to memory-frugal FA sooner.
+    int eff_min_kv = auto_fa_min_kv;
+    size_t free_mem = 0, total_mem = 0;
+    ggml_backend_dev_t dev = ctx->backend ? ggml_backend_get_device(ctx->backend) : nullptr;
+    if (dev) {
+        ggml_backend_dev_memory(dev, &free_mem, &total_mem);
+    }
+    // Prefer free memory when the backend reports it; many mobile drivers report
+    // 0, so fall back to total. If neither is known, rely on the threshold alone.
+    const size_t capacity = free_mem > 0 ? free_mem : total_mem;
+    if (capacity > 0) {
+        const size_t n_head = (size_t) ctx->model.hparams.n_head;
+        // 3 * n^2 * n_head * 4 bytes <= capacity / 2  =>  n <= sqrt(capacity / (24*n_head))
+        const double n_max = std::sqrt((double) capacity / (24.0 * (double) std::max<size_t>(n_head, 1)));
+        eff_min_kv = std::min(eff_min_kv, (int) n_max);
+    }
+
+    return (n_patches < eff_min_kv) ? CLIP_FLASH_ATTN_TYPE_DISABLED
+                                    : CLIP_FLASH_ATTN_TYPE_ENABLED;
+}
+
 clip_graph::clip_graph(clip_ctx * ctx, const clip_image_f32 & img) :
         model(ctx->model),
         hparams(model.hparams),
@@ -300,7 +396,7 @@ clip_graph::clip_graph(clip_ctx * ctx, const clip_image_f32 & img) :
         n_mmproj_embd(clip_n_mmproj_embd(ctx)),
         eps(hparams.eps),
         kq_scale(d_head > 0 ? 1.0f / sqrtf((float)d_head) : 0.0f),
-        flash_attn_type(ctx->flash_attn_type) {
+        flash_attn_type(clip_resolve_flash_attn_type(ctx, n_patches)) {
     struct ggml_init_params params = {
         /*.mem_size   =*/ ctx->buf_compute_meta.size(),
         /*.mem_buffer =*/ ctx->buf_compute_meta.data(),
@@ -4415,9 +4511,13 @@ struct clip_model_loader {
         support_info_graph info;
 
         if (ctx_clip.flash_attn_type == CLIP_FLASH_ATTN_TYPE_AUTO) {
-            // try to enable flash attention to see if it's supported
+            // Probe flash-attention support by forcing it on for the warmup
+            // graph, then restore AUTO so the per-image budget heuristic in
+            // clip_resolve_flash_attn_type() decides at encode time.
             ctx_clip.flash_attn_type = CLIP_FLASH_ATTN_TYPE_ENABLED;
             info = reserve_compute_meta(ctx_clip, batch);
+            ctx_clip.flash_attn_supported = info.fattn;
+            ctx_clip.flash_attn_type = CLIP_FLASH_ATTN_TYPE_AUTO;
             if (!info.fattn && info.fattn_op) {
                 auto op = info.fattn_op;
                 LOG_WRN("%s: *****************************************************************\n", __func__);
@@ -4436,10 +4536,12 @@ struct clip_model_loader {
                 LOG_WRN("%s: please report this on github as an issue\n", __func__);
                 LOG_WRN("%s: *****************************************************************\n", __func__);
                 ctx_clip.flash_attn_type = CLIP_FLASH_ATTN_TYPE_DISABLED;
-                reserve_compute_meta(ctx_clip, batch);
+                // re-measure with FA now resolving to DISABLED (unsupported)
+                info = reserve_compute_meta(ctx_clip, batch);
             }
         } else {
             info = reserve_compute_meta(ctx_clip, batch);
+            ctx_clip.flash_attn_supported = info.fattn;
             if (!info.fattn && ctx_clip.flash_attn_type == CLIP_FLASH_ATTN_TYPE_ENABLED) {
                 LOG_WRN("%s: flash attention is not supported by the current backend; falling back to CPU (performance will be degraded)\n", __func__);
             }
@@ -4447,8 +4549,11 @@ struct clip_model_loader {
 
         ctx_clip.is_allocated = true; // mark buffers as allocated
 
-        LOG_INF("%s: flash attention is %s\n", __func__,
-            (ctx_clip.flash_attn_type == CLIP_FLASH_ATTN_TYPE_ENABLED) ? "enabled" : "disabled");
+        const char * fa_state =
+            ctx_clip.flash_attn_type == CLIP_FLASH_ATTN_TYPE_ENABLED  ? "enabled"  :
+            ctx_clip.flash_attn_type == CLIP_FLASH_ATTN_TYPE_DISABLED ? "disabled" :
+            ctx_clip.flash_attn_supported ? "auto (per-image)" : "auto -> disabled (unsupported)";
+        LOG_INF("%s: flash attention is %s\n", __func__, fa_state);
 
         // print ops that are not supported by the GPU backend (if there is one)
         if (ctx_clip.backend && ctx_clip.backend != ctx_clip.backend_cpu) {
@@ -5420,13 +5525,32 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
     ggml_tensor * embeddings = params->out_embd ? ggml_graph_node(gf, -1) : nullptr;
 
     if (!ggml_backend_sched_alloc_graph(ctx->sched.get(), gf)) {
-        if (ctx->proj_type() == PROJECTOR_TYPE_QWEN3VL && n_batch_cur > 1 && !imgs.is_video) {
-            // Allocation failed (OOM), so fall back to sequential.
-            LOG_WRN("%s: batched graph alloc failed (OOM), retrying with sequential encoding\n", __func__);
-            return do_encode_sequential();
+        // The explicit-attention path that AUTO selects for short sequences needs
+        // O(n_patches^2) scratch and can OOM on memory-constrained devices. If
+        // flash-attention is available, rebuild this image with FA (which never
+        // materializes the full scores) and retry before falling back to slower
+        // sequential tiling. This is a no-op when FA was already the chosen path.
+        bool allocated = false;
+        if (ctx->flash_attn_type == CLIP_FLASH_ATTN_TYPE_AUTO && ctx->flash_attn_supported) {
+            LOG_WRN("%s: explicit-attention graph alloc failed (OOM); retrying with flash-attention\n", __func__);
+            const clip_flash_attn_type saved = ctx->flash_attn_type;
+            ctx->flash_attn_type = CLIP_FLASH_ATTN_TYPE_ENABLED; // force FA for this rebuild
+            ggml_backend_sched_reset(ctx->sched.get());
+            gf = clip_get_graph_builder(ctx, imgs, params)->build();
+            // the rebuilt graph has a new output node; re-read it before scheduling
+            embeddings = params->out_embd ? ggml_graph_node(gf, -1) : nullptr;
+            allocated = ggml_backend_sched_alloc_graph(ctx->sched.get(), gf);
+            ctx->flash_attn_type = saved; // restore AUTO for subsequent images
         }
-        LOG_ERR("%s: failed to allocate compute graph\n", __func__);
-        return false;
+        if (!allocated) {
+            if (ctx->proj_type() == PROJECTOR_TYPE_QWEN3VL && n_batch_cur > 1 && !imgs.is_video) {
+                // Still failing (or FA unavailable) — fall back to sequential.
+                LOG_WRN("%s: graph alloc failed (OOM), retrying with sequential encoding\n", __func__);
+                return do_encode_sequential();
+            }
+            LOG_ERR("%s: ggml_backend_sched_alloc_graph failed\n", __func__);
+            return false;
+        }
     }
 
     // set inputs

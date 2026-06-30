@@ -139,6 +139,11 @@ if (Vulkan_FOUND)
     )
 
     target_link_libraries(ggml-vulkan PRIVATE Vulkan::Vulkan)
+    if (TARGET SPIRV-Headers::SPIRV-Headers)
+        # Provides <spirv/unified1/spirv.hpp> on platforms (e.g. Android NDK)
+        # whose Vulkan package does not bundle the SPIRV headers.
+        target_link_libraries(ggml-vulkan PRIVATE SPIRV-Headers::SPIRV-Headers)
+    endif()
     target_include_directories(ggml-vulkan
         PRIVATE
             ${CMAKE_CURRENT_BINARY_DIR}

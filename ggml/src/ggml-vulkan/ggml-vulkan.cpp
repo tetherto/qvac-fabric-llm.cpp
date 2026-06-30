@@ -1307,6 +1307,60 @@ static vk_fa_tuning_params get_fa_tuning_params_scalar(const vk_device& device, 
         }
     }
 
+    // ---- qvac: Arm Mali scalar flash-attn tuning ----
+    // The scalar path is the only FA path on GPUs without cooperative-matrix
+    // (e.g. Arm Mali), and the generic config (D_split=8, Br=8) is not tuned for
+    // Mali's subgroup size of 16. An on-device sweep (Pixel 9 Pro, Mali-G715,
+    // Gemma 4 E2B vision encoder, head_dim 64) found D_split=4 + Br=4 fastest:
+    // clean encode -6% at 196 tokens, -11% at 784. D_split=2 and larger tiles
+    // regress sharply, so this is gated tightly to the measured shape (head
+    // size <= 64, multi-row attention; the n_rows==1 decode path is untouched).
+    if (device->vendor_id == VK_VENDOR_ID_ARM && n_rows > 1 && hsk <= 64 && hsv <= 64) {
+        result.d_split    = std::min(result.d_split, 4u);
+        result.block_rows = std::min(result.block_rows, 4u);
+    }
+
+    // ---- qvac: scalar flash-attn tuning overrides (build-once, sweep-many) ----
+    // These env vars let us sweep configs on-device without recompiling and take
+    // precedence over the Mali defaults above. An override that would overflow
+    // shared memory is rejected and the computed (safe) defaults are kept.
+    {
+        auto env_u32 = [](const char * name, uint32_t & out) -> bool {
+            const char * v = std::getenv(name);
+            if (!v || !v[0]) {
+                return false;
+            }
+            out = (uint32_t) std::strtoul(v, nullptr, 10);
+            return true;
+        };
+
+        const vk_fa_tuning_params before = result;
+        bool overridden = false;
+        uint32_t tmp = 0;
+        if (env_u32("GGML_VK_FA_BR",        tmp)) { result.block_rows       = tmp;       overridden = true; }
+        if (env_u32("GGML_VK_FA_BC",        tmp)) { result.block_cols       = tmp;       overridden = true; }
+        if (env_u32("GGML_VK_FA_WG",        tmp)) { result.workgroup_size   = tmp;       overridden = true; }
+        if (env_u32("GGML_VK_FA_SGS",       tmp)) { result.subgroup_size    = tmp;       overridden = true; }
+        if (env_u32("GGML_VK_FA_DSPLIT",    tmp)) { result.d_split          = tmp;       overridden = true; }
+        if (env_u32("GGML_VK_FA_RSPLIT",    tmp)) { result.row_split        = tmp;       overridden = true; }
+        if (env_u32("GGML_VK_FA_STAGING",   tmp)) { result.shmem_staging    = tmp != 0;  overridden = true; }
+        if (env_u32("GGML_VK_FA_NOSUBGROUP",tmp)) { result.disable_subgroups= tmp != 0;  overridden = true; }
+
+        if (overridden && !ggml_vk_flash_attn_scalar_shmem_support(device, result, hsk, hsv, f32acc, k_type, v_type)) {
+            fprintf(stderr, "[FA-OVERRIDE] rejected (shmem overflow), keeping defaults: ");
+            result.print();
+            result = before;
+        }
+
+        static bool logged = false;
+        if (std::getenv("GGML_VK_FA_DEBUG") && n_rows != 512 && !logged) {
+            logged = true;
+            fprintf(stderr, "[FA-TUNE] hsk=%u hsv=%u n_rows=%u n_kv=%u k_type=%d f32acc=%d -> ",
+                    hsk, hsv, n_rows, n_kv, (int) k_type, (int) f32acc);
+            result.print();
+        }
+    }
+
     return result;
 }
 
@@ -9327,7 +9381,27 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
     uint32_t workgroups_y = (uint32_t)neq2;
     uint32_t workgroups_z = (uint32_t)neq3;
 
-    const bool f32acc = !ctx->device->fp16 || !ggml_vk_prec_allows_f16acc(ggml_prec_get_acc(dst)) || k->type == GGML_TYPE_BF16;
+    bool f32acc = !ctx->device->fp16 || !ggml_vk_prec_allows_f16acc(ggml_prec_get_acc(dst)) || k->type == GGML_TYPE_BF16;
+
+    // qvac: allow forcing f16 accumulation for FA tuning experiments. Halves
+    // accumulator register/bandwidth pressure (often a Mali win) at the cost of
+    // precision; gated by env so it can be A/B'd against the accuracy check.
+    if (const char * e = std::getenv("GGML_VK_FA_F16ACC")) {
+        if (e[0] == '1' && ctx->device->fp16) {
+            f32acc = false;
+        }
+    }
+
+    {
+        static bool caps_logged = false;
+        if (std::getenv("GGML_VK_FA_DEBUG") && !caps_logged) {
+            caps_logged = true;
+            fprintf(stderr, "[FA-CAPS] vendor=0x%x arch=%d fp16=%d subgroup_size=%u maxSharedMem=%u f32acc=%d\n",
+                    ctx->device->vendor_id, (int) ctx->device->architecture, (int) ctx->device->fp16,
+                    ctx->device->subgroup_size,
+                    ctx->device->properties.limits.maxComputeSharedMemorySize, (int) f32acc);
+        }
+    }
 
     // dequant K/V once into an f16 scratch, reordered KV layout so FA can read without a stride
     auto is_dense_kv_cache = [](const ggml_tensor * t) {

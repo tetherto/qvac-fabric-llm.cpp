@@ -26,6 +26,7 @@
 #include <cstring>
 #include <climits>
 #include <map>
+#include <string>
 #include <type_traits>
 #include <vector>
 
@@ -3321,7 +3322,12 @@ struct mtmd_caps mtmd_get_cap_from_file(const char * fname) {
 //
 
 static void mtmd_debug_encode_impl(mtmd_context * ctx, clip_ctx * ctx_clip, clip_image_f32 & image) {
-    clip_set_debug_output_embeddings(ctx_clip, true);
+    // Dumping the final embeddings (and the per-op cb_eval in mtmd-debug) makes the
+    // measured wall-clock dominated by formatting/printing rather than the encoder.
+    // For a clean Vulkan encoder baseline keep dumps off by default; opt in via env.
+    const char * dump_env = std::getenv("MTMD_DEBUG_DUMP_EMBEDDINGS");
+    clip_set_debug_output_embeddings(ctx_clip, dump_env && dump_env[0] == '1');
+
     int n_mmproj_embd = clip_n_mmproj_embd(ctx_clip);
     int n_tokens = clip_n_output_tokens(ctx_clip, &image);
     std::vector<float> embd_output(n_tokens * n_mmproj_embd, 0.0f);
