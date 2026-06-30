@@ -4626,20 +4626,21 @@ struct clip_model_loader {
         // Without coopmat, Vulkan uses FA_SCALAR which is ~2.6x slower than the matmul path
         // for CLIP encoder attention (Mali-G715: 38 vs ~100 GFLOPS/s). Coopmat-capable GPUs
         // keep FA enabled. Resolved at runtime via proc_address — no compile-time backend dep.
-        // Only acts on AUTO; an explicit user choice (ENABLED/DISABLED) is respected.
-        if (ctx_clip.flash_attn_type == CLIP_FLASH_ATTN_TYPE_AUTO &&
+        // Acts on AUTO *and* ENABLED (the addon enables FA by default) — an inefficient
+        // scalar-FA GPU should never be forced into FA; only explicit DISABLED is left alone.
+        // Default when the backend can't confirm efficient FA = DISABLE (the safe original
+        // behaviour): efficient FA only exists on coopmat GPUs, which DO answer the query.
+        if (ctx_clip.flash_attn_type != CLIP_FLASH_ATTN_TYPE_DISABLED &&
             ctx_clip.backend && ctx_clip.backend != ctx_clip.backend_cpu) {
-            bool efficient_fa = true;
+            bool efficient_fa = false;
             ggml_backend_dev_t dev = ggml_backend_get_device(ctx_clip.backend);
-            if (dev) {
-                ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
-                if (reg) {
-                    typedef bool (*supports_efficient_fa_t)(ggml_backend_t);
-                    auto fn = (supports_efficient_fa_t)ggml_backend_reg_get_proc_address(
-                        reg, "ggml_backend_supports_efficient_fa");
-                    if (fn) {
-                        efficient_fa = fn(ctx_clip.backend);
-                    }
+            ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+            if (reg) {
+                typedef bool (*supports_efficient_fa_t)(ggml_backend_t);
+                auto fn = (supports_efficient_fa_t)ggml_backend_reg_get_proc_address(
+                    reg, "ggml_backend_supports_efficient_fa");
+                if (fn) {
+                    efficient_fa = fn(ctx_clip.backend);
                 }
             }
             if (!efficient_fa) {

@@ -18341,6 +18341,13 @@ static ggml_backend_dev_t ggml_backend_vk_reg_get_device(ggml_backend_reg_t reg,
 
 static bool ggml_backend_vk_supports_efficient_fa(ggml_backend_t backend) {
     ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
+    // ARM/Mali (Valhall) advertises VK_KHR_cooperative_matrix (so coopmat1_fa_support
+    // is true), but its flash-attention still runs the slow path (~40 GFLOPS/s vs the
+    // ~100 GFLOPS/s matmul path; QVAC-21257 profiling). Coopmat-present != efficient FA
+    // here — treat Mali as having no efficient FA so the CLIP projector disables it.
+    if (ctx->device->vendor_id == VK_VENDOR_ID_ARM) {
+        return false;
+    }
     return ctx->device->coopmat2 || ctx->device->coopmat1_fa_support;
 }
 
