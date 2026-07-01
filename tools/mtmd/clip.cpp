@@ -4628,11 +4628,14 @@ struct clip_model_loader {
         // keep FA enabled. Resolved at runtime via proc_address — no compile-time backend dep.
         // Acts on AUTO *and* ENABLED (the addon enables FA by default) — an inefficient
         // scalar-FA GPU should never be forced into FA; only explicit DISABLED is left alone.
-        // Default when the backend can't confirm efficient FA = DISABLE (the safe original
-        // behaviour): efficient FA only exists on coopmat GPUs, which DO answer the query.
+        // Default when the backend can't confirm efficient FA = KEEP it. Only ggml-vulkan
+        // implements the query (returning false for Mali/non-coopmat); backends that don't
+        // answer (Metal, CUDA, …) have efficient FA and must keep it — disabling there forces
+        // explicit attention whose QK^T overflows the clip compute buffer at high n_pos
+        // (GGML_ASSERT in ggml-backend, e.g. image_tile_mode=disabled + large image_max_tokens).
         if (ctx_clip.flash_attn_type != CLIP_FLASH_ATTN_TYPE_DISABLED &&
             ctx_clip.backend && ctx_clip.backend != ctx_clip.backend_cpu) {
-            bool efficient_fa = false;
+            bool efficient_fa = true;
             ggml_backend_dev_t dev = ggml_backend_get_device(ctx_clip.backend);
             ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
             if (reg) {
