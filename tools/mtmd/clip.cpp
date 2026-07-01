@@ -174,6 +174,13 @@ struct clip_ctx {
     bool flash_attn_supported = true;
     bool is_allocated = false;
 
+    // Inputs to the AUTO flash-attn budget decision, resolved once (getenv +
+    // Mali detection + device-memory query) and cached, since none of them
+    // change between images. Populated lazily on the first AUTO resolve.
+    bool   fa_budget_cached = false;
+    int    fa_auto_min_kv   = 0;   // explicit-attention cutoff (n_patches); <=0 disables it
+    size_t fa_mem_capacity  = 0;   // device memory used to cap the cutoff (0 = unknown)
+
     bool debug_output_embeddings = false;
     clip_image_tile_mode tile_mode = CLIP_IMAGE_TILE_MODE_BATCHED;
 
@@ -328,23 +335,39 @@ static const int CLIP_AUTO_FA_MIN_KV_MALI_DEFAULT = 4096;
 // the explicit path below that attention length (n_patches) and flash-attention
 // at/above it. Unset (the default) preserves the legacy behavior: use
 // flash-attention whenever the backend supports it.
-static clip_flash_attn_type clip_resolve_flash_attn_type(const clip_ctx * ctx, int n_patches) {
+static clip_flash_attn_type clip_resolve_flash_attn_type(clip_ctx * ctx, int n_patches) {
     if (ctx->flash_attn_type != CLIP_FLASH_ATTN_TYPE_AUTO) {
         return ctx->flash_attn_type;
     }
     if (!ctx->flash_attn_supported) {
         return CLIP_FLASH_ATTN_TYPE_DISABLED;
     }
-    // Explicit-attention cutoff. The env var overrides on any backend (set to 0
-    // to disable); otherwise it defaults on for Mali (where explicit is faster)
-    // and off everywhere else (where flash-attention is already better).
-    int auto_fa_min_kv;
-    const char * env_min_kv = std::getenv("MTMD_CLIP_AUTO_FA_MIN_KV");
-    if (env_min_kv && env_min_kv[0]) {
-        auto_fa_min_kv = atoi(env_min_kv);
-    } else {
-        auto_fa_min_kv = clip_backend_is_mali(ctx) ? CLIP_AUTO_FA_MIN_KV_MALI_DEFAULT : 0;
+    // Resolve the budget inputs once and cache them: getenv, Mali detection and
+    // the device-memory query don't change between images, so they must not run
+    // on the per-image hot path.
+    if (!ctx->fa_budget_cached) {
+        // Explicit-attention cutoff. The env var overrides on any backend (set
+        // to 0 to disable); otherwise it defaults on for Mali (where explicit is
+        // faster) and off everywhere else (where flash-attention is better).
+        const char * env_min_kv = std::getenv("MTMD_CLIP_AUTO_FA_MIN_KV");
+        if (env_min_kv && env_min_kv[0]) {
+            ctx->fa_auto_min_kv = (int) std::strtol(env_min_kv, nullptr, 10);
+        } else {
+            ctx->fa_auto_min_kv = clip_backend_is_mali(ctx) ? CLIP_AUTO_FA_MIN_KV_MALI_DEFAULT : 0;
+        }
+        size_t free_mem = 0, total_mem = 0;
+        ggml_backend_dev_t dev = ctx->backend ? ggml_backend_get_device(ctx->backend) : nullptr;
+        if (dev) {
+            ggml_backend_dev_memory(dev, &free_mem, &total_mem);
+        }
+        // Prefer free memory when the backend reports it; many mobile drivers
+        // report 0, so fall back to total. If neither is known, rely on the
+        // threshold alone.
+        ctx->fa_mem_capacity = free_mem > 0 ? free_mem : total_mem;
+        ctx->fa_budget_cached = true;
     }
+
+    const int auto_fa_min_kv = ctx->fa_auto_min_kv;
 
     // Cutoff disabled => legacy behavior: flash-attention whenever supported.
     if (auto_fa_min_kv <= 0) {
@@ -360,14 +383,7 @@ static clip_flash_attn_type clip_resolve_flash_attn_type(const clip_ctx * ctx, i
     // temporaries, ~3x) fits in ~half of device memory. This only ever lowers
     // the cutoff, so low-memory devices fall back to memory-frugal FA sooner.
     int eff_min_kv = auto_fa_min_kv;
-    size_t free_mem = 0, total_mem = 0;
-    ggml_backend_dev_t dev = ctx->backend ? ggml_backend_get_device(ctx->backend) : nullptr;
-    if (dev) {
-        ggml_backend_dev_memory(dev, &free_mem, &total_mem);
-    }
-    // Prefer free memory when the backend reports it; many mobile drivers report
-    // 0, so fall back to total. If neither is known, rely on the threshold alone.
-    const size_t capacity = free_mem > 0 ? free_mem : total_mem;
+    const size_t capacity = ctx->fa_mem_capacity;
     if (capacity > 0) {
         const size_t n_head = (size_t) ctx->model.hparams.n_head;
         // 3 * n^2 * n_head * 4 bytes <= capacity / 2  =>  n <= sqrt(capacity / (24*n_head))
@@ -5028,22 +5044,34 @@ int clip_n_output_tokens(const clip_ctx * ctx, const clip_image_f32 * img) {
         case PROJECTOR_TYPE_GEMMA3:
         case PROJECTOR_TYPE_GEMMA4V:
         case PROJECTOR_TYPE_GEMMA4UV:
-        case PROJECTOR_TYPE_IDEFICS3:
-        case PROJECTOR_TYPE_COHERE2V:
         case PROJECTOR_TYPE_INTERNVL:
-        case PROJECTOR_TYPE_NEMOTRON_V2_VL:
-        case PROJECTOR_TYPE_NEMOTRON_OMNI:
         case PROJECTOR_TYPE_LLAMA4:
             {
-                // both X and Y are downscaled by the scale factor; round per
-                // dimension to match the encoder's 2D pooling, i.e.
-                // floor(W/p/s) * floor(H/p/s). This differs from
-                // floor(W/p * H/p / s^2) when a side is not divisible by s,
-                // which would otherwise mismatch the actual graph output and
+                // These pool/reshape per dimension (ggml_pool_2d with pad 0, or a
+                // reshape that requires divisibility), so the graph emits
+                // floor(W/p/s) * floor(H/p/s). Round per dimension to match; this
+                // differs from floor(W/p * H/p / s^2) when a side is not divisible
+                // by s, which would otherwise mismatch the actual graph output and
                 // trip the token-count sanity check in clip_image_batch_encode.
                 int scale_factor = ctx->model.hparams.n_merge;
                 int x_patch = (img->nx() / patch_size) / scale_factor;
                 int y_patch = (img->ny() / patch_size) / scale_factor;
+                n_patches = x_patch * y_patch;
+            } break;
+        case PROJECTOR_TYPE_IDEFICS3:
+        case PROJECTOR_TYPE_COHERE2V:
+        case PROJECTOR_TYPE_NEMOTRON_V2_VL:
+        case PROJECTOR_TYPE_NEMOTRON_OMNI:
+            {
+                // These merge via build_patch_merge_permute(), which pads each
+                // dimension up to a multiple of the scale factor (CLIP_ALIGN)
+                // before the merge, so the graph emits
+                // ceil(W/p/s) * ceil(H/p/s). Match that rounding (mirrors the
+                // LFM2/KIMIVL and PaddleOCR merge cases below); floor would
+                // under-count on non-divisible grids and trip the sanity check.
+                int scale_factor = ctx->model.hparams.n_merge;
+                int x_patch = CLIP_ALIGN(img->nx() / patch_size, scale_factor) / scale_factor;
+                int y_patch = CLIP_ALIGN(img->ny() / patch_size, scale_factor) / scale_factor;
                 n_patches = x_patch * y_patch;
             } break;
         case PROJECTOR_TYPE_GEMMA3NV:
@@ -5544,9 +5572,20 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
         }
         if (!allocated) {
             if (ctx->proj_type() == PROJECTOR_TYPE_QWEN3VL && n_batch_cur > 1 && !imgs.is_video) {
-                // Still failing (or FA unavailable) — fall back to sequential.
+                // Still failing (or FA unavailable) — fall back to sequential. We
+                // already know the batched explicit path OOMs here, so force
+                // flash-attention (the memory-frugal path) for the whole sequential
+                // run when it's supported; otherwise each tile would re-resolve to
+                // explicit, re-OOM and rebuild (up to N x2 allocations). Restore the
+                // prior mode afterwards for subsequent images.
                 LOG_WRN("%s: graph alloc failed (OOM), retrying with sequential encoding\n", __func__);
-                return do_encode_sequential();
+                const clip_flash_attn_type saved = ctx->flash_attn_type;
+                if (ctx->flash_attn_supported) {
+                    ctx->flash_attn_type = CLIP_FLASH_ATTN_TYPE_ENABLED;
+                }
+                const bool ok = do_encode_sequential();
+                ctx->flash_attn_type = saved;
+                return ok;
             }
             LOG_ERR("%s: ggml_backend_sched_alloc_graph failed\n", __func__);
             return false;

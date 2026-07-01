@@ -1325,24 +1325,38 @@ static vk_fa_tuning_params get_fa_tuning_params_scalar(const vk_device& device, 
     // precedence over the Mali defaults above. An override that would overflow
     // shared memory is rejected and the computed (safe) defaults are kept.
     {
+        // Parse an env var into a uint32. Rejects empty, non-numeric, and
+        // out-of-range values (strtoul saturates to ULONG_MAX on overflow and
+        // sets errno; a value > UINT32_MAX would also truncate) so a bad env
+        // can never silently corrupt a tuning param.
         auto env_u32 = [](const char * name, uint32_t & out) -> bool {
             const char * v = std::getenv(name);
             if (!v || !v[0]) {
                 return false;
             }
-            out = (uint32_t) std::strtoul(v, nullptr, 10);
+            errno = 0;
+            char * end = nullptr;
+            unsigned long ul = std::strtoul(v, &end, 10);
+            if (end == v || *end != '\0' || errno == ERANGE || ul > UINT32_MAX) {
+                fprintf(stderr, "[FA-OVERRIDE] ignoring invalid %s=%s\n", name, v);
+                return false;
+            }
+            out = (uint32_t) ul;
             return true;
         };
 
         const vk_fa_tuning_params before = result;
         bool overridden = false;
         uint32_t tmp = 0;
-        if (env_u32("GGML_VK_FA_BR",        tmp)) { result.block_rows       = tmp;       overridden = true; }
-        if (env_u32("GGML_VK_FA_BC",        tmp)) { result.block_cols       = tmp;       overridden = true; }
-        if (env_u32("GGML_VK_FA_WG",        tmp)) { result.workgroup_size   = tmp;       overridden = true; }
-        if (env_u32("GGML_VK_FA_SGS",       tmp)) { result.subgroup_size    = tmp;       overridden = true; }
-        if (env_u32("GGML_VK_FA_DSPLIT",    tmp)) { result.d_split          = tmp;       overridden = true; }
-        if (env_u32("GGML_VK_FA_RSPLIT",    tmp)) { result.row_split        = tmp;       overridden = true; }
+        // Tile/split dimensions must be > 0: they become divisors (CEIL_DIV) and
+        // Vulkan workgroup sizes at dispatch, so a 0 would be a div-by-zero /
+        // invalid dispatch. STAGING / NOSUBGROUP are booleans, so 0 is valid.
+        if (env_u32("GGML_VK_FA_BR",        tmp) && tmp > 0) { result.block_rows       = tmp;       overridden = true; }
+        if (env_u32("GGML_VK_FA_BC",        tmp) && tmp > 0) { result.block_cols       = tmp;       overridden = true; }
+        if (env_u32("GGML_VK_FA_WG",        tmp) && tmp > 0) { result.workgroup_size   = tmp;       overridden = true; }
+        if (env_u32("GGML_VK_FA_SGS",       tmp) && tmp > 0) { result.subgroup_size    = tmp;       overridden = true; }
+        if (env_u32("GGML_VK_FA_DSPLIT",    tmp) && tmp > 0) { result.d_split          = tmp;       overridden = true; }
+        if (env_u32("GGML_VK_FA_RSPLIT",    tmp) && tmp > 0) { result.row_split        = tmp;       overridden = true; }
         if (env_u32("GGML_VK_FA_STAGING",   tmp)) { result.shmem_staging    = tmp != 0;  overridden = true; }
         if (env_u32("GGML_VK_FA_NOSUBGROUP",tmp)) { result.disable_subgroups= tmp != 0;  overridden = true; }
 
