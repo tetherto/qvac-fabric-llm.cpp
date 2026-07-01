@@ -967,6 +967,7 @@ struct mtmd_model {
     // weights
     ggml_context_ptr        ctx_data;
     ggml_backend_buffer_ptr buf;
+    ggml_backend_buffer_ptr buf_repack; // CPU repack buffer for quantized weights
     std::map<ggml_backend_dev_t, size_t> mem_weights;
 
     // embeddings
