@@ -163,6 +163,7 @@ struct clip_ctx {
     ggml_backend_t backend = nullptr;
     ggml_backend_t backend_cpu = nullptr;
     ggml_backend_buffer_ptr buf;
+    ggml_backend_buffer_ptr buf_repack; // CPU repack buffer for quantized weights
 
 
     int max_nodes = 8192;
@@ -4397,6 +4398,71 @@ struct clip_model_loader {
 
             // alloc memory and offload data
             ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(ctx_clip.backend);
+            // On CPU, place quantized 2D weight matrices in the ggml "repack"
+            // extra buffer type (aarch64 i8mm interleaved layout, x86 AVX2, ...)
+            // so their mul_mat uses the much faster repacked GEMM. Only tensors
+            // the backend can actually repack+matmul go there (probed per-tensor);
+            // non-quant conv weights / biases / norms stay in the default buffer,
+            // else their non-matmul ops would become unsupported. On arches with
+            // no repack kernel the probe rejects everything and this is a no-op.
+            // Opt out with MTMD_CLIP_NO_REPACK=1.
+            if (ctx_clip.backend == ctx_clip.backend_cpu && !getenv("MTMD_CLIP_NO_REPACK")) {
+                ggml_backend_dev_t cpu_dev = ggml_backend_get_device(ctx_clip.backend_cpu);
+                ggml_backend_buffer_type_t repack_buft = nullptr;
+                if (cpu_dev) {
+                    ggml_backend_reg_t cpu_reg = ggml_backend_dev_backend_reg(cpu_dev);
+                    auto get_extra_bufts_fn = (ggml_backend_dev_get_extra_bufts_t)
+                        ggml_backend_reg_get_proc_address(cpu_reg, "ggml_backend_dev_get_extra_bufts");
+                    if (get_extra_bufts_fn) {
+                        ggml_backend_buffer_type_t * extra = get_extra_bufts_fn(cpu_dev);
+                        if (extra && extra[0]) repack_buft = extra[0];
+                    }
+                }
+                if (repack_buft) {
+                    // A weight goes to the repack buffer only if THIS arch can
+                    // actually repack it AND run its mul_mat there (probe like
+                    // llama's buft_supported). This is arch-correct: on x86 q8_0
+                    // isn't repackable so the probe fails and weights stay default;
+                    // on ARM (NEON+i8mm) it passes.
+                    ggml_backend_dev_t probe_dev = ggml_backend_get_device(ctx_clip.backend_cpu);
+                    ggml_backend_buffer_t probe_buf = ggml_backend_buft_alloc_buffer(repack_buft, 0);
+                    auto repack_ok = [&](const ggml_tensor * w) -> bool {
+                        if (ggml_n_dims(w) != 2) return false;
+                        ggml_init_params p = { ggml_tensor_overhead() * 4 + 256, nullptr, true };
+                        ggml_context * mctx = ggml_init(p);
+                        if (!mctx) return false;
+                        ggml_tensor * w2 = ggml_new_tensor_2d(mctx, w->type, w->ne[0], w->ne[1]);
+                        ggml_tensor * s1 = ggml_new_tensor_2d(mctx, GGML_TYPE_F32, w->ne[0], 8);
+                        ggml_tensor * op = ggml_mul_mat(mctx, w2, s1);
+                        w2->buffer = probe_buf; // pretend the weight lives in the repack buffer
+                        bool ok = ggml_backend_dev_supports_op(probe_dev, op);
+                        ggml_free(mctx);
+                        return ok;
+                    };
+                    // collect repackable weights
+                    std::vector<ggml_tensor *> repack_tensors;
+                    const size_t align = ggml_backend_buft_get_alignment(repack_buft);
+                    size_t repack_size = 0;
+                    for (ggml_tensor * t = ggml_get_first_tensor(ctx_clip.ctx_data.get());
+                         t != nullptr; t = ggml_get_next_tensor(ctx_clip.ctx_data.get(), t)) {
+                        if (repack_ok(t)) {
+                            repack_tensors.push_back(t);
+                            repack_size += GGML_PAD(ggml_backend_buft_get_alloc_size(repack_buft, t), align);
+                        }
+                    }
+                    if (probe_buf) ggml_backend_buffer_free(probe_buf);
+                    if (!repack_tensors.empty()) {
+                        ctx_clip.buf_repack.reset(ggml_backend_buft_alloc_buffer(repack_buft, repack_size));
+                        ggml_backend_buffer_set_usage(ctx_clip.buf_repack.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+                        ggml_tallocr talloc = ggml_tallocr_new(ctx_clip.buf_repack.get());
+                        for (ggml_tensor * t : repack_tensors) ggml_tallocr_alloc(&talloc, t);
+                        LOG_INF("%s: repacked %zu quantized weights into %s (%.1f MiB)\n",
+                                __func__, repack_tensors.size(), ggml_backend_buft_name(repack_buft),
+                                repack_size / 1024.0 / 1024.0);
+                    }
+                }
+            }
+            // allocate everything not already placed (i.e. the non-repack tensors)
             ctx_clip.buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(ctx_clip.ctx_data.get(), buft));
             ggml_backend_buffer_set_usage(ctx_clip.buf.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
             // read the weight from file
@@ -4430,7 +4496,9 @@ struct clip_model_loader {
                                               conv_f32.data(), n);
                         ggml_fp32_to_fp16_row(conv_f32.data(), conv_f16.data(), n);
                         const size_t dst_bytes = ggml_nbytes(cur); // f16 layout
-                        if (ggml_backend_buft_is_host(buft)) {
+                        // check the tensor's OWN buffer (weights may be split
+                        // across the default host buffer and the non-host repack buffer)
+                        if (ggml_backend_buft_is_host(ggml_backend_buffer_get_type(cur->buffer))) {
                             memcpy(cur->data, conv_f16.data(), dst_bytes);
                         } else {
                             ggml_backend_tensor_set(cur, conv_f16.data(), 0, dst_bytes);
@@ -4445,7 +4513,9 @@ struct clip_model_loader {
                         continue;
                     }
                     size_t num_bytes = ggml_nbytes(cur);
-                    if (ggml_backend_buft_is_host(buft)) {
+                    // check the tensor's OWN buffer (weights may be split
+                    // across the default host buffer and the non-host repack buffer)
+                    if (ggml_backend_buft_is_host(ggml_backend_buffer_get_type(cur->buffer))) {
                         // for the CPU and Metal backend, we can read directly into the tensor
                         fin.read(reinterpret_cast<char *>(cur->data), num_bytes);
                     } else {
