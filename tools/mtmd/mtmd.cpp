@@ -614,6 +614,7 @@ mtmd_context_params mtmd_context_params_default() {
         /* progress_callback_user_data */ nullptr,
         /* backend_device    */ nullptr,
         /* image_tile_mode   */ 1, // 0=batched, 1=sequential (default, matches common_params), 2=disabled
+        /* image_max_tiles   */ -1,
     };
     return params;
 }
@@ -733,6 +734,7 @@ struct mtmd_context {
         model_params.image_min_tokens            = ctx_params.image_min_tokens;
         model_params.image_max_tokens            = ctx_params.image_max_tokens;
         model_params.image_tile_mode             = ctx_params.image_tile_mode;
+        model_params.image_max_tiles             = ctx_params.image_max_tiles;
         model_params.no_alloc                    = no_alloc;
         model_params.progress_callback           = ctx_params.progress_callback;
         model_params.progress_callback_user_data = ctx_params.progress_callback_user_data;

@@ -678,8 +678,34 @@ struct mtmd_model_loader {
                             throw std::runtime_error(mtmd_format("%s: spatial_merge_size (%d) must be 2\n", __func__, hparams.n_merge));
                         }
                         get_u32(KEY_WIN_ATTN_PATTERN, hparams.n_wa_pattern, model.proj_type == PROJECTOR_TYPE_QWEN25VL); // only 2.5 requires it
-                        // optional multi-tile cap; absent in GGUF means it stays 0 and the qwen3vl preprocessor falls back to 4
+                        // SigLIP2-Large ViT (n_head=16, n_layer=24) is used for 2B/4B — max_tiles=4 confirmed.
+                        // Larger ViT variants (8B+) use SigLIP2-SO-400M with unknown max_tiles.
+                        // Read from GGUF if present; otherwise default to 4 and warn for unknown ViTs.
+                        hparams.preproc_max_tiles = 4;
+                        const bool has_max_tiles_key = gguf_find_key(ctx_gguf.get(), KEY_PREPROC_MAX_TILES) >= 0;
                         get_u32(KEY_PREPROC_MAX_TILES, hparams.preproc_max_tiles, false);
+                        if (has_max_tiles_key && (hparams.preproc_max_tiles < 1 || hparams.preproc_max_tiles > MTMD_PREPROC_MAX_TILES_LIMIT)) {
+                            LOG_WRN("%s: clip.vision.preproc_max_tiles=%d out of range [1,%d] in GGUF — defaulting to 4\n",
+                                    __func__, hparams.preproc_max_tiles, MTMD_PREPROC_MAX_TILES_LIMIT);
+                            hparams.preproc_max_tiles = 4;
+                        }
+                        if (!has_max_tiles_key && (hparams.n_head > 16 || hparams.n_layer > 24)) {
+                            const char * model_name =
+                                model.proj_type == PROJECTOR_TYPE_QWEN2VL  ? "Qwen2VL"  :
+                                model.proj_type == PROJECTOR_TYPE_QWEN25VL ? "Qwen2.5VL" : "Qwen3VL";
+                            // preproc_max_tiles is only read by the Qwen3VL preprocessor; Qwen2/2.5VL
+                            // use dyn_size, so --image-max-tiles is inert there and must not be suggested.
+                            if (model.proj_type == PROJECTOR_TYPE_QWEN3VL) {
+                                LOG_WRN("%s: %s large ViT detected (n_head=%d, n_layer=%d) but "
+                                        "clip.vision.preproc_max_tiles not in GGUF — defaulting to 4. "
+                                        "If using an 8B+ model, set the correct value with --image-max-tiles.\n",
+                                        __func__, model_name, hparams.n_head, hparams.n_layer);
+                            } else {
+                                LOG_WRN("%s: %s large ViT detected (n_head=%d, n_layer=%d) but "
+                                        "clip.vision.preproc_max_tiles not in GGUF — defaulting to 4.\n",
+                                        __func__, model_name, hparams.n_head, hparams.n_layer);
+                            }
+                        }
                         // ref: https://huggingface.co/Qwen/Qwen2.5-VL-7B-Instruct/blob/main/preprocessor_config.json
                         hparams.set_limit_image_tokens(8, 4096);
                         // optional limits of the model, the custom values take precedence
@@ -4127,12 +4153,41 @@ mtmd_models mtmd_model_load(const char * fname, const mtmd_model_params & params
                    params.image_tile_mode);
     }
 
+    const char * func_name = __func__; // __func__ inside the lambda would read "operator()"
+
     auto load = [&](mtmd_modality modality) {
         auto model = std::make_unique<mtmd_model>();
         model->hparams.custom_image_min_tokens = params.image_min_tokens;
         model->hparams.custom_image_max_tokens = params.image_max_tokens;
         model->hparams.image_tile_mode         = static_cast<mtmd_image_tile_mode>(params.image_tile_mode);
         loader.load_hparams(*model, modality);
+        // apply CLI/binding overrides after load_hparams so GGUF defaults don't clobber them.
+        // Only the Qwen3VL preprocessor reads preproc_max_tiles live; Qwen2/2.5VL use dyn_size
+        // and InternVL uses a candidate list already frozen in load_hparams, so the override is
+        // inert for them — apply (and validate) it only where it takes effect.
+        //
+        // Treat only a POSITIVE value as an explicit override. -1 is the documented unset
+        // sentinel, and 0 is what a zero-initialized mtmd_model_params / mtmd_context_params
+        // passes (bindings / direct C API callers that never set the field). Both are treated
+        // as unset here so those callers keep the GGUF/model default instead of silently
+        // forcing single-tile and losing multi-tile preprocessing on large/high-res images.
+        if (modality == MTMD_MODALITY_VISION && params.image_max_tiles > 0) {
+            if (model->proj_type != PROJECTOR_TYPE_QWEN3VL) {
+                LOG_WRN("%s: --image-max-tiles is only supported for Qwen3VL; ignoring for this model\n", func_name);
+            } else {
+                int max_tiles = params.image_max_tiles;
+                // Re-validate at this library boundary: bindings populate mtmd_context_params
+                // directly and bypass the CLI's [1,256] check. An unbounded value reaches the
+                // grid-fitting reserve in mtmd-image.cpp and can OOM the process.
+                if (max_tiles > MTMD_PREPROC_MAX_TILES_LIMIT) {
+                    LOG_WRN("%s: --image-max-tiles=%d exceeds [1,%d]; clamping\n",
+                            func_name, max_tiles, MTMD_PREPROC_MAX_TILES_LIMIT);
+                    max_tiles = MTMD_PREPROC_MAX_TILES_LIMIT;
+                }
+                model->hparams.preproc_max_tiles = max_tiles;
+                LOG_INF("%s: preproc_max_tiles: %d (custom value)\n", func_name, max_tiles);
+            }
+        }
         loader.load_tensors(*model, buft, params.no_alloc, params.convert_bf16_to_f16);
         const std::string & def = model->hparams.gen_default_voice;
         if (!def.empty() && model->gen_voices.find(def) == model->gen_voices.end()) {

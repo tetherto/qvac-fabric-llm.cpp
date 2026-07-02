@@ -18,9 +18,16 @@ enum mtmd_modality {
     MTMD_MODALITY_GEN_AUDIO,
 };
 
+// WARNING: value 0 is BATCHED, which is NOT the default mode (sequential is).
+// A zero-initialized mtmd_model_params/mtmd_context_params (`{}`, memset, calloc)
+// therefore selects BATCHED — the one-forward-pass path whose ne[3] batching is not
+// yet verified on every backend (see the NOTE in models/qwen3vl.cpp). Do not rely on
+// zero-init for the default: initialize via mtmd_context_params_default() (sets
+// sequential) or set image_tile_mode explicitly. These values are part of the shipped
+// API (string "0"/"1"/"2" in consumers), so they are intentionally not renumbered.
 enum mtmd_image_tile_mode {
-    MTMD_IMAGE_TILE_MODE_BATCHED    = 0,
-    MTMD_IMAGE_TILE_MODE_SEQUENTIAL = 1,
+    MTMD_IMAGE_TILE_MODE_BATCHED    = 0, // NOT the default; zero-init lands here — see warning above
+    MTMD_IMAGE_TILE_MODE_SEQUENTIAL = 1, // the default (via mtmd_context_params_default)
     MTMD_IMAGE_TILE_MODE_DISABLED   = 2,
 };
 
@@ -252,7 +259,7 @@ struct mtmd_hparams {
     // custom value provided by user, can be undefined if not set
     int32_t custom_image_min_tokens = -1;
     int32_t custom_image_max_tokens = -1;
-    mtmd_image_tile_mode image_tile_mode = MTMD_IMAGE_TILE_MODE_BATCHED;
+    mtmd_image_tile_mode image_tile_mode = MTMD_IMAGE_TILE_MODE_SEQUENTIAL;
 
     void set_image_resize_algo(resize_algo algo, bool torch = false) {
         GGML_ASSERT(!(torch && algo == RESIZE_ALGO_LANCZOS) && "torchvision has no lanczos");
@@ -1391,7 +1398,8 @@ struct mtmd_model_params {
     // custom value provided by user, -1 if not set
     int32_t image_min_tokens = -1;
     int32_t image_max_tokens = -1;
-    int image_tile_mode = MTMD_IMAGE_TILE_MODE_BATCHED; // 0=batched, 1=sequential, 2=disabled
+    int image_tile_mode = MTMD_IMAGE_TILE_MODE_SEQUENTIAL; // 0=batched, 1=sequential (default), 2=disabled. NOTE: 0 (batched) is the zero value but NOT the default — init via mtmd_context_params_default() or set explicitly.
+    int image_max_tiles = -1; // override preproc_max_tiles; -1 or 0 = use GGUF/model default (only a positive value overrides)
     bool no_alloc = false; // only create the tensors, do not read their data
     // the device can't use bf16 weights: declare them as f16 and convert on load
     bool convert_bf16_to_f16 = false;

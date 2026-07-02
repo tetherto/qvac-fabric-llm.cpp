@@ -171,6 +171,8 @@
 | `--video-timestamp-interval N` | interval in milliseconds between text timestamps (default: 5000)<br/>(env: LLAMA_ARG_VIDEO_TIMESTAMP_INTERVAL) |
 | `--video-ffmpeg-dir DIR` | path to the directory containing ffmpeg and ffprobe (default: search in PATH)<br/>(env: LLAMA_ARG_VIDEO_FFMPEG_DIR) |
 | `-o, --output, --output-file FNAME` | output file (default: '') |
+| `--image-tile-mode MODE` | tile encoding mode for multi-tile vision models (e.g. Qwen3VL):<br/>  batched    - all tiles in one forward pass<br/>  sequential - tiles encoded one-by-one (default)<br/>  disabled   - tiling disabled, single tile only<br/>(env: LLAMA_ARG_IMAGE_TILE_MODE) |
+| `--image-max-tiles N` | maximum number of tiles for multi-tile vision models (e.g. Qwen3VL), overrides the<br/>value from the GGUF; use when the GGUF lacks the key or the model default is wrong<br/>for your model size (Qwen3VL defaults to 4, too low for 8B+ variants)<br/>(env: LLAMA_ARG_IMAGE_MAX_TILES) |
 | `--chat-template-kwargs STRING` | sets additional params for the json template parser, must be a valid json object string, e.g. '{"key1":"value1","key2":"value2"}'<br/>(env: LLAMA_ARG_CHAT_TEMPLATE_KWARGS) |
 | `--jinja, --no-jinja` | whether to use jinja template engine for chat (default: enabled)<br/>(env: LLAMA_ARG_JINJA) |
 | `--reasoning-format FORMAT` | controls whether thought tags are allowed and/or extracted from the response, and in which format they're returned; one of:<br/>- none: leaves thoughts unparsed in `message.content`<br/>- deepseek: puts thoughts in `message.reasoning_content`<br/>- deepseek-legacy: keeps `<think>` tags in `message.content` while also populating `message.reasoning_content`<br/>(default: auto)<br/>(env: LLAMA_ARG_THINK) |

@@ -92,6 +92,8 @@ int main(int argc, char ** argv) {
         mparams.warmup           = params.warmup;
         mparams.image_min_tokens = params.image_min_tokens;
         mparams.image_max_tokens = params.image_max_tokens;
+        mparams.image_tile_mode  = (int) params.image_tile_mode;
+        mparams.image_max_tiles  = params.image_max_tiles;
         {
             // The per-op eval callback dumps every intermediate tensor, which
             // dominates wall-clock and ruins encoder timing. Keep it off by
