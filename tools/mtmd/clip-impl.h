@@ -29,6 +29,11 @@
 
 #define MTMD_INTERNAL_HEADER
 
+// Upper bound on preproc_max_tiles, enforced at every site that sets it (GGUF read,
+// CLI/binding override). A larger value would flow into the O(max_tiles·log max_tiles)
+// grid-fitting reserve in mtmd-image.cpp and can request hundreds of GB -> std::bad_alloc.
+constexpr int CLIP_PREPROC_MAX_TILES_LIMIT = 256;
+
 #define KEY_FTYPE               "general.file_type"
 #define KEY_NAME                "general.name"
 #define KEY_DESCRIPTION         "general.description"

@@ -916,40 +916,69 @@ mtmd_image_preproc_out mtmd_image_preprocessor_qwen3vl::preprocess(const clip_im
     GGML_ASSERT(tile_px > 0 && "image_size not set in model hparams");
 
     GGML_ASSERT(hparams.patch_size > 0);
-
+    // Guard the log-ratio division below; the public API asserts this in mtmd.cpp, but a direct
+    // caller (fuzz harness, unit test, malformed upload reaching this path) could reach here with
+    // a zero-dimension image. Fail this one image gracefully instead of aborting the whole process.
     const clip_image_size img_size = img.get_size();
-
-    // Pick the grid (n_col x n_row with n_col*n_row <= max_tiles, excluding 1x1) whose aspect
-    // ratio is closest to the image aspect ratio (log-ratio distance), minimising the stretch needed to
-    // fill the tile canvas. Using log-ratio so e.g. 2:1 and 1:2 are symmetric around 1:1.
-    std::vector<clip_image_size> candidate_grids;
-    for (int col = 1; col <= max_tiles; col++) {
-        for (int row = 1; col * row <= max_tiles; row++) {
-            if (col == 1 && row == 1) { continue; } // 1x1 == the dyn_size fallback below
-            candidate_grids.push_back({col, row});
-        }
-    }
-    const float img_log_ratio = std::log((float)img_size.width / (float)img_size.height);
-    const clip_image_size best_grid = pick_grid_by_log_ratio(candidate_grids, img_log_ratio);
-    const int best_col = best_grid.width;
-    const int best_row = best_grid.height;
-
-    const int target_w = best_col * tile_px;
-    const int target_h = best_row * tile_px;
-
-    // Only tile when the canvas DOWNSCALES the image. If the chosen tile canvas is larger than
-    // the image in either dimension, tiling would upscale it - no real detail is gained, it just
-    // spends several full-tile embeddings (plus an overview) on an image a single dyn_size pass
-    // represents fully and more cheaply. This subsumes the old "fits in one tile" check (any such
-    // image maps to a canvas that upscales it) and avoids the medium-image token blow-up, while
-    // large images the canvas downscales still tile to preserve local detail.
-    if (target_w > img_size.width || target_h > img_size.height) {
-        LOG_INF("%s: %dx%d would upscale into a %dx%d tile canvas - using dyn_size instead\n",
-                __func__, img_size.width, img_size.height, target_w, target_h);
-        output = preprocess_qwen3vl_untiled(hparams, img);
-        // grid_x/grid_y left at 0: single-tile path; tokenizer treats this as 1x1
+    if (img_size.width <= 0 || img_size.height <= 0) {
+        LOG_ERR("%s: image has zero dimension (%dx%d)\n", __func__, img_size.width, img_size.height);
         return output;
     }
+
+    // Select the grid (n_col × n_row, n_col*n_row <= max_tiles, excluding 1×1) that:
+    //   1. downscales the image in both dimensions (upscaling gains no detail)
+    //   2. maximises tile count (more tiles = more spatial detail preserved)
+    //   3. among equal tile counts, minimises log-ratio error (less stretch distortion)
+    // If no grid downscales, fall back to dyn_size (single-tile at native resolution).
+    const float img_log_ratio = std::log((float)img_size.width / (float)img_size.height);
+
+    struct grid_cand { int col, row; float ratio_err; };
+    std::vector<grid_cand> fitting;
+    // candidate count is sum_{col} floor(max_tiles/col) ≈ max_tiles*ln(max_tiles), not max_tiles²;
+    // a small reserve avoids the early reallocations without over-allocating at large max_tiles.
+    fitting.reserve((size_t)(max_tiles * std::log((float)std::max(max_tiles, 2))));
+    for (int col = 1; col <= max_tiles; col++) {
+        for (int row = 1; col * row <= max_tiles; row++) {
+            if (col == 1 && row == 1) { continue; } // 1×1 == dyn_size below
+            if (col * tile_px <= img_size.width && row * tile_px <= img_size.height) {
+                const float err = std::abs(img_log_ratio - std::log((float)col / (float)row));
+                fitting.push_back({col, row, err});
+            }
+        }
+    }
+    if (fitting.empty()) {
+        LOG_INF("%s: %dx%d fits no tile grid (tile_px=%d, max_tiles=%d) — using dyn_size\n",
+                __func__, img_size.width, img_size.height, tile_px, max_tiles);
+        output = preprocess_qwen3vl_untiled(hparams, img);
+        // grid_x/grid_y left at 0 → single-tile path; tokenizer treats this as 1×1
+        return output;
+    }
+
+    // Tolerance band: find the best (minimum) ratio error, then allow any candidate within
+    // TOLERANCE of it to compete on tile count. This prevents a high-tile-count grid from
+    // winning when a near-perfect-ratio lower-tile-count grid exists (e.g. 2×2 over 2×1
+    // for a 2:1 image, which would squash the image 2× in one dimension).
+    static constexpr float RATIO_ERR_TOLERANCE = 0.2f;
+    const float best_ratio_err = std::min_element(fitting.begin(), fitting.end(),
+        [](const grid_cand & a, const grid_cand & b) { return a.ratio_err < b.ratio_err; })->ratio_err;
+    const float eligible_threshold = best_ratio_err + RATIO_ERR_TOLERANCE;
+
+    auto best = std::min_element(fitting.begin(), fitting.end(), [eligible_threshold](const grid_cand & a, const grid_cand & b) {
+        const bool ea = a.ratio_err <= eligible_threshold;
+        const bool eb = b.ratio_err <= eligible_threshold;
+        if (ea != eb) { return ea; }        // eligible always beats ineligible
+        const int ta = a.col * a.row;
+        const int tb = b.col * b.row;
+        if (ta != tb) { return ta > tb; }   // more tiles first
+        return a.ratio_err < b.ratio_err;   // then closer ratio
+    });
+
+    const int use_col = best->col;
+    const int use_row = best->row;
+    LOG_INF("%s: %dx%d — selected %dx%d grid (%d tiles, ratio_err=%.3f)\n",
+            __func__, img_size.width, img_size.height, use_col, use_row, use_col * use_row, best->ratio_err);
+    const int target_w = use_col * tile_px;
+    const int target_h = use_row * tile_px;
 
     // Resize to the tile canvas by stretching. With aspect-ratio-aware grid selection the chosen
     // grid's ratio is close to the image's ratio, so the residual stretch is small.
@@ -960,11 +989,11 @@ mtmd_image_preproc_out mtmd_image_preprocessor_qwen3vl::preprocess(const clip_im
                      /* pad */ PAD_NONE,
                      hparams.image_pad_color);
 
-    // Split into best_col x best_row tiles, packed row-major into the batch.
+    // Split into use_col × use_row tiles, packed row-major into the batch.
     clip_image_u8 tile_u8;
 
-    for (int tr = 0; tr < best_row; tr++) {
-        for (int tc = 0; tc < best_col; tc++) {
+    for (int tr = 0; tr < use_row; tr++) {
+        for (int tc = 0; tc < use_col; tc++) {
             const int src_x0 = tc * tile_px;
             const int src_y0 = tr * tile_px;
             img_tool::crop(resized, tile_u8, src_x0, src_y0, tile_px, tile_px);
@@ -993,8 +1022,8 @@ mtmd_image_preproc_out mtmd_image_preprocessor_qwen3vl::preprocess(const clip_im
         output.overview_in_entries = true;
     }
 
-    output.grid_x = best_col;
-    output.grid_y = best_row;
+    output.grid_x = use_col;
+    output.grid_y = use_row;
     return output;
 }
 

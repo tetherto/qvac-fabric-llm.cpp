@@ -49,9 +49,16 @@ enum clip_flash_attn_type {
     CLIP_FLASH_ATTN_TYPE_ENABLED  = 1,
 };
 
+// WARNING: value 0 is BATCHED, which is NOT the default mode (sequential is).
+// A zero-initialized clip_context_params/mtmd_context_params (`{}`, memset, calloc)
+// therefore selects BATCHED — the one-forward-pass path whose ne[3] batching is not
+// yet verified on every backend (see the NOTE in models/qwen3vl.cpp). Do not rely on
+// zero-init for the default: initialize via mtmd_context_params_default() (sets
+// sequential) or set image_tile_mode explicitly. These values are part of the shipped
+// API (string "0"/"1"/"2" in consumers), so they are intentionally not renumbered.
 enum clip_image_tile_mode {
-    CLIP_IMAGE_TILE_MODE_BATCHED    = 0,
-    CLIP_IMAGE_TILE_MODE_SEQUENTIAL = 1,
+    CLIP_IMAGE_TILE_MODE_BATCHED    = 0, // NOT the default; zero-init lands here — see warning above
+    CLIP_IMAGE_TILE_MODE_SEQUENTIAL = 1, // the default (via mtmd_context_params_default)
     CLIP_IMAGE_TILE_MODE_DISABLED   = 2,
 };
 
@@ -69,7 +76,8 @@ struct clip_context_params {
     mtmd_progress_callback progress_callback;
     void * progress_callback_user_data;
     const char * backend_device; // optional, if null will use env var or default GPU backend
-    int image_tile_mode; // 0=batched (default), 1=sequential, 2=disabled
+    int image_tile_mode;   // 0=batched, 1=sequential (default), 2=disabled. NOTE: 0 (batched) is the zero value but NOT the default — init via mtmd_context_params_default() or set explicitly.
+    int image_max_tiles;   // override preproc_max_tiles; -1 or 0 = use GGUF/model default (only a positive value overrides)
 };
 
 struct clip_init_result {
