@@ -1324,50 +1324,90 @@ static vk_fa_tuning_params get_fa_tuning_params_scalar(const vk_device& device, 
     // These env vars let us sweep configs on-device without recompiling and take
     // precedence over the Mali defaults above. An override that would overflow
     // shared memory is rejected and the computed (safe) defaults are kept.
+    //
+    // The environment is read ONCE per process and cached: this function runs on
+    // the flash-attn dispatch hot path (per attention layer, per token), so the
+    // getenv() calls must not repeat there. Tile/split dims are clamped to a sane
+    // maximum — they feed the shared-memory size math (e.g. Bc*(Br+1)*..., summed
+    // as uint32) and become CEIL_DIV divisors / Vulkan workgroup sizes, so an
+    // absurd value could wrap that math and slip past the shmem guard below.
     {
-        // Parse an env var into a uint32. Rejects empty, non-numeric, and
-        // out-of-range values (strtoul saturates to ULONG_MAX on overflow and
-        // sets errno; a value > UINT32_MAX would also truncate) so a bad env
-        // can never silently corrupt a tuning param.
-        auto env_u32 = [](const char * name, uint32_t & out) -> bool {
-            const char * v = std::getenv(name);
-            if (!v || !v[0]) {
-                return false;
-            }
-            errno = 0;
-            char * end = nullptr;
-            unsigned long ul = std::strtoul(v, &end, 10);
-            if (end == v || *end != '\0' || errno == ERANGE || ul > UINT32_MAX) {
-                fprintf(stderr, "[FA-OVERRIDE] ignoring invalid %s=%s\n", name, v);
-                return false;
-            }
-            out = (uint32_t) ul;
-            return true;
+        // static storage duration so the no-capture parse lambda below can use it
+        // without a capture (MSVC C3493 otherwise); also a compile-time constant.
+        static constexpr uint32_t FA_OVERRIDE_MAX = 1024u;  // well below any wrap threshold
+
+        struct fa_overrides {
+            bool     has_br=false, has_bc=false, has_wg=false, has_sgs=false,
+                     has_dsplit=false, has_rsplit=false, has_staging=false, has_nosg=false;
+            uint32_t br=0, bc=0, wg=0, sgs=0, dsplit=0, rsplit=0;
+            bool     staging=false, nosg=false;
+            bool     any=false, debug=false;
         };
 
-        const vk_fa_tuning_params before = result;
-        bool overridden = false;
-        uint32_t tmp = 0;
-        // Tile/split dimensions must be > 0: they become divisors (CEIL_DIV) and
-        // Vulkan workgroup sizes at dispatch, so a 0 would be a div-by-zero /
-        // invalid dispatch. STAGING / NOSUBGROUP are booleans, so 0 is valid.
-        if (env_u32("GGML_VK_FA_BR",        tmp) && tmp > 0) { result.block_rows       = tmp;       overridden = true; }
-        if (env_u32("GGML_VK_FA_BC",        tmp) && tmp > 0) { result.block_cols       = tmp;       overridden = true; }
-        if (env_u32("GGML_VK_FA_WG",        tmp) && tmp > 0) { result.workgroup_size   = tmp;       overridden = true; }
-        if (env_u32("GGML_VK_FA_SGS",       tmp) && tmp > 0) { result.subgroup_size    = tmp;       overridden = true; }
-        if (env_u32("GGML_VK_FA_DSPLIT",    tmp) && tmp > 0) { result.d_split          = tmp;       overridden = true; }
-        if (env_u32("GGML_VK_FA_RSPLIT",    tmp) && tmp > 0) { result.row_split        = tmp;       overridden = true; }
-        if (env_u32("GGML_VK_FA_STAGING",   tmp)) { result.shmem_staging    = tmp != 0;  overridden = true; }
-        if (env_u32("GGML_VK_FA_NOSUBGROUP",tmp)) { result.disable_subgroups= tmp != 0;  overridden = true; }
+        // Parsed once; C++11 guarantees thread-safe init of the function-local static.
+        static const fa_overrides ov = []() -> fa_overrides {
+            fa_overrides o;
+            // Tile/split dims: 1..FA_OVERRIDE_MAX. 0 would div-by-zero at dispatch;
+            // > max is rejected so it cannot overflow the shmem-size accumulation.
+            auto tile = [](const char * name, uint32_t & out) -> bool {
+                const char * v = std::getenv(name);
+                if (!v || !v[0]) { return false; }
+                errno = 0;
+                char * end = nullptr;
+                unsigned long ul = std::strtoul(v, &end, 10);
+                if (end == v || *end != '\0' || errno == ERANGE || ul == 0 || ul > FA_OVERRIDE_MAX) {
+                    fprintf(stderr, "[FA-OVERRIDE] ignoring out-of-range %s=%s (want 1..%u)\n",
+                            name, v, FA_OVERRIDE_MAX);
+                    return false;
+                }
+                out = (uint32_t) ul;
+                return true;
+            };
+            // Booleans: any valid non-zero integer is true, 0 is false.
+            auto boolean = [](const char * name, bool & out) -> bool {
+                const char * v = std::getenv(name);
+                if (!v || !v[0]) { return false; }
+                errno = 0;
+                char * end = nullptr;
+                unsigned long ul = std::strtoul(v, &end, 10);
+                if (end == v || *end != '\0' || errno == ERANGE) { return false; }
+                out = (ul != 0);
+                return true;
+            };
+            o.has_br     = tile("GGML_VK_FA_BR",         o.br);
+            o.has_bc     = tile("GGML_VK_FA_BC",         o.bc);
+            o.has_wg     = tile("GGML_VK_FA_WG",         o.wg);
+            o.has_sgs    = tile("GGML_VK_FA_SGS",        o.sgs);
+            o.has_dsplit = tile("GGML_VK_FA_DSPLIT",     o.dsplit);
+            o.has_rsplit = tile("GGML_VK_FA_RSPLIT",     o.rsplit);
+            o.has_staging= boolean("GGML_VK_FA_STAGING",   o.staging);
+            o.has_nosg   = boolean("GGML_VK_FA_NOSUBGROUP",o.nosg);
+            o.debug      = std::getenv("GGML_VK_FA_DEBUG") != nullptr;
+            o.any = o.has_br || o.has_bc || o.has_wg || o.has_sgs ||
+                    o.has_dsplit || o.has_rsplit || o.has_staging || o.has_nosg;
+            return o;
+        }();
 
-        if (overridden && !ggml_vk_flash_attn_scalar_shmem_support(device, result, hsk, hsv, f32acc, k_type, v_type)) {
-            fprintf(stderr, "[FA-OVERRIDE] rejected (shmem overflow), keeping defaults: ");
-            result.print();
-            result = before;
+        if (ov.any) {
+            const vk_fa_tuning_params before = result;
+            if (ov.has_br)      { result.block_rows       = ov.br;      }
+            if (ov.has_bc)      { result.block_cols       = ov.bc;      }
+            if (ov.has_wg)      { result.workgroup_size   = ov.wg;      }
+            if (ov.has_sgs)     { result.subgroup_size    = ov.sgs;     }
+            if (ov.has_dsplit)  { result.d_split          = ov.dsplit;  }
+            if (ov.has_rsplit)  { result.row_split        = ov.rsplit;  }
+            if (ov.has_staging) { result.shmem_staging    = ov.staging; }
+            if (ov.has_nosg)    { result.disable_subgroups= ov.nosg;    }
+
+            if (!ggml_vk_flash_attn_scalar_shmem_support(device, result, hsk, hsv, f32acc, k_type, v_type)) {
+                fprintf(stderr, "[FA-OVERRIDE] rejected (shmem overflow), keeping defaults: ");
+                result.print();
+                result = before;
+            }
         }
 
         static bool logged = false;
-        if (std::getenv("GGML_VK_FA_DEBUG") && n_rows != 512 && !logged) {
+        if (ov.debug && n_rows != 512 && !logged) {
             logged = true;
             fprintf(stderr, "[FA-TUNE] hsk=%u hsv=%u n_rows=%u n_kv=%u k_type=%d f32acc=%d -> ",
                     hsk, hsv, n_rows, n_kv, (int) k_type, (int) f32acc);
