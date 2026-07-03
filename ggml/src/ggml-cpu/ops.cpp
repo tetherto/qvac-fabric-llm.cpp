@@ -12239,8 +12239,10 @@ static void ggml_compute_forward_gated_delta_net_back_f32(
     GGML_TENSOR_LOCALS(size_t,  nbb, src_beta, nb);
 
     const bool    kda = (neg0 == S_v);
-    const int64_t K   = src_state->ne[1];
-    const int64_t state_seq_stride = src_state->nb[2] / sizeof(float);
+    // K (snapshot slot count) is set as an op param by ggml_gated_delta_net_back().
+    const int64_t K   = ggml_get_op_params_i32(dst, 0);
+    // state layout [S_v, S_v, H, n_seqs]: seq iv3 starts at iv3 * state_seq_stride.
+    const int64_t state_seq_stride = src_state->nb[3] / sizeof(float);
 
     const int64_t H_k = neq1;
     const int64_t rq3 = nev3 / neq3;
@@ -12269,7 +12271,6 @@ static void ggml_compute_forward_gated_delta_net_back_f32(
     const int64_t state_size_per_snap = S_v * S_v * H * n_seqs;
     const float * d_attn_base  = (const float *) src_d->data;
     const float * d_state_base = (const float *) src_d->data + attn_score_elems;
-    const int64_t shift = n_tokens - K;
 
     const float * state_in_base = (const float *) src_state->data;
 
@@ -12359,7 +12360,8 @@ static void ggml_compute_forward_gated_delta_net_back_f32(
                         for (int64_t i = 0; i < S_v; ++i) { Am[j * S_v + i] += q_d[i] * sdo; }
                     }
 
-                    const int64_t target_slot = t - shift;
+                    // matches the forward op's slot mapping: slot 0 = most recent state (t = n_tokens-1).
+                    const int64_t target_slot = n_tokens - 1 - t;
                     if (target_slot >= 0 && target_slot < K) {
                         const float * dss = d_state_base + target_slot * state_size_per_snap + (iv3 * H + iv1) * S_v * S_v;
                         for (int64_t idx = 0; idx < S_v * S_v; ++idx) { Am[idx] += dss[idx]; }
@@ -12427,11 +12429,9 @@ static void ggml_compute_forward_gated_delta_net_back_f32(
                     }
                 }
 
-                float * ds0 = ds_base + iv1 * S_v * S_v + (S_v * S_v * H) * (K * iv3);
+                // state's gradient has layout [S_v, S_v, H, n_seqs] (no K factor, unlike the forward output).
+                float * ds0 = ds_base + (iv3 * H + iv1) * S_v * S_v;
                 memcpy(ds0, Am, S_v * S_v * sizeof(float));
-                for (int64_t slot = 1; slot < K; ++slot) {
-                    memset(ds_base + iv1 * S_v * S_v + (S_v * S_v * H) * (slot + K * iv3), 0, S_v * S_v * sizeof(float));
-                }
             }
         }
     }

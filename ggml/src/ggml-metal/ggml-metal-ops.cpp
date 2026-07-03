@@ -6603,7 +6603,8 @@ int ggml_metal_op_gated_delta_net_back(ggml_metal_op_t ctx, int idx) {
     const int64_t n_seqs   = v->ne[3];
     const int64_t neq1     = q->ne[1];
     const int64_t neq3     = q->ne[3];
-    const int64_t K        = state->ne[1];
+    // K (snapshot slot count) is set as an op param by ggml_gated_delta_net_back().
+    const int64_t K        = ggml_get_op_params_i32(op, 0);
 
     const int64_t pad_q = GGML_PAD(ggml_nelements(q)     * fsz, GGML_MEM_ALIGN) / fsz;
     const int64_t pad_k = GGML_PAD(ggml_nelements(k)     * fsz, GGML_MEM_ALIGN) / fsz;

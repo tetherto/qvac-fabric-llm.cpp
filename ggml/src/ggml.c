@@ -7111,7 +7111,9 @@ struct ggml_tensor * ggml_gated_delta_net_back(
     end += GGML_PAD(ggml_nelements(state) * tsize, GGML_MEM_ALIGN);
 
     const int64_t gdn_S_v       = v->ne[0];
+    const int64_t gdn_H         = v->ne[1];
     const int64_t gdn_n_tokens  = v->ne[2];
+    const int64_t gdn_n_seqs    = v->ne[3];
     const int64_t gdn_n_wg      = q->ne[1] * q->ne[3];
     const int64_t gdn_wg_stride = gdn_n_tokens * (2 * gdn_S_v * gdn_S_v + 2 * gdn_S_v) + gdn_S_v * gdn_S_v;
     end += GGML_PAD(gdn_n_wg * gdn_wg_stride * (int64_t) tsize, GGML_MEM_ALIGN);
@@ -7119,6 +7121,17 @@ struct ggml_tensor * ggml_gated_delta_net_back(
     const int64_t nelements = (end + tsize - 1) / tsize;
 
     struct ggml_tensor * result = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, nelements);
+
+    // d holds the grad of the forward output, packed as [attn_out (S_v*H, n_tokens*n_seqs) |
+    // K state snapshots (S_v*H, K*S_v*n_seqs)]. The state input's ne[1] is always S_v so it can't
+    // carry K; recover K from d's layout once here (validating the shape) and store it as an op
+    // param so every backend reads it uniformly, mirroring the forward op.
+    GGML_ASSERT(d->ne[0] == gdn_S_v * gdn_H);
+    const int64_t gdn_state_rows = d->ne[1] - gdn_n_tokens * gdn_n_seqs;
+    GGML_ASSERT(gdn_state_rows > 0);
+    GGML_ASSERT(gdn_state_rows % (gdn_S_v * gdn_n_seqs) == 0);
+    const int64_t gdn_K = gdn_state_rows / (gdn_S_v * gdn_n_seqs);
+    ggml_set_op_params_i32(result, 0, (int32_t) gdn_K);
 
     result->op     = GGML_OP_GATED_DELTA_NET_BACK;
     result->src[0] = q;

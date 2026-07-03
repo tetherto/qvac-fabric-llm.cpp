@@ -11725,7 +11725,6 @@ static void ggml_vk_gated_delta_net_back(ggml_backend_vk_context * ctx, vk_conte
     const ggml_tensor * src_q     = dst->src[0];
     const ggml_tensor * src_v     = dst->src[2];
     const ggml_tensor * src_beta  = dst->src[4];
-    const ggml_tensor * src_state = dst->src[5];
 
     GGML_ASSERT(dst->buffer != nullptr);
 
@@ -11733,7 +11732,8 @@ static void ggml_vk_gated_delta_net_back(ggml_backend_vk_context * ctx, vk_conte
     const uint32_t H        = (uint32_t)src_v->ne[1];
     const uint32_t n_tokens = (uint32_t)src_v->ne[2];
     const uint32_t n_seqs   = (uint32_t)src_v->ne[3];
-    const uint32_t K        = (uint32_t)src_state->ne[1];
+    // K (snapshot slot count) is set as an op param by ggml_gated_delta_net_back().
+    const uint32_t K        = (uint32_t) ggml_get_op_params_i32(dst, 0);
 
     const uint32_t s_off = S_v * H * n_tokens * n_seqs;  // d_state region within the grad input d
 
