@@ -84,7 +84,6 @@ void main() {
     const uint sc_carry   = sc_w + n_tokens * S_V;         // running adjoint [j*S_V+i]
 
     const uint state_size_per_snap = state_size * H * n_seqs;
-    const int  shift = int(n_tokens) - int(K);
 
     // zero d_q / d_k for this (iq1, iq3); they accumulate over the v-head group
     for (uint t = 0; t < n_tokens; t++) {
@@ -98,7 +97,8 @@ void main() {
         const uint iv1 = iq1 + gi * neq1;       // v-head (iv1 % neq1 == iq1)
         for (uint sgi = 0; sgi < rq3; sgi++) {
             const uint iv3 = iq3 * rq3 + sgi;   // v-seq
-            const uint state_in_base  = (iv3 * K * H + iv1) * state_size;
+            // state (the forward op's initial state) has layout [S_v, S_v, H, n_seqs] with no K factor.
+            const uint state_in_base  = (iv3 * H + iv1) * state_size;
             const uint state_out_base = (iv3 * H + iv1) * state_size;
             const uint j = tid;                 // column (phases A)
 
@@ -161,7 +161,8 @@ void main() {
                     data_dst[sc_carry + j * S_V + i] += scale * sh_q[i] * do_j;
                 }
                 {
-                    const int target_slot = t - shift;
+                    // matches the forward op's slot mapping: slot 0 = most recent state (t = n_tokens-1).
+                    const int target_slot = int(n_tokens) - 1 - t;
                     if (target_slot >= 0 && target_slot < int(K)) {
                         const uint dss = s_off + uint(target_slot) * state_size_per_snap + state_out_base;
                         for (uint i = 0; i < S_V; i++) {
@@ -204,15 +205,10 @@ void main() {
                 barrier();
             }
 
-            // initial-state gradient (forward reads only slot 0)
+            // initial-state gradient: layout [S_v, S_v, H, n_seqs] (no K factor, unlike the forward output).
             for (uint i = 0; i < S_V; i++) {
-                data_dst[off_ds + iv1 * state_size + (state_size * H) * (K * iv3) + j * S_V + i] =
+                data_dst[off_ds + (iv3 * H + iv1) * state_size + j * S_V + i] =
                     data_dst[sc_carry + j * S_V + i];
-            }
-            for (uint slot = 1; slot < K; slot++) {
-                for (uint i = 0; i < S_V; i++) {
-                    data_dst[off_ds + iv1 * state_size + (state_size * H) * (slot + K * iv3) + j * S_V + i] = 0.0;
-                }
             }
             scratch_barrier();
 

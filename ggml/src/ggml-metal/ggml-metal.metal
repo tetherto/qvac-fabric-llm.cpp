@@ -3804,7 +3804,6 @@ kernel void kernel_gated_delta_net_back(
     const ulong sc_carry   = sc_w     + (ulong) n_tokens * S_v;
 
     const uint state_size_per_snap = state_size * H * args.n_seqs;
-    const int  shift = (int) n_tokens - (int) K;
 
     const uint j = tid; // column (phase A) / row (phase B)
 
@@ -3820,7 +3819,8 @@ kernel void kernel_gated_delta_net_back(
         const uint iv1 = iq1 + gi * neq1; // v-head
         for (uint sgi = 0; sgi < rq3; sgi++) {
             const uint  iv3 = iq3 * rq3 + sgi; // v-seq
-            const ulong state_in_base  = (ulong)(iv3 * K * H + iv1) * state_size;
+            // state (the forward op's initial state) has layout [S_v, S_v, H, n_seqs] with no K factor.
+            const ulong state_in_base  = (ulong)(iv3 * H + iv1) * state_size;
             const ulong state_out_base = (ulong)(iv3 * H + iv1) * state_size;
 
             for (uint t = 0; t < n_tokens; t++) {
@@ -3877,7 +3877,8 @@ kernel void kernel_gated_delta_net_back(
                 for (uint i = 0; i < S_v; i++) {
                     data_dst[sc_carry + j * S_v + i] += scale * sh_q[i] * do_j;
                 }
-                const int target_slot = t - shift;
+                // matches the forward op's slot mapping: slot 0 = most recent state (t = n_tokens-1).
+                const int target_slot = (int) n_tokens - 1 - t;
                 if (target_slot >= 0 && target_slot < (int) K) {
                     const ulong dss = args.s_off + (ulong) target_slot * state_size_per_snap + state_out_base;
                     for (uint i = 0; i < S_v; i++) {
@@ -3926,15 +3927,10 @@ kernel void kernel_gated_delta_net_back(
                 threadgroup_barrier(mem_flags::mem_threadgroup);
             }
 
-            // initial-state gradient (forward reads only slot 0)
+            // initial-state gradient: layout [S_v, S_v, H, n_seqs] (no K factor, unlike the forward output).
             for (uint i = 0; i < S_v; i++) {
-                data_dst[args.off_ds + (ulong) iv1 * state_size + (ulong)(state_size * H) * (K * iv3) + j * S_v + i] =
+                data_dst[args.off_ds + (ulong)(iv3 * H + iv1) * state_size + j * S_v + i] =
                     data_dst[sc_carry + j * S_v + i];
-            }
-            for (uint slot = 1; slot < K; slot++) {
-                for (uint i = 0; i < S_v; i++) {
-                    data_dst[args.off_ds + (ulong) iv1 * state_size + (ulong)(state_size * H) * (slot + K * iv3) + j * S_v + i] = 0.0f;
-                }
             }
             threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
 
