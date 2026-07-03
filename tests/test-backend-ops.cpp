@@ -5492,6 +5492,105 @@ struct test_gated_delta_net_cache_fusion : public test_case {
     }
 };
 
+// GGML_OP_GATED_DELTA_NET_BACK
+struct test_gated_delta_net_back : public test_case {
+    const ggml_type type;
+
+    const int64_t head_count;
+    const int64_t head_size;
+    const int64_t n_seq_tokens;
+    const int64_t n_seqs;
+    const int     v_repeat;
+    const bool    permuted;
+    const bool    kda;
+    const int64_t K; // snapshot slot count: 1 = final-only, >1 = last K states
+
+    std::string vars() override {
+        return VARS_TO_STR9(type, head_count, head_size, n_seq_tokens, n_seqs, v_repeat, permuted, kda, K);
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "GATED_DELTA_NET_BACK";
+    }
+
+    // Without this, the harness compares every non-view graph node individually, which would include
+    // the raw (non-view) op output with its GPU-only scratch tail (see build_graph) and false-positive.
+    // This restricts comparison to just the view returned by build_graph.
+    bool run_whole_graph() override { return true; }
+
+    test_gated_delta_net_back(ggml_type type = GGML_TYPE_F32,
+            int64_t head_count = 4, int64_t head_size = 16, int64_t n_seq_tokens = 1, int64_t n_seqs = 1,
+            int v_repeat = 1, bool permuted = false, bool kda = false, int64_t K = 1)
+        : type(type), head_count(head_count), head_size(head_size), n_seq_tokens(n_seq_tokens), n_seqs(n_seqs),
+          v_repeat(v_repeat), permuted(permuted), kda(kda), K(K) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * q;
+        ggml_tensor * k;
+        ggml_tensor * v;
+        if (permuted) {
+            // create with dims 1 and 2 swapped, then permute back to get non-contiguous layout
+            q = ggml_permute(ctx, ggml_new_tensor_4d(ctx, type, head_size, n_seq_tokens, head_count, n_seqs), 0, 2, 1, 3);
+            k = ggml_permute(ctx, ggml_new_tensor_4d(ctx, type, head_size, n_seq_tokens, head_count, n_seqs), 0, 2, 1, 3);
+            v = ggml_permute(ctx, ggml_new_tensor_4d(ctx, type, head_size, n_seq_tokens, head_count * v_repeat, n_seqs), 0, 2, 1, 3);
+        } else {
+            q = ggml_new_tensor_4d(ctx, type, head_size, head_count, n_seq_tokens, n_seqs);
+            k = ggml_new_tensor_4d(ctx, type, head_size, head_count, n_seq_tokens, n_seqs);
+            v = ggml_new_tensor_4d(ctx, type, head_size, head_count * v_repeat, n_seq_tokens, n_seqs);
+        }
+        ggml_set_name(q, "q");
+        ggml_set_name(k, "k");
+        ggml_set_name(v, "v");
+        const int64_t g_ne0 = kda ? head_size : 1;
+        ggml_tensor * g     = ggml_new_tensor_4d(ctx, type, g_ne0, head_count * v_repeat, n_seq_tokens, n_seqs);
+        ggml_tensor * beta  = ggml_new_tensor_4d(ctx, type, 1, head_count * v_repeat, n_seq_tokens, n_seqs);
+        ggml_tensor * state = ggml_new_tensor_4d(ctx, type, head_size, head_size, head_count * v_repeat, n_seqs);
+        ggml_set_name(g,     "g");
+        ggml_set_name(beta,  "beta");
+        ggml_set_name(state, "state");
+
+        // q/k are L2-normalised in qwen35/kimi-linear before delta_net
+        q = ggml_l2_norm(ctx, q, 1e-6f);
+        k = ggml_l2_norm(ctx, k, 1e-6f);
+
+        // d: incoming gradient, matching the packed [attn_out | K state snapshots] layout of the forward output
+        const int64_t state_rows = K * head_size * n_seqs;
+        ggml_tensor * d = ggml_new_tensor_2d(ctx, type, head_size * head_count * v_repeat, n_seq_tokens * n_seqs + state_rows);
+        ggml_set_name(d, "d");
+
+        ggml_tensor * back = ggml_gated_delta_net_back(ctx, q, k, v, g, beta, state, d);
+
+        // sum of GGML_MEM_ALIGN-padded nelements(q,k,v,g,beta,state), i.e. everything before the scratch tail
+        const size_t tsize = ggml_type_size(GGML_TYPE_F32);
+        size_t n_meaningful_bytes = 0;
+        n_meaningful_bytes += GGML_PAD(ggml_nelements(q)     * tsize, GGML_MEM_ALIGN);
+        n_meaningful_bytes += GGML_PAD(ggml_nelements(k)     * tsize, GGML_MEM_ALIGN);
+        n_meaningful_bytes += GGML_PAD(ggml_nelements(v)     * tsize, GGML_MEM_ALIGN);
+        n_meaningful_bytes += GGML_PAD(ggml_nelements(g)     * tsize, GGML_MEM_ALIGN);
+        n_meaningful_bytes += GGML_PAD(ggml_nelements(beta)  * tsize, GGML_MEM_ALIGN);
+        n_meaningful_bytes += GGML_PAD(ggml_nelements(state) * tsize, GGML_MEM_ALIGN);
+
+        ggml_tensor * out = ggml_view_1d(ctx, back, (int64_t) (n_meaningful_bytes / tsize), 0);
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (ggml_is_view_op(t->op)) { continue; }
+            if (strcmp(t->name, "g") == 0) {
+                init_tensor_uniform(t, -20.0f, -1e-4f);
+            } else if (strcmp(t->name, "beta") == 0) {
+                init_tensor_uniform(t, 0.0f, 1.0f);
+            } else if (strcmp(t->name, "v") == 0) {
+                init_tensor_uniform(t, -0.3f, 5.0f);
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 // GGML_OP_GATED_LINEAR_ATTN
 struct test_gla : public test_case {
     const ggml_type type;
@@ -13288,6 +13387,50 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 4, 32,   4, 1, 4));
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 8, 32,   4, 2, 4));
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 4, 32,   8, 1, 4));
+
+    test_cases.emplace_back(new test_gated_delta_net_back(GGML_TYPE_F32, 32, 128, 1, 1));
+    test_cases.emplace_back(new test_gated_delta_net_back(GGML_TYPE_F32, 32, 16, 1, 1));
+    test_cases.emplace_back(new test_gated_delta_net_back(GGML_TYPE_F32, 32, 16, 1, 1, 1, true, true));
+    test_cases.emplace_back(new test_gated_delta_net_back(GGML_TYPE_F32, 32, 16, 1, 1, 1, false, true));
+    test_cases.emplace_back(new test_gated_delta_net_back(GGML_TYPE_F32, 16, 64, 1, 2));
+    test_cases.emplace_back(new test_gated_delta_net_back(GGML_TYPE_F32, 4, 64, 4, 1));
+    test_cases.emplace_back(new test_gated_delta_net_back(GGML_TYPE_F32, 4, 64, 4, 2));
+    test_cases.emplace_back(new test_gated_delta_net_back(GGML_TYPE_F32, 8, 32, 4, 2, 2));
+    test_cases.emplace_back(new test_gated_delta_net_back(GGML_TYPE_F32, 4, 64, 4, 2, 1, true));
+    test_cases.emplace_back(new test_gated_delta_net_back(GGML_TYPE_F32, 4, 64, 4, 1, 1, true));
+    // KDA (vector gate)
+    test_cases.emplace_back(new test_gated_delta_net_back(GGML_TYPE_F32, 4, 64, 1, 1, 1, false, true));
+    test_cases.emplace_back(new test_gated_delta_net_back(GGML_TYPE_F32, 4, 64, 1, 2, 1, false, true));
+    test_cases.emplace_back(new test_gated_delta_net_back(GGML_TYPE_F32, 4, 16, 1, 2, 1, false, true));
+    test_cases.emplace_back(new test_gated_delta_net_back(GGML_TYPE_F32, 4, 32, 4, 1, 1, false, true));
+    test_cases.emplace_back(new test_gated_delta_net_back(GGML_TYPE_F32, 4, 64, 4, 2, 1, false, true));
+    test_cases.emplace_back(new test_gated_delta_net_back(GGML_TYPE_F32, 8, 32, 4, 2, 2, false, true));
+    test_cases.emplace_back(new test_gated_delta_net_back(GGML_TYPE_F32, 4, 64, 4, 2, 1, true,  true));
+    test_cases.emplace_back(new test_gated_delta_net_back(GGML_TYPE_F32, 4, 16, 4, 2, 1, true,  true));
+    // chunked path: multi-chunk and non-multiple-of-chunk-size (chunk_size=64 GDN, 16 KDA)
+    test_cases.emplace_back(new test_gated_delta_net_back(GGML_TYPE_F32, 4, 64,  64, 1));
+    test_cases.emplace_back(new test_gated_delta_net_back(GGML_TYPE_F32, 4, 64, 127, 1));
+    test_cases.emplace_back(new test_gated_delta_net_back(GGML_TYPE_F32, 4, 64, 256, 1));
+    test_cases.emplace_back(new test_gated_delta_net_back(GGML_TYPE_F32, 4, 64,  65, 1));
+    test_cases.emplace_back(new test_gated_delta_net_back(GGML_TYPE_F32, 4, 64, 100, 1));
+    test_cases.emplace_back(new test_gated_delta_net_back(GGML_TYPE_F32, 4, 64, 200, 1));
+    test_cases.emplace_back(new test_gated_delta_net_back(GGML_TYPE_F32, 4, 64, 127, 2));
+    test_cases.emplace_back(new test_gated_delta_net_back(GGML_TYPE_F32, 4, 64,  64, 1, 1, false, true));
+    test_cases.emplace_back(new test_gated_delta_net_back(GGML_TYPE_F32, 4, 64,  33, 1, 1, false, true));
+    test_cases.emplace_back(new test_gated_delta_net_back(GGML_TYPE_F32, 4, 64, 100, 1, 1, false, true));
+
+    // K > 1: output keeps the last min(n_tokens, K) per-token snapshots, ordered most-recent-first
+    // (slot 0 = final state, slot s = state s tokens back).
+    // exact-match cases (K == n_seq_tokens):
+    test_cases.emplace_back(new test_gated_delta_net_back(GGML_TYPE_F32, 4, 16,   2, 1, 1, false, false, /*K=*/2));
+    test_cases.emplace_back(new test_gated_delta_net_back(GGML_TYPE_F32, 4, 32,   4, 1, 1, false, false, /*K=*/4));
+    test_cases.emplace_back(new test_gated_delta_net_back(GGML_TYPE_F32, 4, 64,   4, 2, 1, false, false, /*K=*/4));
+    test_cases.emplace_back(new test_gated_delta_net_back(GGML_TYPE_F32, 8, 128,  4, 1, 1, false, false, /*K=*/4));
+    test_cases.emplace_back(new test_gated_delta_net_back(GGML_TYPE_F32, 4, 64,   4, 2, 1, false, true,  /*K=*/4));
+    test_cases.emplace_back(new test_gated_delta_net_back(GGML_TYPE_F32, 8, 32,   4, 2, 2, false, true,  /*K=*/4));
+    // overflow: n_tokens > K — only the last K snapshots kept.
+    test_cases.emplace_back(new test_gated_delta_net_back(GGML_TYPE_F32, 4, 32,   8, 1, 1, false, false, /*K=*/3));
+    test_cases.emplace_back(new test_gated_delta_net_back(GGML_TYPE_F32, 4, 64,  16, 2, 1, false, false, /*K=*/4));
 
 #if 0
     // these tests are disabled to save execution time, sbut they can be handy for debugging
