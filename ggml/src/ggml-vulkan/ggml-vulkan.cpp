@@ -10952,10 +10952,10 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
 
     switch (op) {
     case GGML_OP_NORM:
-        // One workgroup per row/channel/sample, matching norm.comp's stride-based
-        // indexing (gl_WorkGroupID.{x,y,z} = {row, channel, sample}).
-        elements = { (uint32_t)ne01, (uint32_t)ne02, (uint32_t)ne03 };
-        break;
+        // Flattened/tiled row dispatch (group below) — norm.comp reconstructs
+        // {row, channel, sample} from the flat workgroup id, so large row counts
+        // never exceed maxComputeWorkGroupCount (a direct {ne01, ne02, ne03}
+        // grid would trip the dispatch assert).
     case GGML_OP_RMS_NORM_BACK:
     case GGML_OP_L2_NORM:
     case GGML_OP_L2_NORM_BACK:
