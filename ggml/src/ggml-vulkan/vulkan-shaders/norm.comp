@@ -27,12 +27,22 @@ shared vec2 sumsh[BLOCK_SIZE];
 
 void main() {
     const uint ncols     = p.ne00;
-    const uint nrows     = gl_NumWorkGroups.x;
-    const uint nchannels = gl_NumWorkGroups.y;
+    const uint nrows     = p.ne01;
+    const uint nchannels = p.ne02;
 
-    const uint row       = gl_WorkGroupID.x;
-    const uint channel   = gl_WorkGroupID.y;
-    const uint samp      = gl_WorkGroupID.z;
+    // The host dispatches the flattened/tiled {512, 512, N} row grid (same as
+    // soft_max.comp et al.) so huge row counts never exceed
+    // maxComputeWorkGroupCount; reconstruct {row, channel, sample} from the
+    // flat workgroup id.
+    const uint flat_row  = gl_WorkGroupID.z * 262144 + gl_WorkGroupID.y * 512 + gl_WorkGroupID.x;
+    if (flat_row >= nrows * nchannels * p.ne03) {
+        // Tiling round-up padding; uniform across the workgroup, so returning
+        // before the barriers below is safe.
+        return;
+    }
+    const uint row       = flat_row % nrows;
+    const uint channel   = (flat_row / nrows) % nchannels;
+    const uint samp      = flat_row / (nrows * nchannels);
     const uint tid       = gl_LocalInvocationID.x;
 
     const uint stride_row     = p.nb01;
@@ -44,8 +54,9 @@ void main() {
     uint32_t b_offset = get_boffset();
     // Bias (C) is required to be aligned (misalign==0) by the fusion gate.
     uint32_t c_offset = 0;
-    // Output is contiguous per row (CLIP layernorm dst), matching rms_norm.comp.
-    uint32_t d_offset = ((samp*nchannels + channel)*nrows + row)*ncols + get_doffset();
+    // Output is contiguous per row (CLIP layernorm dst); flat_row equals
+    // (samp*nchannels + channel)*nrows + row by construction.
+    uint32_t d_offset = flat_row*ncols + get_doffset();
 
     vec2 sum = vec2(0.0f, 0.0f);
 
