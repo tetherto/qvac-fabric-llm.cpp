@@ -186,17 +186,26 @@ mtmd_image_f32_batch mtmd_subcontext::get_dummy_batch() const {
 void mtmd_subcontext::warmup(const mtmd_image_f32_batch & batch) {
     support_info_graph info;
 
-    // Disable FA on GPU projectors that lack efficient (coopmat) flash attention.
-    // Without coopmat, Vulkan uses FA_SCALAR which is ~2.6x slower than the matmul path
-    // for CLIP encoder attention (Mali-G715: 38 vs ~100 GFLOPS/s). Coopmat-capable GPUs
-    // keep FA enabled. Resolved at runtime via proc_address — no compile-time backend dep.
-    // Acts on AUTO *and* ENABLED (the addon enables FA by default) — an inefficient
-    // scalar-FA GPU should never be forced into FA; only explicit DISABLED is left alone.
+    // Downgrade FA to AUTO on GPU projectors that lack efficient (coopmat) flash
+    // attention. Without coopmat, Vulkan uses FA_SCALAR which is ~2.6x slower than the
+    // matmul path for CLIP encoder attention (Mali-G715: 38 vs ~100 GFLOPS/s).
+    // Coopmat-capable GPUs keep FA enabled. Resolved at runtime via proc_address — no
+    // compile-time backend dep. Acts on AUTO *and* ENABLED (the addon enables FA by
+    // default) — an inefficient scalar-FA GPU should never be forced into FA; only
+    // explicit DISABLED is left alone. AUTO (not DISABLED, QVAC-21914): a hard disable
+    // forces the explicit path whose O(n_patches^2 * n_head) score matrix OOMs at high
+    // n_pos (image_tile_mode=disabled + large image_max_tokens killed Pixel 9 Pro at
+    // ~12 GB RSS); AUTO keeps the fast explicit path for normal images via the budget
+    // heuristic in mtmd_resolve_flash_attn_type() and falls back to memory-frugal
+    // scalar FA for huge ones — slow-but-alive beats fast-but-OOM.
     // Default when the backend can't confirm efficient FA = KEEP it. Only ggml-vulkan
     // implements the query (returning false for Mali/non-coopmat); backends that don't
-    // answer (Metal, CUDA, …) have efficient FA and must keep it — disabling there forces
-    // explicit attention whose QK^T overflows the clip compute buffer at high n_pos
-    // (GGML_ASSERT in ggml-backend, e.g. image_tile_mode=disabled + large image_max_tokens).
+    // answer (Metal, CUDA, and also ggml-opencl) have (or are assumed to have) efficient
+    // FA and must keep it — disabling there forces explicit attention whose QK^T
+    // overflows the clip compute buffer at high n_pos (GGML_ASSERT in ggml-backend,
+    // e.g. image_tile_mode=disabled + large image_max_tokens). ggml-opencl's own
+    // giant-encode driver fault at high n_pos is handled inside that backend
+    // (submission bounding: periodic clFlush + FA q-chunking), not via this gate.
     if (flash_attn_type != MTMD_FLASH_ATTN_TYPE_DISABLED &&
         backends.backend && backends.backend != backends.backend_cpu) {
         bool efficient_fa = true;
@@ -211,7 +220,8 @@ void mtmd_subcontext::warmup(const mtmd_image_f32_batch & batch) {
             }
         }
         if (!efficient_fa) {
-            flash_attn_type = MTMD_FLASH_ATTN_TYPE_DISABLED;
+            flash_attn_type = MTMD_FLASH_ATTN_TYPE_AUTO;
+            fa_backend_inefficient = true;
         }
     }
 

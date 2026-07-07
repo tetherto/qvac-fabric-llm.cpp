@@ -47,6 +47,11 @@ static bool mtmd_backend_is_mali(const mtmd_subcontext * ctx) {
 // (7056) uses flash-attention (explicit would OOM there).
 static const int MTMD_AUTO_FA_MIN_KV_MALI_DEFAULT = 4096;
 
+// mtmd_fa_effective_min_kv() — the pure AUTO-budget arithmetic — is defined
+// inline in mtmd-subcontext.h (so unit tests can exercise it without linking an
+// unexported symbol across the Windows mtmd.dll boundary). See there for the
+// full behavior contract.
+
 // Resolve the effective flash-attention mode for a single image graph.
 //
 // ENABLED/DISABLED are explicit user choices and are honored as-is. AUTO is
@@ -75,17 +80,20 @@ static mtmd_flash_attn_type mtmd_resolve_flash_attn_type(mtmd_subcontext * ctx, 
         if (env_min_kv && env_min_kv[0]) {
             ctx->fa_auto_min_kv = (int) std::strtol(env_min_kv, nullptr, 10);
         } else {
-            ctx->fa_auto_min_kv = mtmd_backend_is_mali(ctx) ? MTMD_AUTO_FA_MIN_KV_MALI_DEFAULT : 0;
+            // Default the cutoff on for any backend without efficient (coopmat)
+            // FA — detected either at warmup via the backend query
+            // (fa_backend_inefficient) or by Mali device detection (covers
+            // paths where the warmup GPU-only probe doesn't run).
+            ctx->fa_auto_min_kv = (ctx->fa_backend_inefficient || mtmd_backend_is_mali(ctx))
+                                      ? MTMD_AUTO_FA_MIN_KV_MALI_DEFAULT : 0;
         }
         size_t free_mem = 0, total_mem = 0;
         ggml_backend_dev_t dev = ctx->backends.backend ? ggml_backend_get_device(ctx->backends.backend) : nullptr;
         if (dev) {
             ggml_backend_dev_memory(dev, &free_mem, &total_mem);
         }
-        // Prefer free memory when the backend reports it; many mobile drivers
-        // report 0, so fall back to total. If neither is known, rely on the
-        // threshold alone.
-        ctx->fa_mem_capacity = free_mem > 0 ? free_mem : total_mem;
+        ctx->fa_mem_total = total_mem;
+        ctx->fa_mem_free  = free_mem;
         ctx->fa_budget_cached = true;
     }
 
@@ -99,19 +107,14 @@ static mtmd_flash_attn_type mtmd_resolve_flash_attn_type(mtmd_subcontext * ctx, 
     // Explicit attention (mul_mat + softmax) is faster than the scalar FA kernel
     // on no-coopmat GPUs for short sequences, but it materializes an
     // O(n_patches^2 * n_head) score matrix. Memory-constrained devices can't
-    // hold that, so cap the "use explicit" cutoff by how much device memory is
-    // available: the effective cutoff is the smaller of the configured threshold
-    // and the largest n_patches whose explicit scratch (scores + softmax/kqv
-    // temporaries, ~3x) fits in ~half of device memory. This only ever lowers
-    // the cutoff, so low-memory devices fall back to memory-frugal FA sooner.
-    int eff_min_kv = auto_fa_min_kv;
-    const size_t capacity = ctx->fa_mem_capacity;
-    if (capacity > 0) {
-        const size_t n_head = (size_t) ctx->model.hparams.n_head;
-        // 3 * n^2 * n_head * 4 bytes <= capacity / 2  =>  n <= sqrt(capacity / (24*n_head))
-        const double n_max = std::sqrt((double) capacity / (24.0 * (double) std::max<size_t>(n_head, 1)));
-        eff_min_kv = std::min(eff_min_kv, (int) n_max);
-    }
+    // hold that, so cap the "use explicit" cutoff by the memory budget (see
+    // mtmd_fa_effective_min_kv above: total memory = stable clamp, free memory
+    // = hard-fit check only, no memory info = conservative constant). This only
+    // ever lowers the cutoff, so constrained devices fall back to memory-frugal
+    // FA sooner.
+    const int eff_min_kv = mtmd_fa_effective_min_kv(
+        auto_fa_min_kv, ctx->fa_mem_total, ctx->fa_mem_free,
+        (int) ctx->model.hparams.n_head);
 
     return (n_patches < eff_min_kv) ? MTMD_FLASH_ATTN_TYPE_DISABLED
                                     : MTMD_FLASH_ATTN_TYPE_ENABLED;
