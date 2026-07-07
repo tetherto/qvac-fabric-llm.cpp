@@ -1978,6 +1978,26 @@ kernel void kernel_gelu_back_4(
         ggml_metal_gelu_back(x[3], dy[3]));
 }
 
+kernel void kernel_sigmoid_back(
+        device const float * grad,
+        device const float * src1,
+        device       float * dst,
+        uint tpig[[thread_position_in_grid]]) {
+    const float dy = grad[tpig];
+    const float s  = 1.0f/(1.0f + exp(-src1[tpig]));
+    dst[tpig] = dy*s*(1.0f - s);
+}
+
+kernel void kernel_sigmoid_back_4(
+        device const float4 * grad,
+        device const float4 * src1,
+        device       float4 * dst,
+        uint tpig[[thread_position_in_grid]]) {
+    const float4 dy = grad[tpig];
+    const float4 s  = 1.0f/(1.0f + exp(-src1[tpig]));
+    dst[tpig] = dy*s*(1.0f - s);
+}
+
 kernel void kernel_elu_f32(
         device const float * src0,
         device       float * dst,
