@@ -6,6 +6,8 @@
 #include <stddef.h>
 #include <stdint.h>
 #ifdef __cplusplus
+#include <algorithm>
+#include <cmath>
 #include <map>
 #endif
 
@@ -174,6 +176,51 @@ int clip_model_n_temporal_merge(const struct clip_ctx * ctx); // TODO @ngxson : 
 // summed with the scheduler's compute reservations. Used by mtmd_get_memory_usage
 // (and ultimately by common/fit.cpp's heuristic). Restored from upstream b9341.
 std::map<ggml_backend_dev_t, size_t> clip_get_mem_usage(const struct clip_ctx * ctx);
+
+// QVAC-21914: pure arithmetic of the flash-attention AUTO budget decision.
+// Returns the effective explicit-attention cutoff in n_patches given the
+// configured cutoff and the device memory probe:
+//
+//  - total memory provides the STABLE fast-path clamp (session-independent —
+//    the explicit scratch, ~3*n^2*n_head*4 bytes, must fit in a quarter of
+//    total): normal-size images keep the fast explicit path regardless of
+//    momentary memory pressure.
+//  - free memory (a volatile, load-dependent number) may only LOWER the cutoff
+//    further, and only by the hard-fit requirement: when reported, the explicit
+//    scratch must also fit in what is actually free right now. It can never
+//    extend the explicit path beyond the total-memory clamp.
+//  - neither reported: fail SAFE toward memory-frugal FA with a conservative
+//    constant cap instead of the raw default.
+//
+// Defined inline here (not out-of-line in clip.cpp) so unit tests can exercise
+// it without linking an unexported symbol across the Windows mtmd.dll boundary
+// — the internal clip_* API carries no MTMD_API export decoration.
+inline int clip_fa_effective_min_kv(int auto_min_kv, size_t total_mem, size_t free_mem, int n_head) {
+    // Conservative cutoff cap when the device reports no memory information at
+    // all: 2048 patches keeps the explicit scratch around ~0.8 GB at n_head=16
+    // instead of trusting the raw 4096 default (~3.2 GB) blind.
+    constexpr int NO_MEMINFO_CAP = 2048;
+    if (auto_min_kv <= 0) {
+        return auto_min_kv;
+    }
+    const double heads = (double) (n_head > 0 ? n_head : 1);
+    int eff_min_kv = auto_min_kv;
+    if (total_mem > 0) {
+        // Stable clamp: explicit scratch (3 * n^2 * n_head * 4) <= total/4
+        // =>  n <= sqrt((total/2) / (24*n_head))
+        const double n_max_total = std::sqrt(((double) total_mem / 2.0) / (24.0 * heads));
+        eff_min_kv = std::min(eff_min_kv, (int) n_max_total);
+    }
+    if (free_mem > 0) {
+        // Hard fit: 3 * n^2 * n_head * 4 <= free  =>  n <= sqrt(free / (12*n_head))
+        const double n_max_free = std::sqrt((double) free_mem / (12.0 * heads));
+        eff_min_kv = std::min(eff_min_kv, (int) n_max_free);
+    }
+    if (total_mem == 0 && free_mem == 0) {
+        eff_min_kv = std::min(eff_min_kv, NO_MEMINFO_CAP);
+    }
+    return eff_min_kv;
+}
 #endif
 
 struct clip_cap {

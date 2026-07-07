@@ -36,6 +36,8 @@ typedef const void * (*get_adreno_bin_kernel_func_t)(
 #include <inttypes.h>
 #include <string.h>
 
+#include <algorithm>
+#include <cerrno>
 #include <cstddef>
 #include <cstdint>
 #include <fstream>
@@ -696,6 +698,13 @@ struct ggml_backend_opencl_context {
 
     // whether to fold the MoE down-projection bias add into the combine
     cl_uint fuse_moe_bias_combine;
+
+    // QVAC-21914 submission bounds (resolved once at init from env, logged there).
+    // flush_work_budget: bytes of estimated enqueued work per driver submission in
+    // graph_compute; 0 disables. fa_max_nq: max q rows per flash-attention dispatch;
+    // 0 disables chunking.
+    int64_t flush_work_budget;
+    int     fa_max_nq;
 
     bool adreno_has_large_buffer;
     bool adreno_use_large_buffer;
@@ -9248,6 +9257,36 @@ static ggml_backend_opencl_context * ggml_cl_init(ggml_backend_dev_t dev) {
         backend_ctx->f16_mrow_rpt = (v == 2 || v == 4 || v == 8 || v == 16) ? v : 1;
     }
 
+    // QVAC-21914 submission bounds. Robust parse (strtol, clamp, warn on garbage
+    // instead of silently disabling the mitigation) and log the effective values,
+    // matching the file's other env knobs.
+    auto parse_env_i64 = [](const char * name, int64_t defval, int64_t maxval) -> int64_t {
+        const char * env = std::getenv(name);
+        if (!env || !env[0]) {
+            return defval;
+        }
+        errno = 0;
+        char * end = nullptr;
+        long long v = std::strtoll(env, &end, 10);
+        if (errno != 0 || end == env || *end != '\0' || v < 0) {
+            GGML_LOG_WARN("ggml_opencl: invalid %s='%s', using default %lld\n",
+                          name, env, (long long) defval);
+            return defval;
+        }
+        if (v > maxval) {
+            GGML_LOG_WARN("ggml_opencl: %s=%lld exceeds max, clamping to %lld\n",
+                          name, v, (long long) maxval);
+            return maxval;
+        }
+        return (int64_t) v;
+    };
+    backend_ctx->flush_work_budget = parse_env_i64("GGML_OPENCL_FLUSH_WORK_MB", 512, INT64_MAX >> 20) * (1ll << 20);
+    backend_ctx->fa_max_nq         = (int) parse_env_i64("GGML_OPENCL_FA_MAX_NQ", 4096, INT32_MAX);
+    GGML_LOG_INFO("ggml_opencl: flush work budget: %lld MB (0 = disabled)\n",
+                  (long long) (backend_ctx->flush_work_budget >> 20));
+    GGML_LOG_INFO("ggml_opencl: flash attention max q rows per dispatch: %d (0 = disabled)\n",
+                  backend_ctx->fa_max_nq);
+
     dev_ctx->backend_ctx = backend_ctx.release();
     return dev_ctx->backend_ctx;
 }
@@ -10975,8 +11014,47 @@ static void ggml_opencl_op_rms_norm_mul_add_fused(ggml_backend_t backend, ggml_t
     backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
 }
 
+// QVAC-21914: cheap per-node proxy for enqueued GPU work, used to bound the
+// driver's per-submission batch in graph_compute. Precision is irrelevant —
+// only the ~3 orders of magnitude between a per-token decode step (~10-50 ms
+// of GPU work) and a monolithic 16k-patch ViT encode (~48 s) must separate,
+// and they do: reduction-heavy ops scale by how often their inputs are re-read.
+static int64_t ggml_opencl_node_work_estimate(const ggml_tensor * node) {
+    switch (node->op) {
+        case GGML_OP_MUL_MAT:
+        case GGML_OP_MUL_MAT_ID:
+            // src0 (weights) is streamed once per output column.
+            return (int64_t) ggml_nbytes(node->src[0]) * std::max<int64_t>(node->ne[1], 1);
+        case GGML_OP_FLASH_ATTN_EXT:
+            // K and V are re-read for every q row.
+            return ((int64_t) ggml_nbytes(node->src[1]) + (int64_t) ggml_nbytes(node->src[2])) *
+                   std::max<int64_t>(node->src[0]->ne[1], 1);
+        default:
+            return (int64_t) ggml_nbytes(node);
+    }
+}
+
 static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     ggml_backend_opencl_context *backend_ctx = (ggml_backend_opencl_context *)backend->context;
+
+    // QVAC-21914: bound the driver's per-submission work on giant graphs.
+    // Large vision graphs (e.g. a monolithic 16k-patch ViT encode: thousands
+    // of nodes, ~48 s of GPU work) enqueue everything between two host
+    // synchronization points. On Adreno the GSL command-buffer manager
+    // accumulates the whole stream and the GPU faults near the tail
+    // (log_gpu_snapshot), after which the next submission aborts the process
+    // from cl_a8x_cmdbuf_mgr_submit_ibs (os_exit) — observed on Galaxy S25
+    // Ultra / Adreno 830. Flushing whenever the estimated enqueued work
+    // exceeds flush_work_budget hands the driver bounded batches instead.
+    // Gating on WORK (not a node count) scales the flush cadence to the batch
+    // size: the ~48 s encode flushes many times, while a per-token LLM decode
+    // (its work ~= the model size streamed once, i.e. a few flushes per token
+    // at the default budget for a multi-GB model) is far lighter. clFlush only
+    // submits (no host stall), so the decode-path cost is negligible in
+    // practice (measured GPU decode TPS within noise of pre-hardening), but it
+    // is NOT literally zero for large models — raise flush_work_budget past the
+    // model size, or set it to 0, to make decode fully submission-free.
+    int64_t work_since_flush = 0;
 
     for (int i = 0; i < cgraph->n_nodes; i++) {
         ggml_tensor * node = cgraph->nodes[i];
@@ -10994,87 +11072,93 @@ static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggm
             continue;
         }
 
+        // Accumulate this node's estimated work before dispatch; the budget
+        // check + flush runs AFTER the node is enqueued (bottom of the loop),
+        // so the node that crosses the budget is part of the flushed batch
+        // rather than deferred into a fresh, potentially-unflushed final
+        // batch. Fused ops are accounted by their anchor node — precision is
+        // irrelevant here (see the QVAC-21914 note above).
+        if (backend_ctx->flush_work_budget > 0) {
+            work_since_flush += ggml_opencl_node_work_estimate(node);
+        }
+
+        // Resolve the MoE-combine fusions up front so they can slot into the
+        // if/else chain below (the can_fuse checks report via out-params).
+        const ggml_tensor * bias_combine_out = nullptr;
+        if (backend_ctx->fuse_moe_bias_combine && backend_ctx->fuse_moe_combine &&
+            !backend_ctx->disable_fusion) {
+            ggml_opencl_can_fuse_moe_bias_combine(cgraph, i, &bias_combine_out);
+        }
+        const ggml_tensor * moe_combine_out = nullptr;
+        if (backend_ctx->fuse_moe_combine && !backend_ctx->disable_fusion) {
+            ggml_opencl_can_fuse_moe_combine(cgraph, i, &moe_combine_out);
+        }
+
+        // if/else (not `continue`) so every dispatch path reaches the single
+        // budget-flush touch point below.
         if (!backend_ctx->disable_fusion && ggml_opencl_can_fuse(backend_ctx, cgraph, i, { GGML_OP_NORM, GGML_OP_MUL, GGML_OP_ADD })) {
             ggml_opencl_op_norm_fused(backend, node, cgraph->nodes[i+1], cgraph->nodes[i+2]);
             i += 2;
-            continue;
-        }
-        if (!backend_ctx->disable_fusion && ggml_opencl_can_fuse(backend_ctx, cgraph, i, { GGML_OP_GROUP_NORM, GGML_OP_MUL, GGML_OP_ADD })) {
+        } else if (!backend_ctx->disable_fusion && ggml_opencl_can_fuse(backend_ctx, cgraph, i, { GGML_OP_GROUP_NORM, GGML_OP_MUL, GGML_OP_ADD })) {
             ggml_opencl_op_group_norm_fused(backend, node, cgraph->nodes[i+1], cgraph->nodes[i+2]);
             i += 2;
-            continue;
-        }
-        // Fuse the MoE combine: router-weight mul + cross-expert add chain ->
-        // one weighted-sum-across-experts kernel.
-        // Fold the gpt-oss MoE bias epilogue: add_id(gate_bias) + add_id(up_bias) +
-        // glu(swiglu_oai) -> one kernel, leaving the two matmuls as their own dispatches.
-        // Both add_ids are in-place passes over a tensor the GLU reads again, so this
-        // drops two full read+write passes per layer. Opt out GGML_OPENCL_FUSE_MOE_BIAS_GLU=0.
-        if (backend_ctx->fuse_moe_bias_glu && !backend_ctx->disable_fusion &&
-            ggml_opencl_can_fuse_moe_bias_glu(cgraph, i)) {
+        } else if (backend_ctx->fuse_moe_bias_glu && !backend_ctx->disable_fusion &&
+                   ggml_opencl_can_fuse_moe_bias_glu(cgraph, i)) {
+            // Fold the gpt-oss MoE bias epilogue: add_id(gate_bias) + add_id(up_bias) +
+            // glu(swiglu_oai) -> one kernel, leaving the two matmuls as their own dispatches.
+            // Both add_ids are in-place passes over a tensor the GLU reads again, so this
+            // drops two full read+write passes per layer. Opt out GGML_OPENCL_FUSE_MOE_BIAS_GLU=0.
             ggml_cl_moe_bias_glu_fused(backend, node, cgraph->nodes[i+1], cgraph->nodes[i+2],
                                        cgraph->nodes[i+3], cgraph->nodes[i+4]);
             i += 4;
-            continue;
-        }
-
-        // Fold the MoE down-projection bias into the combine: add_id(down_bias) + the whole
-        // combine subgraph -> one kernel. Checked before the plain combine arm so the longer
-        // pattern wins. Opt out GGML_OPENCL_FUSE_MOE_BIAS_COMBINE=0.
-        if (backend_ctx->fuse_moe_bias_combine && backend_ctx->fuse_moe_combine &&
-            !backend_ctx->disable_fusion) {
-            const ggml_tensor * bias_combine_out = nullptr;
-            if (ggml_opencl_can_fuse_moe_bias_combine(cgraph, i, &bias_combine_out)) {
-                ggml_cl_moe_bias_combine_fused(backend, node, cgraph->nodes[i+1], bias_combine_out);
-                i += 2 * (int)node->ne[1];   // ADD_ID + MUL + k VIEWs + (k-1) ADDs
-                continue;
-            }
-        }
-
-        if (backend_ctx->fuse_moe_combine && !backend_ctx->disable_fusion) {
-            const ggml_tensor * combine_out = nullptr;
-            if (ggml_opencl_can_fuse_moe_combine(cgraph, i, &combine_out)) {
-                ggml_cl_moe_combine_fused(backend, node, combine_out);
-                i += 2 * (int)node->ne[1] - 1;   // skip the k VIEWs + (k-1) ADDs
-                continue;
-            }
-        }
-
-        // Fuse rms_norm + mul(weight) + add(residual). Checked before the
-        // rms_norm+mul fuse so the 3-op pattern wins over its 2-op prefix.
-        // Default on, opt-out GGML_OPENCL_FUSE_RMS_ADD=0.
-        if (!backend_ctx->disable_fusion && backend_ctx->fuse_rms_add &&
-            ggml_opencl_can_fuse(backend_ctx, cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ADD })) {
+        } else if (backend_ctx->fuse_moe_bias_combine && backend_ctx->fuse_moe_combine &&
+                   !backend_ctx->disable_fusion && bias_combine_out != nullptr) {
+            // Fold the MoE down-projection bias into the combine: add_id(down_bias) + the whole
+            // combine subgraph -> one kernel. Checked before the plain combine arm so the longer
+            // pattern wins. Opt out GGML_OPENCL_FUSE_MOE_BIAS_COMBINE=0.
+            ggml_cl_moe_bias_combine_fused(backend, node, cgraph->nodes[i+1], bias_combine_out);
+            i += 2 * (int)node->ne[1];   // ADD_ID + MUL + k VIEWs + (k-1) ADDs
+        } else if (backend_ctx->fuse_moe_combine && !backend_ctx->disable_fusion &&
+                   moe_combine_out != nullptr) {
+            // Fuse the MoE combine: router-weight mul + cross-expert add chain ->
+            // one weighted-sum-across-experts kernel.
+            ggml_cl_moe_combine_fused(backend, node, moe_combine_out);
+            i += 2 * (int)node->ne[1] - 1;   // skip the k VIEWs + (k-1) ADDs
+        } else if (!backend_ctx->disable_fusion && backend_ctx->fuse_rms_add &&
+                   ggml_opencl_can_fuse(backend_ctx, cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ADD })) {
+            // Fuse rms_norm + mul(weight) + add(residual). Checked before the
+            // rms_norm+mul fuse so the 3-op pattern wins over its 2-op prefix.
+            // Default on, opt-out GGML_OPENCL_FUSE_RMS_ADD=0.
             ggml_opencl_op_rms_norm_mul_add_fused(backend, node, cgraph->nodes[i+1], cgraph->nodes[i+2]);
             i += 2;
-            continue;
-        }
-        if (!backend_ctx->disable_fusion && ggml_opencl_can_fuse(backend_ctx, cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL })) {
+        } else if (!backend_ctx->disable_fusion && ggml_opencl_can_fuse(backend_ctx, cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL })) {
             ggml_opencl_op_rms_norm_fused(backend, node, cgraph->nodes[i+1]);
             i++;
-            continue;
-        }
+#ifdef GGML_OPENCL_USE_ADRENO_KERNELS
         // Fuse mul_mat(Wg,x) + mul_mat(Wu,x) + glu — fold the FFN's two decode
         // GEMVs and the GLU into one dispatch. q4_K only (guarded below); the
         // fused kernel uses the same accumulation/reduction order and the same
         // scalar GLU formula -> coherent. Default on, opt-out GGML_OPENCL_FUSE_MM_GLU=0.
-#ifdef GGML_OPENCL_USE_ADRENO_KERNELS
         // The fused executor (ggml_cl_mul_mat_q4_k_glu_fused) is image-path /
         // Adreno-only (GGML_ABORT on the non-Adreno #else); gate the dispatch to
         // match so the FFN GLU subgraph stays dormant on Intel/other drivers.
-        if (backend_ctx->fuse_mm_glu && !backend_ctx->disable_fusion &&
-            ggml_opencl_can_fuse(backend_ctx, cgraph, i, { GGML_OP_MUL_MAT, GGML_OP_MUL_MAT, GGML_OP_GLU })) {
+        } else if (backend_ctx->fuse_mm_glu && !backend_ctx->disable_fusion &&
+                   ggml_opencl_can_fuse(backend_ctx, cgraph, i, { GGML_OP_MUL_MAT, GGML_OP_MUL_MAT, GGML_OP_GLU })) {
             ggml_cl_mul_mat_q4_k_glu_fused(backend, node, cgraph->nodes[i+1], cgraph->nodes[i+2]);
             i += 2;
-            continue;
-        }
 #endif
-
-        bool ok = ggml_cl_compute_forward(backend, node);
-        if (!ok) {
-            GGML_LOG_ERROR("%s: error: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
+        } else {
+            bool ok = ggml_cl_compute_forward(backend, node);
+            if (!ok) {
+                GGML_LOG_ERROR("%s: error: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
+            }
+            GGML_ASSERT(ok);
         }
-        GGML_ASSERT(ok);
+
+        if (backend_ctx->flush_work_budget > 0 && work_since_flush >= backend_ctx->flush_work_budget) {
+            CL_CHECK(clFlush(backend_ctx->queue));
+            work_since_flush = 0;
+        }
     }
 
     return GGML_STATUS_SUCCESS;
@@ -22366,6 +22450,11 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
     ggml_backend_opencl_context *backend_ctx = (ggml_backend_opencl_context *)backend->context;
     std::lock_guard<std::mutex> fa_lock(backend_ctx->fa.mutex);
 
+    // QVAC-21914: n_q is int; the q-chunk loop below accumulates into an int
+    // (q_base += chunk_rows) and derives cl_ulong byte offsets from it. Guard
+    // the int64->int truncation so a pathological q-row count can't wrap
+    // negative and produce an out-of-bounds device offset.
+    GGML_ASSERT(q->ne[1] <= INT32_MAX);
     const int n_q = q->ne[1];
     const int n_kv = k->ne[1];
     const int d_head_q = q->ne[0];
@@ -23250,6 +23339,12 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
         CL_CHECK(clSetKernelArg(kernel, 40, sizeof(cl_mem),    &blk_buffer));
     }
 
+    if (n_q == 0) {
+        // Degenerate empty dispatch: nothing to compute. Guard explicitly so
+        // the chunk loop below cannot be entered with a zero row count.
+        return;
+    }
+
     if (n_q == 1) {
         if (use_local_tile) {
             const size_t lt_wg = 128;
@@ -23286,10 +23381,48 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
         size_t global_work_size[] = { (size_t)((n_q + bm - 1) / bm) * wg_size, (size_t)(n_head * n_batch) };
         backend_ctx->enqueue_ndrange_kernel(kernel, 2, global_work_size, local_work_size, dst);
     } else {
+        // QVAC-21914: chunk very large dispatches along the q-rows so no
+        // single kernel runs unboundedly long. A monolithic ViT encode at
+        // image_max_tokens=4096 puts n_q = n_kv = 16384 through one dispatch
+        // whose every workgroup loops the full 16k KV — on Adreno 830
+        // (Galaxy S25 Ultra, OpenCL) the GPU faults near the end of such
+        // encodes and the driver then kills the process on the next
+        // submission (cl_a8x_cmdbuf_mgr_submit_ibs -> os_exit). Splitting is
+        // exact: the kernel resolves its q row as
+        // group_id(0)*BLOCK_M + tid relative to the Q/O/mask base offsets,
+        // is_causal is always 0 (masking is explicit) and alibi/sinks depend
+        // on the head index only, so shifting the row base via the byte
+        // offsets while shrinking n_q is mathematically identical. clFlush
+        // between chunks hands the driver bounded submissions; 0 disables
+        // (GGML_OPENCL_FA_MAX_NQ, resolved at init).
+        //
+        // The kernel's causal-boundary formula needs the TOTAL n_q; chunks
+        // after the first would silently corrupt output if causal FA were
+        // ever enabled here. This backend always passes explicit masks
+        // (is_causal == 0) — keep it loud if that invariant ever changes.
+        GGML_ASSERT(is_causal == 0 && "FA q-chunking requires total n_q for the causal boundary");
+        const int fa_max_nq = backend_ctx->fa_max_nq;
         const size_t wg_size = (size_t) wg_size_fa;
-        size_t local_work_size[] = { wg_size, 1 };
-        size_t global_work_size[] = { (size_t)((n_q + block_m - 1) / block_m) * wg_size, (size_t)(n_head * n_batch) };
-        backend_ctx->enqueue_ndrange_kernel(kernel, 2, global_work_size, local_work_size, dst);
+        const int chunk_rows = (fa_max_nq > 0 && n_q > fa_max_nq) ? fa_max_nq : n_q;
+
+        for (int q_base = 0; q_base < n_q; q_base += chunk_rows) {
+            const int n_q_chunk = std::min(chunk_rows, n_q - q_base);
+            if (q_base > 0 || n_q_chunk != n_q) {
+                const cl_ulong offset_q_chunk    = offset_q + (cl_ulong)q_base * q_nb1;
+                const cl_ulong offset_o_chunk    = offset_o + (cl_ulong)q_base * o_nb1;
+                const cl_ulong offset_mask_chunk = mask ? offset_mask + (cl_ulong)q_base * mask_nb1 : offset_mask;
+                CL_CHECK(clSetKernelArg(kernel, 1,  sizeof(cl_ulong), &offset_q_chunk));
+                CL_CHECK(clSetKernelArg(kernel, 7,  sizeof(cl_ulong), &offset_o_chunk));
+                CL_CHECK(clSetKernelArg(kernel, 9,  sizeof(int),      &n_q_chunk));
+                CL_CHECK(clSetKernelArg(kernel, 32, sizeof(cl_ulong), &offset_mask_chunk));
+            }
+            size_t local_work_size[] = { wg_size, 1 };
+            size_t global_work_size[] = { (size_t)((n_q_chunk + block_m - 1) / block_m) * wg_size, (size_t)(n_head * n_batch) };
+            backend_ctx->enqueue_ndrange_kernel(kernel, 2, global_work_size, local_work_size, dst);
+            if (q_base + chunk_rows < n_q) {
+                CL_CHECK(clFlush(backend_ctx->queue));
+            }
+        }
     }
 }
 

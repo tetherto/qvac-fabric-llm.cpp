@@ -180,7 +180,13 @@ struct clip_ctx {
     // change between images. Populated lazily on the first AUTO resolve.
     bool   fa_budget_cached = false;
     int    fa_auto_min_kv   = 0;   // explicit-attention cutoff (n_patches); <=0 disables it
-    size_t fa_mem_capacity  = 0;   // device memory used to cap the cutoff (0 = unknown)
+    size_t fa_mem_total     = 0;   // device total memory, stable clamp input (0 = unknown)
+    size_t fa_mem_free      = 0;   // device free memory at first resolve, hard-fit check only (0 = unknown)
+    // Set at warmup when the backend reports it lacks efficient (coopmat) FA
+    // (ggml_backend_supports_efficient_fa == false, e.g. Mali via ggml-vulkan).
+    // Turns on the AUTO cutoff default so the budget heuristic prefers the
+    // explicit path for short sequences but keeps scalar FA for huge ones.
+    bool   fa_backend_inefficient = false;
 
     bool debug_output_embeddings = false;
     clip_image_tile_mode tile_mode = CLIP_IMAGE_TILE_MODE_SEQUENTIAL;
@@ -326,6 +332,11 @@ static bool clip_backend_is_mali(const clip_ctx * ctx) {
 // (7056) uses flash-attention (explicit would OOM there).
 static const int CLIP_AUTO_FA_MIN_KV_MALI_DEFAULT = 4096;
 
+// clip_fa_effective_min_kv() — the pure AUTO-budget arithmetic — is defined
+// inline in clip.h (so unit tests can exercise it without linking an
+// unexported symbol across the Windows mtmd.dll boundary). See there for the
+// full behavior contract.
+
 // Resolve the effective flash-attention mode for a single image graph.
 //
 // ENABLED/DISABLED are explicit user choices and are honored as-is. AUTO is
@@ -354,17 +365,20 @@ static clip_flash_attn_type clip_resolve_flash_attn_type(clip_ctx * ctx, int n_p
         if (env_min_kv && env_min_kv[0]) {
             ctx->fa_auto_min_kv = (int) std::strtol(env_min_kv, nullptr, 10);
         } else {
-            ctx->fa_auto_min_kv = clip_backend_is_mali(ctx) ? CLIP_AUTO_FA_MIN_KV_MALI_DEFAULT : 0;
+            // Default the cutoff on for any backend without efficient (coopmat)
+            // FA — detected either at warmup via the backend query
+            // (fa_backend_inefficient) or by Mali device detection (covers
+            // paths where the warmup GPU-only probe doesn't run).
+            ctx->fa_auto_min_kv = (ctx->fa_backend_inefficient || clip_backend_is_mali(ctx))
+                                      ? CLIP_AUTO_FA_MIN_KV_MALI_DEFAULT : 0;
         }
         size_t free_mem = 0, total_mem = 0;
         ggml_backend_dev_t dev = ctx->backend ? ggml_backend_get_device(ctx->backend) : nullptr;
         if (dev) {
             ggml_backend_dev_memory(dev, &free_mem, &total_mem);
         }
-        // Prefer free memory when the backend reports it; many mobile drivers
-        // report 0, so fall back to total. If neither is known, rely on the
-        // threshold alone.
-        ctx->fa_mem_capacity = free_mem > 0 ? free_mem : total_mem;
+        ctx->fa_mem_total = total_mem;
+        ctx->fa_mem_free  = free_mem;
         ctx->fa_budget_cached = true;
     }
 
@@ -378,19 +392,14 @@ static clip_flash_attn_type clip_resolve_flash_attn_type(clip_ctx * ctx, int n_p
     // Explicit attention (mul_mat + softmax) is faster than the scalar FA kernel
     // on no-coopmat GPUs for short sequences, but it materializes an
     // O(n_patches^2 * n_head) score matrix. Memory-constrained devices can't
-    // hold that, so cap the "use explicit" cutoff by how much device memory is
-    // available: the effective cutoff is the smaller of the configured threshold
-    // and the largest n_patches whose explicit scratch (scores + softmax/kqv
-    // temporaries, ~3x) fits in ~half of device memory. This only ever lowers
-    // the cutoff, so low-memory devices fall back to memory-frugal FA sooner.
-    int eff_min_kv = auto_fa_min_kv;
-    const size_t capacity = ctx->fa_mem_capacity;
-    if (capacity > 0) {
-        const size_t n_head = (size_t) ctx->model.hparams.n_head;
-        // 3 * n^2 * n_head * 4 bytes <= capacity / 2  =>  n <= sqrt(capacity / (24*n_head))
-        const double n_max = std::sqrt((double) capacity / (24.0 * (double) std::max<size_t>(n_head, 1)));
-        eff_min_kv = std::min(eff_min_kv, (int) n_max);
-    }
+    // hold that, so cap the "use explicit" cutoff by the memory budget (see
+    // clip_fa_effective_min_kv above: total memory = stable clamp, free memory
+    // = hard-fit check only, no memory info = conservative constant). This only
+    // ever lowers the cutoff, so constrained devices fall back to memory-frugal
+    // FA sooner.
+    const int eff_min_kv = clip_fa_effective_min_kv(
+        auto_fa_min_kv, ctx->fa_mem_total, ctx->fa_mem_free,
+        (int) ctx->model.hparams.n_head);
 
     return (n_patches < eff_min_kv) ? CLIP_FLASH_ATTN_TYPE_DISABLED
                                     : CLIP_FLASH_ATTN_TYPE_ENABLED;
@@ -4622,17 +4631,26 @@ struct clip_model_loader {
     static void warmup(clip_ctx & ctx_clip, const clip_image_f32_batch & batch) {
         support_info_graph info;
 
-        // Disable FA on GPU projectors that lack efficient (coopmat) flash attention.
-        // Without coopmat, Vulkan uses FA_SCALAR which is ~2.6x slower than the matmul path
-        // for CLIP encoder attention (Mali-G715: 38 vs ~100 GFLOPS/s). Coopmat-capable GPUs
-        // keep FA enabled. Resolved at runtime via proc_address — no compile-time backend dep.
-        // Acts on AUTO *and* ENABLED (the addon enables FA by default) — an inefficient
-        // scalar-FA GPU should never be forced into FA; only explicit DISABLED is left alone.
+        // Downgrade FA to AUTO on GPU projectors that lack efficient (coopmat) flash
+        // attention. Without coopmat, Vulkan uses FA_SCALAR which is ~2.6x slower than the
+        // matmul path for CLIP encoder attention (Mali-G715: 38 vs ~100 GFLOPS/s).
+        // Coopmat-capable GPUs keep FA enabled. Resolved at runtime via proc_address — no
+        // compile-time backend dep. Acts on AUTO *and* ENABLED (the addon enables FA by
+        // default) — an inefficient scalar-FA GPU should never be forced into FA; only
+        // explicit DISABLED is left alone. AUTO (not DISABLED, QVAC-21914): a hard disable
+        // forces the explicit path whose O(n_patches^2 * n_head) score matrix OOMs at high
+        // n_pos (image_tile_mode=disabled + large image_max_tokens killed Pixel 9 Pro at
+        // ~12 GB RSS); AUTO keeps the fast explicit path for normal images via the budget
+        // heuristic in clip_resolve_flash_attn_type() and falls back to memory-frugal
+        // scalar FA for huge ones — slow-but-alive beats fast-but-OOM.
         // Default when the backend can't confirm efficient FA = KEEP it. Only ggml-vulkan
         // implements the query (returning false for Mali/non-coopmat); backends that don't
-        // answer (Metal, CUDA, …) have efficient FA and must keep it — disabling there forces
-        // explicit attention whose QK^T overflows the clip compute buffer at high n_pos
-        // (GGML_ASSERT in ggml-backend, e.g. image_tile_mode=disabled + large image_max_tokens).
+        // answer (Metal, CUDA, and also ggml-opencl) have (or are assumed to have) efficient
+        // FA and must keep it — disabling there forces explicit attention whose QK^T
+        // overflows the clip compute buffer at high n_pos (GGML_ASSERT in ggml-backend,
+        // e.g. image_tile_mode=disabled + large image_max_tokens). ggml-opencl's own
+        // giant-encode driver fault at high n_pos is handled inside that backend
+        // (submission bounding: periodic clFlush + FA q-chunking), not via this gate.
         if (ctx_clip.flash_attn_type != CLIP_FLASH_ATTN_TYPE_DISABLED &&
             ctx_clip.backend && ctx_clip.backend != ctx_clip.backend_cpu) {
             bool efficient_fa = true;
@@ -4647,7 +4665,8 @@ struct clip_model_loader {
                 }
             }
             if (!efficient_fa) {
-                ctx_clip.flash_attn_type = CLIP_FLASH_ATTN_TYPE_DISABLED;
+                ctx_clip.flash_attn_type = CLIP_FLASH_ATTN_TYPE_AUTO;
+                ctx_clip.fa_backend_inefficient = true;
             }
         }
 
