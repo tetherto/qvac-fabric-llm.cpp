@@ -1841,6 +1841,7 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                    ggml_are_same_shape(op, op->src[0]) &&
                    ggml_are_same_shape(op, op->src[1]);
         case GGML_OP_GELU_BACK:
+        case GGML_OP_SIGMOID_BACK:
             return op->type == GGML_TYPE_F32 &&
                    op->src[0] != NULL && op->src[1] != NULL &&
                    op->src[0]->type == GGML_TYPE_F32 &&
