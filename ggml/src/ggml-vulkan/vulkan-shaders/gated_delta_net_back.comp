@@ -1,6 +1,12 @@
 #version 450
+//todo: parameterize the rest of this shader by FLOAT_TYPE
+#define FLOAT_TYPE float
+#include "gated_delta_net_base.glsl"
 
-// Backward of gated_delta_net. One workgroup per (q/k head, q/k seq); S_V threads.
+// Backward of gated_delta_net. One workgroup per (q/k head, q/k seq); one subgroup of
+// SUBGROUP_SIZE threads. Columns are processed in waves of COLS_PER_WG, each column
+// handled by LANES_PER_COLUMN lanes holding ROWS_PER_LANE rows in registers (same
+// decomposition as the forward shader gated_delta_net.comp).
 // The recurrence is replayed forward (storing per-token state S_hist), reverse-scanned
 // (storing per-token adjoint A_hist + delta/w), then a row-parallel pass produces
 // d_q/d_k/d_g. State matrices are stored transposed: M[j*S_V + i] = S[i][j].
@@ -11,10 +17,7 @@
 // All per-token history and the running adjoint live in a scratch region of the dst
 // buffer (low register pressure); correctness over speed for this first version.
 
-layout(constant_id = 0) const uint S_V = 128;
-layout(constant_id = 1) const uint KDA = 0;
-
-layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+layout(local_size_x_id = 2, local_size_y = 1, local_size_z = 1) in;
 
 layout(push_constant) uniform Parameters {
     uint H;
@@ -32,12 +35,6 @@ layout(push_constant) uniform Parameters {
     uint wg_stride;             // scratch floats per workgroup
 };
 
-layout(binding = 0) readonly  buffer QBuf     { float data_q[];     };
-layout(binding = 1) readonly  buffer KBuf     { float data_k[];     };
-layout(binding = 2) readonly  buffer VBuf     { float data_v[];     };
-layout(binding = 3) readonly  buffer GBuf     { float data_g[];     };
-layout(binding = 4) readonly  buffer BetaBuf  { float data_beta[];  };
-layout(binding = 5) readonly  buffer StateBuf { float data_state[]; };
 layout(binding = 6) readonly  buffer DBuf     { float data_d[];     };  // gradient of forward output
 layout(binding = 7) coherent  buffer DstBuf   { float data_dst[];   };  // packed grads + scratch
 
@@ -48,16 +45,19 @@ void scratch_barrier() {
     barrier();
 }
 
-shared float sh_k[S_V];
-shared float sh_q[S_V];
-shared float sh_eg[S_V];   // exp(g) per row i
-shared float sh_red[S_V];  // reduction scratch
+// Sum across the whole workgroup (a single subgroup of SUBGROUP_SIZE threads).
+#if USE_SUBGROUP_ADD
+float reduce_sum(float v) {
+    return subgroupAdd(v);
+}
+#else
+shared float sh_red[SUBGROUP_SIZE];  // reduction scratch
 
 float reduce_sum(float v) {
     const uint t = gl_LocalInvocationID.x;
     sh_red[t] = v;
     barrier();
-    for (uint s = S_V / 2u; s > 0u; s >>= 1u) {
+    for (uint s = SUBGROUP_SIZE / 2u; s > 0u; s >>= 1u) {
         if (t < s) {
             sh_red[t] += sh_red[t + s];
         }
@@ -67,9 +67,10 @@ float reduce_sum(float v) {
     barrier();
     return r;
 }
+#endif
 
 void main() {
-    const uint tid   = gl_LocalInvocationID.x;   // column j (phases A) or row i (phase B)
+    const uint tid   = gl_LocalInvocationID.x;   // thread id: strided zero loops + single-thread accumulations
     const uint iq1   = gl_WorkGroupID.x;         // q/k head
     const uint iq3   = gl_WorkGroupID.y;         // q/k seq
     const uint group = H / neq1;                 // v-heads per q/k head
@@ -81,17 +82,8 @@ void main() {
     const uint sc_A       = sc_S + n_tokens * state_size;  // A_hist[t][j*S_V+i]
     const uint sc_delta   = sc_A + n_tokens * state_size;  // delta_hist[t][j]
     const uint sc_w       = sc_delta + n_tokens * S_V;     // w_hist[t][j]
-    const uint sc_carry   = sc_w + n_tokens * S_V;         // running adjoint [j*S_V+i]
 
     const uint state_size_per_snap = state_size * H * n_seqs;
-
-    // zero d_q / d_k for this (iq1, iq3); they accumulate over the v-head group
-    for (uint t = 0; t < n_tokens; t++) {
-        const uint row = (iq1 + neq1 * (t + n_tokens * iq3)) * S_V + tid;
-        data_dst[row]          = 0.0;
-        data_dst[off_dk + row] = 0.0;
-    }
-    barrier();
 
     for (uint gi = 0; gi < group; gi++) {
         const uint iv1 = iq1 + gi * neq1;       // v-head (iv1 % neq1 == iq1)
@@ -100,160 +92,259 @@ void main() {
             // state (the forward op's initial state) has layout [S_v, S_v, H, n_seqs] with no K factor.
             const uint state_in_base  = (iv3 * H + iv1) * state_size;
             const uint state_out_base = (iv3 * H + iv1) * state_size;
-            const uint j = tid;                 // column (phases A)
 
             // ---------- phase A1: forward replay, store S_hist ----------
-            for (uint t = 0; t < n_tokens; t++) {
-                const uint k_off  = iq3 * sq3 + t * sq2 + iq1 * sq1;
-                const uint v_off  = iv3 * sv3 + t * sv2 + iv1 * sv1;
-                const uint gb_off = iv3 * sb3 + t * sb2 + iv1 * sb1;
-                const float beta_val = data_beta[gb_off];
+            for (uint wave = 0; wave < S_V / COLS_PER_WG; ++wave) {
+                const uint which_col = gl_SubgroupInvocationID / LANES_PER_COLUMN;
+                const uint lane      = gl_SubgroupInvocationID % LANES_PER_COLUMN;
+                const uint j         = wave * COLS_PER_WG + which_col;
 
-                sh_k[tid]  = data_k[k_off + tid];
-                sh_eg[tid] = (KDA == 0) ? exp(data_g[gb_off]) : exp(data_g[gb_off * S_V + tid]);
-                barrier();
-
-                const uint sprev = (t == 0u) ? state_in_base : (sc_S + (t - 1u) * state_size);
-                const bool sprev_state = (t == 0u);
-
-                float kv = 0.0;
-                for (uint i = 0; i < S_V; i++) {
-                    const float sprev_ij = sprev_state ? data_state[sprev + j * S_V + i]
-                                                       : data_dst[sprev + j * S_V + i];
-                    kv += sh_eg[i] * sprev_ij * sh_k[i];
+                float s_shard[ROWS_PER_LANE];
+                [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; r++) {
+                    s_shard[r] = data_state[state_in_base + j * S_V + r * LANES_PER_COLUMN + lane];
                 }
-                const float delta_j = (data_v[v_off + j] - kv) * beta_val;
-                for (uint i = 0; i < S_V; i++) {
-                    const float sprev_ij = sprev_state ? data_state[sprev + j * S_V + i]
-                                                       : data_dst[sprev + j * S_V + i];
-                    data_dst[sc_S + t * state_size + j * S_V + i] = sh_eg[i] * sprev_ij + sh_k[i] * delta_j;
-                }
-                barrier();
-            }
 
-            scratch_barrier();
+                for (uint t = 0; t < n_tokens; ++t) {
+                    const uint k_off  = iq3 * sq3 + t * sq2 + iq1 * sq1;
+                    const uint v_off  = iv3 * sv3 + t * sv2 + iv1 * sv1;
+                    const uint gb_off = iv3 * sb3 + t * sb2 + iv1 * sb1;
+                    const float beta_val = data_beta[gb_off];
 
-            // ---------- phase A2: reverse scan, store A_hist / delta / w ----------
-            for (uint i = 0; i < S_V; i++) {
-                data_dst[sc_carry + j * S_V + i] = 0.0;   // running adjoint for "t = n"
-            }
-            barrier();
+                    float k_reg[ROWS_PER_LANE];
+                    [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; ++r) {
+                        const uint i = r * LANES_PER_COLUMN + lane;
+                        k_reg[r] = data_k[k_off + i];
+                    }
 
-            for (int t = int(n_tokens) - 1; t >= 0; t--) {
-                const uint ut = uint(t);
-                const uint q_off  = iq3 * sq3 + ut * sq2 + iq1 * sq1;
-                const uint k_off  = q_off;
-                const uint v_off  = iv3 * sv3 + ut * sv2 + iv1 * sv1;
-                const uint gb_off = iv3 * sb3 + ut * sb2 + iv1 * sb1;
-                const float beta_val = data_beta[gb_off];
-
-                sh_k[tid]  = data_k[k_off + tid];
-                sh_q[tid]  = data_q[q_off + tid];
-                sh_eg[tid] = (KDA == 0) ? exp(data_g[gb_off]) : exp(data_g[gb_off * S_V + tid]);
-                barrier();
-
-                const uint do_off = (iv3 * n_tokens * H + iv1) * S_V + ut * S_V * H;
-                const float do_j = data_d[do_off + j];
-
-                // A += scale * q (x) do ; plus state-output gradient seed (covers K=1 final
-                // state and K>1 snapshots via target_slot; matches the CPU kernel).
-                for (uint i = 0; i < S_V; i++) {
-                    data_dst[sc_carry + j * S_V + i] += scale * sh_q[i] * do_j;
-                }
-                {
-                    // matches the forward op's slot mapping: slot 0 = most recent state (t = n_tokens-1).
-                    const int target_slot = int(n_tokens) - 1 - t;
-                    if (target_slot >= 0 && target_slot < int(K)) {
-                        const uint dss = s_off + uint(target_slot) * state_size_per_snap + state_out_base;
-                        for (uint i = 0; i < S_V; i++) {
-                            data_dst[sc_carry + j * S_V + i] += data_d[dss + j * S_V + i];
+                    float eq_reg[ROWS_PER_LANE];
+                    if (KDA == 0) {
+                        const float g_val = exp(data_g[gb_off]);
+                        [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; ++r) {
+                            eq_reg[r] = g_val;
+                        }
+                    } else {
+                        const uint g_base = gb_off * S_V;
+                        [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; ++r) {
+                            const uint i = r * LANES_PER_COLUMN + lane;
+                            eq_reg[r] = exp(data_g[g_base + i]);
                         }
                     }
-                }
-                // store A_hist[t] (adjoint used by the row pass)
-                for (uint i = 0; i < S_V; i++) {
-                    data_dst[sc_A + ut * state_size + j * S_V + i] = data_dst[sc_carry + j * S_V + i];
-                }
 
-                // recompute S'_t column j ; u, delta, d_delta, w
-                const uint sprev = (ut == 0u) ? state_in_base : (sc_S + (ut - 1u) * state_size);
-                const bool sprev_state = (ut == 0u);
-                float su = 0.0;
-                float sd = 0.0;
-                for (uint i = 0; i < S_V; i++) {
-                    const float sprev_ij = sprev_state ? data_state[sprev + j * S_V + i]
-                                                       : data_dst[sprev + j * S_V + i];
-                    su += sh_eg[i] * sprev_ij * sh_k[i];
-                    sd += data_dst[sc_carry + j * S_V + i] * sh_k[i];
-                }
-                const float u_j = data_v[v_off + j] - su;
-                const float w_j = beta_val * sd;
-                data_dst[sc_delta + ut * S_V + j] = beta_val * u_j;
-                data_dst[sc_w     + ut * S_V + j] = w_j;
-                data_dst[off_dv + (iv1 + H * (ut + n_tokens * iv3)) * S_V + j] = w_j;
+                    const float v_val = data_v[v_off + j];
 
-                const float dbeta = reduce_sum(sd * u_j);
-                if (tid == 0u) {
-                    data_dst[off_db + iv1 + H * (ut + n_tokens * iv3)] = dbeta;
-                }
+                    float kv_shard = 0.0;
+                    [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; ++r) {
+                        kv_shard = fma(eq_reg[r], s_shard[r] * k_reg[r], kv_shard);
+                    }
+                    const float kv_j = reduce_partial(kv_shard);
 
-                // propagate A_{t-1} = diag(exp(g)) (A - k w^T)
-                for (uint i = 0; i < S_V; i++) {
-                    const float a = data_dst[sc_carry + j * S_V + i];
-                    data_dst[sc_carry + j * S_V + i] = sh_eg[i] * (a - sh_k[i] * w_j);
+                    const float delta_j = (v_val - kv_j) * beta_val;
+
+                    [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; ++r) {
+                        s_shard[r] = fma(eq_reg[r], s_shard[r], k_reg[r] * delta_j);
+                        const uint i = r * LANES_PER_COLUMN + lane;
+                        data_dst[sc_S + t * state_size + j * S_V + i] = s_shard[r];
+                    }
                 }
-                barrier();
             }
 
-            // initial-state gradient: layout [S_v, S_v, H, n_seqs] (no K factor, unlike the forward output).
-            for (uint i = 0; i < S_V; i++) {
-                data_dst[off_ds + (iv3 * H + iv1) * state_size + j * S_V + i] =
-                    data_dst[sc_carry + j * S_V + i];
+            // No barrier between A1 and A2: each invocation re-reads only the S_hist
+            // elements it wrote itself (same wave/lane decomposition in both phases).
+
+            // ---------- phase A2: reverse scan, store A_hist / delta / w ----------
+            for (uint wave = 0; wave < S_V / COLS_PER_WG; ++wave) {
+                const uint which_col = gl_SubgroupInvocationID / LANES_PER_COLUMN;
+                const uint lane      = gl_SubgroupInvocationID % LANES_PER_COLUMN;
+                const uint j         = wave * COLS_PER_WG + which_col;
+
+                float carry_shard[ROWS_PER_LANE];
+                [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; ++r) {
+                    carry_shard[r] = 0.0;
+                }
+
+                for (int t = int(n_tokens) - 1; t >= 0; t--) {
+                    const uint ut = uint(t);
+                    const uint q_off  = iq3 * sq3 + ut * sq2 + iq1 * sq1;
+                    const uint k_off  = q_off;
+                    const uint v_off  = iv3 * sv3 + ut * sv2 + iv1 * sv1;
+                    const uint gb_off = iv3 * sb3 + ut * sb2 + iv1 * sb1;
+                    const float beta_val = data_beta[gb_off];
+
+                    float k_reg[ROWS_PER_LANE];
+                    float q_reg[ROWS_PER_LANE];
+                    [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; ++r) {
+                        const uint i = r * LANES_PER_COLUMN + lane;
+                        k_reg[r] = data_k[k_off + i];
+                        q_reg[r] = data_q[q_off + i];
+                    }
+
+                    float eg_reg[ROWS_PER_LANE];
+                    if (KDA == 0) {
+                        const float g_val = exp(data_g[gb_off]);
+                        [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; ++r) {
+                            eg_reg[r] = g_val;
+                        }
+                    } else {
+                        const uint g_base = gb_off * S_V;
+                        [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; ++r) {
+                            const uint i = r * LANES_PER_COLUMN + lane;
+                            eg_reg[r] = exp(data_g[g_base + i]);
+                        }
+                    }
+
+                    const uint do_off = (iv3 * n_tokens * H + iv1) * S_V + ut * S_V * H;
+                    const float do_j = data_d[do_off + j];
+
+                    // A += scale * q (x) do ; plus state-output gradient seed (covers K=1 final
+                    // state and K>1 snapshots via target_slot; matches the CPU kernel).
+                    [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; ++r) {
+                        const uint i = r * LANES_PER_COLUMN + lane;
+                        carry_shard[r] += scale * q_reg[r] * do_j;
+                    }
+                    {
+                        // matches the forward op's slot mapping: slot 0 = most recent state (t = n_tokens-1).
+                        const int target_slot = int(n_tokens) - 1 - int(t);
+                        if (target_slot >= 0 && target_slot < int(K)) {
+                            const uint dss = s_off + uint(target_slot) * state_size_per_snap + state_out_base;
+                            [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; ++r) {
+                                const uint i = r * LANES_PER_COLUMN + lane;
+                                carry_shard[r] += data_d[dss + j * S_V + i];
+                            }
+                        }
+                    }
+                    // store A_hist[t] (adjoint used by the row pass)
+                    [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; ++r) {
+                        const uint i = r * LANES_PER_COLUMN + lane;
+                        data_dst[sc_A + ut * state_size + j * S_V + i] = carry_shard[r];
+                    }
+
+                    // recompute S'_t column j ; u, delta, d_delta, w
+                    const uint sprev = (ut == 0u) ? state_in_base : (sc_S + (ut - 1u) * state_size);
+                    const bool sprev_state = (ut == 0u);
+
+                    float su_shard = 0.0;
+                    float sd_shard = 0.0;
+                    [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; ++r) {
+                        const uint  i = r * LANES_PER_COLUMN + lane;
+                        const float sprev_ij =
+                            sprev_state ? data_state[sprev + j * S_V + i] : data_dst[sprev + j * S_V + i];
+                        su_shard = fma(eg_reg[r], sprev_ij * k_reg[r], su_shard);
+                        sd_shard = fma(carry_shard[r], k_reg[r], sd_shard);
+                    }
+                    const float su  = reduce_partial(su_shard);
+                    const float sd  = reduce_partial(sd_shard);
+                    const float u_j = data_v[v_off + j] - su;
+                    const float w_j = beta_val * sd;
+
+                    if (lane == 0u) {
+                        data_dst[sc_delta + ut * S_V + j] = beta_val * u_j;
+                        data_dst[sc_w     + ut * S_V + j] = w_j;
+                        data_dst[off_dv + (iv1 + H * (ut + n_tokens * iv3)) * S_V + j] = w_j;
+                    }
+
+                    // d_beta: one contribution per column; only tid 0 ever touches the
+                    // destination, so the first wave initialises and later waves accumulate
+                    // without any cross-thread ordering.
+                    const float dbeta_masked = (lane == 0u) ? (sd * u_j) : 0.0;
+                    const float dbeta_wave   = reduce_sum(dbeta_masked);
+                    if (tid == 0u) {
+                        const uint db_idx = off_db + iv1 + H * (ut + n_tokens * iv3);
+                        if (wave == 0u) {
+                            data_dst[db_idx] = dbeta_wave;
+                        } else {
+                            data_dst[db_idx] += dbeta_wave;
+                        }
+                    }
+
+                    // propagate A_{t-1} = diag(exp(g)) (A - k w^T)
+                    [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; ++r) {
+                        const uint i = r * LANES_PER_COLUMN + lane;
+                        const float a = carry_shard[r];
+                        carry_shard[r] = fma(k_reg[r], -w_j, a) * eg_reg[r];
+                    }
+                }
+
+                // initial-state gradient: layout [S_v, S_v, H, n_seqs] (no K factor, unlike the forward output).
+                [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; ++r) {
+                    const uint i = r * LANES_PER_COLUMN + lane;
+                    data_dst[off_ds + (iv3 * H + iv1) * state_size + j * S_V + i] = carry_shard[r];
+                }
             }
+
+            // A1/A2 scratch (S_hist / A_hist / delta / w) -> phase B handoff: phase B reads
+            // these across all columns, i.e. across threads. This barrier is required.
             scratch_barrier();
 
             // ---------- phase B: row pass for d_q / d_k / d_g ----------
-            const uint i = tid;   // row
-            for (uint t = 0; t < n_tokens; t++) {
-                const uint k_off  = iq3 * sq3 + t * sq2 + iq1 * sq1;
-                const uint gb_off = iv3 * sb3 + t * sb2 + iv1 * sb1;
-                const uint do_off = (iv3 * n_tokens * H + iv1) * S_V + t * S_V * H;
+            for (uint wave = 0; wave < S_V / COLS_PER_WG; ++wave) {
+                const uint which_row = gl_SubgroupInvocationID / LANES_PER_COLUMN;
+                const uint lane      = gl_SubgroupInvocationID % LANES_PER_COLUMN;
+                const uint i         = wave * COLS_PER_WG + which_row;
 
-                const float k_i  = data_k[k_off + i];
-                const float eg_i = (KDA == 0) ? exp(data_g[gb_off]) : exp(data_g[gb_off * S_V + i]);
+                for (uint t = 0; t < n_tokens; t++) {
+                    const uint k_off  = iq3 * sq3 + t * sq2 + iq1 * sq1;
+                    const uint gb_off = iv3 * sb3 + t * sb2 + iv1 * sb1;
+                    const uint do_off = (iv3 * n_tokens * H + iv1) * S_V + t * S_V * H;
 
-                const uint sprev = (t == 0u) ? state_in_base : (sc_S + (t - 1u) * state_size);
-                const bool sprev_state = (t == 0u);
+                    const float k_i  = data_k[k_off + i];
+                    const float eg_i = (KDA == 0) ? exp(data_g[gb_off]) : exp(data_g[gb_off * S_V + i]);
 
-                float dq = 0.0;
-                float dk = 0.0;
-                float dg = 0.0;
-                for (uint jj = 0; jj < S_V; jj++) {
-                    const float st_ij    = data_dst[sc_S + t * state_size + jj * S_V + i];
-                    const float a_ij     = data_dst[sc_A + t * state_size + jj * S_V + i];
-                    const float delta_j  = data_dst[sc_delta + t * S_V + jj];
-                    const float w_j      = data_dst[sc_w     + t * S_V + jj];
-                    const float do_j     = data_d[do_off + jj];
-                    const float sprev_ij = sprev_state ? data_state[sprev + jj * S_V + i]
-                                                       : data_dst[sprev + jj * S_V + i];
-                    const float sp_ij = eg_i * sprev_ij;
-                    dq += st_ij * do_j;
-                    dk += a_ij * delta_j - sp_ij * w_j;
-                    dg += (a_ij - k_i * w_j) * sp_ij;
-                }
-                const uint row = (iq1 + neq1 * (t + n_tokens * iq3)) * S_V + i;
-                data_dst[row]          += scale * dq;
-                data_dst[off_dk + row] += dk;
+                    const uint sprev = (t == 0u) ? state_in_base : (sc_S + (t - 1u) * state_size);
+                    const bool sprev_state = (t == 0u);
 
-                if (KDA != 0) {
-                    data_dst[off_dg + (iv1 + H * (t + n_tokens * iv3)) * S_V + i] = dg;
-                } else {
-                    const float dg_sum = reduce_sum(dg);
-                    if (tid == 0u) {
-                        data_dst[off_dg + (iv1 + H * (t + n_tokens * iv3))] = dg_sum;
+                    float dq_shard = 0.0, dk_shard = 0.0, dg_shard = 0.0;
+                    [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; ++r) {
+                        const uint jj = r * LANES_PER_COLUMN + lane;
+                        const float st_ij    = data_dst[sc_S + t * state_size + jj * S_V + i];
+                        const float a_ij     = data_dst[sc_A + t * state_size + jj * S_V + i];
+                        const float delta_j  = data_dst[sc_delta + t * S_V + jj];
+                        const float w_j      = data_dst[sc_w     + t * S_V + jj];
+                        const float do_j     = data_d[do_off + jj];
+                        const float sprev_ij = sprev_state ? data_state[sprev + jj * S_V + i]
+                                                        : data_dst[sprev + jj * S_V + i];
+                        const float sp_ij = eg_i * sprev_ij;
+                        dq_shard = fma(st_ij, do_j, dq_shard);
+                        dk_shard += fma(a_ij, delta_j, -sp_ij * w_j);
+                        dg_shard = fma(fma(-k_i, w_j, a_ij), sp_ij, dg_shard);
+                    }
+
+                    const float dq = reduce_partial(dq_shard);
+                    const float dk = reduce_partial(dk_shard);
+                    const float dg = reduce_partial(dg_shard);
+
+                    // d_q/d_k accumulate over the v-head group (gi/sgi); the first iteration
+                    // initialises instead of zeroing up front. Row i's writer is lane 0 of
+                    // the same cluster every iteration, so no cross-thread ordering is needed.
+                    const uint row = (iq1 + neq1 * (t + n_tokens * iq3)) * S_V + i;
+                    if (lane == 0u) {
+                        if (gi == 0u && sgi == 0u) {
+                            data_dst[row]          = scale * dq;
+                            data_dst[off_dk + row] = dk;
+                        } else {
+                            data_dst[row]          = fma(scale, dq, data_dst[row]);
+                            data_dst[off_dk + row] += dk;
+                        }
+                    }
+
+                    if (KDA != 0) {
+                        if (lane == 0u) {
+                            data_dst[off_dg + (iv1 + H * (t + n_tokens * iv3)) * S_V + i] = dg;
+                        }
+                    } else {
+                        // scalar d_g: one contribution per row; tid 0 only, first wave
+                        // initialises, later waves accumulate
+                        const float dg_masked   = (lane == 0u) ? dg : 0.0;
+                        const float dg_sum_wave = reduce_sum(dg_masked);
+                        if (tid == 0u) {
+                            const uint dg_idx = off_dg + (iv1 + H * (t + n_tokens * iv3));
+                            if (wave == 0u) {
+                                data_dst[dg_idx] = dg_sum_wave;
+                            } else {
+                                data_dst[dg_idx] += dg_sum_wave;
+                            }
+                        }
                     }
                 }
-                barrier();
             }
             scratch_barrier();
         }

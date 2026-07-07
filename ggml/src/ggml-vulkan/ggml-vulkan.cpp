@@ -4095,6 +4095,11 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             {"gated_delta_net_f32_d64",     "gated_delta_net_f32_d64_kda"},
             {"gated_delta_net_f32_d128",    "gated_delta_net_f32_d128_kda"},
         };
+        const char * gdn_back_names[][2] = {
+            {"gated_delta_net_back_f32_d32",  "gated_delta_net_back_f32_d32_kda"},
+            {"gated_delta_net_back_f32_d64",  "gated_delta_net_back_f32_d64_kda"},
+            {"gated_delta_net_back_f32_d128", "gated_delta_net_back_f32_d128_kda"},
+        };
         for (uint32_t si = 0; si < 4; si++) {
             const uint32_t S_V = gdn_sizes[si];
             GGML_ASSERT(is_pow2(S_V));
@@ -4139,17 +4144,24 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             const bool use_clustered_reduce = device->subgroup_arithmetic && device->subgroup_clustered && need_partial_subgroup_reduce;
             const bool use_subgroup_reduce = device->subgroup_arithmetic && !need_partial_subgroup_reduce;
             const bool use_subgroup_ops = use_clustered_reduce || use_subgroup_reduce;
-            size_t gdn_len;
+            size_t gdn_len, gdn_back_len;
             const void * gdn_data;
+            const void * gdn_back_data;
             if (use_clustered_reduce) {
                 gdn_len = gated_delta_net_f32_len;
+                gdn_back_len = gated_delta_net_back_f32_len;
                 gdn_data = (const void *)gated_delta_net_f32_data;
+                gdn_back_data = (const void *)gated_delta_net_back_f32_data;
             } else if (use_subgroup_reduce) {
                 gdn_len = gated_delta_net_f32_nocluster_len;
+                gdn_back_len = gated_delta_net_back_f32_nocluster_len;
                 gdn_data = (const void *)gated_delta_net_f32_nocluster_data;
+                gdn_back_data = (const void *)gated_delta_net_back_f32_nocluster_data;
             } else {
                 gdn_len = gated_delta_net_f32_shmem_len;
+                gdn_back_len = gated_delta_net_back_f32_shmem_len;
                 gdn_data = (const void *)gated_delta_net_f32_shmem_data;
+                gdn_back_data = (const void *)gated_delta_net_back_f32_shmem_data;
             }
 
             const uint32_t cols_per_wg = gdn_subgroup_size / lanes_per_column;
@@ -4159,24 +4171,13 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                 ggml_vk_create_pipeline(device, device->pipeline_gated_delta_net[si][kda],
                     gdn_names[si][kda], gdn_len, gdn_data, "main", 7, sizeof(vk_op_gated_delta_net_push_constants),
                     wg_denoms, {S_V, kda, gdn_subgroup_size, lanes_per_column}, 1, true, use_subgroup_ops, gdn_subgroup_size);
-            }
-        }
-    }
 
-    {
-        const uint32_t gdn_sizes[] = {32, 64, 128};
-        const char * gdn_back_names[][2] = {
-            {"gated_delta_net_back_f32_d32",  "gated_delta_net_back_f32_d32_kda"},
-            {"gated_delta_net_back_f32_d64",  "gated_delta_net_back_f32_d64_kda"},
-            {"gated_delta_net_back_f32_d128", "gated_delta_net_back_f32_d128_kda"},
-        };
-        for (uint32_t si = 0; si < 3; si++) {
-            const uint32_t S_V = gdn_sizes[si];
-            for (uint32_t kda = 0; kda < 2; kda++) {
-                ggml_vk_create_pipeline(device, device->pipeline_gated_delta_net_back[si][kda],
-                    gdn_back_names[si][kda], gated_delta_net_back_f32_len, gated_delta_net_back_f32_data,
-                    "main", 8, sizeof(vk_op_gated_delta_net_back_push_constants),
-                    {1, 1, 1}, {S_V, kda}, 1, true);
+                if (si != 0) {
+                    ggml_vk_create_pipeline(device, device->pipeline_gated_delta_net_back[si-1][kda],
+                        gdn_back_names[si-1][kda], gdn_back_len, gdn_back_data,
+                        "main", 8, sizeof(vk_op_gated_delta_net_back_push_constants),
+                        {1, 1, 1}, {S_V, kda, gdn_subgroup_size, lanes_per_column}, 1, true, use_subgroup_ops, gdn_subgroup_size);
+                }
             }
         }
     }
@@ -11769,7 +11770,8 @@ static void ggml_vk_gated_delta_net_back(ggml_backend_vk_context * ctx, vk_conte
     const uint32_t off_ds = off_db + pad4(ggml_nelements(dst->src[4]));
     const uint32_t off_scratch = off_ds + pad4(ggml_nelements(dst->src[5]));
 
-    const uint32_t wg_stride = n_tokens * (2u * S_v * S_v + 2u * S_v) + S_v * S_v;
+    // sc_carry scratch region (S_v * S_v) is not needed / unused.
+    const uint32_t wg_stride = n_tokens * (2u * S_v * S_v + 2u * S_v);
 
     const float scale = 1.0f / sqrtf((float)S_v);
     const vk_op_gated_delta_net_back_push_constants pc = {
