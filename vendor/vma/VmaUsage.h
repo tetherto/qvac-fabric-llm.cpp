@@ -103,7 +103,9 @@ include all public interface declarations. Example:
     #pragma GCC diagnostic ignored "-Wmissing-field-initializers"
     #pragma GCC diagnostic ignored "-Wunused-parameter"
     #pragma GCC diagnostic ignored "-Wunused-variable"
-    #pragma GCC diagnostic ignored "-Wsuggest-attribute=noreturn"
+    #ifndef __clang__
+        #pragma GCC diagnostic ignored "-Wsuggest-attribute=noreturn"
+    #endif
 #endif
 
 #ifdef VMA_VOLK_HEADER_PATH
