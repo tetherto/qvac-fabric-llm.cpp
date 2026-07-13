@@ -61,7 +61,7 @@ void main() {
     vec2 sum = vec2(0.0f, 0.0f);
 
     [[unroll]] for (uint col = tid; col < ncols; col += BLOCK_SIZE) {
-        const float xi = float(data_a[a_offset + col]);
+        const float xi = float(data_a[a_offset + col*p.nb00]);
         sum.x += xi;
         sum.y += xi * xi;
     }
@@ -83,7 +83,7 @@ void main() {
     const float inv_std = inversesqrt(var + p.param1);
 
     [[unroll]] for (uint col = tid; col < ncols; col += BLOCK_SIZE) {
-        float result = (float(data_a[a_offset + col]) - mean) * inv_std;
+        float result = (float(data_a[a_offset + col*p.nb00]) - mean) * inv_std;
         if (do_multiply) {
             result *= float(data_b[b_offset + col]);
         }
