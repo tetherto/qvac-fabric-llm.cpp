@@ -20863,6 +20863,11 @@ static void ggml_cl_upscale(ggml_backend_t backend, const ggml_tensor * src0, gg
     const int ne2 = dst->ne[2];
     const int ne3 = dst->ne[3];
 
+    // Zero source dims would make the sf* scale factors below divide by zero (+inf).
+    if (ne00 == 0 || ne01 == 0 || ne02 == 0 || ne03 == 0) {
+        return;
+    }
+
     float sf0 = (float)ne0 / ne00;
     float sf1 = (float)ne1 / ne01;
     float sf2 = (float)ne2 / ne02;
