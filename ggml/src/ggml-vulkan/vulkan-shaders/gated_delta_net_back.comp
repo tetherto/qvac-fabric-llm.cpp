@@ -3,21 +3,42 @@
 #define FLOAT_TYPE float
 #include "gated_delta_net_base.glsl"
 
-// Backward of gated_delta_net. One workgroup per (q/k head, q/k seq); one subgroup of
-// SUBGROUP_SIZE threads. Columns are processed in waves of COLS_PER_WG, each column
-// handled by LANES_PER_COLUMN lanes holding ROWS_PER_LANE rows in registers (same
-// decomposition as the forward shader gated_delta_net.comp).
-// The recurrence is replayed forward (storing per-token state S_hist), reverse-scanned
-// (storing per-token adjoint A_hist + delta/w), then a row-parallel pass produces
-// d_q/d_k/d_g. State matrices are stored transposed: M[j*S_V + i] = S[i][j].
+// Backward of gated_delta_net. One workgroup per (q/k head, q/k seq), looping over the
+// v-heads/seqs of its GQA group (q/k grads accumulate across the group), with three
+// phases per group member:
+//   A1: forward replay of the recurrence; stores per-token state S_hist and residual u.
+//   A2: reverse scan of the adjoint; stores per-token A_hist and sd = A^T k, emits
+//       d_v and d_state.
+//   B:  row-parallel pass over the stored history; emits d_q, d_k, d_g, d_beta.
+// State matrices are stored transposed (M[j*S_V + i] = S[i][j]); all per-token history
+// lives in a scratch region of the dst buffer.
 //
-// q/k broadcast over v-heads (GQA); their grads accumulate across the head group,
-// so this workgroup loops over the v-heads/seqs that map to (iq1, iq3).
+// A1/A2 process columns in waves of COLS_PER_STEP = WG_SIZE / LANES_PER_COLUMN, each
+// column handled by LANES_PER_COLUMN lanes holding ROWS_PER_LANE rows in registers.
+// Multiple subgroups per workgroup process more columns concurrently, lifting SM
+// occupancy above the one-warp-per-block ceiling (the token loop is serial, so more
+// resident warps hide its memory latency). A column's lanes always sit within one
+// subgroup, so the per-column reduce_partial stays a subgroup op.
 //
-// All per-token history and the running adjoint live in a scratch region of the dst
-// buffer (low register pressure); correctness over speed for this first version.
+// Phase B instead maps lanes to contiguous rows i (coalesced reads of the column-major
+// matrices) and walks columns serially per thread, needing no cross-lane reduction
+// except the scalar-g d_g sum. exp(g)*S_prev is reconstructed as S_t - k*delta^T (the
+// forward update solved for the decayed previous state), so B reads only S_hist[t] and
+// A_hist[t]. B's tokens are independent: with WG_SIZE > S_V, WG_SIZE/S_V tokens are
+// processed concurrently.
 
-layout(local_size_x_id = 2, local_size_y = 1, local_size_z = 1) in;
+// WG_SIZE (workgroup threads) is a multiple of SUBGROUP_SIZE; default = one subgroup.
+layout(constant_id = 4) const uint WG_SIZE = 32;
+const uint COLS_PER_STEP  = WG_SIZE / LANES_PER_COLUMN;  // columns advanced per wave, across all subgroups
+const uint NUM_SUBGROUPS  = WG_SIZE / SUBGROUP_SIZE;     // subgroups per workgroup
+
+// Row-pass decomposition: lanes own contiguous rows; spare threads process extra tokens.
+// At most one of T_TILE / ROW_WAVES exceeds 1 (both are 1 when WG_SIZE == S_V).
+const uint ROWS_ACTIVE = (WG_SIZE < S_V) ? WG_SIZE : S_V;  // rows in flight per token
+const uint T_TILE      = WG_SIZE / ROWS_ACTIVE;            // tokens in flight
+const uint ROW_WAVES   = S_V / ROWS_ACTIVE;                // row passes per token
+
+layout(local_size_x_id = 4, local_size_y = 1, local_size_z = 1) in;
 
 layout(push_constant) uniform Parameters {
     uint H;
@@ -25,8 +46,8 @@ layout(push_constant) uniform Parameters {
     uint n_seqs;
     uint K;
     uint s_off;                 // d_state region offset within the gradient input d
-    uint sq1, sq2, sq3;
-    uint sv1, sv2, sv3;
+    uint sq1, sq2, sq3;         // q/k strides in floats: [head, token, seq]
+    uint sv1, sv2, sv3;         // v strides in floats: [head, token, seq]
     uint sb1, sb2, sb3;         // g and beta share this stride (g has ne0 = 1 or S_V)
     uint neq1, rq3;
     float scale;
@@ -45,43 +66,81 @@ void scratch_barrier() {
     barrier();
 }
 
-// Sum across the whole workgroup (a single subgroup of SUBGROUP_SIZE threads).
+// Sum one value per thread across a token's block of ROWS_ACTIVE contiguous threads
+// (row pass, scalar-g d_g only). Returns the block total to every thread in the block.
 #if USE_SUBGROUP_ADD
-float reduce_sum(float v) {
-    return subgroupAdd(v);
+shared float sh_sg[NUM_SUBGROUPS];   // one partial per subgroup
+
+float reduce_token_block(float v) {
+    if (ROWS_ACTIVE < SUBGROUP_SIZE) {
+#if USE_SUBGROUP_CLUSTERED
+        return clustered_add(v, ROWS_ACTIVE);
+#else
+        // unreachable: the nocluster pipeline is only created when S_V >= SUBGROUP_SIZE
+        return v;
+#endif
+    }
+
+    const float s = subgroupAdd(v);
+    if (ROWS_ACTIVE == SUBGROUP_SIZE) {
+        return s;
+    }
+
+    // block spans ROWS_ACTIVE / SUBGROUP_SIZE subgroups: combine via shared memory,
+    // assuming the linear tid -> subgroup mapping guaranteed by the pipeline's required
+    // subgroup size. The leading barrier orders re-use of sh_sg against the previous
+    // call's readers.
+    barrier();
+    if (gl_SubgroupInvocationID == 0u) {
+        sh_sg[gl_SubgroupID] = s;
+    }
+    barrier();
+
+    const uint sg_per_block = ROWS_ACTIVE / SUBGROUP_SIZE;
+    const uint first = (gl_LocalInvocationID.x / ROWS_ACTIVE) * sg_per_block;
+    float total = 0.0;
+    [[unroll]] for (uint k = 0u; k < sg_per_block; ++k) {
+        total += sh_sg[first + k];
+    }
+    return total;
 }
 #else
-shared float sh_red[SUBGROUP_SIZE];  // reduction scratch
+// shmem variant is created single-subgroup (WG_SIZE == SUBGROUP_SIZE): tree over each block.
+shared float sh_red[WG_SIZE];  // reduction scratch
 
-float reduce_sum(float v) {
+float reduce_token_block(float v) {
     const uint t = gl_LocalInvocationID.x;
+    // The leading barrier orders re-use of sh_red against the previous call's readers.
+    barrier();
     sh_red[t] = v;
     barrier();
-    for (uint s = SUBGROUP_SIZE / 2u; s > 0u; s >>= 1u) {
-        if (t < s) {
+    for (uint s = ROWS_ACTIVE / 2u; s > 0u; s >>= 1u) {
+        if ((t % ROWS_ACTIVE) < s) {
             sh_red[t] += sh_red[t + s];
         }
         barrier();
     }
-    float r = sh_red[0];
-    barrier();
-    return r;
+    return sh_red[(t / ROWS_ACTIVE) * ROWS_ACTIVE];
 }
 #endif
 
 void main() {
-    const uint tid   = gl_LocalInvocationID.x;   // thread id: strided zero loops + single-thread accumulations
+    const uint tid   = gl_LocalInvocationID.x;
     const uint iq1   = gl_WorkGroupID.x;         // q/k head
     const uint iq3   = gl_WorkGroupID.y;         // q/k seq
     const uint group = H / neq1;                 // v-heads per q/k head
+
+    // row-pass (phase B) thread mapping
+    const uint i_lane = tid % ROWS_ACTIVE;
+    const uint t_sub  = tid / ROWS_ACTIVE;
 
     const uint state_size = S_V * S_V;
     const uint wg_id      = iq1 + neq1 * iq3;
     const uint sc_base    = off_scratch + wg_id * wg_stride;
     const uint sc_S       = sc_base;                       // S_hist[t][j*S_V+i]
     const uint sc_A       = sc_S + n_tokens * state_size;  // A_hist[t][j*S_V+i]
-    const uint sc_delta   = sc_A + n_tokens * state_size;  // delta_hist[t][j]
-    const uint sc_w       = sc_delta + n_tokens * S_V;     // w_hist[t][j]
+    const uint sc_u       = sc_A + n_tokens * state_size;  // u_hist[t][j]  (u = v - kv ; delta = beta*u)
+    const uint sc_sd      = sc_u + n_tokens * S_V;         // sd_hist[t][j] (sd = A^T k ; w = beta*sd)
 
     const uint state_size_per_snap = state_size * H * n_seqs;
 
@@ -93,14 +152,14 @@ void main() {
             const uint state_in_base  = (iv3 * H + iv1) * state_size;
             const uint state_out_base = (iv3 * H + iv1) * state_size;
 
-            // ---------- phase A1: forward replay, store S_hist ----------
-            for (uint wave = 0; wave < S_V / COLS_PER_WG; ++wave) {
-                const uint which_col = gl_SubgroupInvocationID / LANES_PER_COLUMN;
-                const uint lane      = gl_SubgroupInvocationID % LANES_PER_COLUMN;
-                const uint j         = wave * COLS_PER_WG + which_col;
+            // ---------- phase A1: forward replay, store S_hist / u ----------
+            for (uint wave = 0; wave < S_V / COLS_PER_STEP; ++wave) {
+                const uint which_col = gl_LocalInvocationID.x / LANES_PER_COLUMN;
+                const uint lane      = gl_LocalInvocationID.x % LANES_PER_COLUMN;
+                const uint j         = wave * COLS_PER_STEP + which_col;
 
                 float s_shard[ROWS_PER_LANE];
-                [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; r++) {
+                [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; ++r) {
                     s_shard[r] = data_state[state_in_base + j * S_V + r * LANES_PER_COLUMN + lane];
                 }
 
@@ -138,7 +197,12 @@ void main() {
                     }
                     const float kv_j = reduce_partial(kv_shard);
 
-                    const float delta_j = (v_val - kv_j) * beta_val;
+                    const float u_j     = v_val - kv_j;
+                    const float delta_j = u_j * beta_val;
+
+                    if (lane == 0u) {
+                        data_dst[sc_u + t * S_V + j] = u_j;
+                    }
 
                     [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; ++r) {
                         s_shard[r] = fma(eq_reg[r], s_shard[r], k_reg[r] * delta_j);
@@ -148,14 +212,14 @@ void main() {
                 }
             }
 
-            // No barrier between A1 and A2: each invocation re-reads only the S_hist
-            // elements it wrote itself (same wave/lane decomposition in both phases).
+            // No barrier between A1 and A2: A2 reads no scratch (u_hist and S_hist are
+            // consumed by the row pass, after scratch_barrier).
 
-            // ---------- phase A2: reverse scan, store A_hist / delta / w ----------
-            for (uint wave = 0; wave < S_V / COLS_PER_WG; ++wave) {
-                const uint which_col = gl_SubgroupInvocationID / LANES_PER_COLUMN;
-                const uint lane      = gl_SubgroupInvocationID % LANES_PER_COLUMN;
-                const uint j         = wave * COLS_PER_WG + which_col;
+            // ---------- phase A2: reverse scan, store A_hist / sd / d_v / d_state ----------
+            for (uint wave = 0; wave < S_V / COLS_PER_STEP; ++wave) {
+                const uint which_col = gl_LocalInvocationID.x / LANES_PER_COLUMN;
+                const uint lane      = gl_LocalInvocationID.x % LANES_PER_COLUMN;
+                const uint j         = wave * COLS_PER_STEP + which_col;
 
                 float carry_shard[ROWS_PER_LANE];
                 [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; ++r) {
@@ -166,7 +230,6 @@ void main() {
                     const uint ut = uint(t);
                     const uint q_off  = iq3 * sq3 + ut * sq2 + iq1 * sq1;
                     const uint k_off  = q_off;
-                    const uint v_off  = iv3 * sv3 + ut * sv2 + iv1 * sv1;
                     const uint gb_off = iv3 * sb3 + ut * sb2 + iv1 * sb1;
                     const float beta_val = data_beta[gb_off];
 
@@ -212,48 +275,24 @@ void main() {
                             }
                         }
                     }
+
                     // store A_hist[t] (adjoint used by the row pass)
                     [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; ++r) {
                         const uint i = r * LANES_PER_COLUMN + lane;
                         data_dst[sc_A + ut * state_size + j * S_V + i] = carry_shard[r];
                     }
 
-                    // recompute S'_t column j ; u, delta, d_delta, w
-                    const uint sprev = (ut == 0u) ? state_in_base : (sc_S + (ut - 1u) * state_size);
-                    const bool sprev_state = (ut == 0u);
-
-                    float su_shard = 0.0;
+                    // sd = (A^T k)_j ; w = beta * sd  (u/delta come from A1's replay)
                     float sd_shard = 0.0;
                     [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; ++r) {
-                        const uint  i = r * LANES_PER_COLUMN + lane;
-                        const float sprev_ij =
-                            sprev_state ? data_state[sprev + j * S_V + i] : data_dst[sprev + j * S_V + i];
-                        su_shard = fma(eg_reg[r], sprev_ij * k_reg[r], su_shard);
                         sd_shard = fma(carry_shard[r], k_reg[r], sd_shard);
                     }
-                    const float su  = reduce_partial(su_shard);
                     const float sd  = reduce_partial(sd_shard);
-                    const float u_j = data_v[v_off + j] - su;
                     const float w_j = beta_val * sd;
 
                     if (lane == 0u) {
-                        data_dst[sc_delta + ut * S_V + j] = beta_val * u_j;
-                        data_dst[sc_w     + ut * S_V + j] = w_j;
+                        data_dst[sc_sd + ut * S_V + j] = sd;
                         data_dst[off_dv + (iv1 + H * (ut + n_tokens * iv3)) * S_V + j] = w_j;
-                    }
-
-                    // d_beta: one contribution per column; only tid 0 ever touches the
-                    // destination, so the first wave initialises and later waves accumulate
-                    // without any cross-thread ordering.
-                    const float dbeta_masked = (lane == 0u) ? (sd * u_j) : 0.0;
-                    const float dbeta_wave   = reduce_sum(dbeta_masked);
-                    if (tid == 0u) {
-                        const uint db_idx = off_db + iv1 + H * (ut + n_tokens * iv3);
-                        if (wave == 0u) {
-                            data_dst[db_idx] = dbeta_wave;
-                        } else {
-                            data_dst[db_idx] += dbeta_wave;
-                        }
                     }
 
                     // propagate A_{t-1} = diag(exp(g)) (A - k w^T)
@@ -271,52 +310,63 @@ void main() {
                 }
             }
 
-            // A1/A2 scratch (S_hist / A_hist / delta / w) -> phase B handoff: phase B reads
+            // A1/A2 scratch (S_hist / A_hist / u / sd) -> phase B handoff: phase B reads
             // these across all columns, i.e. across threads. This barrier is required.
             scratch_barrier();
 
-            // ---------- phase B: row pass for d_q / d_k / d_g ----------
-            for (uint wave = 0; wave < S_V / COLS_PER_WG; ++wave) {
-                const uint which_row = gl_SubgroupInvocationID / LANES_PER_COLUMN;
-                const uint lane      = gl_SubgroupInvocationID % LANES_PER_COLUMN;
-                const uint i         = wave * COLS_PER_WG + which_row;
+            // ---------- phase B: row pass for d_q / d_k / d_g / d_beta ----------
+            // T_TILE tokens per iteration; tail threads (t >= n_tokens) run on clamped
+            // addresses with discarded results so control flow stays uniform for the
+            // barriers in reduce_token_block.
+            for (uint tb = 0; tb < n_tokens; tb += T_TILE) {
+                const uint t    = tb + t_sub;
+                const bool t_ok = (t < n_tokens);
+                const uint tc   = t_ok ? t : (n_tokens - 1u);   // clamped for in-bounds addressing
 
-                for (uint t = 0; t < n_tokens; t++) {
-                    const uint k_off  = iq3 * sq3 + t * sq2 + iq1 * sq1;
-                    const uint gb_off = iv3 * sb3 + t * sb2 + iv1 * sb1;
-                    const uint do_off = (iv3 * n_tokens * H + iv1) * S_V + t * S_V * H;
+                const uint k_off  = iq3 * sq3 + tc * sq2 + iq1 * sq1;
+                const uint gb_off = iv3 * sb3 + tc * sb2 + iv1 * sb1;
+                const uint do_off = (iv3 * n_tokens * H + iv1) * S_V + tc * S_V * H;
+                const uint tv     = iv1 + H * (t + n_tokens * iv3);  // (v-head, token) output index
+                const float beta_val = data_beta[gb_off];
 
-                    const float k_i  = data_k[k_off + i];
-                    const float eg_i = (KDA == 0) ? exp(data_g[gb_off]) : exp(data_g[gb_off * S_V + i]);
+                // this token's scratch
+                const uint st_base = sc_S  + tc * state_size;
+                const uint a_base  = sc_A  + tc * state_size;
+                const uint u_base  = sc_u  + tc * S_V;
+                const uint sd_base = sc_sd + tc * S_V;
 
-                    const uint sprev = (t == 0u) ? state_in_base : (sc_S + (t - 1u) * state_size);
-                    const bool sprev_state = (t == 0u);
+                float dbeta  = 0.0;
+                float dg_tot = 0.0;
 
-                    float dq_shard = 0.0, dk_shard = 0.0, dg_shard = 0.0;
-                    [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; ++r) {
-                        const uint jj = r * LANES_PER_COLUMN + lane;
-                        const float st_ij    = data_dst[sc_S + t * state_size + jj * S_V + i];
-                        const float a_ij     = data_dst[sc_A + t * state_size + jj * S_V + i];
-                        const float delta_j  = data_dst[sc_delta + t * S_V + jj];
-                        const float w_j      = data_dst[sc_w     + t * S_V + jj];
-                        const float do_j     = data_d[do_off + jj];
-                        const float sprev_ij = sprev_state ? data_state[sprev + jj * S_V + i]
-                                                        : data_dst[sprev + jj * S_V + i];
-                        const float sp_ij = eg_i * sprev_ij;
-                        dq_shard = fma(st_ij, do_j, dq_shard);
-                        dk_shard += fma(a_ij, delta_j, -sp_ij * w_j);
-                        dg_shard = fma(fma(-k_i, w_j, a_ij), sp_ij, dg_shard);
+                for (uint rw = 0; rw < ROW_WAVES; ++rw) {
+                    const uint i = rw * ROWS_ACTIVE + i_lane;
+                    const float k_i = data_k[k_off + i];
+
+                    float dq = 0.0, dk = 0.0, dg = 0.0;
+                    dbeta = 0.0;   // every row wave recomputes the same per-token value
+                    for (uint jj = 0; jj < S_V; ++jj) {
+                        const float st_ij = data_dst[st_base + jj * S_V + i];
+                        const float a_ij  = data_dst[a_base  + jj * S_V + i];
+                        const float u_j   = data_dst[u_base  + jj];
+                        const float sd_j  = data_dst[sd_base + jj];
+                        const float do_j  = data_d[do_off + jj];
+
+                        const float delta_j = beta_val * u_j;
+                        const float w_j     = beta_val * sd_j;
+                        // exp(g)*S_prev reconstructed from the forward update
+                        const float sp_ij   = fma(-k_i, delta_j, st_ij);
+
+                        dq    = fma(st_ij, do_j, dq);
+                        dk   += fma(a_ij, delta_j, -sp_ij * w_j);
+                        dg    = fma(fma(-k_i, w_j, a_ij), sp_ij, dg);
+                        dbeta = fma(sd_j, u_j, dbeta);
                     }
 
-                    const float dq = reduce_partial(dq_shard);
-                    const float dk = reduce_partial(dk_shard);
-                    const float dg = reduce_partial(dg_shard);
-
                     // d_q/d_k accumulate over the v-head group (gi/sgi); the first iteration
-                    // initialises instead of zeroing up front. Row i's writer is lane 0 of
-                    // the same cluster every iteration, so no cross-thread ordering is needed.
-                    const uint row = (iq1 + neq1 * (t + n_tokens * iq3)) * S_V + i;
-                    if (lane == 0u) {
+                    // initialises instead of zeroing up front. Row (t, i)'s writer is the same
+                    // thread every iteration, so no cross-thread ordering is needed.
+                    if (t_ok) {
+                        const uint row = (iq1 + neq1 * (t + n_tokens * iq3)) * S_V + i;
                         if (gi == 0u && sgi == 0u) {
                             data_dst[row]          = scale * dq;
                             data_dst[off_dk + row] = dk;
@@ -324,29 +374,30 @@ void main() {
                             data_dst[row]          = fma(scale, dq, data_dst[row]);
                             data_dst[off_dk + row] += dk;
                         }
+                        if (KDA != 0) {
+                            data_dst[off_dg + tv * S_V + i] = dg;
+                        }
                     }
+                    if (KDA == 0) {
+                        // scalar d_g: sum over this token's rows
+                        dg_tot += reduce_token_block(t_ok ? dg : 0.0);
+                    }
+                }
 
-                    if (KDA != 0) {
-                        if (lane == 0u) {
-                            data_dst[off_dg + (iv1 + H * (t + n_tokens * iv3)) * S_V + i] = dg;
-                        }
-                    } else {
-                        // scalar d_g: one contribution per row; tid 0 only, first wave
-                        // initialises, later waves accumulate
-                        const float dg_masked   = (lane == 0u) ? dg : 0.0;
-                        const float dg_sum_wave = reduce_sum(dg_masked);
-                        if (tid == 0u) {
-                            const uint dg_idx = off_dg + (iv1 + H * (t + n_tokens * iv3));
-                            if (wave == 0u) {
-                                data_dst[dg_idx] = dg_sum_wave;
-                            } else {
-                                data_dst[dg_idx] += dg_sum_wave;
-                            }
-                        }
+                // dbeta is identical across a token's rows (broadcast operands), so any
+                // row wave's value is the full per-token sum.
+                if (t_ok && i_lane == 0u) {
+                    data_dst[off_db + tv] = dbeta;
+                    if (KDA == 0) {
+                        data_dst[off_dg + tv] = dg_tot;
                     }
                 }
             }
-            scratch_barrier();
+
+            // scratch is reused by the next group member; the last iteration needs no barrier
+            if (gi + 1u < group || sgi + 1u < rq3) {
+                scratch_barrier();
+            }
         }
     }
 }
