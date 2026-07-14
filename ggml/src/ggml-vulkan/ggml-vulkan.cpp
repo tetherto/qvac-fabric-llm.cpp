@@ -4167,6 +4167,18 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             const uint32_t cols_per_wg = gdn_subgroup_size / lanes_per_column;
             const std::array<uint32_t, 3> wg_denoms = {1u, 1u, cols_per_wg};
 
+            // Backward op: several subgroups per workgroup hide the serial token loop's
+            // latency. Target 32, clamped so COLS_PER_STEP <= S_V and the workgroup fits the
+            // device limit (all powers of two, so the result divides S_V). The shmem variant
+            // stays single-subgroup: its reduce_add_shmem is not multi-subgroup safe.
+            uint32_t gdn_back_sg = 1;
+            if (use_subgroup_ops) {
+                const uint32_t sg_by_cols = S_V / cols_per_wg; // COLS_PER_STEP <= S_V
+                const uint32_t sg_by_threads = (1u << device->max_workgroup_size_log2) / gdn_subgroup_size;
+                gdn_back_sg = std::min({ 32u, sg_by_cols, sg_by_threads });
+            }
+            const uint32_t gdn_back_wg = gdn_back_sg * gdn_subgroup_size;
+
             for (uint32_t kda = 0; kda < 2; kda++) {
                 ggml_vk_create_pipeline(device, device->pipeline_gated_delta_net[si][kda],
                     gdn_names[si][kda], gdn_len, gdn_data, "main", 7, sizeof(vk_op_gated_delta_net_push_constants),
@@ -4176,7 +4188,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                     ggml_vk_create_pipeline(device, device->pipeline_gated_delta_net_back[si-1][kda],
                         gdn_back_names[si-1][kda], gdn_back_len, gdn_back_data,
                         "main", 8, sizeof(vk_op_gated_delta_net_back_push_constants),
-                        {1, 1, 1}, {S_V, kda, gdn_subgroup_size, lanes_per_column}, 1, true, use_subgroup_ops, gdn_subgroup_size);
+                        {1, 1, 1}, {S_V, kda, gdn_subgroup_size, lanes_per_column, gdn_back_wg}, 1, true, use_subgroup_ops, gdn_subgroup_size);
                 }
             }
         }

@@ -44,32 +44,40 @@ FLOAT_TYPE reduce_add_shmem(FLOAT_TYPE partial) {
 }
 #endif
 
-// clusterSize for subgroupClusteredAdd must be a compile-time constant; branch on spec constant
-FLOAT_TYPE reduce_partial(FLOAT_TYPE partial) {
-    switch (LANES_PER_COLUMN) {
-        case 1u:
-            return partial;
 #if USE_SUBGROUP_CLUSTERED
-        // Workaround for GLSL requiring a literal constant for the cluster size.
-        // The branches should all fold away.
+// Workaround for GLSL requiring a literal constant for the cluster size: switch on the
+// spec-constant size so the branches fold away. Sizes are powers of two <= 64.
+FLOAT_TYPE clustered_add(FLOAT_TYPE v, const uint cluster) {
+    switch (cluster) {
         case 2u:
-            return subgroupClusteredAdd(partial, 2u);
+            return subgroupClusteredAdd(v, 2u);
         case 4u:
-            return subgroupClusteredAdd(partial, 4u);
+            return subgroupClusteredAdd(v, 4u);
         case 8u:
-            return subgroupClusteredAdd(partial, 8u);
+            return subgroupClusteredAdd(v, 8u);
         case 16u:
-            return subgroupClusteredAdd(partial, 16u);
+            return subgroupClusteredAdd(v, 16u);
         case 32u:
-            return subgroupClusteredAdd(partial, 32u);
+            return subgroupClusteredAdd(v, 32u);
         case 64u:
-            return subgroupClusteredAdd(partial, 64u);
-#endif
-        default:
-#if USE_SUBGROUP_ADD
-            return subgroupAdd(partial);
-#else
-            return reduce_add_shmem(partial);
-#endif
+            return subgroupClusteredAdd(v, 64u);
     }
+    return v;
+}
+#endif
+
+FLOAT_TYPE reduce_partial(FLOAT_TYPE partial) {
+    if (LANES_PER_COLUMN == 1u) {
+        return partial;
+    }
+#if USE_SUBGROUP_CLUSTERED
+    if (LANES_PER_COLUMN <= 64u) {
+        return clustered_add(partial, LANES_PER_COLUMN);
+    }
+#endif
+#if USE_SUBGROUP_ADD
+    return subgroupAdd(partial);
+#else
+    return reduce_add_shmem(partial);
+#endif
 }
