@@ -4110,11 +4110,18 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                 device->subgroup_min_size <= 16u && device->subgroup_max_size >= 16u) {
                 gdn_subgroup_size = 16u;
             }
+
+            // Adreno's subgroupClusteredAdd returns wrong results in the gated_delta_net
+            // shaders (seen on Adreno 840); use the full-subgroup / shmem reduce path
+            // instead, which Adreno 830 (no clustered support) already takes and passes.
+            const bool clustered_ok = device->subgroup_clustered &&
+                                      device->architecture != vk_device_architecture::QUALCOMM_ADRENO;
+
             uint32_t lanes_per_column;
             if (device->vendor_id == VK_VENDOR_ID_INTEL) {
                 // Intel Xe: full-width reduction (min rows/lane) ~10x over the COLS_PER_WG=8 rule.
                 lanes_per_column = std::min(gdn_subgroup_size, S_V);
-            } else if (S_V >= 128u && device->subgroup_clustered) {
+            } else if (S_V >= 128u && clustered_ok) {
                 // COLS_PER_WG=8: measured optimum (Ampere sg32->4, Vega20 sg64->8).
                 lanes_per_column = std::max(1u, gdn_subgroup_size / 8u);
             } else {
@@ -4141,7 +4148,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             GGML_ASSERT((S_V % (gdn_subgroup_size / lanes_per_column)) == 0);
 
             const bool need_partial_subgroup_reduce = lanes_per_column != 1u && lanes_per_column < gdn_subgroup_size;
-            const bool use_clustered_reduce = device->subgroup_arithmetic && device->subgroup_clustered && need_partial_subgroup_reduce;
+            const bool use_clustered_reduce = device->subgroup_arithmetic && clustered_ok && need_partial_subgroup_reduce;
             const bool use_subgroup_reduce = device->subgroup_arithmetic && !need_partial_subgroup_reduce;
             const bool use_subgroup_ops = use_clustered_reduce || use_subgroup_reduce;
             size_t gdn_len, gdn_back_len;
