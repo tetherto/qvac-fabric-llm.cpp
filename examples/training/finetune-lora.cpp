@@ -1,5 +1,6 @@
 #include "arg.h"
 #include "common.h"
+#include "finetune.h"
 #include "log.h"
 #include "llama.h"
 #include "ggml-backend.h"
