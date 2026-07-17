@@ -319,16 +319,10 @@ static bool llama_prepare_model_devices(const llama_model_params & params, llama
 }
 
 // Returns 0 on success, -1 on error, and -2 on cancellation via llama_progress_callback
-static std::pair<int, llama_model *> llama_model_load(struct gguf_context * metadata, llama_model_set_tensor_data_t set_tensor_data, void * set_tensor_data_ud,
-        llama_model_loader & ml, FILE * file, llama_model_params & params) {
+static std::pair<int, llama_model *> llama_model_load(llama_model_loader & ml, llama_model_params & params) {
     try {
-        // b9310 rebase: Silence compiler warnings about unused variables
-        (void) metadata;
-        (void) set_tensor_data;
-        (void) set_tensor_data_ud;
-        (void) file;
-
         ml.lazy.mode = params.lazy_mode;
+
 
         ml.print_info();
         std::unique_ptr<llama_model> model_ptr(llama_model_create(ml, params));
@@ -387,8 +381,8 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
 
 static struct llama_model * llama_model_load_from_file_impl(
         struct gguf_context * metadata,
-        llama_model_set_tensor_data_t set_tensor_data,
-        void * set_tensor_data_ud,
+        [[maybe_unused]] llama_model_set_tensor_data_t set_tensor_data,
+        [[maybe_unused]] void * set_tensor_data_ud,
         bool has_load_input,
         llama_model_loader & ml,
         FILE * file,
@@ -434,7 +428,7 @@ static struct llama_model * llama_model_load_from_file_impl(
         };
     }
 
-    const auto [status, model] = llama_model_load(metadata, set_tensor_data, set_tensor_data_ud, ml, file, params);
+    const auto [status, model] = llama_model_load(ml, params);
     GGML_ASSERT(status <= 0);
     if (status < 0) {
         if (status == -1) {
