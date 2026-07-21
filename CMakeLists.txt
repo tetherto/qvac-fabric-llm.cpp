@@ -249,6 +249,9 @@ add_subdirectory(src)
 include(GNUInstallDirs)
 set(LLAMA_INCLUDE_INSTALL_DIR ${CMAKE_INSTALL_INCLUDEDIR}/llama CACHE PATH "Location of header files")
 
+# default; vendor/cpp-httplib flips this ON when it links system OpenSSL
+set(LLAMA_CPP_HTTPLIB_SYSTEM_OPENSSL OFF)
+
 add_subdirectory(vendor)
 
 if (LLAMA_BUILD_COMMON)
