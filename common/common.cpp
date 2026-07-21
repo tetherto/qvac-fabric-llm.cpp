@@ -1812,7 +1812,10 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.lazy_mode = params.lazy_mode;
     mparams.tensor_split    = params.tensor_split;
     mparams.check_tensors   = params.check_tensors;
-    mparams.use_extra_bufts = !params.no_extra_bufts;
+
+    // Disable weight repacking for training loads, backward ops can't read
+    // repacked layouts.
+    mparams.use_extra_bufts = !params.no_extra_bufts && !params.training;
     mparams.no_host         = params.no_host;
 
     if (params.kv_overrides.empty()) {
