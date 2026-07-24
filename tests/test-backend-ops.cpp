@@ -9851,9 +9851,10 @@ struct test_lightning_indexer : public test_case {
 
     const ggml_type type_K;
     const bool fused;
+    const bool strided_q;
 
     std::string vars() override {
-        return VARS_TO_STR7(hsk, nh, kv, nb, ns, nm, type_K);
+        return VARS_TO_STR8(hsk, nh, kv, nb, ns, nm, type_K, strided_q);
     }
 
     std::string op_desc(ggml_tensor * t) override {
@@ -9869,13 +9870,17 @@ struct test_lightning_indexer : public test_case {
         return ((2 * hsk + 2) * nh + 1) * kv * nb * ns;
     }
 
-    test_lightning_indexer(int64_t hsk = 128, int64_t nh = 64, int64_t kv = 256, int64_t nb = 128, int64_t ns = 1, int64_t nm = 1, ggml_type type_K = GGML_TYPE_F16, bool fused = true)
-        : hsk(hsk), nh(nh), kv(kv), nb(nb), ns(ns), nm(nm), type_K(type_K), fused(fused) {}
+    test_lightning_indexer(int64_t hsk = 128, int64_t nh = 64, int64_t kv = 256, int64_t nb = 128, int64_t ns = 1, int64_t nm = 1, ggml_type type_K = GGML_TYPE_F16, bool fused = true, bool strided_q = false)
+        : hsk(hsk), nh(nh), kv(kv), nb(nb), ns(ns), nm(nm), type_K(type_K), fused(fused), strided_q(strided_q) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
-        ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, hsk, nh, nb, ns);
+        ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, hsk + strided_q, nh, nb, ns);
         ggml_set_param(q);
         ggml_set_name(q, "q");
+        if (strided_q) {
+            q = ggml_view_4d(ctx, q, hsk, nh, nb, ns, q->nb[1], q->nb[2], q->nb[3], 0);
+            ggml_set_name(q, "q_strided");
+        }
 
         ggml_tensor * k = ggml_new_tensor_4d(ctx, type_K, hsk, 1, kv, ns);
         ggml_set_param(k);
@@ -13633,8 +13638,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             }
         }
     }
-    for (int kv : { 1, 17, 31, 32, 33, 63, 64, 65, 257 }) {
-        test_cases.emplace_back(new test_lightning_indexer(128, 64, kv, 7, 1, 1, GGML_TYPE_F32));
+    for (int nh : { 32, 64 }) {
+        for (int kv : { 1, 31, 32, 33, 65, 257 }) {
+            for (ggml_type type_K : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16, GGML_TYPE_Q8_0, GGML_TYPE_Q5_1, GGML_TYPE_Q5_0, GGML_TYPE_Q4_1, GGML_TYPE_Q4_0}) {
+                test_cases.emplace_back(new test_lightning_indexer(128, nh, kv, 7, 1, 1, type_K));
+            }
+        }
+    }
+    for (ggml_type type_K : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16, GGML_TYPE_Q8_0, GGML_TYPE_Q5_1, GGML_TYPE_Q5_0, GGML_TYPE_Q4_1, GGML_TYPE_Q4_0}) {
+        test_cases.emplace_back(new test_lightning_indexer(128, 64, 65, 7, 1, 1, type_K, true, true));
     }
     test_cases.emplace_back(new test_lightning_indexer(128, 64, 65, 7, 4, 4, GGML_TYPE_F32));
     test_cases.emplace_back(new test_lightning_indexer(128, 64, 65, 7, 4, 1, GGML_TYPE_F32));
