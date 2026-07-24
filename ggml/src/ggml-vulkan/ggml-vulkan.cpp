@@ -1835,6 +1835,13 @@ static bool ggml_vk_fa_scalar_uses_mmq(const vk_device& device, ggml_type k_type
     return false;
 }
 
+static bool ggml_vk_is_gfx1151(const vk_device & device) {
+    const std::string device_name = device->properties.deviceName.data();
+    return device->vendor_id == VK_VENDOR_ID_AMD &&
+           device->driver_id == vk::DriverId::eMesaRadv &&
+           device_name.find("GFX1151") != std::string::npos;
+}
+
 void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     VK_LOG_DEBUG("ggml_vk_load_shaders(" << device->name << ")");
 
@@ -1927,13 +1934,16 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                           l_warptile_mmqid, m_warptile_mmqid, s_warptile_mmqid,
                           l_warptile_mmqid_int, m_warptile_mmqid_int, s_warptile_mmqid_int,
                           l_warptile_mmqid_int_k, m_warptile_mmqid_int_k, s_warptile_mmqid_int_k;
+    std::vector<uint32_t> q8_0_bk64_warptile;
     std::array<uint32_t, 3> l_wg_denoms, m_wg_denoms, s_wg_denoms,
                             l_mmq_wg_denoms, m_mmq_wg_denoms, s_mmq_wg_denoms,
                             l_mmq_wg_denoms_k, m_mmq_wg_denoms_k, s_mmq_wg_denoms_k,
                             l_mmq_cm1_wg_denoms_k, m_mmq_cm1_wg_denoms_k, s_mmq_cm1_wg_denoms_k,
                             l_mmqid_wg_denoms, m_mmqid_wg_denoms, s_mmqid_wg_denoms;
+    std::array<uint32_t, 3> q8_0_bk64_wg_denoms {};
 
     uint32_t l_align, m_align, s_align;
+    uint32_t q8_0_bk64_align {};
 
     // RDNA3.5 preferred wave32 here
     const bool cm1_use_wave32 = device->vendor_id == VK_VENDOR_ID_AMD &&
@@ -2127,6 +2137,12 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                 l_align         = 32;  //set as BK
             }
         }
+        // GFX1151 q8_0 prefill candidate for tall attention/output projections.
+        // This keeps the same shader and math as the normal coopmat path, but
+        // doubles K tile depth to reduce q8_0 dequant/load loop overhead.
+        q8_0_bk64_warptile = { 256, 128, 128, 64, subgroup_size_8, 64, 2, tm_m, tn_m, tk_m, subgroup_size_8 };
+        q8_0_bk64_wg_denoms = { 128, 128, 1 };
+        q8_0_bk64_align = 128;
 
         const bool use_cm1_int = device->coopmat_int_support &&
                                  (device->architecture == AMD_RDNA3 || device->architecture == AMD_RDNA4);
@@ -2870,6 +2886,17 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         }
         FOR_EACH_LUT_TYPE_NONFP4(X_CM1)
         FOR_EACH_TQ_FHT_TYPE(X_CM1)
+
+        if (ggml_vk_is_gfx1151(device) &&
+                ggml_vk_matmul_shmem_support(device, q8_0_bk64_warptile, false, GGML_TYPE_Q8_0)) {
+            if (device->coopmat_acc_f16_support) {
+                ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_mat_q8_0_bk64_f16acc, "matmul_q8_0_f32_f16acc_bk64", matmul_quant_f32_f16acc_cm1_len, matmul_quant_f32_f16acc_cm1_data, "main", 3, sizeof(vk_mat_mat_push_constants), q8_0_bk64_wg_denoms, ggml_vk_mul_mm_spec_quant(q8_0_bk64_warptile, true, (uint32_t)GGML_TYPE_Q8_0), q8_0_bk64_align, false, true);
+            }
+            if (device->coopmat_acc_f32_support) {
+                ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_mat_q8_0_bk64_f32acc, "matmul_q8_0_f32_bk64", matmul_quant_f32_cm1_len, matmul_quant_f32_cm1_data, "main", 3, sizeof(vk_mat_mat_push_constants), q8_0_bk64_wg_denoms, ggml_vk_mul_mm_spec_quant(q8_0_bk64_warptile, true, (uint32_t)GGML_TYPE_Q8_0), q8_0_bk64_align, false, true);
+            }
+        }
+
 #if defined(GGML_VULKAN_FLOAT_E2M1_GLSLC_SUPPORT) && defined(GGML_VULKAN_FLOAT_E4M3_GLSLC_SUPPORT)
         if (device->ocp_fp4) {
 #define X_CM1_OCP(TYPE, tstr) \
@@ -7497,6 +7524,23 @@ static void ggml_vk_matmul_tiling(ggml_backend_vk_context *ctx, vk_context& subc
     }
 }
 
+static vk_pipeline ggml_vk_get_q8_0_bk64_pipeline(ggml_backend_vk_context * ctx, uint32_t m, uint32_t n, uint32_t k, uint32_t batch, bool aligned, bool f16acc) {
+    if (!aligned || !ctx->device->coopmat_support || ctx->device->coopmat2 || !ggml_vk_is_gfx1151(ctx->device)) {
+        return nullptr;
+    }
+    // Per-shape GGML_VK_PERF_LOGGER sweep on GFX1151 (2026-09-03): BK64 beats
+    // the regular l tile by 5-6% whenever m <= 1152 at any k (up to 6912), and
+    // for any m at k <= 1536; it loses 8-40% only when both m >= 2048 and
+    // k >= 2048 (worst at 2560x9728). Crossover sits between 1152 and 2048 on
+    // both axes; gate at 1536.
+    if (m < 512 || n < 128 || k < 1024 || (k > 1536 && m > 1536) || batch < 1) {
+        return nullptr;
+    }
+
+    return f16acc ? ctx->device->pipeline_dequant_mul_mat_mat_q8_0_bk64_f16acc
+                  : ctx->device->pipeline_dequant_mul_mat_mat_q8_0_bk64_f32acc;
+}
+
 static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, bool disable_split_k) {
     VK_LOG_DEBUG("ggml_vk_mul_mat_q_f16((" << src0 << ", name=" << src0->name << ", type=" << ggml_type_name(src0->type) << ", ne0=" << src0->ne[0] << ", ne1=" << src0->ne[1] << ", ne2=" << src0->ne[2] << ", ne3=" << src0->ne[3] << ", nb0=" << src0->nb[0] << ", nb1=" << src0->nb[1] << ", nb2=" << src0->nb[2] << ", nb3=" << src0->nb[3];
     std::cerr << "), (" << src1 << ", name=" << src1->name << ", type=" << ggml_type_name(src1->type) << ", ne0=" << src1->ne[0] << ", ne1=" << src1->ne[1] << ", ne2=" << src1->ne[2] << ", ne3=" << src1->ne[3] << ", nb0=" << src1->nb[0] << ", nb1=" << src1->nb[1] << ", nb2=" << src1->nb[2] << ", nb3=" << src1->nb[3];
@@ -7580,6 +7624,13 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
     const bool aligned = !quantize_y && ne10 == kpad && ne01 > 8 && ne11 > 8;
 
     vk_pipeline pipeline = ggml_vk_guess_matmul_pipeline_map(ctx, *mmp_map, ne01, ne11, aligned, false);
+    if (!quantize_y && !qx_needs_dequant && src0->type == GGML_TYPE_Q8_0 && y_f32_kernel) {
+        const bool bk64_f16acc = ggml_vk_get_mul_mat_mat_f16acc(ctx, src0->type, GGML_TYPE_F32, (ggml_prec)dst->op_params[0]);
+        vk_pipeline hot_pipeline = ggml_vk_get_q8_0_bk64_pipeline(ctx, ne01, ne11, ne10, ne12*ne13, aligned, bk64_f16acc);
+        if (hot_pipeline != nullptr) {
+            pipeline = hot_pipeline;
+        }
+    }
 
     if (ggml_nbytes(src0) > ctx->device->properties.limits.maxStorageBufferRange) {
         pipeline = ggml_vk_get_64b_indexing_pipeline(ctx, pipeline);

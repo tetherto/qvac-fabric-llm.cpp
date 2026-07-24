@@ -828,6 +828,8 @@ struct vk_device_struct {
     std::map<vk_matmul_pipeline_key, std::vector<vk_matmul_pipeline_pair>> pipeline_matmul;
     matmul_tile_selector_t matmul_tile_selector;
     matmul_tile_selector_t matmul_id_tile_selector;
+    vk_pipeline pipeline_dequant_mul_mat_mat_q8_0_bk64_f16acc;
+    vk_pipeline pipeline_dequant_mul_mat_mat_q8_0_bk64_f32acc;
 
     // QJL (Stage 2) correction pass applied after mul_mm.comp for standalone
     // MUL_MAT on TBQ3_0/TBQ4_0 when n > mul_mat_vec_max_cols. Indexed as
