@@ -12,6 +12,14 @@
 #include <cfloat>
 #include <cmath>
 
+#if defined(__ARM_NEON)
+#include <arm_neon.h>
+#endif
+
+#if defined(__x86_64__) || defined(_M_X64)
+#include <immintrin.h>
+#endif
+
 // ggml_compute_forward_dup
 
 static void ggml_compute_forward_dup_same_cont(
@@ -12553,6 +12561,120 @@ void ggml_compute_forward_dsv4_hc_pre(
 
 // ggml_compute_forward_dsv4_hc_post
 
+static inline void dsv4_hc_post_compute_scalar(
+        const ggml_tensor * x,
+        const ggml_tensor * residual,
+        const ggml_tensor * post,
+        const ggml_tensor * comb,
+        ggml_tensor * dst,
+        int64_t i,
+        int64_t d,
+        int64_t it,
+        int64_t hc) {
+    const float xv = *(const float *) ((const char *) x->data + i*x->nb[0] + it*x->nb[1]);
+    const float pv = *(const float *) ((const char *) post->data + d*post->nb[0] + it*post->nb[1]);
+    volatile float sum = xv * pv;
+    if (comb) {
+        for (int64_t s = 0; s < hc; ++s) {
+            const float rv = *(const float *) (
+                (const char *) residual->data + i*residual->nb[0] + s*residual->nb[1] + it*residual->nb[2]);
+            const float cw = *(const float *) (
+                (const char *) comb->data + d*comb->nb[0] + s*comb->nb[1] + it*comb->nb[2]);
+            volatile float product = rv * cw;
+            sum = sum + product;
+        }
+    } else {
+        sum = sum + *(const float *) (
+            (const char *) residual->data + i*residual->nb[0] + d*residual->nb[1] + it*residual->nb[2]);
+    }
+    *(float *) ((char *) dst->data + i*dst->nb[0] + d*dst->nb[1] + it*dst->nb[2]) = sum;
+}
+
+#if defined(__ARM_NEON)
+using dsv4_hc_post_vec_t = float32x4_t;
+static constexpr int64_t dsv4_hc_post_vec_width = 4;
+
+static inline dsv4_hc_post_vec_t dsv4_hc_post_vec_load(const float * data) {
+    return vld1q_f32(data);
+}
+
+static inline dsv4_hc_post_vec_t dsv4_hc_post_vec_mul(dsv4_hc_post_vec_t value, float weight) {
+    return vmulq_n_f32(value, weight);
+}
+
+#if defined(__GNUC__) && !defined(__clang__)
+__attribute__((optimize("fp-contract=off")))
+#endif
+static inline dsv4_hc_post_vec_t dsv4_hc_post_vec_mul_add(
+        dsv4_hc_post_vec_t sum, dsv4_hc_post_vec_t value, float weight) {
+#if defined(__clang__)
+#pragma clang fp contract(off)
+#endif
+    const float32x4_t product = vmulq_n_f32(value, weight);
+    return vaddq_f32(sum, product);
+}
+
+static inline void dsv4_hc_post_vec_store(float * data, dsv4_hc_post_vec_t value) {
+    vst1q_f32(data, value);
+}
+#elif defined(__x86_64__) || defined(_M_X64)
+#if defined(__AVX__)
+using dsv4_hc_post_vec_t = __m256;
+static constexpr int64_t dsv4_hc_post_vec_width = 8;
+
+static inline dsv4_hc_post_vec_t dsv4_hc_post_vec_load(const float * data) {
+    return _mm256_loadu_ps(data);
+}
+
+static inline dsv4_hc_post_vec_t dsv4_hc_post_vec_mul(dsv4_hc_post_vec_t value, float weight) {
+    return _mm256_mul_ps(value, _mm256_set1_ps(weight));
+}
+
+#if defined(__GNUC__) && !defined(__clang__)
+__attribute__((optimize("fp-contract=off")))
+#endif
+static inline dsv4_hc_post_vec_t dsv4_hc_post_vec_mul_add(
+        dsv4_hc_post_vec_t sum, dsv4_hc_post_vec_t value, float weight) {
+#if defined(__clang__)
+#pragma clang fp contract(off)
+#endif
+    const __m256 product = _mm256_mul_ps(value, _mm256_set1_ps(weight));
+    return _mm256_add_ps(sum, product);
+}
+
+static inline void dsv4_hc_post_vec_store(float * data, dsv4_hc_post_vec_t value) {
+    _mm256_storeu_ps(data, value);
+}
+#else
+using dsv4_hc_post_vec_t = __m128;
+static constexpr int64_t dsv4_hc_post_vec_width = 4;
+
+static inline dsv4_hc_post_vec_t dsv4_hc_post_vec_load(const float * data) {
+    return _mm_loadu_ps(data);
+}
+
+static inline dsv4_hc_post_vec_t dsv4_hc_post_vec_mul(dsv4_hc_post_vec_t value, float weight) {
+    return _mm_mul_ps(value, _mm_set1_ps(weight));
+}
+
+#if defined(__GNUC__) && !defined(__clang__)
+__attribute__((optimize("fp-contract=off")))
+#endif
+static inline dsv4_hc_post_vec_t dsv4_hc_post_vec_mul_add(
+        dsv4_hc_post_vec_t sum, dsv4_hc_post_vec_t value, float weight) {
+#if defined(__clang__)
+#pragma clang fp contract(off)
+#endif
+    const __m128 product = _mm_mul_ps(value, _mm_set1_ps(weight));
+    return _mm_add_ps(sum, product);
+}
+
+static inline void dsv4_hc_post_vec_store(float * data, dsv4_hc_post_vec_t value) {
+    _mm_storeu_ps(data, value);
+}
+#endif
+#endif
+
 static void ggml_compute_forward_dsv4_hc_post_f32(
         const ggml_compute_params * params,
         ggml_tensor * dst) {
@@ -12579,26 +12701,61 @@ static void ggml_compute_forward_dsv4_hc_post_f32(
     GGML_ASSERT(post->ne[1] == n_tokens);
 
     // comb == NULL: identity mixing, each stream keeps its own residual
-    size_t nbc0 = 0;
-    size_t nbc1 = 0;
-    size_t nbc2 = 0;
     if (comb) {
         GGML_ASSERT(comb->type == GGML_TYPE_F32);
         GGML_ASSERT(comb->ne[0] == hc);
         GGML_ASSERT(comb->ne[1] == hc);
         GGML_ASSERT(comb->ne[2] == n_tokens);
-        nbc0 = comb->nb[0];
-        nbc1 = comb->nb[1];
-        nbc2 = comb->nb[2];
     }
-
-    GGML_TENSOR_LOCALS(size_t, nbx, x,        nb);
-    GGML_TENSOR_LOCALS(size_t, nbr, residual, nb);
-    GGML_TENSOR_LOCALS(size_t, nbp, post,     nb);
-    GGML_TENSOR_LOCALS(size_t, nbd, dst,      nb);
 
     const int ith = params->ith;
     const int nth = params->nth;
+
+#if defined(__ARM_NEON) || defined(__x86_64__) || defined(_M_X64)
+    if (x->nb[0] == sizeof(float) && residual->nb[0] == sizeof(float) && dst->nb[0] == sizeof(float)) {
+        const int64_t n_rows = hc * n_tokens;
+        const int64_t groups_per_row = (n_embd + dsv4_hc_post_vec_width - 1) / dsv4_hc_post_vec_width;
+        const int64_t n_groups = n_rows * groups_per_row;
+        const int64_t group_dr = (n_groups + nth - 1) / nth;
+        const int64_t group0 = group_dr * ith;
+        const int64_t group1 = MIN(group0 + group_dr, n_groups);
+
+        for (int64_t group = group0; group < group1; ++group) {
+            const int64_t row = group / groups_per_row;
+            const int64_t idst = row % hc;
+            const int64_t it = row / hc;
+            const int64_t i0 = dsv4_hc_post_vec_width * (group % groups_per_row);
+            const float pv = *(const float *) ((const char *) post->data + idst*post->nb[0] + it*post->nb[1]);
+
+            if (i0 + dsv4_hc_post_vec_width <= n_embd) {
+                const float * x_row = (const float *) ((const char *) x->data + it*x->nb[1]);
+                float * dst_row = (float *) ((char *) dst->data + idst*dst->nb[1] + it*dst->nb[2]);
+                dsv4_hc_post_vec_t sum = dsv4_hc_post_vec_mul(dsv4_hc_post_vec_load(x_row + i0), pv);
+                if (comb) {
+                    for (int64_t isrc = 0; isrc < hc; ++isrc) {
+                        const float * residual_row = (const float *) (
+                            (const char *) residual->data + isrc*residual->nb[1] + it*residual->nb[2]);
+                        const float cv = *(const float *) (
+                            (const char *) comb->data + idst*comb->nb[0] + isrc*comb->nb[1] + it*comb->nb[2]);
+                        sum = dsv4_hc_post_vec_mul_add(sum, dsv4_hc_post_vec_load(residual_row + i0), cv);
+                    }
+                } else {
+                    const float * residual_row = (const float *) (
+                        (const char *) residual->data + idst*residual->nb[1] + it*residual->nb[2]);
+                    // mul_add is an explicit mul then add with fp-contract off, so weight 1.0f
+                    // is an exact add and matches the scalar identity branch bit for bit.
+                    sum = dsv4_hc_post_vec_mul_add(sum, dsv4_hc_post_vec_load(residual_row + i0), 1.0f);
+                }
+                dsv4_hc_post_vec_store(dst_row + i0, sum);
+            } else {
+                for (int64_t tail = i0; tail < n_embd; ++tail) {
+                    dsv4_hc_post_compute_scalar(x, residual, post, comb, dst, tail, idst, it, hc);
+                }
+            }
+        }
+        return;
+    }
+#endif
 
     const int64_t nr  = n_embd * hc * n_tokens;
     const int64_t dr  = (nr + nth - 1) / nth;
@@ -12609,22 +12766,7 @@ static void ggml_compute_forward_dsv4_hc_post_f32(
         const int64_t i0     = ir % n_embd;
         const int64_t idst   = (ir / n_embd) % hc;
         const int64_t it     = ir / (n_embd * hc);
-
-        const float xv = *(const float *) ((const char *) x->data    + i0*nbx0 + it*nbx1);
-        const float pv = *(const float *) ((const char *) post->data + idst*nbp0 + it*nbp1);
-
-        float sum = xv * pv;
-        if (comb) {
-            for (int64_t isrc = 0; isrc < hc; ++isrc) {
-                const float rv = *(const float *) ((const char *) residual->data + i0*nbr0 + isrc*nbr1 + it*nbr2);
-                const float cv = *(const float *) ((const char *) comb->data     + idst*nbc0 + isrc*nbc1 + it*nbc2);
-                sum += rv * cv;
-            }
-        } else {
-            sum += *(const float *) ((const char *) residual->data + i0*nbr0 + idst*nbr1 + it*nbr2);
-        }
-
-        *(float *) ((char *) dst->data + i0*nbd0 + idst*nbd1 + it*nbd2) = sum;
+        dsv4_hc_post_compute_scalar(x, residual, post, comb, dst, i0, idst, it, hc);
     }
 }
 
