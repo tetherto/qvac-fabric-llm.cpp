@@ -2150,7 +2150,47 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_bin(ggml_metal_l
     const char * t1_str = ggml_type_name(op->src[1]->type);
     const char * t_str  = ggml_type_name(op->type);
 
-    const bool is_c4 = (op->src[0]->ne[0] % 4 == 0) && (op->src[1]->ne[0] % 4 == 0);
+    const size_t f16x4_size = 4*sizeof(ggml_fp16_t);
+    const bool is_f16_strided_4 =
+        n_fuse == 1 &&
+        op->op == GGML_OP_ADD &&
+        op->src[0]->type == GGML_TYPE_F16 &&
+        op->src[1]->type == GGML_TYPE_F16 &&
+        op->type == GGML_TYPE_F16 &&
+        ggml_are_same_shape(op->src[0], op->src[1]) &&
+        op->ne[0] % 4 == 0 &&
+        op->src[0]->nb[0] != sizeof(ggml_fp16_t) &&
+        op->src[0]->nb[0] % sizeof(ggml_fp16_t) == 0 &&
+        op->src[1]->nb[0] == sizeof(ggml_fp16_t) &&
+        op->nb[0] == sizeof(ggml_fp16_t) &&
+        (uintptr_t) op->src[1]->data % f16x4_size == 0 &&
+        (uintptr_t) op->data % f16x4_size == 0 &&
+        op->src[1]->nb[1] % f16x4_size == 0 &&
+        op->src[1]->nb[2] % f16x4_size == 0 &&
+        op->src[1]->nb[3] % f16x4_size == 0 &&
+        op->nb[1] % f16x4_size == 0 &&
+        op->nb[2] % f16x4_size == 0 &&
+        op->nb[3] % f16x4_size == 0;
+
+    if (is_f16_strided_4) {
+        snprintf(base, 256, "kernel_add_f16_strided_4");
+        snprintf(name, 256, "%s", base);
+
+        ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+        if (!res.pipeline) {
+            res = ggml_metal_library_compile_pipeline(lib, base, name, nullptr);
+        }
+
+        res.c4 = true;
+        return res;
+    }
+
+    const bool is_c4 =
+        op->src[0]->ne[0] % 4 == 0 &&
+        op->src[1]->ne[0] % 4 == 0 &&
+        op->src[0]->nb[0] == ggml_type_size(op->src[0]->type) &&
+        op->src[1]->nb[0] == ggml_type_size(op->src[1]->type) &&
+        op->nb[0] == ggml_type_size(op->type);
 
     const bool is_cb = op->src[0]->ne[0] != op->src[1]->ne[0];
     const bool is_rb = ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]) && (ggml_nrows(op->src[1]) == 1) && ggml_nelements(op) < 65536;

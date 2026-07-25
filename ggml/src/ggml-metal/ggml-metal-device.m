@@ -1734,6 +1734,12 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                 }
             }
         case GGML_OP_ADD:
+            if (op->src[0]->type == GGML_TYPE_F16 &&
+                op->src[1]->type == GGML_TYPE_F16 &&
+                op->type == GGML_TYPE_F16) {
+                return true;
+            }
+            // fall through
         case GGML_OP_SUB:
         case GGML_OP_MUL:
         case GGML_OP_DIV:
