@@ -1393,6 +1393,9 @@ kernel void kernel_bin_fuse_impl(
         const int i03 = tgpig.z;
         const int i02 = tgpig.y;
         const int i01 = tgpig.x;
+        const uint64_t nb00 = args.nb00 > sizeof(T0) ? args.nb00 : sizeof(T0);
+        const uint64_t nb10 = args.nb10 > sizeof(T1) ? args.nb10 : sizeof(T1);
+        const uint64_t nb0  = args.nb0  > sizeof(T)  ? args.nb0  : sizeof(T);
 
         if (i01 >= args.ne01) {
             return;
@@ -1402,67 +1405,70 @@ kernel void kernel_bin_fuse_impl(
         const int i12 = i02%args.ne12;
         const int i11 = i01%args.ne11;
 
-        device const T0 * src0_ptr = (device const T0 *) (src0 + i03*args.nb03 + i02*args.nb02 + i01*args.nb01 + args.offs);
-        device       T  * dst_ptr  = (device       T  *) (dst  + i03*args.nb3  + i02*args.nb2  + i01*args.nb1  + args.offs);
+        device const char * src0_ptr = src0 + i03*args.nb03 + i02*args.nb02 + i01*args.nb01 + args.offs;
+        device       char * dst_ptr  = dst  + i03*args.nb3  + i02*args.nb2  + i01*args.nb1  + args.offs;
 
         if (FC_F == 1) {
-            device const T1 * src1_ptr = (device const T1 *) (src1 + args.o1[0] + i13*args.nb13 + i12*args.nb12 + i11*args.nb11);
+            device const char * src1_ptr = src1 + args.o1[0] + i13*args.nb13 + i12*args.nb12 + i11*args.nb11;
 
             for (int i0 = tpitg.x; i0 < args.ne0; i0 += ntg.x) {
                 const int i10 = FC_CB ? i0%args.ne10 : i0;
+                const T0 x0 = *((device const T0 *) (src0_ptr + i0*nb00));
+                const T1 x1 = *((device const T1 *) (src1_ptr + i10*nb10));
+                device T * y = (device T *) (dst_ptr + i0*nb0);
 
                 if (FC_OP == 0) {
-                    dst_ptr[i0] = src0_ptr[i0] + src1_ptr[i10];
+                    *y = x0 + x1;
                 }
 
                 if (FC_OP == 1) {
-                    dst_ptr[i0] = src0_ptr[i0] - src1_ptr[i10];
+                    *y = x0 - x1;
                 }
 
                 if (FC_OP == 2) {
-                    dst_ptr[i0] = src0_ptr[i0] * src1_ptr[i10];
+                    *y = x0 * x1;
                 }
 
                 if (FC_OP == 3) {
-                    dst_ptr[i0] = src0_ptr[i0] / src1_ptr[i10];
+                    *y = x0 / x1;
                 }
             }
         } else {
-            device const T1 * src1_ptr[8];
+            device const char * src1_ptr[8];
             FOR_UNROLL (short j = 0; j < FC_F; ++j) {
-                src1_ptr[j] = (device const T1 *) (src1 + args.o1[j] + i13*args.nb13 + i12*args.nb12 + i11*args.nb11);
+                src1_ptr[j] = src1 + args.o1[j] + i13*args.nb13 + i12*args.nb12 + i11*args.nb11;
             }
 
             for (int i0 = tpitg.x; i0 < args.ne0; i0 += ntg.x) {
                 const int i10 = FC_CB ? i0%args.ne10 : i0;
 
-                T res = src0_ptr[i0];
+                T res = *((device const T0 *) (src0_ptr + i0*nb00));
 
                 if (FC_OP == 0) {
                     FOR_UNROLL (short j = 0; j < FC_F; ++j) {
-                        res += src1_ptr[j][i10];
+                        res += *((device const T1 *) (src1_ptr[j] + i10*nb10));
                     }
                 }
 
                 if (FC_OP == 1) {
                     FOR_UNROLL (short j = 0; j < FC_F; ++j) {
-                        res -= src1_ptr[j][i10];
+                        res -= *((device const T1 *) (src1_ptr[j] + i10*nb10));
                     }
                 }
 
                 if (FC_OP == 2) {
                     FOR_UNROLL (short j = 0; j < FC_F; ++j) {
-                        res *= src1_ptr[j][i10];
+                        res *= *((device const T1 *) (src1_ptr[j] + i10*nb10));
                     }
                 }
 
                 if (FC_OP == 3) {
                     FOR_UNROLL (short j = 0; j < FC_F; ++j) {
-                        res /= src1_ptr[j][i10];
+                        res /= *((device const T1 *) (src1_ptr[j] + i10*nb10));
                     }
                 }
 
-                dst_ptr[i0] = res;
+                *((device T *) (dst_ptr + i0*nb0)) = res;
             }
         }
     }
@@ -1471,6 +1477,42 @@ kernel void kernel_bin_fuse_impl(
 #undef FC_F
 #undef FC_RB
 #undef FC_CB
+}
+
+kernel void kernel_add_f16_strided_4(
+        constant ggml_metal_kargs_bin & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        uint3   tgpig[[threadgroup_position_in_grid]],
+        ushort3 tpitg[[thread_position_in_threadgroup]],
+        ushort3   ntg[[threads_per_threadgroup]]) {
+    const int i03 = tgpig.z;
+    const int i02 = tgpig.y;
+    const int i01 = tgpig.x;
+
+    if (i01 >= args.ne01) {
+        return;
+    }
+
+    device const char * src0_ptr =
+        src0 + args.offs + i03*args.nb03 + i02*args.nb02 + i01*args.nb01;
+    device const half4 * src1_ptr = (device const half4 *) (
+        src1 + args.o1[0] + i03*args.nb13 + i02*args.nb12 + i01*args.nb11);
+    device half4 * dst_ptr = (device half4 *) (
+        dst + args.offs + i03*args.nb3 + i02*args.nb2 + i01*args.nb1);
+
+    for (int i0 = tpitg.x; i0 < args.ne0; i0 += ntg.x) {
+        const int j0 = 4*i0;
+        const half4 x0 = {
+            *((device const half *) (src0_ptr + (j0 + 0)*args.nb00)),
+            *((device const half *) (src0_ptr + (j0 + 1)*args.nb00)),
+            *((device const half *) (src0_ptr + (j0 + 2)*args.nb00)),
+            *((device const half *) (src0_ptr + (j0 + 3)*args.nb00)),
+        };
+
+        dst_ptr[i0] = x0 + src1_ptr[i0];
+    }
 }
 
 typedef decltype(kernel_bin_fuse_impl<float, float, float>) kernel_bin_fuse_t;
