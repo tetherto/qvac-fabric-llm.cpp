@@ -18,7 +18,15 @@ on:
   pull_request:
     types: [opened, synchronize, reopened]
     paths: [
-      '.github/workflows/build-sanitize.yml'
+      '.github/workflows/build-sanitize.yml',
+      '**/CMakeLists.txt',
+      '**/*.cmake',
+      '**/*.cmake.in',
+      '**/*.h',
+      '**/*.hpp',
+      '**/*.c',
+      '**/*.cpp',
+      '**/*.inc'
     ]
 
 cache-mode: none
@@ -40,7 +48,7 @@ jobs:
   ctest:
     runs-on: [self-hosted, X64, CPU, Linux]
 
-    continue-on-error: true
+    continue-on-error: ${{ matrix.sanitizer == 'THREAD' }}
 
     strategy:
       matrix:
@@ -109,4 +117,4 @@ jobs:
         if: ${{ matrix.sanitizer == 'UNDEFINED' }}
         run: |
           cd build
-          ctest -R '^test-vector-index(-faults)?$' --verbose --timeout 900
+          ctest -R '^test-vector-index(-hooks|-faults)?$' --verbose --timeout 900

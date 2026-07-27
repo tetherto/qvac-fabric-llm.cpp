@@ -3,8 +3,8 @@
 // ggml-vector-index: vector-index C API.
 //
 // This public C API supports full f32 storage (`bit_width=32`), q8 storage
-// (`bit_width=8`), and packed q4
-// storage (`bit_width=4`) with CPU search directly against quantized codes.
+// (`bit_width=8`), packed q4 storage (`bit_width=4`), and distinct TurboVec
+// q2/q4 modes with CPU search directly against quantized codes.
 // q8 and q4 use NEON when available. Supported x86 CMake builds compile AVX2
 // kernels separately and runtime-dispatch them from a non-AVX2 baseline.
 //
@@ -77,6 +77,30 @@ GGML_API const char * ggml_vec_index_error_to_string(int error);
 // per vector. `bit_width=32` stores full f32 vectors. Returns NULL on bad args.
 GGML_API ggml_vec_index_t * ggml_vec_index_create(int dim, int bit_width);
 
+// Creates a TurboQuant q2 vector index. This is distinct from the generic
+// q4/q8 modes created by `ggml_vec_index_create`: vectors are normalized,
+// rotated, quantized with Lloyd-Max q2 codebooks, and searched against rotated
+// queries. This implementation requires a 64-bit target,
+// `0 < dim <= 1024 && dim % 8 == 0`, and supports add/search/filter/IVF plus
+// regular snapshot write/load. TurboVec materializes a dense `dim x dim`
+// rotation matrix on first use. Snapshots from earlier releases with larger
+// dimensions can be loaded and rewritten, but add/search/IVF are unsupported.
+// `ggml_vec_index_prepare` is best-effort and does not report allocation status.
+// mmap loading and logged mutations are reserved for later format work.
+GGML_API ggml_vec_index_t * ggml_vec_index_create_turbovec_q2(int dim);
+
+// Creates a TurboQuant q4 vector index. This is distinct from the generic
+// `bit_width=4` mode created by `ggml_vec_index_create`: vectors are normalized,
+// rotated, quantized with Lloyd-Max q4 codebooks, and searched against rotated
+// queries. This implementation requires a 64-bit target,
+// `0 < dim <= 1024 && dim % 8 == 0`, and supports add/search/filter/IVF plus
+// regular snapshot write/load. TurboVec materializes a dense `dim x dim`
+// rotation matrix on first use. Snapshots from earlier releases with larger
+// dimensions can be loaded and rewritten, but add/search/IVF are unsupported.
+// `ggml_vec_index_prepare` is best-effort and does not report allocation status.
+// mmap loading and logged mutations are reserved for later format work.
+GGML_API ggml_vec_index_t * ggml_vec_index_create_turbovec_q4(int dim);
+
 GGML_API void ggml_vec_index_free(ggml_vec_index_t * idx);
 
 // Mutation.
@@ -85,11 +109,16 @@ GGML_API void ggml_vec_index_free(ggml_vec_index_t * idx);
 // associating each with the corresponding `ids[i]` (caller-owned external id).
 // Returns 0 on success. Returns GGML_VEC_INDEX_E_DUPLICATE if any id already
 // exists in the index; in that case the index is unchanged (atomic add).
-// All vector components must be finite. UINT64_MAX is reserved for search
-// result padding and is not a valid id. `n == 0` is a no-op on handles that
-// accept plain mutations. Live index length and total allocated slots are capped
-// at INT_MAX; compact after bulk removes to reclaim tombstoned slots.
-GGML_API int ggml_vec_index_add(ggml_vec_index_t * idx, const float * vectors, int n, const uint64_t * ids);
+// All vector components must be finite. TurboVec q2/q4 also require
+// `abs(component) < 1e16`. UINT64_MAX is reserved for search result padding and
+// is not a valid id. `n == 0` is a no-op on handles that accept plain
+// mutations. Live index length and total allocated slots are capped at INT_MAX;
+// compact after bulk removes to reclaim tombstoned slots.
+GGML_API int ggml_vec_index_add(
+    ggml_vec_index_t * idx,
+    const float      * vectors,
+    int                n,
+    const uint64_t   * ids);
 
 // Removes the entry for `id` by marking its internal slot deleted. Physical
 // storage is compacted only when writing a snapshot. Returns GGML_VEC_INDEX_OK
@@ -101,11 +130,31 @@ GGML_API int ggml_vec_index_remove(ggml_vec_index_t * idx, uint64_t id);
 // invalidated. Returns 0 on success, negative on error.
 GGML_API int ggml_vec_index_compact(ggml_vec_index_t * idx);
 
-// Adds vectors and appends the mutation to a v4 delta log. The index must have
-// an established snapshot lineage from a successful snapshot write or load.
-// The first logged mutation binds the handle to `delta_path`; later logged
-// mutations must use the same log. A durability error can leave the mutation
-// applied and require reloading the snapshot plus delta before further writes.
+// Logged mutations for incremental persistence. These update `idx` and append
+// a durable v4 delta record to `delta_path`. Replay the log on top of a full
+// .tvim snapshot with `ggml_vec_index_load_with_delta`.
+//
+// A new log can only start from a handle whose current state was loaded from or
+// successfully written to a snapshot. Write a new snapshot after plain mutations.
+// Delta logs are state-bound and single-writer per snapshot lineage. Use one
+// evolving writer handle for a given {snapshot, delta_path} pair. Once bound,
+// logged mutations and compaction with a different delta path return
+// GGML_VEC_INDEX_E_INVALID_ARG. Equivalent hardlink aliases identify the same
+// log. If another handle or process appends to the same log, stale writers are
+// caught up when possible; otherwise they are rejected and must reload with
+// `ggml_vec_index_load_with_delta` before appending again.
+// A successful catch-up remains applied even if the requested mutation then
+// returns an error such as GGML_VEC_INDEX_E_DUPLICATE or E_NOT_FOUND.
+// Cross-process protection relies on cooperative OS file locks. Store delta
+// logs on local filesystems and do not modify `.tvid` files outside this API.
+// If an append error occurs after a complete replayable record is observed, the
+// mutation may remain applied and the handle may require reload before further
+// writes.
+// Once a handle participates in delta logging, use logged mutations for
+// content changes and compact_delta for snapshots; plain add/remove/compact/write
+// return GGML_VEC_INDEX_E_INVALID_ARG.
+// New logged mutations require v4 logs; compact the snapshot+delta pair first
+// when carrying a legacy log.
 GGML_API int ggml_vec_index_add_logged(
     ggml_vec_index_t * idx,
     const float      * vectors,
@@ -125,8 +174,9 @@ GGML_API int ggml_vec_index_remove_logged(
 // Read-only.
 GGML_API int ggml_vec_index_contains(const ggml_vec_index_t * idx, uint64_t id);
 
-// Compatibility no-op. Existing callers do not need to call this; use
-// `ggml_vec_index_build_ivf` when ANN search preparation is needed.
+// Optional cache warmup. TurboVec q2/q4 precompute rotation and codebook state;
+// other storage modes ignore this call. Existing callers do not need to call
+// this; use `ggml_vec_index_build_ivf` when ANN search preparation is needed.
 GGML_API void ggml_vec_index_prepare(ggml_vec_index_t * idx);
 
 // Builds an in-memory IVF-flat approximate nearest-neighbor structure for the
@@ -160,8 +210,9 @@ GGML_API int ggml_vec_index_build_ivf(
 // `query[i] * (q_code * per_vector_scale)`, without expanding the stored
 // matrix back to f32. Callers that want cosine similarity must L2-normalize
 // their vectors before insert AND before query; the index does NOT normalize
-// internally. All query components must be finite. SIMD and scalar reduction
-// order can produce small score differences across CPU architectures.
+// internally. All query components must be finite; TurboVec q2/q4 also require
+// `abs(component) < 1e16`. SIMD and scalar reduction order can produce small
+// score differences across CPU architectures.
 GGML_API int ggml_vec_index_search(
     const ggml_vec_index_t * idx,
     const float            * queries,
@@ -218,14 +269,18 @@ GGML_API int ggml_vec_index_search_ivf(
     float                  * out_scores,
     uint64_t               * out_ids);
 
-// Persistence. Returns GGML_VEC_INDEX_E_NOT_DURABLE when the file was
-// atomically replaced but the parent-directory sync failed. Legacy v1
-// snapshots are limited to 4 GiB serialized size; larger v1 states are rejected
-// by load.
+// Persistence. Writers use .tvim v2 for f32/q4/q8 and v3 for TurboVec.
+// Delta-bound handles must use `ggml_vec_index_compact_delta`; ordinary
+// snapshot writes return GGML_VEC_INDEX_E_INVALID_ARG.
+// Returns GGML_VEC_INDEX_E_NOT_DURABLE when the file was atomically replaced
+// but the parent-directory sync failed. Legacy v1 snapshots are limited to 4
+// GiB serialized size; larger v1 states are rejected by load.
 GGML_API int ggml_vec_index_write(
     ggml_vec_index_t * idx,
     const char       * path);
 
+// Loads v2/v3 files and migrates v1 f32 snapshots. Legacy bit_width=8 snapshots
+// are quantized to q8; all other legacy bit widths migrate to f32/32-bit.
 // Returns 0 on success and stores the loaded handle in `out`.
 GGML_API int ggml_vec_index_load_ex(
     const char         * path,
@@ -234,22 +289,33 @@ GGML_API int ggml_vec_index_load_ex(
 // Returns NULL on failure.
 GGML_API ggml_vec_index_t * ggml_vec_index_load(const char * path);
 
-// Loads a read-only current-version (v2) mmap snapshot on a little-endian host.
-// Legacy v1 snapshots return GGML_VEC_INDEX_E_BAD_VERSION. On POSIX, the
-// snapshot filesystem must support flock(). Returns 0 on success and stores
-// the loaded handle in `out`.
+// Loads a v2 .tvim snapshot with its vector section memory-mapped read-only.
+// Legacy v1 snapshots return GGML_VEC_INDEX_E_BAD_VERSION.
+// IDs and quantization scales are copied into memory for lookup and scoring.
+// Data-mutating and logged mutation APIs return
+// GGML_VEC_INDEX_E_INVALID_ARG on mmap-backed handles.
+// Heap-only search preparation such as `ggml_vec_index_build_ivf` is allowed.
+// `ggml_vec_index_write` can snapshot mmap-backed handles, but callers must
+// write to a different path than the mapped source file and the handle must
+// not be delta-bound.
+// This loader is snapshot-only: it does not replay .tvid delta logs. Use
+// `ggml_vec_index_load_with_delta` when loading a snapshot plus delta log;
+// that path materializes the resulting index in memory.
+// Requires a little-endian host and, on POSIX, a filesystem that supports
+// flock(). Use `ggml_vec_index_load` on other hosts.
+// Returns 0 on success and stores the loaded handle in `out`.
 GGML_API int ggml_vec_index_load_mmap_ex(
     const char         * path,
     ggml_vec_index_t  ** out);
 
-// Same platform requirements as ggml_vec_index_load_mmap_ex. Returns NULL on
-// failure.
+// Returns NULL on failure or unsupported file format.
 GGML_API ggml_vec_index_t * ggml_vec_index_load_mmap(const char * path);
 
-// Loads a snapshot and replays a .tvid delta log. The returned handle is bound
-// to that delta log: plain add, remove, compact, and snapshot write operations
-// return GGML_VEC_INDEX_E_INVALID_ARG. Returns 0 on success and stores the
-// loaded handle in `out`.
+// Loads a full .tvim snapshot and replays an append-only delta log. Missing
+// delta logs are treated as empty. The returned handle is bound to that delta
+// log: plain add, remove, compact, and snapshot write operations return
+// GGML_VEC_INDEX_E_INVALID_ARG.
+// Returns 0 on success and stores the loaded handle in `out`.
 GGML_API int ggml_vec_index_load_with_delta_ex(
     const char         * snapshot_path,
     const char         * delta_path,
@@ -272,17 +338,88 @@ GGML_API int ggml_vec_index_len(const ggml_vec_index_t * idx);
 GGML_API int ggml_vec_index_dim(const ggml_vec_index_t * idx);
 GGML_API int ggml_vec_index_bit_width(const ggml_vec_index_t * idx);
 
-// Snapshot formats are little-endian.
+// File format (.tvim versions 2 and 3, all little-endian):
+// "TQ+" here is the TurboVec per-coordinate calibration scheme, unrelated to
+// ggml tensor types GGML_TYPE_TQ1_0 and GGML_TYPE_TQ2_0.
 //
-// Legacy .tvim v1 has a 16-byte header followed by N*D float32 values and N
-// uint64 ids. A serialized bit_width of 8 is quantized to q8 on load; other
-// accepted legacy bit widths load as f32 for compatibility.
+//   offset  size   field
+//   ------  -----  -------------------------------------------------------
+//   0       4      magic = "TVPI" (bytes 0x54, 0x56, 0x50, 0x49)
+//   4       1      version (2 for f32/q4/q8, 3 for TurboVec)
+//   5       1      bit_width (2 for TurboVec q2, 4, 8, or 32)
+//   6       1      storage kind (1 = f32, 2 = q8, 3 = q4, 4 = TurboVec q4, 5 = TurboVec q2)
+//   7       1      flags (bit 0 = checksum trailer present)
+//   8       4      dim (uint32)
+//   12      4      n_vectors (uint32)
+//   16      4      qparam_type (0 = none, 1 = per-vector f32 scale)
+//   20      4      qparam_bytes_per_vector (0 or 4)
+//   24      4      bytes_per_component (0 for packed q4/TurboVec, 1 for q8, 4 for f32)
+//   28      4      TQ+ calibration bytes (v3; zero in v2)
+//   32      ...    qparams:
+//                    - f32: empty
+//                    - q4/q8: N float32 scales
+//                    - TurboVec q2/q4: N float32 score-correction scales
+//   ...     ...    TQ+ calibration (v3): D float32 shifts, then D float32 scales
+//   ...     ...    vectors:
+//                    - f32: N*D float32 values, row-major
+//                    - q8:  N*D int8 codes, row-major
+//                    - q4:  N*ceil(D/2) packed unsigned nibbles, row-major
+//                    - TurboVec q4: N*(D/2) Lloyd-Max codes in bit-plane layout
+//                    - TurboVec q2: N*(D/4) Lloyd-Max codes in bit-plane layout
+//   ...     N*8    ids (uint64)
+//   ...     4      header CRC32C, when flag bit 0 is set
+//   ...     4      qparams CRC32C, when flag bit 0 is set
+//   ...     4      vectors CRC32C, when flag bit 0 is set
+//   ...     4      ids CRC32C, when flag bit 0 is set
 //
-// Current .tvim v2 has a 32-byte header describing f32, q8, or q4 storage,
-// followed by optional per-vector scales, vector bytes, ids, and four CRC32C
-// values covering the header and each data section. Readers reject unknown
-// versions or flags, invalid storage layouts, duplicate or reserved ids,
-// non-finite values, checksum mismatches, truncation, and trailing bytes.
+// Where N = n_vectors and D = dim. q8 uses symmetric per-vector quantization:
+// scale = max(abs(v)) / 127, code = round(v / scale) clamped to [-127, 127].
+// q4 uses scale = max(abs(v)) / 7, code = round(v / scale) clamped to [-7, 7],
+// stored as unsigned nibble `code + 8` (0 is invalid). Zero vectors use
+// scale = 1 and all-zero dequantized codes. Each CRC32C covers exactly its
+// corresponding serialized section; the qparams CRC also covers v3 calibration,
+// the header CRC covers bytes [0, 32), and
+// the CRC32C of an empty section is zero.
+// Legacy v2 files with flags=0 and no checksum trailer remain readable.
+// Writers emit checksummed v2/v3 files. Readers reject unknown versions and
+// flag bits; they also accept legacy v1 f32 snapshots. Legacy bit_width=8
+// snapshots migrate to q8, while all other legacy widths migrate to f32.
+//
+// Delta log (.tvid version 4, all little-endian):
+//
+//   file header:
+//     0   4   magic = "TVDL"
+//     4   1   version = 4
+//     5   1   bit_width (4, 8, or 32)
+//     6   2   reserved (zero)
+//     8   4   dim (uint32)
+//     12  4   reserved (zero)
+//     16  32  base snapshot state identity
+//
+//   record header:
+//     0   1   op (1 = add, 2 = remove)
+//     1   3   reserved (zero)
+//     4   4   n (add count; remove uses 1)
+//     8   8   payload bytes
+//     16  4   CRC32C over record header bytes [0, 16), state identity, and payload
+//     20  4   reserved (zero)
+//     24  32  state identity after applying this record
+//
+//   add payload:
+//     - f32: N uint64 ids, then N*D float32 vectors
+//     - q8:  N uint64 ids, then N float32 scales, then N*D int8 codes
+//     - q4:  N uint64 ids, then N float32 scales, then
+//            N*ceil(D/2) packed unsigned nibbles
+//   remove payload: one uint64 id
+//
+// The base snapshot state identity binds the log to the snapshot state it
+// extends. It stores the active count plus the three maintained 64-bit state
+// hash aggregates, with sums maintained modulo 2^64. Record state identities
+// let loading validate each replayed record's post-state
+// and recognize a compacted snapshot when a process crashed before replacing
+// the old delta log. Readers also accept legacy .tvid v1 logs, whose state
+// field is a full-index CRC32C, v2 logs, whose add payloads always store f32
+// vectors, and v3 logs, whose state field is a 32-bit token.
 
 #ifdef __cplusplus
 }

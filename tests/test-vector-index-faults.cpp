@@ -27,6 +27,10 @@ extern "C" void ggml_vec_index_test_set_data_fsync_fail(int fail);
 extern "C" void ggml_vec_index_test_set_parent_fsync_fail(int fail);
 extern "C" void ggml_vec_index_test_set_delta_append_wait_target(int target);
 extern "C" int ggml_vec_index_test_get_delta_append_waiters(void);
+extern "C" void ggml_vec_index_test_set_delta_append_hold(int hold);
+extern "C" void ggml_vec_index_test_release_delta_append(void);
+extern "C" int ggml_vec_index_test_get_sidecar_lock_probe(void);
+extern "C" int ggml_vec_index_test_get_delta_append_max_active_waiters(void);
 extern "C" void ggml_vec_index_test_set_load_with_delta_pause_ms(int pause_ms);
 extern "C" void ggml_vec_index_test_reset_delta_tail_scan_count(void);
 extern "C" int64_t ggml_vec_index_test_get_delta_tail_scan_count(void);
@@ -395,8 +399,11 @@ void test_hardlink_delta_appends() {
     thread_b.join();
     reset_fault_hooks();
 
-    CHECK((status_a == GGML_VEC_INDEX_OK && status_b == GGML_VEC_INDEX_E_IO) ||
-          (status_a == GGML_VEC_INDEX_E_IO && status_b == GGML_VEC_INDEX_OK));
+    CHECK(status_a == GGML_VEC_INDEX_OK);
+    CHECK(status_b == GGML_VEC_INDEX_OK);
+    CHECK(ggml_vec_index_contains(writer_a, id_a) == 1);
+    CHECK(ggml_vec_index_contains(writer_b, id_a) == 1);
+    CHECK(ggml_vec_index_contains(writer_b, id_b) == 1);
 
     if (status_a == GGML_VEC_INDEX_OK) {
         CHECK(ggml_vec_index_remove_logged(writer_a, id_a, alias_path.c_str()) == GGML_VEC_INDEX_OK);
@@ -407,9 +414,9 @@ void test_hardlink_delta_appends() {
     auto * replayed = ggml_vec_index_load_with_delta(
         snapshot_path.c_str(), delta_path.c_str());
     CHECK(replayed != nullptr);
-    CHECK(ggml_vec_index_len(replayed) == 2);
+    CHECK(ggml_vec_index_len(replayed) == 3);
     CHECK(ggml_vec_index_contains(replayed, id_a) == 0);
-    CHECK(ggml_vec_index_contains(replayed, id_b) == 0);
+    CHECK(ggml_vec_index_contains(replayed, id_b) == 1);
     ggml_vec_index_free(replayed);
     ggml_vec_index_free(writer_a);
     ggml_vec_index_free(writer_b);
@@ -492,9 +499,7 @@ void test_cross_process_delta_appends(const char * self_path, bool use_hardlink_
     status_a = wait_delta_writer_process(process_a);
     status_b = wait_delta_writer_process(process_b);
 
-    if (!ready ||
-        !((status_a == 0 && status_b == 4) ||
-          (status_a == 4 && status_b == 0))) {
+    if (!ready || status_a != 0 || status_b != 0) {
         std::fprintf(
             stderr,
             "cross-process delta append failed: ready=%d status_a=%d status_b=%d\nchild_a: %s\nchild_b: %s\n",
@@ -505,8 +510,8 @@ void test_cross_process_delta_appends(const char * self_path, bool use_hardlink_
             delta_writer_description(snapshot_path, second_delta_path, start_path, ready_path_b, child_id_b).c_str());
     }
     CHECK(ready);
-    CHECK((status_a == 0 && status_b == 4) ||
-          (status_a == 4 && status_b == 0));
+    CHECK(status_a == 0);
+    CHECK(status_b == 0);
     CHECK(std::filesystem::exists(delta_path + ".lock"));
     if (use_hardlink_alias) {
         CHECK(std::filesystem::exists(alias_path + ".lock"));
@@ -515,11 +520,11 @@ void test_cross_process_delta_appends(const char * self_path, bool use_hardlink_
     auto * replayed = ggml_vec_index_load_with_delta(
         snapshot_path.c_str(), delta_path.c_str());
     CHECK(replayed != nullptr);
-    CHECK(ggml_vec_index_len(replayed) == 3);
+    CHECK(ggml_vec_index_len(replayed) == 4);
     CHECK(ggml_vec_index_contains(replayed, base_ids[0]) == 1);
     CHECK(ggml_vec_index_contains(replayed, base_ids[1]) == 1);
-    CHECK(ggml_vec_index_contains(replayed, child_id_a) == (status_a == 0 ? 1 : 0));
-    CHECK(ggml_vec_index_contains(replayed, child_id_b) == (status_b == 0 ? 1 : 0));
+    CHECK(ggml_vec_index_contains(replayed, child_id_a) == 1);
+    CHECK(ggml_vec_index_contains(replayed, child_id_b) == 1);
     ggml_vec_index_free(replayed);
 
     std::filesystem::remove(snapshot_path);
@@ -1051,6 +1056,18 @@ int main(int argc, char ** argv) {
     CHECK(stale_filter != nullptr);
     CHECK(ggml_vec_index_build_ivf(idx, /*n_lists=*/2, /*n_iter=*/1)
           == GGML_VEC_INDEX_OK);
+    {
+        const std::array<uint8_t, 8> torn_header = {
+            'T', 'V', 'D', 'L',
+            4, 32, 0, 0,
+        };
+        std::ofstream delta(delta_path, std::ios::binary | std::ios::trunc);
+        CHECK(delta.good());
+        delta.write(
+            reinterpret_cast<const char *>(torn_header.data()),
+            static_cast<std::streamsize>(torn_header.size()));
+        CHECK(delta.good());
+    }
     CHECK(ggml_vec_index_add_logged(
         idx, logged_vector.data(), 1, &logged_id, delta_path.c_str()) ==
         GGML_VEC_INDEX_OK);
@@ -1321,25 +1338,102 @@ int main(int argc, char ** argv) {
         &stale_tail_id_b, stale_tail_delta_path.c_str()) == GGML_VEC_INDEX_OK);
     CHECK(std::filesystem::file_size(stale_tail_delta_path) == stale_tail_size);
 
-    const uint64_t stale_tail_rejected_id = 803;
+    const uint64_t stale_tail_caught_up_id = 803;
     CHECK(ggml_vec_index_add_logged(
         stale_writer, logged_vector.data(), 1,
-        &stale_tail_rejected_id, stale_tail_delta_path.c_str()) == GGML_VEC_INDEX_E_IO);
-    CHECK(ggml_vec_index_contains(stale_writer, stale_tail_rejected_id) == 0);
+        &stale_tail_caught_up_id, stale_tail_delta_path.c_str()) == GGML_VEC_INDEX_OK);
+    CHECK(ggml_vec_index_contains(stale_writer, stale_tail_id_b) == 1);
+    CHECK(ggml_vec_index_contains(stale_writer, stale_tail_caught_up_id) == 1);
 
     auto * stale_tail_replayed = ggml_vec_index_load_with_delta(
         stale_tail_snapshot_path.c_str(), stale_tail_delta_path.c_str());
     CHECK(stale_tail_replayed != nullptr);
-    CHECK(ggml_vec_index_len(stale_tail_replayed) == 4);
+    CHECK(ggml_vec_index_len(stale_tail_replayed) == 5);
     CHECK(ggml_vec_index_contains(stale_tail_replayed, stale_tail_id_a) == 1);
     CHECK(ggml_vec_index_contains(stale_tail_replayed, stale_tail_id_b) == 1);
-    CHECK(ggml_vec_index_contains(stale_tail_replayed, stale_tail_rejected_id) == 0);
+    CHECK(ggml_vec_index_contains(stale_tail_replayed, stale_tail_caught_up_id) == 1);
     ggml_vec_index_free(stale_tail_replayed);
     ggml_vec_index_free(fresh_writer);
     ggml_vec_index_free(stale_writer);
     std::filesystem::remove(stale_tail_snapshot_path);
     std::filesystem::remove(stale_tail_delta_path);
     std::filesystem::remove(stale_tail_delta_path + ".lock");
+
+    const std::string hardlink_snapshot_path =
+        unique_temp_path("ggml-vector-index-hardlink-lock-base.tvim");
+    const std::string hardlink_delta_path =
+        unique_temp_path("ggml-vector-index-hardlink-lock-log.tvid");
+    const std::string hardlink_alias_path =
+        unique_temp_path("ggml-vector-index-hardlink-lock-alias.tvid");
+    std::filesystem::remove(hardlink_snapshot_path);
+    std::filesystem::remove(hardlink_delta_path);
+    std::filesystem::remove(hardlink_alias_path);
+
+    auto * hardlink_base = ggml_vec_index_create(dim, /*bit_width=*/32);
+    CHECK(hardlink_base != nullptr);
+    CHECK(ggml_vec_index_add(
+        hardlink_base, base_vectors.data(), 2, base_ids.data()) == GGML_VEC_INDEX_OK);
+    CHECK(ggml_vec_index_write(hardlink_base, hardlink_snapshot_path.c_str()) ==
+          GGML_VEC_INDEX_OK);
+    ggml_vec_index_free(hardlink_base);
+
+    {
+        std::ofstream empty_delta(hardlink_delta_path, std::ios::binary);
+        CHECK(empty_delta.is_open());
+    }
+    std::error_code hardlink_ec;
+    std::filesystem::create_hard_link(hardlink_delta_path, hardlink_alias_path, hardlink_ec);
+    if (!hardlink_ec) {
+        auto * hardlink_writer_a = ggml_vec_index_load(hardlink_snapshot_path.c_str());
+        auto * hardlink_writer_b = ggml_vec_index_load(hardlink_snapshot_path.c_str());
+        CHECK(hardlink_writer_a != nullptr);
+        CHECK(hardlink_writer_b != nullptr);
+
+        int status_a = GGML_VEC_INDEX_E_INTERNAL;
+        int status_b = GGML_VEC_INDEX_E_INTERNAL;
+        const uint64_t hardlink_id_a = 805;
+        const uint64_t hardlink_id_b = 806;
+        ggml_vec_index_test_set_delta_append_wait_target(2);
+        std::thread thread_a([&]() {
+            status_a = ggml_vec_index_add_logged(
+                hardlink_writer_a,
+                logged_vector.data(),
+                1,
+                &hardlink_id_a,
+                hardlink_delta_path.c_str());
+        });
+        while (ggml_vec_index_test_get_delta_append_waiters() < 1) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        std::thread thread_b([&]() {
+            status_b = ggml_vec_index_add_logged(
+                hardlink_writer_b,
+                extra_vector.data(),
+                1,
+                &hardlink_id_b,
+                hardlink_alias_path.c_str());
+        });
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        CHECK(ggml_vec_index_test_get_delta_append_waiters() == 1);
+        thread_a.join();
+        thread_b.join();
+        reset_fault_hooks();
+
+        CHECK(status_a == GGML_VEC_INDEX_OK);
+        CHECK(status_b == GGML_VEC_INDEX_OK);
+        CHECK(ggml_vec_index_contains(hardlink_writer_b, hardlink_id_b) == 1);
+        auto * hardlink_replayed = ggml_vec_index_load_with_delta(
+            hardlink_snapshot_path.c_str(), hardlink_delta_path.c_str());
+        CHECK(hardlink_replayed != nullptr);
+        CHECK(ggml_vec_index_contains(hardlink_replayed, hardlink_id_a) == 1);
+        CHECK(ggml_vec_index_contains(hardlink_replayed, hardlink_id_b) == 1);
+        ggml_vec_index_free(hardlink_replayed);
+        ggml_vec_index_free(hardlink_writer_a);
+        ggml_vec_index_free(hardlink_writer_b);
+    }
+    std::filesystem::remove(hardlink_snapshot_path);
+    std::filesystem::remove(hardlink_delta_path);
+    std::filesystem::remove(hardlink_alias_path);
 
     const std::string stale_compact_snapshot_path =
         unique_temp_path("ggml-vector-index-stale-compact-base.tvim");
@@ -1468,46 +1562,59 @@ int main(int argc, char ** argv) {
     CHECK(shared_b != nullptr);
     const uint64_t shared_id_a = 501;
     const uint64_t shared_id_b = 502;
-    std::atomic<bool> start_shared_appends{ false };
     int status_a = GGML_VEC_INDEX_E_INTERNAL;
     int status_b = GGML_VEC_INDEX_E_INTERNAL;
     ggml_vec_index_test_set_delta_append_wait_target(2);
+    ggml_vec_index_test_set_delta_append_hold(1);
     std::thread thread_a([&]() {
-        while (!start_shared_appends.load()) {
-            std::this_thread::yield();
-        }
         status_a = ggml_vec_index_add_logged(
             shared_a, logged_vector.data(), 1, &shared_id_a, shared_delta_path.c_str());
     });
+    const auto first_append_deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (ggml_vec_index_test_get_delta_append_waiters() < 1 &&
+           std::chrono::steady_clock::now() < first_append_deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    const bool first_append_waiting =
+        ggml_vec_index_test_get_delta_append_waiters() == 1;
+    if (!first_append_waiting) {
+        ggml_vec_index_test_release_delta_append();
+        thread_a.join();
+        CHECK(first_append_waiting);
+    }
     std::thread thread_b([&]() {
-        while (!start_shared_appends.load()) {
-            std::this_thread::yield();
-        }
         status_b = ggml_vec_index_add_logged(
             shared_b, extra_vector.data(), 1, &shared_id_b, shared_delta_path.c_str());
     });
-    start_shared_appends.store(true);
+    const auto sidecar_probe_deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (ggml_vec_index_test_get_sidecar_lock_probe() < 0 &&
+           std::chrono::steady_clock::now() < sidecar_probe_deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    const int sidecar_lock_probe = ggml_vec_index_test_get_sidecar_lock_probe();
+    ggml_vec_index_test_release_delta_append();
     thread_a.join();
     thread_b.join();
+    CHECK(sidecar_lock_probe == 1);
+    CHECK(ggml_vec_index_test_get_delta_append_max_active_waiters() == 1);
     reset_fault_hooks();
 
-    CHECK((status_a == GGML_VEC_INDEX_OK && status_b == GGML_VEC_INDEX_E_IO) ||
-          (status_a == GGML_VEC_INDEX_E_IO && status_b == GGML_VEC_INDEX_OK));
-    CHECK(ggml_vec_index_contains(shared_a, shared_id_a) ==
-          (status_a == GGML_VEC_INDEX_OK ? 1 : 0));
-    CHECK(ggml_vec_index_contains(shared_b, shared_id_b) ==
-          (status_b == GGML_VEC_INDEX_OK ? 1 : 0));
+    CHECK(status_a == GGML_VEC_INDEX_OK);
+    CHECK(status_b == GGML_VEC_INDEX_OK);
+    CHECK(ggml_vec_index_contains(shared_a, shared_id_a) == 1);
+    CHECK(ggml_vec_index_contains(shared_b, shared_id_a) == 1);
+    CHECK(ggml_vec_index_contains(shared_b, shared_id_b) == 1);
 
     auto * shared_replayed = ggml_vec_index_load_with_delta(
         shared_snapshot_path.c_str(), shared_delta_path.c_str());
     CHECK(shared_replayed != nullptr);
-    CHECK(ggml_vec_index_len(shared_replayed) == 3);
+    CHECK(ggml_vec_index_len(shared_replayed) == 4);
     CHECK(ggml_vec_index_contains(shared_replayed, base_ids[0]) == 1);
     CHECK(ggml_vec_index_contains(shared_replayed, base_ids[1]) == 1);
-    CHECK(ggml_vec_index_contains(shared_replayed, shared_id_a) ==
-          (status_a == GGML_VEC_INDEX_OK ? 1 : 0));
-    CHECK(ggml_vec_index_contains(shared_replayed, shared_id_b) ==
-          (status_b == GGML_VEC_INDEX_OK ? 1 : 0));
+    CHECK(ggml_vec_index_contains(shared_replayed, shared_id_a) == 1);
+    CHECK(ggml_vec_index_contains(shared_replayed, shared_id_b) == 1);
 
     ggml_vec_index_free(shared_replayed);
     ggml_vec_index_free(shared_a);

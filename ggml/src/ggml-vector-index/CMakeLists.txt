@@ -16,9 +16,10 @@ set(GGML_VECTOR_INDEX_AVX2_CHECK_SOURCE [=[
         const __m128 lo = _mm_cvtepi32_ps(q32_lo);
         const __m128 hi = _mm_cvtepi32_ps(q32_hi);
         const __m256 q = _mm256_insertf128_ps(_mm256_castps128_ps256(lo), hi, 1);
+        const __m256 fma = _mm256_fmadd_ps(q, q, q);
         alignas(32) float out[8];
-        _mm256_store_ps(out, q);
-        return out[0] == -1.0f ? 0 : 1;
+        _mm256_store_ps(out, fma);
+        return out[0] == 0.0f ? 0 : 1;
     }
 ]=])
 
@@ -31,16 +32,18 @@ if (GGML_SYSTEM_ARCH STREQUAL "x86")
             set(GGML_VECTOR_INDEX_AVX2_FLAG "/arch:AVX2")
         endif()
     elseif (CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
-        check_cxx_compiler_flag("-mavx2" GGML_VECTOR_INDEX_SUPPORTS_AVX2)
-        if (GGML_VECTOR_INDEX_SUPPORTS_AVX2)
-            set(GGML_VECTOR_INDEX_AVX2_FLAG "-mavx2")
+        check_cxx_compiler_flag("-mavx2" GGML_VECTOR_INDEX_SUPPORTS_MAVX2)
+        check_cxx_compiler_flag("-mfma" GGML_VECTOR_INDEX_SUPPORTS_MFMA)
+        if (GGML_VECTOR_INDEX_SUPPORTS_MAVX2 AND GGML_VECTOR_INDEX_SUPPORTS_MFMA)
+            set(GGML_VECTOR_INDEX_AVX2_FLAG "-mavx2;-mfma")
         endif()
     endif()
 endif()
 
 if (GGML_VECTOR_INDEX_AVX2_FLAG)
     set(CMAKE_REQUIRED_FLAGS_SAVE ${CMAKE_REQUIRED_FLAGS})
-    set(CMAKE_REQUIRED_FLAGS "${CMAKE_REQUIRED_FLAGS} ${GGML_VECTOR_INDEX_AVX2_FLAG}")
+    string(REPLACE ";" " " GGML_VECTOR_INDEX_AVX2_REQUIRED_FLAGS "${GGML_VECTOR_INDEX_AVX2_FLAG}")
+    set(CMAKE_REQUIRED_FLAGS "${CMAKE_REQUIRED_FLAGS} ${GGML_VECTOR_INDEX_AVX2_REQUIRED_FLAGS}")
     check_cxx_source_compiles(
         "${GGML_VECTOR_INDEX_AVX2_CHECK_SOURCE}"
         GGML_VECTOR_INDEX_SUPPORTS_AVX2_KERNEL)
@@ -128,7 +131,7 @@ foreach(lib IN LISTS CMAKE_CXX_IMPLICIT_LINK_LIBRARIES)
     endif()
 endforeach()
 if (CMAKE_THREAD_LIBS_INIT)
-    list(APPEND GGML_VECTOR_INDEX_PRIVATE_LIBS_LIST ${CMAKE_THREAD_LIBS_INIT})
+    list(APPEND GGML_VECTOR_INDEX_PRIVATE_LIBS_LIST "${CMAKE_THREAD_LIBS_INIT}")
 endif()
 if (GGML_VECTOR_INDEX_PC_MATH_LIBS)
     list(APPEND GGML_VECTOR_INDEX_PRIVATE_LIBS_LIST ${GGML_VECTOR_INDEX_PC_MATH_LIBS})

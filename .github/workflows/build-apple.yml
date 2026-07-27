@@ -10,29 +10,33 @@ on:
       '**/CMakeLists.txt',
       '**/*.cmake',
       '**/*.cmake.in',
+      '**/*.pc.in',
       '**/*.h',
       '**/*.hpp',
       '**/*.c',
       '**/*.cpp',
       '**/*.swift',
       '**/*.m',
-      '**/*.metal'
+      '**/*.metal',
+      'scripts/vector-index-package-smoke.sh'
     ]
 
   pull_request:
     types: [opened, synchronize, reopened]
     paths: [
       '.github/workflows/build-apple.yml',
-      'CMakeLists.txt',
-      'ggml/CMakeLists.txt',
-      'ggml/src/ggml-metal/**',
-      'ggml/src/ggml-rpc/**',
-      'ggml/include/ggml-vector-index.h',
-      'ggml/src/CMakeLists.txt',
-      'ggml/src/ggml-vector-index*',
-      'tests/CMakeLists.txt',
-      'tests/test-vector-index*.cpp',
-      'tools/vector-index-bench/**'
+      '**/CMakeLists.txt',
+      '**/*.cmake',
+      '**/*.cmake.in',
+      '**/*.pc.in',
+      '**/*.h',
+      '**/*.hpp',
+      '**/*.c',
+      '**/*.cpp',
+      '**/*.swift',
+      '**/*.m',
+      '**/*.metal',
+      'scripts/vector-index-package-smoke.sh'
     ]
 
 cache-mode: none
@@ -117,3 +121,35 @@ jobs:
           # ref: https://github.com/ggml-org/llama.cpp/pull/19802#issuecomment-4013704023
           ctest -L main -E "test-llama-archs|test-llama-context|test-speculative-rejection-sampling" --verbose --timeout 1800
 
+      - name: Vector-index static pkg-config smoke
+        id: vector_index_static_pkg_config
+        run: |
+          STATIC_PREFIX="$RUNNER_TEMP/vector-index-static-install"
+          cmake -S ggml -B build-vector-index-package-static \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX="$STATIC_PREFIX" \
+            -DBUILD_SHARED_LIBS=OFF \
+            -DGGML_BUILD_TESTS=OFF \
+            -DGGML_BUILD_EXAMPLES=OFF \
+            -DGGML_VECTOR_INDEX=ON
+          cmake --build build-vector-index-package-static -j $(sysctl -n hw.logicalcpu)
+          cmake --install build-vector-index-package-static
+          PREFIX="$STATIC_PREFIX" \
+            CONSUMER_DIR=vector-index-pkg-config-static \
+            RUN_CMAKE=0 \
+            PKG_CONFIG_STATIC=1 \
+            bash scripts/vector-index-package-smoke.sh
+          cat > ggml-pkg-config-static.c <<'EOF'
+          #include "ggml.h"
+
+          int main(void) {
+              ggml_time_init();
+              return ggml_time_us() < 0;
+          }
+          EOF
+          PKG_CONFIG_PATH="$STATIC_PREFIX/lib/pkgconfig" \
+            cc ggml-pkg-config-static.c \
+              $(PKG_CONFIG_PATH="$STATIC_PREFIX/lib/pkgconfig" \
+                pkg-config --cflags --libs --static ggml) \
+              -o ggml-pkg-config-static
+          ./ggml-pkg-config-static

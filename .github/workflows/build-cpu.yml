@@ -18,6 +18,7 @@ on:
       '**/*.hpp',
       '**/*.c',
       '**/*.cpp',
+      '**/*.inc',
     ]
 
   pull_request:
@@ -35,7 +36,8 @@ on:
       '**/*.h',
       '**/*.hpp',
       '**/*.c',
-      '**/*.cpp'
+      '**/*.cpp',
+      '**/*.inc'
     ]
 
 cache-mode: none
@@ -154,8 +156,8 @@ jobs:
             -DLLAMA_BUILD_TESTS=ON \
             -DGGML_VECTOR_INDEX=ON \
             -DBUILD_SHARED_LIBS=OFF
-          cmake --build build-vector-index-static --target test-vector-index test-vector-index-faults -j $(nproc)
-          ctest --test-dir build-vector-index-static -R '^test-vector-index(-faults)?$' --output-on-failure
+          cmake --build build-vector-index-static --target test-vector-index test-vector-index-hooks test-vector-index-faults -j $(nproc)
+          ctest --test-dir build-vector-index-static -R '^test-vector-index(-hooks|-faults)?$' --output-on-failure
 
       - name: Vector-index package smoke
         if: ${{ matrix.build == 'x64' || matrix.build == 'arm64' }}
