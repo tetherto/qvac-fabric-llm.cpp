@@ -163,6 +163,18 @@ if (NOT WIN32)
     )
 endif()
 
+# POC vector-index smoke test: no model required, no llama runtime touched.
+if (TARGET ggml-vector-index)
+    add_executable(test-vector-index test-vector-index.cpp)
+    target_compile_features(test-vector-index PRIVATE cxx_std_17)
+    target_include_directories(test-vector-index PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
+    target_link_libraries(test-vector-index PRIVATE ggml-vector-index)
+    if (LLAMA_TESTS_INSTALL)
+        install(TARGETS test-vector-index RUNTIME)
+    endif()
+    llama_test(test-vector-index)
+endif()
+
 if (LLAMA_LLGUIDANCE)
     llama_build_and_test(test-grammar-llguidance.cpp  LABEL "main behavior"  ARGS ${PROJECT_SOURCE_DIR}/models/ggml-vocab-llama-bpe.gguf)
 endif ()

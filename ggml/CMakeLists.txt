@@ -123,6 +123,7 @@ option(GGML_STATIC "ggml: static link libraries"                     OFF)
 option(GGML_NATIVE "ggml: optimize the build for the current system" ${GGML_NATIVE_DEFAULT})
 option(GGML_LTO    "ggml: enable link time optimization"             OFF)
 option(GGML_CCACHE "ggml: use ccache if available"                   ON)
+option(GGML_VECTOR_INDEX "ggml: build standalone vector index library" OFF)
 
 # debug
 option(GGML_ALL_WARNINGS           "ggml: enable all compiler warnings"                   ON)
@@ -301,6 +302,25 @@ find_package(Threads REQUIRED)
 
 include(GNUInstallDirs)
 
+if (GGML_STANDALONE OR GGML_VECTOR_INDEX)
+    if (IS_ABSOLUTE "${CMAKE_INSTALL_LIBDIR}")
+        set(GGML_PC_PREFIX "${CMAKE_INSTALL_PREFIX}")
+        set(GGML_PC_LIBDIR "${CMAKE_INSTALL_LIBDIR}")
+    else()
+        set(_GGML_PC_PREFIX_BASE "${CMAKE_CURRENT_BINARY_DIR}/pkgconfig-prefix")
+        file(RELATIVE_PATH GGML_PC_PREFIX_RELATIVE
+            "${_GGML_PC_PREFIX_BASE}/${CMAKE_INSTALL_LIBDIR}/pkgconfig"
+            "${_GGML_PC_PREFIX_BASE}")
+        set(GGML_PC_PREFIX "\${pcfiledir}/${GGML_PC_PREFIX_RELATIVE}")
+        set(GGML_PC_LIBDIR "\${prefix}/${CMAKE_INSTALL_LIBDIR}")
+    endif()
+    if (IS_ABSOLUTE "${CMAKE_INSTALL_INCLUDEDIR}")
+        set(GGML_PC_INCLUDEDIR "${CMAKE_INSTALL_INCLUDEDIR}")
+    else()
+        set(GGML_PC_INCLUDEDIR "\${prefix}/${CMAKE_INSTALL_INCLUDEDIR}")
+    endif()
+endif()
+
 #
 # build the library
 #
@@ -361,7 +381,7 @@ install(
   NAMESPACE ggml::
   DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/ggml)
 
-if (GGML_STANDALONE)
+if (GGML_STANDALONE AND BUILD_SHARED_LIBS)
     configure_file(${CMAKE_CURRENT_SOURCE_DIR}/ggml.pc.in
         ${CMAKE_CURRENT_BINARY_DIR}/ggml.pc
         @ONLY)
@@ -450,6 +470,7 @@ if (MSVC)
 
     configure_msvc_target(ggml-base)
     configure_msvc_target(ggml)
+    configure_msvc_target(ggml-vector-index)
     configure_msvc_target(ggml-cpu)
     configure_msvc_target(ggml-cpu-x64)
     configure_msvc_target(ggml-cpu-sse42)

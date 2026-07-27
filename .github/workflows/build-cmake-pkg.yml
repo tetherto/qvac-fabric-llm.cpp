@@ -26,9 +26,32 @@ jobs:
                 -DLLAMA_BUILD_EXAMPLES=OFF \
                 -DLLAMA_BUILD_APP=OFF \
                 -DLLAMA_BUILD_IS_DEV=OFF \
+                -DGGML_VECTOR_INDEX=ON \
                 -DCMAKE_BUILD_TYPE=Release
           cmake --build build --config Release -j $(nproc)
           cmake --install build --prefix "$PREFIX" --config Release
+
+          PREFIX="$PREFIX" \
+            CONSUMER_DIR=vector-index-cmake-pkg \
+            RUN_PKG_CONFIG=0 \
+            bash scripts/vector-index-package-smoke.sh
+
+          GGML_PREFIX="$(pwd)"/inst-ggml
+          cmake -S ggml -B build-ggml \
+                -DCMAKE_BUILD_TYPE=Release \
+                -DCMAKE_INSTALL_PREFIX="$GGML_PREFIX" \
+                -DCMAKE_INSTALL_LIBDIR=lib/x86_64-linux-gnu \
+                -DBUILD_SHARED_LIBS=OFF \
+                -DGGML_BUILD_TESTS=OFF \
+                -DGGML_BUILD_EXAMPLES=OFF \
+                -DGGML_VECTOR_INDEX=ON
+          cmake --build build-ggml --config Release
+          cmake --install build-ggml --config Release
+          PREFIX="$GGML_PREFIX" \
+            CONSUMER_DIR=vector-index-pkg-config \
+            LIBDIR=lib/x86_64-linux-gnu \
+            PKG_CONFIG_STATIC=1 \
+            bash scripts/vector-index-package-smoke.sh
 
           export LLAMA_CONFIG="$PREFIX"/share/llama/llama-config.cmake
           build_commit=$(git rev-parse --short HEAD | xargs)

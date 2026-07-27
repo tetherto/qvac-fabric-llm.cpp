@@ -653,6 +653,10 @@ foreach (target ggml-base ggml)
     target_compile_features   (${target} PRIVATE c_std_11 cxx_std_17) # don't bump
 endforeach()
 
+if (GGML_VECTOR_INDEX)
+    add_subdirectory(ggml-vector-index)
+endif()
+
 target_link_libraries(ggml-base PRIVATE Threads::Threads)
 
 if (DEFINED MATH_LIBRARY)
