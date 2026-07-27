@@ -7249,7 +7249,10 @@ static void ggml_acc_or_set(
     if (cgraph->grads[isrc]) {
         cgraph->grads[isrc] = ggml_acc_impl(ctx, cgraph->grads[isrc], tensor_cont, nb1, nb2, nb3, offset, cgraph->grad_accs[isrc]);
     } else {
-        struct ggml_tensor * a_zero = ggml_scale(ctx, src, 0.0f); // FIXME this is going to produce NaN if a contains inf/NaN
+        // Build the zero base with ggml_fill, which never reads src's values.
+        struct ggml_tensor * a_zero = ggml_is_contiguous(src)
+            ? ggml_fill(ctx, src, 0.0f)
+            : ggml_scale(ctx, src, 0.0f); // FIXME this is going to produce NaN if a contains inf/NaN
         cgraph->grads[isrc] = ggml_acc_impl(ctx, a_zero, tensor_cont, nb1, nb2, nb3, offset, false);
     }
     ggml_format_name(cgraph->grads[isrc], "grad for %s", cgraph->visited_hash_set.keys[isrc]->name);

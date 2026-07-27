@@ -3866,6 +3866,11 @@ void llama_context::opt_init(struct llama_model * model, struct llama_opt_params
     opt_params.get_opt_pars    = lopt_params.get_opt_pars;
     opt_params.get_opt_pars_ud = lopt_params.get_opt_pars_ud;
     opt_params.optimizer       = lopt_params.optimizer_type;
+    // Seed the backward pass from a down-scaled loss for architectures (mixture-of-experts)
+    // whose gradients overflow fp32 before reaching the optimizer.
+    if (model->hparams.n_expert > 0 || llm_arch_is_hybrid(model->arch) || llm_arch_is_recurrent(model->arch)) {
+        opt_params.loss_scale = 1e-10f;
+    }
     opt_ctx = ggml_opt_init(opt_params);
 
     llama_opt_param_filter param_filter = lopt_params.param_filter;
@@ -4024,7 +4029,7 @@ void llama_context::opt_epoch_iter(
             }
             ggml_opt_prepare_alloc(opt_ctx, ctx_compute_opt, gf, res->get_inp_tokens(), res->get_logits());
             ggml_opt_alloc(opt_ctx, train);
-            
+
             // Load optimizer tensors on first training iteration if pending
             if (train && should_load_optimizer_tensors && !optimizer_tensors_loaded) {
                 if (ggml_opt_load_tensors(opt_ctx, pending_optimizer_checkpoint_path.c_str())) {

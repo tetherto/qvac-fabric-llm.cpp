@@ -44,7 +44,7 @@ extern "C" {
             int64_t        ne_label,     // number of elements per label
             int64_t        ndata,        // total number of datapoints/labels
             int64_t        ndata_shard); // number of datapoints/labels per shard (unit at which the dataset is shuffled/copied)
-    
+
     GGML_API ggml_opt_dataset_t ggml_opt_dataset_init_with_masks(
             enum ggml_type type_data,    // the type for the internal data tensor
             enum ggml_type type_label,   // the type for the internal labels tensor
@@ -146,6 +146,11 @@ extern "C" {
 
         // only GGML_OPT_OPTIMIZER_TYPE_ADAMW needs m, v momenta per parameter tensor
         enum ggml_opt_optimizer_type optimizer;
+
+        // Backward loss scale (default 1.0 = off). The backward is seeded from
+        // loss*loss_scale so gradient magnitudes stay within fp32 range through deep
+        // backprop.
+        float loss_scale;
     };
 
     // get parameters for an optimization context with defaults set where possible
@@ -174,7 +179,7 @@ extern "C" {
 
     // get the gradient accumulator for a node from the forward graph
     GGML_API struct ggml_tensor * ggml_opt_grad_acc(ggml_opt_context_t opt_ctx, struct ggml_tensor * node);
-    
+
     // get optimizer state tensors (momentum and variance for AdamW)
     GGML_API int64_t ggml_opt_get_iter(ggml_opt_context_t opt_ctx);
     GGML_API void    ggml_opt_set_iter(ggml_opt_context_t opt_ctx, int64_t iter);
