@@ -8,13 +8,13 @@ on:
     paths: [
       '.github/workflows/build-sanitize.yml',
       '**/CMakeLists.txt',
-      '**/.cmake',
+      '**/*.cmake',
+      '**/*.cmake.in',
       '**/*.h',
       '**/*.hpp',
       '**/*.c',
       '**/*.cpp'
     ]
-
   pull_request:
     types: [opened, synchronize, reopened]
     paths: [
@@ -38,19 +38,13 @@ env:
 
 jobs:
   ctest:
+    runs-on: [self-hosted, X64, CPU, Linux]
+
     continue-on-error: true
 
     strategy:
       matrix:
-        include:
-        - sanitizer: ADDRESS
-          machine: ubuntu-26.04
-        - sanitizer: THREAD
-          machine: ubuntu-26.04
-        - sanitizer: UNDEFINED
-          machine: ubuntu-26.04
-
-    runs-on: ${{ matrix.machine }}
+        sanitizer: [ADDRESS, THREAD, UNDEFINED]
 
     steps:
       - name: Clone
@@ -79,6 +73,7 @@ jobs:
           cmake -B build \
             -DCMAKE_BUILD_TYPE=RelWithDebInfo \
             -DLLAMA_SANITIZE_${{ matrix.sanitizer }}=ON \
+            -DGGML_VECTOR_INDEX=ON \
             -DGGML_SANITIZE_${{ matrix.sanitizer }}=ON
 
           cmake --build build --config RelWithDebInfo -j $(nproc)
@@ -90,6 +85,7 @@ jobs:
           cmake -B build \
             -DCMAKE_BUILD_TYPE=RelWithDebInfo \
             -DLLAMA_SANITIZE_${{ matrix.sanitizer }}=ON \
+            -DGGML_VECTOR_INDEX=ON \
             -DGGML_SANITIZE_${{ matrix.sanitizer }}=ON \
             -DGGML_OPENMP=OFF
 
@@ -112,3 +108,9 @@ jobs:
         run: |
           cd build
           ctest -L main -E tokenizer --verbose --timeout 900
+
+      - name: Test vector index (undefined)
+        if: ${{ matrix.sanitizer == 'UNDEFINED' }}
+        run: |
+          cd build
+          ctest -R '^test-vector-index$' --verbose --timeout 900

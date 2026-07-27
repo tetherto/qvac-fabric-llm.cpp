@@ -268,4 +268,27 @@ if(NOT TARGET ggml::all)
             INTERFACE_LINK_LIBRARIES "${_ggml_all_targets}")
 endif()
 
+if(GGML_VECTOR_INDEX AND NOT TARGET ggml::ggml-vector-index)
+    find_library(GGML_VECTOR_INDEX_LIBRARY ggml-vector-index
+        REQUIRED
+        HINTS ${GGML_LIB_DIR}
+        NO_CMAKE_FIND_ROOT_PATH)
+
+    add_library(ggml::ggml-vector-index UNKNOWN IMPORTED)
+    set_target_properties(ggml::ggml-vector-index
+        PROPERTIES
+            INTERFACE_INCLUDE_DIRECTORIES "${GGML_INCLUDE_DIR}"
+            IMPORTED_LINK_INTERFACE_LANGUAGES "CXX"
+            IMPORTED_LOCATION "${GGML_VECTOR_INDEX_LIBRARY}"
+            INTERFACE_COMPILE_FEATURES cxx_std_17
+            POSITION_INDEPENDENT_CODE ON)
+endif()
+
+if(TARGET ggml::ggml-vector-index AND NOT TARGET ggml::vector-index)
+    add_library(ggml::vector-index INTERFACE IMPORTED)
+    set_target_properties(ggml::vector-index
+        PROPERTIES
+            INTERFACE_LINK_LIBRARIES ggml::ggml-vector-index)
+endif()
+
 check_required_components(ggml)
