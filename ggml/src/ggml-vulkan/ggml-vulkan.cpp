@@ -1,5 +1,9 @@
 #include "ggml-vulkan-common.h"
 
+#ifdef __APPLE__
+#include <pthread.h>
+#endif
+
 static vk_device_architecture get_device_architecture(const vk::PhysicalDevice& device) {
     vk::PhysicalDeviceProperties props = device.getProperties();
 
@@ -842,11 +846,39 @@ void ggml_vk_destroy_pipeline(vk::Device& device, vk_pipeline& pipeline) {
     device.destroyPipeline(pipeline->pipeline);
 }
 
+// Prevent worker thread overflows.
+static void ggml_vk_load_shaders_big_stack(vk_device & device, vk_pipeline requested = nullptr) {
+#ifdef __APPLE__
+    struct compile_args {
+        vk_device *   device;
+        vk_pipeline * requested;
+    } args = { &device, &requested };
+
+    pthread_attr_t attr;
+    pthread_t      th;
+    bool           ok = pthread_attr_init(&attr) == 0 &&
+                        pthread_attr_setstacksize(&attr, 8u*1024u*1024u) == 0 &&
+                        pthread_create(&th, &attr, [](void * p) -> void * {
+                            compile_args * a = (compile_args *) p;
+                            ggml_vk_load_shaders(*a->device, *a->requested);
+                            return nullptr;
+                        }, &args) == 0;
+    if (ok) {
+        pthread_join(th, nullptr);
+    } else {
+        ggml_vk_load_shaders(device, requested);
+    }
+    pthread_attr_destroy(&attr);
+#else
+    ggml_vk_load_shaders(device, requested);
+#endif
+}
+
 void ggml_pipeline_request_descriptor_sets(ggml_backend_vk_context *ctx, vk_pipeline& pipeline, uint32_t n) {
     VK_LOG_DEBUG("ggml_pipeline_request_descriptor_sets(" << pipeline->name << ", " << n << ")");
     ctx->pipeline_descriptor_set_requirements += n;
     if (!pipeline->compiled) {
-        ggml_vk_load_shaders(ctx->device, pipeline);
+        ggml_vk_load_shaders_big_stack(ctx->device, pipeline);
     }
     ggml_pipeline_allocate_descriptor_sets(ctx);
 }
@@ -5917,7 +5949,7 @@ vk_device ggml_vk_get_device(size_t idx) {
                                  (device->subgroup_size == 32 && device->coopmat_support_16x16x16_f32acc && (getenv("GGML_VK_FORCE_XE_FA") != nullptr)));
 #endif
 
-        ggml_vk_load_shaders(device);
+        ggml_vk_load_shaders_big_stack(device);
 
         // Prefer a dedicated transfer queue on AMD dGPUs (non-GCN) when graphics queue use is disabled.
         const bool prefers_transfer_queue =
@@ -13082,7 +13114,7 @@ void ggml_vk_rms_norm_back(ggml_backend_vk_context * ctx, vk_context& subctx, co
 
 static void ggml_vk_l2_norm_back(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     float * op_params = (float *)dst->op_params;
-    ggml_vk_op_f32<vk_op_push_constants>(ctx, subctx, src0, src1, nullptr, nullptr, dst, GGML_OP_L2_NORM_BACK, { (uint32_t)src0->ne[0], (uint32_t)src0->ne[1], op_params[0], 0.0f, 0.0f, 0.0f });
+    ggml_vk_op_f32<vk_op_push_constants>(ctx, subctx, src0, src1, nullptr, nullptr, dst, GGML_OP_L2_NORM_BACK, { (uint32_t)src0->ne[0], (uint32_t)ggml_nrows(src0), op_params[0], 0.0f, 0.0f, 0.0f });
 }
 
 void ggml_vk_l2_norm(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, ggml_tensor * dst) {
@@ -13823,6 +13855,8 @@ void ggml_vk_cross_entropy_loss(ggml_backend_vk_context * ctx, vk_context& subct
     sp.ne02 = 1;
     sp.ne03 = 1;
     sp.weight = 1.0f;
+    // the tmp buffer is summed as a single row of nrows columns
+    sp.nrows = 1;
     init_pushconst_fastdiv(sp);
     sp.misalign_offsets = get_misalign_bytes(ctx, dst) / ggml_type_size(dst->type);
 
