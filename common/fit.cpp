@@ -78,7 +78,7 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
     llama_context * ctx = llama_init_from_model(model, *cparams);
     if (ctx == nullptr) {
         llama_model_free(model);
-        throw std::runtime_error("failed to create llama_context from model");
+        throw common_params_fit_exception("failed to create llama_context from model");
     }
 
     const size_t nd = llama_model_n_devices(model);
