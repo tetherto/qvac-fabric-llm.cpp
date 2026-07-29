@@ -157,13 +157,48 @@ private:
     int saved_rounding = FE_TONEAREST;
 };
 
-void quantize_q8_row(const float * src, int8_t * dst, int dim, float & scale) {
+float quantization_scale(float max_abs, float divisor) {
     const ScopedNearestRounding rounding_guard;
+    if (max_abs == 0.0f) {
+        return 1.0f;
+    }
+    const float scale = max_abs / divisor;
+    return scale == 0.0f ? max_abs : scale;
+}
 
+void quantize_q8_values(const float * src, int8_t * dst, size_t n, float scale) {
+    const ScopedNearestRounding rounding_guard;
+    for (size_t i = 0; i < n; ++i) {
+        const float scaled = src[i] / scale;
+        int q = round_nearest_even(scaled);
+        q = std::max(-127, std::min(127, q));
+        dst[i] = static_cast<int8_t>(q);
+    }
+}
+
+void quantize_q4_values(const float * src, uint8_t * dst, size_t offset, size_t n, float scale) {
+    const ScopedNearestRounding rounding_guard;
+    for (size_t i = 0; i < n; ++i) {
+        const float scaled = src[i] / scale;
+        int         q      = round_nearest_even(scaled);
+        q                  = std::max(-7, std::min(7, q));
+        const uint8_t code = q4_encode(q);
+        const size_t  component = offset + i;
+        uint8_t &     byte      = dst[component / 2];
+        if ((component & 1) == 0) {
+            byte = static_cast<uint8_t>((byte & 0xf0u) | code);
+        } else {
+            byte = static_cast<uint8_t>((byte & 0x0fu) | (code << 4));
+        }
+    }
+}
+
+void quantize_q8_row(const float * src, int8_t * dst, int dim, float & scale) {
     if (dim <= 0) {
         scale = 1.0f;
         return;
     }
+    const ScopedNearestRounding rounding_guard;
     const size_t dim_sz = static_cast<size_t>(dim);
 
     float max_abs = 0.0f;
@@ -177,25 +212,16 @@ void quantize_q8_row(const float * src, int8_t * dst, int dim, float & scale) {
         return;
     }
 
-    scale = max_abs / 127.0f;
-    if (scale == 0.0f) {
-        scale = max_abs;
-    }
-    for (int i = 0; i < dim; ++i) {
-        const float scaled = src[i] / scale;
-        int q = round_nearest_even(scaled);
-        q                  = std::max(-127, std::min(127, q));
-        dst[i]             = static_cast<int8_t>(q);
-    }
+    scale = quantization_scale(max_abs, 127.0f);
+    quantize_q8_values(src, dst, dim_sz, scale);
 }
 
 void quantize_q4_row(const float * src, uint8_t * dst, int dim, float & scale) {
-    const ScopedNearestRounding rounding_guard;
-
     if (dim <= 0) {
         scale = 1.0f;
         return;
     }
+    const ScopedNearestRounding rounding_guard;
 
     float max_abs = 0.0f;
     for (int i = 0; i < dim; ++i) {
@@ -208,22 +234,8 @@ void quantize_q4_row(const float * src, uint8_t * dst, int dim, float & scale) {
         return;
     }
 
-    scale = max_abs / 7.0f;
-    if (scale == 0.0f) {
-        scale = max_abs;
-    }
-    for (int i = 0; i < dim; ++i) {
-        const float scaled = src[i] / scale;
-        int         q      = round_nearest_even(scaled);
-        q                  = std::max(-7, std::min(7, q));
-        const uint8_t code = q4_encode(q);
-        uint8_t &     byte = dst[static_cast<size_t>(i) / 2];
-        if ((i & 1) == 0) {
-            byte = static_cast<uint8_t>((byte & 0xf0u) | code);
-        } else {
-            byte = static_cast<uint8_t>((byte & 0x0fu) | (code << 4));
-        }
-    }
+    scale = quantization_scale(max_abs, 7.0f);
+    quantize_q4_values(src, dst, 0, static_cast<size_t>(dim), scale);
 }
 
 // ---------------------------------------------------------------------------

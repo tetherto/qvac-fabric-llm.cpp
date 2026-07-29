@@ -15,8 +15,8 @@
 // full duration of any `ggml_vec_index_search_prepared_filtered` call using
 // them; do not free a filter concurrently with a search that uses it.
 //
-// Endianness: persistence format is fixed little-endian. Loaders decode
-// little-endian fields into host values.
+// Endianness: persistence format is fixed little-endian. Stream loaders decode
+// fields into host values; mmap loading requires a little-endian host.
 
 #include <stdint.h>
 
@@ -212,16 +212,14 @@ GGML_API int ggml_vec_index_search_ivf(
     float                  * out_scores,
     uint64_t               * out_ids);
 
-// Persistence. The current implementation supports f32 (`bit_width=32`)
-// legacy .tvim version 1 snapshots only; q4/q8 snapshots return
-// GGML_VEC_INDEX_E_INVALID_ARG. V1 snapshots are limited to 4 GiB serialized
-// size; larger states are rejected by write and load. See bottom of this
-// header.
+// Persistence. Returns GGML_VEC_INDEX_E_NOT_DURABLE when the file was
+// atomically replaced but the parent-directory sync failed. Legacy v1
+// snapshots are limited to 4 GiB serialized size; larger v1 states are rejected
+// by load.
 GGML_API int ggml_vec_index_write(
     ggml_vec_index_t * idx,
     const char       * path);
 
-// Loads f32 legacy .tvim version 1 snapshots.
 // Returns 0 on success and stores the loaded handle in `out`.
 GGML_API int ggml_vec_index_load_ex(
     const char         * path,
@@ -230,17 +228,22 @@ GGML_API int ggml_vec_index_load_ex(
 // Returns NULL on failure.
 GGML_API ggml_vec_index_t * ggml_vec_index_load(const char * path);
 
-// Reserved for future mmap snapshot loading. Currently returns
-// GGML_VEC_INDEX_E_BAD_VERSION and stores NULL in `out`.
+// Loads a read-only current-version (v2) mmap snapshot on a little-endian host.
+// Legacy v1 snapshots return GGML_VEC_INDEX_E_BAD_VERSION. On POSIX, the
+// snapshot filesystem must support flock(). Returns 0 on success and stores
+// the loaded handle in `out`.
 GGML_API int ggml_vec_index_load_mmap_ex(
     const char         * path,
     ggml_vec_index_t  ** out);
 
-// Returns NULL; mmap loading is not implemented yet.
+// Same platform requirements as ggml_vec_index_load_mmap_ex. Returns NULL on
+// failure.
 GGML_API ggml_vec_index_t * ggml_vec_index_load_mmap(const char * path);
 
-// Reserved for future .tvid delta replay. Currently returns
-// GGML_VEC_INDEX_E_INVALID_ARG and stores NULL in `out`.
+// Loads a snapshot and replays a .tvid delta log. The returned handle is bound
+// to that delta log: plain add, remove, compact, and snapshot write operations
+// return GGML_VEC_INDEX_E_INVALID_ARG. Returns 0 on success and stores the
+// loaded handle in `out`.
 GGML_API int ggml_vec_index_load_with_delta_ex(
     const char         * snapshot_path,
     const char         * delta_path,
@@ -250,8 +253,9 @@ GGML_API ggml_vec_index_t * ggml_vec_index_load_with_delta(
     const char * snapshot_path,
     const char * delta_path);
 
-// Reserved for future delta compaction. Currently returns
-// GGML_VEC_INDEX_E_INVALID_ARG.
+// Writes a fresh snapshot and resets the .tvid delta log. Returns
+// GGML_VEC_INDEX_E_PARTIAL_COMPACT if the snapshot was replaced but its
+// durability could not be confirmed, or if resetting the delta log failed.
 GGML_API int ggml_vec_index_compact_delta(
     ggml_vec_index_t * idx,
     const char       * snapshot_path,
@@ -262,23 +266,17 @@ GGML_API int ggml_vec_index_len(const ggml_vec_index_t * idx);
 GGML_API int ggml_vec_index_dim(const ggml_vec_index_t * idx);
 GGML_API int ggml_vec_index_bit_width(const ggml_vec_index_t * idx);
 
-// File format (.tvim legacy version 1, all little-endian):
+// Snapshot formats are little-endian.
 //
-//   offset  size   field
-//   ------  -----  -------------------------------------------------------
-//   0       4      magic = "TVPI" (bytes 0x54, 0x56, 0x50, 0x49)
-//   4       1      version = 1
-//   5       1      bit_width = 32
-//   6       1      reserved (zero)
-//   7       1      reserved (zero)
-//   8       4      dim (uint32)
-//   12      4      n_vectors (uint32)
-//   16      ...    vectors: N*D float32 values, row-major
-//   ...     N*8    ids (uint64)
+// Legacy .tvim v1 has a 16-byte header followed by N*D float32 values and N
+// uint64 ids. A serialized bit_width of 8 is quantized to q8 on load; other
+// accepted legacy bit widths load as f32 for compatibility.
 //
-// Where N = n_vectors and D = dim. Readers reject unknown versions, non-f32
-// bit widths, nonzero reserved bytes, duplicate or reserved ids, non-finite
-// vector components, truncated payloads, and trailing bytes.
+// Current .tvim v2 has a 32-byte header describing f32, q8, or q4 storage,
+// followed by optional per-vector scales, vector bytes, ids, and four CRC32C
+// values covering the header and each data section. Readers reject unknown
+// versions or flags, invalid storage layouts, duplicate or reserved ids,
+// non-finite values, checksum mismatches, truncation, and trailing bytes.
 
 #ifdef __cplusplus
 }

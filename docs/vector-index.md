@@ -20,7 +20,7 @@ flowchart TD
     storage --> exact["Exact CPU search"]
     exact --> filters["Filtered and prepared-filter search"]
     exact --> ivf["IVF-flat candidate selection"]
-    storage --> snapshot["f32 tvim snapshots"]
+    storage --> snapshot["tvim snapshots"]
 ```
 
 The public C API owns the opaque index handle, caller-provided ids, vector
@@ -37,10 +37,13 @@ repeated queries. IVF-flat reduces the number of vectors scored by assigning
 vectors and queries to in-memory centroid lists. It is an optional search
 accelerator and does not change the storage format.
 
-The current persistence implementation supports complete f32 (`bit_width=32`)
-`.tvim` snapshots. q4/q8 snapshots, mmap loading, `.tvid` mutation logs, and
-delta compaction are reserved API surface and return explicit unsupported errors
-until their implementations land.
+The current persistence implementation supports complete `.tvim` snapshots for
+f32 (`bit_width=32`), q8 (`bit_width=8`), and q4 (`bit_width=4`) storage, plus
+`.tvid` replay and compaction for existing logs. Logged add/remove mutations
+remain reserved API surface in this revision.
+
+If compaction replaces the snapshot but cannot confirm its durability or reset
+the delta log, it returns `GGML_VEC_INDEX_E_PARTIAL_COMPACT`.
 
 TurboVec-style q2/q4 search, rotations, TQ+ calibration, Lloyd-Max codebooks,
 LUT scoring, blocked-code caches, and related golden fixtures are planned work.
@@ -80,8 +83,8 @@ Create an index with a fixed dimension and bit width:
 - `bit_width=4`: per-vector symmetric packed q4 storage with f32 scales.
 
 The generic q4/q8 layouts are local to vector-index and are not `ggml-quants`
-block formats. They keep one scale per external vector for random row lookup and
-delete/compact operations. Persistence for q4/q8 storage is not implemented yet.
+block formats. They keep one scale per external vector for random row lookup,
+delete/compact operations, and snapshot round trips.
 
 Search scores are dot products. The index does not normalize vectors internally.
 For cosine similarity, normalize vectors before insertion and normalize queries
@@ -109,3 +112,26 @@ before search.
   search fewer lists and may return different results from exact search.
   Probing at least the number of built lists searches all lists, so candidate
   coverage matches exact search. IVF state is not persisted in snapshots.
+
+## Persistence
+
+Snapshots use `.tvim`. Version 2 records the storage kind, ids, quantization
+scales, vector bytes, and CRC32C checksums for accidental corruption detection.
+The loader still accepts legacy v1 f32 snapshots; legacy `bit_width=8` files
+are quantized to q8 on load.
+
+`ggml_vec_index_load_mmap` maps the vector section of a version 2 snapshot
+read-only and copies ids and scales into memory. Legacy v1 snapshots require
+`ggml_vec_index_load`. Mmap-loaded handles allow search and IVF preparation,
+but reject content mutations. Mmap loading requires a little-endian host because
+mapped vector bytes are read directly; use `ggml_vec_index_load` on big-endian
+hosts. On POSIX, the snapshot filesystem must support `flock`.
+
+Delta logs use `.tvid`. Legacy v1 delta logs use a full-index CRC32C state
+field. Replay validates every record CRC and checks the full legacy state once
+at the committed tail. Newer logs use rolling state tokens, and v4 logs store
+the full rolling state in each record.
+
+An index loaded with `ggml_vec_index_load_with_delta` is bound to that delta
+log. Plain `add`, `remove`, `compact`, and snapshot `write` operations return
+`GGML_VEC_INDEX_E_INVALID_ARG` on the bound handle.

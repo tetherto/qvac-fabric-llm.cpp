@@ -58,6 +58,21 @@ inline constexpr uint32_t kQParamScaleF32 = 1;
 inline constexpr size_t   kTvimV1HeaderSize = 16;
 inline constexpr size_t   kTvimHeaderSize = 32;
 inline constexpr size_t   kTvimChecksumSize = 16;
+inline constexpr size_t   kTvimOffMagic           = 0;
+inline constexpr size_t   kTvimOffVersion         = 4;
+inline constexpr size_t   kTvimOffBitWidth        = 5;
+inline constexpr size_t   kTvimOffStorage         = 6;
+inline constexpr size_t   kTvimOffFlags           = 7;
+inline constexpr size_t   kTvimOffDim             = 8;
+inline constexpr size_t   kTvimOffCount           = 12;
+inline constexpr size_t   kTvimOffQParamType      = 16;
+inline constexpr size_t   kTvimOffQParamSize      = 20;
+inline constexpr size_t   kTvimOffCompSize        = 24;
+inline constexpr size_t   kTvimOffReserved        = 28;
+inline constexpr size_t   kTvimChecksumOffHeader  = 0;
+inline constexpr size_t   kTvimChecksumOffQParams = 4;
+inline constexpr size_t   kTvimChecksumOffVectors = 8;
+inline constexpr size_t   kTvimChecksumOffIds     = 12;
 inline constexpr uint8_t  kTvidMagic[4]   = { 'T', 'V', 'D', 'L' };
 inline constexpr uint8_t  kTvidVersionV1  = 1;
 inline constexpr uint8_t  kTvidVersion    = 2;
@@ -70,6 +85,21 @@ inline constexpr size_t   kTvidHeaderSizeV4 = 48;
 inline constexpr size_t   kTvidRecordHeaderSize = 24;
 inline constexpr size_t   kTvidRecordHeaderSizeV4 = 56;
 inline constexpr size_t   kTvidWideStateSize = 32;
+inline constexpr size_t   kTvidOffMagic           = 0;
+inline constexpr size_t   kTvidOffVersion         = 4;
+inline constexpr size_t   kTvidOffBitWidth        = 5;
+inline constexpr size_t   kTvidOffReserved0       = 6;
+inline constexpr size_t   kTvidOffReserved1       = 7;
+inline constexpr size_t   kTvidOffDim             = 8;
+inline constexpr size_t   kTvidOffState           = 12;
+inline constexpr size_t   kTvidOffWideState       = 16;
+inline constexpr size_t   kTvidRecordOffOp        = 0;
+inline constexpr size_t   kTvidRecordOffReserved  = 1;
+inline constexpr size_t   kTvidRecordOffCount     = 4;
+inline constexpr size_t   kTvidRecordOffPayload   = 8;
+inline constexpr size_t   kTvidRecordOffCrc       = 16;
+inline constexpr size_t   kTvidRecordOffState     = 20;
+inline constexpr size_t   kTvidRecordOffWide      = 24;
 inline constexpr size_t   kMaxIndexLen    = static_cast<size_t>(std::numeric_limits<int>::max());
 inline constexpr uint64_t kMaxSnapshotBytes = UINT64_C(1) << 32;
 
@@ -103,6 +133,7 @@ struct DeltaFileStamp {
     bool valid = false;
     uint64_t size = 0;
     int64_t write_time = 0;
+    int64_t  change_time = 0;
 #ifdef _WIN32
     uint64_t volume_serial = 0;
     uint64_t file_index = 0;
@@ -124,7 +155,10 @@ struct DeltaTailCache {
     std::string path_key;
     int state_kind = 0;
     uint32_t tail_crc = 0;
+    uint32_t       tail_record_crc = 0;
     DeltaStateWide tail_wide;
+    uint64_t       tail_record_offset = 0;
+    uint64_t       tail_crc_offset    = 0;
     uint64_t complete_size = 0;
     DeltaFileStamp stamp;
 };
@@ -163,6 +197,7 @@ struct ggml_vec_index {
     uint64_t state_hash_xor = 0;
     uint64_t state_hash_sum = 0;
     uint64_t state_hash_sum_rot = 0;
+    bool           state_hash_valid            = true;
     DeltaTailCache delta_tail_cache;
 
     std::unique_ptr<MappedFile> mapped_file;
@@ -218,14 +253,24 @@ struct DeltaAppendResult {
 
 class DeltaLogLock {
 public:
-    explicit DeltaLogLock(const char * path);
-    ~DeltaLogLock();
+  // Not reentrant for the same path in one process; blocks until the OS lock
+  // is acquired or returns an error.
+  explicit DeltaLogLock(const char * path, bool writable = true);
+  ~DeltaLogLock();
 
-    DeltaLogLock(const DeltaLogLock &) = delete;
-    DeltaLogLock & operator=(const DeltaLogLock &) = delete;
+  DeltaLogLock(const DeltaLogLock &)             = delete;
+  DeltaLogLock & operator=(const DeltaLogLock &) = delete;
 
-    bool ok() const;
-    bool ensure_data_file_locked(const char * path);
+  bool ok() const;
+  bool needs_absence_recheck() const;
+  bool has_data_file() const;
+  bool ensure_data_file_locked(const char * path);
+  bool path_matches_data_file(const char * path) const;
+  bool data_file_size(uint64_t & size) const;
+  bool data_file_stamp(DeltaFileStamp & stamp) const;
+  bool open_read_stream(std::FILE ** out) const;
+  bool open_append_stream(const char * path, std::FILE ** out);
+  bool truncate_data_file(const char * path, uint64_t size);
 
 private:
     std::shared_ptr<std::mutex> sidecar_process_mutex;
@@ -233,38 +278,47 @@ private:
     std::unique_lock<std::mutex> sidecar_process_lock;
     std::unique_lock<std::mutex> data_process_lock;
     bool locked = false;
+    bool                         recheck_absence = false;
 #ifdef _WIN32
     HANDLE sidecar_file = INVALID_HANDLE_VALUE;
     HANDLE data_file = INVALID_HANDLE_VALUE;
     OVERLAPPED sidecar_lock_overlapped = {};
     OVERLAPPED data_lock_overlapped = {};
 
-    bool lock_data_file(const std::filesystem::path & path, bool create);
+    bool        lock_data_file(const std::filesystem::path & path, bool create, bool writable);
     static void close_file(HANDLE & file, OVERLAPPED & overlapped);
 #else
     int sidecar_fd = -1;
     int data_fd = -1;
 
-    static bool lock_fd(int fd);
-    bool lock_data_file(const std::filesystem::path & path, bool create);
+    static bool lock_fd(int fd, bool exclusive);
+    bool        lock_data_file(const std::filesystem::path & path, bool create, bool writable);
     static void close_fd(int & fd);
 #endif
 };
 
 #ifdef GGML_VEC_INDEX_TEST_HOOKS
 extern "C" {
-void ggml_vec_index_test_set_oom_countdown(int64_t countdown);
-void ggml_vec_index_test_set_write_fail_after(int64_t bytes);
-void ggml_vec_index_test_set_truncate_fail(int fail);
-void ggml_vec_index_test_set_parent_fsync_fail(int fail);
-void ggml_vec_index_test_set_delta_append_wait_target(int target);
-int ggml_vec_index_test_get_delta_append_waiters(void);
-void ggml_vec_index_test_set_load_with_delta_pause_ms(int pause_ms);
-void ggml_vec_index_test_reset_delta_tail_scan_count(void);
+void    ggml_vec_index_test_set_oom_countdown(int64_t countdown);
+void    ggml_vec_index_test_set_write_fail_after(int64_t bytes);
+void    ggml_vec_index_test_set_truncate_fail(int fail);
+void    ggml_vec_index_test_set_parent_fsync_fail(int fail);
+void    ggml_vec_index_test_set_parent_fsync_fail_after(int64_t count);
+void    ggml_vec_index_test_set_delta_append_wait_target(int target);
+int     ggml_vec_index_test_get_delta_append_waiters(void);
+void    ggml_vec_index_test_set_load_with_delta_pause_ms(int pause_ms);
+void    ggml_vec_index_test_set_load_with_delta_block(int block);
+void    ggml_vec_index_test_reset_delta_tail_scan_count(void);
 int64_t ggml_vec_index_test_get_delta_tail_scan_count(void);
-void ggml_vec_index_test_reset_state_crc_scan_count(void);
+void    ggml_vec_index_test_reset_state_crc_scan_count(void);
 int64_t ggml_vec_index_test_get_state_crc_scan_count(void);
-int ggml_vec_index_test_get_load_with_delta_waiters(void);
+void    ggml_vec_index_test_reset_delta_max_read_size(void);
+size_t  ggml_vec_index_test_get_delta_max_read_size(void);
+void    ggml_vec_index_test_reset_mmap_count_reject_count(void);
+int64_t ggml_vec_index_test_get_mmap_count_reject_count(void);
+void    ggml_vec_index_test_reset_load_count_reject_count(void);
+int64_t ggml_vec_index_test_get_load_count_reject_count(void);
+int     ggml_vec_index_test_get_load_with_delta_waiters(void);
 }
 #endif
 
@@ -272,6 +326,7 @@ void test_maybe_throw_bad_alloc();
 bool test_consume_write_bytes(size_t n);
 void test_wait_after_delta_validate();
 void test_wait_after_load_with_delta_snapshot();
+void test_record_delta_read_size(size_t size);
 
 bool is_supported_bit_width(int bit_width);
 bool is_valid_id(uint64_t id);
@@ -309,6 +364,9 @@ bool has_vector_storage(const ggml_vec_index & idx);
 int q4_decode(uint8_t nibble);
 void quantize_q8_row(const float * src, int8_t * dst, int dim, float & scale);
 void quantize_q4_row(const float * src, uint8_t * dst, int dim, float & scale);
+float quantization_scale(float max_abs, float divisor);
+void quantize_q8_values(const float * src, int8_t * dst, size_t n, float scale);
+void quantize_q4_values(const float * src, uint8_t * dst, size_t offset, size_t n, float scale);
 void rollback_appended_slots_unlocked(
     ggml_vec_index_t * idx,
     size_t base_slot,
@@ -337,7 +395,7 @@ DeltaStateWide index_state_wide(const ggml_vec_index & idx);
 DeltaStateWide index_state_wide_after_remove(const ggml_vec_index & idx, uint64_t id);
 
 DeltaStateKind delta_state_kind_for_format(DeltaLogFormat format);
-DeltaLogFormat delta_log_format_for_append(const char * path);
+DeltaLogFormat delta_log_format_for_append(const char * path, const DeltaLogLock * lock = nullptr);
 uint32_t current_delta_state(const ggml_vec_index & idx, DeltaStateKind state_kind);
 DeltaStateWide current_delta_state_wide(const ggml_vec_index & idx);
 void invalidate_delta_tail_cache(ggml_vec_index & idx);
@@ -364,14 +422,14 @@ bool build_add_delta_payload_from_slots(
     int n,
     std::vector<uint8_t> & payload);
 std::vector<uint8_t> build_remove_delta_payload(uint64_t id);
-DeltaAppendResult append_delta_record_locked(
-    ggml_vec_index & idx,
-    const char * delta_path,
-    DeltaLogFormat format,
-    uint8_t op,
-    uint32_t n,
-    uint32_t base_crc_for_new_log,
-    uint32_t state_crc,
-    const DeltaStateWide & base_wide_for_new_log,
-    const DeltaStateWide & state_wide,
-    const std::vector<uint8_t> & payload);
+DeltaAppendResult    append_delta_record_locked(ggml_vec_index &             idx,
+                                                DeltaLogLock &               lock,
+                                                const char *                 delta_path,
+                                                DeltaLogFormat               format,
+                                                uint8_t                      op,
+                                                uint32_t                     n,
+                                                uint32_t                     base_crc_for_new_log,
+                                                uint32_t                     state_crc,
+                                                const DeltaStateWide &       base_wide_for_new_log,
+                                                const DeltaStateWide &       state_wide,
+                                                const std::vector<uint8_t> & payload);
