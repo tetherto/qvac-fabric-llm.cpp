@@ -21,6 +21,7 @@ flowchart TD
     exact --> filters["Filtered and prepared-filter search"]
     exact --> ivf["IVF-flat candidate selection"]
     storage --> snapshot["tvim snapshots"]
+    snapshot --> delta["tvid delta logs"]
 ```
 
 The public C API owns the opaque index handle, caller-provided ids, vector
@@ -38,9 +39,8 @@ vectors and queries to in-memory centroid lists. It is an optional search
 accelerator and does not change the storage format.
 
 The current persistence implementation supports complete `.tvim` snapshots for
-f32 (`bit_width=32`), q8 (`bit_width=8`), and q4 (`bit_width=4`) storage, plus
-`.tvid` replay and compaction for existing logs. Logged add/remove mutations
-remain reserved API surface in this revision.
+f32 (`bit_width=32`), q8 (`bit_width=8`), and q4 (`bit_width=4`) storage.
+`.tvid` logs support durable add/remove mutations, replay, and compaction.
 
 If compaction replaces the snapshot but cannot confirm its durability or reset
 the delta log, it returns `GGML_VEC_INDEX_E_PARTIAL_COMPACT`.
@@ -50,9 +50,9 @@ LUT scoring, blocked-code caches, and related golden fixtures are planned work.
 They are not implemented by this component revision.
 
 Each implemented layer carries its own regression coverage: result ordering,
-architecture parity, f32 snapshot round trips and corruption handling,
-unsupported persistence entry points, IVF cache invalidation, benchmark
-coverage, and package smoke tests.
+architecture parity, snapshot round trips and corruption handling, delta-log
+fault recovery, IVF cache invalidation, benchmark coverage, and package smoke
+tests.
 
 ## Build
 
@@ -130,8 +130,25 @@ hosts. On POSIX, the snapshot filesystem must support `flock`.
 Delta logs use `.tvid`. Legacy v1 delta logs use a full-index CRC32C state
 field. Replay validates every record CRC and checks the full legacy state once
 at the committed tail. Newer logs use rolling state tokens, and v4 logs store
-the full rolling state in each record.
+the full rolling state in each record. New logged mutations require v4; legacy
+logs remain replay-only.
 
 An index loaded with `ggml_vec_index_load_with_delta` is bound to that delta
 log. Plain `add`, `remove`, `compact`, and snapshot `write` operations return
 `GGML_VEC_INDEX_E_INVALID_ARG` on the bound handle.
+
+`ggml_vec_index_add_logged` and `ggml_vec_index_remove_logged` append durable
+mutations. Before starting a new log, establish the snapshot lineage with a
+successful `ggml_vec_index_write` or `ggml_vec_index_load`. The first logged
+mutation binds the handle to the delta log; later logged mutations and
+`ggml_vec_index_compact_delta` must use that same file. Equivalent hardlink
+aliases identify the same log.
+
+An I/O or durability failure can occur after a complete record was written. In
+that case the in-memory mutation remains applied, and the handle may reject
+later logged mutations and delta compaction with `GGML_VEC_INDEX_E_IO`. Reload
+the snapshot and delta log to revalidate the durable state before continuing.
+`GGML_VEC_INDEX_E_NOT_DURABLE` means the record data was synced but directory
+durability could not be confirmed. `GGML_VEC_INDEX_E_PARTIAL_COMPACT` means the
+snapshot was replaced but its durability could not be confirmed, or resetting
+the delta log failed.

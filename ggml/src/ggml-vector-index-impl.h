@@ -189,6 +189,7 @@ struct ggml_vec_index {
     bool           read_only_mmap          = false;
     bool           delta_log_start_allowed = false;
     bool           delta_log_bound         = false;
+    bool           delta_log_reload_required = false;
     std::string bound_delta_log_path_key;
     bool delta_log_rebase_pending = false;
     uint32_t delta_log_rebase_crc = 0;
@@ -249,6 +250,7 @@ enum class DeltaLogFormat {
 struct DeltaAppendResult {
     int status = GGML_VEC_INDEX_OK;
     bool record_complete = false;
+    bool data_synced = false;
 };
 
 class DeltaLogLock {
@@ -302,6 +304,7 @@ extern "C" {
 void    ggml_vec_index_test_set_oom_countdown(int64_t countdown);
 void    ggml_vec_index_test_set_write_fail_after(int64_t bytes);
 void    ggml_vec_index_test_set_truncate_fail(int fail);
+void    ggml_vec_index_test_set_data_fsync_fail(int fail);
 void    ggml_vec_index_test_set_parent_fsync_fail(int fail);
 void    ggml_vec_index_test_set_parent_fsync_fail_after(int64_t count);
 void    ggml_vec_index_test_set_delta_append_wait_target(int target);
@@ -400,7 +403,10 @@ uint32_t current_delta_state(const ggml_vec_index & idx, DeltaStateKind state_ki
 DeltaStateWide current_delta_state_wide(const ggml_vec_index & idx);
 void invalidate_delta_tail_cache(ggml_vec_index & idx);
 bool bind_delta_log_path(ggml_vec_index & idx, const char * delta_path);
-bool delta_log_matches_index_unlocked(const ggml_vec_index_t * idx, const char * delta_path);
+bool delta_log_matches_index_unlocked(
+    const ggml_vec_index_t * idx,
+    const char * delta_path,
+    DeltaLogLock * lock);
 bool validate_logged_add_args(
     const ggml_vec_index_t * idx,
     const float * vectors,

@@ -237,11 +237,6 @@ if(NOT TARGET ggml::ggml)
         PROPERTIES
             INTERFACE_LINK_LIBRARIES "${GGML_INTERFACE_LINK_LIBRARIES}")
 
-    add_library(ggml::all INTERFACE IMPORTED)
-    set_target_properties(ggml::all
-        PROPERTIES
-            INTERFACE_LINK_LIBRARIES "${_ggml_all_targets}")
-
 endif()
 
 # ggml::all aggregates every backend target the package ships. The hand-rolled
@@ -266,6 +261,7 @@ if(NOT TARGET ggml::all)
     set_target_properties(ggml::all
         PROPERTIES
             INTERFACE_LINK_LIBRARIES "${_ggml_all_targets}")
+    unset(_ggml_all_targets)
 endif()
 
 if(GGML_VECTOR_INDEX AND NOT TARGET ggml::ggml-vector-index)

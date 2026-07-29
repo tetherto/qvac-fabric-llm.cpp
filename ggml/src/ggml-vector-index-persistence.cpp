@@ -62,6 +62,7 @@ MappedFile::~MappedFile() {
 std::atomic<int64_t> g_test_oom_countdown{ -1 };
 std::atomic<int64_t> g_test_write_fail_after{ -1 };
 std::atomic<bool> g_test_truncate_fail{ false };
+std::atomic<bool> g_test_data_fsync_fail{ false };
 std::atomic<bool> g_test_parent_fsync_fail{ false };
 std::atomic<int64_t> g_test_parent_fsync_fail_after{ -1 };
 std::atomic<int> g_test_delta_append_wait_target{ 0 };
@@ -553,6 +554,11 @@ static bool flush_and_sync(std::FILE * stream) {
     if (std::fflush(stream) != 0) {
         return false;
     }
+#ifdef GGML_VEC_INDEX_TEST_HOOKS
+    if (g_test_data_fsync_fail.load()) {
+        return false;
+    }
+#endif
 #ifdef _WIN32
     return _commit(_fileno(stream)) == 0;
 #elif defined(__APPLE__)
@@ -620,6 +626,10 @@ void ggml_vec_index_test_set_write_fail_after(int64_t bytes) {
 
 void ggml_vec_index_test_set_truncate_fail(int fail) {
     g_test_truncate_fail.store(fail != 0);
+}
+
+void ggml_vec_index_test_set_data_fsync_fail(int fail) {
+    g_test_data_fsync_fail.store(fail != 0);
 }
 
 void ggml_vec_index_test_set_parent_fsync_fail(int fail) {
@@ -991,6 +1001,72 @@ static bool close_file(std::FILE *& f) {
     return ok;
 }
 
+struct FilesystemPathIdentity {
+#ifdef _WIN32
+    uint64_t volume_serial = 0;
+    uint64_t file_index = 0;
+#else
+    uint64_t device = 0;
+    uint64_t inode = 0;
+#endif
+};
+
+static bool filesystem_path_identity(
+        const std::filesystem::path & path,
+        FilesystemPathIdentity &      identity,
+        bool &                        exists) {
+    identity = {};
+    exists = false;
+#ifdef _WIN32
+    HANDLE file = CreateFileW(
+        path.wstring().c_str(),
+        GENERIC_READ,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        nullptr,
+        OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL,
+        nullptr);
+    if (file == INVALID_HANDLE_VALUE) {
+        const DWORD error = GetLastError();
+        if (error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND || error == ERROR_NOT_READY) {
+            return true;
+        }
+        return false;
+    }
+    BY_HANDLE_FILE_INFORMATION info = {};
+    const bool ok = GetFileInformationByHandle(file, &info) != 0;
+    CloseHandle(file);
+    if (!ok) {
+        return false;
+    }
+    identity.volume_serial = info.dwVolumeSerialNumber;
+    identity.file_index =
+        (static_cast<uint64_t>(info.nFileIndexHigh) << 32) | static_cast<uint64_t>(info.nFileIndexLow);
+#else
+    struct stat st;
+    if (::stat(path.c_str(), &st) != 0) {
+        if (errno == ENOENT || errno == ENOTDIR) {
+            return true;
+        }
+        return false;
+    }
+    identity.device = static_cast<uint64_t>(st.st_dev);
+    identity.inode = static_cast<uint64_t>(st.st_ino);
+#endif
+    exists = true;
+    return true;
+}
+
+static bool filesystem_path_identity_equal(
+        const FilesystemPathIdentity & lhs,
+        const FilesystemPathIdentity & rhs) {
+#ifdef _WIN32
+    return lhs.volume_serial == rhs.volume_serial && lhs.file_index == rhs.file_index;
+#else
+    return lhs.device == rhs.device && lhs.inode == rhs.inode;
+#endif
+}
+
 bool filesystem_paths_equal(const char * lhs, const char * rhs) {
     if (std::strcmp(lhs, rhs) == 0) {
         return true;
@@ -1000,6 +1076,21 @@ bool filesystem_paths_equal(const char * lhs, const char * rhs) {
     std::filesystem::path rhs_path;
     if (!filesystem_path_from_utf8(lhs, lhs_path) || !filesystem_path_from_utf8(rhs, rhs_path)) {
         return false;
+    }
+
+    FilesystemPathIdentity lhs_identity;
+    FilesystemPathIdentity rhs_identity;
+    bool lhs_exists = false;
+    bool rhs_exists = false;
+    const bool lhs_identity_known = filesystem_path_identity(lhs_path, lhs_identity, lhs_exists);
+    const bool rhs_identity_known = filesystem_path_identity(rhs_path, rhs_identity, rhs_exists);
+    if (lhs_identity_known && rhs_identity_known) {
+        if (lhs_exists && rhs_exists) {
+            return filesystem_path_identity_equal(lhs_identity, rhs_identity);
+        }
+        if (lhs_exists != rhs_exists) {
+            return false;
+        }
     }
 
     std::error_code lhs_ec;
@@ -1016,6 +1107,17 @@ bool filesystem_paths_equal(const char * lhs, const char * rhs) {
         }
     }
     return lhs_resolved.lexically_normal() == rhs_resolved.lexically_normal();
+}
+
+static bool filesystem_path_is_symlink(const char * path) {
+    std::filesystem::path fs_path;
+    if (!filesystem_path_from_utf8(path, fs_path)) {
+        return false;
+    }
+
+    std::error_code ec;
+    const std::filesystem::file_status status = std::filesystem::symlink_status(fs_path, ec);
+    return !ec && std::filesystem::is_symlink(status);
 }
 
 static bool delta_lock_path(const char * path, std::filesystem::path & out) {
@@ -1066,7 +1168,8 @@ bool bind_delta_log_path(ggml_vec_index & idx, const char * delta_path) {
         idx.bound_delta_log_path_key.swap(path_key);
         return true;
     }
-    return idx.bound_delta_log_path_key == path_key;
+    return idx.bound_delta_log_path_key == path_key ||
+           filesystem_paths_equal(idx.bound_delta_log_path_key.c_str(), delta_path);
 }
 
 static bool delta_file_stamp(const char * path, DeltaFileStamp & stamp) {
@@ -1978,24 +2081,29 @@ static void update_delta_tail_cache(ggml_vec_index &       idx,
                                     uint64_t               tail_crc_offset    = 0,
                                     uint32_t               tail_record_crc    = 0,
                                     const DeltaLogLock *   lock               = nullptr) {
-    std::string path_key;
-    DeltaFileStamp stamp;
-    const bool     have_stamp = lock != nullptr ? lock->data_file_stamp(stamp) : delta_file_stamp(path, stamp);
-    if (!delta_log_path_key(path, path_key) || !have_stamp) {
-        invalidate_delta_tail_cache(idx);
-        return;
-    }
+    try {
+        std::string path_key;
+        DeltaFileStamp stamp;
+        const bool     have_stamp = lock != nullptr ? lock->data_file_stamp(stamp) : delta_file_stamp(path, stamp);
+        if (!delta_log_path_key(path, path_key) || !have_stamp) {
+            invalidate_delta_tail_cache(idx);
+            return;
+        }
 
-    idx.delta_tail_cache.valid = true;
-    idx.delta_tail_cache.path_key = path_key;
-    idx.delta_tail_cache.state_kind = delta_state_kind_cache_value(state_kind);
-    idx.delta_tail_cache.tail_crc = tail_crc;
-    idx.delta_tail_cache.tail_record_crc    = tail_record_crc;
-    idx.delta_tail_cache.tail_wide = tail_wide;
-    idx.delta_tail_cache.tail_record_offset = tail_record_offset;
-    idx.delta_tail_cache.tail_crc_offset    = tail_crc_offset;
-    idx.delta_tail_cache.complete_size = stamp.size;
-    idx.delta_tail_cache.stamp = stamp;
+        test_maybe_throw_bad_alloc();
+        idx.delta_tail_cache.valid = true;
+        idx.delta_tail_cache.path_key = path_key;
+        idx.delta_tail_cache.state_kind = delta_state_kind_cache_value(state_kind);
+        idx.delta_tail_cache.tail_crc = tail_crc;
+        idx.delta_tail_cache.tail_record_crc    = tail_record_crc;
+        idx.delta_tail_cache.tail_wide = tail_wide;
+        idx.delta_tail_cache.tail_record_offset = tail_record_offset;
+        idx.delta_tail_cache.tail_crc_offset    = tail_crc_offset;
+        idx.delta_tail_cache.complete_size = stamp.size;
+        idx.delta_tail_cache.stamp = stamp;
+    } catch (...) {
+        invalidate_delta_tail_cache(idx);
+    }
 }
 
 DeltaLogFormat delta_log_format_for_append(const char * path, const DeltaLogLock * lock) {
@@ -2404,13 +2512,15 @@ DeltaAppendResult append_delta_record_locked(ggml_vec_index &             idx,
     record_crc_offset = record_start + kTvidRecordOffCrc;
     record_crc_value  = crc ^ 0xffffffffu;
 
-    if (!write_bytes(f, record, record_size) || (!payload.empty() && !write_bytes(f, payload.data(), payload.size())) ||
-        !flush_and_sync(f)) {
+    if (!write_bytes(f, record, record_size) || (!payload.empty() && !write_bytes(f, payload.data(), payload.size()))) {
+        return fail_io();
+    }
+    if (!flush_and_sync(f)) {
         return fail_io();
     }
     const int close_result = std::fclose(f);
     f = nullptr;
-    if (close_result != 0 || !fsync_parent_dir(delta_path) || !lock.path_matches_data_file(delta_path)) {
+    if (close_result != 0 || !lock.path_matches_data_file(delta_path)) {
         const bool truncated = lock.truncate_data_file(delta_path, old_size);
         const bool record_complete =
             !truncated && delta_log_ends_at_state(delta_path, idx, state_kind, state_crc, state_wide, &lock);
@@ -2423,11 +2533,28 @@ DeltaAppendResult append_delta_record_locked(ggml_vec_index &             idx,
         return {
             truncated ? GGML_VEC_INDEX_E_IO : GGML_VEC_INDEX_E_INTERNAL,
             record_complete,
+            true,
+        };
+    }
+    if (!fsync_parent_dir(delta_path)) {
+        const bool truncated = lock.truncate_data_file(delta_path, old_size);
+        const bool record_complete =
+            !truncated && delta_log_ends_at_state(delta_path, idx, state_kind, state_crc, state_wide, &lock);
+        if (record_complete) {
+            update_delta_tail_cache(idx, delta_path, state_kind, state_crc, state_wide, record_start, record_crc_offset,
+                                    record_crc_value, &lock);
+        } else if (truncated) {
+            invalidate_delta_tail_cache(idx);
+        }
+        return {
+            truncated ? GGML_VEC_INDEX_E_IO : GGML_VEC_INDEX_E_NOT_DURABLE,
+            record_complete,
+            true,
         };
     }
     update_delta_tail_cache(idx, delta_path, state_kind, state_crc, state_wide, record_start, record_crc_offset,
                             record_crc_value, &lock);
-    return { GGML_VEC_INDEX_OK, true };
+    return { GGML_VEC_INDEX_OK, true, true };
 }
 
 static int write_empty_delta_log_unlocked(
@@ -4173,7 +4300,10 @@ bool replay_delta_log(ggml_vec_index_t * idx, const char * delta_path, const Del
 
 } // namespace
 
-bool delta_log_matches_index_unlocked(const ggml_vec_index_t * idx, const char * delta_path) {
+bool delta_log_matches_index_unlocked(
+        const ggml_vec_index_t * idx,
+        const char * delta_path,
+        DeltaLogLock * lock) {
     try {
         if (idx == nullptr || !idx->state_hash_valid) {
             return false;
@@ -4183,7 +4313,7 @@ bool delta_log_matches_index_unlocked(const ggml_vec_index_t * idx, const char *
         DeltaStateWide base_wide;
         DeltaLogFormat format     = DeltaLogFormat::v4;
         DeltaStateKind state_kind = DeltaStateKind::wide_state;
-        if (!validate_delta_header(delta_path, *idx, size, format, state_kind, base_crc, base_wide)) {
+        if (!validate_delta_header(delta_path, *idx, size, format, state_kind, base_crc, base_wide, lock)) {
             return false;
         }
         const uint32_t       current_crc  = current_delta_state(*idx, state_kind);
@@ -4194,8 +4324,8 @@ bool delta_log_matches_index_unlocked(const ggml_vec_index_t * idx, const char *
         uint32_t       tail_crc = 0;
         DeltaStateWide tail_wide;
         uint64_t       complete_size = 0;
-        if (!get_cached_delta_tail(*idx, delta_path, state_kind, size, tail_crc, tail_wide, complete_size) &&
-            !inspect_delta_log_tail(delta_path, *idx, tail_crc, tail_wide, complete_size)) {
+        if (!get_cached_delta_tail(*idx, delta_path, state_kind, size, tail_crc, tail_wide, complete_size, lock) &&
+            !inspect_delta_log_tail(delta_path, *idx, tail_crc, tail_wide, complete_size, lock)) {
             return false;
         }
         // A torn trailing record is tolerated here; append heals it before
@@ -4267,10 +4397,16 @@ int ggml_vec_index_compact_delta(ggml_vec_index_t * idx, const char * snapshot_p
         if (idx == nullptr || snapshot_path == nullptr || delta_path == nullptr) {
             return GGML_VEC_INDEX_E_INVALID_ARG;
         }
+        if (filesystem_path_is_symlink(snapshot_path) || filesystem_path_is_symlink(delta_path)) {
+            return GGML_VEC_INDEX_E_INVALID_ARG;
+        }
         if (filesystem_paths_equal(snapshot_path, delta_path)) {
             return GGML_VEC_INDEX_E_INVALID_ARG;
         }
         std::unique_lock<std::shared_mutex> lock(idx->mutex);
+        if (idx->delta_log_reload_required) {
+            return GGML_VEC_INDEX_E_IO;
+        }
         if (idx->read_only_mmap) {
             rebuild_state_hash(*idx);
             if (!idx->mapped_source_path.empty() &&

@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cfloat>
 #include <cfenv>
 #include <chrono>
@@ -1183,6 +1184,109 @@ void check_filtered_and_ivf_search(int bit_width) {
     ggml_vec_index_free(idx);
 }
 
+void check_writer_completes_after_read_admission_closes() {
+    constexpr int dim    = 16;
+    constexpr int n_rows = 512;
+    constexpr int k      = 8;
+
+    std::vector<float> rows;
+    rows.reserve(static_cast<size_t>(n_rows) * dim);
+    std::vector<uint64_t> row_ids;
+    row_ids.reserve(n_rows);
+    for (int row = 0; row < n_rows; ++row) {
+        row_ids.push_back(static_cast<uint64_t>(920000 + row));
+        for (int col = 0; col < dim; ++col) {
+            const float x = static_cast<float>(((row + 1) * (col + 3)) % 17) - 8.0f;
+            rows.push_back(x / 8.0f);
+        }
+    }
+
+    auto * idx = ggml_vec_index_create(dim, /*bit_width=*/32);
+    CHECK(idx != nullptr);
+    CHECK(ggml_vec_index_add(idx, rows.data(), n_rows, row_ids.data()) == GGML_VEC_INDEX_OK);
+
+    std::atomic<int>  ready{ 0 };
+    std::atomic<int>  read_count{ 0 };
+    std::atomic<int>  failures{ 0 };
+    std::atomic<bool> start{ false };
+    std::atomic<bool> writer_pending{ false };
+    std::vector<std::thread> readers;
+    for (int t = 0; t < 4; ++t) {
+        readers.emplace_back([&, t]() {
+            const float * query = rows.data() + static_cast<size_t>(t * 37 % n_rows) * dim;
+            std::array<float, k>    scores{};
+            std::array<uint64_t, k> out_ids{};
+            ready.fetch_add(1);
+            while (!start.load()) {
+                std::this_thread::yield();
+            }
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(250);
+            while (!writer_pending.load() && std::chrono::steady_clock::now() < deadline) {
+                if (ggml_vec_index_search(idx, query, 1, k, scores.data(), out_ids.data()) != GGML_VEC_INDEX_OK) {
+                    failures.fetch_add(1);
+                }
+                if (ggml_vec_index_len(idx) < n_rows) {
+                    failures.fetch_add(1);
+                }
+                read_count.fetch_add(1);
+            }
+        });
+    }
+
+    while (ready.load() != 4) {
+        std::this_thread::yield();
+    }
+    start.store(true);
+    const auto read_deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(250);
+    while (read_count.load() < 32 && std::chrono::steady_clock::now() < read_deadline) {
+        std::this_thread::yield();
+    }
+    CHECK(read_count.load() >= 32);
+
+    std::atomic<int>  writer_status{ GGML_VEC_INDEX_E_INTERNAL };
+    std::atomic<bool> writer_done{ false };
+    const std::vector<float> writer_vec = normalize({
+        1.0f,
+        -0.5f,
+        0.25f,
+        0.75f,
+        -1.0f,
+        0.5f,
+        -0.25f,
+        0.125f,
+        0.0f,
+        0.25f,
+        -0.75f,
+        1.0f,
+        -0.125f,
+        0.625f,
+        -0.375f,
+        0.875f,
+    });
+    const uint64_t writer_id = 930000ULL;
+    std::thread writer([&]() {
+        writer_pending.store(true);
+        writer_status.store(ggml_vec_index_add(idx, writer_vec.data(), 1, &writer_id));
+        writer_done.store(true);
+    });
+
+    const auto writer_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (!writer_done.load() && std::chrono::steady_clock::now() < writer_deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    CHECK(writer_done.load());
+    writer.join();
+    for (std::thread & reader : readers) {
+        reader.join();
+    }
+
+    CHECK(failures.load() == 0);
+    CHECK(writer_status.load() == GGML_VEC_INDEX_OK);
+    CHECK(ggml_vec_index_contains(idx, writer_id) == 1);
+    CHECK(ggml_vec_index_len(idx) == n_rows + 1);
+    ggml_vec_index_free(idx);
+}
+
 void check_ivf_state_not_persisted() {
     const std::array<float, kDim * 2> vectors = {
         1.0f, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f,
@@ -1522,6 +1626,24 @@ void check_delta_log_tail_recovery() {
     CHECK(ggml_vec_index_compact_delta(mmap, snapshot.path.string().c_str(), delta.path.string().c_str()) ==
           GGML_VEC_INDEX_E_INVALID_ARG);
     CHECK(ggml_vec_index_contains(mmap, base_id) == 1);
+    {
+        temp_file       snapshot_alias(".tvim.alias");
+        std::error_code ec;
+        std::filesystem::create_hard_link(snapshot.path, snapshot_alias.path, ec);
+        if (!ec) {
+            CHECK(std::filesystem::equivalent(snapshot.path, snapshot_alias.path, ec));
+            CHECK(!ec);
+            CHECK(ggml_vec_index_write(mmap, snapshot_alias.path.string().c_str()) ==
+                  GGML_VEC_INDEX_E_INVALID_ARG);
+            CHECK(ggml_vec_index_compact_delta(
+                      mmap, snapshot_alias.path.string().c_str(), delta.path.string().c_str()) ==
+                  GGML_VEC_INDEX_E_INVALID_ARG);
+            std::filesystem::remove(snapshot_alias.path, ec);
+        } else {
+            CHECK(ec == std::errc::operation_not_supported || ec == std::errc::function_not_supported ||
+                  ec == std::errc::permission_denied);
+        }
+    }
     ggml_vec_index_free(mmap);
 
     CHECK(ggml_vec_index_compact_delta(base, snapshot.path.string().c_str(), delta.path.string().c_str()) ==
@@ -2790,6 +2912,7 @@ int main() {
     for (int bit_width : { 32, 8, 4 }) {
         check_filtered_and_ivf_search(bit_width);
     }
+    check_writer_completes_after_read_admission_closes();
     check_ivf_state_not_persisted();
     check_committed_delta_replay();
     check_quantized_committed_delta_replay(/*bit_width=*/4);

@@ -154,6 +154,10 @@ The following features are developed in qvac-fabric-llm.cpp and are not availabl
 | Memory-based model loading | Load models from in-memory buffers with split-model and async fulfillment support |
 | Mobile GPU optimization | Adreno 800+ quantized inference (Q4_0, Q8), Adreno-specific Vulkan shader variants, VMA integration |
 
+### Experimental Components
+
+- `ggml-vector-index` is a default-off standalone vector search library. See the [Vector Index Guide](docs/vector-index.md) for build, API, persistence, mmap, and benchmark details.
+
 ### Upstream Compatibility
 
 All standard llama.cpp functionality, models, and APIs remain fully compatible.

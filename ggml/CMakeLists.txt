@@ -123,7 +123,6 @@ option(GGML_STATIC "ggml: static link libraries"                     OFF)
 option(GGML_NATIVE "ggml: optimize the build for the current system" ${GGML_NATIVE_DEFAULT})
 option(GGML_LTO    "ggml: enable link time optimization"             OFF)
 option(GGML_CCACHE "ggml: use ccache if available"                   ON)
-option(GGML_VECTOR_INDEX "ggml: build standalone vector index library" OFF)
 
 # debug
 option(GGML_ALL_WARNINGS           "ggml: enable all compiler warnings"                   ON)
@@ -188,6 +187,7 @@ set(GGML_CPU_POWERPC_CPUTYPE "" CACHE STRING "ggml: CPU type for PowerPC")
 # ggml core
 set(GGML_SCHED_MAX_COPIES  "4" CACHE STRING "ggml: max input copies for pipeline parallelism")
 option(GGML_CPU                             "ggml: enable CPU backend"                        ON)
+option(GGML_VECTOR_INDEX                    "ggml: build vector index library"                OFF)
 option(GGML_SCHED_NO_REALLOC                "ggml: disallow reallocations in ggml-alloc (for debugging)" OFF)
 
 # 3rd party libs / backends
@@ -371,15 +371,38 @@ set_target_properties(ggml PROPERTIES PUBLIC_HEADER "${GGML_PUBLIC_HEADERS}")
 #if (GGML_METAL)
 #    set_target_properties(ggml PROPERTIES RESOURCE "${CMAKE_CURRENT_SOURCE_DIR}/src/ggml-metal.metal")
 #endif()
+
+set(GGML_INSTALL_TARGETS ggml ggml-base)
+
 install(
-  TARGETS ggml ggml-base
-  EXPORT ggml-targets)
+  TARGETS ${GGML_INSTALL_TARGETS}
+  EXPORT ggml-targets
+  PUBLIC_HEADER DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
 
 install(
   EXPORT ggml-targets
   FILE ggml-targets.cmake
   NAMESPACE ggml::
   DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/ggml)
+
+if (GGML_STANDALONE OR GGML_VECTOR_INDEX)
+    if (IS_ABSOLUTE "${CMAKE_INSTALL_LIBDIR}")
+        set(GGML_PC_PREFIX "${CMAKE_INSTALL_PREFIX}")
+        set(GGML_PC_LIBDIR "${CMAKE_INSTALL_LIBDIR}")
+    else()
+        set(_GGML_PC_PREFIX_BASE "${CMAKE_CURRENT_BINARY_DIR}/pkgconfig-prefix")
+        file(RELATIVE_PATH GGML_PC_PREFIX_RELATIVE
+            "${_GGML_PC_PREFIX_BASE}/${CMAKE_INSTALL_LIBDIR}/pkgconfig"
+            "${_GGML_PC_PREFIX_BASE}")
+        set(GGML_PC_PREFIX "\${pcfiledir}/${GGML_PC_PREFIX_RELATIVE}")
+        set(GGML_PC_LIBDIR "\${prefix}/${CMAKE_INSTALL_LIBDIR}")
+    endif()
+    if (IS_ABSOLUTE "${CMAKE_INSTALL_INCLUDEDIR}")
+        set(GGML_PC_INCLUDEDIR "${CMAKE_INSTALL_INCLUDEDIR}")
+    else()
+        set(GGML_PC_INCLUDEDIR "\${prefix}/${CMAKE_INSTALL_INCLUDEDIR}")
+    endif()
+endif()
 
 if (GGML_STANDALONE AND BUILD_SHARED_LIBS)
     configure_file(${CMAKE_CURRENT_SOURCE_DIR}/ggml.pc.in

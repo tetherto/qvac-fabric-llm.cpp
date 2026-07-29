@@ -10,10 +10,12 @@
 //
 // Threading: read-only APIs on the same handle can run concurrently. Mutations,
 // persistence writes, compaction, and IVF builds are serialized with reads and
-// with each other. The caller must still keep the handle alive for the duration
-// of every API call. Prepared filter handles must also remain alive for the
-// full duration of any `ggml_vec_index_search_prepared_filtered` call using
-// them; do not free a filter concurrently with a search that uses it.
+// with each other. Writer fairness and bounded mutation latency are not
+// guaranteed while concurrent readers continue to arrive. The caller must
+// still keep the handle alive for the duration of every API call. Prepared
+// filter handles must also remain alive for the full duration of any
+// `ggml_vec_index_search_prepared_filtered` call using them; do not free a
+// filter concurrently with a search that uses it.
 //
 // Endianness: persistence format is fixed little-endian. Stream loaders decode
 // fields into host values; mmap loading requires a little-endian host.
@@ -99,8 +101,11 @@ GGML_API int ggml_vec_index_remove(ggml_vec_index_t * idx, uint64_t id);
 // invalidated. Returns 0 on success, negative on error.
 GGML_API int ggml_vec_index_compact(ggml_vec_index_t * idx);
 
-// Reserved for future incremental persistence. Currently returns
-// GGML_VEC_INDEX_E_INVALID_ARG without mutating `idx` or writing `delta_path`.
+// Adds vectors and appends the mutation to a v4 delta log. The index must have
+// an established snapshot lineage from a successful snapshot write or load.
+// The first logged mutation binds the handle to `delta_path`; later logged
+// mutations must use the same log. A durability error can leave the mutation
+// applied and require reloading the snapshot plus delta before further writes.
 GGML_API int ggml_vec_index_add_logged(
     ggml_vec_index_t * idx,
     const float      * vectors,
@@ -108,8 +113,9 @@ GGML_API int ggml_vec_index_add_logged(
     const uint64_t   * ids,
     const char       * delta_path);
 
-// Reserved for future incremental persistence. Currently returns
-// GGML_VEC_INDEX_E_INVALID_ARG without mutating `idx` or writing `delta_path`.
+// Removes `id` and appends the mutation to the handle's v4 delta log. Uses the
+// same snapshot-lineage, path-binding, and durability contract as
+// `ggml_vec_index_add_logged`.
 GGML_API int ggml_vec_index_remove_logged(
     ggml_vec_index_t * idx,
     uint64_t           id,

@@ -109,4 +109,4 @@ jobs:
         if: ${{ matrix.sanitizer == 'UNDEFINED' }}
         run: |
           cd build
-          ctest -R '^test-vector-index$' --verbose --timeout 900
+          ctest -R '^test-vector-index(-faults)?$' --verbose --timeout 900
