@@ -123,7 +123,6 @@ option(GGML_STATIC "ggml: static link libraries"                     OFF)
 option(GGML_NATIVE "ggml: optimize the build for the current system" ${GGML_NATIVE_DEFAULT})
 option(GGML_LTO    "ggml: enable link time optimization"             OFF)
 option(GGML_CCACHE "ggml: use ccache if available"                   ON)
-option(GGML_VECTOR_INDEX "ggml: build standalone vector index library" OFF)
 
 # debug
 option(GGML_ALL_WARNINGS           "ggml: enable all compiler warnings"                   ON)
@@ -188,6 +187,7 @@ set(GGML_CPU_POWERPC_CPUTYPE "" CACHE STRING "ggml: CPU type for PowerPC")
 # ggml core
 set(GGML_SCHED_MAX_COPIES  "4" CACHE STRING "ggml: max input copies for pipeline parallelism")
 option(GGML_CPU                             "ggml: enable CPU backend"                        ON)
+option(GGML_VECTOR_INDEX                    "ggml: build vector index library"                OFF)
 option(GGML_SCHED_NO_REALLOC                "ggml: disallow reallocations in ggml-alloc (for debugging)" OFF)
 
 # 3rd party libs / backends
@@ -372,9 +372,13 @@ set_target_properties(ggml PROPERTIES PUBLIC_HEADER "${GGML_PUBLIC_HEADERS}")
 #if (GGML_METAL)
 #    set_target_properties(ggml PROPERTIES RESOURCE "${CMAKE_CURRENT_SOURCE_DIR}/src/ggml-metal.metal")
 #endif()
+
+set(GGML_INSTALL_TARGETS ggml ggml-base)
+
 install(
-  TARGETS ggml ggml-base
-  EXPORT ggml-targets)
+  TARGETS ${GGML_INSTALL_TARGETS}
+  EXPORT ggml-targets
+  PUBLIC_HEADER DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
 
 install(
   EXPORT ggml-targets
@@ -382,7 +386,87 @@ install(
   NAMESPACE ggml::
   DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/ggml)
 
-if (GGML_STANDALONE AND BUILD_SHARED_LIBS)
+if (GGML_STANDALONE OR GGML_VECTOR_INDEX)
+    if (IS_ABSOLUTE "${CMAKE_INSTALL_LIBDIR}")
+        set(GGML_PC_PREFIX "${CMAKE_INSTALL_PREFIX}")
+        set(GGML_PC_LIBDIR "${CMAKE_INSTALL_LIBDIR}")
+    else()
+        set(_GGML_PC_PREFIX_BASE "${CMAKE_CURRENT_BINARY_DIR}/pkgconfig-prefix")
+        file(RELATIVE_PATH GGML_PC_PREFIX_RELATIVE
+            "${_GGML_PC_PREFIX_BASE}/${CMAKE_INSTALL_LIBDIR}/pkgconfig"
+            "${_GGML_PC_PREFIX_BASE}")
+        set(GGML_PC_PREFIX "\${pcfiledir}/${GGML_PC_PREFIX_RELATIVE}")
+        set(GGML_PC_LIBDIR "\${prefix}/${CMAKE_INSTALL_LIBDIR}")
+    endif()
+    if (IS_ABSOLUTE "${CMAKE_INSTALL_INCLUDEDIR}")
+        set(GGML_PC_INCLUDEDIR "${CMAKE_INSTALL_INCLUDEDIR}")
+    else()
+        set(GGML_PC_INCLUDEDIR "\${prefix}/${CMAKE_INSTALL_INCLUDEDIR}")
+    endif()
+endif()
+
+if (GGML_STANDALONE)
+    function(ggml_pc_append_private_lib out_var lib)
+        if ("${lib}" STREQUAL "" OR "${lib}" MATCHES "\\$<")
+            return()
+        endif()
+        if (TARGET "${lib}" OR "${lib}" MATCHES "::")
+            return()
+        elseif ("${lib}" MATCHES "\\.framework$")
+            get_filename_component(GGML_PC_FRAMEWORK_NAME "${lib}" NAME_WE)
+            list(APPEND ${out_var} "-framework ${GGML_PC_FRAMEWORK_NAME}")
+        elseif ("${lib}" MATCHES "^-")
+            list(APPEND ${out_var} "${lib}")
+        elseif (IS_ABSOLUTE "${lib}")
+            list(APPEND ${out_var} "${lib}")
+        else()
+            list(APPEND ${out_var} "-l${lib}")
+        endif()
+        set(${out_var} "${${out_var}}" PARENT_SCOPE)
+    endfunction()
+
+    function(ggml_pc_append_target_private_libs out_var target)
+        if (TARGET "${target}")
+            get_target_property(GGML_PC_TARGET_LIBS "${target}" LINK_LIBRARIES)
+            if (GGML_PC_TARGET_LIBS)
+                foreach(GGML_PC_TARGET_LIB IN LISTS GGML_PC_TARGET_LIBS)
+                    ggml_pc_append_private_lib(${out_var} "${GGML_PC_TARGET_LIB}")
+                endforeach()
+            endif()
+        endif()
+        set(${out_var} "${${out_var}}" PARENT_SCOPE)
+    endfunction()
+
+    set(GGML_PC_LIBS_PRIVATE "")
+    foreach(GGML_PC_BACKEND IN LISTS GGML_AVAILABLE_BACKENDS)
+        list(APPEND GGML_PC_LIBS_PRIVATE "-l${GGML_PC_BACKEND}")
+    endforeach()
+    foreach(GGML_PC_TARGET IN ITEMS ggml ggml-base)
+        ggml_pc_append_target_private_libs(GGML_PC_LIBS_PRIVATE "${GGML_PC_TARGET}")
+    endforeach()
+    foreach(GGML_PC_BACKEND IN LISTS GGML_AVAILABLE_BACKENDS)
+        ggml_pc_append_target_private_libs(GGML_PC_LIBS_PRIVATE "${GGML_PC_BACKEND}")
+    endforeach()
+    foreach(GGML_PC_PRIVATE_LIB IN LISTS CMAKE_CXX_IMPLICIT_LINK_LIBRARIES)
+        ggml_pc_append_private_lib(GGML_PC_LIBS_PRIVATE "${GGML_PC_PRIVATE_LIB}")
+    endforeach()
+    if (CMAKE_THREAD_LIBS_INIT)
+        ggml_pc_append_private_lib(GGML_PC_LIBS_PRIVATE "${CMAKE_THREAD_LIBS_INIT}")
+    endif()
+    if (CMAKE_DL_LIBS)
+        ggml_pc_append_private_lib(GGML_PC_LIBS_PRIVATE "${CMAKE_DL_LIBS}")
+    endif()
+    if (GGML_OPENMP_ENABLED)
+        foreach(GGML_PC_OPENMP_LIB IN LISTS OpenMP_C_LIBRARIES OpenMP_CXX_LIBRARIES)
+            ggml_pc_append_private_lib(GGML_PC_LIBS_PRIVATE "${GGML_PC_OPENMP_LIB}")
+        endforeach()
+        foreach(GGML_PC_OPENMP_FLAG IN ITEMS "${OpenMP_C_FLAGS}" "${OpenMP_CXX_FLAGS}")
+            ggml_pc_append_private_lib(GGML_PC_LIBS_PRIVATE "${GGML_PC_OPENMP_FLAG}")
+        endforeach()
+    endif()
+    list(REMOVE_DUPLICATES GGML_PC_LIBS_PRIVATE)
+    string(REPLACE ";" " " GGML_PC_LIBS_PRIVATE "${GGML_PC_LIBS_PRIVATE}")
+
     configure_file(${CMAKE_CURRENT_SOURCE_DIR}/ggml.pc.in
         ${CMAKE_CURRENT_BINARY_DIR}/ggml.pc
         @ONLY)
