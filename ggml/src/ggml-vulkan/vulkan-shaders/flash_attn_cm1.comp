@@ -591,6 +591,13 @@ void main() {
 
         const uint num_hsv_tiles = (HSV + MatBc * row_split - 1) / (MatBc * row_split); // round up
 
+        // Psh is not written again until the next KV block, so the P fragments are the same
+        // for every hsv_tile. Load them once instead of re-reading LDS per tile.
+        coopmat<FLOAT_TYPE, gl_ScopeSubgroup, MatBc, 16, gl_MatrixUseA> PMat[Bc / MatBc];
+        [[unroll]] for (uint32_t bc_chunk = 0; bc_chunk < Bc / MatBc; ++bc_chunk) {
+            coopMatLoad(PMat[bc_chunk], Psh, bc_chunk * MatBc * psh_stride, psh_stride, gl_CooperativeMatrixLayoutColumnMajor);
+        }
+
         // Each subgroup handles HSV/4 columns
         [[unroll]] for (uint32_t hsv_tile = 0; hsv_tile < num_hsv_tiles; ++hsv_tile) {
             const uint hsv_offset = (hsv_tile * row_split + gl_SubgroupID) * 16;
@@ -645,8 +652,6 @@ void main() {
 
             if (hsv_offset < HSV_pad) {
                 [[unroll]] for (uint32_t bc_chunk = 0; bc_chunk < Bc / MatBc; ++bc_chunk) {
-                    coopMatLoad(KMat, Psh, bc_chunk * MatBc * psh_stride, psh_stride, gl_CooperativeMatrixLayoutColumnMajor);
-
                     if (SHMEM_STAGING == 0) {
                     if (!USE_DECODE_V && !KV_bounds_check && !USE_SPARSE) {
                         // F16/BF16 values can be loaded directly from global memory
@@ -662,7 +667,7 @@ void main() {
                         coopMatLoad(QMat, kvsh, v_tile_offset, kvsh_stride, gl_CooperativeMatrixLayoutRowMajor);
                     }
 
-                    PVMat = coopMatMulAdd(KMat, QMat, PVMat);
+                    PVMat = coopMatMulAdd(PMat[bc_chunk], QMat, PVMat);
                 }
 
                 // Store PVMat to pvsh and load into Of
