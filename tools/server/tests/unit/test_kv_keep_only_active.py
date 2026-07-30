@@ -76,9 +76,17 @@ def test_clear_and_restore():
         "cache_prompt": True,
     })
     assert res.status_code == 200
-    assert "updating prompt cache" in log.drain()
+
+    # TODO: Apply this fix to all exact match log tests
+    # rely on timings to detect cache restore
+    # relying on exact log text is brittle, even more on rebases with upstream
+    # Otherwise we can see job failing like this:
+    # https://github.com/tetherto/qvac-fabric-llm.cpp/actions/runs/30584847301/job/91013698180?pr=190
     assert res.body["timings"]["cache_n"] > 0
     assert res.body["timings"]["prompt_n"] < original_prompt_n
+
+    # consume remaining logs for test cleanliness
+    _ = log.drain()
 
     # Follow-up — slot 0 kept its KV, no clearing needed
     res = server.make_request("POST", "/completion", data={
