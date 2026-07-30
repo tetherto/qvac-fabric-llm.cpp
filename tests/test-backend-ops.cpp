@@ -12932,6 +12932,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_flash_attn_ext(64, 64, 8, {1, 1}, n, n, false, false, 0.0f, 0.0f, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
             test_cases.emplace_back(new test_flash_attn_ext(80, 80, 8, {1, 1}, n, n, false, false, 0.0f, 0.0f, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
         }
+        // n_q not a multiple of the query tile and n_kv leaving a partial final
+        // KV tile for any pow2 tile size (513 = 16*32 + 1): out-of-range query
+        // lanes must stay in the tile loop for the barriers yet not contribute
+        // scores. Catches tiled kernels that early-exit such lanes past a
+        // barrier (race) or skip the trailing barrier before the next tile's
+        // loads. The KV type selects the kernel variant on backends that
+        // specialize per KV type, so cover each tiled variant once.
+        for (ggml_type type_KV : {GGML_TYPE_F16, GGML_TYPE_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0}) {
+            test_cases.emplace_back(new test_flash_attn_ext( 64,  64, 8, {1, 1}, 513, 33, true, false, 0.0f, 0.0f, GGML_PREC_F32, type_KV, type_KV));
+        }
+        test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {1, 1}, 513, 33, true, false, 0.0f, 0.0f, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     } // !GGML_SKIP_FLASH_ATTN
 
     // asymmetric head_dim (hsk != hsv) with one or both sides not 64-aligned
