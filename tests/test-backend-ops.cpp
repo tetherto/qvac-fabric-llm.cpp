@@ -12923,6 +12923,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                 }
             }
         }
+        // bidirectional self-attention, vision-tower shape: no mask, n_q == n_kv.
+        // Catches backends that infer causality from shape (mask==NULL && n_q==n_kv);
+        // the sweep above never hits nb == kv, so this shape is otherwise untested.
+        // 247 (odd) also leaves partial BLOCK_M/BLOCK_N tiles for any pow2 tile size;
+        // 256 is the aligned control that separates causality bugs from tiling bugs.
+        for (int64_t n : {247, 256}) {
+            test_cases.emplace_back(new test_flash_attn_ext(64, 64, 8, {1, 1}, n, n, false, false, 0.0f, 0.0f, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+            test_cases.emplace_back(new test_flash_attn_ext(80, 80, 8, {1, 1}, n, n, false, false, 0.0f, 0.0f, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+        }
     } // !GGML_SKIP_FLASH_ATTN
 
     // asymmetric head_dim (hsk != hsv) with one or both sides not 64-aligned
