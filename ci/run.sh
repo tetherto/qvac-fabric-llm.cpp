@@ -55,6 +55,16 @@ sd=`dirname $0`
 cd $sd/../
 SRC=`pwd`
 
+# nproc is used for -j and quantize thread counts; macOS often lacks GNU coreutils
+if ! command -v nproc >/dev/null 2>&1; then
+    if command -v sysctl >/dev/null 2>&1; then
+        nproc() { sysctl -n hw.logicalcpu 2>/dev/null || sysctl -n hw.ncpu; }
+    else
+        echo "Error: nproc not found. Install coreutils (provides nproc)."
+        exit 1
+    fi
+fi
+
 CMAKE_EXTRA="-DLLAMA_FATAL_WARNINGS=${LLAMA_FATAL_WARNINGS:-ON} -DLLAMA_OPENSSL=OFF -DGGML_SCHED_NO_REALLOC=ON"
 CTEST_EXTRA=""
 
@@ -648,6 +658,10 @@ function gg_check_build_requirements {
     if ! command -v unzip &> /dev/null; then
         echo 'unzip not found, please install'
         exit 1
+    fi
+
+    if ! command -v nproc &> /dev/null; then
+        gg_printf 'nproc not found, please install coreutils'
     fi
 }
 
