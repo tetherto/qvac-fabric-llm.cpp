@@ -966,7 +966,11 @@ void ggml_opt_eval(ggml_opt_context_t opt_ctx, ggml_opt_result_t result) {
         }
     }
 
-    ggml_backend_sched_graph_compute(opt_ctx->backend_sched, opt_ctx->allocated_graph_copy);
+    const enum ggml_status status = ggml_backend_sched_graph_compute(opt_ctx->backend_sched, opt_ctx->allocated_graph_copy);
+    // A failed compute leaves the loss/gradients unwritten; carrying on would
+    // silently accumulate garbage into the results
+    // command buffer hang: zero losses, bogus accuracy counters), so abort.
+    GGML_ASSERT(status == GGML_STATUS_SUCCESS && "ggml_opt: backend graph compute failed, cannot continue training");
     opt_ctx->iter += opt_ctx->allocated_graph == opt_ctx->gb_opt;
     opt_ctx->opt_i = (opt_ctx->opt_i + 1) % opt_ctx->opt_period;
 
