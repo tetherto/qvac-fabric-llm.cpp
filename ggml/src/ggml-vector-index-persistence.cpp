@@ -664,6 +664,10 @@ static bool rename_overwrite(const TempFile & temp, const char * dst) {
 
 #ifdef GGML_VEC_INDEX_TEST_HOOKS
 extern "C" {
+int ggml_vec_index_test_can_address_array(size_t count, size_t element_size) {
+    return can_address_array(count, element_size) ? 1 : 0;
+}
+
 void ggml_vec_index_test_set_oom_countdown(int64_t countdown) {
     g_test_oom_countdown.store(countdown);
 }
@@ -5021,7 +5025,7 @@ bool replay_delta_log_unlocked(ggml_vec_index_t * idx, const char * delta_path, 
         restore_failed_replay();
         throw;
     }
-    if (!replayed || !delta_log_matches_index_unlocked(idx, delta_path)) {
+    if (!replayed || !delta_log_matches_index_unlocked(idx, delta_path, &lock)) {
         restore_failed_replay();
         return false;
     }
@@ -5104,7 +5108,8 @@ int ggml_vec_index_compact_delta(ggml_vec_index_t * idx, const char * snapshot_p
         std::string bound_delta_path_key;
         if (!delta_log_path_key(delta_path, bound_delta_path_key) ||
             (!idx->bound_delta_log_path_key.empty() &&
-             idx->bound_delta_log_path_key != bound_delta_path_key)) {
+             idx->bound_delta_log_path_key != bound_delta_path_key &&
+             !filesystem_paths_equal(idx->bound_delta_log_path_key.c_str(), delta_path))) {
             return GGML_VEC_INDEX_E_INVALID_ARG;
         }
         auto commit_delta_log_binding = [&]() noexcept {

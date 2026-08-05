@@ -416,6 +416,78 @@ size_t best_centroid(const float * query, const std::vector<float> & centroids, 
     return best;
 }
 
+void update_topk_heap(
+        std::vector<ScoreId> & heap,
+        int k,
+        const ScoreId & candidate) {
+    if (heap.size() < static_cast<size_t>(k)) {
+        heap.push_back(candidate);
+        std::push_heap(heap.begin(), heap.end(), MinHeapCmp());
+    } else if (score_id_better(candidate, heap.front())) {
+        std::pop_heap(heap.begin(), heap.end(), MinHeapCmp());
+        heap.back() = candidate;
+        std::push_heap(heap.begin(), heap.end(), MinHeapCmp());
+    }
+}
+
+void write_topk_heap(
+        int k,
+        float * out_scores,
+        uint64_t * out_ids,
+        std::vector<ScoreId> & heap) {
+    std::sort(heap.begin(), heap.end(), [](const ScoreId & a, const ScoreId & b) {
+        return score_id_better(a, b);
+    });
+
+    for (int i = 0; i < k; ++i) {
+        if (static_cast<size_t>(i) < heap.size()) {
+            out_scores[i] = float_score_from_double(heap[static_cast<size_t>(i)].score);
+            out_ids[i] = heap[static_cast<size_t>(i)].id;
+        } else {
+            out_scores[i] = -FLT_MAX;
+            out_ids[i] = UINT64_MAX;
+        }
+    }
+}
+
+template <typename ScoreFn>
+void write_topk_results(
+        const ggml_vec_index_t & idx,
+        int k,
+        float * out_scores,
+        uint64_t * out_ids,
+        std::vector<ScoreId> & heap,
+        const std::vector<size_t> * allowed_slots,
+        ScoreFn score_for_slot) {
+    const size_t n_slots = idx.slot_to_id.size();
+    auto visit_slot = [&](size_t slot) {
+        if (slot_is_active(idx, slot)) {
+            update_topk_heap(
+                heap,
+                k,
+                { score_for_slot(slot), idx.slot_to_id[slot] });
+        }
+    };
+
+    if (allowed_slots != nullptr) {
+        for (size_t slot : *allowed_slots) {
+            if (slot < n_slots) {
+                visit_slot(slot);
+            }
+        }
+    } else if (active_count(idx) < n_slots / 2) {
+        for (const auto & entry : idx.id_to_slot) {
+            visit_slot(entry.second);
+        }
+    } else {
+        for (size_t slot = 0; slot < n_slots; ++slot) {
+            visit_slot(slot);
+        }
+    }
+
+    write_topk_heap(k, out_scores, out_ids, heap);
+}
+
 // Run a single query against all slots, write top-k into out_scores/out_ids.
 // If the index holds fewer than k entries, pad with sentinels.
 void search_one(
@@ -426,7 +498,6 @@ void search_one(
     uint64_t               * out_ids,
     double                   max_query,
     std::vector<ScoreId>   & heap,
-    std::vector<ScoreId>   & drained,
     std::vector<float>     & rotated_query_scratch,
     std::vector<float>     & calibrated_query_scratch,
     std::vector<uint8_t>   & turbovec_lut_scratch,
@@ -439,7 +510,6 @@ void search_one(
 
     test_maybe_throw_bad_alloc();
     heap.clear();
-    drained.clear();
     rotated_query_scratch.clear();
     calibrated_query_scratch.clear();
     turbovec_lut_scratch.clear();
@@ -575,69 +645,152 @@ void search_one(
         }
     }
 
-    auto visit_slot = [&](size_t slot) {
-        if (!slot_is_active(idx, slot)) {
-            return;
-        }
-        const double score = turbovec_scores.empty() ?
-            score_slot(
-                idx,
-                score_query,
-                slot,
-                max_query,
-                turbovec_lut.data(),
-                turbovec_lut_scale,
-                turbovec_lut_bias) :
-            turbovec_scores[slot];
-        const ScoreId candidate{
-            score,
-            idx.slot_to_id[slot]
-        };
-        if (heap.size() < static_cast<size_t>(k)) {
-            heap.push_back(candidate);
-            std::push_heap(heap.begin(), heap.end(), MinHeapCmp());
-        } else if (score_id_better(candidate, heap.front())) {
-            std::pop_heap(heap.begin(), heap.end(), MinHeapCmp());
-            heap.back() = candidate;
-            std::push_heap(heap.begin(), heap.end(), MinHeapCmp());
-        }
-    };
+    write_topk_results(
+        idx,
+        k,
+        out_scores,
+        out_ids,
+        heap,
+        allowed_slots,
+        [&](size_t slot) -> double {
+            return turbovec_scores.empty() ?
+                score_slot(
+                    idx,
+                    score_query,
+                    slot,
+                    max_query,
+                    turbovec_lut.data(),
+                    turbovec_lut_scale,
+                    turbovec_lut_bias) :
+                turbovec_scores[slot];
+        });
+}
 
-    if (allowed_slots != nullptr) {
-        for (size_t slot : *allowed_slots) {
-            if (slot < n_slots) {
-                visit_slot(slot);
+#if GGML_VEC_INDEX_USE_NEON
+struct TurboVecBatch4Scratch {
+    std::array<std::vector<ScoreId>, 4> heaps;
+    std::array<std::vector<float>, 4> calibrated_queries;
+    std::array<std::vector<uint8_t>, 4> luts;
+};
+
+void search_turbovec_four_queries(
+        const ggml_vec_index_t & idx,
+        const float * rotated_queries,
+        int k,
+        float * out_scores,
+        uint64_t * out_ids,
+        TurboVecBatch4Scratch & scratch) {
+    const size_t n_slots = idx.slot_to_id.size();
+    const size_t dim_sz = static_cast<size_t>(idx.dim);
+    const int bits = is_turbovec_q2(idx) ? 2 : 4;
+    const float * score_queries[4] = {};
+    const uint8_t * lut_ptrs[4] = {};
+    float lut_scales[4] = {};
+    float lut_biases[4] = {};
+
+    for (int query = 0; query < 4; ++query) {
+        test_maybe_throw_bad_alloc();
+        scratch.heaps[query].clear();
+        scratch.calibrated_queries[query].clear();
+        scratch.luts[query].clear();
+        scratch.heaps[query].reserve(
+            std::min(static_cast<size_t>(k), n_slots));
+
+        score_queries[query] =
+            rotated_queries + static_cast<size_t>(query) * dim_sz;
+        float tqplus_bias = 0.0f;
+        if (!idx.turbovec_tqplus_shift.empty()) {
+            std::vector<float> & calibrated = scratch.calibrated_queries[query];
+            calibrated.resize(dim_sz);
+            double bias_correction = 0.0;
+            for (int coordinate = 0; coordinate < idx.dim; ++coordinate) {
+                const size_t i = static_cast<size_t>(coordinate);
+                calibrated[i] =
+                    score_queries[query][i] / idx.turbovec_tqplus_scale[i];
+                bias_correction -=
+                    static_cast<double>(score_queries[query][i]) *
+                    static_cast<double>(idx.turbovec_tqplus_shift[i]);
+            }
+            score_queries[query] = calibrated.data();
+            tqplus_bias = static_cast<float>(bias_correction);
+        }
+
+        if (bits == 2) {
+            build_turbovec_q2_lut(
+                score_queries[query],
+                idx.dim,
+                scratch.luts[query],
+                lut_scales[query],
+                lut_biases[query]);
+        } else {
+            build_turbovec_q4_lut(
+                score_queries[query],
+                idx.dim,
+                scratch.luts[query],
+                lut_scales[query],
+                lut_biases[query]);
+        }
+        lut_biases[query] += tqplus_bias;
+        lut_ptrs[query] = scratch.luts[query].data();
+    }
+
+    const float * vector_scales = bits == 2 ?
+        idx.turbovec_q2_scale.data() :
+        idx.turbovec_q4_scale.data();
+    std::array<std::array<float, 32>, 4> block_scores{};
+    float * block_score_ptrs[4] = {
+        block_scores[0].data(),
+        block_scores[1].data(),
+        block_scores[2].data(),
+        block_scores[3].data(),
+    };
+    for (size_t block = 0; block < idx.turbovec_blocked_n_blocks; ++block) {
+#ifdef GGML_VEC_INDEX_TEST_HOOKS
+        g_turbovec_block_score_calls.fetch_add(1, std::memory_order_relaxed);
+#endif
+        score_turbovec_lut_block_4(
+            lut_ptrs,
+            lut_scales,
+            lut_biases,
+            idx.turbovec_blocked_data.data(),
+            vector_scales,
+            block,
+            n_slots,
+            bits,
+            idx.dim,
+            block_score_ptrs);
+        const size_t base_slot = block * 32;
+        const size_t count = std::min(static_cast<size_t>(32), n_slots - base_slot);
+        for (int query = 0; query < 4; ++query) {
+            for (size_t lane = 0; lane < count; ++lane) {
+                float score = block_scores[query][lane];
+                if (!std::isfinite(score)) {
+                    score = score_slot(
+                        idx,
+                        score_queries[query],
+                        base_slot + lane,
+                        0.0,
+                        lut_ptrs[query],
+                        lut_scales[query],
+                        lut_biases[query]);
+                }
+                update_topk_heap(
+                    scratch.heaps[query],
+                    k,
+                    { score, idx.slot_to_id[base_slot + lane] });
             }
         }
-    } else if (active_count(idx) < n_slots / 2) {
-        for (const auto & entry : idx.id_to_slot) {
-            visit_slot(entry.second);
-        }
-    } else {
-        for (size_t slot = 0; slot < n_slots; ++slot) {
-            visit_slot(slot);
-        }
     }
 
-    // Drain the heap into a temporary descending list.
-    drained.reserve(heap.size());
-    while (!heap.empty()) {
-        std::pop_heap(heap.begin(), heap.end(), MinHeapCmp());
-        drained.push_back(heap.back());
-        heap.pop_back();
-    }
-    std::reverse(drained.begin(), drained.end()); // now descending by score
-
-    for (int i = 0; i < k; ++i) {
-        if (static_cast<size_t>(i) < drained.size()) {
-            out_scores[i] = float_score_from_double(drained[i].score);
-            out_ids[i]    = drained[i].id;
-        } else {
-            out_scores[i] = -FLT_MAX;
-            out_ids[i]    = UINT64_MAX;
-        }
+    for (int query = 0; query < 4; ++query) {
+        write_topk_heap(
+            k,
+            out_scores + static_cast<size_t>(query) * static_cast<size_t>(k),
+            out_ids + static_cast<size_t>(query) * static_cast<size_t>(k),
+            scratch.heaps[query]);
     }
 }
+#endif
 
 std::vector<size_t> allowed_slots_for_ids(
     const ggml_vec_index_t & idx,
@@ -925,7 +1078,6 @@ static int ggml_vec_index_search_impl(
         }
 
         std::vector<ScoreId> heap;
-        std::vector<ScoreId> drained;
         std::vector<float> rotated_query_scratch;
         std::vector<float> calibrated_query_scratch;
         std::vector<uint8_t> turbovec_lut_scratch;
@@ -940,7 +1092,48 @@ static int ggml_vec_index_search_impl(
                 n_q,
                 dim);
         }
-        for (int q = 0; q < n_q; ++q) {
+        int q = 0;
+#if GGML_VEC_INDEX_USE_NEON
+        const int batch_bits = is_turbovec_q2(*idx) ? 2 : 4;
+        const size_t batch_n_byte_groups =
+            dim_sz / static_cast<size_t>(8 / batch_bits);
+        const size_t batch_heap_capacity = std::min(k_sz, idx->slot_to_id.size());
+        const uint64_t per_query_scratch =
+            static_cast<uint64_t>(batch_n_byte_groups) * 32 +
+            (idx->turbovec_tqplus_shift.empty() ?
+                0 : static_cast<uint64_t>(dim_sz) * sizeof(float));
+        const uint64_t single_query_scratch =
+            static_cast<uint64_t>(batch_heap_capacity) * sizeof(ScoreId) +
+            static_cast<uint64_t>(idx->slot_to_id.size()) * sizeof(float) +
+            per_query_scratch;
+        const uint64_t batch_query_scratch =
+            4 * (static_cast<uint64_t>(batch_heap_capacity) * sizeof(ScoreId) +
+                 per_query_scratch);
+        const bool batch_scratch_is_bounded =
+            batch_query_scratch <= 2 * single_query_scratch;
+        if ((is_turbovec_q2(*idx) || is_turbovec_q4(*idx)) &&
+            allowed_ptr == nullptr &&
+            active_count(*idx) == idx->slot_to_id.size() &&
+            batch_scratch_is_bounded) {
+            const size_t expected_blocked_bytes =
+                idx->turbovec_blocked_n_blocks * batch_n_byte_groups * 32;
+            if (idx->turbovec_blocked_data.size() == expected_blocked_bytes &&
+                idx->turbovec_blocked_n_blocks ==
+                    (idx->slot_to_id.size() + 31) / 32) {
+                TurboVecBatch4Scratch batch_scratch;
+                for (; q + 4 <= n_q; q += 4) {
+                    search_turbovec_four_queries(
+                        *idx,
+                        rotated_turbovec_queries.data() + static_cast<size_t>(q) * dim_sz,
+                        k,
+                        out_scores + static_cast<size_t>(q) * k_sz,
+                        out_ids + static_cast<size_t>(q) * k_sz,
+                        batch_scratch);
+                }
+            }
+        }
+#endif
+        for (; q < n_q; ++q) {
             const double max_query = query_max_abs_values.empty() ?
                 0.0 : query_max_abs_values[static_cast<size_t>(q)];
             search_one(
@@ -951,7 +1144,6 @@ static int ggml_vec_index_search_impl(
                 out_ids    + static_cast<size_t>(q) * static_cast<size_t>(k),
                 max_query,
                 heap,
-                drained,
                 rotated_query_scratch,
                 calibrated_query_scratch,
                 turbovec_lut_scratch,
@@ -1097,7 +1289,6 @@ int ggml_vec_index_search_ivf(
         std::vector<size_t> selected_lists;
         std::vector<size_t> candidate_slots;
         std::vector<ScoreId> heap;
-        std::vector<ScoreId> drained;
         std::vector<float> rotated_query_scratch;
         std::vector<float> calibrated_query_scratch;
         std::vector<uint8_t> turbovec_lut_scratch;
@@ -1133,7 +1324,6 @@ int ggml_vec_index_search_ivf(
                     ids,
                     max_query,
                     heap,
-                    drained,
                     rotated_query_scratch,
                     calibrated_query_scratch,
                     turbovec_lut_scratch,
@@ -1188,7 +1378,6 @@ int ggml_vec_index_search_ivf(
                 ids,
                 max_query,
                 heap,
-                drained,
                 rotated_query_scratch,
                 calibrated_query_scratch,
                 turbovec_lut_scratch,

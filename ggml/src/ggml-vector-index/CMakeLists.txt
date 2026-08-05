@@ -86,6 +86,20 @@ set_target_properties(ggml-vector-index PROPERTIES
 
 target_link_libraries(ggml-vector-index PRIVATE Threads::Threads)
 
+set(GGML_VECTOR_INDEX_USE_ACCELERATE_QUERY OFF)
+if (APPLE AND GGML_ACCELERATE)
+    find_library(GGML_VECTOR_INDEX_ACCELERATE_FRAMEWORK Accelerate)
+    if (GGML_VECTOR_INDEX_ACCELERATE_FRAMEWORK)
+        set(GGML_VECTOR_INDEX_USE_ACCELERATE_QUERY ON)
+        target_compile_definitions(
+            ggml-vector-index PRIVATE
+                GGML_VEC_INDEX_USE_ACCELERATE_QUERY)
+        target_link_libraries(ggml-vector-index PRIVATE "-framework Accelerate")
+    endif()
+else()
+    unset(GGML_VECTOR_INDEX_ACCELERATE_FRAMEWORK CACHE)
+endif()
+
 set(GGML_VECTOR_INDEX_PC_MATH_LIBS "")
 if (DEFINED MATH_LIBRARY)
     target_link_libraries(ggml-vector-index PRIVATE ${MATH_LIBRARY})
@@ -117,6 +131,12 @@ if (LLAMA_BUILD_TESTS)
     elseif (NOT WIN32 AND NOT DEFINED ENV{ONEAPI_ROOT})
         target_link_libraries(ggml-vector-index-test PRIVATE m)
     endif()
+    if (GGML_VECTOR_INDEX_USE_ACCELERATE_QUERY)
+        target_compile_definitions(
+            ggml-vector-index-test PRIVATE
+                GGML_VEC_INDEX_USE_ACCELERATE_QUERY)
+        target_link_libraries(ggml-vector-index-test PRIVATE "-framework Accelerate")
+    endif()
 endif()
 
 install(
@@ -135,6 +155,9 @@ if (CMAKE_THREAD_LIBS_INIT)
 endif()
 if (GGML_VECTOR_INDEX_PC_MATH_LIBS)
     list(APPEND GGML_VECTOR_INDEX_PRIVATE_LIBS_LIST ${GGML_VECTOR_INDEX_PC_MATH_LIBS})
+endif()
+if (GGML_VECTOR_INDEX_USE_ACCELERATE_QUERY)
+    list(APPEND GGML_VECTOR_INDEX_PRIVATE_LIBS_LIST "-framework" "Accelerate")
 endif()
 string(JOIN " " GGML_VECTOR_INDEX_PC_LIBS_PRIVATE ${GGML_VECTOR_INDEX_PRIVATE_LIBS_LIST})
 

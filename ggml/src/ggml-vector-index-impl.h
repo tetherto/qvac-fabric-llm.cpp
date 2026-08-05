@@ -326,6 +326,7 @@ private:
 
 #ifdef GGML_VEC_INDEX_TEST_HOOKS
 extern "C" {
+int     ggml_vec_index_test_can_address_array(size_t count, size_t element_size);
 void    ggml_vec_index_test_set_oom_countdown(int64_t countdown);
 void    ggml_vec_index_test_set_write_fail_after(int64_t bytes);
 void    ggml_vec_index_test_set_truncate_fail(int fail);
@@ -435,6 +436,10 @@ uint64_t turbovec_query_rotation_hash_for_test(
     const float * queries,
     int n_queries,
     int dim);
+double turbovec_query_rotation_max_abs_diff_for_test(
+    const float * queries,
+    int n_queries,
+    int dim);
 uint64_t turbovec_lut_hash_for_test(
     const float * query,
     const float * tqplus_shift,
@@ -520,6 +525,17 @@ void score_turbovec_lut_block(
     int bits,
     int dim,
     float * out_scores);
+void score_turbovec_lut_block_4(
+    const uint8_t * const luts[4],
+    const float lut_scales[4],
+    const float lut_biases[4],
+    const uint8_t * blocked_codes,
+    const float * vector_scales,
+    size_t block_index,
+    size_t n_vectors,
+    int bits,
+    int dim,
+    float * const out_scores[4]);
 void rollback_appended_slots_unlocked(
     ggml_vec_index_t * idx,
     size_t base_slot,

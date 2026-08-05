@@ -204,7 +204,9 @@ const char * q4_kernel_name() {
 }
 
 const char * turbovec_kernel_name() {
-#if defined(GGML_VEC_INDEX_HAVE_AVX2_KERNEL) && \
+#if defined(__aarch64__) && (defined(__ARM_NEON) || defined(__ARM_NEON__))
+    return "neon-lut+4query-dense";
+#elif defined(GGML_VEC_INDEX_HAVE_AVX2_KERNEL) && \
       (defined(_M_X64) || defined(__x86_64__))
     return x86_cpu_has_avx2() ? "avx2-lut" : "scalar-lut";
 #else
@@ -1295,7 +1297,7 @@ int main(int argc, char ** argv) {
     std::printf("llama-vector-index-bench\n");
     std::printf("  q8 kernel=%s\n", q8_kernel_name());
     std::printf("  q4 kernel=%s\n", q4_kernel_name());
-    std::printf("  turbovec kernel=%s\n", turbovec_kernel_name());
+    std::printf("  turbovec capability=%s\n", turbovec_kernel_name());
     std::printf("  n_vec=%d dim=%d n_query=%d k=%d warmups=%d repeats=%d\n",
         cfg.n_vec, cfg.dim, cfg.n_query, cfg.k, cfg.warmups, cfg.repeats);
     std::printf("  estimated memory: f32=%zu bytes q8=%zu bytes q4=%zu bytes tvq2=%zu bytes tvq4=%zu bytes q8/f32=%.3f q4/f32=%.3f tvq2/f32=%.3f tvq4/f32=%.3f\n",

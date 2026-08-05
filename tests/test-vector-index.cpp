@@ -5,9 +5,6 @@
 // C API.
 
 #include "ggml-vector-index.h"
-#ifdef GGML_VEC_INDEX_TEST_HOOKS
-#include "ggml-vector-index-impl.h"
-#endif
 
 #include <algorithm>
 #include <array>
@@ -41,6 +38,7 @@
 
 #ifdef GGML_VEC_INDEX_TEST_HOOKS
 extern "C" {
+int     ggml_vec_index_test_can_address_array(size_t count, size_t element_size);
 void    ggml_vec_index_test_set_write_fail_after(int64_t bytes);
 void    ggml_vec_index_test_set_oom_countdown(int64_t countdown);
 void    ggml_vec_index_test_set_parent_fsync_fail(int fail);
@@ -56,9 +54,14 @@ int64_t ggml_vec_index_test_get_mmap_count_reject_count(void);
 void    ggml_vec_index_test_reset_load_count_reject_count(void);
 int64_t ggml_vec_index_test_get_load_count_reject_count(void);
 }
+int snapshot_write_v1_preflight(size_t n, size_t dim);
 uint64_t turbovec_rotation_hash_for_test(int dim);
 size_t turbovec_rotation_cache_bytes_for_test(void);
 uint64_t turbovec_query_rotation_hash_for_test(
+    const float * queries,
+    int n_queries,
+    int dim);
+double turbovec_query_rotation_max_abs_diff_for_test(
     const float * queries,
     int n_queries,
     int dim);
@@ -469,6 +472,19 @@ void append_file_bytes(const std::string & path, const std::vector<uint8_t> & by
         f.write(reinterpret_cast<const char *>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
     }
     CHECK(static_cast<bool>(f));
+}
+
+bool has_snapshot_tmp(const std::filesystem::path & path) {
+    const std::filesystem::path parent = path.parent_path();
+    const std::string prefix = path.filename().string() + ".tmp.";
+    std::error_code ec;
+    for (const auto & entry : std::filesystem::directory_iterator(parent, ec)) {
+        const std::string name = entry.path().filename().string();
+        if (name.compare(0, prefix.size(), prefix) == 0) {
+            return true;
+        }
+    }
+    return false;
 }
 
 void append_u32_le(std::vector<uint8_t> & bytes, uint32_t value) {
@@ -1331,6 +1347,15 @@ void check_q8_ivf_extreme_centroid_routing() {
     ggml_vec_index_free(idx);
 }
 
+uint64_t encoded_slot_state_hash(uint64_t id, float scale, const std::vector<uint8_t> & codes);
+std::array<uint64_t, 4> wide_state_from_hashes(std::initializer_list<uint64_t> hashes);
+void append_v4_delta_record(
+        std::vector<uint8_t> & bytes,
+        uint8_t op,
+        uint32_t n,
+        const std::vector<uint8_t> & payload,
+        const std::array<uint64_t, 4> & post_state);
+
 void check_ivf_empty_batch_state_validation() {
     constexpr int dim = 2;
 
@@ -1866,27 +1891,6 @@ void expect_corrupt_load_fails(
     std::filesystem::remove(corrupt_path);
 }
 
-struct temp_file {
-    explicit temp_file(const char * suffix) {
-        static uint64_t counter = 0;
-        path = std::filesystem::temp_directory_path() /
-            ("ggml-vector-index-pr2d-" + std::to_string(counter++) + suffix);
-        std::filesystem::remove(path);
-    }
-
-    ~temp_file() { std::filesystem::remove(path); }
-
-    std::filesystem::path path;
-};
-
-void write_bytes(const std::filesystem::path & path, const std::vector<uint8_t> & bytes) {
-    write_file_bytes(path.string(), bytes);
-}
-
-std::vector<uint8_t> read_bytes(const std::filesystem::path & path) {
-    return read_file_bytes(path.string());
-}
-
 void write_sparse_bytes(const std::filesystem::path & path, const std::vector<uint8_t> & prefix, uint64_t size) {
     CHECK(size >= prefix.size());
     std::ofstream f(path, std::ios::binary | std::ios::trunc);
@@ -1900,10 +1904,6 @@ void write_sparse_bytes(const std::filesystem::path & path, const std::vector<ui
         f.write(&zero, 1);
     }
     CHECK(static_cast<bool>(f));
-}
-
-void put_u32_le(std::vector<uint8_t> & bytes, size_t offset, uint32_t value) {
-    write_u32_le_at(bytes, offset, value);
 }
 
 uint32_t crc32c_u32(uint32_t crc, uint32_t value) {
@@ -2140,6 +2140,17 @@ void check_committed_delta_replay() {
         CHECK(ggml_vec_index_search(loaded, added_vector.data(), 1, 1, scores.data(), out_ids.data()) ==
               GGML_VEC_INDEX_OK);
         CHECK(out_ids[0] == added_id);
+
+        const uint64_t rejected_id = 9253ULL;
+        temp_file     rejected_snapshot(".tvim");
+        CHECK(ggml_vec_index_add(loaded, base_vector.data(), 1, &rejected_id) ==
+              GGML_VEC_INDEX_E_INVALID_ARG);
+        CHECK(ggml_vec_index_remove(loaded, added_id) == GGML_VEC_INDEX_E_INVALID_ARG);
+        CHECK(ggml_vec_index_compact(loaded) == GGML_VEC_INDEX_E_INVALID_ARG);
+        CHECK(ggml_vec_index_write(loaded, rejected_snapshot.path.string().c_str()) ==
+              GGML_VEC_INDEX_E_INVALID_ARG);
+        CHECK(ggml_vec_index_len(loaded) == 1);
+        CHECK(ggml_vec_index_contains(loaded, added_id) == 1);
         ggml_vec_index_free(loaded);
 
 #ifdef GGML_VEC_INDEX_TEST_HOOKS
@@ -2797,7 +2808,7 @@ void check_delta_log_tail_recovery() {
         if (!ec) {
             CHECK(std::filesystem::equivalent(delta_path, delta_alias_path, ec));
             CHECK(!ec);
-            CHECK(ggml_vec_index_compact_delta(base, snapshot.c_str(), delta.c_str()) == GGML_VEC_INDEX_OK);
+            CHECK(ggml_vec_index_compact_delta(base, snapshot.c_str(), delta_alias.c_str()) == GGML_VEC_INDEX_OK);
             CHECK(std::filesystem::equivalent(delta_path, delta_alias_path, ec));
             CHECK(!ec);
             CHECK(read_file_bytes(delta_alias) == read_file_bytes(delta));
@@ -3468,7 +3479,17 @@ float tqplus_golden_value(int row, int column) {
 }
 
 #ifdef GGML_VEC_INDEX_TEST_HOOKS
-void check_turbovec_blocked_scalar_scores(int bits, int dim, int n, int n_queries) {
+void check_turbovec_blocked_scalar_scores(
+        int bits,
+        int dim,
+        int n,
+        int n_queries,
+        int n_scalar_queries = -1) {
+    if (n_scalar_queries < 0) {
+        n_scalar_queries = n_queries;
+    }
+    CHECK(n_scalar_queries >= 0);
+    CHECK(n_scalar_queries <= n_queries);
     auto * blocked = bits == 2 ?
         ggml_vec_index_create_turbovec_q2(dim) :
         ggml_vec_index_create_turbovec_q4(dim);
@@ -3512,20 +3533,25 @@ void check_turbovec_blocked_scalar_scores(int bits, int dim, int n, int n_querie
                     0.11 * std::cos(0.083 * (x + y)));
         }
     }
+    CHECK(turbovec_query_rotation_max_abs_diff_for_test(
+        queries.data(), n_queries, dim) <= 1e-5);
 
     std::vector<float> blocked_scores(static_cast<size_t>(n_queries) * n);
-    std::vector<float> scalar_scores(static_cast<size_t>(n_queries) * n);
+    std::vector<float> scalar_scores(static_cast<size_t>(n_scalar_queries) * n);
     std::vector<uint64_t> blocked_ids(static_cast<size_t>(n_queries) * n);
-    std::vector<uint64_t> scalar_ids(static_cast<size_t>(n_queries) * n);
+    std::vector<uint64_t> scalar_ids(static_cast<size_t>(n_scalar_queries) * n);
     CHECK(ggml_vec_index_search(
         blocked, queries.data(), n_queries, n, blocked_scores.data(), blocked_ids.data()) ==
         GGML_VEC_INDEX_OK);
     CHECK(ggml_vec_index_search(
-        scalar, queries.data(), n_queries, n, scalar_scores.data(), scalar_ids.data()) ==
+        scalar, queries.data(), n_scalar_queries, n, scalar_scores.data(), scalar_ids.data()) ==
         GGML_VEC_INDEX_OK);
 
     std::vector<float> blocked_by_row(static_cast<size_t>(n));
     std::vector<float> scalar_by_row(static_cast<size_t>(n));
+    std::vector<float> single_scores(static_cast<size_t>(n));
+    std::vector<uint64_t> single_ids(static_cast<size_t>(n));
+    std::vector<float> single_by_row(static_cast<size_t>(n));
     for (int query = 0; query < n_queries; ++query) {
         std::fill(blocked_by_row.begin(), blocked_by_row.end(), std::numeric_limits<float>::quiet_NaN());
         std::fill(scalar_by_row.begin(), scalar_by_row.end(), std::numeric_limits<float>::quiet_NaN());
@@ -3533,38 +3559,135 @@ void check_turbovec_blocked_scalar_scores(int bits, int dim, int n, int n_querie
             const size_t offset = static_cast<size_t>(query) * n + static_cast<size_t>(rank);
             CHECK(blocked_ids[offset] >= id_base);
             CHECK(blocked_ids[offset] < id_base + static_cast<uint64_t>(n));
-            CHECK(scalar_ids[offset] >= id_base);
-            CHECK(scalar_ids[offset] < id_base + static_cast<uint64_t>(n));
             blocked_by_row[static_cast<size_t>(blocked_ids[offset] - id_base)] = blocked_scores[offset];
-            scalar_by_row[static_cast<size_t>(scalar_ids[offset] - id_base)] = scalar_scores[offset];
+            if (query < n_scalar_queries) {
+                CHECK(scalar_ids[offset] >= id_base);
+                CHECK(scalar_ids[offset] < id_base + static_cast<uint64_t>(n));
+                scalar_by_row[static_cast<size_t>(scalar_ids[offset] - id_base)] = scalar_scores[offset];
+            }
+        }
+        CHECK(ggml_vec_index_search(
+            blocked,
+            queries.data() + static_cast<size_t>(query) * dim,
+            1,
+            n,
+            single_scores.data(),
+            single_ids.data()) == GGML_VEC_INDEX_OK);
+        std::fill(single_by_row.begin(), single_by_row.end(), std::numeric_limits<float>::quiet_NaN());
+        for (int rank = 0; rank < n; ++rank) {
+            CHECK(single_ids[static_cast<size_t>(rank)] >= id_base);
+            CHECK(single_ids[static_cast<size_t>(rank)] < id_base + static_cast<uint64_t>(n));
+            single_by_row[static_cast<size_t>(single_ids[static_cast<size_t>(rank)] - id_base)] =
+                single_scores[static_cast<size_t>(rank)];
         }
         for (int row = 0; row < n; ++row) {
             const float blocked_score = blocked_by_row[static_cast<size_t>(row)];
-            const float scalar_score = scalar_by_row[static_cast<size_t>(row)];
+            const float single_score = single_by_row[static_cast<size_t>(row)];
             CHECK(std::isfinite(blocked_score));
-            CHECK(std::isfinite(scalar_score));
-            const float tolerance = std::max(
-                1e-4f * std::fabs(scalar_score),
-                1e-4f);
-            const float drift = std::fabs(blocked_score - scalar_score);
-            if (!(drift <= tolerance)) {
-                std::fprintf(
-                    stderr,
-                    "FAIL TurboVec q%d blocked/scalar drift: dim=%d n=%d query=%d row=%d drift=%g tolerance=%g\n",
-                    bits,
-                    dim,
-                    n,
-                    query,
-                    row,
-                    static_cast<double>(drift),
-                    static_cast<double>(tolerance));
-                std::exit(1);
+            CHECK(float_bits(blocked_score) == float_bits(single_score));
+            if (query < n_scalar_queries) {
+                const float scalar_score = scalar_by_row[static_cast<size_t>(row)];
+                CHECK(std::isfinite(scalar_score));
+                const float tolerance = std::max(
+                    1e-4f * std::fabs(scalar_score),
+                    1e-4f);
+                const float drift = std::fabs(blocked_score - scalar_score);
+                if (!(drift <= tolerance)) {
+                    std::fprintf(
+                        stderr,
+                        "FAIL TurboVec q%d blocked/scalar drift: dim=%d n=%d query=%d row=%d drift=%g tolerance=%g\n",
+                        bits,
+                        dim,
+                        n,
+                        query,
+                        row,
+                        static_cast<double>(drift),
+                        static_cast<double>(tolerance));
+                    std::exit(1);
+                }
             }
         }
     }
 
     ggml_vec_index_free(scalar);
     ggml_vec_index_free(blocked);
+}
+
+void check_turbovec_fused_batch_scores(int bits) {
+    constexpr int dim = 256;
+    constexpr int n = 2048;
+    constexpr int n_queries = 17;
+    constexpr int k = 10;
+    auto * index = bits == 2 ?
+        ggml_vec_index_create_turbovec_q2(dim) :
+        ggml_vec_index_create_turbovec_q4(dim);
+    CHECK(index != nullptr);
+
+    std::vector<uint64_t> ids(static_cast<size_t>(n));
+    std::vector<float> vectors(static_cast<size_t>(n) * dim);
+    for (int row = 0; row < n; ++row) {
+        ids[static_cast<size_t>(row)] = static_cast<uint64_t>(40000 + row);
+        for (int col = 0; col < dim; ++col) {
+            const double x = static_cast<double>(row + 1);
+            const double y = static_cast<double>(col + 3);
+            vectors[static_cast<size_t>(row) * dim + static_cast<size_t>(col)] =
+                static_cast<float>(
+                    0.55 * std::sin(0.013 * x * y + 0.17) +
+                    0.35 * std::cos(0.019 * (x + 5.0) * (y + 1.0)) +
+                    0.10 * std::sin(0.071 * (x + y)));
+        }
+    }
+    CHECK(ggml_vec_index_add(index, vectors.data(), n, ids.data()) == GGML_VEC_INDEX_OK);
+
+    std::vector<float> queries(static_cast<size_t>(n_queries) * dim);
+    for (int row = 0; row < n_queries; ++row) {
+        for (int col = 0; col < dim; ++col) {
+            const double x = static_cast<double>(row + 2);
+            const double y = static_cast<double>(col + 7);
+            queries[static_cast<size_t>(row) * dim + static_cast<size_t>(col)] =
+                static_cast<float>(
+                    0.48 * std::cos(0.023 * x * y + 0.31) +
+                    0.41 * std::sin(0.037 * (x + 3.0) * (y + 2.0)) +
+                    0.11 * std::cos(0.083 * (x + y)));
+        }
+    }
+
+    std::vector<float> batch_scores(static_cast<size_t>(n_queries) * k);
+    std::vector<uint64_t> batch_ids(static_cast<size_t>(n_queries) * k);
+    turbovec_reset_block_score_call_count_for_test();
+    CHECK(ggml_vec_index_search(
+        index,
+        queries.data(),
+        n_queries,
+        k,
+        batch_scores.data(),
+        batch_ids.data()) == GGML_VEC_INDEX_OK);
+#if defined(__aarch64__) && (defined(__ARM_NEON) || defined(__ARM_NEON__))
+    const int64_t n_blocks = (n + 31) / 32;
+    const int64_t expected_calls =
+        (n_queries / 4 + n_queries % 4) * n_blocks;
+    CHECK(turbovec_block_score_call_count_for_test() == expected_calls);
+#endif
+
+    std::array<float, k> single_scores{};
+    std::array<uint64_t, k> single_ids{};
+    for (int query = 0; query < n_queries; ++query) {
+        CHECK(ggml_vec_index_search(
+            index,
+            queries.data() + static_cast<size_t>(query) * dim,
+            1,
+            k,
+            single_scores.data(),
+            single_ids.data()) == GGML_VEC_INDEX_OK);
+        for (int rank = 0; rank < k; ++rank) {
+            const size_t offset =
+                static_cast<size_t>(query) * k + static_cast<size_t>(rank);
+            CHECK(batch_ids[offset] == single_ids[static_cast<size_t>(rank)]);
+            CHECK(float_bits(batch_scores[offset]) ==
+                float_bits(single_scores[static_cast<size_t>(rank)]));
+        }
+    }
+    ggml_vec_index_free(index);
 }
 #endif
 
@@ -3612,6 +3735,67 @@ void check_ivf_contains(
     CHECK(ggml_vec_index_search_ivf(
         idx, query, 1, k, nprobe, scores.data(), out.data()) == GGML_VEC_INDEX_OK);
     CHECK(std::find(out.begin(), out.end(), expected_id) != out.end());
+}
+
+void check_turbovec_rounding_mode_persistence(int bits) {
+    constexpr int dim = 136;
+    constexpr int n = 1000;
+    constexpr int k = 4;
+    CHECK(bits == 2 || bits == 4);
+    const int saved_rounding = std::fegetround();
+    CHECK(saved_rounding != -1);
+
+    std::vector<float> vectors(static_cast<size_t>(n) * dim);
+    fill_turbovec_regression_vectors(vectors, n, dim);
+    std::vector<uint64_t> ids(static_cast<size_t>(n));
+    for (int row = 0; row < n; ++row) {
+        ids[static_cast<size_t>(row)] = static_cast<uint64_t>(700000 + bits * 10000 + row);
+    }
+
+    struct RoundingSnapshot {
+        std::vector<uint8_t> bytes;
+        std::array<float, 4> scores;
+        std::array<uint64_t, 4> ids;
+    };
+
+    auto make_snapshot = [&](int rounding_mode, const char * suffix) {
+        const std::string path =
+            (std::filesystem::temp_directory_path() /
+             ("ggml-vector-index-turbovec-rounding-q" + std::to_string(bits) + "-" +
+              suffix + ".tvim")).string();
+        std::filesystem::remove(path);
+
+        CHECK(std::fesetround(rounding_mode) == 0);
+        auto * tv = bits == 2 ?
+            ggml_vec_index_create_turbovec_q2(dim) :
+            ggml_vec_index_create_turbovec_q4(dim);
+        CHECK(tv != nullptr);
+        ggml_vec_index_prepare(tv);
+        CHECK(ggml_vec_index_add(tv, vectors.data(), n, ids.data()) == GGML_VEC_INDEX_OK);
+        CHECK(ggml_vec_index_write(tv, path.c_str()) == GGML_VEC_INDEX_OK);
+        ggml_vec_index_free(tv);
+        CHECK(std::fesetround(saved_rounding) == 0);
+
+        RoundingSnapshot snapshot;
+        snapshot.bytes = read_file_bytes(path);
+        auto * loaded = ggml_vec_index_load(path.c_str());
+        CHECK(loaded != nullptr);
+        CHECK(ggml_vec_index_search(
+            loaded, vectors.data(), 1, k, snapshot.scores.data(), snapshot.ids.data()) ==
+            GGML_VEC_INDEX_OK);
+        ggml_vec_index_free(loaded);
+        std::filesystem::remove(path);
+        return snapshot;
+    };
+
+    const RoundingSnapshot downward = make_snapshot(FE_DOWNWARD, "downward");
+    const RoundingSnapshot upward = make_snapshot(FE_UPWARD, "upward");
+    CHECK(downward.bytes == upward.bytes);
+    CHECK(downward.ids == upward.ids);
+    for (size_t i = 0; i < downward.scores.size(); ++i) {
+        CHECK(float_bits(downward.scores[i]) == float_bits(upward.scores[i]));
+    }
+    CHECK(std::fesetround(saved_rounding) == 0);
 }
 
 float score_for_id(
@@ -4232,9 +4416,10 @@ int main(int argc, char ** argv) {
             }
 
             for (const int bit_width : { 2, 4 }) {
-                check_turbovec_blocked_scalar_scores(bit_width, 128, 17, 3);
-                check_turbovec_blocked_scalar_scores(bit_width, 128, 33, 3);
-                check_turbovec_blocked_scalar_scores(bit_width, 256, 65, 2);
+                check_turbovec_blocked_scalar_scores(bit_width, 128, 17, 4);
+                check_turbovec_blocked_scalar_scores(bit_width, 128, 33, 5);
+                check_turbovec_blocked_scalar_scores(bit_width, 256, 65, 17, 8);
+                check_turbovec_fused_batch_scores(bit_width);
                 check_turbovec_oversized_snapshot_compatibility(bit_width);
             }
             check_turbovec_blocked_scalar_scores(2, 128, 1000, 2);
@@ -4250,6 +4435,7 @@ int main(int argc, char ** argv) {
                     }
                 }
                 check_turbovec_mutation_cache_regression(bit_width);
+                check_turbovec_rounding_mode_persistence(bit_width);
             }
             check_turbovec_incremental_block_repacking();
             check_turbovec_sparse_filter_block_selection();
@@ -4934,10 +5120,10 @@ int main(int argc, char ** argv) {
     // 64-bit CI still covers the overflow boundary used by 32-bit builds.
     {
         constexpr size_t max_size = std::numeric_limits<size_t>::max();
-        CHECK(ggml_vec_index_detail::can_address_array(max_size / sizeof(float), sizeof(float)));
-        CHECK(!ggml_vec_index_detail::can_address_array(max_size / sizeof(float) + 1, sizeof(float)));
-        CHECK(ggml_vec_index_detail::can_address_array(max_size / sizeof(uint64_t), sizeof(uint64_t)));
-        CHECK(!ggml_vec_index_detail::can_address_array(max_size / sizeof(uint64_t) + 1, sizeof(uint64_t)));
+        CHECK(ggml_vec_index_test_can_address_array(max_size / sizeof(float), sizeof(float)) == 1);
+        CHECK(ggml_vec_index_test_can_address_array(max_size / sizeof(float) + 1, sizeof(float)) == 0);
+        CHECK(ggml_vec_index_test_can_address_array(max_size / sizeof(uint64_t), sizeof(uint64_t)) == 1);
+        CHECK(ggml_vec_index_test_can_address_array(max_size / sizeof(uint64_t) + 1, sizeof(uint64_t)) == 0);
     }
 #endif
 
@@ -5306,26 +5492,53 @@ int main(int argc, char ** argv) {
                     rows[static_cast<size_t>((t % n_rows) * kDim + 2)],
                     rows[static_cast<size_t>((t % n_rows) * kDim + 3)],
                 };
-                std::array<float, 3> scores{};
-                std::array<uint64_t, 3> out_ids{};
+                std::array<float, 3> expected_scores{};
+                std::array<uint64_t, 3> expected_ids{};
+                std::array<float, 3> expected_filtered_scores{};
+                std::array<uint64_t, 3> expected_filtered_ids{};
+                CHECK(ggml_vec_index_search(
+                    concurrent, query.data(), 1, /*k=*/3,
+                    expected_scores.data(), expected_ids.data()) == GGML_VEC_INDEX_OK);
+                CHECK(ggml_vec_index_search_filtered(
+                    concurrent, query.data(), 1, /*k=*/3,
+                    allowed.data(), static_cast<int>(allowed.size()),
+                    expected_filtered_scores.data(), expected_filtered_ids.data()) == GGML_VEC_INDEX_OK);
                 ready.fetch_add(1);
                 while (!start.load()) {
                     std::this_thread::yield();
                 }
                 for (int iter = 0; iter < 200; ++iter) {
+                    std::array<float, 3> scores{};
+                    std::array<uint64_t, 3> out_ids{};
+                    scores.fill(std::numeric_limits<float>::quiet_NaN());
+                    out_ids.fill(UINT64_MAX);
                     CHECK(ggml_vec_index_search(
                         concurrent, query.data(), 1, /*k=*/3,
                         scores.data(), out_ids.data()) == GGML_VEC_INDEX_OK);
+                    CHECK(scores == expected_scores);
+                    CHECK(out_ids == expected_ids);
+                    scores.fill(std::numeric_limits<float>::quiet_NaN());
+                    out_ids.fill(UINT64_MAX);
                     CHECK(ggml_vec_index_search_filtered(
                         concurrent, query.data(), 1, /*k=*/3,
                         allowed.data(), static_cast<int>(allowed.size()),
                         scores.data(), out_ids.data()) == GGML_VEC_INDEX_OK);
+                    CHECK(scores == expected_filtered_scores);
+                    CHECK(out_ids == expected_filtered_ids);
+                    scores.fill(std::numeric_limits<float>::quiet_NaN());
+                    out_ids.fill(UINT64_MAX);
                     CHECK(ggml_vec_index_search_prepared_filtered(
                         concurrent, filter, query.data(), 1, /*k=*/3,
                         scores.data(), out_ids.data()) == GGML_VEC_INDEX_OK);
+                    CHECK(scores == expected_filtered_scores);
+                    CHECK(out_ids == expected_filtered_ids);
+                    scores.fill(std::numeric_limits<float>::quiet_NaN());
+                    out_ids.fill(UINT64_MAX);
                     CHECK(ggml_vec_index_search_ivf(
                         concurrent, query.data(), 1, /*k=*/3, /*nprobe=*/4,
                         scores.data(), out_ids.data()) == GGML_VEC_INDEX_OK);
+                    CHECK(scores == expected_scores);
+                    CHECK(out_ids == expected_ids);
                     CHECK(ggml_vec_index_contains(concurrent, row_ids[static_cast<size_t>(t % n_rows)]) == 1);
                     CHECK(ggml_vec_index_len(concurrent) == n_rows);
                     CHECK(ggml_vec_index_dim(concurrent) == kDim);
@@ -5369,30 +5582,49 @@ int main(int argc, char ** argv) {
             concurrent_mutation, rows.data(), n_rows, row_ids.data()) ==
             GGML_VEC_INDEX_OK);
 
-        std::atomic<int> ready{ 0 };
-        std::atomic<bool> start{ false };
-        std::atomic<bool> done{ false };
-        std::atomic<int> failures{ 0 };
+        std::atomic<int>         ready{ 0 };
+        std::atomic<int>         read_count{ 0 };
+        std::atomic<int>         readers_waiting{ 0 };
+        std::atomic<int>         post_signal_reads{ 0 };
+        std::atomic<bool>        start{ false };
+        std::atomic<bool>        writer_pending{ false };
+        std::atomic<bool>        race_start{ false };
+        std::atomic<bool>        writer_done{ false };
+        std::atomic<int>         failures{ 0 };
         std::vector<std::thread> readers;
         for (int t = 0; t < 4; ++t) {
             readers.emplace_back([&, t]() {
-                const float * query =
-                    rows.data() + static_cast<size_t>(t % n_rows) * kDim;
-                std::array<float, 3> scores{};
+                const float *           query = rows.data() + static_cast<size_t>(t % n_rows) * kDim;
+                std::array<float, 3>    scores{};
                 std::array<uint64_t, 3> out_ids{};
                 ready.fetch_add(1);
                 while (!start.load()) {
                     std::this_thread::yield();
                 }
-                while (!done.load()) {
-                    if (ggml_vec_index_search(
-                            concurrent_mutation, query, 1, /*k=*/3,
-                            scores.data(), out_ids.data()) != GGML_VEC_INDEX_OK) {
+                while (!writer_pending.load()) {
+                    if (ggml_vec_index_search(concurrent_mutation, query, 1, /*k=*/3, scores.data(), out_ids.data()) !=
+                        GGML_VEC_INDEX_OK) {
                         failures.fetch_add(1);
                     }
                     if (ggml_vec_index_len(concurrent_mutation) < n_rows) {
                         failures.fetch_add(1);
                     }
+                    read_count.fetch_add(1);
+                }
+                readers_waiting.fetch_add(1);
+                while (!race_start.load()) {
+                    std::this_thread::yield();
+                }
+                for (int iter = 0; iter < 64; ++iter) {
+                    if (ggml_vec_index_search(concurrent_mutation, query, 1, /*k=*/3, scores.data(), out_ids.data()) !=
+                        GGML_VEC_INDEX_OK) {
+                        failures.fetch_add(1);
+                    }
+                    if (ggml_vec_index_len(concurrent_mutation) < n_rows) {
+                        failures.fetch_add(1);
+                    }
+                    post_signal_reads.fetch_add(1);
+                    std::this_thread::yield();
                 }
             });
         }
@@ -5401,23 +5633,46 @@ int main(int argc, char ** argv) {
             std::this_thread::yield();
         }
         start.store(true);
-        for (int iter = 0; iter < 100; ++iter) {
-            const std::vector<float> v = normalize({
-                0.25f,
-                static_cast<float>((iter % 7) - 3),
-                1.0f,
-                -0.5f,
-            });
-            const uint64_t id = static_cast<uint64_t>(10000 + iter);
-            CHECK(ggml_vec_index_add(concurrent_mutation, v.data(), 1, &id)
-                  == GGML_VEC_INDEX_OK);
-            CHECK(ggml_vec_index_remove(concurrent_mutation, id) == GGML_VEC_INDEX_OK);
+        const auto read_deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(250);
+        while (read_count.load() < 32 && std::chrono::steady_clock::now() < read_deadline) {
+            std::this_thread::yield();
         }
-        done.store(true);
+        CHECK(read_count.load() >= 32);
+
+        std::thread writer([&]() {
+            writer_pending.store(true);
+            while (readers_waiting.load() != 4) {
+                std::this_thread::yield();
+            }
+            race_start.store(true);
+            for (int iter = 0; iter < 100; ++iter) {
+                const std::vector<float> v  = normalize({
+                    0.25f,
+                    static_cast<float>((iter % 7) - 3),
+                    1.0f,
+                    -0.5f,
+                });
+                const uint64_t           id = static_cast<uint64_t>(10000 + iter);
+                if (ggml_vec_index_add(concurrent_mutation, v.data(), 1, &id) != GGML_VEC_INDEX_OK ||
+                    ggml_vec_index_remove(concurrent_mutation, id) != GGML_VEC_INDEX_OK) {
+                    failures.fetch_add(1);
+                    break;
+                }
+            }
+            writer_done.store(true);
+        });
+
+        const auto writer_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        while (!writer_done.load() && std::chrono::steady_clock::now() < writer_deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        CHECK(writer_done.load());
+        writer.join();
         for (std::thread & reader : readers) {
             reader.join();
         }
         CHECK(failures.load() == 0);
+        CHECK(post_signal_reads.load() == 4 * 64);
         CHECK(ggml_vec_index_len(concurrent_mutation) == n_rows);
 
         ggml_vec_index_free(concurrent_mutation);
@@ -5622,7 +5877,8 @@ int main(int argc, char ** argv) {
     CHECK((persisted_stat.st_mode & 0777) == 0600);
 #endif
     {
-        const std::filesystem::path missing_parent = temp_path(".missing-dir");
+        const std::filesystem::path missing_parent =
+            std::filesystem::temp_directory_path() / "ggml-vector-index-missing-dir";
         const std::filesystem::path bad_path       = missing_parent / "snapshot.tvim";
         CHECK(ggml_vec_index_write(idx, bad_path.string().c_str()) == GGML_VEC_INDEX_E_IO);
     }
@@ -6565,7 +6821,10 @@ int main(int argc, char ** argv) {
 
             auto * v1 = ggml_vec_index_load(v1_path.c_str());
             CHECK(v1 != nullptr);
-            CHECK(ggml_vec_index_load_mmap(v1_path.c_str()) == nullptr);
+            ggml_vec_index_t * mapped_v1 = nullptr;
+            CHECK(ggml_vec_index_load_mmap_ex(v1_path.c_str(), &mapped_v1) ==
+                  GGML_VEC_INDEX_E_BAD_VERSION);
+            CHECK(mapped_v1 == nullptr);
             CHECK(ggml_vec_index_dim(v1) == kDim);
             CHECK(ggml_vec_index_len(v1) == 2);
             CHECK(ggml_vec_index_bit_width(v1) == (bit_width == 8 ? 8 : 32));
@@ -6636,6 +6895,28 @@ int main(int argc, char ** argv) {
                 CHECK(mmap_out_ids[i] == normal_ids[i]);
                 CHECK(std::fabs(mmap_scores[i] - normal_scores[i]) <= 1e-6f);
             }
+            if (bit_width == 32) {
+                temp_file       symlink_file(".tvim.link");
+                std::error_code ec;
+                std::filesystem::create_symlink(mmap_path, symlink_file.path, ec);
+                if (!ec) {
+                    auto * symlink_mmap = ggml_vec_index_load_mmap(symlink_file.path.string().c_str());
+                    CHECK(symlink_mmap != nullptr);
+                    mmap_scores.fill(std::numeric_limits<float>::quiet_NaN());
+                    mmap_out_ids.fill(UINT64_MAX);
+                    CHECK(ggml_vec_index_search(
+                              symlink_mmap, query.data(), 1, 4, mmap_scores.data(), mmap_out_ids.data()) ==
+                          GGML_VEC_INDEX_OK);
+                    for (int i = 0; i < 4; ++i) {
+                        CHECK(mmap_out_ids[i] == normal_ids[i]);
+                        CHECK(std::fabs(mmap_scores[i] - normal_scores[i]) <= 1e-6f);
+                    }
+                    ggml_vec_index_free(symlink_mmap);
+                } else {
+                    CHECK(ec == std::errc::operation_not_supported || ec == std::errc::function_not_supported ||
+                          ec == std::errc::permission_denied);
+                }
+            }
 
             CHECK(std::filesystem::remove(mmap_path));
             std::array<float, 4> unlinked_scores{};
@@ -6650,9 +6931,17 @@ int main(int argc, char ** argv) {
 
             CHECK(ggml_vec_index_build_ivf(mapped, /*n_lists=*/2, /*n_iter=*/2)
                   == GGML_VEC_INDEX_OK);
+            std::array<float, 2> mmap_ivf_scores{};
+            std::array<uint64_t, 2> mmap_ivf_ids{};
+            mmap_ivf_scores.fill(std::numeric_limits<float>::quiet_NaN());
+            mmap_ivf_ids.fill(UINT64_MAX);
             CHECK(ggml_vec_index_search_ivf(
                 mapped, query.data(), 1, /*k=*/2, /*nprobe=*/2,
-                mmap_scores.data(), mmap_out_ids.data()) == GGML_VEC_INDEX_OK);
+                mmap_ivf_scores.data(), mmap_ivf_ids.data()) == GGML_VEC_INDEX_OK);
+            for (int i = 0; i < 2; ++i) {
+                CHECK(mmap_ivf_ids[i] == normal_ids[i]);
+                CHECK(std::fabs(mmap_ivf_scores[i] - normal_scores[i]) <= 1e-6f);
+            }
 
             const uint64_t new_id = (1ULL << 38) + 99ULL;
             CHECK(ggml_vec_index_add(mapped, seeds[0].data(), 1, &new_id)

@@ -164,7 +164,9 @@ GGML_API int ggml_vec_index_add_logged(
 
 // Removes `id` and appends the mutation to the handle's v4 delta log. Uses the
 // same snapshot-lineage, path-binding, and durability contract as
-// `ggml_vec_index_add_logged`.
+// `ggml_vec_index_add_logged`. Same return convention as
+// `ggml_vec_index_remove`: GGML_VEC_INDEX_OK if removed,
+// GGML_VEC_INDEX_E_NOT_FOUND if not present, negative on error.
 GGML_API int ggml_vec_index_remove_logged(
     ggml_vec_index_t * idx,
     uint64_t           id,

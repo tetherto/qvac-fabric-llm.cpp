@@ -2,6 +2,14 @@
 
 #include "ggml-vector-index-impl.h"
 
+#if defined(GGML_VEC_INDEX_USE_ACCELERATE_QUERY)
+#define ACCELERATE_NEW_LAPACK
+#if defined(__LP64__)
+#define ACCELERATE_LAPACK_ILP64
+#endif
+#include <Accelerate/Accelerate.h>
+#endif
+
 #if GGML_VEC_INDEX_USE_NEON
 #include <arm_neon.h>
 #endif
@@ -37,6 +45,27 @@ struct TurboVecRotationCacheEntry {
     size_t ref_count = 0;
     std::weak_ptr<const std::vector<float>> weak;
     std::shared_ptr<const std::vector<float>> strong;
+};
+
+class ScopedNearestRounding {
+public:
+    ScopedNearestRounding() : saved_rounding(std::fegetround()) {
+        if (saved_rounding != FE_TONEAREST && saved_rounding != -1) {
+            std::fesetround(FE_TONEAREST);
+        }
+    }
+
+    ~ScopedNearestRounding() {
+        if (saved_rounding != FE_TONEAREST && saved_rounding != -1) {
+            std::fesetround(saved_rounding);
+        }
+    }
+
+    ScopedNearestRounding(const ScopedNearestRounding &) = delete;
+    ScopedNearestRounding & operator=(const ScopedNearestRounding &) = delete;
+
+private:
+    int saved_rounding = FE_TONEAREST;
 };
 
 struct ChaCha8 {
@@ -216,6 +245,7 @@ static double sample_standard_normal_ziggurat(ChaCha8 & rng) {
 }
 
 static std::vector<float> make_turbovec_rotation(int dim) {
+    const ScopedNearestRounding rounding_guard;
     const size_t dim_sz = static_cast<size_t>(dim);
     std::vector<double> matrix(dim_sz * dim_sz);
     ChaCha8 rng;
@@ -367,6 +397,69 @@ static void apply_turbovec_rotation_batch(const float * src, float * dst, int n,
             dim,
             false);
     }
+}
+
+static void apply_turbovec_query_rotation_batch(
+        const float * src,
+        float * dst,
+        int n,
+        int dim) {
+#if defined(GGML_VEC_INDEX_USE_ACCELERATE_QUERY)
+    if (n <= 0) {
+        return;
+    }
+    if (__builtin_available(
+            macOS 13.3,
+            iOS 16.4,
+            tvOS 16.4,
+            watchOS 9.4,
+            *)) {
+        const std::shared_ptr<const std::vector<float>> rotation = turbovec_rotation(dim);
+        constexpr int batch_size = 16;
+        std::vector<float> padded;
+        for (int row = 0; row < n; row += batch_size) {
+            const int count = std::min(batch_size, n - row);
+            const float * batch_src =
+                src + static_cast<size_t>(row) * static_cast<size_t>(dim);
+            float * batch_dst =
+                dst + static_cast<size_t>(row) * static_cast<size_t>(dim);
+            if (count < batch_size) {
+                const size_t padded_count =
+                    static_cast<size_t>(batch_size) * static_cast<size_t>(dim);
+                padded.assign(2 * padded_count, 0.0f);
+                std::memcpy(
+                    padded.data(),
+                    batch_src,
+                    static_cast<size_t>(count) * static_cast<size_t>(dim) * sizeof(float));
+                batch_src = padded.data();
+                batch_dst = padded.data() + padded_count;
+            }
+            cblas_sgemm(
+                CblasRowMajor,
+                CblasNoTrans,
+                CblasTrans,
+                batch_size,
+                dim,
+                dim,
+                1.0f,
+                batch_src,
+                dim,
+                rotation->data(),
+                dim,
+                0.0f,
+                batch_dst,
+                dim);
+            if (count < batch_size) {
+                std::memcpy(
+                    dst + static_cast<size_t>(row) * static_cast<size_t>(dim),
+                    batch_dst,
+                    static_cast<size_t>(count) * static_cast<size_t>(dim) * sizeof(float));
+            }
+        }
+        return;
+    }
+#endif
+    apply_turbovec_rotation_batch(src, dst, n, dim);
 }
 
 static double vector_norm(const float * values, int dim) {
@@ -612,6 +705,7 @@ static double adaptive_simpson(const Fn & f, double a, double b, double tol, int
 }
 
 static TurboVecCodebook make_turbovec_codebook(int bits, int dim) {
+    const ScopedNearestRounding rounding_guard;
     const double a = (static_cast<double>(dim) - 1.0) * 0.5;
     const int n_levels = 1 << bits;
     const double std_dev = std::sqrt(2.0 * a / ((2.0 * a + 1.0) * 4.0 * a));
@@ -991,7 +1085,7 @@ uint64_t turbovec_query_rotation_hash_for_test(
         return 0;
     }
     std::vector<float> rotated(static_cast<size_t>(n_queries) * static_cast<size_t>(dim));
-    rotate_turbovec_queries(queries, rotated.data(), n_queries, dim);
+    apply_turbovec_rotation_batch(queries, rotated.data(), n_queries, dim);
     uint64_t hash = UINT64_C(0xcbf29ce484222325);
     for (float value : rotated) {
         uint32_t bits_value = 0;
@@ -1002,6 +1096,30 @@ uint64_t turbovec_query_rotation_hash_for_test(
         }
     }
     return hash;
+}
+
+double turbovec_query_rotation_max_abs_diff_for_test(
+        const float * queries,
+        int n_queries,
+        int dim) {
+    if (queries == nullptr || n_queries < 0 || !turbovec_q4_supported_dim(dim)) {
+        return std::numeric_limits<double>::infinity();
+    }
+    const size_t value_count =
+        static_cast<size_t>(n_queries) * static_cast<size_t>(dim);
+    std::vector<float> fast(value_count);
+    std::vector<float> reference(value_count);
+    apply_turbovec_query_rotation_batch(queries, fast.data(), n_queries, dim);
+    apply_turbovec_rotation_batch(queries, reference.data(), n_queries, dim);
+    double max_diff = 0.0;
+    for (size_t i = 0; i < value_count; ++i) {
+        max_diff = std::max(
+            max_diff,
+            std::fabs(
+                static_cast<double>(fast[i]) -
+                static_cast<double>(reference[i])));
+    }
+    return max_diff;
 }
 
 uint64_t turbovec_lut_hash_for_test(
@@ -1020,7 +1138,8 @@ uint64_t turbovec_lut_hash_for_test(
     }
     std::vector<float> rotated(static_cast<size_t>(n_queries) * static_cast<size_t>(dim));
     std::vector<float> calibrated(static_cast<size_t>(dim));
-    rotate_turbovec_queries(query, rotated.data(), n_queries, dim);
+    // Parity fixtures use scalar rotation hashes, independent of backend reduction order.
+    apply_turbovec_rotation_batch(query, rotated.data(), n_queries, dim);
     double bias_correction = 0.0;
     for (int coordinate = 0; coordinate < dim; ++coordinate) {
         const size_t i = static_cast<size_t>(coordinate);
@@ -1330,9 +1449,11 @@ void score_turbovec_lut_block(
         }
     }
 #else
+#if defined(__x86_64__) || defined(_M_X64)
     static constexpr size_t inverse_perm[16] = {
         0, 2, 4, 6, 8, 10, 12, 14, 1, 3, 5, 7, 9, 11, 13, 15,
     };
+#endif
     for (size_t lane = 0; lane < kTurboVecScoreBlock; ++lane) {
         if (lane >= valid_lanes) {
             out_scores[lane] = -std::numeric_limits<float>::infinity();
@@ -1365,6 +1486,126 @@ void score_turbovec_lut_block(
 #endif
 }
 
+void score_turbovec_lut_block_4(
+        const uint8_t * const luts[4],
+        const float lut_scales[4],
+        const float lut_biases[4],
+        const uint8_t * blocked_codes,
+        const float * vector_scales,
+        size_t block_index,
+        size_t n_vectors,
+        int bits,
+        int dim,
+        float * const out_scores[4]) {
+#if GGML_VEC_INDEX_USE_NEON
+    const size_t n_byte_groups =
+        static_cast<size_t>(dim) / static_cast<size_t>(8 / bits);
+    const size_t base_vector = block_index * kTurboVecScoreBlock;
+    const size_t block_offset =
+        block_index * n_byte_groups * static_cast<size_t>(kTurboVecScoreBlock);
+    const size_t valid_lanes =
+        std::min(static_cast<size_t>(kTurboVecScoreBlock), n_vectors - base_vector);
+    const uint8x16_t nibble_mask = vdupq_n_u8(0x0f);
+    float32x4_t float_accum[4][8];
+    for (int query = 0; query < 4; ++query) {
+        for (float32x4_t & value : float_accum[query]) {
+            value = vdupq_n_f32(lut_biases[query]);
+        }
+    }
+
+    const size_t n_batches =
+        (n_byte_groups + kTurboVecFlushEvery - 1) / kTurboVecFlushEvery;
+    for (size_t batch = 0; batch < n_batches; ++batch) {
+        const size_t group_begin = batch * kTurboVecFlushEvery;
+        const size_t group_end =
+            std::min(group_begin + static_cast<size_t>(kTurboVecFlushEvery), n_byte_groups);
+        uint16x8_t accum[4][4];
+        for (auto & query_accum : accum) {
+            for (uint16x8_t & value : query_accum) {
+                value = vdupq_n_u16(0);
+            }
+        }
+
+        for (size_t group = group_begin; group < group_end; ++group) {
+            const uint8_t * code_group =
+                blocked_codes + block_offset + group * kTurboVecScoreBlock;
+            const uint8x16_t codes0 = vld1q_u8(code_group);
+            const uint8x16_t codes1 = vld1q_u8(code_group + 16);
+            const uint8x16_t lo0 = vandq_u8(codes0, nibble_mask);
+            const uint8x16_t lo1 = vandq_u8(codes1, nibble_mask);
+            const uint8x16_t hi0 = vshrq_n_u8(codes0, 4);
+            const uint8x16_t hi1 = vshrq_n_u8(codes1, 4);
+
+            for (int query = 0; query < 4; ++query) {
+                const uint8_t * lut_group = luts[query] + group * 32;
+                const uint8x16_t lut_hi = vld1q_u8(lut_group);
+                const uint8x16_t lut_lo = vld1q_u8(lut_group + 16);
+                const uint8x16_t values0 = vaddq_u8(
+                    vqtbl1q_u8(lut_lo, lo0),
+                    vqtbl1q_u8(lut_hi, hi0));
+                const uint8x16_t values1 = vaddq_u8(
+                    vqtbl1q_u8(lut_lo, lo1),
+                    vqtbl1q_u8(lut_hi, hi1));
+                accum[query][0] = vaddw_u8(accum[query][0], vget_low_u8(values0));
+                accum[query][1] = vaddw_u8(accum[query][1], vget_high_u8(values0));
+                accum[query][2] = vaddw_u8(accum[query][2], vget_low_u8(values1));
+                accum[query][3] = vaddw_u8(accum[query][3], vget_high_u8(values1));
+            }
+        }
+
+        for (int query = 0; query < 4; ++query) {
+            const float32x4_t scale_v = vdupq_n_f32(lut_scales[query]);
+            for (int i = 0; i < 4; ++i) {
+                const float32x4_t lo =
+                    vcvtq_f32_u32(vmovl_u16(vget_low_u16(accum[query][i])));
+                const float32x4_t hi =
+                    vcvtq_f32_u32(vmovl_u16(vget_high_u16(accum[query][i])));
+                float_accum[query][i * 2] =
+                    vfmaq_f32(float_accum[query][i * 2], scale_v, lo);
+                float_accum[query][i * 2 + 1] =
+                    vfmaq_f32(float_accum[query][i * 2 + 1], scale_v, hi);
+            }
+        }
+    }
+
+    for (int query = 0; query < 4; ++query) {
+        if (valid_lanes == kTurboVecScoreBlock) {
+            for (int i = 0; i < 8; ++i) {
+                const float32x4_t vector_scale =
+                    vld1q_f32(vector_scales + base_vector + static_cast<size_t>(i) * 4);
+                vst1q_f32(
+                    out_scores[query] + static_cast<size_t>(i) * 4,
+                    vmulq_f32(float_accum[query][i], vector_scale));
+            }
+        } else {
+            float decoded[kTurboVecScoreBlock];
+            for (int i = 0; i < 8; ++i) {
+                vst1q_f32(decoded + static_cast<size_t>(i) * 4, float_accum[query][i]);
+            }
+            for (size_t lane = 0; lane < kTurboVecScoreBlock; ++lane) {
+                out_scores[query][lane] = lane < valid_lanes ?
+                    decoded[lane] * vector_scales[base_vector + lane] :
+                    -std::numeric_limits<float>::infinity();
+            }
+        }
+    }
+#else
+    for (int query = 0; query < 4; ++query) {
+        score_turbovec_lut_block(
+            luts[query],
+            lut_scales[query],
+            lut_biases[query],
+            blocked_codes,
+            vector_scales,
+            block_index,
+            n_vectors,
+            bits,
+            dim,
+            out_scores[query]);
+    }
+#endif
+}
+
 void rotate_turbovec_query(const float * src, float * dst, int dim) {
     rotate_turbovec_queries(src, dst, 1, dim);
 }
@@ -1374,7 +1615,7 @@ void rotate_turbovec_queries(
         float * dst,
         int n_queries,
         int dim) {
-    apply_turbovec_rotation_batch(src, dst, n_queries, dim);
+    apply_turbovec_query_rotation_batch(src, dst, n_queries, dim);
 }
 
 void quantize_turbovec_batch(
@@ -1386,6 +1627,7 @@ void quantize_turbovec_batch(
         int dim,
         std::vector<float> & tqplus_shift,
         std::vector<float> & tqplus_scale) {
+    const ScopedNearestRounding rounding_guard;
     const size_t dim_sz = static_cast<size_t>(dim);
     const size_t n_sz = static_cast<size_t>(n);
     const size_t row_bytes = static_cast<size_t>(bits) * (dim_sz / 8);
