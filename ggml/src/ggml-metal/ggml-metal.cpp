@@ -687,11 +687,7 @@ static int ggml_backend_metal_default_n_cb(void) {
         return n_cb > 0 ? n_cb : 1;
     }
 
-#if defined(__APPLE__) && defined(__ENVIRONMENT_IPHONE_OS_VERSION_MIN_REQUIRED__)
-    return 2;
-#else
     return 1;
-#endif
 }
 
 ggml_backend_t ggml_backend_metal_init(void) {
