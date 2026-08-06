@@ -58,7 +58,7 @@ ggml_cuda_init: GGML_CUDA_FORCE_MMQ:    no
 ggml_cuda_init: GGML_CUDA_FORCE_CUBLAS: no
 ggml_cuda_init: found 1 CUDA devices:
   Device 0: NVIDIA GeForce RTX 5090, compute capability 12.0, VMM: yes
-Starting RPC server v3.0.0
+Starting RPC server v7.0.0
   endpoint       : 127.0.0.1:50052
   local cache    : n/a
 Devices:
@@ -82,6 +82,37 @@ $ llama-cli -hf ggml-org/gemma-3-1b-it-GGUF -ngl 99 --rpc 192.168.88.10:50052,19
 
 By default, llama.cpp distributes model weights and the KV cache across all available devices -- both local and remote -- in proportion to each device's available memory.
 You can override this behavior with the `--tensor-split` option and set custom proportions when splitting tensor data across devices.
+
+### Pipeline parallelism
+
+Protocol 7 supports asynchronous RPC transfers and events, allowing `--split-mode layer` to overlap ubatches across remote devices. The client and all servers must use protocol 7.
+
+Run one RPC server endpoint per pipeline stage. A server handles one client connection serially, so devices exposed by the same server process are not pipelined with each other.
+
+For example, start one server per GPU:
+
+```bash
+# host 1
+bin/ggml-rpc-server -H 192.168.88.10 -p 50052 --device CUDA0
+
+# host 2
+bin/ggml-rpc-server -H 192.168.88.11 -p 50052 --device CUDA0
+```
+
+Then use both endpoints in layer split mode:
+
+```bash
+llama-cli -m model.gguf \
+    --rpc 192.168.88.10:50052,192.168.88.11:50052 \
+    --device RPC0,RPC1 \
+    --split-mode layer \
+    --tensor-split 1,1 \
+    --n-gpu-layers all \
+    --batch-size 2048 \
+    --ubatch-size 256
+```
+
+Using a batch larger than the ubatch gives the scheduler enough independent work to overlap the pipeline stages.
 
 ### Local cache
 

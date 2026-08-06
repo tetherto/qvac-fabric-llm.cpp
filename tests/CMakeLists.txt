@@ -387,6 +387,11 @@ if (GGML_METAL AND NOT GGML_BACKEND_DL)
     target_include_directories(test-metal-graph-optimize PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src ${PROJECT_SOURCE_DIR}/ggml/src/ggml-metal)
 endif()
 
+if (GGML_RPC)
+    llama_build_and_test(test-rpc.cpp LINK ggml)
+    set_tests_properties(test-rpc PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
+endif()
+
 llama_build(test-backend-ops.cpp LINK ggml)
 
 llama_build_and_test(test-backend-tensor.cpp LINK ggml)
