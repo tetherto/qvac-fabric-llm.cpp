@@ -1663,9 +1663,18 @@ kernel void kernel_out_prod_q8_0_impl(
         for (int i01 = 0; i01 < args.ne01; ++i01) {
             device const char * src0_row_char = src0_base + i01*args.nb01;
             device const block_q8_0 * src0_row = (device const block_q8_0 *) src0_row_char;
-            const block_q8_0 blk = src0_row[ib];
+            // read the two needed fields through the device pointer instead of
+            // copying the whole 34-byte block per iteration: the copy made each
+            // thread pull the full block while using 3 bytes of it, defeating
+            // coalescing across the threadgroup and multiplying memory traffic
+            // ~30x. On slow-bandwidth phone GPUs the resulting command buffers
+            // exceeded the OS watchdog during finetuning backward passes
+            // (kIOGPUCommandBufferCallbackErrorHang). Same failure class the
+            // Vulkan backend already works around with tiled OUT_PROD shaders
+            // ("avoid VK_ERROR_DEVICE_LOST due to slow threads").
+            device const block_q8_0 * blk = src0_row + ib;
 
-            const float v0 = (float) blk.d * (float) blk.qs[ix];
+            const float v0 = (float) blk->d * (float) blk->qs[ix];
 
             device const src1_t * src1_row = (device const src1_t *)(src1_base + i01*args.nb11);
             const float v1 = (float) src1_row[0];
@@ -1717,11 +1726,13 @@ kernel void kernel_out_prod_q4_0_impl(
         for (int i01 = 0; i01 < args.ne01; ++i01) {
             device const char * src0_row_char = src0_base + i01*args.nb01;
             device const block_q4_0 * src0_row = (device const block_q4_0 *) src0_row_char;
-            const block_q4_0 blk = src0_row[ib];
+            // field access through the device pointer instead of a whole-block
+            // copy — see the q8_0 kernel above for the rationale.
+            device const block_q4_0 * blk = src0_row + ib;
 
-            const uint8_t q = blk.qs[iq];
+            const uint8_t q = blk->qs[iq];
             const int nibble = upper ? (q >> 4) : (q & 0x0F);
-            const float v0 = ((float) blk.d) * ((float) nibble - 8.0f);
+            const float v0 = ((float) blk->d) * ((float) nibble - 8.0f);
 
             device const src1_t * src1_row = (device const src1_t *)(src1_base + i01*args.nb11);
             const float v1 = (float) src1_row[0];
