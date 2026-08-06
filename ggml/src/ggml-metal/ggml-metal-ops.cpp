@@ -45,7 +45,7 @@ struct ggml_metal_op {
         this->dev             = dev;
         this->lib             = ggml_metal_device_get_library(dev);
         this->enc             = ggml_metal_encoder_init(cmd_buf, use_concurrency);
-        this->mem_ranges      = ggml_mem_ranges_init(debug_graph);
+        this->mem_ranges      = use_concurrency ? ggml_mem_ranges_init(debug_graph) : nullptr;
         this->finfo           = finfo;
         this->idx_start       = idx_start;
         this->idx_end         = idx_end;
