@@ -29,6 +29,7 @@
     #include <unistd.h>
     #include <sys/wait.h>
     #include <fcntl.h>
+    #include <poll.h>
 #endif
 
 #define ASYNCIO_CONCURRENCY 64
@@ -177,19 +178,41 @@ int execute_command(std::vector<std::string>& command, std::string& stdout_str, 
         close(stdout_pipe[1]);
         close(stderr_pipe[1]);
 
-        std::array<char, 128> buffer;
-        ssize_t bytes_read;
+        std::array<char, 4096> buffer;
 
-        while ((bytes_read = read(stdout_pipe[0], buffer.data(), buffer.size())) > 0) {
-            stdout_str.append(buffer.data(), bytes_read);
+        // Drain both pipes concurrently: draining them sequentially deadlocks when the
+        // child fills the not-yet-drained pipe (e.g. glslc emitting more than a pipe
+        // buffer of errors) and blocks in write(2) while we block in read(2) on the
+        // other fd, leaving the whole build hung instead of failing.
+        struct pollfd fds[2] = {
+            { stdout_pipe[0], POLLIN, 0 },
+            { stderr_pipe[0], POLLIN, 0 },
+        };
+        std::string * sinks[2] = { &stdout_str, &stderr_str };
+        int open_fds = 2;
+        while (open_fds > 0) {
+            if (poll(fds, 2, -1) < 0) {
+                if (errno == EINTR) {
+                    continue;
+                }
+                break;
+            }
+            for (int i = 0; i < 2; ++i) {
+                if (fds[i].fd < 0 || !(fds[i].revents & (POLLIN | POLLHUP | POLLERR))) {
+                    continue;
+                }
+                ssize_t bytes_read = read(fds[i].fd, buffer.data(), buffer.size());
+                if (bytes_read > 0) {
+                    sinks[i]->append(buffer.data(), bytes_read);
+                } else {
+                    close(fds[i].fd);
+                    fds[i].fd = -1;
+                    open_fds--;
+                }
+            }
         }
-
-        while ((bytes_read = read(stderr_pipe[0], buffer.data(), buffer.size())) > 0) {
-            stderr_str.append(buffer.data(), bytes_read);
-        }
-
-        close(stdout_pipe[0]);
-        close(stderr_pipe[0]);
+        if (fds[0].fd >= 0) close(fds[0].fd);
+        if (fds[1].fd >= 0) close(fds[1].fd);
         int status = 0;
         waitpid(pid, &status, 0);
         return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
