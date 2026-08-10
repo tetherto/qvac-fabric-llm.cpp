@@ -1137,6 +1137,21 @@ bool ggml_backend_buffer_is_multi_buffer(ggml_backend_buffer_t buffer) {
     return buffer->iface.free_buffer == ggml_backend_multi_buffer_free_buffer;
 }
 
+ggml_backend_buffer_t ggml_backend_multi_buffer_get_buffer(ggml_backend_buffer_t buffer, const void * addr) {
+    GGML_ASSERT(ggml_backend_buffer_is_multi_buffer(buffer));
+    ggml_backend_multi_buffer_context * ctx = (ggml_backend_multi_buffer_context *) buffer->context;
+    const uintptr_t address = (uintptr_t) addr;
+    for (size_t i = 0; i < ctx->n_buffers; i++) {
+        ggml_backend_buffer_t sub  = ctx->buffers[i];
+        const uintptr_t       base = (uintptr_t) ggml_backend_buffer_get_base(sub);
+        const size_t          size = ggml_backend_buffer_get_size(sub);
+        if (address >= base && address - base < size) {
+            return sub;
+        }
+    }
+    return NULL;
+}
+
 void ggml_backend_multi_buffer_set_usage(ggml_backend_buffer_t buffer, enum ggml_backend_buffer_usage usage) {
     GGML_ASSERT(buffer);
     GGML_ASSERT(ggml_backend_buffer_is_multi_buffer(buffer));
