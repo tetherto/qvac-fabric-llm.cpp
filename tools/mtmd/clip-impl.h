@@ -1085,7 +1085,10 @@ static std::string string_format(const char * fmt, ...) {
     GGML_ASSERT(size2 == size);
     va_end(ap2);
     va_end(ap);
-    return std::string(buf.data(), buf.size());
+    // `size`, not `buf.size()`: the buffer holds the terminating NUL and including it puts a
+    // real byte inside the string, which anything measuring by length() then passes on. The
+    // ordinal image label went to the tokenizer as one byte too long because of this.
+    return std::string(buf.data(), size);
 }
 
 static void string_replace_all(std::string & s, const std::string & search, const std::string & replace) {

@@ -90,7 +90,9 @@ add_test_audio() {
 add_test_vision "ggml-org/SmolVLM-500M-Instruct-GGUF:Q8_0"
 add_test_vision "ggml-org/SmolVLM2-2.2B-Instruct-GGUF:Q4_K_M"
 add_test_vision "ggml-org/SmolVLM2-500M-Video-Instruct-GGUF:Q8_0"
-add_test_vision "qvac/VisionPsy-Nano-460M-GGUFs:Q8_0"
+# Passed the same image twice, because the `<image: N>` ordinal labels are only emitted when a
+# prompt carries more than one image, and nothing else in this file exercises that path.
+add_test_vision "qvac/VisionPsy-Nano-460M-GGUFs:Q8_0" --image "$SCRIPT_DIR/test-1.jpeg"
 # Flash is the same architecture with the no-upscale preprocessing rule; the published mmproj
 # does not carry the key yet, so the flag is what selects it.
 add_test_vision "qvac/VisionPsy-Nano-460M-Flash-GGUFs:Q8_0" --image-no-upscale on

@@ -134,13 +134,18 @@ struct img_tool {
             const float q = x / static_cast<float>(f);
             return static_cast<int>(even ? std::nearbyint(q) : std::round(q)) * f;
         };
-        auto ceil_by_factor  = [f = opts.align_size](float x) { return static_cast<int>(std::ceil(x / static_cast<float>(f))) * f; };
+        auto ceil_by_factor  = [f = opts.align_size](double x) { return static_cast<int>(std::ceil(x / static_cast<double>(f))) * f; };
         auto floor_by_factor = [f = opts.align_size](float x) { return static_cast<int>(std::floor(x / static_cast<float>(f))) * f; };
 
         int w_bar, h_bar;
         if (opts.longest_edge > 0) {
-            const float scale = std::min(static_cast<float>(opts.longest_edge) / width,
-                                          static_cast<float>(opts.longest_edge) / height);
+            // double, not float: the reference processors do this in Python floats, and where the
+            // true product lands on a multiple of align_size, float32 rounding pushes it just past
+            // and the ceil buys a whole extra row or column of slices. 960x720 at align 512 and
+            // longest_edge 2048 is the common case: 1536 in double, 2048 in float32, so a 4x3 grid
+            // becomes 4x4 and the image gains 4 slices the reference never emits.
+            const double scale = std::min(static_cast<double>(opts.longest_edge) / width,
+                                          static_cast<double>(opts.longest_edge) / height);
             w_bar = ceil_by_factor(width  * scale);
             h_bar = ceil_by_factor(height * scale);
         } else {

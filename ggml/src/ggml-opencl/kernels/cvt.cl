@@ -1958,6 +1958,12 @@ kernel void kernel_restore_block_q8_0_trans(
     uint ne00,
     uint ne01
 ){
+    // One work item per row, and callers round the dispatch up to the work-group size, so the
+    // tail items have no row to restore. Without this they write past the end of dst.
+    if (get_global_id(0) >= ne01) {
+        return;
+    }
+
     uint num_blk_per_row = ne00 / QK8_0;
 
     global block_q8_0 * b = (global block_q8_0 *) dst + get_global_id(0) * num_blk_per_row;
