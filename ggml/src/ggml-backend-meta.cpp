@@ -790,6 +790,7 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
         const bool kv_mirrored = src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED &&
                 src_ss[2].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED;
         GGML_ASSERT(kv_split || kv_mirrored);
+        GGML_ASSERT(!kv_mirrored || (tensor->src[1]->ne[2] == 1 && tensor->src[2]->ne[2] == 1));
         GGML_ASSERT(tensor->src[4] == nullptr || src_ss[4].axis == GGML_BACKEND_SPLIT_AXIS_0);
         return {GGML_BACKEND_SPLIT_AXIS_1, {0}, {1}, 1};
     };
@@ -1283,12 +1284,16 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_m
                 t_ij->buffer = t_ij->view_src->buffer;
                 init_buf     = t_ij->view_src->buffer;
             }
-        } else if (simple_buf != nullptr) {
-            if (ggml_backend_buffer_is_multi_buffer(simple_buf)) {
-                GGML_ABORT("multi buffers are not supported by the meta backend");
-            }
+        } else if (simple_buf != nullptr && !ggml_backend_buffer_is_multi_buffer(simple_buf)) {
             t_ij->data = (char *) ggml_backend_buffer_get_base(simple_buf)
                 + size_t(tensor->data) - size_t(ggml_backend_buffer_get_base(tensor->buffer));
+        }
+        if (t_ij->buffer != nullptr && t_ij->data != nullptr
+                && ggml_backend_buffer_is_multi_buffer(t_ij->buffer)) {
+            ggml_backend_buffer_t sub = ggml_backend_multi_buffer_get_buffer(t_ij->buffer, t_ij->data);
+            if (sub != nullptr) {
+                t_ij->buffer = sub;
+            }
         }
 
         if (init_buf) {
@@ -1297,6 +1302,7 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_m
         } else {
             t_ij->extra = tensor->extra;
         }
+
 
         for (int i = 0; i < GGML_MAX_SRC; i++) {
             t_ij->src[i] = tensor->src[i];

@@ -1514,9 +1514,15 @@ struct ggml_backend_vk_context {
     // True when the K dimension in prealloc_y is padded.
     bool prealloc_y_last_k_padded {};
 
-    // Track which nodes have been used since the last sync, and whether they were written to
-    std::vector<const ggml_tensor *> unsynced_nodes_written;
-    std::vector<const ggml_tensor *> unsynced_nodes_read;
+    struct buffer_range {
+        vk_buffer buffer;
+        size_t base;
+        size_t size;
+    };
+
+    // Track which buffer ranges have been used since the last sync, and whether they were written to.
+    std::vector<buffer_range> unsynced_nodes_written;
+    std::vector<buffer_range> unsynced_nodes_read;
     // Track which prealloc buffers have pending reads that need to be synchronized.
     // These are checked before writing to the buffer (and call ggml_vk_sync_buffers if set),
     // and set to true after the buffer contents are consumed.

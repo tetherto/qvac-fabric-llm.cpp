@@ -14201,23 +14201,23 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
         // Destination nodes are checked against both the written/read lists. Source nodes are only
         // checked against the written list. Two nodes overlap in memory if they come from the same
         // buffer and the tensor or view ranges overlap.
-        auto const &overlaps_unsynced = [&](const ggml_tensor *node, const std::vector<const ggml_tensor *> &unsynced_nodes) -> bool {
+        auto const &get_buffer_range = [](const ggml_tensor * node) {
+            ggml_backend_vk_buffer_context * buf_ctx = (ggml_backend_vk_buffer_context *) node->buffer->context;
+            return ggml_backend_vk_context::buffer_range {
+                buf_ctx->dev_buffer,
+                vk_tensor_offset(node) + node->view_offs,
+                ggml_nbytes(node),
+            };
+        };
+        auto const &overlaps_unsynced = [&](const ggml_tensor * node, const std::vector<ggml_backend_vk_context::buffer_range> & unsynced_nodes) {
             if (unsynced_nodes.size() == 0) {
                 return false;
             }
-            auto n_base = vk_tensor_offset(node) + node->view_offs;
-            auto n_size = ggml_nbytes(node);
-            ggml_backend_vk_buffer_context * a_buf_ctx = (ggml_backend_vk_buffer_context *)node->buffer->context;
-            vk_buffer a_buf = a_buf_ctx->dev_buffer;
-            for (auto &other : unsynced_nodes) {
-                ggml_backend_vk_buffer_context * o_buf_ctx = (ggml_backend_vk_buffer_context *)other->buffer->context;
-                vk_buffer o_buf = o_buf_ctx->dev_buffer;
-                if (a_buf == o_buf) {
-                    auto o_base = vk_tensor_offset(other) + other->view_offs;
-                    auto o_size = ggml_nbytes(other);
-
-                    if ((o_base <= n_base && n_base < o_base + o_size) ||
-                        (n_base <= o_base && o_base < n_base + n_size)) {
+            const auto range = get_buffer_range(node);
+            for (const auto & other : unsynced_nodes) {
+                if (range.buffer == other.buffer) {
+                    if ((other.base <= range.base && range.base < other.base + other.size) ||
+                        (range.base <= other.base && other.base < range.base + range.size)) {
                         return true;
                     }
                 }
@@ -14266,13 +14266,13 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
             const ggml_tensor *cur_node = cgraph->nodes[node_idx + i];
             // Multiple outputs could be written, e.g. in topk_moe. Add them all to the list.
             if (ctx->fused_ops_write_mask & (1 << i)) {
-                ctx->unsynced_nodes_written.push_back(cur_node);
+                ctx->unsynced_nodes_written.push_back(get_buffer_range(cur_node));
             }
             for (uint32_t j = 0; j < GGML_MAX_SRC; ++j) {
                 if (!cur_node->src[j]) {
                     continue;
                 }
-                ctx->unsynced_nodes_read.push_back(cur_node->src[j]);
+                ctx->unsynced_nodes_read.push_back(get_buffer_range(cur_node->src[j]));
             }
         }
     }
@@ -15263,11 +15263,36 @@ static void ggml_backend_vk_get_tensor_2d_async(ggml_backend_t backend, const gg
 
     ggml_backend_vk_buffer_context * buf_ctx = (ggml_backend_vk_buffer_context *)tensor->buffer->context;
 
+    ggml_vk_submit_transfer_ctx(ctx);
     vk_context compute_ctx = ggml_vk_get_compute_ctx(ctx);
 
     vk_buffer buf = buf_ctx->dev_buffer;
 
     auto src_offset = vk_tensor_offset(tensor) + tensor->view_offs + offset;
+    if (buf->memory_property_flags & vk::MemoryPropertyFlagBits::eHostVisible && buf->device->uma) {
+        GGML_ASSERT(buf->memory_property_flags & vk::MemoryPropertyFlagBits::eHostCoherent);
+
+        compute_ctx->s->buffer->buf.pipelineBarrier(
+            vk::PipelineStageFlagBits::eComputeShader | vk::PipelineStageFlagBits::eTransfer,
+            vk::PipelineStageFlagBits::eHost,
+            {},
+            { { vk::AccessFlagBits::eShaderWrite | vk::AccessFlagBits::eTransferWrite,
+                vk::AccessFlagBits::eHostRead } },
+            {}, {});
+
+        if (size == stride_tensor && size == stride_data) {
+            deferred_memcpy(data, (const uint8_t *) buf->info.pMappedData + src_offset, size * n_copies,
+                            &compute_ctx->out_memcpys);
+        } else {
+            for (size_t i = 0; i < n_copies; i++) {
+                deferred_memcpy((uint8_t *) data + i * stride_data,
+                                (const uint8_t *) buf->info.pMappedData + src_offset + i * stride_tensor,
+                                size, &compute_ctx->out_memcpys);
+            }
+        }
+        return;
+    }
+
     bool ret = ggml_vk_buffer_read_2d_async(compute_ctx, buf, src_offset, data, stride_tensor, stride_data, size, n_copies);
 
     if (!ret) {
