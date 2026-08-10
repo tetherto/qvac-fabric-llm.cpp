@@ -430,6 +430,19 @@ if (LLAMA_MTMD)
     # QVAC-21914: clip flash-attention AUTO budget arithmetic (pure CPU).
     llama_build_and_test(test-clip-fa-cutoff.cpp LINK mtmd)
     target_include_directories(test-clip-fa-cutoff PRIVATE ${PROJECT_SOURCE_DIR}/tools/mtmd)
+
+    # QVAC-23075: idefics3-family refined size and slice grid against the reference rule
+    # (pure CPU, no model).
+    llama_build_and_test(test-mtmd-preproc-sizing.cpp LINK mtmd)
+    target_include_directories(test-mtmd-preproc-sizing PRIVATE ${PROJECT_SOURCE_DIR}/tools/mtmd)
+
+    # QVAC-23075: legacy projector alias resolution, which must stay gated on general.name.
+    llama_build_and_test(test-clip-projector-alias.cpp LINK mtmd)
+    target_include_directories(test-clip-projector-alias PRIVATE ${PROJECT_SOURCE_DIR}/tools/mtmd)
+
+    # QVAC-23075: preprocessing metadata rejected at load, on generated metadata-only mmprojs.
+    llama_build_and_test(test-clip-preproc-metadata.cpp LINK mtmd)
+    target_include_directories(test-clip-preproc-metadata PRIVATE ${PROJECT_SOURCE_DIR}/tools/mtmd)
 endif()
 
 llama_build_and_test(test-mtmd-impl.cpp  LABEL behavior  LINK mtmd)

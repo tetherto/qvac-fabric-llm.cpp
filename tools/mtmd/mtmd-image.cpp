@@ -134,13 +134,18 @@ struct img_tool {
             const float q = x / static_cast<float>(f);
             return static_cast<int>(even ? std::nearbyint(q) : std::round(q)) * f;
         };
-        auto ceil_by_factor  = [f = opts.align_size](float x) { return static_cast<int>(std::ceil(x / static_cast<float>(f))) * f; };
+        auto ceil_by_factor  = [f = opts.align_size](double x) { return static_cast<int>(std::ceil(x / static_cast<double>(f))) * f; };
         auto floor_by_factor = [f = opts.align_size](float x) { return static_cast<int>(std::floor(x / static_cast<float>(f))) * f; };
 
         int w_bar, h_bar;
         if (opts.longest_edge > 0) {
-            const float scale = std::min(static_cast<float>(opts.longest_edge) / width,
-                                          static_cast<float>(opts.longest_edge) / height);
+            // double, not float: the reference processors do this in Python floats, and where the
+            // true product lands on a multiple of align_size, float32 rounding pushes it just past
+            // and the ceil buys a whole extra row or column of slices. 960x720 at align 512 and
+            // longest_edge 2048 is the common case: 1536 in double, 2048 in float32, so a 4x3 grid
+            // becomes 4x4 and the image gains 4 slices the reference never emits.
+            const double scale = std::min(static_cast<double>(opts.longest_edge) / width,
+                                          static_cast<double>(opts.longest_edge) / height);
             w_bar = ceil_by_factor(width  * scale);
             h_bar = ceil_by_factor(height * scale);
         } else {
@@ -1408,17 +1413,37 @@ static mtmd_image_size calc_size_no_upscale(const mtmd_image_size & inp_size, in
         : mtmd_image_size{(int) target_short, (int) target_long};
 }
 
+// The refined size has two steps:
+// 1. Resize w/ aspect-ratio preserving such that the longer side is
+//      the preprocessor longest size
+// 2. Resize w/out preserving aspect ratio such that both sides are
+//      multiples of image_size (always rounding up)
+//
+// CITE: https://github.com/huggingface/transformers/blob/main/src/transformers/models/idefics3/image_processing_idefics3.py#L737
+//
+// no_upscale replaces step 1 only; step 2 is shared, so both variants land on a
+// multiple of image_size in each dimension.
+mtmd_idefics3_sizing mtmd_calc_idefics3_sizing(const mtmd_image_size & original_size,
+                                               int image_size,
+                                               int image_longest_edge,
+                                               bool no_upscale,
+                                               int min_pixels,
+                                               int max_pixels) {
+    mtmd_idefics3_sizing out;
+    out.refined_size = no_upscale
+        ? calc_size_no_upscale(original_size, image_size, image_longest_edge)
+        : img_tool::calc_size_preserved_ratio(
+            original_size,
+            { image_size, std::max(0, min_pixels), std::max(0, max_pixels), image_longest_edge });
+    out.grid_size = mtmd_image_size{
+        static_cast<int>(std::ceil(static_cast<float>(out.refined_size.width) / image_size)),
+        static_cast<int>(std::ceil(static_cast<float>(out.refined_size.height) / image_size)),
+    };
+    out.n_slices = out.grid_size.width * out.grid_size.height;
+    return out;
+}
+
 mtmd_image_preproc_out mtmd_image_preprocessor_idefics3::preprocess(const mtmd_image_u8 & img) const {
-    // The refined size has two steps:
-    // 1. Resize w/ aspect-ratio preserving such that the longer side is
-    //      the preprocessor longest size
-    // 2. Resize w/out preserving aspect ratio such that both sides are
-    //      multiples of image_size (always rounding up)
-    //
-    // CITE: https://github.com/huggingface/transformers/blob/main/src/transformers/models/idefics3/image_processing_idefics3.py#L737
-    //
-    // no_upscale replaces step 1 only; step 2 is shared, so both variants land on a
-    // multiple of image_size in each dimension.
     const mtmd_image_size original_size = img.get_size();
 
     // old gguf files have no preprocessor longest size, custom token limits also need the generic size below
@@ -1470,21 +1495,17 @@ mtmd_image_preproc_out mtmd_image_preprocessor_idefics3::preprocess(const mtmd_i
         return output;
     }
 
-    const mtmd_image_size refined_size = hparams.image_no_upscale
-        ? calc_size_no_upscale(original_size, hparams.image_size, hparams.image_longest_edge)
-        : img_tool::calc_size_preserved_ratio(
-            original_size,
-            { hparams.image_size, std::max(0, hparams.image_min_pixels), std::max(0, hparams.image_max_pixels), hparams.image_longest_edge });
+    const mtmd_idefics3_sizing sizing = mtmd_calc_idefics3_sizing(
+        original_size, hparams.image_size, hparams.image_longest_edge, hparams.image_no_upscale,
+        hparams.image_min_pixels, hparams.image_max_pixels);
+    const mtmd_image_size refined_size = sizing.refined_size;
     // LOG_INF("%s: original size: %d x %d, refined size: %d x %d\n",
     //         __func__, original_size.width, original_size.height,
     //         refined_size.width, refined_size.height);
 
     mtmd_image_preprocessor_llava_uhd::slice_instructions instructions;
     instructions.refined_size = refined_size;
-    instructions.grid_size = mtmd_image_size{
-        static_cast<int>(std::ceil(static_cast<float>(refined_size.width) / hparams.image_size)),
-        static_cast<int>(std::ceil(static_cast<float>(refined_size.height) / hparams.image_size)),
-    };
+    instructions.grid_size = sizing.grid_size;
     // Square, in both variants: the reference resizes the global image to (p, p) regardless
     // of no_upscale (GlobalAndSplitImages in custom_transforms.py).
     instructions.overview_size = mtmd_image_size{hparams.image_size, hparams.image_size};
