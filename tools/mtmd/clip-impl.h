@@ -64,6 +64,7 @@ constexpr int CLIP_PREPROC_MAX_TILES_LIMIT = 256;
 #define KEY_PREPROC_IMAGE_SIZE      "clip.vision.preproc_image_size"
 #define KEY_PREPROC_TILE_SIZE       "clip.vision.preproc_tile_size"
 #define KEY_PREPROC_MAX_PIXELS_TOLERANCE "clip.vision.preproc_max_pixels_tolerance"
+#define KEY_PREPROC_NO_UPSCALE      "clip.vision.preproc_no_upscale"
 #define KEY_PATCH_SIZE              "clip.vision.patch_size"
 #define KEY_IMAGE_MEAN              "clip.vision.image_mean"
 #define KEY_IMAGE_STD               "clip.vision.image_std"
@@ -527,6 +528,7 @@ enum projector_type {
     PROJECTOR_TYPE_GEMMA4UA,
     PROJECTOR_TYPE_PHI4,
     PROJECTOR_TYPE_IDEFICS3,
+    PROJECTOR_TYPE_VISIONPSY,
     PROJECTOR_TYPE_PIXTRAL,
     PROJECTOR_TYPE_QWEN25VL,
     PROJECTOR_TYPE_ULTRAVOX,
@@ -609,6 +611,7 @@ static std::map<projector_type, std::string> PROJECTOR_TYPE_NAMES = {
     { PROJECTOR_TYPE_GEMMA4UA,          "gemma4ua"},
     { PROJECTOR_TYPE_PHI4,              "phi4"},
     { PROJECTOR_TYPE_IDEFICS3,          "idefics3"},
+    { PROJECTOR_TYPE_VISIONPSY,         "visionpsy"},
     { PROJECTOR_TYPE_PIXTRAL,           "pixtral"},
     { PROJECTOR_TYPE_ULTRAVOX,          "ultravox"},
     { PROJECTOR_TYPE_INTERNVL,          "internvl"},
@@ -669,10 +672,37 @@ static std::map<projector_type, std::string> PROJECTOR_TYPE_NAMES = {
     { PROJECTOR_TYPE_MUSE_SPARK_AUDIO,  "muse-spark-audio"},
 };
 
+// Legacy clip.projector_type strings kept loadable. Only for reading: the names in
+// PROJECTOR_TYPE_NAMES stay canonical and are what we write out.
+// Every alias is gated on general.name, because these strings are not vendor-specific:
+// "custom" is what the first published VisionPsy Nano mmproj GGUFs declare, and another
+// model shipping the same string must not be silently loaded as VisionPsy (it would get
+// idefics3 preprocessing and a hard <|global_image|> vocab requirement).
+struct clip_projector_alias {
+    const char *   proj_type;
+    const char *   model_name; // required general.name
+    projector_type type;
+};
+
+static const std::vector<clip_projector_alias> PROJECTOR_TYPE_ALIASES = {
+    { "custom", "VisionPsyNano", PROJECTOR_TYPE_VISIONPSY },
+};
+
 static projector_type clip_projector_type_from_string(const std::string & str) {
     for (const auto & pair : PROJECTOR_TYPE_NAMES) {
         if (pair.second == str) {
             return pair.first;
+        }
+    }
+    return PROJECTOR_TYPE_UNKNOWN;
+}
+
+// Resolve a legacy alias. Returns UNKNOWN unless both the projector string and
+// general.name match, see PROJECTOR_TYPE_ALIASES.
+static projector_type clip_projector_type_from_alias(const std::string & str, const std::string & model_name) {
+    for (const auto & alias : PROJECTOR_TYPE_ALIASES) {
+        if (str == alias.proj_type && model_name == alias.model_name) {
+            return alias.type;
         }
     }
     return PROJECTOR_TYPE_UNKNOWN;

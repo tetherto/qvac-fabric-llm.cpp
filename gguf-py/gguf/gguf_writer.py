@@ -1531,6 +1531,9 @@ class GGUFWriter:
     def add_vision_preproc_max_pixels_tolerance(self, value: float) -> None:
         self.add_float32(Keys.ClipVision.PREPROC_MAX_PIXELS_TOLERANCE, value)
 
+    def add_vision_preproc_no_upscale(self, value: bool) -> None:
+        self.add_bool(Keys.ClipVision.PREPROC_NO_UPSCALE, value)
+
     def add_vision_projector_query_side(self, value: int) -> None:
         self.add_uint32(Keys.ClipVision.Projector.QUERY_SIDE, value)
 

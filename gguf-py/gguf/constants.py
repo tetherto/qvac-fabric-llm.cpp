@@ -445,6 +445,7 @@ class Keys:
         PREPROC_IMAGE_SIZE    = "clip.vision.preproc_image_size"
         PREPROC_TILE_SIZE     = "clip.vision.preproc_tile_size"
         PREPROC_MAX_PIXELS_TOLERANCE = "clip.vision.preproc_max_pixels_tolerance"
+        PREPROC_NO_UPSCALE    = "clip.vision.preproc_no_upscale"
         PATCH_SIZE            = "clip.vision.patch_size"
         EMBEDDING_LENGTH      = "clip.vision.embedding_length"
         FEED_FORWARD_LENGTH   = "clip.vision.feed_forward_length"
@@ -6654,6 +6655,7 @@ class VisionProjectorType:
     GEMMA4UA = "gemma4ua" # "unified" variant
     PHI4 = "phi4"
     IDEFICS3 = "idefics3"
+    VISIONPSY = "visionpsy"
     PIXTRAL = "pixtral"
     LLAMA4 = "llama4"
     QWEN2VL = "qwen2vl_merger"

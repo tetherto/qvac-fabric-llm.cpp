@@ -90,6 +90,10 @@ add_test_audio() {
 add_test_vision "ggml-org/SmolVLM-500M-Instruct-GGUF:Q8_0"
 add_test_vision "ggml-org/SmolVLM2-2.2B-Instruct-GGUF:Q4_K_M"
 add_test_vision "ggml-org/SmolVLM2-500M-Video-Instruct-GGUF:Q8_0"
+add_test_vision "qvac/VisionPsy-Nano-460M-GGUFs:Q8_0"
+# Flash is the same architecture with the no-upscale preprocessing rule; the published mmproj
+# does not carry the key yet, so the flag is what selects it.
+add_test_vision "qvac/VisionPsy-Nano-460M-Flash-GGUFs:Q8_0" --image-no-upscale on
 add_test_vision "ggml-org/gemma-3-4b-it-GGUF:Q4_K_M"
 add_test_vision "THUDM/glm-edge-v-5b-gguf:Q4_K_M" -p "name of the newspaper?<__media__>"
 add_test_vision "second-state/Llava-v1.5-7B-GGUF:Q2_K" --chat-template vicuna

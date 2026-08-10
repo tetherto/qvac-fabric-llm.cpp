@@ -1329,6 +1329,61 @@ clip_image_size mtmd_image_preprocessor_lfm2::get_grid_layout(const clip_hparams
 // mtmd_image_preprocessor_idefics3
 //
 
+// Sizing rule for the no-upscale variant, a direct port of DynamicResize._get_new_hw() with
+// resize_to_max_side_len=False from the reference processor. `p` is the slice size
+// (vit_img_size) and `m` the cap (max_img_size); the reference's min_side_len is
+// FLASH_MIN_SIDE_LEN, which is the same 512 as vit_img_size, so it is not a separate knob.
+//
+// CITE: https://huggingface.co/qvac/VisionPsy-Nano-460M-Flash/blob/main/custom_transforms.py
+//
+// Note both branches return multiples of `p`, exactly like the upscaling path: the reference
+// splitter hard-errors on anything else. So this changes HOW MANY slices an image becomes,
+// never their size.
+static clip_image_size calc_size_no_upscale(const clip_image_size & inp_size, int p, int m) {
+    GGML_ASSERT(p > 0 && m > 0);
+    if (inp_size.width <= 0 || inp_size.height <= 0) {
+        return {0, 0};
+    }
+    // integer ceil, mirroring the reference's -(-a // b). Stays in int64_t all the way
+    // through the multiply-back-by-p: an extreme aspect ratio (e.g. a very wide, very
+    // thin image) can push that product past INT32_MAX, which would silently wrap
+    // negative in 32-bit arithmetic and defeat the std::min/std::max clamps below.
+    auto ceil_div = [](int64_t a, int64_t b) { return (a + b - 1) / b; };
+
+    const int64_t long_side  = std::max(inp_size.width, inp_size.height);
+    const int64_t short_side = std::min(inp_size.width, inp_size.height);
+    const int64_t p64 = p;
+    const int64_t m64 = m;
+
+    int64_t target_long;
+    int64_t target_short;
+    if (short_side < p64) {
+        // Short side below one slice: pin it to exactly p and give the long side however many
+        // whole slices the aspect ratio asks for. This is the one case that DOES enlarge.
+        const int64_t den = short_side * p64;
+        target_long  = std::min(m64, ceil_div(long_side * p64, den) * p64);
+        target_short = std::max(ceil_div(short_side * p64, den) * p64, p64);
+    } else {
+        target_long = std::min(m64, ceil_div(long_side, p64) * p64);
+        // double, not float, and deliberately not exact integer arithmetic: the reference is
+        // `math.ceil(short * scale / p)` on Python floats, and its rounding is part of the
+        // rule the model was trained under. Where the true quotient lands on an integer the
+        // three disagree by a whole slice row. Over every size pair up to 3000x3000, float32
+        // differs from the reference in 171 cases and exact integers in 92; double in none.
+        const double scale = (double) target_long / (double) long_side;
+        target_short       = std::max((int64_t) std::ceil((double) short_side * scale / (double) p64) * p64, p64);
+    }
+
+    // Defensive clamp: both branches are designed to land in [p, m], but this guards the
+    // narrowing cast below against ever producing a value outside that range.
+    target_long  = std::clamp(target_long, p64, m64);
+    target_short = std::clamp(target_short, p64, m64);
+
+    return inp_size.width >= inp_size.height
+        ? clip_image_size{(int) target_long, (int) target_short}
+        : clip_image_size{(int) target_short, (int) target_long};
+}
+
 mtmd_image_preproc_out mtmd_image_preprocessor_idefics3::preprocess(const clip_image_u8 & img) const {
     // The refined size has two steps:
     // 1. Resize w/ aspect-ratio preserving such that the longer side is
@@ -1337,6 +1392,9 @@ mtmd_image_preproc_out mtmd_image_preprocessor_idefics3::preprocess(const clip_i
     //      multiples of image_size (always rounding up)
     //
     // CITE: https://github.com/huggingface/transformers/blob/main/src/transformers/models/idefics3/image_processing_idefics3.py#L737
+    //
+    // no_upscale replaces step 1 only; step 2 is shared, so both variants land on a
+    // multiple of image_size in each dimension.
     const clip_image_size original_size = img.get_size();
 
     // old gguf files have no preprocessor longest size, custom token limits also need the generic size below
@@ -1388,20 +1446,24 @@ mtmd_image_preproc_out mtmd_image_preprocessor_idefics3::preprocess(const clip_i
         return output;
     }
 
-    const clip_image_size refined_size = img_tool::calc_size_preserved_ratio(
-        original_size,
-        { hparams.image_size, std::max(0, hparams.image_min_pixels), std::max(0, hparams.image_max_pixels), hparams.image_longest_edge });
+    const clip_image_size refined_size = hparams.image_no_upscale
+        ? calc_size_no_upscale(original_size, hparams.image_size, hparams.image_longest_edge)
+        : img_tool::calc_size_preserved_ratio(
+            original_size,
+            { hparams.image_size, std::max(0, hparams.image_min_pixels), std::max(0, hparams.image_max_pixels), hparams.image_longest_edge });
     // LOG_INF("%s: original size: %d x %d, refined size: %d x %d\n",
     //         __func__, original_size.width, original_size.height,
     //         refined_size.width, refined_size.height);
 
     mtmd_image_preprocessor_llava_uhd::slice_instructions instructions;
-    instructions.overview_size = clip_image_size{hparams.image_size, hparams.image_size};
     instructions.refined_size = refined_size;
     instructions.grid_size = clip_image_size{
         static_cast<int>(std::ceil(static_cast<float>(refined_size.width) / hparams.image_size)),
         static_cast<int>(std::ceil(static_cast<float>(refined_size.height) / hparams.image_size)),
     };
+    // Square, in both variants: the reference resizes the global image to (p, p) regardless
+    // of no_upscale (GlobalAndSplitImages in custom_transforms.py).
+    instructions.overview_size = clip_image_size{hparams.image_size, hparams.image_size};
     for (int y = 0; y < refined_size.height; y += hparams.image_size) {
         for (int x = 0; x < refined_size.width; x += hparams.image_size) {
             // LOG_INF("%s: adding slice at x=%d, y=%d\n", __func__, x, y);

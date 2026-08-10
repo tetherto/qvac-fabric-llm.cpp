@@ -80,6 +80,12 @@ struct clip_context_params {
     const char * backend_device; // optional, if null will use env var or default GPU backend
     int image_tile_mode;   // 0=batched, 1=sequential (default), 2=disabled. NOTE: 0 (batched) is the zero value but NOT the default — init via mtmd_context_params_default() or set explicitly.
     int image_max_tiles;   // override preproc_max_tiles; -1 or 0 = use GGUF/model default (only a positive value overrides)
+    // override preproc_no_upscale (idefics3-style preprocessing); -1 = use GGUF/model
+    // default, 0 = off, 1 = on. WARNING: a zero-initialized struct lands on 0 (off), not
+    // -1 (model default), the one case that silently forces base-style preprocessing
+    // on a Flash-style model. Do not rely on zero-init: use mtmd_context_params_default()
+    // or set this field explicitly.
+    int image_no_upscale;
 };
 
 struct clip_init_result {

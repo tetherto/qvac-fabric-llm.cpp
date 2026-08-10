@@ -2664,6 +2664,24 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples(mmproj_examples).set_env("LLAMA_ARG_IMAGE_MAX_TILES"));
     add_opt(common_arg(
+        {"--image-no-upscale"}, "on|off",
+        "in idefics3-style preprocessing, round an image's long side up to a whole number of\n"
+        "slices and cap it, instead of always stretching it to the cap; overrides the value\n"
+        "from the GGUF. Small images then stay small and become far fewer slices. This is\n"
+        "what separates the VisionPsy Flash checkpoint from the base one, whose mmprojs are\n"
+        "otherwise indistinguishable, so a Flash checkpoint run without it is silently\n"
+        "running base preprocessing",
+        [](common_params & params, const std::string & value) {
+            if (is_truthy(value)) {
+                params.image_no_upscale = 1;
+            } else if (is_falsey(value)) {
+                params.image_no_upscale = 0;
+            } else {
+                throw std::invalid_argument("unknown --image-no-upscale: " + value + " (use on or off)");
+            }
+        }
+    ).set_examples(mmproj_examples).set_env("LLAMA_ARG_IMAGE_NO_UPSCALE"));
+    add_opt(common_arg(
         {"--rpc"}, "SERVERS",
         "comma-separated list of RPC servers (host:port)",
         [](common_params & params, const std::string & value) {

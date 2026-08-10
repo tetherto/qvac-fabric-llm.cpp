@@ -621,6 +621,7 @@ struct common_params {
     common_image_tile_mode image_tile_mode = COMMON_IMAGE_TILE_MODE_SEQUENTIAL;
     int mtmd_batch_max_tokens = 1024;
     int image_max_tiles = -1;  // override preproc_max_tiles from GGUF; -1 = use model default
+    int image_no_upscale = -1; // override preproc_no_upscale from GGUF; -1 = use model default, 0 = off, 1 = on
 
     // for video input
     float       video_fps                   = 4.0f;

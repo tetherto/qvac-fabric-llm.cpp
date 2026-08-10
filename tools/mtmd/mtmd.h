@@ -146,6 +146,13 @@ struct mtmd_context_params {
     // keeps the model default instead of forcing single-tile.
     // needed for 8B+ models whose GGUFs may lack the clip.vision.preproc_max_tiles key
     int image_max_tiles;
+
+    // override clip.vision.preproc_no_upscale for idefics3-style preprocessing:
+    // -1 = use the GGUF/model default, 0 = force off, 1 = force on.
+    // On: the long side is rounded up to a whole number of slices and capped, rather
+    // than always stretched to the cap. Changes the number of output tokens, so a
+    // checkpoint whose GGUF omits the key needs this set to preprocess correctly.
+    int image_no_upscale;
 };
 
 MTMD_API const char * mtmd_default_marker(void);

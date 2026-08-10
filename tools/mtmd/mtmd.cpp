@@ -558,6 +558,7 @@ mtmd_context_params mtmd_context_params_default() {
         /* backend_device    */ nullptr,
         /* image_tile_mode   */ 1, // 0=batched, 1=sequential (default, matches common_params), 2=disabled
         /* image_max_tiles   */ -1,
+        /* image_no_upscale  */ -1, // -1=model default, 0=off, 1=on
     };
     return params;
 }
@@ -599,12 +600,20 @@ struct mtmd_context {
     std::vector<llama_token> tok_row_end;       // end of row
     bool tok_row_end_trail = false;
     bool ov_img_first      = false;
+    // When the slice grid is 1x1 the overview and the single slice are the same
+    // crop, so emit the overview alone instead of the image twice.
+    bool skip_slices_if_single_tile = false;
 
     // MiniCPM-V 4.6/4.7 prepends an <image_id>N</image_id> tag before <image>
     bool use_image_id = false;
 
     // string template for slice image delimiters with row/col (idefics3)
     std::string sli_img_start_tmpl;
+
+    // string template labelling each image with its ordinal, emitted only when a prompt
+    // carries more than one image. Plain text, not a special token, so it is tokenized
+    // the same way the reference processor's f-string is.
+    std::string ord_img_tmpl;
 
     std::unique_ptr<mtmd_audio_preprocessor> audio_preproc;
     std::unique_ptr<mtmd_image_preprocessor> image_preproc;
@@ -669,6 +678,7 @@ struct mtmd_context {
             /* backend_device    */ ctx_params.backend_device,
             /* image_tile_mode   */ ctx_params.image_tile_mode,
             /* image_max_tiles   */ ctx_params.image_max_tiles,
+            /* image_no_upscale  */ ctx_params.image_no_upscale,
         };
 
         auto res = clip_init(mmproj_fname, ctx_clip_params);
@@ -884,6 +894,32 @@ struct mtmd_context {
                     tok_ov_img_end     = {lookup_token("<fake_token_around_image>")};
                     tok_row_end        = {lookup_token("\n")};
                     sli_img_start_tmpl = "<fake_token_around_image><row_%d_col_%d>";
+                    image_preproc = std::make_unique<mtmd_image_preprocessor_idefics3>(ctx_v);
+                } break;
+            case PROJECTOR_TYPE_VISIONPSY:
+                {
+                    // Same llava-uhd slicing as idefics3, but the overview image comes
+                    // first and there are no fake_token / row-end delimiters.
+                    slice_tmpl         = MTMD_SLICE_TMPL_IDEFICS3;
+                    // lookup_token() returns LLAMA_TOKEN_NULL on a miss, which would
+                    // silently splice a garbage id into the prompt. Fail loudly instead,
+                    // but only when there is a vocab to look in: mtmd_get_memory_usage
+                    // builds a context with no text model, and every token misses there.
+                    const llama_token tok_global_image = lookup_token("<|global_image|>");
+                    if (tok_global_image == LLAMA_TOKEN_NULL) {
+                        if (vocab != nullptr) {
+                            throw std::runtime_error("visionpsy: text model vocab is missing <|global_image|>");
+                        }
+                    } else {
+                        tok_ov_img_start = { tok_global_image };
+                    }
+                    sli_img_start_tmpl = "<row_%d_col_%d>";
+                    // get_image_string() prefixes every image with its 0-based ordinal once
+                    // a prompt carries more than one, so a question can still refer to "the
+                    // second image". Not in the vocab, so it goes through BPE as text.
+                    ord_img_tmpl       = "<image: %zu>";
+                    ov_img_first       = true;
+                    skip_slices_if_single_tile = true;
                     image_preproc = std::make_unique<mtmd_image_preprocessor_idefics3>(ctx_v);
                 } break;
             case PROJECTOR_TYPE_PIXTRAL:
@@ -1490,6 +1526,11 @@ struct mtmd_tokenizer {
                             __func__, merged_bitmaps.size(), parts.size() - 1);
                     return 1;
                 }
+                // Ordinal label before the image, matching the reference processor, which
+                // only emits it when the call carries more than one image.
+                if (!ctx->ord_img_tmpl.empty() && merged_bitmaps.size() > 1) {
+                    add_text(string_format(ctx->ord_img_tmpl.c_str(), i_bm), false);
+                }
                 auto bmps = merged_bitmaps[i_bm++];
                 int32_t res = add_media(bmps);
                 if (res != 0) {
@@ -1657,6 +1698,19 @@ struct mtmd_tokenizer {
                 // NOTE: preproc_out is invalidated after this point, do not use it anymore
 
                 // split_batch_to_chunk must always put the overview image first
+                const bool single_tile = ctx->skip_slices_if_single_tile && n_row == 1 && n_col == 1;
+
+                // On a 1x1 grid the overview and the lone slice cover the same crop at the
+                // same size, so only one of the two is sent. Send the SLICE. The reference
+                // pipeline returns the split patch untouched for this grid
+                // (GlobalAndSplitImages.forward returns early, before it resizes a global
+                // patch), and the two paths do not share a resize kernel: the slice is
+                // rendered with image_resize_algo_rf (bicubic) and the overview with
+                // image_resize_algo_ov (bilinear).
+                if (single_tile && chunks.size() > 1) {
+                    std::swap(chunks[0], chunks[1]);
+                }
+
                 auto ov_chunk = std::move(chunks.front());
                 chunks.erase(chunks.begin());
 
@@ -1671,7 +1725,7 @@ struct mtmd_tokenizer {
                 }
 
                 // add slices (or tiles)
-                if (!chunks.empty()) {
+                if (!chunks.empty() && !single_tile) {
                     LOG_DBG("%s: adding %d slices (%d rows x %d cols)\n", __func__, (int)chunks.size(), n_row, n_col);
                     GGML_ASSERT((int)chunks.size() == n_row * n_col);
                     add_text(ctx->tok_slices_start);

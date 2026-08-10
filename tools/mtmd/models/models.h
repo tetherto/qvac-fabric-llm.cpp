@@ -16,6 +16,12 @@
 struct clip_graph_siglip : clip_graph {
     clip_graph_siglip(clip_ctx * ctx, const clip_image_f32 & img) : clip_graph(ctx, img) {}
     ggml_cgraph * build() override;
+    // No support_batch(): batching is unreachable for the models on this graph, not just
+    // unimplemented. VisionPsy and idefics3 both put a text delimiter (<row_R_col_C>)
+    // between every slice, and the batch loops in mtmd-cli.cpp / server-context.cpp break
+    // the batch on any text chunk, so a grid always encodes as n_chunks = 1 regardless.
+    // Enabling it here buys nothing until the prompt layout changes, which the model
+    // defines. Measured: identical n_chunks with --image-tile-mode batched.
 };
 
 struct clip_graph_gemma4v : clip_graph {

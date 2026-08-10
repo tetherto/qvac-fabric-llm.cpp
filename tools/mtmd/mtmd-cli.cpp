@@ -165,6 +165,7 @@ struct mtmd_cli_context {
         mparams.image_max_tokens = params.image_max_tokens;
         mparams.image_tile_mode  = (int)params.image_tile_mode;
         mparams.image_max_tiles  = params.image_max_tiles;
+        mparams.image_no_upscale = params.image_no_upscale;
         {
             // non-causal models need the whole image in one ubatch
             const int n_ubatch = llama_n_ubatch(lctx);
