@@ -6627,7 +6627,7 @@ int ggml_metal_op_gated_delta_net_back(ggml_metal_op_t ctx, int idx) {
     const int64_t off_db      = off_dg + pad_g;
     const int64_t off_ds      = off_db + pad_b;
     const int64_t off_scratch = off_ds + pad_s;
-    const int64_t wg_stride   = n_tokens * (2*S_v*S_v + 2*S_v) + S_v*S_v;
+    const int64_t wg_stride   = n_tokens * (2*S_v*S_v + 2*S_v);
 
     GGML_UNUSED(d);
 
@@ -6660,7 +6660,9 @@ int ggml_metal_op_gated_delta_net_back(ggml_metal_op_t ctx, int idx) {
 
     auto pipeline = ggml_metal_library_get_pipeline_gated_delta_net_back(lib, op);
 
-    const int nth = std::min<int>(S_v, ggml_metal_pipeline_max_theads_per_threadgroup(pipeline));
+    const int nth = pipeline.nth;
+
+    const size_t smem = pipeline.smem;
 
     ggml_metal_encoder_set_pipeline(enc, pipeline);
     ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
@@ -6673,6 +6675,7 @@ int ggml_metal_op_gated_delta_net_back(ggml_metal_op_t ctx, int idx) {
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(d),     7);
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),    8);
 
+    ggml_metal_encoder_set_threadgroup_memory_size(enc, smem, 0);
     ggml_metal_encoder_dispatch_threadgroups(enc, neq1, neq3, 1, nth, 1, 1);
 
     return 1;

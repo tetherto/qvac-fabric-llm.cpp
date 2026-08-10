@@ -6,6 +6,7 @@
 
 #include "ggml-impl.h"
 
+#include <algorithm>
 #include <cassert>
 #include <memory>
 #include <mutex>
@@ -2952,20 +2953,72 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_gated_delta_net_
     const int S_v = op->src[2]->ne[0]; // v: {S_v, H, n_tokens, n_seqs}
     const int kda = (op->src[3]->ne[0] == S_v) ? 1 : 0; // g: ne0 == S_v -> KDA, else 1
 
+    const auto compute_lanes_per_col = [S_v](const uint32_t simdgroup_size) {
+
+        uint32_t lanes_per_column =
+            (S_v >= 128) ? 8u : std::min<uint32_t>(S_v, simdgroup_size);
+
+        // gated_delta_net.comp relies on S_V % COLS_PER_WG == 0 and
+        // S_V % LANES_PER_COLUMN == 0 to avoid bounds checks.
+        while (lanes_per_column > 1u) {
+            const bool valid_lanes = (simdgroup_size % lanes_per_column) == 0 &&
+                                     (S_v % lanes_per_column) == 0;
+            const uint32_t cols_per_wg = valid_lanes ? simdgroup_size / lanes_per_column : 0;
+            if (valid_lanes && cols_per_wg > 0 && (S_v % cols_per_wg) == 0) {
+                break;
+            }
+            lanes_per_column >>= 1u;
+        }
+
+        return static_cast<int16_t>(lanes_per_column);
+    };
+
     snprintf(base, 256, "kernel_gated_delta_net_back");
     snprintf(name, 256, "%s_S_v=%d_kda=%d", base, S_v, kda);
 
     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+
+    // threadExecutionWidth is not availble to after the pipeline is created...
+    constexpr const uint32_t simdgroup_size = 32;
+
+    const int16_t lanes_per_col = compute_lanes_per_col(simdgroup_size);
+
     if (!res.pipeline) {
         ggml_metal_cv_t cv = ggml_metal_cv_init();
 
         ggml_metal_cv_set_int16(cv, S_v, FC_GATED_DELTA_NET + 10);
         ggml_metal_cv_set_int16(cv, kda, FC_GATED_DELTA_NET + 11);
+        ggml_metal_cv_set_int16(cv, lanes_per_col, FC_GATED_DELTA_NET + 12);
 
         res = ggml_metal_library_compile_pipeline(lib, base, name, cv);
 
         ggml_metal_cv_free(cv);
     }
+
+    assert(simdgroup_size == ggml_metal_pipeline_thread_execution_width(res));
+
+    const uint32_t max_nth = static_cast<uint32_t>(ggml_metal_pipeline_max_theads_per_threadgroup(res));
+
+    // Several simdgroups per threadgroup hide the serial token loop's latency. Clamp so that
+    // COLS_PER_STEP = nth/lanes_per_col stays <= S_v; all terms are powers of two, so it also
+    // divides S_v. nsg_max is 0 when a single simdgroup already spans more columns than S_v
+    // has, in which case fall back to one thread per column.
+    uint32_t nth = std::min<uint32_t>(S_v, max_nth);
+
+    const uint32_t nsg_max = std::min({ 32u,
+                                        static_cast<uint32_t>(S_v) * static_cast<uint32_t>(lanes_per_col) / simdgroup_size,
+                                        max_nth / simdgroup_size });
+    if (nsg_max > 0) {
+        uint32_t nsg = 1;
+        while (2*nsg <= nsg_max) {
+            nsg *= 2;
+        }
+
+        nth = nsg * simdgroup_size;
+    }
+
+    res.nth  = static_cast<int>(nth);
+    res.smem = GGML_PAD(sizeof(float) * ((nth + simdgroup_size - 1) / simdgroup_size), 16);
 
     return res;
 }
