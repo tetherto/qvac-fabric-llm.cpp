@@ -151,6 +151,20 @@ struct mtmd_model_loader {
             model.proj_type = projector_type_from_string(proj_type);
 
             if (model.proj_type == PROJECTOR_TYPE_UNKNOWN) {
+                // Not a canonical name. Try the legacy aliases, which are gated on
+                // general.name so a generic string like "custom" only resolves for the
+                // one model that shipped it.
+                std::string model_name;
+                get_string(KEY_NAME, model_name, false);
+                model.proj_type = projector_type_from_alias(proj_type, model_name);
+                if (model.proj_type != PROJECTOR_TYPE_UNKNOWN) {
+                    LOG_WRN("%s: legacy projector type '%s' from general.name='%s' loaded as '%s'\n",
+                            __func__, proj_type.c_str(), model_name.c_str(),
+                            PROJECTOR_TYPE_NAMES.at(model.proj_type).c_str());
+                }
+            }
+
+            if (model.proj_type == PROJECTOR_TYPE_UNKNOWN) {
                 throw std::runtime_error(mtmd_format("%s: unknown projector type: %s\n", __func__, proj_type.c_str()));
             }
 
@@ -418,6 +432,19 @@ struct mtmd_model_loader {
                         get_u32(KEY_PROJ_SCALE_FACTOR, hparams.n_merge, false);
                         get_u32(KEY_PREPROC_IMAGE_SIZE, hparams.image_longest_edge, false);
                         hparams.set_limit_image_tokens();
+                    } break;
+                case PROJECTOR_TYPE_VISIONPSY:
+                    {
+                        // use default llava-uhd preprocessing params
+                        get_u32(KEY_PROJ_SCALE_FACTOR, hparams.n_merge, false);
+                        get_u32(KEY_PREPROC_IMAGE_SIZE, hparams.image_longest_edge, false);
+                        // Optional; absent from every mmproj published so far, including the
+                        // VisionPsy Flash one, which is why --image-no-upscale exists. An
+                        // mmproj that carries the key needs no flag. gguf-py can write it
+                        // (add_vision_preproc_no_upscale, from the reference config's
+                        // resize_to_max_side_len == false); no converter in this repo emits
+                        // it yet because there is no VisionPsy conversion path here.
+                        get_bool(KEY_PREPROC_NO_UPSCALE, hparams.image_no_upscale, false);
                     } break;
                 case PROJECTOR_TYPE_COHERE2V:
                     {
@@ -1674,6 +1701,7 @@ struct mtmd_model_loader {
                     || model.proj_type == PROJECTOR_TYPE_GLM_EDGE
                     || model.proj_type == PROJECTOR_TYPE_GEMMA3
                     || model.proj_type == PROJECTOR_TYPE_IDEFICS3
+                    || model.proj_type == PROJECTOR_TYPE_VISIONPSY
                     || model.proj_type == PROJECTOR_TYPE_MINICPMV
                     || model.proj_type == PROJECTOR_TYPE_MINICPMV4_6
                     || model.proj_type == PROJECTOR_TYPE_MINICPMV4_7
@@ -2301,6 +2329,7 @@ struct mtmd_model_loader {
                     model.mm_soft_emb_norm_w = get_tensor(TN_MM_SOFT_EMB_N);
                 } break;
             case PROJECTOR_TYPE_IDEFICS3:
+            case PROJECTOR_TYPE_VISIONPSY:
                 {
                     model.mm_fc_w = get_tensor(mtmd_format(TN_MM_PROJECTOR, "weight"));
                 } break;
@@ -4188,6 +4217,40 @@ mtmd_models mtmd_model_load(const char * fname, const mtmd_model_params & params
                 LOG_INF("%s: preproc_max_tiles: %d (custom value)\n", func_name, max_tiles);
             }
         }
+        // Same ordering rule as above: override the GGUF value, don't get clobbered by it.
+        // -1 is the unset sentinel; 0 and 1 are both explicit, unlike image_max_tiles, since
+        // "off" is a meaningful choice against a GGUF that turns it on. Only the idefics3
+        // preprocessor reads the flag, and VisionPsy shares that preprocessor.
+        if (modality == MTMD_MODALITY_VISION && params.image_no_upscale >= 0) {
+            const bool no_upscale = params.image_no_upscale != 0;
+            const projector_type pt = model->proj_type;
+            if (pt != PROJECTOR_TYPE_IDEFICS3 && pt != PROJECTOR_TYPE_VISIONPSY) {
+                LOG_WRN("%s: --image-no-upscale only affects idefics3-style preprocessing; ignoring for this model\n", func_name);
+            } else {
+                // Turning it OFF against a GGUF that turned it on is the one case that
+                // silently degrades quality, and it is also what a zero-initialized
+                // mtmd_model_params/mtmd_context_params passes (bindings and direct C
+                // API callers that never set the field). Say so rather than swallow it.
+                if (!no_upscale && model->hparams.image_no_upscale) {
+                    LOG_WRN("%s: image_no_upscale=0 overrides %s=true from the GGUF; "
+                            "pass -1 to keep the model default\n", func_name, KEY_PREPROC_NO_UPSCALE);
+                }
+                model->hparams.image_no_upscale = no_upscale;
+                LOG_INF("%s: preproc_no_upscale: %d (custom value)\n", func_name, no_upscale);
+            }
+        }
+        if (modality == MTMD_MODALITY_VISION) {
+            // calc_size_no_upscale() divides by both of these. image_size == 0 is legal in
+            // general, it means dynamic sizing, so it is only rejected once the no-upscale
+            // rule is actually the one that will run. Checked after the override above so
+            // it covers the flag as well as the GGUF key.
+            const auto & vp = model->hparams;
+            if (vp.image_no_upscale && (vp.image_size <= 0 || vp.image_longest_edge <= 0)) {
+                throw std::runtime_error(
+                    mtmd_format("%s: preproc_no_upscale needs a positive image_size (%d) and %s (%d)\n", func_name,
+                                vp.image_size, KEY_PREPROC_IMAGE_SIZE, vp.image_longest_edge));
+            }
+        }
         loader.load_tensors(*model, buft, params.no_alloc, params.convert_bf16_to_f16);
         const std::string & def = model->hparams.gen_default_voice;
         if (!def.empty() && model->gen_voices.find(def) == model->gen_voices.end()) {
@@ -4416,6 +4479,7 @@ int mtmd_model::n_output_tokens(const mtmd_image_f32 * img) const {
             } break;
         case PROJECTOR_TYPE_IDEFICS3:
         case PROJECTOR_TYPE_COHERE2V:
+        case PROJECTOR_TYPE_VISIONPSY:
         case PROJECTOR_TYPE_NEMOTRON_V2_VL:
         case PROJECTOR_TYPE_NEMOTRON_OMNI:
             {
@@ -4771,6 +4835,7 @@ int mtmd_model::n_mmproj_embd() const {
             return mm_input_proj_w->ne[1];
         case PROJECTOR_TYPE_IDEFICS3:
         case PROJECTOR_TYPE_MUSE_SPARK_AUDIO:
+        case PROJECTOR_TYPE_VISIONPSY:
             return mm_fc_w->ne[1];
         case PROJECTOR_TYPE_VIBEVOICE_ASR:
             return mm_1_w->ne[1];

@@ -106,6 +106,12 @@ struct mtmd_hparams {
     std::array<uint8_t, 3> image_pad_color = {0, 0, 0};
 
     // (preprocessor) for llava-uhd style models
+    // no_upscale: round the long side up to a whole number of slices and cap it at
+    // image_longest_edge, instead of always stretching it to image_longest_edge. An image
+    // below the cap then keeps its own resolution and becomes fewer slices. This is what
+    // distinguishes the VisionPsy Flash checkpoint from the base one; their mmprojs declare
+    // identical vision hparams, so it cannot be inferred from anything else in the GGUF.
+    bool image_no_upscale = false;
     std::vector<mtmd_image_size> image_res_candidates;
     int32_t preproc_min_tiles = 0;
     int32_t preproc_max_tiles = 0;
@@ -1400,6 +1406,12 @@ struct mtmd_model_params {
     int32_t image_max_tokens = -1;
     int image_tile_mode = MTMD_IMAGE_TILE_MODE_SEQUENTIAL; // 0=batched, 1=sequential (default), 2=disabled. NOTE: 0 (batched) is the zero value but NOT the default — init via mtmd_context_params_default() or set explicitly.
     int image_max_tiles = -1; // override preproc_max_tiles; -1 or 0 = use GGUF/model default (only a positive value overrides)
+    // override preproc_no_upscale (idefics3-style preprocessing); -1 = use GGUF/model
+    // default, 0 = off, 1 = on. WARNING: a zero-initialized struct lands on 0 (off), not
+    // -1 (model default), the one case that silently forces base-style preprocessing
+    // on a Flash-style model. Do not rely on zero-init: use mtmd_context_params_default()
+    // or set this field explicitly.
+    int image_no_upscale = -1;
     bool no_alloc = false; // only create the tensors, do not read their data
     // the device can't use bf16 weights: declare them as f16 and convert on load
     bool convert_bf16_to_f16 = false;
