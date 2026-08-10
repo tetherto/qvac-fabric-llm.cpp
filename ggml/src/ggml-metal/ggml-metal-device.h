@@ -56,9 +56,14 @@ struct ggml_metal_pipeline_with_params {
 
     bool c4;
     bool cnt;
+
+    int nth;
 };
 
 int ggml_metal_pipeline_max_theads_per_threadgroup(struct ggml_metal_pipeline_with_params pipeline);
+
+// simdgroup / subgroup / wave size
+int ggml_metal_pipeline_thread_execution_width(struct ggml_metal_pipeline_with_params pipeline);
 
 //
 // MTLCommandBuffer wrapper
