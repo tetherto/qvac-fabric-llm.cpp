@@ -11390,11 +11390,8 @@ static bool ggml_cl_iq2_xxs_use_noshuffle(const ggml_backend_opencl_context * ba
 }
 
 inline bool use_adreno_moe_kernels(const ggml_backend_opencl_context *backend_ctx, const ggml_tensor *tensor) {
-    // The moe weight repack kernels *_trans4_ns alias a private ushort8 through a uchar*.
-    // Certain compilers (found with some A7x and A6x) miscompiles this, corrupting the weights.
-    // So, exclude A6x and A7x from using Adreno MoE kernels for now.
-    // The quants that have a general mul_mat_id kernel fallback to the general version; the
-    // rest fallback to CPU.
+    // Keep A6x and A7x on their existing fallbacks until the optimized kernels
+    // are validated on those generations. Unknown Adreno devices also fall back.
     if (backend_ctx && (backend_ctx->adreno_gen == ADRENO_GPU_GEN::A6X ||
                         backend_ctx->adreno_gen == ADRENO_GPU_GEN::A7X ||
                         backend_ctx->adreno_gen == ADRENO_GPU_GEN::ADRENO_UNKNOWN)) {

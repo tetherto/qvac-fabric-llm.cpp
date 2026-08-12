@@ -5952,6 +5952,61 @@ static void init_mul_mat_id_tensors(ggml_context * ctx, int n_mats, bool skip = 
     init_mul_mat_id_ids(ctx, n_mats, skip);
 }
 
+static float mul_mat_id_adversarial_value(size_t i) {
+    static const float values[] = {
+        -1.0f,   1.0f,   -0.875f,   0.875f,   -0.625f, 0.625f, -0.375f, 0.375f,
+        -0.125f, 0.125f, -0.03125f, 0.03125f, -0.999f, 0.999f, 0.0f,    -0.0f,
+    };
+    const size_t count = sizeof(values) / sizeof(values[0]);
+    return values[(i * 13 + (i / 7) * 5 + i / 257) % count];
+}
+
+static bool init_mul_mat_id_adreno_repack_tensors(ggml_context * ctx, int n_mats) {
+    bool roundtrip_ok = true;
+
+    for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+        if (t->type == GGML_TYPE_I32) {
+            if (ggml_is_view_op(t->op)) {
+                continue;
+            }
+            for (int64_t r = 0; r < ggml_nrows(t); ++r) {
+                std::vector<int32_t> data(t->ne[0]);
+                for (int64_t i = 0; i < t->ne[0]; ++i) {
+                    data[i] = (int32_t) ((i + r) % n_mats);
+                }
+                ggml_backend_tensor_set(t, data.data(), r * t->nb[1], t->ne[0] * sizeof(int32_t));
+            }
+            continue;
+        }
+
+        const size_t       nels = ggml_nelements(t);
+        std::vector<float> data(nels);
+        for (size_t i = 0; i < nels; ++i) {
+            data[i] = mul_mat_id_adversarial_value(i);
+        }
+
+        if (t->type == GGML_TYPE_F32) {
+            ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(float));
+            continue;
+        }
+
+        GGML_ASSERT(ggml_is_quantized(t->type));
+        const int64_t        nrows = ggml_nrows(t);
+        std::vector<float>   imatrix(t->ne[0], 1.0f);
+        std::vector<uint8_t> dataq(ggml_row_size(t->type, t->ne[0]) * nrows);
+        ggml_quantize_chunk(t->type, data.data(), dataq.data(), 0, nrows, t->ne[0], imatrix.data());
+        ggml_backend_tensor_set(t, dataq.data(), 0, dataq.size());
+        std::vector<uint8_t> restored(dataq.size());
+        ggml_backend_tensor_get(t, restored.data(), 0, restored.size());
+        if (memcmp(dataq.data(), restored.data(), dataq.size()) != 0) {
+            printf("quantized tensor roundtrip mismatch for %s ", ggml_type_name(t->type));
+            roundtrip_ok = false;
+        }
+    }
+
+    return roundtrip_ok;
+}
+
 // GGML_OP_MUL_MAT_ID
 struct test_mul_mat_id : public test_case {
     const ggml_type type_a;
@@ -6091,6 +6146,23 @@ struct test_mul_mat_id_w4a4 : public test_mul_mat_id {
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
         return "MUL_MAT_ID_W4A4";
+    }
+};
+
+struct test_mul_mat_id_adreno_repack : public test_mul_mat_id {
+    bool roundtrip_ok = true;
+
+    test_mul_mat_id_adreno_repack(ggml_type type_a) :
+        test_mul_mat_id(type_a, GGML_TYPE_F32, 4, 2, false, 128, 7, 512) {}
+
+    std::string vars() override { return test_mul_mat_id::vars() + ",adreno_trans4_ns=1"; }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        roundtrip_ok = init_mul_mat_id_adreno_repack_tensors(ctx, n_mats);
+    }
+
+    double err(const float * a, const float * b, size_t n) override {
+        return roundtrip_ok ? test_mul_mat_id::err(a, b, n) : 1.0;
     }
 };
 
@@ -12437,6 +12509,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat_id_dup(ta, GGML_TYPE_F32, 2050, 10, true, 64, 33, 256));
     }
 #endif
+
+    for (ggml_type type_a : {
+             GGML_TYPE_Q4_0,
+             GGML_TYPE_Q4_1,
+             GGML_TYPE_Q5_0,
+             GGML_TYPE_Q5_1,
+             GGML_TYPE_Q4_K,
+             GGML_TYPE_Q5_K,
+             GGML_TYPE_Q6_K,
+             GGML_TYPE_MXFP4,
+         }) {
+        test_cases.emplace_back(new test_mul_mat_id_adreno_repack(type_a));
+    }
 
     for (ggml_type type_a : all_types) {
         test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 4, 2, false, 64, 16, 3*ggml_blck_size(type_a)));
