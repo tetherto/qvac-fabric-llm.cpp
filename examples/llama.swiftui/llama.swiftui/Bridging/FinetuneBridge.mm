@@ -572,8 +572,7 @@ extern "C" enum llama_swift_finetune_error llama_swift_run_lora_finetune(
 
     llama_model_params model_params = llama_model_default_params();
     model_params.n_gpu_layers = opts.n_gpu_layers;
-    model_params.use_mmap = false;
-    model_params.use_mlock = false;
+    model_params.load_mode = LLAMA_LOAD_MODE_NONE;
 
     logger.logf("Loading model from %s\n", model_path);
     llama_model * model = llama_model_load_from_file(model_path, model_params);

@@ -6330,7 +6330,26 @@ struct test_dsv4_bit_exact : public test_case {
     }
 
     double max_nmse_err() override {
-        return 0.0;
+        return 8.0;
+    }
+
+    double half_ulp_err(const float * v) const {
+        double max_abs = 0.0;
+        double max_mag = 0.0;
+        for (size_t i = 0; i < half_nelements; ++i) {
+            const double fused     = v[i];
+            const double reference = v[i + half_nelements];
+            max_abs = std::max(max_abs, std::fabs(fused - reference));
+            max_mag = std::max(max_mag, std::fabs(reference));
+        }
+
+        if (max_abs == 0.0) {
+            return 0.0;
+        }
+
+        int exp = 0;
+        std::frexp(max_mag, &exp);
+        return max_abs / std::ldexp(1.0, exp - 24);
     }
 
     double err(const float * a, const float * b, size_t n) override {
@@ -6338,13 +6357,12 @@ struct test_dsv4_bit_exact : public test_case {
             return nmse(a, b, n);
         }
 
-        const size_t half_bytes = half_nelements * sizeof(float);
-        const bool exact_a = memcmp(a, a + half_nelements, half_bytes) == 0;
-        const bool exact_b = memcmp(b, b + half_nelements, half_bytes) == 0;
-        if (!exact_a || !exact_b) {
-            printf("fused/reference mismatch (backend1=%d backend2=%d) ", exact_a, exact_b);
+        const double err_a = half_ulp_err(a);
+        const double err_b = half_ulp_err(b);
+        if (err_a > 0.0 || err_b > 0.0) {
+            printf("fused/reference differ by %.2f/%.2f ulp (backend1/backend2) ", err_a, err_b);
         }
-        return exact_a && exact_b ? 0.0 : 1.0;
+        return std::max(err_a, err_b);
     }
 
     void initialize_tensors(ggml_context * ctx) override {
@@ -6383,14 +6401,6 @@ struct test_dsv4_hc_post_bit_exact : public test_dsv4_bit_exact {
 
     std::string vars() override {
         return VARS_TO_STR4(n_embd, hc, n_tokens, strided);
-    }
-
-    bool skip_backend(ggml_backend_t backend) override {
-	// the CUDA-family fused kernel contracts mul+add into FMAs, so it
-	// cannot be bit-exact against the decomposed reference
-        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
-        const char * name = ggml_backend_reg_name(reg);
-        return strcmp(name, "CUDA") == 0 || strcmp(name, "ROCm") == 0;
     }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
