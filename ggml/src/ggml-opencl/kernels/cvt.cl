@@ -40,44 +40,25 @@ typedef ushort uint16_t;
 typedef int int32_t;
 typedef uint uint32_t;
 
+// trans4_ns GEMM kernels consume bytes in least-significant-first numeric order.
 static inline uint pack_uchar4(uchar x0, uchar x1, uchar x2, uchar x3) {
-#ifdef __ENDIAN_LITTLE__
     return (uint) x0 | ((uint) x1 << 8) | ((uint) x2 << 16) | ((uint) x3 << 24);
-#else
-    return ((uint) x0 << 24) | ((uint) x1 << 16) | ((uint) x2 << 8) | (uint) x3;
-#endif
 }
 
 static inline uchar unpack_uchar0(uint x) {
-#ifdef __ENDIAN_LITTLE__
     return (uchar) (x & 0xFF);
-#else
-    return (uchar) ((x >> 24) & 0xFF);
-#endif
 }
 
 static inline uchar unpack_uchar1(uint x) {
-#ifdef __ENDIAN_LITTLE__
     return (uchar) ((x >> 8) & 0xFF);
-#else
-    return (uchar) ((x >> 16) & 0xFF);
-#endif
 }
 
 static inline uchar unpack_uchar2(uint x) {
-#ifdef __ENDIAN_LITTLE__
     return (uchar) ((x >> 16) & 0xFF);
-#else
-    return (uchar) ((x >> 8) & 0xFF);
-#endif
 }
 
 static inline uchar unpack_uchar3(uint x) {
-#ifdef __ENDIAN_LITTLE__
     return (uchar) ((x >> 24) & 0xFF);
-#else
-    return (uchar) (x & 0xFF);
-#endif
 }
 
 static inline uint pack_trans4_low(__global const uchar * q, uint offset) {
