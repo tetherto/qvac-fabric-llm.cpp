@@ -227,30 +227,52 @@ void xdna_buffer_read(xdna_buffer * buf, void * host, size_t bytes) {
 
 // --- execution ------------------------------------------------------------
 
-bool xdna_kernel_run(xdna_kernel * kern, xdna_buffer ** args, size_t n_args) {
+// Configure a run for `kern` with `n_args` host buffers (ABI: 0=opcode,
+// 1=instruction BO, 2=ninstr, 3..=host buffers).
+static xrt::run make_run(xdna_kernel * kern, xdna_buffer ** args, size_t n_args) {
+    xrt::run run(kern->kernel);
+    run.set_arg(0, XAIE_NPU_OPCODE_RUN);
+    run.set_arg(1, kern->insts_bo);
+    run.set_arg(2, kern->insts_bytes);
+    for (size_t i = 0; i < n_args; i++) {
+        run.set_arg((int) (3 + i), args[i]->bo);
+    }
+    return run;
+}
+
+xrt::run xdna_kernel_run_start(xdna_kernel * kern, xdna_buffer ** args, size_t n_args) {
     if (!kern || !args || n_args == 0) {
-        GGML_LOG_ERROR("%s: run: null kernel/args or no buffers\n", "xdna-runtime");
-        return false;
+        GGML_LOG_ERROR("%s: run start: null kernel/args or no buffers\n", "xdna-runtime");
+        return xrt::run{};
     }
     try {
-        xrt::run run(kern->kernel);
-        // ABI: 0=opcode, 1=instruction BO, 2=ninstr, 3..=host buffers
-        run.set_arg(0, XAIE_NPU_OPCODE_RUN);
-        run.set_arg(1, kern->insts_bo);
-        run.set_arg(2, kern->insts_bytes);
-        for (size_t i = 0; i < n_args; i++) {
-            run.set_arg((int) (3 + i), args[i]->bo);
-        }
+        xrt::run run = make_run(kern, args, n_args);
         run.start();
+        return run;
+    } catch (const std::exception & e) {
+        GGML_LOG_ERROR("%s: kernel run start exception: %s\n", "xdna-runtime", e.what());
+        return xrt::run{};
+    }
+}
+
+bool xdna_run_wait(xrt::run & run) {
+    try {
         const ert_cmd_state st = run.wait();
         if (st != ERT_CMD_STATE_COMPLETED) {
-            GGML_LOG_ERROR("%s: kernel wait state %d (insts=%lld args=%zu)\n",
-                           "xdna-runtime", (int) st, (long long) kern->insts_bytes, n_args);
+            GGML_LOG_ERROR("%s: kernel wait state %d\n", "xdna-runtime", (int) st);
             return false;
         }
         return true;
     } catch (const std::exception & e) {
-        GGML_LOG_ERROR("%s: kernel run exception: %s\n", "xdna-runtime", e.what());
+        GGML_LOG_ERROR("%s: kernel wait exception: %s\n", "xdna-runtime", e.what());
         return false;
     }
+}
+
+bool xdna_kernel_run(xdna_kernel * kern, xdna_buffer ** args, size_t n_args) {
+    xrt::run run = xdna_kernel_run_start(kern, args, n_args);
+    if (!run) {
+        return false;
+    }
+    return xdna_run_wait(run);
 }

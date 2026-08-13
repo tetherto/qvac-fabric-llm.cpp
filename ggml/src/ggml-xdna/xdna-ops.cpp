@@ -72,10 +72,13 @@ static const std::vector<ggml_bf16_t> & gemm_weight_pack(xdna_ops * ops,
 // K is split into blocks of at most GEMM_K_MAX: a per-core K-loop count above
 // 64 (K > 1024 with tile_k=16) wedges the shared hw_context, so wide-K ops run
 // as several sub-GEMMs accumulated on the host.
+//
+// Submission is batched: the kernel is started without waiting and the run is
+// queued in ops->pending; xdna_ops_finalize() waits all runs of the layer and
+// completes the op (readback, accumulation, dst).
 static bool gemm_compute(xdna_ops * ops, struct ggml_tensor * node) {
     const struct ggml_tensor * src0 = node->src[0];
     const struct ggml_tensor * src1 = node->src[1];
-    struct ggml_tensor * dst = node;
 
     const int M = (int) src1->ne[1];
     const int K = (int) src1->ne[0];
@@ -90,11 +93,13 @@ static bool gemm_compute(xdna_ops * ops, struct ggml_tensor * node) {
     xdna_mul_mat_profile prof;
     const xdna_timer t_op;
 
-    std::vector<float> c_acc((size_t) Mk * N, 0.0f);
-
     // All blocks use the full GEMM_K_MAX kernel: a partial K block (K < 1024)
     // after a run of full blocks wedges the shared hw_context, so the last
     // block is zero-padded in K and runs the same K1024 kernel as the rest.
+    xdna_ops::pending_op op;
+    op.node = node;
+    op.c_acc.assign((size_t) Mk * N, 0.0f);
+
     xdna_kernel * kern = nullptr;
     for (int k0 = 0; k0 < K; k0 += GEMM_K_MAX) {
         const int Kb = std::min(GEMM_K_MAX, K - k0);
@@ -119,16 +124,20 @@ static bool gemm_compute(xdna_ops * ops, struct ggml_tensor * node) {
             }
         }
 
-        xdna_buffer * bo_a = xdna_kernel_pool_acquire_buffer(ops->pool, (size_t) Mk * GEMM_K_MAX * sizeof(ggml_bf16_t));
-        xdna_buffer * bo_b = xdna_kernel_pool_acquire_buffer(ops->pool, (size_t) GEMM_K_MAX * N * sizeof(ggml_bf16_t));
-        xdna_buffer * bo_c = xdna_kernel_pool_acquire_buffer(ops->pool, (size_t) Mk * N * sizeof(float));
-        if (!bo_a || !bo_b || !bo_c) {
-            if (bo_a) xdna_kernel_pool_release_buffer(ops->pool, bo_a);
-            if (bo_b) xdna_kernel_pool_release_buffer(ops->pool, bo_b);
-            if (bo_c) xdna_kernel_pool_release_buffer(ops->pool, bo_c);
+        xdna_ops::pending_run pr;
+        pr.bo_a = xdna_kernel_pool_acquire_buffer(ops->pool, (size_t) Mk * GEMM_K_MAX * sizeof(ggml_bf16_t));
+        pr.bo_b = xdna_kernel_pool_acquire_buffer(ops->pool, (size_t) GEMM_K_MAX * N * sizeof(ggml_bf16_t));
+        pr.bo_c = xdna_kernel_pool_acquire_buffer(ops->pool, (size_t) Mk * N * sizeof(float));
+        if (!pr.bo_a || !pr.bo_b || !pr.bo_c) {
+            if (pr.bo_a) xdna_kernel_pool_release_buffer(ops->pool, pr.bo_a);
+            if (pr.bo_b) xdna_kernel_pool_release_buffer(ops->pool, pr.bo_b);
+            if (pr.bo_c) xdna_kernel_pool_release_buffer(ops->pool, pr.bo_c);
             GGML_LOG_ERROR("%s: failed to allocate GEMM buffers\n", "xdna-ops");
             return false;
         }
+        pr.M = M;
+        pr.N = N;
+        pr.c_buf.assign((size_t) Mk * N, 0.0f);
 
         // The BOs are host-visible, so write straight into their mapped memory.
         // A's padding rows are zeroed (the pool may hand back a reused BO); B's
@@ -140,7 +149,7 @@ static bool gemm_compute(xdna_ops * ops, struct ggml_tensor * node) {
         {
             const xdna_timer t;
             const std::vector<ggml_bf16_t> & wpack = gemm_weight_pack(ops, src0, K, N);
-            ggml_bf16_t * b_map = (ggml_bf16_t *) bo_b->bo.map();
+            ggml_bf16_t * b_map = (ggml_bf16_t *) pr.bo_b->bo.map();
             if (Kb == GEMM_K_MAX) {
                 std::memcpy(b_map, wpack.data() + (size_t) k0 * N,
                             (size_t) Kb * N * sizeof(ggml_bf16_t));
@@ -156,7 +165,7 @@ static bool gemm_compute(xdna_ops * ops, struct ggml_tensor * node) {
         // padded, zero-padded in K past Kb.
         {
             const xdna_timer t;
-            ggml_bf16_t * a_map = (ggml_bf16_t *) bo_a->bo.map();
+            ggml_bf16_t * a_map = (ggml_bf16_t *) pr.bo_a->bo.map();
             std::memset(a_map, 0, (size_t) Mk * GEMM_K_MAX * sizeof(ggml_bf16_t));
             for (int m = 0; m < M; m++) {
                 ggml_fp32_to_bf16_row((const float *) src1->data + (size_t) m * K + k0,
@@ -167,69 +176,94 @@ static bool gemm_compute(xdna_ops * ops, struct ggml_tensor * node) {
 
         {
             const xdna_timer t;
-            xdna_buffer_sync_to_device(bo_a);
-            xdna_buffer_sync_to_device(bo_b);
+            xdna_buffer_sync_to_device(pr.bo_a);
+            xdna_buffer_sync_to_device(pr.bo_b);
             if (prof_en) prof.sync += t.ms();
         }
 
-        std::vector<float> c_buf((size_t) Mk * N, 0);
-        xdna_buffer * args[3] = { bo_a, bo_b, bo_c };
+        xdna_buffer * args[3] = { pr.bo_a, pr.bo_b, pr.bo_c };
         {
             const xdna_timer t;
-            if (!xdna_kernel_run(kern, args, 3)) {
-                GGML_LOG_ERROR("%s: GEMM run failed M=%d K=%d N=%d kernel=gemm_K%d_N%d\n",
+            pr.run = xdna_kernel_run_start(kern, args, 3);
+            if (!pr.run) {
+                GGML_LOG_ERROR("%s: GEMM submit failed M=%d K=%d N=%d kernel=gemm_K%d_N%d\n",
                                "xdna-ops", M, K, N, GEMM_K_MAX, N);
-                xdna_kernel_pool_release_buffer(ops->pool, bo_a);
-                xdna_kernel_pool_release_buffer(ops->pool, bo_b);
-                xdna_kernel_pool_release_buffer(ops->pool, bo_c);
+                xdna_kernel_pool_release_buffer(ops->pool, pr.bo_a);
+                xdna_kernel_pool_release_buffer(ops->pool, pr.bo_b);
+                xdna_kernel_pool_release_buffer(ops->pool, pr.bo_c);
                 return false;
             }
             if (prof_en) prof.run += t.ms();
         }
-        {
-            const xdna_timer t;
-            xdna_buffer_read(bo_c, c_buf.data(), (size_t) Mk * N * sizeof(float));
-            if (prof_en) prof.c_read += t.ms();
-        }
-
-        xdna_kernel_pool_release_buffer(ops->pool, bo_a);
-        xdna_kernel_pool_release_buffer(ops->pool, bo_b);
-        xdna_kernel_pool_release_buffer(ops->pool, bo_c);
-
-        // Accumulate this K-block's contribution.
-        {
-            const xdna_timer t;
-            for (size_t i = 0; i < (size_t) Mk * N; i++) {
-                c_acc[i] += c_buf[i];
-            }
-            if (prof_en) prof.accum += t.ms();
-        }
+        op.runs.push_back(std::move(pr));
         prof.n_blocks++;
     }
 
-    // Write the M x N slice of the accumulated result into dst.
-    {
-        const xdna_timer t;
-        for (int m = 0; m < M; m++) {
-            std::memcpy((char *) dst->data + (size_t) m * dst->nb[1],
-                        c_acc.data() + (size_t) m * N, (size_t) N * sizeof(float));
-        }
-        if (prof_en) prof.dst_copy = t.ms();
-    }
+    ops->pending.push_back(std::move(op));
 
     if (prof_en) {
         prof.total = t_op.ms();
         fprintf(stderr,
                 "xdna-profile: MUL_MAT %s M=%d K=%d N=%d blocks=%d "
-                "total=%.3fms bcopy=%.3f apack=%.3f sync=%.3f run=%.3f cread=%.3f accum=%.3f dst=%.3f\n",
-                node->name ? node->name : "?", M, K, N, prof.n_blocks,
-                prof.total, prof.b_copy, prof.a_pack, prof.sync,
-                prof.run, prof.c_read, prof.accum, prof.dst_copy);
+                "total=%.3fms bcopy=%.3f apack=%.3f sync=%.3f submit=%.3f\n",
+                node->name, M, K, N, prof.n_blocks,
+                prof.total, prof.b_copy, prof.a_pack, prof.sync, prof.run);
     }
 
     GGML_LOG_INFO("%s: MUL_MAT %s M=%d K=%d N=%d blocks=%d\n",
-                  "xdna-ops", node->name ? node->name : "?", M, K, N,
+                  "xdna-ops", node->name, M, K, N,
                   (K + GEMM_K_MAX - 1) / GEMM_K_MAX);
+    return true;
+}
+
+bool xdna_ops_finalize(xdna_ops * ops) {
+    if (ops->pending.empty()) {
+        return true;
+    }
+
+    const bool prof_en = ggml_xdna_profiling_enabled();
+    const xdna_timer t_all;
+
+    for (auto & op : ops->pending) {
+        const int Mk = ops->gemm_tiles.M;
+        // Wait the runs first so all kernels of the layer complete together.
+        for (auto & pr : op.runs) {
+            if (!xdna_run_wait(pr.run)) {
+                GGML_LOG_ERROR("%s: finalize: kernel wait failed\n", "xdna-ops");
+                return false;
+            }
+        }
+        // Read C and accumulate this op's K-blocks.
+        for (auto & pr : op.runs) {
+            const xdna_timer t;
+            xdna_buffer_read(pr.bo_c, pr.c_buf.data(), (size_t) Mk * pr.N * sizeof(float));
+            for (size_t i = 0; i < (size_t) Mk * pr.N; i++) {
+                op.c_acc[i] += pr.c_buf[i];
+            }
+            if (prof_en) {
+                // c_read/accum are folded into one line below via time.
+            }
+        }
+        // Write the M x N slice of the accumulated result into dst.
+        for (int m = 0; m < op.runs.front().M; m++) {
+            std::memcpy((char *) op.node->data + (size_t) m * op.node->nb[1],
+                        op.c_acc.data() + (size_t) m * op.runs.front().N,
+                        (size_t) op.runs.front().N * sizeof(float));
+        }
+        // Release buffers back to the pool.
+        for (auto & pr : op.runs) {
+            xdna_kernel_pool_release_buffer(ops->pool, pr.bo_a);
+            xdna_kernel_pool_release_buffer(ops->pool, pr.bo_b);
+            xdna_kernel_pool_release_buffer(ops->pool, pr.bo_c);
+        }
+    }
+
+    if (prof_en) {
+        fprintf(stderr, "xdna-profile: FINALIZE ops=%zu total=%.3fms\n",
+                ops->pending.size(), t_all.ms());
+    }
+
+    ops->pending.clear();
     return true;
 }
 

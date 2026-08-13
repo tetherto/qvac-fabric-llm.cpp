@@ -63,6 +63,14 @@ void          xdna_buffer_sync_to_device(xdna_buffer * buf);
 // 1=instruction BO, 2=ninstr). Sizes are baked into the instruction stream.
 bool xdna_kernel_run(xdna_kernel * kern, xdna_buffer ** args, size_t n_args);
 
+// Submit a kernel without waiting (so multiple kernels can run back-to-back).
+// Returns a run handle that must be waited with xdna_run_wait() before the
+// buffers are reused; an empty handle means the submission failed.
+xrt::run xdna_kernel_run_start(xdna_kernel * kern, xdna_buffer ** args, size_t n_args);
+
+// Wait for a started run. Returns true on success.
+bool xdna_run_wait(xrt::run & run);
+
 // --- kernel pool ----------------------------------------------------------
 
 // Populate `pool->names` from the kernel search dirs. Idempotent per pool.

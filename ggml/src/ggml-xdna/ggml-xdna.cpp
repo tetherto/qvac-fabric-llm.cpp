@@ -79,15 +79,20 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
     }
 
     // The scheduler routes ops accepted by supports_op plus the view ops that
-    // alias their data; views are no-ops here.
+    // alias their data; views are no-ops here. Kernels are submitted (started)
+    // per op and finalized once at the end, so all runs of the graph overlap.
     for (int i = 0; i < cgraph->n_nodes; i++) {
         struct ggml_tensor * node = cgraph->nodes[i];
         if (ggml_xdna_is_view_op(node->op)) {
             continue;
         }
         if (!xdna_ops_compute(&ctx->ops, node)) {
+            xdna_ops_finalize(&ctx->ops);
             return GGML_STATUS_FAILED;
         }
+    }
+    if (!xdna_ops_finalize(&ctx->ops)) {
+        return GGML_STATUS_FAILED;
     }
     return GGML_STATUS_SUCCESS;
 }

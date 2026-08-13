@@ -48,6 +48,23 @@ struct xdna_ops {
 
     std::unordered_map<weight_key, std::vector<ggml_bf16_t>, weight_hash> weight_packs;
     std::mutex weight_mutex;
+
+    // Batching: MUL_MAT ops are submitted (started without wait) and collected
+    // here; xdna_ops_finalize() waits them all, reads C back, and writes dst.
+    struct pending_run {
+        xrt::run       run;
+        xdna_buffer *  bo_c = nullptr;   // held until readback
+        xdna_buffer *  bo_a = nullptr;   // released at finalize
+        xdna_buffer *  bo_b = nullptr;
+        std::vector<float> c_buf;        // Mk x N readback target
+        int M = 0, N = 0;
+    };
+    struct pending_op {
+        struct ggml_tensor * node = nullptr;
+        std::vector<float> c_acc;        // Mk x N accumulator
+        std::vector<pending_run> runs;   // one per K-block
+    };
+    std::vector<pending_op> pending;
 };
 
 // Discover the GEMM xclbin and set up the fixed geometry.
@@ -57,4 +74,10 @@ void xdna_ops_init(xdna_ops * ops, xdna_kernel_pool * pool);
 bool xdna_ops_supported(const xdna_ops * ops, const struct ggml_tensor * op);
 
 // Execute `node` on the NPU. Dispatches per-op; returns false on failure.
+// With batching this only submits (starts) the kernels; call xdna_ops_finalize
+// after all ops of a layer to wait and write results.
 bool xdna_ops_compute(xdna_ops * ops, struct ggml_tensor * node);
+
+// Wait all pending submissions, read C back, accumulate K-blocks, write dst,
+// and release buffers. Safe to call when nothing is pending.
+bool xdna_ops_finalize(xdna_ops * ops);
