@@ -415,6 +415,10 @@ if (LLAMA_MTMD)
     # (pure CPU, no model).
     llama_build_and_test(test-mtmd-preproc-sizing.cpp LINK mtmd)
     target_include_directories(test-mtmd-preproc-sizing PRIVATE ${PROJECT_SOURCE_DIR}/tools/mtmd)
+
+    # QVAC-23075: legacy projector alias resolution, which must stay gated on general.name.
+    llama_build_and_test(test-clip-projector-alias.cpp LINK mtmd)
+    target_include_directories(test-clip-projector-alias PRIVATE ${PROJECT_SOURCE_DIR}/tools/mtmd)
 endif()
 
 llama_build_and_test(test-mtmd-impl.cpp  LABEL behavior  LINK mtmd)
