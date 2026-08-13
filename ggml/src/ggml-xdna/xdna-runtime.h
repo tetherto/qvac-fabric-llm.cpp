@@ -43,10 +43,6 @@ void          xdna_buffer_sync_to_device(xdna_buffer * buf);
 
 // --- execution ------------------------------------------------------------
 
-// Run a kernel with `n_args` host buffers (args 3.. onward; 0=opcode,
-// 1=instruction BO, 2=ninstr). Sizes are baked into the instruction stream.
-bool xdna_kernel_run(xdna_kernel * kern, xdna_buffer ** args, size_t n_args);
-
 // Submit a kernel without waiting (so multiple kernels can run back-to-back).
 // Returns a run handle that must be waited with xdna_run_wait() before the
 // buffers are reused; an empty handle means the submission failed.

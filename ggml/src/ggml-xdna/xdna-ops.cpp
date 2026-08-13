@@ -80,10 +80,6 @@ static xdna_buffer * gemm_weight_bo(xdna_ops * ops, const struct ggml_tensor * s
 // memory is transposed to B [K, N]. The stream is built per shape via
 // xdna_gemm_seq_build, so only A's rows are padded to the baked M block.
 //
-// K is split into blocks of at most GEMM_K_MAX: a per-core K-loop count above
-// 64 (K > 1024 with tile_k=16) wedges the shared hw_context, so wide-K ops run
-// as several sub-GEMMs accumulated on the host.
-//
 // Submission is batched: the kernel is started without waiting and the run is
 // queued in ops->pending; xdna_ops_finalize() waits all runs of the layer and
 // completes the op (readback, accumulation, dst).
@@ -98,7 +94,7 @@ static bool gemm_compute(xdna_ops * ops, struct ggml_tensor * node) {
     // Guaranteed to be supported: compute is only reached for ops accepted by
     // xdna_ops_supported.
     const xdna_gemm_tiles & tiles = ops->gemm_tiles;
-    const int Mk = tiles.M;   // 32-row block
+    const int Mk = tiles.M;   // baked M block
 
     const bool prof_en = ggml_xdna_profiling_enabled();
     xdna_mul_mat_profile prof;
@@ -117,35 +113,40 @@ static bool gemm_compute(xdna_ops * ops, struct ggml_tensor * node) {
     xdna_ops::pending_op op;
     op.node = node;
     op.M = M;
-
     for (int m0 = 0; m0 < M; m0 += Mk) {
-        const int mc = std::min(Mk, M - m0);
         xdna_ops::pending_m_block mb;
         mb.m0 = m0;
         mb.c_acc.assign((size_t) Mk * N, 0.0f);
+        op.m_blocks.push_back(std::move(mb));
+    }
 
-        for (int k0 = 0; k0 < K; k0 += GEMM_K_MAX) {
-            const int Kb = std::min(GEMM_K_MAX, K - k0);
-            const uint32_t b_offset = (uint32_t) k0 * N * 2;
+    // The instruction stream and its bound kernel depend only on the K-block
+    // (K=GEMM_K_MAX, N, b_offset), not on the M-block, so build each once and
+    // reuse it for every M-block.
+    for (int k0 = 0; k0 < K; k0 += GEMM_K_MAX) {
+        const int Kb = std::min(GEMM_K_MAX, K - k0);
+        const uint32_t b_offset = (uint32_t) k0 * N * 2;
 
-            // Build the instruction stream for (GEMM_K_MAX, N) with this block's
-            // B offset and cache the bound kernel under the shape key.
-            xdna_seq seq;
-            if (!xdna_gemm_seq_build(&seq, &tiles, Mk, GEMM_K_MAX, N, b_offset)) {
-                GGML_LOG_ERROR("%s: failed to build GEMM stream M=%d K=%d N=%d\n", "xdna-ops", M, K, N);
-                return false;
-            }
-            std::vector<uint32_t> insts = xdna_seq_build(&seq);
+        // Build the instruction stream for (GEMM_K_MAX, N) with this block's
+        // B offset and cache the bound kernel under the shape key.
+        xdna_seq seq;
+        if (!xdna_gemm_seq_build(&seq, &tiles, Mk, GEMM_K_MAX, N, b_offset)) {
+            GGML_LOG_ERROR("%s: failed to build GEMM stream M=%d K=%d N=%d\n", "xdna-ops", M, K, N);
+            return false;
+        }
+        std::vector<uint32_t> insts = xdna_seq_build(&seq);
 
-            char name[64];
-            snprintf(name, sizeof(name), "gemm_K%d_N%d_b%d", GEMM_K_MAX, N, k0);
-            xdna_kernel * kern = xdna_kernel_pool_get_built(ops->pool, name, ops->gemm_xclbin.c_str(),
-                                                            insts.data(), insts.size());
-            if (!kern) {
-                GGML_LOG_ERROR("%s: failed to load GEMM kernel %s\n", "xdna-ops", name);
-                return false;
-            }
+        char name[64];
+        snprintf(name, sizeof(name), "gemm_K%d_N%d_b%d", GEMM_K_MAX, N, k0);
+        xdna_kernel * kern = xdna_kernel_pool_get_built(ops->pool, name, ops->gemm_xclbin.c_str(),
+                                                        insts.data(), insts.size());
+        if (!kern) {
+            GGML_LOG_ERROR("%s: failed to load GEMM kernel %s\n", "xdna-ops", name);
+            return false;
+        }
 
+        for (auto & mb : op.m_blocks) {
+            const int mc = std::min(Mk, M - mb.m0);
             xdna_ops::pending_run pr;
             pr.bo_a = xdna_kernel_pool_acquire_buffer(ops->pool, (size_t) Mk * GEMM_K_MAX * sizeof(ggml_bf16_t));
             pr.bo_c = xdna_kernel_pool_acquire_buffer(ops->pool, (size_t) Mk * N * sizeof(float));
@@ -165,7 +166,7 @@ static bool gemm_compute(xdna_ops * ops, struct ggml_tensor * node) {
                 ggml_bf16_t * a_map = (ggml_bf16_t *) pr.bo_a->bo.map();
                 std::memset(a_map, 0, (size_t) Mk * GEMM_K_MAX * sizeof(ggml_bf16_t));
                 for (int m = 0; m < mc; m++) {
-                    ggml_fp32_to_bf16_row((const float *) src1->data + (size_t) (m0 + m) * K + k0,
+                    ggml_fp32_to_bf16_row((const float *) src1->data + (size_t) (mb.m0 + m) * K + k0,
                                           a_map + (size_t) m * GEMM_K_MAX, Kb);
                 }
                 if (prof_en) prof.a_pack += t.ms();
@@ -193,7 +194,6 @@ static bool gemm_compute(xdna_ops * ops, struct ggml_tensor * node) {
             mb.runs.push_back(std::move(pr));
             prof.n_blocks++;
         }
-        op.m_blocks.push_back(std::move(mb));
     }
 
     ops->pending.push_back(std::move(op));
@@ -207,8 +207,6 @@ static bool gemm_compute(xdna_ops * ops, struct ggml_tensor * node) {
                 prof.total, prof.a_pack, prof.sync, prof.run);
     }
 
-    GGML_LOG_INFO("%s: MUL_MAT %s M=%d K=%d N=%d blocks=%d\n",
-                  "xdna-ops", node->name, M, K, N, prof.n_blocks);
     return true;
 }
 
@@ -226,6 +224,15 @@ bool xdna_ops_finalize(xdna_ops * ops) {
             for (auto & pr : mb.runs) {
                 if (!xdna_run_wait(pr.run)) {
                     GGML_LOG_ERROR("%s: finalize: kernel wait failed\n", "xdna-ops");
+                    for (auto & fop : ops->pending) {
+                        for (auto & fmb : fop.m_blocks) {
+                            for (auto & fpr : fmb.runs) {
+                                xdna_kernel_pool_release_buffer(ops->pool, fpr.bo_a);
+                                xdna_kernel_pool_release_buffer(ops->pool, fpr.bo_c);
+                            }
+                        }
+                    }
+                    ops->pending.clear();
                     return false;
                 }
             }
@@ -285,7 +292,7 @@ static bool gemm_supported(const xdna_ops * ops, const struct ggml_tensor * op) 
     if (M <= 0) {
         return false;
     }
-    // The stream is always built for the 32-row block, so the geometry check
+    // The stream is always built for the baked M block, so the geometry check
     // is on the block M; op M is tiled into blocks.
     if (!xdna_gemm_seq_supported(&ops->gemm_tiles, ops->gemm_tiles.M, K, N)) {
         return false;

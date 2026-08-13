@@ -20,16 +20,13 @@ enum {
     HDR_W0_ROWS_SHIFT     = 24,
     HDR_W0_GEN_SHIFT      = 16,
     HDR_W0_MINOR_SHIFT    = 8,
-    HDR_W0_MAJOR_SHIFT    = 0,
     HDR_W1_MEMTILE_SHIFT  = 8,
-    HDR_W1_COLS_SHIFT     = 0,
 };
 
 enum opcode : uint32_t {
     OP_WRITE       = 0x00,   // 6 words - register write / DMA push-queue
     OP_BLOCKWRITE  = 0x01,   // 12 words - shim DMA buffer descriptor
     OP_MASKWRITE   = 0x03,   // 7 words - masked register write / issue token
-    OP_PREEMPT     = 0x06,   // 1 word
     OP_TCT         = 0x80,   // 4 words - wait for task-complete token
     OP_DDR_PATCH   = 0x81,   // 12 words - patch a BD address with a buffer's device address
 };
@@ -39,7 +36,6 @@ static constexpr uint32_t SZ_BLOCKWRITE = 12;
 static constexpr uint32_t SZ_MASKWRITE  = 7;
 static constexpr uint32_t SZ_TCT        = 4;
 static constexpr uint32_t SZ_DDR_PATCH  = 12;
-static constexpr uint32_t SZ_PREEMPT    = 1;
 
 static constexpr uint32_t SHIM_BD_BASE       = 0x1D000;  // BD length register
 static constexpr uint32_t SHIM_BD_STRIDE     = 0x20;     // per-BD register stride
@@ -150,16 +146,37 @@ void xdna_seq_wait_token(xdna_seq * seq, uint32_t col, uint32_t row, xdna_dma_di
 // Assemble the full stream (4-word header + instructions).
 std::vector<uint32_t> xdna_seq_build(const xdna_seq * seq);
 
-// GEMM tile/geometry constants baked into the IRON design (see kernels/gemm.py).
-// The geometry is fixed by the compiled xclbin; only the shape is dynamic.
+// GEMM tile/geometry constants baked into the IRON design (see kernels/gemm.py
+// and ggml/src/ggml-xdna/CMakeLists.txt, which defines GGML_XDNA_* for the
+// backend target). The geometry is fixed by the compiled xclbin; only the
+// shape is dynamic. The values must match the CMake definitions.
+#ifndef GGML_XDNA_GEMM_M
+#define GGML_XDNA_GEMM_M 32
+#endif
+#ifndef GGML_XDNA_TILE_M
+#define GGML_XDNA_TILE_M 8
+#endif
+#ifndef GGML_XDNA_TILE_K
+#define GGML_XDNA_TILE_K 16
+#endif
+#ifndef GGML_XDNA_TILE_N
+#define GGML_XDNA_TILE_N 32
+#endif
+#ifndef GGML_XDNA_N_COLS
+#define GGML_XDNA_N_COLS 8
+#endif
+#ifndef GGML_XDNA_N_COMPUTE_ROWS
+#define GGML_XDNA_N_COMPUTE_ROWS 4
+#endif
+
 struct xdna_gemm_tiles {
-    int M        = 32;   // baked M block
-    int tile_m   = 8;    // per-core M tile
-    int tile_k   = 16;   // per-core K tile
-    int tile_n   = 32;   // per-core N tile
-    int n_cols   = 8;    // AIE columns
-    int n_rows   = 4;    // compute tile rows
-    int rtp_base = 0xc400;  // per-tile RTP buffer base
+    int M        = GGML_XDNA_GEMM_M;      // baked M block
+    int tile_m   = GGML_XDNA_TILE_M;      // per-core M tile
+    int tile_k   = GGML_XDNA_TILE_K;      // per-core K tile
+    int tile_n   = GGML_XDNA_TILE_N;      // per-core N tile
+    int n_cols   = GGML_XDNA_N_COLS;      // AIE columns
+    int n_compute_rows = GGML_XDNA_N_COMPUTE_ROWS;  // compute tile rows
+    int rtp_base = 0xc400;                // per-tile RTP buffer base
 };
 
 // True when the dims fit the baked geometry: M <= M block, K multiple of

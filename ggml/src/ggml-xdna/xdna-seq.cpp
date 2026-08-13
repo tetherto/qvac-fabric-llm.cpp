@@ -147,14 +147,16 @@ static void emit_bd(xdna_seq * seq, int col, int bd_id, const xdna_bd & bd,
 bool xdna_gemm_seq_build(xdna_seq * seq, const xdna_gemm_tiles * t, int M, int K, int N,
                          uint32_t b_offset) {
     const int n_cols = t->n_cols;
-    const int n_rows = t->n_rows;
+    const int n_rows = t->n_compute_rows;
     const int tile_n = t->tile_n;
     const int tile_k = t->tile_k;
 
     const int mem_tile_n   = tile_n * n_cols;    // 128 or 256
     const int K_div_k      = K / tile_k;         // per-core K loop count
     const int n_col_tiles  = N / mem_tile_n;     // column tiles per core
-    const int n_shim_mem_A = n_cols < n_rows ? n_cols : n_rows;  // 4
+    // A shims are capped at the number of compute rows (a column can only feed
+    // as many row tiles as there are core rows).
+    const int n_shim_mem_A = n_cols < n_rows ? n_cols : n_rows;
     const int M_per_shim   = M / n_shim_mem_A;   // 8 rows of A per A shim
 
     // RTP writes + barriers (rows 2..5, cols 0..7)

@@ -52,7 +52,7 @@ struct xdna_ops {
 
     // Batching: MUL_MAT ops are submitted (started without wait) and collected
     // here; xdna_ops_finalize() waits them all, reads C back, and writes dst.
-    // Each op is tiled in M (32-row blocks) and K (GEMM_K_MAX blocks): a
+    // Each op is tiled in M (the baked M block) and K (GEMM_K_MAX blocks): a
     // pending_run is one (M-block, K-block) submission.
     struct pending_run {
         xrt::run       run;

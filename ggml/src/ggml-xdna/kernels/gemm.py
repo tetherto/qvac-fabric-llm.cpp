@@ -355,7 +355,7 @@ def bf16_f32_gemm(
     C_conss = [C_l2l3_fifos[col].cons(tile=Tile(col, 0)) for col in range(n_aie_cols)]
 
     # We are limited in the number of BDs. After synchronizing, we can reuse BDs.
-    # We only transfer 6 rows of tiles at once before starting a new transfer block.
+    # We only transfer 4 rows of tiles at once before starting a new transfer block.
     tb_max_n_rows = 4
 
     def seq_fn(A, B, C, *args):

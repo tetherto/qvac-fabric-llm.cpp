@@ -39,9 +39,8 @@ struct xdna_buffer {
     size_t   bytes = 0;
 };
 
-// Pool of kernels: auto-scans the search dirs for kernel artifacts (an
-// xclbin with a sibling .insts.bin), exposes their names, and lazily loads
-// kernels on demand. Backend-specific selection (which kernel fits an op) is
+// Pool of kernels: auto-scans the search dirs for kernel artifacts (xclbin
+// files), exposes their names, and lazily loads kernels on demand. Backend-specific selection (which kernel fits an op) is
 // done by the caller against the names. The runtime caches one hw_context per
 // xclbin uuid, so variants of one xclbin share it with no reload penalty.
 // Also pools host-visible buffers. Data only; the pool API lives in

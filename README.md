@@ -145,6 +145,10 @@ Enhanced GPU support with targeted optimizations for Qualcomm Adreno GPUs.
 - Adreno-specific Vulkan shader variants for improved throughput.
 - Vulkan Memory Allocator (VMA) integration for efficient GPU memory management.
 
+### AMD XDNA (NPU) Backend *(exclusive)*
+
+Offloads GEMM (matrix multiplication) to the AMD XDNA NPU (Ryzen AI, NPU2) via XRT for inference on Strix-class APUs. See [ggml/src/ggml-xdna/README.md](ggml/src/ggml-xdna/README.md) for build and usage instructions.
+
 ---
 
 ## Quick Start

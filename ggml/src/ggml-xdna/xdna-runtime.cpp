@@ -207,10 +207,4 @@ bool xdna_run_wait(xrt::run & run) {
     }
 }
 
-bool xdna_kernel_run(xdna_kernel * kern, xdna_buffer ** args, size_t n_args) {
-    xrt::run run = xdna_kernel_run_start(kern, args, n_args);
-    if (!run) {
-        return false;
-    }
-    return xdna_run_wait(run);
-}
+

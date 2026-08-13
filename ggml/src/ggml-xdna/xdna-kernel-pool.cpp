@@ -16,10 +16,6 @@ void xdna_kernel_pool_scan(xdna_kernel_pool * pool) {
             if (entry.path().extension() != ".xclbin") {
                 continue;
             }
-            // Only usable kernels: the instruction stream must sit next to it.
-            if (!fs::exists(dir / (entry.path().stem().string() + ".insts.bin"))) {
-                continue;
-            }
             pool->names.push_back(entry.path().stem().string());
         }
     }
