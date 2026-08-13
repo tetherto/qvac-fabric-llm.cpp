@@ -3,33 +3,29 @@
 
 #include "ggml-impl.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 #include <vector>
 
 // --- GEMM internals (static) ------------------------------------------------
 
-// Best variant for (K, N): exact K, smallest N >= N. nullptr when none.
-static const xdna_ops_gemm_variant * gemm_find(const xdna_ops * ops, int K, int N) {
-    const xdna_ops_gemm_variant * best = nullptr;
-    for (const auto & kv : ops->gemm_variants) {
-        const xdna_ops_gemm_variant & v = kv.second;
-        if (v.K != K || v.N < N) {
-            continue;
-        }
-        if (!best || v.N < best->N) {
-            best = &v;
-        }
-    }
-    return best;
-}
+// K is split into blocks of at most GEMM_K_MAX: a per-core K-loop count above
+// 64 (K > 1024 with tile_k=16) wedges the shared hw_context. GEMM_N_MAX is a
+// practical cap on N: wide projections (e.g. the vocabulary output) need a
+// huge B transpose and run too long on the NPU.
+static const int GEMM_K_MAX = 1024;
+static const int GEMM_N_MAX = 16384;
 
 // MUL_MAT follows ggml's convention: src0 = weights [K, N] (stored as N rows
 // of K), src1 = activations [K, M] (stored as M rows of K), so dst[M, N] =
 // src1^T @ src0. src1's memory feeds the kernel directly as A [M, K]; src0's
-// memory is transposed to B [K, N]. Inputs are zero-padded to the chosen
-// variant's baked block and the first M x N slice of C is written back to
-// dst.
+// memory is transposed to B [K, N]. The stream is built per shape via
+// xdna_gemm_seq_build, so only A's rows are padded to the baked M block.
+//
+// K is split into blocks of at most GEMM_K_MAX: a per-core K-loop count above
+// 64 (K > 1024 with tile_k=16) wedges the shared hw_context, so wide-K ops run
+// as several sub-GEMMs accumulated on the host.
 static bool gemm_compute(xdna_ops * ops, struct ggml_tensor * node) {
     const struct ggml_tensor * src0 = node->src[0];
     const struct ggml_tensor * src1 = node->src[1];
@@ -39,92 +35,119 @@ static bool gemm_compute(xdna_ops * ops, struct ggml_tensor * node) {
     const int K = (int) src1->ne[0];
     const int N = (int) src0->ne[1];
 
-    // Guaranteed to have a variant: compute is only reached for ops accepted
-    // by xdna_ops_supported, so just pick the right one.
-    const xdna_ops_gemm_variant * variant = gemm_find(ops, K, N);
-    GGML_ASSERT(variant != nullptr);
+    // Guaranteed to be supported: compute is only reached for ops accepted by
+    // xdna_ops_supported.
+    const xdna_gemm_tiles & tiles = ops->gemm_tiles;
+    const int Mk = tiles.M;
 
-    xdna_kernel * kern = xdna_kernel_pool_get(ops->pool, variant->name);
-    if (!kern) {
-        GGML_LOG_ERROR("%s: failed to load GEMM kernel %s\n", "xdna-ops", variant->name.c_str());
-        return false;
-    }
+    std::vector<float> c_acc((size_t) Mk * N, 0.0f);
 
-    const int Mk = variant->M;
-    const int Kk = variant->K;
-    const int Nk = variant->N;
+    // All blocks use the full GEMM_K_MAX kernel: a partial K block (K < 1024)
+    // after a run of full blocks wedges the shared hw_context, so the last
+    // block is zero-padded in K and runs the same K1024 kernel as the rest.
+    xdna_kernel * kern = nullptr;
+    for (int k0 = 0; k0 < K; k0 += GEMM_K_MAX) {
+        const int Kb = std::min(GEMM_K_MAX, K - k0);
 
-    xdna_buffer * bo_a = xdna_kernel_pool_acquire_buffer(ops->pool, (size_t) Mk * Kk * sizeof(ggml_bf16_t));
-    xdna_buffer * bo_b = xdna_kernel_pool_acquire_buffer(ops->pool, (size_t) Kk * Nk * sizeof(ggml_bf16_t));
-    xdna_buffer * bo_c = xdna_kernel_pool_acquire_buffer(ops->pool, (size_t) Mk * Nk * sizeof(float));
-    if (!bo_a || !bo_b || !bo_c) {
-        if (bo_a) xdna_kernel_pool_release_buffer(ops->pool, bo_a);
-        if (bo_b) xdna_kernel_pool_release_buffer(ops->pool, bo_b);
-        if (bo_c) xdna_kernel_pool_release_buffer(ops->pool, bo_c);
-        GGML_LOG_ERROR("%s: failed to allocate GEMM buffers\n", "xdna-ops");
-        return false;
-    }
+        // Build the instruction stream for (GEMM_K_MAX, N) and cache the bound
+        // kernel under the shape key.
+        if (!kern) {
+            xdna_seq seq;
+            if (!xdna_gemm_seq_build(&seq, &tiles, Mk, GEMM_K_MAX, N)) {
+                GGML_LOG_ERROR("%s: failed to build GEMM stream M=%d K=%d N=%d\n", "xdna-ops", M, K, N);
+                return false;
+            }
+            std::vector<uint32_t> insts = xdna_seq_build(&seq);
 
-    // The BOs are host-visible, so write straight into their mapped memory:
-    // one copy instead of host vector + write. Pads are zeroed (stale data
-    // from the pool must not leak past the real M x N block).
-
-    // B: ggml src0 [K, N] -> kernel [Kk x Nk] bf16, transposed + padded.
-    ggml_bf16_t * b_map = (ggml_bf16_t *) bo_b->bo.map();
-    std::memset(b_map, 0, (size_t) Kk * Nk * sizeof(ggml_bf16_t));
-    if (src0->type == GGML_TYPE_BF16) {
-        const auto * d = (const ggml_bf16_t *) src0->data;
-        for (int n = 0; n < N; n++) {
-            for (int k = 0; k < K; k++) {
-                b_map[(size_t) k * Nk + n] = d[(size_t) n * K + k];
+            char name[64];
+            snprintf(name, sizeof(name), "gemm_K%d_N%d", GEMM_K_MAX, N);
+            kern = xdna_kernel_pool_get_built(ops->pool, name, ops->gemm_xclbin.c_str(),
+                                              insts.data(), insts.size());
+            if (!kern) {
+                GGML_LOG_ERROR("%s: failed to load GEMM kernel %s\n", "xdna-ops", name);
+                return false;
             }
         }
-    } else { // GGML_TYPE_F16
-        std::vector<float> row(K);
-        for (int n = 0; n < N; n++) {
-            ggml_fp16_to_fp32_row((const ggml_fp16_t *) src0->data + (size_t) n * K, row.data(), K);
-            for (int k = 0; k < K; k++) {
-                ggml_fp32_to_bf16_row(&row[k], &b_map[(size_t) k * Nk + n], 1);
+
+        xdna_buffer * bo_a = xdna_kernel_pool_acquire_buffer(ops->pool, (size_t) Mk * GEMM_K_MAX * sizeof(ggml_bf16_t));
+        xdna_buffer * bo_b = xdna_kernel_pool_acquire_buffer(ops->pool, (size_t) GEMM_K_MAX * N * sizeof(ggml_bf16_t));
+        xdna_buffer * bo_c = xdna_kernel_pool_acquire_buffer(ops->pool, (size_t) Mk * N * sizeof(float));
+        if (!bo_a || !bo_b || !bo_c) {
+            if (bo_a) xdna_kernel_pool_release_buffer(ops->pool, bo_a);
+            if (bo_b) xdna_kernel_pool_release_buffer(ops->pool, bo_b);
+            if (bo_c) xdna_kernel_pool_release_buffer(ops->pool, bo_c);
+            GGML_LOG_ERROR("%s: failed to allocate GEMM buffers\n", "xdna-ops");
+            return false;
+        }
+
+        // The BOs are host-visible, so write straight into their mapped memory.
+        // A's padding rows are zeroed (the pool may hand back a reused BO); B's
+        // K-padding is zeroed too, so a partial K block adds nothing.
+
+        // B: ggml src0 [k0:k0+Kb, N] -> kernel [GEMM_K_MAX x N] bf16, transposed
+        // and zero-padded in K.
+        ggml_bf16_t * b_map = (ggml_bf16_t *) bo_b->bo.map();
+        std::memset(b_map, 0, (size_t) GEMM_K_MAX * N * sizeof(ggml_bf16_t));
+        if (src0->type == GGML_TYPE_BF16) {
+            const auto * d = (const ggml_bf16_t *) src0->data;
+            for (int n = 0; n < N; n++) {
+                for (int k = 0; k < Kb; k++) {
+                    b_map[(size_t) k * N + n] = d[(size_t) n * K + k0 + k];
+                }
+            }
+        } else { // GGML_TYPE_F16
+            std::vector<float> row(K);
+            for (int n = 0; n < N; n++) {
+                ggml_fp16_to_fp32_row((const ggml_fp16_t *) src0->data + (size_t) n * K, row.data(), K);
+                for (int k = 0; k < Kb; k++) {
+                    ggml_fp32_to_bf16_row(&row[k0 + k], &b_map[(size_t) k * N + n], 1);
+                }
             }
         }
-    }
 
-    // A: src1 [M rows of K] f32 -> [Mk x Kk] bf16, rows padded.
-    ggml_bf16_t * a_map = (ggml_bf16_t *) bo_a->bo.map();
-    std::memset(a_map, 0, (size_t) Mk * Kk * sizeof(ggml_bf16_t));
-    for (int m = 0; m < M; m++) {
-        ggml_fp32_to_bf16_row((const float *) src1->data + (size_t) m * K,
-                              a_map + (size_t) m * Kk, K);
-    }
+        // A: src1 [M rows of K] f32 -> [Mk x GEMM_K_MAX] bf16, K-slice + rows
+        // padded, zero-padded in K past Kb.
+        ggml_bf16_t * a_map = (ggml_bf16_t *) bo_a->bo.map();
+        std::memset(a_map, 0, (size_t) Mk * GEMM_K_MAX * sizeof(ggml_bf16_t));
+        for (int m = 0; m < M; m++) {
+            ggml_fp32_to_bf16_row((const float *) src1->data + (size_t) m * K + k0,
+                                  a_map + (size_t) m * GEMM_K_MAX, Kb);
+        }
 
-    xdna_buffer_sync_to_device(bo_a);
-    xdna_buffer_sync_to_device(bo_b);
+        xdna_buffer_sync_to_device(bo_a);
+        xdna_buffer_sync_to_device(bo_b);
 
-    std::vector<float> c_buf((size_t) Mk * Nk, 0);
-    xdna_buffer * args[3] = { bo_a, bo_b, bo_c };
-    if (!xdna_kernel_run(kern, args, 3)) {
-        GGML_LOG_ERROR("%s: GEMM run failed M=%d K=%d N=%d kernel=%s\n",
-                       "xdna-ops", M, K, N, variant->name.c_str());
+        std::vector<float> c_buf((size_t) Mk * N, 0);
+        xdna_buffer * args[3] = { bo_a, bo_b, bo_c };
+        if (!xdna_kernel_run(kern, args, 3)) {
+            GGML_LOG_ERROR("%s: GEMM run failed M=%d K=%d N=%d kernel=gemm_K%d_N%d\n",
+                           "xdna-ops", M, K, N, GEMM_K_MAX, N);
+            xdna_kernel_pool_release_buffer(ops->pool, bo_a);
+            xdna_kernel_pool_release_buffer(ops->pool, bo_b);
+            xdna_kernel_pool_release_buffer(ops->pool, bo_c);
+            return false;
+        }
+        xdna_buffer_read(bo_c, c_buf.data(), (size_t) Mk * N * sizeof(float));
+
         xdna_kernel_pool_release_buffer(ops->pool, bo_a);
         xdna_kernel_pool_release_buffer(ops->pool, bo_b);
         xdna_kernel_pool_release_buffer(ops->pool, bo_c);
-        return false;
+
+        // Accumulate this K-block's contribution.
+        for (size_t i = 0; i < (size_t) Mk * N; i++) {
+            c_acc[i] += c_buf[i];
+        }
     }
-    xdna_buffer_read(bo_c, c_buf.data(), (size_t) Mk * Nk * sizeof(float));
 
-    xdna_kernel_pool_release_buffer(ops->pool, bo_a);
-    xdna_kernel_pool_release_buffer(ops->pool, bo_b);
-    xdna_kernel_pool_release_buffer(ops->pool, bo_c);
-
-    // Write the M x N slice of C into dst.
+    // Write the M x N slice of the accumulated result into dst.
     for (int m = 0; m < M; m++) {
         std::memcpy((char *) dst->data + (size_t) m * dst->nb[1],
-                    c_buf.data() + (size_t) m * Nk, (size_t) N * sizeof(float));
+                    c_acc.data() + (size_t) m * N, (size_t) N * sizeof(float));
     }
 
-    GGML_LOG_INFO("%s: MUL_MAT %s M=%d K=%d N=%d kernel=%s\n",
+    GGML_LOG_INFO("%s: MUL_MAT %s M=%d K=%d N=%d blocks=%d\n",
                   "xdna-ops", node->name ? node->name : "?", M, K, N,
-                  variant->name.c_str());
+                  (K + GEMM_K_MAX - 1) / GEMM_K_MAX);
     return true;
 }
 
@@ -143,8 +166,15 @@ static bool gemm_supported(const xdna_ops * ops, const struct ggml_tensor * op) 
     const int N = (int) src0->ne[1];
     const int M = (int) src1->ne[1];
 
-    const xdna_ops_gemm_variant * variant = gemm_find(ops, K, N);
-    if (!variant || M <= 0 || M > variant->M) {
+    if (ops->gemm_xclbin.empty()) {
+        return false;
+    }
+    if (!xdna_gemm_seq_supported(&ops->gemm_tiles, M, K, N)) {
+        return false;
+    }
+    // Practical cap on N: wide projections (e.g. the vocabulary output) need a
+    // huge B transpose and run too long on the NPU; those stay on the CPU.
+    if (N > GEMM_N_MAX) {
         return false;
     }
     if (src0->ne[0] != K) {
@@ -170,16 +200,13 @@ static bool gemm_supported(const xdna_ops * ops, const struct ggml_tensor * op) 
 
 void xdna_ops_init(xdna_ops * ops, xdna_kernel_pool * pool) {
     ops->pool = pool;
-    ops->gemm_variants.clear();
+    ops->gemm_tiles = xdna_gemm_tiles{};
+    ops->gemm_xclbin.clear();
     for (const std::string & name : pool->names) {
-        int M = 0, K = 0, N = 0, n_cols = 0;
-        if (sscanf(name.c_str(), "gemm_bf16_f32_M%d_K%d_N%d_c%d", &M, &K, &N, &n_cols) != 4) {
-            continue;
+        if (name.rfind("gemm_bf16_f32_", 0) == 0) {
+            ops->gemm_xclbin = name;
+            break;
         }
-        if (M <= 0 || K <= 0 || N <= 0 || n_cols <= 0) {
-            continue;
-        }
-        ops->gemm_variants[name] = {M, K, N, n_cols, N < 256 ? 16 : 32, name};
     }
 }
 

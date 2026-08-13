@@ -46,6 +46,42 @@ xdna_kernel * xdna_kernel_pool_get(xdna_kernel_pool * pool, const std::string & 
     return kern;
 }
 
+xdna_kernel * xdna_kernel_pool_get_built(xdna_kernel_pool * pool, const std::string & name,
+                                         const char * xclbin_name, const uint32_t * insts, size_t n_words) {
+    std::lock_guard<std::mutex> lock(pool->kernel_mutex);
+
+    auto it = pool->kernels.find(name);
+    if (it != pool->kernels.end()) {
+        return it->second;
+    }
+
+    // nullptr is sticky: a failed lookup is not retried.
+    pool->kernels[name] = nullptr;
+
+    // `xclbin_name` is the artifact stem; resolve it to a real path.
+    xdna_kernel * kern = nullptr;
+    for (const fs::path & dir : xdna_kernel_search_dirs()) {
+        const fs::path xclbin = dir / (std::string(xclbin_name) + ".xclbin");
+        if (fs::exists(xclbin)) {
+            kern = xdna_kernel_load_hw(pool->device, xclbin.c_str());
+            break;
+        }
+    }
+    if (!kern) {
+        GGML_LOG_WARN("%s: kernel %s (hw %s) not found\n", "xdna-kernel-pool",
+                      name.c_str(), xclbin_name);
+        pool->kernels[name] = nullptr;
+        return nullptr;
+    }
+    if (!xdna_kernel_bind_insts(pool->device, kern, insts, n_words)) {
+        xdna_kernel_free(kern);
+        pool->kernels[name] = nullptr;
+        return nullptr;
+    }
+    pool->kernels[name] = kern;
+    return kern;
+}
+
 xdna_buffer * xdna_kernel_pool_acquire_buffer(xdna_kernel_pool * pool, size_t bytes) {
     {
         std::lock_guard<std::mutex> lock(pool->pool_mutex);

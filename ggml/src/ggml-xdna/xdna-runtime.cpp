@@ -81,7 +81,10 @@ std::vector<fs::path> xdna_kernel_search_dirs(void) {
     return dirs;
 }
 
-xdna_kernel * xdna_kernel_load(xdna_device * dev, const char * xclbin_path, const char * insts_path) {
+// Load an xclbin into a kernel handle without an instruction stream. The
+// stream is bound later with xdna_kernel_bind_insts. Returns nullptr on
+// failure.
+xdna_kernel * xdna_kernel_load_hw(xdna_device * dev, const char * xclbin_path) {
     if (!dev) {
         GGML_LOG_ERROR("%s: kernel load: no device\n", "xdna-runtime");
         return nullptr;
@@ -112,25 +115,55 @@ xdna_kernel * xdna_kernel_load(xdna_device * dev, const char * xclbin_path, cons
             return nullptr;
         }
 
-        std::vector<uint32_t> insts = read_file_u32(insts_path);
-        if (insts.empty()) {
-            GGML_LOG_ERROR("%s: empty instruction stream %s\n", "xdna-runtime", insts_path);
-            return nullptr;
-        }
-
         xdna_kernel * kern = new xdna_kernel;
         kern->context      = context;
         kern->kernel       = xrt::kernel(*context, kernels[0].get_name());
-        kern->insts_bytes  = (int64_t)(insts.size() * sizeof(uint32_t));
-        kern->insts_bo     = xrt::bo(dev->device, (size_t) kern->insts_bytes,
-                                     xrt::bo::flags::cacheable, kern->kernel.group_id(1));
-        std::memcpy(kern->insts_bo.map(), insts.data(), (size_t) kern->insts_bytes);
-        kern->insts_bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
         return kern;
     } catch (const std::exception & e) {
         GGML_LOG_ERROR("%s: failed to load kernel %s: %s\n", "xdna-runtime", xclbin_path, e.what());
         return nullptr;
     }
+}
+
+// Bind an in-memory instruction stream to a loaded kernel. The insts BO is
+// created on group 1 (the instruction buffer). `dev` must be the same handle
+// used for the data buffers (XRT treats copies of xrt::device as distinct;
+// mixing them can wedge submissions). Returns false on failure.
+bool xdna_kernel_bind_insts(xdna_device * dev, xdna_kernel * kern, const uint32_t * insts, size_t n_words) {
+    if (!dev || !kern || !insts || n_words == 0) {
+        GGML_LOG_ERROR("%s: bind insts: null device/kernel/insts or empty stream\n", "xdna-runtime");
+        return false;
+    }
+    try {
+        kern->insts_bytes = (int64_t)(n_words * sizeof(uint32_t));
+        kern->insts_bo    = xrt::bo(dev->device, (size_t) kern->insts_bytes,
+                                    xrt::bo::flags::cacheable, kern->kernel.group_id(1));
+        std::memcpy(kern->insts_bo.map(), insts, (size_t) kern->insts_bytes);
+        kern->insts_bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+        return true;
+    } catch (const std::exception & e) {
+        GGML_LOG_ERROR("%s: failed to bind instruction stream: %s\n", "xdna-runtime", e.what());
+        return false;
+    }
+}
+
+xdna_kernel * xdna_kernel_load(xdna_device * dev, const char * xclbin_path, const char * insts_path) {
+    xdna_kernel * kern = xdna_kernel_load_hw(dev, xclbin_path);
+    if (!kern) {
+        return nullptr;
+    }
+
+    std::vector<uint32_t> insts = read_file_u32(insts_path);
+    if (insts.empty()) {
+        GGML_LOG_ERROR("%s: empty instruction stream %s\n", "xdna-runtime", insts_path);
+        xdna_kernel_free(kern);
+        return nullptr;
+    }
+    if (!xdna_kernel_bind_insts(dev, kern, insts.data(), insts.size())) {
+        xdna_kernel_free(kern);
+        return nullptr;
+    }
+    return kern;
 }
 
 xdna_kernel * xdna_kernel_load_search(xdna_device * dev, const char * xclbin_name, const char * insts_name) {

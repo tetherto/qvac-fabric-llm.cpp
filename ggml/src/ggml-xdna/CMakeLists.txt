@@ -6,6 +6,7 @@ ggml_add_backend_library(ggml-xdna
                          ggml-xdna.cpp
                          xdna-runtime.cpp
                          xdna-kernel-pool.cpp
+                         xdna-seq.cpp
                          xdna-ops.cpp
                         )
 

@@ -5,30 +5,24 @@
 // implemented so far; other ops get their own helpers here.
 
 #include "xdna-types.h"
+#include "xdna-runtime.h"
+#include "xdna-seq.h"
 
 #include <map>
 #include <string>
 
 struct ggml_tensor;
 
-// A GEMM kernel variant metadata, parsed from the pool's kernel names.
-struct xdna_ops_gemm_variant {
-    int         M, K, N;   // baked block dims
-    int         n_cols;    // AIE columns the kernel was compiled for
-    int         tile_n;    // per-core N tile: 16 for N < 256, else 32
-    std::string name;      // pool name / artifact stem
-};
-
 // Operator-specific state. Data only; the API lives below as C-style
 // functions.
 struct xdna_ops {
     xdna_kernel_pool * pool = nullptr;
 
-    // GEMM variants by kernel name, parsed once from pool->names.
-    std::map<std::string, xdna_ops_gemm_variant> gemm_variants;
+    xdna_gemm_tiles gemm_tiles;     // GEMM geometry baked into the xclbin
+    std::string     gemm_xclbin;    // discovered xclbin name (geometry provider)
 };
 
-// Parse the GEMM-shaped names from the pool.
+// Discover the GEMM xclbin and set up the fixed geometry.
 void xdna_ops_init(xdna_ops * ops, xdna_kernel_pool * pool);
 
 // True when `op` can be run on the NPU. Dispatches per-op (only GEMM so far).

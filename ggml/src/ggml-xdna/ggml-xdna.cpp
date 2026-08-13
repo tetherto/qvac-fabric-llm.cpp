@@ -35,7 +35,7 @@ static ggml_backend_xdna_context * ggml_xdna_device_context(void) {
             ctx.pool->device = ctx.device;
             xdna_kernel_pool_scan(ctx.pool);
             xdna_ops_init(&ctx.ops, ctx.pool);
-            if (ctx.ops.gemm_variants.empty()) {
+            if (ctx.ops.gemm_xclbin.empty()) {
                 GGML_LOG_WARN("%s: no GEMM kernels found (build with GGML_XDNA=ON "
                               "or set GGML_XDNA_KERNELS_DIR)\n", "ggml-xdna");
             }

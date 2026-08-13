@@ -26,6 +26,14 @@ std::vector<std::filesystem::path> xdna_kernel_search_dirs(void);
 // failure.
 xdna_kernel * xdna_kernel_load(xdna_device * dev, const char * xclbin_path, const char * insts_path);
 
+// Load an xclbin into a kernel handle without an instruction stream; bind one
+// later with xdna_kernel_bind_insts. Returns nullptr on failure.
+xdna_kernel * xdna_kernel_load_hw(xdna_device * dev, const char * xclbin_path);
+
+// Bind an in-memory instruction stream (TXN words) to a loaded kernel. `dev`
+// must be the same handle used for the data buffers.
+bool xdna_kernel_bind_insts(xdna_device * dev, xdna_kernel * kern, const uint32_t * insts, size_t n_words);
+
 // Like xdna_kernel_load, but resolve `xclbin_name`/`insts_name` against the
 // kernel search dirs (GGML_XDNA_KERNELS_DIR, the backend dir, the executable
 // dir, cwd).
@@ -63,6 +71,12 @@ void xdna_kernel_pool_scan(xdna_kernel_pool * pool);
 // Load (or fetch from cache) the kernel for `name`. A failed lookup is
 // cached and not retried.
 xdna_kernel * xdna_kernel_pool_get(xdna_kernel_pool * pool, const std::string & name);
+
+// Load (or fetch from cache) a kernel for `name` with an in-memory built
+// instruction stream: on a miss, load the hw from `xclbin_name` and bind the
+// stream. A failed lookup is cached and not retried.
+xdna_kernel * xdna_kernel_pool_get_built(xdna_kernel_pool * pool, const std::string & name,
+                                         const char * xclbin_name, const uint32_t * insts, size_t n_words);
 
 // Acquire a device buffer of at least `bytes` bytes, reusing an idle one from
 // the pool when possible.
