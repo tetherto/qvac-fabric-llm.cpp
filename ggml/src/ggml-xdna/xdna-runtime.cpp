@@ -8,7 +8,6 @@
 
 #include <cstdlib>
 #include <cstring>
-#include <fstream>
 #include <filesystem>
 #include <map>
 #include <mutex>
@@ -26,20 +25,6 @@ static constexpr int XAIE_NPU_OPCODE_RUN = 3;
 static std::mutex                                            g_ctx_mutex;
 static std::map<xrt::uuid, std::shared_ptr<xrt::hw_context>> g_ctxs;
 
-static std::vector<uint32_t> read_file_u32(const char * path) {
-    std::vector<uint32_t> data;
-    std::ifstream f(path, std::ios::binary);
-    if (!f) {
-        return data;
-    }
-    f.seekg(0, std::ios::end);
-    const size_t size = (size_t) f.tellg();
-    f.seekg(0, std::ios::beg);
-    data.resize(size / sizeof(uint32_t));
-    f.read((char *) data.data(), size);
-    return data;
-}
-
 // --- device -----------------------------------------------------------
 
 xdna_device * xdna_device_open(void) {
@@ -56,17 +41,10 @@ xdna_device * xdna_device_open(void) {
     return dev;
 }
 
-void xdna_device_close(xdna_device * dev) {
-    delete dev;
-}
-
 // --- kernel -------------------------------------------------------------
 
 std::vector<fs::path> xdna_kernel_search_dirs(void) {
     std::vector<fs::path> dirs;
-    if (const char * env_dir = getenv("GGML_XDNA_KERNELS_DIR")) {
-        dirs.emplace_back(env_dir);
-    }
 #ifdef GGML_BACKEND_DIR
     dirs.emplace_back(GGML_BACKEND_DIR);
 #endif
@@ -147,41 +125,6 @@ bool xdna_kernel_bind_insts(xdna_device * dev, xdna_kernel * kern, const uint32_
     }
 }
 
-xdna_kernel * xdna_kernel_load(xdna_device * dev, const char * xclbin_path, const char * insts_path) {
-    xdna_kernel * kern = xdna_kernel_load_hw(dev, xclbin_path);
-    if (!kern) {
-        return nullptr;
-    }
-
-    std::vector<uint32_t> insts = read_file_u32(insts_path);
-    if (insts.empty()) {
-        GGML_LOG_ERROR("%s: empty instruction stream %s\n", "xdna-runtime", insts_path);
-        xdna_kernel_free(kern);
-        return nullptr;
-    }
-    if (!xdna_kernel_bind_insts(dev, kern, insts.data(), insts.size())) {
-        xdna_kernel_free(kern);
-        return nullptr;
-    }
-    return kern;
-}
-
-xdna_kernel * xdna_kernel_load_search(xdna_device * dev, const char * xclbin_name, const char * insts_name) {
-    if (!dev || !xclbin_name || !insts_name) {
-        return nullptr;
-    }
-    for (const fs::path & dir : xdna_kernel_search_dirs()) {
-        const fs::path xclbin = dir / xclbin_name;
-        const fs::path insts  = dir / insts_name;
-        if (fs::exists(xclbin) && fs::exists(insts)) {
-            return xdna_kernel_load(dev, xclbin.c_str(), insts.c_str());
-        }
-    }
-    GGML_LOG_ERROR("%s: kernel not found: %s (set GGML_XDNA_KERNELS_DIR)\n",
-                   "xdna-runtime", xclbin_name);
-    return nullptr;
-}
-
 void xdna_kernel_free(xdna_kernel * kern) {
     delete kern;
 }
@@ -207,11 +150,6 @@ xdna_buffer * xdna_buffer_alloc(xdna_device * dev, size_t bytes) {
 
 void xdna_buffer_free(xdna_buffer * buf) {
     delete buf;
-}
-
-void xdna_buffer_write(xdna_buffer * buf, const void * host, size_t bytes) {
-    std::memcpy(buf->bo.map(), host, bytes);
-    buf->bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
 }
 
 void xdna_buffer_sync_to_device(xdna_buffer * buf) {

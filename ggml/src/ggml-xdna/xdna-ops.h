@@ -52,17 +52,24 @@ struct xdna_ops {
 
     // Batching: MUL_MAT ops are submitted (started without wait) and collected
     // here; xdna_ops_finalize() waits them all, reads C back, and writes dst.
+    // Each op is tiled in M (32-row blocks) and K (GEMM_K_MAX blocks): a
+    // pending_run is one (M-block, K-block) submission.
     struct pending_run {
         xrt::run       run;
         xdna_buffer *  bo_c = nullptr;   // held until readback
         xdna_buffer *  bo_a = nullptr;   // released at finalize
         std::vector<float> c_buf;        // Mk x N readback target
-        int M = 0, N = 0;
+        int N = 0;
+    };
+    struct pending_m_block {
+        int m0 = 0;                      // dst row offset of this M-block
+        std::vector<float> c_acc;        // Mk x N accumulator
+        std::vector<pending_run> runs;   // one per K-block
     };
     struct pending_op {
         struct ggml_tensor * node = nullptr;
-        std::vector<float> c_acc;        // Mk x N accumulator
-        std::vector<pending_run> runs;   // one per K-block
+        int M = 0;                       // total rows of the op
+        std::vector<pending_m_block> m_blocks;
     };
     std::vector<pending_op> pending;
 };

@@ -25,27 +25,6 @@ void xdna_kernel_pool_scan(xdna_kernel_pool * pool) {
     }
 }
 
-xdna_kernel * xdna_kernel_pool_get(xdna_kernel_pool * pool, const std::string & name) {
-    std::lock_guard<std::mutex> lock(pool->kernel_mutex);
-
-    auto it = pool->kernels.find(name);
-    if (it != pool->kernels.end()) {
-        return it->second;
-    }
-
-    // nullptr is sticky: a failed lookup is not retried.
-    pool->kernels[name] = nullptr;
-
-    xdna_kernel * kern = xdna_kernel_load_search(pool->device,
-            (name + ".xclbin").c_str(), (name + ".insts.bin").c_str());
-    if (!kern) {
-        GGML_LOG_WARN("%s: kernel %s not found (set GGML_XDNA_KERNELS_DIR)\n",
-                      "xdna-kernel-pool", name.c_str());
-    }
-    pool->kernels[name] = kern;
-    return kern;
-}
-
 xdna_kernel * xdna_kernel_pool_get_built(xdna_kernel_pool * pool, const std::string & name,
                                          const char * xclbin_name, const uint32_t * insts, size_t n_words) {
     std::lock_guard<std::mutex> lock(pool->kernel_mutex);
@@ -117,17 +96,4 @@ void xdna_kernel_pool_release_buffer(xdna_kernel_pool * pool, xdna_buffer * buf)
         xdna_buffer_free(pool->pool[lru].buf);
         pool->pool.erase(pool->pool.begin() + lru);
     }
-}
-
-void xdna_kernel_pool_clear(xdna_kernel_pool * pool) {
-    for (auto & kv : pool->kernels) {
-        if (kv.second) {
-            xdna_kernel_free(kv.second);
-        }
-    }
-    pool->kernels.clear();
-    for (const auto & e : pool->pool) {
-        xdna_buffer_free(e.buf);
-    }
-    pool->pool.clear();
 }
