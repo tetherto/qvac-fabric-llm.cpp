@@ -3,25 +3,11 @@
 
 #include "ggml-impl.h"
 
-#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <vector>
 
-void xdna_ops_init(xdna_ops * ops, xdna_kernel_pool * pool) {
-    ops->pool = pool;
-    ops->gemm_variants.clear();
-    for (const std::string & name : pool->names) {
-        int M = 0, K = 0, N = 0, n_cols = 0;
-        if (sscanf(name.c_str(), "gemm_bf16_f32_M%d_K%d_N%d_c%d", &M, &K, &N, &n_cols) != 4) {
-            continue;
-        }
-        if (M <= 0 || K <= 0 || N <= 0 || n_cols <= 0) {
-            continue;
-        }
-        ops->gemm_variants[name] = {M, K, N, n_cols, N < 256 ? 16 : 32, name};
-    }
-}
+// --- GEMM internals (static) ------------------------------------------------
 
 // Best variant for (K, N): exact K, smallest N >= N. nullptr when none.
 static const xdna_ops_gemm_variant * gemm_find(const xdna_ops * ops, int K, int N) {
@@ -38,59 +24,12 @@ static const xdna_ops_gemm_variant * gemm_find(const xdna_ops * ops, int K, int 
     return best;
 }
 
-static bool gemm_supported(const xdna_ops * ops, const struct ggml_tensor * op) {
-    if (op->op != GGML_OP_MUL_MAT) {
-        return false;
-    }
-
-    const struct ggml_tensor * src0 = op->src[0];
-    const struct ggml_tensor * src1 = op->src[1];
-    if (!src0 || !src1) {
-        return false;
-    }
-
-    const int K = (int) src1->ne[0];
-    const int N = (int) src0->ne[1];
-    const int M = (int) src1->ne[1];
-
-    const xdna_ops_gemm_variant * variant = gemm_find(ops, K, N);
-    if (!variant || M <= 0 || M > variant->M) {
-        return false;
-    }
-    if (src0->ne[0] != K) {
-        return false;
-    }
-    if (src0->ne[2] * src0->ne[3] != 1 || src1->ne[2] * src1->ne[3] != 1) {
-        return false;
-    }
-    if (src1->type != GGML_TYPE_F32 || op->type != GGML_TYPE_F32) {
-        return false;
-    }
-    if (src0->type != GGML_TYPE_BF16 && src0->type != GGML_TYPE_F16) {
-        return false;
-    }
-    if (!ggml_is_contiguous(op) || !ggml_is_contiguous(src0) || !ggml_is_contiguous(src1)) {
-        return false;
-    }
-
-    return true;
-}
-
-bool xdna_ops_supported(const xdna_ops * ops, const struct ggml_tensor * op) {
-    switch (op->op) {
-        case GGML_OP_MUL_MAT:
-            return gemm_supported(ops, op);
-        default:
-            return false;
-    }
-}
-
 // MUL_MAT follows ggml's convention: src0 = weights [K, N] (stored as N rows
 // of K), src1 = activations [K, M] (stored as M rows of K), so dst[M, N] =
 // src1^T @ src0. src1's memory feeds the kernel directly as A [M, K]; src0's
 // memory is transposed to B [K, N]. Inputs are zero-padded to the chosen
 // variant's baked block and the first M x N slice of C is written back to
-// dst. Always cross-checks against a CPU reference.
+// dst.
 static bool gemm_compute(xdna_ops * ops, struct ggml_tensor * node) {
     const struct ggml_tensor * src0 = node->src[0];
     const struct ggml_tensor * src1 = node->src[1];
@@ -101,7 +40,7 @@ static bool gemm_compute(xdna_ops * ops, struct ggml_tensor * node) {
     const int N = (int) src0->ne[1];
 
     // Guaranteed to have a variant: compute is only reached for ops accepted
-    // by xdna_ops_gemm_supported, so just pick the right one.
+    // by xdna_ops_supported, so just pick the right one.
     const xdna_ops_gemm_variant * variant = gemm_find(ops, K, N);
     GGML_ASSERT(variant != nullptr);
 
@@ -177,41 +116,80 @@ static bool gemm_compute(xdna_ops * ops, struct ggml_tensor * node) {
     xdna_kernel_pool_release_buffer(ops->pool, bo_b);
     xdna_kernel_pool_release_buffer(ops->pool, bo_c);
 
-    // CPU reference: same bf16 inputs, f32 accumulation.
-    std::vector<float> b_f32((size_t) K * N);
-    for (int n = 0; n < N; n++) {
-        if (src0->type == GGML_TYPE_BF16) {
-            ggml_bf16_to_fp32_row((const ggml_bf16_t *) src0->data + (size_t) n * K,
-                                  b_f32.data() + (size_t) n * K, K);
-        } else {
-            ggml_fp16_to_fp32_row((const ggml_fp16_t *) src0->data + (size_t) n * K,
-                                  b_f32.data() + (size_t) n * K, K);
-        }
-    }
-    const float * A = (const float *) src1->data;
-    float max_abs = 0.0f, max_rel = 0.0f;
-    for (int m = 0; m < M; m++) {
-        for (int n = 0; n < N; n++) {
-            float ref = 0.0f;
-            for (int k = 0; k < K; k++) {
-                ref += A[(size_t) m * K + k] * b_f32[(size_t) n * K + k];
-            }
-            const float err = fabsf(c_buf[(size_t) m * Nk + n] - ref);
-            max_abs = fmaxf(max_abs, err);
-            max_rel = fmaxf(max_rel, err / fmaxf(fabsf(ref), 1e-6f));
-        }
-    }
-
     // Write the M x N slice of C into dst.
     for (int m = 0; m < M; m++) {
         std::memcpy((char *) dst->data + (size_t) m * dst->nb[1],
                     c_buf.data() + (size_t) m * Nk, (size_t) N * sizeof(float));
     }
 
-    GGML_LOG_INFO("%s: MUL_MAT %s M=%d K=%d N=%d kernel=%s max_abs=%f max_rel=%f\n",
+    GGML_LOG_INFO("%s: MUL_MAT %s M=%d K=%d N=%d kernel=%s\n",
                   "xdna-ops", node->name ? node->name : "?", M, K, N,
-                  variant->name.c_str(), max_abs, max_rel);
+                  variant->name.c_str());
     return true;
+}
+
+static bool gemm_supported(const xdna_ops * ops, const struct ggml_tensor * op) {
+    if (op->op != GGML_OP_MUL_MAT) {
+        return false;
+    }
+
+    const struct ggml_tensor * src0 = op->src[0];
+    const struct ggml_tensor * src1 = op->src[1];
+    if (!src0 || !src1) {
+        return false;
+    }
+
+    const int K = (int) src1->ne[0];
+    const int N = (int) src0->ne[1];
+    const int M = (int) src1->ne[1];
+
+    const xdna_ops_gemm_variant * variant = gemm_find(ops, K, N);
+    if (!variant || M <= 0 || M > variant->M) {
+        return false;
+    }
+    if (src0->ne[0] != K) {
+        return false;
+    }
+    if (src0->ne[2] * src0->ne[3] != 1 || src1->ne[2] * src1->ne[3] != 1) {
+        return false;
+    }
+    if (src1->type != GGML_TYPE_F32 || op->type != GGML_TYPE_F32) {
+        return false;
+    }
+    if (src0->type != GGML_TYPE_BF16 && src0->type != GGML_TYPE_F16) {
+        return false;
+    }
+    if (!ggml_is_contiguous(op) || !ggml_is_contiguous(src0) || !ggml_is_contiguous(src1)) {
+        return false;
+    }
+
+    return true;
+}
+
+// --- public API -------------------------------------------------------------
+
+void xdna_ops_init(xdna_ops * ops, xdna_kernel_pool * pool) {
+    ops->pool = pool;
+    ops->gemm_variants.clear();
+    for (const std::string & name : pool->names) {
+        int M = 0, K = 0, N = 0, n_cols = 0;
+        if (sscanf(name.c_str(), "gemm_bf16_f32_M%d_K%d_N%d_c%d", &M, &K, &N, &n_cols) != 4) {
+            continue;
+        }
+        if (M <= 0 || K <= 0 || N <= 0 || n_cols <= 0) {
+            continue;
+        }
+        ops->gemm_variants[name] = {M, K, N, n_cols, N < 256 ? 16 : 32, name};
+    }
+}
+
+bool xdna_ops_supported(const xdna_ops * ops, const struct ggml_tensor * op) {
+    switch (op->op) {
+        case GGML_OP_MUL_MAT:
+            return gemm_supported(ops, op);
+        default:
+            return false;
+    }
 }
 
 bool xdna_ops_compute(xdna_ops * ops, struct ggml_tensor * node) {
