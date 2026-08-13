@@ -169,4 +169,7 @@ bool xdna_gemm_seq_supported(const xdna_gemm_tiles * tiles, int M, int K, int N)
 // Build the full TXN stream for C = A @ B with the geometry described by
 // `tiles`. Buffer layout (row-major): arg 0 = A [M x K] bf16, arg 1 = B
 // [K x N] bf16, arg 2 = C [M x N] f32. M must equal the baked block.
-bool xdna_gemm_seq_build(xdna_seq * seq, const xdna_gemm_tiles * tiles, int M, int K, int N);
+// `b_offset` (bytes) shifts the B base address, so a K-block can point into a
+// persistent full-weight buffer.
+bool xdna_gemm_seq_build(xdna_seq * seq, const xdna_gemm_tiles * tiles, int M, int K, int N,
+                         uint32_t b_offset = 0);

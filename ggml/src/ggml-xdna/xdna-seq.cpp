@@ -144,7 +144,8 @@ static void emit_bd(xdna_seq * seq, int col, int bd_id, const xdna_bd & bd,
 //   - buffer_length is in 4-byte words
 //   - the outer tap dim folds into the queue push repeat_count (stride 0)
 //     or the BD iteration field (stride > 0)
-bool xdna_gemm_seq_build(xdna_seq * seq, const xdna_gemm_tiles * t, int M, int K, int N) {
+bool xdna_gemm_seq_build(xdna_seq * seq, const xdna_gemm_tiles * t, int M, int K, int N,
+                         uint32_t b_offset) {
     const int n_cols = t->n_cols;
     const int n_rows = t->n_rows;
     const int tile_n = t->tile_n;
@@ -218,7 +219,7 @@ bool xdna_gemm_seq_build(xdna_seq * seq, const xdna_gemm_tiles * t, int M, int K
             const int b_ch = (col % 2 == 0) ? 1 : 0;
             xdna_bd bd;
             bd.buf_len   = (uint32_t)(tile_n * tile_k * K_div_k / 2); // words
-            bd.buf_off   = (uint32_t) col * tile_n * 2;               // bytes into B
+            bd.buf_off   = (uint32_t) col * tile_n * 2 + b_offset;    // bytes into B
             bd.d0_size   = (uint32_t)(tile_n / 2);                    // words
             bd.d0_stride = 1;
             bd.d1_size   = (uint32_t) tile_k;                         // elements
@@ -230,7 +231,7 @@ bool xdna_gemm_seq_build(xdna_seq * seq, const xdna_gemm_tiles * t, int M, int K
                 bd.iter_stride = to_words((uint32_t) mem_tile_n, 2);
             }
             const uint32_t bd_id = shim_bd[col]++;
-            emit_bd(seq, col, bd_id, bd, 1, (uint32_t) col * tile_n * 2);
+            emit_bd(seq, col, bd_id, bd, 1, (uint32_t) col * tile_n * 2 + b_offset);
             xdna_seq_push_queue(seq, (uint32_t) col, 0, bd_id, xdna_dma_dir::MM2S, (uint32_t) b_ch, false,
                                 n_col_tiles > 1 ? (uint32_t) (n_col_tiles - 1) : 0);
         }

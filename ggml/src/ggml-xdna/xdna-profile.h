@@ -19,14 +19,10 @@ struct xdna_timer {
 // Per-call MUL_MAT timing breakdown, filled when profiling is enabled. The
 // block phases are summed across all K-blocks.
 struct xdna_mul_mat_profile {
-    double b_copy    = 0;   // copy the packed-weight slice into the B BO
-    double a_pack    = 0;   // pack A rows to bf16 (memset + convert)
-    double sync      = 0;   // sync A/B BOs to the device
-    double run       = 0;   // kernel submission + wait
-    double c_read    = 0;   // read C BO back
-    double accum     = 0;   // accumulate the K-block contribution
-    double dst_copy  = 0;   // copy the result into dst
+    double a_pack   = 0;   // pack A rows to bf16 (memset + convert)
+    double sync     = 0;   // sync A BO to the device
+    double run      = 0;   // kernel submission (start without wait)
 
-    int    n_blocks  = 0;   // K-blocks executed
-    double total     = 0;   // whole MUL_MAT
+    int    n_blocks = 0;   // K-blocks executed
+    double total    = 0;   // whole MUL_MAT (submit phase only)
 };

@@ -25,9 +25,10 @@ struct xdna_ops {
     xdna_gemm_tiles gemm_tiles;     // GEMM geometry baked into the xclbin
     std::string     gemm_xclbin;    // discovered xclbin name (geometry provider)
 
-    // Packed-weight cache: tensor data pointer + K + N -> transposed [K x N]
-    // bf16. Weights are immutable for the model lifetime, so the pack
-    // (transpose + bf16 conversion) is done once per tensor and reused.
+    // Packed-weight cache: tensor data pointer + K + N -> device BO holding the
+    // transposed [K_pad x N] bf16 weights (K_pad = K rounded up to the GEMM
+    // block). Weights are immutable, so the pack (transpose + bf16 conversion)
+    // is done once per tensor and reused; kernels point into it via B offsets.
     struct weight_key {
         const void * data = nullptr;
         int          K = 0;
@@ -46,7 +47,7 @@ struct xdna_ops {
         }
     };
 
-    std::unordered_map<weight_key, std::vector<ggml_bf16_t>, weight_hash> weight_packs;
+    std::unordered_map<weight_key, xdna_buffer *, weight_hash> weight_bo;
     std::mutex weight_mutex;
 
     // Batching: MUL_MAT ops are submitted (started without wait) and collected
@@ -55,7 +56,6 @@ struct xdna_ops {
         xrt::run       run;
         xdna_buffer *  bo_c = nullptr;   // held until readback
         xdna_buffer *  bo_a = nullptr;   // released at finalize
-        xdna_buffer *  bo_b = nullptr;
         std::vector<float> c_buf;        // Mk x N readback target
         int M = 0, N = 0;
     };
