@@ -53,6 +53,14 @@ arr_prefix=()
 arr_hf=()
 arr_extra_args=()
 arr_file=()
+# Sparse: only rows that declare an expected count are checked. See expect_encodes().
+arr_encodes=()
+
+# Expected number of image-encode calls for the row just added, one per slice plus one for the
+# overview. Use it where the point of the row is the tile structure rather than the answer.
+expect_encodes() {
+    arr_encodes[$(( ${#arr_hf[@]} - 1 ))]=$1
+}
 
 add_test_vision() {
     local hf=$1
@@ -92,10 +100,15 @@ add_test_vision "ggml-org/SmolVLM2-2.2B-Instruct-GGUF:Q4_K_M"
 add_test_vision "ggml-org/SmolVLM2-500M-Video-Instruct-GGUF:Q8_0"
 # Passed the same image twice, because the `<image: N>` ordinal labels are only emitted when a
 # prompt carries more than one image, and nothing else in this file exercises that path.
+# test-1.jpeg is 640x488, which the base rule refines to 2048x2048, so each image is a 4x4 grid
+# plus its overview: 2 x 17.
 add_test_vision "qvac/VisionPsy-Nano-460M-GGUFs:Q8_0" --image "$SCRIPT_DIR/test-1.jpeg"
+expect_encodes 34
 # Flash is the same architecture with the no-upscale preprocessing rule; the published mmproj
-# does not carry the key yet, so the flag is what selects it.
+# does not carry the key yet, so the flag is what selects it. Same image refines to 1024x512
+# instead, a 2x1 grid plus its overview, which is the whole point of the variant.
 add_test_vision "qvac/VisionPsy-Nano-460M-Flash-GGUFs:Q8_0" --image-no-upscale on
+expect_encodes 3
 add_test_vision "ggml-org/gemma-3-4b-it-GGUF:Q4_K_M"
 add_test_vision "THUDM/glm-edge-v-5b-gguf:Q4_K_M" -p "name of the newspaper?<__media__>"
 add_test_vision "second-state/Llava-v1.5-7B-GGUF:Q2_K" --chat-template vicuna
@@ -216,6 +229,16 @@ for i in "${!arr_hf[@]}"; do
             result="$prefix \033[32mOK\033[0m:   $hf"
         else
             result="$prefix \033[31mFAIL\033[0m: $hf"
+        fi
+        # Where the tile structure is part of what the row tests, check it: the answer text
+        # survives a wrong slice count, so a preprocessing regression is invisible here without
+        # counting the encodes.
+        want_encodes="${arr_encodes[$i]:-}"
+        if [ -n "$want_encodes" ]; then
+            got_encodes=$(echo "$output" | grep -c "encoding mtmd batch" || true)
+            if [ "$got_encodes" != "$want_encodes" ]; then
+                result="$prefix \033[31mFAIL\033[0m: $hf (encodes: got $got_encodes, want $want_encodes)"
+            fi
         fi
         echo -e "$result"
     fi
