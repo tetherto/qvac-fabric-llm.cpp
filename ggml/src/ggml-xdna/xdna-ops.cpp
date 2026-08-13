@@ -17,6 +17,41 @@
 static const int GEMM_K_MAX = 1024;
 static const int GEMM_N_MAX = 16384;
 
+// Return the packed [K x N] bf16 weight for `src0`, built and cached on first
+// use. Weights are immutable, so the transpose + bf16 conversion runs once.
+static const std::vector<ggml_bf16_t> & gemm_weight_pack(xdna_ops * ops,
+                                                         const struct ggml_tensor * src0, int K, int N) {
+    const xdna_ops::weight_key key = { src0->data, K, N };
+    {
+        std::lock_guard<std::mutex> lock(ops->weight_mutex);
+        auto it = ops->weight_packs.find(key);
+        if (it != ops->weight_packs.end()) {
+            return it->second;
+        }
+    }
+
+    std::vector<ggml_bf16_t> pack((size_t) K * N);
+    if (src0->type == GGML_TYPE_BF16) {
+        const auto * d = (const ggml_bf16_t *) src0->data;
+        for (int n = 0; n < N; n++) {
+            for (int k = 0; k < K; k++) {
+                pack[(size_t) k * N + n] = d[(size_t) n * K + k];
+            }
+        }
+    } else { // GGML_TYPE_F16
+        std::vector<float> row(K);
+        for (int n = 0; n < N; n++) {
+            ggml_fp16_to_fp32_row((const ggml_fp16_t *) src0->data + (size_t) n * K, row.data(), K);
+            for (int k = 0; k < K; k++) {
+                ggml_fp32_to_bf16_row(&row[k], &pack[(size_t) k * N + n], 1);
+            }
+        }
+    }
+
+    std::lock_guard<std::mutex> lock(ops->weight_mutex);
+    return ops->weight_packs.emplace(key, std::move(pack)).first->second;
+}
+
 // MUL_MAT follows ggml's convention: src0 = weights [K, N] (stored as N rows
 // of K), src1 = activations [K, M] (stored as M rows of K), so dst[M, N] =
 // src1^T @ src0. src1's memory feeds the kernel directly as A [M, K]; src0's
@@ -84,25 +119,18 @@ static bool gemm_compute(xdna_ops * ops, struct ggml_tensor * node) {
         // A's padding rows are zeroed (the pool may hand back a reused BO); B's
         // K-padding is zeroed too, so a partial K block adds nothing.
 
-        // B: ggml src0 [k0:k0+Kb, N] -> kernel [GEMM_K_MAX x N] bf16, transposed
-        // and zero-padded in K.
+        // B: slice of the cached [K x N] pack -> kernel [GEMM_K_MAX x N] bf16.
+        // Full blocks fill the whole region the kernel reads; partial blocks
+        // are zero-padded in K.
+        const std::vector<ggml_bf16_t> & wpack = gemm_weight_pack(ops, src0, K, N);
         ggml_bf16_t * b_map = (ggml_bf16_t *) bo_b->bo.map();
-        std::memset(b_map, 0, (size_t) GEMM_K_MAX * N * sizeof(ggml_bf16_t));
-        if (src0->type == GGML_TYPE_BF16) {
-            const auto * d = (const ggml_bf16_t *) src0->data;
-            for (int n = 0; n < N; n++) {
-                for (int k = 0; k < Kb; k++) {
-                    b_map[(size_t) k * N + n] = d[(size_t) n * K + k0 + k];
-                }
-            }
-        } else { // GGML_TYPE_F16
-            std::vector<float> row(K);
-            for (int n = 0; n < N; n++) {
-                ggml_fp16_to_fp32_row((const ggml_fp16_t *) src0->data + (size_t) n * K, row.data(), K);
-                for (int k = 0; k < Kb; k++) {
-                    ggml_fp32_to_bf16_row(&row[k0 + k], &b_map[(size_t) k * N + n], 1);
-                }
-            }
+        if (Kb == GEMM_K_MAX) {
+            std::memcpy(b_map, wpack.data() + (size_t) k0 * N,
+                        (size_t) Kb * N * sizeof(ggml_bf16_t));
+        } else {
+            std::memset(b_map, 0, (size_t) GEMM_K_MAX * N * sizeof(ggml_bf16_t));
+            std::memcpy(b_map, wpack.data() + (size_t) k0 * N,
+                        (size_t) Kb * N * sizeof(ggml_bf16_t));
         }
 
         // A: src1 [M rows of K] f32 -> [Mk x GEMM_K_MAX] bf16, K-slice + rows

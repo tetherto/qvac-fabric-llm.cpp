@@ -7,9 +7,13 @@
 #include "xdna-types.h"
 #include "xdna-runtime.h"
 #include "xdna-seq.h"
+#include "ggml.h"
 
 #include <map>
+#include <mutex>
 #include <string>
+#include <unordered_map>
+#include <vector>
 
 struct ggml_tensor;
 
@@ -20,6 +24,30 @@ struct xdna_ops {
 
     xdna_gemm_tiles gemm_tiles;     // GEMM geometry baked into the xclbin
     std::string     gemm_xclbin;    // discovered xclbin name (geometry provider)
+
+    // Packed-weight cache: tensor data pointer + K + N -> transposed [K x N]
+    // bf16. Weights are immutable for the model lifetime, so the pack
+    // (transpose + bf16 conversion) is done once per tensor and reused.
+    struct weight_key {
+        const void * data = nullptr;
+        int          K = 0;
+        int          N = 0;
+
+        bool operator==(const weight_key & o) const {
+            return data == o.data && K == o.K && N == o.N;
+        }
+    };
+    struct weight_hash {
+        size_t operator()(const weight_key & k) const {
+            size_t h = std::hash<const void *>{}(k.data);
+            h = h * 31 + (size_t) k.K;
+            h = h * 31 + (size_t) k.N;
+            return h;
+        }
+    };
+
+    std::unordered_map<weight_key, std::vector<ggml_bf16_t>, weight_hash> weight_packs;
+    std::mutex weight_mutex;
 };
 
 // Discover the GEMM xclbin and set up the fixed geometry.
