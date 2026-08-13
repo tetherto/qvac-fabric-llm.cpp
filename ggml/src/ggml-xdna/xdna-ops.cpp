@@ -1,10 +1,12 @@
 #include "xdna-ops.h"
 #include "xdna-runtime.h"
+#include "xdna-profile.h"
 
 #include "ggml-impl.h"
 
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <vector>
 
@@ -16,6 +18,15 @@
 // huge B transpose and run too long on the NPU.
 static const int GEMM_K_MAX = 1024;
 static const int GEMM_N_MAX = 16384;
+
+// Per-call breakdown is printed when GGML_XDNA_PROFILING=1.
+static bool ggml_xdna_profiling_enabled(void) {
+    static const bool en = []() {
+        const char * v = getenv("GGML_XDNA_PROFILING");
+        return v != nullptr && atoi(v) >= 1;
+    }();
+    return en;
+}
 
 // Return the packed [K x N] bf16 weight for `src0`, built and cached on first
 // use. Weights are immutable, so the transpose + bf16 conversion runs once.
@@ -75,6 +86,10 @@ static bool gemm_compute(xdna_ops * ops, struct ggml_tensor * node) {
     const xdna_gemm_tiles & tiles = ops->gemm_tiles;
     const int Mk = tiles.M;
 
+    const bool prof_en = ggml_xdna_profiling_enabled();
+    xdna_mul_mat_profile prof;
+    const xdna_timer t_op;
+
     std::vector<float> c_acc((size_t) Mk * N, 0.0f);
 
     // All blocks use the full GEMM_K_MAX kernel: a partial K block (K < 1024)
@@ -122,55 +137,94 @@ static bool gemm_compute(xdna_ops * ops, struct ggml_tensor * node) {
         // B: slice of the cached [K x N] pack -> kernel [GEMM_K_MAX x N] bf16.
         // Full blocks fill the whole region the kernel reads; partial blocks
         // are zero-padded in K.
-        const std::vector<ggml_bf16_t> & wpack = gemm_weight_pack(ops, src0, K, N);
-        ggml_bf16_t * b_map = (ggml_bf16_t *) bo_b->bo.map();
-        if (Kb == GEMM_K_MAX) {
-            std::memcpy(b_map, wpack.data() + (size_t) k0 * N,
-                        (size_t) Kb * N * sizeof(ggml_bf16_t));
-        } else {
-            std::memset(b_map, 0, (size_t) GEMM_K_MAX * N * sizeof(ggml_bf16_t));
-            std::memcpy(b_map, wpack.data() + (size_t) k0 * N,
-                        (size_t) Kb * N * sizeof(ggml_bf16_t));
+        {
+            const xdna_timer t;
+            const std::vector<ggml_bf16_t> & wpack = gemm_weight_pack(ops, src0, K, N);
+            ggml_bf16_t * b_map = (ggml_bf16_t *) bo_b->bo.map();
+            if (Kb == GEMM_K_MAX) {
+                std::memcpy(b_map, wpack.data() + (size_t) k0 * N,
+                            (size_t) Kb * N * sizeof(ggml_bf16_t));
+            } else {
+                std::memset(b_map, 0, (size_t) GEMM_K_MAX * N * sizeof(ggml_bf16_t));
+                std::memcpy(b_map, wpack.data() + (size_t) k0 * N,
+                            (size_t) Kb * N * sizeof(ggml_bf16_t));
+            }
+            if (prof_en) prof.b_copy += t.ms();
         }
 
         // A: src1 [M rows of K] f32 -> [Mk x GEMM_K_MAX] bf16, K-slice + rows
         // padded, zero-padded in K past Kb.
-        ggml_bf16_t * a_map = (ggml_bf16_t *) bo_a->bo.map();
-        std::memset(a_map, 0, (size_t) Mk * GEMM_K_MAX * sizeof(ggml_bf16_t));
-        for (int m = 0; m < M; m++) {
-            ggml_fp32_to_bf16_row((const float *) src1->data + (size_t) m * K + k0,
-                                  a_map + (size_t) m * GEMM_K_MAX, Kb);
+        {
+            const xdna_timer t;
+            ggml_bf16_t * a_map = (ggml_bf16_t *) bo_a->bo.map();
+            std::memset(a_map, 0, (size_t) Mk * GEMM_K_MAX * sizeof(ggml_bf16_t));
+            for (int m = 0; m < M; m++) {
+                ggml_fp32_to_bf16_row((const float *) src1->data + (size_t) m * K + k0,
+                                      a_map + (size_t) m * GEMM_K_MAX, Kb);
+            }
+            if (prof_en) prof.a_pack += t.ms();
         }
 
-        xdna_buffer_sync_to_device(bo_a);
-        xdna_buffer_sync_to_device(bo_b);
+        {
+            const xdna_timer t;
+            xdna_buffer_sync_to_device(bo_a);
+            xdna_buffer_sync_to_device(bo_b);
+            if (prof_en) prof.sync += t.ms();
+        }
 
         std::vector<float> c_buf((size_t) Mk * N, 0);
         xdna_buffer * args[3] = { bo_a, bo_b, bo_c };
-        if (!xdna_kernel_run(kern, args, 3)) {
-            GGML_LOG_ERROR("%s: GEMM run failed M=%d K=%d N=%d kernel=gemm_K%d_N%d\n",
-                           "xdna-ops", M, K, N, GEMM_K_MAX, N);
-            xdna_kernel_pool_release_buffer(ops->pool, bo_a);
-            xdna_kernel_pool_release_buffer(ops->pool, bo_b);
-            xdna_kernel_pool_release_buffer(ops->pool, bo_c);
-            return false;
+        {
+            const xdna_timer t;
+            if (!xdna_kernel_run(kern, args, 3)) {
+                GGML_LOG_ERROR("%s: GEMM run failed M=%d K=%d N=%d kernel=gemm_K%d_N%d\n",
+                               "xdna-ops", M, K, N, GEMM_K_MAX, N);
+                xdna_kernel_pool_release_buffer(ops->pool, bo_a);
+                xdna_kernel_pool_release_buffer(ops->pool, bo_b);
+                xdna_kernel_pool_release_buffer(ops->pool, bo_c);
+                return false;
+            }
+            if (prof_en) prof.run += t.ms();
         }
-        xdna_buffer_read(bo_c, c_buf.data(), (size_t) Mk * N * sizeof(float));
+        {
+            const xdna_timer t;
+            xdna_buffer_read(bo_c, c_buf.data(), (size_t) Mk * N * sizeof(float));
+            if (prof_en) prof.c_read += t.ms();
+        }
 
         xdna_kernel_pool_release_buffer(ops->pool, bo_a);
         xdna_kernel_pool_release_buffer(ops->pool, bo_b);
         xdna_kernel_pool_release_buffer(ops->pool, bo_c);
 
         // Accumulate this K-block's contribution.
-        for (size_t i = 0; i < (size_t) Mk * N; i++) {
-            c_acc[i] += c_buf[i];
+        {
+            const xdna_timer t;
+            for (size_t i = 0; i < (size_t) Mk * N; i++) {
+                c_acc[i] += c_buf[i];
+            }
+            if (prof_en) prof.accum += t.ms();
         }
+        prof.n_blocks++;
     }
 
     // Write the M x N slice of the accumulated result into dst.
-    for (int m = 0; m < M; m++) {
-        std::memcpy((char *) dst->data + (size_t) m * dst->nb[1],
-                    c_acc.data() + (size_t) m * N, (size_t) N * sizeof(float));
+    {
+        const xdna_timer t;
+        for (int m = 0; m < M; m++) {
+            std::memcpy((char *) dst->data + (size_t) m * dst->nb[1],
+                        c_acc.data() + (size_t) m * N, (size_t) N * sizeof(float));
+        }
+        if (prof_en) prof.dst_copy = t.ms();
+    }
+
+    if (prof_en) {
+        prof.total = t_op.ms();
+        fprintf(stderr,
+                "xdna-profile: MUL_MAT %s M=%d K=%d N=%d blocks=%d "
+                "total=%.3fms bcopy=%.3f apack=%.3f sync=%.3f run=%.3f cread=%.3f accum=%.3f dst=%.3f\n",
+                node->name ? node->name : "?", M, K, N, prof.n_blocks,
+                prof.total, prof.b_copy, prof.a_pack, prof.sync,
+                prof.run, prof.c_read, prof.accum, prof.dst_copy);
     }
 
     GGML_LOG_INFO("%s: MUL_MAT %s M=%d K=%d N=%d blocks=%d\n",
