@@ -1389,17 +1389,37 @@ static clip_image_size calc_size_no_upscale(const clip_image_size & inp_size, in
         : clip_image_size{(int) target_short, (int) target_long};
 }
 
+// The refined size has two steps:
+// 1. Resize w/ aspect-ratio preserving such that the longer side is
+//      the preprocessor longest size
+// 2. Resize w/out preserving aspect ratio such that both sides are
+//      multiples of image_size (always rounding up)
+//
+// CITE: https://github.com/huggingface/transformers/blob/main/src/transformers/models/idefics3/image_processing_idefics3.py#L737
+//
+// no_upscale replaces step 1 only; step 2 is shared, so both variants land on a
+// multiple of image_size in each dimension.
+mtmd_idefics3_sizing mtmd_calc_idefics3_sizing(const clip_image_size & original_size,
+                                               int image_size,
+                                               int image_longest_edge,
+                                               bool no_upscale,
+                                               int min_pixels,
+                                               int max_pixels) {
+    mtmd_idefics3_sizing out;
+    out.refined_size = no_upscale
+        ? calc_size_no_upscale(original_size, image_size, image_longest_edge)
+        : img_tool::calc_size_preserved_ratio(
+            original_size,
+            { image_size, std::max(0, min_pixels), std::max(0, max_pixels), image_longest_edge });
+    out.grid_size = clip_image_size{
+        static_cast<int>(std::ceil(static_cast<float>(out.refined_size.width) / image_size)),
+        static_cast<int>(std::ceil(static_cast<float>(out.refined_size.height) / image_size)),
+    };
+    out.n_slices = out.grid_size.width * out.grid_size.height;
+    return out;
+}
+
 mtmd_image_preproc_out mtmd_image_preprocessor_idefics3::preprocess(const clip_image_u8 & img) const {
-    // The refined size has two steps:
-    // 1. Resize w/ aspect-ratio preserving such that the longer side is
-    //      the preprocessor longest size
-    // 2. Resize w/out preserving aspect ratio such that both sides are
-    //      multiples of image_size (always rounding up)
-    //
-    // CITE: https://github.com/huggingface/transformers/blob/main/src/transformers/models/idefics3/image_processing_idefics3.py#L737
-    //
-    // no_upscale replaces step 1 only; step 2 is shared, so both variants land on a
-    // multiple of image_size in each dimension.
     const clip_image_size original_size = img.get_size();
 
     // old gguf files have no preprocessor longest size, custom token limits also need the generic size below
@@ -1451,21 +1471,17 @@ mtmd_image_preproc_out mtmd_image_preprocessor_idefics3::preprocess(const clip_i
         return output;
     }
 
-    const clip_image_size refined_size = hparams.image_no_upscale
-        ? calc_size_no_upscale(original_size, hparams.image_size, hparams.image_longest_edge)
-        : img_tool::calc_size_preserved_ratio(
-            original_size,
-            { hparams.image_size, std::max(0, hparams.image_min_pixels), std::max(0, hparams.image_max_pixels), hparams.image_longest_edge });
+    const mtmd_idefics3_sizing sizing = mtmd_calc_idefics3_sizing(
+        original_size, hparams.image_size, hparams.image_longest_edge, hparams.image_no_upscale,
+        hparams.image_min_pixels, hparams.image_max_pixels);
+    const clip_image_size refined_size = sizing.refined_size;
     // LOG_INF("%s: original size: %d x %d, refined size: %d x %d\n",
     //         __func__, original_size.width, original_size.height,
     //         refined_size.width, refined_size.height);
 
     mtmd_image_preprocessor_llava_uhd::slice_instructions instructions;
     instructions.refined_size = refined_size;
-    instructions.grid_size = clip_image_size{
-        static_cast<int>(std::ceil(static_cast<float>(refined_size.width) / hparams.image_size)),
-        static_cast<int>(std::ceil(static_cast<float>(refined_size.height) / hparams.image_size)),
-    };
+    instructions.grid_size = sizing.grid_size;
     // Square, in both variants: the reference resizes the global image to (p, p) regardless
     // of no_upscale (GlobalAndSplitImages in custom_transforms.py).
     instructions.overview_size = clip_image_size{hparams.image_size, hparams.image_size};

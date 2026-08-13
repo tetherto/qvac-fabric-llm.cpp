@@ -269,6 +269,24 @@ private:
     static std::vector<clip_image_size> get_target_ratios(const clip_hparams & hparams);
 };
 
+// What an image becomes under the idefics3-family sizing rule, before any pixel is touched.
+// The slice grid follows from the refined size, so these three travel together.
+struct mtmd_idefics3_sizing {
+    clip_image_size refined_size;
+    clip_image_size grid_size;
+    int n_slices;
+};
+
+// The sizing rule on its own, so it can be checked against the reference processor without a
+// model: `no_upscale` picks the Flash rule (round the long side up to whole slices and cap it)
+// over the base one (always stretch the long side to the cap).
+mtmd_idefics3_sizing mtmd_calc_idefics3_sizing(const clip_image_size & original_size,
+                                               int image_size,
+                                               int image_longest_edge,
+                                               bool no_upscale,
+                                               int min_pixels = 0,
+                                               int max_pixels = 0);
+
 struct mtmd_image_preprocessor_idefics3 : mtmd_image_preprocessor_llava_uhd {
     mtmd_image_preprocessor_idefics3(const clip_ctx * ctx) : mtmd_image_preprocessor_llava_uhd(ctx) {}
     mtmd_image_preproc_out preprocess(const clip_image_u8 & img) const override;

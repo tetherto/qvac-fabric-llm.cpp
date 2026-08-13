@@ -410,6 +410,11 @@ if (LLAMA_MTMD)
     # QVAC-21914: clip flash-attention AUTO budget arithmetic (pure CPU).
     llama_build_and_test(test-clip-fa-cutoff.cpp LINK mtmd)
     target_include_directories(test-clip-fa-cutoff PRIVATE ${PROJECT_SOURCE_DIR}/tools/mtmd)
+
+    # QVAC-23075: idefics3-family refined size and slice grid against the reference rule
+    # (pure CPU, no model).
+    llama_build_and_test(test-mtmd-preproc-sizing.cpp LINK mtmd)
+    target_include_directories(test-mtmd-preproc-sizing PRIVATE ${PROJECT_SOURCE_DIR}/tools/mtmd)
 endif()
 
 llama_build_and_test(test-mtmd-impl.cpp  LABEL behavior  LINK mtmd)
