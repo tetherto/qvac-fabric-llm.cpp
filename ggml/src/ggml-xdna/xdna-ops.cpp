@@ -260,6 +260,16 @@ static bool gemm_supported(const xdna_ops * ops, const struct ggml_tensor * op) 
     if (op->op != GGML_OP_MUL_MAT) {
         return false;
     }
+    // GGML_XDNA_GEMM=0 keeps all GEMMs on the CPU (baseline / diagnostics).
+    {
+        static const bool gemm_enabled = []() {
+            const char * v = getenv("GGML_XDNA_GEMM");
+            return v == nullptr || atoi(v) != 0;
+        }();
+        if (!gemm_enabled) {
+            return false;
+        }
+    }
 
     const struct ggml_tensor * src0 = op->src[0];
     const struct ggml_tensor * src1 = op->src[1];
