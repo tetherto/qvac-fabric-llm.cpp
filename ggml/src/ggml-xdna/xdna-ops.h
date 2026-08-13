@@ -57,9 +57,10 @@ struct xdna_ops {
     struct pending_run {
         xrt::run       run;
         xdna_buffer *  bo_c = nullptr;   // held until readback
-        xdna_buffer *  bo_a = nullptr;   // released at finalize
+        xdna_buffer *  bo_a = nullptr;   // released after readback
         std::vector<float> c_buf;        // Mk x N readback target
         int N = 0;
+        int mb_idx = 0;                  // index into pending_op::m_blocks
     };
     struct pending_m_block {
         int m0 = 0;                      // dst row offset of this M-block
@@ -69,6 +70,7 @@ struct xdna_ops {
     struct pending_op {
         struct ggml_tensor * node = nullptr;
         int M = 0;                       // total rows of the op
+        int N = 0;                       // total columns of the op
         std::vector<pending_m_block> m_blocks;
     };
     std::vector<pending_op> pending;

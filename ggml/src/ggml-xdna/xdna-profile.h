@@ -22,6 +22,8 @@ struct xdna_mul_mat_profile {
     double a_pack   = 0;   // pack A rows to bf16 (memset + convert)
     double sync     = 0;   // sync A BO to the device
     double run      = 0;   // kernel submission (start without wait)
+    double wait     = 0;   // wait for the previous bank's run (NPU time)
+    double read     = 0;   // read back the previous bank's C
 
     int    n_blocks = 0;   // K-blocks executed
     double total    = 0;   // whole MUL_MAT (submit phase only)

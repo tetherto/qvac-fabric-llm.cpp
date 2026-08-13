@@ -92,9 +92,11 @@ static xdna_buffer * gemm_weight_bo(xdna_ops * ops, const struct ggml_tensor * s
 // memory is transposed to B [K, N]. The stream is built per shape via
 // xdna_gemm_seq_build, so only A's rows are padded to the baked M block.
 //
-// Submission is batched: the kernel is started without waiting and the run is
-// queued in ops->pending; xdna_ops_finalize() waits all runs of the layer and
-// completes the op (readback, accumulation, dst).
+// Submission is pipelined: two A/C buffer banks are ping-ponged. The run for
+// block (m0, k0) is submitted without waiting, then the previous block's run
+// is waited and its C read back while the NPU processes the new one, so the
+// C readback overlaps the GEMM. The last few runs are finished in
+// xdna_ops_finalize().
 static bool gemm_compute(xdna_ops * ops, struct ggml_tensor * node) {
     const struct ggml_tensor * src0 = node->src[0];
     const struct ggml_tensor * src1 = node->src[1];
@@ -125,6 +127,7 @@ static bool gemm_compute(xdna_ops * ops, struct ggml_tensor * node) {
     xdna_ops::pending_op op;
     op.node = node;
     op.M = M;
+    op.N = N;
     for (int m0 = 0; m0 < M; m0 += Mk) {
         xdna_ops::pending_m_block mb;
         mb.m0 = m0;
@@ -132,9 +135,13 @@ static bool gemm_compute(xdna_ops * ops, struct ggml_tensor * node) {
         op.m_blocks.push_back(std::move(mb));
     }
 
-    // The instruction stream and its bound kernel depend only on the K-block
-    // (K=GEMM_K_MAX, N, b_offset), not on the M-block, so build each once and
-    // reuse it for every M-block.
+    // Ping-pong A/C banks. Bank b is reused only after its in-flight run has
+    // been waited and its C read back, so the readback overlaps the NPU run
+    // that follows.
+    xdna_ops::pending_run banks[2];
+    int bank = 0;
+    int pending_bank = -1;   // bank with a submitted, un-waited run
+
     for (int k0 = 0; k0 < K; k0 += GEMM_K_MAX) {
         const int Kb = std::min(GEMM_K_MAX, K - k0);
         const uint32_t b_offset = (uint32_t) k0 * N * 2;
@@ -159,20 +166,22 @@ static bool gemm_compute(xdna_ops * ops, struct ggml_tensor * node) {
 
         for (auto & mb : op.m_blocks) {
             const int mc = std::min(Mk, M - mb.m0);
-            xdna_ops::pending_run pr;
-            pr.bo_a = xdna_kernel_pool_acquire_buffer(ops->pool, (size_t) Mk * GEMM_K_MAX * sizeof(ggml_bf16_t));
-            pr.bo_c = xdna_kernel_pool_acquire_buffer(ops->pool, (size_t) Mk * N * sizeof(float));
-            if (!pr.bo_a || !pr.bo_c) {
-                if (pr.bo_a) xdna_kernel_pool_release_buffer(ops->pool, pr.bo_a);
-                if (pr.bo_c) xdna_kernel_pool_release_buffer(ops->pool, pr.bo_c);
-                GGML_LOG_ERROR("%s: failed to allocate GEMM buffers\n", "xdna-ops");
-                return false;
-            }
-            pr.N = N;
-            pr.c_buf.assign((size_t) Mk * N, 0.0f);
 
-            // A: src1[m0:m0+mc, k0:k0+Kb] f32 -> [Mk x GEMM_K_MAX] bf16, M/K
-            // padded (a partial block adds nothing).
+            // Pack A into the current bank and submit. The NPU starts on this
+            // run right away; the previous bank's run (already queued ahead of
+            // it) is then waited and read back while this one runs.
+            xdna_ops::pending_run & pr = banks[bank];
+            if (pr.bo_a == nullptr) {
+                pr.bo_a = xdna_kernel_pool_acquire_buffer(ops->pool, (size_t) Mk * GEMM_K_MAX * sizeof(ggml_bf16_t));
+                pr.bo_c = xdna_kernel_pool_acquire_buffer(ops->pool, (size_t) Mk * N * sizeof(float));
+                if (!pr.bo_a || !pr.bo_c) {
+                    GGML_LOG_ERROR("%s: failed to allocate GEMM buffers\n", "xdna-ops");
+                    return false;
+                }
+                pr.c_buf.assign((size_t) Mk * N, 0.0f);
+                pr.N = N;
+            }
+            pr.mb_idx = (int) (&mb - op.m_blocks.data());
             {
                 const xdna_timer t;
                 ggml_bf16_t * a_map = (ggml_bf16_t *) pr.bo_a->bo.map();
@@ -197,15 +206,48 @@ static bool gemm_compute(xdna_ops * ops, struct ggml_tensor * node) {
                 if (!pr.run) {
                     GGML_LOG_ERROR("%s: GEMM submit failed M=%d K=%d N=%d kernel=gemm_K%d_N%d_b%d\n",
                                    "xdna-ops", M, K, N, GEMM_K_MAX, N, k0);
-                    xdna_kernel_pool_release_buffer(ops->pool, pr.bo_a);
-                    xdna_kernel_pool_release_buffer(ops->pool, pr.bo_c);
                     return false;
                 }
                 if (prof_en) prof.run += t.ms();
             }
-            mb.runs.push_back(std::move(pr));
+
+            // The NPU is now working on `bank`; wait + read back the previous
+            // bank's run (queued ahead of this one) in parallel with it.
+            if (pending_bank >= 0) {
+                xdna_ops::pending_run & prev = banks[pending_bank];
+                {
+                    const xdna_timer t;
+                    if (!xdna_run_wait(prev.run)) {
+                        GGML_LOG_ERROR("%s: GEMM wait failed M=%d K=%d N=%d\n", "xdna-ops", M, K, N);
+                        return false;
+                    }
+                    if (prof_en) prof.wait += t.ms();
+                }
+                {
+                    const xdna_timer t;
+                    xdna_buffer_read(prev.bo_c, prev.c_buf.data(), (size_t) Mk * prev.N * sizeof(float));
+                    if (prof_en) prof.read += t.ms();
+                }
+                for (size_t i = 0; i < (size_t) Mk * prev.N; i++) {
+                    op.m_blocks[prev.mb_idx].c_acc[i] += prev.c_buf[i];
+                }
+                xdna_kernel_pool_release_buffer(ops->pool, prev.bo_a);
+                xdna_kernel_pool_release_buffer(ops->pool, prev.bo_c);
+                banks[pending_bank].bo_a = nullptr;
+                banks[pending_bank].bo_c = nullptr;
+            }
+
+            pending_bank = bank;
+            bank = 1 - bank;
             prof.n_blocks++;
         }
+    }
+
+    // Flush the trailing banks into the op so finalize waits+reads them.
+    if (pending_bank >= 0) {
+        op.m_blocks[banks[pending_bank].mb_idx].runs.push_back(std::move(banks[pending_bank]));
+        banks[pending_bank] = xdna_ops::pending_run();
+        pending_bank = -1;
     }
 
     ops->pending.push_back(std::move(op));
@@ -214,9 +256,9 @@ static bool gemm_compute(xdna_ops * ops, struct ggml_tensor * node) {
         prof.total = t_op.ms();
         fprintf(stderr,
                 "xdna-profile: MUL_MAT %s M=%d K=%d N=%d blocks=%d "
-                "total=%.3fms apack=%.3f sync=%.3f submit=%.3f\n",
+                "total=%.3fms apack=%.3f sync=%.3f submit=%.3f wait=%.3f read=%.3f\n",
                 node->name, M, K, N, prof.n_blocks,
-                prof.total, prof.a_pack, prof.sync, prof.run);
+                prof.total, prof.a_pack, prof.sync, prof.run, prof.wait, prof.read);
     }
 
     return true;
@@ -231,6 +273,7 @@ bool xdna_ops_finalize(xdna_ops * ops) {
     const xdna_timer t_all;
 
     // Wait all runs first so all kernels of the layer complete together.
+    const xdna_timer t_wait;
     for (auto & op : ops->pending) {
         for (auto & mb : op.m_blocks) {
             for (auto & pr : mb.runs) {
@@ -250,8 +293,13 @@ bool xdna_ops_finalize(xdna_ops * ops) {
             }
         }
     }
+    const double ms_wait = t_wait.ms();
 
     // Read C, accumulate K-blocks per M-block, write dst, release buffers.
+    // Most runs are already waited/read/accumulated inside gemm_compute's
+    // pipeline; only the trailing banks land here. m_blocks without runs have
+    // their c_acc fully accumulated already, so just scatter them.
+    const xdna_timer t_read;
     for (auto & op : ops->pending) {
         const int Mk = ops->gemm_tiles.M;
         for (auto & mb : op.m_blocks) {
@@ -264,8 +312,8 @@ bool xdna_ops_finalize(xdna_ops * ops) {
             const int mc = std::min(Mk, op.M - mb.m0);
             for (int m = 0; m < mc; m++) {
                 std::memcpy((char *) op.node->data + (size_t) (mb.m0 + m) * op.node->nb[1],
-                            mb.c_acc.data() + (size_t) m * mb.runs.front().N,
-                            (size_t) mb.runs.front().N * sizeof(float));
+                            mb.c_acc.data() + (size_t) m * op.N,
+                            (size_t) op.N * sizeof(float));
             }
             for (auto & pr : mb.runs) {
                 xdna_kernel_pool_release_buffer(ops->pool, pr.bo_a);
@@ -275,8 +323,8 @@ bool xdna_ops_finalize(xdna_ops * ops) {
     }
 
     if (prof_en) {
-        fprintf(stderr, "xdna-profile: FINALIZE ops=%zu total=%.3fms\n",
-                ops->pending.size(), t_all.ms());
+        fprintf(stderr, "xdna-profile: FINALIZE ops=%zu total=%.3fms wait=%.3f read=%.3f\n",
+                ops->pending.size(), t_all.ms(), ms_wait, t_read.ms());
     }
 
     ops->pending.clear();
