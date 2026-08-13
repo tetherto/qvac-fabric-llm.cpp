@@ -2,31 +2,54 @@
 #include "ggml-xdna.h"
 #include "ggml-backend-impl.h"
 
-// TODO: add AMD XDNA/NPU state here
+#include "xdna-types.h"
+#include "xdna-runtime.h"
+
+#include <mutex>
+#include <string>
+
+#ifdef _WIN32
+#    include <windows.h>
+#else
+#    include <unistd.h>
+#endif
+
+// Process-wide device context shared by all backend instances. The xdna_device
+// Process-wide context shared by all backend instances. The xdna_device holds
+// the name/description, so nothing is duplicated here.
 struct ggml_backend_xdna_context {
-    int placeholder;
+    xdna_device * device = nullptr;
 };
+
+static ggml_backend_xdna_context * ggml_xdna_device_context(void) {
+    static ggml_backend_xdna_context ctx;
+    static std::once_flag once;
+
+    std::call_once(once, [&]() {
+        ctx.device = xdna_device_open();
+    });
+
+    return &ctx;
+}
 
 // backend interface
 
 static const char * ggml_backend_xdna_get_name(ggml_backend_t backend) {
-    return "XDNA";
-
     GGML_UNUSED(backend);
+    return "XDNA";
 }
 
 static void ggml_backend_xdna_free(ggml_backend_t backend) {
-    ggml_backend_xdna_context * ctx = (ggml_backend_xdna_context *)backend->context;
-    delete ctx;
+    // The context is a process-wide singleton; it is not freed here.
+    GGML_UNUSED(backend);
     delete backend;
 }
 
 static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
     // TODO: dispatch ops to the XDNA/NPU, fall back to CPU for now
-    return GGML_STATUS_SUCCESS;
-
     GGML_UNUSED(backend);
     GGML_UNUSED(cgraph);
+    return GGML_STATUS_SUCCESS;
 }
 
 static struct ggml_backend_i xdna_backend_i = {
@@ -54,7 +77,16 @@ static ggml_guid_t ggml_backend_xdna_guid(void) {
 }
 
 ggml_backend_t ggml_backend_xdna_init(void) {
-    ggml_backend_xdna_context * ctx = new ggml_backend_xdna_context;
+    ggml_backend_xdna_context * ctx = ggml_xdna_device_context();
+
+    // When the NPU is absent the backend is still registered (llama.cpp
+    // expects every ACCEL device to yield a backend), but supports_op()
+    // rejects everything so all work stays on the CPU.
+    if (!ctx->device) {
+        GGML_LOG_INFO("%s: XDNA backend init: disabled (no NPU)\n", __func__);
+    } else {
+        GGML_LOG_INFO("%s: XDNA backend init: device=%s\n", __func__, ctx->device->name.c_str());
+    }
 
     ggml_backend_t backend = new ggml_backend {
         /* .guid    = */ ggml_backend_xdna_guid(),
@@ -73,28 +105,38 @@ bool ggml_backend_is_xdna(ggml_backend_t backend) {
 // device interface
 
 static const char * ggml_backend_xdna_device_get_name(ggml_backend_dev_t dev) {
-    return "XDNA0";
-
-    GGML_UNUSED(dev);
+    ggml_backend_xdna_context * ctx = (ggml_backend_xdna_context *) dev->context;
+    return ctx->device ? ctx->device->name.c_str() : "XDNA";
 }
 
 static const char * ggml_backend_xdna_device_get_description(ggml_backend_dev_t dev) {
-    return "AMD XDNA NPU";
-
-    GGML_UNUSED(dev);
+    ggml_backend_xdna_context * ctx = (ggml_backend_xdna_context *) dev->context;
+    return ctx->device ? ctx->device->description.c_str() : "AMD XDNA (no NPU device)";
 }
 
 static void ggml_backend_xdna_device_get_memory(ggml_backend_dev_t dev, size_t * free, size_t * total) {
-    *free  = 0;
-    *total = 0;
-
     GGML_UNUSED(dev);
+    // The NPU reads/writes host-visible BOs, so report the host memory the
+    // device can consume (fit params divides by the free size, so it must be
+    // non-zero for the XDNA device to be used with --fit).
+#ifdef _WIN32
+    MEMORYSTATUSEX status;
+    status.dwLength = sizeof(status);
+    GlobalMemoryStatusEx(&status);
+    *total = status.ullTotalPhys;
+    *free  = status.ullAvailPhys;
+#else
+    long pages = sysconf(_SC_PHYS_PAGES);
+    long page_size = sysconf(_SC_PAGE_SIZE);
+    *total = (size_t) pages * page_size;
+    // "free" system memory is ill-defined, for practical purposes assume all of it is free:
+    *free = *total;
+#endif // _WIN32
 }
 
 static enum ggml_backend_dev_type ggml_backend_xdna_device_get_type(ggml_backend_dev_t dev) {
-    return GGML_BACKEND_DEVICE_TYPE_ACCEL;
-
     GGML_UNUSED(dev);
+    return GGML_BACKEND_DEVICE_TYPE_GPU;
 }
 
 static void ggml_backend_xdna_device_get_props(ggml_backend_dev_t dev, struct ggml_backend_dev_props * props) {
@@ -111,37 +153,37 @@ static void ggml_backend_xdna_device_get_props(ggml_backend_dev_t dev, struct gg
 }
 
 static ggml_backend_t ggml_backend_xdna_device_init_backend(ggml_backend_dev_t dev, const char * params) {
-    return ggml_backend_xdna_init();
-
     GGML_UNUSED(dev);
     GGML_UNUSED(params);
+    return ggml_backend_xdna_init();
 }
 
 static ggml_backend_buffer_type_t ggml_backend_xdna_device_get_buffer_type(ggml_backend_dev_t dev) {
-    return ggml_backend_cpu_buffer_type();
-
     GGML_UNUSED(dev);
+    return ggml_backend_cpu_buffer_type();
 }
 
 static ggml_backend_buffer_t ggml_backend_xdna_device_buffer_from_host_ptr(ggml_backend_dev_t dev, void * ptr, size_t size, size_t max_tensor_size) {
-    return ggml_backend_cpu_buffer_from_ptr(ptr, size);
-
     GGML_UNUSED(dev);
     GGML_UNUSED(max_tensor_size);
+    return ggml_backend_cpu_buffer_from_ptr(ptr, size);
 }
 
 static bool ggml_backend_xdna_device_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
-    // TODO: advertise supported ops
-    return false;
+    ggml_backend_xdna_context * ctx = (ggml_backend_xdna_context *) dev->context;
 
-    GGML_UNUSED(dev);
+    if (!ctx->device) {
+        return false;
+    }
+
+    // TODO: advertise supported ops (MUL_MAT on the NPU for now, nothing yet)
     GGML_UNUSED(op);
+    return false;
 }
 
 static bool ggml_backend_xdna_device_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {
-    return ggml_backend_buft_is_host(buft);
-
     GGML_UNUSED(dev);
+    return ggml_backend_buft_is_host(buft);
 }
 
 static const struct ggml_backend_device_i ggml_backend_xdna_device_i = {
@@ -165,37 +207,32 @@ static const struct ggml_backend_device_i ggml_backend_xdna_device_i = {
 // backend reg interface
 
 static const char * ggml_backend_xdna_reg_get_name(ggml_backend_reg_t reg) {
-    return "XDNA";
-
     GGML_UNUSED(reg);
+    return "XDNA";
 }
 
 static size_t ggml_backend_xdna_reg_get_device_count(ggml_backend_reg_t reg) {
-    return 1;
-
     GGML_UNUSED(reg);
+    return ggml_xdna_device_context()->device ? 1 : 0;
 }
 
 static ggml_backend_dev_t ggml_backend_xdna_reg_get_device(ggml_backend_reg_t reg, size_t index) {
     GGML_ASSERT(index == 0);
+    GGML_UNUSED(index);
 
     static ggml_backend_device ggml_backend_xdna_device = {
         /* .iface   = */ ggml_backend_xdna_device_i,
         /* .reg     = */ reg,
-        /* .context = */ nullptr,
+        /* .context = */ ggml_xdna_device_context(),
     };
 
     return &ggml_backend_xdna_device;
-
-    GGML_UNUSED(reg);
-    GGML_UNUSED(index);
 }
 
 static void * ggml_backend_xdna_get_proc_address(ggml_backend_reg_t reg, const char * name) {
-    return NULL;
-
     GGML_UNUSED(reg);
     GGML_UNUSED(name);
+    return NULL;
 }
 
 static const struct ggml_backend_reg_i ggml_backend_xdna_reg_i = {
