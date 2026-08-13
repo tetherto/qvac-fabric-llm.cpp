@@ -1,5 +1,5 @@
 // QVAC-23075: golden tests for the idefics3-family sizing rule (mtmd_calc_idefics3_sizing in
-// tools/mtmd/mtmd-image.cpp — pure function, exposed via mtmd-image.h). Two bugs in this rule
+// tools/mtmd/mtmd-image.cpp, a pure function exposed via mtmd-image.h). Two bugs in this rule
 // reached review: a float32 scale that bought a whole extra slice row on 4:3 inputs, and a
 // missing check on the metadata it divides by. Both were invisible to the end-to-end tests,
 // which only look at the answer text.

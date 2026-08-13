@@ -22,6 +22,15 @@
  * WARNING: This API is experimental and subject to many BREAKING CHANGES.
  *          Issues related to API usage may receive lower priority support.
  *
+ * WARNING: consumers MUST be rebuilt against these headers on every libmtmd update.
+ *          mtmd_context_params is passed and returned BY VALUE, and fields get appended to
+ *          it, so its size changes without a SOVERSION bump (SOVERSION stays 0 in
+ *          tools/mtmd/CMakeLists.txt). Linking a binary compiled against an older layout
+ *          against a newer libmtmd lets mtmd_context_params_default() write past the
+ *          caller's struct and mtmd_init_from_file() read uninitialized bytes past it.
+ *          Build from source against a pinned commit; do not treat libmtmd as a stable
+ *          drop-in shared object.
+ *
  * For the usage, see an example in mtmd-cli.cpp
  *
  * For contributors:

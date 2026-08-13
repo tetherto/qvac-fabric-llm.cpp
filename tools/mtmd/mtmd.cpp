@@ -40,12 +40,24 @@ std::string mtmd_format(const char * fmt, ...) {
     va_copy(ap2, ap);
     int size = vsnprintf(NULL, 0, fmt, ap);
     GGML_ASSERT(size >= 0 && size < INT_MAX); // NOLINT
-    std::vector<char> buf(size + 1);
-    int size2 = vsnprintf(buf.data(), size + 1, fmt, ap2);
+    if (size == 0) {
+        va_end(ap2);
+        va_end(ap);
+        return std::string();
+    }
+    // Formatted straight into the result, sized to the formatted length, so the terminating NUL
+    // vsnprintf writes lands on the byte past the end that std::string already reserves for it
+    // and never becomes part of the string. Returning std::string(buf.data(), size) over a
+    // std::vector<char> did the same thing correctly, but it let GCC duplicate the size == 0
+    // path, where the buffer is one byte, and then report -Wformat-truncation against it for
+    // every caller with a long literal in its format string. The early return above and the
+    // unknown extent of a std::string buffer both remove that.
+    std::string out((size_t) size, '\0');
+    int size2 = vsnprintf(out.data(), (size_t) size + 1, fmt, ap2);
     GGML_ASSERT(size2 == size);
     va_end(ap2);
     va_end(ap);
-    return std::string(buf.data(), size);
+    return out;
 }
 
 // remember to bump this if the serialization format changes
@@ -1873,6 +1885,11 @@ struct mtmd_tokenizer {
 
                 // add overview image (first)
                 if (ctx->ov_img_first) {
+                    // Logged because the delimiters around it are token ids, not text, so this is
+                    // the only trace of where the overview went. On a 1x1 grid this chunk is the
+                    // refined slice, swapped in above.
+                    LOG_DBG("%s: adding %s image first\n", __func__,
+                            single_tile ? "single-tile refined" : "overview");
                     if (ctx->has_prompt_img_id) {
                         add_text("<image_id>" + std::to_string(n_images_added) + "</image_id>", true);
                     }
@@ -1922,6 +1939,8 @@ struct mtmd_tokenizer {
 
                 // add overview image (last)
                 if (!ctx->ov_img_first) {
+                    LOG_DBG("%s: adding %s image last\n", __func__,
+                            single_tile ? "single-tile refined" : "overview");
                     add_text(ctx->tok_ov_img_start);
                     cur.entries.emplace_back(std::move(ov_chunk));
                     add_text(ctx->tok_ov_img_end);
