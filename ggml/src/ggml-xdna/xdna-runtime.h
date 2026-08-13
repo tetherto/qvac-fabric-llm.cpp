@@ -5,6 +5,9 @@
 
 #include "xdna-types.h"
 
+#include <filesystem>
+#include <vector>
+
 // --- device -----------------------------------------------------------
 
 // Open the first NPU. Returns nullptr when no device is available.
@@ -13,6 +16,10 @@ xdna_device * xdna_device_open(void);
 void          xdna_device_close(xdna_device * dev);
 
 // --- kernel -------------------------------------------------------------
+
+// Kernel search dirs (GGML_XDNA_KERNELS_DIR, the backend dir, the executable
+// dir, cwd).
+std::vector<std::filesystem::path> xdna_kernel_search_dirs(void);
 
 // Load an xclbin + instruction stream into a kernel. xclbins are loaded once
 // per uuid; subsequent loads reuse the shared hw_context. Returns nullptr on
@@ -47,3 +54,21 @@ void          xdna_buffer_sync_to_device(xdna_buffer * buf);
 // Run a kernel with `n_args` host buffers (args 3.. onward; 0=opcode,
 // 1=instruction BO, 2=ninstr). Sizes are baked into the instruction stream.
 bool xdna_kernel_run(xdna_kernel * kern, xdna_buffer ** args, size_t n_args);
+
+// --- kernel pool ----------------------------------------------------------
+
+// Populate `pool->names` from the kernel search dirs. Idempotent per pool.
+void xdna_kernel_pool_scan(xdna_kernel_pool * pool);
+
+// Load (or fetch from cache) the kernel for `name`. A failed lookup is
+// cached and not retried.
+xdna_kernel * xdna_kernel_pool_get(xdna_kernel_pool * pool, const std::string & name);
+
+// Acquire a device buffer of at least `bytes` bytes, reusing an idle one from
+// the pool when possible.
+xdna_buffer * xdna_kernel_pool_acquire_buffer(xdna_kernel_pool * pool, size_t bytes);
+
+// Return a buffer to the pool, freeing the LRU entry past the limit.
+void xdna_kernel_pool_release_buffer(xdna_kernel_pool * pool, xdna_buffer * buf);
+
+void xdna_kernel_pool_clear(xdna_kernel_pool * pool);

@@ -62,6 +62,25 @@ void xdna_device_close(xdna_device * dev) {
 
 // --- kernel -------------------------------------------------------------
 
+std::vector<fs::path> xdna_kernel_search_dirs(void) {
+    std::vector<fs::path> dirs;
+    if (const char * env_dir = getenv("GGML_XDNA_KERNELS_DIR")) {
+        dirs.emplace_back(env_dir);
+    }
+#ifdef GGML_BACKEND_DIR
+    dirs.emplace_back(GGML_BACKEND_DIR);
+#endif
+#ifdef __linux__
+    std::error_code ec;
+    fs::path exe = fs::read_symlink("/proc/self/exe", ec);
+    if (!ec) {
+        dirs.push_back(exe.parent_path());
+    }
+#endif
+    dirs.emplace_back(fs::current_path());
+    return dirs;
+}
+
 xdna_kernel * xdna_kernel_load(xdna_device * dev, const char * xclbin_path, const char * insts_path) {
     if (!dev) {
         GGML_LOG_ERROR("%s: kernel load: no device\n", "xdna-runtime");
@@ -118,22 +137,7 @@ xdna_kernel * xdna_kernel_load_search(xdna_device * dev, const char * xclbin_nam
     if (!dev || !xclbin_name || !insts_name) {
         return nullptr;
     }
-    std::vector<fs::path> dirs;
-    if (const char * env_dir = getenv("GGML_XDNA_KERNELS_DIR")) {
-        dirs.emplace_back(env_dir);
-    }
-#ifdef GGML_BACKEND_DIR
-    dirs.emplace_back(GGML_BACKEND_DIR);
-#endif
-#ifdef __linux__
-    std::error_code ec;
-    fs::path exe = fs::read_symlink("/proc/self/exe", ec);
-    if (!ec) {
-        dirs.push_back(exe.parent_path());
-    }
-#endif
-    dirs.emplace_back(fs::current_path());
-    for (const fs::path & dir : dirs) {
+    for (const fs::path & dir : xdna_kernel_search_dirs()) {
         const fs::path xclbin = dir / xclbin_name;
         const fs::path insts  = dir / insts_name;
         if (fs::exists(xclbin) && fs::exists(insts)) {

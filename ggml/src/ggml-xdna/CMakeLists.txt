@@ -5,6 +5,8 @@ find_package(xrt REQUIRED)
 ggml_add_backend_library(ggml-xdna
                          ggml-xdna.cpp
                          xdna-runtime.cpp
+                         xdna-kernel-pool.cpp
+                         xdna-ops.cpp
                         )
 
 target_link_libraries(ggml-xdna PRIVATE XRT::xrt_coreutil)
@@ -24,7 +26,7 @@ set(XDNA_TILE_K 16)
 
 # GEMM variants to build: "K N n_cols". K must be a multiple of 8, N of 128.
 set(GGML_XDNA_GEMM_VARIANTS
-    "64 128 8"
+    "1024 2048 8"
 )
 
 if (GGML_XDNA_BUILD_KERNELS)

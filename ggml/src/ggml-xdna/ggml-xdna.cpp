@@ -4,6 +4,7 @@
 
 #include "xdna-types.h"
 #include "xdna-runtime.h"
+#include "xdna-ops.h"
 
 #include <mutex>
 #include <string>
@@ -14,11 +15,13 @@
 #    include <unistd.h>
 #endif
 
-// Process-wide device context shared by all backend instances. The xdna_device
 // Process-wide context shared by all backend instances. The xdna_device holds
 // the name/description, so nothing is duplicated here.
 struct ggml_backend_xdna_context {
     xdna_device * device = nullptr;
+    xdna_kernel_pool * pool = nullptr;   // lazily scanned kernel pool
+
+    xdna_ops ops;   // operator-specific dispatch (GEMM variants, helpers)
 };
 
 static ggml_backend_xdna_context * ggml_xdna_device_context(void) {
@@ -27,6 +30,16 @@ static ggml_backend_xdna_context * ggml_xdna_device_context(void) {
 
     std::call_once(once, [&]() {
         ctx.device = xdna_device_open();
+        if (ctx.device) {
+            ctx.pool = new xdna_kernel_pool;
+            ctx.pool->device = ctx.device;
+            xdna_kernel_pool_scan(ctx.pool);
+            xdna_ops_init(&ctx.ops, ctx.pool);
+            if (ctx.ops.gemm_variants.empty()) {
+                GGML_LOG_WARN("%s: no GEMM kernels found (build with GGML_XDNA=ON "
+                              "or set GGML_XDNA_KERNELS_DIR)\n", "ggml-xdna");
+            }
+        }
     });
 
     return &ctx;
@@ -45,10 +58,37 @@ static void ggml_backend_xdna_free(ggml_backend_t backend) {
     delete backend;
 }
 
+static bool ggml_xdna_is_view_op(enum ggml_op op) {
+    switch (op) {
+        case GGML_OP_NONE:
+        case GGML_OP_RESHAPE:
+        case GGML_OP_VIEW:
+        case GGML_OP_PERMUTE:
+        case GGML_OP_TRANSPOSE:
+            return true;
+        default:
+            return false;
+    }
+}
+
 static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
-    // TODO: dispatch ops to the XDNA/NPU, fall back to CPU for now
-    GGML_UNUSED(backend);
-    GGML_UNUSED(cgraph);
+    ggml_backend_xdna_context * ctx = (ggml_backend_xdna_context *) backend->context;
+
+    if (!ctx->device) {
+        return GGML_STATUS_SUCCESS;
+    }
+
+    // The scheduler routes ops accepted by supports_op plus the view ops that
+    // alias their data; views are no-ops here.
+    for (int i = 0; i < cgraph->n_nodes; i++) {
+        struct ggml_tensor * node = cgraph->nodes[i];
+        if (ggml_xdna_is_view_op(node->op)) {
+            continue;
+        }
+        if (!xdna_ops_compute(&ctx->ops, node)) {
+            return GGML_STATUS_FAILED;
+        }
+    }
     return GGML_STATUS_SUCCESS;
 }
 
@@ -172,13 +212,11 @@ static ggml_backend_buffer_t ggml_backend_xdna_device_buffer_from_host_ptr(ggml_
 static bool ggml_backend_xdna_device_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
     ggml_backend_xdna_context * ctx = (ggml_backend_xdna_context *) dev->context;
 
-    if (!ctx->device) {
+    if (!ctx->device || !ctx->pool) {
         return false;
     }
 
-    // TODO: advertise supported ops (MUL_MAT on the NPU for now, nothing yet)
-    GGML_UNUSED(op);
-    return false;
+    return xdna_ops_supported(&ctx->ops, op);
 }
 
 static bool ggml_backend_xdna_device_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {
