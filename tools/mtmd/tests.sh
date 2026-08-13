@@ -53,13 +53,27 @@ arr_prefix=()
 arr_hf=()
 arr_extra_args=()
 arr_file=()
-# Sparse: only rows that declare an expected count are checked. See expect_encodes().
+# Sparse: only rows that declare an expectation are checked. See expect_encodes()/expect_log().
 arr_encodes=()
+arr_expect_log=()
 
 # Expected number of image-encode calls for the row just added, one per slice plus one for the
 # overview. Use it where the point of the row is the tile structure rather than the answer.
 expect_encodes() {
     arr_encodes[$(( ${#arr_hf[@]} - 1 ))]=$1
+}
+
+# Fixed strings that must (expect_log) or must not (expect_no_log) appear in the row's output.
+# The prompt-assembly lines they match are debug level, so a row using these has to pass -v.
+# Stored newline separated, one leading + or - per pattern.
+expect_log() {
+    local i=$(( ${#arr_hf[@]} - 1 ))
+    arr_expect_log[$i]="${arr_expect_log[$i]:-}+$1"$'\n'
+}
+
+expect_no_log() {
+    local i=$(( ${#arr_hf[@]} - 1 ))
+    arr_expect_log[$i]="${arr_expect_log[$i]:-}-$1"$'\n'
 }
 
 add_test_vision() {
@@ -102,13 +116,37 @@ add_test_vision "ggml-org/SmolVLM2-500M-Video-Instruct-GGUF:Q8_0"
 # prompt carries more than one image, and nothing else in this file exercises that path.
 # test-1.jpeg is 640x488, which the base rule refines to 2048x2048, so each image is a 4x4 grid
 # plus its overview: 2 x 17.
-add_test_vision "qvac/VisionPsy-Nano-460M-GGUFs:Q8_0" --image "$SCRIPT_DIR/test-1.jpeg"
+#
+# The chunk total is the sequence assertion. Per image it is one text chunk for the ordinal and
+# the overview delimiter, the overview image, then a delimiter text chunk and an image chunk per
+# slice: 1 + 1 + 2*16 = 34, twice, plus the trailing text chunk after the last image. Drop the
+# overview or a delimiter and the total moves, which the answer text never does.
+add_test_vision "qvac/VisionPsy-Nano-460M-GGUFs:Q8_0" --image "$SCRIPT_DIR/test-1.jpeg" -v
 expect_encodes 34
+expect_log "add_text: <image: 0>"
+expect_log "add_text: <image: 1>"
+expect_log "adding overview image first"
+expect_log "adding 16 slices (4 rows x 4 cols)"
+expect_log "add_text: <row_1_col_1>"
+expect_log "add_text: <row_4_col_4>"
+expect_log "total = 69"
+expect_no_log "adding overview image last"
 # Flash is the same architecture with the no-upscale preprocessing rule; the published mmproj
 # does not carry the key yet, so the flag is what selects it. Same image refines to 1024x512
 # instead, a 2x1 grid plus its overview, which is the whole point of the variant.
-add_test_vision "qvac/VisionPsy-Nano-460M-Flash-GGUFs:Q8_0" --image-no-upscale on
+# Chunk total 7: text, overview, delimiter, slice, delimiter, slice, text.
+add_test_vision "qvac/VisionPsy-Nano-460M-Flash-GGUFs:Q8_0" --image-no-upscale on -v
 expect_encodes 3
+expect_log "adding overview image first"
+expect_log "adding 2 slices (1 rows x 2 cols)"
+expect_log "add_text: <row_1_col_1>"
+expect_log "add_text: <row_1_col_2>"
+expect_log "total = 7"
+expect_no_log "adding overview image last"
+# One image, so no ordinal label, and a 2x1 grid, so no third column and no second row.
+expect_no_log "add_text: <image: 0>"
+expect_no_log "add_text: <row_1_col_3>"
+expect_no_log "add_text: <row_2_col_1>"
 add_test_vision "ggml-org/gemma-3-4b-it-GGUF:Q4_K_M"
 add_test_vision "THUDM/glm-edge-v-5b-gguf:Q4_K_M" -p "name of the newspaper?<__media__>"
 add_test_vision "second-state/Llava-v1.5-7B-GGUF:Q2_K" --chat-template vicuna
@@ -239,6 +277,30 @@ for i in "${!arr_hf[@]}"; do
             if [ "$got_encodes" != "$want_encodes" ]; then
                 result="$prefix \033[31mFAIL\033[0m: $hf (encodes: got $got_encodes, want $want_encodes)"
             fi
+        fi
+        # Same idea for the prompt structure: the delimiters, the ordinal labels and the chunk
+        # total say where every image went, and a wrong sequence still answers the question.
+        patterns="${arr_expect_log[$i]:-}"
+        if [ -n "$patterns" ]; then
+            while IFS= read -r pat; do
+                if [ -z "$pat" ]; then
+                    continue
+                fi
+                want_present=true
+                if [ "${pat:0:1}" = "-" ]; then
+                    want_present=false
+                fi
+                pat="${pat:1}"
+                found=true
+                echo "$output" | grep -qF -- "$pat" || found=false
+                if [ "$found" != "$want_present" ]; then
+                    if [ "$want_present" = true ]; then
+                        result="$prefix \033[31mFAIL\033[0m: $hf (log is missing '$pat')"
+                    else
+                        result="$prefix \033[31mFAIL\033[0m: $hf (log should not contain '$pat')"
+                    fi
+                fi
+            done <<< "$patterns"
         fi
         echo -e "$result"
     fi

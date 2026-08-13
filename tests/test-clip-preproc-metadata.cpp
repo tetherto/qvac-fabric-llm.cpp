@@ -117,7 +117,9 @@ static void expect_passes_validation(const char * name, const fixture_params & p
     // It still fails, on the tensors this fixture does not carry. What must not appear is our
     // own complaint about the sizing metadata.
     if (log.find("slices by image_size") != std::string::npos ||
-        log.find("preproc_no_upscale needs") != std::string::npos) {
+        log.find("preproc_no_upscale needs") != std::string::npos ||
+        log.find("must be a multiple of image_size") != std::string::npos ||
+        log.find("over the limit of") != std::string::npos) {
         std::printf("FAIL %s: valid metadata was rejected by the sizing check\nlog was:\n%s\n",
                     name, log.c_str());
         g_failures++;
@@ -142,6 +144,17 @@ int main() {
     // A cap of exactly one slice is legal, every image becomes a single slice.
     expect_passes_validation("cap-equals-slice", { 512, 512, true });
 
+    // Exactly at the slice limit, 16x16. The bound is on the implied grid, not on pixels, so this
+    // is the largest cap the rule accepts at a 512 slice size.
+    expect_passes_validation("cap-at-tile-limit", { 512, 512 * 16, false });
+
+    // idefics3 with both keys present is the same shape and must stay loadable.
+    {
+        fixture_params p = { 512, 2048, false };
+        p.proj_type = "idefics3";
+        expect_passes_validation("valid-idefics3", p);
+    }
+
     // Zero image_size: the divide and the GGML_ASSERT case. Rejected with the flag off too,
     // which is the half that only applied under no-upscale before.
     expect_rejected("zero-image-size-base",  { 0, 2048, false }, "slices by image_size");
@@ -154,6 +167,31 @@ int main() {
     // Cap below one slice: std::clamp(val, lo, hi) with lo > hi, undefined behaviour rather
     // than a bad size. Only reachable on the no-upscale path, which is the only one that clamps.
     expect_rejected("cap-below-slice", { 512, 256, true }, "preproc_no_upscale needs");
+
+    // A cap that is not a whole number of slices lands the refined long side off-grid, so the
+    // slicing loop emits a ragged trailing slice the reference splitter never produces.
+    expect_rejected("cap-not-multiple-base",  { 512, 2100, false }, "must be a multiple of image_size");
+    expect_rejected("cap-not-multiple-flash", { 512, 2100, true },  "must be a multiple of image_size");
+
+    // The upper bound. Both sizing rules upscale to the cap, so the cap alone decides how many
+    // slices an image becomes, and a GGUF u32 can ask for far more than the encoder can hold.
+    // 512*195 is a 195x195 grid, 38025 slices, tens of GB of tiles.
+    expect_rejected("cap-implies-too-many-slices", { 512, 512 * 195, false }, "over the limit of");
+    // One slice row past the limit, 17x17 against a 256 ceiling.
+    expect_rejected("cap-just-over-tile-limit", { 512, 512 * 17, true }, "over the limit of");
+
+    // idefics3 runs the same rule, so zero image_size aborts there too and has to be rejected as
+    // well. The cap is the only half that differs, below.
+    {
+        fixture_params p = { 0, 2048, false };
+        p.proj_type = "idefics3";
+        expect_rejected("zero-image-size-idefics3", p, "slices by image_size");
+    }
+    {
+        fixture_params p = { 0, 2048, true };
+        p.proj_type = "idefics3";
+        expect_rejected("zero-image-size-idefics3-flash", p, "slices by image_size");
+    }
 
     // idefics3 keeps loading without the cap key, because the shipped
     // ggml-org/SmolVLM-500M-Instruct-GGUF mmproj has none. It is overview-only in that state, so
@@ -172,6 +210,37 @@ int main() {
         } else {
             std::printf("ok   idefics3-no-cap: warns that slicing is off and still loads\n");
         }
+    }
+
+    // The warning above is the whole story for that fixture: nothing may throw after it. The cap
+    // is 0, so every later invariant would fail if it were still checked, and the flag makes the
+    // one that used to be checked unconditionally apply. Overview-only has to stay loadable.
+    {
+        fixture_params p = { 512, 0, false };
+        p.proj_type = "idefics3";
+        p.write_preproc_image_size = false;
+        p.override_no_upscale = 1;
+        const std::string log = try_load("idefics3-no-cap-flag-on", p);
+        const bool warned = log.find("encoded as the overview alone") != std::string::npos;
+        const bool threw = log.find("preproc_no_upscale needs") != std::string::npos ||
+                           log.find("must be a multiple of image_size") != std::string::npos;
+        const bool reached_tensors = log.find("unable to find tensor") != std::string::npos;
+        if (!warned || threw || !reached_tensors) {
+            std::printf("FAIL idefics3-no-cap-flag-on: warned=%d threw=%d reached_tensors=%d\nlog was:\n%s\n",
+                        (int) warned, (int) threw, (int) reached_tensors, log.c_str());
+            g_failures++;
+        } else {
+            std::printf("ok   idefics3-no-cap-flag-on: warns once and does not then throw\n");
+        }
+    }
+
+    // idefics3 reads the GGUF key, not just the flag. Observable only through a rule that the flag
+    // gates: a cap below one slice is rejected iff no-upscale actually took effect, so this fixture
+    // loading fine would mean the key was ignored.
+    {
+        fixture_params p = { 512, 256, true };
+        p.proj_type = "idefics3";
+        expect_rejected("idefics3-gguf-no-upscale-honoured", p, "preproc_no_upscale needs");
     }
 
     // The caller override. -1 keeps the GGUF value, 0 and 1 are both explicit, and turning it

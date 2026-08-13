@@ -1080,15 +1080,24 @@ static std::string string_format(const char * fmt, ...) {
     va_copy(ap2, ap);
     int size = vsnprintf(NULL, 0, fmt, ap);
     GGML_ASSERT(size >= 0 && size < INT_MAX); // NOLINT
-    std::vector<char> buf(size + 1);
-    int size2 = vsnprintf(buf.data(), size + 1, fmt, ap2);
+    if (size == 0) {
+        va_end(ap2);
+        va_end(ap);
+        return std::string();
+    }
+    // Formatted straight into the result, sized to the formatted length, so the terminating NUL
+    // vsnprintf writes lands on the byte past the end that std::string already reserves for it
+    // and never becomes part of the string. Returning std::string(buf.data(), size) over a
+    // std::vector<char> did the same thing correctly, but it let GCC duplicate the size == 0
+    // path, where the buffer is one byte, and then report -Wformat-truncation against it for
+    // every caller with a long literal in its format string. The early return above and the
+    // unknown extent of a std::string buffer both remove that.
+    std::string out((size_t) size, '\0');
+    int size2 = vsnprintf(out.data(), (size_t) size + 1, fmt, ap2);
     GGML_ASSERT(size2 == size);
     va_end(ap2);
     va_end(ap);
-    // `size`, not `buf.size()`: the buffer holds the terminating NUL and including it puts a
-    // real byte inside the string, which anything measuring by length() then passes on. The
-    // ordinal image label went to the tokenizer as one byte too long because of this.
-    return std::string(buf.data(), size);
+    return out;
 }
 
 static void string_replace_all(std::string & s, const std::string & search, const std::string & replace) {

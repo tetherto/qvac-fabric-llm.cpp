@@ -1716,6 +1716,11 @@ struct mtmd_tokenizer {
 
                 // add overview image (first)
                 if (ctx->ov_img_first) {
+                    // Logged because the delimiters around it are token ids, not text, so this is
+                    // the only trace of where the overview went. On a 1x1 grid this chunk is the
+                    // refined slice, swapped in above.
+                    LOG_DBG("%s: adding %s image first\n", __func__,
+                            single_tile ? "single-tile refined" : "overview");
                     if (ctx->use_image_id) {
                         add_text("<image_id>" + std::to_string(n_images_added) + "</image_id>", true);
                     }
@@ -1765,6 +1770,8 @@ struct mtmd_tokenizer {
 
                 // add overview image (last)
                 if (!ctx->ov_img_first) {
+                    LOG_DBG("%s: adding %s image last\n", __func__,
+                            single_tile ? "single-tile refined" : "overview");
                     add_text(ctx->tok_ov_img_start);
                     cur.entries.emplace_back(std::move(ov_chunk));
                     add_text(ctx->tok_ov_img_end);

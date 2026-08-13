@@ -411,18 +411,27 @@ if (LLAMA_MTMD)
     llama_build_and_test(test-clip-fa-cutoff.cpp LINK mtmd)
     target_include_directories(test-clip-fa-cutoff PRIVATE ${PROJECT_SOURCE_DIR}/tools/mtmd)
 
-    # QVAC-23075: idefics3-family refined size and slice grid against the reference rule
-    # (pure CPU, no model).
-    llama_build_and_test(test-mtmd-preproc-sizing.cpp LINK mtmd)
-    target_include_directories(test-mtmd-preproc-sizing PRIVATE ${PROJECT_SOURCE_DIR}/tools/mtmd)
-
     # QVAC-23075: legacy projector alias resolution, which must stay gated on general.name.
+    # Resolution is inline in clip-impl.h, so this one links on every platform.
     llama_build_and_test(test-clip-projector-alias.cpp LINK mtmd)
     target_include_directories(test-clip-projector-alias PRIVATE ${PROJECT_SOURCE_DIR}/tools/mtmd)
 
-    # QVAC-23075: preprocessing metadata rejected at load, on generated metadata-only mmprojs.
-    llama_build_and_test(test-clip-preproc-metadata.cpp LINK mtmd)
-    target_include_directories(test-clip-preproc-metadata PRIVATE ${PROJECT_SOURCE_DIR}/tools/mtmd)
+    if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
+        # Same reason as the llama tests above, and as the note at clip.h's
+        # clip_fa_effective_min_kv: these reach mtmd_calc_idefics3_sizing, clip_init and
+        # clip_log_set_callback, which carry no MTMD_API decoration and so are not exported
+        # across the Windows mtmd.dll boundary. They still run on every other platform, and on
+        # Windows itself in a static build.
+
+        # QVAC-23075: idefics3-family refined size and slice grid against the reference rule
+        # (pure CPU, no model).
+        llama_build_and_test(test-mtmd-preproc-sizing.cpp LINK mtmd)
+        target_include_directories(test-mtmd-preproc-sizing PRIVATE ${PROJECT_SOURCE_DIR}/tools/mtmd)
+
+        # QVAC-23075: preprocessing metadata rejected at load, on generated metadata-only mmprojs.
+        llama_build_and_test(test-clip-preproc-metadata.cpp LINK mtmd)
+        target_include_directories(test-clip-preproc-metadata PRIVATE ${PROJECT_SOURCE_DIR}/tools/mtmd)
+    endif()
 endif()
 
 llama_build_and_test(test-mtmd-impl.cpp  LABEL behavior  LINK mtmd)

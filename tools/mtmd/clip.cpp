@@ -1820,6 +1820,11 @@ struct clip_model_loader {
                         hparams.image_resize_algo = RESIZE_ALGO_LANCZOS;
                         get_u32(KEY_PROJ_SCALE_FACTOR, hparams.n_merge, false);
                         get_u32(KEY_PREPROC_IMAGE_SIZE, hparams.image_longest_edge, false);
+                        // Same optional key as VisionPsy below. Both run the idefics3 sizing
+                        // rule and --image-no-upscale is accepted for both, so a GGUF that
+                        // declares the rule must be honoured here too, or the flag is the only
+                        // way to reach it and metadata is silently ignored.
+                        get_bool(KEY_PREPROC_NO_UPSCALE, hparams.image_no_upscale, false);
                         hparams.set_limit_image_tokens();
                     } break;
                 case PROJECTOR_TYPE_VISIONPSY:
@@ -5048,32 +5053,74 @@ struct clip_init_result clip_init(const char * fname, struct clip_context_params
                 // so the grid is empty and the model silently gets the overview alone, 64 image
                 // tokens where it expects hundreds. Fail the load instead, where it is reportable.
                 //
-                // Scoped to this projector, NOT applied to every slicing model: image_size == 0 is
-                // legal elsewhere and means dynamic sizing, as the sanity check in load_hparams
-                // says, and idefics3 cannot be included either, because the shipped
-                // ggml-org/SmolVLM-500M-Instruct-GGUF mmproj carries no preproc_image_size at all
-                // and would stop loading. That model is already overview-only for this reason, so
-                // it gets a warning instead. Checked after the override above so it covers the
-                // flag as well as the GGUF key.
+                // Scoped to the two projectors that run this rule, NOT applied to every slicing
+                // model: image_size == 0 is legal elsewhere and means dynamic sizing, as the
+                // sanity check in load_hparams says, so a blanket check would reject Qwen-VL.
+                // Checked after the override above so it covers the flag as well as the GGUF key.
                 const auto & vp = ctx_vision->model.hparams;
-                if (ctx_vision->model.proj_type == PROJECTOR_TYPE_VISIONPSY &&
-                        (vp.image_size <= 0 || vp.image_longest_edge <= 0)) {
+                const projector_type slicing_pt = ctx_vision->model.proj_type;
+                const bool idefics3_style = slicing_pt == PROJECTOR_TYPE_VISIONPSY ||
+                                            slicing_pt == PROJECTOR_TYPE_IDEFICS3;
+                // image_size is the divisor and the align size, and zero aborts the process at the
+                // first image, so it is a load failure for both.
+                if (idefics3_style && vp.image_size <= 0) {
                     throw std::runtime_error(
-                        string_format("%s: this projector slices by image_size, which needs a positive image_size (%d) and %s (%d)\n",
-                                      __func__, vp.image_size, KEY_PREPROC_IMAGE_SIZE, vp.image_longest_edge));
+                        string_format("%s: this projector slices by image_size, which must be positive (%d)\n",
+                                      __func__, vp.image_size));
                 }
-                if (ctx_vision->model.proj_type == PROJECTOR_TYPE_IDEFICS3 && vp.image_longest_edge <= 0) {
+                // The cap is the one the two disagree on. VisionPsy's published mmprojs all carry
+                // it, so a missing cap there is broken metadata. idefics3 cannot throw: the shipped
+                // ggml-org/SmolVLM-500M-Instruct-GGUF mmproj has no preproc_image_size at all and
+                // would stop loading. It is already overview-only for that reason, so say so.
+                if (slicing_pt == PROJECTOR_TYPE_VISIONPSY && vp.image_longest_edge <= 0) {
+                    throw std::runtime_error(
+                        string_format("%s: this projector slices by image_size, so %s must be positive (%d)\n",
+                                      __func__, KEY_PREPROC_IMAGE_SIZE, vp.image_longest_edge));
+                }
+                if (slicing_pt == PROJECTOR_TYPE_IDEFICS3 && vp.image_longest_edge <= 0) {
                     LOG_WRN("%s: %s is missing, so the refined size is empty and every image will be "
                             "encoded as the overview alone; slicing is effectively off\n",
                             __func__, KEY_PREPROC_IMAGE_SIZE);
-                }
-                // The cap is also the upper bound of the clamps in calc_size_no_upscale(), and
-                // std::clamp requires lo <= hi, so metadata that puts the cap below one slice is
-                // undefined behaviour rather than a bad result. Reject it here.
-                if (vp.image_no_upscale && vp.image_longest_edge < vp.image_size) {
-                    throw std::runtime_error(
-                        string_format("%s: preproc_no_upscale needs %s (%d) >= image_size (%d)\n", __func__,
-                                      KEY_PREPROC_IMAGE_SIZE, vp.image_longest_edge, vp.image_size));
+                } else if (idefics3_style) {
+                    // Past this point the cap is positive for both projectors, so the rest of the
+                    // rule's invariants are checkable. They are `else` because the overview-only
+                    // idefics3 above never reaches the sizing rule at all, and throwing there
+                    // would contradict the warning we just printed.
+
+                    // The cap is also the upper bound of the clamps in calc_size_no_upscale(), and
+                    // std::clamp requires lo <= hi, so metadata that puts the cap below one slice is
+                    // undefined behaviour rather than a bad result. Reject it here.
+                    if (vp.image_no_upscale && vp.image_longest_edge < vp.image_size) {
+                        throw std::runtime_error(
+                            string_format("%s: preproc_no_upscale needs %s (%d) >= image_size (%d)\n", __func__,
+                                          KEY_PREPROC_IMAGE_SIZE, vp.image_longest_edge, vp.image_size));
+                    }
+                    // The slicing loop steps by image_size and both sizing rules round up to a
+                    // multiple of it, so a cap that is not itself a multiple is the one input that
+                    // breaks the invariant: calc_size_no_upscale() clamps the long side down to the
+                    // cap and lands off-grid, giving a ragged trailing slice the reference splitter
+                    // never emits. test-mtmd-preproc-sizing.cpp asserts the invariant; enforce it
+                    // against real metadata here.
+                    if (vp.image_longest_edge % vp.image_size != 0) {
+                        throw std::runtime_error(
+                            string_format("%s: %s (%d) must be a multiple of image_size (%d)\n", __func__,
+                                          KEY_PREPROC_IMAGE_SIZE, vp.image_longest_edge, vp.image_size));
+                    }
+                    // Upper bound, the counterpart of the image_max_tiles clamp above. The cap is a
+                    // GGUF u32 read into an int, so a corrupt or hostile mmproj can declare a value
+                    // that upscales every image to it: the grid is (cap/image_size)^2 slices and the
+                    // loop in mtmd-image.cpp reserves one tile each, so cap=100000 at image_size=512
+                    // is a 196x196 grid, ~30 GB of tiles, and a cap near INT32_MAX overflows the
+                    // multiply-back in calc_size_preserved_ratio() first. Bound the grid, not the
+                    // pixels, so the limit means the same thing as the Qwen-VL one.
+                    const int64_t tiles_per_side = vp.image_longest_edge / vp.image_size;
+                    if (tiles_per_side * tiles_per_side > CLIP_PREPROC_MAX_TILES_LIMIT) {
+                        throw std::runtime_error(
+                            string_format("%s: %s (%d) at image_size %d implies %lld slices, over the limit of %d\n",
+                                          __func__, KEY_PREPROC_IMAGE_SIZE, vp.image_longest_edge, vp.image_size,
+                                          (long long) (tiles_per_side * tiles_per_side),
+                                          CLIP_PREPROC_MAX_TILES_LIMIT));
+                    }
                 }
             }
             loader.load_tensors(*ctx_vision);
