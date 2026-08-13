@@ -3,6 +3,7 @@
 #include "xdna-profile.h"
 
 #include "ggml-impl.h"
+#include "ggml-quants.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -58,10 +59,21 @@ static xdna_buffer * gemm_weight_bo(xdna_ops * ops, const struct ggml_tensor * s
                 w[(size_t) k * N + n] = d[(size_t) n * K + k];
             }
         }
-    } else { // GGML_TYPE_F16
+    } else if (src0->type == GGML_TYPE_F16) {
         std::vector<float> row(K);
         for (int n = 0; n < N; n++) {
             ggml_fp16_to_fp32_row((const ggml_fp16_t *) src0->data + (size_t) n * K, row.data(), K);
+            for (int k = 0; k < K; k++) {
+                ggml_fp32_to_bf16_row(&row[k], &w[(size_t) k * N + n], 1);
+            }
+        }
+    } else if (src0->type == GGML_TYPE_Q4_K) {
+        // Quantized weights are dequantized once at pack time and stored as
+        // bf16, so the NPU kernel stays unchanged.
+        std::vector<float> row(K);
+        const int nb = K / QK_K;
+        for (int n = 0; n < N; n++) {
+            dequantize_row_q4_K((const block_q4_K *) src0->data + (size_t) n * nb, row.data(), K);
             for (int k = 0; k < K; k++) {
                 ggml_fp32_to_bf16_row(&row[k], &w[(size_t) k * N + n], 1);
             }
@@ -311,7 +323,13 @@ static bool gemm_supported(const xdna_ops * ops, const struct ggml_tensor * op) 
     if (src1->type != GGML_TYPE_F32 || op->type != GGML_TYPE_F32) {
         return false;
     }
-    if (src0->type != GGML_TYPE_BF16 && src0->type != GGML_TYPE_F16) {
+    if (src0->type != GGML_TYPE_BF16 && src0->type != GGML_TYPE_F16 &&
+        src0->type != GGML_TYPE_Q4_K) {
+        return false;
+    }
+    // Q4_K rows are packed in 256-element blocks (QK_K); dequantization needs
+    // whole blocks.
+    if (src0->type == GGML_TYPE_Q4_K && K % QK_K != 0) {
         return false;
     }
     if (!ggml_is_contiguous(op) || !ggml_is_contiguous(src0) || !ggml_is_contiguous(src1)) {

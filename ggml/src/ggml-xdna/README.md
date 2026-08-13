@@ -8,11 +8,15 @@ scaffold: only `MUL_MAT` is implemented, everything else stays on the CPU.
 
 `MUL_MAT` ops that satisfy `gemm_supported` (xdna-ops.cpp):
 
-- `src0` weights of type `BF16` or `F16`, `src1` activations and result `F32`.
+- `src0` weights of type `BF16`, `F16` or `Q4_K` (Q4_K_S); `src1` activations
+  and result `F32`. Quantized weights are dequantized once at pack time and
+  cached as bf16 in the weight BO, so the NPU kernel is the same for every
+  type.
 - 2D contiguous tensors (no batch dimensions).
 - `N <= 16384`: wide projections (e.g. the vocabulary output layer) stay on
   the CPU.
-- `K` is any multiple of `tile_k` (16); wide-K ops are split into blocks.
+- `K` is any multiple of `tile_k` (16), and a multiple of 256 for `Q4_K`;
+  wide-K ops are split into blocks.
 
 Both prefill and decode are covered. Prefill tiles the M dimension into
 32-row blocks; decode runs as `M = 1`. The final vocab projection is the only
