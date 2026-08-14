@@ -7,6 +7,10 @@
 #pragma GCC diagnostic ignored "-Wgnu-anonymous-struct"
 #endif
 
+#ifdef GGML_OPENCL_USE_ADRENO_KERNELS
+#define GGML_COMMON_DECL_CPP
+#include "ggml-common.h"
+#endif
 #include "ggml-opencl.h"
 #include "ggml-backend.h"
 #include "ggml-impl.h"
@@ -41,6 +45,7 @@ typedef const void * (*get_adreno_bin_kernel_func_t)(
 #include <cstddef>
 #include <cstdint>
 #include <fstream>
+#include <limits>
 #include <vector>
 #include <string>
 #include <cmath>
@@ -168,6 +173,130 @@ static size_t align_to(size_t value, size_t to_alignment) {
 
     return ((value + to_alignment - 1) / to_alignment) * to_alignment;
 }
+
+#ifdef GGML_OPENCL_USE_ADRENO_KERNELS
+static uint32_t ggml_opencl_pack_u8x4_lsb(uint8_t x0, uint8_t x1, uint8_t x2, uint8_t x3) {
+    return (uint32_t) x0 |
+           ((uint32_t) x1 << 8) |
+           ((uint32_t) x2 << 16) |
+           ((uint32_t) x3 << 24);
+}
+
+static uint32_t ggml_opencl_pack_q4_trans4_low(const uint8_t * q) {
+    return ggml_opencl_pack_u8x4_lsb(
+        (q[0] & 0x0F) | ((q[1] & 0x0F) << 4),
+        (q[2] & 0x0F) | ((q[3] & 0x0F) << 4),
+        (q[4] & 0x0F) | ((q[5] & 0x0F) << 4),
+        (q[6] & 0x0F) | ((q[7] & 0x0F) << 4));
+}
+
+static uint32_t ggml_opencl_pack_q4_trans4_high(const uint8_t * q) {
+    return ggml_opencl_pack_u8x4_lsb(
+        ((q[0] & 0xF0) >> 4) | (q[1] & 0xF0),
+        ((q[2] & 0xF0) >> 4) | (q[3] & 0xF0),
+        ((q[4] & 0xF0) >> 4) | (q[5] & 0xF0),
+        ((q[6] & 0xF0) >> 4) | (q[7] & 0xF0));
+}
+
+static void ggml_opencl_repack_q4_trans4_quants(
+        const block_q4_K & block,
+        std::vector<uint32_t> & q,
+        size_t q_base,
+        size_t row_count) {
+    for (size_t group = 0; group < QK_K / 64; ++group) {
+        const size_t src_offset = group * 32;
+        const size_t dst_offset = group * 8;
+        q[q_base + (dst_offset + 0) * row_count] = ggml_opencl_pack_q4_trans4_low(block.qs + src_offset + 0);
+        q[q_base + (dst_offset + 1) * row_count] = ggml_opencl_pack_q4_trans4_low(block.qs + src_offset + 8);
+        q[q_base + (dst_offset + 2) * row_count] = ggml_opencl_pack_q4_trans4_low(block.qs + src_offset + 16);
+        q[q_base + (dst_offset + 3) * row_count] = ggml_opencl_pack_q4_trans4_low(block.qs + src_offset + 24);
+        q[q_base + (dst_offset + 4) * row_count] = ggml_opencl_pack_q4_trans4_high(block.qs + src_offset + 0);
+        q[q_base + (dst_offset + 5) * row_count] = ggml_opencl_pack_q4_trans4_high(block.qs + src_offset + 8);
+        q[q_base + (dst_offset + 6) * row_count] = ggml_opencl_pack_q4_trans4_high(block.qs + src_offset + 16);
+        q[q_base + (dst_offset + 7) * row_count] = ggml_opencl_pack_q4_trans4_high(block.qs + src_offset + 24);
+    }
+}
+
+struct ggml_opencl_q4_k_moe_repack {
+    std::vector<ggml_fp16_t> d;
+    std::vector<ggml_fp16_t> dm;
+    std::vector<uint8_t> s;
+    std::vector<uint32_t> q;
+};
+
+static void ggml_opencl_repack_q4_k_moe_blocks(
+        const void * data,
+        size_t block_count,
+        size_t blocks_per_row,
+        size_t row_count,
+        ggml_opencl_q4_k_moe_repack & repack) {
+    const size_t blocks_per_batch = blocks_per_row * row_count;
+    const uint8_t * src = static_cast<const uint8_t *>(data);
+
+    for (size_t src_block_offset = 0; src_block_offset < block_count; ++src_block_offset) {
+        block_q4_K block;
+        memcpy(&block, src + src_block_offset * sizeof(block), sizeof(block));
+
+        const size_t batch = src_block_offset / blocks_per_batch;
+        const size_t batch_offset = src_block_offset % blocks_per_batch;
+        const size_t row = batch_offset / blocks_per_row;
+        const size_t block_column = batch_offset % blocks_per_row;
+        const size_t dst_block_offset =
+            row + block_column * row_count + batch * blocks_per_batch;
+
+        repack.d[dst_block_offset] = block.GGML_COMMON_AGGR_U.GGML_COMMON_AGGR_S.d;
+        repack.dm[dst_block_offset] = block.GGML_COMMON_AGGR_U.GGML_COMMON_AGGR_S.dmin;
+        memcpy(repack.s.data() + src_block_offset * K_SCALE_SIZE, block.scales, K_SCALE_SIZE);
+
+        const size_t q_base =
+            batch * blocks_per_batch * 32 + block_column * row_count * 32 + row;
+        ggml_opencl_repack_q4_trans4_quants(block, repack.q, q_base, row_count);
+    }
+}
+
+static ggml_opencl_q4_k_moe_repack ggml_opencl_repack_q4_k_moe(
+        const ggml_tensor * tensor,
+        const void * data,
+        size_t size_d,
+        size_t size_dm,
+        size_t size_s,
+        size_t size_q) {
+    GGML_ASSERT(tensor->ne[0] > 0 && tensor->ne[0] % QK_K == 0);
+    GGML_ASSERT(tensor->ne[1] > 0);
+    GGML_ASSERT(tensor->ne[2] > 0);
+    GGML_ASSERT(tensor->ne[3] == 1);
+
+    const size_t blocks_per_row = static_cast<size_t>(tensor->ne[0] / QK_K);
+    const size_t row_count = static_cast<size_t>(tensor->ne[1]);
+    const size_t batch_count = static_cast<size_t>(tensor->ne[2]);
+    GGML_ASSERT(blocks_per_row <= std::numeric_limits<size_t>::max() / row_count);
+    const size_t blocks_per_batch = blocks_per_row * row_count;
+    GGML_ASSERT(blocks_per_batch <= std::numeric_limits<size_t>::max() / batch_count);
+    const size_t block_count = blocks_per_batch * batch_count;
+
+    GGML_ASSERT(block_count == static_cast<size_t>(ggml_nelements(tensor) / QK_K));
+    GGML_ASSERT(block_count <= std::numeric_limits<size_t>::max() / sizeof(block_q4_K));
+    GGML_ASSERT(block_count <= std::numeric_limits<size_t>::max() / sizeof(ggml_fp16_t));
+    GGML_ASSERT(size_d == block_count * sizeof(ggml_fp16_t));
+    GGML_ASSERT(size_dm == block_count * sizeof(ggml_fp16_t));
+    GGML_ASSERT(block_count <= std::numeric_limits<size_t>::max() / K_SCALE_SIZE);
+    GGML_ASSERT(size_s == block_count * K_SCALE_SIZE);
+    GGML_ASSERT(block_count <= std::numeric_limits<size_t>::max() / (QK_K / 8));
+    const size_t q_word_count = block_count * (QK_K / 8);
+    GGML_ASSERT(q_word_count <= std::numeric_limits<size_t>::max() / sizeof(uint32_t));
+    GGML_ASSERT(size_q == q_word_count * sizeof(uint32_t));
+
+    ggml_opencl_q4_k_moe_repack repack {
+        std::vector<ggml_fp16_t>(block_count),
+        std::vector<ggml_fp16_t>(block_count),
+        std::vector<uint8_t>(size_s),
+        std::vector<uint32_t>(q_word_count),
+    };
+    ggml_opencl_repack_q4_k_moe_blocks(
+        data, block_count, blocks_per_row, row_count, repack);
+    return repack;
+}
+#endif
 
 
 // Parses a version string of form "XX.YY ". On an error returns ggml_cl_version with all zeroes.
@@ -14950,30 +15079,45 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
 
 #ifdef GGML_OPENCL_USE_ADRENO_KERNELS
         if (use_adreno_moe_kernels(backend_ctx, tensor)) {
-            cl_kernel kernel = backend_ctx->kernel_convert_block_q4_k_trans4_ns;
-
             int ne00 = tensor->ne[0];
             int ne01 = tensor->ne[1];
             int ne02 = tensor->ne[2];
 
-            cl_uchar mask_0F = 0x0F;
-            cl_uchar mask_F0 = 0xF0;
-            CL_CHECK(clSetKernelArg(kernel, 0, sizeof(cl_mem), &data_device));
-            CL_CHECK(clSetKernelArg(kernel, 1, sizeof(cl_mem), &extra->q));
-            CL_CHECK(clSetKernelArg(kernel, 2, sizeof(cl_mem), &extra->d));
-            CL_CHECK(clSetKernelArg(kernel, 3, sizeof(cl_mem), &extra->dm));
-            CL_CHECK(clSetKernelArg(kernel, 4, sizeof(cl_mem), &extra->s));
-            CL_CHECK(clSetKernelArg(kernel, 5, sizeof(int), &ne00));
-            CL_CHECK(clSetKernelArg(kernel, 6, sizeof(int), &ne01));
-            CL_CHECK(clSetKernelArg(kernel, 7, sizeof(cl_uchar), &mask_0F));
-            CL_CHECK(clSetKernelArg(kernel, 8, sizeof(cl_uchar), &mask_F0));
+            static const char * cpu_repack_env = getenv("GGML_OPENCL_Q4K_MOE_CPU_REPACK");
+            const bool use_cpu_repack = cpu_repack_env && atoi(cpu_repack_env) != 0;
+            if (use_cpu_repack) {
+                GGML_ASSERT(offset == 0 && size == ggml_nbytes(tensor) &&
+                            "CPU Q4_K MoE repack requires a full-tensor upload");
+                GGML_LOG_INFO(
+                    "ggml_opencl: using CPU Q4_K MoE repack for tensor '%s' [%" PRId64 ", %" PRId64 ", %" PRId64 ", %" PRId64 "]\n",
+                    tensor->name, tensor->ne[0], tensor->ne[1], tensor->ne[2], tensor->ne[3]);
+                ggml_opencl_q4_k_moe_repack repack =
+                    ggml_opencl_repack_q4_k_moe(tensor, data, size_d, size_dm, size_s, size_q);
+                CL_CHECK(clEnqueueWriteBuffer(queue, extra->d, CL_TRUE, 0, size_d, repack.d.data(), 0, NULL, NULL));
+                CL_CHECK(clEnqueueWriteBuffer(queue, extra->dm, CL_TRUE, 0, size_dm, repack.dm.data(), 0, NULL, NULL));
+                CL_CHECK(clEnqueueWriteBuffer(queue, extra->s, CL_TRUE, 0, size_s, repack.s.data(), 0, NULL, NULL));
+                CL_CHECK(clEnqueueWriteBuffer(queue, extra->q, CL_TRUE, 0, size_q, repack.q.data(), 0, NULL, NULL));
+            } else {
+                cl_kernel kernel = backend_ctx->kernel_convert_block_q4_k_trans4_ns;
+                cl_uchar mask_0F = 0x0F;
+                cl_uchar mask_F0 = 0xF0;
+                CL_CHECK(clSetKernelArg(kernel, 0, sizeof(cl_mem), &data_device));
+                CL_CHECK(clSetKernelArg(kernel, 1, sizeof(cl_mem), &extra->q));
+                CL_CHECK(clSetKernelArg(kernel, 2, sizeof(cl_mem), &extra->d));
+                CL_CHECK(clSetKernelArg(kernel, 3, sizeof(cl_mem), &extra->dm));
+                CL_CHECK(clSetKernelArg(kernel, 4, sizeof(cl_mem), &extra->s));
+                CL_CHECK(clSetKernelArg(kernel, 5, sizeof(int), &ne00));
+                CL_CHECK(clSetKernelArg(kernel, 6, sizeof(int), &ne01));
+                CL_CHECK(clSetKernelArg(kernel, 7, sizeof(cl_uchar), &mask_0F));
+                CL_CHECK(clSetKernelArg(kernel, 8, sizeof(cl_uchar), &mask_F0));
 
-            size_t global_work_size[] = {static_cast<size_t>(((ne01 + 63) / 64) * 64), static_cast<size_t>(ne00 / 256), static_cast<size_t>(ne02)};
-            size_t local_work_size[] = {64, 1, 1};
+                size_t global_work_size[] = {static_cast<size_t>(((ne01 + 63) / 64) * 64), static_cast<size_t>(ne00 / 256), static_cast<size_t>(ne02)};
+                size_t local_work_size[] = {64, 1, 1};
 
-            cl_event evt;
-            CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, 3, NULL, global_work_size, local_work_size, 0, NULL, &evt));
-            CL_CHECK(clWaitForEvents(1, &evt));
+                cl_event evt;
+                CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, 3, NULL, global_work_size, local_work_size, 0, NULL, &evt));
+                CL_CHECK(clWaitForEvents(1, &evt));
+            }
             CL_CHECK(clReleaseMemObject(data_device));
 
             cl_image_format img_format_q = {CL_R, CL_UNSIGNED_INT32};
