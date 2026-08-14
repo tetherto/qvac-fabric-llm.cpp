@@ -11603,6 +11603,19 @@ inline bool use_q4k_tiled(const ggml_backend_opencl_context *backend_ctx, const 
            use_adreno_kernels(backend_ctx, tensor);
 }
 
+static bool use_cpu_q4_k_moe_repack(const ggml_backend_opencl_context * backend_ctx) {
+    const char * env = getenv("GGML_OPENCL_Q4K_MOE_CPU_REPACK");
+    if (env) {
+        return atoi(env) != 0;
+    }
+
+    // Qualcomm E031.47 miscompiles the Q4_K trans4 OpenCL repack used by MoE
+    // weights. Default to the equivalent host repack on affected drivers.
+    return backend_ctx &&
+           backend_ctx->adreno_cl_compiler_version.type == ADRENO_CL_COMPILER_TYPE::E031 &&
+           backend_ctx->adreno_cl_compiler_version.major == 47;
+}
+
 inline bool enable_adreno_trans_weight(const ggml_backend_opencl_context *backend_ctx, const ggml_tensor *tensor) {
 
     bool adreno_kernel = use_adreno_kernels(backend_ctx, tensor);
@@ -15083,9 +15096,7 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
             int ne01 = tensor->ne[1];
             int ne02 = tensor->ne[2];
 
-            static const char * cpu_repack_env = getenv("GGML_OPENCL_Q4K_MOE_CPU_REPACK");
-            const bool use_cpu_repack = cpu_repack_env && atoi(cpu_repack_env) != 0;
-            if (use_cpu_repack) {
+            if (use_cpu_q4_k_moe_repack(backend_ctx)) {
                 GGML_ASSERT(offset == 0 && size == ggml_nbytes(tensor) &&
                             "CPU Q4_K MoE repack requires a full-tensor upload");
                 GGML_LOG_INFO(
