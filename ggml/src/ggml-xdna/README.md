@@ -15,7 +15,7 @@ scaffold: only `MUL_MAT` is implemented, everything else stays on the CPU.
 - 2D contiguous tensors (no batch dimensions).
 - `N <= 16384`: wide projections (e.g. the vocabulary output layer) stay on
   the CPU.
-- `K` is any multiple of `tile_k` (16), and a multiple of 256 for `Q4_K`;
+- `K` is any multiple of `tile_k` (64), and a multiple of 256 for `Q4_K`;
   wide-K ops are split into blocks.
 
 Both prefill and decode are covered. Prefill tiles the M dimension into
@@ -24,10 +24,11 @@ model GEMM that does not go to the NPU.
 
 ### Hardware constraints
 
-- `K_div_k > 64` (K > 1024 with `tile_k = 16`) wedges the shared NPU context,
-  so every K-block is capped at 1024 and partial blocks are zero-padded. This
-  is a context-local hang that reproduces across IRON and hand-built streams.
 - The kernel is BF16-in / F32-out only.
+- Every K-block is capped at 1024 (`GEMM_K_MAX`) and partial blocks are
+  zero-padded. The cap was originally added for a context-local hang observed
+  at `K_div_k > 64` with `tile_k = 16`; with the current driver the hang no
+  longer reproduces, but the conservative cap is kept.
 
 ## Requirements
 
@@ -112,4 +113,5 @@ other work on an edge/fabric device, not raw speed.
 | `xdna-seq.h/.cpp` | TXN instruction-stream builder and the GEMM sequence. |
 | `xdna-ops.h/.cpp` | Per-op dispatch: GEMM support check, compute, finalize. |
 | `xdna-profile.h` | Optional per-op timing (`GGML_XDNA_PROFILING`). |
-| `kernels/gemm.py` | IRON design compiled to the xclbin at build time. |
+| `kernels/gemm.py` | IRON design compiled to the xclbin at build time; also a standalone run/trace harness (`--run`, `--trace-size`). |
+| `kernels/bstream.py` | DDR read-bandwidth probe for the shim DMA (sequential vs strided B patterns). |

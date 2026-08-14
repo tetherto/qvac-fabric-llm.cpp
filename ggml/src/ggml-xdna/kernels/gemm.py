@@ -7,7 +7,7 @@
 #
 # Compile-only mode (builds .xclbin + .insts.bin artifacts):
 #
-#   python3 gemm.py -M 32 -K 64 -N 128 -d npu2 \
+#   python3 gemm.py -M 32 -K 1024 -N 2048 -d npu2 \
 #       --xclbin-path build/bin/gemm.xclbin \
 #       --insts-path  build/bin/gemm.insts.bin
 #
@@ -26,6 +26,7 @@
 from __future__ import annotations
 
 import argparse
+import sys
 
 import numpy as np
 
@@ -101,6 +102,10 @@ def _compile_kwargs(opts) -> dict:
         "dtype_in_str": dtype_in_str,
         "dtype_out_str": dtype_out_str,
         "dev_name":     opts.dev,
+        "trace_size":   getattr(opts, "trace_size", 0),
+        "trace_rows":   tuple(getattr(opts, "trace_rows", None) or ()),
+        "trace_cols":   tuple(getattr(opts, "trace_cols", None) or ()),
+        "trace_egress": getattr(opts, "trace_egress", 0),
     }
 
 
@@ -118,6 +123,10 @@ def bf16_f32_gemm(
     dtype_in_str:            CompileTime[str],
     dtype_out_str:           CompileTime[str],
     dev_name:                CompileTime[str] = "npu2",
+    trace_size:              CompileTime[int] = 0,
+    trace_rows:              CompileTime[tuple] = (),
+    trace_cols:              CompileTime[tuple] = (),
+    trace_egress:            CompileTime[int] = 0,
 ):
     dtype_in = str_to_dtype(dtype_in_str)
     dtype_out = str_to_dtype(dtype_out_str)
@@ -130,6 +139,15 @@ def bf16_f32_gemm(
     mem_tile_m_A = m * n_A_tiles_per_shim
     mem_tile_m_C = m * n_aie_rows
     mem_tile_n = n * n_aie_cols
+
+    # Per-variant tile counts. The host always submits the full baked M/K/N
+    # block (inputs are zero-padded). The loop counts are passed to the cores
+    # as runtime parameters (RTP) written by the runtime sequence, so a single
+    # xclbin serves every (K, N) variant; only the instruction stream (DMA
+    # tiling + RTP values) differs between variants.
+    K_div_k = K // k
+    n_c_col_tiles_per_core = N // mem_tile_n
+    n_c_row_tiles_per_core = M // mem_tile_m_C
 
     if dev_name == "npu1" and n_aie_cols > 4:
         raise AssertionError("Invalid configuration: NPU (Phoenix/Hawk) has 4 columns")
@@ -258,14 +276,6 @@ def bf16_f32_gemm(
         for row in range(n_aie_rows):
             C_l1l2_fifos[row][col] = c_tmp_fifos[row]
 
-    # Per-variant tile counts. The host always submits the full baked M/K/N
-    # block (inputs are zero-padded). The loop counts are passed to the cores
-    # as runtime parameters (RTP) written by the runtime sequence, so a single
-    # xclbin serves every (K, N) variant; only the instruction stream (DMA
-    # tiling + RTP values) differs between variants.
-    K_div_k = K // k
-    n_c_col_tiles_per_core = N // mem_tile_n
-    n_c_row_tiles_per_core = M // mem_tile_m_C
     n_tiles_per_core = n_c_row_tiles_per_core * n_c_col_tiles_per_core
 
     # Per-core RTP buffers (K_div_k, n_tiles_per_core) and a lock barrier so a
@@ -441,8 +451,336 @@ def bf16_f32_gemm(
     rt = Runtime(seq_fn, rt_args)
     my_program = Program(dev_ty, rt, [w for row in workers for w in row])
 
+    if trace_size > 0:
+        from aie.utils.trace.events import CoreEvent
+
+        rows = list(trace_rows) or list(range(n_aie_rows))
+        cols = list(trace_cols) or list(range(n_aie_cols))
+        traced = [workers[r][c] for r in rows for c in cols]
+        # The trace overlay assigns one packet ID per traced tile; the 5-bit
+        # packet-id field (with ID 0 reserved) caps the set at 31 tiles.
+        if len(traced) > 31:
+            print("gemm: trace capped to 31 tiles (hardware packet-id limit); "
+                  "use --trace-rows/--trace-cols to select a subset",
+                  file=sys.stderr)
+            traced = traced[:31]
+        my_program.enable_trace(
+            trace_size,
+            workers=traced,
+            coretile_events=[
+                CoreEvent.INSTR_EVENT_0,
+                CoreEvent.INSTR_EVENT_1,
+                CoreEvent.INSTR_VECTOR,
+                CoreEvent.MEMORY_STALL,
+                CoreEvent.STREAM_STALL,
+                CoreEvent.LOCK_STALL,
+                CoreEvent.ACTIVE,
+            ],
+            egress_shim_col=trace_egress,
+        )
+
     module = my_program.resolve_program()
     return module
+
+
+def _run_gemm(design, opts) -> None:
+    """Compile the GEMM kernel and run it standalone on the NPU.
+
+    Mirrors the ggml-xdna C++ submission scheme (xdna-ops.cpp): the host K
+    dimension is tiled into GEMM_K_MAX-wide blocks, each block submitted as
+    its own kernel run, and A/C buffers are ping-ponged so a block's C
+    readback overlaps the next block's NPU execution. Synthetic bf16 data is
+    used; pass --verify to compare against a numpy reference.
+
+    With --hang the kernel is compiled at K > 1024 (K_div_k > 64) and run as a
+    single submission with a watchdog; a background thread keeps snapshots of
+    the trace buffer so the state just before a stall is preserved.
+    """
+    import os
+    import time
+    from pathlib import Path
+
+    import pyxrt as xrt
+    from ml_dtypes import bfloat16
+
+    if opts.dev is None:
+        from aie.utils import get_current_device
+        from aie.utils.compile import resolve_target_arch
+
+        rtdev = get_current_device()
+        if rtdev is None:
+            sys.exit("--run: no NPU runtime device detected (pass --dev npu2)")
+        opts.dev = "npu2" if resolve_target_arch(rtdev) == "aie2p" else "npu"
+
+    _validate(opts)
+
+    GEMM_K_MAX = 1024
+
+    Mk = opts.M
+    N = opts.N
+    kernel_K = opts.K
+    host_K = opts.host_K if opts.host_K is not None else opts.K
+    host_M = opts.host_M if opts.host_M is not None else opts.M
+
+    n_m_blocks = ceildiv(host_M, Mk)
+    n_k_blocks = ceildiv(host_K, kernel_K)
+
+    if opts.hang and n_k_blocks != 1:
+        sys.exit("--hang expects a single full-K run (set -K > 1024, not --host-K tiling)")
+    if opts.hang and host_M > Mk:
+        sys.exit("--hang expects host M <= baked M block (decode-style, --host-M <= %d)" % Mk)
+
+    # --- compile ------------------------------------------------------------
+    os.makedirs(opts.workdir, exist_ok=True)
+    base = os.path.join(opts.workdir, "gemm_M%d_K%d_N%d" % (Mk, kernel_K, N))
+    if opts.trace_size > 0:
+        base += "_tr%d" % opts.trace_size
+    xclbin_path = base + ".xclbin"
+    insts_path = base + ".insts.bin"
+
+    spec = design.specialize(**_compile_kwargs(opts))
+    xclbin_path, insts_path = spec.compile(xclbin_path=xclbin_path, inst_path=insts_path)
+
+    physical_mlir = None
+    try:
+        kdir = spec.compilable._kernel_dir
+        if kdir is not None:
+            pm = kdir / "input_with_addresses.mlir"
+            if pm.exists():
+                physical_mlir = str(pm)
+    except Exception:
+        pass
+
+    # --- device -------------------------------------------------------------
+    dev = xrt.device(0)
+    xb = xrt.xclbin(str(xclbin_path))
+    dev.register_xclbin(xb)
+    ctx = xrt.hw_context(dev, xb.get_uuid())
+    kernel = xrt.kernel(ctx, xb.get_kernels()[0].get_name())
+
+    insts = np.frombuffer(Path(insts_path).read_bytes(), dtype=np.uint32)
+    insts_bo = xrt.bo(dev, insts.nbytes, xrt.bo.cacheable, kernel.group_id(1))
+    np.frombuffer(insts_bo.map(), dtype=np.uint32)[:] = insts
+    insts_bo.sync(xrt.xclBOSyncDirection.XCL_BO_SYNC_BO_TO_DEVICE)
+    insts_bytes = int(insts.nbytes)
+
+    to_dev = xrt.xclBOSyncDirection.XCL_BO_SYNC_BO_TO_DEVICE
+    from_dev = xrt.xclBOSyncDirection.XCL_BO_SYNC_BO_FROM_DEVICE
+
+    def alloc(nbytes):
+        return xrt.bo(dev, nbytes, xrt.bo.host_only, 0)
+
+    a_bos = [alloc(Mk * kernel_K * np.dtype(bfloat16).itemsize) for _ in range(2)]
+    c_bos = [alloc(Mk * N * np.dtype(np.float32).itemsize) for _ in range(2)]
+    b_bos = [alloc(kernel_K * N * np.dtype(bfloat16).itemsize) for _ in range(n_k_blocks)]
+
+    trace_bo = None
+    if opts.trace_size > 0:
+        trace_bo = alloc(opts.trace_size)
+        if n_k_blocks > 1:
+            sys.exit("--trace-size with host K tiling: trace only a single K-block (set --host-K <= 1024)")
+
+    # --- data ---------------------------------------------------------------
+    rng = np.random.default_rng(7)
+    A = rng.standard_normal((host_M, host_K)).astype(np.float32).astype(bfloat16)
+    B = rng.standard_normal((host_K, N)).astype(np.float32).astype(bfloat16)
+
+    for kb in range(n_k_blocks):
+        k0 = kb * kernel_K
+        kc = min(kernel_K, host_K - k0)
+        blk = np.frombuffer(b_bos[kb].map(), dtype=bfloat16).reshape(kernel_K, N)
+        blk.fill(bfloat16(0))
+        blk[0:kc, :] = B[k0:k0 + kc, :]
+        b_bos[kb].sync(to_dev)
+
+    def fill_a(bo, mb, kb):
+        m0 = mb * Mk
+        mc = min(Mk, host_M - m0)
+        k0 = kb * kernel_K
+        kc = min(kernel_K, host_K - k0)
+        a = np.frombuffer(bo.map(), dtype=bfloat16).reshape(Mk, kernel_K)
+        a.fill(bfloat16(0))
+        a[0:mc, 0:kc] = A[m0:m0 + mc, k0:k0 + kc]
+        bo.sync(to_dev)
+
+    # --- submission loop ----------------------------------------------------
+    trace_words = None
+
+    def run_once():
+        nonlocal trace_words
+        c_host = np.zeros((n_m_blocks * Mk, N), dtype=np.float32)
+        bank = 0
+        pending = -1
+        pend_mb = 0
+        run_prev = None
+        stats = np.zeros(5)  # pack, sync, submit, wait, read
+
+        for kb in range(n_k_blocks):
+            for mb in range(n_m_blocks):
+                t0 = time.perf_counter()
+                fill_a(a_bos[bank], mb, kb)
+                stats[0] += time.perf_counter() - t0
+
+                t0 = time.perf_counter()
+                a_bos[bank].sync(to_dev)
+                stats[1] += time.perf_counter() - t0
+
+                args = [a_bos[bank], b_bos[kb], c_bos[bank]]
+                if trace_bo is not None:
+                    args += [trace_bo]
+                t0 = time.perf_counter()
+                run = kernel(3, insts_bo, insts_bytes, *args)
+                stats[2] += time.perf_counter() - t0
+
+                if pending >= 0:
+                    t0 = time.perf_counter()
+                    st = run_prev.wait()
+                    stats[3] += time.perf_counter() - t0
+                    if st != xrt.ert_cmd_state.ERT_CMD_STATE_COMPLETED:
+                        sys.exit("--run: kernel wait state %s" % str(st))
+                    t0 = time.perf_counter()
+                    c_bos[pending].sync(from_dev)
+                    c = np.frombuffer(c_bos[pending].map(), dtype=np.float32).copy().reshape(Mk, N)
+                    stats[4] += time.perf_counter() - t0
+                    c_host[pend_mb * Mk:(pend_mb + 1) * Mk, :] += c
+                run_prev = run
+                pend_mb = mb
+                pending = bank
+                bank = 1 - bank
+
+        if pending >= 0:
+            t0 = time.perf_counter()
+            st = run_prev.wait()
+            stats[3] += time.perf_counter() - t0
+            if st != xrt.ert_cmd_state.ERT_CMD_STATE_COMPLETED:
+                sys.exit("--run: kernel wait state %s" % str(st))
+            t0 = time.perf_counter()
+            c_bos[pending].sync(from_dev)
+            c = np.frombuffer(c_bos[pending].map(), dtype=np.float32).copy().reshape(Mk, N)
+            stats[4] += time.perf_counter() - t0
+            c_host[pend_mb * Mk:(pend_mb + 1) * Mk, :] += c
+
+        if trace_bo is not None:
+            trace_bo.sync(from_dev)
+            trace_words = np.frombuffer(trace_bo.map(), dtype=np.uint32).copy()
+
+        return c_host, stats
+
+    def run_hang():
+        """Single full-K (K > 1024) run with a watchdog and a trace saver.
+
+        The run normally wedges the shared hw_context; the trace BO is a
+        host-only buffer written by the shim DMA directly into system memory,
+        so polling its mapping preserves the events emitted just before the
+        stall.
+        """
+        import threading
+
+        fill_a(a_bos[0], 0, 0)
+        a_bos[0].sync(to_dev)
+        args = [a_bos[0], b_bos[0], c_bos[0]]
+        if trace_bo is not None:
+            args += [trace_bo]
+        run = kernel(3, insts_bo, insts_bytes, *args)
+
+        done = [False]
+        result = [None]
+        started = time.perf_counter()
+
+        def waiter():
+            result[0] = run.wait()
+            done[0] = True
+
+        threading.Thread(target=waiter, daemon=True).start()
+
+        snapshots = []
+        while not done[0]:
+            if trace_bo is not None:
+                snapshots.append(np.frombuffer(trace_bo.map(), dtype=np.uint32).copy())
+            if time.perf_counter() - started > opts.hang_timeout:
+                break
+            time.sleep(0.05)
+
+        elapsed = time.perf_counter() - started
+        if done[0]:
+            st = result[0]
+            if st != xrt.ert_cmd_state.ERT_CMD_STATE_COMPLETED:
+                sys.exit("--hang: kernel returned %s" % str(st))
+            print("--hang: run completed in %.3f ms (no wedge at K=%d)" % (elapsed * 1000, kernel_K))
+            if trace_bo is not None and snapshots:
+                _save_trace(snapshots[-1])
+            return
+
+        print("--hang: run did not complete within %.0f s - context WEDGE at K=%d (K_div_k=%d)"
+              % (opts.hang_timeout, kernel_K, kernel_K // opts.tile_k))
+        if trace_bo is not None and snapshots:
+            _save_trace(snapshots[-1])
+        sys.exit(2)
+
+    def _save_trace(words):
+        from aie.utils.trace import TraceConfig
+
+        tcfg = TraceConfig(trace_size=opts.trace_size, trace_file=opts.trace_file)
+        tcfg.write_trace(words)
+        print("trace      : %d words -> %s" % (len(words), opts.trace_file))
+        if not physical_mlir:
+            print("  note: no input_with_addresses.mlir found; cannot parse")
+            return
+        try:
+            from aie.utils.trace.parse import parse_trace
+            from aie.utils.trace.utils import print_cycles_summary
+            import json as _json
+
+            buf = tcfg.read_trace()
+            with open(physical_mlir) as f:
+                mlir = f.read()
+            events = parse_trace(buf, mlir, colshift=0)
+            json_path = opts.trace_file + ".json"
+            with open(json_path, "w") as f:
+                _json.dump(events, f)
+            print("  parsed   : -> %s" % json_path)
+            print_cycles_summary(json_path)
+        except Exception as e:
+            print("  parse/summary failed: %r" % e)
+        print("  commands : python -m aie.utils.trace.parse --input %s --mlir %s --output trace.json --colshift 0"
+              % (opts.trace_file, physical_mlir))
+
+    if opts.hang:
+        run_hang()
+        return
+
+    # warmup + iters
+    for _ in range(max(opts.warmup, 0)):
+        run_once()
+    iters = max(opts.iters, 1)
+    c_host = None
+    stats_sum = np.zeros(5)
+    t_wall = time.perf_counter()
+    for _ in range(iters):
+        c_host, stats = run_once()
+        stats_sum += stats
+    wall = (time.perf_counter() - t_wall) / iters * 1000.0
+    stats_avg = stats_sum / iters * 1000.0
+
+    # --- report -------------------------------------------------------------
+    flops = 2.0 * host_M * host_K * N
+    print("shape      : M=%d K=%d N=%d (kernel M=%d K=%d, %d K-block(s) x %d M-block(s))"
+          % (host_M, host_K, N, Mk, kernel_K, n_k_blocks, n_m_blocks))
+    print("avg wall   : %.3f ms/iter -> %.1f GFLOP/s, %.1f tokens/s" % (wall, flops / wall / 1e6, 1000.0 / wall))
+    print("  pack     : %.3f ms (%.1f%%)" % (stats_avg[0], 100 * stats_avg[0] / wall))
+    print("  sync A   : %.3f ms (%.1f%%)" % (stats_avg[1], 100 * stats_avg[1] / wall))
+    print("  submit   : %.3f ms (%.1f%%)" % (stats_avg[2], 100 * stats_avg[2] / wall))
+    print("  wait NPU : %.3f ms (%.1f%%)" % (stats_avg[3], 100 * stats_avg[3] / wall))
+    print("  read C   : %.3f ms (%.1f%%)" % (stats_avg[4], 100 * stats_avg[4] / wall))
+
+    if not opts.no_verify:
+        C_ref = A.astype(np.float32) @ B.astype(np.float32)
+        C = c_host[0:host_M, :]
+        err = np.max(np.abs(C - C_ref))
+        print("verify     : max abs err %.4g (bf16 tolerance ~1e-2)" % err)
+
+    if trace_words is not None:
+        _save_trace(trace_words)
 
 
 def main() -> None:
@@ -453,18 +791,19 @@ def main() -> None:
     add_compile_args(parser)
     parser.add_argument("-M", type=int, default=32,
                         help="Total M dimension (rows, multiple of 4*tile_m)")
-    parser.add_argument("-K", type=int, default=64,
-                        help="Total K dimension (inner dim, multiple of tile_k)")
-    parser.add_argument("-N", type=int, default=128,
+    parser.add_argument("-K", type=int, default=1024,
+                        help="Total K dimension (inner dim, multiple of tile_k). "
+                             "1024 = GEMM_K_MAX; set > 1024 with --hang to probe the K_div_k > 64 boundary")
+    parser.add_argument("-N", type=int, default=2048,
                         help="Total N dimension (cols, multiple of tile_n*n_aie_cols)")
 
     # Tile dimensions (sub-block sizes)
     parser.add_argument("--tile-m", type=int, default=8, dest="tile_m",
                         help="Per-core M tile (default: 8)")
-    parser.add_argument("--tile-k", type=int, default=16, dest="tile_k",
-                        help="Per-core K tile (default: 16)")
-    parser.add_argument("--tile-n", type=int, default=16, dest="tile_n",
-                        help="Per-core N tile (default: 16)")
+    parser.add_argument("--tile-k", type=int, default=64, dest="tile_k",
+                        help="Per-core K tile (default: 64; larger = fewer C reloads)")
+    parser.add_argument("--tile-n", type=int, default=64, dest="tile_n",
+                        help="Per-core N tile (default: 64; wider = longer B DDR bursts)")
 
     # AIE array configuration
     parser.add_argument("--n-aie-cols", type=int, default=8, dest="n_aie_cols",
@@ -473,15 +812,45 @@ def main() -> None:
                         help="Number of AIE core rows used (1-4, default: 4)")
 
     parser.add_argument("--dtype", choices=sorted(DTYPE_COMBOS), default="bf16_f32")
+
+    # Standalone run mode
+    parser.add_argument("--run", action="store_true",
+                        help="Compile and run the kernel on the NPU (no ggml backend)")
+    parser.add_argument("--host-M", type=int, default=None, dest="host_M",
+                        help="Host matrix M rows (decode=1, prefill=32+); default = -M")
+    parser.add_argument("--host-K", type=int, default=None, dest="host_K",
+                        help="Host matrix K (tiled into -K blocks); default = -K")
+    parser.add_argument("--iters", type=int, default=10, help="Benchmark iterations")
+    parser.add_argument("--warmup", type=int, default=2, help="Warmup iterations")
+    parser.add_argument("--workdir", type=str, default="build/bin",
+                        help="Directory for compiled artifacts (default: build/bin)")
+    parser.add_argument("--trace-size", type=int, default=0, dest="trace_size",
+                        help="AIE trace buffer size in bytes (0 = off)")
+    parser.add_argument("--trace-file", type=str, default="trace.txt", dest="trace_file")
+    parser.add_argument("--trace-rows", type=int, nargs="*", default=None, dest="trace_rows",
+                        help="Compute rows to trace (0..n_aie_rows-1); default all")
+    parser.add_argument("--trace-cols", type=int, nargs="*", default=None, dest="trace_cols",
+                        help="Compute cols to trace (0..n_aie_cols-1); default all")
+    parser.add_argument("--trace-egress", type=int, default=0, dest="trace_egress",
+                        help="Shim column the trace packets are routed to (default: 0)")
+    parser.add_argument("--no-verify", action="store_true",
+                        help="Skip the numpy reference check")
+    parser.add_argument("--hang", action="store_true",
+                        help="Single full-K run with K > 1024 and a watchdog (probe the documented wedge)")
+    parser.add_argument("--hang-timeout", type=float, default=15.0, dest="hang_timeout",
+                        help="Seconds to wait for the --hang run before declaring a wedge")
     parser.add_argument("-v", "--verbose", action="store_true")
     opts = parser.parse_args()
 
-    run_design_cli(
-        bf16_f32_gemm,
-        opts,
-        compile_kwargs=_compile_kwargs,
-        validate=_validate,
-    )
+    if opts.run or opts.hang:
+        _run_gemm(bf16_f32_gemm, opts)
+    else:
+        run_design_cli(
+            bf16_f32_gemm,
+            opts,
+            compile_kwargs=_compile_kwargs,
+            validate=_validate,
+        )
 
 
 if __name__ == "__main__":

@@ -17,8 +17,8 @@ target_link_libraries(ggml-xdna PRIVATE XRT::xrt_coreutil)
 # (xdna-seq.h) and the kernel compile stay in sync.
 set(XDNA_GEMM_M 32)         # baked M block
 set(XDNA_TILE_M 8)          # per-core M tile
-set(XDNA_TILE_K 16)         # per-core K tile
-set(XDNA_TILE_N 32)         # per-core N tile
+set(XDNA_TILE_K 64)         # per-core K tile (larger = fewer C reloads per call)
+set(XDNA_TILE_N 64)         # per-core N tile (wider = longer B DDR bursts)
 set(XDNA_N_COLS 8)          # AIE columns
 set(XDNA_N_COMPUTE_ROWS 4)  # compute tile rows
 
