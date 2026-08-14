@@ -2188,7 +2188,7 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
         }
         if (graph->nodes[i] != nullptr) {
             LOG_DBG3("[%s] node %u: id=%" PRId64 ", %s\n", __func__, i, id, rpc_log_format_tensor(graph->nodes[i]).c_str());
-            const size_t hash_pos = ggml_hash_insert(&graph->visited_hash_set, graph->nodes[i]);
+            const size_t hash_pos = ggml_hash_find_or_insert(&graph->visited_hash_set, graph->nodes[i]);
             graph->use_counts[hash_pos] = tensor_ptrs.at(id)->use_count;
         }
     }
