@@ -1,0 +1,109 @@
+name: CI (rpc)
+
+on:
+  workflow_dispatch: # allows manual triggering
+  push:
+    branches:
+      - master
+    paths: [
+      '.github/workflows/build-rpc.yml',
+      '**/CMakeLists.txt',
+      '**/.cmake',
+      '**/*.h',
+      '**/*.hpp',
+      '**/*.c',
+      '**/*.cpp'
+    ]
+
+  pull_request:
+    types: [opened, synchronize, reopened]
+    paths: [
+      '.github/workflows/build-rpc.yml',
+      'ggml/include/ggml-rpc.h',
+      'ggml/src/ggml-rpc/**',
+      'tests/CMakeLists.txt',
+      'tests/test-rpc.cpp',
+      'tools/rpc/**'
+    ]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref && github.ref || github.run_id }}
+  cancel-in-progress: true
+
+env:
+  GGML_NLOOP: 3
+  GGML_N_THREADS: 1
+  LLAMA_ARG_LOG_COLORS: 1
+  LLAMA_ARG_LOG_PREFIX: 1
+  LLAMA_ARG_LOG_TIMESTAMPS: 1
+
+jobs:
+  ubuntu-24-rpc:
+    runs-on: ${{ 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
+
+    steps:
+      - name: Clone
+        id: checkout
+        uses: actions/checkout@v6
+
+      - name: Dependencies
+        id: depends
+        run: |
+          sudo apt-get update
+          sudo apt-get install build-essential libssl-dev ninja-build
+
+      - name: Build
+        id: cmake_build
+        run: |
+          cmake -B build \
+            -G "Ninja" \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DGGML_RPC=ON
+          time cmake --build build --config Release -j $(nproc)
+
+      - name: Download model
+        run: |
+          cmake \
+            -DDEST="${GITHUB_WORKSPACE}/build/tinyllamas/stories15M-q4_0.gguf" \
+            -DNAME="tinyllamas/stories15M-q4_0.gguf" \
+            -DHASH="SHA256=66967fbece6dbe97886593fdbb73589584927e29119ec31f08090732d1861739" \
+            -P cmake/download-models.cmake
+
+      - name: Test
+        id: cmake_test
+        run: |
+          cd build
+          bin/ggml-rpc-server -H 127.0.0.1 -p 50052 -d CPU > rpc-server-0.log 2>&1 &
+          rpc_server_0=$!
+          bin/ggml-rpc-server -H 127.0.0.1 -p 50053 -d CPU > rpc-server-1.log 2>&1 &
+          rpc_server_1=$!
+          trap 'kill ${rpc_server_0} ${rpc_server_1} 2>/dev/null || true' EXIT
+          export GGML_RPC_TEST_ENDPOINTS=127.0.0.1:50052,127.0.0.1:50053
+          ready=0
+          for attempt in $(seq 1 50); do
+            kill -0 ${rpc_server_0} ${rpc_server_1}
+            if bin/llama-bench -rpc ${GGML_RPC_TEST_ENDPOINTS} --list-devices > /dev/null 2>&1; then
+              ready=1
+              break
+            fi
+            sleep 0.2
+          done
+          if [ ${ready} -ne 1 ]; then
+            printf '%s\n' "RPC servers did not become ready"
+            exit 1
+          fi
+          ctest -R '^test-rpc$' --verbose
+          pipeline_output="$(bin/llama-bench -v \
+            -m tinyllamas/stories15M-q4_0.gguf \
+            -rpc ${GGML_RPC_TEST_ENDPOINTS} \
+            -dev RPC0/RPC1 \
+            -sm layer \
+            -ts 1/1 \
+            -ngl 99 \
+            -p 64 \
+            -n 0 \
+            -b 64 \
+            -ub 8 \
+            -r 1 2>&1)"
+          printf '%s\n' "${pipeline_output}"
+          printf '%s\n' "${pipeline_output}" | grep -q "pipeline parallelism enabled"

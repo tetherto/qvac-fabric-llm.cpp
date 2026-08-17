@@ -6,16 +6,21 @@
 
 template < typename T >
 __global__ void
-sigmoid_back_cuda(const T * GGML_CUDA_RESTRICT data_grad,
-                  const T * GGML_CUDA_RESTRICT data_src,
-                        T * GGML_CUDA_RESTRICT data_dst,
+sigmoid_back_cuda(const T * data_grad_ptr,
+                  const T * data_src_ptr,
+                        T * data_dst_ptr,
                   const int64_t k) {
 
+    ggml_cuda_pdl_lc();
+    const T * GGML_CUDA_RESTRICT data_grad = data_grad_ptr;
+    const T * GGML_CUDA_RESTRICT data_src  = data_src_ptr;
+          T * GGML_CUDA_RESTRICT data_dst  = data_dst_ptr;
     const int64_t tid = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
     if (tid >= k) {
         return;
     }
 
+    ggml_cuda_pdl_sync();
     constexpr const float one = 1.0f;
     const float dy = static_cast<float>(data_grad[tid]);
     const float x  = static_cast<float>(data_src[tid]);
