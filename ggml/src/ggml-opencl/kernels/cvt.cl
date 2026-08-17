@@ -41,8 +41,13 @@ typedef int int32_t;
 typedef uint uint32_t;
 
 // trans4_ns GEMM kernels consume bytes in least-significant-first numeric order.
-static inline uint pack_uchar4(uchar x0, uchar x1, uchar x2, uchar x3) {
-    return (uint) x0 | ((uint) x1 << 8) | ((uint) x2 << 16) | ((uint) x3 << 24);
+//
+// Everything here stays in uint registers. Narrowing intermediates to uchar
+// locals is miscompiled by the Adreno E031.47 shader compiler: it keeps the
+// first byte of each packed word and drops the rest, which silently corrupts
+// every repacked expert weight.
+static inline uint pack_uchar4(uint x0, uint x1, uint x2, uint x3) {
+    return (x0 & 0xFFu) | ((x1 & 0xFFu) << 8) | ((x2 & 0xFFu) << 16) | ((x3 & 0xFFu) << 24);
 }
 
 static inline uchar unpack_uchar0(uint x) {
@@ -61,36 +66,33 @@ static inline uchar unpack_uchar3(uint x) {
     return (uchar) ((x >> 24) & 0xFF);
 }
 
+// The low nibbles are combined with a multiply rather than `| (x << 4)`: the
+// E031.47 compiler drops the mask on the shifted term, letting the odd byte's
+// high nibble leak into the next byte of the packed word.
 static inline uint pack_trans4_low(__global const uchar * q, uint offset) {
-    uchar x0 = q[offset + 0];
-    uchar x1 = q[offset + 1];
-    uchar x2 = q[offset + 2];
-    uchar x3 = q[offset + 3];
-    uchar x4 = q[offset + 4];
-    uchar x5 = q[offset + 5];
-    uchar x6 = q[offset + 6];
-    uchar x7 = q[offset + 7];
-    return pack_uchar4(
-        (x0 & 0x0F) | ((x1 & 0x0F) << 4),
-        (x2 & 0x0F) | ((x3 & 0x0F) << 4),
-        (x4 & 0x0F) | ((x5 & 0x0F) << 4),
-        (x6 & 0x0F) | ((x7 & 0x0F) << 4));
+    uint w = 0;
+    for (uint t = 0; t < 4; ++t) {
+        const uint lo = q[offset + 2 * t + 0] & 0x0Fu;
+        const uint hi = q[offset + 2 * t + 1] & 0x0Fu;
+        w |= ((lo + hi * 16u) & 0xFFu) << (8u * t);
+    }
+    return w;
 }
 
 static inline uint pack_trans4_high(__global const uchar * q, uint offset) {
-    uchar x0 = q[offset + 0];
-    uchar x1 = q[offset + 1];
-    uchar x2 = q[offset + 2];
-    uchar x3 = q[offset + 3];
-    uchar x4 = q[offset + 4];
-    uchar x5 = q[offset + 5];
-    uchar x6 = q[offset + 6];
-    uchar x7 = q[offset + 7];
+    const uint x0 = q[offset + 0];
+    const uint x1 = q[offset + 1];
+    const uint x2 = q[offset + 2];
+    const uint x3 = q[offset + 3];
+    const uint x4 = q[offset + 4];
+    const uint x5 = q[offset + 5];
+    const uint x6 = q[offset + 6];
+    const uint x7 = q[offset + 7];
     return pack_uchar4(
-        ((x0 & 0xF0) >> 4) | (x1 & 0xF0),
-        ((x2 & 0xF0) >> 4) | (x3 & 0xF0),
-        ((x4 & 0xF0) >> 4) | (x5 & 0xF0),
-        ((x6 & 0xF0) >> 4) | (x7 & 0xF0));
+        ((x0 & 0xF0u) >> 4) | (x1 & 0xF0u),
+        ((x2 & 0xF0u) >> 4) | (x3 & 0xF0u),
+        ((x4 & 0xF0u) >> 4) | (x5 & 0xF0u),
+        ((x6 & 0xF0u) >> 4) | (x7 & 0xF0u));
 }
 
 static inline void restore_trans4(

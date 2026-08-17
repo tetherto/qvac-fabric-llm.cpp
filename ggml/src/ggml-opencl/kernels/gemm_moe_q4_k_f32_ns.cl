@@ -10,19 +10,20 @@
 #define QK_K 256
 #define K_SCALE_SIZE 12
 
-inline void get_scale_min_k4(
-    int j,
-    global const uchar * q,
-    uchar * d,
-    uchar * m
-) {
+// Returns the 6-bit sub-block scale in bits 0-7 and the min in bits 8-15.
+// Writing the results through pointers to private scalars is miscompiled by the
+// Adreno E031.47 shader compiler, which yields corrupted scales, so this stays
+// pointer-free and scalar.
+inline uint get_scale_min_k4_packed(int j, global const uchar * q) {
+    uint d, m;
     if (j < 4) {
-        *d = q[j]   & 63;
-        *m = q[j+4] & 63;
+        d = q[j]   & 63u;
+        m = q[j+4] & 63u;
     } else {
-        *d = (q[j+4] & 0x0F) | ((q[j-4] & 0xC0) >> 2);
-        *m = ((q[j+4] >> 4) & 0x0F) | ((q[j]   & 0xC0) >> 2);
+        d = (q[j+4] & 0x0Fu) | ((q[j-4] & 0xC0u) >> 2);
+        m = ((q[j+4] >> 4) & 0x0Fu) | ((q[j] & 0xC0u) >> 2);
     }
+    return d | (m << 8);
 }
 
 #define dequantize_q4_k(q4, a_f16, scale, minv) \
@@ -232,11 +233,10 @@ kernel void kernel_gemm_moe_q4_k_f32_ns(
 
         // Load sub-block scale and min
         global const uchar * sc = src0_s + (expert_id * ne01 + row_idx) * scales_per_row + sb * K_SCALE_SIZE;
-        uchar sv, mn;
-        get_scale_min_k4(j, sc, &sv, &mn);
+        uint sm = get_scale_min_k4_packed(j, sc);
 
-        float scale = (float)d_val * (float)sv;
-        float minv = (float)dm_val * (float)mn;
+        float scale = (float)d_val * (float)(sm & 0xFFu);
+        float minv = (float)dm_val * (float)(sm >> 8);
 
         // First sub-block (16 elements)
         uint q_sub_offset = row + ((ne01 * step) >> 3) + ((expert_id * ne00 * ne01) >> 3);

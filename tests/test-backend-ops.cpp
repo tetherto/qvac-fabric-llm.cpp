@@ -5969,10 +5969,22 @@ static bool init_mul_mat_id_adreno_repack_tensors(ggml_context * ctx, int n_mats
             if (ggml_is_view_op(t->op)) {
                 continue;
             }
+            // A real router selects unordered experts from the whole range, so
+            // draw a deterministic per-row permutation instead of the ascending
+            // low-numbered run that (i + r) % n_mats produces.
+            std::vector<int32_t> perm(n_mats);
             for (int64_t r = 0; r < ggml_nrows(t); ++r) {
+                for (int m = 0; m < n_mats; ++m) {
+                    perm[m] = m;
+                }
+                uint32_t rng = (uint32_t) (r * 2654435761u + 12345u);
+                for (int m = n_mats - 1; m > 0; --m) {
+                    rng = rng * 1664525u + 1013904223u;
+                    std::swap(perm[m], perm[(rng >> 16) % (uint32_t) (m + 1)]);
+                }
                 std::vector<int32_t> data(t->ne[0]);
                 for (int64_t i = 0; i < t->ne[0]; ++i) {
-                    data[i] = (int32_t) ((i + r) % n_mats);
+                    data[i] = perm[i % n_mats];
                 }
                 ggml_backend_tensor_set(t, data.data(), r * t->nb[1], t->ne[0] * sizeof(int32_t));
             }
@@ -5999,7 +6011,18 @@ static bool init_mul_mat_id_adreno_repack_tensors(ggml_context * ctx, int n_mats
         std::vector<uint8_t> restored(dataq.size());
         ggml_backend_tensor_get(t, restored.data(), 0, restored.size());
         if (memcmp(dataq.data(), restored.data(), dataq.size()) != 0) {
-            printf("quantized tensor roundtrip mismatch for %s ", ggml_type_name(t->type));
+            const size_t row_size = ggml_row_size(t->type, t->ne[0]);
+            const size_t blk_size = row_size / (t->ne[0] / ggml_blck_size(t->type));
+            size_t n_bad = 0, first_bad = dataq.size();
+            for (size_t i = 0; i < dataq.size(); ++i) {
+                if (dataq[i] != restored[i]) {
+                    if (n_bad == 0) { first_bad = i; }
+                    n_bad++;
+                }
+            }
+            printf("quantized tensor roundtrip mismatch for %s (%zu/%zu bytes, first at %zu = block %zu byte %zu of %zu) ",
+                   ggml_type_name(t->type), n_bad, dataq.size(),
+                   first_bad, first_bad / blk_size, first_bad % blk_size, blk_size);
             roundtrip_ok = false;
         }
     }
@@ -6152,8 +6175,10 @@ struct test_mul_mat_id_w4a4 : public test_mul_mat_id {
 struct test_mul_mat_id_adreno_repack : public test_mul_mat_id {
     bool roundtrip_ok = true;
 
-    test_mul_mat_id_adreno_repack(ggml_type type_a) :
-        test_mul_mat_id(type_a, GGML_TYPE_F32, 4, 2, false, 128, 7, 512) {}
+    test_mul_mat_id_adreno_repack(ggml_type type_a, int n_mats = 4, int n_used = 2,
+                                  int64_t m = 128, int64_t n = 7, int64_t k = 512,
+                                  bool bcast = false) :
+        test_mul_mat_id(type_a, GGML_TYPE_F32, n_mats, n_used, bcast, m, n, k) {}
 
     std::string vars() override { return test_mul_mat_id::vars() + ",adreno_trans4_ns=1"; }
 
@@ -6161,8 +6186,15 @@ struct test_mul_mat_id_adreno_repack : public test_mul_mat_id {
         roundtrip_ok = init_mul_mat_id_adreno_repack_tensors(ctx, n_mats);
     }
 
+    // A repack that does not survive a store/load roundtrip is a genuine
+    // failure. The matmul error on its own can stay under the threshold while
+    // the packed weights are wrong, which is how the Adreno E031.47 packing
+    // miscompile stayed hidden.
     double err(const float * a, const float * b, size_t n) override {
-        return roundtrip_ok ? test_mul_mat_id::err(a, b, n) : 1.0;
+        if (!roundtrip_ok) {
+            return DBL_MAX;
+        }
+        return test_mul_mat_id::err(a, b, n);
     }
 };
 
@@ -12521,6 +12553,32 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
              GGML_TYPE_MXFP4,
          }) {
         test_cases.emplace_back(new test_mul_mat_id_adreno_repack(type_a));
+    }
+
+    // Shapes taken from the MoE experts of a real deployed model (n_embd=1280,
+    // n_ff_exp=896, 6 of 64 experts used), which the small shapes above miss.
+    // n_tokens spans the GEMV (decode) and GEMM (prefill) kernel paths.
+    for (ggml_type type_a : {
+             GGML_TYPE_Q4_0,
+             GGML_TYPE_Q5_0,
+             GGML_TYPE_Q4_K,
+             GGML_TYPE_Q5_K,
+             GGML_TYPE_Q6_K,
+             GGML_TYPE_MXFP4,
+         }) {
+        const int64_t blck = ggml_blck_size(type_a);
+        for (int64_t n_tokens : { 1, 7, 128, 512 }) {
+            // bcast=true matches how build_moe_ffn feeds one token vector to
+            // every selected expert; bcast=false keeps the non-broadcast path.
+            for (bool bcast : { false, true }) {
+                if (1280 % blck == 0) {  // ffn_gate_exps / ffn_up_exps
+                    test_cases.emplace_back(new test_mul_mat_id_adreno_repack(type_a, 64, 6, 896, n_tokens, 1280, bcast));
+                }
+                if (896 % blck == 0) {   // ffn_down_exps
+                    test_cases.emplace_back(new test_mul_mat_id_adreno_repack(type_a, 64, 6, 1280, n_tokens, 896, bcast));
+                }
+            }
+        }
     }
 
     for (ggml_type type_a : all_types) {
