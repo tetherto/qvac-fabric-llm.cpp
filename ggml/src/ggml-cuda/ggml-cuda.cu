@@ -2544,6 +2544,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_SILU_BACK:
             ggml_cuda_op_silu_back(ctx, dst);
             break;
+        case GGML_OP_GEGLU_BACK:
+            ggml_cuda_op_geglu_back(ctx, dst);
+            break;
         case GGML_OP_RMS_NORM:
             ggml_cuda_op_rms_norm(ctx, dst);
             break;
@@ -6070,6 +6073,9 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             }
         case GGML_OP_SILU_BACK:
             return ggml_is_contiguous(op->src[0]) && op->src[0]->type == GGML_TYPE_F32;
+        case GGML_OP_GEGLU_BACK:
+            return ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]) &&
+                op->src[0]->type == GGML_TYPE_F32 && ggml_are_same_shape(op->src[0], op->src[1]);
         case GGML_OP_NORM:
         case GGML_OP_RMS_NORM:
         case GGML_OP_L2_NORM:
