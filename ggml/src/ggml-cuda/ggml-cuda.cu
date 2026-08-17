@@ -72,6 +72,7 @@
 #include "ggml-cuda/fill.cuh"
 #include "ggml-cuda/lightning-indexer.cuh"
 #include "ggml-cuda/top-k-mask.cuh"
+#include "ggml-cuda/sigmoid-back.cuh"
 #include "ggml.h"
 
 #include <algorithm>
@@ -2713,6 +2714,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             break;
         case GGML_OP_TOP_K_MASK:
             ggml_cuda_op_top_k_mask(ctx, dst);
+            break;
+        case GGML_OP_SIGMOID_BACK:
+            ggml_cuda_op_sigmoid_back(ctx, dst);
             break;
         default:
             return false;
@@ -6254,6 +6258,15 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             return ggml_cuda_lightning_indexer_supported(dev_ctx->device, op);
         case GGML_OP_TOP_K_MASK:
             return op->type == GGML_TYPE_F16 || op->type == GGML_TYPE_F32;
+        case GGML_OP_SIGMOID_BACK:
+            return (op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16) &&
+                    op->src[0] != NULL && op->src[1] != NULL &&
+                   op->src[0]->type == op->type && op->src[1]->type == op->type &&
+                   ggml_is_contiguous(op->src[0]) &&
+                   ggml_is_contiguous(op->src[1]) &&
+                   ggml_is_contiguous(op) &&
+                   ggml_are_same_shape(op, op->src[0]) &&
+                   ggml_are_same_shape(op, op->src[1]);
 
         default:
             return false;
