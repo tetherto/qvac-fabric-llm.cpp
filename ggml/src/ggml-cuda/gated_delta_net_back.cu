@@ -129,14 +129,14 @@ template <
     const uint32_t block_size = gdn_back_threads_per_block(S_v, ggml_cuda_get_physical_warp_size())
 >
 __global__ void __launch_bounds__(block_size)
-gated_delta_net_back_cuda(const float * GGML_CUDA_RESTRICT data_q,
-                          const float * GGML_CUDA_RESTRICT data_k,
-                          const float * GGML_CUDA_RESTRICT data_v,
-                          const float * GGML_CUDA_RESTRICT data_g,
-                          const float * GGML_CUDA_RESTRICT data_beta,
-                          const float * GGML_CUDA_RESTRICT data_state,
-                          const float * GGML_CUDA_RESTRICT data_d,
-                                float * GGML_CUDA_RESTRICT data_dst,
+gated_delta_net_back_cuda(const float * data_q_ptr,
+                          const float * data_k_ptr,
+                          const float * data_v_ptr,
+                          const float * data_g_ptr,
+                          const float * data_beta_ptr,
+                          const float * data_state_ptr,
+                          const float * data_d_ptr,
+                                float * data_dst_ptr,
                           const ggml_cuda_gated_delta_net_back_kargs args) {
 
     constexpr const uint32_t warp_size     = ggml_cuda_get_physical_warp_size();
@@ -184,6 +184,14 @@ gated_delta_net_back_cuda(const float * GGML_CUDA_RESTRICT data_q,
     const uint32_t state_size_per_snap = state_size * H * args.n_seqs;
 
     ggml_cuda_pdl_sync();
+    const float * GGML_CUDA_RESTRICT data_q     = data_q_ptr;
+    const float * GGML_CUDA_RESTRICT data_k     = data_k_ptr;
+    const float * GGML_CUDA_RESTRICT data_v     = data_v_ptr;
+    const float * GGML_CUDA_RESTRICT data_g     = data_g_ptr;
+    const float * GGML_CUDA_RESTRICT data_beta  = data_beta_ptr;
+    const float * GGML_CUDA_RESTRICT data_state = data_state_ptr;
+    const float * GGML_CUDA_RESTRICT data_d     = data_d_ptr;
+          float * GGML_CUDA_RESTRICT data_dst   = data_dst_ptr;
 
     for (uint32_t gi = 0; gi < group; gi++) {
         const uint32_t iv1 = iq1 + gi * neq1;       // v-head (iv1 % neq1 == iq1)

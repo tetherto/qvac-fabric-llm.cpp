@@ -25,6 +25,15 @@
 #include <algorithm>
 #include <atomic>
 
+#ifdef _WIN32
+#  define WIN32_LEAN_AND_MEAN
+#  ifndef NOMINMAX
+#    define NOMINMAX
+#  endif
+#  include <windows.h>
+#  include <bcrypt.h>
+#endif
+
 namespace fs = std::filesystem;
 
 // macro for nicer error messages on server crash
@@ -120,6 +129,8 @@ const size_t HASH_THRESHOLD = 10 * 1024 * 1024;
 // Maximum number of graphs cached per device; client and server must use the same value
 // so that both sides clear their caches at the same point in the message stream
 const size_t GRAPH_CACHE_MAX = 1024;
+
+static constexpr size_t RPC_COMM_FULL_DUPLEX_THRESHOLD   = 64 * 1024;
 
 struct rpc_msg_hello_req {
     uint8_t conn_caps[RPC_CONN_CAPS_SIZE];
@@ -254,6 +265,7 @@ struct rpc_msg_comm_init_req {
     uint32_t world;
     uint32_t port;      // rank 0: port to listen on; rank > 0: rank 0's comm port
     char     host[64];  // rank > 0: rank 0's host
+    uint8_t  wire_bf16;
 };
 
 struct rpc_msg_comm_init_rsp {
@@ -262,6 +274,7 @@ struct rpc_msg_comm_init_rsp {
 
 struct rpc_msg_comm_allreduce_req {
     uint32_t   device;
+    uint64_t   op_id;
     rpc_tensor tensor;
 };
 
@@ -308,6 +321,82 @@ struct ggml_backend_rpc_buffer_context {
 };
 
 // RPC helper functions
+
+static bool checked_mul_size(size_t a, size_t b, size_t & result) {
+    if (a != 0 && b > SIZE_MAX / a) {
+        return false;
+    }
+    result = a*b;
+    return true;
+}
+
+static bool checked_add_size(size_t a, size_t b, size_t & result) {
+    if (a > SIZE_MAX - b) {
+        return false;
+    }
+    result = a + b;
+    return true;
+}
+
+static bool checked_rpc_tensor_size(const rpc_tensor & tensor, size_t & tensor_size) {
+    const ggml_type type = (ggml_type) tensor.type;
+    const size_t block_size = ggml_blck_size(type);
+    if (tensor.ne[0] % block_size != 0) {
+        return false;
+    }
+
+    int64_t nelements = 1;
+    for (uint32_t i = 0; i < GGML_MAX_DIMS; i++) {
+        if (tensor.ne[i] != 0 && nelements > INT64_MAX / tensor.ne[i]) {
+            return false;
+        }
+        nelements *= tensor.ne[i];
+    }
+
+    size_t data_size;
+    if (!checked_mul_size(ggml_type_size(type), tensor.ne[0] / block_size, data_size)) {
+        return false;
+    }
+    for (uint32_t i = 1; i < GGML_MAX_DIMS; i++) {
+        if (!checked_mul_size(data_size, tensor.ne[i], data_size)) {
+            return false;
+        }
+    }
+
+    for (uint32_t i = 0; i < GGML_MAX_DIMS; i++) {
+        if (tensor.ne[i] == 0) {
+            tensor_size = 0;
+            return true;
+        }
+    }
+
+    if (block_size == 1) {
+        tensor_size = ggml_type_size(type);
+        for (uint32_t i = 0; i < GGML_MAX_DIMS; i++) {
+            size_t extent;
+            if (!checked_mul_size(tensor.ne[i] - 1, tensor.nb[i], extent) ||
+                    !checked_add_size(tensor_size, extent, tensor_size)) {
+                return false;
+            }
+        }
+    } else {
+        if (!checked_mul_size(tensor.ne[0] / block_size, tensor.nb[0], tensor_size)) {
+            return false;
+        }
+        for (uint32_t i = 1; i < GGML_MAX_DIMS; i++) {
+            size_t extent;
+            if (!checked_mul_size(tensor.ne[i] - 1, tensor.nb[i], extent) ||
+                    !checked_add_size(tensor_size, extent, tensor_size)) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+static bool checked_span_size(size_t size, size_t n_copies, size_t stride) {
+    return n_copies == 0 || stride == 0 || n_copies - 1 <= (SIZE_MAX - size) / stride;
+}
 
 // Computes FNV-1a hash of the data
 static uint64_t fnv_hash(const uint8_t * data, size_t len, uint64_t hash = 0xcbf29ce484222325ULL) {
@@ -882,7 +971,13 @@ static void ggml_backend_rpc_buffer_set_tensor_2d(ggml_backend_buffer_t buffer, 
     LOG_DBG2("[%s] tensor: %s, offset: %zu, size: %s, n_copies: %zu, stride: %zu\n", __func__,
              rpc_log_format_tensor(tensor).c_str(), offset, rpc_log_format_size(size).c_str(), n_copies, stride_tensor);
     // input serialization format: | rpc_tensor | offset (8 bytes) | size (8 bytes) | n_copies (8 bytes) | stride (8 bytes) | data (size * n_copies bytes) |
-    size_t input_size = sizeof(rpc_tensor) + 4*sizeof(uint64_t) + size*n_copies;
+    const size_t header_size = sizeof(rpc_tensor) + 4*sizeof(uint64_t);
+    size_t data_size;
+    size_t input_size;
+    GGML_ASSERT(checked_mul_size(size, n_copies, data_size));
+    GGML_ASSERT(checked_add_size(header_size, data_size, input_size));
+    GGML_ASSERT(checked_span_size(size, n_copies, stride_tensor));
+    GGML_ASSERT(checked_span_size(size, n_copies, stride_data));
     uint8_t * input = new uint8_t[input_size]();
     uint8_t * dest = input;
     memcpy(dest, &rpc_tensor, sizeof(rpc_tensor));
@@ -908,10 +1003,14 @@ static void ggml_backend_rpc_buffer_get_tensor_2d(ggml_backend_buffer_t buffer, 
     request->size     = size;
     request->n_copies = n_copies;
     request->stride   = stride_tensor;
+    size_t output_size;
+    GGML_ASSERT(checked_mul_size(size, n_copies, output_size));
+    GGML_ASSERT(checked_span_size(size, n_copies, stride_tensor));
+    GGML_ASSERT(checked_span_size(size, n_copies, stride_data));
     if (stride_data == size) {
-        ctx->dispatcher->send(RPC_CMD_GET_TENSOR_2D, request, sizeof(*request), data, size*n_copies);
+        ctx->dispatcher->send(RPC_CMD_GET_TENSOR_2D, request, sizeof(*request), data, output_size);
     } else {
-        std::vector<uint8_t> packed(size*n_copies);
+        std::vector<uint8_t> packed(output_size);
         ctx->dispatcher->send(RPC_CMD_GET_TENSOR_2D, request, sizeof(*request), packed.data(), packed.size());
         for (size_t i = 0; i < n_copies; i++) {
             memcpy((char *)data + i*stride_data, packed.data() + i*size, size);
@@ -1443,6 +1542,8 @@ private:
         socket_ptr              peer;
         uint32_t                rank = 0;
         uint32_t                world = 0;
+        bool                    wire_bf16 = true;
+        uint64_t                next_op_id = 0;
         ggml_backend_buffer_ptr scratch;
         size_t                  scratch_size = 0;
         std::vector<uint8_t>    send_buf;
@@ -1657,6 +1758,12 @@ ggml_tensor * rpc_server::deserialize_tensor(struct ggml_context * ctx, const rp
         return nullptr;
     }
 
+    size_t tensor_size;
+    if (!checked_rpc_tensor_size(*tensor, tensor_size)) {
+        GGML_LOG_ERROR("[%s] invalid tensor dimensions or strides\n", __func__);
+        return nullptr;
+    }
+
     ggml_tensor * result = ggml_new_tensor_4d(ctx, (ggml_type) tensor->type,
         tensor->ne[0], tensor->ne[1], tensor->ne[2], tensor->ne[3]);
 
@@ -1673,19 +1780,34 @@ ggml_tensor * rpc_server::deserialize_tensor(struct ggml_context * ctx, const rp
     if (result->buffer && buffers.find(result->buffer) == buffers.end()) {
         result->buffer = nullptr;
     }
+    const bool empty_tensor = tensor_size == 0;
+    if (result->buffer && !empty_tensor && ggml_backend_buffer_is_multi_buffer(result->buffer)) {
+        ggml_backend_buffer_t sub_buffer =
+            ggml_backend_multi_buffer_get_buffer(result->buffer, reinterpret_cast<const void *>(tensor->data));
+        if (sub_buffer == nullptr) {
+            GGML_LOG_ERROR("[%s] tensor '%s' data 0x%" PRIx64 " is not in the multi-buffer\n",
+                           __func__, tensor->name, tensor->data);
+            return nullptr;
+        }
+        result->buffer = sub_buffer;
+    }
 
-    if (result->buffer && ggml_nelements(result) > 0) {
+    if (result->buffer && !empty_tensor) {
         // require that the tensor data does not go beyond the buffer end
-        uint64_t tensor_size = (uint64_t) ggml_nbytes(result);
-        uint64_t buffer_start = (uint64_t) ggml_backend_buffer_get_base(result->buffer);
-        uint64_t buffer_size = (uint64_t) ggml_backend_buffer_get_size(result->buffer);
-        if (tensor->data + tensor_size < tensor->data ||
-            tensor->data < buffer_start || tensor->data + tensor_size > buffer_start + buffer_size) {
+        const uint64_t buffer_start = (uint64_t) ggml_backend_buffer_get_base(result->buffer);
+        const uint64_t buffer_size = (uint64_t) ggml_backend_buffer_get_size(result->buffer);
+        if (tensor_size > UINT64_MAX - tensor->data || buffer_size > UINT64_MAX - buffer_start) {
+            LOG_ERROR("[%s] tensor or buffer range overflows\n", __func__);
+            return nullptr;
+        }
+        const uint64_t tensor_end = tensor->data + tensor_size;
+        const uint64_t buffer_end = buffer_start + buffer_size;
+        if (tensor->data < buffer_start || tensor_end > buffer_end) {
             LOG_ERROR("[%s] tensor '%s' (op %s, type %s, ne [%" PRId64 ", %" PRId64 ", %" PRId64 ", %" PRId64 "]) "
                       "data [0x%" PRIx64 ", 0x%" PRIx64 ") out of buffer bounds [0x%" PRIx64 ", 0x%" PRIx64 ")\n",
                       __func__, tensor->name, ggml_op_name((ggml_op) tensor->op), ggml_type_name(result->type),
                       result->ne[0], result->ne[1], result->ne[2], result->ne[3],
-                      tensor->data, tensor->data + tensor_size, buffer_start, buffer_start + buffer_size);
+                      tensor->data, tensor_end, buffer_start, buffer_end);
             return nullptr;
         }
     }
@@ -1696,6 +1818,10 @@ ggml_tensor * rpc_server::deserialize_tensor(struct ggml_context * ctx, const rp
     }
     result->flags = tensor->flags;
     result->data = reinterpret_cast<void *>(tensor->data);
+    if (empty_tensor && result->buffer) {
+        // Empty split views have no addressable data and can point outside the local shard.
+        result->data = ggml_backend_buffer_get_base(result->buffer);
+    }
     ggml_set_name(result, tensor->name);
     return result;
 }
@@ -2229,7 +2355,8 @@ void rpc_server::sync_all_backends() {
 // so it gets the same transport upgrades (e.g. RDMA).
 bool rpc_server::comm_init(const rpc_msg_comm_init_req & request, rpc_msg_comm_init_rsp & response) {
     response.ok = 0;
-    if (request.device >= backends.size() || request.world != 2 || request.rank >= request.world) {
+    if (request.device >= backends.size() || request.world != 2 || request.rank >= request.world ||
+            request.port == 0 || request.port > UINT16_MAX || request.wire_bf16 > 1) {
         return true;
     }
     comm_state & state = comm_states[request.device];
@@ -2280,8 +2407,9 @@ bool rpc_server::comm_init(const rpc_msg_comm_init_req & request, rpc_msg_comm_i
         }
         state.peer->update_caps(remote_caps);
     }
-    state.rank  = request.rank;
-    state.world = request.world;
+    state.rank        = request.rank;
+    state.world       = request.world;
+    state.wire_bf16   = request.wire_bf16 != 0;
     LOG_INFO("[%s] device %u joined pairwise comm as rank %u\n", __func__, request.device, request.rank);
     response.ok = 1;
     return true;
@@ -2294,6 +2422,11 @@ bool rpc_server::comm_allreduce(const rpc_msg_comm_allreduce_req & request) {
     comm_state & state = comm_states[request.device];
     if (state.peer == nullptr) {
         LOG_ERROR("[%s] no communicator for device %u\n", __func__, request.device);
+        return false;
+    }
+    if (request.op_id != state.next_op_id) {
+        GGML_LOG_ERROR("[%s] unexpected operation id %" PRIu64 ", expected %" PRIu64 "\n",
+                       __func__, request.op_id, state.next_op_id);
         return false;
     }
     ggml_backend_t backend = backends[request.device];
@@ -2315,20 +2448,45 @@ bool rpc_server::comm_allreduce(const rpc_msg_comm_allreduce_req & request) {
     const size_t  nbytes = ggml_nbytes(t_dst);
     const int64_t ne     = ggml_nelements(t_dst);
     if (nbytes == 0) {
+        state.next_op_id++;
         return true;
     }
     // reduce large partials in bf16 to halve the wire bytes; small (decode-sized) ones
     // stay f32 since the extra casts and sync cost more than the bytes saved
-    const bool   wire_bf16  = t_dst->type == GGML_TYPE_F32 && ne >= 32768;
-    const size_t wire_bytes = wire_bf16 ? (size_t) ne*2 : nbytes;
-    const size_t need       = wire_bf16 ? 2*nbytes : nbytes;
+    const bool wire_bf16 = state.wire_bf16 && t_dst->type == GGML_TYPE_F32 && ne >= 32768;
+    size_t wire_bytes = nbytes;
+    size_t need       = nbytes;
+    size_t local_offset = 0;
+    size_t peer_offset  = 0;
+    if (wire_bf16) {
+        size_t aligned_wire_end;
+        if (!checked_mul_size((size_t) ne, 2, wire_bytes) ||
+                !checked_add_size(wire_bytes, alignof(float) - 1, aligned_wire_end)) {
+            GGML_LOG_ERROR("[%s] all-reduce scratch size overflows\n", __func__);
+            return false;
+        }
+        local_offset = aligned_wire_end & ~(alignof(float) - 1);
+        if (!checked_add_size(local_offset, nbytes, peer_offset) ||
+                !checked_add_size(peer_offset, nbytes, need)) {
+            GGML_LOG_ERROR("[%s] all-reduce scratch size overflows\n", __func__);
+            return false;
+        }
+    }
+    size_t frame_bytes;
+    if (!checked_add_size(sizeof(request.op_id), wire_bytes, frame_bytes)) {
+        GGML_LOG_ERROR("[%s] all-reduce frame size overflows\n", __func__);
+        return false;
+    }
     if (state.scratch_size < need) {
         state.scratch.reset(ggml_backend_alloc_buffer(backend, need));
         state.scratch_size = need;
     }
     char * scratch_base = (char *) ggml_backend_buffer_get_base(state.scratch.get());
-    state.send_buf.resize(wire_bytes);
-    state.recv_buf.resize(wire_bytes);
+    state.send_buf.resize(frame_bytes);
+    state.recv_buf.resize(frame_bytes);
+    memcpy(state.send_buf.data(), &request.op_id, sizeof(request.op_id));
+    uint8_t * send_data = state.send_buf.data() + sizeof(request.op_id);
+    uint8_t * recv_data = state.recv_buf.data() + sizeof(request.op_id);
 
     auto new_scratch_tensor = [&](ggml_type type, size_t offset) {
         ggml_tensor * t = ggml_new_tensor_4d(ctx, type, t_dst->ne[0], t_dst->ne[1], t_dst->ne[2], t_dst->ne[3]);
@@ -2360,42 +2518,59 @@ bool rpc_server::comm_allreduce(const rpc_msg_comm_allreduce_req & request) {
 
     ggml_tensor * t_wire_send = nullptr;
     ggml_tensor * t_wire_recv = nullptr;
+    ggml_tensor * t_local     = t_dst;
+    ggml_tensor * t_send      = t_dst;
     if (wire_bf16) {
         t_wire_send = new_scratch_tensor(GGML_TYPE_BF16, 0);
-        t_wire_recv = new_scratch_tensor(GGML_TYPE_BF16, ne*2);
-        compute_nodes(new_cpy_node(t_dst, t_wire_send), nullptr);
-        ggml_backend_synchronize(backend);
-        ggml_backend_tensor_get(t_wire_send, state.send_buf.data(), 0, wire_bytes);
+        t_wire_recv = new_scratch_tensor(GGML_TYPE_BF16, 0);
+        t_local     = new_scratch_tensor(GGML_TYPE_F32, local_offset);
+        ggml_tensor * t_to_wire  = new_cpy_node(t_dst, t_wire_send);
+        ggml_tensor * t_to_local = new_cpy_node(t_to_wire, t_local);
+        compute_nodes(t_to_wire, t_to_local);
+        t_send = t_wire_send;
+    }
+    ggml_backend_tensor_get_async(backend, t_send, send_data, 0, wire_bytes);
+    ggml_backend_synchronize(backend);
+
+    bool exchange_ok;
+    if (wire_bytes >= RPC_COMM_FULL_DUPLEX_THRESHOLD) {
+        exchange_ok = state.peer->exchange_data(state.send_buf.data(), state.recv_buf.data(), frame_bytes);
+    } else if (state.rank == 0) {
+        // rank 0 sends first, rank 1 receives first, so large payloads cannot deadlock
+        exchange_ok = state.peer->send_data(state.send_buf.data(), frame_bytes) &&
+                      state.peer->flush() &&
+                      state.peer->recv_data(state.recv_buf.data(), frame_bytes);
     } else {
-        ggml_backend_tensor_get(t_dst, state.send_buf.data(), 0, wire_bytes);
+        exchange_ok = state.peer->recv_data(state.recv_buf.data(), frame_bytes) &&
+                      state.peer->send_data(state.send_buf.data(), frame_bytes) &&
+                      state.peer->flush();
+    }
+    if (!exchange_ok) {
+        GGML_LOG_ERROR("[%s] peer exchange failed for operation %" PRIu64 "\n", __func__, request.op_id);
+        return false;
     }
 
-    // rank 0 sends first, rank 1 receives first, so large payloads cannot deadlock
-    if (state.rank == 0) {
-        if (!state.peer->send_data(state.send_buf.data(), wire_bytes) || !state.peer->flush() ||
-            !state.peer->recv_data(state.recv_buf.data(), wire_bytes)) {
-            return false;
-        }
-    } else {
-        if (!state.peer->recv_data(state.recv_buf.data(), wire_bytes) ||
-            !state.peer->send_data(state.send_buf.data(), wire_bytes) || !state.peer->flush()) {
-            return false;
-        }
+    uint64_t peer_op_id;
+    memcpy(&peer_op_id, state.recv_buf.data(), sizeof(peer_op_id));
+    if (peer_op_id != request.op_id) {
+        GGML_LOG_ERROR("[%s] peer operation id %" PRIu64 " does not match %" PRIu64 "\n",
+                       __func__, peer_op_id, request.op_id);
+        return false;
     }
 
-    ggml_tensor * t_peer = new_scratch_tensor(t_dst->type, wire_bf16 ? (size_t) ne*4 : 0);
+    ggml_tensor * t_peer = new_scratch_tensor(t_dst->type, peer_offset);
     ggml_tensor * t_cast = nullptr;
     if (wire_bf16) {
-        ggml_backend_tensor_set(t_wire_recv, state.recv_buf.data(), 0, wire_bytes);
+        ggml_backend_tensor_set(t_wire_recv, recv_data, 0, wire_bytes);
         t_cast = new_cpy_node(t_wire_recv, t_peer);
     } else {
-        ggml_backend_tensor_set(t_peer, state.recv_buf.data(), 0, wire_bytes);
+        ggml_backend_tensor_set(t_peer, recv_data, 0, wire_bytes);
     }
 
     ggml_tensor * t_red = ggml_new_tensor_4d(ctx, t_dst->type, t_dst->ne[0], t_dst->ne[1], t_dst->ne[2], t_dst->ne[3]);
     t_red->op     = GGML_OP_ADD;
-    t_red->src[0] = t_dst;
-    t_red->src[1] = t_peer;
+    t_red->src[0] = t_local;
+    t_red->src[1] = t_cast != nullptr ? t_cast : t_peer;
     t_red->buffer = t_dst->buffer;
     t_red->data   = t_dst->data;
     t_red->flags |= GGML_TENSOR_FLAG_COMPUTE;
@@ -2405,6 +2580,7 @@ bool rpc_server::comm_allreduce(const rpc_msg_comm_allreduce_req & request) {
     } else {
         compute_nodes(t_red, nullptr);
     }
+    state.next_op_id++;
     return true;
 }
 
@@ -2980,6 +3156,7 @@ struct ggml_backend_rpc_comm_context {
         std::shared_ptr<rpc_dispatcher> dispatcher;
     };
     std::vector<rank_info> ranks;
+    uint64_t next_op_id = 0;
 };
 
 static void ggml_backend_rpc_comm_free(void * comm_ctx_v) {
@@ -3026,9 +3203,24 @@ static void * ggml_backend_rpc_comm_init(ggml_backend_t * backends, size_t n_bac
     if (!parse_endpoint(ranks[0].endpoint, host0, port0)) {
         return nullptr;
     }
-    const uint32_t comm_port = (uint32_t) port0 + 1000;
     if (host0.size() >= 64) {
         return nullptr;
+    }
+
+    uint32_t comm_port = 0;
+    if (const char * env = std::getenv("GGML_RPC_COMM_PORT")) {
+        char * end = nullptr;
+        const unsigned long parsed = std::strtoul(env, &end, 10);
+        if (end == env || *end != '\0' || parsed == 0 || parsed > 65535) {
+            GGML_LOG_WARN("%s: invalid GGML_RPC_COMM_PORT '%s'\n", __func__, env);
+            return nullptr;
+        }
+        comm_port = (uint32_t) parsed;
+    } else if (port0 <= 0 || port0 > 65535 - 1000) {
+        GGML_LOG_WARN("%s: RPC port %d + 1000 is out of range; set GGML_RPC_COMM_PORT\n", __func__, port0);
+        return nullptr;
+    } else {
+        comm_port = (uint32_t) port0 + 1000;
     }
 
     for (const auto & rank : ranks) {
@@ -3037,13 +3229,15 @@ static void * ggml_backend_rpc_comm_init(ggml_backend_t * backends, size_t n_bac
 
     // Send all init requests before reading any response: rank 0 blocks in accept
     // until rank 1 has connected.
+    const bool wire_bf16 = std::getenv("GGML_RPC_NO_WIRE_BF16") == nullptr;
     std::vector<rpc_msg_comm_init_rsp> responses(n_backends);
     for (size_t i = 0; i < n_backends; i++) {
         auto request = std::make_shared<rpc_msg_comm_init_req>();
-        request->device = ranks[i].device;
-        request->rank   = (uint32_t) i;
-        request->world  = (uint32_t) n_backends;
-        request->port   = comm_port;
+        request->device    = ranks[i].device;
+        request->rank      = (uint32_t) i;
+        request->world     = (uint32_t) n_backends;
+        request->port      = comm_port;
+        request->wire_bf16 = wire_bf16;
         if (i > 0) {
             memcpy(request->host, host0.c_str(), host0.size());
         }
@@ -3092,12 +3286,15 @@ static bool ggml_backend_rpc_comm_allreduce_tensor(void * comm_ctx_v, ggml_tenso
             return false;
         }
     }
+    const uint64_t op_id = comm_ctx->next_op_id;
     for (size_t i = 0; i < n_ranks; i++) {
         auto request = std::make_shared<rpc_msg_comm_allreduce_req>();
         request->device = comm_ctx->ranks[i].device;
+        request->op_id  = op_id;
         request->tensor = serialize_tensor(tensors[i]);
         comm_ctx->ranks[i].dispatcher->send_async(RPC_CMD_COMM_ALLREDUCE, request, sizeof(*request));
     }
+    comm_ctx->next_op_id++;
     return true;
 }
 
