@@ -22,8 +22,14 @@ struct ggml_tensor;
 struct xdna_ops {
     xdna_kernel_pool * pool = nullptr;
 
-    xdna_gemm_tiles gemm_tiles;     // GEMM geometry baked into the xclbin
-    std::string     gemm_xclbin;    // discovered xclbin name (geometry provider)
+    // Two GEMM geometries: decode (M=32, native bf16 r=4, exact) and prefill
+    // (M=64, bfp16-emulated r=8, 2x mmul). Ops with M >= gemm_big_m_min use
+    // the prefill geometry; everything else the decode one.
+    xdna_gemm_tiles gemm_tiles;          // decode geometry (default)
+    xdna_gemm_tiles gemm_tiles_prefill;  // prefill geometry (M=64, rtp 0xd000)
+    std::string gemm_xclbin_decode;      // discovered M32 xclbin stem
+    std::string gemm_xclbin_prefill;     // discovered M64 xclbin stem
+    int gemm_big_m_min = 64;             // M >= this -> prefill geometry
 
     // Packed-weight cache: tensor data pointer + K + N -> device BO holding the
     // transposed [K_pad x N] bf16 weights (K_pad = K rounded up to the GEMM
@@ -69,6 +75,8 @@ struct xdna_ops {
     };
     struct pending_op {
         struct ggml_tensor * node = nullptr;
+        int Mk = 0;                      // M block of the geometry used (32 or 64)
+        int m_off = 0;                   // first row of the range in the op
         int M = 0;                       // total rows of the op
         int N = 0;                       // total columns of the op
         std::vector<pending_m_block> m_blocks;

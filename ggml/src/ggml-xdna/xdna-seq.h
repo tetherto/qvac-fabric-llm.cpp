@@ -156,6 +156,18 @@ std::vector<uint32_t> xdna_seq_build(const xdna_seq * seq);
 #ifndef GGML_XDNA_TILE_M
 #define GGML_XDNA_TILE_M 8
 #endif
+#ifndef GGML_XDNA_GEMM_M_BIG
+#define GGML_XDNA_GEMM_M_BIG 64
+#endif
+#ifndef GGML_XDNA_TILE_M_BIG
+#define GGML_XDNA_TILE_M_BIG 16
+#endif
+
+// Per-tile RTP buffer base in the core tile (input_with_addresses.mlir);
+// it shifts with the L1 buffer sizes: 0xc800 for tile_m=8 (decode, r=4),
+// 0xd000 for tile_m=16 (prefill, bfp16 r=8).
+constexpr int XDNA_RTP_BASE_TILE_M8  = 0xc800;
+constexpr int XDNA_RTP_BASE_TILE_M16 = 0xd000;
 #ifndef GGML_XDNA_TILE_K
 #define GGML_XDNA_TILE_K 64
 #endif
@@ -176,10 +188,8 @@ struct xdna_gemm_tiles {
     int tile_n   = GGML_XDNA_TILE_N;      // per-core N tile
     int n_cols   = GGML_XDNA_N_COLS;      // AIE columns
     int n_compute_rows = GGML_XDNA_N_COMPUTE_ROWS;  // compute tile rows
-    // Per-tile RTP buffer base in the core tile. Must match where IRON places
-    // the rtp{row}_{col} Buffers (input_with_addresses.mlir); it shifts with
-    // the L1 buffer sizes, e.g. 0xc400 for tile_n=32, 0xc800 for tile_n=64.
-    int rtp_base = 0xc800;
+    // Per-tile RTP buffer base in the core tile (XDNA_RTP_BASE_TILE_M*).
+    int rtp_base = XDNA_RTP_BASE_TILE_M8;
 };
 
 // True when the dims fit the baked geometry: M <= M block, K multiple of

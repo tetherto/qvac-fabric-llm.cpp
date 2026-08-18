@@ -102,6 +102,7 @@ def _compile_kwargs(opts) -> dict:
         "dtype_in_str": dtype_in_str,
         "dtype_out_str": dtype_out_str,
         "dev_name":     opts.dev,
+        "emulate_bf16_mmul_with_bfp16": 0 if getattr(opts, "no_bfp16", False) else 1,
         "trace_size":   getattr(opts, "trace_size", 0),
         "trace_rows":   tuple(getattr(opts, "trace_rows", None) or ()),
         "trace_cols":   tuple(getattr(opts, "trace_cols", None) or ()),
@@ -123,6 +124,7 @@ def bf16_f32_gemm(
     dtype_in_str:            CompileTime[str],
     dtype_out_str:           CompileTime[str],
     dev_name:                CompileTime[str] = "npu2",
+    emulate_bf16_mmul_with_bfp16: CompileTime[int] = 1,
     trace_size:              CompileTime[int] = 0,
     trace_rows:              CompileTime[tuple] = (),
     trace_cols:              CompileTime[tuple] = (),
@@ -156,12 +158,15 @@ def bf16_f32_gemm(
             "Invalid configuration: NPU2 (Strix/Strix Halo/Krackan) has 8 columns"
         )
 
-    # Matmul micro-kernel from the IRON kernel library.
+    # Matmul micro-kernel from the IRON kernel library. bfp16 emulation uses
+    # the r=8 mmul (2x throughput); --no-bfp16 builds the native bf16 r=4
+    # kernel (tile_m 8) used for the decode M-block.
     _matmul_kernel = akernels.mm(
         m, k, n,
         input_dtype=dtype_in,
         output_dtype=dtype_out,
         vectorized=True,
+        emulate_bf16_mmul_with_bfp16=bool(emulate_bf16_mmul_with_bfp16),
     )
     r, s, t = _matmul_kernel.mac_dims
 
@@ -802,6 +807,10 @@ def main() -> None:
                         help="Per-core M tile (default: 8)")
     parser.add_argument("--tile-k", type=int, default=64, dest="tile_k",
                         help="Per-core K tile (default: 64; larger = fewer C reloads)")
+    # bfp16 emulation uses the r=8 mmul (2x throughput, tile_m % 16 == 0);
+    # --no-bfp16 builds the native bf16 r=4 kernel (tile_m 8) for decode.
+    parser.add_argument("--no-bfp16", action="store_true", dest="no_bfp16",
+                        help="Use the native bf16 r=4 mmul (tile-m 8, M 32)")
     parser.add_argument("--tile-n", type=int, default=64, dest="tile_n",
                         help="Per-core N tile (default: 64; wider = longer B DDR bursts)")
 

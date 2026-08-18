@@ -29,6 +29,28 @@ static bool ggml_xdna_profiling_enabled(void) {
     return en;
 }
 
+static int xdna_env_int(const char * name, int def) {
+    const char * v = getenv(name);
+    return v ? atoi(v) : def;
+}
+
+// Pick the geometry for an op: the prefill (M=64) geometry for ops wide
+// enough to fill it, otherwise the decode (M=32) geometry. Both the tiles and
+// the xclbin stem derive from the same condition, so they never disagree.
+static const xdna_gemm_tiles & xdna_pick_tiles(const xdna_ops * ops, int M) {
+    if (M >= ops->gemm_big_m_min && !ops->gemm_xclbin_prefill.empty()) {
+        return ops->gemm_tiles_prefill;
+    }
+    return ops->gemm_tiles;
+}
+
+static const char * xdna_pick_xclbin(const xdna_ops * ops, int M) {
+    if (M >= ops->gemm_big_m_min && !ops->gemm_xclbin_prefill.empty()) {
+        return ops->gemm_xclbin_prefill.c_str();
+    }
+    return ops->gemm_xclbin_decode.c_str();
+}
+
 // Return the device BO holding the packed [K_pad x N] bf16 weight for `src0`,
 // built and cached on first use. K_pad rounds K up to the GEMM block, so every
 // K-block reads a valid slice. Weights are immutable, so the transpose + bf16
@@ -107,8 +129,8 @@ static bool gemm_compute(xdna_ops * ops, struct ggml_tensor * node) {
 
     // Guaranteed to be supported: compute is only reached for ops accepted by
     // xdna_ops_supported.
-    const xdna_gemm_tiles & tiles = ops->gemm_tiles;
-    const int Mk = tiles.M;   // baked M block
+    const xdna_gemm_tiles & tiles = xdna_pick_tiles(ops, M);
+    const int Mk = tiles.M;   // baked M block of the selected geometry
 
     const bool prof_en = ggml_xdna_profiling_enabled();
     xdna_mul_mat_profile prof;
@@ -128,6 +150,8 @@ static bool gemm_compute(xdna_ops * ops, struct ggml_tensor * node) {
     op.node = node;
     op.M = M;
     op.N = N;
+    op.Mk = Mk;
+    op.m_off = 0;
     for (int m0 = 0; m0 < M; m0 += Mk) {
         xdna_ops::pending_m_block mb;
         mb.m0 = m0;
@@ -156,8 +180,8 @@ static bool gemm_compute(xdna_ops * ops, struct ggml_tensor * node) {
         std::vector<uint32_t> insts = xdna_seq_build(&seq);
 
         char name[64];
-        snprintf(name, sizeof(name), "gemm_K%d_N%d_b%d", GEMM_K_MAX, N, k0);
-        xdna_kernel * kern = xdna_kernel_pool_get_built(ops->pool, name, ops->gemm_xclbin.c_str(),
+        snprintf(name, sizeof(name), "gemm_K%d_N%d_b%d_m%d", GEMM_K_MAX, N, k0, Mk);
+        xdna_kernel * kern = xdna_kernel_pool_get_built(ops->pool, name, xdna_pick_xclbin(ops, M),
                                                         insts.data(), insts.size());
         if (!kern) {
             GGML_LOG_ERROR("%s: failed to load GEMM kernel %s\n", "xdna-ops", name);
@@ -225,10 +249,15 @@ static bool gemm_compute(xdna_ops * ops, struct ggml_tensor * node) {
                 }
                 {
                     const xdna_timer t;
-                    xdna_buffer_read(prev.bo_c, prev.c_buf.data(), (size_t) Mk * prev.N * sizeof(float));
+                    // Read back only the valid rows: rows [mc, Mk) of a padded
+                    // block are zero (the padded A rows are zeroed), so the
+                    // prefix is exact and the readback drops to mc*N elements.
+                    const size_t p_elems = (size_t) std::min(Mk, op.M - op.m_blocks[prev.mb_idx].m0) * prev.N;
+                    xdna_buffer_read(prev.bo_c, prev.c_buf.data(), p_elems * sizeof(float));
                     if (prof_en) prof.read += t.ms();
                 }
-                for (size_t i = 0; i < (size_t) Mk * prev.N; i++) {
+                const size_t p_elems = (size_t) std::min(Mk, op.M - op.m_blocks[prev.mb_idx].m0) * prev.N;
+                for (size_t i = 0; i < p_elems; i++) {
                     op.m_blocks[prev.mb_idx].c_acc[i] += prev.c_buf[i];
                 }
                 xdna_kernel_pool_release_buffer(ops->pool, prev.bo_a);
@@ -301,17 +330,19 @@ bool xdna_ops_finalize(xdna_ops * ops) {
     // their c_acc fully accumulated already, so just scatter them.
     const xdna_timer t_read;
     for (auto & op : ops->pending) {
-        const int Mk = ops->gemm_tiles.M;
+        const int Mk = op.Mk;   // per-op geometry M block
         for (auto & mb : op.m_blocks) {
+            // Trailing runs are read back here; read only the valid rows.
+            const size_t mc_elems = (size_t) std::min(Mk, op.M - mb.m0) * op.N;
             for (auto & pr : mb.runs) {
-                xdna_buffer_read(pr.bo_c, pr.c_buf.data(), (size_t) Mk * pr.N * sizeof(float));
-                for (size_t i = 0; i < (size_t) Mk * pr.N; i++) {
+                xdna_buffer_read(pr.bo_c, pr.c_buf.data(), mc_elems * sizeof(float));
+                for (size_t i = 0; i < mc_elems; i++) {
                     mb.c_acc[i] += pr.c_buf[i];
                 }
             }
             const int mc = std::min(Mk, op.M - mb.m0);
             for (int m = 0; m < mc; m++) {
-                std::memcpy((char *) op.node->data + (size_t) (mb.m0 + m) * op.node->nb[1],
+                std::memcpy((char *) op.node->data + (size_t) (op.m_off + mb.m0 + m) * op.node->nb[1],
                             mb.c_acc.data() + (size_t) m * op.N,
                             (size_t) op.N * sizeof(float));
             }
@@ -346,15 +377,21 @@ static bool gemm_supported(const xdna_ops * ops, const struct ggml_tensor * op) 
     const int N = (int) src0->ne[1];
     const int M = (int) src1->ne[1];
 
-    if (ops->gemm_xclbin.empty()) {
+    if (ops->gemm_xclbin_decode.empty()) {
         return false;
     }
     if (M <= 0) {
         return false;
     }
+    // The picked geometry falls back to the next smaller artifact; the op is
+    // rejected only when the decode kernel is absent.
+    if (M >= ops->gemm_big_m_min && ops->gemm_xclbin_prefill.empty()) {
+        return false;
+    }
+    const xdna_gemm_tiles & tiles = xdna_pick_tiles(ops, M);
     // The stream is always built for the baked M block, so the geometry check
     // is on the block M; op M is tiled into blocks.
-    if (!xdna_gemm_seq_supported(&ops->gemm_tiles, ops->gemm_tiles.M, K, N)) {
+    if (!xdna_gemm_seq_supported(&tiles, tiles.M, K, N)) {
         return false;
     }
     // Practical cap on N: wide projections (e.g. the vocabulary output) need a
@@ -392,13 +429,30 @@ static bool gemm_supported(const xdna_ops * ops, const struct ggml_tensor * op) 
 void xdna_ops_init(xdna_ops * ops, xdna_kernel_pool * pool) {
     ops->pool = pool;
     ops->gemm_tiles = xdna_gemm_tiles{};
-    ops->gemm_xclbin.clear();
+    ops->gemm_tiles_prefill = xdna_gemm_tiles{};
+    ops->gemm_tiles_prefill.M = GGML_XDNA_GEMM_M_BIG;
+    ops->gemm_tiles_prefill.tile_m = GGML_XDNA_TILE_M_BIG;
+    ops->gemm_tiles_prefill.rtp_base = XDNA_RTP_BASE_TILE_M16;
+    ops->gemm_xclbin_decode.clear();
+    ops->gemm_xclbin_prefill.clear();
+    ops->gemm_big_m_min = xdna_env_int("GGML_XDNA_GEMM_BIG_M_MIN", 64);
+
+    // Stems are gemm_bf16_f32_M%d_K%d_N%d_c%d (see CMakeLists).
     for (const std::string & name : pool->names) {
-        if (name.rfind("gemm_bf16_f32_", 0) == 0) {
-            ops->gemm_xclbin = name;
-            break;
+        int M = 0, K = 0, N = 0, C = 0;
+        if (sscanf(name.c_str(), "gemm_bf16_f32_M%d_K%d_N%d_c%d", &M, &K, &N, &C) != 4) {
+            continue;
+        }
+        if (M == GGML_XDNA_GEMM_M_BIG) {
+            ops->gemm_xclbin_prefill = name;
+        } else if (M == GGML_XDNA_GEMM_M) {
+            ops->gemm_xclbin_decode = name;
         }
     }
+
+    GGML_LOG_INFO("%s: GEMM geometries: decode=%s prefill=%s (big-M threshold %d)\n", "xdna-ops",
+                  ops->gemm_xclbin_decode.c_str(), ops->gemm_xclbin_prefill.c_str(),
+                  ops->gemm_big_m_min);
 }
 
 bool xdna_ops_supported(const xdna_ops * ops, const struct ggml_tensor * op) {
