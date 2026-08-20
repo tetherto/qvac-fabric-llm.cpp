@@ -9053,19 +9053,32 @@ struct test_l2_norm_back : public test_case {
     const ggml_type type;
     const std::array<int64_t, 4> ne;
     const float eps;
+    const bool view;
 
     std::string vars() override {
-        return VARS_TO_STR3(type, ne, eps);
+        return VARS_TO_STR4(type, ne, eps, view);
     }
 
     test_l2_norm_back(ggml_type type = GGML_TYPE_F32,
             std::array<int64_t, 4> ne = {64, 5, 4, 3},
-            float eps = 1e-6f)
-        : type(type), ne(ne), eps(eps) {}
+            float eps = 1e-6f,
+            bool view = false)
+        : type(type), ne(ne), eps(eps), view(view) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
-        ggml_tensor * a = ggml_new_tensor(ctx, type, 4, ne.data());
-        ggml_set_name(a, "a");
+        ggml_tensor * a;
+        if (view) {
+            auto ne_a = ne;
+            ne_a[1] *= 3;
+            a = ggml_new_tensor(ctx, type, 4, ne_a.data());
+            ggml_set_name(a, "a");
+
+            a = ggml_view_4d(ctx, a, ne[0], ne[1], ne[2], ne[3], a->nb[1], a->nb[2], a->nb[3], 0);
+            ggml_set_name(a, "view_of_a");
+        } else {
+            a = ggml_new_tensor(ctx, type, 4, ne.data());
+            ggml_set_name(a, "a");
+        }
 
         ggml_tensor * grad = ggml_new_tensor(ctx, type, 4, ne.data());
         ggml_set_name(grad, "grad");
@@ -11847,6 +11860,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
 
     test_cases.emplace_back(new test_l2_norm_back());
+    test_cases.emplace_back(new test_l2_norm_back(GGML_TYPE_F32, { 1025, 5, 4, 3 }));
+    test_cases.emplace_back(new test_l2_norm_back(GGML_TYPE_F32, {   64, 5, 4, 3 }, 1e-6f, true));
+    test_cases.emplace_back(new test_l2_norm_back(GGML_TYPE_F32, { 1025, 5, 4, 3 }, 1e-6f, true));
 
     // in-place tests
     test_cases.emplace_back(new test_rms_norm(GGML_TYPE_F32, {64, 5, 4, 3}, false, 1e-6f, true));
