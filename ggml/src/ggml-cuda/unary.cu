@@ -686,7 +686,7 @@ static void gelu_back_cuda(const T * grad, const T * x, T * dst, const int k, cu
     gelu_back_kernel<<<num_blocks, CUDA_GELU_BACK_BLOCK_SIZE, 0, stream>>>(grad, x, dst, k);
 }
 
-void ggml_cuda_op_geglu_back(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+void ggml_cuda_op_gelu_back(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * grad = dst->src[0];
     const ggml_tensor * xf   = dst->src[1];
 
