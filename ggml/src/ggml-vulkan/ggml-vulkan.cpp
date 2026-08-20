@@ -15269,6 +15269,15 @@ static void ggml_backend_vk_get_tensor_2d_async(ggml_backend_t backend, const gg
     vk_buffer buf = buf_ctx->dev_buffer;
 
     auto src_offset = vk_tensor_offset(tensor) + tensor->view_offs + offset;
+    vk_buffer pinned_buf = nullptr;
+    size_t pinned_offset = 0;
+    ggml_vk_host_get(ctx->device, data, pinned_buf, pinned_offset);
+    if (pinned_buf != nullptr) {
+        const bool copied = ggml_vk_buffer_read_2d_async(
+                compute_ctx, buf, src_offset, data, stride_tensor, stride_data, size, n_copies);
+        GGML_ASSERT(copied);
+        return;
+    }
     if (buf->memory_property_flags & vk::MemoryPropertyFlagBits::eHostVisible && buf->device->uma) {
         GGML_ASSERT(buf->memory_property_flags & vk::MemoryPropertyFlagBits::eHostCoherent);
 

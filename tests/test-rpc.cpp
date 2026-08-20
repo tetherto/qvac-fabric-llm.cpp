@@ -203,6 +203,11 @@ int main() {
         fprintf(stderr, "failed to initialize RPC communicator\n");
         return 1;
     }
+    void * comm_reused = comm_init(comm_backends, 2);
+    if (comm_reused == nullptr) {
+        fprintf(stderr, "failed to reuse RPC communicator\n");
+        return 1;
+    }
     ggml_tensor * comm_tensors[2] = { tensor_a, tensor_b };
     if (!comm_allreduce(comm, comm_tensors)) {
         return 1;
@@ -212,6 +217,21 @@ int main() {
     ggml_backend_tensor_get(tensor_a, ones.data(), 0, ggml_nbytes(tensor_a));
     ggml_backend_tensor_get(tensor_b, twos.data(), 0, ggml_nbytes(tensor_b));
     if (!check_values(ones, 3.0f) || !check_values(twos, 3.0f)) {
+        return 1;
+    }
+
+    std::fill(ones.begin(), ones.end(), 4.0f);
+    std::fill(twos.begin(), twos.end(), 5.0f);
+    ggml_backend_tensor_set(tensor_a, ones.data(), 0, ggml_nbytes(tensor_a));
+    ggml_backend_tensor_set(tensor_b, twos.data(), 0, ggml_nbytes(tensor_b));
+    if (!comm_allreduce(comm_reused, comm_tensors)) {
+        return 1;
+    }
+    ggml_backend_synchronize(backend_a.get());
+    ggml_backend_synchronize(backend_b.get());
+    ggml_backend_tensor_get(tensor_a, ones.data(), 0, ggml_nbytes(tensor_a));
+    ggml_backend_tensor_get(tensor_b, twos.data(), 0, ggml_nbytes(tensor_b));
+    if (!check_values(ones, 9.0f) || !check_values(twos, 9.0f)) {
         return 1;
     }
 
@@ -245,6 +265,46 @@ int main() {
     }
 
     comm_free(comm);
+
+    std::fill(ones.begin(), ones.end(), 6.0f);
+    std::fill(twos.begin(), twos.end(), 7.0f);
+    ggml_backend_tensor_set(tensor_a, ones.data(), 0, ggml_nbytes(tensor_a));
+    ggml_backend_tensor_set(tensor_b, twos.data(), 0, ggml_nbytes(tensor_b));
+    if (!comm_allreduce(comm_reused, comm_tensors)) {
+        fprintf(stderr, "reused RPC communicator stopped after releasing first handle\n");
+        return 1;
+    }
+    ggml_backend_synchronize(backend_a.get());
+    ggml_backend_synchronize(backend_b.get());
+    ggml_backend_tensor_get(tensor_a, ones.data(), 0, ggml_nbytes(tensor_a));
+    ggml_backend_tensor_get(tensor_b, twos.data(), 0, ggml_nbytes(tensor_b));
+    if (!check_values(ones, 13.0f) || !check_values(twos, 13.0f)) {
+        return 1;
+    }
+
+    comm_free(comm_reused);
+
+    void * comm_reinitialized = comm_init(comm_backends, 2);
+    if (comm_reinitialized == nullptr) {
+        fprintf(stderr, "failed to reinitialize RPC communicator\n");
+        return 1;
+    }
+    std::fill(ones.begin(), ones.end(), 8.0f);
+    std::fill(twos.begin(), twos.end(), 9.0f);
+    ggml_backend_tensor_set(tensor_a, ones.data(), 0, ggml_nbytes(tensor_a));
+    ggml_backend_tensor_set(tensor_b, twos.data(), 0, ggml_nbytes(tensor_b));
+    if (!comm_allreduce(comm_reinitialized, comm_tensors)) {
+        return 1;
+    }
+    ggml_backend_synchronize(backend_a.get());
+    ggml_backend_synchronize(backend_b.get());
+    ggml_backend_tensor_get(tensor_a, ones.data(), 0, ggml_nbytes(tensor_a));
+    ggml_backend_tensor_get(tensor_b, twos.data(), 0, ggml_nbytes(tensor_b));
+    if (!check_values(ones, 17.0f) || !check_values(twos, 17.0f)) {
+        return 1;
+    }
+    comm_free(comm_reinitialized);
+
     ggml_backend_synchronize(backend_a.get());
     ggml_backend_synchronize(backend_b.get());
 
