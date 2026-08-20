@@ -1,16 +1,12 @@
 #version 450
 
-#include "generic_head.glsl"
+#include "generic_binary_head.glsl"
 #include "types.glsl"
 
 #extension GL_EXT_control_flow_attributes : enable
 #define BLOCK_SIZE 512
 
 layout(local_size_x = BLOCK_SIZE, local_size_y = 1, local_size_z = 1) in;
-
-layout (binding = 0) readonly buffer G {A_TYPE data_a[];};
-layout (binding = 1) readonly buffer X {B_TYPE data_b[];};
-layout (binding = 2) writeonly buffer D {D_TYPE data_d[];};
 
 shared FLOAT_TYPE sum_xx[BLOCK_SIZE];
 shared FLOAT_TYPE sum_xg[BLOCK_SIZE];
@@ -20,9 +16,17 @@ void main() {
     const uint tid = gl_LocalInvocationID.x;
 
     // the dispatch is padded up to a multiple of 512 workgroups when nrows > 512
-    if (row >= p.KY) {
+    if (row >= p.ne / p.ne00) {
         return;
     }
+
+    const uint i01 =  row % p.ne01;
+    const uint i02 = (row / p.ne01) % p.ne02;
+    const uint i03 =  row / (p.ne01 * p.ne02);
+
+    const uint a_base = get_aoffset() + src0_idx(0, i01, i02, i03);
+    const uint b_base = get_boffset() + src1_idx(0, i01, i02, i03);
+    const uint d_base = get_doffset() +  dst_idx(0, i01, i02, i03);
 
     // Derivative of x[i]/max(norm(x), eps), with norm(x) = sqrt(dot(x,x)):
     //   dx = scale*g - scale^3 * x * dot(x,g)   (norm > eps)
@@ -31,9 +35,9 @@ void main() {
     sum_xx[tid] = FLOAT_TYPE(0.0f);
     sum_xg[tid] = FLOAT_TYPE(0.0f);
 
-    [[unroll]] for (uint col = tid; col < p.KX; col += BLOCK_SIZE) {
-        const FLOAT_TYPE gi = FLOAT_TYPE(data_a[row*p.KX + col]);
-        const FLOAT_TYPE xi = FLOAT_TYPE(data_b[row*p.KX + col]);
+    [[unroll]] for (uint col = tid; col < p.ne00; col += BLOCK_SIZE) {
+        const FLOAT_TYPE gi = FLOAT_TYPE(data_a[a_base + col*p.nb00]);
+        const FLOAT_TYPE xi = FLOAT_TYPE(data_b[b_base + col*p.nb10]);
         sum_xx[tid] += xi * xi;
         sum_xg[tid] += xi * gi;
     }
@@ -60,9 +64,9 @@ void main() {
         scale_x = FLOAT_TYPE(0.0f);
     }
 
-    [[unroll]] for (uint col = tid; col < p.KX; col += BLOCK_SIZE) {
-        data_d[row*p.KX + col] = D_TYPE(
-            scale_g * FLOAT_TYPE(data_a[row*p.KX + col]) +
-            scale_x * FLOAT_TYPE(data_b[row*p.KX + col]));
+    [[unroll]] for (uint col = tid; col < p.ne00; col += BLOCK_SIZE) {
+        data_d[d_base + col*p.nb20] = D_TYPE(
+            scale_g * FLOAT_TYPE(data_a[a_base + col*p.nb00]) +
+            scale_x * FLOAT_TYPE(data_b[b_base + col*p.nb10]));
     }
 }
