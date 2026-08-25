@@ -8,6 +8,9 @@
 
 #include <Foundation/Foundation.h>
 
+#include <mach/mach.h>
+#include <sys/sysctl.h>
+
 #include <Metal/Metal.h>
 
 #include <stdatomic.h>
@@ -1593,6 +1596,33 @@ void ggml_metal_device_get_memory(ggml_metal_device_t dev, size_t * free, size_t
         size_t cur = dev->mtl_device.currentAllocatedSize;
         // it's possible to allocate more than `recommendedMaxWorkingSetSize`
         *free      = *total > cur ? *total - cur : 0;
+
+        // currentAllocatedSize only counts this process. On unified memory the
+        // device budget is the same physical RAM every other process is using,
+        // so clamp by what the host can still make available — otherwise a
+        // fresh process (e.g. a fit/preflight subprocess) sees an idle device
+        // no matter how much is already wired system-wide.
+        //
+        // "Available" here is physical memory minus what cannot be evicted:
+        // wired pages (other processes' GPU buffers included) and the
+        // compressor's own footprint. Anonymous and file-backed pages are NOT
+        // subtracted — the kernel compresses or evicts them under pressure, and
+        // an estimate like free+inactive that ignores this rejects loads that
+        // demonstrably run.
+        if (dev->mtl_device.hasUnifiedMemory) {
+            vm_statistics64_data_t vm_stats;
+            mach_msg_type_number_t count = HOST_VM_INFO64_COUNT;
+            int64_t total_mem = 0;
+            size_t total_len = sizeof(total_mem);
+            if (host_statistics64(mach_host_self(), HOST_VM_INFO64, (host_info64_t) &vm_stats, &count) == KERN_SUCCESS &&
+                sysctlbyname("hw.memsize", &total_mem, &total_len, NULL, 0) == 0) {
+                const size_t unavailable = ((size_t) vm_stats.wire_count + (size_t) vm_stats.compressor_page_count) * (size_t) vm_kernel_page_size;
+                const size_t host_available = (size_t) total_mem > unavailable ? (size_t) total_mem - unavailable : 0;
+                if (host_available < *free) {
+                    *free = host_available;
+                }
+            }
+        }
     } else {
         *free = 0;
         *total = 0;

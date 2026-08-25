@@ -175,6 +175,10 @@ extern "C" {
         size_t memory_total;
         // device type
         enum ggml_backend_dev_type type;
+        // whether device memory is the same physical pool as host memory
+        // (e.g. Apple silicon unified memory); such devices must be budgeted
+        // together with the host rather than as an independent pool
+        bool memory_unified;
         // device id
         //   for PCI devices, this should be the lower-case PCI bus id formatted as "domain:bus:device.function" (e.g. "0000:c1:00.0")
         //   if the id is unknown, this should be NULL
