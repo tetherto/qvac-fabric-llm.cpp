@@ -2576,6 +2576,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_MUL_MAT_ID_BACK_A:
             ggml_cuda_op_mul_mat_id_back_a(ctx, dst);
             break;
+        case GGML_OP_MUL_MAT_ID_BACK_B:
+            ggml_cuda_op_mul_mat_id_back_b(ctx, dst);
+            break;
         case GGML_OP_OUT_PROD:
             ggml_cuda_out_prod(ctx, dst);
             break;
@@ -5906,6 +5909,10 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_MUL_MAT_ID_BACK_A:
             return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
                    op->src[2]->type == GGML_TYPE_I32 && op->type == GGML_TYPE_F32;
+        case GGML_OP_MUL_MAT_ID_BACK_B:
+            return (op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_Q8_0) &&
+                   op->src[1]->type == GGML_TYPE_F32 && op->src[2]->type == GGML_TYPE_I32 &&
+                   op->type == GGML_TYPE_F32;
         case GGML_OP_OUT_PROD:
             {
                 // ggml_cuda_out_prod dequantizes any non-F32 src to F32 via ggml_get_to_fp32_cuda
