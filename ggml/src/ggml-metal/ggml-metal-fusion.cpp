@@ -913,6 +913,72 @@ static const std::vector<ggml_op> ops_moe_reduce_8 = {
 
 static const std::vector<ggml_op> ops_mul_mat_add = { GGML_OP_MUL_MAT, GGML_OP_ADD };
 
+static const std::vector<ggml_op> ops_mul_mv_id_mul = { GGML_OP_MUL_MAT_ID, GGML_OP_MUL };
+
+// MUL_MAT_ID + routing-weight MUL on the mat-vec path. the MUL is also the head of the
+// MOE_REDUCE pattern; when that matches, MOE_REDUCE wins and this fusion declines
+static bool ggml_metal_fusion_check_mul_mv_id_mul(
+        const ggml_metal_fusion      * fusion,
+        const ggml_tensor * const    * nodes,
+        const ggml_cgraph            * gf,
+        const int                    * node_idxs,
+              int                      idx,
+              ggml_metal_fusion_mode   mode) {
+    GGML_UNUSED(mode);
+
+    const ggml_tensor * mm  = nodes[0];
+    const ggml_tensor * mul = nodes[1];
+
+    if (mul->src[0] != mm && mul->src[1] != mm) {
+        return false;
+    }
+
+    const ggml_tensor * scale = mul->src[0] == mm ? mul->src[1] : mul->src[0];
+    if (!scale || scale->type != GGML_TYPE_F32 || mul->type != GGML_TYPE_F32 || mm->type != GGML_TYPE_F32 ||
+        mm->src[1]->type != GGML_TYPE_F32) {
+        return false;
+    }
+
+    if (!ggml_are_same_shape(mm, mul) || !ggml_is_contiguous(mul) || mul->ne[3] != 1) {
+        return false;
+    }
+
+    for (int i = 0; i < GGML_MAX_DIMS; ++i) {
+        if (scale->ne[i] != 1 && scale->ne[i] != mul->ne[i]) {
+            return false;
+        }
+    }
+
+    // gate mat-vec fusion as in ggml_metal_op_mul_mat_id_use_mm; ignore row counts when packing to keep pp and tg node order stable.
+    if (mode == GGML_METAL_FUSION_FULL && mm->src[0]->ne[0] >= 64 && mm->src[2]->ne[1] >= 32) {
+        return false;
+    }
+
+    const int raw_mul = node_idxs[idx + 1];
+
+    int n_views = 0;
+    while (raw_mul + 1 + n_views < gf->n_nodes && n_views <= GGML_METAL_MOE_REDUCE_MAX_EXPERTS &&
+           gf->nodes[raw_mul + 1 + n_views]->op == GGML_OP_VIEW) {
+        n_views++;
+    }
+
+    static const std::vector<ggml_op> * ops_moe_reduce[GGML_METAL_MOE_REDUCE_MAX_EXPERTS + 1] = {
+        nullptr, nullptr,
+        &ops_moe_reduce_2, &ops_moe_reduce_3, &ops_moe_reduce_4, &ops_moe_reduce_5,
+        &ops_moe_reduce_6, &ops_moe_reduce_7, &ops_moe_reduce_8,
+    };
+
+    if (n_views >= 2 && n_views <= GGML_METAL_MOE_REDUCE_MAX_EXPERTS) {
+        ggml_metal_moe_reduce_match match;
+        if (ggml_metal_fusion_match_moe_reduce(gf, raw_mul, *ops_moe_reduce[n_views], &match)) {
+            return false;
+        }
+    }
+
+    const int outputs[1] = { raw_mul };
+    return ggml_can_fuse_subgraph_ext(gf, node_idxs + idx, 2, fusion->ops.data(), outputs, 1);
+}
+
 static const std::vector<ggml_metal_fusion> ggml_metal_fusions = {
     { GGML_METAL_FUSION_NORM_MUL,       ops_norm_mul,               {},     false, ggml_metal_fusion_check_norm },
     { GGML_METAL_FUSION_NORM_MUL_ADD,   ops_norm_mul_add,           {},     false, ggml_metal_fusion_check_norm },
@@ -944,6 +1010,7 @@ static const std::vector<ggml_metal_fusion> ggml_metal_fusions = {
     { GGML_METAL_FUSION_MUL_MV_GLU,     ops_mul_mv_glu,             {},     true,  ggml_metal_fusion_check_mul_mv_glu },
     { GGML_METAL_FUSION_MUL_MV_GLU,     ops_mul_mv_id_glu,          {},     true,  ggml_metal_fusion_check_mul_mv_glu },
     { GGML_METAL_FUSION_MUL_MV_GLU,     ops_mul_mv_id_glu_stkd,     {},     true,  ggml_metal_fusion_check_mul_mv_glu_stacked },
+    { GGML_METAL_FUSION_MUL_MV_ID_MUL,  ops_mul_mv_id_mul,          {},     true,  ggml_metal_fusion_check_mul_mv_id_mul },
 };
 
 // ---- alloc deps -----------------------------------------------------------
@@ -1006,6 +1073,10 @@ void ggml_metal_fusion_add_alloc_deps(
         if (best) {
             ggml_metal_fusion_add_pattern_alloc_deps(user_data, add_alloc_dep, gf, best, i);
             i += best_raw - 1;
+            // the MUL that ends MUL_MAT_ID + MUL also heads MOE_REDUCE: rescan it so both get their deps
+            if (best->id == GGML_METAL_FUSION_MUL_MV_ID_MUL) {
+                i--;
+            }
         }
     }
 }

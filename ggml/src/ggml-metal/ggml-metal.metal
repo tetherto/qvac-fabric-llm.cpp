@@ -5218,6 +5218,7 @@ constant short FC_mul_mv_nxpsg [[function_constant(FC_MUL_MV + 1)]];
 constant short FC_mul_mv_ne12  [[function_constant(FC_MUL_MV + 2)]];
 constant short FC_mul_mv_r2    [[function_constant(FC_MUL_MV + 3)]];
 constant short FC_mul_mv_r3    [[function_constant(FC_MUL_MV + 4)]];
+constant short FC_mul_mv_id_has_scale [[function_constant(FC_MUL_MV + 6)]];
 
 template<typename block_q_type, short NR0, typename args_t>
 void mul_vec_q_n_f32_impl(
@@ -13446,6 +13447,7 @@ kernel void kernel_mul_mv_id(
         device const char * src1,
         device       char * dst,
         device const char * ids,
+        device const char * scale,
         threadgroup  char * shmem [[threadgroup(0)]],
         uint3  tgpig[[threadgroup_position_in_grid]],
         ushort tiitg[[thread_index_in_threadgroup]],
@@ -13501,6 +13503,30 @@ kernel void kernel_mul_mv_id(
         tiitg,
         tiisg,
         sgitg);
+
+    if (FC_mul_mv_id_has_scale != 0 && tiisg == 0) {
+        const int64_t is1 = (args.nes1 == 1) ? 0 : i1;
+        const int64_t is2 = (args.nes2 == 1) ? 0 : i2;
+        device const char * scale_plane = scale + is1*args.nbs1 + is2*args.nbs2;
+        device float * dst_f32 = (device float *) dst_cur;
+
+        if (args.scale_grouped != 0) {
+            const short NSG = FC_mul_mv_nsg;
+            const int first = (int) (tgpig.x * NSG + sgitg) * args.nr0;
+            for (int row = 0; row < args.nr0 && first + row < args.ne0; ++row) {
+                const float s = (args.nes0 == 1) ? ((device const float *) scale_plane)[0] :
+                    *((device const float *) (scale_plane + (uint64_t) (first + row)*args.nbs0));
+                dst_f32[first + row] *= s;
+            }
+        } else if (sgitg == 0) {
+            const int r0 = (int) tgpig.x * args.nr0;
+            for (int row = 0; row < args.nr0 && r0 + row < args.ne0; ++row) {
+                const float s = (args.nes0 == 1) ? ((device const float *) scale_plane)[0] :
+                    *((device const float *) (scale_plane + (uint64_t) (r0 + row)*args.nbs0));
+                dst_f32[r0 + row] *= s;
+            }
+        }
+    }
 }
 
 typedef decltype(kernel_mul_mv_id<mmv_fn<kernel_mul_mv_t_t_disp<float, float>>>) kernel_mul_mv_id_t;

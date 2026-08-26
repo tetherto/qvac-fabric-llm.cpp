@@ -2775,6 +2775,13 @@ static int ggml_metal_op_mul_mv_glu(ggml_metal_op_t ctx, int idx, int n_fuse) {
             /*.ne1  =*/ ne1,
             /*.nb1  =*/ glu->nb[1],
             /*.nr0  =*/ nr0,
+            /*.scale_grouped =*/ 0,
+            /*.nes0          =*/ 0,
+            /*.nes1          =*/ 0,
+            /*.nes2          =*/ 0,
+            /*.nbs0          =*/ 0,
+            /*.nbs1          =*/ 0,
+            /*.nbs2          =*/ 0,
         };
 
         if (ggml_is_quantized(src0->type)) {
@@ -3156,6 +3163,90 @@ size_t ggml_metal_op_mul_mat_id_extra_ids(const ggml_tensor * op) {
     return ggml_type_size(GGML_TYPE_I32)*(ne20*ne21 + ne02);
 }
 
+// MUL_MAT_ID with the routing-weight MUL applied in the mat-vec epilogue (see GGML_METAL_FUSION_MUL_MV_ID_MUL)
+static int ggml_metal_op_mul_mv_id_mul(ggml_metal_op_t ctx, int idx, int n_fuse) {
+    ggml_tensor * mm  = ctx->node(idx);
+    ggml_tensor * mul = ctx->node(idx + n_fuse - 1);
+
+    ggml_metal_library_t lib = ctx->lib;
+    ggml_metal_encoder_t enc = ctx->enc;
+
+    GGML_ASSERT(!ggml_metal_op_mul_mat_id_use_mm(mm, ggml_metal_device_get_props(ctx->dev)->has_simdgroup_mm));
+
+    const ggml_tensor * src0  = mm->src[0];
+    const ggml_tensor * src1  = mm->src[1];
+    const ggml_tensor * ids   = mm->src[2];
+    const ggml_tensor * scale = mul->src[0] == mm ? mul->src[1] : mul->src[0];
+
+    auto pipeline = ggml_metal_library_get_pipeline_mul_mv_id(lib, mm, 1);
+
+    const int nr0 = pipeline.nr0;
+    const int nr1 = pipeline.nr1;
+    const int nsg = pipeline.nsg;
+    const size_t smem = pipeline.smem;
+
+    const enum ggml_type t = src0->type;
+    const int32_t scale_grouped =
+        !(t == GGML_TYPE_F32 || t == GGML_TYPE_F16 || t == GGML_TYPE_BF16 || t == GGML_TYPE_Q8_0);
+
+    ggml_metal_kargs_mul_mv_id args = {
+        /*.nei0          =*/ (int32_t) ids->ne[0],
+        /*.nei1          =*/ (int32_t) ids->ne[1],
+        /*.nbi1          =*/ ids->nb[1],
+        /*.ne00          =*/ (int32_t) src0->ne[0],
+        /*.ne01          =*/ (int32_t) src0->ne[1],
+        /*.ne02          =*/ (int32_t) src0->ne[2],
+        /*.nb00          =*/ src0->nb[0],
+        /*.nb01          =*/ src0->nb[1],
+        /*.nb02          =*/ src0->nb[2],
+        /*.ne10          =*/ (int32_t) src1->ne[0],
+        /*.ne11          =*/ (int32_t) src1->ne[1],
+        /*.ne12          =*/ (int32_t) src1->ne[2],
+        /*.ne13          =*/ (int32_t) src1->ne[3],
+        /*.nb10          =*/ src1->nb[0],
+        /*.nb11          =*/ src1->nb[1],
+        /*.nb12          =*/ src1->nb[2],
+        /*.ne0           =*/ (int32_t) mul->ne[0],
+        /*.ne1           =*/ (int32_t) mul->ne[1],
+        /*.nb1           =*/ mul->nb[1],
+        /*.nr0           =*/ nr0,
+        /*.scale_grouped =*/ scale_grouped,
+        /*.nes0          =*/ (int32_t) scale->ne[0],
+        /*.nes1          =*/ (int32_t) scale->ne[1],
+        /*.nes2          =*/ (int32_t) scale->ne[2],
+        /*.nbs0          =*/ scale->nb[0],
+        /*.nbs1          =*/ scale->nb[1],
+        /*.nbs2          =*/ scale->nb[2],
+    };
+
+    if (ggml_is_quantized(src0->type)) {
+        GGML_ASSERT(src0->ne[0] >= (int64_t) nsg*nr0);
+    }
+
+    ggml_metal_encoder_set_pipeline(enc, pipeline);
+    ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(src0),  1);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(src1),  2);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(mul),   3);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(ids),   4);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(scale), 5);
+
+    const int64_t _ne1  = 1;
+    const int64_t ne01  = src0->ne[1];
+    const int64_t ne123 = ids->ne[0] * ids->ne[1];
+
+    ggml_metal_encoder_set_threadgroup_memory_size(enc, smem, 0);
+
+    if (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 ||
+            src0->type == GGML_TYPE_BF16 || src0->type == GGML_TYPE_Q8_0) {
+        ggml_metal_encoder_dispatch_threadgroups(enc, (int) ((ne01 + nr0 - 1)/nr0), (int) ((_ne1 + nr1 - 1)/nr1), (int) ne123, 32, nsg, 1);
+    } else {
+        ggml_metal_encoder_dispatch_threadgroups(enc, (int) ((ne01 + nr0*nsg - 1)/(nr0*nsg)), (int) ((_ne1 + nr1 - 1)/nr1), (int) ne123, 32, nsg, 1);
+    }
+
+    return n_fuse;
+}
+
 int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
     if (ctx->use_fusion()) {
         int n = 1;
@@ -3164,6 +3255,11 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
             ctx->count_fusions(fusion);
 
             return ggml_metal_op_mul_mv_glu(ctx, idx, n);
+        }
+        if (fusion && ggml_metal_fusion_get_id(fusion) == GGML_METAL_FUSION_MUL_MV_ID_MUL) {
+            ctx->count_fusions(fusion);
+
+            return ggml_metal_op_mul_mv_id_mul(ctx, idx, n);
         }
     }
 
@@ -3309,7 +3405,7 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
             ggml_metal_encoder_dispatch_threadgroups(enc, max_tiles, (ne01 + 63)/64, 1, 128, 1, 1);
         }
     } else {
-        auto pipeline = ggml_metal_library_get_pipeline_mul_mv_id(lib, op);
+        auto pipeline = ggml_metal_library_get_pipeline_mul_mv_id(lib, op, 0);
 
         const int nr0 = pipeline.nr0;
         const int nr1 = pipeline.nr1;
@@ -3338,6 +3434,13 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
             /*.ne1  =*/ ne1,
             /*.nb1  =*/ nb1,
             /*.nr0  =*/ nr0,
+            /*.scale_grouped =*/ 0,
+            /*.nes0          =*/ 0,
+            /*.nes1          =*/ 0,
+            /*.nes2          =*/ 0,
+            /*.nbs0          =*/ 0,
+            /*.nbs1          =*/ 0,
+            /*.nbs2          =*/ 0,
         };
 
         if (ggml_is_quantized(op->src[0]->type)) {
@@ -3350,6 +3453,7 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
         ggml_metal_encoder_set_buffer(enc, bid_src1, 2);
         ggml_metal_encoder_set_buffer(enc, bid_dst,  3);
         ggml_metal_encoder_set_buffer(enc, bid_src2, 4);
+        ggml_metal_encoder_set_buffer(enc, bid_dst,  5);
 
         const int64_t _ne1 = 1;
         const int64_t ne123 = ne20*ne21;

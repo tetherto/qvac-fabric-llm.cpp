@@ -645,6 +645,13 @@ typedef struct {
     int32_t  ne1;
     uint64_t nb1;
     int32_t  nr0;
+    int32_t  scale_grouped;
+    int32_t  nes0;
+    int32_t  nes1;
+    int32_t  nes2;
+    uint64_t nbs0;
+    uint64_t nbs1;
+    uint64_t nbs2;
 } ggml_metal_kargs_mul_mv_id;
 
 // NORM
