@@ -711,6 +711,153 @@ static bool ggml_metal_fusion_check_mul_mat_add(
         (add->data == res->data || !ggml_metal_fusion_overlap(add, res));
 }
 
+// gate + up + SWIGLU: fuse only single-token decode, without storing the matmul outputs.
+// ignore row counts when packing to keep pp and tg node order stable and avoid graph reallocation.
+static bool ggml_metal_fusion_mul_mv_glu_decode_ok(const ggml_tensor * mm, ggml_metal_fusion_mode mode) {
+    const ggml_tensor * src0 = mm->src[0];
+    const ggml_tensor * src1 = mm->src[1];
+
+    if (!src0 || !src1 || src1->type != GGML_TYPE_F32) {
+        return false;
+    }
+
+    switch (src0->type) {
+        case GGML_TYPE_F32:
+        case GGML_TYPE_F16:
+        case GGML_TYPE_BF16:
+            if (src0->ne[0] < 32) {
+                return false;
+            }
+            break;
+        case GGML_TYPE_Q8_0:
+        case GGML_TYPE_Q4_K:
+        case GGML_TYPE_Q5_K:
+            break;
+        default:
+            return false;
+    }
+
+    if (ggml_is_transposed(src0) || ggml_is_transposed(src1)) {
+        return false;
+    }
+    // hadamard-hinted matmuls take the FWHT path
+    if (mm->op == GGML_OP_MUL_MAT && ggml_get_op_params_i32(mm, 1) == GGML_HINT_SRC0_IS_HADAMARD) {
+        return false;
+    }
+    if (mode == GGML_METAL_FUSION_FULL) {
+        if (mm->op == GGML_OP_MUL_MAT && mm->ne[1] != 1) {
+            return false;
+        }
+        if (mm->op == GGML_OP_MUL_MAT_ID && mm->ne[2] != 1) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+static bool ggml_metal_fusion_mul_mv_glu_swiglu_ok(const ggml_tensor * glu) {
+    return glu->op == GGML_OP_GLU && ggml_get_glu_op(glu) == GGML_GLU_OP_SWIGLU &&
+           glu->type == GGML_TYPE_F32 && ggml_get_op_params_i32(glu, 1) == 0;
+}
+
+// split weights: MUL_MAT(_ID) x2 + GLU, with the two matmuls in either order
+static bool ggml_metal_fusion_check_mul_mv_glu(
+        const ggml_metal_fusion      * fusion,
+        const ggml_tensor * const    * nodes,
+        const ggml_cgraph            * gf,
+        const int                    * node_idxs,
+              int                      idx,
+              ggml_metal_fusion_mode   mode) {
+    GGML_UNUSED(mode);
+
+    const ggml_tensor * glu = nodes[2];
+    if (!ggml_metal_fusion_mul_mv_glu_swiglu_ok(glu)) {
+        return false;
+    }
+
+    const ggml_tensor * gate = glu->src[0];
+    const ggml_tensor * up   = glu->src[1];
+
+    if (!((gate == nodes[0] && up == nodes[1]) || (gate == nodes[1] && up == nodes[0]))) {
+        return false;
+    }
+
+    if (up->src[0]->type != gate->src[0]->type ||
+        !ggml_are_same_shape (up->src[0], gate->src[0]) ||
+        !ggml_are_same_stride(up->src[0], gate->src[0])) {
+        return false;
+    }
+    if (up->src[1] != gate->src[1]) {
+        return false;
+    }
+    if (up->op == GGML_OP_MUL_MAT_ID && up->src[2] != gate->src[2]) {
+        return false;
+    }
+
+    if (!ggml_metal_fusion_mul_mv_glu_decode_ok(up, mode) || !ggml_metal_fusion_mul_mv_glu_decode_ok(gate, mode)) {
+        return false;
+    }
+
+    const int outputs[1] = { node_idxs[idx + 2] };
+    return ggml_can_fuse_subgraph_ext(gf, node_idxs + idx, 3, fusion->ops.data(), outputs, 1);
+}
+
+// stacked ffn_gate_up_exps: MUL_MAT_ID -> VIEW (gate half) -> VIEW (up half) -> GLU
+static bool ggml_metal_fusion_check_mul_mv_glu_stacked(
+        const ggml_metal_fusion      * fusion,
+        const ggml_tensor * const    * nodes,
+        const ggml_cgraph            * gf,
+        const int                    * node_idxs,
+              int                      idx,
+              ggml_metal_fusion_mode   mode) {
+    GGML_UNUSED(mode);
+
+    const std::vector<ggml_op> & ops_all = fusion->ops_all;
+
+    const int raw_start = node_idxs[idx];
+    const int raw_end   = node_idxs[idx + 1];
+    const int raw_count = raw_end - raw_start + 1;
+
+    if (raw_count != (int) ops_all.size()) {
+        return false;
+    }
+
+    int raw_idxs[GGML_METAL_FUSION_MAX];
+    for (int i = 0; i < raw_count; ++i) {
+        raw_idxs[i] = raw_start + i;
+        if (gf->nodes[raw_start + i]->op != ops_all[i]) {
+            return false;
+        }
+    }
+
+    const ggml_tensor * gate_up = nodes[0];
+    const ggml_tensor * v0      = gf->nodes[raw_start + 1];
+    const ggml_tensor * v1      = gf->nodes[raw_start + 2];
+    const ggml_tensor * glu     = nodes[1];
+
+    if (!ggml_metal_fusion_mul_mv_glu_swiglu_ok(glu) ||
+        glu->src[0] != v0 || glu->src[1] != v1 ||
+        v0->view_src != gate_up || v1->view_src != gate_up ||
+        gate_up->ne[0] % 2 != 0) {
+        return false;
+    }
+
+    const int64_t n_ff = gate_up->ne[0] / 2;
+    if (v0->ne[0] != n_ff || v1->ne[0] != n_ff ||
+        v0->view_offs != 0 ||
+        v1->view_offs != (size_t) n_ff * gate_up->nb[0]) {
+        return false;
+    }
+
+    if (!ggml_metal_fusion_mul_mv_glu_decode_ok(gate_up, mode)) {
+        return false;
+    }
+
+    const int outputs[1] = { raw_end };
+    return ggml_can_fuse_subgraph_ext(gf, raw_idxs, raw_count, ops_all.data(), outputs, 1);
+}
+
 // ---- patterns ------------------------------------------------------------
 
 static const std::vector<ggml_op> ops_norm_mul         = { GGML_OP_NORM, GGML_OP_MUL };
@@ -731,6 +878,10 @@ static const std::vector<ggml_op> ops_snake = { GGML_OP_MUL, GGML_OP_SIN, GGML_O
 static const std::vector<ggml_op> ops_gdn_cache = { GGML_OP_GATED_DELTA_NET, GGML_OP_CPY };
 
 static const std::vector<ggml_op> ops_ssm_conv_silu = { GGML_OP_SSM_CONV, GGML_OP_UNARY };
+
+static const std::vector<ggml_op> ops_mul_mv_glu         = { GGML_OP_MUL_MAT,    GGML_OP_MUL_MAT,    GGML_OP_GLU };
+static const std::vector<ggml_op> ops_mul_mv_id_glu      = { GGML_OP_MUL_MAT_ID, GGML_OP_MUL_MAT_ID, GGML_OP_GLU };
+static const std::vector<ggml_op> ops_mul_mv_id_glu_stkd = { GGML_OP_MUL_MAT_ID, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_GLU };
 
 static const std::vector<ggml_op> ops_moe_reduce_2 = {
     GGML_OP_MUL, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_ADD
@@ -790,6 +941,9 @@ static const std::vector<ggml_metal_fusion> ggml_metal_fusions = {
     { GGML_METAL_FUSION_MOE_REDUCE,     ops_moe_reduce_8,           {},     true,  ggml_metal_fusion_check_moe_reduce },
     { GGML_METAL_FUSION_SSM_CONV_SILU,  ops_ssm_conv_silu,          {},     false, ggml_metal_fusion_check_ssm_conv_silu },
     { GGML_METAL_FUSION_MUL_MAT_ADD,    ops_mul_mat_add,            {},     false, ggml_metal_fusion_check_mul_mat_add },
+    { GGML_METAL_FUSION_MUL_MV_GLU,     ops_mul_mv_glu,             {},     true,  ggml_metal_fusion_check_mul_mv_glu },
+    { GGML_METAL_FUSION_MUL_MV_GLU,     ops_mul_mv_id_glu,          {},     true,  ggml_metal_fusion_check_mul_mv_glu },
+    { GGML_METAL_FUSION_MUL_MV_GLU,     ops_mul_mv_id_glu_stkd,     {},     true,  ggml_metal_fusion_check_mul_mv_glu_stacked },
 };
 
 // ---- alloc deps -----------------------------------------------------------
