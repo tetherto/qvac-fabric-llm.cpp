@@ -2376,6 +2376,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_COUNT_EQUAL:
             ggml_cuda_count_equal(ctx, dst);
             break;
+        case GGML_OP_COUNT_EQUAL_MASKED:
+            ggml_cuda_count_equal_masked(ctx, dst);
+            break;
         case GGML_OP_REPEAT:
             ggml_cuda_op_repeat(ctx, dst);
             break;
@@ -6050,6 +6053,16 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_ARGMAX:
         case GGML_OP_COUNT_EQUAL:
             return true;
+        case GGML_OP_COUNT_EQUAL_MASKED:
+            {
+                // Reject anything the kernel cannot index so it falls back to the CPU
+                // instead of tripping an assert in the launcher.
+                return op->src[0]->type == GGML_TYPE_I32 && op->src[1]->type == GGML_TYPE_I32 &&
+                       op->src[2]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_I64 &&
+                       ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]) &&
+                       ggml_is_contiguous(op->src[2]) &&
+                       (ggml_are_same_shape(op->src[0], op->src[2]) || op->src[2]->ne[1] == op->src[0]->ne[0]);
+            } break;
         case GGML_OP_REPEAT:
             {
                 // the CUDA REPEAT path only implements F32/F16; other types assert at runtime
