@@ -8498,19 +8498,23 @@ struct test_mul_mat_vec_fusion : public test_case {
     const bool with_lane_scale;
     std::array<int64_t, 2> batch_dims;
     const bool skip; // set some ids to a negative value (only for use_id)
+    const bool stacked;  // single [k, 2*n, n_mats] matmul split into gate/up views (only for use_id)
 
     test_mul_mat_vec_fusion(ggml_type type, ggml_glu_op op, int64_t m, int64_t n, int64_t k,
                         bool use_id = false, int n_mats = 1, int n_used = 1, bool b = false, bool with_bias = false, bool with_gate = true,
-                        bool with_lane_scale = false, std::array<int64_t, 2> batch_dims = {4, 2}, bool skip = false)
+                        bool with_lane_scale = false, std::array<int64_t, 2> batch_dims = {4, 2}, bool skip = false, bool stacked = false)
     : type(type), glu_op(op), m(m), n(n), k(k), use_id(use_id), n_mats(n_mats), n_used(n_used), b(b), with_bias(with_bias),
-        with_gate(with_gate), with_lane_scale(with_lane_scale), batch_dims(batch_dims), skip(skip) {
+        with_gate(with_gate), with_lane_scale(with_lane_scale), batch_dims(batch_dims), skip(skip), stacked(stacked) {
         if (use_id) {
             GGML_ASSERT(n_used <= n_mats);
+        }
+        if (stacked) {
+            GGML_ASSERT(use_id && with_gate && !with_bias && !with_lane_scale && !b);
         }
     }
 
     std::string vars() override {
-        return VARS_TO_STR14(type, glu_op, m, n, k, use_id, n_mats, n_used, b, with_bias, with_gate, with_lane_scale, batch_dims, skip);
+        return VARS_TO_STR15(type, glu_op, m, n, k, use_id, n_mats, n_used, b, with_bias, with_gate, with_lane_scale, batch_dims, skip, stacked);
     }
 
     std::string op_desc(ggml_tensor * t) override {
@@ -8606,8 +8610,8 @@ struct test_mul_mat_vec_fusion : public test_case {
             ggml_set_name(out, "out");
             return out;
         } else {
-            ggml_tensor * gates = ggml_new_tensor_3d(ctx, type, k, n, n_mats);
-            ggml_tensor * ups   = ggml_new_tensor_3d(ctx, type, k, n, n_mats);
+            ggml_tensor * gates = ggml_new_tensor_3d(ctx, type, k, stacked ? 2*n : n, n_mats);
+            ggml_tensor * ups   = stacked ? nullptr : ggml_new_tensor_3d(ctx, type, k, n, n_mats);
             ggml_tensor * ids   = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_mats, m);
 
             if (n_used != n_mats) {
@@ -8616,6 +8620,24 @@ struct test_mul_mat_vec_fusion : public test_case {
 
             ggml_tensor * cur = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k, this->b ? 1 : n_used, m);
             ggml_set_name(cur, "cur");
+
+            if (stacked) {
+                ggml_tensor * gate_up = ggml_mul_mat_id(ctx, gates, cur, ids); // [2*n, n_used, m]
+
+                ggml_tensor * v0 = ggml_view_3d(ctx, gate_up, n, gate_up->ne[1], gate_up->ne[2],
+                        gate_up->nb[1], gate_up->nb[2], 0);
+                ggml_tensor * v1 = ggml_view_3d(ctx, gate_up, n, gate_up->ne[1], gate_up->ne[2],
+                        gate_up->nb[1], gate_up->nb[2], n*gate_up->nb[0]);
+
+                ggml_tensor * out = ggml_glu_split(ctx, v0, v1, glu_op);
+
+                std::array<int64_t, 4> scale_ne { 1, out->ne[1], out->ne[2], out->ne[3] };
+                ggml_tensor * scale = ggml_new_tensor(ctx, out->type, 4, scale_ne.data());
+                out = ggml_mul(ctx, out, scale);
+
+                ggml_set_name(out, "out");
+                return out;
+            }
 
             auto build_lane_up = [&]() {
                 ggml_tensor * ffn_up = ggml_mul_mat_id(ctx, ups, cur, ids);
@@ -8667,6 +8689,51 @@ struct test_mul_mat_vec_fusion : public test_case {
 
     double max_nmse_err() override {
         return 5e-3;
+    }
+};
+
+// GGML_OP_UNARY + GGML_OP_MUL
+struct test_unary_mul_fusion : public test_case {
+    const ggml_type type;
+    const ggml_unary_op op;
+    const std::array<int64_t, 4> ne;
+    const bool broadcast;
+
+    test_unary_mul_fusion(ggml_type type = GGML_TYPE_F32, ggml_unary_op op = GGML_UNARY_OP_SILU,
+            std::array<int64_t, 4> ne = { 128, 4, 1, 1 }, bool broadcast = false)
+        : type(type), op(op), ne(ne), broadcast(broadcast) {}
+
+    std::string vars() override {
+        return VARS_TO_STR4(type, op, ne, broadcast);
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "UNARY_MUL_FUSION";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor(ctx, type, 4, ne.data());
+        ggml_set_name(a, "a");
+
+        ggml_tensor * b = broadcast
+            ? ggml_new_tensor_1d(ctx, type, ne[0])
+            : ggml_new_tensor(ctx, type, 4, ne.data());
+        ggml_set_name(b, "b");
+
+        ggml_tensor * u = ggml_unary(ctx, a, op);
+        ggml_set_name(u, "u");
+
+        ggml_tensor * out = ggml_mul(ctx, u, b);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+
+    double max_nmse_err() override {
+        return 1e-4;
     }
 };
 
@@ -13657,6 +13724,21 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // The same with experts (~1280 tiles each): 17 tokens with broadcast input (one MMA tile per warp), 2048 tokens without (two, several column tiles per expert).
     test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_Q4_K,   GGML_GLU_OP_SWIGLU,        17,  5120, 256, true, 16, 8, true));
     test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_Q8_0,   GGML_GLU_OP_SWIGLU,      2048,   128, 256, true, 40, 8, false));
+
+    // stacked gate/up weights split into two views
+    for (ggml_type type : { GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K }) {
+        test_cases.emplace_back(new test_mul_mat_vec_fusion(type, GGML_GLU_OP_SWIGLU, 1, 32, 256,
+            true, 16, 8, false, false, true, false, { 1, 1 }, false, true));
+    }
+
+    for (ggml_type type : { GGML_TYPE_F32, GGML_TYPE_F16 }) {
+        for (ggml_unary_op op : { GGML_UNARY_OP_SILU, GGML_UNARY_OP_SIGMOID, GGML_UNARY_OP_SOFTPLUS }) {
+            for (bool broadcast : { false, true }) {
+                test_cases.emplace_back(new test_unary_mul_fusion(type, op, { 128, 4, 1, 1 }, broadcast));
+                test_cases.emplace_back(new test_unary_mul_fusion(type, op, { 5, 7, 11, 13 }, broadcast));
+            }
+        }
+    }
 
     for (auto gate : {GATING_FUNC_SOFTMAX, GATING_FUNC_SIGMOID, GATING_FUNC_SOFTMAX_WEIGHT, GATING_FUNC_SQRT_SOFTPLUS}) {
         for (bool with_norm : {false, true}) {

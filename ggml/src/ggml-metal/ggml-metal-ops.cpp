@@ -863,7 +863,95 @@ int ggml_metal_op_acc(ggml_metal_op_t ctx, int idx) {
     return 1;
 }
 
+// UNARY (silu/sigmoid/softplus) + MUL in one pass (see GGML_METAL_FUSION_UNARY_MUL)
+static int ggml_metal_op_unary_mul(ggml_metal_op_t ctx, int idx, int n_fuse) {
+    ggml_tensor * unary = ctx->node(idx);
+    ggml_tensor * mul   = ctx->node(idx + n_fuse - 1);
+
+    ggml_metal_library_t lib = ctx->lib;
+    ggml_metal_encoder_t enc = ctx->enc;
+
+    const ggml_tensor * src0  = unary->src[0];
+    const ggml_tensor * other = mul->src[0] == unary ? mul->src[1] : mul->src[0];
+
+    auto pipeline = ggml_metal_library_get_pipeline_unary_mul(lib, unary, mul);
+
+    GGML_TENSOR_LOCALS( int32_t, ne0, src0,  ne);
+    GGML_TENSOR_LOCALS(uint64_t, nb0, src0,  nb);
+    GGML_TENSOR_LOCALS( int32_t, ne1, other, ne);
+    GGML_TENSOR_LOCALS(uint64_t, nb1, other, nb);
+    GGML_TENSOR_LOCALS( int32_t, ne,  mul,   ne);
+    GGML_TENSOR_LOCALS(uint64_t, nb,  mul,   nb);
+
+    ggml_metal_kargs_bin args = {
+        /*.ne00 =*/ ne00,
+        /*.ne01 =*/ ne01,
+        /*.ne02 =*/ ne02,
+        /*.ne03 =*/ ne03,
+        /*.nb00 =*/ nb00,
+        /*.nb01 =*/ nb01,
+        /*.nb02 =*/ nb02,
+        /*.nb03 =*/ nb03,
+        /*.ne10 =*/ ne10,
+        /*.ne11 =*/ ne11,
+        /*.ne12 =*/ ne12,
+        /*.ne13 =*/ ne13,
+        /*.nb10 =*/ nb10,
+        /*.nb11 =*/ nb11,
+        /*.nb12 =*/ nb12,
+        /*.nb13 =*/ nb13,
+        /*.ne0  =*/ ne0,
+        /*.ne1  =*/ ne1,
+        /*.ne2  =*/ ne2,
+        /*.ne3  =*/ ne3,
+        /*.nb0  =*/ nb0,
+        /*.nb1  =*/ nb1,
+        /*.nb2  =*/ nb2,
+        /*.nb3  =*/ nb3,
+        /*.offs =*/ 0,
+        /*.o1   =*/ { 0 },
+    };
+
+    if (pipeline.c4) {
+        args.ne00 = ne00/4;
+        args.ne10 = ne10/4;
+        args.ne0  = ne0/4;
+    }
+
+    ggml_metal_encoder_set_pipeline(enc, pipeline);
+    ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(src0),  1);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(other), 2);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(mul),   3);
+
+    if (pipeline.cnt) {
+        const int n = pipeline.c4 ? ggml_nelements(mul)/4 : ggml_nelements(mul);
+        ggml_metal_encoder_dispatch_threadgroups(enc, n, 1, 1, 1, 1, 1);
+    } else {
+        const int nth_max = MIN(256, ggml_metal_pipeline_max_theads_per_threadgroup(pipeline));
+
+        int nth = 1;
+        while (2*nth < args.ne0 && nth < nth_max) {
+            nth *= 2;
+        }
+
+        ggml_metal_encoder_dispatch_threadgroups(enc, ne1, ne2, ne3, nth, 1, 1);
+    }
+
+    return n_fuse;
+}
+
 int ggml_metal_op_unary(ggml_metal_op_t ctx, int idx) {
+    if (ctx->use_fusion()) {
+        int n = 1;
+        const ggml_metal_fusion * fusion = ctx->can_fuse(idx, GGML_METAL_FUSION_FULL, &n);
+        if (fusion && ggml_metal_fusion_get_id(fusion) == GGML_METAL_FUSION_UNARY_MUL) {
+            ctx->count_fusions(fusion);
+
+            return ggml_metal_op_unary_mul(ctx, idx, n);
+        }
+    }
+
     ggml_tensor * op = ctx->node(idx);
 
     ggml_metal_library_t lib = ctx->lib;

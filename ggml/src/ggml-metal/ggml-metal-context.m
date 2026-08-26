@@ -12,6 +12,7 @@
 #import <TargetConditionals.h>
 
 #import <Metal/Metal.h>
+#include <stdio.h>
 
 #undef MIN
 #undef MAX

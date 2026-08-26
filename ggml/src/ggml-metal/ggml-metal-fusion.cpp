@@ -730,6 +730,7 @@ static bool ggml_metal_fusion_mul_mv_glu_decode_ok(const ggml_tensor * mm, ggml_
             }
             break;
         case GGML_TYPE_Q8_0:
+        case GGML_TYPE_Q4_0:
         case GGML_TYPE_Q4_K:
         case GGML_TYPE_Q5_K:
             break;
@@ -845,6 +846,8 @@ static bool ggml_metal_fusion_check_mul_mv_glu_stacked(
 
     const int64_t n_ff = gate_up->ne[0] / 2;
     if (v0->ne[0] != n_ff || v1->ne[0] != n_ff ||
+        v0->ne[1] != gate_up->ne[1] || v0->ne[2] != gate_up->ne[2] || v0->ne[3] != gate_up->ne[3] ||
+        v1->ne[1] != gate_up->ne[1] || v1->ne[2] != gate_up->ne[2] || v1->ne[3] != gate_up->ne[3] ||
         v0->view_offs != 0 ||
         v1->view_offs != (size_t) n_ff * gate_up->nb[0]) {
         return false;
@@ -933,6 +936,11 @@ static bool ggml_metal_fusion_check_mul_mv_id_mul(
         return false;
     }
 
+    // mul(mm, mm) would read the matvec result that the fusion skips
+    if (mul->src[0] == mul->src[1]) {
+        return false;
+    }
+
     const ggml_tensor * scale = mul->src[0] == mm ? mul->src[1] : mul->src[0];
     if (!scale || scale->type != GGML_TYPE_F32 || mul->type != GGML_TYPE_F32 || mm->type != GGML_TYPE_F32 ||
         mm->src[1]->type != GGML_TYPE_F32) {
@@ -947,6 +955,11 @@ static bool ggml_metal_fusion_check_mul_mv_id_mul(
         if (scale->ne[i] != 1 && scale->ne[i] != mul->ne[i]) {
             return false;
         }
+    }
+
+    // the kernel reads scale after writing dst, so dst must not be able to alias scale (inplace mul)
+    if (ggml_are_same_layout(scale, mul)) {
+        return false;
     }
 
     // gate mat-vec fusion as in ggml_metal_op_mul_mat_id_use_mm; ignore row counts when packing to keep pp and tg node order stable.
@@ -977,6 +990,62 @@ static bool ggml_metal_fusion_check_mul_mv_id_mul(
 
     const int outputs[1] = { raw_mul };
     return ggml_can_fuse_subgraph_ext(gf, node_idxs + idx, 2, fusion->ops.data(), outputs, 1);
+}
+
+static const std::vector<ggml_op> ops_unary_mul = { GGML_OP_UNARY, GGML_OP_MUL };
+
+// UNARY (silu/sigmoid/softplus) + MUL: the fused kernel writes unary(src0) * other
+static bool ggml_metal_fusion_check_unary_mul(
+        const ggml_metal_fusion      * fusion,
+        const ggml_tensor * const    * nodes,
+        const ggml_cgraph            * gf,
+        const int                    * node_idxs,
+              int                      idx,
+              ggml_metal_fusion_mode   mode) {
+    GGML_UNUSED(fusion);
+    GGML_UNUSED(gf);
+    GGML_UNUSED(node_idxs);
+    GGML_UNUSED(idx);
+    GGML_UNUSED(mode);
+
+    const ggml_tensor * unary = nodes[0];
+    const ggml_tensor * mul   = nodes[1];
+
+    const ggml_unary_op uop = ggml_get_unary_op(unary);
+    if (uop != GGML_UNARY_OP_SILU && uop != GGML_UNARY_OP_SIGMOID && uop != GGML_UNARY_OP_SOFTPLUS) {
+        return false;
+    }
+
+    if (mul->src[0] != unary && mul->src[1] != unary) {
+        return false;
+    }
+
+    // mul(unary, unary) would read the unary result that the fusion skips
+    if (mul->src[0] == mul->src[1]) {
+        return false;
+    }
+
+    const ggml_tensor * src0  = unary->src[0];
+    const ggml_tensor * other = mul->src[0] == unary ? mul->src[1] : mul->src[0];
+    if (!src0 || !other) {
+        return false;
+    }
+
+    if (unary->type != GGML_TYPE_F32 && unary->type != GGML_TYPE_F16) {
+        return false;
+    }
+    if (src0->type != unary->type || other->type != unary->type || mul->type != unary->type) {
+        return false;
+    }
+    if (!ggml_is_contiguous_rows(src0) || !ggml_is_contiguous_rows(other) || !ggml_is_contiguous_rows(mul)) {
+        return false;
+    }
+    // unary must match dst so we do not recompute it while broadcasting
+    if (!ggml_are_same_shape(src0, mul) || !ggml_can_repeat(other, mul)) {
+        return false;
+    }
+
+    return true;
 }
 
 static const std::vector<ggml_metal_fusion> ggml_metal_fusions = {
@@ -1011,6 +1080,7 @@ static const std::vector<ggml_metal_fusion> ggml_metal_fusions = {
     { GGML_METAL_FUSION_MUL_MV_GLU,     ops_mul_mv_id_glu,          {},     true,  ggml_metal_fusion_check_mul_mv_glu },
     { GGML_METAL_FUSION_MUL_MV_GLU,     ops_mul_mv_id_glu_stkd,     {},     true,  ggml_metal_fusion_check_mul_mv_glu_stacked },
     { GGML_METAL_FUSION_MUL_MV_ID_MUL,  ops_mul_mv_id_mul,          {},     true,  ggml_metal_fusion_check_mul_mv_id_mul },
+    { GGML_METAL_FUSION_UNARY_MUL,      ops_unary_mul,              {},     false, ggml_metal_fusion_check_unary_mul },
 };
 
 // ---- alloc deps -----------------------------------------------------------
@@ -1073,8 +1143,9 @@ void ggml_metal_fusion_add_alloc_deps(
         if (best) {
             ggml_metal_fusion_add_pattern_alloc_deps(user_data, add_alloc_dep, gf, best, i);
             i += best_raw - 1;
-            // the MUL that ends MUL_MAT_ID + MUL also heads MOE_REDUCE: rescan it so both get their deps
-            if (best->id == GGML_METAL_FUSION_MUL_MV_ID_MUL) {
+            // the MUL that ends MUL_MAT_ID + MUL or UNARY + MUL can also head MOE_REDUCE or SNAKE:
+            // rescan it so both get their deps
+            if (best->id == GGML_METAL_FUSION_MUL_MV_ID_MUL || best->id == GGML_METAL_FUSION_UNARY_MUL) {
                 i--;
             }
         }
