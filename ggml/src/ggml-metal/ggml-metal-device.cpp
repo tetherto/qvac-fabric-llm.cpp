@@ -51,6 +51,27 @@ static int ggml_metal_nsg_q5_k(void) {
     return nsg;
 }
 
+static int ggml_metal_gdn_ncols(int nsg) {
+    static int env = -2;
+    if (env == -2) {
+        env = -1;
+        const char * v = getenv("GGML_METAL_GDN_COLS");
+        if (v && v[0]) {
+            const int n = atoi(v);
+            if (n >= 1 && n <= 8) {
+                env = n;
+                GGML_LOG_INFO("ggml_metal: GDN cols=%d\n", env);
+            }
+        }
+    }
+
+    int ncols = env > 0 ? env : nsg;
+    if (ncols > nsg) {
+        ncols = nsg;
+    }
+    return ncols;
+}
+
 struct ggml_metal_device_deleter {
     void operator()(ggml_metal_device_t ctx) {
         ggml_metal_device_free(ctx);
@@ -813,28 +834,32 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_gated_delta_net(
     const int K = ggml_get_op_params_i32(op, 0);
 
     const int nsg = op->src[2]->ne[0]/32;
+    const int ne22 = op->src[2]->ne[2];
+    const int16_t nt_fc = ne22 == 1 ? 1 : 0;
+    const int ncols = ggml_metal_gdn_ncols(nsg);
 
     GGML_ASSERT(op->src[5]->type == GGML_TYPE_F32);
     GGML_ASSERT(op->ne[0] == ne20 * ne21);
     GGML_ASSERT(ne20 % 32 == 0);
 
     snprintf(base, 256, "kernel_gated_delta_net_%s_%d", ggml_type_name(op->src[0]->type), nsg);
-    snprintf(name, 256, "%s_ne20=%d_ne30=%d_K=%d", base, ne20, ne30, K);
+    snprintf(name, 256, "%s_ne20=%d_ne30=%d_K=%d_nt=%d", base, ne20, ne30, K, nt_fc);
 
     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
     if (!res.pipeline) {
         ggml_metal_cv_t cv = ggml_metal_cv_init();
 
-        ggml_metal_cv_set_int16(cv, ne20, FC_GATED_DELTA_NET + 0);
-        ggml_metal_cv_set_int16(cv, ne30, FC_GATED_DELTA_NET + 1);
-        ggml_metal_cv_set_int16(cv, K,    FC_GATED_DELTA_NET + 2);
+        ggml_metal_cv_set_int16(cv, ne20,  FC_GATED_DELTA_NET + 0);
+        ggml_metal_cv_set_int16(cv, ne30,  FC_GATED_DELTA_NET + 1);
+        ggml_metal_cv_set_int16(cv, K,     FC_GATED_DELTA_NET + 2);
+        ggml_metal_cv_set_int16(cv, nt_fc, FC_GATED_DELTA_NET + 3);
 
         res = ggml_metal_library_compile_pipeline(lib, base, name, cv);
 
         ggml_metal_cv_free(cv);
     }
 
-    res.nsg = nsg;
+    res.nsg = ncols;
 
     return res;
 }
