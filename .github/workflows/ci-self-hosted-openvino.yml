@@ -75,5 +75,6 @@ jobs:
       - name: Test
         id: ggml-ci
         run: |
+          git lfs install
           source ./openvino_toolkit/setupvars.sh
           GG_BUILD_OPENVINO=1 GGML_OPENVINO_DEVICE=GPU GG_BUILD_LOW_PERF=1 bash ./ci/run.sh ~/results/llama.cpp ~/mnt/llama.cpp

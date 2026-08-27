@@ -94,6 +94,7 @@ jobs:
       - name: Test
         id: ggml-ci
         run: |
+          git lfs install
           GG_BUILD_WEBGPU=1 \
           GG_BUILD_WEBGPU_DAWN_PREFIX="$GITHUB_WORKSPACE/dawn" \
           GG_BUILD_WEBGPU_DAWN_DIR="$GITHUB_WORKSPACE/dawn/lib64/cmake/Dawn" \
@@ -135,5 +136,6 @@ jobs:
       - name: Test
         id: ggml-ci
         run: |
+          git lfs install
           GG_BUILD_WEBGPU=1 GG_BUILD_WEBGPU_DAWN_PREFIX="$GITHUB_WORKSPACE/dawn" \
             bash ./ci/run.sh ~/results/llama.cpp/$RUNNER_NAME ~/mnt/llama.cpp

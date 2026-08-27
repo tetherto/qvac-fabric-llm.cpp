@@ -77,6 +77,7 @@ jobs:
       - name: Test
         id: ggml-ci
         run: |
+          git lfs install
           nvidia-smi
           GG_BUILD_CUDA=1 CUDACXX=/usr/local/cuda/bin/nvcc bash ./ci/run.sh ~/results/llama.cpp ~/mnt/llama.cpp
 
@@ -109,6 +110,7 @@ jobs:
         env:
           HIP_LAUNCH_BLOCKING: "1"
         run: |
+          git lfs install
           rocminfo
           GG_BUILD_ROCM=1 GG_BUILD_AMDGPU_TARGETS=gfx1151 bash ./ci/run.sh ~/results/llama.cpp ~/mnt/llama.cpp
 
