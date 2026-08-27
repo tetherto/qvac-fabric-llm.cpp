@@ -77,6 +77,7 @@ jobs:
       - name: Test
         id: ggml-ci
         run: |
+          git lfs install
           nvidia-smi
           GG_BUILD_CUDA=1 CUDACXX=/usr/local/cuda/bin/nvcc bash ./ci/run.sh ~/results/llama.cpp ~/mnt/llama.cpp
 
@@ -168,6 +169,7 @@ jobs:
         env:
           HIP_LAUNCH_BLOCKING: ${{ matrix.hip_launch_blocking }}
         run: |
+          git lfs install
           rocminfo
           # Exported rather than set in env:, because ggml only checks that the
           # variable is defined: an empty value would disable graphs on gfx1151 too.
