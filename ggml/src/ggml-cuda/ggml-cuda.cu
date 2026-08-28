@@ -1,3 +1,11 @@
+#if defined(__GNUC__) && !defined(__clang__)
+// GCC 11 (Ubuntu 22.04 CI) falsely reports -Wstringop-overflow when inlining the
+// std::vector<ggml_op> initializer-list inserts of the topk-moe path in
+// ggml_cuda_try_fuse; fatal with LLAMA_FATAL_WARNINGS. The warning is attributed
+// to the STL headers, so it must be disabled before they are included.
+#pragma GCC diagnostic ignored "-Wstringop-overflow"
+#endif
+
 #include "ggml-cuda.h"
 #include "ggml-impl.h"
 #include "ggml-backend-impl.h"
