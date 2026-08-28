@@ -984,24 +984,107 @@ class rpc_command_queue {
     std::unordered_map<uint32_t, std::unordered_set<uint64_t>> graph_uids;
 };
 
-static std::shared_ptr<rpc_command_queue> get_command_queue(const std::string & endpoint) {
-    static std::mutex                                                        mutex;
-    std::lock_guard<std::mutex>                                              lock(mutex);
-    static std::unordered_map<std::string, std::weak_ptr<rpc_command_queue>> queues;
+struct rpc_connection_attempt {
+    std::condition_variable            cv;
+    std::shared_ptr<rpc_command_queue> queue;
+    bool                               keep_alive = false;
+    bool                               done       = false;
+};
 
-    auto it = queues.find(endpoint);
-    if (it != queues.end()) {
+struct rpc_connection_cache {
+    std::mutex                                                                  mutex;
+    std::unordered_map<std::string, std::weak_ptr<rpc_command_queue>>           queues;
+    std::unordered_map<std::string, std::shared_ptr<rpc_command_queue>>         prefetched;
+    std::unordered_map<std::string, std::shared_ptr<rpc_connection_attempt>>    connecting;
+};
+
+static rpc_connection_cache & get_connection_cache() {
+    static rpc_connection_cache cache;
+    return cache;
+}
+
+static std::shared_ptr<rpc_command_queue> get_cached_command_queue_locked(rpc_connection_cache & cache, const std::string & endpoint, bool keep_alive) {
+    auto prefetch_it = cache.prefetched.find(endpoint);
+    if (prefetch_it != cache.prefetched.end()) {
+        if (!prefetch_it->second->is_failed()) {
+            auto queue = prefetch_it->second;
+            if (!keep_alive) {
+                cache.prefetched.erase(prefetch_it);
+            }
+            return queue;
+        }
+        cache.prefetched.erase(prefetch_it);
+    }
+
+    auto it = cache.queues.find(endpoint);
+    if (it != cache.queues.end()) {
         if (auto queue = it->second.lock()) {
             if (!queue->is_failed()) {
+                if (keep_alive) {
+                    cache.prefetched[endpoint] = queue;
+                }
                 return queue;
             }
         }
     }
-    auto queue = rpc_command_queue::create(endpoint);
-    if (queue) {
-        queues[endpoint] = queue;
+    return nullptr;
+}
+
+static std::shared_ptr<rpc_command_queue> get_command_queue(const std::string & endpoint, bool keep_alive = false) {
+    auto & cache = get_connection_cache();
+
+    std::shared_ptr<rpc_connection_attempt> attempt;
+    bool                                    is_connector = false;
+    {
+        std::unique_lock<std::mutex> lock(cache.mutex);
+        if (auto queue = get_cached_command_queue_locked(cache, endpoint, keep_alive)) {
+            return queue;
+        }
+
+        auto it = cache.connecting.find(endpoint);
+        if (it == cache.connecting.end()) {
+            attempt = std::make_shared<rpc_connection_attempt>();
+            attempt->keep_alive = keep_alive;
+            cache.connecting.emplace(endpoint, attempt);
+            is_connector = true;
+        } else {
+            attempt = it->second;
+            attempt->keep_alive = attempt->keep_alive || keep_alive;
+        }
     }
+
+    if (!is_connector) {
+        std::unique_lock<std::mutex> lock(cache.mutex);
+        attempt->cv.wait(lock, [&] { return attempt->done; });
+        auto queue = attempt->queue;
+        if (queue && !keep_alive) {
+            cache.prefetched.erase(endpoint);
+        }
+        return queue;
+    }
+
+    auto queue = rpc_command_queue::create(endpoint);
+
+    {
+        std::lock_guard<std::mutex> lock(cache.mutex);
+        if (queue) {
+            cache.queues[endpoint] = queue;
+            if (attempt->keep_alive) {
+                cache.prefetched[endpoint] = queue;
+            }
+        }
+        attempt->queue = queue;
+        attempt->done  = true;
+        cache.connecting.erase(endpoint);
+    }
+    attempt->cv.notify_all();
     return queue;
+}
+
+static void release_prefetched_command_queue(const std::string & endpoint) {
+    auto & cache = get_connection_cache();
+    std::lock_guard<std::mutex> lock(cache.mutex);
+    cache.prefetched.erase(endpoint);
 }
 
 static void normalize_alloc_cache_tensor(rpc_tensor & tensor) {
@@ -3773,6 +3856,9 @@ static void * ggml_backend_rpc_get_proc_address(ggml_backend_reg_t reg, const ch
     if (std::strcmp(name, "ggml_backend_rpc_add_server") == 0) {
         return (void *)ggml_backend_rpc_add_server;
     }
+    if (std::strcmp(name, "ggml_backend_rpc_prefetch_connection") == 0) {
+        return (void *)ggml_backend_rpc_prefetch_connection;
+    }
     if (std::strcmp(name, "ggml_backend_rpc_start_server") == 0) {
         return (void *)ggml_backend_rpc_start_server;
     }
@@ -3826,6 +3912,12 @@ static const ggml_backend_reg_i ggml_backend_rpc_reg_interface = {
     /* .get_proc_address  = */ ggml_backend_rpc_get_proc_address,
 };
 
+// Establishes the connection without registering a backend. This lets callers
+// warm many endpoints in parallel, then register them in deterministic order.
+bool ggml_backend_rpc_prefetch_connection(const char * endpoint) {
+    return get_command_queue(endpoint, true) != nullptr;
+}
+
 ggml_backend_reg_t ggml_backend_rpc_add_server(const char * endpoint) {
     static std::unordered_map<std::string, ggml_backend_reg_t> reg_map;
     static std::mutex mutex;
@@ -3833,6 +3925,7 @@ ggml_backend_reg_t ggml_backend_rpc_add_server(const char * endpoint) {
     std::lock_guard<std::mutex> lock(mutex);
     if (reg_map.find(endpoint) != reg_map.end()) {
         LOG_DBG3("[%s] endpoint %s already registered\n", __func__, endpoint);
+        release_prefetched_command_queue(endpoint);
         return reg_map[endpoint];
     }
     uint32_t dev_count = ggml_backend_rpc_get_device_count(endpoint);

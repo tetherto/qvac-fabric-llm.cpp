@@ -4,11 +4,13 @@
 #include "../ggml/src/ggml-impl.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <thread>
 #include <vector>
 
 static bool check_values(const std::vector<float> & values, float expected) {
@@ -18,6 +20,101 @@ static bool check_values(const std::vector<float> & values, float expected) {
             return false;
         }
     }
+    return true;
+}
+
+using prefetch_connection_fn = bool (*)(const char *);
+
+static prefetch_connection_fn get_prefetch_connection() {
+    ggml_backend_reg_t rpc_reg = ggml_backend_reg_by_name("RPC");
+    if (rpc_reg == nullptr) {
+        return nullptr;
+    }
+    return (prefetch_connection_fn) ggml_backend_reg_get_proc_address(rpc_reg, "ggml_backend_rpc_prefetch_connection");
+}
+
+static std::vector<std::string> split_endpoints(const std::string & endpoints) {
+    std::vector<std::string> result;
+    size_t start = 0;
+    while (true) {
+        size_t separator = endpoints.find(',', start);
+        result.push_back(endpoints.substr(start, separator - start));
+        if (separator == std::string::npos) {
+            break;
+        }
+        start = separator + 1;
+    }
+    return result;
+}
+
+static int64_t now_ms() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+static bool check_concurrent_prefetch(prefetch_connection_fn prefetch_connection, const std::string & endpoint) {
+    static constexpr size_t n_threads = 8;
+    std::vector<uint8_t> ok(n_threads, false);
+    std::vector<std::thread> threads;
+    threads.reserve(n_threads);
+    for (size_t i = 0; i < n_threads; i++) {
+        threads.emplace_back([&, i]() {
+            ok[i] = prefetch_connection(endpoint.c_str());
+        });
+    }
+    for (auto & thread : threads) {
+        thread.join();
+    }
+    for (uint8_t result : ok) {
+        if (!result) {
+            fprintf(stderr, "concurrent RPC prefetch failed for %s\n", endpoint.c_str());
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool check_unreachable_prefetch_timing(prefetch_connection_fn prefetch_connection, const std::string & endpoints) {
+    std::vector<std::string> rpc_servers = split_endpoints(endpoints);
+    if (rpc_servers.size() < 2) {
+        fprintf(stderr, "GGML_RPC_TEST_UNREACHABLE_ENDPOINTS must contain at least two comma-separated endpoints\n");
+        return false;
+    }
+
+    int64_t start = now_ms();
+    if (prefetch_connection(rpc_servers[0].c_str())) {
+        fprintf(stderr, "expected unreachable RPC endpoint: %s\n", rpc_servers[0].c_str());
+        return false;
+    }
+    int64_t single_ms = now_ms() - start;
+
+    std::vector<uint8_t> ok(rpc_servers.size(), false);
+    std::vector<std::thread> threads;
+    threads.reserve(rpc_servers.size());
+    start = now_ms();
+    for (size_t i = 0; i < rpc_servers.size(); i++) {
+        threads.emplace_back([&, i]() {
+            ok[i] = prefetch_connection(rpc_servers[i].c_str());
+        });
+    }
+    for (auto & thread : threads) {
+        thread.join();
+    }
+    int64_t parallel_ms = now_ms() - start;
+
+    for (size_t i = 0; i < ok.size(); i++) {
+        if (ok[i]) {
+            fprintf(stderr, "expected unreachable RPC endpoint: %s\n", rpc_servers[i].c_str());
+            return false;
+        }
+    }
+    if (parallel_ms > single_ms * 3 / 2 + 1000) {
+        fprintf(stderr, "parallel unreachable RPC prefetch took too long: single=%lld ms parallel=%lld ms\n",
+                (long long) single_ms, (long long) parallel_ms);
+        return false;
+    }
+    printf("unreachable RPC prefetch timing: single=%lld ms parallel=%lld ms\n",
+           (long long) single_ms, (long long) parallel_ms);
     return true;
 }
 
@@ -40,10 +137,26 @@ static ggml_backend_ptr init_backend(const std::string & endpoint, ggml_backend_
 }
 
 int main() {
+    ggml_backend_load_all();
+
+    auto prefetch_connection = get_prefetch_connection();
+    if (prefetch_connection == nullptr) {
+        fprintf(stderr, "RPC prefetch connection function is unavailable\n");
+        return 1;
+    }
+
+    const char * unreachable_endpoints_env = std::getenv("GGML_RPC_TEST_UNREACHABLE_ENDPOINTS");
+    bool ran_unreachable_test = unreachable_endpoints_env != nullptr;
+    if (ran_unreachable_test) {
+        if (!check_unreachable_prefetch_timing(prefetch_connection, unreachable_endpoints_env)) {
+            return 1;
+        }
+    }
+
     const char * endpoints_env = std::getenv("GGML_RPC_TEST_ENDPOINTS");
     if (endpoints_env == nullptr) {
-        printf("GGML_RPC_TEST_ENDPOINTS is not set, skipping RPC integration test\n");
-        return 77;
+        printf("GGML_RPC_TEST_ENDPOINTS is not set, skipping live RPC integration test\n");
+        return ran_unreachable_test ? 0 : 77;
     }
 
     std::string endpoints(endpoints_env);
@@ -55,7 +168,9 @@ int main() {
     std::string endpoint_a = endpoints.substr(0, separator);
     std::string endpoint_b = endpoints.substr(separator + 1);
 
-    ggml_backend_load_all();
+    if (!check_concurrent_prefetch(prefetch_connection, endpoint_a)) {
+        return 1;
+    }
 
     ggml_backend_dev_t device_a  = nullptr;
     ggml_backend_dev_t device_b  = nullptr;
