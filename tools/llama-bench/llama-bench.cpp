@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <array>
 #include <cassert>
+#include <atomic>
 #include <chrono>
 #include <cinttypes>
 #include <clocale>
@@ -25,6 +26,7 @@
 #include "download.h"
 #include "fit.h"
 #include "ggml.h"
+#include "ggml-rpc.h"
 #include "llama.h"
 #include "log.h"
 
@@ -189,7 +191,38 @@ static void register_rpc_server_list(const std::string & servers) {
     if (!ggml_backend_rpc_add_server_fn) {
         throw std::invalid_argument("failed to find RPC add server function");
     }
-    for (const auto & server : rpc_servers) {
+    using prefetch_rpc_connection_fn = bool (*)(const char * endpoint);
+    auto * ggml_backend_rpc_prefetch_connection_fn = (prefetch_rpc_connection_fn) ggml_backend_reg_get_proc_address(rpc_reg, "ggml_backend_rpc_prefetch_connection");
+    if (!ggml_backend_rpc_prefetch_connection_fn) {
+        throw std::invalid_argument("failed to find RPC prefetch connection function");
+    }
+
+    std::vector<uint8_t> prefetch_ok(rpc_servers.size(), false);
+    std::vector<std::thread> prefetch_threads;
+    std::atomic<size_t> next_server(0);
+    const size_t n_prefetch_threads = std::min(rpc_servers.size(), (size_t) GGML_RPC_MAX_SERVERS);
+    prefetch_threads.reserve(n_prefetch_threads);
+    for (size_t i = 0; i < n_prefetch_threads; i++) {
+        prefetch_threads.emplace_back([&]() {
+            while (true) {
+                size_t server = next_server++;
+                if (server >= rpc_servers.size()) {
+                    break;
+                }
+                prefetch_ok[server] = ggml_backend_rpc_prefetch_connection_fn(rpc_servers[server].c_str());
+            }
+        });
+    }
+    for (auto & thread : prefetch_threads) {
+        thread.join();
+    }
+
+    for (size_t i = 0; i < rpc_servers.size(); i++) {
+        if (!prefetch_ok[i]) {
+            LOG_WRN("failed to connect to RPC server %s\n", rpc_servers[i].c_str());
+            continue;
+        }
+        const auto & server = rpc_servers[i];
         auto reg = ggml_backend_rpc_add_server_fn(server.c_str());
         ggml_backend_register(reg);
     }
