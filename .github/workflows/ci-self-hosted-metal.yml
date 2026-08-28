@@ -26,6 +26,9 @@ on:
       'ci/run.sh',
       '**/CMakeLists.txt',
       '**/.cmake',
+      'ggml/include/**',
+      'src/**',
+      'tests/**',
       'ggml/src/*',
       'ggml/src/ggml-cpu/**',
       'ggml/src/ggml-metal/**'
@@ -50,7 +53,7 @@ env:
 
 jobs:
   gpu-metal:
-    runs-on: [self-hosted, macOS, ARM64]
+    runs-on: qvac-macos26-arm64-gpu
 
     steps:
       - name: Clone

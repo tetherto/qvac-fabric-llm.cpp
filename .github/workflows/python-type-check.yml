@@ -26,7 +26,7 @@ concurrency:
 
 jobs:
   python-type-check:
-    runs-on: ubuntu-slim
+    runs-on: qvac-ubuntu2404-x64
     name: python type-check
     steps:
       - name: Check out source repository

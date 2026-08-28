@@ -23,6 +23,9 @@ on:
       'ci/run.sh',
       '**/CMakeLists.txt',
       '**/.cmake',
+      'ggml/include/**',
+      'src/**',
+      'tests/**',
       'ggml/src/*',
       'ggml/src/ggml-cpu/**'
     ]
@@ -46,13 +49,15 @@ env:
 
 jobs:
   cpu-x64-high-perf:
-    runs-on: hf-jobs-cpu-upgrade:ubuntu26_04
+    # runs-on: hf-jobs-cpu-upgrade:ubuntu26_04
+    runs-on: qvac-ubuntu2204-x64
 
+    # upstream pins the test thread counts for its hf-jobs runner only:
     # note: this runner has 8 CPUs, but std::thread::hardware_concurrency reports the cores of the
     #   host (https://github.com/ggml-org/llama.cpp/pull/31439#issuecomment-6683386059)
-    env:
-      TEST_ARG_HARDWARE_CONCURRENCY: 8
-      TEST_ARG_PARALLEL_WORKERS: 4
+    # env:
+    #   TEST_ARG_HARDWARE_CONCURRENCY: 8
+    #   TEST_ARG_PARALLEL_WORKERS: 4
 
     steps:
       - name: Clone
@@ -97,6 +102,7 @@ jobs:
           save: true
 
   cpu-arm64-high-perf-graviton4:
+    if: false  # QVAC-23796: no matching hardware
     runs-on: ah-ubuntu_24_04-c8g_8x
 
     steps:

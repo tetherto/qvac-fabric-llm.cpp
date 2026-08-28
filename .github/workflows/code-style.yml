@@ -19,7 +19,7 @@ concurrency:
 
 jobs:
   model-naming:
-    runs-on: ubuntu-slim
+    runs-on: qvac-ubuntu2404-x64
     steps:
       - uses: actions/checkout@v6
       - name: Check model naming conventions

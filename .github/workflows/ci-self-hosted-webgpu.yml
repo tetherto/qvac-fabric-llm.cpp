@@ -24,6 +24,9 @@ on:
       'ci/run.sh',
       '**/CMakeLists.txt',
       '**/.cmake',
+      'ggml/include/**',
+      'src/**',
+      'tests/**',
       'ggml/src/*',
       'ggml/src/ggml-cpu/**',
       'ggml/src/ggml-webgpu/**'
@@ -48,7 +51,8 @@ env:
 
 jobs:
   gpu-webgpu-nvidia:
-    runs-on: "hf-jobs-t4-small:ubuntu26_04"
+    # runs-on: "hf-jobs-t4-small:ubuntu26_04"
+    runs-on: qvac-ubuntu2404-x64-gpu
 
     steps:
       - name: Clone
@@ -108,7 +112,7 @@ jobs:
           save: true
 
   gpu-webgpu-apple:
-    runs-on: [self-hosted, macOS, ARM64]
+    runs-on: qvac-macos26-arm64-gpu
 
     steps:
       - name: Clone
