@@ -25,7 +25,7 @@ concurrency:
 
 jobs:
   flake8-lint:
-    runs-on: ubuntu-slim
+    runs-on: qvac-ubuntu2404-x64
     name: Lint
     steps:
       - name: Check out source repository

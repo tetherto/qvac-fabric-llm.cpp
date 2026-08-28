@@ -23,7 +23,7 @@ permissions:
 
 jobs:
   check-vendor:
-    runs-on: ubuntu-slim
+    runs-on: qvac-ubuntu2404-x64
 
     steps:
       - name: Checkout

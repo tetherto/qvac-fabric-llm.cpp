@@ -23,6 +23,9 @@ on:
       'ci/run.sh',
       '**/CMakeLists.txt',
       '**/.cmake',
+      'ggml/include/**',
+      'src/**',
+      'tests/**',
       'ggml/src/*',
       'ggml/src/ggml-cpu/**'
     ]
@@ -46,7 +49,7 @@ env:
 
 jobs:
   cpu-x64-high-perf:
-    runs-on: [self-hosted, Linux, X64, CPU]
+    runs-on: qvac-ubuntu2204-x64
 
     steps:
       - name: Clone
@@ -60,6 +63,7 @@ jobs:
           LLAMA_ARG_THREADS=$(nproc) GG_BUILD_HIGH_PERF=1 GG_BUILD_EXTRA_TESTS_0=1 bash ./ci/run.sh ~/results/llama.cpp/$RUNNER_NAME ~/mnt/llama.cpp
 
   cpu-arm64-high-perf-graviton4:
+    if: false  # QVAC-23796: no matching hardware
     runs-on: ah-ubuntu_24_04-c8g_8x
 
     steps:
