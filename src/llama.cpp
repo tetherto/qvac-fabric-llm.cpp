@@ -489,7 +489,12 @@ struct llama_model * llama_model_load_from_file(
 }
 
 static void override_and_disable_mmap(struct llama_model_params & params) {
-    if (params.load_mode == LLAMA_LOAD_MODE_MMAP || params.load_mode == LLAMA_LOAD_MODE_MMAP_MLOCK) {
+    // LLAMA_LOAD_MODE_AUTO also enables mmap in the loader (see
+    // llama_model_loader::use_mmap), so it must be overridden here as well:
+    // memory buffers have no backing file, and the incremental split path
+    // never populates `mappings`.
+    if (params.load_mode == LLAMA_LOAD_MODE_MMAP || params.load_mode == LLAMA_LOAD_MODE_MMAP_MLOCK ||
+        params.load_mode == LLAMA_LOAD_MODE_AUTO) {
         LLAMA_LOG_WARN("Overriding and disabling memory mapping when loading from memory buffer\n");
         params.load_mode = params.load_mode == LLAMA_LOAD_MODE_MMAP_MLOCK ? LLAMA_LOAD_MODE_MLOCK
                                                                           : LLAMA_LOAD_MODE_NONE;
