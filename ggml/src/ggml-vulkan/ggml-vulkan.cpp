@@ -170,6 +170,9 @@ void ggml_vk_print_device_fault_info(const vk_device& device) {
     fault_info.sType = VK_STRUCTURE_TYPE_DEVICE_FAULT_INFO_EXT;
     fault_info.pAddressInfos = address_infos.data();
     fault_info.pVendorInfos = vendor_infos.data();
+    // if fault_info.pVendorBinaryData is needed, then remove the following line,
+    // otherwise if fault_counts.vendorBinarySize != 0 then fault_info.pVendorBinaryData must not be null.
+    fault_counts.vendorBinarySize = 0;
 
     res = device->pfn_vkGetDeviceFaultInfoEXT(device->device, &fault_counts, &fault_info);
     if (res != VK_SUCCESS) {
