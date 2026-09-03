@@ -1337,11 +1337,16 @@ static ggml_backend_buffer_t ggml_backend_cuda_host_buffer_type_alloc_buffer(ggm
 }
 
 ggml_backend_buffer_type_t ggml_backend_cuda_host_buffer_type() {
-    // QVAC-23763: on a host whose every CUDA device was skipped the registry is
-    // empty, which could not happen before this change. ggml_backend_reg_dev_get
-    // would then hit its GGML_ASSERT and abort - the exact failure mode this
-    // change exists to remove. Returning null lets the caller fall back to an
-    // unpinned host buffer instead.
+    // QVAC-23763: with an empty CUDA registry ggml_backend_reg_dev_get hits its
+    // GGML_ASSERT and aborts - the exact failure mode this change exists to
+    // remove. Returning null lets the caller fall back to an unpinned host
+    // buffer instead.
+    //
+    // Skipping every device is one way to get an empty registry, but not the
+    // first: ggml_cuda_init() already returns device_count == 0 when
+    // cudaGetDeviceCount fails, so a driverless host reached the same abort
+    // before this change. The guard is a pre-existing fix and belongs upstream
+    // rather than only here.
     //
     // Not reachable through ggml_backend_dev_host_buffer_type(), which needs a
     // device and so implies the registry is non-empty; reachable through this
@@ -4292,7 +4297,11 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
     ggml_cuda_stream_context & stream_context = cuda_ctx->stream_context();
     stream_context.reset();
 
-    if (!use_cuda_graph || ggml_backend_cuda_get_device_count() != 1) {
+    // QVAC-23763: the registry, not ggml_backend_cuda_get_device_count(), which
+    // stays unfiltered and so still counts devices that were skipped for having
+    // no compiled kernels. On a host with one supported card behind an
+    // unsupported one the count reads 2 and this bails on the single usable GPU.
+    if (!use_cuda_graph || ggml_backend_reg_dev_count(ggml_backend_cuda_reg()) != 1) {
         return;
     }
 
@@ -5519,8 +5528,15 @@ ggml_backend_reg_t ggml_backend_cuda_reg() {
                 // All virtual devices on one card read the same props, so they
                 // share a cc and are skipped or kept as a group.
                 if (!ggml_cuda_compiled_code_available(cc)) {
-                    GGML_LOG_WARN("%s: skipping device %d (%s): no kernels compiled for compute capability %d.%d\n",
-                                  __func__, i, ggml_cuda_device_description(i).c_str(), cc / 100, (cc % 100) / 10);
+                    // once per physical card: every virtual device on one card
+                    // reads the same props, so N of these would be N copies of
+                    // one fact. The id is the physical one, which is what
+                    // nvidia-smi shows; ggml_cuda_device_description() carries
+                    // the virtual index when there is one.
+                    if (info.devices[i].virtual_index == 0) {
+                        GGML_LOG_WARN("%s: skipping physical device %d (%s): no kernels compiled for compute capability %d.%d\n",
+                                      __func__, physical_id, ggml_cuda_device_description(i).c_str(), cc / 100, (cc % 100) / 10);
+                    }
                     continue;
                 }
 
