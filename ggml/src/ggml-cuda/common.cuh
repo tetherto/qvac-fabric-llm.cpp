@@ -197,15 +197,26 @@ static int ggml_cuda_highest_compiled_arch(const int arch) {
 // the ceiling instead would break the stock build, whose list ends in 90-virtual
 // precisely so that newer cards JIT forward.
 //
-// So an all-real list still aborts at the first launch for a card above its
-// ceiling, exactly as it did before this guard. Not hypothetical in this repo:
+// So a card the list does not really cover can still be kept, and there are two
+// ways in, not one.
+//
+// Above the ceiling: an all-real list still aborts at the first launch, exactly
+// as it did before this guard. Not hypothetical in this repo:
 // .github/workflows/build-cuda-ubuntu.yml builds with
 // -DCMAKE_CUDA_ARCHITECTURES=89-real, a single real arch with no PTX at all, so
 // under that build an sm_120 device passes here and then fails with
-// cudaErrorNoKernelImageForDevice. Any size-trimmed consumer arch list has the
-// same exposure at its top end.
+// cudaErrorNoKernelImageForDevice.
 //
-// Closing that direction needs a real loadability probe (a no-op kernel launch,
+// In the middle: a cubin runs only on a higher minor of the SAME major, so a
+// -real-only region that spans a major version has the same hole. With
+// 75-real;90-real an sm_86 device resolves to 750, passes here, and fails the
+// same way.
+//
+// The invariant is therefore two-part, and a size-trimmed consumer list has to
+// hold both ends of it: the lowest entry must be virtual, AND no -real-only
+// region may span a major version.
+//
+// Closing either of those needs a real loadability probe (a no-op kernel launch,
 // or cudaFuncGetAttributes, treating cudaErrorNoKernelImageForDevice as "skip")
 // rather than an arch-list comparison. Out of scope here: this guard covers the
 // below-floor case, which is the one QVAC-23763 hit.
