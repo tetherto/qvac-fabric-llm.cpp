@@ -16,11 +16,17 @@
 #include <map>
 #include <string>
 
+// GGML_CUDA_NAME, and so the registry name, is "ROCm" on HIP and "MUSA" on MUSA.
+// The same source builds all three, and the guard is compiled into all three, so
+// matching only "CUDA" would make those builds skip with hardware present.
 static ggml_backend_reg_t find_cuda_reg() {
+    static const char * const names[] = { "CUDA", "ROCm", "MUSA" };
     for (size_t i = 0; i < ggml_backend_reg_count(); i++) {
         ggml_backend_reg_t reg = ggml_backend_reg_get(i);
-        if (strcmp(ggml_backend_reg_name(reg), "CUDA") == 0) {
-            return reg;
+        for (const char * name : names) {
+            if (strcmp(ggml_backend_reg_name(reg), name) == 0) {
+                return reg;
+            }
         }
     }
     return nullptr;
@@ -96,7 +102,14 @@ int main() {
             fprintf(stderr, "FAIL: every CUDA device was skipped and no CPU or GPU device remains\n");
             fails++;
         } else {
-            printf("all CUDA devices skipped; a non-CUDA fallback device is present\n");
+            // Deliberately not phrased as "all devices were skipped". An empty
+            // registry is also what a machine with no NVIDIA card at all
+            // produces, and nothing here can tell the two apart: skipped
+            // devices leave the registry entirely and the unfiltered count is
+            // not reachable from the public API. Passing this is not evidence
+            // the guard fired. See the note at the end of this file.
+            printf("CUDA registry is empty (no covered device, or no device at all); "
+                   "a non-CUDA fallback device is present\n");
         }
     }
 
