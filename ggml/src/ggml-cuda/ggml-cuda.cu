@@ -5770,7 +5770,7 @@ static void ggml_backend_cuda_device_get_props(ggml_backend_dev_t dev, ggml_back
         /* .buffer_from_host_ptr  = */ false,
         /* .events                = */ events,
         /* .mmap_support          = */ props->type != GGML_BACKEND_DEVICE_TYPE_IGPU,
-        /* .copy_stream           = */ true,
+        /* .copy_stream           = */ events,
     };
 }
 
