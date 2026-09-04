@@ -11248,6 +11248,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // batched: the MoE router backward scatters grad [1, n_expert_used, n_tokens] into [1, n_expert, n_tokens]
     test_cases.emplace_back(new test_get_rows_back(GGML_TYPE_F32, 1, 128, 8, 32, false));
     test_cases.emplace_back(new test_get_rows_back(GGML_TYPE_F32, 256, 5, 4, 3, false));
+    // batched + strided rows: the selected-expert ids reach the router backward as a
+    // top_k view of the argsort output (row stride n_expert, not n_expert_used)
+    test_cases.emplace_back(new test_get_rows_back(GGML_TYPE_F32, 1, 128, 16, 32, true));
+    test_cases.emplace_back(new test_get_rows_back(GGML_TYPE_F32, 256, 5, 4, 3, true));
     for (ggml_type type : all_types) {
         for (bool v : {false, true}) {
             test_cases.emplace_back(new test_get_rows_back(type, 256, 5, 4, 1, v));
