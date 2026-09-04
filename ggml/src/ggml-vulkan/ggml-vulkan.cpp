@@ -4127,6 +4127,16 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     ggml_vk_create_pipeline(device, device->pipeline_mul_mat_id_back_a_f32, "mul_mat_id_back_a_f32", mul_mat_id_back_a_f32_len, mul_mat_id_back_a_f32_data, "main", 4, sizeof(vk_op_mul_mat_id_back_a_push_constants), {1, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_mul_mat_id_back_b_f32, "mul_mat_id_back_b_f32", mul_mat_id_back_b_f32_len, mul_mat_id_back_b_f32_data, "main", 4, sizeof(vk_op_mul_mat_id_back_b_push_constants), {1, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_mul_mat_id_back_b_q8_0, "mul_mat_id_back_b_q8_0", mul_mat_id_back_b_q8_0_len, mul_mat_id_back_b_q8_0_data, "main", 4, sizeof(vk_op_mul_mat_id_back_b_push_constants), {1, 1, 1}, {}, 1, true);
+#define CREATE_MMID_BACK_B_QUANT(TYPE, tname) \
+    ggml_vk_create_pipeline(device, device->pipeline_mul_mat_id_back_b_quant[TYPE], "mul_mat_id_back_b_" #tname, mul_mat_id_back_b_##tname##_len, mul_mat_id_back_b_##tname##_data, "main", 4, sizeof(vk_op_mul_mat_id_back_b_push_constants), {1, 1, 1}, {}, 1, true);
+    CREATE_MMID_BACK_B_QUANT(GGML_TYPE_Q4_0, q4_0)
+    CREATE_MMID_BACK_B_QUANT(GGML_TYPE_Q4_1, q4_1)
+    CREATE_MMID_BACK_B_QUANT(GGML_TYPE_Q5_0, q5_0)
+    CREATE_MMID_BACK_B_QUANT(GGML_TYPE_Q5_1, q5_1)
+    CREATE_MMID_BACK_B_QUANT(GGML_TYPE_Q4_K, q4_k)
+    CREATE_MMID_BACK_B_QUANT(GGML_TYPE_Q5_K, q5_k)
+    CREATE_MMID_BACK_B_QUANT(GGML_TYPE_Q6_K, q6_k)
+#undef CREATE_MMID_BACK_B_QUANT
 
     for (uint32_t i = 0; i < num_argsort_pipelines; ++i) {
         uint32_t BLOCK_SIZE = 1u << std::min(i, device->max_workgroup_size_log2);
@@ -10581,6 +10591,7 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
         if (src1->type == GGML_TYPE_F32 && src2->type == GGML_TYPE_I32 && dst->type == GGML_TYPE_F32) {
             if (src0->type == GGML_TYPE_F32)  return ctx->device->pipeline_mul_mat_id_back_b_f32;
             if (src0->type == GGML_TYPE_Q8_0) return ctx->device->pipeline_mul_mat_id_back_b_q8_0;
+            return ctx->device->pipeline_mul_mat_id_back_b_quant[src0->type];
         }
         return nullptr;
     case GGML_OP_SUM:
@@ -17926,9 +17937,28 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
             return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 && op->src[2]->type == GGML_TYPE_I32 &&
                    op->type == GGML_TYPE_F32;
         case GGML_OP_MUL_MAT_ID_BACK_B:
-            return (op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_Q8_0) &&
-                   op->src[1]->type == GGML_TYPE_F32 && op->src[2]->type == GGML_TYPE_I32 &&
-                   op->type == GGML_TYPE_F32;
+            {
+                bool as_ok = false;
+                switch (op->src[0]->type) {
+                    case GGML_TYPE_F32:
+                    case GGML_TYPE_Q8_0:
+                        as_ok = true;
+                        break;
+                    case GGML_TYPE_Q4_0:
+                    case GGML_TYPE_Q4_1:
+                    case GGML_TYPE_Q5_0:
+                    case GGML_TYPE_Q5_1:
+                    case GGML_TYPE_Q4_K:
+                    case GGML_TYPE_Q5_K:
+                    case GGML_TYPE_Q6_K:
+                        as_ok = ggml_is_contiguous(op->src[0]);
+                        break;
+                    default:
+                        break;
+                }
+                return as_ok && op->src[1]->type == GGML_TYPE_F32 && op->src[2]->type == GGML_TYPE_I32 &&
+                       op->type == GGML_TYPE_F32;
+            }
         case GGML_OP_SILU_BACK:
         case GGML_OP_GELU_BACK:
         case GGML_OP_GEGLU_BACK:

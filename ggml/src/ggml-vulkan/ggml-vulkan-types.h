@@ -1012,6 +1012,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_mul_mat_id_back_a_f32;
     vk_pipeline pipeline_mul_mat_id_back_b_f32;
     vk_pipeline pipeline_mul_mat_id_back_b_q8_0;
+    vk_pipeline pipeline_mul_mat_id_back_b_quant[GGML_TYPE_COUNT];
     vk_pipeline pipeline_argmax_f32;
     vk_pipeline pipeline_count_equal_i32;
     vk_pipeline pipeline_dsv4_hc_comb_f32;

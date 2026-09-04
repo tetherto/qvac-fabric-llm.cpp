@@ -1402,6 +1402,11 @@ void process_shaders() {
     string_to_spv("mul_mat_id_back_a_f32", "mul_mat_id_back_a.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}}));
     string_to_spv("mul_mat_id_back_b_f32", "mul_mat_id_back_b.comp", merge_maps(base_dict, {{"DATA_A_F32", "1"}}));
     string_to_spv("mul_mat_id_back_b_q8_0", "mul_mat_id_back_b.comp", merge_maps(base_dict, {{"DATA_A_Q8_0", "1"}}));
+    // element-wise dequant variants for the other block quants used as MoE expert weights
+    for (const std::string tname : {"q4_0", "q4_1", "q5_0", "q5_1", "q4_k", "q5_k", "q6_k"}) {
+        const std::string data_a_key = "DATA_A_" + to_uppercase(tname);
+        string_to_spv("mul_mat_id_back_b_" + tname, "mul_mat_id_back_b.comp", merge_maps(base_dict, {{data_a_key, "1"}}));
+    }
 
     string_to_spv("argsort_f32", "argsort.comp", {{"A_TYPE", "float"}});
     string_to_spv("argsort_large_f32", "argsort_large.comp", {{"A_TYPE", "float"}});

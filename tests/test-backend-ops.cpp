@@ -12662,11 +12662,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat_id_back_a(GGML_TYPE_F32, 4,  1,  b, 16, 17, 31));
     }
 
-    for (ggml_type type_as : {GGML_TYPE_F32, GGML_TYPE_Q8_0}) {
+    for (ggml_type type_as : {GGML_TYPE_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, GGML_TYPE_Q5_1}) {
         for (bool b : {false, true}) {
             test_cases.emplace_back(new test_mul_mat_id_back_b(type_as, 8,  2,  b, 32, 32, 32));
             test_cases.emplace_back(new test_mul_mat_id_back_b(type_as, 16, 16, b, 50, 200, 64));
             test_cases.emplace_back(new test_mul_mat_id_back_b(type_as, 4,  1,  b, 16, 17, 32));
+        }
+    }
+
+    for (ggml_type type_as : {GGML_TYPE_Q4_K, GGML_TYPE_Q6_K}) {
+        for (bool b : {false, true}) {
+            test_cases.emplace_back(new test_mul_mat_id_back_b(type_as, 8,  2,  b, 32, 32, 256));
+            test_cases.emplace_back(new test_mul_mat_id_back_b(type_as, 16, 16, b, 50, 200, 512));
         }
     }
 
