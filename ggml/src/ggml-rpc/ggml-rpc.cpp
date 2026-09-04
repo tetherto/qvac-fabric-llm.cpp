@@ -3533,6 +3533,7 @@ static void ggml_backend_rpc_device_get_props(ggml_backend_dev_t dev, struct ggm
         /* .buffer_from_host_ptr  = */ false,
         /* .events                = */ true,
         /* .mmap_support          = */ true,
+        /* .copy_stream           = */ false,
     };
 }
 

@@ -396,6 +396,7 @@ struct cmd_params {
     std::vector<std::vector<llama_model_tensor_buft_override>> tensor_buft_overrides;
     std::vector<bool>                embeddings;
     std::vector<bool>                no_op_offload;
+    std::vector<bool>                prefetch_weights;
     std::vector<bool>                no_host;
     std::vector<bool>                repack;
     std::vector<size_t>              fit_params_target;
@@ -442,6 +443,7 @@ static const cmd_params cmd_params_defaults = {
     /* tensor_buft_overrides*/ { std::vector<llama_model_tensor_buft_override>{ { nullptr, nullptr } } },
     /* embeddings           */ { false },
     /* no_op_offload        */ { false },
+    /* prefetch_weights     */ { false },
     /* no_host              */ { false },
     /* repack               */ { llama_model_default_params().use_extra_bufts },
     /* fit_params_target    */ { 0 },
@@ -517,6 +519,7 @@ static void print_usage(int /* argc */, char ** argv) {
     printf("  -ot --override-tensor <tensor name pattern>=<buffer type>;...\n");
     printf("                                                    (default: disabled)\n");
     printf("  -nopo, --no-op-offload <0|1>                      (default: 0)\n");
+    printf("  -pw, --prefetch-weights <0|1>                     (default: 0)\n");
     printf("  --no-host <0|1>                                   (default: %s)\n", join(cmd_params_defaults.no_host, ",").c_str());
     printf("  --repack <0|1>                                    (default: %s)\n", join(cmd_params_defaults.repack, ",").c_str());
     printf("\n");
@@ -947,6 +950,13 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                 }
                 auto p = string_split<bool>(argv[i], split_delim);
                 params.no_op_offload.insert(params.no_op_offload.end(), p.begin(), p.end());
+            } else if (arg == "-pw" || arg == "--prefetch-weights") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                auto p = string_split<bool>(argv[i], split_delim);
+                params.prefetch_weights.insert(params.prefetch_weights.end(), p.begin(), p.end());
             } else if (arg == "--no-host") {
                 if (++i >= argc) {
                     invalid_param = true;
@@ -1225,6 +1235,9 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
     if (params.no_op_offload.empty()) {
         params.no_op_offload = cmd_params_defaults.no_op_offload;
     }
+    if (params.prefetch_weights.empty()) {
+        params.prefetch_weights = cmd_params_defaults.prefetch_weights;
+    }
     if (params.no_host.empty()) {
         params.no_host = cmd_params_defaults.no_host;
     }
@@ -1279,6 +1292,7 @@ struct cmd_params_instance {
     std::vector<llama_model_tensor_buft_override> tensor_buft_overrides;
     bool               embeddings;
     bool               no_op_offload;
+    bool               prefetch_weights;
     bool               no_host;
     bool               repack;
     size_t             fit_target;
@@ -1359,6 +1373,7 @@ struct cmd_params_instance {
         cparams.flash_attn_type = flash_attn;
         cparams.embeddings      = embeddings;
         cparams.op_offload      = !no_op_offload;
+        cparams.prefetch_weights = prefetch_weights;
         cparams.swa_full        = false;
 
         return cparams;
@@ -1386,6 +1401,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
     for (const auto & rpk : params.repack)
     for (const auto & embd : params.embeddings)
     for (const auto & nopo : params.no_op_offload)
+    for (const auto & pw : params.prefetch_weights)
     for (const auto & nb : params.n_batch)
     for (const auto & nub : params.n_ubatch)
     for (const auto & tk : params.type_k)
@@ -1427,6 +1443,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .tensor_buft_overrides = */ ot,
                 /* .embeddings            = */ embd,
                 /* .no_op_offload         = */ nopo,
+                /* .prefetch_weights      = */ pw,
                 /* .no_host               = */ noh,
                 /* .repack                = */ rpk,
                 /* .fit_target            = */ fpt,
@@ -1465,6 +1482,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .tensor_buft_overrides = */ ot,
                 /* .embeddings            = */ embd,
                 /* .no_op_offload         = */ nopo,
+                /* .prefetch_weights      = */ pw,
                 /* .no_host               = */ noh,
                 /* .repack                = */ rpk,
                 /* .fit_target            = */ fpt,
@@ -1503,6 +1521,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .tensor_buft_overrides = */ ot,
                 /* .embeddings            = */ embd,
                 /* .no_op_offload         = */ nopo,
+                /* .prefetch_weights      = */ pw,
                 /* .no_host               = */ noh,
                 /* .repack                = */ rpk,
                 /* .fit_target            = */ fpt,
@@ -1546,6 +1565,7 @@ struct test {
     std::vector<llama_model_tensor_buft_override> tensor_buft_overrides;
     bool                     embeddings;
     bool                     no_op_offload;
+    bool                     prefetch_weights;
     bool                     no_host;
     bool                     repack;
     size_t                   fit_target;
@@ -1587,6 +1607,7 @@ struct test {
         tensor_buft_overrides = inst.tensor_buft_overrides;
         embeddings     = inst.embeddings;
         no_op_offload  = inst.no_op_offload;
+        prefetch_weights = inst.prefetch_weights;
         no_host        = inst.no_host;
         repack         = inst.repack;
         fit_target     = inst.fit_target;
@@ -1649,7 +1670,7 @@ struct test {
             "main_gpu",       "no_kv_offload",  "flash_attn",    "devices",        "tensor_split",
             "tensor_buft_overrides",            "load_mode",     "lazy_mode",
             "embeddings",
-            "no_op_offload",  "no_host",        "repack",        "fit_target",    "fit_min_ctx",
+            "no_op_offload",  "prefetch_weights", "no_host",      "repack",        "fit_target",    "fit_min_ctx",
             "n_prompt",       "n_gen",          "n_depth",
             "test_time",      "avg_ns",         "stddev_ns",     "avg_ts",         "stddev_ts"
         };
@@ -1662,7 +1683,7 @@ struct test {
         if (field == "build_number" || field == "n_batch" || field == "n_ubatch" || field == "n_threads" ||
             field == "poll" || field == "model_size" || field == "model_n_params" || field == "n_gpu_layers" ||
             field == "main_gpu" || field == "n_prompt" || field == "n_gen" || field == "n_depth" || field == "avg_ns" ||
-            field == "stddev_ns" || field == "no_op_offload" || field == "n_cpu_moe" ||
+            field == "stddev_ns" || field == "no_op_offload" || field == "prefetch_weights" || field == "n_cpu_moe" ||
             field == "fit_target" || field == "fit_min_ctx" || field == "flash_attn") {
             return INT;
         }
@@ -1746,6 +1767,7 @@ struct test {
                                             lazy_mode_str(lazy_mode),
                                             std::to_string(embeddings),
                                             std::to_string(no_op_offload),
+                                            std::to_string(prefetch_weights),
                                             std::to_string(no_host),
                                             std::to_string(repack),
                                             std::to_string(fit_target),
@@ -1938,6 +1960,9 @@ struct markdown_printer : public printer {
         if (field == "no_op_offload") {
             return 4;
         }
+        if (field == "prefetch_weights") {
+            return 2;
+        }
         if (field == "no_host") {
             return 4;
         }
@@ -1977,6 +2002,9 @@ struct markdown_printer : public printer {
         }
         if (field == "no_op_offload") {
             return "nopo";
+        }
+        if (field == "prefetch_weights") {
+            return "pw";
         }
         if (field == "no_host") {
             return "noh";
@@ -2073,6 +2101,9 @@ struct markdown_printer : public printer {
         }
         if (params.no_op_offload.size() > 1 || params.no_op_offload != cmd_params_defaults.no_op_offload) {
             fields.emplace_back("no_op_offload");
+        }
+        if (params.prefetch_weights.size() > 1 || params.prefetch_weights != cmd_params_defaults.prefetch_weights) {
+            fields.emplace_back("prefetch_weights");
         }
         if (params.no_host.size() > 1 || params.no_host != cmd_params_defaults.no_host) {
             fields.emplace_back("no_host");

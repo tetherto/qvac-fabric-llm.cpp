@@ -59,6 +59,7 @@ struct llama_cparams {
     bool training_ctx;       // from llama_context_params: the context is built for training
 
     size_t moe_cache_size;
+    bool prefetch_weights;
 
     std::vector<bool> embeddings_layer_inp; // [n_layer()] extract input embeddings for layer
 
