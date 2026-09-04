@@ -571,6 +571,15 @@ llama_context::llama_context(
         }
 
         if (cparams.moe_cache_size > 0) {
+            if (cparams.training_ctx) {
+                throw std::runtime_error("MoE cache does not support training");
+            }
+            for (auto * backend : backend_ptrs) {
+                ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
+                if (reg != nullptr && std::strcmp(ggml_backend_reg_name(reg), "OpenCL") == 0) {
+                    throw std::runtime_error("MoE cache does not support OpenCL tensor uploads");
+                }
+            }
             moe_cache = std::make_unique<llama_moe_cache>(model, model.no_alloc(), backend_ptrs, backend_buft, cparams.moe_cache_size);
         }
 
