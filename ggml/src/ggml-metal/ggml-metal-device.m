@@ -153,7 +153,8 @@ int ggml_metal_pipeline_thread_execution_width(struct ggml_metal_pipeline_with_p
     X(UPSCALE,         upscale)        \
     X(ARGSORT,         argsort)        \
     X(POOL,            pool)           \
-    X(MISC,            misc)
+    X(MISC,            misc)           \
+    X(OUT_PROD,        out_prod)
 
 enum ggml_metal_lib_kind {
 #define X(e, s) GGML_METAL_LIB_##e,
