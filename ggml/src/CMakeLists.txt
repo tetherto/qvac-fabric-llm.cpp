@@ -348,6 +348,18 @@ else()
     set(GGML_OPENMP_ENABLED "OFF" CACHE INTERNAL "")
 endif()
 
+# The GGML_OPENMP_FETCH helper targets are plain build-tree targets outside
+# the ggml-targets export set; ggml-base and the backends link them PRIVATE,
+# which for static libraries still lands in the exported link interface as
+# $<LINK_ONLY:...>, so install(EXPORT) fails with "requires target
+# ggml-openmp-c that is not in any export set". Wrap them so the installed
+# export drops them; static consumers reconstruct the OpenMP linkage through
+# find_dependency(OpenMP) in ggml-config.cmake.in.
+if (TARGET ggml-openmp-c)
+    set(GGML_OPENMP_TARGET_C   "$<BUILD_INTERFACE:${GGML_OPENMP_TARGET_C}>")
+    set(GGML_OPENMP_TARGET_CXX "$<BUILD_INTERFACE:${GGML_OPENMP_TARGET_CXX}>")
+endif()
+
 if (GGML_OPENMP_ENABLED)
     target_compile_definitions(ggml-base PRIVATE GGML_USE_OPENMP)
     target_link_libraries(ggml-base PRIVATE ${GGML_OPENMP_TARGET_C} ${GGML_OPENMP_TARGET_CXX})
