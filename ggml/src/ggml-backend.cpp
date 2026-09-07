@@ -811,6 +811,7 @@ struct ggml_backend_sched_moe_cache_entry {
 struct ggml_backend_sched {
     bool is_reset; // true if the scheduler has been reset since the last graph split
     bool is_alloc;
+    bool has_error;
 
     int n_backends;
 
@@ -990,7 +991,9 @@ static int ggml_backend_sched_backend_id_from_cur(ggml_backend_sched_t sched, st
     if (tensor->buffer || (tensor->view_src && tensor->view_src->buffer)) {
         // since the tensor is pre-allocated, it cannot be moved to another backend
         ggml_backend_buffer_t buffer = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
-        GGML_ABORT("pre-allocated tensor (%s) in a buffer (%s) that cannot run the operation (%s)", tensor->name, ggml_backend_buffer_name(buffer), ggml_op_name(tensor->op));
+        GGML_LOG_ERROR("%s: pre-allocated tensor (%s) in a buffer (%s) cannot run the operation (%s)\n", __func__, tensor->name, ggml_backend_buffer_name(buffer), ggml_op_name(tensor->op));
+        sched->has_error = true;
+        return -1;
     }
 
     // graph input
@@ -1123,7 +1126,7 @@ static void ggml_backend_sched_set_if_supported(ggml_backend_sched_t sched, stru
 }
 
 // assigns backends to ops and splits the graph into subgraphs that can be computed on the same backend
-void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
+bool ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
     // Invariants the inlined hash-set bitset accesses below assume; observed NULL on iOS
     // (iPhone 17 Gemma 4 mtmd path) crashing at ggml_bitset_get's ldr [used + idx*4].
     GGML_ASSERT(sched->hash_set.used != NULL);
@@ -1134,6 +1137,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
     sched->n_graph_inputs = 0;
     sched->n_moe_cache_entries = 0;
     sched->is_reset = false;
+    sched->has_error = false;
 
     struct ggml_init_params params = {
         /* .mem_size =   */ sched->context_buffer_size,
@@ -1157,6 +1161,9 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
         // do not overwrite user assignments
         if (*leaf_backend_id == -1) {
             *leaf_backend_id = ggml_backend_sched_backend_id_from_cur(sched, leaf);
+            if (sched->has_error) {
+                return false;
+            }
         }
     }
 
@@ -1166,6 +1173,9 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
         // do not overwrite user assignments
         if (*node_backend_id == -1) {
             *node_backend_id = ggml_backend_sched_backend_id_from_cur(sched, node);
+            if (sched->has_error) {
+                return false;
+            }
 
 #if 0
             // src
@@ -1357,7 +1367,11 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
         for (int b = 0; b < sched->n_backends && *cur_backend_id == -1; b++) {
             ggml_backend_sched_set_if_supported(sched, node, b, cur_backend_id);
         }
-        GGML_ASSERT(*cur_backend_id != -1);
+        if (*cur_backend_id == -1) {
+            GGML_LOG_ERROR("%s: unable to assign a backend for tensor (%s), operation (%s)\n", __func__, node->name, ggml_op_name(node->op));
+            sched->has_error = true;
+            return false;
+        }
     }
 
     // pass 5: split graph, find tensors that need to be copied
@@ -1674,6 +1688,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
     for (int i = 0; i < sched->n_splits; ++i) {
         sched->splits[i].graph.uid = ggml_graph_next_uid();
     }
+    return true;
 }
 
 static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
@@ -2097,9 +2112,10 @@ void ggml_backend_sched_reset(ggml_backend_sched_t sched) {
         sched->is_reset = true;
     }
     sched->is_alloc = false;
+    sched->has_error = false;
 }
 
-void ggml_backend_sched_reserve_size(ggml_backend_sched_t sched, struct ggml_cgraph * measure_graph, size_t * sizes) {
+bool ggml_backend_sched_reserve_size(ggml_backend_sched_t sched, struct ggml_cgraph * measure_graph, size_t * sizes) {
     GGML_ASSERT(sched);
     GGML_ASSERT((int)sched->hash_set.size >= measure_graph->n_nodes + measure_graph->n_leafs);
     GGML_ASSERT(sizes);
@@ -2108,9 +2124,12 @@ void ggml_backend_sched_reserve_size(ggml_backend_sched_t sched, struct ggml_cgr
 
     ggml_backend_sched_synchronize(sched);
 
-    ggml_backend_sched_split_graph(sched, measure_graph);
+    if (!ggml_backend_sched_split_graph(sched, measure_graph)) {
+        return false;
+    }
 
     ggml_gallocr_reserve_n_size(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids, sizes);
+    return true;
 }
 
 bool ggml_backend_sched_reserve(ggml_backend_sched_t sched, struct ggml_cgraph * measure_graph) {
@@ -2123,7 +2142,9 @@ bool ggml_backend_sched_reserve(ggml_backend_sched_t sched, struct ggml_cgraph *
 
     ggml_backend_sched_synchronize(sched);
 
-    ggml_backend_sched_split_graph(sched, measure_graph);
+    if (!ggml_backend_sched_split_graph(sched, measure_graph)) {
+        return false;
+    }
 
     if (!ggml_gallocr_reserve_n(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids)) {
         return false;
@@ -2142,7 +2163,9 @@ bool ggml_backend_sched_alloc_graph(ggml_backend_sched_t sched, struct ggml_cgra
     sched->cur_copy = sched->next_copy;
     sched->next_copy = (sched->next_copy + 1) % sched->n_copies;
 
-    ggml_backend_sched_split_graph(sched, graph);
+    if (!ggml_backend_sched_split_graph(sched, graph)) {
+        return false;
+    }
 
     if (!ggml_backend_sched_alloc_splits(sched)) {
         return false;
