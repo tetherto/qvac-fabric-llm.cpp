@@ -49,13 +49,19 @@ env:
   LLAMA_ARG_LOG_TIMESTAMPS: 1
   LLAMA_ARG_LOG_VERBOSITY: 10
 
-# QVAC divergence from upstream: dedupe per PR and per branch, so a re-push or
-# re-dispatch supersedes the in-flight run. The default branch deliberately
-# keeps upstream's run_id behaviour — master pushes must not cancel each other,
-# and this workflow's dispatch takes a `sha` input, so two builds of different
-# commits from master must not cancel each other either. See QVAC-24627.
+# QVAC divergence from upstream. Reachable outcomes:
+#
+#   pull_request                 -> per PR   (supersedes)
+#   workflow_dispatch with `sha` -> per sha  (re-dispatching the SAME commit
+#                                   supersedes; two commits coexist)
+#   push to master               -> per run  (run_id; never cancels)
+#   dispatch on another ref, no sha -> per ref (supersedes)
+#
+# The `sha` arm is load-bearing: without it, two dispatches of different
+# commits from the same non-master ref share a group and cancel each other.
+# See QVAC-24627.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || (github.ref == 'refs/heads/master' && github.run_id) || github.ref }}
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.event.inputs.sha || (github.ref == 'refs/heads/master' && github.run_id) || github.ref }}
   cancel-in-progress: true
 
 jobs:
