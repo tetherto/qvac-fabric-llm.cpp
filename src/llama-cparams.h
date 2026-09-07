@@ -2,6 +2,7 @@
 
 #include "llama.h"
 
+#include <cstddef>
 #include <cstdint>
 #include <vector>
 
@@ -53,6 +54,8 @@ struct llama_cparams {
     bool kv_unified;
     bool pipeline_parallel;
     bool training;
+
+    size_t moe_cache_size;
 
     std::vector<bool> embeddings_layer_inp; // [n_layer()] extract input embeddings for layer
 

@@ -880,8 +880,9 @@ extern "C" {
 
     GGML_API void * ggml_new_buffer(struct ggml_context * ctx, size_t nbytes);
 
-    GGML_API struct ggml_tensor * ggml_dup_tensor (struct ggml_context * ctx, const struct ggml_tensor * src);
-    GGML_API struct ggml_tensor * ggml_view_tensor(struct ggml_context * ctx, struct ggml_tensor * src);
+    GGML_API struct ggml_tensor * ggml_dup_tensor       (struct ggml_context * ctx, const struct ggml_tensor * src);
+    GGML_API struct ggml_tensor * ggml_dup_tensor_layout(struct ggml_context * ctx, const struct ggml_tensor * src);
+    GGML_API struct ggml_tensor * ggml_view_tensor      (struct ggml_context * ctx, struct ggml_tensor * src);
 
     // Context tensor enumeration and lookup
     GGML_API struct ggml_tensor * ggml_get_first_tensor(const struct ggml_context * ctx);

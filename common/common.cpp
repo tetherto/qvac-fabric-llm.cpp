@@ -1760,8 +1760,9 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.training          = params.training;
     cparams.kv_unified        = params.kv_unified;
 
-    cparams.type_k = params.cache_type_k;
-    cparams.type_v = params.cache_type_v;
+    cparams.type_k         = params.cache_type_k;
+    cparams.type_v         = params.cache_type_v;
+    cparams.moe_cache_size = params.moe_cache_size;
 
     return cparams;
 }

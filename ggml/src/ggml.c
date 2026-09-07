@@ -1983,6 +1983,14 @@ struct ggml_tensor * ggml_dup_tensor(struct ggml_context * ctx, const struct ggm
     return ggml_new_tensor(ctx, src->type, GGML_MAX_DIMS, src->ne);
 }
 
+struct ggml_tensor * ggml_dup_tensor_layout(struct ggml_context * ctx, const struct ggml_tensor * src) {
+    struct ggml_tensor * result = ggml_dup_tensor(ctx, src);
+    for (int i = 0; i < GGML_MAX_DIMS; ++i) {
+        result->nb[i] = src->nb[i];
+    }
+    return result;
+}
+
 void ggml_unravel_index(const struct ggml_tensor * tensor, int64_t i, int64_t * i0, int64_t * i1, int64_t * i2, int64_t * i3) {
     const int64_t ne2 = tensor->ne[2];
     const int64_t ne1 = tensor->ne[1];
