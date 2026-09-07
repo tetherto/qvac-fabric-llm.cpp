@@ -1132,7 +1132,6 @@ bool ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
     GGML_ASSERT(sched->hash_set.used != NULL);
     GGML_ASSERT(sched->hash_set.keys != NULL);
 
-bool ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
     // reset splits
     sched->n_splits = 0;
     sched->n_graph_inputs = 0;
@@ -1689,6 +1688,7 @@ bool ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
     for (int i = 0; i < sched->n_splits; ++i) {
         sched->splits[i].graph.uid = ggml_graph_next_uid();
     }
+    return true;
 }
 
 static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
