@@ -241,6 +241,10 @@ struct ggml_backend_registry {
             return nullptr;
         }
 
+        return load_backend(path, silent, std::move(handle));
+    }
+
+    ggml_backend_reg_t load_backend(const fs::path & path, bool silent, dl_handle_ptr handle) {
         auto backend_init_fn = (ggml_backend_init_t) dl_get_sym(handle.get(), "ggml_backend_init");
         if (!backend_init_fn) {
             if (!silent) {
@@ -507,10 +511,11 @@ static ggml_backend_reg_t ggml_backend_load_best(const char * name, bool silent,
 
     int best_score = 0;
     fs::path best_path;
+    dl_handle_ptr   best_handle;
     std::error_code ec;
 
-    auto tryEntryWithScore = [&best_score, &best_path, silent, _func = __func__](const fs::path & entryPath,
-                                                                                 int              scoreOffset = 1) {
+    auto tryEntryWithScore = [&best_score, &best_path, &best_handle, silent, _func = __func__](
+                                 const fs::path & entryPath, int scoreOffset = 1) {
         dl_handle_ptr handle{ dl_load_library(entryPath) };
         if (!handle && !silent) {
             GGML_LOG_ERROR("%s: failed to load %s: %s\n", _func, path_str(entryPath).c_str(), dl_error());
@@ -519,7 +524,11 @@ static ggml_backend_reg_t ggml_backend_load_best(const char * name, bool silent,
             auto score_fn = (ggml_backend_score_t) dl_get_sym(handle.get(), "ggml_backend_score");
             int  s        = 1;
             if (score_fn) {
-                s = score_fn() + scoreOffset;
+                const int backend_score = score_fn();
+                if (backend_score == 0) {
+                    return;
+                }
+                s = backend_score + scoreOffset;
             }
 #ifdef NDEBUG
             GGML_LOG_DEBUG("%s: %s score: %d\n", _func, path_str(entryPath).c_str(), s);
@@ -527,6 +536,7 @@ static ggml_backend_reg_t ggml_backend_load_best(const char * name, bool silent,
             if (s > best_score) {
                 best_score = s;
                 best_path  = entryPath;
+                best_handle = std::move(handle);
             }
         }
     };
@@ -589,7 +599,10 @@ static ggml_backend_reg_t ggml_backend_load_best(const char * name, bool silent,
         }
     }
 
-    return get_reg().load_backend(best_path, silent);
+    if (!best_handle) {
+        return nullptr;
+    }
+    return get_reg().load_backend(best_path, silent, std::move(best_handle));
 }
 
 void ggml_backend_load_all() {

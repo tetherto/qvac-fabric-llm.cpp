@@ -1,6 +1,5 @@
-// Pins the CUDA arch-availability registration guard: devices with no compiled
-// kernels for their compute capability are skipped in ggml_backend_cuda_reg(),
-// and everything downstream must cope with the registry holding a subset.
+// Pins CUDA availability registration: devices this build cannot serve are
+// skipped in ggml_backend_cuda_reg(), and downstream code must accept a subset.
 //
 // Regression fixture for QVAC-23763 / tetherto/qvac#4171. Before the guard, a
 // card below the compiled floor enumerated, won backend selection over Vulkan,
