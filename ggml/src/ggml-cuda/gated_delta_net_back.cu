@@ -283,7 +283,7 @@ gated_delta_net_back_cuda(const float * data_q_ptr,
                 }
 
                 for (int t = int(n_tokens) - 1; t >= 0; t--) {
-                    const uint32_t ut = uint(t);
+                    const uint32_t ut       = static_cast<uint32_t>(t);
                     const uint32_t q_off  = iq3 * args.sq3 + ut * args.sq2 + iq1 * args.sq1;
                     const uint32_t k_off  = q_off;
                     const uint32_t gb_off = iv3 * args.sb3 + ut * args.sb2 + iv1 * args.sb1;
@@ -604,32 +604,31 @@ ggml_cuda_op_gated_delta_net_back(ggml_backend_cuda_context & ctx, ggml_tensor *
         
     cudaStream_t stream = ctx.stream();
 
-    const ggml_cuda_gated_delta_net_back_kargs kargs = {
-        .H           = H,
-        .n_tokens    = n_tokens,
-        .n_seqs      = n_seqs,
-        .K           = static_cast<uint32_t>(ggml_get_op_params_i32(dst, 0)),
-        .s_off       = (S_v * H * n_tokens * n_seqs),
-        .sq1         = nbq1 / fsz,
-        .sq2         = nbq2 / fsz,
-        .sq3         = nbq3 / fsz,
-        .sv1         = nbv1 / fsz,
-        .sv2         = nbv2 / fsz,
-        .sv3         = nbv3 / fsz,
-        .sb1         = nbb1 / fsz,
-        .sb2         = nbb2 / fsz,
-        .sb3         = nbb3 / fsz,
-        .neq1        = neq1,
-        .rq3         = nev3 / neq3,
-        .off_dk      = off_dk,
-        .off_dv      = off_dv,
-        .off_dg      = off_dg,     
-        .off_db      = off_db,     
-        .off_ds      = off_ds,     
-        .off_scratch = off_scratch,
-        .wg_stride   = n_tokens * (2*S_v*S_v + 2*S_v),
-        .scale       = 1.0f / sqrtf((float) S_v),
-    };
+    ggml_cuda_gated_delta_net_back_kargs kargs{};
+    kargs.H           = H;
+    kargs.n_tokens    = n_tokens;
+    kargs.n_seqs      = n_seqs;
+    kargs.K           = static_cast<uint32_t>(ggml_get_op_params_i32(dst, 0));
+    kargs.s_off       = S_v * H * n_tokens * n_seqs;
+    kargs.sq1         = nbq1 / fsz;
+    kargs.sq2         = nbq2 / fsz;
+    kargs.sq3         = nbq3 / fsz;
+    kargs.sv1         = nbv1 / fsz;
+    kargs.sv2         = nbv2 / fsz;
+    kargs.sv3         = nbv3 / fsz;
+    kargs.sb1         = nbb1 / fsz;
+    kargs.sb2         = nbb2 / fsz;
+    kargs.sb3         = nbb3 / fsz;
+    kargs.neq1        = neq1;
+    kargs.rq3         = nev3 / neq3;
+    kargs.off_dk      = off_dk;
+    kargs.off_dv      = off_dv;
+    kargs.off_dg      = off_dg;
+    kargs.off_db      = off_db;
+    kargs.off_ds      = off_ds;
+    kargs.off_scratch = off_scratch;
+    kargs.wg_stride   = n_tokens * (2 * S_v * S_v + 2 * S_v);
+    kargs.scale       = 1.0f / sqrtf((float) S_v);
     if (kda) {
         launch_gated_delta_net_back<true>(q_d, k_d, v_d, g_d, b_d, s_d, d_d, dst_d,
                                           S_v, neq3, kargs, stream);
