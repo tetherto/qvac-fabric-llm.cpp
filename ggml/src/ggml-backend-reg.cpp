@@ -1,17 +1,19 @@
+#include "ggml-backend-dl.h"
 #include "ggml-backend-impl.h"
 #include "ggml-backend.h"
-#include "ggml-backend-dl.h"
 #include "ggml-impl.h"
+
 #include <algorithm>
+#include <cctype>
 #include <cstring>
 #include <filesystem>
 #include <limits>
 #include <memory>
+#include <regex>
 #include <string>
 #include <type_traits>
+#include <unordered_set>
 #include <vector>
-#include <cctype>
-#include <regex>
 
 #ifdef _WIN32
 #    define WIN32_LEAN_AND_MEAN
@@ -513,9 +515,35 @@ static ggml_backend_reg_t ggml_backend_load_best(const char * name, bool silent,
     fs::path best_path;
     dl_handle_ptr   best_handle;
     std::error_code ec;
+    std::unordered_set<std::string> attempted_paths;
 
-    auto tryEntryWithScore = [&best_score, &best_path, &best_handle, silent, _func = __func__](
-                                 const fs::path & entryPath, int scoreOffset = 1) {
+    auto markAttempted = [&attempted_paths](const fs::path & path, bool name_only) {
+        std::string key;
+        if (name_only) {
+            key = "name:" + path_str(path);
+        } else {
+            std::error_code path_ec;
+            fs::path        canonical_path = fs::weakly_canonical(path, path_ec);
+            if (path_ec) {
+                path_ec.clear();
+                canonical_path = fs::absolute(path, path_ec);
+            }
+            if (path_ec) {
+                canonical_path = path;
+            }
+            key = "path:" + path_str(canonical_path.lexically_normal());
+        }
+#ifdef _WIN32
+        std::transform(key.begin(), key.end(), key.begin(), [](unsigned char c) { return std::tolower(c); });
+#endif
+        return attempted_paths.insert(std::move(key)).second;
+    };
+
+    auto tryEntryWithScore = [&best_score, &best_path, &best_handle, &markAttempted, silent, _func = __func__](
+                                 const fs::path & entryPath, int scoreOffset = 1, bool name_only = false) {
+        if (!markAttempted(entryPath, name_only)) {
+            return;
+        }
         dl_handle_ptr handle{ dl_load_library(entryPath) };
         if (!handle && !silent) {
             GGML_LOG_ERROR("%s: failed to load %s: %s\n", _func, path_str(entryPath).c_str(), dl_error());
@@ -569,7 +597,9 @@ static ggml_backend_reg_t ggml_backend_load_best(const char * name, bool silent,
             fs::path filename = backend_filename_prefix().native() + name_path.native() + backend_filename_extension().native();
             fs::path path = search_path / filename;
             if (std::error_code ec; fs::exists(path, ec)) {
-                return get_reg().load_backend(path, silent);
+                if (markAttempted(path, false)) {
+                    return get_reg().load_backend(path, silent);
+                }
             } else {
                 if (ec) {
                     GGML_LOG_DEBUG("%s: posix_stat(%s) failure, error-message: %s\n", __func__, path_str(path).c_str(), ec.message().c_str());
@@ -595,7 +625,7 @@ static ggml_backend_reg_t ggml_backend_load_best(const char * name, bool silent,
             // Try loading backend with just the library name, leave to dlopen path resolution.
             fs::path     filename     = backend_filename_prefix().native() + loopNamePath.native() +
                                 backend_filename_extension().native();
-            tryEntryWithScore(filename, 1+scoreOffset);
+            tryEntryWithScore(filename, 1 + scoreOffset, true);
         }
     }
 
