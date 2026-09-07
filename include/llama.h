@@ -409,6 +409,7 @@ extern "C" {
                           // ref: https://github.com/ggml-org/llama.cpp/pull/14363
 
         bool prefetch_weights; // prefetch weight transfers to overlap CPU->GPU copies with compute
+        bool moe_cache_auto;   // MoE cache size was selected automatically by --fit
 
         // [EXPERIMENTAL]
         // backend sampler chain configuration (make sure the caller keeps the sampler chains alive)

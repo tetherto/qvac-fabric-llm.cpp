@@ -209,7 +209,8 @@ struct llama_moe_cache::impl {
             const llama_model & model,
             ggml_backend_t backend,
             ggml_backend_buffer_type_t buft,
-            size_t requested_size) :
+            size_t requested_size,
+            bool automatic) :
         backend(backend),
         no_alloc(model.hparams.no_alloc),
         lru(model.layers.size(), model.hparams.n_expert, 1),
@@ -336,6 +337,10 @@ struct llama_moe_cache::impl {
             n_slots = candidate;
         }
         if (n_slots < int32_t(model.hparams.n_expert_used)) {
+            if (automatic) {
+                LLAMA_LOG_INFO("llama_moe_cache: fitted budget is smaller than one routed layer working set; cache inactive\n");
+                return;
+            }
             throw std::runtime_error("MoE cache budget is smaller than one routed layer working set");
         }
         lru = llama_moe_cache_lru(model.layers.size(), model.hparams.n_expert, n_slots);
@@ -527,8 +532,9 @@ llama_moe_cache::llama_moe_cache(
         const llama_model & model,
         ggml_backend_t backend,
         ggml_backend_buffer_type_t buft,
-        size_t size) :
-    pimpl(new impl(model, backend, buft, size)) {
+        size_t size,
+        bool automatic) :
+    pimpl(new impl(model, backend, buft, size, automatic)) {
 }
 
 llama_moe_cache::~llama_moe_cache() = default;

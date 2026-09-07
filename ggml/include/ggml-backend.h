@@ -384,6 +384,7 @@ extern "C" {
 
     // Enable async weight prefetching to overlap CPU->GPU transfers with compute
     GGML_API void                 ggml_backend_sched_set_prefetch_weights(ggml_backend_sched_t sched, bool enabled);
+    GGML_API void                 ggml_backend_sched_set_prefetch_weights_active(ggml_backend_sched_t sched, bool active);
 
     //
     // Meta backend

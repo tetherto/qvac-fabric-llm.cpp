@@ -275,6 +275,7 @@ llama_context::llama_context(
     cparams.kv_unified       = params.kv_unified;
     cparams.prefetch_weights = params.prefetch_weights;
     cparams.moe_cache_size   = params.moe_cache_size;
+    cparams.moe_cache_auto   = params.moe_cache_auto;
 
     // initialized later
     cparams.pipeline_parallel = false;
@@ -496,7 +497,7 @@ llama_context::llama_context(
             if (cache_backend == nullptr) {
                 throw std::runtime_error("MoE cache requires a GPU backend");
             }
-            moe_cache.reset(new llama_moe_cache(model, cache_backend, cache_buft, cparams.moe_cache_size));
+            moe_cache.reset(new llama_moe_cache(model, cache_backend, cache_buft, cparams.moe_cache_size, cparams.moe_cache_auto));
         }
 
         sched_reserve();
@@ -1383,6 +1384,8 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         ret = GGML_STATUS_FAILED;
         return nullptr;
     }
+
+    ggml_backend_sched_set_prefetch_weights_active(sched.get(), cparams.prefetch_weights && ubatch.n_tokens >= 32);
 
     auto * res = gf_res_prev.get();
     auto * gf  = res->get_gf();
@@ -3802,6 +3805,7 @@ llama_context_params llama_context_default_params() {
         /*.swa_full                    =*/ true,
         /*.kv_unified                  =*/ false,
         /*.prefetch_weights            =*/ false,
+        /*.moe_cache_auto              =*/ false,
         /*.sampler                     =*/ nullptr,
         /*.n_sampler                   =*/ 0,
         /*.ctx_other                   =*/ nullptr,

@@ -580,7 +580,8 @@ struct common_params {
     bool check_tensors     = false; // validate tensor data
     bool no_op_offload     = false; // globally disable offload host tensor operations to device
     bool training          = false; // enable training mode (affects LoRA K/V gradient flow)
-    bool prefetch_weights  = false; // prefetch weight transfers to overlap CPU->GPU copies with compute
+    bool prefetch_weights      = false; // prefetch weight transfers to overlap CPU->GPU copies with compute
+    bool prefetch_weights_auto = true;  // enable weight prefetch when fitting a dense model
     bool no_extra_bufts    = false; // disable extra buffer types (used for weight repacking)
     bool no_host           = false; // bypass host buffer allowing extra buffers to be used
 
@@ -588,7 +589,8 @@ struct common_params {
 
     ggml_type cache_type_k   = GGML_TYPE_F16; // KV cache data type for the K
     ggml_type cache_type_v   = GGML_TYPE_F16; // KV cache data type for the V
-    size_t    moe_cache_size = 0;             // persistent GPU MoE cache size in bytes
+    size_t moe_cache_size = 0; // persistent GPU MoE cache size in bytes
+    bool   moe_cache_auto = true;
 
     common_conversation_mode conversation_mode = COMMON_CONVERSATION_MODE_AUTO;
 

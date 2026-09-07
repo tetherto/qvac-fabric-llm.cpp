@@ -33,6 +33,7 @@
 #include <cstdarg>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <list>
 #include <regex>
 #include <set>
@@ -2843,13 +2844,22 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CPU_MOE"));
     add_opt(common_arg(
-        {"--moe-cache-mib"}, "N",
-        "persistent GPU MoE expert cache size in MiB (default: 0, disabled)",
-        [](common_params & params, int value) {
-            if (value < 0) {
+        {"--moe-cache-mib"}, "N|auto",
+        "persistent GPU MoE expert cache size in MiB (default: auto with --fit)",
+        [](common_params & params, const std::string & value) {
+            if (value == "auto") {
+                params.moe_cache_auto = true;
+                params.moe_cache_size = 0;
+                return;
+            }
+            size_t pos = 0;
+            const long long size_mib = std::stoll(value, &pos);
+            if (size_mib < 0 || pos != value.size() ||
+                static_cast<unsigned long long>(size_mib) > std::numeric_limits<size_t>::max() / (1024ULL * 1024ULL)) {
                 throw std::invalid_argument("invalid value");
             }
-            params.moe_cache_size = size_t(value) * 1024 * 1024;
+            params.moe_cache_auto = false;
+            params.moe_cache_size = size_t(size_mib) * 1024 * 1024;
         }
     ).set_env("LLAMA_ARG_MOE_CACHE_MIB"));
     add_opt(common_arg(
@@ -3041,10 +3051,18 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ));
     add_opt(common_arg(
-        {"-pw", "--prefetch-weights"}, "0|1",
-        string_format("prefetch weight transfers to overlap CPU->GPU copies with compute (default: %d)", (int) params.prefetch_weights),
-        [](common_params & params, int value) {
-            params.prefetch_weights = value != 0;
+        {"-pw", "--prefetch-weights"}, "0|1|auto",
+        "prefetch weight transfers to overlap CPU->GPU copies with compute (default: auto for fitted dense models)",
+        [](common_params & params, const std::string & value) {
+            if (value == "auto") {
+                params.prefetch_weights_auto = true;
+                params.prefetch_weights = false;
+            } else if (value == "0" || value == "1") {
+                params.prefetch_weights_auto = false;
+                params.prefetch_weights = value == "1";
+            } else {
+                throw std::invalid_argument("invalid value");
+            }
         }
     ));
     add_opt(common_arg(

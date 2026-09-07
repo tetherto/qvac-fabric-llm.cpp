@@ -1302,6 +1302,7 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
             params.tensor_buft_overrides.data(),
             params.fit_params_target.data(),
             params.fit_params_min_ctx,
+            params.prefetch_weights_auto,
             params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
     }
 
@@ -1824,6 +1825,7 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.type_k         = params.cache_type_k;
     cparams.type_v         = params.cache_type_v;
     cparams.moe_cache_size = params.moe_cache_size;
+    cparams.moe_cache_auto = params.fit_params && params.moe_cache_auto;
 
     return cparams;
 }
@@ -2433,4 +2435,3 @@ void common_prompt_checkpoint::clear_dft() {
     data_dft.clear();
     data_spec.clear();
 }
-

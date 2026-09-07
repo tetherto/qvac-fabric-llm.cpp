@@ -247,7 +247,7 @@ static bool ggml_dev_shares_host_memory(ggml_backend_dev_t dev) {
 static void common_params_fit_impl(
         const char * path_model, struct llama_model_params * mparams, struct llama_context_params * cparams,
         float * tensor_split, struct llama_model_tensor_buft_override * tensor_buft_overrides,
-        size_t * margins_s, uint32_t n_ctx_min, enum ggml_log_level log_level) {
+        size_t * margins_s, uint32_t n_ctx_min, bool prefetch_weights_auto, enum ggml_log_level log_level) {
     if (mparams->split_mode == LLAMA_SPLIT_MODE_TENSOR) {
         throw common_params_fit_exception("llama_params_fit is not implemented for SPLIT_MODE_TENSOR, abort");
     }
@@ -279,9 +279,25 @@ static void common_params_fit_impl(
     // Single registry touchpoint: the decision arithmetic below is pure over
     // these flags (and unit-testable without live devices, see fit.h).
     std::vector<bool> shares_host(nd);
+    std::vector<bool> supports_copy_stream(nd);
     for (size_t id = 0; id < nd; id++) {
         shares_host[id] = ggml_dev_shares_host_memory(devs[id]);
+        ggml_backend_dev_props props;
+        ggml_backend_dev_get_props(devs[id], &props);
+        supports_copy_stream[id] = props.caps.copy_stream;
     }
+
+    bool auto_moe_cache = cparams->moe_cache_auto && cparams->moe_cache_size == 0 && hp_nex > 0 && nd == 1 && !shares_host[0] && cparams->op_offload && !cparams->training;
+    if (auto_moe_cache) {
+        const ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(devs[0]);
+        auto_moe_cache = reg == nullptr || std::string(ggml_backend_reg_name(reg)) != "OpenCL";
+    }
+    if (cparams->moe_cache_auto && cparams->moe_cache_size == 0 && hp_nex > 0 && !auto_moe_cache) {
+        LOG_TRC("%s: automatic MoE cache is not supported by this configuration\n", __func__);
+    }
+
+    const bool auto_prefetch = prefetch_weights_auto && !cparams->prefetch_weights && hp_nex == 0 && nd == 1 &&
+        !shares_host[0] && supports_copy_stream[0] && cparams->op_offload && !cparams->training;
 
     std::vector<std::string> dev_names;
     {
@@ -414,6 +430,18 @@ static void common_params_fit_impl(
         }
     }
 
+    if (auto_prefetch) {
+        cparams->prefetch_weights = true;
+        common_params_fit_impl(
+            path_model, mparams, cparams, tensor_split, tensor_buft_overrides, margins_s, n_ctx_min, false, log_level);
+        if (mparams->n_gpu_layers == default_mparams.n_gpu_layers) {
+            cparams->prefetch_weights = false;
+        } else {
+            LOG_INF("%s: automatic weight prefetch enabled for fitted host weights\n", __func__);
+        }
+        return;
+    }
+
     // step 2: try reducing memory use by reducing the context size
 
     {
@@ -428,7 +456,7 @@ static void common_params_fit_impl(
             // rows individually have surplus.
             global_surplus -= host_shared_deficit;
         }
-        if (global_surplus < 0) {
+        if (global_surplus < 0 && !auto_moe_cache) {
             if (nd <= 1) {
                 LOG_TRC("%s: cannot meet free memory target of %" PRId64 " MiB, need to reduce device memory by %" PRId64 " MiB\n",
                     __func__, margins[0]/MiB, -global_surplus/MiB);
@@ -678,6 +706,7 @@ static void common_params_fit_impl(
     };
 
     int64_t global_surplus_cpu_moe = 0;
+    size_t auto_moe_cache_size = 0;
     if (hp_nex > 0) {
         const static std::string pattern_moe_all = "blk\\.\\d+\\.ffn_(up|down|gate_up|gate)_(ch|)exps"; // matches all MoE tensors
         ggml_backend_buffer_type_t cpu_buft = ggml_backend_cpu_buffer_type();
@@ -688,6 +717,16 @@ static void common_params_fit_impl(
         LOG_TRC("%s: getting device memory data with all MoE tensors moved to system memory:\n", __func__);
         const dmds_t dmds_cpu_moe = common_get_device_memory_data_impl(
             path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level);
+
+        if (auto_moe_cache) {
+            constexpr int64_t cache_percent = 10;
+            const int64_t expert_memory = dmds_full[0].mb.model - dmds_cpu_moe[0].mb.model;
+            if (expert_memory > 0) {
+                auto_moe_cache_size = size_t(expert_memory * cache_percent / 100);
+                LOG_INF("%s: automatic MoE cache = %.2f MiB (%" PRId64 "%% of %.2f MiB expert weights)\n",
+                    __func__, auto_moe_cache_size / double(MiB), cache_percent, expert_memory / double(MiB));
+            }
+        }
 
         for (size_t id = 0; id < nd; id++) {
             global_surplus_cpu_moe += dmds_cpu_moe[id].free;
@@ -705,6 +744,13 @@ static void common_params_fit_impl(
         // reset
         tensor_buft_overrides[0] = {nullptr, nullptr};
         mparams->tensor_buft_overrides = tensor_buft_overrides;
+    }
+
+    if (auto_moe_cache_size > 0) {
+        cparams->moe_cache_size = auto_moe_cache_size;
+        common_params_fit_impl(
+            path_model, mparams, cparams, tensor_split, tensor_buft_overrides, margins_s, n_ctx_min, prefetch_weights_auto, log_level);
+        return;
     }
 
     std::vector<int64_t> targets; // maximum acceptable memory use per device
@@ -968,6 +1014,7 @@ enum common_params_fit_status common_fit_params(
         llama_model_tensor_buft_override * tensor_buft_overrides,
         size_t * margins,
         uint32_t n_ctx_min,
+        bool prefetch_weights_auto,
         ggml_log_level log_level) {
     const int64_t t0_us = llama_time_us();
     common_params_fit_status status = COMMON_PARAMS_FIT_STATUS_SUCCESS;
@@ -978,7 +1025,8 @@ enum common_params_fit_status common_fit_params(
     const llama_model_params   mparams_original = *mparams;
     const llama_context_params cparams_original = *cparams;
     try {
-        common_params_fit_impl(path_model, mparams, cparams, tensor_split, tensor_buft_overrides, margins, n_ctx_min, log_level);
+        common_params_fit_impl(
+            path_model, mparams, cparams, tensor_split, tensor_buft_overrides, margins, n_ctx_min, prefetch_weights_auto, log_level);
         LOG_TRC("%s: successfully fit params to free device memory\n", __func__);
     } catch (const common_params_fit_exception & e) {
         LOG_WRN("%s: failed to fit params to free device memory: %s\n", __func__, e.what());

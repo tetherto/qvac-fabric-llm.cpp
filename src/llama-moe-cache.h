@@ -56,7 +56,8 @@ public:
             const llama_model & model,
             ggml_backend_t backend,
             ggml_backend_buffer_type_t buft,
-            size_t size);
+            size_t size,
+            bool automatic);
     ~llama_moe_cache();
 
     ggml_backend_t backend() const;

@@ -866,6 +866,7 @@ struct ggml_backend_sched {
 
     bool op_offload;
     bool prefetch_weights;
+    bool prefetch_weights_configured;
 
     // prefetch support: copy backends and events for compute/transfer overlap
     ggml_backend_t       copy_backends[GGML_SCHED_MAX_BACKENDS];
@@ -2391,6 +2392,7 @@ void ggml_backend_sched_set_moe_cache(
 void ggml_backend_sched_set_prefetch_weights(ggml_backend_sched_t sched, bool enabled) {
     GGML_ASSERT(sched);
     sched->prefetch_weights = enabled;
+    sched->prefetch_weights_configured = enabled;
 
     if (enabled && sched->n_backends == 2) {
         for (int b = 0; b < sched->n_backends; b++) {
@@ -2421,6 +2423,12 @@ void ggml_backend_sched_set_prefetch_weights(ggml_backend_sched_t sched, bool en
             }
         }
     }
+}
+
+void ggml_backend_sched_set_prefetch_weights_active(ggml_backend_sched_t sched, bool active) {
+    GGML_ASSERT(sched);
+    GGML_ASSERT(!active || sched->prefetch_weights_configured);
+    sched->prefetch_weights = active;
 }
 
 int ggml_backend_sched_get_n_splits(ggml_backend_sched_t sched) {
