@@ -5336,6 +5336,178 @@ struct test_cutlass_mul_mat : public test_repacked_mul_mat {
     }
 };
 
+struct test_repacked_mul_mat_vec_fusion : public test_case {
+    const ggml_type type;
+    const ggml_glu_op glu_op;
+    const bool with_bias;
+    const bool with_scale;
+
+    test_repacked_mul_mat_vec_fusion(
+            ggml_type type, ggml_glu_op glu_op, bool with_bias, bool with_scale) :
+        type(type), glu_op(glu_op), with_bias(with_bias), with_scale(with_scale) {
+        GGML_ASSERT(!with_scale || type == GGML_TYPE_NVFP4);
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR4(type, glu_op, with_bias, with_scale);
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MUL_MAT_REPACK_FUSION";
+    }
+
+    bool run_whole_graph() override {
+        return true;
+    }
+
+    bool use_weight_context() override {
+        return true;
+    }
+
+    bool use_weight_context_sentinels() override {
+        return false;
+    }
+
+    ggml_backend_buffer_type_t weight_buffer_type(ggml_backend_t backend) override {
+        return test_repacked_weight_buffer_type(backend);
+    }
+
+    double max_nmse_err() override {
+        return type == GGML_TYPE_NVFP4 ? 4e-2 : 2e-2;
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        return build_graph(ctx, ctx);
+    }
+
+    ggml_tensor * build_fusion(
+            ggml_context * ctx,
+            ggml_tensor * input,
+            ggml_tensor * gate_weight,
+            ggml_tensor * up_weight,
+            ggml_tensor * gate_scale,
+            ggml_tensor * up_scale,
+            ggml_tensor * gate_bias,
+            ggml_tensor * up_bias) {
+        ggml_tensor * up = ggml_mul_mat(ctx, up_weight, input);
+        ggml_tensor * gate = ggml_mul_mat(ctx, gate_weight, input);
+        if (with_scale) {
+            up = ggml_mul(ctx, up, up_scale);
+            gate = ggml_mul(ctx, gate, gate_scale);
+        }
+        if (with_bias) {
+            up = ggml_add(ctx, up, up_bias);
+            gate = ggml_add(ctx, gate, gate_bias);
+        }
+
+        return ggml_glu_split(ctx, gate, up, glu_op);
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx, ggml_context * ctx_weights) override {
+        GGML_ASSERT(ctx_weights != nullptr);
+        constexpr int64_t n = 257;
+        constexpr int64_t k = 576;
+
+        ggml_tensor * input = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, 1);
+        ggml_tensor * gate_weight = ::ggml_new_tensor_2d(ctx_weights, type, k, n);
+        ggml_tensor * up_weight = ::ggml_new_tensor_2d(ctx_weights, type, k, n);
+        ggml_tensor * gate_scale = with_scale ? ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1) : nullptr;
+        ggml_tensor * up_scale = with_scale ? ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1) : nullptr;
+        ggml_tensor * gate_bias = with_bias ? ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n) : nullptr;
+        ggml_tensor * up_bias = with_bias ? ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n) : nullptr;
+
+        ggml_tensor * out = build_fusion(
+            ctx, input, gate_weight, up_weight, gate_scale, up_scale, gate_bias, up_bias);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
+struct test_repacked_mul_mat_vec_parity : public test_repacked_mul_mat_vec_fusion {
+    ggml_tensor * pair_output = nullptr;
+    std::vector<uint8_t> gate_data;
+    std::vector<uint8_t> up_data;
+
+    test_repacked_mul_mat_vec_parity(ggml_type type, bool with_scale) :
+        test_repacked_mul_mat_vec_fusion(type, GGML_GLU_OP_SWIGLU, true, with_scale) {
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MUL_MAT_REPACK_PARITY";
+    }
+
+    double max_nmse_err() override {
+        return 1e-6;
+    }
+
+    double err(const float * a, const float * b, size_t n) override {
+        if (n == sentinel_size) {
+            return nmse(a, b, n);
+        }
+        GGML_ASSERT(n % 2 == 0);
+        return nmse(a, a + n / 2, n / 2);
+    }
+
+    std::vector<ggml_tensor *> fusion_test_nodes() override {
+        GGML_ASSERT(pair_output != nullptr);
+        std::vector<ggml_tensor *> nodes = { pair_output };
+        nodes.insert(nodes.end(), sentinels.begin(), sentinels.end());
+        return nodes;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        ggml_tensor * gate_weight = ggml_get_tensor(ctx, "gate_weight");
+        ggml_tensor * up_weight = ggml_get_tensor(ctx, "up_weight");
+        if (up_weight != nullptr) {
+            test_case::initialize_tensors(ctx);
+            up_data.resize(ggml_nbytes(up_weight));
+            ggml_backend_tensor_get(up_weight, up_data.data(), 0, up_data.size());
+            gate_data.resize(ggml_nbytes(gate_weight));
+            ggml_backend_tensor_get(gate_weight, gate_data.data(), 0, gate_data.size());
+            return;
+        }
+
+        ggml_tensor * gate_repacked = ggml_get_tensor(ctx, "gate_repacked");
+        ggml_tensor * up_repacked = ggml_get_tensor(ctx, "up_repacked");
+        GGML_ASSERT(gate_repacked != nullptr && up_repacked != nullptr);
+        GGML_ASSERT(gate_data.size() == ggml_nbytes(gate_repacked));
+        GGML_ASSERT(up_data.size() == ggml_nbytes(up_repacked));
+        ggml_backend_tensor_set(gate_repacked, gate_data.data(), 0, gate_data.size());
+        ggml_backend_tensor_set(up_repacked, up_data.data(), 0, up_data.size());
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx, ggml_context * ctx_weights) override {
+        GGML_ASSERT(ctx_weights != nullptr);
+        constexpr int64_t n = 257;
+        constexpr int64_t k = 576;
+
+        ggml_tensor * input = ::ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, 1);
+        ggml_tensor * gate_weight = ::ggml_new_tensor_2d(ctx, type, k, n);
+        ggml_tensor * up_weight = ::ggml_new_tensor_2d(ctx, type, k, n);
+        ggml_tensor * gate_repacked = ::ggml_new_tensor_2d(ctx_weights, type, k, n);
+        ggml_tensor * up_repacked = ::ggml_new_tensor_2d(ctx_weights, type, k, n);
+        ggml_set_name(gate_weight, "gate_weight");
+        ggml_set_name(up_weight, "up_weight");
+        ggml_set_name(gate_repacked, "gate_repacked");
+        ggml_set_name(up_repacked, "up_repacked");
+
+        ggml_tensor * gate_scale = with_scale ? ::ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1) : nullptr;
+        ggml_tensor * up_scale = with_scale ? ::ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1) : nullptr;
+        ggml_tensor * gate_bias = ::ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n);
+        ggml_tensor * up_bias = ::ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n);
+
+        ggml_tensor * native = build_fusion(
+            ctx, input, gate_weight, up_weight, gate_scale, up_scale, gate_bias, up_bias);
+        ggml_tensor * repacked = build_fusion(
+            ctx, input, gate_repacked, up_repacked, gate_scale, up_scale, gate_bias, up_bias);
+        pair_output = ggml_concat(ctx, native, repacked, 1);
+        ggml_set_name(pair_output, "out");
+        return pair_output;
+    }
+};
+
 // GGML_HINT_SRC0_IS_HADAMARD
 struct test_mul_mat_hadamard : public test_mul_mat {
     test_mul_mat_hadamard(ggml_type type_a = GGML_TYPE_F32, ggml_type type_b = GGML_TYPE_F32,
@@ -11999,6 +12171,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_cutlass_mul_mat(type, 257, 1, 576));
         if (type == GGML_TYPE_NVFP4) {
             test_cases.emplace_back(new test_cutlass_mul_mat(type, 5120, 512, 5120));
+        }
+        for (ggml_glu_op glu_op : {GGML_GLU_OP_SWIGLU, GGML_GLU_OP_GEGLU}) {
+            test_cases.emplace_back(new test_repacked_mul_mat_vec_fusion(type, glu_op, false, false));
+            test_cases.emplace_back(new test_repacked_mul_mat_vec_fusion(type, glu_op, true, false));
+            if (type == GGML_TYPE_NVFP4) {
+                test_cases.emplace_back(new test_repacked_mul_mat_vec_fusion(type, glu_op, false, true));
+                test_cases.emplace_back(new test_repacked_mul_mat_vec_fusion(type, glu_op, true, true));
+            }
+        }
+        test_cases.emplace_back(new test_repacked_mul_mat_vec_parity(type, false));
+        if (type == GGML_TYPE_NVFP4) {
+            test_cases.emplace_back(new test_repacked_mul_mat_vec_parity(type, true));
         }
     }
 
