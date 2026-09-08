@@ -717,6 +717,9 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
     ggml_cuda_lock_cv.wait(lock, []{ return ggml_cuda_lock_counter.load(std::memory_order_relaxed) == 0; });
 
     ggml_cuda_set_device(device);
+    for (auto & upload : uploads) {
+        upload.release();
+    }
 
     if (copy_event != nullptr) {
         CUDA_CHECK(cudaEventDestroy(copy_event));
@@ -1085,6 +1088,16 @@ static void ggml_backend_cuda_repacked_buffer_set_tensor_async(
     GGML_ASSERT(ctx->device == cuda_ctx.device);
     ggml_cuda_set_device(ctx->device);
     cudaStream_t stream = cuda_ctx.stream();
+    auto & upload = cuda_ctx.upload_for_stream();
+    if (upload.data != nullptr) {
+        if (upload.tensor != tensor->data || upload.size != tensor_size || upload.next != offset) {
+            GGML_ABORT("invalid contiguous upload for repacked tensor %s", tensor->name);
+        }
+        CUDA_CHECK(cudaMemcpyAsync((char *) upload.data + offset, data, size, cudaMemcpyHostToDevice, stream));
+        upload.next += size;
+        return;
+    }
+
     ggml_cuda_pool_alloc<char> canonical(cuda_ctx.pool(), tensor_size);
     ggml_backend_cuda_repacked_buffer_update_tensor(
         buffer, tensor, data, 0, offset, size, stream, canonical.ptr);
@@ -2853,6 +2866,46 @@ static void ggml_backend_cuda_free(ggml_backend_t backend) {
     delete backend;
 }
 
+#ifdef GGML_CUDA_CUTLASS
+static bool ggml_backend_cuda_begin_async_upload(ggml_backend_t backend, ggml_tensor * tensor) {
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    ggml_backend_buffer_t buffer = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
+    if (!ggml_backend_buft_is_cuda_repacked(buffer->buft)) {
+        return buffer->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device);
+    }
+    ggml_backend_cuda_buffer_context * buffer_ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
+    if (buffer_ctx->device != cuda_ctx->device) {
+        return false;
+    }
+
+    ggml_cuda_set_device(cuda_ctx->device);
+    auto & upload = cuda_ctx->upload_for_stream();
+    return upload.begin(cuda_ctx->pool(), tensor->data, ggml_nbytes(tensor));
+}
+
+static bool ggml_backend_cuda_end_async_upload(ggml_backend_t backend, ggml_tensor * tensor) {
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    ggml_backend_buffer_t buffer = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
+    if (!ggml_backend_buft_is_cuda_repacked(buffer->buft)) {
+        return buffer->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device);
+    }
+    ggml_backend_cuda_buffer_context * buffer_ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
+    if (buffer_ctx->device != cuda_ctx->device) {
+        return false;
+    }
+
+    ggml_cuda_set_device(cuda_ctx->device);
+    auto & upload = cuda_ctx->upload_for_stream();
+    if (upload.tensor != tensor->data || upload.next != upload.size || upload.size != ggml_nbytes(tensor)) {
+        upload.release();
+        return false;
+    }
+    const bool result = ggml_cuda_cutlass_pack_weight(tensor, upload.data, cuda_ctx->stream());
+    upload.release();
+    return result;
+}
+#endif
+
 static void ggml_backend_cuda_set_tensor_async(ggml_backend_t backend, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
     ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
@@ -2898,6 +2951,12 @@ static void ggml_backend_cuda_set_tensor_2d_async(ggml_backend_t backend, struct
 
 #ifdef GGML_CUDA_CUTLASS
     if (ggml_backend_buft_is_cuda_repacked(buf->buft)) {
+        if (cuda_ctx->upload_for_stream().data != nullptr) {
+            for (size_t i = 0; i < n_copies; ++i) {
+                ggml_backend_cuda_set_tensor_async(backend, tensor, (const char *) data + i * stride_data, offset + i * stride_tensor, size);
+            }
+            return;
+        }
         const auto * buf_ctx = (const ggml_backend_cuda_buffer_context *) buf->context;
         GGML_ASSERT(buf_ctx->device == cuda_ctx->device);
         ggml_cuda_set_device(cuda_ctx->device);
@@ -6131,6 +6190,20 @@ static ggml_backend_buffer_type_t * ggml_backend_cuda_device_get_preferred_bufts
     return bufts;
 }
 
+static bool ggml_backend_cuda_device_supports_async_upload(
+        ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {
+    ggml_backend_cuda_device_context * ctx = (ggml_backend_cuda_device_context *) dev->context;
+    if (buft == ggml_backend_cuda_buffer_type(ctx->device)) {
+        return true;
+    }
+#ifdef GGML_CUDA_CUTLASS
+    return ggml_cuda_repacked_buffer_enabled(ctx->device) &&
+        buft == ggml_backend_cuda_repacked_buffer_type(ctx->device);
+#else
+    return false;
+#endif
+}
+
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
     if (strcmp(name, "ggml_backend_comm_init") == 0) {
@@ -6154,6 +6227,17 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     if (strcmp(name, "ggml_backend_dev_get_preferred_bufts") == 0) {
         return (void *)ggml_backend_cuda_device_get_preferred_bufts;
     }
+    if (strcmp(name, "ggml_backend_dev_supports_async_upload") == 0) {
+        return (void *)ggml_backend_cuda_device_supports_async_upload;
+    }
+#ifdef GGML_CUDA_CUTLASS
+    if (strcmp(name, "ggml_backend_begin_async_upload") == 0) {
+        return (void *) ggml_backend_cuda_begin_async_upload;
+    }
+    if (strcmp(name, "ggml_backend_end_async_upload") == 0) {
+        return (void *) ggml_backend_cuda_end_async_upload;
+    }
+#endif
     return nullptr;
 }
 
