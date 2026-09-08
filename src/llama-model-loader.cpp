@@ -1527,8 +1527,13 @@ bool llama_model_loader::load_all_data(
             return nullptr;
         }
 
-        if (buft != ggml_backend_dev_buffer_type(dev)) {
-            LLAMA_LOG_DEBUG("%s: buffer type %s is not the default buffer type for device %s for async uploads\n", func,
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+        auto supports_async_upload = reg ? (ggml_backend_dev_supports_async_upload_t)
+            ggml_backend_reg_get_proc_address(reg, "ggml_backend_dev_supports_async_upload") : nullptr;
+        const bool buft_supports_async_upload = supports_async_upload ?
+            supports_async_upload(dev, buft) : buft == ggml_backend_dev_buffer_type(dev);
+        if (!buft_supports_async_upload) {
+            LLAMA_LOG_DEBUG("%s: buffer type %s does not support async uploads on device %s\n", func,
                 ggml_backend_buft_name(buft), ggml_backend_dev_name(dev));
             return nullptr;
         }
@@ -1586,6 +1591,18 @@ bool llama_model_loader::load_all_data(
             ggml_backend_dev_name(ggml_backend_get_device(upload.backend.get())),
             ggml_backend_buft_name(ggml_backend_buffer_get_type(bufs.at(0))),
             ggml_backend_name(upload.backend.get()));
+    }
+
+    ggml_backend_begin_async_upload_t begin_async_upload = nullptr;
+    ggml_backend_end_async_upload_t end_async_upload = nullptr;
+    if (upload.backend) {
+        ggml_backend_dev_t dev = ggml_backend_get_device(upload.backend.get());
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+        begin_async_upload = reg ? (ggml_backend_begin_async_upload_t)
+            ggml_backend_reg_get_proc_address(reg, "ggml_backend_begin_async_upload") : nullptr;
+        end_async_upload = reg ? (ggml_backend_end_async_upload_t)
+            ggml_backend_reg_get_proc_address(reg, "ggml_backend_end_async_upload") : nullptr;
+        GGML_ASSERT((begin_async_upload == nullptr) == (end_async_upload == nullptr));
     }
 
     for (struct ggml_tensor * cur = ggml_get_first_tensor(ctx); cur != NULL; cur = ggml_get_next_tensor(ctx, cur)) {
@@ -1662,6 +1679,9 @@ bool llama_model_loader::load_all_data(
 
                     size_t bytes_read = 0;
                     size_t data_read = 0;  // Actual tensor data copied (excluding padding)
+                    if (begin_async_upload && !begin_async_upload(upload.backend.get(), cur)) {
+                        throw std::runtime_error(format("failed to begin asynchronous upload for tensor '%s'", cur->name));
+                    }
 
                     while (bytes_read < read_end - read_start) {
                         size_t read_size = std::min<size_t>(buffer_size, read_end - read_start - bytes_read);
@@ -1694,6 +1714,10 @@ bool llama_model_loader::load_all_data(
                         ggml_backend_tensor_set_async(upload.backend.get(), cur,
                                                       reinterpret_cast<void *>(ptr_data), data_read, data_to_copy);
                         data_read += data_to_copy;
+                        if (data_read == n_size && end_async_upload &&
+                            !end_async_upload(upload.backend.get(), cur)) {
+                            throw std::runtime_error(format("failed to end asynchronous upload for tensor '%s'", cur->name));
+                        }
                         ggml_backend_event_record(upload.events[buffer_idx].get(), upload.backend.get());
 
                         bytes_read += read_size;

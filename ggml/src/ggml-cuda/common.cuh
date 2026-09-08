@@ -1538,6 +1538,45 @@ struct ggml_backend_cuda_context {
         return pool(device);
     }
 
+    struct async_upload {
+        ggml_cuda_pool * pool = nullptr;
+        void * data = nullptr;
+        size_t size = 0;
+        size_t actual_size = 0;
+        const void * tensor = nullptr;
+        size_t next = 0;
+
+        bool begin(ggml_cuda_pool & new_pool, const void * new_tensor, size_t new_size) {
+            if (data != nullptr) {
+                return false;
+            }
+            pool = &new_pool;
+            data = pool->alloc(new_size, &actual_size);
+            size = new_size;
+            tensor = new_tensor;
+            next = 0;
+            return true;
+        }
+
+        void release() {
+            if (data != nullptr) {
+                pool->free(data, actual_size);
+            }
+            pool = nullptr;
+            data = nullptr;
+            size = 0;
+            actual_size = 0;
+            tensor = nullptr;
+            next = 0;
+        }
+    };
+
+    async_upload uploads[GGML_CUDA_MAX_STREAMS];
+
+    async_upload & upload_for_stream() {
+        GGML_ASSERT(curr_stream_no >= 0 && curr_stream_no < GGML_CUDA_MAX_STREAMS);
+        return uploads[curr_stream_no];
+    }
 };
 
 struct ggml_cuda_mm_fusion_args_host {
