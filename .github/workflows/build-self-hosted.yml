@@ -67,6 +67,7 @@ jobs:
 
   gpu-cuda:
     needs: runner_names
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ${{ needs.runner_names.outputs.qvac_ubuntu2204_x64_gpu }}
 
     steps:
@@ -103,6 +104,7 @@ jobs:
 
   gpu-vulkan-nvidia-cm:
     needs: runner_names
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ${{ needs.runner_names.outputs.qvac_ubuntu2204_x64_gpu }}
 
     steps:
@@ -118,6 +120,7 @@ jobs:
 
   gpu-vulkan-nvidia-cm2:
     needs: runner_names
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ${{ needs.runner_names.outputs.qvac_ubuntu2204_x64_gpu }}
 
     steps:
@@ -133,6 +136,7 @@ jobs:
 
   gpu-webgpu-nvidia:
     needs: runner_names
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ${{ needs.runner_names.outputs.qvac_ubuntu2404_x64_gpu }}
 
     steps:
@@ -207,6 +211,7 @@ jobs:
 
   gpu-metal:
     needs: runner_names
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ${{ needs.runner_names.outputs.qvac_macos26_arm64_gpu }}
 
     steps:
@@ -221,6 +226,7 @@ jobs:
 
   gpu-webgpu-apple:
     needs: runner_names
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ${{ needs.runner_names.outputs.qvac_macos26_arm64_gpu }}
 
     steps:
@@ -249,6 +255,7 @@ jobs:
 
   gpu-vulkan-apple:
     needs: runner_names
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ${{ needs.runner_names.outputs.qvac_macos26_arm64_gpu }}
 
     steps:
@@ -336,6 +343,7 @@ jobs:
 
   cpu-x64-high-perf:
     needs: runner_names
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ${{ needs.runner_names.outputs.qvac_ubuntu2204_x64 }}
 
     steps:

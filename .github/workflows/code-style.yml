@@ -21,6 +21,7 @@ jobs:
 
   model-naming:
     needs: runner_names
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ${{ needs.runner_names.outputs.qvac_ubuntu2404_x64 }}
     steps:
       - uses: actions/checkout@v6
