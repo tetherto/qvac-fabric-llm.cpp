@@ -62,7 +62,7 @@ For example, keep expert weights in system RAM and allocate a 1 GiB GPU cache:
 
 Choose a cache budget that leaves VRAM for other model weights, the KV cache, and compute buffers. It must be large enough to hold the active experts for at least one routed layer.
 
-### TurboVec / Local Vector Search *(experimental)*
+### TurboVec / Local Vector Search
 
 `ggml-vector-index` provides a standalone C API for local vector search, including compressed CPU indexes for applications that need on-device retrieval.
 
