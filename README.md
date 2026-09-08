@@ -42,8 +42,6 @@ Split work within each layer across GPUs to accelerate decoding for supported mo
     --device RPC0,RPC1 --split-mode tensor -ngl all
 ```
 
-Direct all-reduce supports exactly two RPC devices on separate endpoints. In this example, allow host 2 to reach host 1 on port `51052` (RPC port plus 1000). See the [RPC Guide](tools/rpc/README.md) for network and tuning options.
-
 ### TurboVec / Local Vector Search
 
 `ggml-vector-index` provides a standalone C API for local vector search, including compressed CPU indexes for applications that need on-device retrieval.
