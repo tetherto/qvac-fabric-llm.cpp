@@ -247,7 +247,13 @@ static bool ggml_dev_shares_host_memory(ggml_backend_dev_t dev) {
 bool common_fit_auto_moe_cache(
         const llama_model_params & mparams, const llama_context_params & cparams,
         uint32_t n_expert, size_t n_devices, bool shares_host, bool cache_supported) {
-    (void) mparams;
+    // Cache sizing requires the placement probes in step 3. Explicit placement
+    // is rejected there, so it must not defer the ordinary context reduction.
+    if (mparams.n_gpu_layers != llama_model_default_params().n_gpu_layers ||
+        (mparams.tensor_buft_overrides &&
+         (mparams.tensor_buft_overrides->pattern || mparams.tensor_buft_overrides->buft))) {
+        return false;
+    }
     return cparams.moe_cache_auto && cparams.moe_cache_size == 0 && n_expert > 0 &&
         n_devices == 1 && !shares_host && cache_supported && cparams.op_offload && !cparams.training;
 }
