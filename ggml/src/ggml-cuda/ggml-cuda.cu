@@ -2091,9 +2091,31 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(
     const bool gate_repacked = gate != nullptr && gate->buffer != nullptr &&
         ggml_backend_buft_is_cuda_repacked(ggml_backend_buffer_get_type(gate->buffer));
     if (src0_repacked || gate_repacked) {
-        return false;
+        if (glu != nullptr) {
+            const ggml_glu_op glu_op = ggml_get_glu_op(glu);
+            if (glu_op != GGML_GLU_OP_SWIGLU && glu_op != GGML_GLU_OP_GEGLU) {
+                return false;
+            }
+        }
+        if (tensor->op != GGML_OP_MUL_MAT || !src0_repacked || (gate != nullptr && !gate_repacked) ||
+            src1->ne[2] != 1 || src1->ne[3] != 1 || dst->ne[2] != 1 || dst->ne[3] != 1) {
+            return false;
+        }
+
+        ggml_cuda_cutlass_weight src0_weight;
+        if (!ggml_cuda_cutlass_weight_from_tensor(src0, src0_weight) || src0_weight.scales_linear == nullptr) {
+            return false;
+        }
+        if (gate != nullptr) {
+            ggml_cuda_cutlass_weight gate_weight;
+            if (gate->type != src0->type || !ggml_are_same_shape(gate, src0) ||
+                !ggml_are_same_stride(gate, src0) ||
+                !ggml_cuda_cutlass_weight_from_tensor(gate, gate_weight) || gate_weight.scales_linear == nullptr ||
+                gate_weight.type != src0_weight.type || gate_weight.k != src0_weight.k) {
+                return false;
+            }
+        }
     }
-    GGML_UNUSED(glu);
 
     const bool bad_padding_clear = ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE &&
                                    ggml_nbytes(src0) != ggml_backend_buffer_get_alloc_size(src0->buffer, src0) &&
@@ -2117,6 +2139,21 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(
     }
 
     return use_mul_mat_vec_q;
+}
+
+static bool ggml_cuda_repacked_mmvq_supported(
+        const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst) {
+    if (!ggml_cuda_cutlass_weight_supported(src0) || src1 == nullptr || dst == nullptr ||
+        src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 ||
+        src0->ne[2] != 1 || src0->ne[3] != 1 ||
+        src1->ne[0] != src0->ne[0] || src1->ne[1] <= 0 || src1->ne[1] > MMVQ_MAX_BATCH_SIZE ||
+        src1->ne[2] != 1 || src1->ne[3] != 1 ||
+        dst->ne[0] != src0->ne[1] || dst->ne[1] != src1->ne[1] || dst->ne[2] != 1 || dst->ne[3] != 1 ||
+        !ggml_is_contiguous(src0) || !ggml_is_contiguous(src1) || !ggml_is_contiguous(dst)) {
+        return false;
+    }
+
+    return true;
 }
 
 static void ggml_cuda_mul_mat_canonical(
@@ -2180,6 +2217,13 @@ static bool ggml_cuda_mul_mat(
 
     if (!ggml_backend_buft_is_cuda_repacked(ggml_backend_buffer_get_type(src0->buffer))) {
         ggml_cuda_mul_mat_canonical(ctx, src0, src1, dst);
+        return true;
+    }
+
+    const int cc = ggml_cuda_info().devices[ctx.device].cc;
+    if (ggml_cuda_repacked_mmvq_supported(src0, src1, dst) &&
+        ggml_cuda_should_use_mmvq(src0->type, cc, src1->ne[1])) {
+        ggml_cuda_mul_mat_vec_q(ctx, src0, src1, nullptr, dst);
         return true;
     }
 
@@ -5350,7 +5394,10 @@ static bool ggml_backend_cuda_repacked_supports_op(
         return false;
     }
 
-    return ggml_cuda_repacked_mul_mat_supported(op->src[0], op->src[1], op);
+    const int cc = ggml_cuda_info().devices[dev_ctx->device].cc;
+    return ggml_cuda_repacked_mul_mat_supported(op->src[0], op->src[1], op) ||
+        (ggml_cuda_repacked_mmvq_supported(op->src[0], op->src[1], op) &&
+         ggml_cuda_should_use_mmvq(op->src[0]->type, cc, op->src[1]->ne[1]));
 }
 
 // TODO: move these functions here
