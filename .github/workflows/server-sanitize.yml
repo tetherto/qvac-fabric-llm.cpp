@@ -33,19 +33,23 @@ env:
 
 # QVAC divergence from upstream. Reachable outcomes:
 #
-#   workflow_dispatch with `sha` -> per sha  (re-dispatching the SAME commit
-#                                   supersedes; two bisection commits coexist)
-#   push to master               -> per run  (run_id; never cancels)
-#   dispatch on another ref, no sha -> per ref (supersedes)
+#   dispatch with `sha`             -> per (sha, slow_tests) (an identical
+#                                      re-dispatch supersedes; a different
+#                                      commit OR a different slow_tests
+#                                      coexists)
+#   push to master                  -> per run  (run_id; never cancels)
+#   dispatch on another ref, no sha -> per ref   (supersedes)
 #
 # This workflow declares no `pull_request` trigger, so the first arm is inert
 # here; it is kept so this block matches the other lanes.
 #
-# The `sha` arm is load-bearing: bisecting a sanitizer regression means
-# dispatching several commits, and without it two dispatches from the same
-# non-master ref share a group and cancel each other. See QVAC-24627.
+# The dispatch arm keys on every input that changes what the run DOES.
+# Bisecting a sanitizer regression means dispatching several commits, so
+# without `sha` those would cancel each other; and without `slow_tests`, a
+# quick re-dispatch of the same commit would kill an in-flight slow-test run.
+# See QVAC-24627.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.event.inputs.sha || (github.ref == 'refs/heads/master' && github.run_id) || github.ref }}
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || (github.event.inputs.sha && format('{0}-slow{1}', github.event.inputs.sha, github.event.inputs.slow_tests)) || (github.ref == 'refs/heads/master' && github.run_id) || github.ref }}
   cancel-in-progress: true
 
 jobs:
