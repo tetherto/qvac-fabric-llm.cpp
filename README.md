@@ -10,7 +10,7 @@
 
 ## Key Features
 
-The following capabilities are developed and maintained as part of qvac-fabric-llm.cpp. Features marked as *exclusive* are not available in upstream llama.cpp.
+The following capabilities are developed and maintained as part of qvac-fabric-llm.cpp.
 
 ### Cluster Inference
 
@@ -61,7 +61,7 @@ Run VisionPsy Nano and Flash vision-language models through the multimodal subsy
 
 See the [Multimodal Guide](tools/mtmd/README.md) for model and projector usage, and the [server CLI reference](tools/server/README.md) for image-processing options.
 
-### TurboQuant KV Cache Quantization *(exclusive)*
+### TurboQuant KV Cache Quantization
 
 TurboQuant adds low-bit KV-cache quantization formats for long-context inference while preserving token-generation quality close to higher-bit caches. It supports:
 
@@ -88,7 +88,7 @@ Qwen3.5-4B Q8_0 benchmark highlights:
 
 Quality checks on Qwen3.5-4B Q8_0 show `tbq4_0/pq4_0` at -0.03% perplexity delta versus `f16/f16`, with 94.8% RULER main score and 37.04 LongBench average versus 37.52 for `f16/f16`. See the full [TurboQuant benchmark report](docs/turboquant-benchmarks.md) for all measured models, contexts, and quality results.
 
-### LoRA Fine-Tuning *(exclusive)*
+### LoRA Fine-Tuning
 
 `qvac-fabric-llm.cpp` provides native [LoRA](https://arxiv.org/abs/2106.09685) (Low-Rank Adaptation) fine-tuning across CPU, Vulkan, and Metal backends. The training pipeline runs directly on consumer hardware, including mobile phones and integrated GPUs.
 
@@ -102,7 +102,7 @@ Quality checks on Qwen3.5-4B Q8_0 show `tbq4_0/pq4_0` at -0.03% perplexity delta
 
 For usage details and CLI reference, see the [Finetuning Guide](examples/training/README.md).
 
-### BitNet Inference and Fine-Tuning *(exclusive)*
+### BitNet Inference and Fine-Tuning
 
 Native support for [BitNet](https://arxiv.org/abs/2402.17764) ternary quantized models via the TQ2_0 data type, enabling efficient inference and LoRA fine-tuning of models such as [bitnet_b1_58-xl](https://huggingface.co/gianni-cor/bitnet_b1_58-xl-TQ2_0) on resource-constrained devices.
 
@@ -113,26 +113,7 @@ The official [microsoft/BitNet](https://github.com/microsoft/BitNet) inference f
 - **Conversion**: HuggingFace-to-GGUF conversion for BitNet model architectures
 - Cooperative matrix (coopmat) support for Vulkan devices that expose the extension
 
-### Memory-Based Model Loading *(exclusive)*
-
-Load models directly from memory buffers instead of the filesystem, enabling deployment in environments where disk access is restricted or unavailable.
-
-- Embedded systems with limited or no filesystem access
-- WebAssembly deployments where models are fetched over the network
-- Encrypted model storage where models are decrypted in memory
-- Streaming scenarios where models arrive over network connections
-
-```cpp
-#include "llama-cpp.h"
-
-std::vector<uint8_t> model_data = /* load from network, decrypt, etc. */;
-auto model = llama_model_load_from_buffer(std::move(model_data), params);
-
-auto model = llama_model_load_from_split_futures(paths, n_paths, context, tensor_list, params);
-llama_model_load_fulfill_split_future(path, context, std::move(streambuf));
-```
-
-### Mobile GPU Optimization *(exclusive)*
+### Mobile GPU Optimization
 
 Enhanced GPU support with targeted optimizations for Qualcomm Adreno GPUs.
 
@@ -207,7 +188,7 @@ The following features are developed in qvac-fabric-llm.cpp and are not availabl
 All standard llama.cpp functionality, models, and APIs remain fully compatible.
 
 - Any GGUF model supported by llama.cpp is supported by qvac-fabric-llm.cpp
-- Existing llama.cpp documentation applies to all non-exclusive features
+- Existing llama.cpp documentation applies to shared functionality
 
 
 ## Contributing
