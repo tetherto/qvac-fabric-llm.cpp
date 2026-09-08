@@ -615,7 +615,8 @@ struct common_params {
     bool check_tensors     = false; // validate tensor data
     bool no_op_offload     = false; // globally disable offload host tensor operations to device
     bool training          = false; // build the context for training (see llama_opt_init)
-    bool prefetch_weights  = false; // prefetch weight transfers to overlap CPU->GPU copies with compute
+    bool prefetch_weights      = false; // prefetch weight transfers to overlap CPU->GPU copies with compute
+    bool prefetch_weights_auto = true;  // enable weight prefetch when fitting a dense model
     bool no_extra_bufts    = false; // disable extra buffer types (used for weight repacking)
     bool no_host           = false; // bypass host buffer allowing extra buffers to be used
     bool load_mtp          = false; // load MTP/NextN layers
@@ -627,6 +628,7 @@ struct common_params {
 
     size_t moe_cache_size      = 0;    // GPU cache size in bytes for the MoE experts kept in the CPU, split among the GPUs like the layers
     float  moe_cache_cpu_share = 0.0f; // share of the MoE cache misses computed on the CPU instead of uploaded
+    bool   moe_cache_auto      = true; // size the MoE cache when fitting a MoE model
 
     common_conversation_mode conversation_mode = COMMON_CONVERSATION_MODE_AUTO;
 
