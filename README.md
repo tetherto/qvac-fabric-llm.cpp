@@ -14,71 +14,35 @@ The following capabilities are developed and maintained as part of qvac-fabric-l
 
 ### Cluster Inference
 
-Run inference across local and remote GPUs using the RPC backend. Pipeline parallelism distributes layers across devices; tensor parallelism splits work within layers across devices.
+Run inference across GPUs on multiple machines using RPC. TCP is supported by default; **RDMA is Linux-only**, with compatible RoCEv2 adapters and `libibverbs`, and is negotiated automatically.
 
-RPC uses TCP by default. **RDMA support is available only on Linux**, with compatible RoCEv2 network adapters and `libibverbs` available at build time. Supported connections negotiate RDMA automatically; the commands below work with either transport.
-
-#### Quickstart Setup
-
-The examples use two GPU hosts and a main host that loads `model.gguf`. Replace the example IP addresses with your hosts' private addresses. Run the RPC servers on a trusted private network.
-
-On each GPU host, build RPC with the backend for that GPU. For NVIDIA CUDA:
+Build with `-DGGML_RPC=ON` and the GPU backend for each host (see the [RPC Guide](tools/rpc/README.md)). Start one server per GPU on a private network:
 
 ```bash
-cmake -B build -DGGML_RPC=ON -DGGML_CUDA=ON
-cmake --build build --config Release -j
-```
-
-On the main host, enable RPC:
-
-```bash
-cmake -B build -DGGML_RPC=ON
-cmake --build build --config Release -j
-```
-
-Start one server per GPU; these same servers work for both modes below:
-
-```bash
-# GPU host 1
+# Run on GPU host 1 and GPU host 2, respectively
 ./build/bin/ggml-rpc-server -H 192.168.88.10 -p 50052 --device CUDA0
-
-# GPU host 2
 ./build/bin/ggml-rpc-server -H 192.168.88.11 -p 50052 --device CUDA0
 ```
 
-Keep the model file on the main host and allow it to reach port `50052` on both GPU hosts.
-
 #### Pipeline Parallelism
 
-Assign successive layers to different GPUs and overlap microbatches across the pipeline. This is useful for processing larger prompt batches. Use one RPC server endpoint per stage; devices exposed by the same server process do not pipeline with each other.
-
-On the main host:
+Split layers across GPUs and overlap prompt microbatches. Use one endpoint per stage and a batch larger than the microbatch. On the main host:
 
 ```bash
-./build/bin/llama-cli -m model.gguf \
-    --rpc 192.168.88.10:50052,192.168.88.11:50052 \
-    --device RPC0,RPC1 --split-mode layer --tensor-split 1,1 \
-    --n-gpu-layers all --batch-size 2048 --ubatch-size 256
+./build/bin/llama-cli -m model.gguf --rpc 192.168.88.10:50052,192.168.88.11:50052 \
+    --device RPC0,RPC1 --split-mode layer -ngl all -b 2048 -ub 256
 ```
-
-A batch larger than the microbatch (`--ubatch-size`) provides independent work to overlap across stages. Adjust `--tensor-split` to match the devices' available memory; `1,1` assigns equal proportions.
 
 #### Tensor Parallelism *(experimental)*
 
-Split weights and KV-cache tensors across GPUs so the devices cooperate within each layer. This can accelerate token generation for supported models, but requires frequent communication and benefits from low-latency, high-bandwidth links.
-
-Using the same servers, run a model that supports tensor split on the main host:
+Split work within each layer across GPUs to accelerate decoding for supported models. Fast network links help because the GPUs exchange results frequently. Using the same servers:
 
 ```bash
-./build/bin/llama-cli -m model.gguf \
-    --rpc 192.168.88.10:50052,192.168.88.11:50052 \
-    --device RPC0,RPC1 --split-mode tensor --tensor-split 1,1 \
-    --n-gpu-layers all
+./build/bin/llama-cli -m model.gguf --rpc 192.168.88.10:50052,192.168.88.11:50052 \
+    --device RPC0,RPC1 --split-mode tensor -ngl all
 ```
 
-With exactly two RPC devices on separate endpoints, all-reduce can exchange results directly between the servers. Allow GPU host 2 to reach port `51052` on GPU host 1 (its RPC port plus 1000), or set `GGML_RPC_COMM_PORT` on the main host to choose another port. Large F32 all-reduce tensors use BF16 on the wire by default to reduce traffic; set `GGML_RPC_NO_WIRE_BF16=1` on the main host to retain F32 transfers.
-
-See the [RPC Guide](tools/rpc/README.md) for other GPU backends, RDMA setup, and troubleshooting.
+Direct all-reduce supports exactly two RPC devices on separate endpoints. In this example, allow host 2 to reach host 1 on port `51052` (RPC port plus 1000). See the [RPC Guide](tools/rpc/README.md) for network and tuning options.
 
 ### TurboVec / Local Vector Search *(experimental)*
 
