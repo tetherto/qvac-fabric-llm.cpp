@@ -3,7 +3,7 @@
 **AI inference and training engine for desktop and mobile platforms.**
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://opensource.org/licenses/MIT)
-[![Based on llama.cpp](https://img.shields.io/badge/based%20on-llama.cpp%20b7248-orange.svg)](https://github.com/ggml-org/llama.cpp)
+[![Based on llama.cpp](https://img.shields.io/badge/based%20on-llama.cpp%20b10549-orange.svg)](https://github.com/ggml-org/llama.cpp)
 
 `qvac-fabric-llm.cpp` is a specialized fork of [llama.cpp](https://github.com/ggml-org/llama.cpp) optimized for embedded systems, mobile devices, and enterprise deployment scenarios. It extends the excellent foundation of llama.cpp with additional capabilities focused on memory-based model loading, mobile GPU optimization, and flexible integration patterns.
 
@@ -11,6 +11,44 @@
 ## Key Features
 
 The following capabilities are developed and maintained as part of qvac-fabric-llm.cpp. Features marked as *exclusive* are not available in upstream llama.cpp.
+
+### Cluster Inference
+
+Run inference across local and remote GPUs using the RPC backend, with pipeline and tensor parallelism for supported configurations.
+
+- **Pipeline parallelism**: overlap microbatches across remote devices with `--split-mode layer`. Use protocol 7 on the client and all servers, with one RPC server endpoint per pipeline stage.
+- **Direct all-reduce**: tensor split with exactly two RPC devices can exchange results directly between servers. Large F32 all-reduce tensors use BF16 on the wire by default to reduce network traffic.
+- **Transport**: TCP connectivity with automatically negotiated RDMA on supported Linux systems.
+
+With one RPC server running on each host, distribute the model across two stages:
+
+```bash
+./build/bin/llama-cli -m model.gguf \
+    --rpc 192.168.88.10:50052,192.168.88.11:50052 \
+    --device RPC0,RPC1 --split-mode layer --tensor-split 1,1 \
+    --n-gpu-layers all --batch-size 2048 --ubatch-size 256
+```
+
+See the [RPC Guide](tools/rpc/README.md) for build instructions, server setup, network requirements, and tuning.
+
+### TurboVec / Local Vector Search *(experimental)*
+
+`ggml-vector-index` provides a standalone C API for local vector search, including compressed CPU indexes for applications that need on-device retrieval.
+
+- **Storage**: full-precision f32, generic q8 and packed q4, plus TurboVec 2-bit and 4-bit modes with scalar, NEON, and AVX2 scoring paths.
+- **Search**: exact top-k scans, filtering by caller-provided IDs, reusable prepared filters, and optional IVF search for approximate candidate selection.
+- **Persistence**: index snapshots, with read-only mmap loading and incremental mutation logs for the generic storage modes. TurboVec supports snapshot save/load; mmap and logged mutations are not yet supported for TurboVec.
+
+The library is disabled by default. Enable it with `-DGGML_VECTOR_INDEX=ON` and link `ggml::vector-index` explicitly; it is not integrated into the llama runtime or server. See the [Vector Index Guide](docs/vector-index.md) for supported dimensions, API usage, persistence contracts, and benchmarks.
+
+### VisionPsy Nano / Flash Support
+
+Run VisionPsy Nano and Flash vision-language models through the multimodal subsystem using compatible GGUF models and projectors.
+
+- **Image sizing**: `--image-no-upscale on` enables the Flash preprocessing rule, rounding image sizes to the slice grid without always stretching smaller images to the maximum size. Use it for Flash projectors that do not declare this rule in GGUF metadata.
+- **Memory-aware vision attention**: automatic flash-attention selection accounts for image size and device memory on backends without efficient cooperative-matrix flash attention.
+
+See the [Multimodal Guide](tools/mtmd/README.md) for model and projector usage, and the [server CLI reference](tools/server/README.md) for image-processing options.
 
 ### TurboQuant KV Cache Quantization *(exclusive)*
 
@@ -139,7 +177,7 @@ For more detailed build instructions, see [docs/build.md](docs/build.md).
 
 qvac-fabric-llm.cpp is a maintained fork of [llama.cpp](https://github.com/ggml-org/llama.cpp). The project regularly synchronizes with upstream releases to incorporate improvements, bug fixes, and new model support, while extending the engine with capabilities not present in the upstream project.
 
-**Current upstream baseline:** llama.cpp b7248
+**Current upstream baseline:** llama.cpp b10549
 
 ### Exclusive Features
 
@@ -152,10 +190,6 @@ The following features are developed in qvac-fabric-llm.cpp and are not availabl
 | BitNet inference and training | TQ2_0 quantization on Vulkan, Metal, and CPU for inference and LoRA fine-tuning; extends [microsoft/BitNet](https://github.com/microsoft/BitNet) beyond its CUDA-only GPU support |
 | Memory-based model loading | Load models from in-memory buffers with split-model and async fulfillment support |
 | Mobile GPU optimization | Adreno 800+ quantized inference (Q4_0, Q8), Adreno-specific Vulkan shader variants, VMA integration |
-
-### Experimental Components
-
-- `ggml-vector-index` is a default-off standalone vector search library. See the [Vector Index Guide](docs/vector-index.md) for build, API, persistence, mmap, and benchmark details.
 
 ### Upstream Compatibility
 
