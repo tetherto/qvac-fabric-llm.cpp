@@ -92,6 +92,12 @@ Enhanced GPU support with targeted optimizations for Qualcomm Adreno GPUs.
 - Adreno-specific Vulkan shader variants for improved throughput.
 - Vulkan Memory Allocator (VMA) integration for efficient GPU memory management.
 
+### AMD XDNA (NPU) Backend *(exclusive)*
+
+Offloads GEMM (matrix multiplication) to the AMD XDNA NPU (Ryzen AI, NPU2) via XRT for inference on Strix-class APUs. See [ggml/src/ggml-xdna/README.md](ggml/src/ggml-xdna/README.md) for build and usage instructions.
+
+Requires Linux with an NPU2 (XDNA2) device, XRT 2.25.x (installed under `/opt/xilinx/xrt`) and a Python interpreter with mlir-aie (IRON) to compile the kernels at build time. Enable with `-DGGML_XDNA=ON`.
+
 
 ## Quick Start
 
@@ -111,6 +117,11 @@ cmake --build build --config Release
 
 # With Metal support (macOS, iOS)
 cmake -B build -DGGML_METAL=ON
+cmake --build build --config Release
+
+# With AMD XDNA NPU support (Linux, Strix-class APUs)
+cmake -B build -DGGML_XDNA=ON -DGGML_OPENMP=ON \
+      -DGGML_XDNA_GEMM_PYTHON=$HOME/aie-env/bin/python
 cmake --build build --config Release
 ```
 
