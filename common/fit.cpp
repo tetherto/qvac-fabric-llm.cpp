@@ -244,6 +244,21 @@ static bool ggml_dev_shares_host_memory(ggml_backend_dev_t dev) {
     return props.memory_unified;
 }
 
+bool common_fit_auto_moe_cache(
+        const llama_model_params & mparams, const llama_context_params & cparams,
+        uint32_t n_expert, size_t n_devices, bool shares_host, bool cache_supported) {
+    (void) mparams;
+    return cparams.moe_cache_auto && cparams.moe_cache_size == 0 && n_expert > 0 &&
+        n_devices == 1 && !shares_host && cache_supported && cparams.op_offload && !cparams.training;
+}
+
+bool common_fit_auto_prefetch_weights(
+        const llama_context_params & cparams, bool automatic,
+        uint32_t n_expert, size_t n_devices, bool shares_host, bool copy_stream) {
+    return automatic && !cparams.prefetch_weights && n_expert == 0 && n_devices == 1 &&
+        !shares_host && copy_stream && cparams.op_offload && !cparams.training;
+}
+
 static void common_params_fit_impl(
         const char * path_model, struct llama_model_params * mparams, struct llama_context_params * cparams,
         float * tensor_split, struct llama_model_tensor_buft_override * tensor_buft_overrides,
@@ -287,17 +302,19 @@ static void common_params_fit_impl(
         supports_copy_stream[id] = props.caps.copy_stream;
     }
 
-    bool auto_moe_cache = cparams->moe_cache_auto && cparams->moe_cache_size == 0 && hp_nex > 0 && nd == 1 && !shares_host[0] && cparams->op_offload && !cparams->training;
-    if (auto_moe_cache) {
+    bool cache_supported = true;
+    if (nd == 1) {
         const ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(devs[0]);
-        auto_moe_cache = reg == nullptr || std::string(ggml_backend_reg_name(reg)) != "OpenCL";
+        cache_supported = reg == nullptr || std::string(ggml_backend_reg_name(reg)) != "OpenCL";
     }
+    const bool auto_moe_cache = common_fit_auto_moe_cache(
+        *mparams, *cparams, hp_nex, nd, nd == 1 && shares_host[0], cache_supported);
     if (cparams->moe_cache_auto && cparams->moe_cache_size == 0 && hp_nex > 0 && !auto_moe_cache) {
         LOG_TRC("%s: automatic MoE cache is not supported by this configuration\n", __func__);
     }
 
-    const bool auto_prefetch = prefetch_weights_auto && !cparams->prefetch_weights && hp_nex == 0 && nd == 1 &&
-        !shares_host[0] && supports_copy_stream[0] && cparams->op_offload && !cparams->training;
+    const bool auto_prefetch = common_fit_auto_prefetch_weights(
+        *cparams, prefetch_weights_auto, hp_nex, nd, nd == 1 && shares_host[0], nd == 1 && supports_copy_stream[0]);
 
     std::vector<std::string> dev_names;
     {
