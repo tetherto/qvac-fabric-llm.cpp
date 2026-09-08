@@ -554,6 +554,14 @@ llama_model_loader::llama_model_loader(
     this->use_mmap      = load_mode == LLAMA_LOAD_MODE_MMAP || load_mode == LLAMA_LOAD_MODE_MMAP_MLOCK || load_mode == LLAMA_LOAD_MODE_AUTO;
     this->use_direct_io = load_mode == LLAMA_LOAD_MODE_DIRECT_IO;
 
+    // with no_alloc and no mmap nothing reads tensor data: llama_model::load_tensors returns before load_all_data.
+    // the file can then be metadata only, like the ones gguf_write_to_file writes with only_meta set.
+    // use the no_alloc argument, not the member: the member is set at the end of this constructor.
+    const bool check_bounds = !(no_alloc && !this->use_mmap);
+    if (!check_bounds) {
+        LLAMA_LOG_DEBUG("%s: no_alloc without mmap, tensor file bounds check is off for '%s'\n", __func__, fname.empty() ? "(file handle)" : fname.c_str());
+    }
+
     if (!fname.empty()) {
         // Load the main GGUF
         struct ggml_context * ctx = NULL;
@@ -585,7 +593,7 @@ llama_model_loader::llama_model_loader(
             }
             n_elements += ggml_nelements(cur);
             n_bytes    += ggml_nbytes(cur);
-            weights_map.emplace(tensor_name, llama_tensor_weight(files.back().get(), 0, metadata, cur));
+            weights_map.emplace(tensor_name, llama_tensor_weight(files.back().get(), 0, metadata, cur, check_bounds));
         }
         uint16_t n_split = 0;
         get_key(llm_kv(LLM_KV_SPLIT_COUNT), n_split, false);
@@ -651,7 +659,7 @@ llama_model_loader::llama_model_loader(
                     }
                     n_elements += ggml_nelements(cur);
                     n_bytes    += ggml_nbytes(cur);
-                    weights_map.emplace(tensor_name, llama_tensor_weight(files.back().get(), idx, ctx_gguf.get(), cur));
+                    weights_map.emplace(tensor_name, llama_tensor_weight(files.back().get(), idx, ctx_gguf.get(), cur, check_bounds));
                 }
             }
 
@@ -695,7 +703,7 @@ llama_model_loader::llama_model_loader(
             }
             n_elements += ggml_nelements(cur);
             n_bytes    += ggml_nbytes(cur);
-            weights_map.emplace(tensor_name, llama_tensor_weight(files.back().get(), 0, metadata, cur));
+            weights_map.emplace(tensor_name, llama_tensor_weight(files.back().get(), 0, metadata, cur, check_bounds));
         }
     } else {
         get_key(llm_kv(LLM_KV_GENERAL_ARCHITECTURE), arch_name, false);
