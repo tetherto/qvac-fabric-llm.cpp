@@ -27,16 +27,22 @@ runs:
         # e.g. in container jobs, where it is not preinstalled
         if ! command -v gh >/dev/null 2>&1; then
           echo "GitHub CLI not found, installing..."
-          if ! command -v curl >/dev/null 2>&1; then
-            apt-get update >/dev/null 2>&1 || true
-            apt-get install -y curl >/dev/null 2>&1 || true
+          # container jobs run as root, self-hosted runners do not, but have sudo
+          SUDO=""
+          if [ "$(id -u)" -ne 0 ]; then
+            command -v sudo >/dev/null 2>&1 || { echo "Not running as root and sudo is not available" >&2; exit 1; }
+            SUDO="sudo"
           fi
-          mkdir -p -m 755 /etc/apt/keyrings
-          curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | tee /etc/apt/keyrings/githubcli-archive-keyring.gpg >/dev/null
-          chmod go+r /etc/apt/keyrings/githubcli-archive-keyring.gpg
-          echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" > /etc/apt/sources.list.d/github-cli.list
-          apt-get update >/dev/null 2>&1 || true
-          apt-get install -y gh || { echo "Failed to install GitHub CLI (gh)" >&2; exit 1; }
+          if ! command -v curl >/dev/null 2>&1; then
+            $SUDO apt-get update >/dev/null 2>&1 || true
+            $SUDO apt-get install -y curl >/dev/null 2>&1 || true
+          fi
+          $SUDO mkdir -p -m 755 /etc/apt/keyrings
+          curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | $SUDO tee /etc/apt/keyrings/githubcli-archive-keyring.gpg >/dev/null
+          $SUDO chmod go+r /etc/apt/keyrings/githubcli-archive-keyring.gpg
+          echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | $SUDO tee /etc/apt/sources.list.d/github-cli.list >/dev/null
+          $SUDO apt-get update >/dev/null 2>&1 || true
+          $SUDO apt-get install -y gh || { echo "Failed to install GitHub CLI (gh)" >&2; exit 1; }
         fi
         command -v gh >/dev/null 2>&1 || { echo "GitHub CLI (gh) is required but could not be installed" >&2; exit 1; }
 
