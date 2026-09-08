@@ -6094,6 +6094,9 @@ static ggml_backend_buffer_type_t test_repacked_weight_buffer_type(ggml_backend_
             if (strstr(ggml_backend_buft_name(*bufts), "_REPACK") != nullptr) {
                 GGML_ASSERT(!backend_has_feature(backend, "FORCE_CUBLAS"));
                 GGML_ASSERT(!backend_has_feature(backend, "FORCE_MMQ"));
+                auto supports_async_upload = (ggml_backend_dev_supports_async_upload_t)
+                    ggml_backend_reg_get_proc_address(reg, "ggml_backend_dev_supports_async_upload");
+                GGML_ASSERT(supports_async_upload != nullptr && supports_async_upload(dev, *bufts));
                 return *bufts;
             }
         }
@@ -6212,6 +6215,18 @@ struct test_cutlass_mul_mat : public test_repacked_mul_mat {
         ggml_tensor * weight_native = ggml_get_tensor(ctx, "weight_native");
         if (weight_native != nullptr) {
             test_case::initialize_tensors(ctx);
+            if (type == GGML_TYPE_NVFP4) {
+                ggml_tensor * input = ggml_get_tensor(ctx, "input");
+                std::vector<float> data(ggml_nelements(input));
+                ggml_backend_tensor_get(input, data.data(), 0, ggml_nbytes(input));
+                for (int64_t row = 0; row < n; ++row) {
+                    const float scale = n > 1 && row % 17 == 0 ? 0.0f : std::ldexp(1.0f, row % 17 - 8);
+                    for (int64_t col = 0; col < k; ++col) {
+                        data[row * k + col] *= scale;
+                    }
+                }
+                ggml_backend_tensor_set(input, data.data(), 0, ggml_nbytes(input));
+            }
             weight_data.resize(ggml_nbytes(weight_native));
             ggml_backend_tensor_get(weight_native, weight_data.data(), 0, weight_data.size());
             return;
@@ -6227,11 +6242,36 @@ struct test_cutlass_mul_mat : public test_repacked_mul_mat {
         std::vector<uint8_t> roundtrip(weight_data.size());
         const size_t offsets[] = {0, weight_data.size() / 3, 2 * weight_data.size() / 3, weight_data.size()};
 
-        ggml_backend_tensor_set(weight_repacked, weight_data.data(), 0, weight_data.size());
+        ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+        auto begin_async_upload = (ggml_backend_begin_async_upload_t)
+            ggml_backend_reg_get_proc_address(reg, "ggml_backend_begin_async_upload");
+        auto end_async_upload = (ggml_backend_end_async_upload_t)
+            ggml_backend_reg_get_proc_address(reg, "ggml_backend_end_async_upload");
+        ggml_backend_ptr backend2(ggml_backend_dev_init(dev, nullptr));
+        GGML_ASSERT(begin_async_upload != nullptr && end_async_upload != nullptr && backend2 != nullptr);
+        GGML_ASSERT(begin_async_upload(backend, weight_repacked));
+        GGML_ASSERT(begin_async_upload(backend2.get(), weight_full));
+        for (size_t i = 0; i < 3; ++i) {
+            ggml_backend_tensor_set_async(
+                backend, weight_repacked, weight_data.data() + offsets[i], offsets[i], offsets[i + 1] - offsets[i]);
+            ggml_backend_tensor_set_async(
+                backend2.get(), weight_full, weight_data.data() + offsets[i], offsets[i], offsets[i + 1] - offsets[i]);
+        }
+        GGML_ASSERT(end_async_upload(backend, weight_repacked));
+        GGML_ASSERT(end_async_upload(backend2.get(), weight_full));
+        ggml_backend_tensor_get_async(backend, weight_repacked, roundtrip.data(), 0, roundtrip.size());
+        ggml_backend_synchronize(backend);
+        ggml_backend_synchronize(backend2.get());
+        transfer_ok = roundtrip == weight_data;
+        ggml_backend_tensor_get(weight_full, roundtrip.data(), 0, roundtrip.size());
+        transfer_ok = transfer_ok && roundtrip == weight_data;
+
+        std::fill(roundtrip.begin(), roundtrip.end(), 0);
         ggml_backend_tensor_set_async(backend, weight_full, weight_data.data(), 0, weight_data.size());
         ggml_backend_tensor_get_async(backend, weight_full, roundtrip.data(), 0, roundtrip.size());
         ggml_backend_synchronize(backend);
-        transfer_ok = roundtrip == weight_data;
+        transfer_ok = transfer_ok && roundtrip == weight_data;
 
         ggml_backend_tensor_set(weight_repacked, zeros.data(), 0, zeros.size());
         for (size_t i : {1, 0, 2}) {
@@ -6278,6 +6318,17 @@ struct test_cutlass_mul_mat : public test_repacked_mul_mat {
         ggml_backend_synchronize(backend);
         transfer_ok = transfer_ok && roundtrip == expected && strided_read == strided;
 
+        GGML_ASSERT(begin_async_upload(backend, weight_full));
+        transfer_ok = !begin_async_upload(backend, weight_copy) && transfer_ok;
+        ggml_backend_tensor_set_async(backend, weight_full, weight_data.data(), 0, offsets[1]);
+        transfer_ok = !end_async_upload(backend, weight_full) && transfer_ok;
+        GGML_ASSERT(begin_async_upload(backend, weight_full));
+        ggml_backend_tensor_set_async(backend, weight_full, weight_data.data(), 0, weight_data.size());
+        GGML_ASSERT(end_async_upload(backend, weight_full));
+        ggml_backend_tensor_get_async(backend, weight_full, roundtrip.data(), 0, roundtrip.size());
+        ggml_backend_synchronize(backend);
+        transfer_ok = transfer_ok && roundtrip == weight_data;
+
         ggml_backend_buffer_set_usage(weight_copy->buffer, GGML_BACKEND_BUFFER_USAGE_COMPUTE);
     }
 
@@ -6298,6 +6349,282 @@ struct test_cutlass_mul_mat : public test_repacked_mul_mat {
         ggml_set_name(input, "input");
         ggml_tensor * native = ggml_mul_mat(ctx, weight_native, input);
         ggml_tensor * repacked = ggml_mul_mat(ctx, weight_alias, input);
+        pair_output = ggml_concat(ctx, native, repacked, 1);
+        ggml_set_name(pair_output, "out");
+        return pair_output;
+    }
+};
+
+struct test_cutlass_shared_activation : public test_case {
+    static constexpr int n_weights = 4;
+
+    ggml_backend_t                              backend = nullptr;
+    std::array<std::vector<uint8_t>, n_weights> weight_data;
+
+    int graph_replays() override { return 4; }
+
+    std::string vars() override { return "type=nvfp4,m=260,n=129,k=576,siblings=3"; }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MUL_MAT_CUTLASS_SHARED_ACTIVATION";
+    }
+
+    double max_nmse_err() override { return 1e-6; }
+
+    double err(const float * a, const float * b, size_t n) override {
+        GGML_UNUSED(b);
+        GGML_ASSERT(n % 2 == 0);
+        return nmse(a, a + n / 2, n / 2);
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    bool use_weight_context() override { return true; }
+
+    bool use_weight_context_sentinels() override { return false; }
+
+    ggml_backend_buffer_type_t weight_buffer_type(ggml_backend_t backend) override {
+        this->backend = backend;
+        return test_repacked_weight_buffer_type(backend);
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        if (ggml_get_tensor(ctx, "weight_native_0") != nullptr) {
+            test_case::initialize_tensors(ctx);
+            for (int i = 0; i < n_weights; ++i) {
+                char name[32];
+                snprintf(name, sizeof(name), "weight_native_%d", i);
+                ggml_tensor * weight = ggml_get_tensor(ctx, name);
+                GGML_ASSERT(weight != nullptr);
+                weight_data[i].resize(ggml_nbytes(weight));
+                ggml_backend_tensor_get(weight, weight_data[i].data(), 0, weight_data[i].size());
+            }
+            return;
+        }
+
+        GGML_ASSERT(backend != nullptr);
+        for (int i = 0; i < n_weights; ++i) {
+            char name[32];
+            snprintf(name, sizeof(name), "weight_repacked_%d", i);
+            ggml_tensor * weight = ggml_get_tensor(ctx, name);
+            GGML_ASSERT(weight != nullptr && !weight_data[i].empty());
+            ggml_backend_tensor_set(weight, weight_data[i].data(), 0, weight_data[i].size());
+        }
+    }
+
+    ggml_tensor * build_projection_group(ggml_context *                               ctx,
+                                         const std::array<ggml_tensor *, n_weights> & weights,
+                                         ggml_tensor *                                input,
+                                         ggml_tensor *                                other_input) {
+        ggml_tensor * first  = ggml_scale(ctx, ggml_mul_mat(ctx, weights[0], input), 1.0f);
+        ggml_tensor * other  = ggml_mul_mat(ctx, weights[3], other_input);
+        ggml_tensor * joined = ggml_concat(ctx, first, other, 0);
+        joined               = ggml_concat(ctx, joined, ggml_mul_mat(ctx, weights[1], input), 0);
+        joined               = ggml_concat(ctx, joined, ggml_mul_mat(ctx, weights[2], input), 0);
+        return joined;
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override { return build_graph(ctx, ctx); }
+
+    ggml_tensor * build_graph(ggml_context * ctx, ggml_context * ctx_weights) override {
+        GGML_ASSERT(ctx_weights != nullptr);
+        constexpr int64_t m = 260;
+        constexpr int64_t n = 129;
+        constexpr int64_t k = 576;
+
+        std::array<ggml_tensor *, n_weights> native;
+        std::array<ggml_tensor *, n_weights> repacked;
+        for (int i = 0; i < n_weights; ++i) {
+            native[i]   = ggml_new_tensor_2d(ctx, GGML_TYPE_NVFP4, k, m);
+            repacked[i] = ::ggml_new_tensor_2d(ctx_weights, GGML_TYPE_NVFP4, k, m);
+            char native_name[32];
+            char repacked_name[32];
+            snprintf(native_name, sizeof(native_name), "weight_native_%d", i);
+            snprintf(repacked_name, sizeof(repacked_name), "weight_repacked_%d", i);
+            ggml_set_name(native[i], native_name);
+            ggml_set_name(repacked[i], repacked_name);
+        }
+
+        ggml_tensor * input       = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
+        ggml_tensor * other_input = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
+        ggml_set_name(input, "input");
+        ggml_set_name(other_input, "other_input");
+
+        ggml_tensor * native_output   = build_projection_group(ctx, native, input, other_input);
+        ggml_tensor * repacked_output = build_projection_group(ctx, repacked, input, other_input);
+        ggml_tensor * out             = ggml_concat(ctx, native_output, repacked_output, 1);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
+struct test_repacked_mul_mat_vec_fusion : public test_case {
+    const ggml_type type;
+    const ggml_glu_op glu_op;
+    const bool with_bias;
+    const bool with_scale;
+
+    test_repacked_mul_mat_vec_fusion(
+            ggml_type type, ggml_glu_op glu_op, bool with_bias, bool with_scale) :
+        type(type), glu_op(glu_op), with_bias(with_bias), with_scale(with_scale) {
+        GGML_ASSERT(!with_scale || type == GGML_TYPE_NVFP4);
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR4(type, glu_op, with_bias, with_scale);
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MUL_MAT_REPACK_FUSION";
+    }
+
+    bool run_whole_graph() override {
+        return true;
+    }
+
+    bool use_weight_context() override {
+        return true;
+    }
+
+    bool use_weight_context_sentinels() override {
+        return false;
+    }
+
+    ggml_backend_buffer_type_t weight_buffer_type(ggml_backend_t backend) override {
+        return test_repacked_weight_buffer_type(backend);
+    }
+
+    double max_nmse_err() override {
+        return type == GGML_TYPE_NVFP4 ? 4e-2 : 2e-2;
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        return build_graph(ctx, ctx);
+    }
+
+    ggml_tensor * build_fusion(
+            ggml_context * ctx,
+            ggml_tensor * input,
+            ggml_tensor * gate_weight,
+            ggml_tensor * up_weight,
+            ggml_tensor * gate_scale,
+            ggml_tensor * up_scale,
+            ggml_tensor * gate_bias,
+            ggml_tensor * up_bias) {
+        ggml_tensor * up = ggml_mul_mat(ctx, up_weight, input);
+        ggml_tensor * gate = ggml_mul_mat(ctx, gate_weight, input);
+        if (with_scale) {
+            up = ggml_mul(ctx, up, up_scale);
+            gate = ggml_mul(ctx, gate, gate_scale);
+        }
+        if (with_bias) {
+            up = ggml_add(ctx, up, up_bias);
+            gate = ggml_add(ctx, gate, gate_bias);
+        }
+
+        return ggml_glu_split(ctx, gate, up, glu_op);
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx, ggml_context * ctx_weights) override {
+        GGML_ASSERT(ctx_weights != nullptr);
+        constexpr int64_t n = 257;
+        constexpr int64_t k = 576;
+
+        ggml_tensor * input = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, 1);
+        ggml_tensor * gate_weight = ::ggml_new_tensor_2d(ctx_weights, type, k, n);
+        ggml_tensor * up_weight = ::ggml_new_tensor_2d(ctx_weights, type, k, n);
+        ggml_tensor * gate_scale = with_scale ? ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1) : nullptr;
+        ggml_tensor * up_scale = with_scale ? ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1) : nullptr;
+        ggml_tensor * gate_bias = with_bias ? ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n) : nullptr;
+        ggml_tensor * up_bias = with_bias ? ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n) : nullptr;
+
+        ggml_tensor * out = build_fusion(
+            ctx, input, gate_weight, up_weight, gate_scale, up_scale, gate_bias, up_bias);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
+struct test_repacked_mul_mat_vec_parity : public test_repacked_mul_mat_vec_fusion {
+    ggml_tensor * pair_output = nullptr;
+    std::vector<uint8_t> gate_data;
+    std::vector<uint8_t> up_data;
+
+    test_repacked_mul_mat_vec_parity(ggml_type type, bool with_scale) :
+        test_repacked_mul_mat_vec_fusion(type, GGML_GLU_OP_SWIGLU, true, with_scale) {
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MUL_MAT_REPACK_PARITY";
+    }
+
+    double max_nmse_err() override {
+        return 1e-6;
+    }
+
+    double err(const float * a, const float * b, size_t n) override {
+        if (n == sentinel_size) {
+            return nmse(a, b, n);
+        }
+        GGML_ASSERT(n % 2 == 0);
+        return nmse(a, a + n / 2, n / 2);
+    }
+
+    std::vector<ggml_tensor *> fusion_test_nodes() override {
+        GGML_ASSERT(pair_output != nullptr);
+        std::vector<ggml_tensor *> nodes = { pair_output };
+        nodes.insert(nodes.end(), sentinels.begin(), sentinels.end());
+        return nodes;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        ggml_tensor * gate_weight = ggml_get_tensor(ctx, "gate_weight");
+        ggml_tensor * up_weight = ggml_get_tensor(ctx, "up_weight");
+        if (up_weight != nullptr) {
+            test_case::initialize_tensors(ctx);
+            up_data.resize(ggml_nbytes(up_weight));
+            ggml_backend_tensor_get(up_weight, up_data.data(), 0, up_data.size());
+            gate_data.resize(ggml_nbytes(gate_weight));
+            ggml_backend_tensor_get(gate_weight, gate_data.data(), 0, gate_data.size());
+            return;
+        }
+
+        ggml_tensor * gate_repacked = ggml_get_tensor(ctx, "gate_repacked");
+        ggml_tensor * up_repacked = ggml_get_tensor(ctx, "up_repacked");
+        GGML_ASSERT(gate_repacked != nullptr && up_repacked != nullptr);
+        GGML_ASSERT(gate_data.size() == ggml_nbytes(gate_repacked));
+        GGML_ASSERT(up_data.size() == ggml_nbytes(up_repacked));
+        ggml_backend_tensor_set(gate_repacked, gate_data.data(), 0, gate_data.size());
+        ggml_backend_tensor_set(up_repacked, up_data.data(), 0, up_data.size());
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx, ggml_context * ctx_weights) override {
+        GGML_ASSERT(ctx_weights != nullptr);
+        constexpr int64_t n = 257;
+        constexpr int64_t k = 576;
+
+        ggml_tensor * input = ::ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, 1);
+        ggml_tensor * gate_weight = ::ggml_new_tensor_2d(ctx, type, k, n);
+        ggml_tensor * up_weight = ::ggml_new_tensor_2d(ctx, type, k, n);
+        ggml_tensor * gate_repacked = ::ggml_new_tensor_2d(ctx_weights, type, k, n);
+        ggml_tensor * up_repacked = ::ggml_new_tensor_2d(ctx_weights, type, k, n);
+        ggml_set_name(gate_weight, "gate_weight");
+        ggml_set_name(up_weight, "up_weight");
+        ggml_set_name(gate_repacked, "gate_repacked");
+        ggml_set_name(up_repacked, "up_repacked");
+
+        ggml_tensor * gate_scale = with_scale ? ::ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1) : nullptr;
+        ggml_tensor * up_scale = with_scale ? ::ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1) : nullptr;
+        ggml_tensor * gate_bias = ::ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n);
+        ggml_tensor * up_bias = ::ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n);
+
+        ggml_tensor * native = build_fusion(
+            ctx, input, gate_weight, up_weight, gate_scale, up_scale, gate_bias, up_bias);
+        ggml_tensor * repacked = build_fusion(
+            ctx, input, gate_repacked, up_repacked, gate_scale, up_scale, gate_bias, up_bias);
         pair_output = ggml_concat(ctx, native, repacked, 1);
         ggml_set_name(pair_output, "out");
         return pair_output;
@@ -15212,7 +15539,22 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_cutlass_mul_mat(type, 257, 256, 576));
         test_cases.emplace_back(new test_cutlass_mul_mat(type, 257, 1, 576));
         if (type == GGML_TYPE_NVFP4) {
+            test_cases.emplace_back(new test_cutlass_mul_mat(type, 260, 65, 64));
+            test_cases.emplace_back(new test_cutlass_mul_mat(type, 260, 129, 576));
             test_cases.emplace_back(new test_cutlass_mul_mat(type, 5120, 512, 5120));
+            test_cases.emplace_back(new test_cutlass_shared_activation());
+        }
+        for (ggml_glu_op glu_op : {GGML_GLU_OP_SWIGLU, GGML_GLU_OP_GEGLU}) {
+            test_cases.emplace_back(new test_repacked_mul_mat_vec_fusion(type, glu_op, false, false));
+            test_cases.emplace_back(new test_repacked_mul_mat_vec_fusion(type, glu_op, true, false));
+            if (type == GGML_TYPE_NVFP4) {
+                test_cases.emplace_back(new test_repacked_mul_mat_vec_fusion(type, glu_op, false, true));
+                test_cases.emplace_back(new test_repacked_mul_mat_vec_fusion(type, glu_op, true, true));
+            }
+        }
+        test_cases.emplace_back(new test_repacked_mul_mat_vec_parity(type, false));
+        if (type == GGML_TYPE_NVFP4) {
+            test_cases.emplace_back(new test_repacked_mul_mat_vec_parity(type, true));
         }
     }
 
