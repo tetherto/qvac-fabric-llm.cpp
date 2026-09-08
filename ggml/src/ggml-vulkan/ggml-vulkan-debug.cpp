@@ -1201,6 +1201,8 @@ void ggml_vk_check_results_0(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph
             tensor_clone = ggml_transpose(ggml_ctx, src_clone[0]);
         } else if (tensor->op == GGML_OP_GET_ROWS) {
             tensor_clone = ggml_get_rows(ggml_ctx, src_clone[0], src_clone[1]);
+        } else if (tensor->op == GGML_OP_GET_ROWS_BACK) {
+            tensor_clone = ggml_get_rows_back(ggml_ctx, src_clone[0], src_clone[1], tensor);
         } else if (tensor->op == GGML_OP_ARGSORT) {
             tensor_clone = ggml_argsort(ggml_ctx, src_clone[0], (ggml_sort_order) *(int *)tensor->op_params);
         } else if (tensor->op == GGML_OP_TOP_K) {
@@ -1439,34 +1441,54 @@ void ggml_vk_check_results_1(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph
     float first_error_correct = -1.0f;
     std::array<int, 4> first_error = { -1, -1, -1, -1 };
     double avg_err = 0.0;
+    double sum_squared_error = 0.0;
+    double sum_squared_ref = 0.0;
     size_t counter = 0;
+
+    const int64_t block_size = ggml_blck_size(tensor->type);
+    const size_t type_size = ggml_type_size(tensor->type);
+    const ggml_to_float_t to_float = ggml_is_quantized(tensor->type) ? ggml_get_type_traits(tensor->type)->to_float : nullptr;
+    std::vector<float> correct_block(to_float ? block_size : 0);
+    std::vector<float> result_block(to_float ? block_size : 0);
 
     for (int i3 = 0; i3 < tensor->ne[3]; i3++) {
         for (int i2 = 0; i2 < tensor->ne[2]; i2++) {
             for (int i1 = 0; i1 < tensor->ne[1]; i1++) {
                 for (int i0 = 0; i0 < tensor->ne[0]; i0++) {
-                    const bool buffer_size_fit = i3*comp_nb[3] + i2*comp_nb[2] + i1*comp_nb[1] + i0*comp_nb[0] < comp_size;
+                    const size_t correct_offset = i3*comp_nb[3] + i2*comp_nb[2] + i1*comp_nb[1] + (i0/block_size)*comp_nb[0];
+                    const size_t result_offset = i3*tensor->nb[3] + i2*tensor->nb[2] + i1*tensor->nb[1] + (i0/block_size)*tensor->nb[0];
+                    const bool buffer_size_fit = correct_offset + type_size <= comp_size;
                     float correct = 0.0f;
                     float result = 0.0f;
 
                     if (buffer_size_fit) {
-                        if (tensor->type == GGML_TYPE_F32) {
-                            correct = *(float *) ((char *) comp_result + i3*comp_nb[3] + i2*comp_nb[2] + i1*comp_nb[1] + i0*comp_nb[0]);
-                            result  = *(float *) ((char *) tensor_data + i3*tensor->nb[3] + i2*tensor->nb[2] + i1*tensor->nb[1] + i0*tensor->nb[0]);
+                        if (to_float != nullptr) {
+                            if (i0 % block_size == 0) {
+                                to_float((const char *) comp_result + correct_offset, correct_block.data(), block_size);
+                                to_float((const char *) tensor_data + result_offset, result_block.data(), block_size);
+                            }
+                            correct = correct_block[i0 % block_size];
+                            result  = result_block[i0 % block_size];
+                        } else if (tensor->type == GGML_TYPE_F32) {
+                            correct = *(float *) ((char *) comp_result + correct_offset);
+                            result  = *(float *) ((char *) tensor_data + result_offset);
                         } else if (tensor->type == GGML_TYPE_F16) {
-                            correct = ggml_fp16_to_fp32(*(ggml_fp16_t *) ((char *) comp_result + i3*comp_nb[3] + i2*comp_nb[2] + i1*comp_nb[1] + i0*comp_nb[0]));
-                            result  = ggml_fp16_to_fp32(*(ggml_fp16_t *) ((char *) tensor_data + i3*tensor->nb[3] + i2*tensor->nb[2] + i1*tensor->nb[1] + i0*tensor->nb[0]));
+                            correct = ggml_fp16_to_fp32(*(ggml_fp16_t *) ((char *) comp_result + correct_offset));
+                            result  = ggml_fp16_to_fp32(*(ggml_fp16_t *) ((char *) tensor_data + result_offset));
                         } else if (tensor->type == GGML_TYPE_BF16) {
-                            correct = ggml_bf16_to_fp32(*(ggml_bf16_t *) ((char *) comp_result + i3*comp_nb[3] + i2*comp_nb[2] + i1*comp_nb[1] + i0*comp_nb[0]));
-                            result  = ggml_bf16_to_fp32(*(ggml_bf16_t *) ((char *) tensor_data + i3*tensor->nb[3] + i2*tensor->nb[2] + i1*tensor->nb[1] + i0*tensor->nb[0]));
+                            correct = ggml_bf16_to_fp32(*(ggml_bf16_t *) ((char *) comp_result + correct_offset));
+                            result  = ggml_bf16_to_fp32(*(ggml_bf16_t *) ((char *) tensor_data + result_offset));
+                        } else if (tensor->type == GGML_TYPE_I16) {
+                            correct = *(int16_t *) ((char *) comp_result + correct_offset);
+                            result  = *(int16_t *) ((char *) tensor_data + result_offset);
                         } else if (tensor->type == GGML_TYPE_I32) {
-                            correct = *(int32_t *) ((char *) comp_result + i3*comp_nb[3] + i2*comp_nb[2] + i1*comp_nb[1] + i0*comp_nb[0]);
-                            result  = *(int32_t *) ((char *) tensor_data + i3*tensor->nb[3] + i2*tensor->nb[2] + i1*tensor->nb[1] + i0*tensor->nb[0]);
+                            correct = *(int32_t *) ((char *) comp_result + correct_offset);
+                            result  = *(int32_t *) ((char *) tensor_data + result_offset);
                         } else if (tensor->type == GGML_TYPE_I64) {
-                            correct = *(int64_t *) ((char *) comp_result + i3*comp_nb[3] + i2*comp_nb[2] + i1*comp_nb[1] + i0*comp_nb[0]);
-                            result  = *(int64_t *) ((char *) tensor_data + i3*tensor->nb[3] + i2*tensor->nb[2] + i1*tensor->nb[1] + i0*tensor->nb[0]);
+                            correct = *(int64_t *) ((char *) comp_result + correct_offset);
+                            result  = *(int64_t *) ((char *) tensor_data + result_offset);
                         } else {
-                            std::cerr << "Results check not implemented for type " << ggml_type_name(tensor->type) << std::endl;
+                            GGML_ABORT("Results check not implemented for type %s", ggml_type_name(tensor->type));
                         }
                     } else {
                         std::cerr << "Missing debug code for type " << ggml_type_name(tensor->type) << std::endl;
@@ -1512,6 +1534,9 @@ void ggml_vk_check_results_1(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph
                     // NaN also appears in results, if both are nan error is 0
                     if (!std::isinf(correct) && !std::isinf(result) && !std::isnan(correct) && !std::isnan(result)) {
                         avg_err += std::fabs(correct - result) / denom;
+                        const double diff = (double) correct - result;
+                        sum_squared_error += diff * diff;
+                        sum_squared_ref += (double) correct * correct;
                     }
                     counter++;
                 }
@@ -1521,8 +1546,16 @@ void ggml_vk_check_results_1(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph
 
     avg_err /= counter;
 
+    // CPU and Vulkan can use different activation quantization for quantized matmuls.
+    // Use the NMSE tolerance from test-backend-ops for these comparisons.
+    const bool use_nmse = (tensor->op == GGML_OP_MUL_MAT || tensor->op == GGML_OP_MUL_MAT_ID) && ggml_is_quantized(src0->type);
+    const double nmse = sum_squared_error == 0.0 ? 0.0 : sum_squared_error / sum_squared_ref;
+    const double error = use_nmse ? nmse : avg_err;
+    const double max_error = use_nmse ? 5e-4 : 0.01;
+    const char * error_name = use_nmse ? "nmse" : "avg_err";
+
     if (vk_output_tensor > 0 && vk_output_tensor == check_counter) {
-        std::cerr << "TENSOR CHECK: avg_err=" << avg_err << " in " << ggml_op_name(tensor->op) << " (check " << check_counter << ")" << std::endl;
+        std::cerr << "TENSOR CHECK: " << error_name << "=" << error << " in " << ggml_op_name(tensor->op) << " (check " << check_counter << ")" << std::endl;
         std::cerr << "tensor=" << tensor << " tensor->name=" << tensor->name << " tensor->type: " << ggml_type_name(tensor->type) << " ne0=" << tensor->ne[0] << " nb0=" << tensor->nb[0] << " ne1=" << tensor->ne[1] << " nb1=" << tensor->nb[1] << " ne2=" << tensor->ne[2] << " nb2=" << tensor->nb[2] << " ne3=" << tensor->ne[3] << " nb3=" << tensor->nb[3] << " offset=" << tensor->view_offs << std::endl;
         if (src0 != nullptr) {
             std::cerr << "src0=" << src0 << " op=" << ggml_op_name(src0->op) << " type=" << ggml_type_name(src0->type) << " ne0=" << src0->ne[0] << " nb0=" << src0->nb[0] << " ne1=" << src0->ne[1] << " nb1=" << src0->nb[1] << " ne2=" << src0->ne[2] << " nb2=" << src0->nb[2] << " ne3=" << src0->ne[3] << " nb3=" << src0->nb[3] << " offset=" << src0->view_offs << std::endl;
@@ -1546,8 +1579,8 @@ void ggml_vk_check_results_1(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph
         ggml_vk_print_graph_origin(tensor, done);
     }
 
-    if (avg_err > 0.01 || std::isnan(avg_err)) {
-        std::cerr << "ERROR: avg_err=" << avg_err << " in " << ggml_op_name(tensor->op) << " (check " << check_counter << ")" << std::endl;
+    if (error > max_error || std::isnan(error)) {
+        std::cerr << "ERROR: " << error_name << "=" << error << " in " << ggml_op_name(tensor->op) << " (check " << check_counter << ")" << std::endl;
         std::cerr << "tensor=" << tensor << " tensor->name=" << tensor->name << " tensor->type: " << ggml_type_name(tensor->type) << " ne0=" << tensor->ne[0] << " nb0=" << tensor->nb[0] << " ne1=" << tensor->ne[1] << " nb1=" << tensor->nb[1] << " ne2=" << tensor->ne[2] << " nb2=" << tensor->nb[2] << " ne3=" << tensor->ne[3] << " nb3=" << tensor->nb[3] << " offset=" << tensor->view_offs << std::endl;
         if (src0 != nullptr) {
             std::cerr << "src0=" << src0 << " op=" << ggml_op_name(src0->op) << " type=" << ggml_type_name(src0->type) << " ne0=" << src0->ne[0] << " nb0=" << src0->nb[0] << " ne1=" << src0->ne[1] << " nb1=" << src0->nb[1] << " ne2=" << src0->ne[2] << " nb2=" << src0->nb[2] << " ne3=" << src0->ne[3] << " nb3=" << src0->nb[3] << " offset=" << src0->view_offs << std::endl;
@@ -1571,7 +1604,7 @@ void ggml_vk_check_results_1(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph
         ggml_vk_print_graph_origin(tensor, done);
         GGML_ABORT("fatal error");
     } else {
-        std::cerr << check_counter << " " << tensor->name << " op=" << ggml_op_name(tensor->op) << " avg_err=" << avg_err << std::endl;
+        std::cerr << check_counter << " " << tensor->name << " op=" << ggml_op_name(tensor->op) << " " << error_name << "=" << error << std::endl;
     }
 
     free(comp_result);
