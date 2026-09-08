@@ -33,7 +33,7 @@ Split layers across GPUs and overlap prompt microbatches. Use one endpoint per s
     --device RPC0,RPC1 --split-mode layer -ngl all -b 2048 -ub 256
 ```
 
-#### Tensor Parallelism *(experimental)*
+#### Tensor Parallelism
 
 Split work within each layer across GPUs to accelerate decoding for supported models. Fast network links help because the GPUs exchange results frequently. Using the same servers:
 
