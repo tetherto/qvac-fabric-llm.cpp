@@ -1064,7 +1064,8 @@ static buft_list_t make_cpu_buft_list(const std::vector<llama_device> & devices,
 }
 
 // GPU: split if LLAMA_SPLIT_MODE_ROW -> GPU
-static buft_list_t make_gpu_buft_list(ggml_backend_dev_t dev, llama_split_mode split_mode, const float * tensor_split) {
+static buft_list_t make_gpu_buft_list(
+        ggml_backend_dev_t dev, llama_split_mode split_mode, const float * tensor_split, bool use_extra_bufts) {
     buft_list_t buft_list;
 
     // add the device split buffer type if requested and available
@@ -1091,22 +1092,28 @@ static buft_list_t make_gpu_buft_list(ggml_backend_dev_t dev, llama_split_mode s
         }
     }
 
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+    const auto add_backend_bufts = [&](ggml_backend_buffer_type_t * bufts) {
+        while (bufts && *bufts) {
+            buft_list.emplace_back(dev, *bufts);
+            ++bufts;
+        }
+    };
+
+    if (use_extra_bufts && reg != nullptr) {
+        auto get_preferred_bufts = (ggml_backend_dev_get_preferred_bufts_t)
+            ggml_backend_reg_get_proc_address(reg, "ggml_backend_dev_get_preferred_bufts");
+        add_backend_bufts(get_preferred_bufts ? get_preferred_bufts(dev) : nullptr);
+    }
+
     // add the device default buffer type
     buft_list.emplace_back(dev, ggml_backend_dev_buffer_type(dev));
 
     // add the device extra buffer type (if any)
-    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
-    if (reg) {
-        auto ggml_backend_dev_get_extra_bufts_fn = (ggml_backend_dev_get_extra_bufts_t)
+    if (use_extra_bufts && reg != nullptr) {
+        auto get_extra_bufts = (ggml_backend_dev_get_extra_bufts_t)
             ggml_backend_reg_get_proc_address(reg, "ggml_backend_dev_get_extra_bufts");
-
-        if (ggml_backend_dev_get_extra_bufts_fn) {
-            ggml_backend_buffer_type_t * extra_bufts = ggml_backend_dev_get_extra_bufts_fn(dev);
-            while (extra_bufts && *extra_bufts) {
-                buft_list.emplace_back(dev, *extra_bufts);
-                ++extra_bufts;
-            }
-        }
+        add_backend_bufts(get_extra_bufts ? get_extra_bufts(dev) : nullptr);
     }
 
     return buft_list;
@@ -1399,7 +1406,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     // build a list of buffer types for the CPU and GPU devices
     pimpl->cpu_buft_list = make_cpu_buft_list(devices, params.use_extra_bufts, params.no_host);
     for (const auto & dev : devices) {
-        buft_list_t buft_list = make_gpu_buft_list(dev.dev, split_mode, tensor_split);
+        buft_list_t buft_list = make_gpu_buft_list(dev.dev, split_mode, tensor_split, params.use_extra_bufts);
         // add CPU buffer types as a fallback
         buft_list.insert(buft_list.end(), pimpl->cpu_buft_list.begin(), pimpl->cpu_buft_list.end());
         pimpl->gpu_buft_list.emplace(dev.dev, std::move(buft_list));
