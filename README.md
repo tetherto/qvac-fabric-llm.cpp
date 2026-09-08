@@ -92,6 +92,21 @@ Enhanced GPU support with targeted optimizations for Qualcomm Adreno GPUs.
 - Adreno-specific Vulkan shader variants for improved throughput.
 - Vulkan Memory Allocator (VMA) integration for efficient GPU memory management.
 
+### AMD XDNA (NPU) Backend *(exclusive)*
+
+Offloads weight `MUL_MAT` to the AMD XDNA2 NPU (Strix Halo / Ryzen AI MAX). Prefill GEMM runs on the NPU; decode stays on nested CPU. Device name for `--device` is `XDNA`.
+
+Build and run instructions, IRON 1.3.4 install, and `--device` semantics: [docs/backend/XDNA.md](docs/backend/XDNA.md).
+
+```bash
+source /opt/xilinx/xrt/setup.sh
+cmake -B build -DGGML_XDNA=ON \
+    -DGGML_XDNA_IRON_PYTHON=$HOME/ironenv/bin/python3
+cmake --build build -j --target llama-completion llama-server
+./build/bin/llama-completion --list-devices
+./build/bin/llama-completion -m model.gguf --device XDNA -ngl 99 -p "Hello" -n 32
+```
+
 
 ## Quick Start
 
@@ -112,6 +127,13 @@ cmake --build build --config Release
 # With Metal support (macOS, iOS)
 cmake -B build -DGGML_METAL=ON
 cmake --build build --config Release
+
+# With AMD XDNA NPU support (Linux, Strix Halo). Needs XRT + mlir-aie 1.3.4.
+# See docs/backend/XDNA.md.
+source /opt/xilinx/xrt/setup.sh
+cmake -B build -DGGML_XDNA=ON \
+    -DGGML_XDNA_IRON_PYTHON=$HOME/ironenv/bin/python3
+cmake --build build --config Release
 ```
 
 For more detailed build instructions, see [docs/build.md](docs/build.md).
@@ -128,7 +150,7 @@ For more detailed build instructions, see [docs/build.md](docs/build.md).
 
 | Platform | Backend | Status |
 |----------|---------|--------|
-| Linux (x86_64, ARM64) | CPU, Vulkan, CUDA | ✅ Full support |
+| Linux (x86_64, ARM64) | CPU, Vulkan, CUDA, XDNA (NPU, x86_64 Strix Halo) | ✅ Full support |
 | macOS (Intel, Apple Silicon) | CPU, Metal | ✅ Full support |
 | Windows (x86_64) | CPU, Vulkan, CUDA | ✅ Full support |
 | Android (ARM64) | CPU, Vulkan, OpenCL | ✅ Full support |
@@ -152,6 +174,7 @@ The following features are developed in qvac-fabric-llm.cpp and are not availabl
 | BitNet inference and training | TQ2_0 quantization on Vulkan, Metal, and CPU for inference and LoRA fine-tuning; extends [microsoft/BitNet](https://github.com/microsoft/BitNet) beyond its CUDA-only GPU support |
 | Memory-based model loading | Load models from in-memory buffers with split-model and async fulfillment support |
 | Mobile GPU optimization | Adreno 800+ quantized inference (Q4_0, Q8), Adreno-specific Vulkan shader variants, VMA integration |
+| AMD XDNA NPU backend | Weight GEMM offload to XDNA2 (`--device XDNA`); see [docs/backend/XDNA.md](docs/backend/XDNA.md) |
 
 ### Experimental Components
 

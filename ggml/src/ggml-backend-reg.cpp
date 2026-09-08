@@ -84,6 +84,10 @@
 #include "ggml-zendnn.h"
 #endif
 
+#ifdef GGML_USE_XDNA
+#include "ggml-xdna.h"
+#endif
+
 #ifdef GGML_USE_OPENVINO
 #include "ggml-openvino.h"
 #endif
@@ -151,6 +155,9 @@ struct ggml_backend_registry {
 #endif
 #ifdef GGML_USE_ZENDNN
         register_backend(ggml_backend_zendnn_reg());
+#endif
+#ifdef GGML_USE_XDNA
+        register_backend(ggml_backend_xdna_reg());
 #endif
 #ifdef GGML_USE_HEXAGON
         register_backend(ggml_backend_hexagon_reg());

@@ -513,6 +513,7 @@ ggml_add_backend(zDNN)
 ggml_add_backend(OpenCL)
 ggml_add_backend(Hexagon)
 ggml_add_backend(ZenDNN)
+ggml_add_backend(XDNA)
 ggml_add_backend(OPENVINO)
 
 set(GGML_CORE_TARGETS ggml-base ggml)

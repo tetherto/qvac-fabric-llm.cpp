@@ -981,7 +981,7 @@ llm_ffn_op_type llm_ffn_op_type_from_string(const std::string & name, llm_ffn_op
 static buft_list_t make_cpu_buft_list(const std::vector<llama_device> & devices, bool use_extra_bufts, bool no_host) {
     buft_list_t buft_list;
 
-    // add ACCEL buffer types
+    // add ACCEL buffer types, and their extra buffer types (repacked weights)
     for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
         ggml_backend_dev_t dev = ggml_backend_dev_get(i);
         if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_ACCEL) {
@@ -989,6 +989,21 @@ static buft_list_t make_cpu_buft_list(const std::vector<llama_device> & devices,
             // skip
             if (buft != ggml_backend_cpu_buffer_type()) {
                 buft_list.emplace_back(dev, buft);
+            }
+
+            if (use_extra_bufts) {
+                auto * reg = ggml_backend_dev_backend_reg(dev);
+                auto ggml_backend_dev_get_extra_bufts_fn = (ggml_backend_dev_get_extra_bufts_t)
+                    ggml_backend_reg_get_proc_address(reg, "ggml_backend_dev_get_extra_bufts");
+                if (ggml_backend_dev_get_extra_bufts_fn) {
+                    ggml_backend_buffer_type_t * extra_bufts = ggml_backend_dev_get_extra_bufts_fn(dev);
+                    while (extra_bufts && *extra_bufts) {
+                        if (*extra_bufts != buft) {
+                            buft_list.emplace_back(dev, *extra_bufts);
+                        }
+                        ++extra_bufts;
+                    }
+                }
             }
         }
     }

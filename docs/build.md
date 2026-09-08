@@ -27,6 +27,7 @@ The following sections describe how to build with different backends and options
 * [OpenCL](#opencl)
 * [Android](#android-1)
 * [OpenVINO](#openvino)
+* [XDNA](#xdna)
 * [Notes about GPU-accelerated backends](#notes-about-gpu-accelerated-backends)
 
 ## CPU Build
@@ -747,6 +748,21 @@ Follow the instructions [here](https://dawn.googlesource.com/dawn/+/refs/heads/m
 ## IBM Z & LinuxONE
 
 To read documentation for how to build on IBM Z & LinuxONE, [click here](./build-s390x.md)
+
+## XDNA
+
+This provides NPU acceleration on AMD XDNA2 (Strix Halo / Ryzen AI MAX) using XRT. The ggml device name is `XDNA`; pass `--device XDNA`.
+
+XRT 2.25.x and mlir-aie **1.3.4** (not 1.4.1) are required. Install steps, CMake flags, and the E2E CLI are in [llama.cpp for XDNA](./backend/XDNA.md).
+
+```bash
+source /opt/xilinx/xrt/setup.sh
+cmake -B build -DGGML_XDNA=ON \
+    -DGGML_XDNA_IRON_PYTHON=$HOME/ironenv/bin/python3
+cmake --build build --config Release --target llama-completion
+./build/bin/llama-completion --list-devices
+./build/bin/llama-completion -m PATH_TO_MODEL --device XDNA -ngl 99 -p "Hello" -n 32
+```
 
 ## OpenVINO
 
