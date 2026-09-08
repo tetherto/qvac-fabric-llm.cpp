@@ -5126,6 +5126,9 @@ static ggml_backend_buffer_type_t test_repacked_weight_buffer_type(ggml_backend_
             if (strstr(ggml_backend_buft_name(*bufts), "_REPACK") != nullptr) {
                 GGML_ASSERT(!backend_has_feature(backend, "FORCE_CUBLAS"));
                 GGML_ASSERT(!backend_has_feature(backend, "FORCE_MMQ"));
+                auto supports_async_upload = (ggml_backend_dev_supports_async_upload_t)
+                    ggml_backend_reg_get_proc_address(reg, "ggml_backend_dev_supports_async_upload");
+                GGML_ASSERT(supports_async_upload != nullptr && supports_async_upload(dev, *bufts));
                 return *bufts;
             }
         }
@@ -5259,11 +5262,36 @@ struct test_cutlass_mul_mat : public test_repacked_mul_mat {
         std::vector<uint8_t> roundtrip(weight_data.size());
         const size_t offsets[] = {0, weight_data.size() / 3, 2 * weight_data.size() / 3, weight_data.size()};
 
-        ggml_backend_tensor_set(weight_repacked, weight_data.data(), 0, weight_data.size());
+        ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+        auto begin_async_upload = (ggml_backend_begin_async_upload_t)
+            ggml_backend_reg_get_proc_address(reg, "ggml_backend_begin_async_upload");
+        auto end_async_upload = (ggml_backend_end_async_upload_t)
+            ggml_backend_reg_get_proc_address(reg, "ggml_backend_end_async_upload");
+        ggml_backend_ptr backend2(ggml_backend_dev_init(dev, nullptr));
+        GGML_ASSERT(begin_async_upload != nullptr && end_async_upload != nullptr && backend2 != nullptr);
+        GGML_ASSERT(begin_async_upload(backend, weight_repacked));
+        GGML_ASSERT(begin_async_upload(backend2.get(), weight_full));
+        for (size_t i = 0; i < 3; ++i) {
+            ggml_backend_tensor_set_async(
+                backend, weight_repacked, weight_data.data() + offsets[i], offsets[i], offsets[i + 1] - offsets[i]);
+            ggml_backend_tensor_set_async(
+                backend2.get(), weight_full, weight_data.data() + offsets[i], offsets[i], offsets[i + 1] - offsets[i]);
+        }
+        GGML_ASSERT(end_async_upload(backend, weight_repacked));
+        GGML_ASSERT(end_async_upload(backend2.get(), weight_full));
+        ggml_backend_tensor_get_async(backend, weight_repacked, roundtrip.data(), 0, roundtrip.size());
+        ggml_backend_synchronize(backend);
+        ggml_backend_synchronize(backend2.get());
+        transfer_ok = roundtrip == weight_data;
+        ggml_backend_tensor_get(weight_full, roundtrip.data(), 0, roundtrip.size());
+        transfer_ok = transfer_ok && roundtrip == weight_data;
+
+        std::fill(roundtrip.begin(), roundtrip.end(), 0);
         ggml_backend_tensor_set_async(backend, weight_full, weight_data.data(), 0, weight_data.size());
         ggml_backend_tensor_get_async(backend, weight_full, roundtrip.data(), 0, roundtrip.size());
         ggml_backend_synchronize(backend);
-        transfer_ok = roundtrip == weight_data;
+        transfer_ok = transfer_ok && roundtrip == weight_data;
 
         ggml_backend_tensor_set(weight_repacked, zeros.data(), 0, zeros.size());
         for (size_t i : {1, 0, 2}) {
@@ -5309,6 +5337,17 @@ struct test_cutlass_mul_mat : public test_repacked_mul_mat {
         ggml_backend_tensor_get_2d_async(backend, weight_full, strided_read.data(), 1, row_size - 3, m, row_size, host_stride);
         ggml_backend_synchronize(backend);
         transfer_ok = transfer_ok && roundtrip == expected && strided_read == strided;
+
+        GGML_ASSERT(begin_async_upload(backend, weight_full));
+        transfer_ok = !begin_async_upload(backend, weight_copy) && transfer_ok;
+        ggml_backend_tensor_set_async(backend, weight_full, weight_data.data(), 0, offsets[1]);
+        transfer_ok = !end_async_upload(backend, weight_full) && transfer_ok;
+        GGML_ASSERT(begin_async_upload(backend, weight_full));
+        ggml_backend_tensor_set_async(backend, weight_full, weight_data.data(), 0, weight_data.size());
+        GGML_ASSERT(end_async_upload(backend, weight_full));
+        ggml_backend_tensor_get_async(backend, weight_full, roundtrip.data(), 0, roundtrip.size());
+        ggml_backend_synchronize(backend);
+        transfer_ok = transfer_ok && roundtrip == weight_data;
 
         ggml_backend_buffer_set_usage(weight_copy->buffer, GGML_BACKEND_BUFFER_USAGE_COMPUTE);
     }
