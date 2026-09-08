@@ -1,6 +1,7 @@
 #include "llama-model-loader.h"
 
 #include "ggml-alloc.h"
+#include "ggml-cpp.h"
 #include "ggml.h"
 #include "gguf.h"
 #include "llama-hparams.h"
@@ -1493,11 +1494,20 @@ bool llama_model_loader::load_all_data(
     // 64MB works well for NVMe drives
     const size_t buffer_size = alignment != 1 ? 64 * 1024 * 1024 + 2 * alignment : 1 * 1024 * 1024;
 
-    std::vector<ggml_backend_buffer_t> host_buffers;
-    std::vector<ggml_backend_event_t> events;
-    std::vector<void *> host_ptrs;
+    struct async_upload_resources {
+        ggml_backend_ptr backend;
+        std::vector<ggml_backend_buffer_ptr> host_buffers;
+        std::vector<ggml_backend_event_ptr> events;
+        std::vector<void *> host_ptrs;
+
+        ~async_upload_resources() {
+            if (backend) {
+                ggml_backend_synchronize(backend.get());
+            }
+        }
+    } upload;
     size_t buffer_idx = 0; // buffer to use for async loads
-    ggml_backend_t upload_backend = [&](const char * func) -> ggml_backend_t {
+    upload.backend.reset([&](const char * func) -> ggml_backend_t {
         if (use_mmap || check_tensors) {
             return nullptr;
         }
@@ -1548,8 +1558,8 @@ bool llama_model_loader::load_all_data(
                 return nullptr;
             }
 
-            host_buffers.emplace_back(buf);
-            host_ptrs.emplace_back(ggml_backend_buffer_get_base(buf));
+            upload.host_buffers.emplace_back(buf);
+            upload.host_ptrs.emplace_back(ggml_backend_buffer_get_base(buf));
 
             auto * event = ggml_backend_event_new(dev);
             if (!event) {
@@ -1558,7 +1568,7 @@ bool llama_model_loader::load_all_data(
                 return nullptr;
             }
 
-            events.emplace_back(event);
+            upload.events.emplace_back(event);
         }
 
         ggml_backend_t backend = ggml_backend_dev_init(dev, nullptr);
@@ -1569,13 +1579,13 @@ bool llama_model_loader::load_all_data(
         }
 
         return backend;
-    }(__func__);
+    }(__func__));
 
-    if (upload_backend) {
+    if (upload.backend) {
         LLAMA_LOG_DEBUG("%s: using async uploads for device %s, buffer type %s, backend %s\n", __func__,
-            ggml_backend_dev_name(ggml_backend_get_device(upload_backend)),
+            ggml_backend_dev_name(ggml_backend_get_device(upload.backend.get())),
             ggml_backend_buft_name(ggml_backend_buffer_get_type(bufs.at(0))),
-            ggml_backend_name(upload_backend));
+            ggml_backend_name(upload.backend.get()));
     }
 
     for (struct ggml_tensor * cur = ggml_get_first_tensor(ctx); cur != NULL; cur = ggml_get_next_tensor(ctx, cur)) {
@@ -1639,7 +1649,7 @@ bool llama_model_loader::load_all_data(
                 }
             } else {
                 // If upload_backend is valid load the tensor in chunks to pinned memory and upload the buffers asynchronously to the GPU.
-                if (upload_backend) {
+                if (upload.backend) {
                     size_t offset = weight->offs;
                     alignment = file->read_alignment();
                     size_t aligned_offset = offset & ~(alignment - 1);
@@ -1657,10 +1667,10 @@ bool llama_model_loader::load_all_data(
                         size_t read_size = std::min<size_t>(buffer_size, read_end - read_start - bytes_read);
 
                         // Align the destination pointer within the pinned buffer
-                        uintptr_t ptr_dest_aligned = (reinterpret_cast<uintptr_t>(host_ptrs[buffer_idx]) + alignment - 1) & ~(alignment - 1);
+                        uintptr_t ptr_dest_aligned = (reinterpret_cast<uintptr_t>(upload.host_ptrs[buffer_idx]) + alignment - 1) & ~(alignment - 1);
 
                         // Wait for previous upload to complete before reusing buffer
-                        ggml_backend_event_synchronize(events[buffer_idx]);
+                        ggml_backend_event_synchronize(upload.events[buffer_idx].get());
 
                         // Read aligned chunk from file
                         file->read_raw_unsafe(reinterpret_cast<void *>(ptr_dest_aligned), read_size);
@@ -1681,11 +1691,11 @@ bool llama_model_loader::load_all_data(
                         }
 
                         // Async upload actual data to GPU
-                        ggml_backend_tensor_set_async(upload_backend, cur,
+                        ggml_backend_tensor_set_async(upload.backend.get(), cur,
                                                       reinterpret_cast<void *>(ptr_data), data_read, data_to_copy);
-                        ggml_backend_event_record(events[buffer_idx], upload_backend);
-
                         data_read += data_to_copy;
+                        ggml_backend_event_record(upload.events[buffer_idx].get(), upload.backend.get());
+
                         bytes_read += read_size;
 
                         ++buffer_idx;
@@ -1714,14 +1724,9 @@ bool llama_model_loader::load_all_data(
     }
 
     // free temporary resources used for async uploads
-    for (auto * event : events) {
-        ggml_backend_event_synchronize(event);
-        ggml_backend_event_free(event);
+    for (const auto & event : upload.events) {
+        ggml_backend_event_synchronize(event.get());
     }
-    for (auto * buf : host_buffers) {
-        ggml_backend_buffer_free(buf);
-    }
-    ggml_backend_free(upload_backend);
 
     // check validation results
     bool validation_failed = false;
