@@ -98,7 +98,7 @@ Quality checks on Qwen3.5-4B Q8_0 show `tbq4_0/pq4_0` at -0.03% perplexity delta
 - Checkpoint saving and resumable training
 - Learning rate schedulers (constant, cosine, linear) with warmup support
 - LoRA adapter merging into base models via **llama-export-lora**
-- Verified compatibility with Qwen3, Qwen3.5 (dense), Qwen3.6 (MoE), Gemma3, and Gemma4 (dense) model architectures
+- Verified compatibility with Qwen3, Qwen3.5 and Qwen3.6 (dense and MoE), Gemma3, and Gemma4 (dense and MoE) model architectures
 
 For usage details and CLI reference, see the [Finetuning Guide](examples/training/README.md).
 
