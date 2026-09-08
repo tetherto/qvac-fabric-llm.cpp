@@ -14,13 +14,45 @@ The following capabilities are developed and maintained as part of qvac-fabric-l
 
 ### Cluster Inference
 
-Run inference across local and remote GPUs using the RPC backend, with pipeline and tensor parallelism for supported configurations.
+Run inference across local and remote GPUs using the RPC backend. Pipeline parallelism distributes layers across devices; tensor parallelism splits work within layers across devices.
 
-- **Pipeline parallelism**: overlap microbatches across remote devices with `--split-mode layer`. Use protocol 7 on the client and all servers, with one RPC server endpoint per pipeline stage.
-- **Direct all-reduce**: tensor split with exactly two RPC devices can exchange results directly between servers. Large F32 all-reduce tensors use BF16 on the wire by default to reduce network traffic.
-- **Transport**: TCP connectivity with automatically negotiated RDMA on supported Linux systems.
+RPC uses TCP by default. **RDMA support is available only on Linux**, with compatible RoCEv2 network adapters and `libibverbs` available at build time. Supported connections negotiate RDMA automatically; the commands below work with either transport.
 
-With one RPC server running on each host, distribute the model across two stages:
+#### Quickstart Setup
+
+The examples use two GPU hosts and a main host that loads `model.gguf`. Replace the example IP addresses with your hosts' private addresses. Run the RPC servers on a trusted private network.
+
+On each GPU host, build RPC with the backend for that GPU. For NVIDIA CUDA:
+
+```bash
+cmake -B build -DGGML_RPC=ON -DGGML_CUDA=ON
+cmake --build build --config Release -j
+```
+
+On the main host, enable RPC:
+
+```bash
+cmake -B build -DGGML_RPC=ON
+cmake --build build --config Release -j
+```
+
+Start one server per GPU; these same servers work for both modes below:
+
+```bash
+# GPU host 1
+./build/bin/ggml-rpc-server -H 192.168.88.10 -p 50052 --device CUDA0
+
+# GPU host 2
+./build/bin/ggml-rpc-server -H 192.168.88.11 -p 50052 --device CUDA0
+```
+
+Keep the model file on the main host and allow it to reach port `50052` on both GPU hosts.
+
+#### Pipeline Parallelism
+
+Assign successive layers to different GPUs and overlap microbatches across the pipeline. This is useful for processing larger prompt batches. Use one RPC server endpoint per stage; devices exposed by the same server process do not pipeline with each other.
+
+On the main host:
 
 ```bash
 ./build/bin/llama-cli -m model.gguf \
@@ -29,7 +61,24 @@ With one RPC server running on each host, distribute the model across two stages
     --n-gpu-layers all --batch-size 2048 --ubatch-size 256
 ```
 
-See the [RPC Guide](tools/rpc/README.md) for build instructions, server setup, network requirements, and tuning.
+A batch larger than the microbatch (`--ubatch-size`) provides independent work to overlap across stages. Adjust `--tensor-split` to match the devices' available memory; `1,1` assigns equal proportions.
+
+#### Tensor Parallelism *(experimental)*
+
+Split weights and KV-cache tensors across GPUs so the devices cooperate within each layer. This can accelerate token generation for supported models, but requires frequent communication and benefits from low-latency, high-bandwidth links.
+
+Using the same servers, run a model that supports tensor split on the main host:
+
+```bash
+./build/bin/llama-cli -m model.gguf \
+    --rpc 192.168.88.10:50052,192.168.88.11:50052 \
+    --device RPC0,RPC1 --split-mode tensor --tensor-split 1,1 \
+    --n-gpu-layers all
+```
+
+With exactly two RPC devices on separate endpoints, all-reduce can exchange results directly between the servers. Allow GPU host 2 to reach port `51052` on GPU host 1 (its RPC port plus 1000), or set `GGML_RPC_COMM_PORT` on the main host to choose another port. Large F32 all-reduce tensors use BF16 on the wire by default to reduce traffic; set `GGML_RPC_NO_WIRE_BF16=1` on the main host to retain F32 transfers.
+
+See the [RPC Guide](tools/rpc/README.md) for other GPU backends, RDMA setup, and troubleshooting.
 
 ### TurboVec / Local Vector Search *(experimental)*
 
