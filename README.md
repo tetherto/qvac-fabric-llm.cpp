@@ -31,6 +31,24 @@ With one RPC server running on each host, distribute the model across two stages
 
 See the [RPC Guide](tools/rpc/README.md) for build instructions, server setup, network requirements, and tuning.
 
+### MoE Expert Cache *(experimental)*
+
+Improve decoding speed on hybrid systems with limited GPU VRAM and ample system RAM by keeping MoE expert weights in system RAM and caching recently used experts on the GPU. Cache hits reuse GPU-resident weights, reducing repeated CPU-to-GPU transfers during token generation. The benefit depends on expert reuse, cache size, and transfer bandwidth.
+
+- **Configurable VRAM budget**: `--moe-cache-mib N` sets the persistent GPU expert cache budget in MiB; `0` disables it (the default).
+- **Hybrid placement**: combine GPU layer offload with `--cpu-moe` to keep all expert weights in system RAM, or `--n-cpu-moe N` to keep the first N layers' expert weights there.
+- **On-demand caching**: upload missing experts and evict least-recently-used entries when the cache fills. The cache supports single-GPU inference; OpenCL, tensor parallelism, multi-GPU execution, and training are not supported.
+
+For example, keep expert weights in system RAM and allocate a 1 GiB GPU cache:
+
+```bash
+./build/bin/llama-cli -m moe-model.gguf \
+    --n-gpu-layers all --cpu-moe --moe-cache-mib 1024 \
+    -p "Explain how mixture-of-experts models work"
+```
+
+Choose a cache budget that leaves VRAM for other model weights, the KV cache, and compute buffers. It must be large enough to hold the active experts for at least one routed layer.
+
 ### TurboVec / Local Vector Search *(experimental)*
 
 `ggml-vector-index` provides a standalone C API for local vector search, including compressed CPU indexes for applications that need on-device retrieval.
