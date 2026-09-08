@@ -1302,6 +1302,7 @@ void common_fit_apply(common_params & params, llama_model_params & mparams, llam
         params.fit_params_target.data(),
         params.fit_params_min_ctx,
         has_draft || spec_mtp ? &extra : nullptr,
+        params.prefetch_weights_auto,
         params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
 }
 common_init_result::common_init_result() : pimpl(new impl{}) {}
@@ -1879,6 +1880,7 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.type_v = params.cache_type_v;
 
     cparams.moe_cache_size = params.moe_cache_size;
+    cparams.moe_cache_auto = params.fit_params && params.moe_cache_auto;
 
     return cparams;
 }

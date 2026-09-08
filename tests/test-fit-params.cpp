@@ -1,8 +1,6 @@
-// Table-driven tests for the pure fit decision arithmetic in common/fit.cpp.
-// These are the sites of the review findings on qvac-fabric-llm.cpp#214: the
-// shared-pool fold and the step-2 context interpolation. Everything here is
-// provable from the algebra with no hardware, which is the point — the
-// context-inflation bug would have failed these fixtures on their first run.
+// Hardware-independent tests for fitting policy and memory arithmetic.
+// Covers automatic acceleration, placement overrides, shared-memory budgets,
+// and context interpolation without loading model weights or a GPU backend.
 
 #include "../common/fit.h"
 
@@ -28,7 +26,82 @@ static void expect_u32(const char * label, uint32_t got, uint32_t want) {
     }
 }
 
+static void test_automatic_acceleration() {
+    // Each row starts from the CLI's automatic defaults. Exercise both model
+    // types: MoE should select caching, dense should select prefetch.
+    enum scenario {
+        DEFAULTS, DISABLED, RESOLVED, CPU_ONLY, MULTI_GPU, UNIFIED,
+        UNSUPPORTED_CACHE, NO_COPY_STREAM, NO_OFFLOAD, TRAINING,
+    };
+    struct test_case {
+        const char * label;
+        scenario config;
+        bool want_cache;
+        bool want_prefetch;
+    };
+    const test_case cases[] = {
+        { "automatic defaults", DEFAULTS, true, true },
+        { "explicit disable", DISABLED, false, false },
+        { "already selected or explicit value", RESOLVED, false, false },
+        { "CPU only", CPU_ONLY, false, false },
+        { "multiple GPUs", MULTI_GPU, false, false },
+        { "unified memory", UNIFIED, false, false },
+        { "unsupported cache backend", UNSUPPORTED_CACHE, false, true },
+        { "no copy stream", NO_COPY_STREAM, true, false },
+        { "operation offload disabled", NO_OFFLOAD, false, false },
+        { "training", TRAINING, false, false },
+    };
+    const auto mparams = llama_model_default_params();
+    for (const auto & tc : cases) {
+        auto cparams = llama_context_default_params();
+        cparams.moe_cache_auto = tc.config != DISABLED;
+        cparams.moe_cache_size = tc.config == RESOLVED ? GiB : 0;
+        cparams.prefetch_weights = tc.config == RESOLVED;
+        cparams.op_offload = tc.config != NO_OFFLOAD;
+        cparams.training = tc.config == TRAINING;
+        const size_t nd = tc.config == CPU_ONLY ? 0 : tc.config == MULTI_GPU ? 2 : 1;
+        for (uint32_t n_expert : { 0U, 8U }) {
+            expect_i64(tc.label, common_fit_auto_moe_cache(
+                mparams, cparams, n_expert, nd, tc.config == UNIFIED, tc.config != UNSUPPORTED_CACHE),
+                n_expert > 0 && tc.want_cache);
+            expect_i64(tc.label, common_fit_auto_prefetch_weights(
+                cparams, tc.config != DISABLED, n_expert, nd, tc.config == UNIFIED, tc.config != NO_COPY_STREAM),
+                n_expert == 0 && tc.want_prefetch);
+        }
+    }
+}
+
+static void test_auto_cache_preserves_context_fitting() {
+    auto mparams = llama_model_default_params();
+    auto cparams = llama_context_default_params();
+    cparams.moe_cache_auto = true;
+
+    // Cache selection defers context reduction until a recursive fit. Explicit
+    // placement cannot reach that recursion: step 3 rejects it. Those callers
+    // must retain the ordinary context-reduction path instead.
+    for (int n_gpu_layers : { 0, 12, 999 }) {
+        mparams.n_gpu_layers = n_gpu_layers;
+        expect_i64("explicit -ngl must not defer context fitting",
+            common_fit_auto_moe_cache(mparams, cparams, 8, 1, false, true), false);
+    }
+    mparams = llama_model_default_params();
+    llama_model_tensor_buft_override overrides[] = {
+        { "blk\\.\\d+\\.ffn_.*_exps", nullptr },
+        { nullptr, nullptr },
+    };
+    mparams.tensor_buft_overrides = overrides;
+    expect_i64("--cpu-moe / -ot must not defer context fitting",
+        common_fit_auto_moe_cache(mparams, cparams, 8, 1, false, true), false);
+
+    // An allocated but empty overrides array is the normal CLI default.
+    mparams.tensor_buft_overrides = &overrides[1];
+    expect_i64("empty overrides still allow automatic cache",
+        common_fit_auto_moe_cache(mparams, cparams, 8, 1, false, true), true);
+}
+
 int main() {
+    test_automatic_acceleration();
+    test_auto_cache_preserves_context_fitting();
     // --- common_fit_shared_pool_deficit ---
 
     // nd == 1, discrete GPU: device demand never counts against the host pool.
