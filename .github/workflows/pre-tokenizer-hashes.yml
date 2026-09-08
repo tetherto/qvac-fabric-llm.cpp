@@ -1,12 +1,18 @@
 name: Check Pre-Tokenizer Hashes
 
+# QVAC-24501: this workflow's own file is in the paths filters below, which
+# update-ops-docs.yml and every build-*.yml already do but upstream omitted
+# here. Without it a change to this file cannot trigger the job it defines, so
+# the runner repoint in this branch was unverifiable by CI.
 on:
     push:
         paths:
+            - '.github/workflows/pre-tokenizer-hashes.yml'
             - 'conversion/base.py'
             - 'convert_hf_to_gguf_update.py'
     pull_request:
         paths:
+            - '.github/workflows/pre-tokenizer-hashes.yml'
             - 'conversion/base.py'
             - 'convert_hf_to_gguf_update.py'
 
