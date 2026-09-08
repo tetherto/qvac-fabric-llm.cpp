@@ -16,7 +16,7 @@ The following capabilities are developed and maintained as part of qvac-fabric-l
 
 Run inference across GPUs on multiple machines using RPC. TCP is supported by default; **RDMA is Linux-only**, with compatible RoCEv2 adapters and `libibverbs`, and is negotiated automatically.
 
-Build with `-DGGML_RPC=ON` and the GPU backend for each host (see the [RPC Guide](tools/rpc/README.md)). Start one server per GPU on a private network:
+Build with `-DGGML_RPC=ON` and the GPU backend for each host. For RDMA, also set `-DGGML_RPC_RDMA=ON` on the Linux client and servers, with `libibverbs` installed (see the [RPC Guide](tools/rpc/README.md)). Start one server per GPU on a private network:
 
 ```bash
 # Run on GPU host 1 and GPU host 2, respectively
