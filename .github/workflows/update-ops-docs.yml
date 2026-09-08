@@ -16,7 +16,11 @@ on:
 
 jobs:
     update-ops-docs:
-        runs-on: [self-hosted, fast, ARM64]
+        # QVAC-24501: upstream's [self-hosted, fast, ARM64] needs a custom `fast`
+        # label the qvac fleet does not carry. The job only runs
+        # scripts/create_ops_docs.py and diffs the result, so it does not need
+        # ARM64 either - the general-purpose fleet CPU box is enough.
+        runs-on: qvac-ubuntu2404-x64
 
         steps:
         - name: Checkout repository

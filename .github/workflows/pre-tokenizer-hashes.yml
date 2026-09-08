@@ -12,7 +12,10 @@ on:
 
 jobs:
     pre-tokenizer-hashes:
-        runs-on: [self-hosted, fast]
+        # QVAC-24501: upstream's [self-hosted, fast] needs a custom `fast` label
+        # the qvac fleet does not carry. This job is Python plus a diff, so the
+        # general-purpose fleet CPU box is ample.
+        runs-on: qvac-ubuntu2404-x64
 
         steps:
         - name: Checkout repository

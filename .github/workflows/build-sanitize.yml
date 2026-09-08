@@ -42,7 +42,12 @@ env:
 
 jobs:
   ctest:
-    runs-on: [self-hosted, X64, CPU, Linux]
+    # QVAC-24501: upstream's [self-hosted, X64, CPU, Linux] needs a custom `CPU`
+    # label that the qvac fleet does not carry, so every job queued for 24h and
+    # was then killed as "cancelled" - it has never produced a result in this
+    # fork. qvac-ubuntu2204-x64 is the fleet CPU box that already runs
+    # build-self-hosted.yml's cpu-x64-high-perf.
+    runs-on: qvac-ubuntu2204-x64
 
     continue-on-error: ${{ matrix.sanitizer == 'THREAD' }}
 

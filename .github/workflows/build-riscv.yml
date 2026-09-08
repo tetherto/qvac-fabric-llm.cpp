@@ -35,6 +35,10 @@ env:
 
 jobs:
   ubuntu-cpu-riscv64-native:
+    # QVAC-24501: ubuntu-24.04-riscv is a GitHub-hosted arch image available on
+    # public repos only, so it never gets a runner here - the job queued for 24h
+    # and was killed as "cancelled" on every run since this fork was created.
+    if: false  # QVAC-23796: no matching hardware
     runs-on: ubuntu-24.04-riscv
 
     steps:
@@ -106,6 +110,9 @@ jobs:
           ./bin/llama-completion -m stories260K.gguf -p "One day, Lily met a Shoggoth" -n 500 -c 256
 
   ubuntu-riscv64-native-sanitizer:
+    # QVAC-24501: see ubuntu-cpu-riscv64-native above. This is a 3-way sanitizer
+    # matrix, so it accounted for 3 of the 12 permanently-queued jobs.
+    if: false  # QVAC-23796: no matching hardware
     runs-on: ubuntu-24.04-riscv
 
     continue-on-error: true

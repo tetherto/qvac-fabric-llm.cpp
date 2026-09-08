@@ -36,6 +36,10 @@ env:
 jobs:
 
   ubuntu-24-s390x:
+    # QVAC-24501: ubuntu-24.04-s390x is a GitHub-hosted arch image available on
+    # public repos only, so it never gets a runner here - the job queued for 24h
+    # and was killed as "cancelled" on every run since this fork was created.
+    if: false  # QVAC-23796: no matching hardware
     runs-on: ubuntu-24.04-s390x
 
     steps:
@@ -95,6 +99,9 @@ jobs:
           ./bin/llama-completion -m stories260K-be.gguf -p "One day, Lily met a Shoggoth" -n 500 -c 256
 
   ubuntu-24-ppc64le:
+    # QVAC-24501: see ubuntu-24-s390x above - ubuntu-24.04-ppc64le is public-repo
+    # only and never gets a runner in this fork.
+    if: false  # QVAC-23796: no matching hardware
     runs-on: ubuntu-24.04-ppc64le
 
     steps:
