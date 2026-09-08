@@ -1855,6 +1855,31 @@ static struct ggml_backend_sched_moe_cache_entry * ggml_backend_sched_moe_cache_
     return NULL;
 }
 
+// Release a copy stream that is parked on this split's compute event.
+//
+// When weight prefetch is on, a split may enqueue
+//     ggml_backend_event_wait(copy_backend, sched->compute_events[backend_id])
+// before its own compute, so the copy stream does not overwrite a staging
+// buffer the previous split is still reading. That wait is satisfied by the
+// matching ggml_backend_event_record() at the end of the split.
+//
+// If compute returns early -- GGML_STATUS_ABORTED from an abort callback is the
+// common case, and cancelling a request mid-prefill is exactly that -- the
+// record never happens and the copy stream waits on an event that will never be
+// signalled. ggml_backend_sched_synchronize() then blocks forever in
+// ggml_backend_synchronize(sched->copy_backends[i]), which the caller sees as a
+// hang rather than as the cancellation it asked for.
+//
+// Recording the event on the way out keeps that handshake balanced on every
+// exit path. The graph is being abandoned, so the event carries no meaning
+// beyond unblocking the copy stream.
+static void ggml_backend_sched_release_prefetch_wait(
+        ggml_backend_sched_t sched, ggml_backend_t split_backend, int split_backend_id) {
+    if (sched->compute_events[split_backend_id] != NULL) {
+        ggml_backend_event_record(sched->compute_events[split_backend_id], split_backend);
+    }
+}
+
 static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     struct ggml_backend_sched_split * splits = sched->splits;
@@ -2035,6 +2060,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                                 selected_ids.data(), selected_ids.size(),
                                 cache_ids.data())) {
                             GGML_LOG_ERROR("%s: failed to prepare persistent MoE cache\n", __func__);
+                            ggml_backend_sched_release_prefetch_wait(sched, split_backend, split_backend_id);
                             return GGML_STATUS_FAILED;
                         }
 
@@ -2111,6 +2137,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         if (!sched->callback_eval) {
             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
             if (ec != GGML_STATUS_SUCCESS) {
+                ggml_backend_sched_release_prefetch_wait(sched, split_backend, split_backend_id);
                 return ec;
             }
         } else {
@@ -2133,6 +2160,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
                 enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &gv);
                 if (ec != GGML_STATUS_SUCCESS) {
+                    ggml_backend_sched_release_prefetch_wait(sched, split_backend, split_backend_id);
                     return ec;
                 }
 
