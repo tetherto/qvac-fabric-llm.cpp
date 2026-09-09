@@ -3980,6 +3980,7 @@ static void ggml_webgpu_init_memset_pipeline(webgpu_global_context & ctx) {
 
 static void ggml_backend_webgpu_request_adapter(wgpu::Instance & instance, wgpu::Adapter & adapter) {
     wgpu::RequestAdapterOptions options = {};
+    options.powerPreference             = wgpu::PowerPreference::HighPerformance;
 
 #ifndef __EMSCRIPTEN__
     // TODO: track need for these toggles: https://issues.chromium.org/issues/42251215
