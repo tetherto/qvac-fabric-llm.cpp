@@ -171,18 +171,6 @@ qvac-fabric-llm.cpp is a maintained fork of [llama.cpp](https://github.com/ggml-
 
 **Current upstream baseline:** llama.cpp b10297
 
-### Exclusive Features
-
-The following features are developed in qvac-fabric-llm.cpp and are not available in upstream llama.cpp:
-
-| Feature | Description |
-|---------|-------------|
-| TurboQuant KV cache quantization | TBQ3_0/TBQ4_0 with QJL correction plus PQ3_0/PQ4_0 Stage 1 formats; CPU quantization/dequantization and Vulkan inference kernels for low-bit KV-cache inference |
-| LoRA fine-tuning | On-device training across CPU, Vulkan, and Metal with SFT, checkpointing, and LR scheduling |
-| BitNet inference and training | TQ2_0 quantization on Vulkan, Metal, and CPU for inference and LoRA fine-tuning; extends [microsoft/BitNet](https://github.com/microsoft/BitNet) beyond its CUDA-only GPU support |
-| Memory-based model loading | Load models from in-memory buffers with split-model and async fulfillment support |
-| Mobile GPU optimization | Adreno 800+ quantized inference (Q4_0, Q8), Adreno-specific Vulkan shader variants, VMA integration |
-
 ### Upstream Compatibility
 
 All standard llama.cpp functionality, models, and APIs remain fully compatible.
