@@ -59,15 +59,6 @@ Split work within each layer across GPUs to accelerate decoding for supported mo
 
 The library is disabled by default. Enable it with `-DGGML_VECTOR_INDEX=ON` and link `ggml::vector-index` explicitly; it is not integrated into the llama runtime or server. See the [Vector Index Guide](docs/vector-index.md) for supported dimensions, API usage, persistence contracts, and benchmarks.
 
-### VisionPsy Nano / Flash Support
-
-Run VisionPsy Nano and Flash vision-language models through the multimodal subsystem using compatible GGUF models and projectors.
-
-- **Image sizing**: `--image-no-upscale on` enables the Flash preprocessing rule, rounding image sizes to the slice grid without always stretching smaller images to the maximum size. Use it for Flash projectors that do not declare this rule in GGUF metadata.
-- **Memory-aware vision attention**: automatic flash-attention selection accounts for image size and device memory on backends without efficient cooperative-matrix flash attention.
-
-See the [Multimodal Guide](tools/mtmd/README.md) for model and projector usage, and the [server CLI reference](tools/server/README.md) for image-processing options.
-
 ### TurboQuant KV Cache Quantization
 
 TurboQuant adds low-bit KV-cache quantization formats for long-context inference while preserving token-generation quality close to higher-bit caches. It supports:
@@ -119,6 +110,15 @@ The official [microsoft/BitNet](https://github.com/microsoft/BitNet) inference f
 - **Training**: LoRA fine-tuning of BitNet models on Vulkan, Metal, and CPU backends
 - **Conversion**: HuggingFace-to-GGUF conversion for BitNet model architectures
 - Cooperative matrix (coopmat) support for Vulkan devices that expose the extension
+
+### VisionPsy Nano / Flash Support
+
+Run VisionPsy Nano and Flash vision-language models through the multimodal subsystem using compatible GGUF models and projectors.
+
+- **Image sizing**: `--image-no-upscale on` enables the Flash preprocessing rule, rounding image sizes to the slice grid without always stretching smaller images to the maximum size. Use it for Flash projectors that do not declare this rule in GGUF metadata.
+- **Memory-aware vision attention**: automatic flash-attention selection accounts for image size and device memory on backends without efficient cooperative-matrix flash attention.
+
+See the [Multimodal Guide](tools/mtmd/README.md) for model and projector usage, and the [server CLI reference](tools/server/README.md) for image-processing options.
 
 ### Mobile GPU Optimization
 
