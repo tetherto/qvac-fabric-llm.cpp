@@ -1,12 +1,19 @@
-# qvac-fabric-llm.cpp
+<div align="center">
 
-**AI inference and training engine for desktop and mobile platforms.**
+<h1>qvac-fabric-llm.cpp</h1>
 
-[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://opensource.org/licenses/MIT)
-[![Based on llama.cpp](https://img.shields.io/badge/based%20on-llama.cpp%20b10297-orange.svg)](https://github.com/ggml-org/llama.cpp)
+<p><strong>AI inference and training engine for desktop and mobile platforms.</strong></p>
+
+<p>
+<a href="https://opensource.org/licenses/MIT"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License: MIT"></a>
+<a href="https://github.com/ggml-org/llama.cpp"><img src="https://img.shields.io/badge/based%20on-llama.cpp%20b10297-orange.svg" alt="Based on llama.cpp"></a>
+</p>
+
+</div>
 
 `qvac-fabric-llm.cpp` is a specialized fork of [llama.cpp](https://github.com/ggml-org/llama.cpp) optimized for embedded systems, mobile devices, and enterprise deployment scenarios. It extends the excellent foundation of llama.cpp with additional capabilities focused on memory-based model loading, mobile GPU optimization, and flexible integration patterns.
 
+---
 
 ## Key Features
 
@@ -71,7 +78,7 @@ TurboQuant adds low-bit KV-cache quantization formats for long-context inference
 - **Backend support**: CPU quantization/dequantization and Vulkan inference kernels, including attention paths and mixed K/V cache configurations. CUDA and Metal do not include TurboQuant kernels in this release.
 - **Test coverage**: performance coverage via [test-kv-cache-quantization-perf.sh](tests/test-kv-cache-quantization-perf.sh), perplexity coverage via [test-kv-cache-quantization-perp.sh](tests/test-kv-cache-quantization-perp.sh), and eval coverage via [test-kv-cache-ruler.py](tests/test-kv-cache-ruler.py), [test-kv-cache-niah.py](tests/test-kv-cache-niah.py), [test-kv-cache-longbench.py](tests/test-kv-cache-longbench.py), [test-kv-cache-zeroscrolls.py](tests/test-kv-cache-zeroscrolls.py), and [test-kv-cache-leval.py](tests/test-kv-cache-leval.py).
 
-Qwen3.5-4B Q8_0 benchmark highlights:
+**Qwen3.5-4B Q8_0 benchmark highlights:**
 
 | Context | Cache config | BPW | RTX 5090 pp | RTX 5090 tg | Strix Halo pp | Strix Halo tg |
 | :-- | :-- | --: | --: | --: | --: | --: |
@@ -122,6 +129,7 @@ Enhanced GPU support with targeted optimizations for Qualcomm Adreno GPUs.
 - Adreno-specific Vulkan shader variants for improved throughput.
 - Vulkan Memory Allocator (VMA) integration for efficient GPU memory management.
 
+---
 
 ## Quick Start
 
@@ -153,17 +161,19 @@ For more detailed build instructions, see [docs/build.md](docs/build.md).
 ./build/bin/llama-cli -m model.gguf -ngl 99 -c 4096 -p "Explain quantum computing in simple terms"
 ```
 
+---
 
 ## Supported Platforms
 
 | Platform | Backend | Status |
-|----------|---------|--------|
+| :-- | :-- | :--: |
 | Linux (x86_64, ARM64) | CPU, Vulkan, CUDA | ✅ Full support |
 | macOS (Intel, Apple Silicon) | CPU, Metal | ✅ Full support |
 | Windows (x86_64) | CPU, Vulkan, CUDA | ✅ Full support |
 | Android (ARM64) | CPU, Vulkan, OpenCL | ✅ Full support |
 | iOS | CPU, Metal | ✅ Full support |
 
+---
 
 ## Relationship with llama.cpp
 
@@ -178,6 +188,7 @@ All standard llama.cpp functionality, models, and APIs remain fully compatible.
 - Any GGUF model supported by llama.cpp is supported by qvac-fabric-llm.cpp
 - Existing llama.cpp documentation applies to shared functionality
 
+---
 
 ## Contributing
 
@@ -187,6 +198,7 @@ We welcome contributions! Please see our development workflow:
 2. Create a feature branch from `master`
 3. Submit a pull request
 
+---
 
 ## License
 
