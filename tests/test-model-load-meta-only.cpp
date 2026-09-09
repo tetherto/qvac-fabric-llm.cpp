@@ -6,13 +6,12 @@
 
 #include <cstdio>
 #include <cstdlib>
-#include <cstring>
 #include <string>
 #include <vector>
 
-static const char * MODEL_PATH        = "test-model-load-meta-only.gguf";
-static const char * SPLIT_PREFIX      = "test-model-load-meta-only-split";
-static const int    N_SPLIT           = 2;
+static const char * MODEL_PATH   = "test-model-load-meta-only.gguf";
+static const char * SPLIT_PREFIX = "test-model-load-meta-only-split";
+static const int    N_SPLIT      = 2;
 
 static const int64_t N_EMBD      = 32;
 static const int64_t N_FF        = 64;
@@ -46,10 +45,44 @@ static const tensor_info TENSORS[] = {
 
 static const int N_TENSORS = sizeof(TENSORS) / sizeof(TENSORS[0]);
 
+// mmap says what the loader turns this mode into, see llama_model_loader::llama_model_loader
+struct load_mode_case {
+    const char *    name;
+    llama_load_mode mode;
+    bool            mmap;
+};
+
+// the modes that relax the check come first, so a regression reports before any later abort
+static const load_mode_case MODES[] = {
+    { "NONE",       LLAMA_LOAD_MODE_NONE,       false },
+    { "MLOCK",      LLAMA_LOAD_MODE_MLOCK,      false },
+    { "DIRECT_IO",  LLAMA_LOAD_MODE_DIRECT_IO,  false },
+    { "AUTO",       LLAMA_LOAD_MODE_AUTO,       true  },
+    { "MMAP",       LLAMA_LOAD_MODE_MMAP,       true  },
+    { "MMAP_MLOCK", LLAMA_LOAD_MODE_MMAP_MLOCK, true  },
+};
+
+static const int N_MODES = sizeof(MODES) / sizeof(MODES[0]);
+
+enum entry_point {
+    ENTRY_FILE,
+    ENTRY_SPLITS,
+    ENTRY_FILE_PTR,
+};
+
+static const char * entry_name(entry_point ep) {
+    switch (ep) {
+        case ENTRY_FILE:     return "from_file";
+        case ENTRY_SPLITS:   return "from_splits";
+        case ENTRY_FILE_PTR: return "from_file_ptr";
+    }
+    return "?";
+}
+
 static int n_fail = 0;
 
-static void check(bool ok, const char * what) {
-    fprintf(stderr, "%s: %s\n", ok ? "PASS" : "FAIL", what);
+static void check(bool ok, const std::string & what) {
+    fprintf(stderr, "%s: %s\n", ok ? "PASS" : "FAIL", what.c_str());
     if (!ok) {
         n_fail++;
     }
@@ -60,6 +93,7 @@ static void check(bool ok, const char * what) {
     exit(EXIT_FAILURE);
 }
 
+// writes tensor infos [first, last) of TENSORS, with no tensor data
 static void write_meta_only(const char * path, int first, int last, bool with_hparams, uint16_t split_no, uint16_t split_count) {
     const size_t mem_size = ggml_tensor_overhead() * (N_TENSORS + 1);
     std::vector<uint8_t> mem(mem_size);
@@ -120,33 +154,39 @@ static std::string split_path(int split_no) {
     return std::string(buf);
 }
 
-static llama_model_params make_params(bool no_alloc, llama_load_mode load_mode) {
+static bool loads(entry_point ep, bool no_alloc, llama_load_mode mode) {
     llama_model_params mparams = llama_model_default_params();
     mparams.no_alloc  = no_alloc;
-    mparams.load_mode = load_mode;
-    return mparams;
-}
+    mparams.load_mode = mode;
 
-static bool loads(bool no_alloc, llama_load_mode load_mode) {
-    llama_model * model = llama_model_load_from_file(MODEL_PATH, make_params(no_alloc, load_mode));
-    if (model == nullptr) {
-        return false;
-    }
-    llama_model_free(model);
-    return true;
-}
+    llama_model * model = nullptr;
 
-static bool loads_split(bool no_alloc, llama_load_mode load_mode) {
-    std::vector<std::string> paths;
-    std::vector<const char *> c_paths;
-    for (int i = 0; i < N_SPLIT; i++) {
-        paths.push_back(split_path(i));
-    }
-    for (const auto & p : paths) {
-        c_paths.push_back(p.c_str());
+    switch (ep) {
+        case ENTRY_FILE:
+            model = llama_model_load_from_file(MODEL_PATH, mparams);
+            break;
+        case ENTRY_SPLITS: {
+            std::vector<std::string>  paths;
+            std::vector<const char *> c_paths;
+            for (int i = 0; i < N_SPLIT; i++) {
+                paths.push_back(split_path(i));
+            }
+            for (const auto & p : paths) {
+                c_paths.push_back(p.c_str());
+            }
+            model = llama_model_load_from_splits(c_paths.data(), c_paths.size(), mparams);
+        } break;
+        case ENTRY_FILE_PTR: {
+            // the loader does not take ownership of the FILE *
+            FILE * f = fopen(MODEL_PATH, "rb");
+            if (f == nullptr) {
+                die("failed to open the metadata-only GGUF");
+            }
+            model = llama_model_load_from_file_ptr(f, mparams);
+            fclose(f);
+        } break;
     }
 
-    llama_model * model = llama_model_load_from_splits(c_paths.data(), c_paths.size(), make_params(no_alloc, load_mode));
     if (model == nullptr) {
         return false;
     }
@@ -163,13 +203,25 @@ int main() {
     write_meta_only(split_path(0).c_str(), 0,       n_first,   /*with_hparams =*/ true,  0, N_SPLIT);
     write_meta_only(split_path(1).c_str(), n_first, N_TENSORS, /*with_hparams =*/ false, 1, N_SPLIT);
 
-    check(loads(/*no_alloc =*/ true, LLAMA_LOAD_MODE_NONE), "no_alloc without mmap loads a metadata-only GGUF");
-    check(loads_split(/*no_alloc =*/ true, LLAMA_LOAD_MODE_NONE), "no_alloc without mmap loads metadata-only splits");
+    const entry_point ENTRIES[] = { ENTRY_FILE, ENTRY_SPLITS, ENTRY_FILE_PTR };
 
-    check(!loads(/*no_alloc =*/ false, LLAMA_LOAD_MODE_NONE), "a real load still rejects a metadata-only GGUF");
-    check(!loads_split(/*no_alloc =*/ false, LLAMA_LOAD_MODE_NONE), "a real load still rejects metadata-only splits");
+    for (int i = 0; i < N_MODES; i++) {
+        const load_mode_case & m = MODES[i];
 
-    check(!loads(/*no_alloc =*/ true, LLAMA_LOAD_MODE_MMAP), "mmap still rejects a metadata-only GGUF");
+        for (int a = 0; a < 2; a++) {
+            const bool no_alloc = a == 1;
+
+            // nothing reads tensor data only when no_alloc is set and the mode does not mmap
+            const bool expect = no_alloc && !m.mmap;
+
+            for (const entry_point ep : ENTRIES) {
+                char buf[256];
+                snprintf(buf, sizeof(buf), "%-13s %-10s no_alloc=%d -> %s",
+                         entry_name(ep), m.name, no_alloc ? 1 : 0, expect ? "loads" : "rejected");
+                check(loads(ep, no_alloc, m.mode) == expect, buf);
+            }
+        }
+    }
 
     remove(MODEL_PATH);
     for (int i = 0; i < N_SPLIT; i++) {
