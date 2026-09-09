@@ -5247,6 +5247,18 @@ struct test_cutlass_mul_mat : public test_repacked_mul_mat {
         ggml_tensor * weight_native = ggml_get_tensor(ctx, "weight_native");
         if (weight_native != nullptr) {
             test_case::initialize_tensors(ctx);
+            if (type == GGML_TYPE_NVFP4) {
+                ggml_tensor * input = ggml_get_tensor(ctx, "input");
+                std::vector<float> data(ggml_nelements(input));
+                ggml_backend_tensor_get(input, data.data(), 0, ggml_nbytes(input));
+                for (int64_t row = 0; row < n; ++row) {
+                    const float scale = n > 1 && row % 17 == 0 ? 0.0f : std::ldexp(1.0f, row % 17 - 8);
+                    for (int64_t col = 0; col < k; ++col) {
+                        data[row * k + col] *= scale;
+                    }
+                }
+                ggml_backend_tensor_set(input, data.data(), 0, ggml_nbytes(input));
+            }
             weight_data.resize(ggml_nbytes(weight_native));
             ggml_backend_tensor_get(weight_native, weight_data.data(), 0, weight_data.size());
             return;
@@ -12209,6 +12221,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_cutlass_mul_mat(type, 257, 256, 576));
         test_cases.emplace_back(new test_cutlass_mul_mat(type, 257, 1, 576));
         if (type == GGML_TYPE_NVFP4) {
+            test_cases.emplace_back(new test_cutlass_mul_mat(type, 260, 65, 64));
+            test_cases.emplace_back(new test_cutlass_mul_mat(type, 260, 129, 576));
             test_cases.emplace_back(new test_cutlass_mul_mat(type, 5120, 512, 5120));
         }
         for (ggml_glu_op glu_op : {GGML_GLU_OP_SWIGLU, GGML_GLU_OP_GEGLU}) {

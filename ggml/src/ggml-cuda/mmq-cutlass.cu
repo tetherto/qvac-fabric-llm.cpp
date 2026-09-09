@@ -101,44 +101,6 @@ static __global__ void cutlass_quantize_mxfp8(
     }
 }
 
-static __global__ void cutlass_repack_nvfp4_activation(
-        const block_fp4_mmq * __restrict__ src,
-        uint8_t * __restrict__ dst,
-        uint8_t * __restrict__ scales,
-        int64_t n_rows,
-        int64_t n_cols_padded) {
-    const int64_t index = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
-    const int64_t scale_blocks = n_cols_padded / QK_NVFP4_SUB;
-    if (index >= n_rows * scale_blocks) {
-        return;
-    }
-
-    const int64_t row = index / scale_blocks;
-    const int64_t subblock = index % scale_blocks;
-    const int64_t k = subblock * QK_NVFP4_SUB;
-    const block_fp4_mmq & block = src[(k / QK_FP4_MMQ) * n_rows + row];
-    const int sub = (k % QK_FP4_MMQ) / QK_NVFP4_SUB;
-    const uint8_t * values = reinterpret_cast<const uint8_t *>(block.qs) + sub * QK_NVFP4_SUB / 2;
-    uint8_t * output = dst + row * (n_cols_padded / 2) + k / 2;
-#    pragma unroll
-    for (int i = 0; i < QK_NVFP4_SUB / 2; ++i) {
-        const int element = 2 * i;
-        const uint8_t lo = (values[element % 8] >> (4 * (element / 8))) & 0x0F;
-        const uint8_t hi = (values[(element + 1) % 8] >> (4 * ((element + 1) / 8))) & 0x0F;
-        output[i] = lo | (hi << 4);
-    }
-    scales[ggml_cuda_cutlass_blockscaled_scale_offset(row, subblock, scale_blocks)] =
-        reinterpret_cast<const uint8_t *>(block.d4)[sub];
-}
-
-static __global__ void cutlass_scale_rows(
-        float * __restrict__ dst, const float * __restrict__ row_scales, int64_t n_rows, int64_t n_cols) {
-    const int64_t index = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
-    if (index < n_rows * n_cols) {
-        dst[index] *= row_scales[index / n_cols];
-    }
-}
-
 static size_t cutlass_activation_size(ggml_type type, int64_t n_rows, int64_t n_cols) {
     GGML_ASSERT(type == GGML_TYPE_MXFP4 || type == GGML_TYPE_NVFP4);
     GGML_ASSERT(n_rows > 0 && n_cols > 0 && n_cols % 128 == 0);
@@ -153,7 +115,6 @@ static size_t cutlass_scale_size(ggml_type type, int64_t n_rows, int64_t n_cols)
 }
 
 static bool cutlass_quantize(
-        ggml_backend_cuda_context & ctx,
         const float * src,
         uint8_t * dst,
         uint8_t * scales,
@@ -176,14 +137,8 @@ static bool cutlass_quantize(
     constexpr int threads = 256;
     CUDA_CHECK(cudaMemsetAsync(scales, 0, cutlass_scale_size(type, n_rows, n_cols_padded), stream));
     if (type == GGML_TYPE_NVFP4) {
-        const int64_t blocks_per_row = (n_cols_padded + QK_FP4_MMQ - 1) / QK_FP4_MMQ;
-        ggml_cuda_pool_alloc<block_fp4_mmq> quantized(ctx.pool(), blocks_per_row * n_rows);
-        quantize_mmq_fp4_cuda(src, nullptr, quantized.get(), row_scales, type, use_aligned_float8,
-            n_cols, stride_row, stride_row * n_rows, stride_row * n_rows,
-            n_cols_padded, n_rows, 1, 1, stream);
-        const int64_t subblocks = n_rows * (n_cols_padded / QK_NVFP4_SUB);
-        cutlass_repack_nvfp4_activation<<<(unsigned) ((subblocks + threads - 1) / threads), threads, 0, stream>>>(
-            quantized.get(), dst, scales, n_rows, n_cols_padded);
+        quantize_cutlass_nvfp4_cuda(src, dst, scales, row_scales, use_aligned_float8,
+            n_cols, n_cols_padded, stride_row, n_rows, stream);
     } else {
         cutlass_quantize_mxfp8<<<(unsigned) n_rows, threads, 0, stream>>>(
             src, dst, scales, n_cols, n_cols_padded, stride_row);
@@ -241,6 +196,13 @@ struct blockscaled_kernel_traits {
     static constexpr int alignment_b = Format::template alignment<ElementB>;
     static constexpr int alignment_d = 128 / cutlass::sizeof_bits<Output>::value;
 
+    using RowScaledAcc = cutlass::epilogue::fusion::Sm90EVT<
+        cutlass::epilogue::fusion::Sm90Compute<cutlass::multiplies, Output, float, cutlass::FloatRoundStyle::round_to_nearest>,
+        cutlass::epilogue::fusion::Sm90ColBroadcast<0, TileShape, float>,
+        cutlass::epilogue::fusion::Sm90AccFetch>;
+    using Fusion = cute::conditional_t<cute::is_same_v<Format, nvfp4_format_traits>, RowScaledAcc,
+        cutlass::epilogue::fusion::LinearCombination<Output, float, void, float>>;
+
     using EpilogueBuilder = cutlass::epilogue::collective::CollectiveBuilder<
         cutlass::arch::Sm120,
         cutlass::arch::OpClassBlockScaledTensorOp,
@@ -255,7 +217,7 @@ struct blockscaled_kernel_traits {
         Output,
         LayoutD,
         alignment_d,
-        cutlass::epilogue::collective::EpilogueScheduleAuto>;
+        cutlass::epilogue::collective::EpilogueScheduleAuto, Fusion>;
     using CollectiveEpilogue = typename EpilogueBuilder::CollectiveOp;
     using StageCount = cutlass::gemm::collective::StageCountAutoCarveout<static_cast<int>(
         sizeof(typename CollectiveEpilogue::SharedStorage))>;
@@ -294,6 +256,7 @@ static ggml_cuda_cutlass_result run_dense_gemm(
         const ggml_cuda_cutlass_weight & weight,
         const uint8_t * activation,
         const uint8_t * activation_scales,
+        const float * row_scales,
         void * dst,
         int m,
         int n,
@@ -331,8 +294,12 @@ static ggml_cuda_cutlass_result run_dense_gemm(
             stride_d,
         },
     };
-    arguments.epilogue.thread.alpha = 1.0f;
-    arguments.epilogue.thread.beta  = 0.0f;
+    if constexpr (cute::is_same_v<typename Traits::Scale, cutlass::float_ue4m3_t>) {
+        arguments.epilogue.thread = {{row_scales}, {}, {}};
+    } else {
+        arguments.epilogue.thread.alpha = 1.0f;
+        arguments.epilogue.thread.beta  = 0.0f;
+    }
 
     Gemm gemm;
     const cutlass::Status can_implement = gemm.can_implement(arguments);
@@ -365,6 +332,7 @@ static ggml_cuda_cutlass_result dispatch_dense_gemm(
         const ggml_cuda_cutlass_weight & weight,
         const uint8_t * activation,
         const uint8_t * activation_scales,
+        const float * row_scales,
         void * dst,
         int m,
         int n,
@@ -372,11 +340,11 @@ static ggml_cuda_cutlass_result dispatch_dense_gemm(
         cudaStream_t stream) {
     if (weight.type == GGML_TYPE_MXFP4) {
         return run_dense_gemm<blockscaled_kernel_traits<mxfp_format_traits>>(
-            ctx, weight, activation, activation_scales, dst, m, n, k, stream);
+            ctx, weight, activation, activation_scales, row_scales, dst, m, n, k, stream);
     }
     if (weight.type == GGML_TYPE_NVFP4) {
         return run_dense_gemm<blockscaled_kernel_traits<nvfp4_format_traits>>(
-            ctx, weight, activation, activation_scales, dst, m, n, k, stream);
+            ctx, weight, activation, activation_scales, row_scales, dst, m, n, k, stream);
     }
     return ggml_cuda_cutlass_result::fallback;
 }
@@ -428,7 +396,7 @@ ggml_cuda_cutlass_result ggml_cuda_cutlass_mul_mat(
         row_scales.alloc(m);
     }
     if (!cutlass_quantize(
-            ctx, (const float *) src1->data,
+            (const float *) src1->data,
             activation.get(),
             scales.get(),
             row_scales.get(),
@@ -442,16 +410,9 @@ ggml_cuda_cutlass_result ggml_cuda_cutlass_mul_mat(
         return ggml_cuda_cutlass_result::fallback;
     }
 
-    const auto result = dispatch_dense_gemm(
-        ctx, weight, activation.get(), scales.get(), dst->data,
+    return dispatch_dense_gemm(
+        ctx, weight, activation.get(), scales.get(), row_scales.get(), dst->data,
         (int) m, (int) n, (int) k_padded, stream);
-    if (result == ggml_cuda_cutlass_result::success && row_scales.get() != nullptr) {
-        constexpr int threads = 256;
-        cutlass_scale_rows<<<(unsigned) ((m * n + threads - 1) / threads), threads, 0, stream>>>(
-            (float *) dst->data, row_scales.get(), m, n);
-        CUDA_CHECK(cudaGetLastError());
-    }
-    return result;
 }
 
 #else
