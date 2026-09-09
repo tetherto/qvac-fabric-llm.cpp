@@ -35,8 +35,19 @@ env:
   LLAMA_ARG_LOG_TIMESTAMPS: 1
   LLAMA_ARG_LOG_VERBOSITY: 10
 
+# QVAC divergence from upstream. Reachable outcomes:
+#
+#   pull_request                 -> per PR   (supersedes)
+#   workflow_dispatch with `sha` -> per sha  (re-dispatching the SAME commit
+#                                   supersedes; two commits coexist)
+#   push to master               -> per run  (run_id; never cancels)
+#   dispatch on another ref, no sha -> per ref (supersedes)
+#
+# The `sha` arm is load-bearing: without it, two dispatches of different
+# commits from the same non-master ref share a group and cancel each other.
+# See QVAC-24627.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.head_ref || github.run_id }}
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.event.inputs.sha || (github.ref == 'refs/heads/master' && github.run_id) || github.ref }}
   cancel-in-progress: true
 
 jobs:

@@ -17,6 +17,13 @@ on:
       'scripts/sync_vendor.py'
     ]
 
+# QVAC addition: dedupe per PR and per branch, so a re-push or re-dispatch
+# supersedes the in-flight run. The default branch is exempt on purpose —
+# master pushes must not cancel each other. See QVAC-24627.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || (github.ref == 'refs/heads/master' && github.run_id) || github.ref }}
+  cancel-in-progress: true
+
 jobs:
   runner_names:
     permissions:
