@@ -118,8 +118,6 @@ Run VisionPsy Nano and Flash vision-language models through the multimodal subsy
 - **Image sizing**: `--image-no-upscale on` enables the Flash preprocessing rule, rounding image sizes to the slice grid without always stretching smaller images to the maximum size. Use it for Flash projectors that do not declare this rule in GGUF metadata.
 - **Memory-aware vision attention**: automatic flash-attention selection accounts for image size and device memory on backends without efficient cooperative-matrix flash attention.
 
-See the [Multimodal Guide](tools/mtmd/README.md) for model and projector usage, and the [server CLI reference](tools/server/README.md) for image-processing options.
-
 ### Mobile GPU Optimization
 
 Enhanced GPU support with targeted optimizations for Qualcomm Adreno GPUs.
