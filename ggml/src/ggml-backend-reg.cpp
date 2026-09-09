@@ -654,6 +654,7 @@ void ggml_backend_load_all_from_path(const char * dir_path) {
     ggml_backend_load_best("rpc", silent, dir_path);
     ggml_backend_load_best("sycl", silent, dir_path);
     ggml_backend_load_best("vulkan", silent, dir_path);
+    ggml_backend_load_best("webgpu", silent, dir_path);
     ggml_backend_load_best("virtgpu", silent, dir_path);
 
     bool useOpencl = true;
