@@ -556,7 +556,7 @@ namespace GGUFMeta {
             n_elements += ggml_nelements(cur);
             n_bytes += ggml_nbytes(cur);
             weights_map.emplace(tensor_name,
-                                llama_model_loader::llama_tensor_weight(raw_file_ptr, idx, gguf_load.meta.get(), cur));
+                                llama_model_loader::llama_tensor_weight(raw_file_ptr, idx, gguf_load.meta.get(), cur, check_bounds));
         }
     }
 
@@ -588,6 +588,13 @@ llama_model_loader::llama_model_loader(
 
     this->use_mmap      = load_mode == LLAMA_LOAD_MODE_MMAP || load_mode == LLAMA_LOAD_MODE_MMAP_MLOCK || load_mode == LLAMA_LOAD_MODE_AUTO;
     this->use_direct_io = load_mode == LLAMA_LOAD_MODE_DIRECT_IO;
+
+    // no_alloc without mmap never reads tensor data, so the file can be metadata only
+    // use the argument: this->no_alloc is only set at the end of this constructor
+    this->check_bounds = !(no_alloc && !this->use_mmap);
+    if (!this->check_bounds) {
+        LLAMA_LOG_DEBUG("%s: no_alloc without mmap, tensor file bounds check is off\n", __func__);
+    }
 
     std::optional<std::set<std::string>> tensor_list = load_input_variant::parse_tensor_list_from_future(load_input);
 
@@ -705,7 +712,7 @@ llama_model_loader::llama_model_loader(
             }
             n_elements += ggml_nelements(cur);
             n_bytes    += ggml_nbytes(cur);
-            weights_map.emplace(tensor_name, llama_tensor_weight(files.back().get(), 0, metadata, cur));
+            weights_map.emplace(tensor_name, llama_tensor_weight(files.back().get(), 0, metadata, cur, check_bounds));
         }
     } else {
         get_key(llm_kv(LLM_KV_GENERAL_ARCHITECTURE), arch_name, false);
@@ -1541,6 +1548,9 @@ void llama_model_loader::unmap_weight(const llama_tensor_weight & w) const {
 }
 
 const void * llama_model_loader::load_data_range(const llama_tensor_weight & w, size_t offs, size_t size, void * buf) const {
+    // offs is not checked against the file size under no_alloc, so no read site may run
+    GGML_ASSERT(!no_alloc);
+
     GGML_ASSERT(offs + size <= ggml_nbytes(w.tensor));
 
     const void * data = buf;
@@ -1569,6 +1579,9 @@ bool llama_model_loader::load_all_data(
         llama_mlocks * lmlocks,
         llama_progress_callback progress_callback,
         void * progress_callback_user_data) {
+    // offs is not checked against the file size under no_alloc, so no read site may run
+    GGML_ASSERT(!no_alloc);
+
     if (files.empty()) {
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
             set_tensor_data(t, set_tensor_data_ud);
