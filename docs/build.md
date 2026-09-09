@@ -301,6 +301,8 @@ The following compilation options are also available to tweak performance:
 
 Weights are repacked during loading without changing the GGUF format. Small batches use the repacked MMVQ kernels; larger batches use CUTLASS where supported, with the existing CUDA kernels as a fallback. MXFP4 uses FP8 activations and NVFP4 uses FP4 activations for CUTLASS prefill. Measure model accuracy as well as prompt processing and generation speed when enabling this option. `--no-repack`, `GGML_CUDA_FORCE_MMQ`, and `GGML_CUDA_FORCE_CUBLAS` disable automatic placement in the repacked buffer.
 
+This option also enables tensorized Gated Delta Net prefill on SM120/SM121 for head width 128, 16 query/key heads, and 16, 32, 48, or 64 value heads. It requires at least 64 tokens, scalar gates, and a single final-state output; other configurations use the existing CUDA implementation. On SM120, 16 value heads and 32 value heads with fewer than 512 tokens also use the existing kernel because it is faster for these workloads. This path uses TF32 operands, an FP16 inverse, and FP32 accumulators and outputs. State updates also retain low-order key values.
+
 ## MUSA
 
 This provides GPU acceleration using a Moore Threads GPU. Make sure to have the [MUSA SDK](https://developer.mthreads.com/musa/musa-sdk) installed.
