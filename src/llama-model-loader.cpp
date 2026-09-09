@@ -554,9 +554,8 @@ llama_model_loader::llama_model_loader(
     this->use_mmap      = load_mode == LLAMA_LOAD_MODE_MMAP || load_mode == LLAMA_LOAD_MODE_MMAP_MLOCK || load_mode == LLAMA_LOAD_MODE_AUTO;
     this->use_direct_io = load_mode == LLAMA_LOAD_MODE_DIRECT_IO;
 
-    // with no_alloc and no mmap nothing reads tensor data: llama_model::load_tensors returns before load_all_data.
-    // the file can then be metadata only, like the ones gguf_write_to_file writes with only_meta set.
-    // use the no_alloc argument, not the member: the member is set at the end of this constructor.
+    // no_alloc without mmap never reads tensor data, so the file can be metadata only
+    // use the argument: this->no_alloc is only set at the end of this constructor
     const bool check_bounds = !(no_alloc && !this->use_mmap);
     if (!check_bounds) {
         LLAMA_LOG_DEBUG("%s: no_alloc without mmap, tensor file bounds check is off for '%s'\n", __func__, fname.empty() ? "(file handle)" : fname.c_str());

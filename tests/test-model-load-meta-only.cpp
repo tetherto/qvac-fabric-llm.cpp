@@ -1,6 +1,4 @@
 // A metadata-only GGUF has the header, the KV pairs and the tensor infos, but no tensor data.
-// The fitter loads such a file with no_alloc and no mmap, where nothing reads tensor data.
-// Every other load mode must still reject it.
 
 #include "ggml.h"
 #include "gguf.h"
@@ -62,7 +60,6 @@ static void check(bool ok, const char * what) {
     exit(EXIT_FAILURE);
 }
 
-// writes tensor infos [first, last) of TENSORS, with no tensor data
 static void write_meta_only(const char * path, int first, int last, bool with_hparams, uint16_t split_no, uint16_t split_count) {
     const size_t mem_size = ggml_tensor_overhead() * (N_TENSORS + 1);
     std::vector<uint8_t> mem(mem_size);
@@ -166,15 +163,12 @@ int main() {
     write_meta_only(split_path(0).c_str(), 0,       n_first,   /*with_hparams =*/ true,  0, N_SPLIT);
     write_meta_only(split_path(1).c_str(), n_first, N_TENSORS, /*with_hparams =*/ false, 1, N_SPLIT);
 
-    // the fitter's configuration: no tensor data is ever read, so the file needs none
     check(loads(/*no_alloc =*/ true, LLAMA_LOAD_MODE_NONE), "no_alloc without mmap loads a metadata-only GGUF");
     check(loads_split(/*no_alloc =*/ true, LLAMA_LOAD_MODE_NONE), "no_alloc without mmap loads metadata-only splits");
 
-    // a real load reads tensor data, so the file bounds check must still reject it
     check(!loads(/*no_alloc =*/ false, LLAMA_LOAD_MODE_NONE), "a real load still rejects a metadata-only GGUF");
     check(!loads_split(/*no_alloc =*/ false, LLAMA_LOAD_MODE_NONE), "a real load still rejects metadata-only splits");
 
-    // mmap maps the tensor data even under no_alloc
     check(!loads(/*no_alloc =*/ true, LLAMA_LOAD_MODE_MMAP), "mmap still rejects a metadata-only GGUF");
 
     remove(MODEL_PATH);
