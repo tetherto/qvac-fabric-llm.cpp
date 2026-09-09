@@ -13,6 +13,10 @@ llama_add_compile_flags()
 # tools
 
 if (EMSCRIPTEN)
+    add_subdirectory(llama-bench)
+    target_link_options(llama-bench PRIVATE
+        "SHELL:-s EXPORTED_RUNTIME_METHODS=FS,callMain"
+        "SHELL:-s EXIT_RUNTIME=1")
 else()
     add_subdirectory(batched-bench)
     add_subdirectory(vector-index-bench)
