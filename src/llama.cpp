@@ -636,11 +636,16 @@ struct llama_model * llama_model_load_from_file_ptr(FILE * file, struct llama_mo
     }
     std::vector<std::string> splits = {};
     load_input_variant::fname_load_input loader_input{ "", splits };
-    llama_model_loader ml(/*metadata*/ nullptr, /*set_tensor_data*/ nullptr, /*set_tensor_data_ud*/ nullptr,
-                          loader_input, file,
-                          params.load_mode, params.check_tensors, params.no_alloc,
-                          params.load_mtp, params.kv_overrides, params.tensor_buft_overrides);
-    return llama_model_load_from_file_impl(nullptr, nullptr, nullptr, /*has_load_input*/ false, ml, file, params);
+    try {
+        llama_model_loader ml(/*metadata*/ nullptr, /*set_tensor_data*/ nullptr, /*set_tensor_data_ud*/ nullptr,
+                              loader_input, file,
+                              params.load_mode, params.check_tensors, params.no_alloc,
+                              params.load_mtp, params.kv_overrides, params.tensor_buft_overrides);
+        return llama_model_load_from_file_impl(nullptr, nullptr, nullptr, /*has_load_input*/ false, ml, file, params);
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("%s: error loading model: %s\n", __func__, err.what());
+        return nullptr;
+    }
 }
 
 struct llama_model * llama_model_load_from_split_futures(const char ** paths, size_t n_paths, const char * context,
