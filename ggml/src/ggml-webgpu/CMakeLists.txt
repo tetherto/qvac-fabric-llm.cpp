@@ -81,3 +81,12 @@ endif()
 
 target_include_directories(ggml-webgpu PRIVATE ${SHADER_OUTPUT_DIR})
 target_link_libraries(ggml-webgpu PRIVATE ${DawnWebGPU_TARGET})
+if(UNIX AND NOT APPLE AND NOT EMSCRIPTEN)
+    find_library(GGML_WEBGPU_LIBSTDCXX NAMES libstdc++.so.6
+                 PATHS /usr/lib/x86_64-linux-gnu /usr/lib/aarch64-linux-gnu /usr/lib64 /usr/lib
+                 NO_DEFAULT_PATH)
+    if(NOT GGML_WEBGPU_LIBSTDCXX)
+        set(GGML_WEBGPU_LIBSTDCXX stdc++)
+    endif()
+    target_link_libraries(ggml-webgpu PRIVATE ${GGML_WEBGPU_LIBSTDCXX})
+endif()
