@@ -1,16 +1,23 @@
-# qvac-fabric-llm.cpp
+<div align="center">
 
-**AI inference and training engine for desktop and mobile platforms.**
+<h1>qvac-fabric-llm.cpp</h1>
 
-[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://opensource.org/licenses/MIT)
-[![Based on llama.cpp](https://img.shields.io/badge/based%20on-llama.cpp%20b10549-orange.svg)](https://github.com/ggml-org/llama.cpp)
+<p><strong>AI inference and training engine for desktop and mobile platforms.</strong></p>
+
+<p>
+<a href="https://opensource.org/licenses/MIT"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License: MIT"></a>
+<a href="https://github.com/ggml-org/llama.cpp"><img src="https://img.shields.io/badge/based%20on-llama.cpp%20b10549-orange.svg" alt="Based on llama.cpp"></a>
+</p>
+
+</div>
 
 `qvac-fabric-llm.cpp` is a specialized fork of [llama.cpp](https://github.com/ggml-org/llama.cpp) optimized for embedded systems, mobile devices, and enterprise deployment scenarios. It extends the excellent foundation of llama.cpp with additional capabilities focused on memory-based model loading, mobile GPU optimization, and flexible integration patterns.
 
+---
 
 ## Key Features
 
-The following capabilities are developed and maintained as part of qvac-fabric-llm.cpp. Features marked as *exclusive* are not available in upstream llama.cpp.
+The following capabilities are developed and maintained as part of qvac-fabric-llm.cpp.
 
 ### Cluster Inference
 
@@ -33,7 +40,7 @@ Split layers across GPUs and overlap prompt microbatches. Use one endpoint per s
     --device RPC0,RPC1 --split-mode layer -ngl all -b 2048 -ub 256
 ```
 
-#### Tensor Parallelism *(experimental)*
+#### Tensor Parallelism
 
 Split work within each layer across GPUs to accelerate decoding for supported models. Fast network links help because the GPUs exchange results frequently. Using the same servers:
 
@@ -41,8 +48,6 @@ Split work within each layer across GPUs to accelerate decoding for supported mo
 ./build/bin/llama-cli -m model.gguf --rpc 192.168.88.10:50052,192.168.88.11:50052 \
     --device RPC0,RPC1 --split-mode tensor -ngl all
 ```
-
-Direct all-reduce supports exactly two RPC devices on separate endpoints. In this example, allow host 2 to reach host 1 on port `51052` (RPC port plus 1000). See the [RPC Guide](tools/rpc/README.md) for network and tuning options.
 
 ### MoE Cache for Faster Decoding *(experimental)*
 
@@ -72,16 +77,7 @@ Choose a cache budget that leaves VRAM for other model weights, the KV cache, an
 
 The library is disabled by default. Enable it with `-DGGML_VECTOR_INDEX=ON` and link `ggml::vector-index` explicitly; it is not integrated into the llama runtime or server. See the [Vector Index Guide](docs/vector-index.md) for supported dimensions, API usage, persistence contracts, and benchmarks.
 
-### VisionPsy Nano / Flash Support
-
-Run VisionPsy Nano and Flash vision-language models through the multimodal subsystem using compatible GGUF models and projectors.
-
-- **Image sizing**: `--image-no-upscale on` enables the Flash preprocessing rule, rounding image sizes to the slice grid without always stretching smaller images to the maximum size. Use it for Flash projectors that do not declare this rule in GGUF metadata.
-- **Memory-aware vision attention**: automatic flash-attention selection accounts for image size and device memory on backends without efficient cooperative-matrix flash attention.
-
-See the [Multimodal Guide](tools/mtmd/README.md) for model and projector usage, and the [server CLI reference](tools/server/README.md) for image-processing options.
-
-### TurboQuant KV Cache Quantization *(exclusive)*
+### TurboQuant KV Cache Quantization
 
 TurboQuant adds low-bit KV-cache quantization formats for long-context inference while preserving token-generation quality close to higher-bit caches. It supports:
 
@@ -91,7 +87,7 @@ TurboQuant adds low-bit KV-cache quantization formats for long-context inference
 - **Backend support**: CPU quantization/dequantization and Vulkan inference kernels, including attention paths and mixed K/V cache configurations. CUDA and Metal do not include TurboQuant kernels in this release.
 - **Test coverage**: performance coverage via [test-kv-cache-quantization-perf.sh](tests/test-kv-cache-quantization-perf.sh), perplexity coverage via [test-kv-cache-quantization-perp.sh](tests/test-kv-cache-quantization-perp.sh), and eval coverage via [test-kv-cache-ruler.py](tests/test-kv-cache-ruler.py), [test-kv-cache-niah.py](tests/test-kv-cache-niah.py), [test-kv-cache-longbench.py](tests/test-kv-cache-longbench.py), [test-kv-cache-zeroscrolls.py](tests/test-kv-cache-zeroscrolls.py), and [test-kv-cache-leval.py](tests/test-kv-cache-leval.py).
 
-Qwen3.5-4B Q8_0 benchmark highlights:
+**Qwen3.5-4B Q8_0 benchmark highlights:**
 
 | Context | Cache config | BPW | RTX 5090 pp | RTX 5090 tg | Strix Halo pp | Strix Halo tg |
 | :-- | :-- | --: | --: | --: | --: | --: |
@@ -108,7 +104,7 @@ Qwen3.5-4B Q8_0 benchmark highlights:
 
 Quality checks on Qwen3.5-4B Q8_0 show `tbq4_0/pq4_0` at -0.03% perplexity delta versus `f16/f16`, with 94.8% RULER main score and 37.04 LongBench average versus 37.52 for `f16/f16`. See the full [TurboQuant benchmark report](docs/turboquant-benchmarks.md) for all measured models, contexts, and quality results.
 
-### LoRA Fine-Tuning *(exclusive)*
+### LoRA Fine-Tuning
 
 `qvac-fabric-llm.cpp` provides native [LoRA](https://arxiv.org/abs/2106.09685) (Low-Rank Adaptation) fine-tuning across CPU, Vulkan, and Metal backends. The training pipeline runs directly on consumer hardware, including mobile phones and integrated GPUs.
 
@@ -118,11 +114,11 @@ Quality checks on Qwen3.5-4B Q8_0 show `tbq4_0/pq4_0` at -0.03% perplexity delta
 - Checkpoint saving and resumable training
 - Learning rate schedulers (constant, cosine, linear) with warmup support
 - LoRA adapter merging into base models via **llama-export-lora**
-- Verified compatibility with Qwen3 and Gemma3 model architectures
+- Verified compatibility with Qwen3, Qwen3.5 and Qwen3.6 (dense and MoE), Gemma3, and Gemma4 (dense and MoE) model architectures
 
 For usage details and CLI reference, see the [Finetuning Guide](examples/training/README.md).
 
-### BitNet Inference and Fine-Tuning *(exclusive)*
+### BitNet Inference and Fine-Tuning
 
 Native support for [BitNet](https://arxiv.org/abs/2402.17764) ternary quantized models via the TQ2_0 data type, enabling efficient inference and LoRA fine-tuning of models such as [bitnet_b1_58-xl](https://huggingface.co/gianni-cor/bitnet_b1_58-xl-TQ2_0) on resource-constrained devices.
 
@@ -133,26 +129,14 @@ The official [microsoft/BitNet](https://github.com/microsoft/BitNet) inference f
 - **Conversion**: HuggingFace-to-GGUF conversion for BitNet model architectures
 - Cooperative matrix (coopmat) support for Vulkan devices that expose the extension
 
-### Memory-Based Model Loading *(exclusive)*
+### VisionPsy Nano / Flash Support
 
-Load models directly from memory buffers instead of the filesystem, enabling deployment in environments where disk access is restricted or unavailable.
+Run VisionPsy Nano and Flash vision-language models through the multimodal subsystem using compatible GGUF models and projectors.
 
-- Embedded systems with limited or no filesystem access
-- WebAssembly deployments where models are fetched over the network
-- Encrypted model storage where models are decrypted in memory
-- Streaming scenarios where models arrive over network connections
+- **Image sizing**: `--image-no-upscale on` enables the Flash preprocessing rule, rounding image sizes to the slice grid without always stretching smaller images to the maximum size. Use it for Flash projectors that do not declare this rule in GGUF metadata.
+- **Memory-aware vision attention**: automatic flash-attention selection accounts for image size and device memory on backends without efficient cooperative-matrix flash attention.
 
-```cpp
-#include "llama-cpp.h"
-
-std::vector<uint8_t> model_data = /* load from network, decrypt, etc. */;
-auto model = llama_model_load_from_buffer(std::move(model_data), params);
-
-auto model = llama_model_load_from_split_futures(paths, n_paths, context, tensor_list, params);
-llama_model_load_fulfill_split_future(path, context, std::move(streambuf));
-```
-
-### Mobile GPU Optimization *(exclusive)*
+### Mobile GPU Optimization
 
 Enhanced GPU support with targeted optimizations for Qualcomm Adreno GPUs.
 
@@ -161,6 +145,7 @@ Enhanced GPU support with targeted optimizations for Qualcomm Adreno GPUs.
 - Adreno-specific Vulkan shader variants for improved throughput.
 - Vulkan Memory Allocator (VMA) integration for efficient GPU memory management.
 
+---
 
 ## Quick Start
 
@@ -192,17 +177,19 @@ For more detailed build instructions, see [docs/build.md](docs/build.md).
 ./build/bin/llama-cli -m model.gguf -ngl 99 -c 4096 -p "Explain quantum computing in simple terms"
 ```
 
+---
 
 ## Supported Platforms
 
 | Platform | Backend | Status |
-|----------|---------|--------|
+| :-- | :-- | :--: |
 | Linux (x86_64, ARM64) | CPU, Vulkan, CUDA | ✅ Full support |
 | macOS (Intel, Apple Silicon) | CPU, Metal | ✅ Full support |
 | Windows (x86_64) | CPU, Vulkan, CUDA | ✅ Full support |
 | Android (ARM64) | CPU, Vulkan, OpenCL | ✅ Full support |
 | iOS | CPU, Metal | ✅ Full support |
 
+---
 
 ## Relationship with llama.cpp
 
@@ -210,25 +197,14 @@ qvac-fabric-llm.cpp is a maintained fork of [llama.cpp](https://github.com/ggml-
 
 **Current upstream baseline:** llama.cpp b10549
 
-### Exclusive Features
-
-The following features are developed in qvac-fabric-llm.cpp and are not available in upstream llama.cpp:
-
-| Feature | Description |
-|---------|-------------|
-| TurboQuant KV cache quantization | TBQ3_0/TBQ4_0 with QJL correction plus PQ3_0/PQ4_0 Stage 1 formats; CPU quantization/dequantization and Vulkan inference kernels for low-bit KV-cache inference |
-| LoRA fine-tuning | On-device training across CPU, Vulkan, and Metal with SFT, checkpointing, and LR scheduling |
-| BitNet inference and training | TQ2_0 quantization on Vulkan, Metal, and CPU for inference and LoRA fine-tuning; extends [microsoft/BitNet](https://github.com/microsoft/BitNet) beyond its CUDA-only GPU support |
-| Memory-based model loading | Load models from in-memory buffers with split-model and async fulfillment support |
-| Mobile GPU optimization | Adreno 800+ quantized inference (Q4_0, Q8), Adreno-specific Vulkan shader variants, VMA integration |
-
 ### Upstream Compatibility
 
 All standard llama.cpp functionality, models, and APIs remain fully compatible.
 
 - Any GGUF model supported by llama.cpp is supported by qvac-fabric-llm.cpp
-- Existing llama.cpp documentation applies to all non-exclusive features
+- Existing llama.cpp documentation applies to shared functionality
 
+---
 
 ## Contributing
 
@@ -238,6 +214,7 @@ We welcome contributions! Please see our development workflow:
 2. Create a feature branch from `master`
 3. Submit a pull request
 
+---
 
 ## License
 
