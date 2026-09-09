@@ -1,4 +1,5 @@
 #include "quantize.cuh"
+#include "repack-cutlass-blockscaled.cuh"
 #include <cstdint>
 
 #if defined(BLACKWELL_MMA_AVAILABLE)
@@ -124,11 +125,12 @@ __device__ __forceinline__ uint8_t compute_e8m0_scale(float amax) {
 }
 
 // scatter: grid over tokens, quantize once, write to all the token's compact rows
-template <bool scatter, bool use_aligned_float8>
+template <bool scatter, bool use_aligned_float8, bool cutlass_layout = false>
 static __global__ void quantize_mmq_nvfp4(
         const float * __restrict__ x, const int32_t * __restrict__ ids, void * __restrict__ vy, float * __restrict__ scale,
         const int64_t ne00, const int64_t s01, const int64_t s02, const int64_t s03,
-        const int64_t ne0, const int64_t ne1, const int64_t ne2, const int n_expert_used) {
+        const int64_t ne0, const int64_t ne1, const int64_t ne2, const int n_expert_used, uint8_t * block_scales = nullptr) {
+    static_assert(!scatter || !cutlass_layout);
 #if defined(BLACKWELL_MMA_AVAILABLE)
 
     const int64_t blocks_per_col = (ne0 + QK_FP4_MMQ - 1) / QK_FP4_MMQ;
@@ -281,20 +283,29 @@ static __global__ void quantize_mmq_nvfp4(
         const float inv_scale = subblock_scale > 0.0f ? 0.5f / subblock_scale : 0.0f;
         const float s = inv_col_scale * inv_scale;
 
-        __nv_fp4x4_e2m1 q0_lo(make_float4(vals[0] * s, vals[8]  * s, vals[1] * s, vals[9]  * s));
-        __nv_fp4x4_e2m1 q0_hi(make_float4(vals[2] * s, vals[10] * s, vals[3] * s, vals[11] * s));
-        __nv_fp4x4_e2m1 q1_lo(make_float4(vals[4] * s, vals[12] * s, vals[5] * s, vals[13] * s));
-        __nv_fp4x4_e2m1 q1_hi(make_float4(vals[6] * s, vals[14] * s, vals[7] * s, vals[15] * s));
+        if constexpr (cutlass_layout) {
+            const __nv_fp4x4_e2m1 q0_lo(make_float4(vals[0]  * s, vals[1]  * s, vals[2]  * s, vals[3]  * s));
+            const __nv_fp4x4_e2m1 q0_hi(make_float4(vals[4]  * s, vals[5]  * s, vals[6]  * s, vals[7]  * s));
+            const __nv_fp4x4_e2m1 q1_lo(make_float4(vals[8]  * s, vals[9]  * s, vals[10] * s, vals[11] * s));
+            const __nv_fp4x4_e2m1 q1_hi(make_float4(vals[12] * s, vals[13] * s, vals[14] * s, vals[15] * s));
+            q0 = uint32_t(q0_lo.__x) | (uint32_t(q0_hi.__x) << 16);
+            q1 = uint32_t(q1_lo.__x) | (uint32_t(q1_hi.__x) << 16);
+        } else {
+            __nv_fp4x4_e2m1 q0_lo(make_float4(vals[0] * s, vals[8]  * s, vals[1] * s, vals[9]  * s));
+            __nv_fp4x4_e2m1 q0_hi(make_float4(vals[2] * s, vals[10] * s, vals[3] * s, vals[11] * s));
+            __nv_fp4x4_e2m1 q1_lo(make_float4(vals[4] * s, vals[12] * s, vals[5] * s, vals[13] * s));
+            __nv_fp4x4_e2m1 q1_hi(make_float4(vals[6] * s, vals[14] * s, vals[7] * s, vals[15] * s));
 
-        const char2 q0_lo_c = *reinterpret_cast<char2 *>(&q0_lo);
-        const char2 q0_hi_c = *reinterpret_cast<char2 *>(&q0_hi);
-        const char2 q1_lo_c = *reinterpret_cast<char2 *>(&q1_lo);
-        const char2 q1_hi_c = *reinterpret_cast<char2 *>(&q1_hi);
+            const char2 q0_lo_c = *reinterpret_cast<char2 *>(&q0_lo);
+            const char2 q0_hi_c = *reinterpret_cast<char2 *>(&q0_hi);
+            const char2 q1_lo_c = *reinterpret_cast<char2 *>(&q1_lo);
+            const char2 q1_hi_c = *reinterpret_cast<char2 *>(&q1_hi);
 
-        q0 = uint32_t(uint8_t(q0_lo_c.x)) | (uint32_t(uint8_t(q0_lo_c.y)) <<  8) |
-            (uint32_t(uint8_t(q0_hi_c.x)) << 16) | (uint32_t(uint8_t(q0_hi_c.y)) << 24);
-        q1 = uint32_t(uint8_t(q1_lo_c.x)) | (uint32_t(uint8_t(q1_lo_c.y)) <<  8) |
-            (uint32_t(uint8_t(q1_hi_c.x)) << 16) | (uint32_t(uint8_t(q1_hi_c.y)) << 24);
+            q0 = uint32_t(uint8_t(q0_lo_c.x)) | (uint32_t(uint8_t(q0_lo_c.y)) <<  8) |
+                (uint32_t(uint8_t(q0_hi_c.x)) << 16) | (uint32_t(uint8_t(q0_hi_c.y)) << 24);
+            q1 = uint32_t(uint8_t(q1_lo_c.x)) | (uint32_t(uint8_t(q1_lo_c.y)) <<  8) |
+                (uint32_t(uint8_t(q1_hi_c.x)) << 16) | (uint32_t(uint8_t(q1_hi_c.y)) << 24);
+        }
 #else
         const float inv_scale = subblock_scale > 0.0f ? 0.5f / subblock_scale : 0.0f;
 #pragma unroll
@@ -316,6 +327,11 @@ static __global__ void quantize_mmq_nvfp4(
                 yqs[2 * sub + 1] = q1;
                 reinterpret_cast<uint8_t *>(yb->d4)[sub] = fp8_code;
             }
+        } else if constexpr (cutlass_layout) {
+            uint32_t * yqs = reinterpret_cast<uint32_t *>(static_cast<uint8_t *>(vy) + (int64_t) blockIdx.x * (ne0 / 2) + isb * (QK_NVFP4_SUB / 2));
+            yqs[0] = q0;
+            yqs[1] = q1;
+            block_scales[ggml_cuda_cutlass_blockscaled_scale_offset(blockIdx.x, isb, ne0 / QK_NVFP4_SUB)] = fp8_code;
         } else {
             block_fp4_mmq * yb = y + (blockIdx.y * ((int64_t) blocks_per_col * ne1) + k_block * ne1 + blockIdx.x);
             uint32_t * yqs = reinterpret_cast<uint32_t *>(yb->qs);
@@ -325,7 +341,7 @@ static __global__ void quantize_mmq_nvfp4(
         }
     }
 #else
-    GGML_UNUSED_VARS(x, ids, vy, scale, ne00, s01, s02, s03, ne0, ne1, ne2, n_expert_used);
+    GGML_UNUSED_VARS(x, ids, vy, scale, ne00, s01, s02, s03, ne0, ne1, ne2, n_expert_used, block_scales);
     NO_DEVICE_CODE; // This is for Blackwell NVFP4 activations only.
 #endif // defined(BLACKWELL_MMA_AVAILABLE)
 
@@ -695,3 +711,20 @@ void quantize_mmq_fp4_cuda(
         quantize_mmq_mxfp4<false><<<num_blocks, block_size, 0, stream>>>(x, ids, vy, ne00, s01, s02, s03, ne0, ne1, ne2, /*n_expert_used=*/0);
     }
 }
+
+#ifdef GGML_CUDA_CUTLASS
+void quantize_cutlass_nvfp4_cuda(
+        const float * x, void * vy, uint8_t * block_scales, float * row_scales, bool use_aligned_float8,
+        int64_t n_cols, int64_t n_cols_padded, int64_t stride_row, int64_t n_rows, cudaStream_t stream) {
+    GGML_ASSERT(n_cols % QK_NVFP4 == 0 && n_cols_padded >= n_cols && n_cols_padded % 128 == 0);
+    const dim3 num_blocks(n_rows, 1, 1);
+    const dim3 block_size(CUDA_QUANTIZE_BLOCK_SIZE_MMQ, 1, 1);
+    if (use_aligned_float8) {
+        quantize_mmq_nvfp4<false, true, true><<<num_blocks, block_size, 0, stream>>>(
+            x, nullptr, vy, row_scales, n_cols, stride_row, 0, 0, n_cols_padded, n_rows, 1, 0, block_scales);
+    } else {
+        quantize_mmq_nvfp4<false, false, true><<<num_blocks, block_size, 0, stream>>>(
+            x, nullptr, vy, row_scales, n_cols, stride_row, 0, 0, n_cols_padded, n_rows, 1, 0, block_scales);
+    }
+}
+#endif
