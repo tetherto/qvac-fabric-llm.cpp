@@ -68,3 +68,9 @@ void quantize_scatter_mmq_q8_1_cuda(const float *   x,
                                     int64_t         nrows_dst,
                                     int             n_expert_used,
                                     cudaStream_t    stream);
+
+#ifdef GGML_CUDA_CUTLASS
+void quantize_cutlass_nvfp4_cuda(
+        const float * x, void * vy, uint8_t * block_scales, float * row_scales, bool use_aligned_float8,
+        int64_t n_cols, int64_t n_cols_padded, int64_t stride_row, int64_t n_rows, cudaStream_t stream);
+#endif
