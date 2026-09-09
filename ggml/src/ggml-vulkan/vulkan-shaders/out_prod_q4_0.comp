@@ -1,0 +1,58 @@
+#version 450
+
+#include "types.glsl"
+#include "generic_binary_head.glsl"
+#include "dequant_funcs.glsl"
+
+// Each thread processes two outputs: i0 and i0 + QUANT_K/2.
+const uint quant_group_sz = 2;
+const uint num_threads = 512 / quant_group_sz;
+layout(local_size_x = num_threads, local_size_y = 1, local_size_z = 1) in;
+
+// Decode a "lower-half index" in [0, ne/2) to (i0, i1, i2, i3) where
+// i0 is guaranteed to be in the lower half of its quantization block
+// (i0 % QUANT_K < QUANT_K/2).
+// Requires ne20 to be a multiple of QUANT_K (always true for Q4_0).
+void get_dst_indices_lower(uint idx, out uint i0, out uint i1, out uint i2, out uint i3) {
+    const uint ne20h = p.ne20 >> 1;
+    i3 = fastdiv(idx, p.ne22 * p.ne21 * ne20h);
+    const uint r3 = idx - i3 * p.ne22 * p.ne21 * ne20h;
+    i2 = fastdiv(r3, p.ne21 * ne20h);
+    const uint r2 = r3 - i2 * p.ne21 * ne20h;
+    i1 = r2 / ne20h;
+    const uint i0h = r2 - i1 * ne20h;
+    i0 = (i0h / (QUANT_K / 2)) * QUANT_K + (i0h % (QUANT_K / 2));
+}
+
+void main() {
+    const uint broadcast2 = uint(p.param2);
+    const uint broadcast3 = p.param3;
+
+    const uint idx = gl_GlobalInvocationID.z * (262144 / 2) + gl_GlobalInvocationID.y * (512 / 2) + gl_GlobalInvocationID.x;
+
+    if (idx < p.ne / 2) {
+        uint i0, i1, i2, i3;
+        get_dst_indices_lower(idx, i0, i1, i2, i3);
+
+        const uint i0_upper = i0 + QUANT_K / 2;
+
+        vec2 acc = vec2(0.0);
+
+        for (uint k = 0; k < p.ne01; k++) {
+            const uint a_block_base = get_aoffset() + (i3 / broadcast3) * p.nb03 + (i2 / broadcast2) * p.nb02 + k * p.nb01;
+            const uint ib = a_block_base + (i0 / QUANT_K) * p.nb00;
+            const uint iqs = i0 % (QUANT_K / QUANT_R);
+
+            const vec2 v  = dequantize(ib, iqs, 0);
+            const vec2 dm = get_dm(ib, 0);
+            const vec2 a_vals = v * dm.x + dm.y;
+
+            const uint b_idx = src1_idx(i1, k, i2, i3);
+            const float b = data_b[get_boffset() + b_idx];
+            acc += a_vals * b;
+        }
+
+        data_d[get_doffset() + dst_idx(i0,       i1, i2, i3)] = acc.x;
+        data_d[get_doffset() + dst_idx(i0_upper, i1, i2, i3)] = acc.y;
+    }
+}

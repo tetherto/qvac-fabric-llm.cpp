@@ -134,6 +134,12 @@ int32_t mtmd_helper_decode_image_chunk(
     int n_pos_per_embd = mtmd_decode_use_mrope(ctx) ? 4 : 1;
 
     int32_t n_tokens = mtmd_input_chunk_get_n_tokens(chunk);
+    if (n_tokens == 0) {
+        LOG_WRN("skipping empty %s chunk\n", name);
+        *new_n_past = n_past + mtmd_input_chunk_get_n_pos(chunk);
+        return 0;
+    }
+
     int32_t i_batch = 0;
     int32_t n_img_batches = (n_tokens + n_batch - 1) / n_batch;
     decode_embd_batch batch_embd(encoded_embd, n_tokens, n_pos_per_embd, n_mmproj_embd);
@@ -148,6 +154,19 @@ int32_t mtmd_helper_decode_image_chunk(
             const auto n_tokens = mtmd_image_tokens_get_n_tokens(image_tokens);
             std::vector<mtmd_decoder_pos> rel_pos(n_tokens);
             mtmd_helper_image_get_decoder_pos(image_tokens, n_past, rel_pos.data());
+            if (rel_pos.empty()) {
+                LOG_WRN("skipping image chunk with empty decoder positions\n");
+                *new_n_past = n_past + mtmd_input_chunk_get_n_pos(chunk);
+                return 0;
+            }
+            const uint32_t rel_t0 = rel_pos[0].t;
+            const auto has_varying_t = [rel_t0](const mtmd_decoder_pos & pos) {
+                return pos.t != rel_t0;
+            };
+            if (std::any_of(rel_pos.begin(), rel_pos.end(), has_varying_t)) {
+                LOG_ERR("failed to decode image chunk: image tokens with varying temporal M-RoPE positions are not supported\n");
+                return -1;
+            }
             batch_embd.set_position_mrope_2d(rel_pos, seq_id);
         } else if (chunk_type == MTMD_INPUT_CHUNK_TYPE_AUDIO) {
             batch_embd.set_position_mrope_1d(n_past, seq_id);

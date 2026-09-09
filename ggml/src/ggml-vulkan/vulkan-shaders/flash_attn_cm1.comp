@@ -4,7 +4,9 @@
 #extension GL_EXT_shader_16bit_storage : require
 
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
 
 #if defined(BFLOAT16)
 #extension GL_EXT_bfloat16 : enable
@@ -18,7 +20,7 @@
 
 #include "types.glsl"
 #include "flash_attn_base.glsl"
-#if !defined(BFLOAT16)
+#if defined(LLAMA_UPSTREAM_FA_MIXED_TYPES) && !defined(BFLOAT16)
 #include "flash_attn_dequant.glsl"
 #endif
 
@@ -62,6 +64,44 @@ shared O_TYPEV4 pvsh[MatBc * osh_stride];
 
 shared ACC_TYPE slope[Br];
 
+#ifdef HAS_QJL_CORRECTION
+const uint32_t QJL_PROJ_K = QJL_FULL_PROJ ? HSK : QUANT_K;
+
+shared float Qf_qjl_proj[Br][QJL_PROJ_K];
+
+void qjl_project_q_block(uint32_t q_offset, uint32_t qjl_block_start, uint32_t tid) {
+    // See detailed comment in flash_attn.comp: read Q directly from the input
+    // SSBO and project one TBQ K block at a time.
+    const uint32_t qjl_sh_start = QJL_FULL_PROJ ? qjl_block_start : 0;
+    [[unroll]] for (uint32_t r = 0; r < Br; ++r) {
+        if (i * Br + r < N) {
+            for (uint32_t idx = tid; idx < QUANT_K; idx += gl_WorkGroupSize.x) {
+                vec4 qv = vec4(data_qv4[q_offset / 4 + (i * Br + r) * q_stride / 4 + (qjl_block_start + idx) / 4]);
+                float q_val = qv[idx % 4];
+                Qf_qjl_proj[r][qjl_sh_start + idx] = q_val * qjl_get_sign(idx);
+            }
+        }
+        barrier();
+
+        if (i * Br + r < N) {
+            for (uint h = 1u; h < QUANT_K; h <<= 1u) {
+                for (uint idx = tid; idx < QUANT_K / 2u; idx += gl_WorkGroupSize.x) {
+                    uint grp = idx / h;
+                    uint pos = idx % h;
+                    uint j = qjl_sh_start + grp * (h << 1u) + pos;
+                    float a = Qf_qjl_proj[r][j];
+                    float b = Qf_qjl_proj[r][j + h];
+                    Qf_qjl_proj[r][j]     = a + b;
+                    Qf_qjl_proj[r][j + h] = a - b;
+                }
+                barrier();
+            }
+        }
+        barrier();
+    }
+}
+#endif
+
 void main() {
 #ifdef NEEDS_INIT_IQ_SHMEM
     if (fa_type_needs_shmem(FaTypeK) || fa_type_needs_shmem(FaTypeV)) {
@@ -102,6 +142,14 @@ void main() {
     }
     barrier();
 
+#ifdef HAS_QJL_CORRECTION
+    if (QJL_FULL_PROJ) {
+        [[unroll]] for (uint32_t qjl_block = 0; qjl_block < HSK / QUANT_K; ++qjl_block) {
+            qjl_project_q_block(q_offset, qjl_block * QUANT_K, tid);
+        }
+    }
+#endif
+
     O_TYPEV4 Of[rows_per_thread][d_per_thread];
     [[unroll]] for (uint32_t r = 0; r < rows_per_thread; ++r) {
         [[unroll]] for (uint32_t d = 0; d < d_per_thread; ++d) {
@@ -137,8 +185,8 @@ void main() {
     uint32_t mo_offset = mo_stride * i;
 
     // FaBlockBytesK/V == 2 for f16 (sizeof f16) and == 16 for f32 (vec4) and == ggml block size for quants.
-    uint32_t k_offset = (ik2*p.nb12 + ik3*p.nb13) / FaBlockBytesK;
-    uint32_t v_offset = (iv2*p.nb22 + iv3*p.nb23) / FaBlockBytesV;
+    uint32_t k_offset = (ik2*p.nb12 + ik3*p.nb13) / FA_BLOCK_BYTES_K;
+    uint32_t v_offset = (iv2*p.nb22 + iv3*p.nb23) / FA_BLOCK_BYTES_V;
     uint32_t m_offset = gqa_iq1*KV;
     if (p.nem2 != 1 || p.nem3 != 1) {
         m_offset += ((iq3 % p.nem3) * p.nem2 + (iq2 % p.nem2)) * p.nem1 * KV;
@@ -315,6 +363,67 @@ void main() {
         coopMatStore(SfMat, sfsh, coord, sfshstride, gl_CooperativeMatrixLayoutRowMajor);
         barrier();
 
+#ifdef HAS_QJL_CORRECTION
+        [[unroll]] for (uint32_t qjl_block = 0; qjl_block < HSK / QUANT_K; ++qjl_block) {
+            if (!QJL_FULL_PROJ) {
+                qjl_project_q_block(q_offset, qjl_block * QUANT_K, tid);
+            }
+            {
+                // sfsh is ACC_TYPEV4 (4 rows packed per vec4 lane), so r -> (r/4, r%4).
+                [[unroll]] for (uint32_t idx = 0; idx < Bc * Br; idx += gl_WorkGroupSize.x) {
+                    uint32_t flat_idx = idx + tid;
+                    if (flat_idx < Bc * Br) {
+                        uint32_t c = flat_idx / Br;
+                        uint32_t r = flat_idx % Br;
+                        uint32_t kv_col = j * Bc + c;
+                        if (i * Br + r < N && (!KV_bounds_check || kv_col < KV)) {
+                            uint32_t k_block = kv_col * k_stride + qjl_block;
+                            uint32_t packed_block = k_offset + k_block;
+#if defined(DATA_K_TBQ3_0) || defined(DATA_K_TBQ3_0_64)
+                            float d_r = float(k_packed.k_data_tbq3[packed_block].d_r);
+#elif defined(DATA_K_TBQ4_0) || defined(DATA_K_TBQ4_0_64)
+                            float d_r = float(k_packed.k_data_tbq4[packed_block].d_r);
+#endif
+                            if (d_r > 1e-15) {
+                                float pos_sum = 0.0;
+                                float total_sum = 0.0;
+                                [[unroll]] for (uint w = 0u; w < QUANT_K / 32u; w++) {
+                                    uint base = w * 4u;
+#if defined(DATA_K_TBQ3_0) || defined(DATA_K_TBQ3_0_64)
+                                    uint bits = uint(k_packed.k_data_tbq3[packed_block].qjl[base])
+                                              | (uint(k_packed.k_data_tbq3[packed_block].qjl[base + 1u]) << 8u)
+                                              | (uint(k_packed.k_data_tbq3[packed_block].qjl[base + 2u]) << 16u)
+                                              | (uint(k_packed.k_data_tbq3[packed_block].qjl[base + 3u]) << 24u);
+#elif defined(DATA_K_TBQ4_0) || defined(DATA_K_TBQ4_0_64)
+                                    uint bits = uint(k_packed.k_data_tbq4[packed_block].qjl[base])
+                                              | (uint(k_packed.k_data_tbq4[packed_block].qjl[base + 1u]) << 8u)
+                                              | (uint(k_packed.k_data_tbq4[packed_block].qjl[base + 2u]) << 16u)
+                                              | (uint(k_packed.k_data_tbq4[packed_block].qjl[base + 3u]) << 24u);
+#endif
+                                    uint dd0 = (QJL_FULL_PROJ ? qjl_block * QUANT_K : 0) + w * 32u;
+                                    [[unroll]] for (uint q = 0u; q < 8u; q++) {
+                                        uint qd = dd0 + q * 4u;
+                                        vec4 pq = vec4(Qf_qjl_proj[r][qd],
+                                                       Qf_qjl_proj[r][qd + 1u],
+                                                       Qf_qjl_proj[r][qd + 2u],
+                                                       Qf_qjl_proj[r][qd + 3u]);
+                                        vec4 mask = vec4(float(bits & 1u), float((bits >> 1u) & 1u),
+                                                         float((bits >> 2u) & 1u), float((bits >> 3u) & 1u));
+                                        pos_sum += dot(mask, pq);
+                                        total_sum += pq.x + pq.y + pq.z + pq.w;
+                                        bits >>= 4u;
+                                    }
+                                }
+                                sfsh[c * sfshstride + r / 4][r % 4] += ACC_TYPE(p.scale * d_r * sqrt(1.5707963) / float(QUANT_K) * (2.0 * pos_sum - total_sum));
+                            }
+                        }
+                    }
+                }
+                barrier();
+            }
+        }
+#endif
+
         if (LOGIT_SOFTCAP) {
             [[unroll]] for (uint32_t idx = 0; idx < Bc * Br / 4; idx += gl_WorkGroupSize.x) {
                 uint32_t c = (idx + tid) / (Br / 4);
@@ -376,7 +485,10 @@ void main() {
             }
         }
 
-        // Calculate and store Pf in Psh
+        // Pf staging: same packing for both f16 V (consumed by coopmat P·V below)
+        // and TurboQuant V (consumed by the fused-dequant scalar P·V loop below).
+        // Each thread writes Pf for its owned (col, row_tid) group: 4 rows packed
+        // into one f16vec4 slot in Psh[col * psh_stride + tile_row(r) / 4].
         [[unroll]] for (uint32_t c = 0; c < cols_per_thread; ++c) {
             const uint col = c * cols_per_iter + col_tid;
 
@@ -394,7 +506,48 @@ void main() {
                 }
             }
         }
+#if defined(V_BLOCK_SIZE) && V_BLOCK_SIZE > 1
+        barrier();
 
+        // TurboQuant V P·V: V is quantized, so coopmat P·V is skipped; instead each
+        // thread owns one HSV/4 output slot (d = d_local*threads_per_rowgroup + col_tid)
+        // and iterates ALL Bc cols, dequantizing V[c][d] inline and reading the
+        // already-staged P from Psh. Lf is computed during Pf staging above and
+        // matches the f16 path, so the existing subgroupAdd reduction at the end of
+        // main() works unchanged. Of needs no cross-thread reduction either, because
+        // each thread fully owns its (r, d_local) accumulator.
+        [[unroll]] for (uint32_t d_local = 0; d_local < d_per_thread; ++d_local) {
+            const uint d = d_local * threads_per_rowgroup + col_tid;
+            if (d >= HSV / 4) break;
+
+            [[unroll]] for (uint32_t c = 0; c < Bc; ++c) {
+                if (KV_bounds_check && j * Bc + c >= KV) {
+                    continue;
+                }
+
+                uint coord = (j * Bc + c) * v_stride * V_BLOCK_SIZE + 4 * d;
+                uint ib    = coord / V_BLOCK_SIZE;
+                uint iqs   = coord % V_BLOCK_SIZE;
+                f16vec4 Vf = f16vec4(dequantize4_v(ib, iqs, v_offset));
+
+                // Psh[col * psh_stride + tile_row(r) / 4] packs Pf for 4 consecutive
+                // rows owned by this thread's row_tid into one f16vec4 lane.
+                [[unroll]] for (uint32_t r = 0; r < rows_per_thread; r += 4) {
+                    const uint row = tile_row(r);
+                    f16vec4 Pf = Psh[c * psh_stride + row / 4];
+                    [[unroll]] for (uint32_t vec_idx = 0; vec_idx < 4; ++vec_idx) {
+                        Of[r + vec_idx][d_local] += Pf[vec_idx] * Vf;
+                    }
+                }
+            }
+        }
+#endif
+
+#if !defined(V_BLOCK_SIZE) || V_BLOCK_SIZE == 1
+        // Standard path: V is f16, P·V via coopmat. Quantized V skipped fused above.
+        // V_BLOCK_SIZE is undefined for the f16/f16 same-type variant (compiled with the
+        // upstream flash_attn_base.glsl, which defines BLOCK_SIZE_V but not V_BLOCK_SIZE);
+        // treat undefined as the standard path so P·V is not silently dropped.
         if (SHMEM_STAGING != 0) {
             [[unroll]] for (uint32_t idx = 0; idx < Bc * HSV_pad / 4; idx += gl_WorkGroupSize.x) {
                 uint32_t d = (idx + tid) % (HSV_pad / 4);
@@ -523,6 +676,7 @@ void main() {
                 }
             }
         }
+#endif // !defined(V_BLOCK_SIZE) || V_BLOCK_SIZE == 1
 
         barrier();
     }

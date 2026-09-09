@@ -187,6 +187,7 @@ set(GGML_CPU_POWERPC_CPUTYPE "" CACHE STRING "ggml: CPU type for PowerPC")
 # ggml core
 set(GGML_SCHED_MAX_COPIES  "4" CACHE STRING "ggml: max input copies for pipeline parallelism")
 option(GGML_CPU                             "ggml: enable CPU backend"                        ON)
+option(GGML_VECTOR_INDEX                    "ggml: build vector index library"                OFF)
 option(GGML_SCHED_NO_REALLOC                "ggml: disallow reallocations in ggml-alloc (for debugging)" OFF)
 
 # 3rd party libs / backends
@@ -221,6 +222,7 @@ option(GGML_HIP_EXPORT_METRICS              "ggml: enable kernel perf metrics ou
 option(GGML_MUSA_GRAPHS                     "ggml: use MUSA graph, experimental, unstable"    OFF)
 option(GGML_MUSA_MUDNN_COPY                 "ggml: enable muDNN for accelerated copy"         OFF)
 option(GGML_VULKAN                          "ggml: use Vulkan"                                OFF)
+option(GGML_VULKAN_BUILD_ADRENO_SHADERS     "ggml: build Adreno-supported shader variants"    ON)
 option(GGML_VULKAN_CHECK_RESULTS            "ggml: run Vulkan op checks"                      OFF)
 option(GGML_VULKAN_DEBUG                    "ggml: enable Vulkan debug output"                OFF)
 option(GGML_VULKAN_MEMORY_DEBUG             "ggml: enable Vulkan memory debug output"         OFF)
@@ -264,6 +266,7 @@ option(GGML_OPENCL                          "ggml: use OpenCL"                  
 option(GGML_OPENCL_PROFILING                "ggml: use OpenCL profiling (increases overhead)" OFF)
 option(GGML_OPENCL_EMBED_KERNELS            "ggml: embed kernels"                             ON)
 option(GGML_OPENCL_USE_ADRENO_KERNELS       "ggml: use optimized kernels for Adreno"          ON)
+option(GGML_OPENCL_KERNEL_CACHE           "ggml: cache compiled OpenCL program binaries on disk" ON)
 set   (GGML_OPENCL_TARGET_VERSION "300" CACHE STRING
                                             "ggml: OpenCL API version to target")
 
@@ -294,6 +297,25 @@ set(THREADS_PREFER_PTHREAD_FLAG ON)
 find_package(Threads REQUIRED)
 
 include(GNUInstallDirs)
+
+if (GGML_STANDALONE OR GGML_VECTOR_INDEX)
+    if (IS_ABSOLUTE "${CMAKE_INSTALL_LIBDIR}")
+        set(GGML_PC_PREFIX "${CMAKE_INSTALL_PREFIX}")
+        set(GGML_PC_LIBDIR "${CMAKE_INSTALL_LIBDIR}")
+    else()
+        set(_GGML_PC_PREFIX_BASE "${CMAKE_CURRENT_BINARY_DIR}/pkgconfig-prefix")
+        file(RELATIVE_PATH GGML_PC_PREFIX_RELATIVE
+            "${_GGML_PC_PREFIX_BASE}/${CMAKE_INSTALL_LIBDIR}/pkgconfig"
+            "${_GGML_PC_PREFIX_BASE}")
+        set(GGML_PC_PREFIX "\${pcfiledir}/${GGML_PC_PREFIX_RELATIVE}")
+        set(GGML_PC_LIBDIR "\${prefix}/${CMAKE_INSTALL_LIBDIR}")
+    endif()
+    if (IS_ABSOLUTE "${CMAKE_INSTALL_INCLUDEDIR}")
+        set(GGML_PC_INCLUDEDIR "${CMAKE_INSTALL_INCLUDEDIR}")
+    else()
+        set(GGML_PC_INCLUDEDIR "\${prefix}/${CMAKE_INSTALL_INCLUDEDIR}")
+    endif()
+endif()
 
 #
 # build the library
@@ -345,10 +367,101 @@ set_target_properties(ggml PROPERTIES PUBLIC_HEADER "${GGML_PUBLIC_HEADERS}")
 #if (GGML_METAL)
 #    set_target_properties(ggml PROPERTIES RESOURCE "${CMAKE_CURRENT_SOURCE_DIR}/src/ggml-metal.metal")
 #endif()
-install(TARGETS ggml LIBRARY PUBLIC_HEADER)
-install(TARGETS ggml-base LIBRARY)
+
+set(GGML_INSTALL_TARGETS ggml ggml-base)
+
+install(
+  TARGETS ${GGML_INSTALL_TARGETS}
+  EXPORT ggml-targets
+  PUBLIC_HEADER DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+
+install(
+  EXPORT ggml-targets
+  FILE ggml-targets.cmake
+  NAMESPACE ggml::
+  DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/ggml)
+
+if (GGML_STANDALONE OR GGML_VECTOR_INDEX)
+    if (IS_ABSOLUTE "${CMAKE_INSTALL_LIBDIR}")
+        set(GGML_PC_PREFIX "${CMAKE_INSTALL_PREFIX}")
+        set(GGML_PC_LIBDIR "${CMAKE_INSTALL_LIBDIR}")
+    else()
+        set(_GGML_PC_PREFIX_BASE "${CMAKE_CURRENT_BINARY_DIR}/pkgconfig-prefix")
+        file(RELATIVE_PATH GGML_PC_PREFIX_RELATIVE
+            "${_GGML_PC_PREFIX_BASE}/${CMAKE_INSTALL_LIBDIR}/pkgconfig"
+            "${_GGML_PC_PREFIX_BASE}")
+        set(GGML_PC_PREFIX "\${pcfiledir}/${GGML_PC_PREFIX_RELATIVE}")
+        set(GGML_PC_LIBDIR "\${prefix}/${CMAKE_INSTALL_LIBDIR}")
+    endif()
+    if (IS_ABSOLUTE "${CMAKE_INSTALL_INCLUDEDIR}")
+        set(GGML_PC_INCLUDEDIR "${CMAKE_INSTALL_INCLUDEDIR}")
+    else()
+        set(GGML_PC_INCLUDEDIR "\${prefix}/${CMAKE_INSTALL_INCLUDEDIR}")
+    endif()
+endif()
 
 if (GGML_STANDALONE)
+    function(ggml_pc_append_private_lib out_var lib)
+        if ("${lib}" STREQUAL "" OR "${lib}" MATCHES "\\$<")
+            return()
+        endif()
+        if (TARGET "${lib}" OR "${lib}" MATCHES "::")
+            return()
+        elseif ("${lib}" MATCHES "\\.framework$")
+            get_filename_component(GGML_PC_FRAMEWORK_NAME "${lib}" NAME_WE)
+            list(APPEND ${out_var} "-framework ${GGML_PC_FRAMEWORK_NAME}")
+        elseif ("${lib}" MATCHES "^-")
+            list(APPEND ${out_var} "${lib}")
+        elseif (IS_ABSOLUTE "${lib}")
+            list(APPEND ${out_var} "${lib}")
+        else()
+            list(APPEND ${out_var} "-l${lib}")
+        endif()
+        set(${out_var} "${${out_var}}" PARENT_SCOPE)
+    endfunction()
+
+    function(ggml_pc_append_target_private_libs out_var target)
+        if (TARGET "${target}")
+            get_target_property(GGML_PC_TARGET_LIBS "${target}" LINK_LIBRARIES)
+            if (GGML_PC_TARGET_LIBS)
+                foreach(GGML_PC_TARGET_LIB IN LISTS GGML_PC_TARGET_LIBS)
+                    ggml_pc_append_private_lib(${out_var} "${GGML_PC_TARGET_LIB}")
+                endforeach()
+            endif()
+        endif()
+        set(${out_var} "${${out_var}}" PARENT_SCOPE)
+    endfunction()
+
+    set(GGML_PC_LIBS_PRIVATE "")
+    foreach(GGML_PC_BACKEND IN LISTS GGML_AVAILABLE_BACKENDS)
+        list(APPEND GGML_PC_LIBS_PRIVATE "-l${GGML_PC_BACKEND}")
+    endforeach()
+    foreach(GGML_PC_TARGET IN ITEMS ggml ggml-base)
+        ggml_pc_append_target_private_libs(GGML_PC_LIBS_PRIVATE "${GGML_PC_TARGET}")
+    endforeach()
+    foreach(GGML_PC_BACKEND IN LISTS GGML_AVAILABLE_BACKENDS)
+        ggml_pc_append_target_private_libs(GGML_PC_LIBS_PRIVATE "${GGML_PC_BACKEND}")
+    endforeach()
+    foreach(GGML_PC_PRIVATE_LIB IN LISTS CMAKE_CXX_IMPLICIT_LINK_LIBRARIES)
+        ggml_pc_append_private_lib(GGML_PC_LIBS_PRIVATE "${GGML_PC_PRIVATE_LIB}")
+    endforeach()
+    if (CMAKE_THREAD_LIBS_INIT)
+        ggml_pc_append_private_lib(GGML_PC_LIBS_PRIVATE "${CMAKE_THREAD_LIBS_INIT}")
+    endif()
+    if (CMAKE_DL_LIBS)
+        ggml_pc_append_private_lib(GGML_PC_LIBS_PRIVATE "${CMAKE_DL_LIBS}")
+    endif()
+    if (GGML_OPENMP_ENABLED)
+        foreach(GGML_PC_OPENMP_LIB IN LISTS OpenMP_C_LIBRARIES OpenMP_CXX_LIBRARIES)
+            ggml_pc_append_private_lib(GGML_PC_LIBS_PRIVATE "${GGML_PC_OPENMP_LIB}")
+        endforeach()
+        foreach(GGML_PC_OPENMP_FLAG IN ITEMS "${OpenMP_C_FLAGS}" "${OpenMP_CXX_FLAGS}")
+            ggml_pc_append_private_lib(GGML_PC_LIBS_PRIVATE "${GGML_PC_OPENMP_FLAG}")
+        endforeach()
+    endif()
+    list(REMOVE_DUPLICATES GGML_PC_LIBS_PRIVATE)
+    string(REPLACE ";" " " GGML_PC_LIBS_PRIVATE "${GGML_PC_LIBS_PRIVATE}")
+
     configure_file(${CMAKE_CURRENT_SOURCE_DIR}/ggml.pc.in
         ${CMAKE_CURRENT_BINARY_DIR}/ggml.pc
         @ONLY)
@@ -397,7 +510,7 @@ set(GGML_BIN_INSTALL_DIR     ${CMAKE_INSTALL_BINDIR}     CACHE PATH "Location of
 configure_package_config_file(
         ${CMAKE_CURRENT_SOURCE_DIR}/cmake/ggml-config.cmake.in
         ${CMAKE_CURRENT_BINARY_DIR}/ggml-config.cmake
-    INSTALL_DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/ggml
+    INSTALL_DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/ggml
     PATH_VARS GGML_INCLUDE_INSTALL_DIR
               GGML_LIB_INSTALL_DIR
               GGML_BIN_INSTALL_DIR)
@@ -416,7 +529,7 @@ message(STATUS "ggml commit:  ${GGML_BUILD_COMMIT}")
 
 install(FILES ${CMAKE_CURRENT_BINARY_DIR}/ggml-config.cmake
               ${CMAKE_CURRENT_BINARY_DIR}/ggml-config-version.cmake
-        DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/ggml)
+        DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/ggml)
 
 if (MSVC)
     set(MSVC_WARNING_FLAGS
@@ -441,6 +554,7 @@ if (MSVC)
 
     configure_msvc_target(ggml-base)
     configure_msvc_target(ggml)
+    configure_msvc_target(ggml-vector-index)
     configure_msvc_target(ggml-cpu)
     configure_msvc_target(ggml-cpu-x64)
     configure_msvc_target(ggml-cpu-sse42)

@@ -1279,6 +1279,42 @@ f16vec4 dequantFuncIQ4_NL_v(const in decodeBufIQ4_NL bl, const in uint blockCoor
 }
 #endif
 
+#if defined(DATA_A_TQ1_0)
+layout(buffer_reference, std430, buffer_reference_align = 2) buffer decodeBufTQ1_0 {
+   block_tq1_0 block;
+};
+
+float16_t dequantFuncTQ1_0(const in decodeBufTQ1_0 bl, const in uint blockCoords[2], const in uint coordInBlock[2])
+{
+    const float16_t d = bl.block.d;
+    const uint idx = coordInBlock[1];
+
+    const uint pow3[6] = uint[6](1u, 3u, 9u, 27u, 81u, 243u);
+
+    uint xi;
+    if (idx < 160u) {
+        const uint n = idx / 32u;         // 0..4
+        const uint m = idx % 32u;         // 0..31
+        const uint q = uint(bl.block.qs[m]);
+        xi = (((q * pow3[n]) & 255u) * 3u) >> 8u;
+    } else if (idx < 240u) {
+        const uint ee = idx - 160u;       // 0..79
+        const uint n = ee / 16u;          // 0..4
+        const uint m = ee % 16u;          // 0..15
+        const uint q = uint(bl.block.qs[32u + m]);
+        xi = (((q * pow3[n]) & 255u) * 3u) >> 8u;
+    } else {
+        const uint ee = idx - 240u;       // 0..15
+        const uint n = ee / 4u;           // 0..3
+        const uint j = ee % 4u;           // 0..3
+        const uint q = uint(bl.block.qh[j]);
+        xi = (((q * pow3[n]) & 255u) * 3u) >> 8u;
+    }
+
+    return d * float16_t(float(xi) - 1.0f);
+}
+#endif
+
 #if defined(DATA_A_MXFP4)
 layout(buffer_reference, std430, buffer_reference_align = 2) buffer decodeBufMXFP4 {
    block_mxfp4 block;
@@ -1385,6 +1421,8 @@ f16vec4 dequantFuncNVFP4_v(const in decodeBufNVFP4 bl, const in uint blockCoords
 }
 #endif
 
+#include "turbo-quant/dequant_funcs_cm2.glsl"
+
 #if defined(DATA_A_Q1_0)
 #define dequantFuncA dequantFuncQ1_0
 #define dequantFuncA_v dequantFuncQ1_0_v
@@ -1455,12 +1493,22 @@ f16vec4 dequantFuncNVFP4_v(const in decodeBufNVFP4 bl, const in uint blockCoords
 #elif defined(DATA_A_IQ4_NL)
 #define dequantFuncA dequantFuncIQ4_NL
 #define dequantFuncA_v dequantFuncIQ4_NL_v
+#elif defined(DATA_A_TQ1_0)
+#define dequantFuncA dequantFuncTQ1_0
 #elif defined(DATA_A_MXFP4)
 #define dequantFuncA dequantFuncMXFP4
 #define dequantFuncA_v dequantFuncMXFP4_v
 #elif defined(DATA_A_NVFP4)
 #define dequantFuncA dequantFuncNVFP4
 #define dequantFuncA_v dequantFuncNVFP4_v
+#elif defined(DATA_A_TBQ3_0) || defined(DATA_A_TBQ3_0_64)
+#define dequantFuncA dequantFuncTBQ3_0
+#elif defined(DATA_A_TBQ4_0) || defined(DATA_A_TBQ4_0_64)
+#define dequantFuncA dequantFuncTBQ4_0
+#elif defined(DATA_A_PQ3_0) || defined(DATA_A_PQ3_0_64)
+#define dequantFuncA dequantFuncPQ3_0
+#elif defined(DATA_A_PQ4_0) || defined(DATA_A_PQ4_0_64)
+#define dequantFuncA dequantFuncPQ4_0
 #elif defined(DATA_A_F32)
 #define dequantFuncA dequantFuncF32
 #endif

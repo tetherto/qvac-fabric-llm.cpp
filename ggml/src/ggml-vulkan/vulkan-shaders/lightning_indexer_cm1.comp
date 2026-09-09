@@ -1,0 +1,151 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_memory_scope_semantics : enable
+
+#include "types.glsl"
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform parameter {
+    uint n_embd;
+    uint n_head;
+    uint n_kv;
+    uint n_tokens;
+    uint n_stream;
+    uint n_mask_stream;
+    uint q_nb0;
+    uint q_nb1;
+    uint q_nb2;
+    uint q_nb3;
+    uint q_offset;
+    uint k_nb0;
+    uint k_nb1;
+    uint k_nb2;
+    uint k_nb3;
+    uint k_offset;
+    uint w_nb0;
+    uint w_nb1;
+    uint w_nb3;
+    uint w_offset;
+    uint m_nb0;
+    uint m_nb1;
+    uint m_nb3;
+    uint m_offset;
+    uint dst_nb0;
+    uint dst_nb1;
+    uint dst_nb3;
+    uint dst_offset;
+} p;
+
+layout(binding = 0) readonly buffer QBuf { float data_q[]; };
+layout(binding = 1) readonly buffer KBuf { A_TYPE data_a[]; };
+#ifdef A_TYPE_PACKED16
+layout(binding = 1) readonly buffer KBuf16 { A_TYPE_PACKED16 data_a_packed16[]; };
+#endif
+#ifdef A_TYPE_PACKED32
+layout(binding = 1) readonly buffer KBuf32 { A_TYPE_PACKED32 data_a_packed32[]; };
+#endif
+layout(binding = 2) readonly buffer WBuf { float data_w[]; };
+layout(binding = 3) readonly buffer MBuf { float16_t data_m[]; };
+layout(binding = 4) writeonly buffer DstBuf { float data_dst[]; };
+
+#include "dequant_funcs.glsl"
+
+const uint N_EMBD = 128;
+const uint CM = 16;
+const uint KV_TILE = 64;
+const uint KV_MATS = KV_TILE / CM;
+const uint KV_PER_WORKGROUP = 256;
+
+shared float16_t q_tile[N_HEAD * N_EMBD];
+shared float16_t k_tile[N_EMBD * KV_TILE];
+shared float scores[N_HEAD * KV_TILE];
+
+float load_k(const uint base, const uint ie) {
+#if defined(DATA_A_Q4_0) || defined(DATA_A_Q4_1) || defined(DATA_A_Q5_0) || defined(DATA_A_Q5_1)
+    const uint ib = base + ie / QUANT_K;
+    const vec2 v = dequantize(ib, ie % (QUANT_K / QUANT_R), 0);
+    const vec2 dm = get_dm(ib, 0);
+    return v[(ie / (QUANT_K / QUANT_R)) % QUANT_R] * dm.x + dm.y;
+#elif defined(DATA_A_Q8_0)
+    const uint ib = base + ie / QUANT_K;
+    const uint iqs = (ie % QUANT_K) & ~1u;
+    const vec2 v = dequantize(ib, iqs, 0);
+    const vec2 dm = get_dm(ib, 0);
+    return v[ie & 1u] * dm.x;
+#else
+    return float(dequantize1(base + ie, 0, 0));
+#endif
+}
+
+void main() {
+    const uint it = gl_WorkGroupID.y;
+    const uint is = gl_WorkGroupID.z;
+    const uint tid = gl_LocalInvocationID.x;
+
+    const uint q_base = p.q_offset + it*p.q_nb2 + is*p.q_nb3;
+    for (uint i = tid; i < N_HEAD * N_EMBD; i += gl_WorkGroupSize.x) {
+        const uint ih = i / N_EMBD;
+        const uint ie = i % N_EMBD;
+        q_tile[i] = float16_t(data_q[q_base + ih*p.q_nb1 + ie*p.q_nb0]);
+    }
+    barrier();
+
+    const uint k_base = p.k_offset + is*p.k_nb3;
+    const uint head_base = gl_SubgroupID * CM;
+    const uint wg_kv_end = min((gl_WorkGroupID.x + 1) * KV_PER_WORKGROUP, p.n_kv);
+    for (uint kv_base = gl_WorkGroupID.x * KV_PER_WORKGROUP; kv_base < wg_kv_end; kv_base += KV_TILE) {
+        for (uint i = tid; i < N_EMBD * KV_TILE; i += gl_WorkGroupSize.x) {
+            const uint ie = i / KV_TILE;
+            const uint ik = kv_base + i % KV_TILE;
+            k_tile[i] = ik < p.n_kv ? float16_t(load_k(k_base + ik*p.k_nb2, ie)) : float16_t(0.0);
+        }
+        barrier();
+
+        coopmat<float, gl_ScopeSubgroup, CM, CM, gl_MatrixUseAccumulator> acc[KV_MATS];
+        [[unroll]] for (uint im = 0; im < KV_MATS; ++im) {
+            acc[im] = coopmat<float, gl_ScopeSubgroup, CM, CM, gl_MatrixUseAccumulator>(0.0);
+        }
+
+        [[unroll]] for (uint ie = 0; ie < N_EMBD; ie += CM) {
+            coopmat<float16_t, gl_ScopeSubgroup, CM, CM, gl_MatrixUseA> mat_q;
+            coopMatLoad(mat_q, q_tile, head_base*N_EMBD + ie, N_EMBD, gl_CooperativeMatrixLayoutRowMajor);
+
+            [[unroll]] for (uint im = 0; im < KV_MATS; ++im) {
+                coopmat<float16_t, gl_ScopeSubgroup, CM, CM, gl_MatrixUseB> mat_k;
+                coopMatLoad(mat_k, k_tile, ie*KV_TILE + im*CM, KV_TILE, gl_CooperativeMatrixLayoutRowMajor);
+                acc[im] = coopMatMulAdd(mat_q, mat_k, acc[im]);
+            }
+        }
+
+        [[unroll]] for (uint im = 0; im < KV_MATS; ++im) {
+            coopMatStore(acc[im], scores, head_base*KV_TILE + im*CM, KV_TILE, gl_CooperativeMatrixLayoutRowMajor);
+        }
+        barrier();
+
+        if (tid < KV_TILE) {
+            const uint ik = kv_base + tid;
+            if (ik < p.n_kv) {
+                float score = 0.0;
+                [[unroll]] for (uint ih = 0; ih < N_HEAD; ++ih) {
+                    score += max(scores[ih*KV_TILE + tid], 0.0) *
+                        data_w[p.w_offset + ih*p.w_nb0 + it*p.w_nb1 + is*p.w_nb3];
+                }
+
+                const uint im = is % p.n_mask_stream;
+                const uint mask_idx = p.m_offset + ik*p.m_nb0 + it*p.m_nb1 + im*p.m_nb3;
+                const uint dst_idx = p.dst_offset + ik*p.dst_nb0 + it*p.dst_nb1 + is*p.dst_nb3;
+                data_dst[dst_idx] = score + float(data_m[mask_idx]);
+            }
+        }
+        barrier();
+    }
+}

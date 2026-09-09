@@ -27,7 +27,12 @@
 #include <functional>
 #include <float.h>
 
-struct clip_logger_state g_logger_state = {clip_log_callback_default, NULL};
+// TODO: allow to pass callback from user code
+struct clip_logger_state g_logger_state = {
+    GGML_LOG_LEVEL_CONT,           // verbosity_thold
+    clip_log_callback_default,     // log_callback
+    NULL                           // log_callback_user_data
+};
 
 //#define CLIP_DEBUG_FUNCTIONS
 
@@ -158,14 +163,33 @@ struct clip_ctx {
     ggml_backend_t backend = nullptr;
     ggml_backend_t backend_cpu = nullptr;
     ggml_backend_buffer_ptr buf;
+    ggml_backend_buffer_ptr buf_repack; // CPU repack buffer for quantized weights
 
 
     int max_nodes = 8192;
     ggml_backend_sched_ptr sched;
     clip_flash_attn_type flash_attn_type = CLIP_FLASH_ATTN_TYPE_AUTO;
+    // Whether the active backend can run GGML_OP_FLASH_ATTN_EXT at all. Probed
+    // once at warmup; in AUTO mode the per-image decision falls back to the
+    // explicit attention path when this is false.
+    bool flash_attn_supported = true;
     bool is_allocated = false;
 
+    // Inputs to the AUTO flash-attn budget decision, resolved once (getenv +
+    // Mali detection + device-memory query) and cached, since none of them
+    // change between images. Populated lazily on the first AUTO resolve.
+    bool   fa_budget_cached = false;
+    int    fa_auto_min_kv   = 0;   // explicit-attention cutoff (n_patches); <=0 disables it
+    size_t fa_mem_total     = 0;   // device total memory, stable clamp input (0 = unknown)
+    size_t fa_mem_free      = 0;   // device free memory at first resolve, hard-fit check only (0 = unknown)
+    // Set at warmup when the backend reports it lacks efficient (coopmat) FA
+    // (ggml_backend_supports_efficient_fa == false, e.g. Mali via ggml-vulkan).
+    // Turns on the AUTO cutoff default so the budget heuristic prefers the
+    // explicit path for short sequences but keeps scalar FA for huge ones.
+    bool   fa_backend_inefficient = false;
+
     bool debug_output_embeddings = false;
+    clip_image_tile_mode tile_mode = CLIP_IMAGE_TILE_MODE_SEQUENTIAL;
 
     // for measuring memory usage
     bool no_alloc = false;
@@ -178,6 +202,10 @@ struct clip_ctx {
     std::mt19937 rng{std::random_device{}()};
     uint32_t rng_seed = UINT32_MAX;
 
+    // When the GPU backend lacks bf16 support but the GGUF has bf16 weights,
+    // we declare the in-context tensors as f16 and convert on disk-load.
+    bool convert_bf16_to_f16 = false;
+
     clip_ctx(clip_context_params & ctx_params) {
         flash_attn_type = ctx_params.flash_attn_type;
         no_alloc = ctx_params.no_alloc;
@@ -186,15 +214,42 @@ struct clip_ctx {
             throw std::runtime_error("failed to initialize CPU backend");
         }
         if (ctx_params.use_gpu) {
-            if (ctx_params.device != nullptr) {
+            auto * backend_name = ctx_params.backend_device ? ctx_params.backend_device : std::getenv("MTMD_BACKEND_DEVICE");
+            if (backend_name != nullptr) {
+                backend = ggml_backend_init_by_name(backend_name, nullptr);
+                if (!backend) {
+                    LOG_WRN("%s: Warning: Failed to initialize \"%s\" backend, falling back to default GPU backend\n", __func__, backend_name);
+                }
+            }
+            if (!backend && ctx_params.device != nullptr) {
                 backend = ggml_backend_dev_init(ctx_params.device, nullptr);
                 if (!backend) {
                     throw std::runtime_error(string_format("%s: failed to initialize \"%s\" backend\n",
                                                            __func__, ggml_backend_dev_name(ctx_params.device)));
                 }
-            } else {
+            }
+            if (!backend) {
                 backend = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_GPU, nullptr);
                 backend = backend ? backend : ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_IGPU, nullptr);
+            }
+        }
+
+        // When the GPU backend can't host bf16 weights (e.g. Metal on M1 / older
+        // GPUs without bfloat support), convert bf16 tensors to f16 on load.
+        // This keeps the projector running on the GPU instead of falling back
+        // to CPU. Without this, ggml_backend_sched_reserve aborts on the first
+        // bf16 leaf tensor with "buffer that cannot run the operation (NONE)".
+        if (backend && backend != backend_cpu && ctx_params.has_bf16_weights) {
+            ggml_init_params probe_params = { /*.mem_size=*/ ggml_tensor_overhead(), /*.mem_buffer=*/ nullptr, /*.no_alloc=*/ true };
+            ggml_context * probe_ctx = ggml_init(probe_params);
+            ggml_tensor * probe = ggml_new_tensor_1d(probe_ctx, GGML_TYPE_BF16, 1);
+            const bool gpu_supports_bf16 = ggml_backend_supports_op(backend, probe);
+            ggml_free(probe_ctx);
+
+            if (!gpu_supports_bf16) {
+                LOG_WRN("%s: GPU backend %s does not support bf16; converting bf16 weights to f16 on load\n",
+                        __func__, ggml_backend_name(backend));
+                convert_bf16_to_f16 = true;
             }
         }
 
@@ -226,6 +281,11 @@ struct clip_ctx {
         }
 
         debug_output_embeddings = std::getenv("MTMD_DEBUG_EMBEDDINGS") != nullptr;
+        if (ctx_params.image_tile_mode < 0 || ctx_params.image_tile_mode > 2) {
+            GGML_ABORT("invalid image_tile_mode %d; valid: 0=batched, 1=sequential, 2=disabled",
+                       ctx_params.image_tile_mode);
+        }
+        tile_mode = static_cast<clip_image_tile_mode>(ctx_params.image_tile_mode);
     }
 
     ~clip_ctx() {
@@ -245,6 +305,110 @@ struct clip_ctx {
 // clip_graph
 //
 
+// Whether the active GPU is an Arm Mali. Mali has no cooperative-matrix units,
+// so the Vulkan flash-attention kernel runs a slow scalar path; the explicit
+// mul_mat attention is faster there for short sequences. Detected from the
+// backend device description (e.g. "Mali-G715"). Safe-fails to false (which just
+// keeps the legacy flash-attention behavior), so a missed match never crashes.
+static bool clip_backend_is_mali(const clip_ctx * ctx) {
+    if (!ctx->backend || ctx->backend == ctx->backend_cpu) {
+        return false;
+    }
+    ggml_backend_dev_t dev = ggml_backend_get_device(ctx->backend);
+    if (!dev) {
+        return false;
+    }
+    const char * strs[2] = { ggml_backend_dev_description(dev), ggml_backend_dev_name(dev) };
+    for (const char * s : strs) {
+        for (; s && *s; ++s) {
+            if ((s[0] == 'M' || s[0] == 'm') && (s[1] == 'a' || s[1] == 'A') &&
+                (s[2] == 'l' || s[2] == 'L') && (s[3] == 'i' || s[3] == 'I')) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+// Default explicit-attention cutoff (n_patches) applied on Mali when the user
+// hasn't set MTMD_CLIP_AUTO_FA_MIN_KV. Tuned for the Gemma 4 E2B vision encoder
+// on Pixel 9 Pro: 196-tok (1764) and 400-tok (3600) use explicit, 784-tok
+// (7056) uses flash-attention (explicit would OOM there).
+static const int CLIP_AUTO_FA_MIN_KV_MALI_DEFAULT = 4096;
+
+// clip_fa_effective_min_kv() — the pure AUTO-budget arithmetic — is defined
+// inline in clip.h (so unit tests can exercise it without linking an
+// unexported symbol across the Windows mtmd.dll boundary). See there for the
+// full behavior contract.
+
+// Resolve the effective flash-attention mode for a single image graph.
+//
+// ENABLED/DISABLED are explicit user choices and are honored as-is. AUTO is
+// budget-aware: flash-attention is the memory-frugal path and is required for
+// long sequences, but on backends without cooperative-matrix (notably Arm
+// Mali) its scalar kernel is slower than the explicit mul_mat + softmax path
+// for short sequences. When MTMD_CLIP_AUTO_FA_MIN_KV is set (>0), AUTO uses
+// the explicit path below that attention length (n_patches) and flash-attention
+// at/above it. Unset (the default) preserves the legacy behavior: use
+// flash-attention whenever the backend supports it.
+static clip_flash_attn_type clip_resolve_flash_attn_type(clip_ctx * ctx, int n_patches) {
+    if (ctx->flash_attn_type != CLIP_FLASH_ATTN_TYPE_AUTO) {
+        return ctx->flash_attn_type;
+    }
+    if (!ctx->flash_attn_supported) {
+        return CLIP_FLASH_ATTN_TYPE_DISABLED;
+    }
+    // Resolve the budget inputs once and cache them: getenv, Mali detection and
+    // the device-memory query don't change between images, so they must not run
+    // on the per-image hot path.
+    if (!ctx->fa_budget_cached) {
+        // Explicit-attention cutoff. The env var overrides on any backend (set
+        // to 0 to disable); otherwise it defaults on for Mali (where explicit is
+        // faster) and off everywhere else (where flash-attention is better).
+        const char * env_min_kv = std::getenv("MTMD_CLIP_AUTO_FA_MIN_KV");
+        if (env_min_kv && env_min_kv[0]) {
+            ctx->fa_auto_min_kv = (int) std::strtol(env_min_kv, nullptr, 10);
+        } else {
+            // Default the cutoff on for any backend without efficient (coopmat)
+            // FA — detected either at warmup via the backend query
+            // (fa_backend_inefficient) or by Mali device detection (covers
+            // paths where the warmup GPU-only probe doesn't run).
+            ctx->fa_auto_min_kv = (ctx->fa_backend_inefficient || clip_backend_is_mali(ctx))
+                                      ? CLIP_AUTO_FA_MIN_KV_MALI_DEFAULT : 0;
+        }
+        size_t free_mem = 0, total_mem = 0;
+        ggml_backend_dev_t dev = ctx->backend ? ggml_backend_get_device(ctx->backend) : nullptr;
+        if (dev) {
+            ggml_backend_dev_memory(dev, &free_mem, &total_mem);
+        }
+        ctx->fa_mem_total = total_mem;
+        ctx->fa_mem_free  = free_mem;
+        ctx->fa_budget_cached = true;
+    }
+
+    const int auto_fa_min_kv = ctx->fa_auto_min_kv;
+
+    // Cutoff disabled => legacy behavior: flash-attention whenever supported.
+    if (auto_fa_min_kv <= 0) {
+        return CLIP_FLASH_ATTN_TYPE_ENABLED;
+    }
+
+    // Explicit attention (mul_mat + softmax) is faster than the scalar FA kernel
+    // on no-coopmat GPUs for short sequences, but it materializes an
+    // O(n_patches^2 * n_head) score matrix. Memory-constrained devices can't
+    // hold that, so cap the "use explicit" cutoff by the memory budget (see
+    // clip_fa_effective_min_kv above: total memory = stable clamp, free memory
+    // = hard-fit check only, no memory info = conservative constant). This only
+    // ever lowers the cutoff, so constrained devices fall back to memory-frugal
+    // FA sooner.
+    const int eff_min_kv = clip_fa_effective_min_kv(
+        auto_fa_min_kv, ctx->fa_mem_total, ctx->fa_mem_free,
+        (int) ctx->model.hparams.n_head);
+
+    return (n_patches < eff_min_kv) ? CLIP_FLASH_ATTN_TYPE_DISABLED
+                                    : CLIP_FLASH_ATTN_TYPE_ENABLED;
+}
+
 clip_graph::clip_graph(clip_ctx * ctx, const clip_image_f32 & img) :
         model(ctx->model),
         hparams(model.hparams),
@@ -262,7 +426,7 @@ clip_graph::clip_graph(clip_ctx * ctx, const clip_image_f32 & img) :
         n_mmproj_embd(clip_n_mmproj_embd(ctx)),
         eps(hparams.eps),
         kq_scale(d_head > 0 ? 1.0f / sqrtf((float)d_head) : 0.0f),
-        flash_attn_type(ctx->flash_attn_type) {
+        flash_attn_type(clip_resolve_flash_attn_type(ctx, n_patches)) {
     struct ggml_init_params params = {
         /*.mem_size   =*/ ctx->buf_compute_meta.size(),
         /*.mem_buffer =*/ ctx->buf_compute_meta.data(),
@@ -903,12 +1067,14 @@ ggml_tensor * clip_graph::build_patch_merge_permute(ggml_tensor * cur, int scale
 
 static std::unique_ptr<clip_graph> clip_get_graph_builder(clip_ctx * ctx, const clip_image_f32_batch & imgs,
                                                             const clip_encode_params * params = nullptr) {
+    GGML_ASSERT(!imgs.entries.empty());
     const clip_image_f32 & img = imgs.entries[0];
     std::unique_ptr<clip_graph> builder;
 
     switch (ctx->proj_type()) {
         case PROJECTOR_TYPE_GEMMA3:
         case PROJECTOR_TYPE_IDEFICS3:
+        case PROJECTOR_TYPE_VISIONPSY:
         case PROJECTOR_TYPE_LFM2:
         case PROJECTOR_TYPE_JANUS_PRO:
         case PROJECTOR_TYPE_PHI4:
@@ -1128,6 +1294,17 @@ struct clip_model_loader {
 
     size_t model_size = 0; // in bytes
 
+    // Returns true if any weight tensor in the GGUF is stored as bf16.
+    bool has_bf16_weights() const {
+        const int n = gguf_get_n_tensors(ctx_gguf.get());
+        for (int i = 0; i < n; ++i) {
+            if (gguf_get_tensor_type(ctx_gguf.get(), i) == GGML_TYPE_BF16) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     bool has_vision    = false;
     bool has_audio     = false;
     bool has_gen_audio = false;
@@ -1241,6 +1418,20 @@ struct clip_model_loader {
             }
 
             model.proj_type = clip_projector_type_from_string(proj_type);
+
+            if (model.proj_type == PROJECTOR_TYPE_UNKNOWN) {
+                // Not a canonical name. Try the legacy aliases, which are gated on
+                // general.name so a generic string like "custom" only resolves for the
+                // one model that shipped it.
+                std::string model_name;
+                get_string(KEY_NAME, model_name, false);
+                model.proj_type = clip_projector_type_from_alias(proj_type, model_name);
+                if (model.proj_type != PROJECTOR_TYPE_UNKNOWN) {
+                    LOG_WRN("%s: legacy projector type '%s' from general.name='%s' loaded as '%s'\n",
+                            __func__, proj_type.c_str(), model_name.c_str(),
+                            PROJECTOR_TYPE_NAMES.at(model.proj_type).c_str());
+                }
+            }
 
             if (model.proj_type == PROJECTOR_TYPE_UNKNOWN) {
                 throw std::runtime_error(string_format("%s: unknown projector type: %s\n", __func__, proj_type.c_str()));
@@ -1461,7 +1652,31 @@ struct clip_model_loader {
                         // use default llava-uhd preprocessing params
                         get_u32(KEY_PROJ_SCALE_FACTOR, hparams.n_merge, false);
                         get_u32(KEY_PREPROC_IMAGE_SIZE, hparams.image_longest_edge, false);
+                        // Same optional key as VisionPsy below. Both run the idefics3 sizing
+                        // rule and --image-no-upscale is accepted for both, so a GGUF that
+                        // declares the rule must be honoured here too, or the flag is the only
+                        // way to reach it and metadata is silently ignored.
+                        get_bool(KEY_PREPROC_NO_UPSCALE, hparams.image_no_upscale, false);
                         hparams.set_limit_image_tokens();
+                    } break;
+                case PROJECTOR_TYPE_VISIONPSY:
+                    {
+                        // use default llava-uhd preprocessing params
+                        get_u32(KEY_PROJ_SCALE_FACTOR, hparams.n_merge, false);
+                        get_u32(KEY_PREPROC_IMAGE_SIZE, hparams.image_longest_edge, false);
+                        // The reference stretches straight to the refined size,
+                        // resize(img, [new_h, new_w]) in DynamicResize.forward, so the default
+                        // aspect-preserving pad would letterbox the slices instead. 640x488
+                        // refines to 1024x512, where PAD_CEIL would leave 176 black columns on
+                        // each side, about a third of the encoded pixels.
+                        hparams.image_pad_rf = PAD_NONE;
+                        // Optional; absent from every mmproj published so far, including the
+                        // VisionPsy Flash one, which is why --image-no-upscale exists. An
+                        // mmproj that carries the key needs no flag. gguf-py can write it
+                        // (add_vision_preproc_no_upscale, from the reference config's
+                        // resize_to_max_side_len == false); no converter in this repo emits
+                        // it yet because there is no VisionPsy conversion path here.
+                        get_bool(KEY_PREPROC_NO_UPSCALE, hparams.image_no_upscale, false);
                     } break;
                 case PROJECTOR_TYPE_LFM2:
                     {
@@ -1560,7 +1775,17 @@ struct clip_model_loader {
                         }
                         // @ngxson : the model performs quite poor with small images, we need to bump minimum image tokens to 40 to avoid that
                         hparams.set_limit_image_tokens(40, 280);
-                        hparams.set_warmup_n_tokens(256); // avoid OOM on warmup
+                        // hparams.set_warmup_n_tokens(256); // avoid OOM on warmup
+                        // intentionally NOT calling set_warmup_n_tokens here: the previous
+                        // set_warmup_n_tokens(256) would override warmup_image_size with a
+                        // size smaller than the real-image max (280 tokens), so the gallocr
+                        // reserved a buffer that didn't fit the actual graph and tripped the
+                        // bounds assert in ggml_backend_tensor_alloc on iOS Heavy9-Gemma4.
+                        // Letting set_limit_image_tokens(40, 280) seed warmup_image_size
+                        // for the 280-token upper bound matches what the real run will need.
+                        // The memory cost is small here (max=280 tokens) compared to other
+                        // projectors with thousands of tokens where the OOM-on-warmup guard
+                        // matters.
                     } break;
 
                 case PROJECTOR_TYPE_GEMMA3NV:
@@ -1578,9 +1803,37 @@ struct clip_model_loader {
                         hparams.image_resize_algo = RESIZE_ALGO_BILINEAR;
                         get_u32(KEY_SPATIAL_MERGE_SIZE, hparams.n_merge, false);
                         get_u32(KEY_WIN_ATTN_PATTERN, hparams.n_wa_pattern, model.proj_type == PROJECTOR_TYPE_QWEN25VL); // only 2.5 requires it
+                        // SigLIP2-Large ViT (n_head=16, n_layer=24) is used for 2B/4B — max_tiles=4 confirmed.
+                        // Larger ViT variants (8B+) use SigLIP2-SO-400M with unknown max_tiles.
+                        // Read from GGUF if present; otherwise default to 4 and warn for unknown ViTs.
+                        hparams.preproc_max_tiles = 4;
+                        const bool has_max_tiles_key = gguf_find_key(ctx_gguf.get(), KEY_PREPROC_MAX_TILES) >= 0;
+                        get_u32(KEY_PREPROC_MAX_TILES, hparams.preproc_max_tiles, false);
+                        if (has_max_tiles_key && (hparams.preproc_max_tiles < 1 || hparams.preproc_max_tiles > CLIP_PREPROC_MAX_TILES_LIMIT)) {
+                            LOG_WRN("%s: clip.vision.preproc_max_tiles=%d out of range [1,%d] in GGUF — defaulting to 4\n",
+                                    __func__, hparams.preproc_max_tiles, CLIP_PREPROC_MAX_TILES_LIMIT);
+                            hparams.preproc_max_tiles = 4;
+                        }
+                        if (!has_max_tiles_key && (hparams.n_head > 16 || hparams.n_layer > 24)) {
+                            const char * model_name =
+                                model.proj_type == PROJECTOR_TYPE_QWEN2VL  ? "Qwen2VL"  :
+                                model.proj_type == PROJECTOR_TYPE_QWEN25VL ? "Qwen2.5VL" : "Qwen3VL";
+                            // preproc_max_tiles is only read by the Qwen3VL preprocessor; Qwen2/2.5VL
+                            // use dyn_size, so --image-max-tiles is inert there and must not be suggested.
+                            if (model.proj_type == PROJECTOR_TYPE_QWEN3VL) {
+                                LOG_WRN("%s: %s large ViT detected (n_head=%d, n_layer=%d) but "
+                                        "clip.vision.preproc_max_tiles not in GGUF — defaulting to 4. "
+                                        "If using an 8B+ model, set the correct value with --image-max-tiles.\n",
+                                        __func__, model_name, hparams.n_head, hparams.n_layer);
+                            } else {
+                                LOG_WRN("%s: %s large ViT detected (n_head=%d, n_layer=%d) but "
+                                        "clip.vision.preproc_max_tiles not in GGUF — defaulting to 4.\n",
+                                        __func__, model_name, hparams.n_head, hparams.n_layer);
+                            }
+                        }
                         // ref: https://huggingface.co/Qwen/Qwen2.5-VL-7B-Instruct/blob/main/preprocessor_config.json
                         hparams.set_limit_image_tokens(8, 4096);
-                        hparams.set_warmup_n_tokens(46*46); // avoid OOM on warmup
+                        hparams.warmup_image_size = hparams.image_size; // warmup at actual tile size to match inference graph shape
                         const int warn_min_pixels = 1024 * hparams.n_merge * hparams.n_merge * hparams.patch_size * hparams.patch_size;
                         if (hparams.image_min_pixels < warn_min_pixels) {
                             LOG_WRN("%s: Qwen-VL models require at minimum 1024 image tokens to function correctly on grounding tasks\n", __func__);
@@ -2063,7 +2316,15 @@ struct clip_model_loader {
             }
             if (cur) {
                 tensors_to_load.push_back(cur);
-                ggml_tensor * data_tensor = ggml_dup_tensor(ctx_clip.ctx_data.get(), cur);
+                ggml_tensor * data_tensor;
+                if (ctx_clip.convert_bf16_to_f16 && cur->type == GGML_TYPE_BF16) {
+                    // Allocate the in-context tensor as F16; the actual values
+                    // get converted from BF16 in the load loop below.
+                    data_tensor = ggml_new_tensor(ctx_clip.ctx_data.get(), GGML_TYPE_F16,
+                                                  ggml_n_dims(cur), cur->ne);
+                } else {
+                    data_tensor = ggml_dup_tensor(ctx_clip.ctx_data.get(), cur);
+                }
                 ggml_set_name(data_tensor, cur->name);
                 loaded_tensor_names.insert(name);
                 cur = data_tensor;
@@ -2226,6 +2487,7 @@ struct clip_model_loader {
                     || model.proj_type == PROJECTOR_TYPE_GLM_EDGE
                     || model.proj_type == PROJECTOR_TYPE_GEMMA3
                     || model.proj_type == PROJECTOR_TYPE_IDEFICS3
+                    || model.proj_type == PROJECTOR_TYPE_VISIONPSY
                     || model.proj_type == PROJECTOR_TYPE_MINICPMV
                     || model.proj_type == PROJECTOR_TYPE_MINICPMV4_6
                 ) && layer.ff_up_w && layer.ff_down_w && layer.ff_down_w->ne[0] == hparams.n_embd;
@@ -2632,6 +2894,7 @@ struct clip_model_loader {
                     model.mm_soft_emb_norm_w = get_tensor(TN_MM_SOFT_EMB_N);
                 } break;
             case PROJECTOR_TYPE_IDEFICS3:
+            case PROJECTOR_TYPE_VISIONPSY:
                 {
                     model.mm_fc_w = get_tensor(string_format(TN_MM_PROJECTOR, "weight"));
                 } break;
@@ -3481,11 +3744,78 @@ struct clip_model_loader {
 
             // alloc memory and offload data
             ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(ctx_clip.backend);
+            // On CPU, place quantized 2D weight matrices in the ggml "repack"
+            // extra buffer type (aarch64 i8mm interleaved layout, x86 AVX2, ...)
+            // so their mul_mat uses the much faster repacked GEMM. Only tensors
+            // the backend can actually repack+matmul go there (probed per-tensor);
+            // non-quant conv weights / biases / norms stay in the default buffer,
+            // else their non-matmul ops would become unsupported. On arches with
+            // no repack kernel the probe rejects everything and this is a no-op.
+            // Opt out with MTMD_CLIP_NO_REPACK=1.
+            if (ctx_clip.backend == ctx_clip.backend_cpu && !getenv("MTMD_CLIP_NO_REPACK")) {
+                ggml_backend_dev_t cpu_dev = ggml_backend_get_device(ctx_clip.backend_cpu);
+                ggml_backend_buffer_type_t repack_buft = nullptr;
+                if (cpu_dev) {
+                    ggml_backend_reg_t cpu_reg = ggml_backend_dev_backend_reg(cpu_dev);
+                    auto get_extra_bufts_fn = (ggml_backend_dev_get_extra_bufts_t)
+                        ggml_backend_reg_get_proc_address(cpu_reg, "ggml_backend_dev_get_extra_bufts");
+                    if (get_extra_bufts_fn) {
+                        ggml_backend_buffer_type_t * extra = get_extra_bufts_fn(cpu_dev);
+                        if (extra && extra[0]) repack_buft = extra[0];
+                    }
+                }
+                if (repack_buft) {
+                    // A weight goes to the repack buffer only if THIS arch can
+                    // actually repack it AND run its mul_mat there (probe like
+                    // llama's buft_supported). This is arch-correct: on x86 q8_0
+                    // isn't repackable so the probe fails and weights stay default;
+                    // on ARM (NEON+i8mm) it passes.
+                    ggml_backend_dev_t probe_dev = ggml_backend_get_device(ctx_clip.backend_cpu);
+                    ggml_backend_buffer_t probe_buf = ggml_backend_buft_alloc_buffer(repack_buft, 0);
+                    auto repack_ok = [&](const ggml_tensor * w) -> bool {
+                        if (ggml_n_dims(w) != 2) return false;
+                        ggml_init_params p = { ggml_tensor_overhead() * 4 + 256, nullptr, true };
+                        ggml_context * mctx = ggml_init(p);
+                        if (!mctx) return false;
+                        ggml_tensor * w2 = ggml_new_tensor_2d(mctx, w->type, w->ne[0], w->ne[1]);
+                        ggml_tensor * s1 = ggml_new_tensor_2d(mctx, GGML_TYPE_F32, w->ne[0], 8);
+                        ggml_tensor * op = ggml_mul_mat(mctx, w2, s1);
+                        w2->buffer = probe_buf; // pretend the weight lives in the repack buffer
+                        bool ok = ggml_backend_dev_supports_op(probe_dev, op);
+                        ggml_free(mctx);
+                        return ok;
+                    };
+                    // collect repackable weights
+                    std::vector<ggml_tensor *> repack_tensors;
+                    const size_t align = ggml_backend_buft_get_alignment(repack_buft);
+                    size_t repack_size = 0;
+                    for (ggml_tensor * t = ggml_get_first_tensor(ctx_clip.ctx_data.get());
+                         t != nullptr; t = ggml_get_next_tensor(ctx_clip.ctx_data.get(), t)) {
+                        if (repack_ok(t)) {
+                            repack_tensors.push_back(t);
+                            repack_size += GGML_PAD(ggml_backend_buft_get_alloc_size(repack_buft, t), align);
+                        }
+                    }
+                    if (probe_buf) ggml_backend_buffer_free(probe_buf);
+                    if (!repack_tensors.empty()) {
+                        ctx_clip.buf_repack.reset(ggml_backend_buft_alloc_buffer(repack_buft, repack_size));
+                        ggml_backend_buffer_set_usage(ctx_clip.buf_repack.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+                        ggml_tallocr talloc = ggml_tallocr_new(ctx_clip.buf_repack.get());
+                        for (ggml_tensor * t : repack_tensors) ggml_tallocr_alloc(&talloc, t);
+                        LOG_INF("%s: repacked %zu quantized weights into %s (%.1f MiB)\n",
+                                __func__, repack_tensors.size(), ggml_backend_buft_name(repack_buft),
+                                repack_size / 1024.0 / 1024.0);
+                    }
+                }
+            }
+            // allocate everything not already placed (i.e. the non-repack tensors)
             ctx_clip.buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(ctx_clip.ctx_data.get(), buft));
             ggml_backend_buffer_set_usage(ctx_clip.buf.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
             // read the weight from file
             if (!ctx_clip.no_alloc) {
                 size_t data_loaded = 0;
+                std::vector<float>       conv_f32;
+                std::vector<ggml_fp16_t> conv_f16;
                 for (auto & t : tensors_to_load) {
                     ggml_tensor * cur = ggml_get_tensor(ctx_clip.ctx_data.get(), t->name);
                     GGML_ASSERT(cur && "tensor not found in ctx_data");
@@ -3496,8 +3826,42 @@ struct clip_model_loader {
                     if (!fin) {
                         throw std::runtime_error(string_format("%s: failed to seek for tensor %s\n", __func__, t->name));
                     }
+                    const bool need_bf16_to_f16 =
+                        ctx_clip.convert_bf16_to_f16 &&
+                        t->type == GGML_TYPE_BF16 &&
+                        cur->type == GGML_TYPE_F16;
+                    if (need_bf16_to_f16) {
+                        // Read raw bf16 from disk, convert to f32 then to f16, write to tensor.
+                        const int64_t n = ggml_nelements(cur);
+                        const size_t  src_bytes = ggml_nbytes(t);  // bf16 layout
+                        read_buf.resize(src_bytes);
+                        fin.read(reinterpret_cast<char *>(read_buf.data()), src_bytes);
+                        conv_f32.resize(n);
+                        conv_f16.resize(n);
+                        ggml_bf16_to_fp32_row(reinterpret_cast<const ggml_bf16_t *>(read_buf.data()),
+                                              conv_f32.data(), n);
+                        ggml_fp32_to_fp16_row(conv_f32.data(), conv_f16.data(), n);
+                        const size_t dst_bytes = ggml_nbytes(cur); // f16 layout
+                        // check the tensor's OWN buffer (weights may be split
+                        // across the default host buffer and the non-host repack buffer)
+                        if (ggml_backend_buft_is_host(ggml_backend_buffer_get_type(cur->buffer))) {
+                            memcpy(cur->data, conv_f16.data(), dst_bytes);
+                        } else {
+                            ggml_backend_tensor_set(cur, conv_f16.data(), 0, dst_bytes);
+                        }
+                        data_loaded += dst_bytes;
+                        if (progress_callback && total_data_size > 0) {
+                            const float progress = (float)data_loaded / (float)total_data_size;
+                            if (!progress_callback(progress, progress_callback_user_data)) {
+                                throw std::runtime_error(string_format("%s: model loading cancelled by progress_callback\n", __func__));
+                            }
+                        }
+                        continue;
+                    }
                     size_t num_bytes = ggml_nbytes(cur);
-                    if (ggml_backend_buft_is_host(buft)) {
+                    // check the tensor's OWN buffer (weights may be split
+                    // across the default host buffer and the non-host repack buffer)
+                    if (ggml_backend_buft_is_host(ggml_backend_buffer_get_type(cur->buffer))) {
                         // for the CPU and Metal backend, we can read directly into the tensor
                         fin.read(reinterpret_cast<char *>(cur->data), num_bytes);
                     } else {
@@ -3578,10 +3942,53 @@ struct clip_model_loader {
     static void warmup(clip_ctx & ctx_clip, const clip_image_f32_batch & batch) {
         support_info_graph info;
 
+        // Downgrade FA to AUTO on GPU projectors that lack efficient (coopmat) flash
+        // attention. Without coopmat, Vulkan uses FA_SCALAR which is ~2.6x slower than the
+        // matmul path for CLIP encoder attention (Mali-G715: 38 vs ~100 GFLOPS/s).
+        // Coopmat-capable GPUs keep FA enabled. Resolved at runtime via proc_address — no
+        // compile-time backend dep. Acts on AUTO *and* ENABLED (the addon enables FA by
+        // default) — an inefficient scalar-FA GPU should never be forced into FA; only
+        // explicit DISABLED is left alone. AUTO (not DISABLED, QVAC-21914): a hard disable
+        // forces the explicit path whose O(n_patches^2 * n_head) score matrix OOMs at high
+        // n_pos (image_tile_mode=disabled + large image_max_tokens killed Pixel 9 Pro at
+        // ~12 GB RSS); AUTO keeps the fast explicit path for normal images via the budget
+        // heuristic in clip_resolve_flash_attn_type() and falls back to memory-frugal
+        // scalar FA for huge ones — slow-but-alive beats fast-but-OOM.
+        // Default when the backend can't confirm efficient FA = KEEP it. Only ggml-vulkan
+        // implements the query (returning false for Mali/non-coopmat); backends that don't
+        // answer (Metal, CUDA, and also ggml-opencl) have (or are assumed to have) efficient
+        // FA and must keep it — disabling there forces explicit attention whose QK^T
+        // overflows the clip compute buffer at high n_pos (GGML_ASSERT in ggml-backend,
+        // e.g. image_tile_mode=disabled + large image_max_tokens). ggml-opencl's own
+        // giant-encode driver fault at high n_pos is handled inside that backend
+        // (submission bounding: periodic clFlush + FA q-chunking), not via this gate.
+        if (ctx_clip.flash_attn_type != CLIP_FLASH_ATTN_TYPE_DISABLED &&
+            ctx_clip.backend && ctx_clip.backend != ctx_clip.backend_cpu) {
+            bool efficient_fa = true;
+            ggml_backend_dev_t dev = ggml_backend_get_device(ctx_clip.backend);
+            ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+            if (reg) {
+                typedef bool (*supports_efficient_fa_t)(ggml_backend_t);
+                auto fn = (supports_efficient_fa_t)ggml_backend_reg_get_proc_address(
+                    reg, "ggml_backend_supports_efficient_fa");
+                if (fn) {
+                    efficient_fa = fn(ctx_clip.backend);
+                }
+            }
+            if (!efficient_fa) {
+                ctx_clip.flash_attn_type = CLIP_FLASH_ATTN_TYPE_AUTO;
+                ctx_clip.fa_backend_inefficient = true;
+            }
+        }
+
         if (ctx_clip.flash_attn_type == CLIP_FLASH_ATTN_TYPE_AUTO) {
-            // try to enable flash attention to see if it's supported
+            // Probe flash-attention support by forcing it on for the warmup
+            // graph, then restore AUTO so the per-image budget heuristic in
+            // clip_resolve_flash_attn_type() decides at encode time.
             ctx_clip.flash_attn_type = CLIP_FLASH_ATTN_TYPE_ENABLED;
             info = reserve_compute_meta(ctx_clip, batch);
+            ctx_clip.flash_attn_supported = info.fattn;
+            ctx_clip.flash_attn_type = CLIP_FLASH_ATTN_TYPE_AUTO;
             if (!info.fattn && info.fattn_op) {
                 auto op = info.fattn_op;
                 LOG_WRN("%s: *****************************************************************\n", __func__);
@@ -3600,10 +4007,12 @@ struct clip_model_loader {
                 LOG_WRN("%s: please report this on github as an issue\n", __func__);
                 LOG_WRN("%s: *****************************************************************\n", __func__);
                 ctx_clip.flash_attn_type = CLIP_FLASH_ATTN_TYPE_DISABLED;
-                reserve_compute_meta(ctx_clip, batch);
+                // re-measure with FA now resolving to DISABLED (unsupported)
+                info = reserve_compute_meta(ctx_clip, batch);
             }
         } else {
             info = reserve_compute_meta(ctx_clip, batch);
+            ctx_clip.flash_attn_supported = info.fattn;
             if (!info.fattn && ctx_clip.flash_attn_type == CLIP_FLASH_ATTN_TYPE_ENABLED) {
                 LOG_WRN("%s: flash attention is not supported by the current backend; falling back to CPU (performance will be degraded)\n", __func__);
             }
@@ -3611,8 +4020,11 @@ struct clip_model_loader {
 
         ctx_clip.is_allocated = true; // mark buffers as allocated
 
-        LOG_INF("%s: flash attention is %s\n", __func__,
-            (ctx_clip.flash_attn_type == CLIP_FLASH_ATTN_TYPE_ENABLED) ? "enabled" : "disabled");
+        const char * fa_state =
+            ctx_clip.flash_attn_type == CLIP_FLASH_ATTN_TYPE_ENABLED  ? "enabled"  :
+            ctx_clip.flash_attn_type == CLIP_FLASH_ATTN_TYPE_DISABLED ? "disabled" :
+            ctx_clip.flash_attn_supported ? "auto (per-image)" : "auto -> disabled (unsupported)";
+        LOG_INF("%s: flash attention is %s\n", __func__, fa_state);
 
         // print ops that are not supported by the GPU backend (if there is one)
         if (ctx_clip.backend && ctx_clip.backend != ctx_clip.backend_cpu) {
@@ -3849,9 +4261,138 @@ struct clip_init_result clip_init(const char * fname, struct clip_context_params
             ctx_params.progress_callback_user_data);
         bool skip_audio = false;
 
+        ctx_params.has_bf16_weights = loader.has_bf16_weights();
+
         if (loader.has_vision) {
             ctx_vision = new clip_ctx(ctx_params);
             loader.load_hparams(ctx_vision->model, CLIP_MODALITY_VISION);
+            // apply CLI/binding overrides after load_hparams so GGUF defaults don't clobber them.
+            // Only the Qwen3VL preprocessor reads preproc_max_tiles live; Qwen2/2.5VL use dyn_size
+            // and InternVL uses a candidate list already frozen in load_hparams, so the override is
+            // inert for them — apply (and validate) it only where it takes effect.
+            //
+            // Treat only a POSITIVE value as an explicit override. -1 is the documented unset
+            // sentinel, and 0 is what a zero-initialized clip_context_params / mtmd_context_params
+            // passes (bindings / direct C API callers that never set the field). Both are treated
+            // as unset here so those callers keep the GGUF/model default instead of silently
+            // forcing single-tile and losing multi-tile preprocessing on large/high-res images.
+            if (ctx_params.image_max_tiles > 0) {
+                if (ctx_vision->model.proj_type != PROJECTOR_TYPE_QWEN3VL) {
+                    LOG_WRN("%s: --image-max-tiles is only supported for Qwen3VL; ignoring for this model\n", __func__);
+                } else {
+                    int max_tiles = ctx_params.image_max_tiles;
+                    // Re-validate at this library boundary: bindings populate clip_context_params
+                    // directly and bypass the CLI's [1,256] check. An unbounded value reaches the
+                    // grid-fitting reserve in mtmd-image.cpp and can OOM the process.
+                    if (max_tiles > CLIP_PREPROC_MAX_TILES_LIMIT) {
+                        LOG_WRN("%s: --image-max-tiles=%d exceeds [1,%d]; clamping\n",
+                                __func__, max_tiles, CLIP_PREPROC_MAX_TILES_LIMIT);
+                        max_tiles = CLIP_PREPROC_MAX_TILES_LIMIT;
+                    }
+                    ctx_vision->model.hparams.preproc_max_tiles = max_tiles;
+                    LOG_INF("%s: preproc_max_tiles: %d (custom value)\n", __func__, max_tiles);
+                }
+            }
+            // Same ordering rule as above: override the GGUF value, don't get clobbered by it.
+            // -1 is the unset sentinel; 0 and 1 are both explicit, unlike image_max_tiles, since
+            // "off" is a meaningful choice against a GGUF that turns it on. Only the idefics3
+            // preprocessor reads the flag, and VisionPsy shares that preprocessor.
+            if (ctx_params.image_no_upscale >= 0) {
+                const bool no_upscale = ctx_params.image_no_upscale != 0;
+                const projector_type pt = ctx_vision->model.proj_type;
+                if (pt != PROJECTOR_TYPE_IDEFICS3 && pt != PROJECTOR_TYPE_VISIONPSY) {
+                    LOG_WRN("%s: --image-no-upscale only affects idefics3-style preprocessing; ignoring for this model\n", __func__);
+                } else {
+                    // Turning it OFF against a GGUF that turned it on is the one case that
+                    // silently degrades quality, and it is also what a zero-initialized
+                    // clip_context_params/mtmd_context_params passes (bindings and direct C
+                    // API callers that never set the field). Say so rather than swallow it.
+                    if (!no_upscale && ctx_vision->model.hparams.image_no_upscale) {
+                        LOG_WRN("%s: image_no_upscale=0 overrides %s=true from the GGUF; "
+                                "pass -1 to keep the model default\n", __func__, KEY_PREPROC_NO_UPSCALE);
+                    }
+                    ctx_vision->model.hparams.image_no_upscale = no_upscale;
+                    LOG_INF("%s: preproc_no_upscale: %d (custom value)\n", __func__, no_upscale);
+                }
+            }
+            {
+                // Both idefics3-style sizing rules divide by image_size and cap with
+                // image_longest_edge, and neither degrades gracefully at zero: image_size 0 hits
+                // GGML_ASSERT(align_size > 0) at preprocess time, which aborts the process rather
+                // than failing the request, and image_longest_edge 0 makes the refined size {0,0},
+                // so the grid is empty and the model silently gets the overview alone, 64 image
+                // tokens where it expects hundreds. Fail the load instead, where it is reportable.
+                //
+                // Scoped to the two projectors that run this rule, NOT applied to every slicing
+                // model: image_size == 0 is legal elsewhere and means dynamic sizing, as the
+                // sanity check in load_hparams says, so a blanket check would reject Qwen-VL.
+                // Checked after the override above so it covers the flag as well as the GGUF key.
+                const auto & vp = ctx_vision->model.hparams;
+                const projector_type slicing_pt = ctx_vision->model.proj_type;
+                const bool idefics3_style = slicing_pt == PROJECTOR_TYPE_VISIONPSY ||
+                                            slicing_pt == PROJECTOR_TYPE_IDEFICS3;
+                // image_size is the divisor and the align size, and zero aborts the process at the
+                // first image, so it is a load failure for both.
+                if (idefics3_style && vp.image_size <= 0) {
+                    throw std::runtime_error(
+                        string_format("%s: this projector slices by image_size, which must be positive (%d)\n",
+                                      __func__, vp.image_size));
+                }
+                // The cap is the one the two disagree on. VisionPsy's published mmprojs all carry
+                // it, so a missing cap there is broken metadata. idefics3 cannot throw: the shipped
+                // ggml-org/SmolVLM-500M-Instruct-GGUF mmproj has no preproc_image_size at all and
+                // would stop loading. It is already overview-only for that reason, so say so.
+                if (slicing_pt == PROJECTOR_TYPE_VISIONPSY && vp.image_longest_edge <= 0) {
+                    throw std::runtime_error(
+                        string_format("%s: this projector slices by image_size, so %s must be positive (%d)\n",
+                                      __func__, KEY_PREPROC_IMAGE_SIZE, vp.image_longest_edge));
+                }
+                if (slicing_pt == PROJECTOR_TYPE_IDEFICS3 && vp.image_longest_edge <= 0) {
+                    LOG_WRN("%s: %s is missing, so the refined size is empty and every image will be "
+                            "encoded as the overview alone; slicing is effectively off\n",
+                            __func__, KEY_PREPROC_IMAGE_SIZE);
+                } else if (idefics3_style) {
+                    // Past this point the cap is positive for both projectors, so the rest of the
+                    // rule's invariants are checkable. They are `else` because the overview-only
+                    // idefics3 above never reaches the sizing rule at all, and throwing there
+                    // would contradict the warning we just printed.
+
+                    // The cap is also the upper bound of the clamps in calc_size_no_upscale(), and
+                    // std::clamp requires lo <= hi, so metadata that puts the cap below one slice is
+                    // undefined behaviour rather than a bad result. Reject it here.
+                    if (vp.image_no_upscale && vp.image_longest_edge < vp.image_size) {
+                        throw std::runtime_error(
+                            string_format("%s: preproc_no_upscale needs %s (%d) >= image_size (%d)\n", __func__,
+                                          KEY_PREPROC_IMAGE_SIZE, vp.image_longest_edge, vp.image_size));
+                    }
+                    // The slicing loop steps by image_size and both sizing rules round up to a
+                    // multiple of it, so a cap that is not itself a multiple is the one input that
+                    // breaks the invariant: calc_size_no_upscale() clamps the long side down to the
+                    // cap and lands off-grid, giving a ragged trailing slice the reference splitter
+                    // never emits. test-mtmd-preproc-sizing.cpp asserts the invariant; enforce it
+                    // against real metadata here.
+                    if (vp.image_longest_edge % vp.image_size != 0) {
+                        throw std::runtime_error(
+                            string_format("%s: %s (%d) must be a multiple of image_size (%d)\n", __func__,
+                                          KEY_PREPROC_IMAGE_SIZE, vp.image_longest_edge, vp.image_size));
+                    }
+                    // Upper bound, the counterpart of the image_max_tiles clamp above. The cap is a
+                    // GGUF u32 read into an int, so a corrupt or hostile mmproj can declare a value
+                    // that upscales every image to it: the grid is (cap/image_size)^2 slices and the
+                    // loop in mtmd-image.cpp reserves one tile each, so cap=100000 at image_size=512
+                    // is a 196x196 grid, ~30 GB of tiles, and a cap near INT32_MAX overflows the
+                    // multiply-back in calc_size_preserved_ratio() first. Bound the grid, not the
+                    // pixels, so the limit means the same thing as the Qwen-VL one.
+                    const int64_t tiles_per_side = vp.image_longest_edge / vp.image_size;
+                    if (tiles_per_side * tiles_per_side > CLIP_PREPROC_MAX_TILES_LIMIT) {
+                        throw std::runtime_error(
+                            string_format("%s: %s (%d) at image_size %d implies %lld slices, over the limit of %d\n",
+                                          __func__, KEY_PREPROC_IMAGE_SIZE, vp.image_longest_edge, vp.image_size,
+                                          (long long) (tiles_per_side * tiles_per_side),
+                                          CLIP_PREPROC_MAX_TILES_LIMIT));
+                    }
+                }
+            }
             loader.load_tensors(*ctx_vision);
             loader.init_ctx(*ctx_vision);
             if (ctx_params.warmup) {
@@ -4048,14 +4589,34 @@ int clip_n_output_tokens(const clip_ctx * ctx, const clip_image_f32 * img) {
         case PROJECTOR_TYPE_GEMMA3:
         case PROJECTOR_TYPE_GEMMA4V:
         case PROJECTOR_TYPE_GEMMA4UV:
-        case PROJECTOR_TYPE_IDEFICS3:
         case PROJECTOR_TYPE_INTERNVL:
-        case PROJECTOR_TYPE_NEMOTRON_V2_VL:
         case PROJECTOR_TYPE_LLAMA4:
             {
-                // both X and Y are downscaled by the scale factor
+                // These pool/reshape per dimension (ggml_pool_2d with pad 0, or a
+                // reshape that requires divisibility), so the graph emits
+                // floor(W/p/s) * floor(H/p/s). Round per dimension to match; this
+                // differs from floor(W/p * H/p / s^2) when a side is not divisible
+                // by s, which would otherwise mismatch the actual graph output and
+                // trip the token-count sanity check in clip_image_batch_encode.
                 int scale_factor = ctx->model.hparams.n_merge;
-                n_patches /= (scale_factor * scale_factor);
+                int x_patch = (img->nx() / patch_size) / scale_factor;
+                int y_patch = (img->ny() / patch_size) / scale_factor;
+                n_patches = x_patch * y_patch;
+            } break;
+        case PROJECTOR_TYPE_IDEFICS3:
+        case PROJECTOR_TYPE_VISIONPSY:
+        case PROJECTOR_TYPE_NEMOTRON_V2_VL:
+            {
+                // These merge via build_patch_merge_permute(), which pads each
+                // dimension up to a multiple of the scale factor (CLIP_ALIGN)
+                // before the merge, so the graph emits
+                // ceil(W/p/s) * ceil(H/p/s). Match that rounding (mirrors the
+                // LFM2/KIMIVL and PaddleOCR merge cases below); floor would
+                // under-count on non-divisible grids and trip the sanity check.
+                int scale_factor = ctx->model.hparams.n_merge;
+                int x_patch = CLIP_ALIGN(img->nx() / patch_size, scale_factor) / scale_factor;
+                int y_patch = CLIP_ALIGN(img->ny() / patch_size, scale_factor) / scale_factor;
+                n_patches = x_patch * y_patch;
             } break;
         case PROJECTOR_TYPE_GEMMA3NV:
             {
@@ -4287,10 +4848,70 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
     const clip_image_f32_batch & imgs = *params->imgs;
     int n_batch_cur = imgs.entries.size();
 
-    // [QWEN_VIDEO] for video models, the batch dimension is used as temporal dimension for merged frames
+    if (n_batch_cur == 0) {
+        return false;
+    }
+
+    // [QWEN_VIDEO] for video models, the batch dimension is used as temporal dimension for merged frames.
     if (!ctx->support_batch && n_batch_cur > clip_model_n_temporal_merge(ctx)) {
         LOG_ERR("%s: batch size %d exceeds maximum supported batch/temporal-merge size %d\n", __func__, n_batch_cur, clip_model_n_temporal_merge(ctx));
         return false;
+    }
+
+    LOG_INF("%s: encoding %d tile(s), grid=%dx%d, tile_size=%dx%d\n", __func__,
+            n_batch_cur,
+            imgs.grid_x, imgs.grid_y,
+            imgs.entries[0].nx(), imgs.entries[0].ny());
+
+    // Validate that all tiles share the same dimensions; logs an error and returns false if not.
+    auto validate_tile_sizes = [&](const char * tag) -> bool {
+        const int tile_nx = imgs.entries[0].nx();
+        const int tile_ny = imgs.entries[0].ny();
+        for (int b = 1; b < n_batch_cur; b++) {
+            if (imgs.entries[b].nx() != tile_nx || imgs.entries[b].ny() != tile_ny) {
+                LOG_ERR("%s: %s tile %d size %dx%d != expected %dx%d; all tiles must be the same size\n",
+                        __func__, tag, b, imgs.entries[b].nx(), imgs.entries[b].ny(), tile_nx, tile_ny);
+                return false;
+            }
+        }
+        return true;
+    };
+
+    // Encode tiles one by one. Used for SEQUENTIAL tile mode and as OOM fallback from BATCHED mode.
+    auto do_encode_sequential = [&]() -> bool {
+        if (!validate_tile_sizes("sequential mode")) { return false; }
+        const int n_tokens_per_tile = clip_n_output_tokens(ctx, &imgs.entries[0]);
+        const int out_embd          = clip_n_mmproj_embd(ctx);
+        const size_t tile_size      = (size_t)n_tokens_per_tile * out_embd;
+        // reused across iterations: same-size tiles, so the buffers are allocated once
+        clip_image_f32_batch single;
+        single.entries.resize(1);
+        single.grid_x = 1;
+        single.grid_y = 1;
+        std::vector<float> single_out;
+        const bool has_out = params->out_embd != nullptr && !params->out_embd->empty();
+        for (int b = 0; b < n_batch_cur; b++) {
+            single.entries[0] = imgs.entries[b];
+            if (has_out) {
+                single_out.resize(tile_size);
+            }
+            bool ok = clip_image_batch_encode(ctx, params->n_threads, &single, single_out);
+            if (!ok) {
+                return false;
+            }
+            if (has_out) {
+                auto & out_batch_embd = *params->out_embd;
+                const size_t offset = (size_t)b * tile_size;
+                GGML_ASSERT(offset + single_out.size() <= out_batch_embd.size());
+                std::copy(single_out.begin(), single_out.end(), out_batch_embd.begin() + offset);
+            }
+        }
+        return true;
+    };
+
+    // Explicit sequential mode.
+    if (ctx->proj_type() == PROJECTOR_TYPE_QWEN3VL && n_batch_cur > 1 && ctx->tile_mode == CLIP_IMAGE_TILE_MODE_SEQUENTIAL) {
+        return do_encode_sequential();
     }
 
     // if buffers are not allocated, we need to do a warmup run to allocate them
@@ -4306,7 +4927,43 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
     // build the inference graph
     ggml_backend_sched_reset(ctx->sched.get());
     ggml_cgraph * gf = clip_get_graph_builder(ctx, imgs, params)->build();
-    ggml_backend_sched_alloc_graph(ctx->sched.get(), gf);
+    if (!ggml_backend_sched_alloc_graph(ctx->sched.get(), gf)) {
+        // The explicit-attention path that AUTO selects for short sequences needs
+        // O(n_patches^2) scratch and can OOM on memory-constrained devices. If
+        // flash-attention is available, rebuild this image with FA (which never
+        // materializes the full scores) and retry before falling back to slower
+        // sequential tiling. This is a no-op when FA was already the chosen path.
+        bool allocated = false;
+        if (ctx->flash_attn_type == CLIP_FLASH_ATTN_TYPE_AUTO && ctx->flash_attn_supported) {
+            LOG_WRN("%s: explicit-attention graph alloc failed (OOM); retrying with flash-attention\n", __func__);
+            const clip_flash_attn_type saved = ctx->flash_attn_type;
+            ctx->flash_attn_type = CLIP_FLASH_ATTN_TYPE_ENABLED; // force FA for this rebuild
+            ggml_backend_sched_reset(ctx->sched.get());
+            gf = clip_get_graph_builder(ctx, imgs)->build();
+            allocated = ggml_backend_sched_alloc_graph(ctx->sched.get(), gf);
+            ctx->flash_attn_type = saved; // restore AUTO for subsequent images
+        }
+        if (!allocated) {
+            if (ctx->proj_type() == PROJECTOR_TYPE_QWEN3VL && n_batch_cur > 1) {
+                // Still failing (or FA unavailable) — fall back to sequential. We
+                // already know the batched explicit path OOMs here, so force
+                // flash-attention (the memory-frugal path) for the whole sequential
+                // run when it's supported; otherwise each tile would re-resolve to
+                // explicit, re-OOM and rebuild (up to N x2 allocations). Restore the
+                // prior mode afterwards for subsequent images.
+                LOG_WRN("%s: graph alloc failed (OOM), retrying with sequential encoding\n", __func__);
+                const clip_flash_attn_type saved = ctx->flash_attn_type;
+                if (ctx->flash_attn_supported) {
+                    ctx->flash_attn_type = CLIP_FLASH_ATTN_TYPE_ENABLED;
+                }
+                const bool ok = do_encode_sequential();
+                ctx->flash_attn_type = saved;
+                return ok;
+            }
+            LOG_ERR("%s: ggml_backend_sched_alloc_graph failed\n", __func__);
+            return false;
+        }
+    }
 
     // set inputs
     const auto & model   = ctx->model;
@@ -4395,7 +5052,7 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
     if (!imgs.is_audio) {
         size_t nelem = 0;
         for (const auto & img : imgs.entries) {
-            nelem += img.nx() * img.ny() * 3;
+            nelem += (size_t)img.nx() * (size_t)img.ny() * 3;
         }
         std::vector<float> inp_raw(nelem);
 
@@ -4410,25 +5067,23 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
         // └─────┘ │
         //   ──────┘ x B
 
-        // IMPORTANT: [QWEN_VIDEO] the batch dim is currently used for temporal dim in Qwen-VL models
-        // All entries must have the same spatial size (enforced by can_batch_with() during merging)
-        {
-            const int nx = imgs.entries[0].nx();
-            const int ny = imgs.entries[0].ny();
-            const int n  = nx * ny;
-
-            for (int b = 0; b < n_batch_cur; b++) {
-                LOG_DBG("%s: copying image %d/%d to input buffer (nx=%d, ny=%d)\n", __func__, b+1, n_batch_cur, nx, ny);
-                const auto & buf = imgs.entries[b].get_ro_buf();
-                float * batch_entry = inp_raw.data() + b * (3*n);
-                for (int y = 0; y < ny; y++) {
-                    for (int x = 0; x < nx; x++) {
-                        size_t base_src = 3*(y * nx + x);
-                        size_t base_dst =    y * nx + x;
-                        batch_entry[      base_dst] = buf[base_src    ];
-                        batch_entry[1*n + base_dst] = buf[base_src + 1];
-                        batch_entry[2*n + base_dst] = buf[base_src + 2];
-                    }
+        // Layout: [nx, ny, 3, n_batch_cur] - channel-first per tile, tiles packed along last dim.
+        // All tiles must be the same size (ensured by the Qwen3VL tiling preprocessor).
+        GGML_ASSERT(n_batch_cur > 0);
+        if (!validate_tile_sizes("batched")) { return false; }
+        for (int b = 0; b < n_batch_cur; b++) {
+            const int    nx = imgs.entries[b].nx();
+            const int    ny = imgs.entries[b].ny();
+            const size_t n  = (size_t)nx * (size_t)ny;
+            const auto & buf = imgs.entries[b].get_ro_buf();
+            float * tile_entry = inp_raw.data() + (size_t)b * 3 * n;
+            for (int y = 0; y < ny; y++) {
+                for (int x = 0; x < nx; x++) {
+                    size_t base_src = 3 * (y * nx + x);
+                    size_t base_dst =      y * nx + x;
+                    tile_entry[      base_dst] = buf[base_src    ];
+                    tile_entry[1*n + base_dst] = buf[base_src + 1];
+                    tile_entry[2*n + base_dst] = buf[base_src + 2];
                 }
             }
         }
@@ -4648,7 +5303,6 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
                 set_input_i32("merger_ds_idx_3", m_ds_3);
             } break;
         case PROJECTOR_TYPE_QWEN2VL:
-        case PROJECTOR_TYPE_QWEN3VL:
         case PROJECTOR_TYPE_GLM4V:
             {
                 const int merge_ratio = hparams.n_merge;
@@ -4665,6 +5319,51 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
                                 positions[2 * num_patches + ptr] = y + dy;
                                 positions[3 * num_patches + ptr] = x + dx;
                                 ptr++;
+                            }
+                        }
+                    }
+                }
+
+                set_input_i32("positions", positions);
+            } break;
+        case PROJECTOR_TYPE_QWEN3VL:
+            {
+                // Per-tile M-RoPE positions use *local* patch coordinates (origin at each tile's
+                // top-left). Attention is computed per-tile and RoPE scores depend only on the
+                // relative position pos_i - pos_j, so any per-tile absolute offset would cancel
+                // exactly and have no effect on the encoder. Every tile therefore gets the same
+                // local-coordinate block. Absolute tile placement reaches the LM via decoder
+                // positions (mtmd_image_tokens_get_decoder_pos in mtmd.cpp), not here.
+                const int merge_ratio  = hparams.n_merge;
+                GGML_ASSERT(merge_ratio > 0);
+                const int pw           = image_size_width  / patch_size; // per-tile width in patches
+                const int ph           = image_size_height / patch_size; // per-tile height in patches
+                GGML_ASSERT(pw % merge_ratio == 0 && ph % merge_ratio == 0 &&
+                            "tile dimensions must be divisible by n_merge");
+                const int n_pos_tile   = pw * ph; // raw patches per tile == n_patches (graph sequence length)
+                // positions layout: section-major over the FULL batched sequence. The mrope kernel
+                // reads section s of token i as positions[s * N + i], where N = n_pos_tile * n_batch_cur
+                // is the rope tensor's ne[2]. The four sections are [y, x, y, x]. Every tile gets the
+                // same local-coordinate block (per-tile absolute offsets cancel under relative
+                // attention), so each section just repeats the tile coordinates n_batch_cur times.
+                // For n_batch_cur == 1 this is identical to the old tile-major layout; for
+                // n_batch_cur > 1 (batched mode) it is the only layout the kernel reads correctly —
+                // a tile-major buffer would mis-index every section beyond the first tile.
+                const size_t N = (size_t)n_pos_tile * (size_t)n_batch_cur;
+                std::vector<int32_t> positions(N * 4);
+                for (int b = 0; b < n_batch_cur; b++) {
+                    const size_t tile_off = (size_t)b * (size_t)n_pos_tile;
+                    int ptr = 0;
+                    for (int y = 0; y < ph; y += merge_ratio) {
+                        for (int x = 0; x < pw; x += merge_ratio) {
+                            for (int dy = 0; dy < merge_ratio; dy++) {
+                                for (int dx = 0; dx < merge_ratio; dx++) {
+                                    positions[0 * N + tile_off + ptr] = y + dy;
+                                    positions[1 * N + tile_off + ptr] = x + dx;
+                                    positions[2 * N + tile_off + ptr] = y + dy;
+                                    positions[3 * N + tile_off + ptr] = x + dx;
+                                    ptr++;
+                                }
                             }
                         }
                     }
@@ -5064,6 +5763,7 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
         case PROJECTOR_TYPE_GEMMA3:
         case PROJECTOR_TYPE_GEMMA3NV:
         case PROJECTOR_TYPE_IDEFICS3:
+        case PROJECTOR_TYPE_VISIONPSY:
         case PROJECTOR_TYPE_INTERNVL:
         case PROJECTOR_TYPE_NEMOTRON_V2_VL:
         case PROJECTOR_TYPE_QWEN2A:
@@ -5468,8 +6168,8 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
                 const int n           = image_side / window_side;
                 const int new_side    = n * query_side;
 
-                // Builds the raster→window permutation indices for a
-                // (side, side) grid split into (n × n) windows of (win × win)
+                // Builds the raster->window permutation indices for a
+                // (side, side) grid split into (n x n) windows of (win x win)
                 // tokens each.  dst[w * win*win + p] = source raster index.
                 auto make_win_idx = [](int side, int win) {
                     const int nn = side / win;
@@ -5563,11 +6263,11 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
     ggml_tensor * embeddings = params->out_embd ? ggml_graph_node(gf, -1) : nullptr;
 
     if (embeddings != nullptr) {
-        // sanity check (assuming that all images in batch have the same number of tokens, so we only check the first one)
+        // sanity check: ne[1] = tokens per tile, ne[2] = batch size (1 for non-batched models)
         const int n_tokens_out = embeddings->ne[1];
         const int expected_n_tokens_out = clip_n_output_tokens(ctx, &imgs.entries[0]);
         if (n_tokens_out != expected_n_tokens_out) {
-            LOG_ERR("%s: expected output %d tokens, got %d\n", __func__, expected_n_tokens_out, n_tokens_out);
+            LOG_ERR("%s: expected output %d tokens (per tile), got %d\n", __func__, expected_n_tokens_out, n_tokens_out);
             GGML_ABORT("Invalid number of output tokens");
         }
 
@@ -5662,11 +6362,12 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
     if (ctx->debug_output_embeddings && embeddings != nullptr) {
         const int64_t n_embd = embeddings->ne[0];
         const int64_t n_tokens = embeddings->ne[1];
+        const int64_t n_tiles  = embeddings->ne[2];
         std::vector<float> emb_data(ggml_nelements(embeddings));
         ggml_backend_tensor_get(embeddings, emb_data.data(), 0, ggml_nbytes(embeddings));
 
         LOG_INF("\n=== MTMD_DEBUG_EMBEDDINGS ===\n");
-        LOG_INF("Shape: [%lld, %lld]\n", (long long)n_embd, (long long)n_tokens);
+        LOG_INF("Shape: [%lld, %lld, %lld]\n", (long long)n_embd, (long long)n_tokens, (long long)n_tiles);
 
         // Print first few values of first token
         LOG_INF("Token 0 (first 16 values): ");
@@ -5748,6 +6449,7 @@ int clip_n_mmproj_embd(const struct clip_ctx * ctx) {
         case PROJECTOR_TYPE_GEMMA4UA:
             return ctx->model.mm_input_proj_w->ne[1];
         case PROJECTOR_TYPE_IDEFICS3:
+        case PROJECTOR_TYPE_VISIONPSY:
             return ctx->model.mm_fc_w->ne[1];
         case PROJECTOR_TYPE_ULTRAVOX:
         case PROJECTOR_TYPE_VOXTRAL:
@@ -5851,6 +6553,10 @@ std::map<ggml_backend_dev_t, size_t> clip_get_mem_usage(const struct clip_ctx * 
         result[dev] += size;
     }
     return result;
+}
+
+clip_image_tile_mode clip_get_tile_mode(const struct clip_ctx * ctx) {
+    return ctx->tile_mode;
 }
 
 //

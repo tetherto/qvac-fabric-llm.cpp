@@ -38,6 +38,7 @@ bool ggml_op_can_inplace(enum ggml_op op) {
         case GGML_OP_ROPE:
         case GGML_OP_ROPE_BACK:
         case GGML_OP_SILU_BACK:
+        case GGML_OP_SIGMOID_BACK:
         case GGML_OP_RMS_NORM:
         case GGML_OP_RMS_NORM_BACK:
         case GGML_OP_SOFT_MAX:
@@ -1042,6 +1043,18 @@ static bool ggml_gallocr_needs_realloc(ggml_gallocr_t galloc, struct ggml_cgraph
 #endif
                 return true;
             }
+        }
+    }
+
+    // check leafs
+    for (int i = 0; i < graph->n_leafs; i++) {
+        struct ggml_tensor * leaf = graph->leafs[i];
+        struct leaf_alloc * leaf_alloc = &galloc->leaf_allocs[i];
+        if (!ggml_gallocr_node_needs_realloc(galloc, leaf, &leaf_alloc->leaf)) {
+#ifndef NDEBUG
+            GGML_LOG_DEBUG("%s: leaf %s is not valid\n", __func__, leaf->name);
+#endif
+            return true;
         }
     }
 

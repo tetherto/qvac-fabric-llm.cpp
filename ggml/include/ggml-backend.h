@@ -156,6 +156,8 @@ extern "C" {
         bool events;
         // mmap is supported for loading
         bool mmap_support;
+        // dedicated copy stream for compute/transfer overlap
+        bool copy_stream;
     };
 
     // all the device properties
@@ -170,6 +172,10 @@ extern "C" {
         size_t memory_total;
         // device type
         enum ggml_backend_dev_type type;
+        // whether device memory is the same physical pool as host memory
+        // (e.g. Apple silicon unified memory); such devices must be budgeted
+        // together with the host rather than as an independent pool
+        bool memory_unified;
         // device id
         //   for PCI devices, this should be the lower-case PCI bus id formatted as "domain:bus:device.function" (e.g. "0000:c1:00.0")
         //   if the id is unknown, this should be NULL
@@ -315,12 +321,28 @@ extern "C" {
     //
     typedef bool (*ggml_backend_sched_eval_callback)(struct ggml_tensor * t, bool ask, void * user_data);
 
+    typedef bool (*ggml_backend_sched_moe_cache_resolve_callback)(
+            void *                user_data,
+            const struct ggml_tensor * weight,
+            ggml_backend_t        backend,
+            struct ggml_tensor ** cached_weight,
+            void **               cache_entry);
+
+    typedef void (*ggml_backend_sched_moe_cache_begin_callback)(void * user_data);
+
+    typedef bool (*ggml_backend_sched_moe_cache_prepare_callback)(
+            void *          user_data,
+            void *          cache_entry,
+            const int32_t * ids,
+            size_t          n_ids,
+            int32_t *       remapped_ids);
+
     // Initialize a backend scheduler, backends with low index are given priority over backends with high index
     GGML_API ggml_backend_sched_t ggml_backend_sched_new(ggml_backend_t * backends, ggml_backend_buffer_type_t * bufts, int n_backends, size_t graph_size, bool parallel, bool op_offload);
     GGML_API void                 ggml_backend_sched_free(ggml_backend_sched_t sched);
 
     // Initialize backend buffers from a measure graph
-    GGML_API void                 ggml_backend_sched_reserve_size(ggml_backend_sched_t sched, struct ggml_cgraph * measure_graph, size_t * sizes);
+    GGML_API bool                 ggml_backend_sched_reserve_size(ggml_backend_sched_t sched, struct ggml_cgraph * measure_graph, size_t * sizes);
     GGML_API bool                 ggml_backend_sched_reserve(ggml_backend_sched_t sched, struct ggml_cgraph * measure_graph); // returns success
 
     GGML_API int                  ggml_backend_sched_get_n_backends(ggml_backend_sched_t sched);
@@ -337,7 +359,7 @@ extern "C" {
     GGML_API ggml_backend_t       ggml_backend_sched_get_tensor_backend(ggml_backend_sched_t sched, struct ggml_tensor * node);
 
     // Split graph without allocating it
-    GGML_API void                 ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph);
+    GGML_API bool                 ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph);
 
     // Allocate and compute graph on the backend scheduler
     GGML_API bool                 ggml_backend_sched_alloc_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph); // returns success
@@ -352,6 +374,17 @@ extern "C" {
 
     // Set a callback to be called for each resulting node during graph compute
     GGML_API void                 ggml_backend_sched_set_eval_callback(ggml_backend_sched_t sched, ggml_backend_sched_eval_callback callback, void * user_data);
+    GGML_API void                 ggml_backend_sched_set_moe_cache(
+            ggml_backend_sched_t                            sched,
+            ggml_backend_t                                  backend,
+            ggml_backend_sched_moe_cache_resolve_callback  resolve,
+            ggml_backend_sched_moe_cache_begin_callback    begin,
+            ggml_backend_sched_moe_cache_prepare_callback  prepare,
+            void *                                         user_data);
+
+    // Enable async weight prefetching to overlap CPU->GPU transfers with compute
+    GGML_API void                 ggml_backend_sched_set_prefetch_weights(ggml_backend_sched_t sched, bool enabled);
+    GGML_API void                 ggml_backend_sched_set_prefetch_weights_active(ggml_backend_sched_t sched, bool active);
 
     //
     // Meta backend

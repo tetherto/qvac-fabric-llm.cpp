@@ -15,14 +15,16 @@ struct socket_t {
 
     bool send_data(const void * data, size_t size);
     bool recv_data(void * data, size_t size);
+    bool exchange_data(const void * send_data, void * recv_data, size_t size);
+    bool set_timeout(int timeout_ms);
 
-    socket_ptr accept();
+    socket_ptr accept(int timeout_ms = -1);
 
     void get_caps(uint8_t * local_caps);
     void update_caps(const uint8_t * remote_caps);
 
     static socket_ptr create_server(const char * host, int port);
-    static socket_ptr connect(const char * host, int port);
+    static socket_ptr connect(const char * host, int port, int timeout_ms = -1);
 
 private:
     struct impl;

@@ -203,6 +203,14 @@ static ggml_backend_buffer_t ggml_backend_metal_buffer_type_alloc_buffer(ggml_ba
     ggml_metal_device_t ctx_dev = (ggml_metal_device_t)buft->device->context;
     ggml_metal_buffer_t res = ggml_metal_buffer_init(ctx_dev, size, shared);
 
+    // ggml_metal_buffer_init returns NULL on allocation / residency-set failure.
+    // Without this guard the next line dereferences a null pointer at offset 0x10
+    // (the is_shared field), crashing the mmproj graph allocator with
+    // EXC_BAD_ACCESS in ggml_metal_buffer_is_shared.
+    if (res == NULL) {
+        return NULL;
+    }
+
     ggml_backend_buffer_i buf_i = ggml_metal_buffer_is_shared(res)
         ? ggml_backend_metal_buffer_shared_i
         : ggml_backend_metal_buffer_private_i;
@@ -590,6 +598,16 @@ static ggml_guid_t ggml_backend_metal_guid(void) {
     return &guid;
 }
 
+static int ggml_backend_metal_default_n_cb(void) {
+    const char * env_n_cb = getenv("GGML_METAL_N_CB");
+    if (env_n_cb != nullptr) {
+        const int n_cb = atoi(env_n_cb);
+        return n_cb > 0 ? n_cb : 1;
+    }
+
+    return 1;
+}
+
 ggml_backend_t ggml_backend_metal_init(void) {
     ggml_backend_dev_t dev = ggml_backend_reg_dev_get(ggml_backend_metal_reg(), 0);
     ggml_metal_device_t ctx_dev = (ggml_metal_device_t)dev->context;
@@ -609,7 +627,7 @@ ggml_backend_t ggml_backend_metal_init(void) {
         /* .context   = */ ctx,
     };
 
-    ggml_backend_metal_set_n_cb(backend, 1);
+    ggml_backend_metal_set_n_cb(backend, ggml_backend_metal_default_n_cb());
 
     return backend;
 }
@@ -671,9 +689,13 @@ static enum ggml_backend_dev_type ggml_backend_metal_device_get_type(ggml_backen
 }
 
 static void ggml_backend_metal_device_get_props(ggml_backend_dev_t dev, ggml_backend_dev_props * props) {
+    ggml_metal_device_t ctx_dev = (ggml_metal_device_t)dev->context;
+
     props->name        = ggml_backend_metal_device_get_name(dev);
     props->description = ggml_backend_metal_device_get_description(dev);
     props->type        = ggml_backend_metal_device_get_type(dev);
+
+    props->memory_unified = ggml_metal_device_get_props(ctx_dev)->has_unified_memory;
 
     ggml_backend_metal_device_get_memory(dev, &props->memory_free, &props->memory_total);
 
@@ -683,6 +705,7 @@ static void ggml_backend_metal_device_get_props(ggml_backend_dev_t dev, ggml_bac
         /* .buffer_from_host_ptr = */ true,
         /* .events               = */ true,
         /* .mmap_support         = */ true,
+        /* .copy_stream          = */ false,
     };
 }
 
@@ -704,7 +727,7 @@ static ggml_backend_t ggml_backend_metal_device_init_backend(ggml_backend_dev_t 
         /* .context   = */ ctx,
     };
 
-    ggml_backend_metal_set_n_cb(backend, 1);
+    ggml_backend_metal_set_n_cb(backend, ggml_backend_metal_default_n_cb());
 
     return backend;
 
@@ -723,6 +746,9 @@ static ggml_backend_buffer_t ggml_backend_metal_device_buffer_mapped(ggml_backen
     ggml_metal_device_t ctx_dev = (ggml_metal_device_t)dev->context;
 
     ggml_metal_buffer_t res = ggml_metal_buffer_map(ctx_dev, ptr, size, max_tensor_size);
+    if (res == NULL) {
+        return NULL;
+    }
 
     const ggml_metal_device_props * props_dev = ggml_metal_device_get_props(ctx_dev);
 
@@ -931,6 +957,15 @@ ggml_backend_reg_t ggml_backend_metal_reg(void) {
 
             for (int i = 0; i < g_devices; ++i) {
                 auto * dev = ggml_backend_metal_device_init(&reg, i);
+
+                // Skip unusable devices (e.g. paravirtualized GPUs with no working simdgroup
+                // intrinsics).
+                if (!ggml_metal_device_get_props((ggml_metal_device_t)dev->context)->has_simdgroup_reduction) {
+                    GGML_LOG_WARN("%s: skipping Metal device %d (no simdgroup reduction support)\n", __func__, i);
+                    ggml_backend_metal_device_free(dev);
+                    continue;
+                }
+
                 devs.emplace_back(dev);
 
                 reg_ctx->devices.push_back(dev);

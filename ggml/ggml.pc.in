@@ -1,0 +1,11 @@
+prefix=@GGML_PC_PREFIX@
+exec_prefix=${prefix}
+libdir=@GGML_PC_LIBDIR@
+includedir=@GGML_PC_INCLUDEDIR@
+
+Name: ggml
+Description: Tensor library for machine learning
+Version: @GGML_VERSION@
+Libs: -L${libdir} -lggml -lggml-base
+Libs.private: @GGML_PC_LIBS_PRIVATE@
+Cflags: -I${includedir}

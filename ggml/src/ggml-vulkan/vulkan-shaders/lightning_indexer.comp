@@ -1,0 +1,114 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+
+#include "types.glsl"
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform parameter {
+    uint n_embd;
+    uint n_head;
+    uint n_kv;
+    uint n_tokens;
+    uint n_stream;
+    uint n_mask_stream;
+    uint q_nb0;
+    uint q_nb1;
+    uint q_nb2;
+    uint q_nb3;
+    uint q_offset;
+    uint k_nb0;
+    uint k_nb1;
+    uint k_nb2;
+    uint k_nb3;
+    uint k_offset;
+    uint w_nb0;
+    uint w_nb1;
+    uint w_nb3;
+    uint w_offset;
+    uint m_nb0;
+    uint m_nb1;
+    uint m_nb3;
+    uint m_offset;
+    uint dst_nb0;
+    uint dst_nb1;
+    uint dst_nb3;
+    uint dst_offset;
+} p;
+
+layout(binding = 0) readonly buffer QBuf { float data_q[]; };
+layout(binding = 1) readonly buffer KBuf { A_TYPE data_a[]; };
+#ifdef A_TYPE_PACKED16
+layout(binding = 1) readonly buffer KBuf16 { A_TYPE_PACKED16 data_a_packed16[]; };
+#endif
+#ifdef A_TYPE_PACKED32
+layout(binding = 1) readonly buffer KBuf32 { A_TYPE_PACKED32 data_a_packed32[]; };
+#endif
+layout(binding = 2) readonly buffer WBuf { float data_w[]; };
+layout(binding = 3) readonly buffer MBuf { float16_t data_m[]; };
+layout(binding = 4) writeonly buffer DstBuf { float data_dst[]; };
+
+#include "dequant_funcs.glsl"
+
+shared float partial[128];
+
+float load_k(const uint base, const uint ie) {
+#if defined(DATA_A_Q4_0) || defined(DATA_A_Q4_1) || defined(DATA_A_Q5_0) || defined(DATA_A_Q5_1)
+    const uint ib = base + ie / QUANT_K;
+    const vec2 v = dequantize(ib, ie % (QUANT_K / QUANT_R), 0);
+    const vec2 dm = get_dm(ib, 0);
+    return v[(ie / (QUANT_K / QUANT_R)) % QUANT_R] * dm.x + dm.y;
+#elif defined(DATA_A_Q8_0)
+    const uint ib = base + ie / QUANT_K;
+    const uint iqs = (ie % QUANT_K) & ~1u;
+    const vec2 v = dequantize(ib, iqs, 0);
+    const vec2 dm = get_dm(ib, 0);
+    return v[ie & 1u] * dm.x;
+#else
+    return float(dequantize1(base + ie, 0, 0));
+#endif
+}
+
+void main() {
+    const uint ik = gl_WorkGroupID.x;
+    const uint it = gl_WorkGroupID.y;
+    const uint is = gl_WorkGroupID.z;
+    const uint lane = gl_LocalInvocationID.x;
+    const uint block_size = gl_WorkGroupSize.x;
+
+    precise float score = 0.0;
+    for (uint ih = lane; ih < p.n_head; ih += block_size) {
+        const uint q_base = p.q_offset + ih*p.q_nb1 + it*p.q_nb2 + is*p.q_nb3;
+        const uint k_base = p.k_offset + ik*p.k_nb2 + is*p.k_nb3;
+
+        precise float qk = 0.0;
+        for (uint ie = 0; ie < p.n_embd; ++ie) {
+            qk = qk + data_q[q_base + ie*p.q_nb0] * load_k(k_base, ie);
+        }
+
+        score = score + max(qk, 0.0) * data_w[p.w_offset + ih*p.w_nb0 + it*p.w_nb1 + is*p.w_nb3];
+    }
+
+    partial[lane] = score;
+    barrier();
+
+    [[unroll]] for (uint offset = block_size / 2; offset > 0; offset >>= 1) {
+        if (lane < offset) {
+            partial[lane] = partial[lane] + partial[lane + offset];
+        }
+        barrier();
+    }
+
+    if (lane == 0) {
+        const uint im = is % p.n_mask_stream;
+        const uint mask_idx = p.m_offset + ik*p.m_nb0 + it*p.m_nb1 + im*p.m_nb3;
+        const uint dst_idx = p.dst_offset + ik*p.dst_nb0 + it*p.dst_nb1 + is*p.dst_nb3;
+        data_dst[dst_idx] = partial[0] + float(data_m[mask_idx]);
+    }
+}

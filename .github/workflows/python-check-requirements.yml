@@ -20,7 +20,7 @@ concurrency:
 
 jobs:
   python-check-requirements:
-    runs-on: [self-hosted, CPU, fast]
+    runs-on: qvac-ubuntu2404-x64
     name: check-requirements
     steps:
       - name: Check out source repository

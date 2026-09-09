@@ -58,7 +58,7 @@ ggml_cuda_init: GGML_CUDA_FORCE_MMQ:    no
 ggml_cuda_init: GGML_CUDA_FORCE_CUBLAS: no
 ggml_cuda_init: found 1 CUDA devices:
   Device 0: NVIDIA GeForce RTX 5090, compute capability 12.0, VMM: yes
-Starting RPC server v3.0.0
+Starting RPC server v7.0.0
   endpoint       : 127.0.0.1:50052
   local cache    : n/a
 Devices:
@@ -83,6 +83,37 @@ $ llama-cli -hf ggml-org/gemma-3-1b-it-GGUF -ngl 99 --rpc 192.168.88.10:50052,19
 By default, llama.cpp distributes model weights and the KV cache across all available devices -- both local and remote -- in proportion to each device's available memory.
 You can override this behavior with the `--tensor-split` option and set custom proportions when splitting tensor data across devices.
 
+### Pipeline parallelism
+
+Protocol 7 supports asynchronous RPC transfers and events, allowing `--split-mode layer` to overlap ubatches across remote devices. The client and all servers must use protocol 7.
+
+Run one RPC server endpoint per pipeline stage. A server handles one client connection serially, so devices exposed by the same server process are not pipelined with each other.
+
+For example, start one server per GPU:
+
+```bash
+# host 1
+bin/ggml-rpc-server -H 192.168.88.10 -p 50052 --device CUDA0
+
+# host 2
+bin/ggml-rpc-server -H 192.168.88.11 -p 50052 --device CUDA0
+```
+
+Then use both endpoints in layer split mode:
+
+```bash
+llama-cli -m model.gguf \
+    --rpc 192.168.88.10:50052,192.168.88.11:50052 \
+    --device RPC0,RPC1 \
+    --split-mode layer \
+    --tensor-split 1,1 \
+    --n-gpu-layers all \
+    --batch-size 2048 \
+    --ubatch-size 256
+```
+
+Using a batch larger than the ubatch gives the scheduler enough independent work to overlap the pipeline stages.
+
 ### Local cache
 
 The RPC server can use a local cache to store large tensors and avoid transferring them over the network.
@@ -101,10 +132,18 @@ On Linux systems with RoCEv2-capable NICs (e.g. Mellanox ConnectX), the RPC back
 
 RDMA is enabled by default when `libibverbs` is found at build time.
 
+### Direct all-reduce
+
+Tensor split with exactly two RPC devices uses a direct server-to-server connection for all-reduce. The first server listens on its RPC port plus 1000, and the second server connects to it. Set `GGML_RPC_COMM_PORT` on the main host to use a different port.
+
+Allow the communication port through the firewall and ensure that the servers can connect to each other. Use this only on a trusted private network because the connection does not provide transport authentication or encryption. Set `GGML_RPC_NO_COMM=1` on the main host to disable direct all-reduce.
+
 ### Troubleshooting
 
 Use the `GGML_RPC_DEBUG` environment variable to enable debug messages from `ggml-rpc-server`:
 ```bash
 $ GGML_RPC_DEBUG=1 bin/ggml-rpc-server
 ```
+
+Set `GGML_RPC_NO_WIRE_BF16=1` on the main host to keep direct all-reduce transfers in F32. By default, large F32 all-reduce tensors use BF16 on the wire to reduce peer traffic.
 

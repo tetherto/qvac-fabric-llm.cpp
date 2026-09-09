@@ -80,3 +80,63 @@ jobs:
         run: |
           cmake -S . -B build -G "Ninja Multi-Config" -D CMAKE_TOOLCHAIN_FILE=cmake/arm64-windows-llvm.cmake -DCMAKE_PREFIX_PATH="$env:RUNNER_TEMP/opencl-arm64-release" -DGGML_OPENCL=ON -DGGML_OPENCL_USE_ADRENO_KERNELS=ON -DLLAMA_BUILD_BORINGSSL=ON
           cmake --build build --config Release -j ${env:NUMBER_OF_PROCESSORS}
+
+  ubuntu-24-opencl:
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Clone
+        id: checkout
+        uses: actions/checkout@v6
+
+      - name: ccache
+        uses: ggml-org/ccache-action@v1.2.21
+        with:
+          key: ubuntu-24-opencl
+          evict-old-files: 1d
+
+      - name: Dependencies
+        id: depends
+        run: |
+          sudo apt-get update
+          # intel-opencl-icd provides a CPU OpenCL device (same package set the
+          # OpenVINO job installs); the rest is the ICD loader + CL headers.
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake clinfo \
+            ocl-icd-opencl-dev opencl-headers opencl-clhpp-headers intel-opencl-icd
+
+      - name: Build (GGML_OPENCL, portable kernels)
+        id: cmake_build
+        run: |
+          # NOTE: no -DLLAMA_FATAL_WARNINGS=ON — upstream ggml-opencl.cpp has
+          # intentional (un-annotated) case fall-throughs that GCC's
+          # -Wimplicit-fallthrough would turn into errors. This job's purpose is
+          # to run test-backend-ops, not to gate upstream warning-cleanliness.
+          # GGML_NATIVE defaults to ON for a native x86 build, which bakes
+          # -march=native into the CPU backend. The ccache key is shared across
+          # runs, so an object built on an AVX-512 runner gets reused on a runner
+          # without it and test-backend-ops dies with SIGILL (exit 132) before
+          # printing a single test. Every other x64 job here already sets OFF.
+          cmake -B build \
+            -DGGML_NATIVE=OFF \
+            -DGGML_OPENCL=ON \
+            -DLLAMA_BUILD_TOOLS=OFF \
+            -DLLAMA_BUILD_EXAMPLES=OFF \
+            -DLLAMA_BUILD_SERVER=OFF
+          time cmake --build build --config Release -j $(nproc) --target test-backend-ops
+
+      - name: Test backend ops (OpenCL)
+        id: test_backend_ops
+        run: |
+          # Functional coverage for the ggml-opencl ops DocTR uses on Adreno:
+          # CONV_2D (regular direct conv), CONV_2D_DW (depthwise), POOL_2D,
+          # HARDSWISH, HARDSIGMOID. These kernels load unconditionally (no
+          # GGML_OPENCL_USE_ADRENO_KERNELS gate), so they are portable OpenCL C
+          # and run here on the Intel CPU ICD, compared against the CPU
+          # reference. NOTE: a CPU ICD does NOT reproduce Adreno-compiler bugs
+          # (e.g. the char->float type-punning miscompile this PR works around) —
+          # that requires the manual Firebase Test Lab device run. This job is a
+          # regression net for kernel math / indexing / dtype correctness that a
+          # compile-only job cannot catch.
+          clinfo -l || true
+          ./build/bin/test-backend-ops test -o CONV_2D,CONV_2D_DW,POOL_2D,HARDSWISH,HARDSIGMOID

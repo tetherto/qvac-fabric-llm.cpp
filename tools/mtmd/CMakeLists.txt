@@ -80,7 +80,12 @@ set_target_properties(mtmd PROPERTIES
 
 target_link_libraries     (mtmd PUBLIC ggml llama)
 target_link_libraries     (mtmd PRIVATE Threads::Threads vendor::hash vendor::miniaudio vendor::stb vendor::sheredom)
-target_include_directories(mtmd PUBLIC  .)
+target_include_directories(
+  mtmd
+  PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>
+    $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
+)
 target_compile_features   (mtmd PRIVATE cxx_std_17)
 
 if (MTMD_VIDEO)
@@ -107,9 +112,7 @@ set_target_properties(mtmd
 
 set_target_properties(mtmd
     PROPERTIES
-    PRIVATE_HEADER debug/mtmd-debug.h)
-
-install(TARGETS mtmd LIBRARY PUBLIC_HEADER)
+    PRIVATE_HEADER ${CMAKE_CURRENT_SOURCE_DIR}/debug/mtmd-debug.h)
 
 if (NOT MSVC)
     # for stb_image.h and miniaudio.h

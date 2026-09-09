@@ -1,7 +1,9 @@
 #include "mtmd-image.h"
 
 #include <algorithm>
+#include <cstring>
 #include <cmath>
+#include <limits>
 #include <vector>
 
 void mtmd_image_preproc_out::append(const clip_hparams & hparams, const clip_image_u8 & img, bool normalized) {
@@ -158,13 +160,18 @@ struct img_tool {
         }
 
         auto round_by_factor = [f = opts.align_size](float x) { return static_cast<int>(std::round(x / static_cast<float>(f))) * f; };
-        auto ceil_by_factor  = [f = opts.align_size](float x) { return static_cast<int>(std::ceil(x / static_cast<float>(f))) * f; };
+        auto ceil_by_factor  = [f = opts.align_size](double x) { return static_cast<int>(std::ceil(x / static_cast<double>(f))) * f; };
         auto floor_by_factor = [f = opts.align_size](float x) { return static_cast<int>(std::floor(x / static_cast<float>(f))) * f; };
 
         int w_bar, h_bar;
         if (opts.longest_edge > 0) {
-            const float scale = std::min(static_cast<float>(opts.longest_edge) / width,
-                                          static_cast<float>(opts.longest_edge) / height);
+            // double, not float: the reference processors do this in Python floats, and where the
+            // true product lands on a multiple of align_size, float32 rounding pushes it just past
+            // and the ceil buys a whole extra row or column of slices. 960x720 at align 512 and
+            // longest_edge 2048 is the common case: 1536 in double, 2048 in float32, so a 4x3 grid
+            // becomes 4x4 and the image gains 4 slices the reference never emits.
+            const double scale = std::min(static_cast<double>(opts.longest_edge) / width,
+                                          static_cast<double>(opts.longest_edge) / height);
             w_bar = ceil_by_factor(width  * scale);
             h_bar = ceil_by_factor(height * scale);
         } else {
@@ -873,6 +880,23 @@ clip_image_size mtmd_image_preprocessor_llava_uhd::get_refine_size(const clip_im
     return refine_size;
 }
 
+// Pick the grid from `candidates` whose log(width/height) is closest to `target_log_ratio`.
+// Strict-less keeps the first candidate on ties, so callers control tie-breaking via ordering.
+// Shared by the log-ratio tilers (llava_uhd, qwen3vl); lfm2 deliberately uses a different
+// (linear ratio diff + area) metric and is not routed through here.
+static clip_image_size pick_grid_by_log_ratio(const std::vector<clip_image_size> & candidates, const float target_log_ratio) {
+    clip_image_size best_grid{1, 1};
+    float min_error = std::numeric_limits<float>::infinity();
+    for (const auto & grid : candidates) {
+        const float error = std::abs(target_log_ratio - std::log(1.0f * grid.width / grid.height));
+        if (error < min_error) {
+            min_error = error;
+            best_grid = grid;
+        }
+    }
+    return best_grid;
+}
+
 clip_image_size mtmd_image_preprocessor_llava_uhd::get_best_grid(const int max_slice_nums, const int multiple, const float log_ratio) {
     std::vector<int> candidate_split_grids_nums;
     for (int i : {multiple - 1, multiple, multiple + 1}) {
@@ -893,16 +917,7 @@ clip_image_size mtmd_image_preprocessor_llava_uhd::get_best_grid(const int max_s
         }
     }
 
-    clip_image_size best_grid{1, 1};
-    float min_error = std::numeric_limits<float>::infinity();
-    for (const auto& grid : candidate_grids) {
-        float error = std::abs(log_ratio - std::log(1.0 * grid.width / grid.height));
-        if (error < min_error) {
-            best_grid = grid;
-            min_error = error;
-        }
-    }
-    return best_grid;
+    return pick_grid_by_log_ratio(candidate_grids, log_ratio);
 }
 
 //
@@ -921,33 +936,168 @@ mtmd_image_preproc_out mtmd_image_preprocessor_fixed_size::preprocess(const clip
     return output;
 }
 
-//
-// mtmd_image_preprocessor_dyn_size
-//
-
-mtmd_image_preproc_out mtmd_image_preprocessor_dyn_size::preprocess(const clip_image_u8 & img) {
+// Resize to [min_pixels, max_pixels] with aspect ratio preserved, aligned to `align_px`, single f32 output.
+static mtmd_image_preproc_out preprocess_dyn_size_aligned(
+        const clip_image_u8 & img,
+        const clip_hparams & hparams,
+        const int align_px) {
     GGML_ASSERT(hparams.image_min_pixels > 0 && hparams.image_max_pixels > 0);
+    GGML_ASSERT(align_px > 0);
     clip_image_u8 resized_image;
-    const clip_image_size original_size = img.get_size();
-    // the original pixtral model doesn't have n_merge
-    const int cur_merge = hparams.n_merge;
+    const clip_image_size img_size = img.get_size();
     const clip_image_size target_size = img_tool::calc_size_preserved_ratio(
-        original_size,
+        img_size,
         {
-            /* align_size   */ hparams.patch_size * cur_merge,
+            /* align_size   */ align_px,
             /* min_pixels   */ hparams.image_min_pixels,
             /* max_pixels   */ hparams.image_max_pixels,
             /* longest_edge */ 0,
         });
     img_tool::resize(img, resized_image, target_size,
-                        hparams.image_resize_algo,
-                        hparams.image_resize_pad,
-                        hparams.image_pad_color);
+                     hparams.image_resize_algo,
+                     hparams.image_resize_pad,
+                     hparams.image_pad_color);
     mtmd_image_preproc_out output;
     output.append(hparams, resized_image, true);
     return output;
 }
 
+static int dyn_size_align_px(const clip_hparams & hparams) {
+    // the original pixtral model doesn't have n_merge
+    const int cur_merge = hparams.n_merge == 0 ? 1 : hparams.n_merge;
+    return hparams.patch_size * cur_merge;
+}
+
+//
+// mtmd_image_preprocessor_dyn_size
+//
+
+mtmd_image_preproc_out mtmd_image_preprocessor_dyn_size::preprocess(const clip_image_u8 & img) {
+    return preprocess_dyn_size_aligned(img, hparams, dyn_size_align_px(hparams));
+}
+
+//
+// mtmd_image_preprocessor_qwen3vl
+//
+
+mtmd_image_preproc_out mtmd_image_preprocessor_qwen3vl::preprocess(const clip_image_u8 & img) {
+    mtmd_image_preproc_out output;
+
+    // Tile size comes from the model's image_size (e.g. 768 for Qwen3VL-2B, patch_size=16).
+    const int tile_px = hparams.image_size;
+    GGML_ASSERT(tile_px > 0 && "image_size not set in model hparams");
+
+    GGML_ASSERT(hparams.patch_size > 0);
+    // Guard the log-ratio division below; the public API asserts this in mtmd.cpp, but a direct
+    // caller (fuzz harness, unit test, malformed upload reaching this path) could reach here with
+    // a zero-dimension image. Fail this one image gracefully instead of aborting the whole process.
+    const clip_image_size img_size = img.get_size();
+    if (img_size.width <= 0 || img_size.height <= 0) {
+        LOG_ERR("%s: image has zero dimension (%dx%d)\n", __func__, img_size.width, img_size.height);
+        return output;
+    }
+
+    // Select the grid (n_col × n_row, n_col*n_row <= max_tiles, excluding 1×1) that:
+    //   1. downscales the image in both dimensions (upscaling gains no detail)
+    //   2. maximises tile count (more tiles = more spatial detail preserved)
+    //   3. among equal tile counts, minimises log-ratio error (less stretch distortion)
+    // If no grid downscales, fall back to dyn_size (single-tile at native resolution).
+    const float img_log_ratio = std::log((float)img_size.width / (float)img_size.height);
+
+    struct grid_cand { int col, row; float ratio_err; };
+    std::vector<grid_cand> fitting;
+    // candidate count is sum_{col} floor(max_tiles/col) ≈ max_tiles*ln(max_tiles), not max_tiles²;
+    // a small reserve avoids the early reallocations without over-allocating at large max_tiles.
+    fitting.reserve((size_t)(max_tiles * std::log((float)std::max(max_tiles, 2))));
+    for (int col = 1; col <= max_tiles; col++) {
+        for (int row = 1; col * row <= max_tiles; row++) {
+            if (col == 1 && row == 1) { continue; } // 1×1 == dyn_size below
+            if (col * tile_px <= img_size.width && row * tile_px <= img_size.height) {
+                const float err = std::abs(img_log_ratio - std::log((float)col / (float)row));
+                fitting.push_back({col, row, err});
+            }
+        }
+    }
+    if (fitting.empty()) {
+        LOG_INF("%s: %dx%d fits no tile grid (tile_px=%d, max_tiles=%d) — using dyn_size\n",
+                __func__, img_size.width, img_size.height, tile_px, max_tiles);
+        output = preprocess_dyn_size_aligned(img, hparams, dyn_size_align_px(hparams));
+        // grid_x/grid_y left at 0 → single-tile path; tokenizer treats this as 1×1
+        return output;
+    }
+
+    // Tolerance band: find the best (minimum) ratio error, then allow any candidate within
+    // TOLERANCE of it to compete on tile count. This prevents a high-tile-count grid from
+    // winning when a near-perfect-ratio lower-tile-count grid exists (e.g. 2×2 over 2×1
+    // for a 2:1 image, which would squash the image 2× in one dimension).
+    static constexpr float RATIO_ERR_TOLERANCE = 0.2f;
+    const float best_ratio_err = std::min_element(fitting.begin(), fitting.end(),
+        [](const grid_cand & a, const grid_cand & b) { return a.ratio_err < b.ratio_err; })->ratio_err;
+    const float eligible_threshold = best_ratio_err + RATIO_ERR_TOLERANCE;
+
+    auto best = std::min_element(fitting.begin(), fitting.end(), [eligible_threshold](const grid_cand & a, const grid_cand & b) {
+        const bool ea = a.ratio_err <= eligible_threshold;
+        const bool eb = b.ratio_err <= eligible_threshold;
+        if (ea != eb) { return ea; }        // eligible always beats ineligible
+        const int ta = a.col * a.row;
+        const int tb = b.col * b.row;
+        if (ta != tb) { return ta > tb; }   // more tiles first
+        return a.ratio_err < b.ratio_err;   // then closer ratio
+    });
+
+    const int use_col = best->col;
+    const int use_row = best->row;
+    LOG_INF("%s: %dx%d — selected %dx%d grid (%d tiles, ratio_err=%.3f)\n",
+            __func__, img_size.width, img_size.height, use_col, use_row, use_col * use_row, best->ratio_err);
+    const int target_w = use_col * tile_px;
+    const int target_h = use_row * tile_px;
+
+    // Resize to the tile canvas by stretching. With aspect-ratio-aware grid selection the chosen
+    // grid's ratio is close to the image's ratio, so the residual stretch is small.
+    // pad=false avoids black bars that confuse the model in tile inputs.
+    clip_image_u8 resized;
+    img_tool::resize(img, resized, {target_w, target_h},
+                     hparams.image_resize_algo,
+                     /* pad */ PAD_NONE,
+                     hparams.image_pad_color);
+
+    // Split into use_col × use_row tiles, packed row-major into the batch.
+    clip_image_u8 tile_u8;
+
+    for (int tr = 0; tr < use_row; tr++) {
+        for (int tc = 0; tc < use_col; tc++) {
+            const int src_x0 = tc * tile_px;
+            const int src_y0 = tr * tile_px;
+            img_tool::crop(resized, tile_u8, src_x0, src_y0, tile_px, tile_px);
+
+            clip_image_f32 tile_f32;
+            tile_f32.from_u8(tile_u8);
+            tile_f32.normalize(hparams.image_mean, hparams.image_std);
+            output.entries.push_back(std::move(tile_f32));
+        }
+    }
+
+    // LLaVA-style global overview (thumbnail): a downscaled full image (tile_px x tile_px) prepended
+    // as entries[0]. It carries the whole image uncut, so text split across a tile seam stays
+    // readable; on DocVQA this recovers seam-truncated text for a sizeable ANLS gain. Encoded as a
+    // separate 1x1 chunk in mtmd.cpp; the tiles are untouched (no resolution cost to them).
+    {
+        clip_image_u8 thumb_u8;
+        img_tool::resize(img, thumb_u8, {tile_px, tile_px},
+                         hparams.image_resize_algo,
+                         /* pad */ PAD_NONE,
+                         hparams.image_pad_color);
+        clip_image_f32 thumb_f32;
+        thumb_f32.from_u8(thumb_u8);
+        thumb_f32.normalize(hparams.image_mean, hparams.image_std);
+        output.entries.insert(output.entries.begin(), std::move(thumb_f32));
+        output.overview_in_entries = true;
+    }
+
+    output.grid_x = use_col;
+    output.grid_y = use_row;
+    return output;
+}
 //
 // mtmd_image_preprocessor_longest_edge
 //
@@ -1133,29 +1283,107 @@ clip_image_size mtmd_image_preprocessor_lfm2::get_grid_layout(int height, int wi
 // mtmd_image_preprocessor_idefics3
 //
 
+// Sizing rule for the no-upscale variant, a direct port of DynamicResize._get_new_hw() with
+// resize_to_max_side_len=False from the reference processor. `p` is the slice size
+// (vit_img_size) and `m` the cap (max_img_size); the reference's min_side_len is
+// FLASH_MIN_SIDE_LEN, which is the same 512 as vit_img_size, so it is not a separate knob.
+//
+// CITE: https://huggingface.co/qvac/VisionPsy-Nano-460M-Flash/blob/main/custom_transforms.py
+//
+// Note both branches return multiples of `p`, exactly like the upscaling path: the reference
+// splitter hard-errors on anything else. So this changes HOW MANY slices an image becomes,
+// never their size.
+static clip_image_size calc_size_no_upscale(const clip_image_size & inp_size, int p, int m) {
+    GGML_ASSERT(p > 0 && m > 0);
+    if (inp_size.width <= 0 || inp_size.height <= 0) {
+        return {0, 0};
+    }
+    // integer ceil, mirroring the reference's -(-a // b). Stays in int64_t all the way
+    // through the multiply-back-by-p: an extreme aspect ratio (e.g. a very wide, very
+    // thin image) can push that product past INT32_MAX, which would silently wrap
+    // negative in 32-bit arithmetic and defeat the std::min/std::max clamps below.
+    auto ceil_div = [](int64_t a, int64_t b) { return (a + b - 1) / b; };
+
+    const int64_t long_side  = std::max(inp_size.width, inp_size.height);
+    const int64_t short_side = std::min(inp_size.width, inp_size.height);
+    const int64_t p64 = p;
+    const int64_t m64 = m;
+
+    int64_t target_long;
+    int64_t target_short;
+    if (short_side < p64) {
+        // Short side below one slice: pin it to exactly p and give the long side however many
+        // whole slices the aspect ratio asks for. This is the one case that DOES enlarge.
+        const int64_t den = short_side * p64;
+        target_long  = std::min(m64, ceil_div(long_side * p64, den) * p64);
+        target_short = std::max(ceil_div(short_side * p64, den) * p64, p64);
+    } else {
+        target_long = std::min(m64, ceil_div(long_side, p64) * p64);
+        // double, not float, and deliberately not exact integer arithmetic: the reference is
+        // `math.ceil(short * scale / p)` on Python floats, and its rounding is part of the
+        // rule the model was trained under. Where the true quotient lands on an integer the
+        // three disagree by a whole slice row. Over every size pair up to 3000x3000, float32
+        // differs from the reference in 171 cases and exact integers in 92; double in none.
+        const double scale = (double) target_long / (double) long_side;
+        target_short       = std::max((int64_t) std::ceil((double) short_side * scale / (double) p64) * p64, p64);
+    }
+
+    // Defensive clamp: both branches are designed to land in [p, m], but this guards the
+    // narrowing cast below against ever producing a value outside that range.
+    target_long  = std::clamp(target_long, p64, m64);
+    target_short = std::clamp(target_short, p64, m64);
+
+    return inp_size.width >= inp_size.height
+        ? clip_image_size{(int) target_long, (int) target_short}
+        : clip_image_size{(int) target_short, (int) target_long};
+}
+
+// The refined size has two steps:
+// 1. Resize w/ aspect-ratio preserving such that the longer side is
+//      the preprocessor longest size
+// 2. Resize w/out preserving aspect ratio such that both sides are
+//      multiples of image_size (always rounding up)
+//
+// CITE: https://github.com/huggingface/transformers/blob/main/src/transformers/models/idefics3/image_processing_idefics3.py#L737
+//
+// no_upscale replaces step 1 only; step 2 is shared, so both variants land on a
+// multiple of image_size in each dimension.
+mtmd_idefics3_sizing mtmd_calc_idefics3_sizing(const clip_image_size & original_size,
+                                               int image_size,
+                                               int image_longest_edge,
+                                               bool no_upscale,
+                                               int min_pixels,
+                                               int max_pixels) {
+    mtmd_idefics3_sizing out;
+    out.refined_size = no_upscale
+        ? calc_size_no_upscale(original_size, image_size, image_longest_edge)
+        : img_tool::calc_size_preserved_ratio(
+            original_size,
+            { image_size, std::max(0, min_pixels), std::max(0, max_pixels), image_longest_edge });
+    out.grid_size = clip_image_size{
+        static_cast<int>(std::ceil(static_cast<float>(out.refined_size.width) / image_size)),
+        static_cast<int>(std::ceil(static_cast<float>(out.refined_size.height) / image_size)),
+    };
+    out.n_slices = out.grid_size.width * out.grid_size.height;
+    return out;
+}
+
 mtmd_image_preproc_out mtmd_image_preprocessor_idefics3::preprocess(const clip_image_u8 & img) {
-    // The refined size has two steps:
-    // 1. Resize w/ aspect-ratio preserving such that the longer side is
-    //      the preprocessor longest size
-    // 2. Resize w/out preserving aspect ratio such that both sides are
-    //      multiples of image_size (always rounding up)
-    //
-    // CITE: https://github.com/huggingface/transformers/blob/main/src/transformers/models/idefics3/image_processing_idefics3.py#L737
     const clip_image_size original_size = img.get_size();
-    const clip_image_size refined_size = img_tool::calc_size_preserved_ratio(
-        original_size,
-        { hparams.image_size, std::max(0, hparams.image_min_pixels), std::max(0, hparams.image_max_pixels), hparams.image_longest_edge });
+    const mtmd_idefics3_sizing sizing = mtmd_calc_idefics3_sizing(
+        original_size, hparams.image_size, hparams.image_longest_edge, hparams.image_no_upscale,
+        hparams.image_min_pixels, hparams.image_max_pixels);
+    const clip_image_size refined_size = sizing.refined_size;
     // LOG_INF("%s: original size: %d x %d, refined size: %d x %d\n",
     //         __func__, original_size.width, original_size.height,
     //         refined_size.width, refined_size.height);
 
     mtmd_image_preprocessor_llava_uhd::slice_instructions instructions;
-    instructions.overview_size = clip_image_size{hparams.image_size, hparams.image_size};
     instructions.refined_size = refined_size;
-    instructions.grid_size = clip_image_size{
-        static_cast<int>(std::ceil(static_cast<float>(refined_size.width) / hparams.image_size)),
-        static_cast<int>(std::ceil(static_cast<float>(refined_size.height) / hparams.image_size)),
-    };
+    instructions.grid_size = sizing.grid_size;
+    // Square, in both variants: the reference resizes the global image to (p, p) regardless
+    // of no_upscale (GlobalAndSplitImages in custom_transforms.py).
+    instructions.overview_size = clip_image_size{hparams.image_size, hparams.image_size};
     for (int y = 0; y < refined_size.height; y += hparams.image_size) {
         for (int x = 0; x < refined_size.width; x += hparams.image_size) {
             // LOG_INF("%s: adding slice at x=%d, y=%d\n", __func__, x, y);

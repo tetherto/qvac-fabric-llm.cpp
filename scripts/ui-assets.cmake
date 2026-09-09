@@ -251,6 +251,15 @@ function(hf_download version out_var out_resolved)
 endfunction()
 
 function(emit_files dist_dir)
+    # A downloaded/prebuilt dist can lag the source and omit static files that a
+    # from-source `vite build` copies verbatim (notably loading.html, which
+    # llama-ui-embed treats as a required asset). Overlay the source static/ tree
+    # so every path (npm build, prebuilt dir, HF download) ends up with the
+    # complete set, regardless of how stale the prebuilt dist.tar.gz is.
+    if(IS_DIRECTORY "${UI_SOURCE_DIR}/static")
+        file(COPY "${UI_SOURCE_DIR}/static/" DESTINATION "${dist_dir}")
+    endif()
+
     # If gzip is requested, compress every asset into a parallel _gzip/ tree
     # the structure stays the same; for ex: /abc/def --> /_gzip/abc/def
     # embed.cpp will check for _gzip and will pick it up

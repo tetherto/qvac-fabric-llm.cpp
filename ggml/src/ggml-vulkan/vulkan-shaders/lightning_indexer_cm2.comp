@@ -1,0 +1,141 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+#extension GL_EXT_buffer_reference : enable
+#extension GL_KHR_memory_scope_semantics : enable
+#extension GL_KHR_cooperative_matrix : enable
+#extension GL_NV_cooperative_matrix2 : enable
+
+#include "dequant_funcs_cm2.glsl"
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform parameter {
+    uint n_embd;
+    uint n_head;
+    uint n_kv;
+    uint n_tokens;
+    uint n_stream;
+    uint n_mask_stream;
+    uint q_nb0;
+    uint q_nb1;
+    uint q_nb2;
+    uint q_nb3;
+    uint q_offset;
+    uint k_nb0;
+    uint k_nb1;
+    uint k_nb2;
+    uint k_nb3;
+    uint k_offset;
+    uint w_nb0;
+    uint w_nb1;
+    uint w_nb3;
+    uint w_offset;
+    uint m_nb0;
+    uint m_nb1;
+    uint m_nb3;
+    uint m_offset;
+    uint dst_nb0;
+    uint dst_nb1;
+    uint dst_nb3;
+    uint dst_offset;
+} p;
+
+layout(binding = 0) readonly buffer QBuf { float data_q[]; };
+layout(binding = 1) readonly buffer KBuf { A_TYPE data_a[]; };
+layout(binding = 2) readonly buffer WBuf { float data_w[]; };
+layout(binding = 3) readonly buffer MBuf { float16_t data_m[]; };
+layout(binding = 4) writeonly buffer DstBuf { float data_dst[]; };
+
+const uint N_EMBD = 128;
+const uint KV_TILE = 64;
+
+float add_reduce(const in float x, const in float y) {
+    return x + y;
+}
+
+float apply_weight(
+        const in uint row,
+        const in uint col,
+        const in float elem,
+        const in uint it,
+        const in uint is) {
+    return max(elem, 0.0) * data_w[p.w_offset + row*p.w_nb0 + it*p.w_nb1 + is*p.w_nb3];
+}
+
+float store_score(
+        const in uint row,
+        const in uint col,
+        const in float elem,
+        const in uint kv_base,
+        const in uint it,
+        const in uint is) {
+    const uint kv = kv_base + col;
+    if (row == 0 && kv < p.n_kv) {
+        const uint im = is % p.n_mask_stream;
+        const uint mask_idx = p.m_offset + kv*p.m_nb0 + it*p.m_nb1 + im*p.m_nb3;
+        const uint dst_idx = p.dst_offset + kv*p.dst_nb0 + it*p.dst_nb1 + is*p.dst_nb3;
+        data_dst[dst_idx] = elem + float(data_m[mask_idx]);
+    }
+    return elem;
+}
+
+void main() {
+    const uint kv_base = gl_WorkGroupID.x * KV_TILE;
+    const uint it = gl_WorkGroupID.y;
+    const uint is = gl_WorkGroupID.z;
+
+    tensorLayoutNV<2, gl_CooperativeMatrixClampModeConstantNV> layout_q =
+        createTensorLayoutNV(2, gl_CooperativeMatrixClampModeConstantNV);
+    tensorLayoutNV<2, gl_CooperativeMatrixClampModeConstantNV> layout_k =
+        createTensorLayoutNV(2, gl_CooperativeMatrixClampModeConstantNV);
+    tensorViewNV<2, false, 1, 0> transpose = createTensorViewNV(2, false, 1, 0);
+
+    layout_q = setTensorLayoutDimensionNV(layout_q, N_HEAD, N_EMBD);
+    layout_q = setTensorLayoutStrideNV(layout_q, p.q_nb1, p.q_nb0);
+#if QUANT_K > 1
+    layout_k = setTensorLayoutBlockSizeNV(layout_k, 1, QUANT_K);
+#endif
+    layout_k = setTensorLayoutDimensionNV(layout_k, p.n_kv, N_EMBD);
+    layout_k = setTensorLayoutStrideNV(layout_k, p.k_nb2, p.k_nb0);
+
+    const uint q_base = p.q_offset + it*p.q_nb2 + is*p.q_nb3;
+    const uint k_base = p.k_offset + is*p.k_nb3;
+
+    coopmat<float16_t, gl_ScopeWorkgroup, N_HEAD, N_EMBD, gl_MatrixUseA> mat_q;
+    {
+        coopmat<float, gl_ScopeWorkgroup, N_HEAD, N_EMBD, gl_MatrixUseAccumulator> q_f32;
+        coopMatLoadTensorNV(q_f32, data_q, q_base,
+            sliceTensorLayoutNV(layout_q, 0, N_HEAD, 0, N_EMBD));
+        mat_q = coopmat<float16_t, gl_ScopeWorkgroup, N_HEAD, N_EMBD, gl_MatrixUseA>(q_f32);
+    }
+
+    coopmat<float16_t, gl_ScopeWorkgroup, N_EMBD, KV_TILE, gl_MatrixUseB> mat_k;
+#if defined(DATA_A_F32)
+    {
+        coopmat<float, gl_ScopeWorkgroup, N_EMBD, KV_TILE, gl_MatrixUseAccumulator> k_f32;
+        coopMatLoadTensorNV(k_f32, data_a, k_base,
+            sliceTensorLayoutNV(layout_k, kv_base, KV_TILE, 0, N_EMBD), transpose);
+        mat_k = coopmat<float16_t, gl_ScopeWorkgroup, N_EMBD, KV_TILE, gl_MatrixUseB>(k_f32);
+    }
+#elif defined(DATA_A_F16)
+    coopMatLoadTensorNV(mat_k, data_a, k_base,
+        sliceTensorLayoutNV(layout_k, kv_base, KV_TILE, 0, N_EMBD), transpose);
+#else
+    coopMatLoadTensorNV(mat_k, data_a, k_base,
+        sliceTensorLayoutNV(layout_k, kv_base, KV_TILE, 0, N_EMBD), transpose, dequantFuncA);
+#endif
+    coopmat<float, gl_ScopeWorkgroup, N_HEAD, KV_TILE, gl_MatrixUseAccumulator> mat_scores =
+        coopmat<float, gl_ScopeWorkgroup, N_HEAD, KV_TILE, gl_MatrixUseAccumulator>(0.0);
+    mat_scores = coopMatMulAdd(mat_q, mat_k, mat_scores);
+    coopMatPerElementNV(mat_scores, mat_scores, apply_weight, it, is);
+
+    coopmat<float, gl_ScopeWorkgroup, N_HEAD, KV_TILE, gl_MatrixUseAccumulator> reduced;
+    coopMatReduceNV(reduced, mat_scores, gl_CooperativeMatrixReduceColumnNV, add_reduce);
+    coopMatPerElementNV(reduced, reduced, store_score, kv_base, it, is);
+}

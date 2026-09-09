@@ -6,6 +6,9 @@
 
 #include <Foundation/Foundation.h>
 
+#include <mach/mach.h>
+#include <sys/sysctl.h>
+
 #include <Metal/Metal.h>
 
 #include <stdatomic.h>
@@ -94,6 +97,12 @@ void ggml_metal_pipeline_free(ggml_metal_pipeline_t pipeline) {
 int ggml_metal_pipeline_max_theads_per_threadgroup(struct ggml_metal_pipeline_with_params pipeline) {
     return pipeline.pipeline->obj.maxTotalThreadsPerThreadgroup;
 }
+
+// simdgroup / subgroup / wave size
+int ggml_metal_pipeline_thread_execution_width(struct ggml_metal_pipeline_with_params pipeline) {
+    return pipeline.pipeline->obj.threadExecutionWidth;
+}
+
 
 struct ggml_metal_library {
     id<MTLLibrary> obj;
@@ -358,6 +367,7 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline(ggml_meta
         /*.smem     =*/ 0,
         /*.c4       =*/ false,
         /*.cnt      =*/ false,
+        /*.nth      =*/ 0,
     };
 
     res.pipeline = ggml_metal_pipelines_get(lib->pipelines, name);
@@ -376,6 +386,7 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_compile_pipeline(ggml_
         /*.smem     =*/ 0,
         /*.c4       =*/ false,
         /*.cnt      =*/ false,
+        /*.nth      =*/ 0,
     };
 
     [lib->lock lock];
@@ -589,8 +600,13 @@ ggml_metal_rsets_t ggml_metal_rsets_init(ggml_metal_device_t dev) {
     res->lock = [[NSLock alloc] init];
     res->data = [[NSMutableArray alloc] init];
 
-    // by default keep the memory wired for 3 minutes
-    res->keep_alive_s = 3*60;
+    // Default to a 1-second heartbeat to emulate the pre-c41bde6fb behavior (no
+    // ongoing requestResidency re-issuance) on memory-constrained targets like
+    // iOS, where holding Metal buffers wired for minutes pushes the app past
+    // jetsam under workloads like the embed-llamacpp 4096-batch stress test.
+    // Set GGML_METAL_RESIDENCY_KEEP_ALIVE_S=180 to restore the upstream default
+    // when running interactive workloads on desktop where wired memory is free.
+    res->keep_alive_s = 1;
 
     const char * GGML_METAL_RESIDENCY_KEEP_ALIVE_S = getenv("GGML_METAL_RESIDENCY_KEEP_ALIVE_S");
     if (GGML_METAL_RESIDENCY_KEEP_ALIVE_S) {
@@ -598,7 +614,7 @@ ggml_metal_rsets_t ggml_metal_rsets_init(ggml_metal_device_t dev) {
     }
 
     if (res->keep_alive_s <= 0) {
-        res->keep_alive_s = 3*60;
+        res->keep_alive_s = 1;
     }
 
     res->time_per_loop_ms = 5;
@@ -653,13 +669,24 @@ void ggml_metal_rsets_free(ggml_metal_rsets_t rsets) {
         return;
     }
 
-    // note: if you hit this assert, most likely you haven't deallocated all Metal resources before exiting
-    GGML_ASSERT([rsets->data count] == 0);
-
+    // Stop the bg residency-request thread before touching rsets->data; it
+    // walks the array every 500ms and would race a removeAllObjects below.
     atomic_store_explicit(&rsets->d_stop, true, memory_order_relaxed);
-
     dispatch_group_wait(rsets->d_group, DISPATCH_TIME_FOREVER);
     dispatch_release(rsets->d_group);
+
+    // The original assert ([rsets->data count] == 0) fires during C++ static
+    // finalization on process exit when this dtor runs after a JS/bare host
+    // has torn down without unregistering its Metal buffers — turning an
+    // otherwise-successful test ("# ok, 4/4 pass") into a SIGABRT. Drain the
+    // set instead so the process can exit cleanly; warn if anything was still
+    // registered so genuine mid-execution leaks remain observable.
+    NSUInteger n = [rsets->data count];
+    if (n != 0) {
+        GGML_LOG_WARN("%s: %lu residency-set entries still registered at teardown; draining\n",
+                      __func__, (unsigned long) n);
+        [rsets->data removeAllObjects];
+    }
 
     [rsets->data release];
     [rsets->lock release];
@@ -732,6 +759,72 @@ ggml_metal_device_t ggml_metal_device_init(int device) {
             dev->props.has_simdgroup_reduction |= [dev->mtl_device supportsFamily:MTLGPUFamilyMetal3_GGML];
 
             dev->props.has_simdgroup_mm = [dev->mtl_device supportsFamily:MTLGPUFamilyApple7];
+
+            // Paravirtualized GPUs on Apple Silicon (e.g. GitHub Actions macos runners)
+            // report MTLGPUFamilyApple5 even though the underlying M-series hardware
+            // supports simdgroup intrinsics. Probe the Metal compiler/linker to see
+            // what actually works, and re-enable accordingly.
+            {
+                if (!dev->props.has_simdgroup_reduction) {
+                    const char * src_simd_red =
+                        "#include <metal_stdlib>\n"
+                        "using namespace metal;\n"
+                        "kernel void probe_simd_red(\n"
+                        "    device const float * src [[buffer(0)]],\n"
+                        "    device       float * dst [[buffer(1)]],\n"
+                        "    uint tpig [[thread_position_in_grid]],\n"
+                        "    uint tiisg [[thread_index_in_simdgroup]]) {\n"
+                        "    float v = src[tpig];\n"
+                        "    v = simd_sum(v);\n"
+                        "    v = simd_max(v);\n"
+                        "    if (tiisg == 0) { dst[tpig / 32] = v; }\n"
+                        "}\n";
+                    GGML_LOG_INFO("%s: probing simdgroup reduction support\n", __func__);
+                    ggml_metal_library_t lib = ggml_metal_library_init_from_source(dev, src_simd_red, false);
+                    if (lib != NULL) {
+                        struct ggml_metal_pipeline_with_params ppl = ggml_metal_library_compile_pipeline(lib, "probe_simd_red", "probe_simd_red", nil);
+                        if (ppl.pipeline) {
+                            GGML_LOG_INFO("%s: simdgroup reduction probe succeeded - enabling\n", __func__);
+                            dev->props.has_simdgroup_reduction = true;
+                        }
+                        ggml_metal_library_free(lib);
+                    }
+                }
+                // Only probe simdgroup_mm on Apple GPUs, simdgroup_half8x8 / simdgroup_load(half)
+                // is an Apple-family hardware feature; trying to compile this pipeline on
+                // Intel/AMD Mac GPUs always fails and the existing pipeline compiler logs the
+                // failure via GGML_LOG_ERROR("incompatible pipeline ..."), which test harnesses
+                // pattern-match as fatal.
+                if (!dev->props.has_simdgroup_mm && [dev->mtl_device supportsFamily:MTLGPUFamilyApple1]) {
+                    const char * src_simd_mm =
+                        "#include <metal_stdlib>\n"
+                        "using namespace metal;\n"
+                        "kernel void probe_simd_mm(\n"
+                        "    device const half  * a [[buffer(0)]],\n"
+                        "    device const half  * b [[buffer(1)]],\n"
+                        "    device       float * c [[buffer(2)]],\n"
+                        "    uint sgitg [[simdgroup_index_in_threadgroup]]) {\n"
+                        "    simdgroup_half8x8  ma;\n"
+                        "    simdgroup_half8x8  mb;\n"
+                        "    simdgroup_float8x8 mc = make_filled_simdgroup_matrix<float, 8>(0.f);\n"
+                        "    simdgroup_load(ma, a, 8);\n"
+                        "    simdgroup_load(mb, b, 8);\n"
+                        "    simdgroup_multiply_accumulate(mc, ma, mb, mc);\n"
+                        "    simdgroup_store(mc, c, 8);\n"
+                        "    (void) sgitg;\n"
+                        "}\n";
+                    GGML_LOG_INFO("%s: probing simdgroup matrix-mul support\n", __func__);
+                    ggml_metal_library_t lib = ggml_metal_library_init_from_source(dev, src_simd_mm, false);
+                    if (lib != NULL) {
+                        struct ggml_metal_pipeline_with_params ppl = ggml_metal_library_compile_pipeline(lib, "probe_simd_mm", "probe_simd_mm", nil);
+                        if (ppl.pipeline) {
+                            GGML_LOG_INFO("%s: simdgroup matrix-mul probe succeeded - enabling\n", __func__);
+                            dev->props.has_simdgroup_mm = true;
+                        }
+                        ggml_metal_library_free(lib);
+                    }
+                }
+            }
             dev->props.has_unified_memory = dev->mtl_device.hasUnifiedMemory;
 
             dev->props.has_bfloat  = [dev->mtl_device supportsFamily:MTLGPUFamilyMetal3_GGML];
@@ -1077,6 +1170,33 @@ void ggml_metal_device_get_memory(ggml_metal_device_t dev, size_t * free, size_t
     if (@available(macOS 10.12, iOS 16.0, *)) {
         *total = dev->mtl_device.recommendedMaxWorkingSetSize;
         *free  = *total - dev->mtl_device.currentAllocatedSize;
+
+        // currentAllocatedSize only counts this process. On unified memory the
+        // device budget is the same physical RAM every other process is using,
+        // so clamp by what the host can still make available — otherwise a
+        // fresh process (e.g. a fit/preflight subprocess) sees an idle device
+        // no matter how much is already wired system-wide.
+        //
+        // "Available" here is physical memory minus what cannot be evicted:
+        // wired pages (other processes' GPU buffers included) and the
+        // compressor's own footprint. Anonymous and file-backed pages are NOT
+        // subtracted — the kernel compresses or evicts them under pressure, and
+        // an estimate like free+inactive that ignores this rejects loads that
+        // demonstrably run.
+        if (dev->mtl_device.hasUnifiedMemory) {
+            vm_statistics64_data_t vm_stats;
+            mach_msg_type_number_t count = HOST_VM_INFO64_COUNT;
+            int64_t total_mem = 0;
+            size_t total_len = sizeof(total_mem);
+            if (host_statistics64(mach_host_self(), HOST_VM_INFO64, (host_info64_t) &vm_stats, &count) == KERN_SUCCESS &&
+                sysctlbyname("hw.memsize", &total_mem, &total_len, NULL, 0) == 0) {
+                const size_t unavailable = ((size_t) vm_stats.wire_count + (size_t) vm_stats.compressor_page_count) * (size_t) vm_kernel_page_size;
+                const size_t host_available = (size_t) total_mem > unavailable ? (size_t) total_mem - unavailable : 0;
+                if (host_available < *free) {
+                    *free = host_available;
+                }
+            }
+        }
     } else {
         *free = 0;
         *total = 0;
@@ -1087,6 +1207,10 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
     const bool has_simdgroup_mm        = dev->props.has_simdgroup_mm;
     const bool has_simdgroup_reduction = dev->props.has_simdgroup_reduction;
     const bool has_bfloat              = dev->props.has_bfloat;
+
+    if (!has_simdgroup_reduction) {
+        return false;
+    }
 
     if (!has_bfloat) {
         if (op->type == GGML_TYPE_BF16) {
@@ -1171,6 +1295,12 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                 if (src0_type != src1_type || src0_type != op->type) {
                     return false;
                 }
+                if (ggml_is_quantized(src0_type)) {
+                    return ggml_is_contiguous_rows(op->src[0]) &&
+                           ggml_is_contiguous_rows(op->src[1]) &&
+                           op->src[0]->ne[0] % ggml_blck_size(src0_type) == 0 &&
+                           op->src[1]->ne[0] % ggml_blck_size(src1_type) == 0;
+                }
                 switch (src0_type) {
                     case GGML_TYPE_F32:
                     case GGML_TYPE_F16:
@@ -1186,6 +1316,12 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                 }
             }
         case GGML_OP_ADD:
+            if (op->src[0]->type == GGML_TYPE_F16 &&
+                op->src[1]->type == GGML_TYPE_F16 &&
+                op->type == GGML_TYPE_F16) {
+                return true;
+            }
+            // fall through
         case GGML_OP_SUB:
         case GGML_OP_MUL:
         case GGML_OP_DIV:
@@ -1193,6 +1329,31 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
             return ggml_is_contiguous_rows(op->src[0]) && ggml_is_contiguous_rows(op->src[1]) && (op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_F16) && (op->src[0]->type == op->src[1]->type);
         case GGML_OP_ACC:
             return ggml_is_contiguous_rows(op->src[0]) && ggml_is_contiguous_rows(op->src[1]) && op->src[0]->type == GGML_TYPE_F32;
+        case GGML_OP_OUT_PROD:
+            if (op->type != GGML_TYPE_F32) {
+                return false;
+            }
+            {
+                const enum ggml_type src0_type = op->src[0]->type;
+                const enum ggml_type src1_type = op->src[1]->type;
+
+                if (src0_type == GGML_TYPE_F16 && src1_type == GGML_TYPE_F32) {
+                    return true;
+                }
+                if (src0_type == GGML_TYPE_F32 && (src1_type == GGML_TYPE_F32 || src1_type == GGML_TYPE_F16)) {
+                    return true;
+                }
+                if (src0_type == GGML_TYPE_F16 && src1_type == GGML_TYPE_F16) {
+                    return true;
+                }
+                if (src0_type == GGML_TYPE_Q8_0 && (src1_type == GGML_TYPE_F32 || src1_type == GGML_TYPE_F16)) {
+                    return true;
+                }
+                if (src0_type == GGML_TYPE_Q4_0 && (src1_type == GGML_TYPE_F32 || src1_type == GGML_TYPE_F16)) {
+                    return true;
+                }
+            }
+            return false;
         case GGML_OP_REPEAT:
         case GGML_OP_CONV_TRANSPOSE_1D:
             return true;
@@ -1222,6 +1383,29 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
         case GGML_OP_GROUP_NORM:
         case GGML_OP_L2_NORM:
             return has_simdgroup_reduction && ggml_is_contiguous_rows(op->src[0]);
+        case GGML_OP_SOFT_MAX_BACK:
+            {
+                if (!has_simdgroup_reduction ||
+                    op->type != GGML_TYPE_F32 ||
+                    op->src[0] == NULL || op->src[1] == NULL ||
+                    op->src[0]->type != GGML_TYPE_F32 ||
+                    op->src[1]->type != GGML_TYPE_F32 ||
+                    !ggml_is_contiguous_1(op->src[0]) ||
+                    !ggml_is_contiguous_1(op->src[1]) ||
+                    !ggml_is_contiguous_1(op) ||
+                    !ggml_are_same_shape(op, op->src[0]) ||
+                    !ggml_are_same_shape(op, op->src[1])) {
+                    return false;
+                }
+
+                float max_bias = 0.0f;
+                memcpy(&max_bias, ((const float *) op->op_params) + 1, sizeof(float));
+                if (max_bias != 0.0f) {
+                    return false;
+                }
+
+                return true;
+            }
         case GGML_OP_COUNT_EQUAL:
             return has_simdgroup_reduction &&
                 op->src[0]->type == GGML_TYPE_I32 &&
@@ -1232,6 +1416,72 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
         case GGML_OP_NORM:
         case GGML_OP_RMS_NORM:
             return has_simdgroup_reduction && (ggml_is_contiguous_rows(op->src[0]));
+        case GGML_OP_RMS_NORM_BACK:
+            return has_simdgroup_reduction &&
+                   op->type == GGML_TYPE_F32 &&
+                   op->src[0] != NULL && op->src[1] != NULL &&
+                   op->src[0]->type == GGML_TYPE_F32 &&
+                   op->src[1]->type == GGML_TYPE_F32 &&
+                   op->ne[0] % 4 == 0 &&
+                   ggml_is_contiguous_1(op->src[0]) &&
+                   ggml_is_contiguous_1(op->src[1]) &&
+                   ggml_is_contiguous_1(op) &&
+                   ggml_are_same_shape(op, op->src[0]) &&
+                   ggml_are_same_shape(op, op->src[1]);
+        case GGML_OP_GELU_BACK:
+        case GGML_OP_SIGMOID_BACK:
+            return op->type == GGML_TYPE_F32 &&
+                   op->src[0] != NULL && op->src[1] != NULL &&
+                   op->src[0]->type == GGML_TYPE_F32 &&
+                   op->src[1]->type == GGML_TYPE_F32 &&
+                   ggml_is_contiguous_1(op->src[0]) &&
+                   ggml_is_contiguous_1(op->src[1]) &&
+                   ggml_is_contiguous_1(op) &&
+                   ggml_are_same_shape(op, op->src[0]) &&
+                   ggml_are_same_shape(op, op->src[1]);
+        case GGML_OP_L2_NORM_BACK:
+            return has_simdgroup_reduction &&
+                   op->type == GGML_TYPE_F32 &&
+                   op->src[0] != NULL && op->src[1] != NULL &&
+                   op->src[0]->type == GGML_TYPE_F32 &&
+                   op->src[1]->type == GGML_TYPE_F32 &&
+                   op->ne[0] % 4 == 0 &&
+                   ggml_is_contiguous_1(op->src[0]) &&
+                   ggml_is_contiguous_1(op->src[1]) &&
+                   ggml_is_contiguous_1(op) &&
+                   ggml_are_same_shape(op, op->src[0]) &&
+                   ggml_are_same_shape(op, op->src[1]);
+        case GGML_OP_MUL_MAT_ID_BACK_A:
+            return op->type == GGML_TYPE_F32 &&
+                   op->src[0]->type == GGML_TYPE_F32 &&
+                   op->src[1]->type == GGML_TYPE_F32 &&
+                   op->src[2]->type == GGML_TYPE_I32;
+        case GGML_OP_MUL_MAT_ID_BACK_B:
+            return op->type == GGML_TYPE_F32 &&
+                   (op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_Q8_0) &&
+                   op->src[1]->type == GGML_TYPE_F32 &&
+                   op->src[2]->type == GGML_TYPE_I32;
+        case GGML_OP_SSM_CONV_BACK_SX:
+        case GGML_OP_SSM_CONV_BACK_C:
+            return op->type == GGML_TYPE_F32 &&
+                   op->src[0]->type == GGML_TYPE_F32 &&
+                   op->src[1]->type == GGML_TYPE_F32 &&
+                   op->src[0]->nb[0] == ggml_type_size(op->src[0]->type) &&
+                   op->src[1]->nb[0] == ggml_type_size(op->src[1]->type);
+        case GGML_OP_GATED_DELTA_NET_BACK:
+            {
+                if (!has_simdgroup_reduction || op->type != GGML_TYPE_F32) {
+                    return false;
+                }
+                for (int i = 0; i < 7; ++i) {
+                    if (op->src[i] == NULL || op->src[i]->type != GGML_TYPE_F32 ||
+                        op->src[i]->nb[0] != ggml_type_size(op->src[i]->type)) {
+                        return false;
+                    }
+                }
+                const int64_t S_v = op->src[2]->ne[0];
+                return S_v > 0 && S_v <= 256 && (S_v & (S_v - 1)) == 0;
+            }
         case GGML_OP_ROPE:
         case GGML_OP_ROPE_BACK:
             return true;
@@ -1388,7 +1638,7 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
         case GGML_OP_SOLVE_TRI:
         case GGML_OP_MUL_MAT:
         case GGML_OP_MUL_MAT_ID:
-            return has_simdgroup_reduction && op->src[0]->type != GGML_TYPE_NVFP4;
+            return op->src[0]->type != GGML_TYPE_TQ1_0 && has_simdgroup_reduction && op->src[0]->type != GGML_TYPE_NVFP4 && !ggml_is_tbq_or_pq(op->src[0]->type);
         case GGML_OP_SET:
         case GGML_OP_CPY:
         case GGML_OP_DUP:
@@ -1452,7 +1702,7 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                 };
             }
         case GGML_OP_GET_ROWS:
-            return op->src[0]->type != GGML_TYPE_NVFP4;
+            return op->src[0]->type != GGML_TYPE_NVFP4 && op->src[0]->type != GGML_TYPE_TQ1_0;
         case GGML_OP_SET_ROWS:
             {
                 if (op->src[0]->type == GGML_TYPE_F16) {

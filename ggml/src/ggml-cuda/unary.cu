@@ -527,6 +527,57 @@ void ggml_cuda_op_silu_back(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
     }
 }
 
+/* gelu_back */
+
+static __device__ __forceinline__ float op_gelu_back(float grad, float x) {
+    const float GELU_COEF_A    = 0.044715f;
+    const float SQRT_2_OVER_PI = 0.79788456080286535587989211986876f;
+
+    const float tanh_val = tanhf(SQRT_2_OVER_PI * x * (1.0f + GELU_COEF_A*x*x));
+    const float dtanh_dx = SQRT_2_OVER_PI * (1.0f + 3.0f*GELU_COEF_A*x*x) * (1.0f - tanh_val*tanh_val);
+
+    return grad * 0.5f * (1.0f + tanh_val + x*dtanh_dx);
+}
+
+template <class T>
+static __global__ void gelu_back_kernel(const T * grad, const T * xf, T * dst, const int k) {
+    const int i = blockDim.x*blockIdx.x + threadIdx.x;
+
+    if (i >= k) {
+        return;
+    }
+
+    dst[i] = (T)op_gelu_back((float)grad[i], (float)xf[i]);
+}
+
+template <class T>
+static void gelu_back_cuda(const T * grad, const T * x, T * dst, const int k, cudaStream_t stream) {
+    const int num_blocks = (k + CUDA_GELU_BACK_BLOCK_SIZE - 1) / CUDA_GELU_BACK_BLOCK_SIZE;
+    gelu_back_kernel<<<num_blocks, CUDA_GELU_BACK_BLOCK_SIZE, 0, stream>>>(grad, x, dst, k);
+}
+
+void ggml_cuda_op_gelu_back(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * grad = dst->src[0];
+    const ggml_tensor * xf   = dst->src[1];
+
+    const float * grad_d = (const float *) grad->data;
+    const float * xf_d   = (const float *) xf->data;
+    float       * dst_d  = (float       *) dst->data;
+
+    cudaStream_t stream = ctx.stream();
+
+    GGML_ASSERT(ggml_is_contiguous(grad));
+    GGML_ASSERT(ggml_is_contiguous(xf));
+    GGML_ASSERT(ggml_are_same_shape(grad, xf));
+    GGML_ASSERT(ggml_are_same_shape(xf, dst));
+
+    GGML_ASSERT(grad->type == GGML_TYPE_F32);
+    GGML_ASSERT(  xf->type == GGML_TYPE_F32);
+    GGML_ASSERT( dst->type == GGML_TYPE_F32);
+
+    gelu_back_cuda(grad_d, xf_d, dst_d, ggml_nelements(dst), stream);
+}
+
 /* leaky relu */
 
 static __device__ __forceinline__ float op_leaky_relu(float x, const float negative_slope) {

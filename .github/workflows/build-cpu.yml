@@ -8,12 +8,17 @@ on:
     paths: [
       '.github/workflows/build-cpu.yml',
       '.github/workflows/build-cmake-pkg.yml',
+      '.github/workflows/build-linux-cross.yml',
+      'scripts/vector-index-package-smoke.sh',
       '**/CMakeLists.txt',
-      '**/.cmake',
+      '**/*.cmake',
+      '**/*.cmake.in',
+      '**/*.pc.in',
       '**/*.h',
       '**/*.hpp',
       '**/*.c',
       '**/*.cpp',
+      '**/*.inc',
     ]
 
   pull_request:
@@ -21,13 +26,18 @@ on:
     paths: [
       '.github/workflows/build-cpu.yml',
       '.github/workflows/build-cmake-pkg.yml',
+      '.github/workflows/build-linux-cross.yml',
       'ggml/src/ggml-rpc/**',
+      'scripts/vector-index-package-smoke.sh',
       '**/CMakeLists.txt',
-      '**/.cmake',
+      '**/*.cmake',
+      '**/*.cmake.in',
+      '**/*.pc.in',
       '**/*.h',
       '**/*.hpp',
       '**/*.c',
-      '**/*.cpp'
+      '**/*.cpp',
+      '**/*.inc'
     ]
 
 concurrency:
@@ -42,9 +52,6 @@ env:
   LLAMA_ARG_LOG_TIMESTAMPS: 1
 
 jobs:
-  build-cmake-pkg:
-    uses: ./.github/workflows/build-cmake-pkg.yml
-
   ubuntu:
     strategy:
       matrix:
@@ -61,10 +68,17 @@ jobs:
         id: checkout
         uses: actions/checkout@v6
 
+      - name: CPU feature hash
+        id: cpu_info
+        run: |
+          CPU_HASH=$(echo | gcc -march=native -dM -E - 2>/dev/null | sort | md5sum | cut -d' ' -f1)
+          echo "cpu_hash=${CPU_HASH}" >> "$GITHUB_OUTPUT"
+          echo "CPU feature hash: ${CPU_HASH}"
+
       - name: ccache
         uses: ggml-org/ccache-action@v1.2.21
         with:
-          key: cpu-${{ matrix.os }}
+          key: cpu-${{ matrix.os }}-${{ steps.cpu_info.outputs.cpu_hash }}
           evict-old-files: 1d
           save: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}
 
@@ -97,6 +111,7 @@ jobs:
           cmake -B build \
             -DGGML_NATIVE=OFF \
             -DLLAMA_FATAL_WARNINGS=ON \
+            -DGGML_VECTOR_INDEX=ON \
             -DGGML_RPC=ON \
             -DGGML_NATIVE=OFF
           time cmake --build build --config Release -j $(nproc)
@@ -106,6 +121,101 @@ jobs:
         run: |
           cd build
           ctest -L main --verbose --timeout 900
+
+      - name: Static vector-index smoke
+        if: ${{ matrix.build == 'x64' || matrix.build == 'arm64' }}
+        id: vector_index_static
+        run: |
+          cmake -B build-vector-index-static \
+            -DLLAMA_FATAL_WARNINGS=ON \
+            -DLLAMA_BUILD_TESTS=ON \
+            -DGGML_VECTOR_INDEX=ON \
+            -DBUILD_SHARED_LIBS=OFF
+          cmake --build build-vector-index-static --target test-vector-index test-vector-index-hooks test-vector-index-faults -j $(nproc)
+          ctest --test-dir build-vector-index-static -R '^test-vector-index(-hooks|-faults)?$' --output-on-failure
+
+      - name: Vector-index package smoke
+        if: ${{ matrix.build == 'x64' || matrix.build == 'arm64' }}
+        id: vector_index_package
+        run: |
+          PREFIX="$RUNNER_TEMP/vector-index-install"
+          cmake --install build --prefix "$PREFIX" --config Release
+
+          mkdir -p vector-index-consumer
+          cat > vector-index-consumer/CMakeLists.txt <<'EOF'
+          cmake_minimum_required(VERSION 3.16)
+          project(vector_index_consumer C CXX)
+          find_package(ggml CONFIG REQUIRED)
+          add_executable(vector_index_consumer main.c)
+          target_link_libraries(vector_index_consumer PRIVATE ggml::vector-index)
+          EOF
+          cat > vector-index-consumer/main.c <<'EOF'
+          #include "ggml-vector-index.h"
+
+          #include <stdint.h>
+          #include <stdio.h>
+
+          int main(void) {
+              ggml_vec_index_t * idx = ggml_vec_index_create(2, 32);
+              if (idx == 0) {
+                  return 1;
+              }
+              const float vector[2] = { 1.0f, 0.0f };
+              const uint64_t id = 7;
+              float score = 0.0f;
+              uint64_t out_id = 0;
+              if (ggml_vec_index_add(idx, vector, 1, &id) != GGML_VEC_INDEX_OK ||
+                  ggml_vec_index_search(idx, vector, 1, 1, &score, &out_id) != GGML_VEC_INDEX_OK ||
+                  out_id != id) {
+                  ggml_vec_index_free(idx);
+                  return 2;
+              }
+              const char * snapshot_path = "vector-index-consumer.tvim";
+              if (ggml_vec_index_write(idx, snapshot_path) != GGML_VEC_INDEX_OK) {
+                  ggml_vec_index_free(idx);
+                  return 3;
+              }
+              ggml_vec_index_free(idx);
+              idx = ggml_vec_index_load(snapshot_path);
+              remove(snapshot_path);
+              if (idx == 0 || ggml_vec_index_contains(idx, id) != 1) {
+                  ggml_vec_index_free(idx);
+                  return 4;
+              }
+              ggml_vec_index_free(idx);
+              return 0;
+          }
+          EOF
+
+          cmake -S vector-index-consumer -B vector-index-consumer/build \
+            -DCMAKE_PREFIX_PATH="$PREFIX/share"
+          cmake --build vector-index-consumer/build
+          vector-index-consumer/build/vector_index_consumer
+
+          export PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig"
+          cc vector-index-consumer/main.c \
+            $(pkg-config --cflags --libs ggml-vector-index) \
+            -o vector-index-pkg-config
+          LD_LIBRARY_PATH="$PREFIX/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
+            ./vector-index-pkg-config
+
+          STATIC_PREFIX="$RUNNER_TEMP/vector-index-static-install"
+          STATIC_LIBDIR="lib/$(gcc -print-multiarch)"
+          cmake -S ggml -B build-vector-index-package-static \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX="$STATIC_PREFIX" \
+            -DCMAKE_INSTALL_LIBDIR="$STATIC_LIBDIR" \
+            -DBUILD_SHARED_LIBS=OFF \
+            -DGGML_BUILD_TESTS=OFF \
+            -DGGML_BUILD_EXAMPLES=OFF \
+            -DGGML_VECTOR_INDEX=ON
+          cmake --build build-vector-index-package-static -j $(nproc)
+          cmake --install build-vector-index-package-static
+          PREFIX="$STATIC_PREFIX" \
+            CONSUMER_DIR=vector-index-consumer-static \
+            LIBDIR="$STATIC_LIBDIR" \
+            PKG_CONFIG_STATIC=1 \
+            bash scripts/vector-index-package-smoke.sh
 
       - name: Test llama2c conversion
         id: llama2c_test
@@ -131,13 +241,13 @@ jobs:
         include:
           - build: 'x64-cpu-static'
             arch: 'x64'
-            defines: '-G "Ninja Multi-Config" -D CMAKE_TOOLCHAIN_FILE=cmake/x64-windows-llvm.cmake -DGGML_NATIVE=OFF -DGGML_OPENMP_FETCH=ON -DLLAMA_BUILD_SERVER=ON -DGGML_RPC=ON -DBUILD_SHARED_LIBS=OFF'
+            defines: '-G "Ninja Multi-Config" -D CMAKE_TOOLCHAIN_FILE=cmake/x64-windows-llvm.cmake -DGGML_NATIVE=OFF -DGGML_OPENMP_FETCH=ON -DLLAMA_BUILD_SERVER=ON -DGGML_RPC=ON -DGGML_VECTOR_INDEX=ON -DBUILD_SHARED_LIBS=OFF'
           - build: 'x64-openblas'
             arch: 'x64'
-            defines: '-G "Ninja Multi-Config" -D CMAKE_TOOLCHAIN_FILE=cmake/x64-windows-llvm.cmake -DGGML_NATIVE=OFF -DLLAMA_BUILD_SERVER=ON -DGGML_RPC=ON -DGGML_BACKEND_DL=ON -DGGML_CPU_ALL_VARIANTS=ON -DGGML_OPENMP=OFF -DGGML_BLAS=ON -DGGML_BLAS_VENDOR=OpenBLAS -DBLAS_INCLUDE_DIRS="$env:RUNNER_TEMP/openblas/include" -DBLAS_LIBRARIES="$env:RUNNER_TEMP/openblas/lib/openblas.lib"'
+            defines: '-G "Ninja Multi-Config" -D CMAKE_TOOLCHAIN_FILE=cmake/x64-windows-llvm.cmake -DGGML_NATIVE=OFF -DLLAMA_BUILD_SERVER=ON -DGGML_RPC=ON -DGGML_VECTOR_INDEX=ON -DGGML_BACKEND_DL=ON -DGGML_CPU_ALL_VARIANTS=ON -DGGML_OPENMP=OFF -DGGML_BLAS=ON -DGGML_BLAS_VENDOR=OpenBLAS -DBLAS_INCLUDE_DIRS="$env:RUNNER_TEMP/openblas/include" -DBLAS_LIBRARIES="$env:RUNNER_TEMP/openblas/lib/openblas.lib"'
           - build: 'arm64'
             arch: 'arm64'
-            defines: '-G "Ninja Multi-Config" -D CMAKE_TOOLCHAIN_FILE=cmake/arm64-windows-llvm.cmake -DGGML_NATIVE=OFF -DGGML_OPENMP_FETCH=ON -DLLAMA_BUILD_SERVER=ON'
+            defines: '-G "Ninja Multi-Config" -D CMAKE_TOOLCHAIN_FILE=cmake/arm64-windows-llvm.cmake -DGGML_NATIVE=OFF -DGGML_OPENMP_FETCH=ON -DLLAMA_BUILD_SERVER=ON -DGGML_VECTOR_INDEX=ON'
 
     steps:
       - name: Clone

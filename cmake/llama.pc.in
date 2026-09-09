@@ -1,7 +1,7 @@
-prefix=@CMAKE_INSTALL_PREFIX@
-exec_prefix=@CMAKE_INSTALL_PREFIX@
-libdir=@CMAKE_INSTALL_FULL_LIBDIR@
-includedir=@CMAKE_INSTALL_FULL_INCLUDEDIR@
+prefix=@LLAMA_PC_PREFIX@
+exec_prefix=${prefix}
+libdir=@LLAMA_PC_LIBDIR@
+includedir=@LLAMA_PC_INCLUDEDIR@
 
 Name: llama
 Description: Port of Facebook's LLaMA model in C/C++

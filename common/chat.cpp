@@ -3570,9 +3570,15 @@ std::optional<common_chat_params> common_chat_try_specialized_template(
     // Gemma4 format detection
     if (src.find("'<|tool_call>call:'") != std::string::npos) {
         if (src.find("{#- OpenAI Chat Completions:") == std::string::npos) {
-            // apply workarounds if using the older gemma4 templates
-            LOG_WRN("%s: detected an outdated gemma4 chat template, applying compatibility workarounds. "
-                    "Consider updating to the official template.\n", __func__);
+            // apply workarounds if using the older gemma4 templates; warn
+            // once per process so callers like the finetune loader (one apply
+            // per conversation in the dataset) don't drown the log.
+            static bool warned = false;
+            if (!warned) {
+                warned = true;
+                LOG_WRN("%s: detected an outdated gemma4 chat template, applying compatibility workarounds. "
+                        "Consider updating to the official template.\n", __func__);
+            }
             workaround::convert_tool_responses_gemma4(params.messages);
         }
         return common_chat_params_init_gemma4(tmpl, params);
@@ -3703,7 +3709,38 @@ static common_chat_params common_chat_templates_apply_jinja(const struct common_
         return data;
     }
 
+    // Mark thinking as "forced open" when the chat template's generation-prompt
+    // suffix leaves the reasoning section open.
+    auto thinking_forced_open_from_gen_prompt = [](const std::string & gen_prompt,
+                                                   const std::string & start_tag,
+                                                   const std::vector<std::string> & end_tags) -> bool {
+        if (start_tag.empty() || gen_prompt.empty()) {
+            return false;
+        }
+        const auto last_start = gen_prompt.rfind(start_tag);
+        if (last_start == std::string::npos) {
+            return false;
+        }
+        if (end_tags.empty()) {
+            return true;
+        }
+        for (const auto & end_tag : end_tags) {
+            if (end_tag.empty()) {
+                return true;
+            }
+            const auto last_end = gen_prompt.rfind(end_tag);
+            if (last_end != std::string::npos && last_end > last_start) {
+                return false;
+            }
+        }
+        return true;
+    };
+
     if (auto result = common_chat_try_specialized_template(tmpl, src, params)) {
+        result->thinking_forced_open  = result->supports_thinking &&
+            thinking_forced_open_from_gen_prompt(result->generation_prompt,
+                                                 result->thinking_start_tag,
+                                                 result->thinking_end_tags);
         return *result;
     }
 
@@ -3731,6 +3768,21 @@ static common_chat_params common_chat_templates_apply_jinja(const struct common_
                 auto_params.thinking_end_tags = {std::move(end_tag)};
             }
         }
+        // Leave auto_params.generation_prompt as what generate_parser computed
+        // (character-level diff via common_chat_template_generation_prompt, plus
+        // any continuation-mode reasoning/content extensions). We previously
+        // overwrote this with params.generation_prompt (which uses the
+        // segment-based calculate_diff_split), but for templates like
+        // MiniMax-M2 whose role delimiters are bracket-shaped (`[e~[`, `]~b]`),
+        // segment-based diff includes the trailing `[e~[` of the prior message
+        // as part of the "right" diff. That makes auto_params.generation_prompt
+        // disagree with parser_generation_prompt (used to build the parser),
+        // and the PEG parser then fails on inputs that include the spurious
+        // delimiter prefix.
+        auto_params.thinking_forced_open = auto_params.supports_thinking &&
+            thinking_forced_open_from_gen_prompt(auto_params.generation_prompt,
+                                                 auto_params.thinking_start_tag,
+                                                 auto_params.thinking_end_tags);
         common_peg_arena arena;
         arena.load(auto_params.parser);
         LOG_DBG("%s: generated parser:\n%s\n\nparser generation prompt: %s\n", __func__, arena.dump(arena.root()).c_str(), auto_params.generation_prompt.c_str());

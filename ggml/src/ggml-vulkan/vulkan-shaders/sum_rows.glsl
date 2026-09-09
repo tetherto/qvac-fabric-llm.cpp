@@ -10,6 +10,7 @@ layout (push_constant) uniform parameter
     uint misalign_offsets;
     uint ne0_12mp, ne0_12L;
     uint ne0_1mp, ne0_1L;
+    uint nrows;
 } p;
 
 uint get_aoffset() { return p.misalign_offsets >> 16; }

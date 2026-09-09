@@ -2062,9 +2062,26 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         cb(weights_sum, "ffn_moe_weights_sum", il);
 
         // Avoid division by zero, clamp to smallest number representable by F16
-        weights_sum = ggml_clamp(ctx0, weights_sum, 6.103515625e-5, INFINITY);
+        // Under training, build the equivalent max(x, eps) = x + relu(eps - x) 
+        // using non-view ops so the gradient walk stays legal. The relu trick 
+        // produces a fresh tensor at each step.
+        const float weights_sum_eps = 6.103515625e-5f;
+        if (cparams.training) {
+            ggml_tensor * shifted = ggml_scale_bias(ctx0, weights_sum, -1.0f, weights_sum_eps);
+            ggml_tensor * relu_shifted = ggml_relu(ctx0, shifted);
+            weights_sum = ggml_add(ctx0, weights_sum, relu_shifted);
+        } else {
+            weights_sum = ggml_clamp(ctx0, weights_sum, weights_sum_eps, INFINITY);
+        }
         cb(weights_sum, "ffn_moe_weights_sum_clamped", il);
 
+        // Under training, materialize the broadcast so div's src1 backward
+        // doesn't hit ggml's broadcast-reduction gap (div grad w.r.t. src1 has
+        // no repeat_back step). Inference keeps the implicit broadcast for
+        // perf, ggml_repeat is a no-op when shapes already match
+        if (cparams.training) {
+            weights_sum = ggml_repeat(ctx0, weights_sum, weights);
+        }
         weights = ggml_div(ctx0, weights, weights_sum); // [n_expert_used, n_tokens]
         cb(weights, "ffn_moe_weights_norm", il);
 
@@ -2772,7 +2789,10 @@ ggml_tensor * llm_graph_context::build_attn(
         ggml_tensor * v_mla, // TODO: remove
             float     kq_scale,
             int       il) const {
-    GGML_ASSERT(v_mla == nullptr);
+    // TurboQuant/PolarQuant KV-cache rotation is incompatible with MLA absorption
+    // (DeepSeek-V2/V3 pass wv_b as v_mla here). Only enforce when the rotation
+    // path is actually active; otherwise this overload must still support MLA.
+    GGML_ASSERT(!(inp->self_k_rot || inp->self_v_rot) || v_mla == nullptr);
 
     if (inp->self_k_rot) {
         q_cur = llama_mul_mat_hadamard(ctx0, q_cur, inp->self_k_rot);
@@ -2804,8 +2824,23 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * kq_mask = inp->get_kq_mask();
 
     ggml_tensor * q = q_cur;
-    ggml_tensor * k = mctx_cur->get_k(ctx0, il);
-    ggml_tensor * v = mctx_cur->get_v(ctx0, il);
+    ggml_tensor * k, * v;
+
+    if (loras && !loras->empty() && k_cur && v_cur && cparams.training) {
+        k = mctx_cur->get_k_lora(ctx0, k_cur, il);
+        v = mctx_cur->get_v_lora(ctx0, v_cur, il);
+    } else {
+        k = mctx_cur->get_k(ctx0, il);
+        v = mctx_cur->get_v(ctx0, il);
+    }
+
+    if (kq_mask->ne[0] != k->ne[2]) {
+        GGML_ASSERT(k->ne[2] <= kq_mask->ne[0]);
+        kq_mask = ggml_view_4d(ctx0, kq_mask,
+                k->ne[2], kq_mask->ne[1], kq_mask->ne[2], kq_mask->ne[3],
+                kq_mask->nb[1], kq_mask->nb[2], kq_mask->nb[3], 0);
+        kq_mask = ggml_cont(ctx0, kq_mask);
+    }
 
     ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il);
     cb(cur, "kqv_out", il);
@@ -3056,11 +3091,27 @@ ggml_tensor * llm_graph_context::build_attn(
         ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il));
     }
 
-    const auto & kq_mask = is_swa ? inp->get_kq_mask_swa() : inp->get_kq_mask();
+    ggml_tensor * kq_mask = is_swa ? inp->get_kq_mask_swa() : inp->get_kq_mask();
 
     ggml_tensor * q = q_cur;
-    ggml_tensor * k = mctx_cur->get_k(ctx0, il);
-    ggml_tensor * v = mctx_cur->get_v(ctx0, il);
+    ggml_tensor * k, * v;
+
+    if (loras && !loras->empty() && k_cur && v_cur && cparams.training) {
+        k = mctx_cur->get_k_lora(ctx0, k_cur, il);
+        v = mctx_cur->get_v_lora(ctx0, v_cur, il);
+    } else {
+        k = mctx_cur->get_k(ctx0, il);
+        v = mctx_cur->get_v(ctx0, il);
+    }
+
+    // Same rationale as above for the ISWA path.
+    if (kq_mask->ne[0] != k->ne[2]) {
+        GGML_ASSERT(k->ne[2] <= kq_mask->ne[0]);
+        kq_mask = ggml_view_4d(ctx0, kq_mask,
+                k->ne[2], kq_mask->ne[1], kq_mask->ne[2], kq_mask->ne[3],
+                kq_mask->nb[1], kq_mask->nb[2], kq_mask->nb[3], 0);
+        kq_mask = ggml_cont(ctx0, kq_mask);
+    }
 
     ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il);
     cb(cur, "kqv_out", il);

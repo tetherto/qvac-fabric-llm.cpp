@@ -13,13 +13,14 @@ layout (constant_id =  8) const uint32_t SubGroupSize = 32;
 layout (constant_id =  9) const uint32_t SHMEM_STAGING = 0;
 layout (constant_id = 10) const uint32_t Flags = 0;
 layout (constant_id = 11) const uint32_t LIMIT_OCCUPANCY_SHMEM = 0;
+#ifdef LLAMA_UPSTREAM_FA_MIXED_TYPES
 // ggml_type enumerant for K/V
 layout (constant_id = 12) const uint32_t FaTypeK = 0;
 layout (constant_id = 13) const uint32_t FaTypeV = 0;
 // sizeof(decode buffer): quants -> ggml block size; F32 -> 16 (decodeBufF32 vec4).
 layout (constant_id = 14) const uint32_t FaBlockBytesK = 2;
 layout (constant_id = 15) const uint32_t FaBlockBytesV = 2;
-
+#endif
 const bool USE_MASK_OPT    = (Flags & 1) != 0;
 const bool MASK_ENABLE     = (Flags & 2) != 0;
 const bool LOGIT_SOFTCAP   = (Flags & 4) != 0;
@@ -87,7 +88,7 @@ layout (binding = 6) readonly buffer MO {uint32_t data_mask_opt[];};
 
 #define BINDING_IDX_K 0
 #define BINDING_IDX_V 1
-
+#ifdef LLAMA_UPSTREAM_FA_MIXED_TYPES
 // FaTypeK / FaTypeV spec constant values. These mirror enum ggml_type so the
 // host can pass the type directly. Keep in sync with ggml.h.
 #define FA_TYPE_F32   0u
@@ -156,6 +157,13 @@ bool fa_type_needs_shmem(uint ty) {
 // through dequantize4 / the MMQ helpers to unpack from the packed block layout.
 #define USE_DECODE_K (FaTypeK != FA_TYPE_F16)
 #define USE_DECODE_V (FaTypeV != FA_TYPE_F16)
+// Vocabulary bridge: the FA shaders (shared with the TBQ compile-time path) use
+// FA_BLOCK_BYTES_K/V; in the b9518 runtime model these are the spec constants.
+#define FA_BLOCK_BYTES_K FaBlockBytesK
+#define FA_BLOCK_BYTES_V FaBlockBytesV
+#else
+#include "turbo-quant/flash_attn_base.glsl"
+#endif
 
 #define CEIL_DIV(a, b) (((a) + (b) - 1) / (b))
 

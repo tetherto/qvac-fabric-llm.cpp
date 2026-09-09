@@ -284,17 +284,36 @@ void main() {
     }
 #endif
 
-    for (uint block = start_k; block < end_k; block += BK) {
-        [[unroll]] for (uint l = 0; l < BM; l += loadstride_a) {
-            load_a_to_shmem(pos_a, loadr_a, loadc_a + l, ir * BM + loadc_a + l, block, end_k);
-        }
-        [[unroll]] for (uint l = 0; l < BN; l += loadstride_b) {
-#if !defined(MUL_MAT_ID)
-            load_b_to_shmem(pos_b, loadr_b, loadc_b + l, ic * BN + loadc_b + l, block, end_k);
+    // Only the last tile in M/N can hang past the end of A/B. Branch each tile load
+    // on its own flag: bounds_check reaches the loaders as a literal, so interior
+    // tiles fold the checks away. Both flags are workgroup-uniform.
+    const bool bounds_check_a = ir * BM + BM > p.M;
+#if defined(MUL_MAT_ID)
+    const bool bounds_check_b = ic * BN + BN > _ne1;
 #else
-            load_b_to_shmem(pos_b, loadr_b, loadc_b + l, ic, _ne1, block, end_k);
+    const bool bounds_check_b = ic * BN + BN > p.N;
 #endif
-        }
+
+#define MM_LOAD_A(bounds_check) \
+    [[unroll]] for (uint l = 0; l < BM; l += loadstride_a) { \
+        load_a_to_shmem(pos_a, loadr_a, loadc_a + l, ir * BM + loadc_a + l, bounds_check, block, end_k); \
+    }
+
+#if defined(MUL_MAT_ID)
+#define MM_LOAD_B(bounds_check) \
+    [[unroll]] for (uint l = 0; l < BN; l += loadstride_b) { \
+        load_b_to_shmem(pos_b, loadr_b, loadc_b + l, ic, _ne1, bounds_check, block, end_k); \
+    }
+#else
+#define MM_LOAD_B(bounds_check) \
+    [[unroll]] for (uint l = 0; l < BN; l += loadstride_b) { \
+        load_b_to_shmem(pos_b, loadr_b, loadc_b + l, ic * BN + loadc_b + l, bounds_check, block, end_k); \
+    }
+#endif
+
+    for (uint block = start_k; block < end_k; block += BK) {
+        if (bounds_check_a) { MM_LOAD_A(true) } else { MM_LOAD_A(false) }
+        if (bounds_check_b) { MM_LOAD_B(true) } else { MM_LOAD_B(false) }
 
         barrier();
 
@@ -353,6 +372,9 @@ void main() {
 
         barrier();
     }
+
+#undef MM_LOAD_A
+#undef MM_LOAD_B
 
 #if defined(ACC_TYPE_MAX)
 #ifdef COOPMAT

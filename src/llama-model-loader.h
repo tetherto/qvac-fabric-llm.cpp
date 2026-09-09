@@ -6,6 +6,7 @@
 #include "llama-arch.h"
 #include "llama-hparams.h"
 #include "llama-mmap.h"
+#include "llama-model-load.h"
 
 #include "ggml-cpp.h"
 
@@ -68,6 +69,7 @@ struct llama_model_loader {
     static const int TENSOR_SKIP            = 1 << 2;
     static const int TENSOR_SKIP_IF_VIRTUAL = 1 << 3;
     static const int TENSOR_ALLOW_RESHAPE   = 1 << 4;
+    static const int TENSOR_READ_LAZY       = 1 << 5; // read rows on demand instead of loading whole tensor; requires mmap for now
 
     int n_kv      = 0;
     int n_tensors = 0;
@@ -80,7 +82,11 @@ struct llama_model_loader {
     bool use_direct_io = false;
     bool check_tensors;
     bool no_alloc;
+    bool check_bounds = true;
     bool load_mtp;
+
+    // set by the caller before the create_tensor() calls
+    enum llama_tensor_read_lazy tensor_read_lazy = LLAMA_TENSOR_READ_LAZY_OFF;
 
     llama_files files;
     llama_ftype ftype;
@@ -88,7 +94,13 @@ struct llama_model_loader {
 
     llama_mmaps mappings;
 
+    // byte ranges of TENSOR_READ_LAZY tensors, per file index
+    std::map<uint32_t, llama_mmap::ranges> lazy_tensor_ranges;
+
     std::map<std::string, llama_tensor_weight, weight_name_comparer> weights_map;
+
+    std::optional<IncrementalSplitsTensorLoad> incremental_splits_tensor_load;
+
     std::unordered_map<std::string, llama_model_kv_override> kv_overrides;
     const llama_model_tensor_buft_override * tensor_buft_overrides;
 
@@ -121,12 +133,13 @@ struct llama_model_loader {
     ggml_backend_buffer_type_t first_moved_from_buft = nullptr;
     ggml_backend_buffer_type_t first_moved_to_buft = nullptr;
 
+    void process_loaded_gguf(struct ggml_context * ctx, gguf_file_load & gguf_load, uint16_t idx);
+
     llama_model_loader(
         struct gguf_context * metadata,
         llama_model_set_tensor_data_t set_tensor_data,
         void * set_tensor_data_ud,
-        const std::string & fname,
-        std::vector<std::string> & splits, // optional, only need if the split does not follow naming scheme
+        load_input_t load_input,
         FILE * file,
         llama_load_mode load_mode,
         bool check_tensors,
@@ -186,7 +199,8 @@ struct llama_model_loader {
 
     struct ggml_tensor * create_tensor(
         const llama_hparams & hparams, const buft_list_t * buft_list_cpu, const buft_list_t * buft_list_input, const buft_list_t * buft_list_output,
-        const buft_list_t * buft_list_layer, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags);
+        const buft_list_t * buft_list_layer, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags,
+        std::optional<uint16_t> split_idx, const std::function<ggml_context *(ggml_backend_buffer_type_t)> & get_ctx_for_split_buft);
 
     void done_getting_tensors(bool partial = false) const;
 
@@ -201,12 +215,8 @@ struct llama_model_loader {
     void load_data_for(struct ggml_tensor * cur) const;
 
     // Returns false if cancelled by progress_callback
-    bool load_all_data(
-            struct ggml_context * ctx,
-            llama_buf_map & bufs,
-            llama_mlocks * lmlocks,
-            llama_progress_callback progress_callback,
-            void * progress_callback_user_data);
+    bool load_all_data(size_t size_data, struct ggml_context * ctx, llama_buf_map & bufs, llama_mlocks * lmlocks,
+                       llama_progress_callback progress_callback, void * progress_callback_user_data);
 
     std::string ftype_name() const;
 

@@ -11,6 +11,7 @@
 
 #include <vector>
 #include <cmath>
+#include <cstdlib>
 #include <limits.h>
 #include <cinttypes>
 #include <clocale>
@@ -91,10 +92,18 @@ int main(int argc, char ** argv) {
         mparams.warmup           = params.warmup;
         mparams.image_min_tokens = params.image_min_tokens;
         mparams.image_max_tokens = params.image_max_tokens;
+        mparams.image_tile_mode  = (int) params.image_tile_mode;
+        mparams.image_max_tiles  = params.image_max_tiles;
+        mparams.image_no_upscale = params.image_no_upscale;
         {
-            // always enable debug callback
-            mparams.cb_eval_user_data = &cb_data;
-            mparams.cb_eval = common_debug_cb_eval;
+            // The per-op eval callback dumps every intermediate tensor, which
+            // dominates wall-clock and ruins encoder timing. Keep it off by
+            // default (clean baseline); set MTMD_DEBUG_CB_EVAL=1 to re-enable.
+            const char * cb_env = std::getenv("MTMD_DEBUG_CB_EVAL");
+            if (cb_env && cb_env[0] == '1') {
+                mparams.cb_eval_user_data = &cb_data;
+                mparams.cb_eval = common_debug_cb_eval;
+            }
         }
         ctx_mtmd.reset(mtmd_init_from_file(clip_path, model, mparams));
         if (!ctx_mtmd.get()) {

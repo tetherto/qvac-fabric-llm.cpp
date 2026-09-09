@@ -68,6 +68,12 @@ struct clip_hparams {
     std::array<uint8_t, 3> image_pad_color = {0, 0, 0};
 
     // (preprocessor) for llava-uhd style models
+    // no_upscale: round the long side up to a whole number of slices and cap it at
+    // image_longest_edge, instead of always stretching it to image_longest_edge. An image
+    // below the cap then keeps its own resolution and becomes fewer slices. This is what
+    // distinguishes the VisionPsy Flash checkpoint from the base one; their mmprojs declare
+    // identical vision hparams, so it cannot be inferred from anything else in the GGUF.
+    bool image_no_upscale = false;
     std::vector<clip_image_size> image_res_candidates;
     int32_t preproc_min_tiles = 0;
     int32_t preproc_max_tiles = 0;
@@ -875,3 +881,4 @@ struct clip_model {
 };
 
 const clip_hparams * clip_get_hparams(const struct clip_ctx * ctx);
+clip_image_tile_mode clip_get_tile_mode(const struct clip_ctx * ctx);

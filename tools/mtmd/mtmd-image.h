@@ -15,6 +15,8 @@ struct mtmd_image_preproc_out {
     clip_image_f32 overview; // overview image (downscaled image)
     int grid_x = 0;
     int grid_y = 0;
+    // when true, entries[0] is an overview thumbnail and entries[1..] are the grid_x*grid_y tiles
+    bool overview_in_entries = false;
 
     void append(const clip_hparams & hparams, const clip_image_u8 & img, bool normalized = true);
     void append(const clip_hparams & hparams, const std::vector<clip_image_u8> & imgs, bool normalized = true);
@@ -123,6 +125,20 @@ struct mtmd_image_preprocessor_dyn_size : mtmd_image_preprocessor {
     mtmd_image_preproc_out preprocess(const clip_image_u8 & img) override;
 };
 
+// Qwen3VL tiling preprocessor: splits image into an NxM grid of equal-size tiles
+// (tile size = hparams.image_size), packed row-major into the batch. Falls back to
+// dyn_size when the image fits in one tile.
+struct mtmd_image_preprocessor_qwen3vl : mtmd_image_preprocessor {
+    int max_tiles;
+
+    mtmd_image_preprocessor_qwen3vl(const clip_ctx * ctx)
+        : mtmd_image_preprocessor(ctx),
+          max_tiles(hparams.preproc_max_tiles > 0 ? hparams.preproc_max_tiles : 4) {
+        GGML_ASSERT(clip_get_tile_mode(ctx) != CLIP_IMAGE_TILE_MODE_DISABLED);
+    }
+    mtmd_image_preproc_out preprocess(const clip_image_u8 & img) override;
+};
+
 // similar to mtmd_image_preprocessor_dyn_size, but resize the image to have longest edge equal to hparams.image_longest_edge, while preserving aspect ratio
 struct mtmd_image_preprocessor_longest_edge : mtmd_image_preprocessor {
     mtmd_image_preprocessor_longest_edge(const clip_ctx * ctx) : mtmd_image_preprocessor(ctx) {}
@@ -158,6 +174,24 @@ private:
     std::vector<clip_image_size> get_target_ratios();
     clip_image_size get_grid_layout(int height, int width);
 };
+
+// What an image becomes under the idefics3-family sizing rule, before any pixel is touched.
+// The slice grid follows from the refined size, so these three travel together.
+struct mtmd_idefics3_sizing {
+    clip_image_size refined_size;
+    clip_image_size grid_size;
+    int n_slices;
+};
+
+// The sizing rule on its own, so it can be checked against the reference processor without a
+// model: `no_upscale` picks the Flash rule (round the long side up to whole slices and cap it)
+// over the base one (always stretch the long side to the cap).
+mtmd_idefics3_sizing mtmd_calc_idefics3_sizing(const clip_image_size & original_size,
+                                               int image_size,
+                                               int image_longest_edge,
+                                               bool no_upscale,
+                                               int min_pixels = 0,
+                                               int max_pixels = 0);
 
 struct mtmd_image_preprocessor_idefics3 : mtmd_image_preprocessor_llava_uhd {
     mtmd_image_preprocessor_idefics3(const clip_ctx * ctx) : mtmd_image_preprocessor_llava_uhd(ctx) {}

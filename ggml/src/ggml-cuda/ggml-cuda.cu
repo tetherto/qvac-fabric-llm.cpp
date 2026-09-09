@@ -1,3 +1,11 @@
+#if defined(__GNUC__) && !defined(__clang__)
+// GCC 11 (Ubuntu 22.04 CI) falsely reports -Wstringop-overflow when inlining the
+// std::vector<ggml_op> initializer-list inserts of the topk-moe path in
+// ggml_cuda_try_fuse; fatal with LLAMA_FATAL_WARNINGS. The warning is attributed
+// to the STL headers, so it must be disabled before they are included.
+#pragma GCC diagnostic ignored "-Wstringop-overflow"
+#endif
+
 #include "ggml-cuda.h"
 #include "ggml-impl.h"
 #include "ggml-backend-impl.h"
@@ -32,6 +40,7 @@
 #include "ggml-cuda/mmq.cuh"
 #include "ggml-cuda/mmvf.cuh"
 #include "ggml-cuda/mmvq.cuh"
+#include "ggml-cuda/mmid-back.cuh"
 #include "ggml-cuda/norm.cuh"
 #include "ggml-cuda/opt-step-adamw.cuh"
 #include "ggml-cuda/opt-step-sgd.cuh"
@@ -58,6 +67,7 @@
 #include "ggml-cuda/wkv.cuh"
 #include "ggml-cuda/gla.cuh"
 #include "ggml-cuda/gated_delta_net.cuh"
+#include "ggml-cuda/gated_delta_net_back.cuh"
 #include "ggml-cuda/dsv4-hc.cuh"
 #include "ggml-cuda/set.cuh"
 #include "ggml-cuda/set-rows.cuh"
@@ -67,6 +77,8 @@
 #include "ggml-cuda/cumsum.cuh"
 #include "ggml-cuda/fill.cuh"
 #include "ggml-cuda/lightning-indexer.cuh"
+#include "ggml-cuda/sigmoid-back.cuh"
+#include "ggml-cuda/ssm-conv-back.cuh"
 #include "ggml.h"
 
 #include <algorithm>
@@ -2064,6 +2076,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_COUNT_EQUAL:
             ggml_cuda_count_equal(ctx, dst);
             break;
+        case GGML_OP_COUNT_EQUAL_MASKED:
+            ggml_cuda_count_equal_masked(ctx, dst);
+            break;
         case GGML_OP_REPEAT:
             ggml_cuda_op_repeat(ctx, dst);
             break;
@@ -2239,17 +2254,30 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_SILU_BACK:
             ggml_cuda_op_silu_back(ctx, dst);
             break;
+        case GGML_OP_GELU_BACK:
+        case GGML_OP_GEGLU_BACK:
+            ggml_cuda_op_gelu_back(ctx, dst);
+            break;
         case GGML_OP_RMS_NORM:
             ggml_cuda_op_rms_norm(ctx, dst);
             break;
         case GGML_OP_RMS_NORM_BACK:
             ggml_cuda_op_rms_norm_back(ctx, dst);
             break;
+        case GGML_OP_L2_NORM_BACK:
+            ggml_cuda_op_l2_norm_back(ctx, dst);
+            break;
         case GGML_OP_MUL_MAT:
             ggml_cuda_mul_mat(ctx, dst->src[0], dst->src[1], dst);
             break;
         case GGML_OP_MUL_MAT_ID:
             ggml_cuda_mul_mat_id(ctx, dst);
+            break;
+        case GGML_OP_MUL_MAT_ID_BACK_A:
+            ggml_cuda_op_mul_mat_id_back_a(ctx, dst);
+            break;
+        case GGML_OP_MUL_MAT_ID_BACK_B:
+            ggml_cuda_op_mul_mat_id_back_b(ctx, dst);
             break;
         case GGML_OP_OUT_PROD:
             ggml_cuda_out_prod(ctx, dst);
@@ -2344,6 +2372,12 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_SSM_SCAN:
             ggml_cuda_op_ssm_scan(ctx, dst);
             break;
+        case GGML_OP_SSM_CONV_BACK_SX:
+            ggml_cuda_op_ssm_conv_back_sx(ctx, dst);
+            break;
+        case GGML_OP_SSM_CONV_BACK_C:
+            ggml_cuda_op_ssm_conv_back_c(ctx, dst);
+            break;
         case GGML_OP_TOP_K:
             ggml_cuda_op_top_k(ctx, dst);
             break;
@@ -2356,6 +2390,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_CROSS_ENTROPY_LOSS:
             ggml_cuda_cross_entropy_loss(ctx, dst);
             break;
+        case GGML_OP_CROSS_ENTROPY_LOSS_MASKED:
+            ggml_cuda_cross_entropy_loss_masked(ctx, dst);
+            break;
         case GGML_OP_TRI:
             ggml_cuda_op_tri(ctx, dst);
             break;
@@ -2367,6 +2404,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             break;
         case GGML_OP_GATED_DELTA_NET:
             ggml_cuda_op_gated_delta_net(ctx, dst);
+            break;
+        case GGML_OP_GATED_DELTA_NET_BACK:
+            ggml_cuda_op_gated_delta_net_back(ctx, dst);
             break;
         case GGML_OP_DSV4_HC_COMB:
             ggml_cuda_op_dsv4_hc_comb(ctx, dst);
@@ -2383,6 +2423,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_CROSS_ENTROPY_LOSS_BACK:
             ggml_cuda_cross_entropy_loss_back(ctx, dst);
             break;
+        case GGML_OP_CROSS_ENTROPY_LOSS_MASKED_BACK:
+            ggml_cuda_cross_entropy_loss_masked_back(ctx, dst);
+            break;
         case GGML_OP_OPT_STEP_ADAMW:
             ggml_cuda_opt_step_adamw(ctx, dst);
             break;
@@ -2397,6 +2440,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             break;
         case GGML_OP_LIGHTNING_INDEXER:
             ggml_cuda_lightning_indexer(ctx, dst);
+            break;
+        case GGML_OP_SIGMOID_BACK:
+            ggml_cuda_op_sigmoid_back(ctx, dst);
             break;
         default:
             return false;
@@ -4840,6 +4886,7 @@ static void ggml_backend_cuda_device_get_props(ggml_backend_dev_t dev, ggml_back
         /* .buffer_from_host_ptr  = */ false,
         /* .events                = */ events,
         /* .mmap_support          = */ props->type != GGML_BACKEND_DEVICE_TYPE_IGPU,
+        /* .copy_stream           = */ events,
     };
 }
 
@@ -4955,6 +5002,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     case GGML_TYPE_MXFP4:
                     case GGML_TYPE_NVFP4:
                     case GGML_TYPE_Q2_K:
+                    case GGML_TYPE_TQ2_0:
                     case GGML_TYPE_Q3_K:
                     case GGML_TYPE_Q4_K:
                     case GGML_TYPE_Q5_K:
@@ -4975,8 +5023,27 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                         return false;
                 }
             } break;
+        case GGML_OP_MUL_MAT_ID_BACK_A:
+            return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
+                   op->src[2]->type == GGML_TYPE_I32 && op->type == GGML_TYPE_F32;
+        case GGML_OP_MUL_MAT_ID_BACK_B:
+            {
+                const ggml_tensor * as = op->src[0];
+                const bool as_ok = as->type == GGML_TYPE_F32 || as->type == GGML_TYPE_Q8_0 ||
+                                   (ggml_is_contiguous(as) && ggml_get_to_fp32_cuda(as->type) != nullptr);
+                return as_ok && op->src[1]->type == GGML_TYPE_F32 && op->src[2]->type == GGML_TYPE_I32 &&
+                       op->type == GGML_TYPE_F32;
+            }
         case GGML_OP_OUT_PROD:
-            return op->type == GGML_TYPE_F32 && op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32;
+            {
+                // ggml_cuda_out_prod dequantizes any non-F32 src to F32 via ggml_get_to_fp32_cuda
+                // before the f32-only cuBLAS GEMM. Only claim support for src types the kernel can
+                // actually handle, otherwise it aborts on e.g. TQ2_0 which has no CUDA dequantizer.
+                auto src_ok = [](const ggml_tensor * src) {
+                    return src->type == GGML_TYPE_F32 || ggml_get_to_fp32_cuda(src->type) != nullptr;
+                };
+                return op->type == GGML_TYPE_F32 && src_ok(op->src[0]) && src_ok(op->src[1]);
+            }
         case GGML_OP_GET_ROWS:
             {
                 switch (op->src[0]->type) {
@@ -4992,6 +5059,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     case GGML_TYPE_Q5_1:
                     case GGML_TYPE_Q8_0:
                     case GGML_TYPE_Q2_K:
+                    case GGML_TYPE_TQ2_0:
                     case GGML_TYPE_Q3_K:
                     case GGML_TYPE_Q4_K:
                     case GGML_TYPE_Q5_K:
@@ -5016,7 +5084,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             } break;
         case GGML_OP_GET_ROWS_BACK:
             {
-                return op->type == GGML_TYPE_F32 && op->src[0]->type == GGML_TYPE_F32 && op->ne[2] == 1 && op->ne[3] == 1;
+                return op->type == GGML_TYPE_F32 && op->src[0]->type == GGML_TYPE_F32 &&
+                       op->src[0]->nb[0] == sizeof(float);
             } break;
         case GGML_OP_SET_ROWS:
             {
@@ -5105,6 +5174,16 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             {
                 return true;
             } break;
+        case GGML_OP_COUNT_EQUAL_MASKED:
+            {
+                // Reject anything the kernel cannot index so it falls back to the CPU
+                // instead of tripping an assert in the launcher.
+                return op->src[0]->type == GGML_TYPE_I32 && op->src[1]->type == GGML_TYPE_I32 &&
+                       op->src[2]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_I64 &&
+                       ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]) &&
+                       ggml_is_contiguous(op->src[2]) &&
+                       (ggml_are_same_shape(op->src[0], op->src[2]) || op->src[2]->ne[1] == op->src[0]->ne[0]);
+            } break;
         case GGML_OP_REPEAT:
             {
                 // the CUDA REPEAT path only implements F32/F16; other types assert at runtime
@@ -5168,6 +5247,10 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_SILU_BACK:
             return ggml_is_contiguous(op->src[0]) && op->src[0]->type == GGML_TYPE_F32;
             break;
+        case GGML_OP_GELU_BACK:
+        case GGML_OP_GEGLU_BACK:
+            return ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]) &&
+                op->src[0]->type == GGML_TYPE_F32 && ggml_are_same_shape(op->src[0], op->src[1]);
         case GGML_OP_NORM:
         case GGML_OP_RMS_NORM:
         case GGML_OP_L2_NORM:
@@ -5175,6 +5258,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_RMS_NORM_BACK:
             return ggml_is_contiguous(op->src[0]);
             break;
+        case GGML_OP_L2_NORM_BACK:
+            return ggml_is_contiguous_rows(op->src[0]) && ggml_is_contiguous_rows(op->src[1]) && ggml_is_contiguous(op);
         case GGML_OP_NONE:
         case GGML_OP_RESHAPE:
         case GGML_OP_VIEW:
@@ -5218,6 +5303,13 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             // assumes d_inner % threads == 0
             return op->src[0]->ne[1] % 128 == 0;
         }
+        case GGML_OP_SSM_CONV_BACK_SX:
+        case GGML_OP_SSM_CONV_BACK_C:
+            return op->type == GGML_TYPE_F32 &&
+                   op->src[0]->type == GGML_TYPE_F32 &&
+                   op->src[1]->type == GGML_TYPE_F32 &&
+                   op->src[0]->nb[0] == ggml_type_size(op->src[0]->type) &&
+                   op->src[1]->nb[0] == ggml_type_size(op->src[1]->type);
         case GGML_OP_CONT:
             return true;
         case GGML_OP_DIAG_MASK_INF:
@@ -5282,6 +5374,36 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
 #else
             return true;
 #endif // GGML_USE_MUSA
+        case GGML_OP_GATED_DELTA_NET_BACK: {
+                //TODO: shares the forward op's MUSA compiler issue, see GGML_OP_GATED_DELTA_NET above
+#ifdef GGML_USE_MUSA
+                return false;
+#else
+                for (int i = 0; i < 7; i++) { // q, k, v, g, beta, state, d
+                    if (op->src[i] == nullptr || op->src[i]->type != GGML_TYPE_F32)
+                        return false;
+                }
+
+                const ggml_tensor * q     = op->src[0];
+                const ggml_tensor * k     = op->src[1];
+                const ggml_tensor * v     = op->src[2];
+                const ggml_tensor * g     = op->src[3];
+                const ggml_tensor * beta  = op->src[4];
+                const ggml_tensor * state = op->src[5];
+                const ggml_tensor * d     = op->src[6];
+                const int64_t S_v = v->ne[0];
+
+                if ((S_v != 16 && S_v != 32 && S_v != 64 && S_v != 128) ||
+                    q->ne[0] != S_v || k->ne[0] != S_v) {
+                    return false;
+                }
+                return op->type == GGML_TYPE_F32 &&
+                       ggml_is_contiguous_rows(q) && ggml_is_contiguous_rows(k) && ggml_is_contiguous_rows(v) &&
+                       ggml_are_same_stride(q, k) && ggml_is_contiguous(state) && ggml_is_contiguous(d) &&
+                       (g->ne[0] == S_v ? ggml_is_contiguous(g) && ggml_is_contiguous(beta)
+                                        : g->ne[0] == 1 && ggml_are_same_stride(g, beta));
+#endif // GGML_USE_MUSA
+        }
         case GGML_OP_DSV4_HC_COMB:
             return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
                 op->src[2]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32;
@@ -5304,9 +5426,28 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_DIAG:
         case GGML_OP_SOLVE_TRI:
             return true;
+        case GGML_OP_CROSS_ENTROPY_LOSS_MASKED:
+            return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
+                   op->src[2]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
+                   ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]) &&
+                   ggml_is_contiguous(op->src[2]);
+        case GGML_OP_CROSS_ENTROPY_LOSS_MASKED_BACK:
+            return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
+                   op->src[2]->type == GGML_TYPE_F32 && op->src[3]->type == GGML_TYPE_F32 &&
+                   op->type == GGML_TYPE_F32 &&
+                   ggml_is_contiguous(op->src[1]) && ggml_is_contiguous(op->src[2]) &&
+                   ggml_is_contiguous(op->src[3]) && ggml_is_contiguous(op);
         case GGML_OP_LIGHTNING_INDEXER:
             return ggml_cuda_lightning_indexer_supported(dev_ctx->device, op);
-
+        case GGML_OP_SIGMOID_BACK:
+            return (op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16) &&
+                    op->src[0] != NULL && op->src[1] != NULL &&
+                   op->src[0]->type == op->type && op->src[1]->type == op->type &&
+                   ggml_is_contiguous(op->src[0]) &&
+                   ggml_is_contiguous(op->src[1]) &&
+                   ggml_is_contiguous(op) &&
+                   ggml_are_same_shape(op, op->src[0]) &&
+                   ggml_are_same_shape(op, op->src[1]);
         default:
             return false;
     }

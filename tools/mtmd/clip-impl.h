@@ -27,6 +27,11 @@
 
 #define MTMD_INTERNAL_HEADER
 
+// Upper bound on preproc_max_tiles, enforced at every site that sets it (GGUF read,
+// CLI/binding override). A larger value would flow into the O(max_tiles·log max_tiles)
+// grid-fitting reserve in mtmd-image.cpp and can request hundreds of GB -> std::bad_alloc.
+constexpr int CLIP_PREPROC_MAX_TILES_LIMIT = 256;
+
 #define KEY_FTYPE               "general.file_type"
 #define KEY_NAME                "general.name"
 #define KEY_DESCRIPTION         "general.description"
@@ -55,6 +60,7 @@
 #define KEY_PREPROC_MIN_TILES       "clip.vision.preproc_min_tiles"
 #define KEY_PREPROC_MAX_TILES       "clip.vision.preproc_max_tiles"
 #define KEY_PREPROC_IMAGE_SIZE      "clip.vision.preproc_image_size"
+#define KEY_PREPROC_NO_UPSCALE      "clip.vision.preproc_no_upscale"
 #define KEY_PATCH_SIZE              "clip.vision.patch_size"
 #define KEY_IMAGE_MEAN              "clip.vision.image_mean"
 #define KEY_IMAGE_STD               "clip.vision.image_std"
@@ -452,6 +458,7 @@ enum projector_type {
     PROJECTOR_TYPE_GEMMA4UA,
     PROJECTOR_TYPE_PHI4,
     PROJECTOR_TYPE_IDEFICS3,
+    PROJECTOR_TYPE_VISIONPSY,
     PROJECTOR_TYPE_PIXTRAL,
     PROJECTOR_TYPE_QWEN25VL,
     PROJECTOR_TYPE_ULTRAVOX,
@@ -515,6 +522,7 @@ static std::map<projector_type, std::string> PROJECTOR_TYPE_NAMES = {
     { PROJECTOR_TYPE_GEMMA4UA,          "gemma4ua"},
     { PROJECTOR_TYPE_PHI4,              "phi4"},
     { PROJECTOR_TYPE_IDEFICS3,          "idefics3"},
+    { PROJECTOR_TYPE_VISIONPSY,         "visionpsy"},
     { PROJECTOR_TYPE_PIXTRAL,           "pixtral"},
     { PROJECTOR_TYPE_ULTRAVOX,          "ultravox"},
     { PROJECTOR_TYPE_INTERNVL,          "internvl"},
@@ -557,10 +565,37 @@ static std::map<projector_type, std::string> PROJECTOR_TYPE_NAMES = {
     { PROJECTOR_TYPE_MUSE_GLIMMER,      "muse-glimmer"},
 };
 
+// Legacy clip.projector_type strings kept loadable. Only for reading: the names in
+// PROJECTOR_TYPE_NAMES stay canonical and are what we write out.
+// Every alias is gated on general.name, because these strings are not vendor-specific:
+// "custom" is what the first published VisionPsy Nano mmproj GGUFs declare, and another
+// model shipping the same string must not be silently loaded as VisionPsy (it would get
+// idefics3 preprocessing and a hard <|global_image|> vocab requirement).
+struct clip_projector_alias {
+    const char *   proj_type;
+    const char *   model_name; // required general.name
+    projector_type type;
+};
+
+static const std::vector<clip_projector_alias> PROJECTOR_TYPE_ALIASES = {
+    { "custom", "VisionPsyNano", PROJECTOR_TYPE_VISIONPSY },
+};
+
 static projector_type clip_projector_type_from_string(const std::string & str) {
     for (const auto & pair : PROJECTOR_TYPE_NAMES) {
         if (pair.second == str) {
             return pair.first;
+        }
+    }
+    return PROJECTOR_TYPE_UNKNOWN;
+}
+
+// Resolve a legacy alias. Returns UNKNOWN unless both the projector string and
+// general.name match, see PROJECTOR_TYPE_ALIASES.
+static projector_type clip_projector_type_from_alias(const std::string & str, const std::string & model_name) {
+    for (const auto & alias : PROJECTOR_TYPE_ALIASES) {
+        if (str == alias.proj_type && model_name == alias.model_name) {
+            return alias.type;
         }
     }
     return PROJECTOR_TYPE_UNKNOWN;
@@ -774,11 +809,19 @@ static void clip_log_callback_default(enum ggml_log_level level, const char * te
 }
 
 struct clip_logger_state {
+    enum ggml_log_level verbosity_thold;
     ggml_log_callback log_callback;
     void * log_callback_user_data;
 };
 
 extern struct clip_logger_state g_logger_state;
+
+// Function to set logging callback (can be used to redirect to llama's logging)
+// If not called, will use the default callback (logs to stderr)
+static inline void clip_log_set_callback(ggml_log_callback callback, void * user_data) {
+    g_logger_state.log_callback = callback;
+    g_logger_state.log_callback_user_data = user_data;
+}
 
 static void clip_log_internal_v(enum ggml_log_level level, const char * format, va_list args) {
     if (format == NULL) {
@@ -821,12 +864,14 @@ static void clip_log_internal(enum ggml_log_level level, const char * format, ..
 struct clip_image_f32_batch {
     std::vector<clip_image_f32> entries;
     bool is_audio = false;
+    int grid_x = 0;
+    int grid_y = 0;
 
     clip_image_f32_batch clone() const {
-        clip_image_f32_batch new_batch{
-            /* entries  */ {},
-            /* is_audio */ is_audio,
-        };
+        clip_image_f32_batch new_batch;
+        new_batch.is_audio     = is_audio;
+        new_batch.grid_x       = grid_x;
+        new_batch.grid_y       = grid_y;
         new_batch.entries.reserve(entries.size());
         for (const auto & entry : entries) {
             new_batch.entries.emplace_back(entry); // copy
@@ -868,12 +913,24 @@ static std::string string_format(const char * fmt, ...) {
     va_copy(ap2, ap);
     int size = vsnprintf(NULL, 0, fmt, ap);
     GGML_ASSERT(size >= 0 && size < INT_MAX); // NOLINT
-    std::vector<char> buf(size + 1);
-    int size2 = vsnprintf(buf.data(), size + 1, fmt, ap2);
+    if (size == 0) {
+        va_end(ap2);
+        va_end(ap);
+        return std::string();
+    }
+    // Formatted straight into the result, sized to the formatted length, so the terminating NUL
+    // vsnprintf writes lands on the byte past the end that std::string already reserves for it
+    // and never becomes part of the string. Returning std::string(buf.data(), size) over a
+    // std::vector<char> did the same thing correctly, but it let GCC duplicate the size == 0
+    // path, where the buffer is one byte, and then report -Wformat-truncation against it for
+    // every caller with a long literal in its format string. The early return above and the
+    // unknown extent of a std::string buffer both remove that.
+    std::string out((size_t) size, '\0');
+    int size2 = vsnprintf(out.data(), (size_t) size + 1, fmt, ap2);
     GGML_ASSERT(size2 == size);
     va_end(ap2);
     va_end(ap);
-    return std::string(buf.data(), buf.size());
+    return out;
 }
 
 static void string_replace_all(std::string & s, const std::string & search, const std::string & replace) {

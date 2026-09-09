@@ -18,6 +18,7 @@
 #define CUDA_COS_BLOCK_SIZE 256
 #define CUDA_GLU_BLOCK_SIZE 256
 #define CUDA_XIELU_BLOCK_SIZE 256
+#define CUDA_GELU_BACK_BLOCK_SIZE 256
 
 void ggml_cuda_op_abs(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 
@@ -32,6 +33,8 @@ void ggml_cuda_op_gelu(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 void ggml_cuda_op_silu(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 
 void ggml_cuda_op_silu_back(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+
+void ggml_cuda_op_gelu_back(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 
 void ggml_cuda_op_gelu_erf(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 

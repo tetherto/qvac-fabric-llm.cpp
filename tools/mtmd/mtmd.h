@@ -22,6 +22,15 @@
  * WARNING: This API is experimental and subject to many BREAKING CHANGES.
  *          Issues related to API usage may receive lower priority support.
  *
+ * WARNING: consumers MUST be rebuilt against these headers on every libmtmd update.
+ *          mtmd_context_params is passed and returned BY VALUE, and fields get appended to
+ *          it, so its size changes without a SOVERSION bump (SOVERSION stays 0 in
+ *          tools/mtmd/CMakeLists.txt). Linking a binary compiled against an older layout
+ *          against a newer libmtmd lets mtmd_context_params_default() write past the
+ *          caller's struct and mtmd_init_from_file() read uninitialized bytes past it.
+ *          Build from source against a pinned commit; do not treat libmtmd as a stable
+ *          drop-in shared object.
+ *
  * For the usage, see an example in mtmd-cli.cpp
  *
  * For contributors:
@@ -115,6 +124,27 @@ struct mtmd_context_params {
     // If it returns false, model loading is immediately aborted.
     mtmd_progress_callback progress_callback;
     void * progress_callback_user_data;
+    const char * backend_device; // optional GPU backend name (e.g. "CUDA", "Metal", "Vulkan"), if null will use env var or default
+
+    // tile encoding mode for multi-tile vision models (Qwen3VL): 0=batched, 1=sequential (default), 2=disabled.
+    // WARNING: the DEFAULT is sequential, but the ZERO value is 0=batched — so a zero-initialized
+    // params struct ({}, memset, calloc) selects BATCHED (the ne[3] one-pass path not yet verified on
+    // all backends), NOT the default. Always initialize via mtmd_context_params_default() (which sets
+    // sequential) or set image_tile_mode explicitly. Values are fixed API (consumers pass "0"/"1"/"2").
+    int image_tile_mode;
+
+    // override preproc_max_tiles from GGUF; -1 or 0 = use model default (4 for Qwen3VL 2B/4B).
+    // Only a positive value is treated as an explicit override, so a zero-initialized struct
+    // keeps the model default instead of forcing single-tile.
+    // needed for 8B+ models whose GGUFs may lack the clip.vision.preproc_max_tiles key
+    int image_max_tiles;
+
+    // override clip.vision.preproc_no_upscale for idefics3-style preprocessing:
+    // -1 = use the GGUF/model default, 0 = force off, 1 = force on.
+    // On: the long side is rounded up to a whole number of slices and capped, rather
+    // than always stretched to the cap. Changes the number of output tokens, so a
+    // checkpoint whose GGUF omits the key needs this set to preprocess correctly.
+    int image_no_upscale;
 };
 
 MTMD_API const char * mtmd_default_marker(void);
@@ -128,6 +158,14 @@ MTMD_API mtmd_context * mtmd_init_from_file(const char * mmproj_fname,
                                             const struct mtmd_context_params ctx_params);
 
 MTMD_API void mtmd_free(mtmd_context * ctx);
+
+// Set up logging to use llama's logging callback
+// This redirects all mtmd/clip logging through llama's logging system
+// Call this after llama_log_set to ensure mtmd uses the same logging callback
+// Example:
+//   llama_log_set(my_log_callback, my_user_data);
+//   mtmd_log_set_llama_callback(my_log_callback, my_user_data);
+MTMD_API void mtmd_log_set_llama_callback(ggml_log_callback llama_cb, void * llama_user_data);
 
 // whether we need to set non-causal mask before llama_decode
 // if chunk is nullptr, we assume the default case where chunk is an image chunk

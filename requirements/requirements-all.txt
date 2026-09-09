@@ -16,3 +16,5 @@
 -r ./requirements-gguf_editor_gui.txt
 
 -r ../examples/model-conversion/requirements.txt
+
+-r ../scripts/requirements.txt

@@ -8,8 +8,10 @@
 #import "ggml-metal-ops.h"
 
 #import <Foundation/Foundation.h>
+#import <TargetConditionals.h>
 
 #import <Metal/Metal.h>
+#include <stdio.h>
 
 #undef MIN
 #undef MAX
@@ -135,6 +137,12 @@ ggml_metal_t ggml_metal_init(ggml_metal_device_t dev) {
 
     res->use_fusion      = getenv("GGML_METAL_FUSION_DISABLE") == nil;
     res->use_concurrency = getenv("GGML_METAL_CONCURRENCY_DISABLE") == nil;
+
+#if TARGET_OS_IPHONE
+    if (getenv("GGML_METAL_CONCURRENCY_DISABLE") == nil) {
+        res->use_concurrency = false;
+    }
+#endif
 
     {
         const char * val = getenv("GGML_METAL_GRAPH_DEBUG");
@@ -351,12 +359,16 @@ void ggml_metal_set_tensor_async(ggml_metal_t ctx, struct ggml_tensor * tensor, 
 void ggml_metal_get_tensor_async(ggml_metal_t ctx, const struct ggml_tensor * tensor, void * data, size_t offset, size_t size) {
     @autoreleasepool {
         id<MTLDevice> device = ggml_metal_device_get_obj(ctx->dev);
+
+        // Prefer no-copy wrapping of the destination host buffer (zero-copy DMA into caller memory).
+        // newBufferWithBytesNoCopy requires the pointer and length to be page-aligned; on
+        // paravirtualized GPUs (e.g. GitHub Actions macos runners) and for arbitrary
+        // caller-provided buffers this often isn't the case, in which case the call returns nil.
+        // Fall back to a temporary device-allocated buffer + blocking memcpy when that happens.
         id<MTLBuffer> buf_dst = [device newBufferWithBytesNoCopy:data
                                                           length:size
                                                          options:MTLResourceStorageModeShared
                                                      deallocator:nil];
-
-        GGML_ASSERT(buf_dst);
 
         struct ggml_metal_buffer_id bid_src = ggml_metal_get_buffer_id(tensor);
         if (bid_src.metal == nil) {
@@ -365,30 +377,43 @@ void ggml_metal_get_tensor_async(ggml_metal_t ctx, const struct ggml_tensor * te
 
         bid_src.offs += offset;
 
-        // queue the copy operation into the queue of the Metal context
-        // this will be queued at the end, after any currently ongoing GPU operations
         id<MTLCommandQueue> queue = ggml_metal_device_get_queue(ctx->dev);
         id<MTLCommandBuffer> cmd_buf = [queue commandBuffer];
         id<MTLBlitCommandEncoder> encoder = [cmd_buf blitCommandEncoder];
 
-        [encoder copyFromBuffer:bid_src.metal
-                   sourceOffset:bid_src.offs
-                       toBuffer:buf_dst
-              destinationOffset:0
-                           size:size];
+        if (buf_dst != nil) {
+            [encoder copyFromBuffer:bid_src.metal
+                       sourceOffset:bid_src.offs
+                           toBuffer:buf_dst
+                  destinationOffset:0
+                               size:size];
 
-        [encoder endEncoding];
-        [cmd_buf commit];
-        [buf_dst release];
+            [encoder endEncoding];
+            [cmd_buf commit];
+            [buf_dst release];
 
-        // do not wait here for completion
-        //[cmd_buf waitUntilCompleted];
+            // do not wait here for completion - remember the command buffer for later
+            [ctx->cmd_bufs_ext addObject:cmd_buf];
+            ctx->cmd_buf_last = cmd_buf;
 
-        // instead, remember a reference to the command buffer and wait for it later if needed
-        [ctx->cmd_bufs_ext addObject:cmd_buf];
-        ctx->cmd_buf_last = cmd_buf;
+            [cmd_buf retain];
+        } else {
+            id<MTLBuffer> buf_tmp = [device newBufferWithLength:size options:MTLResourceStorageModeShared];
+            GGML_ASSERT(buf_tmp);
 
-        [cmd_buf retain];
+            [encoder copyFromBuffer:bid_src.metal
+                       sourceOffset:bid_src.offs
+                           toBuffer:buf_tmp
+                  destinationOffset:0
+                               size:size];
+
+            [encoder endEncoding];
+            [cmd_buf commit];
+            [cmd_buf waitUntilCompleted];
+
+            memcpy(data, [buf_tmp contents], size);
+            [buf_tmp release];
+        }
     }
 }
 
@@ -674,6 +699,7 @@ void ggml_metal_set_n_cb(ggml_metal_t ctx, int n_cb) {
     }
 
     ctx->encode_async = Block_copy(^(size_t iter) {
+      @autoreleasepool {
         const int cb_idx = iter;
         const int n_cb_l = ctx->n_cb;
 
@@ -718,6 +744,7 @@ void ggml_metal_set_n_cb(ggml_metal_t ctx, int n_cb) {
         if (cb_idx < 2 || ctx->abort_callback == NULL) {
             [cmd_buf commit];
         }
+      } // @autoreleasepool
     });
 }
 

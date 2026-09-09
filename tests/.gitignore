@@ -1,6 +1,11 @@
 *
 !*.*
 !snapshots/
+!turbovec-golden-gen/
+!turbovec-golden-gen/Cargo.toml
+!turbovec-golden-gen/src/
+!turbovec-golden-gen/src/main.rs
+turbovec-golden-gen/*.tmp.tv
 *.o
 ggml-common.h
 **/*.swp

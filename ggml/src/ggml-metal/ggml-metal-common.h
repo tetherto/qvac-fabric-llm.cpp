@@ -3,6 +3,7 @@
 #pragma once
 
 #include <stdbool.h>
+#include <stdint.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -46,6 +47,14 @@ bool ggml_mem_ranges_check(ggml_mem_ranges_t mrs, const struct ggml_tensor * ten
 // note: this implementation is generic and not specific to metal
 //       if it proves to work well, we can start using it for other backends in the future
 void ggml_graph_optimize(struct ggml_cgraph * gf);
+
+// match gated_delta_net + the strided cpy that scatters state snapshots into the cache.
+// returns extra graph nodes after the gdn (0 if no match). cache/slot_stride may be NULL.
+int ggml_metal_try_gdn_cache_fusion(
+        const struct ggml_cgraph * gf,
+        int node_idx,
+        const struct ggml_tensor ** cache,
+        int64_t * slot_stride);
 
 #ifdef __cplusplus
 }

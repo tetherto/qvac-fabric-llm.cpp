@@ -1,0 +1,37 @@
+#version 450
+
+#include "generic_head.glsl"
+#include "types.glsl"
+
+#extension GL_EXT_control_flow_attributes : enable
+
+layout(local_size_x = 512, local_size_y = 1, local_size_z = 1) in;
+
+layout (binding = 0) readonly buffer GRAD {A_TYPE data_grad[];};
+layout (binding = 1) readonly buffer GATE {B_TYPE data_gate[];};
+layout (binding = 2) writeonly buffer D {D_TYPE data_d[];};
+
+float gelu_backward(float gate, float grad) {
+    const float c = 0.797884560802865; // sqrt(2/pi)
+    const float a = 0.044715;
+    const float x_squared = gate * gate;
+    const float x_cubed = x_squared * gate;
+    const float inner = c * (gate + a * x_cubed);
+    const float tanh_val = tanh(inner);
+    const float sech2_val = 1.0 - tanh_val * tanh_val;
+    const float dtanh_dx = c * (1.0 + 3.0 * a * x_squared) * sech2_val;
+    return grad * 0.5 * (1.0 + tanh_val + gate * dtanh_dx);
+}
+
+void main() {
+    const uint i = gl_GlobalInvocationID.z * 262144 + gl_GlobalInvocationID.y * 512 + gl_GlobalInvocationID.x;
+
+    if (i >= p.KX) {
+        return;
+    }
+
+    const float grad_val = float(data_grad[i]);
+    const float gate_val = float(data_gate[i]);
+
+    data_d[i] = D_TYPE(gelu_backward(gate_val, grad_val));
+}

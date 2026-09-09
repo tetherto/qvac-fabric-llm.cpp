@@ -1,0 +1,72 @@
+#version 450
+
+#include "types.glsl"
+#include "generic_binary_head.glsl"
+#include "dequant_funcs.glsl"
+
+#define TILE 32
+
+layout(local_size_x = TILE, local_size_y = TILE, local_size_z = 1) in;
+
+#define B(i0,i1,i2,i3) data_b[boffset + src1_idx(i0, i1, i2, i3)]
+#define D(i0,i1,i2,i3) data_d[doffset + dst_idx(i0, i1, i2, i3)]
+
+shared FLOAT_TYPE Asub[TILE][TILE];
+shared FLOAT_TYPE Bsub[TILE][TILE];
+
+void main()
+{
+    const uint col = gl_GlobalInvocationID.x;
+    const uint row = gl_GlobalInvocationID.y;
+    const uint rest = gl_GlobalInvocationID.z;
+    const uint K = p.ne01;
+    const uint M = p.ne00;
+    const uint N = p.ne10;
+    const uint broadcast2 = uint(p.param2);
+    const uint broadcast3 = p.param3;
+    const uint i2 = rest % p.ne22;
+    const uint i3 = rest / p.ne22;
+    const uint i2b = i2 / broadcast2;
+    const uint i3b = i3 / broadcast3;
+    const uint aoffset = get_aoffset();
+    const uint boffset = get_boffset();
+    const uint doffset = get_doffset();
+    FLOAT_TYPE acc = 0.0;
+
+    for (uint t = 0; t < (K + TILE - 1) / TILE; ++t)
+    {
+        uint a_k = t * TILE + gl_LocalInvocationID.y;
+        uint b_k = t * TILE + gl_LocalInvocationID.x;
+
+        // Q8_0 block: [ d | f0 f1 f2 ... ]
+        // Note that p.nb00, p.nb01 ... are in units of blocks not bytes
+        if (col < M && a_k < K) {
+            const uint a_block_base = aoffset + i3b * p.nb03 + i2b * p.nb02 + a_k * p.nb01;
+            const uint ib = a_block_base + (col / QUANT_K);
+            const uint iqs = (col % QUANT_K) / QUANT_R;
+            const vec2 v = dequantize(ib, iqs, 0);
+            const vec2 dm = get_dm(ib, 0);
+            const FLOAT_TYPE a_val = (v * dm.x + dm.y)[col % QUANT_R];
+            Asub[gl_LocalInvocationID.y][gl_LocalInvocationID.x] = a_val;
+        } else {
+            Asub[gl_LocalInvocationID.y][gl_LocalInvocationID.x] = 0.0;
+        }
+
+        Bsub[gl_LocalInvocationID.x][gl_LocalInvocationID.y] =
+            (row < N && b_k < K) ? B(row, b_k, i2, i3) : 0.0;
+
+        memoryBarrierShared();
+        barrier();
+
+        for (uint k = 0; k < TILE; ++k) {
+            acc += Asub[k][gl_LocalInvocationID.x] *
+                   Bsub[k][gl_LocalInvocationID.y];
+        }
+
+        barrier();
+    }
+
+    if (row < N && col < M) {
+        D(col, row, i2, i3) = acc;
+    }
+}

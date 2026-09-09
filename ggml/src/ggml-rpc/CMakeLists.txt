@@ -6,7 +6,7 @@ ggml_add_backend_library(ggml-rpc
                         )
 
 if (WIN32)
-    target_link_libraries(ggml-rpc PRIVATE ws2_32)
+    target_link_libraries(ggml-rpc PRIVATE bcrypt ws2_32)
 endif()
 
 # RDMA auto-detection (Linux only, requires libibverbs)

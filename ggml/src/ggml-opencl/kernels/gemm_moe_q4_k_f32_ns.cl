@@ -10,19 +10,20 @@
 #define QK_K 256
 #define K_SCALE_SIZE 12
 
-inline void get_scale_min_k4(
-    int j,
-    global const uchar * q,
-    uchar * d,
-    uchar * m
-) {
+// Returns the 6-bit sub-block scale in bits 0-7 and the min in bits 8-15.
+// Writing the results through pointers to private scalars is miscompiled by the
+// Adreno E031.47 shader compiler, which yields corrupted scales, so this stays
+// pointer-free and scalar.
+inline uint get_scale_min_k4_packed(int j, global const uchar * q) {
+    uint d, m;
     if (j < 4) {
-        *d = q[j]   & 63;
-        *m = q[j+4] & 63;
+        d = q[j]   & 63u;
+        m = q[j+4] & 63u;
     } else {
-        *d = (q[j+4] & 0x0F) | ((q[j-4] & 0xC0) >> 2);
-        *m = ((q[j+4] >> 4) & 0x0F) | ((q[j]   & 0xC0) >> 2);
+        d = (q[j+4] & 0x0Fu) | ((q[j-4] & 0xC0u) >> 2);
+        m = ((q[j+4] >> 4) & 0x0Fu) | ((q[j] & 0xC0u) >> 2);
     }
+    return d | (m << 8);
 }
 
 #define dequantize_q4_k(q4, a_f16, scale, minv) \
@@ -232,11 +233,10 @@ kernel void kernel_gemm_moe_q4_k_f32_ns(
 
         // Load sub-block scale and min
         global const uchar * sc = src0_s + (expert_id * ne01 + row_idx) * scales_per_row + sb * K_SCALE_SIZE;
-        uchar sv, mn;
-        get_scale_min_k4(j, sc, &sv, &mn);
+        uint sm = get_scale_min_k4_packed(j, sc);
 
-        float scale = (float)d_val * (float)sv;
-        float minv = (float)dm_val * (float)mn;
+        float scale = (float)d_val * (float)(sm & 0xFFu);
+        float minv = (float)dm_val * (float)(sm >> 8);
 
         // First sub-block (16 elements)
         uint q_sub_offset = row + ((ne01 * step) >> 3) + ((expert_id * ne00 * ne01) >> 3);
@@ -290,59 +290,66 @@ kernel void kernel_gemm_moe_q4_k_f32_ns(
         if (!skip_g3) { dotx8_reduce4(reg_a, shared_b, reg_c.hi.hi, 24); }
     }
 
-    if ((get_global_id(0) + block_id_m * TILESIZE_M) >= ne01) {
-        return;
-    }
-
     // Load post router and share in LM
     __local uint out_idx[TILESIZE_N];
 
     if (get_local_id(0) < TILESIZE_N) {
         uint idx = src2[block_id_n * TILESIZE_N + get_local_id(0)];
-        if (idx == 0xFFFFFFFF) {
-            idx = src2[block_id_n * TILESIZE_N + 0];
-        }
-        out_idx[get_local_id(0)] = idx * ne01;
+        // Padding slots keep the sentinel so their store can be skipped below.
+        // ne01 is a multiple of 32 here, so a real idx * ne01 is even and can
+        // never collide with the odd sentinel value.
+        out_idx[get_local_id(0)] = (idx == 0xFFFFFFFFu) ? 0xFFFFFFFFu : idx * ne01;
     }
 
     barrier(CLK_LOCAL_MEM_FENCE);
 
+    // Tail rows have to reach the barrier above before dropping out: the global
+    // size along dim 0 is rounded up to TILESIZE_M.
+    if ((get_global_id(0) + block_id_m * TILESIZE_M) >= ne01) {
+        return;
+    }
+
     // Scatter results back to original position in output grid
     uint m_offset = row + get_local_id(0);
 
-    write_imagef(dst, out_idx[1] + m_offset, (reg_c.s1));
-    write_imagef(dst, out_idx[2] + m_offset, (reg_c.s2));
-    write_imagef(dst, out_idx[3] + m_offset, (reg_c.s3));
-    write_imagef(dst, out_idx[4] + m_offset, (reg_c.s4));
-    write_imagef(dst, out_idx[5] + m_offset, (reg_c.s5));
-    write_imagef(dst, out_idx[6] + m_offset, (reg_c.s6));
-    write_imagef(dst, out_idx[7] + m_offset, (reg_c.s7));
-    write_imagef(dst, out_idx[8] + m_offset, (reg_c.s8));
-    write_imagef(dst, out_idx[9] + m_offset, (reg_c.s9));
-    write_imagef(dst, out_idx[10] + m_offset, (reg_c.sa));
-    write_imagef(dst, out_idx[11] + m_offset, (reg_c.sb));
-    write_imagef(dst, out_idx[12] + m_offset, (reg_c.sc));
-    write_imagef(dst, out_idx[13] + m_offset, (reg_c.sd));
-    write_imagef(dst, out_idx[14] + m_offset, (reg_c.se));
-    write_imagef(dst, out_idx[15] + m_offset, (reg_c.sf));
-    write_imagef(dst, out_idx[16] + m_offset, (reg_c.sg));
-    write_imagef(dst, out_idx[17] + m_offset, (reg_c.sh));
-    write_imagef(dst, out_idx[18] + m_offset, (reg_c.si));
-    write_imagef(dst, out_idx[19] + m_offset, (reg_c.sj));
-    write_imagef(dst, out_idx[20] + m_offset, (reg_c.sk));
-    write_imagef(dst, out_idx[21] + m_offset, (reg_c.sl));
-    write_imagef(dst, out_idx[22] + m_offset, (reg_c.sm));
-    write_imagef(dst, out_idx[23] + m_offset, (reg_c.sn));
-    write_imagef(dst, out_idx[24] + m_offset, (reg_c.so));
-    write_imagef(dst, out_idx[25] + m_offset, (reg_c.sp));
-    write_imagef(dst, out_idx[26] + m_offset, (reg_c.sq));
-    write_imagef(dst, out_idx[27] + m_offset, (reg_c.sr));
-    write_imagef(dst, out_idx[28] + m_offset, (reg_c.ss));
-    write_imagef(dst, out_idx[29] + m_offset, (reg_c.st));
-    write_imagef(dst, out_idx[30] + m_offset, (reg_c.su));
-    write_imagef(dst, out_idx[31] + m_offset, (reg_c.sv));
+    // Skipping padding slots keeps every store to a distinct address. Aliasing
+    // them onto column 0 and overwriting it last would need CLK_IMAGE_MEM_FENCE
+    // to order image stores, which CLK_GLOBAL_MEM_FENCE does not provide.
+#define MOE_STORE_C(t, v) \
+    if (out_idx[t] != 0xFFFFFFFFu) { write_imagef(dst, out_idx[t] + m_offset, (v)); }
 
-    // Store zero padding parts to the index of first output in tile
-    barrier(CLK_GLOBAL_MEM_FENCE);
-    write_imagef(dst, out_idx[0] + m_offset, (reg_c.s0));
+    MOE_STORE_C(0,  reg_c.s0);
+    MOE_STORE_C(1,  reg_c.s1);
+    MOE_STORE_C(2,  reg_c.s2);
+    MOE_STORE_C(3,  reg_c.s3);
+    MOE_STORE_C(4,  reg_c.s4);
+    MOE_STORE_C(5,  reg_c.s5);
+    MOE_STORE_C(6,  reg_c.s6);
+    MOE_STORE_C(7,  reg_c.s7);
+    MOE_STORE_C(8,  reg_c.s8);
+    MOE_STORE_C(9,  reg_c.s9);
+    MOE_STORE_C(10, reg_c.sa);
+    MOE_STORE_C(11, reg_c.sb);
+    MOE_STORE_C(12, reg_c.sc);
+    MOE_STORE_C(13, reg_c.sd);
+    MOE_STORE_C(14, reg_c.se);
+    MOE_STORE_C(15, reg_c.sf);
+    MOE_STORE_C(16, reg_c.sg);
+    MOE_STORE_C(17, reg_c.sh);
+    MOE_STORE_C(18, reg_c.si);
+    MOE_STORE_C(19, reg_c.sj);
+    MOE_STORE_C(20, reg_c.sk);
+    MOE_STORE_C(21, reg_c.sl);
+    MOE_STORE_C(22, reg_c.sm);
+    MOE_STORE_C(23, reg_c.sn);
+    MOE_STORE_C(24, reg_c.so);
+    MOE_STORE_C(25, reg_c.sp);
+    MOE_STORE_C(26, reg_c.sq);
+    MOE_STORE_C(27, reg_c.sr);
+    MOE_STORE_C(28, reg_c.ss);
+    MOE_STORE_C(29, reg_c.st);
+    MOE_STORE_C(30, reg_c.su);
+    MOE_STORE_C(31, reg_c.sv);
+
+#undef MOE_STORE_C
 }

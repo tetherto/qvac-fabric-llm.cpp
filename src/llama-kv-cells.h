@@ -3,17 +3,23 @@
 #include "llama.h"
 #include "llama-cparams.h"
 
+#include <array>
 #include <bitset>
 #include <cassert>
 #include <cstring>
 #include <map>
 #include <set>
+#include <type_traits>
 #include <vector>
 
 struct llama_kv_cell_ext {
     // 2D spatial positions, typically used for M-RoPE
     llama_pos x = 0;
     llama_pos y = 0;
+
+    // when tok = LLAMA_TOKEN_NULL when the cell is produced by embedding input (i.e. multimodal)
+    // use case: n-gram embeddings hash
+    llama_token tok = LLAMA_TOKEN_NULL;
 
     // return true if the current 2D spatial position is greater than other
     bool is_2d_gt(llama_pos ox, llama_pos oy) const {
@@ -23,7 +29,34 @@ struct llama_kv_cell_ext {
     void reset() {
         static_assert(std::is_trivially_copyable_v<llama_kv_cell_ext>);
 
-        memset(this, 0, sizeof(*this));
+        *this = llama_kv_cell_ext{};
+    }
+};
+
+struct llama_kv_cell_shift {
+    std::array<llama_pos, 4> v = {}; // [t, y, x, other]
+
+    llama_pos & t()     { return v[0]; }
+    llama_pos & y()     { return v[1]; }
+    llama_pos & x()     { return v[2]; }
+    llama_pos & other() { return v[3]; }
+
+    llama_pos t()     const { return v[0]; }
+    llama_pos y()     const { return v[1]; }
+    llama_pos x()     const { return v[2]; }
+    llama_pos other() const { return v[3]; }
+
+    llama_pos axis(uint32_t dim) const {
+        assert(dim < v.size());
+        return v[dim];
+    }
+
+    bool is_zero() const {
+        return v == std::array<llama_pos, 4>{};
+    }
+
+    void reset() {
+        v = {};
     }
 };
 
@@ -35,7 +68,7 @@ public:
         for (uint32_t i = 0; i < pos.size(); ++i) {
             pos[i]   = -1;
             ext[i].reset();
-            shift[i] =  0;
+            shift[i].reset();
             seq[i].reset();
         }
 
@@ -52,7 +85,7 @@ public:
         has_shift = false;
 
         for (uint32_t i = 0; i < shift.size(); ++i) {
-            shift[i] = 0;
+            shift[i].reset();
         }
     }
 
@@ -131,7 +164,7 @@ public:
             res.ext[j] = ext[idx];
             res.seq[j] = seq[idx];
 
-            assert(shift[idx] == 0);
+            assert(shift[idx].is_zero());
         }
 
         return res;
@@ -150,7 +183,7 @@ public:
             res.ext[j] = ext[idx];
             res.seq[j] = seq[idx];
 
-            assert(shift[idx] == 0);
+            assert(shift[idx].is_zero());
         }
 
         return res;
@@ -183,7 +216,7 @@ public:
                 seq_pos_add(i + j);
             }
 
-            assert(shift[idx] == 0);
+            assert(shift[idx].is_zero());
         }
     }
 
@@ -214,7 +247,7 @@ public:
                 seq_pos_add(idx);
             }
 
-            assert(shift[idx] == 0);
+            assert(shift[idx].is_zero());
         }
     }
 
@@ -228,7 +261,7 @@ public:
 
         pos[i] = -1;
         ext[i].reset();
-        shift[i] = 0;
+        shift[i].reset();
 
         used.erase(i);
     }
@@ -247,7 +280,7 @@ public:
         if (seq[i].none()) {
             pos[i] = -1;
             ext[i].reset();
-            shift[i] = 0;
+            shift[i].reset();
 
             used.erase(i);
 
@@ -277,7 +310,7 @@ public:
 
             pos[i] = -1;
             ext[i].reset();
-            shift[i] = 0;
+            shift[i].reset();
 
             used.erase(i);
 
@@ -303,6 +336,46 @@ public:
         assert(seq_id >= 0);
 
         return seq[i].test(seq_id);
+    }
+
+    // gather the token ids of the cells in `seqs` with position in [p0, p1)
+    // the callback receives (seq_id, pos, token) for every such (cell, seq) pair
+    // note: used by n-gram input embeddings to recover the tokens preceding a ubatch
+    template<typename F>
+    void for_each_token_in(const std::bitset<LLAMA_MAX_SEQ> & seqs, llama_pos p0, llama_pos p1, F && f) const {
+        for (const auto & i : used) {
+            if (pos[i] < p0 || pos[i] >= p1) {
+                continue;
+            }
+
+            const auto m = seq[i] & seqs;
+
+            // a cell carries a handful of sequences at most, out of LLAMA_MAX_SEQ
+            size_t left = m.count();
+
+            for (llama_seq_id s = 0; left > 0 && s < (llama_seq_id) LLAMA_MAX_SEQ; ++s) {
+                if (m.test(s)) {
+                    f(s, pos[i], ext[i].tok);
+                    --left;
+                }
+            }
+        }
+    }
+
+    // number of cache cells that contain seq_id.
+    // seq_id < 0 counts all non-empty cells.
+    uint32_t seq_token_count(llama_seq_id seq_id) const {
+        if (seq_id < 0) {
+            return get_used();
+        }
+
+        uint32_t result = 0;
+        for (const uint32_t i : used) {
+            if (seq[i].test(seq_id)) {
+                ++result;
+            }
+        }
+        return result;
     }
 
     // note: call only if the cell is not empty and the seq_id is not in the cell
@@ -379,6 +452,20 @@ public:
         assert(i < pos.size());
         assert(pos[i] != -1);
 
+        return shift[i].t();
+    }
+
+    llama_pos get_shift(uint32_t i, uint32_t dim) const {
+        assert(i < pos.size());
+        assert(pos[i] != -1);
+
+        return shift[i].axis(dim);
+    }
+
+    const llama_kv_cell_shift & get_shift_ext(uint32_t i) const {
+        assert(i < pos.size());
+        assert(pos[i] != -1);
+
         return shift[i];
     }
 
@@ -408,23 +495,44 @@ public:
     }
 
     // pos[i] = pos[i] + d
+    // for decoder M-RoPE/iM-RoPE, ext holds the active spatial axes and the 4th axis is unused
     // sets "has_shift" to true
     // note: call only if the cell is not empty
-    bool pos_add(uint32_t i, llama_pos d) {
+    bool pos_add(uint32_t i, llama_pos d, bool shift_ext = false) {
+        llama_kv_cell_shift delta;
+        delta.t() = d;
+
+        if (shift_ext) {
+            // Move the shared M-RoPE origin while preserving relative image-grid offsets.
+            delta.y() = d;
+            delta.x() = d;
+        }
+
+        return pos_shift(i, delta);
+    }
+
+    bool pos_shift(uint32_t i, const llama_kv_cell_shift & d) {
         assert(i < pos.size());
         assert(pos[i] != -1);
 
         seq_pos_rm(i);
 
-        pos[i]   += d;
-        shift[i] += d;
+        pos[i]     += d.t();
+        ext[i].y   += d.y();
+        ext[i].x   += d.x();
+
+        shift[i].t()     += d.t();
+        shift[i].y()     += d.y();
+        shift[i].x()     += d.x();
+        shift[i].other() += d.other();
 
         has_shift = true;
 
         if (pos[i] < 0) {
             seq[i].reset();
             pos[i] = -1;
-            shift[i] = 0;
+            ext[i].reset();
+            shift[i].reset();
 
             used.erase(i);
 
@@ -439,16 +547,17 @@ public:
     // pos[i] = pos[i] / d
     // sets "has_shift" to true
     // note: call only if the cell is not empty
-    void pos_div(uint32_t i, int d) {
+    void pos_div(uint32_t i, int d, bool shift_ext = false) {
         assert(i < pos.size());
         assert(pos[i] != -1);
+        GGML_ASSERT(!shift_ext && "pos_div() is not supported for multi-axis M-RoPE shifts");
 
         const llama_pos p_old = pos[i];
 
         seq_pos_rm(i);
 
         pos[i]   /= d;
-        shift[i] += p_old - pos[i];
+        shift[i].t() += p_old - pos[i];
 
         seq_pos_add(i);
 
@@ -481,7 +590,7 @@ private:
     //      cells.reset_shift();
     //   }
     //
-    std::vector<llama_pos> shift;
+    std::vector<llama_kv_cell_shift> shift;
 
     using seq_set_t = std::bitset<LLAMA_MAX_SEQ>;
 

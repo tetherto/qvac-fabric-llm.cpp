@@ -40,6 +40,85 @@ typedef ushort uint16_t;
 typedef int int32_t;
 typedef uint uint32_t;
 
+// trans4_ns GEMM kernels consume bytes in least-significant-first numeric order.
+//
+// Everything here stays in uint registers. Narrowing intermediates to uchar
+// locals is miscompiled by the Adreno E031.47 shader compiler: it keeps the
+// first byte of each packed word and drops the rest, which silently corrupts
+// every repacked expert weight.
+static inline uint pack_uchar4(uint x0, uint x1, uint x2, uint x3) {
+    return (x0 & 0xFFu) | ((x1 & 0xFFu) << 8) | ((x2 & 0xFFu) << 16) | ((x3 & 0xFFu) << 24);
+}
+
+static inline uchar unpack_uchar0(uint x) {
+    return (uchar) (x & 0xFF);
+}
+
+static inline uchar unpack_uchar1(uint x) {
+    return (uchar) ((x >> 8) & 0xFF);
+}
+
+static inline uchar unpack_uchar2(uint x) {
+    return (uchar) ((x >> 16) & 0xFF);
+}
+
+static inline uchar unpack_uchar3(uint x) {
+    return (uchar) ((x >> 24) & 0xFF);
+}
+
+// The low nibbles are combined with a multiply rather than `| (x << 4)`: the
+// E031.47 compiler drops the mask on the shifted term, letting the odd byte's
+// high nibble leak into the next byte of the packed word.
+static inline uint pack_trans4_low(__global const uchar * q, uint offset) {
+    uint w = 0;
+    for (uint t = 0; t < 4; ++t) {
+        const uint lo = q[offset + 2 * t + 0] & 0x0Fu;
+        const uint hi = q[offset + 2 * t + 1] & 0x0Fu;
+        w |= ((lo + hi * 16u) & 0xFFu) << (8u * t);
+    }
+    return w;
+}
+
+static inline uint pack_trans4_high(__global const uchar * q, uint offset) {
+    const uint x0 = q[offset + 0];
+    const uint x1 = q[offset + 1];
+    const uint x2 = q[offset + 2];
+    const uint x3 = q[offset + 3];
+    const uint x4 = q[offset + 4];
+    const uint x5 = q[offset + 5];
+    const uint x6 = q[offset + 6];
+    const uint x7 = q[offset + 7];
+    return pack_uchar4(
+        ((x0 & 0xF0u) >> 4) | (x1 & 0xF0u),
+        ((x2 & 0xF0u) >> 4) | (x3 & 0xF0u),
+        ((x4 & 0xF0u) >> 4) | (x5 & 0xF0u),
+        ((x6 & 0xF0u) >> 4) | (x7 & 0xF0u));
+}
+
+static inline void restore_trans4(
+    __global uchar * q,
+    uint offset,
+    uint low,
+    uint high
+) {
+    uchar lo0 = unpack_uchar0(low);
+    uchar lo1 = unpack_uchar1(low);
+    uchar lo2 = unpack_uchar2(low);
+    uchar lo3 = unpack_uchar3(low);
+    uchar hi0 = unpack_uchar0(high);
+    uchar hi1 = unpack_uchar1(high);
+    uchar hi2 = unpack_uchar2(high);
+    uchar hi3 = unpack_uchar3(high);
+    q[offset + 0] = (lo0 & 0x0F) | ((hi0 & 0x0F) << 4);
+    q[offset + 1] = ((lo0 & 0xF0) >> 4) | (hi0 & 0xF0);
+    q[offset + 2] = (lo1 & 0x0F) | ((hi1 & 0x0F) << 4);
+    q[offset + 3] = ((lo1 & 0xF0) >> 4) | (hi1 & 0xF0);
+    q[offset + 4] = (lo2 & 0x0F) | ((hi2 & 0x0F) << 4);
+    q[offset + 5] = ((lo2 & 0xF0) >> 4) | (hi2 & 0xF0);
+    q[offset + 6] = (lo3 & 0x0F) | ((hi3 & 0x0F) << 4);
+    q[offset + 7] = ((lo3 & 0xF0) >> 4) | (hi3 & 0xF0);
+}
+
 //------------------------------------------------------------------------------
 // block_q1_0
 //------------------------------------------------------------------------------
@@ -319,29 +398,16 @@ kernel void kernel_convert_block_q4_0_trans4_ns(
     global struct block_q4_0 * b = src0 + src_blk_offset;
     dst_d[dst_blk_offset] = b->d;
 
-    // extract quantization and unshuffle
-    ushort8 pre_block = ((global ushort8 *)(&(b->qs[0])))[0];
-
-    ushort8 post_block = (ushort8)(0);
-
-    uchar * pre_block_ptr = (uchar *)(&pre_block);
-    uchar * post_block_ptr = (uchar *)(&post_block);
-
-    for (int i = 0; i < QK4_0 / 4; ++i) {
-        uchar x0 = pre_block_ptr[2*i + 0];
-        uchar x1 = pre_block_ptr[2*i + 1];
-
-        post_block_ptr[i + 0        ] = convert_uchar(x0 & 0x0F) | convert_uchar((x1 & 0x0F) << 4);
-        post_block_ptr[i + QK4_0 / 4] = convert_uchar((x0 & 0xF0) >> 4) | convert_uchar(x1 & 0xF0);
-    }
-
-    uint4 q_block = as_uint4(post_block);
+    uint q0 = pack_trans4_low(b->qs, 0);
+    uint q1 = pack_trans4_low(b->qs, 8);
+    uint q2 = pack_trans4_high(b->qs, 0);
+    uint q3 = pack_trans4_high(b->qs, 8);
 
     uint offset = i02 * ne00_blk * ne01 * 4 + i00 * ne01 * 4 + i01;
-    dst_q[offset] = q_block.x;
-    dst_q[offset + ne01] = q_block.y;
-    dst_q[offset + ne01 * 2] = q_block.z;
-    dst_q[offset + ne01 * 3] = q_block.w;
+    dst_q[offset] = q0;
+    dst_q[offset + ne01] = q1;
+    dst_q[offset + ne01 * 2] = q2;
+    dst_q[offset + ne01 * 3] = q3;
 }
 
 kernel void kernel_restore_block_q4_0_trans4_ns(
@@ -366,29 +432,13 @@ kernel void kernel_restore_block_q4_0_trans4_ns(
     __global struct block_q4_0 * b = dst0 + dst_blk_offset;
     b->d = src_d[src_d_offset];
 
-    // collect transposed quantization parts for a block
     uint src_q_offset = i02 * ne00_blk * ne01 * 4 + i00 * ne01 * 4 + i01;
-    uint4 q_block;
-    q_block.x = src_q[src_q_offset];
-    q_block.y = src_q[src_q_offset + ne01];
-    q_block.z = src_q[src_q_offset + ne01 * 2];
-    q_block.w = src_q[src_q_offset + ne01 * 3];
-
-    ushort8 post_block = as_ushort8(q_block);
-    ushort8 pre_block = (ushort8)(0);
-
-    uchar * pre_block_ptr = (uchar *)(&pre_block);
-    uchar * post_block_ptr = (uchar *)(&post_block);
-
-    for (int i = 0; i < QK4_0 / 4; ++i) {
-        uchar x0 = post_block_ptr[i + 0];
-        uchar x1 = post_block_ptr[i + QK4_0 / 4];
-
-        pre_block_ptr[2 * i + 0] = convert_uchar(x0 & 0x0F) | convert_uchar((x1 & 0x0F) << 4);
-        pre_block_ptr[2 * i + 1] = convert_uchar((x0 & 0xF0) >> 4) | convert_uchar(x1 & 0xF0);
-    }
-
-    ((__global ushort8 *)(&(b->qs[0])))[0] = pre_block;
+    uint q0 = src_q[src_q_offset];
+    uint q1 = src_q[src_q_offset + ne01];
+    uint q2 = src_q[src_q_offset + ne01 * 2];
+    uint q3 = src_q[src_q_offset + ne01 * 3];
+    restore_trans4(b->qs, 0, q0, q2);
+    restore_trans4(b->qs, 8, q1, q3);
 }
 
 //------------------------------------------------------------------------------
@@ -509,29 +559,16 @@ kernel void kernel_convert_block_q4_1_trans4_ns(
     dst_d[dst_blk_offset] = b->d;
     dst_m[dst_blk_offset] = b->m;
 
-    // extract quantization and unshuffle
-    ushort8 pre_block = ((global ushort8 *)(&(b->qs[0])))[0];
-
-    ushort8 post_block = (ushort8)(0);
-
-    uchar * pre_block_ptr = (uchar *)(&pre_block);
-    uchar * post_block_ptr = (uchar *)(&post_block);
-
-    for (int i = 0; i < QK4_1 / 4; ++i) {
-        uchar x0 = pre_block_ptr[2*i + 0];
-        uchar x1 = pre_block_ptr[2*i + 1];
-
-        post_block_ptr[i + 0        ] = convert_uchar(x0 & 0x0F) | convert_uchar((x1 & 0x0F) << 4);
-        post_block_ptr[i + QK4_1 / 4] = convert_uchar((x0 & 0xF0) >> 4) | convert_uchar(x1 & 0xF0);
-    }
-
-    uint4 q_block = as_uint4(post_block);
+    uint q0 = pack_trans4_low(b->qs, 0);
+    uint q1 = pack_trans4_low(b->qs, 8);
+    uint q2 = pack_trans4_high(b->qs, 0);
+    uint q3 = pack_trans4_high(b->qs, 8);
 
     uint offset = i02 * ne00_blk * ne01 * 4 + i00 * ne01 * 4 + i01;
-    dst_q[offset] = q_block.x;
-    dst_q[offset + ne01] = q_block.y;
-    dst_q[offset + ne01 * 2] = q_block.z;
-    dst_q[offset + ne01 * 3] = q_block.w;
+    dst_q[offset] = q0;
+    dst_q[offset + ne01] = q1;
+    dst_q[offset + ne01 * 2] = q2;
+    dst_q[offset + ne01 * 3] = q3;
 }
 
 kernel void kernel_restore_block_q4_1_trans4_ns(
@@ -558,29 +595,13 @@ kernel void kernel_restore_block_q4_1_trans4_ns(
     b->d = src_d[src_dm_offset];
     b->m = src_m[src_dm_offset];
 
-    // collect transposed quantization parts for a block
     uint src_q_offset = i02 * ne00_blk * ne01 * 4 + i00 * ne01 * 4 + i01;
-    uint4 q_block;
-    q_block.x = src_q[src_q_offset];
-    q_block.y = src_q[src_q_offset + ne01];
-    q_block.z = src_q[src_q_offset + ne01 * 2];
-    q_block.w = src_q[src_q_offset + ne01 * 3];
-
-    ushort8 post_block = as_ushort8(q_block);
-    ushort8 pre_block = (ushort8)(0);
-
-    uchar * pre_block_ptr = (uchar *)(&pre_block);
-    uchar * post_block_ptr = (uchar *)(&post_block);
-
-    for (int i = 0; i < QK4_0 / 4; ++i) {
-        uchar x0 = post_block_ptr[i + 0];
-        uchar x1 = post_block_ptr[i + QK4_0 / 4];
-
-        pre_block_ptr[2 * i + 0] = convert_uchar(x0 & 0x0F) | convert_uchar((x1 & 0x0F) << 4);
-        pre_block_ptr[2 * i + 1] = convert_uchar((x0 & 0xF0) >> 4) | convert_uchar(x1 & 0xF0);
-    }
-
-    ((__global ushort8 *)(&(b->qs[0])))[0] = pre_block;
+    uint q0 = src_q[src_q_offset];
+    uint q1 = src_q[src_q_offset + ne01];
+    uint q2 = src_q[src_q_offset + ne01 * 2];
+    uint q3 = src_q[src_q_offset + ne01 * 3];
+    restore_trans4(b->qs, 0, q0, q2);
+    restore_trans4(b->qs, 8, q1, q3);
 }
 
 //------------------------------------------------------------------------------
@@ -707,30 +728,18 @@ kernel void kernel_convert_block_q5_0_trans4_ns(
     global struct block_q5_0 * b = src0 + src_blk_offset;
     dst_d[dst_blk_offset] = b->d;
 
-    dst_qh[dst_blk_offset] = ((global uint *)(&(b->qh[0])))[0];
+    dst_qh[dst_blk_offset] = pack_uchar4(b->qh[0], b->qh[1], b->qh[2], b->qh[3]);
 
-    // extract quantization and unshuffle
-    ushort8 pre_block = ((global ushort8 *)(&(b->qs[0])))[0];
-    ushort8 post_block = (ushort8)(0);
-
-    uchar * pre_block_ptr = (uchar *)(&pre_block);
-    uchar * post_block_ptr = (uchar *)(&post_block);
-
-    for (int i = 0; i < QK5_0 / 4; ++i) {
-        uchar x0 = pre_block_ptr[2*i + 0];
-        uchar x1 = pre_block_ptr[2*i + 1];
-
-        post_block_ptr[i + 0        ] = convert_uchar(x0 & 0x0F) | convert_uchar((x1 & 0x0F) << 4);
-        post_block_ptr[i + QK5_0 / 4] = convert_uchar((x0 & 0xF0) >> 4) | convert_uchar(x1 & 0xF0);
-    }
-
-    uint4 q_block = as_uint4(post_block);
+    uint q0 = pack_trans4_low(b->qs, 0);
+    uint q1 = pack_trans4_low(b->qs, 8);
+    uint q2 = pack_trans4_high(b->qs, 0);
+    uint q3 = pack_trans4_high(b->qs, 8);
 
     uint offset = i02 * ne00_blk * ne01 * 4 + i00 * ne01 * 4 + i01;
-    dst_qs[offset] = q_block.x;
-    dst_qs[offset + ne01] = q_block.y;
-    dst_qs[offset + ne01 * 2] = q_block.z;
-    dst_qs[offset + ne01 * 3] = q_block.w;
+    dst_qs[offset] = q0;
+    dst_qs[offset + ne01] = q1;
+    dst_qs[offset + ne01 * 2] = q2;
+    dst_qs[offset + ne01 * 3] = q3;
 }
 
 kernel void kernel_restore_block_q5_0_trans4_ns(
@@ -756,31 +765,19 @@ kernel void kernel_restore_block_q5_0_trans4_ns(
     __global struct block_q5_0 * b = dst0 + dst_blk_offset;
     b->d = src_d[src_blk_offset];
 
-    ((__global uint *)(&(b->qh[0])))[0] = src_qh[src_blk_offset];
+    uint qh = src_qh[src_blk_offset];
+    b->qh[0] = unpack_uchar0(qh);
+    b->qh[1] = unpack_uchar1(qh);
+    b->qh[2] = unpack_uchar2(qh);
+    b->qh[3] = unpack_uchar3(qh);
 
-    // collect transposed quantization parts for a block
     uint src_q_offset = i02 * ne00_blk * ne01 * 4 + i00 * ne01 * 4 + i01;
-    uint4 q_block;
-    q_block.x = src_qs[src_q_offset];
-    q_block.y = src_qs[src_q_offset + ne01];
-    q_block.z = src_qs[src_q_offset + ne01 * 2];
-    q_block.w = src_qs[src_q_offset + ne01 * 3];
-
-    ushort8 post_block = as_ushort8(q_block);
-    ushort8 pre_block = (ushort8)(0);
-
-    uchar * pre_block_ptr = (uchar *)(&pre_block);
-    uchar * post_block_ptr = (uchar *)(&post_block);
-
-    for (int i = 0; i < QK5_0 / 4; ++i) {
-        uchar x0 = post_block_ptr[i + 0];
-        uchar x1 = post_block_ptr[i + QK5_0 / 4];
-
-        pre_block_ptr[2 * i + 0] = convert_uchar(x0 & 0x0F) | convert_uchar((x1 & 0x0F) << 4);
-        pre_block_ptr[2 * i + 1] = convert_uchar((x0 & 0xF0) >> 4) | convert_uchar(x1 & 0xF0);
-    }
-
-    ((__global ushort8 *)(&(b->qs[0])))[0] = pre_block;
+    uint q0 = src_qs[src_q_offset];
+    uint q1 = src_qs[src_q_offset + ne01];
+    uint q2 = src_qs[src_q_offset + ne01 * 2];
+    uint q3 = src_qs[src_q_offset + ne01 * 3];
+    restore_trans4(b->qs, 0, q0, q2);
+    restore_trans4(b->qs, 8, q1, q3);
 }
 
 //------------------------------------------------------------------------------
@@ -921,30 +918,18 @@ kernel void kernel_convert_block_q5_1_trans4_ns(
     dst_d[dst_blk_offset] = b->d;
     dst_m[dst_blk_offset] = b->m;
 
-    dst_qh[dst_blk_offset] = ((global uint *)(&(b->qh[0])))[0];
+    dst_qh[dst_blk_offset] = pack_uchar4(b->qh[0], b->qh[1], b->qh[2], b->qh[3]);
 
-    // extract quantization and unshuffle
-    ushort8 pre_block = ((global ushort8 *)(&(b->qs[0])))[0];
-    ushort8 post_block = (ushort8)(0);
-
-    uchar * pre_block_ptr = (uchar *)(&pre_block);
-    uchar * post_block_ptr = (uchar *)(&post_block);
-
-    for (int i = 0; i < QK5_1 / 4; ++i) {
-        uchar x0 = pre_block_ptr[2*i + 0];
-        uchar x1 = pre_block_ptr[2*i + 1];
-
-        post_block_ptr[i + 0        ] = convert_uchar(x0 & 0x0F) | convert_uchar((x1 & 0x0F) << 4);
-        post_block_ptr[i + QK5_1 / 4] = convert_uchar((x0 & 0xF0) >> 4) | convert_uchar(x1 & 0xF0);
-    }
-
-    uint4 q_block = as_uint4(post_block);
+    uint q0 = pack_trans4_low(b->qs, 0);
+    uint q1 = pack_trans4_low(b->qs, 8);
+    uint q2 = pack_trans4_high(b->qs, 0);
+    uint q3 = pack_trans4_high(b->qs, 8);
 
     uint offset = i02 * ne00_blk * ne01 * 4 + i00 * ne01 * 4 + i01;
-    dst_qs[offset] = q_block.x;
-    dst_qs[offset + ne01] = q_block.y;
-    dst_qs[offset + ne01 * 2] = q_block.z;
-    dst_qs[offset + ne01 * 3] = q_block.w;
+    dst_qs[offset] = q0;
+    dst_qs[offset + ne01] = q1;
+    dst_qs[offset + ne01 * 2] = q2;
+    dst_qs[offset + ne01 * 3] = q3;
 }
 
 kernel void kernel_restore_block_q5_1_trans4_ns(
@@ -972,30 +957,19 @@ kernel void kernel_restore_block_q5_1_trans4_ns(
     b->d = src_d[src_blk_offset];
     b->m = src_m[src_blk_offset];
 
-    ((__global uint *)(&(b->qh[0])))[0] = src_qh[src_blk_offset];
+    uint qh = src_qh[src_blk_offset];
+    b->qh[0] = unpack_uchar0(qh);
+    b->qh[1] = unpack_uchar1(qh);
+    b->qh[2] = unpack_uchar2(qh);
+    b->qh[3] = unpack_uchar3(qh);
 
-    // collect transposed quantization parts for a block
     uint src_q_offset = i02 * ne00_blk * ne01 * 4 + i00 * ne01 * 4 + i01;
-    uint4 q_block;
-    q_block.x = src_qs[src_q_offset];
-    q_block.y = src_qs[src_q_offset + ne01];
-    q_block.z = src_qs[src_q_offset + ne01 * 2];
-    q_block.w = src_qs[src_q_offset + ne01 * 3];
-
-    ushort8 post_block = as_ushort8(q_block);
-    ushort8 pre_block = (ushort8)(0);
-
-    uchar * pre_block_ptr = (uchar *)(&pre_block);
-    uchar * post_block_ptr = (uchar *)(&post_block);
-
-    for (int i = 0; i < QK5_1 / 4; ++i) {
-        uchar x0 = post_block_ptr[i + 0];
-        uchar x1 = post_block_ptr[i + QK5_1 / 4];
-
-        pre_block_ptr[2 * i + 0] = convert_uchar(x0 & 0x0F) | convert_uchar((x1 & 0x0F) << 4);
-        pre_block_ptr[2 * i + 1] = convert_uchar((x0 & 0xF0) >> 4) | convert_uchar(x1 & 0xF0);
-    }
-    ((__global ushort8 *)(&(b->qs[0])))[0] = pre_block;
+    uint q0 = src_qs[src_q_offset];
+    uint q1 = src_qs[src_q_offset + ne01];
+    uint q2 = src_qs[src_q_offset + ne01 * 2];
+    uint q3 = src_qs[src_q_offset + ne01 * 3];
+    restore_trans4(b->qs, 0, q0, q2);
+    restore_trans4(b->qs, 8, q1, q3);
 }
 
 kernel void kernel_convert_block_q4_k_trans4_ns(
@@ -1026,26 +1000,18 @@ kernel void kernel_convert_block_q4_k_trans4_ns(
     dst_d [dst_blk_offset] = b->d;
     dst_dm[dst_blk_offset] = b->dm;
 
-    uint4 qv[8];
-    uchar * qv_bytes = (uchar *)qv;
     for (int i = 0; i < QK_K / 64; ++i) {
-        for (int j = 0; j < 16; ++j) {
-            uchar x0 = b->q[i*32 + 2*j];
-            uchar x1 = b->q[i*32 + 2*j + 1];
-
-            qv_bytes[i*32 + j     ] = convert_uchar(x0 & mask_0F) | convert_uchar((x1 & mask_0F) << 4);
-            qv_bytes[i*32 + j + 16] = convert_uchar((x0 & mask_F0) >> 4) | convert_uchar(x1 & mask_F0);
-        }
-    }
-
-    uint base = i02 * ne00_blk * ne01 * 32 + i00 * ne01 * 32 + i01;
-    #pragma unroll
-    for (int p = 0; p < 8; ++p) {
-        uint4 v = qv[p];
-        dst_q[base + (p * 4 + 0) * ne01] = v.x;
-        dst_q[base + (p * 4 + 1) * ne01] = v.y;
-        dst_q[base + (p * 4 + 2) * ne01] = v.z;
-        dst_q[base + (p * 4 + 3) * ne01] = v.w;
+        uint src_offset = i * 32;
+        uint dst_offset = i * 8;
+        uint base = i02 * ne00_blk * ne01 * 32 + i00 * ne01 * 32 + i01;
+        dst_q[base + (dst_offset + 0) * ne01] = pack_trans4_low(b->q, src_offset + 0);
+        dst_q[base + (dst_offset + 1) * ne01] = pack_trans4_low(b->q, src_offset + 8);
+        dst_q[base + (dst_offset + 2) * ne01] = pack_trans4_low(b->q, src_offset + 16);
+        dst_q[base + (dst_offset + 3) * ne01] = pack_trans4_low(b->q, src_offset + 24);
+        dst_q[base + (dst_offset + 4) * ne01] = pack_trans4_high(b->q, src_offset + 0);
+        dst_q[base + (dst_offset + 5) * ne01] = pack_trans4_high(b->q, src_offset + 8);
+        dst_q[base + (dst_offset + 6) * ne01] = pack_trans4_high(b->q, src_offset + 16);
+        dst_q[base + (dst_offset + 7) * ne01] = pack_trans4_high(b->q, src_offset + 24);
     }
 
     __global uchar * s_dst = dst_s + (i02 * ne01 + i01) * ne00_blk * K_SCALE_SIZE + i00 * K_SCALE_SIZE;
@@ -1091,22 +1057,17 @@ kernel void kernel_restore_block_q4_k_trans4_ns(
 
     uint base = i02 * ne00_blk * ne01 * 32 + i00 * ne01 * 32 + i01;
 
-    uint4 qv[8];
-    for (int p = 0; p < 8; ++p) {
-        qv[p].x = src_q[base + (p * 4 + 0) * ne01];
-        qv[p].y = src_q[base + (p * 4 + 1) * ne01];
-        qv[p].z = src_q[base + (p * 4 + 2) * ne01];
-        qv[p].w = src_q[base + (p * 4 + 3) * ne01];
-    }
-
-    uchar * qv_bytes = (uchar *)qv;
     for (int i = 0; i < QK_K / 64; ++i) {
-        for (int j = 0; j < 16; ++j) {
-            uchar lo = qv_bytes[i*32 + j];
-            uchar hi = qv_bytes[i*32 + j + 16];
-            b->q[i*32 + 2*j]     = convert_uchar((lo & mask_0F) | ((hi & mask_0F) << 4));
-            b->q[i*32 + 2*j + 1] = convert_uchar(((lo & mask_F0) >> 4) | (hi & mask_F0));
-        }
+        uint dst_offset = i * 32;
+        uint src_offset = i * 8;
+        restore_trans4(b->q, dst_offset + 0,
+            src_q[base + (src_offset + 0) * ne01], src_q[base + (src_offset + 4) * ne01]);
+        restore_trans4(b->q, dst_offset + 8,
+            src_q[base + (src_offset + 1) * ne01], src_q[base + (src_offset + 5) * ne01]);
+        restore_trans4(b->q, dst_offset + 16,
+            src_q[base + (src_offset + 2) * ne01], src_q[base + (src_offset + 6) * ne01]);
+        restore_trans4(b->q, dst_offset + 24,
+            src_q[base + (src_offset + 3) * ne01], src_q[base + (src_offset + 7) * ne01]);
     }
 }
 
@@ -1151,26 +1112,18 @@ kernel void kernel_convert_block_q5_k_trans4_ns(
         dst_qh[i01 + (i00 * 8 + k) * ne01 + i02 * ne00_blk * 8 * ne01] = packed;
     }
 
-    uint4 qv[8];
-    uchar * qv_bytes = (uchar *)qv;
     for (int i = 0; i < QK_K / 64; ++i) {
-        for (int j = 0; j < 16; ++j) {
-            uchar x0 = b->qs[i*32 + 2*j];
-            uchar x1 = b->qs[i*32 + 2*j + 1];
-
-            qv_bytes[i*32 + j     ] = convert_uchar(x0 & mask_0F) | convert_uchar((x1 & mask_0F) << 4);
-            qv_bytes[i*32 + j + 16] = convert_uchar((x0 & mask_F0) >> 4) | convert_uchar(x1 & mask_F0);
-        }
-    }
-
-    uint base = i02 * ne00_blk * ne01 * 32 + i00 * ne01 * 32 + i01;
-    #pragma unroll
-    for (int p = 0; p < 8; ++p) {
-        uint4 v = qv[p];
-        dst_qs[base + (p * 4 + 0) * ne01] = v.x;
-        dst_qs[base + (p * 4 + 1) * ne01] = v.y;
-        dst_qs[base + (p * 4 + 2) * ne01] = v.z;
-        dst_qs[base + (p * 4 + 3) * ne01] = v.w;
+        uint src_offset = i * 32;
+        uint dst_offset = i * 8;
+        uint base = i02 * ne00_blk * ne01 * 32 + i00 * ne01 * 32 + i01;
+        dst_qs[base + (dst_offset + 0) * ne01] = pack_trans4_low(b->qs, src_offset + 0);
+        dst_qs[base + (dst_offset + 1) * ne01] = pack_trans4_low(b->qs, src_offset + 8);
+        dst_qs[base + (dst_offset + 2) * ne01] = pack_trans4_low(b->qs, src_offset + 16);
+        dst_qs[base + (dst_offset + 3) * ne01] = pack_trans4_low(b->qs, src_offset + 24);
+        dst_qs[base + (dst_offset + 4) * ne01] = pack_trans4_high(b->qs, src_offset + 0);
+        dst_qs[base + (dst_offset + 5) * ne01] = pack_trans4_high(b->qs, src_offset + 8);
+        dst_qs[base + (dst_offset + 6) * ne01] = pack_trans4_high(b->qs, src_offset + 16);
+        dst_qs[base + (dst_offset + 7) * ne01] = pack_trans4_high(b->qs, src_offset + 24);
     }
 
     __global uchar * s_dst = dst_s + (i02 * ne01 + i01) * ne00_blk * K_SCALE_SIZE + i00 * K_SCALE_SIZE;
@@ -1232,22 +1185,17 @@ kernel void kernel_restore_block_q5_k_trans4_ns(
 
     uint base = i02 * ne00_blk * ne01 * 32 + i00 * ne01 * 32 + i01;
 
-    uint4 qv[8];
-    for (int p = 0; p < 8; ++p) {
-        qv[p].x = src_qs[base + (p * 4 + 0) * ne01];
-        qv[p].y = src_qs[base + (p * 4 + 1) * ne01];
-        qv[p].z = src_qs[base + (p * 4 + 2) * ne01];
-        qv[p].w = src_qs[base + (p * 4 + 3) * ne01];
-    }
-
-    uchar * qv_bytes = (uchar *)qv;
     for (int i = 0; i < QK_K / 64; ++i) {
-        for (int j = 0; j < 16; ++j) {
-            uchar lo = qv_bytes[i*32 + j];
-            uchar hi = qv_bytes[i*32 + j + 16];
-            b->qs[i*32 + 2*j]     = convert_uchar((lo & mask_0F) | ((hi & mask_0F) << 4));
-            b->qs[i*32 + 2*j + 1] = convert_uchar(((lo & mask_F0) >> 4) | (hi & mask_F0));
-        }
+        uint dst_offset = i * 32;
+        uint src_offset = i * 8;
+        restore_trans4(b->qs, dst_offset + 0,
+            src_qs[base + (src_offset + 0) * ne01], src_qs[base + (src_offset + 4) * ne01]);
+        restore_trans4(b->qs, dst_offset + 8,
+            src_qs[base + (src_offset + 1) * ne01], src_qs[base + (src_offset + 5) * ne01]);
+        restore_trans4(b->qs, dst_offset + 16,
+            src_qs[base + (src_offset + 2) * ne01], src_qs[base + (src_offset + 6) * ne01]);
+        restore_trans4(b->qs, dst_offset + 24,
+            src_qs[base + (src_offset + 3) * ne01], src_qs[base + (src_offset + 7) * ne01]);
     }
 }
 
@@ -1279,30 +1227,21 @@ kernel void kernel_convert_block_q6_k_trans4_ns(
 
     dst_d[dst_blk_offset] = b->d;
 
-    uint4 qlv[8];
-    uchar * qlv_bytes = (uchar *)qlv;
-    for (int i = 0; i < 2; ++i) {
-        for (int j = 0; j < 16; ++j) {
-            uchar x0 = b->ql[i*64 + 2*j];
-            uchar x1 = b->ql[i*64 + 2*j + 1];
-            uchar x2 = b->ql[i*64 + 32 + 2*j];
-            uchar x3 = b->ql[i*64 + 32 + 2*j + 1];
-            qlv_bytes[i*64 + j     ] = convert_uchar(x0 & mask_0F) | convert_uchar((x1 & mask_0F) << 4);
-            qlv_bytes[i*64 + j + 16] = convert_uchar(x2 & mask_0F) | convert_uchar((x3 & mask_0F) << 4);
-            qlv_bytes[i*64 + j + 32] = convert_uchar((x0 & mask_F0) >> 4) | convert_uchar(x1 & mask_F0);
-            qlv_bytes[i*64 + j + 48] = convert_uchar((x2 & mask_F0) >> 4) | convert_uchar(x3 & mask_F0);
-        }
-    }
-
     uint ql_base = i02 * ne00_blk * ne01 * 32 + i00 * ne01 * 32 + i01;
-
-    #pragma unroll
-    for (int p = 0; p < 8; ++p) {
-        uint4 v = qlv[p];
-        dst_ql[ql_base + (p * 4 + 0) * ne01] = v.x;
-        dst_ql[ql_base + (p * 4 + 1) * ne01] = v.y;
-        dst_ql[ql_base + (p * 4 + 2) * ne01] = v.z;
-        dst_ql[ql_base + (p * 4 + 3) * ne01] = v.w;
+    for (int i = 0; i < 2; ++i) {
+        uint src_offset = i * 64;
+        uint dst_offset = i * 16;
+        for (int j = 0; j < 4; ++j) {
+            uint chunk_offset = j * 8;
+            dst_ql[ql_base + (dst_offset + j) * ne01] =
+                pack_trans4_low(b->ql, src_offset + chunk_offset);
+            dst_ql[ql_base + (dst_offset + 4 + j) * ne01] =
+                pack_trans4_low(b->ql, src_offset + 32 + chunk_offset);
+            dst_ql[ql_base + (dst_offset + 8 + j) * ne01] =
+                pack_trans4_high(b->ql, src_offset + chunk_offset);
+            dst_ql[ql_base + (dst_offset + 12 + j) * ne01] =
+                pack_trans4_high(b->ql, src_offset + 32 + chunk_offset);
+        }
     }
 
     uint qhv[16] = {0};
@@ -1361,25 +1300,16 @@ kernel void kernel_restore_block_q6_k_trans4_ns(
     b->d = src_d[src_blk_offset];
 
     uint ql_base = i02 * ne00_blk * ne01 * 32 + i00 * ne01 * 32 + i01;
-    uint4 qlv[8];
-    for (int p = 0; p < 8; ++p) {
-        qlv[p].x = src_ql[ql_base + (p * 4 + 0) * ne01];
-        qlv[p].y = src_ql[ql_base + (p * 4 + 1) * ne01];
-        qlv[p].z = src_ql[ql_base + (p * 4 + 2) * ne01];
-        qlv[p].w = src_ql[ql_base + (p * 4 + 3) * ne01];
-    }
-
-    uchar * qlv_bytes = (uchar *)qlv;
     for (int i = 0; i < 2; ++i) {
-        for (int j = 0; j < 16; ++j) {
-            uchar lo_02 = qlv_bytes[i*64 + j];
-            uchar lo_13 = qlv_bytes[i*64 + j + 16];
-            uchar hi_02 = qlv_bytes[i*64 + j + 32];
-            uchar hi_13 = qlv_bytes[i*64 + j + 48];
-            b->ql[i*64 + 2*j]          = convert_uchar((lo_02 & mask_0F) | ((hi_02 & mask_0F) << 4));
-            b->ql[i*64 + 2*j + 1]      = convert_uchar(((lo_02 & mask_F0) >> 4) | (hi_02 & mask_F0));
-            b->ql[i*64 + 32 + 2*j]     = convert_uchar((lo_13 & mask_0F) | ((hi_13 & mask_0F) << 4));
-            b->ql[i*64 + 32 + 2*j + 1] = convert_uchar(((lo_13 & mask_F0) >> 4) | (hi_13 & mask_F0));
+        uint dst_offset = i * 64;
+        uint src_offset = i * 16;
+        for (int j = 0; j < 4; ++j) {
+            restore_trans4(b->ql, dst_offset + j * 8,
+                src_ql[ql_base + (src_offset + j) * ne01],
+                src_ql[ql_base + (src_offset + 8 + j) * ne01]);
+            restore_trans4(b->ql, dst_offset + 32 + j * 8,
+                src_ql[ql_base + (src_offset + 4 + j) * ne01],
+                src_ql[ql_base + (src_offset + 12 + j) * ne01]);
         }
     }
 
@@ -1516,29 +1446,16 @@ kernel void kernel_convert_block_mxfp4_trans4_ns(
     global struct block_mxfp4 * b = src0 + src_blk_offset;
     dst_e[dst_blk_offset] = b->e;
 
-    // extract quantization and unshuffle
-    ushort8 pre_block = ((global ushort8 *)(&(b->qs[0])))[0];
-
-    ushort8 post_block = (ushort8)(0);
-
-    uchar * pre_block_ptr = (uchar *)(&pre_block);
-    uchar * post_block_ptr = (uchar *)(&post_block);
-
-    for (int i = 0; i < QK_MXFP4 / 4; ++i) {
-        uchar x0 = pre_block_ptr[2*i + 0];
-        uchar x1 = pre_block_ptr[2*i + 1];
-
-        post_block_ptr[i + 0        ] = convert_uchar(x0 & 0x0F) | convert_uchar((x1 & 0x0F) << 4);
-        post_block_ptr[i + QK_MXFP4 / 4] = convert_uchar((x0 & 0xF0) >> 4) | convert_uchar(x1 & 0xF0);
-    }
-
-    uint4 q_block = as_uint4(post_block);
+    uint q0 = pack_trans4_low(b->qs, 0);
+    uint q1 = pack_trans4_low(b->qs, 8);
+    uint q2 = pack_trans4_high(b->qs, 0);
+    uint q3 = pack_trans4_high(b->qs, 8);
 
     uint offset = i02 * ne00_blk * ne01 * 4 + i00 * ne01 * 4 + i01;
-    dst_q[offset] = q_block.x;
-    dst_q[offset + ne01] = q_block.y;
-    dst_q[offset + ne01 * 2] = q_block.z;
-    dst_q[offset + ne01 * 3] = q_block.w;
+    dst_q[offset] = q0;
+    dst_q[offset + ne01] = q1;
+    dst_q[offset + ne01 * 2] = q2;
+    dst_q[offset + ne01 * 3] = q3;
 }
 
 kernel void kernel_restore_block_mxfp4_trans4_ns(
@@ -1563,29 +1480,13 @@ kernel void kernel_restore_block_mxfp4_trans4_ns(
     __global struct block_mxfp4 * b = dst0 + dst_blk_offset;
     b->e = src_e[src_d_offset];
 
-    // collect transposed quantization parts for a block
     uint src_q_offset = i02 * ne00_blk * ne01 * 4 + i00 * ne01 * 4 + i01;
-    uint4 q_block;
-    q_block.x = src_q[src_q_offset];
-    q_block.y = src_q[src_q_offset + ne01];
-    q_block.z = src_q[src_q_offset + ne01 * 2];
-    q_block.w = src_q[src_q_offset + ne01 * 3];
-
-    ushort8 post_block = as_ushort8(q_block);
-    ushort8 pre_block = (ushort8)(0);
-
-    uchar * pre_block_ptr = (uchar *)(&pre_block);
-    uchar * post_block_ptr = (uchar *)(&post_block);
-
-    for (int i = 0; i < QK_MXFP4 / 4; ++i) {
-        uchar x0 = post_block_ptr[i + 0];
-        uchar x1 = post_block_ptr[i + QK_MXFP4 / 4];
-
-        pre_block_ptr[2 * i + 0] = convert_uchar(x0 & 0x0F) | convert_uchar((x1 & 0x0F) << 4);
-        pre_block_ptr[2 * i + 1] = convert_uchar((x0 & 0xF0) >> 4) | convert_uchar(x1 & 0xF0);
-    }
-
-    ((__global ushort8 *)(&(b->qs[0])))[0] = pre_block;
+    uint q0 = src_q[src_q_offset];
+    uint q1 = src_q[src_q_offset + ne01];
+    uint q2 = src_q[src_q_offset + ne01 * 2];
+    uint q3 = src_q[src_q_offset + ne01 * 3];
+    restore_trans4(b->qs, 0, q0, q2);
+    restore_trans4(b->qs, 8, q1, q3);
 }
 
 
@@ -1787,6 +1688,12 @@ kernel void kernel_restore_block_q8_0_trans(
     uint ne00,
     uint ne01
 ){
+    // One work item per row, and callers round the dispatch up to the work-group size, so the
+    // tail items have no row to restore. Without this they write past the end of dst.
+    if (get_global_id(0) >= ne01) {
+        return;
+    }
+
     uint num_blk_per_row = ne00 / QK8_0;
 
     global block_q8_0 * b = (global block_q8_0 *) dst + get_global_id(0) * num_blk_per_row;

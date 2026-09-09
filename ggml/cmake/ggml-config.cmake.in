@@ -80,7 +80,14 @@ if (NOT GGML_SHARED_LIB)
         set(GGML_OPENCL_INTERFACE_LINK_LIBRARIES $<LINK_ONLY:OpenCL::OpenCL>)
     endif()
 
-    if (GGML_VULKAN)
+    # Under GGML_BACKEND_DL the Vulkan backend ships as a standalone module that
+    # is dlopen'd at runtime; the consumer links only ggml/ggml-base and never
+    # references Vulkan::Vulkan (the backend foreach below is skipped entirely
+    # when GGML_BACKEND_DL is set). Hard-requiring the Vulkan SDK at the
+    # consumer's configure time is therefore spurious for DL builds and breaks
+    # CPU-only consumers (e.g. @qvac/classification-ggml) on build hosts without
+    # a Vulkan SDK. Keep the dependency for non-DL builds, which link it directly.
+    if (GGML_VULKAN AND NOT GGML_BACKEND_DL)
         find_dependency(Vulkan)
         set(GGML_VULKAN_INTERFACE_LINK_LIBRARIES $<LINK_ONLY:Vulkan::Vulkan>)
     endif()
@@ -104,11 +111,35 @@ if (NOT GGML_SHARED_LIB)
             list(APPEND GGML_SYCL_INTERFACE_LINK_LIBRARIES IntelSYCL::SYCL_CXX MKL::MKL MKL::MKL_SYCL)
         endif()
     endif()
+
+    if (GGML_OPENCL)
+        # OpenCL::OpenCL, from the find_dependency(OpenCL) above, is the canonical
+        # target. pkg-config can contribute extra transitive flags that matter when
+        # linking statically, so consult it when it is available - but do not make it
+        # a hard requirement. A static consumer on a system with a working CMake
+        # OpenCL package but no pkg-config (common on Windows and in minimal build
+        # images) would otherwise fail find_package(ggml) outright, for a lookup that
+        # only supplements one already done.
+        # The probe also uses its own prefix: pkg_check_modules(OpenCL ...) writes
+        # OpenCL_FOUND / OpenCL_LIBRARIES etc., clobbering the values that
+        # find_dependency(OpenCL) just set.
+        find_package(PkgConfig QUIET)
+        if (PKG_CONFIG_FOUND)
+            pkg_check_modules(GGML_PC_OPENCL QUIET IMPORTED_TARGET OpenCL)
+            if (TARGET PkgConfig::GGML_PC_OPENCL)
+                list(APPEND GGML_OPENCL_INTERFACE_LINK_LIBRARIES PkgConfig::GGML_PC_OPENCL)
+            endif()
+        endif()
+    endif()
+
 endif()
 
 set_and_check(GGML_INCLUDE_DIR "@PACKAGE_GGML_INCLUDE_INSTALL_DIR@")
 set_and_check(GGML_LIB_DIR "@PACKAGE_GGML_LIB_INSTALL_DIR@")
 #set_and_check(GGML_BIN_DIR "@PACKAGE_GGML_BIN_INSTALL_DIR@")
+
+# Include the exported targets file
+include("${CMAKE_CURRENT_LIST_DIR}/ggml-targets.cmake")
 
 if(NOT TARGET ggml::ggml)
     find_package(Threads REQUIRED)
@@ -196,11 +227,54 @@ if(NOT TARGET ggml::ggml)
         PROPERTIES
             INTERFACE_LINK_LIBRARIES "${GGML_INTERFACE_LINK_LIBRARIES}")
 
+endif()
+
+# ggml::all aggregates every backend target the package ships. The hand-rolled
+# branch above builds it while discovering the backends itself, but that branch
+# only runs when ggml-targets.cmake did NOT define ggml::ggml. Now that the
+# exported targets file is included unconditionally above, the common install
+# takes the other path and would leave ggml::all undefined, so any consumer
+# linking it fails at generate time with
+#   Target ... links to: ggml::all but the target was not found
+# Rebuild the aggregate here from the backend list recorded at install time.
+if(NOT TARGET ggml::all)
+    set(_ggml_all_targets "")
+    if (NOT GGML_BACKEND_DL)
+        foreach(_ggml_backend ${GGML_AVAILABLE_BACKENDS})
+            if (TARGET ggml::${_ggml_backend})
+                list(APPEND _ggml_all_targets ggml::${_ggml_backend})
+            endif()
+        endforeach()
+    endif()
+
     add_library(ggml::all INTERFACE IMPORTED)
     set_target_properties(ggml::all
         PROPERTIES
             INTERFACE_LINK_LIBRARIES "${_ggml_all_targets}")
+    unset(_ggml_all_targets)
+endif()
 
+if(GGML_VECTOR_INDEX AND NOT TARGET ggml::ggml-vector-index)
+    find_library(GGML_VECTOR_INDEX_LIBRARY ggml-vector-index
+        REQUIRED
+        HINTS ${GGML_LIB_DIR}
+        NO_CMAKE_FIND_ROOT_PATH)
+
+    add_library(ggml::ggml-vector-index UNKNOWN IMPORTED)
+    set_target_properties(ggml::ggml-vector-index
+        PROPERTIES
+            INTERFACE_INCLUDE_DIRECTORIES "${GGML_INCLUDE_DIR}"
+            IMPORTED_LINK_INTERFACE_LANGUAGES "CXX"
+            IMPORTED_LOCATION "${GGML_VECTOR_INDEX_LIBRARY}"
+            INTERFACE_COMPILE_FEATURES cxx_std_17
+            POSITION_INDEPENDENT_CODE ON)
+endif()
+
+if(TARGET ggml::ggml-vector-index AND NOT TARGET ggml::vector-index)
+    add_library(ggml::vector-index INTERFACE IMPORTED)
+    set_target_properties(ggml::vector-index
+        PROPERTIES
+            INTERFACE_LINK_LIBRARIES ggml::ggml-vector-index)
 endif()
 
 check_required_components(ggml)
