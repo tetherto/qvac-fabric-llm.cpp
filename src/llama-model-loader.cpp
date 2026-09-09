@@ -1432,6 +1432,9 @@ void llama_model_loader::unmap_weight(const llama_tensor_weight & w) const {
 }
 
 void llama_model_loader::load_data_for(struct ggml_tensor * cur) const {
+    // offs is not checked against the file size under no_alloc, so no read site may run
+    GGML_ASSERT(!no_alloc);
+
     const auto & w = require_weight(ggml_get_name(cur));
 
     if (use_mmap) {
@@ -1461,6 +1464,9 @@ bool llama_model_loader::load_all_data(
         llama_mlocks * lmlocks,
         llama_progress_callback progress_callback,
         void * progress_callback_user_data) {
+    // offs is not checked against the file size under no_alloc, so no read site may run
+    GGML_ASSERT(!no_alloc);
+
     if (files.empty()) {
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
             set_tensor_data(t, set_tensor_data_ud);
