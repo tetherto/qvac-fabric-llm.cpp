@@ -408,6 +408,33 @@ llama_build_and_test(test-fit-params.cpp)
 if (GGML_RPC)
     llama_build_and_test(test-rpc.cpp LINK ggml)
     set_tests_properties(test-rpc PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
+
+    add_executable(test-rpc-allreduce test-rpc-allreduce.cpp)
+    target_link_libraries(test-rpc-allreduce PRIVATE ggml)
+    target_compile_features(test-rpc-allreduce PRIVATE cxx_std_17)
+    find_package(Python3 COMPONENTS Interpreter QUIET)
+    if (Python3_Interpreter_FOUND AND LLAMA_BUILD_TOOLS AND GGML_CPU AND NOT EMSCRIPTEN)
+        function(rpc_allreduce_test name)
+            add_test(NAME ${name} COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/test_rpc_allreduce.py
+                --server $<TARGET_FILE:ggml-rpc-server> ${ARGN})
+            set_tests_properties(${name} PROPERTIES TIMEOUT 150 LABELS "rpc")
+        endfunction()
+        foreach(ranks 2 4 8)
+            foreach(wire f32 bf16)
+                rpc_allreduce_test(test-rpc-allreduce-${ranks}-${wire}
+                    --client $<TARGET_FILE:test-rpc-allreduce> --ranks ${ranks} --wire ${wire})
+            endforeach()
+        endforeach()
+        rpc_allreduce_test(test-rpc-allreduce-port-base
+            --client $<TARGET_FILE:test-rpc-allreduce> --ranks 4 --port-base)
+        rpc_allreduce_test(test-rpc-allreduce-init-failure
+            --client $<TARGET_FILE:test-rpc-allreduce> --ranks 4 --init-failure)
+        rpc_allreduce_test(test-rpc-allreduce-disabled
+            --client $<TARGET_FILE:test-rpc-allreduce> --ranks 4 --disabled)
+        rpc_allreduce_test(test-rpc-local
+            --client $<TARGET_FILE:test-rpc> --ranks 2 --wire bf16 --legacy)
+    endif()
 endif()
 
 llama_build(test-backend-ops.cpp LINK ggml)

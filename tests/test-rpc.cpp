@@ -251,6 +251,7 @@ int main() {
     }
 
     std::vector<float> input(ggml_nelements(tensor_a));
+    std::vector<std::vector<float>> queued_results(8, std::vector<float>(ggml_nelements(result_a)));
     for (int iteration = 0; iteration < 8; iteration++) {
         if (iteration == 4) {
             ggml_backend_buffer_ptr unrelated(ggml_backend_alloc_buffer(backend_a.get(), 4096));
@@ -266,9 +267,18 @@ int main() {
         if (ggml_backend_graph_compute_async(backend_a.get(), graph) != GGML_STATUS_SUCCESS) {
             return 1;
         }
+        ggml_backend_tensor_get_async(backend_a.get(), result_a, queued_results[iteration].data(), 0,
+                                      ggml_nbytes(result_a));
         ggml_backend_event_record(event, backend_a.get());
     }
     ggml_backend_synchronize(backend_a.get());
+
+    for (size_t iteration = 0; iteration < queued_results.size(); iteration++) {
+        if (!check_values(queued_results[iteration], 2.0f*iteration)) {
+            fprintf(stderr, "queued RPC graph/readback ordering failed at iteration %zu\n", iteration);
+            return 1;
+        }
+    }
 
     std::vector<float> result(ggml_nelements(result_a));
     ggml_backend_tensor_get(result_a, result.data(), 0, ggml_nbytes(result_a));
