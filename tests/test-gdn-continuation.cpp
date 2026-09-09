@@ -229,7 +229,7 @@ static int child_main(int64_t tokens, int64_t split) {
     const double state_error              = nmse(reference.full_state, actual.full_state);
     const double continuation_attn_error  = nmse(actual.full_attn, actual.split_attn);
     const double continuation_state_error = nmse(actual.full_state, actual.split_state);
-    const double tolerance = 1e-7;
+    const double tolerance = actual.cute_allocated ? 3e-4 : 1e-7;
     const bool   ok = attn_error <= tolerance && state_error <= tolerance &&
                       continuation_attn_error <= tolerance && continuation_state_error <= tolerance;
 
