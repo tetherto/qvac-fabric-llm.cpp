@@ -37,4 +37,4 @@ struct ggml_cuda_gdn_cute_args {
 
 bool ggml_cuda_gdn_cute_available(int device, const ggml_cuda_gdn_cute_args & args);
 size_t ggml_cuda_gdn_cute_get_alloc_size(int device, const ggml_cuda_gdn_cute_args & args, size_t logical_size);
-bool ggml_cuda_gdn_cute_launch(const ggml_cuda_gdn_cute_args & args, cudaStream_t stream);
+bool ggml_cuda_gdn_cute_launch(int device, const ggml_cuda_gdn_cute_args & args, cudaStream_t stream);

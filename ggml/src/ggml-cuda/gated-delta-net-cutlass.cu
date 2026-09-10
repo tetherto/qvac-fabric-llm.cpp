@@ -1,6 +1,7 @@
 #ifdef GGML_CUDA_CUTLASS
 
 #include "gated-delta-net-cutlass.cuh"
+#include "gated-delta-net-cutlass-prefill.cuh"
 
 #include "common.cuh"
 #include "gdn-cute-inverse.cuh"
@@ -10,7 +11,9 @@
 #include <cutlass/numeric_conversion.h>
 #include <cutlass/cutlass.h>
 
+#include <climits>
 #include <cmath>
+#include <cstdlib>
 #include <limits>
 #include <mutex>
 
@@ -473,22 +476,29 @@ static bool ggml_cuda_gdn_cute_init(int device) {
     return available[device];
 }
 
-bool ggml_cuda_gdn_cute_available(int device, const ggml_cuda_gdn_cute_args & args) {
-    if (!args.eligible || (args.H != 16 && args.H != 32 && args.H != 48 && args.H != 64) || args.H_k != 16 ||
-        args.n_tokens < GDN_CHUNK || args.n_seqs <= 0) {
-        return false;
-    }
-    // The native kernel is faster for these SM120 workloads.
-    if (ggml_cuda_info().devices[device].cc == GGML_CUDA_CC_BLACKWELL &&
-        (args.H == 16 || (args.H == 32 && args.n_tokens < 512))) {
-        return false;
-    }
-    return ggml_cuda_gdn_cute_init(device);
-}
+enum class gdn_cute_schedule {
+    none,
+    persistent,
+    chunked,
+};
 
 struct gdn_cute_workspace_layout {
     size_t q_elems;
     size_t bytes;
+};
+
+struct gdn_cute_plan {
+    gdn_cute_schedule schedule;
+    gdn_cute_workspace_layout persistent;
+    ggml_cuda_gdn_chunked_workspace chunked;
+
+    bool available() const {
+        return schedule != gdn_cute_schedule::none;
+    }
+
+    size_t workspace_bytes() const {
+        return schedule == gdn_cute_schedule::chunked ? chunked.bytes : persistent.bytes;
+    }
 };
 
 static bool gdn_cute_size_mul(size_t & value, size_t factor) {
@@ -504,7 +514,8 @@ static bool ggml_cuda_gdn_cute_workspace_layout(
     size_t q_elems = (size_t) args.n_seqs;
     if (!gdn_cute_size_mul(q_elems, (size_t) args.n_tokens) ||
         !gdn_cute_size_mul(q_elems, (size_t) args.H_k) ||
-        !gdn_cute_size_mul(q_elems, GDN_D)) {
+        !gdn_cute_size_mul(q_elems, GDN_D) ||
+        q_elems > (size_t) INT_MAX * 256) {
         return false;
     }
 
@@ -517,16 +528,83 @@ static bool ggml_cuda_gdn_cute_workspace_layout(
     return true;
 }
 
-size_t ggml_cuda_gdn_cute_get_alloc_size(
-        int device, const ggml_cuda_gdn_cute_args & args, size_t logical_size) {
-    ggml_cuda_set_device(device);
-    if (!ggml_cuda_gdn_cute_available(device, args)) {
-        return logical_size;
+static bool ggml_cuda_gdn_chunked_disabled() {
+    // Diagnostic fallback to the persistent path.
+    static const bool disabled = [] {
+        const char * value = getenv("GGML_CUDA_DISABLE_GDN_CHUNKED");
+        return value != nullptr && atoi(value) != 0;
+    }();
+    return disabled;
+}
+
+static gdn_cute_plan ggml_cuda_gdn_cute_plan(
+        const ggml_cuda_gdn_cute_args & args,
+        int cc,
+        bool persistent_available,
+        bool chunked_available,
+        bool chunked_disabled) {
+    const gdn_cute_workspace_layout no_persistent = {};
+    const ggml_cuda_gdn_chunked_workspace no_chunked = {};
+    const gdn_cute_plan unavailable = { gdn_cute_schedule::none, no_persistent, no_chunked };
+
+    const bool chunked_shape =
+        !chunked_disabled &&
+        chunked_available &&
+        cc == GGML_CUDA_CC_BLACKWELL &&
+        args.eligible &&
+        args.H == 48 &&
+        args.H_k == 16 &&
+        args.n_tokens >= 1024 &&
+        args.n_tokens <= 2048 &&
+        args.n_seqs > 0 &&
+        args.n_seqs <= 64 / ((args.n_tokens + GDN_CHUNK - 1) / GDN_CHUNK);
+    if (chunked_shape) {
+        ggml_cuda_gdn_chunked_workspace workspace;
+        if (ggml_cuda_gdn_chunked_workspace_layout(args, workspace)) {
+            return { gdn_cute_schedule::chunked, no_persistent, workspace };
+        }
+    }
+
+    const bool persistent_shape =
+        persistent_available &&
+        args.eligible &&
+        (args.H == 16 || args.H == 32 || args.H == 48 || args.H == 64) &&
+        args.H_k == 16 &&
+        args.n_tokens >= GDN_CHUNK &&
+        args.n_seqs > 0;
+    if (!persistent_shape ||
+        (cc == GGML_CUDA_CC_BLACKWELL && (args.H == 16 || (args.H == 32 && args.n_tokens < 512)))) {
+        return unavailable;
     }
 
     gdn_cute_workspace_layout workspace;
     if (!ggml_cuda_gdn_cute_workspace_layout(args, workspace)) {
-        GGML_ABORT("GDN CuTe workspace size overflow");
+        return unavailable;
+    }
+    return { gdn_cute_schedule::persistent, workspace, no_chunked };
+}
+
+static gdn_cute_plan ggml_cuda_gdn_cute_make_plan(int device, const ggml_cuda_gdn_cute_args & args) {
+    ggml_cuda_set_device(device);
+    const int cc = ggml_cuda_info().devices[device].cc;
+    const bool disabled = ggml_cuda_gdn_chunked_disabled();
+    return ggml_cuda_gdn_cute_plan(
+        args,
+        cc,
+        ggml_cuda_gdn_cute_init(device),
+        !disabled && ggml_cuda_gdn_chunked_init(device),
+        disabled);
+}
+
+bool ggml_cuda_gdn_cute_available(int device, const ggml_cuda_gdn_cute_args & args) {
+    return ggml_cuda_gdn_cute_make_plan(device, args).available();
+}
+
+size_t ggml_cuda_gdn_cute_get_alloc_size(
+        int device, const ggml_cuda_gdn_cute_args & args, size_t logical_size) {
+    const gdn_cute_plan plan = ggml_cuda_gdn_cute_make_plan(device, args);
+    if (!plan.available()) {
+        return logical_size;
     }
 
     constexpr size_t alignment = 128;
@@ -534,27 +612,29 @@ size_t ggml_cuda_gdn_cute_get_alloc_size(
         GGML_ABORT("GDN CuTe allocation size overflow");
     }
     const size_t workspace_offset = (logical_size + alignment - 1) & ~(alignment - 1);
-    if (workspace_offset > std::numeric_limits<size_t>::max() - workspace.bytes) {
+    if (workspace_offset > std::numeric_limits<size_t>::max() - plan.workspace_bytes()) {
         GGML_ABORT("GDN CuTe allocation size overflow");
     }
-    return workspace_offset + workspace.bytes;
+    return workspace_offset + plan.workspace_bytes();
 }
 
-bool ggml_cuda_gdn_cute_launch(const ggml_cuda_gdn_cute_args & args, cudaStream_t stream) {
+bool ggml_cuda_gdn_cute_launch(int device, const ggml_cuda_gdn_cute_args & args, cudaStream_t stream) {
     if (args.workspace == nullptr || args.state_out == nullptr) {
         return false;
     }
 
-    gdn_cute_workspace_layout workspace;
-    if (!ggml_cuda_gdn_cute_workspace_layout(args, workspace) ||
-        workspace.bytes > args.workspace_size) {
+    const gdn_cute_plan plan = ggml_cuda_gdn_cute_make_plan(device, args);
+    if (!plan.available() || plan.workspace_bytes() > args.workspace_size) {
         return false;
+    }
+    if (plan.schedule == gdn_cute_schedule::chunked) {
+        return ggml_cuda_gdn_chunked_launch(args, plan.chunked, stream);
     }
 
     tf32 * packed_q = static_cast<tf32 *>(args.workspace);
-    tf32 * packed_k = packed_q + workspace.q_elems;
-    tf32 * packed_k_low = packed_k + workspace.q_elems;
-    const int blocks = (int) ((workspace.q_elems + 255) / 256);
+    tf32 * packed_k = packed_q + plan.persistent.q_elems;
+    tf32 * packed_k_low = packed_k + plan.persistent.q_elems;
+    const int blocks = (int) ((plan.persistent.q_elems + 255) / 256);
     gdn_prepack_qk_f32_tf32<<<blocks, 256, 0, stream>>>(
         args.q, args.k, packed_q, packed_k, packed_k_low,
         args.H_k, args.n_tokens, args.n_seqs, args.rq3,
