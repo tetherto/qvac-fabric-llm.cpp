@@ -1280,11 +1280,69 @@ struct ggml_tensor_extra_gpu {
 
 struct ggml_cuda_graph {
 #ifdef USE_CUDA_GRAPH
+    struct owned_buffer {
+        char * data = nullptr;
+        size_t size = 0;
+
+        owned_buffer() = default;
+
+        explicit owned_buffer(size_t size) : size(size) { CUDA_CHECK(cudaMalloc((void **) &data, size)); }
+
+        owned_buffer(const owned_buffer &)             = delete;
+        owned_buffer & operator=(const owned_buffer &) = delete;
+
+        owned_buffer(owned_buffer && other) noexcept : data(other.data), size(other.size) {
+            other.data = nullptr;
+            other.size = 0;
+        }
+
+        owned_buffer & operator=(owned_buffer && other) noexcept {
+            GGML_ASSERT(data == nullptr);
+            data       = other.data;
+            size       = other.size;
+            other.data = nullptr;
+            other.size = 0;
+            return *this;
+        }
+
+        ~owned_buffer() {
+            if (data != nullptr) {
+                CUDA_CHECK(cudaFree(data));
+            }
+        }
+    };
+
     ~ggml_cuda_graph() {
         for (cudaGraphExec_t instance : instances) {
             CUDA_CHECK(cudaGraphExecDestroy(instance));
         }
     }
+
+    // chunks captured during an update point at pending_workspace; commit it once every chunk is captured
+    void * reserve_workspace(size_t size, bool update_required) {
+        if (size == 0) {
+            return nullptr;
+        }
+        if (workspace.size >= size) {
+            return workspace.data;
+        }
+        GGML_ASSERT(update_required && pending_workspace.data == nullptr);
+        pending_workspace = owned_buffer(size);
+        return pending_workspace.data;
+    }
+
+    void commit_workspace() {
+        if (pending_workspace.data == nullptr) {
+            return;
+        }
+        owned_buffer old_workspace(std::move(workspace));
+        workspace = std::move(pending_workspace);
+    }
+
+    void discard_pending_workspace() {
+        owned_buffer discarded(std::move(pending_workspace));
+    }
+
     // the ggml graph is captured as a series of CUDA graphs, so the GPU can run one chunk while the next is enqueued
     std::vector<cudaGraphExec_t> instances;
     size_t num_nodes = 0;
@@ -1300,6 +1358,8 @@ struct ggml_cuda_graph {
         size_t   node_src_nb[GGML_MAX_SRC][GGML_MAX_DIMS];
     };
     std::vector<node_properties> node_props;
+    owned_buffer                 workspace;
+    owned_buffer                 pending_workspace;
 
     bool is_enabled() const {
         static const bool disable_cuda_graphs_due_to_env = (getenv("GGML_CUDA_DISABLE_GRAPHS") != nullptr);
