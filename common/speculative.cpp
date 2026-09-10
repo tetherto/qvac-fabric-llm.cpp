@@ -2385,6 +2385,7 @@ common_speculative_init_result::common_speculative_init_result(
 
     if (spec_mtp) {
         cparams.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
+        cparams.ctx_other_share_compute = true;
     }
 
     // note: for small models maybe we can set this to the maximum possible draft from all speculative types

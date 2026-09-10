@@ -1,4 +1,8 @@
 #include "common.h"
+#include "speculative.h"
+#include "../src/llama-context.h"
+#include "../ggml/src/ggml-backend-impl.h"
+#include <set>
 #include "log.h"
 #include "ggml-backend.h"
 #include "ggml.h"
@@ -65,7 +69,7 @@ static void set_tensor_data(struct ggml_tensor * tensor, void * userdata) {
 }
 
 static void usage(char ** argv) {
-    printf("Usage: %s [-a/--arch arch] [-s/--seed seed] [-v/--verbose]\n", argv[0]);
+    printf("Usage: %s [-a/--arch arch] [-s/--seed seed] [-v/--verbose] [--mtp-shared|--mtp-shared-cpu]\n", argv[0]);
 }
 
 static std::vector<llama_token> get_tokens(const uint32_t n_tokens, const uint32_t n_vocab, const size_t seed){
@@ -731,9 +735,183 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const gg
     return all_ok ? 0 : 1;
 }
 
+struct mtp_backend_probe {
+    ggml_backend_i iface;
+    bool pending = false;
+    bool fail = false;
+    std::set<ggml_backend_buffer_t> buffers;
+};
+
+static std::map<ggml_backend_t, mtp_backend_probe> mtp_probes;
+
+static ggml_status mtp_graph_compute(ggml_backend_t backend, ggml_cgraph * graph) {
+    auto & probe = mtp_probes.at(backend);
+    for (int i = 0; i < ggml_graph_n_nodes(graph); ++i) {
+        auto * tensor = ggml_graph_node(graph, i);
+        if (tensor->buffer && ggml_backend_buffer_get_usage(tensor->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE) {
+            probe.buffers.insert(tensor->buffer);
+        }
+    }
+    auto status = probe.iface.graph_compute(backend, graph);
+    probe.pending = true;
+    if (probe.fail) {
+        probe.fail = false;
+        return GGML_STATUS_FAILED; // Fail after submitting work to exercise error-path synchronization.
+    }
+    return status;
+}
+
+static void mtp_synchronize(ggml_backend_t backend) {
+    auto & probe = mtp_probes.at(backend);
+    if (probe.iface.synchronize) {
+        probe.iface.synchronize(backend);
+    }
+    probe.pending = false;
+}
+
+static int test_mtp_shared(bool cpu) {
+    // A CPU helper with ACCEL classification exercises the same device gate as BLAS/Accelerate.
+    static ggml_backend_device helper = *ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+    helper.iface.get_type = [](ggml_backend_dev_t) { return GGML_BACKEND_DEVICE_TYPE_ACCEL; };
+    helper.iface.init_backend = [](ggml_backend_dev_t dev, const char * params) {
+        auto cpu = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+        auto backend = cpu->iface.init_backend(cpu, params);
+        backend->device = dev;
+        return backend;
+    };
+    helper.iface.supports_op = [](ggml_backend_dev_t, const ggml_tensor *) { return false; };
+    ggml_backend_device_register(&helper);
+    auto metadata = get_gguf_ctx(LLM_ARCH_QWEN35, false);
+    gguf_set_val_u32(metadata.get(), "qwen35.block_count", 3);
+    gguf_set_val_u32(metadata.get(), "qwen35.nextn_predict_layers", 1);
+    auto mp = llama_model_default_params();
+    static ggml_backend_device compute = *ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+    compute.iface.get_type = [](ggml_backend_dev_t) { return GGML_BACKEND_DEVICE_TYPE_GPU; };
+    compute.iface.init_backend = helper.iface.init_backend;
+    ggml_backend_dev_t devices[] = {&compute, nullptr};
+    if (cpu) {
+        mp.devices = devices; // Exercise sharing and source destruction under CPU sanitizers too.
+    }
+    mp.n_gpu_layers = 999;
+    mp.load_mtp = true;
+    size_t seed = 1234;
+    llama_model_ptr model(llama_model_init_from_user(metadata.get(), set_tensor_data, &seed, mp));
+    GGML_ASSERT(model);
+    std::vector<float> reference;
+    for (bool share : {false, true}) {
+        auto cp = llama_context_default_params();
+        GGML_ASSERT(!cp.ctx_other_share_compute);
+        cp.n_ctx = 512;
+        cp.n_batch = cp.n_ubatch = 32;
+        cp.n_outputs_max = cp.n_outputs_max_per_seq = 32;
+        cp.n_seq_max = 1;
+        cp.n_threads = cp.n_threads_batch = 2;
+        cp.no_perf = false;
+        cp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+        llama_context_ptr target(llama_init_from_model(model.get(), cp));
+        GGML_ASSERT(target);
+        cp.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
+        cp.ctx_other = target.get();
+        cp.ctx_other_share_compute = share;
+        llama_context_ptr draft(llama_init_from_model(model.get(), cp));
+        GGML_ASSERT(draft);
+        common_params_speculative params;
+        params.types = {COMMON_SPECULATIVE_TYPE_DRAFT_MTP};
+        params.draft.ctx_tgt = target.get();
+        params.draft.ctx_dft = draft.get();
+        params.draft.backend_sampling = false;
+        common_speculative_ptr spec(common_speculative_init(params, 1));
+        GGML_ASSERT(spec);
+        auto install = [](llama_context * ctx) {
+            auto sched = ctx->get_sched();
+            for (int i = 0; i < ggml_backend_sched_get_n_backends(sched); ++i) {
+                auto backend = ggml_backend_sched_get_backend(sched, i);
+                mtp_probes[backend].iface = backend->iface;
+                backend->iface.graph_compute = mtp_graph_compute;
+                backend->iface.synchronize = mtp_synchronize;
+            }
+        };
+        install(target.get());
+        install(draft.get());
+        auto finished = [](llama_context * ctx) {
+            auto sched = ctx->get_sched();
+            for (int i = 0; i < ggml_backend_sched_get_n_backends(sched); ++i) {
+                GGML_ASSERT(!mtp_probes.at(ggml_backend_sched_get_backend(sched, i)).pending);
+            }
+        };
+        auto buffers = [](llama_context * ctx) {
+            std::set<ggml_backend_buffer_t> result;
+            auto sched = ctx->get_sched();
+            for (int i = 0; i < ggml_backend_sched_get_n_backends(sched); ++i) {
+                const auto & probe = mtp_probes.at(ggml_backend_sched_get_backend(sched, i));
+                result.insert(probe.buffers.begin(), probe.buffers.end());
+            }
+            return result;
+        };
+        llama_batch batch = llama_batch_init(32, 0, 1);
+        std::vector<float> logits;
+        llama_sampler_ptr sampler(llama_sampler_chain_init(llama_sampler_chain_default_params()));
+        llama_sampler_chain_add(sampler.get(), llama_sampler_init_greedy());
+        common_speculative_begin(spec.get(), 0, {});
+        for (int pass = 0; pass < 8; ++pass) {
+            if (pass == 3 || pass == 5) {
+                GGML_ASSERT(llama_set_sampler(target.get(), 0, pass == 3 ? sampler.get() : nullptr));
+                for (auto & entry : mtp_probes) {
+                    entry.second.buffers.clear();
+                }
+            }
+            common_batch_clear(batch);
+            for (int i = 0; i < 32; ++i) {
+                common_batch_add(batch, (i + pass) % 128, pass * 32 + i, {0}, true);
+            }
+            GGML_ASSERT(llama_decode(target.get(), batch) == 0);
+            const auto * output = llama_get_logits(target.get());
+            logits.insert(logits.end(), output, output + 128 * 32);
+            if (pass == 6) {
+                auto backend = ggml_backend_sched_get_backend(draft->get_sched(), 0);
+                mtp_probes.at(backend).fail = true;
+            }
+            GGML_ASSERT(common_speculative_process(spec.get(), batch) == (pass != 6));
+            finished(draft.get());
+            if (pass == 2 || pass == 4 || pass == 5) {
+                auto tgt = buffers(target.get());
+                auto dft = buffers(draft.get());
+                bool aliases = false;
+                for (auto buffer : tgt) {
+                    aliases |= dft.count(buffer) != 0;
+                }
+                auto backend = ggml_backend_sched_get_backend(target->get_sched(), 0);
+                const auto type = ggml_backend_dev_type(ggml_backend_get_device(backend));
+                if (type == GGML_BACKEND_DEVICE_TYPE_GPU || type == GGML_BACKEND_DEVICE_TYPE_IGPU) {
+                    GGML_ASSERT(aliases == share);
+                }
+            }
+        }
+        GGML_ASSERT(llama_perf_context(target.get()).n_reused > 0);
+        GGML_ASSERT(llama_perf_context(draft.get()).n_reused > 0);
+        if (share) {
+            GGML_ASSERT(nmse(reference, logits) < 1e-8);
+        } else {
+            reference = logits;
+        }
+        llama_batch_free(batch);
+        spec.reset();
+        target.reset();
+        llama_set_embeddings(draft.get(), true);
+        draft->sched_reserve(); // The source is gone; the draft must reserve independently.
+        draft.reset();
+        mtp_probes.clear();
+    }
+    printf("MTP shared compute: passed\n");
+    return 0;
+}
+
 int main(int argc, char ** argv) {
     // FIXME these tests are disabled in the CI for macOS-latest-cmake-arm64 because they are segfaulting
     common_init();
+    if (argc == 2 && (strcmp(argv[1], "--mtp-shared") == 0 || strcmp(argv[1], "--mtp-shared-cpu") == 0)) {
+        return test_mtp_shared(strcmp(argv[1], "--mtp-shared-cpu") == 0);
+    }
     std::random_device rd;
 
     llm_arch arch = LLM_ARCH_UNKNOWN;

@@ -420,6 +420,10 @@ extern "C" {
         // a source/target/parent context
         // can be utilized in various ways, for example by sharing results or llama_memory between 2 contexts
         struct llama_context * ctx_other;
+        // Share MTP compute buffers with ctx_other when compatible (default: false).
+        // The caller must serialize all sharing contexts, including asynchronous work.
+        // Synchronize the previous context before decoding, reserving, or changing another context.
+        bool ctx_other_share_compute;
         bool training;    // if true, we're in training mode (affects LoRA K/V gradient flow)
     };
 
