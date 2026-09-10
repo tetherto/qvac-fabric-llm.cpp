@@ -101,31 +101,60 @@ static __global__ void cutlass_quantize_mxfp8(
     }
 }
 
-static size_t cutlass_activation_size(ggml_type type, int64_t n_rows, int64_t n_cols) {
-    GGML_ASSERT(type == GGML_TYPE_MXFP4 || type == GGML_TYPE_NVFP4);
-    GGML_ASSERT(n_rows > 0 && n_cols > 0 && n_cols % 128 == 0);
-    return type == GGML_TYPE_NVFP4 ? (size_t) n_rows * n_cols / 2 : (size_t) n_rows * n_cols;
+static bool cutlass_size_mul(size_t a, size_t b, size_t & result) {
+    if (a != 0 && b > SIZE_MAX / a) {
+        return false;
+    }
+    result = a * b;
+    return true;
 }
 
-static size_t cutlass_scale_size(ggml_type type, int64_t n_rows, int64_t n_cols) {
-    GGML_ASSERT(type == GGML_TYPE_MXFP4 || type == GGML_TYPE_NVFP4);
-    GGML_ASSERT(n_rows > 0 && n_cols > 0 && n_cols % 128 == 0);
+static bool cutlass_size_add(size_t a, size_t b, size_t & result) {
+    if (b > SIZE_MAX - a) {
+        return false;
+    }
+    result = a + b;
+    return true;
+}
+
+static bool cutlass_size_pad_128(size_t size, size_t & result) {
+    if (size > SIZE_MAX - 127) {
+        return false;
+    }
+    result = GGML_PAD(size, (size_t) 128);
+    return true;
+}
+
+static bool cutlass_activation_size(ggml_type type, int64_t n_rows, int64_t n_cols, size_t & result) {
+    if ((type != GGML_TYPE_MXFP4 && type != GGML_TYPE_NVFP4) || n_rows <= 0 || n_cols <= 0 || n_cols % 128 != 0) {
+        return false;
+    }
+    const size_t row_size = type == GGML_TYPE_NVFP4 ? (size_t) n_cols / 2 : (size_t) n_cols;
+    return cutlass_size_mul((size_t) n_rows, row_size, result);
+}
+
+static bool cutlass_scale_size(ggml_type type, int64_t n_rows, int64_t n_cols, size_t & result) {
+    if ((type != GGML_TYPE_MXFP4 && type != GGML_TYPE_NVFP4) || n_rows <= 0 || n_cols <= 0 || n_cols % 128 != 0 ||
+        (size_t) n_rows > SIZE_MAX - 127) {
+        return false;
+    }
     const int scale_values = type == GGML_TYPE_NVFP4 ? QK_NVFP4_SUB : QK_MXFP4;
-    return (size_t) GGML_PAD(n_rows, 128) * (n_cols / scale_values);
+    const size_t rows_padded  = GGML_PAD((size_t) n_rows, (size_t) 128);
+    return cutlass_size_mul(rows_padded, (size_t) n_cols / scale_values, result);
 }
 
-static bool cutlass_quantize(
-        const float * src,
-        uint8_t * dst,
-        uint8_t * scales,
-        float * row_scales,
-        bool use_aligned_float8,
-        ggml_type type,
-        int64_t n_cols,
-        int64_t n_cols_padded,
-        int64_t stride_row,
-        int64_t n_rows,
-        cudaStream_t stream) {
+static bool cutlass_quantize(const float * src,
+                             uint8_t *     dst,
+                             uint8_t *     scales,
+                             float *       row_scales,
+                             bool          use_aligned_float8,
+                             ggml_type     type,
+                             int64_t       n_cols,
+                             int64_t       n_cols_padded,
+                             int64_t       stride_row,
+                             int64_t       n_rows,
+                             size_t        scales_size,
+                             cudaStream_t  stream) {
     if ((type != GGML_TYPE_MXFP4 && type != GGML_TYPE_NVFP4) ||
         n_cols <= 0 || n_cols % 2 != 0 ||
         n_cols_padded < n_cols || n_cols_padded % 128 != 0 ||
@@ -135,7 +164,7 @@ static bool cutlass_quantize(
     }
 
     constexpr int threads = 256;
-    CUDA_CHECK(cudaMemsetAsync(scales, 0, cutlass_scale_size(type, n_rows, n_cols_padded), stream));
+    CUDA_CHECK(cudaMemsetAsync(scales, 0, scales_size, stream));
     if (type == GGML_TYPE_NVFP4) {
         quantize_cutlass_nvfp4_cuda(src, dst, scales, row_scales, use_aligned_float8,
             n_cols, n_cols_padded, stride_row, n_rows, stream);
@@ -144,6 +173,85 @@ static bool cutlass_quantize(
             src, dst, scales, n_cols, n_cols_padded, stride_row);
     }
     CUDA_CHECK(cudaGetLastError());
+    return true;
+}
+
+bool ggml_cuda_cutlass_get_activation_layout(ggml_backend_cuda_context &           ctx,
+                                             const ggml_tensor *                   src0,
+                                             const ggml_tensor *                   src1,
+                                             const ggml_tensor *                   dst,
+                                             ggml_cuda_cutlass_activation_layout & layout) {
+    layout = {};
+
+    ggml_cuda_cutlass_weight weight;
+    if (!ggml_cuda_repacked_mul_mat_supported(src0, src1, dst) || !ggml_cuda_cutlass_weight_from_tensor(src0, weight) ||
+        src1->buffer == nullptr || dst->buffer == nullptr || src0->ne[1] % 4 != 0) {
+        return false;
+    }
+
+    const auto & device_info = ggml_cuda_info().devices[ctx.device];
+    if (!blackwell_mma_available(device_info.cc)) {
+        return false;
+    }
+
+    const ggml_backend_buffer_type_t buffer_type = ggml_backend_cuda_buffer_type(ctx.device);
+    if (ggml_backend_buffer_get_type(src1->buffer) != buffer_type ||
+        ggml_backend_buffer_get_type(dst->buffer) != buffer_type) {
+        return false;
+    }
+
+    const int64_t k = src0->ne[0];
+    const int64_t m = ggml_nelements(src1) / k;
+    size_t        scales_end;
+    if (!cutlass_activation_size(src0->type, m, weight.k, layout.size_values) ||
+        !cutlass_size_pad_128(layout.size_values, layout.offset_scales) ||
+        !cutlass_scale_size(src0->type, m, weight.k, layout.size_scales) ||
+        !cutlass_size_add(layout.offset_scales, layout.size_scales, scales_end) ||
+        !cutlass_size_pad_128(scales_end, layout.offset_rows) ||
+        (src0->type == GGML_TYPE_NVFP4 && !cutlass_size_mul((size_t) m, sizeof(float), layout.size_rows)) ||
+        !cutlass_size_add(layout.offset_rows, layout.size_rows, layout.size_allocation)) {
+        return false;
+    }
+    layout.m        = (int) m;
+    layout.k        = (int) k;
+    layout.k_padded = (int) weight.k;
+    layout.type     = src0->type;
+    return true;
+}
+
+bool ggml_cuda_cutlass_prepare_activation(ggml_backend_cuda_context &                 ctx,
+                                          const ggml_tensor *                         src1,
+                                          const ggml_cuda_cutlass_activation_layout & layout,
+                                          void *                                      workspace,
+                                          size_t                                      workspace_size,
+                                          ggml_cuda_cutlass_activation &              activation) {
+    activation = {};
+    if (src1 == nullptr || src1->type != GGML_TYPE_F32 || !ggml_is_contiguous(src1) || layout.m <= 0 || layout.k <= 0 ||
+        layout.k_padded < layout.k || layout.size_allocation == 0 || workspace == nullptr ||
+        workspace_size < layout.size_allocation || layout.size_values > layout.offset_scales ||
+        layout.offset_scales > layout.offset_rows || layout.offset_rows > layout.size_allocation ||
+        layout.size_scales > layout.offset_rows - layout.offset_scales ||
+        layout.size_rows > layout.size_allocation - layout.offset_rows ||
+        ggml_nelements(src1) != (int64_t) layout.m * layout.k) {
+        return false;
+    }
+
+    uint8_t * values     = (uint8_t *) workspace;
+    uint8_t * scales     = values + layout.offset_scales;
+    float *   row_scales = layout.size_rows != 0 ? (float *) (values + layout.offset_rows) : nullptr;
+    if (!cutlass_quantize((const float *) src1->data, values, scales, row_scales, ggml_cuda_is_aligned(src1, 32),
+                          layout.type, layout.k, layout.k_padded, src1->nb[1] / sizeof(float), layout.m,
+                          layout.size_scales, ctx.stream())) {
+        return false;
+    }
+
+    activation.values     = values;
+    activation.scales     = scales;
+    activation.row_scales = row_scales;
+    activation.m          = layout.m;
+    activation.k          = layout.k;
+    activation.k_padded   = layout.k_padded;
+    activation.type       = layout.type;
     return true;
 }
 
@@ -355,70 +463,79 @@ bool ggml_cuda_cutlass_compiled() {
     return true;
 }
 
-ggml_cuda_cutlass_result ggml_cuda_cutlass_mul_mat(
-        ggml_backend_cuda_context & ctx,
-        const ggml_tensor * src0,
-        const ggml_tensor * src1,
-        ggml_tensor * dst) {
+ggml_cuda_cutlass_result ggml_cuda_cutlass_mul_mat_prequantized(ggml_backend_cuda_context &          ctx,
+                                                                const ggml_tensor *                  src0,
+                                                                const ggml_tensor *                  src1,
+                                                                ggml_tensor *                        dst,
+                                                                const ggml_cuda_cutlass_activation & activation) {
     using namespace ggml_cutlass_sm120;
 
+    ggml_cuda_cutlass_activation_layout layout;
     ggml_cuda_cutlass_weight weight;
-    if (!ggml_cuda_repacked_mul_mat_supported(src0, src1, dst) ||
-        !ggml_cuda_cutlass_weight_from_tensor(src0, weight) ||
-        src1->buffer == nullptr || dst->buffer == nullptr) {
-        return ggml_cuda_cutlass_result::fallback;
-    }
-    if (src0->ne[1] % 4 != 0) {
-        return ggml_cuda_cutlass_result::fallback;
-    }
-
-    const auto & device_info = ggml_cuda_info().devices[ctx.device];
-    if (!blackwell_mma_available(device_info.cc)) {
+    if (!ggml_cuda_cutlass_get_activation_layout(ctx, src0, src1, dst, layout) ||
+        !ggml_cuda_cutlass_weight_from_tensor(src0, weight) || activation.values == nullptr ||
+        activation.scales == nullptr || activation.m != layout.m || activation.k != layout.k ||
+        activation.k_padded != layout.k_padded || activation.type != layout.type ||
+        (layout.type == GGML_TYPE_NVFP4 && activation.row_scales == nullptr)) {
         return ggml_cuda_cutlass_result::fallback;
     }
 
-    const ggml_backend_buffer_type_t buffer_type = ggml_backend_cuda_buffer_type(ctx.device);
-    if (ggml_backend_buffer_get_type(src1->buffer) != buffer_type ||
-        ggml_backend_buffer_get_type(dst->buffer) != buffer_type) {
-        return ggml_cuda_cutlass_result::fallback;
-    }
-
-    const int64_t k = src0->ne[0];
     const int64_t n = src0->ne[1];
-    const int64_t m = ggml_nelements(src1) / k;
-    const int64_t k_padded = weight.k;
-    cudaStream_t stream = ctx.stream();
+    return dispatch_dense_gemm(ctx, weight, activation.values, activation.scales, activation.row_scales, dst->data,
+                               activation.m, (int) n, activation.k_padded, ctx.stream());
+}
 
-    ggml_cuda_pool_alloc<uint8_t> activation(ctx.pool(), cutlass_activation_size(src0->type, m, k_padded));
-    ggml_cuda_pool_alloc<uint8_t> scales(ctx.pool(), cutlass_scale_size(src0->type, m, k_padded));
-    ggml_cuda_pool_alloc<float> row_scales(ctx.pool());
-    if (src0->type == GGML_TYPE_NVFP4) {
-        row_scales.alloc(m);
-    }
-    if (!cutlass_quantize(
-            (const float *) src1->data,
-            activation.get(),
-            scales.get(),
-            row_scales.get(),
-            ggml_cuda_is_aligned(src1, 32),
-            src0->type,
-            k,
-            k_padded,
-            src1->nb[1] / sizeof(float),
-            m,
-            stream)) {
+ggml_cuda_cutlass_result ggml_cuda_cutlass_mul_mat(ggml_backend_cuda_context & ctx,
+                                                   const ggml_tensor *         src0,
+                                                   const ggml_tensor *         src1,
+                                                   ggml_tensor *               dst) {
+    ggml_cuda_cutlass_activation_layout layout;
+    if (!ggml_cuda_cutlass_get_activation_layout(ctx, src0, src1, dst, layout)) {
         return ggml_cuda_cutlass_result::fallback;
     }
 
-    return dispatch_dense_gemm(
-        ctx, weight, activation.get(), scales.get(), row_scales.get(), dst->data,
-        (int) m, (int) n, (int) k_padded, stream);
+    ggml_cuda_pool_alloc<char>   workspace(ctx.pool(), layout.size_allocation);
+    ggml_cuda_cutlass_activation activation;
+    if (!ggml_cuda_cutlass_prepare_activation(ctx, src1, layout, workspace.get(), workspace.actual_size, activation)) {
+        return ggml_cuda_cutlass_result::fallback;
+    }
+    return ggml_cuda_cutlass_mul_mat_prequantized(ctx, src0, src1, dst, activation);
 }
 
 #else
 
 bool ggml_cuda_cutlass_compiled() {
     return false;
+}
+
+bool ggml_cuda_cutlass_get_activation_layout(ggml_backend_cuda_context &           ctx,
+                                             const ggml_tensor *                   src0,
+                                             const ggml_tensor *                   src1,
+                                             const ggml_tensor *                   dst,
+                                             ggml_cuda_cutlass_activation_layout & layout) {
+    GGML_UNUSED_VARS(ctx, src0, src1, dst);
+    layout = {};
+    return false;
+}
+
+bool ggml_cuda_cutlass_prepare_activation(ggml_backend_cuda_context &                 ctx,
+                                          const ggml_tensor *                         src1,
+                                          const ggml_cuda_cutlass_activation_layout & layout,
+                                          void *                                      workspace,
+                                          size_t                                      workspace_size,
+                                          ggml_cuda_cutlass_activation &              activation) {
+    GGML_UNUSED_VARS(ctx, src1, layout, workspace, workspace_size);
+    activation = {};
+    return false;
+}
+
+ggml_cuda_cutlass_result ggml_cuda_cutlass_mul_mat_prequantized(ggml_backend_cuda_context &          ctx,
+                                                                const ggml_tensor *                  src0,
+                                                                const ggml_tensor *                  src1,
+                                                                ggml_tensor *                        dst,
+                                                                const ggml_cuda_cutlass_activation & activation) {
+    GGML_UNUSED_VARS(ctx, src0, src1, dst, activation);
+    return ggml_cuda_cutlass_result::fallback;
 }
 
 ggml_cuda_cutlass_result ggml_cuda_cutlass_mul_mat(
