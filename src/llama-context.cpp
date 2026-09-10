@@ -162,6 +162,12 @@ llama_context::llama_context(
         }
     }
 
+    if (params.ctx_type == LLAMA_CONTEXT_TYPE_MTP && params.ctx_other != nullptr &&
+        &params.ctx_other->get_model() == &model &&
+        cparams.n_seq_max == 1 && params.ctx_other->n_seq_max() == 1) {
+        ctx_compute = params.ctx_other;
+    }
+
     auto rope_scaling_type = params.rope_scaling_type;
     if (rope_scaling_type == LLAMA_ROPE_SCALING_TYPE_UNSPECIFIED) {
         rope_scaling_type = hparams.rope_scaling_type_train;
@@ -658,6 +664,28 @@ void llama_context::sched_reserve() {
         }
     };
     create_sched(cparams.pipeline_parallel);
+
+    if (ctx_compute != nullptr) {
+        int n_devices = 0;
+        bool is_cuda = true;
+        for (ggml_backend_t backend : backend_ptrs) {
+            ggml_backend_dev_t device = ggml_backend_get_device(backend);
+            if (device == nullptr || ggml_backend_dev_type(device) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+                continue;
+            }
+
+            n_devices++;
+            ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(device);
+            is_cuda = is_cuda && reg != nullptr && strcmp(ggml_backend_reg_name(reg), "CUDA") == 0;
+        }
+
+        if (n_devices == 1 && is_cuda &&
+            ggml_backend_sched_share_compute_buffers(sched.get(), ctx_compute->get_sched())) {
+            LLAMA_LOG_INFO("%s: sharing compute buffers with the target context\n", __func__);
+        } else {
+            LLAMA_LOG_INFO("%s: compute buffer sharing unavailable; using independent buffers\n", __func__);
+        }
+    }
 
     llama_memory_context_ptr mctx;
     if (memory) {

@@ -85,6 +85,13 @@ extern "C" {
     GGML_API ggml_backend_buffer_t ggml_backend_multi_buffer_get_buffer(ggml_backend_buffer_t buffer, const void * addr);
     GGML_API void                  ggml_backend_multi_buffer_set_usage(ggml_backend_buffer_t buffer, enum ggml_backend_buffer_usage usage);
 
+    // graph allocator internals
+    struct ggml_gallocr;
+#if defined(__GNUC__) || defined(__clang__)
+    __attribute__((visibility("hidden")))
+#endif
+    bool ggml_gallocr_share_buffers(struct ggml_gallocr * dst, struct ggml_gallocr * src);
+
     //
     // Backend (meta)
     //
