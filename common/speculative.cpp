@@ -1523,6 +1523,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             if (chain_heads) {
                 llama_set_nextn_layer_offset(ctx_dft, 0); // restore default for non-draft decodes
             }
+            // Catch-up decode is async; finish before the target reuses shared compute buffers.
+            llama_synchronize(ctx_dft);
             if (!ok) {
                 return false;
             }
