@@ -367,7 +367,7 @@ static void ggml_cuda_op_gated_delta_net_impl(
             GGML_ASSERT(workspace_offset <= allocation_size);
             args.workspace = (char *) dst->data + workspace_offset;
             args.workspace_size = allocation_size - workspace_offset;
-            if (ggml_cuda_gdn_cute_launch(args, stream)) {
+            if (ggml_cuda_gdn_cute_launch(ctx.device, args, stream)) {
                 return;
             }
         }

@@ -250,7 +250,7 @@ int main(int argc, char ** argv) {
         }
         return child_main(tokens, split);
     }
-    for (int64_t tokens : { 63, 64, 65, 127, 128, 129, 512 }) {
+    for (int64_t tokens : { 63, 64, 65, 127, 128, 129, 512, 1024, 2048 }) {
         if (child_main(tokens, tokens / 2) != 0) {
             return 1;
         }
