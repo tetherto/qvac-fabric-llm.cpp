@@ -113,9 +113,17 @@ void ggml_cuda_out_prod(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 
     const bool src1_T = ggml_is_transposed(src1);
     const cublasOperation_t src1_cublas_op =  src1_T ? CUBLAS_OP_N : CUBLAS_OP_T;
-    const int64_t           ldb            = allocated_src1 ?
+    int64_t                 ldb            = allocated_src1 ?
                                              (src1_T ? ne10 : ne11) :
                                              ((src1_T ?        nb10 :        nb11) /  sizeof(float));
+
+    // A size-1 dimension carries no real stride (ggml sets nb[i] = nb[i-1]), so ldb can land
+    // below the minimum cuBLAS wants.
+    const int64_t ldb_min = src1_T ? ne01 : ne1;
+    if (ldb < ldb_min) {
+        GGML_ASSERT((src1_T ? ne1 : ne01) <= 1);
+        ldb = ldb_min;
+    }
 
     // Only assert for non dequantized src1
     if (!allocated_src1) {
