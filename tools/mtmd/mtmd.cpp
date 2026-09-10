@@ -773,40 +773,67 @@ struct mtmd_context {
             model_params.convert_bf16_to_f16 = !ggml_backend_dev_supports_op(device, probe);
         }
 
-        ggml_backend_buffer_type_t buft = device
-            ? ggml_backend_dev_buffer_type(device)
-            : ggml_backend_dev_buffer_type(ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU));
-        models = mtmd_model_load(mmproj_fname, model_params, buft);
+        // Loads the weights and runs the warmups (which reserve the compute buffers) on
+        // dev, nullptr meaning CPU. When the accelerated backend cannot hold the projector
+        // (a GPU with little free memory, iOS Metal next to a large text model), it is
+        // rebuilt on the CPU backend with the same parameters, so the projector keeps
+        // working, only slower. The failed attempt is freed first so its buffers don't
+        // compete with the retry on unified memory. The modalities share one backend and
+        // scheduler, so they fall back together.
+        auto load_on = [&](ggml_backend_dev_t dev) {
+            ggml_backend_buffer_type_t buft = dev
+                ? ggml_backend_dev_buffer_type(dev)
+                : ggml_backend_dev_buffer_type(ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU));
+            models = mtmd_model_load(mmproj_fname, model_params, buft);
 
-        // soprano and pocket-tts without voice cloning have no encoder
-        if (!models.v && !models.a && !models.gen_a) {
-            throw std::runtime_error(mtmd_format("Failed to load mmproj model from %s\n", mmproj_fname));
-        }
-
-        int max_nodes = 0;
-        for (const auto * m : { models.v.get(), models.a.get(), models.gen_a.get() }) {
-            if (m) {
-                max_nodes = std::max(max_nodes, m->max_nodes);
+            // soprano and pocket-tts without voice cloning have no encoder
+            if (!models.v && !models.a && !models.gen_a) {
+                throw std::runtime_error(mtmd_format("Failed to load mmproj model from %s\n", mmproj_fname));
             }
-        }
 
-        // no_alloc only measures memory, nothing is computed
-        backends = std::make_unique<mtmd_backends>(device, no_alloc ? 1 : ctx_params.n_threads, max_nodes,
-                                                   ctx_params.cb_eval, ctx_params.cb_eval_user_data);
+            int max_nodes = 0;
+            for (const auto * m : { models.v.get(), models.a.get(), models.gen_a.get() }) {
+                if (m) {
+                    max_nodes = std::max(max_nodes, m->max_nodes);
+                }
+            }
 
-        // like llama_context::sched_reserve(), each warmup reserves its graph on the shared scheduler
-        mtmd_subctx_params sctx_params {
-            /* flash_attn_type   */ mtmd_to_flash_attn_type(ctx_params.flash_attn_type),
-            /* warmup            */ ctx_params.warmup,
+            // no_alloc only measures memory, nothing is computed
+            backends = std::make_unique<mtmd_backends>(dev, no_alloc ? 1 : ctx_params.n_threads, max_nodes,
+                                                       ctx_params.cb_eval, ctx_params.cb_eval_user_data);
+
+            // like llama_context::sched_reserve(), each warmup reserves its graph on the shared scheduler
+            mtmd_subctx_params sctx_params {
+                /* flash_attn_type   */ mtmd_to_flash_attn_type(ctx_params.flash_attn_type),
+                /* warmup            */ ctx_params.warmup,
+            };
+            if (models.v) {
+                ctx_v = std::make_unique<mtmd_subcontext>(*models.v, *backends, sctx_params);
+            }
+            if (models.a) {
+                ctx_a = std::make_unique<mtmd_subcontext>(*models.a, *backends, sctx_params);
+            }
+            if (models.gen_a) {
+                ctx_gen_a = std::make_unique<mtmd_subcontext>(*models.gen_a, *backends, sctx_params);
+            }
         };
-        if (models.v) {
-            ctx_v = std::make_unique<mtmd_subcontext>(*models.v, *backends, sctx_params);
-        }
-        if (models.a) {
-            ctx_a = std::make_unique<mtmd_subcontext>(*models.a, *backends, sctx_params);
-        }
-        if (models.gen_a) {
-            ctx_gen_a = std::make_unique<mtmd_subcontext>(*models.gen_a, *backends, sctx_params);
+        try {
+            load_on(device);
+        } catch (const mtmd_backend_alloc_error & e) {
+            if (device == nullptr || ggml_backend_dev_type(device) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+                throw;
+            }
+            LOG_WRN("%s: %s", __func__, e.what());
+            LOG_WRN("%s: not enough memory on %s for the projector, loading it on CPU instead\n",
+                    __func__, ggml_backend_dev_name(device));
+            // the subcontexts point into the models and the backends
+            ctx_gen_a.reset();
+            ctx_a.reset();
+            ctx_v.reset();
+            backends.reset();
+            models = mtmd_models{};
+            model_params.convert_bf16_to_f16 = false; // the CPU backend runs bf16 weights
+            load_on(nullptr);
         }
         for (size_t i = 0; i < backends->ptrs.size(); ++i) {
             const size_t size = ggml_backend_sched_get_buffer_size(backends->sched.get(), backends->ptrs[i]);

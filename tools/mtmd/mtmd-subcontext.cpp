@@ -300,7 +300,11 @@ void mtmd_subcontext::warmup(const mtmd_image_f32_batch & batch) {
 
 mtmd_subcontext::support_info_graph mtmd_subcontext::reserve_compute_meta(const mtmd_image_f32_batch & batch) {
     ggml_cgraph * gf = mtmd_get_graph_builder(this, batch)->build();
-    ggml_backend_sched_reserve(backends.sched.get(), gf);
+    if (!ggml_backend_sched_reserve(backends.sched.get(), gf)) {
+        throw mtmd_backend_alloc_error(mtmd_format(
+            "%s: failed to reserve the compute buffers for the projector graph on %s\n",
+            __func__, ggml_backend_name(backends.backend)));
+    }
 
     const int n_splits = ggml_backend_sched_get_n_splits(backends.sched.get());
     const int n_nodes  = ggml_graph_n_nodes(gf);

@@ -11,6 +11,7 @@
 #include <unordered_set>
 #include <cstdint>
 #include <cmath>
+#include <stdexcept>
 
 enum mtmd_modality {
     MTMD_MODALITY_VISION,
@@ -1426,7 +1427,15 @@ struct mtmd_models {
     std::unique_ptr<mtmd_model> gen_a;
 };
 
+// Thrown when the accelerated backend cannot hold an encoder: its weight buffer or
+// its warmup compute buffers failed to allocate. mtmd_context catches it and reloads
+// the projector on the CPU backend instead of failing the load.
+struct mtmd_backend_alloc_error : public std::runtime_error {
+    using std::runtime_error::runtime_error;
+};
+
 // the weights are allocated in buft, throws on error
+// (mtmd_backend_alloc_error when buft cannot hold them)
 mtmd_models mtmd_model_load(const char * fname, const mtmd_model_params & params, ggml_backend_buffer_type_t buft);
 
 struct mtmd_model_caps {

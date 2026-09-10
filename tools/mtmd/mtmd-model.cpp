@@ -3936,18 +3936,41 @@ struct mtmd_model_loader {
                     if (probe_buf) ggml_backend_buffer_free(probe_buf);
                     if (!repack_tensors.empty()) {
                         model.buf_repack.reset(ggml_backend_buft_alloc_buffer(repack_buft, repack_size));
-                        ggml_backend_buffer_set_usage(model.buf_repack.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
-                        ggml_tallocr talloc = ggml_tallocr_new(model.buf_repack.get());
-                        for (ggml_tensor * t : repack_tensors) ggml_tallocr_alloc(&talloc, t);
-                        LOG_INF("%s: repacked %zu quantized weights into %s (%.1f MiB)\n",
-                                __func__, repack_tensors.size(), ggml_backend_buft_name(repack_buft),
-                                repack_size / 1024.0 / 1024.0);
+                        if (!model.buf_repack) {
+                            // Repacking is only a speed-up: leave these weights to the
+                            // default buffer below rather than failing the load.
+                            LOG_WRN("%s: failed to allocate the %s buffer (%.1f MiB), keeping %zu weights unrepacked\n",
+                                    __func__, ggml_backend_buft_name(repack_buft),
+                                    repack_size / 1024.0 / 1024.0, repack_tensors.size());
+                        } else {
+                            ggml_backend_buffer_set_usage(model.buf_repack.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+                            ggml_tallocr talloc = ggml_tallocr_new(model.buf_repack.get());
+                            for (ggml_tensor * t : repack_tensors) ggml_tallocr_alloc(&talloc, t);
+                            LOG_INF("%s: repacked %zu quantized weights into %s (%.1f MiB)\n",
+                                    __func__, repack_tensors.size(), ggml_backend_buft_name(repack_buft),
+                                    repack_size / 1024.0 / 1024.0);
+                        }
                     }
                 }
             }
             // allocate everything not already placed (i.e. the non-repack tensors)
             model.buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(model.ctx_data.get(), buft));
-            ggml_backend_buffer_set_usage(model.buf.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+            if (model.buf) {
+                ggml_backend_buffer_set_usage(model.buf.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+            } else {
+                // The allocator also returns NULL when nothing was left to place (every
+                // weight already went to the repack buffer). Only a weight that still has
+                // no storage is a failed allocation. Passing NULL on used to abort in
+                // ggml_backend_buffer_set_usage, silently where stderr isn't captured (iOS).
+                for (ggml_tensor * t = ggml_get_first_tensor(model.ctx_data.get()); t != nullptr;
+                     t = ggml_get_next_tensor(model.ctx_data.get(), t)) {
+                    if (t->data == nullptr && t->view_src == nullptr) {
+                        throw mtmd_backend_alloc_error(mtmd_format(
+                            "%s: failed to allocate the %s buffer for the projector weights (%.2f MiB)\n",
+                            __func__, ggml_backend_buft_name(buft), total_data_size / 1024.0 / 1024.0));
+                    }
+                }
+            }
             // read the weight from file
             if (!no_alloc) {
                 size_t data_loaded = 0;
