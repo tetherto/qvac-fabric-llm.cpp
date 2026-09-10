@@ -114,11 +114,21 @@ static void fill_exp_probs_b(std::vector<float> & dst, const char *, const tenso
     }
 }
 
+// MPT divides the activations by ffn.act.scales: keep the divisors away from zero to avoid FP16 overflow
+static void fill_act_scale(std::vector<float> & dst, const char * name, const tensor_data_params & params) {
+    std::mt19937 gen(params.seed ^ std::hash<std::string>{}(name));
+    std::uniform_real_distribution<float> dis(0.5f, 1.5f);
+    for (float & v : dst) {
+        v = dis(gen);
+    }
+}
+
 // a tensor whose values hold a property of their own, matched on a substring of its name, first match wins
 static const struct { const char * match; tensor_filler fill; } TENSOR_FILLERS[] = {
-    { "ssm_a",       fill_ssm_a       },
-    { "_resid_",     fill_resid_gate  },
-    { "exp_probs_b", fill_exp_probs_b },
+    { "ssm_a",           fill_ssm_a       },
+    { "_resid_",         fill_resid_gate  },
+    { "exp_probs_b",     fill_exp_probs_b },
+    { ".ffn.act.scales", fill_act_scale   },
 };
 
 static void set_tensor_data(struct ggml_tensor * tensor, void * userdata) {
