@@ -4750,11 +4750,17 @@ ggml_backend_reg_t ggml_backend_webgpu_reg() {
     }
 
     // WebGPU backend requires f16 support and, on native, implicit device synchronization.
-    if (adapter != nullptr && adapter.HasFeature(wgpu::FeatureName::ShaderF16)
+    if (adapter == nullptr) {
+        GGML_LOG_WARN("ggml_webgpu: no adapter available, backend disabled\n");
+    } else if (!adapter.HasFeature(wgpu::FeatureName::ShaderF16)) {
+        GGML_LOG_WARN(
+            "ggml_webgpu: adapter lacks shader-f16, backend disabled (Dawn hides f16 on NVIDIA/Vulkan by "
+            "default; in Chromium-based browsers launch with --enable-dawn-features=vulkan_enable_f16_on_nvidia)\n");
 #ifndef __EMSCRIPTEN__
-        && adapter.HasFeature(wgpu::FeatureName::ImplicitDeviceSynchronization)
+    } else if (!adapter.HasFeature(wgpu::FeatureName::ImplicitDeviceSynchronization)) {
+        GGML_LOG_WARN("ggml_webgpu: adapter lacks implicit device synchronization, backend disabled\n");
 #endif
-    ) {
+    } else {
         ctx->device_count = 1;
     }
 
