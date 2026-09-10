@@ -104,7 +104,9 @@ if (CUDAToolkit_FOUND)
 
     file(GLOB   GGML_SOURCES_CUDA "*.cu")
     set(GGML_CUDA_CUTLASS_SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/mmq-cutlass.cu")
-    set(GGML_CUDA_GDN_CUTLASS_SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/gated-delta-net-cutlass.cu")
+    set(GGML_CUDA_GDN_CUTLASS_SOURCES
+        "${CMAKE_CURRENT_SOURCE_DIR}/gated-delta-net-cutlass.cu"
+        "${CMAKE_CURRENT_SOURCE_DIR}/gated-delta-net-cutlass-prefill.cu")
     if (COMMAND license_add_file)
         license_add_file("FlashInfer GDN CuTe helpers" "${CMAKE_CURRENT_SOURCE_DIR}/LICENSE-FlashInfer")
         license_add_file("FlashInfer NOTICE" "${CMAKE_CURRENT_SOURCE_DIR}/NOTICE-FlashInfer")
@@ -149,7 +151,7 @@ if (CUDAToolkit_FOUND)
         endif()
 
         list(REMOVE_ITEM GGML_SOURCES_CUDA "${GGML_CUDA_CUTLASS_SOURCE}")
-        list(REMOVE_ITEM GGML_SOURCES_CUDA "${GGML_CUDA_GDN_CUTLASS_SOURCE}")
+        list(REMOVE_ITEM GGML_SOURCES_CUDA ${GGML_CUDA_GDN_CUTLASS_SOURCES})
     endif()
 
     ggml_add_backend_library(ggml-cuda
@@ -230,7 +232,7 @@ if (CUDAToolkit_FOUND)
         endif()
         target_sources(ggml-cuda PRIVATE $<TARGET_OBJECTS:ggml-cuda-cutlass>)
 
-        add_library(ggml-cuda-gdn-cutlass OBJECT "${GGML_CUDA_GDN_CUTLASS_SOURCE}")
+        add_library(ggml-cuda-gdn-cutlass OBJECT ${GGML_CUDA_GDN_CUTLASS_SOURCES})
         set_target_properties(ggml-cuda-gdn-cutlass PROPERTIES
             CUDA_ARCHITECTURES OFF
             CUDA_STANDARD 20

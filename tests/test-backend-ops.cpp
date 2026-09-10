@@ -12300,6 +12300,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_gated_delta_net_precision(v_repeat, 4096, 1.0f, 1.0f, gate, gate));
         }
     }
+    for (int tokens : { 511, 513, 1024, 1025, 2047, 2048 }) {
+        test_cases.emplace_back(new test_gated_delta_net_precision(3, tokens));
+    }
+    test_cases.emplace_back(new test_gated_delta_net(
+        GGML_TYPE_F32, 16, 128, 1024, 1, 3, true, false, 1, false, true));
+    test_cases.emplace_back(new test_gated_delta_net(
+        GGML_TYPE_F32, 16, 128, 1024, 2, 3, false, false, 1, false, true));
     for (int tokens : { 64, 129 }) {
         test_cases.emplace_back(new test_gated_delta_net_precision(3, tokens, 1e6f, 1e6f));
         test_cases.emplace_back(new test_gated_delta_net_precision(3, tokens, 1e-8f, 1e-8f));
