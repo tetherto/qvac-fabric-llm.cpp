@@ -344,6 +344,7 @@ extern "C" {
     // Share physical compute buffers while keeping scheduler and graph allocation state independent.
     // The caller must ensure the schedulers do not execute concurrently while the buffers are shared.
     // Returns false for incompatible or unsupported scheduler layouts, or if dst is already allocated.
+    // Buffers with reset callbacks are unsupported because reset can invalidate another graph's tensor extras.
     GGML_API bool ggml_backend_sched_share_compute_buffers(ggml_backend_sched_t dst, ggml_backend_sched_t src);
 
     // Initialize backend buffers from a measure graph

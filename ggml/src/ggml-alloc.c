@@ -624,6 +624,14 @@ bool ggml_gallocr_share_buffers(ggml_gallocr_t dst, ggml_gallocr_t src) {
         if (dst->bufts[i] != src->bufts[i] || dst->buffers[i] != NULL || src->buffers[i] == NULL) {
             return false;
         }
+
+        // Reset callbacks can invalidate tensor extras still used by another scheduler's graph.
+        for (int c = 0; c < GGML_VBUFFER_MAX_CHUNKS; ++c) {
+            ggml_backend_buffer_t buffer = src->buffers[i]->chunks[c];
+            if (buffer != NULL && buffer->iface.reset != NULL) {
+                return false;
+            }
+        }
     }
 
     struct ggml_gallocr_shared_buffers * shared = src->shared_buffers;
