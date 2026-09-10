@@ -287,9 +287,8 @@ struct nvfp4_format_traits {
     static constexpr int alignment = 32;
 };
 
-template <typename Format>
-struct blockscaled_kernel_traits {
-    using Output           = float;
+template <typename Format, typename Output_ = float> struct blockscaled_kernel_traits {
+    using Output           = Output_;
     using ElementA         = typename Format::Activation;
     using ElementB         = typename Format::Weight;
     using ElementAMainloop = typename Format::template MainloopElement<ElementA>;
@@ -485,6 +484,29 @@ ggml_cuda_cutlass_result ggml_cuda_cutlass_mul_mat_prequantized(ggml_backend_cud
                                activation.m, (int) n, activation.k_padded, ctx.stream());
 }
 
+ggml_cuda_cutlass_result ggml_cuda_cutlass_mul_mat_prequantized_bf16(ggml_backend_cuda_context &          ctx,
+                                                                     const ggml_tensor *                  src0,
+                                                                     const ggml_tensor *                  src1,
+                                                                     const ggml_tensor *                  dst,
+                                                                     const ggml_cuda_cutlass_activation & activation,
+                                                                     void *                               output) {
+    using namespace ggml_cutlass_sm120;
+
+    ggml_cuda_cutlass_activation_layout layout;
+    ggml_cuda_cutlass_weight            weight;
+    if (output == nullptr || src0 == nullptr || src0->type != GGML_TYPE_NVFP4 ||
+        !ggml_cuda_cutlass_get_activation_layout(ctx, src0, src1, dst, layout) ||
+        !ggml_cuda_cutlass_weight_from_tensor(src0, weight) || activation.values == nullptr ||
+        activation.scales == nullptr || activation.row_scales == nullptr || activation.m != layout.m ||
+        activation.k != layout.k || activation.k_padded != layout.k_padded || activation.type != layout.type) {
+        return ggml_cuda_cutlass_result::fallback;
+    }
+
+    return run_dense_gemm<blockscaled_kernel_traits<nvfp4_format_traits, cutlass::bfloat16_t>>(
+        ctx, weight, activation.values, activation.scales, activation.row_scales, output, activation.m,
+        (int) src0->ne[1], activation.k_padded, ctx.stream());
+}
+
 ggml_cuda_cutlass_result ggml_cuda_cutlass_mul_mat(ggml_backend_cuda_context & ctx,
                                                    const ggml_tensor *         src0,
                                                    const ggml_tensor *         src1,
@@ -535,6 +557,16 @@ ggml_cuda_cutlass_result ggml_cuda_cutlass_mul_mat_prequantized(ggml_backend_cud
                                                                 ggml_tensor *                        dst,
                                                                 const ggml_cuda_cutlass_activation & activation) {
     GGML_UNUSED_VARS(ctx, src0, src1, dst, activation);
+    return ggml_cuda_cutlass_result::fallback;
+}
+
+ggml_cuda_cutlass_result ggml_cuda_cutlass_mul_mat_prequantized_bf16(ggml_backend_cuda_context &          ctx,
+                                                                     const ggml_tensor *                  src0,
+                                                                     const ggml_tensor *                  src1,
+                                                                     const ggml_tensor *                  dst,
+                                                                     const ggml_cuda_cutlass_activation & activation,
+                                                                     void *                               output) {
+    GGML_UNUSED_VARS(ctx, src0, src1, dst, activation, output);
     return ggml_cuda_cutlass_result::fallback;
 }
 
