@@ -667,7 +667,7 @@ void llama_context::sched_reserve() {
 
     if (ctx_compute != nullptr) {
         int n_devices = 0;
-        bool is_cuda = true;
+        bool is_supported = true;
         for (ggml_backend_t backend : backend_ptrs) {
             ggml_backend_dev_t device = ggml_backend_get_device(backend);
             if (device == nullptr || ggml_backend_dev_type(device) == GGML_BACKEND_DEVICE_TYPE_CPU) {
@@ -676,10 +676,12 @@ void llama_context::sched_reserve() {
 
             n_devices++;
             ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(device);
-            is_cuda = is_cuda && reg != nullptr && strcmp(ggml_backend_reg_name(reg), "CUDA") == 0;
+            const char * name = reg != nullptr ? ggml_backend_reg_name(reg) : "";
+            is_supported = is_supported &&
+                (strcmp(name, "CUDA") == 0 || strcmp(name, "Vulkan") == 0 || strcmp(name, "MTL") == 0);
         }
 
-        if (n_devices == 1 && is_cuda &&
+        if (n_devices == 1 && is_supported &&
             ggml_backend_sched_share_compute_buffers(sched.get(), ctx_compute->get_sched())) {
             LLAMA_LOG_INFO("%s: sharing compute buffers with the target context\n", __func__);
         } else {
