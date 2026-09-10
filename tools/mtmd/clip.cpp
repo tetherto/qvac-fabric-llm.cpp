@@ -28,6 +28,13 @@
 #include <float.h>
 
 // TODO: allow to pass callback from user code
+// Thrown when the accelerated backend cannot hold an encoder: its weight buffer or
+// its warmup compute buffers failed to allocate. clip_init() catches it and reloads
+// that encoder on the CPU backend instead of failing the load.
+struct clip_backend_alloc_error : public std::runtime_error {
+    using std::runtime_error::runtime_error;
+};
+
 struct clip_logger_state g_logger_state = {
     GGML_LOG_LEVEL_CONT,           // verbosity_thold
     clip_log_callback_default,     // log_callback
@@ -4529,18 +4536,41 @@ struct clip_model_loader {
                     if (probe_buf) ggml_backend_buffer_free(probe_buf);
                     if (!repack_tensors.empty()) {
                         ctx_clip.buf_repack.reset(ggml_backend_buft_alloc_buffer(repack_buft, repack_size));
-                        ggml_backend_buffer_set_usage(ctx_clip.buf_repack.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
-                        ggml_tallocr talloc = ggml_tallocr_new(ctx_clip.buf_repack.get());
-                        for (ggml_tensor * t : repack_tensors) ggml_tallocr_alloc(&talloc, t);
-                        LOG_INF("%s: repacked %zu quantized weights into %s (%.1f MiB)\n",
-                                __func__, repack_tensors.size(), ggml_backend_buft_name(repack_buft),
-                                repack_size / 1024.0 / 1024.0);
+                        if (!ctx_clip.buf_repack) {
+                            // Repacking is only a speed-up: leave these weights to the
+                            // default buffer below rather than failing the load.
+                            LOG_WRN("%s: failed to allocate the %s buffer (%.1f MiB), keeping %zu weights unrepacked\n",
+                                    __func__, ggml_backend_buft_name(repack_buft),
+                                    repack_size / 1024.0 / 1024.0, repack_tensors.size());
+                        } else {
+                            ggml_backend_buffer_set_usage(ctx_clip.buf_repack.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+                            ggml_tallocr talloc = ggml_tallocr_new(ctx_clip.buf_repack.get());
+                            for (ggml_tensor * t : repack_tensors) ggml_tallocr_alloc(&talloc, t);
+                            LOG_INF("%s: repacked %zu quantized weights into %s (%.1f MiB)\n",
+                                    __func__, repack_tensors.size(), ggml_backend_buft_name(repack_buft),
+                                    repack_size / 1024.0 / 1024.0);
+                        }
                     }
                 }
             }
             // allocate everything not already placed (i.e. the non-repack tensors)
             ctx_clip.buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(ctx_clip.ctx_data.get(), buft));
-            ggml_backend_buffer_set_usage(ctx_clip.buf.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+            if (ctx_clip.buf) {
+                ggml_backend_buffer_set_usage(ctx_clip.buf.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+            } else {
+                // The allocator also returns NULL when nothing was left to place (every
+                // weight already went to the repack buffer). Only a weight that still has
+                // no storage is a failed allocation. Passing NULL on used to abort in
+                // ggml_backend_buffer_set_usage, silently where stderr isn't captured (iOS).
+                for (ggml_tensor * t = ggml_get_first_tensor(ctx_clip.ctx_data.get()); t != nullptr;
+                     t = ggml_get_next_tensor(ctx_clip.ctx_data.get(), t)) {
+                    if (t->data == nullptr && t->view_src == nullptr) {
+                        throw clip_backend_alloc_error(string_format(
+                            "%s: failed to allocate the %s buffer for the projector weights (%.2f MiB)\n",
+                            __func__, ggml_backend_buft_name(buft), total_data_size / 1024.0 / 1024.0));
+                    }
+                }
+            }
             // read the weight from file
             if (!ctx_clip.no_alloc) {
                 size_t data_loaded = 0;
@@ -4787,7 +4817,11 @@ struct clip_model_loader {
     // only initialize backend buffers, but do not allocate them yet
     static support_info_graph reserve_compute_meta(clip_ctx & ctx_clip, const clip_image_f32_batch & batch) {
         ggml_cgraph * gf = clip_get_graph_builder(&ctx_clip, batch)->build();
-        ggml_backend_sched_reserve(ctx_clip.sched.get(), gf);
+        if (!ggml_backend_sched_reserve(ctx_clip.sched.get(), gf)) {
+            throw clip_backend_alloc_error(string_format(
+                "%s: failed to reserve the compute buffers for the projector graph on %s\n",
+                __func__, ggml_backend_name(ctx_clip.backend)));
+        }
 
         ctx_clip.mem_compute.clear();
         for (size_t i = 0; i < ctx_clip.backend_ptrs.size(); ++i) {
@@ -4993,6 +5027,44 @@ struct clip_init_result clip_init(const char * fname, struct clip_context_params
 
         ctx_params.has_bf16_weights = loader.has_bf16_weights();
 
+        // Loads the tensors and runs warmup for an encoder whose hyper-parameters are
+        // already set. When the accelerated backend cannot hold it (a GPU with little
+        // free memory, iOS Metal next to a large text model), the encoder is rebuilt on
+        // the CPU backend with the same hyper-parameters, so the projector keeps working,
+        // only slower. The failed attempt is freed first so its buffers don't compete
+        // with the retry on unified memory.
+        auto load_with_cpu_fallback = [&](clip_ctx *& ctx, clip_modality modality) {
+            try {
+                loader.load_tensors(*ctx);
+                loader.init_ctx(*ctx);
+                if (ctx_params.warmup) {
+                    loader.warmup(*ctx);
+                }
+            } catch (const clip_backend_alloc_error & e) {
+                if (ctx->backend == ctx->backend_cpu) {
+                    throw;
+                }
+                LOG_WRN("%s: %s", __func__, e.what());
+                LOG_WRN("%s: not enough memory on %s for the %s encoder, loading it on CPU instead\n",
+                        __func__, ggml_backend_name(ctx->backend),
+                        modality == CLIP_MODALITY_AUDIO ? "audio" : "vision");
+                const clip_hparams hparams = ctx->model.hparams;
+                delete ctx;
+                ctx = nullptr;
+
+                clip_context_params cpu_params = ctx_params;
+                cpu_params.use_gpu = false;
+                ctx = new clip_ctx(cpu_params);
+                loader.load_hparams(ctx->model, modality);
+                ctx->model.hparams = hparams; // keep the overrides applied after load_hparams
+                loader.load_tensors(*ctx);
+                loader.init_ctx(*ctx);
+                if (ctx_params.warmup) {
+                    loader.warmup(*ctx);
+                }
+            }
+        };
+
         if (loader.has_vision) {
             ctx_vision = new clip_ctx(ctx_params);
             loader.load_hparams(ctx_vision->model, CLIP_MODALITY_VISION);
@@ -5123,11 +5195,7 @@ struct clip_init_result clip_init(const char * fname, struct clip_context_params
                     }
                 }
             }
-            loader.load_tensors(*ctx_vision);
-            loader.init_ctx(*ctx_vision);
-            if (ctx_params.warmup) {
-                loader.warmup(*ctx_vision);
-            }
+            load_with_cpu_fallback(ctx_vision, CLIP_MODALITY_VISION);
 
             // TODO: we don't support audio for Gemma 3N, but GGUF contains audio tensors
             // we can remove this check when we implement audio support for Gemma 3N
@@ -5137,11 +5205,7 @@ struct clip_init_result clip_init(const char * fname, struct clip_context_params
         if (loader.has_audio && !skip_audio) {
             ctx_audio = new clip_ctx(ctx_params);
             loader.load_hparams(ctx_audio->model, CLIP_MODALITY_AUDIO);
-            loader.load_tensors(*ctx_audio);
-            loader.init_ctx(*ctx_audio);
-            if (ctx_params.warmup) {
-                loader.warmup(*ctx_audio);
-            }
+            load_with_cpu_fallback(ctx_audio, CLIP_MODALITY_AUDIO);
         }
 
         if (loader.has_gen_audio) {
