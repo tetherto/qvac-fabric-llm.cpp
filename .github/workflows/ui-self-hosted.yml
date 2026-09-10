@@ -58,11 +58,13 @@ jobs:
 
   ui-build:
     name: Build static output
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     uses: ./.github/workflows/ui-build-self-hosted.yml
 
   ui-checks:
     name: Checks
     needs: [ui-build, runner_names]
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ${{ needs.runner_names.outputs.qvac_ubuntu2404_x64 }}
     continue-on-error: true
     timeout-minutes: 30
@@ -112,6 +114,7 @@ jobs:
   e2e-tests:
     name: E2E Tests
     needs: [ui-build, runner_names]
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ${{ needs.runner_names.outputs.qvac_ubuntu2404_x64 }}
     timeout-minutes: 30
     steps:

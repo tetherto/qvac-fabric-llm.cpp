@@ -46,6 +46,7 @@ env:
 
 jobs:
   ctest:
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: [self-hosted, X64, CPU, Linux]
 
     continue-on-error: ${{ matrix.sanitizer == 'THREAD' }}

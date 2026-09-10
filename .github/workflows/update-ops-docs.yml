@@ -16,6 +16,7 @@ on:
 
 jobs:
     update-ops-docs:
+        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
         runs-on: [self-hosted, fast, ARM64]
 
         steps:
