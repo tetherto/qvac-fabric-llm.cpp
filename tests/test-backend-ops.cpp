@@ -5387,6 +5387,110 @@ struct test_cutlass_mul_mat : public test_repacked_mul_mat {
     }
 };
 
+struct test_cutlass_shared_activation : public test_case {
+    static constexpr int n_weights = 4;
+
+    ggml_backend_t                              backend = nullptr;
+    std::array<std::vector<uint8_t>, n_weights> weight_data;
+
+    int graph_replays() override { return 4; }
+
+    std::string vars() override { return "type=nvfp4,m=260,n=129,k=576,siblings=3"; }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MUL_MAT_CUTLASS_SHARED_ACTIVATION";
+    }
+
+    double max_nmse_err() override { return 1e-6; }
+
+    double err(const float * a, const float * b, size_t n) override {
+        GGML_UNUSED(b);
+        GGML_ASSERT(n % 2 == 0);
+        return nmse(a, a + n / 2, n / 2);
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    bool use_weight_context() override { return true; }
+
+    bool use_weight_context_sentinels() override { return false; }
+
+    ggml_backend_buffer_type_t weight_buffer_type(ggml_backend_t backend) override {
+        this->backend = backend;
+        return test_repacked_weight_buffer_type(backend);
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        if (ggml_get_tensor(ctx, "weight_native_0") != nullptr) {
+            test_case::initialize_tensors(ctx);
+            for (int i = 0; i < n_weights; ++i) {
+                char name[32];
+                snprintf(name, sizeof(name), "weight_native_%d", i);
+                ggml_tensor * weight = ggml_get_tensor(ctx, name);
+                GGML_ASSERT(weight != nullptr);
+                weight_data[i].resize(ggml_nbytes(weight));
+                ggml_backend_tensor_get(weight, weight_data[i].data(), 0, weight_data[i].size());
+            }
+            return;
+        }
+
+        GGML_ASSERT(backend != nullptr);
+        for (int i = 0; i < n_weights; ++i) {
+            char name[32];
+            snprintf(name, sizeof(name), "weight_repacked_%d", i);
+            ggml_tensor * weight = ggml_get_tensor(ctx, name);
+            GGML_ASSERT(weight != nullptr && !weight_data[i].empty());
+            ggml_backend_tensor_set(weight, weight_data[i].data(), 0, weight_data[i].size());
+        }
+    }
+
+    ggml_tensor * build_projection_group(ggml_context *                               ctx,
+                                         const std::array<ggml_tensor *, n_weights> & weights,
+                                         ggml_tensor *                                input,
+                                         ggml_tensor *                                other_input) {
+        ggml_tensor * first  = ggml_scale(ctx, ggml_mul_mat(ctx, weights[0], input), 1.0f);
+        ggml_tensor * other  = ggml_mul_mat(ctx, weights[3], other_input);
+        ggml_tensor * joined = ggml_concat(ctx, first, other, 0);
+        joined               = ggml_concat(ctx, joined, ggml_mul_mat(ctx, weights[1], input), 0);
+        joined               = ggml_concat(ctx, joined, ggml_mul_mat(ctx, weights[2], input), 0);
+        return joined;
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override { return build_graph(ctx, ctx); }
+
+    ggml_tensor * build_graph(ggml_context * ctx, ggml_context * ctx_weights) override {
+        GGML_ASSERT(ctx_weights != nullptr);
+        constexpr int64_t m = 260;
+        constexpr int64_t n = 129;
+        constexpr int64_t k = 576;
+
+        std::array<ggml_tensor *, n_weights> native;
+        std::array<ggml_tensor *, n_weights> repacked;
+        for (int i = 0; i < n_weights; ++i) {
+            native[i]   = ggml_new_tensor_2d(ctx, GGML_TYPE_NVFP4, k, m);
+            repacked[i] = ::ggml_new_tensor_2d(ctx_weights, GGML_TYPE_NVFP4, k, m);
+            char native_name[32];
+            char repacked_name[32];
+            snprintf(native_name, sizeof(native_name), "weight_native_%d", i);
+            snprintf(repacked_name, sizeof(repacked_name), "weight_repacked_%d", i);
+            ggml_set_name(native[i], native_name);
+            ggml_set_name(repacked[i], repacked_name);
+        }
+
+        ggml_tensor * input       = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
+        ggml_tensor * other_input = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
+        ggml_set_name(input, "input");
+        ggml_set_name(other_input, "other_input");
+
+        ggml_tensor * native_output   = build_projection_group(ctx, native, input, other_input);
+        ggml_tensor * repacked_output = build_projection_group(ctx, repacked, input, other_input);
+        ggml_tensor * out             = ggml_concat(ctx, native_output, repacked_output, 1);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 struct test_repacked_mul_mat_vec_fusion : public test_case {
     const ggml_type type;
     const ggml_glu_op glu_op;
@@ -12224,6 +12328,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_cutlass_mul_mat(type, 260, 65, 64));
             test_cases.emplace_back(new test_cutlass_mul_mat(type, 260, 129, 576));
             test_cases.emplace_back(new test_cutlass_mul_mat(type, 5120, 512, 5120));
+            test_cases.emplace_back(new test_cutlass_shared_activation());
         }
         for (ggml_glu_op glu_op : {GGML_GLU_OP_SWIGLU, GGML_GLU_OP_GEGLU}) {
             test_cases.emplace_back(new test_repacked_mul_mat_vec_fusion(type, glu_op, false, false));

@@ -2221,8 +2221,11 @@ static void ggml_cuda_mul_mat_canonical(
     ggml_cuda_mul_mat_cublas(ctx, src0, src1, dst);
 }
 
-static bool ggml_cuda_mul_mat(
-        ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+static bool ggml_cuda_mul_mat(ggml_backend_cuda_context &          ctx,
+                              const ggml_tensor *                  src0,
+                              const ggml_tensor *                  src1,
+                              ggml_tensor *                        dst,
+                              const ggml_cuda_cutlass_activation * activation = nullptr) {
     const int32_t hint = ggml_get_op_params_i32(dst, 1);
     if (hint == GGML_HINT_SRC0_IS_HADAMARD && ggml_cuda_op_fwht(ctx, src1, dst)) {
         return true;
@@ -2240,7 +2243,9 @@ static bool ggml_cuda_mul_mat(
         return true;
     }
 
-    const ggml_cuda_cutlass_result cutlass_result = ggml_cuda_cutlass_mul_mat(ctx, src0, src1, dst);
+    const ggml_cuda_cutlass_result cutlass_result =
+        activation != nullptr ? ggml_cuda_cutlass_mul_mat_prequantized(ctx, src0, src1, dst, *activation) :
+                                ggml_cuda_cutlass_mul_mat(ctx, src0, src1, dst);
     if (cutlass_result == ggml_cuda_cutlass_result::success) {
         return true;
     }
@@ -2458,7 +2463,9 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
         nb1, nb2, nb3, stream);
 }
 
-static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct ggml_tensor * dst) {
+static bool ggml_cuda_compute_forward(ggml_backend_cuda_context &          ctx,
+                                      struct ggml_tensor *                 dst,
+                                      const ggml_cuda_cutlass_activation * activation = nullptr) {
     switch (dst->op) {
         case GGML_OP_ARGMAX:
             ggml_cuda_argmax(ctx, dst);
@@ -2658,7 +2665,7 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             ggml_cuda_op_l2_norm_back(ctx, dst);
             break;
         case GGML_OP_MUL_MAT:
-            if (!ggml_cuda_mul_mat(ctx, dst->src[0], dst->src[1], dst)) {
+            if (!ggml_cuda_mul_mat(ctx, dst->src[0], dst->src[1], dst, activation)) {
                 return false;
             }
             break;
@@ -4557,7 +4564,318 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     return 0;
 }
 
-static bool ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, const void * graph_key) {
+static bool ggml_cuda_prepare_concurrent_events(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph) {
+    ggml_cuda_stream_context & stream_ctx = cuda_ctx->stream_context();
+    if (stream_ctx.concurrent_events.empty()) {
+        return false;
+    }
+
+    bool events_valid = true;
+    for (const auto & item : stream_ctx.concurrent_events) {
+        events_valid = events_valid && item.second.is_valid();
+    }
+    if (!events_valid) {
+        stream_ctx.concurrent_events.clear();
+        return false;
+    }
+
+    std::unordered_map<const ggml_tensor *, int> node_to_idx;
+    node_to_idx.reserve(cgraph->n_nodes);
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        node_to_idx[cgraph->nodes[i]] = i;
+    }
+
+    std::vector<std::pair<int, const ggml_cuda_concurrent_event *>> restorations;
+    restorations.reserve(stream_ctx.concurrent_events.size());
+    bool restorations_valid = true;
+    for (const auto & [fork_node, event] : stream_ctx.concurrent_events) {
+        GGML_UNUSED(fork_node);
+        std::vector<int> positions;
+        positions.reserve(event.original_order.size());
+        for (const ggml_tensor * node : event.original_order) {
+            const auto it = node_to_idx.find(node);
+            if (it == node_to_idx.end()) {
+                restorations_valid = false;
+                break;
+            }
+            positions.push_back(it->second);
+        }
+        if (!restorations_valid) {
+            break;
+        }
+
+        std::sort(positions.begin(), positions.end());
+        for (size_t i = 1; i < positions.size(); ++i) {
+            if (positions[i] != positions[i - 1] + 1) {
+                restorations_valid = false;
+                break;
+            }
+        }
+        if (!restorations_valid) {
+            break;
+        }
+        if (!positions.empty()) {
+            restorations.emplace_back(positions.front(), &event);
+        }
+    }
+    if (!restorations_valid) {
+        stream_ctx.concurrent_events.clear();
+        return false;
+    }
+
+    for (const auto & [start, event] : restorations) {
+        for (size_t i = 0; i < event->original_order.size(); ++i) {
+            cgraph->nodes[start + i] = const_cast<ggml_tensor *>(event->original_order[i]);
+        }
+    }
+    return true;
+}
+
+static bool ggml_cuda_cutlass_activation_sharing_enabled() {
+    static const bool disabled = getenv("GGML_CUDA_DISABLE_CUTLASS_ACTIVATION_SHARING") != nullptr;
+    return !disabled;
+}
+
+struct ggml_cuda_cutlass_activation_plan {
+    struct group {
+        const ggml_tensor *                 src1 = nullptr;
+        ggml_cuda_cutlass_activation_layout layout;
+        std::vector<ggml_tensor *>          nodes;
+        int                                 first               = 0;
+        int                                 last                = 0;
+        int                                 slot                = 0;
+        size_t                              workspace_offset    = 0;
+        bool                                prepared            = false;
+        ggml_cuda_cutlass_activation        activation;
+    };
+
+    std::vector<group>                              groups;
+    std::unordered_map<const ggml_tensor *, size_t> node_groups;
+    std::unique_ptr<ggml_cuda_pool_alloc<char>>     direct_workspace;
+    char *                                          workspace      = nullptr;
+    size_t                                          workspace_size = 0;
+
+    const ggml_cuda_cutlass_activation * prepare(ggml_backend_cuda_context & ctx, const ggml_tensor * node) {
+        const auto it = node_groups.find(node);
+        if (it == node_groups.end()) {
+            return nullptr;
+        }
+
+        group & activation_group = groups[it->second];
+        if (!activation_group.prepared) {
+            if (!ggml_cuda_cutlass_prepare_activation(
+                    ctx, activation_group.src1, activation_group.layout,
+                    workspace + activation_group.workspace_offset,
+                    workspace_size - activation_group.workspace_offset, activation_group.activation)) {
+                return nullptr;
+            }
+            activation_group.prepared = true;
+        }
+        return &activation_group.activation;
+    }
+
+    void allocate_direct(ggml_backend_cuda_context & ctx) {
+        if (workspace_size == 0) {
+            return;
+        }
+        direct_workspace = std::make_unique<ggml_cuda_pool_alloc<char>>(ctx.pool(), workspace_size);
+        workspace        = direct_workspace->get();
+    }
+
+#ifdef USE_CUDA_GRAPH
+    void allocate_graph(ggml_cuda_graph * graph, bool update_required) {
+        if (workspace_size != 0) {
+            workspace = (char *) graph->reserve_workspace(workspace_size, update_required);
+        }
+    }
+#endif
+};
+
+static bool ggml_cuda_tensor_ranges_overlap(const ggml_tensor * a, const ggml_tensor * b) {
+    const size_t a_size = ggml_nbytes(a);
+    const size_t b_size = ggml_nbytes(b);
+    if (a_size == 0 || b_size == 0) {
+        return false;
+    }
+    if (a->data == nullptr || b->data == nullptr) {
+        return true;
+    }
+
+    const uintptr_t a_begin = (uintptr_t) a->data;
+    const uintptr_t b_begin = (uintptr_t) b->data;
+    if (a_size > UINTPTR_MAX - a_begin || b_size > UINTPTR_MAX - b_begin) {
+        return true;
+    }
+    return a_begin < b_begin + b_size && b_begin < a_begin + a_size;
+}
+
+static ggml_cuda_cutlass_activation_plan ggml_cuda_build_cutlass_activation_plan(ggml_backend_cuda_context * cuda_ctx,
+                                                                                 ggml_cgraph *               cgraph,
+                                                                                 bool concurrent_events_active) {
+    ggml_cuda_cutlass_activation_plan plan;
+    if (!ggml_cuda_cutlass_activation_sharing_enabled()) {
+        return plan;
+    }
+
+    struct node_location {
+        const ggml_cuda_concurrent_event * event  = nullptr;
+        int                                stream = 0;
+        int                                fork   = 0;
+        int                                join   = 0;
+    };
+
+    std::unordered_map<const ggml_tensor *, node_location> locations;
+
+    if (concurrent_events_active) {
+        std::unordered_map<const ggml_tensor *, int> node_indices;
+        node_indices.reserve(cgraph->n_nodes);
+        for (int i = 0; i < cgraph->n_nodes; ++i) {
+            node_indices[cgraph->nodes[i]] = i;
+        }
+
+        for (const auto & [fork_node, event] : cuda_ctx->stream_context().concurrent_events) {
+            const auto fork_it = node_indices.find(fork_node);
+            const auto join_it = node_indices.find(event.join_node);
+            if (fork_it == node_indices.end() || join_it == node_indices.end()) {
+                continue;
+            }
+            for (const auto & [node, stream] : event.stream_mapping) {
+                locations[node] = { &event, stream, fork_it->second, join_it->second };
+            }
+        }
+    }
+
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        ggml_tensor * node = cgraph->nodes[i];
+        if (node->op != GGML_OP_MUL_MAT || (node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 || node->src[0] == nullptr ||
+            node->src[1] == nullptr || node->src[0]->type != GGML_TYPE_NVFP4 ||
+            ggml_nrows(node->src[1]) <= MMVQ_MAX_BATCH_SIZE) {
+            continue;
+        }
+
+        ggml_cuda_cutlass_activation_layout layout;
+        if (!ggml_cuda_cutlass_get_activation_layout(*cuda_ctx, node->src[0], node->src[1], node, layout)) {
+            continue;
+        }
+
+        ggml_cuda_cutlass_activation_plan::group * activation_group = nullptr;
+        for (ggml_cuda_cutlass_activation_plan::group & candidate : plan.groups) {
+            const auto & candidate_layout = candidate.layout;
+            if (candidate.src1 == node->src[1] && candidate_layout.type == layout.type &&
+                candidate_layout.m == layout.m && candidate_layout.k == layout.k &&
+                candidate_layout.k_padded == layout.k_padded && candidate_layout.size_values == layout.size_values &&
+                candidate_layout.offset_scales == layout.offset_scales &&
+                candidate_layout.size_scales == layout.size_scales &&
+                candidate_layout.offset_rows == layout.offset_rows && candidate_layout.size_rows == layout.size_rows &&
+                candidate_layout.size_allocation == layout.size_allocation) {
+                activation_group = &candidate;
+                break;
+            }
+        }
+
+        if (activation_group == nullptr) {
+            plan.groups.push_back({ node->src[1], layout, {}, i, i });
+            activation_group = &plan.groups.back();
+        }
+        activation_group->nodes.push_back(node);
+        activation_group->last = i;
+    }
+
+    for (auto it = plan.groups.begin(); it != plan.groups.end();) {
+        bool          safe = it->nodes.size() >= 2;
+        node_location location;
+        if (safe) {
+            const auto first_location = locations.find(it->nodes.front());
+            if (first_location != locations.end()) {
+                location = first_location->second;
+            }
+            for (const ggml_tensor * node : it->nodes) {
+                node_location member_location;
+                const auto    member_it = locations.find(node);
+                if (member_it != locations.end()) {
+                    member_location = member_it->second;
+                }
+                if (member_location.event != location.event || member_location.stream != location.stream) {
+                    safe = false;
+                    break;
+                }
+            }
+        }
+        if (safe) {
+            const int write_start = location.event != nullptr ? location.fork + 1 : it->first;
+            const int write_end   = location.event != nullptr ? location.join : it->last;
+            for (int i = write_start; i < write_end; ++i) {
+                const ggml_tensor * node = cgraph->nodes[i];
+                if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) != 0 && !ggml_cuda_is_view_or_noop(node) &&
+                    ggml_cuda_tensor_ranges_overlap(node, it->src1)) {
+                    safe = false;
+                    break;
+                }
+            }
+        }
+
+        if (!safe) {
+            it = plan.groups.erase(it);
+            continue;
+        }
+        if (location.event != nullptr) {
+            it->first = location.fork;
+            it->last  = location.join;
+        }
+        ++it;
+    }
+
+    std::sort(plan.groups.begin(), plan.groups.end(),
+              [](const ggml_cuda_cutlass_activation_plan::group & a,
+                 const ggml_cuda_cutlass_activation_plan::group & b) { return a.first < b.first; });
+
+    std::vector<int>    slot_last;
+    std::vector<size_t> slot_sizes;
+    for (ggml_cuda_cutlass_activation_plan::group & activation_group : plan.groups) {
+        size_t slot = 0;
+        while (slot < slot_last.size() && slot_last[slot] >= activation_group.first) {
+            ++slot;
+        }
+        if (slot == slot_last.size()) {
+            slot_last.push_back(activation_group.last);
+            slot_sizes.push_back(activation_group.layout.size_allocation);
+        } else {
+            slot_last[slot]  = activation_group.last;
+            slot_sizes[slot] = std::max(slot_sizes[slot], activation_group.layout.size_allocation);
+        }
+        activation_group.slot = (int) slot;
+    }
+
+    std::vector<size_t> slot_offsets(slot_sizes.size());
+    for (size_t i = 0; i < slot_sizes.size(); ++i) {
+        if (plan.workspace_size > SIZE_MAX - 127) {
+            return {};
+        }
+        plan.workspace_size = GGML_PAD(plan.workspace_size, (size_t) 128);
+        if (slot_sizes[i] > SIZE_MAX - plan.workspace_size) {
+            return {};
+        }
+        slot_offsets[i] = plan.workspace_size;
+        plan.workspace_size += slot_sizes[i];
+    }
+    for (size_t i = 0; i < plan.groups.size(); ++i) {
+        ggml_cuda_cutlass_activation_plan::group & activation_group = plan.groups[i];
+        activation_group.workspace_offset                           = slot_offsets[activation_group.slot];
+        for (const ggml_tensor * node : activation_group.nodes) {
+            plan.node_groups[node] = i;
+        }
+    }
+
+    return plan;
+}
+
+static bool ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context *         cuda_ctx,
+                                                 ggml_cgraph *                       cgraph,
+                                                 const bool                          use_cuda_graph,
+                                                 const bool                          cuda_graph_update_required,
+                                                 const void *                        graph_key,
+                                                 const bool                          should_launch_concurrent_events,
+                                                 ggml_cuda_cutlass_activation_plan & activation_plan) {
     bool graph_evaluated_or_captured = false;
 
     // flag used to determine whether it is an integrated_gpu
@@ -4566,9 +4884,11 @@ static bool ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
     ggml_cuda_stream_context & stream_ctx = cuda_ctx->stream_context();
     bool                         is_concurrent_event_active = false;
     ggml_cuda_concurrent_event * concurrent_event           = nullptr;
-    bool                         should_launch_concurrent_events = false;
 
     const auto try_launch_concurrent_event = [&](const ggml_tensor * node) {
+        if (!should_launch_concurrent_events) {
+            return;
+        }
         if (stream_ctx.concurrent_events.find(node) != stream_ctx.concurrent_events.end()) {
             concurrent_event = &stream_ctx.concurrent_events[node];
 
@@ -4592,68 +4912,6 @@ static bool ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
         // With the use of CUDA graphs, the execution will be performed by the graph launch.
         if (!use_cuda_graph || cuda_graph_update_required) {
             [[maybe_unused]] int prev_i = 0;
-
-            if (stream_ctx.concurrent_events.size() > 0) {
-                should_launch_concurrent_events = true;
-                for (const auto & [tensor, event] : stream_ctx.concurrent_events) {
-                    should_launch_concurrent_events = should_launch_concurrent_events && event.is_valid();
-                }
-            }
-
-            if (should_launch_concurrent_events) {
-                // Restore original node order within each concurrent region to enable fusion within streams
-
-                std::unordered_map<const ggml_tensor *, int> node_to_idx;
-                node_to_idx.reserve(cgraph->n_nodes);
-                for (int i = 0; i < cgraph->n_nodes; ++i) {
-                    node_to_idx[cgraph->nodes[i]] = i;
-                }
-
-                for (auto & [fork_node, event] : stream_ctx.concurrent_events) {
-                    // Find positions of all nodes from this event in the current graph
-                    std::vector<int> positions;
-                    positions.reserve(event.original_order.size());
-
-                    bool all_found = true;
-                    for (const ggml_tensor * orig_node : event.original_order) {
-                        auto it = node_to_idx.find(orig_node);
-                        if (it != node_to_idx.end()) {
-                            positions.push_back(it->second);
-                        } else {
-                            all_found = false;
-                            break;
-                        }
-                    }
-
-                    if (!all_found || positions.size() != event.original_order.size()) {
-                        continue;
-                    }
-
-                    // Sort positions to get contiguous range
-                    std::vector<int> sorted_positions = positions;
-                    std::sort(sorted_positions.begin(), sorted_positions.end());
-
-                    bool is_contiguous = true;
-                    for (size_t i = 1; i < sorted_positions.size(); ++i) {
-                        if (sorted_positions[i] != sorted_positions[i-1] + 1) {
-                            is_contiguous = false;
-                            break;
-                        }
-                    }
-
-                    if (!is_contiguous) {
-                        continue;
-                    }
-
-                    // Restore original order at the sorted positions
-                    int start_pos = sorted_positions[0];
-                    for (size_t i = 0; i < event.original_order.size(); ++i) {
-                        cgraph->nodes[start_pos + i] = const_cast<ggml_tensor *>(event.original_order[i]);
-                    }
-                }
-            } else {
-                stream_ctx.concurrent_events.clear();
-            }
 
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
@@ -4727,7 +4985,8 @@ static bool ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 GGML_UNUSED(integrated);
 #endif  // NDEBUG
 
-                bool ok = ggml_cuda_compute_forward(*cuda_ctx, node);
+                const ggml_cuda_cutlass_activation * activation = activation_plan.prepare(*cuda_ctx, node);
+                bool                                 ok = ggml_cuda_compute_forward(*cuda_ctx, node, activation);
                 if (!ok) {
                     GGML_LOG_ERROR("%s: op failed %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
                     cuda_ctx->curr_stream_no = 0;
@@ -4767,6 +5026,7 @@ static bool ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
         }
         if (cuda_graph_update_required) { // Update graph executable
             ggml_cuda_graph_update_executable(cuda_ctx, graph_key);
+            graph->commit_workspace();
         }
         // Launch graph
         CUDA_CHECK(cudaGraphLaunch(graph->instance, cuda_ctx->stream()));
@@ -4799,6 +5059,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
 
     ggml_cuda_set_device(cuda_ctx->device);
+    const bool concurrent_events_active = ggml_cuda_prepare_concurrent_events(cuda_ctx, cgraph);
 
     bool use_cuda_graph             = false;
     bool cuda_graph_update_required = false;
@@ -4839,6 +5100,18 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     }
 #endif // USE_CUDA_GRAPH
 
+    ggml_cuda_cutlass_activation_plan activation_plan =
+        ggml_cuda_build_cutlass_activation_plan(cuda_ctx, cgraph, concurrent_events_active);
+#ifdef USE_CUDA_GRAPH
+    if (use_cuda_graph) {
+        activation_plan.allocate_graph(graph, cuda_graph_update_required);
+    } else {
+        activation_plan.allocate_direct(*cuda_ctx);
+    }
+#else
+    activation_plan.allocate_direct(*cuda_ctx);
+#endif
+
     if (use_cuda_graph && cuda_graph_update_required) {
         // Start CUDA graph capture
         {
@@ -4849,7 +5122,8 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
         CUDA_CHECK(cudaStreamBeginCapture(cuda_ctx->stream(), cudaStreamCaptureModeRelaxed));
     }
 
-    if (!ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key)) {
+    if (!ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key,
+                                              concurrent_events_active, activation_plan)) {
 #ifdef USE_CUDA_GRAPH
         if (use_cuda_graph && cuda_graph_update_required) {
             cudaGraph_t failed_graph = nullptr;
@@ -4860,6 +5134,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
             if (failed_graph != nullptr) {
                 CUDA_CHECK(cudaGraphDestroy(failed_graph));
             }
+            graph->discard_pending_workspace();
             (void) cudaGetLastError();
             std::lock_guard<std::mutex> lock(ggml_cuda_lock);
             if (ggml_cuda_lock_counter.fetch_sub(1, std::memory_order_relaxed) == 1) {
