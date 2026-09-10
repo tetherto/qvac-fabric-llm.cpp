@@ -1,5 +1,7 @@
 #include "quantize.cuh"
 #include "repack-cutlass-blockscaled.cuh"
+#include "unary.cuh"
+
 #include <cstdint>
 
 #if defined(BLACKWELL_MMA_AVAILABLE)
@@ -49,6 +51,65 @@ static __device__ __forceinline__ float nvfp4_native_scale_error(
     return err;
 }
 #endif // CUDART_VERSION >= 12080
+
+static __device__ __forceinline__ void nvfp4_select_subblock_scale(const float vals[QK_NVFP4_SUB],
+                                                                   float       inv_col_scale,
+                                                                   uint8_t &   fp8_code,
+                                                                   float &     subblock_scale) {
+    float amax_sub = 0.0f;
+#    pragma unroll
+    for (int k = 0; k < QK_NVFP4_SUB; ++k) {
+        amax_sub = fmaxf(amax_sub, fabsf(vals[k] * inv_col_scale));
+    }
+
+    static constexpr int test_offsets[5] = { 0, -1, 1, -2, 2 };
+    const int            first_fp8_code  = (int) ggml_cuda_fp32_to_ue4m3(amax_sub / 6.0f);
+
+    fp8_code                  = (uint8_t) first_fp8_code;
+    subblock_scale            = ggml_cuda_ue4m3_to_fp32(fp8_code);
+    const float inv_scale_err = subblock_scale > 0.0f ? 0.5f / subblock_scale : 0.0f;
+#    if CUDART_VERSION >= 12080
+    float best_err = nvfp4_native_scale_error(vals, inv_col_scale, inv_scale_err, subblock_scale);
+#    else
+    float best_err = 0.0f;
+#        pragma unroll
+    for (int k = 0; k < QK_NVFP4_SUB; ++k) {
+        const float   v        = vals[k] * inv_col_scale;
+        const uint8_t q        = ggml_cuda_float_to_fp4_e2m1(v, inv_scale_err);
+        const float   err_diff = fabsf(v) - fabsf(kvalues_fp4[q & 0x7]) * subblock_scale;
+        best_err               = fmaf(err_diff, err_diff, best_err);
+    }
+#    endif  // CUDART_VERSION >= 12080
+
+#    pragma unroll
+    for (int i = 1; i < 5; ++i) {
+        const int test_code = first_fp8_code + test_offsets[i];
+        if (test_code < 0 || test_code > 0x7e) {
+            continue;
+        }
+
+        const float test_scale     = ggml_cuda_ue4m3_to_fp32((uint8_t) test_code);
+        const float test_inv_scale = test_scale > 0.0f ? 0.5f / test_scale : 0.0f;
+#    if CUDART_VERSION >= 12080
+        const float cur_err = nvfp4_native_scale_error(vals, inv_col_scale, test_inv_scale, test_scale);
+#    else
+        float cur_err = 0.0f;
+#        pragma unroll
+        for (int k = 0; k < QK_NVFP4_SUB; ++k) {
+            const float   v        = vals[k] * inv_col_scale;
+            const uint8_t q        = ggml_cuda_float_to_fp4_e2m1(v, test_inv_scale);
+            const float   err_diff = fabsf(v) - fabsf(kvalues_fp4[q & 0x7]) * test_scale;
+            cur_err                = fmaf(err_diff, err_diff, cur_err);
+        }
+#    endif  // CUDART_VERSION >= 12080
+
+        if (cur_err < best_err) {
+            best_err       = cur_err;
+            fp8_code       = (uint8_t) test_code;
+            subblock_scale = test_scale;
+        }
+    }
+}
 #endif // defined(BLACKWELL_MMA_AVAILABLE)
 
 __launch_bounds__(CUDA_QUANTIZE_BLOCK_SIZE, 1)
@@ -226,59 +287,9 @@ static __global__ void quantize_mmq_nvfp4(
         uint32_t q0 = 0;
         uint32_t q1 = 0;
 
-        float amax_sub = 0.0f;
-#pragma unroll
-        for (int k = 0; k < QK_NVFP4_SUB; ++k) {
-            amax_sub = fmaxf(amax_sub, fabsf(vals[k] * inv_col_scale));
-        }
-
-        static constexpr int test_offsets[5] = { 0, -1, 1, -2, 2 };
-        const int first_fp8_code = (int) ggml_cuda_fp32_to_ue4m3(amax_sub / 6.0f);
-
-        uint8_t fp8_code = (uint8_t) first_fp8_code;
-        float subblock_scale = ggml_cuda_ue4m3_to_fp32(fp8_code);
-        float inv_scale_err = subblock_scale > 0.0f ? 0.5f / subblock_scale : 0.0f;
-#if CUDART_VERSION >= 12080
-        float best_err = nvfp4_native_scale_error(vals, inv_col_scale, inv_scale_err, subblock_scale);
-#else
-        float best_err = 0.0f;
-#pragma unroll
-        for (int k = 0; k < QK_NVFP4_SUB; ++k) {
-            const float v = vals[k] * inv_col_scale;
-            const uint8_t q = ggml_cuda_float_to_fp4_e2m1(v, inv_scale_err);
-            const float err_diff = fabsf(v) - fabsf(kvalues_fp4[q & 0x7]) * subblock_scale;
-            best_err = fmaf(err_diff, err_diff, best_err);
-        }
-#endif // CUDART_VERSION >= 12080
-
-#pragma unroll
-        for (int i = 1; i < 5; ++i) {
-            const int test_code = first_fp8_code + test_offsets[i];
-            if (test_code < 0 || test_code > 0x7e) {
-                continue;
-            }
-
-            const float test_scale = ggml_cuda_ue4m3_to_fp32((uint8_t) test_code);
-            const float test_inv_scale = test_scale > 0.0f ? 0.5f / test_scale : 0.0f;
-#if CUDART_VERSION >= 12080
-            const float cur_err = nvfp4_native_scale_error(vals, inv_col_scale, test_inv_scale, test_scale);
-#else
-            float cur_err = 0.0f;
-#pragma unroll
-            for (int k = 0; k < QK_NVFP4_SUB; ++k) {
-                const float v = vals[k] * inv_col_scale;
-                const uint8_t q = ggml_cuda_float_to_fp4_e2m1(v, test_inv_scale);
-                const float err_diff = fabsf(v) - fabsf(kvalues_fp4[q & 0x7]) * test_scale;
-                cur_err = fmaf(err_diff, err_diff, cur_err);
-            }
-#endif // CUDART_VERSION >= 12080
-
-            if (cur_err < best_err) {
-                best_err = cur_err;
-                fp8_code = (uint8_t) test_code;
-                subblock_scale = test_scale;
-            }
-        }
+        uint8_t fp8_code;
+        float   subblock_scale;
+        nvfp4_select_subblock_scale(vals, inv_col_scale, fp8_code, subblock_scale);
 #if CUDART_VERSION >= 12080
         const float inv_scale = subblock_scale > 0.0f ? 0.5f / subblock_scale : 0.0f;
         const float s = inv_col_scale * inv_scale;
@@ -713,6 +724,102 @@ void quantize_mmq_fp4_cuda(
 }
 
 #ifdef GGML_CUDA_CUTLASS
+static __global__ void quantize_cutlass_nvfp4_swiglu_bf16(const nv_bfloat16 * __restrict__ gate,
+                                                          const nv_bfloat16 * __restrict__ up,
+                                                          const float * __restrict__ gate_scale,
+                                                          const float * __restrict__ up_scale,
+                                                          float * __restrict__ glu,
+                                                          void * __restrict__ vy,
+                                                          uint8_t * __restrict__ block_scales,
+                                                          float * __restrict__ row_scales,
+                                                          int64_t n_cols,
+                                                          int64_t n_cols_padded) {
+#    if defined(BLACKWELL_MMA_AVAILABLE)
+    const int64_t row        = blockIdx.x;
+    const int64_t row_offset = row * n_cols;
+    const float   gs         = *gate_scale;
+    const float   us         = *up_scale;
+
+    float amax = 0.0f;
+    for (int64_t col = threadIdx.x; col < n_cols; col += blockDim.x) {
+        const float gate_value = (float) gate[row_offset + col] * gs;
+        const float up_value   = (float) up[row_offset + col] * us;
+        const float value      = (float) (nv_bfloat16) (ggml_cuda_op_silu_single(gate_value) * up_value);
+        glu[row_offset + col]  = value;
+        amax                   = fmaxf(amax, fabsf(value));
+    }
+
+    amax = warp_reduce_max<WARP_SIZE>(amax);
+
+    __shared__ float warp_amax[CUDA_QUANTIZE_BLOCK_SIZE_MMQ / WARP_SIZE];
+    const int        lane = threadIdx.x % WARP_SIZE;
+    const int        warp = threadIdx.x / WARP_SIZE;
+    if (lane == 0) {
+        warp_amax[warp] = amax;
+    }
+    __syncthreads();
+
+    if (warp == 0) {
+        amax = threadIdx.x < int(CUDA_QUANTIZE_BLOCK_SIZE_MMQ / WARP_SIZE) ? warp_amax[lane] : 0.0f;
+        amax = warp_reduce_max<WARP_SIZE>(amax);
+        if (lane == 0) {
+            warp_amax[0]    = amax / (6.0f * 448.0f);
+            row_scales[row] = warp_amax[0];
+        }
+    }
+    __syncthreads();
+
+    const float   row_scale     = warp_amax[0];
+    const float   inv_col_scale = row_scale > 0.0f ? 1.0f / row_scale : 0.0f;
+    const int64_t n_subblocks   = n_cols_padded / QK_NVFP4_SUB;
+    for (int64_t subblock = threadIdx.x; subblock < n_subblocks; subblock += blockDim.x) {
+        const int64_t col_base = subblock * QK_NVFP4_SUB;
+        float         vals[QK_NVFP4_SUB];
+#        pragma unroll
+        for (int k = 0; k < QK_NVFP4_SUB; ++k) {
+            const int64_t col = col_base + k;
+            vals[k]           = col < n_cols ? glu[row_offset + col] : 0.0f;
+        }
+
+        uint8_t fp8_code;
+        float   subblock_scale;
+        nvfp4_select_subblock_scale(vals, inv_col_scale, fp8_code, subblock_scale);
+
+        uint32_t q0 = 0;
+        uint32_t q1 = 0;
+#        if CUDART_VERSION >= 12080
+        const float           inv_scale = subblock_scale > 0.0f ? 0.5f / subblock_scale : 0.0f;
+        const float           s         = inv_col_scale * inv_scale;
+        const __nv_fp4x4_e2m1 q0_lo(make_float4(vals[0] * s, vals[1] * s, vals[2] * s, vals[3] * s));
+        const __nv_fp4x4_e2m1 q0_hi(make_float4(vals[4] * s, vals[5] * s, vals[6] * s, vals[7] * s));
+        const __nv_fp4x4_e2m1 q1_lo(make_float4(vals[8] * s, vals[9] * s, vals[10] * s, vals[11] * s));
+        const __nv_fp4x4_e2m1 q1_hi(make_float4(vals[12] * s, vals[13] * s, vals[14] * s, vals[15] * s));
+        q0 = uint32_t(q0_lo.__x) | (uint32_t(q0_hi.__x) << 16);
+        q1 = uint32_t(q1_lo.__x) | (uint32_t(q1_hi.__x) << 16);
+#        else
+        const float inv_scale = subblock_scale > 0.0f ? 0.5f / subblock_scale : 0.0f;
+#            pragma unroll
+        for (int k = 0; k < QK_NVFP4_SUB / 4; ++k) {
+            q0 |= uint32_t(ggml_cuda_float_to_fp4_e2m1(vals[k + 0] * inv_col_scale, inv_scale)) << (8 * k);
+            q0 |= uint32_t(ggml_cuda_float_to_fp4_e2m1(vals[k + 8] * inv_col_scale, inv_scale)) << (8 * k + 4);
+            q1 |= uint32_t(ggml_cuda_float_to_fp4_e2m1(vals[k + 4] * inv_col_scale, inv_scale)) << (8 * k);
+            q1 |= uint32_t(ggml_cuda_float_to_fp4_e2m1(vals[k + 12] * inv_col_scale, inv_scale)) << (8 * k + 4);
+        }
+#        endif  // CUDART_VERSION >= 12080
+
+        uint32_t * output = reinterpret_cast<uint32_t *>(static_cast<uint8_t *>(vy) + row * (n_cols_padded / 2) +
+                                                         subblock * (QK_NVFP4_SUB / 2));
+        output[0]         = q0;
+        output[1]         = q1;
+        block_scales[ggml_cuda_cutlass_blockscaled_scale_offset(row, subblock, n_cols_padded / QK_NVFP4_SUB)] =
+            fp8_code;
+    }
+#    else
+    GGML_UNUSED_VARS(gate, up, gate_scale, up_scale, glu, vy, block_scales, row_scales, n_cols, n_cols_padded);
+    NO_DEVICE_CODE;
+#    endif  // defined(BLACKWELL_MMA_AVAILABLE)
+}
+
 void quantize_cutlass_nvfp4_cuda(
         const float * x, void * vy, uint8_t * block_scales, float * row_scales, bool use_aligned_float8,
         int64_t n_cols, int64_t n_cols_padded, int64_t stride_row, int64_t n_rows, cudaStream_t stream) {
@@ -726,5 +833,25 @@ void quantize_cutlass_nvfp4_cuda(
         quantize_mmq_nvfp4<false, false, true><<<num_blocks, block_size, 0, stream>>>(
             x, nullptr, vy, row_scales, n_cols, stride_row, 0, 0, n_cols_padded, n_rows, 1, 0, block_scales);
     }
+}
+
+void quantize_cutlass_nvfp4_swiglu_bf16_cuda(const nv_bfloat16 * gate,
+                                             const nv_bfloat16 * up,
+                                             const float *       gate_scale,
+                                             const float *       up_scale,
+                                             float *             glu,
+                                             void *              vy,
+                                             uint8_t *           block_scales,
+                                             float *             row_scales,
+                                             int64_t             n_cols,
+                                             int64_t             n_cols_padded,
+                                             int64_t             n_rows,
+                                             cudaStream_t        stream) {
+    GGML_ASSERT(n_cols % QK_NVFP4 == 0 && n_cols_padded >= n_cols && n_cols_padded % 128 == 0);
+    GGML_ASSERT(glu != nullptr);
+    CUDA_CHECK(
+        cudaMemsetAsync(block_scales, 0, (size_t) GGML_PAD(n_rows, 128) * (n_cols_padded / QK_NVFP4_SUB), stream));
+    quantize_cutlass_nvfp4_swiglu_bf16<<<(unsigned) n_rows, CUDA_QUANTIZE_BLOCK_SIZE_MMQ, 0, stream>>>(
+        gate, up, gate_scale, up_scale, glu, vy, block_scales, row_scales, n_cols, n_cols_padded);
 }
 #endif
