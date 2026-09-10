@@ -15,6 +15,7 @@
 #include <array>
 #include <atomic>
 #include <map>
+#include <memory>
 #include <vector>
 
 struct llama_model;
@@ -42,6 +43,11 @@ struct llama_memory_buffer {
 };
 
 using llama_memory_buffers = std::map<ggml_backend_buffer_type_t, llama_memory_buffer>;
+
+struct llama_compute_state {
+    ggml_backend_sched_t sched = nullptr;
+    uint64_t generation = 0;
+};
 
 struct llama_context {
     // init scheduler and compute buffers, reserve worst-case graphs
@@ -384,6 +390,10 @@ private:
     std::vector<swap_info> output_swaps;
 
     ggml_backend_sched_ptr sched;
+    std::shared_ptr<llama_compute_state> compute_state = std::make_shared<llama_compute_state>();
+    std::weak_ptr<llama_compute_state> ctx_compute;
+    uint64_t compute_generation = 0;
+    bool compute_share_source = false;
 
     bool sched_need_reserve = true;
 

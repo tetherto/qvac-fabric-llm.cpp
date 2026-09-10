@@ -255,6 +255,13 @@ llama_context::llama_context(
         }
     }
 
+    if (params.ctx_other_share_compute && params.ctx_type == LLAMA_CONTEXT_TYPE_MTP && params.ctx_other != nullptr &&
+        &params.ctx_other->get_model() == &model &&
+        cparams.n_seq_max == 1 && params.ctx_other->n_seq_max() == 1) {
+        ctx_compute = params.ctx_other->compute_state;
+        params.ctx_other->compute_share_source = true;
+    }
+
     if (cparams.rope_scaling_type == LLAMA_ROPE_SCALING_TYPE_UNSPECIFIED) {
         cparams.rope_scaling_type = hparams.rope_scaling_type_train;
     }
@@ -606,6 +613,7 @@ llama_context::llama_context(
 }
 
 llama_context::~llama_context() {
+    compute_state.reset();
     // wait for any pending asynchronous copies into the output buffers before they are freed
     synchronize();
 
@@ -753,6 +761,10 @@ void llama_context::sched_new(size_t max_nodes, bool parallel) {
 }
 
 void llama_context::sched_reserve() {
+    auto source = ctx_compute.lock();
+    if (source && compute_generation != source->generation) {
+        sched_need_reserve = true;
+    }
     if (!sched_need_reserve) {
         return;
     }
@@ -785,7 +797,37 @@ void llama_context::sched_reserve() {
         cparams.prefetch_weights = false;
     }
 
+    auto previous_sched = std::move(sched);
+    compute_state->sched = nullptr;
+    if (!compute_share_source) {
+        previous_sched.reset();
+    }
+
     sched_new(max_nodes, cparams.pipeline_parallel);
+
+    if (source) {
+        int n_devices = 0;
+        for (ggml_backend_t backend : backend_ptrs) {
+            ggml_backend_dev_t device = ggml_backend_get_device(backend);
+            if (device == nullptr || ggml_backend_dev_type(device) == GGML_BACKEND_DEVICE_TYPE_CPU ||
+                ggml_backend_dev_type(device) == GGML_BACKEND_DEVICE_TYPE_ACCEL) {
+                continue;
+            }
+
+            n_devices++;
+        }
+
+        if (n_devices == 1 &&
+            ggml_backend_sched_share_compute_buffers(sched.get(), source->sched)) {
+            LLAMA_LOG_INFO("%s: sharing compute buffers with the target context\n", __func__);
+        } else {
+            LLAMA_LOG_INFO("%s: compute buffer sharing unavailable; using independent buffers\n", __func__);
+        }
+        compute_generation = source->generation;
+    } else if (compute_share_source && previous_sched) {
+        ggml_backend_sched_share_compute_buffers(sched.get(), previous_sched.get());
+    }
+    previous_sched.reset();
 
     llama_memory_context_ptr mctx;
     if (memory) {
@@ -908,6 +950,9 @@ void llama_context::sched_reserve() {
                 val(n_inputs_pp, n_inputs_tg).c_str(),
                 val(n_input_tensors_pp, n_input_tensors_tg).c_str());
     }
+
+    compute_state->sched = sched.get();
+    ++compute_state->generation;
 
     const int64_t t_end_us = ggml_time_us();
 
@@ -4318,6 +4363,7 @@ llama_context_params llama_context_default_params() {
         /*.sampler                     =*/ nullptr,
         /*.n_sampler                   =*/ 0,
         /*.ctx_other                   =*/ nullptr,
+        /*.ctx_other_share_compute     =*/ false,
         /*.training                    =*/ false,
     };
 
