@@ -1466,7 +1466,17 @@ private:
             process_single_task(std::move(task));
         });
         queue_tasks.on_update_slots([this]() {
-            update_slots();
+            try {
+                update_slots();
+            } catch (const std::exception & e) {
+                // update_slots() throws to abandon a batch it cannot finish. some throw
+                // sites release the affected slots first and some do not, and a slot left
+                // in processing state is picked up again on the next wake-up and throws
+                // again, so the request would hang forever. make sure none survive
+                SRV_ERR("update slots failed: %s\n", e.what());
+
+                release_processing_slots(std::string("Internal server error: ") + e.what());
+            }
         });
         queue_tasks.on_sleeping_state([this](bool sleeping) {
             handle_sleeping_state(sleeping);
@@ -3634,6 +3644,22 @@ private:
         }
     }
 
+    // fail every slot that is still mid-batch and put it back in the pool. the batch is
+    // being abandoned and there is no way to tell how much of it was consumed, so the
+    // whole context goes with it
+    void release_processing_slots(const std::string & err) {
+        for (auto & slot : slots) {
+            if (slot.is_processing()) {
+                send_error(slot, err);
+                slot.release();
+
+                // note: it's complicated to keep track of how much of the current batch has been
+                //       processed before the error occurred, so we simply clear the entire context
+                slot.prompt_clear();
+            }
+        }
+    }
+
     // returns true = success ; false = retry with smaller batch size
     // throw std::runtime_error on fatal error
     bool decode(int32_t & n_batch, int32_t off, llama_batch & batch_view) {
@@ -3683,21 +3709,17 @@ private:
                     err = "Compute error.";
                 }
 
-                // TODO: handle ret == 2 (abort) when we start aborting
+                if (ret == 2) {
+                    // aborted through the abort callback. a smaller batch cannot help, and
+                    // when the abort hit a pending K-shift the shift is still owed, so the
+                    // retry aborts again and halves n_batch until it reaches zero
+                    err = "Operation aborted.";
+                }
 
                 if (!err.empty()) {
                     SRV_ERR("%s off = %d, n_batch = %d, ret = %d\n", err.c_str(), off, n_batch, ret);
 
-                    for (auto & slot : slots) {
-                        if (slot.is_processing()) {
-                            send_error(slot, err);
-                            slot.release();
-
-                            // note: it's complicated to keep track of how much of the current batch has been
-                            //       processed before the error occurred, so we simply clear the entire context
-                            slot.prompt_clear();
-                        }
-                    }
+                    release_processing_slots(err);
 
                     // stop, do not retry with smaller batch size
                     throw std::runtime_error(err);

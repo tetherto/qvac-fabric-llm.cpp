@@ -75,8 +75,22 @@ struct llama_context {
 
     llama_memory_t get_memory() const;
 
-    // return true if the memory was updated
-    bool memory_update(bool optimize);
+    // Result of applying pending memory updates. A bool cannot express this:
+    // "nothing was pending" and "the update failed" are both not-updated, but
+    // only one of them means the caller must stop.
+    enum class memory_update_status {
+        no_update, // nothing was pending
+        updated,   // pending work was applied successfully
+        failed,    // an update was attempted and did not complete
+    };
+
+    memory_update_status memory_update(bool optimize);
+
+    // The memory module computes through llama_memory_context_i::apply(), which
+    // returns bool, so a failed update's ggml_status would be lost on the way
+    // out. The module records it here instead, and memory_update_ret() maps it
+    // onto the same llama_decode codes the ubatch compute path uses.
+    void set_memory_update_result(ggml_status status);
 
     enum llama_pooling_type pooling_type() const;
 
@@ -238,6 +252,13 @@ struct llama_context {
 
 private:
     //
+    // memory
+    //
+
+    // llama_decode return code for a memory update that reported failed
+    int memory_update_ret() const;
+
+    //
     // output
     //
 
@@ -365,6 +386,9 @@ private:
     ggml_backend_sched_ptr sched;
 
     bool sched_need_reserve = true;
+
+    // ggml_status of the last memory update, see set_memory_update_result()
+    ggml_status memory_update_result = GGML_STATUS_SUCCESS;
 
     ggml_backend_t backend_cpu = nullptr;
     std::vector<ggml_backend_ptr> backends;

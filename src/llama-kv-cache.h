@@ -209,6 +209,16 @@ public:
     // return empty vector on failure
     slot_info_vec_t prepare(const std::vector<llama_ubatch> & ubatches);
 
+    // Applies pending shifts and stream copies. Returns whether the update
+    // SUCCEEDED, not whether it did any work: a no-op update is a success.
+    // A failed K-shift leaves the cells carrying shifted positions that K was
+    // never rotated to match, so the caller must not keep decoding. has_shift
+    // stays set on that path because the shift is still owed; a caller that
+    // empties the stream via seq_rm clears it.
+    //
+    // NOTE: the meaning diverges from upstream, which returns whether any work
+    // was done. The signature is unchanged, so a rebase that restores upstream's
+    // body will compile and silently revert this. See tetherto PR #213.
     bool update(llama_context * lctx, bool do_shift, const stream_copy_info & sc_info);
 
     // find a slot of kv cells that can hold the ubatch

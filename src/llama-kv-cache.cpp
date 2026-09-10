@@ -516,6 +516,13 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
         if (new_head != cells.size() && new_head < head) {
             head = new_head;
         }
+
+        // An empty stream owes no shift. Without this, a K-shift that failed
+        // leaves has_shift set with no way for a caller to clear it short of
+        // llama_memory_clear(), so every later decode retries the same shift.
+        if (cells.get_used() == 0) {
+            cells.reset_shift();
+        }
     } else {
         // match any sequence
         for (uint32_t s = 0; s < n_stream; ++s) {
@@ -539,6 +546,11 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
             // If we freed up a slot, set head to it so searching can start there.
             if (new_head != cells.size() && new_head < head) {
                 head = new_head;
+            }
+
+            // see the note on the seq_id >= 0 branch above
+            if (cells.get_used() == 0) {
+                cells.reset_shift();
             }
         }
     }
@@ -937,8 +949,6 @@ bool llama_kv_cache::update(llama_context * lctx, bool do_shift, const stream_co
         return true;
     }
 
-    bool updated = false;
-
     auto * sched = lctx->get_sched();
 
     if (!sc_info.empty()) {
@@ -989,17 +999,26 @@ bool llama_kv_cache::update(llama_context * lctx, bool do_shift, const stream_co
             auto * gf = build_graph_shift(res, lctx);
             if (!ggml_backend_sched_alloc_graph(sched, gf)) {
                 LLAMA_LOG_ERROR("%s: failed to allocate compute graph for K-shift\n", __func__);
-                return updated;
+
+                // has_shift stays set, the shift is still owed
+                lctx->set_memory_update_result(GGML_STATUS_ALLOC_FAILED);
+
+                return false;
             }
 
             res->set_inputs(nullptr);
 
-            if (lctx->graph_compute(gf, false) != GGML_STATUS_SUCCESS) {
+            const auto status = lctx->graph_compute(gf, false);
+            if (status != GGML_STATUS_SUCCESS) {
                 LLAMA_LOG_ERROR("%s: failed to compute K-shift\n", __func__);
-                return updated;
-            }
 
-            updated = true;
+                // keep the status rather than flattening it: stopping is right
+                // either way since K is left half-rotated, but an abort is the
+                // caller cancelling and must not reach it as a fatal error
+                lctx->set_memory_update_result(status);
+
+                return false;
+            }
         }
 
         for (uint32_t s = 0; s < n_stream; ++s) {
@@ -1009,7 +1028,7 @@ bool llama_kv_cache::update(llama_context * lctx, bool do_shift, const stream_co
         }
     }
 
-    return updated;
+    return true;
 }
 
 llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch, bool cont) const {
@@ -2943,9 +2962,7 @@ bool llama_kv_cache_context::apply() {
 
     // no ubatches -> this is a KV cache update
     if (ubatches.empty()) {
-        kv->update(lctx, do_shift, sc_info);
-
-        return true;
+        return kv->update(lctx, do_shift, sc_info);
     }
 
     kv->apply_ubatch(sinfos[i_cur], ubatches[i_cur]);

@@ -829,10 +829,12 @@ llama_memory_t llama_context::get_memory() const {
     return memory.get();
 }
 
-bool llama_context::memory_update(bool optimize) {
+llama_context::memory_update_status llama_context::memory_update(bool optimize) {
     if (!memory) {
-        return false;
+        return memory_update_status::no_update;
     }
+
+    memory_update_result = GGML_STATUS_SUCCESS;
 
     {
         const auto mctx = memory->init_update(this, optimize);
@@ -844,13 +846,13 @@ bool llama_context::memory_update(bool optimize) {
             case LLAMA_MEMORY_STATUS_NO_UPDATE:
                 {
                     // no updates need to be performed
-                    return false;
+                    return memory_update_status::no_update;
                 }
             case LLAMA_MEMORY_STATUS_FAILED_PREPARE:
             case LLAMA_MEMORY_STATUS_FAILED_COMPUTE:
                 {
                     LLAMA_LOG_ERROR("%s: failed to prepare memory update\n", __func__);
-                    return false;
+                    return memory_update_status::failed;
                 }
         }
 
@@ -861,6 +863,24 @@ bool llama_context::memory_update(bool optimize) {
 
         if (!mctx->apply()) {
             LLAMA_LOG_ERROR("%s: failed to apply memory update\n", __func__);
+
+            // the update did not complete, so the memory cannot be trusted for
+            // decode - report it rather than reserving a graph and letting the
+            // caller carry on
+            //
+            // the memory module reset the scheduler to build its own graph, and
+            // the reserve below that would have restored the worst-case
+            // reservation is now skipped, so drain whatever it dispatched before
+            // failing and leave the rebuild to the next call
+            //
+            // sched_need_reserve makes sched_reserve() build a whole new scheduler
+            // rather than only re-reserve, which is what an allocation failure wants:
+            // the current one is freed before the next attempt asks for memory
+            ggml_backend_sched_synchronize(sched.get());
+
+            sched_need_reserve = true;
+
+            return memory_update_status::failed;
         }
     }
 
@@ -882,7 +902,41 @@ bool llama_context::memory_update(bool optimize) {
         }
     }
 
-    return true;
+    return memory_update_status::updated;
+}
+
+void llama_context::set_memory_update_result(ggml_status status) {
+    // an iswa or hybrid apply() runs every sub-context even after one of them has
+    // failed, so more than one can report here. keep the most severe: an abort is the
+    // caller cancelling and must never mask a real failure from another sub-context
+    const auto severity = [](ggml_status s) {
+        switch (s) {
+            case GGML_STATUS_SUCCESS:      return 0;
+            case GGML_STATUS_ABORTED:      return 1;
+            case GGML_STATUS_ALLOC_FAILED: return 2;
+            case GGML_STATUS_FAILED:       return 3;
+        }
+
+        return 3;
+    };
+
+    if (severity(status) > severity(memory_update_result)) {
+        memory_update_result = status;
+    }
+}
+
+int llama_context::memory_update_ret() const {
+    // mirror the mapping decode() uses for the ubatch compute status, so the
+    // caller sees the same code for the same failure wherever it happened. an
+    // abort in particular is not a fatal error
+    switch (memory_update_result) {
+        case GGML_STATUS_ABORTED:      return  2;
+        case GGML_STATUS_FAILED:       return -3;
+        case GGML_STATUS_ALLOC_FAILED: return -2;
+        case GGML_STATUS_SUCCESS:      break; // failed before computing a graph
+    }
+
+    return -2;
 }
 
 enum llama_pooling_type llama_context::pooling_type() const {
@@ -1831,11 +1885,6 @@ int llama_context::decode(const llama_batch & batch_inp) {
     }
     embd_seq.clear();
 
-    if (t_compute_start_us == 0) {
-        t_compute_start_us = ggml_time_us();
-    }
-    n_queued_tokens += n_tokens_all;
-
     output_swaps.clear();
 
     sched_reserve();
@@ -1843,7 +1892,17 @@ int llama_context::decode(const llama_batch & batch_inp) {
     bool did_optimize = false;
 
     // handle any pending shifts/copies
-    memory_update(false);
+    if (memory_update(false) == memory_update_status::failed) {
+        return memory_update_ret();
+    }
+
+    // count the batch only once it is going to be evaluated: the memory update above
+    // can fail and return, and synchronize() attributes everything queued to the next
+    // decode that completes
+    if (t_compute_start_us == 0) {
+        t_compute_start_us = ggml_time_us();
+    }
+    n_queued_tokens += n_tokens_all;
 
     llama_memory_context_ptr mctx;
 
@@ -1868,7 +1927,15 @@ int llama_context::decode(const llama_batch & batch_inp) {
                     if (!did_optimize) {
                         did_optimize = true;
 
-                        if (memory_update(true)) {
+                        const auto status = memory_update(true);
+
+                        // a failed update means the memory cannot be trusted, so
+                        // it must not be reported as the retryable "no slot"
+                        if (status == memory_update_status::failed) {
+                            return memory_update_ret();
+                        }
+
+                        if (status == memory_update_status::updated) {
                             LLAMA_LOG_DEBUG("%s: retrying batch size %d after cache optimization\n", __func__, balloc->get_n_tokens());
 
                             continue;
