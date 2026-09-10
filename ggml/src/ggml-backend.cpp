@@ -2068,29 +2068,34 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                                 copy_size);
                         };
 
+                        // the ids tensor may have zero rows, in which case no expert is marked
+                        // used; bound the scan so that it cannot read past the end of the bitset
                         int id = 0;
-                        while (!ggml_bitset_get(used_ids.data(), id)) {
+                        while (id < n_expert && !ggml_bitset_get(used_ids.data(), id)) {
                             id++;
                         }
-                        int32_t first_id = id;
-                        int32_t last_id = first_id;
 
-                        for (++id; id < n_expert; ++id) {
-                            if (!ggml_bitset_get(used_ids.data(), id)) {
-                                continue;
-                            }
+                        if (id < n_expert) {
+                            int32_t first_id = id;
+                            int32_t last_id = first_id;
 
-                            if (id == last_id + 1) {
+                            for (++id; id < n_expert; ++id) {
+                                if (!ggml_bitset_get(used_ids.data(), id)) {
+                                    continue;
+                                }
+
+                                if (id == last_id + 1) {
+                                    last_id = id;
+                                    continue;
+                                }
+
+                                copy_experts(first_id, last_id);
+
+                                first_id = id;
                                 last_id = id;
-                                continue;
                             }
-
                             copy_experts(first_id, last_id);
-
-                            first_id = id;
-                            last_id = id;
                         }
-                        copy_experts(first_id, last_id);
                     }
                 } else {
                     // try async copy, but if not possible, we can still use a sync copy without synchronizing the dst backend, since we handle the synchronization here with multiple copies and events
