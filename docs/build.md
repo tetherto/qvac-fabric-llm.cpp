@@ -297,6 +297,10 @@ The following compilation options are also available to tweak performance:
 | GGML_CUDA_PEER_MAX_BATCH_SIZE | Positive integer       | 128     | Maximum batch size for which to enable peer access between multiple GPUs. Peer access requires either Linux or NVLink. When using NVLink enabling peer access for larger batch sizes is potentially beneficial.                                                                                                                                                                  |
 | GGML_CUDA_FA_ALL_QUANTS       | Boolean                | false   | Compile support for all KV cache quantization type (combinations) for the FlashAttention CUDA kernels. More fine-grained control over KV cache size but compilation takes much longer.                                                                                                                                                                                           |
 
+`GGML_CUDA_CUTLASS=ON` enables optional block-scaled matrix multiplication for dense MXFP4 and NVFP4 weights on SM120/SM121 Blackwell GPUs. It requires CUDA 12.9 or newer. CMake downloads the pinned CUTLASS release unless `FETCHCONTENT_SOURCE_DIR_CUTLASS` points to a local CUTLASS source tree.
+
+Weights are repacked during loading without changing the GGUF format. Small batches use the repacked MMVQ kernels; larger batches use CUTLASS where supported, with the existing CUDA kernels as a fallback. MXFP4 uses FP8 activations and NVFP4 uses FP4 activations for CUTLASS prefill. Measure model accuracy as well as prompt processing and generation speed when enabling this option. `--no-repack`, `GGML_CUDA_FORCE_MMQ`, and `GGML_CUDA_FORCE_CUBLAS` disable automatic placement in the repacked buffer.
+
 ## MUSA
 
 This provides GPU acceleration using a Moore Threads GPU. Make sure to have the [MUSA SDK](https://developer.mthreads.com/musa/musa-sdk) installed.

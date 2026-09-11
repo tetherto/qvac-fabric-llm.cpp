@@ -221,6 +221,16 @@ extern "C" {
     typedef void                         (*ggml_backend_set_n_threads_t)(ggml_backend_t backend, int n_threads);
     // Get additional buffer types provided by the device (returns a NULL-terminated array)
     typedef ggml_backend_buffer_type_t * (*ggml_backend_dev_get_extra_bufts_t)(ggml_backend_dev_t device);
+    // Get buffer types preferred over the default for model weight placement.
+    // The result is ordered, NULL-terminated, and must be copied before the next call.
+    typedef ggml_backend_buffer_type_t * (*ggml_backend_dev_get_preferred_bufts_t)(ggml_backend_dev_t device);
+    // Check whether set_tensor_async supports host uploads to this buffer type.
+    typedef bool (*ggml_backend_dev_supports_async_upload_t)(ggml_backend_dev_t device, ggml_backend_buffer_type_t buft);
+    // Optional bulk upload: begin, contiguous set_tensor_async calls covering the tensor, then end.
+    // Only one upload may be active per backend stream. Do not access the tensor before end succeeds.
+    // The caller keeps host data alive until the stream completes. Freeing the backend cancels an unfinished upload.
+    typedef bool (*ggml_backend_begin_async_upload_t)(ggml_backend_t backend, struct ggml_tensor * tensor);
+    typedef bool (*ggml_backend_end_async_upload_t)  (ggml_backend_t backend, struct ggml_tensor * tensor);
     // Set the abort callback for the backend
     typedef void                         (*ggml_backend_set_abort_callback_t)(ggml_backend_t backend, ggml_abort_callback abort_callback, void * abort_callback_data);
     // Get a list of feature flags supported by the backend (returns a NULL-terminated array)
