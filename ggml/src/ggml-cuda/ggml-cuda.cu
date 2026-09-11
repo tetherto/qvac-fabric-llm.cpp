@@ -4646,7 +4646,7 @@ struct ggml_cuda_cutlass_activation_plan {
         int                                 slot                = 0;
         size_t                              workspace_offset    = 0;
         bool                                prepared            = false;
-        ggml_cuda_cutlass_activation        activation;
+        ggml_cuda_cutlass_activation        activation = {};
     };
 
     std::vector<group>                              groups;
