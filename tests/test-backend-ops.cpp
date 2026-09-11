@@ -14,15 +14,14 @@
 // ## Section 1: General Setup ##
 // ##############################
 
-
-#include "ggml.h"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 #include "ggml-cpp.h"
+#include "ggml.h"
 
 #include <algorithm>
-#include <atomic>
 #include <array>
+#include <atomic>
 #include <cfloat>
 #include <cinttypes>
 #include <cstdarg>
@@ -31,8 +30,9 @@
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
-#include <future>
 #include <fstream>
+#include <future>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <random>
@@ -42,8 +42,8 @@
 #include <string>
 #include <string_view>
 #include <thread>
-#include <vector>
 #include <unordered_map>
+#include <vector>
 
 static unsigned int ggml_test_n_threads() {
     if (const char * env = getenv("GGML_TEST_N_THREADS")) {
@@ -5570,6 +5570,153 @@ struct test_cutlass_shared_activation : public test_case {
         ggml_tensor * out             = ggml_concat(ctx, native_output, repacked_output, 1);
         ggml_set_name(out, "out");
         return out;
+    }
+};
+
+struct test_cutlass_mlp_bf16 : public test_case {
+    static constexpr int n_weights = 3;
+
+    const bool                                  reuse_glu;
+    ggml_backend_t                              backend     = nullptr;
+    ggml_tensor *                               pair_output = nullptr;
+    ggml_tensor *                               materialized_glu = nullptr;
+    std::array<std::vector<uint8_t>, n_weights> weight_data;
+
+    explicit test_cutlass_mlp_bf16(bool reuse_glu) : reuse_glu(reuse_glu) {}
+
+    int graph_replays() override { return 4; }
+
+    std::string vars() override {
+        return std::string("type=nvfp4,m=576,n=2048,k=576,reuse_glu=") + (reuse_glu ? "yes" : "no");
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MUL_MAT_CUTLASS_MLP_BF16";
+    }
+
+    double max_nmse_err() override { return 2e-2; }
+
+    double err(const float * a, const float * b, size_t n) override {
+        if (materialized_glu != nullptr && n == (size_t) ggml_nelements(materialized_glu)) {
+            return nmse(a, b, n);
+        }
+        GGML_ASSERT(n % 2 == 0);
+        return nmse(a, a + n / 2, n / 2);
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return { pair_output, materialized_glu }; }
+
+    bool use_weight_context() override { return true; }
+
+    bool use_weight_context_sentinels() override { return false; }
+
+    ggml_backend_buffer_type_t weight_buffer_type(ggml_backend_t backend) override {
+        this->backend = backend;
+        return test_repacked_weight_buffer_type(backend);
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        ggml_tensor * native_gate = ggml_get_tensor(ctx, "mlp_native_gate");
+        if (native_gate != nullptr) {
+            test_case::initialize_tensors(ctx);
+            std::vector<float> stale(ggml_nelements(materialized_glu), std::numeric_limits<float>::quiet_NaN());
+            ggml_backend_tensor_set(materialized_glu, stale.data(), 0, ggml_nbytes(materialized_glu));
+
+            ggml_tensor *      input = ggml_get_tensor(ctx, "mlp_input");
+            std::vector<float> input_data(ggml_nelements(input));
+            ggml_backend_tensor_get(input, input_data.data(), 0, ggml_nbytes(input));
+            for (int64_t row = 0; row < input->ne[1]; ++row) {
+                const float scale = row % 19 == 0 ? 0.0f : std::ldexp(1.0f, row % 9 - 8);
+                for (int64_t col = 0; col < input->ne[0]; ++col) {
+                    input_data[row * input->ne[0] + col] *= scale;
+                }
+            }
+            ggml_backend_tensor_set(input, input_data.data(), 0, ggml_nbytes(input));
+
+            const float gate_scale_data = 0.75f;
+            const float up_scale_data   = 1.25f;
+            ggml_backend_tensor_set(ggml_get_tensor(ctx, "mlp_gate_scale"), &gate_scale_data, 0,
+                                    sizeof(gate_scale_data));
+            ggml_backend_tensor_set(ggml_get_tensor(ctx, "mlp_up_scale"), &up_scale_data, 0, sizeof(up_scale_data));
+
+            const char * names[n_weights] = { "mlp_native_gate", "mlp_native_up", "mlp_native_down" };
+            for (int i = 0; i < n_weights; ++i) {
+                ggml_tensor * weight = ggml_get_tensor(ctx, names[i]);
+                weight_data[i].resize(ggml_nbytes(weight));
+                ggml_backend_tensor_get(weight, weight_data[i].data(), 0, weight_data[i].size());
+            }
+            return;
+        }
+
+        GGML_ASSERT(backend != nullptr);
+        const char * names[n_weights] = { "mlp_repacked_gate", "mlp_repacked_up", "mlp_repacked_down" };
+        for (int i = 0; i < n_weights; ++i) {
+            ggml_tensor * weight = ggml_get_tensor(ctx, names[i]);
+            GGML_ASSERT(weight != nullptr && !weight_data[i].empty());
+            ggml_backend_tensor_set(weight, weight_data[i].data(), 0, weight_data[i].size());
+        }
+    }
+
+    ggml_tensor * build_mlp(ggml_context * ctx,
+                            ggml_tensor *  input,
+                            ggml_tensor *  gate_weight,
+                            ggml_tensor *  up_weight,
+                            ggml_tensor *  down_weight,
+                            ggml_tensor *  gate_scale,
+                            ggml_tensor *  up_scale,
+                            ggml_tensor ** materialized = nullptr) const {
+        ggml_tensor * gate = ggml_mul(ctx, ggml_mul_mat(ctx, gate_weight, input), gate_scale);
+        ggml_tensor * up   = ggml_mul(ctx, ggml_mul_mat(ctx, up_weight, input), up_scale);
+        ggml_tensor * glu  = ggml_swiglu_split(ctx, gate, up);
+        if (materialized != nullptr) {
+            *materialized = glu;
+        }
+        ggml_tensor * down = ggml_mul_mat(ctx, down_weight, glu);
+        if (reuse_glu) {
+            down = ggml_add(ctx, down, ggml_scale(ctx, glu, 0.0f));
+        }
+        return down;
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override { return build_graph(ctx, ctx); }
+
+    ggml_tensor * build_graph(ggml_context * ctx, ggml_context * ctx_weights) override {
+        GGML_ASSERT(ctx_weights != nullptr);
+        constexpr int64_t m = 576;
+        constexpr int64_t n = 2048;
+        constexpr int64_t k = 576;
+
+        ggml_tensor * native_gate   = ggml_new_tensor_2d(ctx, GGML_TYPE_NVFP4, k, m);
+        ggml_tensor * native_up     = ggml_new_tensor_2d(ctx, GGML_TYPE_NVFP4, k, m);
+        ggml_tensor * native_down   = ggml_new_tensor_2d(ctx, GGML_TYPE_NVFP4, m, m);
+        ggml_tensor * repacked_gate = ::ggml_new_tensor_2d(ctx_weights, GGML_TYPE_NVFP4, k, m);
+        ggml_tensor * repacked_up   = ::ggml_new_tensor_2d(ctx_weights, GGML_TYPE_NVFP4, k, m);
+        ggml_tensor * repacked_down = ::ggml_new_tensor_2d(ctx_weights, GGML_TYPE_NVFP4, m, m);
+        ggml_set_name(native_gate, "mlp_native_gate");
+        ggml_set_name(native_up, "mlp_native_up");
+        ggml_set_name(native_down, "mlp_native_down");
+        ggml_set_name(repacked_gate, "mlp_repacked_gate");
+        ggml_set_name(repacked_up, "mlp_repacked_up");
+        ggml_set_name(repacked_down, "mlp_repacked_down");
+
+        ggml_tensor * input      = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
+        ggml_tensor * gate_scale = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
+        ggml_tensor * up_scale   = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
+        ggml_set_name(input, "mlp_input");
+        ggml_set_name(gate_scale, "mlp_gate_scale");
+        ggml_set_name(up_scale, "mlp_up_scale");
+
+        ggml_tensor * native         = build_mlp(ctx, input, native_gate, native_up, native_down, gate_scale, up_scale);
+        ggml_tensor * repacked_input = ggml_scale(ctx, input, 1.0f);
+        ggml_set_name(repacked_input, "mlp_attn_norm");
+        ggml_tensor * repacked = build_mlp(ctx, repacked_input, repacked_gate, repacked_up, repacked_down, gate_scale,
+                                           up_scale, &materialized_glu);
+        pair_output = ggml_concat(ctx, native, repacked, 1);
+        ggml_set_name(pair_output, "out");
+        return pair_output;
     }
 };
 
@@ -12453,6 +12600,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_cutlass_mul_mat(type, 260, 129, 576));
             test_cases.emplace_back(new test_cutlass_mul_mat(type, 5120, 512, 5120));
             test_cases.emplace_back(new test_cutlass_shared_activation());
+            test_cases.emplace_back(new test_cutlass_mlp_bf16(false));
+            test_cases.emplace_back(new test_cutlass_mlp_bf16(true));
         }
         for (ggml_glu_op glu_op : {GGML_GLU_OP_SWIGLU, GGML_GLU_OP_GEGLU}) {
             test_cases.emplace_back(new test_repacked_mul_mat_vec_fusion(type, glu_op, false, false));
