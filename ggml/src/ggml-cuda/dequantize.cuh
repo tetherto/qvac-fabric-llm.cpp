@@ -144,6 +144,23 @@ static __device__ __forceinline__ void dequantize_q2_K(const void * vx, const in
 }
 
 template<typename dst_t>
+static __device__ __forceinline__ void dequantize_tq2_0(const void * vx, const int64_t ib, dst_t * yy, const int tid) {
+    const block_tq2_0 * x = (const block_tq2_0 *) vx;
+
+    const int64_t n = tid/32;
+    const int64_t l = tid - 32*n;
+
+    const uint8_t q = x[ib].qs[32*n + l];
+    dst_t * y = yy + 128*n;
+
+    const float d = x[ib].d;
+    y[l+ 0] = ggml_cuda_cast<dst_t>(d * (float) (int) (((q >> 0) & 3) - 1));
+    y[l+32] = ggml_cuda_cast<dst_t>(d * (float) (int) (((q >> 2) & 3) - 1));
+    y[l+64] = ggml_cuda_cast<dst_t>(d * (float) (int) (((q >> 4) & 3) - 1));
+    y[l+96] = ggml_cuda_cast<dst_t>(d * (float) (int) (((q >> 6) & 3) - 1));
+}
+
+template<typename dst_t>
 static __device__ __forceinline__ void dequantize_q3_K(const void * vx, const int64_t ib, dst_t * yy, const int tid) {
     const block_q3_K * x = (const block_q3_K *) vx;
 

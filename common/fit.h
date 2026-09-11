@@ -35,7 +35,50 @@ common_params_fit_status common_fit_params(
                              size_t * margins,               // margins of memory to leave per device in bytes
                            uint32_t   n_ctx_min,             // minimum context size to set when trying to reduce memory use
       const common_fit_extra_model * extra,                  // model to fit alongside the main one, nullptr if there is none
+                               bool   prefetch_weights_auto, // enable prefetch when fitting a dense model
                      ggml_log_level   log_level);            // minimum log level to print during fitting, lower levels go to debug log
+
+// Automatic acceleration policies, exposed for hardware-independent tests.
+bool common_fit_auto_moe_cache(
+        const llama_model_params & mparams, const llama_context_params & cparams,
+        uint32_t n_expert, size_t n_devices, bool shares_host, bool cache_supported);
+
+bool common_fit_auto_prefetch_weights(
+        const llama_context_params & cparams, bool automatic,
+        uint32_t n_expert, size_t n_devices, bool shares_host, bool copy_stream);
+
+// Pure decision arithmetic, exposed for tests (tests/test-fit-params.cpp).
+// The projected figures are resident demand per row; "shares_host" marks
+// devices whose memory is the same physical pool as the host's.
+
+// Deficit (in bytes, >= 0) of the combined host + shared-memory-device budget
+// against available host memory. 0 means the combined budget is met.
+int64_t common_fit_shared_pool_deficit(
+        const std::vector<int64_t> & dev_projected,
+        const std::vector<bool>    & shares_host,
+                           int64_t   host_free,
+                           int64_t   host_projected_resident,
+                           int64_t   host_margin);
+
+// Per-device cap for a device that draws from the host pool. The pool budget
+// is what stays free after the host's own demand and margin, split evenly
+// between the devices that share it. A negative budget is returned unsplit.
+int64_t common_fit_shared_pool_target(
+                           int64_t   host_free,
+                           int64_t   host_projected_resident,
+                           int64_t   host_margin,
+                            size_t   n_shares_host);
+
+// Context size after the step-2 linear interpolation, guarded against a
+// context-independent memory delta (returns n_ctx_min) and clamped to the
+// training context. Returns 0 when no reduction can meet the target.
+uint32_t common_fit_reduced_n_ctx(
+        int64_t  sum_used_target,
+        int64_t  sum_projected_used,
+        int64_t  sum_projected_used_min_ctx,
+        uint32_t hp_nct,
+        uint32_t n_ctx_min,
+        uint32_t n_streams);
 
 // print estimated memory to stdout
 void common_fit_print(

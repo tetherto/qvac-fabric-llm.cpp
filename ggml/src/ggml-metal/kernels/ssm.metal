@@ -1,6 +1,13 @@
 #include "common.h"
 
 // ref: ggml.c:ggml_compute_forward_ssm_conv_f32
+constant short FC_ssm_conv_bs   [[function_constant(FC_SSM_CONV + 0)]];
+constant bool  FC_ssm_conv_silu [[function_constant(FC_SSM_CONV + 1)]];
+
+static inline float ssm_conv_out(float x) {
+    return FC_ssm_conv_silu ? x / (1.0f + exp(-x)) : x;
+}
+
 kernel void kernel_ssm_conv_f32_f32(
         constant ggml_metal_kargs_ssm_conv & args,
         device const  void * src0,
@@ -9,15 +16,15 @@ kernel void kernel_ssm_conv_f32_f32(
         uint3 tgpig[[threadgroup_position_in_grid]],
         uint3 tpitg[[thread_position_in_threadgroup]],
         uint3   ntg[[threads_per_threadgroup]]) {
-    const int64_t ir = tgpig.x;
+    const int64_t ir = (int64_t) tgpig.x * ntg.x + tpitg.x;
     const int64_t i2 = tgpig.y;
     const int64_t i3 = tgpig.z;
 
+    if (ir >= args.ne01) {
+        return;
+    }
+
     const int64_t nc  = args.ne10;
-  //const int64_t ncs = args.ne00;
-  //const int64_t nr  = args.ne01;
-  //const int64_t n_t = args.ne1;
-  //const int64_t n_s = args.ne2;
 
     device const float * s = (device const float *) ((device const char *) src0 + ir*args.nb01 + i2*args.nb00 + i3*args.nb02);
     device const float * c = (device const float *) ((device const char *) src1 + ir*args.nb11);
@@ -29,7 +36,7 @@ kernel void kernel_ssm_conv_f32_f32(
         sumf += s[i0] * c[i0];
     }
 
-    x[0] = sumf;
+    x[0] = ssm_conv_out(sumf);
 }
 
 kernel void kernel_ssm_conv_f32_f32_4(
@@ -40,15 +47,15 @@ kernel void kernel_ssm_conv_f32_f32_4(
         uint3 tgpig[[threadgroup_position_in_grid]],
         uint3 tpitg[[thread_position_in_threadgroup]],
         uint3   ntg[[threads_per_threadgroup]]) {
-    const int64_t ir = tgpig.x;
+    const int64_t ir = (int64_t) tgpig.x * ntg.x + tpitg.x;
     const int64_t i2 = tgpig.y;
     const int64_t i3 = tgpig.z;
 
+    if (ir >= args.ne01) {
+        return;
+    }
+
     const int64_t nc  = args.ne10;
-  //const int64_t ncs = args.ne00;
-  //const int64_t nr  = args.ne01;
-  //const int64_t n_t = args.ne1;
-  //const int64_t n_s = args.ne2;
 
     device const float4 * s = (device const float4 *) ((device const char *) src0 + ir*args.nb01 + i2*args.nb00 + i3*args.nb02);
     device const float4 * c = (device const float4 *) ((device const char *) src1 + ir*args.nb11);
@@ -60,10 +67,8 @@ kernel void kernel_ssm_conv_f32_f32_4(
         sumf += dot(s[i0], c[i0]);
     }
 
-    x[0] = sumf;
+    x[0] = ssm_conv_out(sumf);
 }
-
-constant short FC_ssm_conv_bs   [[function_constant(FC_SSM_CONV + 0)]];
 
 // Batched version: each threadgroup processes multiple tokens for better efficiency
 // Thread layout: each thread handles one token, threadgroup covers BATCH_SIZE tokens
@@ -109,7 +114,7 @@ kernel void kernel_ssm_conv_f32_f32_batched(
         sumf += s[i0] * c[i0];
     }
 
-    x[0] = sumf;
+    x[0] = ssm_conv_out(sumf);
 }
 
 kernel void kernel_ssm_conv_f32_f32_batched_4(
@@ -154,7 +159,74 @@ kernel void kernel_ssm_conv_f32_f32_batched_4(
         sumf += dot(s[i0], c[i0]);
     }
 
-    x[0] = sumf;
+    x[0] = ssm_conv_out(sumf);
+}
+
+// ref: ggml.c:ggml_compute_forward_ssm_conv_back_sx_f32
+kernel void kernel_ssm_conv_back_sx_f32(
+        constant ggml_metal_kargs_ssm_conv_back_sx & args,
+        device const char * g_in,    // grad_out {d_inner, n_t, n_s}
+        device const char * c_in,    // c        {d_conv, d_inner}
+        device       char * dst,     // grad_sx  {ncs, d_inner, n_s}
+        uint3 tpig[[thread_position_in_grid]]) {
+    const int p  = tpig.x;
+    const int i1 = tpig.y;
+    const int i3 = tpig.z;
+
+    if (p >= args.ncs || i1 >= args.nr || i3 >= args.n_s) {
+        return;
+    }
+
+    device const float * grad = (device const float *) g_in;
+    device const float * c    = (device const float *) c_in;
+    device       float * d    = (device       float *) dst;
+
+    float sumf = 0.0f;
+
+    if (args.n_t > 0) {
+        const uint64_t grad_base = i1*args.grad_nb0 + i3*args.grad_nb2;
+        const uint64_t c_base    = i1*args.c_nb1;
+
+        const int t0 = (p + 1 > args.nc) ? (p + 1 - args.nc) : 0;
+        const int t1 = min(args.n_t - 1, p);
+
+        for (int t = t0; t <= t1; ++t) {
+            sumf += grad[grad_base + t*args.grad_nb1] * c[c_base + (p - t)];
+        }
+    }
+
+    d[p*args.dst_nb0 + i1*args.dst_nb1 + i3*args.dst_nb2] = sumf;
+}
+
+// ref: ggml.c:ggml_compute_forward_ssm_conv_back_c_f32
+kernel void kernel_ssm_conv_back_c_f32(
+        constant ggml_metal_kargs_ssm_conv_back_c & args,
+        device const char * g_in,    // grad_out {d_inner, n_t, n_s}
+        device const char * sx_in,   // sx       {ncs, d_inner, n_s}
+        device       char * dst,     // grad_c   {d_conv, d_inner}
+        uint3 tpig[[thread_position_in_grid]]) {
+    const int i0 = tpig.x;
+    const int i1 = tpig.y;
+
+    if (i0 >= args.nc || i1 >= args.nr) {
+        return;
+    }
+
+    device const float * grad = (device const float *) g_in;
+    device const float * sx   = (device const float *) sx_in;
+    device       float * d    = (device       float *) dst;
+
+    float sumf = 0.0f;
+
+    for (int i3 = 0; i3 < args.n_s; ++i3) {
+        const uint64_t grad_base = i1*args.grad_nb0 + i3*args.grad_nb2;
+        const uint64_t sx_base   = i0*args.sx_nb0 + i1*args.sx_nb1 + i3*args.sx_nb2;
+        for (int i2 = 0; i2 < args.n_t; ++i2) {
+            sumf += grad[grad_base + i2*args.grad_nb1] * sx[sx_base + i2*args.sx_nb0];
+        }
+    }
+
+    d[i0 + i1*args.dst_nb1] = sumf;
 }
 
 // ref: ggml.c:ggml_compute_forward_ssm_scan_f32, Mamba-2 part

@@ -2,7 +2,13 @@
 
 void llama_model_gemma4::load_arch_hparams(llama_model_loader & ml) {
     hparams.swa_type = LLAMA_SWA_TYPE_STANDARD;
-    ml.get_key_or_arr(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN, hparams.is_swa_impl, hparams.n_layer());
+    // Skip when n_layer is 0 (vocab-only ggufs used by test-tokenizer-0 etc.):
+    // those carry the model's sliding_window_pattern array verbatim while
+    // having block_count = 0, which would otherwise fail get_key_or_arr's
+    // array-length check.
+    if (hparams.n_layer() > 0) {
+        ml.get_key_or_arr(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN, hparams.is_swa_impl, hparams.n_layer());
+    }
 
     uint32_t n_kv_shared_layers = 0;
     ml.get_key(LLM_KV_ATTENTION_SHARED_KV_LAYERS, n_kv_shared_layers, false);

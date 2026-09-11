@@ -1,0 +1,73 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : require
+
+#include "types.glsl"
+
+const uint num_threads = 256;
+
+layout(local_size_x = num_threads, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform parameter {
+    uint ne;
+    uint n_embd;
+    uint hc;
+    uint n_tokens;
+    uint x_nb0;
+    uint x_nb1;
+    uint x_offset;
+    uint residual_nb0;
+    uint residual_nb1;
+    uint residual_nb2;
+    uint residual_offset;
+    uint post_nb0;
+    uint post_nb1;
+    uint post_offset;
+    uint comb_nb0;
+    uint comb_nb1;
+    uint comb_nb2;
+    uint comb_offset;
+    uint dst_nb0;
+    uint dst_nb1;
+    uint dst_nb2;
+    uint dst_offset;
+} p;
+
+layout(binding = 0) readonly buffer XBuf { float data_x[]; };
+layout(binding = 1) readonly buffer ResidualBuf { float data_residual[]; };
+layout(binding = 2) readonly buffer PostBuf { float data_post[]; };
+layout(binding = 3) readonly buffer CombBuf { float data_comb[]; };
+layout(binding = 4) writeonly buffer DBuf { float data_d[]; };
+
+uint get_idx() {
+    return gl_GlobalInvocationID.z * 262144 + gl_GlobalInvocationID.y * 512 + gl_GlobalInvocationID.x;
+}
+
+void main() {
+    uint idx = get_idx();
+
+    const uint num_iter = 2;
+    [[unroll]] for (uint iter = 0; iter < num_iter; ++iter) {
+        if (idx >= p.ne) {
+            continue;
+        }
+
+        const uint i = idx % p.n_embd;
+        const uint d = (idx / p.n_embd) % p.hc;
+        const uint t = idx / (p.n_embd * p.hc);
+
+        precise float sum = data_x[p.x_offset + i*p.x_nb0 + t*p.x_nb1] *
+                            data_post[p.post_offset + d*p.post_nb0 + t*p.post_nb1];
+
+        for (uint s = 0; s < p.hc; ++s) {
+            const float rv = data_residual[p.residual_offset + i*p.residual_nb0 + s*p.residual_nb1 + t*p.residual_nb2];
+            const float cw = data_comb[p.comb_offset + d*p.comb_nb0 + s*p.comb_nb1 + t*p.comb_nb2];
+            precise float product = rv * cw;
+            sum = sum + product;
+        }
+
+        data_d[p.dst_offset + i*p.dst_nb0 + d*p.dst_nb1 + t*p.dst_nb2] = sum;
+
+        idx += num_threads;
+    }
+}

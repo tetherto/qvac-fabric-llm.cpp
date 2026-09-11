@@ -7,12 +7,23 @@
 #include <algorithm>
 #include <exception>
 #include <memory>
+#include <unordered_map>
 #include <vector>
 
 //
 // dummy backend with configurable max_buffer_size, tracks allocations
 
 uint8_t * const alloc_base = (uint8_t *) 16;
+
+struct dummy_tensor_extra {
+    size_t offset;
+    size_t size;
+};
+
+struct dummy_tensor_extra_pool {
+    std::vector<std::unique_ptr<dummy_tensor_extra>> entries;
+    size_t next = 0;
+};
 
 struct dummy_backend_context {
     size_t max_buffer_size = 64;
@@ -22,6 +33,7 @@ struct dummy_backend_context {
     ggml_backend_device                device;
     ggml_backend                       backend;
     std::vector<ggml_backend_buffer_t> buffers;
+    std::unordered_map<ggml_backend_buffer_t, dummy_tensor_extra_pool> tensor_extras;
 
     size_t allocated_total() const {
         size_t n = 0;
@@ -67,6 +79,7 @@ static void dummy_backend_buffer_free_buffer(ggml_backend_buffer_t buffer) {
     auto i = std::find(ctx->buffers.begin(), ctx->buffers.end(), buffer);
     GGML_ASSERT(i != ctx->buffers.end());
     ctx->buffers.erase(i);
+    ctx->tensor_extras.erase(buffer);
 }
 
 static void * dummy_backend_buffer_get_base(ggml_backend_buffer_t) {
@@ -75,6 +88,30 @@ static void * dummy_backend_buffer_get_base(ggml_backend_buffer_t) {
 
 static ggml_status dummy_backend_buffer_init_tensor(ggml_backend_buffer_t, ggml_tensor *) {
     return GGML_STATUS_SUCCESS;
+}
+
+static ggml_status dummy_backend_buffer_init_tensor_extra(ggml_backend_buffer_t buffer, ggml_tensor * tensor) {
+    if (tensor->view_src != nullptr) {
+        tensor->extra = tensor->view_src->extra;
+        return GGML_STATUS_SUCCESS;
+    }
+
+    auto * ctx = (dummy_backend_context *) buffer->context;
+    auto & pool = ctx->tensor_extras[buffer];
+    if (pool.next == pool.entries.size()) {
+        pool.entries.emplace_back(new dummy_tensor_extra{});
+    }
+
+    auto * extra = pool.entries[pool.next++].get();
+    extra->offset = (uintptr_t) tensor->data - (uintptr_t) alloc_base;
+    extra->size = ggml_nbytes(tensor);
+    tensor->extra = extra;
+    return GGML_STATUS_SUCCESS;
+}
+
+static void dummy_backend_buffer_reset_extras(ggml_backend_buffer_t buffer) {
+    auto * ctx = (dummy_backend_context *) buffer->context;
+    ctx->tensor_extras[buffer].next = 0;
 }
 
 static void dummy_backend_buffer_memset_tensor(ggml_backend_buffer_t, ggml_tensor *, uint8_t, size_t, size_t) {}
@@ -145,6 +182,12 @@ static dummy_backend dummy_backend_init(size_t max_buffer_size, size_t alignment
     return b;
 }
 
+static ggml_backend_sched_ptr dummy_backend_sched_new(dummy_backend & b) {
+    ggml_backend_t             backends[] = { &b.context->backend };
+    ggml_backend_buffer_type_t bufts[]    = { &b.buffer_type };
+    return ggml_backend_sched_ptr(ggml_backend_sched_new(backends, bufts, 1, 64, false, false));
+}
+
 //
 // test utilities
 
@@ -174,6 +217,13 @@ static ggml_tensor * make_input_1d(ggml_context * ctx, int64_t n_elements) {
 static ggml_tensor * make_input_with_size(ggml_context * ctx, size_t size_bytes) {
     GGML_ASSERT(size_bytes % 4 == 0);
     return make_input_1d(ctx, size_bytes / 4);
+}
+
+static ggml_tensor * make_scale_graph(ggml_context * ctx, ggml_cgraph * graph, size_t size_bytes) {
+    ggml_tensor * out = ggml_scale(ctx, make_input_with_size(ctx, size_bytes), 2.0f);
+    ggml_set_output(out);
+    ggml_build_forward_expand(graph, out);
+    return out;
 }
 
 static void assign_names(ggml_context * ctx, const char * prefix = "x") {
@@ -650,6 +700,102 @@ static void test_graph_optimize_alloc_dep() {
     GGML_ASSERT(!graph_reuses_allocation(true));
 }
 
+static void test_shared_buffers() {
+    dummy_backend backend = dummy_backend_init(SIZE_MAX);
+
+    auto [ctx_src, graph_src, ctx_src_ptr] = make_context();
+    ggml_tensor * src_out = make_scale_graph(ctx_src, graph_src, 16);
+
+    ggml_backend_sched_ptr src = dummy_backend_sched_new(backend);
+    GGML_ASSERT(ggml_backend_sched_reserve(src.get(), graph_src));
+    GGML_ASSERT(ggml_backend_sched_alloc_graph(src.get(), graph_src));
+    const size_t shared_size = backend.context->allocated_total();
+    GGML_ASSERT(shared_size > 0);
+
+    auto [ctx_dst, graph_dst, ctx_dst_ptr] = make_context();
+    ggml_tensor * dst_out = make_scale_graph(ctx_dst, graph_dst, 8);
+
+    ggml_backend_sched_ptr dst = dummy_backend_sched_new(backend);
+    GGML_ASSERT(ggml_backend_sched_share_compute_buffers(dst.get(), src.get()));
+    GGML_ASSERT(ggml_backend_sched_reserve(dst.get(), graph_dst));
+    GGML_ASSERT(ggml_backend_sched_alloc_graph(dst.get(), graph_dst));
+    GGML_ASSERT(backend.context->allocated_total() == shared_size);
+    GGML_ASSERT(src_out->buffer == dst_out->buffer);
+
+    // Schedulers keep independent allocation plans.
+    ggml_backend_sched_reset(src.get());
+    GGML_ASSERT(ggml_backend_sched_alloc_graph(src.get(), graph_src));
+
+    auto [ctx_big, graph_big, ctx_big_ptr] = make_context();
+    ggml_tensor * big_out = make_scale_graph(ctx_big, graph_big, 64);
+
+    // A larger reservation detaches from shared buffers.
+    ggml_backend_sched_ptr big = dummy_backend_sched_new(backend);
+    GGML_ASSERT(ggml_backend_sched_share_compute_buffers(big.get(), src.get()));
+    GGML_ASSERT(ggml_backend_sched_reserve(big.get(), graph_big));
+    GGML_ASSERT(ggml_backend_sched_alloc_graph(big.get(), graph_big));
+    GGML_ASSERT(big_out->buffer != src_out->buffer);
+    GGML_ASSERT(backend.context->allocated_total() > shared_size);
+
+    big.reset();
+    GGML_ASSERT(backend.context->allocated_total() == shared_size);
+    // Freeing the source does not invalidate the destination.
+    src.reset();
+    GGML_ASSERT(backend.context->allocated_total() == shared_size);
+    ggml_backend_sched_reset(dst.get());
+    GGML_ASSERT(ggml_backend_sched_alloc_graph(dst.get(), graph_dst));
+    GGML_ASSERT(backend.context->allocated_total() == shared_size);
+    dst.reset();
+    GGML_ASSERT(backend.context->allocated_total() == 0);
+}
+
+static void test_shared_buffers_tensor_extras(size_t max_buffer_size) {
+    dummy_backend backend = dummy_backend_init(max_buffer_size);
+    backend.context->buffer_interface.init_tensor = dummy_backend_buffer_init_tensor_extra;
+    backend.context->buffer_interface.reset = dummy_backend_buffer_reset_extras;
+
+    auto [ctx_src, graph_src, ctx_src_ptr] = make_context();
+    ggml_tensor * src_a = make_input_with_size(ctx_src, 16);
+    ggml_tensor * src_b = make_input_with_size(ctx_src, 16);
+    ggml_tensor * src_out = ggml_add(ctx_src, src_a, src_b);
+    ggml_set_output(src_out);
+    ggml_build_forward_expand(graph_src, src_out);
+
+    auto src = dummy_backend_sched_new(backend);
+    GGML_ASSERT(ggml_backend_sched_reserve(src.get(), graph_src));
+    // Put the reset callback on the last chunk to check every backing buffer.
+    for (size_t i = 0; i + 1 < backend.context->buffers.size(); ++i) {
+        backend.context->buffers[i]->iface.reset = nullptr;
+    }
+    GGML_ASSERT(ggml_backend_sched_alloc_graph(src.get(), graph_src));
+    const size_t src_size = backend.context->allocated_total();
+
+    auto [ctx_dst, graph_dst, ctx_dst_ptr] = make_context();
+    ggml_tensor * dst_out = ggml_add(ctx_dst, make_input_with_size(ctx_dst, 8), make_input_with_size(ctx_dst, 8));
+    ggml_set_output(dst_out);
+    ggml_build_forward_expand(graph_dst, dst_out);
+
+    auto dst = dummy_backend_sched_new(backend);
+    const bool shared = ggml_backend_sched_share_compute_buffers(dst.get(), src.get());
+    GGML_ASSERT(ggml_backend_sched_reserve(dst.get(), graph_dst));
+    GGML_ASSERT(ggml_backend_sched_alloc_graph(dst.get(), graph_dst));
+
+    // The target can reuse its graph without initializing its tensor extras again.
+    for (ggml_tensor * tensor : { src_a, src_b, src_out }) {
+        auto * extra = (dummy_tensor_extra *) tensor->extra;
+        GGML_ASSERT(extra->offset == (uintptr_t) tensor->data - (uintptr_t) alloc_base);
+        GGML_ASSERT(extra->size == ggml_nbytes(tensor));
+    }
+    GGML_ASSERT(!shared);
+    GGML_ASSERT(dst_out->buffer != src_out->buffer);
+
+    dst.reset();
+    GGML_ASSERT(backend.context->allocated_total() == src_size);
+    src.reset();
+    GGML_ASSERT(backend.context->allocated_total() == 0);
+    GGML_ASSERT(backend.context->tensor_extras.empty());
+}
+
 static void run(const char * name, void (*f)()) {
     printf("%s ", name);
     fflush(stdout);
@@ -672,5 +818,8 @@ int main() {
     run("test_buffer_size_zero", test_buffer_size_zero);
     run("test_reallocation", test_reallocation);
     run("test_graph_optimize_alloc_dep", test_graph_optimize_alloc_dep);
+    run("test_shared_buffers", test_shared_buffers);
+    run("test_shared_buffers_tensor_extras(SIZE_MAX)", []() { test_shared_buffers_tensor_extras(SIZE_MAX); });
+    run("test_shared_buffers_tensor_extras(16)", []() { test_shared_buffers_tensor_extras(16); });
     return 0;
 }

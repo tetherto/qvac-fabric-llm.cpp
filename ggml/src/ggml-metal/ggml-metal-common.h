@@ -3,6 +3,7 @@
 #pragma once
 
 #include <stdbool.h>
+#include <stdint.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -50,6 +51,14 @@ void ggml_graph_optimize(struct ggml_cgraph * gf);
 // mat-mat vs mat-vec dispatch; used by both supports_op and ggml_metal_op_mul_mat*
 bool ggml_metal_op_mul_mat_use_mm   (const struct ggml_tensor * op, bool has_simdgroup_mm);
 bool ggml_metal_op_mul_mat_id_use_mm(const struct ggml_tensor * op, bool has_simdgroup_mm);
+
+// match gated_delta_net + the strided cpy that scatters state snapshots into the cache.
+// returns extra graph nodes after the gdn (0 if no match). cache/slot_stride may be NULL.
+int ggml_metal_try_gdn_cache_fusion(
+        const struct ggml_cgraph * gf,
+        int node_idx,
+        const struct ggml_tensor ** cache,
+        int64_t * slot_stride);
 
 #ifdef __cplusplus
 }

@@ -58,7 +58,7 @@ env:
 
 jobs:
   gpu-cuda:
-    runs-on: [self-hosted, Linux, NVIDIA]
+    runs-on: qvac-ubuntu2204-x64-gpu
 
     steps:
       - name: Clone
@@ -68,10 +68,12 @@ jobs:
       - name: Test
         id: ggml-ci
         run: |
+          git lfs install
           nvidia-smi
           GG_BUILD_CUDA=1 bash ./ci/run.sh ~/results/llama.cpp ~/mnt/llama.cpp
 
   gpu-rocm:
+    if: false  # QVAC-23796: no matching hardware
     runs-on: [self-hosted, Linux, AMD]
 
     steps:
@@ -88,11 +90,12 @@ jobs:
         env:
           HIP_LAUNCH_BLOCKING: "1"
         run: |
+          git lfs install
           rocminfo
           GG_BUILD_ROCM=1 GG_BUILD_AMDGPU_TARGETS=gfx1151 bash ./ci/run.sh ~/results/llama.cpp ~/mnt/llama.cpp
 
   gpu-vulkan-nvidia-cm:
-    runs-on: [self-hosted, Linux, NVIDIA]
+    runs-on: qvac-ubuntu2204-x64-gpu
 
     steps:
       - name: Clone
@@ -102,11 +105,12 @@ jobs:
       - name: Test
         id: ggml-ci
         run: |
+          git lfs install
           vulkaninfo --summary
           GG_BUILD_VULKAN=1 GGML_VK_DISABLE_COOPMAT2=1 bash ./ci/run.sh ~/results/llama.cpp ~/mnt/llama.cpp
 
   gpu-vulkan-nvidia-cm2:
-    runs-on: [self-hosted, Linux, NVIDIA, COOPMAT2]
+    runs-on: qvac-ubuntu2204-x64-gpu
 
     steps:
       - name: Clone
@@ -116,11 +120,12 @@ jobs:
       - name: Test
         id: ggml-ci
         run: |
+          git lfs install
           vulkaninfo --summary
           GG_BUILD_VULKAN=1 bash ./ci/run.sh ~/results/llama.cpp ~/mnt/llama.cpp
 
   gpu-webgpu-nvidia:
-    runs-on: [self-hosted, Linux, NVIDIA, X64]
+    runs-on: qvac-ubuntu2404-x64-gpu
 
     steps:
       - name: Clone
@@ -143,6 +148,7 @@ jobs:
       - name: Test
         id: ggml-ci
         run: |
+          git lfs install
           GG_BUILD_WEBGPU=1 \
           GG_BUILD_WEBGPU_DAWN_PREFIX="$GITHUB_WORKSPACE/dawn" \
           GG_BUILD_WEBGPU_DAWN_DIR="$GITHUB_WORKSPACE/dawn/lib64/cmake/Dawn" \
@@ -193,7 +199,7 @@ jobs:
   #         GG_BUILD_ROCM=1 GG_BUILD_AMDGPU_TARGETS="gfx1101" bash ./ci/run.sh ~/results/llama.cpp ~/mnt/llama.cpp
 
   gpu-metal:
-    runs-on: [self-hosted, macOS, ARM64]
+    runs-on: qvac-macos26-arm64-gpu
 
     steps:
       - name: Clone
@@ -203,10 +209,11 @@ jobs:
       - name: Test
         id: ggml-ci
         run: |
+          git lfs install
           GG_BUILD_METAL=1 bash ./ci/run.sh ~/results/llama.cpp ~/mnt/llama.cpp
 
   gpu-webgpu-apple:
-    runs-on: [self-hosted, macOS, ARM64]
+    runs-on: qvac-macos26-arm64-gpu
 
     steps:
       - name: Clone
@@ -229,11 +236,12 @@ jobs:
       - name: Test
         id: ggml-ci
         run: |
+          git lfs install
           GG_BUILD_WEBGPU=1 GG_BUILD_WEBGPU_DAWN_PREFIX="$GITHUB_WORKSPACE/dawn" \
             bash ./ci/run.sh ~/results/llama.cpp ~/mnt/llama.cpp
 
   gpu-vulkan-apple:
-    runs-on: [self-hosted, macOS, ARM64]
+    runs-on: qvac-macos26-arm64-gpu
 
     steps:
       - name: Clone
@@ -243,10 +251,12 @@ jobs:
       - name: Test
         id: ggml-ci
         run: |
+          git lfs install
           vulkaninfo --summary
           GG_BUILD_VULKAN=1 bash ./ci/run.sh ~/results/llama.cpp ~/mnt/llama.cpp
 
   gpu-vulkan-intel-linux:
+    if: false  # QVAC-23796: no matching hardware
     runs-on: [self-hosted, Linux, Intel]
 
     steps:
@@ -259,10 +269,12 @@ jobs:
       - name: Test
         id: ggml-ci
         run: |
+          git lfs install
           vulkaninfo --summary
           GG_BUILD_VULKAN=1 bash ./ci/run.sh ~/results/llama.cpp ~/mnt/llama.cpp
 
   gpu-vulkan-intel-windows:
+    if: false  # QVAC-23796: no matching hardware
     runs-on: [self-hosted, Windows, X64, Intel]
 
     steps:
@@ -278,12 +290,14 @@ jobs:
           CHERE_INVOKING: 1
           PATH: C:\msys64\ucrt64\bin;C:\msys64\usr\bin;C:\Windows\System32;${{ env.PATH }}
         run: |
+          git lfs install
           vulkaninfo --summary
           # Skip python related tests with GG_BUILD_LOW_PERF=1 since Windows MSYS2 UCRT64 currently fails to create
           # a valid python environment for testing
           LLAMA_FATAL_WARNINGS=OFF GG_BUILD_NINJA=1 GG_BUILD_VULKAN=1 GG_BUILD_LOW_PERF=1 ./ci/run.sh ./results/llama.cpp ./mnt/llama.cpp
 
   gpu-openvino-low-perf:
+    if: false  # QVAC-23796: no matching hardware
     runs-on: [self-hosted, Linux, Intel, OpenVINO]
 
     env:
@@ -312,11 +326,12 @@ jobs:
       - name: Test
         id: ggml-ci
         run: |
+          git lfs install
           source ./openvino_toolkit/setupvars.sh
           GG_BUILD_OPENVINO=1 GGML_OPENVINO_DEVICE=GPU GG_BUILD_LOW_PERF=1 bash ./ci/run.sh ~/results/llama.cpp ~/mnt/llama.cpp
 
   cpu-x64-high-perf:
-    runs-on: [self-hosted, Linux, X64]
+    runs-on: qvac-ubuntu2204-x64
 
     steps:
       - name: Clone
@@ -326,9 +341,11 @@ jobs:
       - name: Test
         id: ggml-ci
         run: |
+          git lfs install
           LLAMA_ARG_THREADS=$(nproc) GG_BUILD_HIGH_PERF=1 GG_BUILD_EXTRA_TESTS_0=1 bash ./ci/run.sh ~/results/llama.cpp ~/mnt/llama.cpp
 
   cpu-arm64-high-perf-graviton4:
+    if: false  # QVAC-23796: no matching hardware
     runs-on: ah-ubuntu_22_04-c8g_8x
 
     steps:
@@ -344,6 +361,7 @@ jobs:
           sudo DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a \
           apt-get install -y \
           build-essential \
+          coreutils \
           python3-venv \
           gpg \
           wget \
@@ -361,6 +379,8 @@ jobs:
             | sudo tee /etc/apt/sources.list.d/kitware.list
           sudo apt-get update
           sudo apt-get install -y cmake
+
+          command -v nproc
 
       - name: Test
         id: ggml-ci
@@ -368,6 +388,7 @@ jobs:
           LLAMA_ARG_THREADS=$(nproc) GG_BUILD_HIGH_PERF=1 GG_BUILD_NO_BF16=1 GG_BUILD_EXTRA_TESTS_0=1 bash ./ci/run.sh ~/results/llama.cpp ~/mnt/llama.cpp
 
   cpu-arm64-graviton4-kleidiai:
+    if: false  # QVAC-23796: no matching hardware
     runs-on: ah-ubuntu_22_04-c8g_8x
 
     steps:
@@ -383,6 +404,7 @@ jobs:
           sudo DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a \
           apt-get install -y \
           build-essential \
+          coreutils \
           python3-venv \
           gpg \
           wget \
@@ -401,9 +423,11 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y cmake
 
+          command -v nproc
+
       - name: Test
         id: ggml-ci
         run: |
           GG_BUILD_KLEIDIAI=1 \
           GG_BUILD_EXTRA_TESTS_0=1 \
-          bash ./ci/run.sh ./tmp/results ./tmp/mnt
+          bash ./ci/run.sh ~/results/llama.cpp ~/mnt/llama.cpp

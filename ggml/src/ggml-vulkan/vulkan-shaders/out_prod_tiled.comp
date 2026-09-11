@@ -1,0 +1,63 @@
+#version 450
+
+#extension GL_EXT_shader_16bit_storage : require
+
+#include "types.glsl"
+#include "generic_binary_head.glsl"
+
+#define TILE 32
+
+layout(local_size_x = TILE, local_size_y = TILE, local_size_z = 1) in;
+
+#define A(i0,i1,i2,i3) data_a[aoffset + src0_idx(i0, i1, i2, i3)]
+#define B(i0,i1,i2,i3) data_b[boffset + src1_idx(i0, i1, i2, i3)]
+#define D(i0,i1,i2,i3) data_d[doffset + dst_idx(i0, i1, i2, i3)]
+
+shared FLOAT_TYPE Asub[TILE][TILE];
+shared FLOAT_TYPE Bsub[TILE][TILE];
+
+void main()
+{
+    const uint col = gl_GlobalInvocationID.x;
+    const uint row = gl_GlobalInvocationID.y;
+    const uint rest = gl_GlobalInvocationID.z;
+    const uint K = p.ne01;
+    const uint M = p.ne00;
+    const uint N = p.ne10;
+    const uint broadcast2 = uint(p.param2);
+    const uint broadcast3 = p.param3;
+    const uint i2 = rest % p.ne22;
+    const uint i3 = rest / p.ne22;
+    const uint i2b = i2 / broadcast2;
+    const uint i3b = i3 / broadcast3;
+    const uint aoffset = get_aoffset();
+    const uint boffset = get_boffset();
+    const uint doffset = get_doffset();
+    FLOAT_TYPE acc = 0.0;
+
+    for (uint t = 0; t < (K + TILE - 1) / TILE; ++t)
+    {
+        uint a_k = t * TILE + gl_LocalInvocationID.y;
+        uint b_k = t * TILE + gl_LocalInvocationID.x;
+
+        Asub[gl_LocalInvocationID.y][gl_LocalInvocationID.x] =
+            (col < M && a_k < K) ? A(col, a_k, i2b, i3b) : 0.0;
+
+        Bsub[gl_LocalInvocationID.x][gl_LocalInvocationID.y] =
+            (row < N && b_k < K) ? B(row, b_k, i2, i3) : 0.0;
+
+        memoryBarrierShared();
+        barrier();
+
+        for (uint k = 0; k < TILE; ++k) {
+            acc += Asub[k][gl_LocalInvocationID.x] *
+                   Bsub[k][gl_LocalInvocationID.y];
+        }
+
+        barrier();
+    }
+
+    if (row < N && col < M) {
+        D(col, row, i2, i3) = acc;
+    }
+}

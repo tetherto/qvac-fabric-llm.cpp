@@ -1369,6 +1369,9 @@ class GGUFWriter:
     def add_vision_preproc_image_size(self, value: int) -> None:
         self.add_uint32(Keys.ClipVision.PREPROC_IMAGE_SIZE, value)
 
+    def add_vision_preproc_no_upscale(self, value: bool) -> None:
+        self.add_bool(Keys.ClipVision.PREPROC_NO_UPSCALE, value)
+
     def add_vision_projector_query_side(self, value: int) -> None:
         self.add_uint32(Keys.ClipVision.Projector.QUERY_SIDE, value)
 

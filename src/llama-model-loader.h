@@ -6,6 +6,7 @@
 #include "llama-arch.h"
 #include "llama-hparams.h"
 #include "llama-mmap.h"
+#include "llama-model-load.h"
 
 #include "ggml-cpp.h"
 
@@ -37,14 +38,14 @@ struct llama_model_loader {
 
         ggml_tensor * tensor;
 
-        llama_tensor_weight(const llama_file * file, uint16_t idx, const struct gguf_context * gguf_ctx, ggml_tensor * tensor) : idx(idx), tensor(tensor) {
+        llama_tensor_weight(const llama_file * file, uint16_t idx, const struct gguf_context * gguf_ctx, ggml_tensor * tensor, bool check_bounds = true) : idx(idx), tensor(tensor) {
             const int tensor_idx = gguf_find_tensor(gguf_ctx,  ggml_get_name(tensor));
             if (tensor_idx < 0) {
                 throw std::runtime_error(format("tensor '%s' not found in the model", ggml_get_name(tensor)));
             }
 
             offs = gguf_get_data_offset(gguf_ctx) + gguf_get_tensor_offset(gguf_ctx, tensor_idx);
-            if (offs + ggml_nbytes(tensor) < offs || offs + ggml_nbytes(tensor) > file->size()) {
+            if (offs + ggml_nbytes(tensor) < offs || (check_bounds && offs + ggml_nbytes(tensor) > file->size())) {
                 throw std::runtime_error(format("tensor '%s' data is not within the file bounds, model is corrupted or incomplete", ggml_get_name(tensor)));
             }
         }
@@ -82,6 +83,7 @@ struct llama_model_loader {
     bool use_direct_io = false;
     bool check_tensors;
     bool no_alloc;
+    bool check_bounds = true;
     bool load_mtp;
 
     // handle TENSOR_READ_LAZY
@@ -124,6 +126,9 @@ struct llama_model_loader {
     llama_mmaps mappings;
 
     std::map<std::string, llama_tensor_weight, weight_name_comparer> weights_map;
+
+    std::optional<IncrementalSplitsTensorLoad> incremental_splits_tensor_load;
+
     std::unordered_map<std::string, llama_model_kv_override> kv_overrides;
     const llama_model_tensor_buft_override * tensor_buft_overrides;
 
@@ -171,12 +176,13 @@ struct llama_model_loader {
     ggml_backend_buffer_type_t first_moved_from_buft = nullptr;
     ggml_backend_buffer_type_t first_moved_to_buft = nullptr;
 
+    void process_loaded_gguf(struct ggml_context * ctx, gguf_file_load & gguf_load, uint16_t idx);
+
     llama_model_loader(
         struct gguf_context * metadata,
         llama_model_set_tensor_data_t set_tensor_data,
         void * set_tensor_data_ud,
-        const std::string & fname,
-        std::vector<std::string> & splits, // optional, only need if the split does not follow naming scheme
+        load_input_t load_input,
         FILE * file,
         llama_load_mode load_mode,
         bool check_tensors,
@@ -236,7 +242,8 @@ struct llama_model_loader {
 
     struct ggml_tensor * create_tensor(
         const llama_hparams & hparams, const buft_list_t * buft_list_cpu, const buft_list_t * buft_list_input, const buft_list_t * buft_list_output,
-        const buft_list_t * buft_list_layer, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags);
+        const buft_list_t * buft_list_layer, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags,
+        std::optional<uint16_t> split_idx, const std::function<ggml_context *(ggml_backend_buffer_type_t)> & get_ctx_for_split_buft);
 
     void done_getting_tensors(bool partial = false) const;
 
@@ -252,12 +259,8 @@ struct llama_model_loader {
     const void * load_data_range(const llama_tensor_weight & w, size_t offs, size_t size, void * buf) const;
 
     // Returns false if cancelled by progress_callback
-    bool load_all_data(
-            struct ggml_context * ctx,
-            llama_buf_map & bufs,
-            llama_mlocks * lmlocks,
-            llama_progress_callback progress_callback,
-            void * progress_callback_user_data);
+    bool load_all_data(size_t size_data, struct ggml_context * ctx, llama_buf_map & bufs, llama_mlocks * lmlocks,
+                       llama_progress_callback progress_callback, void * progress_callback_user_data);
 
     std::string ftype_name() const;
 

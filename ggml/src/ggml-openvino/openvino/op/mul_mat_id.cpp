@@ -154,11 +154,14 @@ ov::Output<ov::Node> translate_mul_mat_id_mxfp4_packed(const NodeContext & conte
         qs, ov::op::v0::Constant::create(ov::element::u8, ov::Shape{}, {0x0F}), ov::op::AutoBroadcastType::NUMPY);
     auto high_shift = std::make_shared<ov::op::v15::BitwiseRightShift>(
         qs, ov::op::v0::Constant::create(ov::element::u8, ov::Shape{}, {4}), ov::op::AutoBroadcastType::NUMPY);
+    // i64 indices on purpose: the CPU plugin's i32 JIT gather kernel miscomputes the index-load
+    // offset for tensors of this size (vpgatherdd walks ~4x the index buffer below its base) and
+    // segfaults when the page below happens to be unmapped.
     auto nibbles = std::make_shared<ov::op::v0::Concat>(ov::OutputVector{low, high_shift}, 4);
-    auto nibble_indices = std::make_shared<ov::op::v0::Convert>(nibbles, ov::element::i32);
+    auto nibble_indices = std::make_shared<ov::op::v0::Convert>(nibbles, ov::element::i64);
     auto weights_f32 = std::make_shared<ov::op::v8::Gather>(f4_lut, nibble_indices, gather_axis);
 
-    auto scale_indices = std::make_shared<ov::op::v0::Convert>(scale_byte, ov::element::i32);
+    auto scale_indices = std::make_shared<ov::op::v0::Convert>(scale_byte, ov::element::i64);
     auto scales_f32 = std::make_shared<ov::op::v8::Gather>(scale_lut, scale_indices, gather_axis);
     ov::Output<ov::Node> selected_weights = std::make_shared<ov::op::v1::Multiply>(weights_f32, scales_f32,
                                                                                   ov::op::AutoBroadcastType::NUMPY);

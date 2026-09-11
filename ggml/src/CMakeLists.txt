@@ -1,4 +1,5 @@
 include(CheckCXXCompilerFlag)
+include(CheckCXXSourceCompiles)
 include("../cmake/common.cmake")
 
 add_compile_definitions(GGML_SCHED_MAX_COPIES=${GGML_SCHED_MAX_COPIES})
@@ -185,10 +186,6 @@ endif()
 
 # ggml
 
-if (GGML_BACKEND_DL AND NOT BUILD_SHARED_LIBS)
-    message(FATAL_ERROR "GGML_BACKEND_DL requires BUILD_SHARED_LIBS")
-endif()
-
 add_library(ggml-base
             ../include/ggml.h
             ../include/ggml-alloc.h
@@ -196,6 +193,7 @@ add_library(ggml-base
             ../include/ggml-cpp.h
             ../include/ggml-opt.h
             ../include/gguf.h
+            ../include/uint8-buff-stream.h
             ggml.c
             ggml.cpp
             ggml-alloc.c
@@ -204,9 +202,11 @@ add_library(ggml-base
             ggml-opt.cpp
             ggml-threading.cpp
             ggml-threading.h
+            ggml-tbq-quants.c
             ggml-quants.c
             ggml-quants.h
-            gguf.cpp)
+            gguf.cpp
+            uint8-buff-stream.cpp)
 
 set_target_properties(ggml-base PROPERTIES
     VERSION ${GGML_VERSION}
@@ -348,6 +348,18 @@ else()
     set(GGML_OPENMP_ENABLED "OFF" CACHE INTERNAL "")
 endif()
 
+# The GGML_OPENMP_FETCH helper targets are plain build-tree targets outside
+# the ggml-targets export set; ggml-base and the backends link them PRIVATE,
+# which for static libraries still lands in the exported link interface as
+# $<LINK_ONLY:...>, so install(EXPORT) fails with "requires target
+# ggml-openmp-c that is not in any export set". Wrap them so the installed
+# export drops them; static consumers reconstruct the OpenMP linkage through
+# find_dependency(OpenMP) in ggml-config.cmake.in.
+if (TARGET ggml-openmp-c)
+    set(GGML_OPENMP_TARGET_C   "$<BUILD_INTERFACE:${GGML_OPENMP_TARGET_C}>")
+    set(GGML_OPENMP_TARGET_CXX "$<BUILD_INTERFACE:${GGML_OPENMP_TARGET_CXX}>")
+endif()
+
 if (GGML_OPENMP_ENABLED)
     target_compile_definitions(ggml-base PRIVATE GGML_USE_OPENMP)
     target_link_libraries(ggml-base PRIVATE ${GGML_OPENMP_TARGET_C} ${GGML_OPENMP_TARGET_CXX})
@@ -376,28 +388,45 @@ if (CMAKE_SYSTEM_NAME MATCHES "Linux")
     target_link_libraries(ggml PRIVATE dl)
 endif()
 
+if (GGML_VECTOR_INDEX)
+    add_subdirectory(ggml-vector-index)
+endif()
+
 function(ggml_add_backend_library backend)
     if (GGML_BACKEND_DL)
         add_library(${backend} MODULE ${ARGN})
         # write the shared library to the output directory
-        set_target_properties(${backend} PROPERTIES LIBRARY_OUTPUT_DIRECTORY ${CMAKE_RUNTIME_OUTPUT_DIRECTORY})
+        # Set output name with qvac- prefix to match backend_filename_prefix() in ggml-backend-reg.cpp
+        set_target_properties(${backend} PROPERTIES
+            LIBRARY_OUTPUT_DIRECTORY ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}
+            OUTPUT_NAME "qvac-${backend}")
         target_compile_definitions(${backend} PRIVATE GGML_BACKEND_DL)
-        add_dependencies(ggml ${backend})
+        # Do not add dependency, the User will have to explicitely build and install
+        # the available `ggml::ggml-*` backend targets. This is for better integration
+        # with cmake-bare
+        # add_dependencies(ggml ${backend})
+
         if (GGML_BACKEND_DIR)
-            install(TARGETS ${backend} LIBRARY DESTINATION ${GGML_BACKEND_DIR})
+            install(TARGETS ${backend}
+                    EXPORT ggml-targets
+                    LIBRARY DESTINATION ${GGML_BACKEND_DIR}
+                    RUNTIME DESTINATION ${GGML_BACKEND_DIR})
         else()
-            install(TARGETS ${backend} LIBRARY DESTINATION ${CMAKE_INSTALL_BINDIR})
+            install(TARGETS ${backend}
+                    EXPORT ggml-targets
+                    LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+                    RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
         endif()
     else()
         add_library(${backend} ${ARGN})
         target_link_libraries(ggml PUBLIC ${backend})
-        install(TARGETS ${backend} LIBRARY)
+        install(TARGETS ${backend} EXPORT ggml-targets)
     endif()
 
     target_link_libraries(${backend} PRIVATE ggml-base)
     target_include_directories(${backend} PRIVATE ..)
 
-    if (${BUILD_SHARED_LIBS})
+    if (${BUILD_SHARED_LIBS} OR GGML_BACKEND_DL)
         target_compile_definitions(${backend} PRIVATE GGML_BACKEND_BUILD)
         target_compile_definitions(${backend} PUBLIC  GGML_BACKEND_SHARED)
     endif()
@@ -519,14 +548,24 @@ if (GGML_CPU_ALL_VARIANTS)
             # Many of these features are optional so we build versions with popular
             # combinations and name the backends based on the version they were
             # first released with
+            # qvac: SVE/SVE2 CPU-variant kernels are numerically broken on real
+            # linux-arm64 hardware (Graviton3/Neoverse-V1) — vla/pi05 integration
+            # diverges from the PyTorch reference (cos ~0.77 vs ~0.999) only when
+            # an SVE-enabled variant is runtime-selected; the same model on a
+            # non-SVE variant matches at ~0.999. Strip *only* SVE/SVE2 here (keep
+            # DOTPROD/FP16/i8mm and SME, which are not implicated). armv9.2_1 gets
+            # explicit NOSVE because ARMv9-A mandates SVE2, so -march=armv9.2-a+sme
+            # would otherwise re-enable SVE code paths even with SVE off the
+            # feature list (mirrors the apple_m4 NOSVE+SME variant). armv8.6_1
+            # needs no NOSVE — ARMv8 does not imply SVE. Variants that collapse to
+            # an already-listed feature set after the strip are dropped
+            # (armv8.2_3->8.2_2, armv8.6_2->8.6_1, armv9.2_2->9.2_1).
+            # Android / Apple / other platforms are intentionally untouched.
             ggml_add_cpu_backend_variant(armv8.0_1)
             ggml_add_cpu_backend_variant(armv8.2_1    DOTPROD)
             ggml_add_cpu_backend_variant(armv8.2_2    DOTPROD FP16_VECTOR_ARITHMETIC)
-            ggml_add_cpu_backend_variant(armv8.2_3    DOTPROD FP16_VECTOR_ARITHMETIC SVE)
-            ggml_add_cpu_backend_variant(armv8.6_1    DOTPROD FP16_VECTOR_ARITHMETIC SVE MATMUL_INT8)
-            ggml_add_cpu_backend_variant(armv8.6_2    DOTPROD FP16_VECTOR_ARITHMETIC SVE MATMUL_INT8 SVE2)
-            ggml_add_cpu_backend_variant(armv9.2_1    DOTPROD FP16_VECTOR_ARITHMETIC SVE MATMUL_INT8 SME)
-            ggml_add_cpu_backend_variant(armv9.2_2    DOTPROD FP16_VECTOR_ARITHMETIC SVE MATMUL_INT8 SVE2 SME)
+            ggml_add_cpu_backend_variant(armv8.6_1    DOTPROD FP16_VECTOR_ARITHMETIC MATMUL_INT8)
+            ggml_add_cpu_backend_variant(armv9.2_1    DOTPROD FP16_VECTOR_ARITHMETIC MATMUL_INT8 NOSVE SME)
         elseif (CMAKE_SYSTEM_NAME MATCHES "Android")
             # Android-specific backends with SoC-compatible feature sets
             ggml_add_cpu_backend_variant(android_armv8.0_1)
@@ -602,7 +641,12 @@ ggml_add_backend(Hexagon)
 ggml_add_backend(ZenDNN)
 ggml_add_backend(OPENVINO)
 
-foreach (target ggml-base ggml)
+set(GGML_CORE_TARGETS ggml-base ggml)
+if (GGML_VECTOR_INDEX)
+    list(APPEND GGML_CORE_TARGETS ggml-vector-index)
+endif()
+
+foreach (target ${GGML_CORE_TARGETS})
     target_include_directories(${target} PUBLIC    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../include> $<INSTALL_INTERFACE:include>)
     target_compile_features   (${target} PRIVATE c_std_11 cxx_std_17) # don't bump
 endforeach()
@@ -623,8 +667,8 @@ if(CMAKE_SYSTEM_NAME MATCHES "visionOS")
     target_compile_definitions(ggml-base PUBLIC _DARWIN_C_SOURCE)
 endif()
 
-if (BUILD_SHARED_LIBS)
-    foreach (target ggml-base ggml)
+if (BUILD_SHARED_LIBS OR GGML_BACKEND_DL)
+    foreach (target ${GGML_CORE_TARGETS})
         set_target_properties(${target} PROPERTIES POSITION_INDEPENDENT_CODE ON)
         target_compile_definitions(${target} PRIVATE GGML_BUILD)
         target_compile_definitions(${target} PUBLIC  GGML_SHARED)

@@ -1,0 +1,159 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+
+// QJL (Stage 2) correction pass for standalone MUL_MAT on TBQ3_0/TBQ4_0.
+//
+// The main mul_mm.comp dispatch already produced C = A_dequant * d · B with
+// the 3-bit/4-bit centroid values, matching what `mul_mat_vec_tbq*_0.comp`
+// computes before its QJL epilogue.  This kernel runs the same QJL epilogue
+// over the whole (M, N) output and accumulates the bias correction into C.
+//
+// One workgroup handles one (row_a, col_b, batch) triple and loops over the
+// K-blocks (QUANT_K elements each; 128 for TBQ*_0, 64 for TBQ*_0_64). The
+// thread layout matches the vec shader: local_size_x == QUANT_K so the
+// Walsh-Hadamard butterfly can be done in shared memory without cross-
+// workgroup communication. The QJL dot product is reduced cooperatively across
+// the full workgroup; if QUANT_K spans multiple hardware subgroups, subgroup
+// partials are stitched through shared memory.
+//
+// Specialization:
+//   DATA_A_TBQ3_0 / DATA_A_TBQ4_0 / DATA_A_TBQ3_0_64 / DATA_A_TBQ4_0_64
+//       picks the block_a layout and, transitively, QUANT_K.
+//   B_TYPE is float (f32) or float16_t (f16).  D_TYPE is float.
+//   SG_SIZE is the subgroup size selected by the host; 0 uses gl_SubgroupSize.
+
+layout(constant_id = 0) const uint SG_SIZE = 0u;
+
+#include "types.glsl"
+#include "tq_utils.glsl"
+
+layout (local_size_x = QUANT_K, local_size_y = 1, local_size_z = 1) in;
+
+layout (binding = 0) readonly buffer A {A_TYPE data_a[];};
+layout (binding = 1) readonly buffer B {B_TYPE data_b[];};
+layout (binding = 2)          buffer D {D_TYPE data_d[];};
+
+layout (push_constant) uniform parameter {
+    uint M; uint N; uint K;
+    uint stride_a; uint stride_b; uint stride_d;
+    uint batch_stride_a; uint batch_stride_b; uint batch_stride_d;
+    uint k_split;
+    uint ne02; uint ne12; uint broadcast2; uint broadcast3;
+    uint padded_N;
+} p;
+
+shared float proj_b_sh[QUANT_K];
+shared float qjl_sh_red[QUANT_K / 4u];
+
+float qjl_wg_add(float x) {
+    const uint SG_HW = SG_SIZE == 0u ? gl_SubgroupSize : SG_SIZE;
+    const uint SG = SG_HW < QUANT_K ? SG_HW : QUANT_K;
+    const uint NSG = QUANT_K / SG;
+
+    float s = subgroupAdd(x);
+    if (NSG == 1u) {
+        return s;
+    }
+
+    if (subgroupElect()) {
+        qjl_sh_red[gl_SubgroupID] = s;
+    }
+    barrier();
+
+    float total = 0.0;
+    for (uint i = 0u; i < NSG; ++i) {
+        total += qjl_sh_red[i];
+    }
+    barrier();
+    return total;
+}
+
+void main() {
+    const uint row_a    = gl_WorkGroupID.x;
+    const uint col_b    = gl_WorkGroupID.y;
+    const uint batch_id = gl_WorkGroupID.z;
+    const uint tid      = gl_LocalInvocationID.x;
+
+    if (row_a >= p.M || col_b >= p.N) {
+        return;
+    }
+
+    // Broadcast src0 over batch dimensions (matches mul_mm.comp).
+    uint i02 = 0;
+    uint i03 = 0;
+    if (batch_id != 0) {
+        const uint i13 = batch_id / p.ne12;
+        const uint i12 = batch_id % p.ne12;
+        i03 = i13 / p.broadcast3;
+        i02 = i12 / p.broadcast2;
+    }
+
+    // For src0 (A), the host passes strides in BLOCK units. k_split is unused
+    // by this correction pass, so it carries src0->nb[3] / sizeof(block).
+    // Keeping dim2 and dim3 strides separate is required for permuted TBQ
+    // views, where nb[3] is not necessarily ne[2] * nb[2].
+    const uint a_batch_off_blocks = i02 * p.batch_stride_a + i03 * p.k_split;
+    const uint b_batch_off        = batch_id    * p.batch_stride_b;
+    const uint d_batch_off        = batch_id    * p.batch_stride_d;
+
+    const uint num_blocks_per_row = p.K / QUANT_K;
+    const uint ib0 = a_batch_off_blocks + row_a * p.stride_a;
+
+    float accum = 0.0;
+
+    for (uint blk = 0u; blk < num_blocks_per_row; ++blk) {
+        const uint ib = ib0 + blk;
+
+        const float d_r = float(data_a[ib].d_r);
+        const bool has_qjl = d_r > 1e-15;
+
+        // Load one B slice of QUANT_K elements into shared memory, sign-flipped
+        // by the QJL Stage 2 sign diagonal (seed 137).
+        const uint b_elem =
+            b_batch_off + col_b * p.stride_b + blk * QUANT_K + tid;
+        proj_b_sh[tid] = float(data_b[b_elem]) * qjl_get_sign(tid);
+        barrier();
+
+        // In-place Walsh-Hadamard transform across QUANT_K elements.
+        for (uint h = 1u; h < QUANT_K; h <<= 1u) {
+            if (tid < QUANT_K / 2u) {
+                const uint grp = tid / h;
+                const uint pos = tid % h;
+                const uint idx = grp * (h << 1u) + pos;
+                const float va = proj_b_sh[idx];
+                const float vb = proj_b_sh[idx + h];
+                proj_b_sh[idx]     = va + vb;
+                proj_b_sh[idx + h] = va - vb;
+            }
+            barrier();
+        }
+
+        if (has_qjl) {
+            const float qjl_scale = d_r * sqrt(1.5707963) / float(QUANT_K);
+            const uint byte_idx = tid >> 3u;
+            const uint bit_idx  = tid & 7u;
+            const float proj_b  = proj_b_sh[tid];
+            const float qjl_bit = float((uint(data_a[ib].qjl[byte_idx]) >> bit_idx) & 1u);
+
+            const float pos_sum   = qjl_wg_add(qjl_bit * proj_b);
+            const float total_sum = qjl_wg_add(proj_b);
+            if (tid == 0u) {
+                accum += qjl_scale * (2.0 * pos_sum - total_sum);
+            }
+        }
+        barrier();
+    }
+
+    // Thread 0 adds the accumulated correction into the output tensor.
+    if (tid == 0u) {
+        const uint d_idx = d_batch_off + col_b * p.stride_d + row_a;
+        data_d[d_idx] = D_TYPE(float(data_d[d_idx]) + accum);
+    }
+}

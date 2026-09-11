@@ -8,17 +8,25 @@ on:
     paths: [
       '.github/workflows/build-sanitize.yml',
       '**/CMakeLists.txt',
-      '**/.cmake',
+      '**/*.cmake',
+      '**/*.cmake.in',
       '**/*.h',
       '**/*.hpp',
       '**/*.c',
       '**/*.cpp'
     ]
-
   pull_request:
     types: [opened, synchronize, reopened]
     paths: [
-      '.github/workflows/build-sanitize.yml'
+      '.github/workflows/build-sanitize.yml',
+      '**/CMakeLists.txt',
+      '**/*.cmake',
+      '**/*.cmake.in',
+      '**/*.h',
+      '**/*.hpp',
+      '**/*.c',
+      '**/*.cpp',
+      '**/*.inc'
     ]
 
 concurrency:
@@ -34,20 +42,13 @@ env:
 
 jobs:
   ctest:
-    continue-on-error: true
+    runs-on: [self-hosted, X64, CPU, Linux]
+
+    continue-on-error: ${{ matrix.sanitizer == 'THREAD' }}
 
     strategy:
       matrix:
-        include:
-        # thread and address doesn't run properly on some self hosted machines, so run it on Github instead
-        - sanitizer: ADDRESS
-          machine: ubuntu-24.04
-        - sanitizer: THREAD
-          machine: ubuntu-24.04
-        - sanitizer: UNDEFINED
-          machine: [self-hosted, X64, Linux]
-
-    runs-on: ${{ matrix.machine }}
+        sanitizer: [ADDRESS, THREAD, UNDEFINED]
 
     steps:
       - name: Clone
@@ -72,6 +73,7 @@ jobs:
             -DCMAKE_BUILD_TYPE=Debug \
             -DLLAMA_FATAL_WARNINGS=ON \
             -DLLAMA_SANITIZE_${{ matrix.sanitizer }}=ON \
+            -DGGML_VECTOR_INDEX=ON \
             -DGGML_SANITIZE_${{ matrix.sanitizer }}=ON
 
           cmake --build build --config Debug -j $(nproc)
@@ -83,6 +85,7 @@ jobs:
           cmake -B build \
             -DCMAKE_BUILD_TYPE=RelWithDebInfo \
             -DLLAMA_SANITIZE_${{ matrix.sanitizer }}=ON \
+            -DGGML_VECTOR_INDEX=ON \
             -DGGML_SANITIZE_${{ matrix.sanitizer }}=ON
 
           cmake --build build --config RelWithDebInfo -j $(nproc)
@@ -94,6 +97,7 @@ jobs:
           cmake -B build \
             -DCMAKE_BUILD_TYPE=RelWithDebInfo \
             -DLLAMA_SANITIZE_${{ matrix.sanitizer }}=ON \
+            -DGGML_VECTOR_INDEX=ON \
             -DGGML_SANITIZE_${{ matrix.sanitizer }}=ON \
             -DGGML_OPENMP=OFF
 
@@ -106,3 +110,9 @@ jobs:
         run: |
           cd build
           ctest -L main -E tokenizer --verbose --timeout 900
+
+      - name: Test vector index (undefined)
+        if: ${{ matrix.sanitizer == 'UNDEFINED' }}
+        run: |
+          cd build
+          ctest -R '^test-vector-index(-hooks|-faults)?$' --verbose --timeout 900

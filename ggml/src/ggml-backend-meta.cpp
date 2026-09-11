@@ -133,6 +133,7 @@ static void ggml_backend_meta_device_get_props(ggml_backend_dev_t dev, ggml_back
         /* .buffer_from_host_ptr  = */ false, // Not implemented.
         /* .events                = */ false, // Not implemented.
         /* .mmap_support          = */ true,
+        /* .copy_stream           = */ false, // Not available
     };
     for (ggml_backend_dev_t simple_dev : meta_dev_ctx->simple_devs) {
         ggml_backend_dev_props tmp_props;
@@ -786,6 +787,7 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
         const bool kv_mirrored = src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED &&
                 src_ss[2].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED;
         GGML_ASSERT(kv_split || kv_mirrored);
+        GGML_ASSERT(!kv_mirrored || (tensor->src[1]->ne[2] == 1 && tensor->src[2]->ne[2] == 1));
         GGML_ASSERT(tensor->src[4] == nullptr || src_ss[4].axis == GGML_BACKEND_SPLIT_AXIS_0);
         return {GGML_BACKEND_SPLIT_AXIS_1, {0}, {1}, 1};
     };
@@ -865,7 +867,12 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
         ggml_backend_meta_split_state split_state;
         switch (tensor->op) {
             case GGML_OP_NONE: {
-                split_state = {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1};
+                if (tensor->view_src != nullptr) {
+                    // full-tensor view created with ggml_view_tensor, transparent for the split state
+                    split_state = ggml_backend_meta_get_split_state(stc, tensor->view_src, assume_sync);
+                } else {
+                    split_state = {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1};
+                }
             } break;
             case GGML_OP_DUP: {
                 split_state = handle_generic(src_ss, /*scalar_only =*/ true);
@@ -907,7 +914,8 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             case GGML_OP_CONCAT: {
                 split_state = handle_concat(src_ss);
             } break;
-            case GGML_OP_SILU_BACK: {
+            case GGML_OP_SILU_BACK:
+            case GGML_OP_SIGMOID_BACK: {
                 split_state = handle_generic(src_ss, /*scalar_only =*/ false);
             } break;
             case GGML_OP_NORM:
@@ -1200,11 +1208,6 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_m
         ggml_context          * simple_ctx = stc.ctxs[j].get();
         ggml_backend_buffer_t   simple_buf = buf_ctx->bufs[j].get();
 
-        if ((simple_buf != nullptr) && ggml_backend_buffer_is_multi_buffer(simple_buf)) {
-            // see https://github.com/ggml-org/llama.cpp/issues/22197
-            GGML_ABORT("multi buffers are not supported by the meta backend");
-        }
-
         if (split_dim >= 0 && split_dim < GGML_MAX_DIMS) {
             // TODO: the following assert fails for llama-parallel even though the results are correct:
             // GGML_ASSERT(ggml_is_contiguously_allocated(tensor));
@@ -1254,9 +1257,19 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_m
         }
         if (t_ij->view_src != nullptr) {
             t_ij->data = (char *) t_ij->view_src->data + t_ij->view_offs;
-        } else if (simple_buf != nullptr) {
+            if (t_ij->view_src->buffer != nullptr) {
+                t_ij->buffer = t_ij->view_src->buffer;
+            }
+        } else if (simple_buf != nullptr && !ggml_backend_buffer_is_multi_buffer(simple_buf)) {
             t_ij->data = (char *) ggml_backend_buffer_get_base(simple_buf)
                 + size_t(tensor->data) - size_t(ggml_backend_buffer_get_base(tensor->buffer));
+        }
+        if (t_ij->buffer != nullptr && t_ij->data != nullptr
+                && ggml_backend_buffer_is_multi_buffer(t_ij->buffer)) {
+            ggml_backend_buffer_t sub = ggml_backend_multi_buffer_get_buffer(t_ij->buffer, t_ij->data);
+            if (sub != nullptr) {
+                t_ij->buffer = sub;
+            }
         }
 
         if (simple_buf) {
@@ -1265,6 +1278,7 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_m
         } else {
             t_ij->extra = tensor->extra;
         }
+
 
         for (int i = 0; i < GGML_MAX_SRC; i++) {
             t_ij->src[i] = tensor->src[i];
