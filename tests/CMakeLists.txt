@@ -324,6 +324,7 @@ if (NOT LLAMA_SANITIZE_ADDRESS AND NOT GGML_SCHED_NO_REALLOC)
   llama_build_and_test(test-opt.cpp)
 endif()
 llama_build_and_test(test-backend-ops.cpp)
+llama_build_and_test(test-gdn-continuation.cpp)
 llama_build_and_test(test-unified-memory-props.cpp)
 if (GGML_METAL)
     # only a Metal build can enumerate a Metal device
