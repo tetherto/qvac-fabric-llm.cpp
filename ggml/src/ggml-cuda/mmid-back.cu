@@ -212,16 +212,16 @@ void ggml_cuda_op_mul_mat_id_back_a(ggml_backend_cuda_context & ctx, ggml_tensor
     const uint32_t n_expert = (uint32_t)dst->ne[2];
 
     const ggml_cuda_mul_mat_id_back_a_kargs args = {
-        .K       = (uint32_t)dst->ne[0],
-        .n_used  = (uint32_t)ids->ne[0],
-        .n_tok   = (uint32_t)ids->ne[1],
-        .g_nb1   = (uint32_t)(grad_out->nb[1] / g_type_size),
-        .g_nb2   = (uint32_t)(grad_out->nb[2] / g_type_size),
-        .b_nb1   = (uint32_t)(b->nb[1] / b_type_size),
-        .b_nb2   = (uint32_t)(b->nb[2] / b_type_size),
-        .ids_nb1 = (uint32_t)(ids->nb[1] / ids_type_size),
-        .d_nb1   = (uint32_t)(dst->nb[1] / d_type_size),
-        .d_nb2   = (uint32_t)(dst->nb[2] / d_type_size),
+        (uint32_t)dst->ne[0],
+        (uint32_t)ids->ne[0],
+        (uint32_t)ids->ne[1],
+        (uint32_t)(grad_out->nb[1] / g_type_size),
+        (uint32_t)(grad_out->nb[2] / g_type_size),
+        (uint32_t)(b->nb[1] / b_type_size),
+        (uint32_t)(b->nb[2] / b_type_size),
+        (uint32_t)(ids->nb[1] / ids_type_size),
+        (uint32_t)(dst->nb[1] / d_type_size),
+        (uint32_t)(dst->nb[2] / d_type_size),
     };
     cudaStream_t stream = ctx.stream();
 #define LAUNCH_MMID_BACK_A(broadcast_b) \
@@ -281,18 +281,18 @@ void ggml_cuda_op_mul_mat_id_back_b(ggml_backend_cuda_context & ctx, ggml_tensor
     }
 
     const ggml_cuda_mul_mat_id_back_b_kargs args = {
-        .K        = (uint32_t)dst->ne[0],
-        .N        = (uint32_t)as->ne[1],
-        .n_used   = (uint32_t)ids->ne[0],
-        .n_tok    = (uint32_t)ids->ne[1],
-        .dst_ne1  = (uint32_t)dst->ne[1],
-        .as_nb1   = as_nb1,
-        .as_nb2   = as_nb2,
-        .g_nb1    = (uint32_t)(grad_out->nb[1] / g_type_size),
-        .g_nb2    = (uint32_t)(grad_out->nb[2] / g_type_size),
-        .ids_nb1  = (uint32_t)(ids->nb[1] / ids_type_size),
-        .d_nb1    = (uint32_t)(dst->nb[1] / d_type_size),
-        .d_nb2    = (uint32_t)(dst->nb[2] / d_type_size),
+        (uint32_t)dst->ne[0],
+        (uint32_t)as->ne[1],
+        (uint32_t)ids->ne[0],
+        (uint32_t)ids->ne[1],
+        (uint32_t)dst->ne[1],
+        as_nb1,
+        as_nb2,
+        (uint32_t)(grad_out->nb[1] / g_type_size),
+        (uint32_t)(grad_out->nb[2] / g_type_size),
+        (uint32_t)(ids->nb[1] / ids_type_size),
+        (uint32_t)(dst->nb[1] / d_type_size),
+        (uint32_t)(dst->nb[2] / d_type_size),
     };
 #define LAUNCH_MMID_BACK_B(A_TYPE) \
     launch_mul_mat_id_back_b<A_TYPE>(data_a, data_grad, data_i, data_d, stream, args)
