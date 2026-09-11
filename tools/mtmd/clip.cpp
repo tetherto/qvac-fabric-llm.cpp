@@ -4404,6 +4404,12 @@ struct clip_init_result clip_init(const char * fname, struct clip_context_params
             skip_audio = ctx_vision->model.proj_type == PROJECTOR_TYPE_GEMMA3NV;
         }
 
+        // The caller can drop the audio tower when it never sends audio
+        if (loader.has_audio && !skip_audio && ctx_params.skip_audio) {
+            LOG_INF("%s: skipping the audio encoder at the caller's request\n", __func__);
+            skip_audio = true;
+        }
+
         if (loader.has_audio && !skip_audio) {
             ctx_audio = new clip_ctx(ctx_params);
             loader.load_hparams(ctx_audio->model, CLIP_MODALITY_AUDIO);

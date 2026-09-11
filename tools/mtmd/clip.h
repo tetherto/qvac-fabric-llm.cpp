@@ -84,6 +84,11 @@ struct clip_context_params {
     // on a Flash-style model. Do not rely on zero-init: use mtmd_context_params_default()
     // or set this field explicitly.
     int image_no_upscale;
+    // skip the audio encoder even when the GGUF declares one. The projector still
+    // loads its vision encoder, so clip_init() returns a vision-only context and
+    // mtmd_support_audio() reports false. Lets a caller that never feeds audio
+    // avoid paying for those weights and their warmup compute buffers.
+    bool skip_audio;
 };
 
 struct clip_init_result {

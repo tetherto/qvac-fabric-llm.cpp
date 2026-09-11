@@ -483,6 +483,7 @@ mtmd_context_params mtmd_context_params_default() {
         /* image_tile_mode   */ 1, // 0=batched, 1=sequential (default, matches common_params), 2=disabled
         /* image_max_tiles   */ -1,
         /* image_no_upscale  */ -1, // -1=model default, 0=off, 1=on
+        /* skip_audio        */ false,
     };
     return params;
 }
@@ -601,6 +602,7 @@ struct mtmd_context {
             /* image_tile_mode   */ ctx_params.image_tile_mode,
             /* image_max_tiles   */ ctx_params.image_max_tiles,
             /* image_no_upscale  */ ctx_params.image_no_upscale,
+            /* skip_audio        */ ctx_params.skip_audio,
         };
 
         auto res = clip_init(mmproj_fname, ctx_clip_params);
