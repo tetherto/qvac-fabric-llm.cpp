@@ -858,7 +858,9 @@ struct mtmd_context {
 
         // since we already validate n_embd of vision and audio mmproj,
         // we can safely assume that they are the same
-        // a gen-only mmproj is validated below
+        // a projector can be gen-audio only: soprano has no speaker encoder, and any other
+        // gen-audio mmproj loses its audio encoder when the caller sets skip_audio
+        // (a gen-only mmproj is validated below)
         int n_embd_mmproj = ctx_v || ctx_a ? (ctx_v ? ctx_v : ctx_a)->model.n_mmproj_embd() : n_embd_text;
         if (n_embd_text > 0 && n_embd_text != n_embd_mmproj) {
             throw std::runtime_error(mtmd_format(
