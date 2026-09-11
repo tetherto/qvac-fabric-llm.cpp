@@ -164,8 +164,9 @@ struct mtmd_context_params {
     int image_no_upscale;
 
     // skip loading the audio encoder even when the mmproj declares one. The vision
-    // encoder still loads, so mtmd_support_audio() returns false and audio input is
-    // rejected. Use it when the caller never sends audio and wants the memory back.
+    // and audio-generation encoders still load, so mtmd_support_audio() returns false
+    // and audio input is rejected. Use it when the caller never sends audio and wants
+    // the memory back.
     bool skip_audio;
 };
 

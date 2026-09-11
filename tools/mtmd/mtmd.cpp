@@ -687,9 +687,7 @@ struct mtmd_context {
         ctx_v = res.ctx_v;
         ctx_a = res.ctx_a;
         ctx_gen_a = res.ctx_gen_a;
-        // soprano has no speaker encoder, its mmproj only holds the decoder
-        const bool gen_only = ctx_gen_a && clip_get_projector_type(ctx_gen_a) == PROJECTOR_TYPE_SOPRANO;
-        if (!ctx_v && !ctx_a && !gen_only) {
+        if (!ctx_v && !ctx_a && !ctx_gen_a) {
             throw std::runtime_error(string_format("Failed to load CLIP model from %s\n", mmproj_fname));
         }
 
@@ -706,13 +704,16 @@ struct mtmd_context {
 
         // since we already validate n_embd of vision and audio mmproj,
         // we can safely assume that they are the same
-        // a gen-only mmproj is validated below
-        int n_embd_clip = ctx_v || ctx_a ? clip_n_mmproj_embd(ctx_v ? ctx_v : ctx_a) : n_embd_text;
-        if (n_embd_text > 0 && n_embd_text != n_embd_clip) {
-            throw std::runtime_error(string_format(
-                "mismatch between text model (n_embd = %d) and mmproj (n_embd = %d)\n"
-                "hint: you may be using wrong mmproj\n",
-                n_embd_text, n_embd_clip));
+        // a projector can be gen-audio only: soprano has no speaker encoder, and any other
+        // gen-audio mmproj loses its audio encoder when the caller sets skip_audio
+        if (ctx_v || ctx_a) {
+            int n_embd_clip = clip_n_mmproj_embd(ctx_v ? ctx_v : ctx_a);
+            if (n_embd_text > 0 && n_embd_text != n_embd_clip) {
+                throw std::runtime_error(string_format(
+                    "mismatch between text model (n_embd = %d) and mmproj (n_embd = %d)\n"
+                    "hint: you may be using wrong mmproj\n",
+                    n_embd_text, n_embd_clip));
+            }
         }
         if (ctx_gen_a) {
             int n_embd_gen = clip_n_mmproj_embd(ctx_gen_a);

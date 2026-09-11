@@ -1254,6 +1254,7 @@ private:
             mparams.image_tile_mode  = (int) params_base.image_tile_mode;
             mparams.image_max_tiles  = params_base.image_max_tiles;
             mparams.image_no_upscale = params_base.image_no_upscale;
+            mparams.skip_audio       = params_base.mmproj_no_audio;
             mparams.media_marker     = get_media_marker();
             // progress callback
             mparams.progress_callback           = load_progress_callback;
