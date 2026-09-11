@@ -126,6 +126,11 @@ static const char * rpc_cmd_name(enum rpc_cmd cmd) {
     }
 }
 
+// Protocol minor that introduced RPC_CMD_SET_TENSOR_2D_HASH. The client must not
+// send it to a server that announced an older minor at HELLO: such a server
+// answers "Unknown command" and closes the connection.
+static constexpr uint8_t RPC_PROTO_MINOR_SET_TENSOR_2D_HASH = 1;
+
 // Try a hash lookup first when data size is larger than this threshold
 const size_t HASH_THRESHOLD = 10 * 1024 * 1024;
 
@@ -574,9 +579,11 @@ static bool send_rpc_cmd(socket_ptr sock, enum rpc_cmd cmd, const void * input, 
 // Performs HELLO handshake with transport auto-negotiation.
 // Advertises local capabilities via conn_caps; if the server responds with
 // matching capabilities, the socket is upgraded transparently.
-static bool negotiate_hello(const std::shared_ptr<socket_t> & sock) {
+// On success `response` holds the version the server announced; the caller
+// uses it to avoid commands newer than the server's minor.
+static bool negotiate_hello(const std::shared_ptr<socket_t> & sock, rpc_msg_hello_rsp & response) {
     rpc_msg_hello_req request = {};
-    rpc_msg_hello_rsp response = {};
+    response = {};
 
     sock->get_caps(request.conn_caps);
 
@@ -684,14 +691,20 @@ class rpc_command_queue {
             return nullptr;
         }
         auto sock = socket_t::connect(host.c_str(), port, RPC_CLIENT_CONNECT_TIMEOUT_MS);
-        if (sock == nullptr || !sock->set_timeout(RPC_CLIENT_IO_TIMEOUT_MS) || !negotiate_hello(sock)) {
+        rpc_msg_hello_rsp hello = {};
+        if (sock == nullptr || !sock->set_timeout(RPC_CLIENT_IO_TIMEOUT_MS) || !negotiate_hello(sock, hello)) {
             return nullptr;
         }
-        auto queue    = std::shared_ptr<rpc_command_queue>(new rpc_command_queue(endpoint, std::move(sock)));
+        auto queue    = std::shared_ptr<rpc_command_queue>(new rpc_command_queue(endpoint, std::move(sock), hello.minor));
         queue->worker = std::thread(&rpc_command_queue::worker_loop, queue.get());
         LOG_DBG("[%s] connected to %s\n", __func__, endpoint.c_str());
         return queue;
     }
+
+    // Protocol minor the server announced at HELLO. negotiate_hello() already
+    // rejected majors other than ours and minors newer than ours, so this is
+    // in [0, RPC_PROTO_MINOR_VERSION]; gate commands added in a later minor on it.
+    uint8_t server_minor() const { return server_proto_minor; }
 
     ~rpc_command_queue() {
         {
@@ -892,7 +905,8 @@ class rpc_command_queue {
     }
 
   private:
-    rpc_command_queue(std::string endpoint, socket_ptr sock) : endpoint(std::move(endpoint)), sock(std::move(sock)) {}
+    rpc_command_queue(std::string endpoint, socket_ptr sock, uint8_t server_proto_minor) :
+        endpoint(std::move(endpoint)), sock(std::move(sock)), server_proto_minor(server_proto_minor) {}
 
     static void signal_failed(rpc_queue_cmd & cmd) {
         if (cmd.pending_copy) {
@@ -1004,6 +1018,7 @@ class rpc_command_queue {
 
     std::string                               endpoint;
     socket_ptr                                sock;
+    uint8_t                                   server_proto_minor = 0;
     std::thread                               worker;
     std::mutex                                mutex;
     std::condition_variable                   cv;
@@ -1307,7 +1322,8 @@ static void ggml_backend_rpc_buffer_set_tensor_2d(ggml_backend_buffer_t buffer, 
     for (size_t i = 0; i < n_copies; i++) {
         memcpy(dest + i*size, (const char *)data + i*stride_data, size);
     }
-    if (data_size > HASH_THRESHOLD) {
+    // a 108.0 server does not know RPC_CMD_SET_TENSOR_2D_HASH; send it the plain transfer
+    if (data_size > HASH_THRESHOLD && ctx->cmd_queue->server_minor() >= RPC_PROTO_MINOR_SET_TENSOR_2D_HASH) {
         rpc_msg_set_tensor_2d_hash_req request;
         request.tensor   = rpc_tensor;
         request.offset   = offset;
