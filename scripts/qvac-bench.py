@@ -232,6 +232,9 @@ def make_env(options: OptionsType) -> dict[str, str]:
             env.pop("GGML_CUDA_ENABLE_UNIFIED_MEMORY", None)
     if "cuda_visible_devices" in options:
         env["CUDA_VISIBLE_DEVICES"] = str(options["cuda_visible_devices"])
+    # only for benchmark runs: vendor libs on Android break build tools like cmake
+    if "ld_library_path" in options:
+        env["LD_LIBRARY_PATH"] = os.pathsep.join(p for p in (str(options["ld_library_path"]), env.get("LD_LIBRARY_PATH")) if p)
     return env
 
 
