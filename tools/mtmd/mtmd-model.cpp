@@ -4366,7 +4366,14 @@ mtmd_models mtmd_model_load(const char * fname, const mtmd_model_params & params
 
     // TODO: we don't support audio for Gemma 3N, but GGUF contains audio tensors
     // we can remove this check when we implement audio support for Gemma 3N
-    const bool skip_audio = res.v && res.v->proj_type == PROJECTOR_TYPE_GEMMA3NV;
+    bool skip_audio = res.v && res.v->proj_type == PROJECTOR_TYPE_GEMMA3NV;
+
+    // The caller can drop the audio tower when it never sends audio
+    if (loader.has_audio && !skip_audio && params.skip_audio) {
+        LOG_INF("%s: skipping the audio encoder at the caller's request\n", __func__);
+        skip_audio = true;
+    }
+
     if (loader.has_audio && !skip_audio) {
         res.a = load(MTMD_MODALITY_AUDIO);
     }

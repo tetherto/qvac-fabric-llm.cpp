@@ -1416,6 +1416,11 @@ struct mtmd_model_params {
     bool no_alloc = false; // only create the tensors, do not read their data
     // the device can't use bf16 weights: declare them as f16 and convert on load
     bool convert_bf16_to_f16 = false;
+    // skip the audio encoder even when the GGUF declares one. The projector still
+    // loads its vision encoder, so mtmd_model_load() returns a vision-only model and
+    // mtmd_support_audio() reports false. Lets a caller that never feeds audio
+    // avoid paying for those weights and their warmup compute buffers.
+    bool skip_audio = false;
     mtmd_progress_callback progress_callback = nullptr;
     void * progress_callback_user_data = nullptr;
 };
