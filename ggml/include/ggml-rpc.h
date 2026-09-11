@@ -19,7 +19,10 @@ extern "C" {
 // fork's majors are rebased two up on this line:
 // 111 adds butterfly communicator rounds and round-tagged peer frames
 //     (b12032 fork: 109, b11259 fork: 108). Not wire-compatible with fork 109/110.
-// 111.1 adds the 2d set_tensor hash command (b12032 fork: 109.1, b11259 fork: 108.1).
+// 111.1 adds RPC_CMD_SET_TENSOR_2D_HASH (b12032 fork: 109.1, b11259 fork: 108.1).
+// A minor bump is additive: the client still accepts a server with an older
+// minor and must gate every command introduced by a later minor on the minor
+// the server announces at HELLO.
 #define RPC_PROTO_MAJOR_VERSION    111
 #define RPC_PROTO_MINOR_VERSION    1
 #define RPC_PROTO_PATCH_VERSION    2
