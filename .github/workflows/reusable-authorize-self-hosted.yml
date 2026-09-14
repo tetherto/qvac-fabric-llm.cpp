@@ -63,5 +63,5 @@ jobs:
             exit 0
           fi
 
-          echo "::notice::Self-hosted jobs require qvac/fork-verified on the current head SHA. Approve the fork-ci environment, then re-run this workflow."
+          echo "::notice::Self-hosted jobs require qvac/fork-verified on the current head SHA. Approve the fork-ci environment on the Fork approval workflow; that records the SHA and re-runs pull_request CI. Same-repo PRs and workflow_dispatch already run on the fleet."
           echo "allowed=false" >> "$GITHUB_OUTPUT"

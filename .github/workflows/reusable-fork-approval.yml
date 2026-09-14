@@ -16,6 +16,7 @@ jobs:
     timeout-minutes: 5
     permissions:
       statuses: write
+      actions: write
     environment: ${{ github.event_name == 'pull_request_target' && github.event.pull_request.head.repo.full_name != github.repository && 'fork-ci' || '' }}
     steps:
       - name: Harden Runner
@@ -35,6 +36,26 @@ jobs:
             -f state=success \
             -f context=qvac/fork-verified \
             -f description="fork-ci environment approved for this commit"
+
+      # pull_request consumers read that status at start-time. Approving fork-ci
+      # is not a pull_request event, so re-run completed PR workflows for this
+      # SHA so self-hosted jobs can actually start (same-repo PRs never wait).
+      - name: Re-run pull_request workflows for this SHA
+        if: github.event_name == 'pull_request_target' && github.event.pull_request.head.repo.full_name != github.repository
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          gh run list --commit "${HEAD_SHA}" --event pull_request --limit 50 --json databaseId,status --jq '.[] | select(.status == "completed") | .databaseId' > /tmp/run-ids.txt
+          if [ ! -s /tmp/run-ids.txt ]; then
+            echo "No completed pull_request runs for this SHA yet; they will see qvac/fork-verified when they start."
+            exit 0
+          fi
+          while read -r id; do
+            echo "Re-running pull_request workflow run ${id}"
+            gh run rerun "${id}"
+          done < /tmp/run-ids.txt
 
       - name: Approved
         run: echo "fork PR authorised to run self-hosted jobs"

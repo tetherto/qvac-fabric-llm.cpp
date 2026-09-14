@@ -15,4 +15,5 @@ jobs:
   fork-approval:
     permissions:
       statuses: write
+      actions: write
     uses: ./.github/workflows/reusable-fork-approval.yml
