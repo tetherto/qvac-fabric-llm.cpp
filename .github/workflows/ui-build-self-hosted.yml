@@ -12,7 +12,6 @@ jobs:
   authorize:
     permissions:
       contents: read
-      statuses: read
     uses: ./.github/workflows/reusable-authorize-self-hosted.yml
 
   build:

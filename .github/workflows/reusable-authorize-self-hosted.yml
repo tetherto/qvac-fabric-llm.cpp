@@ -1,8 +1,10 @@
 name: Authorize self-hosted fork CI (reusable)
 
-# Unprivileged consumer gate. Same-repo PRs and non-pull_request events are
-# allowed. External forks require qvac/fork-verified success on the current
-# head SHA. Read-only: no secrets, no checkout.
+# Unprivileged gate on pull_request (read-only token, no secrets, no checkout).
+# Same-repo PRs and non-pull_request events skip the environment and run.
+# External forks wait on the fork-ci environment for this run — that is the
+# SHA-bound approval. A new push is a new run and must be re-approved.
+# Must never use pull_request_target: engine CI has no secrets to grant.
 
 on:
   workflow_call:
@@ -20,48 +22,12 @@ jobs:
     timeout-minutes: 5
     permissions:
       contents: read
-      statuses: read
+    environment: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository && 'fork-ci' || '' }}
     outputs:
       allowed: ${{ steps.auth.outputs.allowed }}
     steps:
-      - name: Resolve SHA-bound fork approval
-        id: approved
-        env:
-          GH_TOKEN: ${{ github.token }}
-          REPO: ${{ github.repository }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-          STATUS_CONTEXT: qvac/fork-verified
-        run: |
-          approved=false
-          if [ -n "$HEAD_SHA" ]; then
-            state=$(gh api "repos/${REPO}/commits/${HEAD_SHA}/statuses" \
-              --jq "map(select(.context == \"${STATUS_CONTEXT}\"))[0].state // \"\"" \
-              2>/dev/null || echo "")
-            if [ "$state" = "success" ]; then approved=true; fi
-          fi
-          echo "approved=$approved" >> "$GITHUB_OUTPUT"
-
       - name: Authorize self-hosted jobs
         id: auth
-        env:
-          EVENT: ${{ github.event_name }}
-          IS_FORK: ${{ github.event.pull_request.head.repo.full_name != github.repository }}
-          HAS_APPROVED_SHA: ${{ steps.approved.outputs.approved }}
         run: |
-          if [ "$EVENT" != "pull_request" ]; then
-            echo "allowed=true" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          if [ "$IS_FORK" = "false" ]; then
-            echo "allowed=true" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          if [ "$HAS_APPROVED_SHA" = "true" ]; then
-            echo "allowed=true" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          echo "::notice::Self-hosted jobs require qvac/fork-verified on the current head SHA. Approve the fork-ci environment on the Fork approval workflow; that records the SHA and re-runs pull_request CI. Same-repo PRs and workflow_dispatch already run on the fleet."
-          echo "allowed=false" >> "$GITHUB_OUTPUT"
+          echo "allowed=true" >> "$GITHUB_OUTPUT"
+          echo "self-hosted jobs authorised for this run"
