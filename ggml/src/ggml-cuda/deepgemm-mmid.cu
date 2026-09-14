@@ -3,11 +3,30 @@
 #include "mmid.cuh"
 
 #include <deep_gemm/impls/sm90_fp8_gemm_1d2d.cuh>
+#if __has_include(<deep_gemm/epilogue/transform.cuh>)
+#include <deep_gemm/epilogue/transform.cuh>
+#endif
+#if __has_include(<deep_gemm/impls/sm90_fp8_mega_moe.cuh>)
+#define GGML_CUDA_HAS_DEEPGEMM_MEGA_MOE 1
+#include <deep_gemm/impls/sm90_fp8_mega_moe.cuh>
+#include <deep_gemm/impls/sm90_mega_moe_pre_dispatch.cuh>
+#include <deep_gemm/layout/mega_moe.cuh>
+#include <deep_gemm/layout/sym_buffer.cuh>
+#else
+#define GGML_CUDA_HAS_DEEPGEMM_MEGA_MOE 0
+#endif
 
+#include <array>
 #include <cmath>
 #include <cstring>
 
 namespace {
+
+#if __has_include(<deep_gemm/epilogue/transform.cuh>)
+using dg_epilogue_identity = deep_gemm::epilogue::transform::EpilogueIdentity;
+#else
+using dg_epilogue_identity = deep_gemm::EpilogueIdentity;
+#endif
 
 constexpr int DG_M_BLOCKED_MIN = 128;
 constexpr int DG_M_BLOCKED_MID = 512;
@@ -18,6 +37,14 @@ constexpr int DG_QWEN_GROUPS = 512;
 constexpr int DG_SCALE_K   = 128;
 constexpr int DG_NUM_SMS   = 128;
 constexpr int DG_CONTIG_ALIGNMENT = 128;
+
+#if GGML_CUDA_HAS_DEEPGEMM_MEGA_MOE
+constexpr int DG_MEGA_MAX_TOKENS = 384;
+constexpr int DG_MEGA_POOL_TOKENS = 6912;
+constexpr int DG_MEGA_PADDED_SF_TOKENS = 110592;
+constexpr int DG_MEGA_NUM_SMS = 132;
+constexpr int DG_MEGA_SMEM_SIZE = 227600;
+#endif
 
 template<int n_threads>
 __device__ float block_abs_max(float value) {
@@ -308,6 +335,54 @@ __global__ void quantize_weights(
     }
 }
 
+#if GGML_CUDA_HAS_DEEPGEMM_MEGA_MOE
+__global__ void convert_f32_to_bf16(
+        const float * src,
+        __nv_bfloat16 * dst,
+        size_t n) {
+    const size_t i = static_cast<size_t>(blockIdx.x)*blockDim.x + threadIdx.x;
+    if (i < n) {
+        dst[i] = __float2bfloat16(src[i]);
+    }
+}
+
+__global__ void convert_bf16_to_f32(
+        const __nv_bfloat16 * src,
+        float * dst,
+        size_t n) {
+    const size_t i = static_cast<size_t>(blockIdx.x)*blockDim.x + threadIdx.x;
+    if (i < n) {
+        dst[i] = __bfloat162float(src[i]);
+    }
+}
+
+// MegaMoE's fused SwiGLU epilogue consumes gate/up FP8 rows interleaved in
+// granularity-8 chunks: gate[0:8], up[0:8], gate[8:16], up[8:16], ... .
+// The per-128 block scales remain in their original gate-then-up order.
+__global__ void interleave_mega_moe_gate_up(
+        const uint8_t * src,
+        uint8_t * dst,
+        int n_experts,
+        int n_ff,
+        int k) {
+    const size_t rows = static_cast<size_t>(2)*n_ff;
+    const size_t total = static_cast<size_t>(n_experts)*rows*k;
+    const size_t i = static_cast<size_t>(blockIdx.x)*blockDim.x + threadIdx.x;
+    if (i >= total) {
+        return;
+    }
+
+    const int col = i % k;
+    const size_t expert_row = i / k;
+    const int row = expert_row % (2*n_ff);
+    const int expert = expert_row / (2*n_ff);
+    const bool is_up = row >= n_ff;
+    const int local_row = is_up ? row - n_ff : row;
+    const int dst_row = 2*(local_row/8)*8 + (is_up ? 8 : 0) + local_row%8;
+    dst[(static_cast<size_t>(expert)*(2*n_ff) + dst_row)*k + col] = src[i];
+}
+#endif
+
 __global__ void scatter_bf16_output(
         const __nv_bfloat16 * packed,
         const int32_t * assignment_rows,
@@ -446,6 +521,208 @@ CUtensorMap make_tma_2d_desc(
     return map;
 }
 
+#if GGML_CUDA_HAS_DEEPGEMM_MEGA_MOE
+struct mega_moe_workspace_view {
+    uint8_t * input;
+    float * input_sf;
+    int64_t * topk_idx;
+    float * topk_weights;
+    uint8_t * l1_acts;
+    float * l1_acts_sf;
+    uint8_t * l2_acts;
+    float * l2_acts_sf;
+    size_t bytes;
+};
+
+size_t mega_moe_workspace_bytes() {
+    const deep_gemm::layout::SM90Workspace workspace(
+        nullptr, 1, DG_TEST_GROUPS, DG_MEGA_MAX_TOKENS, 10);
+    const size_t fp8_input = static_cast<size_t>(DG_MEGA_MAX_TOKENS)*2560;
+    const size_t input_sf = static_cast<size_t>(DG_MEGA_MAX_TOKENS)*(2560/128)*sizeof(float);
+    const size_t topk_idx = static_cast<size_t>(DG_MEGA_MAX_TOKENS)*10*sizeof(int64_t);
+    const size_t topk_weights = static_cast<size_t>(DG_MEGA_MAX_TOKENS)*10*sizeof(float);
+    const size_t l1_acts = static_cast<size_t>(DG_MEGA_POOL_TOKENS)*2560;
+    const size_t l1_acts_sf =
+        static_cast<size_t>(DG_MEGA_PADDED_SF_TOKENS)*(2560/128)*sizeof(float);
+    const size_t l1_topk_weights = static_cast<size_t>(DG_MEGA_POOL_TOKENS)*sizeof(float);
+    const size_t l2_acts = static_cast<size_t>(DG_MEGA_POOL_TOKENS)*256;
+    const size_t l2_acts_sf =
+        static_cast<size_t>(DG_MEGA_PADDED_SF_TOKENS)*(256/64)*sizeof(float);
+    const size_t combine =
+        static_cast<size_t>(10)*DG_MEGA_MAX_TOKENS*2560*sizeof(__nv_bfloat16);
+    return workspace.get_num_bytes() + fp8_input + input_sf + topk_idx + topk_weights +
+        l1_acts + l1_acts_sf + l1_topk_weights + l2_acts + l2_acts_sf + combine;
+}
+
+mega_moe_workspace_view make_mega_moe_workspace_view(uint8_t * base) {
+    const deep_gemm::layout::SM90Workspace workspace(
+        base, 1, DG_TEST_GROUPS, DG_MEGA_MAX_TOKENS, 10);
+    const deep_gemm::layout::Data fp8_token(2560);
+    const deep_gemm::layout::Data fp8_input_sf(2560/32);
+    const deep_gemm::layout::Data input_topk_idx(10*sizeof(int64_t), false);
+    const deep_gemm::layout::Data input_topk_weights(10*sizeof(float), false);
+    const deep_gemm::layout::Data l1_topk_weights(sizeof(float), false);
+    const deep_gemm::layout::Data fp8_intermediate(256);
+    const deep_gemm::layout::Data fp8_intermediate_sf(256/16);
+    const deep_gemm::layout::Data bf16_token(2560*2);
+
+    const deep_gemm::layout::Buffer input(
+        fp8_token, 1, DG_MEGA_MAX_TOKENS, workspace.get_end_ptr());
+    const deep_gemm::layout::Buffer input_sf(
+        fp8_input_sf, 1, DG_MEGA_MAX_TOKENS, input.get_end_ptr());
+    const deep_gemm::layout::Buffer topk_idx(
+        input_topk_idx, 1, DG_MEGA_MAX_TOKENS, input_sf.get_end_ptr());
+    const deep_gemm::layout::Buffer topk_weights(
+        input_topk_weights, 1, DG_MEGA_MAX_TOKENS, topk_idx.get_end_ptr());
+    const deep_gemm::layout::Buffer l1_acts(
+        fp8_token, 1, DG_MEGA_POOL_TOKENS, topk_weights.get_end_ptr());
+    const deep_gemm::layout::Buffer l1_acts_sf(
+        fp8_input_sf, 1, DG_MEGA_PADDED_SF_TOKENS, l1_acts.get_end_ptr());
+    const deep_gemm::layout::Buffer l1_route_weights(
+        l1_topk_weights, 1, DG_MEGA_POOL_TOKENS, l1_acts_sf.get_end_ptr());
+    const deep_gemm::layout::Buffer l2_acts(
+        fp8_intermediate, 1, DG_MEGA_POOL_TOKENS, l1_route_weights.get_end_ptr());
+    const deep_gemm::layout::Buffer l2_acts_sf(
+        fp8_intermediate_sf, 1, DG_MEGA_PADDED_SF_TOKENS, l2_acts.get_end_ptr());
+    const deep_gemm::layout::Buffer combine(
+        bf16_token, 10, DG_MEGA_MAX_TOKENS, l2_acts_sf.get_end_ptr());
+
+    return {
+        input.get_base_ptr<uint8_t>(),
+        input_sf.get_base_ptr<float>(),
+        topk_idx.get_base_ptr<int64_t>(),
+        topk_weights.get_base_ptr<float>(),
+        l1_acts.get_base_ptr<uint8_t>(),
+        l1_acts_sf.get_base_ptr<float>(),
+        l2_acts.get_base_ptr<uint8_t>(),
+        l2_acts_sf.get_base_ptr<float>(),
+        static_cast<size_t>(
+            reinterpret_cast<uintptr_t>(combine.get_end_ptr()) -
+            reinterpret_cast<uintptr_t>(base)),
+    };
+}
+
+void launch_deepgemm_mega_moe_16x256(
+        uint8_t * workspace,
+        __nv_bfloat16 * output,
+        const __nv_bfloat16 * input,
+        const int32_t * ids,
+        const float * routing_weights,
+        uint8_t * l1_weights,
+        const float * l1_weights_sf,
+        uint8_t * l2_weights,
+        const float * l2_weights_sf,
+        cudaStream_t stream) {
+    const mega_moe_workspace_view view = make_mega_moe_workspace_view(workspace);
+
+    constexpr uint32_t num_tokens = 1;
+    constexpr uint32_t hidden = 2560;
+    constexpr uint32_t num_groups = hidden/128;
+    constexpr uint32_t top_k = 10;
+    constexpr uint32_t pre_dispatch_threads = hidden/8;
+    constexpr uint32_t pad_slots = (DG_MEGA_MAX_TOKENS - num_tokens)*top_k;
+    constexpr uint32_t pad_blocks =
+        (pad_slots + pre_dispatch_threads - 1)/pre_dispatch_threads;
+
+    deep_gemm::sm90_mega_moe_pre_dispatch_kernel<128, false>
+        <<<num_tokens + pad_blocks, pre_dispatch_threads, 0, stream>>>(
+            input,
+            ids,
+            routing_weights,
+            reinterpret_cast<__nv_fp8_e4m3 *>(view.input),
+            view.input_sf,
+            view.topk_idx,
+            view.topk_weights,
+            num_tokens,
+            DG_MEGA_MAX_TOKENS,
+            hidden,
+            num_groups,
+            top_k,
+            1.0f);
+    CUDA_CHECK(cudaGetLastError());
+
+    CUtensorMap map_l1_acts = make_tma_2d_desc(
+        view.l1_acts, CU_TENSOR_MAP_DATA_TYPE_UINT8, 1,
+        2560, DG_MEGA_POOL_TOKENS, 128, 64, 2560,
+        CU_TENSOR_MAP_SWIZZLE_128B);
+    CUtensorMap map_l1_acts_sf = make_tma_2d_desc(
+        view.l1_acts_sf, CU_TENSOR_MAP_DATA_TYPE_FLOAT32, sizeof(float),
+        DG_MEGA_PADDED_SF_TOKENS, 2560/128, 64, 1, DG_MEGA_PADDED_SF_TOKENS,
+        CU_TENSOR_MAP_SWIZZLE_NONE);
+    CUtensorMap map_l1_weights = make_tma_2d_desc(
+        l1_weights, CU_TENSOR_MAP_DATA_TYPE_UINT8, 1,
+        2560, DG_TEST_GROUPS*512, 128, 128, 2560,
+        CU_TENSOR_MAP_SWIZZLE_128B);
+    CUtensorMap map_l1_output = make_tma_2d_desc(
+        view.l2_acts, CU_TENSOR_MAP_DATA_TYPE_UINT8, 1,
+        256, DG_MEGA_POOL_TOKENS, 64, 64, 256,
+        CU_TENSOR_MAP_SWIZZLE_NONE);
+    CUtensorMap map_l2_acts = make_tma_2d_desc(
+        view.l2_acts, CU_TENSOR_MAP_DATA_TYPE_UINT8, 1,
+        256, DG_MEGA_POOL_TOKENS, 128, 64, 256,
+        CU_TENSOR_MAP_SWIZZLE_128B);
+    CUtensorMap map_l2_acts_sf = make_tma_2d_desc(
+        view.l2_acts_sf, CU_TENSOR_MAP_DATA_TYPE_FLOAT32, sizeof(float),
+        DG_MEGA_PADDED_SF_TOKENS, 256/64, 64, 1, DG_MEGA_PADDED_SF_TOKENS,
+        CU_TENSOR_MAP_SWIZZLE_NONE);
+    CUtensorMap map_l2_weights = make_tma_2d_desc(
+        l2_weights, CU_TENSOR_MAP_DATA_TYPE_UINT8, 1,
+        256, DG_TEST_GROUPS*2560, 128, 128, 256,
+        CU_TENSOR_MAP_SWIZZLE_128B);
+
+    auto kernel = &deep_gemm::sm90_fp8_mega_moe_impl<
+        DG_MEGA_MAX_TOKENS,
+        2560, 256,
+        DG_TEST_GROUPS, 10,
+        DG_TEST_GROUPS,
+        64, 128, 128,
+        DG_MEGA_POOL_TOKENS,
+        DG_MEGA_PADDED_SF_TOKENS,
+        8,
+        64, 64, 256,
+        DG_MEGA_NUM_SMS, 1,
+        1.0e30f,
+        false,
+        0,
+        false,
+        false,
+        true,
+        false,
+        true>;
+    CUDA_CHECK(cudaFuncSetAttribute(
+        kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, DG_MEGA_SMEM_SIZE));
+
+    std::array<int64_t, 1> workspace_ptrs = {
+        reinterpret_cast<int64_t>(workspace),
+    };
+    deep_gemm::layout::SymBuffer<1> sym_buffer(workspace_ptrs, 0);
+    int * cumulative_stats = nullptr;
+    void * output_ptr = output;
+    void * args[] = {
+        &output_ptr,
+        &cumulative_stats,
+        const_cast<uint32_t *>(&num_tokens),
+        &sym_buffer,
+        &map_l1_acts,
+        &map_l1_acts_sf,
+        &map_l1_weights,
+        &l1_weights_sf,
+        &map_l1_output,
+        &map_l2_acts,
+        &map_l2_acts_sf,
+        &map_l2_weights,
+        &l2_weights_sf,
+    };
+
+    cudaLaunchConfig_t config = {};
+    config.gridDim = dim3(DG_MEGA_NUM_SMS, 1, 1);
+    config.blockDim = dim3(384, 1, 1);
+    config.dynamicSmemBytes = DG_MEGA_SMEM_SIZE;
+    config.stream = stream;
+    CUDA_CHECK(cudaLaunchKernelExC(&config, reinterpret_cast<const void *>(kernel), args));
+}
+#endif
+
 template<int n, int k, int n_last_stages, int n_groups, int block_n = 160>
 void launch_deepgemm(
         uint8_t * a_fp8,
@@ -470,6 +747,19 @@ void launch_deepgemm(
         n_stages * 2 * 8;
     static_assert(smem_size <= 232448);
 
+#if __has_include(<deep_gemm/epilogue/transform.cuh>)
+    auto kernel = &deep_gemm::sm90_fp8_gemm_1d2d_impl<
+        cute::UMMA::Major::K,
+        0, n, k,
+        n_groups,
+        block_m, block_n, block_k,
+        128, 128, swizzle_d,
+        n_stages,
+        128, 128,
+        1, false,
+        DG_NUM_SMS, deep_gemm::GemmType::MGroupedMasked,
+        cutlass::bfloat16_t, dg_epilogue_identity>;
+#else
     auto kernel = &deep_gemm::sm90_fp8_gemm_1d2d_impl<
         0, n, k,
         n_groups,
@@ -478,7 +768,8 @@ void launch_deepgemm(
         n_stages, n_last_stages,
         128, 128,
         1, false,
-        DG_NUM_SMS, deep_gemm::GemmType::MGroupedMasked, deep_gemm::EpilogueIdentity>;
+        DG_NUM_SMS, deep_gemm::GemmType::MGroupedMasked, dg_epilogue_identity>;
+#endif
 
     CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
 
@@ -542,7 +833,7 @@ void launch_deepgemm_contiguous(
     constexpr int block_k = 128;
     constexpr int n_stages = 4;
     constexpr int swizzle_d = 64;
-    constexpr int n_threads = 256;
+    constexpr int n_threads = 384;
     constexpr int sfb_rows = k/block_k;
     constexpr int sfb_factor = block_k % block_n == 0 ? 1 : 2;
     constexpr int smem_size =
@@ -552,15 +843,29 @@ void launch_deepgemm_contiguous(
         n_stages*2*8;
     static_assert(smem_size <= 232448);
 
+#if __has_include(<deep_gemm/epilogue/transform.cuh>)
+    auto kernel = &deep_gemm::sm90_fp8_gemm_1d2d_impl<
+        cute::UMMA::Major::K,
+        0, n, k,
+        n_groups,
+        block_m, block_n, block_k,
+        128, 128, swizzle_d,
+        n_stages,
+        128, 256,
+        1, false,
+        DG_NUM_SMS, deep_gemm::GemmType::MGroupedContiguous,
+        cutlass::bfloat16_t, dg_epilogue_identity>;
+#else
     auto kernel = &deep_gemm::sm90_fp8_gemm_1d2d_impl<
         0, n, k,
         n_groups,
         block_m, block_n, block_k,
         swizzle_d,
         n_stages, n_last_stages,
-        128, 128,
+        128, 256,
         1, false,
-        DG_NUM_SMS, deep_gemm::GemmType::MGroupedContiguous, deep_gemm::EpilogueIdentity>;
+        DG_NUM_SMS, deep_gemm::GemmType::MGroupedContiguous, dg_epilogue_identity>;
+#endif
 
     CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
 
@@ -719,6 +1024,11 @@ bool runtime_enabled() {
 
 bool moe_ffn_runtime_enabled() {
     const char * value = std::getenv("GGML_CUDA_DEEPGEMM_MOE_FFN");
+    return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
+}
+
+bool mega_moe_runtime_enabled() {
+    const char * value = std::getenv("GGML_CUDA_DEEPGEMM_MEGA_MOE");
     return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
 }
 
@@ -1095,6 +1405,91 @@ bool ggml_cuda_deepgemm_moe_ffn(ggml_backend_cuda_context & ctx, ggml_tensor * d
     const int m_blocked     = n_tokens <= DG_M_BLOCKED_MIN ? DG_M_BLOCKED_MIN :
                               n_tokens <= DG_M_BLOCKED_MID ? DG_M_BLOCKED_MID : DG_M_BLOCKED_MAX;
     const int expert_offset = ggml_get_op_params_i32(dst, 0);
+
+#if GGML_CUDA_HAS_DEEPGEMM_MEGA_MOE
+    // Start with the exact decode specialization validated by the standalone
+    // DeepGEMM test. Runtime quantization/transformation is intentionally only
+    // a backend-op correctness bridge; model integration will keep these FP8
+    // weights resident in MegaMoE's interleaved format.
+    if (mega_moe_runtime_enabled() &&
+        n_tokens == 1 &&
+        n_embd == 2560 &&
+        n_ff == 256 &&
+        n_groups == DG_TEST_GROUPS &&
+        top_k == 10 &&
+        expert_offset == 0) {
+        cudaStream_t stream = ctx.stream();
+        ggml_cuda_pool & pool = ctx.pool();
+
+        const size_t input_elements = static_cast<size_t>(n_tokens)*n_embd;
+        const size_t gate_up_elements =
+            static_cast<size_t>(n_groups)*gate_up_n*n_embd;
+        const size_t down_elements =
+            static_cast<size_t>(n_groups)*n_embd*n_ff;
+        const size_t gate_up_scale_elements =
+            static_cast<size_t>(n_groups)*(gate_up_n/DG_SCALE_K)*(n_embd/DG_SCALE_K);
+        const size_t down_scale_elements =
+            static_cast<size_t>(n_groups)*(n_embd/DG_SCALE_K)*(n_ff/DG_SCALE_K);
+
+        ggml_cuda_pool_alloc<uint8_t> workspace(pool, mega_moe_workspace_bytes());
+        ggml_cuda_pool_alloc<__nv_bfloat16> input_bf16(pool, input_elements);
+        ggml_cuda_pool_alloc<__nv_bfloat16> output_bf16(pool, input_elements);
+        ggml_cuda_pool_alloc<uint8_t> gate_up_interleaved(pool, gate_up_elements);
+        ggml_cuda_pool_alloc<uint8_t> gate_up_quantized(pool);
+        ggml_cuda_pool_alloc<uint8_t> down_quantized(pool);
+        ggml_cuda_pool_alloc<float> gate_up_quantized_scales(pool);
+        ggml_cuda_pool_alloc<float> down_quantized_scales(pool);
+
+        uint8_t * gate_up_fp8 = native_fp8
+            ? static_cast<uint8_t *>(gate_up->data)
+            : gate_up_quantized.alloc(gate_up_elements);
+        uint8_t * down_fp8 = native_fp8
+            ? static_cast<uint8_t *>(down->data)
+            : down_quantized.alloc(down_elements);
+        float * gate_up_sfb = native_fp8
+            ? static_cast<float *>(gate_up_scale->data)
+            : gate_up_quantized_scales.alloc(gate_up_scale_elements);
+        float * down_sfb = native_fp8
+            ? static_cast<float *>(down_scale->data)
+            : down_quantized_scales.alloc(down_scale_elements);
+        ggml_cuda_pool_alloc<int32_t> all_experts(pool, n_groups);
+
+        CUDA_CHECK(cudaMemsetAsync(workspace.ptr, 0, mega_moe_workspace_bytes(), stream));
+        convert_f32_to_bf16<<<(input_elements + 255)/256, 256, 0, stream>>>(
+            static_cast<const float *>(x->data), input_bf16.ptr, input_elements);
+        CUDA_CHECK(cudaGetLastError());
+
+        if (!native_fp8) {
+            CUDA_CHECK(cudaMemsetAsync(all_experts.ptr, 1, n_groups*sizeof(int32_t), stream));
+            quantize_weights<<<gate_up_scale_elements, 256, 0, stream>>>(
+                reinterpret_cast<const __nv_bfloat16 *>(gate_up->data),
+                all_experts.ptr, gate_up_fp8, gate_up_sfb, gate_up_n, n_embd);
+            quantize_weights<<<down_scale_elements, 256, 0, stream>>>(
+                reinterpret_cast<const __nv_bfloat16 *>(down->data),
+                all_experts.ptr, down_fp8, down_sfb, n_embd, n_ff);
+            CUDA_CHECK(cudaGetLastError());
+        }
+
+        interleave_mega_moe_gate_up<<<(gate_up_elements + 255)/256, 256, 0, stream>>>(
+            gate_up_fp8, gate_up_interleaved.ptr, n_groups, n_ff, n_embd);
+        CUDA_CHECK(cudaGetLastError());
+        launch_deepgemm_mega_moe_16x256(
+            workspace.ptr, output_bf16.ptr, input_bf16.ptr,
+            static_cast<const int32_t *>(ids->data),
+            static_cast<const float *>(weights->data),
+            gate_up_interleaved.ptr, gate_up_sfb, down_fp8, down_sfb, stream);
+        convert_bf16_to_f32<<<(input_elements + 255)/256, 256, 0, stream>>>(
+            output_bf16.ptr, static_cast<float *>(dst->data), input_elements);
+        CUDA_CHECK(cudaGetLastError());
+
+        static bool mega_logged = false;
+        if (!mega_logged) {
+            GGML_LOG_INFO("%s: using DeepGEMM SM90 MegaMoE prototype (16 experts, I=256, M=1)\n", __func__);
+            mega_logged = true;
+        }
+        return true;
+    }
+#endif
 
     static bool logged = false;
     if (!logged) {

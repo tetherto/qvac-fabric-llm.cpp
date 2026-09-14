@@ -13,6 +13,7 @@
 #include <cstring>
 #include <map>
 #include <memory>
+#include <numeric>
 #include <set>
 #include <string>
 #include <tuple>
@@ -516,6 +517,36 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
         return true;
     };
 
+    auto split_states_same_ratio = [&](const ggml_backend_meta_split_state & a,
+                                       const ggml_backend_meta_split_state & b) -> bool {
+        std::vector<int64_t> sums_a(n_bufs, 0);
+        std::vector<int64_t> sums_b(n_bufs, 0);
+        int64_t total_a = 0;
+        int64_t total_b = 0;
+        for (size_t j = 0; j < n_bufs; ++j) {
+            for (size_t s = 0; s < a.n_segments; ++s) {
+                sums_a[j] += a.ne[s*n_bufs + j] * a.nr[s];
+            }
+            for (size_t s = 0; s < b.n_segments; ++s) {
+                sums_b[j] += b.ne[s*n_bufs + j] * b.nr[s];
+            }
+            total_a += sums_a[j];
+            total_b += sums_b[j];
+        }
+        if (total_a <= 0 || total_b <= 0) {
+            return total_a == total_b;
+        }
+
+        for (size_t j = 0; j < n_bufs; ++j) {
+            const int64_t gcd_a = std::gcd(sums_a[j], total_a);
+            const int64_t gcd_b = std::gcd(sums_b[j], total_b);
+            if (sums_a[j]/gcd_a != sums_b[j]/gcd_b || total_a/gcd_a != total_b/gcd_b) {
+                return false;
+            }
+        }
+        return true;
+    };
+
     auto handle_generic = [&](const std::vector<ggml_backend_meta_split_state> & src_ss, bool scalar_only) -> ggml_backend_meta_split_state {
         ggml_backend_meta_split_state ret = {GGML_BACKEND_SPLIT_AXIS_NONE, {0}, {1}, 1};
         for (size_t i = 0; i < GGML_MAX_SRC; i++) {
@@ -609,24 +640,30 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
     };
 
     auto handle_moe_ffn = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
-        GGML_ASSERT(src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_2);
-        GGML_ASSERT(src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_2);
-        GGML_ASSERT(split_states_equal(src_ss[0], src_ss[1]));
+        const bool expert_parallel = src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_2 &&
+                                     src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_2;
+        const bool tensor_parallel = src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_1 &&
+                                     src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_0;
+        GGML_ASSERT(expert_parallel || tensor_parallel);
+        GGML_ASSERT(expert_parallel ? split_states_equal(src_ss[0], src_ss[1]) :
+                                      split_states_same_ratio(src_ss[0], src_ss[1]));
         GGML_ASSERT(src_ss[2].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
         GGML_ASSERT(src_ss[3].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
         GGML_ASSERT(src_ss[4].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
 
         if (tensor->src[5] != nullptr) {
-            GGML_ASSERT(src_ss[5].axis == GGML_BACKEND_SPLIT_AXIS_2);
-            GGML_ASSERT(split_states_equal(src_ss[0], src_ss[5]));
+            GGML_ASSERT(src_ss[5].axis == src_ss[0].axis);
+            GGML_ASSERT(expert_parallel ? split_states_equal(src_ss[0], src_ss[5]) :
+                                          split_states_same_ratio(src_ss[0], src_ss[5]));
         }
         if (tensor->src[6] != nullptr) {
-            GGML_ASSERT(src_ss[6].axis == GGML_BACKEND_SPLIT_AXIS_2);
-            GGML_ASSERT(split_states_equal(src_ss[0], src_ss[6]));
+            GGML_ASSERT(src_ss[6].axis == src_ss[1].axis);
+            GGML_ASSERT(expert_parallel ? split_states_equal(src_ss[1], src_ss[6]) :
+                                          split_states_same_ratio(src_ss[1], src_ss[6]));
         }
 
-        // Each device produces the weighted sum of its local experts. The
-        // meta backend inserts exactly one reduction for the full hidden state.
+        // EP sums local experts; TP sums local FFN-width shards. In both cases
+        // the meta backend inserts exactly one reduction for the hidden state.
         return {assume_sync ? GGML_BACKEND_SPLIT_AXIS_MIRRORED : GGML_BACKEND_SPLIT_AXIS_PARTIAL, {0}, {1}, 1};
     };
 
@@ -1295,15 +1332,18 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_m
         if (t_ij->op == GGML_OP_MOE_FFN) {
             const ggml_backend_meta_split_state expert_ss =
                 ggml_backend_meta_get_split_state(tensor->src[0], /*assume_sync =*/ true);
-            GGML_ASSERT(expert_ss.axis == GGML_BACKEND_SPLIT_AXIS_2);
-
-            int32_t expert_offset = ggml_get_op_params_i32(tensor, 0);
-            for (size_t k = 0; k < j; ++k) {
-                for (size_t s = 0; s < expert_ss.n_segments; ++s) {
-                    expert_offset += expert_ss.ne[s*n_simple_bufs + k]*expert_ss.nr[s];
+            if (expert_ss.axis == GGML_BACKEND_SPLIT_AXIS_2) {
+                int32_t expert_offset = ggml_get_op_params_i32(tensor, 0);
+                for (size_t k = 0; k < j; ++k) {
+                    for (size_t s = 0; s < expert_ss.n_segments; ++s) {
+                        expert_offset += expert_ss.ne[s*n_simple_bufs + k]*expert_ss.nr[s];
+                    }
                 }
+                ggml_set_op_params_i32(t_ij, 0, expert_offset);
+            } else {
+                GGML_ASSERT(expert_ss.axis == GGML_BACKEND_SPLIT_AXIS_1);
+                GGML_ASSERT(ggml_get_op_params_i32(tensor, 0) == 0);
             }
-            ggml_set_op_params_i32(t_ij, 0, expert_offset);
         }
 
         simple_tensors.push_back(t_ij);

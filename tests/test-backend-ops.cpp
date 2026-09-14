@@ -10789,7 +10789,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // This is large enough to be useful only on an explicitly selected Hopper.
     if (getenv("GGML_TEST_DEEPGEMM_MOE_FFN")) {
         for (int64_t n_tokens : { 1, 2, 128 }) {
-            test_cases.emplace_back(new test_moe_ffn_deepgemm(n_tokens));
+            for (int64_t n_ff : { 256, 384, 640 }) {
+                test_cases.emplace_back(new test_moe_ffn_deepgemm(n_tokens, n_ff));
+            }
         }
     }
 
@@ -12345,6 +12347,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
                 }
             }
         }
+    }
+
+    // Full-op timing for the exact SM90 MegaMoE decode specialization.
+    if (getenv("GGML_TEST_DEEPGEMM_MOE_FFN")) {
+        test_cases.emplace_back(new test_moe_ffn_deepgemm(1, 256));
     }
 
     return test_cases;

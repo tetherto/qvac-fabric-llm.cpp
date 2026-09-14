@@ -556,26 +556,6 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
         }
 
         // FFN
-        // Keep each expert complete on one device only for the opt-in fused
-        // routed FFN. The regular MUL_MAT_ID graph requires the standard
-        // axis-1/axis-0 tensor-parallel layout handled below.
-        if (ud->model->arch == LLM_ARCH_QWEN4EXP &&
-                llama_env_flag_enabled("GGML_CUDA_DEEPGEMM_MOE_FFN")) {
-            if (std::regex_match(tensor_name, pattern_ffn_gate_up_weight) &&
-                    tensor->type == GGML_TYPE_F8_E4M3) {
-                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_2);
-            }
-            if (std::regex_match(tensor_name, pattern_ffn_down_weight) &&
-                    tensor->type == GGML_TYPE_F8_E4M3 &&
-                    tensor_name.find("_exps.") != std::string::npos) {
-                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_2);
-            }
-            if (std::regex_match(tensor_name, pattern_ffn_gate_up_scale) ||
-                    std::regex_match(tensor_name, pattern_ffn_down_scale)) {
-                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_2);
-            }
-        }
-
         if (std::regex_match(tensor_name, pattern_ffn_up_weight) || std::regex_match(tensor_name, pattern_ffn_gate_weight)) {
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "ffn_down.weight", "ffn_down_exps.weight");
         }
