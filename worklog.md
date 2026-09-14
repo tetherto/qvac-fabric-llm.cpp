@@ -441,6 +441,76 @@ not quantization and interleaving on every operator call. Open questions:
 Measure the actual `n_groups`/slot count from a real run before implementing
 this. `GGML_CUDA_DEEPGEMM_DEBUG=1` and the MoE-cache logs are available for that.
 
+## Chunked GDN and shared BF16 activation casts (2026-09-15)
+
+The warmed two-H100 FP8 PP2048 baseline was `7754.61 tok/s` (last four of
+five runs). Nsight showed repeated F32 -> BF16 activation staging before BF16
+cuBLAS GEMMs. Normalized to one captured execution, these conversions used
+1550 launches and 54.772 ms summed across both GPUs. The main redundant
+fan-outs were:
+
+- the `[10240, 2048]` normalized HC activation, consumed by both the down and
+  injection projections;
+- the `[2560, 2048]` recurrent-layer input, consumed by QKV, gate, beta, and
+  alpha projections.
+
+`src/models/qwen4exp.cpp` now materializes one BF16 graph tensor for each
+fan-out and shares it between those projections. The change is guarded on BF16
+weights and no active LoRA, so quantized weights, other model variants, and
+adapter behavior retain their previous paths.
+
+Using the generic contiguous `GGML_OP_CPY` cast initially regressed warmed
+PP2048 to `7690.72 tok/s`: its four-dimensional scalar copy kernel was about
+2.3x slower than the flat converter used by cuBLAS staging. The CUDA copy
+dispatcher now sends contiguous F32 -> BF16 casts through that lower-overhead
+flat converter and keeps the existing copy kernel for non-contiguous tensors.
+Focused contiguous and non-contiguous CPY tests both pass.
+
+With the fast explicit casts and recurrent GDN (`GGML_CUDA_GDN_CHUNKED=0`):
+
+```text
+samples: 5217.24, 8056.31, 8042.09, 8079.89, 8085.15 tok/s
+warmed last-four mean: 8065.86 tok/s
+gain over baseline: +4.01%
+```
+
+The first sample includes new CUDA graph capture and is excluded from the
+steady-state comparison. A confirming warmed Nsight sample measured
+`8092.4 tok/s`. Conversion work fell to 1526 launches and 41.157 ms per
+captured execution, a 24.9% time reduction from the normalized baseline. The
+old `cpy_scalar_contiguous<float, bf16>` kernel is absent from the winning
+trace.
+
+An opt-in FLA-style chunked GDN prefill specialization was also added for the
+Qwen4Exp scalar-gate shape (`K=1`, state size 128, at least 32 tokens) on
+Ampere-or-newer NVIDIA GPUs. It uses 32-token chunks, a block triangular
+inverse, WMMA for the lower-left solve, precomputed W/U, a register-resident
+FP32 state, and fused state/output production. Other shapes use the existing
+recurrent kernel. Enable it with:
+
+```bash
+GGML_CUDA_GDN_CHUNKED=2
+```
+
+Four focused GPU-6 correctness cases pass against the CPU reference: T64,
+T65, T256, and T127 with two sequences and repeated values. For the standalone
+H32/S128/T1024 shape, the recurrent kernel took 681.71 us and the chunked path
+took 661.20 us, about 3% faster.
+
+The chunked path is additive with the shared casts in the full model:
+
+```text
+samples: 7999.32, 8207.61, 8196.82, 8221.12, 8249.96 tok/s
+warmed last-four mean: 8218.88 tok/s
+gain over casts alone: +1.90%
+gain over original baseline: +5.99%
+```
+
+Exact end-to-end configuration: GPUs 6/7, FP8 GGUF, tensor split `1/1`,
+`-sm tensor`, `-p 2048 -n 0 -b 2048 -ub 2048`, PLE token-embedding weights
+on CPU, DeepGEMM `MUL_MAT_ID` enabled, and the experimental fused/MegaMoE
+paths disabled.
+
 ## Saved profiling artifacts
 
 SGLang:
@@ -457,6 +527,13 @@ llama.cpp:
 - `/tmp/qwen-q4-tg8-onegpu.nsys-rep`
 - `/tmp/qwen-q4-tg8-tensor.nsys-rep`
 - `/tmp/ggml-megamoe-one.nsys-rep` and `.sqlite`
+
+GDN and BF16-cast reports (durable remote copy):
+
+- `/home/aman/qwen4-exp-opt-bench-20260911/results/gdn-bf16-casts-20260915/`
+- `qwen4-gdn-chunked-fused-state-out.nsys-rep` and `.sqlite`
+- `qwen4-fp8-shared-bf16-casts.nsys-rep` and `.sqlite` (slow generic CPY)
+- `qwen4-fp8-shared-fast-bf16-casts.nsys-rep` and `.sqlite` (winning path)
 
 Fused-path reports/results:
 

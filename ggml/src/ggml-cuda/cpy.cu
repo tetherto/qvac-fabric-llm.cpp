@@ -1,4 +1,5 @@
 #include "cpy.cuh"
+#include "convert.cuh"
 #include "dequantize.cuh"
 #include "cpy-utils.cuh"
 #if defined(GGML_USE_MUSA) && defined(GGML_MUSA_MUDNN_COPY)
@@ -486,8 +487,13 @@ void ggml_cuda_cpy(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, gg
         }
     } else if (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_BF16) {
         if (contiguous_srcs) {
-            ggml_cpy_scalar_contiguous_cuda<float, nv_bfloat16>
-                (src0_ddc, src1_ddc, ne, main_stream);
+            // The generic CPY kernel computes four-dimensional offsets for
+            // every element. Contiguous casts need only a flat conversion and
+            // are substantially faster through the lower-overhead flat converter
+            // also used to stage cuBLAS inputs.
+            const to_bf16_cuda_t to_bf16 = ggml_get_to_bf16_cuda(GGML_TYPE_F32);
+            GGML_ASSERT(to_bf16 != nullptr);
+            to_bf16(src0_ddc, (nv_bfloat16 *) src1_ddc, ne, main_stream);
         } else {
             ggml_cpy_scalar_cuda<float, nv_bfloat16>
                 (src0_ddc, src1_ddc, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13, main_stream);

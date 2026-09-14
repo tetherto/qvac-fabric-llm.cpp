@@ -258,7 +258,18 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
     xn = ggml_reshape_2d(ctx0, xn, hc_dim, nt);
     cb(xn, "hc_norm", il);
 
-    ggml_tensor * lo = build_lora_mm(w_down, xn);
+    // The BF16 down and injection projections share this large activation.
+    // Materialize it once in the graph instead of making each cuBLAS call
+    // independently stage the same F32 tensor to BF16. Keep the F32 value for
+    // the elementwise HC path, and preserve LoRA behavior when adapters exist.
+    ggml_tensor * xn_mm = xn;
+    if (inject != nullptr && w_inject != nullptr && loras->empty() &&
+        w_down->type == GGML_TYPE_BF16 && w_inject->type == GGML_TYPE_BF16) {
+        xn_mm = ggml_cast(ctx0, xn, GGML_TYPE_BF16);
+        cb(xn_mm, "hc_norm_bf16", il);
+    }
+
+    ggml_tensor * lo = build_lora_mm(w_down, xn_mm);
     lo = ggml_silu(ctx0, ggml_scale(ctx0, lo, 1.0f / (float) hc));
     ggml_tensor * gate = build_lora_mm(w_up, lo);
     cb(gate, "hc_gate", il);
@@ -289,7 +300,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
     cb(mixed, "hc_mixed", il);
 
     if (inject) {
-        *inject = build_lora_mm(w_inject, xn);
+        *inject = build_lora_mm(w_inject, xn_mm);
         cb(*inject, "hc_inject", il);
     }
 
@@ -870,18 +881,30 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
     GGML_ASSERT(ubatch.n_tokens == n_seq_tokens * n_seqs);
     GGML_ASSERT(head_v_dim * num_v_heads == d_inner);
 
-    auto qkvz = build_qkvz(cur, il);
+    // QKV, z, beta, and alpha all use BF16 weights in the native FP8 model.
+    // Share one explicit cast so their GEMMs do not each stage `cur` from F32.
+    ggml_tensor * cur_mm = cur;
+    if (loras->empty() &&
+        model.layers[il].wqkv->type      == GGML_TYPE_BF16 &&
+        model.layers[il].wqkv_gate->type == GGML_TYPE_BF16 &&
+        model.layers[il].ssm_beta->type  == GGML_TYPE_BF16 &&
+        model.layers[il].ssm_alpha->type == GGML_TYPE_BF16) {
+        cur_mm = ggml_cast(ctx0, cur, GGML_TYPE_BF16);
+        cb(cur_mm, "linear_attn_input_bf16", il);
+    }
+
+    auto qkvz = build_qkvz(cur_mm, il);
     ggml_tensor * qkv_mixed = qkvz.first;
     ggml_tensor * z         = qkvz.second;
 
-    ggml_tensor * beta = build_lora_mm(model.layers[il].ssm_beta, cur, model.layers[il].ssm_beta_s);
+    ggml_tensor * beta = build_lora_mm(model.layers[il].ssm_beta, cur_mm, model.layers[il].ssm_beta_s);
     beta = ggml_reshape_4d(ctx0, beta, 1, num_v_heads, n_seq_tokens, n_seqs);
     cb(beta, "beta", il);
 
     beta = ggml_sigmoid(ctx0, beta);
     cb(beta, "beta_sigmoid", il);
 
-    ggml_tensor * alpha = build_lora_mm(model.layers[il].ssm_alpha, cur, model.layers[il].ssm_alpha_s);
+    ggml_tensor * alpha = build_lora_mm(model.layers[il].ssm_alpha, cur_mm, model.layers[il].ssm_alpha_s);
     alpha = ggml_reshape_3d(ctx0, alpha, num_v_heads, n_seq_tokens, n_seqs);
     cb(alpha, "alpha", il);
 
