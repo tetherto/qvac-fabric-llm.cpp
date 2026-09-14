@@ -1196,7 +1196,9 @@ static ggml_backend_buffer_t ggml_backend_alloc_ctx_tensors_from_buft_impl(
             this_size = GGML_PAD(ggml_backend_buft_get_alloc_size(buft, t), alignment);
         }
 
-        if (cur_buf_size > 0 && (cur_buf_size + this_size) > max_size) {
+        // Views need no allocation, but must remain in the range to be initialized,
+        // even when the preceding tensor exceeds the backend's preferred buffer size.
+        if (this_size > 0 && cur_buf_size > 0 && (cur_buf_size + this_size) > max_size) {
             // allocate tensors in the current buffer
             if (!no_alloc && !alloc_tensor_range(ctx, first, t, buft, cur_buf_size, &buffers, &n_buffers)) {
                 return NULL;
