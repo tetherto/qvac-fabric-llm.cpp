@@ -4654,6 +4654,8 @@ struct test_gated_delta_net : public test_case {
           v_repeat(v_repeat), permuted(permuted), kda(kda), K(K), check_grad(check_grad) {}
 
     bool   grad_precise() override { return true; }
+    // The FLA-style CUDA prefill specialization uses BF16 tensor-core inputs.
+    double max_nmse_err() override { return 1e-5; }
     double max_maa_err()  override { return 2e-2; }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
@@ -11860,6 +11862,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 100, 1));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 200, 1));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 127, 2));
+    // CUDA FLA-style chunked prefill specialization, including a partial chunk.
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128,  64, 1));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128,  65, 1));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 256, 1));
+    test_cases.emplace_back(new test_gated_delta_net(
+        GGML_TYPE_F32, 4, 128, 127, 2, /*v_repeat=*/2));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64,  64, 1, 1, false, true));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64,  33, 1, 1, false, true));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 100, 1, 1, false, true));

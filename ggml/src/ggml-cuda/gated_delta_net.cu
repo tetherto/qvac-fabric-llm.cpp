@@ -1,6 +1,632 @@
 #include "gated_delta_net.cuh"
 #include "ggml-cuda/common.cuh"
 
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+#include <mma.h>
+
+namespace wmma = nvcuda::wmma;
+
+// FLA-style WY chunking for the Qwen prefill shape. A block owns 32 value
+// columns for one (sequence, head), keeps that state tile resident, and advances
+// it 32 tokens at a time. BF16 tensor-core inputs with FP32 accumulation mirror
+// FLA's inference path while the original recurrent kernel remains the exact
+// fallback.
+static constexpr int GDN_CHUNK_S  = 128;
+static constexpr int GDN_CHUNK_BT = 32;
+static constexpr int GDN_CHUNK_BV = 32;
+static constexpr int GDN_CHUNK_THREADS = 256;
+
+struct __align__(16) gdn_wy_smem {
+    __nv_bfloat16 k[GDN_CHUNK_BT * GDN_CHUNK_S];
+    __nv_bfloat16 w[GDN_CHUNK_BT * GDN_CHUNK_S];
+    float w_f32[GDN_CHUNK_BT * GDN_CHUNK_S];
+    float a[GDN_CHUNK_BT * GDN_CHUNK_BT];
+    float ai_f32[GDN_CHUNK_BT * GDN_CHUNK_BT];
+    __nv_bfloat16 ai[GDN_CHUNK_BT * GDN_CHUNK_BT];
+    float gcum[GDN_CHUNK_BT];
+    float beta[GDN_CHUNK_BT];
+};
+
+__global__ void __launch_bounds__(GDN_CHUNK_THREADS, 2)
+gated_delta_net_chunked_wy_cuda(
+        const float * k,
+        const float * g,
+        const float * beta,
+        __nv_bfloat16 * w,
+        __nv_bfloat16 * ai,
+        int64_t H,
+        int64_t n_tokens,
+        int64_t n_chunks,
+        int64_t sq1,
+        int64_t sq2,
+        int64_t sq3,
+        int64_t sb1,
+        int64_t sb2,
+        int64_t sb3,
+        int64_t neqk1,
+        int64_t rq3) {
+#if defined(AMPERE_MMA_AVAILABLE)
+    __shared__ gdn_wy_smem sm;
+    const int tid      = threadIdx.x;
+    const int warp     = tid / WARP_SIZE;
+    const int chunk    = blockIdx.x;
+    const int h_idx    = blockIdx.y;
+    const int sequence = blockIdx.z;
+    const int token0   = chunk * GDN_CHUNK_BT;
+    const int chunk_len = min(GDN_CHUNK_BT, (int) n_tokens - token0);
+    const int iq1 = h_idx % neqk1;
+    const int iq3 = sequence / rq3;
+    const float * k_base = k + iq3 * sq3 + iq1 * sq1;
+    const float * g_base = g + sequence * sb3 + h_idx * sb1;
+    const float * b_base = beta + sequence * sb3 + h_idx * sb1;
+
+    for (int idx = tid; idx < GDN_CHUNK_BT * GDN_CHUNK_S; idx += GDN_CHUNK_THREADS) {
+        const int t = idx / GDN_CHUNK_S;
+        const int d = idx % GDN_CHUNK_S;
+        const float x = t < chunk_len ? k_base[(token0 + t) * sq2 + d] : 0.0f;
+        sm.k[idx] = __float2bfloat16_rn(x);
+    }
+    if (tid == 0) {
+        float sum = 0.0f;
+        for (int t = 0; t < GDN_CHUNK_BT; ++t) {
+            if (t < chunk_len) {
+                sum += g_base[(token0 + t) * sb2];
+                sm.beta[t] = b_base[(token0 + t) * sb2];
+            } else {
+                sm.beta[t] = 0.0f;
+            }
+            sm.gcum[t] = sum;
+        }
+    }
+    __syncthreads();
+
+    constexpr int token_tiles = GDN_CHUNK_BT / 16;
+    for (int tile = warp; tile < token_tiles * token_tiles; tile += GDN_CHUNK_THREADS / WARP_SIZE) {
+        const int tile_i = tile / token_tiles;
+        const int tile_j = tile % token_tiles;
+        wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc;
+        wmma::fill_fragment(acc, 0.0f);
+#pragma unroll
+        for (int d = 0; d < GDN_CHUNK_S; d += 16) {
+            wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::row_major> ma;
+            wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::col_major> mb;
+            wmma::load_matrix_sync(ma, sm.k + tile_i * 16 * GDN_CHUNK_S + d, GDN_CHUNK_S);
+            wmma::load_matrix_sync(mb, sm.k + tile_j * 16 * GDN_CHUNK_S + d, GDN_CHUNK_S);
+            wmma::mma_sync(acc, ma, mb, acc);
+        }
+        wmma::store_matrix_sync(
+            sm.a + tile_i * 16 * GDN_CHUNK_BT + tile_j * 16,
+            acc, GDN_CHUNK_BT, wmma::mem_row_major);
+    }
+    __syncthreads();
+    for (int idx = tid; idx < GDN_CHUNK_BT * GDN_CHUNK_BT; idx += GDN_CHUNK_THREADS) {
+        const int i = idx / GDN_CHUNK_BT;
+        const int j = idx % GDN_CHUNK_BT;
+        sm.a[idx] = (i < chunk_len && j < i)
+            ? sm.a[idx] * sm.beta[i] * expf(sm.gcum[i] - sm.gcum[j])
+            : 0.0f;
+    }
+    __syncthreads();
+    for (int idx = tid; idx < GDN_CHUNK_BT * GDN_CHUNK_S; idx += GDN_CHUNK_THREADS) {
+        const int t = idx / GDN_CHUNK_S;
+        sm.w[idx] = __float2bfloat16_rn(
+            __bfloat162float(sm.k[idx]) * sm.beta[t] * expf(sm.gcum[t]));
+    }
+    if (tid == 0) {
+        for (int idx = 0; idx < GDN_CHUNK_BT * GDN_CHUNK_BT; ++idx) {
+            sm.ai_f32[idx] = 0.0f;
+        }
+        // Invert the two diagonal 16x16 blocks independently. The remaining
+        // lower-left block is -I11*A10*I00 and is formed by the tensor cores
+        // below. This is the two-block specialization of FLA's block-WY solve.
+        for (int block = 0; block < 2; ++block) {
+            const int begin = block * 16;
+            const int end = min(begin + 16, chunk_len);
+            for (int i = begin; i < end; ++i) {
+                sm.ai_f32[i * GDN_CHUNK_BT + i] = 1.0f;
+                for (int j = begin; j < i; ++j) {
+                    float x = 0.0f;
+                    for (int l = j; l < i; ++l) {
+                        x += sm.a[i * GDN_CHUNK_BT + l] * sm.ai_f32[l * GDN_CHUNK_BT + j];
+                    }
+                    sm.ai_f32[i * GDN_CHUNK_BT + j] = -x;
+                }
+            }
+        }
+    }
+    __syncthreads();
+    for (int idx = tid; idx < GDN_CHUNK_BT * GDN_CHUNK_BT; idx += GDN_CHUNK_THREADS) {
+        sm.ai[idx] = __float2bfloat16_rn(sm.ai_f32[idx]);
+        // K is no longer needed after the weighted copy above, so reuse its
+        // first 32x32 elements as a BF16 view of A for the block products.
+        sm.k[idx] = __float2bfloat16_rn(sm.a[idx]);
+    }
+    __syncthreads();
+
+    if (warp == 0) {
+        wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc;
+        wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::row_major> ma;
+        wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::row_major> mb;
+        wmma::fill_fragment(acc, 0.0f);
+        wmma::load_matrix_sync(ma, sm.ai + 16 * GDN_CHUNK_BT + 16, GDN_CHUNK_BT);
+        wmma::load_matrix_sync(mb, sm.k + 16 * GDN_CHUNK_BT, GDN_CHUNK_BT);
+        wmma::mma_sync(acc, ma, mb, acc);
+        wmma::store_matrix_sync(sm.w_f32, acc, 16, wmma::mem_row_major);
+    }
+    __syncthreads();
+    for (int idx = tid; idx < 16 * 16; idx += GDN_CHUNK_THREADS) {
+        sm.k[GDN_CHUNK_BT * GDN_CHUNK_BT + idx] = __float2bfloat16_rn(sm.w_f32[idx]);
+    }
+    __syncthreads();
+    if (warp == 0) {
+        wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc;
+        wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::row_major> ma;
+        wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::row_major> mb;
+        wmma::fill_fragment(acc, 0.0f);
+        wmma::load_matrix_sync(ma, sm.k + GDN_CHUNK_BT * GDN_CHUNK_BT, 16);
+        wmma::load_matrix_sync(mb, sm.ai, GDN_CHUNK_BT);
+        wmma::mma_sync(acc, ma, mb, acc);
+        wmma::store_matrix_sync(sm.a, acc, 16, wmma::mem_row_major);
+    }
+    __syncthreads();
+    for (int idx = tid; idx < 16 * 16; idx += GDN_CHUNK_THREADS) {
+        const int i = idx / 16;
+        const int j = idx % 16;
+        sm.ai[(16 + i) * GDN_CHUNK_BT + j] = __float2bfloat16_rn(-sm.a[idx]);
+    }
+    __syncthreads();
+
+    constexpr int w_tiles = token_tiles * (GDN_CHUNK_S / 16);
+    for (int tile = warp; tile < w_tiles; tile += GDN_CHUNK_THREADS / WARP_SIZE) {
+        const int tile_i = tile / (GDN_CHUNK_S / 16);
+        const int tile_j = tile % (GDN_CHUNK_S / 16);
+        wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc;
+        wmma::fill_fragment(acc, 0.0f);
+#pragma unroll
+        for (int d = 0; d < GDN_CHUNK_BT; d += 16) {
+            wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::row_major> ma;
+            wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::row_major> mb;
+            wmma::load_matrix_sync(ma, sm.ai + tile_i * 16 * GDN_CHUNK_BT + d, GDN_CHUNK_BT);
+            wmma::load_matrix_sync(mb, sm.w + d * GDN_CHUNK_S + tile_j * 16, GDN_CHUNK_S);
+            wmma::mma_sync(acc, ma, mb, acc);
+        }
+        wmma::store_matrix_sync(
+            sm.w_f32 + tile_i * 16 * GDN_CHUNK_S + tile_j * 16,
+            acc, GDN_CHUNK_S, wmma::mem_row_major);
+    }
+    __syncthreads();
+
+    const size_t chunk_base =
+        (((size_t) sequence * H + h_idx) * n_chunks + chunk) * GDN_CHUNK_BT * GDN_CHUNK_S;
+    const size_t ai_base =
+        (((size_t) sequence * H + h_idx) * n_chunks + chunk) * GDN_CHUNK_BT * GDN_CHUNK_BT;
+    for (int idx = tid; idx < GDN_CHUNK_BT * GDN_CHUNK_S; idx += GDN_CHUNK_THREADS) {
+        w[chunk_base + idx] = __float2bfloat16_rn(sm.w_f32[idx]);
+    }
+    for (int idx = tid; idx < GDN_CHUNK_BT * GDN_CHUNK_BT; idx += GDN_CHUNK_THREADS) {
+        ai[ai_base + idx] = sm.ai[idx];
+    }
+#else
+    GGML_UNUSED_VARS(k, g, beta, w, ai, H, n_tokens, n_chunks, sq1, sq2, sq3,
+                     sb1, sb2, sb3, neqk1, rq3);
+#endif
+}
+
+struct __align__(16) gdn_u_smem {
+    __nv_bfloat16 v[GDN_CHUNK_BT * GDN_CHUNK_BV];
+    float out[GDN_CHUNK_BT * GDN_CHUNK_BV];
+};
+
+__global__ void __launch_bounds__(GDN_CHUNK_THREADS, 2)
+gated_delta_net_chunked_u_cuda(
+        const float * v,
+        const float * beta,
+        const __nv_bfloat16 * ai,
+        __nv_bfloat16 * u,
+        int64_t H,
+        int64_t n_tokens,
+        int64_t n_chunks,
+        int64_t sv1,
+        int64_t sv2,
+        int64_t sv3,
+        int64_t sb1,
+        int64_t sb2,
+        int64_t sb3) {
+#if defined(AMPERE_MMA_AVAILABLE)
+    __shared__ gdn_u_smem sm;
+    const int tid      = threadIdx.x;
+    const int warp     = tid / WARP_SIZE;
+    const int chunk    = blockIdx.x;
+    const int h_idx    = blockIdx.y;
+    const int sequence = blockIdx.z / (GDN_CHUNK_S / GDN_CHUNK_BV);
+    const int v_tile   = blockIdx.z % (GDN_CHUNK_S / GDN_CHUNK_BV);
+    const int col_base = v_tile * GDN_CHUNK_BV;
+    const int token0   = chunk * GDN_CHUNK_BT;
+    const int chunk_len = min(GDN_CHUNK_BT, (int) n_tokens - token0);
+    const float * v_base = v + sequence * sv3 + h_idx * sv1;
+    const float * b_base = beta + sequence * sb3 + h_idx * sb1;
+
+    for (int idx = tid; idx < GDN_CHUNK_BT * GDN_CHUNK_BV; idx += GDN_CHUNK_THREADS) {
+        const int t = idx / GDN_CHUNK_BV;
+        const int c = idx % GDN_CHUNK_BV + col_base;
+        const float x = t < chunk_len
+            ? v_base[(token0 + t) * sv2 + c] * b_base[(token0 + t) * sb2]
+            : 0.0f;
+        sm.v[idx] = __float2bfloat16_rn(x);
+    }
+    __syncthreads();
+
+    const size_t ai_base =
+        (((size_t) sequence * H + h_idx) * n_chunks + chunk) * GDN_CHUNK_BT * GDN_CHUNK_BT;
+    constexpr int u_tiles = (GDN_CHUNK_BT / 16) * (GDN_CHUNK_BV / 16);
+    for (int tile = warp; tile < u_tiles; tile += GDN_CHUNK_THREADS / WARP_SIZE) {
+        const int tile_i = tile / (GDN_CHUNK_BV / 16);
+        const int tile_j = tile % (GDN_CHUNK_BV / 16);
+        wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc;
+        wmma::fill_fragment(acc, 0.0f);
+#pragma unroll
+        for (int d = 0; d < GDN_CHUNK_BT; d += 16) {
+            wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::row_major> ma;
+            wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::row_major> mb;
+            wmma::load_matrix_sync(ma, ai + ai_base + tile_i * 16 * GDN_CHUNK_BT + d, GDN_CHUNK_BT);
+            wmma::load_matrix_sync(mb, sm.v + d * GDN_CHUNK_BV + tile_j * 16, GDN_CHUNK_BV);
+            wmma::mma_sync(acc, ma, mb, acc);
+        }
+        wmma::store_matrix_sync(
+            sm.out + tile_i * 16 * GDN_CHUNK_BV + tile_j * 16,
+            acc, GDN_CHUNK_BV, wmma::mem_row_major);
+    }
+    __syncthreads();
+
+    const size_t chunk_base =
+        (((size_t) sequence * H + h_idx) * n_chunks + chunk) * GDN_CHUNK_BT * GDN_CHUNK_S;
+    for (int idx = tid; idx < GDN_CHUNK_BT * GDN_CHUNK_BV; idx += GDN_CHUNK_THREADS) {
+        const int t = idx / GDN_CHUNK_BV;
+        const int c = idx % GDN_CHUNK_BV + col_base;
+        u[chunk_base + t * GDN_CHUNK_S + c] = __float2bfloat16_rn(sm.out[idx]);
+    }
+#else
+    GGML_UNUSED_VARS(v, beta, ai, u, H, n_tokens, n_chunks, sv1, sv2, sv3, sb1, sb2, sb3);
+#endif
+}
+
+struct __align__(16) gdn_state_smem {
+    union {
+        float state_f32[GDN_CHUNK_S * GDN_CHUNK_BV];
+        __nv_bfloat16 q[GDN_CHUNK_BT * GDN_CHUNK_S];
+    };
+    __nv_bfloat16 state_bf16[GDN_CHUNK_S * GDN_CHUNK_BV];
+    __nv_bfloat16 r[GDN_CHUNK_BT * GDN_CHUNK_BV];
+    __nv_bfloat16 ks[GDN_CHUNK_BT * GDN_CHUNK_S];
+    float tmp[GDN_CHUNK_BT * GDN_CHUNK_BV];
+    float qk[GDN_CHUNK_BT * GDN_CHUNK_BT];
+    float gcum[GDN_CHUNK_BT];
+};
+
+__global__ void __launch_bounds__(GDN_CHUNK_THREADS, 1)
+gated_delta_net_chunked_state_cuda(
+        const float * q,
+        const float * k,
+        const float * g,
+        const float * curr_state,
+        const __nv_bfloat16 * w,
+        __nv_bfloat16 * r,
+        float * dst,
+        float * state,
+        int64_t H,
+        int64_t n_tokens,
+        int64_t n_chunks,
+        int64_t sq1,
+        int64_t sq2,
+        int64_t sq3,
+        int64_t sb1,
+        int64_t sb2,
+        int64_t sb3,
+        int64_t neqk1,
+        int64_t rq3,
+        float scale) {
+#if defined(AMPERE_MMA_AVAILABLE)
+    __shared__ gdn_state_smem sm;
+    const int tid      = threadIdx.x;
+    const int warp     = tid / WARP_SIZE;
+    const int h_idx    = blockIdx.x;
+    const int sequence = blockIdx.y;
+    const int v_tile   = blockIdx.z;
+    const int col_base = v_tile * GDN_CHUNK_BV;
+    const int iq1 = h_idx % neqk1;
+    const int iq3 = sequence / rq3;
+    const float * q_base = q + iq3 * sq3 + iq1 * sq1;
+    const float * k_base = k + iq3 * sq3 + iq1 * sq1;
+    const float * g_base = g + sequence * sb3 + h_idx * sb1;
+    const int64_t state_offset = (sequence * H + h_idx) * GDN_CHUNK_S * GDN_CHUNK_S;
+    curr_state += state_offset;
+    state      += state_offset;
+
+    for (int idx = tid; idx < GDN_CHUNK_S * GDN_CHUNK_BV; idx += GDN_CHUNK_THREADS) {
+        const int row = idx / GDN_CHUNK_BV;
+        const int col = idx % GDN_CHUNK_BV + col_base;
+        const float x = curr_state[col * GDN_CHUNK_S + row];
+        sm.state_f32[idx] = x;
+    }
+    __syncthreads();
+
+    // Each warp owns two 16x16 tiles of the 128x32 state. Keep their FP32
+    // accumulators live across the chunk recurrence, as FLA does, instead of
+    // round-tripping the state through shared memory after every update.
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> state_acc[2];
+#pragma unroll
+    for (int slot = 0; slot < 2; ++slot) {
+        const int tile = warp + slot * (GDN_CHUNK_THREADS / WARP_SIZE);
+        const int tile_i = tile / (GDN_CHUNK_BV / 16);
+        const int tile_j = tile % (GDN_CHUNK_BV / 16);
+        wmma::load_matrix_sync(
+            state_acc[slot], sm.state_f32 + tile_i * 16 * GDN_CHUNK_BV + tile_j * 16,
+            GDN_CHUNK_BV, wmma::mem_row_major);
+    }
+
+    for (int chunk = 0; chunk < n_chunks; ++chunk) {
+        const int token0 = chunk * GDN_CHUNK_BT;
+        const int chunk_len = min(GDN_CHUNK_BT, (int) n_tokens - token0);
+        const size_t chunk_base =
+            (((size_t) sequence * H + h_idx) * n_chunks + chunk) * GDN_CHUNK_BT * GDN_CHUNK_S;
+
+        // Materialize the register state only for the BF16 snapshot consumed
+        // by W*H and by the output kernel.
+#pragma unroll
+        for (int slot = 0; slot < 2; ++slot) {
+            const int tile = warp + slot * (GDN_CHUNK_THREADS / WARP_SIZE);
+            const int tile_i = tile / (GDN_CHUNK_BV / 16);
+            const int tile_j = tile % (GDN_CHUNK_BV / 16);
+            wmma::store_matrix_sync(
+                sm.state_f32 + tile_i * 16 * GDN_CHUNK_BV + tile_j * 16,
+                state_acc[slot], GDN_CHUNK_BV, wmma::mem_row_major);
+        }
+        __syncthreads();
+        for (int idx = tid; idx < GDN_CHUNK_S * GDN_CHUNK_BV; idx += GDN_CHUNK_THREADS) {
+            const __nv_bfloat16 x = __float2bfloat16_rn(sm.state_f32[idx]);
+            sm.state_bf16[idx] = x;
+        }
+        __syncthreads();
+        constexpr int r_tiles = (GDN_CHUNK_BT / 16) * (GDN_CHUNK_BV / 16);
+        if (warp < r_tiles) {
+            const int tile_i = warp / (GDN_CHUNK_BV / 16);
+            const int tile_j = warp % (GDN_CHUNK_BV / 16);
+            wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc;
+            wmma::fill_fragment(acc, 0.0f);
+#pragma unroll
+            for (int d = 0; d < GDN_CHUNK_S; d += 16) {
+                wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::row_major> ma;
+                wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::row_major> mb;
+                wmma::load_matrix_sync(
+                    ma, w + chunk_base + tile_i * 16 * GDN_CHUNK_S + d, GDN_CHUNK_S);
+                wmma::load_matrix_sync(
+                    mb, sm.state_bf16 + d * GDN_CHUNK_BV + tile_j * 16, GDN_CHUNK_BV);
+                wmma::mma_sync(acc, ma, mb, acc);
+            }
+            wmma::store_matrix_sync(
+                sm.tmp + tile_i * 16 * GDN_CHUNK_BV + tile_j * 16,
+                acc, GDN_CHUNK_BV, wmma::mem_row_major);
+        }
+        __syncthreads();
+        for (int idx = tid; idx < GDN_CHUNK_BT * GDN_CHUNK_BV; idx += GDN_CHUNK_THREADS) {
+            const int t = idx / GDN_CHUNK_BV;
+            const int c = idx % GDN_CHUNK_BV + col_base;
+            const float x = __bfloat162float(r[chunk_base + t * GDN_CHUNK_S + c]) - sm.tmp[idx];
+            sm.r[idx] = __float2bfloat16_rn(x);
+            r[chunk_base + t * GDN_CHUNK_S + c] = sm.r[idx];
+        }
+        if (tid == 0) {
+            float sum = 0.0f;
+            for (int t = 0; t < GDN_CHUNK_BT; ++t) {
+                if (t < chunk_len) {
+                    sum += g_base[(token0 + t) * sb2];
+                }
+                sm.gcum[t] = sum;
+            }
+        }
+        __syncthreads();
+
+        // Produce this chunk's output while H_start and R are resident. The
+        // state_f32/q union is safe here because the state lives in WMMA
+        // accumulator registers until the next chunk boundary.
+        for (int idx = tid; idx < GDN_CHUNK_BT * GDN_CHUNK_S; idx += GDN_CHUNK_THREADS) {
+            const int t = idx / GDN_CHUNK_S;
+            const int d = idx % GDN_CHUNK_S;
+            sm.q[idx] = __float2bfloat16_rn(
+                t < chunk_len ? q_base[(token0 + t) * sq2 + d] : 0.0f);
+            sm.ks[idx] = __float2bfloat16_rn(
+                t < chunk_len ? k_base[(token0 + t) * sq2 + d] : 0.0f);
+        }
+        __syncthreads();
+        constexpr int out_tiles = (GDN_CHUNK_BT / 16) * (GDN_CHUNK_BV / 16);
+        if (warp < out_tiles) {
+            const int tile_i = warp / (GDN_CHUNK_BV / 16);
+            const int tile_j = warp % (GDN_CHUNK_BV / 16);
+            wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc;
+            wmma::fill_fragment(acc, 0.0f);
+#pragma unroll
+            for (int d = 0; d < GDN_CHUNK_S; d += 16) {
+                wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::row_major> ma;
+                wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::row_major> mb;
+                wmma::load_matrix_sync(
+                    ma, sm.q + tile_i * 16 * GDN_CHUNK_S + d, GDN_CHUNK_S);
+                wmma::load_matrix_sync(
+                    mb, sm.state_bf16 + d * GDN_CHUNK_BV + tile_j * 16, GDN_CHUNK_BV);
+                wmma::mma_sync(acc, ma, mb, acc);
+            }
+            wmma::store_matrix_sync(
+                sm.tmp + tile_i * 16 * GDN_CHUNK_BV + tile_j * 16,
+                acc, GDN_CHUNK_BV, wmma::mem_row_major);
+        } else {
+            const int tile = warp - out_tiles;
+            const int tile_i = tile / (GDN_CHUNK_BT / 16);
+            const int tile_j = tile % (GDN_CHUNK_BT / 16);
+            wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc;
+            wmma::fill_fragment(acc, 0.0f);
+#pragma unroll
+            for (int d = 0; d < GDN_CHUNK_S; d += 16) {
+                wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::row_major> ma;
+                wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::col_major> mb;
+                wmma::load_matrix_sync(
+                    ma, sm.q + tile_i * 16 * GDN_CHUNK_S + d, GDN_CHUNK_S);
+                wmma::load_matrix_sync(
+                    mb, sm.ks + tile_j * 16 * GDN_CHUNK_S + d, GDN_CHUNK_S);
+                wmma::mma_sync(acc, ma, mb, acc);
+            }
+            wmma::store_matrix_sync(
+                sm.qk + tile_i * 16 * GDN_CHUNK_BT + tile_j * 16,
+                acc, GDN_CHUNK_BT, wmma::mem_row_major);
+        }
+        __syncthreads();
+        for (int idx = tid; idx < GDN_CHUNK_BT * GDN_CHUNK_BV; idx += GDN_CHUNK_THREADS) {
+            sm.tmp[idx] *= expf(sm.gcum[idx / GDN_CHUNK_BV]);
+        }
+        for (int idx = tid; idx < GDN_CHUNK_BT * GDN_CHUNK_BT; idx += GDN_CHUNK_THREADS) {
+            const int i = idx / GDN_CHUNK_BT;
+            const int j = idx % GDN_CHUNK_BT;
+            const float x = (i < chunk_len && j <= i)
+                ? sm.qk[idx] * expf(sm.gcum[i] - sm.gcum[j])
+                : 0.0f;
+            sm.ks[idx] = __float2bfloat16_rn(x);
+        }
+        __syncthreads();
+        if (warp < out_tiles) {
+            const int tile_i = warp / (GDN_CHUNK_BV / 16);
+            const int tile_j = warp % (GDN_CHUNK_BV / 16);
+            wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc;
+            wmma::load_matrix_sync(
+                acc, sm.tmp + tile_i * 16 * GDN_CHUNK_BV + tile_j * 16,
+                GDN_CHUNK_BV, wmma::mem_row_major);
+#pragma unroll
+            for (int d = 0; d < GDN_CHUNK_BT; d += 16) {
+                wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::row_major> ma;
+                wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::row_major> mb;
+                wmma::load_matrix_sync(
+                    ma, sm.ks + tile_i * 16 * GDN_CHUNK_BT + d, GDN_CHUNK_BT);
+                wmma::load_matrix_sync(
+                    mb, sm.r + d * GDN_CHUNK_BV + tile_j * 16, GDN_CHUNK_BV);
+                wmma::mma_sync(acc, ma, mb, acc);
+            }
+            wmma::store_matrix_sync(
+                sm.tmp + tile_i * 16 * GDN_CHUNK_BV + tile_j * 16,
+                acc, GDN_CHUNK_BV, wmma::mem_row_major);
+        }
+        __syncthreads();
+        for (int idx = tid; idx < chunk_len * GDN_CHUNK_BV; idx += GDN_CHUNK_THREADS) {
+            const int t = idx / GDN_CHUNK_BV;
+            const int c = idx % GDN_CHUNK_BV + col_base;
+            dst[((size_t) sequence * n_tokens + token0 + t) * H * GDN_CHUNK_S +
+                h_idx * GDN_CHUNK_S + c] = sm.tmp[idx] * scale;
+        }
+
+        const float decay = expf(sm.gcum[chunk_len - 1]);
+#pragma unroll
+        for (int slot = 0; slot < 2; ++slot) {
+#pragma unroll
+            for (int e = 0; e < state_acc[slot].num_elements; ++e) {
+                state_acc[slot].x[e] *= decay;
+            }
+        }
+        for (int idx = tid; idx < GDN_CHUNK_BT * GDN_CHUNK_S; idx += GDN_CHUNK_THREADS) {
+            const int t = idx / GDN_CHUNK_S;
+            const int d = idx % GDN_CHUNK_S;
+            const float x = t < chunk_len
+                ? k_base[(token0 + t) * sq2 + d] * expf(sm.gcum[chunk_len - 1] - sm.gcum[t])
+                : 0.0f;
+            sm.ks[idx] = __float2bfloat16_rn(x);
+        }
+        __syncthreads();
+        // Update the two resident state tiles directly; no shared-memory spill
+        // or BF16 reconversion is needed before the next chunk.
+#pragma unroll
+        for (int slot = 0; slot < 2; ++slot) {
+            const int tile = warp + slot * (GDN_CHUNK_THREADS / WARP_SIZE);
+            const int tile_i = tile / (GDN_CHUNK_BV / 16);
+            const int tile_j = tile % (GDN_CHUNK_BV / 16);
+#pragma unroll
+            for (int d = 0; d < GDN_CHUNK_BT; d += 16) {
+                wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::col_major> ma;
+                wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::row_major> mb;
+                wmma::load_matrix_sync(
+                    ma, sm.ks + d * GDN_CHUNK_S + tile_i * 16, GDN_CHUNK_S);
+                wmma::load_matrix_sync(
+                    mb, sm.r + d * GDN_CHUNK_BV + tile_j * 16, GDN_CHUNK_BV);
+                wmma::mma_sync(state_acc[slot], ma, mb, state_acc[slot]);
+            }
+        }
+    }
+    // Store the final FP32 state in GGML's transposed cache layout.
+#pragma unroll
+    for (int slot = 0; slot < 2; ++slot) {
+        const int tile = warp + slot * (GDN_CHUNK_THREADS / WARP_SIZE);
+        const int tile_i = tile / (GDN_CHUNK_BV / 16);
+        const int tile_j = tile % (GDN_CHUNK_BV / 16);
+        wmma::store_matrix_sync(
+            sm.state_f32 + tile_i * 16 * GDN_CHUNK_BV + tile_j * 16,
+            state_acc[slot], GDN_CHUNK_BV, wmma::mem_row_major);
+    }
+    __syncthreads();
+    for (int idx = tid; idx < GDN_CHUNK_S * GDN_CHUNK_BV; idx += GDN_CHUNK_THREADS) {
+        const int row = idx / GDN_CHUNK_BV;
+        const int col = idx % GDN_CHUNK_BV + col_base;
+        state[col * GDN_CHUNK_S + row] = sm.state_f32[idx];
+    }
+#else
+    GGML_UNUSED_VARS(q, k, g, curr_state, w, r, dst, state, H, n_tokens, n_chunks,
+                     sq1, sq2, sq3, sb1, sb2, sb3, neqk1, rq3, scale);
+#endif
+}
+
+static bool launch_gated_delta_net_chunked_parallel(
+        ggml_backend_cuda_context & ctx,
+        const float * q_d, const float * k_d, const float * v_d,
+        const float * g_d, const float * b_d, const float * s_d,
+        float * dst_d, float * state_d,
+        int64_t S_v, int64_t H, int64_t n_tokens, int64_t n_seqs,
+        int64_t sq1, int64_t sq2, int64_t sq3,
+        int64_t sv1, int64_t sv2, int64_t sv3,
+        int64_t sb1, int64_t sb2, int64_t sb3,
+        int64_t neqk1, int64_t rq3, float scale, cudaStream_t stream) {
+    static const int mode = [] {
+        const char * value = std::getenv("GGML_CUDA_GDN_CHUNKED");
+        return value != nullptr ? std::atoi(value) : 0;
+    }();
+    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    if (mode != 2 || S_v != GDN_CHUNK_S || n_tokens < GDN_CHUNK_BT ||
+        !GGML_CUDA_CC_IS_NVIDIA(cc) || ggml_cuda_highest_compiled_arch(cc) < GGML_CUDA_CC_AMPERE) {
+        return false;
+    }
+
+    const int64_t n_chunks = (n_tokens + GDN_CHUNK_BT - 1) / GDN_CHUNK_BT;
+    const size_t chunk_elements = (size_t) n_seqs * H * n_chunks * GDN_CHUNK_BT * GDN_CHUNK_S;
+    const size_t ai_elements = (size_t) n_seqs * H * n_chunks * GDN_CHUNK_BT * GDN_CHUNK_BT;
+    ggml_cuda_pool_alloc<__nv_bfloat16> w_buf(ctx.pool(), chunk_elements);
+    ggml_cuda_pool_alloc<__nv_bfloat16> r_buf(ctx.pool(), chunk_elements);
+    ggml_cuda_pool_alloc<__nv_bfloat16> ai_buf(ctx.pool(), ai_elements);
+
+    ggml_cuda_kernel_launch_params wy_params(
+        dim3(n_chunks, H, n_seqs), dim3(GDN_CHUNK_THREADS, 1, 1), 0, stream);
+    ggml_cuda_kernel_launch(gated_delta_net_chunked_wy_cuda, wy_params,
+        k_d, g_d, b_d, w_buf.get(), ai_buf.get(), H, n_tokens, n_chunks,
+        sq1, sq2, sq3, sb1, sb2, sb3, neqk1, rq3);
+
+    ggml_cuda_kernel_launch_params u_params(
+        dim3(n_chunks, H, n_seqs * (GDN_CHUNK_S / GDN_CHUNK_BV)),
+        dim3(GDN_CHUNK_THREADS, 1, 1), 0, stream);
+    ggml_cuda_kernel_launch(gated_delta_net_chunked_u_cuda, u_params,
+        v_d, b_d, ai_buf.get(), r_buf.get(), H, n_tokens, n_chunks,
+        sv1, sv2, sv3, sb1, sb2, sb3);
+
+    ggml_cuda_kernel_launch_params state_params(
+        dim3(H, n_seqs, GDN_CHUNK_S / GDN_CHUNK_BV), dim3(GDN_CHUNK_THREADS, 1, 1), 0, stream);
+    ggml_cuda_kernel_launch(gated_delta_net_chunked_state_cuda, state_params,
+        q_d, k_d, g_d, s_d, w_buf.get(), r_buf.get(), dst_d, state_d,
+        H, n_tokens, n_chunks, sq1, sq2, sq3, sb1, sb2, sb3, neqk1, rq3, scale);
+    return true;
+}
+
+#endif
+
 template <int S_v, bool KDA, bool keep_rs_t>
 __global__ void __launch_bounds__((ggml_cuda_get_physical_warp_size() < S_v ? ggml_cuda_get_physical_warp_size() : S_v) * 4, 2)
 gated_delta_net_cuda(const float * q,
@@ -293,6 +919,17 @@ static void ggml_cuda_op_gated_delta_net_impl(
         state_d           = cache->data;
         state_slot_stride = cache->slot_stride;
     }
+
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    if (!kda && !keep_rs &&
+        launch_gated_delta_net_chunked_parallel(
+            ctx, q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d,
+            S_v, H, n_tokens, n_seqs,
+            sq1, sq2, sq3, sv1, sv2, sv3, sb1, sb2, sb3,
+            neqk1, rq3, scale, stream)) {
+        return;
+    }
+#endif
 
     if (kda) {
         if (keep_rs) {
