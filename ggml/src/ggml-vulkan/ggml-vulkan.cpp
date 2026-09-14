@@ -13227,7 +13227,7 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
         }
         return nullptr;
     case GGML_OP_DSV4_HC_PRE:
-        if (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
+        if (src2 == nullptr && src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
             return ctx->device->pipeline_dsv4_hc_pre_f32;
         }
         return nullptr;
@@ -13769,7 +13769,7 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
         }
         return nullptr;
     case GGML_OP_SSM_CONV:
-        if (src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
+        if (src2 == nullptr && src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
             switch (ctx->num_additional_fused_ops) {
                 case 0:  return ctx->device->pipeline_ssm_conv_f32;
                 case 1:  return ctx->device->pipeline_ssm_conv_silu_f32;
@@ -21600,7 +21600,8 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                    groups_x <= device->properties.limits.maxComputeWorkGroupCount[0];
         }
         case GGML_OP_DSV4_HC_PRE:
-            return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
+            return op->src[2] == nullptr &&
+                   op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
                    op->type == GGML_TYPE_F32 && op->src[0]->ne[1] > 0 && op->src[0]->ne[3] == 1 &&
                    ggml_get_op_params_i32(op, 1) == 0 &&
                    op->src[1]->ne[0] == op->src[0]->ne[1] &&
@@ -21823,7 +21824,7 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                 return true;
             }
         case GGML_OP_SSM_CONV:
-            return op->src[0]->type == GGML_TYPE_F32;
+            return op->src[2] == nullptr && op->src[0]->type == GGML_TYPE_F32;
         case GGML_OP_SSM_CONV_BACK_SX:
         case GGML_OP_SSM_CONV_BACK_C:
             return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32;
@@ -22480,7 +22481,15 @@ static void ggml_vk_check_results_0(ggml_backend_vk_context * ctx, ggml_cgraph *
                 ggml_ctx, src_clone[0], src_clone[1], src_clone[2],
                 ggml_get_op_params_f32(tensor, 0), ggml_get_op_params_i32(tensor, 1));
         } else if (tensor->op == GGML_OP_DSV4_HC_PRE) {
-            tensor_clone = ggml_dsv4_hc_pre(ggml_ctx, src_clone[0], src_clone[1]);
+            if (src_clone[2] != nullptr) {
+                tensor_clone = ggml_dsv4_hc_pre_gated_inject(
+                    ggml_ctx, src_clone[0], src_clone[1], src_clone[2], ggml_get_op_params_f32(tensor, 0));
+            } else if (ggml_get_op_params_i32(tensor, 1) != 0) {
+                tensor_clone = ggml_dsv4_hc_pre_gated(
+                    ggml_ctx, src_clone[0], src_clone[1], ggml_get_op_params_f32(tensor, 0));
+            } else {
+                tensor_clone = ggml_dsv4_hc_pre(ggml_ctx, src_clone[0], src_clone[1]);
+            }
         } else if (tensor->op == GGML_OP_DSV4_HC_POST) {
             tensor_clone = ggml_dsv4_hc_post(ggml_ctx, src_clone[0], src_clone[1], src_clone[2], src_clone[3]);
         } else if (tensor->op == GGML_OP_SUB) {
@@ -22844,7 +22853,9 @@ static void ggml_vk_check_results_0(ggml_backend_vk_context * ctx, ggml_cgraph *
             tensor_clone = ggml_ssm_scan(ggml_ctx, src_clone[0], src_clone[1], src_clone[2],
                                          src_clone[3], src_clone[4], src_clone[5], src_clone[6], K);
         } else if (tensor->op == GGML_OP_SSM_CONV) {
-            tensor_clone = ggml_ssm_conv(ggml_ctx, src_clone[0], src_clone[1]);
+            tensor_clone = src_clone[2] != nullptr
+                ? ggml_ssm_conv_ext(ggml_ctx, src_clone[0], src_clone[2], src_clone[1])
+                : ggml_ssm_conv(ggml_ctx, src_clone[0], src_clone[1]);
         } else if (tensor->op == GGML_OP_SSM_CONV_BACK_SX) {
             tensor_clone = ggml_ssm_conv_back_sx(ggml_ctx, src_clone[0], src_clone[1], tensor);
         } else if (tensor->op == GGML_OP_SSM_CONV_BACK_C) {

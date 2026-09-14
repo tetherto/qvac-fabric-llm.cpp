@@ -2565,6 +2565,14 @@ extern "C" {
             struct ggml_tensor  * sx,
             struct ggml_tensor  * c);
 
+    // Causal convolution without materializing concat(state, transpose(x)).
+    // x: [d_inner, n_t, n_s], state: [d_conv - 1, d_inner, n_s].
+    GGML_API struct ggml_tensor * ggml_ssm_conv_ext(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * state,
+            struct ggml_tensor  * c);
+
     // Backward of ggml_ssm_conv w.r.t. `sx` (conv input).
     GGML_API struct ggml_tensor * ggml_ssm_conv_back_sx(
             struct ggml_context * ctx,
@@ -2776,6 +2784,16 @@ extern "C" {
             struct ggml_context * ctx,
             struct ggml_tensor  * x,
             struct ggml_tensor  * gate,
+            float                 scale);
+
+    // CUDA-oriented variant that also computes the four HC injection logits.
+    // w_inject: [n_embd*hc, hc]. The flat result contains a contiguous
+    // [n_embd, n_tokens] mixed tensor followed by [hc, n_tokens] injection.
+    GGML_API struct ggml_tensor * ggml_dsv4_hc_pre_gated_inject(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * gate,
+            struct ggml_tensor  * w_inject,
             float                 scale);
 
     // hc_post: x [n_embd, n_tokens], residual [n_embd, hc, n_tokens],

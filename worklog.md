@@ -511,6 +511,68 @@ Exact end-to-end configuration: GPUs 6/7, FP8 GGUF, tensor split `1/1`,
 on CPU, DeepGEMM `MUL_MAT_ID` enabled, and the experimental fused/MegaMoE
 paths disabled.
 
+## HC injection and separate-state SSM convolution (2026-09-15)
+
+Two additional Qwen4Exp prefill experiments are now available behind opt-in
+environment flags.
+
+`GGML_CUDA_HC_INJECT=1` folds the four-output injection projection into
+`GGML_OP_DSV4_HC_PRE`. The extended op returns contiguous mixed-HC and
+injection regions from one CUDA launch, with BF16 and F32 injection-weight
+support. Two focused Hopper cases pass against the CPU implementation.
+
+This path is correct but neutral at PP2048:
+
+```text
+samples: 7740.98, 8029.11, 8123.16, 8132.62,
+         8178.19, 8215.24, 8225.53, 8213.89 tok/s
+warmed last-four mean: 8208.21 tok/s
+chunked-GDN baseline: 8218.88 tok/s
+delta: -0.13%
+```
+
+The profile explains why the projected 3% did not materialize. The fused
+scalar-reduction kernel used 20.419 ms summed across both GPUs. The original
+HC-pre kernel plus the small tensor-core injection GEMM used about 21.111 ms.
+That is only about 0.35 ms of critical-path saving per PP2048 execution. Keep
+this path disabled; a useful successor would need a tensor-core/cooperative
+projection rather than scalar dot products.
+
+`GGML_CUDA_SSM_CONV_SEPARATE_STATE=1` keeps recurrent history separate and
+teaches `GGML_OP_SSM_CONV` to consume channel-major `[channels, T, sequences]`
+activations directly. Qwen4Exp uses this only when the ubatch is long enough;
+decode and short-token graphs retain the old concat path. The cache update now
+materializes only the last three token columns. CPU, CUDA, tensor-split
+metadata, and non-CUDA support checks were updated. Focused short-token,
+long-token, and real 3328-channel fused-SiLU cases all pass on GPU 6 against
+the CPU reference, and the full `-sm tensor` model graph runs on GPUs 6/7.
+
+The first CUDA prototype removed concat but loaded the channel-major tensor in
+an uncoalesced order: convolution grew from 3.430 ms to 9.076 ms summed across
+both GPUs and warmed PP2048 was effectively neutral. Mapping one thread to one
+channel made each timestep load coalesced. The final profile is:
+
+```text
+                                      old path    final path
+concat_non_cont (both GPUs)            5.801 ms     0.275 ms
+ssm_conv (both GPUs)                   3.430 ms     2.136 ms
+remaining cache-tail transpose             --      0.359 ms
+concat launches                            74           2
+```
+
+The removed concat plus faster convolution saves about 3.4 ms of PP2048
+critical-path time, approximately 1.4% at the 249 ms baseline. End-to-end
+samples on the shared machine drifted between runs, but the repeatable warmed
+range with the final path was `8168-8340 tok/s`; one final run stabilized at
+`8339.58 tok/s`. The adjacent flag-off runs stabilized at `8048.35` and
+`7934.53 tok/s`, while the earlier clean baseline was `8218.88 tok/s`.
+Because the paired throughput is noisy, treat the profile-derived ~1.4% as the
+credible gain rather than the larger adjacent-run deltas.
+
+Exact benchmark configuration remained two H100s (physical GPUs 6/7), FP8
+GGUF, `-sm tensor -ts 1/1`, PP2048/ubatch2048, CPU-resident PLE embeddings,
+DeepGEMM `MUL_MAT_ID`, chunked GDN mode 2, and HC injection disabled.
+
 ## Saved profiling artifacts
 
 SGLang:
@@ -534,6 +596,14 @@ GDN and BF16-cast reports (durable remote copy):
 - `qwen4-gdn-chunked-fused-state-out.nsys-rep` and `.sqlite`
 - `qwen4-fp8-shared-bf16-casts.nsys-rep` and `.sqlite` (slow generic CPY)
 - `qwen4-fp8-shared-fast-bf16-casts.nsys-rep` and `.sqlite` (winning path)
+
+HC injection and separate-state SSM reports/results (durable remote copy):
+
+- `/home/aman/qwen4-exp-opt-bench-20260911/results/hc-ssm-fusions-20260915/`
+- `qwen4-hc-inject-fused.nsys-rep` and `.sqlite`
+- `ssm-separate-pp2048-profile.nsys-rep` and `.sqlite` (uncoalesced prototype)
+- `ssm-separate-coalesced-pp2048-profile.nsys-rep` and `.sqlite` (final kernel)
+- raw paired `*-pp2048-r8.jsonl` benchmark outputs
 
 Fused-path reports/results:
 

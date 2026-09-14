@@ -10318,13 +10318,14 @@ static void ggml_compute_forward_ssm_conv_f32(
         ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0]; // conv_x
     const ggml_tensor * src1 = dst->src[1]; // conv1d.weight
+    const ggml_tensor * state = dst->src[2]; // optional separate history
 
     const int ith = params->ith;
     const int nth = params->nth;
 
     const int nc  = src1->ne[0]; // d_conv
-    const int ncs = src0->ne[0]; // d_conv - 1 + n_t
-    const int nr  = src0->ne[1]; // d_inner
+    const int ncs = state ? 0 : src0->ne[0]; // d_conv - 1 + n_t
+    const int nr  = state ? src0->ne[0] : src0->ne[1]; // d_inner
     const int n_t =  dst->ne[1]; // tokens per sequence
     const int n_s =  dst->ne[2]; // number of sequences in the batch
 
@@ -10332,6 +10333,12 @@ static void ggml_compute_forward_ssm_conv_f32(
     GGML_ASSERT(src0->nb[0] == sizeof(float));
     GGML_ASSERT(src1->nb[0] == sizeof(float));
     GGML_ASSERT(src0->nb[1] == src0->ne[0]*sizeof(float));
+    if (state) {
+        GGML_ASSERT(state->type == GGML_TYPE_F32);
+        GGML_ASSERT(state->ne[0] == nc - 1 && state->ne[1] == nr && state->ne[2] == n_s);
+        GGML_ASSERT(state->nb[0] == sizeof(float));
+        GGML_ASSERT(state->nb[1] == state->ne[0]*sizeof(float));
+    }
 
     // rows per thread
     const int dr = (nr + nth - 1)/nth;
@@ -10343,11 +10350,12 @@ static void ggml_compute_forward_ssm_conv_f32(
 
     for (int i3 = 0; i3 < n_s; ++i3) {
         for (int i2 = 0; i2 < n_t; ++i2) {
-            // {d_conv - 1 + n_t, d_inner, n_seqs}
-            // sliding window
-            const float * s = (const float *) ((const char *) src0->data + ir0*(src0->nb[1]) + i2*(src0->nb[0]) + i3*(src0->nb[2])); // {d_conv, d_inner, n_s}
             const float * c = (const float *) ((const char *) src1->data + ir0*(src1->nb[1])); // {d_conv, d_inner}
             float * x = (float *) ((char *) dst->data + ir0*(dst->nb[0]) + i2*(dst->nb[1]) + i3*(dst->nb[2])); // {d_inner, n_t, n_s}
+
+            // {d_conv - 1 + n_t, d_inner, n_seqs} sliding window
+            const float * s = state ? nullptr : (const float *) ((const char *) src0->data +
+                    ir0*src0->nb[1] + i2*src0->nb[0] + i3*src0->nb[2]);
 
             // TODO: transpose the output for smaller strides for big batches?
             // d_inner
@@ -10358,7 +10366,20 @@ static void ggml_compute_forward_ssm_conv_f32(
 
                 // d_conv
                 for (int i0 = 0; i0 < nc; ++i0) {
-                    sumf += s[i0 + i1*ncs] * c[i0 + i1*nc];
+                    float xv;
+                    if (state) {
+                        const int pos = i2 + i0;
+                        if (pos < nc - 1) {
+                            xv = *(const float *) ((const char *) state->data +
+                                    pos*state->nb[0] + (ir0 + i1)*state->nb[1] + i3*state->nb[2]);
+                        } else {
+                            xv = *(const float *) ((const char *) src0->data +
+                                    (ir0 + i1)*src0->nb[0] + (pos - (nc - 1))*src0->nb[1] + i3*src0->nb[2]);
+                        }
+                    } else {
+                        xv = s[i0 + i1*ncs];
+                    }
+                    sumf += xv * c[i0 + i1*nc];
                 }
                 x[i1] = sumf;
             }
@@ -12224,6 +12245,7 @@ static void ggml_compute_forward_dsv4_hc_pre_f32(
         ggml_tensor * dst) {
     const ggml_tensor * x       = dst->src[0];
     const ggml_tensor * weights = dst->src[1];
+    const ggml_tensor * inject  = dst->src[2];
 
     GGML_ASSERT(x->type == GGML_TYPE_F32);
     GGML_ASSERT(weights->type == GGML_TYPE_F32);
@@ -12236,8 +12258,16 @@ static void ggml_compute_forward_dsv4_hc_pre_f32(
     const float scale = ggml_get_op_params_f32(dst, 0);
     const bool  gated = ggml_get_op_params_i32(dst, 1) != 0;
 
-    GGML_ASSERT(dst->ne[0] == n_embd);
-    GGML_ASSERT(dst->ne[1] == n_tokens);
+    if (inject) {
+        GGML_ASSERT(gated);
+        GGML_ASSERT(inject->type == GGML_TYPE_F32 || inject->type == GGML_TYPE_BF16);
+        GGML_ASSERT(inject->ne[0] == n_embd*hc && inject->ne[1] == hc);
+        GGML_ASSERT(ggml_is_contiguous(inject));
+        GGML_ASSERT(ggml_nelements(dst) == (n_embd + hc)*n_tokens);
+    } else {
+        GGML_ASSERT(dst->ne[0] == n_embd);
+        GGML_ASSERT(dst->ne[1] == n_tokens);
+    }
     if (gated) {
         GGML_ASSERT(weights->ne[0] == n_embd);
         GGML_ASSERT(weights->ne[1] == hc);
@@ -12276,7 +12306,34 @@ static void ggml_compute_forward_dsv4_hc_pre_f32(
             sum += xv * wv;
         }
 
-        *(float *) ((char *) dst->data + i0*nbd0 + it*nbd1) = scale * sum;
+        if (inject) {
+            ((float *) dst->data)[i0 + it*n_embd] = scale * sum;
+        } else {
+            *(float *) ((char *) dst->data + i0*nbd0 + it*nbd1) = scale * sum;
+        }
+    }
+
+    if (inject) {
+        float * inject_out = (float *) dst->data + n_embd*n_tokens;
+        const int64_t n_inject = hc*n_tokens;
+        const int64_t di = (n_inject + nth - 1) / nth;
+        const int64_t ii0 = di*ith;
+        const int64_t ii1 = MIN(ii0 + di, n_inject);
+
+        for (int64_t ii = ii0; ii < ii1; ++ii) {
+            const int64_t ih_out = ii % hc;
+            const int64_t it     = ii / hc;
+            float sum = 0.0f;
+            for (int64_t ih = 0; ih < hc; ++ih) {
+                for (int64_t i0 = 0; i0 < n_embd; ++i0) {
+                    const float xv = *(const float *) ((const char *) x->data +
+                            i0*nbx0 + ih*nbx1 + it*nbx2);
+                    const int64_t iw = i0 + n_embd*ih + n_embd*hc*ih_out;
+                    sum += xv * ggml_get_f32_1d(inject, (int) iw);
+                }
+            }
+            inject_out[ii] = sum;
+        }
     }
 }
 

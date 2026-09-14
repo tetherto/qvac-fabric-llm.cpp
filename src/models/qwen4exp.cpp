@@ -274,13 +274,36 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
     ggml_tensor * gate = build_lora_mm(w_up, lo);
     cb(gate, "hc_gate", il);
 
+    const bool fuse_inject = inject != nullptr && w_inject != nullptr &&
+        llama_env_flag_enabled("GGML_CUDA_HC_INJECT") &&
+        cparams.fused_dsv4_hc_pre && il >= 0 && hc == 4 &&
+        loras->empty() && w_inject->type == GGML_TYPE_BF16;
+
     ggml_tensor * mixed = nullptr;
     if (cparams.fused_dsv4_hc_pre && il >= 0) {
-        // sigmoid gate and mean over the streams in one op
-        mixed = ggml_dsv4_hc_pre_gated(ctx0,
-                ggml_reshape_3d(ctx0, xn,   n_embd, hc, nt),
-                ggml_reshape_3d(ctx0, gate, n_embd, hc, nt), 1.0f / (float) hc);
-        res->add_fused_node({LLM_FUSED_OP_DSV4_HC_PRE, mixed, il});
+        ggml_tensor * xn3   = ggml_reshape_3d(ctx0, xn,   n_embd, hc, nt);
+        ggml_tensor * gate3 = ggml_reshape_3d(ctx0, gate, n_embd, hc, nt);
+
+        if (fuse_inject) {
+            // One token block reads xn once for both the gated stream mean and
+            // the four injection dot products. Keep the two public results
+            // contiguous in separate regions of one packed op output.
+            ggml_tensor * packed = ggml_dsv4_hc_pre_gated_inject(
+                    ctx0, xn3, gate3, w_inject, 1.0f / (float) hc);
+            cb(packed, "hc_pre_inject_packed", il);
+
+            mixed = ggml_view_2d(ctx0, packed, n_embd, nt,
+                    ggml_row_size(GGML_TYPE_F32, n_embd), 0);
+            *inject = ggml_view_2d(ctx0, packed, hc, nt,
+                    ggml_row_size(GGML_TYPE_F32, hc),
+                    ggml_row_size(GGML_TYPE_F32, n_embd) * nt);
+            cb(*inject, "hc_inject", il);
+            res->add_fused_node({LLM_FUSED_OP_DSV4_HC_PRE, packed, il});
+        } else {
+            // sigmoid gate and mean over the streams in one op
+            mixed = ggml_dsv4_hc_pre_gated(ctx0, xn3, gate3, 1.0f / (float) hc);
+            res->add_fused_node({LLM_FUSED_OP_DSV4_HC_PRE, mixed, il});
+        }
     } else {
         ggml_tensor * gated = ggml_mul(ctx0, xn, ggml_sigmoid(ctx0, gate));
         gated = ggml_reshape_3d(ctx0, gated, n_embd, hc, nt);
@@ -299,7 +322,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
     }
     cb(mixed, "hc_mixed", il);
 
-    if (inject) {
+    if (inject && !fuse_inject) {
         *inject = build_lora_mm(w_inject, xn_mm);
         cb(*inject, "hc_inject", il);
     }
@@ -926,14 +949,21 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
     // the channels must match how load_arch_tensors sizes wqkv, not ssm_d_inner
     const int64_t conv_channels    = head_k_dim * num_k_heads * 2 + head_v_dim * num_v_heads;
 
+    const bool separate_conv_state =
+        llama_env_flag_enabled("GGML_CUDA_SSM_CONV_SEPARATE_STATE") &&
+        n_seq_tokens >= conv_kernel_size - 1;
+    ggml_tensor * conv_state = nullptr;
     ggml_tensor * conv_input = build_conv_state_at(inp, conv_states_all, qkv_mixed,
-            conv_kernel_size - 1, conv_channels, il);
+            conv_kernel_size - 1, conv_channels, il,
+            separate_conv_state ? &conv_state : nullptr);
 
     ggml_tensor * state = build_rs(inp, ssm_states_all, hparams.n_embd_s(), n_seqs);
     state = ggml_reshape_4d(ctx0, state, head_v_dim, head_v_dim, num_v_heads, n_seqs);
     cb(state, "state_predelta", il);
 
-    ggml_tensor * conv_output_proper = ggml_ssm_conv(ctx0, conv_input, conv_kernel);
+    ggml_tensor * conv_output_proper = separate_conv_state
+        ? ggml_ssm_conv_ext(ctx0, conv_input, conv_state, conv_kernel)
+        : ggml_ssm_conv(ctx0, conv_input, conv_kernel);
     cb(conv_output_proper, "conv_output_raw", il);
 
     ggml_tensor * conv_output_silu = ggml_silu(ctx0, conv_output_proper);
@@ -1149,7 +1179,8 @@ ggml_tensor * llama_model_qwen4exp::graph::build_conv_state_at(
         ggml_tensor *        x,
         int64_t              state_cols,
         int64_t              channels,
-        int                  il) {
+        int                  il,
+        ggml_tensor **       separate_state) {
     const auto * mctx_cur = inp->mctx;
 
     const auto kv_head = mctx_cur->get_head();
@@ -1168,6 +1199,29 @@ ggml_tensor * llama_model_qwen4exp::graph::build_conv_state_at(
 
     ggml_tensor * state = ggml_reshape_3d(ctx0, rows, state_cols, channels, n_seqs);
     cb(state, "conv_state_at", il);
+
+    if (separate_state) {
+        GGML_ASSERT(x->ne[0] == channels && x->ne[2] == n_seqs);
+        GGML_ASSERT(x->ne[1] >= state_cols);
+        *separate_state = state;
+
+        // Only the last state_cols tokens need to be materialized for the
+        // recurrent cache. The convolution reads the full channel-major x and
+        // the gathered history directly.
+        ggml_tensor * tail_channels = ggml_view_3d(ctx0, x,
+                channels, state_cols, n_seqs,
+                x->nb[1], x->nb[2],
+                (x->ne[1] - state_cols)*x->nb[1]);
+        ggml_tensor * tail = ggml_transpose(ctx0, tail_channels);
+
+        const size_t row_size = ggml_row_size(conv_states_all->type, row_total);
+        ggml_tensor * dst = ggml_view_2d(ctx0, conv_states_all,
+                state_cols*channels, n_seqs,
+                conv_states_all->nb[1],
+                kv_head*row_size);
+        ggml_build_forward_expand(gf, ggml_cpy(ctx0, ggml_cont(ctx0, tail), dst));
+        return x;
+    }
 
     ggml_tensor * conv_input = ggml_concat(ctx0, state, ggml_transpose(ctx0, x), 0);
 

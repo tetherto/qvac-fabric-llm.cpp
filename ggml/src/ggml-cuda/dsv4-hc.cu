@@ -1,4 +1,5 @@
 #include "common.cuh"
+#include "convert.cuh"
 #include "dsv4-hc.cuh"
 
 
@@ -145,6 +146,73 @@ static __global__ void dsv4_hc_pre_f32(
     dst[i0*sd0 + it*sd1] = scale * sum;
 }
 
+template <typename inject_t>
+static __global__ void dsv4_hc_pre_inject_f32(
+        const float * x,
+        const float * gate,
+        const inject_t * inject,
+        float * dst,
+        int64_t n_embd,
+        int64_t n_tokens,
+        int64_t sx0,
+        int64_t sx1,
+        int64_t sx2,
+        int64_t sg0,
+        int64_t sg1,
+        int64_t sg2,
+        int64_t si0,
+        int64_t si1,
+        float scale) {
+    constexpr int max_warps = 256 / WARP_SIZE;
+    __shared__ float warp_sums[DSV4_HC][max_warps];
+
+    ggml_cuda_pdl_lc();
+    const int lane = threadIdx.x % WARP_SIZE;
+    const int warp = threadIdx.x / WARP_SIZE;
+    const int64_t it = blockIdx.x;
+
+    float inject_sum[DSV4_HC] = { 0.0f };
+
+    ggml_cuda_pdl_sync();
+    for (int64_t i0 = threadIdx.x; i0 < n_embd; i0 += blockDim.x) {
+        float mixed = 0.0f;
+#pragma unroll
+        for (int ih = 0; ih < DSV4_HC; ++ih) {
+            const float xv = x[i0*sx0 + ih*sx1 + it*sx2];
+            const float gv = gate[i0*sg0 + ih*sg1 + it*sg2];
+            mixed += xv / (1.0f + expf(-gv));
+
+            const int64_t ii = i0 + (int64_t) ih*n_embd;
+#pragma unroll
+            for (int io = 0; io < DSV4_HC; ++io) {
+                inject_sum[io] += xv * ggml_cuda_cast<float>(inject[ii*si0 + io*si1]);
+            }
+        }
+        dst[i0 + it*n_embd] = scale * mixed;
+    }
+
+#pragma unroll
+    for (int io = 0; io < DSV4_HC; ++io) {
+        const float sum = warp_reduce_sum(inject_sum[io]);
+        if (lane == 0) {
+            warp_sums[io][warp] = sum;
+        }
+    }
+    __syncthreads();
+
+    if (warp == 0) {
+        float * inject_dst = dst + n_embd*n_tokens;
+#pragma unroll
+        for (int io = 0; io < DSV4_HC; ++io) {
+            float sum = lane < max_warps ? warp_sums[io][lane] : 0.0f;
+            sum = warp_reduce_sum(sum);
+            if (lane == 0) {
+                inject_dst[io + it*DSV4_HC] = sum;
+            }
+        }
+    }
+}
+
 template <bool has_comb>
 static __global__ void dsv4_hc_post_f32(
         const float * x,
@@ -240,6 +308,7 @@ void ggml_cuda_op_dsv4_hc_comb(ggml_backend_cuda_context & ctx, ggml_tensor * ds
 void ggml_cuda_op_dsv4_hc_pre(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * x       = dst->src[0];
     const ggml_tensor * weights = dst->src[1];
+    const ggml_tensor * inject  = dst->src[2];
 
     GGML_ASSERT(x->type == GGML_TYPE_F32);
     GGML_ASSERT(weights->type == GGML_TYPE_F32);
@@ -255,6 +324,42 @@ void ggml_cuda_op_dsv4_hc_pre(ggml_backend_cuda_context & ctx, ggml_tensor * dst
 
     const float scale = ggml_get_op_params_f32(dst, 0);
     const bool  gated = ggml_get_op_params_i32(dst, 1) != 0;
+
+    if (inject) {
+        GGML_ASSERT(gated);
+        GGML_ASSERT(hc == DSV4_HC);
+        GGML_ASSERT(inject->type == GGML_TYPE_F32 || inject->type == GGML_TYPE_BF16);
+        GGML_ASSERT(inject->ne[0] == n_embd*hc && inject->ne[1] == hc);
+        GGML_ASSERT(ggml_is_contiguous(inject));
+        GGML_ASSERT(ggml_nelements(dst) == (n_embd + hc)*n_tokens);
+
+        const int block_size = 256;
+        const dim3 block_dims(block_size, 1, 1);
+        const dim3 grid_dims(n_tokens, 1, 1);
+        const ggml_cuda_kernel_launch_params launch_params =
+            ggml_cuda_kernel_launch_params(grid_dims, block_dims, 0, ctx.stream());
+
+        if (inject->type == GGML_TYPE_BF16) {
+            ggml_cuda_kernel_launch(dsv4_hc_pre_inject_f32<__nv_bfloat16>, launch_params,
+                    (const float *) x->data, (const float *) weights->data,
+                    (const __nv_bfloat16 *) inject->data, (float *) dst->data,
+                    n_embd, n_tokens,
+                    nbx0 / sizeof(float), nbx1 / sizeof(float), nbx2 / sizeof(float),
+                    nbw0 / sizeof(float), nbw1 / sizeof(float), nbw2 / sizeof(float),
+                    inject->nb[0] / sizeof(__nv_bfloat16), inject->nb[1] / sizeof(__nv_bfloat16),
+                    scale);
+        } else {
+            ggml_cuda_kernel_launch(dsv4_hc_pre_inject_f32<float>, launch_params,
+                    (const float *) x->data, (const float *) weights->data,
+                    (const float *) inject->data, (float *) dst->data,
+                    n_embd, n_tokens,
+                    nbx0 / sizeof(float), nbx1 / sizeof(float), nbx2 / sizeof(float),
+                    nbw0 / sizeof(float), nbw1 / sizeof(float), nbw2 / sizeof(float),
+                    inject->nb[0] / sizeof(float), inject->nb[1] / sizeof(float),
+                    scale);
+        }
+        return;
+    }
 
     const int block_size = 256;
     const int64_t nr = n_embd * n_tokens;

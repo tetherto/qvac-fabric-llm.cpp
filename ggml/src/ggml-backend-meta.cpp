@@ -847,6 +847,16 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
     };
 
     auto handle_ssm_conv = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
+        if (tensor->src[2] != nullptr) {
+            // x is [channels, tokens], while state and weights are
+            // [history, channels] and [kernel, channels].
+            if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_0 &&
+                    src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_1 &&
+                    src_ss[2].axis == GGML_BACKEND_SPLIT_AXIS_1) {
+                return {GGML_BACKEND_SPLIT_AXIS_0, {0}, {1}, 1};
+            }
+            return handle_generic(src_ss, /*scalar_only =*/ false);
+        }
         if (src_ss[0].axis == src_ss[1].axis) {
             if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_0) {
                 return {GGML_BACKEND_SPLIT_AXIS_1, {0}, {1}, 1};

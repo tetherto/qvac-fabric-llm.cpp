@@ -4235,6 +4235,41 @@ struct test_dsv4_hc_pre : public test_dsv4_hc {
     }
 };
 
+struct test_dsv4_hc_pre_inject : public test_case {
+    static constexpr int64_t hc = 4;
+    const int64_t n_embd;
+    const int64_t n_tokens;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "DSV4_HC_PRE_INJECT";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR2(n_embd, n_tokens);
+    }
+
+    double max_nmse_err() override { return 1e-6; }
+
+    test_dsv4_hc_pre_inject(int64_t n_embd, int64_t n_tokens)
+        : n_embd(n_embd), n_tokens(n_tokens) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, hc, n_tokens);
+        ggml_set_name(x, "x");
+
+        ggml_tensor * gate = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, hc, n_tokens);
+        ggml_set_name(gate, "gate");
+
+        ggml_tensor * inject = ggml_new_tensor_2d(ctx, GGML_TYPE_BF16, n_embd*hc, hc);
+        ggml_set_name(inject, "inject");
+
+        ggml_tensor * out = ggml_dsv4_hc_pre_gated_inject(ctx, x, gate, inject, 1.0f/hc);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 struct test_dsv4_hc_post : public test_dsv4_hc {
     const int64_t n_embd;
     const int64_t n_tokens;
@@ -4300,6 +4335,47 @@ struct test_ssm_conv : public test_case {
         ggml_tensor * out = ggml_ssm_conv(ctx, a, b);
         ggml_set_name(out, "out");
         return out;
+    }
+};
+
+// GGML_OP_SSM_CONV with token activations and recurrent state kept separate.
+struct test_ssm_conv_ext : public test_case {
+    const int64_t d_conv;
+    const int64_t d_inner;
+    const int64_t n_t;
+    const int64_t n_s;
+    const bool silu;
+
+    std::string vars() override {
+        return VARS_TO_STR5(d_conv, d_inner, n_t, n_s, silu);
+    }
+
+    test_ssm_conv_ext(int64_t d_conv, int64_t d_inner, int64_t n_t, int64_t n_s, bool silu)
+        : d_conv(d_conv), d_inner(d_inner), n_t(n_t), n_s(n_s), silu(silu) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, d_inner, n_t, n_s);
+        ggml_set_name(x, "x");
+
+        ggml_tensor * state = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, d_conv - 1, d_inner, n_s);
+        ggml_set_name(state, "state");
+
+        ggml_tensor * c = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d_conv, d_inner);
+        ggml_set_name(c, "c");
+
+        ggml_tensor * out = ggml_ssm_conv_ext(ctx, x, state, c);
+        if (silu) {
+            out = ggml_silu(ctx, out);
+        }
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    bool run_whole_graph() override { return silu; }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return silu ? "SSM_CONV_EXT_SILU" : "SSM_CONV_EXT";
     }
 };
 
@@ -9760,6 +9836,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_dsv4_hc_pre(4096, 21));
     test_cases.emplace_back(new test_dsv4_hc_pre(31, 17, true));
     test_cases.emplace_back(new test_dsv4_hc_pre(4096, 21, true));
+    test_cases.emplace_back(new test_dsv4_hc_pre_inject(257, 19));
+    test_cases.emplace_back(new test_dsv4_hc_pre_inject(2560, 3));
 
     test_cases.emplace_back(new test_dsv4_hc_post(1, 1));
     test_cases.emplace_back(new test_dsv4_hc_post(31, 17));
@@ -10520,6 +10598,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_ssm_conv(GGML_TYPE_F32, {d_conv - 1 + 64, d_inner, 4, 1}, {d_conv, d_inner, 1, 1}));
         }
     }
+    test_cases.emplace_back(new test_ssm_conv_ext(4, 128, 1,  2, false));
+    test_cases.emplace_back(new test_ssm_conv_ext(4, 128, 65, 2, false));
+    test_cases.emplace_back(new test_ssm_conv_ext(4, 3328, 64, 1, true));
     // small ssm_conv cases that fit within grad_nmax, to exercise the finite-difference backward check
     for (int64_t d_conv : {3, 4}) {
         for (int64_t n_t : {1, 6}) {

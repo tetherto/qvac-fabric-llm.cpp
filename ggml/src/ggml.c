@@ -5924,6 +5924,35 @@ struct ggml_tensor * ggml_ssm_conv(
     return result;
 }
 
+struct ggml_tensor * ggml_ssm_conv_ext(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * state,
+        struct ggml_tensor  * c) {
+    GGML_ASSERT(ggml_is_3d(x));
+    GGML_ASSERT(ggml_is_3d(state));
+    GGML_ASSERT(ggml_is_matrix(c));
+
+    const int64_t d_conv  = c->ne[0];
+    const int64_t d_inner = c->ne[1];
+    const int64_t n_t     = x->ne[1];
+    const int64_t n_s     = x->ne[2];
+
+    GGML_ASSERT(x->ne[0] == d_inner);
+    GGML_ASSERT(state->ne[0] == d_conv - 1);
+    GGML_ASSERT(state->ne[1] == d_inner);
+    GGML_ASSERT(state->ne[2] == n_s);
+
+    struct ggml_tensor * result = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, d_inner, n_t, n_s);
+
+    result->op     = GGML_OP_SSM_CONV;
+    result->src[0] = x;
+    result->src[1] = c;
+    result->src[2] = state;
+
+    return result;
+}
+
 // ggml_ssm_conv_back_sx
 
 /*
@@ -6877,6 +6906,7 @@ static struct ggml_tensor * ggml_dsv4_hc_pre_impl(
         struct ggml_context * ctx,
         struct ggml_tensor  * x,
         struct ggml_tensor  * weights,
+        struct ggml_tensor  * w_inject,
         float                 scale,
         bool                  gated) {
     GGML_ASSERT(x->type == GGML_TYPE_F32);
@@ -6899,7 +6929,18 @@ static struct ggml_tensor * ggml_dsv4_hc_pre_impl(
     }
     GGML_ASSERT(weights->ne[3] == 1);
 
-    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
+    if (w_inject) {
+        GGML_ASSERT(gated);
+        GGML_ASSERT(w_inject->type == GGML_TYPE_F32 || w_inject->type == GGML_TYPE_BF16);
+        GGML_ASSERT(w_inject->ne[0] == n_embd*hc);
+        GGML_ASSERT(w_inject->ne[1] == hc);
+        GGML_ASSERT(w_inject->ne[2] == 1 && w_inject->ne[3] == 1);
+        GGML_ASSERT(ggml_is_contiguous(w_inject));
+    }
+
+    struct ggml_tensor * result = w_inject
+        ? ggml_new_tensor_1d(ctx, GGML_TYPE_F32, (n_embd + hc)*n_tokens)
+        : ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
 
     ggml_set_op_params_f32(result, 0, scale);
     ggml_set_op_params_i32(result, 1, gated ? 1 : 0);
@@ -6907,6 +6948,7 @@ static struct ggml_tensor * ggml_dsv4_hc_pre_impl(
     result->op     = GGML_OP_DSV4_HC_PRE;
     result->src[0] = x;
     result->src[1] = weights;
+    result->src[2] = w_inject;
 
     return result;
 }
@@ -6915,7 +6957,7 @@ struct ggml_tensor * ggml_dsv4_hc_pre(
         struct ggml_context * ctx,
         struct ggml_tensor  * x,
         struct ggml_tensor  * weights) {
-    return ggml_dsv4_hc_pre_impl(ctx, x, weights, 1.0f, false);
+    return ggml_dsv4_hc_pre_impl(ctx, x, weights, NULL, 1.0f, false);
 }
 
 struct ggml_tensor * ggml_dsv4_hc_pre_gated(
@@ -6923,7 +6965,16 @@ struct ggml_tensor * ggml_dsv4_hc_pre_gated(
         struct ggml_tensor  * x,
         struct ggml_tensor  * gate,
         float                 scale) {
-    return ggml_dsv4_hc_pre_impl(ctx, x, gate, scale, true);
+    return ggml_dsv4_hc_pre_impl(ctx, x, gate, NULL, scale, true);
+}
+
+struct ggml_tensor * ggml_dsv4_hc_pre_gated_inject(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * gate,
+        struct ggml_tensor  * w_inject,
+        float                 scale) {
+    return ggml_dsv4_hc_pre_impl(ctx, x, gate, w_inject, scale, true);
 }
 
 // ggml_dsv4_hc_post

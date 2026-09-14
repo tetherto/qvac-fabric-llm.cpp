@@ -5780,7 +5780,14 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         }
         case GGML_OP_SSM_CONV: {
             // assumes d_inner % threads == 0
-            return op->src[0]->ne[1] % 128 == 0;
+            if (op->src[2] == nullptr) {
+                return op->src[0]->ne[1] % 128 == 0;
+            }
+            return op->type == GGML_TYPE_F32 && op->src[0]->type == GGML_TYPE_F32 &&
+                op->src[1]->type == GGML_TYPE_F32 && op->src[2]->type == GGML_TYPE_F32 &&
+                op->src[0]->ne[0] % 128 == 0 && op->src[1]->ne[1] == op->src[0]->ne[0] &&
+                op->src[2]->ne[0] == op->src[1]->ne[0] - 1 &&
+                op->src[2]->ne[1] == op->src[0]->ne[0] && op->src[2]->ne[2] == op->src[0]->ne[2];
         }
         case GGML_OP_SSM_CONV_BACK_SX:
         case GGML_OP_SSM_CONV_BACK_C:
@@ -5887,8 +5894,18 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
                 op->src[2]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32;
         case GGML_OP_DSV4_HC_PRE:
-            return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
-                op->type == GGML_TYPE_F32;
+            if (op->src[0]->type != GGML_TYPE_F32 || op->src[1]->type != GGML_TYPE_F32 ||
+                    op->type != GGML_TYPE_F32) {
+                return false;
+            }
+            if (op->src[2] == nullptr) {
+                return true;
+            }
+            return ggml_get_op_params_i32(op, 1) != 0 && op->src[0]->ne[1] == 4 &&
+                (op->src[2]->type == GGML_TYPE_F32 || op->src[2]->type == GGML_TYPE_BF16) &&
+                op->src[2]->ne[0] == op->src[0]->ne[0]*op->src[0]->ne[1] &&
+                op->src[2]->ne[1] == op->src[0]->ne[1] && ggml_is_contiguous(op->src[2]) &&
+                ggml_nelements(op) == (op->src[0]->ne[0] + op->src[0]->ne[1])*op->src[0]->ne[2];
         case GGML_OP_DSV4_HC_POST:
             return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
                 op->src[2]->type == GGML_TYPE_F32 && (op->src[3] == nullptr || op->src[3]->type == GGML_TYPE_F32) &&
