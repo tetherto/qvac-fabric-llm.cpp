@@ -69,8 +69,14 @@ jobs:
       contents: read
     uses: ./.github/workflows/reusable-runner-names.yml
 
+  authorize:
+    permissions:
+      contents: read
+    uses: ./.github/workflows/reusable-authorize-self-hosted.yml
+
   gpu-cuda:
-    needs: runner_names
+    needs: [runner_names, authorize]
+    if: needs.authorize.outputs.allowed == 'true'
     runs-on: ${{ needs.runner_names.outputs.qvac_ubuntu2204_x64_gpu }}
 
     steps:
@@ -106,7 +112,8 @@ jobs:
           GG_BUILD_ROCM=1 GG_BUILD_AMDGPU_TARGETS=gfx1151 bash ./ci/run.sh ~/results/llama.cpp ~/mnt/llama.cpp
 
   gpu-vulkan-nvidia-cm:
-    needs: runner_names
+    needs: [runner_names, authorize]
+    if: needs.authorize.outputs.allowed == 'true'
     runs-on: ${{ needs.runner_names.outputs.qvac_ubuntu2204_x64_gpu }}
 
     steps:
@@ -121,7 +128,8 @@ jobs:
           GG_BUILD_VULKAN=1 GGML_VK_DISABLE_COOPMAT2=1 bash ./ci/run.sh ~/results/llama.cpp ~/mnt/llama.cpp
 
   gpu-vulkan-nvidia-cm2:
-    needs: runner_names
+    needs: [runner_names, authorize]
+    if: needs.authorize.outputs.allowed == 'true'
     runs-on: ${{ needs.runner_names.outputs.qvac_ubuntu2204_x64_gpu }}
 
     steps:
@@ -136,7 +144,8 @@ jobs:
           GG_BUILD_VULKAN=1 bash ./ci/run.sh ~/results/llama.cpp ~/mnt/llama.cpp
 
   gpu-webgpu-nvidia:
-    needs: runner_names
+    needs: [runner_names, authorize]
+    if: needs.authorize.outputs.allowed == 'true'
     runs-on: ${{ needs.runner_names.outputs.qvac_ubuntu2404_x64_gpu }}
 
     steps:
@@ -210,7 +219,8 @@ jobs:
   #         GG_BUILD_ROCM=1 GG_BUILD_AMDGPU_TARGETS="gfx1101" bash ./ci/run.sh ~/results/llama.cpp ~/mnt/llama.cpp
 
   gpu-metal:
-    needs: runner_names
+    needs: [runner_names, authorize]
+    if: needs.authorize.outputs.allowed == 'true'
     runs-on: ${{ needs.runner_names.outputs.qvac_macos26_arm64_gpu }}
 
     steps:
@@ -224,7 +234,8 @@ jobs:
           GG_BUILD_METAL=1 bash ./ci/run.sh ~/results/llama.cpp ~/mnt/llama.cpp
 
   gpu-webgpu-apple:
-    needs: runner_names
+    needs: [runner_names, authorize]
+    if: needs.authorize.outputs.allowed == 'true'
     runs-on: ${{ needs.runner_names.outputs.qvac_macos26_arm64_gpu }}
 
     steps:
@@ -252,7 +263,8 @@ jobs:
             bash ./ci/run.sh ~/results/llama.cpp ~/mnt/llama.cpp
 
   gpu-vulkan-apple:
-    needs: runner_names
+    needs: [runner_names, authorize]
+    if: needs.authorize.outputs.allowed == 'true'
     runs-on: ${{ needs.runner_names.outputs.qvac_macos26_arm64_gpu }}
 
     steps:
@@ -339,7 +351,8 @@ jobs:
           GG_BUILD_OPENVINO=1 GGML_OPENVINO_DEVICE=GPU GG_BUILD_LOW_PERF=1 bash ./ci/run.sh ~/results/llama.cpp ~/mnt/llama.cpp
 
   cpu-x64-high-perf:
-    needs: runner_names
+    needs: [runner_names, authorize]
+    if: needs.authorize.outputs.allowed == 'true'
     runs-on: ${{ needs.runner_names.outputs.qvac_ubuntu2204_x64 }}
 
     steps:

@@ -30,8 +30,14 @@ jobs:
       contents: read
     uses: ./.github/workflows/reusable-runner-names.yml
 
+  authorize:
+    permissions:
+      contents: read
+    uses: ./.github/workflows/reusable-authorize-self-hosted.yml
+
   python-type-check:
-    needs: runner_names
+    needs: [runner_names, authorize]
+    if: needs.authorize.outputs.allowed == 'true'
     runs-on: ${{ needs.runner_names.outputs.qvac_ubuntu2404_x64 }}
     name: python type-check
     steps:

@@ -1,0 +1,33 @@
+name: Authorize self-hosted fork CI (reusable)
+
+# Unprivileged gate on pull_request (read-only token, no secrets, no checkout).
+# Same-repo PRs and non-pull_request events skip the environment and run.
+# External forks wait on the fork-ci environment for this run — that is the
+# SHA-bound approval. A new push is a new run and must be re-approved.
+# Must never use pull_request_target: engine CI has no secrets to grant.
+
+on:
+  workflow_call:
+    outputs:
+      allowed:
+        description: true when this run may use qvac-* self-hosted runners
+        value: ${{ jobs.authorize.outputs.allowed }}
+
+permissions: {}
+
+jobs:
+  authorize:
+    name: Authorize self-hosted
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    environment: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository && 'fork-ci' || '' }}
+    outputs:
+      allowed: ${{ steps.auth.outputs.allowed }}
+    steps:
+      - name: Authorize self-hosted jobs
+        id: auth
+        run: |
+          echo "allowed=true" >> "$GITHUB_OUTPUT"
+          echo "self-hosted jobs authorised for this run"
