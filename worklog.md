@@ -19,6 +19,10 @@ Current branch: `qwen4-exp-opt`
 Recent commits, newest first:
 
 ```text
+eef7dd05f qwen4exp: add hc ops
+0611b6329 use TENSOR_ALLOW_RESHAPE
+88bdd21d1 qwen4exp: enable rms_norm + mul fusion
+a9c97c109 docs: record MoE reduction fusion checkpoint
 4e1f24d24 cuda: fuse MoE weighted expert reduction (#25952)
 9d77e2b65 ggml: allow passing alloc dependencies in graph_optimize (#27301)
 d907668f2 docs: record qwen4exp pp2048 profile
@@ -66,19 +70,22 @@ the installed SGLang wheel uses a CUDA 13.0 runtime.
 
 ## Trusted performance checkpoint
 
-Known-good non-fused FP8 run:
+Current optimized FP8 run:
 
 - `-sm tensor -lm none`
-- PP2048: **6669.59 +/- 119.34 tok/s**
+- DeepGEMM `MUL_MAT_ID` enabled; experimental whole-MoE and MegaMoE paths disabled
+- Qwen4Exp HC and CUDA MoE-reduction fusions enabled
+- PP2048: **7687.85 +/- 73.05 tok/s** over 15 repetitions
+- Stable last-eight mean: **7729.52 tok/s**
 
 This is the checkpoint to reproduce before making another optimization. The
-earlier approximately 5k tok/s PP2048 result was real, but the later tensor-split
-fix improved it to the value above.
+prior non-fused checkpoint was 6674.29 +/- 98.27 tok/s. The current full mean
+is 15.19% faster.
 
 ### 2026-09-14: warmed PP2048 Nsight profile
 
-The baseline was reproduced before profiling with the whole-MoE and MegaMoE
-paths explicitly disabled:
+The pre-HC-fusion baseline was reproduced before profiling with the whole-MoE
+and MegaMoE paths explicitly disabled:
 
 ```bash
 CUDA_VISIBLE_DEVICES=6,7 \
@@ -222,17 +229,87 @@ Verification:
   emits the original MUL/ADD kernels, proving both dispatch and fallback.
 
 The first post-pick PP2048 smoke was not stable enough to claim a performance
-change: 6050.43, 5758.03, 5876.70, 5970.26, and 6625.13 tok/s, averaging
-6056.11 tok/s. The final sample returned near the 6.67k checkpoint, while the
-first four were unusually slow. Do not use the average as the new baseline.
-Before judging this fusion, take a longer warmed run and confirm that the real
-Qwen4Exp graph emits `moe_weighted_reduction_f32`; the targeted operator trace
-only proves the synthetic matcher cases.
+change: 6050.43, 5758.03, 5876.70, 5970.26, and 6625.13 tok/s. A later warmed
+run after the HC PRs supersedes this result; see the next section. The real
+Qwen4Exp graph is now confirmed to emit `moe_weighted_reduction_f32`.
 
 Despite the upstream commit message mentioning
 `GGML_CUDA_MOE_WEIGHTED_REDUCTION=0`, this revision only implements the global
 `GGML_CUDA_DISABLE_FUSION` guard. Do not use that global switch for an
 apples-to-apples A/B because it disables other CUDA fusions too.
+
+### Qwen4Exp HC graph fusions
+
+PR #28896 was cherry-picked as:
+
+- `88bdd21d1`: arrange Qwen4Exp RMS norm and gamma multiplication for backend
+  fusion.
+- `0611b6329`: load HC gamma tensors as `[n_embd, hc]` with
+  `TENSOR_ALLOW_RESHAPE`, removing graph reshapes.
+
+PR #28901 was cherry-picked as `eef7dd05f`. It maps the explicit Qwen4Exp
+sigmoid/multiply/stream-reduction chain to gated `DSV4_HC_PRE`, and maps its
+repeat/multiply/add residual chain to identity-combine `DSV4_HC_POST`.
+
+The PR #28901 cherry-pick conflicted with newer CPU and Vulkan HC code already
+on this branch. The resolution retained the vectorized CPU HC-post
+implementation and added its identity-combine behavior. The existing Vulkan
+support checks now reject gated-pre and null-combine post graphs, which its
+current shaders do not implement.
+
+Verification:
+
+- Local CUDA build completed.
+- All 12 focused CPU HC tests passed.
+- The SM90/DeepGEMM build completed on the remote host.
+- On physical GPU 6, all 18 focused CUDA cases passed: six HC-pre, six HC-post,
+  and six MoE weighted-reduction cases.
+
+The 15-repetition FP8 PP2048 run used the same command as the earlier baseline
+with `-sm tensor -lm none`, `-b 2048 -ub 2048`, and only GPUs 6 and 7.
+It produced **7687.85 +/- 73.05 tok/s**:
+
+```text
+7451.16, 7630.02, 7682.45, 7694.23, 7692.94,
+7665.82, 7664.95, 7724.96, 7735.18, 7737.62,
+7726.11, 7739.74, 7720.40, 7723.74, 7728.38
+```
+
+The last eight samples average **7729.52 tok/s**. The full mean is 15.19%
+above the reproduced pre-HC-fusion 6674.29 tok/s checkpoint.
+
+The real-model graph dispatch was verified with CUDA graph node tracing:
+
+- Report:
+  `/home/aman/qwen4-exp-opt-bench-20260911/results/fp8-hc-moe-fusions-pp2048-20260914.nsys-rep`
+- SQLite:
+  `/home/aman/qwen4-exp-opt-bench-20260911/results/fp8-hc-moe-fusions-pp2048-20260914.sqlite`
+- The complete two-repetition capture contains 576 gated
+  `dsv4_hc_pre_f32<true>` launches, 576 identity
+  `dsv4_hc_post_f32<false>` launches, and 72
+  `moe_weighted_reduction_f32` launches.
+- `rms_norm_f32<..., true, false>` is present, confirming RMS norm plus
+  multiplication is using the fused CUDA kernel.
+
+Across the complete graph warmup plus two profiled repetitions, summed CUDA
+kernel time is 1430.275 ms across both GPUs. The largest groups are:
+
+| Kernel group | Time | Share |
+| --- | ---: | ---: |
+| Gated DeltaNet core | 282.051 ms | 19.72% |
+| F32 to BF16 conversion | 164.315 ms | 11.49% |
+| Four FP8 DeepGEMM shapes | 111.267 ms | 7.78% |
+| Identity HC-post | 81.857 ms | 5.72% |
+| NCCL all-reduce | 82.336 ms | 5.76% |
+| Elementwise multiply | 63.713 ms | 4.45% |
+| MoE activation pack/quantize | 58.237 ms | 4.07% |
+| MoE output scatter | 53.189 ms | 3.72% |
+| Gated HC-pre | 41.076 ms | 2.87% |
+| MoE weighted reduction | 6.398 ms | 0.45% |
+
+The remaining largest target is still the recurrent core and surrounding type
+conversion work. The weighted MoE reduction is now small; further MoE gains
+need to reduce DeepGEMM packing/scattering or fuse a larger region.
 
 ### FP8 GGUF and tensor parallel split
 
