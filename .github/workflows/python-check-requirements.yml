@@ -24,9 +24,15 @@ jobs:
       contents: read
     uses: ./.github/workflows/reusable-runner-names.yml
 
+  authorize:
+    permissions:
+      contents: read
+      statuses: read
+    uses: ./.github/workflows/reusable-authorize-self-hosted.yml
+
   python-check-requirements:
-    needs: runner_names
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    needs: [runner_names, authorize]
+    if: needs.authorize.outputs.allowed == 'true'
     runs-on: ${{ needs.runner_names.outputs.qvac_ubuntu2404_x64 }}
     name: check-requirements
     steps:

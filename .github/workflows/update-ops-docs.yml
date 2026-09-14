@@ -15,31 +15,37 @@ on:
             - 'scripts/create_ops_docs.py'
 
 jobs:
-    update-ops-docs:
-        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
-        runs-on: [self-hosted, fast, ARM64]
+  authorize:
+    permissions:
+      contents: read
+      statuses: read
+    uses: ./.github/workflows/reusable-authorize-self-hosted.yml
 
-        steps:
-        - name: Checkout repository
-          uses: actions/checkout@v6
+  update-ops-docs:
+    needs: authorize
+    if: needs.authorize.outputs.allowed == 'true'
+    runs-on: [self-hosted, fast, ARM64]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
 
-        - name: Set up Python
-          uses: actions/setup-python@v6
-          with:
-              python-version: '3.x'
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.x'
 
-        - name: Generate operations documentation to temporary file
-          run: |
-              mkdir -p /tmp/ops_check
-              ./scripts/create_ops_docs.py /tmp/ops_check/ops.md
+      - name: Generate operations documentation to temporary file
+        run: |
+          mkdir -p /tmp/ops_check
+          ./scripts/create_ops_docs.py /tmp/ops_check/ops.md
 
-        - name: Check if docs/ops.md matches generated version
-          run: |
-              if ! diff -q docs/ops.md /tmp/ops_check/ops.md; then
-                  echo "Operations documentation (docs/ops.md) is not up to date with the backend CSV files."
-                  echo "To fix: run ./scripts/create_ops_docs.py and commit the updated docs/ops.md along with your changes"
-                  echo "Differences found:"
-                  diff docs/ops.md /tmp/ops_check/ops.md || true
-                  exit 1
-              fi
-              echo "Operations documentation is up to date."
+      - name: Check if docs/ops.md matches generated version
+        run: |
+          if ! diff -q docs/ops.md /tmp/ops_check/ops.md; then
+              echo "Operations documentation (docs/ops.md) is not up to date with the backend CSV files."
+              echo "To fix: run ./scripts/create_ops_docs.py and commit the updated docs/ops.md along with your changes"
+              echo "Differences found:"
+              diff docs/ops.md /tmp/ops_check/ops.md || true
+              exit 1
+          fi
+          echo "Operations documentation is up to date."
