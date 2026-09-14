@@ -956,6 +956,11 @@ static bool weight_buft_supported(const llama_hparams & hparams, ggml_tensor * w
                 ggml_tensor * b = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, w->ne[0], n_ids_used, 512);
                 ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_ids_used, 512);
                 op_tensor = ggml_mul_mat_id(ctx, w, b, ids);
+                if (w->type == GGML_TYPE_F8_E4M3) {
+                    GGML_ASSERT(w->ne[0] % 128 == 0 && w->ne[1] % 128 == 0);
+                    op_tensor->src[3] = ggml_new_tensor_3d(
+                        ctx, GGML_TYPE_F32, w->ne[0] / 128, w->ne[1] / 128, w->ne[2]);
+                }
             } break;
         case GGML_OP_ADD:
             {

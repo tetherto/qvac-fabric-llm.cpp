@@ -9,7 +9,13 @@
 #include <cassert>
 #include <cmath>
 #include <iterator>
+#include <limits>
 #include <stdexcept>
+
+// Reject older QSA states that do not preserve the multimodal fallback flag.
+// This header is specific to the indexer memory; other state formats are unchanged.
+static constexpr uint32_t HYBRID_IDX_STATE_MAGIC   = 0x51494458; // QIDX
+static constexpr uint32_t HYBRID_IDX_STATE_VERSION = 1;
 
 //
 // llama_memory_hybrid_idx
@@ -44,6 +50,7 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
         type_r, type_s, rs_size,
         n_seq_max, n_rs_seq, offload, unified,
         filter_attn, filter_recr),
+    n_seq_max(n_seq_max),
     hparams_idx(model.hparams),
     mem_idx(filter_idx == nullptr ? nullptr : [&] {
         // MQA with a single key head of indexer_head_size, as llama_kv_cache_dsa shapes its own
@@ -134,6 +141,8 @@ llama_memory_context_ptr llama_memory_hybrid_idx::init_update(llama_context * lc
 void llama_memory_hybrid_idx::clear(bool data) {
     llama_memory_hybrid::clear(data);
 
+    qsa_disabled.reset();
+
     if (mem_idx) {
         mem_idx->clear(data);
     }
@@ -149,7 +158,16 @@ bool llama_memory_hybrid_idx::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_po
         mem_idx->seq_rm(seq_id, p0, p1);
     }
 
-    return get_mem_attn()->seq_rm(seq_id, p0, p1);
+    const bool res = get_mem_attn()->seq_rm(seq_id, p0, p1);
+    if (res && p0 <= 0 && (p1 < 0 || p1 == std::numeric_limits<llama_pos>::max())) {
+        if (seq_id < 0) {
+            qsa_disabled.reset();
+        } else {
+            qsa_disabled.reset(seq_id);
+        }
+    }
+
+    return res;
 }
 
 void llama_memory_hybrid_idx::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {
@@ -157,11 +175,19 @@ void llama_memory_hybrid_idx::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_i
 
     if (mem_idx) {
         mem_idx->seq_cp(seq_id_src, seq_id_dst, p0, p1);
+
+        if (qsa_disabled[seq_id_src] && get_mem_attn()->seq_pos_max(seq_id_dst) >= 0) {
+            qsa_disabled.set(seq_id_dst);
+        }
     }
 }
 
 void llama_memory_hybrid_idx::seq_keep(llama_seq_id seq_id) {
     llama_memory_hybrid::seq_keep(seq_id);
+
+    const bool disabled = qsa_disabled[seq_id];
+    qsa_disabled.reset();
+    qsa_disabled.set(seq_id, disabled);
 
     if (mem_idx) {
         mem_idx->seq_keep(seq_id);
@@ -197,9 +223,20 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_memory_hybrid_idx::memory_bre
 }
 
 void llama_memory_hybrid_idx::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
+    if (mem_idx) {
+        const uint32_t count = seq_id < 0 ? n_seq_max : 1;
+        io.write(&HYBRID_IDX_STATE_MAGIC, sizeof(HYBRID_IDX_STATE_MAGIC));
+        io.write(&HYBRID_IDX_STATE_VERSION, sizeof(HYBRID_IDX_STATE_VERSION));
+        io.write(&count, sizeof(count));
+        for (uint32_t s = 0; s < count; ++s) {
+            const uint8_t disabled = qsa_disabled[seq_id < 0 ? s : seq_id];
+            io.write(&disabled, sizeof(disabled));
+        }
+    }
+
     llama_memory_hybrid::state_write(io, seq_id, flags);
 
-    // [TAG_HYBRID_IDX_STATE] the indexer section goes last, so it is a pure suffix: an old reader stops early instead of misparsing it
+    // [TAG_HYBRID_IDX_STATE] the indexer section follows the hybrid caches
     // The indexer mirrors the attention cache, so it uses the same PARTIAL_ONLY gate.
     if ((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0) {
         if (mem_idx) {
@@ -219,7 +256,32 @@ void llama_memory_hybrid_idx::state_read(llama_io_read_i & io, llama_seq_id seq_
     llama_kv_cache::slot_info_vec_t sinfos_attn;
 
     try {
+        std::bitset<LLAMA_MAX_SEQ> restored_qsa_disabled;
+        if (mem_idx) {
+            uint32_t magic, version, count;
+            io.read(&magic, sizeof(magic));
+            io.read(&version, sizeof(version));
+            io.read(&count, sizeof(count));
+            if (magic != HYBRID_IDX_STATE_MAGIC || version != HYBRID_IDX_STATE_VERSION ||
+                    count != (seq_id < 0 ? n_seq_max : 1)) {
+                throw std::runtime_error("hybrid indexer state header mismatch");
+            }
+            for (uint32_t s = 0; s < count; ++s) {
+                uint8_t disabled;
+                io.read(&disabled, sizeof(disabled));
+                if (disabled > 1) {
+                    throw std::runtime_error("invalid hybrid indexer QSA flag");
+                }
+                restored_qsa_disabled.set(seq_id < 0 ? s : seq_id, disabled != 0);
+            }
+        }
+
         if ((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0) {
+            // An empty saved sequence must also replace the destination cells.
+            // Otherwise clearing its flag could expose an old image to QSA.
+            if (seq_id >= 0) {
+                state_drop(seq_id);
+            }
             get_mem_attn()->state_read_sinfo(io, seq_id, flags, mem_idx ? &sinfos_attn : nullptr, nullptr);
         }
 
@@ -230,6 +292,15 @@ void llama_memory_hybrid_idx::state_read(llama_io_read_i & io, llama_seq_id seq_
             if (mem_idx) {
                 mem_idx->state_read_sinfo(io, seq_id, flags, nullptr, &sinfos_attn);
             }
+        }
+
+        if (flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) {
+            // Recurrent-only rollback leaves the attention cells in place.
+            qsa_disabled |= restored_qsa_disabled;
+        } else if (seq_id < 0) {
+            qsa_disabled = restored_qsa_disabled;
+        } else {
+            qsa_disabled.set(seq_id, restored_qsa_disabled[seq_id]);
         }
 
     } catch (...) {
@@ -255,10 +326,56 @@ void llama_memory_hybrid_idx::state_drop(llama_seq_id seq_id) {
     if (mem_idx) {
         mem_idx->seq_rm(seq_id, -1, -1);
     }
+
+    qsa_disabled.reset(seq_id);
 }
 
 llama_kv_cache * llama_memory_hybrid_idx::get_mem_idx() const {
     return mem_idx.get();
+}
+
+static bool llama_qsa_is_multimodal(const llama_ubatch & ubatch, uint32_t i) {
+    return ubatch.token == nullptr || (ubatch.is_pos_2d() &&
+            (ubatch.pos[i + ubatch.n_tokens] != ubatch.pos[i] ||
+             ubatch.pos[i + 2*ubatch.n_tokens] != ubatch.pos[i]));
+}
+
+void llama_memory_hybrid_idx::update_qsa(const llama_ubatch & ubatch) {
+    if (!mem_idx) {
+        return;
+    }
+
+    for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+        if (llama_qsa_is_multimodal(ubatch, i)) {
+            for (int32_t s = 0; s < ubatch.n_seq_id[i]; ++s) {
+                qsa_disabled.set(ubatch.seq_id[i][s]);
+            }
+        }
+    }
+}
+
+bool llama_memory_hybrid_idx::can_use_qsa(const llama_ubatch & ubatch) const {
+    if (!mem_idx) {
+        return false;
+    }
+
+    // The current block gather also visits foreign cells in a unified stream.
+    if (mem_idx->get_n_stream() == 1 && qsa_disabled.any()) {
+        return false;
+    }
+
+    for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+        if (llama_qsa_is_multimodal(ubatch, i)) {
+            return false;
+        }
+        for (int32_t s = 0; s < ubatch.n_seq_id[i]; ++s) {
+            if (qsa_disabled[ubatch.seq_id[i][s]]) {
+                return false;
+            }
+        }
+    }
+
+    return true;
 }
 
 //
@@ -283,6 +400,7 @@ llama_memory_hybrid_idx_context::llama_memory_hybrid_idx_context(llama_memory_st
 llama_memory_hybrid_idx_context::llama_memory_hybrid_idx_context(llama_memory_hybrid_idx * mem) :
     llama_memory_hybrid_context(mem),
     mem(mem),
+    is_full(true),
     // graph reservation walks a full context, and qwen4exp builds the sparse attention only when this is set
     // without it the reserved worst case is the dense graph, so ggml-alloc must grow the buffer on the first decode
     ns_ubatch(mem->get_mem_idx() == nullptr ?
@@ -326,6 +444,10 @@ bool llama_memory_hybrid_idx_context::apply() {
         res = res & ctx_idx->apply();
     }
 
+    if (res && ctx_idx && !is_full) {
+        mem->update_qsa(get_ubatch());
+    }
+
     return res;
 }
 
@@ -339,6 +461,12 @@ uint32_t llama_memory_hybrid_idx_context::get_n_stream() const {
     return ns_ubatch[i_cur];
 }
 
+bool llama_memory_hybrid_idx_context::can_use_qsa(const llama_ubatch & ubatch) const {
+    // Reservation must still account for the largest sparse graph, even if the
+    // current sequences use dense attention.
+    return get_idx() != nullptr && (is_full || mem->can_use_qsa(ubatch));
+}
+
 void llama_memory_hybrid_idx_context::set_input_qsa(
         ggml_tensor * cell_blk,
         ggml_tensor * blk_cells,
@@ -349,6 +477,7 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
         bool blk_bias) const {
     GGML_ASSERT(ratio > 0);
     GGML_ASSERT(mem != nullptr && mem->get_mem_idx() != nullptr);
+    GGML_ASSERT(can_use_qsa(*ubatch));
 
     GGML_ASSERT(ggml_backend_buffer_is_host(cell_blk->buffer));
 
@@ -367,7 +496,7 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
     float   * dst_bias      = (float   *) bias->data;
 
     // block b covers [b*ratio, (b+1)*ratio), so its first token is at b*ratio
-    // all mrope sections carry it: exact for text, approximate for images
+    // multimodal sequences bypass QSA; their temporal positions do not count tokens
     for (int64_t sec = 0; sec < 4; ++sec) {
         for (int64_t s = 0; s < n_ns; ++s) {
             for (int64_t b = 0; b < n_blocks; ++b) {

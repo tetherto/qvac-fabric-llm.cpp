@@ -215,6 +215,19 @@ extern "C" {
     typedef void   (*ggml_backend_comm_free_t)(void * comm_ctx);
     typedef bool   (*ggml_backend_comm_allreduce_tensor_t)(void * comm_ctx, struct ggml_tensor ** tensors);
 
+    // Optional whole-graph capture hooks for communication backends. The graph
+    // array is backend-major: graphs[backend*n_graphs_per_backend + graph].
+    // CAPTURE means that the caller must execute the graph normally and then
+    // call graph_end. REPLAY means that the backend already launched it.
+    enum ggml_backend_comm_graph_mode {
+        GGML_BACKEND_COMM_GRAPH_DIRECT = 0,
+        GGML_BACKEND_COMM_GRAPH_CAPTURE,
+        GGML_BACKEND_COMM_GRAPH_REPLAY,
+    };
+    typedef enum ggml_backend_comm_graph_mode (*ggml_backend_comm_graph_begin_t)(
+        void * comm_ctx, uint64_t graph_uid, struct ggml_cgraph * const * graphs, size_t n_graphs_per_backend);
+    typedef bool (*ggml_backend_comm_graph_end_t)(void * comm_ctx, bool success);
+
     // Split buffer type for tensor parallelism (old)
     typedef ggml_backend_buffer_type_t   (*ggml_backend_split_buffer_type_t)(int main_device, const float * tensor_split);
     // Set the number of threads for the backend

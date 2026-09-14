@@ -103,6 +103,9 @@ if (CUDAToolkit_FOUND)
     list(APPEND GGML_HEADERS_CUDA "../../include/ggml-cuda.h")
 
     file(GLOB   GGML_SOURCES_CUDA "*.cu")
+    # DeepGEMM kernels require the SM90a architecture target and are compiled
+    # in a dedicated object library below when explicitly enabled.
+    list(FILTER GGML_SOURCES_CUDA EXCLUDE REGEX "/deepgemm-mmid\\.cu$")
     file(GLOB   SRCS "template-instances/fattn-tile*.cu")
     list(APPEND GGML_SOURCES_CUDA ${SRCS})
     file(GLOB   SRCS "template-instances/fattn-mma*.cu")
@@ -128,6 +131,43 @@ if (CUDAToolkit_FOUND)
                              ${GGML_HEADERS_CUDA}
                              ${GGML_SOURCES_CUDA}
                             )
+
+    if (GGML_CUDA_DEEPGEMM)
+        if (CUDAToolkit_VERSION VERSION_LESS "12.3")
+            message(FATAL_ERROR "GGML_CUDA_DEEPGEMM requires CUDA Toolkit 12.3 or newer")
+        endif()
+        if (NOT EXISTS "${GGML_CUDA_DEEPGEMM_ROOT}/deep_gemm/include/deep_gemm/impls/sm90_fp8_gemm_1d2d.cuh")
+            message(FATAL_ERROR
+                "GGML_CUDA_DEEPGEMM_ROOT must point to a DeepGEMM source checkout "
+                "(expected deep_gemm/include/deep_gemm/impls/sm90_fp8_gemm_1d2d.cuh)")
+        endif()
+        if (NOT EXISTS "${GGML_CUDA_DEEPGEMM_ROOT}/third-party/cutlass/include/cute/arch/copy_sm90_tma.hpp")
+            message(FATAL_ERROR "GGML_CUDA_DEEPGEMM_ROOT is missing the CUTLASS submodule")
+        endif()
+
+        # CMake 3.22 does not understand the architecture-specific `90a`
+        # suffix, so suppress its automatic -gencode flags for this object and
+        # pass the same SM90a target used by DeepGEMM's pinned JIT compiler.
+        add_library(ggml-cuda-deepgemm-mmid OBJECT deepgemm-mmid.cu)
+        set_target_properties(ggml-cuda-deepgemm-mmid PROPERTIES
+            CUDA_ARCHITECTURES OFF
+            CUDA_STANDARD 17
+            CUDA_STANDARD_REQUIRED ON
+            POSITION_INDEPENDENT_CODE ON)
+        target_compile_definitions(ggml-cuda-deepgemm-mmid PRIVATE GGML_CUDA_DEEPGEMM)
+        target_include_directories(ggml-cuda-deepgemm-mmid PRIVATE
+            .
+            ..
+            ../../include
+            "${GGML_CUDA_DEEPGEMM_ROOT}/deep_gemm/include"
+            "${GGML_CUDA_DEEPGEMM_ROOT}/third-party/cutlass/include")
+        target_compile_options(ggml-cuda-deepgemm-mmid PRIVATE
+            "$<$<COMPILE_LANGUAGE:CUDA>:-gencode=arch=compute_90a,code=sm_90a;-O3;--expt-relaxed-constexpr;--expt-extended-lambda;--diag-suppress=39,161,174,177,186,940;--ptxas-options=--register-usage-level=10>")
+
+        target_sources(ggml-cuda PRIVATE $<TARGET_OBJECTS:ggml-cuda-deepgemm-mmid>)
+        target_compile_definitions(ggml-cuda PRIVATE GGML_CUDA_DEEPGEMM)
+        target_link_libraries(ggml-cuda PRIVATE CUDA::cuda_driver)
+    endif()
 
     add_compile_definitions(GGML_CUDA_PEER_MAX_BATCH_SIZE=${GGML_CUDA_PEER_MAX_BATCH_SIZE})
 

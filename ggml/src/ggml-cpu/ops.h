@@ -44,6 +44,7 @@ void ggml_compute_forward_repeat_back(const struct ggml_compute_params * params,
 void ggml_compute_forward_concat(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_silu_back(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_gelu_back(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+void ggml_compute_forward_moe_ffn(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_mul_mat_id_back_a(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_mul_mat_id_back_b(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_geglu_back(const struct ggml_compute_params * params, struct ggml_tensor * dst);

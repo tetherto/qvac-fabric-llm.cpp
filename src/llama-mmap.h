@@ -10,6 +10,13 @@
 #include <string>
 #include <map>
 
+// Shared-memory device buffers must contain only their assigned tensors.
+// A file span can include CPU weights between GPU weights, so mapping it would
+// make layer offload ineffective and disagree with no_alloc fit projections.
+inline bool llama_use_mmap_device_buffer(bool use_mmap, bool shares_host) {
+    return use_mmap && !shares_host;
+}
+
 struct llama_file;
 struct llama_mmap;
 struct llama_mlock;

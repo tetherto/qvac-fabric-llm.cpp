@@ -3116,6 +3116,105 @@ void ggml_compute_forward_gelu_back(
     }
 }
 
+// ggml_compute_forward_moe_ffn
+
+static inline float ggml_moe_ffn_weight(
+        const ggml_tensor * weight,
+        const ggml_tensor * scale,
+        int64_t i0,
+        int64_t i1,
+        int64_t i2) {
+    const char * ptr = (const char *) weight->data + i0*weight->nb[0] + i1*weight->nb[1] + i2*weight->nb[2];
+    if (weight->type == GGML_TYPE_BF16) {
+        return GGML_BF16_TO_FP32(*(const ggml_bf16_t *) ptr);
+    }
+
+    GGML_ASSERT(weight->type == GGML_TYPE_F8_E4M3 && scale != nullptr);
+    const float s = *(const float *) ((const char *) scale->data +
+        (i0/128)*scale->nb[0] + (i1/128)*scale->nb[1] + i2*scale->nb[2]);
+    return ggml_ue4m3_to_fp32(*(const uint8_t *) ptr) * s;
+}
+
+void ggml_compute_forward_moe_ffn(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * gate_up       = dst->src[0];
+    const ggml_tensor * down          = dst->src[1];
+    const ggml_tensor * x             = dst->src[2];
+    const ggml_tensor * ids           = dst->src[3];
+    const ggml_tensor * weights       = dst->src[4];
+    const ggml_tensor * gate_up_scale = dst->src[5];
+    const ggml_tensor * down_scale    = dst->src[6];
+
+    GGML_ASSERT(gate_up->type == GGML_TYPE_BF16 || gate_up->type == GGML_TYPE_F8_E4M3);
+    GGML_ASSERT(down->type == gate_up->type);
+    GGML_ASSERT(x->type == GGML_TYPE_F32 && ids->type == GGML_TYPE_I32);
+    GGML_ASSERT(weights->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(dst));
+
+    const int64_t n_embd        = gate_up->ne[0];
+    const int64_t n_ff          = gate_up->ne[1]/2;
+    const int64_t n_expert      = gate_up->ne[2];
+    const int64_t n_expert_used = ids->ne[0];
+    const int64_t n_tokens      = ids->ne[1];
+    const int64_t n_assignments = n_expert_used*n_tokens;
+    const int32_t expert_offset = ggml_get_op_params_i32(dst, 0);
+
+    GGML_ASSERT(params->wsize >= (size_t) n_assignments*n_ff*sizeof(float));
+    float * activated = (float *) params->wdata;
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    for (int64_t index = ith; index < n_assignments*n_ff; index += nth) {
+        const int64_t ih         = index % n_ff;
+        const int64_t assignment = index / n_ff;
+        const int64_t slot       = assignment % n_expert_used;
+        const int64_t token      = assignment / n_expert_used;
+        const int32_t global_id  = *(const int32_t *) ((const char *) ids->data +
+            slot*ids->nb[0] + token*ids->nb[1]);
+        const int64_t expert = (int64_t) global_id - expert_offset;
+
+        float value = 0.0f;
+        if (expert >= 0 && expert < n_expert) {
+            const float * xv = (const float *) ((const char *) x->data + token*x->nb[2]);
+            float gate = 0.0f;
+            float up   = 0.0f;
+            for (int64_t ik = 0; ik < n_embd; ++ik) {
+                gate += ggml_moe_ffn_weight(gate_up, gate_up_scale, ik, ih,        expert)*xv[ik];
+                up   += ggml_moe_ffn_weight(gate_up, gate_up_scale, ik, ih + n_ff, expert)*xv[ik];
+            }
+            value = gate/(1.0f + expf(-gate))*up;
+        }
+        activated[assignment*n_ff + ih] = value;
+    }
+
+    ggml_barrier(params->threadpool);
+
+    for (int64_t index = ith; index < n_tokens*n_embd; index += nth) {
+        const int64_t io    = index % n_embd;
+        const int64_t token = index / n_embd;
+        float sum = 0.0f;
+        for (int64_t slot = 0; slot < n_expert_used; ++slot) {
+            const int32_t global_id = *(const int32_t *) ((const char *) ids->data +
+                slot*ids->nb[0] + token*ids->nb[1]);
+            const int64_t expert = (int64_t) global_id - expert_offset;
+            if (expert < 0 || expert >= n_expert) {
+                continue;
+            }
+            float expert_sum = 0.0f;
+            const float * av = activated + (token*n_expert_used + slot)*n_ff;
+            for (int64_t ih = 0; ih < n_ff; ++ih) {
+                expert_sum += ggml_moe_ffn_weight(down, down_scale, ih, io, expert)*av[ih];
+            }
+            const float route_weight = *(const float *) ((const char *) weights->data +
+                slot*weights->nb[1] + token*weights->nb[2]);
+            sum += route_weight*expert_sum;
+        }
+        ((float *) dst->data)[index] = sum;
+    }
+}
+
 // ggml_compute_forward_mul_mat_id_back_a
 
 static void ggml_compute_forward_mul_mat_id_back_a_f32(
@@ -6457,6 +6556,7 @@ void ggml_compute_forward_clamp(
         case GGML_TYPE_I32:
         case GGML_TYPE_I64:
         case GGML_TYPE_F64:
+        case GGML_TYPE_F8_E4M3:
         GGML_CASE_TBQ_TYPES:
         case GGML_TYPE_COUNT:
             {

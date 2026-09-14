@@ -1522,7 +1522,12 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
           ggml_tensor * w_s) const {
     ggml_tensor * res = ggml_mul_mat_id(ctx0, w, cur, ids);
 
-    if (w_s) {
+    if (w->type == GGML_TYPE_F8_E4M3) {
+        // FP8 block scales are part of the matrix representation and must be
+        // consumed inside the GEMM, rather than multiplied onto its result.
+        GGML_ASSERT(w_s != nullptr && w_s->type == GGML_TYPE_F32);
+        res->src[3] = w_s;
+    } else if (w_s) {
         const int64_t n_expert = w_s->ne[0];
         const int64_t n_tokens = cur->ne[2];
         ggml_tensor * s = ggml_reshape_3d(ctx0, w_s, 1, n_expert, 1);
@@ -2102,6 +2107,35 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         ggml_tensor * repeated = ggml_repeat_4d(ctx0, cur, n_embd, n_expert_used, n_tokens, 1);
         cur = ggml_mul(ctx0, repeated, weights);
         cb(cur, "ffn_moe_weighted", il);
+    }
+
+    // Qwen4-Exp stores routed gate/up as one tensor. Keep the experimental
+    // whole-FFN path opt-in while it is being tuned; native FP8 otherwise uses
+    // the regular MUL_MAT_ID graph below.
+    const bool fused_moe_enabled = [] {
+        const char * value = getenv("GGML_CUDA_DEEPGEMM_MOE_FFN");
+        return value != nullptr && value[0] != '\0' && strcmp(value, "0") != 0;
+    }();
+    const bool fused_moe_weight_type = gate_up_exps && down_exps &&
+        (gate_up_exps->type == GGML_TYPE_F8_E4M3 || gate_up_exps->type == GGML_TYPE_BF16);
+    const bool fused_moe_scales = gate_up_exps &&
+        ((gate_up_exps->type == GGML_TYPE_F8_E4M3 && up_exps_s && down_exps_s) ||
+         (gate_up_exps->type == GGML_TYPE_BF16 && !up_exps_s && !down_exps_s));
+    const bool fused_moe_compatible =
+        fused_moe_enabled && arch == LLM_ARCH_QWEN4EXP && fused_moe_weight_type && fused_moe_scales &&
+        gate_up_exps->type == down_exps->type && type_op == LLM_FFN_SILU &&
+        !weight_before_ffn && !cparams.training && loras->empty() &&
+        !gate_up_exps_b && !up_exps_b && !gate_exps_b && !down_exps_b &&
+        !up_exps && !gate_exps;
+
+    if (fused_moe_compatible) {
+        ggml_tensor * moe_out = ggml_moe_ffn(
+            ctx0, gate_up_exps, down_exps, cur, selected_experts, weights,
+            up_exps_s, down_exps_s, 0);
+        cb(moe_out, "ffn_moe_fused", il);
+        ggml_build_forward_expand(gf, moe_out);
+        cb(moe_out, "ffn_moe_out", il);
+        return moe_out;
     }
 
     ggml_tensor * up = nullptr;

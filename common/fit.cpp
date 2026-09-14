@@ -391,6 +391,10 @@ static void common_params_fit_impl(
             __func__, sum_projected_used/MiB, sum_free/MiB);
     }
 
+    // Shared-memory devices use packed weight buffers even with mmap enabled
+    // (see llama_use_mmap_device_buffer). Their model bytes remain resident
+    // device demand; only the CPU row's mapped weights are evictable. This
+    // keeps the no_alloc tensor projection identical to actual device placement.
     // Host demand must be measured in the same currency as host availability.
     // The probe loads with LLAMA_LOAD_MODE_NONE, so mb.model counts the full
     // weight bytes as resident buffers — but under the caller's real

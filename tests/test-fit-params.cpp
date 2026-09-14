@@ -3,6 +3,7 @@
 // and context interpolation without loading model weights or a GPU backend.
 
 #include "../common/fit.h"
+#include "../src/llama-mmap.h"
 
 #include <cstdio>
 #include <cstdint>
@@ -99,7 +100,31 @@ static void test_auto_cache_preserves_context_fitting() {
         common_fit_auto_moe_cache(mparams, cparams, 8, 1, false, true), true);
 }
 
+static void test_mmap_shared_device_projection() {
+    for (bool mmap : {false, true}) {
+        expect_i64("shared device always uses packed weights",
+            llama_use_mmap_device_buffer(mmap, true), false);
+        expect_i64("discrete device mapping policy unchanged",
+            llama_use_mmap_device_buffer(mmap, false), mmap);
+
+        // A 19 GiB file spans both CPU and GPU tensors. With packed device
+        // buffers, reducing offload from 16 to 13 GiB reduces the actual
+        // device working set by 3 GiB even when the file span stays constant.
+        const int64_t file_span = 19 * GiB;
+        for (int64_t weights : {16 * GiB, 13 * GiB}) {
+            const int64_t device_model = llama_use_mmap_device_buffer(mmap, true) ? file_span : weights;
+            expect_i64("device projection matches packed allocation", device_model, weights);
+            const int64_t cpu_model = file_span - weights;
+            const int64_t host_resident = GiB + (mmap ? 0 : cpu_model);
+            expect_i64("mmap only removes CPU model from resident demand",
+                common_fit_shared_pool_deficit({device_model + GiB}, {true}, 18 * GiB, host_resident, GiB),
+                mmap ? (weights == 16 * GiB ? GiB : 0) : 4 * GiB);
+        }
+    }
+}
+
 int main() {
+    test_mmap_shared_device_projection();
     test_automatic_acceleration();
     test_auto_cache_preserves_context_fitting();
     // --- common_fit_shared_pool_deficit ---

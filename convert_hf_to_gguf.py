@@ -156,6 +156,12 @@ def parse_args() -> argparse.Namespace:
         "--fp8-as-q8", action="store_true",
         help="Store tensors dequantized from FP8 as Q8_0 instead of BF16/F16.",
     )
+    parser.add_argument(
+        "--preserve-fp8-experts", action="store_true",
+        help=("Store routed MoE expert weights as their original E4M3 bytes plus "
+              "128x128 block scales. Currently supported for Qwen4-Exp with "
+              "--fuse-gate-up-exps."),
+    )
 
     parser.add_argument(
         "--target-model-dir", type=str, default=None,
@@ -290,6 +296,7 @@ def main() -> None:
                                      target_model_dir=Path(args.target_model_dir) if args.target_model_dir else None,
                                      fuse_gate_up_exps=args.fuse_gate_up_exps,
                                      fp8_as_q8=args.fp8_as_q8,
+                                     preserve_fp8_experts=args.preserve_fp8_experts,
                                      )
 
         if args.vocab_only:

@@ -32,6 +32,9 @@
 #include "ggml-cuda/cumsum.cuh"
 #include "ggml-cuda/diagmask.cuh"
 #include "ggml-cuda/diag.cuh"
+#ifdef GGML_CUDA_DEEPGEMM
+#include "ggml-cuda/deepgemm-mmid.cuh"
+#endif
 #include "ggml-cuda/fattn.cuh"
 #include "ggml-cuda/fwht.cuh"
 #include "ggml-cuda/getrows.cuh"
@@ -99,6 +102,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <string>
+#include <thread>
 #include <vector>
 
 static_assert(sizeof(half) == sizeof(ggml_fp16_t), "wrong fp16 size");
@@ -806,6 +810,10 @@ static void ggml_backend_cuda_buffer_get_tensor(ggml_backend_buffer_t buffer, co
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
 
     ggml_cuda_set_device(ctx->device);
+    if (getenv("GGML_CUDA_BUFFER_DEBUG") != nullptr && size >= 100*1024*1024) {
+        GGML_LOG_INFO("%s: reading %zu MiB from device %d tensor %s, offset=%zu MiB\n",
+            __func__, size/1024/1024, ctx->device, tensor->name, offset/1024/1024);
+    }
     CUDA_CHECK(cudaMemcpyAsync(data, (const char *) tensor->data + offset, size, cudaMemcpyDeviceToHost, cudaStreamPerThread));
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
 }
@@ -825,6 +833,11 @@ static void ggml_backend_cuda_buffer_get_tensor_2d(ggml_backend_buffer_t buffer,
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *)buffer->context;
 
     ggml_cuda_set_device(ctx->device);
+    const size_t total_size = size*n_copies;
+    if (getenv("GGML_CUDA_BUFFER_DEBUG") != nullptr && total_size >= 100*1024*1024) {
+        GGML_LOG_INFO("%s: reading %zu MiB from device %d tensor %s, offset=%zu MiB, copies=%zu\n",
+            __func__, total_size/1024/1024, ctx->device, tensor->name, offset/1024/1024, n_copies);
+    }
     CUDA_CHECK(cudaMemcpy2DAsync(
         data, stride_data, (const char *) tensor->data + offset, stride_tensor, size, n_copies, cudaMemcpyDeviceToHost, cudaStreamPerThread));
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
@@ -996,7 +1009,96 @@ struct ggml_backend_cuda_comm_context {
     std::vector<ncclComm_t>     comms;
 #endif // GGML_USE_NCCL
 
+#if defined(USE_CUDA_GRAPH) && defined(GGML_USE_NCCL) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    uint64_t                     graph_uid       = 0;
+    bool                         graph_seen_once = false;
+    bool                         graph_capturing = false;
+    bool                         graph_disabled  = false;
+    std::vector<cudaGraph_t>     graphs;
+    std::vector<cudaGraphExec_t> graph_instances;
+    std::vector<std::thread>     graph_launch_threads;
+    std::mutex                   graph_launch_mutex;
+    std::condition_variable      graph_launch_cv;
+    std::condition_variable      graph_launch_done_cv;
+    uint64_t                     graph_launch_generation = 0;
+    size_t                       graph_launch_done       = 0;
+    bool                         graph_launch_stop       = false;
+
+    void launch_graphs() {
+        if (graph_launch_threads.empty()) {
+            graph_launch_threads.reserve(backends.size());
+            for (size_t i = 0; i < backends.size(); ++i) {
+                graph_launch_threads.emplace_back([this, i]() {
+                    uint64_t observed_generation = 0;
+                    for (;;) {
+                        {
+                            std::unique_lock<std::mutex> lock(graph_launch_mutex);
+                            graph_launch_cv.wait(lock, [&]() {
+                                return graph_launch_stop || graph_launch_generation != observed_generation;
+                            });
+                            if (graph_launch_stop) {
+                                return;
+                            }
+                            observed_generation = graph_launch_generation;
+                        }
+
+                        auto * cuda_ctx = static_cast<ggml_backend_cuda_context *>(backends[i]->context);
+                        ggml_cuda_set_device(cuda_ctx->device);
+                        CUDA_CHECK(cudaGraphLaunch(graph_instances[i], cuda_ctx->stream()));
+
+                        {
+                            std::lock_guard<std::mutex> lock(graph_launch_mutex);
+                            if (++graph_launch_done == backends.size()) {
+                                graph_launch_done_cv.notify_one();
+                            }
+                        }
+                    }
+                });
+            }
+        }
+
+        std::unique_lock<std::mutex> lock(graph_launch_mutex);
+        graph_launch_done = 0;
+        ++graph_launch_generation;
+        graph_launch_cv.notify_all();
+        graph_launch_done_cv.wait(lock, [&]() {
+            return graph_launch_done == backends.size();
+        });
+    }
+
+    void stop_graph_launch_threads() {
+        {
+            std::lock_guard<std::mutex> lock(graph_launch_mutex);
+            graph_launch_stop = true;
+        }
+        graph_launch_cv.notify_all();
+        for (std::thread & thread : graph_launch_threads) {
+            thread.join();
+        }
+        graph_launch_threads.clear();
+    }
+
+    void reset_graph() {
+        for (size_t i = 0; i < graph_instances.size(); ++i) {
+            ggml_cuda_set_device(dev_ids[i]);
+            if (graph_instances[i] != nullptr) {
+                CUDA_CHECK(cudaGraphExecDestroy(graph_instances[i]));
+            }
+            if (graphs[i] != nullptr) {
+                CUDA_CHECK(cudaGraphDestroy(graphs[i]));
+            }
+        }
+        graphs.clear();
+        graph_instances.clear();
+        graph_capturing = false;
+    }
+#endif
+
     ~ggml_backend_cuda_comm_context() {
+#if defined(USE_CUDA_GRAPH) && defined(GGML_USE_NCCL) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+        stop_graph_launch_threads();
+        reset_graph();
+#endif
 #ifdef GGML_USE_NCCL
         for (ncclComm_t comm : comms) {
             NCCL_CHECK(ncclCommDestroy(comm));
@@ -1886,6 +1988,12 @@ static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int c
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
 
+#ifdef GGML_CUDA_DEEPGEMM
+    if (ggml_cuda_deepgemm_mul_mat_id_graph_compatible(dst, ggml_cuda_get_device())) {
+        return false;
+    }
+#endif
+
     if (src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
         return true;
     }
@@ -1922,6 +2030,12 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     GGML_TENSOR_BINARY_OP_LOCALS
 
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+
+#ifdef GGML_CUDA_DEEPGEMM
+    if (ggml_cuda_deepgemm_mul_mat_id(ctx, dst)) {
+        return;
+    }
+#endif
 
     // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
     if (src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
@@ -2273,6 +2387,14 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_MUL_MAT_ID:
             ggml_cuda_mul_mat_id(ctx, dst);
             break;
+        case GGML_OP_MOE_FFN:
+#ifdef GGML_CUDA_DEEPGEMM
+            if (ggml_cuda_deepgemm_moe_ffn(ctx, dst)) {
+                break;
+            }
+#endif
+            GGML_ABORT("unsupported CUDA MOE_FFN operation");
+            break;
         case GGML_OP_MUL_MAT_ID_BACK_A:
             ggml_cuda_op_mul_mat_id_back_a(ctx, dst);
             break;
@@ -2489,6 +2611,10 @@ static void ggml_backend_cuda_get_tensor_async(ggml_backend_t backend, const ggm
 
     GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
 
+    if (getenv("GGML_CUDA_BUFFER_DEBUG") != nullptr && size >= 100*1024*1024) {
+        GGML_LOG_INFO("%s: reading %zu MiB from device %d tensor %s, offset=%zu MiB\n",
+            __func__, size/1024/1024, cuda_ctx->device, tensor->name, offset/1024/1024);
+    }
     CUDA_CHECK(cudaMemcpyAsync(data, (const char *) tensor->data + offset, size, cudaMemcpyDeviceToHost, cuda_ctx->stream()));
 }
 
@@ -2509,6 +2635,11 @@ static void ggml_backend_cuda_get_tensor_2d_async(ggml_backend_t backend, const 
     ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
 
     GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
+    const size_t total_size = size*n_copies;
+    if (getenv("GGML_CUDA_BUFFER_DEBUG") != nullptr && total_size >= 100*1024*1024) {
+        GGML_LOG_INFO("%s: reading %zu MiB from device %d tensor %s, offset=%zu MiB, copies=%zu\n",
+            __func__, total_size/1024/1024, cuda_ctx->device, tensor->name, offset/1024/1024, n_copies);
+    }
 
     CUDA_CHECK(cudaMemcpy2DAsync(
         data, stride_data, (const char *) tensor->data + offset, stride_tensor, size, n_copies, cudaMemcpyDeviceToHost, cuda_ctx->stream()));
@@ -2694,6 +2825,154 @@ static void ggml_cuda_graph_update_executable(ggml_backend_cuda_context * cuda_c
     }
 }
 #endif // USE_CUDA_GRAPH
+
+#if defined(USE_CUDA_GRAPH) && defined(GGML_USE_NCCL) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+static void ggml_backend_cuda_comm_graph_launch(ggml_backend_cuda_comm_context * comm_ctx) {
+    // A cudaGraphLaunch containing NCCL is collective. Launching multiple
+    // ranks sequentially from one thread can block on the first rank before
+    // the peer rank has been launched, particularly with NCCL < 2.26.
+    // NCCL_GRAPH_MIXING_SUPPORT=0 removes that serialization and is faster
+    // than dispatching through the persistent launch threads.
+    const char * graph_mixing = getenv("NCCL_GRAPH_MIXING_SUPPORT");
+    if (graph_mixing != nullptr && strcmp(graph_mixing, "0") == 0) {
+        for (size_t i = 0; i < comm_ctx->backends.size(); ++i) {
+            auto * cuda_ctx = static_cast<ggml_backend_cuda_context *>(comm_ctx->backends[i]->context);
+            ggml_cuda_set_device(cuda_ctx->device);
+            CUDA_CHECK(cudaGraphLaunch(comm_ctx->graph_instances[i], cuda_ctx->stream()));
+        }
+    } else {
+        comm_ctx->launch_graphs();
+    }
+}
+#endif
+
+static enum ggml_backend_comm_graph_mode ggml_backend_cuda_comm_graph_begin(
+        void * comm_ctx_v, uint64_t graph_uid, struct ggml_cgraph * const * graphs, size_t n_graphs_per_backend) {
+#if defined(USE_CUDA_GRAPH) && defined(GGML_USE_NCCL) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    auto * comm_ctx = static_cast<ggml_backend_cuda_comm_context *>(comm_ctx_v);
+    const char * tp_graphs = getenv("GGML_CUDA_TP_GRAPHS");
+    if (comm_ctx == nullptr || graph_uid == 0 || tp_graphs == nullptr || strcmp(tp_graphs, "0") == 0 ||
+        getenv("GGML_CUDA_DISABLE_GRAPHS") != nullptr ||
+        getenv("GGML_CUDA_DISABLE_TP_GRAPHS") != nullptr ||
+        comm_ctx->try_allreduce != ggml_backend_cuda_comm_try_allreduce_nccl || comm_ctx->graph_disabled) {
+        return GGML_BACKEND_COMM_GRAPH_DIRECT;
+    }
+
+    if (comm_ctx->graph_uid != graph_uid) {
+        comm_ctx->reset_graph();
+        comm_ctx->graph_uid       = graph_uid;
+        comm_ctx->graph_seen_once = true;
+        return GGML_BACKEND_COMM_GRAPH_DIRECT;
+    }
+
+    if (!comm_ctx->graph_instances.empty()) {
+        ggml_backend_cuda_comm_graph_launch(comm_ctx);
+        return GGML_BACKEND_COMM_GRAPH_REPLAY;
+    }
+
+    if (!comm_ctx->graph_seen_once) {
+        comm_ctx->graph_seen_once = true;
+        return GGML_BACKEND_COMM_GRAPH_DIRECT;
+    }
+
+    // Use the same compatibility test as the per-backend CUDA graph path.
+    // This keeps synchronous MUL_MAT_ID implementations out of whole-graph
+    // capture while allowing the stream-ordered native-FP8 DeepGEMM path.
+    for (size_t i = 0; i < comm_ctx->backends.size(); ++i) {
+        auto * cuda_ctx = static_cast<ggml_backend_cuda_context *>(comm_ctx->backends[i]->context);
+        ggml_cuda_set_device(cuda_ctx->device);
+        for (size_t j = 0; j < n_graphs_per_backend; ++j) {
+            if (!ggml_cuda_graph_check_compability(graphs[i*n_graphs_per_backend + j])) {
+                comm_ctx->graph_disabled = true;
+                return GGML_BACKEND_COMM_GRAPH_DIRECT;
+            }
+        }
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(ggml_cuda_lock);
+        ggml_cuda_lock_counter.fetch_add(1, std::memory_order_relaxed);
+    }
+    for (size_t i = 0; i < comm_ctx->backends.size(); ++i) {
+        auto * cuda_ctx = static_cast<ggml_backend_cuda_context *>(comm_ctx->backends[i]->context);
+        ggml_cuda_set_device(cuda_ctx->device);
+        cuda_ctx->curr_stream_no = 0;
+        cuda_ctx->external_graph_capture = true;
+        CUDA_CHECK(cudaStreamBeginCapture(cuda_ctx->stream(), cudaStreamCaptureModeRelaxed));
+    }
+    comm_ctx->graph_capturing = true;
+    GGML_LOG_DEBUG("%s: capturing tensor-parallel graph uid=%" PRIu64 " on %zu devices\n",
+                   __func__, graph_uid, comm_ctx->backends.size());
+    return GGML_BACKEND_COMM_GRAPH_CAPTURE;
+#else
+    GGML_UNUSED(comm_ctx_v);
+    GGML_UNUSED(graph_uid);
+    GGML_UNUSED(graphs);
+    GGML_UNUSED(n_graphs_per_backend);
+    return GGML_BACKEND_COMM_GRAPH_DIRECT;
+#endif
+}
+
+static bool ggml_backend_cuda_comm_graph_end(void * comm_ctx_v, bool success) {
+#if defined(USE_CUDA_GRAPH) && defined(GGML_USE_NCCL) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    auto * comm_ctx = static_cast<ggml_backend_cuda_comm_context *>(comm_ctx_v);
+    GGML_ASSERT(comm_ctx != nullptr && comm_ctx->graph_capturing);
+
+    comm_ctx->graphs.assign(comm_ctx->backends.size(), nullptr);
+    comm_ctx->graph_instances.assign(comm_ctx->backends.size(), nullptr);
+    bool capture_ok = success;
+    for (size_t i = 0; i < comm_ctx->backends.size(); ++i) {
+        auto * cuda_ctx = static_cast<ggml_backend_cuda_context *>(comm_ctx->backends[i]->context);
+        ggml_cuda_set_device(cuda_ctx->device);
+        cuda_ctx->curr_stream_no = 0;
+        cuda_ctx->external_graph_capture = false;
+        const cudaError_t err = cudaStreamEndCapture(cuda_ctx->stream(), &comm_ctx->graphs[i]);
+        if (err != cudaSuccess || comm_ctx->graphs[i] == nullptr) {
+            GGML_LOG_ERROR("%s: cudaStreamEndCapture failed on device %d: %s\n",
+                           __func__, cuda_ctx->device, cudaGetErrorString(err));
+            capture_ok = false;
+        }
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(ggml_cuda_lock);
+        if (ggml_cuda_lock_counter.fetch_sub(1, std::memory_order_relaxed) == 1) {
+            ggml_cuda_lock_cv.notify_all();
+        }
+    }
+    comm_ctx->graph_capturing = false;
+
+    if (capture_ok) {
+        for (size_t i = 0; i < comm_ctx->backends.size(); ++i) {
+            ggml_cuda_set_device(comm_ctx->dev_ids[i]);
+            const cudaError_t err =
+                cudaGraphInstantiate(&comm_ctx->graph_instances[i], comm_ctx->graphs[i], nullptr, nullptr, 0);
+            if (err != cudaSuccess) {
+                GGML_LOG_ERROR("%s: cudaGraphInstantiate failed on device %d: %s\n",
+                               __func__, comm_ctx->dev_ids[i], cudaGetErrorString(err));
+                capture_ok = false;
+                break;
+            }
+        }
+    }
+
+    if (!capture_ok) {
+        comm_ctx->graph_disabled = true;
+        comm_ctx->reset_graph();
+        return false;
+    }
+
+    // Stream capture records rather than executes the work, so launch the
+    // newly instantiated graphs to complete the evaluation that captured them.
+    ggml_backend_cuda_comm_graph_launch(comm_ctx);
+    GGML_LOG_DEBUG("%s: tensor-parallel graph capture complete\n", __func__);
+    return true;
+#else
+    GGML_UNUSED(comm_ctx_v);
+    GGML_UNUSED(success);
+    return false;
+#endif
+}
 
 static bool ggml_cuda_should_fuse_rope_set_rows(const ggml_tensor * rope,
                                                 const ggml_tensor * view,
@@ -4291,6 +4570,13 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
 
     ggml_cuda_set_device(cuda_ctx->device);
 
+#ifdef USE_CUDA_GRAPH
+    if (cuda_ctx->external_graph_capture) {
+        ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, false, false, nullptr);
+        return GGML_STATUS_SUCCESS;
+    }
+#endif
+
     bool use_cuda_graph             = false;
     bool cuda_graph_update_required = false;
     const void * graph_key = nullptr;
@@ -5019,10 +5305,24 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     case GGML_TYPE_IQ4_XS:
                     case GGML_TYPE_BF16:
                         return true;
+#ifdef GGML_CUDA_DEEPGEMM
+                    case GGML_TYPE_F8_E4M3:
+                        return op->op == GGML_OP_MUL_MAT_ID &&
+                            b->type == GGML_TYPE_F32 &&
+                            op->src[3] != nullptr &&
+                            op->src[3]->type == GGML_TYPE_F32 &&
+                            ggml_cuda_info().devices[dev_ctx->device].cc == GGML_CUDA_CC_HOPPER;
+#endif
                     default:
                         return false;
                 }
             } break;
+        case GGML_OP_MOE_FFN:
+#ifdef GGML_CUDA_DEEPGEMM
+            return ggml_cuda_deepgemm_moe_ffn_supported(op, dev_ctx->device);
+#else
+            return false;
+#endif
         case GGML_OP_MUL_MAT_ID_BACK_A:
             return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
                    op->src[2]->type == GGML_TYPE_I32 && op->type == GGML_TYPE_F32;
@@ -5618,6 +5918,12 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_comm_allreduce_tensor") == 0) {
         return (void *)ggml_backend_cuda_comm_allreduce_tensor;
+    }
+    if (strcmp(name, "ggml_backend_comm_graph_begin") == 0) {
+        return (void *)ggml_backend_cuda_comm_graph_begin;
+    }
+    if (strcmp(name, "ggml_backend_comm_graph_end") == 0) {
+        return (void *)ggml_backend_cuda_comm_graph_end;
     }
     if (strcmp(name, "ggml_backend_register_host_buffer") == 0) {
         return (void *)ggml_backend_cuda_register_host_buffer;

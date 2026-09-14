@@ -202,6 +202,30 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
         layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", il), { n_ff_exp, n_embd, n_expert }, 0);
         create_tensor_gate_up_exps(layer, il, n_embd, n_ff_exp, n_expert, 0);
 
+        // Native FP8 expert weights carry one dequantization scale per 128x128
+        // block. Reuse ffn_up_exps_s for the fused gate/up tensor because
+        // build_moe_ffn already passes that slot to the merged projection.
+        if (layer.ffn_down_exps->type == GGML_TYPE_F8_E4M3) {
+            GGML_ASSERT(n_ff_exp % 128 == 0 && n_embd % 128 == 0);
+            layer.ffn_down_exps_s = create_tensor(
+                tn(LLM_TENSOR_FFN_DOWN_EXPS, "scale", il),
+                { n_ff_exp / 128, n_embd / 128, n_expert }, 0);
+        }
+        if (layer.ffn_gate_up_exps && layer.ffn_gate_up_exps->type == GGML_TYPE_F8_E4M3) {
+            GGML_ASSERT(n_embd % 128 == 0 && (2 * n_ff_exp) % 128 == 0);
+            layer.ffn_up_exps_s = create_tensor(
+                tn(LLM_TENSOR_FFN_GATE_UP_EXPS, "scale", il),
+                { n_embd / 128, (2 * n_ff_exp) / 128, n_expert }, 0);
+        } else if (layer.ffn_gate_exps && layer.ffn_gate_exps->type == GGML_TYPE_F8_E4M3) {
+            GGML_ASSERT(n_embd % 128 == 0 && n_ff_exp % 128 == 0);
+            layer.ffn_gate_exps_s = create_tensor(
+                tn(LLM_TENSOR_FFN_GATE_EXPS, "scale", il),
+                { n_embd / 128, n_ff_exp / 128, n_expert }, 0);
+            layer.ffn_up_exps_s = create_tensor(
+                tn(LLM_TENSOR_FFN_UP_EXPS, "scale", il),
+                { n_embd / 128, n_ff_exp / 128, n_expert }, 0);
+        }
+
         layer.ffn_gate_inp_shexp = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP_SHEXP, "weight", il), { n_embd }, 0);
         layer.ffn_gate_shexp     = create_tensor(tn(LLM_TENSOR_FFN_GATE_SHEXP,     "weight", il), { n_embd, n_ff_shexp }, 0);
         layer.ffn_up_shexp       = create_tensor(tn(LLM_TENSOR_FFN_UP_SHEXP,       "weight", il), { n_embd, n_ff_shexp }, 0);
@@ -424,21 +448,29 @@ ggml_tensor * llama_model_qwen4exp::graph::build_norm_gated(
 // one mean-pooled indexer key scores each block; set_input resolves the cache layout
 class llama_model_qwen4exp::llm_graph_input_qsa : public llm_graph_input_i {
 public:
-    llm_graph_input_qsa(const llama_memory_hybrid_idx_context * mctx, uint32_t ratio, bool blk_bias) :
-        mctx(mctx), ratio(ratio), blk_bias(blk_bias) {}
+    llm_graph_input_qsa(const llama_memory_hybrid_idx_context * mctx, uint32_t ratio, bool blk_bias, bool use_qsa) :
+        mctx(mctx), ratio(ratio), blk_bias(blk_bias), use_qsa(use_qsa) {}
     virtual ~llm_graph_input_qsa() = default;
 
     void set_input(const llama_ubatch * ubatch) override {
         mctx->get_idx()->set_input_k_idxs(k_idxs, ubatch);
-        mctx->set_input_qsa(cell_blk, blk_cells, blk_pos, bias, ubatch, ratio, blk_bias);
+        if (use_qsa) {
+            mctx->set_input_qsa(cell_blk, blk_cells, blk_pos, bias, ubatch, ratio, blk_bias);
+        }
     }
 
     bool can_reuse(const llm_graph_params & params) override {
         mctx = static_cast<const llama_memory_hybrid_idx_context *>(params.mctx);
 
         const auto * idx = mctx->get_idx();
-        if (idx == nullptr) {
+        if (idx == nullptr || use_qsa != mctx->can_use_qsa(params.ubatch)) {
             return false;
+        }
+
+        // Dense batches still fill the raw indexer cache. A later text batch
+        // can use it after another sequence in the batch has been cleared.
+        if (!use_qsa) {
+            return k_idxs->ne[0] == params.ubatch.n_tokens;
         }
 
         const int64_t n_kv     = idx->get_n_kv();
@@ -472,6 +504,7 @@ public:
 
     // the per-cell half of the bias is the attention mask, so only the per-block half is uploaded
     const bool blk_bias;
+    const bool use_qsa;
 };
 
 ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
@@ -505,6 +538,8 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
         kq_mask->ne[0] == n_kv && kq_mask->ne[1] == n_tps && kq_mask->ne[3] == n_stream &&
         cparams.causal_attn && !hparams.use_alibi;
 
+    const bool use_qsa = mctx_hyb->can_use_qsa(ubatch);
+
     // nothing above depends on the layer, so the layers sharing a ratio share one input set
     llm_graph_input_qsa * inp = nullptr;
 
@@ -512,18 +547,20 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
     if (it != qsa_inps.end()) {
         inp = it->second;
     } else {
-        auto qsa = std::make_unique<llm_graph_input_qsa>(mctx_hyb, (uint32_t) r, blk_bias);
+        auto qsa = std::make_unique<llm_graph_input_qsa>(mctx_hyb, (uint32_t) r, blk_bias, use_qsa);
 
-        qsa->k_idxs    = mctx_idx->build_input_k_idxs(ctx0, ubatch);
-        qsa->cell_blk  = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, n_kv, n_stream);
-        qsa->blk_cells = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, r*n_blocks, n_stream);
-        qsa->blk_pos   = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 4*n_blocks*n_stream);
-        qsa->bias      = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, blk_bias ? n_blocks : n_kv, n_tps, n_stream);
+        qsa->k_idxs = mctx_idx->build_input_k_idxs(ctx0, ubatch);
+        if (use_qsa) {
+            qsa->cell_blk  = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, n_kv, n_stream);
+            qsa->blk_cells = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, r*n_blocks, n_stream);
+            qsa->blk_pos   = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 4*n_blocks*n_stream);
+            qsa->bias      = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, blk_bias ? n_blocks : n_kv, n_tps, n_stream);
 
-        ggml_set_input(qsa->cell_blk);
-        ggml_set_input(qsa->blk_cells);
-        ggml_set_input(qsa->blk_pos);
-        ggml_set_input(qsa->bias);
+            ggml_set_input(qsa->cell_blk);
+            ggml_set_input(qsa->blk_cells);
+            ggml_set_input(qsa->blk_pos);
+            ggml_set_input(qsa->bias);
+        }
 
         inp = qsa.get();
         res->add_input(std::move(qsa));
@@ -536,6 +573,12 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
     cb(k_raw, "indexer_k_raw", il);
 
     ggml_build_forward_expand(gf, mctx_idx->cpy_k(ctx0, k_raw, inp->k_idxs, il));
+
+    // Images sharing a temporal position cannot be grouped by position/ratio.
+    // Keep these sequences dense until logical token ordering is implemented.
+    if (!use_qsa) {
+        return nullptr;
+    }
 
     // one key head, so rows are contiguous. get_k gives [idx_dim, n_head_kv, n_kv, n_stream].
     ggml_tensor * k_all = mctx_idx->get_k(ctx0, il);

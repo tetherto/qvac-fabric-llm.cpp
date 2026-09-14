@@ -226,6 +226,9 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     # llama_build_and_test(test-double-float.cpp) # SLOW
 
     llama_build_and_test(test-llama-archs.cpp)
+    if (NOT GGML_WEBGPU)
+        llama_test(test-llama-archs NAME test-qsa-multimodal ARGS --qsa-multimodal --seed 1)
+    endif()
 
     set(MODEL_DIR "${CMAKE_CURRENT_BINARY_DIR}/test-models/")
     file(MAKE_DIRECTORY "${MODEL_DIR}")
@@ -266,6 +269,8 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     target_include_directories(test-kv-cells PRIVATE ${PROJECT_SOURCE_DIR}/src)
     llama_build_and_test(test-kv-cache.cpp)
     target_include_directories(test-kv-cache PRIVATE ${PROJECT_SOURCE_DIR}/src)
+    llama_build_and_test(test-memory-hybrid-idx.cpp)
+    target_include_directories(test-memory-hybrid-idx PRIVATE ${PROJECT_SOURCE_DIR}/src)
 endif()
 
 llama_build_and_test(test-chat-peg-parser.cpp peg-parser/simple-tokenize.cpp)

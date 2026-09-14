@@ -358,6 +358,7 @@ struct cmd_params {
     std::vector<std::string>         hf_file;
     std::string                      hf_token;
     bool                             offline;
+    llama_tensor_read_lazy           tensor_read_lazy;
     std::vector<int>                 n_prompt;
     std::vector<int>                 n_gen;
     std::vector<std::pair<int, int>> n_pg;
@@ -403,6 +404,7 @@ static const cmd_params cmd_params_defaults = {
     /* hf_file              */ {},
     /* hf_token             */ "",
     /* offline              */ false,
+    /* tensor_read_lazy     */ LLAMA_TENSOR_READ_LAZY_AUTO,
     /* n_prompt             */ { 512 },
     /* n_gen                */ { 128 },
     /* n_pg                 */ {},
@@ -475,6 +477,7 @@ static void print_usage(int /* argc */, char ** argv) {
     printf("                                                    (default: value from HF_TOKEN environment variable)\n");
     printf("  --offline                                         Offline mode: forces use of cache, prevents network access\n");
     printf("                                                    (default: disabled)\n");
+    printf("  --tensor-read-lazy <off|auto|on>                  on-demand reading of arch-marked tensors (default: auto)\n");
     printf("  -p, --n-prompt <n>                                (default: %s)\n", join(cmd_params_defaults.n_prompt, ",").c_str());
     printf("  -n, --n-gen <n>                                   (default: %s)\n", join(cmd_params_defaults.n_gen, ",").c_str());
     printf("  -pg <pp,tg>                                       (default: %s)\n", join(transform_to_str(cmd_params_defaults.n_pg, pair_str), ",").c_str());
@@ -569,6 +572,7 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
     params.progress             = cmd_params_defaults.progress;
     params.no_warmup            = cmd_params_defaults.no_warmup;
     params.offline              = cmd_params_defaults.offline;
+    params.tensor_read_lazy     = cmd_params_defaults.tensor_read_lazy;
 
     if (const char * env = getenv("HF_TOKEN")) {
         params.hf_token = env;
@@ -834,6 +838,21 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                     break;
                 }
                 params.load_mode.insert(params.load_mode.end(), modes.begin(), modes.end());
+            } else if (arg == "--tensor-read-lazy") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                const std::string mode = argv[i];
+                if (mode == "off") {
+                    params.tensor_read_lazy = LLAMA_TENSOR_READ_LAZY_OFF;
+                } else if (mode == "auto") {
+                    params.tensor_read_lazy = LLAMA_TENSOR_READ_LAZY_AUTO;
+                } else if (mode == "on") {
+                    params.tensor_read_lazy = LLAMA_TENSOR_READ_LAZY_ON;
+                } else {
+                    invalid_param = true;
+                }
             } else if (arg == "-mg" || arg == "--main-gpu") {
                 if (++i >= argc) {
                     invalid_param = true;
@@ -2338,6 +2357,7 @@ int llama_bench(int argc, char ** argv) {
             fprintf(stderr, "llama-bench: benchmark %d/%zu: starting\n", params_idx, params_count);
         }
         auto mparams = inst.to_llama_mparams();
+        mparams.tensor_read_lazy = params.tensor_read_lazy;
         auto cparams = inst.to_llama_cparams();
 
         bool do_fit = inst.fit_target != cmd_params_defaults.fit_params_target[0] ||

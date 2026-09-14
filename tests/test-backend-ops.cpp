@@ -5315,6 +5315,97 @@ struct test_mul_mat_id : public test_case {
     }
 };
 
+struct test_mul_mat_id_deepgemm : public test_mul_mat_id {
+    using test_mul_mat_id::test_mul_mat_id;
+
+    double max_nmse_err() override {
+        // The experimental path dynamically quantizes both inputs to E4M3,
+        // while the CPU reference retains the original BF16/F32 values.
+        return 2e-3;
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MUL_MAT_ID_DEEPGEMM";
+    }
+};
+
+struct test_moe_ffn_deepgemm : public test_case {
+    const int64_t n_tokens;
+    const int64_t n_ff;
+    static constexpr int64_t n_embd = 2560;
+    static constexpr int64_t n_expert = 16;
+    static constexpr int64_t n_used = 10;
+
+    explicit test_moe_ffn_deepgemm(int64_t n_tokens, int64_t n_ff = 640) :
+        n_tokens(n_tokens), n_ff(n_ff) {}
+
+    std::string vars() override {
+        return VARS_TO_STR2(n_tokens, n_ff);
+    }
+
+    double max_nmse_err() override {
+        // Both GEMMs and the intermediate SwiGLU value are dynamically
+        // quantized to E4M3 by the experimental Hopper path.
+        return 1e-2;
+    }
+
+    uint64_t op_flops(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return 6*n_tokens*n_used*n_embd*n_ff;
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * gate_up = ggml_new_tensor_3d(
+            ctx, GGML_TYPE_BF16, n_embd, 2*n_ff, n_expert);
+        ggml_tensor * down = ggml_new_tensor_3d(
+            ctx, GGML_TYPE_BF16, n_ff, n_embd, n_expert);
+        ggml_tensor * x = ggml_new_tensor_3d(
+            ctx, GGML_TYPE_F32, n_embd, 1, n_tokens);
+        ggml_tensor * ids = ggml_new_tensor_2d(
+            ctx, GGML_TYPE_I32, n_used, n_tokens);
+        ggml_tensor * weights = ggml_new_tensor_3d(
+            ctx, GGML_TYPE_F32, 1, n_used, n_tokens);
+
+        ggml_set_name(gate_up, "gate_up");
+        ggml_set_name(down, "down");
+        ggml_set_name(x, "x");
+        ggml_set_name(ids, "ids");
+        ggml_set_name(weights, "routing_weights");
+
+        ggml_tensor * out = ggml_moe_ffn(
+            ctx, gate_up, down, x, ids, weights, nullptr, nullptr, 0);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "ids") == 0) {
+                std::vector<int32_t> data(ggml_nelements(t));
+                for (int64_t token = 0; token < n_tokens; ++token) {
+                    for (int64_t slot = 0; slot < n_used; ++slot) {
+                        data[token*n_used + slot] = (token*n_used + slot) % n_expert;
+                    }
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(data[0]));
+            } else if (strcmp(t->name, "routing_weights") == 0) {
+                std::vector<float> data(ggml_nelements(t), 1.0f/n_used);
+                ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(data[0]));
+            } else if (strcmp(t->name, "gate_up") == 0 || strcmp(t->name, "down") == 0) {
+                init_tensor_uniform(t, -0.02f, 0.02f);
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MOE_FFN_DEEPGEMM";
+    }
+};
+
 struct test_mul_mat_id_adreno_repack : public test_mul_mat_id {
     bool roundtrip_ok = true;
 
@@ -10682,6 +10773,24 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_F16, GGML_TYPE_F32, 16, 16, b, 50, 200, 64));
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_BF16, GGML_TYPE_F32, 16, 16, b, 32, 1024, 16));
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_BF16, GGML_TYPE_F32, 16, 16, b, 50, 200, 64));
+    }
+
+    // Large, opt-in cases for the experimental Qwen4-Exp DeepGEMM path.
+    if (getenv("GGML_TEST_DEEPGEMM_MUL_MAT_ID")) {
+        for (int64_t n_tokens : { 1, 2 }) {
+            // Merged gate/up consumes one activation vector broadcast over top-k.
+            test_cases.emplace_back(new test_mul_mat_id_deepgemm(GGML_TYPE_BF16, GGML_TYPE_F32, 16, 10, true, 1280, n_tokens, 2560));
+            // Down consumes a distinct activated vector for each selected expert.
+            test_cases.emplace_back(new test_mul_mat_id_deepgemm(GGML_TYPE_BF16, GGML_TYPE_F32, 16, 10, false, 2560, n_tokens, 640));
+        }
+    }
+
+    // End-to-end routed expert FFN comparison against the CPU reference.
+    // This is large enough to be useful only on an explicitly selected Hopper.
+    if (getenv("GGML_TEST_DEEPGEMM_MOE_FFN")) {
+        for (int64_t n_tokens : { 1, 2, 128 }) {
+            test_cases.emplace_back(new test_moe_ffn_deepgemm(n_tokens));
+        }
     }
 
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_F16, GGML_TYPE_F32, 1, 1, false, 8, 16, 1));

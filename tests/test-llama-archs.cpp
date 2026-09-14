@@ -12,6 +12,7 @@
 #include "../src/llama-model-saver.h"
 
 #include <cinttypes>
+#include <cmath>
 #include <cstddef>
 #include <cstdio>
 #include <cstring>
@@ -65,7 +66,7 @@ static void set_tensor_data(struct ggml_tensor * tensor, void * userdata) {
 }
 
 static void usage(char ** argv) {
-    printf("Usage: %s [-a/--arch arch] [-s/--seed seed] [-v/--verbose]\n", argv[0]);
+    printf("Usage: %s [-a/--arch arch] [-s/--seed seed] [-v/--verbose] [--qsa-multimodal]\n", argv[0]);
 }
 
 static std::vector<llama_token> get_tokens(const uint32_t n_tokens, const uint32_t n_vocab, const size_t seed){
@@ -316,7 +317,8 @@ static bool silent_model_load_progress(float /*progress*/, void * /*user_data*/)
 
 static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
         struct gguf_context * gguf_ctx, FILE * file, const size_t seed, const std::vector<ggml_backend_dev_t> & devs,
-        const llama_split_mode split_mode = LLAMA_SPLIT_MODE_LAYER, bool encode = false) {
+        const llama_split_mode split_mode = LLAMA_SPLIT_MODE_LAYER, bool encode = false,
+        ggml_backend_sched_eval_callback cb_eval = nullptr, void * cb_eval_user_data = nullptr) {
     GGML_ASSERT((gguf_ctx == nullptr) != (file == nullptr));
     llama_model_params model_params = llama_model_default_params();
     model_params.progress_callback = silent_model_load_progress;
@@ -329,6 +331,8 @@ static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
     ctx_params.n_ctx = 0;
     ctx_params.n_threads = 4;
     ctx_params.n_threads_batch = 4;
+    ctx_params.cb_eval = cb_eval;
+    ctx_params.cb_eval_user_data = cb_eval_user_data;
     if (!encode) {
         ctx_params.n_ubatch = 64;
     }
@@ -556,6 +560,93 @@ static int save_models(const llm_arch target_arch, const size_t seed, const ggml
     return 0;
 }
 
+// Image patches exceed the tiny model's sparse budget and share a temporal
+// position. Compare the fallback with a model that explicitly uses dense attention.
+static int test_qsa_multimodal(size_t seed) {
+    struct observed_nodes {
+        bool raw = false;
+        bool top_k = false;
+    } observed;
+    auto observe = [](ggml_tensor * tensor, bool ask, void * data) {
+        if (ask) {
+            auto & nodes = *static_cast<observed_nodes *>(data);
+            nodes.raw |= std::strncmp(tensor->name, "indexer_k_raw-", 14) == 0;
+            nodes.top_k |= std::strncmp(tensor->name, "indexer_top_k-", 14) == 0;
+        }
+        return false;
+    };
+    auto gguf_sparse = get_gguf_ctx(LLM_ARCH_QWEN4EXP, true);
+    auto gguf_dense = get_gguf_ctx(LLM_ARCH_QWEN4EXP, true);
+    const uint32_t ratios[] = { 0, 0 };
+    gguf_set_arr_data(gguf_dense.get(), "qwen4exp.attention.compress_ratios", GGUF_TYPE_UINT32, ratios, 2);
+    auto sparse = get_model_and_ctx(gguf_sparse.get(), nullptr, seed, {}, LLAMA_SPLIT_MODE_LAYER,
+                                    false, observe, &observed);
+    auto dense = get_model_and_ctx(gguf_dense.get(), nullptr, seed, {});
+    auto * ctx = sparse.second.get();
+    auto * ref = dense.second.get();
+    const uint32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(sparse.first.get()));
+
+    auto decode = [&](llama_context * context, llama_batch batch) {
+        GGML_ASSERT(llama_decode(context, batch) == 0);
+        llama_synchronize(context);
+        const float * logits = llama_get_logits_ith(context, -1);
+        return std::vector<float>(logits, logits + n_vocab);
+    };
+    auto compare = [&](llama_batch batch) {
+        observed = {};
+        const auto actual = decode(ctx, batch);
+        const auto expected = decode(ref, batch);
+        GGML_ASSERT(observed.raw && !observed.top_k);
+        for (size_t i = 0; i < actual.size(); ++i) {
+            GGML_ASSERT(std::isfinite(actual[i]) && std::isfinite(expected[i]));
+        }
+        GGML_ASSERT(nmse(actual, expected) < 1e-8);
+    };
+
+    constexpr uint32_t n_patches = 64; // indexer_top_k = 8, compress_ratio = 4
+    std::vector<float> embeddings(n_patches*llama_model_n_embd(sparse.first.get()));
+    std::mt19937 rng(seed);
+    std::normal_distribution<float> distribution(0.0f, 0.1f);
+    for (float & value : embeddings) {
+        value = distribution(rng);
+    }
+    std::vector<llama_pos> positions(4*n_patches, 0);
+    for (uint32_t i = 0; i < n_patches; ++i) {
+        positions[i + n_patches] = i/8;
+        positions[i + 2*n_patches] = i%8;
+    }
+    llama_batch image = {};
+    image.n_tokens = n_patches;
+    image.embd = embeddings.data();
+    image.pos = positions.data();
+    compare(image);
+
+    llama_token token = 1;
+    llama_pos pos = 8;
+    llama_batch text = {};
+    text.n_tokens = 1;
+    text.token = &token;
+    text.pos = &pos;
+    compare(text);
+    std::vector<uint8_t> state(llama_state_seq_get_size(ctx, 0));
+    GGML_ASSERT(llama_state_seq_get_data(ctx, state.data(), state.size(), 0) == state.size());
+
+    // Dense -> sparse and sparse -> dense must invalidate a graph with the same
+    // batch shape. Raw keys continue to be written in both modes.
+    llama_memory_clear(llama_get_memory(ctx), true);
+    pos = 0;
+    observed = {};
+    decode(ctx, text);
+    GGML_ASSERT(observed.raw && observed.top_k);
+    GGML_ASSERT(llama_state_seq_set_data(ctx, state.data(), state.size(), 0) == state.size());
+    pos = 9;
+    compare(text);
+    ++pos;
+    compare(text); // reuse the dense graph on another text decode
+    printf("QSA multimodal logits and graph reuse tests passed\n");
+    return 0;
+}
+
 static int test_backends(const llm_arch target_arch, const size_t seed, const ggml_log_level log_level) {
     struct user_data_t {
         struct {
@@ -740,8 +831,12 @@ int main(int argc, char ** argv) {
     size_t seed = rd();
     ggml_log_level log_level = GGML_LOG_LEVEL_ERROR;
     std::string out;
+    bool qsa_multimodal = false;
 
     for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--qsa-multimodal") == 0) {
+            qsa_multimodal = true;
+        }
         if (strcmp(argv[i], "-a") == 0 || strcmp(argv[i], "--arch") == 0) {
             if (i + 1 < argc) {
                 const std::string arch_name = argv[++i];
@@ -779,6 +874,9 @@ int main(int argc, char ** argv) {
     printf("%s: using seed %zu\n", __func__, seed);
 
     try {
+        if (qsa_multimodal) {
+            return test_qsa_multimodal(seed);
+        }
         if (!out.empty()) {
             return save_models(arch, seed, log_level, out);
         }

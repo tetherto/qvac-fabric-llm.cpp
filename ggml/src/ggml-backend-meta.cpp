@@ -608,6 +608,28 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
         //return {GGML_BACKEND_SPLIT_AXIS_UNKNOWN, {0}, {1}, 1};
     };
 
+    auto handle_moe_ffn = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
+        GGML_ASSERT(src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_2);
+        GGML_ASSERT(src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_2);
+        GGML_ASSERT(split_states_equal(src_ss[0], src_ss[1]));
+        GGML_ASSERT(src_ss[2].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+        GGML_ASSERT(src_ss[3].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+        GGML_ASSERT(src_ss[4].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+
+        if (tensor->src[5] != nullptr) {
+            GGML_ASSERT(src_ss[5].axis == GGML_BACKEND_SPLIT_AXIS_2);
+            GGML_ASSERT(split_states_equal(src_ss[0], src_ss[5]));
+        }
+        if (tensor->src[6] != nullptr) {
+            GGML_ASSERT(src_ss[6].axis == GGML_BACKEND_SPLIT_AXIS_2);
+            GGML_ASSERT(split_states_equal(src_ss[0], src_ss[6]));
+        }
+
+        // Each device produces the weighted sum of its local experts. The
+        // meta backend inserts exactly one reduction for the full hidden state.
+        return {assume_sync ? GGML_BACKEND_SPLIT_AXIS_MIRRORED : GGML_BACKEND_SPLIT_AXIS_PARTIAL, {0}, {1}, 1};
+    };
+
     auto handle_reshape = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
         switch (src_ss[0].axis) {
             case GGML_BACKEND_SPLIT_AXIS_0:
@@ -853,7 +875,8 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             case GGML_OP_NONE: {
                 if (tensor->view_src != nullptr) {
                     // full-tensor view created with ggml_view_tensor, transparent for the split state
-                    split_state = ggml_backend_meta_get_split_state(stc, tensor->view_src, assume_sync);
+                    split_state = tensor->src[0] != nullptr ? src_ss[0] :
+                        ggml_backend_meta_get_split_state(stc, tensor->view_src, assume_sync);
                 } else {
                     split_state = {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1};
                 }
@@ -912,6 +935,9 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             case GGML_OP_MUL_MAT:
             case GGML_OP_MUL_MAT_ID: {
                 split_state = handle_mul_mat(src_ss);
+            } break;
+            case GGML_OP_MOE_FFN: {
+                split_state = handle_moe_ffn(src_ss);
             } break;
             case GGML_OP_OUT_PROD: {
                 split_state = handle_generic(src_ss, /*scalar_only =*/ true);
@@ -1266,6 +1292,20 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_m
             }
         }
 
+        if (t_ij->op == GGML_OP_MOE_FFN) {
+            const ggml_backend_meta_split_state expert_ss =
+                ggml_backend_meta_get_split_state(tensor->src[0], /*assume_sync =*/ true);
+            GGML_ASSERT(expert_ss.axis == GGML_BACKEND_SPLIT_AXIS_2);
+
+            int32_t expert_offset = ggml_get_op_params_i32(tensor, 0);
+            for (size_t k = 0; k < j; ++k) {
+                for (size_t s = 0; s < expert_ss.n_segments; ++s) {
+                    expert_offset += expert_ss.ne[s*n_simple_bufs + k]*expert_ss.nr[s];
+                }
+            }
+            ggml_set_op_params_i32(t_ij, 0, expert_offset);
+        }
+
         simple_tensors.push_back(t_ij);
     }
 
@@ -1522,6 +1562,13 @@ static void ggml_backend_meta_buffer_get_tensor(ggml_backend_buffer_t buffer, co
     const size_t n_bufs = ggml_backend_meta_buffer_n_bufs(buffer);
     const ggml_backend_meta_split_state split_state = ggml_backend_meta_get_split_state(tensor, /*assume_sync =*/ false);
     GGML_ASSERT(ggml_is_contiguous(tensor) || split_state.axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+    const ggml_backend_meta_buffer_context * buf_ctx =
+        (const ggml_backend_meta_buffer_context *) buffer->context;
+    if (buf_ctx->debug > 1 && size >= 100*1024*1024) {
+        GGML_LOG_INFO("%s: reading %zu MiB from %s, axis=%s, offset=%zu MiB\n",
+            __func__, size/1024/1024, tensor->name,
+            ggml_backend_meta_split_axis_name(split_state.axis), offset/1024/1024);
+    }
 
     if (split_state.n_segments != 1 || split_state.nr[0] != 1) {
         GGML_ASSERT(split_state.axis >= 0 && split_state.axis < GGML_MAX_DIMS);
@@ -1769,8 +1816,10 @@ struct ggml_backend_meta_context {
     size_t                      n_subgraphs   = 0;
     uint64_t                    uid           = 0;
 
-    void *                               comm_ctx       = nullptr;
-    ggml_backend_comm_allreduce_tensor_t comm_allreduce = nullptr;
+    void *                                  comm_ctx         = nullptr;
+    ggml_backend_comm_allreduce_tensor_t    comm_allreduce   = nullptr;
+    ggml_backend_comm_graph_begin_t         comm_graph_begin = nullptr;
+    ggml_backend_comm_graph_end_t           comm_graph_end   = nullptr;
 
     ggml_backend_meta_context(ggml_backend_dev_t meta_dev, const char * params) {
         const size_t n_devs = ggml_backend_meta_dev_n_devs(meta_dev);
@@ -1802,6 +1851,17 @@ struct ggml_backend_meta_context {
                 ggml_backend_reg_get_proc_address(ggml_backend_dev_backend_reg(
                     ggml_backend_get_device(simple_backends[0])), "ggml_backend_comm_allreduce_tensor");
             GGML_ASSERT(comm_allreduce != nullptr);
+
+            comm_graph_begin = (ggml_backend_comm_graph_begin_t)
+                ggml_backend_reg_get_proc_address(ggml_backend_dev_backend_reg(
+                    ggml_backend_get_device(simple_backends[0])), "ggml_backend_comm_graph_begin");
+            comm_graph_end = (ggml_backend_comm_graph_end_t)
+                ggml_backend_reg_get_proc_address(ggml_backend_dev_backend_reg(
+                    ggml_backend_get_device(simple_backends[0])), "ggml_backend_comm_graph_end");
+            if (comm_graph_begin == nullptr || comm_graph_end == nullptr) {
+                comm_graph_begin = nullptr;
+                comm_graph_end   = nullptr;
+            }
         }
     }
 
@@ -2398,11 +2458,36 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
     };
 
 
+    enum ggml_backend_comm_graph_mode comm_graph_mode = GGML_BACKEND_COMM_GRAPH_DIRECT;
+    if (backend_ctx->comm_graph_begin != nullptr && backend_ctx->uid != 0) {
+        std::vector<ggml_cgraph *> comm_graphs;
+        comm_graphs.reserve(n_backends * backend_ctx->n_subgraphs);
+        for (size_t j = 0; j < n_backends; ++j) {
+            auto & bcj = backend_ctx->backend_configs[j];
+            for (size_t i = 0; i < backend_ctx->n_subgraphs; ++i) {
+                comm_graphs.push_back(bcj.cgraphs[i].cgraph_main);
+            }
+        }
+        comm_graph_mode = backend_ctx->comm_graph_begin(
+            backend_ctx->comm_ctx, backend_ctx->uid, comm_graphs.data(), backend_ctx->n_subgraphs);
+        if (comm_graph_mode == GGML_BACKEND_COMM_GRAPH_REPLAY) {
+            return GGML_STATUS_SUCCESS;
+        }
+    }
+
+    const bool capturing_comm_graph = comm_graph_mode == GGML_BACKEND_COMM_GRAPH_CAPTURE;
+    const auto abort_comm_graph = [&]() {
+        if (capturing_comm_graph) {
+            backend_ctx->comm_graph_end(backend_ctx->comm_ctx, false);
+        }
+    };
+
     for (size_t i = 0; i < backend_ctx->n_subgraphs; i++) {
         for (size_t j = 0; j < n_backends; j++) {
             auto & bcj = backend_ctx->backend_configs[j];
             const ggml_status status = ggml_backend_graph_compute_async(bcj.backend, bcj.cgraphs[i].cgraph_main);
             if (status != GGML_STATUS_SUCCESS) {
+                abort_comm_graph();
                 return status;
             }
         }
@@ -2421,12 +2506,22 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             }
 
             if (!backend_allreduce_success) {
+                if (capturing_comm_graph) {
+                    // Captured work has not executed. Abort and retry directly;
+                    // graph_end(false) disables capture for this comm context.
+                    abort_comm_graph();
+                    return ggml_backend_meta_graph_compute(backend, cgraph);
+                }
                 const ggml_status status = allreduce_fallback(i);
                 if (status != GGML_STATUS_SUCCESS) {
                     return status;
                 }
             }
         }
+    }
+
+    if (capturing_comm_graph && !backend_ctx->comm_graph_end(backend_ctx->comm_ctx, true)) {
+        return GGML_STATUS_FAILED;
     }
     return GGML_STATUS_SUCCESS;
 }

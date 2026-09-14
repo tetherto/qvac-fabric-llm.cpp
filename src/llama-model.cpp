@@ -400,7 +400,9 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     static const std::regex pattern_ffn_gate_weight   ("blk\\.\\d*\\.ffn_gate(_exps)?.weight");
     static const std::regex pattern_ffn_gate_bias     ("blk\\.\\d*\\.ffn_gate(_exps)?.bias");
     static const std::regex pattern_ffn_gate_up_weight("blk\\.\\d*\\.ffn_gate_up(_exps)?.weight");
+    static const std::regex pattern_ffn_gate_up_scale ("blk\\.\\d*\\.ffn_gate_up(_exps)?.scale");
     static const std::regex pattern_ffn_down_weight   ("blk\\.\\d*\\.ffn_down(_exps)?.weight");
+    static const std::regex pattern_ffn_down_scale    ("blk\\.\\d*\\.ffn_down(_exps)?.scale");
     static const std::regex pattern_ffn_down_bias         ("blk\\.\\d*\\.ffn_down.bias");
     static const std::regex pattern_ffn_down_exps_bias    ("blk\\.\\d*\\.ffn_down_exps.bias");
     static const std::regex pattern_ffn_up_shexp_weight   ("blk\\.\\d*\\.ffn_up_shexp.weight");
@@ -554,6 +556,26 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
         }
 
         // FFN
+        // Native-FP8 Qwen4-Exp uses the fused routed FFN below. Keep each
+        // expert complete on one device (EP-style) instead of slicing its
+        // hidden dimensions, matching the grouped GEMM shapes used by
+        // DeepGEMM and avoiding duplicated work for all 512 experts.
+        if (ud->model->arch == LLM_ARCH_QWEN4EXP) {
+            if (std::regex_match(tensor_name, pattern_ffn_gate_up_weight) &&
+                    tensor->type == GGML_TYPE_F8_E4M3) {
+                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_2);
+            }
+            if (std::regex_match(tensor_name, pattern_ffn_down_weight) &&
+                    tensor->type == GGML_TYPE_F8_E4M3 &&
+                    tensor_name.find("_exps.") != std::string::npos) {
+                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_2);
+            }
+            if (std::regex_match(tensor_name, pattern_ffn_gate_up_scale) ||
+                    std::regex_match(tensor_name, pattern_ffn_down_scale)) {
+                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_2);
+            }
+        }
+
         if (std::regex_match(tensor_name, pattern_ffn_up_weight) || std::regex_match(tensor_name, pattern_ffn_gate_weight)) {
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "ffn_down.weight", "ffn_down_exps.weight");
         }
@@ -563,8 +585,14 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
         if (std::regex_match(tensor_name, pattern_ffn_gate_up_weight)) {
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "ffn_down.weight", "ffn_down_exps.weight");
         }
+        if (std::regex_match(tensor_name, pattern_ffn_gate_up_scale)) {
+            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "ffn_gate_up_exps.weight");
+        }
         if (std::regex_match(tensor_name, pattern_ffn_down_weight)) {
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0, "ffn_down.weight", "ffn_down_exps.weight");
+        }
+        if (std::regex_match(tensor_name, pattern_ffn_down_scale)) {
+            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0, "ffn_down_exps.weight");
         }
         if (std::regex_match(tensor_name, pattern_ffn_down_bias)) {
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
@@ -630,10 +658,16 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             }
 
             // the FFN is the same for Qwen 3 Next and Qwen 3.5:
-            if (std::regex_match(tensor_name, pattern_ffn_gate_up_weight)) {
+            if (axis == 1 && std::regex_match(tensor_name, pattern_ffn_gate_up_weight)) {
                 const int64_t n_ff_exp = hparams.n_ff_exp;
                 GGML_ASSERT(tensor->ne[axis] == 2*n_ff_exp);
                 return {{n_ff_exp, 2}};
+            }
+            if (axis == 1 && std::regex_match(tensor_name, pattern_ffn_gate_up_scale)) {
+                GGML_ASSERT(hparams.n_ff_exp % 128 == 0);
+                const int64_t n_ff_exp_blocks = hparams.n_ff_exp / 128;
+                GGML_ASSERT(tensor->ne[axis] == 2*n_ff_exp_blocks);
+                return {{n_ff_exp_blocks, 2}};
             }
             return {{tensor->ne[axis], 1}};
         }
@@ -1735,6 +1769,33 @@ bool llama_model::create_backend_buffers(std::size_t size_data,
     const size_t n_max_backend_buffer = ml.ctx_map.size() * ml.files.size();
     pimpl->ctxs_bufs.reserve(n_max_backend_buffer);
 
+    // Reject impossible direct loads before allocating any model buffers.
+    // no_alloc probes must remain available so the fitter can reduce offload.
+    if (!ml.no_alloc) {
+        std::map<ggml_backend_dev_t, size_t> device_weights;
+        for (const auto & [buft, ctx_ptr] : ml.ctx_map) {
+            ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
+            if (!dev || ggml_backend_buft_is_host(buft)) {
+                continue;
+            }
+            ggml_backend_dev_props props;
+            ggml_backend_dev_get_props(dev, &props);
+            if (props.memory_unified) {
+                device_weights[dev] += ggml_backend_alloc_ctx_tensors_from_buft_size(ctx_ptr.get(), buft);
+            }
+        }
+        for (const auto & [dev, size] : device_weights) {
+            ggml_backend_dev_props props;
+            ggml_backend_dev_get_props(dev, &props);
+            if (props.memory_total > 0 && size > props.memory_free) {
+                throw std::runtime_error(format(
+                    "%s: device weights require %.2f MiB but only %.2f MiB of the shared device budget is available; "
+                    "mmap cannot reduce this working set. Reduce --gpu-layers or enable fitting with --fit on",
+                    props.name, size / 1048576.0, props.memory_free / 1048576.0));
+            }
+        }
+    }
+
     for (auto & [buft, ctx_ptr] : ml.ctx_map) {
         ggml_context * ctx = ctx_ptr.get();
 
@@ -1761,13 +1822,15 @@ bool llama_model::create_backend_buffers(std::size_t size_data,
         bool is_default_buft = buft == ggml_backend_dev_buffer_type(dev);
 
         std::vector<ggml_backend_buffer_ptr> bufs;
-        if (ml.use_mmap && use_mmap_buffer && buffer_from_host_ptr_supported && is_default_buft) {
+        const bool map_device_buffer = llama_use_mmap_device_buffer(
+            ml.use_mmap && use_mmap_buffer && buffer_from_host_ptr_supported && is_default_buft,
+            props.memory_unified);
+        if (map_device_buffer) {
             GGML_ASSERT(!ml.no_alloc);
             for (uint32_t idx = 0; idx < ml.files.size(); idx++) {
-                // only the mmap region containing the tensors in the model is mapped to the backend buffer
-                // this is important for metal with apple silicon: if the entire model could be mapped to a metal buffer,
-                //     then we could just use metal for all layers
-                // this allows using partial offloading when the model size exceeds the metal buffer size, but not the RAM size
+                // Map the file span needed by this context. It can contain
+                // unrelated CPU tensors between device tensors; shared-memory
+                // devices therefore use the packed allocation branch below.
                 void * addr = nullptr;
                 size_t first, last; // NOLINT
                 ml.get_mapping_range(&first, &last, &addr, idx, ctx);
@@ -1783,6 +1846,10 @@ bool llama_model::create_backend_buffers(std::size_t size_data,
                 buf_map.emplace(idx, buf);
             }
         } else {
+            if (ml.use_mmap && props.memory_unified && !ml.no_alloc) {
+                LLAMA_LOG_INFO("%s: %s using packed device weights; mmap is retained for CPU weights\n",
+                    __func__, props.name);
+            }
             ggml_backend_buffer_t buf;
             if (ml.no_alloc) {
                 buf = ggml_backend_buft_alloc_buffer(buft, /*size =*/ 0); // dummy buffer

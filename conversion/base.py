@@ -130,7 +130,8 @@ class ModelBase:
                  sentence_transformers_dense_modules: bool = False,
                  target_model_dir: Path | None = None,
                  fuse_gate_up_exps: bool = False,
-                 fp8_as_q8: bool = False):
+                 fp8_as_q8: bool = False,
+                 preserve_fp8_experts: bool = False):
         if type(self) is ModelBase or \
                 type(self) is TextModel or \
                 type(self) is MmprojModel:
@@ -161,7 +162,12 @@ class ModelBase:
         self._is_nvfp4 = False
         self._is_mxfp4 = False
         self._fp8_as_q8 = fp8_as_q8
+        self._preserve_fp8_experts = preserve_fp8_experts
         self._fp8_dequantized: set[str] = set()
+        self._fp8_preserved: set[str] = set()
+
+        if self._fp8_as_q8 and self._preserve_fp8_experts:
+            raise ValueError("--fp8-as-q8 and --preserve-fp8-experts are mutually exclusive")
 
         # Apply heuristics to figure out typical tensor encoding based on first tensor's dtype
         # NOTE: can't use field "torch_dtype" in config.json, because some finetunes lie.
@@ -439,6 +445,9 @@ class ModelBase:
                 for name in self.model_tensors.keys():
                     if name.endswith("_scale_inv"):
                         weight_name = name.removesuffix("_scale_inv")
+                        if self.should_preserve_fp8(weight_name):
+                            self._fp8_preserved.add(weight_name)
+                            continue
                         w = self.model_tensors[weight_name]
                         s = self.model_tensors[name]
                         self.model_tensors[weight_name] = lambda w=w, s=s, bs=block_size: dequant_simple(w(), s(), bs)
@@ -572,6 +581,10 @@ class ModelBase:
 
         for name, value in new_tensors.items():
             self.model_tensors[name] = value
+
+    def should_preserve_fp8(self, name: str) -> bool:
+        del name
+        return False
 
     @classmethod
     def filter_tensors(cls, item: tuple[str, Callable[[], Tensor]]) -> tuple[str, Callable[[], Tensor]] | None:
@@ -913,7 +926,7 @@ class ModelBase:
             old_dtype = data_torch.dtype
 
             # convert any unsupported data types to float32
-            if data_torch.dtype not in (torch.float16, torch.float32):
+            if data_torch.dtype not in (torch.float16, torch.float32) and name not in self._fp8_preserved:
                 data_torch = data_torch.to(torch.float32)
 
             # use the first number-like part of the tensor name as the block id
@@ -1010,12 +1023,16 @@ class ModelBase:
                 quantize = data.quantize if isinstance(data, gguf.LazyChunkedTensor) else (
                     lambda qtype, d=data: gguf.quants.quantize(d, qtype))
 
-                try:
-                    data = quantize(data_qtype)
-                except gguf.QuantError as e:
-                    logger.warning("%s, %s", e, "falling back to F16")
-                    data_qtype = gguf.GGMLQuantizationType.F16
-                    data = quantize(data_qtype)
+                if data_qtype == gguf.GGMLQuantizationType.F8_E4M3:
+                    if data.dtype != np.uint8:
+                        raise ValueError(f"FP8 tensor {new_name} must contain raw uint8 data, got {data.dtype}")
+                else:
+                    try:
+                        data = quantize(data_qtype)
+                    except gguf.QuantError as e:
+                        logger.warning("%s, %s", e, "falling back to F16")
+                        data_qtype = gguf.GGMLQuantizationType.F16
+                        data = quantize(data_qtype)
 
                 shape = gguf.quant_shape_from_byte_shape(data.shape, data_qtype) if data.dtype == np.uint8 else data.shape
 

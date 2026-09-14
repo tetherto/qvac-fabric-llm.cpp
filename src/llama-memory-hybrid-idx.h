@@ -2,6 +2,7 @@
 
 #include "llama-memory-hybrid.h"
 
+#include <bitset>
 #include <memory>
 #include <vector>
 
@@ -75,16 +76,25 @@ public:
 
     llama_kv_cache * get_mem_idx() const;   // nullptr when the model carries no indexer
 
+    // Position-based QSA blocks are only valid for text. Keep image-bearing
+    // sequences dense until they are cleared, including after a state restore.
+    void update_qsa(const llama_ubatch & ubatch);
+    bool can_use_qsa(const llama_ubatch & ubatch) const;
+
 private:
     // forget seq_id (all of it if seq_id < 0) in every cache at once, so a failed restore cannot leave the caches out of step
     // seq_id < 0 drops the whole context, as the caches themselves do on a failed restore
     void state_drop(llama_seq_id seq_id);
+
+    const uint32_t n_seq_max;
 
     // the indexer cache holds one key head per layer, so it needs its own hparams:
     // llama_kv_cache keeps a reference to what it is given
     llama_hparams hparams_idx;
 
     const std::unique_ptr<llama_kv_cache> mem_idx;
+
+    std::bitset<LLAMA_MAX_SEQ> qsa_disabled;
 };
 
 class llama_memory_hybrid_idx_context : public llama_memory_hybrid_context {
@@ -129,6 +139,8 @@ public:
     // streams in the current slot info, the `ns` of get_k/get_v; 1 if unified
     uint32_t get_n_stream() const;
 
+    bool can_use_qsa(const llama_ubatch & ubatch) const;
+
     // block-compressed sparse attention (qwen4exp QSA) over the cells of the indexer cache.
     // Blocks cut the position line, not the cell array, so no caller assumes a contiguous layout:
     //   cell_blk  I32 [n_kv, ns]           block each cell belongs to
@@ -142,7 +154,8 @@ public:
                        bool blk_bias) const;
 
 private:
-    const llama_memory_hybrid_idx * mem = nullptr;
+    llama_memory_hybrid_idx * mem = nullptr;
+    const bool is_full = false;
 
     // streams per ubatch, read from the slot infos before ctx_idx takes them
     // declared first, so it is initialised while sinfos_idx is still intact
