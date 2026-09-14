@@ -69,7 +69,7 @@ static void set_tensor_data(struct ggml_tensor * tensor, void * userdata) {
 }
 
 static void usage(char ** argv) {
-    printf("Usage: %s [-a/--arch arch] [-s/--seed seed] [-v/--verbose] [--mtp-shared|--mtp-shared-cpu]\n", argv[0]);
+    printf("Usage: %s [-a/--arch arch] [-s/--seed seed] [-v/--verbose] [--mtp-shared|--mtp-shared-cpu|--qsa-unified-multiseq]\n", argv[0]);
 }
 
 static std::vector<llama_token> get_tokens(const uint32_t n_tokens, const uint32_t n_vocab, const size_t seed){
@@ -344,7 +344,9 @@ static bool silent_model_load_progress(float /*progress*/, void * /*user_data*/)
 
 static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
         struct gguf_context * gguf_ctx, FILE * file, const size_t seed, const std::vector<ggml_backend_dev_t> & devs,
-        const llama_split_mode split_mode = LLAMA_SPLIT_MODE_LAYER, bool encode = false) {
+        const llama_split_mode split_mode = LLAMA_SPLIT_MODE_LAYER, bool encode = false,
+        uint32_t n_seq_max = 1, bool kv_unified = false,
+        ggml_backend_sched_eval_callback cb_eval = nullptr, void * cb_eval_user_data = nullptr) {
     GGML_ASSERT((gguf_ctx == nullptr) != (file == nullptr));
     llama_model_params model_params = llama_model_default_params();
     model_params.progress_callback = silent_model_load_progress;
@@ -357,6 +359,10 @@ static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
     ctx_params.n_ctx = 0;
     ctx_params.n_threads = 4;
     ctx_params.n_threads_batch = 4;
+    ctx_params.n_seq_max = n_seq_max;
+    ctx_params.kv_unified = kv_unified;
+    ctx_params.cb_eval = cb_eval;
+    ctx_params.cb_eval_user_data = cb_eval_user_data;
     if (!encode) {
         ctx_params.n_ubatch = 64;
     }
@@ -581,6 +587,96 @@ static int save_models(const llm_arch target_arch, const size_t seed, const ggml
         }
     }
     llama_log_set(ud.original_logger.callback, ud.original_logger.user_data);
+    return 0;
+}
+
+// A unified cache has one cell-to-block map for every sequence. Image patches can share a
+// temporal position, so until QSA has sequence-local ranks this configuration must stay dense.
+static int test_qsa_unified_multiseq(size_t seed) {
+    struct observed_nodes {
+        bool top_k = false;
+    } observed;
+
+    auto observe = [](ggml_tensor * tensor, bool ask, void * data) {
+        if (ask) {
+            auto & nodes = *static_cast<observed_nodes *>(data);
+            nodes.top_k |= std::strncmp(tensor->name, "indexer_top_k-", 14) == 0;
+        }
+        return false;
+    };
+
+    auto gguf_sparse = get_gguf_ctx(LLM_ARCH_QWEN4EXP, true);
+    auto gguf_dense  = get_gguf_ctx(LLM_ARCH_QWEN4EXP, true);
+
+    const uint32_t dense_ratios[] = { 0, 0 };
+    gguf_set_arr_data(gguf_dense.get(), "qwen4exp.attention.compress_ratios",
+            GGUF_TYPE_UINT32, dense_ratios, 2);
+
+    auto sparse = get_model_and_ctx(gguf_sparse.get(), nullptr, seed, {}, LLAMA_SPLIT_MODE_LAYER,
+            false, 2, true, observe, &observed);
+    auto dense = get_model_and_ctx(gguf_dense.get(), nullptr, seed, {}, LLAMA_SPLIT_MODE_LAYER,
+            false, 2, true);
+
+    constexpr uint32_t n_seq     = 2;
+    constexpr uint32_t n_patches = 8;
+    constexpr uint32_t n_tokens  = n_seq*n_patches;
+
+    const uint32_t n_embd  = llama_model_n_embd(sparse.first.get());
+    const uint32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(sparse.first.get()));
+
+    std::vector<float> embeddings(n_tokens*n_embd);
+    std::mt19937 rng(seed);
+    std::normal_distribution<float> distribution(0.0f, 0.1f);
+    for (float & value : embeddings) {
+        value = distribution(rng);
+    }
+
+    std::vector<llama_pos> positions(4*n_tokens, 0);
+    std::vector<int32_t> n_seq_ids(n_tokens, 1);
+    std::vector<llama_seq_id> seq_ids(n_tokens);
+    std::vector<llama_seq_id *> seq_id_ptrs(n_tokens);
+    std::vector<int8_t> logits(n_tokens, 1);
+
+    for (uint32_t s = 0; s < n_seq; ++s) {
+        for (uint32_t p = 0; p < n_patches; ++p) {
+            const uint32_t i = s*n_patches + p;
+            positions[i] = 0;
+            positions[i + n_tokens] = p/4;
+            positions[i + 2*n_tokens] = p%4;
+            seq_ids[i] = (llama_seq_id) s;
+            seq_id_ptrs[i] = &seq_ids[i];
+        }
+    }
+
+    llama_batch image = {};
+    image.n_tokens = n_tokens;
+    image.embd = embeddings.data();
+    image.pos = positions.data();
+    image.n_seq_id = n_seq_ids.data();
+    image.seq_id = seq_id_ptrs.data();
+    image.logits = logits.data();
+
+    auto decode = [n_vocab](llama_context * ctx, llama_batch batch) {
+        GGML_ASSERT(llama_decode(ctx, batch) == 0);
+        llama_synchronize(ctx);
+
+        std::vector<float> result;
+        result.reserve((size_t) batch.n_tokens*n_vocab);
+        for (int32_t i = 0; i < batch.n_tokens; ++i) {
+            const float * row = llama_get_logits_ith(ctx, i);
+            GGML_ASSERT(row != nullptr);
+            result.insert(result.end(), row, row + n_vocab);
+        }
+        return result;
+    };
+
+    const auto actual   = decode(sparse.second.get(), image);
+    const auto expected = decode(dense.second.get(), image);
+
+    GGML_ASSERT(!observed.top_k);
+    GGML_ASSERT(nmse(actual, expected) < 1e-8);
+
+    printf("QSA unified multi-sequence fallback test passed\n");
     return 0;
 }
 
@@ -943,8 +1039,14 @@ int main(int argc, char ** argv) {
     size_t seed = rd();
     ggml_log_level log_level = GGML_LOG_LEVEL_ERROR;
     std::string out;
+    bool qsa_unified_multiseq = false;
 
     for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--qsa-unified-multiseq") == 0) {
+            qsa_unified_multiseq = true;
+            continue;
+        }
+
         if (strcmp(argv[i], "-a") == 0 || strcmp(argv[i], "--arch") == 0) {
             if (i + 1 < argc) {
                 const std::string arch_name = argv[++i];
@@ -982,6 +1084,9 @@ int main(int argc, char ** argv) {
     printf("%s: using seed %zu\n", __func__, seed);
 
     try {
+        if (qsa_unified_multiseq) {
+            return test_qsa_unified_multiseq(seed);
+        }
         if (!out.empty()) {
             return save_models(arch, seed, log_level, out);
         }
