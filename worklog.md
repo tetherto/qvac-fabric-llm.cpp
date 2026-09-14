@@ -19,6 +19,10 @@ Current branch: `qwen4-exp-opt`
 Recent commits, newest first:
 
 ```text
+4e1f24d24 cuda: fuse MoE weighted expert reduction (#25952)
+9d77e2b65 ggml: allow passing alloc dependencies in graph_optimize (#27301)
+d907668f2 docs: record qwen4exp pp2048 profile
+0b5c41852 docs: record qwen4exp optimization worklog
 6d2008c5d cuda: prototype DeepGEMM fused MoE paths
 677d4d80d tests: add SM90 DeepGEMM MegaMoE prototype
 e94017aff qwen4exp: align FP8 tensor split with MoE graph
@@ -29,8 +33,9 @@ e94017aff qwen4exp: align FP8 tensor split with MoE graph
 `6d2008c5d` is a useful correctness/feasibility checkpoint, but its fused path is
 not the performance direction in its current form.
 
-There were no tracked changes after `6d2008c5d` when this log was written.
-Pre-existing untracked files were intentionally left untouched.
+The original worklog checkpoint was clean after `6d2008c5d`. Subsequent
+tracked work is represented by the commits above. Pre-existing untracked files
+were intentionally left untouched.
 
 ## Machines and paths
 
@@ -190,6 +195,44 @@ single-request token generation.
 Commit `9db850853` enables sparse flash attention for Qwen4Exp. The upstream
 mechanism is activated by setting `set_n_kv_max`. This is present on the branch,
 but it has not been established as the main current bottleneck.
+
+### CUDA MoE weighted expert reduction
+
+Commit `4e1f24d24` cherry-picks upstream #25952. It structurally matches the
+MoE combine tail and replaces router-weight multiplication, expert views, and
+the ordered ADD chain with one `moe_weighted_reduction_f32` CUDA kernel. It
+supports scaled and unscaled graphs with k=2 through k=15, including Qwen4Exp's
+top-k 10. Unsupported graphs retain the original per-op path.
+
+The fusion requires allocator lifetime dependencies. Its prerequisite was
+cherry-picked as `9d77e2b65` from upstream #27301. The scheduler conflict was
+resolved by retaining this branch's prefetch/MoE-cache allocation terms and
+adding `n_dep_nodes` to the graph-size calculation. The CUDA include conflict
+was resolved by retaining both `mmid-back.cuh` and
+`moe-weighted-reduction.cuh`.
+
+Verification:
+
+- The local CUDA build completed successfully.
+- The SM90 build with DeepGEMM completed successfully on the remote host.
+- All 6/6 upstream `MOE_WEIGHTED_REDUCTION` cases passed on physical GPU 6:
+  scaled/unscaled, aligned/unaligned, k=2/8/12/15, and the k=16 fallback.
+- Nsight trace `/tmp/qwen4-moe-weighted-reduction-test.nsys-rep` contains five
+  `moe_weighted_reduction_f32` launches for the supported cases. The k=16 case
+  emits the original MUL/ADD kernels, proving both dispatch and fallback.
+
+The first post-pick PP2048 smoke was not stable enough to claim a performance
+change: 6050.43, 5758.03, 5876.70, 5970.26, and 6625.13 tok/s, averaging
+6056.11 tok/s. The final sample returned near the 6.67k checkpoint, while the
+first four were unusually slow. Do not use the average as the new baseline.
+Before judging this fusion, take a longer warmed run and confirm that the real
+Qwen4Exp graph emits `moe_weighted_reduction_f32`; the targeted operator trace
+only proves the synthetic matcher cases.
+
+Despite the upstream commit message mentioning
+`GGML_CUDA_MOE_WEIGHTED_REDUCTION=0`, this revision only implements the global
+`GGML_CUDA_DISABLE_FUSION` guard. Do not use that global switch for an
+apples-to-apples A/B because it disables other CUDA fusions too.
 
 ### FP8 GGUF and tensor parallel split
 
