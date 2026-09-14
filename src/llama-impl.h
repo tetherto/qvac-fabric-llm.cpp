@@ -42,6 +42,8 @@ void llama_log_callback_default(ggml_log_level level, const char * text, void * 
 // helpers
 //
 
+bool llama_env_flag_enabled(const char * name);
+
 template <typename T>
 struct no_init {
     T value;

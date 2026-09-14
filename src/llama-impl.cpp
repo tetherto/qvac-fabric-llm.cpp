@@ -4,6 +4,7 @@
 #include "llama.h"
 
 #include <cinttypes>
+#include <cstdlib>
 #include <climits>
 #include <cstdarg>
 #include <cstring>
@@ -16,6 +17,11 @@ struct llama_logger_state {
 };
 
 static llama_logger_state g_logger_state;
+
+bool llama_env_flag_enabled(const char * name) {
+    const char * value = std::getenv(name);
+    return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
+}
 
 time_meas::time_meas(int64_t & t_acc, bool disable) : t_start_us(disable ? -1 : ggml_time_us()), t_acc(t_acc) {}
 

@@ -556,11 +556,11 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
         }
 
         // FFN
-        // Native-FP8 Qwen4-Exp uses the fused routed FFN below. Keep each
-        // expert complete on one device (EP-style) instead of slicing its
-        // hidden dimensions, matching the grouped GEMM shapes used by
-        // DeepGEMM and avoiding duplicated work for all 512 experts.
-        if (ud->model->arch == LLM_ARCH_QWEN4EXP) {
+        // Keep each expert complete on one device only for the opt-in fused
+        // routed FFN. The regular MUL_MAT_ID graph requires the standard
+        // axis-1/axis-0 tensor-parallel layout handled below.
+        if (ud->model->arch == LLM_ARCH_QWEN4EXP &&
+                llama_env_flag_enabled("GGML_CUDA_DEEPGEMM_MOE_FFN")) {
             if (std::regex_match(tensor_name, pattern_ffn_gate_up_weight) &&
                     tensor->type == GGML_TYPE_F8_E4M3) {
                 return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_2);

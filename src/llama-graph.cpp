@@ -2112,10 +2112,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     // Qwen4-Exp stores routed gate/up as one tensor. Keep the experimental
     // whole-FFN path opt-in while it is being tuned; native FP8 otherwise uses
     // the regular MUL_MAT_ID graph below.
-    const bool fused_moe_enabled = [] {
-        const char * value = getenv("GGML_CUDA_DEEPGEMM_MOE_FFN");
-        return value != nullptr && value[0] != '\0' && strcmp(value, "0") != 0;
-    }();
+    const bool fused_moe_enabled = llama_env_flag_enabled("GGML_CUDA_DEEPGEMM_MOE_FFN");
     const bool fused_moe_weight_type = gate_up_exps && down_exps &&
         (gate_up_exps->type == GGML_TYPE_F8_E4M3 || gate_up_exps->type == GGML_TYPE_BF16);
     const bool fused_moe_scales = gate_up_exps &&
