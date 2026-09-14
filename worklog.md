@@ -70,6 +70,94 @@ This is the checkpoint to reproduce before making another optimization. The
 earlier approximately 5k tok/s PP2048 result was real, but the later tensor-split
 fix improved it to the value above.
 
+### 2026-09-14: warmed PP2048 Nsight profile
+
+The baseline was reproduced before profiling with the whole-MoE and MegaMoE
+paths explicitly disabled:
+
+```bash
+CUDA_VISIBLE_DEVICES=6,7 \
+GGML_CUDA_DEEPGEMM_MUL_MAT_ID=1 \
+GGML_CUDA_DEEPGEMM_MOE_FFN=0 \
+GGML_CUDA_DEEPGEMM_MEGA_MOE=0 \
+/home/aman/qwen4-exp-opt-bench-20260911/build-deepgemm-mmid/bin/llama-bench \
+  -m /home/aman/qwen4-exp-opt-bench-20260911/fp8-gguf/Qwen3.8-Flash-Next-BF16-FP8-00001-of-00005.gguf \
+  -ngl 99 -sm tensor -ts 1/1 \
+  -ot 'per_layer_token_embd\.weight=CPU' \
+  -lm none -p 2048 -n 0 -b 2048 -ub 2048 -t 32 -r 5 -o jsonl
+```
+
+Result: **6674.29 +/- 98.27 tok/s**, with samples 6500.49, 6706.55,
+6700.86, 6725.86, and 6737.66 tok/s. This independently reproduces the
+previous 6669.59 tok/s checkpoint.
+
+The steady profile uses the same command with `nsys profile`, CUDA graph node
+tracing, and two measured repetitions. Nsight overhead reduced its samples to
+6388.51 and 6579.27 tok/s. The analysis below isolates only the second graph
+replay, after all 194 graph objects had been created.
+
+Artifacts:
+
+- `/home/aman/qwen4-exp-opt-bench-20260911/results/fp8-mmid-tensor-pp2048-steady-20260914.nsys-rep`
+- `/home/aman/qwen4-exp-opt-bench-20260911/results/fp8-mmid-tensor-pp2048-steady-20260914.sqlite`
+- The earlier cold-graph capture is
+  `fp8-mmid-tensor-pp2048-baseline-20260914.nsys-rep` in the same directory.
+
+The warmed replay's GPU window is 277.154 ms. GPU 0 has 273.376 ms of summed
+kernel work and 3.411 ms of D2D copies; GPU 1 has 273.259 ms of kernel work and
+3.418 ms of D2D copies. After merging overlapping activity, both devices are
+active for about **99.2%** of the window. There are no H2D or peer copies in the
+warmed replay. Each GPU performs 272 D2D copies totaling 2.748 GB.
+
+Kernel time is nearly symmetric across the two GPUs. The following percentages
+are sums across both GPUs; the per-GPU percentages are effectively identical:
+
+| Category | Time across both GPUs | Kernel-time share |
+| --- | ---: | ---: |
+| Elementwise | 170.332 ms | 31.16% |
+| Recurrent core (`gated_delta_net`, SSM convolution) | 97.348 ms | 17.81% |
+| Type conversions | 58.452 ms | 10.69% |
+| Other dense GEMMs | 43.775 ms | 8.01% |
+| MoE DeepGEMM FP8 GEMMs | 36.829 ms | 6.74% |
+| Normalization | 31.283 ms | 5.72% |
+| Top-k/sort, shared by MoE and attention indexer | 23.511 ms | 4.30% |
+| Layout/gather/copy kernels | 19.749 ms | 3.61% |
+| MoE activation pack/quantize | 19.425 ms | 3.55% |
+| MoE output scatter | 17.708 ms | 3.24% |
+| NCCL all-reduce | 17.555 ms | 3.21% |
+| Attention/RoPE | 7.980 ms | 1.46% |
+| Other | 2.688 ms | 0.49% |
+
+The largest individual groups are `gated_delta_net` (93.925 ms across both
+GPUs), elementwise multiply (66.149 ms), f32-to-bf16 conversion (54.495 ms),
+elementwise add (41.576 ms), and gated sigmoid (22.404 ms). The four local FP8
+DeepGEMM shapes together consume 36.829 ms. Pack/quantize and scatter add another
+37.133 ms.
+
+Conclusions from this trace:
+
+- This PP2048 path is GPU-compute/memory-kernel bound, not CPU-launch bound.
+  Nsight records 194 `cudaGraphLaunch` calls in the replay, but the devices stay
+  busy. Most `cudaStreamSynchronize` API time is the CPU waiting for GPU work.
+- NCCL is not the primary PP2048 problem. It costs about 8-9 ms per GPU, or 3.2%
+  of kernel time. Even free all-reduce would improve throughput by only about
+  3.3%.
+- DeepGEMM plus its activation packing and output scattering is 13.5% of kernel
+  time. Making that entire sequence free has a theoretical ceiling of about
+  1.16x, roughly 7.7k tok/s from the unprofiled baseline. Including every
+  top-k/sort kernel still cannot explain a multi-x gap to SGLang.
+- Gate and up are already fused: the trace shows the expected N=512 and N=768
+  DeepGEMM shapes, which are `2 * I` for the I256 and I384 tensor-parallel
+  shards.
+- The largest opportunity is the surrounding elementwise, conversion,
+  normalization, and recurrent pipeline. Elementwise plus conversions alone is
+  41.9% of kernel time. The next matched SGLang profile should determine which
+  of these operations it fuses into its recurrent/DeltaNet kernels.
+
+This supersedes graph setup and NCCL as the first PP2048 optimization targets.
+The next comparison should focus on SGLang's fused recurrent block and on why
+llama.cpp emits thousands of standalone elementwise/conversion kernels.
+
 Do not use the experimental whole-`GGML_MOE_FFN` path as the baseline. Its real
 end-to-end results were approximately:
 
@@ -275,33 +363,36 @@ timers under profiling. Their approximately 501 ms versus 544 ms total for 20
 tokens is not a valid throughput benchmark. Ignore `/tmp/qwen4-perf-record.log`;
 it only records that the attempted perf command was unavailable.
 
-## Tomorrow: prioritized restart plan
+## Prioritized next steps
 
-1. Reconstruct an apples-to-apples SGLang target on GPUs 6/7.
+1. **Pending:** reconstruct an apples-to-apples SGLang target on GPUs 6/7.
    - Run an exact PP2048 single request after warmup.
    - Run decode with the same concurrency/batch semantics and output length as
      the llama.cpp test.
    - Record complete commands, model path, memory settings, graph/eager mode,
      and raw output in a dated results directory.
-2. Reproduce the known-good non-fused FP8 checkpoint before editing code.
-   - Use `-sm tensor -lm none` on GPUs 6 and 7.
-   - Expect PP2048 near `6669.59 +/- 119.34 tok/s` after warmup.
-   - Capture the corresponding token-generation result with the exact same
-     model and split.
-3. Profile both matched runs with Nsight Systems and calculate the per-layer
-   critical path. Attribute time to MoE kernels, expert-cache H2D fills,
-   NCCL/all-reduce, CUDA launch/graph gaps, and recurrent/attention work.
+2. **Complete (2026-09-14):** reproduce and profile the known-good non-fused
+   FP8 llama.cpp checkpoint. The exact command, results, and traces are in the
+   warmed PP2048 section above.
+3. **Partially complete:** calculate the matched per-layer critical-path delta.
+   The llama.cpp side is profiled; the comparable SGLang PP2048 capture remains.
+   Compare MoE kernels, data movement, collectives, graph gaps, and especially
+   recurrent/elementwise fusion.
 4. Choose the next implementation only from the measured delta:
-   - If resident/transformed MegaMoE weights explain SGLang's advantage,
+   - First inspect whether SGLang fuses the elementwise/conversion work around
+     `gated_delta_net`; these categories dominate the llama.cpp trace.
+   - Only if resident/transformed MegaMoE weights explain SGLang's advantage,
      transform and pad at MoE cache fill and specialize for the actual slot
      count. Never requantize/interleave weights per token.
    - If SGLang keeps all experts resident while llama.cpp host-caches them, first
      match the memory/residency configuration. That may be the real ceiling.
-   - If graph gaps or collectives dominate, fix capture/all-reduce instead of
-     adding another MoE kernel.
+   - Do not prioritize PP2048 graph-launch or all-reduce work without new
+     evidence; the warmed llama.cpp trace shows saturated GPUs and only 3.2%
+     NCCL kernel time.
 5. After every change, rerun warmed PP2048 and matched TG. Reject changes that
    do not improve end-to-end numbers, even if a synthetic operator benchmark is
    faster.
 
-The immediate next action is measurement, not another fusion. The success
+The immediate next action is a matched warmed SGLang PP2048 trace, followed by
+an operator-by-operator comparison with the saved llama.cpp trace. The success
 criterion is closing the matched end-to-end gap to SGLang.
