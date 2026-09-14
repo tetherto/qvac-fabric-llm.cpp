@@ -12233,10 +12233,19 @@ static void ggml_compute_forward_dsv4_hc_pre_f32(
     const int64_t hc       = x->ne[1];
     const int64_t n_tokens = x->ne[2];
 
+    const float scale = ggml_get_op_params_f32(dst, 0);
+    const bool  gated = ggml_get_op_params_i32(dst, 1) != 0;
+
     GGML_ASSERT(dst->ne[0] == n_embd);
     GGML_ASSERT(dst->ne[1] == n_tokens);
-    GGML_ASSERT(weights->ne[0] == hc);
-    GGML_ASSERT(weights->ne[1] == n_tokens);
+    if (gated) {
+        GGML_ASSERT(weights->ne[0] == n_embd);
+        GGML_ASSERT(weights->ne[1] == hc);
+        GGML_ASSERT(weights->ne[2] == n_tokens);
+    } else {
+        GGML_ASSERT(weights->ne[0] == hc);
+        GGML_ASSERT(weights->ne[1] == n_tokens);
+    }
 
     GGML_TENSOR_LOCALS(size_t, nbx, x,       nb);
     GGML_TENSOR_LOCALS(size_t, nbw, weights, nb);
@@ -12256,12 +12265,18 @@ static void ggml_compute_forward_dsv4_hc_pre_f32(
 
         float sum = 0.0f;
         for (int64_t ih = 0; ih < hc; ++ih) {
-            const float xv = *(const float *) ((const char *) x->data       + i0*nbx0 + ih*nbx1 + it*nbx2);
-            const float wv = *(const float *) ((const char *) weights->data + ih*nbw0 + it*nbw1);
+            const float xv = *(const float *) ((const char *) x->data + i0*nbx0 + ih*nbx1 + it*nbx2);
+            float wv;
+            if (gated) {
+                const float gv = *(const float *) ((const char *) weights->data + i0*nbw0 + ih*nbw1 + it*nbw2);
+                wv = 1.0f / (1.0f + expf(-gv));
+            } else {
+                wv = *(const float *) ((const char *) weights->data + ih*nbw0 + it*nbw1);
+            }
             sum += xv * wv;
         }
 
-        *(float *) ((char *) dst->data + i0*nbd0 + it*nbd1) = sum;
+        *(float *) ((char *) dst->data + i0*nbd0 + it*nbd1) = scale * sum;
     }
 }
 
@@ -12297,13 +12312,18 @@ static inline void dsv4_hc_post_compute_scalar(
     const float xv = *(const float *) ((const char *) x->data + i*x->nb[0] + it*x->nb[1]);
     const float pv = *(const float *) ((const char *) post->data + d*post->nb[0] + it*post->nb[1]);
     volatile float sum = xv * pv;
-    for (int64_t s = 0; s < hc; ++s) {
-        const float rv = *(const float *) (
-            (const char *) residual->data + i*residual->nb[0] + s*residual->nb[1] + it*residual->nb[2]);
-        const float cw = *(const float *) (
-            (const char *) comb->data + d*comb->nb[0] + s*comb->nb[1] + it*comb->nb[2]);
-        volatile float product = rv * cw;
-        sum = sum + product;
+    if (comb) {
+        for (int64_t s = 0; s < hc; ++s) {
+            const float rv = *(const float *) (
+                (const char *) residual->data + i*residual->nb[0] + s*residual->nb[1] + it*residual->nb[2]);
+            const float cw = *(const float *) (
+                (const char *) comb->data + d*comb->nb[0] + s*comb->nb[1] + it*comb->nb[2]);
+            volatile float product = rv * cw;
+            sum = sum + product;
+        }
+    } else {
+        sum = sum + *(const float *) (
+            (const char *) residual->data + i*residual->nb[0] + d*residual->nb[1] + it*residual->nb[2]);
     }
     *(float *) ((char *) dst->data + i*dst->nb[0] + d*dst->nb[1] + it*dst->nb[2]) = sum;
 }
@@ -12404,7 +12424,6 @@ static void ggml_compute_forward_dsv4_hc_post_f32(
     GGML_ASSERT(x->type == GGML_TYPE_F32);
     GGML_ASSERT(residual->type == GGML_TYPE_F32);
     GGML_ASSERT(post->type == GGML_TYPE_F32);
-    GGML_ASSERT(comb->type == GGML_TYPE_F32);
     GGML_ASSERT(dst->type == GGML_TYPE_F32);
 
     const int64_t n_embd   = x->ne[0];
@@ -12418,9 +12437,14 @@ static void ggml_compute_forward_dsv4_hc_post_f32(
     GGML_ASSERT(residual->ne[2] == n_tokens);
     GGML_ASSERT(post->ne[0] == hc);
     GGML_ASSERT(post->ne[1] == n_tokens);
-    GGML_ASSERT(comb->ne[0] == hc);
-    GGML_ASSERT(comb->ne[1] == hc);
-    GGML_ASSERT(comb->ne[2] == n_tokens);
+
+    // comb == NULL: identity mixing, each stream keeps its own residual
+    if (comb) {
+        GGML_ASSERT(comb->type == GGML_TYPE_F32);
+        GGML_ASSERT(comb->ne[0] == hc);
+        GGML_ASSERT(comb->ne[1] == hc);
+        GGML_ASSERT(comb->ne[2] == n_tokens);
+    }
 
     const int ith = params->ith;
     const int nth = params->nth;
@@ -12445,12 +12469,18 @@ static void ggml_compute_forward_dsv4_hc_post_f32(
                 const float * x_row = (const float *) ((const char *) x->data + it*x->nb[1]);
                 float * dst_row = (float *) ((char *) dst->data + idst*dst->nb[1] + it*dst->nb[2]);
                 dsv4_hc_post_vec_t sum = dsv4_hc_post_vec_mul(dsv4_hc_post_vec_load(x_row + i0), pv);
-                for (int64_t isrc = 0; isrc < hc; ++isrc) {
+                if (comb) {
+                    for (int64_t isrc = 0; isrc < hc; ++isrc) {
+                        const float * residual_row = (const float *) (
+                            (const char *) residual->data + isrc*residual->nb[1] + it*residual->nb[2]);
+                        const float cv = *(const float *) (
+                            (const char *) comb->data + idst*comb->nb[0] + isrc*comb->nb[1] + it*comb->nb[2]);
+                        sum = dsv4_hc_post_vec_mul_add(sum, dsv4_hc_post_vec_load(residual_row + i0), cv);
+                    }
+                } else {
                     const float * residual_row = (const float *) (
-                        (const char *) residual->data + isrc*residual->nb[1] + it*residual->nb[2]);
-                    const float cv = *(const float *) (
-                        (const char *) comb->data + idst*comb->nb[0] + isrc*comb->nb[1] + it*comb->nb[2]);
-                    sum = dsv4_hc_post_vec_mul_add(sum, dsv4_hc_post_vec_load(residual_row + i0), cv);
+                        (const char *) residual->data + idst*residual->nb[1] + it*residual->nb[2]);
+                    sum = dsv4_hc_post_vec_mul_add(sum, dsv4_hc_post_vec_load(residual_row + i0), 1.0f);
                 }
                 dsv4_hc_post_vec_store(dst_row + i0, sum);
             } else {
