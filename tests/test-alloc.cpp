@@ -402,6 +402,50 @@ static void test_tensor_larger_than_max_size() {
     GGML_ASSERT(backend.context->allocated_total() == 24);
 }
 
+// Cache banks can exceed the backend's preferred buffer size. Views after the
+// final bank must still be initialized, even though they need no allocation.
+static void test_context_alloc_trailing_views(size_t bank_size, bool trailing_tensor) {
+    dummy_backend backend = dummy_backend_init(32);
+    auto [ctx, graph, ctx_ptr] = make_context();
+
+    ggml_tensor * banks[3];
+    for (auto & bank : banks) {
+        bank = make_input_with_size(ctx, bank_size);
+    }
+    ggml_tensor * views[3];
+    for (int i = 0; i < 3; ++i) {
+        views[i] = ggml_view_1d(ctx, banks[i], 4, 8);
+    }
+    ggml_tensor * nested = ggml_view_1d(ctx, views[2], 2, 4);
+    if (trailing_tensor) {
+        make_input_with_size(ctx, 8);
+    }
+    assign_names(ctx);
+
+    const size_t expected_size = 3 * bank_size + (trailing_tensor ? 8 : 0);
+    GGML_ASSERT(ggml_backend_alloc_ctx_tensors_from_buft_size(ctx, &backend.buffer_type) == expected_size);
+    GGML_ASSERT(backend.context->buffers.empty());
+    for (ggml_tensor * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
+        GGML_ASSERT(t->buffer == nullptr && t->data == nullptr);
+    }
+
+    ggml_backend_buffer_ptr buffer(ggml_backend_alloc_ctx_tensors_from_buft(ctx, &backend.buffer_type));
+    GGML_ASSERT(buffer != nullptr);
+    GGML_ASSERT(backend.context->allocated_total() == expected_size);
+    GGML_ASSERT(backend.context->buffers.size() == (trailing_tensor ? 4 : 3));
+    for (ggml_tensor * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
+        GGML_ASSERT(t->buffer != nullptr && t->data != nullptr);
+        if (t->view_src) {
+            GGML_ASSERT(t->buffer == t->view_src->buffer);
+            GGML_ASSERT(t->data == (char *) t->view_src->data + t->view_offs);
+        }
+    }
+    GGML_ASSERT(nested->buffer == banks[2]->buffer);
+    GGML_ASSERT(nested->data == (char *) banks[2]->data + 12);
+    buffer.reset();
+    GGML_ASSERT(backend.context->buffers.empty());
+}
+
 // This test assumes a max of 16 buffer chunks, and tries to allocate tensors that would
 // require more. Expectation is that the last buffer should grow to fit everything,
 // leaving it to the backend to error out if it can't allocate that much.
@@ -770,6 +814,9 @@ int main() {
     run("test_max_size_too_many_tensors", test_max_size_too_many_tensors);
     run("test_max_size_tensor_too_large", test_max_size_tensor_too_large);
     run("test_tensor_larger_than_max_size", test_tensor_larger_than_max_size);
+    run("test_context_alloc_trailing_views(32, false)", []() { test_context_alloc_trailing_views(32, false); });
+    run("test_context_alloc_trailing_views(40, false)", []() { test_context_alloc_trailing_views(40, false); });
+    run("test_context_alloc_trailing_views(40, true)", []() { test_context_alloc_trailing_views(40, true); });
     run("test_not_enough_chunks", test_not_enough_chunks);
     run("test_fill_leftover_space", test_fill_leftover_space);
     run("test_view_inplace", test_view_inplace);
