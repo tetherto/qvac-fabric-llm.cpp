@@ -104,6 +104,8 @@ if (CUDAToolkit_FOUND)
 
     file(GLOB   GGML_SOURCES_CUDA "*.cu")
     set(GGML_CUDA_CUTLASS_SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/mmq-cutlass.cu")
+    set(GGML_CUDA_CUTLASS_F8_SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/mmf8-cutlass.cu")
+    list(REMOVE_ITEM GGML_SOURCES_CUDA "${GGML_CUDA_CUTLASS_F8_SOURCE}") # built by its own target when GGML_CUDA_CUTLASS is on
     file(GLOB   SRCS "template-instances/fattn-tile*.cu")
     list(APPEND GGML_SOURCES_CUDA ${SRCS})
     file(GLOB   SRCS "template-instances/fattn-mma*.cu")
@@ -130,14 +132,19 @@ if (CUDAToolkit_FOUND)
             message(FATAL_ERROR "GGML_CUDA_CUTLASS requires CUDA 12.9 or newer")
         endif()
 
-        include(FetchContent)
-        FetchContent_Declare(
-            CUTLASS
-            GIT_REPOSITORY https://github.com/NVIDIA/cutlass.git
-            GIT_TAG        v4.7.0
-            SOURCE_SUBDIR  source-only
-        )
-        FetchContent_MakeAvailable(CUTLASS)
+        if (GGML_CUDA_CUTLASS_DIR)
+            # a local CUTLASS checkout, so a build host without network access can still enable the FP8 GEMM
+            set(cutlass_SOURCE_DIR "${GGML_CUDA_CUTLASS_DIR}")
+        else()
+            include(FetchContent)
+            FetchContent_Declare(
+                CUTLASS
+                GIT_REPOSITORY https://github.com/NVIDIA/cutlass.git
+                GIT_TAG        v4.7.0
+                SOURCE_SUBDIR  source-only
+            )
+            FetchContent_MakeAvailable(CUTLASS)
+        endif()
 
         if (COMMAND license_add_file)
             license_add_file("CUTLASS" "${cutlass_SOURCE_DIR}/LICENSE.txt")
@@ -315,6 +322,28 @@ if (CUDAToolkit_FOUND)
     foreach(GGML_CUDA_COMPILE_TARGET IN LISTS GGML_CUDA_COMPILE_TARGETS)
         target_compile_options(${GGML_CUDA_COMPILE_TARGET} PRIVATE "$<$<COMPILE_LANGUAGE:CUDA>:${CUDA_FLAGS}>")
     endforeach()
+
+    if (GGML_CUDA_CUTLASS)
+        # sm_90a only (wgmma/TMA); compiled apart from the main target so the arch list of ggml-cuda stays as configured
+        add_library(ggml-cuda-cutlass-f8 OBJECT "${GGML_CUDA_CUTLASS_F8_SOURCE}")
+        set_target_properties(ggml-cuda-cutlass-f8 PROPERTIES
+            CUDA_ARCHITECTURES OFF
+            POSITION_INDEPENDENT_CODE ON
+            CUDA_STANDARD 17
+            CXX_STANDARD 17)
+        target_link_libraries(ggml-cuda-cutlass-f8 PRIVATE CUDA::cudart)
+        target_include_directories(ggml-cuda-cutlass-f8 PRIVATE .. "${CMAKE_CURRENT_SOURCE_DIR}")
+        target_include_directories(ggml-cuda-cutlass-f8 SYSTEM PRIVATE
+            "${cutlass_SOURCE_DIR}/include"
+            "${cutlass_SOURCE_DIR}/tools/util/include")
+        target_compile_definitions(ggml-cuda-cutlass-f8 PRIVATE GGML_CUDA_CUTLASS)
+        target_compile_options(ggml-cuda-cutlass-f8 PRIVATE
+            "$<$<COMPILE_LANGUAGE:CUDA>:-gencode;arch=compute_90a,code=sm_90a;--expt-relaxed-constexpr;-Xcompiler;-Wno-pedantic>")
+        if (BUILD_SHARED_LIBS)
+            target_compile_definitions(ggml-cuda-cutlass-f8 PRIVATE GGML_BACKEND_BUILD GGML_BACKEND_SHARED)
+        endif()
+        target_sources(ggml-cuda PRIVATE $<TARGET_OBJECTS:ggml-cuda-cutlass-f8>)
+    endif()
 else()
     message(FATAL_ERROR "CUDA Toolkit not found")
 endif()

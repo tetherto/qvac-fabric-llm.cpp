@@ -866,6 +866,22 @@ static __device__ __forceinline__ float ggml_cuda_ue4m3_to_fp32(uint8_t x) {
 #endif // defined(GGML_USE_HIP) && defined(CDNA3) && defined(FP8_AVAILABLE) && HIP_VERSION >= 60200000
 }
 
+// signed OCP e4m3fn (bias 7, no inf); the NaN encodings 0x7F/0xFF decode to 0 like the CPU helper
+static __device__ __forceinline__ float ggml_cuda_e4m3_to_fp32(uint8_t x) {
+    if ((x & 0x7F) == 0x7F) {
+        return 0.0f;
+    }
+    const int exp = (x >> 3) & 0xF;
+    const int man = x & 0x7;
+    float raw;
+    if (exp == 0) {
+        raw = ldexpf((float) man, -9);
+    } else {
+        raw = ldexpf(1.0f + (float) man / 8.0f, exp - 7);
+    }
+    return (x & 0x80) ? -raw : raw;
+}
+
 static __device__ __forceinline__ uint8_t ggml_cuda_fp32_to_ue4m3(float x) {
 #if defined(BLACKWELL_MMA_AVAILABLE) // This is used for NVFP4 subblock scale quantizations only
     if (!(x > 0.0f)) {

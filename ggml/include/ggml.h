@@ -232,6 +232,9 @@
 #define GGML_DEFAULT_N_THREADS  4
 #define GGML_DEFAULT_GRAPH_SIZE 2048
 
+// GGML_TYPE_F8_E4M3 block scale granularity along both k and n
+#define GGML_F8_E4M3_SCALE_BLOCK 128
+
 #if UINTPTR_MAX == 0xFFFFFFFF
     #define GGML_MEM_ALIGN 4
 #elif defined(__EMSCRIPTEN__)
@@ -438,7 +441,8 @@ extern "C" {
         GGML_TYPE_PQ3_0_64  = 48, // PolarQuant 3-bit (Stage 1 only), block=64  (3.25 bpw)
         GGML_TYPE_PQ4_0     = 49, // PolarQuant 4-bit (Stage 1 only), block=128 (4.125 bpw)
         GGML_TYPE_PQ4_0_64  = 50, // PolarQuant 4-bit (Stage 1 only), block=64  (4.25 bpw)
-        GGML_TYPE_COUNT     = 51,
+        GGML_TYPE_F8_E4M3   = 51, // FP8 e4m3, block scales in a sidecar tensor
+        GGML_TYPE_COUNT     = 52,
     };
 
     // precision
@@ -483,6 +487,7 @@ extern "C" {
         GGML_FTYPE_MOSTLY_NVFP4   = 26, // except 1d tensors
         GGML_FTYPE_MOSTLY_Q1_0    = 27, // except 1d tensors
         GGML_FTYPE_MOSTLY_Q2_0    = 28, // except 1d tensors
+        GGML_FTYPE_MOSTLY_F8_E4M3 = 29, // except 1d tensors
     };
 
     // available tensor operations:
@@ -1488,6 +1493,13 @@ extern "C" {
     GGML_API struct ggml_tensor * ggml_mul_mat(
             struct ggml_context * ctx,
             struct ggml_tensor  * a,
+            struct ggml_tensor  * b);
+
+    // a: F8_E4M3 weights [k, n]; a_scale: F32 [n/128, k/128] block scales, stored as src[2]
+    GGML_API struct ggml_tensor * ggml_mul_mat_blockscaled(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * a_scale,
             struct ggml_tensor  * b);
 
     // change the precision of a matrix multiplication

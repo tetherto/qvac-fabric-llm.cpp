@@ -5998,6 +5998,10 @@ static bool do_ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, cons
 
                 ggml_type src0_type = op->src[0]->type;
 
+                if (src0_type == GGML_TYPE_F8_E4M3) {
+                    return false;
+                }
+
                 // TODO: The configuration below needs more work to be supported with oneDNN
                 if (ggml_is_permuted(a) && !ggml_is_contiguous(a) &&
                     a->ne[2] > 1 && a->ne[3] > 1 && src0_type == GGML_TYPE_F16) {
