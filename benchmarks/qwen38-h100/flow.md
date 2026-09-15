@@ -63,3 +63,11 @@ ggml_cuda_mul_mat_f8(src0 = F8 weight [K][N], src1 = F32 activations [K][M], dst
 ### Tests
 
 `tests/test-backend-ops.cpp`: `test_mul_mat_f8(k, n, m, b_max)` builds `ggml_mul_mat_blockscaled`, fills the weights with random e4m3 bytes (no NaN encodings), scales in [0.5, 2], activations in [-b_max, b_max]; 18 cases (model shapes, odd M, tiny activations), tolerance 5e-4 NMSE at M <= 8 and 5e-3 above; run with `-o MUL_MAT_F8`.
+
+### Gated delta net on CUDA (`ggml/src/ggml-cuda/gated_delta_net.cu`, C1)
+
+`ggml_cuda_op_gated_delta_net_impl` order for a prefill ubatch (q/k [S, H_k, T, S_n], v [S, H_v, T, S_n], gate, beta, state):
+1. Opt-in external kernel: when `GGML_CUDA_GDN_AOT_LIB` names a library that exports `flashinfer_gdn_sm90_aot_launch` (loaded once with `dlopen`, Linux only), and the op is not KDA, keeps one state slot (K == 1), runs on cc 900 with S_v 128, T >= 64, H_v a multiple of H_k and at most 1023 sequences: a pack kernel writes BF16 q/k (expanded to one head per v-head with ggml's `h_v % H_k` mapping), BF16 v, `alpha = exp(g)` and beta into pool buffers, a tiny kernel writes `cu_seqlens`, the external fused delta-rule kernel writes BF16 output and the fp32 state, an unpack kernel converts the output to F32 into `dst`. Any failed condition or a nonzero launch status falls through.
+2. Otherwise the P4 path: whole 64-token chunks through `gated_delta_net_chunked_cuda<S_v>` (TF32 tensor cores), then the serial kernel on the tail from the chunk state. Decode (T = 1) always takes the serial kernel.
+
+Without the variable nothing changes: the loader returns null once and every call falls through (verified by a trace with zero FlashInfer launches and the P4 kernel present). Tests: `test_gated_delta_net` cases at the qwen35 shape family ((16, 128, 64/4096/4033, v_repeat 3), (4, 128, 127, 2 seqs, v_repeat 2)); tolerance 5e-5 NMSE with the library (BF16 I/O), 5e-7 for the TF32 chunked path (T >= 64, not KDA), the generic 1e-7 elsewhere.
