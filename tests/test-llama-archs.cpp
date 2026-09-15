@@ -172,7 +172,8 @@ static void usage(char ** argv) {
     LOG("  -v <N>                   Set log verbosity level\n");
     LOG("  -b, --backend <backend>  Run only on the given backend device\n");
     LOG("  -h, --help               Show this help message\n");
-    LOG("  --mtp-shared[-cpu]       Run only the shared native-MTP buffer test (must be the sole argument)\n\n");
+    LOG("  --mtp-shared[-cpu]       Run only the shared native-MTP buffer test (must be the sole argument)\n");
+    LOG("  --qsa-unified-multiseq   Run only the QSA unified multi-sequence test\n\n");
     LOG("Examples:\n");
     LOG("  %s\n", argv[0]);
     LOG("  %s -a qwen35moe\n", argv[0]);
@@ -785,13 +786,19 @@ static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
         struct gguf_context * gguf_ctx, FILE * file, const size_t seed, const float stdev,
         const std::vector<ggml_backend_dev_t> & devs,
         const llama_split_mode split_mode = LLAMA_SPLIT_MODE_LAYER, bool encode = false,
-        const llama_model_tensor_buft_override * tensor_buft_overrides = nullptr, const size_t moe_cache_size = 0) {
+        const llama_model_tensor_buft_override * tensor_buft_overrides = nullptr, const size_t moe_cache_size = 0,
+        uint32_t n_seq_max = 1, bool kv_unified = false,
+        ggml_backend_sched_eval_callback cb_eval = nullptr, void * cb_eval_user_data = nullptr) {
     llama_model_ptr model = get_model(gguf_ctx, file, seed, stdev, devs, split_mode, tensor_buft_overrides);
 
     llama_context_params ctx_params = llama_context_default_params();
     ctx_params.n_ctx = 0;
     ctx_params.n_threads = 4;
     ctx_params.n_threads_batch = 4;
+    ctx_params.n_seq_max = n_seq_max;
+    ctx_params.kv_unified = kv_unified;
+    ctx_params.cb_eval = cb_eval;
+    ctx_params.cb_eval_user_data = cb_eval_user_data;
     if (!encode) {
         ctx_params.n_ubatch = 64;
     }
@@ -1129,6 +1136,131 @@ static std::string get_device_label(ggml_backend_dev_t dev) {
     }
 
     return std::string(desc) + " (" + name + ")";
+}
+
+// A unified cache has one cell-to-block map for every sequence. Image patches can share a
+// temporal position, so until QSA has sequence-local ranks this configuration must stay dense.
+static int test_qsa_unified_multiseq(size_t seed, float stdev) {
+    struct observed_nodes {
+        bool top_k = false;
+    } observed;
+
+    auto observe = [](ggml_tensor * tensor, bool ask, void * data) {
+        if (ask) {
+            auto & nodes = *static_cast<observed_nodes *>(data);
+            nodes.top_k |= std::strncmp(tensor->name, "indexer_top_k-", 14) == 0;
+        }
+        return false;
+    };
+
+    // top_k below the per-sequence context so the indexer drops cells
+    auto gguf_sparse = get_gguf_ctx(LLM_ARCH_QWEN4EXP, true);
+    auto gguf_dense  = get_gguf_ctx(LLM_ARCH_QWEN4EXP, true);
+    gguf_set_val_u32(gguf_sparse.get(), "qwen4exp.attention.indexer.top_k", 8);
+
+    const uint32_t dense_ratios[] = { 0, 0 };
+    gguf_set_arr_data(gguf_dense.get(), "qwen4exp.attention.compress_ratios",
+            GGUF_TYPE_UINT32, dense_ratios, 2);
+
+    auto unified = get_model_and_ctx(gguf_sparse.get(), nullptr, seed, stdev, {}, LLAMA_SPLIT_MODE_LAYER,
+            false, nullptr, 0, 2, true, observe, &observed);
+    auto streams = get_model_and_ctx(gguf_sparse.get(), nullptr, seed, stdev, {}, LLAMA_SPLIT_MODE_LAYER,
+            false, nullptr, 0, 2, false);
+    auto dense = get_model_and_ctx(gguf_dense.get(), nullptr, seed, stdev, {}, LLAMA_SPLIT_MODE_LAYER,
+            false, nullptr, 0, 2, false);
+
+    const uint32_t n_embd  = llama_model_n_embd(unified.first.get());
+    const uint32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(unified.first.get()));
+
+    std::mt19937 rng(seed);
+    std::normal_distribution<float> distribution(0.0f, 0.1f);
+
+    struct image_batch {
+        std::vector<float>          embd;
+        std::vector<llama_pos>      pos;
+        std::vector<int32_t>        n_seq_id;
+        std::vector<llama_seq_id>   seq_id;
+        std::vector<llama_seq_id *> seq_id_ptr;
+        std::vector<int8_t>         logits;
+        llama_batch                 batch = {};
+    };
+
+    // {seq, n_patches, first pos}; the patches of the sequences are interleaved token by token
+    auto make_batch = [&](const std::vector<std::array<int, 3>> & seqs) {
+        std::vector<std::array<int, 3>> order; // seq, patch, first pos
+        for (int p = 0; ; ++p) {
+            const size_t n_prev = order.size();
+            for (const auto & sq : seqs) {
+                if (p < sq[1]) {
+                    order.push_back({ sq[0], p, sq[2] });
+                }
+            }
+            if (order.size() == n_prev) {
+                break;
+            }
+        }
+
+        auto ib = std::make_unique<image_batch>();
+        const int n = (int) order.size();
+        ib->embd.resize((size_t) n*n_embd);
+        for (float & value : ib->embd) {
+            value = distribution(rng);
+        }
+        ib->pos.assign(4*n, 0);
+        ib->n_seq_id.assign(n, 1);
+        ib->seq_id.resize(n);
+        ib->seq_id_ptr.resize(n);
+        ib->logits.assign(n, 1);
+        for (int i = 0; i < n; ++i) {
+            ib->pos[i]       = order[i][2] + order[i][1]/8;
+            ib->pos[i + n]   = order[i][1]/8;
+            ib->pos[i + 2*n] = order[i][1]%8;
+            ib->seq_id[i]     = order[i][0];
+            ib->seq_id_ptr[i] = &ib->seq_id[i];
+        }
+        ib->batch.n_tokens = n;
+        ib->batch.embd     = ib->embd.data();
+        ib->batch.pos      = ib->pos.data();
+        ib->batch.n_seq_id = ib->n_seq_id.data();
+        ib->batch.seq_id   = ib->seq_id_ptr.data();
+        ib->batch.logits   = ib->logits.data();
+        return ib;
+    };
+
+    auto decode = [n_vocab](llama_context * ctx, llama_batch batch) {
+        GGML_ASSERT(llama_decode(ctx, batch) == 0);
+        llama_synchronize(ctx);
+
+        std::vector<float> result;
+        result.reserve((size_t) batch.n_tokens*n_vocab);
+        for (int32_t i = 0; i < batch.n_tokens; ++i) {
+            const float * row = llama_get_logits_ith(ctx, i);
+            GGML_ASSERT(row != nullptr);
+            result.insert(result.end(), row, row + n_vocab);
+        }
+        return result;
+    };
+
+    // seq 1 is prefilled so the sequences own interleaved, unequal cell ranges in the unified cache
+    std::vector<std::unique_ptr<image_batch>> steps;
+    steps.push_back(make_batch({ { 1, 24, 0 } }));
+    steps.push_back(make_batch({ { 0, 64, 0 }, { 1, 40, 3 } }));
+    steps.push_back(make_batch({ { 1, 16, 8 }, { 0, 32, 8 } }));
+
+    for (const auto & step : steps) {
+        const auto actual   = decode(unified.second.get(), step->batch);
+        const auto expected = decode(streams.second.get(), step->batch);
+        const auto baseline = decode(dense.second.get(),   step->batch);
+
+        // unified matches per-stream to ~1e-14, sparse differs from dense by ~1e-9
+        GGML_ASSERT(nmse(actual, expected) < 1e-11);
+        GGML_ASSERT(nmse(expected, baseline) > 1e-11);
+    }
+
+    GGML_ASSERT(observed.top_k);
+
+    printf("QSA unified multi-sequence test passed\n");
+    return 0;
 }
 
 static int test_backends(const std::string & arch_filter, const size_t seed, const float stdev, const int verbosity, const char * target_backend) {
@@ -1603,6 +1735,7 @@ int main(int argc, char ** argv) {
     float stdev = 0.1f;
     std::string out;
     const char * target_backend = nullptr;
+    bool qsa_unified_multiseq = false;
 
     int verbosity = LOG_LEVEL_ERROR;
 
@@ -1610,6 +1743,8 @@ int main(int argc, char ** argv) {
         if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
             usage(argv);
             return 0;
+        } else if (strcmp(argv[i], "--qsa-unified-multiseq") == 0) {
+            qsa_unified_multiseq = true;
         } else if (strcmp(argv[i], "-a") == 0 || strcmp(argv[i], "--arch") == 0) {
             if (i + 1 < argc) {
                 const std::string arch_name = argv[++i];
@@ -1685,6 +1820,9 @@ int main(int argc, char ** argv) {
     init_normal_pool(seed, stdev);
 
     try {
+        if (qsa_unified_multiseq) {
+            return test_qsa_unified_multiseq(seed, stdev);
+        }
         if (!out.empty()) {
             return save_models(arch_filter, seed, stdev, verbosity, out);
         }
