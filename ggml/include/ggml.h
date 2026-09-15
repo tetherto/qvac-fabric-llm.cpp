@@ -1251,7 +1251,7 @@ extern "C" {
            struct ggml_context * ctx,
            struct ggml_tensor  * grad,
            struct ggml_tensor  * g);
-    
+
     // a - dy
     // b - x
     GGML_API struct ggml_tensor * ggml_sigmoid_back(
@@ -2850,7 +2850,7 @@ extern "C" {
     GGML_API struct ggml_tensor * ggml_cross_entropy_loss_masked(
             struct ggml_context * ctx,
             struct ggml_tensor  * a,  // logits
-            struct ggml_tensor  * b,  // labels  
+            struct ggml_tensor  * b,  // labels
             struct ggml_tensor  * c); // mask (1 for assistant tokens, 0 for masked)
     GGML_API struct ggml_tensor * ggml_cross_entropy_loss_masked_back(
             struct ggml_context * ctx,

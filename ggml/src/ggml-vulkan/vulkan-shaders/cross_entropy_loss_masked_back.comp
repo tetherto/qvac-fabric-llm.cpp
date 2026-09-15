@@ -21,28 +21,28 @@ shared FLOAT_TYPE vals[BLOCK_SIZE];
 void main() {
     const uint nclasses = p.KX;
     const uint nrows = p.KY;
-    
+
     const uint row = gl_WorkGroupID.x;
     if (row >= nrows) {
         return;
     }
-    
+
     const uint tid = gl_LocalInvocationID.x;
     const uint warp_size = gl_WorkGroupSize.x;
-    
+
     const uint logits_offset = row * nclasses;
     const uint labels_offset = row * nclasses;
     const uint dst_offset = row * nclasses;
 
     const float mask_value = data_d[row * nclasses + 0];
-    
+
     if (mask_value <= 0.5) {
         for (uint i = tid; i < nclasses; i += warp_size) {
             data_e[dst_offset + i] = D_TYPE(0.0);
         }
         return;
     }
-    
+
     FLOAT_TYPE d_by_valid;
     if (tid == 0) {
         FLOAT_TYPE valid_tokens = FLOAT_TYPE(0.0);
@@ -55,7 +55,7 @@ void main() {
 
         const FLOAT_TYPE upstream_grad = FLOAT_TYPE(data_a[0]);
         d_by_valid = valid_tokens > 0.0 ? upstream_grad / valid_tokens : FLOAT_TYPE(0.0);
-        
+
         vals[0] = d_by_valid;
     }
     barrier();
@@ -68,10 +68,10 @@ void main() {
         FLOAT_TYPE val = FLOAT_TYPE(data_b[logits_offset + i]);
         thread_max = max(thread_max, val);
     }
-    
+
     vals[tid] = thread_max;
     barrier();
-    
+
     [[unroll]]
     for (uint s = warp_size / 2; s > 0; s >>= 1) {
         if (tid < s) {
@@ -79,19 +79,19 @@ void main() {
         }
         barrier();
     }
-    
+
     const FLOAT_TYPE row_max = vals[0];
     barrier();
-    
+
     FLOAT_TYPE thread_sum = FLOAT_TYPE(0.0);
     for (uint i = tid; i < nclasses; i += warp_size) {
         FLOAT_TYPE val = FLOAT_TYPE(data_b[logits_offset + i]);
         thread_sum += exp(val - row_max);
     }
-    
+
     vals[tid] = thread_sum;
     barrier();
-    
+
     [[unroll]]
     for (uint s = warp_size / 2; s > 0; s >>= 1) {
         if (tid < s) {
@@ -99,15 +99,15 @@ void main() {
         }
         barrier();
     }
-    
+
     const FLOAT_TYPE row_sum = vals[0];
     const FLOAT_TYPE sm_scale = FLOAT_TYPE(1.0) / row_sum;
     barrier();
-    
+
     for (uint i = tid; i < nclasses; i += warp_size) {
         FLOAT_TYPE logit = FLOAT_TYPE(data_b[logits_offset + i]);
         FLOAT_TYPE softmax_val = exp(logit - row_max) * sm_scale;
-        
+
         FLOAT_TYPE label = FLOAT_TYPE(data_c[labels_offset + i]);
         FLOAT_TYPE gradient = (softmax_val - label) * d_by_valid;
 
