@@ -72,3 +72,33 @@ The activation scale tensor is `[K/128][M]` and TMA needs a 16-byte row stride, 
 - Q8_0 GEMV geometry retune (Q8-D2): parked when the campaign moved to FP8; its per-node table is the design input the F8 GEMV used.
 - BF16 reference logits for an absolute quality number: needs about 130 GB of disk; not run. All quality rows are relative to the Q8_K_XL reference logits or to the FP8 fallback logits.
 - A relaxed gate for W8A8 prefill: not taken; thresholds are set before results, not after.
+
+## 11. FFN-only CUTLASS routing (F4)
+
+Options:
+- (a) Route only the FFN up/gate/down matmuls through the W8A8 GEMM and keep the attention / linear-attention projections on the F16 fallback, selected by an op hint set in `build_ffn` (no tensor-name or shape heuristics in the backend).
+- (b) Finer activation groups (64-wide) for every F8 matmul.
+
+Taken: (a) first (the user's choice among the F3 levers), then rejected by the gate: Same top p 98.43% against the 99.0% floor, Mean KLD 0.0035 (F2 with everything routed: 98.03%, 0.0059). The hint mechanism and the tests were reverted; the CUTLASS build stays opt-in and rejected. (b) is the next candidate, together with per-channel smoothing.
+
+## 12. Which PR #264 pieces to take, and on what basis
+
+The user's rule: nothing is skipped on reasoning alone; every candidate is measured at our shape before a decision. Measured on his own branch built on the host (M0): his BF16 wmma chunked GDN kernel 4695 us vs our P4 kernel 1702 us per (16 heads, 48 v-heads, 4096 tokens) op, skipped; his FlashInfer SM90 adapter 578 us, taken as C1. Measured standalone (M1): DeepGEMM 0.1.7 dense FP8 at 1.27x the CUTLASS example's TFLOPS on the FFN shapes, recorded as a future GEMM lever, nothing merged (his DeepGEMM integration is MoE-only with hard-coded qwen4exp shapes and BF16 output). His rms_norm + mul arrangement: already active in our graph. His shared BF16 casts: no standalone effect on our graph (no F32->BF16 CPY), so the analogue was built as C3.
+
+## 13. FlashInfer GDN adapter as an opt-in external library (C1)
+
+Options:
+- (a) Vendor the CuTe DSL kernel source or the generated object into the tree.
+- (b) Keep it external: `dlopen` a `.so` named by `GGML_CUDA_GDN_AOT_LIB`, fall through to our kernels when unset or when the shape is outside the adapter's conditions.
+
+Taken: (b), as in PR #264. The artifact is an NVIDIA CuTe DSL AOT export (needs `libcute_dsl_runtime.so`), not something the build can produce; keeping it external keeps the default build and the default numerics unchanged (without the variable the trace shows zero FlashInfer launches and the P4 kernel as before). Accepted on the campaign rules: gate Mean KLD 0.0001 / Same top p 99.79% (BF16 q/k/v/out rounding, fp32 state), server prefill +7.8% at 10k and +3.4% at 110k on both reps, decode unchanged. The test tolerance for the external kernel is 5e-5 NMSE (BF16 class; measured 1.0e-5 to 1.3e-5), and the TF32 chunked path got 5e-7 after it was found sitting on the generic 1e-7 line with run-to-run noise.
+
+## 14. Separate-state SSM_CONV (C2) and the shared F16 cast (C3): rejected on the acceptance rules
+
+C2 removes the per-layer concat of conv state and tokens (his op extension `ggml_ssm_conv_ext`, CUDA and CPU only, opt-in by env var because the other backends reject `src[2]`). Tests and a 4-chunk PPL equality passed, llama-bench gained 1.4 to 3.0%, but the server's 110k prompt was 4.0% slower in four alternating launches while the 10k prompt was 1.8% faster; the rule (server not worse on both shapes) rejects it. The cause was not found in the time box (ruled out: run order, CPU fallback on partial ubatches, server checkpoints); the patch is kept.
+
+C3 replaces the per-matmul F32->F16 activation convert inside the F8 fallback with one graph-level cast shared by the projections of a layer (GDN wqkv+gate, attention q/k/v, FFN up+gate: 144 of 400 converts per ubatch). It needed the F8 matmul, the CUDA `supports_op` and the CPU reference to accept F16 activations, and it sent contiguous F32->F16/BF16 copies through the vectorized converter. Tests and equality passed and the trace showed 1.9% less GPU kernel time, but llama-bench was flat to -1%; rejected on the +1% rule, patch kept.
+
+## 15. Server acceptance runs are A/B on one idle GPU
+
+After C2's first server run (measured while the other GPU ran an A/B) disagreed with its controlled repeat, server acceptance numbers are taken with the host otherwise idle, the server relaunched per configuration, and the two configurations alternated (`srv_ab.sh` on the host). The C1 acceptance was measured before this rule; its 10k gain (+7.8%, +6.4%) is well above the noise seen since (about 1.5% at 10k, 0.2% at 110k).

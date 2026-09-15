@@ -62,24 +62,30 @@ Also not taken: CUTLASS tiles 256x128 (440 TFLOPS) and StreamK (5% slower); GEMV
 
 ## Ranked levers (from the F3 section of the ledger)
 
-1. Activation quantization on the CUTLASS path that passes the gate: route only the FFN GEMMs through CUTLASS and keep the attention / linear-attention projections on the fallback, then re-gate (chosen next).
+1. Activation quantization on the CUTLASS path that passes the gate. Tried as F4 (FFN-only routing through an op hint): Same top p 98.43% (needs 99.0%), Mean KLD 0.0035; rejected. The projections carry about 40% of the F2 divergence, the FFN GEMMs alone still flip 1.6% of the top-1 tokens. Next candidates: 64-wide activation groups or per-channel smoothing. Standalone data point (M1): DeepGEMM 0.1.7 runs the same W8A8 product at 1.27x the CUTLASS example's TFLOPS on the FFN shapes at M 4096, so a dense DeepGEMM path is a GEMM lever once the numerics pass.
 2. Server-side prefill overhead (0.3 to 0.5 s per 10k request).
 3. Decode launch count: fuse norm + residual, q/k norm, the alpha/beta projections.
 4. Finer (64-wide) activation groups if lever 1 is not enough.
-5. GDN chunk kernel (21 us/token of prefill, second largest family).
+5. GDN chunk kernel: done as C1 (accepted). PR #264's FlashInfer SM90 fused delta-rule adapter, opt-in through `GGML_CUDA_GDN_AOT_LIB=<.so>` (external CuTe DSL artifact, needs `libcute_dsl_runtime.so` on `LD_LIBRARY_PATH`): the GDN op 1702 -> 578 us at (16 heads, 48 v-heads, 4096 tokens), server prefill +7.8% at 10k and +3.4% at 110k, gate Mean KLD 0.0001 / Same top p 99.79%. The teammate's own chunked kernel was measured 2.8x slower than our P4 kernel at that shape and skipped. Remaining inside this family: the F32->BF16 pack kernel now costs more than the fused kernel (350 vs 208 us per call).
 6. `lm_head` in FP8 (about 3% of decode, changes output-head numerics; user decision).
+7. Two small levers from PR #264 measured and rejected (patches kept): separate-state `SSM_CONV` (C2: llama-bench +1.4% to +3.0%, but the server 110k prompt was 4% slower in four controlled launches, cause not found) and a shared F16 cast of the F8 projection inputs (C3: 1.9% less GPU kernel time, llama-bench flat to -1%).
 
 ## What is committed
 
-Branch `fp8-h100-campaign` on `origin` (tetherto/qvac-fabric-llm.cpp), five commits on top of `54db4c109`:
+Branch `fp8-h100-campaign` on `origin` (tetherto/qvac-fabric-llm.cpp), on top of `54db4c109`:
 - `fb2496614` cuda : Hopper prefill and decode work for Qwen3.8-27B (the earlier campaign: cuBLAS gate, chunked GDN, vec8 convert, prompt-cache prefault)
 - `4544e57f9` ggml : native FP8 e4m3 weights with 128x128 block scales (F8_E4M3)
 - `a6f4f0caa` benchmarks : campaign ledger, scripts, patches and results
 - `3becb7df9` cuda : per-device SM count for the CUTLASS FP8 GEMM; F2 measurements and ledger
 - `3b204a0b9` cuda : FP8 activation quantizer scale floor, error path; F3 report and patches
+- `d5aa3d424`, `afd5585c8` docs
+- `f31a3909f` cuda : opt-in FlashInfer SM90 fused gated delta net path (from PR #264); ledger for F4 (rejected), M0, M1, C1
+- `62051f7c5` benchmarks : C2 separate-state SSM_CONV measured and rejected
 
-The working tree is clean. Nothing was merged to the default branch; no PR exists. Note on process: `AGENTS.md` in this repository says an agent must never push or create a PR; the pushes above were done on the user's explicit instruction to a separate branch of the private fork. Later commits and pushes follow the user's rule: short messages, no attribution trailers.
+Note on process: `AGENTS.md` in this repository says an agent must never push or create a PR; the pushes above were done on the user's explicit instruction to a separate branch of the private fork, with short messages and no attribution trailers as the user asked.
+
+Merge note for whoever lands second: PR #264 and this branch both define `GGML_TYPE_F8_E4M3 = 51`, with transposed `.scale` layouts (`{N/128, K/128}` here, `{K/128, N/128, E}` there) and different attachment points (`src[2]` of `MUL_MAT` here, `src[3]` of `MUL_MAT_ID` there); `ggml.c` type traits (`is_quantized false` + `to_float` here), `supports_op`, `build_lora_mm_id` and the CUDA CMake blocks conflict.
 
 ## Host state
 
-`/home/pratik/qwen38-bench/`: `models/Qwen3.8-27B-FP8.gguf` (30 GB), `models/unsloth-Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-Q8_K_XL.gguf`, `kld-base-q8.bin` and `kld-base-f8.bin` (31 GB each), `cutlass/` (v4.2.1 source, example 67 build, the standalone benches), `prof/` (nsys traces for f8-pp10k, f8-tg10240, f8-tg110000), two build trees `build-h100` (default) and `build-h100-f8` (CUTLASS on). 71 GB free. Removed earlier at the user's request: the NVFP4 checkpoint, the Q4 GGUF and its logits, the BF16/Q8 draft GGUFs, the FP8 safetensors and the uv cache.
+`/home/pratik/qwen38-bench/`: `models/Qwen3.8-27B-FP8.gguf` (30 GB), `models/unsloth-Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-Q8_K_XL.gguf`, `kld-base-q8.bin` and `kld-base-f8.bin` (31 GB each), `cutlass/` (v4.2.1 source, example 67 build, the standalone benches), `flashinfer-gdn/` (the C1 library, its bridge header/object and the teammate's export/compare scripts), `prof/` (nsys traces incl. f4/c1/c1off/c2/c3 pp4096 and the gate logs), `srv_ab.sh` (server A/B launcher), two build trees `build-h100` (default) and `build-h100-f8` (CUTLASS on). 66 GB free. The teammate's branch worktree and the DeepGEMM venv were removed after M0/M1. Removed earlier at the user's request: the NVFP4 checkpoint, the Q4 GGUF and its logits, the BF16/Q8 draft GGUFs, the FP8 safetensors and the uv cache.
