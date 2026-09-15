@@ -4655,6 +4655,15 @@ struct test_gated_delta_net : public test_case {
 
     bool   grad_precise() override { return true; }
     double max_maa_err()  override { return 2e-2; }
+    // the opt-in external FlashInfer kernel (CUDA, GGML_CUDA_GDN_AOT_LIB) rounds q/k/v and the output to BF16.
+    // The TF32 chunked GDN prefill kernel sits at NMSE 1e-7 (1.06e-7 at S 64 T 256, 1.09e-7 at S 128 T 4096).
+    double max_nmse_err() override {
+        if (getenv("GGML_CUDA_GDN_AOT_LIB")) {
+            return 5e-5;
+        }
+        const bool chunked = !kda && n_seq_tokens >= 64 && (head_size == 64 || head_size == 128);
+        return chunked ? 5e-7 : test_case::max_nmse_err();
+    }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         const bool grad = (mode == MODE_GRAD) && !permuted && check_grad;
@@ -12293,6 +12302,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 256, 1, 3));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 200, 2, 1, true));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 2, 128, 130, 2, 2));
+    // external SM90 fused kernel shapes (qwen35 H_k 16, H_v 48; T not a multiple of 64; multi-seq)
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128,   64, 1, 3));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 4096, 1, 3));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 4033, 1, 3));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32,  4, 128,  127, 2, 2));
     // chunked prefix followed by a serial tail that must hold all K snapshots (tail exactly K, and tail > K)
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64,  68, 1, 1, false, false, /*K=*/4));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 100, 2, 1, false, false, /*K=*/4));
@@ -12876,6 +12890,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 512, 1));  // 4h PP-512
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 1024, 1)); // 4h PP-1024
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 64, 1, 1, false, true)); // KDA PP-64
+    // qwen35 (Qwen3.8-27B): H_k 16, H_v 48 (v_repeat 3), ub 4096
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 1024, 1, 3));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 4096, 1, 3));
 
     // GATED_DELTA_NET_BACK: mirrors the forward configurations above.
     // Backward only runs during training, so the sequence lengths that matter are the PP-sized ones.
