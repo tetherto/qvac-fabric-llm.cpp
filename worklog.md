@@ -1017,3 +1017,45 @@ Validation:
 - `test-llama-archs --arch qwen4exp` passes CUDA and CPU numerical checks
 - the Meta-backend split-axis assertion also reproduces with the pooled-cache
   kill switch and belongs to the preceding direct-sparse-index metadata path
+
+## 2026-09-15: batch-1 tensor-parallel whole-graph experiment
+
+The existing opt-in `GGML_CUDA_TP_GRAPHS=1` path was tested with the current
+FP8 checkpoint at 64K context on physical H100 GPUs 6 and 7. Verbose depth-zero
+tests proved that the native-FP8 DeepGEMM graph passes compatibility checking,
+captures successfully on both devices, and replays a stable batch-1 graph.
+Nsight at 32K recorded 252 `cudaGraphLaunch` calls for 128 generated tokens,
+approximately one launch per GPU per token after the initial direct/capture
+steps, versus 24,638 calls (192.5 per token across both GPUs) without the
+whole-model graph.
+
+The launch-count reduction did not translate into a material throughput gain:
+
+| 64K TG128 mode | samples (tok/s) | mean |
+| --- | --- | ---: |
+| TP graph, default concurrent launcher | 51.3589, 50.6579, 48.8907, 51.2357, 51.1583 | 50.6603 |
+| TP graph, concurrent launcher plus NCCL mixing disabled | 51.6392, 50.8139, 47.8513, 51.5675, 51.4967 | 50.6737 |
+| Adjacent TP graph-off control | 49.5332, 50.0497, 49.9025, 51.4438, 51.5429 | 50.4944 |
+
+The last-two stable means are 51.5321 tok/s for the best graph mode and
+51.4934 tok/s for graph-off, only +0.08%. The earlier pooled-cache result of
+51.8596 tok/s is consistent with ordinary run-to-run drift. Treat whole-model
+TP capture as performance-neutral for this FP8 batch-1 workload.
+
+`NCCL_GRAPH_MIXING_SUPPORT=0` with the current sequential rank launcher hung
+at the first collective graph launch. An experimental concurrent-launch
+override made that configuration complete, but it was also neutral, so the
+override was removed. The normal concurrent launcher remains the only working
+configuration tested here.
+
+The 32K graph trace is `/tmp/qwen4-fp8-tpgraph-d32768-20260915.nsys-rep` on the
+benchmark host. CUDA tracing shows about 5.18 ms average API time per collective
+graph launch, but this is substantially inflated by graph-node tracing. More
+importantly, summed GPU kernel time is about 4.55 seconds across the two GPUs
+for 128 tokens, or about 17.8 ms per GPU/token. The device-side MoE GEMMs and
+pack/scatter path, dense BF16 projections, QSA selection/attention, and 96
+all-reduces per GPU/token remain. Removing host graph fragmentation alone
+therefore cannot close the SGLang gap.
+
+The temporary llama-bench CUDA-profiler marker and concurrent-launch override
+were removed after measurement. No experiment-only source changes remain.
