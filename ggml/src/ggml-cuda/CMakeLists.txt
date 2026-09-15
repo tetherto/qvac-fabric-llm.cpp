@@ -158,6 +158,10 @@ if (CUDAToolkit_FOUND)
                              ${GGML_SOURCES_CUDA}
                             )
 
+    if (CMAKE_DL_LIBS)
+        target_link_libraries(ggml-cuda PRIVATE ${CMAKE_DL_LIBS})
+    endif()
+
     add_compile_definitions(GGML_CUDA_PEER_MAX_BATCH_SIZE=${GGML_CUDA_PEER_MAX_BATCH_SIZE})
 
     if (GGML_CUDA_GRAPHS)
