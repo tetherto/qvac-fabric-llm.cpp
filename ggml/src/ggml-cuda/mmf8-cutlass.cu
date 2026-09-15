@@ -76,8 +76,10 @@ cutlass::KernelHardwareInfo hw_info_for_current_device() {
     constexpr int max_devices = 16;
     static std::atomic<int> sm_counts[max_devices];
     cutlass::KernelHardwareInfo info;
-    if (cudaGetDevice(&info.device_id) != cudaSuccess) {
-        info.device_id = 0;
+    const cudaError_t err = cudaGetDevice(&info.device_id);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "%s: cudaGetDevice failed: %s\n", __func__, cudaGetErrorString(err));
+        abort();
     }
     if (info.device_id < 0 || info.device_id >= max_devices) {
         info.sm_count = cutlass::KernelHardwareInfo::query_device_multiprocessor_count(info.device_id);

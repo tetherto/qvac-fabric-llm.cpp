@@ -6,6 +6,8 @@
 #include "mmf8-cutlass.cuh"
 #endif // GGML_CUDA_CUTLASS
 
+#include <cfloat>
+
 // two packed e4m3 -> two floats; e4m3 values are exact in f16
 static __device__ __forceinline__ float2 ggml_cuda_e4m3x2_to_float2(const uint16_t v) {
 #if defined(FP8_AVAILABLE) && !defined(GGML_USE_HIP)
@@ -19,9 +21,8 @@ static __device__ __forceinline__ float2 ggml_cuda_e4m3x2_to_float2(const uint16
 #define MMF8_GEMV_NWARPS 4
 #define MMF8_GEMV_MAX_NCOLS 8
 
-// a block owns `nrows_w` consecutive weight rows; its warps split the k range in trips of 512 columns (16 bytes per lane, 4 scale blocks)
-// each lane converts the 16 weights of every row in registers and reuses one activation slice for all of them,
-// which keeps the L1 traffic for the activations at the weight traffic (measured: y loads were the limiter at one row per warp)
+// a block owns nrows_w consecutive rows and its warps split k in trips of 512 columns (16 bytes per lane, 4 scale blocks)
+// one activation slice per trip serves all nrows_w rows: at one row per warp the activation loads were the limiter
 template <int ncols_dst, int nrows_w, bool y_vec>
 static __global__ void mul_mat_vec_f8_e4m3(
         const uint8_t * __restrict__ x, const float * __restrict__ sx, const float * __restrict__ y, float * __restrict__ dst,
@@ -182,7 +183,7 @@ static void dequant_f8_e4m3_blockscaled_f16_cuda(
     dequant_f8_e4m3_blockscaled_f16<<<block_nums, CUDA_DEQUANTIZE_BLOCK_SIZE, 0, stream>>>(x, sx, y, ncols, nblk_n);
 }
 
-// scaled dequant to F16 followed by cuBLAS with F32 accumulation: the same numerics as the quantized prefill path
+// scaled dequant to F16 followed by cuBLAS with F32 accumulation
 static void mul_mat_f8_e4m3_cublas(
         ggml_backend_cuda_context & ctx, const uint8_t * x, const float * sx, const float * y, float * dst,
         const int ncols, const int nrows, const int nblk_n, const int64_t ntokens, cudaStream_t stream) {
@@ -206,8 +207,7 @@ static void mul_mat_f8_e4m3_cublas(
 }
 
 #ifdef GGML_CUDA_CUTLASS
-// activations to e4m3 with one scale per (token, 128-k group); scales stored [K/128][M_pad] (tokens contiguous) for the CUTLASS SFA layout
-// one warp per (token, group): 4 floats per lane
+// one warp per (token, 128-k group), 4 floats per lane; scales stored [K/128][M_pad] (tokens contiguous) as CUTLASS expects
 static __global__ void quantize_f8_e4m3_group128(
         const float * __restrict__ x, uint8_t * __restrict__ q, float * __restrict__ sfa, const int stride_sfa, const int ntokens, const int ncols) {
     const int nblk_k = ncols/GGML_F8_E4M3_SCALE_BLOCK;
@@ -224,8 +224,8 @@ static __global__ void quantize_f8_e4m3_group128(
     float amax = fmaxf(fmaxf(fabsf(v.x), fabsf(v.y)), fmaxf(fabsf(v.z), fabsf(v.w)));
     amax = warp_reduce_max<32>(amax);
 
-    const float scale = amax > 0.0f ? amax/448.0f : 1.0f;
-    const float inv   = amax > 0.0f ? 448.0f/amax : 1.0f;
+    const float scale = fmaxf(amax/448.0f, FLT_MIN); // keeps 1/scale finite for zero or subnormal groups
+    const float inv   = 1.0f/scale;
     const __nv_fp8x2_storage_t lo = __nv_cvt_float2_to_fp8x2(make_float2(v.x*inv, v.y*inv), __NV_SATFINITE, __NV_E4M3);
     const __nv_fp8x2_storage_t hi = __nv_cvt_float2_to_fp8x2(make_float2(v.z*inv, v.w*inv), __NV_SATFINITE, __NV_E4M3);
     *(uint32_t *) (q + i) = (uint32_t) lo | ((uint32_t) hi << 16);

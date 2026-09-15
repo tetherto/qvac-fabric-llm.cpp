@@ -5074,9 +5074,10 @@ struct test_mul_mat_f8 : public test_case {
     const int64_t k; // weight columns (ne[0])
     const int64_t n; // weight rows
     const int64_t m; // tokens
+    const float b_max; // activation magnitude; subnormal values exercise the activation quantizer's scale floor
 
     std::string vars() override {
-        return VARS_TO_STR3(k, n, m);
+        return VARS_TO_STR4(k, n, m, b_max);
     }
 
     double max_nmse_err() override {
@@ -5089,7 +5090,7 @@ struct test_mul_mat_f8 : public test_case {
         return 2 * k * n * m;
     }
 
-    test_mul_mat_f8(int64_t k = 256, int64_t n = 128, int64_t m = 1) : k(k), n(n), m(m) {}
+    test_mul_mat_f8(int64_t k = 256, int64_t n = 128, int64_t m = 1, float b_max = 1.0f) : k(k), n(n), m(m), b_max(b_max) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * a = ggml_new_tensor_2d(ctx, GGML_TYPE_F8_E4M3, k, n);
@@ -5119,7 +5120,7 @@ struct test_mul_mat_f8 : public test_case {
             } else if (strcmp(t->name, "a_scale") == 0) {
                 init_tensor_uniform(t, 0.5f, 2.0f);
             } else {
-                init_tensor_uniform(t);
+                init_tensor_uniform(t, -b_max, b_max);
             }
         }
     }
@@ -10485,6 +10486,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
     for (int64_t m : {2, 1000}) {
         test_cases.emplace_back(new test_mul_mat_f8(6144, 5120, m));
+    }
+
+    // activation groups whose amax/448 is below FLT_MIN (quantizer scale floor); m > 8 so the GEMM paths run
+    for (int64_t m : {9, 64}) {
+        test_cases.emplace_back(new test_mul_mat_f8(256, 128, m, 1e-37f));
     }
 
     for (ggml_type type_a : all_types) {
