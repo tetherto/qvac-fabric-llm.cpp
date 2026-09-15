@@ -38,6 +38,8 @@ const char * ggml_backend_meta_split_axis_name(enum ggml_backend_meta_split_axis
             return "MIRRORED";
         case GGML_BACKEND_SPLIT_AXIS_PARTIAL:
             return "PARTIAL";
+        case GGML_BACKEND_SPLIT_AXIS_EXPERT:
+            return "EXPERT";
         case GGML_BACKEND_SPLIT_AXIS_NONE:
             return "NONE";
         case GGML_BACKEND_SPLIT_AXIS_UNKNOWN:
@@ -598,6 +600,21 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             GGML_ASSERT(split_states_equal(src_ss[0], src_ss[1]));
             return src_ss[0];
         }
+        // MUL_MAT_ID can retain expert-local, full-shaped intermediates from
+        // the gate/up projection through its nonlinear activation and into
+        // the down projection.  The down result is an additive hidden-state
+        // contribution and becomes an ordinary PARTIAL tensor.
+        if (tensor->op == GGML_OP_MUL_MAT_ID &&
+                src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_2 &&
+                src_ss[2].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
+            if (src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
+                return {GGML_BACKEND_SPLIT_AXIS_EXPERT, {0}, {1}, 1};
+            }
+            if (src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_EXPERT) {
+                return {assume_sync ? GGML_BACKEND_SPLIT_AXIS_MIRRORED : GGML_BACKEND_SPLIT_AXIS_PARTIAL, {0}, {1}, 1};
+            }
+        }
+
         // batched matmul with the batches split across devices and a replicated activation
         if (src_ss[0].axis >= GGML_BACKEND_SPLIT_AXIS_2 && src_ss[0].axis < GGML_MAX_DIMS &&
                 src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
@@ -639,7 +656,8 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
                 GGML_ABORT("shape mismatch for %s", ggml_op_name(tensor->op));
             }
             case GGML_BACKEND_SPLIT_AXIS_MIRRORED:
-            case GGML_BACKEND_SPLIT_AXIS_PARTIAL: {
+            case GGML_BACKEND_SPLIT_AXIS_PARTIAL:
+            case GGML_BACKEND_SPLIT_AXIS_EXPERT: {
                 return src_ss[0];
             }
             default: {
@@ -684,7 +702,9 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             }
             GGML_ABORT("fatal error");
         }
-        if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED || src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL) {
+        if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED ||
+                src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL ||
+                src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_EXPERT) {
             return src_ss[0];
         }
         GGML_ABORT("view of permuted tensor not implemented");
@@ -701,7 +721,8 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
                 return {ggml_backend_meta_split_axis(tensor->op_params[src_ss[0].axis]), {0}, {src_ss[0].nr[0]}, 1};
             }
             case GGML_BACKEND_SPLIT_AXIS_MIRRORED:
-            case GGML_BACKEND_SPLIT_AXIS_PARTIAL: {
+            case GGML_BACKEND_SPLIT_AXIS_PARTIAL:
+            case GGML_BACKEND_SPLIT_AXIS_EXPERT: {
                 return src_ss[0];
             }
             default: {
@@ -721,7 +742,8 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             case GGML_BACKEND_SPLIT_AXIS_2:
             case GGML_BACKEND_SPLIT_AXIS_3:
             case GGML_BACKEND_SPLIT_AXIS_MIRRORED:
-            case GGML_BACKEND_SPLIT_AXIS_PARTIAL: {
+            case GGML_BACKEND_SPLIT_AXIS_PARTIAL:
+            case GGML_BACKEND_SPLIT_AXIS_EXPERT: {
                 return src_ss[0];
             }
             default: {
@@ -1278,6 +1300,24 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_m
             }
         }
 
+        // A MUL_MAT_ID whose weight stack is partitioned on the expert axis
+        // still receives global expert IDs.  Record the first global expert
+        // owned by this simple tensor so supporting backends can translate
+        // those IDs without changing the public operator contract.
+        if (tensor->op == GGML_OP_MUL_MAT_ID && tensor->src[0] != nullptr &&
+                ggml_backend_buffer_is_meta(tensor->src[0]->buffer)) {
+            const ggml_backend_meta_split_state src0_ss =
+                ggml_backend_meta_get_split_state(stc, tensor->src[0], /*assume_sync =*/ true);
+            if (src0_ss.axis == GGML_BACKEND_SPLIT_AXIS_2) {
+                GGML_ASSERT(src0_ss.n_segments == 1 && src0_ss.nr[0] == 1);
+                int32_t expert_offset = 0;
+                for (size_t jj = 0; jj < j; ++jj) {
+                    expert_offset += src0_ss.ne[jj];
+                }
+                t_ij->op_params[2] = expert_offset;
+            }
+        }
+
         simple_tensors.push_back(t_ij);
     }
 
@@ -1404,6 +1444,7 @@ static void ggml_backend_meta_buffer_memset_tensor(
             GGML_ASSERT(value == 0);
             [[fallthrough]];
         }
+        case GGML_BACKEND_SPLIT_AXIS_EXPERT:
         case GGML_BACKEND_SPLIT_AXIS_MIRRORED: {
             for (size_t j = 0; j < n_bufs; j++) {
                 ggml_tensor * simple_tensor = ggml_backend_meta_buffer_simple_tensor(tensor, j);
@@ -2182,6 +2223,16 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
                 if (node->view_src != nullptr && node->view_src->op == GGML_OP_NONE && ggml_backend_buffer_is_host(node->view_src->buffer)) {
+                    // Host-backed views are no-ops in the per-device graphs and do not have a Meta split state.
+                    // If one is the final graph node, it must still close the last subgraph range.
+                    if (i + 1 == cgraph->n_nodes) {
+                        for (size_t j = 0; j < n_backends; j++) {
+                            auto & bcj = backend_ctx->backend_configs[j];
+                            bcj.cgraphs[n_subgraphs].offset = i_start;
+                        }
+                        n_subgraphs++;
+                        i_start = i + 1;
+                    }
                     continue;
                 }
                 const ggml_backend_meta_split_state split_state = ggml_backend_meta_get_split_state(node, /*assume_sync =*/ false);

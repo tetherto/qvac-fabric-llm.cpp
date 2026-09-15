@@ -189,8 +189,9 @@ __global__ void scatter_bf16_output(
     const int packed_row = assignment_rows[assignment];
 
     for (int col = threadIdx.x; col < n; col += blockDim.x) {
-        dst[token * dst_stride_token + slot * dst_stride_slot + col] =
-            static_cast<float>(packed[static_cast<size_t>(packed_row) * n + col]);
+        dst[token * dst_stride_token + slot * dst_stride_slot + col] = packed_row >= 0
+            ? static_cast<float>(packed[static_cast<size_t>(packed_row) * n + col])
+            : 0.0f;
     }
 }
 CUtensorMap make_tma_2d_desc(
@@ -432,6 +433,7 @@ bool mul_mat_id_supported(const ggml_tensor * dst, int device) {
     const int k         = static_cast<int>(weights->ne[0]);
     const int n         = static_cast<int>(weights->ne[1]);
     const int n_groups  = static_cast<int>(weights->ne[2]);
+    const int expert_offset = ggml_get_op_params_i32(dst, 2);
     const int top_k     = static_cast<int>(ids->ne[0]);
     const int n_tokens  = static_cast<int>(ids->ne[1]);
     const int scale_k   = k / DG_SCALE_K;
@@ -459,7 +461,8 @@ bool mul_mat_id_supported(const ggml_tensor * dst, int device) {
         dst->nb[0] != sizeof(float) ||
         !ggml_is_contiguous(weights) ||
         !ggml_is_contiguous(x) ||
-        !ggml_is_contiguous(dst)) {
+        !ggml_is_contiguous(dst) ||
+        expert_offset < 0 || expert_offset + n_groups > DG_QWEN_GROUPS) {
         return false;
     }
 
@@ -507,6 +510,7 @@ bool ggml_cuda_deepgemm_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor 
     const int k         = static_cast<int>(weights->ne[0]);
     const int n         = static_cast<int>(weights->ne[1]);
     const int n_groups  = static_cast<int>(weights->ne[2]);
+    const int expert_offset = ggml_get_op_params_i32(dst, 2);
     const int top_k     = static_cast<int>(ids->ne[0]);
     const int n_tokens  = static_cast<int>(ids->ne[1]);
     const int scale_k   = k / DG_SCALE_K;
@@ -560,7 +564,7 @@ bool ggml_cuda_deepgemm_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor 
         x_stride_slot,
         static_cast<int64_t>(x->nb[2] / sizeof(float)),
         static_cast<int64_t>(ids->nb[1] / sizeof(int32_t)),
-        0,
+        expert_offset,
         n_groups);
     CUDA_CHECK(cudaGetLastError());
 

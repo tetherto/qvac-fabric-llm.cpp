@@ -27,6 +27,7 @@
 #include <algorithm>
 #include <cassert>
 #include <cfloat>
+#include <cstdlib>
 #include <cstdint>
 #include <cstring>
 #include <cmath>
@@ -503,6 +504,31 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
         // the PLE table is model-level and its conv is mirrored, so every device runs the whole conv and needs the whole history
         if (std::regex_match(tensor_name, pattern_ple_r_cache)) {
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+        }
+
+        // Experimental hybrid TP/EP path for Qwen4Exp.  The routed expert
+        // weights are partitioned by expert rather than by intermediate
+        // columns.  The gate/up result remains expert-local through SwiGLU;
+        // the down MUL_MAT_ID turns it into a partial hidden-state tensor that
+        // the Meta backend reduces at the existing MoE boundary.
+        // Keep this opt-in because it is tuned for the native-FP8 SM90 path.
+        const char * qwen4exp_ep_env = std::getenv("LLAMA_QWEN4EXP_EXPERT_PARALLEL");
+        const float * qwen4exp_tensor_split = ud->model->tensor_split();
+        const bool qwen4exp_equal_split = qwen4exp_tensor_split == nullptr ||
+            qwen4exp_tensor_split[0] == qwen4exp_tensor_split[1];
+        const bool qwen4exp_ep = ud->model->arch == LLM_ARCH_QWEN4EXP &&
+            ud->n_devices == 2 && qwen4exp_equal_split && hparams.n_expert == 512 &&
+            qwen4exp_ep_env != nullptr && qwen4exp_ep_env[0] != '\0' && qwen4exp_ep_env[0] != '0';
+        const bool routed_expert_tensor = tensor_name.find("_exps.") != std::string::npos;
+        const bool native_fp8_expert_weight = tensor->type == GGML_TYPE_F8_E4M3 &&
+            (std::regex_match(tensor_name, pattern_ffn_gate_up_weight) ||
+             std::regex_match(tensor_name, pattern_ffn_down_weight));
+        const bool native_fp8_expert_scale = tensor->type == GGML_TYPE_F32 &&
+            (std::regex_match(tensor_name, pattern_ffn_gate_up_scale) ||
+             std::regex_match(tensor_name, pattern_ffn_down_scale));
+        if (qwen4exp_ep && routed_expert_tensor && tensor->ne[2] == 512 &&
+                (native_fp8_expert_weight || native_fp8_expert_scale)) {
+            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_2);
         }
 
         // standard attention

@@ -414,6 +414,9 @@ extern "C" {
 
         GGML_BACKEND_SPLIT_AXIS_MIRRORED = 10, // all values on all backends
         GGML_BACKEND_SPLIT_AXIS_PARTIAL  = 11, // each backend has a partial sum
+        // full-shaped tensors whose nonzero rows belong to disjoint expert
+        // partitions; unlike PARTIAL, nonlinear row-wise ops may remain local
+        GGML_BACKEND_SPLIT_AXIS_EXPERT   = 12,
 
         // for internal bookkeeping only:
         GGML_BACKEND_SPLIT_AXIS_NONE    = 98,
