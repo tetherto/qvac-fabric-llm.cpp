@@ -101,4 +101,4 @@ C3 replaces the per-matmul F32->F16 activation convert inside the F8 fallback wi
 
 ## 15. Server acceptance runs are A/B on one idle GPU
 
-After C2's first server run (measured while the other GPU ran an A/B) disagreed with its controlled repeat, server acceptance numbers are taken with the host otherwise idle, the server relaunched per configuration, and the two configurations alternated (`srv_ab.sh` on the host). The C1 acceptance was measured before this rule; its 10k gain (+7.8%, +6.4%) is well above the noise seen since (about 1.5% at 10k, 0.2% at 110k).
+After C2's first server run (measured while the other GPU ran an A/B) disagreed with its controlled repeat, server acceptance numbers are taken with the host otherwise idle, the server relaunched per configuration, and the two configurations alternated (`srv_ab.sh` on the host). The C1 acceptance was measured before this rule; its 10k gain (+9.2% and +6.4% per rep, +7.8% on the mean) is well above the noise seen since (about 1.5% at 10k, 0.2% at 110k).
