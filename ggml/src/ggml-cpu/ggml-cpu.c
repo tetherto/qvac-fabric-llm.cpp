@@ -458,6 +458,12 @@ static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
         .vec_dot_type             = GGML_TYPE_Q8_0,
         .nrows                    = 1,
     },
+    [GGML_TYPE_F8_E4M3] = {
+        .from_float               = NULL,
+        .vec_dot                  = NULL,
+        .vec_dot_type             = GGML_TYPE_F32,
+        .nrows                    = 1,
+    },
     [GGML_TYPE_I32] = {
         .from_float               = (ggml_from_float_t) ggml_cpu_fp32_to_i32,
     },
@@ -1324,6 +1330,72 @@ static void ggml_compute_forward_mul_mat_one_chunk(
     }
 }
 
+// reference path for F8_E4M3 weights with 128x128 block scales in dst->src[2]
+static void ggml_compute_forward_mul_mat_f8_e4m3(
+        const struct ggml_compute_params * params,
+              struct ggml_tensor * dst) {
+    const struct ggml_tensor * src0   = dst->src[0];
+    const struct ggml_tensor * src1   = dst->src[1];
+    const struct ggml_tensor * src0_s = dst->src[2];
+
+    GGML_TENSOR_BINARY_OP_LOCALS
+
+    GGML_ASSERT(src0_s && src0_s->type == GGML_TYPE_F32 && "F8_E4M3 mul_mat needs the block scale tensor as src[2]");
+    GGML_ASSERT(src1->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(src0) && ggml_is_contiguous(src0_s) && ggml_is_contiguous(src1) && ggml_is_contiguous(dst));
+    GGML_ASSERT(ne02 == 1 && ne03 == 1);
+    GGML_ASSERT(ne00 % GGML_F8_E4M3_SCALE_BLOCK == 0 && ne01 % GGML_F8_E4M3_SCALE_BLOCK == 0);
+    GGML_ASSERT(src0_s->ne[0] == ne01/GGML_F8_E4M3_SCALE_BLOCK && src0_s->ne[1] == ne00/GGML_F8_E4M3_SCALE_BLOCK);
+    GGML_ASSERT(ne0 == ne01);
+
+    const int64_t K  = ne00;
+    const int64_t N  = ne01;
+    const int64_t M  = ne11*ne12*ne13;
+    const int64_t KB = K/GGML_F8_E4M3_SCALE_BLOCK;
+    const int64_t NB = N/GGML_F8_E4M3_SCALE_BLOCK;
+
+    const uint8_t * w = (const uint8_t *) src0->data;
+    const float   * s = (const float *)   src0_s->data;
+    const float   * x = (const float *)   src1->data;
+    float         * y = (float *)         dst->data;
+
+    float lut[256];
+    for (int i = 0; i < 256; i++) {
+        lut[i] = ggml_e4m3_to_fp32((uint8_t) i);
+    }
+
+    const int64_t dr = (N + params->nth - 1)/params->nth;
+    const int64_t n0 = dr*params->ith;
+    const int64_t n1 = MIN(n0 + dr, N);
+
+    for (int64_t n = n0; n < n1; n++) {
+        const uint8_t * wr = w + n*K;
+        const float   * sr = s + n/GGML_F8_E4M3_SCALE_BLOCK;
+        for (int64_t m0 = 0; m0 < M; m0 += 64) {
+            const int64_t mc = MIN(64, M - m0);
+            float acc[64] = {0};
+            for (int64_t kb = 0; kb < KB; kb++) {
+                float wb[GGML_F8_E4M3_SCALE_BLOCK];
+                for (int k = 0; k < GGML_F8_E4M3_SCALE_BLOCK; k++) {
+                    wb[k] = lut[wr[kb*GGML_F8_E4M3_SCALE_BLOCK + k]];
+                }
+                const float sb = sr[kb*NB];
+                for (int64_t mi = 0; mi < mc; mi++) {
+                    const float * xr = x + (m0 + mi)*K + kb*GGML_F8_E4M3_SCALE_BLOCK;
+                    float part = 0.0f;
+                    for (int k = 0; k < GGML_F8_E4M3_SCALE_BLOCK; k++) {
+                        part += wb[k]*xr[k];
+                    }
+                    acc[mi] += sb*part;
+                }
+            }
+            for (int64_t mi = 0; mi < mc; mi++) {
+                y[(m0 + mi)*N + n] = acc[mi];
+            }
+        }
+    }
+}
+
 void ggml_compute_forward_mul_mat(
         const struct ggml_compute_params * params,
               struct ggml_tensor * dst) {
@@ -1334,6 +1406,10 @@ void ggml_compute_forward_mul_mat(
     const int32_t hint = ggml_get_op_params_i32(dst, 1);
     if (hint == GGML_HINT_SRC0_IS_HADAMARD && !params->use_ref) {
         ggml_compute_forward_fwht(params, dst);
+        return;
+    }
+    if (src0->type == GGML_TYPE_F8_E4M3) {
+        ggml_compute_forward_mul_mat_f8_e4m3(params, dst);
         return;
     }
 

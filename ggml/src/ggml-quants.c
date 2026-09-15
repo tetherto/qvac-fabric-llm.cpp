@@ -611,6 +611,13 @@ void dequantize_row_nvfp4(const block_nvfp4 * GGML_RESTRICT x, float * GGML_REST
     }
 }
 
+// unscaled e4m3 values; the block scales live in a separate tensor
+void ggml_f8_e4m3_to_fp32_row(const uint8_t * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    for (int64_t i = 0; i < k; i++) {
+        y[i] = ggml_e4m3_to_fp32(x[i]);
+    }
+}
+
 //
 // 2-6 bit quantization in super-blocks
 //
@@ -5661,7 +5668,8 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
         case GGML_TYPE_I16:
         case GGML_TYPE_I32:
         case GGML_TYPE_I64:
-            // nothing to validate
+        case GGML_TYPE_F8_E4M3:
+            // nothing to validate (e4m3 NaN encodings decode to 0)
             break;
         default:
             {

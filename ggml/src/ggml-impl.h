@@ -552,6 +552,58 @@ static inline uint8_t ggml_fp32_to_ue4m3(float x) {
     return (uint8_t) ((ue4m3_exp << 3) | ue4m3_man);
 }
 
+// E4M3 (OCP e4m3fn): signed, 4 exp bits (bias=7), 3 mantissa bits, no inf, 0x7F/0xFF are NaN (decoded as 0)
+static inline float ggml_e4m3_to_fp32(uint8_t x) {
+    if ((x & 0x7F) == 0x7F) {
+        return 0.0f;
+    }
+    int   exp = (x >> 3) & 0xF;
+    int   man = x & 0x7;
+    float raw;
+    if (exp == 0) {
+        raw = ldexpf((float) man, -9);
+    } else {
+        raw = ldexpf(1.0f + (float) man / 8.0f, exp - 7);
+    }
+    return (x & 0x80) ? -raw : raw;
+}
+
+// round to nearest even, saturate to +-448, NaN -> 0x7F
+static inline uint8_t ggml_fp32_to_e4m3(float x) {
+    uint32_t bits;
+    memcpy(&bits, &x, 4);
+    const uint8_t  sign = (bits >> 24) & 0x80;
+    const uint32_t abs  = bits & 0x7FFFFFFF;
+    if (abs > 0x7F800000) {
+        return 0x7F;
+    }
+    if (abs >= 0x43E00000) {
+        return sign | 0x7E;
+    }
+    const int e = (int) (abs >> 23) - 127;
+    if (e < -6) {
+        // subnormal: man = RNE(|x| * 2^9); 8 becomes the min normal 0x08
+        float a;
+        memcpy(&a, &abs, 4);
+        const float s    = a * 512.0f;
+        int         man  = (int) s;
+        const float frac = s - (float) man;
+        if (frac > 0.5f || (frac == 0.5f && (man & 1))) {
+            man++;
+        }
+        return sign | (uint8_t) man;
+    }
+    const uint32_t rest = abs & 0xFFFFF;
+    uint32_t enc = ((uint32_t) (e + 7) << 3) | ((abs >> 20) & 0x7);
+    if (rest > 0x80000 || (rest == 0x80000 && (enc & 1))) {
+        enc++;
+    }
+    if (enc > 0x7E) {
+        enc = 0x7E;
+    }
+    return sign | (uint8_t) enc;
+}
+
 /**
  * Converts brain16 to float32.
  *
