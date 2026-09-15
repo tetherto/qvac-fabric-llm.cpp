@@ -639,10 +639,13 @@ static bool ggml_cuda_fattn_cutlass_supported(const ggml_tensor * dst, const int
         return false;
     }
     const int64_t n_q = Q->ne[1];
-    if (n_q < 256 || n_q % 8 != 0 || Q->ne[2] % K->ne[2] != 0 || V->ne[2] != K->ne[2] || V->ne[1] != K->ne[1]) {
+    if (n_q < 256 || Q->ne[2] % K->ne[2] != 0 || V->ne[2] != K->ne[2] || V->ne[1] != K->ne[1]) {
         return false;
     }
-    if (n_kv_used < n_q || n_kv_used > K->ne[1]) {
+    // the kernel needs a multiple of 8 queries: the batch is padded with phantom queries that attend the same number
+    // of phantom cells past n_kv_used (their rows are discarded), which must exist in the K/V views
+    const int64_t pad = (8 - n_q % 8) % 8;
+    if (n_kv_used < n_q || n_kv_used + pad > K->ne[1]) {
         return false;
     }
     if (Q->nb[0] != sizeof(float) || Q->nb[2] != (size_t) D*sizeof(float) || Q->nb[1] != (size_t) Q->ne[2]*D*sizeof(float)) {
@@ -666,22 +669,29 @@ static void ggml_cuda_flash_attn_ext_cutlass_run(ggml_backend_cuda_context & ctx
     const int n_head    = Q->ne[2];
     const int n_head_kv = K->ne[2];
     const int gqa       = n_head / n_head_kv;
-    const int64_t n_qh  = (int64_t) n_q * n_head * D;
+    const int pad       = (8 - n_q % 8) % 8; // phantom queries, see ggml_cuda_fattn_cutlass_supported
+    const int n_q8      = n_q + pad;
+    const int n_kv8     = n_kv_used + pad;
+    const int64_t n_qh  = (int64_t) n_q  * n_head * D;
+    const int64_t n_qh8 = (int64_t) n_q8 * n_head * D;
 
     cudaStream_t stream = ctx.stream();
 
-    ggml_cuda_pool_alloc<half>  q16(ctx.pool(), n_qh);
-    ggml_cuda_pool_alloc<half>  o16(ctx.pool(), n_qh);
-    ggml_cuda_pool_alloc<float> lse(ctx.pool(), (int64_t) n_q * n_head);
+    ggml_cuda_pool_alloc<half>  q16(ctx.pool(), n_qh8);
+    ggml_cuda_pool_alloc<half>  o16(ctx.pool(), n_qh8);
+    ggml_cuda_pool_alloc<float> lse(ctx.pool(), (int64_t) n_q8 * n_head);
 
-    // the permuted Q view covers one contiguous [D, n_head, n_q] buffer
+    // the permuted Q view covers one contiguous [D, n_head, n_q] buffer; phantom rows are zero
     const to_fp16_cuda_t to_fp16 = ggml_get_to_fp16_cuda(GGML_TYPE_F32);
     to_fp16(Q->data, q16.get(), n_qh, stream);
+    if (pad > 0) {
+        CUDA_CHECK(cudaMemsetAsync(q16.get() + n_qh, 0, (n_qh8 - n_qh)*sizeof(half), stream));
+    }
 
-    const size_t ws_size = ggml_cuda_fattn_cutlass_workspace_size(n_head_kv, gqa, n_q, n_kv_used);
+    const size_t ws_size = ggml_cuda_fattn_cutlass_workspace_size(n_head_kv, gqa, n_q8, n_kv8);
     ggml_cuda_pool_alloc<uint8_t> ws(ctx.pool(), ws_size > 0 ? ws_size : 1);
 
-    // F32 K/V (no KV cache): the used cells are converted to a contiguous f16 [D, n_kv_used, n_head_kv] buffer
+    // F32 K/V (no KV cache): the cells [0, n_kv8) are converted to a contiguous f16 [D, n_kv8, n_head_kv] buffer
     ggml_cuda_pool_alloc<half> k16(ctx.pool());
     ggml_cuda_pool_alloc<half> v16(ctx.pool());
     const half * k_data = (const half *) K->data;
@@ -692,24 +702,24 @@ static void ggml_cuda_flash_attn_ext_cutlass_run(ggml_backend_cuda_context & ctx
         if (t->type == GGML_TYPE_F16) {
             return;
         }
-        buf.alloc((int64_t) D * n_kv_used * n_head_kv);
+        buf.alloc((int64_t) D * n_kv8 * n_head_kv);
         ggml_tensor src = *t;
-        src.ne[1] = n_kv_used;
+        src.ne[1] = n_kv8;
         ggml_tensor dst16 = {};
         dst16.type  = GGML_TYPE_F16;
-        dst16.ne[0] = D; dst16.ne[1] = n_kv_used; dst16.ne[2] = n_head_kv; dst16.ne[3] = 1;
-        dst16.nb[0] = sizeof(half); dst16.nb[1] = D*sizeof(half); dst16.nb[2] = dst16.nb[1]*n_kv_used; dst16.nb[3] = dst16.nb[2];
+        dst16.ne[0] = D; dst16.ne[1] = n_kv8; dst16.ne[2] = n_head_kv; dst16.ne[3] = 1;
+        dst16.nb[0] = sizeof(half); dst16.nb[1] = D*sizeof(half); dst16.nb[2] = dst16.nb[1]*n_kv8; dst16.nb[3] = dst16.nb[2];
         dst16.data  = buf.get();
         ggml_cuda_cpy(ctx, &src, &dst16);
         data = buf.get();
         nb1  = D;
-        nb2  = (int64_t) D * n_kv_used;
+        nb2  = (int64_t) D * n_kv8;
     };
     convert_kv(K, k16, k_data, k_nb1, k_nb2);
     convert_kv(V, v16, v_data, v_nb1, v_nb2);
 
     ggml_cuda_fattn_cutlass(q16.get(), k_data, v_data, o16.get(), lse.get(),
-        n_head_kv, gqa, n_q, n_kv_used, k_nb1, k_nb2, v_nb1, v_nb2,
+        n_head_kv, gqa, n_q8, n_kv8, k_nb1, k_nb2, v_nb1, v_nb2,
         ws.get(), ws_size, stream);
 
     const to_fp32_cuda_t to_fp32 = ggml_get_to_fp32_cuda(GGML_TYPE_F16);
