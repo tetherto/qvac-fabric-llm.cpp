@@ -94,12 +94,13 @@ enum rpc_cmd {
     RPC_CMD_COMM_ALLREDUCE,
     RPC_CMD_COMM_FREE,
     RPC_CMD_SYNCHRONIZE,
+    RPC_CMD_SET_TENSOR_2D_HASH,
     RPC_CMD_COUNT,
 };
 
 static_assert(RPC_CMD_HELLO == 14, "RPC_CMD_HELLO must be always 14");
 
-// Try RPC_CMD_SET_TENSOR_HASH first when data size is larger than this threshold
+// Try a hash lookup first when data size is larger than this threshold
 const size_t HASH_THRESHOLD = 10 * 1024 * 1024;
 
 // Maximum number of graphs cached per device; client and server must use the same value
@@ -246,6 +247,15 @@ struct rpc_msg_get_tensor_2d_req {
     uint64_t size;
     uint64_t n_copies;
     uint64_t stride;
+};
+
+struct rpc_msg_set_tensor_2d_hash_req {
+    rpc_tensor tensor;
+    uint64_t offset;
+    uint64_t size;
+    uint64_t n_copies;
+    uint64_t stride;
+    uint64_t hash;
 };
 
 struct rpc_msg_comm_init_req {
@@ -1211,6 +1221,22 @@ static void ggml_backend_rpc_buffer_set_tensor_2d(ggml_backend_buffer_t buffer, 
     for (size_t i = 0; i < n_copies; i++) {
         memcpy(dest + i*size, (const char *)data + i*stride_data, size);
     }
+    if (data_size > HASH_THRESHOLD) {
+        rpc_msg_set_tensor_2d_hash_req request;
+        request.tensor   = rpc_tensor;
+        request.offset   = offset;
+        request.size     = size;
+        request.n_copies = n_copies;
+        request.stride   = stride_tensor;
+        request.hash     = fnv_hash(dest, data_size);
+        rpc_msg_set_tensor_hash_rsp response;
+        bool status = ctx->cmd_queue->submit_rpc_sync(RPC_CMD_SET_TENSOR_2D_HASH, &request, sizeof(request), &response,
+                                                      sizeof(response));
+        RPC_STATUS_ASSERT(status);
+        if (response.result) {
+            return;
+        }
+    }
     bool status = ctx->cmd_queue->submit_rpc(RPC_CMD_SET_TENSOR_2D, input.data(), input.size());
     RPC_STATUS_ASSERT(status);
 }
@@ -1746,6 +1772,7 @@ public:
     bool set_tensor(const std::vector<uint8_t> & input);
     bool set_tensor_2d(const std::vector<uint8_t> & input);
     bool set_tensor_hash(const rpc_msg_set_tensor_hash_req & request, rpc_msg_set_tensor_hash_rsp & response);
+    bool set_tensor_2d_hash(const rpc_msg_set_tensor_2d_hash_req & request, rpc_msg_set_tensor_hash_rsp & response);
     bool get_tensor(const rpc_msg_get_tensor_req & request, std::vector<uint8_t> & response);
     bool get_tensor_2d(const rpc_msg_get_tensor_2d_req & request, std::vector<uint8_t> & response);
     bool copy_tensor(const rpc_msg_copy_tensor_req & request, rpc_msg_copy_tensor_rsp & response);
@@ -2112,6 +2139,28 @@ bool rpc_server::set_tensor(const std::vector<uint8_t> & input) {
     return true;
 }
 
+static bool validate_tensor_2d_region(const char * func, const rpc_tensor & in_tensor, const ggml_tensor * tensor,
+                                      uint64_t offset, uint64_t size, uint64_t n_copies, uint64_t stride) {
+    if (stride != 0 && n_copies - 1 > (UINT64_MAX - size) / stride) {
+        return false;
+    }
+    const uint64_t span = (n_copies - 1)*stride + size;
+    const uint64_t p0 = (uint64_t) ggml_backend_buffer_get_base(tensor->buffer);
+    const uint64_t p1 = p0 + ggml_backend_buffer_get_size(tensor->buffer);
+
+    if (in_tensor.data < p0 || in_tensor.data > p1 || offset > p1 - in_tensor.data || span > p1 - in_tensor.data - offset) {
+        GGML_LOG_ERROR("[%s] tensor data region (data=0x%" PRIx64 ", offset=%" PRIu64 ", span=%" PRIu64 ") out of buffer bounds [0x%" PRIx64 ", 0x%" PRIx64 ")\n",
+                       func, in_tensor.data, offset, span, p0, p1);
+        return false;
+    }
+    if (offset > ggml_nbytes(tensor) || span > ggml_nbytes(tensor) - offset) {
+        GGML_LOG_ERROR("[%s] tensor write region (offset=%" PRIu64 ", span=%" PRIu64 ") out of tensor bounds (%zu)\n",
+                       func, offset, span, ggml_nbytes(tensor));
+        return false;
+    }
+    return true;
+}
+
 bool rpc_server::set_tensor_2d(const std::vector<uint8_t> & input) {
     sync_all_backends();
     // serialization format: | rpc_tensor | offset (8 bytes) | size (8 bytes) | n_copies (8 bytes) | stride (8 bytes) | data (size * n_copies bytes) |
@@ -2147,28 +2196,20 @@ bool rpc_server::set_tensor_2d(const std::vector<uint8_t> & input) {
     LOG_DBG("[%s] buffer: %p, data: %p, offset: %" PRIu64 ", size: %" PRIu64 ", n_copies: %" PRIu64 ", stride: %" PRIu64 "\n",
             __func__, (void*)tensor->buffer, tensor->data, offset, size, n_copies, stride);
 
-    // sanitize tensor->data
-    {
-        if (stride != 0 && n_copies - 1 > (UINT64_MAX - size) / stride) {
-            return false;
-        }
-        const uint64_t span = (n_copies - 1)*stride + size;
-        const uint64_t p0 = (uint64_t) ggml_backend_buffer_get_base(tensor->buffer);
-        const uint64_t p1 = p0 + ggml_backend_buffer_get_size(tensor->buffer);
-
-        if (in_tensor->data < p0 || in_tensor->data > p1 || offset > p1 - in_tensor->data || span > p1 - in_tensor->data - offset) {
-            GGML_LOG_ERROR("[%s] tensor data region (data=0x%" PRIx64 ", offset=%" PRIu64 ", span=%" PRIu64 ") out of buffer bounds [0x%" PRIx64 ", 0x%" PRIx64 ")\n",
-                           __func__, in_tensor->data, offset, span, p0, p1);
-            return false;
-        }
-        if (offset > ggml_nbytes(tensor) || span > ggml_nbytes(tensor) - offset) {
-            GGML_LOG_ERROR("[%s] tensor write region (offset=%" PRIu64 ", span=%" PRIu64 ") out of tensor bounds (%zu)\n",
-                           __func__, offset, span, ggml_nbytes(tensor));
-            return false;
-        }
+    if (!validate_tensor_2d_region(__func__, *in_tensor, tensor, offset, size, n_copies, stride)) {
+        return false;
     }
 
     const void * data = input.data() + sizeof(rpc_tensor) + 4*sizeof(uint64_t);
+    if (cache_dir && data_size > HASH_THRESHOLD) {
+        uint64_t hash = fnv_hash((const uint8_t *) data, data_size);
+        char hash_str[17];
+        snprintf(hash_str, sizeof(hash_str), "%016" PRIx64, hash);
+        fs::path cache_file = fs::path(cache_dir) / hash_str;
+        std::ofstream ofs(cache_file, std::ios::binary);
+        ofs.write((const char *) data, data_size);
+        GGML_LOG_INFO("[%s] saved to '%s'\n", __func__, cache_file.string().c_str());
+    }
     ggml_backend_tensor_set_2d(tensor, data, offset, size, n_copies, stride, size);
     return true;
 }
@@ -2232,6 +2273,50 @@ bool rpc_server::set_tensor_hash(const rpc_msg_set_tensor_hash_req & request, rp
         }
     }
     ggml_backend_tensor_set(tensor, cached_file.data(), request.offset, size);
+    response.result = 1;
+    return true;
+}
+
+bool rpc_server::set_tensor_2d_hash(
+        const rpc_msg_set_tensor_2d_hash_req & request, rpc_msg_set_tensor_hash_rsp & response) {
+    sync_all_backends();
+    size_t data_size;
+    if (request.n_copies == 0 || request.size == 0 ||
+        request.size > SIZE_MAX || request.n_copies > SIZE_MAX ||
+        !checked_mul_size((size_t) request.size, (size_t) request.n_copies, data_size)) {
+        return false;
+    }
+
+    std::vector<uint8_t> cached_file;
+    if (!get_cached_file(request.hash, cached_file) || cached_file.size() != data_size) {
+        response.result = 0;
+        return true;
+    }
+
+    struct ggml_init_params params {
+        /*.mem_size   =*/ ggml_tensor_overhead(),
+        /*.mem_buffer =*/ NULL,
+        /*.no_alloc   =*/ true,
+    };
+    ggml_context_ptr ctx_ptr { ggml_init(params) };
+    GGML_ASSERT(ctx_ptr != nullptr);
+    ggml_context * ctx = ctx_ptr.get();
+    ggml_tensor * tensor = deserialize_tensor(ctx, &request.tensor);
+    if (tensor == nullptr || tensor->buffer == nullptr) {
+        GGML_LOG_ERROR("[%s] error deserializing tensor\n", __func__);
+        return false;
+    }
+    LOG_DBG("[%s] buffer: %p, data: %p, offset: %" PRIu64 ", size: %" PRIu64 ", n_copies: %" PRIu64 ", stride: %" PRIu64 ", hash: %" PRIx64 "\n",
+            __func__, (void *) tensor->buffer, tensor->data, request.offset, request.size, request.n_copies,
+            request.stride, request.hash);
+
+    if (!validate_tensor_2d_region(__func__, request.tensor, tensor, request.offset, request.size, request.n_copies,
+                                   request.stride)) {
+        return false;
+    }
+
+    ggml_backend_tensor_set_2d(tensor, cached_file.data(), request.offset, request.size, request.n_copies,
+                               request.stride, request.size);
     response.result = 1;
     return true;
 }
@@ -3146,6 +3231,20 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
                 }
                 rpc_msg_set_tensor_hash_rsp response;
                 if (!server.set_tensor_hash(request, response)) {
+                    return;
+                }
+                if (!send_msg(sock, &response, sizeof(response))) {
+                    return;
+                }
+                break;
+            }
+            case RPC_CMD_SET_TENSOR_2D_HASH: {
+                rpc_msg_set_tensor_2d_hash_req request;
+                if (!recv_msg(sock, &request, sizeof(request))) {
+                    return;
+                }
+                rpc_msg_set_tensor_hash_rsp response;
+                if (!server.set_tensor_2d_hash(request, response)) {
                     return;
                 }
                 if (!send_msg(sock, &response, sizeof(response))) {

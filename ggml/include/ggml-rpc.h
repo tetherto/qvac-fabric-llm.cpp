@@ -15,7 +15,7 @@ extern "C" {
 // HELLO fields are uint8_t on the wire, so the value must stay <= 255.
 // 108 adds butterfly communicator rounds and round-tagged peer frames.
 #define RPC_PROTO_MAJOR_VERSION    108
-#define RPC_PROTO_MINOR_VERSION    0
+#define RPC_PROTO_MINOR_VERSION    1
 #define RPC_PROTO_PATCH_VERSION    0
 
 #ifdef  __cplusplus

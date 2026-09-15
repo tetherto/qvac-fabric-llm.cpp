@@ -145,6 +145,11 @@ struct mtmd_context_params {
     // than always stretched to the cap. Changes the number of output tokens, so a
     // checkpoint whose GGUF omits the key needs this set to preprocess correctly.
     int image_no_upscale;
+
+    // skip loading the audio encoder even when the mmproj declares one. The vision
+    // encoder still loads, so mtmd_support_audio() returns false and audio input is
+    // rejected. Use it when the caller never sends audio and wants the memory back.
+    bool skip_audio;
 };
 
 MTMD_API const char * mtmd_default_marker(void);

@@ -226,6 +226,13 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     # llama_build_and_test(test-double-float.cpp) # SLOW
 
     llama_build_and_test(test-llama-archs.cpp)
+    llama_test(test-llama-archs NAME test-mtp-shared-cpu ARGS --mtp-shared-cpu)
+    if (GGML_CUDA)
+        llama_test(test-llama-archs NAME test-mtp-shared ARGS --mtp-shared)
+    endif()
+    if (NOT GGML_WEBGPU)
+        llama_test(test-llama-archs NAME test-qsa-unified-multiseq ARGS --qsa-unified-multiseq --seed 1)
+    endif()
 
     set(MODEL_DIR "${CMAKE_CURRENT_BINARY_DIR}/test-models/")
     file(MAKE_DIRECTORY "${MODEL_DIR}")

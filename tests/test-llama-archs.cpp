@@ -1,4 +1,8 @@
 #include "common.h"
+#include "speculative.h"
+#include "../src/llama-context.h"
+#include "../ggml/src/ggml-backend-impl.h"
+#include <set>
 #include "log.h"
 #include "ggml-backend.h"
 #include "ggml.h"
@@ -65,7 +69,7 @@ static void set_tensor_data(struct ggml_tensor * tensor, void * userdata) {
 }
 
 static void usage(char ** argv) {
-    printf("Usage: %s [-a/--arch arch] [-s/--seed seed] [-v/--verbose]\n", argv[0]);
+    printf("Usage: %s [-a/--arch arch] [-s/--seed seed] [-v/--verbose] [--mtp-shared|--mtp-shared-cpu|--qsa-unified-multiseq]\n", argv[0]);
 }
 
 static std::vector<llama_token> get_tokens(const uint32_t n_tokens, const uint32_t n_vocab, const size_t seed){
@@ -225,6 +229,30 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
         ms.add_kv(LLM_KV_HYPER_CONNECTION_LOW_RANK, uint32_t(8));
         // without this the QSA layers fall back to dense and go uncovered
         ms.add_kv(LLM_KV_ATTENTION_COMPRESS_RATIOS, std::vector<uint32_t>(n_layer, 4));
+
+        // has_cell_ext() needs ple_n_heads here: the indexer cache serializes no ext without it
+        const uint32_t ple_ngram_size      = 3;
+        const uint32_t ple_heads_per_ngram = 2;
+        const uint32_t ple_n_heads         = (ple_ngram_size - 1)*ple_heads_per_ngram;
+        GGML_ASSERT(n_embd % ple_n_heads == 0);
+        const uint32_t ple_head_dim = n_embd/ple_n_heads;
+
+        std::vector<uint64_t> ple_head_offsets(ple_n_heads);
+        std::vector<uint64_t> ple_head_vocab_sizes(ple_n_heads, n_vocab);
+        for (uint32_t h = 0; h < ple_n_heads; h++) {
+            ple_head_offsets[h] = uint64_t(h)*n_vocab;
+        }
+
+        // the PLE history lives in the recurrent cache, so it must sit on a linear attention layer
+        ms.add_kv(LLM_KV_PLE_LAYERS,                  std::vector<uint32_t>({ 0 }));
+        ms.add_kv(LLM_KV_PLE_NGRAM_SIZE,              ple_ngram_size);
+        ms.add_kv(LLM_KV_PLE_HEADS_PER_NGRAM,         ple_heads_per_ngram);
+        ms.add_kv(LLM_KV_PLE_CONV_KERNEL,             uint32_t(4));
+        ms.add_kv(LLM_KV_PLE_EOS_TOKEN_ID,            uint32_t(0));
+        ms.add_kv(LLM_KV_EMBEDDING_LENGTH_PER_LAYER,  ple_head_dim);
+        ms.add_kv(LLM_KV_PLE_LAYER_MULTIPLIERS,       std::vector<uint64_t>({ 1, 3, 5 }));
+        ms.add_kv(LLM_KV_PLE_HEAD_OFFSETS,            ple_head_offsets);
+        ms.add_kv(LLM_KV_PLE_HEAD_VOCAB_SIZES,        ple_head_vocab_sizes);
     }
 
     ms.add_kv(LLM_KV_ATTENTION_INDEXER_HEAD_COUNT,   arch == LLM_ARCH_MINIMAX_M3 || arch == LLM_ARCH_DEEPSEEK4 ? n_head : uint32_t(1));
@@ -316,7 +344,9 @@ static bool silent_model_load_progress(float /*progress*/, void * /*user_data*/)
 
 static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
         struct gguf_context * gguf_ctx, FILE * file, const size_t seed, const std::vector<ggml_backend_dev_t> & devs,
-        const llama_split_mode split_mode = LLAMA_SPLIT_MODE_LAYER, bool encode = false) {
+        const llama_split_mode split_mode = LLAMA_SPLIT_MODE_LAYER, bool encode = false,
+        uint32_t n_seq_max = 1, bool kv_unified = false,
+        ggml_backend_sched_eval_callback cb_eval = nullptr, void * cb_eval_user_data = nullptr) {
     GGML_ASSERT((gguf_ctx == nullptr) != (file == nullptr));
     llama_model_params model_params = llama_model_default_params();
     model_params.progress_callback = silent_model_load_progress;
@@ -329,6 +359,10 @@ static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
     ctx_params.n_ctx = 0;
     ctx_params.n_threads = 4;
     ctx_params.n_threads_batch = 4;
+    ctx_params.n_seq_max = n_seq_max;
+    ctx_params.kv_unified = kv_unified;
+    ctx_params.cb_eval = cb_eval;
+    ctx_params.cb_eval_user_data = cb_eval_user_data;
     if (!encode) {
         ctx_params.n_ubatch = 64;
     }
@@ -556,6 +590,96 @@ static int save_models(const llm_arch target_arch, const size_t seed, const ggml
     return 0;
 }
 
+// A unified cache has one cell-to-block map for every sequence. Image patches can share a
+// temporal position, so until QSA has sequence-local ranks this configuration must stay dense.
+static int test_qsa_unified_multiseq(size_t seed) {
+    struct observed_nodes {
+        bool top_k = false;
+    } observed;
+
+    auto observe = [](ggml_tensor * tensor, bool ask, void * data) {
+        if (ask) {
+            auto & nodes = *static_cast<observed_nodes *>(data);
+            nodes.top_k |= std::strncmp(tensor->name, "indexer_top_k-", 14) == 0;
+        }
+        return false;
+    };
+
+    auto gguf_sparse = get_gguf_ctx(LLM_ARCH_QWEN4EXP, true);
+    auto gguf_dense  = get_gguf_ctx(LLM_ARCH_QWEN4EXP, true);
+
+    const uint32_t dense_ratios[] = { 0, 0 };
+    gguf_set_arr_data(gguf_dense.get(), "qwen4exp.attention.compress_ratios",
+            GGUF_TYPE_UINT32, dense_ratios, 2);
+
+    auto sparse = get_model_and_ctx(gguf_sparse.get(), nullptr, seed, {}, LLAMA_SPLIT_MODE_LAYER,
+            false, 2, true, observe, &observed);
+    auto dense = get_model_and_ctx(gguf_dense.get(), nullptr, seed, {}, LLAMA_SPLIT_MODE_LAYER,
+            false, 2, true);
+
+    constexpr uint32_t n_seq     = 2;
+    constexpr uint32_t n_patches = 8;
+    constexpr uint32_t n_tokens  = n_seq*n_patches;
+
+    const uint32_t n_embd  = llama_model_n_embd(sparse.first.get());
+    const uint32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(sparse.first.get()));
+
+    std::vector<float> embeddings(n_tokens*n_embd);
+    std::mt19937 rng(seed);
+    std::normal_distribution<float> distribution(0.0f, 0.1f);
+    for (float & value : embeddings) {
+        value = distribution(rng);
+    }
+
+    std::vector<llama_pos> positions(4*n_tokens, 0);
+    std::vector<int32_t> n_seq_ids(n_tokens, 1);
+    std::vector<llama_seq_id> seq_ids(n_tokens);
+    std::vector<llama_seq_id *> seq_id_ptrs(n_tokens);
+    std::vector<int8_t> logits(n_tokens, 1);
+
+    for (uint32_t s = 0; s < n_seq; ++s) {
+        for (uint32_t p = 0; p < n_patches; ++p) {
+            const uint32_t i = s*n_patches + p;
+            positions[i] = 0;
+            positions[i + n_tokens] = p/4;
+            positions[i + 2*n_tokens] = p%4;
+            seq_ids[i] = (llama_seq_id) s;
+            seq_id_ptrs[i] = &seq_ids[i];
+        }
+    }
+
+    llama_batch image = {};
+    image.n_tokens = n_tokens;
+    image.embd = embeddings.data();
+    image.pos = positions.data();
+    image.n_seq_id = n_seq_ids.data();
+    image.seq_id = seq_id_ptrs.data();
+    image.logits = logits.data();
+
+    auto decode = [n_vocab](llama_context * ctx, llama_batch batch) {
+        GGML_ASSERT(llama_decode(ctx, batch) == 0);
+        llama_synchronize(ctx);
+
+        std::vector<float> result;
+        result.reserve((size_t) batch.n_tokens*n_vocab);
+        for (int32_t i = 0; i < batch.n_tokens; ++i) {
+            const float * row = llama_get_logits_ith(ctx, i);
+            GGML_ASSERT(row != nullptr);
+            result.insert(result.end(), row, row + n_vocab);
+        }
+        return result;
+    };
+
+    const auto actual   = decode(sparse.second.get(), image);
+    const auto expected = decode(dense.second.get(), image);
+
+    GGML_ASSERT(!observed.top_k);
+    GGML_ASSERT(nmse(actual, expected) < 1e-8);
+
+    printf("QSA unified multi-sequence fallback test passed\n");
+    return 0;
+}
+
 static int test_backends(const llm_arch target_arch, const size_t seed, const ggml_log_level log_level) {
     struct user_data_t {
         struct {
@@ -667,6 +791,7 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const gg
                 std::string status_nmse      = "\033[1;33mSKIP\033[0m";
                 std::string status_roundtrip = "\033[1;33mSKIP\033[0m";
                 char nmse_str[12] = {0};
+
                 bool skip = !arch_supported(arch) || (dc.split_mode == LLAMA_SPLIT_MODE_TENSOR && dc.devs.empty());
                 if (!skip) {
                     if (logits_cpu.empty()) {
@@ -731,17 +856,197 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const gg
     return all_ok ? 0 : 1;
 }
 
+struct mtp_backend_probe {
+    ggml_backend_i iface;
+    bool pending = false;
+    bool fail = false;
+    std::set<ggml_backend_buffer_t> buffers;
+};
+
+static std::map<ggml_backend_t, mtp_backend_probe> mtp_probes;
+
+static ggml_status mtp_graph_compute(ggml_backend_t backend, ggml_cgraph * graph) {
+    auto & probe = mtp_probes.at(backend);
+    for (int i = 0; i < ggml_graph_n_nodes(graph); ++i) {
+        auto * tensor = ggml_graph_node(graph, i);
+        if (tensor->buffer && ggml_backend_buffer_get_usage(tensor->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE) {
+            probe.buffers.insert(tensor->buffer);
+        }
+    }
+    auto status = probe.iface.graph_compute(backend, graph);
+    probe.pending = true;
+    if (probe.fail) {
+        probe.fail = false;
+        return GGML_STATUS_FAILED; // Fail after submitting work to exercise error-path synchronization.
+    }
+    return status;
+}
+
+static void mtp_synchronize(ggml_backend_t backend) {
+    auto & probe = mtp_probes.at(backend);
+    if (probe.iface.synchronize) {
+        probe.iface.synchronize(backend);
+    }
+    probe.pending = false;
+}
+
+static int test_mtp_shared(bool cpu) {
+    // A CPU helper with ACCEL classification exercises the same device gate as BLAS/Accelerate.
+    static ggml_backend_device helper = *ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+    helper.iface.get_type = [](ggml_backend_dev_t) { return GGML_BACKEND_DEVICE_TYPE_ACCEL; };
+    helper.iface.init_backend = [](ggml_backend_dev_t dev, const char * params) {
+        auto cpu = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+        auto backend = cpu->iface.init_backend(cpu, params);
+        backend->device = dev;
+        return backend;
+    };
+    helper.iface.supports_op = [](ggml_backend_dev_t, const ggml_tensor *) { return false; };
+    ggml_backend_device_register(&helper);
+    auto metadata = get_gguf_ctx(LLM_ARCH_QWEN35, false);
+    gguf_set_val_u32(metadata.get(), "qwen35.block_count", 3);
+    gguf_set_val_u32(metadata.get(), "qwen35.nextn_predict_layers", 1);
+    auto mp = llama_model_default_params();
+    static ggml_backend_device compute = *ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+    compute.iface.get_type = [](ggml_backend_dev_t) { return GGML_BACKEND_DEVICE_TYPE_GPU; };
+    compute.iface.init_backend = helper.iface.init_backend;
+    ggml_backend_dev_t devices[] = {&compute, nullptr};
+    if (cpu) {
+        mp.devices = devices; // Exercise sharing and source destruction under CPU sanitizers too.
+    }
+    mp.n_gpu_layers = 999;
+    mp.load_mtp = true;
+    size_t seed = 1234;
+    llama_model_ptr model(llama_model_init_from_user(metadata.get(), set_tensor_data, &seed, mp));
+    GGML_ASSERT(model);
+    std::vector<float> reference;
+    for (bool share : {false, true}) {
+        auto cp = llama_context_default_params();
+        GGML_ASSERT(!cp.ctx_other_share_compute);
+        cp.n_ctx = 512;
+        cp.n_batch = cp.n_ubatch = 32;
+        cp.n_outputs_max = cp.n_outputs_max_per_seq = 32;
+        cp.n_seq_max = 1;
+        cp.n_threads = cp.n_threads_batch = 2;
+        cp.no_perf = false;
+        cp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+        llama_context_ptr target(llama_init_from_model(model.get(), cp));
+        GGML_ASSERT(target);
+        cp.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
+        cp.ctx_other = target.get();
+        cp.ctx_other_share_compute = share;
+        llama_context_ptr draft(llama_init_from_model(model.get(), cp));
+        GGML_ASSERT(draft);
+        common_params_speculative params;
+        params.types = {COMMON_SPECULATIVE_TYPE_DRAFT_MTP};
+        params.draft.ctx_tgt = target.get();
+        params.draft.ctx_dft = draft.get();
+        params.draft.backend_sampling = false;
+        common_speculative_ptr spec(common_speculative_init(params, 1));
+        GGML_ASSERT(spec);
+        auto install = [](llama_context * ctx) {
+            auto sched = ctx->get_sched();
+            for (int i = 0; i < ggml_backend_sched_get_n_backends(sched); ++i) {
+                auto backend = ggml_backend_sched_get_backend(sched, i);
+                mtp_probes[backend].iface = backend->iface;
+                backend->iface.graph_compute = mtp_graph_compute;
+                backend->iface.synchronize = mtp_synchronize;
+            }
+        };
+        install(target.get());
+        install(draft.get());
+        auto finished = [](llama_context * ctx) {
+            auto sched = ctx->get_sched();
+            for (int i = 0; i < ggml_backend_sched_get_n_backends(sched); ++i) {
+                GGML_ASSERT(!mtp_probes.at(ggml_backend_sched_get_backend(sched, i)).pending);
+            }
+        };
+        auto buffers = [](llama_context * ctx) {
+            std::set<ggml_backend_buffer_t> result;
+            auto sched = ctx->get_sched();
+            for (int i = 0; i < ggml_backend_sched_get_n_backends(sched); ++i) {
+                const auto & probe = mtp_probes.at(ggml_backend_sched_get_backend(sched, i));
+                result.insert(probe.buffers.begin(), probe.buffers.end());
+            }
+            return result;
+        };
+        llama_batch batch = llama_batch_init(32, 0, 1);
+        std::vector<float> logits;
+        llama_sampler_ptr sampler(llama_sampler_chain_init(llama_sampler_chain_default_params()));
+        llama_sampler_chain_add(sampler.get(), llama_sampler_init_greedy());
+        common_speculative_begin(spec.get(), 0, {});
+        for (int pass = 0; pass < 8; ++pass) {
+            if (pass == 3 || pass == 5) {
+                GGML_ASSERT(llama_set_sampler(target.get(), 0, pass == 3 ? sampler.get() : nullptr));
+                for (auto & entry : mtp_probes) {
+                    entry.second.buffers.clear();
+                }
+            }
+            common_batch_clear(batch);
+            for (int i = 0; i < 32; ++i) {
+                common_batch_add(batch, (i + pass) % 128, pass * 32 + i, {0}, true);
+            }
+            GGML_ASSERT(llama_decode(target.get(), batch) == 0);
+            const auto * output = llama_get_logits(target.get());
+            logits.insert(logits.end(), output, output + 128 * 32);
+            if (pass == 6) {
+                auto backend = ggml_backend_sched_get_backend(draft->get_sched(), 0);
+                mtp_probes.at(backend).fail = true;
+            }
+            GGML_ASSERT(common_speculative_process(spec.get(), batch) == (pass != 6));
+            finished(draft.get());
+            if (pass == 2 || pass == 4 || pass == 5) {
+                auto tgt = buffers(target.get());
+                auto dft = buffers(draft.get());
+                bool aliases = false;
+                for (auto buffer : tgt) {
+                    aliases |= dft.count(buffer) != 0;
+                }
+                auto backend = ggml_backend_sched_get_backend(target->get_sched(), 0);
+                const auto type = ggml_backend_dev_type(ggml_backend_get_device(backend));
+                if (type == GGML_BACKEND_DEVICE_TYPE_GPU || type == GGML_BACKEND_DEVICE_TYPE_IGPU) {
+                    GGML_ASSERT(aliases == share);
+                }
+            }
+        }
+        GGML_ASSERT(llama_perf_context(target.get()).n_reused > 0);
+        GGML_ASSERT(llama_perf_context(draft.get()).n_reused > 0);
+        if (share) {
+            GGML_ASSERT(nmse(reference, logits) < 1e-8);
+        } else {
+            reference = logits;
+        }
+        llama_batch_free(batch);
+        spec.reset();
+        target.reset();
+        llama_set_embeddings(draft.get(), true);
+        draft->sched_reserve(); // The source is gone; the draft must reserve independently.
+        draft.reset();
+        mtp_probes.clear();
+    }
+    printf("MTP shared compute: passed\n");
+    return 0;
+}
+
 int main(int argc, char ** argv) {
     // FIXME these tests are disabled in the CI for macOS-latest-cmake-arm64 because they are segfaulting
     common_init();
+    if (argc == 2 && (strcmp(argv[1], "--mtp-shared") == 0 || strcmp(argv[1], "--mtp-shared-cpu") == 0)) {
+        return test_mtp_shared(strcmp(argv[1], "--mtp-shared-cpu") == 0);
+    }
     std::random_device rd;
 
     llm_arch arch = LLM_ARCH_UNKNOWN;
     size_t seed = rd();
     ggml_log_level log_level = GGML_LOG_LEVEL_ERROR;
     std::string out;
+    bool qsa_unified_multiseq = false;
 
     for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--qsa-unified-multiseq") == 0) {
+            qsa_unified_multiseq = true;
+            continue;
+        }
+
         if (strcmp(argv[i], "-a") == 0 || strcmp(argv[i], "--arch") == 0) {
             if (i + 1 < argc) {
                 const std::string arch_name = argv[++i];
@@ -779,6 +1084,9 @@ int main(int argc, char ** argv) {
     printf("%s: using seed %zu\n", __func__, seed);
 
     try {
+        if (qsa_unified_multiseq) {
+            return test_qsa_unified_multiseq(seed);
+        }
         if (!out.empty()) {
             return save_models(arch, seed, log_level, out);
         }

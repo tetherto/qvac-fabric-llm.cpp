@@ -73,9 +73,9 @@ jobs:
         id: cmake_test
         run: |
           cd build
-          bin/ggml-rpc-server -H 127.0.0.1 -p 50052 -d CPU > rpc-server-0.log 2>&1 &
+          LLAMA_CACHE="${PWD}/rpc-test-cache-0" bin/ggml-rpc-server -H 127.0.0.1 -p 50052 -d CPU -c > rpc-server-0.log 2>&1 &
           rpc_server_0=$!
-          bin/ggml-rpc-server -H 127.0.0.1 -p 50053 -d CPU > rpc-server-1.log 2>&1 &
+          LLAMA_CACHE="${PWD}/rpc-test-cache-1" bin/ggml-rpc-server -H 127.0.0.1 -p 50053 -d CPU -c > rpc-server-1.log 2>&1 &
           rpc_server_1=$!
           trap 'kill ${rpc_server_0} ${rpc_server_1} 2>/dev/null || true' EXIT
           export GGML_RPC_TEST_ENDPOINTS=127.0.0.1:50052,127.0.0.1:50053
@@ -93,6 +93,10 @@ jobs:
             exit 1
           fi
           ctest -R '^test-rpc$' --verbose
+          if [ "$(grep -c '\[set_tensor_2d\] saved to' rpc-server-0.log)" -ne 1 ]; then
+            printf '%s\n' "2D tensor cache test did not record exactly one upload"
+            exit 1
+          fi
           pipeline_output="$(bin/llama-bench -v \
             -m tinyllamas/stories15M-q4_0.gguf \
             -rpc ${GGML_RPC_TEST_ENDPOINTS} \

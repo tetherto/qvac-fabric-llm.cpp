@@ -600,6 +600,7 @@ struct common_params {
     ggml_backend_dev_t mmproj_device = nullptr; // GPU device to use for multimodal model
     std::string mmproj_backend = "";            // GPU backend for multimodal model (e.g. "CUDA", "Metal", "Vulkan")
     bool no_mmproj = false;                     // explicitly disable multimodal model
+    bool mmproj_no_audio = false;               // load the projector but skip its audio encoder
     std::vector<std::string> image;             // path to image file(s) ; TODO: change the name to "media"
     int image_min_tokens = -1;
     int image_max_tokens = -1;
