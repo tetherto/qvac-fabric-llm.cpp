@@ -6,8 +6,16 @@
 extern "C" {
 #endif
 
-#define RPC_PROTO_MAJOR_VERSION    7
-#define RPC_PROTO_MINOR_VERSION    0
+// qvac fork: downstream ggml_op insertions shift the serialized op ids
+// relative to upstream, so the wire format is incompatible with stock
+// llama.cpp peers even though the message framing is unchanged. Keep the
+// major version in the downstream namespace (>= 100), bumping it for
+// incompatible changes, so mismatched peers are rejected at the HELLO
+// handshake instead of misdecoding graphs. The
+// HELLO fields are uint8_t on the wire, so the value must stay <= 255.
+// 108 adds butterfly communicator rounds and round-tagged peer frames.
+#define RPC_PROTO_MAJOR_VERSION    108
+#define RPC_PROTO_MINOR_VERSION    1
 #define RPC_PROTO_PATCH_VERSION    0
 
 #ifdef  __cplusplus

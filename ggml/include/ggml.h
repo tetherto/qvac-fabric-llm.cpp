@@ -880,8 +880,9 @@ extern "C" {
 
     GGML_API void * ggml_new_buffer(struct ggml_context * ctx, size_t nbytes);
 
-    GGML_API struct ggml_tensor * ggml_dup_tensor (struct ggml_context * ctx, const struct ggml_tensor * src);
-    GGML_API struct ggml_tensor * ggml_view_tensor(struct ggml_context * ctx, struct ggml_tensor * src);
+    GGML_API struct ggml_tensor * ggml_dup_tensor       (struct ggml_context * ctx, const struct ggml_tensor * src);
+    GGML_API struct ggml_tensor * ggml_dup_tensor_layout(struct ggml_context * ctx, const struct ggml_tensor * src);
+    GGML_API struct ggml_tensor * ggml_view_tensor      (struct ggml_context * ctx, struct ggml_tensor * src);
 
     // Context tensor enumeration and lookup
     GGML_API struct ggml_tensor * ggml_get_first_tensor(const struct ggml_context * ctx);
@@ -1250,7 +1251,7 @@ extern "C" {
            struct ggml_context * ctx,
            struct ggml_tensor  * grad,
            struct ggml_tensor  * g);
-
+    
     // a - dy
     // b - x
     GGML_API struct ggml_tensor * ggml_sigmoid_back(
@@ -2056,6 +2057,14 @@ extern "C" {
             float                 beta_fast,
             float                 beta_slow);
 
+    // set the offset dims for RoPE
+    // a must be GGML_OP_ROPE or GGML_OP_ROPE_BACK
+    // vision RoPE is not supported
+    // example: (marking: x = rotated, 0 = unrotated)
+    //     n_embd = 10, n_dims = 4, offset = 2 --> [00xxxx0000]
+    GGML_API struct ggml_tensor * ggml_rope_set_offset(
+            struct ggml_tensor  * a,
+            int                   n_offs);
 
     // clamp
     // in-place, returns view(a)
@@ -2548,7 +2557,8 @@ extern "C" {
             struct ggml_tensor  * A,
             struct ggml_tensor  * B,
             struct ggml_tensor  * C,
-            struct ggml_tensor  * ids);
+            struct ggml_tensor  * ids,
+            int64_t               K);
 
     // partition into non-overlapping windows with padding if needed
     // example:
@@ -2840,7 +2850,7 @@ extern "C" {
     GGML_API struct ggml_tensor * ggml_cross_entropy_loss_masked(
             struct ggml_context * ctx,
             struct ggml_tensor  * a,  // logits
-            struct ggml_tensor  * b,  // labels
+            struct ggml_tensor  * b,  // labels  
             struct ggml_tensor  * c); // mask (1 for assistant tokens, 0 for masked)
     GGML_API struct ggml_tensor * ggml_cross_entropy_loss_masked_back(
             struct ggml_context * ctx,

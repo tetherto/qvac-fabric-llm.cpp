@@ -18,19 +18,12 @@ fi
 
 set -x
 
-BIN_DIR=$(realpath "$1")
-SPLIT_SRC=$BIN_DIR/llama-gguf-split
-MAIN_SRC=$BIN_DIR/llama-completion
+SPLIT=$1/llama-gguf-split
+MAIN=$1/llama-completion
 WORK_PATH=$TMP_DIR/gguf-split
-ROOT_DIR=$(realpath "$(dirname "$0")/../../")
+ROOT_DIR=$(realpath $(dirname $0)/../../)
 
 mkdir -p "$WORK_PATH"
-
-cp -f "$SPLIT_SRC" "$WORK_PATH/"
-cp -f "$MAIN_SRC" "$WORK_PATH/"
-
-SPLIT=$WORK_PATH/llama-gguf-split
-MAIN=$WORK_PATH/llama-completion
 
 # Clean up in case of previously failed test
 rm -f $WORK_PATH/ggml-model-split*.gguf $WORK_PATH/ggml-model-merge*.gguf

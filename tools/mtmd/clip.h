@@ -64,6 +64,7 @@ enum clip_image_tile_mode {
 
 struct clip_context_params {
     bool use_gpu;
+    ggml_backend_dev_t device;
     enum clip_flash_attn_type flash_attn_type;
     int image_min_tokens;
     int image_max_tokens;
@@ -83,6 +84,11 @@ struct clip_context_params {
     // on a Flash-style model. Do not rely on zero-init: use mtmd_context_params_default()
     // or set this field explicitly.
     int image_no_upscale;
+    // skip the audio encoder even when the GGUF declares one. The projector still
+    // loads its vision encoder, so clip_init() returns a vision-only context and
+    // mtmd_support_audio() reports false. Lets a caller that never feeds audio
+    // avoid paying for those weights and their warmup compute buffers.
+    bool skip_audio;
 };
 
 struct clip_init_result {
@@ -130,9 +136,14 @@ struct clip_encode_params {
     int32_t top_k = 50;
     float   top_p = 1.0f;
     std::vector<int32_t> * out_codes = nullptr; // this frame's 16 sampled codes
+    std::vector<float> * out_feats = nullptr; // continuous counterpart of out_codes
+    uint32_t seed = UINT32_MAX;               // UINT32_MAX for random
+    float   temp = 0.0f;                      // sampling temperature, noise scale for flow-matching decoders
+    bool * out_is_eos = nullptr;
 
     // GEN_WAV
     const std::vector<int32_t> * codes = nullptr;     // this frame's 16 RVQ codes
+    const std::vector<float> *   feats = nullptr;     // continuous counterpart of codes
     std::vector<float> * out_audio = nullptr;         // decoded PCM samples, F32
     const std::vector<uint8_t> * state_in  = nullptr; // state from previous call, null or wrong size means cold start
     std::vector<uint8_t> *       state_out = nullptr; // state for the next call

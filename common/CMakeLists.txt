@@ -138,12 +138,14 @@ add_library(${TARGET} STATIC
     )
 
 set_target_properties(${TARGET} PROPERTIES
-    VERSION ${LLAMA_INSTALL_VERSION}
-    SOVERSION 0
+    VERSION ${LLAMA_VERSION_BASE}
+    SOVERSION ${LLAMA_VERSION_MAJOR}
     MACHO_CURRENT_VERSION 0 # keep macOS linker from seeing oversized version number
 )
 
 set_target_properties(${TARGET} PROPERTIES PUBLIC_HEADER "${${TARGET}_HEADERS}")
+target_link_libraries     (${TARGET} PUBLIC vendor::nlohmann vendor::sheredom)
+
 install(FILES ${${TARGET}_JINJA_HEADERS}
         DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/llama/common/jinja)
 
@@ -205,8 +207,8 @@ target_link_libraries     (${TARGET} PRIVATE ${LLAMA_COMMON_EXTRA_LIBS} PUBLIC l
 # qvac: rebase onto upstream b9341 renamed the common target to `llama-common`.
 # Keep both names addressable so qvac-side CMakeLists (target `common`) and
 # upstream/example/tool CMakeLists (target `llama-common`) both link.
-if (NOT TARGET llama-common)
-    add_library(llama-common ALIAS ${TARGET})
+if (NOT TARGET common)
+    add_library(common ALIAS ${TARGET})
 endif()
 
 

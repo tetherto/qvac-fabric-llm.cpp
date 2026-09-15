@@ -880,6 +880,31 @@ static __device__ __forceinline__ float vec_dot_q2_K_q8_1(
     return vec_dot_q2_K_q8_1_impl_mmvq(v, u, scales, bq2_K->dm, d8);
 }
 
+#define VDR_TQ2_0_Q8_1_MMVQ 1
+
+static __device__ __forceinline__ float vec_dot_tq2_0_q8_1(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+
+    const block_tq2_0 * bq = (const block_tq2_0 *) vbq + kbx;
+
+    const int bq8_offset = QR_TQ2_0 * (iqs / QI8_1);
+
+    const int v = get_int_b2(bq->qs, iqs);
+
+    float sumf = 0.0f;
+#pragma unroll
+    for (int i = 0; i < QR_TQ2_0; ++i) {
+        const int vi = (v >> (2*i)) & 0x03030303;
+        const int u  = get_int_b4(bq8_1[bq8_offset + i].qs, iqs % QI8_1);
+        const float d8 = __low2float(bq8_1[bq8_offset + i].ds);
+
+        const int sumi = ggml_cuda_dp4a(vi, u, 0) - ggml_cuda_dp4a(0x01010101, u, 0);
+        sumf += d8 * sumi;
+    }
+
+    return __half2float(bq->d) * sumf;
+}
+
 static __device__ __forceinline__ float vec_dot_q3_K_q8_1(
     const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
 

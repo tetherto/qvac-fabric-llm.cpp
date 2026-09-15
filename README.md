@@ -6,7 +6,7 @@
 
 <p>
 <a href="https://opensource.org/licenses/MIT"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License: MIT"></a>
-<a href="https://github.com/ggml-org/llama.cpp"><img src="https://img.shields.io/badge/based%20on-llama.cpp%20b10297-orange.svg" alt="Based on llama.cpp"></a>
+<a href="https://github.com/ggml-org/llama.cpp"><img src="https://img.shields.io/badge/based%20on-llama.cpp%20b10549-orange.svg" alt="Based on llama.cpp"></a>
 </p>
 
 </div>
@@ -48,6 +48,24 @@ Split work within each layer across GPUs to accelerate decoding for supported mo
 ./build/bin/llama-cli -m model.gguf --rpc 192.168.88.10:50052,192.168.88.11:50052 \
     --device RPC0,RPC1 --split-mode tensor -ngl all
 ```
+
+### MoE Cache for Faster Decoding *(experimental)*
+
+Improve decoding speed on hybrid systems with limited GPU VRAM and ample system RAM by keeping MoE expert weights in system RAM and caching recently used experts on the GPU. Cache hits reuse GPU-resident weights, reducing repeated CPU-to-GPU transfers during token generation. The benefit depends on expert reuse, cache size, and transfer bandwidth.
+
+- **Configurable VRAM budget**: `--moe-cache-mib N` sets the persistent GPU expert cache budget in MiB; `0` disables it (the default).
+- **Hybrid placement**: combine GPU layer offload with `--cpu-moe` to keep all expert weights in system RAM, or `--n-cpu-moe N` to keep the first N layers' expert weights there.
+- **On-demand caching**: upload missing experts and evict least-recently-used entries when the cache fills. The cache supports single-GPU inference; OpenCL, tensor parallelism, multi-GPU execution, and training are not supported.
+
+For example, keep expert weights in system RAM and allocate a 1 GiB GPU cache:
+
+```bash
+./build/bin/llama-cli -m moe-model.gguf \
+    --n-gpu-layers all --cpu-moe --moe-cache-mib 1024 \
+    -p "Explain how mixture-of-experts models work"
+```
+
+Choose a cache budget that leaves VRAM for other model weights, the KV cache, and compute buffers. It must be large enough to hold the active experts for at least one routed layer.
 
 ### TurboVec / Local Vector Search
 
@@ -177,7 +195,7 @@ For more detailed build instructions, see [docs/build.md](docs/build.md).
 
 qvac-fabric-llm.cpp is a maintained fork of [llama.cpp](https://github.com/ggml-org/llama.cpp). The project regularly synchronizes with upstream releases to incorporate improvements, bug fixes, and new model support, while extending the engine with capabilities not present in the upstream project.
 
-**Current upstream baseline:** llama.cpp b10297
+**Current upstream baseline:** llama.cpp b10549
 
 ### Upstream Compatibility
 

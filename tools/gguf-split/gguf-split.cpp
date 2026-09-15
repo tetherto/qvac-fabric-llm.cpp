@@ -112,7 +112,7 @@ static void split_params_parse_ex(int argc, const char ** argv, split_params & p
             split_print_usage(argv[0]);
             exit(0);
         } else if (arg == "--version") {
-            fprintf(stderr, "version: %d (%s)\n", llama_build_number(), llama_commit());
+            fprintf(stderr, "version: %s (build %d, commit %s)\n", llama_version(), llama_build_number(), llama_commit());
             fprintf(stderr, "built with %s for %s\n", llama_compiler(), llama_build_target());
             exit(0);
         } else if (arg == "--dry-run") {
@@ -336,7 +336,7 @@ struct split_strategy {
             }
             total_size = total_size / 1000 / 1000; // convert to megabytes
             printf("split %05d: n_tensors = %" PRIi64 ", total_size = %zuM\n", i_split + 1, gguf_get_n_tensors(ctx_out), total_size);
-
+            
             if (params.verbose) {
                 for (int i = 0; i < gguf_get_n_tensors(ctx_out); ++i) {
                     const char * t_name = gguf_get_tensor_name(ctx_out, i);

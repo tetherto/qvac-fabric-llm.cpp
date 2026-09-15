@@ -154,6 +154,7 @@ struct mtmd_cli_context {
         const char * clip_path = params.mmproj.path.c_str();
         mtmd_context_params mparams = mtmd_context_params_default();
         mparams.use_gpu          = params.mmproj_use_gpu;
+        mparams.device           = params.mmproj_device;
         mparams.print_timings    = true;
         mparams.n_threads        = params.cpuparams.n_threads;
         mparams.flash_attn_type  = params.flash_attn_type;
@@ -163,6 +164,7 @@ struct mtmd_cli_context {
         mparams.image_tile_mode  = (int)params.image_tile_mode;
         mparams.image_max_tiles  = params.image_max_tiles;
         mparams.image_no_upscale = params.image_no_upscale;
+        mparams.skip_audio       = params.mmproj_no_audio;
         if (std::getenv("MTMD_DEBUG_GRAPH") != nullptr) {
             mparams.cb_eval_user_data = &cb_data;
             mparams.cb_eval = common_debug_cb_eval;

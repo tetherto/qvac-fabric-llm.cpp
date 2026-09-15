@@ -24,7 +24,17 @@ common_params_fit_status common_fit_params(
    llama_model_tensor_buft_override * tensor_buft_overrides, // writable buffer for overrides, needs at least llama_max_tensor_buft_overrides elements
                              size_t * margins,               // margins of memory to leave per device in bytes
                            uint32_t   n_ctx_min,             // minimum context size to set when trying to reduce memory use
+                               bool   prefetch_weights_auto, // enable prefetch when fitting a dense model
                      ggml_log_level   log_level);            // minimum log level to print during fitting, lower levels go to debug log
+
+// Automatic acceleration policies, exposed for hardware-independent tests.
+bool common_fit_auto_moe_cache(
+        const llama_model_params & mparams, const llama_context_params & cparams,
+        uint32_t n_expert, size_t n_devices, bool shares_host, bool cache_supported);
+
+bool common_fit_auto_prefetch_weights(
+        const llama_context_params & cparams, bool automatic,
+        uint32_t n_expert, size_t n_devices, bool shares_host, bool copy_stream);
 
 // Pure decision arithmetic, exposed for tests (tests/test-fit-params.cpp).
 // The projected figures are resident demand per row; "shares_host" marks

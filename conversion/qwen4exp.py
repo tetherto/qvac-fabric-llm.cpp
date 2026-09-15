@@ -14,6 +14,7 @@ from .qwen3vl import Qwen3VLVisionModel
 
 
 @ModelBase.register("Qwen4ExpForConditionalGeneration", "Qwen4ExpForCausalLM")
+@ModelBase.example("Qwen/Qwen3.8-Flash-Next")
 class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
     """Qwen3.8-Flash-Next.
 
@@ -189,5 +190,6 @@ class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
 
 
 @ModelBase.register("Qwen4ExpForConditionalGeneration")
+@ModelBase.example("Qwen/Qwen3.8-Flash-Next")
 class Qwen4ExpVisionModel(Qwen3VLVisionModel):
     """The vision tower is an unmodified Qwen3-VL ViT."""

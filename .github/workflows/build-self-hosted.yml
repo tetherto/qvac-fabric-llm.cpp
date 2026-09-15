@@ -43,16 +43,9 @@ on:
       '**/*.wgsl'
     ]
 
-# QVAC divergence from upstream: dedupe per PR and per branch, so a re-push or
-# re-dispatch supersedes the in-flight run. The default branch deliberately
-# keeps upstream's run_id behaviour — master pushes must not cancel each other,
-# or a merged commit can end with no CI verdict. See QVAC-24627.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || (github.ref == 'refs/heads/master' && github.run_id) || github.ref }}
+  group: ${{ github.workflow }}-${{ github.head_ref && github.ref || github.run_id }}
   cancel-in-progress: true
-
-permissions:
-  contents: read
 
 env:
   # note: this is dud token to avoid rate limiting (https://github.com/ggml-org/llama.cpp/pull/25706#issuecomment-4979941302)
@@ -64,14 +57,8 @@ env:
   LLAMA_ARG_LOG_TIMESTAMPS: 1
 
 jobs:
-  runner_names:
-    permissions:
-      contents: read
-    uses: ./.github/workflows/reusable-runner-names.yml
-
   gpu-cuda:
-    needs: runner_names
-    runs-on: ${{ needs.runner_names.outputs.qvac_ubuntu2204_x64_gpu }}
+    runs-on: qvac-ubuntu2204-x64-gpu
 
     steps:
       - name: Clone
@@ -81,6 +68,7 @@ jobs:
       - name: Test
         id: ggml-ci
         run: |
+          git lfs install
           nvidia-smi
           GG_BUILD_CUDA=1 bash ./ci/run.sh ~/results/llama.cpp ~/mnt/llama.cpp
 
@@ -102,12 +90,12 @@ jobs:
         env:
           HIP_LAUNCH_BLOCKING: "1"
         run: |
+          git lfs install
           rocminfo
           GG_BUILD_ROCM=1 GG_BUILD_AMDGPU_TARGETS=gfx1151 bash ./ci/run.sh ~/results/llama.cpp ~/mnt/llama.cpp
 
   gpu-vulkan-nvidia-cm:
-    needs: runner_names
-    runs-on: ${{ needs.runner_names.outputs.qvac_ubuntu2204_x64_gpu }}
+    runs-on: qvac-ubuntu2204-x64-gpu
 
     steps:
       - name: Clone
@@ -117,12 +105,12 @@ jobs:
       - name: Test
         id: ggml-ci
         run: |
+          git lfs install
           vulkaninfo --summary
           GG_BUILD_VULKAN=1 GGML_VK_DISABLE_COOPMAT2=1 bash ./ci/run.sh ~/results/llama.cpp ~/mnt/llama.cpp
 
   gpu-vulkan-nvidia-cm2:
-    needs: runner_names
-    runs-on: ${{ needs.runner_names.outputs.qvac_ubuntu2204_x64_gpu }}
+    runs-on: qvac-ubuntu2204-x64-gpu
 
     steps:
       - name: Clone
@@ -132,12 +120,12 @@ jobs:
       - name: Test
         id: ggml-ci
         run: |
+          git lfs install
           vulkaninfo --summary
           GG_BUILD_VULKAN=1 bash ./ci/run.sh ~/results/llama.cpp ~/mnt/llama.cpp
 
   gpu-webgpu-nvidia:
-    needs: runner_names
-    runs-on: ${{ needs.runner_names.outputs.qvac_ubuntu2404_x64_gpu }}
+    runs-on: qvac-ubuntu2404-x64-gpu
 
     steps:
       - name: Clone
@@ -160,6 +148,7 @@ jobs:
       - name: Test
         id: ggml-ci
         run: |
+          git lfs install
           GG_BUILD_WEBGPU=1 \
           GG_BUILD_WEBGPU_DAWN_PREFIX="$GITHUB_WORKSPACE/dawn" \
           GG_BUILD_WEBGPU_DAWN_DIR="$GITHUB_WORKSPACE/dawn/lib64/cmake/Dawn" \
@@ -210,8 +199,7 @@ jobs:
   #         GG_BUILD_ROCM=1 GG_BUILD_AMDGPU_TARGETS="gfx1101" bash ./ci/run.sh ~/results/llama.cpp ~/mnt/llama.cpp
 
   gpu-metal:
-    needs: runner_names
-    runs-on: ${{ needs.runner_names.outputs.qvac_macos26_arm64_gpu }}
+    runs-on: qvac-macos26-arm64-gpu
 
     steps:
       - name: Clone
@@ -221,11 +209,11 @@ jobs:
       - name: Test
         id: ggml-ci
         run: |
+          git lfs install
           GG_BUILD_METAL=1 bash ./ci/run.sh ~/results/llama.cpp ~/mnt/llama.cpp
 
   gpu-webgpu-apple:
-    needs: runner_names
-    runs-on: ${{ needs.runner_names.outputs.qvac_macos26_arm64_gpu }}
+    runs-on: qvac-macos26-arm64-gpu
 
     steps:
       - name: Clone
@@ -248,12 +236,12 @@ jobs:
       - name: Test
         id: ggml-ci
         run: |
+          git lfs install
           GG_BUILD_WEBGPU=1 GG_BUILD_WEBGPU_DAWN_PREFIX="$GITHUB_WORKSPACE/dawn" \
             bash ./ci/run.sh ~/results/llama.cpp ~/mnt/llama.cpp
 
   gpu-vulkan-apple:
-    needs: runner_names
-    runs-on: ${{ needs.runner_names.outputs.qvac_macos26_arm64_gpu }}
+    runs-on: qvac-macos26-arm64-gpu
 
     steps:
       - name: Clone
@@ -263,6 +251,7 @@ jobs:
       - name: Test
         id: ggml-ci
         run: |
+          git lfs install
           vulkaninfo --summary
           GG_BUILD_VULKAN=1 bash ./ci/run.sh ~/results/llama.cpp ~/mnt/llama.cpp
 
@@ -280,6 +269,7 @@ jobs:
       - name: Test
         id: ggml-ci
         run: |
+          git lfs install
           vulkaninfo --summary
           GG_BUILD_VULKAN=1 bash ./ci/run.sh ~/results/llama.cpp ~/mnt/llama.cpp
 
@@ -300,6 +290,7 @@ jobs:
           CHERE_INVOKING: 1
           PATH: C:\msys64\ucrt64\bin;C:\msys64\usr\bin;C:\Windows\System32;${{ env.PATH }}
         run: |
+          git lfs install
           vulkaninfo --summary
           # Skip python related tests with GG_BUILD_LOW_PERF=1 since Windows MSYS2 UCRT64 currently fails to create
           # a valid python environment for testing
@@ -311,8 +302,8 @@ jobs:
 
     env:
       # Sync versions in build.yml, build-self-hosted.yml, release.yml, build-cache.yml, .devops/openvino.Dockerfile
-      OPENVINO_VERSION_MAJOR: "2026.2.1"
-      OPENVINO_VERSION_FULL: "2026.2.1.21919.ede283a88e3"
+      OPENVINO_VERSION_MAJOR: "2026.3"
+      OPENVINO_VERSION_FULL: "2026.3.0.22451.bd8d6542e3c"
 
     steps:
       - name: Clone
@@ -335,12 +326,12 @@ jobs:
       - name: Test
         id: ggml-ci
         run: |
+          git lfs install
           source ./openvino_toolkit/setupvars.sh
           GG_BUILD_OPENVINO=1 GGML_OPENVINO_DEVICE=GPU GG_BUILD_LOW_PERF=1 bash ./ci/run.sh ~/results/llama.cpp ~/mnt/llama.cpp
 
   cpu-x64-high-perf:
-    needs: runner_names
-    runs-on: ${{ needs.runner_names.outputs.qvac_ubuntu2204_x64 }}
+    runs-on: qvac-ubuntu2204-x64
 
     steps:
       - name: Clone
@@ -350,6 +341,7 @@ jobs:
       - name: Test
         id: ggml-ci
         run: |
+          git lfs install
           LLAMA_ARG_THREADS=$(nproc) GG_BUILD_HIGH_PERF=1 GG_BUILD_EXTRA_TESTS_0=1 bash ./ci/run.sh ~/results/llama.cpp ~/mnt/llama.cpp
 
   cpu-arm64-high-perf-graviton4:

@@ -13,10 +13,12 @@
 
 #include <atomic>
 #include <map>
+#include <memory>
 #include <vector>
 
 struct llama_model;
 class llama_batch_allocr;
+class llama_moe_cache;
 
 class llama_io_read_i;
 class llama_io_write_i;
@@ -39,6 +41,11 @@ struct llama_memory_buffer {
 };
 
 using llama_memory_buffers = std::map<ggml_backend_buffer_type_t, llama_memory_buffer>;
+
+struct llama_compute_state {
+    ggml_backend_sched_t sched = nullptr;
+    uint64_t generation = 0;
+};
 
 struct llama_context {
     // init scheduler and compute buffers, reserve worst-case graphs
@@ -208,7 +215,7 @@ struct llama_context {
 
     // Optimizer state access for checkpointing (delegated to ggml_opt API)
     int64_t opt_get_iter();
-
+    
     // Optimizer state persistence
     bool opt_save_state(const char* filename);
     bool opt_load_state(const char* filename);
@@ -306,6 +313,7 @@ private:
     llama_cross cross; // TODO: tmp for handling cross-attention - need something better probably
 
     llama_memory_ptr memory;
+    std::unique_ptr<llama_moe_cache> moe_cache;
 
     // decode output (2-dimensional array: [n_outputs][n_vocab])
     buffer_view<float> logits = {nullptr, 0};
@@ -361,6 +369,10 @@ private:
     std::vector<swap_info> output_swaps;
 
     ggml_backend_sched_ptr sched;
+    std::shared_ptr<llama_compute_state> compute_state = std::make_shared<llama_compute_state>();
+    std::weak_ptr<llama_compute_state> ctx_compute;
+    uint64_t compute_generation = 0;
+    bool compute_share_source = false;
 
     bool sched_need_reserve = true;
 
@@ -370,7 +382,7 @@ private:
     // training
     ggml_opt_context_t opt_ctx = nullptr;
     uint32_t original_n_ctx_train = 0;
-
+    
     // optimizer state loading (deferred until after ggml_opt_build)
     std::string pending_optimizer_checkpoint_path;
     bool should_load_optimizer_tensors = false;
