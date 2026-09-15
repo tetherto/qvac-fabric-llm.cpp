@@ -1174,3 +1174,40 @@ QSA layers x 128 tokens). The winning trace and SQLite export are:
 
 - `/home/aman/qwen4-exp-opt-bench-20260911/results/qsa-block-20260915/qsa-block-sentinel-d32768.nsys-rep`
 - `/home/aman/qwen4-exp-opt-bench-20260911/results/qsa-block-20260915/qsa-block-sentinel-d32768.sqlite`
+
+### Mirrored block-map handoff
+
+The sentinel trace still uploaded its 132112-byte physical block map once per
+QSA layer: 3072 H2D copies per TG128. Directly allocating the graph input on
+the Meta backend worked but used synchronous `ggml_backend_tensor_set` calls
+before replay. The retained form keeps the writable input host-backed, inserts
+one `DUP` explicitly assigned to the tensor-split Meta backend, and shares that
+mirrored graph-local result across all QSA layers. Layer split keeps the host
+map because its QSA layers may live on different backends.
+
+A host/device-DUP/host bracket at 32K context produced these warmed final-three
+TG128 means:
+
+| run | TG128 |
+| --- | ---: |
+| device-map first | 59.7170 tok/s |
+| host-map control | 58.2753 tok/s |
+| device-map repeat | 59.5385 tok/s |
+
+The two device-map runs average 59.6278 tok/s, +2.32% over the intervening
+control. Absolute throughput drifted from the earlier 61.3449 tok/s checkpoint,
+so this adjacent bracket—not cross-hour absolute values—is the attribution.
+
+One complete profiled TG128 repetition confirms the intended mechanism:
+
+| path | 132112-byte H2D | `cudaMemcpyAsync` | `cudaStreamSynchronize` |
+| --- | ---: | ---: | ---: |
+| host map | 3072 | 6656 | 17413 |
+| Meta `DUP` map | 258 | 5120 | 10119 |
+
+That is 91.6% fewer full-map uploads, 23.1% fewer async-copy API calls, and
+41.9% fewer stream synchronizations, with the same 3072 compact QSA gathers.
+The device-map artifacts are:
+
+- `/home/aman/qwen4-exp-opt-bench-20260911/results/qsa-block-20260915/qsa-block-device-map-d32768.nsys-rep`
+- `/home/aman/qwen4-exp-opt-bench-20260911/results/qsa-block-20260915/qsa-block-device-map-d32768.sqlite`

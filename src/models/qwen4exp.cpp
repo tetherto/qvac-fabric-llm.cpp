@@ -580,6 +580,7 @@ public:
     ggml_tensor * blk_cells = nullptr;   // I32 [ratio*n_blocks, n_stream]
     ggml_tensor * blk_pos   = nullptr;   // I32 [4*n_blocks*n_stream]
     ggml_tensor * block_cells = nullptr; // I32 [ratio*n_score_blocks, n_stream], -1 for incomplete blocks
+    ggml_tensor * block_cells_dev = nullptr; // mirrored graph-local copy for batch-1 decode
     ggml_tensor * tail_cells  = nullptr; // I32 [ratio-1, n_tokens/n_stream, n_stream]
     ggml_tensor * bias      = nullptr;   // F32 [n_blocks or n_kv, n_tokens/n_stream, n_stream]
 
@@ -640,6 +641,11 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
     // sentinel block. This leaves one host block-map input instead of adding a
     // separate tail input at every QSA layer scheduler boundary.
     const bool block_sentinel = block_topk && n_tps == 1 && pooled_cache;
+    // Under tensor split every layer uses the same Meta backend. Copy the host
+    // map into that backend once inside the graph and let all QSA layers share
+    // it. Layer split can span different backends and keeps the ordinary map.
+    const bool device_block_map = block_sentinel &&
+        model.split_mode() == LLAMA_SPLIT_MODE_TENSOR;
     const int64_t n_score_blocks = n_blocks + (block_sentinel ? 1 : 0);
 
     // nothing above depends on the layer, so the layers sharing a ratio share one input set
@@ -668,6 +674,22 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
                         ctx0, GGML_TYPE_I32, r*n_score_blocks, n_stream);
 
                 ggml_set_input(qsa->block_cells);
+                if (device_block_map) {
+                    qsa->block_cells_dev = ggml_dup(ctx0, qsa->block_cells);
+                    ggml_set_name(qsa->block_cells_dev, "qsa_block_cells_dev");
+
+                    bool placed = false;
+                    const ggml_backend_dev_t layer_dev = model.dev_layer(il);
+                    for (int ib = 0; ib < ggml_backend_sched_get_n_backends(sched); ++ib) {
+                        ggml_backend_t backend = ggml_backend_sched_get_backend(sched, ib);
+                        if (ggml_backend_get_device(backend) == layer_dev) {
+                            ggml_backend_sched_set_tensor_backend(sched, qsa->block_cells_dev, backend);
+                            placed = true;
+                            break;
+                        }
+                    }
+                    GGML_ASSERT(placed && "qsa: failed to find the layer backend for the device block map");
+                }
                 if (!block_sentinel) {
                     qsa->tail_cells = ggml_new_tensor_3d(
                             ctx0, GGML_TYPE_I32, r - 1, n_tps, n_stream);
@@ -816,7 +838,8 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
         blocks = ggml_reshape_3d(ctx0, blocks, n_selected_blocks*n_tps, 1, n_stream);
 
         ggml_tensor * block_cells = ggml_reshape_4d(
-                ctx0, inp->block_cells, r, n_score_blocks, 1, n_stream);
+                ctx0, inp->block_cells_dev != nullptr ? inp->block_cells_dev : inp->block_cells,
+                r, n_score_blocks, 1, n_stream);
         ggml_tensor * selected = ggml_get_rows(ctx0, block_cells, blocks);
         selected = ggml_reshape_4d(
                 ctx0, selected, r*n_selected_blocks, n_tps, 1, n_stream);
