@@ -465,10 +465,88 @@ static ggml_cuda_cutlass_result dispatch_dense_gemm(
     return ggml_cuda_cutlass_result::fallback;
 }
 
+// host-side mirror of run_dense_gemm's checks, for plan-time fallback prediction
+// activation pointers are dummies with the weakest alignment the workspace guarantees (128)
+template <typename Traits>
+static bool can_implement_dense_gemm(
+        const ggml_cuda_cutlass_weight & weight, const void * dst, int m, int n, int k) {
+    using Gemm             = typename Traits::Gemm;
+    using BlockScaleConfig = typename Traits::BlockScaleConfig;
+
+    const auto stride_a   = cutlass::make_cute_packed_stride(typename Traits::StrideA{}, make_shape(m, k, 1));
+    const auto stride_b   = cutlass::make_cute_packed_stride(typename Traits::StrideB{}, make_shape(n, k, 1));
+    const auto stride_c   = cutlass::make_cute_packed_stride(typename Traits::StrideC{}, make_shape(m, n, 1));
+    const auto stride_d   = cutlass::make_cute_packed_stride(typename Traits::StrideD{}, make_shape(m, n, 1));
+    const auto shape      = make_shape(m, n, k, 1);
+    const auto layout_sfa = BlockScaleConfig::tile_atom_to_shape_SFA(shape);
+    const auto layout_sfb = BlockScaleConfig::tile_atom_to_shape_SFB(shape);
+
+    const char * dummy = (const char *) weight.values + 128;
+
+    typename Gemm::Arguments arguments = {
+        cutlass::gemm::GemmUniversalMode::kGemm,
+        shape,
+        {
+            reinterpret_cast<const typename Gemm::ElementA *>(dummy),
+            stride_a,
+            reinterpret_cast<const typename Gemm::ElementB *>(weight.values),
+            stride_b,
+            reinterpret_cast<const typename Traits::Scale *>(dummy),
+            layout_sfa,
+            reinterpret_cast<const typename Traits::Scale *>(weight.scales),
+            layout_sfb,
+        },
+        {
+            {},
+            nullptr,
+            stride_c,
+            reinterpret_cast<typename Traits::Output *>(const_cast<void *>(dst)),
+            stride_d,
+        },
+    };
+
+    if constexpr (std::is_same_v<typename Traits::Scale, cutlass::float_ue4m3_t>) {
+        arguments.epilogue.thread = { { reinterpret_cast<const float *>(dummy) }, {}, {} };
+    } else {
+        arguments.epilogue.thread.alpha = 1.0f;
+        arguments.epilogue.thread.beta  = 0.0f;
+    }
+
+    Gemm gemm;
+    return gemm.can_implement(arguments) == cutlass::Status::kSuccess;
+}
+
 } // namespace ggml_cutlass_sm120
 
 bool ggml_cuda_cutlass_compiled() {
     return true;
+}
+
+bool ggml_cuda_cutlass_mul_mat_prequantized_supported(
+        ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst) {
+    using namespace ggml_cutlass_sm120;
+
+    if (dst == nullptr || dst->data == nullptr) {
+        return false;
+    }
+
+    ggml_cuda_cutlass_activation_layout layout;
+    ggml_cuda_cutlass_weight            weight;
+    if (!ggml_cuda_cutlass_get_activation_layout(ctx, src0, src1, dst, layout) ||
+        !ggml_cuda_cutlass_weight_from_tensor(src0, weight)) {
+        return false;
+    }
+
+    const int64_t n = src0->ne[1];
+    if (weight.type == GGML_TYPE_NVFP4) {
+        return can_implement_dense_gemm<blockscaled_kernel_traits<nvfp4_format_traits>>(
+            weight, dst->data, layout.m, (int) n, layout.k_padded);
+    }
+    if (weight.type == GGML_TYPE_MXFP4) {
+        return can_implement_dense_gemm<blockscaled_kernel_traits<mxfp_format_traits>>(
+            weight, dst->data, layout.m, (int) n, layout.k_padded);
+    }
+    return false;
 }
 
 ggml_cuda_cutlass_result ggml_cuda_cutlass_mul_mat_prequantized(ggml_backend_cuda_context &          ctx,
@@ -567,6 +645,12 @@ ggml_cuda_cutlass_result ggml_cuda_cutlass_mul_mat_prequantized(ggml_backend_cud
                                                                 const ggml_cuda_cutlass_activation & activation) {
     GGML_UNUSED_VARS(ctx, src0, src1, dst, activation);
     return ggml_cuda_cutlass_result::fallback;
+}
+
+bool ggml_cuda_cutlass_mul_mat_prequantized_supported(
+        ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst) {
+    GGML_UNUSED_VARS(ctx, src0, src1, dst);
+    return false;
 }
 
 ggml_cuda_cutlass_result ggml_cuda_cutlass_mul_mat_prequantized_bf16(ggml_backend_cuda_context &          ctx,
