@@ -5754,6 +5754,23 @@ enum ggml_prec ggml_flash_attn_ext_get_prec(
     return (enum ggml_prec) prec_i32;
 }
 
+void ggml_flash_attn_ext_set_kv_used(
+        struct ggml_tensor * a,
+        int32_t              n_kv_used) {
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
+    GGML_ASSERT(a->src[3] == NULL); // the implicit mask replaces the mask tensor
+    GGML_ASSERT(n_kv_used >= a->src[0]->ne[1] && n_kv_used <= a->src[1]->ne[1]);
+
+    ggml_set_op_params_i32(a, 4, n_kv_used); // 3 is the precision
+}
+
+int32_t ggml_flash_attn_ext_get_kv_used(
+        const struct ggml_tensor * a) {
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
+
+    return ggml_get_op_params_i32(a, 4);
+}
+
 void ggml_flash_attn_ext_add_sinks(
         struct ggml_tensor * a,
         struct ggml_tensor * sinks) {

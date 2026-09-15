@@ -297,7 +297,9 @@ void ggml_cuda_mul_mat_f8(ggml_backend_cuda_context & ctx, const ggml_tensor * s
     }
 
 #ifdef GGML_CUDA_CUTLASS
-    if (ggml_cuda_info().devices[ctx.device].cc == GGML_CUDA_CC_HOPPER && ((uintptr_t) y % 16 == 0)) {
+    // GGML_CUDA_DISABLE_MMF8_CUTLASS: run the F16 fallback GEMM instead (A/B and equivalence gates)
+    static const bool cutlass_disabled = getenv("GGML_CUDA_DISABLE_MMF8_CUTLASS") != nullptr;
+    if (!cutlass_disabled && ggml_cuda_info().devices[ctx.device].cc == GGML_CUDA_CC_HOPPER && ((uintptr_t) y % 16 == 0)) {
         mul_mat_f8_e4m3_cutlass(ctx, x, sx, y, d, ncols, nrows, ntokens, stream);
         return;
     }

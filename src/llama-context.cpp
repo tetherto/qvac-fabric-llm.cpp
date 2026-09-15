@@ -7,6 +7,8 @@
 #include "llama-batch.h"
 #include "llama-io.h"
 #include "llama-memory.h"
+#include "llama-kv-cache.h"
+#include "llama-memory-hybrid.h"
 #include "llama-mmap.h"
 #include "llama-moe-cache.h"
 #include "llama-model.h"
@@ -62,6 +64,53 @@ static const llm_fused_op_probe llm_fused_op_lid_probe = {
     /*.name             =*/ "Lightning Indexer",
     /*.n_tokens_per_seq =*/ 1,
 };
+
+// the implicit causal mask (no mask tensor, see ggml_flash_attn_ext_set_kv_used) needs backend support for the
+// model's attention shape: probe the device of the first attention layer with a representative prefill op
+static bool llama_attn_implicit_mask_supported(const llama_model & model, ggml_type type_k, ggml_type type_v) {
+    const auto & hparams = model.hparams;
+
+    int32_t il = -1;
+    for (uint32_t i = 0; i < hparams.n_layer(); ++i) {
+        if (!hparams.is_recr(i)) {
+            il = i;
+            break;
+        }
+    }
+    if (il < 0) {
+        return false;
+    }
+
+    ggml_backend_dev_t dev = model.dev_layer(il);
+    if (!dev) {
+        return false;
+    }
+
+    ggml_init_params ip = { 8*ggml_tensor_overhead(), nullptr, true };
+    ggml_context * ctx = ggml_init(ip);
+
+    const int64_t n_tokens = 256;
+    const int64_t n_kv     = 256;
+
+    // the FA operands as build_attn_mha permutes them: q [D, n_tokens, n_head], k/v [D, n_kv, n_head_kv]
+    ggml_tensor * q = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, hparams.n_embd_head_k(il), hparams.n_head(il),    n_tokens);
+    ggml_tensor * k = ggml_new_tensor_3d(ctx, type_k,        hparams.n_embd_head_k(il), hparams.n_head_kv(il), n_kv);
+    ggml_tensor * v = ggml_new_tensor_3d(ctx, type_v,        hparams.n_embd_head_v(il), hparams.n_head_kv(il), n_kv);
+    q = ggml_permute(ctx, q, 0, 2, 1, 3);
+    k = ggml_permute(ctx, k, 0, 2, 1, 3);
+    v = ggml_permute(ctx, v, 0, 2, 1, 3);
+
+    ggml_tensor * op = ggml_flash_attn_ext(ctx, q, k, v, nullptr, 1.0f/sqrtf((float) hparams.n_embd_head_k(il)),
+        hparams.f_max_alibi_bias, hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f);
+    ggml_flash_attn_ext_set_prec(op, GGML_PREC_F32);
+    ggml_flash_attn_ext_set_kv_used(op, n_kv);
+
+    const bool res = ggml_backend_dev_supports_op(dev, op);
+
+    ggml_free(ctx);
+
+    return res;
+}
 
 static const llm_fused_op_probe llm_fused_op_dsv4_hc_pre_probe = {
     /*.op               =*/ LLM_FUSED_OP_DSV4_HC_PRE,
@@ -716,6 +765,22 @@ void llama_context::sched_reserve() {
     LLAMA_LOG_DEBUG("%s: worst-case: n_tokens = %d, n_seqs = %d, n_outputs = %d\n", __func__, n_tokens, n_seqs, n_outputs);
 
     resolve_fused_ops(mctx.get(), n_seqs);
+
+    {
+        // the K/V cache types come from the attention memory (plain or the attention part of a hybrid model)
+        ggml_type type_k = GGML_TYPE_COUNT;
+        ggml_type type_v = GGML_TYPE_COUNT;
+        if (const auto * kv_ctx = dynamic_cast<const llama_kv_cache_context *>(mctx.get())) {
+            type_k = kv_ctx->type_k();
+            type_v = kv_ctx->type_v();
+        } else if (const auto * hyb_ctx = dynamic_cast<const llama_memory_hybrid_context *>(mctx.get())) {
+            type_k = hyb_ctx->get_attn()->type_k();
+            type_v = hyb_ctx->get_attn()->type_v();
+        }
+        cparams.attn_implicit_mask = type_k != GGML_TYPE_COUNT && cparams.flash_attn && cparams.causal_attn &&
+            llama_attn_implicit_mask_supported(model, type_k, type_v);
+        LLAMA_LOG_INFO("%s: implicit causal attention mask: %s\n", __func__, cparams.attn_implicit_mask ? "enabled" : "disabled");
+    }
 
     // reserve worst-case graph
     int n_splits_pp = -1;

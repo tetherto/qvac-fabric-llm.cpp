@@ -63,6 +63,18 @@ static bool can_reuse_kq_mask(
     return res;
 }
 
+// > 0 when the ubatch attends with the implicit causal mask instead of a mask tensor (see ggml_flash_attn_ext_set_kv_used)
+static int32_t llm_graph_attn_implicit_mask_n_kv_used(
+        const llama_kv_cache_context * mctx,
+        const llama_ubatch & ubatch,
+        const llama_cparams & cparams) {
+    if (!cparams.attn_implicit_mask || !cparams.flash_attn || !cparams.causal_attn || ubatch.n_tokens < llama_kv_cache::n_tokens_min_implicit_mask) {
+        return 0;
+    }
+
+    return mctx->get_n_kv_used();
+}
+
 // impl
 
 void llm_graph_input_embd::set_input(const llama_ubatch * ubatch) {
@@ -495,7 +507,10 @@ bool llm_graph_input_attn_kv::can_reuse(const llm_graph_params & params) {
     res &= self_k_idxs->ne[0] == params.ubatch.n_tokens;
   //res &= self_v_idxs->ne[0] == params.ubatch.n_tokens; // TODO: need to move this to the unified cache and check there
 
-    res &= can_reuse_kq_mask(self_kq_mask, mctx, params.ubatch, params.cparams);
+    res &= n_kv_used == llm_graph_attn_implicit_mask_n_kv_used(mctx, params.ubatch, params.cparams);
+    if (n_kv_used == 0) {
+        res &= can_reuse_kq_mask(self_kq_mask, mctx, params.ubatch, params.cparams);
+    }
 
     return res;
 }
@@ -1063,7 +1078,9 @@ void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
     mctx->get_attn()->set_input_k_idxs(inp_attn->self_k_idxs, ubatch);
     mctx->get_attn()->set_input_v_idxs(inp_attn->self_v_idxs, ubatch);
 
-    mctx->get_attn()->set_input_kq_mask(inp_attn->self_kq_mask, ubatch, cparams.causal_attn);
+    if (inp_attn->self_kq_mask) {
+        mctx->get_attn()->set_input_kq_mask(inp_attn->self_kq_mask, ubatch, cparams.causal_attn);
+    }
 
     if (inp_attn->self_k_rot) {
         mctx->get_attn()->set_input_k_rot(inp_attn->self_k_rot);
@@ -1096,7 +1113,10 @@ bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
     res &= inp_attn->self_k_idxs->ne[0] == params.ubatch.n_tokens;
   //res &= inp_attn->self_v_idxs->ne[0] == params.ubatch.n_tokens; // TODO: need to move this to the unified cache and check there
 
-    res &= can_reuse_kq_mask(inp_attn->self_kq_mask, mctx->get_attn(), params.ubatch, params.cparams);
+    res &= inp_attn->n_kv_used == llm_graph_attn_implicit_mask_n_kv_used(mctx->get_attn(), params.ubatch, params.cparams);
+    if (inp_attn->n_kv_used == 0) {
+        res &= can_reuse_kq_mask(inp_attn->self_kq_mask, mctx->get_attn(), params.ubatch, params.cparams);
+    }
 
     res &= inp_rs->s_copy->ne[0] == mctx->get_recr()->get_n_rs();
 
@@ -2551,7 +2571,9 @@ ggml_tensor * llm_graph_context::build_attn_mha(
          ggml_tensor * sinks,
          ggml_tensor * v_mla,
                float   kq_scale,
-                 int   il) const {
+                 int   il,
+             int32_t   n_kv_used) const {
+    GGML_ASSERT(kq_mask != nullptr || n_kv_used == 0 || (cparams.flash_attn && kq_b == nullptr));
     const bool v_trans = v->nb[1] > v->nb[2];
 
     // split the batch into streams if needed
@@ -2588,6 +2610,9 @@ ggml_tensor * llm_graph_context::build_attn_mha(
 
         ggml_flash_attn_ext_add_sinks(cur, sinks);
         ggml_flash_attn_ext_set_prec (cur, GGML_PREC_F32);
+        if (kq_mask == nullptr && n_kv_used > 0) {
+            ggml_flash_attn_ext_set_kv_used(cur, n_kv_used);
+        }
 
         if (v_mla) {
 #if 0
@@ -2768,9 +2793,12 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
 
         inp->self_k_idxs = mctx_cur->build_input_k_idxs(ctx0, ubatch);
         inp->self_v_idxs = mctx_cur->build_input_v_idxs(ctx0, ubatch);
-
-        inp->self_kq_mask = build_attn_inp_kq_mask(ctx0, mctx_cur, ubatch, cparams);
-        inp->self_kq_mask_cnv = inp->self_kq_mask;
+        // implicit causal mask (prefill-sized batches of one contiguous sequence): no mask tensor to fill and upload
+        inp->n_kv_used = llm_graph_attn_implicit_mask_n_kv_used(mctx_cur, ubatch, cparams);
+        if (inp->n_kv_used == 0) {
+            inp->self_kq_mask = build_attn_inp_kq_mask(ctx0, mctx_cur, ubatch, cparams);
+            inp->self_kq_mask_cnv = inp->self_kq_mask;
+        }
     }
 
     inp->self_k_rot = mctx_cur->build_input_k_rot(ctx0);
@@ -2845,7 +2873,7 @@ ggml_tensor * llm_graph_context::build_attn(
         v = mctx_cur->get_v(ctx0, il);
     }
 
-    if (kq_mask->ne[0] != k->ne[2]) {
+    if (kq_mask && kq_mask->ne[0] != k->ne[2]) {
         GGML_ASSERT(k->ne[2] <= kq_mask->ne[0]);
         kq_mask = ggml_view_4d(ctx0, kq_mask,
                 k->ne[2], kq_mask->ne[1], kq_mask->ne[2], kq_mask->ne[3],
@@ -2853,7 +2881,7 @@ ggml_tensor * llm_graph_context::build_attn(
         kq_mask = ggml_cont(ctx0, kq_mask);
     }
 
-    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il);
+    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il, inp->get_n_kv_used());
     cb(cur, "kqv_out", il);
 
     if (inp->self_v_rot) {

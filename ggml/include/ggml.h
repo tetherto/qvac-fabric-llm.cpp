@@ -2529,6 +2529,17 @@ extern "C" {
     GGML_API enum ggml_prec ggml_flash_attn_ext_get_prec(
             const struct ggml_tensor * a);
 
+    // implicit causal mask for one contiguous sequence, used instead of the mask tensor (mask must be NULL):
+    // cells [0, n_kv_used) of k/v hold one sequence in position order and the n_q queries are its last
+    // n_q positions, so query row i attends cell c iff c < n_kv_used && c <= i + (n_kv_used - n_q).
+    // 0 (the default) means "no implicit mask"; backends that do not implement it reject the op in supports_op.
+    GGML_API void ggml_flash_attn_ext_set_kv_used(
+            struct ggml_tensor * a,
+            int32_t              n_kv_used);
+
+    GGML_API int32_t ggml_flash_attn_ext_get_kv_used(
+            const struct ggml_tensor * a);
+
     GGML_API void ggml_flash_attn_ext_add_sinks(
             struct ggml_tensor * a,
             struct ggml_tensor * sinks);

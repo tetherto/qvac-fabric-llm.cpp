@@ -2656,6 +2656,9 @@ static bool ggml_backend_cann_supports_op(ggml_backend_dev_t dev, const ggml_ten
             return true;
         case GGML_OP_FLASH_ATTN_EXT:
             {
+                if (op->src[3] == nullptr && ggml_flash_attn_ext_get_kv_used(op) > 0) {
+                    return false; // implicit causal mask (n_kv_used) is CPU/CUDA only
+                }
 #ifdef ASCEND_310P
                 // FA not support on 310p device
                 return false;
