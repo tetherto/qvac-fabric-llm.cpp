@@ -165,11 +165,46 @@ constexpr int ggml_cuda_highest_compiled_arch_impl(const int arch, const int cur
 constexpr int ggml_cuda_highest_compiled_arch(const int arch) {
     return ggml_cuda_highest_compiled_arch_impl(arch, 0, __CUDA_ARCH_LIST__);
 }
+
+// The -1 below is what lets registration skip a device. Upstream ggml aborts
+// there instead, so a resync of the impl above must not drop it silently.
+static_assert(ggml_cuda_highest_compiled_arch_impl(750, 0, 800, 860, 890) == -1,
+              "a device below every compiled arch must resolve to -1 so registration can skip it");
+static_assert(ggml_cuda_highest_compiled_arch_impl(800, 0, 800, 860, 890) == 800,
+              "a device matching the compiled floor must resolve to that floor");
+static_assert(ggml_cuda_highest_compiled_arch_impl(890, 0, 800, 860, 890) == 890,
+              "a device with an exact compiled arch must resolve to it");
+static_assert(ggml_cuda_highest_compiled_arch_impl(1200, 0, 800, 860, 890) == 890,
+              "a device above every compiled arch must resolve to the highest compiled one");
 #else
 static int ggml_cuda_highest_compiled_arch(const int arch) {
     return arch;
 }
 #endif // __CUDA_ARCH_LIST__
+
+// Fast rejection for devices below the compiled floor. The registration path
+// also asks the CUDA runtime to load a probe kernel, which covers real-only gaps,
+// devices above an all-real ceiling, and PTX rejected by an older driver.
+static bool ggml_cuda_compiled_code_available(const int cc) {
+    if (!GGML_CUDA_CC_IS_NVIDIA(cc)) {
+        return true;
+    }
+    return ggml_cuda_highest_compiled_arch(cc) > 0;
+}
+
+constexpr int ggml_cuda_arch_score_impl(const int loadable_devices, const int exact_devices) {
+    return loadable_devices == 0 ? 0 : loadable_devices * (GGML_CUDA_MAX_DEVICES + 1) + exact_devices;
+}
+
+static bool ggml_cuda_arch_is_exact(const int cc) {
+    return GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) == cc;
+}
+
+static_assert(ggml_cuda_arch_score_impl(2, 0) > ggml_cuda_arch_score_impl(1, 1),
+              "covering every device must beat a partial exact match");
+static_assert(ggml_cuda_arch_score_impl(1, 1) > ggml_cuda_arch_score_impl(1, 0),
+              "an exact arch must win when coverage is equal");
+static_assert(ggml_cuda_arch_score_impl(0, 0) == 0, "a module that covers no device must be rejected");
 
 // ---------------------------------------------------------------------------------------------------------
 
@@ -1680,4 +1715,3 @@ static __inline__ void ggml_cuda_kernel_launch(Kernel kernel, const ggml_cuda_ke
     kernel<<<launch_params.block_nums, launch_params.block_dims, launch_params.shmem, launch_params.stream>>>(std::forward<Args>(args)... );
     CUDA_CHECK(cudaGetLastError());
 }
-

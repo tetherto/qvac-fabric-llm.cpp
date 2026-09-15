@@ -667,7 +667,7 @@ if(CMAKE_SYSTEM_NAME MATCHES "visionOS")
     target_compile_definitions(ggml-base PUBLIC _DARWIN_C_SOURCE)
 endif()
 
-if (BUILD_SHARED_LIBS OR GGML_BACKEND_DL)
+if (BUILD_SHARED_LIBS OR (GGML_BACKEND_DL AND NOT WIN32))
     foreach (target ${GGML_CORE_TARGETS})
         set_target_properties(${target} PROPERTIES POSITION_INDEPENDENT_CODE ON)
         target_compile_definitions(${target} PRIVATE GGML_BUILD)

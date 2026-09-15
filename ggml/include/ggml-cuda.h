@@ -33,6 +33,11 @@ GGML_BACKEND_API bool ggml_backend_cuda_allreduce_tensor(ggml_backend_t * backen
 // pinned host buffer for use with the CPU backend for faster copies between CPU and GPU
 GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_cuda_host_buffer_type(void);
 
+// Number of CUDA devices the driver reports, NOT the number this build can use.
+// QVAC-23763 made ggml_backend_cuda_reg() skip devices with no compiled kernels
+// for their compute capability, so ids inside this range can be holes:
+// ggml_backend_cuda_init() and ggml_backend_cuda_buffer_type() both return NULL
+// for them. For usable devices, walk ggml_backend_reg_dev_count(reg) instead.
 GGML_BACKEND_API int  ggml_backend_cuda_get_device_count(void);
 GGML_BACKEND_API void ggml_backend_cuda_get_device_description(int device, char * description, size_t description_size);
 GGML_BACKEND_API void ggml_backend_cuda_get_device_memory(int device, size_t * free, size_t * total);
