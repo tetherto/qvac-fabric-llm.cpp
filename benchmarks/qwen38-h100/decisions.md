@@ -102,3 +102,40 @@ C3 replaces the per-matmul F32->F16 activation convert inside the F8 fallback wi
 ## 15. Server acceptance runs are A/B on one idle GPU
 
 After C2's first server run (measured while the other GPU ran an A/B) disagreed with its controlled repeat, server acceptance numbers are taken with the host otherwise idle, the server relaunched per configuration, and the two configurations alternated (`srv_ab.sh` on the host). The C1 acceptance was measured before this rule; its 10k gain (+9.2% and +6.4% per rep, +7.8% on the mean) is well above the noise seen since (about 1.5% at 10k, 0.2% at 110k).
+
+## 16. W8A8 CUTLASS GEMM as the default FP8 prefill path (A1, campaign 2)
+
+Options:
+- (a) Keep the F16 fallback GEMM as the default and the W8A8 GEMM opt-in (the F2/F4 state: the W8A8 build failed the equivalence gate against the fallback build's logits).
+- (b) Make the W8A8 GEMM the default (`GGML_CUDA_CUTLASS=ON` in the campaign build) and re-register the gate against the fallback FP8 logits with a threshold that admits the per-token activation quantization (G2: Same top p >= 98.0%, Mean KLD <= 0.006).
+
+Taken: (b), the user's decision for campaign 2 (prefill is the larger gap and the fallback GEMM already runs at 76% of the H100 F16 peak, so the W8A8 tensor-core rate is the only way to a 10k prompt above 10k tok/s). G2 measured 98.018% / 0.005949, inside the registered limits by a small margin. Every later equivalence gate (G1) is measured with `GGML_CUDA_DISABLE_MMF8_CUTLASS=1` on both sides, because the W8A8 rounding re-rolls on any upstream change of about 1e-4 and a W8A8-vs-W8A8 KLD near 0.01 is not a signal (decision recorded in the B1 ledger entry).
+
+## 17. Causal attention without a mask tensor (B1)
+
+Options:
+- (a) Keep the mask tensor and give the CUTLASS FMHA the mask as an extra input (the example has no mask input; it would need a custom fusion and the mask fill and upload would stay).
+- (b) Describe the common case (one sequence, cells [0, n_kv_used) in position order, the ubatch at the tail) with one integer on the op (`ggml_flash_attn_ext_set_kv_used`), let the KV cache prove the geometry after `apply_ubatch`, and let backends that cannot run it materialize the mask themselves.
+
+Taken: (b). The mask for a 4096-token ubatch at 110k is 900 MB of f16 per layer set filled on the host every ubatch; with (b) it is gone on the CUDA path (the FMHA uses the offset causal rule, the ggml kernels get a device-side fill when the FMHA does not apply) and the other backends reject the op in `supports_op` so the scheduler never hands it to them. The CPU reference implements the same rule so `test-backend-ops` compares against it. Batches below 256 tokens keep the mask (the cell scan is not worth a launch there). M-RoPE stays admitted because its only special case fails the contiguity check.
+
+## 18. Checkpoint blobs: pooled pageable memory, not pinned (S1)
+
+Options:
+- (a) Pinned host buffers (`ggml_backend_dev_host_buffer_type`) for every checkpoint blob, pooled after free: fastest device copies (measured mid-prompt checkpoint 148 -> 63 ms).
+- (b) A bounded pinned staging buffer plus a memcpy into pageable blobs.
+- (c) Pageable blobs from a pool of freed blocks (1 GiB idle cap), so the pages are faulted once and reused.
+
+Taken: (c). (a) keeps every live checkpoint page-locked: 32 checkpoints per slot at 150 MiB each is 4.7 GiB of pinned memory per slot, and the prompt cache copies them, so a server could lock 10+ GiB; a pool cap does not bound live allocations. (b) adds a 150 MiB memcpy per checkpoint. The page faults were the dominant cost (about 57 ms of the 148, 38k faults), the pageable copy itself is 20 ms slower than pinned; (c) removes the faults with no lock footprint and keeps the code to one small class (`common_state_buffer`). Measured under host load only (72-96 ms mid-prompt); the sync-point-2 server A/B carries the accepted number.
+
+## 19. Decode launch fusions are graph-pattern matches with explicit alias rules (D2, D4, D5)
+
+Options:
+- (a) Change the graph builders (`build_norm`, the delta-net builder) to emit new fused ops.
+- (b) Match the existing op runs in the CUDA backend and replace them with one launch, as the existing RMS_NORM+MUL and SSM_CONV+SILU fusions do.
+
+Taken: (b): no new ops, no change for other backends, the CPU reference stays the unfused graph. Three patterns: residual `ADD -> RMS_NORM -> MUL` (the add stays an output, exact-alias rules listed in `ggml_cuda_should_fuse_add_rms_norm_mul`: in-place add and dst on a dead add input are allowed because each element is touched by one thread, dst on the add result is not, partial overlaps never); `ssm_conv -> silu -> per-head L2_NORM slices (+ scale)` scanned as a run of view/norm/scale nodes because the fused and the ggml-op delta-net builders emit different view chains; the gate projections `alpha/beta mul_mat -> add/softplus/mul, sigmoid` at batch <= 8 (above that the GEMM path keeps the tensor cores). Every match runs `ggml_can_fuse_subgraph` with the surviving nodes as outputs and `ggml_cuda_check_fusion_memory_ranges`, and each pattern has a whole-graph `test-backend-ops` case that checks all of its outputs plus an nsys count proving the fused kernel ran.
+
+## 20. FMHA query padding
+
+The CUTLASS FMHA needs the query count to be a multiple of 8; the last ubatch of a prompt has an arbitrary length (1841 tokens at 10k). Taken: pad with phantom queries that attend the same number of phantom cells past `n_kv_used` (they exist in the K/V views, which the support check verifies), zero the phantom Q rows, discard their outputs; no host-side change. Alternative (fall back to the mask fill for those ubatches) was the B1 state and cost the mask path on 18% of the tokens of a 10k prompt.
