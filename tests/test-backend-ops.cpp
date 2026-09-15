@@ -11623,6 +11623,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
 
     // Large-k, including multi-row and ties (qwen4exp)
+    test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, { 8192,  1, 1, 1 }, 512));
+    test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, { 8192,  2, 1, 1 }, 512, true));
+    test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, { 8193,  1, 1, 1 }, 513));
+    test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, { 8193,  2, 1, 1 }, 513, true));
     test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, { 1024,  1, 1, 1 }, 1024));
     test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, { 2048,  2, 1, 1 }, 1024));
     test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, { 4096,  1, 1, 1 }, 2048));

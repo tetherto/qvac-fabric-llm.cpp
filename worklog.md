@@ -1,6 +1,6 @@
 # Qwen4Exp optimization worklog
 
-Last updated: 2026-09-15 (Asia/Singapore)
+Last updated: 2026-09-16 (Asia/Singapore)
 
 ## Objective
 
@@ -18,6 +18,7 @@ Current branch: `qwen4-exp-opt`
 Recent commits, newest first:
 
 ```text
+642df9f48 cuda: fuse batch-1 DeepGEMM MoE decode
 d429fee9f cuda: remove failed fused MoE prototypes
 ad6c3e5e8 cuda: add opt-in FlashInfer SM90 GDN path
 556468da6 qwen4exp: add HC inject and separate-state SSM paths
@@ -1294,3 +1295,45 @@ Artifacts are under:
 - `full-ffn-b1-staged-d32768.nsys-rep` and `.sqlite`
 - `full-ffn-b1-staged-nographs-d32768.nsys-rep` and `.sqlite`
 - `full-ffn-b1-disabled-nographs-d32768.nsys-rep` and `.sqlite`
+
+## 2026-09-16: Hopper radix QSA block selection
+
+The generic CUDA `TOP_K` path used CUB `DeviceTopK` for every QSA layer. At a
+32K resident context, selecting the 513 block IDs needed by the batch-1
+sentinel graph expanded into eight kernels: index and offset initialization,
+a histogram, four radix onesweep passes, and an exclusive scan. The new Hopper
+specialization handles the QSA widths 512 and 513 in one 1024-thread kernel.
+It finds the exact F32 threshold through four in-kernel radix passes and emits
+all greater keys plus the required number of exact-threshold ties. Rows larger
+than 65,536 elements, other top-k widths, and non-Hopper devices retain CUB.
+Set `GGML_CUDA_RADIX_TOP_K=0` for the CUB A/B fallback.
+
+Focused physical-H100 validation passed 6/6: distinct and tied one-/two-row
+TOP_K cases for both widths, plus the full sentinel and non-sentinel QSA block
+graphs. Five synchronous stress repetitions also passed. A focused Nsight
+microtrace measured 11.232 us per 8193-to-513 radix kernel versus about
+52.4 us per CUB selection, a 4.7x operator speedup.
+
+An adjacent radix/CUB/radix bracket used the same 32K FP8 tensor/EP workload as
+the preceding MoE result. Warmed means were:
+
+| QSA selector | PP2048 final-two mean | TG128 final-three mean |
+| --- | ---: | ---: |
+| radix candidate 1 | 7622.25 tok/s | 65.4140 tok/s |
+| CUB control | 7038.62 tok/s | 62.9557 tok/s |
+| radix candidate 2 | 7666.27 tok/s | 65.1687 tok/s |
+
+The two radix runs average **7644.26 PP2048 tok/s (+8.60%)** and
+**65.2914 TG128 tok/s (+3.71%)** relative to the intervening control.
+
+The graph-disabled 16-token trace gives exact steady-window attribution. Across
+24 QSA layers, the selector launch count falls from 3072 to 384. Selector GPU
+time falls from 17.1557 ms to 6.7456 ms, saving 10.4101 ms over the trace, or
+0.6506 ms/token. Graph-disabled throughput rises from 15.1872 to 19.2312 tok/s;
+that larger percentage includes CPU launch overhead and is diagnostic only.
+
+Artifacts:
+
+- `/tmp/qsa-topk-radix.nsys-rep` and `/tmp/qsa-topk-cub.nsys-rep`
+- `/home/aman/qwen4-exp-opt-bench-20260911/results/decode-b1-pack-20260916/radix-topk-nographs-d32768.nsys-rep`
+- `/home/aman/qwen4-exp-opt-bench-20260911/results/decode-b1-pack-20260916/radix-topk-nographs-d32768.sqlite`
