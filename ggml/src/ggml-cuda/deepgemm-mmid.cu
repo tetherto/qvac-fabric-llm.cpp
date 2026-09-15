@@ -139,9 +139,14 @@ __global__ void pack_quantize_broadcast_b1(
         int top_k,
         int m_blocked,
         int expert_offset,
-        int n_groups) {
+        int n_groups,
+        const float * route_weights,
+        float * route_weights_copy) {
     const int kb = blockIdx.x;
     const int col = kb * DG_SCALE_K + threadIdx.x;
+    if (kb == 0 && threadIdx.x < top_k && route_weights != nullptr) {
+        route_weights_copy[threadIdx.x] = route_weights[threadIdx.x];
+    }
     const float value = x[col];
     const float amax = fmaxf(block_abs_max<128>(value), 1.0e-4f);
     const float scale = amax / 448.0f;
@@ -246,6 +251,72 @@ __global__ void scatter_bf16_output(
             : 0.0f;
     }
 }
+
+__global__ void weighted_reduce_bf16_output_b1(
+        const __nv_bfloat16 * packed,
+        const int32_t * assignment_rows,
+        const float * weights,
+        float * dst,
+        int n,
+        int top_k) {
+    const int col = blockIdx.x * blockDim.x + threadIdx.x;
+    if (col >= n) {
+        return;
+    }
+
+    float sum = 0.0f;
+    for (int slot = 0; slot < top_k; ++slot) {
+        const int packed_row = assignment_rows[slot];
+        if (packed_row >= 0) {
+            sum += static_cast<float>(packed[static_cast<size_t>(packed_row) * n + col]) * weights[slot];
+        }
+    }
+    dst[col] = sum;
+}
+
+// Consume the packed BF16 gate/up result in expert-row order and produce the
+// FP8 activation/scales expected by the down projection. This avoids gate/up
+// scatter, a separate F32 SwiGLU intermediate, and a second route/pack pass.
+__global__ void swiglu_quantize_packed_b1(
+        const __nv_bfloat16 * gate_up,
+        const int32_t * assignment_rows,
+        uint8_t * activated_fp8,
+        float * activated_scales,
+        int n_ff,
+        int top_k,
+        int m_blocked) {
+    const int slot = blockIdx.x;
+    if (slot >= top_k) {
+        return;
+    }
+
+    const int packed_row = assignment_rows[slot];
+    if (packed_row < 0) {
+        return;
+    }
+
+    const int scale_k = n_ff / DG_SCALE_K;
+    const int expert = packed_row / m_blocked;
+    const int row = packed_row % m_blocked;
+    const __nv_bfloat16 * gate_up_row =
+        gate_up + static_cast<size_t>(packed_row) * (2*n_ff);
+
+    for (int kb = 0; kb < scale_k; ++kb) {
+        const int col = kb * DG_SCALE_K + threadIdx.x;
+        const float gate = static_cast<float>(gate_up_row[col]);
+        const float up   = static_cast<float>(gate_up_row[n_ff + col]);
+        const float value = gate / (1.0f + expf(-gate)) * up;
+        const float amax = fmaxf(block_abs_max<128>(value), 1.0e-4f);
+        const float scale = amax / 448.0f;
+
+        if (threadIdx.x == 0) {
+            activated_scales[(expert * scale_k + kb) * m_blocked + row] = scale;
+        }
+        activated_fp8[static_cast<size_t>(packed_row) * n_ff + col] =
+            fp32_to_e4m3(value / scale);
+    }
+}
+
 CUtensorMap make_tma_2d_desc(
         void * data,
         CUtensorMapDataType dtype,
@@ -467,6 +538,11 @@ bool broadcast_b1_pack_enabled() {
     return value == nullptr || value[0] == '\0' || std::strcmp(value, "0") != 0;
 }
 
+bool moe_ffn_b1_enabled() {
+    const char * value = std::getenv("GGML_CUDA_DEEPGEMM_B1_FFN");
+    return value == nullptr || value[0] == '\0' || std::strcmp(value, "0") != 0;
+}
+
 bool mul_mat_id_supported(const ggml_tensor * dst, int device) {
     if (dst == nullptr || dst->src[0] == nullptr || dst->src[1] == nullptr || dst->src[2] == nullptr) {
         return false;
@@ -546,7 +622,11 @@ bool ggml_cuda_deepgemm_mul_mat_id_graph_compatible(const ggml_tensor * dst, int
            mul_mat_id_supported(dst, device);
 }
 
-bool ggml_cuda_deepgemm_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+static bool ggml_cuda_deepgemm_mul_mat_id_impl(
+        ggml_backend_cuda_context & ctx,
+        ggml_tensor * dst,
+        const ggml_tensor * reduction_weights,
+        ggml_tensor * reduced_dst) {
     const ggml_tensor * weights = dst->src[0];
     const ggml_tensor * x       = dst->src[1];
     const ggml_tensor * ids     = dst->src[2];
@@ -575,6 +655,18 @@ bool ggml_cuda_deepgemm_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor 
     const int m_blocked = n_tokens <= DG_M_BLOCKED_MIN ? DG_M_BLOCKED_MIN :
                           n_tokens <= DG_M_BLOCKED_MID ? DG_M_BLOCKED_MID : DG_M_BLOCKED_MAX;
     const bool qwen_gate_up = k == 2560;
+
+    const bool fused_reduction = reduction_weights != nullptr || reduced_dst != nullptr;
+    if (fused_reduction && (
+            reduction_weights == nullptr || reduced_dst == nullptr || qwen_gate_up || n_tokens != 1 ||
+            reduction_weights->type != GGML_TYPE_F32 || !ggml_is_contiguous(reduction_weights) ||
+            reduction_weights->ne[0] != 1 || reduction_weights->ne[1] != top_k ||
+            reduction_weights->ne[2] != 1 || reduction_weights->ne[3] != 1 ||
+            reduced_dst->type != GGML_TYPE_F32 || !ggml_is_contiguous(reduced_dst) ||
+            reduced_dst->ne[0] != n || reduced_dst->ne[1] != 1 ||
+            reduced_dst->ne[2] != 1 || reduced_dst->ne[3] != 1)) {
+        return false;
+    }
 
     static bool logged = false;
     if (!logged) {
@@ -619,7 +711,9 @@ bool ggml_cuda_deepgemm_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor 
             top_k,
             m_blocked,
             expert_offset,
-            n_groups);
+            n_groups,
+            nullptr,
+            nullptr);
     } else {
         pack_quantize_activations<<<assignments, 128, 0, stream>>>(
             static_cast<const float *>(x->data),
@@ -665,15 +759,213 @@ bool ggml_cuda_deepgemm_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor 
             qwen_gate_up, n, k, m_blocked, stream);
     }
 
-    scatter_bf16_output<<<assignments, 256, 0, stream>>>(
-        packed_dst.ptr,
-        assignment_rows.ptr,
-        static_cast<float *>(dst->data),
-        n,
-        top_k,
-        n_tokens,
-        static_cast<int64_t>(dst->nb[1] / sizeof(float)),
-        static_cast<int64_t>(dst->nb[2] / sizeof(float)));
+    if (fused_reduction) {
+        weighted_reduce_bf16_output_b1<<<(n + 255) / 256, 256, 0, stream>>>(
+            packed_dst.ptr,
+            assignment_rows.ptr,
+            static_cast<const float *>(reduction_weights->data),
+            static_cast<float *>(reduced_dst->data),
+            n,
+            top_k);
+    } else {
+        scatter_bf16_output<<<assignments, 256, 0, stream>>>(
+            packed_dst.ptr,
+            assignment_rows.ptr,
+            static_cast<float *>(dst->data),
+            n,
+            top_k,
+            n_tokens,
+            static_cast<int64_t>(dst->nb[1] / sizeof(float)),
+            static_cast<int64_t>(dst->nb[2] / sizeof(float)));
+    }
     CUDA_CHECK(cudaGetLastError());
+    return true;
+}
+
+bool ggml_cuda_deepgemm_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    return ggml_cuda_deepgemm_mul_mat_id_impl(ctx, dst, nullptr, nullptr);
+}
+
+bool ggml_cuda_deepgemm_mul_mat_id_weighted_reduction(
+        ggml_backend_cuda_context & ctx,
+        ggml_tensor * dst,
+        const ggml_tensor * weights,
+        ggml_tensor * reduced_dst) {
+    const char * value = std::getenv("GGML_CUDA_DEEPGEMM_B1_REDUCE");
+    if (value != nullptr && value[0] != '\0' && std::strcmp(value, "0") == 0) {
+        return false;
+    }
+
+    static bool logged = false;
+    const bool handled = ggml_cuda_deepgemm_mul_mat_id_impl(ctx, dst, weights, reduced_dst);
+    if (handled && !logged) {
+        GGML_LOG_INFO("%s: fusing batch-1 down scatter with weighted expert reduction\n", __func__);
+        logged = true;
+    }
+    return handled;
+}
+
+bool ggml_cuda_deepgemm_moe_ffn_b1(
+        ggml_backend_cuda_context & ctx,
+        ggml_tensor * gate_up_dst,
+        ggml_tensor * down_dst,
+        const ggml_tensor * reduction_weights,
+        ggml_tensor * reduced_dst) {
+    if (!moe_ffn_b1_enabled() ||
+            !mul_mat_id_supported(gate_up_dst, ctx.device) ||
+            !mul_mat_id_supported(down_dst, ctx.device)) {
+        return false;
+    }
+
+    const ggml_tensor * gate_up       = gate_up_dst->src[0];
+    const ggml_tensor * x             = gate_up_dst->src[1];
+    const ggml_tensor * ids           = gate_up_dst->src[2];
+    const ggml_tensor * gate_up_scale = gate_up_dst->src[3];
+    const ggml_tensor * down          = down_dst->src[0];
+    const ggml_tensor * down_scale    = down_dst->src[3];
+    const bool native_fp8 = gate_up->type == GGML_TYPE_F8_E4M3;
+
+    if (!native_fp8 && !runtime_enabled()) {
+        return false;
+    }
+
+    const int n_embd        = static_cast<int>(gate_up->ne[0]);
+    const int gate_up_n     = static_cast<int>(gate_up->ne[1]);
+    const int n_ff          = gate_up_n / 2;
+    const int n_groups      = static_cast<int>(gate_up->ne[2]);
+    const int top_k         = static_cast<int>(ids->ne[0]);
+    const int n_tokens      = static_cast<int>(ids->ne[1]);
+    const int m_blocked     = DG_M_BLOCKED_MIN;
+    const int expert_offset = ggml_get_op_params_i32(gate_up_dst, 2);
+
+    if (n_tokens != 1 || x->ne[1] != 1 || gate_up_n != 2*n_ff ||
+            down->type != gate_up->type || down->ne[0] != n_ff ||
+            down->ne[1] != n_embd || down->ne[2] != n_groups || down->ne[3] != 1 ||
+            down_dst->src[2] != ids ||
+            ggml_get_op_params_i32(down_dst, 2) != expert_offset ||
+            reduction_weights == nullptr || reduction_weights->type != GGML_TYPE_F32 ||
+            !ggml_is_contiguous(reduction_weights) ||
+            reduction_weights->ne[0] != 1 || reduction_weights->ne[1] != top_k ||
+            reduction_weights->ne[2] != 1 || reduction_weights->ne[3] != 1 ||
+            reduced_dst == nullptr || reduced_dst->type != GGML_TYPE_F32 ||
+            !ggml_is_contiguous(reduced_dst) ||
+            reduced_dst->ne[0] != n_embd || reduced_dst->ne[1] != 1 ||
+            reduced_dst->ne[2] != 1 || reduced_dst->ne[3] != 1) {
+        return false;
+    }
+
+    if (native_fp8 && (gate_up_scale == nullptr || down_scale == nullptr)) {
+        return false;
+    }
+
+    cudaStream_t stream = ctx.stream();
+    ggml_cuda_pool & pool = ctx.pool();
+
+    const size_t activation_elems = static_cast<size_t>(n_groups) * m_blocked * n_embd;
+    const size_t activation_scale_elems =
+        static_cast<size_t>(n_groups) * m_blocked * (n_embd / DG_SCALE_K);
+    ggml_cuda_pool_alloc<uint8_t> activations_fp8(pool, activation_elems);
+    ggml_cuda_pool_alloc<float> activation_scales(pool, activation_scale_elems);
+    ggml_cuda_pool_alloc<__nv_bfloat16> packed(
+        pool, static_cast<size_t>(n_groups) * m_blocked * n_embd);
+    ggml_cuda_pool_alloc<int32_t> counts(pool, n_groups);
+    ggml_cuda_pool_alloc<int32_t> assignment_rows(pool, top_k);
+    ggml_cuda_pool_alloc<float> route_weights_copy(pool, top_k);
+
+    ggml_cuda_pool_alloc<uint8_t> quantized_weights(pool);
+    ggml_cuda_pool_alloc<float> quantized_weight_scales(pool);
+    uint8_t * gate_up_fp8 = native_fp8
+        ? static_cast<uint8_t *>(gate_up->data)
+        : quantized_weights.alloc(static_cast<size_t>(n_groups) * gate_up_n * n_embd);
+    float * gate_up_sfb = native_fp8
+        ? static_cast<float *>(gate_up_scale->data)
+        : quantized_weight_scales.alloc(static_cast<size_t>(n_groups) *
+            (gate_up_n / DG_SCALE_K) * (n_embd / DG_SCALE_K));
+
+    CUDA_CHECK(cudaMemsetAsync(counts.ptr, 0, n_groups * sizeof(int32_t), stream));
+    pack_quantize_broadcast_b1<<<n_embd / DG_SCALE_K, 128, 0, stream>>>(
+        static_cast<const float *>(x->data),
+        static_cast<const int32_t *>(ids->data),
+        counts.ptr,
+        assignment_rows.ptr,
+        activations_fp8.ptr,
+        activation_scales.ptr,
+        n_embd,
+        top_k,
+        m_blocked,
+        expert_offset,
+        n_groups,
+        static_cast<const float *>(reduction_weights->data),
+        route_weights_copy.ptr);
+    CUDA_CHECK(cudaGetLastError());
+
+    if (!native_fp8) {
+        quantize_weights<<<n_groups * (gate_up_n / DG_SCALE_K) * (n_embd / DG_SCALE_K),
+                256, 0, stream>>>(
+            reinterpret_cast<const __nv_bfloat16 *>(gate_up->data), counts.ptr,
+            gate_up_fp8, gate_up_sfb, gate_up_n, n_embd);
+        CUDA_CHECK(cudaGetLastError());
+    }
+
+    if (n_groups == DG_TEST_GROUPS) {
+        launch_qwen_gate_up<DG_TEST_GROUPS>(
+            activations_fp8.ptr, activation_scales.ptr, gate_up_fp8, gate_up_sfb,
+            packed.ptr, counts.ptr, gate_up_n, m_blocked, stream);
+    } else if (n_groups == DG_EP_GROUPS) {
+        launch_qwen_gate_up<DG_EP_GROUPS>(
+            activations_fp8.ptr, activation_scales.ptr, gate_up_fp8, gate_up_sfb,
+            packed.ptr, counts.ptr, gate_up_n, m_blocked, stream);
+    } else {
+        launch_qwen_gate_up<DG_QWEN_GROUPS>(
+            activations_fp8.ptr, activation_scales.ptr, gate_up_fp8, gate_up_sfb,
+            packed.ptr, counts.ptr, gate_up_n, m_blocked, stream);
+    }
+
+    swiglu_quantize_packed_b1<<<top_k, 128, 0, stream>>>(
+        packed.ptr, assignment_rows.ptr, activations_fp8.ptr, activation_scales.ptr,
+        n_ff, top_k, m_blocked);
+    CUDA_CHECK(cudaGetLastError());
+
+    uint8_t * down_fp8 = native_fp8
+        ? static_cast<uint8_t *>(down->data)
+        : quantized_weights.ptr;
+    float * down_sfb = native_fp8
+        ? static_cast<float *>(down_scale->data)
+        : quantized_weight_scales.ptr;
+    if (!native_fp8) {
+        quantize_weights<<<n_groups * (n_embd / DG_SCALE_K) * (n_ff / DG_SCALE_K),
+                256, 0, stream>>>(
+            reinterpret_cast<const __nv_bfloat16 *>(down->data), counts.ptr,
+            down_fp8, down_sfb, n_embd, n_ff);
+        CUDA_CHECK(cudaGetLastError());
+    }
+
+    if (n_groups == DG_TEST_GROUPS) {
+        launch_qwen_down<DG_TEST_GROUPS>(
+            activations_fp8.ptr, activation_scales.ptr, down_fp8, down_sfb,
+            packed.ptr, counts.ptr, n_ff, m_blocked, stream);
+    } else if (n_groups == DG_EP_GROUPS) {
+        launch_qwen_down<DG_EP_GROUPS>(
+            activations_fp8.ptr, activation_scales.ptr, down_fp8, down_sfb,
+            packed.ptr, counts.ptr, n_ff, m_blocked, stream);
+    } else {
+        launch_qwen_down<DG_QWEN_GROUPS>(
+            activations_fp8.ptr, activation_scales.ptr, down_fp8, down_sfb,
+            packed.ptr, counts.ptr, n_ff, m_blocked, stream);
+    }
+
+    weighted_reduce_bf16_output_b1<<<(n_embd + 255) / 256, 256, 0, stream>>>(
+        packed.ptr, assignment_rows.ptr,
+        route_weights_copy.ptr,
+        static_cast<float *>(reduced_dst->data), n_embd, top_k);
+    CUDA_CHECK(cudaGetLastError());
+
+    static bool logged = false;
+    if (!logged) {
+        GGML_LOG_INFO(
+            "%s: fusing batch-1 gate/up, SwiGLU, down, and weighted reduction (%d experts)\n",
+            __func__, n_groups);
+        logged = true;
+    }
     return true;
 }

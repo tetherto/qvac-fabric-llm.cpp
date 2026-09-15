@@ -1250,3 +1250,47 @@ Artifacts are under:
 - `/home/aman/qwen4-exp-opt-bench-20260911/results/decode-b1-pack-20260916/`
 - `candidate-nsys.nsys-rep` and `candidate-nsys.sqlite`
 - `control-1.jsonl`, `candidate.jsonl`, `control-2.jsonl`, and `candidate-2.jsonl`
+
+## 2026-09-16: full batch-1 DeepGEMM MoE fusion
+
+Batch-1 tensor-split decode now recognizes the existing 25-node local MoE
+subgraph and executes it as one internal CUDA fusion without introducing a new
+public GGML operation or moving the tensor-split all-reduce boundary. The fast
+path stages the activation, expert IDs, and route weights; runs the merged
+gate/up DeepGEMM; computes SwiGLU while quantizing directly into the packed FP8
+layout required by the down projection; runs the down DeepGEMM; and reduces the
+packed BF16 expert results directly with the staged router weights. The
+original graph remains the fallback. Set `GGML_CUDA_DEEPGEMM_B1_FFN=0` to
+disable the full fusion for A/B testing.
+
+The focused `MOE_FFN_DEEPGEMM_B1` H100 test passes against the CPU reference,
+and a short real-model trace confirms the fast path on all 48 MoE layers on
+both physical GPUs 6/7. Adjacent five-repetition FP8 measurements at 32K
+context used `-sm tensor -ts 1/1`, hybrid expert parallelism, QSA block top-k,
+ubatch 2048, CPU PLE, and the FlashInfer GDN adapter:
+
+| full batch-1 fusion | TG128 samples | stable last-three mean |
+| --- | --- | ---: |
+| disabled | 58.6813, 59.5333, 60.7367, 60.6770, 60.6849 | 60.6995 tok/s |
+| enabled | 60.2996, 61.6302, 62.7103, 62.7352, 62.7384 | 62.7280 tok/s |
+
+This is a reproducible **+3.34%** batch-1 decode improvement. The warmed final
+two PP2048 samples were 6971.17 tok/s disabled and 7115.04 tok/s enabled
+(+2.06%), although prefill is not the target of this batch-1-only path.
+
+A matching graph-disabled Nsight pair was used only to expose individual
+steady-state kernels. Relative to the disabled run, the fusion removed 6,328
+kernel launches from the complete captured workload. The directly attributable
+MoE changes removed 24.382 ms and added 9.266 ms, a net 15.116 ms reduction in
+summed GPU kernel time. Normalizing the 1,664 per-device-layer fusion calls and
+dividing for two concurrently executing GPUs gives about 0.436 ms saved per
+token, consistent with the graph-enabled end-to-end result. With graphs
+disabled, throughput rose from 8.1268 to 15.1872 tok/s; that larger number is
+diagnostic launch-overhead removal and is not the production result.
+
+Artifacts are under:
+
+- `/home/aman/qwen4-exp-opt-bench-20260911/results/decode-b1-pack-20260916/`
+- `full-ffn-b1-staged-d32768.nsys-rep` and `.sqlite`
+- `full-ffn-b1-staged-nographs-d32768.nsys-rep` and `.sqlite`
+- `full-ffn-b1-disabled-nographs-d32768.nsys-rep` and `.sqlite`

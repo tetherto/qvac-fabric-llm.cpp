@@ -5458,6 +5458,145 @@ struct test_mul_mat_id_deepgemm : public test_mul_mat_id {
     }
 };
 
+struct test_mul_mat_id_deepgemm_reduction : public test_case {
+    std::string vars() override {
+        return "n_mats=16,n_used=10,m=2560,n=1,k=640";
+    }
+
+    double max_nmse_err() override {
+        return 2e-3;
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MUL_MAT_ID_DEEPGEMM_REDUCTION";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        constexpr int64_t n_mats = 16;
+        constexpr int64_t n_used = 10;
+        constexpr int64_t n_embd = 2560;
+        constexpr int64_t k      = 640;
+
+        ggml_tensor * as = ggml_new_tensor_3d(ctx, GGML_TYPE_BF16, k, n_embd, n_mats);
+        ggml_set_name(as, "as");
+
+        ggml_tensor * ids_storage = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_mats, 1);
+        ggml_set_name(ids_storage, "ids_storage");
+        ggml_tensor * ids = ggml_view_2d(ctx, ids_storage, n_used, 1, ids_storage->nb[1], 0);
+        ggml_set_name(ids, "ids");
+
+        ggml_tensor * b = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k, n_used, 1);
+        ggml_set_name(b, "b");
+        ggml_tensor * experts = ggml_mul_mat_id(ctx, as, b, ids);
+        ggml_set_name(experts, "experts");
+
+        ggml_tensor * weights = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, n_used, 1);
+        ggml_set_name(weights, "weights");
+        ggml_tensor * weighted = ggml_mul(ctx, experts, weights);
+        ggml_set_name(weighted, "weighted_experts");
+        ggml_build_forward_expand(gf, weighted);
+
+        std::array<ggml_tensor *, n_used> views;
+        for (int64_t expert = 0; expert < n_used; ++expert) {
+            views[expert] = ggml_view_2d(
+                ctx, weighted, n_embd, 1, weighted->nb[2], expert * weighted->nb[1]);
+            ggml_build_forward_expand(gf, views[expert]);
+        }
+
+        ggml_tensor * out = views[0];
+        for (int64_t expert = 1; expert < n_used; ++expert) {
+            out = ggml_add(ctx, out, views[expert]);
+            ggml_build_forward_expand(gf, out);
+        }
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        init_mul_mat_id_tensors(ctx, 16);
+    }
+};
+
+struct test_moe_ffn_deepgemm_b1 : public test_case {
+    static constexpr int64_t n_mats = 16;
+    static constexpr int64_t n_used = 10;
+    static constexpr int64_t n_embd = 2560;
+    static constexpr int64_t n_ff   = 640;
+
+    std::string vars() override {
+        return "n_mats=16,n_used=10,n_embd=2560,n_ff=640,n_tokens=1";
+    }
+
+    double max_nmse_err() override {
+        // Both GEMMs and the intermediate SwiGLU activation are dynamically
+        // quantized to E4M3 by the experimental Hopper path.
+        return 1e-2;
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MOE_FFN_DEEPGEMM_B1";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * gate_up_weights =
+            ggml_new_tensor_3d(ctx, GGML_TYPE_BF16, n_embd, 2*n_ff, n_mats);
+        ggml_set_name(gate_up_weights, "gate_up_weights");
+        ggml_tensor * down_weights =
+            ggml_new_tensor_3d(ctx, GGML_TYPE_BF16, n_ff, n_embd, n_mats);
+        ggml_set_name(down_weights, "down_weights");
+
+        ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_used, 1);
+        ggml_set_name(ids, "ids");
+        ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, 1, 1);
+        ggml_set_name(x, "x");
+
+        ggml_tensor * gate_up = ggml_mul_mat_id(ctx, gate_up_weights, x, ids);
+        ggml_set_name(gate_up, "gate_up");
+        ggml_tensor * gate = ggml_view_3d(
+            ctx, gate_up, n_ff, n_used, 1, gate_up->nb[1], gate_up->nb[2], 0);
+        ggml_set_name(gate, "gate");
+        ggml_tensor * up = ggml_view_3d(
+            ctx, gate_up, n_ff, n_used, 1, gate_up->nb[1], gate_up->nb[2],
+            n_ff * gate_up->nb[0]);
+        ggml_set_name(up, "up");
+        ggml_tensor * activated = ggml_swiglu_split(ctx, gate, up);
+        ggml_set_name(activated, "activated");
+
+        ggml_tensor * experts = ggml_mul_mat_id(ctx, down_weights, activated, ids);
+        ggml_set_name(experts, "experts");
+        ggml_tensor * weights = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, n_used, 1);
+        ggml_set_name(weights, "weights");
+        ggml_tensor * weighted = ggml_mul(ctx, experts, weights);
+        ggml_set_name(weighted, "weighted_experts");
+        ggml_build_forward_expand(gf, weighted);
+
+        std::array<ggml_tensor *, n_used> views;
+        for (int64_t expert = 0; expert < n_used; ++expert) {
+            views[expert] = ggml_view_2d(
+                ctx, weighted, n_embd, 1, weighted->nb[2], expert * weighted->nb[1]);
+            ggml_build_forward_expand(gf, views[expert]);
+        }
+
+        ggml_tensor * out = views[0];
+        for (int64_t expert = 1; expert < n_used; ++expert) {
+            out = ggml_add(ctx, out, views[expert]);
+            ggml_build_forward_expand(gf, out);
+        }
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        init_mul_mat_id_tensors(ctx, n_mats);
+    }
+};
+
 struct test_mul_mat_id_adreno_repack : public test_mul_mat_id {
     bool roundtrip_ok = true;
 
@@ -11037,6 +11176,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             // Down consumes a distinct activated vector for each selected expert.
             test_cases.emplace_back(new test_mul_mat_id_deepgemm(GGML_TYPE_BF16, GGML_TYPE_F32, 16, 10, false, 2560, n_tokens, 640));
         }
+        test_cases.emplace_back(new test_mul_mat_id_deepgemm_reduction());
+        test_cases.emplace_back(new test_moe_ffn_deepgemm_b1());
     }
 
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_F16, GGML_TYPE_F32, 1, 1, false, 8, 16, 1));

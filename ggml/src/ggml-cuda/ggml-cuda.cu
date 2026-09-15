@@ -3277,7 +3277,8 @@ static bool ggml_cuda_check_fusion_memory_ranges(const ggml_cgraph * cgraph,
                                                  const int           node_count,
                                                  const int *         out_nodes,
                                                  const int           out_count,
-                                                 const bool          is_topk_moe = false) {
+                                                 const bool          is_topk_moe = false,
+                                                 std::initializer_list<const ggml_tensor *> safe_input_aliases = {}) {
     auto nodes_overlap = [&](const ggml_tensor * a, const ggml_tensor * b) {
         const int64_t a_start = (int64_t) a->data;
         const int64_t a_end   = a_start + ggml_backend_buft_get_alloc_size(a->buffer->buft, a);
@@ -3314,6 +3315,14 @@ static bool ggml_cuda_check_fusion_memory_ranges(const ggml_cgraph * cgraph,
                 }
 
                 if (nodes_overlap(dst, src)) {
+                    // Some fused operators consume an aliased input into
+                    // private storage before writing their output. Keep this
+                    // exception explicit per call site; all other external
+                    // inputs retain the conservative overlap check.
+                    if (std::find(safe_input_aliases.begin(), safe_input_aliases.end(), src) !=
+                            safe_input_aliases.end()) {
+                        continue;
+                    }
                     bool found = false;
 
                     for (int k = node_idx; k < j; ++k) {
@@ -3478,6 +3487,84 @@ static bool ggml_cuda_match_moe_weighted_reduction(
     match.node_count   = node_count;
     return true;
 }
+
+#ifdef GGML_CUDA_DEEPGEMM
+struct ggml_cuda_deepgemm_moe_ffn_b1_match {
+    ggml_tensor * gate_up = nullptr;
+    ggml_tensor * down    = nullptr;
+    ggml_cuda_moe_weighted_reduction_match reduction;
+    int node_count = 0;
+};
+
+static bool ggml_cuda_match_deepgemm_moe_ffn_b1(
+        const ggml_cgraph * cgraph,
+        int node_idx,
+        ggml_cuda_deepgemm_moe_ffn_b1_match & match) {
+    // Merged gate/up graph:
+    //   MUL_MAT_ID, VIEW(gate), VIEW(up), SWIGLU, MUL_MAT_ID,
+    //   router MUL, ten VIEWs, nine ADDs.
+    if (node_idx + 5 >= cgraph->n_nodes) {
+        return false;
+    }
+
+    ggml_tensor * gate_up = cgraph->nodes[node_idx + 0];
+    const ggml_tensor * gate = cgraph->nodes[node_idx + 1];
+    const ggml_tensor * up   = cgraph->nodes[node_idx + 2];
+    const ggml_tensor * glu  = cgraph->nodes[node_idx + 3];
+    ggml_tensor * down       = cgraph->nodes[node_idx + 4];
+
+    if (gate_up->op != GGML_OP_MUL_MAT_ID ||
+            gate->op != GGML_OP_VIEW || up->op != GGML_OP_VIEW ||
+            glu->op != GGML_OP_GLU || ggml_get_glu_op(glu) != GGML_GLU_OP_SWIGLU ||
+            down->op != GGML_OP_MUL_MAT_ID ||
+            gate->src[0] != gate_up || gate->view_src != gate_up ||
+            up->src[0] != gate_up || up->view_src != gate_up ||
+            glu->src[0] != gate || glu->src[1] != up ||
+            down->src[1] != glu || down->src[2] != gate_up->src[2]) {
+        return false;
+    }
+
+    const int64_t n_ff = gate_up->ne[0] / 2;
+    if (gate_up->type != GGML_TYPE_F32 || gate_up->ne[0] != 2*n_ff ||
+            gate->type != GGML_TYPE_F32 || up->type != GGML_TYPE_F32 ||
+            gate->ne[0] != n_ff || up->ne[0] != n_ff ||
+            gate->ne[1] != gate_up->ne[1] || up->ne[1] != gate_up->ne[1] ||
+            gate->ne[2] != gate_up->ne[2] || up->ne[2] != gate_up->ne[2] ||
+            gate->ne[3] != gate_up->ne[3] || up->ne[3] != gate_up->ne[3] ||
+            gate->view_offs != 0 || up->view_offs != (size_t) n_ff * gate_up->nb[0] ||
+            glu->type != GGML_TYPE_F32 || !ggml_is_contiguous(glu) ||
+            glu->ne[0] != n_ff || glu->ne[1] != gate_up->ne[1] ||
+            glu->ne[2] != gate_up->ne[2] || glu->ne[3] != gate_up->ne[3]) {
+        return false;
+    }
+
+    ggml_cuda_moe_weighted_reduction_match reduction;
+    if (!ggml_cuda_match_moe_weighted_reduction(cgraph, node_idx + 5, reduction) ||
+            reduction.experts != down || reduction.expert_scale != nullptr) {
+        return false;
+    }
+
+    const int node_count = 5 + reduction.node_count;
+    const int output_idx = node_idx + node_count - 1;
+    std::vector<ggml_op> ops(node_count);
+    for (int offset = 0; offset < node_count; ++offset) {
+        ops[offset] = cgraph->nodes[node_idx + offset]->op;
+    }
+    if (!ggml_can_fuse_subgraph(cgraph, node_idx, node_count, ops.data(), &output_idx, 1) ||
+            !ggml_cuda_check_fusion_memory_ranges(
+                cgraph, node_idx, node_count, &output_idx, 1,
+                /*is_topk_moe=*/ false,
+                {gate_up->src[1], gate_up->src[2], reduction.weights})) {
+        return false;
+    }
+
+    match.gate_up   = gate_up;
+    match.down      = down;
+    match.reduction = reduction;
+    match.node_count = node_count;
+    return true;
+}
+#endif
 
 
 static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
@@ -3740,6 +3827,43 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     ggml_tensor * node = cgraph->nodes[i];
+
+#ifdef GGML_CUDA_DEEPGEMM
+    // Keep Meta's original tensor-split graph and all-reduce boundary, but
+    // execute the complete local batch-1 expert FFN in packed DeepGEMM form.
+    if (node->op == GGML_OP_MUL_MAT_ID) {
+        ggml_cuda_deepgemm_moe_ffn_b1_match match;
+        if (ggml_cuda_match_deepgemm_moe_ffn_b1(cgraph, i, match) &&
+                ggml_cuda_deepgemm_moe_ffn_b1(
+                    *cuda_ctx, match.gate_up, match.down,
+                    match.reduction.weights, match.reduction.dst)) {
+            return match.node_count - 1;
+        }
+    }
+
+    // Native FP8 batch-1 down projection followed by the standard router
+    // weighting and expert sum. DeepGEMM can reduce directly from its packed
+    // BF16 output, avoiding the full ten-slot F32 scatter and its reread.
+    if (node->op == GGML_OP_MUL_MAT_ID && i + 1 < cgraph->n_nodes) {
+        ggml_cuda_moe_weighted_reduction_match match;
+        if (ggml_cuda_match_moe_weighted_reduction(cgraph, i + 1, match) &&
+                match.experts == node && match.expert_scale == nullptr) {
+            const int node_count = match.node_count + 1;
+            const int output_idx = i + node_count - 1;
+            std::vector<ggml_op> ops(node_count);
+            for (int offset = 0; offset < node_count; ++offset) {
+                ops[offset] = cgraph->nodes[i + offset]->op;
+            }
+
+            if (ggml_can_fuse_subgraph(cgraph, i, node_count, ops.data(), &output_idx, 1) &&
+                    ggml_cuda_check_fusion_memory_ranges(cgraph, i, node_count, &output_idx, 1) &&
+                    ggml_cuda_deepgemm_mul_mat_id_weighted_reduction(
+                        *cuda_ctx, node, match.weights, match.dst)) {
+                return node_count - 1;
+            }
+        }
+    }
+#endif
 
     if (node->op == GGML_OP_MUL) {
         ggml_cuda_moe_weighted_reduction_match match;
