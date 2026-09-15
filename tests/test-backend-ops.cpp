@@ -2587,8 +2587,9 @@ struct test_set_rows : public test_case {
             // roughly (2.0 / 2^bits)^2, divided by the mean square value of the reference,
             // which is roughly 0.25 times the number of elements.
             double err_estimate = 1.0f/8.0f;
-            if (type_src == GGML_TYPE_F16 && type_dst == GGML_TYPE_Q2_0) {
-                err_estimate *= 4.0f;
+            if (type_dst == GGML_TYPE_Q2_0) {
+                // Q2_0 uses amax as its step, which is about 1 for these inputs.
+                err_estimate = 1.0f;
             }
             if (type_dst == GGML_TYPE_Q5_0 || type_dst == GGML_TYPE_Q5_1) {
                 err_estimate /= 2.0f;
