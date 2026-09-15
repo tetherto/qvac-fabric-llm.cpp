@@ -124,6 +124,58 @@ __global__ void pack_quantize_activations(
     }
 }
 
+// Batch-1 gate/up receives one activation row broadcast over all selected
+// experts. Quantize each 128-element K block once, then fan it out to the
+// expert-local rows expected by DeepGEMM. The generic kernel above instead
+// repeats the quantization once per assignment.
+__global__ void pack_quantize_broadcast_b1(
+        const float * x,
+        const int32_t * ids,
+        int32_t * counts,
+        int32_t * assignment_rows,
+        uint8_t * a_fp8,
+        float * sfa,
+        int k,
+        int top_k,
+        int m_blocked,
+        int expert_offset,
+        int n_groups) {
+    const int kb = blockIdx.x;
+    const int col = kb * DG_SCALE_K + threadIdx.x;
+    const float value = x[col];
+    const float amax = fmaxf(block_abs_max<128>(value), 1.0e-4f);
+    const float scale = amax / 448.0f;
+    const uint8_t quantized = fp32_to_e4m3(value / scale);
+    const int scale_k = k / DG_SCALE_K;
+
+    for (int slot = 0; slot < top_k; ++slot) {
+        const int routed_expert = ids[slot] - expert_offset;
+        if (routed_expert < 0 || routed_expert >= n_groups) {
+            if (kb == 0 && threadIdx.x == 0) {
+                assignment_rows[slot] = -1;
+            }
+            continue;
+        }
+
+        // TOP_K normally produces unique IDs. Retain correct MUL_MAT_ID
+        // semantics for duplicate IDs by assigning successive rows.
+        int row = 0;
+        for (int previous = 0; previous < slot; ++previous) {
+            row += ids[previous] - expert_offset == routed_expert;
+        }
+        const int packed_row = routed_expert * m_blocked + row;
+
+        if (threadIdx.x == 0) {
+            sfa[(routed_expert * scale_k + kb) * m_blocked + row] = scale;
+            if (kb == 0) {
+                assignment_rows[slot] = packed_row;
+                counts[routed_expert] = row + 1;
+            }
+        }
+        a_fp8[static_cast<size_t>(packed_row) * k + col] = quantized;
+    }
+}
+
 __global__ void quantize_weights(
         const __nv_bfloat16 * weights,
         const int32_t * counts,
@@ -410,6 +462,11 @@ bool runtime_enabled() {
     return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
 }
 
+bool broadcast_b1_pack_enabled() {
+    const char * value = std::getenv("GGML_CUDA_DEEPGEMM_B1_PACK");
+    return value == nullptr || value[0] == '\0' || std::strcmp(value, "0") != 0;
+}
+
 bool mul_mat_id_supported(const ggml_tensor * dst, int device) {
     if (dst == nullptr || dst->src[0] == nullptr || dst->src[1] == nullptr || dst->src[2] == nullptr) {
         return false;
@@ -550,22 +607,37 @@ bool ggml_cuda_deepgemm_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor 
 
     const int64_t x_stride_slot =
         x->ne[1] == 1 ? 0 : static_cast<int64_t>(x->nb[1] / sizeof(float));
-    pack_quantize_activations<<<assignments, 128, 0, stream>>>(
-        static_cast<const float *>(x->data),
-        static_cast<const int32_t *>(ids->data),
-        counts.ptr,
-        assignment_rows.ptr,
-        a_fp8.ptr,
-        sfa.ptr,
-        k,
-        top_k,
-        n_tokens,
-        m_blocked,
-        x_stride_slot,
-        static_cast<int64_t>(x->nb[2] / sizeof(float)),
-        static_cast<int64_t>(ids->nb[1] / sizeof(int32_t)),
-        expert_offset,
-        n_groups);
+    if (n_tokens == 1 && x_stride_slot == 0 && broadcast_b1_pack_enabled()) {
+        pack_quantize_broadcast_b1<<<scale_k, 128, 0, stream>>>(
+            static_cast<const float *>(x->data),
+            static_cast<const int32_t *>(ids->data),
+            counts.ptr,
+            assignment_rows.ptr,
+            a_fp8.ptr,
+            sfa.ptr,
+            k,
+            top_k,
+            m_blocked,
+            expert_offset,
+            n_groups);
+    } else {
+        pack_quantize_activations<<<assignments, 128, 0, stream>>>(
+            static_cast<const float *>(x->data),
+            static_cast<const int32_t *>(ids->data),
+            counts.ptr,
+            assignment_rows.ptr,
+            a_fp8.ptr,
+            sfa.ptr,
+            k,
+            top_k,
+            n_tokens,
+            m_blocked,
+            x_stride_slot,
+            static_cast<int64_t>(x->nb[2] / sizeof(float)),
+            static_cast<int64_t>(ids->nb[1] / sizeof(int32_t)),
+            expert_offset,
+            n_groups);
+    }
     CUDA_CHECK(cudaGetLastError());
 
     if (!native_fp8) {

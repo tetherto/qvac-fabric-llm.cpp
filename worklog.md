@@ -1211,3 +1211,42 @@ The device-map artifacts are:
 
 - `/home/aman/qwen4-exp-opt-bench-20260911/results/qsa-block-20260915/qsa-block-device-map-d32768.nsys-rep`
 - `/home/aman/qwen4-exp-opt-bench-20260911/results/qsa-block-20260915/qsa-block-device-map-d32768.sqlite`
+
+## 2026-09-16: batch-1 DeepGEMM broadcast packing
+
+The merged gate/up `MUL_MAT_ID` receives one activation row broadcast over the
+ten selected experts during batch-1 decode. The generic DeepGEMM pack kernel
+previously loaded and FP8-quantized that same 2,560-element row independently
+for every selected expert. A batch-1 specialization now quantizes each
+128-element K block once and fans the result out to the selected expert rows.
+The down projection keeps the generic path because its ten expert activations
+are distinct. Set `GGML_CUDA_DEEPGEMM_B1_PACK=0` only to disable the automatic
+specialization for A/B testing.
+
+The existing H100 CPU-reference tests passed 4/4 on physical GPU 6, including
+one- and two-token gate/up and down shapes. Full 32K-context tensor/EP runs on
+physical GPUs 6/7 also completed. End-to-end samples were too affected by host
+drift to assign a reliable throughput percentage: candidate warmed final-three
+means were 60.69 and 53.39 tok/s, while the adjacent disabled controls were
+54.75 and 51.15 tok/s. Do not cite the one fast candidate as a 10% gain.
+
+The exact final-128-token CUDA trace gives a stable device-side attribution:
+
+| pack path, summed over GPUs 6/7 | launches | GPU time |
+| --- | ---: | ---: |
+| prior generic gate/up + down | 24,576 | 184.597 ms |
+| new broadcast gate/up | 12,288 | 42.795 ms |
+| unchanged generic down | 12,288 | 50.285 ms |
+| new combined total | 24,576 | 93.080 ms |
+
+Combined activation packing falls by 49.6%, saving 91.517 ms of summed GPU
+kernel time over 128 tokens. The saving is symmetric across ranks and is about
+0.357 ms/token after dividing by two concurrently executing GPUs. Against the
+roughly 16.8 ms/token healthy baseline this bounds the expected end-to-end gain
+near 2%, rather than the noisy bracket's larger apparent change.
+
+Artifacts are under:
+
+- `/home/aman/qwen4-exp-opt-bench-20260911/results/decode-b1-pack-20260916/`
+- `candidate-nsys.nsys-rep` and `candidate-nsys.sqlite`
+- `control-1.jsonl`, `candidate.jsonl`, `control-2.jsonl`, and `candidate-2.jsonl`
