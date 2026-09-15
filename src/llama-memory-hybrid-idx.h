@@ -171,12 +171,18 @@ public:
     //   cell_blk  I32 [n_kv, ns]           block each cell belongs to
     //   blk_cells I32 [ratio*n_blocks, ns] cells making up each block
     //   blk_pos   I32 [4*n_blocks*ns]      mrope position rows of each block's first token
+    //   block_cells I32 [ratio*n_blocks, ns] physical cells for block-top-k expansion;
+    //               batch-1 decode may append one forced sentinel row holding the live tail
+    //   tail_cells  I32 [ratio-1, n_tokens/ns, ns] visible incomplete-tail cells, -1 padded;
+    //               nullptr when the tail is carried by the batch-1 sentinel row
     //   bias      F32 [n_kv, n_tokens/ns, ns] -inf where invisible, large where always visible
-    // blk_bias asks for the bias per block instead: [n_blocks, n_tokens/ns, ns]
+    // blk_bias asks for the bias per block instead: [n_blocks, n_tokens/ns, ns],
+    // or [n_blocks+1, 1, ns] for the batch-1 sentinel form
     // the caller then adds the attention mask, the only part of the bias that varies within a block
     void set_input_qsa(ggml_tensor * cell_blk, ggml_tensor * blk_cells, ggml_tensor * blk_pos,
+                       ggml_tensor * block_cells, ggml_tensor * tail_cells,
                        ggml_tensor * bias, const llama_ubatch * ubatch, uint32_t ratio,
-                       bool blk_bias,
+                       bool blk_bias, bool block_topk,
                        ggml_tensor * dirty_cells = nullptr,
                        ggml_tensor * dirty_pos   = nullptr,
                        ggml_tensor * dirty_rows  = nullptr) const;

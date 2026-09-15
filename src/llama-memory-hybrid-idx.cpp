@@ -613,10 +613,13 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
         ggml_tensor * cell_blk,
         ggml_tensor * blk_cells,
         ggml_tensor * blk_pos,
+        ggml_tensor * block_cells,
+        ggml_tensor * tail_cells,
         ggml_tensor * bias,
         const llama_ubatch * ubatch,
         uint32_t ratio,
         bool blk_bias,
+        bool block_topk,
         ggml_tensor * dirty_cells,
         ggml_tensor * dirty_pos,
         ggml_tensor * dirty_rows) const {
@@ -624,21 +627,30 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
     GGML_ASSERT(mem != nullptr && mem->get_mem_idx() != nullptr);
     GGML_ASSERT(can_use_qsa(*ubatch));
 
-    GGML_ASSERT(ggml_backend_buffer_is_host(cell_blk->buffer));
+    GGML_ASSERT(cell_blk == nullptr || ggml_backend_buffer_is_host(cell_blk->buffer));
 
-    const int64_t n_kv     = cell_blk->ne[0];
-    const int64_t n_ns     = cell_blk->ne[1];        // streams in this ubatch
+    const int64_t n_kv     = get_idx()->get_n_kv();
+    const int64_t n_ns     = cell_blk != nullptr ? cell_blk->ne[1] : block_cells->ne[1];
     const int64_t n_tokens = ubatch->n_tokens;
     const int64_t r        = ratio;
     const int64_t n_blocks = (n_kv + r - 1)/r;
 
     GGML_ASSERT(n_tokens % n_ns == 0);
     const int64_t n_tps = n_tokens/n_ns;             // tokens per stream
+    const bool block_sentinel = block_topk && tail_cells == nullptr;
+    const int64_t n_map_blocks = block_cells != nullptr ? block_cells->ne[0]/r : 0;
 
-    int32_t * dst_cell_blk  = (int32_t *) cell_blk->data;
+    int32_t * dst_cell_blk  = cell_blk != nullptr ? (int32_t *) cell_blk->data : nullptr;
     int32_t * dst_blk_cells = blk_cells != nullptr ? (int32_t *) blk_cells->data : nullptr;
     int32_t * dst_blk_pos   = blk_pos   != nullptr ? (int32_t *) blk_pos->data   : nullptr;
+    int32_t * dst_block_cells = block_cells != nullptr ? (int32_t *) block_cells->data : nullptr;
+    int32_t * dst_tail_cells  = tail_cells  != nullptr ? (int32_t *) tail_cells->data  : nullptr;
     float   * dst_bias      = (float   *) bias->data;
+
+    GGML_ASSERT(block_cells == nullptr || block_cells->ne[0] % r == 0);
+    GGML_ASSERT(!block_topk || (blk_bias && dst_block_cells != nullptr));
+    GGML_ASSERT(!block_sentinel || (n_tps == 1 && n_map_blocks == n_blocks + 1));
+    GGML_ASSERT(!block_topk || block_sentinel || n_map_blocks == n_blocks);
 
     // block b covers [b*ratio, (b+1)*ratio), so its first token is at b*ratio
     // multimodal sequences bypass QSA; their temporal positions do not count tokens
@@ -662,16 +674,22 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
         const llama_seq_id seq_of_stream = ubatch->seq_id[s*n_tps][0];
         const auto & cells = mem->get_mem_idx()->get_cells(seq_of_stream);
 
-        int32_t * cur_cell_blk = dst_cell_blk + s*n_kv;
+        int32_t * cur_cell_blk = dst_cell_blk != nullptr ? dst_cell_blk + s*n_kv : nullptr;
         int32_t * cur_blk_cells = dst_blk_cells != nullptr
             ? dst_blk_cells + s*(r*n_blocks)
             : local_blk_cells.data();
+        int32_t * cur_block_cells = dst_block_cells != nullptr
+            ? dst_block_cells + s*(r*n_map_blocks)
+            : nullptr;
 
         // an incomplete block cannot be pooled; the bias below forces those tail cells in
         // -1 means no usable block, and block 0 only keeps the gather in range
         std::fill(blk_of.begin(),  blk_of.end(),  -1);
         std::fill(filled.begin(),  filled.end(),   0);
         std::fill(cur_blk_cells, cur_blk_cells + r*n_blocks, 0);
+        if (cur_block_cells != nullptr) {
+            std::fill(cur_block_cells, cur_block_cells + r*n_map_blocks, -1);
+        }
 
         // a cell no block covers needs its own -inf, which a per-block bias cannot carry
         // every cache path keeps the position below the cell window, so this stays false
@@ -695,6 +713,14 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
             filled[b]++;
         }
 
+        if (cur_block_cells != nullptr) {
+            for (int64_t b = 0; b < n_blocks; ++b) {
+                if (filled[b] == r) {
+                    std::copy_n(cur_blk_cells + b*r, r, cur_block_cells + b*r);
+                }
+            }
+        }
+
         GGML_ASSERT((!blk_bias || !oor) && "qsa: cell position runs past the cell window");
 
         // per-block mode keeps an unpooled cell's real block, so the block's own -inf reaches it
@@ -703,7 +729,9 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
             if (blk_of[j] >= 0 && filled[blk_of[j]] < r && !blk_bias) {
                 blk_of[j] = -1;
             }
-            cur_cell_blk[j] = blk_of[j] < 0 ? 0 : blk_of[j];
+            if (cur_cell_blk != nullptr) {
+                cur_cell_blk[j] = blk_of[j] < 0 ? 0 : blk_of[j];
+            }
         }
 
         if (dirty_cells != nullptr) {
@@ -757,14 +785,39 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
             // the tail is an incomplete block and is always visible, as in the reference
             const llama_pos tail_start = (q + 1)/r*r;
 
+            if (dst_tail_cells != nullptr || block_sentinel) {
+                int32_t * cur_tail = dst_tail_cells != nullptr
+                    ? dst_tail_cells + i*(r - 1)
+                    : cur_block_cells + n_blocks*r;
+                const int64_t tail_width = dst_tail_cells != nullptr ? r - 1 : r;
+                std::fill(cur_tail, cur_tail + tail_width, -1);
+
+                const int64_t tail_block = tail_start/r;
+                if (tail_block < n_blocks) {
+                    for (int64_t j = 0; j < r - 1 && tail_start + j <= q; ++j) {
+                        const int32_t cell = cur_blk_cells[tail_block*r + j];
+                        if (!cells.is_empty(cell) && cells.seq_has(cell, seq_id) &&
+                                cells.pos_get(cell) == tail_start + j) {
+                            cur_tail[j] = cell;
+                        }
+                    }
+                }
+            }
+
             if (blk_bias) {
                 // a block sits wholly inside or outside the tail, so one value covers it
                 // the caller adds the attention mask, which drops empty, foreign and future cells
-                float * cur_blk_bias = dst_bias + i*n_blocks;
+                const int64_t n_bias = bias->ne[0];
+                float * cur_blk_bias = dst_bias + i*n_bias;
 
                 for (int64_t b = 0; b < n_blocks; ++b) {
                     // finite, so it can never meet a -inf and produce a nan
-                    cur_blk_bias[b] = b*r >= tail_start ? 1e9f : (filled[b] < r ? -INFINITY : 0.0f);
+                    cur_blk_bias[b] = block_topk
+                        ? (b*r >= tail_start || filled[b] < r ? -INFINITY : 0.0f)
+                        : (b*r >= tail_start ? 1e9f : (filled[b] < r ? -INFINITY : 0.0f));
+                }
+                if (block_sentinel) {
+                    cur_blk_bias[n_blocks] = 1e9f;
                 }
 
                 continue;

@@ -1059,3 +1059,118 @@ therefore cannot close the SGLang gap.
 
 The temporary llama-bench CUDA-profiler marker and concurrent-launch override
 were removed after measurement. No experiment-only source changes remain.
+
+## 2026-09-15: batch-1 hybrid tensor/expert-parallel prototype
+
+An opt-in Qwen4Exp path now keeps the dense, attention, and recurrent graph in
+the existing tensor-parallel layout while splitting the 512 routed experts
+256/256 across two equally weighted GPUs. Enable it with
+`LLAMA_QWEN4EXP_EXPERT_PARALLEL=1`; the normal `-sm tensor -ts 1/1` behavior is
+unchanged when the variable is absent.
+
+The Meta backend carries a full-shaped `EXPERT` intermediate whose nonzero
+expert slots are disjoint across ranks. This lets gate/up, its views, and
+SwiGLU stay local. The down `MUL_MAT_ID` produces a normal partial hidden-state
+tensor, so the existing delayed MoE reduction performs one all-reduce after
+weighting and summing expert slots rather than between the two projections.
+Each simple `MUL_MAT_ID` receives its global expert offset; the DeepGEMM pack
+kernel translates global IDs to the local 256-expert table and its scatter
+writes zero for nonlocal assignments.
+
+This is an A/B experiment, not an assumed win. The average MoE FLOP count and
+collective count are close to ordinary tensor parallelism. Potential gains are
+the native full-I=640 DeepGEMM shapes and the smaller per-rank expert table;
+the main risk is stochastic 5/5 routing imbalance at batch size one.
+
+Validation completed on physical H100 GPU 6 or GPUs 6/7:
+
+- local CPU build plus `test-llama-archs --arch qwen4exp` passed
+- the remote SM90 build of `llama-bench` and `test-backend-ops` passed
+- focused DeepGEMM gate/up and down correctness passed 4/4 for one- and
+  two-token shapes
+- a deterministic 24-token greedy completion matched the ordinary tensor path
+  token for token
+
+Warmed TG128 A/B results:
+
+| context | ordinary tensor final four | hybrid TP/EP final four | gain |
+| --- | ---: | ---: | ---: |
+| depth zero | 58.2616 tok/s | 65.8878 tok/s | +13.09% |
+| after 32K | 51.4206 tok/s | 59.6422 tok/s | +15.99% |
+
+The last three 32K samples were especially stable: 51.6313, 51.6359, and
+51.6364 tok/s for ordinary tensor parallelism versus 60.1901, 60.4585, and
+60.4834 tok/s for hybrid TP/EP. Their means are 51.6345 and 60.3773 tok/s,
+respectively, a 16.93% improvement. Stable PP2048 changed only modestly, from
+5737.34 to 5803.66 tok/s (+1.16%), as expected for an optimization aimed at
+small-token expert GEMMs.
+
+## 2026-09-15: compressed QSA block selection experiment
+
+`LLAMA_QSA_BLOCK_TOPK=1` is an opt-in exact-block selector for the current
+ratio-4 QSA layout. It ranks 512 complete blocks instead of sorting 2051 token
+cells, expands the winning blocks through a physical-cell map, and appends the
+three-cell incomplete tail. Negative fixed-width padding is supported by the
+CPU and CUDA `SET_ROWS` implementations. The block map, incomplete tail, bias,
+and graph composition have focused CPU/CUDA tests, and the 4K model graph now
+runs end to end under the Meta backend.
+
+The first 32K A/B shows that this graph is not yet a decode optimization:
+
+| block selector | ordinary tensor TG128 | hybrid TP/EP TG128 | stable PP2048 |
+| --- | ---: | ---: | ---: |
+| disabled | 51.6345 tok/s | 60.3773 tok/s | 5737 / 5804 tok/s |
+| enabled | 43.5151 tok/s | 49.3197 tok/s | 6284 / 6575 tok/s |
+
+These are last-three stable means. The compressed selector improves prefill
+by about 9.5% without EP and 13.3% with EP relative to the corresponding
+disabled run, but regresses decode by roughly 16-18%. It therefore remains off by
+default. The next step is an Nsight A/B of the selector subgraph; likely targets
+are the `GET_ROWS` expansion and `CONCAT`/layout chain rather than the reduced
+top-k width itself.
+
+## 2026-09-16: compressed QSA batch-1 tensor-split recovery
+
+Nsight showed that the first compressed-selector graph paid for a generic I32
+`GET_ROWS` launch whose 256-thread block copied only one four-I32 row. A compact
+`k_get_rows_i32_x4` path now assigns one aligned `int4` row to each thread. The
+focused `TOPK_QSA_BLOCKS` CUDA test passes on physical H100 GPU 6. This change
+mainly recovers prefill: the gather is only 32.5 ms across 14,100 QSA-layer
+invocations in the final profile.
+
+The remaining batch-1 regression came from the separately uploaded
+three-cell live-tail input. Across 24 QSA layers it repeatedly split the Meta
+graph, producing extra host copies and stream synchronizations. Batch-1 decode
+now appends one sentinel row to the existing block map, stores the live tail in
+that row with `-1` padding, gives its pooled score a finite forced bias, and
+selects 513 blocks. The resulting 2052 cell indices contain the same 512
+complete blocks and at most three live tail cells; sparse attention ignores the
+one padded index. Prefill retains the separate per-query tail representation.
+
+Adjacent five-repetition FP8 measurements at 32K context on physical H100 GPUs
+6/7 used `-sm tensor -ts 1/1`, hybrid expert parallelism, ubatch 2048, CPU PLE,
+DeepGEMM `MUL_MAT_ID`, separate-state SSM convolution, and the FlashInfer GDN
+adapter:
+
+| mode | PP2048 warmed last two | TG128 warmed last three |
+| --- | ---: | ---: |
+| QSA token selector control | 5821.73 tok/s | 56.0721 tok/s |
+| compressed block selector + sentinel | 7001.81 tok/s | 61.3449 tok/s |
+
+This is +20.27% PP2048 and +9.40% batch-1 decode in the adjacent A/B. Relative
+to the pre-sentinel compressed result (49.9258 tok/s), decode recovered 22.87%.
+The block selector remains opt-in through `LLAMA_QSA_BLOCK_TOPK=1`.
+
+A complete steady TG128 repetition in the old and new Nsight captures had:
+
+| compressed path | `cudaMemcpyAsync` | `cudaStreamSynchronize` |
+| --- | ---: | ---: |
+| separate tail | 10405 (81.3/token) | 26660 (208.3/token) |
+| sentinel tail | 6656 (52.0/token) | 17413 (136.0/token) |
+
+The sentinel therefore removes 36.0% of the async-copy calls and 34.7% of the
+stream synchronizations while leaving the 3072 expected compact gathers (24
+QSA layers x 128 tokens). The winning trace and SQLite export are:
+
+- `/home/aman/qwen4-exp-opt-bench-20260911/results/qsa-block-20260915/qsa-block-sentinel-d32768.nsys-rep`
+- `/home/aman/qwen4-exp-opt-bench-20260911/results/qsa-block-20260915/qsa-block-sentinel-d32768.sqlite`

@@ -2494,9 +2494,10 @@ struct test_set_rows : public test_case {
     const std::array<int, 2> nr23; // broadcast only dims 2 and 3
     const int r; // rows to set
     const bool v; // view (non-contiguous src1)
+    const bool negative_pad; // first row index is fixed-width padding
 
     std::string vars() override {
-        return VARS_TO_STR7(type_src, type_dst, type_idx, ne, nr23, r, v);
+        return VARS_TO_STR8(type_src, type_dst, type_idx, ne, nr23, r, v, negative_pad);
     }
 
     test_set_rows(ggml_type type_src,
@@ -2504,8 +2505,9 @@ struct test_set_rows : public test_case {
             ggml_type type_idx,
             std::array<int64_t, 4> ne,
             std::array<int, 2> nr23,
-            int r, bool v = false)
-        : type_src(type_src), type_dst(type_dst), type_idx(type_idx), ne(ne), nr23(nr23), r(r), v(v) {}
+            int r, bool v = false, bool negative_pad = false)
+        : type_src(type_src), type_dst(type_dst), type_idx(type_idx), ne(ne), nr23(nr23), r(r), v(v),
+          negative_pad(negative_pad) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * dst = ggml_new_tensor_4d(ctx, type_dst, ne[0], ne[1], ne[2]*nr23[0], ne[3]*nr23[1]);
@@ -2536,6 +2538,15 @@ struct test_set_rows : public test_case {
             }
             if (t->type == GGML_TYPE_I64 || t->type == GGML_TYPE_I32) {
                 init_set_rows_row_ids(t, ne[1]);
+                if (negative_pad) {
+                    if (t->type == GGML_TYPE_I32) {
+                        const int32_t pad = -1;
+                        ggml_backend_tensor_set(t, &pad, 0, sizeof(pad));
+                    } else {
+                        const int64_t pad = -1;
+                        ggml_backend_tensor_set(t, &pad, 0, sizeof(pad));
+                    }
+                }
             } else {
                 init_tensor_uniform(t);
             }
@@ -7304,6 +7315,110 @@ struct test_topk_qsa : public test_case {
     }
 };
 
+// qwen4exp long-context path: top-k blocks, expand them to physical cells,
+// append the incomplete tail, and build the portable sparse mask.
+struct test_topk_qsa_blocks : public test_case {
+    const int64_t n_blocks;
+    const int64_t n_tps;
+    const bool sentinel;
+    static constexpr int64_t ratio = 4;
+    static constexpr int64_t n_block_top_k = 512;
+    ggml_tensor * out {};
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "TOPK_QSA_BLOCKS";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR3(n_blocks, n_tps, sentinel);
+    }
+
+    test_topk_qsa_blocks(int64_t n_blocks = 1024, int64_t n_tps = 2, bool sentinel = false)
+        : n_blocks(n_blocks), n_tps(n_tps), sentinel(sentinel) {
+        GGML_ASSERT(n_blocks >= n_block_top_k);
+        GGML_ASSERT(!sentinel || n_tps == 1);
+    }
+
+    double max_err() override { return 0.0; }
+    bool run_whole_graph() override { return true; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t n_kv = ratio*n_blocks;
+        const int64_t n_score_blocks = n_blocks + (sentinel ? 1 : 0);
+        const int64_t n_selected_blocks = n_block_top_k + (sentinel ? 1 : 0);
+        const int64_t width = ratio*n_selected_blocks + (sentinel ? 0 : ratio - 1);
+
+        ggml_tensor * score = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_score_blocks, n_tps, 1);
+        ggml_set_name(score, "score");
+        ggml_tensor * block_cells =
+            ggml_new_tensor_4d(ctx, GGML_TYPE_I32, ratio, n_score_blocks, 1, 1);
+        ggml_set_name(block_cells, "block_cells");
+
+        ggml_tensor * blocks = ggml_cont(ctx, ggml_top_k(ctx, score, n_selected_blocks));
+        blocks = ggml_reshape_3d(ctx, blocks, n_selected_blocks*n_tps, 1, 1);
+        ggml_tensor * selected = ggml_get_rows(ctx, block_cells, blocks);
+        selected = ggml_reshape_4d(ctx, selected, ratio*n_selected_blocks, n_tps, 1, 1);
+        ggml_tensor * indices = selected;
+        if (!sentinel) {
+            ggml_tensor * tail =
+                ggml_new_tensor_4d(ctx, GGML_TYPE_I32, ratio - 1, n_tps, 1, 1);
+            ggml_set_name(tail, "tail");
+            indices = ggml_concat(ctx, selected, tail, 0);
+        }
+
+        ggml_tensor * mask = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, n_kv, n_tps, 1);
+        ggml_set_name(mask, "mask");
+        ggml_tensor * zeros = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, width, n_tps, 1);
+        ggml_set_name(zeros, "zeros");
+        out = ggml_set_rows(ctx, mask, zeros, indices);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->op != GGML_OP_NONE) {
+                continue;
+            }
+            if (strcmp(t->name, "score") == 0) {
+                std::vector<float> data(ggml_nelements(t));
+                for (int64_t i = 0; i < (int64_t) data.size(); ++i) {
+                    data[i] = (float) i;
+                }
+                if (sentinel) {
+                    data[n_blocks] = 1e9f;
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(float));
+            } else if (strcmp(t->name, "block_cells") == 0) {
+                std::vector<int32_t> data(ggml_nelements(t));
+                for (int64_t i = 0; i < (int64_t) data.size(); ++i) {
+                    data[i] = (int32_t) i;
+                }
+                if (sentinel) {
+                    data[n_blocks*ratio + 0] = 0;
+                    data[n_blocks*ratio + 1] = 1;
+                    data[n_blocks*ratio + 2] = -1;
+                    data[n_blocks*ratio + 3] = -1;
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(int32_t));
+            } else if (strcmp(t->name, "tail") == 0) {
+                std::vector<int32_t> data(ggml_nelements(t), -1);
+                for (int64_t i = 0; i < n_tps; ++i) {
+                    data[i*(ratio - 1)] = (int32_t) i;
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(int32_t));
+            } else if (strcmp(t->name, "mask") == 0) {
+                std::vector<float> data(ggml_nelements(t), -INFINITY);
+                ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(float));
+            } else if (strcmp(t->name, "zeros") == 0) {
+                std::vector<float> data(ggml_nelements(t), 0.0f);
+                ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(float));
+            }
+        }
+    }
+};
+
 enum MoeGatingFunc {
     GATING_FUNC_SOFTMAX,
     GATING_FUNC_SIGMOID,
@@ -9877,7 +9992,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     test_cases.emplace_back(new test_set_rows(GGML_TYPE_F32, GGML_TYPE_F32, GGML_TYPE_I64, { 1, 8, 1, 3 }, { 1, 1 }, 2, false));
     test_cases.emplace_back(new test_set_rows(GGML_TYPE_F32, GGML_TYPE_F32, GGML_TYPE_I32, { 1, 8, 1, 3 }, { 1, 1 }, 2, false));
+    test_cases.emplace_back(new test_set_rows(GGML_TYPE_F32, GGML_TYPE_F32, GGML_TYPE_I64, { 4, 8, 1, 1 }, { 1, 1 }, 3, false, true));
+    test_cases.emplace_back(new test_set_rows(GGML_TYPE_F32, GGML_TYPE_F32, GGML_TYPE_I32, { 4, 8, 1, 1 }, { 1, 1 }, 3, false, true));
     test_cases.emplace_back(new test_set_rows(GGML_TYPE_F32, GGML_TYPE_Q8_0, GGML_TYPE_I32, { 256, 5, 1, 3 }, { 1, 1, }, 1, false));
+    test_cases.emplace_back(new test_set_rows(GGML_TYPE_F32, GGML_TYPE_Q8_0, GGML_TYPE_I32, { 256, 5, 1, 1 }, { 1, 1, }, 2, false, true));
     for (ggml_type src_type : {GGML_TYPE_F16, GGML_TYPE_F32}) {
         for (ggml_type type : all_types) {
             for (int b : {1, 7}) {
@@ -11378,6 +11496,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_topk_qsa(512,  2048,  2, 1, 1500));
     test_cases.emplace_back(new test_topk_qsa(256,  2048,  4, 2, 2000));
     test_cases.emplace_back(new test_topk_qsa(64,   256,   2, 1, 200));  // small k: unfused fallback
+    test_cases.emplace_back(new test_topk_qsa_blocks(1024, 2));
+    test_cases.emplace_back(new test_topk_qsa_blocks(1024, 1, true));
 
     // exhaustive top_k tests
     //for (int i = 1; i < 9999; ++i) {

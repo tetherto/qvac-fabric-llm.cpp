@@ -129,6 +129,34 @@ static __global__ void k_get_rows_float_vec(
     }
 }
 
+// Four-I32 rows are used to expand QSA block IDs to physical KV-cache cells.
+// The generic vector path launches one 256-thread block per row even though
+// only one thread copies its int4.  Assign one row to each thread instead.
+static __global__ void k_get_rows_i32_x4(
+        const int32_t * src0_ptr, const int32_t * src1_ptr, int32_t * dst_ptr,
+        const int64_t ne10, const int64_t ne11, const uint3 ne12_fdv,
+        const size_t s1, const size_t s2, const size_t s3,
+        const size_t nb01, const size_t nb02, const size_t nb03,
+        const size_t s10, const size_t s11, const size_t s12) {
+
+    ggml_cuda_pdl_lc();
+    ggml_cuda_pdl_sync();
+    const int64_t n_rows = ne10*ne11*(int64_t) ne12_fdv.z;
+    for (int64_t row = (int64_t) blockIdx.x*blockDim.x + threadIdx.x;
+            row < n_rows; row += (int64_t) gridDim.x*blockDim.x) {
+        const int i10 = row % ne10;
+        const uint2 dm = fast_div_modulo((uint32_t) (row/ne10), ne12_fdv);
+        const int i11 = dm.x;
+        const int i12 = dm.y;
+        const int i01 = src1_ptr[i10*s10 + i11*s11 + i12*s12];
+
+        int32_t * GGML_CUDA_RESTRICT dst_row = dst_ptr + i10*s1 + i11*s2 + i12*s3;
+        const int32_t * GGML_CUDA_RESTRICT src0_row = (const int32_t *)
+            ((const char *) src0_ptr + i01*nb01 + i11*nb02 + i12*nb03);
+        *reinterpret_cast<int4 *>(dst_row) = *reinterpret_cast<const int4 *>(src0_row);
+    }
+}
+
 template<typename grad_t, typename dst_t>
 static __global__ void k_get_rows_back_float(
         const grad_t * __restrict__ grad, const int32_t * __restrict__ rows, dst_t * __restrict__ dst,
@@ -264,6 +292,28 @@ static void get_rows_cuda_float(
     GGML_ASSERT(ne12 > 0);
     GGML_ASSERT(ne11 <= std::numeric_limits<uint32_t>::max() / ne12);
     const uint3 ne12_fdv = init_fastdiv_values(ne12);
+
+    if constexpr (std::is_same<src0_t, int32_t>::value && std::is_same<dst_t, int32_t>::value) {
+        const bool can_copy_x4 = ne00 == 4 &&
+            (nb01 % 16 == 0) && (nb02 % 16 == 0) && (nb03 % 16 == 0) &&
+            (nb1  % 16 == 0) && (nb2  % 16 == 0) && (nb3  % 16 == 0) &&
+            (((uintptr_t) src0_d) % 16 == 0) && (((uintptr_t) dst_d) % 16 == 0);
+        if (can_copy_x4) {
+            const int64_t n_rows = ne10*ne11*ne12;
+            const int block_count = MIN((n_rows + CUDA_GET_ROWS_BLOCK_SIZE - 1) / CUDA_GET_ROWS_BLOCK_SIZE,
+                                        (int64_t) UINT16_MAX);
+            const dim3 block_nums(block_count, 1, 1);
+            const ggml_cuda_kernel_launch_params launch_params =
+                ggml_cuda_kernel_launch_params{block_nums, block_dims, 0, stream};
+            ggml_cuda_kernel_launch(k_get_rows_i32_x4, launch_params,
+                (const int32_t *) src0_d, src1_d, (int32_t *) dst_d,
+                ne10, ne11, ne12_fdv,
+                s1, s2, s3,
+                nb01, nb02, nb03,
+                s10, s11, s12);
+            return;
+        }
+    }
 
     if constexpr (std::is_same<src0_t, dst_t>::value) {
         constexpr int VEC = 16 / sizeof(dst_t);

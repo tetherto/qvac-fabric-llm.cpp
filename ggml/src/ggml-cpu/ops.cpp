@@ -5771,7 +5771,11 @@ static void ggml_compute_forward_set_rows_impl(
 
                 const int64_t i1 = *(idx_t *) ((char *) src1->data + i10*nb10 + i11*nb11 + i12*nb12);
 
-                GGML_ASSERT(i1 >= 0 && i1 < ne1);
+                // Negative rows are padding for fixed-width sparse index lists.
+                if (i1 < 0) {
+                    continue;
+                }
+                GGML_ASSERT(i1 < ne1);
 
                 if constexpr (std::is_same_v<src_t, float>) {
                     from_float(

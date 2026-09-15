@@ -2,6 +2,8 @@
 #include "llama-io.h"
 #include "llama-model.h"
 
+#include <array>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <memory>
@@ -237,8 +239,130 @@ static void test_fallback(bool unified) {
     GGML_ASSERT(mem.can_use_qsa(next));
 }
 
+static void test_block_topk_inputs() {
+    llama_model model(llama_model_default_params());
+    auto & hp = model.hparams;
+    hp.n_layer_all = 1;
+    hp.n_embd = 64;
+    hp.n_head_arr[0] = 1;
+    hp.n_head_kv_arr[0] = 1;
+    hp.n_embd_head_k_full = 64;
+    hp.n_embd_head_v_full = 64;
+    hp.n_rot_full = 64;
+    hp.rope_type = LLAMA_ROPE_TYPE_IMROPE;
+    hp.rope_sections = { 16, 24, 24, 0 };
+    hp.indexer_head_size = 64;
+    hp.dsv4_compress_ratios[0] = 4;
+
+    llama_memory_hybrid_idx mem(model,
+            GGML_TYPE_F32, GGML_TYPE_F32, false, 64, 1, 0, LLAMA_SWA_TYPE_NONE,
+            GGML_TYPE_F32, GGML_TYPE_F32, 3, 3, 4, false, true,
+            [](int32_t) { return true; }, [](int32_t) { return false; }, [](int32_t) { return true; });
+
+    auto batch = make_batch(0, 0, 6);
+    std::vector<llama_ubatch> batches = { batch };
+    GGML_ASSERT(mem.get_mem_recr()->prepare(batches));
+    auto slots = mem.get_mem_attn()->prepare(batches);
+    GGML_ASSERT(!slots.empty());
+
+    llama_memory_hybrid_idx_context mctx(&mem, slots, slots, batches);
+    GGML_ASSERT(mctx.apply());
+
+    ggml_init_params ip = {
+        /*.mem_size   =*/ 16*1024,
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+    ggml_context_ptr ctx(ggml_init(ip));
+    GGML_ASSERT(ctx);
+
+    constexpr int64_t n_kv = 64;
+    constexpr int64_t ratio = 4;
+    constexpr int64_t n_blocks = n_kv/ratio;
+    constexpr int64_t n_tokens = 6;
+
+    ggml_tensor * cell_blk    = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_I32, n_kv, 1);
+    ggml_tensor * block_cells = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_I32, ratio*n_blocks, 1);
+    ggml_tensor * tail_cells  = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_I32, ratio - 1, n_tokens, 1);
+    ggml_tensor * bias        = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, n_blocks, n_tokens, 1);
+    ggml_tensor * sentinel_cells = ggml_new_tensor_2d(
+            ctx.get(), GGML_TYPE_I32, ratio*(n_blocks + 1), 1);
+    ggml_tensor * sentinel_bias = ggml_new_tensor_3d(
+            ctx.get(), GGML_TYPE_F32, n_blocks + 1, 1, 1);
+
+    ggml_backend_buffer_ptr buf(
+            ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), ggml_backend_cpu_buffer_type()));
+    GGML_ASSERT(buf);
+
+    mctx.set_input_qsa(
+            cell_blk, nullptr, nullptr, block_cells, tail_cells, bias, &batch, ratio,
+            /*blk_bias =*/ true, /*block_topk =*/ true);
+
+    const auto & cells = mem.get_mem_idx()->get_cells(0);
+    std::array<int32_t, n_tokens> pos_cell;
+    pos_cell.fill(-1);
+    for (uint32_t cell = 0; cell < cells.size(); ++cell) {
+        if (!cells.is_empty(cell) && cells.seq_has(cell, 0)) {
+            const llama_pos pos = cells.pos_get(cell);
+            if (pos >= 0 && pos < n_tokens) {
+                pos_cell[pos] = cell;
+            }
+        }
+    }
+    for (const int32_t cell : pos_cell) {
+        GGML_ASSERT(cell >= 0);
+    }
+
+    const int32_t * blocks = (const int32_t *) block_cells->data;
+    for (int64_t j = 0; j < ratio; ++j) {
+        GGML_ASSERT(blocks[j] == pos_cell[j]);
+        GGML_ASSERT(blocks[ratio + j] == -1);
+    }
+
+    const int32_t * tails = (const int32_t *) tail_cells->data;
+    const std::array<std::array<int32_t, ratio - 1>, n_tokens> expected = {{
+        {{ pos_cell[0], -1,          -1          }},
+        {{ pos_cell[0], pos_cell[1], -1          }},
+        {{ pos_cell[0], pos_cell[1], pos_cell[2] }},
+        {{ -1,          -1,          -1          }},
+        {{ pos_cell[4], -1,          -1          }},
+        {{ pos_cell[4], pos_cell[5], -1          }},
+    }};
+    for (int64_t i = 0; i < n_tokens; ++i) {
+        for (int64_t j = 0; j < ratio - 1; ++j) {
+            GGML_ASSERT(tails[i*(ratio - 1) + j] == expected[i][j]);
+        }
+    }
+
+    const float * block_bias = (const float *) bias->data;
+    GGML_ASSERT(std::isinf(block_bias[2*n_blocks + 0]) && block_bias[2*n_blocks + 0] < 0.0f);
+    GGML_ASSERT(block_bias[3*n_blocks + 0] == 0.0f);
+    GGML_ASSERT(block_bias[4*n_blocks + 0] == 0.0f);
+    GGML_ASSERT(std::isinf(block_bias[4*n_blocks + 1]) && block_bias[4*n_blocks + 1] < 0.0f);
+
+    auto decode = make_batch(0, 5, 1);
+    mctx.set_input_qsa(
+            nullptr, nullptr, nullptr, sentinel_cells, nullptr, sentinel_bias, &decode, ratio,
+            /*blk_bias =*/ true, /*block_topk =*/ true);
+
+    const int32_t * sentinel = (const int32_t *) sentinel_cells->data;
+    for (int64_t j = 0; j < ratio; ++j) {
+        GGML_ASSERT(sentinel[j] == pos_cell[j]);
+    }
+    GGML_ASSERT(sentinel[n_blocks*ratio + 0] == pos_cell[4]);
+    GGML_ASSERT(sentinel[n_blocks*ratio + 1] == pos_cell[5]);
+    GGML_ASSERT(sentinel[n_blocks*ratio + 2] == -1);
+    GGML_ASSERT(sentinel[n_blocks*ratio + 3] == -1);
+
+    const float * sentinel_scores = (const float *) sentinel_bias->data;
+    GGML_ASSERT(sentinel_scores[0] == 0.0f);
+    GGML_ASSERT(std::isinf(sentinel_scores[1]) && sentinel_scores[1] < 0.0f);
+    GGML_ASSERT(sentinel_scores[n_blocks] == 1e9f);
+}
+
 int main() {
     test_fallback(true);
     test_fallback(false);
+    test_block_topk_inputs();
     printf("QSA multimodal cache tests passed\n");
 }
