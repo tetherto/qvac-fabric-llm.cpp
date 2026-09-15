@@ -132,6 +132,10 @@ if (CUDAToolkit_FOUND)
                              ${GGML_SOURCES_CUDA}
                             )
 
+    if (CMAKE_DL_LIBS)
+        target_link_libraries(ggml-cuda PRIVATE ${CMAKE_DL_LIBS})
+    endif()
+
     if (GGML_CUDA_DEEPGEMM)
         if (CUDAToolkit_VERSION VERSION_LESS "12.3")
             message(FATAL_ERROR "GGML_CUDA_DEEPGEMM requires CUDA Toolkit 12.3 or newer")

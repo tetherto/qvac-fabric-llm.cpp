@@ -663,3 +663,89 @@ it only records that the attempted perf command was unavailable.
 The immediate next action is a matched warmed SGLang PP2048 trace, followed by
 an operator-by-operator comparison with the saved llama.cpp trace. The success
 criterion is closing the matched end-to-end gap to SGLang.
+
+## FlashInfer SM90 GDN AOT experiment (2026-09-15)
+
+The FlashInfer Hopper fully fused delta-rule kernel is now callable from the
+GGML CUDA GDN operator through an opt-in external-library adapter. Set
+`GGML_CUDA_GDN_AOT_LIB=/path/to/libflashinfer_gdn_sm90_aot.so`; without that
+variable, unsupported shapes, or a failed library load, the existing GGML
+chunked/recurrent paths remain unchanged. The current dispatch is intentionally
+narrow: Linux CUDA, SM90, `S=128`, at least 64 tokens, scalar decay, one final
+state, and at most 1023 sequences.
+
+Sources evaluated:
+
+- FlashInfer SM90 GDN implementation:
+  https://github.com/flashinfer-ai/flashinfer/blob/main/flashinfer/gdn_prefill.py
+- FLA chunked gated delta rule reference:
+  https://github.com/fla-org/flash-linear-attention/blob/main/fla/ops/gated_delta_rule/chunk.py
+- SGLang's GDN benchmark:
+  https://github.com/sgl-project/sglang/blob/main/benchmark/bench_linear_attention/bench_gdn_prefill.py
+
+FlashInfer 0.6.18 generates this kernel with CuTe DSL. Directly calling the
+device entry point is impractical because its ABI contains four 128-byte TMA
+descriptors. Instead, the CuTe wrapper was AOT-exported as a host-callable
+object and linked into a small C ABI bridge. The GGML adapter dynamically loads
+that bridge and runs three stages on the current CUDA stream:
+
+1. Pack F32 Q/K/V to BF16, exponentiate the log decay to F32 alpha, and pack
+   beta.
+2. Launch FlashInfer's fully fused SM90 delta-rule kernel.
+3. Convert the BF16 output back to the F32 GGML destination.
+
+FlashInfer groups adjacent value heads for GVA, while the existing GGML GDN
+kernel maps value heads with `h_v % H_q`. The adapter therefore expands Q/K to
+the value-head count in transient BF16 buffers using GGML's current modulo
+mapping and invokes FlashInfer in equal-head mode. This preserves the branch's
+existing model behavior rather than introducing a hidden head-order change.
+
+Standalone validation against an independent CPU scalar reference at
+`T=64, H=8, H_v=24, S=128` gave output max-abs `7.60e-4`, output NRMSE
+`0.00260`, state max-abs `4.36e-4`, and state NRMSE `0.00164`. The bridge output
+and final state were bit-identical to FlashInfer's Python API at both
+`T=2048, H=8, H_v=24` and multi-sequence `B=2, T=127, H=4, H_v=8`. The GGML
+backend cases are within BF16 accuracy, although two randomized cases can land
+just above the test's strict `1e-5` NMSE threshold (`1.13e-5` to `1.40e-5`)
+because FlashInfer stores its output as BF16 whereas GGML's native path returns
+F32. The large mismatch seen before the head-order adapter is gone.
+
+The end-to-end FP8 PP2048 comparison used physical GPUs 6/7, `-sm tensor
+-ts 1/1`, ubatch 2048, CPU-resident PLE embeddings, DeepGEMM `MUL_MAT_ID`, the
+separate-state SSM path, and six repetitions. Excluding the first cold sample:
+
+```text
+path                         warmed samples (tok/s)                     mean
+GGML chunked GDN             8227.72 8296.18 8300.69 8322.91 8356.64  8300.03
+FlashInfer SM90 GDN AOT      9574.34 9568.00 9633.58 9640.28 9668.54  9616.95
+```
+
+This is a `15.9%` warmed end-to-end PP2048 throughput improvement. Nsight
+Systems counted 216 calls of each GDN stage (36 GDN modules x two GPUs x three
+executions). Mean time per module/device was:
+
+```text
+FlashInfer fully fused kernel       97.11 us
+F32/BF16 + gate preparation         81.97 us
+BF16/F32 output unpack              18.56 us
+cu_seqlens setup                      0.89 us
+total                               198.53 us
+```
+
+The prior GGML chunked path was approximately `1.187 ms` per module/device, so
+the adapter removes about `83%` of GDN time. Input packing is now almost as
+expensive as the fused kernel itself; the next GDN-specific optimization is to
+keep its inputs/outputs in BF16 or fuse the surrounding projection/layout work
+so the 100.5 us of conversion overhead disappears.
+
+Durable remote artifacts are in:
+
+- `/home/aman/qwen4-exp-opt-bench-20260911/results/flashinfer-gdn-aot-20260915/`
+- `qwen4-gdn-aot-pp2048.nsys-rep`
+- `libflashinfer_gdn_sm90_aot.so`, generated object/header, export script,
+  C bridge, standalone C++ harness, and Python comparison scripts
+
+The generated CuTe object/runtime has NVIDIA packaging/licensing and Hopper
+portability constraints, so it is kept as an external experiment artifact and
+is not vendored into the repository. A production version needs an explicit
+dependency/build policy before enabling this path by default.
