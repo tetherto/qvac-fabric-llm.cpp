@@ -61,6 +61,10 @@ ggml_cuda_cutlass_result ggml_cuda_cutlass_mul_mat_prequantized(ggml_backend_cud
                                                                 ggml_tensor *                        dst,
                                                                 const ggml_cuda_cutlass_activation & activation);
 
+// host-side check: would ggml_cuda_cutlass_mul_mat_prequantized succeed for these tensors?
+bool ggml_cuda_cutlass_mul_mat_prequantized_supported(
+        ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst);
+
 ggml_cuda_cutlass_result ggml_cuda_cutlass_mul_mat_prequantized_bf16(ggml_backend_cuda_context &          ctx,
                                                                      const ggml_tensor *                  src0,
                                                                      const ggml_tensor *                  src1,

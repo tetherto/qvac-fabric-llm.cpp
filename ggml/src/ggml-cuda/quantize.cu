@@ -733,8 +733,12 @@ static __global__ void quantize_cutlass_nvfp4_swiglu_bf16(const nv_bfloat16 * __
                                                           uint8_t * __restrict__ block_scales,
                                                           float * __restrict__ row_scales,
                                                           int64_t n_cols,
-                                                          int64_t n_cols_padded) {
+                                                          int64_t n_cols_padded,
+                                                          bool use_smem) {
 #    if defined(BLACKWELL_MMA_AVAILABLE)
+    // row_buf stages the swiglu result in shared memory, avoiding the glu global round-trip
+    extern __shared__ float row_buf[];
+
     const int64_t row        = blockIdx.x;
     const int64_t row_offset = row * n_cols;
     const float   gs         = *gate_scale;
@@ -745,8 +749,13 @@ static __global__ void quantize_cutlass_nvfp4_swiglu_bf16(const nv_bfloat16 * __
         const float gate_value = (float) gate[row_offset + col] * gs;
         const float up_value   = (float) up[row_offset + col] * us;
         const float value      = (float) (nv_bfloat16) (ggml_cuda_op_silu_single(gate_value) * up_value);
-        glu[row_offset + col]  = value;
-        amax                   = fmaxf(amax, fabsf(value));
+        if (use_smem) {
+            row_buf[col] = value;
+        }
+        if (glu != nullptr) {
+            glu[row_offset + col] = value;
+        }
+        amax = fmaxf(amax, fabsf(value));
     }
 
     amax = warp_reduce_max<WARP_SIZE>(amax);
@@ -778,7 +787,7 @@ static __global__ void quantize_cutlass_nvfp4_swiglu_bf16(const nv_bfloat16 * __
 #        pragma unroll
         for (int k = 0; k < QK_NVFP4_SUB; ++k) {
             const int64_t col = col_base + k;
-            vals[k]           = col < n_cols ? glu[row_offset + col] : 0.0f;
+            vals[k]           = col < n_cols ? (use_smem ? row_buf[col] : glu[row_offset + col]) : 0.0f;
         }
 
         uint8_t fp8_code;
@@ -815,7 +824,8 @@ static __global__ void quantize_cutlass_nvfp4_swiglu_bf16(const nv_bfloat16 * __
             fp8_code;
     }
 #    else
-    GGML_UNUSED_VARS(gate, up, gate_scale, up_scale, glu, vy, block_scales, row_scales, n_cols, n_cols_padded);
+    GGML_UNUSED_VARS(gate, up, gate_scale, up_scale, glu, vy, block_scales, row_scales, n_cols, n_cols_padded,
+                     use_smem);
     NO_DEVICE_CODE;
 #    endif  // defined(BLACKWELL_MMA_AVAILABLE)
 }
@@ -848,10 +858,25 @@ void quantize_cutlass_nvfp4_swiglu_bf16_cuda(const nv_bfloat16 * gate,
                                              int64_t             n_rows,
                                              cudaStream_t        stream) {
     GGML_ASSERT(n_cols % QK_NVFP4 == 0 && n_cols_padded >= n_cols && n_cols_padded % 128 == 0);
-    GGML_ASSERT(glu != nullptr);
+    GGML_ASSERT(n_cols > 0 && (uint64_t) n_cols <= SIZE_MAX / sizeof(float));
+    const size_t row_bytes = (size_t) n_cols * sizeof(float);
+    const size_t smpbo     = ggml_cuda_info().devices[ggml_cuda_get_device()].smpbo;
+    // 1KB margin: max dynamic smem is smpbo minus the kernel's static shared usage
+    const bool   use_smem  = row_bytes + 1024 <= smpbo;
+    GGML_ASSERT(glu != nullptr || use_smem);
+    if (use_smem) {
+        static size_t smem_configured[GGML_CUDA_MAX_DEVICES] = {};
+        const int     id = ggml_cuda_get_device();
+        if (smem_configured[id] < row_bytes) {
+            CUDA_CHECK(cudaFuncSetAttribute(
+                quantize_cutlass_nvfp4_swiglu_bf16, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) row_bytes));
+            smem_configured[id] = row_bytes;
+        }
+    }
     CUDA_CHECK(
         cudaMemsetAsync(block_scales, 0, (size_t) GGML_PAD(n_rows, 128) * (n_cols_padded / QK_NVFP4_SUB), stream));
-    quantize_cutlass_nvfp4_swiglu_bf16<<<(unsigned) n_rows, CUDA_QUANTIZE_BLOCK_SIZE_MMQ, 0, stream>>>(
-        gate, up, gate_scale, up_scale, glu, vy, block_scales, row_scales, n_cols, n_cols_padded);
+    quantize_cutlass_nvfp4_swiglu_bf16<<<(unsigned) n_rows, CUDA_QUANTIZE_BLOCK_SIZE_MMQ, use_smem ? row_bytes : 0,
+                                         stream>>>(
+        gate, up, gate_scale, up_scale, glu, vy, block_scales, row_scales, n_cols, n_cols_padded, use_smem);
 }
 #endif
