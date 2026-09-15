@@ -8031,6 +8031,9 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
         case GGML_OP_MEAN:
             return op->src[0]->type == GGML_TYPE_F32;
         case GGML_OP_FLASH_ATTN_EXT: {
+            if (op->src[3] == nullptr && ggml_flash_attn_ext_get_kv_used(op) > 0) {
+                return false; // implicit causal mask (n_kv_used) is CPU/CUDA only
+            }
             // The E17 compilers segfault while building FA kernels, skip E17 for now
             if (adreno_e17_compiler_quirks(backend_ctx)) {
                 return false;
