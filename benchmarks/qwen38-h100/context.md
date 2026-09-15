@@ -4,7 +4,7 @@ Plain-language companion to `progress-log.md` (the measurements), `decisions.md`
 
 ## Where we started
 
-The campaign scoreboard after the Hopper/GDN/KV/prompt-cache work (T1 build, Q8_K_XL GGUF): prefill 5846 tok/s at 10k, 3716 at 110k; decode 63.3 tok/s at 10k, 55.0 at 110k. Targets: 11649 / - / 91.8 / 53.8. SGLang FP8 on the same GPU: 17414 prefill, 82 decode. The user set the direction: make the shipped FP8 checkpoint (`Qwen/Qwen3.8-27B-FP8`) run natively and as fast as possible.
+The campaign scoreboard after the Hopper/GDN/KV/prompt-cache work (T1 build, Q8_K_XL GGUF): prefill 5846 tok/s at 10k, 3716 at 110k; decode 63.3 tok/s at 10k, 55.0 at 110k (server `prompt_ms` rates). Targets (3x prefill, 1.5x decode over the I00 baseline): pp10k 11649, pp110k 6906 (3x the Q4 I00 110k rate; the Q8 I00 110k rate was 2901), tg10k 91.8, tg110k 53.8. SGLang FP8 on the same GPU (client TTFT-based prefill, the same `pd_bench.py` shapes): 17414 at 10k, 13245 at 110k, 8117 for 10k after a cached 100k prefix; decode 82.1 / 74.4 / 74.5. The user set the direction: make the shipped FP8 checkpoint (`Qwen/Qwen3.8-27B-FP8`) run natively and as fast as possible.
 
 ## Findings before writing code (F0)
 
@@ -15,7 +15,7 @@ The campaign scoreboard after the Hopper/GDN/KV/prompt-cache work (T1 build, Q8_
 
 ## What was built
 
-Two layers, delivered as two patches on the branch `fp8-h100-campaign` (`benchmarks/qwen38-h100/patches/`):
+Layers on the branch `fp8-h100-campaign`, each with a patch under `benchmarks/qwen38-h100/patches/`: two accepted (`F8-format.patch`, `C1-flashinfer-gdn.patch`), one opt-in build that failed its gate (`F8-cutlass.patch`), and two measured-and-rejected patches kept for the record (`C2-ssm-conv-state.patch`, `C3-shared-f16-cast.patch`). F4 (FFN-only CUTLASS routing) was rejected and fully reverted, no patch.
 
 `F8-format.patch` (accepted, the default build):
 - `ggml/include/ggml.h`, `ggml/src/ggml.c`, `ggml-impl.h`, `ggml-quants.c/h`: the type `GGML_TYPE_F8_E4M3` and `ggml_mul_mat_blockscaled`.
@@ -32,7 +32,10 @@ Two layers, delivered as two patches on the branch `fp8-h100-campaign` (`benchma
 - `ggml/src/ggml-cuda/mmf8-cutlass.cu`, `mmf8-cutlass.cuh`: the SM90 block-scaled GEMM wrapper.
 - `ggml/src/ggml-cuda/mmf8.cu`: the activation quantizer and the M > 8 dispatch to CUTLASS.
 
-Both patches apply and build from the pre-FP8 commit on the host in a clean worktree; the F8 tests pass on each layer (validated 2026-09-15).
+`C1-flashinfer-gdn.patch` (accepted, opt-in at run time through `GGML_CUDA_GDN_AOT_LIB`):
+- `ggml/src/ggml-cuda/gated_delta_net.cu`: loader, pack/unpack/cu_seqlens kernels and the dispatch to the external FlashInfer SM90 fused delta-rule kernel (from PR #264), placed before our chunk/tail split; `ggml/src/ggml-cuda/CMakeLists.txt`: `CMAKE_DL_LIBS`; tests at the qwen35 shape family. The library itself is an external NVIDIA CuTe DSL artifact, not vendored.
+
+Both F8 patches apply and build from the pre-FP8 commit on the host in a clean worktree; the F8 tests pass on each layer (validated 2026-09-15). The C1 patch is the diff of commit `f31a3909f` against its parent.
 
 ## What worked
 
@@ -81,6 +84,9 @@ Branch `fp8-h100-campaign` on `origin` (tetherto/qvac-fabric-llm.cpp), on top of
 - `d5aa3d424`, `afd5585c8` docs
 - `f31a3909f` cuda : opt-in FlashInfer SM90 fused gated delta net path (from PR #264); ledger for F4 (rejected), M0, M1, C1
 - `62051f7c5` benchmarks : C2 separate-state SSM_CONV measured and rejected
+- `98ebe486b` benchmarks : F4, M0/M1, C1-C3 outcomes, scoreboard rows and docs; plus the follow-up docs commit after it
+
+PR #268 (base `temp-10549`, head `fp8-h100-campaign`) carries the per-change table as its description; created on the user's explicit instruction.
 
 Note on process: `AGENTS.md` in this repository says an agent must never push or create a PR; the pushes above were done on the user's explicit instruction to a separate branch of the private fork, with short messages and no attribution trailers as the user asked.
 
