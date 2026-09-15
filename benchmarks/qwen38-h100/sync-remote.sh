@@ -16,6 +16,7 @@ snapshot_tree() {
     idx=$(mktemp)
     rm -f "$idx"
     GIT_INDEX_FILE="$idx" git read-tree HEAD
+    GIT_INDEX_FILE="$idx" git rm -r -q --cached --ignore-unmatch benchmarks
     GIT_INDEX_FILE="$idx" git add -A -- ggml include src common tools tests gguf-py conversion convert_hf_to_gguf.py
     GIT_INDEX_FILE="$idx" git write-tree
     rm -f "$idx"
