@@ -2388,14 +2388,6 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_MUL_MAT_ID:
             ggml_cuda_mul_mat_id(ctx, dst);
             break;
-        case GGML_OP_MOE_FFN:
-#ifdef GGML_CUDA_DEEPGEMM
-            if (ggml_cuda_deepgemm_moe_ffn(ctx, dst)) {
-                break;
-            }
-#endif
-            GGML_ABORT("unsupported CUDA MOE_FFN operation");
-            break;
         case GGML_OP_MUL_MAT_ID_BACK_A:
             ggml_cuda_op_mul_mat_id_back_a(ctx, dst);
             break;
@@ -5496,12 +5488,6 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                         return false;
                 }
             } break;
-        case GGML_OP_MOE_FFN:
-#ifdef GGML_CUDA_DEEPGEMM
-            return ggml_cuda_deepgemm_moe_ffn_supported(op, dev_ctx->device);
-#else
-            return false;
-#endif
         case GGML_OP_MUL_MAT_ID_BACK_A:
             return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
                    op->src[2]->type == GGML_TYPE_I32 && op->type == GGML_TYPE_F32;

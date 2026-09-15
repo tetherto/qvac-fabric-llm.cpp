@@ -2109,32 +2109,6 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         cb(cur, "ffn_moe_weighted", il);
     }
 
-    // Qwen4-Exp stores routed gate/up as one tensor. Keep the experimental
-    // whole-FFN path opt-in while it is being tuned; native FP8 otherwise uses
-    // the regular MUL_MAT_ID graph below.
-    const bool fused_moe_enabled = llama_env_flag_enabled("GGML_CUDA_DEEPGEMM_MOE_FFN");
-    const bool fused_moe_weight_type = gate_up_exps && down_exps &&
-        (gate_up_exps->type == GGML_TYPE_F8_E4M3 || gate_up_exps->type == GGML_TYPE_BF16);
-    const bool fused_moe_scales = gate_up_exps &&
-        ((gate_up_exps->type == GGML_TYPE_F8_E4M3 && up_exps_s && down_exps_s) ||
-         (gate_up_exps->type == GGML_TYPE_BF16 && !up_exps_s && !down_exps_s));
-    const bool fused_moe_compatible =
-        fused_moe_enabled && arch == LLM_ARCH_QWEN4EXP && fused_moe_weight_type && fused_moe_scales &&
-        gate_up_exps->type == down_exps->type && type_op == LLM_FFN_SILU &&
-        !weight_before_ffn && !cparams.training && loras->empty() &&
-        !gate_up_exps_b && !up_exps_b && !gate_exps_b && !down_exps_b &&
-        !up_exps && !gate_exps;
-
-    if (fused_moe_compatible) {
-        ggml_tensor * moe_out = ggml_moe_ffn(
-            ctx0, gate_up_exps, down_exps, cur, selected_experts, weights,
-            up_exps_s, down_exps_s, 0);
-        cb(moe_out, "ffn_moe_fused", il);
-        ggml_build_forward_expand(gf, moe_out);
-        cb(moe_out, "ffn_moe_out", il);
-        return moe_out;
-    }
-
     ggml_tensor * up = nullptr;
     ggml_tensor * experts = nullptr;
 

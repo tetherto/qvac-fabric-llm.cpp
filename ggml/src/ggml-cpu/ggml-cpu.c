@@ -1939,10 +1939,6 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_mul_mat_id(params, tensor);
             } break;
-        case GGML_OP_MOE_FFN:
-            {
-                ggml_compute_forward_moe_ffn(params, tensor);
-            } break;
         case GGML_OP_MUL_MAT_ID_BACK_A:
             {
                 ggml_compute_forward_mul_mat_id_back_a(params, tensor);
@@ -2467,7 +2463,6 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_CONCAT:
         case GGML_OP_MUL_MAT:
         case GGML_OP_MUL_MAT_ID:
-        case GGML_OP_MOE_FFN:
         case GGML_OP_MUL_MAT_ID_BACK_A:
         case GGML_OP_MUL_MAT_ID_BACK_B:
         case GGML_OP_OUT_PROD:
@@ -3024,12 +3019,6 @@ struct ggml_cplan ggml_graph_plan(
                         cur += n_as*ids->ne[0]*ids->ne[1]*sizeof(struct mmid_row_mapping) + sizeof(int64_t);
                         // atomic_current_chunk
                         cur += CACHE_LINE_SIZE*n_as + CACHE_LINE_SIZE;
-                    } break;
-                case GGML_OP_MOE_FFN:
-                    {
-                        const struct ggml_tensor * gate_up = node->src[0];
-                        const struct ggml_tensor * ids = node->src[3];
-                        cur = ids->ne[0]*ids->ne[1]*(gate_up->ne[1]/2)*sizeof(float);
                     } break;
                 case GGML_OP_OUT_PROD:
                     {

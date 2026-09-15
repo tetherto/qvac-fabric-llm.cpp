@@ -1096,7 +1096,6 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
 
     "MUL_MAT",
     "MUL_MAT_ID",
-    "MOE_FFN",
     "MUL_MAT_ID_BACK_A",
     "MUL_MAT_ID_BACK_B",
     "OUT_PROD",
@@ -1183,7 +1182,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 114, "GGML_OP_COUNT != 114");
+static_assert(GGML_OP_COUNT == 113, "GGML_OP_COUNT != 113");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1224,7 +1223,6 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
 
     "X*Y",
     "X[i]*Y",
-    "moe_ffn(X[i],Y[i],x,w)",
     "back_a(X[i]*Y)",
     "back_b(X[i]*Y)",
     "X*Y",
@@ -1311,7 +1309,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 114, "GGML_OP_COUNT != 114");
+static_assert(GGML_OP_COUNT == 113, "GGML_OP_COUNT != 113");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -3535,71 +3533,6 @@ struct ggml_tensor * ggml_mul_mat_id(
     result->src[1] = b;
     result->src[2] = ids;
 
-    return result;
-}
-
-// ggml_moe_ffn
-
-struct ggml_tensor * ggml_moe_ffn(
-        struct ggml_context * ctx,
-        struct ggml_tensor  * gate_up,
-        struct ggml_tensor  * down,
-        struct ggml_tensor  * x,
-        struct ggml_tensor  * ids,
-        struct ggml_tensor  * weights,
-        struct ggml_tensor  * gate_up_scale,
-        struct ggml_tensor  * down_scale,
-        int32_t               expert_offset) {
-    GGML_ASSERT(gate_up != NULL && down != NULL && x != NULL && ids != NULL && weights != NULL);
-    GGML_ASSERT(!ggml_is_transposed(gate_up));
-    GGML_ASSERT(!ggml_is_transposed(down));
-    GGML_ASSERT(gate_up->type == down->type);
-    GGML_ASSERT(gate_up->type == GGML_TYPE_BF16 || gate_up->type == GGML_TYPE_F8_E4M3);
-    GGML_ASSERT(x->type == GGML_TYPE_F32);
-    GGML_ASSERT(ids->type == GGML_TYPE_I32);
-    GGML_ASSERT(weights->type == GGML_TYPE_F32);
-
-    const int64_t n_embd        = gate_up->ne[0];
-    const int64_t n_ff          = gate_up->ne[1] / 2;
-    const int64_t n_expert      = gate_up->ne[2];
-    const int64_t n_expert_used = ids->ne[0];
-    const int64_t n_tokens      = ids->ne[1];
-
-    GGML_ASSERT(expert_offset >= 0);
-    GGML_ASSERT(gate_up->ne[1] == 2*n_ff);
-    GGML_ASSERT(gate_up->ne[3] == 1);
-    GGML_ASSERT(down->ne[0] == n_ff);
-    GGML_ASSERT(down->ne[1] == n_embd);
-    GGML_ASSERT(down->ne[2] == n_expert && down->ne[3] == 1);
-    GGML_ASSERT(x->ne[0] == n_embd && x->ne[1] == 1 && x->ne[2] == n_tokens && x->ne[3] == 1);
-    GGML_ASSERT(ids->ne[2] == 1 && ids->ne[3] == 1);
-    GGML_ASSERT(weights->ne[0] == 1 && weights->ne[1] == n_expert_used &&
-                weights->ne[2] == n_tokens && weights->ne[3] == 1);
-
-    if (gate_up->type == GGML_TYPE_F8_E4M3) {
-        GGML_ASSERT(gate_up_scale != NULL && down_scale != NULL);
-        GGML_ASSERT(gate_up_scale->type == GGML_TYPE_F32 && down_scale->type == GGML_TYPE_F32);
-        GGML_ASSERT(n_embd % 128 == 0 && n_ff % 128 == 0);
-        GGML_ASSERT(gate_up_scale->ne[0] == n_embd/128);
-        GGML_ASSERT(gate_up_scale->ne[1] == 2*n_ff/128);
-        GGML_ASSERT(gate_up_scale->ne[2] == n_expert && gate_up_scale->ne[3] == 1);
-        GGML_ASSERT(down_scale->ne[0] == n_ff/128);
-        GGML_ASSERT(down_scale->ne[1] == n_embd/128);
-        GGML_ASSERT(down_scale->ne[2] == n_expert && down_scale->ne[3] == 1);
-    } else {
-        GGML_ASSERT(gate_up_scale == NULL && down_scale == NULL);
-    }
-
-    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
-    ggml_set_op_params_i32(result, 0, expert_offset);
-    result->op     = GGML_OP_MOE_FFN;
-    result->src[0] = gate_up;
-    result->src[1] = down;
-    result->src[2] = x;
-    result->src[3] = ids;
-    result->src[4] = weights;
-    result->src[5] = gate_up_scale;
-    result->src[6] = down_scale;
     return result;
 }
 

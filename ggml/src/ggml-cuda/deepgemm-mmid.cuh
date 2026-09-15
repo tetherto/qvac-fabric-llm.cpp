@@ -13,10 +13,3 @@ bool ggml_cuda_deepgemm_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor 
 // graph. This intentionally performs the same shape/layout checks as the
 // execution path rather than assuming every FP8 MUL_MAT_ID is supported.
 bool ggml_cuda_deepgemm_mul_mat_id_graph_compatible(const ggml_tensor * dst, int device);
-
-// Fused Qwen4-Exp routed expert FFN. The CUDA implementation keeps the
-// gate/up activation and down-projection intermediates in BF16/FP8 packed
-// expert layout and emits only the weighted local expert sum.
-bool ggml_cuda_deepgemm_moe_ffn(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
-bool ggml_cuda_deepgemm_moe_ffn_supported(const ggml_tensor * dst, int device);
-bool ggml_cuda_deepgemm_moe_ffn_graph_compatible(const ggml_tensor * dst, int device);

@@ -526,7 +526,6 @@ extern "C" {
 
         GGML_OP_MUL_MAT,
         GGML_OP_MUL_MAT_ID,
-        GGML_OP_MOE_FFN,
         GGML_OP_MUL_MAT_ID_BACK_A,
         GGML_OP_MUL_MAT_ID_BACK_B,
         GGML_OP_OUT_PROD,
@@ -1509,28 +1508,6 @@ extern "C" {
             struct ggml_tensor  * as,
             struct ggml_tensor  * b,
             struct ggml_tensor  * ids);
-
-    // Fused routed MoE feed-forward network:
-    //   sum_i weight_i * down_i(silu(gate_i(x)) * up_i(x))
-    // gate_up: [n_embd, 2*n_ff, n_expert]
-    // down:    [n_ff, n_embd, n_expert]
-    // x:       [n_embd, 1, n_tokens]
-    // ids:     [n_expert_used, n_tokens]
-    // weights: [1, n_expert_used, n_tokens]
-    //
-    // Block-scaled FP8 weights require [K/128, N/128, n_expert]
-    // scale tensors. expert_offset allows a backend to own a contiguous subset
-    // of the global experts; non-local routes contribute zero.
-    GGML_API struct ggml_tensor * ggml_moe_ffn(
-            struct ggml_context * ctx,
-            struct ggml_tensor  * gate_up,
-            struct ggml_tensor  * down,
-            struct ggml_tensor  * x,
-            struct ggml_tensor  * ids,
-            struct ggml_tensor  * weights,
-            struct ggml_tensor  * gate_up_scale,
-            struct ggml_tensor  * down_scale,
-            int32_t               expert_offset);
 
     // Backward of ggml_mul_mat_id w.r.t. `as` (expert weight stack).
     GGML_API struct ggml_tensor * ggml_mul_mat_id_back_a(

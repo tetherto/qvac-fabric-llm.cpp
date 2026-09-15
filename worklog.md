@@ -1,6 +1,6 @@
 # Qwen4Exp optimization worklog
 
-Last updated: 2026-09-14 (Asia/Singapore)
+Last updated: 2026-09-15 (Asia/Singapore)
 
 ## Objective
 
@@ -73,14 +73,16 @@ the installed SGLang wheel uses a CUDA 13.0 runtime.
 Current optimized FP8 run:
 
 - `-sm tensor -lm none`
-- DeepGEMM `MUL_MAT_ID` enabled; experimental whole-MoE and MegaMoE paths disabled
-- Qwen4Exp HC and CUDA MoE-reduction fusions enabled
-- PP2048: **7687.85 +/- 73.05 tok/s** over 15 repetitions
-- Stable last-eight mean: **7729.52 tok/s**
+- DeepGEMM `MUL_MAT_ID` enabled; failed whole-MoE and MegaMoE prototypes removed
+- Qwen4Exp HC, separate-state SSM convolution, CUDA MoE-reduction, and external
+  FlashInfer SM90 GDN paths enabled
+- PP2048 post-cleanup warmed mean: **9764.91 tok/s** (last four samples)
+- TG128 post-cleanup warmed mean: **62.83 tok/s** (last four samples)
 
 This is the checkpoint to reproduce before making another optimization. The
-prior non-fused checkpoint was 6674.29 +/- 98.27 tok/s. The current full mean
-is 15.19% faster.
+first repetition includes model/kernel cold start and is excluded from the
+warmed figures. Historical checkpoints below remain useful for attributing
+individual optimizations.
 
 ### 2026-09-14: warmed PP2048 Nsight profile
 
@@ -749,3 +751,67 @@ The generated CuTe object/runtime has NVIDIA packaging/licensing and Hopper
 portability constraints, so it is kept as an external experiment artifact and
 is not vendored into the repository. A production version needs an explicit
 dependency/build policy before enabling this path by default.
+
+## Decode profile and prototype cleanup (2026-09-15)
+
+The failed `GGML_OP_MOE_FFN` vertical slice and MegaMoE experiment have been
+removed from the branch. This includes their graph/backend dispatch, CPU and
+CUDA implementations, test registrations, environment flags, and standalone
+prototype scripts. The working DeepGEMM `MUL_MAT_ID` path and FlashInfer GDN
+adapter remain. Removing the serialized GGML op shifts later op IDs, so the RPC
+protocol major was intentionally advanced from 108 to 109 and its op-count
+guard updated from 114 to 113.
+
+Post-cleanup validation on physical GPU 6:
+
+```text
+DeepGEMM MUL_MAT_ID focused correctness     4/4 passed
+standard CUDA GATED_DELTA_NET              47/47 passed
+```
+
+Post-cleanup end-to-end results on physical GPUs 6/7 used the FP8 GGUF,
+`-sm tensor -ts 1/1`, ubatch 2048, CPU-resident PLE embeddings, DeepGEMM
+`MUL_MAT_ID`, the separate-state SSM path, and the FlashInfer GDN AOT adapter:
+
+```text
+TG128 samples (tok/s)      57.2654 62.8450 62.8241 62.8419 62.8238
+TG128 warmed mean                                           62.8337
+PP2048 samples (tok/s)    4651.76 9776.50 9721.49 9749.41 9812.22
+PP2048 warmed mean                                         9764.91
+```
+
+The first sample is consistently cold. The warmed decode result reproduces the
+pre-cleanup 62.9-63.1 tok/s range, and prefill reproduces the approximately
+9.6k tok/s FlashInfer-GDN checkpoint.
+
+The current two-GPU tensor-parallel TG profile covers 130 token executions.
+The main GPU-time buckets are:
+
+```text
+DeepGEMM FP8 expert GEMMs                                  26.0%
+dense BF16 GEMV (two largest shapes alone)                 17.6%
+NCCL all-reduce                                             6.7%
+MoE pack/quantize, scatter, top-k, and weighted reduction    7.5%
+recurrent GDN                                               0.6%
+SSM convolution                                             0.7%
+```
+
+There were 12,222 `cudaGraphLaunch` API calls, approximately 94 per generated
+token, with a 53.4 us mean host API duration. That is about 5.0 ms of host-side
+launch activity per token in aggregate, although overlap means it is not all
+necessarily on the critical path. The result changes the decode priority:
+GDN is no longer a meaningful decode target; MoE data movement/GEMMs, dense
+GEMV, tensor-parallel collectives, and graph fragmentation are the next areas
+to measure and optimize.
+
+Keeping GDN Q/K/V in BF16 is still a useful *prefill* follow-up. Today the
+Qwen4Exp graph produces F32 after SSM convolution, SiLU, and Q/K normalization,
+and the GDN contract requires F32 inputs and output. A useful implementation
+must extend that contract and adjust or fuse the surrounding producers; adding
+isolated casts would not save the approximately 100.5 us per module/device of
+FlashInfer adapter packing and output conversion.
+
+Durable decode profile artifacts:
+
+- `/home/aman/qwen4-exp-opt-bench-20260911/results/decode-cleanup-20260915/qwen4-fp8-decode-current.nsys-rep`
+- `/home/aman/qwen4-exp-opt-bench-20260911/results/decode-cleanup-20260915/qwen4-fp8-decode-current.sqlite`

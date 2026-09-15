@@ -155,9 +155,9 @@ if (CUDAToolkit_FOUND)
         add_library(ggml-cuda-deepgemm-mmid OBJECT deepgemm-mmid.cu)
         set_target_properties(ggml-cuda-deepgemm-mmid PROPERTIES
             CUDA_ARCHITECTURES OFF
+            CUDA_STANDARD 17
+            CUDA_STANDARD_REQUIRED ON
             POSITION_INDEPENDENT_CODE ON)
-        set_source_files_properties(deepgemm-mmid.cu PROPERTIES
-            COMPILE_FLAGS "--std=c++20")
         target_compile_definitions(ggml-cuda-deepgemm-mmid PRIVATE GGML_CUDA_DEEPGEMM)
         target_include_directories(ggml-cuda-deepgemm-mmid PRIVATE
             .
