@@ -124,6 +124,11 @@ bool ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(const int cc, const ggml_
     const ggml_tensor * Q    = dst->src[0];
     const ggml_tensor * K    = dst->src[1];
     const ggml_tensor * mask = dst->src[3];
+    const ggml_tensor * sparse_indices = dst->src[5];
+
+    if (sparse_indices != nullptr && ncols1 != 1) {
+        return false;
+    }
 
     float max_bias = 0.0f;
     float logit_softcap = 0.0f;
@@ -132,11 +137,16 @@ bool ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(const int cc, const ggml_
 
     const int32_t n_kv_max = ggml_get_op_params_i32(dst, 4);
 
-    const int64_t n_gather = (ncols1 == 1 ? Q->ne[1] : ncols1) * (int64_t) n_kv_max;
+    const int64_t n_gather = sparse_indices != nullptr ? n_kv_max :
+        (ncols1 == 1 ? Q->ne[1] : ncols1) * (int64_t) n_kv_max;
 
     return GGML_CUDA_CC_IS_NVIDIA(cc) && turing_mma_available(cc) &&
         mask != nullptr && n_kv_max > 0 && max_bias == 0.0f && logit_softcap == 0.0f &&
         mask->ne[0] == K->ne[1] && mask->ne[1] >= Q->ne[1] && mask->ne[2] == 1 &&
+        (sparse_indices == nullptr ||
+            (sparse_indices->type == GGML_TYPE_I32 && ggml_is_contiguous(sparse_indices) &&
+             sparse_indices->ne[0] == n_kv_max && sparse_indices->ne[1] == Q->ne[1] &&
+             sparse_indices->ne[2] == 1 && Q->ne[3] % sparse_indices->ne[3] == 0)) &&
         K->ne[1] >= std::max<int64_t>(4096, 2*n_gather);
 #endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 }

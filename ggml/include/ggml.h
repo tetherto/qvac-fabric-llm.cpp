@@ -2524,6 +2524,13 @@ extern "C" {
             struct ggml_tensor * a,
             int32_t              n_kv_max);
 
+    // Optional precomputed sparse K/V indices: [n_kv_max, n_batch, 1, ne3].
+    // Each query must have exactly n_kv_max valid indices. Backends that do not
+    // support this optimization continue to use the mask.
+    GGML_API void ggml_flash_attn_ext_set_sparse_indices(
+            struct ggml_tensor * a,
+            struct ggml_tensor * indices);
+
     GGML_API void ggml_flash_attn_ext_add_sinks(
             struct ggml_tensor * a,
             struct ggml_tensor * sinks);

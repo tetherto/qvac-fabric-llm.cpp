@@ -796,6 +796,7 @@ static __global__ void flash_attn_tile(
         const char * V_ptr,
         const char * mask_ptr,
         const char * sinks_ptr,
+        const int  * sparse_indices_ptr,
         const int  * KV_max_ptr,
         float      * dst_ptr,
         float2     * dst_meta_ptr,
@@ -812,6 +813,7 @@ static __global__ void flash_attn_tile(
                             const int32_t nb21, const int32_t nb22, const int64_t nb23,
                             const int32_t ne31, const int32_t ne32, const int32_t ne33,
                             const int32_t nb31, const int32_t nb32, const int64_t nb33) {
+    GGML_UNUSED(sparse_indices_ptr);
 #ifdef FLASH_ATTN_AVAILABLE
     const char * GGML_CUDA_RESTRICT Q        = Q_ptr;
     const char * GGML_CUDA_RESTRICT K        = K_ptr;
@@ -1132,7 +1134,7 @@ static __global__ void flash_attn_tile(
         }
     }
 #else
-    GGML_UNUSED_VARS(Q_ptr, K_ptr, V_ptr, mask_ptr, sinks_ptr, KV_max_ptr, dst_ptr, dst_meta_ptr, scale,
+    GGML_UNUSED_VARS(Q_ptr, K_ptr, V_ptr, mask_ptr, sinks_ptr, sparse_indices_ptr, KV_max_ptr, dst_ptr, dst_meta_ptr, scale,
         max_bias, m0, m1, n_head_log2, logit_softcap,
         ne00, ne01, ne02, ne03,
               nb01, nb02, nb03,

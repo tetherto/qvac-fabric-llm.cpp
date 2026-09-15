@@ -7,10 +7,9 @@ Last updated: 2026-09-15 (Asia/Singapore)
 Get Qwen4Exp FP8 performance close to SGLang on Hopper while keeping the work on
 `qwen4-exp-opt`. Use only GPUs 6 and 7 on `aman@cosmicac-b4c09bd2`.
 
-The next comparison must be apples-to-apples: same prompt length, request/batch
-shape, generated-token count, GPU count, model, warmup state, and CUDA-graph
-mode. The current SGLang decode number appears batched and must not be compared
-directly with single-stream `llama-bench` token generation.
+The matched SGLang comparison is now complete for batch-1 decode and PP2048 at
+a resident 32K context. Future comparisons must retain the same request shape,
+GPU count, model, warmup state, and CUDA-graph mode.
 
 ## Git checkpoint
 
@@ -19,6 +18,12 @@ Current branch: `qwen4-exp-opt`
 Recent commits, newest first:
 
 ```text
+d429fee9f cuda: remove failed fused MoE prototypes
+ad6c3e5e8 cuda: add opt-in FlashInfer SM90 GDN path
+556468da6 qwen4exp: add HC inject and separate-state SSM paths
+9aae78437 qwen4exp: share BF16 prefill activation casts
+69098ed5c cuda: add chunked gated delta net prefill path
+f1e3ab835 docs: record qwen4exp HC fusion profile
 eef7dd05f qwen4exp: add hc ops
 0611b6329 use TENSOR_ALLOW_RESHAPE
 88bdd21d1 qwen4exp: enable rms_norm + mul fusion
@@ -815,3 +820,162 @@ Durable decode profile artifacts:
 
 - `/home/aman/qwen4-exp-opt-bench-20260911/results/decode-cleanup-20260915/qwen4-fp8-decode-current.nsys-rep`
 - `/home/aman/qwen4-exp-opt-bench-20260911/results/decode-cleanup-20260915/qwen4-fp8-decode-current.sqlite`
+
+## Matched SGLang comparison at 32K context (2026-09-15)
+
+The comparison uses physical H100 GPUs 6/7 and batch size one. "At 32K"
+means that 32,768 tokens and all recurrent/KV state are resident before either
+the timed PP2048 extension or the timed decode begins. Prefix construction is
+excluded from the reported measurements.
+
+SGLang uses the Hugging Face FP8 checkpoint at
+`/home/shared/models/Qwen3.8-Flash-Next-FP8`, TP=2, EP=2, FA3, full decode CUDA
+graphs, Triton fused GDN decode, FlashInfer GDN prefill, and the default pinned
+CPU PLE offload. Custom all-reduce and FlashInfer all-reduce fusion were
+disabled. CUDA 12.8 was selected explicitly because `/usr/local/cuda` points
+at an incomplete CUDA 13.0 toolkit on this host. A small wrapper around the
+stock SGLang one-batch benchmark constructs the prefix in four 8192-token
+extensions while preserving KV and recurrent state.
+
+The llama.cpp run uses the FP8 GGUF, `-sm tensor -ts 1/1`, ubatch 2048,
+CPU-resident PLE embeddings, DeepGEMM `MUL_MAT_ID`, the separate-state SSM
+convolution, and the external FlashInfer GDN adapter. Its essential benchmark
+arguments are:
+
+```text
+-d 32768 -p 2048 -n 128 -b 2048 -ub 2048 -t 32 -r 5
+-ngl 99 -sm tensor -ts 1/1 -lm none
+-ot 'per_layer_token_embd\.weight=CPU'
+```
+
+Environment:
+
+```text
+CUDA_VISIBLE_DEVICES=6,7
+GGML_CUDA_DEEPGEMM_MUL_MAT_ID=1
+GGML_CUDA_GDN_CHUNKED=2
+GGML_CUDA_SSM_CONV_SEPARATE_STATE=1
+GGML_CUDA_GDN_AOT_LIB=/home/aman/qwen4-exp-opt-bench-20260911/results/flashinfer-gdn-aot-20260915/libflashinfer_gdn_sm90_aot.so
+```
+
+Raw matched results:
+
+| Workload | llama.cpp FP8 | SGLang FP8 | SGLang advantage |
+| --- | ---: | ---: | ---: |
+| PP2048 after 32K | 5698.81 tok/s, 359.374 ms | 10906.31 tok/s, 187.781 ms | 1.914x |
+| TG128 after 32K | 49.5286 tok/s, 20.190 ms/token | 101.4722 tok/s, 9.855 ms/token | 2.049x |
+
+The llama.cpp figures are the mean of the final four repetitions after its
+first cold repetition. The SGLang PP number is the median of five timed
+extensions; the decode number is the median of 640 timed decode steps across
+five repetitions. Relative to llama.cpp's depth-zero checkpoint, the 32K
+context reduces PP2048 throughput by **41.6%** and decode by **21.2%**.
+
+### PP2048 profile
+
+The dominant long-context difference is sparse full attention. On each GPU,
+llama.cpp spends about 88 ms under tracing in the sparse-index/sort/attention
+stack: five CUB segmented-sort kernels per full-attention layer, additional
+argsort/index setup, and a separate `flash_attn_ext_f16` call. Segmented sort
+alone is 19.4% of its aggregate GPU kernel time. SGLang uses one
+`fast_topk_kernel` and one `_sparse_gqa_chunk_prefill` per full-attention layer;
+its corresponding large kernels take about 10.4 ms per GPU under tracing.
+Absolute Nsight durations include tracing overhead, but the approximately 8x
+operator delta and launch structure are unambiguous.
+
+The next visible PP delta is the MoE path. llama.cpp's DeepGEMM gate-up/down,
+activation pack/quantize, and scatter consume about 37.8 ms per GPU under
+tracing before smaller top-k and reduction kernels. SGLang's fused MoE,
+activation/quantization, and reduction sequence is roughly 25-27 ms per GPU.
+llama.cpp also has a prominent F32-to-BF16 conversion bucket (5.8%); no
+equivalent conversion bucket is prominent in SGLang.
+
+SGLang's aggregate NCCL percentage is misleading. Rank 0 records 82.0 ms over
+98 all-reduces (median 705 us), while rank 1 records only 4.8 ms over 90
+all-reduces (median 53 us). The long rank-0 NCCL kernels mostly expose TP/EP
+rank imbalance and waiting, rather than 82 ms of data-transfer work. llama.cpp
+is symmetric at about 8-9 ms of NCCL per GPU. SGLang wins despite this
+imbalance, so all-reduce is not the first PP target. The FlashInfer GDN path is
+also small on both sides and is no longer a primary PP target.
+
+### Decode profile
+
+The most actionable decode difference is graph granularity. SGLang issues one
+whole-model `cudaGraphLaunch` per GPU per generated token. llama.cpp records
+24,638 graph launches for 128 generated tokens, or **192.5 launches per token
+across both GPUs (96.2 per GPU)**. This matches the many scheduler/backend graph
+fragments around the 48-layer MoE path. Nsight inflates CUDA API latency, so its
+absolute API time is not an end-to-end saving estimate; the earlier low-overhead
+trace put host graph-launch activity near 5 ms/token. The launch-count delta is
+nevertheless exact.
+
+Normalized device-side costs under the decode traces are approximately:
+
+| Area | llama.cpp per GPU/token | SGLang per GPU/token | Observation |
+| --- | ---: | ---: | --- |
+| MoE GEMMs + pack/scatter/top-k/reduce | >=5.5 ms | ~2.6 ms | SGLang's fused MoE path is much cheaper |
+| Sparse-attention gather/sort/attention | ~2.4 ms | ~0.5 ms plus small helpers | llama.cpp still sorts/gathers at every full-attention layer |
+| Dense BF16 projections | ~3.5 ms | ~2.7-3.0 ms | SGLang uses tuned NVJet kernels |
+| NCCL | ~0.85-1.12 ms | ~0.76-0.82 ms | secondary |
+| GDN/SSM core | ~0.2 ms | ~0.2 ms | already competitive; not a target |
+
+The SGLang decode report named `tg16` actually contains the final 64 steady
+steps (steps 64-127). `start_profile()` returns `None` for CUDA-profiler mode,
+so the wrapper originally used a false stop guard and capture continued to the
+end. The raw timing is unaffected, and 64 steps give a stable kernel mix. The
+durable wrapper has been fixed to track profiling activity separately, so
+future bounded captures stop correctly.
+
+### Revised order of attack
+
+1. A/B the existing tensor-parallel whole-graph path on the current FP8 model
+   at depth 32K (`GGML_CUDA_TP_GRAPHS=1`, with the known NCCL graph launch
+   setting), then fix it until decode approaches one replay per GPU/token.
+2. Replace the QSA preselection pipeline with a fused top-k/indexer and sparse
+   prefill/decode kernel, eliminating CUB segmented/radix sorts and large
+   `get_rows` materialization. This is the largest PP2048 target and a material
+   decode target.
+3. Build a practical fused MoE execution path around the already fused gate-up
+   weights: persistent packing/routing plus gate-up, activation, down, and
+   reduction with fewer intermediate launches. The removed whole-`MOE_FFN`
+   prototype is not a base for this work.
+4. Route the remaining batch-1 BF16 projection shapes to tuned GEMV/GEMM
+   kernels or fuse adjacent projections.
+
+Durable raw results, logs, Nsight reports, SQLite exports, and CSV summaries:
+
+- `/home/aman/qwen4-exp-opt-bench-20260911/results/sglang-vs-ggml-d32k-20260915/`
+- `sglang-d32768-pp2048-r5.jsonl`
+- `sglang-d32768-tg128-r5.jsonl`
+- `ggml-d32768-pp2048-tg128-r5.jsonl`
+- `sglang-d32768-pp2048.nsys-rep`
+- `sglang-d32768-tg16.nsys-rep` (64 steady steps, as noted above)
+- `ggml-d32768-pp2048.nsys-rep`
+- `ggml-d32768-tg128.nsys-rep`
+
+The temporary llama-bench CUDA-profiler marker was removed after capture and
+the normal remote binary was rebuilt. No profiler-only source changes remain
+in the branch or remote benchmark tree.
+
+## 2026-09-15: direct sparse-index FlashAttention checkpoint
+
+The QSA-selected token indices can now be passed directly into CUDA
+`FLASH_ATTN_EXT`, avoiding the old union mask and KV compaction across all
+queries in the ubatch. A focused H100 backend-op test passed for an 8192-token
+cache with 512 direct sparse indices. Vulkan and other backends retain the
+existing mask path.
+
+At 32K context on GPUs 6 and 7 with tensor split, FP8 weights, PP2048/TG128,
+and five repetitions:
+
+| Workload | warmed mean | Previous comparable mean | Delta |
+| --- | ---: | ---: | ---: |
+| PP2048 | 5725.06 tok/s | 5698.81 tok/s | +0.46% |
+| TG128 | 50.0909 tok/s | 49.5286 tok/s | +1.14% |
+
+The previous union represented about 7718 unique cache rows per layer for the
+eight-query PP2048 ubatch, versus 2051 selected rows per query. Direct indexing
+removes that amplification, but the QSA score and CUB segmented/radix selection
+remain. The warmed Nsight capture is:
+
+`/home/aman/qwen4-exp-opt-bench-20260911/results/qsa-direct-20260915/ggml-d32768-pp2048-direct.nsys-rep`

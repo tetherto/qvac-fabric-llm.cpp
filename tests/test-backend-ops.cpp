@@ -199,7 +199,7 @@ static void init_tensor_kq_mask(ggml_tensor * tensor, float min = -1.0f, float m
     ggml_backend_tensor_set(tensor, data_f16.data(), 0, data_f16.size()*sizeof(ggml_fp16_t));
 }
 
-static void init_tensor_kq_mask_sparse(ggml_tensor * tensor, int64_t n_kv_max) {
+static void init_tensor_kq_mask_sparse(ggml_tensor * tensor, int64_t n_kv_max, bool exact_count = false) {
     GGML_ASSERT(tensor->type == GGML_TYPE_F16);
     GGML_ASSERT(n_kv_max > 1 && n_kv_max <= tensor->ne[0]);
 
@@ -215,7 +215,7 @@ static void init_tensor_kq_mask_sparse(ggml_tensor * tensor, int64_t n_kv_max) {
     std::mt19937 gen(0x5A17);
     for (int64_t row = 0; row < nrows; ++row) {
         std::shuffle(order.begin(), order.end(), gen);
-        const int64_t count = n_kv_max - row % std::min<int64_t>(n_kv_max, 17);
+        const int64_t count = exact_count ? n_kv_max : n_kv_max - row % std::min<int64_t>(n_kv_max, 17);
         std::sort(order.begin(), order.begin() + count);
         for (int64_t i = 0; i < count; ++i) {
             data_f32[row*ne0 + order[i]] = -0.03125f * (1 + (i + row) % 7);
@@ -224,6 +224,30 @@ static void init_tensor_kq_mask_sparse(ggml_tensor * tensor, int64_t n_kv_max) {
 
     ggml_fp32_to_fp16_row(data_f32.data(), data_f16.data(), data_f16.size());
     ggml_backend_tensor_set(tensor, data_f16.data(), 0, data_f16.size()*sizeof(ggml_fp16_t));
+}
+
+static void init_tensor_kq_sparse_indices(ggml_tensor * tensor, int64_t n_kv) {
+    GGML_ASSERT(tensor->type == GGML_TYPE_I32);
+    GGML_ASSERT(tensor->ne[0] > 1 && tensor->ne[0] <= n_kv);
+
+    const int64_t n_kv_max = tensor->ne[0];
+    const int64_t nrows = ggml_nrows(tensor);
+    std::vector<int32_t> data(ggml_nelements(tensor));
+    std::vector<int32_t> order(n_kv);
+    for (int64_t i = 0; i < n_kv; ++i) {
+        order[i] = i;
+    }
+
+    // Reproduce the exact-count mask initialization above so each index points
+    // at one of the finite entries in the corresponding mask row.
+    std::mt19937 gen(0x5A17);
+    for (int64_t row = 0; row < nrows; ++row) {
+        std::shuffle(order.begin(), order.end(), gen);
+        std::sort(order.begin(), order.begin() + n_kv_max);
+        std::copy_n(order.begin(), n_kv_max, data.begin() + row*n_kv_max);
+    }
+
+    ggml_backend_tensor_set(tensor, data.data(), 0, data.size()*sizeof(int32_t));
 }
 
 // generate a lower triangular matrix
@@ -8331,9 +8355,11 @@ struct test_flash_attn_ext : public test_case {
     const bool kv_view; // create K/V as views of a larger buffer (like a KV cache)
     const bool v_is_view_of_k;
     const int64_t n_kv_max;
+    const bool direct_sparse_indices;
 
     std::string vars() override {
-        return VARS_TO_STR17(hsk, hsv, nh, nr23, kv, nb, mask, sinks, max_bias, logit_softcap, prec, type_K, type_V, permute, kv_view, v_is_view_of_k, n_kv_max);
+        return VARS_TO_STR17(hsk, hsv, nh, nr23, kv, nb, mask, sinks, max_bias, logit_softcap, prec, type_K, type_V, permute, kv_view, v_is_view_of_k, n_kv_max) +
+            ",direct_sparse_indices=" + (direct_sparse_indices ? "true" : "false");
     }
 
     double max_nmse_err() override {
@@ -8350,9 +8376,10 @@ struct test_flash_attn_ext : public test_case {
     test_flash_attn_ext(int64_t hsk = 128, int64_t hsv = 128, int64_t nh = 32, std::array<int64_t, 2> nr23 = {1, 1}, int64_t kv = 96, int64_t nb = 8,
                         bool mask = true, bool sinks = false, float max_bias = 0.0f, float logit_softcap = 0.0f, ggml_prec prec = GGML_PREC_F32,
                         ggml_type type_K = GGML_TYPE_F16, ggml_type type_V = GGML_TYPE_F16, std::array<int32_t, 4> permute = {0, 1, 2, 3},
-                        bool kv_view = true, bool v_is_view_of_k = false, int64_t n_kv_max = 0)
+                        bool kv_view = true, bool v_is_view_of_k = false, int64_t n_kv_max = 0, bool direct_sparse_indices = false)
         : hsk(hsk), hsv(hsv), nh(nh), nr23(nr23), kv(kv), nb(nb), mask(mask), sinks(sinks), max_bias(max_bias), logit_softcap(logit_softcap), prec(prec),
-          type_K(type_K), type_V(type_V), permute(permute), kv_view(kv_view), v_is_view_of_k(v_is_view_of_k), n_kv_max(n_kv_max) {}
+          type_K(type_K), type_V(type_V), permute(permute), kv_view(kv_view), v_is_view_of_k(v_is_view_of_k), n_kv_max(n_kv_max),
+          direct_sparse_indices(direct_sparse_indices) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         const int64_t hsk_padded = GGML_PAD(hsk, ggml_blck_size(type_K));
@@ -8410,9 +8437,17 @@ struct test_flash_attn_ext : public test_case {
             ggml_set_name(s, "s");
         }
 
+        ggml_tensor * indices = nullptr;
+        if (direct_sparse_indices) {
+            GGML_ASSERT(mask && n_kv_max > 0);
+            indices = ggml_new_tensor_4d(ctx, GGML_TYPE_I32, n_kv_max, nb, 1, nr23[1]);
+            ggml_set_name(indices, "indices");
+        }
+
         ggml_tensor * out = ggml_flash_attn_ext(ctx, q, k, v, m, 1.0f/sqrtf(hsk), max_bias, logit_softcap);
         ggml_flash_attn_ext_add_sinks(out, s);
         ggml_flash_attn_ext_set_n_kv_max(out, n_kv_max);
+        ggml_flash_attn_ext_set_sparse_indices(out, indices);
         ggml_flash_attn_ext_set_prec (out, prec);
         ggml_set_name(out, "out");
 
@@ -8426,10 +8461,12 @@ struct test_flash_attn_ext : public test_case {
                 init_tensor_uniform(t, -10.0f, 10.0f);
             } else if (strcmp(t->name, "m") == 0) {
                 if (n_kv_max > 0) {
-                    init_tensor_kq_mask_sparse(t, n_kv_max);
+                    init_tensor_kq_mask_sparse(t, n_kv_max, direct_sparse_indices);
                 } else {
                     init_tensor_kq_mask(t);
                 }
+            } else if (strcmp(t->name, "indices") == 0) {
+                init_tensor_kq_sparse_indices(t, kv);
             } else {
                 init_tensor_uniform(t);
             }
@@ -11630,6 +11667,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, 4096,  1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false,  512));
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, 8192, 64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false,  512));
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 1, {12, 2}, 8192, 67, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false,  512));
+
+    // Qwen4exp direct top-k indices: one exact sparse list per query.
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, 8192, 64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 512, true));
 
     // sparse mask + quantized cache
     test_cases.emplace_back(new test_flash_attn_ext(128, 128, 1, { 8, 1}, 4096,  1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, false, 512));

@@ -24,6 +24,7 @@ typedef void (* fattn_kernel_t)(
         const char * __restrict__ V,
         const char * __restrict__ mask,
         const char * __restrict__ sinks,
+        const int  * __restrict__ sparse_indices,
         const int  * __restrict__ KV_max,
         float      * __restrict__ dst,
         float2     * __restrict__ dst_meta,
@@ -986,8 +987,9 @@ void launch_fattn(
 
     const bool V_is_K_view = V->view_src && (V->view_src == K || (V->view_src == K->view_src && V->view_offs == K->view_offs));
 
-    const ggml_tensor * mask  = dst->src[3];
-    const ggml_tensor * sinks = dst->src[4];
+    const ggml_tensor * mask                  = dst->src[3];
+    const ggml_tensor * sinks                 = dst->src[4];
+    const ggml_tensor * sparse_indices_tensor = dst->src[5];
 
     ggml_tensor * KQV = dst;
 
@@ -1092,18 +1094,38 @@ void launch_fattn(
     const int ntiles_z_gqa = ((gqa_ratio + ncols2 - 1) / ncols2);
     const int ntiles_dst   = ntiles_x * ntiles_z_gqa * K->ne[2] * Q->ne[3];
 
-    // sparse: a query tile of ncols1 queries shares one index list, the union of the queries' visible columns
+    const int * sparse_indices_data = nullptr;
+    int *       KV_max_data         = nullptr;
+
+    // Sparse attention either consumes a precomputed list for every query, or
+    // compacts the finite mask entries into one union list per query tile.
     int32_t n_kv_max = 0;
     if (use_sparse) {
         GGML_ASSERT(mask != nullptr);
         const int32_t n_kv_max_query = ggml_get_op_params_i32(KQV, 4);
         GGML_ASSERT(n_kv_max_query > 0);
-        n_kv_max = std::min<int64_t>(K->ne[1], int64_t(ncols1)*n_kv_max_query);
 
-        const size_t n_lists = size_t(ntiles_x) * mask->ne[3];
+        if (sparse_indices_tensor) {
+            GGML_ASSERT(ncols1 == 1);
+            GGML_ASSERT(sparse_indices_tensor->type == GGML_TYPE_I32);
+            GGML_ASSERT(ggml_is_contiguous(sparse_indices_tensor));
+            GGML_ASSERT(sparse_indices_tensor->ne[0] == n_kv_max_query);
+            GGML_ASSERT(sparse_indices_tensor->ne[1] == Q->ne[1]);
+            GGML_ASSERT(sparse_indices_tensor->ne[2] == 1);
+            GGML_ASSERT(Q->ne[3] % sparse_indices_tensor->ne[3] == 0);
 
-        KV_max.alloc(size_t(n_kv_max)*n_lists + n_lists);
-        ggml_cuda_flash_attn_ext_compact_mask(mask, KV_max.ptr, KV_max.ptr + size_t(n_kv_max)*n_lists, Q->ne[1], ncols1, n_kv_max, main_stream);
+            n_kv_max = n_kv_max_query;
+            sparse_indices_data = (const int *) sparse_indices_tensor->data;
+        } else {
+            n_kv_max = std::min<int64_t>(K->ne[1], int64_t(ncols1)*n_kv_max_query);
+
+            const size_t n_lists = size_t(ntiles_x) * mask->ne[3];
+            KV_max.alloc(size_t(n_kv_max)*n_lists + n_lists);
+            sparse_indices_data = KV_max.ptr;
+            KV_max_data = KV_max.ptr + size_t(n_kv_max)*n_lists;
+            ggml_cuda_flash_attn_ext_compact_mask(
+                mask, KV_max.ptr, KV_max_data, Q->ne[1], ncols1, n_kv_max, main_stream);
+        }
     }
 
     // Optional optimization where the mask is scanned to determine whether part of the calculation can be skipped.
@@ -1120,6 +1142,7 @@ void launch_fattn(
         const int iter_k = K->ne[1] / FATTN_KQ_STRIDE;
 
         KV_max.alloc(ne_KV_max);
+        KV_max_data = KV_max.ptr;
         ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(blocks_num_KV_max, block_dim_KV_max, 0, main_stream);
         ggml_cuda_kernel_launch(flash_attn_mask_to_KV_max<ncols1>, launch_params,
             (const half2 *) mask->data, KV_max.ptr, iter_k, s31, s33);
@@ -1233,7 +1256,8 @@ void launch_fattn(
         V_data,
         mask ? ((const char *) mask->data) : nullptr,
         sinks ? ((const char *) sinks->data) : nullptr,
-        KV_max.ptr,
+        sparse_indices_data,
+        KV_max_data,
         !stream_k && parallel_blocks > 1 ? dst_tmp.ptr : (float *) KQV->data, dst_tmp_meta.ptr,
         scale, max_bias, m0, m1, n_head_log2, logit_softcap,
         Q->ne[0], ne01,     Q->ne[2], Q->ne[3], Q->nb[1], Q->nb[2], Q->nb[3],
