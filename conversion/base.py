@@ -1597,6 +1597,9 @@ class TextModel(ModelBase):
         if chkhsh == "c7699093ba4255a91e702aa38a596aa81669f3525dae06c2953267dde580f448":
             # ref: https://huggingface.co/jinaai/jina-reranker-v1-tiny-en
             res = "jina-v1-en"
+        if chkhsh == "ff56fb99e60f4978c0aacffdb54ab8cc5a808741777dbcdb17fb986823d6ff7e":
+            # ref: https://huggingface.co/jinaai/jina-reranker-v1-tiny-en (transformers 5.10+)
+            res = "jina-v1-en"
         if chkhsh == "0876d13b50744004aa9aeae05e7b0647eac9d801b5ba4668afc01e709c15e19f":
             # ref: https://huggingface.co/jinaai/jina-embeddings-v2-base-en
             res = "jina-v2-en"
