@@ -1337,3 +1337,35 @@ Artifacts:
 - `/tmp/qsa-topk-radix.nsys-rep` and `/tmp/qsa-topk-cub.nsys-rep`
 - `/home/aman/qwen4-exp-opt-bench-20260911/results/decode-b1-pack-20260916/radix-topk-nographs-d32768.nsys-rep`
 - `/home/aman/qwen4-exp-opt-bench-20260911/results/decode-b1-pack-20260916/radix-topk-nographs-d32768.sqlite`
+
+## 2026-09-16: batch-1 recurrent projection inputs
+
+The explicit F32-to-BF16 activation cast shared by the four recurrent GDN
+projection groups is beneficial for prefill, but not for batch-1 decode. The
+decode graph now keeps the recurrent input in F32 and uses the CUDA
+BF16-weight/F32-vector kernels directly. Multi-token batches retain the shared
+BF16 cast, so the existing prefill path is unchanged.
+
+A profiler-bounded 16-token trace at 32K context on physical H100 GPUs 6/7
+measured 471.161 ms of summed GPU kernel work for the shared-BF16 control and
+462.930 ms for the F32-vector path, a **1.75% reduction**. Qwen4Exp CUDA
+validation passed with NMSE 8.38e-08 and a successful serialization roundtrip;
+the test subsequently encountered the already-known unrelated Meta-backend
+split-axis assertion.
+
+An unprofiled five-repeat tensor/EP comparison confirmed the gain:
+
+| recurrent projection input | TG64 samples | stable last-three mean |
+| --- | --- | ---: |
+| shared BF16 cast | 59.4030, 59.2673, 63.3876, 63.2930, 63.3823 | 63.3543 tok/s |
+| direct F32 vector | 59.8645, 61.1251, 64.7424, 64.6765, 64.7325 | 64.7171 tok/s |
+
+That is a **+2.15%** stable batch-1 decode improvement. Applying the same idea
+to the 96 HC projection inputs was rejected: enabling both paths increased the
+recurrent-only trace from 462.930 ms to 468.573 ms. HC therefore keeps its
+shared BF16 activation cast.
+
+Artifacts are under:
+
+- `/home/aman/qwen4-exp-opt-bench-20260911/results/decode-b1-proj-20260916/`
+- `bf16-control.nsys-rep`, `recurrent-only.nsys-rep`, and `f32-candidate.nsys-rep`

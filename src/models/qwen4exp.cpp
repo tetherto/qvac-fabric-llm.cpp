@@ -1072,9 +1072,11 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
     GGML_ASSERT(head_v_dim * num_v_heads == d_inner);
 
     // QKV, z, beta, and alpha all use BF16 weights in the native FP8 model.
-    // Share one explicit cast so their GEMMs do not each stage `cur` from F32.
+    // For multi-token batches, share one explicit cast so their GEMMs do not
+    // each stage `cur` from F32. For batch-1 decode, the CUDA BF16-weight/F32-
+    // vector kernels are faster than the cast plus cuBLAS tensor kernels.
     ggml_tensor * cur_mm = cur;
-    if (loras->empty() &&
+    if (n_seq_tokens != 1 && loras->empty() &&
         model.layers[il].wqkv->type      == GGML_TYPE_BF16 &&
         model.layers[il].wqkv_gate->type == GGML_TYPE_BF16 &&
         model.layers[il].ssm_beta->type  == GGML_TYPE_BF16 &&
