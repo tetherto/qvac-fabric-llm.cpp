@@ -104,6 +104,13 @@ if (CUDAToolkit_FOUND)
 
     file(GLOB   GGML_SOURCES_CUDA "*.cu")
     set(GGML_CUDA_CUTLASS_SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/mmq-cutlass.cu")
+    set(GGML_CUDA_GDN_CUTLASS_SOURCES
+        "${CMAKE_CURRENT_SOURCE_DIR}/gated-delta-net-cutlass.cu"
+        "${CMAKE_CURRENT_SOURCE_DIR}/gated-delta-net-cutlass-prefill.cu")
+    if (COMMAND license_add_file)
+        license_add_file("FlashInfer GDN CuTe helpers" "${CMAKE_CURRENT_SOURCE_DIR}/LICENSE-FlashInfer")
+        license_add_file("FlashInfer NOTICE" "${CMAKE_CURRENT_SOURCE_DIR}/NOTICE-FlashInfer")
+    endif()
     file(GLOB   SRCS "template-instances/fattn-tile*.cu")
     list(APPEND GGML_SOURCES_CUDA ${SRCS})
     file(GLOB   SRCS "template-instances/fattn-mma*.cu")
@@ -144,6 +151,7 @@ if (CUDAToolkit_FOUND)
         endif()
 
         list(REMOVE_ITEM GGML_SOURCES_CUDA "${GGML_CUDA_CUTLASS_SOURCE}")
+        list(REMOVE_ITEM GGML_SOURCES_CUDA ${GGML_CUDA_GDN_CUTLASS_SOURCES})
     endif()
 
     ggml_add_backend_library(ggml-cuda
@@ -224,6 +232,25 @@ if (CUDAToolkit_FOUND)
         endif()
         target_sources(ggml-cuda PRIVATE $<TARGET_OBJECTS:ggml-cuda-cutlass>)
 
+        add_library(ggml-cuda-gdn-cutlass OBJECT ${GGML_CUDA_GDN_CUTLASS_SOURCES})
+        set_target_properties(ggml-cuda-gdn-cutlass PROPERTIES
+            CUDA_ARCHITECTURES OFF
+            CUDA_STANDARD 20
+            CUDA_STANDARD_REQUIRED ON
+            POSITION_INDEPENDENT_CODE ON)
+        target_link_libraries(ggml-cuda-gdn-cutlass PRIVATE ggml-base)
+        target_include_directories(ggml-cuda-gdn-cutlass PRIVATE
+            ..
+            "${cutlass_SOURCE_DIR}/include")
+        target_compile_definitions(ggml-cuda-gdn-cutlass PRIVATE GGML_CUDA_CUTLASS)
+        target_compile_options(ggml-cuda-gdn-cutlass PRIVATE
+            "$<$<COMPILE_LANGUAGE:CUDA>:--generate-code=arch=compute_120f,code=sm_120f>"
+            "$<$<COMPILE_LANGUAGE:CUDA>:--generate-code=arch=compute_121f,code=sm_121f>"
+            "$<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>")
+        if (BUILD_SHARED_LIBS)
+            target_compile_definitions(ggml-cuda-gdn-cutlass PRIVATE GGML_BACKEND_BUILD GGML_BACKEND_SHARED)
+        endif()
+        target_sources(ggml-cuda PRIVATE $<TARGET_OBJECTS:ggml-cuda-gdn-cutlass>)
         target_compile_definitions(ggml-cuda PRIVATE GGML_CUDA_CUTLASS)
     endif()
 
@@ -311,6 +338,9 @@ if (CUDAToolkit_FOUND)
     set(GGML_CUDA_COMPILE_TARGETS ggml-cuda)
     if (TARGET ggml-cuda-cutlass)
         list(APPEND GGML_CUDA_COMPILE_TARGETS ggml-cuda-cutlass)
+    endif()
+    if (TARGET ggml-cuda-gdn-cutlass)
+        list(APPEND GGML_CUDA_COMPILE_TARGETS ggml-cuda-gdn-cutlass)
     endif()
     foreach(GGML_CUDA_COMPILE_TARGET IN LISTS GGML_CUDA_COMPILE_TARGETS)
         target_compile_options(${GGML_CUDA_COMPILE_TARGET} PRIVATE "$<$<COMPILE_LANGUAGE:CUDA>:${CUDA_FLAGS}>")

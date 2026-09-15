@@ -1,5 +1,10 @@
 #include "gated_delta_net.cuh"
+#ifdef GGML_CUDA_CUTLASS
+#include "gated-delta-net-cutlass.cuh"
+#endif
 #include "ggml-cuda/common.cuh"
+
+#include <cstdint>
 
 template <int S_v, bool KDA, bool keep_rs_t>
 __global__ void __launch_bounds__((ggml_cuda_get_physical_warp_size() < S_v ? ggml_cuda_get_physical_warp_size() : S_v) * 4, 2)
@@ -220,6 +225,60 @@ static void launch_gated_delta_net(
     }
 }
 
+#ifdef GGML_CUDA_CUTLASS
+static ggml_cuda_gdn_cute_args ggml_cuda_gdn_cute_args_from_tensor(const ggml_tensor * dst) {
+    const ggml_tensor * q     = dst->src[0];
+    const ggml_tensor * k     = dst->src[1];
+    const ggml_tensor * v     = dst->src[2];
+    const ggml_tensor * g     = dst->src[3];
+    const ggml_tensor * beta  = dst->src[4];
+    const ggml_tensor * state = dst->src[5];
+
+    const int64_t S_v = v->ne[0];
+    const int64_t H   = v->ne[1];
+    return {
+        (const float *) q->data,
+        (const float *) k->data,
+        (const float *) v->data,
+        (const float *) g->data,
+        (const float *) beta->data,
+        (const float *) state->data,
+        (float *) dst->data,
+        nullptr,
+        nullptr,
+        0,
+        H,
+        q->ne[1],
+        v->ne[2],
+        v->ne[3],
+        v->ne[3] / q->ne[3],
+        (int64_t) (q->nb[1] / sizeof(float)),
+        (int64_t) (q->nb[2] / sizeof(float)),
+        (int64_t) (q->nb[3] / sizeof(float)),
+        (int64_t) (v->nb[1] / sizeof(float)),
+        (int64_t) (v->nb[2] / sizeof(float)),
+        (int64_t) (v->nb[3] / sizeof(float)),
+        (int64_t) (beta->nb[1] / sizeof(float)),
+        (int64_t) (beta->nb[2] / sizeof(float)),
+        (int64_t) (beta->nb[3] / sizeof(float)),
+        1.0f / sqrtf((float) S_v),
+        g->ne[0] == 1 && ggml_get_op_params_i32(dst, 0) == 1 && S_v == 128 && q->ne[0] == 128,
+    };
+}
+#endif
+
+size_t ggml_cuda_gated_delta_net_get_alloc_size(int device, const ggml_tensor * dst) {
+    const size_t logical_size = ggml_nbytes(dst);
+#ifdef GGML_CUDA_CUTLASS
+    GGML_ASSERT(dst->op == GGML_OP_GATED_DELTA_NET);
+    return ggml_cuda_gdn_cute_get_alloc_size(
+        device, ggml_cuda_gdn_cute_args_from_tensor(dst), logical_size);
+#else
+    GGML_UNUSED(device);
+    return logical_size;
+#endif
+}
+
 static void ggml_cuda_op_gated_delta_net_impl(
         ggml_backend_cuda_context & ctx, ggml_tensor * dst, const ggml_cuda_gated_delta_net_fused_cache * cache) {
     ggml_tensor * src_q     = dst->src[0];
@@ -294,6 +353,26 @@ static void ggml_cuda_op_gated_delta_net_impl(
         state_slot_stride = cache->slot_stride;
     }
 
+#ifdef GGML_CUDA_CUTLASS
+    {
+        ggml_cuda_gdn_cute_args args = ggml_cuda_gdn_cute_args_from_tensor(dst);
+        args.state_out = state_d;
+        if (ggml_cuda_gdn_cute_available(ctx.device, args)) {
+            constexpr size_t workspace_alignment = 128;
+            const size_t logical_size = ggml_nbytes(dst);
+            const size_t allocation_size = ggml_backend_buffer_get_alloc_size(dst->buffer, dst);
+            GGML_ASSERT(logical_size <= SIZE_MAX - (workspace_alignment - 1));
+            const size_t workspace_offset =
+                (logical_size + workspace_alignment - 1) & ~(workspace_alignment - 1);
+            GGML_ASSERT(workspace_offset <= allocation_size);
+            args.workspace = (char *) dst->data + workspace_offset;
+            args.workspace_size = allocation_size - workspace_offset;
+            if (ggml_cuda_gdn_cute_launch(ctx.device, args, stream)) {
+                return;
+            }
+        }
+    }
+#endif
     if (kda) {
         if (keep_rs) {
             launch_gated_delta_net<true, true>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d,
