@@ -1,0 +1,14 @@
+diff --git a/conversion/base.py b/conversion/base.py
+index 402ed0786..0eab107fd 100644
+--- a/conversion/base.py
++++ b/conversion/base.py
+@@ -221,7 +221,8 @@ class ModelBase:
+ 
+         prefix = "model" if not self.is_mistral_format else "consolidated"
+         part_names: list[str] = ModelBase.get_model_part_names(self.dir_model, prefix, ".safetensors")
+-        is_safetensors: bool = len(part_names) > 0
++        # some checkpoints name their parts differently (e.g. layers-N.safetensors) and only the index lists them
++        is_safetensors: bool = len(part_names) > 0 or (self.dir_model / "model.safetensors.index.json").is_file()
+         if not is_safetensors:
+             part_names = ModelBase.get_model_part_names(self.dir_model, "pytorch_model", ".bin")
+ 

@@ -1,0 +1,279 @@
+diff --git a/ggml/CMakeLists.txt b/ggml/CMakeLists.txt
+index 95e36e9d2..19314c0cb 100644
+--- a/ggml/CMakeLists.txt
++++ b/ggml/CMakeLists.txt
+@@ -209,6 +209,8 @@ option(GGML_CUDA_FA                         "ggml: compile ggml FlashAttention C
+ option(GGML_CUDA_FA_ALL_QUANTS              "ggml: compile all quants for FlashAttention"     OFF)
+ option(GGML_CUDA_GRAPHS                     "ggml: use CUDA graphs (llama.cpp only)"          ${GGML_CUDA_GRAPHS_DEFAULT})
+ option(GGML_CUDA_NCCL                       "ggml: use NVIDIA Collective Comm. Library"       ON)
++option(GGML_CUDA_CUTLASS                    "ggml: build the CUTLASS SM90 FP8 block-scaled GEMM (needs CUDA arch 90)" OFF)
++set   (GGML_CUDA_CUTLASS_DIR "" CACHE PATH  "ggml: existing CUTLASS source tree (skips the download)")
+ set   (GGML_CUDA_COMPRESSION_MODE "size" CACHE STRING
+                                             "ggml: cuda link binary compression mode; requires cuda 12.8+")
+ set_property(CACHE GGML_CUDA_COMPRESSION_MODE PROPERTY STRINGS "none;speed;balance;size")
+diff --git a/ggml/src/ggml-cuda/CMakeLists.txt b/ggml/src/ggml-cuda/CMakeLists.txt
+index d3953eee9..6eb074476 100644
+--- a/ggml/src/ggml-cuda/CMakeLists.txt
++++ b/ggml/src/ggml-cuda/CMakeLists.txt
+@@ -264,6 +264,26 @@ if (CUDAToolkit_FOUND)
+     endif()
+ 
+     target_compile_options(ggml-cuda PRIVATE "$<$<COMPILE_LANGUAGE:CUDA>:${CUDA_FLAGS}>")
++
++    if (GGML_CUDA_CUTLASS)
++        if (GGML_CUDA_CUTLASS_DIR)
++            set(cutlass_SOURCE_DIR ${GGML_CUDA_CUTLASS_DIR})
++        else()
++            include(FetchContent)
++            FetchContent_Declare(cutlass GIT_REPOSITORY https://github.com/NVIDIA/cutlass.git GIT_TAG v4.2.1 GIT_SHALLOW TRUE)
++            FetchContent_Populate(cutlass)
++        endif()
++        message(STATUS "CUTLASS FP8 GEMM enabled, sources in ${cutlass_SOURCE_DIR}")
++
++        # sm_90a only (wgmma/TMA); compiled apart from the main target so the arch list of ggml-cuda stays as configured
++        add_library(ggml-cuda-cutlass OBJECT mmf8-cutlass.cu)
++        target_include_directories(ggml-cuda-cutlass PRIVATE ${cutlass_SOURCE_DIR}/include ${cutlass_SOURCE_DIR}/tools/util/include ${CMAKE_CURRENT_SOURCE_DIR})
++        set_target_properties(ggml-cuda-cutlass PROPERTIES CUDA_ARCHITECTURES OFF POSITION_INDEPENDENT_CODE ON CUDA_STANDARD 17 CXX_STANDARD 17)
++        target_compile_options(ggml-cuda-cutlass PRIVATE "$<$<COMPILE_LANGUAGE:CUDA>:-gencode;arch=compute_90a,code=sm_90a;--expt-relaxed-constexpr;-Xcompiler;-Wno-pedantic>")
++        target_link_libraries(ggml-cuda-cutlass PRIVATE CUDA::cudart)
++        target_link_libraries(ggml-cuda PRIVATE ggml-cuda-cutlass)
++        target_compile_definitions(ggml-cuda PRIVATE GGML_CUDA_CUTLASS)
++    endif()
+ else()
+     message(FATAL_ERROR "CUDA Toolkit not found")
+ endif()
+diff --git a/ggml/src/ggml-cuda/mmf8-cutlass.cu b/ggml/src/ggml-cuda/mmf8-cutlass.cu
+new file mode 100644
+index 000000000..ac2aa245a
+--- /dev/null
++++ b/ggml/src/ggml-cuda/mmf8-cutlass.cu
+@@ -0,0 +1,127 @@
++// SM90 block-scaled FP8 GEMM for F8_E4M3 weights; compiled for sm_90a only (see GGML_CUDA_CUTLASS in CMakeLists.txt)
++#include "mmf8-cutlass.cuh"
++
++#include "cutlass/cutlass.h"
++#include "cutlass/numeric_types.h"
++#include "cute/tensor.hpp"
++#include "cutlass/gemm/dispatch_policy.hpp"
++#include "cutlass/gemm/collective/collective_builder.hpp"
++#include "cutlass/gemm/device/gemm_universal_adapter.h"
++#include "cutlass/gemm/kernel/gemm_universal.hpp"
++#include "cutlass/gemm/kernel/tile_scheduler_params.h"
++#include "cutlass/epilogue/dispatch_policy.hpp"
++#include "cutlass/epilogue/collective/collective_builder.hpp"
++#include "cutlass/detail/blockwise_scale_layout.hpp"
++#include "cutlass/util/packed_stride.hpp"
++
++#include <cstdio>
++#include <cstdlib>
++
++namespace {
++
++using namespace cute;
++
++// A [M][K] row-major (per-token activations), B [N][K] (weights, k contiguous), D [M][N] row-major f32
++// tile 128x128x128, cluster 1x1x1, persistent scheduler: 1094 / 1136 TFLOPS at M=4096 on the FFN shapes (F0)
++using ElementA = cutlass::float_e4m3_t;
++using LayoutA  = cutlass::layout::RowMajor;
++using ElementB = cutlass::float_e4m3_t;
++using LayoutB  = cutlass::layout::ColumnMajor;
++using ElementD = float;
++using LayoutD  = cutlass::layout::RowMajor;
++using ElementAccumulator = float;
++using ElementCompute     = float;
++constexpr int AlignA = 16;
++constexpr int AlignB = 16;
++constexpr int AlignD = 4;
++
++using TileShape    = Shape<_128, _128, _128>;
++using ClusterShape = Shape<_1, _1, _1>;
++
++using ScaleConfig = cutlass::detail::Sm90BlockwiseScaleConfig<1, 128, 128>;
++using LayoutSFA   = decltype(ScaleConfig::deduce_layoutSFA());
++using LayoutSFB   = decltype(ScaleConfig::deduce_layoutSFB());
++
++using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
++    cutlass::arch::Sm90, cutlass::arch::OpClassTensorOp,
++    TileShape, ClusterShape,
++    cutlass::epilogue::collective::EpilogueTileAuto,
++    ElementAccumulator, ElementCompute,
++    void, LayoutD, AlignD,
++    ElementD, LayoutD, AlignD,
++    cutlass::epilogue::TmaWarpSpecializedCooperative
++>::CollectiveOp;
++
++using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<
++    cutlass::arch::Sm90, cutlass::arch::OpClassTensorOp,
++    ElementA, cute::tuple<LayoutA, LayoutSFA>, AlignA,
++    ElementB, cute::tuple<LayoutB, LayoutSFB>, AlignB,
++    ElementAccumulator,
++    TileShape, ClusterShape,
++    cutlass::gemm::collective::StageCountAutoCarveout<static_cast<int>(sizeof(typename CollectiveEpilogue::SharedStorage))>,
++    cutlass::gemm::KernelTmaWarpSpecializedCooperativeFP8Blockwise
++>::CollectiveOp;
++
++using GemmKernel = cutlass::gemm::kernel::GemmUniversal<Shape<int, int, int, int>, CollectiveMainloop, CollectiveEpilogue, cutlass::gemm::PersistentScheduler>;
++using Gemm       = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
++using StrideA    = typename Gemm::GemmKernel::StrideA;
++using StrideB    = typename Gemm::GemmKernel::StrideB;
++using StrideD    = typename Gemm::GemmKernel::StrideD;
++
++constexpr int MAX_SWIZZLE = 4;
++
++typename Gemm::Arguments make_args(const uint8_t * a, const float * sfa, const uint8_t * b, const float * sfb, float * d, int M, int N, int K) {
++    static cutlass::KernelHardwareInfo hw_info = [] {
++        cutlass::KernelHardwareInfo info;
++        cudaGetDevice(&info.device_id);
++        info.sm_count = cutlass::KernelHardwareInfo::query_device_multiprocessor_count(info.device_id);
++        return info;
++    }();
++
++    const StrideA stride_A = cutlass::make_cute_packed_stride(StrideA{}, make_shape(M, K, 1));
++    const StrideB stride_B = cutlass::make_cute_packed_stride(StrideB{}, make_shape(N, K, 1));
++    const StrideD stride_D = cutlass::make_cute_packed_stride(StrideD{}, make_shape(M, N, 1));
++    const LayoutSFA layout_SFA = ScaleConfig::tile_atom_to_shape_SFA(make_shape(M, N, K, 1));
++    const LayoutSFB layout_SFB = ScaleConfig::tile_atom_to_shape_SFB(make_shape(M, N, K, 1));
++
++    typename Gemm::Arguments args{
++        cutlass::gemm::GemmUniversalMode::kGemm,
++        {M, N, K, 1},
++        {(const ElementA *) a, stride_A, (const ElementB *) b, stride_B, sfa, layout_SFA, sfb, layout_SFB},
++        {{}, nullptr, stride_D, d, stride_D},
++        hw_info
++    };
++    args.scheduler.max_swizzle_size = MAX_SWIZZLE;
++    return args;
++}
++
++} // namespace
++
++size_t ggml_cuda_mmf8_cutlass_workspace_size(int M, int N, int K) {
++    return Gemm::get_workspace_size(make_args(nullptr, nullptr, nullptr, nullptr, nullptr, M, N, K));
++}
++
++void ggml_cuda_mmf8_cutlass(
++        const uint8_t * a, const float * sfa, const uint8_t * b, const float * sfb, float * d,
++        int M, int N, int K, void * workspace, size_t workspace_size, cudaStream_t stream) {
++    const typename Gemm::Arguments args = make_args(a, sfa, b, sfb, d, M, N, K);
++
++    Gemm gemm;
++    cutlass::Status status = gemm.can_implement(args);
++    if (status != cutlass::Status::kSuccess) {
++        fprintf(stderr, "%s: CUTLASS cannot implement the FP8 GEMM for M=%d N=%d K=%d: %s\n", __func__, M, N, K, cutlass::cutlassGetStatusString(status));
++        abort();
++    }
++    if (Gemm::get_workspace_size(args) > workspace_size) {
++        fprintf(stderr, "%s: workspace too small for M=%d N=%d K=%d\n", __func__, M, N, K);
++        abort();
++    }
++    status = gemm.initialize(args, workspace, stream);
++    if (status == cutlass::Status::kSuccess) {
++        status = gemm.run(stream);
++    }
++    if (status != cutlass::Status::kSuccess) {
++        fprintf(stderr, "%s: CUTLASS FP8 GEMM failed for M=%d N=%d K=%d: %s\n", __func__, M, N, K, cutlass::cutlassGetStatusString(status));
++        abort();
++    }
++}
+diff --git a/ggml/src/ggml-cuda/mmf8-cutlass.cuh b/ggml/src/ggml-cuda/mmf8-cutlass.cuh
+new file mode 100644
+index 000000000..3aa888994
+--- /dev/null
++++ b/ggml/src/ggml-cuda/mmf8-cutlass.cuh
+@@ -0,0 +1,14 @@
++#pragma once
++
++#include <cuda_runtime.h>
++
++#include <cstddef>
++#include <cstdint>
++
++// SM90 block-scaled FP8 GEMM (CUTLASS): D[M][N] = sum_k A[M][K] * B[N][K], e4m3 operands,
++// A scales per (token, 128-k group) stored [K/128][M], B scales per 128x128 block stored [K/128][N/128]
++size_t ggml_cuda_mmf8_cutlass_workspace_size(int M, int N, int K);
++
++void ggml_cuda_mmf8_cutlass(
++        const uint8_t * a, const float * sfa, const uint8_t * b, const float * sfb, float * d,
++        int M, int N, int K, void * workspace, size_t workspace_size, cudaStream_t stream);
+diff --git a/ggml/src/ggml-cuda/mmf8.cu b/ggml/src/ggml-cuda/mmf8.cu
+index 4393c1852..4c8cfdcb2 100644
+--- a/ggml/src/ggml-cuda/mmf8.cu
++++ b/ggml/src/ggml-cuda/mmf8.cu
+@@ -2,6 +2,9 @@
+ #include "common.cuh"
+ #include "convert.cuh"
+ #include "mmf8.cuh"
++#ifdef GGML_CUDA_CUTLASS
++#include "mmf8-cutlass.cuh"
++#endif // GGML_CUDA_CUTLASS
+ 
+ // two packed e4m3 -> two floats; e4m3 values are exact in f16
+ static __device__ __forceinline__ float2 ggml_cuda_e4m3x2_to_float2(const uint16_t v) {
+@@ -202,6 +205,54 @@ static void mul_mat_f8_e4m3_cublas(
+                 CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+ }
+ 
++#ifdef GGML_CUDA_CUTLASS
++// activations to e4m3 with one scale per (token, 128-k group); scales stored [K/128][M] (M contiguous) for the CUTLASS SFA layout
++// one warp per (token, group): 4 floats per lane
++static __global__ void quantize_f8_e4m3_group128(
++        const float * __restrict__ x, uint8_t * __restrict__ q, float * __restrict__ sfa, const int ntokens, const int ncols) {
++    const int nblk_k = ncols/GGML_F8_E4M3_SCALE_BLOCK;
++    const int pair   = blockIdx.x*(blockDim.x/32) + threadIdx.x/32;
++    const int lane   = threadIdx.x % 32;
++    if (pair >= ntokens*nblk_k) {
++        return;
++    }
++    const int m  = pair % ntokens;
++    const int kb = pair / ntokens;
++
++    const size_t i = (size_t) m*ncols + (size_t) kb*GGML_F8_E4M3_SCALE_BLOCK + lane*4;
++    const float4 v = *(const float4 *) (x + i);
++    float amax = fmaxf(fmaxf(fabsf(v.x), fabsf(v.y)), fmaxf(fabsf(v.z), fabsf(v.w)));
++    amax = warp_reduce_max<32>(amax);
++
++    const float scale = amax > 0.0f ? amax/448.0f : 1.0f;
++    const float inv   = amax > 0.0f ? 448.0f/amax : 1.0f;
++    const __nv_fp8x2_storage_t lo = __nv_cvt_float2_to_fp8x2(make_float2(v.x*inv, v.y*inv), __NV_SATFINITE, __NV_E4M3);
++    const __nv_fp8x2_storage_t hi = __nv_cvt_float2_to_fp8x2(make_float2(v.z*inv, v.w*inv), __NV_SATFINITE, __NV_E4M3);
++    *(uint32_t *) (q + i) = (uint32_t) lo | ((uint32_t) hi << 16);
++    if (lane == 0) {
++        sfa[(size_t) kb*ntokens + m] = scale;
++    }
++}
++
++static void mul_mat_f8_e4m3_cutlass(
++        ggml_backend_cuda_context & ctx, const uint8_t * x, const float * sx, const float * y, float * dst,
++        const int ncols, const int nrows, const int64_t ntokens, cudaStream_t stream) {
++    const int nblk_k = ncols/GGML_F8_E4M3_SCALE_BLOCK;
++
++    ggml_cuda_pool_alloc<uint8_t> yq(ctx.pool(), (size_t) ntokens*ncols);
++    ggml_cuda_pool_alloc<float>   ys(ctx.pool(), (size_t) ntokens*nblk_k);
++    {
++        const int64_t npairs = ntokens*nblk_k;
++        const dim3 block_nums((npairs + 7)/8, 1, 1);
++        quantize_f8_e4m3_group128<<<block_nums, 256, 0, stream>>>(y, yq.get(), ys.get(), ntokens, ncols);
++    }
++
++    const size_t ws_size = ggml_cuda_mmf8_cutlass_workspace_size(ntokens, nrows, ncols);
++    ggml_cuda_pool_alloc<uint8_t> ws(ctx.pool(), ws_size > 0 ? ws_size : 16);
++    ggml_cuda_mmf8_cutlass(yq.get(), ys.get(), x, sx, dst, ntokens, nrows, ncols, ws.get(), ws_size, stream);
++}
++#endif // GGML_CUDA_CUTLASS
++
+ void ggml_cuda_mul_mat_f8(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+     const ggml_tensor * src0_s = dst->src[2];
+ 
+@@ -232,5 +283,12 @@ void ggml_cuda_mul_mat_f8(ggml_backend_cuda_context & ctx, const ggml_tensor * s
+         return;
+     }
+ 
++#ifdef GGML_CUDA_CUTLASS
++    if (ggml_cuda_info().devices[ctx.device].cc == GGML_CUDA_CC_HOPPER && ((uintptr_t) y % 16 == 0)) {
++        mul_mat_f8_e4m3_cutlass(ctx, x, sx, y, d, ncols, nrows, ntokens, stream);
++        return;
++    }
++#endif // GGML_CUDA_CUTLASS
++
+     mul_mat_f8_e4m3_cublas(ctx, x, sx, y, d, ncols, nrows, nblk_n, ntokens, stream);
+ }
