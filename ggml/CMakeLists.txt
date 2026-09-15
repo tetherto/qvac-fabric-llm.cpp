@@ -210,6 +210,8 @@ option(GGML_CUDA_FA                         "ggml: compile ggml FlashAttention C
 option(GGML_CUDA_FA_ALL_QUANTS              "ggml: compile all quants for FlashAttention"     OFF)
 option(GGML_CUDA_GRAPHS                     "ggml: use CUDA graphs (llama.cpp only)"          ${GGML_CUDA_GRAPHS_DEFAULT})
 option(GGML_CUDA_NCCL                       "ggml: use NVIDIA Collective Comm. Library"       ON)
+option(GGML_CUDA_CUTLASS                    "ggml: build the CUTLASS SM90 FP8 block-scaled GEMM (needs CUDA arch 90)" OFF)
+set   (GGML_CUDA_CUTLASS_DIR "" CACHE PATH  "ggml: existing CUTLASS source tree (skips the download)")
 set   (GGML_CUDA_COMPRESSION_MODE "size" CACHE STRING
                                             "ggml: cuda link binary compression mode; requires cuda 12.8+")
 set_property(CACHE GGML_CUDA_COMPRESSION_MODE PROPERTY STRINGS "none;speed;balance;size")

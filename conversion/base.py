@@ -221,7 +221,8 @@ class ModelBase:
 
         prefix = "model" if not self.is_mistral_format else "consolidated"
         part_names: list[str] = ModelBase.get_model_part_names(self.dir_model, prefix, ".safetensors")
-        is_safetensors: bool = len(part_names) > 0
+        # some checkpoints name their parts differently (e.g. layers-N.safetensors) and only the index lists them
+        is_safetensors: bool = len(part_names) > 0 or (self.dir_model / "model.safetensors.index.json").is_file()
         if not is_safetensors:
             part_names = ModelBase.get_model_part_names(self.dir_model, "pytorch_model", ".bin")
 
@@ -730,6 +731,51 @@ class ModelBase:
         self._write_scale_tensor(new_name.replace(".weight", ".scale"), scale2)
         self._write_scale_tensor(new_name.replace(".weight", ".input_scale"), input_scale)
 
+    def modify_fp8_raw(self, name: str, weight: Tensor, scale: Tensor) -> tuple[Tensor, Tensor] | None:
+        # hook for architectures that permute rows or columns; permutations must move whole 128-blocks
+        # return None to leave the tensor to the dequant path
+        del name
+        return weight, scale
+
+    def _repack_fp8(self):
+        quant_config = self.hparams.get("quantization_config") or {}
+        if quant_config.get("quant_method") != "fp8":
+            raise ValueError("--outtype fp8 needs an FP8 checkpoint (quantization_config.quant_method == 'fp8')")
+        block = gguf.GGML_F8_E4M3_SCALE_BLOCK
+        if list(quant_config.get("weight_block_size") or []) != [block, block]:
+            raise ValueError(f"--outtype fp8 needs weight_block_size [{block}, {block}], got {quant_config.get('weight_block_size')}")
+
+        consumed: list[str] = []
+        for name in list(self.model_tensors.keys()):
+            if not name.endswith("_scale_inv"):
+                continue
+            weight_name = name.removesuffix("_scale_inv")
+            weight = LazyTorchTensor.to_eager(self.model_tensors[weight_name]())
+            scale = LazyTorchTensor.to_eager(self.model_tensors[name]())
+            if weight.dtype != torch.float8_e4m3fn or weight.ndim != 2 or scale.ndim != 2:
+                continue
+            n, k = weight.shape
+            if n % block or k % block or tuple(scale.shape) != (n // block, k // block):
+                logger.info(f"{weight_name}: shape {list(weight.shape)} is not 128-aligned, dequantizing instead")
+                continue
+            # the hook sees the raw e4m3 bytes (uint8) and the F32 scales
+            transformed = self.modify_fp8_raw(weight_name, weight.view(torch.uint8), scale.float())
+            if transformed is None:
+                continue
+            weight, scale = transformed
+
+            new_name = self.map_tensor_name(weight_name)
+            w_u8 = weight.contiguous().cpu().numpy()
+            # ggml shape {n/128, k/128}: n/128 contiguous, the layout the CUDA block-scaled GEMM reads
+            s_f32 = np.ascontiguousarray(scale.float().cpu().numpy().T)
+            logger.info(f"Repacked {new_name} with shape {list(weight.shape)} as F8_E4M3 + scale {list(s_f32.shape)}")
+            self.gguf_writer.add_tensor(new_name, w_u8, raw_dtype=gguf.GGMLQuantizationType.F8_E4M3)
+            self.gguf_writer.add_tensor(new_name.replace(".weight", ".scale"), s_f32)
+            consumed += [weight_name, name]
+
+        for name in consumed:
+            self.model_tensors.pop(name, None)
+
     def _generate_nvfp4_tensors(self):
         # Per-layer expert merging to avoid holding all experts in memory
         expert_blocks: dict[tuple[int, str], list[tuple[int, np.ndarray]]] = {}
@@ -897,6 +943,9 @@ class ModelBase:
                             self.model_tensors[input_scale_name] = inverse_scale(self.model_tensors.pop(name))
             self._generate_nvfp4_tensors()
 
+        if self.ftype == gguf.LlamaFileType.MOSTLY_F8_E4M3:
+            self._repack_fp8()
+
         self.dequant_model()
 
         # Handle empty tensor_map for models with block_count=0 (like MobileNetV5)
@@ -1003,6 +1052,8 @@ class ModelBase:
                         data_qtype = gguf.GGMLQuantizationType.TQ1_0
                     elif self.ftype == gguf.LlamaFileType.MOSTLY_TQ2_0:
                         data_qtype = gguf.GGMLQuantizationType.TQ2_0
+                    elif self.ftype == gguf.LlamaFileType.MOSTLY_F8_E4M3:
+                        data_qtype = gguf.GGMLQuantizationType.BF16
                     else:
                         raise ValueError(f"Unknown file type: {self.ftype.name}")
 

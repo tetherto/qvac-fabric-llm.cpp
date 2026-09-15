@@ -37,6 +37,7 @@
 #include "ggml-cuda/getrows.cuh"
 #include "ggml-cuda/im2col.cuh"
 #include "ggml-cuda/mmf.cuh"
+#include "ggml-cuda/mmf8.cuh"
 #include "ggml-cuda/mmq-cutlass.cuh"
 #include "ggml-cuda/mmq.cuh"
 #include "ggml-cuda/mmvf.cuh"
@@ -2172,6 +2173,10 @@ static bool ggml_cuda_repacked_mmvq_supported(
 static void ggml_cuda_mul_mat_canonical(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     GGML_TENSOR_BINARY_OP_LOCALS
+    if (src0->type == GGML_TYPE_F8_E4M3) {
+        ggml_cuda_mul_mat_f8(ctx, src0, src1, dst);
+        return;
+    }
 
     // If src0 is a temporary compute buffer it may have some padding that needs to be cleared for mul_mat_vec_q or mul_mat_q.
     // But if src0 is also a view of another tensor then this cannot be done safely because it may overwrite valid tensor data.
@@ -5818,6 +5823,10 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                 }
                 if (b->type == GGML_TYPE_F16 && a->type != GGML_TYPE_F16) {
                     return false;
+                }
+                // src[2] (the block scales) may be absent here: the loader probes the op without it
+                if (a->type == GGML_TYPE_F8_E4M3) {
+                    return op->op == GGML_OP_MUL_MAT && b->type == GGML_TYPE_F32 && a->ne[2] == 1 && a->ne[3] == 1;
                 }
 #ifdef GGML_USE_MUSA
                 const int cc = ggml_cuda_info().devices[dev_ctx->device].cc;
