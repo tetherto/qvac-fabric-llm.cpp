@@ -4582,7 +4582,7 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
         }
     }
 
-    bool work_size(int /* n_threads */, const struct ggml_tensor * op, size_t & size) override {
+    bool work_size(int n_threads, const struct ggml_tensor * op, size_t & size) override {
         switch (op->op) {
             case GGML_OP_MUL_MAT:
                 {
@@ -4606,8 +4606,8 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
             case GGML_OP_OUT_PROD:
                 {
                     const int64_t ne00 = op->src[0]->ne[0];
-                    // Same scratch as standard out_prod_q: ne00 floats + cache line per thread
-                    size = (ne00 + CACHE_LINE_SIZE_F32) * sizeof(float);
+                    // forward_out_prod slices wdata per thread: ne00 floats + cache line each
+                    size = (ne00 + CACHE_LINE_SIZE_F32) * sizeof(float) * n_threads;
                     return true;
                 }
             default:

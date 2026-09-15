@@ -119,10 +119,13 @@ layout (constant_id = 3) const uint BK = 16;  // Assumed to be 32 if working wit
 #endif
 
 #ifdef COOPMAT
-#define SHMEM_STRIDE (BK / 2 + 4)
+layout(constant_id = 12) const uint SHMEM_STRIDE_PAD = 4;
+layout(constant_id = 13) const bool APPLY_SLM_A_RESHAPE = false;
 #else
-#define SHMEM_STRIDE (BK / 2 + 1)
+const uint SHMEM_STRIDE_PAD = 1;
+const bool APPLY_SLM_A_RESHAPE = false;
 #endif
+#define SHMEM_STRIDE (BK / 2 + SHMEM_STRIDE_PAD)
 
 shared FLOAT_TYPEV2 buf_a[BM * SHMEM_STRIDE];
 shared FLOAT_TYPEV2 buf_b[BN * SHMEM_STRIDE];
@@ -281,17 +284,36 @@ void main() {
     }
 #endif
 
-    for (uint block = start_k; block < end_k; block += BK) {
-        [[unroll]] for (uint l = 0; l < BM; l += loadstride_a) {
-            load_a_to_shmem(pos_a, loadr_a, loadc_a + l, ir * BM + loadc_a + l, block, end_k);
-        }
-        [[unroll]] for (uint l = 0; l < BN; l += loadstride_b) {
-#if !defined(MUL_MAT_ID)
-            load_b_to_shmem(pos_b, loadr_b, loadc_b + l, ic * BN + loadc_b + l, block, end_k);
+    // Only the last tile in M/N can hang past the end of A/B. Branch each tile load
+    // on its own flag: bounds_check reaches the loaders as a literal, so interior
+    // tiles fold the checks away. Both flags are workgroup-uniform.
+    const bool bounds_check_a = ir * BM + BM > p.M;
+#if defined(MUL_MAT_ID)
+    const bool bounds_check_b = ic * BN + BN > _ne1;
 #else
-            load_b_to_shmem(pos_b, loadr_b, loadc_b + l, ic, _ne1, block, end_k);
+    const bool bounds_check_b = ic * BN + BN > p.N;
 #endif
-        }
+
+#define MM_LOAD_A(bounds_check) \
+    [[unroll]] for (uint l = 0; l < BM; l += loadstride_a) { \
+        load_a_to_shmem(pos_a, loadr_a, loadc_a + l, ir * BM + loadc_a + l, bounds_check, block, end_k); \
+    }
+
+#if defined(MUL_MAT_ID)
+#define MM_LOAD_B(bounds_check) \
+    [[unroll]] for (uint l = 0; l < BN; l += loadstride_b) { \
+        load_b_to_shmem(pos_b, loadr_b, loadc_b + l, ic, _ne1, bounds_check, block, end_k); \
+    }
+#else
+#define MM_LOAD_B(bounds_check) \
+    [[unroll]] for (uint l = 0; l < BN; l += loadstride_b) { \
+        load_b_to_shmem(pos_b, loadr_b, loadc_b + l, ic * BN + loadc_b + l, bounds_check, block, end_k); \
+    }
+#endif
+
+    for (uint block = start_k; block < end_k; block += BK) {
+        if (bounds_check_a) { MM_LOAD_A(true) } else { MM_LOAD_A(false) }
+        if (bounds_check_b) { MM_LOAD_B(true) } else { MM_LOAD_B(false) }
 
         barrier();
 
@@ -302,7 +324,7 @@ void main() {
         [[unroll]] for (uint i = 0; i < BK; i += TK) {
             [[unroll]] for (uint cm_row = 0; cm_row < cms_per_row; cm_row++) {
                 // Load from shared into cache
-                coopMatLoad(cache_a, buf_a, (warp_r * WM + cm_row * TM) * SHMEM_STRIDE + i / 2, SHMEM_STRIDE, gl_CooperativeMatrixLayoutRowMajor);
+                coopMatLoad(cache_a, buf_a, a_shmem_index(warp_r * WM + cm_row * TM, i / 2), a_shmem_stride(), gl_CooperativeMatrixLayoutRowMajor);
 
                 [[unroll]] for (uint cm_col = 0; cm_col < cms_per_col; cm_col++) {
                     coopMatLoad(cache_b, buf_b, (warp_c * WN + cm_col * TN) * SHMEM_STRIDE + i / 2, SHMEM_STRIDE, gl_CooperativeMatrixLayoutColumnMajor);
@@ -350,6 +372,9 @@ void main() {
 
         barrier();
     }
+
+#undef MM_LOAD_A
+#undef MM_LOAD_B
 
 #if defined(ACC_TYPE_MAX)
 #ifdef COOPMAT

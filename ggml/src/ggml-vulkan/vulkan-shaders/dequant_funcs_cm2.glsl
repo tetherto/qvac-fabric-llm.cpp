@@ -247,6 +247,44 @@ f16vec4 dequantFuncQ8_0_v(const in decodeBufQ8_0 bl, const in uint blockCoords[2
     return f16vec4(vec4(qi) * vec4(float(d)));
 }
 
+layout(buffer_reference, std430, buffer_reference_align = 2) buffer decodeBufTQ2_0 {
+   block_tq2_0 block;
+};
+
+layout(buffer_reference, std430, buffer_reference_align = 2) buffer decodeBufTQ2_0_packed16 {
+   block_tq2_0_packed16 block;
+};
+
+float16_t dequantFuncTQ2_0(const in decodeBufTQ2_0 bl, const in uint blockCoords[2], const in uint coordInBlock[2])
+{
+    decodeBufTQ2_0_packed16 bl16 = decodeBufTQ2_0_packed16(bl);
+    const uint idx = coordInBlock[1];
+
+    const uint qsshift = (idx & 0x60) >> 4;             // 0,2,4,6
+
+    uint qs = uint32_t(bl16.block.qs[((idx & 0x80) >> 3) + ((idx & 0x1E) >> 1)]);
+    qs = (qs >> qsshift) & 0x0303;
+    qs = unpack8(qs)[idx & 1];
+
+    return bl.block.d * (float16_t(int(qs)) - float16_t(1.0));
+}
+
+f16vec4 dequantFuncTQ2_0_v(const in decodeBufTQ2_0 bl, const in uint blockCoords[2], const in uint coordInBlock[2])
+{
+    const uint idx = coordInBlock[1];
+
+    const uint qsshift = (idx & 0x60) >> 4;             // 0,2,4,6
+    const uint qsi = ((idx & 0x80) >> 2) + (idx & 0x1C); // byte index of 4-aligned group
+
+    const uint qsw = (uint(bl.block.qs[qsi]))
+                   | (uint(bl.block.qs[qsi + 1]) << 8)
+                   | (uint(bl.block.qs[qsi + 2]) << 16)
+                   | (uint(bl.block.qs[qsi + 3]) << 24);
+    const u8vec4 q = unpack8((qsw >> qsshift) & 0x03030303);
+
+    return bl.block.d * (f16vec4(q) - f16vec4(1.0));
+}
+
 layout(buffer_reference, std430, buffer_reference_align = 4) buffer decodeBufQ2_K {
    block_q2_K block;
 };
@@ -1241,26 +1279,6 @@ f16vec4 dequantFuncIQ4_NL_v(const in decodeBufIQ4_NL bl, const in uint blockCoor
 }
 #endif
 
-#if defined(DATA_A_TQ2_0)
-layout(buffer_reference, std430, buffer_reference_align = 2) buffer decodeBufTQ2_0 {
-   block_tq2_0 block;
-};
-
-#define TQ2_CM2 1
-#include "tq_utils.glsl"
-#undef TQ2_CM2
-
-float16_t dequantFuncTQ2_0(const in decodeBufTQ2_0 bl, const in uint blockCoords[2], const in uint coordInBlock[2])
-{
-    const float16_t d = bl.block.d;
-    const uint idx = coordInBlock[1];
-
-    const int val = tq2_dequantize(bl, idx);
-
-    return d * float16_t(val);
-}
-#endif
-
 #if defined(DATA_A_TQ1_0)
 layout(buffer_reference, std430, buffer_reference_align = 2) buffer decodeBufTQ1_0 {
    block_tq1_0 block;
@@ -1275,20 +1293,20 @@ float16_t dequantFuncTQ1_0(const in decodeBufTQ1_0 bl, const in uint blockCoords
 
     uint xi;
     if (idx < 160u) {
-        const uint n = idx / 32u;
-        const uint m = idx % 32u;
+        const uint n = idx / 32u;         // 0..4
+        const uint m = idx % 32u;         // 0..31
         const uint q = uint(bl.block.qs[m]);
         xi = (((q * pow3[n]) & 255u) * 3u) >> 8u;
     } else if (idx < 240u) {
-        const uint ee = idx - 160u;
-        const uint n = ee / 16u;
-        const uint m = ee % 16u;
+        const uint ee = idx - 160u;       // 0..79
+        const uint n = ee / 16u;          // 0..4
+        const uint m = ee % 16u;          // 0..15
         const uint q = uint(bl.block.qs[32u + m]);
         xi = (((q * pow3[n]) & 255u) * 3u) >> 8u;
     } else {
-        const uint ee = idx - 240u;
-        const uint n = ee / 4u;
-        const uint j = ee % 4u;
+        const uint ee = idx - 240u;       // 0..15
+        const uint n = ee / 4u;           // 0..3
+        const uint j = ee % 4u;           // 0..3
         const uint q = uint(bl.block.qh[j]);
         xi = (((q * pow3[n]) & 255u) * 3u) >> 8u;
     }
@@ -1428,6 +1446,7 @@ f16vec4 dequantFuncNVFP4_v(const in decodeBufNVFP4 bl, const in uint blockCoords
 #define dequantFuncA_v dequantFuncQ8_0_v
 #elif defined(DATA_A_TQ2_0)
 #define dequantFuncA dequantFuncTQ2_0
+#define dequantFuncA_v dequantFuncTQ2_0_v
 #elif defined(DATA_A_Q2_K)
 #define dequantFuncA dequantFuncQ2_K
 #define dequantFuncA_v dequantFuncQ2_K_v
@@ -1474,8 +1493,6 @@ f16vec4 dequantFuncNVFP4_v(const in decodeBufNVFP4 bl, const in uint blockCoords
 #elif defined(DATA_A_IQ4_NL)
 #define dequantFuncA dequantFuncIQ4_NL
 #define dequantFuncA_v dequantFuncIQ4_NL_v
-#elif defined(DATA_A_TQ2_0)
-#define dequantFuncA dequantFuncTQ2_0
 #elif defined(DATA_A_TQ1_0)
 #define dequantFuncA dequantFuncTQ1_0
 #elif defined(DATA_A_MXFP4)

@@ -27,4 +27,3 @@ struct llama_adapter_lora * llama_lora_create_adapter(
 bool llama_lora_allocate_buffers(
     struct llama_adapter_lora * adapter,
     struct llama_model * model);
-

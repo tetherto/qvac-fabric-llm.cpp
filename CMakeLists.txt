@@ -2,6 +2,26 @@ cmake_minimum_required(VERSION 3.14...3.28) # for add_link_options and implicit 
 project("llama.cpp" C CXX)
 include(CheckIncludeFileCXX)
 
+### llama.cpp version
+set(LLAMA_VERSION_MAJOR 0)
+set(LLAMA_VERSION_MINOR 1)
+set(LLAMA_VERSION_PATCH 2)
+set(LLAMA_VERSION_BASE "${LLAMA_VERSION_MAJOR}.${LLAMA_VERSION_MINOR}.${LLAMA_VERSION_PATCH}")
+
+# whether this is a development/nightly build
+# set this to OFF when making a release from a release tag (vX.Y.Z)
+# ref: https://github.com/ggml-org/ggml/discussions/1579
+option(LLAMA_BUILD_IS_DEV "llama: dev build" ON)
+
+if (LLAMA_BUILD_IS_DEV)
+    set(LLAMA_VERSION "${LLAMA_VERSION_BASE}-dev")
+else()
+    # TODO: check that the current commit is tagged correctly according to the version specified above
+    set(LLAMA_VERSION "${LLAMA_VERSION_BASE}")
+endif()
+
+message(STATUS "llama.cpp version: ${LLAMA_VERSION}")
+
 #set(CMAKE_WARN_DEPRECATED YES)
 set(CMAKE_WARN_UNUSED_CLI YES)
 
@@ -24,9 +44,6 @@ if (CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
     set(LLAMA_STANDALONE ON)
 
     include(git-vars)
-
-    # configure project version
-    # TODO
 else()
     set(LLAMA_STANDALONE OFF)
 endif()
@@ -145,7 +162,6 @@ endif()
 if (NOT DEFINED LLAMA_BUILD_COMMIT)
     set(LLAMA_BUILD_COMMIT        ${BUILD_COMMIT})
 endif()
-set(LLAMA_INSTALL_VERSION 0.0.${LLAMA_BUILD_NUMBER})
 
 # override ggml options
 set(GGML_ALL_WARNINGS   ${LLAMA_ALL_WARNINGS})
@@ -217,18 +233,17 @@ add_subdirectory(src)
 # utils, programs, examples and tests
 #
 
-# LLAMA_INCLUDE_INSTALL_DIR is referenced by common/CMakeLists.txt (added just
-# below) in llama-common-base's $<INSTALL_INTERFACE:> include dir. It must be
-# defined here, before add_subdirectory(common); otherwise it expands empty and
-# the installed llama::llama-common target carries a bogus "/common" include
-# path that breaks downstream find_package(llama) consumers.
+# vendor/ and common/ expand $<INSTALL_INTERFACE:${LLAMA_INCLUDE_INSTALL_DIR}> at configure time
 include(GNUInstallDirs)
 set(LLAMA_INCLUDE_INSTALL_DIR ${CMAKE_INSTALL_INCLUDEDIR}/llama CACHE PATH "Location of header files")
 
+# default; vendor/cpp-httplib flips this ON when it links system OpenSSL
 set(LLAMA_CPP_HTTPLIB_SYSTEM_OPENSSL OFF)
+
+add_subdirectory(vendor)
+
 if (LLAMA_BUILD_COMMON)
     add_subdirectory(common)
-    add_subdirectory(vendor/cpp-httplib)
 endif()
 
 if(LLAMA_BUILD_EXAMPLES OR LLAMA_BUILD_TESTS)
@@ -276,7 +291,10 @@ foreach(FILE_PATH ${EXTRA_LICENSES})
     license_add_file("${NAME}" "${FILE_PATH}")
 endforeach()
 
-if (LLAMA_BUILD_COMMON AND TARGET llama-common)
+# TARGET check rather than LLAMA_BUILD_COMMON: with BUILD_LLAMA=OFF the
+# common/ subdirectory is never added, and license_generate() fatals on a
+# missing target
+if (TARGET llama-common)
     license_generate(llama-common)
 endif()
 
@@ -312,6 +330,21 @@ if (LLAMA_BUILD_COMMON)
       TARGETS cpp-httplib
       EXPORT llama-targets)
 
+  # llama-common links these PUBLIC, so they must be exported regardless of
+  # LLAMA_CURL
+  install(
+      TARGETS nlohmann sheredom
+      EXPORT llama-targets)
+
+  install(FILES
+      ${CMAKE_CURRENT_SOURCE_DIR}/vendor/nlohmann/json.hpp
+      ${CMAKE_CURRENT_SOURCE_DIR}/vendor/nlohmann/json_fwd.hpp
+    DESTINATION ${LLAMA_INCLUDE_INSTALL_DIR}/nlohmann)
+
+  install(FILES
+      ${CMAKE_CURRENT_SOURCE_DIR}/vendor/sheredom/subprocess.h
+    DESTINATION ${LLAMA_INCLUDE_INSTALL_DIR}/sheredom)
+
   install(
     TARGETS llama-common llama-common-base
     EXPORT llama-targets
@@ -321,6 +354,16 @@ if (LLAMA_BUILD_COMMON)
 endif()
 
 if (LLAMA_MTMD AND TARGET mtmd)
+
+  # a static mtmd records its PRIVATE vendor deps as $<LINK_ONLY:...> usage
+  # requirements, so they must be part of the export set as well
+  install(
+      TARGETS vendor-hash miniaudio stb
+      EXPORT llama-targets)
+
+  if (NOT LLAMA_BUILD_COMMON) # otherwise already exported above
+    install(TARGETS sheredom EXPORT llama-targets)
+  endif()
 
   install(
     TARGETS mtmd
@@ -336,26 +379,18 @@ install(
   NAMESPACE llama::
   DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/llama)
 
-install(
-  FILES ${CMAKE_CURRENT_BINARY_DIR}/llama-config.cmake
-  DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/llama)
-
-if (LLAMA_BUILD_COMMON)
-    install(TARGETS llama-common LIBRARY)
-endif()
-
 configure_package_config_file(
   ${CMAKE_CURRENT_SOURCE_DIR}/cmake/llama-config.cmake.in
   ${CMAKE_CURRENT_BINARY_DIR}/llama-config.cmake
   INSTALL_DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/llama)
 
 write_basic_package_version_file(
-        ${CMAKE_CURRENT_BINARY_DIR}/llama-version.cmake
-    VERSION ${LLAMA_INSTALL_VERSION}
+        ${CMAKE_CURRENT_BINARY_DIR}/llama-config-version.cmake
+        VERSION ${LLAMA_VERSION}
     COMPATIBILITY SameMajorVersion)
 
 install(FILES ${CMAKE_CURRENT_BINARY_DIR}/llama-config.cmake
-              ${CMAKE_CURRENT_BINARY_DIR}/llama-version.cmake
+              ${CMAKE_CURRENT_BINARY_DIR}/llama-config-version.cmake
         DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/llama)
 
 install(
