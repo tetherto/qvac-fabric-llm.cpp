@@ -979,3 +979,41 @@ removes that amplification, but the QSA score and CUB segmented/radix selection
 remain. The warmed Nsight capture is:
 
 `/home/aman/qwen4-exp-opt-bench-20260911/results/qsa-direct-20260915/ggml-d32768-pp2048-direct.nsys-rep`
+
+## 2026-09-15: incremental QSA pooled-key cache
+
+Ported the incremental pooled-key-cache design from llama.cpp PR #28699 onto
+the branch's newer multimodal-safe QSA path. Each complete
+`compress_ratio` position block now stores one F32 mean-pooled, normalized,
+and roped indexer key per QSA layer. Steady decode gathers and transforms only
+the newly completed block, then writes it with `set_rows`; it no longer
+regathers and repools every cached raw indexer key at every full-attention
+layer.
+
+The pooled buffers are grouped by the raw indexer cache's backend buffer type,
+so tensor-split layers keep their summaries on the owning GPU. The existing
+full recompute remains available for multi-stream memories and through
+`LLAMA_QSA_NO_POOLED_CACHE=1`. Image-bearing sequences still take the dense
+fallback. Per-sequence validity watermarks are reset or clamped by cache clear,
+tail removal, sequence copy/keep, position shifts, and full state restores.
+
+Controlled FP8 A/B on H100 GPUs 6 and 7, `-sm tensor -ts 1/1`:
+
+| Workload | pooled ON | pooled OFF | Delta |
+| --- | ---: | ---: | ---: |
+| PP2048 after 32K, steady plateau | 5863.30 tok/s | 5810.70 tok/s | +0.91% |
+| TG128 after 32K, warmed final four | 51.5393 tok/s | 50.3049 tok/s | +2.45% |
+| TG128 after 64K, warmed final four | 51.8596 tok/s | 47.6044 tok/s | +8.94% |
+
+The pooled PP graph needed two to three extra one-time warmup repetitions; its
+last five samples were 5850.95, 5874.21, 5860.09, 5855.67, and 5875.57 tok/s.
+This is finite graph/kernel warmup rather than a steady regression.
+
+Validation:
+
+- full local CUDA build passed
+- `test-memory-hybrid-idx` now instantiates the pooled cache and checks
+  allocation plus clear/copy watermark behavior; it passes
+- `test-llama-archs --arch qwen4exp` passes CUDA and CPU numerical checks
+- the Meta-backend split-axis assertion also reproduces with the pooled-cache
+  kill switch and belongs to the preceding direct-sparse-index metadata path

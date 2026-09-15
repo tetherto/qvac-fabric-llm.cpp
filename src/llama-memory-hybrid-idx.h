@@ -2,8 +2,12 @@
 
 #include "llama-memory-hybrid.h"
 
+#include "ggml-backend.h"
+
 #include <bitset>
+#include <map>
 #include <memory>
+#include <unordered_map>
 #include <vector>
 
 //
@@ -81,6 +85,13 @@ public:
     void update_qsa(const llama_ubatch & ubatch);
     bool can_use_qsa(const llama_ubatch & ubatch) const;
 
+    // Cached mean-pooled, normalized, and roped indexer keys. Complete
+    // position blocks are immutable, so each row is computed once per
+    // content epoch and reused by every subsequent decode graph.
+    ggml_tensor * get_pooled_k(int32_t il) const;
+    uint32_t get_pooled_rows() const { return pooled_rows; }
+    int64_t & pooled_valid(llama_seq_id seq_id) const;
+
 private:
     // forget seq_id (all of it if seq_id < 0) in every cache at once, so a failed restore cannot leave the caches out of step
     // seq_id < 0 drops the whole context, as the caches themselves do on a failed restore
@@ -95,6 +106,20 @@ private:
     const std::unique_ptr<llama_kv_cache> mem_idx;
 
     std::bitset<LLAMA_MAX_SEQ> qsa_disabled;
+
+    // One context and buffer per indexer-cache buffer type keeps each layer's
+    // pooled rows on the same device as its raw indexer keys.
+    std::vector<ggml_context_ptr>        pooled_ctxs;
+    std::vector<ggml_backend_buffer_ptr> pooled_bufs;
+    std::map<int32_t, ggml_tensor *>     pooled_k;
+
+    uint32_t pooled_rows  = 0;
+    uint32_t pooled_ratio = 0;
+
+    mutable std::unordered_map<llama_seq_id, int64_t> pooled_w;
+
+    void pooled_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1);
+    void pooled_reset(llama_seq_id seq_id);
 };
 
 class llama_memory_hybrid_idx_context : public llama_memory_hybrid_context {
@@ -151,7 +176,14 @@ public:
     // the caller then adds the attention mask, the only part of the bias that varies within a block
     void set_input_qsa(ggml_tensor * cell_blk, ggml_tensor * blk_cells, ggml_tensor * blk_pos,
                        ggml_tensor * bias, const llama_ubatch * ubatch, uint32_t ratio,
-                       bool blk_bias) const;
+                       bool blk_bias,
+                       ggml_tensor * dirty_cells = nullptr,
+                       ggml_tensor * dirty_pos   = nullptr,
+                       ggml_tensor * dirty_rows  = nullptr) const;
+
+    ggml_tensor * get_pooled_k(int32_t il) const;
+    uint32_t get_pooled_rows() const;
+    uint32_t qsa_pooled_n_dirty_max(const llama_ubatch & ubatch, uint32_t ratio) const;
 
 private:
     llama_memory_hybrid_idx * mem = nullptr;

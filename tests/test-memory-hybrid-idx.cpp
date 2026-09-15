@@ -113,11 +113,21 @@ static void test_fallback(bool unified) {
     hp.rope_type = LLAMA_ROPE_TYPE_IMROPE;
     hp.rope_sections = { 16, 24, 24, 0 };
     hp.indexer_head_size = 64;
+    hp.dsv4_compress_ratios[0] = 4;
 
     llama_memory_hybrid_idx mem(model,
             GGML_TYPE_F32, GGML_TYPE_F32, false, 64, 1, 0, LLAMA_SWA_TYPE_NONE,
             GGML_TYPE_F32, GGML_TYPE_F32, 3, 3, 4, false, unified,
             [](int32_t) { return true; }, [](int32_t) { return false; }, [](int32_t) { return true; });
+
+    GGML_ASSERT((mem.get_pooled_k(0) != nullptr) == unified);
+    GGML_ASSERT(mem.get_pooled_rows() == (unified ? 18 : 0));
+
+    if (unified) {
+        mem.pooled_valid(2) = 7;
+        mem.clear(false);
+        GGML_ASSERT(mem.pooled_valid(2) == 0);
+    }
 
     auto text = make_batch(0, 0, 4);
     auto image = make_batch(0, 4, 4, true);
@@ -125,6 +135,10 @@ static void test_fallback(bool unified) {
     GGML_ASSERT(mem.can_use_qsa(text));
     GGML_ASSERT(!mem.can_use_qsa(image));
     apply(mem, text);
+
+    if (unified) {
+        mem.pooled_valid(0) = 1;
+    }
 
     // Slot planning must not mark a sequence before the image batch is applied.
     GGML_ASSERT(!mem.get_mem_attn()->prepare({ image }).empty());
@@ -142,6 +156,10 @@ static void test_fallback(bool unified) {
     const auto image_state = save(mem, 0);
     const auto image_partial = save(mem, 0, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
     mem.seq_cp(0, 1, -1, -1);
+    if (unified) {
+        GGML_ASSERT(mem.pooled_valid(0) == 1);
+        GGML_ASSERT(mem.pooled_valid(1) == 0);
+    }
     auto copied = make_batch(1, 7, 1);
     GGML_ASSERT(!mem.can_use_qsa(copied));
     auto independent = make_batch(2, 0, 1);
