@@ -1,0 +1,827 @@
+diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
+index 241b0a2d4..bb1665997 100644
+--- a/ggml/include/ggml.h
++++ b/ggml/include/ggml.h
+@@ -2529,6 +2529,17 @@ extern "C" {
+     GGML_API enum ggml_prec ggml_flash_attn_ext_get_prec(
+             const struct ggml_tensor * a);
+ 
++    // implicit causal mask for one contiguous sequence, used instead of the mask tensor (mask must be NULL):
++    // cells [0, n_kv_used) of k/v hold one sequence in position order and the n_q queries are its last
++    // n_q positions, so query row i attends cell c iff c < n_kv_used && c <= i + (n_kv_used - n_q).
++    // 0 (the default) means "no implicit mask"; backends that do not implement it reject the op in supports_op.
++    GGML_API void ggml_flash_attn_ext_set_kv_used(
++            struct ggml_tensor * a,
++            int32_t              n_kv_used);
++
++    GGML_API int32_t ggml_flash_attn_ext_get_kv_used(
++            const struct ggml_tensor * a);
++
+     GGML_API void ggml_flash_attn_ext_add_sinks(
+             struct ggml_tensor * a,
+             struct ggml_tensor * sinks);
+diff --git a/ggml/src/ggml-cpu/ops.cpp b/ggml/src/ggml-cpu/ops.cpp
+index 7f72291cc..90945ff21 100644
+--- a/ggml/src/ggml-cpu/ops.cpp
++++ b/ggml/src/ggml-cpu/ops.cpp
+@@ -9208,6 +9208,7 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
+     GGML_ASSERT((v->type == GGML_TYPE_F32 || v_to_float  ) && "fattn: unsupported V-type");
+ 
+     int ith = params->ith;
++    const int32_t n_kv_used = mask ? 0 : ggml_flash_attn_ext_get_kv_used(dst);
+ 
+     for (int ir = ir0; ir < ir1; ++ir) {
+         // q indices
+@@ -9249,7 +9250,10 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
+         // loop over n_kv and n_head_kv
+         // ref: https://arxiv.org/pdf/2112.05682.pdf
+ 
+-        for (int64_t ic = ic_start; ic < ic_end; ++ic) {
++        // implicit causal mask (no mask tensor): row iq1 attends cells [0, iq1 + n_kv_used - N]
++        const int64_t ic_row_end = n_kv_used > 0 ? MIN(ic_end, iq1 + (n_kv_used - N) + 1) : ic_end;
++
++        for (int64_t ic = ic_start; ic < ic_row_end; ++ic) {
+             const float mv = mp ? slope*GGML_CPU_FP16_TO_FP32(mp[ic]) : 0.0f;
+             if (mv == -INFINITY) {
+                 continue;
+@@ -9829,7 +9833,9 @@ static void ggml_compute_forward_flash_attn_ext_f16(
+         const int64_t dr = (nr + nchunk - 1) / nchunk;
+ 
+         static constexpr int64_t Q_TILE_SZ  = ggml_fa_tile_config::Q;
+-        bool use_tiled = !use_ref &&
++        // the implicit causal mask (n_kv_used, no mask tensor) is implemented by the one_chunk path only
++        const bool implicit_mask = dst->src[3] == NULL && ggml_flash_attn_ext_get_kv_used(dst) > 0;
++        bool use_tiled = !use_ref && !implicit_mask &&
+                                (q->type == GGML_TYPE_F32 &&
+                                 kv_is_f32_or_f16 &&
+                                 k->type == v->type &&
+diff --git a/ggml/src/ggml-cuda/CMakeLists.txt b/ggml/src/ggml-cuda/CMakeLists.txt
+index eef145bcc..81e3704b2 100644
+--- a/ggml/src/ggml-cuda/CMakeLists.txt
++++ b/ggml/src/ggml-cuda/CMakeLists.txt
+@@ -103,7 +103,8 @@ if (CUDAToolkit_FOUND)
+     list(APPEND GGML_HEADERS_CUDA "../../include/ggml-cuda.h")
+ 
+     file(GLOB   GGML_SOURCES_CUDA "*.cu")
+-    list(REMOVE_ITEM GGML_SOURCES_CUDA "${CMAKE_CURRENT_SOURCE_DIR}/mmf8-cutlass.cu") # built by its own target when GGML_CUDA_CUTLASS is on
++    # built by their own target when GGML_CUDA_CUTLASS is on
++    list(REMOVE_ITEM GGML_SOURCES_CUDA "${CMAKE_CURRENT_SOURCE_DIR}/mmf8-cutlass.cu" "${CMAKE_CURRENT_SOURCE_DIR}/fattn-cutlass.cu")
+     file(GLOB   SRCS "template-instances/fattn-tile*.cu")
+     list(APPEND GGML_SOURCES_CUDA ${SRCS})
+     file(GLOB   SRCS "template-instances/fattn-mma*.cu")
+@@ -281,8 +282,8 @@ if (CUDAToolkit_FOUND)
+         message(STATUS "CUTLASS FP8 GEMM enabled, sources in ${cutlass_SOURCE_DIR}")
+ 
+         # sm_90a only (wgmma/TMA); compiled apart from the main target so the arch list of ggml-cuda stays as configured
+-        add_library(ggml-cuda-cutlass OBJECT mmf8-cutlass.cu)
+-        target_include_directories(ggml-cuda-cutlass PRIVATE ${cutlass_SOURCE_DIR}/include ${cutlass_SOURCE_DIR}/tools/util/include ${CMAKE_CURRENT_SOURCE_DIR})
++        add_library(ggml-cuda-cutlass OBJECT mmf8-cutlass.cu fattn-cutlass.cu)
++        target_include_directories(ggml-cuda-cutlass PRIVATE ${cutlass_SOURCE_DIR}/include ${cutlass_SOURCE_DIR}/tools/util/include ${cutlass_SOURCE_DIR}/examples/88_hopper_fmha ${CMAKE_CURRENT_SOURCE_DIR})
+         set_target_properties(ggml-cuda-cutlass PROPERTIES CUDA_ARCHITECTURES OFF POSITION_INDEPENDENT_CODE ON CUDA_STANDARD 17 CXX_STANDARD 17)
+         target_compile_options(ggml-cuda-cutlass PRIVATE "$<$<COMPILE_LANGUAGE:CUDA>:-gencode;arch=compute_90a,code=sm_90a;--expt-relaxed-constexpr;-Xcompiler;-Wno-pedantic>")
+         target_link_libraries(ggml-cuda-cutlass PRIVATE CUDA::cudart)
+diff --git a/ggml/src/ggml-cuda/fattn.cu b/ggml/src/ggml-cuda/fattn.cu
+index ab7a3b297..bb5e93ce8 100644
+--- a/ggml/src/ggml-cuda/fattn.cu
++++ b/ggml/src/ggml-cuda/fattn.cu
+@@ -1,9 +1,14 @@
+ #include "common.cuh"
++#include "convert.cuh"
++#include "cpy.cuh"
+ #include "fattn-common.cuh"
+ #include "fattn-mma-f16.cuh"
+ #include "fattn-tile.cuh"
+ #include "fattn-vec.cuh"
+ #include "fattn.cuh"
++#ifdef GGML_CUDA_CUTLASS
++#include "fattn-cutlass.cuh"
++#endif // GGML_CUDA_CUTLASS
+ 
+ template <int DKQ, int DV, int ncols2>
+ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+@@ -373,9 +378,13 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
+     float max_bias = 0.0f;
+     memcpy(&max_bias, (const float *) KQV->op_params + 1, sizeof(float));
+ 
++    // The implicit causal mask (n_kv_used set, no mask tensor) is materialized on device as a contiguous
++    // [n_kv, n_q] f16 mask before the kernels run, so it counts as a mask here.
++    const bool has_mask = mask != nullptr || ggml_flash_attn_ext_get_kv_used(dst) > 0;
++
+     // The effective batch size for the kernel can be increased by gqa_ratio.
+     // The kernel versions without this optimization are also used for ALiBi, if there is no mask, or if the KV cache is not padded,
+-    bool gqa_opt_applies = gqa_ratio >= 2 && mask && max_bias == 0.0f && K->ne[1] % FATTN_KQ_STRIDE == 0;
++    bool gqa_opt_applies = gqa_ratio >= 2 && has_mask && max_bias == 0.0f && K->ne[1] % FATTN_KQ_STRIDE == 0;
+     for (const ggml_tensor * t : {Q, K, V, mask}) {
+         if (t == nullptr || ggml_is_quantized(t->type)) {
+             continue;
+@@ -567,8 +576,18 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
+     return f16_extra.end - (uintptr_t) dst->data;
+ }
+ 
+-void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+-    ggml_cuda_set_device(ctx.device);
++// implicit causal mask materialized as the [n_kv, n_q] f16 mask the kernels expect: row i keeps cells
++// c < n_kv_used && c <= i + (n_kv_used - n_q), everything else is -inf
++static __global__ void fattn_causal_mask_f16(half * __restrict__ mask, const int n_kv, const int n_q, const int n_kv_used) {
++    const int i = blockIdx.x;
++    const int c_max = i + (n_kv_used - n_q); // inclusive
++    half * row = mask + (size_t) i * n_kv;
++    for (int c = threadIdx.x; c < n_kv; c += blockDim.x) {
++        row[c] = c <= c_max ? __float2half(0.0f) : __float2half(-INFINITY);
++    }
++}
++
++static void ggml_cuda_flash_attn_ext_dispatch(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+     switch (ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst)) {
+         case BEST_FATTN_KERNEL_NONE:
+             GGML_ABORT("fatal error");
+@@ -584,6 +603,157 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
+     }
+ }
+ 
++#ifdef GGML_CUDA_CUTLASS
++// Hopper FMHA (CUTLASS example 88): f16 K/V, head dim 256, no sinks/ALiBi/softcap, softmax scale 1/sqrt(D)
++// (fixed inside the kernel), prefill-sized query batches, Q the usual permuted view of a contiguous
++// [D, n_head, n_q] buffer, dst contiguous.
++static bool ggml_cuda_fattn_cutlass_supported(const ggml_tensor * dst, const int n_kv_used) {
++    const ggml_tensor * Q = dst->src[0];
++    const ggml_tensor * K = dst->src[1];
++    const ggml_tensor * V = dst->src[2];
++
++    static const bool disabled = getenv("GGML_CUDA_DISABLE_FATTN_CUTLASS") != nullptr;
++    if (disabled || dst->src[4] != nullptr) {
++        return false;
++    }
++    if (ggml_cuda_info().devices[ggml_cuda_get_device()].cc != GGML_CUDA_CC_HOPPER) {
++        return false;
++    }
++    float scale, max_bias, logit_softcap;
++    memcpy(&scale,         (const float *) dst->op_params + 0, sizeof(float));
++    memcpy(&max_bias,      (const float *) dst->op_params + 1, sizeof(float));
++    memcpy(&logit_softcap, (const float *) dst->op_params + 2, sizeof(float));
++    if (max_bias != 0.0f || logit_softcap != 0.0f || fabsf(scale - 1.0f/sqrtf((float) GGML_FATTN_CUTLASS_D)) > 1e-6f) {
++        return false;
++    }
++    const int D = GGML_FATTN_CUTLASS_D;
++    if (Q->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
++        return false;
++    }
++    for (const ggml_tensor * t : {K, V}) {
++        if (t->type != GGML_TYPE_F16 && t->type != GGML_TYPE_F32) {
++            return false;
++        }
++    }
++    if (Q->ne[0] != D || K->ne[0] != D || V->ne[0] != D || Q->ne[3] != 1 || K->ne[3] != 1 || V->ne[3] != 1) {
++        return false;
++    }
++    const int64_t n_q = Q->ne[1];
++    if (n_q < 256 || n_q % 8 != 0 || Q->ne[2] % K->ne[2] != 0 || V->ne[2] != K->ne[2] || V->ne[1] != K->ne[1]) {
++        return false;
++    }
++    if (n_kv_used < n_q || n_kv_used > K->ne[1]) {
++        return false;
++    }
++    if (Q->nb[0] != sizeof(float) || Q->nb[2] != (size_t) D*sizeof(float) || Q->nb[1] != (size_t) Q->ne[2]*D*sizeof(float)) {
++        return false;
++    }
++    for (const ggml_tensor * t : {K, V}) {
++        if (t->nb[0] != ggml_type_size(t->type) || t->nb[1] % 16 != 0 || t->nb[2] % 16 != 0 || t->nb[1] > INT32_MAX || t->nb[2] > INT32_MAX) {
++            return false;
++        }
++    }
++    return ggml_is_contiguous(dst);
++}
++
++static void ggml_cuda_flash_attn_ext_cutlass_run(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const int n_kv_used) {
++    const ggml_tensor * Q = dst->src[0];
++    const ggml_tensor * K = dst->src[1];
++    const ggml_tensor * V = dst->src[2];
++
++    const int D         = GGML_FATTN_CUTLASS_D;
++    const int n_q       = Q->ne[1];
++    const int n_head    = Q->ne[2];
++    const int n_head_kv = K->ne[2];
++    const int gqa       = n_head / n_head_kv;
++    const int64_t n_qh  = (int64_t) n_q * n_head * D;
++
++    cudaStream_t stream = ctx.stream();
++
++    ggml_cuda_pool_alloc<half>  q16(ctx.pool(), n_qh);
++    ggml_cuda_pool_alloc<half>  o16(ctx.pool(), n_qh);
++    ggml_cuda_pool_alloc<float> lse(ctx.pool(), (int64_t) n_q * n_head);
++
++    // the permuted Q view covers one contiguous [D, n_head, n_q] buffer
++    const to_fp16_cuda_t to_fp16 = ggml_get_to_fp16_cuda(GGML_TYPE_F32);
++    to_fp16(Q->data, q16.get(), n_qh, stream);
++
++    const size_t ws_size = ggml_cuda_fattn_cutlass_workspace_size(n_head_kv, gqa, n_q, n_kv_used);
++    ggml_cuda_pool_alloc<uint8_t> ws(ctx.pool(), ws_size > 0 ? ws_size : 1);
++
++    // F32 K/V (no KV cache): the used cells are converted to a contiguous f16 [D, n_kv_used, n_head_kv] buffer
++    ggml_cuda_pool_alloc<half> k16(ctx.pool());
++    ggml_cuda_pool_alloc<half> v16(ctx.pool());
++    const half * k_data = (const half *) K->data;
++    const half * v_data = (const half *) V->data;
++    int64_t k_nb1 = K->nb[1]/sizeof(half), k_nb2 = K->nb[2]/sizeof(half);
++    int64_t v_nb1 = V->nb[1]/sizeof(half), v_nb2 = V->nb[2]/sizeof(half);
++    auto convert_kv = [&](const ggml_tensor * t, ggml_cuda_pool_alloc<half> & buf, const half *& data, int64_t & nb1, int64_t & nb2) {
++        if (t->type == GGML_TYPE_F16) {
++            return;
++        }
++        buf.alloc((int64_t) D * n_kv_used * n_head_kv);
++        ggml_tensor src = *t;
++        src.ne[1] = n_kv_used;
++        ggml_tensor dst16 = {};
++        dst16.type  = GGML_TYPE_F16;
++        dst16.ne[0] = D; dst16.ne[1] = n_kv_used; dst16.ne[2] = n_head_kv; dst16.ne[3] = 1;
++        dst16.nb[0] = sizeof(half); dst16.nb[1] = D*sizeof(half); dst16.nb[2] = dst16.nb[1]*n_kv_used; dst16.nb[3] = dst16.nb[2];
++        dst16.data  = buf.get();
++        ggml_cuda_cpy(ctx, &src, &dst16);
++        data = buf.get();
++        nb1  = D;
++        nb2  = (int64_t) D * n_kv_used;
++    };
++    convert_kv(K, k16, k_data, k_nb1, k_nb2);
++    convert_kv(V, v16, v_data, v_nb1, v_nb2);
++
++    ggml_cuda_fattn_cutlass(q16.get(), k_data, v_data, o16.get(), lse.get(),
++        n_head_kv, gqa, n_q, n_kv_used, k_nb1, k_nb2, v_nb1, v_nb2,
++        ws.get(), ws_size, stream);
++
++    const to_fp32_cuda_t to_fp32 = ggml_get_to_fp32_cuda(GGML_TYPE_F16);
++    to_fp32(o16.get(), (float *) dst->data, n_qh, stream);
++}
++#endif // GGML_CUDA_CUTLASS
++
++void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
++    ggml_cuda_set_device(ctx.device);
++
++    const int32_t n_kv_used = dst->src[3] == nullptr ? ggml_flash_attn_ext_get_kv_used(dst) : 0;
++    if (n_kv_used <= 0) {
++        ggml_cuda_flash_attn_ext_dispatch(ctx, dst);
++        return;
++    }
++
++#ifdef GGML_CUDA_CUTLASS
++    if (ggml_cuda_fattn_cutlass_supported(dst, n_kv_used)) {
++        ggml_cuda_flash_attn_ext_cutlass_run(ctx, dst, n_kv_used);
++        return;
++    }
++#endif // GGML_CUDA_CUTLASS
++
++    // materialize the implicit mask and run the regular kernels with it
++    const ggml_tensor * Q = dst->src[0];
++    const ggml_tensor * K = dst->src[1];
++    const int64_t n_kv = K->ne[1];
++    const int64_t n_q  = Q->ne[1];
++
++    ggml_cuda_pool_alloc<half> mask_buf(ctx.pool(), n_kv*n_q);
++    fattn_causal_mask_f16<<<n_q, 256, 0, ctx.stream()>>>(mask_buf.get(), n_kv, n_q, n_kv_used);
++    CUDA_CHECK(cudaGetLastError());
++
++    ggml_tensor mask = {};
++    mask.type  = GGML_TYPE_F16;
++    mask.ne[0] = n_kv; mask.ne[1] = n_q; mask.ne[2] = 1; mask.ne[3] = 1;
++    mask.nb[0] = sizeof(half); mask.nb[1] = n_kv*sizeof(half); mask.nb[2] = mask.nb[1]*n_q; mask.nb[3] = mask.nb[2];
++    mask.data  = mask_buf.get();
++
++    dst->src[3] = &mask;
++    ggml_cuda_flash_attn_ext_dispatch(ctx, dst);
++    dst->src[3] = nullptr;
++}
++
+ bool ggml_cuda_flash_attn_ext_supported(int device, const ggml_tensor * dst) {
+     return ggml_cuda_get_best_fattn_kernel(device, dst) != BEST_FATTN_KERNEL_NONE;
+ }
+diff --git a/ggml/src/ggml-cuda/mmf8-cutlass.cu b/ggml/src/ggml-cuda/mmf8-cutlass.cu
+index 72613a083..7321f30df 100644
+--- a/ggml/src/ggml-cuda/mmf8-cutlass.cu
++++ b/ggml/src/ggml-cuda/mmf8-cutlass.cu
+@@ -13,8 +13,8 @@
+ #include "cutlass/epilogue/collective/collective_builder.hpp"
+ #include "cutlass/detail/blockwise_scale_layout.hpp"
+ #include "cutlass/util/packed_stride.hpp"
++#include "cutlass-hw.cuh"
+ 
+-#include <atomic>
+ #include <cstdio>
+ #include <cstdlib>
+ 
+@@ -71,31 +71,8 @@ using StrideD    = typename Gemm::GemmKernel::StrideD;
+ 
+ constexpr int MAX_SWIZZLE = 4;
+ 
+-// SM count per device, queried once (the current device is set by the caller); duplicate first queries are harmless
+-cutlass::KernelHardwareInfo hw_info_for_current_device() {
+-    constexpr int max_devices = 16;
+-    static std::atomic<int> sm_counts[max_devices];
+-    cutlass::KernelHardwareInfo info;
+-    const cudaError_t err = cudaGetDevice(&info.device_id);
+-    if (err != cudaSuccess) {
+-        fprintf(stderr, "%s: cudaGetDevice failed: %s\n", __func__, cudaGetErrorString(err));
+-        abort();
+-    }
+-    if (info.device_id < 0 || info.device_id >= max_devices) {
+-        info.sm_count = cutlass::KernelHardwareInfo::query_device_multiprocessor_count(info.device_id);
+-        return info;
+-    }
+-    int n = sm_counts[info.device_id].load(std::memory_order_relaxed);
+-    if (n == 0) {
+-        n = cutlass::KernelHardwareInfo::query_device_multiprocessor_count(info.device_id);
+-        sm_counts[info.device_id].store(n, std::memory_order_relaxed);
+-    }
+-    info.sm_count = n;
+-    return info;
+-}
+-
+ typename Gemm::Arguments make_args(const uint8_t * a, const float * sfa, const uint8_t * b, const float * sfb, float * d, int M, int N, int K) {
+-    const cutlass::KernelHardwareInfo hw_info = hw_info_for_current_device();
++    const cutlass::KernelHardwareInfo hw_info = ggml_cutlass_hw_info_for_current_device();
+ 
+     const StrideA stride_A = cutlass::make_cute_packed_stride(StrideA{}, make_shape(M, K, 1));
+     const StrideB stride_B = cutlass::make_cute_packed_stride(StrideB{}, make_shape(N, K, 1));
+diff --git a/ggml/src/ggml-cuda/mmf8.cu b/ggml/src/ggml-cuda/mmf8.cu
+index dd86aa702..e73545a7d 100644
+--- a/ggml/src/ggml-cuda/mmf8.cu
++++ b/ggml/src/ggml-cuda/mmf8.cu
+@@ -297,7 +297,9 @@ void ggml_cuda_mul_mat_f8(ggml_backend_cuda_context & ctx, const ggml_tensor * s
+     }
+ 
+ #ifdef GGML_CUDA_CUTLASS
+-    if (ggml_cuda_info().devices[ctx.device].cc == GGML_CUDA_CC_HOPPER && ((uintptr_t) y % 16 == 0)) {
++    // GGML_CUDA_DISABLE_MMF8_CUTLASS: run the F16 fallback GEMM instead (A/B and equivalence gates)
++    static const bool cutlass_disabled = getenv("GGML_CUDA_DISABLE_MMF8_CUTLASS") != nullptr;
++    if (!cutlass_disabled && ggml_cuda_info().devices[ctx.device].cc == GGML_CUDA_CC_HOPPER && ((uintptr_t) y % 16 == 0)) {
+         mul_mat_f8_e4m3_cutlass(ctx, x, sx, y, d, ncols, nrows, ntokens, stream);
+         return;
+     }
+diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
+index 6e2b08f6e..7edeb91f5 100644
+--- a/ggml/src/ggml.c
++++ b/ggml/src/ggml.c
+@@ -5754,6 +5754,23 @@ enum ggml_prec ggml_flash_attn_ext_get_prec(
+     return (enum ggml_prec) prec_i32;
+ }
+ 
++void ggml_flash_attn_ext_set_kv_used(
++        struct ggml_tensor * a,
++        int32_t              n_kv_used) {
++    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
++    GGML_ASSERT(a->src[3] == NULL); // the implicit mask replaces the mask tensor
++    GGML_ASSERT(n_kv_used >= a->src[0]->ne[1] && n_kv_used <= a->src[1]->ne[1]);
++
++    ggml_set_op_params_i32(a, 4, n_kv_used); // 3 is the precision
++}
++
++int32_t ggml_flash_attn_ext_get_kv_used(
++        const struct ggml_tensor * a) {
++    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
++
++    return ggml_get_op_params_i32(a, 4);
++}
++
+ void ggml_flash_attn_ext_add_sinks(
+         struct ggml_tensor * a,
+         struct ggml_tensor * sinks) {
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index dfbb380a5..e78f8d3c4 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -7,6 +7,8 @@
+ #include "llama-batch.h"
+ #include "llama-io.h"
+ #include "llama-memory.h"
++#include "llama-kv-cache.h"
++#include "llama-memory-hybrid.h"
+ #include "llama-mmap.h"
+ #include "llama-moe-cache.h"
+ #include "llama-model.h"
+@@ -63,6 +65,53 @@ static const llm_fused_op_probe llm_fused_op_lid_probe = {
+     /*.n_tokens_per_seq =*/ 1,
+ };
+ 
++// the implicit causal mask (no mask tensor, see ggml_flash_attn_ext_set_kv_used) needs backend support for the
++// model's attention shape: probe the device of the first attention layer with a representative prefill op
++static bool llama_attn_implicit_mask_supported(const llama_model & model, ggml_type type_k, ggml_type type_v) {
++    const auto & hparams = model.hparams;
++
++    int32_t il = -1;
++    for (uint32_t i = 0; i < hparams.n_layer(); ++i) {
++        if (!hparams.is_recr(i)) {
++            il = i;
++            break;
++        }
++    }
++    if (il < 0) {
++        return false;
++    }
++
++    ggml_backend_dev_t dev = model.dev_layer(il);
++    if (!dev) {
++        return false;
++    }
++
++    ggml_init_params ip = { 8*ggml_tensor_overhead(), nullptr, true };
++    ggml_context * ctx = ggml_init(ip);
++
++    const int64_t n_tokens = 256;
++    const int64_t n_kv     = 256;
++
++    // the FA operands as build_attn_mha permutes them: q [D, n_tokens, n_head], k/v [D, n_kv, n_head_kv]
++    ggml_tensor * q = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, hparams.n_embd_head_k(il), hparams.n_head(il),    n_tokens);
++    ggml_tensor * k = ggml_new_tensor_3d(ctx, type_k,        hparams.n_embd_head_k(il), hparams.n_head_kv(il), n_kv);
++    ggml_tensor * v = ggml_new_tensor_3d(ctx, type_v,        hparams.n_embd_head_v(il), hparams.n_head_kv(il), n_kv);
++    q = ggml_permute(ctx, q, 0, 2, 1, 3);
++    k = ggml_permute(ctx, k, 0, 2, 1, 3);
++    v = ggml_permute(ctx, v, 0, 2, 1, 3);
++
++    ggml_tensor * op = ggml_flash_attn_ext(ctx, q, k, v, nullptr, 1.0f/sqrtf((float) hparams.n_embd_head_k(il)),
++        hparams.f_max_alibi_bias, hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f);
++    ggml_flash_attn_ext_set_prec(op, GGML_PREC_F32);
++    ggml_flash_attn_ext_set_kv_used(op, n_kv);
++
++    const bool res = ggml_backend_dev_supports_op(dev, op);
++
++    ggml_free(ctx);
++
++    return res;
++}
++
+ static const llm_fused_op_probe llm_fused_op_dsv4_hc_pre_probe = {
+     /*.op               =*/ LLM_FUSED_OP_DSV4_HC_PRE,
+     /*.name             =*/ "fused DeepSeek V4 HC pre",
+@@ -717,6 +766,22 @@ void llama_context::sched_reserve() {
+ 
+     resolve_fused_ops(mctx.get(), n_seqs);
+ 
++    {
++        // the K/V cache types come from the attention memory (plain or the attention part of a hybrid model)
++        ggml_type type_k = GGML_TYPE_COUNT;
++        ggml_type type_v = GGML_TYPE_COUNT;
++        if (const auto * kv_ctx = dynamic_cast<const llama_kv_cache_context *>(mctx.get())) {
++            type_k = kv_ctx->type_k();
++            type_v = kv_ctx->type_v();
++        } else if (const auto * hyb_ctx = dynamic_cast<const llama_memory_hybrid_context *>(mctx.get())) {
++            type_k = hyb_ctx->get_attn()->type_k();
++            type_v = hyb_ctx->get_attn()->type_v();
++        }
++        cparams.attn_implicit_mask = type_k != GGML_TYPE_COUNT && cparams.flash_attn && cparams.causal_attn &&
++            llama_attn_implicit_mask_supported(model, type_k, type_v);
++        LLAMA_LOG_INFO("%s: implicit causal attention mask: %s\n", __func__, cparams.attn_implicit_mask ? "enabled" : "disabled");
++    }
++
+     // reserve worst-case graph
+     int n_splits_pp = -1;
+     int n_nodes_pp  = -1;
+diff --git a/src/llama-cparams.h b/src/llama-cparams.h
+index 8e90ab92f..bb976f4aa 100644
+--- a/src/llama-cparams.h
++++ b/src/llama-cparams.h
+@@ -40,6 +40,7 @@ struct llama_cparams {
+     bool offload_kqv;
+     bool flash_attn;
+     bool auto_fa;
++    bool attn_implicit_mask; // FA without a mask tensor for one contiguous sequence (ggml_flash_attn_ext_set_kv_used); backend-probed
+     bool fused_gdn_ar;       // use fused gated delta net (autoregressive)
+     bool fused_gdn_ch;       // use fused gated delta net (chunked)
+     bool auto_fgdn;
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index bd860ff7a..e5f089804 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -63,6 +63,18 @@ static bool can_reuse_kq_mask(
+     return res;
+ }
+ 
++// > 0 when the ubatch attends with the implicit causal mask instead of a mask tensor (see ggml_flash_attn_ext_set_kv_used)
++static int32_t llm_graph_attn_implicit_mask_n_kv_used(
++        const llama_kv_cache_context * mctx,
++        const llama_ubatch & ubatch,
++        const llama_cparams & cparams) {
++    if (!cparams.attn_implicit_mask || !cparams.flash_attn || !cparams.causal_attn || ubatch.n_tokens < llama_kv_cache::n_tokens_min_implicit_mask) {
++        return 0;
++    }
++
++    return mctx->get_n_kv_used();
++}
++
+ // impl
+ 
+ void llm_graph_input_embd::set_input(const llama_ubatch * ubatch) {
+@@ -495,7 +507,10 @@ bool llm_graph_input_attn_kv::can_reuse(const llm_graph_params & params) {
+     res &= self_k_idxs->ne[0] == params.ubatch.n_tokens;
+   //res &= self_v_idxs->ne[0] == params.ubatch.n_tokens; // TODO: need to move this to the unified cache and check there
+ 
+-    res &= can_reuse_kq_mask(self_kq_mask, mctx, params.ubatch, params.cparams);
++    res &= n_kv_used == llm_graph_attn_implicit_mask_n_kv_used(mctx, params.ubatch, params.cparams);
++    if (n_kv_used == 0) {
++        res &= can_reuse_kq_mask(self_kq_mask, mctx, params.ubatch, params.cparams);
++    }
+ 
+     return res;
+ }
+@@ -1063,7 +1078,9 @@ void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
+     mctx->get_attn()->set_input_k_idxs(inp_attn->self_k_idxs, ubatch);
+     mctx->get_attn()->set_input_v_idxs(inp_attn->self_v_idxs, ubatch);
+ 
+-    mctx->get_attn()->set_input_kq_mask(inp_attn->self_kq_mask, ubatch, cparams.causal_attn);
++    if (inp_attn->self_kq_mask) {
++        mctx->get_attn()->set_input_kq_mask(inp_attn->self_kq_mask, ubatch, cparams.causal_attn);
++    }
+ 
+     if (inp_attn->self_k_rot) {
+         mctx->get_attn()->set_input_k_rot(inp_attn->self_k_rot);
+@@ -1096,7 +1113,10 @@ bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
+     res &= inp_attn->self_k_idxs->ne[0] == params.ubatch.n_tokens;
+   //res &= inp_attn->self_v_idxs->ne[0] == params.ubatch.n_tokens; // TODO: need to move this to the unified cache and check there
+ 
+-    res &= can_reuse_kq_mask(inp_attn->self_kq_mask, mctx->get_attn(), params.ubatch, params.cparams);
++    res &= inp_attn->n_kv_used == llm_graph_attn_implicit_mask_n_kv_used(mctx->get_attn(), params.ubatch, params.cparams);
++    if (inp_attn->n_kv_used == 0) {
++        res &= can_reuse_kq_mask(inp_attn->self_kq_mask, mctx->get_attn(), params.ubatch, params.cparams);
++    }
+ 
+     res &= inp_rs->s_copy->ne[0] == mctx->get_recr()->get_n_rs();
+ 
+@@ -2551,7 +2571,9 @@ ggml_tensor * llm_graph_context::build_attn_mha(
+          ggml_tensor * sinks,
+          ggml_tensor * v_mla,
+                float   kq_scale,
+-                 int   il) const {
++                 int   il,
++             int32_t   n_kv_used) const {
++    GGML_ASSERT(kq_mask != nullptr || n_kv_used == 0 || (cparams.flash_attn && kq_b == nullptr));
+     const bool v_trans = v->nb[1] > v->nb[2];
+ 
+     // split the batch into streams if needed
+@@ -2588,6 +2610,9 @@ ggml_tensor * llm_graph_context::build_attn_mha(
+ 
+         ggml_flash_attn_ext_add_sinks(cur, sinks);
+         ggml_flash_attn_ext_set_prec (cur, GGML_PREC_F32);
++        if (kq_mask == nullptr && n_kv_used > 0) {
++            ggml_flash_attn_ext_set_kv_used(cur, n_kv_used);
++        }
+ 
+         if (v_mla) {
+ #if 0
+@@ -2768,9 +2793,12 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
+ 
+         inp->self_k_idxs = mctx_cur->build_input_k_idxs(ctx0, ubatch);
+         inp->self_v_idxs = mctx_cur->build_input_v_idxs(ctx0, ubatch);
+-
+-        inp->self_kq_mask = build_attn_inp_kq_mask(ctx0, mctx_cur, ubatch, cparams);
+-        inp->self_kq_mask_cnv = inp->self_kq_mask;
++        // implicit causal mask (prefill-sized batches of one contiguous sequence): no mask tensor to fill and upload
++        inp->n_kv_used = llm_graph_attn_implicit_mask_n_kv_used(mctx_cur, ubatch, cparams);
++        if (inp->n_kv_used == 0) {
++            inp->self_kq_mask = build_attn_inp_kq_mask(ctx0, mctx_cur, ubatch, cparams);
++            inp->self_kq_mask_cnv = inp->self_kq_mask;
++        }
+     }
+ 
+     inp->self_k_rot = mctx_cur->build_input_k_rot(ctx0);
+@@ -2845,7 +2873,7 @@ ggml_tensor * llm_graph_context::build_attn(
+         v = mctx_cur->get_v(ctx0, il);
+     }
+ 
+-    if (kq_mask->ne[0] != k->ne[2]) {
++    if (kq_mask && kq_mask->ne[0] != k->ne[2]) {
+         GGML_ASSERT(k->ne[2] <= kq_mask->ne[0]);
+         kq_mask = ggml_view_4d(ctx0, kq_mask,
+                 k->ne[2], kq_mask->ne[1], kq_mask->ne[2], kq_mask->ne[3],
+@@ -2853,7 +2881,7 @@ ggml_tensor * llm_graph_context::build_attn(
+         kq_mask = ggml_cont(ctx0, kq_mask);
+     }
+ 
+-    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il);
++    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il, inp->get_n_kv_used());
+     cb(cur, "kqv_out", il);
+ 
+     if (inp->self_v_rot) {
+diff --git a/src/llama-graph.h b/src/llama-graph.h
+index 94324c745..b18149c9e 100644
+--- a/src/llama-graph.h
++++ b/src/llama-graph.h
+@@ -337,12 +337,17 @@ public:
+ 
+     ggml_tensor * get_kq_mask() const { return self_kq_mask_cnv; }
+ 
++    // > 0: no mask tensor, the attention uses the implicit causal mask over cells [0, n_kv_used) (see build_attn_mha)
++    int32_t get_n_kv_used() const { return n_kv_used; }
++
+     ggml_tensor * self_k_idxs = nullptr; // I64 [n_batch]
+     ggml_tensor * self_v_idxs = nullptr; // I64 [n_batch] or [n_batch*n_embd_v_gqa]
+ 
+-    ggml_tensor * self_kq_mask     = nullptr; // F32/F16 [n_kv, n_batch/n_stream, 1, n_stream]
++    ggml_tensor * self_kq_mask     = nullptr; // F32/F16 [n_kv, n_batch/n_stream, 1, n_stream], null with the implicit mask
+     ggml_tensor * self_kq_mask_cnv = nullptr; //         [n_kv, n_batch/n_stream, 1, n_stream]
+ 
++    int32_t n_kv_used = 0;
++
+     // note: assumes v_rot^2 == I
+     ggml_tensor * self_k_rot = nullptr;
+     ggml_tensor * self_v_rot = nullptr;
+@@ -1135,11 +1140,12 @@ struct llm_graph_context {
+             ggml_tensor * k,       // [n_embd_head_k, n_head_k, n_tokens]
+             ggml_tensor * v,       // [n_embd_head_v, n_head_v, n_tokens] (v_trans = false)
+             ggml_tensor * kq_b,
+-            ggml_tensor * kq_mask,
++            ggml_tensor * kq_mask, // null with the implicit causal mask (n_kv_used > 0, flash attention only)
+             ggml_tensor * sinks,   // [n_head_q]
+             ggml_tensor * v_mla,   // [n_embd_head_v_mla, n_embd_head_v, n_head_v]
+                   float   kq_scale,
+-                    int   il) const;
++                    int   il,
++                int32_t   n_kv_used = 0) const;
+ 
+     llm_graph_input_attn_no_cache * build_attn_inp_no_cache() const;
+ 
+diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
+index cfa6a15e0..07afdf8c9 100644
+--- a/src/llama-kv-cache.cpp
++++ b/src/llama-kv-cache.cpp
+@@ -1378,6 +1378,55 @@ uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {
+     return result;
+ }
+ 
++uint32_t llama_kv_cache::get_n_kv_used(const slot_info & sinfo, const llama_ubatch & ubatch) const {
++    // M-RoPE (2D positions) only changes the causal rule for cells sharing a primary position, which the
++    // contiguity checks below exclude, so it needs no separate rejection
++    if (n_stream != 1 || sinfo.n_stream() != 1 || swa_type != LLAMA_SWA_TYPE_NONE || hparams.use_alibi) {
++        return 0;
++    }
++
++    const uint32_t n_tokens = ubatch.n_tokens;
++    if (n_tokens < n_tokens_min_implicit_mask || sinfo.idxs[0].size() != n_tokens) {
++        return 0;
++    }
++
++    // one sequence across the ubatch
++    const llama_seq_id seq_id = ubatch.seq_id[0][0];
++    for (uint32_t i = 0; i < n_tokens; ++i) {
++        if (ubatch.n_seq_id[i] != 1 || ubatch.seq_id[i][0] != seq_id) {
++            return 0;
++        }
++    }
++
++    const auto & cells = v_cells[sinfo.strm[0]];
++
++    const uint32_t n_used = cells.used_max_p1();
++    if (n_used < n_tokens) {
++        return 0;
++    }
++
++    // cells [0, n_used) hold this sequence only, in position order
++    if (cells.is_empty(0)) {
++        return 0;
++    }
++    const llama_pos pos0 = cells.pos_get(0);
++    for (uint32_t j = 0; j < n_used; ++j) {
++        if (cells.is_empty(j) || cells.seq_count(j) != 1 || !cells.seq_has(j, seq_id) || cells.pos_get(j) != pos0 + (llama_pos) j) {
++            return 0;
++        }
++    }
++
++    // the ubatch occupies the tail [n_used - n_tokens, n_used)
++    const uint32_t tail = n_used - n_tokens;
++    for (uint32_t i = 0; i < n_tokens; ++i) {
++        if (sinfo.idxs[0][i] != tail + i || ubatch.pos[i] != pos0 + (llama_pos) (tail + i)) {
++            return 0;
++        }
++    }
++
++    return n_used;
++}
++
+ int64_t llama_kv_cache::get_k_shift_width(uint32_t il) const {
+     const auto & layer = layers.at(map_layer_ids.at(il));
+ 
+@@ -2954,6 +3003,7 @@ bool llama_kv_cache_context::apply() {
+ 
+     kv->apply_ubatch(sinfos[i_cur], ubatches[i_cur]);
+     n_kv = kv->get_n_kv(sinfos[i_cur]);
++    n_kv_used = kv->get_n_kv_used(sinfos[i_cur], ubatches[i_cur]);
+ 
+     return true;
+ }
+@@ -2972,6 +3022,10 @@ uint32_t llama_kv_cache_context::get_n_kv() const {
+     return n_kv;
+ }
+ 
++uint32_t llama_kv_cache_context::get_n_kv_used() const {
++    return n_kv_used;
++}
++
+ ggml_type llama_kv_cache_context::type_k() const {
+     return kv->type_k();
+ }
+diff --git a/src/llama-kv-cache.h b/src/llama-kv-cache.h
+index caaf92f3f..eb7823944 100644
+--- a/src/llama-kv-cache.h
++++ b/src/llama-kv-cache.h
+@@ -169,6 +169,14 @@ public:
+ 
+     const llama_kv_cells & get_cells(llama_seq_id seq_id) const;
+ 
++    // > 0 when the ubatch can attend with the implicit causal mask (ggml_flash_attn_ext_set_kv_used): one stream,
++    // no SWA/ALiBi, one sequence, cells [0, n) contiguous in position order, the ubatch at the tail (then n is
++    // returned); 0 otherwise. Call after apply_ubatch. Batches below n_tokens_min_implicit_mask return 0 without
++    // scanning the cells: the mask fill is cheap for them and a backend may spend a launch per layer instead.
++    static constexpr uint32_t n_tokens_min_implicit_mask = 256;
++
++    uint32_t get_n_kv_used(const slot_info & sinfo, const llama_ubatch & ubatch) const;
++
+     // state_read, plus the cells the restored tokens were placed in
+     // a cache that mirrors another one (the qwen4exp indexer) must not search for its own cells: two searches agree only by luck
+     //   sinfos_out: if set, filled with the layout used; a stream with no cells leaves an empty entry
+@@ -399,6 +407,7 @@ public:
+     //
+ 
+     uint32_t get_n_kv() const;
++    uint32_t get_n_kv_used() const;
+ 
+     ggml_type type_k() const;
+     ggml_type type_v() const;
+@@ -474,4 +483,7 @@ private:
+     // a heuristic, to avoid attending the full cache if it is not yet utilized
+     // as the cache gets filled, the benefit from this heuristic disappears
+     int32_t n_kv;
++
++    // see llama_kv_cache::get_n_kv_used; 0 = use the mask tensor
++    int32_t n_kv_used = 0;
+ };
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index 5acbe92c7..f6313e6fb 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -8191,9 +8191,10 @@ struct test_flash_attn_ext : public test_case {
+     const ggml_type type_V;
+     std::array<int32_t, 4> permute;
+     const bool kv_view; // create K/V as views of a larger buffer (like a KV cache)
++    const int64_t n_kv_used; // > 0: implicit causal mask over cells [0, n_kv_used) instead of a mask tensor
+ 
+     std::string vars() override {
+-        return VARS_TO_STR15(hsk, hsv, nh, nr23, kv, nb, mask, sinks, max_bias, logit_softcap, prec, type_K, type_V, permute, kv_view);
++        return VARS_TO_STR16(hsk, hsv, nh, nr23, kv, nb, mask, sinks, max_bias, logit_softcap, prec, type_K, type_V, permute, kv_view, n_kv_used);
+     }
+ 
+     double max_nmse_err() override {
+@@ -8210,9 +8211,11 @@ struct test_flash_attn_ext : public test_case {
+     test_flash_attn_ext(int64_t hsk = 128, int64_t hsv = 128, int64_t nh = 32, std::array<int64_t, 2> nr23 = {1, 1}, int64_t kv = 96, int64_t nb = 8,
+                         bool mask = true, bool sinks = false, float max_bias = 0.0f, float logit_softcap = 0.0f, ggml_prec prec = GGML_PREC_F32,
+                         ggml_type type_K = GGML_TYPE_F16, ggml_type type_V = GGML_TYPE_F16, std::array<int32_t, 4> permute = {0, 1, 2, 3},
+-                        bool kv_view = true)
++                        bool kv_view = true, int64_t n_kv_used = 0)
+         : hsk(hsk), hsv(hsv), nh(nh), nr23(nr23), kv(kv), nb(nb), mask(mask), sinks(sinks), max_bias(max_bias), logit_softcap(logit_softcap), prec(prec),
+-          type_K(type_K), type_V(type_V), permute(permute), kv_view(kv_view) {}
++          type_K(type_K), type_V(type_V), permute(permute), kv_view(kv_view), n_kv_used(n_kv_used) {
++        GGML_ASSERT(n_kv_used == 0 || (!mask && n_kv_used >= nb && n_kv_used <= kv));
++    }
+ 
+     ggml_tensor * build_graph(ggml_context * ctx) override {
+         const int64_t hsk_padded = GGML_PAD(hsk, ggml_blck_size(type_K));
+@@ -8273,6 +8276,9 @@ struct test_flash_attn_ext : public test_case {
+         ggml_tensor * out = ggml_flash_attn_ext(ctx, q, k, v, m, 1.0f/sqrtf(hsk), max_bias, logit_softcap);
+         ggml_flash_attn_ext_add_sinks(out, s);
+         ggml_flash_attn_ext_set_prec (out, prec);
++        if (n_kv_used > 0) {
++            ggml_flash_attn_ext_set_kv_used(out, n_kv_used);
++        }
+         ggml_set_name(out, "out");
+ 
+         return out;
+@@ -11469,6 +11475,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+                                                         GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+     }
+ 
++    // implicit causal mask (n_kv_used, no mask tensor): the CUDA Hopper FMHA path (D 256, f16 K/V, nb >= 256, the model
++    // layout = permute {0,2,1,3}) and the materialized-mask fallback (small nb, other head sizes, plain layout), each
++    // against the CPU rule; nb < kv and nb == n_kv_used exercise the bottom-right offset and the K residual tile
++    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 4096, 4096, false, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 2, 1, 3}, true, 4096));
++    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 4096, 1024, false, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 2, 1, 3}, true, 3000));
++    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 4096,  264, false, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 2, 1, 3}, true,  777));
++    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 4096, 1024, false, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, 3000));
++    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 4096, 1024, false, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F32, GGML_TYPE_F32, {0, 2, 1, 3}, true, 3000));
++    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 8192,    1, false, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 2, 1, 3}, true, 5000));
++    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 1024,   64, false, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true,  900));
++    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {4, 1}, 1024,  256, false, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 2, 1, 3}, true,  900));
++
+     // dense-allocated (non-view) quant K/V at batch >= 64, in cache and native layouts
+     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {1, 1}, 512, 75, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 2, 1, 3}, false));
+     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {4, 1}, 512, 75, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 2, 1, 3}, false));
+@@ -12090,6 +12108,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {16, 1}, 10000, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {16, 1}, 20000, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+ 
++    // qwen35 (Qwen3.8-27B) attention layers: head dim 256, 4 KV heads, GQA 6; prefill ubatch 4096 and decode
++    // with the mask tensor (ggml kernels), prefill also with the implicit causal mask (CUDA: Hopper FMHA)
++    for (auto kv_nb : { std::pair<int, int>{4096, 4096}, {16384, 4096}, {110080, 4096}, {10240, 1}, {110080, 1} }) {
++        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv_nb.first, kv_nb.second, true,  false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
++        if (kv_nb.second >= 256) {
++            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv_nb.first, kv_nb.second, false, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 2, 1, 3}, true, kv_nb.first));
++        }
++    }
++
+     for (int kv : { 4096, 8192, 16384, }) {
+         for (int hs : { 64, 128, }) {
+             for (int nr : { 1, 4, }) {

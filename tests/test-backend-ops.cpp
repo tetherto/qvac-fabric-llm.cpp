@@ -8191,9 +8191,10 @@ struct test_flash_attn_ext : public test_case {
     const ggml_type type_V;
     std::array<int32_t, 4> permute;
     const bool kv_view; // create K/V as views of a larger buffer (like a KV cache)
+    const int64_t n_kv_used; // > 0: implicit causal mask over cells [0, n_kv_used) instead of a mask tensor
 
     std::string vars() override {
-        return VARS_TO_STR15(hsk, hsv, nh, nr23, kv, nb, mask, sinks, max_bias, logit_softcap, prec, type_K, type_V, permute, kv_view);
+        return VARS_TO_STR16(hsk, hsv, nh, nr23, kv, nb, mask, sinks, max_bias, logit_softcap, prec, type_K, type_V, permute, kv_view, n_kv_used);
     }
 
     double max_nmse_err() override {
@@ -8210,9 +8211,11 @@ struct test_flash_attn_ext : public test_case {
     test_flash_attn_ext(int64_t hsk = 128, int64_t hsv = 128, int64_t nh = 32, std::array<int64_t, 2> nr23 = {1, 1}, int64_t kv = 96, int64_t nb = 8,
                         bool mask = true, bool sinks = false, float max_bias = 0.0f, float logit_softcap = 0.0f, ggml_prec prec = GGML_PREC_F32,
                         ggml_type type_K = GGML_TYPE_F16, ggml_type type_V = GGML_TYPE_F16, std::array<int32_t, 4> permute = {0, 1, 2, 3},
-                        bool kv_view = true)
+                        bool kv_view = true, int64_t n_kv_used = 0)
         : hsk(hsk), hsv(hsv), nh(nh), nr23(nr23), kv(kv), nb(nb), mask(mask), sinks(sinks), max_bias(max_bias), logit_softcap(logit_softcap), prec(prec),
-          type_K(type_K), type_V(type_V), permute(permute), kv_view(kv_view) {}
+          type_K(type_K), type_V(type_V), permute(permute), kv_view(kv_view), n_kv_used(n_kv_used) {
+        GGML_ASSERT(n_kv_used == 0 || (!mask && n_kv_used >= nb && n_kv_used <= kv));
+    }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         const int64_t hsk_padded = GGML_PAD(hsk, ggml_blck_size(type_K));
@@ -8273,6 +8276,9 @@ struct test_flash_attn_ext : public test_case {
         ggml_tensor * out = ggml_flash_attn_ext(ctx, q, k, v, m, 1.0f/sqrtf(hsk), max_bias, logit_softcap);
         ggml_flash_attn_ext_add_sinks(out, s);
         ggml_flash_attn_ext_set_prec (out, prec);
+        if (n_kv_used > 0) {
+            ggml_flash_attn_ext_set_kv_used(out, n_kv_used);
+        }
         ggml_set_name(out, "out");
 
         return out;
@@ -11469,6 +11475,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                                                         GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     }
 
+    // implicit causal mask (n_kv_used, no mask tensor): the CUDA Hopper FMHA path (D 256, f16 K/V, nb >= 256, the model
+    // layout = permute {0,2,1,3}) and the materialized-mask fallback (small nb, other head sizes, plain layout), each
+    // against the CPU rule; nb < kv and nb == n_kv_used exercise the bottom-right offset and the K residual tile
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 4096, 4096, false, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 2, 1, 3}, true, 4096));
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 4096, 1024, false, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 2, 1, 3}, true, 3000));
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 4096,  264, false, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 2, 1, 3}, true,  777));
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 4096, 1024, false, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, 3000));
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 4096, 1024, false, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F32, GGML_TYPE_F32, {0, 2, 1, 3}, true, 3000));
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 8192,    1, false, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 2, 1, 3}, true, 5000));
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 1024,   64, false, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true,  900));
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {4, 1}, 1024,  256, false, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 2, 1, 3}, true,  900));
+
     // dense-allocated (non-view) quant K/V at batch >= 64, in cache and native layouts
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {1, 1}, 512, 75, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 2, 1, 3}, false));
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {4, 1}, 512, 75, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 2, 1, 3}, false));
@@ -12089,6 +12107,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {16, 1}, 20000, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {16, 1}, 10000, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {16, 1}, 20000, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+
+    // qwen35 (Qwen3.8-27B) attention layers: head dim 256, 4 KV heads, GQA 6; prefill ubatch 4096 and decode
+    // with the mask tensor (ggml kernels), prefill also with the implicit causal mask (CUDA: Hopper FMHA)
+    for (auto kv_nb : { std::pair<int, int>{4096, 4096}, {16384, 4096}, {110080, 4096}, {10240, 1}, {110080, 1} }) {
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv_nb.first, kv_nb.second, true,  false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+        if (kv_nb.second >= 256) {
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv_nb.first, kv_nb.second, false, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 2, 1, 3}, true, kv_nb.first));
+        }
+    }
 
     for (int kv : { 4096, 8192, 16384, }) {
         for (int hs : { 64, 128, }) {

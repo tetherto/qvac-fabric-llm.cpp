@@ -13,8 +13,8 @@
 #include "cutlass/epilogue/collective/collective_builder.hpp"
 #include "cutlass/detail/blockwise_scale_layout.hpp"
 #include "cutlass/util/packed_stride.hpp"
+#include "cutlass-hw.cuh"
 
-#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 
@@ -71,31 +71,8 @@ using StrideD    = typename Gemm::GemmKernel::StrideD;
 
 constexpr int MAX_SWIZZLE = 4;
 
-// SM count per device, queried once (the current device is set by the caller); duplicate first queries are harmless
-cutlass::KernelHardwareInfo hw_info_for_current_device() {
-    constexpr int max_devices = 16;
-    static std::atomic<int> sm_counts[max_devices];
-    cutlass::KernelHardwareInfo info;
-    const cudaError_t err = cudaGetDevice(&info.device_id);
-    if (err != cudaSuccess) {
-        fprintf(stderr, "%s: cudaGetDevice failed: %s\n", __func__, cudaGetErrorString(err));
-        abort();
-    }
-    if (info.device_id < 0 || info.device_id >= max_devices) {
-        info.sm_count = cutlass::KernelHardwareInfo::query_device_multiprocessor_count(info.device_id);
-        return info;
-    }
-    int n = sm_counts[info.device_id].load(std::memory_order_relaxed);
-    if (n == 0) {
-        n = cutlass::KernelHardwareInfo::query_device_multiprocessor_count(info.device_id);
-        sm_counts[info.device_id].store(n, std::memory_order_relaxed);
-    }
-    info.sm_count = n;
-    return info;
-}
-
 typename Gemm::Arguments make_args(const uint8_t * a, const float * sfa, const uint8_t * b, const float * sfb, float * d, int M, int N, int K) {
-    const cutlass::KernelHardwareInfo hw_info = hw_info_for_current_device();
+    const cutlass::KernelHardwareInfo hw_info = ggml_cutlass_hw_info_for_current_device();
 
     const StrideA stride_A = cutlass::make_cute_packed_stride(StrideA{}, make_shape(M, K, 1));
     const StrideB stride_B = cutlass::make_cute_packed_stride(StrideB{}, make_shape(N, K, 1));

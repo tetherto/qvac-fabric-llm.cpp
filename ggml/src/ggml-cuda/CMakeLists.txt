@@ -103,7 +103,8 @@ if (CUDAToolkit_FOUND)
     list(APPEND GGML_HEADERS_CUDA "../../include/ggml-cuda.h")
 
     file(GLOB   GGML_SOURCES_CUDA "*.cu")
-    list(REMOVE_ITEM GGML_SOURCES_CUDA "${CMAKE_CURRENT_SOURCE_DIR}/mmf8-cutlass.cu") # built by its own target when GGML_CUDA_CUTLASS is on
+    # built by their own target when GGML_CUDA_CUTLASS is on
+    list(REMOVE_ITEM GGML_SOURCES_CUDA "${CMAKE_CURRENT_SOURCE_DIR}/mmf8-cutlass.cu" "${CMAKE_CURRENT_SOURCE_DIR}/fattn-cutlass.cu")
     file(GLOB   SRCS "template-instances/fattn-tile*.cu")
     list(APPEND GGML_SOURCES_CUDA ${SRCS})
     file(GLOB   SRCS "template-instances/fattn-mma*.cu")
@@ -281,8 +282,8 @@ if (CUDAToolkit_FOUND)
         message(STATUS "CUTLASS FP8 GEMM enabled, sources in ${cutlass_SOURCE_DIR}")
 
         # sm_90a only (wgmma/TMA); compiled apart from the main target so the arch list of ggml-cuda stays as configured
-        add_library(ggml-cuda-cutlass OBJECT mmf8-cutlass.cu)
-        target_include_directories(ggml-cuda-cutlass PRIVATE ${cutlass_SOURCE_DIR}/include ${cutlass_SOURCE_DIR}/tools/util/include ${CMAKE_CURRENT_SOURCE_DIR})
+        add_library(ggml-cuda-cutlass OBJECT mmf8-cutlass.cu fattn-cutlass.cu)
+        target_include_directories(ggml-cuda-cutlass PRIVATE ${cutlass_SOURCE_DIR}/include ${cutlass_SOURCE_DIR}/tools/util/include ${cutlass_SOURCE_DIR}/examples/88_hopper_fmha ${CMAKE_CURRENT_SOURCE_DIR})
         set_target_properties(ggml-cuda-cutlass PROPERTIES CUDA_ARCHITECTURES OFF POSITION_INDEPENDENT_CODE ON CUDA_STANDARD 17 CXX_STANDARD 17)
         target_compile_options(ggml-cuda-cutlass PRIVATE "$<$<COMPILE_LANGUAGE:CUDA>:-gencode;arch=compute_90a,code=sm_90a;--expt-relaxed-constexpr;-Xcompiler;-Wno-pedantic>")
         target_link_libraries(ggml-cuda-cutlass PRIVATE CUDA::cudart)

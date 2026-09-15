@@ -1378,6 +1378,55 @@ uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {
     return result;
 }
 
+uint32_t llama_kv_cache::get_n_kv_used(const slot_info & sinfo, const llama_ubatch & ubatch) const {
+    // M-RoPE (2D positions) only changes the causal rule for cells sharing a primary position, which the
+    // contiguity checks below exclude, so it needs no separate rejection
+    if (n_stream != 1 || sinfo.n_stream() != 1 || swa_type != LLAMA_SWA_TYPE_NONE || hparams.use_alibi) {
+        return 0;
+    }
+
+    const uint32_t n_tokens = ubatch.n_tokens;
+    if (n_tokens < n_tokens_min_implicit_mask || sinfo.idxs[0].size() != n_tokens) {
+        return 0;
+    }
+
+    // one sequence across the ubatch
+    const llama_seq_id seq_id = ubatch.seq_id[0][0];
+    for (uint32_t i = 0; i < n_tokens; ++i) {
+        if (ubatch.n_seq_id[i] != 1 || ubatch.seq_id[i][0] != seq_id) {
+            return 0;
+        }
+    }
+
+    const auto & cells = v_cells[sinfo.strm[0]];
+
+    const uint32_t n_used = cells.used_max_p1();
+    if (n_used < n_tokens) {
+        return 0;
+    }
+
+    // cells [0, n_used) hold this sequence only, in position order
+    if (cells.is_empty(0)) {
+        return 0;
+    }
+    const llama_pos pos0 = cells.pos_get(0);
+    for (uint32_t j = 0; j < n_used; ++j) {
+        if (cells.is_empty(j) || cells.seq_count(j) != 1 || !cells.seq_has(j, seq_id) || cells.pos_get(j) != pos0 + (llama_pos) j) {
+            return 0;
+        }
+    }
+
+    // the ubatch occupies the tail [n_used - n_tokens, n_used)
+    const uint32_t tail = n_used - n_tokens;
+    for (uint32_t i = 0; i < n_tokens; ++i) {
+        if (sinfo.idxs[0][i] != tail + i || ubatch.pos[i] != pos0 + (llama_pos) (tail + i)) {
+            return 0;
+        }
+    }
+
+    return n_used;
+}
+
 int64_t llama_kv_cache::get_k_shift_width(uint32_t il) const {
     const auto & layer = layers.at(map_layer_ids.at(il));
 
@@ -2954,6 +3003,7 @@ bool llama_kv_cache_context::apply() {
 
     kv->apply_ubatch(sinfos[i_cur], ubatches[i_cur]);
     n_kv = kv->get_n_kv(sinfos[i_cur]);
+    n_kv_used = kv->get_n_kv_used(sinfos[i_cur], ubatches[i_cur]);
 
     return true;
 }
@@ -2970,6 +3020,10 @@ const llama_ubatch & llama_kv_cache_context::get_ubatch() const {
 
 uint32_t llama_kv_cache_context::get_n_kv() const {
     return n_kv;
+}
+
+uint32_t llama_kv_cache_context::get_n_kv_used() const {
+    return n_kv_used;
 }
 
 ggml_type llama_kv_cache_context::type_k() const {

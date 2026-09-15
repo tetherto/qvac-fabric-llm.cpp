@@ -4158,7 +4158,8 @@ static bool ggml_backend_hexagon_device_supports_op(ggml_backend_dev_t dev, cons
             break;
 
         case GGML_OP_FLASH_ATTN_EXT:
-            supp = ggml_hexagon_supported_flash_attn_ext(sess, op);
+            // implicit causal mask (n_kv_used) is CPU/CUDA only
+            supp = !(op->src[3] == nullptr && ggml_flash_attn_ext_get_kv_used(op) > 0) && ggml_hexagon_supported_flash_attn_ext(sess, op);
             break;
 
         case GGML_OP_SET_ROWS:
