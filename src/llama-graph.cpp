@@ -2062,8 +2062,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         cb(weights_sum, "ffn_moe_weights_sum", il);
 
         // Avoid division by zero, clamp to smallest number representable by F16
-        // Under training, build the equivalent max(x, eps) = x + relu(eps - x) 
-        // using non-view ops so the gradient walk stays legal. The relu trick 
+        // Under training, build the equivalent max(x, eps) = x + relu(eps - x)
+        // using non-view ops so the gradient walk stays legal. The relu trick
         // produces a fresh tensor at each step.
         const float weights_sum_eps = 6.103515625e-5f;
         if (cparams.training) {

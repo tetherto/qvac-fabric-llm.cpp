@@ -56,10 +56,10 @@ void my_log_callback(ggml_log_level level, const char * text, void * user_data) 
 int main() {
     // Set up llama's logging
     llama_log_set(my_log_callback, NULL);
-    
+
     // Redirect mtmd/clip logging to use the same callback
     mtmd_log_set_llama_callback(my_log_callback, NULL);
-    
+
     // Now all mtmd and clip logs will use your custom callback
     mtmd_context * ctx = mtmd_init_from_file(...);
     // ...
