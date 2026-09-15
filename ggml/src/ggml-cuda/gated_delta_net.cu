@@ -1,6 +1,12 @@
 #include "gated_delta_net.cuh"
 #include "ggml-cuda/common.cuh"
 
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+#if defined(__linux__)
+#include <dlfcn.h>
+#endif
+#endif
+
 // serial kernel: one dependent step per token; n_tokens_dst is the token count of the whole op (dst row stride), n_tokens the count processed here
 template <int S_v, bool KDA, bool keep_rs_t>
 __global__ void __launch_bounds__((ggml_cuda_get_physical_warp_size() < S_v ? ggml_cuda_get_physical_warp_size() : S_v) * 4, 2)
@@ -619,6 +625,179 @@ static void launch_gated_delta_net(
     }
 }
 
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+// opt-in external SM90 fused delta-rule kernel (FlashInfer CuTe DSL AOT export), loaded from GGML_CUDA_GDN_AOT_LIB
+using gdn_flashinfer_aot_launch_t = int (*)(
+    const void *, const void *, const void *, void *,
+    const float *, const float *, float *, const float *,
+    void *, const int64_t *, int32_t, int32_t, int32_t, int32_t, int32_t,
+    cudaStream_t);
+
+static gdn_flashinfer_aot_launch_t get_gdn_flashinfer_aot_launch() {
+#if defined(__linux__)
+    static const gdn_flashinfer_aot_launch_t launch = [] {
+        const char * path = std::getenv("GGML_CUDA_GDN_AOT_LIB");
+        if (path == nullptr || path[0] == '\0') {
+            return (gdn_flashinfer_aot_launch_t) nullptr;
+        }
+
+        void * handle = dlopen(path, RTLD_NOW | RTLD_LOCAL);
+        if (handle == nullptr) {
+            std::fprintf(stderr, "ggml_cuda: failed to load GDN AOT library %s: %s\n", path, dlerror());
+            return (gdn_flashinfer_aot_launch_t) nullptr;
+        }
+
+        void * symbol = dlsym(handle, "flashinfer_gdn_sm90_aot_launch");
+        if (symbol == nullptr) {
+            std::fprintf(stderr, "ggml_cuda: GDN AOT library is missing flashinfer_gdn_sm90_aot_launch: %s\n", dlerror());
+            return (gdn_flashinfer_aot_launch_t) nullptr;
+        }
+
+        std::fprintf(stderr, "ggml_cuda: using FlashInfer SM90 AOT GDN from %s\n", path);
+        return reinterpret_cast<gdn_flashinfer_aot_launch_t>(symbol);
+    }();
+    return launch;
+#else
+    return nullptr;
+#endif
+}
+
+__global__ void gated_delta_net_flashinfer_prepare_cuda(
+        const float * q,
+        const float * k,
+        const float * v,
+        const float * g,
+        const float * beta,
+        __nv_bfloat16 * q_bf16,
+        __nv_bfloat16 * k_bf16,
+        __nv_bfloat16 * v_bf16,
+        float * alpha,
+        float * beta_packed,
+        int64_t S,
+        int64_t H_q,
+        int64_t H_v,
+        int64_t n_tokens,
+        int64_t n_seqs,
+        int64_t sq1,
+        int64_t sq2,
+        int64_t sq3,
+        int64_t sv1,
+        int64_t sv2,
+        int64_t sv3,
+        int64_t sb1,
+        int64_t sb2,
+        int64_t sb3,
+        int64_t rq3) {
+    const int64_t idx = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    const int64_t n = n_seqs * n_tokens * H_v * S;
+    if (idx >= n) {
+        return;
+    }
+
+    const int64_t d = idx % S;
+    const int64_t ih = (idx / S) % H_v;
+    const int64_t it = (idx / (S * H_v)) % n_tokens;
+    const int64_t is = idx / (S * H_v * n_tokens);
+
+    v_bf16[idx] = __float2bfloat16_rn(v[is * sv3 + it * sv2 + ih * sv1 + d]);
+    if (d == 0) {
+        const int64_t gate_idx = is * n_tokens * H_v + it * H_v + ih;
+        const int64_t src_gate_idx = is * sb3 + it * sb2 + ih * sb1;
+        alpha[gate_idx] = expf(g[src_gate_idx]);
+        beta_packed[gate_idx] = beta[src_gate_idx];
+    }
+
+    // keep ggml's grouped-value head mapping (h_v % H_q) by materializing equal-head q/k.
+    // FlashInfer's native GVA convention groups adjacent value heads instead.
+    const int64_t iq3 = is / rq3;
+    const int64_t iq1 = ih % H_q;
+    const int64_t q_idx = ((is * n_tokens + it) * H_v + ih) * S + d;
+    const int64_t src_idx = iq3 * sq3 + it * sq2 + iq1 * sq1 + d;
+    q_bf16[q_idx] = __float2bfloat16_rn(q[src_idx]);
+    k_bf16[q_idx] = __float2bfloat16_rn(k[src_idx]);
+}
+
+__global__ void gated_delta_net_flashinfer_unpack_cuda(
+        const __nv_bfloat16 * src, float * dst, int64_t n) {
+    const int64_t idx = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) {
+        dst[idx] = __bfloat162float(src[idx]);
+    }
+}
+
+__global__ void gated_delta_net_flashinfer_cu_seqlens_cuda(
+        int64_t * cu_seqlens, int64_t n_tokens, int64_t n_seqs) {
+    const int64_t idx = threadIdx.x;
+    if (idx <= n_seqs) {
+        cu_seqlens[idx] = idx * n_tokens;
+    }
+}
+
+static bool launch_gated_delta_net_flashinfer_aot(
+        ggml_backend_cuda_context & ctx,
+        const float * q_d, const float * k_d, const float * v_d,
+        const float * g_d, const float * b_d, const float * s_d,
+        float * dst_d, float * state_d,
+        int64_t S_v, int64_t H, int64_t n_tokens, int64_t n_seqs,
+        int64_t sq1, int64_t sq2, int64_t sq3,
+        int64_t sv1, int64_t sv2, int64_t sv3,
+        int64_t sb1, int64_t sb2, int64_t sb3,
+        int64_t H_q, int64_t rq3, cudaStream_t stream) {
+    const gdn_flashinfer_aot_launch_t launch = get_gdn_flashinfer_aot_launch();
+    const int device = ggml_cuda_get_device();
+    const auto & info = ggml_cuda_info().devices[device];
+    if (launch == nullptr || info.cc != GGML_CUDA_CC_HOPPER || S_v != 128 ||
+        n_tokens < 64 || H_q <= 0 || H % H_q != 0 || n_seqs > 1023 ||
+        n_tokens * n_seqs > INT32_MAX || H > INT32_MAX || H_q > INT32_MAX) {
+        return false;
+    }
+
+    const size_t v_elements = (size_t) n_seqs * n_tokens * H * S_v;
+    const size_t q_elements = v_elements;
+    const size_t gate_elements = (size_t) n_seqs * n_tokens * H;
+    const size_t tensormaps_bytes = (size_t) info.nsm * 128;
+
+    ggml_cuda_pool_alloc<__nv_bfloat16> q_bf16(ctx.pool(), q_elements);
+    ggml_cuda_pool_alloc<__nv_bfloat16> k_bf16(ctx.pool(), q_elements);
+    ggml_cuda_pool_alloc<__nv_bfloat16> v_bf16(ctx.pool(), v_elements);
+    ggml_cuda_pool_alloc<__nv_bfloat16> out_bf16(ctx.pool(), v_elements);
+    ggml_cuda_pool_alloc<float> alpha(ctx.pool(), gate_elements);
+    ggml_cuda_pool_alloc<float> beta(ctx.pool(), gate_elements);
+    ggml_cuda_pool_alloc<int64_t> cu_seqlens(ctx.pool(), n_seqs + 1);
+    ggml_cuda_pool_alloc<uint8_t> tensormaps(ctx.pool(), tensormaps_bytes);
+
+    const int threads = 256;
+    ggml_cuda_kernel_launch_params prepare_params(
+        dim3((v_elements + threads - 1) / threads, 1, 1), dim3(threads, 1, 1), 0, stream);
+    ggml_cuda_kernel_launch(gated_delta_net_flashinfer_prepare_cuda, prepare_params,
+        q_d, k_d, v_d, g_d, b_d,
+        q_bf16.get(), k_bf16.get(), v_bf16.get(), alpha.get(), beta.get(),
+        S_v, H_q, H, n_tokens, n_seqs,
+        sq1, sq2, sq3, sv1, sv2, sv3, sb1, sb2, sb3, rq3);
+
+    ggml_cuda_kernel_launch_params cu_params(
+        dim3(1, 1, 1), dim3(n_seqs + 1, 1, 1), 0, stream);
+    ggml_cuda_kernel_launch(gated_delta_net_flashinfer_cu_seqlens_cuda, cu_params,
+        cu_seqlens.get(), n_tokens, n_seqs);
+
+    const int rc = launch(
+        q_bf16.get(), k_bf16.get(), v_bf16.get(), out_bf16.get(),
+        alpha.get(), beta.get(), state_d, s_d, tensormaps.get(), cu_seqlens.get(),
+        (int32_t) (n_tokens * n_seqs), (int32_t) H, (int32_t) H, (int32_t) n_seqs,
+        (int32_t) tensormaps_bytes, stream);
+    if (rc != 0) {
+        std::fprintf(stderr, "ggml_cuda: FlashInfer SM90 AOT GDN launch failed with status %d\n", rc);
+        return false;
+    }
+
+    ggml_cuda_kernel_launch_params unpack_params(
+        dim3((v_elements + threads - 1) / threads, 1, 1), dim3(threads, 1, 1), 0, stream);
+    ggml_cuda_kernel_launch(gated_delta_net_flashinfer_unpack_cuda, unpack_params,
+        out_bf16.get(), dst_d, (int64_t) v_elements);
+    return true;
+}
+#endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+
 static void ggml_cuda_op_gated_delta_net_impl(
         ggml_backend_cuda_context & ctx, ggml_tensor * dst, const ggml_cuda_gated_delta_net_fused_cache * cache) {
     ggml_tensor * src_q     = dst->src[0];
@@ -692,6 +871,17 @@ static void ggml_cuda_op_gated_delta_net_impl(
         state_d           = cache->data;
         state_slot_stride = cache->slot_stride;
     }
+
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    if (!kda && !keep_rs &&
+        launch_gated_delta_net_flashinfer_aot(
+            ctx, q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d,
+            S_v, H, n_tokens, n_seqs,
+            sq1, sq2, sq3, sv1, sv2, sv3, sb1, sb2, sb3,
+            neqk1, rq3, stream)) {
+        return;
+    }
+#endif
 
     // prefill: run whole chunks through the chunked kernel, then the serial kernel finishes the tail from that state.
     // K > 1 keeps at least K tokens in the tail so every snapshot slot is written by the serial kernel.
