@@ -219,6 +219,9 @@ static void llama_tensor_dequantize_impl(
     }
     float * f32_output = (float *) output.data();
 
+    if (tensor->type == GGML_TYPE_F8_E4M3) {
+        throw std::runtime_error("quantizing from F8_E4M3 is not supported: the block scales live in sidecar tensors");
+    }
     const ggml_type_traits * qtype = ggml_get_type_traits(tensor->type);
     if (ggml_is_quantized(tensor->type)) {
         if (qtype->to_float == NULL) {

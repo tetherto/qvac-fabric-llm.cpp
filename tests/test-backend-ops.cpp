@@ -4612,6 +4612,15 @@ struct test_gated_delta_net : public test_case {
 
     bool   grad_precise() override { return true; }
     double max_maa_err()  override { return 2e-2; }
+    // the opt-in external FlashInfer kernel (CUDA, GGML_CUDA_GDN_AOT_LIB) rounds q/k/v and the output to BF16.
+    // The TF32 chunked GDN prefill kernel sits at NMSE 1e-7 (1.06e-7 at S 64 T 256, 1.09e-7 at S 128 T 4096).
+    double max_nmse_err() override {
+        if (getenv("GGML_CUDA_GDN_AOT_LIB")) {
+            return 5e-5;
+        }
+        const bool chunked = !kda && n_seq_tokens >= 64 && (head_size == 64 || head_size == 128);
+        return chunked ? 5e-7 : test_case::max_nmse_err();
+    }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         const bool grad = (mode == MODE_GRAD) && !permuted && check_grad;
@@ -5066,6 +5075,68 @@ struct test_mul_mat : public test_case {
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
         return ggml_op_name(GGML_OP_MUL_MAT);
+    }
+};
+
+// GGML_OP_MUL_MAT with F8_E4M3 weights and 128x128 block scales in src[2]
+struct test_mul_mat_f8 : public test_case {
+    const int64_t k; // weight columns (ne[0])
+    const int64_t n; // weight rows
+    const int64_t m; // tokens
+    const float b_max; // activation magnitude; subnormal values exercise the activation quantizer's scale floor
+
+    std::string vars() override {
+        return VARS_TO_STR4(k, n, m, b_max);
+    }
+
+    double max_nmse_err() override {
+        // GEMV paths use F32 activations; the GEMM paths may quantize the activations to e4m3 per 128-group
+        return m <= 8 ? 5e-4 : 5e-3;
+    }
+
+    uint64_t op_flops(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return 2 * k * n * m;
+    }
+
+    test_mul_mat_f8(int64_t k = 256, int64_t n = 128, int64_t m = 1, float b_max = 1.0f) : k(k), n(n), m(m), b_max(b_max) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor_2d(ctx, GGML_TYPE_F8_E4M3, k, n);
+        ggml_set_name(a, "a");
+        ggml_tensor * s = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n/GGML_F8_E4M3_SCALE_BLOCK, k/GGML_F8_E4M3_SCALE_BLOCK);
+        ggml_set_name(s, "a_scale");
+        ggml_tensor * b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, m);
+        ggml_set_name(b, "b");
+
+        ggml_tensor * out = ggml_mul_mat_blockscaled(ctx, a, s, b);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        std::default_random_engine rng(42);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type == GGML_TYPE_F8_E4M3) {
+                // exponent field <= 10 keeps |w| <= 8; no NaN encodings
+                std::uniform_int_distribution<int> dist(0, 255);
+                std::vector<uint8_t> data(ggml_nelements(t));
+                for (size_t i = 0; i < data.size(); i++) {
+                    const uint8_t v = (uint8_t) dist(rng);
+                    data[i] = (v & 0x80) | (v & 0x7F) % 0x58;
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size());
+            } else if (strcmp(t->name, "a_scale") == 0) {
+                init_tensor_uniform(t, 0.5f, 2.0f);
+            } else {
+                init_tensor_uniform(t, -b_max, b_max);
+            }
+        }
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MUL_MAT_F8";
     }
 };
 
@@ -10411,6 +10482,26 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_TQ2_0, GGML_TYPE_F32, 16, 2, 1024, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_TQ2_0, GGML_TYPE_F32, 16, 4, 1024, {1, 1}, {1, 1}));
 
+    // F8_E4M3 weights with 128x128 block scales: (k, n, tokens)
+    for (int64_t m : {1, 2, 8, 9, 64}) {
+        test_cases.emplace_back(new test_mul_mat_f8(256, 128, m));
+    }
+    for (int64_t m : {1, 8, 64, 512, 4096}) {
+        test_cases.emplace_back(new test_mul_mat_f8(5120, 17408, m));
+    }
+    for (int64_t m : {1, 4096}) {
+        test_cases.emplace_back(new test_mul_mat_f8(17408, 5120, m));
+        test_cases.emplace_back(new test_mul_mat_f8(5120, 1024, m));
+    }
+    for (int64_t m : {2, 1000}) {
+        test_cases.emplace_back(new test_mul_mat_f8(6144, 5120, m));
+    }
+
+    // activation groups whose amax/448 is below FLT_MIN (quantizer scale floor); m > 8 so the GEMM paths run
+    for (int64_t m : {9, 64}) {
+        test_cases.emplace_back(new test_mul_mat_f8(256, 128, m, 1e-37f));
+    }
+
     for (ggml_type type_a : all_types) {
         for (int i = 1; i < 10; ++i) {
             test_cases.emplace_back(new test_mul_mat(type_a,    GGML_TYPE_F32, 16,  i, 1*256, { 1,  1}, {1, 1}));
@@ -11600,6 +11691,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64,  64, 1, 1, false, true));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64,  33, 1, 1, false, true));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 100, 1, 1, false, true));
+    // chunked path at head_size 128 with q/k head broadcast (qwen35: H_k 16, H_v 48), permuted input, multi-seq
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 256, 1, 3));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 200, 2, 1, true));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 2, 128, 130, 2, 2));
+    // external SM90 fused kernel shapes (qwen35 H_k 16, H_v 48; T not a multiple of 64; multi-seq)
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128,   64, 1, 3));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 4096, 1, 3));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 4033, 1, 3));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32,  4, 128,  127, 2, 2));
+    // chunked prefix followed by a serial tail that must hold all K snapshots (tail exactly K, and tail > K)
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64,  68, 1, 1, false, false, /*K=*/4));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 100, 2, 1, false, false, /*K=*/4));
 
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32,  2, 32, 4, 1, 1, false, false, 1, true));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32,  2, 32, 4, 1, 1, false, true,  1, true));
@@ -11623,6 +11726,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(/*H=*/4, /*S=*/32, /*T=*/4, /*seqs=*/1, /*K=*/4));
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(/*H=*/4, /*S=*/32, /*T=*/1, /*seqs=*/2, /*K=*/1));
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(/*H=*/8, /*S=*/64, /*T=*/8, /*seqs=*/2, /*K=*/3));
+    // cache fusion through the chunked CUDA path (T >= 64 at head_size 128), with and without a snapshot tail
+    test_cases.emplace_back(new test_gated_delta_net_cache_fusion(/*H=*/4, /*S=*/128, /*T=*/256, /*seqs=*/1, /*K=*/1));
+    test_cases.emplace_back(new test_gated_delta_net_cache_fusion(/*H=*/4, /*S=*/128, /*T=*/132, /*seqs=*/2, /*K=*/4));
 
     // head sizes spanning the backend threadgroup-shape decisions (columns per thread,
     // threads per threadgroup); every power of two the backends accept.
@@ -11905,6 +12011,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         }
     }
 
+    for (int64_t m : {1, 4096}) {
+        test_cases.emplace_back(new test_mul_mat_f8(5120, 17408, m));
+        test_cases.emplace_back(new test_mul_mat_f8(17408, 5120, m));
+    }
+
     // qwen3-30b-a3b
     for (int bs : {1, 4, 8, 32, 64, 128, 256, 512}) {
         for (ggml_type type_a : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_Q4_K, GGML_TYPE_Q6_K, GGML_TYPE_IQ2_XS}) {
@@ -12140,6 +12251,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 512, 1));  // 4h PP-512
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 1024, 1)); // 4h PP-1024
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 64, 1, 1, false, true)); // KDA PP-64
+    // qwen35 (Qwen3.8-27B): H_k 16, H_v 48 (v_repeat 3), ub 4096
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 1024, 1, 3));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 4096, 1, 3));
 
     // GATED_DELTA_NET_BACK: mirrors the forward configurations above.
     // Backward only runs during training, so the sequence lengths that matter are the PP-sized ones.

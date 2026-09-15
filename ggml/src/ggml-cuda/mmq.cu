@@ -308,6 +308,11 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
             return false;
         }
     }
+#ifndef GGML_CUDA_FORCE_MMQ
+    if (cc == GGML_CUDA_CC_HOPPER && n_experts == 0 && ne11 >= MMQ_HOPPER_CUBLAS_MIN_BATCH_SIZE) {
+        return false;
+    }
+#endif // GGML_CUDA_FORCE_MMQ
 
     if (turing_mma_available(cc)) {
         return true;

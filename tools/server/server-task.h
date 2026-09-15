@@ -3,10 +3,12 @@
 #include "common.h"
 #include "llama.h"
 
+#include <algorithm>
 #include <string>
 #include <unordered_set>
 #include <list>
 #include <map>
+#include <memory>
 
 // TODO: prevent including the whole server-common.h as we only use server_tokens
 #include "server-common.h"
@@ -586,9 +588,24 @@ struct server_prompt {
     }
 };
 
+// state buffer without value-initialization: the pages are faulted in by server_prompt_cache::alloc
+struct server_prompt_buffer {
+    std::unique_ptr<uint8_t[]> ptr;
+    size_t n = 0;
+
+    uint8_t * data() { return ptr.get(); }
+    size_t size() const { return n; }
+    bool empty() const { return n == 0; }
+
+    void clear() {
+        ptr.reset();
+        n = 0;
+    }
+};
+
 struct server_prompt_data {
-    std::vector<uint8_t> main;
-    std::vector<uint8_t> drft;
+    server_prompt_buffer main;
+    server_prompt_buffer drft;
 
     size_t size() const {
         return main.size() + drft.size();
@@ -611,9 +628,10 @@ struct server_prompt_cache_state {
 };
 
 struct server_prompt_cache {
-    server_prompt_cache(int32_t limit_size_mib, size_t limit_tokens) {
+    server_prompt_cache(int32_t limit_size_mib, size_t limit_tokens, int n_threads) {
         this->limit_size   = 1024ull*1024ull*(limit_size_mib < 0 ? 0 : limit_size_mib);
         this->limit_tokens = limit_tokens;
+        this->n_threads    = std::max(1, n_threads);
     }
 
     std::list<server_prompt_cache_state> states;
@@ -623,6 +641,9 @@ struct server_prompt_cache {
 
     // in tokens, 0 = no limit
     size_t limit_tokens = 0;
+
+    // threads used to fault in the pages of a new state buffer
+    int n_threads = 1;
 
     size_t size() const;
 
