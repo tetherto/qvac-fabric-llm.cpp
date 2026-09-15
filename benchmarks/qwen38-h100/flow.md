@@ -71,3 +71,23 @@ ggml_cuda_mul_mat_f8(src0 = F8 weight [K][N], src1 = F32 activations [K][M], dst
 2. Otherwise the P4 path: whole 64-token chunks through `gated_delta_net_chunked_cuda<S_v>` (TF32 tensor cores), then the serial kernel on the tail from the chunk state. Decode (T = 1) always takes the serial kernel.
 
 Without the variable nothing changes: the loader returns null once and every call falls through (verified by a trace with zero FlashInfer launches and the P4 kernel present). Tests: `test_gated_delta_net` cases at the qwen35 shape family ((16, 128, 64/4096/4033, v_repeat 3), (4, 128, 127, 2 seqs, v_repeat 2)); tolerance 5e-5 NMSE with the library (BF16 I/O), 5e-7 for the TF32 chunked path (T >= 64, not KDA), the generic 1e-7 elsewhere.
+
+## Campaign 2 (branch `h100-attn-decode`, on top of the above)
+
+### Prefill attention without a mask (`ggml_flash_attn_ext_set_kv_used`, B1)
+
+1. `llama_kv_cache::get_n_kv_used(sinfo, ubatch)` after `apply_ubatch`: for a ubatch of at least 256 tokens (`n_tokens_min_implicit_mask`), one stream, one sequence, no SWA/ALiBi/2D positions, it scans the cells and returns n when cells [0, n) are used, in position order, with the ubatch at the tail; 0 otherwise. `llama_context` probes once per context whether the attention backend accepts the op without a mask (`cparams.attn_implicit_mask`).
+2. `build_attn_inp_kv_impl` stores `n_kv_used` on the input instead of filling the mask; `build_attn` passes it to `build_attn_mha`, which calls `ggml_flash_attn_ext` with a null mask and sets op param 4. `can_reuse` (plain and hybrid inputs) compares it.
+3. CUDA `ggml_cuda_flash_attn_ext`: on cc 900 with D 256, f16 or f32 K/V, n_q >= 256 and K/V head strides that TMA accepts, `ggml_cuda_flash_attn_ext_cutlass_run` converts Q to f16, pads n_q to a multiple of 8 with zero phantom rows (and the same number of phantom cells past `n_kv_used`), converts f32 K/V cells to f16 when needed, launches the example-88 kernel (`fattn-cutlass.cu`, one launch per layer, B = kv heads, H = 6, `CausalOffsetFusion` with offset `n_kv_used - n_q`), and converts O back to f32. Otherwise `fattn_causal_mask_f16` materializes the [n_kv, n_q] mask on device and the existing kernels run. Every other backend returns false from `supports_op` for a mask-less op; the CPU reference applies the rule inside `ggml_compute_forward_flash_attn_ext_f16_one_chunk`.
+
+### Decode fusions in `ggml_cuda_try_fuse` (D2, D4, D5)
+
+- `ADD -> RMS_NORM -> MUL` (the residual add feeding a norm): `ggml_cuda_should_fuse_add_rms_norm_mul` checks F32, same shapes, contiguity, width a multiple of 4 up to 16384, 16-byte alignment and the alias rules; `rms_norm_add_mul_f32<256|1024, vals>` keeps the row in registers, writes the sum and the normalized product. The subgraph check lists the add and the mul as outputs (the residual stream is read by the next layer).
+- `SSM_CONV -> [ADD bias] -> UNARY silu` followed by the run of views / `L2_NORM` / `SCALE` nodes the delta-net builder emits (`ggml_cuda_try_ssm_conv_l2_fusion`): each `L2_NORM` must read a `[128, n_heads, n_t, n_s]` view of the silu output at a 128-aligned channel; the conv kernels (`with_l2` template) block-reduce the squares per token and write the normalized (scaled) rows; up to two slices (`ggml_cuda_ssm_conv_l2`). Head dims other than 128 keep the separate norm launches.
+- alpha/beta gate projections (`ggml_cuda_try_gdn_gates_fusion`, `gdn-gates.cu`): `MUL_MAT -> [views] -> ADD dt_bias -> SOFTPLUS -> MUL a -> [views], MUL_MAT (same input) -> [views] -> SIGMOID -> [views]` at batch <= 8 with F16/BF16 weights; one block of 256 threads per output row and token, fp32 products like `mul_mat_vec_f`, the gate math in the epilogue.
+
+Each fusion is proven by a whole-graph `test-backend-ops` case (`ADD_RMS_NORM_MUL`, `SSM_CONV_L2`, `GDN_GATES`) and an nsys count of the fused kernel; `GGML_CUDA_DISABLE_FUSION=1` turns all of them off.
+
+### Server checkpoints (`common_state_buffer`, S1)
+
+`common_prompt_checkpoint::data_tgt/data_dft` are `common_state_buffer`s: `resize()` takes the smallest idle block that fits from a process-wide pool (freed blocks are kept up to 1 GiB), so a steady stream of 150 MiB checkpoints stops faulting fresh pages on every save; contents after `resize()` are undefined (the checkpoint fills the whole blob).
