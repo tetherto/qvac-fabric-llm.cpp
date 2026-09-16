@@ -77,6 +77,21 @@ class ModelType(IntEnum):
     MMPROJ = 2
 
 
+# e4m3 with one F32 scale per block x block tile, scale = amax/448 (dequant = q * scale, the convention FP8 checkpoints
+# ship); returns the e4m3 bytes [n, k] and the scales in ggml's sidecar layout {n/block, k/block} (n/block contiguous)
+def fp8_block_quantize(weight: Tensor, block: int) -> tuple[np.ndarray, np.ndarray]:
+    if weight.ndim != 2 or weight.shape[0] % block or weight.shape[1] % block:
+        raise ValueError(f"fp8_block_quantize: shape {list(weight.shape)} is not {block}-aligned")
+    n, k = weight.shape
+    blocks = weight.float().reshape(n // block, block, k // block, block)
+    amax = blocks.abs().amax(dim=(1, 3))
+    scale = torch.where(amax > 0, amax / 448.0, torch.ones_like(amax))
+    q = (blocks / scale[:, None, :, None]).to(torch.float8_e4m3fn).reshape(n, k)
+    q_u8 = q.view(torch.uint8).contiguous().cpu().numpy()
+    s_f32 = np.ascontiguousarray(scale.float().cpu().numpy().T)
+    return q_u8, s_f32
+
+
 class ModelBase:
     _model_classes: dict[ModelType, dict[str, type[ModelBase]]] = {
         ModelType.TEXT: {},
@@ -130,7 +145,8 @@ class ModelBase:
                  sentence_transformers_dense_modules: bool = False,
                  target_model_dir: Path | None = None,
                  fuse_gate_up_exps: bool = False,
-                 fp8_as_q8: bool = False):
+                 fp8_as_q8: bool = False,
+                 fp8_output_head: bool = False):
         if type(self) is ModelBase or \
                 type(self) is TextModel or \
                 type(self) is MmprojModel:
@@ -161,6 +177,7 @@ class ModelBase:
         self._is_nvfp4 = False
         self._is_mxfp4 = False
         self._fp8_as_q8 = fp8_as_q8
+        self._fp8_output_head = fp8_output_head
         self._fp8_dequantized: set[str] = set()
 
         # Apply heuristics to figure out typical tensor encoding based on first tensor's dtype
@@ -775,6 +792,31 @@ class ModelBase:
 
         for name in consumed:
             self.model_tensors.pop(name, None)
+
+        if self._fp8_output_head:
+            self._quantize_fp8_output_head(block)
+
+    # the checkpoint ships the output head in BF16; quantize it to e4m3 with 128x128 block scales (scale = amax/448 per
+    # block, the shipped convention: dequant = q * scale) when the user asks for it
+    def _quantize_fp8_output_head(self, block: int):
+        head = None
+        for name in self.model_tensors.keys():
+            try:
+                if name.endswith(".weight") and self.map_tensor_name(name) == "output.weight":
+                    head = name
+                    break
+            except ValueError:
+                continue
+        if head is None:
+            logger.info("--fp8-output-head: no separate output head (tied embeddings), nothing to quantize")
+            return
+        weight = LazyTorchTensor.to_eager(self.model_tensors[head]()).float()
+        q_u8, s_f32 = fp8_block_quantize(weight, block)
+        new_name = self.map_tensor_name(head)
+        logger.info(f"Quantized {new_name} with shape {list(weight.shape)} to F8_E4M3 + scale {list(s_f32.shape)}")
+        self.gguf_writer.add_tensor(new_name, q_u8, raw_dtype=gguf.GGMLQuantizationType.F8_E4M3)
+        self.gguf_writer.add_tensor(new_name.replace(".weight", ".scale"), s_f32)
+        self.model_tensors.pop(head, None)
 
     def _generate_nvfp4_tensors(self):
         # Per-layer expert merging to avoid holding all experts in memory

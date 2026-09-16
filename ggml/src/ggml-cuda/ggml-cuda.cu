@@ -70,6 +70,7 @@
 #include "ggml-cuda/gla.cuh"
 #include "ggml-cuda/gated_delta_net.cuh"
 #include "ggml-cuda/gdn-gates.cuh"
+#include "ggml-cuda/conv-state.cuh"
 #include "ggml-cuda/gated_delta_net_back.cuh"
 #include "ggml-cuda/dsv4-hc.cuh"
 #include "ggml-cuda/set.cuh"
@@ -4151,6 +4152,139 @@ static int ggml_cuda_try_gdn_gates_fusion(const ggml_cgraph * cgraph, int node_i
     return count - 1;
 }
 
+// the conv input of a recurrent layer: get_rows of the state rows -> [views] -> concat with the transposed new tokens
+// -> view of the last d_conv-1 columns -> cpy into the state cache. The run may hold the zero-sized "extra state"
+// nodes the graph builder emits (a get_rows and a cpy over 0 rows) and any views. Returns the nodes to skip after
+// the get_rows, 0 when the run is absent.
+static int ggml_cuda_try_conv_state_fusion(const ggml_cgraph * cgraph, int node_idx, ggml_cuda_conv_state_args & a) {
+    constexpr int max_nodes = 31;
+    const int end = std::min(cgraph->n_nodes, node_idx + max_nodes);
+
+    auto is_view = [](const ggml_tensor * t) {
+        return t->op == GGML_OP_RESHAPE || t->op == GGML_OP_PERMUTE || t->op == GGML_OP_VIEW || t->op == GGML_OP_TRANSPOSE;
+    };
+
+    const ggml_tensor * rows = cgraph->nodes[node_idx];
+    if (rows->op != GGML_OP_GET_ROWS || rows->type != GGML_TYPE_F32 || rows->src[0]->type != GGML_TYPE_F32 ||
+        rows->src[1]->type != GGML_TYPE_I32 || rows->ne[2] != 1 || rows->ne[3] != 1 || !ggml_is_contiguous(rows)) {
+        return 0;
+    }
+    const ggml_tensor * states = rows->src[0];              // [state_size, mem_size] view of the cache tensor
+    const ggml_tensor * cache  = states->view_src ? states->view_src : states;
+    const ggml_tensor * idx    = rows->src[1];
+    const int64_t state_size = states->ne[0];
+    const int64_t n_seqs     = rows->ne[1];
+    if (states->nb[0] != sizeof(float) || states->ne[2] != 1 || states->ne[3] != 1 || idx->nb[0] != sizeof(int32_t) || idx->ne[0] != n_seqs) {
+        return 0;
+    }
+
+    // the run up to the concat: views, and zero-sized get_rows / cpy
+    int j = node_idx + 1;
+    const ggml_tensor * concat = nullptr;
+    for (; j < end; ++j) {
+        const ggml_tensor * t = cgraph->nodes[j];
+        if (t->op == GGML_OP_CONCAT) {
+            concat = t;
+            break;
+        }
+        if (is_view(t) || ((t->op == GGML_OP_GET_ROWS || t->op == GGML_OP_CPY) && ggml_nelements(t) == 0)) {
+            continue;
+        }
+        return 0;
+    }
+    if (concat == nullptr || ggml_get_op_params_i32(concat, 0) != 0 || concat->type != GGML_TYPE_F32 || !ggml_is_contiguous(concat)) {
+        return 0;
+    }
+    const int concat_idx = j;
+    const ggml_tensor * st = concat->src[0]; // [d_conv-1, n_ch, n_seqs] view of the gathered rows
+    const ggml_tensor * xt = concat->src[1]; // [n_t, n_ch, n_seqs] transpose of the new tokens [n_ch, n_t, n_seqs]
+    const int64_t n_state = st->ne[0];
+    const int64_t n_ch    = st->ne[1];
+    const int64_t n_t     = xt->ne[0];
+    if (st->view_src != rows || !ggml_is_contiguous(st) || st->ne[2] != n_seqs || st->ne[3] != 1 || n_state*n_ch != state_size ||
+        xt->type != GGML_TYPE_F32 || xt->ne[1] != n_ch || xt->ne[2] != n_seqs || xt->ne[3] != 1 ||
+        xt->nb[1] != sizeof(float) || xt->nb[0] % sizeof(float) != 0 || xt->nb[2] % sizeof(float) != 0 ||
+        concat->ne[0] != n_state + n_t || concat->ne[1] != n_ch || concat->ne[2] != n_seqs || concat->ne[3] != 1) {
+        return 0;
+    }
+
+    // then views and the one cpy of concat[n_t .. n_t+n_state) into rows of the cache
+    const ggml_tensor * cpy = nullptr;
+    for (++j; j < end; ++j) {
+        const ggml_tensor * t = cgraph->nodes[j];
+        if (t->op == GGML_OP_CPY && ggml_nelements(t) > 0) {
+            cpy = t;
+            break;
+        }
+        if (is_view(t) || (t->op == GGML_OP_CPY && ggml_nelements(t) == 0)) {
+            continue;
+        }
+        return 0;
+    }
+    if (cpy == nullptr) {
+        return 0;
+    }
+    const ggml_tensor * last = cpy->src[0];
+    const ggml_tensor * upd  = cpy->src[1];
+    if (last->view_src != concat || last->ne[0] != n_state || last->ne[1] != n_ch || last->ne[2] != n_seqs || last->ne[3] != 1 ||
+        last->nb[1] != concat->nb[1] || last->nb[2] != concat->nb[2] ||
+        (const char *) last->data != (const char *) concat->data + n_t*sizeof(float)) {
+        return 0;
+    }
+    const ggml_tensor * upd_root = upd->view_src ? upd->view_src : upd;
+    if (upd_root != cache || upd->type != GGML_TYPE_F32 || upd->ne[0] != state_size || upd->ne[1] != n_seqs || upd->ne[2] != 1 || upd->ne[3] != 1 ||
+        upd->nb[0] != sizeof(float) || upd->nb[1] % sizeof(float) != 0) {
+        return 0;
+    }
+
+    // every node but the get_rows is an output (views, the zero-sized extras, the concat and the cpy)
+    const int count = j - node_idx + 1;
+    enum ggml_op ops[max_nodes];
+    int outputs[max_nodes];
+    int n_outputs = 0;
+    for (int k = 0; k < count; ++k) {
+        ops[k] = cgraph->nodes[node_idx + k]->op;
+        if (k > 0) {
+            outputs[n_outputs++] = node_idx + k;
+        }
+    }
+    if (!ggml_can_fuse_subgraph(cgraph, node_idx, count, ops, outputs, n_outputs)) {
+        return 0;
+    }
+    // one thread owns one channel: it reads its state and token values before it writes them back, so a sequence
+    // continuing in its own row (the decode case) is safe; with several sequences a row can be read by one thread
+    // and overwritten by another in the same launch, and above a few tokens the per-channel loop is uncoalesced,
+    // so both keep the separate launches. conv_in is a fresh buffer: the inputs are live at the concat node, but
+    // the ranges are checked anyway
+    a.n_ch   = n_ch;
+    a.d_conv = n_state + 1;
+    a.n_t    = n_t;
+    a.n_seqs = n_seqs;
+    if (!ggml_cuda_conv_state_supported(a)) {
+        return 0;
+    }
+    auto disjoint = [](const void * p, size_t n, const ggml_tensor * t) {
+        const uintptr_t a0 = (uintptr_t) p, a1 = a0 + n;
+        const uintptr_t b0 = (uintptr_t) t->data, b1 = b0 + ggml_backend_buft_get_alloc_size(t->buffer->buft, t);
+        return a1 <= b0 || b1 <= a0;
+    };
+    if (!disjoint(concat->data, ggml_nbytes(concat), xt) || !disjoint(concat->data, ggml_nbytes(concat), states) ||
+        !disjoint(concat->data, ggml_nbytes(concat), idx)) {
+        return 0;
+    }
+
+    a.states        = (const float *) states->data;
+    a.idx           = (const int32_t *) idx->data;
+    a.x             = (const float *) xt->data;
+    a.conv_in       = (float *) concat->data;
+    a.cache         = (float *) upd->data;
+    a.states_stride = states->nb[1]/sizeof(float);
+    a.x_stride_t    = xt->nb[0]/sizeof(float);
+    a.x_stride_s    = xt->nb[2]/sizeof(float);
+    a.cache_stride  = upd->nb[1]/sizeof(float);
+    return count - 1;
+}
+
 // try and fuse nodes and return the number of nodes to skip
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
@@ -4171,6 +4305,16 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                           __func__, node->name, nodes_to_skip);
 #endif
             ggml_cuda_op_gated_delta_net_fused_cache(*cuda_ctx, node, fused_state_cpy);
+            return nodes_to_skip;
+        }
+    }
+
+    // recurrent conv input: get_rows of the state row -> concat with the new tokens -> cpy of the tail back to the cache
+    if (node->op == GGML_OP_GET_ROWS) {
+        ggml_cuda_conv_state_args a;
+        const int nodes_to_skip = ggml_cuda_try_conv_state_fusion(cgraph, i, a);
+        if (nodes_to_skip > 0) {
+            ggml_cuda_op_conv_state(*cuda_ctx, a);
             return nodes_to_skip;
         }
     }
