@@ -18,6 +18,7 @@ FAMILIES = [
     ("mmf",              re.compile(r"mul_mat_f\b|mul_mat_f<")),
     ("fmha_cutlass",     re.compile(r"cutlass::fmha|FmhaKernel")),
     ("gated_delta_net",  re.compile(r"gated_delta_net|flashinfergdn|gdn_gates")),
+    ("deepgemm",         re.compile(r"sm90_fp8_gemm|deep_gemm")),
     ("cutlass_gemm",     re.compile(r"cutlass|device_kernel")),
     ("f8_quantize",      re.compile(r"quantize_f8_e4m3|dequant_f8_e4m3")),
     ("cublas_gemm",      re.compile(r"nvjet|gemm|sm90_xmma|ampere_")),
