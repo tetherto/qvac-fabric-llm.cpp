@@ -4431,6 +4431,86 @@ static int ggml_cuda_try_conv_tokens_fusion(const ggml_cgraph * cgraph, int node
     return count - 1;
 }
 
+// two or three F8 mul_mats on one F32 activation, consecutive up to view nodes (q/k/v, the delta-net qkv/z): the
+// CUTLASS batch quantizes the activation once for all of them, the GEMV batch runs one launch. Executes the run and
+// returns the nodes to skip, 0 when it does not apply. Yields to the fused up/gate GEMV when a swiglu of two of the
+// mul_mats follows at its batch. No memory-range check: the fused calls write exactly the run's own outputs
+static int ggml_cuda_try_shared_src1_mul_mat_f8(ggml_backend_cuda_context * ctx, const ggml_cgraph * cgraph, int node_idx) {
+    const ggml_tensor * node = cgraph->nodes[node_idx];
+    if (node->op != GGML_OP_MUL_MAT || node->src[0]->type != GGML_TYPE_F8_E4M3 || node->src[2] == nullptr ||
+        node->src[1]->type != GGML_TYPE_F32 || !ggml_is_contiguous(node->src[1]) ||
+        node->type != GGML_TYPE_F32 || !ggml_is_contiguous(node)) {
+        return 0;
+    }
+    const ggml_tensor * src1 = node->src[1];
+
+    ggml_tensor * dsts[GGML_CUDA_MMF8_SHARED_MAX];
+    int n = 0;
+    dsts[n++] = cgraph->nodes[node_idx];
+    int last = node_idx;
+    const int end = std::min(cgraph->n_nodes, node_idx + 8);
+    for (int j = node_idx + 1; j < end && n < GGML_CUDA_MMF8_SHARED_MAX; ++j) {
+        ggml_tensor * t = cgraph->nodes[j];
+        if (ggml_cuda_is_view_or_noop(t)) {
+            continue;
+        }
+        if (t->op == GGML_OP_MUL_MAT && t->src[0]->type == GGML_TYPE_F8_E4M3 && t->src[2] != nullptr && t->src[1] == src1 &&
+            t->type == GGML_TYPE_F32 && ggml_is_contiguous(t)) {
+            dsts[n++] = t;
+            last = j;
+            continue;
+        }
+        break;
+    }
+    if (n < 2) {
+        return 0;
+    }
+    for (int k = last + 1; k < cgraph->n_nodes; ++k) {
+        const ggml_tensor * t = cgraph->nodes[k];
+        if (ggml_cuda_is_view_or_noop(t)) {
+            continue;
+        }
+        if (t->op == GGML_OP_GLU && ggml_nrows(src1) <= 4) {
+            int hits = 0;
+            for (int m = 0; m < n; ++m) {
+                hits += (t->src[0] == dsts[m] ? 1 : 0) + (t->src[1] == dsts[m] ? 1 : 0);
+            }
+            if (hits == 2) {
+                return 0;
+            }
+        }
+        break;
+    }
+
+    const int count = last - node_idx + 1;
+    enum ggml_op ops[8];
+    int outputs[8];
+    for (int k = 0; k < count; ++k) {
+        ops[k]     = cgraph->nodes[node_idx + k]->op;
+        outputs[k] = node_idx + k;
+    }
+    if (!ggml_can_fuse_subgraph(cgraph, node_idx, count, ops, outputs, count)) {
+        return 0;
+    }
+
+    bool aligned = (uintptr_t) src1->data % 16 == 0;
+    for (int m = 0; m < n; ++m) {
+        aligned = aligned && (uintptr_t) dsts[m]->data % 16 == 0;
+    }
+    if (ggml_cuda_mul_mat_f8_uses_cutlass(*ctx, node->src[0], src1)) {
+        if (!aligned) {
+            return 0;
+        }
+        ggml_cuda_mul_mat_f8_shared_cutlass(*ctx, dsts, n);
+        return count - 1;
+    }
+    if (ggml_nrows(src1) <= GGML_CUDA_MMF8_GEMV_MAX_NCOLS) {
+        ggml_cuda_mul_mat_f8_shared_gemv(*ctx, dsts, n);
+        return count - 1;
+    }
+    return 0;
+}
+
 // try and fuse nodes and return the number of nodes to skip
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
@@ -4501,6 +4581,33 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         if (nodes_to_skip > 0) {
             ggml_cuda_op_gdn_gates(*cuda_ctx, m.x, m.w_alpha, m.w_beta, m.dt_bias, m.a, m.g, m.b);
             return nodes_to_skip;
+        }
+    }
+
+    // two or three F8 mul_mats on one activation: quantize once (CUTLASS batch) or one GEMV launch
+    if (node->op == GGML_OP_MUL_MAT) {
+        const int nodes_to_skip = ggml_cuda_try_shared_src1_mul_mat_f8(cuda_ctx, cgraph, i);
+        if (nodes_to_skip > 0) {
+            return nodes_to_skip;
+        }
+    }
+
+    // cont(strided view) -> sigmoid -> mul(x, sigmoid): the attention output gate read from its view in one kernel
+    if (node->op == GGML_OP_CONT && i + 2 < cgraph->n_nodes) {
+        const ggml_tensor * view = node->src[0];
+        ggml_tensor * sig = cgraph->nodes[i + 1];
+        ggml_tensor * mul = cgraph->nodes[i + 2];
+        if (node->type == GGML_TYPE_F32 && view->type == GGML_TYPE_F32 && ggml_is_contiguous(node) && view->nb[0] == sizeof(float) &&
+            ggml_nelements(view) == ggml_nelements(node) &&
+            sig->op == GGML_OP_UNARY && ggml_get_unary_op(sig) == GGML_UNARY_OP_SIGMOID && sig->src[0] == node &&
+            mul->op == GGML_OP_MUL && mul->src[1] == sig && mul->type == GGML_TYPE_F32 && ggml_is_contiguous(mul) &&
+            mul->src[0]->type == GGML_TYPE_F32 && ggml_is_contiguous(mul->src[0]) && ggml_are_same_shape(mul->src[0], sig) &&
+            ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_CONT, GGML_OP_UNARY, GGML_OP_MUL }, { i + 2 })) {
+            int written[] = { i + 2 };
+            if (ggml_cuda_check_fusion_memory_ranges(cgraph, i, 3, written, 1)) {
+                ggml_cuda_op_mul_sigmoid_strided(*cuda_ctx, mul->src[0], view, mul);
+                return 2;
+            }
         }
     }
 

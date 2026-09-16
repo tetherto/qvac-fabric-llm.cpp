@@ -20,7 +20,7 @@ static __device__ __forceinline__ float2 ggml_cuda_e4m3x2_to_float2(const uint16
 }
 
 #define MMF8_GEMV_NWARPS 4
-#define MMF8_GEMV_MAX_NCOLS 8
+#define MMF8_GEMV_MAX_NCOLS GGML_CUDA_MMF8_GEMV_MAX_NCOLS
 
 // one trip of weights (16 bytes per row) and the block scale of each matrix at column k
 template <int nmat, int nrows_w>
@@ -47,16 +47,15 @@ static __device__ __forceinline__ void mmf8_gemv_load_w(
 // PDL: the grid dependency is waited at entry and the launch completion signalled before the reduction (as mmvf), so
 // the next kernel's launch overlaps the epilogue; no __restrict__ on the parameters (PDL rule)
 template <int ncols_dst, int nrows_w, bool y_vec, bool has_glu>
-static __global__ void mul_mat_vec_f8_e4m3(
+static __device__ __forceinline__ void mmf8_gemv_block(
         const uint8_t * x, const float * sx, const uint8_t * xg, const float * sxg,
         const float * y, float * dst,
-        const int ncols, const int nblk_n, const int stride_col_y, const int stride_col_dst) {
+        const int ncols, const int nblk_n, const int stride_col_y, const int stride_col_dst, const int row0,
+        float (&red)[has_glu ? 2 : 1][MMF8_GEMV_NWARPS][nrows_w][ncols_dst]) {
     constexpr int warp_size = 32;
     constexpr int trip      = warp_size*16;
     constexpr int nmat      = has_glu ? 2 : 1;
-    __shared__ float red[nmat][MMF8_GEMV_NWARPS][nrows_w][ncols_dst];
 
-    const int row0 = blockIdx.x*nrows_w;
     const int warp = threadIdx.y;
     const int lane = threadIdx.x;
 
@@ -162,6 +161,84 @@ static __global__ void mul_mat_vec_f8_e4m3(
         } else {
             dst[(size_t) j*stride_col_dst + row0 + r] = t[0];
         }
+    }
+}
+
+template <int ncols_dst, int nrows_w, bool y_vec, bool has_glu>
+static __global__ void mul_mat_vec_f8_e4m3(
+        const uint8_t * x, const float * sx, const uint8_t * xg, const float * sxg,
+        const float * y, float * dst,
+        const int ncols, const int nblk_n, const int stride_col_y, const int stride_col_dst) {
+    __shared__ float red[has_glu ? 2 : 1][MMF8_GEMV_NWARPS][nrows_w][ncols_dst];
+    mmf8_gemv_block<ncols_dst, nrows_w, y_vec, has_glu>(x, sx, xg, sxg, y, dst, ncols, nblk_n, stride_col_y, stride_col_dst, blockIdx.x*nrows_w, red);
+}
+
+// up to three F8 matrices sharing one activation in one launch (q/k/v, the delta-net qkv/z): block b computes rows of
+// the matrix whose block range holds b, with the plain kernel's per-row arithmetic (bit-identical per output)
+#define MMF8_MULTI_MAX 3
+struct mmf8_multi_args {
+    const uint8_t * x[MMF8_MULTI_MAX];
+    const float   * sx[MMF8_MULTI_MAX];
+    float         * dst[MMF8_MULTI_MAX];
+    int nrows[MMF8_MULTI_MAX];
+    int block0[MMF8_MULTI_MAX + 1]; // first block of each matrix; block0[n] = the grid size
+    int n;
+};
+
+template <int ncols_dst, int nrows_w, bool y_vec>
+static __global__ void mul_mat_vec_f8_e4m3_multi(const mmf8_multi_args a, const float * y, const int ncols, const int stride_col_y) {
+    __shared__ float red[1][MMF8_GEMV_NWARPS][nrows_w][ncols_dst];
+    // constant indices only: a dynamic index into the parameter struct would copy it to local memory per thread
+    const uint8_t * x     = a.x[0];
+    const float   * sx    = a.sx[0];
+    float         * dst   = a.dst[0];
+    int             nrows = a.nrows[0];
+    int             b0    = a.block0[0];
+#pragma unroll
+    for (int i = 1; i < MMF8_MULTI_MAX; ++i) {
+        if (i < a.n && (int) blockIdx.x >= a.block0[i]) {
+            x     = a.x[i];
+            sx    = a.sx[i];
+            dst   = a.dst[i];
+            nrows = a.nrows[i];
+            b0    = a.block0[i];
+        }
+    }
+    const int row0 = (blockIdx.x - b0)*nrows_w;
+    mmf8_gemv_block<ncols_dst, nrows_w, y_vec, false>(x, sx, nullptr, nullptr, y, dst, ncols, nrows/GGML_F8_E4M3_SCALE_BLOCK, stride_col_y, nrows, row0, red);
+}
+
+template <int ncols_dst>
+static void launch_mul_mat_vec_f8_e4m3_multi(const mmf8_multi_args & a, const float * y, const int ncols, const int stride_col_y, cudaStream_t stream) {
+    constexpr int nrows_w = ncols_dst == 1 ? 4 : (ncols_dst == 2 ? 2 : 1);
+    mmf8_multi_args b = a;
+    b.block0[0] = 0;
+    for (int i = 0; i < a.n; ++i) {
+        GGML_ASSERT(a.nrows[i] % nrows_w == 0);
+        b.block0[i + 1] = b.block0[i] + a.nrows[i]/nrows_w;
+    }
+    const dim3 block_dims(32, MMF8_GEMV_NWARPS, 1);
+    const dim3 block_nums(b.block0[a.n], 1, 1);
+    const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, 0, stream);
+    const bool y_vec = ((uintptr_t) y % sizeof(float4) == 0) && stride_col_y % 4 == 0;
+    if (y_vec) {
+        ggml_cuda_kernel_launch(mul_mat_vec_f8_e4m3_multi<ncols_dst, nrows_w, true>, launch_params, b, y, ncols, stride_col_y);
+    } else {
+        ggml_cuda_kernel_launch(mul_mat_vec_f8_e4m3_multi<ncols_dst, nrows_w, false>, launch_params, b, y, ncols, stride_col_y);
+    }
+}
+
+static void mul_mat_vec_f8_e4m3_multi_cuda(const mmf8_multi_args & a, const float * y, const int ncols, const int ncols_dst, const int stride_col_y, cudaStream_t stream) {
+    switch (ncols_dst) {
+        case 1: launch_mul_mat_vec_f8_e4m3_multi<1>(a, y, ncols, stride_col_y, stream); break;
+        case 2: launch_mul_mat_vec_f8_e4m3_multi<2>(a, y, ncols, stride_col_y, stream); break;
+        case 3: launch_mul_mat_vec_f8_e4m3_multi<3>(a, y, ncols, stride_col_y, stream); break;
+        case 4: launch_mul_mat_vec_f8_e4m3_multi<4>(a, y, ncols, stride_col_y, stream); break;
+        case 5: launch_mul_mat_vec_f8_e4m3_multi<5>(a, y, ncols, stride_col_y, stream); break;
+        case 6: launch_mul_mat_vec_f8_e4m3_multi<6>(a, y, ncols, stride_col_y, stream); break;
+        case 7: launch_mul_mat_vec_f8_e4m3_multi<7>(a, y, ncols, stride_col_y, stream); break;
+        case 8: launch_mul_mat_vec_f8_e4m3_multi<8>(a, y, ncols, stride_col_y, stream); break;
+        default: GGML_ABORT("fatal error");
     }
 }
 
@@ -332,41 +409,58 @@ static __global__ void glu_quantize_f8_e4m3_group128(
     quantize_group128_lane(v, q, sfa, (size_t) m*ncols + col, (size_t) kb*stride_sfa + m, lane);
 }
 
+// the per-token e4m3 activation with [K/128][M_pad] scales: pool buffers, M padded to a multiple of 4 (the scale
+// tensor's TMA row stride must be 16 bytes), quantized from y or from silu(glu_gate) * glu_up
+struct mmf8_quantized_act {
+    ggml_cuda_pool_alloc<uint8_t> yq;
+    ggml_cuda_pool_alloc<float>   ys;
+    int64_t ntokens_pad;
+    mmf8_quantized_act(ggml_cuda_pool & pool) : yq(pool), ys(pool), ntokens_pad(0) {}
+};
+
+static void mmf8_quantize_activations(
+        mmf8_quantized_act & q, const float * y, const int ncols, const int64_t ntokens, cudaStream_t stream,
+        const float * glu_gate = nullptr, const float * glu_up = nullptr, const int64_t o_g = 0, const int64_t o_u = 0) {
+    const int nblk_k = ncols/GGML_F8_E4M3_SCALE_BLOCK;
+    q.ntokens_pad = (ntokens + 3) & ~(int64_t) 3;
+    q.yq.alloc((size_t) q.ntokens_pad*ncols);
+    q.ys.alloc((size_t) q.ntokens_pad*nblk_k);
+    if (q.ntokens_pad != ntokens) {
+        CUDA_CHECK(cudaMemsetAsync(q.yq.get() + (size_t) ntokens*ncols, 0, (size_t) (q.ntokens_pad - ntokens)*ncols, stream));
+        CUDA_CHECK(cudaMemsetAsync(q.ys.get(), 0, (size_t) q.ntokens_pad*nblk_k*sizeof(float), stream));
+    }
+    const int64_t npairs = ntokens*nblk_k;
+    const dim3 block_nums((npairs + 7)/8, 1, 1);
+    if (glu_gate != nullptr) {
+        glu_quantize_f8_e4m3_group128<<<block_nums, 256, 0, stream>>>(glu_gate, glu_up, q.yq.get(), q.ys.get(), q.ntokens_pad, ntokens, ncols, o_g, o_u);
+    } else {
+        quantize_f8_e4m3_group128<<<block_nums, 256, 0, stream>>>(y, q.yq.get(), q.ys.get(), q.ntokens_pad, ntokens, ncols);
+    }
+}
+
+// the GEMM of one weight against a quantized activation; a padded M runs into a pool buffer and is copied out
+static void mmf8_gemm_cutlass_quantized(
+        ggml_backend_cuda_context & ctx, mmf8_quantized_act & q, const uint8_t * x, const float * sx, float * dst,
+        const int ncols, const int nrows, const int64_t ntokens, cudaStream_t stream) {
+    const size_t ws_size = ggml_cuda_mmf8_cutlass_workspace_size(q.ntokens_pad, nrows, ncols);
+    ggml_cuda_pool_alloc<uint8_t> ws(ctx.pool(), ws_size > 0 ? ws_size : 16);
+    if (q.ntokens_pad == ntokens) {
+        ggml_cuda_mmf8_cutlass(q.yq.get(), q.ys.get(), x, sx, dst, ntokens, nrows, ncols, ws.get(), ws_size, stream);
+        return;
+    }
+    ggml_cuda_pool_alloc<float> dst_pad(ctx.pool(), (size_t) q.ntokens_pad*nrows);
+    ggml_cuda_mmf8_cutlass(q.yq.get(), q.ys.get(), x, sx, dst_pad.get(), q.ntokens_pad, nrows, ncols, ws.get(), ws_size, stream);
+    CUDA_CHECK(cudaMemcpyAsync(dst, dst_pad.get(), (size_t) ntokens*nrows*sizeof(float), cudaMemcpyDeviceToDevice, stream));
+}
+
 // y is the F32 activation; with glu_gate set the activation is silu(glu_gate) * glu_up instead (never materialized)
 static void mul_mat_f8_e4m3_cutlass(
         ggml_backend_cuda_context & ctx, const uint8_t * x, const float * sx, const float * y, float * dst,
         const int ncols, const int nrows, const int64_t ntokens, cudaStream_t stream,
         const float * glu_gate = nullptr, const float * glu_up = nullptr, const int64_t o_g = 0, const int64_t o_u = 0) {
-    const int nblk_k = ncols/GGML_F8_E4M3_SCALE_BLOCK;
-
-    // the activation scale tensor is [K/128][M] and TMA needs a 16-byte row stride, so M is padded to a multiple of 4
-    const int64_t ntokens_pad = (ntokens + 3) & ~(int64_t) 3;
-
-    ggml_cuda_pool_alloc<uint8_t> yq(ctx.pool(), (size_t) ntokens_pad*ncols);
-    ggml_cuda_pool_alloc<float>   ys(ctx.pool(), (size_t) ntokens_pad*nblk_k);
-    if (ntokens_pad != ntokens) {
-        CUDA_CHECK(cudaMemsetAsync(yq.get() + (size_t) ntokens*ncols, 0, (size_t) (ntokens_pad - ntokens)*ncols, stream));
-        CUDA_CHECK(cudaMemsetAsync(ys.get(), 0, (size_t) ntokens_pad*nblk_k*sizeof(float), stream));
-    }
-    {
-        const int64_t npairs = ntokens*nblk_k;
-        const dim3 block_nums((npairs + 7)/8, 1, 1);
-        if (glu_gate != nullptr) {
-            glu_quantize_f8_e4m3_group128<<<block_nums, 256, 0, stream>>>(glu_gate, glu_up, yq.get(), ys.get(), ntokens_pad, ntokens, ncols, o_g, o_u);
-        } else {
-            quantize_f8_e4m3_group128<<<block_nums, 256, 0, stream>>>(y, yq.get(), ys.get(), ntokens_pad, ntokens, ncols);
-        }
-    }
-
-    const size_t ws_size = ggml_cuda_mmf8_cutlass_workspace_size(ntokens_pad, nrows, ncols);
-    ggml_cuda_pool_alloc<uint8_t> ws(ctx.pool(), ws_size > 0 ? ws_size : 16);
-    if (ntokens_pad == ntokens) {
-        ggml_cuda_mmf8_cutlass(yq.get(), ys.get(), x, sx, dst, ntokens, nrows, ncols, ws.get(), ws_size, stream);
-        return;
-    }
-    ggml_cuda_pool_alloc<float> dst_pad(ctx.pool(), (size_t) ntokens_pad*nrows);
-    ggml_cuda_mmf8_cutlass(yq.get(), ys.get(), x, sx, dst_pad.get(), ntokens_pad, nrows, ncols, ws.get(), ws_size, stream);
-    CUDA_CHECK(cudaMemcpyAsync(dst, dst_pad.get(), (size_t) ntokens*nrows*sizeof(float), cudaMemcpyDeviceToDevice, stream));
+    mmf8_quantized_act q(ctx.pool());
+    mmf8_quantize_activations(q, y, ncols, ntokens, stream, glu_gate, glu_up, o_g, o_u);
+    mmf8_gemm_cutlass_quantized(ctx, q, x, sx, dst, ncols, nrows, ntokens, stream);
 }
 #endif // GGML_CUDA_CUTLASS
 
@@ -475,4 +569,58 @@ void ggml_cuda_mul_mat_f8_gemv_glu(ggml_backend_cuda_context & ctx, const ggml_t
     mul_mat_vec_f8_e4m3_cuda((const uint8_t *) src0->data, (const float *) up->src[2]->data,
                              (const uint8_t *) src0g->data, (const float *) gate->src[2]->data,
                              (const float *) src1->data, (float *) glu->data, ncols, nrows, nblk_n, ntokens, ncols, nrows, ctx.stream());
+}
+
+// n F8 mul_mats (2 or 3) on the same F32 activation at the CUTLASS batch: the activation is quantized once, then one
+// GEMM per weight; the bytes and scales are what each unfused call would have produced
+void ggml_cuda_mul_mat_f8_shared_cutlass(ggml_backend_cuda_context & ctx, ggml_tensor ** dsts, const int n) {
+#ifdef GGML_CUDA_CUTLASS
+    GGML_ASSERT(n >= 2 && n <= MMF8_MULTI_MAX);
+    const ggml_tensor * src1 = dsts[0]->src[1];
+    for (int i = 0; i < n; ++i) {
+        ggml_cuda_mul_mat_f8_check(dsts[i]->src[0], src1, dsts[i]);
+        GGML_ASSERT(dsts[i]->src[1] == src1);
+        GGML_ASSERT((uintptr_t) dsts[i]->data % 16 == 0);
+    }
+    GGML_ASSERT(ggml_cuda_mul_mat_f8_uses_cutlass(ctx, dsts[0]->src[0], src1) && (uintptr_t) src1->data % 16 == 0);
+
+    const int     ncols   = src1->ne[0];
+    const int64_t ntokens = ggml_nrows(src1);
+    cudaStream_t  stream  = ctx.stream();
+
+    mmf8_quantized_act q(ctx.pool());
+    mmf8_quantize_activations(q, (const float *) src1->data, ncols, ntokens, stream);
+    for (int i = 0; i < n; ++i) {
+        const ggml_tensor * src0 = dsts[i]->src[0];
+        mmf8_gemm_cutlass_quantized(ctx, q, (const uint8_t *) src0->data, (const float *) dsts[i]->src[2]->data, (float *) dsts[i]->data,
+                                    ncols, src0->ne[1], ntokens, stream);
+    }
+#else
+    GGML_UNUSED(ctx);
+    GGML_UNUSED(dsts);
+    GGML_UNUSED(n);
+    GGML_ABORT("F8 shared-activation GEMM needs the CUTLASS build");
+#endif // GGML_CUDA_CUTLASS
+}
+
+// the same at the GEMV batch (<= MMF8_GEMV_MAX_NCOLS tokens): one launch over all matrices
+void ggml_cuda_mul_mat_f8_shared_gemv(ggml_backend_cuda_context & ctx, ggml_tensor ** dsts, const int n) {
+    GGML_ASSERT(n >= 2 && n <= MMF8_MULTI_MAX);
+    const ggml_tensor * src1 = dsts[0]->src[1];
+    const int     ncols   = src1->ne[0];
+    const int64_t ntokens = ggml_nrows(src1);
+    GGML_ASSERT(ntokens <= MMF8_GEMV_MAX_NCOLS);
+
+    mmf8_multi_args a = {};
+    a.n = n;
+    for (int i = 0; i < n; ++i) {
+        const ggml_tensor * src0 = dsts[i]->src[0];
+        ggml_cuda_mul_mat_f8_check(src0, src1, dsts[i]);
+        GGML_ASSERT(dsts[i]->src[1] == src1);
+        a.x[i]     = (const uint8_t *) src0->data;
+        a.sx[i]    = (const float *) dsts[i]->src[2]->data;
+        a.dst[i]   = (float *) dsts[i]->data;
+        a.nrows[i] = src0->ne[1];
+    }
+    mul_mat_vec_f8_e4m3_multi_cuda(a, (const float *) src1->data, ncols, ntokens, ncols, ctx.stream());
 }
