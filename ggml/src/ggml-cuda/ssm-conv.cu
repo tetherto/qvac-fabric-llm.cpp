@@ -1,4 +1,5 @@
 #include "common.cuh"
+#include "conv-state.cuh"
 #include "ssm-conv.cuh"
 #include "unary.cuh"
 
@@ -255,5 +256,104 @@ void ggml_cuda_op_ssm_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst, g
     } else {
         ssm_conv_f32_cuda<false, false>(src0_d, src1_d, bias_d, src0->nb[0], src0->nb[1], src0->nb[2], src1->nb[1], dst_d, out->nb[0], out->nb[1],
                           out->nb[2], nc, nr, n_t, n_s, no_l2, stream);
+    }
+}
+
+// one block = 128 consecutive channels (one head of a norm slice) x a tile of split_t tokens; the d_conv inputs of a
+// channel sit in registers, the first d_conv-1 come from the state row (first tile) or from the previous tokens.
+// Same accumulation order as ssm_conv_long_token_f32, so the sums are bit-identical to the concat path
+template <int d_conv, bool with_l2, int split_t>
+static __global__ void ssm_conv_tokens_f32(const ggml_cuda_ssm_conv_tokens_args a, const ggml_cuda_ssm_conv_l2 l2) {
+    constexpr int split_ch = 128;
+    ggml_cuda_pdl_lc();
+    const int tid       = threadIdx.x;
+    const int ch_base   = blockIdx.x*split_ch;
+    const int c         = ch_base + tid;
+    const int t0        = blockIdx.y*split_t;
+    const int local_n_t = min(split_t, a.n_t - t0);
+
+    __shared__ float s_red[2][WARP_SIZE];
+    const int l2_slice = with_l2 ? ssm_conv_l2_slice<split_ch>(l2, ch_base) : -1;
+
+    // weights and bias never depend on the previous kernel: load them before the grid dependency
+    float w[d_conv];
+#pragma unroll
+    for (int j = 0; j < d_conv; j++) {
+        w[j] = a.w[c*a.w_stride + j];
+    }
+    const float b = a.bias != nullptr ? a.bias[c] : 0.0f;
+
+    ggml_cuda_pdl_sync();
+    float win[d_conv];
+    if (t0 == 0) {
+        const float * st = a.states + a.idx[0]*a.states_stride + c*(d_conv - 1);
+#pragma unroll
+        for (int j = 0; j < d_conv - 1; j++) {
+            win[j] = st[j];
+        }
+    } else {
+#pragma unroll
+        for (int j = 0; j < d_conv - 1; j++) {
+            win[j] = a.x[(t0 - (d_conv - 1) + j)*a.x_stride_t + c];
+        }
+    }
+
+    for (int i = 0; i < local_n_t; i++) {
+        win[d_conv - 1] = a.x[(t0 + i)*a.x_stride_t + c];
+        float sumf = 0.0f;
+#pragma unroll
+        for (int j = 0; j < d_conv; j++) {
+            sumf += win[j]*w[j];
+        }
+        sumf += b;
+        const float y = ggml_cuda_op_silu_single(sumf);
+        a.y[(t0 + i)*(int64_t) a.n_ch + c] = y;
+        if constexpr (with_l2) {
+            if (l2_slice >= 0) { // block-uniform
+                ssm_conv_l2_row<split_ch>(l2, l2_slice, ch_base, t0 + i, 0, tid, y, s_red[i & 1]);
+            }
+        }
+#pragma unroll
+        for (int j = 0; j < d_conv - 1; j++) {
+            win[j] = win[j + 1];
+        }
+    }
+
+    // the next state row = the last d_conv-1 tokens; only the first tile's blocks read the state row, and the same
+    // thread read its elements above, so writing the row in place is safe
+    if (blockIdx.y == 0) {
+        float * cache = a.cache + c*(d_conv - 1);
+#pragma unroll
+        for (int j = 0; j < d_conv - 1; j++) {
+            cache[j] = a.x[(a.n_t - (d_conv - 1) + j)*a.x_stride_t + c];
+        }
+    }
+}
+
+bool ggml_cuda_ssm_conv_tokens_supported(const ggml_cuda_ssm_conv_tokens_args & a) {
+    return (a.d_conv == 3 || a.d_conv == 4 || a.d_conv == 5 || a.d_conv == 9) &&
+        a.n_ch % 128 == 0 && a.n_t > GGML_CUDA_CONV_STATE_MAX_T;
+}
+
+void ggml_cuda_op_ssm_conv_tokens(ggml_backend_cuda_context & ctx, const ggml_cuda_ssm_conv_tokens_args & a, const ggml_cuda_ssm_conv_l2 & l2) {
+    GGML_ASSERT(ggml_cuda_ssm_conv_tokens_supported(a));
+    constexpr int split_t = 32;
+    const dim3 blocks(a.n_ch/128, (a.n_t + split_t - 1)/split_t, 1);
+    const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(blocks, 128, 0, ctx.stream());
+
+    auto launch = [&](auto NC) {
+        constexpr int d_conv = decltype(NC)::value;
+        if (l2.n > 0) {
+            ggml_cuda_kernel_launch(ssm_conv_tokens_f32<d_conv, true, split_t>, launch_params, a, l2);
+        } else {
+            ggml_cuda_kernel_launch(ssm_conv_tokens_f32<d_conv, false, split_t>, launch_params, a, l2);
+        }
+    };
+    switch (a.d_conv) {
+        case 3: launch(std::integral_constant<int, 3>{}); break;
+        case 4: launch(std::integral_constant<int, 4>{}); break;
+        case 5: launch(std::integral_constant<int, 5>{}); break;
+        case 9: launch(std::integral_constant<int, 9>{}); break;
+        default: GGML_ABORT("ssm_conv_tokens: unsupported d_conv");
     }
 }

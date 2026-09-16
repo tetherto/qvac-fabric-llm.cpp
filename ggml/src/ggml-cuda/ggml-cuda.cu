@@ -3920,9 +3920,18 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
 // ssm_conv -> [add bias] -> silu, followed by per-head l2 norms of channel slices of the silu output (views), each
 // optionally scaled; the graph builder emits these as one run of nodes (views, l2 norms, scales and the permutes that
 // feed the delta-net op), so the run is scanned from the silu on and everything in it is skipped after the fused
-// launch. Returns the number of nodes to skip after the ssm_conv, 0 when the pattern is absent.
-static int ggml_cuda_try_ssm_conv_l2_fusion(const ggml_cgraph * cgraph, int node_idx,
-                                            ggml_tensor *& bias_add, ggml_tensor *& silu, ggml_cuda_ssm_conv_l2 & l2) {
+// launch. The parsed run: the conv, an optional bias add, the silu, then the norms and their folded scales
+struct ggml_cuda_ssm_conv_l2_match {
+    ggml_tensor * bias_add;
+    ggml_tensor * silu;
+    int n_base;                             // nodes up to and including the silu
+    int l2_idx[GGML_CUDA_SSM_CONV_MAX_L2];  // graph index of each l2 norm
+    int out_idx[GGML_CUDA_SSM_CONV_MAX_L2]; // graph index of the tensor the kernel writes for it (the norm or its scale)
+};
+
+// parses the run without the fusability checks; returns its node count, 0 when the pattern is absent
+static int ggml_cuda_match_ssm_conv_l2_run(const ggml_cgraph * cgraph, int node_idx, ggml_cuda_ssm_conv_l2_match & m,
+                                           ggml_cuda_ssm_conv_l2 & l2) {
     constexpr int max_nodes = 31; // run length limit: ggml_can_fuse_subgraph asserts count < 32
     constexpr int head_dim  = 128; // one block of the conv kernel
 
@@ -3934,16 +3943,18 @@ static int ggml_cuda_try_ssm_conv_l2_fusion(const ggml_cgraph * cgraph, int node
     } else {
         return 0;
     }
-    bias_add = n_base == 3 ? cgraph->nodes[node_idx + 1] : nullptr;
-    silu     = cgraph->nodes[node_idx + n_base - 1];
+    m.n_base   = n_base;
+    m.bias_add = n_base == 3 ? cgraph->nodes[node_idx + 1] : nullptr;
+    m.silu     = cgraph->nodes[node_idx + n_base - 1];
+    const ggml_tensor * silu = m.silu;
     const int64_t n_ch = silu->ne[0];
     if (silu->nb[0] != sizeof(float) || n_ch % head_dim != 0) {
         return 0;
     }
 
     l2 = {};
-    int l2_idx[GGML_CUDA_SSM_CONV_MAX_L2];  // graph index of each l2 norm
-    int out_idx[GGML_CUDA_SSM_CONV_MAX_L2]; // graph index of the tensor the kernel writes for it (the norm or its scale)
+    int * l2_idx  = m.l2_idx;
+    int * out_idx = m.out_idx;
 
     int j = node_idx + n_base;
     for (; j < cgraph->n_nodes && j - node_idx < max_nodes; ++j) {
@@ -4019,19 +4030,37 @@ static int ggml_cuda_try_ssm_conv_l2_fusion(const ggml_cgraph * cgraph, int node
     if (l2.n == 0) {
         return 0;
     }
+    return j - node_idx;
+}
+
+// whether node k of a matched run is never written: the conv, the bias add, a norm folded into its scale
+static bool ggml_cuda_ssm_conv_l2_elided(const ggml_cuda_ssm_conv_l2_match & m, const ggml_cuda_ssm_conv_l2 & l2, int node_idx, int k) {
+    bool elided = k < m.n_base - 1;
+    for (int r = 0; r < l2.n; ++r) {
+        elided = elided || (node_idx + k == m.l2_idx[r] && m.out_idx[r] != m.l2_idx[r]);
+    }
+    return elided;
+}
+
+// Returns the number of nodes to skip after the ssm_conv, 0 when the pattern is absent or not fusable
+static int ggml_cuda_try_ssm_conv_l2_fusion(const ggml_cgraph * cgraph, int node_idx,
+                                            ggml_tensor *& bias_add, ggml_tensor *& silu, ggml_cuda_ssm_conv_l2 & l2) {
+    constexpr int max_nodes = 31;
+    ggml_cuda_ssm_conv_l2_match m;
+    const int count = ggml_cuda_match_ssm_conv_l2_run(cgraph, node_idx, m, l2);
+    if (count == 0) {
+        return 0;
+    }
+    bias_add = m.bias_add;
+    silu     = m.silu;
 
     // every node of the run is an output except the conv, the bias add and a norm folded into its scale
-    const int count = j - node_idx;
     enum ggml_op ops[max_nodes];
     int outputs[max_nodes];
     int n_outputs = 0;
     for (int k = 0; k < count; ++k) {
         ops[k] = cgraph->nodes[node_idx + k]->op;
-        bool elided = k < n_base - 1;
-        for (int r = 0; r < l2.n; ++r) {
-            elided = elided || (node_idx + k == l2_idx[r] && out_idx[r] != l2_idx[r]);
-        }
-        if (!elided) {
+        if (!ggml_cuda_ssm_conv_l2_elided(m, l2, node_idx, k)) {
             outputs[n_outputs++] = node_idx + k;
         }
     }
@@ -4041,9 +4070,9 @@ static int ggml_cuda_try_ssm_conv_l2_fusion(const ggml_cgraph * cgraph, int node
 
     // the written buffers (silu output, norm outputs) must not overlap the conv inputs
     int written[1 + GGML_CUDA_SSM_CONV_MAX_L2];
-    written[0] = node_idx + n_base - 1;
+    written[0] = node_idx + m.n_base - 1;
     for (int r = 0; r < l2.n; ++r) {
-        written[1 + r] = out_idx[r];
+        written[1 + r] = m.out_idx[r];
     }
     if (!ggml_cuda_check_fusion_memory_ranges(cgraph, node_idx, count, written, 1 + l2.n)) {
         return 0;
@@ -4158,9 +4187,10 @@ static int ggml_cuda_try_gdn_gates_fusion(const ggml_cgraph * cgraph, int node_i
 
 // the conv input of a recurrent layer: get_rows of the state rows -> [views] -> concat with the transposed new tokens
 // -> view of the last d_conv-1 columns -> cpy into the state cache. The run may hold the zero-sized "extra state"
-// nodes the graph builder emits (a get_rows and a cpy over 0 rows) and any views. Returns the nodes to skip after
-// the get_rows, 0 when the run is absent.
-static int ggml_cuda_try_conv_state_fusion(const ggml_cgraph * cgraph, int node_idx, ggml_cuda_conv_state_args & a) {
+// nodes the graph builder emits (a get_rows and a cpy over 0 rows) and any views. Parses the run and fills the
+// geometry and pointers without the fusability checks; returns the node count from the get_rows through the cpy,
+// 0 when the run is absent
+static int ggml_cuda_match_conv_state_run(const ggml_cgraph * cgraph, int node_idx, ggml_cuda_conv_state_args & a, int & concat_idx) {
     constexpr int max_nodes = 31;
     const int end = std::min(cgraph->n_nodes, node_idx + max_nodes);
 
@@ -4199,7 +4229,7 @@ static int ggml_cuda_try_conv_state_fusion(const ggml_cgraph * cgraph, int node_
     if (concat == nullptr || ggml_get_op_params_i32(concat, 0) != 0 || concat->type != GGML_TYPE_F32 || !ggml_is_contiguous(concat)) {
         return 0;
     }
-    const int concat_idx = j;
+    concat_idx = j;
     const ggml_tensor * st = concat->src[0]; // [d_conv-1, n_ch, n_seqs] view of the gathered rows
     const ggml_tensor * xt = concat->src[1]; // [n_t, n_ch, n_seqs] transpose of the new tokens [n_ch, n_t, n_seqs]
     const int64_t n_state = st->ne[0];
@@ -4241,8 +4271,32 @@ static int ggml_cuda_try_conv_state_fusion(const ggml_cgraph * cgraph, int node_
         return 0;
     }
 
+    a.n_ch          = n_ch;
+    a.d_conv        = n_state + 1;
+    a.n_t           = n_t;
+    a.n_seqs        = n_seqs;
+    a.states        = (const float *) states->data;
+    a.idx           = (const int32_t *) idx->data;
+    a.x             = (const float *) xt->data;
+    a.conv_in       = (float *) concat->data;
+    a.cache         = (float *) upd->data;
+    a.states_stride = states->nb[1]/sizeof(float);
+    a.x_stride_t    = xt->nb[0]/sizeof(float);
+    a.x_stride_s    = xt->nb[2]/sizeof(float);
+    a.cache_stride  = upd->nb[1]/sizeof(float);
+    return j - node_idx + 1;
+}
+
+// Returns the nodes to skip after the get_rows, 0 when the run is absent or outside the small-batch kernel
+static int ggml_cuda_try_conv_state_fusion(const ggml_cgraph * cgraph, int node_idx, ggml_cuda_conv_state_args & a) {
+    constexpr int max_nodes = 31;
+    int concat_idx = -1;
+    const int count = ggml_cuda_match_conv_state_run(cgraph, node_idx, a, concat_idx);
+    if (count == 0) {
+        return 0;
+    }
+
     // every node but the get_rows is an output (views, the zero-sized extras, the concat and the cpy)
-    const int count = j - node_idx + 1;
     enum ggml_op ops[max_nodes];
     int outputs[max_nodes];
     int n_outputs = 0;
@@ -4260,32 +4314,110 @@ static int ggml_cuda_try_conv_state_fusion(const ggml_cgraph * cgraph, int node_
     // and overwritten by another in the same launch, and above a few tokens the per-channel loop is uncoalesced,
     // so both keep the separate launches. conv_in is a fresh buffer: the inputs are live at the concat node, but
     // the ranges are checked anyway
-    a.n_ch   = n_ch;
-    a.d_conv = n_state + 1;
-    a.n_t    = n_t;
-    a.n_seqs = n_seqs;
     if (!ggml_cuda_conv_state_supported(a)) {
         return 0;
     }
+    const ggml_tensor * rows   = cgraph->nodes[node_idx];
+    const ggml_tensor * concat = cgraph->nodes[concat_idx];
     auto disjoint = [](const void * p, size_t n, const ggml_tensor * t) {
         const uintptr_t a0 = (uintptr_t) p, a1 = a0 + n;
         const uintptr_t b0 = (uintptr_t) t->data, b1 = b0 + ggml_backend_buft_get_alloc_size(t->buffer->buft, t);
         return a1 <= b0 || b1 <= a0;
     };
-    if (!disjoint(concat->data, ggml_nbytes(concat), xt) || !disjoint(concat->data, ggml_nbytes(concat), states) ||
-        !disjoint(concat->data, ggml_nbytes(concat), idx)) {
+    if (!disjoint(concat->data, ggml_nbytes(concat), concat->src[1]) || !disjoint(concat->data, ggml_nbytes(concat), rows->src[0]) ||
+        !disjoint(concat->data, ggml_nbytes(concat), rows->src[1])) {
+        return 0;
+    }
+    return count - 1;
+}
+
+// the prefill form of the conv-state run: the same get_rows -> concat -> cpy run directly followed by the
+// ssm_conv -> [add] -> silu -> l2-norm run, one sequence above the small-batch token limit. The concat and the
+// transposed copy are never materialized: one kernel reads the state row and the token projection, writes the silu
+// output, the norms and the next state row. Returns the nodes to skip after the get_rows, 0 when absent
+static int ggml_cuda_try_conv_tokens_fusion(const ggml_cgraph * cgraph, int node_idx, ggml_cuda_ssm_conv_tokens_args & ta,
+                                            ggml_cuda_ssm_conv_l2 & l2) {
+    constexpr int max_nodes = 31;
+    ggml_cuda_conv_state_args a;
+    int concat_idx = -1;
+    const int count0 = ggml_cuda_match_conv_state_run(cgraph, node_idx, a, concat_idx);
+    if (count0 == 0 || a.n_seqs != 1 || a.n_t <= GGML_CUDA_CONV_STATE_MAX_T) {
+        return 0;
+    }
+    const int conv_idx = node_idx + count0;
+    if (conv_idx >= cgraph->n_nodes) {
+        return 0;
+    }
+    const ggml_tensor * conv = cgraph->nodes[conv_idx];
+    const ggml_tensor * w    = conv->src[1];
+    if (conv->op != GGML_OP_SSM_CONV || conv->src[0] != cgraph->nodes[concat_idx] || w->type != GGML_TYPE_F32 ||
+        w->ne[0] != a.d_conv || w->ne[1] != a.n_ch || w->nb[0] != sizeof(float)) {
+        return 0;
+    }
+    ggml_cuda_ssm_conv_l2_match m;
+    const int count1 = ggml_cuda_match_ssm_conv_l2_run(cgraph, conv_idx, m, l2);
+    if (count1 == 0) {
+        return 0;
+    }
+    const ggml_tensor * silu = m.silu;
+    if (!ggml_is_contiguous(silu) || silu->ne[0] != a.n_ch || silu->ne[1] != a.n_t || silu->ne[2] != 1 || silu->ne[3] != 1) {
+        return 0;
+    }
+    const ggml_tensor * bias = nullptr;
+    if (m.bias_add != nullptr) {
+        bias = m.bias_add->src[0] == conv ? m.bias_add->src[1] : m.bias_add->src[0];
+        if (bias->type != GGML_TYPE_F32 || !ggml_is_contiguous(bias) || ggml_nelements(bias) != a.n_ch) {
+            return 0;
+        }
+    }
+
+    // one run: every node is an output except the get_rows, the concat, the conv, the bias add and the folded norms
+    const int count = count0 + count1;
+    if (count > max_nodes) {
+        return 0;
+    }
+    enum ggml_op ops[max_nodes];
+    int outputs[max_nodes];
+    int n_outputs = 0;
+    for (int k = 0; k < count; ++k) {
+        ops[k] = cgraph->nodes[node_idx + k]->op;
+        const bool elided = k == 0 || node_idx + k == concat_idx ||
+            (k >= count0 && ggml_cuda_ssm_conv_l2_elided(m, l2, conv_idx, k - count0));
+        if (!elided) {
+            outputs[n_outputs++] = node_idx + k;
+        }
+    }
+    if (!ggml_can_fuse_subgraph(cgraph, node_idx, count, ops, outputs, n_outputs)) {
         return 0;
     }
 
-    a.states        = (const float *) states->data;
-    a.idx           = (const int32_t *) idx->data;
-    a.x             = (const float *) xt->data;
-    a.conv_in       = (float *) concat->data;
-    a.cache         = (float *) upd->data;
-    a.states_stride = states->nb[1]/sizeof(float);
-    a.x_stride_t    = xt->nb[0]/sizeof(float);
-    a.x_stride_s    = xt->nb[2]/sizeof(float);
-    a.cache_stride  = upd->nb[1]/sizeof(float);
+    // the written buffers (silu output, norm outputs) must not overlap the token projection; the next state row may
+    // be the gathered row (each thread reads its elements before it writes them)
+    int written[1 + GGML_CUDA_SSM_CONV_MAX_L2];
+    written[0] = conv_idx + m.n_base - 1;
+    for (int r = 0; r < l2.n; ++r) {
+        written[1 + r] = m.out_idx[r];
+    }
+    if (!ggml_cuda_check_fusion_memory_ranges(cgraph, node_idx, count, written, 1 + l2.n)) {
+        return 0;
+    }
+
+    ta.states        = a.states;
+    ta.idx           = a.idx;
+    ta.x             = a.x;
+    ta.w             = (const float *) w->data;
+    ta.bias          = bias != nullptr ? (const float *) bias->data : nullptr;
+    ta.y             = (float *) silu->data;
+    ta.cache         = a.cache;
+    ta.states_stride = a.states_stride;
+    ta.x_stride_t    = a.x_stride_t;
+    ta.w_stride      = w->nb[1]/sizeof(float);
+    ta.n_ch          = a.n_ch;
+    ta.d_conv        = a.d_conv;
+    ta.n_t           = a.n_t;
+    if (!ggml_cuda_ssm_conv_tokens_supported(ta)) {
+        return 0;
+    }
     return count - 1;
 }
 
@@ -4313,8 +4445,16 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
 
-    // recurrent conv input: get_rows of the state row -> concat with the new tokens -> cpy of the tail back to the cache
+    // recurrent conv input: get_rows of the state row -> concat with the new tokens -> cpy of the tail back to the cache;
+    // prefill batches of one sequence take the conv, silu and norms along and never materialize the concat
     if (node->op == GGML_OP_GET_ROWS) {
+        ggml_cuda_ssm_conv_tokens_args ta;
+        ggml_cuda_ssm_conv_l2 l2;
+        const int tokens_to_skip = ggml_cuda_try_conv_tokens_fusion(cgraph, i, ta, l2);
+        if (tokens_to_skip > 0) {
+            ggml_cuda_op_ssm_conv_tokens(*cuda_ctx, ta, l2);
+            return tokens_to_skip;
+        }
         ggml_cuda_conv_state_args a;
         const int nodes_to_skip = ggml_cuda_try_conv_state_fusion(cgraph, i, a);
         if (nodes_to_skip > 0) {
