@@ -11368,6 +11368,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (uint32_t n : {5120, 12288}) { // the register-cached fused kernel's 256- and 1024-thread paths
         test_cases.emplace_back(new test_add_rms_norm_mul(GGML_TYPE_F32, {n, 3, 1, 1}, 1e-6f));
     }
+    for (int64_t nr : {1, 8, 9}) { // the 512-thread decode path and the first row count above it
+        test_cases.emplace_back(new test_add_rms_norm_mul(GGML_TYPE_F32, {5120, nr, 1, 1}, 1e-6f));
+    }
+    test_cases.emplace_back(new test_add_rms_norm_mul(GGML_TYPE_F32, {8192, 2, 1, 1}, 1e-6f)); // 8 float4 per thread at 256
 
     for (auto multi_add : {false, true}) {
         for (auto set_rows : {false, true}) {
@@ -13352,6 +13356,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_ssm_conv_l2(4, 128, 16, 1, 1, false));
     test_cases.emplace_back(new test_conv_state_ssm_conv(4, 128, 26, 4096, 1, 8, false)); // prefill chain, 9984 channels
     test_cases.emplace_back(new test_gdn_gates(GGML_TYPE_BF16, 5120, 48, 1, false));
+    test_cases.emplace_back(new test_add_rms_norm_mul(GGML_TYPE_F32, {5120, 1, 1, 1}, 1e-6f)); // residual norm at decode
+    test_cases.emplace_back(new test_add_rms_norm_mul(GGML_TYPE_F32, {5120, 4, 1, 1}, 1e-6f));
     test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 128, 64, 48, 1, 512, 1)); // prefill
     test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 128, 64, 48, 1, 1,   1)); // generate
     test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 128, 80, 128, 1, 512, 1)); // Nemotron-9B prefill
