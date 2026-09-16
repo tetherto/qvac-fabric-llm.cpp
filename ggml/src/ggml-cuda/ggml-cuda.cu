@@ -727,6 +727,12 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
     if (copy_event != nullptr) {
         CUDA_CHECK(cudaEventDestroy(copy_event));
     }
+    if (gdn_pack.data != nullptr) {
+        CUDA_CHECK(cudaFree(gdn_pack.data));
+    }
+    for (void * p : gdn_pack.retired) {
+        CUDA_CHECK(cudaFree(p));
+    }
     for (int i = 0; i < GGML_CUDA_MAX_DEVICES; ++i) {
         for (int j = 0; j < GGML_CUDA_MAX_STREAMS; ++j) {
             if (streams[i][j] != nullptr) {
@@ -4344,9 +4350,10 @@ static int ggml_cuda_try_conv_state_fusion(const ggml_cgraph * cgraph, int node_
 // the prefill form of the conv-state run: the same get_rows -> concat -> cpy run directly followed by the
 // ssm_conv -> [add] -> silu -> l2-norm run, one sequence above the small-batch token limit. The concat and the
 // transposed copy are never materialized: one kernel reads the state row and the token projection, writes the silu
-// output, the norms and the next state row. Returns the nodes to skip after the get_rows, 0 when absent
+// output, the norms and the next state row. Returns the nodes to skip after the get_rows, 0 when absent; written
+// receives the node indices of the silu output and of the l2.n norm outputs
 static int ggml_cuda_try_conv_tokens_fusion(const ggml_cgraph * cgraph, int node_idx, ggml_cuda_ssm_conv_tokens_args & ta,
-                                            ggml_cuda_ssm_conv_l2 & l2) {
+                                            ggml_cuda_ssm_conv_l2 & l2, int * written) {
     constexpr int max_nodes = 31;
     ggml_cuda_conv_state_args a;
     int concat_idx = -1;
@@ -4403,7 +4410,6 @@ static int ggml_cuda_try_conv_tokens_fusion(const ggml_cgraph * cgraph, int node
 
     // the written buffers (silu output, norm outputs) must not overlap the token projection; the next state row may
     // be the gathered row (each thread reads its elements before it writes them)
-    int written[1 + GGML_CUDA_SSM_CONV_MAX_L2];
     written[0] = conv_idx + m.n_base - 1;
     for (int r = 0; r < l2.n; ++r) {
         written[1 + r] = m.out_idx[r];
@@ -4429,6 +4435,119 @@ static int ggml_cuda_try_conv_tokens_fusion(const ggml_cgraph * cgraph, int node
         return 0;
     }
     return count - 1;
+}
+
+// the FlashInfer GDN kernel's bf16 inputs written by the fused conv kernel: finds the gated delta net node fed by the
+// run's normalized q/k slices and by a head-major view of the silu output (v), checks that it takes the AOT path,
+// and points the conv launch at the context's pack buffer (grown for the largest ubatch seen); the gdn op then packs
+// the gates only. When nothing but the run and that node reads the silu output and the norms (view chains included,
+// no output flags), the kernel also skips their f32 stores: the pack is the only output (the gdn op aborts instead of
+// falling back if the AOT launch fails). Silent when the node is absent or shaped differently: the gdn op packs from
+// the f32 tensors. GGML_CUDA_DISABLE_GDN_PACK=1 turns it off for A/B runs
+static void ggml_cuda_conv_tokens_pack_for_gdn(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int node_idx,
+                                               int first_idx, const int * written,
+                                               ggml_cuda_ssm_conv_tokens_args & ta, ggml_cuda_ssm_conv_l2 & l2) {
+    constexpr int64_t S = 128;
+    static const bool disabled = getenv("GGML_CUDA_DISABLE_GDN_PACK") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_GDN_PACK"));
+    if (disabled || l2.n != 2) {
+        return;
+    }
+    const ggml_tensor * gdn = nullptr;
+    const char * y0 = (const char *) ta.y;
+    const char * y1 = y0 + (size_t) ta.n_ch * ta.n_t * sizeof(float);
+    for (int j = first_idx; j < cgraph->n_nodes && j < first_idx + 32; ++j) {
+        const ggml_tensor * node = cgraph->nodes[j];
+        if (node->op == GGML_OP_GATED_DELTA_NET) {
+            const char * v = (const char *) node->src[2]->data;
+            if (v >= y0 && v < y1) {
+                gdn = node;
+            }
+            break;
+        }
+    }
+    if (gdn == nullptr || !ggml_cuda_gated_delta_net_flashinfer_aot(gdn)) {
+        return;
+    }
+    const ggml_tensor * q = gdn->src[0];
+    const ggml_tensor * k = gdn->src[1];
+    const ggml_tensor * v = gdn->src[2];
+    const int64_t H_v = v->ne[1];
+    // v: [S, H_v, n_t] straight out of the silu rows
+    if (v->type != GGML_TYPE_F32 || v->ne[0] != S || v->ne[2] != ta.n_t || v->ne[3] != 1 ||
+        v->nb[1] != S*sizeof(float) || v->nb[2] != (size_t) ta.n_ch*sizeof(float)) {
+        return;
+    }
+    const int64_t v_ch0 = ((const float *) v->data - ta.y);
+    if (v_ch0 % S != 0 || v_ch0 + H_v*S > ta.n_ch) {
+        return;
+    }
+    // q and k: each the whole of one norm slice, [S, n_heads, n_t] with the slice's strides
+    int slice[2] = {-1, -1};
+    for (int s = 0; s < 2; ++s) {
+        const ggml_tensor * t = s == 0 ? q : k;
+        for (int r = 0; r < l2.n; ++r) {
+            const int64_t n_heads = (l2.ch1[r] - l2.ch0[r]) / S;
+            if (t->type == GGML_TYPE_F32 && t->data == l2.dst[r] && t->ne[0] == S && t->ne[1] == n_heads &&
+                t->ne[2] == ta.n_t && t->ne[3] == 1 && t->nb[1] == (size_t) l2.nb1[r]*sizeof(float) &&
+                t->nb[2] == (size_t) l2.nb2[r]*sizeof(float) && H_v % n_heads == 0) {
+                slice[s] = r;
+            }
+        }
+    }
+    if (slice[0] < 0 || slice[1] < 0 || slice[0] == slice[1]) {
+        return;
+    }
+
+    ggml_cuda_gdn_pack & pack = ctx.gdn_pack;
+    const size_t elements = (size_t) ta.n_t * H_v * S;
+    if (elements > pack.capacity) {
+        if (pack.data != nullptr) {
+            pack.retired.push_back(pack.data);
+        }
+        ggml_cuda_set_device(ctx.device);
+        CUDA_CHECK(cudaMalloc(&pack.data, 3*elements*sizeof(__nv_bfloat16)));
+        pack.capacity = elements;
+    }
+    pack.elements = elements;
+    pack.node     = gdn;
+    pack.f32_elided = false;
+    l2.pack[slice[0]] = (__nv_bfloat16 *) pack.q();
+    l2.pack[slice[1]] = (__nv_bfloat16 *) pack.k();
+    l2.pack_heads     = (int) H_v;
+    ta.v_pack = (__nv_bfloat16 *) pack.v();
+    ta.v_ch0  = (int) v_ch0;
+    ta.v_nch  = (int) (H_v*S);
+
+    // are the f32 outputs dead: every reader outside the run is the gdn node or a view op (whose own readers are
+    // checked in turn since they list the view as a source)
+    const ggml_tensor * roots[1 + GGML_CUDA_SSM_CONV_MAX_L2];
+    for (int i = 0; i < 1 + l2.n; ++i) {
+        roots[i] = cgraph->nodes[written[i]];
+        if (roots[i]->flags & GGML_TENSOR_FLAG_OUTPUT) {
+            return;
+        }
+    }
+    for (int j = 0; j < cgraph->n_nodes; ++j) {
+        const ggml_tensor * node = cgraph->nodes[j];
+        if ((j >= node_idx && j < first_idx) || node == gdn || ggml_cuda_is_view_or_noop(node)) {
+            continue;
+        }
+        for (int s = 0; s < GGML_MAX_SRC && node->src[s] != nullptr; ++s) {
+            const ggml_tensor * root = node->src[s];
+            while (root->view_src != nullptr) {
+                root = root->view_src;
+            }
+            for (int i = 0; i < 1 + l2.n; ++i) {
+                if (root == roots[i]) {
+                    return;
+                }
+            }
+        }
+    }
+    pack.f32_elided = true;
+    ta.y = nullptr;
+    l2.dst[slice[0]] = nullptr;
+    l2.dst[slice[1]] = nullptr;
 }
 
 // two or three F8 mul_mats on one F32 activation, consecutive up to view nodes (q/k/v, the delta-net qkv/z): the
@@ -4540,8 +4659,10 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     if (node->op == GGML_OP_GET_ROWS) {
         ggml_cuda_ssm_conv_tokens_args ta;
         ggml_cuda_ssm_conv_l2 l2;
-        const int tokens_to_skip = ggml_cuda_try_conv_tokens_fusion(cgraph, i, ta, l2);
+        int written[1 + GGML_CUDA_SSM_CONV_MAX_L2];
+        const int tokens_to_skip = ggml_cuda_try_conv_tokens_fusion(cgraph, i, ta, l2, written);
         if (tokens_to_skip > 0) {
+            ggml_cuda_conv_tokens_pack_for_gdn(*cuda_ctx, cgraph, i, i + tokens_to_skip + 1, written, ta, l2);
             ggml_cuda_op_ssm_conv_tokens(*cuda_ctx, ta, l2);
             return tokens_to_skip;
         }

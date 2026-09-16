@@ -259,20 +259,25 @@ void ggml_cuda_op_ssm_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst, g
     }
 }
 
-// one block = 128 consecutive channels (one head of a norm slice) x a tile of split_t tokens; the d_conv inputs of a
-// channel sit in registers, the first d_conv-1 come from the state row (first tile) or from the previous tokens.
-// Same accumulation order as ssm_conv_long_token_f32, so the sums are bit-identical to the concat path
+// one block = 128 consecutive channels (one head of a norm slice) x a tile of split_t tokens. The tile's inputs are
+// loaded into registers up front (split_t independent loads per thread, so the loop is not one memory round trip per
+// token), the conv runs from registers with the same accumulation order as ssm_conv_long_token_f32 (bit-identical
+// sums), and the per-token L2 norms of a slice are reduced in one batch: a warp reduction per token, one shared
+// exchange and one barrier for the tile instead of a block reduction per token
 template <int d_conv, bool with_l2, int split_t>
 static __global__ void ssm_conv_tokens_f32(const ggml_cuda_ssm_conv_tokens_args a, const ggml_cuda_ssm_conv_l2 l2) {
     constexpr int split_ch = 128;
+    constexpr int n_warps  = split_ch/WARP_SIZE;
     ggml_cuda_pdl_lc();
     const int tid       = threadIdx.x;
+    const int warp      = tid / WARP_SIZE;
+    const int lane      = tid % WARP_SIZE;
     const int ch_base   = blockIdx.x*split_ch;
     const int c         = ch_base + tid;
     const int t0        = blockIdx.y*split_t;
     const int local_n_t = min(split_t, a.n_t - t0);
 
-    __shared__ float s_red[2][WARP_SIZE];
+    __shared__ float s_red[n_warps][split_t];
     const int l2_slice = with_l2 ? ssm_conv_l2_slice<split_ch>(l2, ch_base) : -1;
 
     // weights and bias never depend on the previous kernel: load them before the grid dependency
@@ -297,25 +302,101 @@ static __global__ void ssm_conv_tokens_f32(const ggml_cuda_ssm_conv_tokens_args 
             win[j] = a.x[(t0 - (d_conv - 1) + j)*a.x_stride_t + c];
         }
     }
+    float xt[split_t];
+#pragma unroll
+    for (int i = 0; i < split_t; i++) {
+        xt[i] = i < local_n_t ? a.x[(t0 + i)*a.x_stride_t + c] : 0.0f;
+    }
 
-    for (int i = 0; i < local_n_t; i++) {
-        win[d_conv - 1] = a.x[(t0 + i)*a.x_stride_t + c];
+    float yv[split_t];
+#pragma unroll
+    for (int i = 0; i < split_t; i++) {
+        win[d_conv - 1] = xt[i];
         float sumf = 0.0f;
 #pragma unroll
         for (int j = 0; j < d_conv; j++) {
             sumf += win[j]*w[j];
         }
         sumf += b;
-        const float y = ggml_cuda_op_silu_single(sumf);
-        a.y[(t0 + i)*(int64_t) a.n_ch + c] = y;
-        if constexpr (with_l2) {
-            if (l2_slice >= 0) { // block-uniform
-                ssm_conv_l2_row<split_ch>(l2, l2_slice, ch_base, t0 + i, 0, tid, y, s_red[i & 1]);
-            }
-        }
+        yv[i] = ggml_cuda_op_silu_single(sumf);
 #pragma unroll
         for (int j = 0; j < d_conv - 1; j++) {
             win[j] = win[j + 1];
+        }
+    }
+
+    if (a.y != nullptr) { // null when the bf16 packs are the only consumers' copy
+#pragma unroll
+        for (int i = 0; i < split_t; i++) {
+            if (i < local_n_t) {
+                a.y[(t0 + i)*(int64_t) a.n_ch + c] = yv[i];
+            }
+        }
+    }
+    if (a.v_pack != nullptr && c >= a.v_ch0 && c < a.v_ch0 + a.v_nch) { // block-uniform
+#pragma unroll
+        for (int i = 0; i < split_t; i++) {
+            if (i < local_n_t) {
+                a.v_pack[(t0 + i)*(int64_t) a.v_nch + (c - a.v_ch0)] = __float2bfloat16_rn(yv[i]);
+            }
+        }
+    }
+
+    if constexpr (with_l2) {
+        if (l2_slice >= 0) { // block-uniform
+            // constant indices only: a dynamic index into the parameter struct would copy it to local memory per thread
+            int     ch0   = l2.ch0[0];
+            int     ch1   = l2.ch1[0];
+            float   eps   = l2.eps[0];
+            float   scl   = l2.scale[0];
+            float * dst   = l2.dst[0];
+            int64_t nb1   = l2.nb1[0];
+            int64_t nb2   = l2.nb2[0];
+            __nv_bfloat16 * pack = l2.pack[0];
+#pragma unroll
+            for (int r = 1; r < GGML_CUDA_SSM_CONV_MAX_L2; r++) {
+                if (r == l2_slice) {
+                    ch0  = l2.ch0[r];
+                    ch1  = l2.ch1[r];
+                    eps  = l2.eps[r];
+                    scl  = l2.scale[r];
+                    dst  = l2.dst[r];
+                    nb1  = l2.nb1[r];
+                    nb2  = l2.nb2[r];
+                    pack = l2.pack[r];
+                }
+            }
+#pragma unroll
+            for (int i = 0; i < split_t; i++) {
+                const float ss = warp_reduce_sum(yv[i]*yv[i]);
+                if (lane == 0) {
+                    s_red[warp][i] = ss;
+                }
+            }
+            __syncthreads();
+            const int     n_heads = (ch1 - ch0) / split_ch;
+            const int64_t head    = (ch_base - ch0) / split_ch;
+#pragma unroll
+            for (int i = 0; i < split_t; i++) {
+                if (i < local_n_t) {
+                    // the warp partials are combined in block_reduce's order (a shuffle tree over lanes 0..n_warps-1),
+                    // so the sums equal the per-token block_reduce bit for bit. The order is load-bearing: a one-ulp
+                    // change of this sum moves the Qwen3.8 GX gate from exact to 0.0136 mean KLD (the delta-net state
+                    // amplifies it), so a sequential sum of the partials is not an option
+                    const float ss    = warp_reduce_sum(lane < n_warps ? s_red[lane][i] : 0.0f);
+                    const float scale = rsqrtf(fmaxf(ss, eps*eps)) * scl;
+                    const float o     = yv[i]*scale;
+                    if (dst != nullptr) {
+                        dst[head*nb1 + (int64_t) (t0 + i)*nb2 + tid] = o;
+                    }
+                    if (pack != nullptr) {
+                        const __nv_bfloat16 ob = __float2bfloat16_rn(o);
+                        for (int hv = head; hv < l2.pack_heads; hv += n_heads) {
+                            pack[((t0 + i)*(int64_t) l2.pack_heads + hv)*split_ch + tid] = ob;
+                        }
+                    }
+                }
+            }
         }
     }
 
