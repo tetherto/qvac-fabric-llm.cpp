@@ -3341,6 +3341,11 @@ struct test_bin_bcast : public test_case {
 
     bool run_whole_graph() override { return nf > 1; }
 
+    double max_nmse_err() override {
+        // Fused ADD can keep F32 intermediates; the CPU rounds each result to F16.
+        return op == ggml_add && type == GGML_TYPE_F16 && nf > 1 ? 1e-6 : test_case::max_nmse_err();
+    }
+
     std::string vars() override {
         return VARS_TO_STR6(type, ne, nr, nf, perm1, src_overlap);
     }
