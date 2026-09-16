@@ -17,6 +17,7 @@ struct socket_t {
     bool recv_data(void * data, size_t size);
     bool exchange_data(const void * send_data, void * recv_data, size_t size);
     bool set_timeout(int timeout_ms);
+    void shutdown();
 
     socket_ptr accept(int timeout_ms = -1);
 
