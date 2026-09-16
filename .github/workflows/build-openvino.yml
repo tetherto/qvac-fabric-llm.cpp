@@ -41,7 +41,8 @@ env:
   LLAMA_ARG_LOG_PREFIX: 1
   LLAMA_ARG_LOG_TIMESTAMPS: 1
   # TODO: fix failing tests on OpenVINO backend
-  CTEST_EXCLUDE: "test-llama-archs|test-llama-context|test-fp8-kv"
+  # QVAC divergence from upstream: the anchored test names hit unresolved OpenVINO frontend limitations. Other CI jobs still run them.
+  CTEST_EXCLUDE: "test-llama-archs|test-llama-context|test-fp8-kv|^(test-hadamard-contracts|test-moe-no-output-ubatches|test-coreml-ffn)$"
 
 jobs:
   ubuntu-24-openvino:
@@ -108,6 +109,8 @@ jobs:
       contents: read
 
     env:
+      # Windows runner VMs can advertise unusable AMX: https://github.com/actions/runner-images/issues/14483
+      ONEDNN_MAX_CPU_ISA: AVX512_CORE
       # Sync versions in build-openvino.yml, ci-self-hosted-openvino.yml, release.yml, release-publish.yml, build-cache.yml, .devops/openvino.Dockerfile, docs/backend/OPENVINO.md
       OPENVINO_VERSION_MAJOR: "2026.4.1"
       OPENVINO_VERSION_FULL: "2026.4.1.22982.07f9c262b05"
