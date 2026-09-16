@@ -2,6 +2,7 @@
 #include "common.cuh"
 #include "convert.cuh"
 #include "mmf8.cuh"
+#include "unary.cuh"
 #ifdef GGML_CUDA_CUTLASS
 #include "mmf8-cutlass.cuh"
 #endif // GGML_CUDA_CUTLASS
@@ -210,7 +211,24 @@ static void mul_mat_f8_e4m3_cublas(
 }
 
 #ifdef GGML_CUDA_CUTLASS
-// one warp per (token, 128-k group), 4 floats per lane; scales stored [K/128][M_pad] (tokens contiguous) as CUTLASS expects
+// the quantizer of one lane's 4 values of a (token, 128-k group) pair: warp amax, scale = amax/448 floored at FLT_MIN,
+// two packed e4m3 conversions; scales stored [K/128][M_pad] (tokens contiguous) as CUTLASS expects
+static __device__ __forceinline__ void quantize_group128_lane(
+        const float4 v, uint8_t * q, float * sfa, const size_t i, const size_t s_idx, const int lane) {
+    float amax = fmaxf(fmaxf(fabsf(v.x), fabsf(v.y)), fmaxf(fabsf(v.z), fabsf(v.w)));
+    amax = warp_reduce_max<32>(amax);
+
+    const float scale = fmaxf(amax/448.0f, FLT_MIN); // keeps 1/scale finite for zero or subnormal groups
+    const float inv   = 1.0f/scale;
+    const __nv_fp8x2_storage_t lo = __nv_cvt_float2_to_fp8x2(make_float2(v.x*inv, v.y*inv), __NV_SATFINITE, __NV_E4M3);
+    const __nv_fp8x2_storage_t hi = __nv_cvt_float2_to_fp8x2(make_float2(v.z*inv, v.w*inv), __NV_SATFINITE, __NV_E4M3);
+    *(uint32_t *) (q + i) = (uint32_t) lo | ((uint32_t) hi << 16);
+    if (lane == 0) {
+        sfa[s_idx] = scale;
+    }
+}
+
+// one warp per (token, 128-k group), 4 floats per lane
 static __global__ void quantize_f8_e4m3_group128(
         const float * __restrict__ x, uint8_t * __restrict__ q, float * __restrict__ sfa, const int stride_sfa, const int ntokens, const int ncols) {
     const int nblk_k = ncols/GGML_F8_E4M3_SCALE_BLOCK;
@@ -224,22 +242,36 @@ static __global__ void quantize_f8_e4m3_group128(
 
     const size_t i = (size_t) m*ncols + (size_t) kb*GGML_F8_E4M3_SCALE_BLOCK + lane*4;
     const float4 v = *(const float4 *) (x + i);
-    float amax = fmaxf(fmaxf(fabsf(v.x), fabsf(v.y)), fmaxf(fabsf(v.z), fabsf(v.w)));
-    amax = warp_reduce_max<32>(amax);
-
-    const float scale = fmaxf(amax/448.0f, FLT_MIN); // keeps 1/scale finite for zero or subnormal groups
-    const float inv   = 1.0f/scale;
-    const __nv_fp8x2_storage_t lo = __nv_cvt_float2_to_fp8x2(make_float2(v.x*inv, v.y*inv), __NV_SATFINITE, __NV_E4M3);
-    const __nv_fp8x2_storage_t hi = __nv_cvt_float2_to_fp8x2(make_float2(v.z*inv, v.w*inv), __NV_SATFINITE, __NV_E4M3);
-    *(uint32_t *) (q + i) = (uint32_t) lo | ((uint32_t) hi << 16);
-    if (lane == 0) {
-        sfa[(size_t) kb*stride_sfa + m] = scale;
-    }
+    quantize_group128_lane(v, q, sfa, i, (size_t) kb*stride_sfa + m, lane);
 }
 
+// the same quantizer fed by silu(gate) * up computed in fp32 exactly as the GLU kernel does, so the e4m3 input of the
+// down projection is bit-identical to quantizing the materialized GLU output; gate and up rows have their own strides
+static __global__ void glu_quantize_f8_e4m3_group128(
+        const float * __restrict__ g, const float * __restrict__ u, uint8_t * __restrict__ q, float * __restrict__ sfa,
+        const int stride_sfa, const int ntokens, const int ncols, const int64_t o_g, const int64_t o_u) {
+    const int nblk_k = ncols/GGML_F8_E4M3_SCALE_BLOCK;
+    const int pair   = blockIdx.x*(blockDim.x/32) + threadIdx.x/32;
+    const int lane   = threadIdx.x % 32;
+    if (pair >= ntokens*nblk_k) {
+        return;
+    }
+    const int m  = pair % ntokens;
+    const int kb = pair / ntokens;
+
+    const size_t col = (size_t) kb*GGML_F8_E4M3_SCALE_BLOCK + lane*4;
+    const float4 gg = *(const float4 *) (g + (size_t) m*o_g + col);
+    const float4 uu = *(const float4 *) (u + (size_t) m*o_u + col);
+    const float4 v  = make_float4(ggml_cuda_op_silu_single(gg.x)*uu.x, ggml_cuda_op_silu_single(gg.y)*uu.y,
+                                  ggml_cuda_op_silu_single(gg.z)*uu.z, ggml_cuda_op_silu_single(gg.w)*uu.w);
+    quantize_group128_lane(v, q, sfa, (size_t) m*ncols + col, (size_t) kb*stride_sfa + m, lane);
+}
+
+// y is the F32 activation; with glu_gate set the activation is silu(glu_gate) * glu_up instead (never materialized)
 static void mul_mat_f8_e4m3_cutlass(
         ggml_backend_cuda_context & ctx, const uint8_t * x, const float * sx, const float * y, float * dst,
-        const int ncols, const int nrows, const int64_t ntokens, cudaStream_t stream) {
+        const int ncols, const int nrows, const int64_t ntokens, cudaStream_t stream,
+        const float * glu_gate = nullptr, const float * glu_up = nullptr, const int64_t o_g = 0, const int64_t o_u = 0) {
     const int nblk_k = ncols/GGML_F8_E4M3_SCALE_BLOCK;
 
     // the activation scale tensor is [K/128][M] and TMA needs a 16-byte row stride, so M is padded to a multiple of 4
@@ -254,7 +286,11 @@ static void mul_mat_f8_e4m3_cutlass(
     {
         const int64_t npairs = ntokens*nblk_k;
         const dim3 block_nums((npairs + 7)/8, 1, 1);
-        quantize_f8_e4m3_group128<<<block_nums, 256, 0, stream>>>(y, yq.get(), ys.get(), ntokens_pad, ntokens, ncols);
+        if (glu_gate != nullptr) {
+            glu_quantize_f8_e4m3_group128<<<block_nums, 256, 0, stream>>>(glu_gate, glu_up, yq.get(), ys.get(), ntokens_pad, ntokens, ncols, o_g, o_u);
+        } else {
+            quantize_f8_e4m3_group128<<<block_nums, 256, 0, stream>>>(y, yq.get(), ys.get(), ntokens_pad, ntokens, ncols);
+        }
     }
 
     const size_t ws_size = ggml_cuda_mmf8_cutlass_workspace_size(ntokens_pad, nrows, ncols);
@@ -269,7 +305,21 @@ static void mul_mat_f8_e4m3_cutlass(
 }
 #endif // GGML_CUDA_CUTLASS
 
-void ggml_cuda_mul_mat_f8(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+bool ggml_cuda_mul_mat_f8_uses_cutlass(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1) {
+#ifdef GGML_CUDA_CUTLASS
+    // GGML_CUDA_DISABLE_MMF8_CUTLASS: run the F16 fallback GEMM instead (A/B and equivalence gates)
+    static const bool cutlass_disabled = getenv("GGML_CUDA_DISABLE_MMF8_CUTLASS") != nullptr;
+    return src0->type == GGML_TYPE_F8_E4M3 && ggml_nrows(src1) > MMF8_GEMV_MAX_NCOLS && !cutlass_disabled &&
+        ggml_cuda_info().devices[ctx.device].cc == GGML_CUDA_CC_HOPPER;
+#else
+    GGML_UNUSED(ctx);
+    GGML_UNUSED(src0);
+    GGML_UNUSED(src1);
+    return false;
+#endif // GGML_CUDA_CUTLASS
+}
+
+static void ggml_cuda_mul_mat_f8_check(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst) {
     const ggml_tensor * src0_s = dst->src[2];
 
     GGML_ASSERT(src0->type == GGML_TYPE_F8_E4M3);
@@ -281,6 +331,37 @@ void ggml_cuda_mul_mat_f8(ggml_backend_cuda_context & ctx, const ggml_tensor * s
     GGML_ASSERT(src0->ne[0] % GGML_F8_E4M3_SCALE_BLOCK == 0 && src0->ne[1] % GGML_F8_E4M3_SCALE_BLOCK == 0);
     GGML_ASSERT(src0_s->ne[0] == src0->ne[1]/GGML_F8_E4M3_SCALE_BLOCK && src0_s->ne[1] == src0->ne[0]/GGML_F8_E4M3_SCALE_BLOCK);
     GGML_ASSERT(src1->ne[0] == src0->ne[0]);
+}
+
+void ggml_cuda_mul_mat_f8_glu_cutlass(ggml_backend_cuda_context & ctx, const ggml_tensor * glu, ggml_tensor * dst) {
+#ifdef GGML_CUDA_CUTLASS
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * gate = glu->src[0];
+    const ggml_tensor * up   = glu->src[1];
+    ggml_cuda_mul_mat_f8_check(src0, glu, dst);
+    GGML_ASSERT(ggml_cuda_mul_mat_f8_uses_cutlass(ctx, src0, glu));
+    GGML_ASSERT(gate->type == GGML_TYPE_F32 && up->type == GGML_TYPE_F32);
+    GGML_ASSERT(gate->ne[0] == src0->ne[0] && up->ne[0] == src0->ne[0]);
+    GGML_ASSERT(ggml_nrows(gate) == ggml_nrows(glu) && ggml_nrows(up) == ggml_nrows(glu));
+    GGML_ASSERT((uintptr_t) gate->data % 16 == 0 && (uintptr_t) up->data % 16 == 0 && gate->nb[1] % 16 == 0 && up->nb[1] % 16 == 0);
+
+    const int     ncols   = src0->ne[0];
+    const int     nrows   = src0->ne[1];
+    const int64_t ntokens = ggml_nrows(glu);
+
+    mul_mat_f8_e4m3_cutlass(ctx, (const uint8_t *) src0->data, (const float *) dst->src[2]->data, nullptr, (float *) dst->data,
+                            ncols, nrows, ntokens, ctx.stream(),
+                            (const float *) gate->data, (const float *) up->data, gate->nb[1]/sizeof(float), up->nb[1]/sizeof(float));
+#else
+    GGML_UNUSED(ctx);
+    GGML_UNUSED(glu);
+    GGML_UNUSED(dst);
+    GGML_ABORT("F8 GLU fusion needs the CUTLASS build");
+#endif // GGML_CUDA_CUTLASS
+}
+
+void ggml_cuda_mul_mat_f8(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    ggml_cuda_mul_mat_f8_check(src0, src1, dst);
 
     const int     ncols   = src0->ne[0];
     const int     nrows   = src0->ne[1];
@@ -288,7 +369,7 @@ void ggml_cuda_mul_mat_f8(ggml_backend_cuda_context & ctx, const ggml_tensor * s
     const int64_t ntokens = ggml_nrows(src1);
 
     const uint8_t * x  = (const uint8_t *) src0->data;
-    const float   * sx = (const float *)   src0_s->data;
+    const float   * sx = (const float *)   dst->src[2]->data;
     const float   * y  = (const float *)   src1->data;
     float         * d  = (float *)         dst->data;
 
@@ -300,9 +381,7 @@ void ggml_cuda_mul_mat_f8(ggml_backend_cuda_context & ctx, const ggml_tensor * s
     }
 
 #ifdef GGML_CUDA_CUTLASS
-    // GGML_CUDA_DISABLE_MMF8_CUTLASS: run the F16 fallback GEMM instead (A/B and equivalence gates)
-    static const bool cutlass_disabled = getenv("GGML_CUDA_DISABLE_MMF8_CUTLASS") != nullptr;
-    if (!cutlass_disabled && ggml_cuda_info().devices[ctx.device].cc == GGML_CUDA_CC_HOPPER && ((uintptr_t) y % 16 == 0)) {
+    if (ggml_cuda_mul_mat_f8_uses_cutlass(ctx, src0, src1) && ((uintptr_t) y % 16 == 0)) {
         mul_mat_f8_e4m3_cutlass(ctx, x, sx, y, d, ncols, nrows, ntokens, stream);
         return;
     }

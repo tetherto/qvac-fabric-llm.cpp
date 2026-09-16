@@ -6077,6 +6077,83 @@ struct test_mul_mat_f8 : public test_case {
     }
 };
 
+// an F8 FFN block: up and gate mul_mats on one activation, swiglu, down mul_mat. Exercises the fused up/gate GEMV
+// with the silu epilogue at small batch and the swiglu quantized straight into the down GEMM at large batch
+struct test_mul_mat_f8_ffn : public test_case {
+    const int64_t d_model;
+    const int64_t d_ff;
+    const int64_t m;     // tokens
+    const float   x_max; // input magnitude: the F16-activation fallback GEMM overflows past 65504 in the swiglu product
+
+    std::string vars() override {
+        return VARS_TO_STR4(d_model, d_ff, m, x_max);
+    }
+
+    double max_nmse_err() override {
+        // the GEMM paths quantize the activations of both stages to e4m3 per 128-group
+        return m <= 8 ? 5e-4 : 5e-3;
+    }
+
+    uint64_t op_flops(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return 2 * m * 3 * d_model * d_ff;
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    test_mul_mat_f8_ffn(int64_t d_model = 256, int64_t d_ff = 512, int64_t m = 1, float x_max = 1.0f)
+        : d_model(d_model), d_ff(d_ff), m(m), x_max(x_max) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d_model, m);
+        ggml_set_name(x, "x");
+        ggml_tensor * up     = ggml_new_tensor_2d(ctx, GGML_TYPE_F8_E4M3, d_model, d_ff);
+        ggml_tensor * gate   = ggml_new_tensor_2d(ctx, GGML_TYPE_F8_E4M3, d_model, d_ff);
+        ggml_tensor * down   = ggml_new_tensor_2d(ctx, GGML_TYPE_F8_E4M3, d_ff, d_model);
+        ggml_tensor * s_up   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d_ff/GGML_F8_E4M3_SCALE_BLOCK, d_model/GGML_F8_E4M3_SCALE_BLOCK);
+        ggml_tensor * s_gate = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d_ff/GGML_F8_E4M3_SCALE_BLOCK, d_model/GGML_F8_E4M3_SCALE_BLOCK);
+        ggml_tensor * s_down = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d_model/GGML_F8_E4M3_SCALE_BLOCK, d_ff/GGML_F8_E4M3_SCALE_BLOCK);
+        ggml_set_name(up, "up");
+        ggml_set_name(gate, "gate");
+        ggml_set_name(down, "down");
+        ggml_set_name(s_up, "s_up");
+        ggml_set_name(s_gate, "s_gate");
+        ggml_set_name(s_down, "s_down");
+
+        ggml_tensor * u = ggml_mul_mat_blockscaled(ctx, up, s_up, x);
+        ggml_tensor * g = ggml_mul_mat_blockscaled(ctx, gate, s_gate, x);
+        ggml_tensor * h = ggml_swiglu_split(ctx, g, u);
+        ggml_tensor * out = ggml_mul_mat_blockscaled(ctx, down, s_down, h);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        std::default_random_engine rng(42);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type == GGML_TYPE_F8_E4M3) {
+                // exponent field <= 10 keeps |w| <= 8; no NaN encodings
+                std::uniform_int_distribution<int> dist(0, 255);
+                std::vector<uint8_t> data(ggml_nelements(t));
+                for (size_t i = 0; i < data.size(); i++) {
+                    const uint8_t v = (uint8_t) dist(rng);
+                    data[i] = (v & 0x80) | (v & 0x7F) % 0x58;
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size());
+            } else if (strncmp(t->name, "s_", 2) == 0) {
+                init_tensor_uniform(t, 0.5f, 2.0f);
+            } else {
+                init_tensor_uniform(t, -x_max, x_max);
+            }
+        }
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MUL_MAT_F8_FFN";
+    }
+};
+
 // GGML_HINT_SRC0_IS_HADAMARD
 struct test_mul_mat_hadamard : public test_mul_mat {
     test_mul_mat_hadamard(ggml_type type_a = GGML_TYPE_F32, ggml_type type_b = GGML_TYPE_F32,
@@ -11242,7 +11319,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_sigmoid_back());
 
     for (float eps : { 0.0f, 1e-6f, 1e-4f, 1e-1f, 10.f }) {
-        for (uint32_t n : { 64, 1025 }) {
+        for (uint32_t n : { 64, 128, 256, 1025 }) {
             for (bool v : { false, true }) {
                 test_cases.emplace_back(new test_norm(GGML_TYPE_F32, { n, 5, 4, 3 }, v, eps));
                 test_cases.emplace_back(new test_rms_norm(GGML_TYPE_F32, { n, 5, 4, 3 }, v, eps));
@@ -11271,7 +11348,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_rms_norm(GGML_TYPE_F32, {64, 5, 4, 3}, false, 1e-6f, true));
 
     for (float eps : { 0.0f, 1e-6f, 1e-4f, 1e-1f, 1.0f }) {
-        for (uint32_t n : { 64, 1025 }) {
+        for (uint32_t n : { 64, 128, 256, 1025 }) {
             test_cases.emplace_back(new test_rms_norm_mul_add(GGML_TYPE_F32, { n, 5, 4, 3 }, eps, false));
             test_cases.emplace_back(new test_rms_norm_mul_add(GGML_TYPE_F32, { n, 5, 4, 3 }, eps, true));
             test_cases.emplace_back(new test_norm_mul_add(GGML_TYPE_F32, { n, 5, 4, 3 }, eps, false));
@@ -11479,6 +11556,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // an output head: more rows than a CUDA grid dimension holds (65535), both the GEMV and the GEMM paths
     for (int64_t m : {1, 64}) {
         test_cases.emplace_back(new test_mul_mat_f8(256, 66048, m));
+    }
+    // an F8 FFN block (up, gate, swiglu, down): the fused up/gate GEMV at m <= 4, the swiglu quantized into the down
+    // GEMM's input at m > 8 on the CUTLASS route
+    for (int64_t m : {1, 2, 4, 8, 9, 64, 4096}) {
+        test_cases.emplace_back(new test_mul_mat_f8_ffn(256, 512, m));
+    }
+    for (int64_t m : {1, 4, 64}) {
+        test_cases.emplace_back(new test_mul_mat_f8_ffn(5120, 17408, m, 0.01f));
     }
 
     for (ggml_type type_a : all_types) {
@@ -13039,6 +13124,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     for (int64_t m : {1, 4096}) {
         test_cases.emplace_back(new test_mul_mat_f8(5120, 17408, m));
         test_cases.emplace_back(new test_mul_mat_f8(17408, 5120, m));
+    }
+    for (int64_t m : {1, 4096}) {
+        test_cases.emplace_back(new test_mul_mat_f8_ffn(5120, 17408, m, 0.01f));
     }
 
     // qwen3-30b-a3b

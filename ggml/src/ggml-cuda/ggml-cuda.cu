@@ -4463,6 +4463,26 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
 
+    // swiglu(gate, up) consumed only by an F8 mul_mat on the CUTLASS route: the product is quantized straight into the
+    // GEMM's e4m3 input. No memory-range check: the only kernel reading gate and up writes pool buffers, and the GEMM
+    // writing dst runs after it on the same stream
+    if (node->op == GGML_OP_GLU && i + 1 < cgraph->n_nodes) {
+        ggml_tensor * mm = cgraph->nodes[i + 1];
+        const ggml_tensor * gate = node->src[0];
+        const ggml_tensor * up   = node->src[1];
+        if (mm->op == GGML_OP_MUL_MAT && mm->src[1] == node && mm->src[0]->type == GGML_TYPE_F8_E4M3 && mm->src[2] != nullptr &&
+            ggml_get_glu_op(node) == GGML_GLU_OP_SWIGLU && up != nullptr && ggml_get_op_params_i32(node, 1) == 0 &&
+            node->type == GGML_TYPE_F32 && gate->type == GGML_TYPE_F32 && up->type == GGML_TYPE_F32 &&
+            ggml_is_contiguous(node) && ggml_is_contiguous(gate) && ggml_is_contiguous(up) &&
+            ggml_nrows(gate) == ggml_nrows(node) && ggml_nrows(up) == ggml_nrows(node) &&
+            (uintptr_t) gate->data % 16 == 0 && (uintptr_t) up->data % 16 == 0 && gate->nb[1] % 16 == 0 && up->nb[1] % 16 == 0 &&
+            ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_GLU, GGML_OP_MUL_MAT }, { i + 1 }) &&
+            ggml_cuda_mul_mat_f8_uses_cutlass(*cuda_ctx, mm->src[0], node)) {
+            ggml_cuda_mul_mat_f8_glu_cutlass(*cuda_ctx, node, mm);
+            return 1;
+        }
+    }
+
     // gated delta net gate projections at small batch: alpha mul_mat -> add(dt_bias) -> softplus -> mul(a) and
     // beta mul_mat (same input) -> sigmoid, with the builder's views in between, one launch for all of it
     if (node->op == GGML_OP_MUL_MAT) {
