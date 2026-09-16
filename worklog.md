@@ -1498,6 +1498,24 @@ DeepGEMM, FlashInfer GDN, separate-state SSM, compressed-QSA, and CPU PLE
 configuration. Its five samples were 8135.07, 8002.82, 8175.57, 8269.60, and
 8229.36 tok/s; the warmed last-three mean is **8224.84 tok/s** at 1.2159 s.
 
+This aggregate must not be confused with one depth-zero PP2048 operation. A
+current-branch reproduction of `-p 2048 -b 2048 -ub 2048 -r 5` produced one
+cold sample at 2766.39 tok/s followed by 9989.84, 10075.70, 10102.20, and
+10145.90 tok/s, a **10078.41 tok/s** warmed mean. Five copies of its 203.2 ms
+steady latency would total about 1.016 s, while the actual 10K run takes
+1.216 s. The roughly 200 ms difference is context-dependent work accumulated
+by later chunks, principally the QSA selection/sparse-attention path; MoE and
+recurrent work do not scale with resident attention context in the same way.
+
+The matching SGLang depth-zero PP2048 run used exactly one 2,048-token extend
+per repetition. After its separate cold warmup, the five measurements were
+11271.77, 11531.03, 11560.28, 11570.11, and 11577.69 tok/s: **11502.18 tok/s
+mean** and **11560.28 tok/s median**. Against llama.cpp's current 10078.41
+tok/s warmed mean, the depth-zero gap is only about **14-15%**. The much larger
+PP10000 difference therefore develops with resident context and points to the
+QSA selection/sort/sparse-attention pipeline rather than the context-independent
+MoE or recurrent prefill work.
+
 SGLang uses the HF FP8 checkpoint, TP=2, EP=2, FA3, and its FlashInfer GDN
 prefill path. The cache was explicitly limited to one 16K request with
 `--mem-fraction-static 0.95 --max-running-requests 1 --max-total-tokens 16384`
@@ -1508,12 +1526,27 @@ its five samples were 31364.13, 31412.05, 31302.68, 31405.51, and 31405.17
 tok/s: **31377.91 tok/s mean**, **31405.17 tok/s median**, and 318.70 ms mean
 latency.
 
-Therefore SGLang really exceeds 20k tok/s for this clean prompt: it reaches
-about **31.4k tok/s**, or **3.82x** the current llama.cpp `-ub 2048` steady
-throughput. This is a depth-zero prompt result and must not be conflated with
-the earlier PP2048 extension measured after a resident 32K context.
+This 31.4k tok/s result is useful as SGLang's one-shot 10K shape, but it is not
+an ubatch-2048 comparison. The stock one-batch benchmark calls
+`model_runner.extend(reqs)` directly, bypassing the scheduler, so adding
+`--chunked-prefill-size 2048` alone does not split the request.
+
+A wrapper therefore forced the same state-preserving chunk sequence as the
+llama.cpp run: 2048 + 2048 + 2048 + 2048 + 1808 tokens. After one excluded
+cold warmup, SGLang produced 10871.48, 10949.71, 11024.97, 11052.93, and
+11032.90 tok/s: **10986.40 tok/s mean**, **11024.97 tok/s median**, and
+910.25 ms mean total latency. This is **1.34x** llama.cpp's warmed 8224.84
+tok/s, rather than the unmatched one-shot result's 3.82x. Forcing 2K chunks
+reduces SGLang throughput by about 65% relative to its single 10K extend.
+
+These are depth-zero prompt results and must not be conflated with the earlier
+PP2048 extension measured after a resident 32K context.
 
 Raw files:
 
 - `/home/aman/qwen4-exp-opt-bench-20260911/results/prefill-10k-ub2048-20260916/llama-pp10000-ub2048-r5.jsonl`
+- `/home/aman/qwen4-exp-opt-bench-20260911/results/prefill-10k-ub2048-20260916/llama-pp2048-current-r5.jsonl`
+- `/home/aman/qwen4-exp-opt-bench-20260911/results/prefill-10k-ub2048-20260916/sglang-pp2048-r5.jsonl`
 - `/home/aman/qwen4-exp-opt-bench-20260911/results/prefill-10k-ub2048-20260916/sglang-pp10000-r5.jsonl`
+- `/home/aman/qwen4-exp-opt-bench-20260911/results/prefill-10k-ub2048-20260916/sglang-pp10000-chunk2048-r5.jsonl`
+- `/home/aman/qwen4-exp-opt-bench-20260911/results/prefill-10k-ub2048-20260916/sglang_chunked_prefill_bench.py`
