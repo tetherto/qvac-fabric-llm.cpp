@@ -7257,7 +7257,7 @@ struct test_out_prod : public test_case {
     }
 
     double max_nmse_err() override {
-        return 5e-4;
+        return type_a == GGML_TYPE_F32 && type_b == GGML_TYPE_F32 && k == 1 ? 1e-7 : 5e-4;
     }
 
     test_out_prod(ggml_type type_a = GGML_TYPE_F32, ggml_type type_b = GGML_TYPE_F32,
@@ -13483,6 +13483,27 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         for (ggml_type type_b : {GGML_TYPE_F32, GGML_TYPE_F16}) {
             test_cases.emplace_back(new test_out_prod(type_a, type_b, 1024, 128, 151936, {1, 1}, {1, 1}));
             test_cases.emplace_back(new test_out_prod(type_a, type_b, 3072, 128, 1024, {1, 1}, {1, 1}));
+        }
+    }
+
+    test_cases.emplace_back(new test_out_prod(GGML_TYPE_F32, GGML_TYPE_F32,
+                                              2097152, 1, 1, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_out_prod(GGML_TYPE_F32, GGML_TYPE_F32,
+                                              1, 2097152, 1, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_out_prod(GGML_TYPE_F32, GGML_TYPE_F32,
+                                              1, 1, 1, {256, 256}, {1, 1}));
+
+    for (int64_t rows : {31, 32, 33, 65, 256}) {
+        for (bool trans_b : {false, true}) {
+            test_cases.emplace_back(new test_out_prod(GGML_TYPE_Q8_0, GGML_TYPE_F32,
+                                                      32, rows, 65536, {1, 1}, {1, 1}, trans_b));
+        }
+    }
+
+    for (ggml_type type_a : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_Q4_0, GGML_TYPE_TQ2_0}) {
+        for (bool trans_b : {false, true}) {
+            test_cases.emplace_back(new test_out_prod(type_a, GGML_TYPE_F32,
+                                                      256, 33, 65536, {1, 1}, {1, 1}, trans_b));
         }
     }
 

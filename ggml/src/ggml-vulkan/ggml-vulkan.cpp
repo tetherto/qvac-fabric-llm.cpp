@@ -6694,6 +6694,63 @@ void ggml_vk_ctx_begin(vk_device& device, vk_context& subctx) {
     }
 }
 
+template <typename T, typename SetPcRowOffsetFun>
+static void ggml_vk_dispatch_rows_chunked(ggml_backend_vk_context* ctx,
+                                          vk_context& subctx,
+                                          vk_pipeline& pipeline,
+                                          const std::array<uint32_t, 3>& elements,
+                                          uint32_t chunk_count,
+                                          T &push_constants,
+                                          std::initializer_list<vk::DescriptorBufferInfo> const& descriptor_buffer_infos,
+                                          SetPcRowOffsetFun&& set_row_offset) {
+
+    std::lock_guard<std::recursive_mutex> guard(ctx->device->mutex);
+
+    const auto wait_for_submission = [&]() {
+        VK_CHECK(ctx->device->device.waitForFences({ ctx->device->fence }, true, UINT64_MAX),
+                    "dispatch_rows_chunked waitForFences", ctx->device);
+        ctx->device->device.resetFences({ ctx->device->fence });
+    };
+
+    if (!subctx->in_memcpys.empty() || !subctx->memsets.empty()) {
+        if (ctx->device->async_use_transfer_queue) {
+            ctx->device->transfer_queue->handle->submit({}, ctx->device->fence);
+            wait_for_submission();
+        }
+        subctx->p->q->handle->submit({}, ctx->device->fence);
+        wait_for_submission();
+    }
+
+    const auto submit_chunk = [&](const bool wait) {
+        ggml_vk_ctx_end(subctx);
+        for (auto& cpy : subctx->in_memcpys) {
+            memcpy(cpy.dst, cpy.src, cpy.n);
+        }
+        subctx->in_memcpys.clear();
+        for (auto& mset : subctx->memsets) {
+            memset(mset.dst, mset.val, mset.n);
+        }
+        subctx->memsets.clear();
+        if (wait) {
+            ggml_vk_submit(subctx, ctx->device->fence);
+            wait_for_submission();
+        } else {
+            ggml_vk_submit(subctx, {});
+            ctx->submit_pending = true;
+        }
+        ggml_vk_ctx_begin(ctx->device, subctx);
+    };
+
+    submit_chunk(false);
+    for (uint32_t chunk = 0; chunk < chunk_count; ++chunk) {
+        const uint32_t row_offset = chunk * 32;
+        set_row_offset(push_constants, row_offset);
+        ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, descriptor_buffer_infos, push_constants, elements);
+        submit_chunk((chunk + 1) == chunk_count);
+    }
+    return;
+}
+
 vk_context ggml_vk_get_compute_ctx(ggml_backend_vk_context * ctx) {
     vk_context result;
     if (!ctx->compute_ctx.expired()) {
@@ -10563,8 +10620,13 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
         }
     case GGML_OP_OUT_PROD:
         // Use a tiled shader for AMD RADV on embedded GPUs to avoid VK_ERROR_DEVICE_LOST due to slow threads.
-        if (ctx->device->uma && ctx->device->driver_id == vk::DriverId::eMesaRadv &&
-            src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
+        if (ctx->device->uma &&
+            (ctx->device->driver_id == vk::DriverId::eMesaRadv ||
+             ctx->device->architecture == vk_device_architecture::QUALCOMM_ADRENO) &&
+            src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
+            CEIL_DIV(dst->ne[0], 32) <= ctx->device->properties.limits.maxComputeWorkGroupCount[0] &&
+            CEIL_DIV(dst->ne[1], 32) <= ctx->device->properties.limits.maxComputeWorkGroupCount[1] &&
+            dst->ne[2] * dst->ne[3] <= ctx->device->properties.limits.maxComputeWorkGroupCount[2]) {
             if (src0->type == GGML_TYPE_F32) return ctx->device->pipeline_out_prod_tiled_f32;
             if (src0->type == GGML_TYPE_F16) return ctx->device->pipeline_out_prod_tiled_f16_f32;
             if (src0->type == GGML_TYPE_Q4_0) return ctx->device->pipeline_out_prod_tiled_q4_0;
@@ -11002,7 +11064,16 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
         GGML_ABORT("fatal error");
     }
 
-    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+    const bool split_out_prod = op == GGML_OP_OUT_PROD &&
+        (pipeline == ctx->device->pipeline_out_prod_tiled_f32 ||
+         pipeline == ctx->device->pipeline_out_prod_tiled_f16_f32 ||
+         pipeline == ctx->device->pipeline_out_prod_tiled_q4_0 ||
+         pipeline == ctx->device->pipeline_out_prod_tiled_q8_0 ||
+         pipeline == ctx->device->pipeline_out_prod_tiled_tq2_0) &&
+        ctx->device->architecture == vk_device_architecture::QUALCOMM_ADRENO &&
+        ne01 >= 65536 && dst->ne[1] > 32 && dst->ne[2] == 1 && dst->ne[3] == 1;
+    const uint32_t out_prod_chunks = split_out_prod ? CEIL_DIV(dst->ne[1], 32) : 1;
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, out_prod_chunks);
 
     vk_subbuffer src0_buf = ggml_vk_tensor_subbuffer(ctx, src0, true);
     vk_subbuffer src1_buf = use_src1 ? ggml_vk_tensor_subbuffer(ctx, src1, true) : vk_subbuffer{};
@@ -11418,6 +11489,13 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
     } else if (use_src2) {
         ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { src0_buf, src1_buf, src2_buf, dst_buf }, pc, elements);
     } else if (use_src1) {
+        if constexpr (std::is_same_v<PC, vk_op_binary_push_constants>) {
+            if (split_out_prod) {
+                ggml_vk_dispatch_rows_chunked(ctx, subctx, pipeline, { elements[0], 1, 1 }, out_prod_chunks, pc, { src0_buf, src1_buf, dst_buf },
+                    [](auto& pc, uint32_t row_offset){ memcpy(&pc.param1, &row_offset, sizeof(row_offset)); });
+                return;
+            }
+        }
         ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { src0_buf, src1_buf, dst_buf }, pc, elements);
     } else {
         ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { src0_buf, dst_buf }, pc, elements);

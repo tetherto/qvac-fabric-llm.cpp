@@ -17,7 +17,7 @@ shared FLOAT_TYPE Bsub[TILE][TILE];
 void main()
 {
     const uint col = gl_GlobalInvocationID.x;
-    const uint row = gl_GlobalInvocationID.y;
+    const uint row = gl_GlobalInvocationID.y + floatBitsToUint(p.param1);
     const uint rest = gl_GlobalInvocationID.z;
     const uint K = p.ne01;
     const uint M = p.ne00;
