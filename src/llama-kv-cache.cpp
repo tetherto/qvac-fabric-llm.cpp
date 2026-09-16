@@ -1549,7 +1549,7 @@ ggml_tensor * llama_kv_cache::get_k_lora(ggml_context * ctx, ggml_tensor * k_cur
     GGML_UNUSED(sinfo);
 
     // Training always uses a single unified stream, so sinfo.s0 is always 0
-    // There is no cached "past" for a different stream to concatenate, so 
+    // There is no cached "past" for a different stream to concatenate, so
     // k_cur is the full, correct, gradient-connected tensor.
     return k_cur;
 }
