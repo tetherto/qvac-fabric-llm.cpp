@@ -5195,6 +5195,7 @@ struct test_repacked_mul_mat : public test_case {
 };
 
 struct test_cutlass_mul_mat : public test_repacked_mul_mat {
+    const bool unaligned_input;
     ggml_tensor * pair_output = nullptr;
     std::vector<uint8_t> weight_data;
     bool transfer_ok = true;
@@ -5203,8 +5204,12 @@ struct test_cutlass_mul_mat : public test_repacked_mul_mat {
         return 4;
     }
 
-    test_cutlass_mul_mat(ggml_type type, int64_t m, int64_t n, int64_t k) :
-        test_repacked_mul_mat(type, m, n, k) {
+    test_cutlass_mul_mat(ggml_type type, int64_t m, int64_t n, int64_t k, bool unaligned_input = false) :
+        test_repacked_mul_mat(type, m, n, k), unaligned_input(unaligned_input) {
+    }
+
+    std::string vars() override {
+        return test_repacked_mul_mat::vars() + "," + VAR_TO_STR(unaligned_input);
     }
 
     std::string op_desc(ggml_tensor * t) override {
@@ -5377,7 +5382,15 @@ struct test_cutlass_mul_mat : public test_repacked_mul_mat {
         ggml_set_name(weight_copy, "weight_copy");
         ggml_set_name(weight_alias, "weight_alias");
 
-        ggml_tensor * input = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
+        ggml_tensor * input;
+        if (unaligned_input) {
+            ggml_tensor * storage = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, k * n + 1);
+            ggml_set_name(storage, "input_storage");
+            // Contiguous, but only four-byte aligned: vector loads must handle this view.
+            input = ggml_view_2d(ctx, storage, k, n, k * sizeof(float), sizeof(float));
+        } else {
+            input = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
+        }
         ggml_set_name(input, "input");
         ggml_tensor * native = ggml_mul_mat(ctx, weight_native, input);
         ggml_tensor * repacked = ggml_mul_mat(ctx, weight_alias, input);
@@ -12324,6 +12337,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_cutlass_mul_mat(type, 260, 256, 576));
         test_cases.emplace_back(new test_cutlass_mul_mat(type, 257, 256, 576));
         test_cases.emplace_back(new test_cutlass_mul_mat(type, 257, 1, 576));
+        if (type == GGML_TYPE_MXFP4) {
+            test_cases.emplace_back(new test_cutlass_mul_mat(type, 260, 65, 576, true));
+        }
         if (type == GGML_TYPE_NVFP4) {
             test_cases.emplace_back(new test_cutlass_mul_mat(type, 260, 65, 64));
             test_cases.emplace_back(new test_cutlass_mul_mat(type, 260, 129, 576));
