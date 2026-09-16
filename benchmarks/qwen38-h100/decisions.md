@@ -107,7 +107,7 @@ After C2's first server run (measured while the other GPU ran an A/B) disagreed 
 
 Options:
 - (a) Keep the F16 fallback GEMM as the default and the W8A8 GEMM opt-in (the F2/F4 state: the W8A8 build failed the equivalence gate against the fallback build's logits).
-- (b) Make the W8A8 GEMM the default (`GGML_CUDA_CUTLASS=ON` in the campaign build) and re-register the gate against the fallback FP8 logits with a threshold that admits the per-token activation quantization (G2: Same top p >= 98.0%, Mean KLD <= 0.006).
+- (b) Make the W8A8 GEMM the default (`GGML_CUDA_CUTLASS=ON` in the campaign build) under a user-authorized relaxed gate against the fallback FP8 logits (G2: Same top p >= 98.0%, Mean KLD <= 0.006), with the limits set around F2's measured 98.03% / 0.005892. Whether SGLang/vLLM serve this checkpoint with an identical activation quantizer was not verified (the checkpoint config is no longer on the host), so G2 is an F2-vs-fallback tolerance, not a claim of vendor equivalence.
 
 Taken: (b), the user's decision for campaign 2 (prefill is the larger gap and the fallback GEMM already runs at 76% of the H100 F16 peak, so the W8A8 tensor-core rate is the only way to a 10k prompt above 10k tok/s). G2 measured 98.018% / 0.005949, inside the registered limits by a small margin. Every later equivalence gate (G1) is measured with `GGML_CUDA_DISABLE_MMF8_CUTLASS=1` on both sides, because the W8A8 rounding re-rolls on any upstream change of about 1e-4 and a W8A8-vs-W8A8 KLD near 0.01 is not a signal (decision recorded in the B1 ledger entry).
 

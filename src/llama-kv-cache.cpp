@@ -1391,6 +1391,9 @@ uint32_t llama_kv_cache::get_n_kv_used(const slot_info & sinfo, const llama_ubat
     }
 
     // one sequence across the ubatch
+    if (ubatch.seq_id == nullptr || ubatch.n_seq_id[0] != 1) {
+        return 0;
+    }
     const llama_seq_id seq_id = ubatch.seq_id[0][0];
     for (uint32_t i = 0; i < n_tokens; ++i) {
         if (ubatch.n_seq_id[i] != 1 || ubatch.seq_id[i][0] != seq_id) {
