@@ -123,14 +123,14 @@ launch_op_ssm_conv_back_c(const void * data_grad,
 
 __host__ void
 ggml_cuda_op_ssm_conv_back_sx(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
-    
+
     const ggml_tensor * grad_out = dst->src[0];
     const ggml_tensor * c        = dst->src[1];
 
     const void * data_grad = grad_out->data;
     const void * data_c    = c->data;
           void * data_dst  = dst->data;
-    
+
     constexpr const auto fsz = static_cast<uint32_t>(sizeof(float));
 
     GGML_ASSERT(dst->type == GGML_TYPE_F32);
@@ -164,14 +164,14 @@ ggml_cuda_op_ssm_conv_back_sx(ggml_backend_cuda_context & ctx, ggml_tensor * dst
 
 __host__ void
 ggml_cuda_op_ssm_conv_back_c(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
-    
+
     const ggml_tensor * grad_out = dst->src[0];
     const ggml_tensor * sx       = dst->src[1];
 
     const void * data_grad = grad_out->data;
     const void * data_sx    = sx->data;
           void * data_dst  = dst->data;
-    
+
     constexpr const auto fsz = static_cast<uint32_t>(sizeof(float));
 
     GGML_ASSERT(dst->type == GGML_TYPE_F32);

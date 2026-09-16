@@ -266,7 +266,7 @@ class MiniCPMV4_7VisionModel(MiniCPMV4_6VisionModel):
             assert tokenizer is not None
             ids = []
             for text in self.tok_embd_sep:
-                tok = tokenizer.encode(text, add_special_tokens=False)
+                tok = tokenizer.encode(text, add_special_tokens=False)  # ty: ignore[unresolved-attribute]
                 if len(tok) != 1:
                     raise ValueError(f"separator {text!r} must be a single token, got {tok}")
                 ids.append(tok[0])
