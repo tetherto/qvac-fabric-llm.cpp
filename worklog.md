@@ -1550,3 +1550,55 @@ Raw files:
 - `/home/aman/qwen4-exp-opt-bench-20260911/results/prefill-10k-ub2048-20260916/sglang-pp10000-r5.jsonl`
 - `/home/aman/qwen4-exp-opt-bench-20260911/results/prefill-10k-ub2048-20260916/sglang-pp10000-chunk2048-r5.jsonl`
 - `/home/aman/qwen4-exp-opt-bench-20260911/results/prefill-10k-ub2048-20260916/sglang_chunked_prefill_bench.py`
+
+## 2026-09-16: specialized Hopper QSA sparse-GQA kernel
+
+SGLang's late-prefill QSA kernel uses one Triton program (one warp) per
+query/KV-head pair, directly gathers the selected K/V rows, and fuses QK,
+online softmax, and PV. At the 1808-new-token, 8192-resident shape its
+`_sparse_gqa_chunk_prefill` kernel took 13.680 ms over 24 layer/device calls,
+or **570 us per call**. The matching generic llama.cpp indexed
+FlashAttention kernel took 47.692 ms over 24 calls, or **1.987 ms per call**.
+
+A native CUDA specialization now mirrors that schedule for the exact
+Qwen4-Exp geometry: D=256, GQA ratio 12, F32 Q, F16 K/V, F16 causal mask,
+precomputed I32 sparse indices, and Hopper. One warp owns one query/KV-head
+pair. The 12 query heads are padded to a 16-row WMMA tile; 32 selected tokens
+are processed per iteration with fused QK, base-2 online softmax, and PV.
+Each scattered K/V row is copied as 32 contiguous 16-byte lane segments using
+`cp.async`, so all 12 query heads reuse the gathered row. Set
+`GGML_CUDA_QSA_FATTN=1` to enable it; it is deliberately opt-in while it does
+not yet beat the generic fallback.
+
+The exact direct-sparse backend case (D=256, 24 Q heads, 2 KV heads, KV=8192,
+64 queries, budget=512) passes against the CPU reference on an H100. Tuning
+results on the full FP8 model's late 1808-token chunk were:
+
+| specialized variant | steady PP throughput |
+| --- | ---: |
+| scalar K/V gather, tile 16 | about 4.84k tok/s |
+| vector K/V gather, tile 16 | about 7.50k tok/s |
+| vector K/V gather, tile 32 | about 7.82k tok/s |
+| vector K/V gather, tile 64 | about 7.01k tok/s |
+| `cp.async` K/V gather, tile 32 | **8.37k tok/s** |
+| generic indexed fallback | about **8.6k tok/s** |
+
+The synchronous vector-gather tile-16 kernel itself took about 4.508 ms per
+layer/device call, down from 15.529 ms for the scalar first version. Async
+gather closes most of the end-to-end gap, but the native path remains about
+3% behind the existing generic path and well behind SGLang's kernel latency.
+The next useful kernel-level attack is genuine two-stage K/V gather/MMA
+overlap rather than a larger tile; tile 64 lost too much occupancy.
+
+The temporary direct-causal-mask graph shortcut was removed. It showed no
+reliable end-to-end gain and would change the non-flash fallback semantics,
+where sparse indices are not consumed. Temporary `llama-bench` CUDA-profiler
+hooks were also removed before the checkpoint.
+
+Artifacts:
+
+- `/home/aman/qwen4-exp-opt-bench-20260911/results/prefill-10k-ub2048-20260916/llama-pp1808-at-d8192-qsa-specialized-vec16.nsys-rep`
+- `/home/aman/qwen4-exp-opt-bench-20260911/results/prefill-10k-ub2048-20260916/llama-pp1808-at-d8192-qsa-specialized-vec32-r5.jsonl`
+- `/home/aman/qwen4-exp-opt-bench-20260911/results/prefill-10k-ub2048-20260916/llama-pp1808-at-d8192-qsa-specialized-vec64-r5.jsonl`
+- `/home/aman/qwen4-exp-opt-bench-20260911/results/prefill-10k-ub2048-20260916/llama-pp1808-at-d8192-qsa-specialized-cpasync32-r5.jsonl`
+- `/home/aman/qwen4-exp-opt-bench-20260911/results/prefill-10k-ub2048-20260916/llama-pp1808-at-d8192-qsa-specialized-final-r5.jsonl`

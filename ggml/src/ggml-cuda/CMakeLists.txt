@@ -102,7 +102,7 @@ if (CUDAToolkit_FOUND)
     file(GLOB   GGML_HEADERS_CUDA "*.cuh")
     list(APPEND GGML_HEADERS_CUDA "../../include/ggml-cuda.h")
 
-    file(GLOB   GGML_SOURCES_CUDA "*.cu")
+    file(GLOB   GGML_SOURCES_CUDA CONFIGURE_DEPENDS "*.cu")
     # DeepGEMM kernels require the SM90a architecture target and are compiled
     # in a dedicated object library below when explicitly enabled.
     list(FILTER GGML_SOURCES_CUDA EXCLUDE REGEX "/deepgemm-mmid\\.cu$")
