@@ -151,3 +151,7 @@ Options:
 - (b) One thread per channel for one sequence at batch <= 8: every thread reads its channel's state and token values into registers before writing the conv input row and the next state row.
 
 Taken: (b). The state cache is both read (the gathered row) and written (the updated row) by the fused op; with one sequence the rows are the same or disjoint per channel and the read-before-write order inside a thread makes the in-place update safe, while with several sequences a thread could overwrite a row another thread is still gathering (a forked sequence reading the slot another one updates), and a per-channel loop over thousands of prefill tokens is uncoalesced. Multi-sequence and prefill batches keep the get_rows / concat / cpy launches; the existing `ggml_cuda_check_fusion_memory_ranges` would reject every match here (the cache view is outside the run), so the conv input's disjointness from the inputs is checked directly and the cache aliasing is what the thread design covers.
+
+## 23. Campaign-3 GPU roles
+
+User decision (2026-09-16): both GPUs work at the same time. GPU 5 runs the timing (llama-bench A/B/A/B, nsys, `test-backend-ops perf`); GPU 4 runs the gates and correctness (`test-backend-ops test`, KL gates). The interleaved A/B/A/B absorbs slow drifts from the concurrent load, and every timing line in the ledger records the host load average. The server sync point keeps decision 15: one GPU, host otherwise idle.
