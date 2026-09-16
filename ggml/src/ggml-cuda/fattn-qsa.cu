@@ -6,6 +6,10 @@
 #include <cstdlib>
 #include <cstring>
 
+#if defined(__linux__) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+#    include <dlfcn.h>
+#endif
+
 namespace wmma = nvcuda::wmma;
 
 namespace {
@@ -16,6 +20,94 @@ constexpr int   QSA_BLOCK_M  = 16;
 constexpr int   QSA_BLOCK_N  = 32;
 constexpr int   QSA_D_TILES  = QSA_HEAD_DIM / 16;
 constexpr float LOG2E_F      = 1.4426950408889634f;
+
+constexpr int QSA_TRITON_SHARED = 24640;
+
+constexpr int          QSA_TRITON_VARIANTS                          = 2;
+constexpr int          QSA_TRITON_TOP_K[QSA_TRITON_VARIANTS]        = { 2048, 2051 };
+constexpr const char * QSA_TRITON_CUBIN_SYMBOL[QSA_TRITON_VARIANTS] = {
+    "qsa_ggml_c8f6d621_0d1d2d3d4d_cubin",
+    "qsa_ggml_36391803_0d1d2d3d4d_cubin",
+};
+
+#if defined(__linux__) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+struct qsa_triton_aot_state {
+    void *       handle                                                = nullptr;
+    const void * cubins[QSA_TRITON_VARIANTS]                           = {};
+    CUmodule     modules[QSA_TRITON_VARIANTS][GGML_CUDA_MAX_DEVICES]   = {};
+    CUfunction   functions[QSA_TRITON_VARIANTS][GGML_CUDA_MAX_DEVICES] = {};
+    std::mutex   mutex;
+
+    qsa_triton_aot_state() {
+        const char * path = std::getenv("GGML_CUDA_QSA_TRITON_LIB");
+        if (path == nullptr || path[0] == '\0') {
+            return;
+        }
+
+        handle = dlopen(path, RTLD_NOW | RTLD_LOCAL);
+        if (handle == nullptr) {
+            std::fprintf(stderr, "ggml_cuda: failed to load QSA Triton AOT library %s: %s\n", path, dlerror());
+            return;
+        }
+
+        int found = 0;
+        for (int variant = 0; variant < QSA_TRITON_VARIANTS; ++variant) {
+            cubins[variant] = dlsym(handle, QSA_TRITON_CUBIN_SYMBOL[variant]);
+            found += cubins[variant] != nullptr;
+        }
+        if (found == 0) {
+            std::fprintf(stderr, "ggml_cuda: QSA Triton AOT library contains no supported cubin\n");
+            return;
+        }
+
+        std::fprintf(stderr, "ggml_cuda: using Triton SM90 QSA AOT from %s (%s%s)\n", path,
+                     cubins[0] != nullptr ? "top-k 2048" : "",
+                     cubins[1] != nullptr ? (cubins[0] != nullptr ? ", top-k 2051" : "top-k 2051") : "");
+    }
+};
+
+static qsa_triton_aot_state & qsa_triton_state() {
+    static qsa_triton_aot_state state;
+    return state;
+}
+
+static void qsa_cu_check(CUresult result, const char * operation) {
+    if (result == CUDA_SUCCESS) {
+        return;
+    }
+
+    const char * name = nullptr;
+    const char * text = nullptr;
+    cuGetErrorName(result, &name);
+    cuGetErrorString(result, &text);
+    GGML_ABORT("%s failed: %s (%s)", operation, name != nullptr ? name : "unknown", text != nullptr ? text : "unknown");
+}
+
+static int qsa_triton_variant(int n_kv_max) {
+    for (int variant = 0; variant < QSA_TRITON_VARIANTS; ++variant) {
+        if (QSA_TRITON_TOP_K[variant] == n_kv_max) {
+            return variant;
+        }
+    }
+    return -1;
+}
+
+static CUfunction qsa_triton_function(int device, int variant) {
+    qsa_triton_aot_state & state = qsa_triton_state();
+    if (variant < 0 || state.cubins[variant] == nullptr) {
+        return nullptr;
+    }
+
+    std::lock_guard<std::mutex> lock(state.mutex);
+    if (state.functions[variant][device] == nullptr) {
+        qsa_cu_check(cuModuleLoadData(&state.modules[variant][device], state.cubins[variant]),
+                     "cuModuleLoadData(qsa_ggml)");
+        qsa_cu_check(cuModuleGetFunction(&state.functions[variant][device], state.modules[variant][device], "qsa_ggml"),
+                     "cuModuleGetFunction(qsa_ggml)");
+    }
+    return state.functions[variant][device];
+}
+#endif
 
 static __device__ __forceinline__ float qsa_warp_max(float value) {
 #pragma unroll
@@ -259,9 +351,99 @@ static bool qsa_runtime_enabled() {
     return enabled;
 }
 
+static bool qsa_triton_supported(const int device, const ggml_tensor * dst) {
+#if defined(__linux__) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    if (dst == nullptr || qsa_triton_state().handle == nullptr ||
+        ggml_cuda_info().devices[device].cc != GGML_CUDA_CC_HOPPER) {
+        return false;
+    }
+
+    const char * block_top_k = std::getenv("LLAMA_QSA_BLOCK_TOPK");
+    if (block_top_k == nullptr || block_top_k[0] == '\0' || std::strcmp(block_top_k, "0") == 0) {
+        return false;
+    }
+
+    const ggml_tensor * q       = dst->src[0];
+    const ggml_tensor * k       = dst->src[1];
+    const ggml_tensor * v       = dst->src[2];
+    const ggml_tensor * mask    = dst->src[3];
+    const ggml_tensor * sinks   = dst->src[4];
+    const ggml_tensor * indices = dst->src[5];
+    if (q == nullptr || k == nullptr || v == nullptr || mask == nullptr || indices == nullptr || sinks != nullptr) {
+        return false;
+    }
+
+    float scale         = 0.0f;
+    float max_bias      = 0.0f;
+    float logit_softcap = 0.0f;
+    memcpy(&scale, (const float *) dst->op_params, sizeof(float));
+    memcpy(&max_bias, (const float *) dst->op_params + 1, sizeof(float));
+    memcpy(&logit_softcap, (const float *) dst->op_params + 2, sizeof(float));
+    const int32_t n_kv_max = ggml_get_op_params_i32(dst, 4);
+    const int     variant  = qsa_triton_variant(n_kv_max);
+
+    return q->type == GGML_TYPE_F32 && k->type == GGML_TYPE_F16 && v->type == GGML_TYPE_F16 &&
+           dst->type == GGML_TYPE_F32 && mask->type == GGML_TYPE_F16 && indices->type == GGML_TYPE_I32 &&
+           scale == 0.0625f && max_bias == 0.0f && logit_softcap == 0.0f && variant >= 0 &&
+           qsa_triton_state().cubins[variant] != nullptr && q->ne[0] == 256 && q->ne[1] >= 64 && q->ne[2] == 12 &&
+           q->ne[3] == 1 && k->ne[0] == 256 && k->ne[1] > n_kv_max && k->ne[2] == 1 && k->ne[3] == 1 &&
+           v->ne[0] == 256 && v->ne[1] == k->ne[1] && v->ne[2] == 1 && v->ne[3] == 1 && dst->ne[0] == 256 &&
+           dst->ne[1] == 12 && dst->ne[2] == q->ne[1] && dst->ne[3] == 1 && indices->ne[0] == n_kv_max &&
+           indices->ne[1] == q->ne[1] && indices->ne[2] == 1 && indices->ne[3] == 1 && q->nb[0] == sizeof(float) &&
+           q->nb[1] == 3072 * sizeof(float) && q->nb[2] == 256 * sizeof(float) && k->nb[0] == sizeof(ggml_fp16_t) &&
+           k->nb[1] == 256 * sizeof(ggml_fp16_t) && v->nb[0] == sizeof(ggml_fp16_t) &&
+           v->nb[1] == 256 * sizeof(ggml_fp16_t) && dst->nb[0] == sizeof(float) && dst->nb[1] == 256 * sizeof(float) &&
+           dst->nb[2] == 3072 * sizeof(float) && indices->nb[0] == sizeof(int32_t) &&
+           indices->nb[1] == n_kv_max * sizeof(int32_t);
+#else
+    GGML_UNUSED(device);
+    GGML_UNUSED(dst);
+    return false;
+#endif
+}
+
+static void qsa_triton_launch(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+#if defined(__linux__) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    const int     device   = ggml_cuda_get_device();
+    const int32_t n_kv_max = ggml_get_op_params_i32(dst, 4);
+    const int     variant  = qsa_triton_variant(n_kv_max);
+    CUfunction    function = qsa_triton_function(device, variant);
+    GGML_ASSERT(function != nullptr);
+
+    CUdeviceptr q               = (CUdeviceptr) dst->src[0]->data;
+    CUdeviceptr k               = (CUdeviceptr) dst->src[1]->data;
+    CUdeviceptr v               = (CUdeviceptr) dst->src[2]->data;
+    CUdeviceptr out             = (CUdeviceptr) dst->data;
+    CUdeviceptr indices         = (CUdeviceptr) dst->src[5]->data;
+    int32_t     n_queries       = dst->src[0]->ne[1];
+    CUdeviceptr global_scratch  = 0;
+    CUdeviceptr profile_scratch = 0;
+    void *      args[]          = { &q, &k, &v, &out, &indices, &n_queries, &global_scratch, &profile_scratch };
+
+    qsa_cu_check(
+        cuLaunchKernel(function, n_queries, 1, 1, 32, 1, 1, QSA_TRITON_SHARED, (CUstream) ctx.stream(), args, nullptr),
+        "cuLaunchKernel(qsa_ggml)");
+
+    static bool announced[GGML_CUDA_MAX_DEVICES] = {};
+    if (!announced[device]) {
+        announced[device] = true;
+        std::fprintf(stderr, "ggml_cuda: launched Triton QSA AOT kernel on device %d (queries=%d, top-k=%d)\n", device,
+                     n_queries, n_kv_max);
+    }
+#else
+    GGML_UNUSED(ctx);
+    GGML_UNUSED(dst);
+    GGML_ABORT("Triton QSA AOT is unavailable on this platform");
+#endif
+}
+
 }  // namespace
 
 bool ggml_cuda_flash_attn_ext_qsa_f16_supported(int device, const ggml_tensor * dst) {
+    if (qsa_triton_supported(device, dst)) {
+        return true;
+    }
+
     if (!qsa_runtime_enabled() || ggml_cuda_info().devices[device].cc != GGML_CUDA_CC_HOPPER || dst == nullptr) {
         return false;
     }
@@ -295,6 +477,11 @@ bool ggml_cuda_flash_attn_ext_qsa_f16_supported(int device, const ggml_tensor * 
 }
 
 void ggml_cuda_flash_attn_ext_qsa_f16(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    if (qsa_triton_supported(ggml_cuda_get_device(), dst)) {
+        qsa_triton_launch(ctx, dst);
+        return;
+    }
+
     const ggml_tensor * q       = dst->src[0];
     const ggml_tensor * k       = dst->src[1];
     const ggml_tensor * v       = dst->src[2];

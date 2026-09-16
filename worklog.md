@@ -1602,3 +1602,67 @@ Artifacts:
 - `/home/aman/qwen4-exp-opt-bench-20260911/results/prefill-10k-ub2048-20260916/llama-pp1808-at-d8192-qsa-specialized-vec64-r5.jsonl`
 - `/home/aman/qwen4-exp-opt-bench-20260911/results/prefill-10k-ub2048-20260916/llama-pp1808-at-d8192-qsa-specialized-cpasync32-r5.jsonl`
 - `/home/aman/qwen4-exp-opt-bench-20260911/results/prefill-10k-ub2048-20260916/llama-pp1808-at-d8192-qsa-specialized-final-r5.jsonl`
+
+## 2026-09-16: Triton AOT QSA integration
+
+The SGLang sparse-GQA schedule was reproduced directly in Triton for GGML's
+local tensor-split layout. Each program is one warp for one query and local KV
+head, processes the 12 associated query heads together, gathers 16 indexed K/V
+rows per iteration, and fuses QK, online softmax, and PV. Two SM90 cubins were
+AOT-compiled for the observed direct-index widths, 2048 and 2051. The combined
+library is:
+
+- `/home/aman/qwen4-exp-opt-bench-20260911/results/qsa-triton-aot-20260916/libqsa_ggml_sm90_topk2048_2051.so`
+
+Set `GGML_CUDA_QSA_TRITON_LIB` to that library to enable the path. GGML loads
+the embedded cubin separately into each CUDA device context instead of calling
+Triton's generated process-global launcher, which is not safe for the two
+tensor-split CUDA contexts. Dispatch is intentionally strict: Linux CUDA,
+Hopper, `LLAMA_QSA_BLOCK_TOPK=1`, F32 Q/output, F16 K/V/mask, I32 direct
+indices, D=256, 12 local Q heads, one local KV head, scale 1/16, exact known
+strides, 2048 or 2051 indices, and resident KV length greater than the sparse
+budget. Depth-zero PP2048 therefore remains on the generic dense-friendly
+path. The native WMMA experiment remains available separately through
+`GGML_CUDA_QSA_FATTN=1`.
+
+Standalone correctness on physical H100 GPUs 6/7 passed for both AOT variants.
+The maximum absolute error against the FP32 reference was 6.56e-5 for top-k
+2048 and 6.52e-5 for top-k 2051; each AOT output was bit-identical to its
+Triton JIT output. The exact 2048-query/top-k-2048 shape took 0.525 ms, while
+the earlier 1808-query/top-k-2051 shape took about 0.556 ms.
+
+All full-model measurements below used the FP8 GGUF, physical GPUs 6/7,
+`-sm tensor -ts 1/1`, DeepGEMM expert matmul, FlashInfer GDN, expert parallel,
+compressed QSA, CPU PLE, and `-lm none`. Short runs had large first-touch and
+host-transfer variation even though the PLE weights were fully loaded in host
+memory, so crossover comparisons use the final three repetitions from the
+same resident process:
+
+| 2048-token prefill | Triton AOT | generic indexed FA | change |
+| --- | ---: | ---: | ---: |
+| depth 2048 (4K total KV) | 9708 tok/s | 9660 tok/s | +0.5% |
+| depth 4096 (6K total KV) | 9783 tok/s | 8996 tok/s | +8.7% |
+| depth 6144 (8K total KV) | 9646 tok/s | 8794 tok/s | +9.7% |
+
+At 1808 tokens after depth 8192, the five-sample AOT mean was 7806 tok/s versus
+6234 tok/s for the same-build generic control, a 25.2% improvement despite an
+outlier in each run. The AOT run's last two samples were 9043 and 9411 tok/s.
+
+For complete 10K prefill with `-b 10000 -ub 2048`, ten repetitions made the
+steady result clear. The AOT last-five mean was **8703 tok/s**; the matching
+generic last-five mean was **7287 tok/s**, so the integrated sparse-only path
+was **19.4% faster**. SGLang's previously measured matching 2K-chunk result is
+10986 tok/s, leaving it about 26% faster than this llama.cpp checkpoint.
+
+At the requested 100K resident context (`-p 2048 -d 100000`), replacing sparse
+attention alone no longer moved steady end-to-end speed. The final-three means
+were **5795 tok/s AOT** and **5838 tok/s generic** (-0.7%, effectively tied).
+The fixed-size attention work is no longer the useful target there; the QSA
+selection/pooling work that scales with resident context is the next attack.
+
+Generation and standalone validation inputs are retained on the benchmark
+host:
+
+- `/home/aman/qwen4-exp-opt-bench-20260911/results/prefill-10k-ub2048-20260916/qsa_triton_probe.py`
+- `/home/aman/qwen4-exp-opt-bench-20260911/results/qsa-triton-aot-20260916/qsa2048.c8f6d621_0d1d2d3d4d.c`
+- `/home/aman/qwen4-exp-opt-bench-20260911/results/qsa-triton-aot-20260916/qsa_ggml.36391803_0d1d2d3d4d.c`
