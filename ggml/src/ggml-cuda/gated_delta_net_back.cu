@@ -79,7 +79,7 @@ warp_reduce_partial(T partial) {
 
     static_assert((lanes_per_col & (lanes_per_col - 1u)) == 0u,
                   "lanes_per_col must be a power of two");
-                  
+
     static_assert(!std::is_integral_v<T>,
                   "warp_reduce_sum ignores width for integral types on Ampere and newer");
     if constexpr (lanes_per_col == 1) {
@@ -124,7 +124,7 @@ reduce_token_block(float v,
 }
 
 template <
-    const bool KDA, 
+    const bool KDA,
     const uint32_t S_v,
     const uint32_t block_size = gdn_back_threads_per_block(S_v, ggml_cuda_get_physical_warp_size())
 >
@@ -140,7 +140,7 @@ gated_delta_net_back_cuda(const float * data_q_ptr,
                           const ggml_cuda_gated_delta_net_back_kargs args) {
 
     constexpr const uint32_t warp_size     = ggml_cuda_get_physical_warp_size();
-    constexpr const uint32_t lanes_per_col = compute_lanes_per_col(S_v, warp_size);    
+    constexpr const uint32_t lanes_per_col = compute_lanes_per_col(S_v, warp_size);
     constexpr const uint32_t rows_per_lane = S_v / lanes_per_col;
     constexpr const uint32_t cols_per_step = block_size / lanes_per_col; // columns advanced per wave, across all warps
 
@@ -538,7 +538,7 @@ launch_gated_delta_net_back(const float * data_q,
 
 __host__ void
 ggml_cuda_op_gated_delta_net_back(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
-    
+
     ggml_tensor * src_q     = dst->src[0];
     ggml_tensor * src_k     = dst->src[1];
     ggml_tensor * src_v     = dst->src[2];
@@ -601,7 +601,7 @@ ggml_cuda_op_gated_delta_net_back(ggml_backend_cuda_context & ctx, ggml_tensor *
     const uint32_t off_db      = off_dg + pad_g;
     const uint32_t off_ds      = off_db + pad_b;
     const uint32_t off_scratch = off_ds + pad_s;
-        
+
     cudaStream_t stream = ctx.stream();
 
     const ggml_cuda_gated_delta_net_back_kargs kargs = {
@@ -623,9 +623,9 @@ ggml_cuda_op_gated_delta_net_back(ggml_backend_cuda_context & ctx, ggml_tensor *
         .rq3         = nev3 / neq3,
         .off_dk      = off_dk,
         .off_dv      = off_dv,
-        .off_dg      = off_dg,     
-        .off_db      = off_db,     
-        .off_ds      = off_ds,     
+        .off_dg      = off_dg,
+        .off_db      = off_db,
+        .off_ds      = off_ds,
         .off_scratch = off_scratch,
         .wg_stride   = n_tokens * (2*S_v*S_v + 2*S_v),
         .scale       = 1.0f / sqrtf((float) S_v),

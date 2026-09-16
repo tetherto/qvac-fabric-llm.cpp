@@ -30,7 +30,7 @@ To make things clear, will start from a blank state. You can skip steps you've a
    # Add upstream ggml remote
    git remote add ggml git@github.com:ggml-org/llama.cpp.git
    git fetch ggml
-   
+
    # Add tether remote
    git remote add tether git@github.com:tetherto/qvac-ext-lib-llama.cpp.git
    git fetch tether
@@ -71,7 +71,7 @@ To make things clear, will start from a blank state. You can skip steps you've a
 
 2. **Update vcpkg port**:
    ```bash
-   # Copy latest ports/llama-cpp folder from qvac-registry-vcpkg 
+   # Copy latest ports/llama-cpp folder from qvac-registry-vcpkg
    cp -r qvac-registry-vcpkg/ports/llama-cpp vcpkg/ports/llama-cpp
    ```
 
