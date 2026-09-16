@@ -1,0 +1,333 @@
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index b7bb6c18d..ad0b72c7c 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -1771,6 +1771,16 @@ static bool ggml_cuda_should_fuse_mul_mat(const ggml_tensor * ffn_up,
+     return true;
+ }
+ 
++// up and gate F8 mul_mats on one activation feeding a swiglu, at the batch the fused GEMV serves (the shape and
++// operand checks are ggml_cuda_should_fuse_mul_mat's, run by ggml_cuda_can_fuse before this)
++static bool ggml_cuda_should_fuse_mul_mat_vec_f8(const ggml_tensor * up, const ggml_tensor * gate, const ggml_tensor * glu) {
++    return up->op == GGML_OP_MUL_MAT && gate->op == GGML_OP_MUL_MAT &&
++        up->src[0]->type == GGML_TYPE_F8_E4M3 && gate->src[0]->type == GGML_TYPE_F8_E4M3 &&
++        up->src[2] != nullptr && gate->src[2] != nullptr && up->src[1]->type == GGML_TYPE_F32 &&
++        ggml_nrows(up->src[1]) <= 4 && ggml_get_glu_op(glu) == GGML_GLU_OP_SWIGLU &&
++        glu->type == GGML_TYPE_F32 && ggml_is_contiguous(glu);
++}
++
+ static bool ggml_cuda_should_fuse_mul_mat_vec_f(const ggml_tensor * tensor) {
+     ggml_tensor *       src0 = tensor->src[0];
+     ggml_tensor *       src1 = tensor->src[1];
+@@ -4470,6 +4480,13 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+             const ggml_tensor * src1 = up->src[1];
+             const ggml_tensor * ids  = up->src[2];
+ 
++            if (op == GGML_OP_MUL_MAT && ggml_cuda_should_fuse_mul_mat_vec_f8(up, gate, glu)) {
++                ggml_cuda_mul_mat_f8_gemv_glu(*cuda_ctx, up, gate, glu);
++                fused_mul_mat_vec = true;
++                fused_node_count  = 3;
++                break;
++            }
++
+             if (ggml_cuda_should_fuse_mul_mat_vec_f(up)) {
+                 ggml_cuda_mm_fusion_args_host fusion_data{};
+                 fusion_data.gate   = gate->src[0];
+diff --git a/ggml/src/ggml-cuda/mmf8.cu b/ggml/src/ggml-cuda/mmf8.cu
+index c8127d937..76e4ddf89 100644
+--- a/ggml/src/ggml-cuda/mmf8.cu
++++ b/ggml/src/ggml-cuda/mmf8.cu
+@@ -22,39 +22,63 @@ static __device__ __forceinline__ float2 ggml_cuda_e4m3x2_to_float2(const uint16
+ #define MMF8_GEMV_NWARPS 4
+ #define MMF8_GEMV_MAX_NCOLS 8
+ 
++// one trip of weights (16 bytes per row) and the block scale of each matrix at column k
++template <int nmat, int nrows_w>
++static __device__ __forceinline__ void mmf8_gemv_load_w(
++        const uint8_t * xr, const float * sr, const uint8_t * xgr, const float * sgr, const int ncols, const int nblk_n, const int k,
++        uint4 (&w4)[nmat][nrows_w], float (&s)[nmat]) {
++#pragma unroll
++    for (int r = 0; r < nrows_w; ++r) {
++        w4[0][r] = *(const uint4 *) (xr + (size_t) r*ncols + k);
++        if constexpr (nmat == 2) {
++            w4[1][r] = *(const uint4 *) (xgr + (size_t) r*ncols + k);
++        }
++    }
++    s[0] = sr[(k/GGML_F8_E4M3_SCALE_BLOCK)*nblk_n];
++    if constexpr (nmat == 2) {
++        s[1] = sgr[(k/GGML_F8_E4M3_SCALE_BLOCK)*nblk_n];
++    }
++}
++
+ // a block owns nrows_w consecutive rows and its warps split k in trips of 512 columns (16 bytes per lane, 4 scale blocks)
+-// one activation slice per trip serves all nrows_w rows: at one row per warp the activation loads were the limiter
+-template <int ncols_dst, int nrows_w, bool y_vec>
++// one activation slice per trip serves all nrows_w rows: at one row per warp the activation loads were the limiter.
++// has_glu: xg/sxg are the gate matrix (same shape and scales layout as x); the activation is read once for both and
++// the epilogue writes silu(gate) * up from the same per-row sums the separate launches would produce
++template <int ncols_dst, int nrows_w, bool y_vec, bool has_glu>
+ static __global__ void mul_mat_vec_f8_e4m3(
+-        const uint8_t * __restrict__ x, const float * __restrict__ sx, const float * __restrict__ y, float * __restrict__ dst,
++        const uint8_t * __restrict__ x, const float * __restrict__ sx, const uint8_t * __restrict__ xg, const float * __restrict__ sxg,
++        const float * __restrict__ y, float * __restrict__ dst,
+         const int ncols, const int nblk_n, const int stride_col_y, const int stride_col_dst) {
+     constexpr int warp_size = 32;
+     constexpr int trip      = warp_size*16;
+-    __shared__ float red[MMF8_GEMV_NWARPS][nrows_w][ncols_dst];
++    constexpr int nmat      = has_glu ? 2 : 1;
++    __shared__ float red[nmat][MMF8_GEMV_NWARPS][nrows_w][ncols_dst];
+ 
+     const int row0 = blockIdx.x*nrows_w;
+     const int warp = threadIdx.y;
+     const int lane = threadIdx.x;
+ 
+-    const uint8_t * xr = x  + (size_t) row0*ncols;
+-    const float   * sr = sx + row0/GGML_F8_E4M3_SCALE_BLOCK; // nrows_w divides the scale block, so the rows share it
++    const uint8_t * xr  = x  + (size_t) row0*ncols;
++    const float   * sr  = sx + row0/GGML_F8_E4M3_SCALE_BLOCK; // nrows_w divides the scale block, so the rows share it
++    const uint8_t * xgr = has_glu ? xg  + (size_t) row0*ncols : nullptr;
++    const float   * sgr = has_glu ? sxg + row0/GGML_F8_E4M3_SCALE_BLOCK : nullptr;
+ 
+-    float sumf[nrows_w][ncols_dst];
++    float sumf[nmat][nrows_w][ncols_dst];
+ #pragma unroll
+-    for (int r = 0; r < nrows_w; ++r) {
++    for (int g = 0; g < nmat; ++g) {
+ #pragma unroll
+-        for (int j = 0; j < ncols_dst; ++j) {
+-            sumf[r][j] = 0.0f;
++        for (int r = 0; r < nrows_w; ++r) {
++#pragma unroll
++            for (int j = 0; j < ncols_dst; ++j) {
++                sumf[g][r][j] = 0.0f;
++            }
+         }
+     }
+ 
+     for (int k = warp*trip + lane*16; k < ncols; k += MMF8_GEMV_NWARPS*trip) {
+-        uint4 w4[nrows_w];
+-#pragma unroll
+-        for (int r = 0; r < nrows_w; ++r) {
+-            w4[r] = *(const uint4 *) (xr + (size_t) r*ncols + k);
+-        }
+-        const float s = sr[(k/GGML_F8_E4M3_SCALE_BLOCK)*nblk_n];
++        uint4 w4[nmat][nrows_w];
++        float s[nmat];
++        mmf8_gemv_load_w<nmat, nrows_w>(xr, sr, xgr, sgr, ncols, nblk_n, k, w4, s);
+ 
+         float v[ncols_dst][16];
+ #pragma unroll
+@@ -78,34 +102,40 @@ static __global__ void mul_mat_vec_f8_e4m3(
+         }
+ 
+ #pragma unroll
+-        for (int r = 0; r < nrows_w; ++r) {
+-            const uint16_t * w2 = (const uint16_t *) &w4[r];
+-            float w[16];
++        for (int g = 0; g < nmat; ++g) {
+ #pragma unroll
+-            for (int i = 0; i < 8; ++i) {
+-                const float2 f = ggml_cuda_e4m3x2_to_float2(w2[i]);
+-                w[2*i + 0] = f.x;
+-                w[2*i + 1] = f.y;
+-            }
++            for (int r = 0; r < nrows_w; ++r) {
++                const uint16_t * w2 = (const uint16_t *) &w4[g][r];
++                float w[16];
+ #pragma unroll
+-            for (int j = 0; j < ncols_dst; ++j) {
+-                float part = 0.0f;
++                for (int i = 0; i < 8; ++i) {
++                    const float2 f = ggml_cuda_e4m3x2_to_float2(w2[i]);
++                    w[2*i + 0] = f.x;
++                    w[2*i + 1] = f.y;
++                }
+ #pragma unroll
+-                for (int i = 0; i < 16; ++i) {
+-                    part += w[i]*v[j][i];
++                for (int j = 0; j < ncols_dst; ++j) {
++                    float part = 0.0f;
++#pragma unroll
++                    for (int i = 0; i < 16; ++i) {
++                        part += w[i]*v[j][i];
++                    }
++                    sumf[g][r][j] += s[g]*part;
+                 }
+-                sumf[r][j] += s*part;
+             }
+         }
+     }
+ 
+ #pragma unroll
+-    for (int r = 0; r < nrows_w; ++r) {
++    for (int g = 0; g < nmat; ++g) {
+ #pragma unroll
+-        for (int j = 0; j < ncols_dst; ++j) {
+-            sumf[r][j] = warp_reduce_sum<warp_size>(sumf[r][j]);
+-            if (lane == 0) {
+-                red[warp][r][j] = sumf[r][j];
++        for (int r = 0; r < nrows_w; ++r) {
++#pragma unroll
++            for (int j = 0; j < ncols_dst; ++j) {
++                sumf[g][r][j] = warp_reduce_sum<warp_size>(sumf[g][r][j]);
++                if (lane == 0) {
++                    red[g][warp][r][j] = sumf[g][r][j];
++                }
+             }
+         }
+     }
+@@ -114,44 +144,72 @@ static __global__ void mul_mat_vec_f8_e4m3(
+     if (warp == 0 && lane < nrows_w*ncols_dst) {
+         const int r = lane / ncols_dst;
+         const int j = lane % ncols_dst;
+-        float t = 0.0f;
++        float t[nmat];
+ #pragma unroll
+-        for (int w = 0; w < MMF8_GEMV_NWARPS; ++w) {
+-            t += red[w][r][j];
++        for (int g = 0; g < nmat; ++g) {
++            t[g] = 0.0f;
++#pragma unroll
++            for (int w = 0; w < MMF8_GEMV_NWARPS; ++w) {
++                t[g] += red[g][w][r][j];
++            }
++        }
++        if constexpr (has_glu) {
++            dst[(size_t) j*stride_col_dst + row0 + r] = ggml_cuda_op_silu_single(t[1])*t[0]; // silu(gate) * up, as the GLU kernel
++        } else {
++            dst[(size_t) j*stride_col_dst + row0 + r] = t[0];
+         }
+-        dst[(size_t) j*stride_col_dst + row0 + r] = t;
+     }
+ }
+ 
+-template <int ncols_dst>
+-static void launch_mul_mat_vec_f8_e4m3(
+-        const uint8_t * x, const float * sx, const float * y, float * dst,
++template <int ncols_dst, int nrows_w>
++static void launch_mul_mat_vec_f8_e4m3_rows(
++        const uint8_t * x, const float * sx, const uint8_t * xg, const float * sxg, const float * y, float * dst,
+         const int ncols, const int nrows, const int nblk_n, const int stride_col_y, const int stride_col_dst, cudaStream_t stream) {
+-    // 4 rows per warp at batch 1, fewer when more activation columns have to stay in registers
+-    constexpr int nrows_w = ncols_dst == 1 ? 4 : (ncols_dst == 2 ? 2 : 1);
+     GGML_ASSERT(nrows % nrows_w == 0);
+     const dim3 block_dims(32, MMF8_GEMV_NWARPS, 1);
+     const dim3 block_nums(nrows/nrows_w, 1, 1);
+     const bool y_vec = ((uintptr_t) y % sizeof(float4) == 0) && stride_col_y % 4 == 0;
++    if (xg != nullptr) {
++        // the fused up/gate epilogue keeps two accumulator sets: batch <= 4 only
++        if constexpr (ncols_dst <= 4) {
++            if (y_vec) {
++                mul_mat_vec_f8_e4m3<ncols_dst, nrows_w, true, true><<<block_nums, block_dims, 0, stream>>>(x, sx, xg, sxg, y, dst, ncols, nblk_n, stride_col_y, stride_col_dst);
++            } else {
++                mul_mat_vec_f8_e4m3<ncols_dst, nrows_w, false, true><<<block_nums, block_dims, 0, stream>>>(x, sx, xg, sxg, y, dst, ncols, nblk_n, stride_col_y, stride_col_dst);
++            }
++            return;
++        }
++        GGML_ABORT("fused F8 up/gate GEMV: batch above 4");
++    }
+     if (y_vec) {
+-        mul_mat_vec_f8_e4m3<ncols_dst, nrows_w, true><<<block_nums, block_dims, 0, stream>>>(x, sx, y, dst, ncols, nblk_n, stride_col_y, stride_col_dst);
++        mul_mat_vec_f8_e4m3<ncols_dst, nrows_w, true, false><<<block_nums, block_dims, 0, stream>>>(x, sx, nullptr, nullptr, y, dst, ncols, nblk_n, stride_col_y, stride_col_dst);
+     } else {
+-        mul_mat_vec_f8_e4m3<ncols_dst, nrows_w, false><<<block_nums, block_dims, 0, stream>>>(x, sx, y, dst, ncols, nblk_n, stride_col_y, stride_col_dst);
++        mul_mat_vec_f8_e4m3<ncols_dst, nrows_w, false, false><<<block_nums, block_dims, 0, stream>>>(x, sx, nullptr, nullptr, y, dst, ncols, nblk_n, stride_col_y, stride_col_dst);
+     }
+ }
+ 
++template <int ncols_dst>
++static void launch_mul_mat_vec_f8_e4m3(
++        const uint8_t * x, const float * sx, const uint8_t * xg, const float * sxg, const float * y, float * dst,
++        const int ncols, const int nrows, const int nblk_n, const int stride_col_y, const int stride_col_dst, cudaStream_t stream) {
++    // 4 rows per warp at batch 1, fewer when more activation columns have to stay in registers
++    constexpr int nrows_w = ncols_dst == 1 ? 4 : (ncols_dst == 2 ? 2 : 1);
++    launch_mul_mat_vec_f8_e4m3_rows<ncols_dst, nrows_w>(x, sx, xg, sxg, y, dst, ncols, nrows, nblk_n, stride_col_y, stride_col_dst, stream);
++}
++
++// xg/sxg: the gate matrix of a fused up/gate GEMV (nullptr for a plain one)
+ static void mul_mat_vec_f8_e4m3_cuda(
+-        const uint8_t * x, const float * sx, const float * y, float * dst,
++        const uint8_t * x, const float * sx, const uint8_t * xg, const float * sxg, const float * y, float * dst,
+         const int ncols, const int nrows, const int nblk_n, const int ncols_dst, const int stride_col_y, const int stride_col_dst, cudaStream_t stream) {
+     switch (ncols_dst) {
+-        case 1: launch_mul_mat_vec_f8_e4m3<1>(x, sx, y, dst, ncols, nrows, nblk_n, stride_col_y, stride_col_dst, stream); break;
+-        case 2: launch_mul_mat_vec_f8_e4m3<2>(x, sx, y, dst, ncols, nrows, nblk_n, stride_col_y, stride_col_dst, stream); break;
+-        case 3: launch_mul_mat_vec_f8_e4m3<3>(x, sx, y, dst, ncols, nrows, nblk_n, stride_col_y, stride_col_dst, stream); break;
+-        case 4: launch_mul_mat_vec_f8_e4m3<4>(x, sx, y, dst, ncols, nrows, nblk_n, stride_col_y, stride_col_dst, stream); break;
+-        case 5: launch_mul_mat_vec_f8_e4m3<5>(x, sx, y, dst, ncols, nrows, nblk_n, stride_col_y, stride_col_dst, stream); break;
+-        case 6: launch_mul_mat_vec_f8_e4m3<6>(x, sx, y, dst, ncols, nrows, nblk_n, stride_col_y, stride_col_dst, stream); break;
+-        case 7: launch_mul_mat_vec_f8_e4m3<7>(x, sx, y, dst, ncols, nrows, nblk_n, stride_col_y, stride_col_dst, stream); break;
+-        case 8: launch_mul_mat_vec_f8_e4m3<8>(x, sx, y, dst, ncols, nrows, nblk_n, stride_col_y, stride_col_dst, stream); break;
++        case 1: launch_mul_mat_vec_f8_e4m3<1>(x, sx, xg, sxg, y, dst, ncols, nrows, nblk_n, stride_col_y, stride_col_dst, stream); break;
++        case 2: launch_mul_mat_vec_f8_e4m3<2>(x, sx, xg, sxg, y, dst, ncols, nrows, nblk_n, stride_col_y, stride_col_dst, stream); break;
++        case 3: launch_mul_mat_vec_f8_e4m3<3>(x, sx, xg, sxg, y, dst, ncols, nrows, nblk_n, stride_col_y, stride_col_dst, stream); break;
++        case 4: launch_mul_mat_vec_f8_e4m3<4>(x, sx, xg, sxg, y, dst, ncols, nrows, nblk_n, stride_col_y, stride_col_dst, stream); break;
++        case 5: launch_mul_mat_vec_f8_e4m3<5>(x, sx, xg, sxg, y, dst, ncols, nrows, nblk_n, stride_col_y, stride_col_dst, stream); break;
++        case 6: launch_mul_mat_vec_f8_e4m3<6>(x, sx, xg, sxg, y, dst, ncols, nrows, nblk_n, stride_col_y, stride_col_dst, stream); break;
++        case 7: launch_mul_mat_vec_f8_e4m3<7>(x, sx, xg, sxg, y, dst, ncols, nrows, nblk_n, stride_col_y, stride_col_dst, stream); break;
++        case 8: launch_mul_mat_vec_f8_e4m3<8>(x, sx, xg, sxg, y, dst, ncols, nrows, nblk_n, stride_col_y, stride_col_dst, stream); break;
+         default: GGML_ABORT("fatal error");
+     }
+ }
+@@ -376,7 +434,7 @@ void ggml_cuda_mul_mat_f8(ggml_backend_cuda_context & ctx, const ggml_tensor * s
+     cudaStream_t stream = ctx.stream();
+ 
+     if (ntokens <= MMF8_GEMV_MAX_NCOLS) {
+-        mul_mat_vec_f8_e4m3_cuda(x, sx, y, d, ncols, nrows, nblk_n, ntokens, ncols, nrows, stream);
++        mul_mat_vec_f8_e4m3_cuda(x, sx, nullptr, nullptr, y, d, ncols, nrows, nblk_n, ntokens, ncols, nrows, stream);
+         return;
+     }
+ 
+@@ -389,3 +447,25 @@ void ggml_cuda_mul_mat_f8(ggml_backend_cuda_context & ctx, const ggml_tensor * s
+ 
+     mul_mat_f8_e4m3_cublas(ctx, x, sx, y, d, ncols, nrows, nblk_n, ntokens, stream);
+ }
++
++void ggml_cuda_mul_mat_f8_gemv_glu(ggml_backend_cuda_context & ctx, const ggml_tensor * up, const ggml_tensor * gate, ggml_tensor * glu) {
++    const ggml_tensor * src0  = up->src[0];
++    const ggml_tensor * src0g = gate->src[0];
++    const ggml_tensor * src1  = up->src[1];
++    ggml_cuda_mul_mat_f8_check(src0, src1, up);
++    ggml_cuda_mul_mat_f8_check(src0g, src1, gate);
++    GGML_ASSERT(gate->src[1] == src1);
++    GGML_ASSERT(ggml_are_same_shape(src0, src0g) && ggml_are_same_shape(up->src[2], gate->src[2]));
++    GGML_ASSERT(glu->type == GGML_TYPE_F32 && ggml_is_contiguous(glu));
++    GGML_ASSERT(glu->ne[0] == src0->ne[1] && ggml_nrows(glu) == ggml_nrows(src1));
++
++    const int     ncols   = src0->ne[0];
++    const int     nrows   = src0->ne[1];
++    const int     nblk_n  = nrows/GGML_F8_E4M3_SCALE_BLOCK;
++    const int64_t ntokens = ggml_nrows(src1);
++    GGML_ASSERT(ntokens <= 4);
++
++    mul_mat_vec_f8_e4m3_cuda((const uint8_t *) src0->data, (const float *) up->src[2]->data,
++                             (const uint8_t *) src0g->data, (const float *) gate->src[2]->data,
++                             (const float *) src1->data, (float *) glu->data, ncols, nrows, nblk_n, ntokens, ncols, nrows, ctx.stream());
++}
+diff --git a/ggml/src/ggml-cuda/mmf8.cuh b/ggml/src/ggml-cuda/mmf8.cuh
+index 376265c8e..c320e6e2d 100644
+--- a/ggml/src/ggml-cuda/mmf8.cuh
++++ b/ggml/src/ggml-cuda/mmf8.cuh
+@@ -12,3 +12,7 @@ bool ggml_cuda_mul_mat_f8_uses_cutlass(ggml_backend_cuda_context & ctx, const gg
+ // the CUTLASS route for dst = mul_mat(src0, glu) where glu = swiglu_split(gate, up): silu(gate) * up is quantized
+ // straight into the GEMM's e4m3 input, the GLU output is never written
+ void ggml_cuda_mul_mat_f8_glu_cutlass(ggml_backend_cuda_context & ctx, const ggml_tensor * glu, ggml_tensor * dst);
++
++// one GEMV launch for the up and gate mul_mats of a swiglu (same activation, F8 weights of the same shape), batch <= 4;
++// writes silu(gate) * up into the GLU output from the same per-row sums the separate launches produce
++void ggml_cuda_mul_mat_f8_gemv_glu(ggml_backend_cuda_context & ctx, const ggml_tensor * up, const ggml_tensor * gate, ggml_tensor * glu);
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index 8fa3cee5b..2d7ef03d2 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -12486,6 +12486,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+         test_cases.emplace_back(new test_mul_mat_f8(5120, 17408, m));
+         test_cases.emplace_back(new test_mul_mat_f8(17408, 5120, m));
+     }
++    // the other decode GEMV shapes of qwen35: k/v, out_proj, GDN qkv rows
++    test_cases.emplace_back(new test_mul_mat_f8(5120, 1024, 1));
++    test_cases.emplace_back(new test_mul_mat_f8(5120, 6144, 1));
++    test_cases.emplace_back(new test_mul_mat_f8(5120, 10240, 1));
+     for (int64_t m : {1, 4096}) {
+         test_cases.emplace_back(new test_mul_mat_f8_ffn(5120, 17408, m, 0.01f));
+     }

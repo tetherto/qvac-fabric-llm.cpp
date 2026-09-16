@@ -13125,6 +13125,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         test_cases.emplace_back(new test_mul_mat_f8(5120, 17408, m));
         test_cases.emplace_back(new test_mul_mat_f8(17408, 5120, m));
     }
+    // the other decode GEMV shapes of qwen35: k/v, out_proj, GDN qkv rows
+    test_cases.emplace_back(new test_mul_mat_f8(5120, 1024, 1));
+    test_cases.emplace_back(new test_mul_mat_f8(5120, 6144, 1));
+    test_cases.emplace_back(new test_mul_mat_f8(5120, 10240, 1));
     for (int64_t m : {1, 4096}) {
         test_cases.emplace_back(new test_mul_mat_f8_ffn(5120, 17408, m, 0.01f));
     }

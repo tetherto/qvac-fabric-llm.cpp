@@ -2067,6 +2067,16 @@ static bool ggml_cuda_should_fuse_mul_mat(const ggml_tensor * ffn_up,
     return true;
 }
 
+// up and gate F8 mul_mats on one activation feeding a swiglu, at the batch the fused GEMV serves (the shape and
+// operand checks are ggml_cuda_should_fuse_mul_mat's, run by ggml_cuda_can_fuse before this)
+static bool ggml_cuda_should_fuse_mul_mat_vec_f8(const ggml_tensor * up, const ggml_tensor * gate, const ggml_tensor * glu) {
+    return up->op == GGML_OP_MUL_MAT && gate->op == GGML_OP_MUL_MAT &&
+        up->src[0]->type == GGML_TYPE_F8_E4M3 && gate->src[0]->type == GGML_TYPE_F8_E4M3 &&
+        up->src[2] != nullptr && gate->src[2] != nullptr && up->src[1]->type == GGML_TYPE_F32 &&
+        ggml_nrows(up->src[1]) <= 4 && ggml_get_glu_op(glu) == GGML_GLU_OP_SWIGLU &&
+        glu->type == GGML_TYPE_F32 && ggml_is_contiguous(glu);
+}
+
 static bool ggml_cuda_should_fuse_mul_mat_vec_f(const ggml_tensor * tensor) {
     ggml_tensor *       src0 = tensor->src[0];
     ggml_tensor *       src1 = tensor->src[1];
@@ -4981,6 +4991,13 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             const ggml_tensor * src0 = up->src[0];
             const ggml_tensor * src1 = up->src[1];
             const ggml_tensor * ids  = up->src[2];
+
+            if (op == GGML_OP_MUL_MAT && ggml_cuda_should_fuse_mul_mat_vec_f8(up, gate, glu)) {
+                ggml_cuda_mul_mat_f8_gemv_glu(*cuda_ctx, up, gate, glu);
+                fused_mul_mat_vec = true;
+                fused_node_count  = 3;
+                break;
+            }
 
             if (ggml_cuda_should_fuse_mul_mat_vec_f(up)) {
                 ggml_cuda_mm_fusion_args_host fusion_data{};
