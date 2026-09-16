@@ -155,14 +155,17 @@ static void mul_mat_vec_f8_e4m3_cuda(
     }
 }
 
-// y[n*ncols + k] = e4m3(x[n*ncols + k]) * scale[(k/128)*nblk_n + n/128], 8 elements per thread
+// y[n*ncols + k] = e4m3(x[n*ncols + k]) * scale[(k/128)*nblk_n + n/128], 8 elements per thread; one flat grid over
+// (row, 8-column group) so that weights with more than 65535 rows (the output head) fit the launch limits
 static __global__ void dequant_f8_e4m3_blockscaled_f16(
-        const uint8_t * __restrict__ x, const float * __restrict__ sx, half * __restrict__ y, const int ncols, const int nblk_n) {
-    const int row = blockIdx.y;
-    const int k   = (blockIdx.x*blockDim.x + threadIdx.x)*8;
-    if (k >= ncols) {
+        const uint8_t * __restrict__ x, const float * __restrict__ sx, half * __restrict__ y, const int ncols, const int nblk_n, const int64_t n_groups) {
+    const int64_t g = (int64_t) blockIdx.x*blockDim.x + threadIdx.x;
+    if (g >= n_groups) {
         return;
     }
+    const int n8  = ncols/8;
+    const int row = g / n8;
+    const int k   = (g % n8)*8;
     const size_t i = (size_t) row*ncols + k;
     const uint2 w8 = *(const uint2 *) (x + i);
     const uint16_t * w2 = (const uint16_t *) &w8;
@@ -178,9 +181,9 @@ static __global__ void dequant_f8_e4m3_blockscaled_f16(
 
 static void dequant_f8_e4m3_blockscaled_f16_cuda(
         const uint8_t * x, const float * sx, half * y, const int ncols, const int nrows, const int nblk_n, cudaStream_t stream) {
-    const int n8 = ncols/8;
-    const dim3 block_nums((n8 + CUDA_DEQUANTIZE_BLOCK_SIZE - 1)/CUDA_DEQUANTIZE_BLOCK_SIZE, nrows, 1);
-    dequant_f8_e4m3_blockscaled_f16<<<block_nums, CUDA_DEQUANTIZE_BLOCK_SIZE, 0, stream>>>(x, sx, y, ncols, nblk_n);
+    const int64_t n_groups = (int64_t) nrows*(ncols/8);
+    const dim3 block_nums((n_groups + CUDA_DEQUANTIZE_BLOCK_SIZE - 1)/CUDA_DEQUANTIZE_BLOCK_SIZE, 1, 1);
+    dequant_f8_e4m3_blockscaled_f16<<<block_nums, CUDA_DEQUANTIZE_BLOCK_SIZE, 0, stream>>>(x, sx, y, ncols, nblk_n, n_groups);
 }
 
 // scaled dequant to F16 followed by cuBLAS with F32 accumulation

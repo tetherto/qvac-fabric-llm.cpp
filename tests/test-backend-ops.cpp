@@ -4578,6 +4578,72 @@ struct test_gdn_gates : public test_case {
     }
 };
 
+// the recurrent conv input chain: GET_ROWS of the state rows -> CONCAT with the transposed tokens -> CPY of the last
+// d_conv-1 columns back into the state cache (fused on CUDA for one sequence at small batch); the conv input and
+// the updated cache rows are concatenated so both outputs are checked
+struct test_conv_state : public test_case {
+    const int64_t d_conv;
+    const int64_t n_ch;
+    const int64_t n_t;
+    const int64_t n_seqs;
+    const int64_t mem_size;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "CONV_STATE";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR5(d_conv, n_ch, n_t, n_seqs, mem_size);
+    }
+
+    test_conv_state(int64_t d_conv = 4, int64_t n_ch = 512, int64_t n_t = 1, int64_t n_seqs = 1, int64_t mem_size = 4)
+        : d_conv(d_conv), n_ch(n_ch), n_t(n_t), n_seqs(n_seqs), mem_size(mem_size) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t state_size = (d_conv - 1)*n_ch;
+
+        ggml_tensor * states = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, state_size, mem_size);
+        ggml_tensor * idx    = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_seqs);
+        ggml_tensor * x      = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_ch, n_t, n_seqs);
+        ggml_set_name(states, "states");
+        ggml_set_name(idx, "idx");
+        ggml_set_name(x, "x");
+
+        ggml_tensor * rows = ggml_get_rows(ctx, states, idx);
+        ggml_tensor * st   = ggml_reshape_3d(ctx, rows, d_conv - 1, n_ch, n_seqs);
+        ggml_tensor * conv_input = ggml_concat(ctx, st, ggml_transpose(ctx, x), 0);
+        ggml_set_name(conv_input, "conv_input");
+
+        // the tail of the conv input becomes the next state: written into rows [mem_size - n_seqs, mem_size)
+        ggml_tensor * last = ggml_view_3d(ctx, conv_input, d_conv - 1, n_ch, n_seqs, conv_input->nb[1], conv_input->nb[2],
+                                          ggml_row_size(conv_input->type, n_t));
+        ggml_tensor * upd  = ggml_view_2d(ctx, states, state_size, n_seqs, states->nb[1], (mem_size - n_seqs)*states->nb[1]);
+        ggml_tensor * next = ggml_cpy(ctx, last, upd);
+
+        ggml_tensor * out = ggml_concat(ctx, ggml_reshape_2d(ctx, conv_input, (d_conv - 1 + n_t)*n_ch, n_seqs), next, 0);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type == GGML_TYPE_I32) {
+                // gather from the rows that are written (the in-place update) and from others
+                std::vector<int32_t> data(ggml_nelements(t));
+                for (int64_t i = 0; i < ggml_nelements(t); i++) {
+                    data[i] = (i % 2 == 0) ? (int32_t) (mem_size - n_seqs + i) : (int32_t) (i % mem_size);
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(int32_t));
+            } else {
+                init_tensor_uniform(t, -1.0f, 1.0f);
+            }
+        }
+    }
+};
+
 // GGML_OP_SSM_SCAN
 struct test_ssm_scan : public test_case {
     const ggml_type type;
@@ -11198,6 +11264,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // the conv input chain (get_rows + concat + tail copy): the last two stay unfused (two sequences, batch above the limit)
+    for (auto [d_conv, n_ch, n_t, n_seqs, mem] : std::vector<std::array<int64_t, 5>>{
+            {4, 512, 1, 1, 4}, {4, 10240, 1, 1, 8}, {4, 512, 4, 1, 4}, {9, 256, 1, 1, 4}, {3, 256, 2, 1, 3},
+            {4, 512, 1, 2, 4}, {4, 512, 16, 1, 4} }) {
+        test_cases.emplace_back(new test_conv_state(d_conv, n_ch, n_t, n_seqs, mem));
+    }
+
     // fused ssm_conv + (optional) bias_add + silu. The bias-only graph (no silu) is intentionally
     // not tested since there's no fusion for that pattern in ggml_cuda_can_fuse.
     for (int64_t d_conv : {3, 4, 9}) {
@@ -11306,6 +11379,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // activation groups whose amax/448 is below FLT_MIN (quantizer scale floor); m > 8 so the GEMM paths run
     for (int64_t m : {9, 64}) {
         test_cases.emplace_back(new test_mul_mat_f8(256, 128, m, 1e-37f));
+    }
+    // an output head: more rows than a CUDA grid dimension holds (65535), both the GEMV and the GEMM paths
+    for (int64_t m : {1, 64}) {
+        test_cases.emplace_back(new test_mul_mat_f8(256, 66048, m));
     }
 
     for (ggml_type type_a : all_types) {

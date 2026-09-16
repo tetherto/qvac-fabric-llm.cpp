@@ -139,3 +139,15 @@ Taken: (b): no new ops, no change for other backends, the CPU reference stays th
 ## 20. FMHA query padding
 
 The CUTLASS FMHA needs the query count to be a multiple of 8; the last ubatch of a prompt has an arbitrary length (1841 tokens at 10k). Taken: pad with phantom queries that attend the same number of phantom cells past `n_kv_used` (they exist in the K/V views, which the support check verifies), zero the phantom Q rows, discard their outputs; no host-side change. Alternative (fall back to the mask fill for those ubatches) was the B1 state and cost the mask path on 18% of the tokens of a 10k prompt.
+
+## 21. Output head in FP8: measured and rejected (LM1)
+
+The user chose to try it behind the weight-only gate (Same top p >= 99.0%, Mean KLD <= 0.002 against the fallback FP8 logits). Options for producing it: (a) re-convert from the safetensors with a new converter flag; (b) requantize the BF16 head inside the existing GGUF with the same function. Both were built (`--fp8-output-head` in the converter, `gguf_fp8_output_head.py` for the GGUF, sharing `fp8_block_quantize`), (b) was used because the safetensors were no longer on the host. Result: decode +3.5% (80.9 tok/s at d10240, the campaign's decode target in llama-bench) but Same top p 98.35%: the head's rounding flips 1.4% of the top-1 tokens against 0.24% for the whole block-scaled trunk, so the gate rejects it and the campaign GGUF keeps the BF16 head. The option stays available for models where it passes. A side effect that is kept: the fallback dequant kernel's grid could not address more than 65535 rows (the head has 248320), fixed with a flat grid and covered by two op cases.
+
+## 22. Conv-state fusion limited to one sequence and small batches (D6)
+
+Options:
+- (a) A general kernel over (sequence, channel, column) elements, with the three launches replaced for every shape.
+- (b) One thread per channel for one sequence at batch <= 8: every thread reads its channel's state and token values into registers before writing the conv input row and the next state row.
+
+Taken: (b). The state cache is both read (the gathered row) and written (the updated row) by the fused op; with one sequence the rows are the same or disjoint per channel and the read-before-write order inside a thread makes the in-place update safe, while with several sequences a thread could overwrite a row another thread is still gathering (a forked sequence reading the slot another one updates), and a per-channel loop over thousands of prefill tokens is uncoalesced. Multi-sequence and prefill batches keep the get_rows / concat / cpy launches; the existing `ggml_cuda_check_fusion_memory_ranges` would reject every match here (the cache view is outside the run), so the conv input's disjointness from the inputs is checked directly and the cache aliasing is what the thread design covers.
