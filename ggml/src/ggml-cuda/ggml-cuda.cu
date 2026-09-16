@@ -3828,6 +3828,61 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     ggml_tensor * node = cgraph->nodes[i];
 
+    static const bool qsa_select_fusion_enabled = [] {
+        const char * value = getenv("LLAMA_QSA_FUSED_SELECT");
+        return value != nullptr && value[0] != '\0' && std::atoi(value) != 0;
+    }();
+    if (qsa_select_fusion_enabled && node->op == GGML_OP_UNARY &&
+            ggml_get_unary_op(node) == GGML_UNARY_OP_RELU && i + 14 < cgraph->n_nodes) {
+        ggml_tensor * view0      = cgraph->nodes[i + 1];
+        ggml_tensor * sum        = cgraph->nodes[i + 2];
+        ggml_tensor * view1      = cgraph->nodes[i + 3];
+        ggml_tensor * add1       = cgraph->nodes[i + 4];
+        ggml_tensor * view2      = cgraph->nodes[i + 5];
+        ggml_tensor * add2       = cgraph->nodes[i + 6];
+        ggml_tensor * view3      = cgraph->nodes[i + 7];
+        ggml_tensor * add3       = cgraph->nodes[i + 8];
+        ggml_tensor * bias_add   = cgraph->nodes[i + 9];
+        ggml_tensor * top_k      = cgraph->nodes[i + 10];
+        ggml_tensor * ids_cont   = cgraph->nodes[i + 11];
+        ggml_tensor * ids        = cgraph->nodes[i + 12];
+        ggml_tensor * get_rows   = cgraph->nodes[i + 13];
+        ggml_tensor * selected   = cgraph->nodes[i + 14];
+
+        const ggml_tensor * bias = bias_add->src[0] == add3 ? bias_add->src[1] :
+                                   bias_add->src[1] == add3 ? bias_add->src[0] : nullptr;
+        const bool common_match = node->src[0] != nullptr && node->src[0]->ne[1] == 4 &&
+                node->src[0]->ne[2]*node->src[0]->ne[3] <= 16 &&
+                view0->op == GGML_OP_VIEW && sum->op == GGML_OP_CONT &&
+                view1->op == GGML_OP_VIEW && add1->op == GGML_OP_ADD &&
+                view2->op == GGML_OP_VIEW && add2->op == GGML_OP_ADD &&
+                view3->op == GGML_OP_VIEW && add3->op == GGML_OP_ADD &&
+                bias_add->op == GGML_OP_ADD && bias != nullptr &&
+                top_k->op == GGML_OP_TOP_K && (top_k->ne[0] == 512 || top_k->ne[0] == 513) &&
+                ids_cont->op == GGML_OP_CONT && ids->op == GGML_OP_RESHAPE &&
+                get_rows->op == GGML_OP_GET_ROWS && selected->op == GGML_OP_RESHAPE &&
+                view0->src[0] == node && sum->src[0] == view0 && view1->src[0] == node &&
+                add1->src[0] == sum && add1->src[1] == view1 && view2->src[0] == node &&
+                add2->src[0] == add1 && add2->src[1] == view2 && view3->src[0] == node &&
+                add3->src[0] == add2 && add3->src[1] == view3 && top_k->src[0] == bias_add &&
+                ids_cont->src[0] == top_k && ids->src[0] == ids_cont && get_rows->src[1] == ids &&
+                selected->src[0] == get_rows;
+
+        if (common_match) {
+            constexpr int node_count = 10;
+            std::vector<ggml_op> ops(node_count);
+            for (int offset = 0; offset < node_count; ++offset) {
+                ops[offset] = cgraph->nodes[i + offset]->op;
+            }
+            const int output_idx = i + 9;
+            if (ggml_can_fuse_subgraph(cgraph, i, node_count, ops.data(), &output_idx, 1) &&
+                    ggml_cuda_check_fusion_memory_ranges(cgraph, i, node_count, &output_idx, 1) &&
+                    ggml_cuda_try_qsa_reduce_scores(*cuda_ctx, node->src[0], bias, bias_add)) {
+                return node_count - 1;
+            }
+        }
+    }
+
 #ifdef GGML_CUDA_DEEPGEMM
     // Keep Meta's original tensor-split graph and all-reduce boundary, but
     // execute the complete local batch-1 expert FFN in packed DeepGEMM form.

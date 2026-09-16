@@ -173,6 +173,27 @@ __global__ __launch_bounds__(CUDA_RADIX_TOP_K_THREADS, 1) void radix_top_k_f32(
     }
 }
 
+__global__ void qsa_reduce_scores_f32(
+        const float * __restrict__ scores,
+        const float * __restrict__ bias,
+        float * __restrict__ dst,
+        int n_blocks,
+        int n_heads) {
+    const int block = blockIdx.x*blockDim.x + threadIdx.x;
+    const int row   = blockIdx.y;
+    if (block >= n_blocks) {
+        return;
+    }
+
+    const int idx = row*n_blocks + block;
+    float value = bias[idx];
+#pragma unroll 4
+    for (int head = 0; head < n_heads; ++head) {
+        value += fmaxf(scores[block + static_cast<size_t>(n_blocks)*(head + n_heads*row)], 0.0f);
+    }
+    dst[idx] = value;
+}
+
 static bool use_radix_top_k(int device, int64_t ncols, int64_t k) {
     static const bool enabled = [] {
         const char * value = std::getenv("GGML_CUDA_RADIX_TOP_K");
@@ -186,6 +207,32 @@ static bool use_radix_top_k(int device, int64_t ncols, int64_t k) {
 }
 
 } // namespace
+
+bool ggml_cuda_try_qsa_reduce_scores(
+        ggml_backend_cuda_context & ctx,
+        const ggml_tensor * scores,
+        const ggml_tensor * bias,
+        ggml_tensor * dst) {
+    if (scores == nullptr || bias == nullptr || dst == nullptr ||
+            ggml_cuda_info().devices[ctx.device].cc != GGML_CUDA_CC_HOPPER ||
+            scores->type != GGML_TYPE_F32 || bias->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 ||
+            scores->ne[1] != 4 || scores->ne[2]*scores->ne[3] <= 1 ||
+            scores->ne[2]*scores->ne[3] > 16 || bias->ne[0] != scores->ne[0] ||
+            bias->ne[1] != scores->ne[2] || bias->ne[2] != 1 || bias->ne[3] != scores->ne[3] ||
+            !ggml_are_same_shape(bias, dst) || !ggml_is_contiguous(scores) ||
+            !ggml_is_contiguous(bias) || !ggml_is_contiguous(dst)) {
+        return false;
+    }
+
+    constexpr int threads = 256;
+    const int n_rows = scores->ne[2]*scores->ne[3];
+    const dim3 blocks((scores->ne[0] + threads - 1)/threads, n_rows, 1);
+    qsa_reduce_scores_f32<<<blocks, threads, 0, ctx.stream()>>>(
+            (const float *) scores->data, (const float *) bias->data, (float *) dst->data,
+            scores->ne[0], scores->ne[1]);
+    CUDA_CHECK(cudaGetLastError());
+    return true;
+}
 
 void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src0   = dst->src[0];

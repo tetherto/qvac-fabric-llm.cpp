@@ -7558,6 +7558,109 @@ struct test_topk_qsa_blocks : public test_case {
     }
 };
 
+struct test_qsa_select_blocks_graph : public test_case {
+    const int64_t n_blocks;
+    const int64_t n_queries;
+    const int64_t n_streams;
+    const bool    with_tail;
+    static constexpr int64_t n_heads = 4;
+    static constexpr int64_t ratio   = 4;
+
+    test_qsa_select_blocks_graph(int64_t n_blocks, int64_t n_queries, int64_t n_streams, bool with_tail)
+        : n_blocks(n_blocks), n_queries(n_queries), n_streams(n_streams), with_tail(with_tail) {}
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "QSA_SELECT_BLOCKS_GRAPH";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR4(n_blocks, n_queries, n_streams, with_tail);
+    }
+
+    double max_err() override { return 0.0; }
+    bool run_whole_graph() override { return true; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * scores = ggml_new_tensor_4d(
+                ctx, GGML_TYPE_F32, n_blocks, n_heads, n_queries, n_streams);
+        ggml_tensor * bias = ggml_new_tensor_3d(
+                ctx, GGML_TYPE_F32, n_blocks, n_queries, n_streams);
+        ggml_tensor * cells = ggml_new_tensor_4d(
+                ctx, GGML_TYPE_I32, ratio, n_blocks, 1, n_streams);
+        ggml_tensor * tail = with_tail
+            ? ggml_new_tensor_4d(ctx, GGML_TYPE_I32, ratio - 1, n_queries, 1, n_streams)
+            : nullptr;
+        ggml_set_name(scores, "scores");
+        ggml_set_name(bias, "bias");
+        ggml_set_name(cells, "cells");
+        if (tail != nullptr) {
+            ggml_set_name(tail, "tail");
+        }
+
+        const int64_t k = with_tail ? 512 : 513;
+        ggml_tensor * rectified = ggml_relu(ctx, scores);
+        ggml_tensor * summed = nullptr;
+        for (int64_t head = 0; head < n_heads; ++head) {
+            ggml_tensor * slice = ggml_view_3d(ctx, rectified, n_blocks, n_queries, n_streams,
+                    rectified->nb[2], rectified->nb[3], head*rectified->nb[1]);
+            summed = summed != nullptr ? ggml_add(ctx, summed, slice) : ggml_cont(ctx, slice);
+        }
+        ggml_tensor * reduced = ggml_add(ctx, summed, bias);
+        ggml_tensor * blocks = ggml_cont(ctx, ggml_top_k(ctx, reduced, k));
+        blocks = ggml_reshape_3d(ctx, blocks, k*n_queries, 1, n_streams);
+        ggml_tensor * selected = ggml_get_rows(ctx, cells, blocks);
+        selected = ggml_reshape_4d(ctx, selected, ratio*k, n_queries, 1, n_streams);
+        return tail != nullptr ? ggml_concat(ctx, selected, tail, 0) : selected;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->op != GGML_OP_NONE) {
+                continue;
+            }
+            if (strcmp(t->name, "scores") == 0) {
+                std::vector<float> data(ggml_nelements(t));
+                for (int64_t row = 0; row < n_queries*n_streams; ++row) {
+                    for (int64_t head = 0; head < n_heads; ++head) {
+                        for (int64_t block = 0; block < n_blocks; ++block) {
+                            data[block + n_blocks*(head + n_heads*row)] =
+                                0.01f*(float) block + 0.0001f*(float) head + 0.000001f*(float) row;
+                        }
+                    }
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(float));
+            } else if (strcmp(t->name, "bias") == 0) {
+                std::vector<float> data(ggml_nelements(t), 0.0f);
+                ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(float));
+            } else if (strcmp(t->name, "cells") == 0) {
+                std::vector<int32_t> data(ggml_nelements(t));
+                for (int64_t i = 0; i < (int64_t) data.size(); ++i) {
+                    data[i] = (int32_t) i;
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(int32_t));
+            } else if (strcmp(t->name, "tail") == 0) {
+                std::vector<int32_t> data(ggml_nelements(t));
+                for (int64_t i = 0; i < (int64_t) data.size(); ++i) {
+                    data[i] = -(int32_t) (i + 1);
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(int32_t));
+            }
+        }
+    }
+
+    double err(const float * a, const float * b, size_t n) override {
+        std::vector<int32_t> ia(n), ib(n);
+        for (size_t i = 0; i < n; ++i) {
+            ia[i] = (int32_t) a[i];
+            ib[i] = (int32_t) b[i];
+        }
+        std::sort(ia.begin(), ia.end());
+        std::sort(ib.begin(), ib.end());
+        return ia == ib ? 0.0 : 1.0;
+    }
+};
+
 enum MoeGatingFunc {
     GATING_FUNC_SOFTMAX,
     GATING_FUNC_SIGMOID,
@@ -11647,6 +11750,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_topk_qsa(64,   256,   2, 1, 200));  // small k: unfused fallback
     test_cases.emplace_back(new test_topk_qsa_blocks(1024, 2));
     test_cases.emplace_back(new test_topk_qsa_blocks(1024, 1, true));
+    test_cases.emplace_back(new test_qsa_select_blocks_graph(8192,  8, 1, true));
+    test_cases.emplace_back(new test_qsa_select_blocks_graph(8192, 16, 1, true));
 
     // exhaustive top_k tests
     //for (int i = 1; i < 9999; ++i) {

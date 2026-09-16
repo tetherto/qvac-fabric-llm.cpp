@@ -1,6 +1,6 @@
 # Qwen4Exp optimization worklog
 
-Last updated: 2026-09-16 (Asia/Singapore)
+Last updated: 2026-09-17 (Asia/Singapore)
 
 ## Objective
 
@@ -1670,3 +1670,35 @@ host:
 - `/home/aman/qwen4-exp-opt-bench-20260911/results/prefill-10k-ub2048-20260916/qsa_triton_probe.py`
 - `/home/aman/qwen4-exp-opt-bench-20260911/results/qsa-triton-aot-20260916/qsa2048.c8f6d621_0d1d2d3d4d.c`
 - `/home/aman/qwen4-exp-opt-bench-20260911/results/qsa-triton-aot-20260916/qsa_ggml.36391803_0d1d2d3d4d.c`
+
+## 2026-09-17: small-batch QSA score reduction
+
+The compressed-QSA block selector originally materialized four positive score
+heads and reduced them through three adds before adding the learned block bias.
+An opt-in CUDA graph fusion now recognizes the exact Qwen4Exp subgraph and
+computes that reduction directly into the input of the existing Hopper radix
+top-k. Set `LLAMA_QSA_FUSED_SELECT=1` to enable it. The fusion is restricted to
+aggregate row counts 2 through 16; batch one retains its existing path, while
+larger prefill shapes retain the established kernels.
+
+Two broader designs were rejected. Making the complete selector a public GGML
+operation caused the Meta scheduler to introduce large pageable host transfers.
+A backend-local single-CTA reduction plus top-k avoided those transfers but
+scaled poorly, losing 6.9% at batch 8 and 12.5% at batch 16. The retained
+two-stage design fuses only ReLU and the four-head reduction, then reuses the
+existing parallel radix top-k, gather, and tail path.
+
+Exact whole-graph CUDA tests pass against the CPU reference for 8192 blocks,
+the 513-entry tail case, and batch sizes 8 and 16. Repeated TG64 measurements
+used a shared 32K prefix, unified KV, the FP8 model, physical H100 GPUs 6/7,
+tensor/expert parallelism, DeepGEMM, FlashInfer GDN, compressed QSA, CPU PLE,
+and `-lm none`. Using the final two warmed repetitions from each resident
+process:
+
+| aggregate decode batch | existing path | fused reduction | change |
+| --- | ---: | ---: | ---: |
+| 8 | 225.320 tok/s | 229.857 tok/s | +2.01% |
+| 16 | 362.034 tok/s | 375.244 tok/s | +3.65% |
+
+The batch-1 path is intentionally unchanged; subsequent work should establish
+a new matched TG128 baseline and profile it independently.
