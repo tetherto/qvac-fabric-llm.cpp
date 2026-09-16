@@ -283,6 +283,41 @@ static void unary_gated_cuda(const T * x, const T * g, T * dst, const int64_t k,
     ggml_cuda_kernel_launch(unary_gated_op_kernel<op, T>, launch_params, x, g, dst, k, n, o0, o1);
 }
 
+// x * sigmoid(g) with g a strided 4-D view (element-contiguous along ne0) of the same logical shape as x: the attention
+// output gate read straight from the q/gate projection, without the ggml_cont of the gate half. Same op_sigmoid and
+// the same product as the fused unary+mul kernel, so the result is bit-identical to cont -> sigmoid -> mul
+static __global__ void mul_sigmoid_strided_f32(const float * x, const float * g, float * dst, const int64_t k,
+                                               const int64_t ne0, const int64_t ne1, const int64_t ne2,
+                                               const int64_t s1, const int64_t s2, const int64_t s3) {
+    ggml_cuda_pdl_lc();
+    const int64_t i = int64_t(blockDim.x)*blockIdx.x + threadIdx.x;
+    if (i >= k) {
+        return;
+    }
+    const int64_t i0 = i % ne0;
+    const int64_t t1 = i / ne0;
+    const int64_t i1 = t1 % ne1;
+    const int64_t t2 = t1 / ne1;
+    const int64_t i2 = t2 % ne2;
+    const int64_t i3 = t2 / ne2;
+
+    ggml_cuda_pdl_sync();
+    dst[i] = op_sigmoid(g[i0 + i1*s1 + i2*s2 + i3*s3]) * x[i];
+}
+
+void ggml_cuda_op_mul_sigmoid_strided(ggml_backend_cuda_context & ctx, const ggml_tensor * x, const ggml_tensor * gate_view, ggml_tensor * dst) {
+    GGML_ASSERT(x->type == GGML_TYPE_F32 && gate_view->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(x) && ggml_is_contiguous(dst) && ggml_are_same_shape(x, dst));
+    GGML_ASSERT(ggml_nelements(gate_view) == ggml_nelements(x) && gate_view->nb[0] == sizeof(float));
+
+    const int64_t k = ggml_nelements(dst);
+    const int64_t num_blocks = (k + CUDA_GLU_BLOCK_SIZE - 1) / CUDA_GLU_BLOCK_SIZE;
+    const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params((dim3) num_blocks, CUDA_GLU_BLOCK_SIZE, 0, ctx.stream());
+    ggml_cuda_kernel_launch(mul_sigmoid_strided_f32, launch_params, (const float *) x->data, (const float *) gate_view->data, (float *) dst->data, k,
+                            gate_view->ne[0], gate_view->ne[1], gate_view->ne[2],
+                            (int64_t) (gate_view->nb[1]/sizeof(float)), (int64_t) (gate_view->nb[2]/sizeof(float)), (int64_t) (gate_view->nb[3]/sizeof(float)));
+}
+
 template <float (*op)(float)>
 void ggml_cuda_op_unary_gated(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];

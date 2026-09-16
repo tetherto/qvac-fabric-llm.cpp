@@ -6154,6 +6154,103 @@ struct test_mul_mat_f8_ffn : public test_case {
     }
 };
 
+// two or three F8 mul_mats on one activation, created back to back (q/k/v, the delta-net qkv/z): the CUDA backend
+// quantizes the activation once for all of them at large batch and runs one GEMV launch at small batch
+struct test_mul_mat_f8_shared : public test_case {
+    const int64_t k;
+    const std::array<int64_t, 3> n;
+    const int     n_mat;
+    const int64_t m;
+    const float   x_max;
+
+    std::string vars() override {
+        return VARS_TO_STR5(k, n, n_mat, m, x_max);
+    }
+
+    double max_nmse_err() override {
+        return m <= 8 ? 5e-4 : 5e-3;
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    test_mul_mat_f8_shared(int64_t k = 256, std::array<int64_t, 3> n = {128, 256, 384}, int n_mat = 3, int64_t m = 1, float x_max = 1.0f)
+        : k(k), n(n), n_mat(n_mat), m(m), x_max(x_max) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, m);
+        ggml_set_name(x, "x");
+        ggml_tensor * out = nullptr;
+        for (int i = 0; i < n_mat; ++i) {
+            ggml_tensor * w = ggml_new_tensor_2d(ctx, GGML_TYPE_F8_E4M3, k, n[i]);
+            ggml_tensor * s = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n[i]/GGML_F8_E4M3_SCALE_BLOCK, k/GGML_F8_E4M3_SCALE_BLOCK);
+            ggml_format_name(w, "w%d", i);
+            ggml_format_name(s, "s_%d", i);
+            ggml_tensor * y = ggml_reshape_1d(ctx, ggml_mul_mat_blockscaled(ctx, w, s, x), n[i]*m);
+            out = out == nullptr ? y : ggml_concat(ctx, out, y, 0);
+        }
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        std::default_random_engine rng(42);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type == GGML_TYPE_F8_E4M3) {
+                std::uniform_int_distribution<int> dist(0, 255);
+                std::vector<uint8_t> data(ggml_nelements(t));
+                for (size_t i = 0; i < data.size(); i++) {
+                    const uint8_t v = (uint8_t) dist(rng);
+                    data[i] = (v & 0x80) | (v & 0x7F) % 0x58;
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size());
+            } else if (strncmp(t->name, "s_", 2) == 0) {
+                init_tensor_uniform(t, 0.5f, 2.0f);
+            } else {
+                init_tensor_uniform(t, -x_max, x_max);
+            }
+        }
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MUL_MAT_F8_SHARED";
+    }
+};
+
+// the attention output gate of the qwen35 family: x * sigmoid(cont(gate view)) where the gate is the odd half of a
+// [2*head, n_head, T] projection; the CUDA backend reads the strided view in the multiply without the cont
+struct test_mul_sigmoid_strided : public test_case {
+    const int64_t head;
+    const int64_t n_head;
+    const int64_t n_tokens;
+
+    std::string vars() override {
+        return VARS_TO_STR3(head, n_head, n_tokens);
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    test_mul_sigmoid_strided(int64_t head = 256, int64_t n_head = 24, int64_t n_tokens = 1)
+        : head(head), n_head(n_head), n_tokens(n_tokens) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * full = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 2*head, n_head, n_tokens);
+        ggml_set_name(full, "full");
+        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, head*n_head, n_tokens);
+        ggml_set_name(x, "x");
+        ggml_tensor * gate = ggml_view_3d(ctx, full, head, n_head, n_tokens, full->nb[1], full->nb[2], head*sizeof(float));
+        gate = ggml_cont_2d(ctx, gate, head*n_head, n_tokens);
+        ggml_tensor * out = ggml_mul(ctx, x, ggml_sigmoid(ctx, gate));
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MUL_SIGMOID_STRIDED";
+    }
+};
+
 // GGML_HINT_SRC0_IS_HADAMARD
 struct test_mul_mat_hadamard : public test_mul_mat {
     test_mul_mat_hadamard(ggml_type type_a = GGML_TYPE_F32, ggml_type type_b = GGML_TYPE_F32,
@@ -11368,10 +11465,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (uint32_t n : {5120, 12288}) { // the register-cached fused kernel's 256- and 1024-thread paths
         test_cases.emplace_back(new test_add_rms_norm_mul(GGML_TYPE_F32, {n, 3, 1, 1}, 1e-6f));
     }
-    for (int64_t nr : {1, 8, 9}) { // the 512-thread decode path and the first row count above it
+    for (int64_t nr : {1, 8, 9}) { // the warp-per-row path at decode batches and the first row count above it
         test_cases.emplace_back(new test_add_rms_norm_mul(GGML_TYPE_F32, {5120, nr, 1, 1}, 1e-6f));
     }
-    test_cases.emplace_back(new test_add_rms_norm_mul(GGML_TYPE_F32, {8192, 2, 1, 1}, 1e-6f)); // 8 float4 per thread at 256
+    test_cases.emplace_back(new test_add_rms_norm_mul(GGML_TYPE_F32, {8192, 2, 1, 1}, 1e-6f)); // 64 float4 per lane
 
     for (auto multi_add : {false, true}) {
         for (auto set_rows : {false, true}) {
@@ -11569,6 +11666,21 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (int64_t m : {1, 4, 64}) {
         test_cases.emplace_back(new test_mul_mat_f8_ffn(5120, 17408, m, 0.01f));
     }
+    // two or three F8 mul_mats sharing one activation: one quantize (m > 8, CUTLASS route) or one GEMV launch (m <= 8)
+    for (int n_mat : {2, 3}) {
+        for (int64_t m : {1, 2, 4, 8, 9, 64, 4096}) {
+            test_cases.emplace_back(new test_mul_mat_f8_shared(256, {128, 256, 384}, n_mat, m));
+        }
+    }
+    for (int64_t m : {1, 4, 4096}) {
+        test_cases.emplace_back(new test_mul_mat_f8_shared(5120, {12288, 1024, 1024}, 3, m, 0.01f));
+    }
+    test_cases.emplace_back(new test_mul_mat_f8_shared(5120, {10240, 6144, 0}, 2, 1, 0.01f));
+    // the attention output gate read from its strided view
+    for (int64_t t : {1, 4, 4096}) {
+        test_cases.emplace_back(new test_mul_sigmoid_strided(256, 24, t));
+    }
+    test_cases.emplace_back(new test_mul_sigmoid_strided(64, 3, 5));
 
     for (ggml_type type_a : all_types) {
         for (int i = 1; i < 10; ++i) {
@@ -13136,6 +13248,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     for (int64_t m : {1, 4096}) {
         test_cases.emplace_back(new test_mul_mat_f8_ffn(5120, 17408, m, 0.01f));
     }
+    test_cases.emplace_back(new test_mul_mat_f8_shared(5120, {12288, 1024, 1024}, 3, 1, 0.01f));
+    test_cases.emplace_back(new test_mul_mat_f8_shared(5120, {10240, 6144, 0}, 2, 4096, 0.01f));
+    test_cases.emplace_back(new test_mul_sigmoid_strided(256, 24, 4096));
 
     // qwen3-30b-a3b
     for (int bs : {1, 4, 8, 32, 64, 128, 256, 512}) {

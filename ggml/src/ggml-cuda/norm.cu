@@ -618,10 +618,11 @@ static void rms_norm_mul_f32_cuda(const float *  x,
 }
 
 // residual add folded into the following rms_norm * weight: one block per row writes the sum (the residual stream,
-// read again by later nodes) and the normalized product; contiguous rows, weight [ncols]. The row and the weight are
-// held in registers between the two passes (max_vals float4 each per thread), so the second pass only stores: a
-// single-row launch at decode pays one memory round trip before the reduction and none after it
-template <int block_size, int max_vals>
+// read again by later nodes) and the normalized product; contiguous rows, weight [ncols]. The row is held in
+// registers between the two passes (max_vals float4 per thread) so the second pass does not re-read the sum; with
+// prefetch_w the weight row is loaded in the first pass too, so a single-row launch at decode pays one memory round
+// trip before the reduction and none after it (the many-row prefill launches keep the lighter register footprint)
+template <int block_size, int max_vals, bool prefetch_w = false>
 static __global__ void rms_norm_add_mul_f32(const float * a, const float * b, const float * mul, float * sum, float * dst,
                                             const int ncols, const float eps) {
     ggml_cuda_pdl_lc();
@@ -646,7 +647,9 @@ static __global__ void rms_norm_add_mul_f32(const float * a, const float * b, co
         if (col < ncols4) {
             const float4 va = a4[col];
             const float4 vb = b4[col];
-            wv[i] = mul4[col];
+            if constexpr (prefetch_w) {
+                wv[i] = mul4[col];
+            }
             const float4 s  = make_float4(va.x + vb.x, va.y + vb.y, va.z + vb.z, va.w + vb.w);
             sum4[col] = s;
             vals[i]   = s;
@@ -663,7 +666,7 @@ static __global__ void rms_norm_add_mul_f32(const float * a, const float * b, co
     for (int i = 0; i < max_vals; i++) {
         const int col = tid + i*block_size;
         if (col < ncols4) {
-            const float4 w = wv[i];
+            const float4 w = prefetch_w ? wv[i] : mul4[col];
             const float4 s = vals[i];
             dst4[col] = make_float4(scale*s.x*w.x, scale*s.y*w.y, scale*s.z*w.z, scale*s.w*w.w);
         }
@@ -678,7 +681,7 @@ static void rms_norm_add_mul_f32_cuda(const float * a, const float * b, const fl
         const dim3 blocks_num(nrows, 1, 1);
         const dim3 block_dims(512, 1, 1);
         const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params{blocks_num, block_dims, 32*sizeof(float), stream};
-        ggml_cuda_kernel_launch(rms_norm_add_mul_f32<512, 3>, launch_params, a, b, mul, sum, dst, ncols, eps);
+        ggml_cuda_kernel_launch(rms_norm_add_mul_f32<512, 3, true>, launch_params, a, b, mul, sum, dst, ncols, eps);
         return;
     }
     const dim3 blocks_num(nrows, 1, 1);
