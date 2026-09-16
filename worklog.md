@@ -1650,9 +1650,13 @@ outlier in each run. The AOT run's last two samples were 9043 and 9411 tok/s.
 
 For complete 10K prefill with `-b 10000 -ub 2048`, ten repetitions made the
 steady result clear. The AOT last-five mean was **8703 tok/s**; the matching
-generic last-five mean was **7287 tok/s**, so the integrated sparse-only path
-was **19.4% faster**. SGLang's previously measured matching 2K-chunk result is
-10986 tok/s, leaving it about 26% faster than this llama.cpp checkpoint.
+generic run collected immediately afterward had a last-five mean of **7287
+tok/s**, an apparent **19.4% gain**. That generic control was unusually slow
+relative to the trusted 8225 tok/s warmed checkpoint recorded above, however.
+Against that checkpoint the conservative AOT improvement is **5.8%**. More
+interleaved sampling is needed to narrow the run-to-run range. SGLang's
+previously measured matching 2K-chunk result is 10986 tok/s, leaving it about
+26% faster than this llama.cpp checkpoint.
 
 At the requested 100K resident context (`-p 2048 -d 100000`), replacing sparse
 attention alone no longer moved steady end-to-end speed. The final-three means
