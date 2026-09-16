@@ -60,6 +60,7 @@ static __device__ __forceinline__ float cutlass_half_warp_amax(float value0, flo
     return amax;
 }
 
+template <bool use_aligned_float2>
 static __global__ void cutlass_quantize_mxfp8(
         const float * __restrict__ src,
         uint8_t * __restrict__ dst,
@@ -80,11 +81,16 @@ static __global__ void cutlass_quantize_mxfp8(
         const int scale_block = 2 * pair + half;
         const int64_t k       = (int64_t) scale_block * WARP_SIZE + pair_lane * 2;
         float2 value          = { 0.0f, 0.0f };
-        if (k + 1 < n_cols) {
-            value = *reinterpret_cast<const float2 *>(src + (int64_t) row * stride_row + k);
+        if constexpr (use_aligned_float2) {
+            if (k + 1 < n_cols) {
+                value = *reinterpret_cast<const float2 *>(src + (int64_t) row * stride_row + k);
+            }
         } else {
             if (k < n_cols) {
                 value.x = src[(int64_t) row * stride_row + k];
+            }
+            if (k + 1 < n_cols) {
+                value.y = src[(int64_t) row * stride_row + k + 1];
             }
         }
 
@@ -168,8 +174,11 @@ static bool cutlass_quantize(const float * src,
     if (type == GGML_TYPE_NVFP4) {
         quantize_cutlass_nvfp4_cuda(src, dst, scales, row_scales, use_aligned_float8,
             n_cols, n_cols_padded, stride_row, n_rows, stream);
+    } else if ((uintptr_t) src % alignof(float2) == 0) {
+        cutlass_quantize_mxfp8<true><<<(unsigned) n_rows, threads, 0, stream>>>(
+            src, dst, scales, n_cols, n_cols_padded, stride_row);
     } else {
-        cutlass_quantize_mxfp8<<<(unsigned) n_rows, threads, 0, stream>>>(
+        cutlass_quantize_mxfp8<false><<<(unsigned) n_rows, threads, 0, stream>>>(
             src, dst, scales, n_cols, n_cols_padded, stride_row);
     }
     CUDA_CHECK(cudaGetLastError());
