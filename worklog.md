@@ -1369,3 +1369,151 @@ Artifacts are under:
 
 - `/home/aman/qwen4-exp-opt-bench-20260911/results/decode-b1-proj-20260916/`
 - `bf16-control.nsys-rep`, `recurrent-only.nsys-rep`, and `f32-candidate.nsys-rep`
+
+## 2026-09-16: batch-1 tensor-split communication experiments
+
+The current 32K decode trace contains exactly 96 F32 AllReduces per token.
+Across the two ranks the NCCL Ring/LL kernel averaged 16.18 us on the critical
+rank and 7.24 us on its peer. This exposes about 1.55 ms/token on the critical
+rank, but it is not all recoverable because the collective also synchronizes
+the two unequal per-rank workloads.
+
+Two opt-in direct-NVLink implementations were tested and fully removed:
+
+- an asymmetric peer reduce/broadcast using cross-device CUDA events reached
+  70.83 tok/s over its warmed final four depth-zero TG64 samples;
+- a symmetric one-block-per-rank custom reduction using double-buffered
+  peer-visible scratch and an in-kernel rendezvous reached 69.09 tok/s.
+
+The adjacent clean NCCL control reached 74.88 tok/s. Both custom paths
+therefore lost to NCCL and no experiment-only AllReduce code remains.
+
+A second opt-in experiment mirrored all 36 recurrent GDN layers and their
+state on both GPUs, while retaining expert parallelism and tensor-split full
+attention. This reduced the theoretical collective count from 96 to 60 per
+token, but duplicating the recurrent projections/GDN computation reduced the
+warmed final-three depth-zero TG64 mean to 72.04 tok/s. This path was also
+fully removed.
+
+A standalone two-H100 NCCL sweep at the model's 40 KiB reduction size
+(10,240 F32 values) confirmed that the existing selection is already best:
+
+| algorithm/protocol | time per AllReduce |
+| --- | ---: |
+| Ring / LL | 8.48 us |
+| Tree / LL | 9.42 us |
+| Tree / LL128 | 13.29 us |
+| Ring / LL128 | 15.22 us |
+| Ring / Simple | 21.29 us |
+| Tree / Simple | 22.15 us |
+
+NVLS rejected this two-rank small-message configuration. A Ring/LL channel
+sweep found two channels best at 8.65 us; the unconstrained default was
+slightly faster at 8.48 us, so no NCCL override is retained.
+
+Conclusion: the existing hybrid tensor/expert path is already the winning
+batch-1 use of `-sm tensor`. Replacing NCCL or duplicating the GDN graph does
+not help. Further long-context decode gains should target useful per-rank work,
+especially the QSA selection/mask/attention pipeline, rather than the
+collective implementation.
+
+## 2026-09-16: maskless precomputed QSA indices
+
+An opt-in CUDA experiment let the block-top-k QSA path pass its precomputed
+cell indices to sparse FlashAttention without constructing or consuming the
+dense KQ mask. The batch-1 sentinel list is self-contained: complete selected
+blocks contain only visible cells and the live tail uses `-1` padding. A
+deterministic 2168-token real-model check produced the same first eight tokens
+with the mask enabled and omitted.
+
+Enabling maskless attention for both prefill and decode was rejected. At 32K
+resident context its warmed PP2048 samples settled at 5358.42, 5578.22, and
+5581.78 tok/s, versus 7369.82, 7590.62, and 7633.10 tok/s for the masked
+control. Its apparently faster decode followed that materially different
+prefill path and was therefore not a valid isolated decode result.
+
+Restricting the experiment to the single-token sentinel graph restored
+PP2048, but did not improve decode:
+
+| decode path | final three TG64 samples | mean |
+| --- | --- | ---: |
+| masked control | 63.8963, 64.6261, 64.4801 | 64.3342 tok/s |
+| maskless, mask input retained | 64.1589, 64.1061, 64.1534 | 64.1395 tok/s |
+| maskless, mask input fully pruned | 64.3347, 64.3136, 64.1698 | 64.2727 tok/s |
+
+The fully pruned form also skipped the host mask fill, not just the CUDA
+fill/set/add kernels. Its remaining difference from control is only -0.10%, so
+the warm captured graph already makes the decode mask effectively free. All
+maskless-QSA source changes and its environment switch were removed; the local
+and remote source trees were restored to the checkpoint implementation.
+
+## 2026-09-16: rejected HC injection projection
+
+The opt-in `GGML_CUDA_HC_INJECT=1` path that folds the four-output injection
+projection into HC-pre remains a rejection. It was neutral for PP2048, but its
+stable batch-1 decode rate was about 59.09 tok/s versus 64.33 tok/s for the
+clean path. The scalar block reductions cost more than the small tensor-core
+GEMMs they replace, so the option remains disabled.
+
+## 2026-09-16: Hopper batch-1 BF16 HC GEMV
+
+The hot unfused HC projection shape is K=320, with 10,240 output rows. The
+generic BF16-weight/F32-vector MMVF implementation assigned a five-warp block
+and shared-memory cross-warp reduction to every row. A Hopper-only specialization
+now assigns one warp per row and eight rows per block. It is restricted to
+K=320, batch/channel/sample count one, no IDs, and no fused epilogue; set
+`GGML_CUDA_BF16_GEMV_WARP_ROWS=0` to disable it.
+
+Both 320x10240 and 320x2560 focused CUDA cases pass against the CPU reference.
+On one H100 the backend-op microbench changed as follows:
+
+| shape | generic | warp-per-row | speedup |
+| --- | ---: | ---: | ---: |
+| 320x10240 | 14.54 us | 3.90 us | 3.73x |
+| 320x2560 | 6.44 us | 1.58 us | 4.08x |
+
+A full two-H100 tensor/EP bracket at a resident 32K context gave stable TG64
+candidate means of 68.75, 72.26, and 68.01 tok/s around control means of 64.55
+and 63.40 tok/s. Process-level decode variation makes the bracket average
+optimistic; the conservative adjacent comparisons are **+6.5% to +7.3%**.
+PP2048 remained in the 7.55-7.61k tok/s range.
+
+The final Nsight capture confirms 3,362 specialized launches at 5.037 us mean,
+16.934 ms summed. The prior generic 10,240-row launches used 47.237 ms summed
+at 14.050 us mean, saving about 30.3 ms of summed GPU time in the captured
+workload. The 2,560-row projection still uses the generic fused-epilogue path
+and remains a possible follow-up target.
+
+Artifacts:
+
+- `/home/aman/qwen4-exp-opt-bench-20260911/results/bf16-gemv-warp-rows-20260916/`
+- `default-final.nsys-rep`
+
+## 2026-09-16: clean 10K prefill, llama.cpp ubatch 2048 vs SGLang
+
+The depth-zero comparison uses the same FP8 model family on physical H100 GPUs
+6/7, TP/EP tensor splitting, batch size one, and a 10,000-token prompt. The
+llama.cpp run uses `-b 10000 -ub 2048 -p 10000 -n 0 -r 5` with the current
+DeepGEMM, FlashInfer GDN, separate-state SSM, compressed-QSA, and CPU PLE
+configuration. Its five samples were 8135.07, 8002.82, 8175.57, 8269.60, and
+8229.36 tok/s; the warmed last-three mean is **8224.84 tok/s** at 1.2159 s.
+
+SGLang uses the HF FP8 checkpoint, TP=2, EP=2, FA3, and its FlashInfer GDN
+prefill path. The cache was explicitly limited to one 16K request with
+`--mem-fraction-static 0.95 --max-running-requests 1 --max-total-tokens 16384`
+so server-side cache reservation did not consume the remaining model memory.
+SGLang automatically disabled prefill CUDA graphs for this model, so the
+measured prefill itself is not a graph replay. After one excluded cold warmup,
+its five samples were 31364.13, 31412.05, 31302.68, 31405.51, and 31405.17
+tok/s: **31377.91 tok/s mean**, **31405.17 tok/s median**, and 318.70 ms mean
+latency.
+
+Therefore SGLang really exceeds 20k tok/s for this clean prompt: it reaches
+about **31.4k tok/s**, or **3.82x** the current llama.cpp `-ub 2048` steady
+throughput. This is a depth-zero prompt result and must not be conflated with
+the earlier PP2048 extension measured after a resident 32K context.
+
+Raw files:
+
+- `/home/aman/qwen4-exp-opt-bench-20260911/results/prefill-10k-ub2048-20260916/llama-pp10000-ub2048-r5.jsonl`
+- `/home/aman/qwen4-exp-opt-bench-20260911/results/prefill-10k-ub2048-20260916/sglang-pp10000-r5.jsonl`

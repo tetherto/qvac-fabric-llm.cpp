@@ -4,6 +4,54 @@
 #include "mmvf.cuh"
 #include "convert.cuh"
 
+#if !defined(GGML_USE_HIP)
+// Decode-sized BF16 GEMV for short rows.  The generic MMVF kernel assigns one
+// block to every output row; for K=320 that means five warps plus a shared-memory
+// reduction per row.  Here each warp owns a row and eight rows share a block.
+// This is intentionally narrow while it is evaluated on the Qwen4Exp HC
+// projections.
+template <int rows_per_block>
+static __global__ void mul_mat_vec_f_bf16_warp_rows(
+        const nv_bfloat16 * x, const float * y, float * dst,
+        const int64_t nrows, const int64_t stride_row, const int ncols2) {
+    constexpr int warp_size = 32;
+    static_assert(rows_per_block * warp_size <= 1024, "invalid block size");
+
+    const int lane = threadIdx.x % warp_size;
+    const int warp = threadIdx.x / warp_size;
+    const int64_t row = (int64_t) blockIdx.x * rows_per_block + warp;
+
+    ggml_cuda_pdl_sync();
+
+    float sum = 0.0f;
+    if (row < nrows) {
+        const nv_bfloat162 * x2 = reinterpret_cast<const nv_bfloat162 *>(x + row*stride_row);
+        const float2 * y2 = reinterpret_cast<const float2 *>(y);
+
+        for (int col2 = lane; col2 < ncols2; col2 += warp_size) {
+            const nv_bfloat162 xv = x2[col2];
+            const float2       yv = y2[col2];
+            ggml_cuda_mad(sum, xv.x, yv.x);
+            ggml_cuda_mad(sum, xv.y, yv.y);
+        }
+    }
+
+    ggml_cuda_pdl_lc();
+    sum = warp_reduce_sum<warp_size>(sum);
+    if (row < nrows && lane == 0) {
+        dst[row] = sum;
+    }
+}
+
+static bool mul_mat_vec_f_bf16_warp_rows_enabled() {
+    static const bool enabled = [] {
+        const char * value = getenv("GGML_CUDA_BF16_GEMV_WARP_ROWS");
+        return value == nullptr || std::atoi(value) != 0;
+    }();
+    return enabled;
+}
+#endif
+
 template <typename T, typename type_acc, int ncols_dst, int block_size, bool has_fusion = false, bool is_multi_token_id = false>
 static __global__ void mul_mat_vec_f(
         const T * x_ptr, const float * y_ptr, const int32_t * ids_ptr, const ggml_cuda_mm_fusion_args_device fusion, float * dst_ptr,
@@ -610,6 +658,27 @@ static void mul_mat_vec_f_cuda(
         const int64_t stride_channel_x, const int64_t stride_channel_y, const int64_t stride_channel_dst, const int64_t nsamples_x,
         const int64_t nsamples_dst, const int64_t stride_sample_x, const int64_t stride_sample_y, const int64_t stride_sample_dst,
         const int64_t ids_stride, enum ggml_prec prec, cudaStream_t stream) {
+
+#if !defined(GGML_USE_HIP)
+    if constexpr (std::is_same_v<T, nv_bfloat16>) {
+        const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr;
+        const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+
+        if (mul_mat_vec_f_bf16_warp_rows_enabled() &&
+            cc == GGML_CUDA_CC_HOPPER && ids == nullptr && !has_fusion &&
+            ncols == 320 && ncols_dst == 1 &&
+            nchannels_x == 1 && nchannels_y == 1 && nchannels_dst == 1 &&
+            nsamples_x == 1 && nsamples_dst == 1) {
+            constexpr int rows_per_block = 8;
+            const dim3 block_dims(32*rows_per_block, 1, 1);
+            const dim3 block_nums((nrows + rows_per_block - 1) / rows_per_block, 1, 1);
+            const ggml_cuda_kernel_launch_params launch_params = { block_nums, block_dims, 0, stream };
+            ggml_cuda_kernel_launch(mul_mat_vec_f_bf16_warp_rows<rows_per_block>, launch_params,
+                x, y, dst, nrows, stride_row, ncols/2);
+            return;
+        }
+    }
+#endif
 
     if constexpr(std::is_same_v<T, half>) {
         if (prec == GGML_PREC_DEFAULT) {
