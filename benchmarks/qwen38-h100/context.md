@@ -86,6 +86,13 @@ Branch `fp8-h100-campaign` on `origin` (tetherto/qvac-fabric-llm.cpp), on top of
 - `62051f7c5` benchmarks : C2 separate-state SSM_CONV measured and rejected
 - `98ebe486b` benchmarks : F4, M0/M1, C1-C3 outcomes, scoreboard rows and docs; plus the follow-up docs commit after it
 
+Branch `h100-attn-decode` (campaign 2, on top of `98ebe486b` + the docs follow-up `ed09c5e1d`):
+- `a67d00445` cuda : Hopper FMHA for causal prefill attention, implicit causal mask (`n_kv_used`), W8A8 CUTLASS GEMM as the H100 default (A1, B1)
+- `6a500447a` cuda : decode fusions D2/D4/D5, FMHA query padding; common : pooled checkpoint buffers; sync point 2
+- `ea4d4104f` cuda : conv-state fusion (D6), flat dequant grid; convert : `--fp8-output-head` (LM1, rejected); sync point 3
+
+PR #270 (base `fp8-h100-campaign`, head `h100-attn-decode`) carries the campaign-2 table; created on the user's instruction as a stacked PR. The rejected FP8-head GGUF was deleted from the host after LM1 (the user's condition: keep it only if the gate passes).
+
 PR #268 (base `temp-10549`, head `fp8-h100-campaign`) carries the per-change table as its description; created on the user's explicit instruction.
 
 Note on process: `AGENTS.md` in this repository says an agent must never push or create a PR; the pushes above were done on the user's explicit instruction to a separate branch of the private fork, with short messages and no attribution trailers as the user asked.
@@ -108,4 +115,4 @@ Not taken yet: the FA stream-k fixup at decode (0.15 ms per token), the prompt-c
 
 ## Host state
 
-`/home/pratik/qwen38-bench/`: `models/Qwen3.8-27B-FP8.gguf` (30 GB, the campaign GGUF), `models/Qwen3.8-27B-FP8-head.gguf` (28.7 GB, the rejected FP8-head variant, deleted after LM1 unless the user wants it kept), `models/unsloth-Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-Q8_K_XL.gguf`, `kld-base-q8.bin` and `kld-base-f8.bin` (31 GB each; `kld-base-w8a8.bin` deleted with the user's approval on 2026-09-16 to make room), `cutlass/` (v4.2.1 source, example 67 and 88 builds, the standalone benches), `flashinfer-gdn/` (the C1 library, its bridge header/object and the teammate's export/compare scripts), `prof/` (nsys traces incl. the d0/d2/d4/d5/d5c/d6 decode windows and the gate logs), `srv_ab.sh` (server A/B launcher with a `BUILD` selector), build trees `build-h100` (the campaign-2 default, CUTLASS on), `build-h100-b1` (archived A1 + B1 + pinned S1 binaries, the A side of sync points 2 and 3), `build-h100-c1` / `build-h100-prev` (older archives), `build-h100-f8`. The teammate's branch worktree and the DeepGEMM venv were removed after M0/M1. Removed earlier at the user's request: the NVFP4 checkpoint, the Q4 GGUF and its logits, the BF16/Q8 draft GGUFs, the FP8 safetensors and the uv cache.
+`/home/pratik/qwen38-bench/`: `models/Qwen3.8-27B-FP8.gguf` (30 GB, the campaign GGUF), `models/unsloth-Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-Q8_K_XL.gguf`, `kld-base-q8.bin` and `kld-base-f8.bin` (31 GB each; `kld-base-w8a8.bin` deleted with the user's approval on 2026-09-16 to make room), `cutlass/` (v4.2.1 source, example 67 and 88 builds, the standalone benches), `flashinfer-gdn/` (the C1 library, its bridge header/object and the teammate's export/compare scripts), `prof/` (nsys traces incl. the d0/d2/d4/d5/d5c/d6 decode windows and the gate logs), `srv_ab.sh` (server A/B launcher with a `BUILD` selector), build trees `build-h100` (the campaign-2 default, CUTLASS on), `build-h100-b1` (archived A1 + B1 + pinned S1 binaries, the A side of sync points 2 and 3), `build-h100-c1` / `build-h100-prev` (older archives), `build-h100-f8`. 62 GB free. The teammate's branch worktree and the DeepGEMM venv were removed after M0/M1. Removed earlier at the user's request: the NVFP4 checkpoint, the Q4 GGUF and its logits, the BF16/Q8 draft GGUFs, the FP8 safetensors and the uv cache.
