@@ -3,4 +3,6 @@
 add_library(stb INTERFACE)
 add_library(vendor::stb ALIAS stb)
 
-target_include_directories(stb INTERFACE ..)
+target_include_directories(stb INTERFACE
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/..>
+    $<INSTALL_INTERFACE:${LLAMA_INCLUDE_INSTALL_DIR}>)

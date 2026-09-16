@@ -358,6 +358,15 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
                 "the indexer cache must track the attention cache cell for cell");
     }
 
+    static bool warned_qsa_unified = false;
+    const bool qsa_configured = std::any_of(hparams.dsv4_compress_ratios.begin(),
+            hparams.dsv4_compress_ratios.end(), [](uint32_t ratio) { return ratio > 0; });
+    if (mctx_idx && qsa_configured && cparams.kv_unified && cparams.n_seq_max > 1 && !warned_qsa_unified) {
+        LLAMA_LOG_WARN("%s: unified KV cache with n_seq_max > 1; QSA needs per-sequence multimodal ranks "
+                "-> running dense attention. Drop --kv-unified to enable QSA.\n", __func__);
+        warned_qsa_unified = true;
+    }
+
     ggml_tensor * inp_pos     = build_inp_pos();
     ggml_tensor * inp_out_ids = build_inp_out_ids();
 
@@ -768,8 +777,12 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
     const int64_t n_embd_head = hparams.n_embd_head_v();
     GGML_ASSERT(n_embd_head == hparams.n_embd_head_k());
 
-    // indexer reads the same block input as q/k/v; no cache or no ratio means dense
-    const bool qsa = mctx_hyb->get_idx() != nullptr && hparams.dsv4_compress_ratios[il] > 0;
+    // Multimodal tokens can share a temporal position. set_input_qsa ranks them correctly when
+    // each sequence has its own stream, but a unified multi-sequence cache needs sequence-local
+    // ranks that the shared cell-to-block map cannot represent yet.
+    const bool streams_ok = cparams.n_seq_max == 1 || !cparams.kv_unified;
+    const bool qsa = streams_ok && mctx_hyb->get_idx() != nullptr &&
+        hparams.dsv4_compress_ratios[il] > 0;
 
     ggml_tensor * top_k = qsa ? build_qsa_top_k(mctx_hyb, cur, inp_pos, inp->get_kq_mask(), sections, il) : nullptr;
 

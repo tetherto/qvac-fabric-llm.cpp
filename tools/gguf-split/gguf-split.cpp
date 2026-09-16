@@ -17,6 +17,7 @@
 #include <fstream>
 #include <string>
 #include <vector>
+#include <set>
 
 #if defined(_WIN32)
     #include <windows.h>
@@ -48,6 +49,8 @@ struct split_params {
     bool no_tensor_first_split = false;
     bool dry_run = false;
     bool delete_splits = false;
+    bool verbose = false;
+    std::set<std::string> must_be_followed_layers;
 };
 
 static void split_print_usage(const char * executable) {
@@ -55,7 +58,8 @@ static void split_print_usage(const char * executable) {
     printf("\n");
     printf("usage: %s [options] GGUF_IN GGUF_OUT\n", executable);
     printf("\n");
-    printf("Apply a GGUF operation on IN to OUT.");
+    printf("Apply a GGUF operation on IN to OUT.\n");
+    printf("When splitting, also creates GGUF_OUT.tensors.txt with all tensor names.\n");
     printf("\n");
     printf("options:\n");
     printf("  -h, --help              show this help message and exit\n");
@@ -65,8 +69,10 @@ static void split_print_usage(const char * executable) {
     printf("  --split-max-tensors     max tensors in each split (default: %d)\n", default_params.n_split_tensors);
     printf("  --split-max-size N(M|G) max size per split\n");
     printf("  --no-tensor-first-split do not add tensors to the first split (disabled by default)\n");
+    printf("  --must-be-followed LAYER ensure LAYER is not the last tensor in a split and will not be released when loading after any tensor is created (can be used multiple times)\n");
     printf("  --dry-run               only print out a split plan and exit, without writing any new files\n");
     printf("  --delete-splits         delete the split files during merge to free up disk space WARNING: this option is unsafe and will leave you in an unrecoverable state if something fails during the merge\n");
+    printf("  --verbose               show tensor names for each split\n");
     printf("\n");
 }
 
@@ -112,6 +118,9 @@ static void split_params_parse_ex(int argc, const char ** argv, split_params & p
         } else if (arg == "--dry-run") {
             arg_found = true;
             params.dry_run = true;
+        } else if (arg == "--verbose") {
+            arg_found = true;
+            params.verbose = true;
         } else if (arg == "--no-tensor-first-split") {
             arg_found = true;
             params.no_tensor_first_split = true;
@@ -152,6 +161,13 @@ static void split_params_parse_ex(int argc, const char ** argv, split_params & p
         } else if (arg == "--delete-splits") {
             arg_found = true;
             params.delete_splits = true;
+        } else if (arg == "--must-be-followed") {
+            if (++arg_idx >= argc) {
+                invalid_param = true;
+                break;
+            }
+            arg_found = true;
+            params.must_be_followed_layers.insert(argv[arg_idx]);
         }
 
         if (!arg_found) {
@@ -284,7 +300,19 @@ struct split_strategy {
         }
     }
 
+    bool must_be_followed(int i_tensor) {
+        if (i_tensor > 0 && i_tensor < n_tensors) {
+            const char* tensor_name = gguf_get_tensor_name(ctx_gguf, i_tensor);
+            return params.must_be_followed_layers.find(tensor_name) != params.must_be_followed_layers.end();
+        }
+        return false;
+    }
+
     bool should_split(int i_tensor, size_t next_size) {
+        if (must_be_followed(i_tensor) || must_be_followed(i_tensor - 1)) {
+            return false;
+        }
+
         if (params.mode == MODE_SIZE) {
             // split by max size per file
             return next_size > params.n_bytes_split;
@@ -308,8 +336,39 @@ struct split_strategy {
             }
             total_size = total_size / 1000 / 1000; // convert to megabytes
             printf("split %05d: n_tensors = %" PRIi64 ", total_size = %zuM\n", i_split + 1, gguf_get_n_tensors(ctx_out), total_size);
+            
+            if (params.verbose) {
+                for (int i = 0; i < gguf_get_n_tensors(ctx_out); ++i) {
+                    const char * t_name = gguf_get_tensor_name(ctx_out, i);
+                    printf("  - %s\n", t_name);
+                }
+            }
             i_split++;
         }
+    }
+
+    void write_tensor_list() {
+        // Create a .txt file with all tensor names from all splits
+        std::string   tensor_list_path = params.output + ".tensors.txt";
+        std::ofstream tensor_file(tensor_list_path);
+        if (!tensor_file.is_open()) {
+            fprintf(stderr, "warning: failed to create tensor list file %s\n", tensor_list_path.c_str());
+            return;
+        }
+
+        printf("Writing tensor list to %s ... ", tensor_list_path.c_str());
+        fflush(stdout);
+
+        // Write all tensor names from all splits
+        for (auto & ctx_out : ctx_outs) {
+            for (int i = 0; i < gguf_get_n_tensors(ctx_out); ++i) {
+                const char * t_name = gguf_get_tensor_name(ctx_out, i);
+                tensor_file << t_name << "\n";
+            }
+        }
+
+        tensor_file.close();
+        printf("done\n");
     }
 
     void write() {
@@ -392,6 +451,9 @@ static void gguf_split(const split_params & split_params) {
     strategy.print_info();
 
     if (!split_params.dry_run) {
+        // Write tensor list file
+        strategy.write_tensor_list();
+
         // write all output splits
         strategy.write();
     }

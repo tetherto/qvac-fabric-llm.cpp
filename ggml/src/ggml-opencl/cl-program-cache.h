@@ -73,3 +73,8 @@ void cl_program_cache_try_save(
     cl_device_id                   device,
     const char *                   source,
     const std::string &            compile_opts);
+
+// Hex-encoded SHA-256 of an arbitrary buffer, backed by the embedded
+// implementation in cl-program-cache.cpp. Lets other cache layers in this
+// backend compute digests without linking an external SHA-256.
+std::string cl_program_cache_sha256_hex(const void * data, size_t len);

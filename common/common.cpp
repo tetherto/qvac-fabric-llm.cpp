@@ -9,6 +9,7 @@
 #include "sampling.h"
 #include "speculative.h"
 #include "unicode.h"
+#include "chat.h"
 
 #include <algorithm>
 #include <cinttypes>
@@ -1287,6 +1288,8 @@ struct common_init_result::impl {
     std::vector<llama_sampler_seq_config> samplers_seq_config;
 };
 
+common_init_result::common_init_result() : pimpl(new impl{}) {}
+
 common_init_result::common_init_result(common_params & params, bool model_only) :
     pimpl(new impl{}) {
     auto mparams = common_model_params_to_llama(params);
@@ -1323,6 +1326,7 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
             params.fit_params_target.data(),
             params.fit_params_min_ctx,
             has_draft || spec_mtp ? &extra : nullptr,
+            params.prefetch_weights_auto,
             params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
     }
 
@@ -1433,26 +1437,14 @@ std::vector<llama_adapter_lora_ptr> & common_init_result::lora() {
     return pimpl->lora;
 }
 
-common_init_result_ptr common_init_from_params(common_params & params, bool model_only) {
-    common_init_result_ptr res(new common_init_result(params, model_only));
-
-    llama_model * model = res->model();
-    if (model == NULL) {
-        COM_ERR("failed to load model '%s'\n", params.model.path.c_str());
-        return res;
-    }
-
-    if (model_only) {
-        return res;
-    }
+common_init_result_ptr common_init_from_model_and_params(llama_model* model, common_init_result_ptr res, common_params & params) {
+    const llama_vocab * vocab = llama_model_get_vocab(model);
 
     llama_context * lctx = res->context();
     if (lctx == NULL) {
         COM_ERR("failed to create context with model '%s'\n", params.model.path.c_str());
         return res;
     }
-
-    const llama_vocab * vocab = llama_model_get_vocab(model);
 
     if (params.ctx_shift && !llama_memory_can_shift(llama_get_memory(lctx))) {
         COM_WRN("%s", "KV cache shifting is not supported for this context, disabling KV cache shifting\n");
@@ -1547,6 +1539,106 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
     }
 
     return res;
+}
+
+common_init_result_ptr common_init_from_params(common_params & params, bool model_only) {
+    common_init_result_ptr res(new common_init_result(params, model_only));
+
+    llama_model * model = res->model();
+    if (model == NULL) {
+        COM_ERR("failed to load model '%s'\n", params.model.path.c_str());
+        return res;
+    }
+
+    if (model_only) {
+        return res;
+    }
+
+    return common_init_from_model_and_params(model, std::move(res), params);
+}
+
+// Compat overload for callers that have already loaded a model externally
+// and don't have a params.model.path the file-based constructor can open.
+common_init_result_ptr common_init_from_model_and_params(llama_model * model, common_params & params) {
+    if (model == nullptr) {
+        // Mirror common_init_from_params: on load failure return a *valid* empty
+        // result (model()/context() == nullptr), never a null pointer. Callers
+        // adopt this result and inspect model()/context() to detect failure
+        // (e.g. and then throw); returning a null common_init_result_ptr here
+        // makes those callers dereference null and crash.
+        return common_init_result_ptr(new common_init_result());
+    }
+
+    // Adopt the externally-loaded model into an empty result. Do NOT use the
+    // file-based constructor here: it would load a throwaway model from
+    // params.model.path and build a context (and samplers) bound to it, and the
+    // pimpl->model.reset(model) below would then free that file model while its
+    // context/samplers still referenced it -- a heap-use-after-free in
+    // ~llama_context, plus a duplicated logit-bias/sampler setup.
+    common_init_result_ptr res(new common_init_result());
+    auto & pimpl = res->pimpl;
+    pimpl->model.reset(model);
+
+    auto cparams = common_context_params_to_llama(params);
+    const llama_vocab * vocab = llama_model_get_vocab(model);
+
+    for (auto & la : params.lora_adapters) {
+        llama_adapter_lora_ptr lora;
+        lora.reset(llama_adapter_lora_init(model, la.path.c_str()));
+        if (lora == nullptr) {
+            LOG_ERR("%s: failed to load lora adapter '%s'\n", __func__, la.path.c_str());
+            return res;
+        }
+
+        char buf[1024];
+        la.ptr = lora.get();
+        llama_adapter_meta_val_str(la.ptr, "adapter.lora.task_name", buf, sizeof(buf));
+        la.task_name = buf;
+        llama_adapter_meta_val_str(la.ptr, "adapter.lora.prompt_prefix", buf, sizeof(buf));
+        la.prompt_prefix = buf;
+        pimpl->lora.emplace_back(std::move(lora));
+    }
+
+    common_init_sampler_from_model(model, params.sampling);
+
+    if (params.sampling.ignore_eos && llama_vocab_eos(vocab) == LLAMA_TOKEN_NULL) {
+        LOG_WRN("%s: warning: vocab does not have an EOS token, ignoring --ignore-eos\n", __func__);
+        params.sampling.ignore_eos = false;
+    }
+
+    for (llama_token i = 0; i < llama_vocab_n_tokens(vocab); i++) {
+        if (llama_vocab_is_eog(vocab, i)) {
+            LOG_INF("%s: added %s logit bias = %f\n", __func__, common_token_to_piece(vocab, i).c_str(), -INFINITY);
+            params.sampling.logit_bias_eog.push_back({i, -INFINITY});
+        }
+    }
+
+    if (params.sampling.ignore_eos) {
+        params.sampling.logit_bias.insert(
+                params.sampling.logit_bias.end(),
+                params.sampling.logit_bias_eog.begin(), params.sampling.logit_bias_eog.end());
+    }
+
+    pimpl->samplers.resize(cparams.n_seq_max);
+    pimpl->samplers_seq_config.resize(cparams.n_seq_max);
+    for (int i = 0; i < (int) cparams.n_seq_max; ++i) {
+        pimpl->samplers[i].reset(common_sampler_init(model, params.sampling));
+        pimpl->samplers_seq_config[i] = { i, common_sampler_get(pimpl->samplers[i].get()) };
+    }
+
+    if (params.sampling.backend_sampling) {
+        cparams.samplers   = pimpl->samplers_seq_config.data();
+        cparams.n_samplers = pimpl->samplers_seq_config.size();
+    }
+
+    llama_context * lctx = llama_init_from_model(model, cparams);
+    if (lctx == NULL) {
+        LOG_ERR("%s: failed to create context with externally-loaded model\n", __func__);
+        return res;
+    }
+    pimpl->context.reset(lctx);
+
+    return common_init_from_model_and_params(model, std::move(res), params);
 }
 
 common_init_result::~common_init_result() = default;
@@ -1691,7 +1783,10 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.lazy_mode = params.lazy_mode;
     mparams.tensor_split    = params.tensor_split;
     mparams.check_tensors   = params.check_tensors;
-    mparams.use_extra_bufts = !params.no_extra_bufts;
+
+    // Disable weight repacking for training loads, backward ops can't read
+    // repacked layouts.
+    mparams.use_extra_bufts = !params.no_extra_bufts && !params.training;
     mparams.no_host         = params.no_host;
 
     if (params.kv_overrides.empty()) {
@@ -1747,10 +1842,14 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.no_perf           = params.no_perf;
     cparams.op_offload        = !params.no_op_offload;
     cparams.swa_full          = params.swa_full;
+    cparams.training          = params.training;
     cparams.kv_unified        = params.kv_unified;
+    cparams.prefetch_weights  = params.prefetch_weights;
 
-    cparams.type_k = params.cache_type_k;
-    cparams.type_v = params.cache_type_v;
+    cparams.type_k         = params.cache_type_k;
+    cparams.type_v         = params.cache_type_v;
+    cparams.moe_cache_size = params.moe_cache_size;
+    cparams.moe_cache_auto = params.fit_params && params.moe_cache_auto;
 
     return cparams;
 }

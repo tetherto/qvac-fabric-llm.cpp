@@ -55,6 +55,13 @@
 /autogen-*.md
 /common/build-info.cpp
 
+# Local TurboVec review artifacts
+/.cargo-turbovec-gen/
+/.cargo-turbovec-inspect/
+/ggml/build*/
+/results/
+/tests/turbovec-golden-gen/*.tmp.tv
+
 # Deprecated
 
 /main
