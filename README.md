@@ -53,7 +53,7 @@ Split work within each layer across GPUs to accelerate decoding for supported mo
 
 Improve decoding speed on hybrid systems with limited GPU VRAM and ample system RAM by keeping MoE expert weights in system RAM and caching recently used experts on the GPU. Cache hits reuse GPU-resident weights, reducing repeated CPU-to-GPU transfers during token generation. The benefit depends on expert reuse, cache size, and transfer bandwidth.
 
-- **Configurable VRAM budget**: `--moe-cache-mib N` sets the persistent GPU expert cache budget in MiB; `0` disables it (the default).
+- **Configurable VRAM budget**: `--moe-cache-mib` defaults to `auto` with `--fit` (on by default). `--moe-cache-mib N` sets an explicit GPU expert cache budget in MiB; `0` disables the cache.
 - **Hybrid placement**: combine GPU layer offload with `--cpu-moe` to keep all expert weights in system RAM, or `--n-cpu-moe N` to keep the first N layers' expert weights there.
 - **On-demand caching**: upload missing experts and evict least-recently-used entries when the cache fills. The cache supports single-GPU inference; OpenCL, tensor parallelism, multi-GPU execution, and training are not supported.
 
