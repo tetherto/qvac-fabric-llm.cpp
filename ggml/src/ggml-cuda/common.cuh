@@ -1494,6 +1494,22 @@ struct ggml_cuda_stream_context {
     }
 };
 
+// the FlashInfer GDN kernel's bf16 inputs packed by the fused conv kernel (q and k expanded to the value heads, v; each
+// [n_tokens][H_v][S] like gated_delta_net_flashinfer_prepare8_cuda writes them): one allocation reused by every layer,
+// grown for the largest ubatch seen; outgrown buffers stay allocated since a captured graph may still reference them
+struct ggml_cuda_gdn_pack {
+    const ggml_tensor * node = nullptr; // the gated delta net op the buffer is filled for, nullptr once consumed
+    bool f32_elided = false;            // the conv kernel skipped the f32 q/k/v stores: the pack is the only copy
+    void * data = nullptr;
+    size_t elements = 0; // bf16 elements per tensor of the current fill: q at data, k and v follow
+    size_t capacity = 0; // elements per tensor the allocation holds
+    std::vector<void *> retired;
+
+    void * q() const { return data; }
+    void * k() const { return (char *) data + elements*2; }
+    void * v() const { return (char *) data + elements*4; }
+};
+
 struct ggml_backend_cuda_context {
     int device;
     std::string name;
@@ -1505,6 +1521,7 @@ struct ggml_backend_cuda_context {
     size_t cublas_workspace_sizes[GGML_CUDA_MAX_DEVICES] = {0};
 
     int curr_stream_no = 0;
+    ggml_cuda_gdn_pack gdn_pack;
 
 #ifdef USE_CUDA_GRAPH
     // Map from first_node_ptr to cuda_graph - allows multiple graphs per context

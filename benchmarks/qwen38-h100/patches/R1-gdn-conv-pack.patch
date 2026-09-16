@@ -1,0 +1,576 @@
+diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
+index 284a8a627..b96f83188 100644
+--- a/ggml/src/ggml-cuda/common.cuh
++++ b/ggml/src/ggml-cuda/common.cuh
+@@ -1435,6 +1435,22 @@ struct ggml_cuda_stream_context {
+     }
+ };
+ 
++// the FlashInfer GDN kernel's bf16 inputs packed by the fused conv kernel (q and k expanded to the value heads, v; each
++// [n_tokens][H_v][S] like gated_delta_net_flashinfer_prepare8_cuda writes them): one allocation reused by every layer,
++// grown for the largest ubatch seen; outgrown buffers stay allocated since a captured graph may still reference them
++struct ggml_cuda_gdn_pack {
++    const ggml_tensor * node = nullptr; // the gated delta net op the buffer is filled for, nullptr once consumed
++    bool f32_elided = false;            // the conv kernel skipped the f32 q/k/v stores: the pack is the only copy
++    void * data = nullptr;
++    size_t elements = 0; // bf16 elements per tensor of the current fill: q at data, k and v follow
++    size_t capacity = 0; // elements per tensor the allocation holds
++    std::vector<void *> retired;
++
++    void * q() const { return data; }
++    void * k() const { return (char *) data + elements*2; }
++    void * v() const { return (char *) data + elements*4; }
++};
++
+ struct ggml_backend_cuda_context {
+     int device;
+     std::string name;
+@@ -1446,6 +1462,7 @@ struct ggml_backend_cuda_context {
+     size_t cublas_workspace_sizes[GGML_CUDA_MAX_DEVICES] = {0};
+ 
+     int curr_stream_no = 0;
++    ggml_cuda_gdn_pack gdn_pack;
+ 
+ #ifdef USE_CUDA_GRAPH
+     // Map from first_node_ptr to cuda_graph - allows multiple graphs per context
+diff --git a/ggml/src/ggml-cuda/gated_delta_net.cu b/ggml/src/ggml-cuda/gated_delta_net.cu
+index d1b3d8872..1c8f506f3 100644
+--- a/ggml/src/ggml-cuda/gated_delta_net.cu
++++ b/ggml/src/ggml-cuda/gated_delta_net.cu
+@@ -818,6 +818,32 @@ __global__ void gated_delta_net_flashinfer_cu_seqlens_cuda(
+     }
+ }
+ 
++// alpha/beta only: the q/k/v packs were written by the fused conv kernel (ctx.gdn_pack)
++__global__ void gated_delta_net_flashinfer_gates_cuda(
++        const float * g, const float * beta, float * alpha, float * beta_packed,
++        int64_t H_v, int64_t n_tokens, int64_t n_seqs, int64_t sb1, int64_t sb2, int64_t sb3) {
++    const int64_t idx = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
++    if (idx >= n_seqs * n_tokens * H_v) {
++        return;
++    }
++    ggml_cuda_pdl_sync();
++    const int64_t ih = idx % H_v;
++    const int64_t it = (idx / H_v) % n_tokens;
++    const int64_t is = idx / (H_v * n_tokens);
++    const int64_t src_gate_idx = is * sb3 + it * sb2 + ih * sb1;
++    alpha[idx]       = expf(g[src_gate_idx]);
++    beta_packed[idx] = beta[src_gate_idx];
++}
++
++static bool gdn_flashinfer_aot_serves(int64_t S_v, int64_t H, int64_t n_tokens, int64_t n_seqs, int64_t H_q) {
++    const int device = ggml_cuda_get_device();
++    const auto & info = ggml_cuda_info().devices[device];
++    return get_gdn_flashinfer_aot_launch() != nullptr && info.cc == GGML_CUDA_CC_HOPPER && S_v == 128 &&
++        n_tokens >= 64 && H_q > 0 && H % H_q == 0 && n_seqs <= 1023 &&
++        n_tokens * n_seqs <= INT32_MAX && H <= INT32_MAX && H_q <= INT32_MAX;
++}
++
++// pack_q/k/v: the bf16 inputs already written by the fused conv kernel (nullptr: packed here from the f32 sources)
+ static bool launch_gated_delta_net_flashinfer_aot(
+         ggml_backend_cuda_context & ctx,
+         const float * q_d, const float * k_d, const float * v_d,
+@@ -827,24 +853,29 @@ static bool launch_gated_delta_net_flashinfer_aot(
+         int64_t sq1, int64_t sq2, int64_t sq3,
+         int64_t sv1, int64_t sv2, int64_t sv3,
+         int64_t sb1, int64_t sb2, int64_t sb3,
+-        int64_t H_q, int64_t rq3, cudaStream_t stream) {
++        int64_t H_q, int64_t rq3, cudaStream_t stream,
++        __nv_bfloat16 * pack_q, __nv_bfloat16 * pack_k, __nv_bfloat16 * pack_v) {
+     const gdn_flashinfer_aot_launch_t launch = get_gdn_flashinfer_aot_launch();
+     const int device = ggml_cuda_get_device();
+     const auto & info = ggml_cuda_info().devices[device];
+-    if (launch == nullptr || info.cc != GGML_CUDA_CC_HOPPER || S_v != 128 ||
+-        n_tokens < 64 || H_q <= 0 || H % H_q != 0 || n_seqs > 1023 ||
+-        n_tokens * n_seqs > INT32_MAX || H > INT32_MAX || H_q > INT32_MAX) {
++    if (!gdn_flashinfer_aot_serves(S_v, H, n_tokens, n_seqs, H_q)) {
+         return false;
+     }
+ 
++    const bool packed = pack_q != nullptr;
+     const size_t v_elements = (size_t) n_seqs * n_tokens * H * S_v;
+     const size_t q_elements = v_elements;
+     const size_t gate_elements = (size_t) n_seqs * n_tokens * H;
+     const size_t tensormaps_bytes = (size_t) info.nsm * 128;
+ 
+-    ggml_cuda_pool_alloc<__nv_bfloat16> q_bf16(ctx.pool(), q_elements);
+-    ggml_cuda_pool_alloc<__nv_bfloat16> k_bf16(ctx.pool(), q_elements);
+-    ggml_cuda_pool_alloc<__nv_bfloat16> v_bf16(ctx.pool(), v_elements);
++    ggml_cuda_pool_alloc<__nv_bfloat16> q_bf16(ctx.pool());
++    ggml_cuda_pool_alloc<__nv_bfloat16> k_bf16(ctx.pool());
++    ggml_cuda_pool_alloc<__nv_bfloat16> v_bf16(ctx.pool());
++    if (!packed) {
++        pack_q = q_bf16.alloc(q_elements);
++        pack_k = k_bf16.alloc(q_elements);
++        pack_v = v_bf16.alloc(v_elements);
++    }
+     ggml_cuda_pool_alloc<__nv_bfloat16> out_bf16(ctx.pool(), v_elements);
+     ggml_cuda_pool_alloc<float> alpha(ctx.pool(), gate_elements);
+     ggml_cuda_pool_alloc<float> beta(ctx.pool(), gate_elements);
+@@ -858,20 +889,27 @@ static bool launch_gated_delta_net_flashinfer_aot(
+     const size_t prepare_threads = vec8 ? v_elements / 8 : v_elements;
+ 
+     const int threads = 256;
+-    ggml_cuda_kernel_launch_params prepare_params(
+-        dim3((prepare_threads + threads - 1) / threads, 1, 1), dim3(threads, 1, 1), 0, stream);
+-    if (vec8) {
+-        ggml_cuda_kernel_launch(gated_delta_net_flashinfer_prepare8_cuda, prepare_params,
+-            q_d, k_d, v_d, g_d, b_d,
+-            q_bf16.get(), k_bf16.get(), v_bf16.get(), alpha.get(), beta.get(),
+-            S_v, H_q, H, n_tokens, n_seqs,
+-            sq1, sq2, sq3, sv1, sv2, sv3, sb1, sb2, sb3, rq3);
++    if (packed) {
++        ggml_cuda_kernel_launch_params gates_params(
++            dim3((gate_elements + threads - 1) / threads, 1, 1), dim3(threads, 1, 1), 0, stream);
++        ggml_cuda_kernel_launch(gated_delta_net_flashinfer_gates_cuda, gates_params,
++            g_d, b_d, alpha.get(), beta.get(), H, n_tokens, n_seqs, sb1, sb2, sb3);
+     } else {
+-        ggml_cuda_kernel_launch(gated_delta_net_flashinfer_prepare_cuda, prepare_params,
+-            q_d, k_d, v_d, g_d, b_d,
+-            q_bf16.get(), k_bf16.get(), v_bf16.get(), alpha.get(), beta.get(),
+-            S_v, H_q, H, n_tokens, n_seqs,
+-            sq1, sq2, sq3, sv1, sv2, sv3, sb1, sb2, sb3, rq3);
++        ggml_cuda_kernel_launch_params prepare_params(
++            dim3((prepare_threads + threads - 1) / threads, 1, 1), dim3(threads, 1, 1), 0, stream);
++        if (vec8) {
++            ggml_cuda_kernel_launch(gated_delta_net_flashinfer_prepare8_cuda, prepare_params,
++                q_d, k_d, v_d, g_d, b_d,
++                pack_q, pack_k, pack_v, alpha.get(), beta.get(),
++                S_v, H_q, H, n_tokens, n_seqs,
++                sq1, sq2, sq3, sv1, sv2, sv3, sb1, sb2, sb3, rq3);
++        } else {
++            ggml_cuda_kernel_launch(gated_delta_net_flashinfer_prepare_cuda, prepare_params,
++                q_d, k_d, v_d, g_d, b_d,
++                pack_q, pack_k, pack_v, alpha.get(), beta.get(),
++                S_v, H_q, H, n_tokens, n_seqs,
++                sq1, sq2, sq3, sv1, sv2, sv3, sb1, sb2, sb3, rq3);
++        }
+     }
+ 
+     ggml_cuda_kernel_launch_params cu_params(
+@@ -880,7 +918,7 @@ static bool launch_gated_delta_net_flashinfer_aot(
+         cu_seqlens.get(), n_tokens, n_seqs);
+ 
+     const int rc = launch(
+-        q_bf16.get(), k_bf16.get(), v_bf16.get(), out_bf16.get(),
++        pack_q, pack_k, pack_v, out_bf16.get(),
+         alpha.get(), beta.get(), state_d, s_d, tensormaps.get(), cu_seqlens.get(),
+         (int32_t) (n_tokens * n_seqs), (int32_t) H, (int32_t) H, (int32_t) n_seqs,
+         (int32_t) tensormaps_bytes, stream);
+@@ -977,14 +1015,23 @@ static void ggml_cuda_op_gated_delta_net_impl(
+     }
+ 
+ #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
++    // the fused conv kernel may have packed this node's bf16 inputs (one use per fill)
++    ggml_cuda_gdn_pack & pack = ctx.gdn_pack;
++    const bool packed = pack.node == dst && pack.elements == (size_t) n_seqs * n_tokens * H * S_v;
++    pack.node = nullptr;
+     if (!kda && !keep_rs &&
+         launch_gated_delta_net_flashinfer_aot(
+             ctx, q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d,
+             S_v, H, n_tokens, n_seqs,
+             sq1, sq2, sq3, sv1, sv2, sv3, sb1, sb2, sb3,
+-            neqk1, rq3, stream)) {
++            neqk1, rq3, stream,
++            packed ? (__nv_bfloat16 *) pack.q() : nullptr,
++            packed ? (__nv_bfloat16 *) pack.k() : nullptr,
++            packed ? (__nv_bfloat16 *) pack.v() : nullptr)) {
+         return;
+     }
++    // the fallback kernels read the f32 q/k/v, which the conv kernel skipped when the pack was their only reader
++    GGML_ASSERT(!(packed && pack.f32_elided) && "FlashInfer GDN launch failed with conv-packed inputs");
+ #endif
+ 
+     // prefill: run whole chunks through the chunked kernel, then the serial kernel finishes the tail from that state.
+@@ -1055,3 +1102,17 @@ void ggml_cuda_op_gated_delta_net_fused_cache(
+         ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_cuda_gated_delta_net_fused_cache cache) {
+     ggml_cuda_op_gated_delta_net_impl(ctx, dst, &cache);
+ }
++
++bool ggml_cuda_gated_delta_net_flashinfer_aot(const ggml_tensor * dst) {
++#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
++    const ggml_tensor * src_q = dst->src[0];
++    const ggml_tensor * src_v = dst->src[2];
++    const ggml_tensor * src_g = dst->src[3];
++    const bool kda = src_g->ne[0] == src_v->ne[0];
++    return !kda && ggml_get_op_params_i32(dst, 0) <= 1 &&
++        gdn_flashinfer_aot_serves(src_v->ne[0], src_v->ne[1], src_v->ne[2], src_v->ne[3], src_q->ne[1]);
++#else
++    GGML_UNUSED(dst);
++    return false;
++#endif
++}
+diff --git a/ggml/src/ggml-cuda/gated_delta_net.cuh b/ggml/src/ggml-cuda/gated_delta_net.cuh
+index f9bf43706..c95ee7877 100644
+--- a/ggml/src/ggml-cuda/gated_delta_net.cuh
++++ b/ggml/src/ggml-cuda/gated_delta_net.cuh
+@@ -12,3 +12,7 @@ void ggml_cuda_op_gated_delta_net(ggml_backend_cuda_context & ctx, ggml_tensor *
+ // same op, but writes the snapshot(s) into the cache instead of dst (see ggml_cuda_try_gdn_cache_fusion)
+ void ggml_cuda_op_gated_delta_net_fused_cache(ggml_backend_cuda_context & ctx, ggml_tensor * dst,
+                                               ggml_cuda_gated_delta_net_fused_cache cache);
++
++// whether the op runs on the FlashInfer SM90 AOT kernel (library loaded, Hopper, S_v 128, at least 64 tokens, K 1):
++// the fused conv kernel packs the kernel's bf16 q/k/v inputs (ctx.gdn_pack) only for such a node
++bool ggml_cuda_gated_delta_net_flashinfer_aot(const ggml_tensor * dst);
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 30298c7a4..4ed8b69a0 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -721,6 +721,12 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
+     if (copy_event != nullptr) {
+         CUDA_CHECK(cudaEventDestroy(copy_event));
+     }
++    if (gdn_pack.data != nullptr) {
++        CUDA_CHECK(cudaFree(gdn_pack.data));
++    }
++    for (void * p : gdn_pack.retired) {
++        CUDA_CHECK(cudaFree(p));
++    }
+     for (int i = 0; i < GGML_CUDA_MAX_DEVICES; ++i) {
+         for (int j = 0; j < GGML_CUDA_MAX_STREAMS; ++j) {
+             if (streams[i][j] != nullptr) {
+@@ -3832,9 +3838,10 @@ static int ggml_cuda_try_conv_state_fusion(const ggml_cgraph * cgraph, int node_
+ // the prefill form of the conv-state run: the same get_rows -> concat -> cpy run directly followed by the
+ // ssm_conv -> [add] -> silu -> l2-norm run, one sequence above the small-batch token limit. The concat and the
+ // transposed copy are never materialized: one kernel reads the state row and the token projection, writes the silu
+-// output, the norms and the next state row. Returns the nodes to skip after the get_rows, 0 when absent
++// output, the norms and the next state row. Returns the nodes to skip after the get_rows, 0 when absent; written
++// receives the node indices of the silu output and of the l2.n norm outputs
+ static int ggml_cuda_try_conv_tokens_fusion(const ggml_cgraph * cgraph, int node_idx, ggml_cuda_ssm_conv_tokens_args & ta,
+-                                            ggml_cuda_ssm_conv_l2 & l2) {
++                                            ggml_cuda_ssm_conv_l2 & l2, int * written) {
+     constexpr int max_nodes = 31;
+     ggml_cuda_conv_state_args a;
+     int concat_idx = -1;
+@@ -3891,7 +3898,6 @@ static int ggml_cuda_try_conv_tokens_fusion(const ggml_cgraph * cgraph, int node
+ 
+     // the written buffers (silu output, norm outputs) must not overlap the token projection; the next state row may
+     // be the gathered row (each thread reads its elements before it writes them)
+-    int written[1 + GGML_CUDA_SSM_CONV_MAX_L2];
+     written[0] = conv_idx + m.n_base - 1;
+     for (int r = 0; r < l2.n; ++r) {
+         written[1 + r] = m.out_idx[r];
+@@ -3919,6 +3925,119 @@ static int ggml_cuda_try_conv_tokens_fusion(const ggml_cgraph * cgraph, int node
+     return count - 1;
+ }
+ 
++// the FlashInfer GDN kernel's bf16 inputs written by the fused conv kernel: finds the gated delta net node fed by the
++// run's normalized q/k slices and by a head-major view of the silu output (v), checks that it takes the AOT path,
++// and points the conv launch at the context's pack buffer (grown for the largest ubatch seen); the gdn op then packs
++// the gates only. When nothing but the run and that node reads the silu output and the norms (view chains included,
++// no output flags), the kernel also skips their f32 stores: the pack is the only output (the gdn op aborts instead of
++// falling back if the AOT launch fails). Silent when the node is absent or shaped differently: the gdn op packs from
++// the f32 tensors. GGML_CUDA_DISABLE_GDN_PACK=1 turns it off for A/B runs
++static void ggml_cuda_conv_tokens_pack_for_gdn(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int node_idx,
++                                               int first_idx, const int * written,
++                                               ggml_cuda_ssm_conv_tokens_args & ta, ggml_cuda_ssm_conv_l2 & l2) {
++    constexpr int64_t S = 128;
++    static const bool disabled = getenv("GGML_CUDA_DISABLE_GDN_PACK") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_GDN_PACK"));
++    if (disabled || l2.n != 2) {
++        return;
++    }
++    const ggml_tensor * gdn = nullptr;
++    const char * y0 = (const char *) ta.y;
++    const char * y1 = y0 + (size_t) ta.n_ch * ta.n_t * sizeof(float);
++    for (int j = first_idx; j < cgraph->n_nodes && j < first_idx + 32; ++j) {
++        const ggml_tensor * node = cgraph->nodes[j];
++        if (node->op == GGML_OP_GATED_DELTA_NET) {
++            const char * v = (const char *) node->src[2]->data;
++            if (v >= y0 && v < y1) {
++                gdn = node;
++            }
++            break;
++        }
++    }
++    if (gdn == nullptr || !ggml_cuda_gated_delta_net_flashinfer_aot(gdn)) {
++        return;
++    }
++    const ggml_tensor * q = gdn->src[0];
++    const ggml_tensor * k = gdn->src[1];
++    const ggml_tensor * v = gdn->src[2];
++    const int64_t H_v = v->ne[1];
++    // v: [S, H_v, n_t] straight out of the silu rows
++    if (v->type != GGML_TYPE_F32 || v->ne[0] != S || v->ne[2] != ta.n_t || v->ne[3] != 1 ||
++        v->nb[1] != S*sizeof(float) || v->nb[2] != (size_t) ta.n_ch*sizeof(float)) {
++        return;
++    }
++    const int64_t v_ch0 = ((const float *) v->data - ta.y);
++    if (v_ch0 % S != 0 || v_ch0 + H_v*S > ta.n_ch) {
++        return;
++    }
++    // q and k: each the whole of one norm slice, [S, n_heads, n_t] with the slice's strides
++    int slice[2] = {-1, -1};
++    for (int s = 0; s < 2; ++s) {
++        const ggml_tensor * t = s == 0 ? q : k;
++        for (int r = 0; r < l2.n; ++r) {
++            const int64_t n_heads = (l2.ch1[r] - l2.ch0[r]) / S;
++            if (t->type == GGML_TYPE_F32 && t->data == l2.dst[r] && t->ne[0] == S && t->ne[1] == n_heads &&
++                t->ne[2] == ta.n_t && t->ne[3] == 1 && t->nb[1] == (size_t) l2.nb1[r]*sizeof(float) &&
++                t->nb[2] == (size_t) l2.nb2[r]*sizeof(float) && H_v % n_heads == 0) {
++                slice[s] = r;
++            }
++        }
++    }
++    if (slice[0] < 0 || slice[1] < 0 || slice[0] == slice[1]) {
++        return;
++    }
++
++    ggml_cuda_gdn_pack & pack = ctx.gdn_pack;
++    const size_t elements = (size_t) ta.n_t * H_v * S;
++    if (elements > pack.capacity) {
++        if (pack.data != nullptr) {
++            pack.retired.push_back(pack.data);
++        }
++        ggml_cuda_set_device(ctx.device);
++        CUDA_CHECK(cudaMalloc(&pack.data, 3*elements*sizeof(__nv_bfloat16)));
++        pack.capacity = elements;
++    }
++    pack.elements = elements;
++    pack.node     = gdn;
++    pack.f32_elided = false;
++    l2.pack[slice[0]] = (__nv_bfloat16 *) pack.q();
++    l2.pack[slice[1]] = (__nv_bfloat16 *) pack.k();
++    l2.pack_heads     = (int) H_v;
++    ta.v_pack = (__nv_bfloat16 *) pack.v();
++    ta.v_ch0  = (int) v_ch0;
++    ta.v_nch  = (int) (H_v*S);
++
++    // are the f32 outputs dead: every reader outside the run is the gdn node or a view op (whose own readers are
++    // checked in turn since they list the view as a source)
++    const ggml_tensor * roots[1 + GGML_CUDA_SSM_CONV_MAX_L2];
++    for (int i = 0; i < 1 + l2.n; ++i) {
++        roots[i] = cgraph->nodes[written[i]];
++        if (roots[i]->flags & GGML_TENSOR_FLAG_OUTPUT) {
++            return;
++        }
++    }
++    for (int j = 0; j < cgraph->n_nodes; ++j) {
++        const ggml_tensor * node = cgraph->nodes[j];
++        if ((j >= node_idx && j < first_idx) || node == gdn || ggml_cuda_is_view_or_noop(node)) {
++            continue;
++        }
++        for (int s = 0; s < GGML_MAX_SRC && node->src[s] != nullptr; ++s) {
++            const ggml_tensor * root = node->src[s];
++            while (root->view_src != nullptr) {
++                root = root->view_src;
++            }
++            for (int i = 0; i < 1 + l2.n; ++i) {
++                if (root == roots[i]) {
++                    return;
++                }
++            }
++        }
++    }
++    pack.f32_elided = true;
++    ta.y = nullptr;
++    l2.dst[slice[0]] = nullptr;
++    l2.dst[slice[1]] = nullptr;
++}
++
+ // two or three F8 mul_mats on one F32 activation, consecutive up to view nodes (q/k/v, the delta-net qkv/z): the
+ // CUTLASS batch quantizes the activation once for all of them, the GEMV batch runs one launch. Executes the run and
+ // returns the nodes to skip, 0 when it does not apply. Yields to the fused up/gate GEMV when a swiglu of two of the
+@@ -4028,8 +4147,10 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+     if (node->op == GGML_OP_GET_ROWS) {
+         ggml_cuda_ssm_conv_tokens_args ta;
+         ggml_cuda_ssm_conv_l2 l2;
+-        const int tokens_to_skip = ggml_cuda_try_conv_tokens_fusion(cgraph, i, ta, l2);
++        int written[1 + GGML_CUDA_SSM_CONV_MAX_L2];
++        const int tokens_to_skip = ggml_cuda_try_conv_tokens_fusion(cgraph, i, ta, l2, written);
+         if (tokens_to_skip > 0) {
++            ggml_cuda_conv_tokens_pack_for_gdn(*cuda_ctx, cgraph, i, i + tokens_to_skip + 1, written, ta, l2);
+             ggml_cuda_op_ssm_conv_tokens(*cuda_ctx, ta, l2);
+             return tokens_to_skip;
+         }
+diff --git a/ggml/src/ggml-cuda/ssm-conv.cu b/ggml/src/ggml-cuda/ssm-conv.cu
+index 964232b67..ce2626b89 100644
+--- a/ggml/src/ggml-cuda/ssm-conv.cu
++++ b/ggml/src/ggml-cuda/ssm-conv.cu
+@@ -259,20 +259,25 @@ void ggml_cuda_op_ssm_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst, g
+     }
+ }
+ 
+-// one block = 128 consecutive channels (one head of a norm slice) x a tile of split_t tokens; the d_conv inputs of a
+-// channel sit in registers, the first d_conv-1 come from the state row (first tile) or from the previous tokens.
+-// Same accumulation order as ssm_conv_long_token_f32, so the sums are bit-identical to the concat path
++// one block = 128 consecutive channels (one head of a norm slice) x a tile of split_t tokens. The tile's inputs are
++// loaded into registers up front (split_t independent loads per thread, so the loop is not one memory round trip per
++// token), the conv runs from registers with the same accumulation order as ssm_conv_long_token_f32 (bit-identical
++// sums), and the per-token L2 norms of a slice are reduced in one batch: a warp reduction per token, one shared
++// exchange and one barrier for the tile instead of a block reduction per token
+ template <int d_conv, bool with_l2, int split_t>
+ static __global__ void ssm_conv_tokens_f32(const ggml_cuda_ssm_conv_tokens_args a, const ggml_cuda_ssm_conv_l2 l2) {
+     constexpr int split_ch = 128;
++    constexpr int n_warps  = split_ch/WARP_SIZE;
+     ggml_cuda_pdl_lc();
+     const int tid       = threadIdx.x;
++    const int warp      = tid / WARP_SIZE;
++    const int lane      = tid % WARP_SIZE;
+     const int ch_base   = blockIdx.x*split_ch;
+     const int c         = ch_base + tid;
+     const int t0        = blockIdx.y*split_t;
+     const int local_n_t = min(split_t, a.n_t - t0);
+ 
+-    __shared__ float s_red[2][WARP_SIZE];
++    __shared__ float s_red[n_warps][split_t];
+     const int l2_slice = with_l2 ? ssm_conv_l2_slice<split_ch>(l2, ch_base) : -1;
+ 
+     // weights and bias never depend on the previous kernel: load them before the grid dependency
+@@ -297,28 +302,104 @@ static __global__ void ssm_conv_tokens_f32(const ggml_cuda_ssm_conv_tokens_args
+             win[j] = a.x[(t0 - (d_conv - 1) + j)*a.x_stride_t + c];
+         }
+     }
++    float xt[split_t];
++#pragma unroll
++    for (int i = 0; i < split_t; i++) {
++        xt[i] = i < local_n_t ? a.x[(t0 + i)*a.x_stride_t + c] : 0.0f;
++    }
+ 
+-    for (int i = 0; i < local_n_t; i++) {
+-        win[d_conv - 1] = a.x[(t0 + i)*a.x_stride_t + c];
++    float yv[split_t];
++#pragma unroll
++    for (int i = 0; i < split_t; i++) {
++        win[d_conv - 1] = xt[i];
+         float sumf = 0.0f;
+ #pragma unroll
+         for (int j = 0; j < d_conv; j++) {
+             sumf += win[j]*w[j];
+         }
+         sumf += b;
+-        const float y = ggml_cuda_op_silu_single(sumf);
+-        a.y[(t0 + i)*(int64_t) a.n_ch + c] = y;
+-        if constexpr (with_l2) {
+-            if (l2_slice >= 0) { // block-uniform
+-                ssm_conv_l2_row<split_ch>(l2, l2_slice, ch_base, t0 + i, 0, tid, y, s_red[i & 1]);
+-            }
+-        }
++        yv[i] = ggml_cuda_op_silu_single(sumf);
+ #pragma unroll
+         for (int j = 0; j < d_conv - 1; j++) {
+             win[j] = win[j + 1];
+         }
+     }
+ 
++    if (a.y != nullptr) { // null when the bf16 packs are the only consumers' copy
++#pragma unroll
++        for (int i = 0; i < split_t; i++) {
++            if (i < local_n_t) {
++                a.y[(t0 + i)*(int64_t) a.n_ch + c] = yv[i];
++            }
++        }
++    }
++    if (a.v_pack != nullptr && c >= a.v_ch0 && c < a.v_ch0 + a.v_nch) { // block-uniform
++#pragma unroll
++        for (int i = 0; i < split_t; i++) {
++            if (i < local_n_t) {
++                a.v_pack[(t0 + i)*(int64_t) a.v_nch + (c - a.v_ch0)] = __float2bfloat16_rn(yv[i]);
++            }
++        }
++    }
++
++    if constexpr (with_l2) {
++        if (l2_slice >= 0) { // block-uniform
++            // constant indices only: a dynamic index into the parameter struct would copy it to local memory per thread
++            int     ch0   = l2.ch0[0];
++            int     ch1   = l2.ch1[0];
++            float   eps   = l2.eps[0];
++            float   scl   = l2.scale[0];
++            float * dst   = l2.dst[0];
++            int64_t nb1   = l2.nb1[0];
++            int64_t nb2   = l2.nb2[0];
++            __nv_bfloat16 * pack = l2.pack[0];
++#pragma unroll
++            for (int r = 1; r < GGML_CUDA_SSM_CONV_MAX_L2; r++) {
++                if (r == l2_slice) {
++                    ch0  = l2.ch0[r];
++                    ch1  = l2.ch1[r];
++                    eps  = l2.eps[r];
++                    scl  = l2.scale[r];
++                    dst  = l2.dst[r];
++                    nb1  = l2.nb1[r];
++                    nb2  = l2.nb2[r];
++                    pack = l2.pack[r];
++                }
++            }
++#pragma unroll
++            for (int i = 0; i < split_t; i++) {
++                const float ss = warp_reduce_sum(yv[i]*yv[i]);
++                if (lane == 0) {
++                    s_red[warp][i] = ss;
++                }
++            }
++            __syncthreads();
++            const int     n_heads = (ch1 - ch0) / split_ch;
++            const int64_t head    = (ch_base - ch0) / split_ch;
++#pragma unroll
++            for (int i = 0; i < split_t; i++) {
++                if (i < local_n_t) {
++                    // the warp partials are combined in block_reduce's order (a shuffle tree over lanes 0..n_warps-1),
++                    // so the sums equal the per-token block_reduce bit for bit. The order is load-bearing: a one-ulp
++                    // change of this sum moves the Qwen3.8 GX gate from exact to 0.0136 mean KLD (the delta-net state
++                    // amplifies it), so a sequential sum of the partials is not an option
++                    const float ss    = warp_reduce_sum(lane < n_warps ? s_red[lane][i] : 0.0f);
++                    const float scale = rsqrtf(fmaxf(ss, eps*eps)) * scl;
++                    const float o     = yv[i]*scale;
++                    if (dst != nullptr) {
++                        dst[head*nb1 + (int64_t) (t0 + i)*nb2 + tid] = o;
++                    }
++                    if (pack != nullptr) {
++                        const __nv_bfloat16 ob = __float2bfloat16_rn(o);
++                        for (int hv = head; hv < l2.pack_heads; hv += n_heads) {
++                            pack[((t0 + i)*(int64_t) l2.pack_heads + hv)*split_ch + tid] = ob;
++                        }
++                    }
++                }
++            }
++        }
++    }
++
+     // the next state row = the last d_conv-1 tokens; only the first tile's blocks read the state row, and the same
+     // thread read its elements above, so writing the row in place is safe
+     if (blockIdx.y == 0) {
+diff --git a/ggml/src/ggml-cuda/ssm-conv.cuh b/ggml/src/ggml-cuda/ssm-conv.cuh
+index bc47188ba..105356318 100644
+--- a/ggml/src/ggml-cuda/ssm-conv.cuh
++++ b/ggml/src/ggml-cuda/ssm-conv.cuh
+@@ -4,7 +4,10 @@
+ 
+ // per-head L2 norms of channel slices of the (silu) conv output (the q/k heads of a gated delta net), computed in the
+ // conv kernel's epilogue; each slice is [head_dim = 128 channels, n_heads] at channel ch0, its normalized rows go to
+-// dst with the given strides (in floats) and an optional folded scale
++// dst with the given strides (in floats) and an optional folded scale. pack[r] (optional, token batches only) also
++// receives the normalized rows as bf16 in the FlashInfer layout [n_t][pack_heads][128], head h of the slice repeated
++// at every value head hv with hv % n_heads == h (the head mapping of gated_delta_net_flashinfer_prepare8_cuda);
++// dst[r] may then be nullptr when the pack is the only copy read
+ struct ggml_cuda_ssm_conv_l2 {
+     int     n = 0;
+     int     ch0[GGML_CUDA_SSM_CONV_MAX_L2];
+@@ -15,6 +18,8 @@ struct ggml_cuda_ssm_conv_l2 {
+     int64_t nb1[GGML_CUDA_SSM_CONV_MAX_L2]; // head stride
+     int64_t nb2[GGML_CUDA_SSM_CONV_MAX_L2]; // token stride
+     int64_t nb3[GGML_CUDA_SSM_CONV_MAX_L2]; // sequence stride
++    __nv_bfloat16 * pack[GGML_CUDA_SSM_CONV_MAX_L2] = {nullptr, nullptr};
++    int     pack_heads = 0;
+ };
+ 
+ void ggml_cuda_op_ssm_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_tensor * bias_add_node = nullptr, ggml_tensor * silu_dst = nullptr,
+@@ -30,14 +35,17 @@ struct ggml_cuda_ssm_conv_tokens_args {
+     const float   * x;             // [n_ch, n_t], token stride x_stride_t floats
+     const float   * w;             // [d_conv, n_ch], channel stride w_stride floats
+     const float   * bias;          // [n_ch] or nullptr
+-    float         * y;             // [n_ch, n_t] contiguous (the silu output)
++    float         * y;             // [n_ch, n_t] contiguous (the silu output); nullptr when only the packs are read
+     float         * cache;         // [n_ch][d_conv-1] the next state row (may be the row states[idx[0]])
++    __nv_bfloat16 * v_pack = nullptr; // optional: channels [v_ch0, v_ch0 + v_nch) of y as bf16 [n_t][v_nch]
+     int64_t states_stride;
+     int64_t x_stride_t;
+     int64_t w_stride;
+     int     n_ch;
+     int     d_conv;                // 3, 4, 5 or 9
+     int     n_t;                   // > GGML_CUDA_CONV_STATE_MAX_T
++    int     v_ch0 = 0;             // multiples of 128
++    int     v_nch = 0;
+ };
+ 
+ bool ggml_cuda_ssm_conv_tokens_supported(const ggml_cuda_ssm_conv_tokens_args & a);

@@ -818,6 +818,32 @@ __global__ void gated_delta_net_flashinfer_cu_seqlens_cuda(
     }
 }
 
+// alpha/beta only: the q/k/v packs were written by the fused conv kernel (ctx.gdn_pack)
+__global__ void gated_delta_net_flashinfer_gates_cuda(
+        const float * g, const float * beta, float * alpha, float * beta_packed,
+        int64_t H_v, int64_t n_tokens, int64_t n_seqs, int64_t sb1, int64_t sb2, int64_t sb3) {
+    const int64_t idx = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n_seqs * n_tokens * H_v) {
+        return;
+    }
+    ggml_cuda_pdl_sync();
+    const int64_t ih = idx % H_v;
+    const int64_t it = (idx / H_v) % n_tokens;
+    const int64_t is = idx / (H_v * n_tokens);
+    const int64_t src_gate_idx = is * sb3 + it * sb2 + ih * sb1;
+    alpha[idx]       = expf(g[src_gate_idx]);
+    beta_packed[idx] = beta[src_gate_idx];
+}
+
+static bool gdn_flashinfer_aot_serves(int64_t S_v, int64_t H, int64_t n_tokens, int64_t n_seqs, int64_t H_q) {
+    const int device = ggml_cuda_get_device();
+    const auto & info = ggml_cuda_info().devices[device];
+    return get_gdn_flashinfer_aot_launch() != nullptr && info.cc == GGML_CUDA_CC_HOPPER && S_v == 128 &&
+        n_tokens >= 64 && H_q > 0 && H % H_q == 0 && n_seqs <= 1023 &&
+        n_tokens * n_seqs <= INT32_MAX && H <= INT32_MAX && H_q <= INT32_MAX;
+}
+
+// pack_q/k/v: the bf16 inputs already written by the fused conv kernel (nullptr: packed here from the f32 sources)
 static bool launch_gated_delta_net_flashinfer_aot(
         ggml_backend_cuda_context & ctx,
         const float * q_d, const float * k_d, const float * v_d,
@@ -827,24 +853,29 @@ static bool launch_gated_delta_net_flashinfer_aot(
         int64_t sq1, int64_t sq2, int64_t sq3,
         int64_t sv1, int64_t sv2, int64_t sv3,
         int64_t sb1, int64_t sb2, int64_t sb3,
-        int64_t H_q, int64_t rq3, cudaStream_t stream) {
+        int64_t H_q, int64_t rq3, cudaStream_t stream,
+        __nv_bfloat16 * pack_q, __nv_bfloat16 * pack_k, __nv_bfloat16 * pack_v) {
     const gdn_flashinfer_aot_launch_t launch = get_gdn_flashinfer_aot_launch();
     const int device = ggml_cuda_get_device();
     const auto & info = ggml_cuda_info().devices[device];
-    if (launch == nullptr || info.cc != GGML_CUDA_CC_HOPPER || S_v != 128 ||
-        n_tokens < 64 || H_q <= 0 || H % H_q != 0 || n_seqs > 1023 ||
-        n_tokens * n_seqs > INT32_MAX || H > INT32_MAX || H_q > INT32_MAX) {
+    if (!gdn_flashinfer_aot_serves(S_v, H, n_tokens, n_seqs, H_q)) {
         return false;
     }
 
+    const bool packed = pack_q != nullptr;
     const size_t v_elements = (size_t) n_seqs * n_tokens * H * S_v;
     const size_t q_elements = v_elements;
     const size_t gate_elements = (size_t) n_seqs * n_tokens * H;
     const size_t tensormaps_bytes = (size_t) info.nsm * 128;
 
-    ggml_cuda_pool_alloc<__nv_bfloat16> q_bf16(ctx.pool(), q_elements);
-    ggml_cuda_pool_alloc<__nv_bfloat16> k_bf16(ctx.pool(), q_elements);
-    ggml_cuda_pool_alloc<__nv_bfloat16> v_bf16(ctx.pool(), v_elements);
+    ggml_cuda_pool_alloc<__nv_bfloat16> q_bf16(ctx.pool());
+    ggml_cuda_pool_alloc<__nv_bfloat16> k_bf16(ctx.pool());
+    ggml_cuda_pool_alloc<__nv_bfloat16> v_bf16(ctx.pool());
+    if (!packed) {
+        pack_q = q_bf16.alloc(q_elements);
+        pack_k = k_bf16.alloc(q_elements);
+        pack_v = v_bf16.alloc(v_elements);
+    }
     ggml_cuda_pool_alloc<__nv_bfloat16> out_bf16(ctx.pool(), v_elements);
     ggml_cuda_pool_alloc<float> alpha(ctx.pool(), gate_elements);
     ggml_cuda_pool_alloc<float> beta(ctx.pool(), gate_elements);
@@ -858,20 +889,27 @@ static bool launch_gated_delta_net_flashinfer_aot(
     const size_t prepare_threads = vec8 ? v_elements / 8 : v_elements;
 
     const int threads = 256;
-    ggml_cuda_kernel_launch_params prepare_params(
-        dim3((prepare_threads + threads - 1) / threads, 1, 1), dim3(threads, 1, 1), 0, stream);
-    if (vec8) {
-        ggml_cuda_kernel_launch(gated_delta_net_flashinfer_prepare8_cuda, prepare_params,
-            q_d, k_d, v_d, g_d, b_d,
-            q_bf16.get(), k_bf16.get(), v_bf16.get(), alpha.get(), beta.get(),
-            S_v, H_q, H, n_tokens, n_seqs,
-            sq1, sq2, sq3, sv1, sv2, sv3, sb1, sb2, sb3, rq3);
+    if (packed) {
+        ggml_cuda_kernel_launch_params gates_params(
+            dim3((gate_elements + threads - 1) / threads, 1, 1), dim3(threads, 1, 1), 0, stream);
+        ggml_cuda_kernel_launch(gated_delta_net_flashinfer_gates_cuda, gates_params,
+            g_d, b_d, alpha.get(), beta.get(), H, n_tokens, n_seqs, sb1, sb2, sb3);
     } else {
-        ggml_cuda_kernel_launch(gated_delta_net_flashinfer_prepare_cuda, prepare_params,
-            q_d, k_d, v_d, g_d, b_d,
-            q_bf16.get(), k_bf16.get(), v_bf16.get(), alpha.get(), beta.get(),
-            S_v, H_q, H, n_tokens, n_seqs,
-            sq1, sq2, sq3, sv1, sv2, sv3, sb1, sb2, sb3, rq3);
+        ggml_cuda_kernel_launch_params prepare_params(
+            dim3((prepare_threads + threads - 1) / threads, 1, 1), dim3(threads, 1, 1), 0, stream);
+        if (vec8) {
+            ggml_cuda_kernel_launch(gated_delta_net_flashinfer_prepare8_cuda, prepare_params,
+                q_d, k_d, v_d, g_d, b_d,
+                pack_q, pack_k, pack_v, alpha.get(), beta.get(),
+                S_v, H_q, H, n_tokens, n_seqs,
+                sq1, sq2, sq3, sv1, sv2, sv3, sb1, sb2, sb3, rq3);
+        } else {
+            ggml_cuda_kernel_launch(gated_delta_net_flashinfer_prepare_cuda, prepare_params,
+                q_d, k_d, v_d, g_d, b_d,
+                pack_q, pack_k, pack_v, alpha.get(), beta.get(),
+                S_v, H_q, H, n_tokens, n_seqs,
+                sq1, sq2, sq3, sv1, sv2, sv3, sb1, sb2, sb3, rq3);
+        }
     }
 
     ggml_cuda_kernel_launch_params cu_params(
@@ -880,7 +918,7 @@ static bool launch_gated_delta_net_flashinfer_aot(
         cu_seqlens.get(), n_tokens, n_seqs);
 
     const int rc = launch(
-        q_bf16.get(), k_bf16.get(), v_bf16.get(), out_bf16.get(),
+        pack_q, pack_k, pack_v, out_bf16.get(),
         alpha.get(), beta.get(), state_d, s_d, tensormaps.get(), cu_seqlens.get(),
         (int32_t) (n_tokens * n_seqs), (int32_t) H, (int32_t) H, (int32_t) n_seqs,
         (int32_t) tensormaps_bytes, stream);
@@ -977,14 +1015,23 @@ static void ggml_cuda_op_gated_delta_net_impl(
     }
 
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    // the fused conv kernel may have packed this node's bf16 inputs (one use per fill)
+    ggml_cuda_gdn_pack & pack = ctx.gdn_pack;
+    const bool packed = pack.node == dst && pack.elements == (size_t) n_seqs * n_tokens * H * S_v;
+    pack.node = nullptr;
     if (!kda && !keep_rs &&
         launch_gated_delta_net_flashinfer_aot(
             ctx, q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d,
             S_v, H, n_tokens, n_seqs,
             sq1, sq2, sq3, sv1, sv2, sv3, sb1, sb2, sb3,
-            neqk1, rq3, stream)) {
+            neqk1, rq3, stream,
+            packed ? (__nv_bfloat16 *) pack.q() : nullptr,
+            packed ? (__nv_bfloat16 *) pack.k() : nullptr,
+            packed ? (__nv_bfloat16 *) pack.v() : nullptr)) {
         return;
     }
+    // the fallback kernels read the f32 q/k/v, which the conv kernel skipped when the pack was their only reader
+    GGML_ASSERT(!(packed && pack.f32_elided) && "FlashInfer GDN launch failed with conv-packed inputs");
 #endif
 
     // prefill: run whole chunks through the chunked kernel, then the serial kernel finishes the tail from that state.
@@ -1054,4 +1101,18 @@ void ggml_cuda_op_gated_delta_net(ggml_backend_cuda_context & ctx, ggml_tensor *
 void ggml_cuda_op_gated_delta_net_fused_cache(
         ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_cuda_gated_delta_net_fused_cache cache) {
     ggml_cuda_op_gated_delta_net_impl(ctx, dst, &cache);
+}
+
+bool ggml_cuda_gated_delta_net_flashinfer_aot(const ggml_tensor * dst) {
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    const ggml_tensor * src_q = dst->src[0];
+    const ggml_tensor * src_v = dst->src[2];
+    const ggml_tensor * src_g = dst->src[3];
+    const bool kda = src_g->ne[0] == src_v->ne[0];
+    return !kda && ggml_get_op_params_i32(dst, 0) <= 1 &&
+        gdn_flashinfer_aot_serves(src_v->ne[0], src_v->ne[1], src_v->ne[2], src_v->ne[3], src_q->ne[1]);
+#else
+    GGML_UNUSED(dst);
+    return false;
+#endif
 }
