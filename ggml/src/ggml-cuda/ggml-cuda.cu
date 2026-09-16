@@ -3344,6 +3344,10 @@ static bool ggml_cuda_should_fuse_add_rms_norm_mul(const ggml_tensor * add,
     // by every row, and any other overlap (partial, or through padded allocations) is rejected
     const ggml_tensor * a = add->src[0];
     const ggml_tensor * b = add->src[1];
+    // the same tensor object twice is not caught by the pair loop below: only a == b (add(x, x)) is harmless
+    if (w == a || w == b) {
+        return false;
+    }
     auto alias_ok = [&](const ggml_tensor * x, const ggml_tensor * y) {
         return (x == a && y == b) || ((x == add || x == mul) && (y == a || y == b));
     };
