@@ -39,6 +39,12 @@ env:
 
 jobs:
   ubuntu-24-openvino:
+    # QVAC-24501: needs Intel + OpenVINO hardware, not present in the fleet, so
+    # this queued for 24h and was killed on every run. Same convention as the
+    # gated jobs in build-self-hosted.yml. Note openvino-windows-2022 below is
+    # deliberately left running - it is on a GitHub image and passes, so it
+    # keeps our only OpenVINO build coverage.
+    if: false  # QVAC-23796: no matching hardware
     runs-on: [self-hosted, Linux, Intel, OpenVINO]
 
     env:

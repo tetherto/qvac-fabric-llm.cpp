@@ -16,7 +16,11 @@ on:
 
 jobs:
     update-ops-docs:
-        runs-on: [self-hosted, fast, ARM64]
+        # QVAC-24501: upstream's [self-hosted, fast, ARM64] needs a custom `fast`
+        # label the qvac fleet does not carry. The job only runs
+        # scripts/create_ops_docs.py and diffs the result, so it does not need
+        # ARM64 either - the general-purpose fleet CPU box is enough.
+        runs-on: qvac-ubuntu2404-x64
 
         steps:
         - name: Checkout repository
@@ -27,18 +31,25 @@ jobs:
           with:
               python-version: '3.x'
 
+        # QVAC-24501: upstream wrote this against a fixed /tmp/ops_check path.
+        # Our fleet hosts run several runner accounts side by side, so /tmp is
+        # shared: the first job to run creates the directory, and the next job
+        # on a different runner account gets EACCES writing into it. Observed
+        # exactly that - runner5 created it, runner9 then failed with
+        # "PermissionError: [Errno 13] Permission denied: '/tmp/ops_check/ops.md'".
+        # $RUNNER_TEMP is per-job and cleaned up, so it cannot collide.
         - name: Generate operations documentation to temporary file
           run: |
-              mkdir -p /tmp/ops_check
-              ./scripts/create_ops_docs.py /tmp/ops_check/ops.md
+              mkdir -p "$RUNNER_TEMP/ops_check"
+              ./scripts/create_ops_docs.py "$RUNNER_TEMP/ops_check/ops.md"
 
         - name: Check if docs/ops.md matches generated version
           run: |
-              if ! diff -q docs/ops.md /tmp/ops_check/ops.md; then
+              if ! diff -q docs/ops.md "$RUNNER_TEMP/ops_check/ops.md"; then
                   echo "Operations documentation (docs/ops.md) is not up to date with the backend CSV files."
                   echo "To fix: run ./scripts/create_ops_docs.py and commit the updated docs/ops.md along with your changes"
                   echo "Differences found:"
-                  diff docs/ops.md /tmp/ops_check/ops.md || true
+                  diff docs/ops.md "$RUNNER_TEMP/ops_check/ops.md" || true
                   exit 1
               fi
               echo "Operations documentation is up to date."

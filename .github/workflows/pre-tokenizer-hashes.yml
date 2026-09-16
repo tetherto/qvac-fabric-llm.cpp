@@ -1,12 +1,18 @@
 name: Check Pre-Tokenizer Hashes
 
+# QVAC-24501: this workflow's own file is in the paths filters below, which
+# update-ops-docs.yml and every build-*.yml already do but upstream omitted
+# here. Without it a change to this file cannot trigger the job it defines, so
+# the runner repoint in this branch was unverifiable by CI.
 on:
     push:
         paths:
+            - '.github/workflows/pre-tokenizer-hashes.yml'
             - 'conversion/base.py'
             - 'convert_hf_to_gguf_update.py'
     pull_request:
         paths:
+            - '.github/workflows/pre-tokenizer-hashes.yml'
             - 'conversion/base.py'
             - 'convert_hf_to_gguf_update.py'
 
@@ -20,7 +26,10 @@ concurrency:
 
 jobs:
     pre-tokenizer-hashes:
-        runs-on: [self-hosted, fast]
+        # QVAC-24501: upstream's [self-hosted, fast] needs a custom `fast` label
+        # the qvac fleet does not carry. This job is Python plus a diff, so the
+        # general-purpose fleet CPU box is ample.
+        runs-on: qvac-ubuntu2404-x64
 
         steps:
         - name: Checkout repository
@@ -36,18 +45,24 @@ jobs:
               python3 -m venv .venv
               .venv/bin/pip install -r requirements/requirements-convert_hf_to_gguf_update.txt
 
+        # QVAC-24501: upstream stashed the pristine copy at a fixed /tmp/base.py.
+        # Our fleet hosts run several runner accounts side by side and share
+        # /tmp, so that path can be owned by another account (EACCES on cp) or,
+        # worse, hold a stale copy from a different job - which would diff this
+        # branch against someone else's file and report the wrong answer.
+        # $RUNNER_TEMP is per-job, so neither can happen.
         - name: Update pre-tokenizer hashes
           run: |
-              cp conversion/base.py /tmp
+              cp conversion/base.py "$RUNNER_TEMP/base.py"
               .venv/bin/python convert_hf_to_gguf_update.py --check-missing
 
         - name: Check if committed pre-tokenizer hashes matches generated version
           run: |
-              if ! diff -q conversion/base.py /tmp/base.py; then
+              if ! diff -q conversion/base.py "$RUNNER_TEMP/base.py"; then
                   echo "Model pre-tokenizer hashes (in conversion/base.py) do not match generated hashes (from convert_hf_to_gguf_update.py)."
                   echo "To fix: run ./convert_hf_to_gguf_update.py and commit the updated conversion/base.py along with your changes"
                   echo "Differences found:"
-                  diff conversion/base.py /tmp/base.py || true
+                  diff conversion/base.py "$RUNNER_TEMP/base.py" || true
                   exit 1
               fi
               echo "Model pre-tokenizer hashes are up to date."
