@@ -94,6 +94,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cfloat>
+#include <functional>
 #include <initializer_list>
 #include <limits>
 #include <map>
@@ -4453,6 +4454,7 @@ static void ggml_cuda_conv_tokens_pack_for_gdn(ggml_backend_cuda_context & ctx, 
         return;
     }
     const ggml_tensor * gdn = nullptr;
+    int gdn_idx = -1;
     const char * y0 = (const char *) ta.y;
     const char * y1 = y0 + (size_t) ta.n_ch * ta.n_t * sizeof(float);
     for (int j = first_idx; j < cgraph->n_nodes && j < first_idx + 32; ++j) {
@@ -4460,7 +4462,8 @@ static void ggml_cuda_conv_tokens_pack_for_gdn(ggml_backend_cuda_context & ctx, 
         if (node->op == GGML_OP_GATED_DELTA_NET) {
             const char * v = (const char *) node->src[2]->data;
             if (v >= y0 && v < y1) {
-                gdn = node;
+                gdn     = node;
+                gdn_idx = j;
             }
             break;
         }
@@ -4518,30 +4521,34 @@ static void ggml_cuda_conv_tokens_pack_for_gdn(ggml_backend_cuda_context & ctx, 
     ta.v_ch0  = (int) v_ch0;
     ta.v_nch  = (int) (H_v*S);
 
-    // are the f32 outputs dead: every reader outside the run is the gdn node or a view op (whose own readers are
-    // checked in turn since they list the view as a source)
-    const ggml_tensor * roots[1 + GGML_CUDA_SSM_CONV_MAX_L2];
+    // are the f32 outputs dead: every use of the silu output and of the norms (the graph's use counts) is by the run
+    // itself, by the gdn node, or by a view op between them whose own uses are accounted the same way; a reader
+    // elsewhere leaves a count unmatched
     for (int i = 0; i < 1 + l2.n; ++i) {
-        roots[i] = cgraph->nodes[written[i]];
-        if (roots[i]->flags & GGML_TENSOR_FLAG_OUTPUT) {
+        if (cgraph->nodes[written[i]]->flags & GGML_TENSOR_FLAG_OUTPUT) {
             return;
         }
     }
-    for (int j = 0; j < cgraph->n_nodes; ++j) {
-        const ggml_tensor * node = cgraph->nodes[j];
-        if ((j >= node_idx && j < first_idx) || node == gdn || ggml_cuda_is_view_or_noop(node)) {
-            continue;
-        }
-        for (int s = 0; s < GGML_MAX_SRC && node->src[s] != nullptr; ++s) {
-            const ggml_tensor * root = node->src[s];
-            while (root->view_src != nullptr) {
-                root = root->view_src;
-            }
-            for (int i = 0; i < 1 + l2.n; ++i) {
-                if (root == roots[i]) {
-                    return;
+    const std::function<bool(int)> only_read_here = [&](int t_idx) -> bool {
+        const ggml_tensor * t = cgraph->nodes[t_idx];
+        int32_t uses = 0;
+        for (int j = t_idx + 1; j <= gdn_idx; ++j) {
+            const ggml_tensor * node = cgraph->nodes[j];
+            for (int s = 0; s < GGML_MAX_SRC; ++s) {
+                if (node->src[s] != t) {
+                    continue;
                 }
+                if (!(j < first_idx || node == gdn || (ggml_cuda_is_view_or_noop(node) && only_read_here(j)))) {
+                    return false;
+                }
+                uses++;
             }
+        }
+        return uses == ggml_node_get_use_count(cgraph, t_idx);
+    };
+    for (int i = 0; i < 1 + l2.n; ++i) {
+        if (!only_read_here(written[i])) {
+            return;
         }
     }
     pack.f32_elided = true;
