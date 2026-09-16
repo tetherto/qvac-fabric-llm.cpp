@@ -213,10 +213,18 @@ index f9bf43706..c95ee7877 100644
 +// the fused conv kernel packs the kernel's bf16 q/k/v inputs (ctx.gdn_pack) only for such a node
 +bool ggml_cuda_gated_delta_net_flashinfer_aot(const ggml_tensor * dst);
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index 30298c7a4..4ed8b69a0 100644
+index 30298c7a4..d4affb6ba 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
-@@ -721,6 +721,12 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
+@@ -93,6 +93,7 @@
+ #include <cstddef>
+ #include <cstdint>
+ #include <cfloat>
++#include <functional>
+ #include <initializer_list>
+ #include <limits>
+ #include <map>
+@@ -721,6 +722,12 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
      if (copy_event != nullptr) {
          CUDA_CHECK(cudaEventDestroy(copy_event));
      }
@@ -229,7 +237,7 @@ index 30298c7a4..4ed8b69a0 100644
      for (int i = 0; i < GGML_CUDA_MAX_DEVICES; ++i) {
          for (int j = 0; j < GGML_CUDA_MAX_STREAMS; ++j) {
              if (streams[i][j] != nullptr) {
-@@ -3832,9 +3838,10 @@ static int ggml_cuda_try_conv_state_fusion(const ggml_cgraph * cgraph, int node_
+@@ -3832,9 +3839,10 @@ static int ggml_cuda_try_conv_state_fusion(const ggml_cgraph * cgraph, int node_
  // the prefill form of the conv-state run: the same get_rows -> concat -> cpy run directly followed by the
  // ssm_conv -> [add] -> silu -> l2-norm run, one sequence above the small-batch token limit. The concat and the
  // transposed copy are never materialized: one kernel reads the state row and the token projection, writes the silu
@@ -242,7 +250,7 @@ index 30298c7a4..4ed8b69a0 100644
      constexpr int max_nodes = 31;
      ggml_cuda_conv_state_args a;
      int concat_idx = -1;
-@@ -3891,7 +3898,6 @@ static int ggml_cuda_try_conv_tokens_fusion(const ggml_cgraph * cgraph, int node
+@@ -3891,7 +3899,6 @@ static int ggml_cuda_try_conv_tokens_fusion(const ggml_cgraph * cgraph, int node
  
      // the written buffers (silu output, norm outputs) must not overlap the token projection; the next state row may
      // be the gathered row (each thread reads its elements before it writes them)
@@ -250,7 +258,7 @@ index 30298c7a4..4ed8b69a0 100644
      written[0] = conv_idx + m.n_base - 1;
      for (int r = 0; r < l2.n; ++r) {
          written[1 + r] = m.out_idx[r];
-@@ -3919,6 +3925,119 @@ static int ggml_cuda_try_conv_tokens_fusion(const ggml_cgraph * cgraph, int node
+@@ -3919,6 +3926,125 @@ static int ggml_cuda_try_conv_tokens_fusion(const ggml_cgraph * cgraph, int node
      return count - 1;
  }
  
@@ -270,6 +278,7 @@ index 30298c7a4..4ed8b69a0 100644
 +        return;
 +    }
 +    const ggml_tensor * gdn = nullptr;
++    int gdn_idx = -1;
 +    const char * y0 = (const char *) ta.y;
 +    const char * y1 = y0 + (size_t) ta.n_ch * ta.n_t * sizeof(float);
 +    for (int j = first_idx; j < cgraph->n_nodes && j < first_idx + 32; ++j) {
@@ -277,7 +286,8 @@ index 30298c7a4..4ed8b69a0 100644
 +        if (node->op == GGML_OP_GATED_DELTA_NET) {
 +            const char * v = (const char *) node->src[2]->data;
 +            if (v >= y0 && v < y1) {
-+                gdn = node;
++                gdn     = node;
++                gdn_idx = j;
 +            }
 +            break;
 +        }
@@ -335,30 +345,34 @@ index 30298c7a4..4ed8b69a0 100644
 +    ta.v_ch0  = (int) v_ch0;
 +    ta.v_nch  = (int) (H_v*S);
 +
-+    // are the f32 outputs dead: every reader outside the run is the gdn node or a view op (whose own readers are
-+    // checked in turn since they list the view as a source)
-+    const ggml_tensor * roots[1 + GGML_CUDA_SSM_CONV_MAX_L2];
++    // are the f32 outputs dead: every use of the silu output and of the norms (the graph's use counts) is by the run
++    // itself, by the gdn node, or by a view op between them whose own uses are accounted the same way; a reader
++    // elsewhere leaves a count unmatched
 +    for (int i = 0; i < 1 + l2.n; ++i) {
-+        roots[i] = cgraph->nodes[written[i]];
-+        if (roots[i]->flags & GGML_TENSOR_FLAG_OUTPUT) {
++        if (cgraph->nodes[written[i]]->flags & GGML_TENSOR_FLAG_OUTPUT) {
 +            return;
 +        }
 +    }
-+    for (int j = 0; j < cgraph->n_nodes; ++j) {
-+        const ggml_tensor * node = cgraph->nodes[j];
-+        if ((j >= node_idx && j < first_idx) || node == gdn || ggml_cuda_is_view_or_noop(node)) {
-+            continue;
-+        }
-+        for (int s = 0; s < GGML_MAX_SRC && node->src[s] != nullptr; ++s) {
-+            const ggml_tensor * root = node->src[s];
-+            while (root->view_src != nullptr) {
-+                root = root->view_src;
-+            }
-+            for (int i = 0; i < 1 + l2.n; ++i) {
-+                if (root == roots[i]) {
-+                    return;
++    const std::function<bool(int)> only_read_here = [&](int t_idx) -> bool {
++        const ggml_tensor * t = cgraph->nodes[t_idx];
++        int32_t uses = 0;
++        for (int j = t_idx + 1; j <= gdn_idx; ++j) {
++            const ggml_tensor * node = cgraph->nodes[j];
++            for (int s = 0; s < GGML_MAX_SRC; ++s) {
++                if (node->src[s] != t) {
++                    continue;
 +                }
++                if (!(j < first_idx || node == gdn || (ggml_cuda_is_view_or_noop(node) && only_read_here(j)))) {
++                    return false;
++                }
++                uses++;
 +            }
++        }
++        return uses == ggml_node_get_use_count(cgraph, t_idx);
++    };
++    for (int i = 0; i < 1 + l2.n; ++i) {
++        if (!only_read_here(written[i])) {
++            return;
 +        }
 +    }
 +    pack.f32_elided = true;
@@ -370,7 +384,7 @@ index 30298c7a4..4ed8b69a0 100644
  // two or three F8 mul_mats on one F32 activation, consecutive up to view nodes (q/k/v, the delta-net qkv/z): the
  // CUTLASS batch quantizes the activation once for all of them, the GEMV batch runs one launch. Executes the run and
  // returns the nodes to skip, 0 when it does not apply. Yields to the fused up/gate GEMV when a swiglu of two of the
-@@ -4028,8 +4147,10 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -4028,8 +4154,10 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
      if (node->op == GGML_OP_GET_ROWS) {
          ggml_cuda_ssm_conv_tokens_args ta;
          ggml_cuda_ssm_conv_l2 l2;
