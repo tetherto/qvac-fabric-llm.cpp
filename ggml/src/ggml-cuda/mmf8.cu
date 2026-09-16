@@ -44,10 +44,12 @@ static __device__ __forceinline__ void mmf8_gemv_load_w(
 // one activation slice per trip serves all nrows_w rows: at one row per warp the activation loads were the limiter.
 // has_glu: xg/sxg are the gate matrix (same shape and scales layout as x); the activation is read once for both and
 // the epilogue writes silu(gate) * up from the same per-row sums the separate launches would produce
+// PDL: the grid dependency is waited at entry and the launch completion signalled before the reduction (as mmvf), so
+// the next kernel's launch overlaps the epilogue; no __restrict__ on the parameters (PDL rule)
 template <int ncols_dst, int nrows_w, bool y_vec, bool has_glu>
 static __global__ void mul_mat_vec_f8_e4m3(
-        const uint8_t * __restrict__ x, const float * __restrict__ sx, const uint8_t * __restrict__ xg, const float * __restrict__ sxg,
-        const float * __restrict__ y, float * __restrict__ dst,
+        const uint8_t * x, const float * sx, const uint8_t * xg, const float * sxg,
+        const float * y, float * dst,
         const int ncols, const int nblk_n, const int stride_col_y, const int stride_col_dst) {
     constexpr int warp_size = 32;
     constexpr int trip      = warp_size*16;
@@ -75,6 +77,7 @@ static __global__ void mul_mat_vec_f8_e4m3(
         }
     }
 
+    ggml_cuda_pdl_sync();
     for (int k = warp*trip + lane*16; k < ncols; k += MMF8_GEMV_NWARPS*trip) {
         uint4 w4[nmat][nrows_w];
         float s[nmat];
@@ -126,6 +129,7 @@ static __global__ void mul_mat_vec_f8_e4m3(
         }
     }
 
+    ggml_cuda_pdl_lc();
 #pragma unroll
     for (int g = 0; g < nmat; ++g) {
 #pragma unroll
@@ -168,23 +172,26 @@ static void launch_mul_mat_vec_f8_e4m3_rows(
     GGML_ASSERT(nrows % nrows_w == 0);
     const dim3 block_dims(32, MMF8_GEMV_NWARPS, 1);
     const dim3 block_nums(nrows/nrows_w, 1, 1);
+    const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, 0, stream);
     const bool y_vec = ((uintptr_t) y % sizeof(float4) == 0) && stride_col_y % 4 == 0;
     if (xg != nullptr) {
         // the fused up/gate epilogue keeps two accumulator sets: batch <= 4 only
         if constexpr (ncols_dst <= 4) {
             if (y_vec) {
-                mul_mat_vec_f8_e4m3<ncols_dst, nrows_w, true, true><<<block_nums, block_dims, 0, stream>>>(x, sx, xg, sxg, y, dst, ncols, nblk_n, stride_col_y, stride_col_dst);
+                ggml_cuda_kernel_launch(mul_mat_vec_f8_e4m3<ncols_dst, nrows_w, true, true>, launch_params, x, sx, xg, sxg, y, dst, ncols, nblk_n, stride_col_y, stride_col_dst);
             } else {
-                mul_mat_vec_f8_e4m3<ncols_dst, nrows_w, false, true><<<block_nums, block_dims, 0, stream>>>(x, sx, xg, sxg, y, dst, ncols, nblk_n, stride_col_y, stride_col_dst);
+                ggml_cuda_kernel_launch(mul_mat_vec_f8_e4m3<ncols_dst, nrows_w, false, true>, launch_params, x, sx, xg, sxg, y, dst, ncols, nblk_n, stride_col_y, stride_col_dst);
             }
             return;
         }
         GGML_ABORT("fused F8 up/gate GEMV: batch above 4");
     }
+    const uint8_t * no_xg  = nullptr;
+    const float   * no_sxg = nullptr;
     if (y_vec) {
-        mul_mat_vec_f8_e4m3<ncols_dst, nrows_w, true, false><<<block_nums, block_dims, 0, stream>>>(x, sx, nullptr, nullptr, y, dst, ncols, nblk_n, stride_col_y, stride_col_dst);
+        ggml_cuda_kernel_launch(mul_mat_vec_f8_e4m3<ncols_dst, nrows_w, true, false>, launch_params, x, sx, no_xg, no_sxg, y, dst, ncols, nblk_n, stride_col_y, stride_col_dst);
     } else {
-        mul_mat_vec_f8_e4m3<ncols_dst, nrows_w, false, false><<<block_nums, block_dims, 0, stream>>>(x, sx, nullptr, nullptr, y, dst, ncols, nblk_n, stride_col_y, stride_col_dst);
+        ggml_cuda_kernel_launch(mul_mat_vec_f8_e4m3<ncols_dst, nrows_w, false, false>, launch_params, x, sx, no_xg, no_sxg, y, dst, ncols, nblk_n, stride_col_y, stride_col_dst);
     }
 }
 
