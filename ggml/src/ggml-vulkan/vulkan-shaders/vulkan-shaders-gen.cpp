@@ -58,7 +58,6 @@ const std::vector<std::string> type_names = {
     "q5_0",
     "q5_1",
     "q8_0",
-    "tq2_0",
     "tq1_0",
     "q2_k",
     "q3_k",
@@ -76,6 +75,7 @@ const std::vector<std::string> type_names = {
     "iq4_nl",
     "mxfp4",
     "nvfp4",
+    "tq2_0",
     "bf16",
     "tbq3_0",
     "tbq4_0",
@@ -954,7 +954,7 @@ void process_shaders() {
         }
 #endif
 
-        if (tname != "tq2_0" && tname != "tq1_0" && !is_tq_fht) {
+        if (tname != "tq1_0" && !is_tq_fht) {
         string_to_spv("mul_mat_vec_id_" + tname + "_f32_f32", shader, merge_maps(base_dict, {{"MUL_MAT_ID", "1"}, {data_a_key, "1"}, {"B_TYPE", "float"}, {"B_TYPEV2", "vec2"}, {"B_TYPEV4", "vec4"}, {"D_TYPE", "float"}}));
         string_to_spv("mul_mat_vec_id_" + tname + "_f32_f32_subgroup", shader, merge_maps(base_dict, {{"MUL_MAT_ID", "1"}, {data_a_key, "1"}, {"B_TYPE", "float"}, {"B_TYPEV2", "vec2"}, {"B_TYPEV4", "vec4"}, {"D_TYPE", "float"}, {"USE_SUBGROUP_ADD", "1"}}));
         string_to_spv("mul_mat_vec_id_" + tname + "_f32_f32_subgroup_no_shmem", shader, merge_maps(base_dict, {{"MUL_MAT_ID", "1"}, {data_a_key, "1"}, {"B_TYPE", "float"}, {"B_TYPEV2", "vec2"}, {"B_TYPEV4", "vec4"}, {"D_TYPE", "float"}, {"USE_SUBGROUP_ADD_NO_SHMEM", "1"}}));
@@ -990,6 +990,10 @@ void process_shaders() {
                 dequant_source = "dequant_tbq4_0.comp";
             }
             string_to_spv("dequant_" + tname, dequant_source, merge_maps(base_dict, {{data_a_key, "1"}, {"D_TYPE", "float16_t"}}));
+        }
+        // Fused dequant+transpose variant for FA quant-KV (per-head-contiguous f16 scratch).
+        if (tname == "q8_0") {
+            string_to_spv("dequant_" + tname + "_transpose", "dequant_" + tname + ".comp", merge_maps(base_dict, {{data_a_key, "1"}, {"D_TYPE", "float16_t"}, {"DEQUANT_TRANSPOSE", "1"}}));
         }
 
         // get_rows uses element-wise dequant which doesn't work for TQ3/TQ4 (need FHT)
@@ -1054,6 +1058,8 @@ void process_shaders() {
 
     string_to_spv("cpy_transpose_16", "copy_transpose.comp", {{"A_TYPE", "uint16_t"}, {"D_TYPE", "uint16_t"}});
     string_to_spv("cpy_transpose_32", "copy_transpose.comp", {{"A_TYPE", "uint"}, {"D_TYPE", "uint"}});
+    string_to_spv("cpy_transpose_02_16", "copy_transpose_02.comp", {{"A_TYPE", "uint16_t"}, {"D_TYPE", "uint16_t"}});
+    string_to_spv("cpy_transpose_02_32", "copy_transpose_02.comp", {{"A_TYPE", "uint"}, {"D_TYPE", "uint"}});
 
     for (std::string t : {"q1_0", "q2_0", "q4_0", "q4_1", "q5_0", "q5_1", "q8_0", "iq4_nl", "tbq3_0", "tbq4_0", "pq3_0", "pq4_0",
                            "tbq3_0_64", "tbq4_0_64", "pq3_0_64", "pq4_0_64"}) {
@@ -1324,6 +1330,11 @@ void process_shaders() {
     string_to_spv("mul_mat_id_back_a_f32", "mul_mat_id_back_a.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}}));
     string_to_spv("mul_mat_id_back_b_f32", "mul_mat_id_back_b.comp", merge_maps(base_dict, {{"DATA_A_F32", "1"}}));
     string_to_spv("mul_mat_id_back_b_q8_0", "mul_mat_id_back_b.comp", merge_maps(base_dict, {{"DATA_A_Q8_0", "1"}}));
+    // element-wise dequant variants for the other block quants used as MoE expert weights
+    for (const std::string tname : {"q4_0", "q4_1", "q5_0", "q5_1", "q4_k", "q5_k", "q6_k"}) {
+        const std::string data_a_key = "DATA_A_" + to_uppercase(tname);
+        string_to_spv("mul_mat_id_back_b_" + tname, "mul_mat_id_back_b.comp", merge_maps(base_dict, {{data_a_key, "1"}}));
+    }
 
     string_to_spv("argsort_f32", "argsort.comp", {{"A_TYPE", "float"}});
     string_to_spv("argsort_large_f32", "argsort_large.comp", {{"A_TYPE", "float"}});
@@ -1680,7 +1691,7 @@ void write_output_files() {
             src << "const uint64_t arr_dmmv_" << tname << "_" << btype << "_f32_len[3] =  {mul_mat_vec_" << tname << "_" << btype << "_f32_len,  mul_mat_vec_" << tname << "_" << btype << "_f32_subgroup_len, mul_mat_vec_"  << tname << "_" << btype << "_f32_subgroup_no_shmem_len};\n";
         }
 
-        if (btype == "f16" || tname == "tq2_0" || tname == "tq1_0" ||
+        if (btype == "f16" || tname == "tq1_0" || (tname == "tq2_0" && btype == "q8_1") ||
             tname == "tbq3_0" || tname == "tbq4_0" || tname == "pq3_0" || tname == "pq4_0") {
             continue;
         }

@@ -1,6 +1,7 @@
 #include "ggml-backend.h"
 #include "ggml-cpp.h"
 #include "ggml.h"
+#include "../ggml/src/ggml-impl.h"
 
 #include <algorithm>
 #include <chrono>
@@ -195,6 +196,7 @@ int main() {
     ggml_tensor * result_a = ggml_scale(ctx_a.get(), tensor_a, 2.0f);
     ggml_cgraph * graph    = ggml_new_graph_custom(ctx_a.get(), 16, false);
     ggml_build_forward_expand(graph, result_a);
+    graph->uid = 1; // nonzero uid: RPC client caches the graph so queued re-dispatches exercise GRAPH_RECOMPUTE
     ggml_cgraph * foreign_graph = ggml_new_graph_custom(ctx_a.get(), 1, false);
     ggml_graph_add_node(foreign_graph, tensor_a);
 
@@ -235,6 +237,47 @@ int main() {
         }
     }
 
+    {
+        ggml_context_ptr ctx_cached{ ggml_init(params) };
+        if (ctx_cached == nullptr) {
+            return 1;
+        }
+        ggml_tensor * tensor_cached = ggml_new_tensor_2d(ctx_cached.get(), GGML_TYPE_F32, 1024 * 1024, 3);
+        ggml_backend_buffer_ptr buffer_cached(ggml_backend_alloc_ctx_tensors(ctx_cached.get(), backend_a.get()));
+        if (buffer_cached == nullptr) {
+            return 1;
+        }
+
+        const size_t cached_row_size = tensor_cached->nb[1];
+        const size_t cached_rows = tensor_cached->ne[1];
+        const size_t cached_input_stride = cached_row_size + 2 * sizeof(float);
+        const size_t cached_output_stride = cached_row_size + 3 * sizeof(float);
+        std::vector<uint8_t> cached_input(cached_input_stride * cached_rows);
+        std::vector<uint8_t> cached_output(cached_output_stride * cached_rows, 0);
+        for (size_t row = 0; row < cached_rows; row++) {
+            for (size_t i = 0; i < cached_row_size; i++) {
+                cached_input[row * cached_input_stride + i] = (uint8_t) (row + i);
+            }
+        }
+
+        ggml_backend_tensor_set_2d_async(backend_a.get(), tensor_cached, cached_input.data(), 0, cached_row_size,
+                                         cached_rows, tensor_cached->nb[1], cached_input_stride);
+        ggml_backend_synchronize(backend_a.get());
+        ggml_backend_tensor_memset(tensor_cached, 0, 0, ggml_nbytes(tensor_cached));
+        ggml_backend_tensor_set_2d_async(backend_a.get(), tensor_cached, cached_input.data(), 0, cached_row_size,
+                                         cached_rows, tensor_cached->nb[1], cached_input_stride);
+        ggml_backend_tensor_get_2d_async(backend_a.get(), tensor_cached, cached_output.data(), 0, cached_row_size,
+                                         cached_rows, tensor_cached->nb[1], cached_output_stride);
+        ggml_backend_synchronize(backend_a.get());
+        for (size_t row = 0; row < cached_rows; row++) {
+            if (memcmp(cached_input.data() + row * cached_input_stride,
+                       cached_output.data() + row * cached_output_stride, cached_row_size) != 0) {
+                fprintf(stderr, "cached 2D RPC transfer mismatch\n");
+                return 1;
+            }
+        }
+    }
+
     ggml_backend_event_t events[4] = {
         ggml_backend_event_new(device_a),
         ggml_backend_event_new(device_a),
@@ -249,6 +292,7 @@ int main() {
     }
 
     std::vector<float> input(ggml_nelements(tensor_a));
+    std::vector<std::vector<float>> queued_results(8, std::vector<float>(ggml_nelements(result_a)));
     for (int iteration = 0; iteration < 8; iteration++) {
         ggml_backend_event_t event = events[iteration % 4];
         ggml_backend_event_synchronize(event);
@@ -257,9 +301,18 @@ int main() {
         if (ggml_backend_graph_compute_async(backend_a.get(), graph) != GGML_STATUS_SUCCESS) {
             return 1;
         }
+        ggml_backend_tensor_get_async(backend_a.get(), result_a, queued_results[iteration].data(), 0,
+                                      ggml_nbytes(result_a));
         ggml_backend_event_record(event, backend_a.get());
     }
     ggml_backend_synchronize(backend_a.get());
+
+    for (size_t iteration = 0; iteration < queued_results.size(); iteration++) {
+        if (!check_values(queued_results[iteration], 2.0f*iteration)) {
+            fprintf(stderr, "queued RPC graph/readback ordering failed at iteration %zu\n", iteration);
+            return 1;
+        }
+    }
 
     std::vector<float> result(ggml_nelements(result_a));
     ggml_backend_tensor_get(result_a, result.data(), 0, ggml_nbytes(result_a));

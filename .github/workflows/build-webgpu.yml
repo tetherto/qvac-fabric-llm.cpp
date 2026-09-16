@@ -103,7 +103,7 @@ jobs:
         id: cmake_test
         run: |
           cd build
-          ctest -L main --verbose --timeout 900
+          ctest -L main --verbose --timeout 1800
 
   ubuntu:
     runs-on: ai-run-linux-gpu

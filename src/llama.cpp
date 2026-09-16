@@ -54,6 +54,8 @@ const char * llama_flash_attn_type_name(enum llama_flash_attn_type flash_attn_ty
 
 const char * llama_load_mode_name(enum llama_load_mode load_mode) {
     switch (load_mode) {
+        case LLAMA_LOAD_MODE_AUTO:
+            return "auto";
         case LLAMA_LOAD_MODE_NONE:
             return "none";
         case LLAMA_LOAD_MODE_MMAP:
@@ -69,11 +71,12 @@ const char * llama_load_mode_name(enum llama_load_mode load_mode) {
 }
 
 enum llama_load_mode llama_load_mode_from_str(const char * str) {
-    if (std::strcmp(str, "none") == 0)       { return LLAMA_LOAD_MODE_NONE;       }
-    if (std::strcmp(str, "mmap") == 0)       { return LLAMA_LOAD_MODE_MMAP;       }
-    if (std::strcmp(str, "mlock") == 0)      { return LLAMA_LOAD_MODE_MLOCK;      }
+    if (std::strcmp(str, "auto")       == 0) { return LLAMA_LOAD_MODE_AUTO;       }
+    if (std::strcmp(str, "none")       == 0) { return LLAMA_LOAD_MODE_NONE;       }
+    if (std::strcmp(str, "mmap")       == 0) { return LLAMA_LOAD_MODE_MMAP;       }
+    if (std::strcmp(str, "mlock")      == 0) { return LLAMA_LOAD_MODE_MLOCK;      }
     if (std::strcmp(str, "mmap+mlock") == 0) { return LLAMA_LOAD_MODE_MMAP_MLOCK; }
-    if (std::strcmp(str, "dio") == 0)        { return LLAMA_LOAD_MODE_DIRECT_IO;  }
+    if (std::strcmp(str, "dio")        == 0) { return LLAMA_LOAD_MODE_DIRECT_IO;  }
     throw std::invalid_argument(std::string("unknown load mode: ") + str);
 }
 
@@ -115,6 +118,10 @@ bool llama_supports_rpc(void) {
         ggml_backend_load_all();
     }
     return ggml_backend_reg_by_name("RPC") != nullptr;
+}
+
+const char * llama_version(void) {
+    return LLAMA_VERSION;
 }
 
 void llama_backend_init(void) {
@@ -256,7 +263,11 @@ static bool llama_prepare_model_devices(const llama_model_params & params, llama
                     }
 
                     case GGML_BACKEND_DEVICE_TYPE_IGPU:
-                        if (igpus.empty()) {
+                        // igpus.empty() - workaround for integrated devices seen by multiple backends
+                        // ref: https://github.com/ggml-org/llama.cpp/pull/23897
+                        // ggml_backend_dev_backend_reg - allow devices of the same backend regardless if integrated
+                        // ref: https://github.com/ggml-org/llama.cpp/pull/23897#issuecomment-5264222997
+                        if (igpus.empty() || ggml_backend_dev_backend_reg(dev) == ggml_backend_dev_backend_reg(igpus.back().dev)) {
                             igpus.push_back({false, dev});
                         }
                         break;
@@ -476,7 +487,12 @@ struct llama_model * llama_model_load_from_file(
 }
 
 static void override_and_disable_mmap(struct llama_model_params & params) {
-    if (params.load_mode == LLAMA_LOAD_MODE_MMAP || params.load_mode == LLAMA_LOAD_MODE_MMAP_MLOCK) {
+    // LLAMA_LOAD_MODE_AUTO also enables mmap in the loader (see
+    // llama_model_loader::use_mmap), so it must be overridden here as well:
+    // memory buffers have no backing file, and the incremental split path
+    // never populates `mappings`.
+    if (params.load_mode == LLAMA_LOAD_MODE_MMAP || params.load_mode == LLAMA_LOAD_MODE_MMAP_MLOCK ||
+        params.load_mode == LLAMA_LOAD_MODE_AUTO) {
         LLAMA_LOG_WARN("Overriding and disabling memory mapping when loading from memory buffer\n");
         params.load_mode = params.load_mode == LLAMA_LOAD_MODE_MMAP_MLOCK ? LLAMA_LOAD_MODE_MLOCK
                                                                           : LLAMA_LOAD_MODE_NONE;
@@ -620,11 +636,16 @@ struct llama_model * llama_model_load_from_file_ptr(FILE * file, struct llama_mo
     }
     std::vector<std::string> splits = {};
     load_input_variant::fname_load_input loader_input{ "", splits };
-    llama_model_loader ml(/*metadata*/ nullptr, /*set_tensor_data*/ nullptr, /*set_tensor_data_ud*/ nullptr,
-                          loader_input, file,
-                          params.load_mode, params.check_tensors, params.no_alloc,
-                          params.load_mtp, params.kv_overrides, params.tensor_buft_overrides);
-    return llama_model_load_from_file_impl(nullptr, nullptr, nullptr, /*has_load_input*/ false, ml, file, params);
+    try {
+        llama_model_loader ml(/*metadata*/ nullptr, /*set_tensor_data*/ nullptr, /*set_tensor_data_ud*/ nullptr,
+                              loader_input, file,
+                              params.load_mode, params.check_tensors, params.no_alloc,
+                              params.load_mtp, params.kv_overrides, params.tensor_buft_overrides);
+        return llama_model_load_from_file_impl(nullptr, nullptr, nullptr, /*has_load_input*/ false, ml, file, params);
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("%s: error loading model: %s\n", __func__, err.what());
+        return nullptr;
+    }
 }
 
 struct llama_model * llama_model_load_from_split_futures(const char ** paths, size_t n_paths, const char * context,

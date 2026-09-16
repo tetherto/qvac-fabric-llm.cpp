@@ -215,6 +215,7 @@ set(GGML_OPENCL_KERNELS
     sqr
     sqrt
     ssm_conv
+    ssm_scan
     gated_delta_net
     sub
     sum_rows
@@ -250,9 +251,3 @@ endif ()
 foreach (K ${GGML_OPENCL_KERNELS})
     ggml_opencl_add_kernel(${K})
 endforeach()
-
-if (GGML_OPENCL_KERNEL_CACHE)
-    set(GGUF_HASH_DEPS "${CMAKE_CURRENT_SOURCE_DIR}/../../../examples/gguf-hash/deps")
-    target_sources(${TARGET_NAME} PRIVATE ${GGUF_HASH_DEPS}/sha256/sha256.c)
-    target_include_directories(${TARGET_NAME} PRIVATE ${GGUF_HASH_DEPS}/sha256 ${GGUF_HASH_DEPS})
-endif ()

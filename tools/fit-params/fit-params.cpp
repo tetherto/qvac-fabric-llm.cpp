@@ -33,6 +33,7 @@ int llama_fit_params(int argc, char ** argv) {
     if (!params.fit_params_print) {
         const common_params_fit_status status = common_fit_params(params.model.path.c_str(), &mparams, &cparams,
                 params.tensor_split, params.tensor_buft_overrides.data(), params.fit_params_target.data(), params.fit_params_min_ctx,
+                params.prefetch_weights_auto,
                 params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
         if (status != COMMON_PARAMS_FIT_STATUS_SUCCESS) {
             LOG_ERR("%s: failed to fit CLI arguments to free memory, exiting...\n", __func__);
@@ -42,6 +43,12 @@ int llama_fit_params(int argc, char ** argv) {
         LOG_INF("%s: printing fitted CLI arguments to stdout...\n", __func__);
         common_log_flush(common_log_main());
         printf("-c %" PRIu32 " -ngl %" PRIi32, cparams.n_ctx, mparams.n_gpu_layers);
+        if (cparams.moe_cache_size > 0) {
+            printf(" --moe-cache-mib %zu", cparams.moe_cache_size / (1024 * 1024));
+        }
+        if (cparams.prefetch_weights) {
+            printf(" -pw 1");
+        }
 
         size_t nd = llama_max_devices();
         while (nd > 1 && mparams.tensor_split[nd - 1] == 0.0f) {
