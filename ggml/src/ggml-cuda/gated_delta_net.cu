@@ -725,6 +725,91 @@ __global__ void gated_delta_net_flashinfer_unpack_cuda(
     }
 }
 
+// 8 consecutive d per thread: two float4 loads and one 16-byte bf16x8 store per tensor, the same round-to-nearest as
+// the scalar kernel; used when S is a multiple of 8 and every stride and base pointer keeps the loads 16-byte aligned
+static __device__ __forceinline__ void gdn_pack8_bf16(const float * src, __nv_bfloat16 * dst) {
+    const float4 a = *(const float4 *) src;
+    const float4 b = *(const float4 *) (src + 4);
+    union { __nv_bfloat162 h[4]; uint4 u; } r;
+    r.h[0] = __float22bfloat162_rn(make_float2(a.x, a.y));
+    r.h[1] = __float22bfloat162_rn(make_float2(a.z, a.w));
+    r.h[2] = __float22bfloat162_rn(make_float2(b.x, b.y));
+    r.h[3] = __float22bfloat162_rn(make_float2(b.z, b.w));
+    *(uint4 *) dst = r.u;
+}
+
+__global__ void gated_delta_net_flashinfer_prepare8_cuda(
+        const float * q,
+        const float * k,
+        const float * v,
+        const float * g,
+        const float * beta,
+        __nv_bfloat16 * q_bf16,
+        __nv_bfloat16 * k_bf16,
+        __nv_bfloat16 * v_bf16,
+        float * alpha,
+        float * beta_packed,
+        int64_t S,
+        int64_t H_q,
+        int64_t H_v,
+        int64_t n_tokens,
+        int64_t n_seqs,
+        int64_t sq1,
+        int64_t sq2,
+        int64_t sq3,
+        int64_t sv1,
+        int64_t sv2,
+        int64_t sv3,
+        int64_t sb1,
+        int64_t sb2,
+        int64_t sb3,
+        int64_t rq3) {
+    const int64_t idx = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    const int64_t S8  = S / 8;
+    const int64_t n8  = n_seqs * n_tokens * H_v * S8;
+    if (idx >= n8) {
+        return;
+    }
+
+    ggml_cuda_pdl_sync();
+    const int64_t d8 = idx % S8;
+    const int64_t ih = (idx / S8) % H_v;
+    const int64_t it = (idx / (S8 * H_v)) % n_tokens;
+    const int64_t is = idx / (S8 * H_v * n_tokens);
+
+    gdn_pack8_bf16(v + is * sv3 + it * sv2 + ih * sv1 + d8 * 8, v_bf16 + idx * 8);
+    if (d8 == 0) {
+        const int64_t gate_idx = is * n_tokens * H_v + it * H_v + ih;
+        const int64_t src_gate_idx = is * sb3 + it * sb2 + ih * sb1;
+        alpha[gate_idx] = expf(g[src_gate_idx]);
+        beta_packed[gate_idx] = beta[src_gate_idx];
+    }
+
+    // keep ggml's grouped-value head mapping (h_v % H_q) by materializing equal-head q/k
+    const int64_t iq3 = is / rq3;
+    const int64_t iq1 = ih % H_q;
+    const int64_t src_idx = iq3 * sq3 + it * sq2 + iq1 * sq1 + d8 * 8;
+    gdn_pack8_bf16(q + src_idx, q_bf16 + idx * 8);
+    gdn_pack8_bf16(k + src_idx, k_bf16 + idx * 8);
+}
+
+__global__ void gated_delta_net_flashinfer_unpack8_cuda(
+        const __nv_bfloat16 * src, float * dst, int64_t n8) {
+    const int64_t idx = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n8) {
+        return;
+    }
+    ggml_cuda_pdl_sync();
+    union { uint4 u; __nv_bfloat162 h[4]; } r;
+    r.u = *(const uint4 *) (src + idx * 8);
+    const float2 f0 = __bfloat1622float2(r.h[0]);
+    const float2 f1 = __bfloat1622float2(r.h[1]);
+    const float2 f2 = __bfloat1622float2(r.h[2]);
+    const float2 f3 = __bfloat1622float2(r.h[3]);
+    *(float4 *) (dst + idx * 8)     = make_float4(f0.x, f0.y, f1.x, f1.y);
+    *(float4 *) (dst + idx * 8 + 4) = make_float4(f2.x, f2.y, f3.x, f3.y);
+}
+
 __global__ void gated_delta_net_flashinfer_cu_seqlens_cuda(
         int64_t * cu_seqlens, int64_t n_tokens, int64_t n_seqs) {
     const int64_t idx = threadIdx.x;
@@ -766,14 +851,28 @@ static bool launch_gated_delta_net_flashinfer_aot(
     ggml_cuda_pool_alloc<int64_t> cu_seqlens(ctx.pool(), n_seqs + 1);
     ggml_cuda_pool_alloc<uint8_t> tensormaps(ctx.pool(), tensormaps_bytes);
 
+    // the 8-wide pack needs S a multiple of 8, strides that are multiples of 4 floats and 16-byte aligned bases; the
+    // pool buffers are aligned by construction
+    const bool vec8 = S_v % 8 == 0 && sq1 % 4 == 0 && sq2 % 4 == 0 && sq3 % 4 == 0 && sv1 % 4 == 0 && sv2 % 4 == 0 && sv3 % 4 == 0 &&
+        (uintptr_t) q_d % 16 == 0 && (uintptr_t) k_d % 16 == 0 && (uintptr_t) v_d % 16 == 0 && (uintptr_t) dst_d % 16 == 0;
+    const size_t prepare_threads = vec8 ? v_elements / 8 : v_elements;
+
     const int threads = 256;
     ggml_cuda_kernel_launch_params prepare_params(
-        dim3((v_elements + threads - 1) / threads, 1, 1), dim3(threads, 1, 1), 0, stream);
-    ggml_cuda_kernel_launch(gated_delta_net_flashinfer_prepare_cuda, prepare_params,
-        q_d, k_d, v_d, g_d, b_d,
-        q_bf16.get(), k_bf16.get(), v_bf16.get(), alpha.get(), beta.get(),
-        S_v, H_q, H, n_tokens, n_seqs,
-        sq1, sq2, sq3, sv1, sv2, sv3, sb1, sb2, sb3, rq3);
+        dim3((prepare_threads + threads - 1) / threads, 1, 1), dim3(threads, 1, 1), 0, stream);
+    if (vec8) {
+        ggml_cuda_kernel_launch(gated_delta_net_flashinfer_prepare8_cuda, prepare_params,
+            q_d, k_d, v_d, g_d, b_d,
+            q_bf16.get(), k_bf16.get(), v_bf16.get(), alpha.get(), beta.get(),
+            S_v, H_q, H, n_tokens, n_seqs,
+            sq1, sq2, sq3, sv1, sv2, sv3, sb1, sb2, sb3, rq3);
+    } else {
+        ggml_cuda_kernel_launch(gated_delta_net_flashinfer_prepare_cuda, prepare_params,
+            q_d, k_d, v_d, g_d, b_d,
+            q_bf16.get(), k_bf16.get(), v_bf16.get(), alpha.get(), beta.get(),
+            S_v, H_q, H, n_tokens, n_seqs,
+            sq1, sq2, sq3, sv1, sv2, sv3, sb1, sb2, sb3, rq3);
+    }
 
     ggml_cuda_kernel_launch_params cu_params(
         dim3(1, 1, 1), dim3(n_seqs + 1, 1, 1), 0, stream);
@@ -791,9 +890,14 @@ static bool launch_gated_delta_net_flashinfer_aot(
     }
 
     ggml_cuda_kernel_launch_params unpack_params(
-        dim3((v_elements + threads - 1) / threads, 1, 1), dim3(threads, 1, 1), 0, stream);
-    ggml_cuda_kernel_launch(gated_delta_net_flashinfer_unpack_cuda, unpack_params,
-        out_bf16.get(), dst_d, (int64_t) v_elements);
+        dim3((prepare_threads + threads - 1) / threads, 1, 1), dim3(threads, 1, 1), 0, stream);
+    if (vec8) {
+        ggml_cuda_kernel_launch(gated_delta_net_flashinfer_unpack8_cuda, unpack_params,
+            out_bf16.get(), dst_d, (int64_t) (v_elements / 8));
+    } else {
+        ggml_cuda_kernel_launch(gated_delta_net_flashinfer_unpack_cuda, unpack_params,
+            out_bf16.get(), dst_d, (int64_t) v_elements);
+    }
     return true;
 }
 #endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)

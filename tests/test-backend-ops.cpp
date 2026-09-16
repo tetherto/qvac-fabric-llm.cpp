@@ -4644,6 +4644,96 @@ struct test_conv_state : public test_case {
     }
 };
 
+// the conv-state run followed by the conv chain of a gated delta net (ssm_conv, [bias], silu, per-head q/k l2 norms):
+// the model graph order (state write-back before the conv), so a backend can fuse the whole chain at prefill
+struct test_conv_state_ssm_conv : public test_case {
+    const int64_t d_conv;
+    const int64_t head_dim;
+    const int64_t n_head;
+    const int64_t n_t;
+    const int64_t n_seqs;
+    const int64_t mem_size;
+    const bool    fuse_bias;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "CONV_STATE_SSM_CONV";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR7(d_conv, head_dim, n_head, n_t, n_seqs, mem_size, fuse_bias);
+    }
+
+    test_conv_state_ssm_conv(int64_t d_conv = 4, int64_t head_dim = 128, int64_t n_head = 4, int64_t n_t = 64, int64_t n_seqs = 1,
+                             int64_t mem_size = 4, bool fuse_bias = false)
+        : d_conv(d_conv), head_dim(head_dim), n_head(n_head), n_t(n_t), n_seqs(n_seqs), mem_size(mem_size), fuse_bias(fuse_bias) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t n_ch       = 3*n_head*head_dim; // q, k, v slices
+        const int64_t state_size = (d_conv - 1)*n_ch;
+
+        ggml_tensor * states = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, state_size, mem_size);
+        ggml_tensor * idx    = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_seqs);
+        ggml_tensor * x      = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_ch, n_t, n_seqs);
+        ggml_tensor * b      = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d_conv, n_ch);
+        ggml_set_name(states, "states");
+        ggml_set_name(idx, "idx");
+        ggml_set_name(x, "x");
+        ggml_set_name(b, "b");
+
+        ggml_tensor * rows = ggml_get_rows(ctx, states, idx);
+        ggml_tensor * st   = ggml_reshape_3d(ctx, rows, d_conv - 1, n_ch, n_seqs);
+        ggml_tensor * conv_input = ggml_concat(ctx, st, ggml_transpose(ctx, x), 0);
+        ggml_set_name(conv_input, "conv_input");
+
+        ggml_tensor * last = ggml_view_3d(ctx, conv_input, d_conv - 1, n_ch, n_seqs, conv_input->nb[1], conv_input->nb[2],
+                                          ggml_row_size(conv_input->type, n_t));
+        ggml_tensor * upd  = ggml_view_2d(ctx, states, state_size, n_seqs, states->nb[1], (mem_size - n_seqs)*states->nb[1]);
+        ggml_tensor * next = ggml_cpy(ctx, last, upd);
+
+        ggml_tensor * conv = ggml_ssm_conv(ctx, conv_input, b);
+        if (fuse_bias) {
+            ggml_tensor * bias = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_ch);
+            ggml_set_name(bias, "bias");
+            conv = ggml_add(ctx, conv, bias);
+        }
+        conv = ggml_silu(ctx, conv);
+
+        const size_t nb_ch = ggml_row_size(conv->type, n_ch);
+        auto slice = [&](int64_t i) {
+            return ggml_view_4d(ctx, conv, head_dim, n_head, n_t, n_seqs, ggml_row_size(conv->type, head_dim), nb_ch, nb_ch*n_t,
+                                i*n_head*head_dim*ggml_element_size(conv));
+        };
+        ggml_tensor * q = ggml_l2_norm(ctx, slice(0), 1e-6f);
+        ggml_tensor * k = ggml_l2_norm(ctx, slice(1), 1e-6f);
+        ggml_tensor * v = slice(2);
+        ggml_tensor * sum = ggml_add(ctx, ggml_add(ctx, q, k), v);
+
+        // the state write-back is visited first so the graph order matches the model's; one output covers the conv
+        // output (v), both norms and the next state rows
+        ggml_tensor * out = ggml_concat(ctx, next, ggml_reshape_2d(ctx, sum, head_dim*n_head*n_t, n_seqs), 0);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type == GGML_TYPE_I32) {
+                // gather from the rows that are written (the in-place update) and from others
+                std::vector<int32_t> data(ggml_nelements(t));
+                for (int64_t i = 0; i < ggml_nelements(t); i++) {
+                    data[i] = (i % 2 == 0) ? (int32_t) (mem_size - n_seqs + i) : (int32_t) (i % mem_size);
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(int32_t));
+            } else {
+                init_tensor_uniform(t, -1.0f, 1.0f);
+            }
+        }
+    }
+};
+
 // GGML_OP_SSM_SCAN
 struct test_ssm_scan : public test_case {
     const ggml_type type;
@@ -11270,6 +11360,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             {4, 512, 1, 2, 4}, {4, 512, 16, 1, 4} }) {
         test_cases.emplace_back(new test_conv_state(d_conv, n_ch, n_t, n_seqs, mem));
     }
+    // the prefill chain: conv-state run, then conv + silu + q/k norms, fused as one launch on CUDA for one sequence
+    for (auto [d_conv, head_dim, n_head, n_t, n_seqs, mem, bias] : std::vector<std::array<int64_t, 7>>{
+            {4, 128, 4, 64, 1, 4, 0}, {4, 128, 4, 4096, 1, 8, 0}, {4, 128, 4, 100, 1, 4, 1}, {4, 128, 4, 1, 1, 4, 0},
+            {4, 128, 4, 64, 2, 4, 0}, {9, 128, 2, 40, 1, 4, 0}, {4, 128, 4, 9, 1, 4, 0} }) {
+        test_cases.emplace_back(new test_conv_state_ssm_conv(d_conv, head_dim, n_head, n_t, n_seqs, mem, bias != 0));
+    }
 
     // fused ssm_conv + (optional) bias_add + silu. The bias-only graph (no silu) is intentionally
     // not tested since there's no fusion for that pattern in ggml_cuda_can_fuse.
@@ -12596,6 +12692,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 4096, 1, 3));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 4033, 1, 3));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32,  4, 128,  127, 2, 2));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128,   64, 1, 3, true)); // permuted input, vectorized pack
     // chunked prefix followed by a serial tail that must hold all K snapshots (tail exactly K, and tail > K)
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64,  68, 1, 1, false, false, /*K=*/4));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 100, 2, 1, false, false, /*K=*/4));
@@ -13161,6 +13258,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_ssm_conv_bias_silu(GGML_TYPE_F32, {4,   3328, 1, 1}, {4, 3328, 1, 1}, true));  // generate
     // qwen35 (Qwen3.8-27B) gated delta net input chain at decode: conv + silu + q/k norms, gate projections
     test_cases.emplace_back(new test_ssm_conv_l2(4, 128, 16, 1, 1, false));
+    test_cases.emplace_back(new test_conv_state_ssm_conv(4, 128, 26, 4096, 1, 8, false)); // prefill chain, 9984 channels
     test_cases.emplace_back(new test_gdn_gates(GGML_TYPE_BF16, 5120, 48, 1, false));
     test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 128, 64, 48, 1, 512, 1)); // prefill
     test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 128, 64, 48, 1, 1,   1)); // generate
