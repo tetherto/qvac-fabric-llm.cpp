@@ -777,12 +777,12 @@ static bool ggml_backend_buffer_is_cuda(ggml_backend_buffer_t buffer) {
     return buffer->iface.free_buffer == ggml_backend_cuda_buffer_free_buffer;
 }
 
-#ifdef GGML_CUDA_CUTLASS
+#ifdef GGML_CUDA_CUTLASS_BLOCKSCALED
 static const char * ggml_backend_cuda_repacked_buffer_type_get_name(ggml_backend_buffer_type_t buft);
 #endif
 
 bool ggml_backend_buft_is_cuda_repacked(ggml_backend_buffer_type_t buft) {
-#ifdef GGML_CUDA_CUTLASS
+#ifdef GGML_CUDA_CUTLASS_BLOCKSCALED
     return buft != nullptr && buft->iface.get_name == ggml_backend_cuda_repacked_buffer_type_get_name;
 #else
     GGML_UNUSED(buft);
@@ -1007,7 +1007,7 @@ ggml_backend_buffer_type_t ggml_backend_cuda_buffer_type(int device) {
     return &ggml_backend_cuda_buffer_types[device];
 }
 
-#ifdef GGML_CUDA_CUTLASS
+#ifdef GGML_CUDA_CUTLASS_BLOCKSCALED
 
 static ggml_cuda_repack_metadata ggml_cuda_cutlass_blockscaled_metadata = {
     GGML_CUDA_REPACK_TYPE_CUTLASS_BLOCKSCALED,
@@ -2897,7 +2897,7 @@ static void ggml_backend_cuda_free(ggml_backend_t backend) {
     delete backend;
 }
 
-#ifdef GGML_CUDA_CUTLASS
+#ifdef GGML_CUDA_CUTLASS_BLOCKSCALED
 static bool ggml_backend_cuda_begin_async_upload(ggml_backend_t backend, ggml_tensor * tensor) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
     ggml_backend_buffer_t buffer = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
@@ -2941,7 +2941,7 @@ static void ggml_backend_cuda_set_tensor_async(ggml_backend_t backend, ggml_tens
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
     ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
 
-#ifdef GGML_CUDA_CUTLASS
+#ifdef GGML_CUDA_CUTLASS_BLOCKSCALED
     if (ggml_backend_buft_is_cuda_repacked(buf->buft)) {
         ggml_backend_cuda_repacked_buffer_set_tensor_async(
             *cuda_ctx, buf, tensor, data, offset, size);
@@ -2958,7 +2958,7 @@ static void ggml_backend_cuda_get_tensor_async(ggml_backend_t backend, const ggm
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
     ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
 
-#ifdef GGML_CUDA_CUTLASS
+#ifdef GGML_CUDA_CUTLASS_BLOCKSCALED
     if (ggml_backend_buft_is_cuda_repacked(buf->buft)) {
         ggml_backend_cuda_buffer_context * buf_ctx = (ggml_backend_cuda_buffer_context *) buf->context;
         GGML_ASSERT(buf_ctx->device == cuda_ctx->device);
@@ -2980,7 +2980,7 @@ static void ggml_backend_cuda_set_tensor_2d_async(ggml_backend_t backend, struct
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
     ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
 
-#ifdef GGML_CUDA_CUTLASS
+#ifdef GGML_CUDA_CUTLASS_BLOCKSCALED
     if (ggml_backend_buft_is_cuda_repacked(buf->buft)) {
         if (cuda_ctx->upload_for_stream().data != nullptr) {
             for (size_t i = 0; i < n_copies; ++i) {
@@ -3011,7 +3011,7 @@ static void ggml_backend_cuda_get_tensor_2d_async(ggml_backend_t backend, const 
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
     ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
 
-#ifdef GGML_CUDA_CUTLASS
+#ifdef GGML_CUDA_CUTLASS_BLOCKSCALED
     if (ggml_backend_buft_is_cuda_repacked(buf->buft)) {
         const auto * buf_ctx = (const ggml_backend_cuda_buffer_context *) buf->context;
         GGML_ASSERT(buf_ctx->device == cuda_ctx->device);
@@ -3046,7 +3046,7 @@ static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_
     const bool src_repacked = ggml_backend_buft_is_cuda_repacked(buf_src->buft);
     const bool dst_repacked = ggml_backend_buft_is_cuda_repacked(buf_dst->buft);
     if (src_repacked || dst_repacked) {
-#ifdef GGML_CUDA_CUTLASS
+#ifdef GGML_CUDA_CUTLASS_BLOCKSCALED
         if (!src_repacked || !dst_repacked || src->type != dst->type ||
             !ggml_are_same_shape(src, dst) || src->extra != dst->extra) {
             return false;
@@ -7369,7 +7369,7 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t 
 
 static ggml_backend_buffer_type_t * ggml_backend_cuda_device_get_preferred_bufts(ggml_backend_dev_t dev) {
     static thread_local ggml_backend_buffer_type_t bufts[2] = {};
-#ifdef GGML_CUDA_CUTLASS
+#ifdef GGML_CUDA_CUTLASS_BLOCKSCALED
     ggml_backend_cuda_device_context * ctx = (ggml_backend_cuda_device_context *) dev->context;
     bufts[0] = ggml_cuda_repacked_buffer_enabled(ctx->device) ?
         ggml_backend_cuda_repacked_buffer_type(ctx->device) : nullptr;
@@ -7387,7 +7387,7 @@ static bool ggml_backend_cuda_device_supports_async_upload(
     if (buft == ggml_backend_cuda_buffer_type(ctx->device)) {
         return true;
     }
-#ifdef GGML_CUDA_CUTLASS
+#ifdef GGML_CUDA_CUTLASS_BLOCKSCALED
     return ggml_cuda_repacked_buffer_enabled(ctx->device) &&
         buft == ggml_backend_cuda_repacked_buffer_type(ctx->device);
 #else
@@ -7421,7 +7421,7 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     if (strcmp(name, "ggml_backend_dev_supports_async_upload") == 0) {
         return (void *)ggml_backend_cuda_device_supports_async_upload;
     }
-#ifdef GGML_CUDA_CUTLASS
+#ifdef GGML_CUDA_CUTLASS_BLOCKSCALED
     if (strcmp(name, "ggml_backend_begin_async_upload") == 0) {
         return (void *) ggml_backend_cuda_begin_async_upload;
     }

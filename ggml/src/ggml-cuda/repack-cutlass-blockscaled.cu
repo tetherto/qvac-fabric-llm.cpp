@@ -13,7 +13,7 @@ bool ggml_cuda_repack_is_cutlass_blockscaled(const ggml_tensor * tensor) {
     return metadata->type == GGML_CUDA_REPACK_TYPE_CUTLASS_BLOCKSCALED;
 }
 
-#ifdef GGML_CUDA_CUTLASS
+#ifdef GGML_CUDA_CUTLASS_BLOCKSCALED
 
 template <typename block_t_, int block_values_, int scale_values_>
 struct cutlass_repack_format_base {

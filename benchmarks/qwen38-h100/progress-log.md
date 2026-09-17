@@ -927,3 +927,25 @@ the GEMV itself and keeps its lower launch overhead at B=2 to 4; (3) SGLang stil
 after (1) or (2) needs its own round.
 Not measured here: the GEMM route at ntokens 2 to 8 in isolation (`test-backend-ops perf` has no m=2,4,8 cases at the model
 shapes), speculative decoding on either engine, and the 110k shape at concurrency.
+
+## Stack collapsed into one PR and the CUTLASS build gate split (2026-09-17, user ask)
+Goal (user): carry the campaign as a single PR instead of three stacked ones, with the collapsed head verified against the
+build the stacked tips produced.
+Change: (a) `fp8-h100-campaign` fast-forwarded to the campaign-4 tip `69372672c` (31 commits over `temp-10549`), so PR #268
+carries everything; #270 is auto-marked merged because its base now contains its head, #275 closed by hand. The tree of the
+collapsed head is identical to the old #275 tip (same tree hash `83d74109d`), and all nine campaign CUDA sources are
+byte-identical to the pre-rebase tip `88c692279`. (b) `GGML_CUDA_CUTLASS` split into the umbrella option plus
+`GGML_CUDA_CUTLASS_BLOCKSCALED` (default on): the base's sm_120f/121f block-scaled MXFP4 kernels and their repacked-buffer
+plumbing now sit behind the new macro and CMake disables it with a status line below CUDA 12.9, while the campaign's sm_90a
+FP8 sources keep the umbrella macro. Before the split the new base's `FATAL_ERROR "requires CUDA 12.9"` made any CUTLASS
+build impossible on the bench host, whose only nvcc is 12.8; `mmq-cutlass.cu` and `repack-cutlass-blockscaled.cu` already had
+complete no-CUTLASS branches, so the split is a macro rename in 16 places plus the CMake wiring.
+Verify: A/B/A/B on GPU 5 (`-r 3`, q8-head GGUF, load 3.2), A = the pre-rebase campaign build `build-h100-r1` at `54db4c109`,
+B = the collapsed head built with CUTLASS on and block-scaled off: pp10240 11840 / 11808 (A) against 11856 / 11815 (B),
+tg128 at d10240 88.25 / 88.25 against 88.14 / 88.11. Both phases match within run noise, so the rebase and the split changed
+no numbers. The 14443 pp10240 of the campaign-4 accept row does not reproduce today on either binary (A itself measures
+11824 now), so that figure carries a host-state difference from 2026-09-16 rather than a code difference; same-day A/B is the
+comparison that holds. CUTLASS-off builds of the same head link `test-backend-ops`, `llama-bench` and `llama-server` with no
+errors, and decode there is the same 88.23.
+Decision: both kept. The split is what makes the campaign buildable with CUTLASS on any host below CUDA 12.9; the base's
+Blackwell path is unchanged when the toolkit supports it.

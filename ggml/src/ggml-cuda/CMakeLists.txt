@@ -104,7 +104,7 @@ if (CUDAToolkit_FOUND)
 
     file(GLOB   GGML_SOURCES_CUDA "*.cu")
     set(GGML_CUDA_CUTLASS_SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/mmq-cutlass.cu")
-    # built by their own target when GGML_CUDA_CUTLASS is on
+    # both are built by their own target; the block-scaled one only when GGML_CUDA_CUTLASS_BLOCKSCALED is on
     set(GGML_CUDA_CUTLASS_F8_SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/mmf8-cutlass.cu" "${CMAKE_CURRENT_SOURCE_DIR}/fattn-cutlass.cu")
     list(REMOVE_ITEM GGML_SOURCES_CUDA ${GGML_CUDA_CUTLASS_F8_SOURCE})
     file(GLOB   SRCS "template-instances/fattn-tile*.cu")
@@ -129,8 +129,10 @@ if (CUDAToolkit_FOUND)
     endif()
 
     if (GGML_CUDA_CUTLASS)
-        if (CUDAToolkit_VERSION VERSION_LESS "12.9")
-            message(FATAL_ERROR "GGML_CUDA_CUTLASS requires CUDA 12.9 or newer")
+        if (GGML_CUDA_CUTLASS_BLOCKSCALED AND CUDAToolkit_VERSION VERSION_LESS "12.9")
+            # the sm_120f/121f block-scaled kernels need 12.9; the sm_90a FP8 sources below build with 12.4 and newer
+            message(STATUS "GGML_CUDA_CUTLASS_BLOCKSCALED needs CUDA 12.9 or newer, disabled for CUDA ${CUDAToolkit_VERSION}")
+            set(GGML_CUDA_CUTLASS_BLOCKSCALED OFF)
         endif()
 
         if (GGML_CUDA_CUTLASS_DIR)
@@ -151,7 +153,9 @@ if (CUDAToolkit_FOUND)
             license_add_file("CUTLASS" "${cutlass_SOURCE_DIR}/LICENSE.txt")
         endif()
 
-        list(REMOVE_ITEM GGML_SOURCES_CUDA "${GGML_CUDA_CUTLASS_SOURCE}")
+        if (GGML_CUDA_CUTLASS_BLOCKSCALED)
+            list(REMOVE_ITEM GGML_SOURCES_CUDA "${GGML_CUDA_CUTLASS_SOURCE}")
+        endif()
     endif()
 
     ggml_add_backend_library(ggml-cuda
@@ -216,7 +220,7 @@ if (CUDAToolkit_FOUND)
         target_link_libraries(ggml-cuda PRIVATE CUDA::cuda_driver)
     endif()
 
-    if (GGML_CUDA_CUTLASS)
+    if (GGML_CUDA_CUTLASS AND GGML_CUDA_CUTLASS_BLOCKSCALED)
         add_library(ggml-cuda-cutlass OBJECT "${GGML_CUDA_CUTLASS_SOURCE}")
         set_target_properties(ggml-cuda-cutlass PROPERTIES
             CUDA_ARCHITECTURES OFF
@@ -226,7 +230,7 @@ if (CUDAToolkit_FOUND)
         target_include_directories(ggml-cuda-cutlass SYSTEM PRIVATE
             "${cutlass_SOURCE_DIR}/include"
             "${cutlass_SOURCE_DIR}/tools/util/include")
-        target_compile_definitions(ggml-cuda-cutlass PRIVATE GGML_CUDA_CUTLASS)
+        target_compile_definitions(ggml-cuda-cutlass PRIVATE GGML_CUDA_CUTLASS GGML_CUDA_CUTLASS_BLOCKSCALED)
         target_compile_options(ggml-cuda-cutlass PRIVATE
             "$<$<COMPILE_LANGUAGE:CUDA>:--generate-code=arch=compute_120f,code=sm_120f>"
             "$<$<COMPILE_LANGUAGE:CUDA>:--generate-code=arch=compute_121f,code=sm_121f>"
@@ -236,7 +240,7 @@ if (CUDAToolkit_FOUND)
         endif()
         target_sources(ggml-cuda PRIVATE $<TARGET_OBJECTS:ggml-cuda-cutlass>)
 
-        target_compile_definitions(ggml-cuda PRIVATE GGML_CUDA_CUTLASS)
+        target_compile_definitions(ggml-cuda PRIVATE GGML_CUDA_CUTLASS_BLOCKSCALED)
     endif()
 
     if (GGML_CUDA_NCCL)
@@ -349,6 +353,8 @@ if (CUDAToolkit_FOUND)
             target_compile_definitions(ggml-cuda-cutlass-f8 PRIVATE GGML_BACKEND_BUILD GGML_BACKEND_SHARED)
         endif()
         target_sources(ggml-cuda PRIVATE $<TARGET_OBJECTS:ggml-cuda-cutlass-f8>)
+
+        target_compile_definitions(ggml-cuda PRIVATE GGML_CUDA_CUTLASS)
     endif()
 else()
     message(FATAL_ERROR "CUDA Toolkit not found")
