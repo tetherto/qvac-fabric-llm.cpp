@@ -9,12 +9,13 @@ Each block owns one sequence/value head. Eight warps keep the state across 64-to
 Hardware: NVIDIA GB10 (SM121, CUDA 13.0) and AMD Radeon 8060S (gfx1151, ROCm HIP 7.15). Both builds used `GGML_CUDA_CUTLASS=OFF`.
 
 - All 121 GDN/precision cases and all nine continuation/replay cases passed on each backend.
-- The continuation harness confirmed the accelerated allocation (`mma=1`) on both backends and the default native fallback (`mma=0`) on ROCm.
+- The continuation harness confirmed the accelerated allocation (`mma=1`) on both backends and the native fallback (`mma=0`) on ROCm. These initial checks used the former runtime switches; dispatch is now automatic.
 - CUDA memcheck reported zero errors for 129-token, two-sequence, permuted and nonpermuted inputs. Racecheck reported zero hazards for 129-token continuation.
+- After removing the runtime switches, CUDA and HIP builds passed. All nine continuation cases passed on each backend with no switches set. Additional Strix checks confirmed native dispatch at 2047 tokens, WMMA at 2048 tokens, and correct 4096-token continuation split at 2048.
 - SM75 and SM120 compilation passed; only SM121 and gfx1151 received runtime testing.
 - At 2048 tokens, CUDA output/state NMSE was 5.443e-5 / 1.116e-6. ROCm output/state NMSE was 3.892e-5 / 7.882e-7. The continuation tolerance is 3e-4.
 
-These are operator and throughput checks, not a representative model-quality evaluation. A Qwen3.6 GGUF was not present on Strix, so its measurements use synthetic Qwen-shaped operator inputs.
+These are operator and throughput checks, not a representative model-quality evaluation. The operator measurements use synthetic Qwen-shaped inputs. A later full-model Strix measurement uses Qwen3.8-27B Q8.
 
 ## Strix performance
 
@@ -25,7 +26,9 @@ One sequence, width 128, 16 query/key heads, 48 value heads. Repeated measuremen
 | 512 | 1.892 ms | 1.988 ms | 0.95x |
 | 2048 | 15.790 ms | 8.597 ms | 1.84x |
 
-The initial swizzled layout took 23.507 ms at 2048 tokens. The plain HIP layout passed the complete correctness suite after the change. ROCm remains opt-in because the shorter prompt regressed and the performance coverage is narrow.
+The initial swizzled layout took 23.507 ms at 2048 tokens. The plain HIP layout passed the complete correctness suite after the change. ROCm now selects WMMA automatically on gfx1151 for eligible microbatches of at least 2048 tokens. Shorter microbatches use native GDN because the 512-token case regressed. Both GDN runtime environment switches have been removed.
+
+A subsequent Qwen3.8-27B-UD-Q8_K_L full-model comparison at PP16384, batch 16384, microbatch 16384, flash attention enabled, and full GPU offload measured 217.107 +/- 0.462 tokens/s with native GDN and 269.122 +/- 0.353 tokens/s with WMMA. Both used the same CUTLASS-off ROCm build, normal warm-up, and three measured repetitions (native first). This is a 23.96% throughput gain, reducing prompt time from 75.465 to 60.880 seconds. The 16384-token continuation check split at 8192 also passed with WMMA active.
 
 ## GB10 performance
 
@@ -58,16 +61,12 @@ Configure CUDA with `GGML_CUDA=ON`, `CMAKE_CUDA_ARCHITECTURES=121`, `GGML_CUDA_C
 build/bin/test-backend-ops test -o GATED_DELTA_NET,GATED_DELTA_NET_PRECISION -b CUDA0 -j 4
 build/bin/test-gdn-continuation
 
-# Strix: opt in to the WMMA kernel
-GGML_HIP_GDN_MMA=1 build/bin/test-backend-ops test -o GATED_DELTA_NET,GATED_DELTA_NET_PRECISION -b ROCm0 -j 4
-GGML_HIP_GDN_MMA=1 build/bin/test-gdn-continuation
-GGML_HIP_GDN_MMA=1 build/bin/test-backend-ops perf -o GATED_DELTA_NET -b ROCm0 -p 'head_count=16,head_size=128,n_seq_tokens=(512|2048),n_seqs=1,v_repeat=3,'
-
-# Native comparison: same binary and options
-GGML_CUDA_DISABLE_GDN_MMA=1 build/bin/test-backend-ops perf -o GATED_DELTA_NET -b ROCm0 -p 'head_count=16,head_size=128,n_seq_tokens=(512|2048),n_seqs=1,v_repeat=3,'
+# Strix: automatic WMMA selection for eligible microbatches >= 2048 tokens
+build/bin/test-backend-ops test -o GATED_DELTA_NET,GATED_DELTA_NET_PRECISION -b ROCm0 -j 4
+build/bin/test-gdn-continuation
+build/bin/test-backend-ops perf -o GATED_DELTA_NET -b ROCm0 -p 'head_count=16,head_size=128,n_seq_tokens=(512|2048),n_seqs=1,v_repeat=3,'
 
 build/bin/llama-bench -m qwen3.6-27b-nvfp4.gguf -p 4096 -n 0 -b 4096 -ub 2048 -fa 1 -ngl 999 -r 3 -o json
-GGML_CUDA_DISABLE_GDN_MMA=1 build/bin/llama-bench -m qwen3.6-27b-nvfp4.gguf -p 4096 -n 0 -b 4096 -ub 2048 -fa 1 -ngl 999 -r 3 -o json
 ```
 
-Both environment controls are read once per device; restart the process when changing them. Native kernels remain available for unsupported shapes and hardware.
+Native kernels remain available through automatic dispatch for unsupported shapes and hardware, and short prompts on gfx1151. The native-versus-MMA comparisons above were collected before the runtime switches were removed; reproducing the native baseline now requires a separate build with MMA dispatch disabled.
