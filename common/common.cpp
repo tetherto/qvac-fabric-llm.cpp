@@ -1297,13 +1297,29 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
     if (params.fit_params) {
         COM_TRC("%s", "fitting params to device memory ...\n");
         COM_TRC("%s", "(for bugs during this step try to reproduce them with -fit off, or provide --verbose logs if the bug only occurs with -fit on)\n");
-        common_fit_params(params.model.path.c_str(), &mparams, &cparams,
+        const int64_t fit_start_us = llama_time_us();
+        const auto fit_status = common_fit_params(params.model.path.c_str(), &mparams, &cparams,
             params.tensor_split,
             params.tensor_buft_overrides.data(),
             params.fit_params_target.data(),
             params.fit_params_min_ctx,
             params.prefetch_weights_auto,
             params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
+        if (fit_status == COMMON_PARAMS_FIT_STATUS_SUCCESS) {
+            // Keep caller-visible parameters consistent with the fitted buffers
+            // and the model/context configuration used below.
+            params.n_gpu_layers = mparams.n_gpu_layers;
+            params.n_ctx = cparams.n_ctx;
+            params.moe_cache_size = cparams.moe_cache_size;
+            params.prefetch_weights = cparams.prefetch_weights;
+            COM_INF("fit completed in %.2f seconds: n_gpu_layers = %d, n_ctx = %u, moe_cache_size = %zu, prefetch_weights = %s\n",
+                    (llama_time_us() - fit_start_us) * 1e-6, mparams.n_gpu_layers, cparams.n_ctx,
+                    (size_t) cparams.moe_cache_size, cparams.prefetch_weights ? "on" : "off");
+        } else {
+            COM_WRN("fit %s after %.2f seconds; continuing with original parameters\n",
+                    fit_status == COMMON_PARAMS_FIT_STATUS_FAILURE ? "failed" : "encountered an error",
+                    (llama_time_us() - fit_start_us) * 1e-6);
+        }
     }
 
     llama_model * model = llama_model_load_from_file(params.model.path.c_str(), mparams);

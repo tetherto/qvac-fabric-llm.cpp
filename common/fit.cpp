@@ -1,14 +1,17 @@
 #include "fit.h"
 
 #include "log.h"
+#include "llama-cpp.h"
 
 #include "../src/llama-ext.h"
 
 #include <array>
+#include <algorithm>
 #include <cassert>
 #include <stdexcept>
 #include <cinttypes>
 #include <set>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -35,12 +38,19 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
         uint32_t & hp_n_ctx_train,
         uint32_t & hp_n_expert,
         ggml_log_level log_level) {
+    // Serialize temporary logger overrides across all fit/memory probes.
+    static std::mutex logger_mutex;
+    const std::lock_guard<std::mutex> lock(logger_mutex);
     struct user_data_t {
         struct {
             ggml_log_callback callback;
             void * user_data;
         } original_logger;
         ggml_log_level min_level; // prints below this log level go to debug log
+
+        ~user_data_t() {
+            llama_log_set(original_logger.callback, original_logger.user_data);
+        }
     };
     user_data_t ud;
     llama_log_get(&ud.original_logger.callback, &ud.original_logger.user_data);
@@ -56,16 +66,15 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
     mparams_copy.no_alloc  = true;
     mparams_copy.load_mode = LLAMA_LOAD_MODE_NONE;
 
-    llama_model * model = llama_model_load_from_file(path_model, mparams_copy);
+    llama_model_ptr model_owner(llama_model_load_from_file(path_model, mparams_copy));
+    llama_model * model = model_owner.get();
     if (model == nullptr) {
-        llama_log_set(ud.original_logger.callback, ud.original_logger.user_data);
         throw std::runtime_error("failed to load model");
     }
 
-    llama_context * ctx = llama_init_from_model(model, *cparams);
+    llama_context_ptr ctx_owner(llama_init_from_model(model, *cparams));
+    llama_context * ctx = ctx_owner.get();
     if (ctx == nullptr) {
-        llama_model_free(model);
-        llama_log_set(ud.original_logger.callback, ud.original_logger.user_data);
         throw common_params_fit_exception("failed to create llama_context from model");
     }
 
@@ -144,10 +153,6 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
     hp_n_expert    = llama_model_n_expert(model);
 
     common_memory_breakdown_print(ctx);
-
-    llama_free(ctx);
-    llama_model_free(model);
-    llama_log_set(ud.original_logger.callback, ud.original_logger.user_data);
 
     return ret;
 }
@@ -1042,11 +1047,20 @@ enum common_params_fit_status common_fit_params(
     const int64_t t0_us = llama_time_us();
     common_params_fit_status status = COMMON_PARAMS_FIT_STATUS_SUCCESS;
     // The impl mutates the params while it works (e.g. n_ctx during the
-    // context-reduction probe). Callers that ignore the status — including
-    // common_init_from_params — would otherwise load with a half-mutated
-    // configuration after a FAILURE, silently clamping the context.
+    // context-reduction probe). Callers that continue after failure would
+    // otherwise load with a half-mutated configuration, silently clamping
+    // the context.
     const llama_model_params   mparams_original = *mparams;
     const llama_context_params cparams_original = *cparams;
+    // The structs only hold pointers to these caller-owned writable buffers.
+    std::vector<float> split_original;
+    std::vector<llama_model_tensor_buft_override> overrides_original;
+    if (tensor_split) {
+        split_original.assign(tensor_split, tensor_split + llama_max_devices());
+    }
+    if (tensor_buft_overrides) {
+        overrides_original.assign(tensor_buft_overrides, tensor_buft_overrides + llama_max_tensor_buft_overrides());
+    }
     try {
         common_params_fit_impl(
             path_model, mparams, cparams, tensor_split, tensor_buft_overrides, margins, n_ctx_min, prefetch_weights_auto, log_level);
@@ -1063,6 +1077,8 @@ enum common_params_fit_status common_fit_params(
         status = COMMON_PARAMS_FIT_STATUS_ERROR;
     }
     if (status != COMMON_PARAMS_FIT_STATUS_SUCCESS) {
+        std::copy(split_original.begin(), split_original.end(), tensor_split);
+        std::copy(overrides_original.begin(), overrides_original.end(), tensor_buft_overrides);
         *mparams = mparams_original;
         *cparams = cparams_original;
     }
