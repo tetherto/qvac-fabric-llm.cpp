@@ -35,6 +35,18 @@ GGML_BACKEND_API void ggml_backend_rpc_get_device_memory(const char * endpoint, 
 GGML_BACKEND_API void ggml_backend_rpc_start_server(const char * endpoint, const char * cache_dir,
                                                     size_t n_threads, size_t n_devices, ggml_backend_dev_t * devices);
 
+// Managed server lifecycle for in-process hosts such as mobile Bare apps.
+// create() initializes devices and binds the listening socket synchronously;
+// run() blocks until stop() is requested and must be called from a worker
+// thread. The caller must wait for run() to return before calling free().
+typedef struct ggml_backend_rpc_server * ggml_backend_rpc_server_t;
+GGML_BACKEND_API ggml_backend_rpc_server_t ggml_backend_rpc_server_create(
+        const char * endpoint, const char * cache_dir,
+        size_t n_threads, size_t n_devices, ggml_backend_dev_t * devices);
+GGML_BACKEND_API void ggml_backend_rpc_server_run(ggml_backend_rpc_server_t server);
+GGML_BACKEND_API void ggml_backend_rpc_server_stop(ggml_backend_rpc_server_t server);
+GGML_BACKEND_API void ggml_backend_rpc_server_free(ggml_backend_rpc_server_t server);
+
 GGML_BACKEND_API ggml_backend_reg_t ggml_backend_rpc_reg(void);
 GGML_BACKEND_API ggml_backend_reg_t ggml_backend_rpc_add_server(const char * endpoint);
 

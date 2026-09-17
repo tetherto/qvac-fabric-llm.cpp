@@ -654,6 +654,8 @@ class rpc_command_queue {
         }
         auto sock = socket_t::connect(host.c_str(), port, RPC_CLIENT_CONNECT_TIMEOUT_MS);
         if (sock == nullptr || !sock->set_timeout(RPC_CLIENT_IO_TIMEOUT_MS) || !negotiate_hello(sock)) {
+            sock.reset();
+            rpc_transport_shutdown();
             return nullptr;
         }
         auto queue    = std::shared_ptr<rpc_command_queue>(new rpc_command_queue(endpoint, std::move(sock)));
@@ -671,6 +673,8 @@ class rpc_command_queue {
         if (worker.joinable()) {
             worker.join();
         }
+        sock.reset();
+        rpc_transport_shutdown();
     }
 
     bool submit_rpc(rpc_cmd command, const void * input, size_t input_size) {
@@ -3382,13 +3386,42 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
     }
 }
 
-void ggml_backend_rpc_start_server(const char * endpoint, const char * cache_dir,
-                                   size_t n_threads, size_t n_devices, ggml_backend_dev_t * devices) {
-    if (n_devices == 0 || devices == nullptr) {
-        fprintf(stderr, "Invalid arguments to ggml_backend_rpc_start_server\n");
-        return;
-    }
+struct ggml_backend_rpc_server {
     std::vector<ggml_backend_t> backends;
+    std::string cache_dir;
+    bool has_cache_dir = false;
+    std::string host;
+    socket_ptr server_socket;
+    socket_ptr client_socket;
+    std::mutex client_mutex;
+    std::atomic<bool> stop_requested{false};
+    std::atomic<bool> running{false};
+    bool transport_initialized = false;
+
+    ~ggml_backend_rpc_server() {
+        client_socket.reset();
+        server_socket.reset();
+        if (transport_initialized) {
+            rpc_transport_shutdown();
+        }
+        for (auto backend : backends) {
+            ggml_backend_free(backend);
+        }
+    }
+};
+
+ggml_backend_rpc_server_t ggml_backend_rpc_server_create(
+        const char * endpoint, const char * cache_dir,
+        size_t n_threads, size_t n_devices, ggml_backend_dev_t * devices) {
+    if (n_devices == 0 || devices == nullptr) {
+        fprintf(stderr, "Invalid arguments to ggml_backend_rpc_server_create\n");
+        return nullptr;
+    }
+    auto server = std::make_unique<ggml_backend_rpc_server>();
+    server->has_cache_dir = cache_dir != nullptr;
+    if (server->has_cache_dir) {
+        server->cache_dir = cache_dir;
+    }
     printf("Starting RPC server v%d.%d.%d\n",
         RPC_PROTO_MAJOR_VERSION,
         RPC_PROTO_MINOR_VERSION,
@@ -3405,9 +3438,9 @@ void ggml_backend_rpc_start_server(const char * endpoint, const char * cache_dir
         auto backend = ggml_backend_dev_init(dev, nullptr);
         if (!backend) {
             fprintf(stderr, "Failed to create backend for device %s\n", dev->iface.get_name(dev));
-            return;
+            return nullptr;
         }
-        backends.push_back(backend);
+        server->backends.push_back(backend);
         ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
         if (reg) {
             auto ggml_backend_set_n_threads_fn = (ggml_backend_set_n_threads_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_set_n_threads");
@@ -3417,10 +3450,9 @@ void ggml_backend_rpc_start_server(const char * endpoint, const char * cache_dir
         }
     }
 
-    std::string host;
     int port;
-    if (!parse_endpoint(endpoint, host, port)) {
-        return;
+    if (!parse_endpoint(endpoint, server->host, port)) {
+        return nullptr;
     }
 
 #ifdef GGML_RPC_RDMA
@@ -3430,29 +3462,79 @@ void ggml_backend_rpc_start_server(const char * endpoint, const char * cache_dir
 #endif // GGML_RPC_RDMA
     if (!rpc_transport_init()) {
         fprintf(stderr, "Failed to initialize RPC transport\n");
-        return;
+        return nullptr;
     }
-    auto server_socket = socket_t::create_server(host.c_str(), port);
-    if (server_socket == nullptr) {
+    server->transport_initialized = true;
+    server->server_socket         = socket_t::create_server(server->host.c_str(), port);
+    if (server->server_socket == nullptr) {
         fprintf(stderr, "Failed to create server socket\n");
+        return nullptr;
+    }
+    return server.release();
+}
+
+void ggml_backend_rpc_server_run(ggml_backend_rpc_server_t server) {
+    if (server == nullptr || server->running.exchange(true)) {
         return;
     }
-    while (true) {
-        auto client_socket = server_socket->accept();
+    while (!server->stop_requested.load()) {
+        bool timed_out     = false;
+        auto client_socket = server->server_socket->accept(100, &timed_out);
         if (client_socket == nullptr) {
-            fprintf(stderr, "Failed to accept client connection\n");
-            return;
+            if (timed_out) {
+                continue;
+            }
+            break;
+        }
+        {
+            std::lock_guard<std::mutex> lock(server->client_mutex);
+            if (server->stop_requested.load()) {
+                client_socket->shutdown();
+                break;
+            }
+            server->client_socket = client_socket;
         }
         printf("Accepted client connection\n");
         fflush(stdout);
-        rpc_serve_client(backends, cache_dir, host, client_socket);
+        rpc_serve_client(
+            server->backends,
+            server->has_cache_dir ? server->cache_dir.c_str() : nullptr,
+            server->host,
+            client_socket);
+        {
+            std::lock_guard<std::mutex> lock(server->client_mutex);
+            server->client_socket.reset();
+        }
         printf("Client connection closed\n");
         fflush(stdout);
     }
-    rpc_transport_shutdown();
-    for (auto backend : backends) {
-        ggml_backend_free(backend);
+    server->running.store(false);
+}
+
+void ggml_backend_rpc_server_stop(ggml_backend_rpc_server_t server) {
+    if (server == nullptr) {
+        return;
     }
+    server->stop_requested.store(true);
+    std::lock_guard<std::mutex> lock(server->client_mutex);
+    if (server->client_socket != nullptr) {
+        server->client_socket->shutdown();
+    }
+}
+
+void ggml_backend_rpc_server_free(ggml_backend_rpc_server_t server) {
+    delete server;
+}
+
+void ggml_backend_rpc_start_server(const char * endpoint, const char * cache_dir,
+                                   size_t n_threads, size_t n_devices, ggml_backend_dev_t * devices) {
+    ggml_backend_rpc_server_t server = ggml_backend_rpc_server_create(
+        endpoint, cache_dir, n_threads, n_devices, devices);
+    if (server == nullptr) {
+        return;
+    }
+    ggml_backend_rpc_server_run(server);
+    ggml_backend_rpc_server_free(server);
 }
 
 static const char * ggml_backend_rpc_device_get_name(ggml_backend_dev_t dev) {
@@ -3841,6 +3923,18 @@ static void * ggml_backend_rpc_get_proc_address(ggml_backend_reg_t reg, const ch
     }
     if (std::strcmp(name, "ggml_backend_rpc_start_server") == 0) {
         return (void *)ggml_backend_rpc_start_server;
+    }
+    if (std::strcmp(name, "ggml_backend_rpc_server_create") == 0) {
+        return (void *)ggml_backend_rpc_server_create;
+    }
+    if (std::strcmp(name, "ggml_backend_rpc_server_run") == 0) {
+        return (void *)ggml_backend_rpc_server_run;
+    }
+    if (std::strcmp(name, "ggml_backend_rpc_server_stop") == 0) {
+        return (void *)ggml_backend_rpc_server_stop;
+    }
+    if (std::strcmp(name, "ggml_backend_rpc_server_free") == 0) {
+        return (void *)ggml_backend_rpc_server_free;
     }
     if (std::strcmp(name, "ggml_backend_comm_init") == 0) {
         return (void *)ggml_backend_rpc_comm_init;
