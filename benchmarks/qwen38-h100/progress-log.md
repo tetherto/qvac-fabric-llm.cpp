@@ -902,9 +902,28 @@ GPU (`prof/bb-r1.log`, `-npp 10240 -ntg 1024 -npl 1,2,4,8,16,32 -c 393216 -b 409
 reproduces it: S_TG 88.04 / 125.59 / 88.06 / 74.38 / 548.03 / 818.38 tok/s at B = 1 / 2 / 4 / 8 / 16 / 32, i.e. per-step decode
 time 11.4 / 15.9 / 46.5 / 107.5 / 29.2 / 39.1 ms. B = 4 and B = 8 cost one full single-token step per sequence (4 x 11.4 = 45.6
 against 46.5 measured, 8 x 11.4 = 91 against 107.5), while B = 16 and B = 32 amortize the weight reads as expected. So the loss
-is in the graph or the CUDA backend, not in the server's batch assembly, and its boundary sits exactly at the batch-8 limit of
-the decode paths added during campaigns 2 to 4 (the F8 GEMV route `ntokens <= MMF8_GEMV_MAX_NCOLS = 8`, the D6 conv-state
-fusion and the R2b state-gather elision, all gated on batches up to 8 and one sequence). Prefill is unaffected: S_PP is
-12082 to 12469 tok/s across every B.
-Not measured here: which of those kernels or fusions is responsible (needs a decode-window nsys trace at B = 4 and B = 16 with
-PDL off, and an A/B with `GGML_CUDA_DISABLE_FUSION=1`), speculative decoding on either engine, and the 110k shape.
+is in the graph or the CUDA backend, not in the server's batch assembly, and its boundary sits at the batch-8 limit of the F8
+decode GEMV route (`ntokens <= MMF8_GEMV_MAX_NCOLS = 8`). Prefill is unaffected: S_PP is 12082 to 12469 tok/s at every B.
+
+Attribution (2026-09-17, GPU 5, load 1.8 to 2.0, `conc_attrib.sh`): the cause is the F8 decode GEMV at more than one column,
+not the server, not the fusions and not batch assembly.
+- Fusion A/B (`-ntg 128`, fusion-on vs `GGML_CUDA_DISABLE_FUSION=1`): tg 88.35 / 77.75 at B=1, 88.06 / 68.23 at B=4,
+  73.92 / 72.45 at B=8, 548.82 / 514.30 at B=16. Fusions help at every batch and the collapse survives with them off, so the
+  campaign-2 to campaign-4 decode fusions are not responsible.
+- nsys decode window at B=4 with PDL off (`prof/bs-b4-nopdl`, `kern_window.py --n-tokens 64`): 45.44 ms of kernel time per
+  step, 982 launches, of which `mmf8_gemv` is 90.7% at 41.20 ms over 256 launches. The launch count per step is the same 256
+  as at B=1, where the same family costs about 9.3 ms, so the weight bytes are read once per step and the kernel itself is
+  4.4x slower per byte at four columns. Second in the table is the FMHA at 1.18 ms; nothing else is above 0.6 ms.
+- Mechanism in the kernel: `launch_mul_mat_vec_f8_e4m3[_multi]` picks `nrows_w = ncols_dst == 1 ? 4 : (ncols_dst == 2 ? 2 : 1)`
+  (`ggml/src/ggml-cuda/mmf8.cu:213`), so from three columns on a block owns one weight row and loads `ncols_dst` whole
+  activation columns for it: 4 x 5120 floats (80 KB) of activation against 5120 bytes of weights on the K=5120 shapes. The
+  block is activation-load bound and the weight-row amortization the B=1 path gets from four rows per block is gone.
+- At B >= 9 the dispatch leaves the GEMV (`ntokens <= MMF8_GEMV_MAX_NCOLS = 8`) and runs the CUTLASS W8A8 GEMM plus MMQ for
+  the Q8_0 head: per-step 29.2 ms at B=16 and 39.1 ms at B=32, which is why scaling resumes there.
+Levers, in order of expected gain (none implemented): (1) lower the GEMV-to-GEMM crossover from 8 to about 2 columns, the
+B=16 step time implies 8 columns through the GEMM at roughly 25 to 30 ms against 108 ms today (about 4x on aggregate decode at
+B=8); (2) keep `nrows_w = 4` at every `ncols_dst` and stage the activation columns in shared memory once per block, which fixes
+the GEMV itself and keeps its lower launch overhead at B=2 to 4; (3) SGLang still leads at B=8 by 7.5x, so the remaining gap
+after (1) or (2) needs its own round.
+Not measured here: the GEMM route at ntokens 2 to 8 in isolation (`test-backend-ops perf` has no m=2,4,8 cases at the model
+shapes), speculative decoding on either engine, and the 110k shape at concurrency.
