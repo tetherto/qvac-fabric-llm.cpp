@@ -31,14 +31,14 @@ struct outputs {
     std::vector<float> full_state;
     std::vector<float> split_attn;
     std::vector<float> split_state;
-    bool               cute_allocated = false;
+    bool               mma_allocated = false;
 };
 
-static ggml_backend_t cuda_backend() {
+static ggml_backend_t gpu_backend() {
     for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
         ggml_backend_dev_t dev = ggml_backend_dev_get(i);
         ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
-        if (reg != nullptr && strcmp(ggml_backend_reg_name(reg), "CUDA") == 0) {
+        if (reg != nullptr && (strcmp(ggml_backend_reg_name(reg), "CUDA") == 0 || strcmp(ggml_backend_reg_name(reg), "ROCm") == 0)) {
             return ggml_backend_dev_init(dev, nullptr);
         }
     }
@@ -155,7 +155,7 @@ static bool run_graph(
     ggml_backend_tensor_set(beta, data.beta.data(), 0, data.beta.size() * sizeof(float));
     ggml_backend_tensor_set(state, data.state.data(), 0, data.state.size() * sizeof(float));
 
-    result.cute_allocated = ggml_backend_buffer_get_alloc_size(full->buffer, full) > ggml_nbytes(full);
+    result.mma_allocated = ggml_backend_buffer_get_alloc_size(full->buffer, full) > ggml_nbytes(full);
     std::vector<float> previous_full(ggml_nelements(full));
     std::vector<float> previous_first(ggml_nelements(first));
     std::vector<float> previous_second(ggml_nelements(second));
@@ -207,9 +207,9 @@ static double nmse(const std::vector<float> & reference, const std::vector<float
 
 static int child_main(int64_t tokens, int64_t split) {
     ggml_backend_load_all();
-    ggml_backend_ptr cuda(cuda_backend());
-    if (!cuda) {
-        printf("RESULT skip=no_cuda\n");
+    ggml_backend_ptr gpu(gpu_backend());
+    if (!gpu) {
+        printf("RESULT skip=no_cuda_or_rocm\n");
         return 0;
     }
     ggml_backend_ptr cpu(ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr));
@@ -221,7 +221,7 @@ static int child_main(int64_t tokens, int64_t split) {
     outputs      reference;
     outputs      actual;
     if (!run_graph(cpu.get(), data, tokens, split, 1, reference) ||
-        !run_graph(cuda.get(), data, tokens, split, REPLAYS, actual)) {
+        !run_graph(gpu.get(), data, tokens, split, REPLAYS, actual)) {
         return 1;
     }
 
@@ -229,12 +229,12 @@ static int child_main(int64_t tokens, int64_t split) {
     const double state_error              = nmse(reference.full_state, actual.full_state);
     const double continuation_attn_error  = nmse(actual.full_attn, actual.split_attn);
     const double continuation_state_error = nmse(actual.full_state, actual.split_state);
-    const double tolerance = actual.cute_allocated ? 3e-4 : 1e-7;
+    const double tolerance = actual.mma_allocated ? 3e-4 : 1e-7;
     const bool   ok = attn_error <= tolerance && state_error <= tolerance &&
                       continuation_attn_error <= tolerance && continuation_state_error <= tolerance;
 
-    printf("RESULT ok=%d cute=%d tokens=%lld split=%lld attn=%.9e state=%.9e split_attn=%.9e split_state=%.9e\n",
-           ok ? 1 : 0, actual.cute_allocated ? 1 : 0, (long long) tokens, (long long) split, attn_error, state_error,
+    printf("RESULT ok=%d mma=%d tokens=%lld split=%lld attn=%.9e state=%.9e split_attn=%.9e split_state=%.9e\n",
+           ok ? 1 : 0, actual.mma_allocated ? 1 : 0, (long long) tokens, (long long) split, attn_error, state_error,
            continuation_attn_error, continuation_state_error);
     return ok ? 0 : 1;
 }
