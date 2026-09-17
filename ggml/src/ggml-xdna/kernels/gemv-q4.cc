@@ -412,7 +412,7 @@ extern "C" {
 // gamma and the words that describe the tile, in a buffer no dispatch writes.
 // Keeping the two apart is the whole point: writes from the host and from the
 // array hold in one order only when they are not to the same buffer.
-void act_pro_tile(const int32_t *in, const int32_t *hst, int32_t *out)
+void ggml_xdna_act_pro(const int32_t *in, const int32_t *hst, int32_t *out)
 {
     const int flags = hst[ACT_TILE / 4 - 2];
     if (!((flags >> 4) & 1)) {
@@ -760,21 +760,13 @@ static void gemv_q8g16(const uint8_t *w, const int32_t *a32, float *out)
 
 // The activation tile carries the code width of this dispatch in its last
 // word, so one entry point serves both.
-void gemv_dispatch(const uint8_t *w, const int32_t *a32, float *out)
+void ggml_xdna_gemv(const uint8_t *w, const int32_t *a32, float *out)
 {
-#if GEMV_STUB
-    // Prices the stage's arithmetic: the objects still move, the kernel does
-    // nothing with them. The results are wrong; the point is what a dispatch
-    // costs when only the data movement is left.
-    (void)w; (void)a32; (void)out;
-    return;
-#else
     if (a32[ACT_TILE / 4 - 1] == 0) {
         gemv_q4g32(w, a32, out);
     } else {
         gemv_q8g16(w, a32, out);
     }
-#endif
 }
 
 } // extern "C"

@@ -1,8 +1,8 @@
 #include "xdna-fa-prefill.h"
 #include "ggml-impl.h"
+#include "xdna-util.h"
 #include "xdna-runtime.h"
 #include "xdna-types.h"
-#include "xdna-profile.h"
 
 #include <cmath>
 #include <cstdint>
@@ -99,14 +99,12 @@ static const uint16_t * f16_bf16_table(void) {
     return t.data();
 }
 
-bool xdna_fa_prefill_enabled(void) {
+static bool fa_pf_enabled(void) {
     // Opt-in (GGML_XDNA_FA=1). The kernel runs the full-attention prefill
     // layers on the array, but its per-chunk dispatch and the scores round trip
     // cost more than the host attention for this model: ~19% of prefill
-    // throughput (pp1024 1501 -> 1221 t/s). Off by default for speed; set it
-    // for full-array coverage.
-    const char * v = getenv("GGML_XDNA_FA");
-    if (v == nullptr || v[0] == '\0' || strcmp(v, "0") == 0) {
+    // throughput. Off by default for speed; set it for full-array coverage.
+    if (xdna_env_int("GGML_XDNA_FA", 0) == 0) {
         return false;
     }
     for (const auto & dir : xdna_kernel_search_dirs()) {
@@ -153,7 +151,7 @@ static bool mask_is_causal(const ggml_tensor * m, int64_t n_kv, int64_t n_tokens
 
 bool xdna_fa_prefill_supported(const struct ggml_tensor * node) {
     using namespace fa_pf;
-    if (!xdna_fa_prefill_enabled() || !node || node->op != GGML_OP_FLASH_ATTN_EXT) {
+    if (!fa_pf_enabled() || !node || node->op != GGML_OP_FLASH_ATTN_EXT) {
         return false;
     }
     const ggml_tensor * q = node->src[0];
@@ -350,7 +348,6 @@ bool xdna_fa_prefill_run(struct xdna_device * dev, struct ggml_tensor * node) {
         return false;
     }
     {
-        xdna_rp _p("fa", "pack kv");
         uint16_t * kvh = (uint16_t *) g_fa.kv->bo.map();
         if (j0 == 0) {
             std::memset(kvh, 0, g_fa.kv_chunks * kv_chunk_bytes());
@@ -366,7 +363,6 @@ bool xdna_fa_prefill_run(struct xdna_device * dev, struct ggml_tensor * node) {
     for (int64_t rd = 0; rd < rounds; rd++) {
         const int64_t m0 = rd * MBLK;
         {
-            xdna_rp _p("fa", "pack q");
             pack_q(q, qh, m0);
         }
         for (size_t c = 0; c < chunks; c++) {
@@ -380,10 +376,8 @@ bool xdna_fa_prefill_run(struct xdna_device * dev, struct ggml_tensor * node) {
                 }
             }
             {
-                xdna_rp _p("fa", "sync q");
                 xdna_buffer_sync_to_device(g_fa.q);
             }
-            xdna_rp _p("fa", "dispatch");
             xdna_buffer * args[3] = { g_fa.q, g_fa.kv_view[c], g_fa.o };
             xrt::run run = xdna_kernel_run_start(g_fa.kern, args, 3);
             if (!xdna_run_wait(run)) {
@@ -393,7 +387,6 @@ bool xdna_fa_prefill_run(struct xdna_device * dev, struct ggml_tensor * node) {
         xdna_buffer_sync_from_device(g_fa.o);
 
         // dst is [D, n_head, n_tokens]; a core's object holds O transposed.
-        xdna_rp _p("fa", "scatter");
         const float * o = (const float *) g_fa.o->bo.map();
         for (int h = 0; h < H; h++) {
             for (int r = 0; r < ROWS; r++) {

@@ -109,12 +109,6 @@ bool xdna_wfmt_repack_row_as(enum ggml_type type, xdna_wfmt fmt, const void * sr
 // ggml dequant validates the format end to end.
 bool xdna_wfmt_decode_row(xdna_wfmt fmt, const void * src, int64_t k, float * dst);
 
-// Check the repack against the ggml dequant of the same rows and fold the
-// worst relative RMS into the verification table (GGML_XDNA_VERIFY). A correct
-// q4g32 repack of Q4_K carries ~16 mantissa bits of the group parameters, so
-// anything much above 1e-5 is a format bug.
-void xdna_wfmt_selfcheck(enum ggml_type type, const void * data, int64_t k, int64_t n_rows,
-                         const char * label);
 
 // The format the decode GEMV uses for `type`. Both widths pack into the same
 // tile size, so a single artifact streams either and the GEMV never switches

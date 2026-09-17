@@ -73,7 +73,7 @@ def _fill(t):
 
 
 def _conv_fn(C: int, T: int, KW: int, tokmaj: int = 0, bf16: int = 0):
-    src = (Path(__file__).resolve().parent / "conv.cc").read_text()
+    src = (Path(__file__).resolve().parent / "conv-ssm.cc").read_text()
     flags = [f"-DDIM_C={C}", f"-DDIM_T={T}", f"-DDIM_KW={KW}"]
     if tokmaj:
         flags.append("-DCONV_TOKEN_MAJOR")

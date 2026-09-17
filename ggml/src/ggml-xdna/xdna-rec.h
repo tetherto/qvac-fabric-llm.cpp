@@ -1,22 +1,18 @@
 #pragma once
 
 // Fused recurrent-layer runner for the XDNA decode path of the Qwen3.5
-// gated-delta-net. A single-token decode runs each recurrent layer on three
-// device kernels, keeping the recurrent state on the NPU between tokens:
+// gated-delta-net. A single-token decode runs each recurrent layer on one
+// device design, keeping the recurrent state on the NPU between tokens:
 //
-//   xdna_rec_core - attn_gdn_gated.xclbin (kernels/attn_gdn_gated.py): the
-//     merged conv+norm+gdn+gated A-half in one run per token, driven by a
-//     host-built per-token TXN stream (xdna_attn_gdn_txn_build, fused layout).
+//   xdna_rec_core - fused_layer.xclbin (kernels/fused_layer.py): the merged
+//     conv+norm+gdn+gated core plus the decode GEMV side by side, driven by a
+//     host-built per-token TXN stream (xdna_attn_gdn_build, fused layout).
 //     Conv history and the bf16 ssm state stay on the device; per token only
 //     the F_Q qkv windows, the x tails and the z lanes of the azg BO are
-//     re-uploaded, and the int8 aq codes + d_a come back (attn never leaves).
-//   xdna_rec_so  - attn_so_mmul.xclbin (kernels/attn_so_mmul.py): the ssm_out
-//     projection on the native int8 x int4 MMUL. The core returns the int8
-//     gated aq codes (written into the feed A slabs here) and the host adds the
-//     residual (h_attn).
-//   xdna_rec_ffn - ffn_mmul_ab.xclbin (kernels/ffn_layer_mmul.py): the whole
-//     FFN (gate/up/silu/down) on the int8 x int4 MMUL, adding the FFN output
-//     to h_attn (h_out).
+//     re-uploaded, and the gated epilogue's int8 aq codes + d_a come back.
+//   xdna_rec_gemv - the same design's GEMV cores (xdna-rec-gemv.h): the
+//     ssm_out projection, appended to the core's own stream, and the whole
+//     FFN (gate/up/silu/down) as a second dispatch on it.
 //
 // The runner is byte-transparent: it only allocates BOs of the sizes in
 // xdna_rec_geom and copies the caller's host buffers in/out. It does not know
@@ -110,27 +106,18 @@ void xdna_rec_rms_norm(const float * in, const float * w, size_t n,
 
 // --- attn_gdn_gated core (conv+norm+gdn+gated) ------------------------------
 
-// A loaded conv+norm+gdn+gated single-run runner for attn_gdn_gated.xclbin
-// (kernels/attn_gdn_gated.py). The BO set is the persistent decode state: feed
+// A loaded conv+norm+gdn+gated single-run runner for fused_layer.xclbin
+// (kernels/fused_layer.py). The BO set is the persistent decode state: feed
 // (conv history + qkv + conv weights, only the per-token F_Q windows re-synced
 // after t=0), x tails, pkvb (norm output, device-written), gstate (bf16 ssm
 // state, in place on the device), azg (per head [attn|z|gamma|hh], attn lanes
 // device-written by the gdn stage, z host-uploaded per token, gamma/hh seeded
 // once) and out (aq codes + d_a, device-written). The kernel program is bound
-// once with the host-built TXN stream (xdna_attn_gdn_txn_build, fused layout).
+// once with the host-built TXN stream (xdna_attn_gdn_build, fused layout).
 struct xdna_rec_core {
     xdna_device * dev = nullptr;
     bool dev_owned = false;          // true when the runner opened its own device
-    xdna_kernel * kern = nullptr;    // attn_gdn_gated.xclbin
-    // GGML_XDNA_ATTN_PHASE_PROF=1: the same token split into one dispatch per
-    // stage, so each can be timed. The cores loop forever on their fifos, so
-    // the work and its order are unchanged - only where the token is cut.
-    // They share one hardware context, the xclbin being the same.
-    xdna_kernel * phase_kern[4] = {};
-    // The FFN transition as its own dispatch on the SAME xclbin
-    // (GGML_XDNA_POST_FUSED): fill+drain of the in-design post tile, so no
-    // second design and no second context.
-    xdna_kernel * post_kern = nullptr;
+    xdna_kernel * kern = nullptr;    // fused_layer.xclbin
     // The core's stream, kept so the ssm_out projection can be appended to a
     // copy of it once the GEMV runner exists (xdna_rec_core_fuse_so). The two
     // are already one array configuration and one hardware context; fusing
@@ -138,30 +125,18 @@ struct xdna_rec_core {
     // per-phase cost is paid for.
     xdna_seq      base_seq;
     std::string   xclbin;
-    // The same design as a full ELF (GGML_XDNA_CORE_ELF, fused_layer_full.elf):
-    // its sequence is the ELF's control code and its buffers are plain kernel
-    // arguments, so the layer is not limited to the six a patched stream can
-    // name. Null unless the switch is on.
-    struct xdna_rec_core_elf * elf = nullptr;
-    bool          elf_seeded = false;
     // The projection drains into the FFN's activation tiles rather than into
     // an output buffer of its own, so the layer's two dispatches have nothing
     // between them.
     bool          so_to_act = false;
-    // The FFN rides the same stream, so the layer is one dispatch.
     bool          ffn_fused = false;
     xdna_kernel * so_kern = nullptr;
-    std::vector<uint32_t> ref_words;
 
     struct xdna_gemv * so_gemv = nullptr;
     xrt::run      so_run;
     bool          so_fused = false;
-    struct xdna_rec_post * post = nullptr;  // the standalone FFN transition
-    uint32_t      post_in_off = 0;    // residual and gamma go here
-    uint32_t      post_out_off = 0;   // hattn and the FFN activation
 
     bool          pkv_onchip = false;
-    int           out_base = 0;
     int           act_arg = 5;
     xdna_buffer * gbuf = nullptr;   // fused: [activation | weights | out]
     size_t        gbuf_out_off = 0;
@@ -178,9 +153,8 @@ struct xdna_rec_core {
 };
 
 // Open a device (when `dev` is null one is opened and owned by the runner),
-// load attn_gdn_gated.xclbin and bind the host-built phased TXN stream
-// (schedule 4, fused layout) in place of an IRON .insts.bin. Returns nullptr
-// on failure.
+// load fused_layer.xclbin and bind the host-built phased TXN stream in place
+// of an IRON .insts.bin. Returns nullptr on failure.
 xdna_rec_core * xdna_rec_core_create(xdna_device * dev, const xdna_rec_geom & g,
                                      const char * xclbin);
 
@@ -207,37 +181,18 @@ bool xdna_rec_core_seed(xdna_rec_core * core, const void * state);
 // Valid until the next core run.
 const void * xdna_rec_core_act(const xdna_rec_core * core);
 
-// Byte offset of that activation inside the core's output buffer.
-size_t xdna_rec_core_act_off(void);
 
-// The standalone FFN transition runner (xdna-rec-post.h).
-struct xdna_rec_post;
-struct xdna_rec_post * xdna_rec_core_post_get(xdna_rec_core * core,
-                                              struct xdna_kernel_pool * pool);
-
-// The FFN transition tile's host-side windows, when it rides this stream.
-void * xdna_rec_core_post_in(const xdna_rec_core * core);
-const void * xdna_rec_core_post_out(const xdna_rec_core * core);
-void xdna_rec_core_post_sync(xdna_rec_core * core);
-bool xdna_rec_core_post_run(xdna_rec_core * core);
-
-
-// Where the host leaves the layer's residual and gamma for the post tile, and
-// where that tile leaves hattn and the FFN's activation. Null when the post
-// transition is not active.
 // The core's output buffer, and the offset a fused projection drains into.
 const void * xdna_rec_core_out(const xdna_rec_core * core);
 size_t xdna_rec_core_out_off(const xdna_rec_core * core);
 
 // Append the ssm_out projection to the core's stream and bind a run over both
 // buffer sets, so a layer's first two dispatches become one. `so` is the
-// projection's GEMV, `act_off` the byte offset in the core's output buffer
-// where the gated stage leaves the activation it reads. Returns false when the
-// two streams cannot share a column's descriptors, in which case the caller
-// keeps the two dispatches.
+// projection's GEMV and `ffn` its FFN pair, whose activation tiles the
+// projection drains into. Returns false when the two streams cannot share a
+// column's descriptors, in which case the caller keeps the two dispatches.
 bool xdna_rec_core_fuse_so(xdna_rec_core * core, struct xdna_kernel_pool * pool,
-                           struct xdna_gemv * so, uint32_t act_off,
-                           struct xdna_gemv_pair * ffn);
+                           struct xdna_gemv * so, struct xdna_gemv_pair * ffn);
 
 // True when the fused run is bound and xdna_rec_core_run will also project.
 bool xdna_rec_core_so_fused(const xdna_rec_core * core);
@@ -254,139 +209,3 @@ bool xdna_rec_core_run(xdna_rec_core * core, int t, const void * qkv,
                        const void * x, const float * z, int8_t * aq,
                        float * d_a);
 
-// --- attn_so_mmul (ssm_out) ------------------------------------------------
-
-// Sizes / layout mirrors attn_so_mmul.py resolve(): 8 columns x 2 groups of 64
-// out columns, K = 2048 in 32 slabs of 64 rows. Each feed object = padded int8
-// A slab (256 B) + one 64x64 int4 W tile (2048 B).
-namespace xdna_so_pack {
-constexpr int K      = 2048;   // gated row dim (ssm_out K)
-constexpr int N      = 1024;   // ssm_out col dim
-constexpr int NCOL   = 8;
-constexpr int GRP    = 64;
-constexpr int CPC    = N / NCOL;      // 128
-constexpr int NG     = CPC / GRP;     // 2 groups per column
-constexpr int SB     = K / 64;        // 32 slabs per group
-constexpr int A_SZ   = 256;
-constexpr int B_SZ   = 2048;
-constexpr int OBJ    = A_SZ + B_SZ;   // 2304 B per object
-constexpr int NT     = NG * SB;       // 64 objects per column
-constexpr int CB_Q5  = (K / 256) * 176;  // 1408 B per Q5_K ssm_out column
-constexpr int CB_Q4  = (K / 256) * 144;  // 1152 B per Q4_K ssm_out column
-constexpr int CB_Q6  = (K / 256) * 210;  // 1680 B per Q6_K ssm_out column
-
-inline int64_t feed_bytes() { return (int64_t) NCOL * NT * OBJ; }
-inline int64_t acc_bytes()  { return (int64_t) NCOL * NG * 256 * 4; }
-} // namespace xdna_so_pack
-
-// The ssm_out-mmul device state of one fused layer session.
-struct xdna_rec_so {
-    xdna_device * dev = nullptr;
-    xdna_kernel * kern = nullptr;   // attn_so_mmul xclbin + insts
-    xdna_buffer * feed = nullptr;   // per-token feed (int4 W resident + int8 A)
-    xdna_buffer * acc = nullptr;    // raw int32 group accumulators [4096]
-    std::vector<uint8_t> feed_tmpl; // feed with the int4 W grid (constant)
-    std::vector<float> dw;          // per-output-column W scale [N]
-    // Exact fp32 ssm_out weights [N][K], only for the verified layer
-    // (GGML_XDNA_VERIFY); empty otherwise.
-    std::vector<float> w_ref;
-    int il = 0;
-};
-
-// Load the attn_so_mmul xclbin/insts, allocate the BO set, dequant the
-// ssm_out [K x N] into the int4 grid + per-column scales and upload the
-// constant W-grid feed template. Returns nullptr on failure.
-// `so_type` is the ggml_type of the ssm_out weight (Q4_K, Q5_K or Q6_K); the
-// column stride and the dequant routine follow from it.
-xdna_rec_so * xdna_rec_so_create(xdna_device * dev, int il,
-                                 const char * xclbin, const char * insts,
-                                 const uint8_t * w_so, int so_type);
-
-void xdna_rec_so_free(xdna_rec_so * m);
-
-// Run one decode ssm_out: the int8 aq codes + d_a scale arrive from the fused
-// core (attn_gdn_gated); rewrite the A slab of every feed object from aq, run
-// the mmul and write h_attn[n] = hres[n] + acc*d_a*d_w[n].
-bool xdna_rec_so_run(xdna_rec_so * m, const int8_t * aq, float d_a,
-                     const float * hres, float * h_attn);
-
-// --- ffn_mmul_ab (whole FFN) ------------------------------------------------
-
-// Sizes / layout mirrors ffn_layer_mmul.py resolve(4, 4) + build_a_feed /
-// build_b_feed. Group = 64 output cols; each feed object is one (col, group,
-// k-slab) tile element.
-namespace xdna_rec_ffn_pack {
-constexpr int K     = 1024;    // hidden (gate/up row) dim = hff width
-constexpr int KDOWN = 3584;    // down row dim = mid length
-constexpr int N_MID = 3584;
-constexpr int N_OUT = 1024;
-// stage A element layout (bytes)
-constexpr int A_HDR  = 512;
-constexpr int A_AOF  = 512;
-constexpr int A_BGO  = 768;
-constexpr int A_BUO  = 2816;
-constexpr int A_OBJ  = 4864;
-// stage B element layout
-constexpr int B_TAG  = 2048;
-constexpr int B_OBJ  = 2056;
-constexpr int NA     = 4;      // stage-A columns
-constexpr int NB     = 4;      // stage-B columns
-constexpr int GRPA   = 64;
-constexpr int GRPB   = 64;
-constexpr int SA     = 16;     // stage-A slabs (K / 64)
-constexpr int SB     = 56;     // stage-B slabs (KDOWN / 64)
-constexpr int NGA    = N_MID / (NA * GRPA);   // 14 stage-A groups per column
-constexpr int NGB    = N_OUT / (NB * GRPB);   // 4 stage-B groups per column
-constexpr int NTA    = SA * NGA;              // 224 A objects per column
-constexpr int NTB    = SB * NGB;              // 224 B objects per column
-constexpr int CPCA   = N_MID / NA;            // 896
-constexpr int CPCB   = N_OUT / NB;            // 256
-
-// per-token stage-A feed, shared scratch mid/acc, stage-B feed, raw int32 out
-inline int64_t af_bytes()   { return (int64_t) NA * NTA * A_OBJ; }
-inline int64_t mid_bytes()  { return (int64_t) KDOWN * 4; }
-inline int64_t acc_bytes()  { return (int64_t) NA * 512 * 4; }
-inline int64_t bf_bytes()   { return (int64_t) NB * NTB * B_OBJ; }
-inline int64_t out_bytes()  { return (int64_t) NB * NGB * 256 * 4; }
-inline int64_t aux_bytes()  { return (int64_t) NB * 8 * 4; }
-} // namespace xdna_rec_ffn_pack
-
-// The mmul-FFN device state of one fused layer session.
-struct xdna_rec_ffn {
-    xdna_device * dev = nullptr;
-    xdna_kernel * kern = nullptr;   // ffn_mmul_ab xclbin + insts
-    xdna_buffer * af = nullptr;     // per-token stage-A feed (int8 A + header)
-    xdna_buffer * mid = nullptr;    // mid f32 / in-place int8 codes scratch
-    xdna_buffer * acc = nullptr;    // stage-A int32 acc drain
-    xdna_buffer * bf = nullptr;     // stage-B down int4 feed (constant)
-    xdna_buffer * out = nullptr;    // raw int32 down acc [1024]
-    xdna_buffer * aux = nullptr;    // per-stage-B-col d_aB
-
-    std::vector<uint8_t> af_tmpl;   // af with the gate/up int4 grids (const)
-    std::vector<float> dw_g;        // per-mid-column gate scale [N_MID]
-    std::vector<float> dw_u;        // per-mid-column up scale [N_MID]
-    std::vector<float> dw_d;        // per-output-column down scale [N_OUT]
-    // Exact fp32 weights of the verified layer (GGML_XDNA_VERIFY): gate/up
-    // [N_MID][K] and down [N_OUT][KDOWN]. Empty otherwise.
-    std::vector<float> wg_ref;
-    std::vector<float> wu_ref;
-    std::vector<float> wd_ref;
-    int il = 0;
-};
-
-// Load the ffn_mmul_ab xclbin/insts, allocate the BO set, dequant the Q4_K
-// gate/up [K x N_MID] and Q4_K or Q6_K down [KDOWN x N_OUT] weights (down_q6)
-// into the int4 grids + per-column scales and build the constant stage-A
-// gate/up template and the stage-B feed. Returns nullptr on failure.
-xdna_rec_ffn * xdna_rec_ffn_create(xdna_device * dev, int il,
-                                   const char * xclbin, const char * insts,
-                                   const uint8_t * w_gate, const uint8_t * w_up,
-                                   const uint8_t * w_down, bool down_q6);
-
-void xdna_rec_ffn_free(xdna_rec_ffn * m);
-
-// Run one decode (M=1) FFN token: quantize hff -> int8, fill the af header +
-// A codes, run the fused kernel and write h_out = h_attn + (d_aB*d_w rescaled
-// raw int32). All lengths are fixed by the geometry above.
-bool xdna_rec_ffn_run(xdna_rec_ffn * m, const float * hff,
-                      const float * h_attn, float * h_out);

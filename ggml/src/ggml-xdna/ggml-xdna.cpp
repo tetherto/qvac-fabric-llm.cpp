@@ -2,13 +2,13 @@
 #include "ggml-xdna.h"
 #include "ggml-backend-impl.h"
 #include "ggml-cpu.h"
+#include "xdna-util.h"
 
 #include "xdna-types.h"
 #include "xdna-runtime.h"
 #include "xdna-ops.h"
-#include "xdna_design_tag.h"
+#include "xdna-design-tag.h"
 #include "xdna-rec.h"
-#include "xdna-rec-post.h"
 #include "xdna-rec-gemv.h"
 #include "xdna-conv-prefill.h"
 
@@ -58,11 +58,7 @@ static bool ggml_xdna_is_view_op(enum ggml_op op) {
 // ---------------------------------------------------------------------------
 
 static bool xdna_glue_active(void) {
-    const char * v = getenv("GGML_XDNA_GLUE");
-    if (v == nullptr) {
-        return true;
-    }
-    return strcmp(v, "0") != 0 && strcmp(v, "off") != 0 && strcmp(v, "none") != 0;
+    return xdna_env_on("GGML_XDNA_GLUE");
 }
 
 // True when `op` is claimed by the backend and should be glued (CPU-run) when
@@ -259,84 +255,6 @@ static ggml_cgraph * xdna_glue_cgraph(void) {
     return cg;
 }
 
-// Wall-clock spent running host ops from inside the XDNA chunk, and how many
-// batches it took (GGML_XDNA_GLUE_PROF=1). The split execution costs more than
-// the ops themselves, so this says whether the cost is the work or the
-// batching.
-//
-// GGML_XDNA_GLUE_PROF=2 additionally runs every host node on its own and
-// tallies it by op (MUL_MAT also by shape), which is the inventory of what is
-// still not on the array and what each of those costs a token. It makes the
-// batching worse by construction, so read the per-op split from it and the
-// total from level 1.
-struct xdna_glue_prof {
-    bool     enabled = false;
-    bool     per_op  = false;
-    uint64_t batches = 0;
-    uint64_t nodes   = 0;
-    double   us      = 0.0;
-    std::map<std::string, std::pair<uint64_t, double>> ops;
-
-    ~xdna_glue_prof() {
-        if (!enabled || !batches) {
-            return;
-        }
-        fprintf(stderr, "xdna-glue-prof: batches=%llu nodes=%llu total=%.1fms "
-                        "(%.1fus/batch)\n",
-                (unsigned long long) batches, (unsigned long long) nodes,
-                us / 1000.0, us / (double) batches);
-        if (ops.empty()) {
-            return;
-        }
-        std::vector<std::pair<double, const std::string *>> by_cost;
-        for (const auto & kv : ops) {
-            by_cost.emplace_back(kv.second.second, &kv.first);
-        }
-        std::sort(by_cost.begin(), by_cost.end(),
-                  [](const auto & a, const auto & b) { return a.first > b.first; });
-        for (const auto & e : by_cost) {
-            const auto & v = ops.at(*e.second);
-            fprintf(stderr, "xdna-glue-prof:   %-34s n=%-7llu %8.1fms %7.1fus each\n",
-                    e.second->c_str(), (unsigned long long) v.first,
-                    v.second / 1000.0, v.second / (double) v.first);
-        }
-    }
-};
-
-static xdna_glue_prof & xdna_glue_prof_get(void) {
-    static xdna_glue_prof p = []() {
-        xdna_glue_prof q;
-        const char * v = getenv("GGML_XDNA_GLUE_PROF");
-        q.enabled = v != nullptr && atoi(v) >= 1;
-        q.per_op  = v != nullptr && atoi(v) >= 2;
-        return q;
-    }();
-    return p;
-}
-
-// The label a host node is tallied under: the op, and for the ops whose cost
-// is all in their shape the shape as well.
-static std::string xdna_glue_prof_label(const struct ggml_tensor * n) {
-    std::string s = ggml_op_name(n->op);
-    if (n->op == GGML_OP_MUL_MAT && n->src[0]) {
-        char buf[64];
-        snprintf(buf, sizeof(buf), " %s %lldx%lld", ggml_type_name(n->src[0]->type),
-                 (long long) n->src[0]->ne[0], (long long) n->src[0]->ne[1]);
-        s += buf;
-    } else if (n->op == GGML_OP_FLASH_ATTN_EXT && n->src[0] && n->src[1]) {
-        char buf[96];
-        snprintf(buf, sizeof(buf), " q[%lld,%lld,%lld] k[%lld,%lld,%lld] %s",
-                 (long long) n->src[0]->ne[0], (long long) n->src[0]->ne[1],
-                 (long long) n->src[0]->ne[2],
-                 (long long) n->src[1]->ne[0], (long long) n->src[1]->ne[1],
-                 (long long) n->src[1]->ne[2], ggml_type_name(n->src[1]->type));
-        s += buf;
-    } else if (n->op == GGML_OP_UNARY) {
-        s += std::string(" ") + ggml_unary_op_name(ggml_get_unary_op(n));
-    }
-    return s;
-}
-
 // Run `node` on the host from within the XDNA chunk. Flushes (waits) all
 // pending NPU submissions first, so the op sees the results of the NPU ops it
 // depends on. Returns false on failure or when the op is not glue-claimed.
@@ -361,17 +279,9 @@ static bool xdna_glue_host_run(xdna_ops * ops, const struct ggml_tensor * node) 
     cg->n_nodes = 1;
     cg->n_leafs = 0;
     cg->nodes[0] = const_cast<struct ggml_tensor *>(node);
-    xdna_glue_prof & prof = xdna_glue_prof_get();
-    const auto tn = std::chrono::steady_clock::now();
     if (ggml_backend_graph_compute(cpu, cg) != GGML_STATUS_SUCCESS) {
         GGML_LOG_ERROR("%s: glue: host compute failed for %s\n", "ggml-xdna", ggml_op_name(node->op));
         return false;
-    }
-    if (prof.per_op) {
-        auto & e = prof.ops[xdna_glue_prof_label(node)];
-        e.first++;
-        e.second += std::chrono::duration<double, std::micro>(
-                        std::chrono::steady_clock::now() - tn).count();
     }
     return true;
 }
@@ -383,9 +293,6 @@ static bool xdna_glue_flush(xdna_ops * ops, std::vector<struct ggml_tensor *> & 
     if (batch.empty()) {
         return true;
     }
-    xdna_glue_prof & prof = xdna_glue_prof_get();
-    const auto t0 = std::chrono::steady_clock::now();
-    const size_t n_in = batch.size();
     if (!xdna_ops_finalize(ops)) {
         batch.clear();
         return false;
@@ -400,33 +307,20 @@ static bool xdna_glue_flush(xdna_ops * ops, std::vector<struct ggml_tensor *> & 
     ggml_backend_cpu_set_n_threads(cpu, xdna_glue_threads(g_glue_n_tokens >= 32));
     size_t off = 0;
     while (off < batch.size()) {
-        const size_t n = prof.per_op ? 1 : std::min<size_t>(64, batch.size() - off);
+        const size_t n = std::min<size_t>(64, batch.size() - off);
         cg->n_nodes = (int) n;
         cg->n_leafs = 0;
         for (size_t j = 0; j < n; j++) {
             cg->nodes[j] = batch[off + j];
         }
-        const auto tn = std::chrono::steady_clock::now();
         if (ggml_backend_graph_compute(cpu, cg) != GGML_STATUS_SUCCESS) {
             GGML_LOG_ERROR("%s: glue: host compute failed for batch\n", "ggml-xdna");
             batch.clear();
             return false;
         }
-        if (prof.per_op) {
-            auto & e = prof.ops[xdna_glue_prof_label(batch[off])];
-            e.first++;
-            e.second += std::chrono::duration<double, std::micro>(
-                            std::chrono::steady_clock::now() - tn).count();
-        }
         off += n;
     }
     batch.clear();
-    if (prof.enabled) {
-        prof.us += std::chrono::duration<double, std::micro>(
-                       std::chrono::steady_clock::now() - t0).count();
-        prof.batches++;
-        prof.nodes += n_in;
-    }
     return true;
 }
 
@@ -434,12 +328,11 @@ static bool xdna_glue_flush(xdna_ops * ops, std::vector<struct ggml_tensor *> & 
 // Fused decode recurrent layer.
 //
 // A single-token decode replaces every recurrent (gated-delta-net) layer by
-// one xdna_rec_* persistent run (attn_gdn_gated + attn_so_mmul + ffn_mmul_ab
-// xclbins): the layer's projections (qkv/z/gate/beta) keep their graph nodes
-// but, in isolation mode, run on the host glue; their outputs feed the device
-// kernels; the recurrent conv and ssm state is seeded once from the llama
-// recurrent cache and then carried on the device. Prefill (M > 1) and MHA
-// layers are untouched.
+// one xdna_rec_* persistent run on fused_layer.xclbin: the layer's projections
+// (qkv/z/gate/beta) keep their graph nodes but, in isolation mode, run on the
+// host glue; their outputs feed the device kernels; the recurrent conv and ssm
+// state is seeded once from the llama recurrent cache and then carried on the
+// device. Prefill (M > 1) and MHA layers are untouched.
 // ---------------------------------------------------------------------------
 
 // Process-wide context shared by all backend instances.
@@ -465,16 +358,12 @@ struct ggml_backend_xdna_context {
 // the host scratch buffers it reuses every token.
 struct xdna_rec_session {
     int il = -1;
-    xdna_rec_core * core = nullptr;    // attn_gdn_gated (conv+norm+gdn+gated)
-    // Either the per-stage xclbins or, by default, both stages on the decode
-    // GEMV artifact (xdna-rec-gemv.h), which is one hardware context for all
-    // three of its dispatches instead of two more reconfigurations per layer.
-    xdna_rec_so * so = nullptr;        // attn_so_mmul (ssm_out)
-    xdna_rec_ffn * ffn = nullptr;      // ffn_mmul_ab (whole FFN)
-    xdna_rec_gemv * gv = nullptr;      // both of the above, on the GEMV route
+    xdna_rec_core * core = nullptr;    // fused_layer.xclbin (conv+norm+gdn+gated)
+    // The layer's projections, on the decode GEMV of the same design
+    // (xdna-rec-gemv.h), so the layer never changes hardware context.
+    xdna_rec_gemv * gv = nullptr;
     xdna_rec_layer_host host;
     bool seeded = false;
-    bool post_seeded = false;   // one-time gamma/flag upload
     std::vector<uint8_t> feed0;        // one-time feed host buffer (hist+qkv+conv W)
     std::vector<uint8_t> x;            // per-token host buffer (eg/beta/scale tails)
     std::vector<float> hattn, hout, hff;
@@ -518,39 +407,11 @@ struct xdna_rec_plan {
 };
 
 // Fused recurrent-layer path is the DEFAULT NPU decode mode. GGML_XDNA_FUSED_LAYER=0
-// restores the per-op decode path. Requires the fused xclbins to exist
+// restores the per-op decode path. Requires the fused xclbin to exist
 // (xdna_rec_active); otherwise the backend falls back to per-op.
-// GGML_XDNA_ACT_RAW=1: the FFN's activation is built on the array, by the
-// prologue tile the artifact must have been built with (ACT_RAW=1). The two
-// have to agree - raw tiles reaching cores that expect codes is silent
-// garbage, not an error.
-static bool xdna_act_raw(void) {
-    static const bool on = []() {
-        const char * e = getenv("GGML_XDNA_ACT_RAW");
-        return e == nullptr || atoi(e) != 0;
-    }();
-    return on;
-}
-
-static bool xdna_rec_enabled(void) {
-    const char * v = getenv("GGML_XDNA_FUSED_LAYER");
-    return v == nullptr || atoi(v) != 0;
-}
-
-// The projection stages of a fused layer run on the decode GEMV artifact.
-// GGML_XDNA_REC_GEMV=0 restores the per-stage xclbins, which is the comparison
-// the switch was made on and the fallback if a weight set does not fit.
-static bool xdna_rec_gemv_enabled(void) {
-    const char * v = getenv("GGML_XDNA_REC_GEMV");
-    return v == nullptr || atoi(v) != 0;
-}
-
-// The three xclbin artifacts the fused recurrent layer runs, resolved against
-// the runtime kernel search dirs: attn_gdn_gated (conv+norm+gdn+gated,
-// host-built TXN stream - xclbin only), attn_so_mmul (int4 ssm_out) and
-// ffn_mmul_ab (int4 FFN). Each stem pair must be found somewhere in the search
-// dirs.
-// The artifacts are looked up under their design-tagged names only
+//
+// The artifact (kernels/fused_layer.py) is resolved against the runtime kernel
+// search dirs and looked up under its design-tagged name only
 // (kernels/design_tag.py): an untagged artifact is from an older design, and
 // running this backend's stream against it reads as garbage output with no
 // error. With the tag, the two sides can only drift if one of them was
@@ -565,7 +426,7 @@ static bool xdna_rec_find_pair(const char * stem, std::string & x, std::string &
             (dir / (std::string(stem) + "_" + XDNA_DESIGN_TAG + ".insts.bin")).string();
         if (std::filesystem::exists(fx, ec)) {
             x = fx;
-            i = fi;   // may be empty (attn_gdn_txn binds the host-built TXN)
+            i = fi;
             return true;
         }
         const std::string fxo = (dir / (std::string(stem) + ".xclbin")).string();
@@ -581,42 +442,20 @@ static bool xdna_rec_find_pair(const char * stem, std::string & x, std::string &
 }
 
 struct xdna_rec_paths {
-    std::string g_x;     // attn_gdn_gated, or the merged layer (xclbin only)
-    std::string so_x, so_i;    // attn_so_mmul
-    std::string mm_x, mm_i;    // ffn_mmul_ab
-    bool fused = false;        // g_x is the merged artifact
+    std::string g_x;   // fused_layer.xclbin
 };
 
-// The merged layer artifact (kernels/fused_layer.py) holds the core and the
-// decode GEMV in one array configuration, so a layer's dispatches share one
-// hardware context instead of reconfiguring the array between them. Used when
-// it is present and GGML_XDNA_REC_ONE_XCLBIN is not turned off; the core's own
-// stream is unchanged, its 290 shim transfers being identical in both
-// artifacts.
-static bool xdna_rec_one_xclbin(void) {
-    const char * v = getenv("GGML_XDNA_REC_ONE_XCLBIN");
-    return v == nullptr || atoi(v) != 0;
-}
-
+// The fused layer artifact (kernels/fused_layer.py) holds the recurrent core
+// and the decode GEMV in one array configuration, so a layer's dispatches
+// share one hardware context instead of reconfiguring the array between them.
 static bool xdna_rec_find_paths(xdna_rec_paths & p) {
-    bool ok = true;
     std::string gx, gi;
-    ok &= xdna_rec_find_pair("attn_gdn_gated",  gx, gi);    // host TXN: xclbin only
-    ok &= xdna_rec_find_pair("attn_so_mmul",  p.so_x, p.so_i);
-    ok &= xdna_rec_find_pair("ffn_mmul_ab",   p.mm_x, p.mm_i);
-    p.g_x = gx;
-    if (xdna_rec_one_xclbin()) {
-        std::string fx, fi;
-        if (xdna_rec_find_pair("fused_layer", fx, fi) && !fx.empty()) {
-            p.g_x   = fx;
-            p.fused = true;
-        }
-    }
-    if (!ok || p.so_i.empty() || p.mm_i.empty()) {
-        GGML_LOG_WARN("%s: fused layer: recurrent xclbins "
-                      "(attn_gdn_gated/attn_so_mmul/ffn_mmul_ab) not found\n", "ggml-xdna");
+    if (!xdna_rec_find_pair("fused_layer", gx, gi) && gx.empty()) {
+        GGML_LOG_WARN("%s: fused layer: fused_layer.xclbin not found; "
+                      "leaving the decode on the per-op kernels\n", "ggml-xdna");
         return false;
     }
+    p.g_x = gx;
     return true;
 }
 
@@ -624,7 +463,10 @@ static bool xdna_rec_find_paths(xdna_rec_paths & p) {
 // present in the kernel search dirs. When they are missing the backend
 // silently runs the per-op decode path instead.
 static bool xdna_rec_active(void) {
-    if (!xdna_rec_enabled()) {
+    // GGML_XDNA_FUSED_LAYER=0 forces the per-op decode path. The fused design
+    // only covers the quantized weight sets its kernels were built for, so a
+    // model it does not cover needs the fallback.
+    if (xdna_env_int("GGML_XDNA_FUSED_LAYER", 1) == 0) {
         return false;
     }
     static xdna_rec_paths paths;
@@ -802,74 +644,6 @@ static bool xdna_rec_scan(ggml_backend_xdna_context * ctx,
 // (GGML_XDNA_REC_PROF=1). Accumulated over the whole process and printed once
 // at exit: decode cost is dominated by these, so the split says whether the
 // gap to the target is dispatch latency or kernel time.
-using xdna_rec_clock = std::chrono::steady_clock;
-
-struct xdna_rec_prof {
-    bool     enabled = false;
-    // GGML_XDNA_REC_PROF=2 additionally dispatches ssm_out and the FFN a second
-    // time with the same inputs and times that. Both are stateless projections,
-    // so the repeat is a pure re-run of work the device just did. It separates
-    // the two things a dispatch can be spending its time on: if the repeat is
-    // much cheaper, the cost is getting to the kernel - the array is
-    // reconfigured whenever consecutive dispatches come from different xclbins,
-    // and a layer alternates between three. If it is not, the kernel is
-    // genuinely that slow.
-    bool     repeat  = false;
-    uint64_t runs    = 0;
-    double   core_us = 0.0;   // attn_gdn_gated (conv+norm+gdn+gated)
-    double   so_us   = 0.0;   // attn_so_mmul (ssm_out)
-    double   ffn_us  = 0.0;   // ffn_mmul_ab (gate/up/silu/down)
-    double   so_rep_us  = 0.0;
-    double   ffn_rep_us = 0.0;
-    // Everything in the fused run that is not one of the three dispatches:
-    // packing the core's x buffer, the post norm, and writing the outputs back
-    // into the graph's tensors.
-    double   pre_us  = 0.0;
-    double   post_us = 0.0;
-    double   pre_a_us = 0.0, pre_b_us = 0.0, pre_c_us = 0.0;
-
-    ~xdna_rec_prof() {
-        if (!enabled || runs == 0) {
-            return;
-        }
-        const double n = (double) runs;
-        fprintf(stderr,
-                "xdna-rec-prof: layer-runs=%llu core=%.0fus so=%.0fus ffn=%.0fus "
-                "pre=%.0fus post=%.0fus total=%.0fus (per layer-run)\n",
-                (unsigned long long) runs, core_us / n, so_us / n, ffn_us / n,
-                (pre_us + pre_a_us + pre_b_us + pre_c_us) / n, post_us / n,
-                (core_us + so_us + ffn_us + pre_us + pre_a_us + pre_b_us +
-                 pre_c_us + post_us) / n);
-        fprintf(stderr, "xdna-rec-prof: pre split: inputs=%.0fus seed=%.0fus "
-                "pack-x=%.0fus\n", pre_a_us / n, pre_b_us / n, pre_c_us / n);
-        if (repeat) {
-            fprintf(stderr,
-                    "xdna-rec-prof: immediate repeat of the same xclbin: "
-                    "so=%.0fus (vs %.0f) ffn=%.0fus (vs %.0f)\n",
-                    so_rep_us / n, so_us / n, ffn_rep_us / n, ffn_us / n);
-        }
-    }
-};
-
-static xdna_rec_prof & xdna_rec_prof_get(void) {
-    static xdna_rec_prof p = []() {
-        xdna_rec_prof q;
-        const char * v = getenv("GGML_XDNA_REC_PROF");
-        q.enabled = v != nullptr && atoi(v) >= 1;
-        q.repeat  = v != nullptr && atoi(v) >= 2;
-        return q;
-    }();
-    return p;
-}
-
-// Microseconds since `t0`, then restart `t0`.
-static double xdna_rec_prof_lap(xdna_rec_clock::time_point & t0) {
-    const auto now = xdna_rec_clock::now();
-    const double us = std::chrono::duration<double, std::micro>(now - t0).count();
-    t0 = now;
-    return us;
-}
-
 // The recurrent-memory row the layer's state read points at: the sequence's
 // cell slot, which is what tells two sequences sharing one context apart.
 static int64_t xdna_rec_seq_row(const xdna_rec_plan & p) {
@@ -908,14 +682,6 @@ static bool xdna_rec_run(ggml_backend_xdna_context * ctx, xdna_rec_plan & p,
                          std::unordered_set<const ggml_tensor *> & consumed,
                          const ggml_cgraph * cgraph) {
     using namespace xdna_rec_pack;
-    if (getenv("GGML_XDNA_POST_TRACE")) {
-        fprintf(stderr, "xdna-rec-run: layer %d enter\n", p.il);
-    }
-    xdna_rec_prof & prof0 = xdna_rec_prof_get();
-    xdna_rec_clock::time_point t_pre;
-    if (prof0.enabled) {
-        t_pre = xdna_rec_clock::now();
-    }
     xdna_rec_session * s = xdna_rec_session_get(ctx, p.il, xdna_rec_seq_row(p));
     if (!s) {
         return false;
@@ -935,9 +701,6 @@ static bool xdna_rec_run(ggml_backend_xdna_context * ctx, xdna_rec_plan & p,
         GGML_LOG_ERROR("%s: fused layer %d: bad input tensors\n", "ggml-xdna", p.il);
         return false;
     }
-    if (prof0.enabled) {
-        prof0.pre_a_us += xdna_rec_prof_lap(t_pre);
-    }
 
     if (!s->seeded) {
         const float * ch = !s->cap_conv.empty() ? s->cap_conv.data()
@@ -953,11 +716,11 @@ static bool xdna_rec_run(ggml_backend_xdna_context * ctx, xdna_rec_plan & p,
         s->host.w_ssm_norm  = (const float *) p.w_gamma->data;
         s->host.w_post_norm = (const float *) p.w_post->data;
 
-        // The whole recurrent layer runs on the three fused kernels only when
-        // the quantized weight set matches their native layouts (Q4_K/Q5_K/Q6_K
-        // ssm_out, Q4_K gate/up, Q4_K/Q6_K down). A mismatch is a hard error here: the
-        // fused path is the only NPU route for the recurrent layers, there is
-        // no scalar fused fallback.
+        // The whole recurrent layer runs on the fused design only when the
+        // quantized weight set matches its native layouts (Q4_K/Q5_K/Q6_K
+        // ssm_out, Q4_K gate/up, Q4_K/Q6_K down). A mismatch is a hard error
+        // here: the fused path is the only NPU route for the recurrent layers,
+        // there is no scalar fused fallback.
         if ((p.w_so->type != GGML_TYPE_Q4_K && p.w_so->type != GGML_TYPE_Q5_K &&
              p.w_so->type != GGML_TYPE_Q6_K) ||
             p.w_gate->type != GGML_TYPE_Q4_K ||
@@ -988,56 +751,29 @@ static bool xdna_rec_run(ggml_backend_xdna_context * ctx, xdna_rec_plan & p,
 
         s->core = xdna_rec_core_create(ctx->device, g, paths.g_x.c_str());
         if (!s->core) {
-            GGML_LOG_ERROR("%s: fused layer %d: attn_gdn_gated load failed\n", "ggml-xdna", p.il);
+            GGML_LOG_ERROR("%s: fused layer %d: fused_layer load failed\n", "ggml-xdna", p.il);
             return false;
         }
-        if (xdna_rec_gemv_enabled()) {
-            s->gv = xdna_rec_gemv_create(ctx->pool, p.w_so, p.w_gate, p.w_up,
-                                         p.w_down, paths.fused);
-            if (!s->gv) {
-                GGML_LOG_ERROR("%s: fused layer %d: the GEMV route does not "
-                               "cover this weight set; set GGML_XDNA_REC_GEMV=0 "
-                               "for the per-stage kernels\n", "ggml-xdna", p.il);
-                return false;
-            }
-        } else {
-            s->so = xdna_rec_so_create(ctx->device, p.il, paths.so_x.c_str(),
-                                       paths.so_i.c_str(), (const uint8_t *) p.w_so->data,
-                                       (int) p.w_so->type);
-            if (!s->so) {
-                return false;
-            }
-            s->ffn = xdna_rec_ffn_create(ctx->device, p.il, paths.mm_x.c_str(),
-                                         paths.mm_i.c_str(),
-                                         (const uint8_t *) p.w_gate->data,
-                                         (const uint8_t *) p.w_up->data,
-                                         (const uint8_t *) p.w_down->data,
-                                         p.w_down->type == GGML_TYPE_Q6_K);
-            if (!s->ffn) {
-                return false;
-            }
+        s->gv = xdna_rec_gemv_create(ctx->pool, p.w_so, p.w_gate, p.w_up,
+                                     p.w_down, true);
+        if (!s->gv) {
+            GGML_LOG_ERROR("%s: fused layer %d: the GEMV route does not cover "
+                           "this weight set\n", "ggml-xdna", p.il);
+            return false;
         }
-        if (!xdna_rec_core_begin(s->core, s->feed0.data(),
-                                 s->host.w_ssm_norm)) {
+        if (!xdna_rec_core_begin(s->core, s->feed0.data(), s->host.w_ssm_norm)) {
             return false;
         }
         // One dispatch for the core and the projection that reads what its
         // gated stage writes. Both are already the same array configuration
         // and the same hardware context; this makes them one stream, so the
         // array pays its fixed per-phase cost once instead of twice.
-        if (s->gv) {
-            xdna_rec_core_fuse_so(s->core, ctx->pool, xdna_rec_gemv_so(s->gv),
-                                  (uint32_t) xdna_rec_core_act_off(),
-                                  s->gv->ffn);
-        }
+        xdna_rec_core_fuse_so(s->core, ctx->pool, xdna_rec_gemv_so(s->gv),
+                              s->gv->ffn);
         if (!xdna_rec_core_seed(s->core, st)) {
             return false;
         }
         s->seeded = true;
-        if (getenv("GGML_XDNA_REC_LOG") != nullptr) {
-            GGML_LOG_INFO("%s: fused layer %d: attn_gdn_gated/ssm_out/ffn seeded\n",
-                          "ggml-xdna", p.il);
-        }
         s->x.resize((size_t) g.x_bytes);
         s->hattn.resize((size_t) g.d_out);
         s->hout.resize((size_t) g.d_out);
@@ -1045,9 +781,6 @@ static bool xdna_rec_run(ggml_backend_xdna_context * ctx, xdna_rec_plan & p,
         s->aq.resize(KGATE);
     }
 
-    if (prof0.enabled) {
-        prof0.pre_b_us += xdna_rec_prof_lap(t_pre);
-    }
     const float * hres = !s->cap_hres.empty() ? s->cap_hres.data()
                                               : xdna_rec_tdata(p.n_hres, D_OUT);
     if (!hres) {
@@ -1056,50 +789,14 @@ static bool xdna_rec_run(ggml_backend_xdna_context * ctx, xdna_rec_plan & p,
     }
 
     xdna_rec_pack_x(gate, beta, s->x);
-    if (prof0.enabled) {
-        prof0.pre_c_us += xdna_rec_prof_lap(t_pre);
-    }
     const int t = s->core->token;
 
-    xdna_rec_prof & prof = xdna_rec_prof_get();
-    const bool prof_en = prof.enabled;
-    xdna_rec_clock::time_point t0;
-    if (prof_en) {
-        prof.pre_us += xdna_rec_prof_lap(t_pre);
-        t0 = t_pre;
-    }
-
-    // conv+norm+gdn+gated: run the fused A-half core on attn_gdn_gated and read
-    // the int8 aq codes + d_a back; the ssm_out runner then projects them and
-    // adds the residual (h_attn).
-    static const bool post_fused = []() {
-        const char * e = getenv("GGML_XDNA_POST_FUSED");
-        return e != nullptr && atoi(e) != 0;
-    }();
-    if (post_fused && getenv("GGML_XDNA_POST_FIRST") &&
-        !xdna_rec_core_post_run(s->core)) {
-        return false;
-    }
     // With the projection draining into the FFN's tiles, the host's half of
     // that activation - the residual and gamma - is written before the core
     // runs, not between the two dispatches. Both are known by now, and this is
     // what leaves nothing between them.
-    const bool to_act_pre = xdna_act_raw() && s->gv && s->gv->ffn &&
-                            xdna_rec_one_xclbin() &&
-                            xdna_rec_core_so_to_act(s->core);
-    // GGML_XDNA_SO_TO_ACT_PRE=0 puts this back after the core dispatch, which
-    // is where it was while the handover was being brought up.
-    // Off: preparing the host's half before the core dispatch drifts the
-    // result from the second token on, though the first token's tiles are
-    // identical either way. Not understood yet, so it stays where it works.
-    static const bool pre = []() {
-        const char * e = getenv("GGML_XDNA_SO_TO_ACT_PRE");
-        return e != nullptr && atoi(e) >= 1;
-    }();
-    // Fused, the FFN is part of the dispatch below, so its activation's host
-    // half has to be there first - which is the ordinary order, not the one
-    // that drifted: there is no dispatch of ours in between any more.
-    if (to_act_pre && (pre || xdna_rec_core_ffn_fused(s->core)) &&
+    const bool to_act_pre = s->gv->ffn && xdna_rec_core_so_to_act(s->core);
+    if (to_act_pre && xdna_rec_core_ffn_fused(s->core) &&
         !xdna_gemv_pair_prep_raw(s->gv->ffn, hres, s->host.w_post_norm)) {
         return false;
     }
@@ -1107,188 +804,29 @@ static bool xdna_rec_run(ggml_backend_xdna_context * ctx, xdna_rec_plan & p,
                            s->x.data(), z, s->aq.data(), &s->d_a)) {
         return false;
     }
-    // GGML_XDNA_SO_TO_ACT_PRE=2: the activation was prepared before the core
-    // ran, and this is the only thing left between the two dispatches - a
-    // sync, no packing. If it is needed, the array's drain is not visible to
-    // the next dispatch without one.
-    // =2 reads the projection's result out of the tiles here, before the FFN
-    // dispatch, instead of after it. If that is what the drift turns on, the
-    // FFN dispatch does not leave the tiles alone.
-    bool acc_early = false;
-    const int pre_mode = getenv("GGML_XDNA_SO_TO_ACT_PRE")
-        ? atoi(getenv("GGML_XDNA_SO_TO_ACT_PRE")) : 0;
-    if (pre && to_act_pre && pre_mode == 2) {
-        if (!xdna_rec_gemv_acc_from_tiles(s->gv, s->gv->acc.data())) {
-            return false;
-        }
-        acc_early = true;
-    }
-    // =3: the activation was prepared before the core ran, and this is a bare
-    // flush of the buffer the core just drained into. A flush of what the
-    // device wrote is what made the handover work at all, so the question is
-    // whether the next dispatch needs one even when the host wrote nothing.
-    if (pre && to_act_pre && pre_mode == 3) {
-        xdna_gemv_pair_act_sync_from(s->gv->ffn);
-        xdna_gemv_pair_act_sync_to(s->gv->ffn);
-    }
-    if (prof_en) {
-        prof.core_us += xdna_rec_prof_lap(t0);
-    }
-    const bool so_in_core = s->gv && xdna_rec_core_so_fused(s->core);
+    const bool so_in_core = xdna_rec_core_so_fused(s->core);
     // When the projection drained into the FFN's activation tiles there is
     // nothing to collect: its result is already where the next dispatch reads
     // it, and the host only needs it again for the layer's last residual add,
     // which happens after both dispatches rather than between them.
     const bool so_to_act = so_in_core && xdna_rec_core_so_to_act(s->core);
     if (so_to_act) {
-        // Nothing: the projection's result is already in the tiles the next
-        // dispatch reads, and h_attn is only wanted after both of them.
+        // Nothing: as above.
     } else if (so_in_core ? !xdna_rec_gemv_so_collect(s->gv, xdna_rec_core_out(s->core),
-                                               xdna_rec_core_out_off(s->core),
-                                               xdna_rec_core_act(s->core),
-                                               hres, s->hattn.data())
-        : s->gv ? !xdna_rec_gemv_so_run(s->gv, xdna_rec_core_act(s->core),
-                                        s->aq.data(), s->d_a, hres,
-                                        s->hattn.data())
-              : !xdna_rec_so_run(s->so, s->aq.data(), s->d_a, hres,
-                                 s->hattn.data())) {
+                                                      xdna_rec_core_out_off(s->core),
+                                                      xdna_rec_core_act(s->core),
+                                                      hres, s->hattn.data())
+                          : !xdna_rec_gemv_so_run(s->gv, xdna_rec_core_act(s->core),
+                                                  s->aq.data(), s->d_a, hres,
+                                                  s->hattn.data())) {
         return false;
     }
-    if (prof_en) {
-        prof.so_us += xdna_rec_prof_lap(t0);
-        if (prof.repeat) {
-            xdna_rec_clock::time_point t1 = xdna_rec_clock::now();
-            if (s->gv ? !xdna_rec_gemv_so_run(s->gv, xdna_rec_core_act(s->core),
-                                              s->aq.data(), s->d_a, hres,
-                                              s->hattn.data())
-                      : !xdna_rec_so_run(s->so, s->aq.data(), s->d_a, hres,
-                                         s->hattn.data())) {
-                return false;
-            }
-            prof.so_rep_us += xdna_rec_prof_lap(t1);
-        }
-    }
-    // GGML_XDNA_POST=1: the FFN transition runs on its own xclbin between
-    // the fused dispatch and the pair. The host assembles the input from the
-    // raw projection output, the residual and the gamma; the pair consumes
-    // the tiles the design wrote. Everything the layer needs is then on the
-    // array - three dispatches for now. Off by default: the dispatch hangs in
-    // the real process even though the design's own sequence completes in
-    // isolation.
-    static const bool post_sep = []() {
-        const char * e = getenv("GGML_XDNA_POST");
-        return e != nullptr && atoi(e) != 0;
-    }();
-    if (getenv("GGML_XDNA_POST_TRACE")) {
-        fprintf(stderr, "xdna-post: layer %d sep=%d gv=%p ffn=%p so=%p core=%p\n",
-                p.il, (int) post_sep, (void *) s->gv,
-                s->gv ? (void *) s->gv->ffn : nullptr,
-                s->gv ? (void *) s->gv->so : nullptr, (void *) s->core);
-    }
-    // GGML_XDNA_POST_FUSED: the transition runs as its own dispatch on the
-    // SAME xclbin (xdna_rec_core_post_run) - one design, one context. The
-    // host assembles [so_out|residual|gamma|flags] at the front of the out
-    // buffer; the post stream fills and drains that window, and the pair
-    // consumes the tiles it wrote. (GGML_XDNA_POST_FIRST moves the dispatch
-    // before the core run - the bisection switch.)
-    if (post_fused && s->gv && s->gv->ffn && s->gv->so) {
-        if (getenv("GGML_XDNA_POST_TRACE")) {
-            fprintf(stderr, "xdna-post: layer %d fused dispatch\n", p.il);
-        }
-        uint8_t * om = (uint8_t *) s->core->gstate->bo.map() + 65536;
-        float * pin = (float *) om;
-        std::memcpy(pin, s->gv->acc.data(), D_OUT * sizeof(float));
-        std::memcpy(pin + D_OUT, hres, D_OUT * sizeof(float));
-        if (!s->post_seeded) {
-            std::memcpy(pin + 2 * D_OUT, s->host.w_post_norm,
-                        D_OUT * sizeof(float));
-            ((int32_t *) pin)[3 * D_OUT] =
-                xdna_gemv_pair_last_flags(s->gv->ffn);
-            s->post_seeded = true;
-        }
-        if (!getenv("GGML_XDNA_POST_FIRST") &&
-            !xdna_rec_core_post_run(s->core)) {
-            return false;
-        }
-        if (getenv("GGML_XDNA_POST_TRACE")) {
-            fprintf(stderr, "xdna-post: layer %d fused done\n", p.il);
-        }
-        const uint8_t * pout = om;
-        std::memcpy(s->hattn.data(), pout, D_OUT * sizeof(float));
-        if (getenv("GGML_XDNA_POST_TRACE")) {
-            fprintf(stderr, "xdna-post: layer %d fused pair\n", p.il);
-        }
-        if (!xdna_gemv_pair_run_packed(s->gv->ffn, pout + D_OUT * 4,
-                                       s->gv->acc.data())) {
-            return false;
-        }
-        for (int i = 0; i < D_OUT; i++) {
-            s->hout[i] = s->hattn[i] + s->gv->acc[i];
-        }
-    } else if (post_sep && s->gv && s->gv->ffn && s->gv->so) {
-        xdna_rec_post * post = xdna_rec_core_post_get(s->core, ctx->pool);
-        if (!post || !post->ok) {
-            return false;
-        }
-        if (getenv("GGML_XDNA_POST_TRACE")) {
-            fprintf(stderr, "xdna-post: layer %d dispatch\n", p.il);
-        }
-        float * pin = (float *) post->in->bo.map();
-        std::memcpy(pin, s->gv->acc.data(), D_OUT * sizeof(float));
-        std::memcpy(pin + D_OUT, hres, D_OUT * sizeof(float));
-        if (!s->post_seeded) {
-            std::memcpy(pin + 2 * D_OUT, s->host.w_post_norm,
-                        D_OUT * sizeof(float));
-            ((int32_t *) pin)[3 * D_OUT] = xdna_gemv_pair_last_flags(s->gv->ffn);
-            s->post_seeded = true;
-        }
-        xdna_buffer_sync_to_device_range(post->in, (3 * D_OUT + 4) * 4, 0);
-        if (!xdna_rec_post_run(post)) {
-            return false;
-        }
-        if (getenv("GGML_XDNA_POST_TRACE")) {
-            fprintf(stderr, "xdna-post: layer %d done\n", p.il);
-        }
-        const uint8_t * pout = (const uint8_t *) post->out->bo.map();
-        std::memcpy(s->hattn.data(), pout, D_OUT * sizeof(float));
-        if (getenv("GGML_XDNA_POST_TRACE")) {
-            // Compare against the CPU norm of the same input - which of the
-            // two diverges names where the garbage enters.
-            std::vector<float> tmp(D_OUT);
-            for (int i = 0; i < D_OUT; i++) {
-                tmp[i] = s->gv->acc[i] + hres[i];
-            }
-            std::vector<float> hcpu(D_OUT);
-            xdna_rec_rms_norm(tmp.data(), s->host.w_post_norm, D_OUT,
-                              1e-6f, hcpu.data());
-            fprintf(stderr,
-                    "xdna-post: layer %d hattn_dev[0:4]=%g %g %g %g "
-                    "hcpu[0:4]=%g %g %g %g\n",
-                    p.il, s->hattn[0], s->hattn[1], s->hattn[2], s->hattn[3],
-                    hcpu[0], hcpu[1], hcpu[2], hcpu[3]);
-            fprintf(stderr, "xdna-post: layer %d pair\n", p.il);
-        }
-        if (!xdna_gemv_pair_run_packed(s->gv->ffn, pout + D_OUT * 4,
-                                       s->gv->acc.data())) {
-            return false;
-        }
-        if (getenv("GGML_XDNA_POST_TRACE")) {
-            fprintf(stderr, "xdna-post: layer %d pair done\n", p.il);
-        }
-        for (int i = 0; i < D_OUT; i++) {
-            s->hout[i] = s->hattn[i] + s->gv->acc[i];
-        }
-    } else if (xdna_act_raw() && s->gv && s->gv->ffn &&
-               xdna_rec_one_xclbin()) {
+    if (s->gv->ffn) {
         // The transition is the array's: the activation tiles carry the
         // projection's output, the residual and gamma as numbers and the
         // design's prologue tile turns them into codes. Nothing of the layer
         // is left on the host between its two dispatches. A null acc says the
         // projection already drained its own into the tiles.
-        // GGML_XDNA_SO_TO_ACT=2 keeps the drain but has the host write acc
-        // back over it, with the values it just read out of the same tiles.
-        // If that is correct and =1 is not, what the array wrote is not what
-        // the next dispatch reads, even though the host can read it.
         if (so_to_act) {
             std::vector<float> ffn_out(D_OUT);
             // Fused: the FFN already ran, in the core's own dispatch, and left
@@ -1299,16 +837,15 @@ static bool xdna_rec_run(ggml_backend_xdna_context * ctx, xdna_rec_plan & p,
                     return false;
                 }
             } else {
-                if (!pre && !xdna_gemv_pair_prep_raw(s->gv->ffn, hres,
-                                                     s->host.w_post_norm)) {
+                if (!xdna_gemv_pair_prep_raw(s->gv->ffn, hres,
+                                             s->host.w_post_norm)) {
                     return false;
                 }
                 if (!xdna_gemv_pair_dispatch(s->gv->ffn, ffn_out.data())) {
                     return false;
                 }
             }
-            if (!acc_early &&
-                !xdna_rec_gemv_acc_from_tiles(s->gv, s->gv->acc.data())) {
+            if (!xdna_rec_gemv_acc_from_tiles(s->gv, s->gv->acc.data())) {
                 return false;
             }
             for (int i = 0; i < D_OUT; i++) {
@@ -1322,36 +859,16 @@ static bool xdna_rec_run(ggml_backend_xdna_context * ctx, xdna_rec_plan & p,
         }
     } else {
         xdna_rec_rms_norm(s->hattn.data(), s->host.w_post_norm, D_OUT, 1e-6f, s->hff.data());
-        if (s->gv ? !xdna_rec_gemv_ffn_run(s->gv, s->hff.data(), s->hattn.data(),
-                                           s->hout.data())
-                  : !xdna_rec_ffn_run(s->ffn, s->hff.data(), s->hattn.data(),
-                                      s->hout.data())) {
+        if (!xdna_rec_gemv_ffn_run(s->gv, s->hff.data(), s->hattn.data(),
+                                   s->hout.data())) {
             return false;
         }
-    }
-
-    if (prof_en) {
-        prof.ffn_us += xdna_rec_prof_lap(t0);
-        if (prof.repeat) {
-            xdna_rec_clock::time_point t1 = xdna_rec_clock::now();
-            if (s->gv ? !xdna_rec_gemv_ffn_run(s->gv, s->hff.data(), s->hattn.data(),
-                                               s->hout.data())
-                      : !xdna_rec_ffn_run(s->ffn, s->hff.data(), s->hattn.data(),
-                                          s->hout.data())) {
-                return false;
-            }
-            prof.ffn_rep_us += xdna_rec_prof_lap(t1);
-        }
-        prof.runs++;
     }
 
     // Write the fused outputs into the layer add tensors every downstream op
     // reads (l_out feeds the next layer/MHA, attn_residual its own FFN path).
     std::memcpy(p.n_resid->data, s->hattn.data(), D_OUT * sizeof(float));
     std::memcpy(p.n_lout->data,  s->hout.data(),  D_OUT * sizeof(float));
-    if (getenv("GGML_XDNA_REC_LOG") != nullptr) {
-        GGML_LOG_INFO("%s: fused layer %d token %d\n", "ggml-xdna", p.il, t);
-    }
 
     // Mark the whole conv/gdn/ffn subgraph consumed (fire .. l_out).
     for (int j = p.i_fire; j <= p.i_lout && j < cgraph->n_nodes; j++) {
@@ -1359,9 +876,6 @@ static bool xdna_rec_run(ggml_backend_xdna_context * ctx, xdna_rec_plan & p,
         if (!ggml_xdna_is_view_op(n->op) && n->op != GGML_OP_NONE) {
             consumed.insert(n);
         }
-    }
-    if (prof_en) {
-        prof.post_us += xdna_rec_prof_lap(t0);
     }
     return true;
 }
@@ -1373,17 +887,15 @@ static bool xdna_rec_run(ggml_backend_xdna_context * ctx, xdna_rec_plan & p,
 // Eagerly register the xclbins this backend will actually run, so their
 // hw_contexts exist at process start while the NPU is idle. Lazy registration
 // in the middle of active NPU work fails DRM_IOCTL_AMDXDNA_CREATE_HWCTX with
-// EINVAL, and the device caps concurrent contexts at 16. The warm is
-// mode-aware: with the fused decode path active (default) only its three
-// kernels (attn_gdn_gated / attn_so_mmul / ffn_mmul_ab) are registered;
-// otherwise the per-op GEMM / prefill kernel set of xdna_ops is registered.
-// The handles are kept alive for the process lifetime (the runtime shares one
-// hw_context per xclbin uuid).
+// EINVAL, and the device caps concurrent contexts at 16.
+//
+// The list is exactly what the dispatch paths of the active mode can submit.
+// Warming an artifact no dispatch reaches costs a hardware context that the
+// 16-context budget then cannot spend on one that is used.
 static void xdna_kernels_warm(xdna_kernel_pool * pool, const xdna_ops * ops) {
     if (!pool || !pool->device) {
         return;
     }
-    static std::vector<xdna_kernel *> kept;
     const auto warm_stem = [&](const std::string & stem) {
         if (stem.empty()) {
             return;
@@ -1392,32 +904,40 @@ static void xdna_kernels_warm(xdna_kernel_pool * pool, const xdna_ops * ops) {
             std::error_code ec;
             const std::string x = (dir / (stem + ".xclbin")).string();
             if (std::filesystem::exists(x, ec)) {
-                xdna_kernel * k = xdna_kernel_load_hw(pool->device, x.c_str());
-                if (k) {
-                    kept.push_back(k);
-                }
-                break;
+                xdna_kernel_load_hw(pool->device, x.c_str());
+                return;
             }
         }
     };
+    const auto warm_names = [&](const std::string & prefix) {
+        for (const std::string & name : pool->names) {
+            if (name.compare(0, prefix.size(), prefix) == 0) {
+                warm_stem(name);
+            }
+        }
+    };
+
+    // The decode GEMV artifact is per array split, and exactly one split is in
+    // use: whichever the active mode's projections are built with.
+    const xdna_gemv_split split = xdna_rec_active() ? XDNA_GEMV_SPLIT_FUSED
+                                                    : XDNA_GEMV_SPLIT_DEFAULT;
+    warm_stem(xdna_gemv_stem(split));
+
     if (xdna_rec_active()) {
-        // Fused decode path: register the three fused kernels (the insts for
-        // attn_gdn_gated are host-built; the so/ffn insts are read from their
-        // .insts.bin at session create time).
-        warm_stem("attn_gdn_gated_" XDNA_DESIGN_TAG);
-        warm_stem("attn_so_mmul_" XDNA_DESIGN_TAG);
-        warm_stem("ffn_mmul_ab_" XDNA_DESIGN_TAG);
-        warm_stem("post_norm_" XDNA_DESIGN_TAG);
+        // Fused decode: the core design and the prefill kernels a prompt chunk
+        // still dispatches.
+        xdna_rec_paths paths;
+        if (xdna_rec_find_paths(paths)) {
+            warm_stem(std::filesystem::path(paths.g_x).stem().string());
+        }
+        warm_names("conv_prefill");
+        warm_names("fa_prefill");
         return;
     }
-    // Per-op path: the GEMM variants xdna-ops resolves.
+    // Per-op decode: the GEMM variants xdna-ops resolves.
     warm_stem(ops->gemm_xclbin_decode);
-    for (const auto & kv : ops->pref_xclbin) {
-        warm_stem(kv.second);
-    }
-    for (const auto & kv : ops->i8_xclbin) {
-        warm_stem(kv.second);
-    }
+    warm_names("gemm_int8_int32");
+    warm_names("gemm_bf16_f32");
 }
 
 static ggml_backend_xdna_context * ggml_xdna_device_context(void) {
@@ -1457,100 +977,12 @@ static void ggml_backend_xdna_free(ggml_backend_t backend) {
 }
 
 // GGML_XDNA_OPS_PROF=1: where each op of a decode graph actually ran,
-// accumulated over the process and printed once at exit. Four destinations:
-// the fused recurrent layer, a decode GEMV dispatch, a per-op NPU kernel, or
-// the host. A fifth table lists what the backend refused outright, which the
-// scheduler then gives to the CPU backend.
-struct xdna_ops_prof_t {
-    enum where { W_FUSED, W_GEMV, W_NPU, W_HOST, W_REFUSED, W_N };
-    static const char * name(int w) {
-        static const char * n[W_N] = { "fused layer", "gemv dispatch",
-                                       "npu op", "host", "refused" };
-        return n[w];
-    }
-    std::map<std::pair<std::string, int>, std::pair<uint64_t, uint64_t>> tally;
-    uint64_t graphs = 0;
-    // Wall clock of a decode graph and of the three things it spends it on.
-    // The layer profilers say what a layer costs; this says what the rest of
-    // the token costs, which is the only way to tell whether the gap to the
-    // target is in the layers at all.
-    double total_us = 0, rec_us = 0, glue_us = 0, npu_us = 0;
-
-    void add(const char * op, int w, int64_t elems) {
-        auto & e = tally[{ op, w }];
-        e.first++;
-        e.second += (uint64_t) elems;
-    }
-
-    ~xdna_ops_prof_t() {
-        if (tally.empty()) {
-            return;
-        }
-        fprintf(stderr, "xdna-ops-prof: %llu decode graphs\n",
-                (unsigned long long) graphs);
-        if (graphs) {
-            const double n = (double) graphs;
-            fprintf(stderr, "xdna-ops-prof: per graph: total=%.0fus fused-layers=%.0fus "
-                    "npu-ops=%.0fus host-glue=%.0fus other=%.0fus\n",
-                    total_us / n, rec_us / n, npu_us / n, glue_us / n,
-                    (total_us - rec_us - npu_us - glue_us) / n);
-        }
-        fprintf(stderr, "xdna-ops-prof: %-18s %-14s %10s %14s\n",
-                "op", "ran on", "calls", "elements");
-        for (const auto & kv : tally) {
-            fprintf(stderr, "xdna-ops-prof: %-18s %-14s %10llu %14llu\n",
-                    kv.first.first.c_str(), name(kv.first.second),
-                    (unsigned long long) kv.second.first,
-                    (unsigned long long) kv.second.second);
-        }
-    }
-};
-
-static xdna_ops_prof_t & xdna_ops_prof_get(void) {
-    static xdna_ops_prof_t p;
-    return p;
-}
-
-static bool xdna_ops_prof_on(void) {
-    static const bool on = getenv("GGML_XDNA_OPS_PROF") != nullptr;
-    return on;
-}
-
-// Microseconds since `t0`, then restart `t0`.
-static double xdna_ops_prof_lap(std::chrono::steady_clock::time_point & t0) {
-    const auto now = std::chrono::steady_clock::now();
-    const double us = std::chrono::duration<double, std::micro>(now - t0).count();
-    t0 = now;
-    return us;
-}
-
-// The prefill conv input is built as CONCAT(conv history, transpose(qkv)) and
-// then handed to SSM_CONV, which transposes it straight back: ggml_ssm_conv
-// takes a token-major window and returns channel-major. The concat is the
-// single most expensive host op of the prompt - 8.8 ms a call, 126 calls -
-// and all of it is the scalar element-at-a-time copy the CPU concat does when
-// a source is a transpose view, on one thread (it splits over ne2, and there
-// is one sequence).
-//
-// So do not build it. conv_prefill reads the two sources directly, and the
-// only other thing that reads the concat is the 3-row tail view that becomes
-// the next conv state - that tail is written, the rest is left alone.
-//
-// This is only safe where the graph really looks like that, which is what
-// this checks: dim-0 f32 concat of a single sequence, immediately followed by
-// an SSM_CONV the array claims, and no consumer besides that conv other than
-// views living wholly inside the tail.
 static void xdna_concat_tail_plan(ggml_backend_xdna_context * ctx,
                                   struct ggml_cgraph * cgraph,
                                   std::unordered_map<const ggml_tensor *,
                                                      struct ggml_tensor *> & out) {
-    static const bool dbg = []() {
-        const char * v = getenv("GGML_XDNA_CONV_FUSE");
-        return v != nullptr && atoi(v) > 1;
-    }();
     // No do/while wrapper: the `continue` has to leave the node loop.
-#define CF_NO(why) { if (dbg) fprintf(stderr, "xdna-concat-fuse: node %d %s: %s\n", \
-                                      i, n->name ? n->name : "?", why); continue; }
+#define CF_NO(why) { GGML_UNUSED(why); continue; }
     for (int i = 0; i < cgraph->n_nodes; i++) {
         struct ggml_tensor * n = cgraph->nodes[i];
         if (n->op != GGML_OP_CONCAT || n->type != GGML_TYPE_F32) {
@@ -1633,19 +1065,7 @@ static void xdna_concat_tail_plan(ggml_backend_xdna_context * ctx,
                  c->ne[0] <= keep && off >= tail_off;
         }
         if (ok) {
-            if (dbg) {
-                fprintf(stderr, "xdna-concat-fuse: node %d accepted: ne=[%lld,%lld] a=[%lld,%lld] "
-                        "b=[%lld,%lld] conv ne=[%lld,%lld] w=[%lld,%lld]\n", i,
-                        (long long) n->ne[0], (long long) n->ne[1],
-                        (long long) a->ne[0], (long long) a->ne[1],
-                        (long long) b->ne[0], (long long) b->ne[1],
-                        (long long) conv->ne[0], (long long) conv->ne[1],
-                        (long long) conv->src[1]->ne[0], (long long) conv->src[1]->ne[1]);
-                fflush(stderr);
-            }
             out[n] = conv;
-        } else if (dbg) {
-            fprintf(stderr, "xdna-concat-fuse: node %d: a consumer reads past the tail\n", i);
         }
     }
 #undef CF_NO
@@ -1671,11 +1091,6 @@ static void xdna_concat_tail_fill(struct ggml_tensor * n,
                 *(const float *) ((const char *) a->data + i0 * a->nb[0] + i1 * a->nb[1]);
         }
     }
-    if (getenv("GGML_XDNA_CONV_FUSE") && atoi(getenv("GGML_XDNA_CONV_FUSE")) > 1) {
-        fprintf(stderr, "xdna-concat-fuse: filled %s tail rows %lld..%lld, hist %zu\n",
-                n->name ? n->name : "?", (long long) t0, (long long) n->ne[0], hist.size());
-        fflush(stderr);
-    }
     xdna_conv_prefill_direct_add(n, hist.data(), a->ne[0]);
     for (int64_t i1 = 0; i1 < n->ne[1]; i1++) {
         for (int64_t i0 = t0; i0 < n->ne[0]; i0++) {
@@ -1690,9 +1105,6 @@ static void xdna_concat_tail_fill(struct ggml_tensor * n,
 
 static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
     ggml_backend_xdna_context * ctx = (ggml_backend_xdna_context *) backend->context;
-    const auto t_graph = std::chrono::steady_clock::now();
-    auto t_lap = t_graph;
-    double rec_us = 0, glue_us = 0, npu_us = 0;
 
     if (!ctx->device) {
         return GGML_STATUS_SUCCESS;
@@ -1709,7 +1121,7 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
     // merged artifact, which is the context the layers leave resident.
     {
         static xdna_rec_paths fp;
-        static const bool have_fused = xdna_rec_find_paths(fp) && fp.fused;
+        static const bool have_fused = xdna_rec_find_paths(fp);
         ctx->ops.fused_gemv = ctx->ops.isolation && have_fused;
     }
 
@@ -1723,21 +1135,13 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
     }
 
     // Prefill conv inputs whose concat the array reads through instead of
-    // building (GGML_XDNA_CONV_FUSE=0 builds them the ordinary way).
+    // building.
     std::unordered_map<const ggml_tensor *, struct ggml_tensor *> concat_tail;
     // Owns the conv-history snapshots for the length of the graph; deque so
     // the pointers handed to the conv runner survive later pushes.
     std::deque<std::vector<float>> concat_hist;
     xdna_conv_prefill_direct_reset();
-    {
-        static const bool fuse = []() {
-            const char * v = getenv("GGML_XDNA_CONV_FUSE");
-            return v == nullptr || atoi(v) != 0;
-        }();
-        if (fuse) {
-            xdna_concat_tail_plan(ctx, cgraph, concat_tail);
-        }
-    }
+    xdna_concat_tail_plan(ctx, cgraph, concat_tail);
 
     // Input snapshot points of the fused plans: when the loop reaches one of
     // these producer nodes it runs the node (if not already consumed by an
@@ -1773,12 +1177,8 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
     // host and then be overwritten, so they are marked consumed up front.
     // Everything the fused run actually reads is spared: its six inputs and
     // whatever produces them.
-    static const bool skip_body = []() {
-        const char * v = getenv("GGML_XDNA_REC_SKIP_BODY");
-        return v == nullptr || atoi(v) != 0;
-    }();
     for (auto & pl : rec_plans) {
-        if (!skip_body || pl.i_conv < 0 || pl.i_fire <= pl.i_conv) {
+        if (pl.i_conv < 0 || pl.i_fire <= pl.i_conv) {
             continue;
         }
         std::unordered_set<const ggml_tensor *> needed;
@@ -1828,25 +1228,9 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
     // the result either way.
     xdna_ops_plan_gemv(&ctx->ops, cgraph, &gemv_skip);
 
-    // Only decode graphs are tallied: a graph carrying fused recurrent layers
-    // is by construction a single-token decode, and mixing the prompt's graphs
-    // into the averages makes them say nothing about either.
-    const bool prof_on = xdna_ops_prof_on() && !rec_plans.empty();
-    if (prof_on) {
-        xdna_ops_prof_get().graphs++;
-    }
-
     std::vector<struct ggml_tensor *> glue_batch;
     for (int i = 0; i < cgraph->n_nodes; i++) {
         struct ggml_tensor * node = cgraph->nodes[i];
-        // Produced by a dispatch already; nothing left to run here.
-        if (xdna_ops_gemv_absorbed(&ctx->ops, node)) {
-            if (prof_on) {
-                xdna_ops_prof_get().add(ggml_op_name(node->op),
-                                        xdna_ops_prof_t::W_GEMV, ggml_nelements(node));
-            }
-            continue;
-        }
         // Fused-layer input snapshot: right when a producer node runs, copy its
         // output into the layer session before llama recycles the buffer. A
         // consumed node was already produced (e.g. the fused write of a
@@ -1873,7 +1257,6 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                 if (on_npu && !xdna_ops_finalize(&ctx->ops)) {
                     return GGML_STATUS_FAILED;
                 }
-                (on_npu ? npu_us : glue_us) += xdna_ops_prof_lap(t_lap);
             }
             if (s && node->type == GGML_TYPE_F32 && node->data) {
                 switch (c.kind) {
@@ -1919,17 +1302,14 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                         if (!xdna_glue_flush(&ctx->ops, glue_batch)) {
                             return GGML_STATUS_FAILED;
                         }
-                        glue_us += xdna_ops_prof_lap(t_lap);
                     }
                     if (!xdna_ops_finalize(&ctx->ops)) {
                         return GGML_STATUS_FAILED;
                     }
-                    npu_us += xdna_ops_prof_lap(t_lap);
                     if (!xdna_rec_run(ctx, pl, consumed, cgraph)) {
                         xdna_ops_finalize(&ctx->ops);
                         return GGML_STATUS_FAILED;
                     }
-                    rec_us += xdna_ops_prof_lap(t_lap);
                     break;
                 }
             }
@@ -1938,10 +1318,6 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
             continue;
         }
         if (consumed.count(node)) {
-            if (prof_on) {
-                xdna_ops_prof_get().add(ggml_op_name(node->op),
-                                        xdna_ops_prof_t::W_FUSED, ggml_nelements(node));
-            }
             continue;
         }
         // A concat the conv reads through: write the live tail, then run the
@@ -1954,33 +1330,21 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                     if (!xdna_glue_flush(&ctx->ops, glue_batch)) {
                         return GGML_STATUS_FAILED;
                     }
-                    glue_us += xdna_ops_prof_lap(t_lap);
                 }
                 concat_hist.emplace_back();
                 xdna_concat_tail_fill(node, concat_hist.back());
-                glue_us += xdna_ops_prof_lap(t_lap);
                 if (!xdna_ops_compute(&ctx->ops, cf->second) ||
                     !xdna_ops_finalize(&ctx->ops)) {
                     xdna_ops_finalize(&ctx->ops);
                     return GGML_STATUS_FAILED;
                 }
-                npu_us += xdna_ops_prof_lap(t_lap);
                 consumed.insert(cf->second);
-                if (prof_on) {
-                    xdna_ops_prof_get().add(ggml_op_name(cf->second->op),
-                                            xdna_ops_prof_t::W_NPU,
-                                            ggml_nelements(cf->second));
-                }
                 continue;
             }
         }
         // Glue-claimed cheap ops accumulate into one CPU batch (flushed before
         // the next NPU op or at the graph end).
         if (xdna_glue_claims(node) && !xdna_ops_supported(&ctx->ops, node)) {
-            if (prof_on) {
-                xdna_ops_prof_get().add(ggml_op_name(node->op),
-                                        xdna_ops_prof_t::W_HOST, ggml_nelements(node));
-            }
             // A concat this backend can copy itself does not go to the batch:
             // it is pure data movement with no cgraph amortization to gain, and
             // ggml's element-at-a-time version is the most expensive host op in
@@ -1990,7 +1354,6 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                     if (!xdna_glue_flush(&ctx->ops, glue_batch)) {
                         return GGML_STATUS_FAILED;
                     }
-                    glue_us += xdna_ops_prof_lap(t_lap);
                 }
                 if (!xdna_ops_finalize(&ctx->ops)) {
                     return GGML_STATUS_FAILED;
@@ -2002,39 +1365,23 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
             glue_batch.push_back(node);
             continue;
         }
-        if (prof_on) {
-            xdna_ops_prof_get().add(ggml_op_name(node->op),
-                                    xdna_ops_prof_t::W_NPU, ggml_nelements(node));
-        }
         if (!glue_batch.empty()) {
             if (!xdna_glue_flush(&ctx->ops, glue_batch)) {
                 return GGML_STATUS_FAILED;
             }
-            glue_us += xdna_ops_prof_lap(t_lap);
         }
         if (!xdna_ops_compute(&ctx->ops, node)) {
             xdna_ops_finalize(&ctx->ops);
             return GGML_STATUS_FAILED;
         }
-        npu_us += xdna_ops_prof_lap(t_lap);
     }
     if (!glue_batch.empty()) {
         if (!xdna_glue_flush(&ctx->ops, glue_batch)) {
             return GGML_STATUS_FAILED;
         }
-        glue_us += xdna_ops_prof_lap(t_lap);
     }
     if (!xdna_ops_finalize(&ctx->ops)) {
         return GGML_STATUS_FAILED;
-    }
-    npu_us += xdna_ops_prof_lap(t_lap);
-    if (prof_on) {
-        auto & p = xdna_ops_prof_get();
-        p.rec_us  += rec_us;
-        p.glue_us += glue_us;
-        p.npu_us  += npu_us;
-        p.total_us += std::chrono::duration<double, std::micro>(
-                          std::chrono::steady_clock::now() - t_graph).count();
     }
     return GGML_STATUS_SUCCESS;
 }
@@ -2166,12 +1513,7 @@ static bool ggml_backend_xdna_device_supports_op(ggml_backend_dev_t dev, const s
     // Claim the native NPU ops plus the whitelisted cheap ops of the fused
     // recurrent layer, so the decode chunk stays whole and the glue can host
     // the rest.
-    const bool ok = xdna_glue_claims(op) || xdna_ops_supported(&ctx->ops, op);
-    if (!ok && xdna_ops_prof_on() && op->ne[1] <= 1) {
-        xdna_ops_prof_get().add(ggml_op_name(op->op), xdna_ops_prof_t::W_REFUSED,
-                                ggml_nelements(op));
-    }
-    return ok;
+    return xdna_glue_claims(op) || xdna_ops_supported(&ctx->ops, op);
 }
 
 static bool ggml_backend_xdna_device_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {

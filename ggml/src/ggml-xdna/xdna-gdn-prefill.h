@@ -1,6 +1,6 @@
 #pragma once
 
-// GDN prefill offload (kernels/gdn-prefill.py): replaces the CPU
+// GDN prefill offload (kernels/gdn_prefill.py): replaces the CPU
 // GGML_OP_GATED_DELTA_NET execution of a prefill recurrent layer (M > 1
 // tokens) by chained device runs of the CS=64-token bf16 recurrence kernel.
 // The DMA schedule is a host-built TXN stream (xdna_gdn_prefill_seq_build),
@@ -12,7 +12,6 @@
 struct xdna_device;
 
 // True when the xclbin artifact is present.
-bool xdna_gdn_prefill_enabled(void);
 
 // True when `node` is a GGML_OP_GATED_DELTA_NET prefill op the baked kernel
 // covers (see header comment). False keeps the node on the CPU.

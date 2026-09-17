@@ -2,7 +2,6 @@
 
 #include "ggml-impl.h"
 #include "ggml-quants.h"
-#include "xdna-verify.h"
 
 #include <algorithm>
 #include <cmath>
@@ -339,68 +338,4 @@ bool xdna_wfmt_decode_row(xdna_wfmt fmt, const void * src, int64_t k, float * ds
     return false;
 }
 
-void xdna_wfmt_selfcheck(enum ggml_type type, const void * data, int64_t k, int64_t n_rows,
-                         const char * label) {
-    if (xdna_verify_level() <= 0 || !data) {
-        return;
-    }
-    // Once per tensor: the check is called from the support probe, which runs
-    // for every MUL_MAT of every graph.
-    {
-        static std::mutex seen_mutex;
-        static std::set<const void *> seen;
-        std::lock_guard<std::mutex> lock(seen_mutex);
-        if (!seen.insert(data).second) {
-            return;
-        }
-    }
-    const xdna_wfmt fmt = xdna_wfmt_for(type);
-    const size_t rb = xdna_wfmt_row_bytes(fmt, k);
-    const ggml_type_traits * tr = ggml_get_type_traits(type);
-    if (fmt == XDNA_WFMT_NONE || rb == 0 || !tr || !tr->to_float) {
-        return;
-    }
-
-    // A handful of rows is enough: the repack is per super-block, so a format
-    // error shows up in the first one.
-    const int64_t rows = std::min<int64_t>(n_rows, 8);
-    const size_t src_rb = ggml_row_size(type, k);
-    std::vector<uint8_t> packed(rb);
-    std::vector<float> ref((size_t) k);
-    std::vector<float> got((size_t) k);
-    double worst = 0.0;
-
-    for (int64_t r = 0; r < rows; r++) {
-        const uint8_t * row = (const uint8_t *) data + (size_t) r * src_rb;
-        if (!xdna_wfmt_repack_row(type, row, k, packed.data()) ||
-            !xdna_wfmt_decode_row(fmt, packed.data(), k, got.data())) {
-            return;
-        }
-        tr->to_float(row, ref.data(), k);
-        worst = std::max(worst, xdna_verify_rel(got.data(), ref.data(), (size_t) k));
-    }
-
-    char key[128];
-    snprintf(key, sizeof(key), "repack %s->%s", ggml_type_name(type),
-             fmt == XDNA_WFMT_Q4G32 ? "q4g32" : "q8g16");
-    GGML_UNUSED(label);
-    xdna_verify_add(key, worst);
-
-    // The floor of any bf16-producing dequant, for context: the exact weights
-    // rounded to bf16. The format itself is bit-exact, so its row above must
-    // read zero.
-    double worst_floor = 0.0;
-    std::vector<ggml_bf16_t> tmp((size_t) k);
-    for (int64_t r = 0; r < rows; r++) {
-        const uint8_t * row = (const uint8_t *) data + (size_t) r * src_rb;
-        tr->to_float(row, ref.data(), k);
-        ggml_fp32_to_bf16_row(ref.data(), tmp.data(), (int) k);
-        for (int64_t i = 0; i < k; i++) {
-            got[(size_t) i] = ggml_bf16_to_fp32(tmp[(size_t) i]);
-        }
-        worst_floor = std::max(worst_floor, xdna_verify_rel(got.data(), ref.data(), (size_t) k));
-    }
-    snprintf(key, sizeof(key), "repack %s->bf16 floor", ggml_type_name(type));
-    xdna_verify_add(key, worst_floor);
-}
 

@@ -1,14 +1,12 @@
 #include "xdna-gdn-prefill.h"
 #include "ggml-impl.h"
 #include "xdna-runtime.h"
+#include "xdna-util.h"
 #include "xdna-seq.h"
-#include "xdna-types.h"
-#include "xdna-profile.h"
 
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
-#include <fstream>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
@@ -17,7 +15,7 @@
 #include <string>
 #include <vector>
 
-// Runner for the bf16 GDN prefill kernel (kernels/gdn-prefill.py). Host ABI of
+// Runner for the bf16 GDN prefill kernel (kernels/gdn_prefill.py). Host ABI of
 // the design: three host BOs
 //   tok    : [H][CS][3*S+2] bf16   q | k | v | eg | beta
 //   packed : [H][NS][ROWS*S + CS*ROWS] bf16. A strip is a slice of the state's
@@ -64,16 +62,13 @@ struct gdn_pf_runner {
 
 static gdn_pf_runner g_runner;
 
-bool xdna_gdn_prefill_enabled(void) {
-    // Opt-in (GGML_XDNA_GDN=1). The device recurrence leaves a bf16 state, so
-    // decode continues from a state ~4e-2 off the f32 reference after 512
-    // tokens (GGML_XDNA_GDN_VERIFY=1 prints it), and it is slower than the host
-    // for this model: on the array it costs ~25% of prefill throughput (pp1024
-    // 1501 -> 1097 t/s), because the kernel advances 64 tokens per dispatch and
-    // every chunk pays its own bf16 packing, submit/wait and read-back. Off by
-    // default for speed; set it for full-array coverage.
-    const char * v = getenv("GGML_XDNA_GDN");
-    if (v == nullptr || v[0] == '\0' || strcmp(v, "0") == 0) {
+static bool gdn_pf_enabled(void) {
+    // Opt-in (GGML_XDNA_GDN=1). The device recurrence leaves a bf16 state and
+    // is slower than the host for this model: on the array it costs ~25% of
+    // prefill throughput, because the kernel advances 64 tokens per dispatch
+    // and every chunk pays its own bf16 packing, submit/wait and read-back.
+    // Off by default for speed; set it for full-array coverage.
+    if (xdna_env_int("GGML_XDNA_GDN", 0) == 0) {
         return false;
     }
     for (const auto & dir : xdna_kernel_search_dirs()) {
@@ -87,7 +82,7 @@ bool xdna_gdn_prefill_enabled(void) {
 
 bool xdna_gdn_prefill_supported(const struct ggml_tensor * node) {
     using namespace gdn_pf;
-    if (!xdna_gdn_prefill_enabled() || !node || node->op != GGML_OP_GATED_DELTA_NET) {
+    if (!gdn_pf_enabled() || !node || node->op != GGML_OP_GATED_DELTA_NET) {
         return false;
     }
     const ggml_tensor * q = node->src[0];
@@ -100,16 +95,9 @@ bool xdna_gdn_prefill_supported(const struct ggml_tensor * node) {
         return false;
     }
     if (v->ne[2] <= 1) {
-        // Single-token decode: keep off by default. GGML_XDNA_GDN_AR=1 also
-        // accepts the 1-token shape (the llama fused-op autoregressive probe)
-        // so the fused GDN paths can be enabled end to end.
-        static const bool allow_ar = []() {
-            const char * e = getenv("GGML_XDNA_GDN_AR");
-            return e != nullptr && atoi(e) >= 1;
-        }();
-        if (!allow_ar) {
-            return false;
-        }
+        // Single-token decode stays on the host: this kernel is the prefill
+        // recurrence.
+        return false;
     }
     // Accept any batch: full CS=64-token chunks run on the device and any tail
     // is finished exactly on the host. Accepting small batches also lets the
@@ -353,8 +341,8 @@ static bool gdn_pf_load(xdna_device * dev) {
         }
     }
     if (xclbin.empty()) {
-        fprintf(stderr, "xdna-gdn-prefill: %s.xclbin not found; "
-                        "leaving GDN prefill on CPU\n", STEM);
+        GGML_LOG_WARN("%s: %s.xclbin not found; leaving GDN prefill on CPU\n",
+                      "xdna-gdn-prefill", STEM);
         return false;
     }
     g_runner.dev = dev;
@@ -365,17 +353,12 @@ static bool gdn_pf_load(xdna_device * dev) {
     xdna_seq seq;
     const xdna_gdn_prefill_geom geom;
     if (!xdna_gdn_prefill_seq_build(&seq, &geom)) {
-        fprintf(stderr, "xdna-gdn-prefill: TXN stream build failed\n");
+        GGML_LOG_ERROR("%s: TXN stream build failed\n", "xdna-gdn-prefill");
         xdna_kernel_free(g_runner.kern);
         g_runner.kern = nullptr;
         return false;
     }
     const std::vector<uint32_t> words = xdna_seq_build(&seq);
-    if (const char * path = getenv("GGML_XDNA_GDN_PF_DUMP")) {
-        std::ofstream f(path, std::ios::binary);
-        f.write((const char *) words.data(),
-                (std::streamsize) (words.size() * 4));
-    }
     if (words.empty() ||
         !xdna_kernel_bind_insts(dev, g_runner.kern, words.data(), words.size())) {
         xdna_kernel_free(g_runner.kern);
@@ -420,7 +403,6 @@ bool xdna_gdn_prefill_run(struct xdna_device * dev, struct ggml_tensor * node) {
 
     // Seed the device state buffer from the llama cache state.
     {
-        xdna_rp _p("gdn", "seed");
         seed_state((uint16_t *) g_runner.pkd->bo.map(), s);
         xdna_buffer_sync_to_device(g_runner.pkd);
     }
@@ -429,18 +411,16 @@ bool xdna_gdn_prefill_run(struct xdna_device * dev, struct ggml_tensor * node) {
 
     for (int c = 0; c < n_full; c++) {
         {
-            xdna_rp _p("gdn", "pack");
             pack_chunk(tok_map, q, k, v, g, b, c * CS);
             xdna_buffer_sync_to_device(g_runner.tok);
         }
 
         {
             // In-place packed buffer: SIN and SOUT are the same BO.
-            xdna_rp _p("gdn", "dispatch");
             xdna_buffer * args[3] = { g_runner.tok, g_runner.pkd, g_runner.pkd };
             xrt::run run = xdna_kernel_run_start(g_runner.kern, args, 3);
             if (!xdna_run_wait(run)) {
-                fprintf(stderr, "xdna-gdn-prefill: chunk %d run failed\n", c);
+                GGML_LOG_ERROR("%s: chunk %d run failed\n", "xdna-gdn-prefill", c);
                 return false;
             }
         }
@@ -448,18 +428,15 @@ bool xdna_gdn_prefill_run(struct xdna_device * dev, struct ggml_tensor * node) {
         // Refresh the host map (the state and attn suffixes interleave per
         // (head, strip) block, so a partial range sync would miss blocks) and
         // scatter this chunk's attn into the ggml result.
-        xdna_rp _p("gdn", "scatter");
         g_runner.pkd->bo.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
         const uint16_t * pkd_map = (const uint16_t *) g_runner.pkd->bo.map();
         scatter_attn(pkd_map, dst_attn, c * CS);
     }
 
     if (n_tail == 0) {
-        xdna_rp _p("gdn", "unpack state");
         g_runner.pkd->bo.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
         unpack_state((uint16_t *) g_runner.pkd->bo.map(), dst_state);
     } else {
-        xdna_rp _p("gdn", "host tail");
         // Finish the tail on the host: unpack the chunk-boundary bf16 state to
         // f32 and run the exact CPU recurrence over the remaining tokens.
         g_runner.pkd->bo.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
@@ -467,128 +444,6 @@ bool xdna_gdn_prefill_run(struct xdna_device * dev, struct ggml_tensor * node) {
         unpack_state((uint16_t *) g_runner.pkd->bo.map(), state.data());
         cpu_tail(q, k, v, g, b, state.data(), dst, n_full * CS, n_tail);
         std::memcpy(dst_state, state.data(), state.size() * sizeof(float));
-    }
-
-    // GGML_XDNA_GDN_VERIFY=1 recomputes the whole op with the exact recurrence
-    // this file already trusts for the tail, from the same seed, and says how
-    // far the array's two outputs are from it. A prefill whose state is wrong
-    // does not look wrong here - it looks like a decode that answers nothing -
-    // so the check has to be on the op, not on the text.
-    if (getenv("GGML_XDNA_GDN_VERIFY") && n_full > 0) {
-        // Only the calls that actually ran a chunk on the array: the probe's
-        // two-token shapes all take the host tail and match by construction.
-        static int shown = 0;
-        if (shown++ < 4) {
-            std::vector<float> rs((size_t) H * S * S);
-            std::vector<float> rdst((size_t) S * H * M + (size_t) H * S * S);
-            const float * seed = (const float *) s->data;
-            std::memcpy(rs.data(), seed, rs.size() * sizeof(float));
-            cpu_tail(q, k, v, g, b, rs.data(), rdst.data(), 0, M);
-            const auto rel = [](const float * a, const float * r, size_t n) {
-                double num = 0, den = 0;
-                for (size_t i = 0; i < n; i++) {
-                    const double d = (double) a[i] - r[i];
-                    num += d * d;
-                    den += (double) r[i] * r[i];
-                }
-                return den > 0 ? std::sqrt(num / den) : -1.0;
-            };
-            // The attn is close and the state is not, so the recurrence on
-            // the array is right and what it writes out is not. Price the
-            // state against the reference at several chunk counts: if the
-            // drain is a chunk behind, one of them fits.
-            const double r_full = rel(dst_state, rs.data(), rs.size());
-            double r_lag = -1.0, r_lag2 = -1.0;
-            if (n_full >= 2) {
-                std::vector<float> ls((size_t) H * S * S);
-                std::vector<float> ld(rdst.size());
-                std::memcpy(ls.data(), seed, ls.size() * sizeof(float));
-                cpu_tail(q, k, v, g, b, ls.data(), ld.data(), 0,
-                         (n_full - 1) * CS);
-                r_lag = rel(dst_state, ls.data(), ls.size());
-                std::memcpy(ls.data(), seed, ls.size() * sizeof(float));
-                cpu_tail(q, k, v, g, b, ls.data(), ld.data(), 0, CS);
-                r_lag2 = rel(dst_state, ls.data(), ls.size());
-            }
-            // Where does each of the array's values live in the reference?
-            // A permutation shows up as a regular pattern in the answer; noise
-            // shows up as no match at all.
-            if (getenv("GGML_XDNA_GDN_PERM")) {
-                fprintf(stderr, "xdna-gdn-perm: head 0, dst index -> nearest "
-                                "reference index (S=%d):\n", S);
-                for (int i = 0; i < 8; i++) {
-                    const float want = dst_state[i];
-                    int    best = -1;
-                    double bd   = 1e30;
-                    for (int j = 0; j < S * S; j++) {
-                        const double d = std::fabs((double) rs[j] - want);
-                        if (d < bd) { bd = d; best = j; }
-                    }
-                    fprintf(stderr, "   %3d (%g) -> %5d (%g) row %d col %d, "
-                            "err %.2e\n", i, want, best, rs[best],
-                            best % S, best / S, bd);
-                }
-            }
-            // Split the attn: the first n_full*CS tokens are the array's
-            // own, the rest is the host tail - which is exact given the state
-            // it starts from, so its error is the state's error.
-            const size_t per_tok = (size_t) S * H;
-            const double a_dev = rel(dst_attn, rdst.data(),
-                                     per_tok * (size_t) (n_full * CS));
-            const double a_one = rel(dst_attn, rdst.data(), per_tok * CS);
-            // The seed is all zeros on a fresh prompt, so every strip layout
-            // is indistinguishable going in and only the readback shows which
-            // one the kernel actually leaves. Price the candidates.
-            if (getenv("GGML_XDNA_GDN_LAYOUT")) {
-                // Against the reference after exactly the chunks the array
-                // ran, not after all M - the buffer holds the chunk boundary.
-                std::vector<float> cs_ref((size_t) H * S * S);
-                {
-                    std::vector<float> tmp(rdst.size());
-                    std::memcpy(cs_ref.data(), seed, cs_ref.size() * sizeof(float));
-                    cpu_tail(q, k, v, g, b, cs_ref.data(), tmp.data(), 0,
-                             n_full * CS);
-                }
-                const uint16_t * pk = (const uint16_t *) g_runner.pkd->bo.map();
-                // The four readings of the strip: which state axis the
-                // strip slices (value, as the kernel's j0 and scatter_attn
-                // say, or key) x which index is major inside it.
-                const char * names[] = { "strip=value, i-major (current)",
-                                         "strip=key,   j-major (old)",
-                                         "strip=value, l-major",
-                                         "strip=key,   l-major" };
-                for (int cand = 0; cand < 4; cand++) {
-                    std::vector<float> t((size_t) H * S * S, 0.0f);
-                    for (int h = 0; h < H; h++) {
-                        float * hst = t.data() + (size_t) h * S * S;
-                        for (int ns = 0; ns < NS; ns++) {
-                            const uint16_t * src =
-                                pk + ((size_t) h * NS + ns) * PACKED_N;
-                            for (int a = 0; a < S; a++) {
-                                for (int l = 0; l < ROWS; l++) {
-                                    const size_t idx =
-                                        (cand & 2) ? (size_t) l * S + a
-                                                   : (size_t) a * ROWS + l;
-                                    const size_t cell =
-                                        (cand & 1)
-                                            ? (size_t) a * S + ns * ROWS + l
-                                            : (size_t) (ns * ROWS + l) * S + a;
-                                    hst[cell] = bf16_to_f32(src[idx]);
-                                }
-                            }
-                        }
-                    }
-                    fprintf(stderr, "xdna-gdn-layout: %-30s rel %.3e\n",
-                            names[cand], rel(t.data(), cs_ref.data(), t.size()));
-                }
-            }
-            fprintf(stderr, "xdna-gdn-verify: M=%d full=%d tail=%d | attn rel "
-                    "%.3e (array's own %.3e, first chunk %.3e) | state rel %.3e"
-                    " (one chunk short %.3e, one chunk only %.3e)\n",
-                    M, n_full, n_tail,
-                    rel(dst_attn, rdst.data(), (size_t) S * H * M),
-                    a_dev, a_one, r_full, r_lag, r_lag2);
-        }
     }
 
     return true;

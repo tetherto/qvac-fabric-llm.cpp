@@ -1,12 +1,10 @@
-#include <cstring>
 #include "xdna-rec-gemv.h"
 
+#include "ggml-impl.h"
 #include "ggml.h"
 
 #include <algorithm>
-#include <cmath>
-#include <cstdio>
-#include <cstdlib>
+#include <cstring>
 #include <memory>
 
 namespace {
@@ -36,36 +34,6 @@ bool pack_stage(const struct ggml_tensor * const * ws, int n_w,
                                   out.packed);
 }
 
-// One dispatch: pack, then load the runner.
-xdna_gemv * make_stage(xdna_kernel_pool * pool,
-                       const struct ggml_tensor * const * ws, int n_w,
-                       int64_t K, int64_t N, bool epilogue,
-                       xdna_gemv_split split) {
-    stage s;
-    if (!pack_stage(ws, n_w, K, N, epilogue, split, s)) {
-        return nullptr;
-    }
-    return xdna_gemv_create(pool, s.geom, s.packed);
-}
-
-// GGML_XDNA_GEMV_PAIR=0 keeps the FFN as two dispatches, which is what the
-// pair is measured against on the same build.
-bool xdna_rec_gemv_pair_enabled() {
-    static const bool on = []() {
-        const char * v = getenv("GGML_XDNA_GEMV_PAIR");
-        return v == nullptr || atoi(v) != 0;
-    }();
-    return on;
-}
-
-bool xdna_rec_gemv_pair_verify() {
-    static const bool on = []() {
-        const char * v = getenv("GGML_XDNA_GEMV_PAIR_VERIFY");
-        return v != nullptr && atoi(v) != 0;
-    }();
-    return on;
-}
-
 } // namespace
 
 xdna_rec_gemv * xdna_rec_gemv_create(xdna_kernel_pool * pool,
@@ -90,30 +58,29 @@ xdna_rec_gemv * xdna_rec_gemv_create(xdna_kernel_pool * pool,
 
     std::unique_ptr<xdna_rec_gemv> m(new xdna_rec_gemv);
 
-    const struct ggml_tensor * so_w[1] = { w_so };
-    m->so = make_stage(pool, so_w, 1, w_so->ne[0], w_so->ne[1], false, split);
-
     const struct ggml_tensor * gu[2] = { w_gate, w_up };
     const struct ggml_tensor * dn[1] = { w_down };
-    stage s_act, s_down;
+    stage s_so, s_act, s_down;
+    if (!pack_stage(&w_so, 1, w_so->ne[0], w_so->ne[1], false, split, s_so)) {
+        delete m.release();
+        return nullptr;
+    }
     if (!pack_stage(gu, 2, w_gate->ne[0], w_gate->ne[1] + w_up->ne[1], true,
                     split, s_act) ||
         !pack_stage(dn, 1, w_down->ne[0], w_down->ne[1], false, split, s_down)) {
-        xdna_rec_gemv_free(m.release());
+        delete m.release();
         return nullptr;
     }
+    m->so = xdna_gemv_create(pool, s_so.geom, s_so.packed);
 
-    // Both in one stream when the geometry allows it. Only the merged
-    // artifact's split puts one core to a column, which is what lets a core's
-    // output be one descriptor into the next dispatch's activation.
-    if (fused && xdna_rec_gemv_pair_enabled()) {
+    // Both FFN stages in one stream when the geometry allows it. Only the
+    // merged artifact's split puts one core to a column, which is what lets a
+    // core's output be one descriptor into the next dispatch's activation.
+    if (fused) {
         m->ffn = xdna_gemv_pair_create(pool, s_act.geom, s_act.packed,
                                        s_down.geom, s_down.packed);
     }
-    // GGML_XDNA_GEMV_PAIR_VERIFY=1 keeps the two-dispatch path alongside the
-    // pair and runs both, which is the only way to tell a bad handover from a
-    // bad second dispatch.
-    if (!m->ffn || xdna_rec_gemv_pair_verify()) {
+    if (!m->ffn) {
         m->act  = xdna_gemv_create(pool, s_act.geom, s_act.packed);
         m->down = xdna_gemv_create(pool, s_down.geom, s_down.packed);
     }
@@ -145,16 +112,6 @@ xdna_gemv * xdna_rec_gemv_so(xdna_rec_gemv * m) {
     return m ? m->so : nullptr;
 }
 
-bool xdna_rec_gemv_so_collect_raw(xdna_rec_gemv * m, const void * out,
-                                  size_t off, float * dst) {
-    if (!m || !m->so || !out || !dst) {
-        return false;
-    }
-    std::memcpy(dst, (const uint8_t *) out + off,
-                (size_t) m->so->geom.n_real * sizeof(float));
-    return true;
-}
-
 bool xdna_rec_gemv_so_collect(xdna_rec_gemv * m, const void * out, size_t off,
                               const void * act, const float * hres,
                               float * h_attn) {
@@ -163,76 +120,28 @@ bool xdna_rec_gemv_so_collect(xdna_rec_gemv * m, const void * out, size_t off,
     }
     if (out) {
         // The fused stream drains into the core's output buffer, past what the
-        // core writes: it has no argument of its own to drain to.
-        // The gated stage writes the activation in the layout its build was
-        // told (GATED_FMT); the projection's geometry derives from the model's
-        // ssm_out type. If the two disagree the result is silent garbage, so
-        // say it loudly.
+        // core writes: it has no argument of its own to drain to. The gated
+        // stage writes the activation in the layout its build was told
+        // (GATED_FMT); the projection's geometry derives from the model's
+        // ssm_out type. If the two disagree the result is silent garbage.
         if (act) {
             const int32_t * h = (const int32_t *) act;
             const int afmt = h[XDNA_GEMV_ACT_TILE / 4 - 1];
             const int wfmt = m->so->geom.fmt == XDNA_WFMT_Q4G32 ? 0 : 1;
             if (afmt != wfmt) {
-                fprintf(stderr, "xdna-rec-gemv: the artifact's activation "
-                        "format (%d) does not match this model's ssm_out (%d); "
-                        "rebuild the kernels with the matching GATED_FMT\n",
-                        afmt, wfmt);
+                GGML_LOG_ERROR(
+                    "%s: the artifact's activation format (%d) does not match "
+                    "this model's ssm_out (%d); rebuild the kernels with the "
+                    "matching GATED_FMT\n", "xdna-rec-gemv", afmt, wfmt);
                 return false;
-            }
-        }
-        if (getenv("GGML_XDNA_SO_ACT_DUMP2")) {
-            static int shown = 0;
-            if (shown++ < 2) {
-                const int32_t * h = (const int32_t *) act;
-                fprintf(stderr, "so-act2: hdr nt=%d nout=%d fmt=%d flags=%d "
-                        "codes[0..7] =",
-                        h[0], h[1], h[2112 / 4 - 1], h[2112 / 4 - 2]);
-                const int8_t * c = (const int8_t *) ((const uint8_t *) act + 2112);
-                for (int i = 0; i < 8; i++) {
-                    fprintf(stderr, " %d", (int) c[i]);
-                }
-                fprintf(stderr, "\n");
             }
         }
         std::memcpy(m->acc.data(), (const uint8_t *) out + off,
                     (size_t) m->so->geom.n_real * sizeof(float));
-        // GGML_XDNA_SO_FUSED_VERIFY=1 runs the same projection the ordinary
-        // way on the same activation and compares, which says whether the
-        // fused half of the stream computed or only completed.
-        if (act && getenv("GGML_XDNA_SO_FUSED_VERIFY")) {
-            static int shown = 0;
-            if (shown++ < 3) {
-                std::vector<float> ref(m->acc.size(), 0.0f);
-                if (xdna_gemv_run_packed(m->so, act, ref.data())) {
-                    double num = 0, den = 0;
-                    for (int i = 0; i < m->so->geom.n_real; i++) {
-                        const double e = (double) m->acc[i] - ref[i];
-                        num += e * e;
-                        den += (double) ref[i] * ref[i];
-                    }
-                    fprintf(stderr, "so-fused: rel %.3e  fused %g %g %g | "
-                            "ref %g %g %g\n",
-                            den > 0 ? std::sqrt(num / den) : -1.0,
-                            m->acc[0], m->acc[1], m->acc[2],
-                            ref[0], ref[1], ref[2]);
-                }
-            }
-        }
     } else if (!xdna_gemv_read_out(m->so, m->acc.data())) {
         return false;
     }
     const int n = m->so->geom.n_real;
-    if (getenv("GGML_XDNA_ACT_DUMP")) {
-        static int k = 0;
-        if (k++ < 3) {
-            fprintf(stderr, "xdna-acc(host): %g %g %g | t1 %g %g %g | "
-                    "t2 %g %g %g | t3 %g %g %g\n",
-                    m->acc[0], m->acc[1], m->acc[2],
-                    m->acc[256], m->acc[257], m->acc[258],
-                    m->acc[512], m->acc[513], m->acc[514],
-                    m->acc[768], m->acc[769], m->acc[770]);
-        }
-    }
     for (int i = 0; i < n; i++) {
         h_attn[i] = hres[i] + m->acc[i];
     }
@@ -249,68 +158,9 @@ bool xdna_rec_gemv_so_run(xdna_rec_gemv * m, const void * act_tiles,
     // reads, so the common path neither dequantizes nor repacks. The fallback
     // is for the 8-bit weight form, whose groups are 16 wide where the gated
     // kernel writes 32.
-    // GGML_XDNA_SO_ACT_DUMP=1 decodes the tiles the gated stage wrote and
-    // compares them against the codes it also wrote in the row-scale form.
-    if (act_tiles && aq && getenv("GGML_XDNA_SO_ACT_DUMP")) {
-        static int shown = 0;
-        if (shown++ < 2) {
-            const uint8_t * a8 = (const uint8_t *) act_tiles;
-            const int32_t * h = (const int32_t *) a8;
-            fprintf(stderr, "so-act: hdr nt=%d nout=%d fmt=%d flags=%d\n",
-                    h[0], h[1], h[2112 / 4 - 1], h[2112 / 4 - 2]);
-            double num = 0, den = 0;
-            for (int i = 0; i < (int) m->a.size(); i++) {
-                const int t = i / 256, g = (i % 256) / 32;
-                const uint8_t * tile = a8 + (size_t) (1 + t) * 2112;
-                const float d = ((const float *) (tile + 256))[8 + g];
-                const float got = (float) ((const int8_t *) tile)[i % 256] * d;
-                const float ref = (float) aq[i] * d_a;
-                num += (double) (got - ref) * (got - ref);
-                den += (double) ref * ref;
-            }
-            int i0 = 0;
-            while (i0 < (int) m->a.size() && aq[i0] == 0) {
-                i0++;
-            }
-            const int t0 = i0 / 256, g0 = (i0 % 256) / 32;
-            const uint8_t * tl = a8 + (size_t) (1 + t0) * 2112;
-            fprintf(stderr, "so-act: rel %.3e den %.3e  first nonzero i=%d "
-                    "dev code %d scale %g -> %g | ref code %d d_a %g -> %g\n",
-                    den > 0 ? std::sqrt(num / den) : -1.0, den, i0,
-                    (int) ((const int8_t *) tl)[i0 % 256],
-                    ((const float *) (tl + 256))[8 + g0],
-                    (float) ((const int8_t *) tl)[i0 % 256] *
-                        ((const float *) (tl + 256))[8 + g0],
-                    (int) aq[i0], d_a, aq[i0] * d_a);
-        }
-    }
-    static const bool packed_on = []() {
-        const char * v = getenv("GGML_XDNA_SO_PACKED");
-        return v == nullptr || atoi(v) != 0;
-    }();
-    if (packed_on && act_tiles && m->so->geom.fmt == XDNA_WFMT_Q4G32) {
+    if (act_tiles && m->so->geom.fmt == XDNA_WFMT_Q4G32) {
         if (!xdna_gemv_run_packed(m->so, act_tiles, m->acc.data())) {
             return false;
-        }
-        if (aq && getenv("GGML_XDNA_SO_ACT_DUMP")) {
-            static int shown2 = 0;
-            if (shown2++ < 3) {
-                std::vector<float> ref(m->acc.size(), 0.0f);
-                const size_t K = m->a.size();
-                for (size_t i = 0; i < K; i++) {
-                    m->a[i] = (float) aq[i] * d_a;
-                }
-                xdna_gemv_run(m->so, m->a.data(), ref.data());
-                double num = 0, den = 0;
-                for (int i = 0; i < m->so->geom.n_real; i++) {
-                    const double e = (double) m->acc[i] - ref[i];
-                    num += e * e;
-                    den += (double) ref[i] * ref[i];
-                }
-                fprintf(stderr, "so-out: rel %.3e  packed %g %g %g | host %g %g %g\n",
-                        den > 0 ? std::sqrt(num / den) : -1.0,
-                        m->acc[0], m->acc[1], m->acc[2], ref[0], ref[1], ref[2]);
-            }
         }
     } else {
         if (!aq) {
@@ -352,18 +202,6 @@ bool xdna_rec_gemv_acc_from_tiles(xdna_rec_gemv * m, float * acc) {
                     base + (size_t) (t + 1) * XDNA_GEMV_ACT_TILE,
                     (size_t) kt * sizeof(float));
     }
-    if (getenv("GGML_XDNA_ACT_DUMP")) {
-        static int n = 0;
-        if (n++ < 3) {
-            fprintf(stderr, "xdna-act: kt=%d nt=%d tiles", kt, nt);
-            for (int t = 0; t < nt; t++) {
-                const float * f = (const float *)
-                    (base + (size_t) (t + 1) * XDNA_GEMV_ACT_TILE);
-                fprintf(stderr, " | t%d %g %g %g", t, f[0], f[1], f[2]);
-            }
-            fprintf(stderr, "\n");
-        }
-    }
     return true;
 }
 
@@ -392,37 +230,7 @@ bool xdna_rec_gemv_ffn_run(xdna_rec_gemv * m, const float * hff,
     // projections share an activation, so they share a launch, and the
     // nonlinearity closes on the cores. With the pair the down projection is
     // in that same stream and its activation never leaves the device.
-    if (m->ffn && xdna_rec_gemv_pair_verify()) {
-        std::vector<float> ref(m->acc.size(), 0.0f);
-        if (!xdna_gemv_run(m->act, hff, m->mid.data()) ||
-            !xdna_gemv_run(m->down, m->mid.data(), ref.data()) ||
-            !xdna_gemv_pair_run(m->ffn, hff, m->acc.data())) {
-            return false;
-        }
-        std::vector<float> mid_dev;
-        xdna_gemv_pair_read_mid(m->ffn, mid_dev);
-        static int shown = 0;
-        if (shown++ < 4) {
-            const auto rel = [](const std::vector<float> & a,
-                                const std::vector<float> & b, int n) {
-                double num = 0, den = 0;
-                for (int i = 0; i < n; i++) {
-                    const double d = (double) a[i] - b[i];
-                    num += d * d;
-                    den += (double) b[i] * b[i];
-                }
-                return den > 0 ? std::sqrt(num / den) : 0.0;
-            };
-            fprintf(stderr, "xdna-gemv-pair: mid rel %.3e (dev %g %g %g | host %g %g %g), "
-                    "out rel %.3e (pair %g %g %g | ref %g %g %g)\n",
-                    rel(mid_dev, m->mid, (int) m->mid.size()),
-                    mid_dev[0], mid_dev[1], mid_dev[2],
-                    m->mid[0], m->mid[1], m->mid[2],
-                    rel(m->acc, ref, m->n_out),
-                    m->acc[0], m->acc[1], m->acc[2],
-                    ref[0], ref[1], ref[2]);
-        }
-    } else if (m->ffn) {
+    if (m->ffn) {
         if (!xdna_gemv_pair_run(m->ffn, hff, m->acc.data())) {
             return false;
         }

@@ -1,7 +1,7 @@
 #include "xdna-seq.h"
 
 // Per-token TXN stream builder for the merged conv+norm+gdn decode kernel
-// (attn_gdn_txn.xclbin, kernels/attn_gdn_txn.py). With the fused azg_n /
+// (fused_layer.xclbin, kernels/fused_layer.py). With the fused azg_n /
 // out_words geometry it drives attn_gdn_gated.xclbin (kernels/attn_gdn_gated.py)
 // and appends the on-chip gated phase. The emission mirrors the python
 // builders word for word, so the two builders are interchangeable at runtime.
@@ -14,7 +14,7 @@
 static constexpr xdna_dma_dir DIR_MM2S = xdna_dma_dir::MM2S;
 static constexpr xdna_dma_dir DIR_S2MM = xdna_dma_dir::S2MM;
 
-// BD word fields (verified vs the compiled attn_gdn_txn streams): d1 = burst
+// BD word fields (verified against the design's compiled stream): d1 = burst
 // flag only, d2 = ax_cache 2.
 static void emit_bd(xdna_seq * seq, int col, int bd, uint32_t len_words,
                     uint32_t arg, uint32_t byte_off) {
@@ -31,8 +31,7 @@ static void emit_bd(xdna_seq * seq, int col, int bd, uint32_t len_words,
 
 // A strided descriptor: `d1` runs of `d0` words, `d1_stride` words apart. The
 // encoding is the one IRON emits for a two-dimensional TensorAccessPattern -
-// sizes in 32-bit words, strides in words - read back out of a built artifact
-// with kernels/shim_map.py.
+// sizes in 32-bit words, strides in words - read back out of a built artifact.
 static void emit_bd_2d(xdna_seq * seq, int col, int bd, uint32_t arg,
                        uint32_t byte_off, uint32_t d0, uint32_t d1,
                        uint32_t d1_stride) {
@@ -61,7 +60,7 @@ static bool valid_geom(const xdna_attn_gdn_geom * g) {
     return true;
 }
 
-bool xdna_attn_gdn_txn_build(xdna_seq * seq, const xdna_attn_gdn_geom * g,
+bool xdna_attn_gdn_build(xdna_seq * seq, const xdna_attn_gdn_geom * g,
                              int schedule, int phase) {
     // phase < 0 builds the whole token; 0..3 build conv, norm, gdn or the
     // gated epilogue alone. The cores loop forever waiting on their fifos, so
@@ -345,7 +344,7 @@ bool xdna_attn_gdn_txn_build(xdna_seq * seq, const xdna_attn_gdn_geom * g,
     // gg = gdn_cols/sg of the columns. A round is still gdn_cols consecutive
     // chunks, so a stream's half of it is contiguous in the state buffer.
     // Where they sit is what the design pins (kernels/attn_gdn_gated.py) and
-    // what shim_map.py reads back: fills on the state and sout columns, drains
+    // what the artifact pins: fills on the state and sout columns, drains
     // on the same two the other way round.
     const int sg = g->gdn_state_streams > 0 ? g->gdn_state_streams : 1;
     const int gg = gc / sg;
@@ -375,10 +374,7 @@ bool xdna_attn_gdn_txn_build(xdna_seq * seq, const xdna_attn_gdn_geom * g,
                             false, 0);
     }
     // Rounds in flight before waiting; each costs one descriptor per stream.
-    int B = (schedule >= 4) ? 4 : 1;
-    if (const char * be = getenv("GGML_XDNA_GDN_BATCH")) {
-        B = atoi(be);
-    }
+    const int B = (schedule >= 4) ? 4 : 1;
 
     for (int r0 = 0; r0 < gdn_slots; r0 += B) {
         const int nb = std::min(B, gdn_slots - r0);

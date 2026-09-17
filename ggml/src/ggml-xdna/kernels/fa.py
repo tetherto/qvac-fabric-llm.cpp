@@ -76,7 +76,7 @@ QHDR = 16   # int32 of chunk header ahead of a query block (64-byte aligned)
 
 
 def _fa_fns(D: int, MT: int, JT: int, ROWS: int, scale: float):
-    src = (Path(__file__).resolve().parent / "fa.cc").read_text()
+    src = (Path(__file__).resolve().parent / "attn-fa.cc").read_text()
     flags = [f"-DFA_D={D}", f"-DFA_MT={MT}", f"-DFA_JT={JT}",
              f"-DFA_ROWS={ROWS}", f"-DFA_SCALE={scale!r}f", f"-DFA_QHDR={QHDR}"]
     digest = hashlib.sha256((src + "\0".join(flags)).encode()).hexdigest()[:8]

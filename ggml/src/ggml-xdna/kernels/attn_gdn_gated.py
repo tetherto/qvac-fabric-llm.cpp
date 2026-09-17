@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 # attn_gdn_gated.py -*- Python -*-
 #
-# A-half of the fused recurrent layer: the merged conv+norm+gdn design of
-# attn_gdn_txn.py PLUS the rec_gated epilogue tile, all in ONE xclbin / ONE
-# per-token run, with no host attn round trip.  Channel verdict (probe #1): a
-# shim column exposes 2 MM2S + 2 S2MM DMA channels, and the rec_gated tile as
-# written takes 2 MM2S fills (az, gamma) + 1 S2MM drain.  The decoded
-# attn_gdn_txn stream shows only the norm columns (2-3) have spare channels,
+# A-half of the fused recurrent layer: the merged conv+norm+gdn design PLUS the
+# rec_gated epilogue tile, all in ONE xclbin / ONE per-token run, with no host
+# attn round trip.  Channel verdict (probe #1): a shim column exposes 2 MM2S +
+# 2 S2MM DMA channels, and the rec_gated tile as written takes 2 MM2S fills
+# (az, gamma) + 1 S2MM drain.  The decoded stream shows only the norm columns
+# (2-3) have spare channels,
 # and they have exactly one free MM2S (norm x fill owns the other) and one free
 # S2MM.  The allocator therefore rejects a norm-column gated tile fed by az +
 # gamma fills:
@@ -36,10 +36,8 @@
 
 from __future__ import annotations
 
-import argparse
 import os
 import sys
-import time
 from pathlib import Path
 
 import hashlib
@@ -58,16 +56,14 @@ from aie.iron import (
 from aie.iron.device import from_name, Tile
 from aie.helpers.taplib import TensorAccessPattern
 from aie.helpers.dialects.scf import _for as range_
-from aie.utils.hostruntime.argparse import add_compile_args
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import attn_cn  # noqa: E402
 import gdn_v  # noqa: E402
 import rec_gated
 import rec_post  # noqa: E402
-import design_tag
 
-# ---- stage geometry (attn_cn + gdn_v + rec_gated constants) ----------------
+# ---- stage geometry (attn_cn + gdn_v + rec_gated constants) -------------------------
 CH    = attn_cn.CH          # 6144
 S_V   = attn_cn.S_V         # 128
 N_VH  = attn_cn.N_VH        # 16
@@ -114,94 +110,11 @@ GATED_FMT = int(__import__("os").environ.get("GATED_FMT", "1"))
 ACTN   = (1 + K_G // (128 if GATED_FMT == 1 else 256)) * ACT_TILE_G
 OUTN   = ACT_OFF_G + ACTN
 
-_GAHEAD = """#include <stdint.h>
-#include <math.h>
-#include <aie_api/aie.hpp>
-using namespace aie;
-"""
-
-
-def _gated_stub() -> int:
-    """GGML/GEMV-style diagnostic: 1 drops the per-head epilogue, 2 drops the
-    final int8 quantization, 3 drops both. The results are wrong; the point is
-    what the stage costs without them."""
-    return int(__import__("os").environ.get("GATED_STUB", "0"))
+H2_SRC = Path(__file__).resolve().parent / "gated-h2.cc"
 
 
 def _gated_h2_src():
-    # azg per head = [attn 128][z 128][gamma 128][hh] (gamma replicated per
-    # head by the host so the tile needs a single MM2S chain).  Same epilogue
-    # math as rec_gated._gated_src's gated_head, gamma read from the object.
-    return _GAHEAD + """
-#if ATTN_ONCHIP
-extern "C" void gated_h2(uint8_t * out, const float * azg4,
-                         const float * att_lo, const float * att_hi) {
-#else
-extern "C" void gated_h2(uint8_t * out, const float * azg4) {
-#endif
-#if GATED_STUB & 1
-    (void)out; (void)azg4;
-    return;
-#else
-    // One object carries HG heads. The stage is one tile walking them in
-    // order, and with a head per object the fifo handshake, not the
-    // arithmetic, was what it spent its time on: stubbing both of its kernels
-    // left the stage exactly as expensive.
-
-    for (int hj = 0; hj < HG; hj++) {
-    const float * azg = azg4 + hj * AZG_N;
-    const int hh = (int)azg[384];
-    float * gbuf = (float *)out + hh * 128;
-#if ATTN_ONCHIP
-    // The gdn block hands its attn over on chip, a round at a time, so a head
-    // arrives as two objects of NC_GDN chunks. Copying them into one local
-    // array costs eight vector moves and leaves the rest of the kernel - and
-    // the DDR layout it falls back to - exactly as it was.
-    alignas(64) float aloc[128];
-    for (int i = 0; i < 64; i += 16) {
-        aie::store_v(aloc + i,      aie::load_v<16>(att_lo + i));
-        aie::store_v(aloc + 64 + i, aie::load_v<16>(att_hi + i));
-    }
-    const float * a = aloc;
-#else
-    const float * a = azg;
-#endif
-    const float * z = azg + 128;
-    const float * gamma = azg + 256;
-    const auto bc_h = aie::broadcast<float, 16>(0.5f);
-    const auto bc1 = aie::broadcast<bfloat16, 16>(1.0f);
-    // Vector sum of squares; the scalar loop this replaces was 128 dependent
-    // float adds per head.
-    aie::vector<float, 16> sq = aie::zeros<float, 16>();
-    for (int i = 0; i < 128; i += 16) {
-        auto v = aie::load_v<16>(a + i);
-        sq = aie::add(sq, aie::mul(v, v).to_vector<float>());
-    }
-    alignas(64) float sql[16];
-    aie::store_v(sql, sq);
-    float ms = 0.0f;
-    for (int i = 0; i < 16; i++) ms += sql[i];
-    const float rsc = 1.0f / aie::sqrt(ms / 128.0f + 1e-6f);
-    const auto bc_r = aie::broadcast<float, 16>(rsc);
-    for (int i = 0; i < 128; i += 16) {
-        auto a16 = aie::load_v<16>(a + i);
-        auto z16 = aie::load_v<16>(z + i);
-        auto g16 = aie::load_v<16>(gamma + i);
-        auto t16 = aie::mul(z16, bc_h).to_vector<float>();
-        auto thb = aie::tanh(t16);
-        auto th  = aie::mul(thb, bc1).to_vector<float>();
-        auto thh = aie::mul(th, bc_h).to_vector<float>();
-        auto sig = aie::add(thh, bc_h);
-        auto silu = aie::mul(z16, sig).to_vector<float>();
-        auto g1 = aie::mul(a16, bc_r).to_vector<float>();
-        auto g2 = aie::mul(g1, g16).to_vector<float>();
-        aie::vector<float, 16> g = aie::mul(g2, silu).to_vector<float>();
-        aie::store_v(gbuf + i, g);
-    }
-    }
-#endif
-}
-"""
+    return H2_SRC.read_text()
 
 
 # ---- merged conv + norm + gdn + gated design (park workers) ----------------
@@ -245,12 +158,7 @@ def build_core(dev_name: str = "npu2"):
     ATT_T = np.ndarray[(gdn_v.CHUNK,), np.dtype[np.float32]]
     ATT4_T = np.ndarray[(NC_GDN * gdn_v.CHUNK,), np.dtype[np.float32]]
 
-    # STAGE_STUB is a bitmask - 1 conv, 2 norm, 4 gdn - that empties a stage's
-    # kernel so the stage's floor, the part that is data movement rather than
-    # arithmetic, can be measured on its own.
-    stage_stub = int(__import__("os").environ.get("STAGE_STUB", "0"))
-    sflags = ["-O2", "-DNDEBUG", f"-DSTAGE_STUB={stage_stub}",
-              f"-DGDN_NOREDUCE={int(__import__('os').environ.get('GDN_NOREDUCE', '0'))}"]
+    sflags = ["-O2", "-DNDEBUG"]
 
     def _sobj(name: str, src: str, flags: list) -> str:
         # Every kernel here is named for its flags as well as its source.
@@ -275,13 +183,13 @@ def build_core(dev_name: str = "npu2"):
     norm_src_j = [[attn_cn._norm_src(f"normj{gi}_{half}", -1, half * NC_GDN + gi)
                    for half in range(2)] for gi in range(NC_GDN)]
     gdn_src  = gdn_v._kernel_src()
-    conv_k = iron.ExternalFunction(name="convh", source_string=conv_src,
+    conv_k = iron.ExternalFunction(name="ggml_xdna_attn_conv", source_string=conv_src,
                                    arg_types=[FEED_T, X_T, HIST_T],
-                                   object_file_name=_sobj("convh", conv_src, sflags),
+                                   object_file_name=_sobj("ggml_xdna_attn_conv", conv_src, sflags),
                                    compile_flags=sflags, inline=True)
-    norm_k = iron.ExternalFunction(name="normh", source_string=norm_src,
+    norm_k = iron.ExternalFunction(name="ggml_xdna_attn_norm", source_string=norm_src,
                                    arg_types=[HN_T, PKVB_T],
-                                   object_file_name=_sobj("normh", norm_src, sflags),
+                                   object_file_name=_sobj("ggml_xdna_attn_norm", norm_src, sflags),
                                    compile_flags=sflags, inline=True)
     norm_kj = [[iron.ExternalFunction(
                     name=f"normj{gi}_{half}", source_string=norm_src_j[gi][half],
@@ -290,19 +198,18 @@ def build_core(dev_name: str = "npu2"):
                                            norm_src_j[gi][half], sflags),
                     compile_flags=sflags, inline=True)
                 for half in range(2)] for gi in range(NC_GDN)]
-    gdn_k = iron.ExternalFunction(name="gdn_v", source_string=gdn_src,
+    gdn_k = iron.ExternalFunction(name="ggml_xdna_gdn_v", source_string=gdn_src,
                                   arg_types=[PKV_T, ROWS_T, ROWS_T, ATT_T],
-                                  object_file_name=_sobj("gdn_v", gdn_src, sflags),
+                                  object_file_name=_sobj("ggml_xdna_gdn_v", gdn_src, sflags),
                                   compile_flags=sflags, inline=True)
 
     AZG_T = np.ndarray[(HG * AZG_N,), np.dtype[np.float32]]
     OUT_T = np.ndarray[(ACT_OFF_G if act_split else OUTN,), np.dtype[np.uint8]]
     ACTB_T = np.ndarray[(ACTN,), np.dtype[np.uint8]]
-    gflags = ["-O2", "-DNDEBUG", f"-DGATED_STUB={_gated_stub()}",
+    gflags = ["-O2", "-DNDEBUG",
               f"-DHG={HG}", f"-DAZG_N={AZG_N}", f"-DATTN_ONCHIP={int(att_onchip)}",
               f"-DK_GATE={K_G}", f"-DACT_TILE={ACT_TILE_G}",
               f"-DACT_OFF={ACT_OFF_G}", f"-DACT_SPLIT={int(act_split)}",
-              f"-DGATED_ACT={int(__import__('os').environ.get('GATED_ACT', '1'))}",
               f"-DGATED_FMT={GATED_FMT}"]
 
     def _obj(name: str, src: str) -> str:
@@ -325,25 +232,24 @@ def build_core(dev_name: str = "npu2"):
     POSTO_T = np.ndarray[(POST_D * 4 + (1 + POST_NT) * ACT_TILE_G,),
                          np.dtype[np.uint8]]
     post_src = rec_post._kernel_src(POST_D, 256, ACT_TILE_G)
-    pflags = ["-O2", "-DNDEBUG", f"-DGATED_FMT={GATED_FMT}",
-              f"-DPOST_STUB={int(__import__('os').environ.get('POST_STUB', '0'))}"]
+    pflags = ["-O2", "-DNDEBUG", f"-DGATED_FMT={GATED_FMT}"]
     post_k = iron.ExternalFunction(
-        name="post_norm", source_string=post_src,
+        name="ggml_xdna_post_norm", source_string=post_src,
         arg_types=[POSTI_T, POSTO_T],
-        object_file_name=_sobj("post_norm", post_src, pflags),
+        object_file_name=_sobj("ggml_xdna_post_norm", post_src, pflags),
         compile_flags=pflags, inline=True)
 
     h2_src = _gated_h2_src()
     fin_src = rec_gated._gated_src()
-    kh = iron.ExternalFunction(name="gated_h2", source_string=h2_src,
+    kh = iron.ExternalFunction(name="ggml_xdna_gated_h2", source_string=h2_src,
                                arg_types=([OUT_T, AZG_T, ATT4_T, ATT4_T]
                                           if att_onchip else [OUT_T, AZG_T]),
-                               object_file_name=_obj("gated_h2", h2_src),
+                               object_file_name=_obj("ggml_xdna_gated_h2", h2_src),
                                compile_flags=gflags, inline=True)
-    kf = iron.ExternalFunction(name="gated_fin", source_string=fin_src,
+    kf = iron.ExternalFunction(name="ggml_xdna_gated_fin", source_string=fin_src,
                                arg_types=([OUT_T, ACTB_T] if act_split
                                           else [OUT_T]),
-                               object_file_name=_obj("gated_fin", fin_src),
+                               object_file_name=_obj("ggml_xdna_gated_fin", fin_src),
                                compile_flags=gflags, inline=True)
 
     FEED_g = np.ndarray[(NC_CONV * CN_CONV * FEED_N,), np.dtype[np.float32]]
@@ -421,40 +327,6 @@ def build_core(dev_name: str = "npu2"):
                     x23.cons(tile=Tile(CONV_X_COL[col], 0)),
                     h23.cons(tile=Tile(CONV_H_COL[col], 0))]
 
-    # CORE_MIN=1: conv stage only - the smallest useful design, for bisecting
-    # the full-ELF load stall against PDI size.
-    if int(__import__("os").environ.get("CORE_MIN", "0")):
-        def seq_fn_min(FEED, X, PKVB, STATE, AZG, OUT, *fifos):
-            it = iter(fifos)
-            def nxt():
-                return next(it)
-            cfeed, cxdrain, chist = [], [], []
-            for _col in range(NC_CONV):
-                cfeed.append(nxt())
-                cxdrain.append(nxt())
-                chist.append(nxt())
-            for col in range(NC_CONV):
-                for g in range(0, CN_CONV, gpo):
-                    ach = group_base(col, g)
-                    h, r = head_region(ach)
-                    gi = TaskGroup()
-                    cfeed[col].fill(FEED, tap=TensorAccessPattern(
-                        (NC_CONV * CN_CONV * FEED_N,),
-                        offset=(col * CN_CONV + g) * FEED_N,
-                        sizes=[gpo, fslot], strides=[FEED_N, 1]), group=gi)
-                    gi.finish()
-                    go = TaskGroup()
-                    cxdrain[col].drain(X, tap=TensorAccessPattern(
-                        (N_VH * HEAD_NORM,), offset=h * HEAD_NORM + r * S_V,
-                        sizes=[gpo, S_V], strides=[HEAD_NORM, 1]), wait=True,
-                        group=go)
-                    chist[col].drain(FEED, tap=TensorAccessPattern(
-                        (NC_CONV * CN_CONV * FEED_N,),
-                        offset=(col * CN_CONV + g) * FEED_N + F_H,
-                        sizes=[gpo, 3 * S_V], strides=[FEED_N, 1]), wait=True,
-                        group=go)
-                    go.finish()
-        return workers, rt_args, seq_fn_min
 
     # ---- norm: cols NC_CONV..NC_CONV+NC_NORM-1, row 3 ----
     # One stream in and one out for the whole stage rather than one per column.
@@ -735,7 +607,7 @@ def build_core(dev_name: str = "npu2"):
     # and leaves attn unconsumed (gdn then blocks on its attn fifo - the
     # state drains stop, which is itself the answer). Whichever completes
     # names the input the full worker waits on forever.
-    gdiag = int(__import__("os").environ.get("GATED_DIAG", "0"))
+    gdiag = 0
 
     def gated_fn_diag1(ac, tc, oc, qc, kh_, kf_, nh=N_VH // HG):
         # waits on both inputs, calls no compute kernel
@@ -805,8 +677,7 @@ def build_core(dev_name: str = "npu2"):
     # MM2S carries the norm x. The route crosses columns, which costs nothing
     # - it is 32 KB once a layer. GATED_AZ_COL overrides the fill column
     # (the activation drain must then stay off it too - see GACT_COL).
-    az_col = int(__import__("os").environ.get("GATED_AZ_COL",
-                                              str(AZG_COL)))
+    az_col = int(__import__("os").environ.get("GATED_AZ_COL", str(AZG_COL)))
     rt_args += [az3.prod(tile=Tile(az_col, 0)),
                 gt23.cons(tile=Tile(gcol, 0))]
     if act_split:
@@ -815,8 +686,7 @@ def build_core(dev_name: str = "npu2"):
         # a different column must be mirrored there or the drain token never
         # arrives. The azg fill shares the column, so the builder keeps its
         # descriptor apart (fill bd 0 / drain bd 1).
-        gact_col = int(__import__("os").environ.get("GACT_COL",
-                                                    str(AZG_COL)))
+        gact_col = int(__import__("os").environ.get("GACT_COL", str(AZG_COL)))
         rt_args += [ga23.cons(tile=Tile(gact_col, 0))]
 
     # ---- post: col POST_COL, row 2 ----
@@ -824,7 +694,7 @@ def build_core(dev_name: str = "npu2"):
     # its fill/drain) - the diagnostic switch for the full-ELF sequence,
     # which the C++ backend never exercised with this tile enabled (there the
     # transition runs as its own design).
-    post_tile = bool(int(__import__("os").environ.get("POST_TILE", "1")))
+    post_tile = True
     POST_COL = NC_CONV + 1
     pi3 = ObjectFifo(POSTI_T, name="pni3", depth=1)
     pi2 = pi3.cons().forward(obj_type=POSTI_T, name="pni2", depth=1)
@@ -864,9 +734,6 @@ def build_core(dev_name: str = "npu2"):
                         po23.cons(tile=Tile(int(_pd), 0))]
 
     # IRON reference seq mirrors the python mode0 col-major order + gated phase.
-    # CORE_STOP: end the sequence after phase N (1 conv, 2 norm, 3 azg fill,
-    # 4 gdn rounds) - the phase-bisection switch for the full-ELF stall.
-    stop_at = int(__import__("os").environ.get("CORE_STOP", "0"))
 
     def seq_fn(FEED, X, PKVB, STATE, AZG, OUT, *fifos):
         it = iter(fifos)
@@ -916,8 +783,6 @@ def build_core(dev_name: str = "npu2"):
                     offset=(col * CN_CONV + g) * FEED_N + F_H,
                     sizes=[gpo, 3 * S_V], strides=[FEED_N, 1]), wait=True, group=go)
                 go.finish()
-        if stop_at == 1:
-            return
 
         # norm: a round of NC_NORM adjacent heads, one per column - or one head
         # broadcast to every core when the chunks stay on chip.
@@ -935,8 +800,6 @@ def build_core(dev_name: str = "npu2"):
                     (N_VH * PKVB_N,), offset=h * NC_NORM * PKVB_N,
                     sizes=[NC_NORM * PKVB_N], strides=[1]), wait=True, group=go)
                 go.finish()
-        if stop_at == 2:
-            return
 
         # gated phase: the z, gamma and head index of every head. With attn
         # coming over the array this fill has to be in flight *before* the gdn
@@ -948,8 +811,6 @@ def build_core(dev_name: str = "npu2"):
             (N_VH * AZG_N,), offset=0, sizes=[N_VH * AZG_N], strides=[1]),
             group=tg)
         tg.finish()
-        if stop_at == 3:
-            return
 
         # gdn: a round of NC_GDN consecutive chunks per transfer, which the
         # MemTile hands out one chunk per column. Chunk gi + r*NC_GDN still
@@ -979,8 +840,6 @@ def build_core(dev_name: str = "npu2"):
                     sizes=[NC_GDN * gdn_v.CHUNK], strides=[1]), wait=True,
                     group=go)
             go.finish()
-        if stop_at == 4:
-            return
 
         # The post tile's own transfers, filling and draining windows of the
         # gated output buffer the backend points them at.
@@ -1017,525 +876,4 @@ def attn_gdn_gated(*, dev_name: CompileTime[str] = "npu2"):
     workers, rt_args, seq_fn = build_core(dev_name)
     rt = Runtime(seq_fn, rt_args)
     prog = Program(from_name(dev_name, n_cols=GDN_COL0 + NC_GDN), rt, workers)
-    # IRON_TRACE: route hardware tracing to a DDR buffer (appended as a
-    # runtime argument) - the diagnostic for which wait of the full-ELF
-    # sequence never satisfies.
-    if int(__import__("os").environ.get("IRON_TRACE", "0")):
-        # IRON_TRACE_ONE: trace a single worker (index into `workers`) -
-        # the full trace overlay of all workers does not route on this
-        # array (the pathfinder's mastersets collide with the design's
-        # stream-switch connections), and one flow at a time is enough to
-        # find which wait never satisfies.
-        one = __import__("os").environ.get("IRON_TRACE_ONE")
-        traced = [workers[int(one)]] if one is not None else list(workers)
-        for w in traced:
-            if w.trace is None:
-                w.trace = 1
-        # The trace egress needs a shim DMA of its own: column 0 carries the
-        # conv fills, 4-7 the gdn transfers, so 2 (a norm column, no shim
-        # endpoints) is the free one.
-        egress = int(__import__("os").environ.get("IRON_TRACE_COL", "2"))
-        # IRON_TRACE_STALLS: trace only the three stall events - which of
-        # them fires every cycle tells what a stalled worker waits on
-        # (memory / stream / lock).
-        stalls = bool(int(__import__("os").environ.get(
-            "IRON_TRACE_STALLS", "0")))
-        stall_events = None
-        if stalls:
-            from aie.dialects.aie import CoreEventAIE2P
-            stall_events = [CoreEventAIE2P.MEMORY_STALL,
-                            CoreEventAIE2P.STREAM_STALL,
-                            CoreEventAIE2P.LOCK_STALL]
-        prog.enable_trace(
-            trace_size=262144, workers=traced, egress_shim_col=egress,
-            coretile_events=stall_events)
     return prog.resolve_program()
-
-
-# ---- TXN builder (mirror of the C++ xdna-seq-attn.cpp fused schedule) -------
-
-SZ_W = {0x00: 6, 0x01: 12, 0x03: 7, 0x80: 4, 0x81: 12}
-SHIM_BD_BASE = 0x1D000
-SHIM_PUSHQ_BASE = 0x1D204
-SHIM_TOKEN_BASE = 0x1D200
-NCOL_MERGED = GDN_COL0 + NC_GDN   # 8
-
-
-def tile_reg(col, row, reg):
-    return ((col & 0x7F) << 25) | ((row & 0x1F) << 20) | (reg & 0xFFFFF)
-
-
-class Txn:
-    def __init__(self, n_cols):
-        self.n_cols = n_cols
-        self.ops = []
-
-    def write(self, col, row, reg, val):
-        self.ops += [0x00, 0, tile_reg(col, row, reg), 0, val, SZ_W[0x00] * 4]
-
-    def blockwrite(self, col, row, bd, blen, boff, d0, d1, d2, it):
-        self.ops += [0x01, 0, tile_reg(col, row, SHIM_BD_BASE + bd * 0x20),
-                     SZ_W[0x01] * 4, blen, boff, 0, d0, d1, d2, it,
-                     (1 << 25)]
-
-    def ddr_patch(self, col, row, bd, arg_idx, arg_off):
-        self.ops += [0x81, SZ_W[0x81] * 4, 0, 0, 0, 0,
-                     tile_reg(col, row, SHIM_BD_BASE + bd * 0x20 + 4), 0,
-                     arg_idx, 0, arg_off, 0]
-
-    def maskwrite(self, col, row, reg, val, mask):
-        self.ops += [0x03, 0, tile_reg(col, row, reg), 0, val, mask,
-                     SZ_W[0x03] * 4]
-
-    def push_queue(self, col, row, bd, dma_dir, channel, issue_token, repeat=0):
-        reg = SHIM_PUSHQ_BASE + (0x8 if channel > 0 else 0) + \
-              (0x10 if dma_dir else 0)
-        val = bd | (repeat << 16)
-        if issue_token:
-            val |= 0x80000000
-        self.write(col, row, reg, val)
-
-    def issue_token(self, col, row, dma_dir, channel):
-        reg = SHIM_TOKEN_BASE + channel * 0x8 + (0x10 if dma_dir else 0)
-        self.maskwrite(col, row, reg, 0xF << 8, 0x1F00)
-
-    def wait_token(self, col, row, dma_dir, channel):
-        self.ops += [0x80, SZ_W[0x80] * 4,
-                     (row & 0xFF) << 8 | (col & 0xFF) << 16 |
-                     (1 if dma_dir else 0),
-                     (channel & 0xFF) << 24 | 0x00010100]
-
-    def build(self):
-        ops = self.ops
-        ninstr = 0
-        i = 0
-        while i < len(ops):
-            op = ops[i]
-            if op in SZ_W:
-                ninstr += 1
-                i += SZ_W[op]
-            else:
-                raise SystemExit(f"attn_gdn_gated: malformed op stream at word {i}")
-        out = [(6 << 24) | (4 << 16) | (1 << 8) | 0,
-               self.n_cols | (1 << 8),
-               ninstr,
-               (4 + len(ops)) * 4]
-        out += ops
-        return np.array(out, dtype=np.uint32)
-
-
-# Per-fifo endpoint -> shim (dma_dir, channel, bd_id, arg) maps matching the
-# IRON-compiled attn_gdn_gated columns (verified against the decoded stream):
-# conv cols 0-1 (MM2S ch0 feed, S2MM ch1 x, S2MM ch0 hist), norm cols 2-3
-# (MM2S ch0 x, S2MM ch0 pkvb), gdn cols 4-7 (MM2S ch0 pkv, MM2S ch1 state,
-# S2MM ch1 state, S2MM ch0 attn->azg) and the gated tile on col 2 (MM2S ch1
-# azg fill, S2MM ch1 out drain). MM2S = 1 (host -> device), S2MM = 0.
-EP_CV_FEED = {"dir": 1, "ch": 0, "bd": 0, "arg": 0}
-EP_CV_X    = {"dir": 0, "ch": 1, "bd": 0, "arg": 1}
-EP_CV_HIST = {"dir": 0, "ch": 0, "bd": 1, "arg": 0}
-EP_NM_X    = {"dir": 1, "ch": 0, "bd": 0, "arg": 1}
-EP_NM_PKVB = {"dir": 0, "ch": 0, "bd": 0, "arg": 2}
-EP_GD_PKV  = {"dir": 1, "ch": 0, "bd": 0, "arg": 2}
-EP_GD_STATE= {"dir": 1, "ch": 1, "bd": 1, "arg": 3}
-EP_GD_OUT  = {"dir": 0, "ch": 1, "bd": 0, "arg": 3}
-EP_GD_AZG  = {"dir": 0, "ch": 0, "bd": 1, "arg": 4}
-EP_GT_AZG  = {"dir": 1, "ch": 1, "bd": 0, "arg": 4}
-EP_GT_OUT  = {"dir": 0, "ch": 1, "bd": 0, "arg": 5}
-
-
-def ga_head_region(ga):
-    return ga % 16, ga // 16
-
-
-def build_attn_gdn_gated_stream(mode=4):
-    """Per-token TXN stream for attn_gdn_gated.xclbin (6 BOs: arg0 feed, arg1
-    x, arg2 pkvb, arg3 state bf16, arg4 azg, arg5 out). Byte offsets:
-      conv/hist/norm identical to attn_gdn_txn;
-      gdn azg chunk c (head,j): attn lanes at (head*AZG_N + j*CHUNK)*4;
-      gated: azg heads filled from arg4 (attn lanes written by gdn above),
-      out drained to arg5.
-    Phases run in time: conv cols0-1, norm cols2-3, gdn cols4-7, gated col2.
-    mode 0: col-major per phase; 1: slot-major; 2/4: phased groups."""
-    t = Txn(NCOL_MERGED)
-
-    def conv_fill(col, ga):
-        e = EP_CV_FEED
-        t.blockwrite(col, 0, e["bd"], FEED_N, ga * FEED_N * 4, 0, 0xC0000000,
-                     0x2000000, 0)
-        t.ddr_patch(col, 0, e["bd"], e["arg"], ga * FEED_N * 4)
-        t.push_queue(col, 0, e["bd"], e["dir"], e["ch"], False)
-
-    def conv_drain_issue(col, ga):
-        x = EP_CV_X
-        h, r = ga_head_region(ga)
-        xoff = (h * HEAD_NORM + r * S_V) * 4
-        t.blockwrite(col, 0, x["bd"], S_V, xoff, 0, 0xC0000000, 0x2000000, 0)
-        t.ddr_patch(col, 0, x["bd"], x["arg"], xoff)
-        t.issue_token(col, 0, x["dir"], x["ch"])
-        t.push_queue(col, 0, x["bd"], x["dir"], x["ch"], True)
-        hh = EP_CV_HIST
-        t.blockwrite(col, 0, hh["bd"], 3 * S_V, ga * FEED_N * 4, 0,
-                     0xC0000000, 0x2000000, 0)
-        t.ddr_patch(col, 0, hh["bd"], hh["arg"], ga * FEED_N * 4)
-        t.issue_token(col, 0, hh["dir"], hh["ch"])
-        t.push_queue(col, 0, hh["bd"], hh["dir"], hh["ch"], True)
-
-    def conv_wait(col):
-        t.wait_token(col, 0, EP_CV_X["dir"], EP_CV_X["ch"])
-        t.wait_token(col, 0, EP_CV_HIST["dir"], EP_CV_HIST["ch"])
-
-    def norm_fill(col, head):
-        e = EP_NM_X
-        t.blockwrite(col, 0, e["bd"], HEAD_NORM, head * HEAD_NORM * 4, 0,
-                     0xC0000000, 0x2000000, 0)
-        t.ddr_patch(col, 0, e["bd"], e["arg"], head * HEAD_NORM * 4)
-        t.push_queue(col, 0, e["bd"], e["dir"], e["ch"], False)
-
-    def norm_drain_issue(col, head):
-        e = EP_NM_PKVB
-        t.blockwrite(col, 0, e["bd"], PKVB_N, head * PKVB_N * 4, 0, 0xC0000000,
-                     0x2000000, 0)
-        t.ddr_patch(col, 0, e["bd"], e["arg"], head * PKVB_N * 4)
-        t.issue_token(col, 0, e["dir"], e["ch"])
-        t.push_queue(col, 0, e["bd"], e["dir"], e["ch"], True)
-
-    def norm_wait(col):
-        t.wait_token(col, 0, EP_NM_PKVB["dir"], EP_NM_PKVB["ch"])
-
-    def gdn_fill(col, c):
-        e = EP_GD_PKV
-        t.blockwrite(col, 0, e["bd"], PKV_N, c * PKV_N * 4, 0, 0xC0000000,
-                     0x2000000, 0)
-        t.ddr_patch(col, 0, e["bd"], e["arg"], c * PKV_N * 4)
-        t.push_queue(col, 0, e["bd"], e["dir"], e["ch"], False)
-        st = EP_GD_STATE
-        t.blockwrite(col, 0, st["bd"], gdn_v.ROWS // 2, c * gdn_v.ROWS * 2, 0,
-                     0xC0000000, 0x2000000, 0)
-        t.ddr_patch(col, 0, st["bd"], st["arg"], c * gdn_v.ROWS * 2)
-        t.push_queue(col, 0, st["bd"], st["dir"], st["ch"], False)
-
-    def gdn_drain(col, c):
-        ou = EP_GD_OUT
-        t.blockwrite(col, 0, ou["bd"], gdn_v.ROWS // 2, c * gdn_v.ROWS * 2, 0,
-                     0xC0000000, 0x2000000, 0)
-        t.ddr_patch(col, 0, ou["bd"], ou["arg"], c * gdn_v.ROWS * 2)
-        t.issue_token(col, 0, ou["dir"], ou["ch"])
-        t.push_queue(col, 0, ou["bd"], ou["dir"], ou["ch"], True)
-        az = EP_GD_AZG
-        head = c // N_OBJ
-        j = c % N_OBJ
-        aoff = (head * AZG_N + j * gdn_v.CHUNK) * 4
-        t.blockwrite(col, 0, az["bd"], gdn_v.CHUNK, aoff, 0, 0xC0000000,
-                     0x2000000, 0)
-        t.ddr_patch(col, 0, az["bd"], az["arg"], aoff)
-        t.issue_token(col, 0, az["dir"], az["ch"])
-        t.push_queue(col, 0, az["bd"], az["dir"], az["ch"], True)
-        t.wait_token(col, 0, ou["dir"], ou["ch"])
-        t.wait_token(col, 0, az["dir"], az["ch"])
-
-    def gated_phase():
-        g = EP_GT_AZG
-        t.blockwrite(GATED_COL, 0, g["bd"], N_VH * AZG_N, 0, 0, 0xC0000000,
-                     0x2000000, 0)
-        t.ddr_patch(GATED_COL, 0, g["bd"], g["arg"], 0)
-        t.push_queue(GATED_COL, 0, g["bd"], g["dir"], g["ch"], False)
-        o = EP_GT_OUT
-        t.blockwrite(GATED_COL, 0, o["bd"], OUTN // 4, 0, 0, 0xC0000000,
-                     0x2000000, 0)
-        # arg5 out: IRON patches the drain address with bit31 set; without it
-        # the firmware drains the wrong target and the out BO stays zero.
-        t.ddr_patch(GATED_COL, 0, o["bd"], o["arg"], 0x80000000)
-        t.issue_token(GATED_COL, 0, o["dir"], o["ch"])
-        t.push_queue(GATED_COL, 0, o["bd"], o["dir"], o["ch"], True)
-        t.wait_token(GATED_COL, 0, o["dir"], o["ch"])
-
-    gp = NC_CONV * CN_CONV // NC_CONV  # 24 conv groups per conv col
-    hp = N_VH // NC_NORM          # 8 heads per norm col
-    slots = N_VH * N_OBJ // NC_GDN  # 32 chunk objects per gdn col
-    group = 1 if mode == 1 else 2
-
-    # conv phase (cols 0..1)
-    if mode == 0:
-        for col in range(NC_CONV):
-            for s in range(gp):
-                t.blockwrite(col, 0, EP_CV_FEED["bd"], FEED_N,
-                             (col * gp + s) * FEED_N * 4, 0, 0xC0000000,
-                             0x2000000, 0)
-                t.ddr_patch(col, 0, EP_CV_FEED["bd"], EP_CV_FEED["arg"],
-                            (col * gp + s) * FEED_N * 4)
-                t.push_queue(col, 0, EP_CV_FEED["bd"], 1, 0, False)
-                conv_drain_issue(col, col * gp + s)
-                conv_wait(col)
-    else:
-        for g0 in range(0, gp, group):
-            for s in range(g0, min(g0 + group, gp)):
-                for col in range(NC_CONV):
-                    conv_fill(col, col * gp + s)
-            for s in range(g0, min(g0 + group, gp)):
-                for col in range(NC_CONV):
-                    conv_drain_issue(col, col * gp + s)
-            for s in range(g0, min(g0 + group, gp)):
-                for col in range(NC_CONV):
-                    conv_wait(col)
-
-    # norm phase (cols 2..3)
-    if mode == 0:
-        for j in range(NC_NORM):
-            for hs in range(hp):
-                t.blockwrite(NC_CONV + j, 0, EP_NM_X["bd"], HEAD_NORM,
-                             (j * hp + hs) * HEAD_NORM * 4, 0, 0xC0000000,
-                             0x2000000, 0)
-                t.ddr_patch(NC_CONV + j, 0, EP_NM_X["bd"], EP_NM_X["arg"],
-                            (j * hp + hs) * HEAD_NORM * 4)
-                t.push_queue(NC_CONV + j, 0, EP_NM_X["bd"], 1, 0, False)
-                norm_drain_issue(NC_CONV + j, j * hp + hs)
-                norm_wait(NC_CONV + j)
-    else:
-        for h0 in range(0, hp, group):
-            for hs in range(h0, min(h0 + group, hp)):
-                for j in range(NC_NORM):
-                    norm_fill(NC_CONV + j, j * hp + hs)
-            for hs in range(h0, min(h0 + group, hp)):
-                for j in range(NC_NORM):
-                    norm_drain_issue(NC_CONV + j, j * hp + hs)
-            for hs in range(h0, min(h0 + group, hp)):
-                for j in range(NC_NORM):
-                    norm_wait(NC_CONV + j)
-
-    # gdn phase (cols 4..7)
-    if mode == 0:
-        for gi in range(NC_GDN):
-            for s in range(slots):
-                gdn_fill(GDN_COL0 + gi, gi + s * NC_GDN)
-                gdn_drain(GDN_COL0 + gi, gi + s * NC_GDN)
-    else:
-        for g0 in range(0, slots, group):
-            for s in range(g0, min(g0 + group, slots)):
-                for gi in range(NC_GDN):
-                    gdn_fill(GDN_COL0 + gi, gi + s * NC_GDN)
-            for s in range(g0, min(g0 + group, slots)):
-                for gi in range(NC_GDN):
-                    gdn_drain(GDN_COL0 + gi, gi + s * NC_GDN)
-
-    # gated phase (col 2), after every gdn drain waited
-    gated_phase()
-    return t.build()
-
-
-def main():
-    ap = argparse.ArgumentParser(prog="attn_gdn_gated")
-    add_compile_args(ap)
-    ap.add_argument("--run", action="store_true")
-    ap.add_argument("--real", action="store_true")
-    ap.add_argument("--workdir", type=str, default="build/bin")
-    ap.add_argument("--tag", default=None)
-    ap.add_argument("--ntok", type=int, default=3)
-    ap.add_argument("--model",
-                    default="/home/asherstnev/.cache/llama.cpp/qwen3.5-0.8b-bf16.gguf")
-    opts = ap.parse_args()
-    if opts.dev is None:
-        opts.dev = "npu2"
-    if opts.tag is None:
-        opts.tag = time.strftime("agg_%H%M%S")
-    wd = os.path.join(opts.workdir, opts.tag)
-    os.makedirs(wd, exist_ok=True)
-    base = os.path.join(wd, "attn_gdn_gated")
-    t0 = time.time()
-    spec = attn_gdn_gated.specialize(dev_name=opts.dev)
-    xclbin_path, insts_path = spec.compile(xclbin_path=base + ".xclbin",
-                                           inst_path=base + ".insts.bin")
-    print(f"compiled {xclbin_path} ({time.time()-t0:.0f}s)")
-    design_tag.stamp(xclbin_path, insts_path, opts.dev or "")
-    print("xclbin", xclbin_path)
-    print(f"tag={opts.tag}")
-    if not opts.run:
-        return
-    run_validation(opts, xclbin_path)
-
-
-def run_validation(opts, xclbin_path):
-    """Standalone device check of the fused kernel vs the fp64 scalar layer
-    trajectory (gdn_v/check_real semantics).  Drives attn_gdn_gated.xclbin with
-    the host-built mode-2 stream, uploads feed/x/azg like xdna-rec.cpp, and for
-    each token diffs (a) the azg attn lanes against the scalar gdn attn and
-    (b) the device aq/d_a against rec_gated.host_gated(attn_scalar, z, gamma)."""
-    import pyxrt as xrt
-    from ml_dtypes import bfloat16
-
-    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-    sys.path.insert(0, "/home/asherstnev/Work/qvac-fabric-llm.cpp/ggml/src/"
-                       "ggml-xdna/kernels")
-    from ref_delta_layer import N_KH, QKVD, D, load_layer, rms_norm, silu
-    from check_real import load_reader, load_embed
-    from rec_gated import host_gated, N_VH as _NVR
-
-    if os.environ.get("AGTX_IRON_WORDS"):
-        ip = Path(str(xclbin_path)).with_suffix(".insts.bin")
-        if os.environ.get("AGTX_IRON_FILE"):
-            ip = Path(os.environ["AGTX_IRON_FILE"])
-        words = np.frombuffer(ip.read_bytes(), dtype=np.uint32)
-        print(f"using IRON words ({len(words)})")
-    else:
-        words = build_attn_gdn_gated_stream(mode=2)
-        print(f"using host words ({len(words)})")
-
-    dev = xrt.device(0)
-    xb = xrt.xclbin(str(xclbin_path))
-    dev.register_xclbin(xb)
-    ctx = xrt.hw_context(dev, xb.get_uuid())
-    kernel = xrt.kernel(ctx, xb.get_kernels()[0].get_name())
-    insts_bo = xrt.bo(dev, words.nbytes, xrt.bo.cacheable, kernel.group_id(1))
-    np.frombuffer(insts_bo.map(), dtype=np.uint32)[:] = words
-    insts_bo.sync(xrt.xclBOSyncDirection.XCL_BO_SYNC_BO_TO_DEVICE)
-
-    def mk_bo(arr, ro=False):
-        bo = xrt.bo(dev, arr.nbytes, xrt.bo.host_only, 0)
-        if not ro:
-            np.frombuffer(bo.map(), dtype=np.uint8)[:] = \
-                np.ascontiguousarray(arr).view(np.uint8).reshape(-1)
-            bo.sync(xrt.xclBOSyncDirection.XCL_BO_SYNC_BO_TO_DEVICE)
-        return bo
-
-    reader = load_reader(opts.model)
-    W = load_layer(reader, 0)
-    scale = np.float32(1.0 / np.sqrt(S_V))
-    gamma = W["ssm_norm"].astype(np.float64)
-
-    tokens = list(range(5, 5 + opts.ntok))
-    if opts.real:
-        h_in = [load_embed(reader, tk).astype(np.float32) for tk in tokens]
-    else:
-        rng = np.random.default_rng(3)
-        h_in = [rng.standard_normal(D).astype(np.float32) for _ in tokens]
-
-    def proj(h):
-        cur = rms_norm(h, W["attn_norm"])
-        qkv = cur @ W["wqkv"]
-        z = cur @ W["z_gate"]
-        alpha = cur @ W["alpha"]
-        beta_raw = cur @ W["beta"]
-        gate = np.log1p(np.exp(-np.abs(alpha + W["dt"]))) + \
-            np.maximum(alpha + W["dt"], 0.0)
-        gate = gate * W["a"]
-        beta = 1.0 / (1.0 + np.exp(-beta_raw))
-        return qkv, z, np.exp(gate).astype(np.float32), beta.astype(np.float32)
-
-    Wcv = W["conv"]
-
-    def block_chan_base(b):
-        return (b // CN_CONV) * (CN_CONV * S_V) + (b % CN_CONV) * S_V
-
-    feed0 = np.zeros(NC_CONV * CN_CONV * FEED_N, dtype=np.float32)
-    for b in range(NC_CONV * CN_CONV):
-        for ch in range(S_V):
-            ach = block_chan_base(b) + ch
-            feed0[b * FEED_N + F_W + 4 * ch: b * FEED_N + F_W + 4 * ch + 4] = \
-                Wcv[:, ach]
-
-    feed_bo = mk_bo(feed0)
-    x_bo = mk_bo(np.zeros(N_VH * HEAD_NORM, dtype=np.float32))
-    pkvb_bo = mk_bo(np.zeros(N_VH * PKVB_N, dtype=np.float32))
-    state_bo = mk_bo(np.zeros(STATE_N, dtype=bfloat16))
-    azg = np.zeros(N_VH * AZG_N, dtype=np.float32)
-    for h in range(N_VH):
-        azg[h * AZG_N + 2 * S_V:h * AZG_N + 3 * S_V] = gamma[:S_V]
-        azg[h * AZG_N + 3 * S_V] = float(h)
-    azg_bo = mk_bo(azg, ro=True)
-    out_bo = mk_bo(np.zeros(OUTN, dtype=np.uint8), ro=True)
-
-    hist = np.zeros((3, QKVD), dtype=np.float32)
-    feed = feed0.copy()
-
-    def step_dev(qkv, z, eg, beta_s):
-        nonlocal feed, hist
-        for b in range(NC_CONV * CN_CONV):
-            ach0 = block_chan_base(b)
-            hslice = feed[b * FEED_N + F_H: b * FEED_N + F_H + 3 * S_V]
-            for tap in range(3):
-                hslice[tap::3] = hist[tap, ach0:ach0 + S_V]
-            feed[b * FEED_N + F_Q: b * FEED_N + F_Q + S_V] = \
-                qkv[ach0:ach0 + S_V]
-        np.frombuffer(feed_bo.map(), dtype=np.uint8)[:] = \
-            np.ascontiguousarray(feed).view(np.uint8).reshape(-1)
-        feed_bo.sync(xrt.xclBOSyncDirection.XCL_BO_SYNC_BO_TO_DEVICE)
-        X = np.zeros(N_VH * HEAD_NORM, dtype=np.float32)
-        for hh in range(N_VH):
-            X[hh * HEAD_NORM + 3 * S_V:(hh + 1) * HEAD_NORM] = \
-                [eg[hh], beta_s[hh], scale]
-        np.frombuffer(x_bo.map(), dtype=np.uint8)[:] = \
-            np.ascontiguousarray(X).view(np.uint8).reshape(-1)
-        x_bo.sync(xrt.xclBOSyncDirection.XCL_BO_SYNC_BO_TO_DEVICE)
-        for h in range(N_VH):
-            azg[h * AZG_N + S_V:h * AZG_N + 2 * S_V] = \
-                z[h * S_V:(h + 1) * S_V].astype(np.float32)
-        np.frombuffer(azg_bo.map(), dtype=np.uint8)[:] = \
-            np.ascontiguousarray(azg).view(np.uint8).reshape(-1)
-        azg_bo.sync(xrt.xclBOSyncDirection.XCL_BO_SYNC_BO_TO_DEVICE)
-        run = kernel(3, insts_bo, int(words.nbytes), feed_bo, x_bo, pkvb_bo,
-                     state_bo, azg_bo, out_bo)
-        if run.wait() != xrt.ert_cmd_state.ERT_CMD_STATE_COMPLETED:
-            sys.exit("attn_gdn_gated run failed")
-        conv_in = np.concatenate([hist, qkv[None, :]], axis=0)
-        hist = conv_in[1:, :].copy()
-
-    from gdn_v import scalar_chunk
-    S_ref = np.zeros((N_VH, S_V, S_V), dtype=np.float32)
-    print(f"== attn_gdn_gated: {len(tokens)} tokens layer 0 (tokens {tokens}) ==")
-    for t in range(len(tokens)):
-        qkv, z, eg, beta_s = proj(h_in[t])
-        conv_in = np.concatenate([hist, qkv[None, :]], axis=0)
-        step_dev(qkv, z, eg, beta_s)
-
-        # scalar reference: host conv (same history) + fp32 gdn recursion
-        x = silu(np.sum(Wcv * conv_in, axis=0).astype(np.float32))
-        qf = x[0:2048].reshape(N_KH, S_V)
-        kf = x[2048:4096].reshape(N_KH, S_V)
-        vf = x[4096:6144].reshape(N_VH, S_V)
-        qn = np.stack([q / np.linalg.norm(q) for q in qf])
-        kn = np.stack([k / np.linalg.norm(k) for k in kf])
-        attn_ref = np.zeros((N_VH, S_V), dtype=np.float32)
-        A_new = np.zeros_like(S_ref)
-        for h in range(N_VH):
-            p = np.zeros(PKV_N, dtype=np.float32)
-            p[0:S_V] = kn[h]
-            p[S_V:2 * S_V] = qn[h]
-            p[3 * S_V:3 * S_V + 3] = [eg[h], beta_s[h], scale]
-            for j in range(N_OBJ):
-                pp = p.copy()
-                pp[2 * S_V:2 * S_V + gdn_v.CHUNK] = vf[h][j * gdn_v.CHUNK:(j + 1) * gdn_v.CHUNK]
-                sout, attn = scalar_chunk(
-                    pp, S_ref[h, j * gdn_v.CHUNK:(j + 1) * gdn_v.CHUNK])
-                A_new[h, j * gdn_v.CHUNK:(j + 1) * gdn_v.CHUNK] = sout
-                attn_ref[h, j * gdn_v.CHUNK:(j + 1) * gdn_v.CHUNK] = attn
-        S_ref = A_new
-
-        # device readbacks
-        azg_bo.sync(xrt.xclBOSyncDirection.XCL_BO_SYNC_BO_FROM_DEVICE)
-        azg_dev = np.frombuffer(azg_bo.map(), dtype=np.float32)[:N_VH * AZG_N]
-        attn_dev = np.zeros(N_VH * S_V, dtype=np.float32)
-        for h in range(N_VH):
-            attn_dev[h * S_V:(h + 1) * S_V] = \
-                azg_dev[h * AZG_N:h * AZG_N + S_V]
-        out_bo.sync(xrt.xclBOSyncDirection.XCL_BO_SYNC_BO_FROM_DEVICE)
-        ob = np.frombuffer(out_bo.map(), dtype=np.uint8)[:]
-        aq_dev = ob[K_G * 4:K_G * 4 + K_G].copy().view(np.int8)
-        da_dev = np.frombuffer(ob[K_G * 4 + K_G:K_G * 4 + K_G + 4].copy(),
-                               dtype=np.float32)[0]
-
-        attn_sc = attn_ref.reshape(-1)
-        ea = np.abs(attn_dev - attn_sc).max()
-        _, aq_ref, da_ref = host_gated(attn_sc.astype(np.float64),
-                                       z.astype(np.float64), gamma)
-        nmis = int(np.count_nonzero(aq_dev != aq_ref))
-        scratch = np.frombuffer(ob[:K_G * 4].copy(), dtype=np.float32)
-        print(f"t={t}: attn max_abs vs scalar = {ea:.3e}   "
-              f"d_a dev={da_dev:.6e} ref={da_ref:.6e}   "
-              f"aq mismatches={nmis}/{K_G}")
-        print(f"    scratch max={np.abs(scratch).max():.3e} "
-              f"rms={np.sqrt(np.mean(scratch*scratch)):.3e} "
-              f"aq_dev nonzero={int(np.count_nonzero(aq_dev))}")
-    print(f"== done ({opts.ntok} tokens) ==")
-
-
-if __name__ == "__main__":
-    main()

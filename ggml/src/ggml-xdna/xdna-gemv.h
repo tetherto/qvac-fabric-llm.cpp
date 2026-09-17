@@ -1,7 +1,7 @@
 #pragma once
 
 // Decode GEMV on the NPU: one activation row against packed quantized weights
-// (kernels/gemv_q4.py + gemv_q4.cc). The group parameters are applied to the
+// (kernels/gemv_q4.py + kernels/gemv-q4.cc). The group parameters are applied to the
 // accumulator rather than materialising bf16 weights, so the weight stream
 // stays at 0.75 B/value (q4g32) or 1.25 B/value (q8g16) and the arithmetic is
 // exact apart from one f32 rescale per 32 values of K.
@@ -148,6 +148,10 @@ struct xdna_gemv_geom {
 
 // Output chunks one dispatch can carry, limited by the shim descriptor ids.
 int xdna_gemv_max_chunks(void);
+
+// Artifact stem of the design one array split runs on. The warm path needs it
+// before any geometry is known; the geometry's own stem() derives from it.
+std::string xdna_gemv_stem(xdna_gemv_split split);
 
 // Build the instruction stream for `geom`: one linear weight descriptor per
 // column, the count header, then an activation and an output descriptor per
@@ -300,7 +304,6 @@ struct xdna_gemv_pair {
     size_t o_tail_off = 0;        // where the output sits when it has no argument
 
     std::vector<uint8_t> host_a;  // staging for g1's activation only
-    std::vector<uint32_t> insts;  // the stream, for the rebind probe
     xrt::run run;
 };
 
@@ -356,17 +359,11 @@ bool xdna_gemv_pair_raw_act(const xdna_gemv_pair * p);
 struct xdna_buffer * xdna_gemv_pair_act_buf(xdna_gemv_pair * p);
 struct xdna_buffer * xdna_gemv_pair_w_buf(xdna_gemv_pair * p);
 struct xdna_buffer * xdna_gemv_pair_h_buf(xdna_gemv_pair * p);
-// True when this build expects the prologue's second input to be fed.
-bool xdna_gemv_act_pro_h(void);
 size_t xdna_gemv_pair_o_tail(const xdna_gemv_pair * p);
 // Identifies the pair's two geometries, for naming a stream that contains it.
 std::string xdna_gemv_pair_key(const xdna_gemv_pair * p);
 int xdna_gemv_pair_k_tile(const xdna_gemv_pair * p);
 int xdna_gemv_pair_n_tiles(const xdna_gemv_pair * p);
-
-// Decode the activation the first dispatch wrote into the second's buffer, so
-// the handover can be checked against what the host would have packed.
-bool xdna_gemv_pair_read_mid(xdna_gemv_pair * p, std::vector<float> & mid);
 
 // Run one decode token: quantize `act` (K floats) to int8 with a scale per
 // group, run the kernel and write `out` (N floats). Returns false on failure.
@@ -379,7 +376,7 @@ bool xdna_gemv_pair_read_mid(xdna_gemv_pair * p, std::vector<float> & mid);
 //
 // int8 and not int16: the code width is the multiply's operand width, and the
 // q4g32 dispatches are limited by the multiply rather than the weight stream.
-// See gemv_q4.cc.
+// See gemv-q4.cc.
 bool xdna_gemv_run(xdna_gemv * g, const float * act, float * out);
 
 // The same, with the activation already in the tile layout - written by

@@ -51,7 +51,7 @@ from aie.utils.verify import assert_pass
 
 from wfmt import Q4_GROUP, Q8_GROUP, group_size, split_pairs
 
-PERM_ONLY = bool(__import__("os").environ.get("GEMV_PERM_ONLY"))
+PERM_ONLY = False
 CORES_PER_COL = 4
 # Which compute rows of a column the design places its cores on. Rows 2..5 are
 # the compute rows of an AIE2P column (0 is shim, 1 is mem). The default takes
@@ -61,11 +61,8 @@ CORES_PER_COL = 4
 ROWS_ALL = "2,3,4,5"
 # Columns one multiply covers. AIE2P's int8 datapath is 64 lanes wide, so a
 # core at least that many columns wide builds at 64 and does twice the work per
-# multiply; a narrower one has to stay at 32. GEMV_VEC overrides it.
+# multiply; a narrower one has to stay at 32.
 def vec_for(n_core: int) -> int:
-    forced = int(__import__("os").environ.get("GEMV_VEC", "0"))
-    if forced:
-        return forced
     return 64 if n_core >= 64 else 32
 
 
@@ -102,7 +99,7 @@ def act_bytes(k_tile: int, fmt: str) -> int:
 
 
 def _kernels(fmt: str, k_tile: int, n_core: int):
-    src = (Path(__file__).resolve().parent / "gemv_q4.cc").read_text()
+    src = (Path(__file__).resolve().parent / "gemv-q4.cc").read_text()
     # The kernel's tile size has to be the one the design streams. Taking it
     # from the table instead of the argument silently mismatched whenever
     # --k-tile was given, which reads as a device fault rather than a build
@@ -113,16 +110,11 @@ def _kernels(fmt: str, k_tile: int, n_core: int):
              f"-DACT_TILE={ACT_TILE}", f"-DN_CORE={n_core}",
              f"-DQ4_GROUP={Q4_GROUP}", f"-DQ8_GROUP={Q8_GROUP}",
              f"-DGEMV_VEC={vec_for(n_core)}",
-             f"-DGEMV_STUB={int(__import__('os').environ.get('GEMV_STUB', '0'))}",
              # ACT_RAW builds the per-tile quantizer into the core (gemv_q4.cc),
              # so a producer on the array can hand this dispatch numbers rather
              # than codes. It costs about a kilobyte of a program memory that is
              # already full, so it is off unless a design asks for it.
              f"-DACT_RAW={int(__import__('os').environ.get('ACT_RAW', '0'))}"]
-    if __import__("os").environ.get("GEMV_SILU_ID"):
-        flags.append("-DSILU_IDENTITY")
-    if _silu_step():
-        flags.append(f"-DSILU_STEP={_silu_step()}")
 
     # The prologue is a build of its own: its quantizer is about a kilobyte of
     # program memory and the GEMV cores have none spare, so it is linked into
@@ -138,23 +130,23 @@ def _kernels(fmt: str, k_tile: int, n_core: int):
     o_ty = np.ndarray[(n_core,), np.dtype[np.float32]]
     a_raw_ty = np.ndarray[(act_bytes(k_tile, fmt) // 4,), np.dtype[np.int32]]
     pro_tile = ExternalFunction(
-        "act_pro_tile",
+        "ggml_xdna_act_pro",
         object_file_name=f"actpro_{n_core}_{pdigest}.o",
         source_string=src,
         arg_types=[a_raw_ty, a_raw_ty, a_raw_ty],
         compile_flags=pro_flags)
     gemv = ExternalFunction(
-        "gemv_dispatch",
+        "ggml_xdna_gemv",
         object_file_name=f"gemv_{n_core}_{digest}.o",
         source_string=src,
         arg_types=[w_ty, a_ty, o_ty],
         include_dirs=_include_dirs(),
         compile_flags=flags,
     )
-    zsrc = (Path(__file__).resolve().parent / "gemv_zero.cc").read_text()
+    zsrc = (Path(__file__).resolve().parent / "gemv-zero.cc").read_text()
     zdigest = hashlib.sha256((zsrc + "\0".join(flags)).encode()).hexdigest()[:8]
     zero = ExternalFunction(
-        "gemv_zero",
+        "ggml_xdna_gemv_zero",
         object_file_name=f"gemv_zero_{n_core}_{zdigest}.o",
         source_string=zsrc,
         arg_types=[o_ty],
@@ -195,20 +187,14 @@ def _rows_map(spec: str, cols: int) -> list:
 def _dev_act() -> bool:
     """Pack the activation the way the cores emit it, to check that the kernel
     reads back what the epilogue writes."""
-    return bool(int(__import__("os").environ.get("GEMV_DEV_ACT", "0")))
+    return False
 
 
 def _epi_quant() -> bool:
     """The epilogue writes its result as an activation tile - int8 codes with
     a scale and a code sum per group - instead of f32, so the dispatch that
     consumes it needs nothing from the host in between."""
-    return bool(int(__import__("os").environ.get("GEMV_EPI_QUANT", "0")))
-
-
-def _silu_step() -> int:
-    """Return an intermediate of the nonlinearity instead of silu itself, so a
-    failure can be bisected against a reference for the same step."""
-    return int(__import__("os").environ.get("GEMV_SILU_STEP", "0"))
+    return False
 
 
 def _core(w_in, a_in, out, gemv, zero):
@@ -288,13 +274,7 @@ def build_gemv(FMT: str, K: int, N: int, K_TILE: int, COLS: int,
     # spending one of them per column on a broadcast of a few kilobytes leaves
     # nothing for another design sharing the array. The weights - the traffic
     # that decides the speed - keep a channel per column.
-    # GEMV_ACT_DEPTH: the core alternates a weight object and an activation
-    # tile, so a shallow broadcast would make it wait on the tile every tile.
-    # It does not: at 4 and 8 the dispatches measure exactly what they do at 2
-    # (gate/up 206 us, the two down projections 133 and 175), so the broadcast
-    # is not what the fill costs either.
-    a_shim = ObjectFifo(a_ty, name="inA",
-                        depth=int(__import__("os").environ.get("GEMV_ACT_DEPTH", "2")))
+    a_shim = ObjectFifo(a_ty, name="inA", depth=2)
 
     # GEMV_W_DEPTH: how far ahead of the cores a column's weights may run.
     # The fixed cost of a dispatch is the pipeline fill - with the arithmetic
@@ -305,7 +285,7 @@ def build_gemv(FMT: str, K: int, N: int, K_TILE: int, COLS: int,
     # Only where a column has one core: the four-row standalone design splits
     # a column's object four ways, and the extra descriptors that needs push
     # its output join past the MemTile's budget.
-    wdepth = int(__import__("os").environ.get("GEMV_W_DEPTH", "2")) if ROWS == 1 else 2
+    wdepth = 2
     w_shim, o_shim = [], []
     w_core = []
     for c in range(COLS):
@@ -326,7 +306,7 @@ def build_gemv(FMT: str, K: int, N: int, K_TILE: int, COLS: int,
     # kilobytes a tile, so the join costs nothing and gives the array back a
     # shim channel per column it removes - which is what the gdn block's state
     # stream, 512 KB through a single channel, needs.
-    OG = OUT_GROUP or int(__import__("os").environ.get("GEMV_OUT_GROUP", "1"))
+    OG = OUT_GROUP or 1
     OG = max(1, min(OG, COLS))
     o_core = [None] * COLS
     for g0 in range(0, COLS, OG):
@@ -352,18 +332,12 @@ def build_gemv(FMT: str, K: int, N: int, K_TILE: int, COLS: int,
     # switches carry its output to the cores the way the broadcast already
     # reaches them.
     act_pro = int(__import__("os").environ.get("ACT_RAW", "0"))
-    # ACT_PRO_H: the prologue takes its host half from a second input, in a
-    # buffer no dispatch writes. That is what a layer in one dispatch needs -
-    # host and array writes to one buffer hold in one order only - but every
-    # stream on this artifact then has to feed that input, and until they all
-    # do it stays off.
-    act_pro_h = act_pro and int(__import__("os").environ.get("ACT_PRO_H", "0"))
     a_cons = a_shim
     pro_workers = []
     if act_pro:
         a_q = ObjectFifo(a_ty, name="actQ", depth=2)
-        pro_col = int(__import__("os").environ.get("ACT_PRO_COL", "0"))
-        pro_row = int(__import__("os").environ.get("ACT_PRO_ROW", "3"))
+        pro_col = 0
+        pro_row = 3
 
         # One object in, one out. The worker body is wrapped in an outer loop
         # by IRON, so this keeps no count of its own - and a count that drifts
@@ -376,8 +350,6 @@ def build_gemv(FMT: str, K: int, N: int, K_TILE: int, COLS: int,
         # separate buffers is what makes the order of the writes stop
         # mattering - host and array writes to one buffer hold in one order
         # only, and a layer in a single dispatch needs the other one.
-        a_h = ObjectFifo(a_ty, name="actH", depth=2) if act_pro_h else None
-
         def _pro(a_in, h_in, a_out, ktile):
             i_ = a_in.acquire(1)
             h_ = h_in.acquire(1)
@@ -397,12 +369,7 @@ def build_gemv(FMT: str, K: int, N: int, K_TILE: int, COLS: int,
             a_in.release(1)
             a_out.release(1)
 
-        pro_workers = [Worker(_pro, fn_args=[a_shim.cons(), a_h.cons(),
-                                             a_q.prod(), pro_tile],
-                              tile=Tile(pro_col, pro_row),
-                              stack_size=0x1000)
-                       if act_pro_h else
-                       Worker(_pro1, fn_args=[a_shim.cons(), a_q.prod(), pro_tile],
+        pro_workers = [Worker(_pro1, fn_args=[a_shim.cons(), a_q.prod(), pro_tile],
                               tile=Tile(pro_col, pro_row),
                               stack_size=0x1000)]
         a_cons = a_q
@@ -411,7 +378,7 @@ def build_gemv(FMT: str, K: int, N: int, K_TILE: int, COLS: int,
         Worker(_core, fn_args=[w_core[c][i].cons(), a_cons.cons(),
                                o_core[c][i].prod(), gemv, zero],
                tile=Tile(c, rows_map[c][i]),
-               stack_size=int(__import__("os").environ.get("GEMV_STACK", "3072")))
+               stack_size=3072)
         for c in range(COLS) for i in range(ROWS)
     ]
 
@@ -426,7 +393,7 @@ def build_gemv(FMT: str, K: int, N: int, K_TILE: int, COLS: int,
     # pinned, and the recurrent design's fills are pinned around them
     # (attn_gdn_gated.py) to leave each column a channel.
     # GEMV_PIN_W=0 goes back to letting the placer choose.
-    pin_w = int(__import__("os").environ.get("GEMV_PIN_W", "1"))
+    pin_w = 1
     w_prods = [w_shim[c].prod(tile=Tile(c, 0)) if pin_w else w_shim[c].prod()
                for c in range(COLS)]
     # The broadcast goes on the column whose shim the recurrent design leaves
@@ -434,12 +401,6 @@ def build_gemv(FMT: str, K: int, N: int, K_TILE: int, COLS: int,
     # backend's hand-built stream has to know which column carries it.
     a_prod = a_shim.prod(tile=Tile(4 if pin_w else 0, 0))
     o_conss = [o.cons() for o in o_shim]
-    # The host half's own endpoint, and its own runtime argument. Left to the
-    # placer: the backend reads the mapping out of the artifact anyway
-    # (shim_map.py), and the columns the recurrent design leaves free are not
-    # something to guess at.
-    h_prod = a_h.prod() if act_pro_h else None
-
     a_words = (1 + n_out * NT) * ab // 4
 
     def seq(a_w, a_a, a_o, wp, ap, op):
@@ -470,24 +431,12 @@ def build_gemv(FMT: str, K: int, N: int, K_TILE: int, COLS: int,
                 wait=True, group=go)
         go.finish()
 
-    if act_pro_h:
-        # The host half is one object per tile, in step with them.
-        def seq_h(a_w, a_a, a_h_, a_o, wp, ap, hp, op):
-            seq(a_w, a_a, a_o, wp, ap, op)
-            gh = TaskGroup()
-            hp.fill(a_h_, tap=flat_tap(a_words, 0, a_words), group=gh)
-            gh.finish()
-
-        return (workers,
-                [w_all_ty, a_all_ty, a_all_ty, o_all_ty,
-                 w_prods, a_prod, h_prod, o_conss],
-                seq_h)
     return workers, [w_all_ty, a_all_ty, o_all_ty, w_prods, a_prod, o_conss], seq
 
 
 # See fused_layer.py: the kernel sources have to be named, or a cached
 # artifact can be served for a design whose C++ has changed.
-@iron.jit(source_files=["gemv_q4.cc", "gemv_zero.cc"])
+@iron.jit(source_files=["gemv-q4.cc", "gemv-zero.cc"])
 def gemv_q4(
     weights: In,
     acts: In,
@@ -650,22 +599,7 @@ def _run_and_verify(opts) -> None:
     elif opts.epilogue:
         g = ref[: N // 2].astype(np.float64)
         u = ref[N // 2:].astype(np.float64)
-        step = _silu_step()
-        if __import__("os").environ.get("GEMV_SILU_ID"):
-            f = g
-        elif step:
-            # Same reduction the kernel does, step by step. The trailing "* u"
-            # stays in every case: the epilogue always multiplies by the up
-            # projection, and leaving it out of a probe reference makes the
-            # probe disagree for a reason that has nothing to do with the step.
-            xc = np.clip(g, -40.0, 40.0)
-            f = {1: xc,
-                 2: np.exp(-xc),
-                 3: 1.0 + np.exp(-xc),
-                 4: 1.0 / (1.0 + np.exp(-xc)),
-                 5: 1.0 / (1.0 + np.exp(-xc))}[step]
-        else:
-            f = g / (1.0 + np.exp(-g))
+        f = g / (1.0 + np.exp(-g))
         ref = (f * u).astype(np.float32)
 
     tb = tile_bytes(fmt, K_TILE, n_core)
@@ -710,7 +644,7 @@ def _run_and_verify(opts) -> None:
 
     gemv_q4(a_w, a_a, a_o, **_compile_kwargs(opts))
     got = a_o.numpy().astype(np.float32)
-    if opts.epilogue and not __import__("os").environ.get("GEMV_PERM_ONLY"):
+    if opts.epilogue:
         if _epi_quant():
             # Per core slot: n_core/2 int8 codes, then a code sum and a scale
             # per group of Q4_GROUP. Dequantized here only to check it.
@@ -739,35 +673,11 @@ def _run_and_verify(opts) -> None:
               f"-> {wbytes / wall / 1e6:.1f} GB/s")
 
     bad = int(np.count_nonzero(~np.isfinite(got)))
-    if bad and __import__("os").environ.get("GEMV_RAW"):
-        i0 = int(np.nonzero(~np.isfinite(got))[0][0])
-        print("raw:", " ".join(f"{v:08x}" for v in
-                               got[i0:i0 + 8].view(np.uint32)))
     if bad:
         idx = np.nonzero(~np.isfinite(got))[0]
         print(f"non-finite lanes: {bad}/{got.size}, first at {idx[:8]}")
         print("got[:8] =", got[:8])
         print("ref[:8] =", ref[:8])
-    if opts.epilogue and __import__("os").environ.get("GEMV_CHUNKS"):
-        per = got.reshape(n_out, -1)
-        rp = ref.reshape(n_out, -1)
-        for k in range(n_out):
-            e = float(np.abs(per[k] - rp[k]).max() /
-                      max(np.sqrt((rp[k] ** 2).mean()), 1e-30))
-            print(f"  chunk {k}: rel {e:.3e}")
-    if opts.epilogue and __import__("os").environ.get("GEMV_CELLS"):
-        # Which (chunk, core) slots are wrong: a bad column or a bad core shows
-        # up here, a numerical range problem does not.
-        per_core = n_core // 2
-        pc = got.reshape(n_out, n_cores, per_core)
-        rc = ref.reshape(n_out, n_cores, per_core)
-        sc = max(float(np.sqrt((ref ** 2).mean())), 1e-30)
-        print("     " + "".join(f"{c % 10}" for c in range(n_cores)))
-        for k in range(n_out):
-            row = "".join("." if float(np.abs(pc[k, c] - rc[k, c]).max()) / sc < 1e-2
-                          else "X" for c in range(n_cores))
-            print(f"  c{k}: {row}")
-
     scale = float(np.sqrt((ref ** 2).mean()))
     err = float(np.abs(got - ref).max())
     print(f"gemv {fmt}: K={K} N={N} K_TILE={K_TILE} cores={n_cores} "

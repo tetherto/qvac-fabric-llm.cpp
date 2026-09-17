@@ -1,7 +1,6 @@
 #include "xdna-ops.h"
 #include "xdna-runtime.h"
-#include "xdna-profile.h"
-#include "xdna-verify.h"
+#include "xdna-util.h"
 #include "xdna-quant.h"
 #include "xdna-gemv.h"
 #include "xdna-gdn-prefill.h"
@@ -28,20 +27,8 @@
 // huge B transpose and run too long on the NPU.
 static const int GEMM_K_MAX = 1024;
 static const int GEMM_N_MAX = 16384;
-
-// Per-call breakdown is printed when GGML_XDNA_PROFILING=1.
-static bool ggml_xdna_profiling_enabled(void) {
-    static const bool en = []() {
-        const char * v = getenv("GGML_XDNA_PROFILING");
-        return v != nullptr && atoi(v) >= 1;
-    }();
-    return en;
-}
-
-static int xdna_env_int(const char * name, int def) {
-    const char * v = getenv(name);
-    return v ? atoi(v) : def;
-}
+// Rows at or above this use the prefill geometry; below it the decode M32 one.
+static const int GEMM_M_BIG_MIN = 64;
 
 // --- int8 activation packing (SIMD) -----------------------------------------
 //
@@ -172,16 +159,12 @@ struct xdna_gemm_geom {
 
 // Pick the prefill M block for an op: the available block that minimizes the
 // byte cost of re-streaming B per submission vs. padding the batch to whole
-// blocks (A fill + accumulator work on the padded rows). Blocks larger than
-// GGML_XDNA_GEMM_M_MAX (0 = no cap) are skipped, which lets A/B runs fall back
-// to the M64-only behaviour. Returns 0 when nothing fits.
+// blocks (A fill + accumulator work on the padded rows). Returns 0 when
+// nothing fits.
 static int pick_prefill_block(const xdna_ops * ops, int M, int K, int N, int eb,
                               const std::unordered_map<int, std::string> & route) {
     int64_t best_b = 0, best_cost = 0;
     for (int Mk : ops->pref_blocks) {           // descending
-        if (ops->gemm_m_max > 0 && Mk > ops->gemm_m_max) {
-            continue;
-        }
         if (route.find(Mk) == route.end()) {
             continue;
         }
@@ -196,7 +179,7 @@ static int pick_prefill_block(const xdna_ops * ops, int M, int K, int N, int eb,
     return (int) best_b;
 }
 
-// Pick the geometry for an op: the decode M32 geometry below gemm_big_m_min,
+// Pick the geometry for an op: the decode M32 geometry below GEMM_M_BIG_MIN,
 // otherwise the cheapest prefill M block <= M that has an artifact for the
 // chosen route (bf16 or native int8). Falls back to the decode geometry when
 // no prefill block is available.
@@ -204,7 +187,7 @@ static xdna_gemm_geom xdna_pick_geom(const xdna_ops * ops, int M, int K, int N, 
     xdna_gemm_geom g;
     g.tiles  = ops->gemm_tiles;
     g.xclbin = ops->gemm_xclbin_decode.c_str();
-    if (M < ops->gemm_big_m_min) {
+    if (M < GEMM_M_BIG_MIN) {
         return g;
     }
     const std::unordered_map<int, std::string> & route = want_i8 ? ops->i8_xclbin
@@ -309,7 +292,7 @@ static bool xdna_int8_eligible(const xdna_ops * ops, const struct ggml_tensor * 
         src0->type != GGML_TYPE_Q6_K) {
         return false;
     }
-    if (src1->ne[1] < (int64_t) ops->gemm_big_m_min) {
+    if (src1->ne[1] < (int64_t) GEMM_M_BIG_MIN) {
         return false;
     }
     // The chosen block has to exist. Without this the picker would fall back
@@ -422,16 +405,11 @@ static bool gemm_compute_i8(xdna_ops * ops, struct ggml_tensor * node) {
     const int K = (int) src1->ne[0];
     const int N = (int) src0->ne[1];
 
-    const bool prof_en = ggml_xdna_profiling_enabled();
-    xdna_mul_mat_profile prof;
-    const xdna_timer t_op;
 
-    const xdna_timer twbo;
     xdna_ops::int8_wbo * wb = gemm_int8_weight_bo(ops, src0, K, N);
     if (!wb) {
         return false;
     }
-    if (prof_en) prof.wbo += twbo.ms();
     const xdna_gemm_geom geom = xdna_pick_geom(ops, M, K, N, /* want_i8 */ true);
     const xdna_gemm_tiles & tiles = geom.tiles;
     const int Mk = tiles.M;
@@ -445,7 +423,6 @@ static bool gemm_compute_i8(xdna_ops * ops, struct ggml_tensor * node) {
     const bool single_k = K <= GEMM_K_MAX;
     std::vector<std::vector<float>> d_a((size_t) n_mb);
     {
-        const xdna_timer t;
         for (int b = 0; b < n_mb; b++) {
             d_a[b].assign((size_t) Mk, 1.0f);
         }
@@ -455,14 +432,12 @@ static bool gemm_compute_i8(xdna_ops * ops, struct ggml_tensor * node) {
                             (size_t) N * sizeof(float));
             }
         }
-        if (prof_en) prof.acc_zero += t.ms();
     }
 
     // Per-row activation scale over the full K: every K-block of a row is
     // quantized with the same d_a, so the per-block results sum into one
     // consistent total before the d_a * d_w rescale.
     {
-        const xdna_timer t;
         for (int b = 0; b < n_mb; b++) {
             const int mc = std::min(Mk, M - b * Mk);
             for (int m = 0; m < mc; m++) {
@@ -471,7 +446,6 @@ static bool gemm_compute_i8(xdna_ops * ops, struct ggml_tensor * node) {
                 d_a[b][m] = amax > 0.0f ? amax / 127.0f : 1.0f;
             }
         }
-        if (prof_en) prof.d_scan += t.ms();
     }
 
     // Fold one read-back C block into the destination. The row scale is per
@@ -508,7 +482,6 @@ static bool gemm_compute_i8(xdna_ops * ops, struct ggml_tensor * node) {
     for (int k0 = 0; k0 < K; k0 += GEMM_K_MAX) {
         const int Kb = std::min(GEMM_K_MAX, K - k0);
         const uint32_t b_offset = (uint32_t) k0 * N;   // int8 bytes into B
-        const xdna_timer ts;
         xdna_seq seq;
         if (!xdna_gemm_seq_build(&seq, &tiles, Mk, GEMM_K_MAX, N, b_offset)) {
             GGML_LOG_ERROR("%s: failed to build int8 GEMM stream M=%d K=%d N=%d\n", "xdna-ops", M, K, N);
@@ -524,22 +497,18 @@ static bool gemm_compute_i8(xdna_ops * ops, struct ggml_tensor * node) {
             GGML_LOG_ERROR("%s: failed to load int8 GEMM kernel %s\n", "xdna-ops", name);
             return false;
         }
-        if (prof_en) prof.seq += ts.ms();
 
         for (int b = 0; b < n_mb; b++) {
             const int mc = std::min(Mk, M - b * Mk);
             if (bo_a[bank] == nullptr) {
-                const xdna_timer tp;
                 bo_a[bank] = xdna_kernel_pool_acquire_buffer(ops->pool, (size_t) Mk * GEMM_K_MAX);
                 bo_c[bank] = xdna_kernel_pool_acquire_buffer(ops->pool, (size_t) Mk * N * sizeof(int32_t));
-                if (prof_en) prof.pool += tp.ms();
                 if (!bo_a[bank] || !bo_c[bank]) {
                     GGML_LOG_ERROR("%s: failed to allocate int8 GEMM buffers\n", "xdna-ops");
                     return false;
                 }
             }
             {
-                const xdna_timer t;
                 int8_t * a = (int8_t *) bo_a[bank]->bo.map();
                 // A full block (every row, every K word written below) needs no
                 // zeroing; only a partial K block or a padded M tail does.
@@ -552,46 +521,33 @@ static bool gemm_compute_i8(xdna_ops * ops, struct ggml_tensor * node) {
                     int8_t * dst = a + (size_t) m * GEMM_K_MAX;
                     xdna_quantize_row(dst, row, Kb, 1.0f / d);
                 }
-                if (prof_en) prof.a_pack += t.ms();
             }
             {
-                const xdna_timer t;
                 xdna_buffer_sync_to_device(bo_a[bank]);
-                if (prof_en) prof.sync += t.ms();
             }
             {
                 xdna_buffer * args[3] = { bo_a[bank], wb->bo, bo_c[bank] };
-                const xdna_timer t;
                 runs[bank] = xdna_kernel_run_start(kern, args, 3);
                 if (!runs[bank]) {
                     GGML_LOG_ERROR("%s: int8 GEMM submit failed M=%d K=%d N=%d\n", "xdna-ops", M, K, N);
                     return false;
                 }
-                if (prof_en) prof.run += t.ms();
             }
 
             if (pend >= 0) {
-                const xdna_timer t;
                 if (!xdna_run_wait(runs[pend])) {
                     GGML_LOG_ERROR("%s: int8 GEMM wait failed M=%d K=%d N=%d node=%s\n", "xdna-ops", M, K, N, node->name ? node->name : "?");
                     return false;
                 }
-                if (prof_en) prof.wait += t.ms();
                 {
-                    const xdna_timer tr;
                     xdna_buffer_sync_from_device(bo_c[pend]);
-                    if (prof_en) prof.read += tr.ms();
                 }
                 {
-                    const xdna_timer ta;
                     fold_block(pend_mb, (const int32_t *) bo_c[pend]->bo.map());
-                    if (prof_en) prof.c_acc += ta.ms();
                 }
                 {
-                    const xdna_timer tp;
                     xdna_kernel_pool_release_buffer(ops->pool, bo_a[pend]);
                     xdna_kernel_pool_release_buffer(ops->pool, bo_c[pend]);
-                    if (prof_en) prof.pool += tp.ms();
                 }
                 bo_a[pend] = nullptr;
                 bo_c[pend] = nullptr;
@@ -599,46 +555,25 @@ static bool gemm_compute_i8(xdna_ops * ops, struct ggml_tensor * node) {
             pend = bank;
             pend_mb = b;
             bank = 1 - bank;
-            prof.n_blocks++;
         }
     }
     if (pend >= 0) {
-        const xdna_timer t;
         if (!xdna_run_wait(runs[pend])) {
             GGML_LOG_ERROR("%s: int8 GEMM final wait failed M=%d K=%d N=%d node=%s\n", "xdna-ops", M, K, N, node->name ? node->name : "?");
             return false;
         }
-        if (prof_en) prof.wait += t.ms();
         {
-            const xdna_timer tr;
             xdna_buffer_sync_from_device(bo_c[pend]);
-            if (prof_en) prof.read += tr.ms();
         }
         {
-            const xdna_timer ta;
             fold_block(pend_mb, (const int32_t *) bo_c[pend]->bo.map());
-            if (prof_en) prof.c_acc += ta.ms();
         }
         {
-            const xdna_timer tp;
             xdna_kernel_pool_release_buffer(ops->pool, bo_a[pend]);
             xdna_kernel_pool_release_buffer(ops->pool, bo_c[pend]);
-            if (prof_en) prof.pool += tp.ms();
         }
         bo_a[pend] = nullptr;
         bo_c[pend] = nullptr;
-    }
-
-    if (prof_en) {
-        prof.total = t_op.ms();
-        fprintf(stderr,
-                "xdna-profile: MUL_MAT %s M=%d K=%d N=%d blocks=%d "
-                "total=%.3fms apack=%.3f sync=%.3f submit=%.3f wait=%.3f read=%.3f "
-                "seq=%.3f dscan=%.3f cacc=%.3f rescale=%.3f acczero=%.3f wbo=%.3f pool=%.3f (int8)\n",
-                node->name, M, K, N, prof.n_blocks,
-                prof.total, prof.a_pack, prof.sync, prof.run, prof.wait, prof.read,
-                prof.seq, prof.d_scan, prof.c_acc, prof.rescale, prof.acc_zero,
-                prof.wbo, prof.pool);
     }
     return true;
 }
@@ -669,9 +604,6 @@ static bool gemm_compute(xdna_ops * ops, struct ggml_tensor * node) {
     const xdna_gemm_tiles & tiles = geom.tiles;
     const int Mk = tiles.M;   // baked M block of the selected geometry
 
-    const bool prof_en = ggml_xdna_profiling_enabled();
-    xdna_mul_mat_profile prof;
-    const xdna_timer t_op;
 
     // B is a persistent BO with the packed [K_pad x N] weights; each K-block's
     // stream points into it via its K offset, so no per-call weight copy.
@@ -748,32 +680,26 @@ static bool gemm_compute(xdna_ops * ops, struct ggml_tensor * node) {
             }
             pr.mb_idx = (int) (&mb - op.m_blocks.data());
             {
-                const xdna_timer t;
                 ggml_bf16_t * a_map = (ggml_bf16_t *) pr.bo_a->bo.map();
                 std::memset(a_map, 0, (size_t) Mk * GEMM_K_MAX * sizeof(ggml_bf16_t));
                 for (int m = 0; m < mc; m++) {
                     f32_to_bf16_run((const float *) src1->data + (size_t) (mb.m0 + m) * K + k0,
                                     a_map + (size_t) m * GEMM_K_MAX, Kb);
                 }
-                if (prof_en) prof.a_pack += t.ms();
             }
 
             {
-                const xdna_timer t;
                 xdna_buffer_sync_to_device(pr.bo_a);
-                if (prof_en) prof.sync += t.ms();
             }
 
             xdna_buffer * args[3] = { pr.bo_a, bo_w, pr.bo_c };
             {
-                const xdna_timer t;
                 pr.run = xdna_kernel_run_start(kern, args, 3);
                 if (!pr.run) {
                     GGML_LOG_ERROR("%s: GEMM submit failed M=%d K=%d N=%d kernel=gemm_K%d_N%d_b%d\n",
                                    "xdna-ops", M, K, N, GEMM_K_MAX, N, k0);
                     return false;
                 }
-                if (prof_en) prof.run += t.ms();
             }
 
             // The NPU is now working on `bank`; wait + read back the previous
@@ -781,12 +707,10 @@ static bool gemm_compute(xdna_ops * ops, struct ggml_tensor * node) {
             if (pending_bank >= 0) {
                 xdna_ops::pending_run & prev = banks[pending_bank];
                 {
-                    const xdna_timer t;
                     if (!xdna_run_wait(prev.run)) {
                         GGML_LOG_ERROR("%s: GEMM wait failed M=%d K=%d N=%d\n", "xdna-ops", M, K, N);
                         return false;
                     }
-                    if (prof_en) prof.wait += t.ms();
                 }
                 // Read back only the valid rows: rows [mc, Mk) of a padded
                 // block are zero (the padded A rows are zeroed), so the prefix
@@ -794,12 +718,9 @@ static bool gemm_compute(xdna_ops * ops, struct ggml_tensor * node) {
                 const xdna_ops::pending_m_block & pmb = op.m_blocks[prev.mb_idx];
                 const int pmc = std::min(Mk, M - pmb.m0);
                 {
-                    const xdna_timer t;
                     xdna_buffer_sync_from_device(prev.bo_c);
-                    if (prof_en) prof.read += t.ms();
                 }
                 {
-                    const xdna_timer ta;
                     const float * c = (const float *) prev.bo_c->bo.map();
                     for (int m = 0; m < pmc; m++) {
                         float * dst = (float *) ((char *) node->data +
@@ -809,7 +730,6 @@ static bool gemm_compute(xdna_ops * ops, struct ggml_tensor * node) {
                             dst[n] += crow[n];
                         }
                     }
-                    if (prof_en) prof.c_acc += ta.ms();
                 }
                 xdna_kernel_pool_release_buffer(ops->pool, prev.bo_a);
                 xdna_kernel_pool_release_buffer(ops->pool, prev.bo_c);
@@ -819,7 +739,6 @@ static bool gemm_compute(xdna_ops * ops, struct ggml_tensor * node) {
 
             pending_bank = bank;
             bank = 1 - bank;
-            prof.n_blocks++;
         }
     }
 
@@ -831,88 +750,17 @@ static bool gemm_compute(xdna_ops * ops, struct ggml_tensor * node) {
     }
 
     ops->pending.push_back(std::move(op));
-
-    if (prof_en) {
-        prof.total = t_op.ms();
-        fprintf(stderr,
-                "xdna-profile: MUL_MAT %s M=%d K=%d N=%d blocks=%d "
-                "total=%.3fms apack=%.3f sync=%.3f submit=%.3f wait=%.3f read=%.3f\n",
-                node->name, M, K, N, prof.n_blocks,
-                prof.total, prof.a_pack, prof.sync, prof.run, prof.wait, prof.read);
-    }
-
     return true;
 }
 
-
-// Recompute one finished MUL_MAT on the host and fold its relative RMS into
-// the shared verification statistics (see xdna-verify.h).
-// dst[m][n] = sum_k src1[m][k] * src0[n][k].
-static void xdna_verify_mul_mat(const struct ggml_tensor * node) {
-    const struct ggml_tensor * src0 = node->src[0];
-    const struct ggml_tensor * src1 = node->src[1];
-
-    const int64_t K = src1->ne[0];
-    const int64_t M = src1->ne[1];
-    const int64_t N = src0->ne[1];
-
-    const ggml_type_traits * tr = ggml_get_type_traits(src0->type);
-    if (tr == nullptr || tr->to_float == nullptr) {
-        return;
-    }
-
-    std::vector<float> w((size_t) K);
-    double se = 0.0;     // sum of squared error
-    double sr = 0.0;     // sum of squared reference
-    const size_t row_sz = ggml_row_size(src0->type, K);
-
-    for (int64_t n = 0; n < N; n++) {
-        tr->to_float((const char *) src0->data + (size_t) n * row_sz, w.data(), K);
-        for (int64_t m = 0; m < M; m++) {
-            const float * a = (const float *) ((const char *) src1->data + (size_t) m * src1->nb[1]);
-            double acc = 0.0;
-            for (int64_t k = 0; k < K; k++) {
-                acc += (double) a[k] * (double) w[k];
-            }
-            const float got = ((const float *) ((const char *) node->data + (size_t) m * node->nb[1]))[n];
-            const double d = (double) got - acc;
-            se += d * d;
-            sr += acc * acc;
-        }
-    }
-
-    const double rel = sr > 0.0 ? std::sqrt(se / sr) : 0.0;
-    const char * nm = ggml_get_name(node);
-    // Strip the trailing "-<layer>" so all layers of one projection share a row.
-    std::string key = nm ? nm : "?";
-    const size_t dash = key.rfind('-');
-    if (dash != std::string::npos && dash + 1 < key.size() &&
-        key.find_first_not_of("0123456789", dash + 1) == std::string::npos) {
-        key.resize(dash);
-    }
-    char shape[64];
-    snprintf(shape, sizeof(shape), " M%lld K%lld N%lld", (long long) M, (long long) K, (long long) N);
-    key += shape;
-
-    xdna_verify_add(key.c_str(), rel);
-
-    if (xdna_verify_level() >= 2) {
-        fprintf(stderr, "xdna-verify: %-24s M=%lld K=%lld N=%lld type_a=%s relRMS=%.3e\n",
-                nm ? nm : "?", (long long) M, (long long) K, (long long) N,
-                ggml_type_name(src0->type), rel);
-    }
-}
 
 bool xdna_ops_finalize(xdna_ops * ops) {
     if (ops->pending.empty()) {
         return true;
     }
 
-    const bool prof_en = ggml_xdna_profiling_enabled();
-    const xdna_timer t_all;
 
     // Wait all runs first so all kernels of the layer complete together.
-    const xdna_timer t_wait;
     for (auto & op : ops->pending) {
         for (auto & mb : op.m_blocks) {
             for (auto & pr : mb.runs) {
@@ -932,11 +780,9 @@ bool xdna_ops_finalize(xdna_ops * ops) {
             }
         }
     }
-    const double ms_wait = t_wait.ms();
 
     // Read the trailing banks' C straight from their BOs into the (already
     // zeroed and partially accumulated) f32 dst, then release the buffers.
-    const xdna_timer t_read;
     for (auto & op : ops->pending) {
         const int Mk = op.Mk;   // per-op geometry M block
         for (auto & mb : op.m_blocks) {
@@ -960,23 +806,9 @@ bool xdna_ops_finalize(xdna_ops * ops) {
         }
     }
 
-    if (prof_en) {
-        fprintf(stderr, "xdna-profile: FINALIZE ops=%zu total=%.3fms wait=%.3f read=%.3f\n",
-                ops->pending.size(), t_all.ms(), ms_wait, t_read.ms());
-    }
-
-    if (xdna_verify_level() > 0) {
-        for (const auto & op : ops->pending) {
-            xdna_verify_mul_mat(op.node);
-        }
-    }
-
     ops->pending.clear();
     return true;
 }
-
-static void xdna_verify_mul_mat(const struct ggml_tensor * node);
-static void xdna_verify_gemv_epilogue(const struct xdna_ops::gemv_group & grp);
 
 // --- decode GEMV ------------------------------------------------------------
 //
@@ -1004,36 +836,6 @@ static bool xdna_ops_is_view(enum ggml_op op) {
     }
 }
 
-// The FFN epilogue is opt-in: closing silu on the cores costs accuracy,
-// because the target's f32 multiply is emulated and the chain is long enough
-// to show it (7.8e-4 against 2.9e-5 with the host-side silu).
-static bool xdna_gemv_epilogue_enabled(void) {
-    static const bool en = []() {
-        const char * v = getenv("GGML_XDNA_GEMV_EPILOGUE");
-        return v != nullptr && atoi(v) != 0;
-    }();
-    return en;
-}
-
-// Per-op decode projections outside the fused layers, on the merged layer
-// artifact. On by default: it is what puts every MUL_MAT of the decode on the
-// array. GGML_XDNA_GEMV_OPS=0 leaves them on the host, which is faster today -
-// see xdna_ops_supported for the measurement and why it is not the default.
-static bool xdna_gemv_ops_enabled(void) {
-    static const bool en = []() {
-        const char * v = getenv("GGML_XDNA_GEMV_OPS");
-        return v == nullptr || atoi(v) != 0;
-    }();
-    return en;
-}
-
-static bool xdna_gemv_enabled(void) {
-    static const bool en = []() {
-        const char * v = getenv("GGML_XDNA_GEMV");
-        return v != nullptr && atoi(v) != 0;
-    }();
-    return en;
-}
 
 // The geometry serving this node, or an invalid one. Decode only: ne[1] is the
 // number of activation rows.
@@ -1051,9 +853,6 @@ static xdna_gemv_geom xdna_gemv_geom_for(const struct ggml_tensor * op,
         }
         return xdna_gemv_geom{};
     };
-    if (!xdna_gemv_enabled() && !xdna_gemv_ops_enabled()) {
-        return no("disabled");
-    }
     if (op->op != GGML_OP_MUL_MAT || !src0 || !src1) {
         return no("not a mul_mat");
     }
@@ -1069,19 +868,6 @@ static xdna_gemv_geom xdna_gemv_geom_for(const struct ggml_tensor * op,
     if (!ggml_is_contiguous(op) || !ggml_is_contiguous(src0) || !ggml_is_contiguous(src1)) {
         return no("not contiguous");
     }
-    // GGML_XDNA_GEMV_ONLY=KxN[,KxN...] restricts the route to those shapes, to
-    // tell a per-shape fault from state leaking between dispatches.
-    static const char * only = getenv("GGML_XDNA_GEMV_ONLY");
-    if (only) {
-        char want[32];
-        snprintf(want, sizeof(want), "%dx%d", (int) src0->ne[0], (int) src0->ne[1]);
-        const char * p = strstr(only, want);
-        const size_t n = strlen(want);
-        const bool hit = p && (p == only || p[-1] == ',') && (p[n] == 0 || p[n] == ',');
-        if (!hit) {
-            return no("excluded by GEMV_ONLY");
-        }
-    }
     const xdna_gemv_geom g = xdna_gemv_variant(src0->type, src0->ne[0], src0->ne[1],
                                                false, split);
     if (!g.valid()) {
@@ -1093,7 +879,6 @@ static xdna_gemv_geom xdna_gemv_geom_for(const struct ggml_tensor * op,
 // Fetch (or build) the runner for a dispatch, keyed by its first weight.
 static xdna_gemv * xdna_gemv_get(xdna_ops * ops,
                                  const struct ggml_tensor * const * ws, int n_w,
-                                 const int32_t * colmap,
                                  const xdna_gemv_geom & geom) {
     {
         std::lock_guard<std::mutex> lock(ops->gemv_mutex);
@@ -1103,7 +888,7 @@ static xdna_gemv * xdna_gemv_get(xdna_ops * ops,
         }
     }
     std::vector<uint8_t> packed;
-    if (!xdna_gemv_pack_weights(geom, ws, n_w, colmap, packed)) {
+    if (!xdna_gemv_pack_weights(geom, ws, n_w, nullptr, packed)) {
         GGML_LOG_ERROR("%s: gemv: cannot pack %s\n", "xdna-ops", ggml_get_name(ws[0]));
         return nullptr;
     }
@@ -1130,44 +915,19 @@ static bool gemv_compute_group(xdna_ops * ops, xdna_ops::gemv_group & grp,
         for (const struct ggml_tensor * n : grp.nodes) {
             ws.push_back(n->src[0]);
         }
-        xdna_gemv * g = xdna_gemv_get(ops, ws.data(), (int) ws.size(),
-                                      grp.colmap.empty() ? nullptr : grp.colmap.data(),
-                                      grp.geom);
+        xdna_gemv * g = xdna_gemv_get(ops, ws.data(), (int) ws.size(), grp.geom);
         if (!g) {
             return false;
         }
 
-        const bool prof_en = ggml_xdna_profiling_enabled();
-        const xdna_timer t_op;
         grp.buf.resize((size_t) grp.geom.n_real);
         if (!xdna_gemv_run(g, (const float *) grp.nodes[0]->src[1]->data,
                            grp.buf.data())) {
             return false;
         }
         grp.ran = true;
-        if (prof_en) {
-            fprintf(stderr, "xdna-profile: GEMV %s%s K=%d N=%d total=%.3fms\n",
-                    ggml_get_name(grp.nodes[0]),
-                    grp.nodes.size() > 1 ? "+" : "", grp.geom.K, grp.geom.n_real,
-                    t_op.ms());
-        }
-        if (xdna_verify_level() > 0) {
-            if (grp.out) {
-                xdna_verify_gemv_epilogue(grp);
-            } else {
-                for (const struct ggml_tensor * n : grp.nodes) {
-                    xdna_verify_mul_mat(n);
-                }
-            }
-        }
     }
 
-    if (grp.out) {
-        // The dispatch produced the FFN activation itself.
-        std::memcpy(grp.out->data, grp.buf.data(),
-                    (size_t) grp.geom.n_real * sizeof(float));
-        return true;
-    }
     for (size_t k = 0; k < grp.nodes.size(); k++) {
         if (grp.nodes[k] == node) {
             std::memcpy(node->data, grp.buf.data() + grp.off[k],
@@ -1178,249 +938,32 @@ static bool gemv_compute_group(xdna_ops * ops, xdna_ops::gemv_group & grp,
     return true;
 }
 
-// The fused FFN activation has no ggml node of its own to check against: the
-// silu and the mul are absorbed, so xdna_verify_mul_mat would only ever see
-// the two projections that feed it. Recompute silu(gate)*up on the host from
-// the same weights and compare the value the cores actually returned.
-static void xdna_verify_gemv_epilogue(const xdna_ops::gemv_group & grp) {
-    if (grp.nodes.size() != 2 || !grp.out) {
-        return;
-    }
-    const struct ggml_tensor * gate = grp.nodes[0];
-    const struct ggml_tensor * up   = grp.nodes[1];
-    const struct ggml_tensor * src1 = gate->src[1];
-    const int64_t K    = src1->ne[0];
-    const int64_t half = grp.geom.n_real;
-    if (up->src[1] != src1 || gate->src[0]->ne[1] < half || up->src[0]->ne[1] < half) {
-        return;
-    }
-
-    const ggml_type_traits * tg = ggml_get_type_traits(gate->src[0]->type);
-    const ggml_type_traits * tu = ggml_get_type_traits(up->src[0]->type);
-    if (!tg || !tg->to_float || !tu || !tu->to_float) {
-        return;
-    }
-
-    const float * a = (const float *) src1->data;
-    const float * got = (const float *) grp.out->data;
-    std::vector<float> wg((size_t) K), wu((size_t) K);
-    const size_t rg = ggml_row_size(gate->src[0]->type, K);
-    const size_t ru = ggml_row_size(up->src[0]->type, K);
-
-    double se = 0.0, sr = 0.0;
-    int64_t worst_n = -1;
-    double worst_d = -1.0, worst_got = 0.0, worst_ref = 0.0;
-    for (int64_t n = 0; n < half; n++) {
-        tg->to_float((const char *) gate->src[0]->data + (size_t) n * rg, wg.data(), K);
-        tu->to_float((const char *) up->src[0]->data + (size_t) n * ru, wu.data(), K);
-        double g = 0.0, u = 0.0;
-        for (int64_t k = 0; k < K; k++) {
-            g += (double) a[k] * (double) wg[k];
-            u += (double) a[k] * (double) wu[k];
-        }
-        const double ref = g / (1.0 + std::exp(-g)) * u;
-        const double d   = (double) got[n] - ref;
-        se += d * d;
-        sr += ref * ref;
-        if (std::fabs(d) > worst_d) {
-            worst_d = std::fabs(d);
-            worst_n = n;
-            worst_got = got[n];
-            worst_ref = ref;
-        }
-    }
-
-    static const bool dbg = getenv("GGML_XDNA_GEMV_DEBUG") != nullptr;
-    if (dbg) {
-        static int shown = 0;
-        if (shown++ == 0) {
-            // A map of which (chunk, core) slots are damaged. A whole slot or a
-            // whole chunk is structural - a lost transfer; scattered lanes
-            // would be arithmetic. The reference is recomputed per value, so
-            // this costs a second pass over the projection, only once.
-            const int64_t cores = grp.geom.cores();
-            const int64_t hh    = grp.geom.n_core() / 2;
-            const double  scale = std::sqrt(sr / (double) half);
-            fprintf(stderr, "xdna-gemv-debug: epilogue rel %.3e, damage map "
-                    "(chunk rows, core columns)\n",
-                    sr > 0.0 ? std::sqrt(se / sr) : 0.0);
-            for (int64_t k = 0; k < grp.geom.n_out(); k++) {
-                std::string row;
-                for (int64_t e = 0; e < cores; e++) {
-                    double worst = 0.0;
-                    for (int64_t i = 0; i < hh; i++) {
-                        const int64_t n = (k * cores + e) * hh + i;
-                        tg->to_float((const char *) gate->src[0]->data + (size_t) n * rg,
-                                     wg.data(), K);
-                        tu->to_float((const char *) up->src[0]->data + (size_t) n * ru,
-                                     wu.data(), K);
-                        double gv = 0.0, uv = 0.0;
-                        for (int64_t kk = 0; kk < K; kk++) {
-                            gv += (double) a[kk] * (double) wg[kk];
-                            uv += (double) a[kk] * (double) wu[kk];
-                        }
-                        worst = std::max(worst,
-                            std::fabs((double) got[n] - gv / (1.0 + std::exp(-gv)) * uv));
-                    }
-                    row += worst > 0.05 * scale ? 'X' : '.';
-                }
-                fprintf(stderr, "xdna-gemv-debug:   chunk %lld: %s\n",
-                        (long long) k, row.c_str());
-            }
-        } else if (shown < 12) {
-            const int64_t cores = grp.geom.cores();
-            const int64_t hh    = grp.geom.n_core() / 2;
-            fprintf(stderr, "xdna-gemv-debug: epilogue rel %.3e  worst n=%lld "
-                    "(chunk %lld core %lld lane %lld) got %g ref %g\n",
-                    sr > 0.0 ? std::sqrt(se / sr) : 0.0, (long long) worst_n,
-                    (long long) (worst_n / (cores * hh)),
-                    (long long) ((worst_n / hh) % cores),
-                    (long long) (worst_n % hh), worst_got, worst_ref);
-        }
-    }
-
-    char key[64];
-    snprintf(key, sizeof(key), "gemv epilogue K%lld N%lld",
-             (long long) K, (long long) (2 * half));
-    xdna_verify_add(key, sr > 0.0 ? std::sqrt(se / sr) : 0.0);
-}
-
-// How many nodes of the graph read `t`.
-static int xdna_ops_consumers(const struct ggml_cgraph * cgraph, const struct ggml_tensor * t) {
-    int n = 0;
-    for (int i = 0; i < cgraph->n_nodes; i++) {
-        const struct ggml_tensor * node = cgraph->nodes[i];
-        for (int s = 0; s < GGML_MAX_SRC && node->src[s]; s++) {
-            if (node->src[s] == t) {
-                n++;
-            }
-        }
-    }
-    return n;
-}
-
-bool xdna_ops_gemv_absorbed(const xdna_ops * ops, const struct ggml_tensor * node) {
-    return ops->gemv_absorbed.count(node) != 0;
-}
-
-// Recognise a gate/up pair whose results only feed silu(gate)*up, and fold
-// that multiply into the dispatch. On success `gate`, `up`, the silu and the
-// multiply are returned so the caller can absorb them.
-static bool xdna_ops_ffn_pair(const struct ggml_cgraph * cgraph,
-                              const xdna_ops::gemv_group & grp,
-                              struct ggml_tensor ** gate, struct ggml_tensor ** up,
-                              struct ggml_tensor ** silu, struct ggml_tensor ** mul) {
-    if (grp.nodes.size() != 2) {
-        return false;
-    }
-
-    // Nothing outside the fold may read the pieces it consumes.
-    const auto fold_ok = [&](const struct ggml_tensor * g, const struct ggml_tensor * u,
-                             const struct ggml_tensor * s, const struct ggml_tensor * m) {
-        return xdna_ops_consumers(cgraph, g) == 1 && xdna_ops_consumers(cgraph, u) == 1 &&
-               (s == nullptr || xdna_ops_consumers(cgraph, s) == 1) && ggml_is_contiguous(m);
-    };
-
-    for (int i = 0; i < cgraph->n_nodes; i++) {
-        struct ggml_tensor * n = cgraph->nodes[i];
-
-        // The form llama.cpp actually builds for a gated FFN: one GLU node,
-        // ggml_swiglu_split(gate, up), which is silu(src0)*src1 - the `swapped`
-        // parameter only orders the halves of a single source. There is no
-        // separate silu node to absorb.
-        if (n->op == GGML_OP_GLU && n->src[1] &&
-            ggml_get_glu_op(n) == GGML_GLU_OP_SWIGLU) {
-            struct ggml_tensor * g = n->src[0];
-            struct ggml_tensor * u = n->src[1];
-            const bool pair = (g == grp.nodes[0] && u == grp.nodes[1]) ||
-                              (g == grp.nodes[1] && u == grp.nodes[0]);
-            if (!pair) {
-                continue;
-            }
-            if (!fold_ok(g, u, nullptr, n)) {
-                return false;
-            }
-            *gate = g;
-            *up   = u;
-            *silu = nullptr;
-            *mul  = n;
-            return true;
-        }
-
-        // The unfused form, silu followed by a mul, for graphs built that way.
-        if (n->op != GGML_OP_UNARY || ggml_get_unary_op(n) != GGML_UNARY_OP_SILU) {
-            continue;
-        }
-        struct ggml_tensor * g = n->src[0];
-        struct ggml_tensor * u = (g == grp.nodes[0]) ? grp.nodes[1]
-                               : (g == grp.nodes[1]) ? grp.nodes[0] : nullptr;
-        if (!u) {
-            continue;
-        }
-        for (int j = i + 1; j < cgraph->n_nodes; j++) {
-            struct ggml_tensor * m = cgraph->nodes[j];
-            if (m->op != GGML_OP_MUL) {
-                continue;
-            }
-            const bool match = (m->src[0] == n && m->src[1] == u) ||
-                               (m->src[0] == u && m->src[1] == n);
-            if (!match) {
-                continue;
-            }
-            if (!fold_ok(g, u, n, m)) {
-                return false;
-            }
-            *gate = g;
-            *up   = u;
-            *silu = n;
-            *mul  = m;
-            return true;
-        }
-    }
-    return false;
-}
-
 void xdna_ops_plan_gemv(xdna_ops * ops, const struct ggml_cgraph * cgraph,
                         const std::unordered_set<const struct ggml_tensor *> * skip) {
     // Rebuilt per graph, so every group starts unrun.
     ops->gemv_groups.clear();
     ops->gemv_group_of.clear();
-    ops->gemv_absorbed.clear();
     // The per-op route needs the merged artifact: on any other one a
     // projection outside the fused layers reconfigures the array for its own
     // xclbin, which costs more than the projection.
-    if (!xdna_gemv_enabled() && !(ops->fused_gemv && xdna_gemv_ops_enabled())) {
+    if (!ops->fused_gemv) {
         return;
     }
 
-    // Why a graph claims nothing is otherwise invisible: the planner just
-    // returns empty and every op falls back to the host.
-    static const bool debug = getenv("GGML_XDNA_GEMV_DEBUG") != nullptr;
-    std::map<std::string, int> rejected;
-    int n_mul_mat = 0;
     // The split decides the artifact, and therefore the hardware context. On
     // the merged layer artifact a projection outside the fused layers costs
     // only its own work; on the standalone GEMV xclbin it costs a
     // reconfiguration of the array as well, which is what made this route
     // measure 4x worse than leaving those projections on the host.
-    const xdna_gemv_split split = (ops->fused_gemv && xdna_gemv_ops_enabled())
-                                      ? XDNA_GEMV_SPLIT_FUSED
-                                      : XDNA_GEMV_SPLIT_DEFAULT;
+    const xdna_gemv_split split = ops->fused_gemv ? XDNA_GEMV_SPLIT_FUSED
+                                                  : XDNA_GEMV_SPLIT_DEFAULT;
     const auto claimed = [&](const struct ggml_tensor * n) {
         return skip && skip->count(n) != 0;
     };
 
     for (int i = 0; i < cgraph->n_nodes; i++) {
         struct ggml_tensor * node = cgraph->nodes[i];
-        const char * why = "claimed";
-        const bool ok = !claimed(node) && xdna_gemv_geom_for(node, &why, split).valid();
-        if (debug && node->op == GGML_OP_MUL_MAT) {
-            n_mul_mat++;
-            char buf[128];
-            snprintf(buf, sizeof(buf), "%-26s K%-6d N%-6d", why,
-                     (int) node->src[0]->ne[0], (int) node->src[0]->ne[1]);
-            rejected[buf]++;
-        }
+        const bool ok = !claimed(node) && xdna_gemv_geom_for(node, nullptr, split).valid();
         if (!ok || ops->gemv_group_of.count(node)) {
             continue;
         }
@@ -1443,10 +986,7 @@ void xdna_ops_plan_gemv(xdna_ops * ops, const struct ggml_cgraph * cgraph,
         // at 56 GB/s and ~150 us a dispatch that is worth it up to about 8 MB,
         // and the projections this joins are far under.
         // GGML_XDNA_GEMV_PROMOTE=0 keeps a group to one natural format.
-        static const bool promote = []() {
-            const char * e = getenv("GGML_XDNA_GEMV_PROMOTE");
-            return e == nullptr || atoi(e) != 0;
-        }();
+        static const bool promote = xdna_env_on("GGML_XDNA_GEMV_PROMOTE");
         enum ggml_type gtype = node->src[0]->type;
         for (int j = i + 1; j < cgraph->n_nodes; j++) {
             struct ggml_tensor * cand = cgraph->nodes[j];
@@ -1481,30 +1021,6 @@ void xdna_ops_plan_gemv(xdna_ops * ops, const struct ggml_cgraph * cgraph,
         if (!grp.geom.valid()) {
             continue;
         }
-        // Close the FFN activation on the cores when the shape allows it.
-        struct ggml_tensor * gate = nullptr;
-        struct ggml_tensor * up   = nullptr;
-        struct ggml_tensor * silu = nullptr;
-        struct ggml_tensor * mul  = nullptr;
-        if (xdna_gemv_epilogue_enabled() &&
-            xdna_ops_ffn_pair(cgraph, grp, &gate, &up, &silu, &mul)) {
-            const xdna_gemv_geom eg =
-                xdna_gemv_variant(gate->src[0]->type, node->src[0]->ne[0], n_total,
-                                  true, split);
-            if (eg.valid()) {
-                // The gate weight must come first: a core pairs its gate half
-                // with its up half by position.
-                grp.nodes = { gate, up };
-                grp.geom  = eg;
-                grp.out   = mul;
-                xdna_gemv_colmap(eg, grp.colmap);
-                if (silu) {
-                    ops->gemv_absorbed.insert(silu);
-                }
-                ops->gemv_absorbed.insert(mul);
-            }
-        }
-
         const int idx = (int) ops->gemv_groups.size();
         for (struct ggml_tensor * n : grp.nodes) {
             ops->gemv_group_of[n] = idx;
@@ -1512,72 +1028,6 @@ void xdna_ops_plan_gemv(xdna_ops * ops, const struct ggml_cgraph * cgraph,
         ops->gemv_groups.push_back(std::move(grp));
     }
 
-    if (debug) {
-        // The whole MUL_MAT list of the first few graphs: what a layer's
-        // projections actually look like to the planner - name, shape, type,
-        // and whether a group took them - is otherwise invisible.
-        static int listed = 0;
-        int n_decode_mm = 0;
-        for (int i = 0; i < cgraph->n_nodes; i++) {
-            const struct ggml_tensor * n = cgraph->nodes[i];
-            n_decode_mm += n->op == GGML_OP_MUL_MAT && n->ne[1] == 1;
-        }
-        if (listed < 1 && n_decode_mm > 8) {
-            listed++;
-            for (int i = 0; i < cgraph->n_nodes; i++) {
-                const struct ggml_tensor * n = cgraph->nodes[i];
-                if (n->op != GGML_OP_MUL_MAT || n->ne[1] != 1) {
-                    continue;
-                }
-                const char * why = "claimed";
-                const bool ok = !claimed(n) &&
-                                xdna_gemv_geom_for(n, &why, split).valid();
-                fprintf(stderr, "xdna-gemv-debug: i%-5d %-26s K%-6d N%-6d %-8s "
-                        "act=%-22s grp=%-3d %s\n", i,
-                        ggml_get_name(n) ? ggml_get_name(n) : "?",
-                        (int) n->src[0]->ne[0], (int) n->src[0]->ne[1],
-                        ggml_type_name(n->src[0]->type),
-                        ggml_get_name(n->src[1]) ? ggml_get_name(n->src[1]) : "?",
-                        ops->gemv_group_of.count(n)
-                            ? ops->gemv_group_of[n] : -1,
-                        ok ? "" : why);
-            }
-        }
-        // What the host is left holding, in weight bytes: the decode's cost
-        // is the weights it streams, wherever it streams them.
-        {
-            size_t host_b = 0, npu_b = 0;
-            int host_n = 0;
-            for (int i = 0; i < cgraph->n_nodes; i++) {
-                const struct ggml_tensor * n = cgraph->nodes[i];
-                if (n->op != GGML_OP_MUL_MAT || n->ne[1] != 1) {
-                    continue;
-                }
-                const size_t b = ggml_nbytes(n->src[0]);
-                if (ops->gemv_group_of.count(n)) {
-                    npu_b += b;
-                } else {
-                    host_b += b;
-                    host_n++;
-                }
-            }
-            if (host_n > 4) {
-                fprintf(stderr, "xdna-gemv-debug: decode graph: host %d mul_mat "
-                        "%.2f MB, gemv %.2f MB\n", host_n,
-                        host_b / 1048576.0, npu_b / 1048576.0);
-            }
-        }
-        static int graphs = 0;
-        const int n_grp = (int) ops->gemv_groups.size();
-        fprintf(stderr, "xdna-gemv-debug: graph %d: %d nodes, %d mul_mat, "
-                "%d groups\n", graphs++, cgraph->n_nodes, n_mul_mat, n_grp);
-        if (n_grp == 0) {
-            for (const auto & kv : rejected) {
-                fprintf(stderr, "xdna-gemv-debug:   %s x%d\n",
-                        kv.first.c_str(), kv.second);
-            }
-        }
-    }
 }
 
 static bool gemm_supported(const xdna_ops * ops, const struct ggml_tensor * op) {
@@ -1595,12 +1045,6 @@ static bool gemm_supported(const xdna_ops * ops, const struct ggml_tensor * op) 
     const int N = (int) src0->ne[1];
     const int M = (int) src1->ne[1];
 
-    // Validate the NPU weight formats against the ggml dequant of this tensor.
-    // The probe sees every MUL_MAT weight, including the Q5_K/Q6_K ones that
-    // have no NPU route yet; the check itself runs once per tensor and is a
-    // no-op unless GGML_XDNA_VERIFY is set.
-    xdna_wfmt_selfcheck(src0->type, src0->data, K, N, ggml_get_name(src0));
-
     // Decode shapes with a GEMV artifact take that route regardless of the
     // GEMM geometry.
     if (xdna_gemv_geom_for(op).valid()) {
@@ -1613,7 +1057,7 @@ static bool gemm_supported(const xdna_ops * ops, const struct ggml_tensor * op) 
     if (M <= 0) {
         return false;
     }
-    const bool prefill_m = M >= ops->gemm_big_m_min;
+    const bool prefill_m = M >= GEMM_M_BIG_MIN;
     const bool is_q = src0->type == GGML_TYPE_Q4_K ||
                       src0->type == GGML_TYPE_Q5_K ||
                       src0->type == GGML_TYPE_Q6_K;
@@ -1672,11 +1116,6 @@ void xdna_ops_init(xdna_ops * ops, xdna_kernel_pool * pool) {
     ops->pref_blocks.clear();
     ops->pref_xclbin.clear();
     ops->i8_xclbin.clear();
-    ops->gemm_big_m_min = xdna_env_int("GGML_XDNA_GEMM_BIG_M_MIN", 64);
-    // The TXN stream builder emits the row-sweep schedule, so every baked
-    // prefill block is usable. GGML_XDNA_GEMM_M_MAX caps the block size for
-    // A/B testing (0 = no cap).
-    ops->gemm_m_max     = xdna_env_int("GGML_XDNA_GEMM_M_MAX", 0);
 
     // Stems are gemm_bf16_f32_M%d_K%d_N%d_c%d and gemm_int8_int32_M%d_K%d_N%d_c%d
     // (see CMakeLists). The decode M block (GGML_XDNA_GEMM_M) is the native bf16
@@ -1722,7 +1161,7 @@ void xdna_ops_init(xdna_ops * ops, xdna_kernel_pool * pool) {
     }
     GGML_LOG_INFO("%s: GEMM geometries: decode=%s prefill blocks=[%s] int8 blocks=[%s] (big-M threshold %d)\n",
                   "xdna-ops", ops->gemm_xclbin_decode.c_str(), blocks.c_str(),
-                  ops->i8_xclbin.empty() ? "-" : blocks.c_str(), ops->gemm_big_m_min);
+                  ops->i8_xclbin.empty() ? "-" : blocks.c_str(), GEMM_M_BIG_MIN);
 }
 
 bool xdna_ops_supported(const xdna_ops * ops, const struct ggml_tensor * op) {
@@ -1745,7 +1184,7 @@ bool xdna_ops_supported(const xdna_ops * ops, const struct ggml_tensor * op) {
     //
     // GGML_XDNA_GEMV_OPS=0 puts them back on the host.
     if (ops->isolation && op->ne[1] <= 1 &&
-        !(xdna_gemv_ops_enabled() && ops->gemv_group_of.count(op))) {
+        !(true && ops->gemv_group_of.count(op))) {
         return false;
     }
     switch (op->op) {
@@ -1753,7 +1192,7 @@ bool xdna_ops_supported(const xdna_ops * ops, const struct ggml_tensor * op) {
             return gemm_supported(ops, op);
         case GGML_OP_GATED_DELTA_NET:
             // Prefill recurrent body offloaded to the GDN prefill kernel
-            // (kernels/gdn-prefill.py) when the artifact is present.
+            // (kernels/gdn_prefill.py) when the artifact is present.
             return xdna_gdn_prefill_supported(op);
         case GGML_OP_SSM_CONV:
             // Depthwise conv1d offloaded to the conv kernel when present.

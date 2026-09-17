@@ -31,21 +31,19 @@ struct xdna_kernel {
     xrt::kernel                      kernel;
     xrt::bo                          insts_bo;
     int64_t                          insts_bytes = 0;
-    std::string                      xclbin_name;   // for run tracing
+    std::string                      xclbin_name;
 };
 
 // A host-visible device buffer object (BO).
 struct xdna_buffer {
-    xrt::bo  bo;
-    size_t   bytes = 0;
+    xrt::bo bo;
+    size_t  bytes = 0;
 };
 
-// Pool of kernels: auto-scans the search dirs for kernel artifacts (xclbin
-// files), exposes their names, and lazily loads kernels on demand. Backend-specific selection (which kernel fits an op) is
-// done by the caller against the names. The runtime caches one hw_context per
-// xclbin uuid, so variants of one xclbin share it with no reload penalty.
-// Also pools host-visible buffers. Data only; the pool API lives in
-// xdna-runtime.h as C-style functions.
+// Pool of kernels: holds the artifact stems found in the search dirs and the
+// kernels loaded from them. The runtime caches one hw_context per xclbin uuid,
+// so variants of one xclbin share it with no reload penalty. Also pools
+// host-visible buffers.
 struct xdna_kernel_pool {
     struct pool_entry {
         xdna_buffer * buf;

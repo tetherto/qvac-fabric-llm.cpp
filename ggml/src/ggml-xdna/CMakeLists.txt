@@ -5,9 +5,7 @@ find_package(xrt REQUIRED)
 ggml_add_backend_library(ggml-xdna
                          ggml-xdna.cpp
                          xdna-runtime.cpp
-                         xdna-kernel-pool.cpp
                          xdna-seq.cpp
-                         xdna-verify.cpp
                          xdna-quant.cpp
                          xdna-gemv.cpp
                          xdna-seq-attn.cpp
@@ -17,7 +15,6 @@ ggml_add_backend_library(ggml-xdna
                          xdna-conv-prefill.cpp
                          xdna-rec.cpp
                          xdna-rec-gemv.cpp
-                         xdna-rec-post.cpp
                         )
 
 target_link_libraries(ggml-xdna PRIVATE XRT::xrt_coreutil)
@@ -59,7 +56,6 @@ set(XDNA_N_COMPUTE_ROWS 4)  # compute tile rows
 target_compile_definitions(ggml-xdna PRIVATE
     GGML_XDNA_GEMM_M=${XDNA_GEMM_M}
     GGML_XDNA_TILE_M=${XDNA_TILE_M}
-    GGML_XDNA_GEMM_M_BIG=${XDNA_GEMM_M_BIG}
     GGML_XDNA_TILE_M_BIG=${XDNA_TILE_M_BIG}
     GGML_XDNA_TILE_M_BIG_I8=${XDNA_TILE_M_BIG_I8}
     GGML_XDNA_TILE_K=${XDNA_TILE_K}
@@ -189,7 +185,7 @@ if (GGML_XDNA_BUILD_KERNELS)
         list(APPEND XDNA_ARTIFACTS ${INT8_XCLBIN} ${INT8_INSTS})
     endforeach()
 
-    # GDN prefill kernel (gdn-prefill.py + gdn-prefill.cc): the bf16 CS=64-token
+    # GDN prefill kernel (gdn_prefill.py + gdn-prefill.cc): the bf16 CS=64-token
     # GGML_OP_GATED_DELTA_NET recurrence, run by xdna-gdn-prefill.cpp. The DMA
     # schedule is a host-built TXN stream at runtime; the .insts.bin here is
     # only a build-time reference and is never read by the runner. Stem follows
@@ -200,18 +196,18 @@ if (GGML_XDNA_BUILD_KERNELS)
 
     add_custom_command(
         OUTPUT ${GDN_PREFILL_XCLBIN} ${GDN_PREFILL_INSTS}
-        COMMAND ${GEMM_PYTHON} "${GEMM_DIR}/gdn-prefill.py"
+        COMMAND ${GEMM_PYTHON} "${GEMM_DIR}/gdn_prefill.py"
                 -d npu2
                 --xclbin-path ${GDN_PREFILL_XCLBIN}
                 --insts-path ${GDN_PREFILL_INSTS}
-        DEPENDS "${GEMM_DIR}/gdn-prefill.py" "${GEMM_DIR}/gdn-prefill.cc"
+        DEPENDS "${GEMM_DIR}/gdn_prefill.py" "${GEMM_DIR}/gdn-prefill.cc"
         WORKING_DIRECTORY "${GEMM_DIR}"
         COMMENT "ggml-xdna: compiling GDN prefill kernel S128 H16 CS64"
         VERBATIM
     )
     list(APPEND XDNA_ARTIFACTS ${GDN_PREFILL_XCLBIN} ${GDN_PREFILL_INSTS})
 
-    # SSM_CONV kernel (conv.py + conv.cc, ported from the qvac-fabric max2
+    # SSM_CONV kernel (conv.py + conv-ssm.cc, ported from the qvac-fabric max2
     # branch): causal depthwise conv1d, token-major layout (no host transpose),
     # C=16 channels x 8 cols x 4 rows = 512 channels per tile, T=256 token
     # tiles, MB=8 tiles streamed per run. Host loops the 6144/512 channel
@@ -229,14 +225,14 @@ if (GGML_XDNA_BUILD_KERNELS)
                 --bf16
                 --xclbin-path ${CONV_XCLBIN}
                 --insts-path ${CONV_INSTS}
-        DEPENDS "${GEMM_DIR}/conv.py" "${GEMM_DIR}/conv.cc"
+        DEPENDS "${GEMM_DIR}/conv.py" "${GEMM_DIR}/conv-ssm.cc"
         WORKING_DIRECTORY "${GEMM_DIR}"
         COMMENT "ggml-xdna: compiling conv kernel C16 T256 KW4 MB8 (token-major, bf16)"
         VERBATIM
     )
     list(APPEND XDNA_ARTIFACTS ${CONV_XCLBIN} ${CONV_INSTS})
 
-    # Flash attention kernel (fa.py + fa.cc) for the six full-attention prefill
+    # Flash attention kernel (fa.py + attn-fa.cc) for the six full-attention prefill
     # layers: 8 columns = 8 query heads, 4 cores a column each owning 32
     # queries, 64 key tiles of 8 keys a dispatch. The host chains chunks of the
     # key range and rounds of the batch, so this one artifact covers every n_kv.
@@ -251,84 +247,45 @@ if (GGML_XDNA_BUILD_KERNELS)
                 --cols 8 --KVH 2 --MT 32 --JT 8 --NMB 1 --NJ 64
                 --xclbin-path ${FA_XCLBIN}
                 --insts-path ${FA_INSTS}
-        DEPENDS "${GEMM_DIR}/fa.py" "${GEMM_DIR}/fa.cc"
+        DEPENDS "${GEMM_DIR}/fa.py" "${GEMM_DIR}/attn-fa.cc"
         WORKING_DIRECTORY "${GEMM_DIR}"
         COMMENT "ggml-xdna: compiling flash attention kernel D256 MT32 JT8 NJ64"
         VERBATIM
     )
     list(APPEND XDNA_ARTIFACTS ${FA_XCLBIN} ${FA_INSTS})
 
-    # Fused decode A-half kernel (attn_gdn_gated.py + attn_cn.py + gdn_v.py +
-    # rec_gated.py): the merged recurrent-core decode kernel with the gated
-    # epilogue on-chip of the fused layer path (xdna-rec.cpp). The .insts.bin is
-    # only a build-time reference; the runner binds a host-built phased TXN
-    # stream (xdna-seq-attn.cpp). Stem: attn_gdn_gated.
-    set(ATTN_GDN_STEM "attn_gdn_gated")
-    set(ATTN_GDN_XCLBIN "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/${ATTN_GDN_STEM}.xclbin")
-    set(ATTN_GDN_INSTS  "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/${ATTN_GDN_STEM}.insts.bin")
-
+    # Fused decode (fused_layer.py): the whole recurrent layer in one xclbin -
+    # the conv+norm+gdn+gated core, the decode GEMV its projections run on, and
+    # the FFN transition tile, side by side so a layer's dispatches share one
+    # hardware context. The .insts.bin is only a build-time reference; the
+    # runner binds a host-built phased TXN stream.
+    #
+    # ACT_RAW=1 puts the FFN transition on a tile of this design (the residual
+    # add, the norm and the quantization), so the host has nothing to do
+    # between a layer's dispatches.
+    set(FL_XCLBIN "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/fused_layer.xclbin")
+    set(FL_INSTS  "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/fused_layer.insts.bin")
     add_custom_command(
-        OUTPUT ${ATTN_GDN_XCLBIN} ${ATTN_GDN_INSTS}
-        COMMAND ${GEMM_PYTHON} "${GEMM_DIR}/attn_gdn_gated.py"
+        OUTPUT ${FL_XCLBIN} ${FL_INSTS}
+        COMMAND ${CMAKE_COMMAND} -E env ACT_RAW=1
+                ${GEMM_PYTHON} "${GEMM_DIR}/fused_layer.py"
                 -d npu2
-                --workdir ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}
-                --tag ""
-        DEPENDS "${GEMM_DIR}/attn_gdn_gated.py" "${GEMM_DIR}/attn_cn.py"
+                --xclbin-path ${FL_XCLBIN}
+                --insts-path ${FL_INSTS}
+        DEPENDS "${GEMM_DIR}/fused_layer.py" "${GEMM_DIR}/attn_gdn_gated.py"
+                "${GEMM_DIR}/gemv_q4.py" "${GEMM_DIR}/gemv-q4.cc"
+                "${GEMM_DIR}/gemv-zero.cc" "${GEMM_DIR}/attn_cn.py"
                 "${GEMM_DIR}/gdn_v.py" "${GEMM_DIR}/rec_gated.py"
+                "${GEMM_DIR}/rec_post.py"
         WORKING_DIRECTORY "${GEMM_DIR}"
-        COMMENT "ggml-xdna: compiling fused decode kernel attn_gdn_gated"
+        COMMENT "ggml-xdna: compiling the merged recurrent layer"
         VERBATIM
     )
-    list(APPEND XDNA_ARTIFACTS ${ATTN_GDN_XCLBIN} ${ATTN_GDN_INSTS})
+    list(APPEND XDNA_ARTIFACTS ${FL_XCLBIN} ${FL_INSTS})
 
-    # Fused decode ssm_out kernel (attn_so_mmul.py): the int4 (Q5_K ssm_out)
-    # matmul of the fused layer path (xdna-rec.cpp). The .insts.bin is only a
-    # build-time reference; the runner binds a host-built TXN stream. Stem:
-    # attn_so_mmul. Geometry is fixed by the Qwen3.5-0.8B constants in the
-    # design (K_SO/N_SO/NCOL), which the C++ rec path also assumes.
-    set(SO_STEM "attn_so_mmul")
-    set(SO_XCLBIN "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/${SO_STEM}.xclbin")
-    set(SO_INSTS  "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/${SO_STEM}.insts.bin")
 
-    add_custom_command(
-        OUTPUT ${SO_XCLBIN} ${SO_INSTS}
-        COMMAND ${GEMM_PYTHON} "${GEMM_DIR}/attn_so_mmul.py"
-                -d npu2
-                --workdir ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}
-                --compile
-        DEPENDS "${GEMM_DIR}/attn_so_mmul.py" "${GEMM_DIR}/ffn_layer_mmul.py"
-                "${GEMM_DIR}/proj_qK.py" "${GEMM_DIR}/ffn_mid.py"
-        WORKING_DIRECTORY "${GEMM_DIR}"
-        COMMENT "ggml-xdna: compiling fused decode ssm_out kernel attn_so_mmul"
-        VERBATIM
-    )
-    list(APPEND XDNA_ARTIFACTS ${SO_XCLBIN} ${SO_INSTS})
-
-    # Fused decode FFN kernel (ffn_layer_mmul.py --stage ab): the whole FFN of
-    # the fused layer path (xdna-rec.cpp), stage-A gate/up int4 + stage-B down
-    # int4 with the silu in-core. The .insts.bin is only a build-time
-    # reference. Stem: ffn_mmul_ab. Geometry is fixed by the Qwen3.5-0.8B
-    # constants in the design (K/N_MID/K_DOWN/N_OUT, n_a=n_b=4).
-    set(FFN_STEM "ffn_mmul_ab")
-    set(FFN_XCLBIN "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/${FFN_STEM}.xclbin")
-    set(FFN_INSTS  "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/${FFN_STEM}.insts.bin")
-
-    add_custom_command(
-        OUTPUT ${FFN_XCLBIN} ${FFN_INSTS}
-        COMMAND ${GEMM_PYTHON} "${GEMM_DIR}/ffn_layer_mmul.py"
-                -d npu2
-                --workdir ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}
-                --compile
-        DEPENDS "${GEMM_DIR}/ffn_layer_mmul.py" "${GEMM_DIR}/proj_qK.py"
-                "${GEMM_DIR}/ffn_mid.py"
-        WORKING_DIRECTORY "${GEMM_DIR}"
-        COMMENT "ggml-xdna: compiling fused decode FFN kernel ffn_mmul_ab"
-        VERBATIM
-    )
-    list(APPEND XDNA_ARTIFACTS ${FFN_XCLBIN} ${FFN_INSTS})
-
-    # Decode GEMV (gemv_q4.py + gemv_q4.cc): a single artifact. Both code
-    # widths pack into the same tile size, so one design streams either and
+    # Decode GEMV (gemv_q4.py + gemv-q4.cc): one artifact per array split. Both
+    # code widths pack into the same tile size, so one design streams either and
     # Q4_K keeps its 4-bit codes; a second artifact would be a second hardware
     # context, and the NPU reconfigures the array between them.
     # The core program depends only on (format, n_core, k_tile) - K, N and the
@@ -336,107 +293,42 @@ if (GGML_XDNA_BUILD_KERNELS)
     # decode shape shares one xclbin and therefore one hardware context. The
     # shape it is compiled at only fixes IRON's own instruction stream, which
     # the backend replaces with xdna_gemv_seq_build.
-    set(XDNA_GEMV_COLS   8)     # AIE columns instantiated
+    set(XDNA_GEMV_COLS 8)     # AIE columns instantiated
 
-    # Two ways of splitting the same array, both covering 1024 output columns
-    # per pass: "n_core rows row-list". Four rows of 32 is the standalone
-    # decode geometry; two rows of 64 leaves every column a row for the fused
-    # layer's GDN core, and is also how much less of the array a design can
-    # configure while doing the same work, which the backend can A/B with
-    # GGML_XDNA_GEMV_ROWS=2.
-    set(XDNA_GEMV_SPLITS
-        "32 4 2,3,4,5"
-        "64 2 3,5|3,5|2,5|2,5|2,3|2,3|2,3|2,3")
+    # The per-op decode split: four rows of 32 output columns per core covers
+    # 1024 columns per pass. The fused layer's projections use the split that
+    # shares the array with the GDN core instead (gemv_n128_r1_c8, built as
+    # part of fused_layer).
+    set(GV_N_CORE 32)
+    set(GV_ROWS 4)
+    set(GV_ROW_MAP "2,3,4,5")
+    set(GV_STEM "gemv_n${GV_N_CORE}_r${GV_ROWS}_c${XDNA_GEMV_COLS}")
+    set(GV_XCLBIN "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/${GV_STEM}.xclbin")
+    set(GV_INSTS  "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/${GV_STEM}.insts.bin")
 
-    foreach(GV_SPLIT IN LISTS XDNA_GEMV_SPLITS)
-        string(REGEX MATCHALL "[^ ]+" GV_PARTS "${GV_SPLIT}")
-        list(GET GV_PARTS 0 GV_N_CORE)
-        list(GET GV_PARTS 1 GV_ROWS)
-        list(GET GV_PARTS 2 GV_ROW_MAP)
-        set(GV_STEM "gemv_n${GV_N_CORE}_r${GV_ROWS}_c${XDNA_GEMV_COLS}")
-        set(GV_XCLBIN "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/${GV_STEM}.xclbin")
-        set(GV_INSTS  "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/${GV_STEM}.insts.bin")
-
-        add_custom_command(
-            OUTPUT ${GV_XCLBIN} ${GV_INSTS}
-            COMMAND ${GEMM_PYTHON} "${GEMM_DIR}/gemv_q4.py"
-                    -d npu2 --fmt q8g16
-                    -K 1024 -N 1024
-                    --n-core ${GV_N_CORE}
-                    --rows ${GV_ROW_MAP}
-                    --cols ${XDNA_GEMV_COLS}
-                    --xclbin-path ${GV_XCLBIN}
-                    --insts-path ${GV_INSTS}
-            DEPENDS "${GEMM_DIR}/gemv_q4.py" "${GEMM_DIR}/gemv_q4.cc"
-                    "${GEMM_DIR}/gemv_zero.cc" "${GEMM_DIR}/wfmt.py"
-            WORKING_DIRECTORY "${GEMM_DIR}"
-            COMMENT "ggml-xdna: compiling decode GEMV ${GV_STEM}"
-            VERBATIM
-        )
-        list(APPEND XDNA_ARTIFACTS ${GV_XCLBIN} ${GV_INSTS})
-    endforeach()
-
-    # The whole recurrent layer in one xclbin (fused_layer.py): the fused
-    # conv+norm+gdn+gated core and the decode GEMV configured side by side, so
-    # a layer's dispatches share one hardware context instead of reconfiguring
-    # the array between them. The fused decode path uses it when it is present
-    # and falls back to the separate artifacts when it is not.
-    option(GGML_XDNA_BUILD_FUSED_LAYER "build the merged recurrent-layer xclbin" ON)
-    if (GGML_XDNA_BUILD_FUSED_LAYER)
-        set(FL_XCLBIN "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/fused_layer.xclbin")
-        set(FL_INSTS  "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/fused_layer.insts.bin")
-        # ACT_RAW=1 puts the FFN transition on a tile of this design (the
-        # residual add, the norm and the quantization), so the host has nothing
-        # to do between a layer's two dispatches. Only this artifact gets it:
-        # the standalone GEMV ones have no prologue tile and would be handed
-        # numbers where they expect codes.
-        add_custom_command(
-            OUTPUT ${FL_XCLBIN} ${FL_INSTS}
-            COMMAND ${CMAKE_COMMAND} -E env ACT_RAW=1
-                    ${GEMM_PYTHON} "${GEMM_DIR}/fused_layer.py"
-                    -d npu2
-                    --xclbin-path ${FL_XCLBIN}
-                    --insts-path ${FL_INSTS}
-            DEPENDS "${GEMM_DIR}/fused_layer.py" "${GEMM_DIR}/attn_gdn_gated.py"
-                    "${GEMM_DIR}/gemv_q4.py" "${GEMM_DIR}/gemv_q4.cc"
-                    "${GEMM_DIR}/gemv_zero.cc" "${GEMM_DIR}/attn_cn.py"
-                    "${GEMM_DIR}/gdn_v.py" "${GEMM_DIR}/rec_gated.py"
-            WORKING_DIRECTORY "${GEMM_DIR}"
-            COMMENT "ggml-xdna: compiling the merged recurrent layer"
-            VERBATIM
-        )
-        list(APPEND XDNA_ARTIFACTS ${FL_XCLBIN} ${FL_INSTS})
-
-        # The same design as a self-contained full ELF. The sequence becomes
-        # the ELF's control code instead of an instruction stream the host
-        # builds and patches, so the layer's buffers are plain kernel
-        # arguments - the six a patched stream is limited to is what keeps a
-        # layer at more than one dispatch.
-        set(FL_ELF "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/fused_layer_full.elf")
-        add_custom_command(
-            OUTPUT ${FL_ELF}
-            COMMAND ${CMAKE_COMMAND} -E env ACT_RAW=1
-                    ${GEMM_PYTHON} "${GEMM_DIR}/fused_layer.py"
-                    -d npu2
-                    --elf-path ${FL_ELF}
-            DEPENDS "${GEMM_DIR}/fused_layer.py" "${GEMM_DIR}/attn_gdn_gated.py"
-                    "${GEMM_DIR}/gemv_q4.py" "${GEMM_DIR}/gemv_q4.cc"
-                    "${GEMM_DIR}/gemv_zero.cc" "${GEMM_DIR}/attn_cn.py"
-                    "${GEMM_DIR}/gdn_v.py" "${GEMM_DIR}/rec_gated.py"
-            WORKING_DIRECTORY "${GEMM_DIR}"
-            COMMENT "ggml-xdna: compiling the merged recurrent layer as a full ELF"
-            VERBATIM
-        )
-        list(APPEND XDNA_ARTIFACTS ${FL_ELF})
-    endif()
+    add_custom_command(
+        OUTPUT ${GV_XCLBIN} ${GV_INSTS}
+        COMMAND ${GEMM_PYTHON} "${GEMM_DIR}/gemv_q4.py"
+                -d npu2 --fmt q8g16
+                -K 1024 -N 1024
+                --n-core ${GV_N_CORE}
+                --rows ${GV_ROW_MAP}
+                --cols ${XDNA_GEMV_COLS}
+                --xclbin-path ${GV_XCLBIN}
+                --insts-path ${GV_INSTS}
+        DEPENDS "${GEMM_DIR}/gemv_q4.py" "${GEMM_DIR}/gemv-q4.cc"
+                "${GEMM_DIR}/gemv-zero.cc" "${GEMM_DIR}/wfmt.py"
+        WORKING_DIRECTORY "${GEMM_DIR}"
+        COMMENT "ggml-xdna: compiling decode GEMV ${GV_STEM}"
+        VERBATIM
+    )
+    list(APPEND XDNA_ARTIFACTS ${GV_XCLBIN} ${GV_INSTS})
 
     # Tagged copies of every artifact the backend loads under a design-tagged
     # name (design_tag.py). One run covers them all, after any of them built:
     # the tag hashes all the design sources, so a change anywhere moves the tag
     # for the designs ninja did not rebuild too.
-    set(XDNA_TAGGED_STEMS
-        attn_gdn_gated attn_so_mmul ffn_mmul_ab fused_layer
-        gemv_n32_r4_c8 gemv_n64_r2_c8)
+    set(XDNA_TAGGED_STEMS fused_layer gemv_n32_r4_c8)
     set(XDNA_TAGGED_ARTIFACTS)
     foreach(TS IN LISTS XDNA_TAGGED_STEMS)
         foreach(TE IN ITEMS .xclbin .insts.bin)
@@ -455,41 +347,6 @@ if (GGML_XDNA_BUILD_KERNELS)
         VERBATIM
     )
     list(APPEND XDNA_ARTIFACTS ${XDNA_TAGGED_ARTIFACTS})
-
-    # The FFN transition as its own xclbin (post_norm.py): residual add, rms
-    # norm and the FFN's activation tiles on one core, dispatched between the
-    # fused core and the FFN pair.
-    set(POST_STEM "post_norm")
-    set(POST_XCLBIN "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/${POST_STEM}.xclbin")
-    set(POST_INSTS  "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/${POST_STEM}.insts.bin")
-    add_custom_command(
-        OUTPUT ${POST_XCLBIN} ${POST_INSTS}
-        COMMAND ${GEMM_PYTHON} "${GEMM_DIR}/post_norm.py"
-                -d npu2
-                --xclbin-path ${POST_XCLBIN}
-                --insts-path ${POST_INSTS}
-        DEPENDS "${GEMM_DIR}/post_norm.py" "${GEMM_DIR}/design_tag.py"
-        WORKING_DIRECTORY "${GEMM_DIR}"
-        COMMENT "ggml-xdna: compiling the FFN transition kernel post_norm"
-        VERBATIM
-    )
-    list(APPEND XDNA_ARTIFACTS ${POST_XCLBIN} ${POST_INSTS})
-
-    # The same design as a self-contained full ELF (PDIs + control code), the
-    # platform's mode for a dispatch between other dispatches: no xclbin
-    # context to cross.
-    set(POST_ELF "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/${POST_STEM}_full.elf")
-    add_custom_command(
-        OUTPUT ${POST_ELF}
-        COMMAND ${GEMM_PYTHON} "${GEMM_DIR}/post_norm.py"
-                -d npu2
-                --elf-path ${POST_ELF}
-        DEPENDS "${GEMM_DIR}/post_norm.py"
-        WORKING_DIRECTORY "${GEMM_DIR}"
-        COMMENT "ggml-xdna: compiling the FFN transition as a full ELF"
-        VERBATIM
-    )
-    list(APPEND XDNA_ARTIFACTS ${POST_ELF})
 
     add_custom_target(ggml-xdna-kernels ALL DEPENDS ${XDNA_ARTIFACTS})
 

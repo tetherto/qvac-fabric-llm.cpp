@@ -12,7 +12,6 @@
 struct xdna_device;
 
 // True when the xclbin + insts artifacts are present.
-bool xdna_conv_prefill_enabled(void);
 
 // True when `node` is a GGML_OP_SSM_CONV prefill op the kernel covers.
 bool xdna_conv_prefill_supported(const struct ggml_tensor * node);

@@ -1,11 +1,13 @@
 # Every kernel artifact is copied to a name carrying a hash of the design
 # sources and the build-time knobs, and the backend looks only for that name.
+# The hash covers what the artifacts are built from, not the interpreter that
+# happened to run the build, so two interpreters over the same sources agree.
 # A backend that moved on while the artifacts stayed behind - the ninja trap
 # where the kernels target is not rebuilt - then fails with a clear message
 # instead of driving an old design with a new stream, which reads as garbage
 # model output and no error at all.
 #
-# The hash is also written to ../xdna_design_tag.h, which the backend
+# The hash is also written to ../xdna-design-tag.h, which the backend
 # #includes, so the two sides can only drift if one of them is rebuilt and the
 # other is not - which is exactly the state the tagged name turns into a loud
 # failure.
@@ -15,36 +17,17 @@ import os
 import shutil
 
 KERNEL_DIR = os.path.dirname(os.path.abspath(__file__))
-HEADER = os.path.join(KERNEL_DIR, "..", "xdna_design_tag.h")
+HEADER = os.path.join(KERNEL_DIR, "..", "xdna-design-tag.h")
 
 # The build-time environment knobs a design reads. A change here is a change
 # of design, exactly like a change of source.
 DESIGN_ENV = {
     "ATT_DEPTH", "CONV_GPO", "CONV_SLOT", "CONV_SPREAD",
     "GATED_ACT_SPLIT", "GATED_ATTN_ONCHIP", "GATED_DEPTH", "GATED_HEADS",
-    "GATED_STUB", "GDN_STATE_STREAMS",
-    "GEMV_ACT_DEPTH", "GEMV_OUT_GROUP", "GEMV_PIN_W", "GEMV_SILU_ID",
-    "GEMV_SILU_STEP", "GEMV_STACK", "GEMV_STUB", "GEMV_VEC", "GEMV_W_DEPTH",
-    "PKV_ONCHIP", "POST_STUB",
+    "GATED_FMT", "GDN_STATE_STREAMS",
+    "GEMV_STACK", "GEMV_VEC", "GEMV_W_DEPTH",
+    "PKV_ONCHIP",
 }
-
-
-def _toolchain() -> str:
-    # The IRON compiler is what decides the design's placement, and the
-    # backend's streams know that placement by heart. A different toolchain is
-    # a different design even when the sources are byte-identical, so its
-    # versions are part of the tag.
-    try:
-        import importlib.metadata as md
-        parts = []
-        for name in ("mlir-aie", "llvm-aie"):
-            try:
-                parts.append(f"{name}={md.version(name)}")
-            except md.PackageNotFoundError:
-                pass
-        return ";".join(parts)
-    except Exception:
-        return ""
 
 
 def tag(extra: str = "") -> str:
@@ -56,7 +39,7 @@ def tag(extra: str = "") -> str:
             src.append(f + "\0" + fh.read().decode(errors="replace"))
     env = "".join(f"{k}={os.environ[k]}\n"
                   for k in sorted(DESIGN_ENV) if k in os.environ)
-    blob = "\0".join(src) + "\1" + env + "\2" + _toolchain() + "\3" + extra
+    blob = "\0".join(src) + "\1" + env + "\2" + extra
     return hashlib.sha256(blob.encode()).hexdigest()[:12]
 
 
@@ -76,11 +59,11 @@ def _write_header(t: str) -> None:
         print(f"design tag {t} (new)")
 
 
-# The stems the backend loads under tagged names. The GEMM prefill artifacts
-# are loaded by geometry-encoded names and stay untagged.
+# The stems the backend loads under tagged names: the merged recurrent-layer
+# design and the decode GEMV, one per array split. The prefill artifacts (GEMM,
+# conv, flash attention) are loaded by geometry-encoded names and stay untagged.
 KNOWN_STEMS = [
-    "attn_gdn_gated", "attn_so_mmul", "ffn_mmul_ab", "fused_layer",
-    "gemv_n32_r4_c8", "gemv_n64_r2_c8", "post_norm",
+    "fused_layer", "gemv_n32_r4_c8", "gemv_n128_r1_c8",
 ]
 
 

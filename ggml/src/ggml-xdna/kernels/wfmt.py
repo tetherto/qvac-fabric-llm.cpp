@@ -51,7 +51,7 @@ def group_size(fmt: str) -> int:
 
 def dequant_fn(fmt: str, k: int, n: int, s: int = MAC_S, t: int = MAC_T) -> ExternalFunction:
     """The core function that expands one packed tile into a bf16 (k, n) tile."""
-    src = (Path(__file__).resolve().parent / "dequant_b.cc").read_text()
+    src = (Path(__file__).resolve().parent / "gemm-dequant.cc").read_text()
     flags = [
         f"-DK_TILE={k}", f"-DN_TILE={n}",
         f"-DMAC_S={s}", f"-DMAC_T={t}", f"-DQ4_GROUP={Q4_GROUP}",

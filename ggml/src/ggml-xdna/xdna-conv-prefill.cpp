@@ -1,8 +1,8 @@
 #include "xdna-conv-prefill.h"
 #include "ggml-impl.h"
+#include "xdna-util.h"
 #include "xdna-runtime.h"
 #include "xdna-types.h"
-#include "xdna-profile.h"
 
 #include <cstdint>
 #include <cstdio>
@@ -90,16 +90,13 @@ void xdna_conv_prefill_direct_add(const struct ggml_tensor * concat,
     }
 }
 
-bool xdna_conv_prefill_enabled(void) {
+static bool conv_pf_enabled(void) {
     // On by default (GGML_XDNA_CONV=0 falls back to the host conv). The per-op
     // conv still round-trips its input and output through DDR, so it costs
-    // ~10% of prefill throughput against the host (interleaved pp1024 A/B:
-    // 1223 against 1361 t/s), but the op belongs on the array, and the bf16 BOs
-    // plus the vectorised pack/scatter keep that gap small. The host conv only
-    // looks cheap because it runs inside the CPU glue and overlaps the NPU GEMM
-    // stream, while an NPU dispatch serialises with it.
-    const char * v = getenv("GGML_XDNA_CONV");
-    if (v != nullptr && v[0] != '\0' && strcmp(v, "0") == 0) {
+    // ~10% of prefill throughput against the host, but the op belongs on the
+    // array, and the bf16 BOs plus the vectorised pack/scatter keep that gap
+    // small.
+    if (xdna_env_int("GGML_XDNA_CONV", 1) == 0) {
         return false;
     }
     for (const auto & dir : xdna_kernel_search_dirs()) {
@@ -114,7 +111,7 @@ bool xdna_conv_prefill_enabled(void) {
 
 bool xdna_conv_prefill_supported(const struct ggml_tensor * node) {
     using namespace conv_pf;
-    if (!xdna_conv_prefill_enabled() || !node || node->op != GGML_OP_SSM_CONV) {
+    if (!conv_pf_enabled() || !node || node->op != GGML_OP_SSM_CONV) {
         return false;
     }
     // Decode (single-token) SSM_CONV stays on the CPU: a one-token conv tile
@@ -255,7 +252,6 @@ bool xdna_conv_prefill_run(struct xdna_device * dev, struct ggml_tensor * node) 
     for (size_t sub = 0; sub < n_submits; sub++) {
         const size_t base = sub * MB;
         {
-        xdna_rp _pk("conv", "pack");
         ggml_bf16_t * xw_h = (ggml_bf16_t *) g_conv.xw->bo.map();
 
         for (int mb = 0; mb < MB; mb++) {
@@ -345,7 +341,6 @@ bool xdna_conv_prefill_run(struct xdna_device * dev, struct ggml_tensor * node) 
         xdna_buffer_sync_to_device(g_conv.xw);
         }
         {
-            xdna_rp _p("conv", "dispatch");
             xdna_buffer * args[2] = { g_conv.xw, g_conv.out };
             xrt::run run = xdna_kernel_run_start(g_conv.kern, args, 2);
             if (!xdna_run_wait(run)) {
@@ -353,7 +348,6 @@ bool xdna_conv_prefill_run(struct xdna_device * dev, struct ggml_tensor * node) 
             }
             xdna_buffer_sync_from_device(g_conv.out);
         }
-        xdna_rp _ps("conv", "scatter");
 
         // Scatter the real tiles of this batch into dst (token-major rows).
         const ggml_bf16_t * o = (const ggml_bf16_t *) g_conv.out->bo.map();

@@ -105,7 +105,7 @@ enum class xdna_dma_dir : uint32_t {
 // apart, is buf_len = run*reps, d0_size = run, d0_stride = 1, d1_size = reps,
 // d1_stride = stride. Anything unsure here is worth checking the same way:
 // build the pattern in IRON, disassemble the .insts.bin it ships beside the
-// xclbin (kernels/shim_map.py has the plumbing) and read the words.
+// xclbin (the .insts.bin it ships beside the xclbin and read the words.
 struct xdna_bd {
     uint32_t buf_len   = 0;   // total transfer length in bytes
     uint32_t buf_off   = 0;   // byte offset into the host buffer
@@ -243,7 +243,7 @@ bool xdna_gemm_seq_build(xdna_seq * seq, const xdna_gemm_tiles * tiles, int M, i
                          uint32_t b_offset = 0);
 
 // Fixed geometry of one CS=64-token GDN prefill chunk (S=128, H=16, see
-// kernels/gdn-prefill.py). Byte/word counts per shim column of the three
+// kernels/gdn_prefill.py). Byte/word counts per shim column of the three
 // host BOs: arg 0 = tok [H][CS][3*S+2] bf16, arg 1 = packed state|attn
 // [H][NS][ROWS*S + CS*ROWS] bf16, arg 2 = same packed buffer (in place).
 struct xdna_gdn_prefill_geom {
@@ -262,11 +262,11 @@ struct xdna_gdn_prefill_geom {
 // flows into the next chunk.
 bool xdna_gdn_prefill_seq_build(xdna_seq * seq, const xdna_gdn_prefill_geom * g);
 
-// Geometry of the merged conv+norm+gdn decode kernel (attn_gdn_txn.xclbin,
-// kernels/attn_gdn_txn.py). The worker layout is the rec_full design: conv on
+// Geometry of the merged conv+norm+gdn decode kernel (fused_layer.xclbin,
+// kernels/fused_layer.py). The worker layout is the rec_full design: conv on
 // cols 0..conv_cols-1, norm on the next norm_cols, bf16-vector gdn on the last
 // gdn_cols. The defaults match one 1024-wide Qwen3.5 gated-delta-net layer
-// (kernels/attn_gdn_txn.py resolve()); a default-constructed geometry is valid.
+// (kernels/fused_layer.py resolve()); a default-constructed geometry is valid.
 struct xdna_attn_gdn_geom {
     int feed_n    = 1024;   // floats per conv feed block
     // Floats of a slot the conv object carries; see CONV_SLOT in
@@ -286,8 +286,8 @@ struct xdna_attn_gdn_geom {
     // shim tile has one port for all of its channels, so the feed streaming in
     // and the x and history writes going out must not share a column - it is
     // the one thing that told this stage apart from the gdn block, which does
-    // reach the tile's rate. Read back from the artifact with
-    // kernels/shim_map.py; the design pins them (kernels/attn_gdn_gated.py).
+    // reach the tile's rate. Read back from the artifact; the design pins them
+    // (kernels/attn_gdn_gated.py).
     // Defaults are the conv columns themselves; CONV_SPREAD=1 in the design
     // moves them to { {5,1}, {4,0} } for x and { {5,0}, {7,1} } for the
     // history, which measures the same.
@@ -348,7 +348,7 @@ struct xdna_attn_gdn_geom {
 };
 
 // Hand-built per-token TXN stream for the merged conv+norm+gdn recurrent-core
-// xclbin (attn_gdn_txn.xclbin, or attn_gdn_gated.xclbin when azg_n is set).
+// xclbin (fused_layer.xclbin, or attn_gdn_gated.xclbin when azg_n is set).
 // One host-built stream per token runs the phases in time (conv -> norm -> gdn
 // [- > gated]) with BD/channel reuse in ONE xrt run.  Run BO args (same as the
 // rec_full/attn_cn/gdn layouts): arg0 feed (n_block x feed_n f32), arg1 x
@@ -359,5 +359,5 @@ struct xdna_attn_gdn_geom {
 // column-major per phase; 1 = slot-major; 2 = phased (groups of 2); 4 =
 // BD-bank pipelining. The stream is bound once at load and replayed every token
 // (BO contents change, offsets do not).
-bool xdna_attn_gdn_txn_build(xdna_seq * seq, const xdna_attn_gdn_geom * g,
+bool xdna_attn_gdn_build(xdna_seq * seq, const xdna_attn_gdn_geom * g,
                              int schedule, int phase = -1);

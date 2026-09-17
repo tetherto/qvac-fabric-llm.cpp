@@ -36,7 +36,7 @@ struct xdna_ops {
     bool fused_gemv = false;
 
     // Two GEMM families. Decode: M=32, native bf16 r=4, exact - used for ops
-    // with M < gemm_big_m_min. Prefill: one or more baked M blocks (the M64
+    // with M < GEMM_M_BIG_MIN. Prefill: one or more baked M blocks (the M64
     // base; larger blocks when their artifacts are built), bfp16-emulated r=8
     // (2x mmul), selected per op as the block that minimizes the weighted
     // pad/weight-stream cost. Quantized (Q4_K/Q5_K/Q6_K) prefill weights
@@ -49,8 +49,6 @@ struct xdna_ops {
     std::vector<int>                     pref_blocks;  // baked M blocks, descending
     std::unordered_map<int, std::string> pref_xclbin;  // block -> bf16 stem
     std::unordered_map<int, std::string> i8_xclbin;    // block -> int8 stem
-    int gemm_big_m_min = 64;              // M >= this -> prefill geometry
-    int gemm_m_max     = 0;               // cap on prefill M block (0 = none)
 
     // Packed-weight cache: tensor data pointer + K + N -> device BO holding the
     // transposed [K_pad x N] bf16 weights (K_pad = K rounded up to the GEMM
@@ -127,11 +125,6 @@ struct xdna_ops {
     struct gemv_group {
         std::vector<struct ggml_tensor *> nodes;
         xdna_gemv_geom geom;
-        // FFN epilogue: the gate and up projections run together and the
-        // dispatch returns silu(gate)*up, so the silu and the multiply have no
-        // work left on the host. `out` is the tensor that result belongs to.
-        struct ggml_tensor * out = nullptr;
-        std::vector<int32_t> colmap;
         // Projections sharing an activation are grouped however far apart they
         // sit in the graph, so the dispatch cannot write their outputs where it
         // runs - ggml's allocator may still be using that memory for something
@@ -143,9 +136,6 @@ struct xdna_ops {
     };
     std::vector<gemv_group> gemv_groups;
     std::unordered_map<const struct ggml_tensor *, int> gemv_group_of;
-    std::vector<float> gemv_out;   // scratch for one dispatch's outputs
-    // Nodes a dispatch already produced, which the host must then skip.
-    std::unordered_set<const struct ggml_tensor *> gemv_absorbed;
 };
 
 // Find the projections of `cgraph` that share an activation and record them as
@@ -155,9 +145,6 @@ struct xdna_ops {
 // snapshot - which must not be absorbed into a GEMV group.
 void xdna_ops_plan_gemv(xdna_ops * ops, const struct ggml_cgraph * cgraph,
                         const std::unordered_set<const struct ggml_tensor *> * skip);
-
-// True when `node` was produced by a dispatch, so the host must not run it.
-bool xdna_ops_gemv_absorbed(const xdna_ops * ops, const struct ggml_tensor * node);
 
 // Discover the GEMM xclbin and set up the fixed geometry.
 void xdna_ops_init(xdna_ops * ops, xdna_kernel_pool * pool);

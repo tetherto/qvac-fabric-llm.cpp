@@ -1,8 +1,8 @@
-#include "xdna_design_tag.h"
+#include "xdna-design-tag.h"
 #include "xdna-gemv.h"
 
 #include "ggml-impl.h"
-#include "xdna-verify.h"
+#include "xdna-util.h"
 
 #include <algorithm>
 #include <cmath>
@@ -23,7 +23,7 @@ namespace {
 // Per-group block inside a packed tile: the codes of one group for the lane
 // group's columns, then that group's scale and min for each of them. The bf16 pair the two
 // scale is per super-block and lives at the end of the tile. Mirrors
-// gemv_q4.cc.
+// gemv-q4.cc.
 int block_code_bytes(xdna_wfmt fmt, int lane) {
     return fmt == XDNA_WFMT_Q4G32 ? XDNA_Q4G32_GROUP * lane / 2 : XDNA_Q8G16_GROUP * lane;
 }
@@ -36,13 +36,6 @@ int block_param_bytes(xdna_wfmt fmt, int lane) {
     // measured 25% slower for the 6% of bytes it saved. An integer under 256
     // is exact in bf16, so nothing is lost.
     return 4 * lane;
-}
-
-// f32 -> bf16, round to nearest even.
-uint16_t bf16_of(float f) {
-    uint32_t b;
-    std::memcpy(&b, &f, 4);
-    return (uint16_t) ((b + 0x7FFF + ((b >> 16) & 1)) >> 16);
 }
 
 int block_bytes(xdna_wfmt fmt, int lane) {
@@ -83,16 +76,6 @@ bool xdna_gemv_geom::valid() const {
 }
 
 bool xdna_gemv_use_half(xdna_gemv_split want) {
-    static const int forced = []() {
-        const char * v = getenv("GGML_XDNA_GEMV_ROWS");
-        return v ? atoi(v) : 0;
-    }();
-    if (forced == XDNA_GEMV_ROWS_HALF) {
-        return true;
-    }
-    if (forced == XDNA_GEMV_ROWS) {
-        return false;
-    }
     return want == XDNA_GEMV_SPLIT_HALF;
 }
 
@@ -106,6 +89,19 @@ std::string xdna_gemv_geom::stem() const {
     snprintf(buf, sizeof(buf), "gemv_n%d_r%d_c%d_%s", n_core_v, rows_v,
              XDNA_GEMV_COLS, XDNA_DESIGN_TAG);
     return buf;
+}
+
+std::string xdna_gemv_stem(xdna_gemv_split split) {
+    xdna_gemv_geom g;
+    if (split == XDNA_GEMV_SPLIT_FUSED) {
+        g.rows_v   = XDNA_GEMV_ROWS_FUSED;
+        g.n_core_v = XDNA_GEMV_N_CORE_FUSED;
+        g.fused_v  = true;
+    } else if (split == XDNA_GEMV_SPLIT_HALF) {
+        g.rows_v   = XDNA_GEMV_ROWS_HALF;
+        g.n_core_v = XDNA_GEMV_N_CORE_HALF;
+    }
+    return g.stem();
 }
 
 std::string xdna_gemv_geom::seq_key() const {
@@ -200,22 +196,6 @@ void strided_bd(xdna_bd & bd, size_t d0_bytes, uint32_t d1, size_t stride_bytes,
 
 } // namespace
 
-// Every output chunk replays the same K tiles, and the host copies the body
-// once per chunk. GGML_XDNA_ACT_REPEAT=1 has the stream re-read the single
-// copy with a zero-stride descriptor instead - the same bytes off DDR without
-// the memcpy, and a device-side producer of the activation would then have
-// only one body to write. It measures 29.8 t/s against 33.6: a zero stride
-// re-fetches rather than reusing what it just read, and that costs far more
-// than the 27 KB memcpy it saves. Off by default; kept because a device
-// producer may still want the layout.
-static bool act_repeat_bd(void) {
-    static const int v = [] {
-        const char * e = getenv("GGML_XDNA_ACT_REPEAT");
-        return e ? atoi(e) : 0;
-    }();
-    return v != 0;
-}
-
 int xdna_gemv_max_chunks(void) {
     return MAX_CHUNKS;
 }
@@ -232,28 +212,15 @@ struct shim_ep {
 // broadcast taking column 0's first channel and that column's weights moving
 // to the second. The merged layer's are wherever they fit beside the GDN core,
 // which is not one per column - column 0 has no output channel left at all -
-// and pinning them does not place. Read back from the built artifact with
-// kernels/shim_map.py; if either design's fifos change, read it again.
-// GGML_XDNA_ACT_PRO_H=1: the artifact was built with ACT_PRO_H=1, so its
-// prologue takes a second input and every stream has to feed it. The two have
-// to agree - a stream that does not push it hangs the prologue on its fifo.
-static bool act_pro_h(void) {
-    static const bool on = []() {
-        const char * e = getenv("GGML_XDNA_ACT_PRO_H");
-        return e != nullptr && atoi(e) != 0;
-    }();
-    return on;
-}
-
+// and pinning them does not place. Read them back from the built artifact; if
+// either design's fifos change, read them again.
 struct gemv_shim_map {
     shim_ep w[XDNA_GEMV_COLS];
     shim_ep a;
-    // The prologue's second input, where it takes the host's half of a tile
-    // from a buffer no dispatch writes (kernels/gemv_q4.py, ACT_PRO_H). Read
+    // (A second prologue input would sit here; this build has none.) Read
     // out of the artifact the same way as the rest: it is the one MM2S push
     // the design gains.
     shim_ep h;
-    bool    has_h = false;
     shim_ep o[XDNA_GEMV_COLS];
     // Columns whose cores share one output stream, joined in a MemTile. The
     // merged design does this to give shim channels back to the core's stages;
@@ -265,7 +232,7 @@ struct gemv_shim_map {
 gemv_shim_map shim_map_for(const xdna_gemv_geom & geom) {
     gemv_shim_map m;
     if (geom.fused_v) {
-        // shim_map.py fused_layer.insts.bin --tail 17
+        // Read out of the merged design's compiled stream.
         //
         // Re-read this whenever either half of the merged design changes its
         // fifos, and never guess it. Consolidating the core's conv stage moved
@@ -289,10 +256,8 @@ gemv_shim_map shim_map_for(const xdna_gemv_geom & geom) {
             m.o[g] = O[g];
         }
         m.a = {4, 0};
-        // shim_map.py fused_layer.insts.bin, built with ACT_PRO_H=1: the one
-        // push the design gains over the same design without it.
-        m.h = {6, 1};
-        m.has_h = act_pro_h();
+        // The one push the design gains over the same design without the
+        // prologue's second input.
     } else {
         for (int c = 0; c < XDNA_GEMV_COLS; c++) {
             m.w[c] = {(uint8_t) c, (uint8_t) (c == 0 ? 1 : 0)};
@@ -344,10 +309,8 @@ bool xdna_gemv_seq_build_pair(xdna_seq * seq, const xdna_gemv_geom & g1,
     // endpoint. Reserving less lets next_fixed run into what take_bd hands
     // out for the outputs, and a descriptor written over while its transfer
     // is in flight is lost silently.
-    const auto act_bds = [](const xdna_gemv_geom & g) {
-        return (act_repeat_bd() && g.n_out() > 1) ? 2 : 1;
-    };
-    const int n_ab = act_bds(g1) + act_bds(g2);
+    // One descriptor per activation fill, for each of the two dispatches.
+    const int n_ab = 2;
     for (int pass = 0; pass < 2; pass++) {
         for (int c = 0; c < g1.cols; c++) {
             take_bd(map.w[c].col);
@@ -355,9 +318,6 @@ bool xdna_gemv_seq_build_pair(xdna_seq * seq, const xdna_gemv_geom & g1,
     }
     for (int k = 0; k < n_ab; k++) {
         take_bd(map.a.col);
-        if (map.has_h) {
-            take_bd(map.h.col);
-        }
     }
     std::vector<std::vector<uint32_t>> o2_bd((size_t) n_o);
     for (int c = 0; c < n_o; c++) {
@@ -372,9 +332,9 @@ bool xdna_gemv_seq_build_pair(xdna_seq * seq, const xdna_gemv_geom & g1,
     for (int c = 0; c < n_o; c++) {
         const int col = map.o[c].col;
         if ((int) next_bd[col] >= MAX_BD) {
-            fprintf(stderr, "xdna-gemv-pair: column %d is out of descriptors "
-                            "(%u of %d) with %d output streams to place\n",
-                    col, next_bd[col], MAX_BD, n_o);
+            GGML_LOG_ERROR("%s: gemv pair: column %d is out of descriptors "
+                           "(%u of %d) with %d output streams to place\n",
+                           "xdna-gemv", col, next_bd[col], MAX_BD, n_o);
             return false;
         }
         o1_bd[(size_t) c].push_back(take_bd(col));
@@ -402,25 +362,6 @@ bool xdna_gemv_seq_build_pair(xdna_seq * seq, const xdna_gemv_geom & g1,
     const auto fill_acts_on = [&](const xdna_gemv_geom & g, size_t base,
                                   const shim_ep & ep, int arg) {
         const size_t atb_ = g.act_tile_bytes();
-        if (act_repeat_bd() && g.n_out() > 1) {
-            const uint32_t h_id = next_fixed(ep.col);
-            xdna_bd hbd;
-            linear_bd(hbd, atb_, (uint32_t) base);
-            xdna_seq_blockwrite(seq, ep.col, 0, h_id, &hbd);
-            xdna_seq_ddr_patch(seq, ep.col, 0, h_id, arg, (uint32_t) base);
-            xdna_seq_push_queue(seq, ep.col, 0, h_id, xdna_dma_dir::MM2S,
-                                ep.ch, false, 0);
-            const uint32_t b_id = next_fixed(ep.col);
-            const uint32_t boff = (uint32_t) (base + atb_);
-            xdna_bd bbd;
-            strided_bd(bbd, (size_t) g.n_tiles() * atb_, (uint32_t) g.n_out(),
-                       0, boff);
-            xdna_seq_blockwrite(seq, ep.col, 0, b_id, &bbd);
-            xdna_seq_ddr_patch(seq, ep.col, 0, b_id, arg, boff);
-            xdna_seq_push_queue(seq, ep.col, 0, b_id, xdna_dma_dir::MM2S,
-                                ep.ch, false, 0);
-            return;
-        }
         const uint32_t bd_id = next_fixed(ep.col);
         const uint32_t off   = (uint32_t) base;
         xdna_bd bd;
@@ -435,9 +376,6 @@ bool xdna_gemv_seq_build_pair(xdna_seq * seq, const xdna_gemv_geom & g1,
     // prologue has an input of its own for it.
     const auto fill_acts = [&](const xdna_gemv_geom & g, size_t base) {
         fill_acts_on(g, base, map.a, a_a);
-        if (map.has_h) {
-            fill_acts_on(g, base, map.h, a_a);
-        }
     };
 
     // ---- the epilogue pair, draining into the second dispatch's activation
@@ -445,10 +383,6 @@ bool xdna_gemv_seq_build_pair(xdna_seq * seq, const xdna_gemv_geom & g1,
     // The first phase's tiles are the previous dispatch's drain, so its host
     // half comes from somewhere the host owns alone.
     fill_acts_on(g1, po.a_base, map.a, a_a);
-    if (map.has_h) {
-        fill_acts_on(g1, po.h_arg >= 0 ? po.h_base : po.a_base, map.h,
-                     po.h_arg >= 0 ? po.h_arg : a_a);
-    }
 
     const int    mid_chunk = g1.chunk() / 2;
     const int    mid_core  = g1.n_core() / 2;
@@ -561,26 +495,12 @@ bool xdna_gemv_seq_build(xdna_seq * seq, const xdna_gemv_geom & geom,
     const auto take_bd = [&](int col) { return next_bd[col]++; };
 
     // Weights: one linear run per column, ordered [col][chunk][tile][row].
-    // GGML_XDNA_GEMV_WSPLIT cuts each run into that many descriptors instead
-    // of one. It moves exactly the same bytes to exactly the same place, so
-    // what it prices is a descriptor - the fixed cost of a dispatch does not
-    // come from its bytes or its arithmetic, and this says whether it comes
-    // from the length of the instruction stream.
-    int wsplit = 1;
-    if (const char * ws = getenv("GGML_XDNA_GEMV_WSPLIT")) {
-        wsplit = atoi(ws);
-        if (wsplit < 1 || span % (size_t) wsplit != 0) {
-            wsplit = 1;
-        }
-    }
     for (int c = 0; c < geom.cols; c++) {
-        for (int p = 0; p < wsplit; p++) {
-            const size_t   part  = span / (size_t) wsplit;
-            const uint32_t off   = (uint32_t) (woff0 + (size_t) c * span +
-                                               (size_t) p * part);
+        {
+            const uint32_t off   = (uint32_t) (woff0 + (size_t) c * span);
             const uint32_t bd_id = take_bd(map.w[c].col);
             xdna_bd bd;
-            linear_bd(bd, part, off);
+            linear_bd(bd, span, off);
             xdna_seq_blockwrite(seq, map.w[c].col, 0, bd_id, &bd);
             xdna_seq_ddr_patch(seq, map.w[c].col, 0, bd_id, a_w, off);
             xdna_seq_push_queue(seq, map.w[c].col, 0, bd_id, xdna_dma_dir::MM2S,
@@ -601,27 +521,7 @@ bool xdna_gemv_seq_build(xdna_seq * seq, const xdna_gemv_geom & geom,
     // tiles, once with the host's half of them. Same shape, same object count -
     // the prologue takes one of each per tile - only the endpoint, argument
     // and offset differ.
-    const int      a_h_arg = o_.h_arg >= 0 ? o_.h_arg : a_a;
-    const uint32_t h_off0  = o_.h_arg >= 0 ? o_.h_off : (uint32_t) aoff0;
     const auto fill_act_on = [&](const shim_ep & ep, int arg, uint32_t base) {
-        if (act_repeat_bd() && n_out > 1) {
-            const uint32_t h_id = take_bd(ep.col);
-            xdna_bd hbd;
-            linear_bd(hbd, atb, base);
-            xdna_seq_blockwrite(seq, ep.col, 0, h_id, &hbd);
-            xdna_seq_ddr_patch(seq, ep.col, 0, h_id, arg, base);
-            xdna_seq_push_queue(seq, ep.col, 0, h_id, xdna_dma_dir::MM2S,
-                                ep.ch, false, 0);
-            const uint32_t b_id = take_bd(ep.col);
-            xdna_bd bbd;
-            strided_bd(bbd, (size_t) nt * atb, (uint32_t) n_out, 0,
-                       (uint32_t) (base + atb));
-            xdna_seq_blockwrite(seq, ep.col, 0, b_id, &bbd);
-            xdna_seq_ddr_patch(seq, ep.col, 0, b_id, arg, (uint32_t) (base + atb));
-            xdna_seq_push_queue(seq, ep.col, 0, b_id, xdna_dma_dir::MM2S,
-                                ep.ch, false, 0);
-            return;
-        }
         const uint32_t bd_id = take_bd(ep.col);
         xdna_bd bd;
         linear_bd(bd, (size_t) (1 + n_out * nt) * atb, base);
@@ -631,9 +531,6 @@ bool xdna_gemv_seq_build(xdna_seq * seq, const xdna_gemv_geom & geom,
                             ep.ch, false, 0);
     };
     fill_act_on(map.a, a_a, (uint32_t) aoff0);
-    if (map.has_h) {
-        fill_act_on(map.h, a_h_arg, h_off0);
-    }
 
     if (o_.stages == 2) {
         return true;
@@ -861,8 +758,8 @@ bool xdna_gemv_pack_weights(const xdna_gemv_geom & geom,
                     }
                     const int8_t * d8 = (const int8_t *) (rec + (size_t) sbg * code_b);
                     uint16_t * pb = (uint16_t *) (blk + cb);
-                    pb[lane]        = bf16_of((float) d8[gi]);
-                    pb[LANE + lane] = bf16_of((float) d8[sbg + gi]);
+                    pb[lane]        = xdna_bf16((float) d8[gi]);
+                    pb[LANE + lane] = xdna_bf16((float) d8[sbg + gi]);
 
                     // The pair is the same for every group of the super-block,
                     // so this writes it once per group and the last one wins.
@@ -877,75 +774,6 @@ bool xdna_gemv_pack_weights(const xdna_gemv_geom & geom,
                 }
             }
         }
-    }
-    // GGML_XDNA_VERIFY: read the packed tiles back the way the kernel does and
-    // compare against the reference decode of the same row. The repack check in
-    // xdna-quant covers the record; this covers the scatter into lanes, which
-    // is where a format change actually goes wrong.
-    if (xdna_verify_level() > 0) {
-        std::vector<float> ref((size_t) K), got((size_t) K);
-        double num = 0, den = 0;
-        for (int n = 0; n < std::min(geom.N, 64); n++) {
-            const int src_col = colmap ? colmap[n] : n;
-            if (src_col >= (int) owner.size()) {
-                continue;
-            }
-            const struct ggml_tensor * w = owner[(size_t) src_col];
-            const size_t src_rb = ggml_row_size(w->type, K);
-            if (!xdna_wfmt_repack_row_as(w->type, geom.fmt,
-                                         (const uint8_t *) w->data +
-                                             (size_t) ownrow[(size_t) src_col] * src_rb,
-                                         K, row.data()) ||
-                !xdna_wfmt_decode_row(geom.fmt, row.data(), K, ref.data())) {
-                continue;
-            }
-            const int oc = n / geom.chunk(), rem = n % geom.chunk();
-            const int core = rem / n_core, c = core / rows, r = core % rows;
-            const int nc = rem % n_core, j = nc / LANE, lane = nc % LANE;
-            for (int t = 0; t < NT; t++) {
-                const uint8_t * tile = dst.data() +
-                    (((size_t) (c * geom.n_out() + oc) * NT + t) * rows + r) * tb;
-                const uint16_t * sup = (const uint16_t *)
-                    (tile + (size_t) lg_all * gpt * bb);
-                for (int gg = 0; gg < gpt; gg++) {
-                    const uint8_t * blk = tile + (size_t) (j * gpt + gg) * bb;
-                    const uint16_t * sp = sup +
-                        (size_t) (j * nsup + gg / (gpt / nsup)) * (SUP_BYTES / 2);
-                    const auto bf = [](uint16_t hi, uint16_t lo) {
-                        const auto w = [](uint16_t h) {
-                            uint32_t b = (uint32_t) h << 16;
-                            float f;
-                            std::memcpy(&f, &b, 4);
-                            return f;
-                        };
-                        return w(hi) + w(lo);
-                    };
-                    const float dS = bf(sp[lane], sp[LANE + lane]);
-                    const float mS = bf(sp[2 * LANE + lane], sp[3 * LANE + lane]);
-                    const uint16_t * pb = (const uint16_t *) (blk + cb);
-                    const float d = dS * bf(pb[lane], 0);
-                    const float m = mS * bf(pb[LANE + lane], 0);
-                    for (int k = 0; k < grp; k++) {
-                        float q;
-                        if (geom.fmt == XDNA_WFMT_Q4G32) {
-                            const uint8_t byte = blk[(size_t) k * (LANE / 2) + lane / 2];
-                            q = (float) (lane & 1 ? (byte >> 4) : (byte & 0x0F));
-                        } else {
-                            q = (float) (int8_t) blk[(size_t) k * LANE + lane];
-                        }
-                        got[(size_t) (t * gpt + gg) * grp + k] = q * d + m;
-                    }
-                }
-            }
-            for (int i = 0; i < K; i++) {
-                const double e = (double) got[(size_t) i] - ref[(size_t) i];
-                num += e * e;
-                den += (double) ref[(size_t) i] * ref[(size_t) i];
-            }
-        }
-        fprintf(stderr, "xdna-verify: gemv tile scatter %s K=%d N=%d rel %.3e\n",
-                geom.fmt == XDNA_WFMT_Q4G32 ? "q4g32" : "q8g16", K, geom.N,
-                den > 0 ? std::sqrt(num / den) : 0.0);
     }
     return true;
 }
@@ -978,26 +806,10 @@ xdna_gemv * xdna_gemv_create(xdna_kernel_pool * pool, const xdna_gemv_geom & geo
     // consecutive ops cheap.
     xdna_seq seq;
     xdna_gemv_seq_opts so_;
-    if (act_pro_h() && geom.fused_v) {
-        // The design has a buffer for the prologue's second input, so the
-        // output is one along. This dispatch's tiles are the host's own, so
-        // its second input is the same buffer as its first.
-        so_.h_arg = 1;
-        so_.o_arg = 3;
-    }
     if (!xdna_gemv_seq_build(&seq, geom, &so_)) {
         return nullptr;
     }
     const std::vector<uint32_t> insts = xdna_seq_build(&seq);
-
-
-    // GGML_XDNA_GEMV_DUMP=<dir> writes each built stream next to IRON's own,
-    // so the two can be compared for a shape both can express.
-    if (const char * dir = getenv("GGML_XDNA_GEMV_DUMP")) {
-        const std::string path = std::string(dir) + "/" + geom.seq_key() + ".insts.bin";
-        std::ofstream f(path, std::ios::binary);
-        f.write((const char *) insts.data(), (std::streamsize) (insts.size() * 4));
-    }
 
     xdna_gemv * g = new xdna_gemv;
     g->dev  = dev;
@@ -1023,13 +835,8 @@ xdna_gemv * xdna_gemv_create(xdna_kernel_pool * pool, const xdna_gemv_geom & geo
     g->host_a.resize(geom.act_bytes());
 
     // The buffer set never changes for this weight, so the run is built once.
-    xdna_buffer * args[4] = { g->w, g->a, g->a, g->o };
-    if (act_pro_h() && g->geom.fused_v) {
-        g->run = xdna_kernel_run_make(g->kern, args, 4);
-    } else {
-        args[2] = g->o;
-        g->run = xdna_kernel_run_make(g->kern, args, 3);
-    }
+    xdna_buffer * args[3] = { g->w, g->a, g->o };
+    g->run = xdna_kernel_run_make(g->kern, args, 3);
     return g;
 }
 
@@ -1053,63 +860,17 @@ void xdna_gemv_free(xdna_gemv * g) {
 // A null `act` writes the header and the flag words but no codes: that is how
 // a buffer the cores will fill is prepared, since those words sit past the
 // last block and so survive every dispatch.
-// GGML_XDNA_GEMV_STAGE_PROF=1 splits every dispatch into the host's share -
-// quantizing the activation and flushing it - and the device's, so a stage
-// that is short of the array's bandwidth can be told from one that is waiting
-// on the host.
-namespace {
-
-struct gemv_stage_prof {
-    struct row { uint64_t n = 0; double host_us = 0, dev_us = 0, sub_us = 0; };
-    bool                             on = false;
-    std::map<std::string, row>       rows;
-
-    ~gemv_stage_prof() {
-        for (const auto & kv : rows) {
-            const double n = (double) kv.second.n;
-            fprintf(stderr, "xdna-gemv-stage: %-28s runs=%-6llu host=%.0fus "
-                    "submit=%.0fus wait=%.0fus\n", kv.first.c_str(),
-                    (unsigned long long) kv.second.n,
-                    kv.second.host_us / n, kv.second.sub_us / n,
-                    kv.second.dev_us / n);
-        }
-    }
-};
-
-gemv_stage_prof & stage_prof() {
-    static gemv_stage_prof p = []() {
-        gemv_stage_prof q;
-        const char * v = getenv("GGML_XDNA_GEMV_STAGE_PROF");
-        q.on = v != nullptr && atoi(v) != 0;
-        return q;
-    }();
-    return p;
-}
-
-double stage_lap(std::chrono::steady_clock::time_point & t0) {
-    const auto now = std::chrono::steady_clock::now();
-    const double us = std::chrono::duration<double, std::micro>(now - t0).count();
-    t0 = now;
-    return us;
-}
-
-} // namespace
-
-// GGML_XDNA_ACT_RAW=1 hands the cores bf16 activations in place of codes and
-// lets them quantize the tile themselves (gemv_q4.cc quant_tile, the same
-// per-group scale this function applies). Nothing about the result changes;
-// what changes is that packing the activation stops being something only the
-// host can do, which is what keeps the FFN out of the layer's dispatch.
+// The cores are handed bf16 activations in place of codes and quantize the
+// tile themselves (gemv-q4.cc quant_tile, the same per-group scale this
+// function applies). Nothing about the result changes; what changes is that
+// packing the activation stops being something only the host can do, which is
+// what keeps the FFN out of the layer's dispatch.
 static bool act_raw(void) {
-    static const bool on = []() {
-        const char * e = getenv("GGML_XDNA_ACT_RAW");
-        return e == nullptr || atoi(e) != 0;
-    }();
-    return on;
+    return true;
 }
 
 // Byte offset of the raw activations inside a tile; mirrors ACT_RAW_OFF in
-// gemv_q4.cc. Past any tile's codes and group parameters.
+// gemv-q4.cc. Past any tile's codes and group parameters.
 static constexpr int XDNA_ACT_RAW_OFF = 0;
 
 static void gemv_pack_act(const xdna_gemv_geom & geom, const float * act,
@@ -1153,8 +914,8 @@ static void gemv_pack_act(const xdna_gemv_geom & geom, const float * act,
                 if (!acc_on_device) {
                     ac[i] = src[i];
                 }
-                rw[i]      = bf16_of(res[(size_t) t * kt + i]);
-                rw[kt + i] = bf16_of(gam[(size_t) t * kt + i]);
+                rw[i]      = xdna_bf16(res[(size_t) t * kt + i]);
+                rw[kt + i] = xdna_bf16(gam[(size_t) t * kt + i]);
             }
             // The row length the norm divides by, in every tile: the prologue
             // reads it there rather than counting objects.
@@ -1192,7 +953,7 @@ static void gemv_pack_act(const xdna_gemv_geom & geom, const float * act,
     // Every output chunk replays the same K tiles. The stream re-reads the one
     // body with a zero-stride descriptor (see xdna_gemv_seq_build); the copies
     // are only for the path that does not.
-    if (!act_repeat_bd() || geom.n_out() <= 1) {
+    {
         const size_t body = (size_t) geom.n_tiles() * atb;
         for (int k = 1; (act || acc_on_device) && k < geom.n_out(); k++) {
             std::memcpy(dst + atb + (size_t) k * body,
@@ -1208,7 +969,7 @@ bool xdna_gemv_run_packed(xdna_gemv * g, const void * act_tiles, float * out) {
     const size_t n = (size_t) (1 + g->geom.n_tiles()) * g->geom.act_tile_bytes();
     std::memcpy(g->a->bo.map(), act_tiles, n);
     xdna_buffer_sync_to_device_range(g->a, n, 0);
-    if (!xdna_run_restart(g->run, "gemv packed") || !xdna_run_wait(g->run)) {
+    if (!xdna_run_restart(g->run) || !xdna_run_wait(g->run)) {
         return false;
     }
     xdna_buffer_sync_from_device(g->o);
@@ -1230,39 +991,17 @@ bool xdna_gemv_run(xdna_gemv * g, const float * act, float * out) {
         return false;
     }
     const xdna_gemv_geom & geom = g->geom;
-    auto t0 = std::chrono::steady_clock::now();
     gemv_pack_act(geom, act, g->host_a.data(), 0, geom.epilogue ? 1 : 0);
     std::memcpy(g->a->bo.map(), g->host_a.data(), g->host_a.size());
     xdna_buffer_sync_to_device(g->a);
-    const double host_us = stage_lap(t0);
 
-    // GGML_XDNA_GEMV_NOP=1 skips the dispatch and returns zeros: the result is
-    // meaningless, but the time left is everything around the NPU work, which
-    // is how the split between dispatch and orchestration was measured.
-    static const bool nop = []() {
-        const char * v = getenv("GGML_XDNA_GEMV_NOP");
-        return v != nullptr && atoi(v) != 0;
-    }();
-    if (nop) {
-        std::memset(out, 0, (size_t) geom.n_real * sizeof(float));
-        return true;
-    }
-
-    if (!xdna_run_restart(g->run, "gemv")) {
+    if (!xdna_run_restart(g->run)) {
         return false;
     }
-    const double sub_us = stage_lap(t0);
     if (!xdna_run_wait(g->run)) {
         return false;
     }
     xdna_buffer_sync_from_device(g->o);
-    if (stage_prof().on) {
-        auto & r = stage_prof().rows[geom.seq_key()];
-        r.n++;
-        r.host_us += host_us;
-        r.sub_us  += sub_us;
-        r.dev_us  += stage_lap(t0);
-    }
 
     // The group scales are applied on the device, so nothing is left here.
     const float * raw = (const float *) g->o->bo.map();
@@ -1272,27 +1011,6 @@ bool xdna_gemv_run(xdna_gemv * g, const float * act, float * out) {
         // Every 32-lane group carries 16 valid floats and a zeroed tail.
         const int LANE = geom.lane();
         const int half = LANE / 2;
-        // The upper half of every slot is written as zero by the epilogue
-        // store. If it comes back non-zero the cores never took that branch -
-        // they left 32 raw accumulators - and the gather below is reading the
-        // wrong values rather than the epilogue being wrong.
-        static const bool dbg = getenv("GGML_XDNA_GEMV_DEBUG") != nullptr;
-        if (dbg) {
-            static int shown = 0;
-            if (shown++ < 2) {
-                int nz = 0, tot = 0;
-                for (int u = 0; u < geom.N / LANE; u++) {
-                    const float * slot = raw + (size_t) u * LANE;
-                    for (int i = half; i < LANE; i++, tot++) {
-                        nz += slot[i] != 0.0f;
-                    }
-                }
-                fprintf(stderr, "xdna-gemv-debug: epilogue K=%d N=%d: %d/%d "
-                        "upper-half values non-zero, out[0..3] = %g %g %g %g\n",
-                        geom.K, geom.N, nz, tot,
-                        raw[0], raw[1], raw[2], raw[3]);
-            }
-        }
         for (int u = 0; u < geom.N / LANE; u++) {
             std::memcpy(out + (size_t) u * half, raw + (size_t) u * LANE,
                         (size_t) half * sizeof(float));
@@ -1366,10 +1084,6 @@ xdna_gemv_pair * xdna_gemv_pair_create(xdna_kernel_pool * pool,
 
     xdna_seq seq;
     xdna_gemv_pair_opts po;
-    if (act_pro_h()) {
-        po.h_arg = 2;
-        po.o_arg = 3;
-    }
     if (!xdna_gemv_seq_build_pair(&seq, g1, g2, w2_off, a2_off, &po)) {
         return nullptr;
     }
@@ -1400,13 +1114,6 @@ xdna_gemv_pair * xdna_gemv_pair_create(xdna_kernel_pool * pool,
     p->o_tail_off = a2_off + g2.act_bytes();
     p->a = xdna_buffer_alloc(p->dev, p->o_tail_off + g2.out_bytes());
     p->o = xdna_buffer_alloc(p->dev, g2.out_bytes());
-    if (act_pro_h()) {
-        p->ah = xdna_buffer_alloc(p->dev, g1.act_bytes());
-        if (!p->ah) {
-            xdna_gemv_pair_free(p);
-            return nullptr;
-        }
-    }
     if (!p->w || !p->a || !p->o) {
         xdna_gemv_pair_free(p);
         return nullptr;
@@ -1427,7 +1134,6 @@ xdna_gemv_pair * xdna_gemv_pair_create(xdna_kernel_pool * pool,
     xdna_buffer_sync_to_device(p->a);
 
     p->host_a.assign(g1.act_bytes(), 0);
-    p->insts = insts;
     xdna_buffer * args[4] = { p->w, p->a, p->ah ? p->ah : p->a, p->o };
     p->run = xdna_kernel_run_make(p->kern, args, p->ah ? 4 : 3);
     if (!p->ah) {
@@ -1468,24 +1174,8 @@ bool xdna_gemv_pair_run_packed(xdna_gemv_pair * p, const void * act_tiles,
     xdna_buffer_sync_to_device_range(
         p->a, (size_t) (1 + p->g1.n_out() * p->g1.n_tiles()) *
                   p->g1.act_tile_bytes(), 0);
-    // After a dispatch on another context the fused one's next run has hung;
-    // probe whether re-binding the instruction stream heals it.
-    if (getenv("GGML_XDNA_PAIR_REBIND") && !p->insts.empty()) {
-        if (!xdna_kernel_bind_insts(p->dev, p->kern, p->insts.data(),
-                                    p->insts.size())) {
-            return false;
-        }
-        xdna_buffer * args[3] = { p->w, p->a, p->o };
-        p->run = xdna_kernel_run_make(p->kern, args, 3);
-    }
-    if (getenv("GGML_XDNA_PAIR_TRACE")) {
-        fprintf(stderr, "xdna-pair: packed restart\n");
-    }
-    if (!xdna_run_restart(p->run, "gemv pair") || !xdna_run_wait(p->run)) {
+    if (!xdna_run_restart(p->run) || !xdna_run_wait(p->run)) {
         return false;
-    }
-    if (getenv("GGML_XDNA_PAIR_TRACE")) {
-        fprintf(stderr, "xdna-pair: packed done\n");
     }
     xdna_buffer_sync_from_device(p->o);
     std::memcpy(out, p->o->bo.map(), (size_t) p->g2.n_real * sizeof(float));
@@ -1512,8 +1202,8 @@ static void gemv_pack_act_host_half(const xdna_gemv_geom & geom, uint8_t * dst,
         uint8_t *  tile = dst + (size_t) (t + 1) * atb;
         uint16_t * rw   = (uint16_t *) tile;
         for (int i = 0; i < kt; i++) {
-            rw[i]      = bf16_of(res[(size_t) t * kt + i]);
-            rw[kt + i] = bf16_of(gam[(size_t) t * kt + i]);
+            rw[i]      = xdna_bf16(res[(size_t) t * kt + i]);
+            rw[kt + i] = xdna_bf16(gam[(size_t) t * kt + i]);
         }
         int32_t * w = (int32_t *) tile;
         w[XDNA_GEMV_ACT_TILE / 4 - 1] = geom.fmt == XDNA_WFMT_Q4G32 ? 0 : 1;
@@ -1542,8 +1232,7 @@ bool xdna_gemv_pair_prep_raw(xdna_gemv_pair * p, const float * res,
     gemv_pack_act(p->g1, nullptr, (uint8_t *) p->a->bo.map(), 0, last, res, gam);
     // The whole buffer. The host has just read it back, so this writes the
     // array's own acc where it already is - and only this works: a partial
-    // flush does not deliver the drain to the next dispatch at all (see
-    // HANDOFF.md for the rest of that table).
+    // flush does not deliver the drain to the next dispatch at all.
     xdna_buffer_sync_to_device(p->a);
     return true;
 }
@@ -1577,57 +1266,11 @@ bool xdna_gemv_pair_dispatch(xdna_gemv_pair * p, float * out) {
     if (!p || !out) {
         return false;
     }
-    // GGML_XDNA_PAIR_IN_DUMP: everything the dispatch reads out of its
-    // activation, summed, and what it produced - the same point in the
-    // sequence whichever order the host prepared it in.
-    const bool dump = getenv("GGML_XDNA_PAIR_IN_DUMP") != nullptr;
-    double s_acc = 0, s_res = 0, s_gam = 0;
-    int32_t hdr0 = 0, hdr1 = 0, fl = 0;
-    if (dump) {
-        // Read what the device sees, not what the host last wrote. The host's
-        // half comes from its own buffer when it has one, at its own offsets -
-        // the residual at zero and gamma behind it, where the second input
-        // wants them, not where a whole tile carries them.
-        xdna_buffer_sync_from_device(p->a);
-        const uint8_t * b = (const uint8_t *) p->a->bo.map();
-        const uint8_t * h = b;
-        int hres_off = 0;
-        if (p->ah) {
-            xdna_buffer_sync_from_device(p->ah);
-            h = (const uint8_t *) p->ah->bo.map();
-        }
-        const int kt = p->g1.k_tile();
-        if (!p->ah) {
-            hres_off = 4 * kt;   // a whole tile: acc first, then the host half
-        }
-        hdr0 = ((const int32_t *) h)[0];
-        hdr1 = ((const int32_t *) h)[1];
-        for (int t = 0; t < p->g1.n_tiles(); t++) {
-            const uint8_t * tl = b + (size_t) (t + 1) * XDNA_GEMV_ACT_TILE;
-            const uint8_t * hl = h + (size_t) (t + 1) * XDNA_GEMV_ACT_TILE;
-            const float *    a = (const float *) tl;
-            const uint16_t * r = (const uint16_t *) (hl + hres_off);
-            for (int i = 0; i < kt; i++) {
-                s_acc += a[i];
-                s_res += r[i];
-                s_gam += r[kt + i];
-            }
-            fl = ((const int32_t *) hl)[XDNA_GEMV_ACT_TILE / 4 - 2];
-        }
-    }
-    if (!xdna_run_restart(p->run, "gemv pair") || !xdna_run_wait(p->run)) {
+    if (!xdna_run_restart(p->run) || !xdna_run_wait(p->run)) {
         return false;
     }
     xdna_buffer_sync_from_device(p->o);
     std::memcpy(out, p->o->bo.map(), (size_t) p->g2.n_real * sizeof(float));
-    if (dump) {
-        static int n = 0;
-        if (n++ < 4) {
-            fprintf(stderr, "pair-in: hdr %d %d flags %d | acc %.6f res %.1f "
-                    "gam %.1f -> out %g %g %g\n",
-                    hdr0, hdr1, fl, s_acc, s_res, s_gam, out[0], out[1], out[2]);
-        }
-    }
     return true;
 }
 
@@ -1649,10 +1292,6 @@ xdna_buffer * xdna_gemv_pair_w_buf(xdna_gemv_pair * p) {
 
 xdna_buffer * xdna_gemv_pair_h_buf(xdna_gemv_pair * p) {
     return p ? p->ah : nullptr;
-}
-
-bool xdna_gemv_act_pro_h(void) {
-    return act_pro_h();
 }
 
 std::string xdna_gemv_pair_key(const xdna_gemv_pair * p) {
@@ -1690,102 +1329,29 @@ static bool xdna_gemv_pair_run_impl(xdna_gemv_pair * p, const float * act,
     // quantized tile rather than floats (bit 2), and group that tile the way
     // the second dispatch's format reads it (bit 3).
     const int32_t last = 1 | 4 | (p->g2.fmt == XDNA_WFMT_Q8G16 ? 8 : 0);
-    auto t0 = std::chrono::steady_clock::now();
     if (!act && res && gam) {
         // The dispatch before this one drained its result into the front of
         // every tile, so the staging copy cannot be pushed over the buffer -
         // it holds a stale acc. Write the host's part in place and flush only
         // that: from the residual to the end of the tile, never the acc.
-        const int    kt  = p->g1.k_tile();
-        const size_t atb = p->g1.act_tile_bytes();
         gemv_pack_act(p->g1, nullptr, (uint8_t *) p->a->bo.map(), 0, last,
                       res, gam);
         // The whole buffer, not the ranges the host touched. The host has
         // just read it back (acc included), so flushing everything writes the
         // array's own values where they already are - and a partial flush
         // does not get acc to the next dispatch, though the host can read it.
-        (void) kt;
         xdna_buffer_sync_to_device(p->a);
     } else {
         gemv_pack_act(p->g1, act, p->host_a.data(), 0, last, res, gam);
         std::memcpy(p->a->bo.map(), p->host_a.data(), p->host_a.size());
         xdna_buffer_sync_to_device_range(p->a, p->host_a.size(), 0);
     }
-    const double host_us = stage_lap(t0);
 
-    static int flag_dump = 0;
-    if (getenv("GGML_XDNA_GEMV_PAIR_DUMP") && flag_dump++ < 2) {
-        const int32_t * m32 = (const int32_t *) p->a->bo.map();
-        const size_t    st  = XDNA_GEMV_ACT_TILE / 4;
-        fprintf(stderr, "xdna-gemv-pair: g1 K=%d N=%d nt=%d nout=%d fmt=%d "
-                "g2 K=%d N=%d nt=%d nout=%d fmt=%d last=%d | tile flags",
-                p->g1.K, p->g1.N, p->g1.n_tiles(), p->g1.n_out(), (int) p->g1.fmt,
-                p->g2.K, p->g2.N, p->g2.n_tiles(), p->g2.n_out(), (int) p->g2.fmt,
-                last);
-        for (int t = 0; t < p->g1.n_tiles() * p->g1.n_out(); t++) {
-            fprintf(stderr, " %d", m32[(1 + t) * st + st - 2]);
-        }
-        fprintf(stderr, "\n");
-    }
-
-    if (!xdna_run_restart(p->run, "gemv pair") || !xdna_run_wait(p->run)) {
+    if (!xdna_run_restart(p->run) || !xdna_run_wait(p->run)) {
         return false;
     }
     xdna_buffer_sync_from_device(p->o);
     std::memcpy(out, p->o->bo.map(), (size_t) p->g2.n_real * sizeof(float));
-    if (stage_prof().on) {
-        auto & r = stage_prof().rows["pair " + p->g1.seq_key()];
-        r.n++;
-        r.host_us += host_us;
-        r.dev_us  += stage_lap(t0);
-    }
-
-    // A one-off timing probe (GGML_XDNA_RUNLIST_PROBE=N) on the pair, which is
-    // a stateless projection: repeating it changes nothing.
-    static bool probed = false;
-    if (!probed && getenv("GGML_XDNA_RUNLIST_PROBE")) {
-        probed = true;
-        xdna_buffer * pa[3] = { p->w, p->a, p->o };
-        xdna_runlist_probe(p->dev, p->kern, pa, 3);
-    }
-
     return true;
 }
 
-bool xdna_gemv_pair_read_mid(xdna_gemv_pair * p, std::vector<float> & mid) {
-    if (!p) {
-        return false;
-    }
-    xdna_buffer_sync_from_device(p->a);
-    const uint8_t * a2  = (const uint8_t *) p->a->bo.map() + p->a2_off;
-    const int mid_core  = p->g1.n_core() / 2;
-    const int grp       = p->g2.fmt == XDNA_WFMT_Q8G16 ? XDNA_Q8G16_GROUP
-                                                       : XDNA_Q4G32_GROUP;
-    const int gpb       = mid_core / grp;
-    mid.assign((size_t) p->g1.n_real, 0.0f);
-    // What a block holds tells the two failures apart: codes and parameters
-    // mean the epilogue quantized, f32 that looks like the result itself means
-    // it took the plain store instead.
-    static int dumped = 0;
-    if (getenv("GGML_XDNA_GEMV_PAIR_DUMP") && dumped++ < 2) {
-        const uint8_t * b = a2 + XDNA_GEMV_ACT_TILE;
-        const int8_t *  c16 = (const int8_t *) b;
-        const float *   f32 = (const float *) b;
-        fprintf(stderr, "xdna-gemv-pair: block0 i16 %d %d %d %d | f32 %g %g %g %g "
-                "| par@128 %g %g %g %g %g %g %g %g | flags %d\n",
-                c16[0], c16[1], c16[2], c16[3], f32[0], f32[1], f32[2], f32[3],
-                f32[32], f32[33], f32[34], f32[35], f32[36], f32[37], f32[38], f32[39],
-                ((const int32_t *) (a2 + XDNA_GEMV_ACT_TILE))[XDNA_GEMV_ACT_TILE / 4 - 2]);
-    }
-    for (int m = 0; m < p->g1.n_real; m++) {
-        const int t   = m / p->g2.k_tile();
-        const int blk = (m % p->g2.k_tile()) / mid_core;
-        const int i   = m % mid_core;
-        const uint8_t * b = a2 + (size_t) (1 + t) * XDNA_GEMV_ACT_TILE +
-                            (size_t) blk * p->g1.n_core() * sizeof(float);
-        const int8_t  code  = ((const int8_t *) b)[i];
-        const float * par   = (const float *) (b + (size_t) mid_core);
-        mid[(size_t) m] = (float) code * par[gpb + i / grp];
-    }
-    return true;
-}

@@ -37,13 +37,10 @@
 # What the backend needs next: the compiler places the GEMV's shim endpoints
 # wherever they fit, which in the merged design is not one per column - the
 # core has already taken, for instance, every one of column 0's output
-# channels. Pinning them does not place. So the mapping has to be read back out
-# of the built artifact, which is what shim_map.py does:
-#
-#   python3 shim_map.py fused_layer.insts.bin --tail 17
-#
-# prints the GEMV phase's 8 weight fills, 1 activation fill and 8 output
-# drains, in the order the design issues them, with the column, direction and
+# channels. Pinning them does not place. So the mapping is read back out of the
+# built artifact: its GEMV phase's 8 weight fills, 1 activation fill and 8
+# output drains, in the order the design issues them, with the column,
+# direction and
 # channel of each. The core's phase is everything before that.
 
 from __future__ import annotations
@@ -85,7 +82,7 @@ OUT_GROUP = 2
 # hashes the generator and the files it is told about, not the C++ a design
 # happens to read at generation time, and a cached artifact built from an
 # older kernel is indistinguishable from a logic bug in the new one.
-@iron.jit(source_files=["gemv_q4.cc", "gemv_zero.cc"])
+@iron.jit(source_files=["gemv-q4.cc", "gemv-zero.cc"])
 def fused_layer(
     feed: In,
     x: In,

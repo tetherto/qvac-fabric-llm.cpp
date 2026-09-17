@@ -10,7 +10,7 @@
 #define N_CORE 64
 #endif
 
-extern "C" void gemv_zero(float *out)
+extern "C" void ggml_xdna_gemv_zero(float *out)
 {
     constexpr int VEC = 32;
     const aie::vector<float, VEC> z = aie::zeros<float, VEC>();
