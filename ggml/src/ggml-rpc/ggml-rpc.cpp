@@ -654,6 +654,8 @@ class rpc_command_queue {
         }
         auto sock = socket_t::connect(host.c_str(), port, RPC_CLIENT_CONNECT_TIMEOUT_MS);
         if (sock == nullptr || !sock->set_timeout(RPC_CLIENT_IO_TIMEOUT_MS) || !negotiate_hello(sock)) {
+            sock.reset();
+            rpc_transport_shutdown();
             return nullptr;
         }
         auto queue    = std::shared_ptr<rpc_command_queue>(new rpc_command_queue(endpoint, std::move(sock)));
@@ -671,6 +673,8 @@ class rpc_command_queue {
         if (worker.joinable()) {
             worker.join();
         }
+        sock.reset();
+        rpc_transport_shutdown();
     }
 
     bool submit_rpc(rpc_cmd command, const void * input, size_t input_size) {
@@ -3392,8 +3396,14 @@ struct ggml_backend_rpc_server {
     std::mutex client_mutex;
     std::atomic<bool> stop_requested{false};
     std::atomic<bool> running{false};
+    bool transport_initialized = false;
 
     ~ggml_backend_rpc_server() {
+        client_socket.reset();
+        server_socket.reset();
+        if (transport_initialized) {
+            rpc_transport_shutdown();
+        }
         for (auto backend : backends) {
             ggml_backend_free(backend);
         }
@@ -3454,7 +3464,8 @@ ggml_backend_rpc_server_t ggml_backend_rpc_server_create(
         fprintf(stderr, "Failed to initialize RPC transport\n");
         return nullptr;
     }
-    server->server_socket = socket_t::create_server(server->host.c_str(), port);
+    server->transport_initialized = true;
+    server->server_socket         = socket_t::create_server(server->host.c_str(), port);
     if (server->server_socket == nullptr) {
         fprintf(stderr, "Failed to create server socket\n");
         return nullptr;
@@ -3467,9 +3478,13 @@ void ggml_backend_rpc_server_run(ggml_backend_rpc_server_t server) {
         return;
     }
     while (!server->stop_requested.load()) {
-        auto client_socket = server->server_socket->accept(100);
+        bool timed_out     = false;
+        auto client_socket = server->server_socket->accept(100, &timed_out);
         if (client_socket == nullptr) {
-            continue;
+            if (timed_out) {
+                continue;
+            }
+            break;
         }
         {
             std::lock_guard<std::mutex> lock(server->client_mutex);

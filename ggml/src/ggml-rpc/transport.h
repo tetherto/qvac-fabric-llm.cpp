@@ -19,7 +19,7 @@ struct socket_t {
     bool set_timeout(int timeout_ms);
     void shutdown();
 
-    socket_ptr accept(int timeout_ms = -1);
+    socket_ptr accept(int timeout_ms = -1, bool * timed_out = nullptr);
 
     void get_caps(uint8_t * local_caps);
     void update_caps(const uint8_t * remote_caps);
