@@ -11636,7 +11636,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_TQ2_0, GGML_TYPE_F32, 16, 4, 1024, {1, 1}, {1, 1}));
 
     // F8_E4M3 weights with 128x128 block scales: (k, n, tokens)
-    for (int64_t m : {1, 2, 8, 9, 64}) {
+    for (int64_t m : {1, 2, 3, 4, 5, 6, 7, 8, 9, 64}) {
         test_cases.emplace_back(new test_mul_mat_f8(256, 128, m));
     }
     for (int64_t m : {1, 8, 64, 512, 4096}) {
@@ -11644,6 +11644,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
     for (int64_t m : {1, 4096}) {
         test_cases.emplace_back(new test_mul_mat_f8(17408, 5120, m));
+        test_cases.emplace_back(new test_mul_mat_f8(5120, 1024, m));
+    }
+    // the GEMV chunks the activation columns two at a time, so an odd batch ends in a one-column chunk
+    for (int64_t m : {3, 5, 7}) {
         test_cases.emplace_back(new test_mul_mat_f8(5120, 1024, m));
     }
     for (int64_t m : {2, 1000}) {
@@ -11658,9 +11662,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (int64_t m : {1, 64}) {
         test_cases.emplace_back(new test_mul_mat_f8(256, 66048, m));
     }
-    // an F8 FFN block (up, gate, swiglu, down): the fused up/gate GEMV at m <= 4, the swiglu quantized into the down
+    // an F8 FFN block (up, gate, swiglu, down): the fused up/gate GEMV at m <= 8, the swiglu quantized into the down
     // GEMM's input at m > 8 on the CUTLASS route
-    for (int64_t m : {1, 2, 4, 8, 9, 64, 4096}) {
+    for (int64_t m : {1, 2, 3, 4, 5, 7, 8, 9, 64, 4096}) {
         test_cases.emplace_back(new test_mul_mat_f8_ffn(256, 512, m));
     }
     for (int64_t m : {1, 4, 64}) {
@@ -11668,7 +11672,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
     // two or three F8 mul_mats sharing one activation: one quantize (m > 8, CUTLASS route) or one GEMV launch (m <= 8)
     for (int n_mat : {2, 3}) {
-        for (int64_t m : {1, 2, 4, 8, 9, 64, 4096}) {
+        for (int64_t m : {1, 2, 3, 5, 8, 9, 64, 4096}) {
             test_cases.emplace_back(new test_mul_mat_f8_shared(256, {128, 256, 384}, n_mat, m));
         }
     }

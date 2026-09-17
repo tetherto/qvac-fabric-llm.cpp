@@ -13,7 +13,7 @@ bool ggml_cuda_mul_mat_f8_uses_cutlass(ggml_backend_cuda_context & ctx, const gg
 // straight into the GEMM's e4m3 input, the GLU output is never written
 void ggml_cuda_mul_mat_f8_glu_cutlass(ggml_backend_cuda_context & ctx, const ggml_tensor * glu, ggml_tensor * dst);
 
-// one GEMV launch for the up and gate mul_mats of a swiglu (same activation, F8 weights of the same shape), batch <= 4;
+// one GEMV launch for the up and gate mul_mats of a swiglu (same activation, F8 weights of the same shape), batch <= 8;
 // writes silu(gate) * up into the GLU output from the same per-row sums the separate launches produce
 void ggml_cuda_mul_mat_f8_gemv_glu(ggml_backend_cuda_context & ctx, const ggml_tensor * up, const ggml_tensor * gate, ggml_tensor * glu);
 
@@ -23,3 +23,6 @@ void ggml_cuda_mul_mat_f8_shared_cutlass(ggml_backend_cuda_context & ctx, ggml_t
 void ggml_cuda_mul_mat_f8_shared_gemv(ggml_backend_cuda_context & ctx, ggml_tensor ** dsts, int n);
 #define GGML_CUDA_MMF8_SHARED_MAX 3
 #define GGML_CUDA_MMF8_GEMV_MAX_NCOLS 8
+
+// the batch up to which the F8 GEMV is used instead of the CUTLASS W8A8 GEMM: the cap above, or GGML_CUDA_MMF8_GEMV_MAX
+int ggml_cuda_mmf8_gemv_max_ncols();

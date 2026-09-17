@@ -2080,7 +2080,7 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_f8(const ggml_tensor * up, const g
     return up->op == GGML_OP_MUL_MAT && gate->op == GGML_OP_MUL_MAT &&
         up->src[0]->type == GGML_TYPE_F8_E4M3 && gate->src[0]->type == GGML_TYPE_F8_E4M3 &&
         up->src[2] != nullptr && gate->src[2] != nullptr && up->src[1]->type == GGML_TYPE_F32 &&
-        ggml_nrows(up->src[1]) <= 4 && ggml_get_glu_op(glu) == GGML_GLU_OP_SWIGLU &&
+        ggml_nrows(up->src[1]) <= ggml_cuda_mmf8_gemv_max_ncols() && ggml_get_glu_op(glu) == GGML_GLU_OP_SWIGLU &&
         glu->type == GGML_TYPE_F32 && ggml_is_contiguous(glu);
 }
 
@@ -4630,7 +4630,7 @@ static int ggml_cuda_try_shared_src1_mul_mat_f8(ggml_backend_cuda_context * ctx,
         ggml_cuda_mul_mat_f8_shared_cutlass(*ctx, dsts, n);
         return count - 1;
     }
-    if (ggml_nrows(src1) <= GGML_CUDA_MMF8_GEMV_MAX_NCOLS) {
+    if (ggml_nrows(src1) <= ggml_cuda_mmf8_gemv_max_ncols()) {
         ggml_cuda_mul_mat_f8_shared_gemv(*ctx, dsts, n);
         return count - 1;
     }

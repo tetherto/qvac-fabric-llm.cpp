@@ -949,3 +949,31 @@ comparison that holds. CUTLASS-off builds of the same head link `test-backend-op
 errors, and decode there is the same 88.23.
 Decision: both kept. The split is what makes the campaign buildable with CUTLASS on any host below CUDA 12.9; the base's
 Blackwell path is unchanged when the toolkit supports it.
+
+## Decode batch scaling: 4 weight rows per block at every batch, GEMV crossover knob (2026-09-17, user ask)
+Goal (user): make decode scale from batch 2 to 8, where aggregate decode is flat or worse than batch 1.
+Current state before this iteration: `llama-batched-bench` at 10240 + 128 gives S_TG 88.04 / 125.59 / 88.06 / 74.38 tok/s at
+B = 1 / 2 / 4 / 8, which is 11.4 / 15.9 / 46.5 / 107.5 ms per decode step, then 548.03 at B=16 where the dispatch leaves the
+GEMV. The B=4 nsys window (PDL off) attributes 41.20 of the 45.44 ms kernel time per step to `mmf8_gemv` over 256 launches,
+the same launch count as B=1 where the family costs about 9.3 ms, so the cost is per block and not launch overhead. The
+launch config is the cause: `mmf8.cu:236` and `mmf8.cu:303` set `nrows_w = ncols_dst == 1 ? 4 : (ncols_dst == 2 ? 2 : 1)`, so
+from 3 columns up a block owns one weight row (5120 B) and still loads all `ncols_dst` activation columns (4 x 5120 floats
+at B=4), leaving the block activation-load bound and multiplying the blocks that re-read the activation by 4.
+Verify-first: the fusion A/B of the previous entry already ruled the graph out (fusion off is slower at every batch), and the
+B=4 attribution above is the same-day measurement this iteration is compared against.
+Change: (a) `nrows_w = 4` at every `ncols_dst` in both GEMV launchers, with the kernel's inner column loop restructured into
+chunks of at most two activation columns (`mmf8_gemv_cols` / `mmf8_gemv_chunks`), so at most two columns are live in
+registers while the trip's weights are reused; the chunk recursion keeps every array index a compile-time constant, since a
+dynamic index into `sumf` would move it to local memory. The per-output accumulation order over k, the warp reduction and the
+epilogue are untouched, so the output is bit-identical. (b) The fused up/gate GEMV cap rises from 4 to
+`MMF8_GEMV_MAX_NCOLS` = 8 tokens. (c) The GEMV-to-GEMM crossover becomes `ggml_cuda_mmf8_gemv_max_ncols()`, read once from
+`GGML_CUDA_MMF8_GEMV_MAX` and clamped to the compile-time cap, and every crossover site (plain, shared, fused, and
+`uses_cutlass`) goes through it, so an A/B of GEMV against the CUTLASS W8A8 GEMM at 2 to 8 tokens needs no rebuild.
+Prediction: activation re-reads per matmul fall 4x at `ncols_dst >= 3` and 2x at `ncols_dst == 2`; per decode step 46.5 to 14
+to 18 ms at B=4, 107.5 to 18 to 26 ms at B=8, 15.9 to 12 to 14 ms at B=2; S_TG at least 140 at B=2, 230 at B=4, 300 at B=8,
+with B=1 unchanged within 1% and S_PP inside its measured 12082 to 12469 band.
+Gate: GX (bit-exact, `Mean KLD 0.000000` and `Same top p 100.000%` against fresh `kld-r1-q8h-ub{1,4,8}-4c.bin` references
+from the A-side binary) for (a) and (b); the op tests gain m = 3, 5, 6, 7 cases because the chunking is per `ncols_dst` and an
+odd batch ends in a one-column chunk. Lowering the crossover default for (c) additionally needs the GEMM to be at least 10%
+faster per decode step at that batch and to clear G2 (Same top p >= 98.0%, Mean KLD <= 0.006); otherwise the default stays 8
+and the knob remains an A/B tool.

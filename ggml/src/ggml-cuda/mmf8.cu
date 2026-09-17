@@ -40,8 +40,74 @@ static __device__ __forceinline__ void mmf8_gemv_load_w(
     }
 }
 
+// one chunk of at most two activation columns: v stays in registers and the trip's weights are reused for both, so
+// the block can own nrows_w rows at any batch instead of dropping to one row and re-reading the activation nrows_w times
+template <int jbase, int jt, int ncols_dst, int nmat, int nrows_w, bool y_vec>
+static __device__ __forceinline__ void mmf8_gemv_cols(
+        const uint4 (&w4)[nmat][nrows_w], const float (&s)[nmat], const float * y, const int stride_col_y, const int k,
+        float (&sumf)[nmat][nrows_w][ncols_dst]) {
+    float v[jt][16];
+#pragma unroll
+    for (int jj = 0; jj < jt; ++jj) {
+        const float * yj = y + (size_t) (jbase + jj)*stride_col_y + k;
+        if constexpr (y_vec) {
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                const float4 t = ((const float4 *) yj)[i];
+                v[jj][4*i + 0] = t.x;
+                v[jj][4*i + 1] = t.y;
+                v[jj][4*i + 2] = t.z;
+                v[jj][4*i + 3] = t.w;
+            }
+        } else {
+#pragma unroll
+            for (int i = 0; i < 16; ++i) {
+                v[jj][i] = yj[i];
+            }
+        }
+    }
+
+#pragma unroll
+    for (int g = 0; g < nmat; ++g) {
+#pragma unroll
+        for (int r = 0; r < nrows_w; ++r) {
+            const uint16_t * w2 = (const uint16_t *) &w4[g][r];
+            float w[16];
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                const float2 f = ggml_cuda_e4m3x2_to_float2(w2[i]);
+                w[2*i + 0] = f.x;
+                w[2*i + 1] = f.y;
+            }
+#pragma unroll
+            for (int jj = 0; jj < jt; ++jj) {
+                float part = 0.0f;
+#pragma unroll
+                for (int i = 0; i < 16; ++i) {
+                    part += w[i]*v[jj][i];
+                }
+                sumf[g][r][jbase + jj] += s[g]*part;
+            }
+        }
+    }
+}
+
+// walk the activation columns in chunks: the recursion keeps every array index a compile-time constant, since a
+// dynamic index into sumf or v would move it to local memory
+template <int jbase, int ncols_dst, int nmat, int nrows_w, bool y_vec>
+static __device__ __forceinline__ void mmf8_gemv_chunks(
+        const uint4 (&w4)[nmat][nrows_w], const float (&s)[nmat], const float * y, const int stride_col_y, const int k,
+        float (&sumf)[nmat][nrows_w][ncols_dst]) {
+    if constexpr (jbase < ncols_dst) {
+        constexpr int jt = (ncols_dst - jbase) >= 2 ? 2 : 1;
+        mmf8_gemv_cols  <jbase, jt, ncols_dst, nmat, nrows_w, y_vec>(w4, s, y, stride_col_y, k, sumf);
+        mmf8_gemv_chunks<jbase + jt, ncols_dst, nmat, nrows_w, y_vec>(w4, s, y, stride_col_y, k, sumf);
+    }
+}
+
 // a block owns nrows_w consecutive rows and its warps split k in trips of 512 columns (16 bytes per lane, 4 scale blocks)
-// one activation slice per trip serves all nrows_w rows: at one row per warp the activation loads were the limiter.
+// one activation slice per trip serves all nrows_w rows, in chunks of at most two columns: at one row per block the
+// activation loads were the limiter at batch 2 and above
 // has_glu: xg/sxg are the gate matrix (same shape and scales layout as x); the activation is read once for both and
 // the epilogue writes silu(gate) * up from the same per-row sums the separate launches would produce
 // PDL: the grid dependency is waited at entry and the launch completion signalled before the reduction (as mmvf), so
@@ -82,50 +148,7 @@ static __device__ __forceinline__ void mmf8_gemv_block(
         float s[nmat];
         mmf8_gemv_load_w<nmat, nrows_w>(xr, sr, xgr, sgr, ncols, nblk_n, k, w4, s);
 
-        float v[ncols_dst][16];
-#pragma unroll
-        for (int j = 0; j < ncols_dst; ++j) {
-            const float * yj = y + (size_t) j*stride_col_y + k;
-            if constexpr (y_vec) {
-#pragma unroll
-                for (int i = 0; i < 4; ++i) {
-                    const float4 t = ((const float4 *) yj)[i];
-                    v[j][4*i + 0] = t.x;
-                    v[j][4*i + 1] = t.y;
-                    v[j][4*i + 2] = t.z;
-                    v[j][4*i + 3] = t.w;
-                }
-            } else {
-#pragma unroll
-                for (int i = 0; i < 16; ++i) {
-                    v[j][i] = yj[i];
-                }
-            }
-        }
-
-#pragma unroll
-        for (int g = 0; g < nmat; ++g) {
-#pragma unroll
-            for (int r = 0; r < nrows_w; ++r) {
-                const uint16_t * w2 = (const uint16_t *) &w4[g][r];
-                float w[16];
-#pragma unroll
-                for (int i = 0; i < 8; ++i) {
-                    const float2 f = ggml_cuda_e4m3x2_to_float2(w2[i]);
-                    w[2*i + 0] = f.x;
-                    w[2*i + 1] = f.y;
-                }
-#pragma unroll
-                for (int j = 0; j < ncols_dst; ++j) {
-                    float part = 0.0f;
-#pragma unroll
-                    for (int i = 0; i < 16; ++i) {
-                        part += w[i]*v[j][i];
-                    }
-                    sumf[g][r][j] += s[g]*part;
-                }
-            }
-        }
+        mmf8_gemv_chunks<0, ncols_dst, nmat, nrows_w, y_vec>(w4, s, y, stride_col_y, k, sumf);
     }
 
     ggml_cuda_pdl_lc();
@@ -210,7 +233,7 @@ static __global__ void mul_mat_vec_f8_e4m3_multi(const mmf8_multi_args a, const 
 
 template <int ncols_dst>
 static void launch_mul_mat_vec_f8_e4m3_multi(const mmf8_multi_args & a, const float * y, const int ncols, const int stride_col_y, cudaStream_t stream) {
-    constexpr int nrows_w = ncols_dst == 1 ? 4 : (ncols_dst == 2 ? 2 : 1);
+    constexpr int nrows_w = 4; // always 4 rows per block; the activation columns are chunked inside the kernel
     mmf8_multi_args b = a;
     b.block0[0] = 0;
     for (int i = 0; i < a.n; ++i) {
@@ -252,8 +275,8 @@ static void launch_mul_mat_vec_f8_e4m3_rows(
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, 0, stream);
     const bool y_vec = ((uintptr_t) y % sizeof(float4) == 0) && stride_col_y % 4 == 0;
     if (xg != nullptr) {
-        // the fused up/gate epilogue keeps two accumulator sets: batch <= 4 only
-        if constexpr (ncols_dst <= 4) {
+        // the fused up/gate epilogue keeps two accumulator sets: batch <= MMF8_GEMV_MAX_NCOLS
+        if constexpr (ncols_dst <= MMF8_GEMV_MAX_NCOLS) {
             if (y_vec) {
                 ggml_cuda_kernel_launch(mul_mat_vec_f8_e4m3<ncols_dst, nrows_w, true, true>, launch_params, x, sx, xg, sxg, y, dst, ncols, nblk_n, stride_col_y, stride_col_dst);
             } else {
@@ -261,7 +284,7 @@ static void launch_mul_mat_vec_f8_e4m3_rows(
             }
             return;
         }
-        GGML_ABORT("fused F8 up/gate GEMV: batch above 4");
+        GGML_ABORT("fused F8 up/gate GEMV: batch above the GEMV limit");
     }
     const uint8_t * no_xg  = nullptr;
     const float   * no_sxg = nullptr;
@@ -276,8 +299,9 @@ template <int ncols_dst>
 static void launch_mul_mat_vec_f8_e4m3(
         const uint8_t * x, const float * sx, const uint8_t * xg, const float * sxg, const float * y, float * dst,
         const int ncols, const int nrows, const int nblk_n, const int stride_col_y, const int stride_col_dst, cudaStream_t stream) {
-    // 4 rows per warp at batch 1, fewer when more activation columns have to stay in registers
-    constexpr int nrows_w = ncols_dst == 1 ? 4 : (ncols_dst == 2 ? 2 : 1);
+    // always 4 rows per block: the activation columns are chunked inside the kernel, so more columns no longer
+    // force the block down to one row
+    constexpr int nrows_w = 4;
     launch_mul_mat_vec_f8_e4m3_rows<ncols_dst, nrows_w>(x, sx, xg, sxg, y, dst, ncols, nrows, nblk_n, stride_col_y, stride_col_dst, stream);
 }
 
@@ -464,11 +488,22 @@ static void mul_mat_f8_e4m3_cutlass(
 }
 #endif // GGML_CUDA_CUTLASS
 
+// GGML_CUDA_MMF8_GEMV_MAX: batch up to which the F8 GEMV runs instead of the CUTLASS W8A8 GEMM (A/B and tuning);
+// clamped to the compile-time cap, since only ncols_dst 1..MMF8_GEMV_MAX_NCOLS are instantiated
+int ggml_cuda_mmf8_gemv_max_ncols() {
+    static const int v = []() {
+        const char * s = getenv("GGML_CUDA_MMF8_GEMV_MAX");
+        const int    n = s ? atoi(s) : MMF8_GEMV_MAX_NCOLS;
+        return n < 1 ? 1 : (n > MMF8_GEMV_MAX_NCOLS ? MMF8_GEMV_MAX_NCOLS : n);
+    }();
+    return v;
+}
+
 bool ggml_cuda_mul_mat_f8_uses_cutlass(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1) {
 #ifdef GGML_CUDA_CUTLASS
     // GGML_CUDA_DISABLE_MMF8_CUTLASS: run the F16 fallback GEMM instead (A/B and equivalence gates)
     static const bool cutlass_disabled = getenv("GGML_CUDA_DISABLE_MMF8_CUTLASS") != nullptr;
-    return src0->type == GGML_TYPE_F8_E4M3 && ggml_nrows(src1) > MMF8_GEMV_MAX_NCOLS && !cutlass_disabled &&
+    return src0->type == GGML_TYPE_F8_E4M3 && ggml_nrows(src1) > ggml_cuda_mmf8_gemv_max_ncols() && !cutlass_disabled &&
         ggml_cuda_info().devices[ctx.device].cc == GGML_CUDA_CC_HOPPER;
 #else
     GGML_UNUSED(ctx);
@@ -534,7 +569,7 @@ void ggml_cuda_mul_mat_f8(ggml_backend_cuda_context & ctx, const ggml_tensor * s
 
     cudaStream_t stream = ctx.stream();
 
-    if (ntokens <= MMF8_GEMV_MAX_NCOLS) {
+    if (ntokens <= ggml_cuda_mmf8_gemv_max_ncols()) {
         mul_mat_vec_f8_e4m3_cuda(x, sx, nullptr, nullptr, y, d, ncols, nrows, nblk_n, ntokens, ncols, nrows, stream);
         return;
     }
@@ -564,7 +599,7 @@ void ggml_cuda_mul_mat_f8_gemv_glu(ggml_backend_cuda_context & ctx, const ggml_t
     const int     nrows   = src0->ne[1];
     const int     nblk_n  = nrows/GGML_F8_E4M3_SCALE_BLOCK;
     const int64_t ntokens = ggml_nrows(src1);
-    GGML_ASSERT(ntokens <= 4);
+    GGML_ASSERT(ntokens <= ggml_cuda_mmf8_gemv_max_ncols());
 
     mul_mat_vec_f8_e4m3_cuda((const uint8_t *) src0->data, (const float *) up->src[2]->data,
                              (const uint8_t *) src0g->data, (const float *) gate->src[2]->data,
@@ -609,7 +644,7 @@ void ggml_cuda_mul_mat_f8_shared_gemv(ggml_backend_cuda_context & ctx, ggml_tens
     const ggml_tensor * src1 = dsts[0]->src[1];
     const int     ncols   = src1->ne[0];
     const int64_t ntokens = ggml_nrows(src1);
-    GGML_ASSERT(ntokens <= MMF8_GEMV_MAX_NCOLS);
+    GGML_ASSERT(ntokens <= ggml_cuda_mmf8_gemv_max_ncols());
 
     mmf8_multi_args a = {};
     a.n = n;
