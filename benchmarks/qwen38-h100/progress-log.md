@@ -866,3 +866,45 @@ Status: done. `build-h100-r1` (R2 + R3 + R1) with the Q8_0-head GGUF (`srv_ab_q8
 Notes: every shape and every rep pair is faster on `r1` except the rep-1 cold-10k request (8302 / 8664 vs 10242 / 10384 on `k3`, which is itself far above its sync-point-4 rep-1 of 7821 / 7660: the rep-1 effect varies by day). Probe launches on the same host (single launches, cold-10k rep 1 / rep 2): `r1` with `GGML_CUDA_DISABLE_GDN_PACK=1` 11028 / 11819, `r1` again 9616 / 12202, `r3` 10722 / 11845, so the R1 pack moves about 0.15 to 0.35 s into the first 10k request. An nsys API trace of the `r1` server (`prof/srv-r1-api`) shows where it goes: the pack's own `cudaMalloc` takes 0.18 ms, but the first 4096-token ubatch of the first 10k request is followed by `cuMemCreate` 61 ms + `cuMemSetAccess` 77 ms (pool growth) and 135 / 58 / 164 ms stream synchronizations at the ubatch boundaries; without the pack the same one-time costs land in `pd_bench`'s 500-token probe request (server prompt eval 582 ms there vs 300 ms with the pack), which is not scored. Structural, once per server life, not a per-request cost (rep 2 is +5.7%). Flagged: a server warmup with one full-size ubatch (config level, not a kernel change) would move every one-time cost before the first scored request on both builds.
 Against the user targets: decode above 80: yes (83.9 at 10k, 69.7 at 110k); server pp10k above 10000: rep 2 yes (12396, 12066), the 2-rep mean yes (10357), rep 1 no (8302, 8664). Against the campaign-4 predictions: llama-bench pp10240 13638 -> 14443 (+5.9%) and tg128 at d10240 81.7 -> 88.3 (+8.1%) carried to the server as cold-110k +4.4%, warm +2.9%, decode +7.8% / +6.4%.
 Decision: campaign-4 build accepted (faster on every shape and every rep pair except the once-per-life rep-1 cold-10k, all gates exact); scoreboard row added; PR #275 opened (base `h100-attn-decode`, head `h100-campaign4`).
+
+## Concurrency sweep at 10k + 1k: fabric vs SGLang FP8, batch 1 to 32 (2026-09-17, user ask)
+
+Goal (user): aggregate prefill and decode throughput at 1, 2, 4, 8, 16 and 32 concurrent requests, pp10k + tg1k only, FP8 on
+both sides, and the same numbers for SGLang.
+Method: new client `conc_bench.py` sends N identical-shape requests at once over `/v1/completions` with streaming and
+`stream_options.include_usage`, each with a unique first line so no request can hit a prefix cache (a run fails if the server
+reports a cache hit or omits usage counts). Per run: `prefill_agg` = sum of prompt tokens / time until the last request's first
+token; `decode_agg` = output tokens streamed after that instant / the remaining wall time; `output_tok_s` = all output tokens /
+total wall; per-stream decode and TTFT per request. 1024 output tokens with `ignore_eos`, temperature 0, 2 reps per level.
+Runners `conc_fabric.sh` (one llama-server per level, `--parallel N`, ctx = max(262144, N x 12288), the campaign-4 build
+`build-h100-r1` with `Qwen3.8-27B-FP8-q8head.gguf`, ub 4096, f16 KV) and `conc_sglang.sh` (SGLang 0.5.20.dev20260914 on the
+shipped `Qwen/Qwen3.8-27B-FP8` checkpoint, fa3 attention, 262144 context, `--enable-cache-report`; the server auto-capped
+`max_running_requests` to 20 and reported `chunked_prefill_size=8192`, `max_total_num_tokens=273521`). Both engines on one H100
+(GPU 4), serially, idle host; results in `results/fabric/R-conc-n*.json` and `results/sglang/S-conc.json`. Both reps agree
+within 1% on every SGLang row and within 1% on every fabric row except fabric n=32 prefill (6770 / 3791).
+
+| N | fabric prefill agg tok/s | sglang prefill agg | ratio | fabric decode agg tok/s | sglang decode agg | ratio | fabric TTFT mean s | sglang TTFT mean s |
+|---|---|---|---|---|---|---|---|---|
+| 1 | 8773 | 16828 | 1.92 | 83.9 | 83.2 | 0.99 | 1.14 | 0.60 |
+| 2 | 7161 | 17410 | 2.43 | 119.1 | 159.4 | 1.34 | 2.49 | 1.10 |
+| 4 | 7098 | 17855 | 2.52 | 84.1 | 299.2 | 3.56 | 4.20 | 1.77 |
+| 8 | 6516 | 18104 | 2.78 | 71.6 | 538.1 | 7.52 | 8.00 | 4.23 |
+| 16 | 6579 | 18113 | 2.75 | 413.7 | 910.1 | 2.20 | 15.28 | 7.63 |
+| 32 | 5280 | 8501 | 1.61 | 471.5 | 751.9 | 1.59 | 45.82 | 20.79 |
+
+Total throughput (prompt + output tokens / wall): fabric 829 / 1108 / 817 / 704 / 2797 / 2717, SGLang 858 / 1581 / 2778 / 4505 /
+6592 / 6381 tok/s at N = 1 / 2 / 4 / 8 / 16 / 32. The N = 32 row of both engines is admission-limited, not compute-limited:
+SGLang admits 20 of the 32 requests at once (13 streams were still running when the last first token arrived, against 32 on
+fabric), and fabric's second rep prefilled at 3791 against 6770 in the first.
+
+Finding (fabric): aggregate decode does not scale with batch below 9. Engine-level `llama-batched-bench` on the same build and
+GPU (`prof/bb-r1.log`, `-npp 10240 -ntg 1024 -npl 1,2,4,8,16,32 -c 393216 -b 4096 -ub 4096 -fa 1`, no server in the path)
+reproduces it: S_TG 88.04 / 125.59 / 88.06 / 74.38 / 548.03 / 818.38 tok/s at B = 1 / 2 / 4 / 8 / 16 / 32, i.e. per-step decode
+time 11.4 / 15.9 / 46.5 / 107.5 / 29.2 / 39.1 ms. B = 4 and B = 8 cost one full single-token step per sequence (4 x 11.4 = 45.6
+against 46.5 measured, 8 x 11.4 = 91 against 107.5), while B = 16 and B = 32 amortize the weight reads as expected. So the loss
+is in the graph or the CUDA backend, not in the server's batch assembly, and its boundary sits exactly at the batch-8 limit of
+the decode paths added during campaigns 2 to 4 (the F8 GEMV route `ntokens <= MMF8_GEMV_MAX_NCOLS = 8`, the D6 conv-state
+fusion and the R2b state-gather elision, all gated on batches up to 8 and one sequence). Prefill is unaffected: S_PP is
+12082 to 12469 tok/s across every B.
+Not measured here: which of those kernels or fusions is responsible (needs a decode-window nsys trace at B = 4 and B = 16 with
+PDL off, and an A/B with `GGML_CUDA_DISABLE_FUSION=1`), speculative decoding on either engine, and the 110k shape.
