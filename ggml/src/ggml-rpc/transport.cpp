@@ -483,7 +483,11 @@ bool socket_t::impl::send_data(const void * data, size_t size) {
     size_t bytes_sent = 0;
     while (bytes_sent < size) {
         size_t size_to_send = std::min(size - bytes_sent, MAX_CHUNK_SIZE);
-        ssize_t n = send(fd, (const char *)data + bytes_sent, size_to_send, 0);
+        int flags = 0;
+#ifdef MSG_NOSIGNAL
+        flags = MSG_NOSIGNAL;
+#endif
+        ssize_t n = send(fd, (const char *)data + bytes_sent, size_to_send, flags);
         if (n < 0) {
             GGML_LOG_ERROR("send failed (bytes_sent=%zu, size_to_send=%zu)\n",
                            bytes_sent, size_to_send);
@@ -656,6 +660,16 @@ static bool set_no_delay(sockfd_t sockfd) {
     return ret == 0;
 }
 
+static bool set_no_sigpipe(sockfd_t sockfd) {
+#if !defined(_WIN32) && !defined(MSG_NOSIGNAL) && defined(SO_NOSIGPIPE)
+    int flag = 1;
+    return setsockopt(sockfd, SOL_SOCKET, SO_NOSIGPIPE, (char *)&flag, sizeof(int)) == 0;
+#else
+    (void) sockfd;
+    return true;
+#endif
+}
+
 static bool set_non_blocking(sockfd_t sockfd, bool enabled) {
 #ifdef _WIN32
     u_long mode = enabled ? 1 : 0;
@@ -704,6 +718,11 @@ socket_ptr socket_t::accept(int timeout_ms) {
     }
     if (!set_no_delay(client_socket_fd)) {
         GGML_LOG_ERROR("Failed to set TCP_NODELAY\n");
+        return nullptr;
+    }
+    if (!set_no_sigpipe(client_socket_fd)) {
+        GGML_LOG_ERROR("Failed to suppress SIGPIPE\n");
+        close_socket(client_socket_fd);
         return nullptr;
     }
     return socket_ptr(new socket_t(std::make_unique<impl>(client_socket_fd)));
@@ -803,6 +822,10 @@ socket_ptr socket_t::connect(const char * host, int port, int timeout_ms) {
     }
     if (!set_no_delay(sockfd)) {
         GGML_LOG_ERROR("Failed to set TCP_NODELAY\n");
+        return fail();
+    }
+    if (!set_no_sigpipe(sockfd)) {
+        GGML_LOG_ERROR("Failed to suppress SIGPIPE\n");
         return fail();
     }
     return socket_ptr(new socket_t(std::make_unique<impl>(sockfd)));
