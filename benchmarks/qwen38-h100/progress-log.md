@@ -977,3 +977,30 @@ from the A-side binary) for (a) and (b); the op tests gain m = 3, 5, 6, 7 cases 
 odd batch ends in a one-column chunk. Lowering the crossover default for (c) additionally needs the GEMM to be at least 10%
 faster per decode step at that batch and to clear G2 (Same top p >= 98.0%, Mean KLD <= 0.006); otherwise the default stays 8
 and the knob remains an A/B tool.
+Verify (GPU 5 for the gates, GPU 4 for the batched-bench A/B, A = `build-h100-r1` at `54db4c109`, B = this change built
+with CUTLASS on and block-scaled off): registers `cuobjdump -res-usage` STACK 0 and LOCAL 0 for every
+`mul_mat_vec_f8` instance, so the chunking spills nothing; the has_glu kernels at `ncols_dst` 7 and 8 do sit at REG 255.
+Op tests 28/28 MUL_MAT_F8, 13/13 MUL_MAT_F8_FFN, 20/20 MUL_MAT_F8_SHARED with the new odd-batch cases.
+GX: at `-ub` 1, 4 and 8 the candidate gives `Same top p 100.000%` and `Mean KLD -0.000000` against the fresh references,
+with `Maximum KLD 0.000062`; the A-side binary re-run against its own reference reports the identical statistics to every
+printed digit (same PPL, same maximum and 99.9% KLD), so that residual is the harness's own reproducibility and the two
+builds agree. `llama-batched-bench` at 10240 + 128, two A/B passes: S_TG 87.26 / 87.30 (A) against 87.16 / 86.09 (B) at
+B=1, 124.92 / 124.67 against 144.66 / 144.50 at B=2, 87.48 / 87.41 against 204.79 / 203.68 at B=4, 73.96 / 74.41 against
+207.04 / 205.74 at B=8, and 548.26 / 547.46 against 548.52 / 544.68 at B=16 where the route is unchanged. The B=1 dip is
+run noise: a dedicated `llama-bench` tg128 at d10240 A/B gives 88.17 / 88.02 (A) against 87.84 / 88.10 (B). Per decode step
+that is 45.7 to 19.5 ms at B=4 and 108 to 38.6 ms at B=8, short of the predicted 14 to 18 and 18 to 26 ms but 2.3x and
+2.8x better than before; S_PP stays 11868 to 12322. Server sweep (`conc_fabric.sh`, 10k prompt + 1024 output, 2 reps per
+level) decode_agg: 84.2 / 83.8 (A) against 83.5 / 83.8 (B) at N=1, 118.9 / 118.5 against 134.9 / 134.2 at N=2,
+84.5 / 84.6 against 187.5 / 187.6 at N=4, 71.5 / 72.0 against 189.6 / 189.4 at N=8, with prefill_agg 6770 / 6499 against
+7390 / 7420 at N=4 and 6348 / 5927 against 7625 / 7049 at N=8.
+Crossover sweep with the knob (build B, two passes, per decode step): GEMV 13.9 ms against GEMM 22.0 ms at B=2, 19.5
+against 21.4 at B=4, 38.6 against 23.7 at B=8. Only B=8 clears the 10% rule (the GEMM is 39% faster there, S_TG 337.7
+against 207.1), so the default was lowered to 7 and gated: at `-ub 8` the GEMM route gives Mean KLD 0.008682 and
+Same top p 97.826%, outside G2's 0.006 and 98.0%, while the same build at `-ub 4` stays bit-exact. The default was
+reverted to 8.
+Decision: (a) and (b) kept. Aggregate decode at the shapes that were flat now scales: 2.2x at N=4 and 2.6x at N=8 on the
+server, 2.3x and 2.8x on `llama-batched-bench`, bit-exact, with B=1 and B=16 unchanged. (c) kept as the env knob
+`GGML_CUDA_MMF8_GEMV_MAX` with the default at 8: the batch-8 GEMM is the largest single remaining decode win (another
+1.6x at that batch) but it needs a more accurate activation quantization to pass G2, which is its own iteration.
+Next: the GEMV is now 38.6 ms per step at B=8 against 11.4 at B=1 for 8x the work, so it is no longer activation-bound;
+the next decode target is the weight traffic itself (one pass of the 26 GB of weights per step is about 8.7 ms at 3 TB/s).
