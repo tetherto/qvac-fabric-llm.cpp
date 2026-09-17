@@ -3,7 +3,6 @@
 #include "mma.cuh"
 
 #include <climits>
-#include <cstdlib>
 #include <limits>
 #include <mutex>
 
@@ -392,16 +391,10 @@ static bool gdn_init(int device) {
     static bool available[GGML_CUDA_MAX_DEVICES] = {};
     GGML_ASSERT(device >= 0 && device < GGML_CUDA_MAX_DEVICES);
     std::call_once(once[device], [device] {
-        const char * disabled = std::getenv("GGML_CUDA_DISABLE_GDN_MMA");
-        if (disabled && std::atoi(disabled) != 0) {
-            return;
-        }
         ggml_cuda_set_device(device);
         const auto & info = ggml_cuda_info().devices[device];
 #ifdef GGML_USE_HIP
-        // WMMA wins for long prompts on gfx1151, but can regress short prompts.
-        const char * enabled = std::getenv("GGML_HIP_GDN_MMA");
-        const bool supported = enabled && std::atoi(enabled) != 0 && info.cc == GGML_CUDA_CC_OFFSET_AMD + 0x1151;
+        const bool supported = info.cc == GGML_CUDA_CC_OFFSET_AMD + 0x1151;
 #elif defined(GGML_USE_MUSA)
         const bool supported = false;
 #else
@@ -425,6 +418,10 @@ static bool gdn_plan(int device, const ggml_cuda_gdn_mma_args & args, gdn_worksp
         return false;
     }
     const int cc = ggml_cuda_info().devices[device].cc;
+    // Use WMMA from the shortest prompt size with a measured win on gfx1151.
+    if (cc == GGML_CUDA_CC_OFFSET_AMD + 0x1151 && args.n_tokens < 2048) {
+        return false;
+    }
     if (cc == GGML_CUDA_CC_BLACKWELL && (args.H == 16 || (args.H == 32 && args.n_tokens < 512))) {
         return false;
     }
