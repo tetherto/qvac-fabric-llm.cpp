@@ -1,11 +1,11 @@
 #pragma once
 
-#include "vendors/cuda.h"
+#include "common.cuh"
 
 #include <cstddef>
 #include <cstdint>
 
-struct ggml_cuda_gdn_cute_args {
+struct ggml_cuda_gdn_mma_args {
     const float * q;
     const float * k;
     const float * v;
@@ -35,6 +35,6 @@ struct ggml_cuda_gdn_cute_args {
     bool    eligible;
 };
 
-bool ggml_cuda_gdn_cute_available(int device, const ggml_cuda_gdn_cute_args & args);
-size_t ggml_cuda_gdn_cute_get_alloc_size(int device, const ggml_cuda_gdn_cute_args & args, size_t logical_size);
-bool ggml_cuda_gdn_cute_launch(int device, const ggml_cuda_gdn_cute_args & args, cudaStream_t stream);
+bool ggml_cuda_gdn_mma_available(int device, const ggml_cuda_gdn_mma_args & args);
+size_t ggml_cuda_gdn_mma_get_alloc_size(int device, const ggml_cuda_gdn_mma_args & args, size_t logical_size);
+bool ggml_cuda_gdn_mma_launch(int device, const ggml_cuda_gdn_mma_args & args, cudaStream_t stream);
