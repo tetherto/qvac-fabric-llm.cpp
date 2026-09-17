@@ -12,8 +12,10 @@ enum common_params_fit_status {
 };
 
 // fits mparams and cparams to free device memory (assumes system memory is unlimited)
-//   - returns true if the parameters could be successfully modified to fit device memory
-//   - this function is NOT thread safe because it modifies the global llama logger state
+//   - returns SUCCESS if parameters fit, FAILURE if they cannot fit, or ERROR on a hard error
+//   - restores parameters and writable buffers on FAILURE or ERROR
+//   - temporary global logger overrides are serialized between fit/memory probes;
+//     callers must still exclude unrelated logging and logger changes during probes
 //   - only parameters that have the same value as in llama_default_model_params are modified
 //     with the exception of the context size which is modified if and only if equal to 0
 common_params_fit_status common_fit_params(
