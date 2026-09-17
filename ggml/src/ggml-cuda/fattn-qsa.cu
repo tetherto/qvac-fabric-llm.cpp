@@ -19,6 +19,7 @@ constexpr int   QSA_GROUP    = 12;
 constexpr int   QSA_BLOCK_M  = 16;
 constexpr int   QSA_BLOCK_N  = 32;
 constexpr int   QSA_D_TILES  = QSA_HEAD_DIM / 16;
+constexpr int   QSA_DECODE_SPLITS = 64;
 constexpr float LOG2E_F      = 1.4426950408889634f;
 
 constexpr int QSA_TRITON_SHARED = 24640;
@@ -121,6 +122,132 @@ static __device__ __forceinline__ float qsa_exp2(float value) {
     float result;
     asm("ex2.approx.ftz.f32 %0, %1;" : "=f"(result) : "f"(value));
     return result;
+}
+
+// Batch-one QSA decode needs more parallelism than the one-warp prefill
+// schedule below. Split the sparse token list across CTAs for every query
+// head, then merge their online-softmax partials in a second kernel.
+__launch_bounds__(WARP_SIZE) static __global__ void qsa_decode_split_f16(
+        const char * __restrict__ q_ptr,
+        const char * __restrict__ k_ptr,
+        const char * __restrict__ v_ptr,
+        const char * __restrict__ mask_ptr,
+        const int * __restrict__ indices,
+        float * __restrict__ partial,
+        float scale,
+        int n_kv,
+        int n_kv_max,
+        int64_t q_nb2,
+        int64_t k_nb1,
+        int64_t v_nb1) {
+    const int head  = blockIdx.x;
+    const int split = blockIdx.y;
+    const int lane  = threadIdx.x;
+
+    const float * q = reinterpret_cast<const float *>(q_ptr + int64_t(head) * q_nb2);
+    float q_values[QSA_HEAD_DIM / WARP_SIZE];
+    float accumulators[QSA_HEAD_DIM / WARP_SIZE] = {};
+#pragma unroll
+    for (int i = 0; i < QSA_HEAD_DIM / WARP_SIZE; ++i) {
+        q_values[i] = q[lane + i * WARP_SIZE];
+    }
+    float running_max = -INFINITY;
+    float running_sum = 0.0f;
+
+    const int tokens_per_split = (n_kv_max + QSA_DECODE_SPLITS - 1) / QSA_DECODE_SPLITS;
+    const int slot_begin = split * tokens_per_split;
+    const int slot_end   = min(slot_begin + tokens_per_split, n_kv_max);
+
+    for (int slot = slot_begin; slot < slot_end; ++slot) {
+        const int token = indices[slot];
+        float dot = 0.0f;
+        if (token >= 0 && token < n_kv) {
+            const half * k = reinterpret_cast<const half *>(k_ptr + int64_t(token) * k_nb1);
+#pragma unroll
+            for (int i = 0; i < QSA_HEAD_DIM / WARP_SIZE; ++i) {
+                const int d = lane + i * WARP_SIZE;
+                dot += q_values[i] * __half2float(k[d]);
+            }
+        }
+        dot = warp_reduce_sum(dot);
+
+        float alpha = 1.0f;
+        float beta  = 0.0f;
+        if (lane == 0 && token >= 0 && token < n_kv) {
+            const float bias = __half2float(reinterpret_cast<const half *>(mask_ptr)[token]);
+            if (isfinite(bias)) {
+                const float score    = dot * scale + bias;
+                const float next_max = fmaxf(running_max, score);
+                alpha = running_max == -INFINITY ? 0.0f : __expf(running_max - next_max);
+                beta  = __expf(score - next_max);
+                running_sum = running_sum * alpha + beta;
+                running_max = next_max;
+            }
+        }
+        alpha = __shfl_sync(0xffffffffU, alpha, 0);
+        beta  = __shfl_sync(0xffffffffU, beta, 0);
+
+#pragma unroll
+        for (int i = 0; i < QSA_HEAD_DIM / WARP_SIZE; ++i) {
+            accumulators[i] *= alpha;
+        }
+        if (beta != 0.0f) {
+            const half * v = reinterpret_cast<const half *>(v_ptr + int64_t(token) * v_nb1);
+#pragma unroll
+            for (int i = 0; i < QSA_HEAD_DIM / WARP_SIZE; ++i) {
+                const int d = lane + i * WARP_SIZE;
+                accumulators[i] += beta * __half2float(v[d]);
+            }
+        }
+    }
+
+    float * row = partial + (head * QSA_DECODE_SPLITS + split) * (QSA_HEAD_DIM + 2);
+    if (lane == 0) {
+        row[0] = running_max;
+        row[1] = running_sum;
+    }
+#pragma unroll
+    for (int i = 0; i < QSA_HEAD_DIM / WARP_SIZE; ++i) {
+        row[lane + i * WARP_SIZE + 2] = accumulators[i];
+    }
+}
+
+__launch_bounds__(QSA_HEAD_DIM) static __global__ void qsa_decode_reduce_f32(
+        const float * __restrict__ partial,
+        float * __restrict__ dst) {
+    const int head = blockIdx.x;
+    const int tid  = threadIdx.x;
+
+    __shared__ float coefficients[QSA_DECODE_SPLITS];
+    __shared__ float denominator;
+
+    if (tid == 0) {
+        float maximum = -INFINITY;
+#pragma unroll
+        for (int split = 0; split < QSA_DECODE_SPLITS; ++split) {
+            const float * row = partial + (head * QSA_DECODE_SPLITS + split) * (QSA_HEAD_DIM + 2);
+            maximum = fmaxf(maximum, row[0]);
+        }
+
+        float sum = 0.0f;
+#pragma unroll
+        for (int split = 0; split < QSA_DECODE_SPLITS; ++split) {
+            const float * row = partial + (head * QSA_DECODE_SPLITS + split) * (QSA_HEAD_DIM + 2);
+            const float coefficient = row[0] == -INFINITY ? 0.0f : __expf(row[0] - maximum);
+            coefficients[split] = coefficient;
+            sum += row[1] * coefficient;
+        }
+        denominator = sum;
+    }
+    __syncthreads();
+
+    float value = 0.0f;
+#pragma unroll
+    for (int split = 0; split < QSA_DECODE_SPLITS; ++split) {
+        const float * row = partial + (head * QSA_DECODE_SPLITS + split) * (QSA_HEAD_DIM + 2);
+        value += row[tid + 2] * coefficients[split];
+    }
+    dst[head * QSA_HEAD_DIM + tid] = denominator > 0.0f ? value / denominator : 0.0f;
 }
 
 // Qwen4-Exp QSA prefill: one warp owns one (query, KV head) pair. The 12 GQA
@@ -351,6 +478,83 @@ static bool qsa_runtime_enabled() {
     return enabled;
 }
 
+static bool qsa_decode_runtime_enabled() {
+    static const bool enabled = [] {
+        const char * value = std::getenv("GGML_CUDA_QSA_DECODE");
+        return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
+    }();
+    return enabled;
+}
+
+static bool qsa_decode_supported(const int device, const ggml_tensor * dst) {
+    if (!qsa_decode_runtime_enabled() || dst == nullptr ||
+        ggml_cuda_info().devices[device].cc != GGML_CUDA_CC_HOPPER) {
+        return false;
+    }
+
+    const char * block_top_k = std::getenv("LLAMA_QSA_BLOCK_TOPK");
+    if (block_top_k == nullptr || block_top_k[0] == '\0' || std::strcmp(block_top_k, "0") == 0) {
+        return false;
+    }
+
+    const ggml_tensor * q       = dst->src[0];
+    const ggml_tensor * k       = dst->src[1];
+    const ggml_tensor * v       = dst->src[2];
+    const ggml_tensor * mask    = dst->src[3];
+    const ggml_tensor * sinks   = dst->src[4];
+    const ggml_tensor * indices = dst->src[5];
+    if (q == nullptr || k == nullptr || v == nullptr || mask == nullptr || indices == nullptr || sinks != nullptr) {
+        return false;
+    }
+
+    float scale         = 0.0f;
+    float max_bias      = 0.0f;
+    float logit_softcap = 0.0f;
+    memcpy(&scale, (const float *) dst->op_params, sizeof(float));
+    memcpy(&max_bias, (const float *) dst->op_params + 1, sizeof(float));
+    memcpy(&logit_softcap, (const float *) dst->op_params + 2, sizeof(float));
+    const int32_t n_kv_max = ggml_get_op_params_i32(dst, 4);
+
+    return q->type == GGML_TYPE_F32 && k->type == GGML_TYPE_F16 && v->type == GGML_TYPE_F16 &&
+           dst->type == GGML_TYPE_F32 && mask->type == GGML_TYPE_F16 && indices->type == GGML_TYPE_I32 &&
+           scale == 0.0625f && max_bias == 0.0f && logit_softcap == 0.0f && q->ne[0] == QSA_HEAD_DIM &&
+           q->ne[1] == 1 && q->ne[2] == QSA_GROUP && q->ne[3] == 1 && k->ne[0] == QSA_HEAD_DIM &&
+           k->ne[1] > n_kv_max && k->ne[2] == 1 && k->ne[3] == 1 && v->ne[0] == QSA_HEAD_DIM &&
+           v->ne[1] == k->ne[1] && v->ne[2] == 1 && v->ne[3] == 1 && mask->ne[0] == k->ne[1] &&
+           mask->ne[1] == 1 && mask->ne[2] == 1 && mask->ne[3] == 1 && indices->ne[0] == n_kv_max &&
+           indices->ne[1] == 1 && indices->ne[2] == 1 && indices->ne[3] == 1 && n_kv_max > 0 &&
+           n_kv_max <= 4096 && q->nb[0] == sizeof(float) && k->nb[0] == sizeof(half) &&
+           v->nb[0] == sizeof(half) && mask->nb[0] == sizeof(half) && indices->nb[0] == sizeof(int32_t) &&
+           ggml_is_contiguous(indices) && ggml_is_contiguous(dst);
+}
+
+static void qsa_decode_launch(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * q       = dst->src[0];
+    const ggml_tensor * k       = dst->src[1];
+    const ggml_tensor * v       = dst->src[2];
+    const ggml_tensor * mask    = dst->src[3];
+    const ggml_tensor * indices = dst->src[5];
+
+    float scale = 1.0f;
+    memcpy(&scale, (const float *) dst->op_params, sizeof(float));
+    const int32_t n_kv_max = ggml_get_op_params_i32(dst, 4);
+
+    constexpr size_t partial_elements = QSA_GROUP * QSA_DECODE_SPLITS * (QSA_HEAD_DIM + 2);
+    ggml_cuda_pool_alloc<float> partial(ctx.pool(), partial_elements);
+
+    const ggml_cuda_kernel_launch_params split_params(
+        dim3(QSA_GROUP, QSA_DECODE_SPLITS, 1), dim3(WARP_SIZE, 1, 1), 0, ctx.stream());
+    ggml_cuda_kernel_launch(
+        qsa_decode_split_f16, split_params, (const char *) q->data, (const char *) k->data,
+        (const char *) v->data, (const char *) mask->data, (const int *) indices->data, partial.ptr, scale,
+        int(k->ne[1]), n_kv_max, int64_t(q->nb[2]), int64_t(k->nb[1]), int64_t(v->nb[1]));
+
+    const ggml_cuda_kernel_launch_params reduce_params(
+        dim3(QSA_GROUP, 1, 1), dim3(QSA_HEAD_DIM, 1, 1), 0, ctx.stream());
+    ggml_cuda_kernel_launch(qsa_decode_reduce_f32, reduce_params, partial.ptr, (float *) dst->data);
+    CUDA_CHECK(cudaGetLastError());
+}
+
 static bool qsa_triton_supported(const int device, const ggml_tensor * dst) {
 #if defined(__linux__) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
     if (dst == nullptr || qsa_triton_state().handle == nullptr ||
@@ -440,6 +644,10 @@ static void qsa_triton_launch(ggml_backend_cuda_context & ctx, ggml_tensor * dst
 }  // namespace
 
 bool ggml_cuda_flash_attn_ext_qsa_f16_supported(int device, const ggml_tensor * dst) {
+    if (qsa_decode_supported(device, dst)) {
+        return true;
+    }
+
     if (qsa_triton_supported(device, dst)) {
         return true;
     }
@@ -477,6 +685,11 @@ bool ggml_cuda_flash_attn_ext_qsa_f16_supported(int device, const ggml_tensor * 
 }
 
 void ggml_cuda_flash_attn_ext_qsa_f16(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    if (qsa_decode_supported(ggml_cuda_get_device(), dst)) {
+        qsa_decode_launch(ctx, dst);
+        return;
+    }
+
     if (qsa_triton_supported(ggml_cuda_get_device(), dst)) {
         qsa_triton_launch(ctx, dst);
         return;

@@ -1702,3 +1702,63 @@ process:
 
 The batch-1 path is intentionally unchanged; subsequent work should establish
 a new matched TG128 baseline and profile it independently.
+
+
+## 2026-09-17: batch-1 QSA decode and long BF16 GEMV
+
+A fresh two-H100 batch-1 baseline used the FP8 GGUF, physical GPUs 6/7,
+`-sm tensor -ts 1/1`, DeepGEMM expert matmul, FlashInfer GDN, expert
+parallelism, compressed QSA, pinned-host PLE through `-lm none`, and
+`-b 2048 -ub 2048`. The warmed last-four TG128 mean was 78.46 tok/s at
+depth zero and 67.78 tok/s at a resident 32K context. The matched SGLang
+32K checkpoint remains 101.47 tok/s.
+
+A Hopper-only batch-one QSA kernel now handles the exact Qwen4Exp sparse
+attention shape when `GGML_CUDA_QSA_DECODE=1`. The first stage launches one
+warp for each of 12 local query heads and 64 selected-token splits, preloads
+the 256-element query, and computes online-softmax partials directly from the
+I32 sparse indices and F16 K/V cache. A second 256-thread CTA per head merges
+the 64 max/sum/value partials. Dispatch is restricted to F32 Q/output, F16
+K/V and mask, D=256, one query token and sequence, 12 local Q heads, one
+local KV head, scale 1/16, no sinks/max-bias/soft-cap, at most 4096 selected
+tokens, and the block-top-k QSA graph.
+
+The exact sparse 2051-index backend-op case passes against the CPU reference
+on H100 GPU 6. At 32K context the warmed last-four TG128 mean improved from
+67.78 to 73.16 tok/s (+7.93%); the final two samples were 74.61 and 74.48
+tok/s. Decode-only Nsight isolation found 0.472 ms/GPU/token in the split
+stage and 0.042 ms/GPU/token in the merge stage. No generic FlashAttention
+remains in the isolated decode interval.
+
+The same trace showed the remaining generic BF16 projection bucket at about
+2.35 ms/GPU/token. Extending the existing warp-per-row GEMV from K=320 to the
+real K=2560 and K=6144 projection widths was useful only for large output
+matrices. The final dispatch therefore requires at least 2560 output rows for
+those new widths; K=320 retains its established behavior. Set
+`GGML_CUDA_BF16_GEMV_LONG_ROWS=0` to disable only the extension. Exact
+5120x2560 and 2560x6144 cases pass the CPU reference. Focused H100 timings
+were 5.05 vs 11.16 us for 5120x2560, 201.88 vs 252.52 us for
+124160x2560, and 7.32 vs 7.78 us for 2560x6144.
+
+A same-binary A/B/A bracket at 32K retained every other optimization. The two
+candidate terminal pairs averaged 75.41 tok/s, versus 74.20 tok/s with only
+the long-row extension disabled, a repeatable +1.63%. Combined with the new
+QSA path this checkpoint is about 11% above the fresh 67.78 tok/s baseline,
+although SGLang remains roughly 1.35x faster.
+
+Rejected experiments included the existing one-warp QSA prefill kernel for
+decode (48.06 tok/s), an initial block-level split-K design (about 66.1
+tok/s), whole-TP CUDA graphs (about 72.47 tok/s stable), a K=256 GEMV test
+that did not match any hot real projection, and an unguarded long-width GEMV
+that regressed the frequently launched 24/128/256/512-row projections and
+cancelled the large-matrix savings.
+
+Artifacts are under:
+
+- `/home/aman/qwen4-exp-opt-bench-20260911/results/decode-b1-20260917/`
+- `qsa-warp-split64-d32768-tg128-r5.jsonl`
+- `qsa-warp-split64-d32768-tg64.nsys-rep`
+- `qsa-gemv-real-shapes-d32768-tg64.nsys-rep`
+- `qsa-gemv-large-only-d32768-tg128-r5.jsonl`
+- `qsa-gemv-long-off-d32768-tg128-r5.jsonl`
+- `qsa-gemv-large-only-repeat-d32768-tg128-r5.jsonl`

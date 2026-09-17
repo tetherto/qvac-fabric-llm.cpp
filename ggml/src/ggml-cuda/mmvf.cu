@@ -5,11 +5,10 @@
 #include "convert.cuh"
 
 #if !defined(GGML_USE_HIP)
-// Decode-sized BF16 GEMV for short rows.  The generic MMVF kernel assigns one
-// block to every output row; for K=320 that means five warps plus a shared-memory
-// reduction per row.  Here each warp owns a row and eight rows share a block.
-// This is intentionally narrow while it is evaluated on the Qwen4Exp HC
-// projections.
+// Decode-sized BF16 GEMV.  The generic MMVF kernel assigns one block to every
+// output row and uses a shared-memory cross-warp reduction.  Here each warp owns
+// a row and eight rows share a block.  Keep dispatch restricted to the recurring
+// Qwen4Exp projection widths while this Hopper path is evaluated.
 template <int rows_per_block>
 static __global__ void mul_mat_vec_f_bf16_warp_rows(
         const nv_bfloat16 * x, const float * y, float * dst,
@@ -46,6 +45,14 @@ static __global__ void mul_mat_vec_f_bf16_warp_rows(
 static bool mul_mat_vec_f_bf16_warp_rows_enabled() {
     static const bool enabled = [] {
         const char * value = getenv("GGML_CUDA_BF16_GEMV_WARP_ROWS");
+        return value == nullptr || std::atoi(value) != 0;
+    }();
+    return enabled;
+}
+
+static bool mul_mat_vec_f_bf16_warp_rows_long_enabled() {
+    static const bool enabled = [] {
+        const char * value = getenv("GGML_CUDA_BF16_GEMV_LONG_ROWS");
         return value == nullptr || std::atoi(value) != 0;
     }();
     return enabled;
@@ -666,7 +673,9 @@ static void mul_mat_vec_f_cuda(
 
         if (mul_mat_vec_f_bf16_warp_rows_enabled() &&
             cc == GGML_CUDA_CC_HOPPER && ids == nullptr && !has_fusion &&
-            ncols == 320 && ncols_dst == 1 &&
+            (ncols == 320 || (mul_mat_vec_f_bf16_warp_rows_long_enabled() &&
+                (ncols == 2560 || ncols == 6144) && nrows >= 2560)) &&
+            ncols_dst == 1 &&
             nchannels_x == 1 && nchannels_y == 1 && nchannels_dst == 1 &&
             nsamples_x == 1 && nsamples_dst == 1) {
             constexpr int rows_per_block = 8;
