@@ -1004,3 +1004,51 @@ server, 2.3x and 2.8x on `llama-batched-bench`, bit-exact, with B=1 and B=16 unc
 1.6x at that batch) but it needs a more accurate activation quantization to pass G2, which is its own iteration.
 Next: the GEMV is now 38.6 ms per step at B=8 against 11.4 at B=1 for 8x the work, so it is no longer activation-bound;
 the next decode target is the weight traffic itself (one pass of the 26 GB of weights per step is about 8.7 ms at 3 TB/s).
+
+## Decode 5-6x at batch 8: f16 tensor-core F8 matmul for batch 2 to 8 (2026-09-18, user ask)
+Goal (user): 2.6x aggregate decode at batch 8 is short of the target; profile decode at concurrency, name the biggest
+remaining gaps including KV-cache management, and raise the scaling to 5-6x.
+Current state before this iteration: one decode step at batch 8 costs 38.6 ms (`llama-batched-bench` S_TG 207,
+server decode_agg 189.5 against 83.7 at batch 1). Batch 1 is 11.4 ms for the same 24.7 GB of weight reads, which is
+2.68 TB/s or 80% of HBM3 peak, so batch 1 is bandwidth bound; batch 8 moves the same bytes at 0.64 TB/s, so it is
+not. Byte floor at batch 8 with eight 10k contexts: 27.2 GB of weights read once, 5.37 GB of f16 KV (16 attention
+layers of the 64, `n_head_kv` 4 x `head_dim` 256 = 64 KiB per token), about 2.4 GB of GDN recurrent state, so 35 GB
+or 10.4 ms at peak and 11.3 ms at the 2.7 to 3.1 TB/s this host streams, plus a non-matmul kernel tail of about
+3.3 ms. The reachable step is therefore 15 to 19 ms, which is the 5-6x the ask names.
+Where the 27 ms above the floor goes: the GEMV converts every e4m3 byte to float and multiplies in scalar FP32, and
+it repeats that conversion once per two-column chunk, so batch 8 pays about 198e9 FP32 FMAs (6.7 ms at the 29.7e12
+FMA/s of an H100) plus about 49e9 FP8-to-float conversions (about 6.7 ms at quarter rate). Hopper has no FP8 MMA
+operand type in this tree (`mma.cuh` carries f16, bf16 and the Blackwell-only block-scaled e2m1), but every e4m3
+value is exact in f16, so one conversion per weight byte into an f16 MMA A-tile with FP32 accumulation removes both
+costs: the MMA work is 0.4 to 1.6 ms and the conversion about 1.7 ms, which puts the kernel back on bandwidth.
+Verify-first: nsys decode windows with `GGML_CUDA_PDL=0` at B=2 and B=8 at 10k and at B=8 at 110k, each read under
+both `kern_window.py` markers because the default one predates the CUTLASS prefill route and undercuts the window,
+plus the CUDA-graph node fraction and an `ncu` SpeedOfLight pass on the batch-8 F8 matmul. The `ncu` pass is the
+decision rule for the whole iteration: below 40% DRAM with the FMA or ALU pipe above 60% means arithmetic bound and
+the MMA kernel is the right lever; above 70% DRAM means it cannot help and this plan is wrong.
+Change: (a) a new f16 tensor-core F8 matmul in `mmf8-mma.cu` for `ncols_dst` 2 to 8, built from the `mul_mat_f`
+staging and reduction shape in `mmf.cuh`: 32 weight rows per block, 4 warps each owning 64-scalar k slabs,
+`tile<16,8,half2>` A tiles converted once per slab from e4m3 (lossless in f16), `tile<8,8,half2>` B tiles staged
+from the F32 activations, `tile<16,8,float>` accumulators flushed into FP32 sums with the 128-wide weight scale per
+slab, and the fused up/gate epilogue of the GEMV. (b) `ggml_cuda_mmf8_mma_min_ncols()`, read once from
+`GGML_CUDA_MMF8_MMA_MIN` with default 2 and 9 disabling the path, routed at the three GEMV call sites (plain, fused
+up/gate, multi). Batch 1 stays on the GEMV: it is already at 80% of peak and an 8-wide B tile would waste 7 columns.
+(c) `MMF8_MMA_NWARPS` 4 against 8 chosen by `test-backend-ops perf` on the five decode shapes at m=8, not guessed.
+(d) the KV question answered by measurement only: q8_0 K/V at batch 8 at 10k and 110k, kept as a documented option
+only if it cuts the 110k step by at least 5% and clears G2. No KV code change is in scope: `--kv-unified` would move
+batch-8 decode onto `flash_attn_ext_f16<256,256,8,8>` and 8x the masked MMA work for the same bytes, and paging or
+prefix sharing does not exist in this fork outside the unified cache's per-cell bitset.
+Prediction: the batch-8 step falls from 38.6 ms to 15 to 20 ms, so S_TG at least 400 at B=8, 300 at B=4, 150 at B=2,
+with B=1 within 1% of 87 to 88 and S_PP inside its 11800 to 12470 band; server decode_agg at least 420 at N=8, which
+is 5x the 83.7 single-stream rate, with prefill_agg no worse than the 7049 to 7625 measured at N=8. q8_0 K/V is
+predicted to fail its gate (q4_0 K/V already measured 97.408% and 0.008138 on this model) and to lose most of its
+byte win to the vec FA kernel that a quantized non-unified cache selects.
+Gate: the MMA path rounds activations to f16 and changes the summation order, so it is not bit-exact; it takes the
+decode gate's numeric form, Same top p >= 99.0% and Mean KLD <= 0.002 at `-ub` 2, 4 and 8 against the
+`kld-r1-q8h-ub{2,4,8}-4c.bin` references. f16 activations are the precision the campaign's own G1/G2 reference
+logits already come from (`mul_mat_f8_e4m3_cublas` is an F16xF16 cuBLAS GEMM and wrote `kld-base-f8.bin`). Fail
+path, pre-decided: stage each activation as a two-term f16 split and run the B tile twice into the same accumulator,
+which recovers about 21 mantissa bits for one extra mma per fragment; if that also fails, the default reverts to 9
+and the kernel stays behind the knob. Op-test coverage is the existing m = 2 to 8 cases of MUL_MAT_F8,
+MUL_MAT_F8_FFN and MUL_MAT_F8_SHARED, which now route through the new kernel, with `GGML_CUDA_MMF8_MMA_MIN=9` as the
+bisect switch. q8_0 K/V keeps G2 (Same top p >= 98.0%, Mean KLD <= 0.006 against `kld-base-f8.bin`).
