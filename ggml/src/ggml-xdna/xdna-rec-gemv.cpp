@@ -19,6 +19,9 @@ struct stage {
 bool pack_stage(const struct ggml_tensor * const * ws, int n_w,
                 int64_t K, int64_t N, bool epilogue,
                 xdna_gemv_split split, stage & out) {
+    if (!ws || n_w <= 0 || !ws[0]) {
+        return false;
+    }
     out.geom = xdna_gemv_variant(ws[0]->type, K, N, epilogue, split);
     if (!out.geom.valid()) {
         return false;
@@ -40,8 +43,7 @@ xdna_rec_gemv * xdna_rec_gemv_create(xdna_kernel_pool * pool,
                                      const struct ggml_tensor * w_so,
                                      const struct ggml_tensor * w_gate,
                                      const struct ggml_tensor * w_up,
-                                     const struct ggml_tensor * w_down,
-                                     bool fused) {
+                                     const struct ggml_tensor * w_down) {
     if (!pool || !w_so || !w_gate || !w_up || !w_down) {
         return nullptr;
     }
@@ -50,11 +52,9 @@ xdna_rec_gemv * xdna_rec_gemv_create(xdna_kernel_pool * pool,
         return nullptr;   // the epilogue pairs the two halves by position
     }
 
-    // On the merged artifact the projections share the core's hardware
-    // context; otherwise the half-height split, which is half the array and
-    // therefore half as expensive to arrive at.
-    const xdna_gemv_split split = fused ? XDNA_GEMV_SPLIT_FUSED
-                                        : XDNA_GEMV_SPLIT_HALF;
+    // The projections run on the merged layer artifact, the same one the core
+    // is on, so a layer never changes hardware context.
+    constexpr xdna_gemv_split split = XDNA_GEMV_SPLIT_FUSED;
 
     std::unique_ptr<xdna_rec_gemv> m(new xdna_rec_gemv);
 
@@ -62,24 +62,20 @@ xdna_rec_gemv * xdna_rec_gemv_create(xdna_kernel_pool * pool,
     const struct ggml_tensor * dn[1] = { w_down };
     stage s_so, s_act, s_down;
     if (!pack_stage(&w_so, 1, w_so->ne[0], w_so->ne[1], false, split, s_so)) {
-        delete m.release();
         return nullptr;
     }
     if (!pack_stage(gu, 2, w_gate->ne[0], w_gate->ne[1] + w_up->ne[1], true,
                     split, s_act) ||
         !pack_stage(dn, 1, w_down->ne[0], w_down->ne[1], false, split, s_down)) {
-        delete m.release();
         return nullptr;
     }
     m->so = xdna_gemv_create(pool, s_so.geom, s_so.packed);
 
-    // Both FFN stages in one stream when the geometry allows it. Only the
-    // merged artifact's split puts one core to a column, which is what lets a
-    // core's output be one descriptor into the next dispatch's activation.
-    if (fused) {
-        m->ffn = xdna_gemv_pair_create(pool, s_act.geom, s_act.packed,
-                                       s_down.geom, s_down.packed);
-    }
+    // Both FFN stages in one stream when the geometry allows it. The fused
+    // split puts one core to a column, which is what lets a core's output be
+    // one descriptor into the next dispatch's activation.
+    m->ffn = xdna_gemv_pair_create(pool, s_act.geom, s_act.packed,
+                                   s_down.geom, s_down.packed);
     if (!m->ffn) {
         m->act  = xdna_gemv_create(pool, s_act.geom, s_act.packed);
         m->down = xdna_gemv_create(pool, s_down.geom, s_down.packed);

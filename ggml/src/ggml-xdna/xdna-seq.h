@@ -107,16 +107,18 @@ enum class xdna_dma_dir : uint32_t {
 // build the pattern in IRON, disassemble the .insts.bin it ships beside the
 // xclbin (the .insts.bin it ships beside the xclbin and read the words.
 struct xdna_bd {
-    uint32_t buf_len   = 0;   // total transfer length in bytes
+    // Lengths, sizes and strides are in 32-bit words, the units the address
+    // generator takes; only buf_off is in bytes.
+    uint32_t buf_len   = 0;   // total transfer length
     uint32_t buf_off   = 0;   // byte offset into the host buffer
-    uint32_t d0_size   = 0;   // dim0 size (elements)
-    uint32_t d0_stride = 0;   // dim0 stride (bytes)
-    uint32_t d1_size   = 0;   // dim1 size (elements)
-    uint32_t d1_stride = 0;   // dim1 stride (bytes)
-    uint32_t d2_stride = 0;   // dim2 stride (bytes); d2 size inferred
+    uint32_t d0_size   = 0;   // dim0 size
+    uint32_t d0_stride = 0;   // dim0 stride
+    uint32_t d1_size   = 0;   // dim1 size
+    uint32_t d1_stride = 0;   // dim1 stride
+    uint32_t d2_stride = 0;   // dim2 stride; d2 size inferred
     uint32_t ax_cache  = 0;   // AXI cache bits (usually 2)
     uint32_t iter_size   = 1; // iteration count (outermost repeat)
-    uint32_t iter_stride = 1; // iteration stride (bytes)
+    uint32_t iter_stride = 1; // iteration stride
     uint32_t next_bd   = 0;   // next BD id in the chain (0 = none)
     bool     valid     = true;
 
@@ -128,8 +130,12 @@ struct xdna_bd {
 };
 
 // Builder state. Data only; the API lives below as C-style functions.
+// AIE columns one sequence can address: the shim's descriptor file is indexed
+// by column, and every per-column table in this module is sized by this.
+enum { XDNA_SEQ_MAX_COLS = 8 };
+
 struct xdna_seq {
-    uint32_t n_cols = 8;        // AIE columns
+    uint32_t n_cols = XDNA_SEQ_MAX_COLS;  // AIE columns
     uint32_t n_rows = 6;        // total rows (mem tiles + cores)
     uint32_t mem_tile_rows = 1;
     std::vector<uint32_t> ops;
@@ -137,7 +143,7 @@ struct xdna_seq {
     // Highest descriptor id + 1 written on each column's shim, so a stream
     // appended to this one can start where it left off. Reprogramming a
     // descriptor whose transfer has not drained loses it silently.
-    uint32_t bd_used[8] = {};
+    uint32_t bd_used[XDNA_SEQ_MAX_COLS] = {};
 };
 
 // 32-bit register write (also used for RTP values and DMA push-queue).

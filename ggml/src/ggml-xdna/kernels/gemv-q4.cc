@@ -1,4 +1,3 @@
-// SPDX-License-Identifier: MIT
 //
 // Decode GEMV over the packed NPU weight formats (xdna-quant.h): int8
 // activations against 4-bit affine or 8-bit symmetric weights, with the group

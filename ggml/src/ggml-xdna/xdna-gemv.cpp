@@ -67,16 +67,14 @@ bool xdna_gemv_geom::valid() const {
     if (fmt == XDNA_WFMT_NONE || K <= 0 || N <= 0 || cols <= 0 || cols > XDNA_GEMV_COLS) {
         return false;
     }
-    if (K % k_tile() || k_tile() % group()) {
+    // The packer repacks whole ggml super-blocks (xdna_wfmt_repack_row_as), so
+    // a K the map accepts but the packer does not would fail per row, late.
+    if (K % k_tile() || k_tile() % group() || K % XDNA_SB_VALUES) {
         return false;
     }
     // One descriptor per chunk for the activations and one for the output,
     // plus the weight descriptor, all inside the shim's 16 ids.
     return N % chunk() == 0 && n_out() >= 1 && n_out() <= xdna_gemv_max_chunks();
-}
-
-bool xdna_gemv_use_half(xdna_gemv_split want) {
-    return want == XDNA_GEMV_SPLIT_HALF;
 }
 
 std::string xdna_gemv_geom::stem() const {
@@ -97,9 +95,6 @@ std::string xdna_gemv_stem(xdna_gemv_split split) {
         g.rows_v   = XDNA_GEMV_ROWS_FUSED;
         g.n_core_v = XDNA_GEMV_N_CORE_FUSED;
         g.fused_v  = true;
-    } else if (split == XDNA_GEMV_SPLIT_HALF) {
-        g.rows_v   = XDNA_GEMV_ROWS_HALF;
-        g.n_core_v = XDNA_GEMV_N_CORE_HALF;
     }
     return g.stem();
 }
@@ -120,15 +115,13 @@ xdna_gemv_geom xdna_gemv_variant(enum ggml_type type, int64_t K, int64_t N,
         g.rows_v   = XDNA_GEMV_ROWS_FUSED;
         g.n_core_v = XDNA_GEMV_N_CORE_FUSED;
         g.fused_v  = true;
-    } else if (xdna_gemv_use_half(split)) {
-        g.rows_v   = XDNA_GEMV_ROWS_HALF;
-        g.n_core_v = XDNA_GEMV_N_CORE_HALF;
     }
     // One format for every quantized type: a second artifact would mean a
     // hardware-context switch whenever consecutive ops differ, which measured
     // 2.5 ms against 0.1 ms for the work itself.
     g.fmt = xdna_wfmt_gemv_for(type);
-    if (g.fmt == XDNA_WFMT_NONE || K <= 0 || N <= 0) {
+    if (g.fmt == XDNA_WFMT_NONE || K <= 0 || N <= 0 ||
+        K > (int64_t) INT32_MAX || N > (int64_t) INT32_MAX) {
         return xdna_gemv_geom{};
     }
     g.K    = (int) K;
@@ -294,10 +287,17 @@ bool xdna_gemv_seq_build_pair(xdna_seq * seq, const xdna_gemv_geom & g1,
     const int og  = map.o_group;
     const int n_o = map.n_o();
     uint32_t next_bd[XDNA_GEMV_COLS];
+    bool     bd_full = false;
     for (int c = 0; c < XDNA_GEMV_COLS; c++) {
         next_bd[c] = (uint32_t) po.bd_base;
     }
-    const auto take_bd = [&](int col) { return next_bd[col]++; };
+    const auto take_bd = [&](int col) {
+        if (next_bd[col] >= (uint32_t) MAX_BD) {
+            bd_full = true;
+            return (uint32_t) 0;
+        }
+        return next_bd[col]++;
+    };
 
     // Everything but the first dispatch's outputs takes a fixed number of
     // descriptors, so those are claimed first and the first dispatch gets what
@@ -323,11 +323,12 @@ bool xdna_gemv_seq_build_pair(xdna_seq * seq, const xdna_gemv_geom & g1,
     for (int c = 0; c < n_o; c++) {
         o2_bd[(size_t) c].push_back(take_bd(map.o[c].col));
     }
-
-    int streams[XDNA_GEMV_COLS] = {};
-    for (int c = 0; c < n_o; c++) {
-        streams[map.o[c].col]++;
+    if (bd_full) {
+        GGML_LOG_ERROR("%s: gemv pair: a column ran out of descriptors "
+                       "reserving the fixed set (max %d)\n", "xdna-gemv", MAX_BD);
+        return false;
     }
+
     std::vector<std::vector<uint32_t>> o1_bd((size_t) n_o);
     for (int c = 0; c < n_o; c++) {
         const int col = map.o[c].col;
@@ -339,7 +340,6 @@ bool xdna_gemv_seq_build_pair(xdna_seq * seq, const xdna_gemv_geom & g1,
         }
         o1_bd[(size_t) c].push_back(take_bd(col));
     }
-
     uint32_t fixed[XDNA_GEMV_COLS];
     for (int c = 0; c < XDNA_GEMV_COLS; c++) {
         fixed[c] = (uint32_t) po.bd_base;
@@ -452,6 +452,16 @@ bool xdna_gemv_seq_build_pair(xdna_seq * seq, const xdna_gemv_geom & g1,
                                 map.o[c].ch);
         }
     }
+    // A descriptor id is four bits: a column that ends past the file has its
+    // transfers written over another channel's registers.
+    for (int c = 0; c < XDNA_GEMV_COLS; c++) {
+        if ((int) fixed[c] > MAX_BD || (int) next_bd[c] > MAX_BD) {
+            GGML_LOG_ERROR("%s: gemv pair: column %d used %d descriptors (max %d)\n",
+                           "xdna-gemv", c,
+                           std::max((int) fixed[c], (int) next_bd[c]), MAX_BD);
+            return false;
+        }
+    }
     return true;
 }
 
@@ -485,6 +495,7 @@ bool xdna_gemv_seq_build(xdna_seq * seq, const xdna_gemv_geom & geom,
     // A column's descriptor file is handed out as transfers are emitted, so a
     // column carrying several of the merged layout's streams keeps them apart.
     uint32_t next_bd[XDNA_GEMV_COLS] = {};
+    bool     bd_full = false;
     for (int col = 0; col < XDNA_GEMV_COLS; col++) {
         // A negative base means "after whatever this stream has already
         // written on that column", which is the only safe answer when the
@@ -492,7 +503,24 @@ bool xdna_gemv_seq_build(xdna_seq * seq, const xdna_gemv_geom & geom,
         next_bd[col] = o_.bd_base >= 0 ? (uint32_t) o_.bd_base
                                        : seq->bd_used[col];
     }
-    const auto take_bd = [&](int col) { return next_bd[col]++; };
+    // A descriptor id is four bits. A column that runs past the file has its
+    // transfers written over another channel's registers, which reads as
+    // missing or duplicated data and no error at all.
+    const auto take_bd = [&](int col) {
+        if (next_bd[col] >= (uint32_t) MAX_BD) {
+            bd_full = true;
+            return (uint32_t) 0;
+        }
+        return next_bd[col]++;
+    };
+    const auto done = [&]() {
+        if (bd_full) {
+            GGML_LOG_ERROR("%s: gemv: a column ran out of descriptors (max %d)\n",
+                           "xdna-gemv", MAX_BD);
+            return false;
+        }
+        return true;
+    };
 
     // Weights: one linear run per column, ordered [col][chunk][tile][row].
     for (int c = 0; c < geom.cols; c++) {
@@ -509,7 +537,7 @@ bool xdna_gemv_seq_build(xdna_seq * seq, const xdna_gemv_geom & geom,
     }
 
     if (o_.stages == 1) {
-        return true;
+        return done();
     }
     // Activations: one descriptor for the count header and every chunk's copy
     // of the K tiles, which xdna_gemv_run lays out consecutively, broadcast to
@@ -533,7 +561,7 @@ bool xdna_gemv_seq_build(xdna_seq * seq, const xdna_gemv_geom & geom,
     fill_act_on(map.a, a_a, (uint32_t) aoff0);
 
     if (o_.stages == 2) {
-        return true;
+        return done();
     }
     // Output: a column owns rows*n_core consecutive floats of every chunk.
     // Each stream gets as many descriptors as its column can still spare, so
@@ -551,7 +579,12 @@ bool xdna_gemv_seq_build(xdna_seq * seq, const xdna_gemv_geom & geom,
             continue;
         }
         const int spare = (MAX_BD - (int) next_bd[col]) / streams[col];
-        depth[col] = std::max(1, std::min(spare, n_out));
+        if (spare < 1) {
+            GGML_LOG_ERROR("%s: gemv: column %d has no descriptor left for its "
+                           "%d output streams\n", "xdna-gemv", col, streams[col]);
+            return false;
+        }
+        depth[col] = std::min(spare, n_out);
     }
 
     // One strided descriptor for a whole stream when the design joins several
@@ -576,13 +609,13 @@ bool xdna_gemv_seq_build(xdna_seq * seq, const xdna_gemv_geom & geom,
                                 map.o[c].ch, true, 0);
         }
         if (o_.stages == 3) {
-            return true;
+            return done();
         }
         for (int c = 0; c < n_o; c++) {
             xdna_seq_wait_token(seq, map.o[c].col, 0, xdna_dma_dir::S2MM,
                                 map.o[c].ch);
         }
-        return true;
+        return done();
     }
 
     std::vector<std::vector<uint32_t>> o_bd((size_t) n_o);
@@ -630,7 +663,7 @@ bool xdna_gemv_seq_build(xdna_seq * seq, const xdna_gemv_geom & geom,
                                 map.o[c].ch);
         }
     }
-    return true;
+    return done();
 }
 
 // --- weight packing ---------------------------------------------------------
@@ -712,7 +745,7 @@ bool xdna_gemv_pack_weights(const xdna_gemv_geom & geom,
 
     for (int n = 0; n < geom.N; n++) {
         const int src_col = colmap ? colmap[n] : n;
-        if (src_col >= (int) owner.size()) {
+        if (src_col < 0 || src_col >= (int) owner.size()) {
             continue;   // padding column: zero weights decode to a zero output
         }
         {
@@ -865,9 +898,12 @@ void xdna_gemv_free(xdna_gemv * g) {
 // function applies). Nothing about the result changes; what changes is that
 // packing the activation stops being something only the host can do, which is
 // what keeps the FFN out of the layer's dispatch.
-static bool act_raw(void) {
-    return true;
-}
+//
+// The merged artifact is always built with ACT_RAW=1 (CMakeLists), and this
+// side has no way to drive one built without the prologue tile: the tiles it
+// writes carry the residual and gamma as numbers, which a design compiled for
+// codes would read as codes. So the prologue is a property of the artifact,
+// not a runtime choice.
 
 // Byte offset of the raw activations inside a tile; mirrors ACT_RAW_OFF in
 // gemv-q4.cc. Past any tile's codes and group parameters.
@@ -904,8 +940,7 @@ static void gemv_pack_act(const xdna_gemv_geom & geom, const float * act,
         // norm and no quantization at all on this path.
         // Only on the merged artifact: it is the one built with the prologue
         // tile. Raw tiles reaching cores that expect codes is silent garbage.
-        const bool raw = (act || acc_on_device) && act_raw() && geom.fused_v &&
-                         res && gam;
+        const bool raw = (act || acc_on_device) && geom.fused_v && res && gam;
         if (raw) {
             const int kt = geom.k_tile();
             float *    ac = (float *) (tile + XDNA_ACT_RAW_OFF);
@@ -1134,12 +1169,8 @@ xdna_gemv_pair * xdna_gemv_pair_create(xdna_kernel_pool * pool,
     xdna_buffer_sync_to_device(p->a);
 
     p->host_a.assign(g1.act_bytes(), 0);
-    xdna_buffer * args[4] = { p->w, p->a, p->ah ? p->ah : p->a, p->o };
-    p->run = xdna_kernel_run_make(p->kern, args, p->ah ? 4 : 3);
-    if (!p->ah) {
-        args[2] = p->o;
-        p->run = xdna_kernel_run_make(p->kern, args, 3);
-    }
+    xdna_buffer * args[3] = { p->w, p->a, p->o };
+    p->run = xdna_kernel_run_make(p->kern, args, 3);
     return p;
 }
 
@@ -1153,39 +1184,8 @@ void xdna_gemv_pair_free(xdna_gemv_pair * p) {
     delete p;
 }
 
-int32_t xdna_gemv_pair_last_flags(const xdna_gemv_pair * p) {
-    return p ? (1 | 4 | (p->g2.fmt == XDNA_WFMT_Q8G16 ? 8 : 0)) : 0;
-}
 
-bool xdna_gemv_pair_run_packed(xdna_gemv_pair * p, const void * act_tiles,
-                               float * out) {
-    if (!p || !act_tiles || !out) {
-        return false;
-    }
-    const size_t n = (size_t) (1 + p->g1.n_tiles()) * p->g1.act_tile_bytes();
-    std::memcpy(p->a->bo.map(), act_tiles, n);
-    // Every output chunk replays the same tiles; the device produced one body.
-    const size_t body = (size_t) p->g1.n_tiles() * p->g1.act_tile_bytes();
-    for (int k = 1; k < p->g1.n_out(); k++) {
-        std::memcpy((uint8_t *) p->a->bo.map() + p->g1.act_tile_bytes() +
-                        (size_t) k * body,
-                    (const uint8_t *) act_tiles + p->g1.act_tile_bytes(), body);
-    }
-    xdna_buffer_sync_to_device_range(
-        p->a, (size_t) (1 + p->g1.n_out() * p->g1.n_tiles()) *
-                  p->g1.act_tile_bytes(), 0);
-    if (!xdna_run_restart(p->run) || !xdna_run_wait(p->run)) {
-        return false;
-    }
-    xdna_buffer_sync_from_device(p->o);
-    std::memcpy(out, p->o->bo.map(), (size_t) p->g2.n_real * sizeof(float));
-    return true;
-}
 
-// The host's half of a raw activation, written before the dispatch that fills
-// the rest of it. Everything here is known before the layer starts - the
-// residual is the layer's input and gamma is the model's - so doing it here
-// rather than between the two dispatches is what leaves nothing between them.
 // The host's half of a tile, in the layout the prologue's second input wants:
 // the residual, then gamma, then the words that describe the tile.
 static void gemv_pack_act_host_half(const xdna_gemv_geom & geom, uint8_t * dst,
@@ -1214,36 +1214,28 @@ static void gemv_pack_act_host_half(const xdna_gemv_geom & geom, uint8_t * dst,
     }
 }
 
+// The flag word the pair wants in the last tile of a chunk: close the chunk
+// (bit 0), store the result as a quantized tile rather than floats (bit 2),
+// and group that tile the way the second dispatch's format reads it (bit 3).
+static int32_t pair_last_flags(const xdna_gemv_pair * p) {
+    return 1 | 4 | (p->g2.fmt == XDNA_WFMT_Q8G16 ? 8 : 0);
+}
+
 bool xdna_gemv_pair_prep_raw(xdna_gemv_pair * p, const float * res,
                              const float * gam) {
     if (!p || !res || !gam) {
         return false;
     }
-    const int32_t last = 1 | 4 | (p->g2.fmt == XDNA_WFMT_Q8G16 ? 8 : 0);
-    if (p->ah) {
-        // Its own buffer, which no dispatch writes - so the order of this
-        // against the drain into the tiles does not matter, and it can happen
-        // before the one dispatch that does both halves of the layer.
-        gemv_pack_act_host_half(p->g1, (uint8_t *) p->ah->bo.map(), last,
-                                res, gam);
-        xdna_buffer_sync_to_device(p->ah);
-        return true;
-    }
-    gemv_pack_act(p->g1, nullptr, (uint8_t *) p->a->bo.map(), 0, last, res, gam);
-    // The whole buffer. The host has just read it back, so this writes the
-    // array's own acc where it already is - and only this works: a partial
-    // flush does not deliver the drain to the next dispatch at all.
+    gemv_pack_act(p->g1, nullptr, (uint8_t *) p->a->bo.map(), 0,
+                  pair_last_flags(p), res, gam);
+    // The whole buffer, not just the host's half of a tile: a partial flush
+    // does not deliver the array's drain to the next dispatch at all. It is
+    // safe because the caller read the buffer back since the last dispatch
+    // wrote it (see xdna_gemv_pair_prep_raw).
     xdna_buffer_sync_to_device(p->a);
     return true;
 }
 
-// The dispatch alone, for an activation prepared earlier and completed by the
-// dispatch before this one.
-void xdna_gemv_pair_act_sync_from(xdna_gemv_pair * p) {
-    if (p) {
-        xdna_buffer_sync_from_device(p->a);
-    }
-}
 
 // The output a fused run left in the tail of the activation buffer.
 bool xdna_gemv_pair_out_from_tail(xdna_gemv_pair * p, float * out) {
@@ -1256,11 +1248,6 @@ bool xdna_gemv_pair_out_from_tail(xdna_gemv_pair * p, float * out) {
     return true;
 }
 
-void xdna_gemv_pair_act_sync_to(xdna_gemv_pair * p) {
-    if (p) {
-        xdna_buffer_sync_to_device(p->a);
-    }
-}
 
 bool xdna_gemv_pair_dispatch(xdna_gemv_pair * p, float * out) {
     if (!p || !out) {
@@ -1279,28 +1266,16 @@ static bool xdna_gemv_pair_run_impl(xdna_gemv_pair * p, const float * act,
                                     float * out);
 
 bool xdna_gemv_pair_raw_act(const xdna_gemv_pair * p) {
-    return p && act_raw() && p->g1.fused_v;
+    return p && p->g1.fused_v;
 }
 
 xdna_buffer * xdna_gemv_pair_act_buf(xdna_gemv_pair * p) {
     return p ? p->a : nullptr;
 }
 
-xdna_buffer * xdna_gemv_pair_w_buf(xdna_gemv_pair * p) {
-    return p ? p->w : nullptr;
-}
 
-xdna_buffer * xdna_gemv_pair_h_buf(xdna_gemv_pair * p) {
-    return p ? p->ah : nullptr;
-}
 
-std::string xdna_gemv_pair_key(const xdna_gemv_pair * p) {
-    return p ? p->g1.seq_key() + "+" + p->g2.seq_key() : std::string();
-}
 
-size_t xdna_gemv_pair_o_tail(const xdna_gemv_pair * p) {
-    return p ? p->o_tail_off : 0;
-}
 
 int xdna_gemv_pair_k_tile(const xdna_gemv_pair * p) {
     return p ? p->g1.k_tile() : 0;
@@ -1325,21 +1300,17 @@ static bool xdna_gemv_pair_run_impl(xdna_gemv_pair * p, const float * act,
     if (!p || !out || (!act && !(res && gam))) {
         return false;
     }
-    // Close the chunk with the epilogue (bit 0), store the result as a
-    // quantized tile rather than floats (bit 2), and group that tile the way
-    // the second dispatch's format reads it (bit 3).
-    const int32_t last = 1 | 4 | (p->g2.fmt == XDNA_WFMT_Q8G16 ? 8 : 0);
+    const int32_t last = pair_last_flags(p);
     if (!act && res && gam) {
         // The dispatch before this one drained its result into the front of
-        // every tile, so the staging copy cannot be pushed over the buffer -
-        // it holds a stale acc. Write the host's part in place and flush only
-        // that: from the residual to the end of the tile, never the acc.
+        // every tile, so the staging copy cannot be pushed over the buffer: it
+        // holds a stale acc. Write the host's part in place instead and flush
+        // the whole buffer - a partial flush does not deliver the drain to the
+        // next dispatch at all. That is only safe because the host copy is
+        // usually the array's own values: the caller read the buffer back since
+        // the last dispatch wrote it (see xdna_gemv_pair_prep_raw).
         gemv_pack_act(p->g1, nullptr, (uint8_t *) p->a->bo.map(), 0, last,
                       res, gam);
-        // The whole buffer, not the ranges the host touched. The host has
-        // just read it back (acc included), so flushing everything writes the
-        // array's own values where they already are - and a partial flush
-        // does not get acc to the next dispatch, though the host can read it.
         xdna_buffer_sync_to_device(p->a);
     } else {
         gemv_pack_act(p->g1, act, p->host_a.data(), 0, last, res, gam);

@@ -506,32 +506,6 @@ def build_core(dev_name: str = "npu2"):
             pc.release(1)
             sc.release(1)
 
-    def gdn_fn2(pa, pb, sc, oc, ac, k, npair=N_OBJ_GDN // 4):
-        # Two rounds from one norm column, then two from the other: that is the
-        # order the rounds come in, because a head is two rounds and the
-        # columns take alternate heads.
-        for _ in range_(npair):
-            for _ in range_(2):
-                pp = pa.acquire(1)
-                si = sc.acquire(1)
-                so = oc.acquire(1)
-                ao = ac.acquire(1)
-                k(pp, si, so, ao)
-                oc.release(1)
-                ac.release(1)
-                pa.release(1)
-                sc.release(1)
-            for _ in range_(2):
-                pp = pb.acquire(1)
-                si = sc.acquire(1)
-                so = oc.acquire(1)
-                ao = ac.acquire(1)
-                k(pp, si, so, ao)
-                oc.release(1)
-                ac.release(1)
-                pb.release(1)
-                sc.release(1)
-
     for gi in range(NC_GDN):
         workers.append(Worker(
             gdn_fn, [p2[gi][0].cons(), s2[gi].cons(),
@@ -601,66 +575,7 @@ def build_core(dev_name: str = "npu2"):
         kf_(o)
         oc.release(1)
 
-    # GATED_DIAG: diagnostic worker variants that consume the gated tile's
-    # inputs without calling the compute kernels (kf still runs so the
-    # activation drain has data). 1 waits on both inputs, 2 waits on az only
-    # and leaves attn unconsumed (gdn then blocks on its attn fifo - the
-    # state drains stop, which is itself the answer). Whichever completes
-    # names the input the full worker waits on forever.
-    gdiag = 0
-
-    def gated_fn_diag1(ac, tc, oc, qc, kh_, kf_, nh=N_VH // HG):
-        # waits on both inputs, calls no compute kernel
-        o = oc.acquire(1)
-        q = qc.acquire(1)
-        for _ in range_(nh):
-            a = ac.acquire(1)
-            t = tc.acquire(2)
-            tc.release(2)
-            ac.release(1)
-        kf_(o, q)
-        qc.release(1)
-        oc.release(1)
-
-    def gated_fn_diag2(ac, tc, oc, qc, kh_, kf_, nh=N_VH // HG):
-        # waits on az only; attn stays unconsumed
-        o = oc.acquire(1)
-        q = qc.acquire(1)
-        for _ in range_(nh):
-            a = ac.acquire(1)
-            ac.release(1)
-        kf_(o, q)
-        qc.release(1)
-        oc.release(1)
-
-    def gated_fn_diag3(ac, tc, oc, qc, kh_, kf_, nh=N_VH // HG):
-        # consumes both inputs, calls no kernel at all
-        o = oc.acquire(1)
-        q = qc.acquire(1)
-        for _ in range_(nh):
-            a = ac.acquire(1)
-            t = tc.acquire(2)
-            tc.release(2)
-            ac.release(1)
-        qc.release(1)
-        oc.release(1)
-
-    if att_onchip and act_split and gdiag == 1:
-        workers.append(Worker(gated_fn_diag1,
-                              [az2.cons(), a23.cons(), gt12.prod(),
-                               ga12.prod(), kh, kf],
-                              tile=Tile(gcol, 4), stack_size=0x3000))
-    elif att_onchip and act_split and gdiag == 2:
-        workers.append(Worker(gated_fn_diag2,
-                              [az2.cons(), a23.cons(), gt12.prod(),
-                               ga12.prod(), kh, kf],
-                              tile=Tile(gcol, 4), stack_size=0x3000))
-    elif att_onchip and act_split and gdiag == 3:
-        workers.append(Worker(gated_fn_diag3,
-                              [az2.cons(), a23.cons(), gt12.prod(),
-                               ga12.prod(), kh, kf],
-                              tile=Tile(gcol, 4), stack_size=0x3000))
-    elif att_onchip and act_split:
+    if att_onchip and act_split:
         workers.append(Worker(gated_fn_on_s,
                               [az2.cons(), a23.cons(), gt12.prod(),
                                ga12.prod(), kh, kf],
@@ -690,11 +605,10 @@ def build_core(dev_name: str = "npu2"):
         rt_args += [ga23.cons(tile=Tile(gact_col, 0))]
 
     # ---- post: col POST_COL, row 2 ----
-    # POST_TILE=0 drops the in-design post tile entirely (worker, fifos and
-    # its fill/drain) - the diagnostic switch for the full-ELF sequence,
-    # which the C++ backend never exercised with this tile enabled (there the
-    # transition runs as its own design).
-    post_tile = True
+    # The FFN transition is always part of this design: it turns the
+    # projection's output, the residual and gamma the host wrote into the
+    # activation the next dispatch reads, which is what lets a layer's two
+    # dispatches go into one stream.
     POST_COL = NC_CONV + 1
     pi3 = ObjectFifo(POSTI_T, name="pni3", depth=1)
     pi2 = pi3.cons().forward(obj_type=POSTI_T, name="pni2", depth=1)
@@ -710,28 +624,26 @@ def build_core(dev_name: str = "npu2"):
             oc.release(1)
             ic.release(1)
 
-    if post_tile:
-        workers.append(Worker(post_fn, [pi2.cons(), po12.prod(), post_k],
-                              stack_size=0x3000))
-        # The endpoints are pinned: the fill on (1,0) MM2S ch1, the drain on
-        # (2,0) S2MM ch1 - free in this design. The fused projection's first
-        # weight stream drives (0,0) MM2S ch1, so the fill must not sit
-        # there or the post dispatch after a fused dispatch never completes.
-        # The host-built stream (xdna-rec.cpp POST_FILL_COL / POST_DRN_COL)
-        # agrees with these. POST_FILL_COL=auto / POST_DRN_COL=auto restore
-        # the placer's choice (the merged fused_layer design pins its own
-        # endpoints).
-        _pf = __import__("os").environ.get("POST_FILL_COL", "1")
-        _pd = __import__("os").environ.get("POST_DRN_COL", "2")
-        if _pf in ("", "auto") and _pd in ("", "auto"):
-            rt_args += [pi3.prod(), po23.cons()]
-        elif _pf in ("", "auto"):
-            rt_args += [pi3.prod(), po23.cons(tile=Tile(int(_pd), 0))]
-        elif _pd in ("", "auto"):
-            rt_args += [pi3.prod(tile=Tile(int(_pf), 0)), po23.cons()]
-        else:
-            rt_args += [pi3.prod(tile=Tile(int(_pf), 0)),
-                        po23.cons(tile=Tile(int(_pd), 0))]
+    workers.append(Worker(post_fn, [pi2.cons(), po12.prod(), post_k],
+                          stack_size=0x3000))
+    # The endpoints are pinned: the fill on (1,0) MM2S ch1, the drain on
+    # (2,0) S2MM ch1 - free in this design. The fused projection's first
+    # weight stream drives (0,0) MM2S ch1, so the fill must not sit
+    # there or the post dispatch after a fused dispatch never completes.
+    # The host-built stream (xdna-rec.cpp POST_FILL_COL / POST_DRN_COL)
+    # agrees with these; "auto" restores the placer's choice (the merged
+    # fused_layer design pins its own endpoints).
+    _pf = __import__("os").environ.get("POST_FILL_COL", "1")
+    _pd = __import__("os").environ.get("POST_DRN_COL", "2")
+    if _pf in ("", "auto") and _pd in ("", "auto"):
+        rt_args += [pi3.prod(), po23.cons()]
+    elif _pf in ("", "auto"):
+        rt_args += [pi3.prod(), po23.cons(tile=Tile(int(_pd), 0))]
+    elif _pd in ("", "auto"):
+        rt_args += [pi3.prod(tile=Tile(int(_pf), 0)), po23.cons()]
+    else:
+        rt_args += [pi3.prod(tile=Tile(int(_pf), 0)),
+                    po23.cons(tile=Tile(int(_pd), 0))]
 
     # IRON reference seq mirrors the python mode0 col-major order + gated phase.
 
@@ -757,8 +669,8 @@ def build_core(dev_name: str = "npu2"):
         gzfill = nxt()
         gout = nxt()
         gact = nxt() if act_split else None
-        pfill = nxt() if post_tile else None
-        pdrain = nxt() if post_tile else None
+        pfill = nxt()
+        pdrain = nxt()
 
 
         # conv cols col-major, a round being gpo consecutive feed groups: they

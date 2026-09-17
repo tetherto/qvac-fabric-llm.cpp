@@ -19,13 +19,26 @@ import shutil
 KERNEL_DIR = os.path.dirname(os.path.abspath(__file__))
 HEADER = os.path.join(KERNEL_DIR, "..", "xdna-design-tag.h")
 
-# The build-time environment knobs a design reads. A change here is a change
-# of design, exactly like a change of source.
+# The build-time environment knobs the designs read from outside. A change here
+# is a change of design, exactly like a change of source.
+#
+# Only knobs that every stamping step sees belong here: the tag has to come out
+# the same whether it is computed by a design as it builds or by the stamping
+# step afterwards, or a build of one design would relabel the artifact of
+# another and the backend would look for a name that does not exist. So this
+# leaves out:
+#   - knobs a design sets itself (POST_FILL_COL, POST_DRN_COL, ACT_RAW for the
+#     merged layer): the source that sets them is hashed anyway, and the value
+#     the stamping step would see is a different one;
+#   - ACT_RAW for the standalone GEMV, which decides whether the prologue tile
+#     is in that artifact: the two variants are separate files by construction
+#     (fused_layer.xclbin and gemv_n32_r4_c8.xclbin), so it is not a knob of
+#     either one's identity.
 DESIGN_ENV = {
-    "ATT_DEPTH", "CONV_GPO", "CONV_SLOT", "CONV_SPREAD",
-    "GATED_ACT_SPLIT", "GATED_ATTN_ONCHIP", "GATED_DEPTH", "GATED_HEADS",
-    "GATED_FMT", "GDN_STATE_STREAMS",
-    "GEMV_STACK", "GEMV_VEC", "GEMV_W_DEPTH",
+    "ATT_DEPTH",
+    "CONV_DEPTH", "CONV_DIRECT", "CONV_GPO", "CONV_SLOT", "CONV_SPREAD",
+    "GACT_COL", "GATED_ACT_SPLIT", "GATED_ATTN_ONCHIP", "GATED_AZ_COL",
+    "GATED_DEPTH", "GATED_FMT", "GATED_HEADS", "GDN_STATE_STREAMS",
     "PKV_ONCHIP",
 }
 
@@ -63,8 +76,20 @@ def _write_header(t: str) -> None:
 # design and the decode GEMV, one per array split. The prefill artifacts (GEMM,
 # conv, flash attention) are loaded by geometry-encoded names and stay untagged.
 KNOWN_STEMS = [
-    "fused_layer", "gemv_n32_r4_c8", "gemv_n128_r1_c8",
+    "fused_layer", "gemv_n32_r4_c8",
 ]
+
+
+# <stem>.xclbin -> <stem>_<tag>.xclbin, <stem>.insts.bin ->
+# <stem>_<tag>.insts.bin: the names the backend looks for, which are not what
+# splitext gives for the two-suffix instruction file.
+def _tagged(src: str, t: str) -> str:
+    d, name = os.path.split(src)
+    for suffix in (".insts.bin", ".xclbin"):
+        if name.endswith(suffix):
+            return os.path.join(d, f"{name[:-len(suffix)]}_{t}{suffix}")
+    stem, ext = os.path.splitext(name)
+    return os.path.join(d, f"{stem}_{t}{ext}")
 
 
 def stamp(xclbin_path, insts_path=None, extra: str = ""):
@@ -74,8 +99,7 @@ def stamp(xclbin_path, insts_path=None, extra: str = ""):
     for src in (xclbin_path, insts_path):
         src = str(src) if src is not None else None
         if src and os.path.exists(src):
-            base, ext = os.path.splitext(src)
-            shutil.copy2(src, f"{base}_{t}{ext}")
+            shutil.copy2(src, _tagged(src, t))
 
 
 def stamp_all(bindir: str, extra: str = "") -> None:
@@ -89,7 +113,7 @@ def stamp_all(bindir: str, extra: str = "") -> None:
         for ext in (".xclbin", ".insts.bin"):
             src = os.path.join(bindir, stem + ext)
             if os.path.exists(src):
-                shutil.copy2(src, os.path.join(bindir, stem + f"_{t}" + ext))
+                shutil.copy2(src, _tagged(src, t))
     print(f"design tag {t} (stamp-all)")
 
 

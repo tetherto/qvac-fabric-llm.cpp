@@ -1,4 +1,3 @@
-// SPDX-License-Identifier: MIT
 //
 // On-chip expansion of the packed NPU weight formats (see xdna-quant.h) into
 // the bf16 B tile the mmul micro-kernel consumes.

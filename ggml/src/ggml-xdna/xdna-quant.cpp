@@ -192,15 +192,6 @@ void repack_q5k_block(const block_q5_K * b, uint8_t * dst) {
 
 } // namespace
 
-xdna_wfmt xdna_wfmt_for(enum ggml_type type) {
-    switch (type) {
-        case GGML_TYPE_Q4_K: return XDNA_WFMT_Q4G32;
-        case GGML_TYPE_Q5_K:
-        case GGML_TYPE_Q6_K: return XDNA_WFMT_Q8G16;
-        default:             return XDNA_WFMT_NONE;
-    }
-}
-
 size_t xdna_wfmt_row_bytes(xdna_wfmt fmt, int64_t k) {
     // A record is a super-block either way, so a row is whole records.
     if (k % XDNA_SB_VALUES) {
@@ -275,67 +266,3 @@ bool xdna_wfmt_repack_row(enum ggml_type type, const void * src, int64_t k, void
             return false;
     }
 }
-
-bool xdna_wfmt_decode_row(xdna_wfmt fmt, const void * src, int64_t k, float * dst) {
-    if (!src || !dst || k <= 0) {
-        return false;
-    }
-    const uint8_t * in = (const uint8_t *) src;
-
-    if (k % XDNA_SB_VALUES) {
-        return false;
-    }
-    const int64_t nsb = k / XDNA_SB_VALUES;
-
-    if (fmt == XDNA_WFMT_Q4G32) {
-        constexpr int NG = XDNA_Q4G32_SB_GROUPS;
-        for (int64_t sb = 0; sb < nsb; sb++) {
-            const uint8_t * rec = in + (size_t) sb * XDNA_Q4G32_SB_BYTES;
-            const int8_t * d8 = (const int8_t *) (rec + NG * XDNA_Q4G32_CODE);
-            const int8_t * m8 = d8 + NG;
-            uint16_t q[4];
-            std::memcpy(q, rec + NG * XDNA_Q4G32_CODE + 2 * NG, sizeof(q));
-            const float dS = join_bf16(q[0], q[1]);
-            const float mS = join_bf16(q[2], q[3]);
-            for (int g = 0; g < NG; g++) {
-                const uint8_t * p = rec + (size_t) g * XDNA_Q4G32_CODE;
-                const float d = dS * (float) d8[g];
-                const float m = mS * (float) m8[g];
-                float * y = dst + (sb * NG + g) * XDNA_Q4G32_GROUP;
-                for (int i = 0; i < XDNA_Q4G32_GROUP; i++) {
-                    const uint8_t v = (i & 1) ? (uint8_t) (p[i >> 1] >> 4)
-                                              : (uint8_t) (p[i >> 1] & 0x0F);
-                    y[i] = (float) v * d + m;
-                }
-            }
-        }
-        return true;
-    }
-
-    if (fmt == XDNA_WFMT_Q8G16) {
-        constexpr int NG = XDNA_Q8G16_SB_GROUPS;
-        for (int64_t sb = 0; sb < nsb; sb++) {
-            const uint8_t * rec = in + (size_t) sb * XDNA_Q8G16_SB_BYTES;
-            const int8_t * d8 = (const int8_t *) (rec + NG * XDNA_Q8G16_CODE);
-            const int8_t * m8 = d8 + NG;
-            uint16_t q[4];
-            std::memcpy(q, rec + NG * XDNA_Q8G16_CODE + 2 * NG, sizeof(q));
-            const float dS = join_bf16(q[0], q[1]);
-            const float mS = join_bf16(q[2], q[3]);
-            for (int g = 0; g < NG; g++) {
-                const uint8_t * p = rec + (size_t) g * XDNA_Q8G16_CODE;
-                const float d = dS * (float) d8[g];
-                const float m = mS * (float) m8[g];
-                float * y = dst + (sb * NG + g) * XDNA_Q8G16_GROUP;
-                for (int i = 0; i < XDNA_Q8G16_GROUP; i++) {
-                    y[i] = (float) (int8_t) p[i] * d + m;
-                }
-            }
-        }
-        return true;
-    }
-
-    return false;
-}
-
-

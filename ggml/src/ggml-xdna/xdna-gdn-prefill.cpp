@@ -210,7 +210,7 @@ static void unpack_state(uint16_t * pkd, float * dst_state) {
 // vectorise it: the packer below moves 228M values over a prompt, and going
 // through a per-element helper that recomputes a strided address and memcpys
 // four bytes cost 744 ms of the 6.8 s prompt - as long as the array spent
-// computing them (GGML_XDNA_RUNNER_PROF).
+// computing them.
 static void bf16_run(uint16_t * dst, const float * src, int n) {
     for (int i = 0; i < n; i++) {
         uint32_t x;

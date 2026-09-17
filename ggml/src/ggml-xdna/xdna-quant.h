@@ -86,9 +86,6 @@ enum xdna_wfmt {
     XDNA_WFMT_Q8G16,
 };
 
-// The format `type` repacks into, or XDNA_WFMT_NONE when it has none.
-xdna_wfmt xdna_wfmt_for(enum ggml_type type);
-
 // Bytes one row of `k` values takes in `fmt` (0 when k is not a multiple of
 // the group size).
 size_t xdna_wfmt_row_bytes(xdna_wfmt fmt, int64_t k);
@@ -103,12 +100,6 @@ bool xdna_wfmt_repack_row(enum ggml_type type, const void * src, int64_t k, void
 // the GEMV keep every type on one format.
 bool xdna_wfmt_repack_row_as(enum ggml_type type, xdna_wfmt fmt, const void * src,
                              int64_t k, void * dst);
-
-// Host reference decode of a repacked row into `k` floats. Mirrors exactly
-// what the AIE dequant computes, so a host check of repack+decode against the
-// ggml dequant validates the format end to end.
-bool xdna_wfmt_decode_row(xdna_wfmt fmt, const void * src, int64_t k, float * dst);
-
 
 // The format the decode GEMV uses for `type`. Both widths pack into the same
 // tile size, so a single artifact streams either and the GEMV never switches

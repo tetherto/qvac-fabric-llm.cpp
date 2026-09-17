@@ -51,7 +51,6 @@ from aie.utils.verify import assert_pass
 
 from wfmt import Q4_GROUP, Q8_GROUP, group_size, split_pairs
 
-PERM_ONLY = False
 CORES_PER_COL = 4
 # Which compute rows of a column the design places its cores on. Rows 2..5 are
 # the compute rows of an AIE2P column (0 is shim, 1 is mem). The default takes
@@ -93,9 +92,6 @@ def tile_bytes(fmt: str, k_tile: int, n_core: int) -> int:
     return lg * (ng * (code + 4 * vec) + nsup * 4 * vec * 2)
 
 
-def act_bytes(k_tile: int, fmt: str) -> int:
-    """int8 codes, then a f32 sum and a f32 scale per group, then the width."""
-    return ACT_TILE
 
 
 def _kernels(fmt: str, k_tile: int, n_core: int):
@@ -126,9 +122,9 @@ def _kernels(fmt: str, k_tile: int, n_core: int):
     digest = hashlib.sha256((src + "\0".join(flags)).encode()).hexdigest()[:8]
     pdigest = hashlib.sha256((src + "\0".join(pro_flags)).encode()).hexdigest()[:8]
     w_ty = np.ndarray[(tile_bytes(fmt, k_tile, n_core),), np.dtype[np.uint8]]
-    a_ty = np.ndarray[(act_bytes(k_tile, fmt) // 4,), np.dtype[np.int32]]
+    a_ty = np.ndarray[(ACT_TILE // 4,), np.dtype[np.int32]]
     o_ty = np.ndarray[(n_core,), np.dtype[np.float32]]
-    a_raw_ty = np.ndarray[(act_bytes(k_tile, fmt) // 4,), np.dtype[np.int32]]
+    a_raw_ty = np.ndarray[(ACT_TILE // 4,), np.dtype[np.int32]]
     pro_tile = ExternalFunction(
         "ggml_xdna_act_pro",
         object_file_name=f"actpro_{n_core}_{pdigest}.o",
@@ -184,19 +180,6 @@ def _rows_map(spec: str, cols: int) -> list:
     return rows
 
 
-def _dev_act() -> bool:
-    """Pack the activation the way the cores emit it, to check that the kernel
-    reads back what the epilogue writes."""
-    return False
-
-
-def _epi_quant() -> bool:
-    """The epilogue writes its result as an activation tile - int8 codes with
-    a scale and a code sum per group - instead of f32, so the dispatch that
-    consumes it needs nothing from the host in between."""
-    return False
-
-
 def _core(w_in, a_in, out, gemv, zero):
     # The first activation object carries the counts for this dispatch.
     hdr = a_in.acquire(1)
@@ -237,7 +220,7 @@ def build_gemv(FMT: str, K: int, N: int, K_TILE: int, COLS: int,
     n_out = N // (n_cores * n_core)
     NT = K // K_TILE
     tb = tile_bytes(FMT, K_TILE, n_core)
-    ab = act_bytes(K_TILE, FMT)
+    ab = ACT_TILE
 
     # L1 holds the double-buffered weight and activation tiles plus the f32
     # accumulator. Overrunning it fails deep inside the MLIR pipeline with an
@@ -350,15 +333,6 @@ def build_gemv(FMT: str, K: int, N: int, K_TILE: int, COLS: int,
         # separate buffers is what makes the order of the writes stop
         # mattering - host and array writes to one buffer hold in one order
         # only, and a layer in a single dispatch needs the other one.
-        def _pro(a_in, h_in, a_out, ktile):
-            i_ = a_in.acquire(1)
-            h_ = h_in.acquire(1)
-            o_ = a_out.acquire(1)
-            ktile(i_, h_, o_)
-            a_in.release(1)
-            h_in.release(1)
-            a_out.release(1)
-
         def _pro1(a_in, a_out, ktile):
             # One buffer for both: the tile is its own host half. Correct
             # wherever the host writes the whole tile, which is every stream
@@ -392,14 +366,11 @@ def build_gemv(FMT: str, K: int, N: int, K_TILE: int, COLS: int,
     # 28.6. One per column is the whole point of eight streams, so they are
     # pinned, and the recurrent design's fills are pinned around them
     # (attn_gdn_gated.py) to leave each column a channel.
-    # GEMV_PIN_W=0 goes back to letting the placer choose.
-    pin_w = 1
-    w_prods = [w_shim[c].prod(tile=Tile(c, 0)) if pin_w else w_shim[c].prod()
-               for c in range(COLS)]
+    w_prods = [w_shim[c].prod(tile=Tile(c, 0)) for c in range(COLS)]
     # The broadcast goes on the column whose shim the recurrent design leaves
     # a second channel on. Pinned rather than left to the placer because the
     # backend's hand-built stream has to know which column carries it.
-    a_prod = a_shim.prod(tile=Tile(4 if pin_w else 0, 0))
+    a_prod = a_shim.prod(tile=Tile(4, 0))
     o_conss = [o.cons() for o in o_shim]
     a_words = (1 + n_out * NT) * ab // 4
 
@@ -594,9 +565,7 @@ def _run_and_verify(opts) -> None:
                                        (0 if i < half else N // 2))
 
     ref = (aq.astype(np.float64) @ w.astype(np.float64)).astype(np.float32)
-    if opts.epilogue and PERM_ONLY:
-        ref = ref[colmap]
-    elif opts.epilogue:
+    if opts.epilogue:
         g = ref[: N // 2].astype(np.float64)
         u = ref[N // 2:].astype(np.float64)
         f = g / (1.0 + np.exp(-g))
@@ -628,9 +597,8 @@ def _run_and_verify(opts) -> None:
     hdr[ACT_TILE // 4 - 1] = 0 if fmt == "q4g32" else 1
     tiles = [pack_act_tile(fmt, a[t * K_TILE:(t + 1) * K_TILE],
                            d_a[t * (K_TILE // grp):(t + 1) * (K_TILE // grp)],
-                           (int(opts.epilogue and not PERM_ONLY and t == NT - 1) |
-                        (4 if _epi_quant() else 0)),
-                       n_core if _dev_act() else 0)
+                           int(opts.epilogue and t == NT - 1),
+                       0)
              for t in range(NT)]
     abuf = np.concatenate([hdr.view(np.uint8)] + tiles * n_out)
 
@@ -645,18 +613,8 @@ def _run_and_verify(opts) -> None:
     gemv_q4(a_w, a_a, a_o, **_compile_kwargs(opts))
     got = a_o.numpy().astype(np.float32)
     if opts.epilogue:
-        if _epi_quant():
-            # Per core slot: n_core/2 int8 codes, then a code sum and a scale
-            # per group of Q4_GROUP. Dequantized here only to check it.
-            raw = got.reshape(-1, n_core)
-            ng = (n_core // 2) // Q4_GROUP
-            codes = raw[:, :(n_core // 2) // 4].copy().view(np.int8)
-            scale = raw[:, (n_core // 2) // 4 + ng:(n_core // 2) // 4 + 2 * ng]
-            got = (codes.reshape(-1, ng, Q4_GROUP) *
-                   scale.reshape(-1, ng, 1)).reshape(-1)
-        else:
-            # Each 32-lane group carries 16 valid floats and a zeroed tail.
-            got = got.reshape(-1, VEC)[:, :half].reshape(-1)
+        # Each 32-lane group carries 16 valid floats and a zeroed tail.
+        got = got.reshape(-1, VEC)[:, :half].reshape(-1)
 
     if opts.iters > 0:
         import time

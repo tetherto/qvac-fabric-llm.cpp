@@ -410,58 +410,42 @@ struct xdna_rec_plan {
 // restores the per-op decode path. Requires the fused xclbin to exist
 // (xdna_rec_active); otherwise the backend falls back to per-op.
 //
-// The artifact (kernels/fused_layer.py) is resolved against the runtime kernel
-// search dirs and looked up under its design-tagged name only
-// (kernels/design_tag.py): an untagged artifact is from an older design, and
-// running this backend's stream against it reads as garbage output with no
-// error. With the tag, the two sides can only drift if one of them was
-// rebuilt and the other not - which is exactly what the tag turns into a loud
-// failure.
-static bool xdna_rec_find_pair(const char * stem, std::string & x, std::string & i) {
-    for (const auto & dir : xdna_kernel_search_dirs()) {
-        std::error_code ec;
-        const std::string fx =
-            (dir / (std::string(stem) + "_" + XDNA_DESIGN_TAG + ".xclbin")).string();
-        const std::string fi =
-            (dir / (std::string(stem) + "_" + XDNA_DESIGN_TAG + ".insts.bin")).string();
-        if (std::filesystem::exists(fx, ec)) {
-            x = fx;
-            i = fi;
-            return true;
+// The artifact (kernels/fused_layer.py) holds the recurrent core and the decode
+// GEMV in one array configuration, so a layer's dispatches share one hardware
+// context instead of reconfiguring the array between them. It is looked up
+// under its design-tagged name only (kernels/design_tag.py): an artifact from
+// other sources is invisible rather than driven, because running this stream
+// against a stale design reads as garbage output with no error at all. The tag
+// covers the design sources and the build knobs, not this stream builder - a
+// change here needs no artifact rebuild, and no artifact mismatch can hide it.
+static const std::string & xdna_fused_xclbin(void) {
+    static const std::string path = []() {
+        for (const auto & dir : xdna_kernel_search_dirs()) {
+            std::error_code ec;
+            const std::string f =
+                (dir / ("fused_layer_" XDNA_DESIGN_TAG ".xclbin")).string();
+            if (std::filesystem::exists(f, ec)) {
+                return f;
+            }
         }
-        const std::string fxo = (dir / (std::string(stem) + ".xclbin")).string();
-        if (std::filesystem::exists(fxo, ec)) {
-            GGML_LOG_ERROR(
-                "%s: %s.xclbin is present but not built for design tag %s; "
-                "the kernel artifacts are stale. Rebuild them and the backend "
-                "together:\n    cmake --build build --target "
-                "ggml-xdna-kernels\n", "ggml-xdna", stem, XDNA_DESIGN_TAG);
+        for (const auto & dir : xdna_kernel_search_dirs()) {
+            std::error_code ec;
+            if (std::filesystem::exists(dir / "fused_layer.xclbin", ec)) {
+                GGML_LOG_ERROR(
+                    "%s: fused_layer.xclbin is present but not built for design "
+                    "tag %s; the kernel artifacts are stale. Rebuild them and "
+                    "the backend together:\n    cmake --build build --target "
+                    "ggml-xdna-kernels\n", "ggml-xdna", XDNA_DESIGN_TAG);
+            }
         }
-    }
-    return false;
+        return std::string();
+    }();
+    return path;
 }
 
-struct xdna_rec_paths {
-    std::string g_x;   // fused_layer.xclbin
-};
-
-// The fused layer artifact (kernels/fused_layer.py) holds the recurrent core
-// and the decode GEMV in one array configuration, so a layer's dispatches
-// share one hardware context instead of reconfiguring the array between them.
-static bool xdna_rec_find_paths(xdna_rec_paths & p) {
-    std::string gx, gi;
-    if (!xdna_rec_find_pair("fused_layer", gx, gi) && gx.empty()) {
-        GGML_LOG_WARN("%s: fused layer: fused_layer.xclbin not found; "
-                      "leaving the decode on the per-op kernels\n", "ggml-xdna");
-        return false;
-    }
-    p.g_x = gx;
-    return true;
-}
-
-// Fused layer path is active (default): enabled and the fused xclbins are
-// present in the kernel search dirs. When they are missing the backend
-// silently runs the per-op decode path instead.
+// Fused layer path is active (default): enabled and the fused xclbin is
+// present in the kernel search dirs. When it is missing the backend silently
+// runs the per-op decode path instead.
 static bool xdna_rec_active(void) {
     // GGML_XDNA_FUSED_LAYER=0 forces the per-op decode path. The fused design
     // only covers the quantized weight sets its kernels were built for, so a
@@ -469,9 +453,7 @@ static bool xdna_rec_active(void) {
     if (xdna_env_int("GGML_XDNA_FUSED_LAYER", 1) == 0) {
         return false;
     }
-    static xdna_rec_paths paths;
-    static const bool have = xdna_rec_find_paths(paths);
-    return have;
+    return !xdna_fused_xclbin().empty();
 }
 
 // Parse "blk.N." prefixes from weight tensor names; returns false when absent.
@@ -640,10 +622,6 @@ static bool xdna_rec_scan(ggml_backend_xdna_context * ctx,
     return !plans.empty();
 }
 
-// Optional wall-clock split of the three fused kernels of a recurrent layer
-// (GGML_XDNA_REC_PROF=1). Accumulated over the whole process and printed once
-// at exit: decode cost is dominated by these, so the split says whether the
-// gap to the target is dispatch latency or kernel time.
 // The recurrent-memory row the layer's state read points at: the sequence's
 // cell slot, which is what tells two sequences sharing one context apart.
 static int64_t xdna_rec_seq_row(const xdna_rec_plan & p) {
@@ -732,30 +710,43 @@ static bool xdna_rec_run(ggml_backend_xdna_context * ctx, xdna_rec_plan & p,
                            ggml_type_name(p.w_up->type), ggml_type_name(p.w_down->type));
             return false;
         }
+        // The gated stage writes its activation in the layout the artifact was
+        // built with (-DGATED_FMT), and the model's ssm_out decides which one
+        // it needs: Q4_K is the 4-bit form, Q5_K/Q6_K the 8-bit. Nothing can
+        // adapt at run time - the kernel's layout is fixed - so a model that
+        // needs the other form stops here, before any buffer is sized or any
+        // dispatch runs, instead of writing past the end of a buffer sized for
+        // this one.
+        const int want_fmt = p.w_so->type == GGML_TYPE_Q4_K ? 0 : 1;
+        if (want_fmt != xdna_rec_pack::GATED_FMT) {
+            GGML_LOG_ERROR("%s: fused layer %d: ssm_out is %s, which needs the "
+                           "%d-bit activation layout, but the kernels were built "
+                           "with GATED_FMT=%d; rebuild them and the backend with "
+                           "-DGGML_XDNA_GATED_FMT=%d\n", "ggml-xdna", p.il,
+                           ggml_type_name(p.w_so->type), want_fmt == 0 ? 4 : 8,
+                           xdna_rec_pack::GATED_FMT, want_fmt);
+            return false;
+        }
 
         xdna_rec_pack_begin(s->host, ch, qkv, s->feed0);
 
-        xdna_rec_paths paths;
-        if (!xdna_rec_find_paths(paths)) {
+        const std::string & gx = xdna_fused_xclbin();
+        if (gx.empty()) {
+            GGML_LOG_ERROR("%s: fused layer %d: no fused_layer artifact for this "
+                           "design\n", "ggml-xdna", p.il);
             return false;
         }
         xdna_rec_geom g = xdna_rec_pack_geom();
-        // The activation layout the gated stage writes depends on the ssm_out
-        // weight type - Q4_K is the 4-bit form, Q5_K/Q6_K the 8-bit - and so
-        // does the gated out object's size. The artifact must be built with
-        // the matching GATED_FMT.
-        g.out_bytes = (int64_t) xdna_rec_pack::ACT_OFF +
-                      (int64_t) (1 + xdna_rec_pack::KGATE /
-                                        (p.w_so->type == GGML_TYPE_Q4_K ? 256 : 128)) *
-                          xdna_rec_pack::ACT_TILE_G;
+        // The gated out object's size follows the compiled layout (xdna-rec.h).
+        g.out_bytes = (int64_t) xdna_rec_pack::OUTN;
 
-        s->core = xdna_rec_core_create(ctx->device, g, paths.g_x.c_str());
+        s->core = xdna_rec_core_create(ctx->device, g, gx.c_str());
         if (!s->core) {
             GGML_LOG_ERROR("%s: fused layer %d: fused_layer load failed\n", "ggml-xdna", p.il);
             return false;
         }
         s->gv = xdna_rec_gemv_create(ctx->pool, p.w_so, p.w_gate, p.w_up,
-                                     p.w_down, true);
+                                     p.w_down);
         if (!s->gv) {
             GGML_LOG_ERROR("%s: fused layer %d: the GEMV route does not cover "
                            "this weight set\n", "ggml-xdna", p.il);
@@ -917,24 +908,19 @@ static void xdna_kernels_warm(xdna_kernel_pool * pool, const xdna_ops * ops) {
         }
     };
 
-    // The decode GEMV artifact is per array split, and exactly one split is in
-    // use: whichever the active mode's projections are built with.
-    const xdna_gemv_split split = xdna_rec_active() ? XDNA_GEMV_SPLIT_FUSED
-                                                    : XDNA_GEMV_SPLIT_DEFAULT;
-    warm_stem(xdna_gemv_stem(split));
-
     if (xdna_rec_active()) {
-        // Fused decode: the core design and the prefill kernels a prompt chunk
-        // still dispatches.
-        xdna_rec_paths paths;
-        if (xdna_rec_find_paths(paths)) {
-            warm_stem(std::filesystem::path(paths.g_x).stem().string());
-        }
+        // Fused decode: one design carries both the core and the decode GEMV
+        // its projections run on, so warming it covers the split the mode
+        // uses. The prefill kernels are warmed alongside it - a prompt chunk
+        // still dispatches those.
+        warm_stem(std::filesystem::path(xdna_fused_xclbin()).stem().string());
         warm_names("conv_prefill");
         warm_names("fa_prefill");
         return;
     }
-    // Per-op decode: the GEMM variants xdna-ops resolves.
+    // Per-op decode: the standalone GEMV split and the GEMM variants xdna-ops
+    // resolves.
+    warm_stem(xdna_gemv_stem(XDNA_GEMV_SPLIT_DEFAULT));
     warm_stem(ops->gemm_xclbin_decode);
     warm_names("gemm_int8_int32");
     warm_names("gemm_bf16_f32");
@@ -976,7 +962,10 @@ static void ggml_backend_xdna_free(ggml_backend_t backend) {
     delete backend;
 }
 
-// GGML_XDNA_OPS_PROF=1: where each op of a decode graph actually ran,
+// CONCAT nodes the conv prefill reads through instead of building (see
+// xdna_conv_prefill_direct_add): the conv input is the cached tokens with the
+// chunk's projection, and materialising it costs an element-at-a-time copy of
+// the whole thing.
 static void xdna_concat_tail_plan(ggml_backend_xdna_context * ctx,
                                   struct ggml_cgraph * cgraph,
                                   std::unordered_map<const ggml_tensor *,
@@ -1119,11 +1108,7 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
     ctx->ops.isolation = xdna_rec_active();
     // Projections outside the fused layers go through the decode GEMV on the
     // merged artifact, which is the context the layers leave resident.
-    {
-        static xdna_rec_paths fp;
-        static const bool have_fused = xdna_rec_find_paths(fp);
-        ctx->ops.fused_gemv = ctx->ops.isolation && have_fused;
-    }
+    ctx->ops.fused_gemv = ctx->ops.isolation && !xdna_fused_xclbin().empty();
 
     // Fused decode linear layers: scan this chunk for complete recurrent
     // layers of a single-token decode; each fires once in the dispatch loop

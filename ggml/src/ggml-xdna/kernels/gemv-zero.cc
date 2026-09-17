@@ -1,4 +1,3 @@
-// SPDX-License-Identifier: MIT
 //
 // Zero one core's f32 accumulator before the K loop of the decode GEMV
 // (gemv_q4.cc). Separate translation unit: the design compiles one object per

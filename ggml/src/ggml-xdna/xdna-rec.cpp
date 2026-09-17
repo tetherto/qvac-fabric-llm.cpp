@@ -207,15 +207,19 @@ xdna_rec_core * xdna_rec_core_create(xdna_device * dev, const xdna_rec_geom & g,
 
     core->feed = xdna_buffer_alloc(dev, (size_t) g.feed_bytes);
     core->x    = xdna_buffer_alloc(dev, (size_t) g.x_bytes);
+    // Sized by the larger of the two gated layouts, like `out` below: the
+    // activation the norm writes has to fit whichever one the artifact is.
     core->pkvb = xdna_buffer_alloc(dev,
                                    std::max((size_t) g.pkvb_bytes,
-                                            (size_t) (g.out_bytes -
+                                            (size_t) (xdna_rec_pack::OUTN_MAX -
                                                       xdna_rec_pack::ACT_OFF)));
     core->gstate = xdna_buffer_alloc(dev, (size_t) g.state_bytes / 2);
     core->azg = xdna_buffer_alloc(dev, (size_t) g.azg_bytes);
-    // Room past the gated output for a projection fused into this stream
-    // to drain into: it cannot have an argument of its own.
-    core->out = xdna_buffer_alloc(dev, (size_t) g.out_bytes + 8192);
+    // The gated output, sized by the larger layout, plus room past it for a
+    // projection fused into this stream to drain into (it cannot have an
+    // argument of its own). The stream's own lengths come from g.out_bytes and
+    // follow the layout the artifact was built with.
+    core->out = xdna_buffer_alloc(dev, (size_t) xdna_rec_pack::OUTN_MAX + 8192);
     if (!core->feed || !core->x || !core->pkvb || !core->gstate || !core->azg ||
         !core->out) {
         GGML_LOG_ERROR("%s: core BO allocation failed\n", "xdna-rec");

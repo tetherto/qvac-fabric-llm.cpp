@@ -48,13 +48,42 @@ static void emit_bd_2d(xdna_seq * seq, int col, int bd, uint32_t arg,
     xdna_seq_ddr_patch(seq, (uint32_t) col, 0, (uint32_t) bd, arg, byte_off);
 }
 
+// The builder below emits one stream for one compiled layout: the conv, norm
+// and gdn stages sit on fixed columns and several drains name their shim
+// column as an offset from the stage's first one. A geometry that differs
+// would put those transfers on another tile - or past the last one - so it is
+// refused here rather than streamed.
 static bool valid_geom(const xdna_attn_gdn_geom * g) {
-    if (!g || g->conv_cols <= 0 || g->norm_cols <= 0 || g->gdn_cols <= 0 ||
-        g->conv_cols + g->norm_cols + g->gdn_cols != g->n_cols ||
-        g->n_block % g->conv_cols != 0 || g->n_vh % g->norm_cols != 0 ||
+    if (!g || (int) g->n_cols != XDNA_SEQ_MAX_COLS) {
+        return false;
+    }
+    if (g->conv_cols != 2 || g->norm_cols != 2 || g->gdn_cols != 4 ||
+        g->conv_cols + g->norm_cols + g->gdn_cols != g->n_cols) {
+        return false;
+    }
+    if (g->n_block % g->conv_cols != 0 || g->n_vh % g->norm_cols != 0 ||
         g->n_block % g->n_vh != 0 || g->feed_n < 3 * g->sv + g->sv ||
         g->head_norm != 3 * g->sv + 3 || g->pkv_n != 3 * g->sv + 3 ||
         g->pkvb_n != g->n_obj * g->pkv_n) {
+        return false;
+    }
+    // The stage's own geometry: a stream driven against a different one would
+    // truncate a divisor or a modulo into a dropped round.
+    if (g->feed_slot <= 0 || g->feed_slot > g->feed_n || g->rows <= 0 ||
+        g->chunk <= 0 || g->rows % g->chunk != 0 || g->sv <= 0) {
+        return false;
+    }
+    if (g->gdn_state_streams <= 0 || g->n_vh % g->gdn_state_streams != 0 ||
+        g->n_obj % g->gdn_cols != 0) {
+        return false;
+    }
+    if (g->gated_act_bytes) {
+        if (g->gated_act_bytes % 4 || g->gated_act_bytes / 4 > g->out_words ||
+            g->gated_act_col < 0 || g->gated_act_col >= (int) g->n_cols) {
+            return false;
+        }
+    }
+    if (g->out_words < 0 || g->out_base < 0) {
         return false;
     }
     return true;
@@ -316,13 +345,11 @@ bool xdna_attn_gdn_build(xdna_seq * seq, const xdna_attn_gdn_geom * g,
         emit_bd(seq, nfill_col, 0, (uint32_t) nw_fill, 1,
                 (uint32_t)(h * nw_fill * 4));
         xdna_seq_push_queue(seq, (uint32_t) nfill_col, 0, 0, DIR_MM2S, 0, false, 0);
-        if (!g->pkv_onchip) {
-            emit_bd(seq, ndrain_col, 0, (uint32_t)(g->norm_cols * g->pkvb_n), 2,
-                    (uint32_t)(h * g->norm_cols * g->pkvb_n * 4));
-            xdna_seq_issue_token(seq, (uint32_t) ndrain_col, 0, DIR_S2MM, 0, 0xF);
-            xdna_seq_push_queue(seq, (uint32_t) ndrain_col, 0, 0, DIR_S2MM, 0, true, 0);
-            xdna_seq_wait_token(seq, (uint32_t) ndrain_col, 0, DIR_S2MM, 0);
-        }
+        emit_bd(seq, ndrain_col, 0, (uint32_t)(g->norm_cols * g->pkvb_n), 2,
+                (uint32_t)(h * g->norm_cols * g->pkvb_n * 4));
+        xdna_seq_issue_token(seq, (uint32_t) ndrain_col, 0, DIR_S2MM, 0, 0xF);
+        xdna_seq_push_queue(seq, (uint32_t) ndrain_col, 0, 0, DIR_S2MM, 0, true, 0);
+        xdna_seq_wait_token(seq, (uint32_t) ndrain_col, 0, DIR_S2MM, 0);
     }
     }
 
@@ -460,6 +487,10 @@ bool xdna_attn_gdn_build(xdna_seq * seq, const xdna_attn_gdn_geom * g,
         // the same channel, the second covering only the activation window,
         // so the handover has a completion of its own to wait on.
         const uint32_t act_w = (uint32_t)(g->gated_act_bytes / 4);
+        if (act_w > (uint32_t) g->out_words) {
+            return false;   // valid_geom holds this; a truncated length would
+                            // otherwise become a huge unsigned transfer
+        }
         {
             xdna_bd bd_;
             bd_.buf_len   = (uint32_t) g->out_words - act_w;

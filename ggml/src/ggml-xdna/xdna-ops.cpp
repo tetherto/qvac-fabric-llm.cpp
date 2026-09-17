@@ -121,15 +121,16 @@ static void xdna_quantize_row(int8_t * dst, const float * row, int n, float reci
 }
 
 // RTP base for a per-core M tile. The address is fixed by the compiled L1
-// layout, so each tile size the build bakes needs its own constant; an
-// unknown tile would make every RTP write land in the wrong buffer.
+// layout, so each tile size the build bakes needs its own constant, and an
+// unknown tile writes every RTP somewhere wrong. 0 says "no such tile": the
+// geometry is then refused instead of driven with the wrong address.
 static int rtp_base_for_tile_m(int tile_m) {
     switch (tile_m) {
         case 8:  return XDNA_RTP_BASE_TILE_M8;
         case 16: return XDNA_RTP_BASE_TILE_M16;
         case 32: return XDNA_RTP_BASE_TILE_M32;
         case 64: return XDNA_RTP_BASE_TILE_M64;
-        default: return XDNA_RTP_BASE_TILE_M16;
+        default: return 0;
     }
 }
 
@@ -138,7 +139,7 @@ static int rtp_base_for_tile_m(int tile_m) {
 // and doubles the per-core M tile, which halves the number of times the
 // weights cross DDR per op. Only the baked M block differs between kernels.
 static xdna_gemm_tiles prefill_tiles_for(int Mk, int elem_bytes) {
-    xdna_gemm_tiles t;
+    xdna_gemm_tiles t;   // rtp_base 0 on an unbaked tile: xdna_pick_geom refuses it
     t.M              = Mk;
     t.tile_m         = elem_bytes == 1 ? GGML_XDNA_TILE_M_BIG_I8 : GGML_XDNA_TILE_M_BIG;
     t.tile_k         = GGML_XDNA_TILE_K;
@@ -195,8 +196,11 @@ static xdna_gemm_geom xdna_pick_geom(const xdna_ops * ops, int M, int K, int N, 
     const int eb = want_i8 ? 1 : 2;
     const int Mk = pick_prefill_block(ops, M, K, N, eb, route);
     if (Mk > 0) {
-        g.tiles  = prefill_tiles_for(Mk, eb);
-        g.xclbin = route.at(Mk).c_str();
+        const xdna_gemm_tiles t = prefill_tiles_for(Mk, eb);
+        if (t.rtp_base > 0) {
+            g.tiles  = t;
+            g.xclbin = route.at(Mk).c_str();
+        }
     }
     return g;
 }
@@ -349,8 +353,8 @@ static xdna_ops::int8_wbo * gemm_int8_weight_bo(xdna_ops * ops, const struct ggm
     int8_t * w = (int8_t *) wb->bo->bo.map();
     std::memset(w, 0, (size_t) K_pad * N);
     // Dequantising the tensor and re-quantising it to int8 is once per weight,
-    // but it was 1638 ms of a 6.8 s prompt (GGML_XDNA_PROFILING=1) - more than
-    // the array spent on the GEMMs themselves.
+    // but it measured 1638 ms of a 6.8 s prompt - more than the array spent on
+    // the GEMMs themselves.
     //
     // Two things made it slow. The columns are independent, so this is a
     // parallel loop; and the destination is transposed, w[k*N + n], so writing
@@ -840,8 +844,8 @@ static bool xdna_ops_is_view(enum ggml_op op) {
 // The geometry serving this node, or an invalid one. Decode only: ne[1] is the
 // number of activation rows.
 // The decode GEMV gate. `why`, when given, is set to the first condition that
-// failed, so GGML_XDNA_GEMV_DEBUG can say which one a graph is losing nodes to
-// instead of reporting that nothing was claimed.
+// failed, so a caller can say which one a graph is losing nodes to instead of
+// reporting that nothing was claimed.
 static xdna_gemv_geom xdna_gemv_geom_for(const struct ggml_tensor * op,
                                          const char ** why = nullptr,
                                          xdna_gemv_split split = XDNA_GEMV_SPLIT_DEFAULT) {
@@ -1159,9 +1163,16 @@ void xdna_ops_init(xdna_ops * ops, xdna_kernel_pool * pool) {
         }
         blocks += std::to_string(ops->pref_blocks[i]);
     }
+    std::string i8_blocks;
+    for (const auto & kv : ops->i8_xclbin) {
+        if (!i8_blocks.empty()) {
+            i8_blocks += ",";
+        }
+        i8_blocks += std::to_string(kv.first);
+    }
     GGML_LOG_INFO("%s: GEMM geometries: decode=%s prefill blocks=[%s] int8 blocks=[%s] (big-M threshold %d)\n",
                   "xdna-ops", ops->gemm_xclbin_decode.c_str(), blocks.c_str(),
-                  ops->i8_xclbin.empty() ? "-" : blocks.c_str(), GEMM_M_BIG_MIN);
+                  i8_blocks.empty() ? "-" : i8_blocks.c_str(), GEMM_M_BIG_MIN);
 }
 
 bool xdna_ops_supported(const xdna_ops * ops, const struct ggml_tensor * op) {
@@ -1181,10 +1192,7 @@ bool xdna_ops_supported(const xdna_ops * ops, const struct ggml_tensor * op) {
     // about 1.3x the bytes at 26 GB/s where the CPU moves them at 28. The
     // in_proj of a recurrent layer is Q6_K and is the single biggest
     // projection in the model, which is most of the difference.
-    //
-    // GGML_XDNA_GEMV_OPS=0 puts them back on the host.
-    if (ops->isolation && op->ne[1] <= 1 &&
-        !(true && ops->gemv_group_of.count(op))) {
+    if (ops->isolation && op->ne[1] <= 1 && !ops->gemv_group_of.count(op)) {
         return false;
     }
     switch (op->op) {

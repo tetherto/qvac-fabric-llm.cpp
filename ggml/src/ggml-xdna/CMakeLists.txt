@@ -48,6 +48,8 @@ set(XDNA_GEMM_M_BIG 256)    # base prefill M block
 set(XDNA_TILE_M_BIG 32)     # bf16 prefill per-core M tile
 set(XDNA_TILE_M_BIG_I8 64)  # int8 prefill per-core M tile
 set(XDNA_GEMM_M_BIG_EXTRA 512 2048)   # extra prefill M blocks (baked variants)
+set(XDNA_GATED_FMT 1 CACHE STRING
+    "ggml-xdna: gated activation layout baked into the fused layer (0 = 4-bit, for a Q4_K ssm_out; 1 = 8-bit, for Q5_K/Q6_K)")
 set(XDNA_TILE_K 64)         # per-core K tile (larger = fewer C reloads per call)
 set(XDNA_TILE_N 64)         # per-core N tile (wider = longer B DDR bursts)
 set(XDNA_N_COLS 8)          # AIE columns
@@ -62,6 +64,7 @@ target_compile_definitions(ggml-xdna PRIVATE
     GGML_XDNA_TILE_N=${XDNA_TILE_N}
     GGML_XDNA_N_COLS=${XDNA_N_COLS}
     GGML_XDNA_N_COMPUTE_ROWS=${XDNA_N_COMPUTE_ROWS}
+    GGML_XDNA_GATED_FMT=${XDNA_GATED_FMT}
 )
 
 # NPU kernels are compiled out-of-line by kernels/gemm.py (IRON/MLIR-AIE) at
@@ -260,14 +263,16 @@ if (GGML_XDNA_BUILD_KERNELS)
     # hardware context. The .insts.bin is only a build-time reference; the
     # runner binds a host-built phased TXN stream.
     #
-    # ACT_RAW=1 puts the FFN transition on a tile of this design (the residual
-    # add, the norm and the quantization), so the host has nothing to do
-    # between a layer's dispatches.
+    # The design itself puts the FFN transition on a tile of this array (the
+    # residual add, the norm and the quantization), so the host has nothing to
+    # do between a layer's dispatches; it sets ACT_RAW in fused_layer.py rather
+    # than reading it here, which keeps that part of its identity in its
+    # source.
     set(FL_XCLBIN "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/fused_layer.xclbin")
     set(FL_INSTS  "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/fused_layer.insts.bin")
     add_custom_command(
         OUTPUT ${FL_XCLBIN} ${FL_INSTS}
-        COMMAND ${CMAKE_COMMAND} -E env ACT_RAW=1
+        COMMAND ${CMAKE_COMMAND} -E env GATED_FMT=${XDNA_GATED_FMT}
                 ${GEMM_PYTHON} "${GEMM_DIR}/fused_layer.py"
                 -d npu2
                 --xclbin-path ${FL_XCLBIN}
@@ -297,8 +302,8 @@ if (GGML_XDNA_BUILD_KERNELS)
 
     # The per-op decode split: four rows of 32 output columns per core covers
     # 1024 columns per pass. The fused layer's projections use the split that
-    # shares the array with the GDN core instead (gemv_n128_r1_c8, built as
-    # part of fused_layer).
+    # shares the array with the GDN core instead, which is built inside
+    # fused_layer.xclbin and loaded under that artifact's name.
     set(GV_N_CORE 32)
     set(GV_ROWS 4)
     set(GV_ROW_MAP "2,3,4,5")
@@ -308,7 +313,8 @@ if (GGML_XDNA_BUILD_KERNELS)
 
     add_custom_command(
         OUTPUT ${GV_XCLBIN} ${GV_INSTS}
-        COMMAND ${GEMM_PYTHON} "${GEMM_DIR}/gemv_q4.py"
+        COMMAND ${CMAKE_COMMAND} -E env GATED_FMT=${XDNA_GATED_FMT}
+                ${GEMM_PYTHON} "${GEMM_DIR}/gemv_q4.py"
                 -d npu2 --fmt q8g16
                 -K 1024 -N 1024
                 --n-core ${GV_N_CORE}
@@ -338,7 +344,8 @@ if (GGML_XDNA_BUILD_KERNELS)
     endforeach()
     add_custom_command(
         OUTPUT ${XDNA_TAGGED_ARTIFACTS}
-        COMMAND ${GEMM_PYTHON} "${GEMM_DIR}/design_tag.py"
+        COMMAND ${CMAKE_COMMAND} -E env GATED_FMT=${XDNA_GATED_FMT}
+                ${GEMM_PYTHON} "${GEMM_DIR}/design_tag.py"
                 --stamp-dir ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}
                 --extra npu2
         DEPENDS ${XDNA_ARTIFACTS} "${GEMM_DIR}/design_tag.py"

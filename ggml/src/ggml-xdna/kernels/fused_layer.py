@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: MIT
 #
 # The whole recurrent layer of the Qwen3.5 decode in one xclbin: the fused
 # conv+norm+gdn+gated core (attn_gdn_gated.py) and the decode GEMV
@@ -101,10 +100,16 @@ def fused_layer(
     K_TILE: CompileTime[int] = 256,
 ):
     # The merged design pins its own post endpoints (the placer's choice);
-    # the standalone attn_gdn_gated pins (1,0)/(2,0) instead.
+    # the standalone attn_gdn_gated pins (1,0)/(2,0) instead. The prologue tile
+    # that turns the host's numbers into the activation the next dispatch reads
+    # is part of this design, not a choice: the backend always writes those
+    # numbers, so an artifact without it cannot be driven. Both are set here
+    # rather than read from the environment, so the source alone decides what
+    # this design is.
     import os as _os
     _os.environ["POST_FILL_COL"] = "auto"
     _os.environ["POST_DRN_COL"] = "auto"
+    _os.environ["ACT_RAW"] = "1"
     cw, ca, cseq = ag.build_core(dev_name)
     gw, ga, gseq = gq.build_gemv(FMT, K, N, K_TILE, COLS, N_CORE, ROWS_FREE,
                                  OUT_GROUP)

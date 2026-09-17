@@ -273,6 +273,7 @@ bool xdna_run_wait(xrt::run & run) {
 // --- kernel pool -----------------------------------------------------------
 
 void xdna_kernel_pool_scan(xdna_kernel_pool * pool) {
+    pool->names.clear();
     for (const fs::path & dir : xdna_kernel_search_dirs()) {
         std::error_code ec;
         for (const auto & entry : fs::directory_iterator(dir, ec)) {
@@ -327,6 +328,9 @@ xdna_buffer * xdna_kernel_pool_acquire_buffer(xdna_kernel_pool * pool, size_t by
         size_t best = pool->pool.size();
         size_t best_size = 0;
         for (size_t i = 0; i < pool->pool.size(); i++) {
+            if (!pool->pool[i].buf) {
+                continue;
+            }
             const size_t sz = pool->pool[i].buf->bytes;
             if (sz >= bytes && (best == pool->pool.size() || sz < best_size)) {
                 best = i;
@@ -343,6 +347,9 @@ xdna_buffer * xdna_kernel_pool_acquire_buffer(xdna_kernel_pool * pool, size_t by
 }
 
 void xdna_kernel_pool_release_buffer(xdna_kernel_pool * pool, xdna_buffer * buf) {
+    if (!buf) {
+        return;
+    }
     std::lock_guard<std::mutex> lock(pool->pool_mutex);
     pool->pool.push_back({buf, ++pool->pool_tick});
 

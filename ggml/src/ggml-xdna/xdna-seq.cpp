@@ -1,5 +1,7 @@
 #include "xdna-seq.h"
 
+#include "ggml-impl.h"
+
 // TXN instruction encodings (NPU2 / XDNA2). Each op is a fixed-size word
 // group; the last word of each group holds op_size * 4 (the total op size in
 // bytes), which the firmware uses to advance the instruction pointer.
@@ -21,7 +23,7 @@ void xdna_seq_write(xdna_seq * seq, uint32_t col, uint32_t row, uint32_t reg, ui
 }
 
 void xdna_seq_blockwrite(xdna_seq * seq, uint32_t col, uint32_t row, uint32_t bd_id, const xdna_bd * bd) {
-    if (row == 0 && col < 8 && bd_id + 1 > seq->bd_used[col]) {
+    if (row == 0 && col < XDNA_SEQ_MAX_COLS && bd_id + 1 > seq->bd_used[col]) {
         seq->bd_used[col] = bd_id + 1;
     }
     seq->n_instr++;
@@ -94,7 +96,7 @@ void xdna_seq_maskwrite(xdna_seq * seq, uint32_t col, uint32_t row, uint32_t reg
 void xdna_seq_push_queue(xdna_seq * seq, uint32_t col, uint32_t row, uint32_t bd_id, xdna_dma_dir dir,
                          uint32_t channel, bool issue_token, uint32_t repeat) {
     const uint32_t reg = xdna_txn::SHIM_PUSHQ_BASE +
-                         (channel > 0 ? xdna_txn::SHIM_CTRL_STRIDE : 0) +
+                         channel * xdna_txn::SHIM_CTRL_STRIDE +
                          (dir == xdna_dma_dir::MM2S ? xdna_txn::SHIM_DIR_STRIDE : 0);
     uint32_t value = (bd_id & xdna_txn::PUSH_BD_ID_MASK) | (repeat << xdna_txn::PUSH_REPEAT_SHIFT);
     if (issue_token) {
@@ -136,7 +138,17 @@ std::vector<uint32_t> xdna_seq_build(const xdna_seq * seq) {
 // --- GEMM sequence -----------------------------------------------------------
 
 bool xdna_gemm_seq_supported(const xdna_gemm_tiles * tiles, int M, int K, int N) {
-    if (M <= 0 || M > tiles->M) {
+    if (!tiles || tiles->n_cols <= 0 || (uint32_t) tiles->n_cols > XDNA_SEQ_MAX_COLS) {
+        return false;
+    }
+    if (tiles->tile_m <= 0 || tiles->tile_k <= 0 || tiles->tile_n <= 0 ||
+        tiles->n_compute_rows <= 0 || tiles->elem_bytes <= 0 || tiles->rtp_base <= 0) {
+        return false;
+    }
+    // The stream is built for whole sweeps of the baked block; a partial block
+    // would emit no DMA at all (see xdna_gemm_seq_build).
+    const int sweep_m = tiles->tile_m * tiles->n_compute_rows;
+    if (M <= 0 || M > tiles->M || M % sweep_m != 0) {
         return false;
     }
     if (K <= 0 || K % tiles->tile_k != 0) {
@@ -144,6 +156,12 @@ bool xdna_gemm_seq_supported(const xdna_gemm_tiles * tiles, int M, int K, int N)
     }
     const int mem_tile_n = tiles->tile_n * tiles->n_cols;
     if (N < mem_tile_n || N % mem_tile_n != 0) {
+        return false;
+    }
+    // Sizes and strides go to the address generator in 4-byte words, so a
+    // dimension that is not a whole word would be truncated into a wrong
+    // transfer rather than refused.
+    if ((tiles->tile_k * tiles->elem_bytes) % 4 || (tiles->tile_n * tiles->elem_bytes) % 4) {
         return false;
     }
     return true;
@@ -169,6 +187,13 @@ static void emit_bd(xdna_seq * seq, int col, int bd_id, const xdna_bd & bd,
 //     or the BD iteration field (stride > 0)
 bool xdna_gemm_seq_build(xdna_seq * seq, const xdna_gemm_tiles * t, int M, int K, int N,
                          uint32_t b_offset) {
+    if (!seq || !xdna_gemm_seq_supported(t, M, K, N)) {
+        GGML_LOG_ERROR("%s: gemm: unsupported geometry M%d K%d N%d "
+                       "(block M%d tile %dx%dx%d cols %d)\n", "xdna-seq", M, K, N,
+                       t ? t->M : 0, t ? t->tile_m : 0, t ? t->tile_k : 0,
+                       t ? t->tile_n : 0, t ? t->n_cols : 0);
+        return false;
+    }
     const int n_cols = t->n_cols;
     const int n_rows = t->n_compute_rows;
     const int tile_n = t->tile_n;
@@ -187,6 +212,7 @@ bool xdna_gemm_seq_build(xdna_seq * seq, const xdna_gemm_tiles * t, int M, int K
     const int mem_tile_m_A = tile_m;                       // A rows per shim per sweep
     const int mem_tile_m_C = tile_m * n_rows;              // C rows per sweep
     const int n_sweeps     = M / mem_tile_m_C;
+    GGML_ASSERT(n_sweeps > 0);   // xdna_gemm_seq_supported holds M to a whole sweep
 
     // RTP writes + barriers (rows 2..5, cols 0..7): per-core loop counts, the
     // core's n_tiles_per_core = row sweeps x column tiles.
@@ -206,7 +232,7 @@ bool xdna_gemm_seq_build(xdna_seq * seq, const xdna_gemm_tiles * t, int M, int K
     for (int sweep = 0; sweep < n_sweeps; sweep++) {
         const size_t c_row_off = (size_t) sweep * mem_tile_m_C;    // rows into C
         const size_t c_byte    = c_row_off * N * 4;                // C is f32/int32
-        uint32_t shim_bd[8] = { 0, 0, 0, 0, 0, 0, 0, 0 };
+        uint32_t shim_bd[XDNA_SEQ_MAX_COLS] = {};
         for (int col = 0; col < n_cols; col++) {
             // C output [M x N] f32/int32. Column c covers tile_n output columns
             // laid out every mem_tile_n elements (interleaved by the tiler).

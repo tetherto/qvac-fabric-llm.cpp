@@ -68,8 +68,23 @@ constexpr int KGATE   = NVH * SV;      // gdn attn / aq row length
 // kernels/attn_gdn_gated.py.
 constexpr int ACT_TILE_G = 2112;
 constexpr int ACT_OFF = 10496;                            // after aq and d_a
-constexpr int ACTN    = (1 + KGATE / 256) * ACT_TILE_G;
+// The layout the gated stage writes and the ssm_out GEMV reads: 0 = 4-bit
+// (groups of 32, for a Q4_K ssm_out), 1 = 8-bit (groups of 16, for Q5_K and
+// Q6_K). It is baked into the artifact with -DGATED_FMT, and CMake compiles
+// the backend with the same value: the two cannot be reconciled at run time,
+// because the kernel's layout is fixed at build time, so a model that needs
+// the other one is refused instead of writing past a buffer sized for this
+// one.
+#ifndef GGML_XDNA_GATED_FMT
+#define GGML_XDNA_GATED_FMT 1
+#endif
+constexpr int GATED_FMT = GGML_XDNA_GATED_FMT;
+constexpr int ACTN    = (1 + KGATE / (GATED_FMT == 1 ? 128 : 256)) * ACT_TILE_G;
 constexpr int OUTN    = ACT_OFF + ACTN;
+// The bigger of the two layouts. Buffers are sized by this one so that a host
+// and an artifact that disagree cannot write past the end of the buffer; the
+// disagreement itself is reported and the run refused.
+constexpr int OUTN_MAX = ACT_OFF + (1 + KGATE / 128) * ACT_TILE_G;
 
 int64_t state_floats();   // NVH * N_OBJ * ROWS_N (fp32 ssm state floats)
 int64_t feed_blocks();    // NCONV * CN

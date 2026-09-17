@@ -47,14 +47,11 @@ struct xdna_rec_gemv {
 // weights must be types the GEMV route covers (Q4_K for gate/up; Q4_K, Q5_K or
 // Q6_K for ssm_out and down) and their shapes must tile the array exactly.
 // Returns nullptr when any of that does not hold.
-// `fused` runs the projections on the merged layer artifact, the same one the
-// core is on, so the layer never changes hardware context.
 xdna_rec_gemv * xdna_rec_gemv_create(struct xdna_kernel_pool * pool,
                                      const struct ggml_tensor * w_so,
                                      const struct ggml_tensor * w_gate,
                                      const struct ggml_tensor * w_up,
-                                     const struct ggml_tensor * w_down,
-                                     bool fused);
+                                     const struct ggml_tensor * w_down);
 
 void xdna_rec_gemv_free(xdna_rec_gemv * m);
 
