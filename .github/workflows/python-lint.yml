@@ -24,7 +24,13 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  authorize:
+    permissions: {}
+    uses: ./.github/workflows/reusable-authorize-self-hosted.yml
+
   flake8-lint:
+    needs: authorize
+    if: needs.authorize.outputs.allowed == 'true'
     runs-on: qvac-ubuntu2404-x64
     name: Lint
     steps:
