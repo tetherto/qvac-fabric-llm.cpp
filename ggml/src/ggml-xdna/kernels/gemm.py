@@ -1,8 +1,6 @@
 #!/usr/bin/env python3
 # gemm.py -*- Python -*-
 #
-# SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
-#
 # Minimal IRON design for the ggml-xdna GEMM kernel (C = A @ B, bf16 -> f32).
 #
 # Compile-only mode (builds .xclbin + .insts.bin artifacts):
@@ -45,17 +43,37 @@ from aie.utils.hostruntime.cli import run_design_cli
 import aie.iron.kernels as akernels
 
 
-# bf16 -> f32 only.
+# bf16 -> f32 and int8 -> int32 (native AIE2P int8 x int8 mmul).
 DTYPE_COMBOS = {
-    "bf16_f32": {"label": "bf16->f32"},
+    "bf16_f32":  {"label": "bf16->f32"},
+    "int8_int32": {"label": "int8->int32"},
 }
 
-# Micro-kernel MAC dimensions (r, s, t) for NPU2 native bf16.
-MICROKERNEL_MAC_DIM = (4, 8, 8)
+# Micro-kernel MAC dimensions (r, s, t) per input dtype on NPU2/AIE2P (the
+# aie_kernels/aie2p/mm.cc combo table): bf16 native r=4 (bfp16 emulation is
+# r=8), int8 native r=8. The mm.cc requires dim_m % (2*r) == 0, so tile_m must
+# be a multiple of 2*r (8 for bf16 native, 16 for bfp16/int8).
+MICROKERNEL_MAC_DIM = {
+    "bf16": (4, 8, 8),
+    "int8": (8, 8, 8),
+}
+
+
+import wfmt
+
+
+def _packed_split(tb: int) -> int:
+    """Number of equal runs a packed tile is split into so the innermost BD
+    dim stays inside the 10-bit d0 size field (1023 4-byte words)."""
+    g = 1
+    while tb // 4 // g > 1023:
+        g *= 2
+    return g
 
 
 def _validate(opts) -> None:
-    r, s, t = MICROKERNEL_MAC_DIM
+    dtype_in_str = opts.dtype.split("_")[0]
+    r, s, t = MICROKERNEL_MAC_DIM[dtype_in_str]
 
     if opts.M % (2 * r) != 0:
         raise SystemExit(f"-M ({opts.M}) must be a multiple of 2*r ({2 * r})")
@@ -89,7 +107,11 @@ def _validate(opts) -> None:
 
 
 def _compile_kwargs(opts) -> dict:
-    dtype_in_str, dtype_out_str = opts.dtype.split("_")  # "bf16_f32" -> "bf16", "f32"
+    # "bf16_f32" -> ("bf16", "f32"); "int8_int32" -> ("i8", "i32") in the
+    # str_to_dtype naming.
+    dtype_in_str, dtype_out_str = opts.dtype.split("_")
+    dtype_in_str = "i8" if dtype_in_str == "int8" else dtype_in_str
+    dtype_out_str = "i32" if dtype_out_str == "int32" else dtype_out_str
     return {
         "M":            opts.M,
         "K":            opts.K,
@@ -102,7 +124,9 @@ def _compile_kwargs(opts) -> dict:
         "dtype_in_str": dtype_in_str,
         "dtype_out_str": dtype_out_str,
         "dev_name":     opts.dev,
-        "emulate_bf16_mmul_with_bfp16": 0 if getattr(opts, "no_bfp16", False) else 1,
+        # bfp16 emulation is a bf16-only path (int8 uses the native int8 mmul).
+        "emulate_bf16_mmul_with_bfp16": 0 if dtype_in_str != "bf16" or getattr(opts, "no_bfp16", False) else 1,
+        "WFMT":         getattr(opts, "wfmt", "none") or "none",
         "trace_size":   getattr(opts, "trace_size", 0),
         "trace_rows":   tuple(getattr(opts, "trace_rows", None) or ()),
         "trace_cols":   tuple(getattr(opts, "trace_cols", None) or ()),
@@ -125,6 +149,7 @@ def bf16_f32_gemm(
     dtype_out_str:           CompileTime[str],
     dev_name:                CompileTime[str] = "npu2",
     emulate_bf16_mmul_with_bfp16: CompileTime[int] = 1,
+    WFMT:                    CompileTime[str] = "none",
     trace_size:              CompileTime[int] = 0,
     trace_rows:              CompileTime[tuple] = (),
     trace_cols:              CompileTime[tuple] = (),
@@ -151,6 +176,16 @@ def bf16_f32_gemm(
     n_c_col_tiles_per_core = N // mem_tile_n
     n_c_row_tiles_per_core = M // mem_tile_m_C
 
+    # Packed-weight route: B crosses DDR in one of the quantized formats
+    # (wfmt.py / xdna-quant.h) and every core expands its own tile into bf16
+    # before the mmul. The tiles are pre-ordered by the host, so the shim and
+    # the L2->L1 forward both move plain bytes.
+    packed = WFMT != "none"
+    if packed:
+        if dtype_in_str != "bf16":
+            raise AssertionError("packed weights expand to bf16; --dtype must be bf16_f32")
+        tile_b = wfmt.tile_bytes(WFMT, k, n)
+
     if dev_name == "npu1" and n_aie_cols > 4:
         raise AssertionError("Invalid configuration: NPU (Phoenix/Hawk) has 4 columns")
     if dev_name == "npu2" and n_aie_cols > 8:
@@ -169,6 +204,9 @@ def bf16_f32_gemm(
         emulate_bf16_mmul_with_bfp16=bool(emulate_bf16_mmul_with_bfp16),
     )
     r, s, t = _matmul_kernel.mac_dims
+    # The packed tile is stored in the mmul's own sub-tile order, so the
+    # expansion is built for this kernel's (s, t).
+    dequant_kernel = wfmt.dequant_fn(WFMT, k, n, s, t) if packed else None
 
     assert M % mem_tile_m_A == 0, "A must be tileable into (m * n_A_tiles_per_shim, k)-sized blocks"
     assert K % k == 0
@@ -186,18 +224,26 @@ def bf16_f32_gemm(
 
     # Tensor types
     A_ty = np.ndarray[(M * K,), np.dtype[dtype_in]]
-    B_ty = np.ndarray[(K * N,), np.dtype[dtype_in]]
+    B_ty = (np.ndarray[(K * N // (k * n) * tile_b,), np.dtype[np.uint8]]
+            if packed else np.ndarray[(K * N,), np.dtype[dtype_in]])
     C_ty = np.ndarray[(M * N,), np.dtype[dtype_out]]
     A_l2_ty = np.ndarray[(mem_tile_m_A * k,), np.dtype[dtype_in]]
-    B_l2_ty = np.ndarray[(k * n,), np.dtype[dtype_in]]
+    B_l2_ty = (np.ndarray[(tile_b,), np.dtype[np.uint8]]
+               if packed else np.ndarray[(k * n,), np.dtype[dtype_in]])
     C_l2_ty = np.ndarray[(mem_tile_m_C * n,), np.dtype[dtype_out]]
     A_l1_ty = np.ndarray[(m, k), np.dtype[dtype_in]]
+    B_l1_packed_ty = np.ndarray[(tile_b,), np.dtype[np.uint8]] if packed else None
+    # The expanded tile is flat: that is the mmul micro-kernel's B operand type.
+    B_deq_ty = np.ndarray[(k * n,), np.dtype[dtype_in]]
     B_l1_ty = np.ndarray[(k, n), np.dtype[dtype_in]]
     C_l1_ty = np.ndarray[(m, n), np.dtype[dtype_out]]
 
     zero_kernel = _matmul_kernel.zero
     matmul_kernel = _matmul_kernel
-    fifo_depth_out = fifo_depth
+    # A 128-row tile needs three L1 buffers of 32 KB for C alone at depth 2,
+    # which does not fit; one C object in flight is enough because the shim
+    # waits on its token before the next sweep reuses the descriptors.
+    fifo_depth_out = 1 if m >= 128 else fifo_depth
 
     # AIE tiles: rows 0-1 mem tiles, rows 2-5 compute cores.
     tiles = [[(col, row) for col in range(0, n_aie_cols)] for row in range(0, 6)]
@@ -246,17 +292,30 @@ def bf16_f32_gemm(
     # Input B: L3-L2, then forward to L2-L1 (row-major [k x n] tiles).
     for col in range(n_aie_cols):
         B_l3l2_fifos[col] = ObjectFifo(B_l2_ty, name=f"B_L3L2_{col}", depth=fifo_depth)
-        dims_to_stream = [(k // s, s * n), (n // t, t), (s, n), (t, 1)]
-        B_l2l1_fifos[col] = (
-            B_l3l2_fifos[col]
-            .cons()
-            .forward(
-                obj_type=B_l1_ty,
-                name=f"B_L2L1_{col}",
-                dims_to_stream=dims_to_stream,
-                tile=Tile(col, 1),
+        if packed:
+            # The host already stores each tile in the mmul's sub-tile order,
+            # so nothing is re-strided on the way in.
+            B_l2l1_fifos[col] = (
+                B_l3l2_fifos[col]
+                .cons()
+                .forward(
+                    obj_type=B_l1_packed_ty,
+                    name=f"B_L2L1_{col}",
+                    tile=Tile(col, 1),
+                )
             )
-        )
+        else:
+            dims_to_stream = [(k // s, s * n), (n // t, t), (s, n), (t, 1)]
+            B_l2l1_fifos[col] = (
+                B_l3l2_fifos[col]
+                .cons()
+                .forward(
+                    obj_type=B_l1_ty,
+                    name=f"B_L2L1_{col}",
+                    dims_to_stream=dims_to_stream,
+                    tile=Tile(col, 1),
+                )
+            )
 
         # Output C: L1-L2 (join along rows), then L2-L3 (row-major [m x n] tiles).
         dims_to_stream = [(m // r, r * n), (r, t), (n // t, r * t), (t, 1)]
@@ -303,6 +362,35 @@ def bf16_f32_gemm(
     ]
 
     # Tasks for each worker to perform
+    # One expanded B tile per core. Only the packed route needs it; the plain
+    # route hands the mmul the L1 tile directly.
+    b_scratch = [
+        [
+            Buffer(B_deq_ty, name=f"Bdq_{row}_{col}", tile=Tile(*core_tiles[row][col]))
+            if packed else None
+            for col in range(n_aie_cols)
+        ]
+        for row in range(n_aie_rows)
+    ]
+
+    def core_fn_packed(in_a, in_b, out_c, zero, matmul, dequant, bdq, rtp, barrier):
+        barrier.wait_for_value(1)
+        rtp_K_div_k = rtp[0]
+        rtp_n_tiles_per_core = rtp[1]
+        for _ in range_(rtp_n_tiles_per_core):
+            elem_out = out_c.acquire(1)
+            zero(elem_out)
+
+            for _ in range_(rtp_K_div_k):
+                elem_in_a = in_a.acquire(1)
+                elem_in_b = in_b.acquire(1)
+                dequant(elem_in_b, bdq)
+                matmul(elem_in_a, bdq, elem_out)
+                in_a.release(1)
+                in_b.release(1)
+
+            out_c.release(1)
+
     def core_fn(in_a, in_b, out_c, zero, matmul, rtp, barrier):
         barrier.wait_for_value(1)
         rtp_K_div_k = rtp[0]
@@ -321,24 +409,24 @@ def bf16_f32_gemm(
             out_c.release(1)
 
     # Set up compute tiles
-    workers = Worker.grid(
-        n_aie_rows,
-        n_aie_cols,
-        lambda row, col: Worker(
-            core_fn,
-            [
-                A_l2l1_fifos[row].cons(),
-                B_l2l1_fifos[col].cons(),
-                C_l1l2_fifos[row][col].prod(),
-                zero_kernel,
-                matmul_kernel,
-                rtps[row][col],
-                barriers[row][col],
-            ],
-            tile=Tile(*core_tiles[row][col]),
-            stack_size=0xD00,
-        ),
-    )
+    def _worker(row, col):
+        common = [
+            A_l2l1_fifos[row].cons(),
+            B_l2l1_fifos[col].cons(),
+            C_l1l2_fifos[row][col].prod(),
+            zero_kernel,
+            matmul_kernel,
+        ]
+        if packed:
+            args = common + [dequant_kernel, b_scratch[row][col],
+                             rtps[row][col], barriers[row][col]]
+            body = core_fn_packed
+        else:
+            args = common + [rtps[row][col], barriers[row][col]]
+            body = core_fn
+        return Worker(body, args, tile=Tile(*core_tiles[row][col]), stack_size=0xD00)
+
+    workers = Worker.grid(n_aie_rows, n_aie_cols, _worker)
 
     # Define tensor access patterns (tiling) for A, B, and C
     A_tiles = TensorTiler2D.group_tiler(
@@ -349,16 +437,34 @@ def bf16_f32_gemm(
         pattern_repeat=n_c_col_tiles_per_core,
         prune_step=False,
     )
-    B_tiles = TensorTiler2D.step_tiler(
-        (K, N),  # Size of B matrix
-        (k, n),  # Size of B tile
-        # Number of tiles per transfer in each dimension (whole col, partial row)
-        tile_group_repeats=(K_div_k, n_c_col_tiles_per_core),
-        # Contiguous tile group in col, but send every n_aie_cols-th tile in the row
-        tile_group_steps=(1, n_aie_cols),
-        tile_group_col_major=True,  # Send all tiles in column before moving on to next column
-        prune_step=False,
-    )
+    if packed:
+        # Packed B is a flat run of tiles ordered [column-tile][k-tile][aie-col],
+        # so a column reads one tile every n_aie_cols, K_div_k of them per
+        # column tile. The tile is split into _packed_split runs only to keep
+        # the innermost BD size inside its 10-bit field.
+        b_split = _packed_split(tile_b)
+        b_total = K * N // (k * n) * tile_b
+        B_tiles = [
+            TensorAccessPattern(
+                (1, b_total),
+                offset=col * tile_b,
+                sizes=[n_c_col_tiles_per_core, K_div_k, b_split, tile_b // b_split],
+                strides=[K_div_k * n_aie_cols * tile_b, n_aie_cols * tile_b,
+                         tile_b // b_split, 1],
+            )
+            for col in range(n_aie_cols)
+        ]
+    else:
+        B_tiles = TensorTiler2D.step_tiler(
+            (K, N),  # Size of B matrix
+            (k, n),  # Size of B tile
+            # Number of tiles per transfer in each dimension (whole col, partial row)
+            tile_group_repeats=(K_div_k, n_c_col_tiles_per_core),
+            # Contiguous tile group in col, but send every n_aie_cols-th tile in the row
+            tile_group_steps=(1, n_aie_cols),
+            tile_group_col_major=True,  # Send all tiles in column before moving on to next column
+            prune_step=False,
+        )
 
     # Shim-side fifo handles, registered with the Runtime so their shim
     # endpoints are bound before resolution.
@@ -546,6 +652,19 @@ def _run_gemm(design, opts) -> None:
     spec = design.specialize(**_compile_kwargs(opts))
     xclbin_path, insts_path = spec.compile(xclbin_path=xclbin_path, inst_path=insts_path)
 
+    # mac_dims depend on the target, so the packing must read them off the
+    # kernel the design just built rather than assume a constant.
+    def _mac_st():
+        import aie.iron.kernels as akernels
+        from aie.iron import str_to_dtype
+        kw = _compile_kwargs(opts)
+        km = akernels.mm(kw["m"], kw["k"], kw["n"],
+                         input_dtype=str_to_dtype(kw["dtype_in_str"]),
+                         output_dtype=str_to_dtype(kw["dtype_out_str"]),
+                         vectorized=True,
+                         emulate_bf16_mmul_with_bfp16=bool(kw["emulate_bf16_mmul_with_bfp16"]))
+        return km.mac_dims[1], km.mac_dims[2]
+
     physical_mlir = None
     try:
         kdir = spec.compilable._kernel_dir
@@ -575,9 +694,97 @@ def _run_gemm(design, opts) -> None:
     def alloc(nbytes):
         return xrt.bo(dev, nbytes, xrt.bo.host_only, 0)
 
+    # int8->int32 standalone verification: C = A_int8 @ B_int8 exact in int32.
+    # Host per-row/column scales are a backend-side concern; here A/B are raw
+    # int8 and the int32 accumulator is checked against the exact integer
+    # reference (zero padding on A and K-blocks keeps the comparison clean).
+    if opts.dtype == "int8_int32":
+        a_bos = [alloc(Mk * kernel_K) for _ in range(2)]
+        c_bos = [alloc(Mk * N * 4) for _ in range(2)]
+        b_bos = [alloc(kernel_K * N) for _ in range(n_k_blocks)]
+        rng = np.random.default_rng(7)
+        A = rng.integers(-64, 64, (host_M, host_K)).astype(np.int8)
+        B = rng.integers(-64, 64, (host_K, N)).astype(np.int8)
+        for kb in range(n_k_blocks):
+            k0 = kb * kernel_K
+            kc = min(kernel_K, host_K - k0)
+            blk = np.frombuffer(b_bos[kb].map(), dtype=np.int8).reshape(kernel_K, N)
+            blk.fill(0)
+            blk[0:kc, :] = B[k0:k0 + kc, :]
+            b_bos[kb].sync(to_dev)
+
+        def fill_a_i8(bo, mb, kb):
+            m0 = mb * Mk
+            mc = min(Mk, host_M - m0)
+            k0 = kb * kernel_K
+            kc = min(kernel_K, host_K - k0)
+            a = np.frombuffer(bo.map(), dtype=np.int8).reshape(Mk, kernel_K)
+            a.fill(0)
+            a[0:mc, 0:kc] = A[m0:m0 + mc, k0:k0 + kc]
+            bo.sync(to_dev)
+
+        c_host = np.zeros((n_m_blocks * Mk, N), dtype=np.int32)
+        bank = 0
+        pending = -1
+        pend_mb = 0
+        run_prev = None
+        for kb in range(n_k_blocks):
+            for mb in range(n_m_blocks):
+                fill_a_i8(a_bos[bank], mb, kb)
+                run = kernel(3, insts_bo, insts_bytes, a_bos[bank], b_bos[kb], c_bos[bank])
+                if pending >= 0:
+                    st = run_prev.wait()
+                    if st != xrt.ert_cmd_state.ERT_CMD_STATE_COMPLETED:
+                        sys.exit("int8 kernel wait state %s" % str(st))
+                    c_bos[pending].sync(from_dev)
+                    c_host[pend_mb * Mk:(pend_mb + 1) * Mk, :] += \
+                        np.frombuffer(c_bos[pending].map(), dtype=np.int32).copy().reshape(Mk, N)
+                run_prev = run
+                pend_mb = mb
+                pending = bank
+                bank = 1 - bank
+        if pending >= 0:
+            st = run_prev.wait()
+            if st != xrt.ert_cmd_state.ERT_CMD_STATE_COMPLETED:
+                sys.exit("int8 kernel wait state %s" % str(st))
+            c_bos[pending].sync(from_dev)
+            c_host[pend_mb * Mk:(pend_mb + 1) * Mk, :] += \
+                np.frombuffer(c_bos[pending].map(), dtype=np.int32).copy().reshape(Mk, N)
+
+        C_ref = (A.astype(np.int64) @ B.astype(np.int64)).astype(np.int32)
+        C = c_host[0:host_M, :]
+        err = int(np.max(np.abs(C.astype(np.int64) - C_ref.astype(np.int64))))
+        print("int8 verify : max abs err %d (want 0), M=%d K=%d N=%d" % (err, host_M, kernel_K, N))
+        print("RESULT: %s" % ("PASS" if err == 0 else "FAIL"))
+        if err != 0:
+            sys.exit(1)
+        for _ in range(max(opts.warmup, 0)):
+            r = kernel(3, insts_bo, insts_bytes, a_bos[0], b_bos[0], c_bos[0])
+            r.wait()
+        flops = 2.0 * host_M * kernel_K * N
+        times = []
+        for _ in range(max(opts.iters, 1)):
+            t0 = time.perf_counter()
+            r = kernel(3, insts_bo, insts_bytes, a_bos[0], b_bos[0], c_bos[0])
+            r.wait()
+            times.append(time.perf_counter() - t0)
+        wall = min(times) * 1000.0
+        print("int8 bench : min %.3f ms/iter -> %.1f GFLOP/s (host M=%d)" % (wall, flops / wall / 1e6, host_M))
+        return
+
+    wfmt_name = getattr(opts, "wfmt", "none") or "none"
+    b_packed = wfmt_name != "none"
+    tile_k, tile_n = opts.tile_k, opts.tile_n
+    b_tile_b = wfmt.tile_bytes(wfmt_name, tile_k, tile_n) if b_packed else 0
+    mac_s, mac_t = _mac_st() if b_packed else (0, 0)
+
     a_bos = [alloc(Mk * kernel_K * np.dtype(bfloat16).itemsize) for _ in range(2)]
     c_bos = [alloc(Mk * N * np.dtype(np.float32).itemsize) for _ in range(2)]
-    b_bos = [alloc(kernel_K * N * np.dtype(bfloat16).itemsize) for _ in range(n_k_blocks)]
+    if b_packed:
+        b_bos = [alloc(kernel_K * N // (tile_k * tile_n) * b_tile_b)
+                 for _ in range(n_k_blocks)]
+    else:
+        b_bos = [alloc(kernel_K * N * np.dtype(bfloat16).itemsize) for _ in range(n_k_blocks)]
 
     trace_bo = None
     if opts.trace_size > 0:
@@ -588,15 +795,55 @@ def _run_gemm(design, opts) -> None:
     # --- data ---------------------------------------------------------------
     rng = np.random.default_rng(7)
     A = rng.standard_normal((host_M, host_K)).astype(np.float32).astype(bfloat16)
-    B = rng.standard_normal((host_K, N)).astype(np.float32).astype(bfloat16)
 
-    for kb in range(n_k_blocks):
-        k0 = kb * kernel_K
-        kc = min(kernel_K, host_K - k0)
-        blk = np.frombuffer(b_bos[kb].map(), dtype=bfloat16).reshape(kernel_K, N)
-        blk.fill(bfloat16(0))
-        blk[0:kc, :] = B[k0:k0 + kc, :]
-        b_bos[kb].sync(to_dev)
+    if b_packed:
+        # B is drawn directly in the packed format, so the reference is the
+        # weights the NPU will actually see after expansion. Tiles are laid out
+        # [column-tile][k-tile][aie-col], the order the column streams read.
+        grp = wfmt.group_size(wfmt_name)
+        ng = host_K // grp
+        lo, hi = (0, 16) if wfmt_name == "q4g32" else (-32, 32)
+        codes = rng.integers(lo, hi, size=(host_K, N)).astype(np.int32)
+        d = (rng.standard_normal((ng, N)) * 0.02).astype(np.float32)
+        m = ((rng.standard_normal((ng, N)) * 0.05).astype(np.float32)
+             if wfmt_name == "q4g32" else None)
+
+        gidx = np.arange(host_K) // grp
+        B_eff = codes.astype(np.float32) * d[gidx]
+        if m is not None:
+            B_eff = B_eff + m[gidx]
+        B = B_eff.astype(bfloat16)
+
+        n_col_tiles = N // (tile_n * opts.n_aie_cols)
+        for kb in range(n_k_blocks):
+            k0 = kb * kernel_K
+            blk = np.frombuffer(b_bos[kb].map(), dtype=np.uint8)
+            blk.fill(0)
+            for ct in range(n_col_tiles):
+                for kt in range(kernel_K // tile_k):
+                    for col in range(opts.n_aie_cols):
+                        ka = k0 + kt * tile_k
+                        na = (ct * opts.n_aie_cols + col) * tile_n
+                        if ka >= host_K:
+                            continue
+                        c_t = codes[ka:ka + tile_k, na:na + tile_n]
+                        g0 = ka // grp
+                        d_t = d[g0:g0 + tile_k // grp, na:na + tile_n]
+                        m_t = None if m is None else m[g0:g0 + tile_k // grp, na:na + tile_n]
+                        off = ((ct * (kernel_K // tile_k) + kt) * opts.n_aie_cols + col) * b_tile_b
+                        blk[off:off + b_tile_b] = wfmt.pack_tile(wfmt_name, c_t, d_t, m_t,
+                                                                 mac_s, mac_t)
+            b_bos[kb].sync(to_dev)
+    else:
+        B = rng.standard_normal((host_K, N)).astype(np.float32).astype(bfloat16)
+
+        for kb in range(n_k_blocks):
+            k0 = kb * kernel_K
+            kc = min(kernel_K, host_K - k0)
+            blk = np.frombuffer(b_bos[kb].map(), dtype=bfloat16).reshape(kernel_K, N)
+            blk.fill(bfloat16(0))
+            blk[0:kc, :] = B[k0:k0 + kc, :]
+            b_bos[kb].sync(to_dev)
 
     def fill_a(bo, mb, kb):
         m0 = mb * Mk
@@ -809,6 +1056,9 @@ def main() -> None:
                         help="Per-core K tile (default: 64; larger = fewer C reloads)")
     # bfp16 emulation uses the r=8 mmul (2x throughput, tile_m % 16 == 0);
     # --no-bfp16 builds the native bf16 r=4 kernel (tile_m 8) for decode.
+    parser.add_argument("--wfmt", choices=("none",) + wfmt.FORMATS, default="none",
+                        help="stream B in a packed weight format and expand it "
+                             "on the cores (see wfmt.py); bf16 mmul only")
     parser.add_argument("--no-bfp16", action="store_true", dest="no_bfp16",
                         help="Use the native bf16 r=4 mmul (tile-m 8, M 32)")
     parser.add_argument("--tile-n", type=int, default=64, dest="tile_n",

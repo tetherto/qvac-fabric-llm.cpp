@@ -87,6 +87,25 @@ enum class xdna_dma_dir : uint32_t {
 
 // Shim DMA buffer descriptor (the payload of a BLOCKWRITE). Strides and sizes
 // are given as real element/byte counts; the emitter encodes (value - 1).
+// A shim buffer descriptor. The address-generation fields describe a strided
+// walk: d0 is the innermost run, d1 repeats it, d2 repeats that, and `iter`
+// repeats the whole thing. Every size is a count of 32-bit words and every
+// stride is in words too; the writer stores each stride as stride-1, so pass
+// the stride itself. A size of 0 means "do not wrap", which is what a plain
+// linear transfer wants - a size of 1 wraps the descriptor after a single
+// word.
+//
+// The encoding is IRON's own, read back from an artifact it built for a known
+// two-dimensional access pattern rather than guessed: for a TensorAccessPattern
+// of sizes [4, 128] and strides [1024, 1] over f32 it emits
+//
+//   buf_len 512   d0 size 128 stride 1   d1 size 4 stride 1024
+//
+// so a two-dimensional drain of `reps` runs of `run` words, `stride` words
+// apart, is buf_len = run*reps, d0_size = run, d0_stride = 1, d1_size = reps,
+// d1_stride = stride. Anything unsure here is worth checking the same way:
+// build the pattern in IRON, disassemble the .insts.bin it ships beside the
+// xclbin (kernels/shim_map.py has the plumbing) and read the words.
 struct xdna_bd {
     uint32_t buf_len   = 0;   // total transfer length in bytes
     uint32_t buf_off   = 0;   // byte offset into the host buffer
@@ -115,6 +134,10 @@ struct xdna_seq {
     uint32_t mem_tile_rows = 1;
     std::vector<uint32_t> ops;
     uint32_t n_instr = 0;
+    // Highest descriptor id + 1 written on each column's shim, so a stream
+    // appended to this one can start where it left off. Reprogramming a
+    // descriptor whose transfer has not drained loses it silently.
+    uint32_t bd_used[8] = {};
 };
 
 // 32-bit register write (also used for RTP values and DMA push-queue).
@@ -160,14 +183,25 @@ std::vector<uint32_t> xdna_seq_build(const xdna_seq * seq);
 #define GGML_XDNA_GEMM_M_BIG 64
 #endif
 #ifndef GGML_XDNA_TILE_M_BIG
-#define GGML_XDNA_TILE_M_BIG 16
+#define GGML_XDNA_TILE_M_BIG 32
+#endif
+#ifndef GGML_XDNA_TILE_M_BIG_I8
+#define GGML_XDNA_TILE_M_BIG_I8 64
 #endif
 
-// Per-tile RTP buffer base in the core tile (input_with_addresses.mlir);
-// it shifts with the L1 buffer sizes: 0xc800 for tile_m=8 (decode, r=4),
-// 0xd000 for tile_m=16 (prefill, bfp16 r=8).
-constexpr int XDNA_RTP_BASE_TILE_M8  = 0xc800;
-constexpr int XDNA_RTP_BASE_TILE_M16 = 0xd000;
+// Per-tile RTP buffer base in the core tile, read back from the compiled
+// input_with_addresses.mlir (the rtp buffer's address; the insts header carries
+// it as 0x200000 + this). 0x8800 for tile_m=8 (decode, native r=4) and 0x2d00
+// for both prefill tiles: with mlir-aie 1.4.3 the allocator drops the prefill
+// rtp right after the first B_L2L1 object, so tile_m 32 (bf16) and 64 (int8)
+// share the offset even though their A/B/C buffers differ. The base moves with
+// the toolchain's placement, not with the geometry - an earlier 1.4.2 build put
+// them at 0xa000 and 0xe000 - so a toolchain change means re-reading this value
+// from a freshly compiled .prj, not guessing it.
+constexpr int XDNA_RTP_BASE_TILE_M8  = 0x8800;
+constexpr int XDNA_RTP_BASE_TILE_M16 = 0x9000;
+constexpr int XDNA_RTP_BASE_TILE_M32 = 0x2d00;
+constexpr int XDNA_RTP_BASE_TILE_M64 = 0x2d00;
 #ifndef GGML_XDNA_TILE_K
 #define GGML_XDNA_TILE_K 64
 #endif
@@ -190,6 +224,10 @@ struct xdna_gemm_tiles {
     int n_compute_rows = GGML_XDNA_N_COMPUTE_ROWS;  // compute tile rows
     // Per-tile RTP buffer base in the core tile (XDNA_RTP_BASE_TILE_M*).
     int rtp_base = XDNA_RTP_BASE_TILE_M8;
+    // A/B element size in bytes: 2 = bf16, 1 = int8 (int8 x int8 -> int32).
+    // C is always 4 bytes (f32 or raw int32); the stream BD lengths/offsets
+    // scale with eb.
+    int elem_bytes = 2;
 };
 
 // True when the dims fit the baked geometry: M <= M block, K multiple of
@@ -203,3 +241,123 @@ bool xdna_gemm_seq_supported(const xdna_gemm_tiles * tiles, int M, int K, int N)
 // persistent full-weight buffer.
 bool xdna_gemm_seq_build(xdna_seq * seq, const xdna_gemm_tiles * tiles, int M, int K, int N,
                          uint32_t b_offset = 0);
+
+// Fixed geometry of one CS=64-token GDN prefill chunk (S=128, H=16, see
+// kernels/gdn-prefill.py). Byte/word counts per shim column of the three
+// host BOs: arg 0 = tok [H][CS][3*S+2] bf16, arg 1 = packed state|attn
+// [H][NS][ROWS*S + CS*ROWS] bf16, arg 2 = same packed buffer (in place).
+struct xdna_gdn_prefill_geom {
+    int n_cols = 8;             // shim columns (H/2)
+    int state_col_bytes = 98304;  // packed column, bytes (= 4 workers x PACKED_N x 2)
+    int state_col_words = 24576;  // packed column in 4-byte words
+    int tok_col_bytes  = 98816;   // tok column, bytes (= 2 heads x CS x (3*S+2) x 2)
+    int tok_col_words  = 24704;
+};
+
+// Build the TXN stream for one CS=64-token chunk of the GDN prefill kernel:
+// state seed (8 columns, arg 1), then per column the tok fill (arg 0) and the
+// packed drain (arg 2); the last column's drain stamps the completion token the
+// host waits. The stream is bound once and reused for every chained chunk - the
+// state seed re-copies the in-place packed BO, so the updated device state
+// flows into the next chunk.
+bool xdna_gdn_prefill_seq_build(xdna_seq * seq, const xdna_gdn_prefill_geom * g);
+
+// Geometry of the merged conv+norm+gdn decode kernel (attn_gdn_txn.xclbin,
+// kernels/attn_gdn_txn.py). The worker layout is the rec_full design: conv on
+// cols 0..conv_cols-1, norm on the next norm_cols, bf16-vector gdn on the last
+// gdn_cols. The defaults match one 1024-wide Qwen3.5 gated-delta-net layer
+// (kernels/attn_gdn_txn.py resolve()); a default-constructed geometry is valid.
+struct xdna_attn_gdn_geom {
+    int feed_n    = 1024;   // floats per conv feed block
+    // Floats of a slot the conv object carries; see CONV_SLOT in
+    // kernels/attn_gdn_gated.py. Less than feed_n leaves the conv weights out
+    // of the stream and the stage's output wrong - a diagnostic only.
+    int feed_slot = 1024;
+    int sv        = 128;    // conv group / head slice width
+    int head_norm = 387;    // floats per head in the X BO (q|k|v|eg|b|scale)
+    int pkv_n     = 387;    // floats per pkv chunk object
+    int pkvb_n    = 3096;   // floats per head pkvb (n_obj * pkv_n)
+    int n_block   = 48;     // conv feed blocks (groups)
+    // Feed groups one conv object carries. gdn's 16 KB objects move at the
+    // shim's full rate where conv's 4 KB ones manage a fifth of it, and the
+    // stage has no arithmetic in it, so this is what its time is made of.
+    int conv_gpo  = 4;
+    // Where the conv stage's two drains meet the shim, per conv column. A
+    // shim tile has one port for all of its channels, so the feed streaming in
+    // and the x and history writes going out must not share a column - it is
+    // the one thing that told this stage apart from the gdn block, which does
+    // reach the tile's rate. Read back from the artifact with
+    // kernels/shim_map.py; the design pins them (kernels/attn_gdn_gated.py).
+    // Defaults are the conv columns themselves; CONV_SPREAD=1 in the design
+    // moves them to { {5,1}, {4,0} } for x and { {5,0}, {7,1} } for the
+    // history, which measures the same.
+    int conv_x_col[2] = { 0, 1 };
+    int conv_x_ch [2] = { 1, 1 };
+    int conv_h_col[2] = { 0, 1 };
+    int conv_h_ch [2] = { 0, 0 };
+    int conv_cols = 2;      // conv columns (cols 0-1)
+    int norm_cols = 2;      // norm columns (cols 2-3)
+    int gdn_cols  = 4;      // gdn columns (cols 4-7)
+    int n_vh      = 16;     // value heads
+    int n_obj     = 8;      // pkv chunks per head
+    // Shim streams the gdn state is split across, in each direction. The
+    // block's cost is that stream: 512 KB in and 512 KB out a layer, which one
+    // channel moves in 119 us with the arithmetic hidden underneath.
+    int gdn_state_streams = 1;
+    // The norm stage hands its chunks to the gdn cores through a MemTile
+    // instead of writing them to DDR for the gdn fill to read back (PKV_ONCHIP
+    // in kernels/attn_gdn_gated.py). With it the stage has no drain and the
+    // block no pkv fill, and the two stop being separate phases.
+    int pkv_onchip = 1;
+    // The gdn block's attn reaches the gated tile over the array rather than
+    // through DDR (GATED_ATTN_ONCHIP in attn_gdn_gated.py). The per-round
+    // attn drain goes away and the gated fill moves ahead of the gdn rounds,
+    // because the tile now consumes a head while the block is still running.
+    int attn_onchip = 1;
+    // Bytes of the ssm_out activation the gated stage produces. Non-zero means
+    // the design gives it a fifo of its own (GATED_ACT_SPLIT in
+    // attn_gdn_gated.py), so the stream drains it with a plainly patched
+    // descriptor on its own column - which is what a projection appended to
+    // this stream needs in order to read it back. The gated output's own drain
+    // cannot be that: it wants the bit31 patch form, and that form wants
+    // offset zero.
+    //
+    // Splitting the *drain* instead - two descriptors over the one object -
+    // does not work at all; one object cannot be drained by two descriptors,
+    // and the stream times out with or without anything appended.
+    int gated_act_bytes = 0;
+    int gated_act_col   = 7;   // its shim column (S2MM channel 0)
+    int gated_act_arg   = 5;   // the argument it drains into
+    int gated_act_off   = 0;   // and the byte offset in it
+    int rows      = 2048;   // bf16 state rows per chunk object
+    int chunk     = 16;     // state rows per chunk
+    int n_cols    = 8;      // shim columns
+    // A-half fused epilogue (attn_gdn_gated.xclbin, kernels/attn_gdn_gated.py):
+    // when azg_n > 0 the arg4 BO is the azg head buffer (per head
+    // [attn|z|gamma|hh], 3*sv+1 floats), gdn attn drains use the azg head
+    // stride and a gated phase is appended (azg fill on the first norm column's
+    // MM2S ch1, out drain on its S2MM ch1). 0 keeps the legacy attn layout.
+    int azg_n     = 0;      // floats per azg head (0 = legacy attn BO)
+    int out_words = 0;      // gated out object words (10244 B / 4)
+    // Byte offset the gated output is drained to inside its argument. Zero
+    // needs the bit31 patch form the compiled IRON stream uses; a non-zero one
+    // is patched plainly, the way every other drain in this stream is - and
+    // those are the ones another stage reads back reliably in the same
+    // dispatch (the conv drains write x and the norm fills read it).
+    int out_base = 0;
+};
+
+// Hand-built per-token TXN stream for the merged conv+norm+gdn recurrent-core
+// xclbin (attn_gdn_txn.xclbin, or attn_gdn_gated.xclbin when azg_n is set).
+// One host-built stream per token runs the phases in time (conv -> norm -> gdn
+// [- > gated]) with BD/channel reuse in ONE xrt run.  Run BO args (same as the
+// rec_full/attn_cn/gdn layouts): arg0 feed (n_block x feed_n f32), arg1 x
+// (n_vh x head_norm f32 tails + q/k/v slices), arg2 pkvb (n_vh x pkvb_n f32
+// norm output), arg3 state (n_vh x n_obj x rows bf16, in place), arg4 attn
+// (n_vh x sv f32 readback) or azg (n_vh x azg_n f32 when fused) and, in the
+// fused layout only, arg5 out (gated scratch + aq + d_a). `schedule`: 0 = IRON
+// column-major per phase; 1 = slot-major; 2 = phased (groups of 2); 4 =
+// BD-bank pipelining. The stream is bound once at load and replayed every token
+// (BO contents change, offsets do not).
+bool xdna_attn_gdn_txn_build(xdna_seq * seq, const xdna_attn_gdn_geom * g,
+                             int schedule, int phase = -1);

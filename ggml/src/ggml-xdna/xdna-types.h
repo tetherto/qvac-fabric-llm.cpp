@@ -31,6 +31,7 @@ struct xdna_kernel {
     xrt::kernel                      kernel;
     xrt::bo                          insts_bo;
     int64_t                          insts_bytes = 0;
+    std::string                      xclbin_name;   // for run tracing
 };
 
 // A host-visible device buffer object (BO).

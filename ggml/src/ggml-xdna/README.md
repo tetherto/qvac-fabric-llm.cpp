@@ -18,9 +18,14 @@ scaffold: only `MUL_MAT` is implemented, everything else stays on the CPU.
 - `K` is any multiple of `tile_k` (64), and a multiple of 256 for `Q4_K`;
   wide-K ops are split into blocks.
 
-Both prefill and decode are covered. Prefill tiles the M dimension into
-32-row blocks; decode runs as `M = 1`. The final vocab projection is the only
-model GEMM that does not go to the NPU.
+Both prefill and decode are covered. Prefill bakes M blocks of 256, 512 and
+2048 rows; the per-core M tile is the weight-reuse factor, because one B sweep
+feeds `tile_m * n_compute_rows` rows. The int8 route therefore uses a 64-row
+tile (256 rows per sweep, four times less DDR weight traffic than the 16-row
+tile it replaced) and the bf16 route a 32-row tile, which is as far as its
+double-width banks plus the f32 C tile fit in the 64 KB core L1. Decode runs
+as `M = 1`. The final vocab projection is the only model GEMM that does not go
+to the NPU.
 
 ### Hardware constraints
 
@@ -67,12 +72,16 @@ cmake --build build -j$(nproc) --target llama-completion llama-server ggml-xdna-
   the `XDNA_*` variables in this directory's CMakeLists, which are also passed
   to the C++ code as `GGML_XDNA_*` compile definitions (xdna-seq.h).
 
-The kernel artifacts (`gemm_bf16_f32_M32_K1024_N2048_c8.xclbin` and
-`gemm_bf16_f32_M64_K1024_N2048_c8.xclbin`, plus `.insts.bin`) land in the
-build output directory (`build/bin`). At
-runtime they are looked up in the backend install dir, the executable dir and
-the working directory. The `.insts.bin` files are reference copies of the
-compiled DMA sequences; the runtime builds its own instruction streams.
+The kernel artifacts (`gemm_bf16_f32_M{32,256,512,2048}_K1024_N2048_c8.xclbin`
+and `gemm_int8_int32_M{256,512,2048}_K1024_N2048_c8.xclbin`, plus `.insts.bin`)
+land in the build output directory (`build/bin`). The `bf16_f32` M32 artifact
+is the decode geometry; every other M block is a prefill geometry. At runtime
+they are looked up in the backend install dir, the executable dir and the
+working directory. The `.insts.bin` files are reference copies of the compiled
+DMA sequences; the runtime builds its own instruction streams. Changing the
+tile geometry (the `XDNA_TILE_M*` values in this directory's CMakeLists)
+invalidates every prefill artifact, so rebuild both sides together with
+`cmake --build build --target ggml-xdna-kernels`.
 
 ## Running
 
@@ -98,6 +107,9 @@ OMP_WAIT_POLICY=PASSIVE ./build/bin/llama-completion -m model.gguf \
   NPU.
 - `GGML_XDNA_PROFILING=1` prints a per-`MUL_MAT` timing breakdown and a
   `FINALIZE` summary to stderr.
+- `GGML_XDNA_GLUE_THREADS` and `GGML_XDNA_GLUE_THREADS_BIG` size the
+  host-fallback pool used inside an NPU chunk: the small pool (default 4) for
+  decode, the big one (default 16) for a prompt chunk.
 
 Server flags used for the numbers in "Performance expectations":
 
