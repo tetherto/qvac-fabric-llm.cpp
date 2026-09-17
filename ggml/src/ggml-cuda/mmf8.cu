@@ -493,7 +493,7 @@ static void mul_mat_f8_e4m3_cutlass(
 int ggml_cuda_mmf8_gemv_max_ncols() {
     static const int v = []() {
         const char * s = getenv("GGML_CUDA_MMF8_GEMV_MAX");
-        const int    n = s ? atoi(s) : MMF8_GEMV_MAX_NCOLS;
+        const int    n = s ? atoi(s) : GGML_CUDA_MMF8_GEMV_MAX_DEFAULT;
         return n < 1 ? 1 : (n > MMF8_GEMV_MAX_NCOLS ? MMF8_GEMV_MAX_NCOLS : n);
     }();
     return v;

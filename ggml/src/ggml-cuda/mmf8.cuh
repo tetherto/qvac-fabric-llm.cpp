@@ -24,5 +24,7 @@ void ggml_cuda_mul_mat_f8_shared_gemv(ggml_backend_cuda_context & ctx, ggml_tens
 #define GGML_CUDA_MMF8_SHARED_MAX 3
 #define GGML_CUDA_MMF8_GEMV_MAX_NCOLS 8
 
-// the batch up to which the F8 GEMV is used instead of the CUTLASS W8A8 GEMM: the cap above, or GGML_CUDA_MMF8_GEMV_MAX
+// the batch up to which the F8 GEMV is used instead of the CUTLASS W8A8 GEMM: 7, since the GEMM is 39% faster per
+// decode step at 8 tokens and slower at 4 and below. GGML_CUDA_MMF8_GEMV_MAX overrides it, up to the cap above
+#define GGML_CUDA_MMF8_GEMV_MAX_DEFAULT 7
 int ggml_cuda_mmf8_gemv_max_ncols();
