@@ -26,7 +26,7 @@ bool ggml_cuda_repacked_mul_mat_supported(
         ggml_nelements(dst) == n_rows * src0->ne[1];
 }
 
-#ifdef GGML_CUDA_CUTLASS
+#ifdef GGML_CUDA_CUTLASS_BLOCKSCALED
 
 #    include <cuda_fp8.h>
 

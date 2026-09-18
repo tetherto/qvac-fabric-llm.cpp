@@ -460,6 +460,10 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
 
     const int64_t n_seqs = ubatch.n_seqs;
 
+    // the projection is an input of this function: adding it to the graph first keeps the state gather, the concat
+    // and the state write-back below as one run of consecutive nodes (a backend fuses them as a unit)
+    ggml_build_forward_expand(gf, qkv_mixed);
+
     ggml_tensor * conv_states = build_rs(inp, conv_states_all, hparams.n_embd_r(), n_seqs);
     cb(conv_states, "conv_states", il);
 

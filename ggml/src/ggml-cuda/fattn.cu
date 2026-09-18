@@ -1,9 +1,14 @@
 #include "common.cuh"
+#include "convert.cuh"
+#include "cpy.cuh"
 #include "fattn-common.cuh"
 #include "fattn-mma-f16.cuh"
 #include "fattn-tile.cuh"
 #include "fattn-vec.cuh"
 #include "fattn.cuh"
+#ifdef GGML_CUDA_CUTLASS
+#include "fattn-cutlass.cuh"
+#endif // GGML_CUDA_CUTLASS
 
 template <int DKQ, int DV, int ncols2>
 static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
@@ -373,9 +378,13 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     float max_bias = 0.0f;
     memcpy(&max_bias, (const float *) KQV->op_params + 1, sizeof(float));
 
+    // The implicit causal mask (n_kv_used set, no mask tensor) is materialized on device as a contiguous
+    // [n_kv, n_q] f16 mask before the kernels run, so it counts as a mask here.
+    const bool has_mask = mask != nullptr || ggml_flash_attn_ext_get_kv_used(dst) > 0;
+
     // The effective batch size for the kernel can be increased by gqa_ratio.
     // The kernel versions without this optimization are also used for ALiBi, if there is no mask, or if the KV cache is not padded,
-    bool gqa_opt_applies = gqa_ratio >= 2 && mask && max_bias == 0.0f && K->ne[1] % FATTN_KQ_STRIDE == 0;
+    bool gqa_opt_applies = gqa_ratio >= 2 && has_mask && max_bias == 0.0f && K->ne[1] % FATTN_KQ_STRIDE == 0;
     for (const ggml_tensor * t : {Q, K, V, mask}) {
         if (t == nullptr || ggml_is_quantized(t->type)) {
             continue;
@@ -567,8 +576,18 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
     return f16_extra.end - (uintptr_t) dst->data;
 }
 
-void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
-    ggml_cuda_set_device(ctx.device);
+// implicit causal mask materialized as the [n_kv, n_q] f16 mask the kernels expect: row i keeps cells
+// c < n_kv_used && c <= i + (n_kv_used - n_q), everything else is -inf
+static __global__ void fattn_causal_mask_f16(half * __restrict__ mask, const int n_kv, const int n_q, const int n_kv_used) {
+    const int i = blockIdx.x;
+    const int c_max = i + (n_kv_used - n_q); // inclusive
+    half * row = mask + (size_t) i * n_kv;
+    for (int c = threadIdx.x; c < n_kv; c += blockDim.x) {
+        row[c] = c <= c_max ? __float2half(0.0f) : __float2half(-INFINITY);
+    }
+}
+
+static void ggml_cuda_flash_attn_ext_dispatch(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     switch (ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst)) {
         case BEST_FATTN_KERNEL_NONE:
             GGML_ABORT("fatal error");
@@ -582,6 +601,167 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
             ggml_cuda_flash_attn_ext_mma_f16(ctx, dst);
             break;
     }
+}
+
+#ifdef GGML_CUDA_CUTLASS
+// Hopper FMHA (CUTLASS example 88): f16 K/V, head dim 256, no sinks/ALiBi/softcap, softmax scale 1/sqrt(D)
+// (fixed inside the kernel), prefill-sized query batches, Q the usual permuted view of a contiguous
+// [D, n_head, n_q] buffer, dst contiguous.
+static bool ggml_cuda_fattn_cutlass_supported(const ggml_tensor * dst, const int n_kv_used) {
+    const ggml_tensor * Q = dst->src[0];
+    const ggml_tensor * K = dst->src[1];
+    const ggml_tensor * V = dst->src[2];
+
+    static const bool disabled = getenv("GGML_CUDA_DISABLE_FATTN_CUTLASS") != nullptr;
+    if (disabled || dst->src[4] != nullptr) {
+        return false;
+    }
+    if (ggml_cuda_info().devices[ggml_cuda_get_device()].cc != GGML_CUDA_CC_HOPPER) {
+        return false;
+    }
+    float scale, max_bias, logit_softcap;
+    memcpy(&scale,         (const float *) dst->op_params + 0, sizeof(float));
+    memcpy(&max_bias,      (const float *) dst->op_params + 1, sizeof(float));
+    memcpy(&logit_softcap, (const float *) dst->op_params + 2, sizeof(float));
+    if (max_bias != 0.0f || logit_softcap != 0.0f || fabsf(scale - 1.0f/sqrtf((float) GGML_FATTN_CUTLASS_D)) > 1e-6f) {
+        return false;
+    }
+    const int D = GGML_FATTN_CUTLASS_D;
+    if (Q->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
+        return false;
+    }
+    for (const ggml_tensor * t : {K, V}) {
+        if (t->type != GGML_TYPE_F16 && t->type != GGML_TYPE_F32) {
+            return false;
+        }
+    }
+    if (Q->ne[0] != D || K->ne[0] != D || V->ne[0] != D || Q->ne[3] != 1 || K->ne[3] != 1 || V->ne[3] != 1) {
+        return false;
+    }
+    const int64_t n_q = Q->ne[1];
+    if (n_q < 256 || Q->ne[2] % K->ne[2] != 0 || V->ne[2] != K->ne[2] || V->ne[1] != K->ne[1]) {
+        return false;
+    }
+    // the kernel needs a multiple of 8 queries: the batch is padded with phantom queries that attend the same number
+    // of phantom cells past n_kv_used (their rows are discarded), which must exist in the K/V views
+    const int64_t pad = (8 - n_q % 8) % 8;
+    if (n_kv_used < n_q || n_kv_used + pad > K->ne[1]) {
+        return false;
+    }
+    if (Q->nb[0] != sizeof(float) || Q->nb[2] != (size_t) D*sizeof(float) || Q->nb[1] != (size_t) Q->ne[2]*D*sizeof(float)) {
+        return false;
+    }
+    for (const ggml_tensor * t : {K, V}) {
+        if (t->nb[0] != ggml_type_size(t->type) || t->nb[1] % 16 != 0 || t->nb[2] % 16 != 0 || t->nb[1] > INT32_MAX || t->nb[2] > INT32_MAX) {
+            return false;
+        }
+    }
+    return ggml_is_contiguous(dst);
+}
+
+static void ggml_cuda_flash_attn_ext_cutlass_run(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const int n_kv_used) {
+    const ggml_tensor * Q = dst->src[0];
+    const ggml_tensor * K = dst->src[1];
+    const ggml_tensor * V = dst->src[2];
+
+    const int D         = GGML_FATTN_CUTLASS_D;
+    const int n_q       = Q->ne[1];
+    const int n_head    = Q->ne[2];
+    const int n_head_kv = K->ne[2];
+    const int gqa       = n_head / n_head_kv;
+    const int pad       = (8 - n_q % 8) % 8; // phantom queries, see ggml_cuda_fattn_cutlass_supported
+    const int n_q8      = n_q + pad;
+    const int n_kv8     = n_kv_used + pad;
+    const int64_t n_qh  = (int64_t) n_q  * n_head * D;
+    const int64_t n_qh8 = (int64_t) n_q8 * n_head * D;
+
+    cudaStream_t stream = ctx.stream();
+
+    ggml_cuda_pool_alloc<half>  q16(ctx.pool(), n_qh8);
+    ggml_cuda_pool_alloc<half>  o16(ctx.pool(), n_qh8);
+    ggml_cuda_pool_alloc<float> lse(ctx.pool(), (int64_t) n_q8 * n_head);
+
+    // the permuted Q view covers one contiguous [D, n_head, n_q] buffer; phantom rows are zero
+    const to_fp16_cuda_t to_fp16 = ggml_get_to_fp16_cuda(GGML_TYPE_F32);
+    to_fp16(Q->data, q16.get(), n_qh, stream);
+    if (pad > 0) {
+        CUDA_CHECK(cudaMemsetAsync(q16.get() + n_qh, 0, (n_qh8 - n_qh)*sizeof(half), stream));
+    }
+
+    const size_t ws_size = ggml_cuda_fattn_cutlass_workspace_size(n_head_kv, gqa, n_q8, n_kv8);
+    ggml_cuda_pool_alloc<uint8_t> ws(ctx.pool(), ws_size > 0 ? ws_size : 1);
+
+    // F32 K/V (no KV cache): the cells [0, n_kv8) are converted to a contiguous f16 [D, n_kv8, n_head_kv] buffer
+    ggml_cuda_pool_alloc<half> k16(ctx.pool());
+    ggml_cuda_pool_alloc<half> v16(ctx.pool());
+    const half * k_data = (const half *) K->data;
+    const half * v_data = (const half *) V->data;
+    int64_t k_nb1 = K->nb[1]/sizeof(half), k_nb2 = K->nb[2]/sizeof(half);
+    int64_t v_nb1 = V->nb[1]/sizeof(half), v_nb2 = V->nb[2]/sizeof(half);
+    auto convert_kv = [&](const ggml_tensor * t, ggml_cuda_pool_alloc<half> & buf, const half *& data, int64_t & nb1, int64_t & nb2) {
+        if (t->type == GGML_TYPE_F16) {
+            return;
+        }
+        buf.alloc((int64_t) D * n_kv8 * n_head_kv);
+        ggml_tensor src = *t;
+        src.ne[1] = n_kv8;
+        ggml_tensor dst16 = {};
+        dst16.type  = GGML_TYPE_F16;
+        dst16.ne[0] = D; dst16.ne[1] = n_kv8; dst16.ne[2] = n_head_kv; dst16.ne[3] = 1;
+        dst16.nb[0] = sizeof(half); dst16.nb[1] = D*sizeof(half); dst16.nb[2] = dst16.nb[1]*n_kv8; dst16.nb[3] = dst16.nb[2];
+        dst16.data  = buf.get();
+        ggml_cuda_cpy(ctx, &src, &dst16);
+        data = buf.get();
+        nb1  = D;
+        nb2  = (int64_t) D * n_kv8;
+    };
+    convert_kv(K, k16, k_data, k_nb1, k_nb2);
+    convert_kv(V, v16, v_data, v_nb1, v_nb2);
+
+    ggml_cuda_fattn_cutlass(q16.get(), k_data, v_data, o16.get(), lse.get(),
+        n_head_kv, gqa, n_q8, n_kv8, k_nb1, k_nb2, v_nb1, v_nb2,
+        ws.get(), ws_size, stream);
+
+    const to_fp32_cuda_t to_fp32 = ggml_get_to_fp32_cuda(GGML_TYPE_F16);
+    to_fp32(o16.get(), (float *) dst->data, n_qh, stream);
+}
+#endif // GGML_CUDA_CUTLASS
+
+void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    ggml_cuda_set_device(ctx.device);
+
+    const int32_t n_kv_used = dst->src[3] == nullptr ? ggml_flash_attn_ext_get_kv_used(dst) : 0;
+    if (n_kv_used <= 0) {
+        ggml_cuda_flash_attn_ext_dispatch(ctx, dst);
+        return;
+    }
+
+#ifdef GGML_CUDA_CUTLASS
+    if (ggml_cuda_fattn_cutlass_supported(dst, n_kv_used)) {
+        ggml_cuda_flash_attn_ext_cutlass_run(ctx, dst, n_kv_used);
+        return;
+    }
+#endif // GGML_CUDA_CUTLASS
+
+    // materialize the implicit mask and run the regular kernels with it
+    const ggml_tensor * Q = dst->src[0];
+    const ggml_tensor * K = dst->src[1];
+    const int64_t n_kv = K->ne[1];
+    const int64_t n_q  = Q->ne[1];
+
+    ggml_cuda_pool_alloc<half> mask_buf(ctx.pool(), n_kv*n_q);
+    fattn_causal_mask_f16<<<n_q, 256, 0, ctx.stream()>>>(mask_buf.get(), n_kv, n_q, n_kv_used);
+    CUDA_CHECK(cudaGetLastError());
+
+    ggml_tensor mask = {};
+    mask.type  = GGML_TYPE_F16;
+    mask.ne[0] = n_kv; mask.ne[1] = n_q; mask.ne[2] = 1; mask.ne[3] = 1;
+    mask.nb[0] = sizeof(half); mask.nb[1] = n_kv*sizeof(half); mask.nb[2] = mask.nb[1]*n_q; mask.nb[3] = mask.nb[2];
+    mask.data  = mask_buf.get();
+
+    dst->src[3] = &mask;
+    ggml_cuda_flash_attn_ext_dispatch(ctx, dst);
+    dst->src[3] = nullptr;
 }
 
 bool ggml_cuda_flash_attn_ext_supported(int device, const ggml_tensor * dst) {

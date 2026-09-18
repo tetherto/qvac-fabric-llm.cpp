@@ -201,7 +201,7 @@ option(GGML_CUDA                            "ggml: use CUDA"                    
 option(GGML_MUSA                            "ggml: use MUSA"                                  OFF)
 option(GGML_CUDA_FORCE_MMQ                  "ggml: use mmq kernels instead of cuBLAS"         OFF)
 option(GGML_CUDA_FORCE_CUBLAS               "ggml: always use cuBLAS instead of mmq kernels"  OFF)
-option(GGML_CUDA_CUTLASS                    "ggml: build CUTLASS kernels"                     OFF)
+option(GGML_CUDA_CUTLASS                    "ggml: build the CUTLASS kernels (SM90 FP8 always, block-scaled with CUDA 12.9+)" OFF)
 set   (GGML_CUDA_PEER_MAX_BATCH_SIZE "128" CACHE STRING
                                             "ggml: max. batch size for using peer access")
 option(GGML_CUDA_NO_PEER_COPY               "ggml: do not use peer to peer copies"            OFF)
@@ -210,6 +210,8 @@ option(GGML_CUDA_FA                         "ggml: compile ggml FlashAttention C
 option(GGML_CUDA_FA_ALL_QUANTS              "ggml: compile all quants for FlashAttention"     OFF)
 option(GGML_CUDA_GRAPHS                     "ggml: use CUDA graphs (llama.cpp only)"          ${GGML_CUDA_GRAPHS_DEFAULT})
 option(GGML_CUDA_NCCL                       "ggml: use NVIDIA Collective Comm. Library"       ON)
+option(GGML_CUDA_CUTLASS_BLOCKSCALED        "ggml: build the CUTLASS block-scaled MXFP4/NVFP4 kernels (needs CUDA 12.9)" ON)
+set   (GGML_CUDA_CUTLASS_DIR "" CACHE PATH  "ggml: existing CUTLASS source tree (skips the download)")
 set   (GGML_CUDA_COMPRESSION_MODE "size" CACHE STRING
                                             "ggml: cuda link binary compression mode; requires cuda 12.8+")
 set_property(CACHE GGML_CUDA_COMPRESSION_MODE PROPERTY STRINGS "none;speed;balance;size")

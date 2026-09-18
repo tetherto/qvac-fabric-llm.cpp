@@ -764,6 +764,22 @@ class NVFP4(__Quant, qtype=GGMLQuantizationType.NVFP4):
         return (d * vals.astype(np.float32)).reshape(n_super, 64)
 
 
+class F8_E4M3(__Quant, qtype=GGMLQuantizationType.F8_E4M3):
+    # plain OCP e4m3fn bytes; the 128x128 block scales are a separate F32 ".scale" tensor, so this decodes unscaled values
+    @classmethod
+    def quantize_blocks(cls, blocks: np.ndarray) -> np.ndarray:
+        raise NotImplementedError("F8_E4M3 is written from FP8 checkpoints only (see conversion/base.py _repack_fp8)")
+
+    @classmethod
+    def dequantize_blocks(cls, blocks: np.ndarray) -> np.ndarray:
+        x = blocks.reshape(-1)
+        exp = (x >> 3).astype(np.int32) & 0xF
+        man = (x & 0x7).astype(np.float32)
+        raw = np.where(exp == 0, man * 2**-9, (1.0 + man / 8.0) * (2.0 ** (exp.astype(np.float32) - 7)))
+        raw = np.where((x & 0x7F) == 0x7F, 0.0, raw)
+        return np.where(x & 0x80, -raw, raw).astype(np.float32).reshape(blocks.shape)
+
+
 class IQ2_XXS(__Quant, qtype=GGMLQuantizationType.IQ2_XXS):
     ksigns: bytes = (
         b"\x00\x81\x82\x03\x84\x05\x06\x87\x88\x09\x0a\x8b\x0c\x8d\x8e\x0f"

@@ -164,10 +164,21 @@ public:
     ggml_type type_k() const;
     ggml_type type_v() const;
 
+    // false for a K-only cache (MLA absorbs V into the latent K), where type_v() has nothing to report
+    bool has_v() const;
+
     std::vector<uint32_t> get_layer_ids() const;
     ggml_tensor * get_k_storage(int32_t il) const;
 
     const llama_kv_cells & get_cells(llama_seq_id seq_id) const;
+
+    // > 0 when the ubatch can attend with the implicit causal mask (ggml_flash_attn_ext_set_kv_used): one stream,
+    // no SWA/ALiBi, one sequence, cells [0, n) contiguous in position order, the ubatch at the tail (then n is
+    // returned); 0 otherwise. Call after apply_ubatch. Batches below n_tokens_min_implicit_mask return 0 without
+    // scanning the cells: the mask fill is cheap for them and a backend may spend a launch per layer instead.
+    static constexpr uint32_t n_tokens_min_implicit_mask = 256;
+
+    uint32_t get_n_kv_used(const slot_info & sinfo, const llama_ubatch & ubatch) const;
 
     // state_read, plus the cells the restored tokens were placed in
     // a cache that mirrors another one (the qwen4exp indexer) must not search for its own cells: two searches agree only by luck
@@ -399,9 +410,11 @@ public:
     //
 
     uint32_t get_n_kv() const;
+    uint32_t get_n_kv_used() const;
 
     ggml_type type_k() const;
     ggml_type type_v() const;
+    bool      has_v()  const;
 
     // get views of the current state of the cache
     ggml_tensor * get_k(ggml_context * ctx, int32_t il) const;
@@ -474,4 +487,7 @@ private:
     // a heuristic, to avoid attending the full cache if it is not yet utilized
     // as the cache gets filled, the benefit from this heuristic disappears
     int32_t n_kv;
+
+    // see llama_kv_cache::get_n_kv_used; 0 = use the mask tensor
+    int32_t n_kv_used = 0;
 };

@@ -559,6 +559,41 @@ class _LinearAttentionVReorderBase(Qwen3NextModel):
         weight, scale = self._transform_nvfp4_weight(name, weight, scale)
         super()._repack_nvfp4(name, weight, scale, scale2, input_scale)
 
+    def modify_fp8_raw(self, name: str, weight: Tensor, scale: Tensor) -> tuple[Tensor, Tensor] | None:
+        num_k_heads = self.hparams.get("linear_num_key_heads", 0)
+        num_v_heads = self.hparams.get("linear_num_value_heads", 0)
+        if not (num_k_heads > 0 and num_v_heads > 0 and num_k_heads != num_v_heads and ".linear_attn." in name):
+            return weight, scale
+        if not name.endswith((".in_proj_qkv.weight", ".in_proj_z.weight", ".out_proj.weight")):
+            return weight, scale
+
+        head_k_dim = self.hparams["linear_key_head_dim"]
+        head_v_dim = self.hparams["linear_value_head_dim"]
+        num_v_per_k = num_v_heads // num_k_heads
+        block = gguf.GGML_F8_E4M3_SCALE_BLOCK
+        if head_v_dim % block != 0 or (head_k_dim * num_k_heads) % block != 0:
+            return None  # the V head permutation would split a scale block; dequantize instead
+
+        # the head permutation moves whole rows or columns of 128, so the 128x128 scale grid permutes the same way
+        def block_perm(n_rows: int, head_dim: int) -> Tensor:
+            rows = self._reorder_v_heads(torch.arange(n_rows, dtype=torch.long).unsqueeze(-1), 0, num_k_heads, num_v_per_k, head_dim).squeeze(-1)
+            return rows.reshape(-1, block)[:, 0] // block
+
+        if name.endswith(".in_proj_qkv.weight"):
+            qk_dim = 2 * head_k_dim * num_k_heads
+            v = self._reorder_v_heads(weight[qk_dim:], 0, num_k_heads, num_v_per_k, head_v_dim)
+            v_scale = scale[qk_dim // block:].index_select(0, block_perm(num_v_heads * head_v_dim, head_v_dim))
+            return torch.cat([weight[:qk_dim], v], dim=0), torch.cat([scale[:qk_dim // block], v_scale], dim=0)
+
+        if name.endswith(".in_proj_z.weight"):
+            weight = self._reorder_v_heads(weight, 0, num_k_heads, num_v_per_k, head_v_dim)
+            scale = scale.index_select(0, block_perm(num_v_heads * head_v_dim, head_v_dim))
+            return weight, scale
+
+        weight = self._reorder_v_heads(weight, 1, num_k_heads, num_v_per_k, head_v_dim)
+        scale = scale.index_select(1, block_perm(num_v_heads * head_v_dim, head_v_dim))
+        return weight, scale
+
     def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
         num_k_heads = self.hparams.get("linear_num_key_heads", 0)
         num_v_heads = self.hparams.get("linear_num_value_heads", 0)

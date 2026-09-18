@@ -154,6 +154,137 @@ static __global__ void rms_norm_f32(const float * x,
     }
 }
 
+// rows of up to 256 columns (head norms, gated norms): one warp per row, 8 rows per block, float4 loads and a warp
+// reduction only. mul/add broadcast over rows, channels and samples like rms_norm_f32 but must span the full row
+template <bool do_multiply, bool do_add>
+static __global__ void rms_norm_small_f32(const float * x,
+                                          float *       dst,
+                                          const int     ncols,
+                                          const int     nrows,
+                                          const int64_t stride_row,
+                                          const int64_t stride_channel,
+                                          const int64_t stride_sample,
+                                          const float   eps,
+                                          const float * mul,
+                                          const int64_t mul_stride_row,
+                                          const int64_t mul_stride_channel,
+                                          const int64_t mul_stride_sample,
+                                          const uint3   mul_nrows_packed,
+                                          const uint3   mul_nchannels_packed,
+                                          const uint3   mul_nsamples_packed,
+                                          const float * add,
+                                          const int64_t add_stride_row,
+                                          const int64_t add_stride_channel,
+                                          const int64_t add_stride_sample,
+                                          const uint3   add_nrows_packed,
+                                          const uint3   add_nchannels_packed,
+                                          const uint3   add_nsamples_packed) {
+    constexpr int rows_per_block = 8;
+    static_assert(!do_add || do_multiply, "fusing add is not supported without multiplying");
+    ggml_cuda_pdl_lc();
+    const int nchannels = gridDim.y;
+    const int row       = blockIdx.x*rows_per_block + threadIdx.x/WARP_SIZE;
+    const int channel   = blockIdx.y;
+    const int sample    = blockIdx.z;
+    const int lane      = threadIdx.x % WARP_SIZE;
+    if (row >= nrows) { // whole warps exit together
+        return;
+    }
+
+    x   += sample*stride_sample + channel*stride_channel + row*stride_row;
+    dst += ((int64_t) (sample*nchannels + channel)*nrows + row)*ncols;
+
+    if constexpr (do_multiply) {
+        const uint32_t mul_row     = fastmodulo(row, mul_nrows_packed);
+        const uint32_t mul_channel = fastmodulo(channel, mul_nchannels_packed);
+        const uint32_t mul_sample  = fastmodulo(sample, mul_nsamples_packed);
+        mul += mul_sample * mul_stride_sample + mul_channel * mul_stride_channel + mul_row * mul_stride_row;
+    }
+
+    if constexpr (do_add) {
+        const uint32_t add_row     = fastmodulo(row, add_nrows_packed);
+        const uint32_t add_channel = fastmodulo(channel, add_nchannels_packed);
+        const uint32_t add_sample  = fastmodulo(sample, add_nsamples_packed);
+        add += add_sample * add_stride_sample + add_channel * add_stride_channel + add_row * add_stride_row;
+    }
+
+    const int ncols4 = ncols/4;
+    float4 v[2] = { make_float4(0.0f, 0.0f, 0.0f, 0.0f), make_float4(0.0f, 0.0f, 0.0f, 0.0f) };
+    float tmp = 0.0f;
+
+    ggml_cuda_pdl_sync();
+#pragma unroll
+    for (int k = 0; k < 2; k++) {
+        const int col4 = lane + k*WARP_SIZE;
+        if (col4 < ncols4) {
+            v[k] = *(const float4 *) (x + 4*col4);
+            tmp += v[k].x*v[k].x + v[k].y*v[k].y + v[k].z*v[k].z + v[k].w*v[k].w;
+        }
+    }
+    tmp = warp_reduce_sum(tmp);
+
+    const float mean  = tmp / ncols;
+    const float scale = rsqrtf(mean + eps);
+
+#pragma unroll
+    for (int k = 0; k < 2; k++) {
+        const int col4 = lane + k*WARP_SIZE;
+        if (col4 < ncols4) {
+            float4 o = make_float4(scale*v[k].x, scale*v[k].y, scale*v[k].z, scale*v[k].w);
+            if constexpr (do_multiply) {
+                const float4 w = *(const float4 *) (mul + 4*col4);
+                o = make_float4(o.x*w.x, o.y*w.y, o.z*w.z, o.w*w.w);
+            }
+            if constexpr (do_add) {
+                const float4 a = *(const float4 *) (add + 4*col4);
+                o = make_float4(o.x + a.x, o.y + a.y, o.z + a.z, o.w + a.w);
+            }
+            *(float4 *) (dst + 4*col4) = o;
+        }
+    }
+}
+
+// launches rms_norm_small_f32 when the row width, strides and pointers fit its float4 path; false otherwise
+static bool rms_norm_small_f32_cuda(const float * x, float * dst, const int ncols, const int nrows, const int nchannels, const int nsamples,
+        const int64_t stride_row, const int64_t stride_channel, const int64_t stride_sample, const float eps,
+        const float * mul, const int64_t mul_stride_row, const int64_t mul_stride_channel, const int64_t mul_stride_sample,
+        const uint32_t mul_ncols, const uint32_t mul_nrows, const uint32_t mul_nchannels, const uint32_t mul_nsamples,
+        const float * add, const int64_t add_stride_row, const int64_t add_stride_channel, const int64_t add_stride_sample,
+        const uint32_t add_ncols, const uint32_t add_nrows, const uint32_t add_nchannels, const uint32_t add_nsamples,
+        cudaStream_t stream) {
+    auto aligned = [](const float * p, const int64_t s0, const int64_t s1, const int64_t s2) {
+        return p == nullptr || ((uintptr_t) p % 16 == 0 && s0 % 4 == 0 && s1 % 4 == 0 && s2 % 4 == 0);
+    };
+    if (ncols > 256 || ncols % 4 != 0 || !aligned(x, stride_row, stride_channel, stride_sample) || (uintptr_t) dst % 16 != 0 ||
+        (mul != nullptr && (mul_ncols != (uint32_t) ncols || !aligned(mul, mul_stride_row, mul_stride_channel, mul_stride_sample))) ||
+        (add != nullptr && (add_ncols != (uint32_t) ncols || !aligned(add, add_stride_row, add_stride_channel, add_stride_sample)))) {
+        return false;
+    }
+    const dim3 blocks_num((nrows + 7)/8, nchannels, nsamples);
+    const dim3 block_dims(256, 1, 1);
+    const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params{blocks_num, block_dims, 0, stream};
+    const uint3 zero = make_uint3(0, 0, 0);
+    if (mul == nullptr) {
+        ggml_cuda_kernel_launch(rms_norm_small_f32<false, false>, launch_params,
+            x, dst, ncols, nrows, stride_row, stride_channel, stride_sample, eps,
+            nullptr, 0, 0, 0, zero, zero, zero, nullptr, 0, 0, 0, zero, zero, zero);
+    } else if (add == nullptr) {
+        ggml_cuda_kernel_launch(rms_norm_small_f32<true, false>, launch_params,
+            x, dst, ncols, nrows, stride_row, stride_channel, stride_sample, eps,
+            mul, mul_stride_row, mul_stride_channel, mul_stride_sample,
+            init_fastdiv_values(mul_nrows), init_fastdiv_values(mul_nchannels), init_fastdiv_values(mul_nsamples),
+            nullptr, 0, 0, 0, zero, zero, zero);
+    } else {
+        ggml_cuda_kernel_launch(rms_norm_small_f32<true, true>, launch_params,
+            x, dst, ncols, nrows, stride_row, stride_channel, stride_sample, eps,
+            mul, mul_stride_row, mul_stride_channel, mul_stride_sample,
+            init_fastdiv_values(mul_nrows), init_fastdiv_values(mul_nchannels), init_fastdiv_values(mul_nsamples),
+            add, add_stride_row, add_stride_channel, add_stride_sample,
+            init_fastdiv_values(add_nrows), init_fastdiv_values(add_nchannels), init_fastdiv_values(add_nsamples));
+    }
+    return true;
+}
+
 template <int block_size>
 static __global__ void rms_norm_back_f32(
         const float * grad, const float * xf, float * dst, const int ncols, const float eps) {
@@ -373,6 +504,10 @@ static void group_norm_f32_cuda(
 static void rms_norm_f32_cuda(
         const float * x, float * dst, const int ncols, const int nrows, const int nchannels, const int nsamples,
         const int64_t stride_row, const int64_t stride_channel, const int64_t stride_sample, const float eps, cudaStream_t stream) {
+    if (rms_norm_small_f32_cuda(x, dst, ncols, nrows, nchannels, nsamples, stride_row, stride_channel, stride_sample, eps,
+                                nullptr, 0, 0, 0, 0, 0, 0, 0, nullptr, 0, 0, 0, 0, 0, 0, 0, stream)) {
+        return;
+    }
     const dim3 blocks_num(nrows, nchannels, nsamples);
     if (ncols < 1024) {
         const dim3 block_dims(256, 1, 1);
@@ -424,6 +559,12 @@ static void rms_norm_mul_f32_cuda(const float *  x,
         rms_norm_f32_cuda(x, dst, ncols, nrows, nchannels, nsamples, stride_row, stride_channel, stride_sample, eps, stream);
         return;
     }
+    if (rms_norm_small_f32_cuda(x, dst, ncols, nrows, nchannels, nsamples, stride_row, stride_channel, stride_sample, eps,
+                                mul, mul_stride_row, mul_stride_channel, mul_stride_sample, mul_ncols, mul_nrows, mul_nchannels, mul_nsamples,
+                                add, add_stride_row, add_stride_channel, add_stride_sample, add_ncols, add_nrows, add_nchannels, add_nsamples,
+                                stream)) {
+        return;
+    }
     if (add == nullptr) {
         const uint3 mul_ncols_packed     = init_fastdiv_values(mul_ncols);
         const uint3 mul_nrows_packed     = init_fastdiv_values(mul_nrows);
@@ -473,6 +614,90 @@ static void rms_norm_mul_f32_cuda(const float *  x,
                 add_stride_row, add_stride_channel, add_stride_sample, add_ncols_packed, add_nrows_packed,
                 add_nchannels_packed, add_nsamples_packed);
         }
+    }
+}
+
+// residual add folded into the following rms_norm * weight: one block per row writes the sum (the residual stream,
+// read again by later nodes) and the normalized product; contiguous rows, weight [ncols]. The row is held in
+// registers between the two passes (max_vals float4 per thread) so the second pass does not re-read the sum; with
+// prefetch_w the weight row is loaded in the first pass too, so a single-row launch at decode pays one memory round
+// trip before the reduction and none after it (the many-row prefill launches keep the lighter register footprint)
+template <int block_size, int max_vals, bool prefetch_w = false>
+static __global__ void rms_norm_add_mul_f32(const float * a, const float * b, const float * mul, float * sum, float * dst,
+                                            const int ncols, const float eps) {
+    ggml_cuda_pdl_lc();
+    const int64_t row = blockIdx.x;
+    const int     tid = threadIdx.x;
+
+    const int ncols4 = ncols/4;
+    const float4 * a4   = (const float4 *) (a   + row*ncols);
+    const float4 * b4   = (const float4 *) (b   + row*ncols);
+    const float4 * mul4 = (const float4 *) mul;
+    float4       * sum4 = (float4 *) (sum + row*ncols);
+    float4       * dst4 = (float4 *) (dst + row*ncols);
+
+    float4 vals[max_vals];
+    float4 wv[max_vals];
+    float  tmp = 0.0f; // partial sum for thread in warp
+
+    ggml_cuda_pdl_sync();
+#pragma unroll
+    for (int i = 0; i < max_vals; i++) {
+        const int col = tid + i*block_size;
+        if (col < ncols4) {
+            const float4 va = a4[col];
+            const float4 vb = b4[col];
+            if constexpr (prefetch_w) {
+                wv[i] = mul4[col];
+            }
+            const float4 s  = make_float4(va.x + vb.x, va.y + vb.y, va.z + vb.z, va.w + vb.w);
+            sum4[col] = s;
+            vals[i]   = s;
+            tmp += s.x*s.x + s.y*s.y + s.z*s.z + s.w*s.w;
+        }
+    }
+
+    extern __shared__ float s_sum[];
+    tmp = block_reduce<block_reduce_method::SUM, block_size>(tmp, s_sum);
+
+    const float scale = rsqrtf(tmp/ncols + eps);
+
+#pragma unroll
+    for (int i = 0; i < max_vals; i++) {
+        const int col = tid + i*block_size;
+        if (col < ncols4) {
+            const float4 w = prefetch_w ? wv[i] : mul4[col];
+            const float4 s = vals[i];
+            dst4[col] = make_float4(scale*s.x*w.x, scale*s.y*w.y, scale*s.z*w.z, scale*s.w*w.w);
+        }
+    }
+}
+
+// ncols % 4 == 0 and ncols <= 16384 (4 float4 per thread at 1024 threads), checked by the fusion condition.
+// Decode batches (nrows <= 8) spread the few rows over 512 threads each: more loads in flight per row
+static void rms_norm_add_mul_f32_cuda(const float * a, const float * b, const float * mul, float * sum, float * dst,
+                                      const int ncols, const int64_t nrows, const float eps, cudaStream_t stream) {
+    if (nrows <= 8 && ncols > 4*256 && ncols <= 3*4*512) {
+        const dim3 blocks_num(nrows, 1, 1);
+        const dim3 block_dims(512, 1, 1);
+        const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params{blocks_num, block_dims, 32*sizeof(float), stream};
+        ggml_cuda_kernel_launch(rms_norm_add_mul_f32<512, 3, true>, launch_params, a, b, mul, sum, dst, ncols, eps);
+        return;
+    }
+    const dim3 blocks_num(nrows, 1, 1);
+    if (ncols <= 4*256) {
+        const dim3 block_dims(256, 1, 1);
+        const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params{blocks_num, block_dims, 32*sizeof(float), stream};
+        ggml_cuda_kernel_launch(rms_norm_add_mul_f32<256, 1>, launch_params, a, b, mul, sum, dst, ncols, eps);
+    } else if (ncols <= 8*4*256) {
+        const dim3 block_dims(256, 1, 1);
+        const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params{blocks_num, block_dims, 32*sizeof(float), stream};
+        ggml_cuda_kernel_launch(rms_norm_add_mul_f32<256, 8>, launch_params, a, b, mul, sum, dst, ncols, eps);
+    } else {
+        GGML_ASSERT(ncols <= 4*4*1024);
+        const dim3 block_dims(1024, 1, 1);
+        const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params{blocks_num, block_dims, 32*sizeof(float), stream};
+        ggml_cuda_kernel_launch(rms_norm_add_mul_f32<1024, 4>, launch_params, a, b, mul, sum, dst, ncols, eps);
     }
 }
 
@@ -815,4 +1040,22 @@ void ggml_cuda_op_l2_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int64_t s03 = nb03 / ts0;
 
     l2_norm_f32_cuda(src0_d, dst_d, ne00, ne01, ne02, ne03, s01, s02, s03, eps, stream);
+}
+
+void ggml_cuda_op_rms_norm_fused_pre_add(ggml_backend_cuda_context & ctx,
+                                         ggml_tensor *               add_tensor,
+                                         ggml_tensor *               norm_tensor,
+                                         ggml_tensor *               mul_tensor) {
+    // checked by ggml_cuda_should_fuse_add_rms_norm_mul: F32 everywhere, add operands same shape and contiguous,
+    // norm = rms_norm(add), mul = norm * w with w [ne0]
+    const ggml_tensor * w = mul_tensor->src[0] == norm_tensor ? mul_tensor->src[1] : mul_tensor->src[0];
+
+    float eps = 0.0f;
+    memcpy(&eps, norm_tensor->op_params, sizeof(float));
+    GGML_ASSERT(eps >= 0.0f);
+
+    rms_norm_add_mul_f32_cuda(
+        (const float *) add_tensor->src[0]->data, (const float *) add_tensor->src[1]->data, (const float *) w->data,
+        (float *) add_tensor->data, (float *) mul_tensor->data,
+        add_tensor->ne[0], ggml_nrows(add_tensor), eps, ctx.stream());
 }

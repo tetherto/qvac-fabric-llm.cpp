@@ -468,10 +468,6 @@ ggml_tensor * llama_model_qwen3next::graph::build_layer_attn_linear(
 
     ggml_tensor * conv_input = build_conv_state(inp, conv_states_all, qkv_mixed, conv_kernel_size, conv_channels, il);
 
-    ggml_tensor * state = build_rs(inp, ssm_states_all, hparams.n_embd_s(), n_seqs);
-    state = ggml_reshape_4d(ctx0, state, head_v_dim, head_v_dim, num_v_heads, n_seqs);
-    cb(state, "state_predelta", il);
-
     ggml_tensor * conv_output_proper = ggml_ssm_conv(ctx0, conv_input, conv_kernel);
     cb(conv_output_proper, "conv_output_raw", il);
 
@@ -511,6 +507,17 @@ ggml_tensor * llama_model_qwen3next::graph::build_layer_attn_linear(
 
     q_conv = ggml_l2_norm(ctx0, q_conv, eps_norm);
     k_conv = ggml_l2_norm(ctx0, k_conv, eps_norm);
+
+    // the conv chain goes into the graph before the SSM-state gather so a backend can fuse the state gather, the conv,
+    // the silu and the norms as one run; the zero-sized view keeps the projection's buffer reserved past the norms
+    // (the fused kernel reads it while writing the conv output; the allocator would otherwise reuse it in place)
+    ggml_build_forward_expand(gf, q_conv);
+    ggml_build_forward_expand(gf, k_conv);
+    ggml_build_forward_expand(gf, ggml_view_1d(ctx0, qkv_mixed, 0, 0));
+
+    ggml_tensor * state = build_rs(inp, ssm_states_all, hparams.n_embd_s(), n_seqs);
+    state = ggml_reshape_4d(ctx0, state, head_v_dim, head_v_dim, num_v_heads, n_seqs);
+    cb(state, "state_predelta", il);
 
     //q_conv = ggml_cont_4d(ctx0, q_conv, head_k_dim, num_k_heads, n_seq_tokens, n_seqs);
     //k_conv = ggml_cont_4d(ctx0, k_conv, head_k_dim, num_k_heads, n_seq_tokens, n_seqs);
