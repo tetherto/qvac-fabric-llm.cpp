@@ -4477,7 +4477,8 @@ static bool ggml_backend_webgpu_device_supports_op(ggml_backend_dev_t dev, const
         case GGML_OP_L2_NORM:
             // one workgroup per row: more rows than the dispatch limit cannot be encoded at all
             supports_op = (op->type == GGML_TYPE_F32 && src0->type == GGML_TYPE_F32) && ggml_is_contiguous_rows(src0) &&
-                          ggml_nrows(src0) <= (int64_t) capabilities.limits.maxComputeWorkgroupsPerDimension;
+                          ggml_nrows(src0) <=
+                              (int64_t) ctx->webgpu_global_ctx->capabilities.limits.maxComputeWorkgroupsPerDimension;
             break;
         case GGML_OP_ROPE:
             supports_op = op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16;
