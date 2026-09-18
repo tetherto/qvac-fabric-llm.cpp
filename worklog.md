@@ -1762,3 +1762,48 @@ Artifacts are under:
 - `qsa-gemv-large-only-d32768-tg128-r5.jsonl`
 - `qsa-gemv-long-off-d32768-tg128-r5.jsonl`
 - `qsa-gemv-large-only-repeat-d32768-tg128-r5.jsonl`
+
+## 2026-09-17: final FP8 comparison against SGLang
+
+The final comparison used physical H100 GPUs 6/7, batch one, FP8 model
+weights, tensor/expert parallelism across both GPUs, PP2048, TG128, and a
+2048-token llama.cpp ubatch. The llama.cpp run enabled the native FP8 expert
+GEMV, FlashInfer GDN, compressed QSA and its batch-one decode kernel, the
+fused selector, expert parallelism, and pinned-host PLE via `-lm none`.
+SGLang used TP2/EP2, FA3, QSA, FlashInfer GDN prefill, Triton GDN decode, and
+a batch-one CUDA graph. Its custom all-reduce and FlashInfer all-reduce fusion
+were disabled, consistently with the earlier comparison setup.
+
+Representative values are medians from the stable window. At context zero,
+SGLang TG uses the required one-token seed. At 64K, prefix construction is
+outside the timed region for both PP2048 and TG128. SGLang's 64K prefix was
+built in 2048-token chunks with `--mem-fraction-static 0.90`; this changes the
+KV reservation, not the timed workload.
+
+| resident context | workload | llama.cpp | SGLang | SGLang / llama.cpp |
+| --- | ---: | ---: | ---: | ---: |
+| 0 | PP2048 | 9835.12 tok/s | 12014.14 tok/s | 1.222x |
+| 0 | TG128 | 87.33 tok/s | 110.61 tok/s | 1.267x |
+| 64K | PP2048 | 6480.38 tok/s | 11031.32 tok/s | 1.702x |
+| 64K | TG128 | 74.16 tok/s | 103.58 tok/s | 1.397x |
+
+The corresponding llama.cpp deficits relative to SGLang are 18.1%, 21.1%,
+41.3%, and 28.4%. The widening PP gap at 64K is the clearest remaining issue:
+llama.cpp loses 34.1% of its empty-context PP throughput, whereas SGLang loses
+only 8.2%. Decode degrades by 15.1% for llama.cpp versus 6.4% for SGLang.
+
+Raw llama.cpp PP samples were `6688.79, 9774.46, 9808.49, 9861.74,
+9878.28` at context zero and `2068.14, 1724.86, 6467.90, 6489.27,
+6480.38` at 64K. The first sample was excluded at context zero and the first
+two cold samples at 64K. Raw llama.cpp TG samples were `57.96, 87.73, 82.52,
+86.93, 88.23` and `63.47, 68.62, 74.27, 77.87, 74.04`; their first samples
+were excluded. SGLang PP2048 at context zero had a 12014.14 tok/s median over
+six runs after warmup; its 64K PP samples were `11098.28, 11031.32, 11009.71,
+11123.45, 10990.79`. SGLang TG medians aggregate 640 timed decode tokens:
+110.61 tok/s at the seed context and 103.58 tok/s at 64K.
+
+One memory-placement caveat remains: llama.cpp keeps PLE in pinned host memory.
+Earlier SGLang observations reported its default pinned-CPU PLE offload, while
+the final model-load memory accounting did not make that placement conclusive.
+Verify resident bytes and transfers before treating this as a strict
+weight-residency comparison.
