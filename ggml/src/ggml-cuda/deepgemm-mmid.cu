@@ -64,6 +64,153 @@ __device__ uint8_t fp32_to_e4m3(float value) {
     return fp8.__x;
 }
 
+__device__ float2 e4m3x2_to_fp32x2(uint16_t value) {
+    __nv_fp8x2_e4m3 fp8;
+    fp8.__x = value;
+    return static_cast<float2>(fp8);
+}
+
+__device__ float warp_sum(float value) {
+#pragma unroll
+    for (int offset = 16; offset > 0; offset /= 2) {
+        value += __shfl_down_sync(0xffffffff, value, offset);
+    }
+    return value;
+}
+
+constexpr int DG_GEMV_WARPS = 8;
+
+// DeepGEMM's persistent grouped kernel is designed for substantially more M
+// than batch-one expert routing provides. In the hybrid TP/EP graph each rank
+// normally owns only about five of the ten selected routes, and each local
+// expert has a single row. Read the persistent native-FP8 weights directly as
+// coalesced GEMVs instead of packing those rows into an M=128 grouped layout.
+__global__ void fp8_moe_gate_up_swiglu_b1(
+        const uint8_t * __restrict__ weights,
+        const float * __restrict__ weight_scales,
+        const float * __restrict__ x,
+        const int32_t * __restrict__ ids,
+        float * __restrict__ activated,
+        int n_embd,
+        int n_ff,
+        int top_k,
+        int expert_offset,
+        int n_groups) {
+    const int warp = threadIdx.x / 32;
+    const int lane = threadIdx.x % 32;
+    const int row  = blockIdx.x * DG_GEMV_WARPS + warp;
+    const int slot = blockIdx.y;
+    if (row >= n_ff || slot >= top_k) {
+        return;
+    }
+
+    const int expert = ids[slot] - expert_offset;
+    if (expert < 0 || expert >= n_groups) {
+        if (lane == 0) {
+            activated[slot * n_ff + row] = 0.0f;
+        }
+        return;
+    }
+
+    const int scale_k = n_embd / DG_SCALE_K;
+    const int scale_n = (2 * n_ff) / DG_SCALE_K;
+    const size_t expert_base = static_cast<size_t>(expert) * (2 * n_ff) * n_embd;
+    const size_t gate_base   = expert_base + static_cast<size_t>(row) * n_embd;
+    const size_t up_base     = expert_base + static_cast<size_t>(n_ff + row) * n_embd;
+
+    float gate = 0.0f;
+    float up   = 0.0f;
+#pragma unroll
+    for (int kb = 0; kb < 20; ++kb) {
+        if (kb >= scale_k) {
+            break;
+        }
+        const float gate_scale = weight_scales[
+            (static_cast<size_t>(expert) * scale_n + row / DG_SCALE_K) * scale_k + kb];
+        const float up_scale = weight_scales[
+            (static_cast<size_t>(expert) * scale_n + (n_ff + row) / DG_SCALE_K) * scale_k + kb];
+#pragma unroll
+        for (int i = 0; i < DG_SCALE_K / 64; ++i) {
+            const int col = kb * DG_SCALE_K + i * 64 + 2 * lane;
+            const float2 xv = *reinterpret_cast<const float2 *>(x + col);
+            const float2 gate_weight = e4m3x2_to_fp32x2(
+                *reinterpret_cast<const uint16_t *>(weights + gate_base + col));
+            const float2 up_weight = e4m3x2_to_fp32x2(
+                *reinterpret_cast<const uint16_t *>(weights + up_base + col));
+            gate = fmaf(gate_weight.x * gate_scale, xv.x, gate);
+            gate = fmaf(gate_weight.y * gate_scale, xv.y, gate);
+            up   = fmaf(up_weight.x * up_scale, xv.x, up);
+            up   = fmaf(up_weight.y * up_scale, xv.y, up);
+        }
+    }
+
+    gate = warp_sum(gate);
+    up   = warp_sum(up);
+    if (lane == 0) {
+        activated[slot * n_ff + row] = (gate / (1.0f + expf(-gate))) * up;
+    }
+}
+
+// Fuse the down GEMVs across all locally-owned routes with router weighting.
+__global__ void fp8_moe_down_reduce_b1(
+        const uint8_t * __restrict__ weights,
+        const float * __restrict__ weight_scales,
+        const float * __restrict__ activated,
+        const int32_t * __restrict__ ids,
+        const float * __restrict__ route_weights,
+        float * __restrict__ dst,
+        int n_embd,
+        int n_ff,
+        int top_k,
+        int expert_offset,
+        int n_groups) {
+    const int warp = threadIdx.x / 32;
+    const int lane = threadIdx.x % 32;
+    const int row  = blockIdx.x * DG_GEMV_WARPS + warp;
+    if (row >= n_embd) {
+        return;
+    }
+
+    const int scale_k = n_ff / DG_SCALE_K;
+    const int scale_n = n_embd / DG_SCALE_K;
+    float result = 0.0f;
+    for (int slot = 0; slot < top_k; ++slot) {
+        const int expert = ids[slot] - expert_offset;
+        if (expert < 0 || expert >= n_groups) {
+            continue;
+        }
+
+        const size_t row_base = (static_cast<size_t>(expert) * n_embd + row) * n_ff;
+        float dot = 0.0f;
+#pragma unroll
+        for (int kb = 0; kb < 5; ++kb) {
+            if (kb >= scale_k) {
+                break;
+            }
+            const float weight_scale = weight_scales[
+                (static_cast<size_t>(expert) * scale_n + row / DG_SCALE_K) * scale_k + kb];
+#pragma unroll
+            for (int i = 0; i < DG_SCALE_K / 64; ++i) {
+                const int col = kb * DG_SCALE_K + i * 64 + 2 * lane;
+                const float2 weight = e4m3x2_to_fp32x2(
+                    *reinterpret_cast<const uint16_t *>(weights + row_base + col));
+                const float2 value = *reinterpret_cast<const float2 *>(
+                    activated + slot * n_ff + col);
+                dot = fmaf(weight.x * weight_scale, value.x, dot);
+                dot = fmaf(weight.y * weight_scale, value.y, dot);
+            }
+        }
+        dot = warp_sum(dot);
+        if (lane == 0) {
+            result = fmaf(route_weights[slot], dot, result);
+        }
+    }
+
+    if (lane == 0) {
+        dst[row] = result;
+    }
+}
+
 __global__ void pack_quantize_activations(
         const float * x,
         const int32_t * ids,
@@ -543,6 +690,11 @@ bool moe_ffn_b1_enabled() {
     return value == nullptr || value[0] == '\0' || std::strcmp(value, "0") != 0;
 }
 
+bool moe_ffn_b1_gemv_enabled() {
+    const char * value = std::getenv("GGML_CUDA_FP8_MOE_GEMV");
+    return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
+}
+
 bool mul_mat_id_supported(const ggml_tensor * dst, int device) {
     if (dst == nullptr || dst->src[0] == nullptr || dst->src[1] == nullptr || dst->src[2] == nullptr) {
         return false;
@@ -860,6 +1012,41 @@ bool ggml_cuda_deepgemm_moe_ffn_b1(
 
     cudaStream_t stream = ctx.stream();
     ggml_cuda_pool & pool = ctx.pool();
+
+    if (native_fp8 && moe_ffn_b1_gemv_enabled() &&
+            n_embd == 2560 && n_ff == 640 && top_k == 10 &&
+            (n_groups == DG_EP_GROUPS || n_groups == DG_QWEN_GROUPS)) {
+        ggml_cuda_pool_alloc<float> activated(pool, static_cast<size_t>(top_k) * n_ff);
+        const dim3 gate_up_grid((n_ff + DG_GEMV_WARPS - 1) / DG_GEMV_WARPS, top_k, 1);
+        fp8_moe_gate_up_swiglu_b1<<<gate_up_grid, DG_GEMV_WARPS * 32, 0, stream>>>(
+            static_cast<const uint8_t *>(gate_up->data),
+            static_cast<const float *>(gate_up_scale->data),
+            static_cast<const float *>(x->data),
+            static_cast<const int32_t *>(ids->data),
+            activated.ptr,
+            n_embd, n_ff, top_k, expert_offset, n_groups);
+        CUDA_CHECK(cudaGetLastError());
+
+        const dim3 down_grid((n_embd + DG_GEMV_WARPS - 1) / DG_GEMV_WARPS, 1, 1);
+        fp8_moe_down_reduce_b1<<<down_grid, DG_GEMV_WARPS * 32, 0, stream>>>(
+            static_cast<const uint8_t *>(down->data),
+            static_cast<const float *>(down_scale->data),
+            activated.ptr,
+            static_cast<const int32_t *>(ids->data),
+            static_cast<const float *>(reduction_weights->data),
+            static_cast<float *>(reduced_dst->data),
+            n_embd, n_ff, top_k, expert_offset, n_groups);
+        CUDA_CHECK(cudaGetLastError());
+
+        static bool gemv_logged = false;
+        if (!gemv_logged) {
+            GGML_LOG_INFO(
+                "%s: using native-FP8 batch-1 gate/up+SwiGLU and down+reduce GEMVs (%d experts)\n",
+                __func__, n_groups);
+            gemv_logged = true;
+        }
+        return true;
+    }
 
     const size_t activation_elems = static_cast<size_t>(n_groups) * m_blocked * n_embd;
     const size_t activation_scale_elems =
