@@ -44,11 +44,15 @@ struct mmf8_multi_args {
 
 // The f16 tensor-core decode matmul (mmf8-mma.cu): same operands, scales and output as the GEMV, but each weight
 // byte is converted once into an f16 MMA tile and accumulated in FP32, which removes the GEMV's per-column FP32
-// FMA chain and its repeated conversions. Batch 2..8; batch 1 keeps the GEMV.
+// FMA chain and its repeated conversions. Batch 2..8; batch 1 keeps the GEMV. The activation is converted to f16
+// once per launch into a pool buffer, so the B tile costs half the bytes and no conversion per slab; that needs
+// the context, and it needs the activation columns to be contiguous (stride_col_y == ncols).
 void mul_mat_f8_e4m3_mma_cuda(
+    ggml_backend_cuda_context & ctx,
     const uint8_t * x, const float * sx, const uint8_t * xg, const float * sxg, const float * y, float * dst,
     int ncols, int nrows, int nblk_n, int ncols_dst, int stride_col_y, int stride_col_dst, cudaStream_t stream);
 void mul_mat_f8_e4m3_mma_multi_cuda(
+    ggml_backend_cuda_context & ctx,
     const mmf8_multi_args & a, const float * y, int ncols, int ncols_dst, int stride_col_y, cudaStream_t stream);
 
 // GGML_CUDA_MMF8_MMA_MIN overrides the batch at which the tensor-core matmul takes over from the GEMV;

@@ -65,7 +65,7 @@ static __device__ __forceinline__ void mmf8_mma_issue_tile(
 template <int ncols_dst, bool has_glu>
 static __device__ __forceinline__ void mmf8_mma_block(
         const uint8_t * x, const float * sx, const uint8_t * xg, const float * sxg,
-        const float * y, float * dst,
+        const half * y, float * dst,
         const int ncols, const int nblk_n, const int stride_col_y, const int stride_col_dst, const int row0,
         const int split, const int ksplit, char * smem, char * raw) {
 #ifdef TURING_MMA_AVAILABLE
@@ -114,9 +114,9 @@ static __device__ __forceinline__ void mmf8_mma_block(
             half2 a0 = __floats2half2_rn(0.0f, 0.0f);
             half2 a1 = a0;
             if (j0 < ncols_dst) {
-                const float * yj = y + (size_t) j0*stride_col_y + k0 + 4*lane;
-                a0 = __floats2half2_rn(yj[0], yj[1]);
-                a1 = __floats2half2_rn(yj[2], yj[3]);
+                const half2 * yj = (const half2 *) (y + (size_t) j0*stride_col_y + k0) + 2*lane;
+                a0 = yj[0];
+                a1 = yj[1];
             }
             tile_xy[j0*MMF8_MMA_KPAD + 2*lane + 0] = a0;
             tile_xy[j0*MMF8_MMA_KPAD + 2*lane + 1] = a1;
@@ -237,7 +237,7 @@ static __device__ __forceinline__ void mmf8_mma_block(
 template <int ncols_dst, bool has_glu>
 static __global__ void mul_mat_f8_e4m3_mma(
         const uint8_t * x, const float * sx, const uint8_t * xg, const float * sxg,
-        const float * y, float * dst,
+        const half * y, float * dst,
         const int ncols, const int nblk_n, const int stride_col_y, const int stride_col_dst, const int ksplit) {
     __shared__ __align__(16) char smem[MMF8_MMA_SMEM];
     __shared__ __align__(16) char raw[MMF8_MMA_RAWMEM];
@@ -247,7 +247,7 @@ static __global__ void mul_mat_f8_e4m3_mma(
 
 // up to three F8 matrices sharing one activation in one launch, with the same block mapping as the multi GEMV
 template <int ncols_dst>
-static __global__ void mul_mat_f8_e4m3_mma_multi(const mmf8_multi_args a, const float * y, const int ncols, const int stride_col_y, const int ksplit) {
+static __global__ void mul_mat_f8_e4m3_mma_multi(const mmf8_multi_args a, const half * y, const int ncols, const int stride_col_y, const int ksplit) {
     __shared__ __align__(16) char smem[MMF8_MMA_SMEM];
     __shared__ __align__(16) char raw[MMF8_MMA_RAWMEM];
     // constant indices only: a dynamic index into the parameter struct would copy it to local memory per thread
@@ -286,7 +286,7 @@ static int mmf8_mma_ksplit(const int nrows, const int ncols, const bool has_glu)
 
 template <int ncols_dst>
 static void launch_mul_mat_f8_e4m3_mma(
-        const uint8_t * x, const float * sx, const uint8_t * xg, const float * sxg, const float * y, float * dst,
+        const uint8_t * x, const float * sx, const uint8_t * xg, const float * sxg, const half * y, float * dst,
         const int ncols, const int nrows, const int nblk_n, const int stride_col_y, const int stride_col_dst, cudaStream_t stream) {
     GGML_ASSERT(nrows % MMF8_MMA_ROWS == 0);
     GGML_ASSERT(ncols % MMF8_MMA_KSLAB == 0);
@@ -310,10 +310,18 @@ static void launch_mul_mat_f8_e4m3_mma(
                             x, sx, no_xg, no_sxg, y, dst, ncols, nblk_n, stride_col_y, stride_col_dst, ksplit);
 }
 
+// The activation is converted to f16 once per launch: the B tile is f16 either way, and every row block of every
+// launch reads the whole activation, so this halves those bytes and drops one conversion per staged element.
 // xg/sxg: the gate matrix of a fused up/gate matmul (nullptr for a plain one)
 void mul_mat_f8_e4m3_mma_cuda(
-        const uint8_t * x, const float * sx, const uint8_t * xg, const float * sxg, const float * y, float * dst,
+        ggml_backend_cuda_context & ctx,
+        const uint8_t * x, const float * sx, const uint8_t * xg, const float * sxg, const float * yf, float * dst,
         const int ncols, const int nrows, const int nblk_n, const int ncols_dst, const int stride_col_y, const int stride_col_dst, cudaStream_t stream) {
+    GGML_ASSERT(stride_col_y == ncols);
+    ggml_cuda_pool_alloc<half> y16(ctx.pool(), (size_t) ncols_dst*ncols);
+    const to_fp16_cuda_t to_fp16 = ggml_get_to_fp16_cuda(GGML_TYPE_F32);
+    to_fp16(yf, y16.get(), (int64_t) ncols_dst*ncols, stream);
+    const half * y = y16.get();
     switch (ncols_dst) {
         case 2: launch_mul_mat_f8_e4m3_mma<2>(x, sx, xg, sxg, y, dst, ncols, nrows, nblk_n, stride_col_y, stride_col_dst, stream); break;
         case 3: launch_mul_mat_f8_e4m3_mma<3>(x, sx, xg, sxg, y, dst, ncols, nrows, nblk_n, stride_col_y, stride_col_dst, stream); break;
@@ -327,7 +335,7 @@ void mul_mat_f8_e4m3_mma_cuda(
 }
 
 template <int ncols_dst>
-static void launch_mul_mat_f8_e4m3_mma_multi(const mmf8_multi_args & a, const float * y, const int ncols, const int stride_col_y, cudaStream_t stream) {
+static void launch_mul_mat_f8_e4m3_mma_multi(const mmf8_multi_args & a, const half * y, const int ncols, const int stride_col_y, cudaStream_t stream) {
     mmf8_multi_args b = a;
     b.block0[0] = 0;
     for (int i = 0; i < a.n; ++i) {
@@ -348,7 +356,14 @@ static void launch_mul_mat_f8_e4m3_mma_multi(const mmf8_multi_args & a, const fl
     ggml_cuda_kernel_launch(mul_mat_f8_e4m3_mma_multi<ncols_dst>, launch_params, b, y, ncols, stride_col_y, ksplit);
 }
 
-void mul_mat_f8_e4m3_mma_multi_cuda(const mmf8_multi_args & a, const float * y, const int ncols, const int ncols_dst, const int stride_col_y, cudaStream_t stream) {
+void mul_mat_f8_e4m3_mma_multi_cuda(
+        ggml_backend_cuda_context & ctx,
+        const mmf8_multi_args & a, const float * yf, const int ncols, const int ncols_dst, const int stride_col_y, cudaStream_t stream) {
+    GGML_ASSERT(stride_col_y == ncols);
+    ggml_cuda_pool_alloc<half> y16(ctx.pool(), (size_t) ncols_dst*ncols);
+    const to_fp16_cuda_t to_fp16 = ggml_get_to_fp16_cuda(GGML_TYPE_F32);
+    to_fp16(yf, y16.get(), (int64_t) ncols_dst*ncols, stream);
+    const half * y = y16.get();
     switch (ncols_dst) {
         case 2: launch_mul_mat_f8_e4m3_mma_multi<2>(a, y, ncols, stride_col_y, stream); break;
         case 3: launch_mul_mat_f8_e4m3_mma_multi<3>(a, y, ncols, stride_col_y, stream); break;

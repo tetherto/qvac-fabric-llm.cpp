@@ -561,7 +561,7 @@ void ggml_cuda_mul_mat_f8(ggml_backend_cuda_context & ctx, const ggml_tensor * s
 
     if (ntokens <= ggml_cuda_mmf8_gemv_max_ncols()) {
         if (ggml_cuda_mmf8_use_mma(ctx, ntokens)) {
-            mul_mat_f8_e4m3_mma_cuda(x, sx, nullptr, nullptr, y, d, ncols, nrows, nblk_n, ntokens, ncols, nrows, stream);
+            mul_mat_f8_e4m3_mma_cuda(ctx, x, sx, nullptr, nullptr, y, d, ncols, nrows, nblk_n, ntokens, ncols, nrows, stream);
         } else {
             mul_mat_vec_f8_e4m3_cuda(x, sx, nullptr, nullptr, y, d, ncols, nrows, nblk_n, ntokens, ncols, nrows, stream);
         }
@@ -596,7 +596,7 @@ void ggml_cuda_mul_mat_f8_gemv_glu(ggml_backend_cuda_context & ctx, const ggml_t
     GGML_ASSERT(ntokens <= ggml_cuda_mmf8_gemv_max_ncols());
 
     if (ggml_cuda_mmf8_use_mma(ctx, ntokens)) {
-        mul_mat_f8_e4m3_mma_cuda((const uint8_t *) src0->data, (const float *) up->src[2]->data,
+        mul_mat_f8_e4m3_mma_cuda(ctx, (const uint8_t *) src0->data, (const float *) up->src[2]->data,
                                  (const uint8_t *) src0g->data, (const float *) gate->src[2]->data,
                                  (const float *) src1->data, (float *) glu->data, ncols, nrows, nblk_n, ntokens, ncols, nrows, ctx.stream());
         return;
@@ -658,7 +658,7 @@ void ggml_cuda_mul_mat_f8_shared_gemv(ggml_backend_cuda_context & ctx, ggml_tens
         a.nrows[i] = src0->ne[1];
     }
     if (ggml_cuda_mmf8_use_mma(ctx, ntokens)) {
-        mul_mat_f8_e4m3_mma_multi_cuda(a, (const float *) src1->data, ncols, ntokens, ncols, ctx.stream());
+        mul_mat_f8_e4m3_mma_multi_cuda(ctx, a, (const float *) src1->data, ncols, ntokens, ncols, ctx.stream());
         return;
     }
     mul_mat_vec_f8_e4m3_multi_cuda(a, (const float *) src1->data, ncols, ntokens, ncols, ctx.stream());
