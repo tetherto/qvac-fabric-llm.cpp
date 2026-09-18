@@ -164,6 +164,9 @@ public:
     ggml_type type_k() const;
     ggml_type type_v() const;
 
+    // false for a K-only cache (MLA absorbs V into the latent K), where type_v() has nothing to report
+    bool has_v() const;
+
     std::vector<uint32_t> get_layer_ids() const;
     ggml_tensor * get_k_storage(int32_t il) const;
 
@@ -411,6 +414,7 @@ public:
 
     ggml_type type_k() const;
     ggml_type type_v() const;
+    bool      has_v()  const;
 
     // get views of the current state of the cache
     ggml_tensor * get_k(ggml_context * ctx, int32_t il) const;

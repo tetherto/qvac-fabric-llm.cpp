@@ -517,8 +517,8 @@ static void ggml_cuda_mul_mat_f8_check(const ggml_tensor * src0, const ggml_tens
     GGML_ASSERT(src1->ne[0] == src0->ne[0]);
 }
 
-void ggml_cuda_mul_mat_f8_glu_cutlass(ggml_backend_cuda_context & ctx, const ggml_tensor * glu, ggml_tensor * dst) {
 #ifdef GGML_CUDA_CUTLASS
+void ggml_cuda_mul_mat_f8_glu_cutlass(ggml_backend_cuda_context & ctx, const ggml_tensor * glu, ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * gate = glu->src[0];
     const ggml_tensor * up   = glu->src[1];
@@ -536,13 +536,8 @@ void ggml_cuda_mul_mat_f8_glu_cutlass(ggml_backend_cuda_context & ctx, const ggm
     mul_mat_f8_e4m3_cutlass(ctx, (const uint8_t *) src0->data, (const float *) dst->src[2]->data, nullptr, (float *) dst->data,
                             ncols, nrows, ntokens, ctx.stream(),
                             (const float *) gate->data, (const float *) up->data, gate->nb[1]/sizeof(float), up->nb[1]/sizeof(float));
-#else
-    GGML_UNUSED(ctx);
-    GGML_UNUSED(glu);
-    GGML_UNUSED(dst);
-    GGML_ABORT("F8 GLU fusion needs the CUTLASS build");
-#endif // GGML_CUDA_CUTLASS
 }
+#endif // GGML_CUDA_CUTLASS
 
 void ggml_cuda_mul_mat_f8(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     ggml_cuda_mul_mat_f8_check(src0, src1, dst);
@@ -606,10 +601,10 @@ void ggml_cuda_mul_mat_f8_gemv_glu(ggml_backend_cuda_context & ctx, const ggml_t
                              (const float *) src1->data, (float *) glu->data, ncols, nrows, nblk_n, ntokens, ncols, nrows, ctx.stream());
 }
 
+#ifdef GGML_CUDA_CUTLASS
 // n F8 mul_mats (2 or 3) on the same F32 activation at the CUTLASS batch: the activation is quantized once, then one
 // GEMM per weight; the bytes and scales are what each unfused call would have produced
 void ggml_cuda_mul_mat_f8_shared_cutlass(ggml_backend_cuda_context & ctx, ggml_tensor ** dsts, const int n) {
-#ifdef GGML_CUDA_CUTLASS
     GGML_ASSERT(n >= 2 && n <= MMF8_MULTI_MAX);
     const ggml_tensor * src1 = dsts[0]->src[1];
     for (int i = 0; i < n; ++i) {
@@ -630,13 +625,8 @@ void ggml_cuda_mul_mat_f8_shared_cutlass(ggml_backend_cuda_context & ctx, ggml_t
         mmf8_gemm_cutlass_quantized(ctx, q, (const uint8_t *) src0->data, (const float *) dsts[i]->src[2]->data, (float *) dsts[i]->data,
                                     ncols, src0->ne[1], ntokens, stream);
     }
-#else
-    GGML_UNUSED(ctx);
-    GGML_UNUSED(dsts);
-    GGML_UNUSED(n);
-    GGML_ABORT("F8 shared-activation GEMM needs the CUTLASS build");
-#endif // GGML_CUDA_CUTLASS
 }
+#endif // GGML_CUDA_CUTLASS
 
 // the same at the GEMV batch (<= MMF8_GEMV_MAX_NCOLS tokens): one launch over all matrices
 void ggml_cuda_mul_mat_f8_shared_gemv(ggml_backend_cuda_context & ctx, ggml_tensor ** dsts, const int n) {

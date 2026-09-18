@@ -70,6 +70,11 @@ static const llm_fused_op_probe llm_fused_op_lid_probe = {
 static bool llama_attn_implicit_mask_supported(const llama_model & model, ggml_type type_k, ggml_type type_v) {
     const auto & hparams = model.hparams;
 
+    // ALiBi rides on the mask tensor (ggml_flash_attn_ext asserts one when max_bias > 0), so there is nothing to drop
+    if (hparams.f_max_alibi_bias > 0.0f) {
+        return false;
+    }
+
     int32_t il = -1;
     for (uint32_t i = 0; i < hparams.n_layer(); ++i) {
         if (!hparams.is_recr(i)) {
@@ -767,15 +772,20 @@ void llama_context::sched_reserve() {
     resolve_fused_ops(mctx.get(), n_seqs);
 
     {
-        // the K/V cache types come from the attention memory (plain or the attention part of a hybrid model)
+        // the K/V cache types come from the attention memory (plain or the attention part of a hybrid model); a
+        // K-only cache (MLA) has no V tensor to report, and the mask-free path does not serve it
         ggml_type type_k = GGML_TYPE_COUNT;
         ggml_type type_v = GGML_TYPE_COUNT;
         if (const auto * kv_ctx = dynamic_cast<const llama_kv_cache_context *>(mctx.get())) {
-            type_k = kv_ctx->type_k();
-            type_v = kv_ctx->type_v();
+            if (kv_ctx->has_v()) {
+                type_k = kv_ctx->type_k();
+                type_v = kv_ctx->type_v();
+            }
         } else if (const auto * hyb_ctx = dynamic_cast<const llama_memory_hybrid_context *>(mctx.get())) {
-            type_k = hyb_ctx->get_attn()->type_k();
-            type_v = hyb_ctx->get_attn()->type_v();
+            if (hyb_ctx->get_attn()->has_v()) {
+                type_k = hyb_ctx->get_attn()->type_k();
+                type_v = hyb_ctx->get_attn()->type_v();
+            }
         }
         cparams.attn_implicit_mask = type_k != GGML_TYPE_COUNT && cparams.flash_attn && cparams.causal_attn &&
             llama_attn_implicit_mask_supported(model, type_k, type_v);

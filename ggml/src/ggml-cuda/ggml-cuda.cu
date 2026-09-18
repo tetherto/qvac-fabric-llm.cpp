@@ -3999,8 +3999,9 @@ static int ggml_cuda_match_ssm_conv_l2_run(const ggml_cgraph * cgraph, int node_
                 v->nb[2] != silu->nb[1] || v->nb[3] != silu->nb[2] || v->ne[2] != silu->ne[1] || v->ne[3] != silu->ne[2]) {
                 break;
             }
+            const int64_t fsz = sizeof(float);
             const int64_t off = (const char *) v->data - (const char *) silu->data;
-            if (off < 0 || off % (head_dim*sizeof(float)) != 0 || off/sizeof(float) + v->ne[1]*head_dim > n_ch) {
+            if (off < 0 || off % (head_dim*fsz) != 0 || off/fsz + v->ne[1]*head_dim > n_ch) {
                 break;
             }
             if (t->nb[0] != sizeof(float) || !ggml_are_same_shape(t, v)) {
@@ -4445,7 +4446,7 @@ static int ggml_cuda_try_conv_tokens_fusion(const ggml_cgraph * cgraph, int node
 // no output flags), the kernel also skips their f32 stores: the pack is the only output (the gdn op aborts instead of
 // falling back if the AOT launch fails). Silent when the node is absent or shaped differently: the gdn op packs from
 // the f32 tensors. GGML_CUDA_DISABLE_GDN_PACK=1 turns it off for A/B runs
-static void ggml_cuda_conv_tokens_pack_for_gdn(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int node_idx,
+static void ggml_cuda_conv_tokens_pack_for_gdn(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph,
                                                int first_idx, const int * written,
                                                ggml_cuda_ssm_conv_tokens_args & ta, ggml_cuda_ssm_conv_l2 & l2) {
     constexpr int64_t S = 128;
@@ -4619,17 +4620,19 @@ static int ggml_cuda_try_shared_src1_mul_mat_f8(ggml_backend_cuda_context * ctx,
         return 0;
     }
 
-    bool aligned = (uintptr_t) src1->data % 16 == 0;
-    for (int m = 0; m < n; ++m) {
-        aligned = aligned && (uintptr_t) dsts[m]->data % 16 == 0;
-    }
+#ifdef GGML_CUDA_CUTLASS
     if (ggml_cuda_mul_mat_f8_uses_cutlass(*ctx, node->src[0], src1)) {
+        bool aligned = (uintptr_t) src1->data % 16 == 0;
+        for (int m = 0; m < n; ++m) {
+            aligned = aligned && (uintptr_t) dsts[m]->data % 16 == 0;
+        }
         if (!aligned) {
             return 0;
         }
         ggml_cuda_mul_mat_f8_shared_cutlass(*ctx, dsts, n);
         return count - 1;
     }
+#endif // GGML_CUDA_CUTLASS
     if (ggml_nrows(src1) <= ggml_cuda_mmf8_gemv_max_ncols()) {
         ggml_cuda_mul_mat_f8_shared_gemv(*ctx, dsts, n);
         return count - 1;
@@ -4669,7 +4672,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         int written[1 + GGML_CUDA_SSM_CONV_MAX_L2];
         const int tokens_to_skip = ggml_cuda_try_conv_tokens_fusion(cgraph, i, ta, l2, written);
         if (tokens_to_skip > 0) {
-            ggml_cuda_conv_tokens_pack_for_gdn(*cuda_ctx, cgraph, i, i + tokens_to_skip + 1, written, ta, l2);
+            ggml_cuda_conv_tokens_pack_for_gdn(*cuda_ctx, cgraph, i + tokens_to_skip + 1, written, ta, l2);
             ggml_cuda_op_ssm_conv_tokens(*cuda_ctx, ta, l2);
             return tokens_to_skip;
         }
@@ -4684,6 +4687,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     // swiglu(gate, up) consumed only by an F8 mul_mat on the CUTLASS route: the product is quantized straight into the
     // GEMM's e4m3 input. No memory-range check: the only kernel reading gate and up writes pool buffers, and the GEMM
     // writing dst runs after it on the same stream
+#ifdef GGML_CUDA_CUTLASS
     if (node->op == GGML_OP_GLU && i + 1 < cgraph->n_nodes) {
         ggml_tensor * mm = cgraph->nodes[i + 1];
         const ggml_tensor * gate = node->src[0];
@@ -4700,6 +4704,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             return 1;
         }
     }
+#endif // GGML_CUDA_CUTLASS
 
     // gated delta net gate projections at small batch: alpha mul_mat -> add(dt_bias) -> softplus -> mul(a) and
     // beta mul_mat (same input) -> sigmoid, with the builder's views in between, one launch for all of it

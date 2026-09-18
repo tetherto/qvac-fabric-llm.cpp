@@ -9,17 +9,21 @@ void ggml_cuda_mul_mat_f8(ggml_backend_cuda_context & ctx, const ggml_tensor * s
 // built in, not disabled by GGML_CUDA_DISABLE_MMF8_CUTLASS)
 bool ggml_cuda_mul_mat_f8_uses_cutlass(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1);
 
+#ifdef GGML_CUDA_CUTLASS
 // the CUTLASS route for dst = mul_mat(src0, glu) where glu = swiglu_split(gate, up): silu(gate) * up is quantized
 // straight into the GEMM's e4m3 input, the GLU output is never written
 void ggml_cuda_mul_mat_f8_glu_cutlass(ggml_backend_cuda_context & ctx, const ggml_tensor * glu, ggml_tensor * dst);
+
+// n (2 or 3) F8 mul_mat nodes sharing one F32 src1, at the CUTLASS batch: quantize once, then one GEMM per weight
+void ggml_cuda_mul_mat_f8_shared_cutlass(ggml_backend_cuda_context & ctx, ggml_tensor ** dsts, int n);
+#endif // GGML_CUDA_CUTLASS
 
 // one GEMV launch for the up and gate mul_mats of a swiglu (same activation, F8 weights of the same shape), batch <= 8;
 // writes silu(gate) * up into the GLU output from the same per-row sums the separate launches produce
 void ggml_cuda_mul_mat_f8_gemv_glu(ggml_backend_cuda_context & ctx, const ggml_tensor * up, const ggml_tensor * gate, ggml_tensor * glu);
 
-// n (2 or 3) F8 mul_mat nodes sharing one F32 src1: quantize once + one CUTLASS GEMM each (CUTLASS batch), or one
-// multi-weight GEMV launch (batch <= 8); dsts are the mul_mat nodes, each with its weight in src[0] and scales in src[2]
-void ggml_cuda_mul_mat_f8_shared_cutlass(ggml_backend_cuda_context & ctx, ggml_tensor ** dsts, int n);
+// n (2 or 3) F8 mul_mat nodes sharing one F32 src1: one multi-weight GEMV launch (batch <= 8); dsts are the mul_mat
+// nodes, each with its weight in src[0] and scales in src[2]
 void ggml_cuda_mul_mat_f8_shared_gemv(ggml_backend_cuda_context & ctx, ggml_tensor ** dsts, int n);
 #define GGML_CUDA_MMF8_SHARED_MAX 3
 #define GGML_CUDA_MMF8_GEMV_MAX_NCOLS 8
