@@ -4725,8 +4725,8 @@ struct test_gated_delta_net_precision : public test_gated_delta_net {
     const float gate_min;
     std::vector<ggml_tensor *> outputs;
 
-    test_gated_delta_net_precision(int v_repeat, int tokens, float value_scale = 1.0f, float state_scale = 1.0f, float gate_max = -0.01f, float gate_min = -0.03f)
-        : test_gated_delta_net(GGML_TYPE_F32, 16, 128, tokens, 1, v_repeat),
+    test_gated_delta_net_precision(int v_repeat, int tokens, float value_scale = 1.0f, float state_scale = 1.0f, float gate_max = -0.01f, float gate_min = -0.03f, int sequences = 1)
+        : test_gated_delta_net(GGML_TYPE_F32, 16, 128, tokens, sequences, v_repeat),
           value_scale(value_scale), state_scale(state_scale), gate_max(gate_max), gate_min(gate_min) {}
 
     std::string op_desc(ggml_tensor *) override { return "GATED_DELTA_NET_PRECISION"; }
@@ -4743,8 +4743,8 @@ struct test_gated_delta_net_precision : public test_gated_delta_net {
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * gdn = test_gated_delta_net::build_graph(ctx);
-        const int64_t attn_size = head_size * head_count * v_repeat * n_seq_tokens;
-        const int64_t state_size = head_size * head_size * head_count * v_repeat;
+        const int64_t attn_size = head_size * head_count * v_repeat * n_seq_tokens * n_seqs;
+        const int64_t state_size = head_size * head_size * head_count * v_repeat * n_seqs;
         ggml_tensor * attn = ggml_cont(ctx, ggml_view_1d(ctx, gdn, attn_size, 0));
         ggml_tensor * state = ggml_cont(ctx, ggml_view_1d(ctx, gdn, state_size, attn_size * sizeof(float)));
         ggml_set_name(attn, "attn_out");
@@ -12253,6 +12253,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             }
         }
     }
+
+    // Split scheduling threshold, partial chunks, and multi-sequence fallback.
+    for (int tokens : {2047, 2048, 2049, 4097}) {
+        test_cases.emplace_back(new test_gated_delta_net_precision(2, tokens));
+    }
+    test_cases.emplace_back(new test_gated_delta_net_precision(2, 2048, 1.0f, 1.0f, -0.01f, -0.03f, 2));
 
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 1, 1));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 16, 1, 1));

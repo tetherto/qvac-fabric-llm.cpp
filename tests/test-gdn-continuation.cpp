@@ -13,7 +13,6 @@
 namespace {
 
 constexpr int64_t D       = 128;
-constexpr int64_t H       = 48;
 constexpr int64_t H_K     = 16;
 constexpr int     REPLAYS = 4;
 
@@ -45,7 +44,7 @@ static ggml_backend_t gpu_backend() {
     return nullptr;
 }
 
-static inputs make_inputs(int64_t tokens) {
+static inputs make_inputs(int64_t tokens, int64_t H) {
     inputs data;
     data.q.resize(D * H_K * tokens);
     data.k.resize(D * H_K * tokens);
@@ -95,12 +94,12 @@ static ggml_tensor * token_view(
 
 static ggml_tensor * scalar_token_view(
         ggml_context * ctx, ggml_tensor * tensor, int64_t begin, int64_t count) {
-    return ggml_view_4d(ctx, tensor, 1, H, count, 1, tensor->nb[1], tensor->nb[2], tensor->nb[3],
+    return ggml_view_4d(ctx, tensor, 1, tensor->ne[1], count, 1, tensor->nb[1], tensor->nb[2], tensor->nb[3],
                         begin * tensor->nb[2]);
 }
 
 static bool run_graph(
-        ggml_backend_t backend, const inputs & data, int64_t tokens, int64_t split, int repeats, outputs & result) {
+        ggml_backend_t backend, const inputs & data, int64_t tokens, int64_t split, int repeats, outputs & result, int64_t H) {
     ggml_init_params params = {
         64 * ggml_tensor_overhead() + ggml_graph_overhead_custom(64, false),
         nullptr,
@@ -205,7 +204,7 @@ static double nmse(const std::vector<float> & reference, const std::vector<float
     return norm == 0.0 ? error : error / norm;
 }
 
-static int child_main(int64_t tokens, int64_t split) {
+static int child_main(int64_t tokens, int64_t split, int64_t H = 48) {
     ggml_backend_load_all();
     ggml_backend_ptr gpu(gpu_backend());
     if (!gpu) {
@@ -217,11 +216,11 @@ static int child_main(int64_t tokens, int64_t split) {
         return 1;
     }
 
-    const inputs data = make_inputs(tokens);
+    const inputs data = make_inputs(tokens, H);
     outputs      reference;
     outputs      actual;
-    if (!run_graph(cpu.get(), data, tokens, split, 1, reference) ||
-        !run_graph(gpu.get(), data, tokens, split, REPLAYS, actual)) {
+    if (!run_graph(cpu.get(), data, tokens, split, 1, reference, H) ||
+        !run_graph(gpu.get(), data, tokens, split, REPLAYS, actual, H)) {
         return 1;
     }
 
@@ -233,8 +232,8 @@ static int child_main(int64_t tokens, int64_t split) {
     const bool   ok = attn_error <= tolerance && state_error <= tolerance &&
                       continuation_attn_error <= tolerance && continuation_state_error <= tolerance;
 
-    printf("RESULT ok=%d mma=%d tokens=%lld split=%lld attn=%.9e state=%.9e split_attn=%.9e split_state=%.9e\n",
-           ok ? 1 : 0, actual.mma_allocated ? 1 : 0, (long long) tokens, (long long) split, attn_error, state_error,
+    printf("RESULT ok=%d mma=%d heads=%lld tokens=%lld split=%lld attn=%.9e state=%.9e split_attn=%.9e split_state=%.9e\n",
+           ok ? 1 : 0, actual.mma_allocated ? 1 : 0, (long long) H, (long long) tokens, (long long) split, attn_error, state_error,
            continuation_attn_error, continuation_state_error);
     return ok ? 0 : 1;
 }
@@ -242,17 +241,23 @@ static int child_main(int64_t tokens, int64_t split) {
 } // namespace
 
 int main(int argc, char ** argv) {
-    if (argc == 4 && strcmp(argv[1], "--child") == 0) {
+    if ((argc == 4 || argc == 5) && strcmp(argv[1], "--child") == 0) {
         const int64_t tokens = atoll(argv[2]);
         const int64_t split  = atoll(argv[3]);
         if (tokens <= 1 || split <= 0 || split >= tokens) {
             return 1;
         }
-        return child_main(tokens, split);
-    }
-    for (int64_t tokens : { 63, 64, 65, 127, 128, 129, 512, 1024, 2048 }) {
-        if (child_main(tokens, tokens / 2) != 0) {
+        const int64_t heads = argc == 5 ? atoll(argv[4]) : 48;
+        if (heads != 32 && heads != 48) {
             return 1;
+        }
+        return child_main(tokens, split, heads);
+    }
+    for (int64_t tokens : { 63, 64, 65, 127, 128, 129, 512, 1024, 2047, 2048, 2049, 4097 }) {
+        for (int64_t heads : {32, 48}) {
+            if (child_main(tokens, tokens / 2, heads) != 0) {
+                return 1;
+            }
         }
     }
     return 0;
