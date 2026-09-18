@@ -812,6 +812,7 @@ struct ggml_backend_opencl_context {
     bool fuse_mm_glu = true;                     // opt-out GGML_OPENCL_FUSE_MM_GLU=0 (byte-identical gate+up GEMV + GLU, q4_K FFN)
     bool fuse_rms_add = true;                    // opt-out GGML_OPENCL_FUSE_RMS_ADD=0 (fused rms_norm*w + residual)
     bool f16_mrow = true;                        // opt-out GGML_OPENCL_F16_MROW=0 (multi-row-per-WG f16 decode GEMV for attn proj + lm_head)
+    bool wide_gemv_wg_ok = true;                 // every tiled/o4 lm_head GEMV kernel accepts the {64,4,1} launch on this device (checked at creation)
     int  f16_mrow_rpt = 1;                       // GGML_OPENCL_F16_MROW_RPT={1,2,4,8,16} rows-per-subgroup register blocking
 
     // ragged moe, use int to directly pass to kernel
@@ -2221,6 +2222,23 @@ static std::string ggml_opencl_make_compile_opts(const ggml_backend_opencl_conte
     }
 
     return compile_opts;
+}
+
+// The tiled and o4 lm_head/embed GEMV kernels are launched 64x4 work-items per
+// group, like the 2-output kernel they replace. A compiler can still give one of
+// them a smaller per-kernel cap (register and private-memory pressure differ per
+// driver); enqueueing it then fails and CL_CHECK aborts the process in the middle
+// of decode. Check the cap once at creation and keep the dispatch on the 2-output
+// kernels when a variant would not fit.
+static void check_wide_gemv_workgroup(ggml_backend_opencl_context *backend_ctx, cl_kernel kernel, const char *name) {
+    const size_t needed = 64 * 4;
+    size_t cap = 0;
+    cl_int err = clGetKernelWorkGroupInfo(kernel, backend_ctx->device, CL_KERNEL_WORK_GROUP_SIZE, sizeof(cap), &cap, NULL);
+    if (err != CL_SUCCESS || cap < needed) {
+        GGML_LOG_WARN("ggml_opencl: %s: work-group cap %zu < %zu (err %d), lm_head GEMV stays on the 2-output kernels\n",
+                      name, cap, needed, err);
+        backend_ctx->wide_gemv_wg_ok = false;
+    }
 }
 
 static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
@@ -6623,6 +6641,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         cl_program prog = build_program_from_source(
             backend_ctx, kernel_src.c_str(), CL_gemv_compile_opts);
         CL_CHECK((backend_ctx->kernel_gemv_noshuffle_q4_k_f32_o4 = clCreateKernel(prog, "kernel_gemv_noshuffle_q4_k_f32_o4", &err), err));
+        check_wide_gemv_workgroup(backend_ctx, backend_ctx->kernel_gemv_noshuffle_q4_k_f32_o4, "kernel_gemv_noshuffle_q4_k_f32_o4");
         CL_CHECK(clReleaseProgram(prog));
         GGML_LOG_CONT(".");
     }
@@ -6642,6 +6661,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
             build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
         CL_CHECK((backend_ctx->kernel_gemv_noshuffle_q4_k_f32_tiled =
             clCreateKernel(prog, "kernel_gemv_noshuffle_q4_k_f32_tiled", &err), err));
+        check_wide_gemv_workgroup(backend_ctx, backend_ctx->kernel_gemv_noshuffle_q4_k_f32_tiled, "kernel_gemv_noshuffle_q4_k_f32_tiled");
         CL_CHECK(clReleaseProgram(prog));
         GGML_LOG_CONT(".");
     }
@@ -7540,6 +7560,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
             build_program_from_source(backend_ctx, kernel_src.c_str(), CL_gemv_compile_opts);
 
         CL_CHECK((backend_ctx->kernel_gemv_noshuffle_q6_K_f32_o4 = clCreateKernel(prog, "kernel_gemv_noshuffle_q6_K_f32_o4", &err), err));
+        check_wide_gemv_workgroup(backend_ctx, backend_ctx->kernel_gemv_noshuffle_q6_K_f32_o4, "kernel_gemv_noshuffle_q6_K_f32_o4");
         CL_CHECK(clReleaseProgram(prog));
 
         // Global-read variant: weights read from __global coalesced instead of
@@ -7548,6 +7569,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         cl_program prog_g = build_program_from_source(backend_ctx, kernel_src.c_str(), CL_gemv_compile_opts + " -DQ6K_O4_GLOBAL");
         CL_CHECK((backend_ctx->kernel_gemv_noshuffle_q6_K_f32_o4_global =
             clCreateKernel(prog_g, "kernel_gemv_noshuffle_q6_K_f32_o4_global", &err), err));
+        check_wide_gemv_workgroup(backend_ctx, backend_ctx->kernel_gemv_noshuffle_q6_K_f32_o4_global, "kernel_gemv_noshuffle_q6_K_f32_o4_global");
         CL_CHECK(clReleaseProgram(prog_g));
         GGML_LOG_CONT(".");
     }
@@ -7567,6 +7589,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
             build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
         CL_CHECK((backend_ctx->kernel_gemv_noshuffle_q6_K_f32_tiled =
             clCreateKernel(prog, "kernel_gemv_noshuffle_q6_K_f32_tiled", &err), err));
+        check_wide_gemv_workgroup(backend_ctx, backend_ctx->kernel_gemv_noshuffle_q6_K_f32_tiled, "kernel_gemv_noshuffle_q6_K_f32_tiled");
         CL_CHECK((backend_ctx->kernel_gemv_noshuffle_q6_K_f32_tiled_mc3 =
             clCreateKernel(prog, "kernel_gemv_noshuffle_q6_K_f32_tiled_mc3", &err), err));
         CL_CHECK(clReleaseProgram(prog));
@@ -11535,6 +11558,26 @@ inline bool use_adreno_moe_kernels(const ggml_backend_opencl_context *backend_ct
     return (((strstr(tensor->name, "ffn") != NULL) && (strstr(tensor->name, "exps") != NULL)) || (strstr(tensor->name, "as") != NULL)) && (ne01 % 32 == 0);
 }
 
+// Whether the tiled/o4 lm_head GEMV variants can be launched at all on this
+// device (see check_wide_gemv_workgroup). Not overridable: a variant that does
+// not fit aborts in clEnqueueNDRangeKernel.
+inline bool wide_gemv_usable(const ggml_backend_opencl_context *backend_ctx) {
+    return backend_ctx && backend_ctx->wide_gemv_wg_ok;
+}
+
+// Default for the tiled and o4 lm_head/embed GEMV variants. Off on the E031.47
+// compiler: the Galaxy S25 Ultra (Adreno 830, E031.47) aborts in
+// clEnqueueNDRangeKernel on the q6_K variant during decode, while the S26 Ultra
+// (Adreno 840, E031.50) runs the same kernels, and E031.47 already miscompiles
+// the MoE repack (use_cpu_q4_k_moe_repack). Those devices keep the 2-output
+// kernels the 10549 line shipped. The GGML_OPENCL_{Q4K,Q6K}_GEMV_{TILED,O4} knobs
+// still force a variant on for experiments.
+inline bool wide_gemv_default_on(const ggml_backend_opencl_context *backend_ctx) {
+    return wide_gemv_usable(backend_ctx) &&
+           !(backend_ctx->adreno_cl_compiler_version.type == ADRENO_CL_COMPILER_TYPE::E031 &&
+             backend_ctx->adreno_cl_compiler_version.major == 47);
+}
+
 // Device default for the tiled-wide lm_head/embed GEMV layout: ON for X2E and A8X.
 //
 // These kernels were previously off everywhere on the grounds that they compute
@@ -11559,8 +11602,27 @@ inline bool use_adreno_moe_kernels(const ggml_backend_opencl_context *backend_ct
 // order bias. A7X regresses hard on this layout and stays off.
 // GGML_OPENCL_{Q4K,Q6K}_GEMV_TILED forces either way (=0 off, any other value on).
 inline bool tiled_gemv_default_on(const ggml_backend_opencl_context *backend_ctx) {
-    return backend_ctx && (backend_ctx->adreno_gen == ADRENO_GPU_GEN::X2E ||
-                           backend_ctx->adreno_gen == ADRENO_GPU_GEN::A8X);
+    return wide_gemv_default_on(backend_ctx) &&
+           (backend_ctx->adreno_gen == ADRENO_GPU_GEN::X2E ||
+            backend_ctx->adreno_gen == ADRENO_GPU_GEN::A8X);
+}
+
+// o4 lm_head/embed GEMV (default on where wide_gemv_default_on; forced either
+// way by GGML_OPENCL_{Q6K,Q4K}_GEMV_O4: =0 off, else on).
+inline bool q6k_gemv_o4_enabled(const ggml_backend_opencl_context *backend_ctx) {
+    static const char * e = std::getenv("GGML_OPENCL_Q6K_GEMV_O4");
+    if (e && e[0] != '\0') {
+        return e[0] != '0' && wide_gemv_usable(backend_ctx);
+    }
+    return wide_gemv_default_on(backend_ctx);
+}
+
+inline bool q4k_gemv_o4_enabled(const ggml_backend_opencl_context *backend_ctx) {
+    static const char * e = std::getenv("GGML_OPENCL_Q4K_GEMV_O4");
+    if (e && e[0] != '\0') {
+        return e[0] != '0' && wide_gemv_usable(backend_ctx);
+    }
+    return wide_gemv_default_on(backend_ctx);
 }
 
 // Tiled-wide q6_K GEMV (default OFF; GGML_OPENCL_Q6K_GEMV_TILED forces either
@@ -11570,7 +11632,7 @@ inline bool tiled_gemv_default_on(const ggml_backend_opencl_context *backend_ctx
 inline bool q6k_gemv_tiled_enabled(const ggml_backend_opencl_context *backend_ctx) {
     static const char * e = std::getenv("GGML_OPENCL_Q6K_GEMV_TILED");
     if (e && e[0] != '\0') {
-        return e[0] != '0';
+        return e[0] != '0' && wide_gemv_usable(backend_ctx);
     }
     return tiled_gemv_default_on(backend_ctx);
 }
@@ -11593,7 +11655,7 @@ inline bool q4k_gemv_tiled_enabled(const ggml_backend_opencl_context *backend_ct
     }
     static const char * e = std::getenv("GGML_OPENCL_Q4K_GEMV_TILED");
     if (e && e[0] != '\0') {
-        return e[0] != '0';
+        return e[0] != '0' && wide_gemv_usable(backend_ctx);
     }
     return tiled_gemv_default_on(backend_ctx);
 }
@@ -26947,11 +27009,7 @@ static void ggml_cl_mul_mat_q4_k_f32_adreno(ggml_backend_t backend, const ggml_t
         // (ne01 = vocab ~256K on Gemma): shares one activation read across 4
         // output rows. Gated to large ne01 (lm_head/embed). Default on; opt-out
         // GGML_OPENCL_Q4K_GEMV_O4=0. (Skipped when mc3 handles the ne1==3 verify.)
-        static const bool q4k_o4_env = []{
-            const char * e = std::getenv("GGML_OPENCL_Q4K_GEMV_O4");
-            return !e || e[0] == '\0' || e[0] != '0';
-        }();
-        const bool use_q4k_o4 = !use_tiled && !use_mc3 && q4k_o4_env && (ne01 % 4 == 0) && (ne01 >= 32768);
+        const bool use_q4k_o4 = !use_tiled && !use_mc3 && q4k_gemv_o4_enabled(backend_ctx) && (ne01 % 4 == 0) && (ne01 >= 32768);
         // Split-K across workgroups for small-M decode GEMVs. A single-token GEMV
         // makes only CEIL_DIV(M/2,64) workgroups; even with the wide intra-WG split
         // (16 subgroups) those all land on ONE CU, so small-M matmuls under-fill the
@@ -27771,18 +27829,15 @@ static void ggml_cl_mul_mat_q6_K_f32_adreno(ggml_backend_t backend, const ggml_t
         // kernel (o4 regresses there). o4_global reads the weights from __global
         // coalesced instead of image1d_buffer -- the texture cache caps the
         // read-once-per-token lm_head bandwidth, while __global reaches the higher
-        // rate the rest of the model gets. Both default ON; opt out via
-        // GGML_OPENCL_Q6K_GEMV_O4 / GGML_OPENCL_Q6K_GEMV_O4_GLOBAL = 0.
-        static const bool gemv_o4_env = []{
-            const char * e = std::getenv("GGML_OPENCL_Q6K_GEMV_O4");
-            return !e || e[0] == '\0' || e[0] != '0';
-        }();
+        // rate the rest of the model gets. o4 defaults per wide_gemv_default_on
+        // (GGML_OPENCL_Q6K_GEMV_O4 forces it); o4_global defaults ON, opt out via
+        // GGML_OPENCL_Q6K_GEMV_O4_GLOBAL = 0.
         static const bool o4_global_env = []{
             const char * e = std::getenv("GGML_OPENCL_Q6K_GEMV_O4_GLOBAL");
             return !e || e[0] == '\0' || e[0] != '0';
         }();
         const bool use_tiled     = !use_q6k_mc3 && use_q6k_tiled(backend_ctx, src0);
-        const bool use_o4        = !use_tiled && !use_q6k_mc3 && gemv_o4_env && (ne01 % 4 == 0) && (ne01 >= 32768);
+        const bool use_o4        = !use_tiled && !use_q6k_mc3 && q6k_gemv_o4_enabled(backend_ctx) && (ne01 % 4 == 0) && (ne01 >= 32768);
         const bool use_o4_global = use_o4 && o4_global_env;
 
         // ql/qh image views are only needed when NOT reading weights from global.
