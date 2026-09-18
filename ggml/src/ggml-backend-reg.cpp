@@ -563,18 +563,17 @@ static ggml_backend_reg_t ggml_backend_load_best(const char * name, bool silent,
         }
     }
 
-    // In the case of Android, we can load with just the library filename, without pre-pending any path
+#ifdef __ANDROID__
+    // Android can load an APK-embedded library by filename without a path.
     if (best_path.empty()) {
         // From worst to best
         std::vector<fs::path> names = { name_path };
-#ifdef __ANDROID__
         if (strcmp(name, "cpu") == 0) {
             names.emplace_back("cpu-android_armv8.0_1");
             names.emplace_back("cpu-android_armv8.2_1");
             names.emplace_back("cpu-android_armv8.2_2");
             names.emplace_back("cpu-android_armv8.6_1");
         }
-#endif
         for (size_t scoreOffset = 0; scoreOffset < names.size(); ++scoreOffset) {
             const auto & loopNamePath = names[scoreOffset];
             // Try loading backend with just the library name, leave to dlopen path resolution.
@@ -583,6 +582,7 @@ static ggml_backend_reg_t ggml_backend_load_best(const char * name, bool silent,
             tryEntryWithScore(filename, 1+scoreOffset);
         }
     }
+#endif
 
     return get_reg().load_backend(best_path, silent);
 }
