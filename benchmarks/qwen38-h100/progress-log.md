@@ -1111,3 +1111,41 @@ scheduling inside these two kernels, not arithmetic: the activation slab is rest
 is as many bytes as the weights that slab consumes, and `ncu` cannot be used on this host to confirm where the
 stalls are (ERR_NVGPUCTRPERM). The batch-8 CUTLASS W8A8 GEMM, still 23.7 ms per step and blocked on its activation
 quantization accuracy, is the other standing option.
+
+## Decode weight pipeline: cp.async double-buffered F8 weight staging (2026-09-18, user ask)
+Goal (user): chase the last 1.5x of decode scaling inside the F8 tensor-core matmul, starting with the multi-weight
+kernel, by pipelining the weight staging instead of adding arithmetic.
+Current state: batch 8 at 10240 + 128 runs S_TG 367.1 on `llama-batched-bench` and decode_agg 314 on the server at
+N=8. The F8 matmul family is 935 ms of kernel time over the profiled run; the multi kernel is 437.8 ms of that at
+106.9 us per launch, which is 1.67 TB/s of weight traffic where the batch-1 GEMV reaches 2.68 TB/s. One pass of the
+26 GB of weights is 8.7 ms at 3 TB/s, so the floor for a batch-8 step is about 14.6 ms against 21.8 ms today.
+Correction to the premise: the activation slab is already resident across both A-tile passes. It is staged once per
+128-k slab and then held in `tile_B` registers, which survive the weight staging that overwrites the shared tile.
+What is not pipelined is the weight path: per A tile the warp issues four `uint4` global loads, converts them,
+stores them into the one per-warp staging tile, syncs, `ldmatrix`es, and only then issues the next tile's loads.
+With 2 A tiles per slab (4 with a fused up/gate) and about 3 slabs per warp per block, nothing is in flight while
+the MMA runs.
+Path: E1, two-stage `cp.async` pipeline. New `cp_async_commit_group` and `cp_async_wait_group<n>` helpers in
+`cp-async.cuh` (the file only has `cp_async_wait_all`, which cannot leave a younger group in flight), two raw
+weight slots per warp in a separate 16 KB shared array, and the k loop flattened over `t = g*ntA + itA` so tile
+t + 1 is issued before tile t is consumed, crossing slab boundaries. The raw slot holds the e4m3 bytes; the
+conversion to `half2` happens on the way into the `ldmatrix` tile, so each lane converts exactly the 16 bytes it
+copied and only the cross-lane `ldmatrix` needs a `__syncwarp`. The first issue must follow
+`ggml_cuda_pdl_sync()`, because PDL forbids touching producer memory before the grid dependency is waited.
+E2, f16 activation: the B tile is f16 but the kernel reads 4 bytes per activation element and converts 8 per lane
+per slab, and every row block of every launch re-reads the same activation out of L2 (about 35 MB per multi launch
+against 142 MB of weight traffic). Convert once per launch into a pool buffer with the existing
+`ggml_get_to_fp16_cuda` path and stage 8 bytes per lane instead of 16.
+Fail path: E3, two k-slabs per warp trip, doubling `kstride` and the `tile_B` sets so the activation staging is
+amortised over twice the weight work and the scheduler gets two independent MMA chains. Only if E1 and E2 together
+land under 5% at batch 8.
+Accept rules, pre-committed, all same-day A/B against a retained pre-change binary: E1 needs 3% at batch 8 and no
+more than 1% off batch 4; E2 needs 2% and must not grow the conversion family past 3% of decode kernel time; E3
+needs 3%. Batch 1 and batch 16 must not move at all, since those routes are untouched. `ncu` is unusable on this
+host (ERR_NVGPUCTRPERM), so attribution is the nsys per-kernel total of `mul_mat_f8_e4m3_mma_multi<8>` against the
+437.8 ms measured today, profiled on both sides in the same session.
+Op-test coverage: the existing MUL_MAT_F8, MUL_MAT_F8_FFN and MUL_MAT_F8_SHARED cases, plus MUL_MAT_F8 again with
+`GGML_CUDA_MMF8_MMA_MIN=9` to prove the GEMV path is untouched.
+Gate: this iteration must not change values, so the bar is tighter than G1. Mean KLD at most 0.000030 and Same top
+p at least 99.7% at `-ub 4` and `-ub 8` against `kld-r1-q8h-ub{4,8}-4c.bin`, where the kept kernel measured
+0.000015 / 99.780% and 0.000017 / 99.890%.
