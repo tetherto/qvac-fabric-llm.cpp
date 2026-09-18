@@ -400,14 +400,14 @@ gated_delta_net_chunked_cuda(const float * q,
             float x1 = Gs[32 + lane];
 #pragma unroll
             for (int off = 1; off < 32; off <<= 1) {
-                const float y0 = __shfl_up_sync(0xffffffff, x0, off);
-                const float y1 = __shfl_up_sync(0xffffffff, x1, off);
+                const float y0 = __shfl_up_sync(0xffffffff, x0, off, 32);
+                const float y1 = __shfl_up_sync(0xffffffff, x1, off, 32);
                 if (lane >= off) {
                     x0 += y0;
                     x1 += y1;
                 }
             }
-            x1 += __shfl_sync(0xffffffff, x0, 31);
+            x1 += __shfl_sync(0xffffffff, x0, 31, 32);
             Gs[lane]      = x0;
             Gs[32 + lane] = x1;
         }
