@@ -2036,6 +2036,131 @@ void ggml_compute_forward_repeat_back(
 
 // ggml_compute_forward_concat
 
+// copy tile size, also the work granularity along dim 1
+static constexpr int64_t concat_block = 32;
+
+// copy src[:, c0:c1, i2, i3] into dst at offset (o0, o1, o2, o3), dst must be contiguous
+template <typename T>
+static void ggml_concat_copy_rows(
+        const ggml_tensor * src,
+        ggml_tensor * dst,
+        int64_t o0, int64_t o1, int64_t o2, int64_t o3,
+        int64_t i2, int64_t i3,
+        int64_t c0, int64_t c1) {
+
+    const int64_t ne00 = src->ne[0];
+
+    const size_t nb00 = src->nb[0];
+    const size_t nb01 = src->nb[1];
+    const size_t nb02 = src->nb[2];
+    const size_t nb03 = src->nb[3];
+
+    const size_t nb1 = dst->nb[1];
+
+    const size_t ts = sizeof(T);
+
+    char       * y0 = (char *) dst->data + o0*ts + o1*nb1 + (i2 + o2)*dst->nb[2] + (i3 + o3)*dst->nb[3];
+    const char * x0 = (const char *) src->data + i2*nb02 + i3*nb03;
+
+    if (nb00 == ts) {
+        for (int64_t i1 = c0; i1 < c1; i1++) {
+            memcpy(y0 + i1*nb1, x0 + i1*nb01, ne00*ts);
+        }
+        return;
+    }
+
+    if (nb01 == ts) {
+        // dim0/dim1-transposed source: walk it in tiles, so that each source
+        // cache line is fully consumed before moving to the next one
+        for (int64_t t0 = 0; t0 < ne00; t0 += concat_block) {
+            const int64_t t1 = MIN(t0 + concat_block, ne00);
+            for (int64_t i1 = c0; i1 < c1; i1++) {
+                T * y = (T *) (y0 + i1*nb1);
+                const char * x = x0 + i1*nb01;
+                for (int64_t i0 = t0; i0 < t1; i0++) {
+                    y[i0] = *(const T *) (x + i0*nb00);
+                }
+            }
+        }
+        return;
+    }
+
+    for (int64_t i1 = c0; i1 < c1; i1++) {
+        T * y = (T *) (y0 + i1*nb1);
+        const char * x = x0 + i1*nb01;
+        for (int64_t i0 = 0; i0 < ne00; i0++) {
+            y[i0] = *(const T *) (x + i0*nb00);
+        }
+    }
+}
+
+template <typename T>
+static void ggml_concat_copy_src(
+        const ggml_tensor * src,
+        ggml_tensor * dst,
+        int64_t o0, int64_t o1, int64_t o2, int64_t o3,
+        int ith, int nth) {
+
+    const int64_t n_blocks = (src->ne[1] + concat_block - 1) / concat_block;
+
+    const int64_t nr  = src->ne[2]*src->ne[3]*n_blocks;
+    const int64_t dr  = (nr + nth - 1)/nth;
+    const int64_t ir0 = dr*ith;
+    const int64_t ir1 = MIN(ir0 + dr, nr);
+
+    for (int64_t ir = ir0; ir < ir1; ir++) {
+        const int64_t i3 = ir/(src->ne[2]*n_blocks);
+        const int64_t i2 = (ir/n_blocks) % src->ne[2];
+        const int64_t c0 = (ir % n_blocks)*concat_block;
+        const int64_t c1 = MIN(c0 + concat_block, src->ne[1]);
+
+        ggml_concat_copy_rows<T>(src, dst, o0, o1, o2, o3, i2, i3, c0, c1);
+    }
+}
+
+template <typename T>
+static void ggml_compute_forward_concat_cont(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    const int32_t dim = ggml_get_op_params_i32(dst, 0);
+
+    GGML_ASSERT(dim >= 0 && dim < 4);
+
+    int64_t o[4] = {0, 0, 0, 0};
+    o[dim] = src0->ne[dim];
+
+    if (dim != 0) {
+        ggml_concat_copy_src<T>(src0, dst,    0,    0,    0,    0, ith, nth);
+        ggml_concat_copy_src<T>(src1, dst, o[0], o[1], o[2], o[3], ith, nth);
+        return;
+    }
+
+    // both sources write to the same dst rows, so copy them back to back
+    const int64_t n_blocks = (dst->ne[1] + concat_block - 1) / concat_block;
+
+    const int64_t nr  = dst->ne[2]*dst->ne[3]*n_blocks;
+    const int64_t dr  = (nr + nth - 1)/nth;
+    const int64_t ir0 = dr*ith;
+    const int64_t ir1 = MIN(ir0 + dr, nr);
+
+    for (int64_t ir = ir0; ir < ir1; ir++) {
+        const int64_t i3 = ir/(dst->ne[2]*n_blocks);
+        const int64_t i2 = (ir/n_blocks) % dst->ne[2];
+        const int64_t c0 = (ir % n_blocks)*concat_block;
+        const int64_t c1 = MIN(c0 + concat_block, dst->ne[1]);
+
+        ggml_concat_copy_rows<T>(src0, dst,    0, 0, 0, 0, i2, i3, c0, c1);
+        ggml_concat_copy_rows<T>(src1, dst, o[0], 0, 0, 0, i2, i3, c0, c1);
+    }
+}
+
 static void ggml_compute_forward_concat_any(
     const ggml_compute_params * params,
     ggml_tensor * dst) {
@@ -2224,6 +2349,33 @@ void ggml_compute_forward_concat(
         GGML_ASSERT(ggml_is_contiguous_rows(src1));
         GGML_ASSERT(src0->ne[0] % ggml_blck_size(src0->type) == 0);
         GGML_ASSERT(src1->ne[0] % ggml_blck_size(src1->type) == 0);
+    }
+
+    // fast path: the destination is contiguous, so every source row lands in one
+    // run of dst. The element type only decides the copy width - the values are
+    // moved as bits, never converted - so integer types of the matching size are
+    // used for the float types as well.
+    if (ggml_is_contiguous(dst)) {
+        switch (src0->type) {
+            case GGML_TYPE_I8:
+                ggml_compute_forward_concat_cont<uint8_t>(params, dst);
+                return;
+            case GGML_TYPE_I16:
+            case GGML_TYPE_F16:
+            case GGML_TYPE_BF16:
+                ggml_compute_forward_concat_cont<uint16_t>(params, dst);
+                return;
+            case GGML_TYPE_I32:
+            case GGML_TYPE_F32:
+                ggml_compute_forward_concat_cont<uint32_t>(params, dst);
+                return;
+            case GGML_TYPE_I64:
+            case GGML_TYPE_F64:
+                ggml_compute_forward_concat_cont<uint64_t>(params, dst);
+                return;
+            default:
+                break;
+        }
     }
 
     switch (src0->type) {

@@ -11038,6 +11038,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_concat(GGML_TYPE_F16, {11, 12, 13, 14}, 7, dim, v));
         }
     }
+    test_cases.emplace_back(new test_concat(GGML_TYPE_F32, {11, 65, 3, 1}, 70, 0, 8));
+    test_cases.emplace_back(new test_concat(GGML_TYPE_F32, {11, 65, 3, 2}, 70, 0, 8));
+    test_cases.emplace_back(new test_concat(GGML_TYPE_F32, {11, 65, 3, 1}, 70, 0, 4));
+    test_cases.emplace_back(new test_concat(GGML_TYPE_I32, {11, 65, 3, 1}, 70, 0, 8));
+    test_cases.emplace_back(new test_concat(GGML_TYPE_F16, {11, 65, 3, 1}, 70, 0, 8));
 
     for (ggml_type type_a : { GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1, GGML_TYPE_Q8_0 }) {
         for (int v : { 0, 4, 8, 12 }) {
@@ -12123,6 +12128,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_acc(GGML_TYPE_F32, {256, 17, 2, 3}, {256, 16, 2, 3}, 1));
     test_cases.emplace_back(new test_acc(GGML_TYPE_F32, {256, 17, 2, 3}, {128, 16, 2, 3}, 2));
     test_cases.emplace_back(new test_acc(GGML_TYPE_F32, {256, 17, 2, 3}, {64, 16, 2, 3}, 3));
+
+    // GDN / Mamba / LFM2 conv_input: concat(state, transpose(x), dim=0)
+    // Qwen3.5-0.8B: d_conv-1=3, C=6144
+    for (int64_t n_tok : {512, 2048, 4096, 8192}) {
+        test_cases.emplace_back(new test_concat(GGML_TYPE_F32, {3, 6144, 1, 1}, n_tok, 0, 8));
+    }
+    test_cases.emplace_back(new test_concat(GGML_TYPE_F32, {3, 6144, 1, 1}, 4096, 0, 0));
+    test_cases.emplace_back(new test_concat(GGML_TYPE_F16, {3, 6144, 1, 1}, 4096, 0, 8));
+    test_cases.emplace_back(new test_concat(GGML_TYPE_F32, {3, 1536, 1, 1}, 4096, 0, 8)); // Mamba-like
 
     // GATED_DELTA_NET: realistic model configurations
     // TG: n_seq_tokens=1 (autoregressive)
