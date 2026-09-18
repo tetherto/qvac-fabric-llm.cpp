@@ -1052,3 +1052,62 @@ which recovers about 21 mantissa bits for one extra mma per fragment; if that al
 and the kernel stays behind the knob. Op-test coverage is the existing m = 2 to 8 cases of MUL_MAT_F8,
 MUL_MAT_F8_FFN and MUL_MAT_F8_SHARED, which now route through the new kernel, with `GGML_CUDA_MMF8_MMA_MIN=9` as the
 bisect switch. q8_0 K/V keeps G2 (Same top p >= 98.0%, Mean KLD <= 0.006 against `kld-base-f8.bin`).
+Verify: profile of the pre-change head on GPU 5 (`conc_attrib.sh`, PDL off, `--cuda-graph-trace=node`), per token at
+10240 + 64: B=2 7.858 ms wall with `mmf8_gemv` 76.7% (5.450 ms, 128 launches), B=8 5.124 ms wall with `mmf8_gemv`
+82.5% (4.008 ms, 32 launches), `fa_mma` 5.3% (0.256 ms) and every other family at or below 2.9%. The default
+`kern_window.py` marker is the correct cut here (its window reproduces the run's own decode rate); the CUTLASS-aware
+marker cuts too early and leaks whole prefill ubatches, which shows as fractional launches per token. CUDA-graph
+node fraction at B=8: 61803 of 73538 kernels. The 110k window ran at B=4, not B=8: eight 110k sequences need 880k of
+context, which is 56 GB of f16 KV on top of the weights. `ncu` is unusable on this host (ERR_NVGPUCTRPERM, GPU
+performance counters are admin-only), so the arithmetic-bound claim rests on the two windows instead: B=2 and B=8
+read identical weight bytes with identical launch counts per step (128 and 32 per token, one per layer) and differ
+only in activation columns, yet the per-step matmul time goes 10.90 ms to 32.06 ms. Bytes cannot explain that.
+Measured, single-weight decode shapes at m=8 (`test-backend-ops perf`, GEMV against the first MMA build):
+5120x17408 112.19 -> 57.42 us, 17408x5120 102.85 -> 83.78, 5120x10240 67.66 -> 44.62, 5120x6144 40.38 -> 25.59,
+5120x1024 7.35 -> 12.65 (the only loser: 1024 rows is 32 blocks). Sum 330.4 -> 224.1 us.
+First A/B was a regression: S_TG at B=8 206.4 -> 141.9, B=4 204.8 -> 78.6, B=2 144.6 -> 58.2. Cause, from the trace:
+the single-weight kernel serves N=5120 (down and out projections), so its grid was 5120/32 = 160 blocks against 132
+SMs with 4 warps each, where the GEMV ran 1280 blocks; the isolated perf numbers were L2-warm and hid it. Two fixes
+kept: (a) blocks of the same rows split k (grid.y, `MMF8_MMA_TARGET_BLOCKS` 2560, partials added into a pre-zeroed
+output, ksplit 1 for the fused up/gate since silu needs the whole sum), (b) weight staging loads 16 bytes per lane
+(one instruction per four 128-byte rows) instead of 4. Split-k alone: B=8 275.8. Both: B=8 367.2 / 367.0 over two
+passes, B=4 214.9 / 214.6, B=2 116.7 / 116.9. 8 warps instead of 4 measured 267.1 at B=8 against 275.8, so 4 stays.
+Accepted A/B on one build, knob off against on (GPU 4, 10240 + 128, S_TG): B=1 87.16 -> 87.04, B=2 144.41 -> 116.8,
+B=4 203.76 -> 214.5, B=8 205.83 -> 367.1, B=16 546.97 -> 547.98 (route unchanged there). S_PP stayed in
+11810 to 12334. Batch 2 loses because an 8-wide B tile wastes six of its columns, so the default crossover is 4.
+Attribution after the change (same window, B=8): the F8 matmul family falls from 2052 ms to 935 ms of kernel time
+over the run, 2.20x, and per token from 4.008 ms to 1.83 ms. The multi kernel is now the largest single item
+(437.8 ms, grid 1088x3, 106.9 us per launch, 1.67 TB/s of weight traffic), so the next decode target is that
+kernel's traffic rate, not its arithmetic.
+Gate: PASS. Same top p 99.780% at `-ub 4` and 99.890% at `-ub 8` against 99.0%; Mean KLD 0.000015 and 0.000017
+against 0.002, which is 100x of margin; Maximum KLD 0.028107 and 0.017865, RMS dp 0.102% and 0.098%. The two-term
+f16 activation split held in reserve was not needed. `-ub 2` is not gated because the default crossover leaves batch
+2 on the GEMV. Op tests: MUL_MAT_F8 33/33, MUL_MAT_F8_FFN 14/14, MUL_MAT_F8_SHARED 21/21, and MUL_MAT_F8 again with
+`GGML_CUDA_MMF8_MMA_MIN=9` to prove the GEMV path is untouched. `cuobjdump -res-usage`: every
+`mul_mat_f8_e4m3_mma*` instance at REG 72 to 80, STACK 0, LOCAL 0, SHARED 17408.
+Server (`conc_fabric.sh` copy against the worktree build, GPU 4, 10k prompt + 1024 out, 2 reps, one build with the
+knob off and on): decode_agg N=1 83.2/83.5 -> 83.0/83.0, N=2 134.3/134.0 -> 134.8/134.7 (batch 2 stays on the GEMV),
+N=4 186.2/186.8 -> 197.2/197.2, N=8 184.3/187.3 -> 314.3/313.1, which is 1.69x at N=8. prefill_agg unchanged:
+7126/6849 -> 7167/6947 at N=8, 8810/8923 -> 8835/8753 at N=1. JSONs in `results/fabric/mma{A,B}-n{1,2,4,8}.json`.
+Aggregate decode scaling at batch 8 is now 3.79x of the single-stream rate on the server and 4.21x on
+`llama-batched-bench`, against 2.22x and 2.36x before this iteration. That is short of the 5-6x the ask names.
+Launch-config table, all at batch 8 on `llama-batched-bench` S_TG: warps 4 -> 367, 8 -> 267. Rows per block 32 ->
+367, 64 -> 352 (and 215 -> 182 at batch 4; the row blocks are what fills the GPU, so halving the activation
+restaging costs more than it saves). Split target 1280 -> 359, 2560 -> 367, 5120 -> 363. Kept: 4 warps, 32 rows,
+2560 blocks.
+KV: rejected, no default changed. q8_0 K/V at batch 8 and 10k runs S_TG 304.70 against 365.51 for f16, 17% slower;
+at 110k and batch 4 (eight 110k sequences do not fit: 888k of context is 57 GB of f16 KV on top of 27 GB of weights)
+it runs 82.76 against 140.73, 41% slower. The byte win is real but a quantized non-unified cache selects the vec FA
+kernel instead of `flash_attn_ext_f16<256,256,1,8>`, which costs more than the bytes save. The G2 run was not spent:
+the pre-committed rule needed a 5% win at 110k first. KV management is not a decode lever on this model at 10k
+either: 16 of 64 layers carry KV, `n_head_kv` 4 x `head_dim` 256 = 64 KiB per token, so batch 8 at 10k is 5.37 GB
+per step, about 2 ms of a 22 ms step.
+Decision: kept. The tensor-core matmul is the decode path for batch 4 to 8 (`GGML_CUDA_MMF8_MMA_MIN` default 4,
+9 disables it), the GEMV keeps batch 1 to 3, and the CUTLASS W8A8 GEMM keeps batch 9 and above. Batch 8 per decode
+step is 38.6 ms -> 21.8 ms.
+Next: the multi-weight kernel is now the largest decode item at 437.8 ms of the 935 ms F8 matmul total, moving its
+weights at 1.67 TB/s where batch 1 reaches 2.68 TB/s, so the remaining 1.5x to the 14.6 ms floor is weight-traffic
+scheduling inside these two kernels, not arithmetic: the activation slab is restaged per warp per 128-k slab, which
+is as many bytes as the weights that slab consumes, and `ncu` cannot be used on this host to confirm where the
+stalls are (ERR_NVGPUCTRPERM). The batch-8 CUTLASS W8A8 GEMM, still 23.7 ms per step and blocked on its activation
+quantization accuracy, is the other standing option.

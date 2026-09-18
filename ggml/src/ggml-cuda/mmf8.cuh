@@ -29,3 +29,32 @@ void ggml_cuda_mul_mat_f8_shared_gemv(ggml_backend_cuda_context & ctx, ggml_tens
 // keeps the whole batch range it serves; GGML_CUDA_MMF8_GEMV_MAX overrides it for A/B, up to the cap above
 #define GGML_CUDA_MMF8_GEMV_MAX_DEFAULT GGML_CUDA_MMF8_GEMV_MAX_NCOLS
 int ggml_cuda_mmf8_gemv_max_ncols();
+
+// up to three F8 matrices sharing one activation in one launch (q/k/v, the delta-net qkv/z): block b computes rows
+// of the matrix whose block range holds b, with the per-row arithmetic of the single-weight kernel
+#define MMF8_MULTI_MAX 3
+struct mmf8_multi_args {
+    const uint8_t * x[MMF8_MULTI_MAX];
+    const float   * sx[MMF8_MULTI_MAX];
+    float         * dst[MMF8_MULTI_MAX];
+    int nrows[MMF8_MULTI_MAX];
+    int block0[MMF8_MULTI_MAX + 1]; // first block of each matrix; block0[n] = the grid size
+    int n;
+};
+
+// The f16 tensor-core decode matmul (mmf8-mma.cu): same operands, scales and output as the GEMV, but each weight
+// byte is converted once into an f16 MMA tile and accumulated in FP32, which removes the GEMV's per-column FP32
+// FMA chain and its repeated conversions. Batch 2..8; batch 1 keeps the GEMV.
+void mul_mat_f8_e4m3_mma_cuda(
+    const uint8_t * x, const float * sx, const uint8_t * xg, const float * sxg, const float * y, float * dst,
+    int ncols, int nrows, int nblk_n, int ncols_dst, int stride_col_y, int stride_col_dst, cudaStream_t stream);
+void mul_mat_f8_e4m3_mma_multi_cuda(
+    const mmf8_multi_args & a, const float * y, int ncols, int ncols_dst, int stride_col_y, cudaStream_t stream);
+
+// GGML_CUDA_MMF8_MMA_MIN overrides the batch at which the tensor-core matmul takes over from the GEMV;
+// GGML_CUDA_MMF8_GEMV_MAX_NCOLS + 1 disables it and is the A/B switch against the GEMV. Measured 2026-09-18 at
+// 10k context: batch 8 runs 367 against 206 tok/s, batch 4 215 against 204, batch 2 117 against 144, so the
+// default is 4: an 8-wide B tile wastes too many of its columns below that
+#define GGML_CUDA_MMF8_MMA_MIN_DEFAULT 4
+int  ggml_cuda_mmf8_mma_min_ncols();
+bool ggml_cuda_mmf8_use_mma(ggml_backend_cuda_context & ctx, int64_t ntokens);

@@ -13249,10 +13249,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_mul_mat_f8(5120, 1024, 1));
     test_cases.emplace_back(new test_mul_mat_f8(5120, 6144, 1));
     test_cases.emplace_back(new test_mul_mat_f8(5120, 10240, 1));
-    for (int64_t m : {1, 4096}) {
+    // the same five shapes at batch 8, where the tensor-core matmul runs: the launch config is picked on their sum
+    test_cases.emplace_back(new test_mul_mat_f8(5120, 17408, 8));
+    test_cases.emplace_back(new test_mul_mat_f8(17408, 5120, 8));
+    test_cases.emplace_back(new test_mul_mat_f8(5120, 1024, 8));
+    test_cases.emplace_back(new test_mul_mat_f8(5120, 6144, 8));
+    test_cases.emplace_back(new test_mul_mat_f8(5120, 10240, 8));
+    for (int64_t m : {1, 8, 4096}) {
         test_cases.emplace_back(new test_mul_mat_f8_ffn(5120, 17408, m, 0.01f));
     }
     test_cases.emplace_back(new test_mul_mat_f8_shared(5120, {12288, 1024, 1024}, 3, 1, 0.01f));
+    test_cases.emplace_back(new test_mul_mat_f8_shared(5120, {12288, 1024, 1024}, 3, 8, 0.01f));
+    test_cases.emplace_back(new test_mul_mat_f8_shared(5120, {10240, 6144, 0}, 2, 8, 0.01f));
     test_cases.emplace_back(new test_mul_mat_f8_shared(5120, {10240, 6144, 0}, 2, 4096, 0.01f));
     test_cases.emplace_back(new test_mul_sigmoid_strided(256, 24, 4096));
 

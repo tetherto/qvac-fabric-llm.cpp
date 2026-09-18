@@ -196,17 +196,7 @@ static __global__ void mul_mat_vec_f8_e4m3(
     mmf8_gemv_block<ncols_dst, nrows_w, y_vec, has_glu>(x, sx, xg, sxg, y, dst, ncols, nblk_n, stride_col_y, stride_col_dst, blockIdx.x*nrows_w, red);
 }
 
-// up to three F8 matrices sharing one activation in one launch (q/k/v, the delta-net qkv/z): block b computes rows of
-// the matrix whose block range holds b, with the plain kernel's per-row arithmetic (bit-identical per output)
-#define MMF8_MULTI_MAX 3
-struct mmf8_multi_args {
-    const uint8_t * x[MMF8_MULTI_MAX];
-    const float   * sx[MMF8_MULTI_MAX];
-    float         * dst[MMF8_MULTI_MAX];
-    int nrows[MMF8_MULTI_MAX];
-    int block0[MMF8_MULTI_MAX + 1]; // first block of each matrix; block0[n] = the grid size
-    int n;
-};
+// the multi-weight launch arguments live in mmf8.cuh: the tensor-core matmul uses the same block mapping
 
 template <int ncols_dst, int nrows_w, bool y_vec>
 static __global__ void mul_mat_vec_f8_e4m3_multi(const mmf8_multi_args a, const float * y, const int ncols, const int stride_col_y) {
@@ -570,7 +560,11 @@ void ggml_cuda_mul_mat_f8(ggml_backend_cuda_context & ctx, const ggml_tensor * s
     cudaStream_t stream = ctx.stream();
 
     if (ntokens <= ggml_cuda_mmf8_gemv_max_ncols()) {
-        mul_mat_vec_f8_e4m3_cuda(x, sx, nullptr, nullptr, y, d, ncols, nrows, nblk_n, ntokens, ncols, nrows, stream);
+        if (ggml_cuda_mmf8_use_mma(ctx, ntokens)) {
+            mul_mat_f8_e4m3_mma_cuda(x, sx, nullptr, nullptr, y, d, ncols, nrows, nblk_n, ntokens, ncols, nrows, stream);
+        } else {
+            mul_mat_vec_f8_e4m3_cuda(x, sx, nullptr, nullptr, y, d, ncols, nrows, nblk_n, ntokens, ncols, nrows, stream);
+        }
         return;
     }
 
@@ -601,6 +595,12 @@ void ggml_cuda_mul_mat_f8_gemv_glu(ggml_backend_cuda_context & ctx, const ggml_t
     const int64_t ntokens = ggml_nrows(src1);
     GGML_ASSERT(ntokens <= ggml_cuda_mmf8_gemv_max_ncols());
 
+    if (ggml_cuda_mmf8_use_mma(ctx, ntokens)) {
+        mul_mat_f8_e4m3_mma_cuda((const uint8_t *) src0->data, (const float *) up->src[2]->data,
+                                 (const uint8_t *) src0g->data, (const float *) gate->src[2]->data,
+                                 (const float *) src1->data, (float *) glu->data, ncols, nrows, nblk_n, ntokens, ncols, nrows, ctx.stream());
+        return;
+    }
     mul_mat_vec_f8_e4m3_cuda((const uint8_t *) src0->data, (const float *) up->src[2]->data,
                              (const uint8_t *) src0g->data, (const float *) gate->src[2]->data,
                              (const float *) src1->data, (float *) glu->data, ncols, nrows, nblk_n, ntokens, ncols, nrows, ctx.stream());
@@ -656,6 +656,10 @@ void ggml_cuda_mul_mat_f8_shared_gemv(ggml_backend_cuda_context & ctx, ggml_tens
         a.sx[i]    = (const float *) dsts[i]->src[2]->data;
         a.dst[i]   = (float *) dsts[i]->data;
         a.nrows[i] = src0->ne[1];
+    }
+    if (ggml_cuda_mmf8_use_mma(ctx, ntokens)) {
+        mul_mat_f8_e4m3_mma_multi_cuda(a, (const float *) src1->data, ncols, ntokens, ncols, ctx.stream());
+        return;
     }
     mul_mat_vec_f8_e4m3_multi_cuda(a, (const float *) src1->data, ncols, ntokens, ncols, ctx.stream());
 }
