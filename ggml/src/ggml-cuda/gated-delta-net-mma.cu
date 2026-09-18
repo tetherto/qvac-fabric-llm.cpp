@@ -67,11 +67,11 @@ using gdn_a = tile<16, 8, nv_bfloat162>;
 using gdn_b = tile<8, 8, nv_bfloat162>;
 #endif
 
-template<int Stride, bool Transpose = false>
+template<int stride_t, bool transpose_t = false>
 struct gdn_bf16_view {
     const bf16 * data;
     __device__ __forceinline__ float get(int row, int col) const {
-        return __bfloat162float(data[Transpose ? gdn_index(col, row, Stride) : gdn_index(row, col, Stride)]);
+        return __bfloat162float(data[transpose_t ? gdn_index(col, row, stride_t) : gdn_index(row, col, stride_t)]);
     }
 };
 
@@ -91,16 +91,16 @@ struct gdn_key_low_view {
     }
 };
 
-template<class Tile, bool Low = false, class View>
-__device__ __forceinline__ Tile gdn_load(const View & src, int row, int col) {
-    Tile result;
+template<class tile_t, bool low_t = false, class view_t>
+__device__ __forceinline__ tile_t gdn_load(const view_t & src, int row, int col) {
+    tile_t result;
 #pragma unroll
-    for (int i = 0; i < Tile::ne; ++i) {
-        const int r = row + Tile::get_i(i);
-        const int c = col + 2 * Tile::get_j(i);
+    for (int i = 0; i < tile_t::ne; ++i) {
+        const int r = row + tile_t::get_i(i);
+        const int c = col + 2 * tile_t::get_j(i);
         float x = src.get(r, c);
         float y = src.get(r, c + 1);
-        if constexpr (Low) {
+        if constexpr (low_t) {
             x -= __bfloat162float(__float2bfloat16(x));
             y -= __bfloat162float(__float2bfloat16(y));
         }
@@ -109,10 +109,10 @@ __device__ __forceinline__ Tile gdn_load(const View & src, int row, int col) {
     return result;
 }
 
-template<int K, class AView, class BView>
-__device__ __forceinline__ void gdn_product(gdn_acc & acc, const AView & a, const BView & b, int row, int col) {
+template<int k_t, class a_view_t, class b_view_t>
+__device__ __forceinline__ void gdn_product(gdn_acc & acc, const a_view_t & a, const b_view_t & b, int row, int col) {
 #pragma unroll
-    for (int k = 0; k < K; k += 16) {
+    for (int k = 0; k < k_t; k += 16) {
         const auto ra = gdn_load<gdn_a>(a, row, k);
         const auto rb = gdn_load<gdn_b>(b, col, k);
         mma(acc, ra, rb);
@@ -279,7 +279,7 @@ static __global__ __launch_bounds__(GDN_THREADS, 1) void gdn_prepare(const bf16 
 // Transfer computes the zero-state result and linear state propagation together.
 enum class gdn_mode { persistent, output, transfer };
 
-template <gdn_mode Mode>
+template <gdn_mode mode_t>
 static __global__ __launch_bounds__(GDN_THREADS, 1) void gdn_persistent(const bf16 *         packed_q,
                                                                         const bf16 *         packed_k,
                                                                         const bf16 *         packed_k_low,
@@ -321,17 +321,17 @@ static __global__ __launch_bounds__(GDN_THREADS, 1) void gdn_persistent(const bf
     const int64_t v_offset       = seq * sv3 + head * sv1;
     float *       out            = dst + ((int64_t) seq * tokens * H + head) * GDN_D;
     // Each warp owns 16 value rows and keeps their FP32 state across chunks.
-    gdn_acc       state[Mode == gdn_mode::transfer ? 2 : 1][GDN_D / GDN_N];
-    for (int pass = 0; pass < (Mode == gdn_mode::transfer ? 2 : 1); ++pass) {
+    gdn_acc       state[mode_t == gdn_mode::transfer ? 2 : 1][GDN_D / GDN_N];
+    for (int pass = 0; pass < (mode_t == gdn_mode::transfer ? 2 : 1); ++pass) {
 #    pragma unroll
         for (int j = 0; j < GDN_D / GDN_N; ++j) {
 #    pragma unroll
             for (int i = 0; i < gdn_acc::ne; ++i) {
                 const int row = value_base + gdn_acc::get_i(i);
                 const int col = j * GDN_N + gdn_acc::get_j(i);
-                if (Mode == gdn_mode::transfer && pass == 0) {
+                if (mode_t == gdn_mode::transfer && pass == 0) {
                     state[pass][j].x[i] = 0.0f;
-                } else if (Mode == gdn_mode::transfer && pass == 1) {
+                } else if (mode_t == gdn_mode::transfer && pass == 1) {
                     state[pass][j].x[i] = row == col ? 1.0f : 0.0f;
                 } else {
                     state[pass][j].x[i] = state_in[(segments == 1 ? state_offset : partial_offset) + row * GDN_D + col];
@@ -342,7 +342,7 @@ static __global__ __launch_bounds__(GDN_THREADS, 1) void gdn_persistent(const bf
 
     for (int64_t chunk = begin; chunk < end; chunk += GDN_CHUNK) {
         const int valid = min((int64_t) GDN_CHUNK, end - chunk);
-        if constexpr (Mode == gdn_mode::persistent) {
+        if constexpr (mode_t == gdn_mode::persistent) {
             gdn_prepare_chunk(smem, packed_q, packed_k, g, beta, q_offset, chunk, valid, seq, head, H_k, sb1, sb2, sb3,
                               scale);
         } else {
@@ -353,14 +353,14 @@ static __global__ __launch_bounds__(GDN_THREADS, 1) void gdn_persistent(const bf
                 const int     d     = i % GDN_D;
                 const int64_t src   = q_offset + (chunk + t) * H_k * GDN_D + d;
                 const int     index = gdn_index(t, d, GDN_D);
-                if constexpr (Mode != gdn_mode::transfer) {
+                if constexpr (mode_t != gdn_mode::transfer) {
                     smem.q[index] = t < valid ? packed_q[src] : __float2bfloat16(0.0f);
                 }
                 smem.k[index] = t < valid ? packed_k[src] : __float2bfloat16(0.0f);
             }
             for (int i = tid; i < GDN_CHUNK * GDN_CHUNK; i += GDN_THREADS) {
                 smem.inverse[i] = cache.inverse[i];
-                if constexpr (Mode != gdn_mode::transfer) {
+                if constexpr (mode_t != gdn_mode::transfer) {
                     smem.qk[i] = cache.qk[i];
                 }
             }
@@ -371,7 +371,7 @@ static __global__ __launch_bounds__(GDN_THREADS, 1) void gdn_persistent(const bf
             __syncthreads();
         }
         const gdn_bf16_view<GDN_D> queries{ smem.q }, keys{ smem.k };
-        for (int pass = 0; pass < (Mode == gdn_mode::transfer ? 2 : 1); ++pass) {
+        for (int pass = 0; pass < (mode_t == gdn_mode::transfer ? 2 : 1); ++pass) {
 #    pragma unroll
             for (int j = 0; j < GDN_D / GDN_N; ++j) {
 #    pragma unroll
@@ -387,7 +387,7 @@ static __global__ __launch_bounds__(GDN_THREADS, 1) void gdn_persistent(const bf
 #    pragma unroll
             for (int j = 0; j < GDN_CHUNK / GDN_N; ++j) {
                 gdn_acc output;
-                if constexpr (Mode != gdn_mode::transfer) {
+                if constexpr (mode_t != gdn_mode::transfer) {
                     gdn_product<GDN_D>(output, state_view, queries, value_base, j * GDN_N);
                 }
                 gdn_product<GDN_D>(residual[j], state_view, keys, value_base, j * GDN_N);
@@ -397,11 +397,11 @@ static __global__ __launch_bounds__(GDN_THREADS, 1) void gdn_persistent(const bf
                     const int   t     = j * GDN_N + gdn_acc::get_j(i);
                     const int   value = value_base + gdn_acc::get_i(i);
                     const float decay = expf(smem.prefix[t]);
-                    const float vv    = !(Mode == gdn_mode::transfer && pass == 1) && t < valid ?
+                    const float vv    = !(mode_t == gdn_mode::transfer && pass == 1) && t < valid ?
                                             v[v_offset + (chunk + t) * sv2 + value] :
                                             0.0f;
                     residual[j].x[i]  = (vv - decay * residual[j].x[i]) * smem.beta[t];
-                    if (Mode != gdn_mode::transfer && t < valid) {
+                    if (mode_t != gdn_mode::transfer && t < valid) {
                         out[(chunk + t) * H * GDN_D + value] = scale * decay * output.x[i];
                     }
                 }
@@ -451,7 +451,7 @@ static __global__ __launch_bounds__(GDN_THREADS, 1) void gdn_persistent(const bf
             }
             __syncthreads();
             const gdn_bf16_view<GDN_CHUNK> qk{ smem.qk };
-            if constexpr (Mode != gdn_mode::transfer) {
+            if constexpr (mode_t != gdn_mode::transfer) {
 #    pragma unroll
                 for (int j = 0; j < GDN_CHUNK / GDN_N; ++j) {
                     gdn_acc output;
@@ -464,7 +464,7 @@ static __global__ __launch_bounds__(GDN_THREADS, 1) void gdn_persistent(const bf
 #    pragma unroll
                     for (int i = 0; i < gdn_acc::ne; ++i) {
                         const int t = j * GDN_N + gdn_acc::get_j(i);
-                        if (Mode != gdn_mode::transfer && t < valid) {
+                        if (mode_t != gdn_mode::transfer && t < valid) {
                             out[(chunk + t) * H * GDN_D + value_base + gdn_acc::get_i(i)] += output.x[i];
                         }
                     }
@@ -504,14 +504,14 @@ static __global__ __launch_bounds__(GDN_THREADS, 1) void gdn_persistent(const bf
             __syncthreads();
         }
     }
-    for (int pass = 0; pass < (Mode == gdn_mode::transfer ? 2 : 1); ++pass) {
+    for (int pass = 0; pass < (mode_t == gdn_mode::transfer ? 2 : 1); ++pass) {
 #    pragma unroll
         for (int j = 0; j < GDN_D / GDN_N; ++j) {
 #    pragma unroll
             for (int i = 0; i < gdn_acc::ne; ++i) {
-                if (Mode == gdn_mode::transfer || segment == segments - 1) {
+                if (mode_t == gdn_mode::transfer || segment == segments - 1) {
                     (pass == 1 ? matrix_out :
-                                 state_out)[(Mode != gdn_mode::transfer ? state_offset : partial_offset) +
+                                 state_out)[(mode_t != gdn_mode::transfer ? state_offset : partial_offset) +
                                             (value_base + gdn_acc::get_i(i)) * GDN_D + j * GDN_N + gdn_acc::get_j(i)] =
                         state[pass][j].x[i];
                 }
@@ -526,11 +526,11 @@ static __global__ __launch_bounds__(GDN_THREADS, 1) void gdn_persistent(const bf
 }
 
 #if defined(AMPERE_MMA_AVAILABLE) || (defined(AMD_WMMA_AVAILABLE) && defined(RDNA3))
-template <bool Transpose = false> struct gdn_float_view {
+template <bool transpose_t = false> struct gdn_float_view {
     const float * data;
 
     __device__ __forceinline__ float get(int row, int col) const {
-        return data[Transpose ? col * GDN_D + row : row * GDN_D + col];
+        return data[transpose_t ? col * GDN_D + row : row * GDN_D + col];
     }
 };
 #endif

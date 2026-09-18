@@ -104,7 +104,6 @@ if (CUDAToolkit_FOUND)
 
     file(GLOB   GGML_SOURCES_CUDA "*.cu")
     set(GGML_CUDA_CUTLASS_SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/mmq-cutlass.cu")
-
     file(GLOB   SRCS "template-instances/fattn-tile*.cu")
     list(APPEND GGML_SOURCES_CUDA ${SRCS})
     file(GLOB   SRCS "template-instances/fattn-mma*.cu")
