@@ -4409,8 +4409,8 @@ static bool ggml_backend_webgpu_device_supports_op(ggml_backend_dev_t dev, const
             break;
         case GGML_OP_FLASH_ATTN_EXT:
             {
-                if (tensor->src[3] == nullptr && ggml_flash_attn_ext_get_kv_used(tensor) > 0) {
-                    return false; // implicit causal mask (n_kv_used) is CPU/CUDA only
+                if (op->src[3] == nullptr && ggml_flash_attn_ext_get_kv_used(op) > 0) {
+                    return false;  // implicit causal mask (n_kv_used) is CPU/CUDA only
                 }
                 // conservative support checks for whether the more resource-intensive shader paths
                 // can be used, to avoid cases where flash_attn is assigned to the CPU later on
