@@ -1149,3 +1149,42 @@ Op-test coverage: the existing MUL_MAT_F8, MUL_MAT_F8_FFN and MUL_MAT_F8_SHARED 
 Gate: this iteration must not change values, so the bar is tighter than G1. Mean KLD at most 0.000030 and Same top
 p at least 99.7% at `-ub 4` and `-ub 8` against `kld-r1-q8h-ub{4,8}-4c.bin`, where the kept kernel measured
 0.000015 / 99.780% and 0.000017 / 99.890%.
+Verify: both experiments were kept, each measured on its own against the build before it, in one session on GPU 4
+(10240 + 128, two passes per side, S_TG). E1, cp.async pipeline against the pre-iteration head: B=1 86.99/87.08
+against 86.73/87.14, B=2 144.30/144.66 against 144.50/144.41 (GEMV route, unchanged), B=4 216.89/217.22 against
+245.03/244.99 (+12.9%), B=8 367.28/366.90 against 413.77/412.31 (+12.6%), B=16 547.30/546.90 against 546.35/546.95
+(CUTLASS route, unchanged). E2, f16 activation against the E1 build: B=2 142.52/142.86 against 142.98/143.36,
+B=4 244.35/244.53 against 248.70/248.45 (+1.7%), B=8 413.60/412.70 against 442.61/442.70 (+7.1%). Cumulative at
+batch 8: 367.1 to 442.7 tok/s, 1.21x, and aggregate decode scaling against batch 1 goes 4.22x to 5.09x.
+Attribution, both sides profiled the same way on GPU 5 (PDL off, `--cuda-graph-trace=node`, 10240 + 64 at B=8,
+whole-run kernel totals rather than the decode-window cut, so these are not comparable to the 437.8 ms window
+figure above): `mul_mat_f8_e4m3_mma_multi<8>` 633.0 ms to 442.1 ms (-30.2%), `mul_mat_f8_e4m3_mma<8,0>` 296.4 ms to
+228.9 ms (-22.8%), both at 8192 launches on either side. The f16 activation conversion appears as 16384
+`convert_unary_vec8<float, half>` launches at 19.1 ms total, which is 2.8% of the F8 matmul family and 1.7% of
+decode kernel busy time, against the 0.505 ms per token it buys. Decode window per token: 3.017 ms wall and 2.652
+ms busy to 2.616 ms wall and 2.188 ms busy. `kern_families.py` gained an `mmf8_mma` family in this iteration; the
+kernels landed in `other` before that, which is why the window table shows `other` falling 1.818 to 1.313 ms per
+token.
+Registers and shared: every `mul_mat_f8_e4m3_mma*` instance at REG 90 to 136, STACK 0, LOCAL 0, SHARED 34816
+(17408 of staging tiles plus 16384 of raw weight slots, rounded to 34 KiB). The fused up/gate instances sit at the
+top of that register range, so their occupancy falls from 6 blocks per SM to 3; measured anyway and kept, since
+batch 4 and 8 both improved. Op tests: MUL_MAT_F8, MUL_MAT_F8_FFN and MUL_MAT_F8_SHARED all pass after each
+experiment, plus MUL_MAT_F8 with `GGML_CUDA_MMF8_MMA_MIN=9`.
+Gate: PASS, values unchanged as designed. Mean KLD 0.000015 at both `-ub 4` and `-ub 8` against the 0.000030 bar,
+Same top p 99.878% and 99.853% against 99.7%, Maximum KLD 0.031017 and 0.030128, RMS dp 0.123% and 0.133%.
+E3 (two k-slabs per warp trip) was not needed: the bar for it was E1 and E2 together landing under 5% and they
+landed at 20.6%.
+Server (`conc_fabric.sh` copy against the two builds, GPU 4, 10k prompt + 1024 output, 2 reps, JSONs in
+`results/fabric/wp{A,B}-n{1,2,4,8}.json`): decode_agg N=1 83.5/83.2 to 83.2/83.5, N=2 134.0/134.2 to 134.0/133.6,
+N=4 192.9/196.4 to 222.7/223.2 (+14.6%), N=8 312.9/311.7 to 345.2/364.9 (+13.7% on the means; the second B rep ran
+hot, 364.9 with ttft 9.12 s against 345.2 at 6.57 s). prefill_agg unchanged inside run noise, 6386 to 8848 on both
+sides. Aggregate server decode scaling at N=8 against N=1 goes 3.75x to 4.26x.
+Decision: both kept. The decode path for batch 4 to 8 is now the pipelined tensor-core matmul with an f16
+activation; batch 1 to 3 keeps the GEMV and batch 9 and above the CUTLASS W8A8 GEMM, both untouched.
+Next: the matmul is close to its bandwidth floor. `mmf8_mma` is 1.311 ms per token at batch 8, which is 10.5 ms per
+decode step for the 26 GB of weights, or 2.48 TB/s, against the batch-1 GEMV's 2.68 TB/s and a 3 TB/s practical
+peak: at most 1.8 ms per step is left in the matmul itself. The step is about 18 ms, so the remaining decode items
+are elsewhere: the non-matmul families sum to 0.88 ms per token (7.0 ms per step, led by `fa_mma` 0.255,
+`dequant_convert` 0.164 and `gated_delta_net` 0.139) and the window shows 0.434 ms per token of idle gaps across
+163 launches per token, which is launch-bound overhead rather than work. The standing larger lever is still the
+batch-8 CUTLASS W8A8 GEMM, blocked on its activation quantization accuracy.

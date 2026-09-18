@@ -14,6 +14,7 @@ FAMILIES = [
     ("mmq",              re.compile(r"mul_mat_q")),
     ("mmvq",             re.compile(r"mul_mat_vec_q")),
     ("mmf8_gemv",        re.compile(r"mul_mat_vec_f8_e4m3")),
+    ("mmf8_mma",         re.compile(r"mul_mat_f8_e4m3_mma")),
     ("mmvf",             re.compile(r"mul_mat_vec_f")),
     ("mmf",              re.compile(r"mul_mat_f\b|mul_mat_f<")),
     ("fmha_cutlass",     re.compile(r"cutlass::fmha|FmhaKernel")),
