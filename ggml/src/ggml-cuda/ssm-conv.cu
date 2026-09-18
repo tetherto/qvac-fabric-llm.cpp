@@ -352,7 +352,7 @@ static __global__ void ssm_conv_tokens_f32(const ggml_cuda_ssm_conv_tokens_args 
             float * dst   = l2.dst[0];
             int64_t nb1   = l2.nb1[0];
             int64_t nb2   = l2.nb2[0];
-            __nv_bfloat16 * pack = l2.pack[0];
+            nv_bfloat16 * pack = l2.pack[0];
 #pragma unroll
             for (int r = 1; r < GGML_CUDA_SSM_CONV_MAX_L2; r++) {
                 if (r == l2_slice) {
@@ -390,7 +390,7 @@ static __global__ void ssm_conv_tokens_f32(const ggml_cuda_ssm_conv_tokens_args 
                         dst[head*nb1 + (int64_t) (t0 + i)*nb2 + tid] = o;
                     }
                     if (pack != nullptr) {
-                        const __nv_bfloat16 ob = __float2bfloat16_rn(o);
+                        const nv_bfloat16 ob = __float2bfloat16_rn(o);
                         for (int hv = head; hv < l2.pack_heads; hv += n_heads) {
                             pack[((t0 + i)*(int64_t) l2.pack_heads + hv)*split_ch + tid] = ob;
                         }

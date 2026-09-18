@@ -668,9 +668,9 @@ __global__ void gated_delta_net_flashinfer_prepare_cuda(
         const float * v,
         const float * g,
         const float * beta,
-        __nv_bfloat16 * q_bf16,
-        __nv_bfloat16 * k_bf16,
-        __nv_bfloat16 * v_bf16,
+        nv_bfloat16 * q_bf16,
+        nv_bfloat16 * k_bf16,
+        nv_bfloat16 * v_bf16,
         float * alpha,
         float * beta_packed,
         int64_t S,
@@ -718,7 +718,7 @@ __global__ void gated_delta_net_flashinfer_prepare_cuda(
 }
 
 __global__ void gated_delta_net_flashinfer_unpack_cuda(
-        const __nv_bfloat16 * src, float * dst, int64_t n) {
+        const nv_bfloat16 * src, float * dst, int64_t n) {
     const int64_t idx = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < n) {
         dst[idx] = __bfloat162float(src[idx]);
@@ -727,10 +727,10 @@ __global__ void gated_delta_net_flashinfer_unpack_cuda(
 
 // 8 consecutive d per thread: two float4 loads and one 16-byte bf16x8 store per tensor, the same round-to-nearest as
 // the scalar kernel; used when S is a multiple of 8 and every stride and base pointer keeps the loads 16-byte aligned
-static __device__ __forceinline__ void gdn_pack8_bf16(const float * src, __nv_bfloat16 * dst) {
+static __device__ __forceinline__ void gdn_pack8_bf16(const float * src, nv_bfloat16 * dst) {
     const float4 a = *(const float4 *) src;
     const float4 b = *(const float4 *) (src + 4);
-    union { __nv_bfloat162 h[4]; uint4 u; } r;
+    union { nv_bfloat162 h[4]; uint4 u; } r;
     r.h[0] = __float22bfloat162_rn(make_float2(a.x, a.y));
     r.h[1] = __float22bfloat162_rn(make_float2(a.z, a.w));
     r.h[2] = __float22bfloat162_rn(make_float2(b.x, b.y));
@@ -744,9 +744,9 @@ __global__ void gated_delta_net_flashinfer_prepare8_cuda(
         const float * v,
         const float * g,
         const float * beta,
-        __nv_bfloat16 * q_bf16,
-        __nv_bfloat16 * k_bf16,
-        __nv_bfloat16 * v_bf16,
+        nv_bfloat16 * q_bf16,
+        nv_bfloat16 * k_bf16,
+        nv_bfloat16 * v_bf16,
         float * alpha,
         float * beta_packed,
         int64_t S,
@@ -794,13 +794,13 @@ __global__ void gated_delta_net_flashinfer_prepare8_cuda(
 }
 
 __global__ void gated_delta_net_flashinfer_unpack8_cuda(
-        const __nv_bfloat16 * src, float * dst, int64_t n8) {
+        const nv_bfloat16 * src, float * dst, int64_t n8) {
     const int64_t idx = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= n8) {
         return;
     }
     ggml_cuda_pdl_sync();
-    union { uint4 u; __nv_bfloat162 h[4]; } r;
+    union { uint4 u; nv_bfloat162 h[4]; } r;
     r.u = *(const uint4 *) (src + idx * 8);
     const float2 f0 = __bfloat1622float2(r.h[0]);
     const float2 f1 = __bfloat1622float2(r.h[1]);
@@ -854,7 +854,7 @@ static bool launch_gated_delta_net_flashinfer_aot(
         int64_t sv1, int64_t sv2, int64_t sv3,
         int64_t sb1, int64_t sb2, int64_t sb3,
         int64_t H_q, int64_t rq3, cudaStream_t stream,
-        __nv_bfloat16 * pack_q, __nv_bfloat16 * pack_k, __nv_bfloat16 * pack_v) {
+        nv_bfloat16 * pack_q, nv_bfloat16 * pack_k, nv_bfloat16 * pack_v) {
     const gdn_flashinfer_aot_launch_t launch = get_gdn_flashinfer_aot_launch();
     const int device = ggml_cuda_get_device();
     const auto & info = ggml_cuda_info().devices[device];
@@ -868,15 +868,15 @@ static bool launch_gated_delta_net_flashinfer_aot(
     const size_t gate_elements = (size_t) n_seqs * n_tokens * H;
     const size_t tensormaps_bytes = (size_t) info.nsm * 128;
 
-    ggml_cuda_pool_alloc<__nv_bfloat16> q_bf16(ctx.pool());
-    ggml_cuda_pool_alloc<__nv_bfloat16> k_bf16(ctx.pool());
-    ggml_cuda_pool_alloc<__nv_bfloat16> v_bf16(ctx.pool());
+    ggml_cuda_pool_alloc<nv_bfloat16> q_bf16(ctx.pool());
+    ggml_cuda_pool_alloc<nv_bfloat16> k_bf16(ctx.pool());
+    ggml_cuda_pool_alloc<nv_bfloat16> v_bf16(ctx.pool());
     if (!packed) {
         pack_q = q_bf16.alloc(q_elements);
         pack_k = k_bf16.alloc(q_elements);
         pack_v = v_bf16.alloc(v_elements);
     }
-    ggml_cuda_pool_alloc<__nv_bfloat16> out_bf16(ctx.pool(), v_elements);
+    ggml_cuda_pool_alloc<nv_bfloat16> out_bf16(ctx.pool(), v_elements);
     ggml_cuda_pool_alloc<float> alpha(ctx.pool(), gate_elements);
     ggml_cuda_pool_alloc<float> beta(ctx.pool(), gate_elements);
     ggml_cuda_pool_alloc<int64_t> cu_seqlens(ctx.pool(), n_seqs + 1);
@@ -1025,9 +1025,9 @@ static void ggml_cuda_op_gated_delta_net_impl(
             S_v, H, n_tokens, n_seqs,
             sq1, sq2, sq3, sv1, sv2, sv3, sb1, sb2, sb3,
             neqk1, rq3, stream,
-            packed ? (__nv_bfloat16 *) pack.q() : nullptr,
-            packed ? (__nv_bfloat16 *) pack.k() : nullptr,
-            packed ? (__nv_bfloat16 *) pack.v() : nullptr)) {
+            packed ? (nv_bfloat16 *) pack.q() : nullptr,
+            packed ? (nv_bfloat16 *) pack.k() : nullptr,
+            packed ? (nv_bfloat16 *) pack.v() : nullptr)) {
         return;
     }
     // the fallback kernels read the f32 q/k/v, which the conv kernel skipped when the pack was their only reader

@@ -18,7 +18,7 @@ struct ggml_cuda_ssm_conv_l2 {
     int64_t nb1[GGML_CUDA_SSM_CONV_MAX_L2]; // head stride
     int64_t nb2[GGML_CUDA_SSM_CONV_MAX_L2]; // token stride
     int64_t nb3[GGML_CUDA_SSM_CONV_MAX_L2]; // sequence stride
-    __nv_bfloat16 * pack[GGML_CUDA_SSM_CONV_MAX_L2] = {nullptr, nullptr};
+    nv_bfloat16 * pack[GGML_CUDA_SSM_CONV_MAX_L2] = {nullptr, nullptr};
     int     pack_heads = 0;
 };
 
@@ -37,7 +37,7 @@ struct ggml_cuda_ssm_conv_tokens_args {
     const float   * bias;          // [n_ch] or nullptr
     float         * y;             // [n_ch, n_t] contiguous (the silu output); nullptr when only the packs are read
     float         * cache;         // [n_ch][d_conv-1] the next state row (may be the row states[idx[0]])
-    __nv_bfloat16 * v_pack = nullptr; // optional: channels [v_ch0, v_ch0 + v_nch) of y as bf16 [n_t][v_nch]
+    nv_bfloat16 * v_pack = nullptr; // optional: channels [v_ch0, v_ch0 + v_nch) of y as bf16 [n_t][v_nch]
     int64_t states_stride;
     int64_t x_stride_t;
     int64_t w_stride;

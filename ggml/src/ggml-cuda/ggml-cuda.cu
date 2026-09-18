@@ -4509,16 +4509,16 @@ static void ggml_cuda_conv_tokens_pack_for_gdn(ggml_backend_cuda_context & ctx, 
             pack.retired.push_back(pack.data);
         }
         ggml_cuda_set_device(ctx.device);
-        CUDA_CHECK(cudaMalloc(&pack.data, 3*elements*sizeof(__nv_bfloat16)));
+        CUDA_CHECK(cudaMalloc(&pack.data, 3*elements*sizeof(nv_bfloat16)));
         pack.capacity = elements;
     }
     pack.elements = elements;
     pack.node     = gdn;
     pack.f32_elided = false;
-    l2.pack[slice[0]] = (__nv_bfloat16 *) pack.q();
-    l2.pack[slice[1]] = (__nv_bfloat16 *) pack.k();
+    l2.pack[slice[0]] = (nv_bfloat16 *) pack.q();
+    l2.pack[slice[1]] = (nv_bfloat16 *) pack.k();
     l2.pack_heads     = (int) H_v;
-    ta.v_pack = (__nv_bfloat16 *) pack.v();
+    ta.v_pack = (nv_bfloat16 *) pack.v();
     ta.v_ch0  = (int) v_ch0;
     ta.v_nch  = (int) (H_v*S);
 

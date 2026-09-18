@@ -30,8 +30,8 @@ static __global__ void gdn_gates(const T * __restrict__ wa, const T * __restrict
             ggml_cuda_mad(acc, w2.y, x2.y);
         } else {
             const nv_bfloat162 w2 = *(const nv_bfloat162 *) (w + i);
-            ggml_cuda_mad(acc, w2.x, x2.x);
-            ggml_cuda_mad(acc, w2.y, x2.y);
+            ggml_cuda_mad(acc, __bfloat162float(w2.x), x2.x);
+            ggml_cuda_mad(acc, __bfloat162float(w2.y), x2.y);
         }
     }
 
