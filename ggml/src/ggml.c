@@ -7787,6 +7787,17 @@ static void ggml_compute_backward(
                         ggml_add_or_set(ctx, cgraph, isrc1, ggml_mul(ctx, grad, ggml_gelu(ctx, src0)));
                     }
                 } break;
+                case GGML_GLU_OP_REGLU: {
+                    // y = relu(a)*b, so da = step(a)*b*dy and db = relu(a)*dy
+                    if (src0_needs_grads) {
+                        GGML_ASSERT(src1 && "backward pass only implemented for split reglu");
+                        struct ggml_tensor * grad_mul_src1 = ggml_mul(ctx, grad, src1);
+                        ggml_add_or_set(ctx, cgraph, isrc0, ggml_mul(ctx, grad_mul_src1, ggml_step(ctx, src0)));
+                    }
+                    if (src1_needs_grads) {
+                        ggml_add_or_set(ctx, cgraph, isrc1, ggml_mul(ctx, grad, ggml_relu(ctx, src0)));
+                    }
+                } break;
                 default: {
                     GGML_ABORT("unsupported glu op for backward pass: %s", ggml_glu_op_name(ggml_get_glu_op(tensor)));
                 } //break;
