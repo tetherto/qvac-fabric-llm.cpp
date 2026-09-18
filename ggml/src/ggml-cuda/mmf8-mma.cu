@@ -1,6 +1,7 @@
 #include "ggml.h"
 #include "common.cuh"
 #include "convert.cuh"
+#include "cp-async.cuh"
 #include "mma.cuh"
 #include "mmf8.cuh"
 #include "unary.cuh"
@@ -15,6 +16,8 @@ using namespace ggml_cuda_mma;
 // block, so the scale is applied once per slab to the FP32 accumulator and no accumulator alignment is needed.
 // Measured 2026-09-18: 64 rows per block halves the activation restaging but costs more than it saves (S_TG 352
 // against 367 at batch 8, 182 against 215 at batch 4), because the row blocks are what fills the GPU.
+// The weight path is double-buffered: each A tile is copied as raw e4m3 bytes into one of two shared slots with
+// cp.async while the previous tile's conversion and mma run, so a load is always in flight.
 #define MMF8_MMA_NWARPS 4
 #define MMF8_MMA_ROWS   32
 #define MMF8_MMA_KSLAB  GGML_F8_E4M3_SCALE_BLOCK        // scalar k per warp trip
@@ -23,6 +26,9 @@ using namespace ggml_cuda_mma;
 #define MMF8_MMA_SMEM   (MMF8_MMA_NWARPS*MMF8_MMA_TILE_I*MMF8_MMA_KPAD*(int) sizeof(half2))
 // blocks to aim for; measured at batch 8: 1280 gives S_TG 359, 2560 gives 367, 5120 gives 363
 #define MMF8_MMA_TARGET_BLOCKS 2560
+#define MMF8_MMA_STAGES 2                                    // raw weight slots per warp: one in flight, one in use
+#define MMF8_MMA_RAW    (MMF8_MMA_TILE_I*MMF8_MMA_KSLAB)      // bytes of one raw A tile: 16 rows of 128 columns
+#define MMF8_MMA_RAWMEM (MMF8_MMA_NWARPS*MMF8_MMA_STAGES*MMF8_MMA_RAW)
 
 // two packed e4m3 -> half2; e4m3 is exact in f16, so this is lossless and costs one instruction per two weights
 static __device__ __forceinline__ half2 ggml_cuda_e4m3x2_to_half2(const uint16_t v) {
@@ -32,6 +38,20 @@ static __device__ __forceinline__ half2 ggml_cuda_e4m3x2_to_half2(const uint16_t
 #else
     return __floats2half2_rn(ggml_cuda_e4m3_to_fp32((uint8_t) (v & 0xFF)), ggml_cuda_e4m3_to_fp32((uint8_t) (v >> 8)));
 #endif // defined(FP8_AVAILABLE) && !defined(GGML_USE_HIP)
+}
+
+// Stages one raw A tile into a slot with cp.async, in the layout the conversion reads back: lane l owns row
+// l/8 of each group of four rows and bytes 16*(l%8) of that row, which is the 16 bytes it converts itself.
+static __device__ __forceinline__ void mmf8_mma_issue_tile(
+        char * slot, const uint8_t * xw, const int row_off, const int ncols, const int k, const int lane) {
+#pragma unroll
+    for (int it = 0; it < MMF8_MMA_TILE_I/4; ++it) {
+        const int          i   = it*4 + lane/8;
+        const void *       src = xw + (size_t) (row_off + i)*ncols + k + 16*(lane % 8);
+        const unsigned int dst = ggml_cuda_cvta_generic_to_shared(slot + (i*8 + (lane % 8))*16);
+        cp_async_cg_16<128>(dst, src);
+    }
+    cp_async_commit_group();
 }
 
 // has_glu: xg/sxg are the gate matrix of a fused up/gate matmul; the activation is staged once for both and the
@@ -47,7 +67,7 @@ static __device__ __forceinline__ void mmf8_mma_block(
         const uint8_t * x, const float * sx, const uint8_t * xg, const float * sxg,
         const float * y, float * dst,
         const int ncols, const int nblk_n, const int stride_col_y, const int stride_col_dst, const int row0,
-        const int split, const int ksplit, char * smem) {
+        const int split, const int ksplit, char * smem, char * raw) {
 #ifdef TURING_MMA_AVAILABLE
     typedef tile<16, 8, half2> tile_A;
     typedef tile< 8, 8, half2> tile_B;
@@ -74,8 +94,19 @@ static __device__ __forceinline__ void mmf8_mma_block(
 
     float sums[nmat][ntA][tile_C::ne] = {};
 
+    constexpr int ntiles = nmat*ntA;                                 // A tiles consumed per slab
+
+    const int kstride  = ksplit*MMF8_MMA_NWARPS*MMF8_MMA_KSLAB;
+    char *    raw_warp = raw + warp*(MMF8_MMA_STAGES*MMF8_MMA_RAW);
+    int       k0       = (split*MMF8_MMA_NWARPS + warp)*MMF8_MMA_KSLAB;
+    int       stage    = 0;
+
+    // the first copy has to follow the grid dependency: PDL forbids touching producer memory before it is waited
     ggml_cuda_pdl_sync();
-    for (int k0 = (split*MMF8_MMA_NWARPS + warp)*MMF8_MMA_KSLAB; k0 < ncols; k0 += ksplit*MMF8_MMA_NWARPS*MMF8_MMA_KSLAB) {
+    if (k0 < ncols) {
+        mmf8_mma_issue_tile(raw_warp, xr, 0, ncols, k0, lane);
+    }
+    for (; k0 < ncols; k0 += kstride) {
         // the activation slab: 8 columns of 128 k as half2, zero-filled above ncols_dst
         __syncwarp();
 #pragma unroll
@@ -100,17 +131,30 @@ static __device__ __forceinline__ void mmf8_mma_block(
 
 #pragma unroll
         for (int g = 0; g < nmat; ++g) {
-            const uint8_t * xw = g == 0 ? xr : xgr;
-            const float     s  = (g == 0 ? sr : sgr)[(k0/GGML_F8_E4M3_SCALE_BLOCK)*nblk_n];
+            const float s = (g == 0 ? sr : sgr)[(k0/GGML_F8_E4M3_SCALE_BLOCK)*nblk_n];
 #pragma unroll
             for (int itA = 0; itA < ntA; ++itA) {
+                // issue the next tile before consuming this one, so its copy overlaps the conversion and the mma;
+                // the last tile of a slab prefetches the first tile of the next slab
+                const int t  = g*ntA + itA;
+                const int tn = (t + 1) % ntiles;
+                const int kn = t + 1 == ntiles ? k0 + kstride : k0;
+                if (kn < ncols) {
+                    mmf8_mma_issue_tile(raw_warp + ((stage + 1) % MMF8_MMA_STAGES)*MMF8_MMA_RAW,
+                                        tn < ntA ? xr : xgr, (tn % ntA)*tile_A::I, ncols, kn, lane);
+                    cp_async_wait_group<1>();
+                } else {
+                    cp_async_wait_group<0>();   // nothing younger is in flight, so wait for this tile itself
+                }
+                const char * slot = raw_warp + stage*MMF8_MMA_RAW;
+
                 __syncwarp();
-                // 16 bytes per lane: one instruction stages four whole 128-byte weight rows, which keeps four
-                // times more weight bytes in flight than a 4-byte load per lane does
+                // every lane converts exactly the 16 bytes it copied, so only the cross-lane ldmatrix below
+                // needs the warp barrier
 #pragma unroll
                 for (int it = 0; it < tile_A::I/4; ++it) {
                     const int      i = it*4 + lane/8;
-                    const uint4    w = *(const uint4 *) (xw + (size_t) (itA*tile_A::I + i)*ncols + k0 + 16*(lane % 8));
+                    const uint4    w = *(const uint4 *) (slot + (i*8 + (lane % 8))*16);
                     const uint32_t v[4] = {w.x, w.y, w.z, w.w};
                     half2 *        p = tile_xy + i*MMF8_MMA_KPAD + (lane % 8)*8;
 #pragma unroll
@@ -132,6 +176,7 @@ static __device__ __forceinline__ void mmf8_mma_block(
                 for (int l = 0; l < tile_C::ne; ++l) {
                     sums[g][itA][l] += s*C.x[l];
                 }
+                stage = (stage + 1) % MMF8_MMA_STAGES;
             }
         }
     }
@@ -183,7 +228,8 @@ static __device__ __forceinline__ void mmf8_mma_block(
         }
     }
 #else
-    GGML_UNUSED_VARS(x, sx, xg, sxg, y, dst, ncols, nblk_n, stride_col_y, stride_col_dst, row0, split, ksplit, smem);
+    GGML_UNUSED_VARS(x, sx, xg, sxg, y, dst, ncols, nblk_n, stride_col_y, stride_col_dst, row0, split, ksplit,
+                     smem, raw);
     NO_DEVICE_CODE;
 #endif // TURING_MMA_AVAILABLE
 }
@@ -194,14 +240,16 @@ static __global__ void mul_mat_f8_e4m3_mma(
         const float * y, float * dst,
         const int ncols, const int nblk_n, const int stride_col_y, const int stride_col_dst, const int ksplit) {
     __shared__ __align__(16) char smem[MMF8_MMA_SMEM];
+    __shared__ __align__(16) char raw[MMF8_MMA_RAWMEM];
     mmf8_mma_block<ncols_dst, has_glu>(x, sx, xg, sxg, y, dst, ncols, nblk_n, stride_col_y, stride_col_dst,
-                                       blockIdx.x*MMF8_MMA_ROWS, blockIdx.y, ksplit, smem);
+                                       blockIdx.x*MMF8_MMA_ROWS, blockIdx.y, ksplit, smem, raw);
 }
 
 // up to three F8 matrices sharing one activation in one launch, with the same block mapping as the multi GEMV
 template <int ncols_dst>
 static __global__ void mul_mat_f8_e4m3_mma_multi(const mmf8_multi_args a, const float * y, const int ncols, const int stride_col_y, const int ksplit) {
     __shared__ __align__(16) char smem[MMF8_MMA_SMEM];
+    __shared__ __align__(16) char raw[MMF8_MMA_RAWMEM];
     // constant indices only: a dynamic index into the parameter struct would copy it to local memory per thread
     const uint8_t * x     = a.x[0];
     const float   * sx    = a.sx[0];
@@ -220,7 +268,7 @@ static __global__ void mul_mat_f8_e4m3_mma_multi(const mmf8_multi_args a, const 
     }
     const int row0 = (blockIdx.x - b0)*MMF8_MMA_ROWS;
     mmf8_mma_block<ncols_dst, false>(x, sx, nullptr, nullptr, y, dst, ncols, nrows/GGML_F8_E4M3_SCALE_BLOCK,
-                                     stride_col_y, nrows, row0, blockIdx.y, ksplit, smem);
+                                     stride_col_y, nrows, row0, blockIdx.y, ksplit, smem, raw);
 }
 
 // How many blocks split k so the grid fills the GPU: one wave is 132 blocks on an H100 and the GEMV this replaces
