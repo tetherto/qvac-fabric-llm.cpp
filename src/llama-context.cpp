@@ -66,9 +66,17 @@ static const llm_fused_op_probe llm_fused_op_lid_probe = {
 };
 
 // the implicit causal mask (no mask tensor, see ggml_flash_attn_ext_set_kv_used) needs backend support for the
-// model's attention shape: probe the device of the first attention layer with a representative prefill op
+// model's attention shape: probe the device of the first attention layer with a representative prefill op.
+// Opt-in for now: the mask-free graph has a different shape from the masked one, so a context that mixes both
+// (prefill without a mask, decode with one) makes ggml-alloc rediscover its plan, which a GGML_SCHED_NO_REALLOC
+// build reports as an unexpected reallocation. Set GGML_ATTN_IMPLICIT_MASK=1 to use it (the H100 campaign does).
 static bool llama_attn_implicit_mask_supported(const llama_model & model, ggml_type type_k, ggml_type type_v) {
     const auto & hparams = model.hparams;
+
+    const char * opt_in = getenv("GGML_ATTN_IMPLICIT_MASK");
+    if (opt_in == nullptr || atoi(opt_in) == 0) {
+        return false;
+    }
 
     // ALiBi rides on the mask tensor (ggml_flash_attn_ext asserts one when max_bias > 0), so there is nothing to drop
     if (hparams.f_max_alibi_bias > 0.0f) {

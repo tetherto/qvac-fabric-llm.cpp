@@ -348,6 +348,10 @@ public:
 
     int32_t n_kv_used = 0;
 
+    // the flash-attn nodes built with the implicit mask; set_input refreshes their extent so a reused graph
+    // serves the next ubatch without a rebuild
+    std::vector<ggml_tensor *> fa_implicit;
+
     // note: assumes v_rot^2 == I
     ggml_tensor * self_k_rot = nullptr;
     ggml_tensor * self_v_rot = nullptr;
@@ -1145,7 +1149,9 @@ struct llm_graph_context {
             ggml_tensor * v_mla,   // [n_embd_head_v_mla, n_embd_head_v, n_head_v]
                   float   kq_scale,
                     int   il,
-                int32_t   n_kv_used = 0) const;
+                int32_t   n_kv_used = 0,
+            // receives the flash-attn nodes built with the implicit mask, so set_input can refresh their extent
+            std::vector<ggml_tensor *> * fa_implicit = nullptr) const;
 
     llm_graph_input_attn_no_cache * build_attn_inp_no_cache() const;
 

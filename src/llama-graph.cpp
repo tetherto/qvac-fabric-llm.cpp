@@ -495,6 +495,15 @@ void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
     if (self_v_rot && self_v_rot->buffer) {
         mctx->set_input_v_rot(self_v_rot);
     }
+
+    // the implicit causal mask has no tensor to fill: the extent lives in the flash-attn op params, and it moves
+    // with the cache, so refresh it here rather than rebuilding the graph for every ubatch
+    if (!fa_implicit.empty()) {
+        n_kv_used = (int32_t) mctx->get_n_kv_used();
+        for (ggml_tensor * node : fa_implicit) {
+            ggml_flash_attn_ext_set_kv_used(node, n_kv_used);
+        }
+    }
 }
 
 bool llm_graph_input_attn_kv::can_reuse(const llm_graph_params & params) {
@@ -506,8 +515,8 @@ bool llm_graph_input_attn_kv::can_reuse(const llm_graph_params & params) {
 
     res &= self_k_idxs->ne[0] == params.ubatch.n_tokens;
   //res &= self_v_idxs->ne[0] == params.ubatch.n_tokens; // TODO: need to move this to the unified cache and check there
-
-    res &= n_kv_used == llm_graph_attn_implicit_mask_n_kv_used(mctx, params.ubatch, params.cparams);
+    // only the mask mode has to match: set_input refreshes the extent itself
+    res &= (n_kv_used > 0) == (llm_graph_attn_implicit_mask_n_kv_used(mctx, params.ubatch, params.cparams) > 0);
     if (n_kv_used == 0) {
         res &= can_reuse_kq_mask(self_kq_mask, mctx, params.ubatch, params.cparams);
     }
@@ -1082,6 +1091,14 @@ void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
         mctx->get_attn()->set_input_kq_mask(inp_attn->self_kq_mask, ubatch, cparams.causal_attn);
     }
 
+    // same as llm_graph_input_attn_kv::set_input: the implicit mask carries its extent in the op params
+    if (!inp_attn->fa_implicit.empty()) {
+        inp_attn->n_kv_used = (int32_t) mctx->get_attn()->get_n_kv_used();
+        for (ggml_tensor * node : inp_attn->fa_implicit) {
+            ggml_flash_attn_ext_set_kv_used(node, inp_attn->n_kv_used);
+        }
+    }
+
     if (inp_attn->self_k_rot) {
         mctx->get_attn()->set_input_k_rot(inp_attn->self_k_rot);
     }
@@ -1113,7 +1130,9 @@ bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
     res &= inp_attn->self_k_idxs->ne[0] == params.ubatch.n_tokens;
   //res &= inp_attn->self_v_idxs->ne[0] == params.ubatch.n_tokens; // TODO: need to move this to the unified cache and check there
 
-    res &= inp_attn->n_kv_used == llm_graph_attn_implicit_mask_n_kv_used(mctx->get_attn(), params.ubatch, params.cparams);
+    // only the mask mode has to match: the attention input refreshes the extent in its own set_input
+    res &= (inp_attn->n_kv_used > 0) ==
+           (llm_graph_attn_implicit_mask_n_kv_used(mctx->get_attn(), params.ubatch, params.cparams) > 0);
     if (inp_attn->n_kv_used == 0) {
         res &= can_reuse_kq_mask(inp_attn->self_kq_mask, mctx->get_attn(), params.ubatch, params.cparams);
     }
@@ -2572,7 +2591,8 @@ ggml_tensor * llm_graph_context::build_attn_mha(
          ggml_tensor * v_mla,
                float   kq_scale,
                  int   il,
-             int32_t   n_kv_used) const {
+             int32_t   n_kv_used,
+  std::vector<ggml_tensor *> * fa_implicit) const {
     GGML_ASSERT(kq_mask != nullptr || n_kv_used == 0 || (cparams.flash_attn && kq_b == nullptr));
     const bool v_trans = v->nb[1] > v->nb[2];
 
@@ -2612,6 +2632,10 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         ggml_flash_attn_ext_set_prec (cur, GGML_PREC_F32);
         if (kq_mask == nullptr && n_kv_used > 0) {
             ggml_flash_attn_ext_set_kv_used(cur, n_kv_used);
+            // the cache extent changes every ubatch, so set_input refreshes it instead of rebuilding the graph
+            if (fa_implicit) {
+                fa_implicit->push_back(cur);
+            }
         }
 
         if (v_mla) {
@@ -2881,7 +2905,8 @@ ggml_tensor * llm_graph_context::build_attn(
         kq_mask = ggml_cont(ctx0, kq_mask);
     }
 
-    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il, inp->get_n_kv_used());
+    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il, inp->get_n_kv_used(),
+                                       &inp->fa_implicit);
     cb(cur, "kqv_out", il);
 
     if (inp->self_v_rot) {

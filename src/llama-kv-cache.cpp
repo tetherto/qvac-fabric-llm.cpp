@@ -2973,6 +2973,10 @@ llama_kv_cache_context::llama_kv_cache_context(
         llama_kv_cache * kv) : status(LLAMA_MEMORY_STATUS_SUCCESS), kv(kv) {
     n_kv = kv->get_size();
 
+    // worst case for the graph shape: a prefill-sized ubatch attends with the implicit causal mask, so the
+    // reserved graph must be the mask-free one (the value itself only reaches the flash-attn op params)
+    n_kv_used = n_kv;
+
     const uint32_t n_stream = kv->get_n_stream();
 
     // create a dummy slot info - the actual data is irrelevant. we just need to build the graph
