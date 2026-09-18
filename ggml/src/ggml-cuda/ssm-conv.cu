@@ -337,7 +337,7 @@ static __global__ void ssm_conv_tokens_f32(const ggml_cuda_ssm_conv_tokens_args 
 #pragma unroll
         for (int i = 0; i < split_t; i++) {
             if (i < local_n_t) {
-                a.v_pack[(t0 + i)*(int64_t) a.v_nch + (c - a.v_ch0)] = __float2bfloat16_rn(yv[i]);
+                a.v_pack[(t0 + i)*(int64_t) a.v_nch + (c - a.v_ch0)] = __float2bfloat16(yv[i]);
             }
         }
     }
@@ -390,7 +390,7 @@ static __global__ void ssm_conv_tokens_f32(const ggml_cuda_ssm_conv_tokens_args 
                         dst[head*nb1 + (int64_t) (t0 + i)*nb2 + tid] = o;
                     }
                     if (pack != nullptr) {
-                        const nv_bfloat16 ob = __float2bfloat16_rn(o);
+                        const nv_bfloat16 ob = __float2bfloat16(o);
                         for (int hv = head; hv < l2.pack_heads; hv += n_heads) {
                             pack[((t0 + i)*(int64_t) l2.pack_heads + hv)*split_ch + tid] = ob;
                         }

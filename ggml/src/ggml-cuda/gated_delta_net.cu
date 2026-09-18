@@ -699,7 +699,7 @@ __global__ void gated_delta_net_flashinfer_prepare_cuda(
     const int64_t it = (idx / (S * H_v)) % n_tokens;
     const int64_t is = idx / (S * H_v * n_tokens);
 
-    v_bf16[idx] = __float2bfloat16_rn(v[is * sv3 + it * sv2 + ih * sv1 + d]);
+    v_bf16[idx] = __float2bfloat16(v[is * sv3 + it * sv2 + ih * sv1 + d]);
     if (d == 0) {
         const int64_t gate_idx = is * n_tokens * H_v + it * H_v + ih;
         const int64_t src_gate_idx = is * sb3 + it * sb2 + ih * sb1;
@@ -713,8 +713,8 @@ __global__ void gated_delta_net_flashinfer_prepare_cuda(
     const int64_t iq1 = ih % H_q;
     const int64_t q_idx = ((is * n_tokens + it) * H_v + ih) * S + d;
     const int64_t src_idx = iq3 * sq3 + it * sq2 + iq1 * sq1 + d;
-    q_bf16[q_idx] = __float2bfloat16_rn(q[src_idx]);
-    k_bf16[q_idx] = __float2bfloat16_rn(k[src_idx]);
+    q_bf16[q_idx] = __float2bfloat16(q[src_idx]);
+    k_bf16[q_idx] = __float2bfloat16(k[src_idx]);
 }
 
 __global__ void gated_delta_net_flashinfer_unpack_cuda(
