@@ -1008,6 +1008,31 @@ static int test_mtp_shared(bool cpu) {
                 }
             }
         }
+        std::vector<uint8_t> state;
+        GGML_ASSERT(common_speculative_get_state(spec.get(), 0, state));
+        GGML_ASSERT(state.size() == sizeof(llama_pos) + (size_t) llama_model_n_embd_out(model.get()) * sizeof(float));
+        llama_pos state_pos = -1;
+        std::memcpy(&state_pos, state.data(), sizeof(state_pos));
+        GGML_ASSERT(state_pos == 255);
+
+        const auto saved_state = state;
+        common_speculative_set_state(spec.get(), 0, { 0 });
+        GGML_ASSERT(common_speculative_get_state(spec.get(), 0, state));
+        GGML_ASSERT(state == saved_state);
+
+        auto            invalid_pos_state = saved_state;
+        const llama_pos invalid_pos       = -1;
+        std::memcpy(invalid_pos_state.data(), &invalid_pos, sizeof(invalid_pos));
+        common_speculative_set_state(spec.get(), 0, invalid_pos_state);
+        GGML_ASSERT(common_speculative_get_state(spec.get(), 0, state));
+        GGML_ASSERT(state == saved_state);
+
+        common_speculative_set_state(spec.get(), 0, {});
+        GGML_ASSERT(!common_speculative_get_state(spec.get(), 0, state));
+        common_speculative_set_state(spec.get(), 0, saved_state);
+        GGML_ASSERT(common_speculative_get_state(spec.get(), 0, state));
+        GGML_ASSERT(state == saved_state);
+
         GGML_ASSERT(llama_perf_context(target.get()).n_reused > 0);
         GGML_ASSERT(llama_perf_context(draft.get()).n_reused > 0);
         if (share) {
