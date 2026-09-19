@@ -10,6 +10,9 @@
 #  include <winsock2.h>
 #else
 #  include <arpa/inet.h>
+#  include <errno.h>
+#  include <fcntl.h>
+#  include <poll.h>
 #  include <sys/socket.h>
 #  include <sys/types.h>
 #  include <netinet/in.h>
@@ -17,18 +20,18 @@
 #  include <netdb.h>
 #  include <unistd.h>
 #endif
+#include <algorithm>
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <optional>
+#include <thread>
 
 #ifdef GGML_RPC_RDMA
 #  include <infiniband/verbs.h>
 #  include <array>
 #  include <time.h>
-#  ifndef _WIN32
-#    include <poll.h>
-#  endif
 #  ifdef GGML_RPC_RDMA_APPLE
 #    include "transport-apple.h"
 #  endif
@@ -126,7 +129,9 @@ struct socket_t::impl {
     ~impl();
     bool send_data(const void * data, size_t size);
     bool recv_data(void * data, size_t size);
+    bool exchange_data(const void * send_data, void * recv_data, size_t size);
     bool flush();
+    bool set_timeout(int timeout_ms);
     void get_caps(uint8_t * local_caps);
     void update_caps(const uint8_t * remote_caps);
 
@@ -149,6 +154,7 @@ struct socket_t::impl {
 #endif // GGML_RPC_RDMA
     bool     use_rdma;
     sockfd_t fd;
+    int      timeout_ms = -1;
 };
 
 socket_t::impl::~impl() {
@@ -400,6 +406,9 @@ bool socket_t::impl::rdma_activate(uint32_t remote_qpn, uint32_t remote_psn, con
 }
 
 bool socket_t::impl::rdma_poll(struct ibv_cq * cq, struct ibv_wc * wc) {
+    const auto deadline = timeout_ms >= 0
+            ? std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms)
+            : std::chrono::steady_clock::time_point::max();
     for (uint64_t s = 0; ; s++) {
         int n = ibv_poll_cq(cq, 1, wc);
         if (n > 0) {
@@ -410,8 +419,12 @@ bool socket_t::impl::rdma_poll(struct ibv_cq * cq, struct ibv_wc * wc) {
             return wc->status == IBV_WC_SUCCESS;
         }
         if (n < 0) return false;
-        if ((s & 0xFFFFF) == 0 && s > 0) {
+        if ((s & 0xFFF) == 0 && s > 0) {
             if (tcp_peer_closed()) {
+                return false;
+            }
+            if (std::chrono::steady_clock::now() >= deadline) {
+                GGML_LOG_ERROR("RDMA operation timed out\n");
                 return false;
             }
         }
@@ -490,7 +503,11 @@ bool socket_t::impl::send_data(const void * data, size_t size) {
     size_t bytes_sent = 0;
     while (bytes_sent < size) {
         size_t size_to_send = std::min(size - bytes_sent, MAX_CHUNK_SIZE);
-        ssize_t n = send(fd, (const char *)data + bytes_sent, size_to_send, 0);
+        int flags = 0;
+#ifdef MSG_NOSIGNAL
+        flags = MSG_NOSIGNAL;
+#endif
+        ssize_t n = send(fd, (const char *)data + bytes_sent, size_to_send, flags);
         if (n < 0) {
             GGML_LOG_ERROR("send failed (bytes_sent=%zu, size_to_send=%zu)\n",
                            bytes_sent, size_to_send);
@@ -526,6 +543,42 @@ bool socket_t::impl::recv_data(void * data, size_t size) {
         }
         bytes_recv += (size_t)n;
     }
+    return true;
+}
+
+bool socket_t::impl::exchange_data(const void * send_buf, void * recv_buf, size_t size) {
+    bool send_ok = false;
+    std::thread sender([&]() {
+        // the peer blocks on our data before answering, so post the coalescing
+        // transport's trailing partial frame before waiting on the recv side
+        send_ok = send_data(send_buf, size) && flush();
+    });
+    const bool recv_ok = recv_data(recv_buf, size);
+    sender.join();
+    return send_ok && recv_ok;
+}
+
+bool socket_t::impl::set_timeout(int timeout) {
+    if (timeout < 0) {
+        return false;
+    }
+#ifdef _WIN32
+    const DWORD value = (DWORD) timeout;
+    if (setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, (const char *) &value, sizeof(value)) != 0 ||
+            setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, (const char *) &value, sizeof(value)) != 0) {
+        return false;
+    }
+#else
+    const struct timeval value = {
+        /*.tv_sec  =*/ timeout / 1000,
+        /*.tv_usec =*/ (timeout % 1000) * 1000,
+    };
+    if (setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &value, sizeof(value)) != 0 ||
+            setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &value, sizeof(value)) != 0) {
+        return false;
+    }
+#endif
+    timeout_ms = timeout;
     return true;
 }
 
@@ -608,8 +661,28 @@ bool socket_t::recv_data(void * data, size_t size) {
     return pimpl->recv_data(data, size);
 }
 
+bool socket_t::exchange_data(const void * send_data, void * recv_data, size_t size) {
+    return pimpl->exchange_data(send_data, recv_data, size);
+}
+
 bool socket_t::flush() {
     return pimpl->flush();
+}
+
+bool socket_t::set_timeout(int timeout_ms) {
+    return pimpl->set_timeout(timeout_ms);
+}
+
+void socket_t::shutdown() {
+#ifdef _WIN32
+    if (pimpl->fd != INVALID_SOCKET) {
+        ::shutdown(pimpl->fd, SD_BOTH);
+    }
+#else
+    if (pimpl->fd >= 0) {
+        ::shutdown(pimpl->fd, SHUT_RDWR);
+    }
+#endif
 }
 
 void socket_t::get_caps(uint8_t * local_caps) {
@@ -628,11 +701,50 @@ static bool is_valid_fd(sockfd_t sockfd) {
 #endif
 }
 
+static void close_socket(sockfd_t sockfd) {
+#ifdef _WIN32
+    closesocket(sockfd);
+#else
+    close(sockfd);
+#endif
+}
+
+static bool socket_error_is_interrupted() {
+#ifdef _WIN32
+    return WSAGetLastError() == WSAEINTR;
+#else
+    return errno == EINTR;
+#endif
+}
+
 static bool set_no_delay(sockfd_t sockfd) {
     int flag = 1;
     // set TCP_NODELAY to disable Nagle's algorithm
     int ret = setsockopt(sockfd, IPPROTO_TCP, TCP_NODELAY, (char *)&flag, sizeof(int));
     return ret == 0;
+}
+
+static bool set_no_sigpipe(sockfd_t sockfd) {
+#if !defined(_WIN32) && !defined(MSG_NOSIGNAL) && defined(SO_NOSIGPIPE)
+    int flag = 1;
+    return setsockopt(sockfd, SOL_SOCKET, SO_NOSIGPIPE, (char *)&flag, sizeof(int)) == 0;
+#else
+    (void) sockfd;
+    return true;
+#endif
+}
+
+static bool set_non_blocking(sockfd_t sockfd, bool enabled) {
+#ifdef _WIN32
+    u_long mode = enabled ? 1 : 0;
+    return ioctlsocket(sockfd, FIONBIO, &mode) == 0;
+#else
+    const int flags = fcntl(sockfd, F_GETFL, 0);
+    if (flags < 0) {
+        return false;
+    }
+    return fcntl(sockfd, F_SETFL, enabled ? flags | O_NONBLOCK : flags & ~O_NONBLOCK) == 0;
+#endif
 }
 
 static bool set_reuse_addr(sockfd_t sockfd) {
@@ -641,16 +753,76 @@ static bool set_reuse_addr(sockfd_t sockfd) {
     return ret == 0;
 }
 
-socket_ptr socket_t::accept() {
-    auto client_socket_fd = ::accept(pimpl->fd, NULL, NULL);
-    if (!is_valid_fd(client_socket_fd)) {
-        return nullptr;
+socket_ptr socket_t::accept(int timeout_ms, bool * timed_out) {
+    if (timed_out != nullptr) {
+        *timed_out = false;
     }
-    if (!set_no_delay(client_socket_fd)) {
-        GGML_LOG_ERROR("Failed to set TCP_NODELAY\n");
-        return nullptr;
+    auto deadline = std::chrono::steady_clock::time_point::max();
+    if (timeout_ms > 0) {
+        deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
     }
-    return socket_ptr(new socket_t(std::make_unique<impl>(client_socket_fd)));
+    while (true) {
+        if (timeout_ms >= 0) {
+            int wait_ms = timeout_ms;
+            if (timeout_ms > 0) {
+                const auto remaining = deadline - std::chrono::steady_clock::now();
+                if (remaining <= std::chrono::steady_clock::duration::zero()) {
+                    if (timed_out != nullptr) {
+                        *timed_out = true;
+                    }
+                    return nullptr;
+                }
+                wait_ms = std::max(1, (int) std::chrono::duration_cast<std::chrono::milliseconds>(remaining).count());
+            }
+#ifdef _WIN32
+            fd_set readfds;
+            FD_ZERO(&readfds);
+            FD_SET(pimpl->fd, &readfds);
+
+            struct timeval timeout = {
+                /*.tv_sec  =*/ wait_ms / 1000,
+                /*.tv_usec =*/ (wait_ms % 1000) * 1000,
+            };
+            const int ready = select(0, &readfds, NULL, NULL, &timeout);
+#else
+            struct pollfd pfd   = { pimpl->fd, POLLIN, 0 };
+            const int     ready = poll(&pfd, 1, wait_ms);
+#endif
+            if (ready == 0) {
+                if (timed_out != nullptr) {
+                    *timed_out = true;
+                }
+                return nullptr;
+            }
+            if (ready < 0) {
+                if (socket_error_is_interrupted()) {
+                    continue;
+                }
+                GGML_LOG_ERROR("Failed to wait for incoming connection\n");
+                return nullptr;
+            }
+        }
+
+        auto client_socket_fd = ::accept(pimpl->fd, NULL, NULL);
+        if (!is_valid_fd(client_socket_fd)) {
+            if (socket_error_is_interrupted()) {
+                continue;
+            }
+            GGML_LOG_ERROR("Failed to accept incoming connection\n");
+            return nullptr;
+        }
+        if (!set_no_delay(client_socket_fd)) {
+            GGML_LOG_ERROR("Failed to set TCP_NODELAY\n");
+            close_socket(client_socket_fd);
+            return nullptr;
+        }
+        if (!set_no_sigpipe(client_socket_fd)) {
+            GGML_LOG_ERROR("Failed to suppress SIGPIPE\n");
+            close_socket(client_socket_fd);
+            return nullptr;
+        }
+        return socket_ptr(new socket_t(std::make_unique<impl>(client_socket_fd)));
+    }
 }
 
 socket_ptr socket_t::create_server(const char * host, int port) {
@@ -680,47 +852,101 @@ socket_ptr socket_t::create_server(const char * host, int port) {
     return socket_ptr(new socket_t(std::make_unique<impl>(sockfd)));
 }
 
-socket_ptr socket_t::connect(const char * host, int port) {
+socket_ptr socket_t::connect(const char * host, int port, int timeout_ms) {
     auto sockfd = socket(AF_INET, SOCK_STREAM, 0);
     if (!is_valid_fd(sockfd)) {
         return nullptr;
     }
-    if (!set_no_delay(sockfd)) {
-        GGML_LOG_ERROR("Failed to set TCP_NODELAY\n");
+    auto fail = [&]() -> socket_ptr {
+        close_socket(sockfd);
         return nullptr;
-    }
+    };
     struct sockaddr_in addr;
     addr.sin_family = AF_INET;
     addr.sin_port = htons(port);
     struct hostent * server = gethostbyname(host);
     if (server == NULL) {
         GGML_LOG_ERROR("Cannot resolve host '%s'\n", host);
-        return nullptr;
+        return fail();
     }
     memcpy(&addr.sin_addr.s_addr, server->h_addr, server->h_length);
-    if (::connect(sockfd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-        return nullptr;
+    if (timeout_ms >= 0) {
+        if (!set_non_blocking(sockfd, true)) {
+            return fail();
+        }
+        if (::connect(sockfd, (struct sockaddr *) &addr, sizeof(addr)) < 0) {
+#ifdef _WIN32
+            const int error = WSAGetLastError();
+            if (error != WSAEWOULDBLOCK && error != WSAEINPROGRESS) {
+                return fail();
+            }
+#else
+            if (errno != EINPROGRESS) {
+                return fail();
+            }
+#endif
+#ifdef _WIN32
+            fd_set writefds;
+            FD_ZERO(&writefds);
+            FD_SET(sockfd, &writefds);
+            struct timeval timeout = {
+                /*.tv_sec  =*/ timeout_ms / 1000,
+                /*.tv_usec =*/ (timeout_ms % 1000) * 1000,
+            };
+            const int ready = select(0, NULL, &writefds, NULL, &timeout);
+#else
+            struct pollfd pfd   = { sockfd, POLLOUT, 0 };
+            const int     ready = poll(&pfd, 1, timeout_ms);
+#endif
+            if (ready <= 0) {
+                return fail();
+            }
+            int socket_error = 0;
+#ifdef _WIN32
+            int error_size = sizeof(socket_error);
+#else
+            socklen_t error_size = sizeof(socket_error);
+#endif
+            if (getsockopt(sockfd, SOL_SOCKET, SO_ERROR, (char *) &socket_error, &error_size) != 0 ||
+                    socket_error != 0) {
+                return fail();
+            }
+        }
+        if (!set_non_blocking(sockfd, false)) {
+            return fail();
+        }
+    } else if (::connect(sockfd, (struct sockaddr *) &addr, sizeof(addr)) < 0) {
+        return fail();
+    }
+    if (!set_no_delay(sockfd)) {
+        GGML_LOG_ERROR("Failed to set TCP_NODELAY\n");
+        return fail();
+    }
+    if (!set_no_sigpipe(sockfd)) {
+        GGML_LOG_ERROR("Failed to suppress SIGPIPE\n");
+        return fail();
     }
     return socket_ptr(new socket_t(std::make_unique<impl>(sockfd)));
 }
 
 #ifdef _WIN32
 static std::mutex g_rpc_transport_mu;
-static bool g_rpc_transport_wsa_started = false;
+static size_t     g_rpc_transport_users = 0;
 #endif
 
 bool rpc_transport_init() {
 #ifdef _WIN32
     std::lock_guard<std::mutex> lock(g_rpc_transport_mu);
-    if (g_rpc_transport_wsa_started) {
+    if (g_rpc_transport_users > 0) {
+        g_rpc_transport_users++;
         return true;
     }
     WSADATA wsaData;
-    int res = WSAStartup(MAKEWORD(2, 2), &wsaData);
+    int     res = WSAStartup(MAKEWORD(2, 2), &wsaData);
     if (res != 0) {
         return false;
     }
-    g_rpc_transport_wsa_started = true;
+    g_rpc_transport_users = 1;
     return true;
 #else
     return true;
@@ -730,10 +956,13 @@ bool rpc_transport_init() {
 void rpc_transport_shutdown() {
 #ifdef _WIN32
     std::lock_guard<std::mutex> lock(g_rpc_transport_mu);
-    if (!g_rpc_transport_wsa_started) {
+    if (g_rpc_transport_users == 0) {
+        return;
+    }
+    g_rpc_transport_users--;
+    if (g_rpc_transport_users > 0) {
         return;
     }
     WSACleanup();
-    g_rpc_transport_wsa_started = false;
 #endif
 }

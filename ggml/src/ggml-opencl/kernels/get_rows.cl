@@ -147,6 +147,55 @@ kernel void kernel_get_rows_f16(
     }
 }
 
+#define QK8_0 32
+
+typedef struct {
+    half  d;
+    char  qs[QK8_0];
+} block_q8_0;
+
+kernel void kernel_get_rows_q8_0(
+        global void * src0,
+        ulong offset0,
+        global int * src1,
+        ulong offset1,
+        global float * dst,
+        ulong offsetd,
+        int ne00,
+        ulong nb01,
+        ulong nb02,
+        ulong nb03,
+        int ne10,
+        ulong nb10,
+        ulong nb11,
+        ulong nb12,
+        ulong nb1,
+        ulong nb2,
+        ulong nb3
+) {
+    src0 = (global void*)((global char*)src0 + offset0);
+    src1 = (global int*)((global char*)src1 + offset1);
+    dst = (global float*)((global char*)dst + offsetd);
+
+    int i10 = get_group_id(0);
+    int i11 = get_group_id(1);
+    int i12 = get_group_id(2);
+
+    int r = ((global int32_t *) ((global char *) src1 + i12*nb12 + i11*nb11 + i10*nb10))[0];
+
+    int i02 = i11;
+    int i03 = i12;
+
+    global block_q8_0 * src_row = (global block_q8_0 *)((global char *) src0 + r*nb01 + i02*nb02 + i03*nb03);
+    global float      * dst_row = (global float *)((global char *) dst + i12*nb3 + i11*nb2 + i10*nb1);
+
+    for (int ind = get_local_id(0); ind < ne00; ind += get_local_size(0)) {
+        int bi = ind / QK8_0;
+        int qi = ind % QK8_0;
+        dst_row[ind] = (float)src_row[bi].qs[qi] * (float)src_row[bi].d;
+    }
+}
+
 kernel void kernel_get_rows_q4_0(
         global void * src0,
         ulong offset0,

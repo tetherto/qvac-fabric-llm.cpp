@@ -6,12 +6,23 @@
 extern "C" {
 #endif
 
-#define RPC_PROTO_MAJOR_VERSION    6
-#define RPC_PROTO_MINOR_VERSION    0
+// qvac fork: downstream ggml_op insertions shift the serialized op ids
+// relative to upstream, so the wire format is incompatible with stock
+// llama.cpp peers even though the message framing is unchanged. Keep the
+// major version in the downstream namespace (>= 100), bumping it for
+// incompatible changes, so mismatched peers are rejected at the HELLO
+// handshake instead of misdecoding graphs. The
+// HELLO fields are uint8_t on the wire, so the value must stay <= 255.
+// 108 adds butterfly communicator rounds and round-tagged peer frames.
+// 108.1 adds RPC_CMD_SET_TENSOR_2D_HASH. A minor bump is additive: the client
+// still accepts a server with an older minor and must gate every command
+// introduced by a later minor on the minor the server announces at HELLO.
+#define RPC_PROTO_MAJOR_VERSION    108
+#define RPC_PROTO_MINOR_VERSION    1
 #define RPC_PROTO_PATCH_VERSION    0
 
 #ifdef  __cplusplus
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT has changed - update RPC_PROTO_PATCH_VERSION");
+static_assert(GGML_OP_COUNT == 113, "GGML_OP_COUNT has changed - update the RPC protocol version");
 #endif
 
 #define GGML_RPC_MAX_SERVERS       16
@@ -27,8 +38,24 @@ GGML_BACKEND_API void ggml_backend_rpc_get_device_memory(const char * endpoint, 
 GGML_BACKEND_API void ggml_backend_rpc_start_server(const char * endpoint, const char * cache_dir,
                                                     size_t n_threads, size_t n_devices, ggml_backend_dev_t * devices);
 
+// Managed server lifecycle for in-process hosts such as mobile Bare apps.
+// create() initializes devices and binds the listening socket synchronously;
+// run() blocks until stop() is requested and must be called from a worker
+// thread. The caller must wait for run() to return before calling free().
+typedef struct ggml_backend_rpc_server * ggml_backend_rpc_server_t;
+GGML_BACKEND_API ggml_backend_rpc_server_t ggml_backend_rpc_server_create(
+        const char * endpoint, const char * cache_dir,
+        size_t n_threads, size_t n_devices, ggml_backend_dev_t * devices);
+GGML_BACKEND_API void ggml_backend_rpc_server_run(ggml_backend_rpc_server_t server);
+GGML_BACKEND_API void ggml_backend_rpc_server_stop(ggml_backend_rpc_server_t server);
+GGML_BACKEND_API void ggml_backend_rpc_server_free(ggml_backend_rpc_server_t server);
+
 GGML_BACKEND_API ggml_backend_reg_t ggml_backend_rpc_reg(void);
 GGML_BACKEND_API ggml_backend_reg_t ggml_backend_rpc_add_server(const char * endpoint);
+
+// Connects to `endpoint` and caches the connection without registering it as a backend.
+// Different endpoints can connect concurrently; same-endpoint callers share one attempt.
+GGML_BACKEND_API bool ggml_backend_rpc_prefetch_connection(const char * endpoint);
 
 #ifdef  __cplusplus
 }

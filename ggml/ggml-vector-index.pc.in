@@ -1,0 +1,11 @@
+prefix=@GGML_PC_PREFIX@
+exec_prefix=${prefix}
+libdir=@GGML_PC_LIBDIR@
+includedir=@GGML_PC_INCLUDEDIR@
+
+Name: ggml-vector-index
+Description: Vector index library for ggml
+Version: @GGML_VERSION@
+Libs: -L${libdir} -lggml-vector-index
+Libs.private: @GGML_VECTOR_INDEX_PC_LIBS_PRIVATE@
+Cflags: -I${includedir}
