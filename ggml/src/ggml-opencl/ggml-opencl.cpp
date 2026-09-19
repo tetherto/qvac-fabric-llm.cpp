@@ -801,7 +801,7 @@ struct ggml_backend_opencl_context {
     size_t global_mem_size;
     size_t max_alloc_size;
     size_t max_workgroup_size;
-    cl_ulong local_mem_size;
+    cl_ulong local_mem_size = 0;                 // CL_DEVICE_LOCAL_MEM_SIZE (0 = unknown)
     bool fp16_support;
     bool has_vector_subgroup_broadcast;
     bool has_khr_subgroup_shuffle = false;
@@ -811,7 +811,8 @@ struct ggml_backend_opencl_context {
     bool disable_fusion;
     bool fuse_mm_glu = true;                     // opt-out GGML_OPENCL_FUSE_MM_GLU=0 (byte-identical gate+up GEMV + GLU, q4_K FFN)
     bool fuse_rms_add = true;                    // opt-out GGML_OPENCL_FUSE_RMS_ADD=0 (fused rms_norm*w + residual)
-    bool f16_mrow = true;                        // opt-out GGML_OPENCL_F16_MROW=0 (multi-row-per-WG f16 decode GEMV for attn proj + lm_head)
+    bool f16_mrow = true;                        // opt-out GGML_OPENCL_F16_MROW=0 (multi-row-per-WG f16 decode GEMV for attn proj + lm_head); cleared when the 64x16 launch exceeds a kernel's cap
+    cl_ulong f16_mrow_static_local = 0;          // CL_KERNEL_LOCAL_MEM_SIZE of the mrow kernels, on top of the per-launch activation buffer
     bool wide_gemv_wg_ok = true;                 // every tiled/o4 lm_head GEMV kernel accepts the {64,4,1} launch on this device (checked at creation)
     int  f16_mrow_rpt = 1;                       // GGML_OPENCL_F16_MROW_RPT={1,2,4,8,16} rows-per-subgroup register blocking
 
@@ -2224,20 +2225,50 @@ static std::string ggml_opencl_make_compile_opts(const ggml_backend_opencl_conte
     return compile_opts;
 }
 
-// The tiled and o4 lm_head/embed GEMV kernels are launched 64x4 work-items per
-// group, like the 2-output kernel they replace. A compiler can still give one of
-// them a smaller per-kernel cap (register and private-memory pressure differ per
-// driver); enqueueing it then fails and CL_CHECK aborts the process in the middle
-// of decode. Check the cap once at creation and keep the dispatch on the 2-output
-// kernels when a variant would not fit.
-static void check_wide_gemv_workgroup(ggml_backend_opencl_context *backend_ctx, cl_kernel kernel, const char *name) {
-    const size_t needed = 64 * 4;
+// The Qualcomm E031.47 compiler (Adreno 830 on the Galaxy S25 Ultra) rejects
+// the wide decode GEMV launches at clEnqueueNDRangeKernel that E031.50 (Adreno
+// 840) accepts, and needed the trans4_ns nibble-packing workaround (c4277689f).
+// The wide variants default off on it; the env knobs still force them on.
+static bool adreno_e031_47_compiler(const ggml_backend_opencl_context *backend_ctx) {
+    return backend_ctx && backend_ctx->gpu_family == GPU_FAMILY::ADRENO &&
+           backend_ctx->adreno_cl_compiler_version.type == ADRENO_CL_COMPILER_TYPE::E031 &&
+           backend_ctx->adreno_cl_compiler_version.major == 47;
+}
+
+// A compiler can give a kernel a smaller work-group cap than the launch it is
+// written for (register and private-memory pressure differ per driver);
+// enqueueing it then fails and CL_CHECK aborts the process in the middle of
+// decode. Checked once at creation so the dispatch can stay on a kernel that
+// fits. Returns false, after logging, when `needed` work-items do not fit.
+static bool kernel_fits_workgroup(ggml_backend_opencl_context *backend_ctx, cl_kernel kernel, const char *name, size_t needed) {
     size_t cap = 0;
     cl_int err = clGetKernelWorkGroupInfo(kernel, backend_ctx->device, CL_KERNEL_WORK_GROUP_SIZE, sizeof(cap), &cap, NULL);
     if (err != CL_SUCCESS || cap < needed) {
-        GGML_LOG_WARN("ggml_opencl: %s: work-group cap %zu < %zu (err %d), lm_head GEMV stays on the 2-output kernels\n",
-                      name, cap, needed, err);
+        GGML_LOG_WARN("ggml_opencl: %s: work-group cap %zu < %zu (err %d), not using it\n", name, cap, needed, err);
+        return false;
+    }
+    return true;
+}
+
+// The tiled and o4 lm_head/embed GEMV kernels launch 64x4 work-items per group,
+// like the 2-output kernel they replace; keep the dispatch on the 2-output kernels
+// when a variant would not fit.
+static void check_wide_gemv_workgroup(ggml_backend_opencl_context *backend_ctx, cl_kernel kernel, const char *name) {
+    if (!kernel_fits_workgroup(backend_ctx, kernel, name, 64 * 4)) {
         backend_ctx->wide_gemv_wg_ok = false;
+    }
+}
+
+// The multi-row f16 decode GEMV launches 64 x MROW(16) = 1024 work-items per
+// group and stages the activation column in __local; the dispatch falls back to
+// the 1-row kernel when a variant does not fit.
+static void check_f16_mrow_kernel(ggml_backend_opencl_context *backend_ctx, cl_kernel kernel, const char *name) {
+    if (!kernel_fits_workgroup(backend_ctx, kernel, name, 64 * 16)) {
+        backend_ctx->f16_mrow = false;
+    }
+    cl_ulong local_bytes = 0;
+    if (clGetKernelWorkGroupInfo(kernel, backend_ctx->device, CL_KERNEL_LOCAL_MEM_SIZE, sizeof(local_bytes), &local_bytes, NULL) == CL_SUCCESS) {
+        backend_ctx->f16_mrow_static_local = std::max(backend_ctx->f16_mrow_static_local, local_bytes);
     }
 }
 
@@ -3746,6 +3777,11 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         CL_CHECK((backend_ctx->kernel_mul_mat_f16_f32_mrow_r4 = clCreateKernel(backend_ctx->program_mul_mv_f16_f32_mrow, "kernel_mul_mat_f16_f32_mrow_r4", &err), err));
         CL_CHECK((backend_ctx->kernel_mul_mat_f16_f32_mrow_h8 = clCreateKernel(backend_ctx->program_mul_mv_f16_f32_mrow, "kernel_mul_mat_f16_f32_mrow_h8", &err), err));
         CL_CHECK((backend_ctx->kernel_mul_mat_f16_f32_mrow_h8r2 = clCreateKernel(backend_ctx->program_mul_mv_f16_f32_mrow, "kernel_mul_mat_f16_f32_mrow_h8r2", &err), err));
+        check_f16_mrow_kernel(backend_ctx, backend_ctx->kernel_mul_mat_f16_f32_mrow,      "kernel_mul_mat_f16_f32_mrow");
+        check_f16_mrow_kernel(backend_ctx, backend_ctx->kernel_mul_mat_f16_f32_mrow_r2,   "kernel_mul_mat_f16_f32_mrow_r2");
+        check_f16_mrow_kernel(backend_ctx, backend_ctx->kernel_mul_mat_f16_f32_mrow_r4,   "kernel_mul_mat_f16_f32_mrow_r4");
+        check_f16_mrow_kernel(backend_ctx, backend_ctx->kernel_mul_mat_f16_f32_mrow_h8,   "kernel_mul_mat_f16_f32_mrow_h8");
+        check_f16_mrow_kernel(backend_ctx, backend_ctx->kernel_mul_mat_f16_f32_mrow_h8r2, "kernel_mul_mat_f16_f32_mrow_h8r2");
         GGML_LOG_CONT(".");
     }
 
@@ -9401,6 +9437,9 @@ static ggml_backend_opencl_context * ggml_cl_init(ggml_backend_dev_t dev) {
     if (const char * env = getenv("GGML_OPENCL_FUSE_RMS_ADD")) {
         backend_ctx->fuse_rms_add = atoi(env) != 0;
     }
+    if (adreno_e031_47_compiler(backend_ctx.get())) {
+        backend_ctx->f16_mrow = false;
+    }
     if (const char * env = getenv("GGML_OPENCL_F16_MROW")) {
         backend_ctx->f16_mrow = atoi(env) != 0;
     }
@@ -11565,17 +11604,13 @@ inline bool wide_gemv_usable(const ggml_backend_opencl_context *backend_ctx) {
     return backend_ctx && backend_ctx->wide_gemv_wg_ok;
 }
 
-// Default for the tiled and o4 lm_head/embed GEMV variants. Off on the E031.47
-// compiler: the Galaxy S25 Ultra (Adreno 830, E031.47) aborts in
-// clEnqueueNDRangeKernel on the q6_K variant during decode, while the S26 Ultra
-// (Adreno 840, E031.50) runs the same kernels, and E031.47 already miscompiles
-// the MoE repack (use_cpu_q4_k_moe_repack). Those devices keep the 2-output
-// kernels the 10549 line shipped. The GGML_OPENCL_{Q4K,Q6K}_GEMV_{TILED,O4} knobs
-// still force a variant on for experiments.
+// Default for the tiled and o4 lm_head/embed GEMV variants: off on the E031.47
+// compiler (see adreno_e031_47_compiler), where the Galaxy S25 Ultra aborted in
+// clEnqueueNDRangeKernel on the q6_K variant during decode. Those devices keep
+// the 2-output kernels the 10549 line shipped. The
+// GGML_OPENCL_{Q4K,Q6K}_GEMV_{TILED,O4} knobs still force a variant on.
 inline bool wide_gemv_default_on(const ggml_backend_opencl_context *backend_ctx) {
-    return wide_gemv_usable(backend_ctx) &&
-           !(backend_ctx->adreno_cl_compiler_version.type == ADRENO_CL_COMPILER_TYPE::E031 &&
-             backend_ctx->adreno_cl_compiler_version.major == 47);
+    return wide_gemv_usable(backend_ctx) && !adreno_e031_47_compiler(backend_ctx);
 }
 
 // Device default for the tiled-wide lm_head/embed GEMV layout: ON for X2E and A8X.
@@ -32215,8 +32250,14 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                     // staged once in __local. ne00<=8192 bounds the LDS. The mrow WG
                     // is 64 x MROW = 1024 work-items (> Intel's 512 max) and reduces
                     // within a 64-wide subgroup, so skip on Intel.
+                    // The staged activation column is a per-launch __local buffer of
+                    // ne00 floats (rounded up to float4) on top of the kernel's own
+                    // static allocation; a launch that exceeds the device's local
+                    // memory fails at enqueue, so size it against CL_DEVICE_LOCAL_MEM_SIZE.
+                    const cl_ulong mrow_local_bytes = sizeof(float) * ((ne00 + 3) / 4 * 4) + backend_ctx->f16_mrow_static_local;
+                    const bool mrow_local_fits = backend_ctx->local_mem_size == 0 || mrow_local_bytes <= backend_ctx->local_mem_size;
                     if (backend_ctx->f16_mrow && backend_ctx->gpu_family != INTEL &&
-                        backend_ctx->kernel_mul_mat_f16_f32_mrow != nullptr &&
+                        backend_ctx->kernel_mul_mat_f16_f32_mrow != nullptr && mrow_local_fits &&
                         ne00 >= 128 && ne01 >= 8 && ne00 % 4 == 0 && ne00 <= 8192) {
                         // The register-blocked / half8 variants cast the src0 row pointer to
                         // half4 / half8 (8- and 16-byte loads) with no scalar fallback inside
