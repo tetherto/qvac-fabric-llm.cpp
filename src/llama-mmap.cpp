@@ -322,23 +322,32 @@ struct llama_file_disk::impl {
         off_t offset_from_alignment = offset - aligned_offset;
         size_t bytes_to_read = (offset_from_alignment + size + alignment - 1) & ~(alignment - 1);
 
-        void * raw_buffer = nullptr;
-        int ret = posix_memalign(&raw_buffer, alignment, bytes_to_read);
-        if (ret != 0) {
-            throw std::runtime_error(format("posix_memalign failed with error %d", ret));
+        // Reuse the aligned bounce buffer across calls. Allocating it per call
+        // meant a fresh mmap, a page fault and a kernel zero-fill for every page
+        // of every tensor -- for a 145 GB model that is the dominant cost of the
+        // direct-IO path. Grow-only, so the steady state is a single allocation.
+        if (bytes_to_read > bounce_cap) {
+            free(bounce_buf);
+            bounce_buf = nullptr;
+            void * raw_buffer = nullptr;
+            int ret = posix_memalign(&raw_buffer, alignment, bytes_to_read);
+            if (ret != 0) {
+                bounce_cap = 0;
+                throw std::runtime_error(format("posix_memalign failed with error %d", ret));
+            }
+            bounce_buf = raw_buffer;
+            bounce_cap = bytes_to_read;
         }
 
-        struct aligned_buffer_deleter {
-            void operator()(void * p) const { free(p); }
-        };
-        std::unique_ptr<void, aligned_buffer_deleter> buffer(raw_buffer);
-
         seek(aligned_offset, SEEK_SET);
-        read_raw_unsafe(buffer.get(), bytes_to_read);
+        read_raw_unsafe(bounce_buf, bytes_to_read);
 
-        uintptr_t actual_data = reinterpret_cast<uintptr_t>(buffer.get()) + offset_from_alignment;
+        uintptr_t actual_data = reinterpret_cast<uintptr_t>(bounce_buf) + offset_from_alignment;
         memcpy(dest, reinterpret_cast<void *>(actual_data), size);
     }
+
+    void * bounce_buf = nullptr;
+    size_t  bounce_cap = 0;
 
     void read_raw(void * ptr, size_t len) {
         if (has_direct_io()) {
@@ -374,6 +383,8 @@ struct llama_file_disk::impl {
     }
 
     ~impl() {
+        free(bounce_buf);
+        bounce_buf = nullptr;
         if (fd != -1) {
             close(fd);
         } else if (owns_fp) {
