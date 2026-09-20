@@ -607,7 +607,7 @@ llama_model_loader::llama_model_loader(
     if (!fname_empty || is_buffer) {
         // Load the main GGUF
         struct ggml_context * ctx = NULL;
-        gguf_file_load main_gguf(&ctx, load_input);
+        gguf_file_load main_gguf(&ctx, load_input, this->use_direct_io);
 
         if (load_input_variant::variant_supports_split_load_from_memory(load_input)) {
             incremental_splits_tensor_load.emplace(ctx, *this, main_gguf, std::move(*tensor_list));
