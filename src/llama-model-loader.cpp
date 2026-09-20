@@ -1,5 +1,12 @@
 #include "llama-model-loader.h"
 
+#ifndef _WIN32
+#include <unistd.h>
+#include <atomic>
+#include <thread>
+#include <mutex>
+#endif
+
 #include "ggml-alloc.h"
 #include "ggml-cpp.h"
 #include "ggml.h"
@@ -1605,6 +1612,18 @@ bool llama_model_loader::load_all_data(
         GGML_ASSERT((begin_async_upload == nullptr) == (end_async_upload == nullptr));
     }
 
+    // Tensors that can be read straight from a direct-IO file descriptor are
+    // deferred and uploaded by a pool of threads. A single thread reading and
+    // copying the whole model saturates neither the NVMe nor the interconnect.
+    struct pending_read { struct ggml_tensor * tensor; size_t offs; size_t size; uint16_t idx; };
+    std::vector<pending_read> pending_reads;
+    int n_load_threads = 1;
+#ifndef _WIN32
+    if (const char * e = getenv("LLAMA_LOAD_THREADS")) {
+        n_load_threads = std::max(1, atoi(e));
+    }
+#endif
+
     for (struct ggml_tensor * cur = ggml_get_first_tensor(ctx); cur != NULL; cur = ggml_get_next_tensor(ctx, cur)) {
         const auto * weight = get_weight(ggml_get_name(cur));
         if (weight == nullptr) {
@@ -1732,6 +1751,11 @@ bool llama_model_loader::load_all_data(
                     if (check_tensors && !ggml_validate_row_data(cur->type, src, n_size)) {
                         throw std::runtime_error(format("tensor '%s' has invalid data", ggml_get_name(cur)));
                     }
+                } else if (n_load_threads > 1 && !check_tensors &&
+                           file->has_direct_io() && file->file_id() != -1) {
+                    // read in parallel after the walk; pread() is position-based
+                    // so the shared descriptor is safe to use from many threads
+                    pending_reads.push_back({ cur, weight->offs, n_size, weight->idx });
                 } else {
                     read_buf.resize(n_size);
                     file->seek(weight->offs, SEEK_SET);
@@ -1746,6 +1770,86 @@ bool llama_model_loader::load_all_data(
 
         size_done += n_size;
     }
+
+#ifndef _WIN32
+    if (!pending_reads.empty()) {
+        std::atomic<size_t> next_item{0};
+        std::atomic<bool>   any_failed{false};
+        std::mutex          err_mutex;
+        std::string         err_msg;
+
+        auto worker = [&]() {
+            void * abuf = nullptr;
+            size_t acap = 0;
+            try {
+                for (;;) {
+                    const size_t i = next_item.fetch_add(1);
+                    if (i >= pending_reads.size() || any_failed.load()) {
+                        break;
+                    }
+                    const pending_read & pr = pending_reads[i];
+                    const auto & f = files.at(pr.idx);
+
+                    const int    fd    = f->file_id();
+                    const size_t align = f->read_alignment();
+
+                    // O_DIRECT needs the offset, the length and the destination
+                    // all aligned, so read a padded window into an aligned buffer
+                    const off_t  aoff = (off_t) (pr.offs & ~(size_t) (align - 1));
+                    const size_t skip = pr.offs - (size_t) aoff;
+                    const size_t want = (skip + pr.size + align - 1) & ~(size_t) (align - 1);
+
+                    if (want > acap) {
+                        free(abuf);
+                        abuf = nullptr;
+                        if (posix_memalign(&abuf, align, want) != 0) {
+                            throw std::runtime_error("posix_memalign failed during parallel load");
+                        }
+                        acap = want;
+                    }
+
+                    size_t got = 0;
+                    while (got < want) {
+                        const ssize_t r = pread(fd, (char *) abuf + got, want - got, aoff + (off_t) got);
+                        if (r < 0) {
+                            if (errno == EINTR) {
+                                continue;
+                            }
+                            throw std::runtime_error(format("pread failed: %s", strerror(errno)));
+                        }
+                        if (r == 0) {
+                            break; // short final window at end of file
+                        }
+                        got += (size_t) r;
+                    }
+                    if (got < skip + pr.size) {
+                        throw std::runtime_error(format("short read for tensor '%s'", ggml_get_name(pr.tensor)));
+                    }
+
+                    ggml_backend_tensor_set(pr.tensor, (char *) abuf + skip, 0, pr.size);
+                }
+            } catch (const std::exception & e) {
+                std::lock_guard<std::mutex> lock(err_mutex);
+                if (!any_failed.exchange(true)) {
+                    err_msg = e.what();
+                }
+            }
+            free(abuf);
+        };
+
+        std::vector<std::thread> pool;
+        pool.reserve(n_load_threads);
+        for (int t = 0; t < n_load_threads; ++t) {
+            pool.emplace_back(worker);
+        }
+        for (auto & t : pool) {
+            t.join();
+        }
+        if (any_failed.load()) {
+            throw std::runtime_error(err_msg);
+        }
+    }
+#endif
 
     // free temporary resources used for async uploads
     for (const auto & event : upload.events) {
