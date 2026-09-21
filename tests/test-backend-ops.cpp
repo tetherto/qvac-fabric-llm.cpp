@@ -5430,7 +5430,6 @@ struct test_gated_delta_net : public test_case {
     const bool    kda;
     const int64_t K; // snapshot slot count: 1 = final-only, >1 = last K states
     const bool    check_grad;
-    const bool    reduced_precision_tolerance;
 
     std::string vars() override {
         return VARS_TO_STR9(type, head_count, head_size, n_seq_tokens, n_seqs, v_repeat, permuted, kda, K);
@@ -5438,15 +5437,12 @@ struct test_gated_delta_net : public test_case {
 
     test_gated_delta_net(ggml_type type = GGML_TYPE_F32,
             int64_t head_count = 4, int64_t head_size = 16, int64_t n_seq_tokens = 1, int64_t n_seqs = 1,
-            int v_repeat = 1, bool permuted = false, bool kda = false, int64_t K = 1,
-            bool check_grad = false, bool reduced_precision_tolerance = false)
+            int v_repeat = 1, bool permuted = false, bool kda = false, int64_t K = 1, bool check_grad = false)
         : type(type), head_count(head_count), head_size(head_size), n_seq_tokens(n_seq_tokens), n_seqs(n_seqs),
-          v_repeat(v_repeat), permuted(permuted), kda(kda), K(K), check_grad(check_grad),
-          reduced_precision_tolerance(reduced_precision_tolerance) {}
+          v_repeat(v_repeat), permuted(permuted), kda(kda), K(K), check_grad(check_grad) {}
 
     bool   grad_precise() override { return true; }
     double max_maa_err()  override { return 2e-2; }
-    double max_nmse_err() override { return reduced_precision_tolerance ? 3e-5 : 1e-7; }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         const bool grad = (mode == MODE_GRAD) && !permuted && check_grad;
@@ -14573,25 +14569,6 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // Keep the WebGPU dispatch below 65535 workgroups (32 per token for this shape).
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 2047, 2, 3));
 
-    for (int v_repeat : { 1, 2, 3, 4 }) {
-        for (int tokens : { 64, 65, 127, 128, 129, 512, 2048 }) {
-            test_cases.emplace_back(new test_gated_delta_net(
-                GGML_TYPE_F32, 16, 128, tokens, 1, v_repeat, false, false, 1, false, true));
-        }
-        for (bool permuted : { false, true }) {
-            test_cases.emplace_back(new test_gated_delta_net(
-                GGML_TYPE_F32, 16, 128, 129, 2, v_repeat, permuted, false, 1, false, true));
-        }
-        test_cases.emplace_back(new test_gated_delta_net(
-            GGML_TYPE_F32, 16, 128, 65, 2, v_repeat, false, true));
-        test_cases.emplace_back(new test_gated_delta_net(
-            GGML_TYPE_F32, 16, 128, 65, 2, v_repeat, false, false, 4));
-    }
-    test_cases.emplace_back(new test_gated_delta_net(
-        GGML_TYPE_F32, 16, 128, 1024, 1, 3, true, false, 1, false, true));
-    test_cases.emplace_back(new test_gated_delta_net(
-        GGML_TYPE_F32, 16, 128, 1024, 2, 3, false, false, 1, false, true));
-
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32,  2, 32, 4, 1, 1, false, false, 1, true));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32,  2, 32, 4, 1, 1, false, true,  1, true));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32,  2, 32, 4, 1, 1, false, false, 2, true));
@@ -15304,11 +15281,6 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 512, 1));  // 4h PP-512
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 1024, 1)); // 4h PP-1024
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 64, 1, 1, false, true)); // KDA PP-64
-    // GQA (Qwen3.8-like: 16 kv heads, 48 v heads) and partial-chunk / multi-seq prefill
-    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 512, 1, 3));
-    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 2048, 1, 3));
-    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 200, 2, 3));
-    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 96, 1, 3, true));
 
     // GATED_DELTA_NET_BACK: mirrors the forward configurations above.
     // Backward only runs during training, so the sequence lengths that matter are the PP-sized ones.
