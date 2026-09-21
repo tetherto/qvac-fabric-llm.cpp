@@ -12263,7 +12263,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
-    // Split scheduling threshold, partial chunks, and multi-sequence fallback.
+    // Long prefill, partial chunks, and multiple sequences.
     for (int tokens : {2047, 2048, 2049, 4096}) {
         test_cases.emplace_back(new test_gated_delta_net_precision(2, tokens));
     }
