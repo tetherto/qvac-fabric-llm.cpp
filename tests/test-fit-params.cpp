@@ -144,7 +144,46 @@ static void test_probe_logger_restoration() {
     llama_log_set(original_callback, original_data);
 }
 
+// Programmatic callers need not pad explicit overrides to the fitter's
+// maximum output size. ASan checks both the snapshot and error rollback.
+static void test_compact_override_rollback() {
+    for (bool fail : { false, true }) {
+        for (size_t count : { size_t(0), size_t(1), size_t(3) }) {
+            std::vector<llama_model_tensor_buft_override> overrides(count + 1);
+            for (size_t i = 0; i < count; ++i) {
+                overrides[i] = { "blk.*", nullptr };
+            }
+            overrides[count] = { nullptr, nullptr };
+            overrides.shrink_to_fit();
+            const auto original = overrides;
+            auto mparams = llama_model_default_params();
+            auto cparams = llama_context_default_params();
+            mparams.tensor_buft_overrides = overrides.data();
+            if (fail) {
+                mparams.split_mode = LLAMA_SPLIT_MODE_TENSOR;
+            }
+            const auto original_ngl = mparams.n_gpu_layers;
+            const auto original_ctx = cparams.n_ctx;
+            std::vector<float> split(llama_max_devices(), 0.0f);
+            std::vector<size_t> margins(llama_max_devices(), 0);
+            const auto status = common_fit_params(
+                "/nonexistent-fit-test/model.gguf", &mparams, &cparams,
+                split.data(), overrides.data(), margins.data(), 0, false, GGML_LOG_LEVEL_ERROR);
+            expect_i64("fit returns expected failure status", status,
+                fail ? COMMON_PARAMS_FIT_STATUS_FAILURE : COMMON_PARAMS_FIT_STATUS_ERROR);
+            expect_i64("rollback preserves override pointer", mparams.tensor_buft_overrides == overrides.data(), true);
+            expect_i64("rollback preserves GPU layers", mparams.n_gpu_layers, original_ngl);
+            expect_u32("rollback preserves context", cparams.n_ctx, original_ctx);
+            for (size_t i = 0; i <= count; ++i) {
+                expect_i64("rollback preserves pattern", overrides[i].pattern == original[i].pattern, true);
+                expect_i64("rollback preserves buffer type", overrides[i].buft == original[i].buft, true);
+            }
+        }
+    }
+}
+
 int main() {
+    test_compact_override_rollback();
     test_probe_logger_restoration();
     test_automatic_acceleration();
     test_auto_cache_preserves_context_fitting();

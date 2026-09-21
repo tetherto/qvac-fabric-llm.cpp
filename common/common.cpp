@@ -1306,12 +1306,7 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
             params.prefetch_weights_auto,
             params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
         if (fit_status == COMMON_PARAMS_FIT_STATUS_SUCCESS) {
-            // Keep caller-visible parameters consistent with the fitted buffers
-            // and the model/context configuration used below.
-            params.n_gpu_layers = mparams.n_gpu_layers;
-            params.n_ctx = cparams.n_ctx;
-            params.moe_cache_size = cparams.moe_cache_size;
-            params.prefetch_weights = cparams.prefetch_weights;
+            // Keep the user's scalar settings for subsequent draft and MTP contexts.
             COM_INF("fit completed in %.2f seconds: n_gpu_layers = %d, n_ctx = %u, moe_cache_size = %zu, prefetch_weights = %s\n",
                     (llama_time_us() - fit_start_us) * 1e-6, mparams.n_gpu_layers, cparams.n_ctx,
                     (size_t) cparams.moe_cache_size, cparams.prefetch_weights ? "on" : "off");

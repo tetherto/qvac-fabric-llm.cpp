@@ -1059,7 +1059,14 @@ enum common_params_fit_status common_fit_params(
         split_original.assign(tensor_split, tensor_split + llama_max_devices());
     }
     if (tensor_buft_overrides) {
-        overrides_original.assign(tensor_buft_overrides, tensor_buft_overrides + llama_max_tensor_buft_overrides());
+        // Explicit overrides can be compact. Save through the terminator only.
+        // Restoring the terminator also hides any fitted entries.
+        for (size_t i = 0; i < llama_max_tensor_buft_overrides(); ++i) {
+            overrides_original.push_back(tensor_buft_overrides[i]);
+            if (!tensor_buft_overrides[i].pattern) {
+                break;
+            }
+        }
     }
     try {
         common_params_fit_impl(
