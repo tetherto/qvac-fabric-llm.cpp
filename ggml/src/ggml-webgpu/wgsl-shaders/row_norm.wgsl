@@ -32,7 +32,8 @@ struct Params {
     ne1: u32,
     ne2: u32,
 
-    eps: f32
+    eps: f32,
+    nrows: u32,
 };
 
 @group(0) @binding(0)
@@ -53,10 +54,14 @@ var<workgroup> scratch: array<f32, WG_SIZE * 2u>;
 
 @compute @workgroup_size(WG_SIZE)
 fn main(@builtin(workgroup_id) wid: vec3<u32>,
+        @builtin(num_workgroups) nwg: vec3<u32>,
         @builtin(local_invocation_id) lid: vec3<u32>) {
 
-    // one thread per row
-    var i = wid.x;
+    // one workgroup per row
+    var i = wid.x + wid.y * nwg.x;
+    if (i >= params.nrows) {
+        return;
+    }
     let i3 = i / (params.ne2 * params.ne1);
     i = i % (params.ne2 * params.ne1);
     let i2 = i / params.ne1;
