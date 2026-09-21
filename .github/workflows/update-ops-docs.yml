@@ -14,8 +14,17 @@ on:
             - 'docs/ops/**'
             - 'scripts/create_ops_docs.py'
 
+permissions:
+    contents: read
+
 jobs:
+    authorize:
+        permissions: {}
+        uses: ./.github/workflows/reusable-authorize-self-hosted.yml
+
     update-ops-docs:
+        needs: authorize
+        if: needs.authorize.outputs.allowed == 'true'
         # QVAC-24501: upstream's [self-hosted, fast, ARM64] needs a custom `fast`
         # label the qvac fleet does not carry. The job only runs
         # scripts/create_ops_docs.py and diffs the result, so it does not need

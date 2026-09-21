@@ -118,6 +118,10 @@ ggml_opt_dataset_t common_opt_sft_dataset_init(
                 inputs.messages = std::move(chat_msgs);
                 inputs.add_generation_prompt = false;
                 inputs.use_jinja = true;
+
+                inputs.enable_thinking = std::any_of(
+                    inputs.messages.begin(), inputs.messages.end(),
+                    [](const common_chat_msg & m) { return !m.reasoning_content.empty(); });
                 try {
                     render = common_chat_templates_apply(chat_templates.get(), inputs).prompt;
 

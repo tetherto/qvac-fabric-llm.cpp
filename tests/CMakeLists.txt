@@ -182,6 +182,7 @@ llama_build(test-recurrent-state-rollback.cpp)
 
 if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     # these tests are disabled on Windows because they use internal functions not exported with LLAMA_API (when building with shared libraries)
+    llama_build_and_test(test-unicode.cpp)
     llama_build_and_test(test-sampling.cpp)
     llama_build_and_test(test-reasoning-budget.cpp)
     llama_build_and_test(test-grammar-parser.cpp)
@@ -225,6 +226,13 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     # llama_build_and_test(test-double-float.cpp) # SLOW
 
     llama_build_and_test(test-llama-archs.cpp)
+    llama_test(test-llama-archs NAME test-mtp-shared-cpu ARGS --mtp-shared-cpu)
+    if (GGML_CUDA)
+        llama_test(test-llama-archs NAME test-mtp-shared ARGS --mtp-shared)
+    endif()
+    if (NOT GGML_WEBGPU)
+        llama_test(test-llama-archs NAME test-qsa-unified-multiseq ARGS --qsa-unified-multiseq --seed 1)
+    endif()
 
     set(MODEL_DIR "${CMAKE_CURRENT_BINARY_DIR}/test-models/")
     file(MAKE_DIRECTORY "${MODEL_DIR}")
@@ -250,6 +258,17 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
             FIXTURES_REQUIRED generate-models
         )
     endif()
+
+    llama_test(
+        test-recurrent-state-rollback
+        NAME test-recurrent-state-rollback-nemotron-h
+        LABEL main
+        ARGS -m "${MODEL_DIR}/nemotron_h-dense.gguf"
+    )
+    set_tests_properties(test-recurrent-state-rollback-nemotron-h PROPERTIES
+        FIXTURES_REQUIRED generate-models
+    )
+
     llama_build_and_test(test-kv-cells.cpp)
     target_include_directories(test-kv-cells PRIVATE ${PROJECT_SOURCE_DIR}/src)
     llama_build_and_test(test-kv-cache.cpp)
@@ -299,6 +318,7 @@ llama_build(test-multi-instance-repro.cpp)
 
 llama_build_and_test(test-arg-parser.cpp)
 llama_build_and_test(test-model-resolution.cpp)
+llama_build_and_test(test-model-load-meta-only.cpp)
 # the test serves its repos from an httplib server, and the library links it privately
 target_link_libraries(test-model-resolution PRIVATE cpp-httplib)
 
@@ -313,9 +333,42 @@ if (GGML_METAL)
     target_compile_definitions(test-unified-memory-props PRIVATE LLAMA_TEST_EXPECT_METAL)
 endif()
 llama_build_and_test(test-fit-params.cpp)
+if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
+    # This test uses internal symbols that are not exported from llama.dll.
+    llama_build(test-moe-cache.cpp)
+    target_include_directories(test-moe-cache PRIVATE ${PROJECT_SOURCE_DIR}/src)
+    llama_test(test-moe-cache)
+endif()
 if (GGML_RPC)
     llama_build_and_test(test-rpc.cpp)
     set_tests_properties(test-rpc PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
+
+    add_executable(test-rpc-allreduce test-rpc-allreduce.cpp)
+    target_link_libraries(test-rpc-allreduce PRIVATE ggml)
+    target_compile_features(test-rpc-allreduce PRIVATE cxx_std_17)
+    find_package(Python3 COMPONENTS Interpreter QUIET)
+    if (Python3_Interpreter_FOUND AND LLAMA_BUILD_TOOLS AND GGML_CPU AND NOT EMSCRIPTEN)
+        function(rpc_allreduce_test name)
+            add_test(NAME ${name} COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/test_rpc_allreduce.py
+                --server $<TARGET_FILE:ggml-rpc-server> ${ARGN})
+            set_tests_properties(${name} PROPERTIES TIMEOUT 150 LABELS "rpc")
+        endfunction()
+        foreach(ranks 2 4 8)
+            foreach(wire f32 bf16)
+                rpc_allreduce_test(test-rpc-allreduce-${ranks}-${wire}
+                    --client $<TARGET_FILE:test-rpc-allreduce> --ranks ${ranks} --wire ${wire})
+            endforeach()
+        endforeach()
+        rpc_allreduce_test(test-rpc-allreduce-port-base
+            --client $<TARGET_FILE:test-rpc-allreduce> --ranks 4 --port-base)
+        rpc_allreduce_test(test-rpc-allreduce-init-failure
+            --client $<TARGET_FILE:test-rpc-allreduce> --ranks 4 --init-failure)
+        rpc_allreduce_test(test-rpc-allreduce-disabled
+            --client $<TARGET_FILE:test-rpc-allreduce> --ranks 4 --disabled)
+        rpc_allreduce_test(test-rpc-local
+            --client $<TARGET_FILE:test-rpc> --ranks 2 --wire bf16 --legacy)
+    endif()
 endif()
 
 # Vulkan TBQ/PQ copy-to-quant subgroup-size sweep. Spawns itself with different
@@ -411,6 +464,9 @@ if (LLAMA_MTMD)
         unset(LLAMA_TEST_NAME)
     endif()
 endif()
+
+llama_build_and_test(test-mtmd-impl.cpp)
+target_link_libraries(test-mtmd-impl PRIVATE mtmd)
 
 # GGUF model data fetcher library for tests that need real model metadata
 # Only compile when cpp-httplib has SSL support (CPPHTTPLIB_OPENSSL_SUPPORT)

@@ -1,9 +1,9 @@
-import { afterEach, describe, expect, it, vi } from 'vitest';
 import { Client } from '@modelcontextprotocol/sdk/client';
-import { MCPService } from '$lib/services/mcp.service';
+import { CORS_PROXY } from '$lib/constants';
 import { MCPConnectionPhase, MCPTransportType } from '$lib/enums';
-import type { MCPConnectionLog, MCPServerConfig } from '$lib/types';
-import { CORS_PROXY_HEADER_PREFIX } from '$lib/constants';
+import { MCPService } from '$lib/services/mcp.service';
+import type { MCPConnection, MCPConnectionLog, MCPServerConfig } from '$lib/types';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
 type DiagnosticFetchFactory = (
 	serverName: string,
@@ -33,20 +33,19 @@ describe('MCPService', () => {
 	it('stops transport phase logging after handshake diagnostics are disabled', async () => {
 		const logs: MCPConnectionLog[] = [];
 		const response = new Response('{}', {
-			status: 200,
-			headers: { 'content-type': 'application/json' }
+			headers: { 'content-type': 'application/json' },
+			status: 200
 		});
 
 		vi.stubGlobal('fetch', vi.fn().mockResolvedValue(response));
 
 		const config: MCPServerConfig = {
-			url: 'https://example.com/mcp',
-			transport: MCPTransportType.STREAMABLE_HTTP
+			transport: MCPTransportType.STREAMABLE_HTTP,
+			url: 'https://example.com/mcp'
 		};
-
 		const controller = createDiagnosticFetch(config, (log) => logs.push(log));
 
-		await controller.fetch(config.url, { method: 'POST', body: '{}' });
+		await controller.fetch(config.url, { body: '{}', method: 'POST' });
 		expect(logs).toHaveLength(2);
 		expect(
 			logs.map((log) => {
@@ -54,12 +53,13 @@ describe('MCPService', () => {
 					request?: { url?: string };
 					response?: { url?: string };
 				};
+
 				return details.request?.url ?? details.response?.url;
 			})
 		).toEqual(['https://example.com/mcp', 'https://example.com/mcp']);
 
 		controller.disable();
-		await controller.fetch(config.url, { method: 'POST', body: '{}' });
+		await controller.fetch(config.url, { body: '{}', method: 'POST' });
 
 		expect(logs).toHaveLength(2);
 	});
@@ -67,38 +67,37 @@ describe('MCPService', () => {
 	it('redacts all configured custom headers in diagnostic request logs', async () => {
 		const logs: MCPConnectionLog[] = [];
 		const response = new Response('{}', {
-			status: 200,
-			headers: { 'content-type': 'application/json' }
+			headers: { 'content-type': 'application/json' },
+			status: 200
 		});
 
 		vi.stubGlobal('fetch', vi.fn().mockResolvedValue(response));
 
 		const config: MCPServerConfig = {
-			url: 'https://example.com/mcp',
-			transport: MCPTransportType.STREAMABLE_HTTP,
 			headers: {
 				'x-auth-token': 'secret-token',
 				'x-vendor-api-key': 'secret-key'
-			}
+			},
+			transport: MCPTransportType.STREAMABLE_HTTP,
+			url: 'https://example.com/mcp'
 		};
-
 		const controller = createDiagnosticFetch(config, (log) => logs.push(log), {
 			headers: config.headers
 		});
 
 		await controller.fetch(config.url, {
-			method: 'POST',
+			body: '{}',
 			headers: { 'content-type': 'application/json' },
-			body: '{}'
+			method: 'POST'
 		});
 
 		expect(logs).toHaveLength(2);
 		expect(logs[0].details).toMatchObject({
 			request: {
 				headers: {
+					'content-type': 'application/json',
 					'x-auth-token': '[redacted]',
-					'x-vendor-api-key': '[redacted]',
-					'content-type': 'application/json'
+					'x-vendor-api-key': '[redacted]'
 				}
 			}
 		});
@@ -106,23 +105,22 @@ describe('MCPService', () => {
 
 	it('wraps dynamic request headers when using the CORS proxy', async () => {
 		const logs: MCPConnectionLog[] = [];
-		const proxiedAuthToken = `${CORS_PROXY_HEADER_PREFIX}x-auth-token`;
-		const proxiedContentType = `${CORS_PROXY_HEADER_PREFIX}content-type`;
-		const proxiedSessionId = `${CORS_PROXY_HEADER_PREFIX}mcp-session-id`;
+		const proxiedAuthToken = `${CORS_PROXY.HEADER_PREFIX}x-auth-token`;
+		const proxiedContentType = `${CORS_PROXY.HEADER_PREFIX}content-type`;
+		const proxiedSessionId = `${CORS_PROXY.HEADER_PREFIX}mcp-session-id`;
 		const response = new Response('{}', {
-			status: 200,
-			headers: { 'content-type': 'application/json' }
+			headers: { 'content-type': 'application/json' },
+			status: 200
 		});
 		const fetchMock = vi.fn().mockResolvedValue(response);
 
 		vi.stubGlobal('fetch', fetchMock);
 
 		const config: MCPServerConfig = {
-			url: 'https://example.com/mcp',
 			transport: MCPTransportType.STREAMABLE_HTTP,
+			url: 'https://example.com/mcp',
 			useProxy: true
 		};
-
 		const controller = createDiagnosticFetch(
 			config,
 			(log) => logs.push(log),
@@ -136,15 +134,16 @@ describe('MCPService', () => {
 		);
 
 		await controller.fetch('http://localhost:8080/cors-proxy?url=https%3A%2F%2Fexample.com%2Fmcp', {
-			method: 'POST',
+			body: '{}',
 			headers: {
 				'content-type': 'application/json',
 				'mcp-session-id': 'session-request-12345'
 			},
-			body: '{}'
+			method: 'POST'
 		});
 
 		const sentHeaders = fetchMock.mock.calls[0]?.[1]?.headers as Headers;
+
 		expect(sentHeaders.get('authorization')).toBe('Bearer llama-server-key');
 		expect(sentHeaders.get(proxiedAuthToken)).toBe('target-token');
 		expect(sentHeaders.get(proxiedContentType)).toBe('application/json');
@@ -169,13 +168,11 @@ describe('MCPService', () => {
 		vi.stubGlobal('fetch', fetchMock);
 
 		const config: MCPServerConfig = {
-			url: 'https://example.com/mcp',
 			transport: MCPTransportType.STREAMABLE_HTTP,
+			url: 'https://example.com/mcp',
 			useProxy: true
 		};
-
 		const controller = createDiagnosticFetch(config, (log) => logs.push(log), {}, true);
-
 		const response = await controller.fetch(
 			'http://localhost:8080/cors-proxy?url=https%3A%2F%2Fexample.com%2Fmcp',
 			{ method: 'DELETE' }
@@ -184,36 +181,35 @@ describe('MCPService', () => {
 		expect(fetchMock).not.toHaveBeenCalled();
 		expect(response.status).toBe(200);
 		expect(logs.at(-1)?.details).toMatchObject({
-			response: { status: 200, isFake: true }
+			response: { isFake: true, status: 200 }
 		});
 	});
 
 	it('partially redacts mcp-session-id in diagnostic request and response logs', async () => {
 		const logs: MCPConnectionLog[] = [];
 		const response = new Response('{}', {
-			status: 200,
 			headers: {
 				'content-type': 'application/json',
 				'mcp-session-id': 'session-response-67890'
-			}
+			},
+			status: 200
 		});
 
 		vi.stubGlobal('fetch', vi.fn().mockResolvedValue(response));
 
 		const config: MCPServerConfig = {
-			url: 'https://example.com/mcp',
-			transport: MCPTransportType.STREAMABLE_HTTP
+			transport: MCPTransportType.STREAMABLE_HTTP,
+			url: 'https://example.com/mcp'
 		};
-
 		const controller = createDiagnosticFetch(config, (log) => logs.push(log));
 
 		await controller.fetch(config.url, {
-			method: 'POST',
+			body: '{}',
 			headers: {
 				'content-type': 'application/json',
 				'mcp-session-id': 'session-request-12345'
 			},
-			body: '{}'
+			method: 'POST'
 		});
 
 		expect(logs).toHaveLength(2);
@@ -238,35 +234,34 @@ describe('MCPService', () => {
 	it('extracts JSON-RPC methods without logging the raw request body', async () => {
 		const logs: MCPConnectionLog[] = [];
 		const response = new Response('{}', {
-			status: 200,
-			headers: { 'content-type': 'application/json' }
+			headers: { 'content-type': 'application/json' },
+			status: 200
 		});
 
 		vi.stubGlobal('fetch', vi.fn().mockResolvedValue(response));
 
 		const config: MCPServerConfig = {
-			url: 'https://example.com/mcp',
-			transport: MCPTransportType.STREAMABLE_HTTP
+			transport: MCPTransportType.STREAMABLE_HTTP,
+			url: 'https://example.com/mcp'
 		};
-
 		const controller = createDiagnosticFetch(config, (log) => logs.push(log));
 
 		await controller.fetch(config.url, {
-			method: 'POST',
 			body: JSON.stringify([
-				{ jsonrpc: '2.0', id: 1, method: 'initialize' },
+				{ id: 1, jsonrpc: '2.0', method: 'initialize' },
 				{ jsonrpc: '2.0', method: 'notifications/initialized' }
-			])
+			]),
+			method: 'POST'
 		});
 
 		expect(logs[0].details).toMatchObject({
 			request: {
-				method: 'POST',
 				body: {
 					kind: 'string',
 					size: expect.any(Number)
 				},
-				jsonRpcMethods: ['initialize', 'notifications/initialized']
+				jsonRpcMethods: ['initialize', 'notifications/initialized'],
+				method: 'POST'
 			}
 		});
 	});
@@ -278,13 +273,12 @@ describe('MCPService', () => {
 		vi.stubGlobal('fetch', vi.fn().mockRejectedValue(fetchError));
 
 		const config: MCPServerConfig = {
-			url: 'http://localhost:8000/mcp',
-			transport: MCPTransportType.STREAMABLE_HTTP
+			transport: MCPTransportType.STREAMABLE_HTTP,
+			url: 'http://localhost:8000/mcp'
 		};
-
 		const controller = createDiagnosticFetch(config, (log) => logs.push(log));
 
-		await expect(controller.fetch(config.url, { method: 'POST', body: '{}' })).rejects.toThrow(
+		await expect(controller.fetch(config.url, { body: '{}', method: 'POST' })).rejects.toThrow(
 			'Failed to fetch'
 		);
 
@@ -297,12 +291,13 @@ describe('MCPService', () => {
 	it('detaches phase error logging after the initialize handshake completes', async () => {
 		const phaseLogs: Array<{ phase: MCPConnectionPhase; log: MCPConnectionLog }> = [];
 		const stopPhaseLogging = vi.fn();
+
 		let emitClientError: ((error: Error) => void) | undefined;
 
 		vi.spyOn(MCPService, 'createTransport').mockReturnValue({
+			stopPhaseLogging,
 			transport: {} as never,
-			type: MCPTransportType.WEBSOCKET,
-			stopPhaseLogging
+			type: MCPTransportType.WEBSOCKET
 		});
 		vi.spyOn(MCPService, 'listTools').mockResolvedValue([]);
 		vi.spyOn(Client.prototype, 'getServerVersion').mockReturnValue(undefined);
@@ -316,18 +311,18 @@ describe('MCPService', () => {
 		await MCPService.connect(
 			'test-server',
 			{
-				url: 'ws://example.com/mcp',
-				transport: MCPTransportType.WEBSOCKET
+				transport: MCPTransportType.WEBSOCKET,
+				url: 'ws://example.com/mcp'
 			},
 			undefined,
 			undefined,
-			(phase, log) => phaseLogs.push({ phase, log })
+			(phase, log) => phaseLogs.push({ log, phase })
 		);
 
 		expect(stopPhaseLogging).toHaveBeenCalledTimes(1);
 		expect(
 			phaseLogs.filter(
-				({ phase, log }) =>
+				({ log, phase }) =>
 					phase === MCPConnectionPhase.ERROR &&
 					log.message === 'Protocol error: handshake protocol error'
 			)
@@ -337,10 +332,27 @@ describe('MCPService', () => {
 
 		expect(
 			phaseLogs.filter(
-				({ phase, log }) =>
+				({ log, phase }) =>
 					phase === MCPConnectionPhase.ERROR &&
 					log.message === 'Protocol error: runtime protocol error'
 			)
 		).toHaveLength(0);
+	});
+
+	it('falls back to structuredContent when content array is empty', async () => {
+		const connection = {
+			client: {
+				callTool: vi.fn().mockResolvedValue({
+					content: [],
+					structuredContent: { accounts: [{ id: 1 }], total: 1 }
+				})
+			},
+			requestTimeoutMs: 9000,
+			serverName: 'test-server'
+		} as unknown as MCPConnection;
+		const result = await MCPService.callTool(connection, { arguments: {}, name: 'tool' });
+
+		expect(result.isError).toBe(false);
+		expect(result.content).toBe('{"accounts":[{"id":1}],"total":1}');
 	});
 });

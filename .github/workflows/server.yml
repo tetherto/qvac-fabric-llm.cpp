@@ -49,8 +49,24 @@ env:
   LLAMA_ARG_LOG_TIMESTAMPS: 1
   LLAMA_ARG_LOG_VERBOSITY: 10
 
+# QVAC divergence from upstream. Reachable outcomes:
+#
+#   pull_request                    -> per PR              (supersedes)
+#   dispatch with `sha`             -> per (sha, slow_tests) (an identical
+#                                      re-dispatch supersedes; a different
+#                                      commit OR a different slow_tests
+#                                      coexists)
+#   push to master                  -> per run  (run_id; never cancels)
+#   dispatch on another ref, no sha -> per ref   (supersedes)
+#
+# The dispatch arm keys on every input that changes what the run DOES. Without
+# `sha`, two dispatches of different commits from the same non-master ref would
+# cancel each other. Without `slow_tests`, a quick re-dispatch of the same
+# commit would kill an in-flight slow-test run — the steps it gates (5th/7th of
+# `ubuntu`, 5th of `windows`) are exactly the long ones.
+# See QVAC-24627.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.head_ref || github.run_id }}
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || (github.event.inputs.sha && format('{0}-slow{1}', github.event.inputs.sha, github.event.inputs.slow_tests)) || (github.ref == 'refs/heads/master' && github.run_id) || github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -104,21 +120,21 @@ jobs:
         id: server_integration_tests
         run: |
           cd tools/server/tests
-          pytest -v -x -m "not slow"
+          ./tests.sh
 
       - name: Slow tests
         id: server_integration_tests_slow
         if: ${{ github.event.schedule || github.event.inputs.slow_tests == 'true' }}
         run: |
           cd tools/server/tests
-          SLOW_TESTS=1 pytest -v -x
+          SLOW_TESTS=1 ./tests.sh
 
       - name: Tests (Backend sampling)
         id: server_integration_tests_backend_sampling
         run: |
           cd tools/server/tests
           export LLAMA_ARG_BACKEND_SAMPLING=1
-          pytest -v -x -m "not slow"
+          ./tests.sh
 
       - name: Slow tests (Backend sampling)
         id: server_integration_tests_slow_backend_sampling
@@ -126,7 +142,7 @@ jobs:
         run: |
           cd tools/server/tests
           export LLAMA_ARG_BACKEND_SAMPLING=1
-          SLOW_TESTS=1 pytest -v -x
+          SLOW_TESTS=1 ./tests.sh
 
   windows:
     runs-on: windows-2025
@@ -167,15 +183,17 @@ jobs:
 
       - name: Tests
         id: server_integration_tests
+        shell: bash
         run: |
           cd tools/server/tests
-          $env:PYTHONIOENCODING = ":replace"
-          pytest -v -x -m "not slow"
+          export PYTHONIOENCODING=":replace"
+          ./tests.sh
 
       - name: Slow tests
         id: server_integration_tests_slow
         if: ${{ github.event.schedule || github.event.inputs.slow_tests == 'true' }}
+        shell: bash
         run: |
           cd tools/server/tests
-          $env:SLOW_TESTS = "1"
-          pytest -v -x
+          export SLOW_TESTS="1"
+          ./tests.sh

@@ -22,8 +22,12 @@ on:
       'ggml/src/ggml-openvino/**'
     ]
 
+# QVAC divergence from upstream: dedupe per PR and per branch, so a re-push or
+# re-dispatch supersedes the in-flight run. The default branch deliberately
+# keeps upstream's run_id behaviour — master pushes must not cancel each other,
+# or a merged commit can end with no CI verdict. See QVAC-24627.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.head_ref && github.ref || github.run_id }}
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || (github.ref == 'refs/heads/master' && github.run_id) || github.ref }}
   cancel-in-progress: true
 
 env:
@@ -34,19 +38,27 @@ env:
   LLAMA_ARG_LOG_TIMESTAMPS: 1
 
 jobs:
+  authorize:
+    permissions: {}
+    uses: ./.github/workflows/reusable-authorize-self-hosted.yml
+
   ubuntu-24-openvino:
     # QVAC-24501: needs Intel + OpenVINO hardware, not present in the fleet, so
     # this queued for 24h and was killed on every run. Same convention as the
     # gated jobs in build-self-hosted.yml. Note openvino-windows-2022 below is
     # deliberately left running - it is on a GitHub image and passes, so it
     # keeps our only OpenVINO build coverage.
+    #
+    # No `needs: authorize` here: the fork-ci gate (QVAC-24629) only matters for
+    # jobs that can reach the fleet, and this one never starts. Same shape as
+    # gpu-rocm and the other `if: false` jobs in build-self-hosted.yml.
     if: false  # QVAC-23796: no matching hardware
     runs-on: [self-hosted, Linux, Intel, OpenVINO]
 
     env:
       # Sync versions in build-openvino.yml, build-self-hosted.yml, release.yml, build-cache.yml, .devops/openvino.Dockerfile
-      OPENVINO_VERSION_MAJOR: "2026.2.1"
-      OPENVINO_VERSION_FULL: "2026.2.1.21919.ede283a88e3"
+      OPENVINO_VERSION_MAJOR: "2026.3"
+      OPENVINO_VERSION_FULL: "2026.3.0.22451.bd8d6542e3c"
 
     steps:
       - name: Clone
@@ -87,7 +99,7 @@ jobs:
         # TODO: fix and re-enable the `test-llama-archs` test below
         run: |
           cd ${{ github.workspace }}
-          ctest --test-dir build/ReleaseOV -L main -E "test-llama-archs" --verbose --timeout 2000
+          ctest --test-dir build/ReleaseOV -L main -E "test-llama-archs|test-recurrent-state-rollback-nemotron-h" --verbose --timeout 2000
 
       - name: Test (GPU)
         id: cmake_test_gpu
@@ -95,15 +107,15 @@ jobs:
         run: |
           cd ${{ github.workspace }}
           export GGML_OPENVINO_DEVICE=GPU
-          ctest --test-dir build/ReleaseOV -L main -E "test-llama-archs" --verbose --timeout 3000
+          ctest --test-dir build/ReleaseOV -L main -E "test-llama-archs|test-recurrent-state-rollback-nemotron-h" --verbose --timeout 3000
 
   openvino-windows-2022:
     runs-on: windows-2022
 
     env:
       # Sync versions in build-openvino.yml, build-self-hosted.yml, release.yml, build-cache.yml, .devops/openvino.Dockerfile
-      OPENVINO_VERSION_MAJOR: "2026.2.1"
-      OPENVINO_VERSION_FULL: "2026.2.1.21919.ede283a88e3"
+      OPENVINO_VERSION_MAJOR: "2026.3"
+      OPENVINO_VERSION_FULL: "2026.3.0.22451.bd8d6542e3c"
 
     steps:
       - name: Clone
@@ -172,4 +184,4 @@ jobs:
           call "%OPENVINO_ROOT%\setupvars.bat"
 
           cd build
-          ctest --test-dir ReleaseOV -L main -E "test-llama-archs" -C Release --verbose --timeout 3000
+          ctest --test-dir ReleaseOV -L main -E "test-llama-archs|test-recurrent-state-rollback-nemotron-h" -C Release --verbose --timeout 3000
