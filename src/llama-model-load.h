@@ -16,7 +16,7 @@ struct gguf_file_load {
     gguf_context_ptr            meta;
     std::unique_ptr<llama_file> file = nullptr;
 
-    gguf_file_load(struct ggml_context ** ctx, load_input_t load_input);
+    gguf_file_load(struct ggml_context ** ctx, load_input_t load_input, bool use_direct_io = false);
 };
 
 /// @brief Stores relevant information to be able to loads a `.gguf` split file when load method is called.
@@ -31,7 +31,8 @@ struct SplitLoad {
               std::string kv_split_no);
 
     static gguf_file_load load_split_gguf(struct ggml_context ** ctx, const char * fname_split,
-                                          load_input_t & load_input, std::vector<std::string> & splits);
+                                          load_input_t & load_input, std::vector<std::string> & splits,
+                                          bool use_direct_io = false);
 
     struct ggml_context * load(struct llama_model_loader & ml);
 };
