@@ -792,6 +792,7 @@ static __global__ void mul_mat_vec_q(
                             } else {
                                 tmp_gate[j][i] += vec_dot_q_cuda(
                                     vgate, &y[j*stride_col_y + kby], kbx_offset + i*stride_row_x + kbx, kqs);
+                            }
                         }
                     }
                 }
