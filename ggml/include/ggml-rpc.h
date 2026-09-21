@@ -14,8 +14,9 @@ extern "C" {
 // handshake instead of misdecoding graphs. The
 // HELLO fields are uint8_t on the wire, so the value must stay <= 255.
 // 108 adds butterfly communicator rounds and round-tagged peer frames.
-#define RPC_PROTO_MAJOR_VERSION    108
-#define RPC_PROTO_MINOR_VERSION    1
+// 109 adds cache flags to SET_TENSOR and SET_TENSOR_2D.
+#define RPC_PROTO_MAJOR_VERSION    109
+#define RPC_PROTO_MINOR_VERSION    0
 #define RPC_PROTO_PATCH_VERSION    0
 
 #ifdef  __cplusplus
