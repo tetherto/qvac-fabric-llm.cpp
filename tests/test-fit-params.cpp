@@ -183,6 +183,7 @@ static void test_compact_override_rollback() {
 }
 
 int main() {
+    ggml_time_init();
     test_compact_override_rollback();
     test_probe_logger_restoration();
     test_automatic_acceleration();
