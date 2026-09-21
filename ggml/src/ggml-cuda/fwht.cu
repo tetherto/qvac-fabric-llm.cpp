@@ -276,7 +276,9 @@ static bool fwht_launch(ggml_backend_cuda_context & ctx, const T * src_d, float 
             FWHT_CASE(1024)
             FWHT_CASE(2048)
             FWHT_SMEM_CASE(4096)
+#ifndef GGML_USE_MUSA
             FWHT_SMEM_CASE(8192)
+#endif
             default:
                 return false;
         }
@@ -286,7 +288,9 @@ static bool fwht_launch(ggml_backend_cuda_context & ctx, const T * src_d, float 
         FWHT_BLOCK_CASE(1024)
         FWHT_BLOCK_CASE(2048)
         FWHT_BLOCK_CASE(4096)
+#ifndef GGML_USE_MUSA
         FWHT_BLOCK_CASE(8192)
+#endif
 #undef FWHT_CASE
 #undef FWHT_SMEM_CASE
 #undef FWHT_BLOCK_CASE
