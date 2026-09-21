@@ -640,6 +640,17 @@ struct rpc_queue_cmd {
     std::shared_ptr<rpc_pending_get_2d> pending_get_2d;
 };
 
+// Serialization format: | rpc_tensor | cache_flag (1 byte) | offset (8 bytes) | data |
+static std::vector<uint8_t> serialize_set_tensor(const rpc_tensor & tensor, uint8_t cache_flag, uint64_t offset, const void * data, size_t size) {
+    std::vector<uint8_t> input(sizeof(tensor) + sizeof(cache_flag) + sizeof(offset) + size);
+    uint8_t * p = input.data();
+    memcpy(p, &tensor, sizeof(tensor));         p += sizeof(tensor);
+    memcpy(p, &cache_flag, sizeof(cache_flag)); p += sizeof(cache_flag);
+    memcpy(p, &offset, sizeof(offset));         p += sizeof(offset);
+    memcpy(p, data, size);
+    return input;
+}
+
 class rpc_command_queue {
   public:
     static std::shared_ptr<rpc_command_queue> create(const std::string & endpoint) {
@@ -654,6 +665,8 @@ class rpc_command_queue {
         }
         auto sock = socket_t::connect(host.c_str(), port, RPC_CLIENT_CONNECT_TIMEOUT_MS);
         if (sock == nullptr || !sock->set_timeout(RPC_CLIENT_IO_TIMEOUT_MS) || !negotiate_hello(sock)) {
+            sock.reset();
+            rpc_transport_shutdown();
             return nullptr;
         }
         auto queue    = std::shared_ptr<rpc_command_queue>(new rpc_command_queue(endpoint, std::move(sock)));
@@ -671,6 +684,8 @@ class rpc_command_queue {
         if (worker.joinable()) {
             worker.join();
         }
+        sock.reset();
+        rpc_transport_shutdown();
     }
 
     bool submit_rpc(rpc_cmd command, const void * input, size_t input_size) {
@@ -743,12 +758,8 @@ class rpc_command_queue {
         return submit_rpc_deferred(command, input, input_size, output, output_size)->wait();
     }
 
-    bool submit_set_tensor(const rpc_tensor & tensor, const void * data, size_t offset, size_t size) {
-        const size_t         input_size = sizeof(rpc_tensor) + sizeof(uint64_t) + size;
-        std::vector<uint8_t> input(input_size);
-        memcpy(input.data(), &tensor, sizeof(tensor));
-        memcpy(input.data() + sizeof(tensor), &offset, sizeof(offset));
-        memcpy(input.data() + sizeof(tensor) + sizeof(offset), data, size);
+    bool submit_set_tensor(const rpc_tensor & tensor, const void * data, size_t offset, size_t size, uint8_t cache_flag = 0) {
+        auto input = serialize_set_tensor(tensor, cache_flag, offset, data, size);
         return submit_rpc(RPC_CMD_SET_TENSOR, input.data(), input.size());
     }
 
@@ -801,14 +812,9 @@ class rpc_command_queue {
         if (!pending->wait_for(std::chrono::milliseconds(RPC_CLIENT_IO_TIMEOUT_MS))) {
             return false;
         }
-        const size_t input_size = sizeof(tensor) + sizeof(uint64_t) + pending->data.size();
         rpc_queue_cmd queue_cmd;
         queue_cmd.command = RPC_CMD_SET_TENSOR;
-        queue_cmd.data.resize(input_size);
-        memcpy(queue_cmd.data.data(), &tensor, sizeof(tensor));
-        uint64_t offset = 0;
-        memcpy(queue_cmd.data.data() + sizeof(tensor), &offset, sizeof(offset));
-        memcpy(queue_cmd.data.data() + sizeof(tensor) + sizeof(offset), pending->data.data(), pending->data.size());
+        queue_cmd.data = serialize_set_tensor(tensor, 0, 0, pending->data.data(), pending->data.size());
         return enqueue_locked(std::move(queue_cmd));
     }
 
@@ -843,6 +849,9 @@ class rpc_command_queue {
     }
 
   private:
+    std::condition_variable queue_cv;
+    size_t                  queued_bytes = 0;
+
     rpc_command_queue(std::string endpoint, socket_ptr sock) : endpoint(std::move(endpoint)), sock(std::move(sock)) {}
 
     static void signal_failed(rpc_queue_cmd & cmd) {
@@ -860,16 +869,40 @@ class rpc_command_queue {
     }
 
     bool enqueue_locked(rpc_queue_cmd && cmd) {
+        const size_t cmd_bytes = cmd.data.size();
         {
-            std::lock_guard<std::mutex> lock(mutex);
+            std::unique_lock<std::mutex> lock(mutex);
+            // Bound the amount of payload waiting to be sent. A single producer
+            // self-throttles because it blocks reading the next tensor, but with
+            // several producers the queue grows without limit and the process is
+            // OOM-killed. queued_bytes == 0 still admits one oversized command,
+            // so a payload larger than the cap can never deadlock.
+            queue_cv.wait(lock, [&] {
+                return shutdown || failed || queued_bytes == 0 ||
+                       queued_bytes + cmd_bytes <= max_queued_bytes();
+            });
             if (shutdown || failed) {
                 signal_failed(cmd);
                 return false;
             }
+            queued_bytes += cmd_bytes;
             commands.push_back(std::move(cmd));
         }
         cv.notify_one();
         return true;
+    }
+
+    static size_t max_queued_bytes() {
+        static const size_t cap = [] {
+            if (const char * e = getenv("GGML_RPC_QUEUE_MAX_MB")) {
+                const long v = atol(e);
+                if (v > 0) {
+                    return (size_t) v * 1024 * 1024;
+                }
+            }
+            return (size_t) 4 * 1024 * 1024 * 1024; // 4 GiB
+        }();
+        return cap;
     }
 
     bool execute(rpc_queue_cmd & cmd) {
@@ -920,7 +953,13 @@ class rpc_command_queue {
                 cmd = std::move(commands.front());
                 commands.pop_front();
             }
+            const size_t cmd_bytes = cmd.data.size();
             if (execute(cmd)) {
+                {
+                    std::lock_guard<std::mutex> lock(mutex);
+                    queued_bytes -= std::min(queued_bytes, cmd_bytes);
+                }
+                queue_cv.notify_all();
                 continue;
             }
 
@@ -930,6 +969,7 @@ class rpc_command_queue {
                 failed = true;
                 pending.swap(commands);
             }
+            queue_cv.notify_all();
             signal_failed(cmd);
             for (auto & queued : pending) {
                 signal_failed(queued);
@@ -1178,33 +1218,44 @@ static void ggml_backend_rpc_buffer_memset_tensor(
     RPC_STATUS_ASSERT(status);
 }
 
-static void ggml_backend_rpc_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
-    ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *)buffer->context;
+// Only weights use the hash cache; activations must not be hashed or saved.
+static bool rpc_use_hash_cache(const ggml_tensor * tensor, size_t size) {
+    return size > HASH_THRESHOLD && tensor->buffer->usage == GGML_BACKEND_BUFFER_USAGE_WEIGHTS;
+}
+
+static void rpc_set_tensor(rpc_command_queue & queue, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     rpc_tensor rpc_tensor = serialize_tensor(tensor);
-    if (size > HASH_THRESHOLD) {
+    uint8_t cache_flag = 0;
+    if (rpc_use_hash_cache(tensor, size)) {
         rpc_msg_set_tensor_hash_req request;
         request.tensor = rpc_tensor;
         request.offset = offset;
         request.hash = fnv_hash((const uint8_t*)data, size);
         rpc_msg_set_tensor_hash_rsp response;
-        bool status = ctx->cmd_queue->submit_rpc_sync(RPC_CMD_SET_TENSOR_HASH, &request, sizeof(request), &response,
+        bool status = queue.submit_rpc_sync(RPC_CMD_SET_TENSOR_HASH, &request, sizeof(request), &response,
                                                       sizeof(response));
         RPC_STATUS_ASSERT(status);
         if (response.result) {
             // the server has the same data, no need to send it
             return;
         }
+        cache_flag = 1;
     }
-    bool status = ctx->cmd_queue->submit_set_tensor(rpc_tensor, data, offset, size);
+    bool status = queue.submit_set_tensor(rpc_tensor, data, offset, size, cache_flag);
     RPC_STATUS_ASSERT(status);
+}
+
+static void ggml_backend_rpc_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
+    ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *)buffer->context;
+    rpc_set_tensor(*ctx->cmd_queue, tensor, data, offset, size);
 }
 
 static void ggml_backend_rpc_buffer_set_tensor_2d(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data,
         size_t offset, size_t size, size_t n_copies, size_t stride_tensor, size_t stride_data) {
     ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *)buffer->context;
     rpc_tensor rpc_tensor = serialize_tensor(tensor);
-    // input serialization format: | rpc_tensor | offset (8 bytes) | size (8 bytes) | n_copies (8 bytes) | stride (8 bytes) | data (size * n_copies bytes) |
-    const size_t header_size = sizeof(rpc_tensor) + 4*sizeof(uint64_t);
+    // input serialization format: | rpc_tensor | cache_flag (1 byte) | offset (8 bytes) | size (8 bytes) | n_copies (8 bytes) | stride (8 bytes) | data (size * n_copies bytes) |
+    const size_t header_size = sizeof(rpc_tensor) + sizeof(uint8_t) + 4*sizeof(uint64_t);
     size_t data_size;
     size_t input_size;
     GGML_ASSERT(checked_mul_size(size, n_copies, data_size));
@@ -1215,13 +1266,14 @@ static void ggml_backend_rpc_buffer_set_tensor_2d(ggml_backend_buffer_t buffer, 
     uint8_t * dest = input.data();
     memcpy(dest, &rpc_tensor, sizeof(rpc_tensor));
     dest += sizeof(rpc_tensor);
+    uint8_t * cache_flag = dest++;
     uint64_t header[4] = { offset, size, n_copies, stride_tensor };
     memcpy(dest, header, sizeof(header));
     dest += sizeof(header);
     for (size_t i = 0; i < n_copies; i++) {
         memcpy(dest + i*size, (const char *)data + i*stride_data, size);
     }
-    if (data_size > HASH_THRESHOLD) {
+    if (rpc_use_hash_cache(tensor, data_size)) {
         rpc_msg_set_tensor_2d_hash_req request;
         request.tensor   = rpc_tensor;
         request.offset   = offset;
@@ -1236,6 +1288,7 @@ static void ggml_backend_rpc_buffer_set_tensor_2d(ggml_backend_buffer_t buffer, 
         if (response.result) {
             return;
         }
+        *cache_flag = 1;
     }
     bool status = ctx->cmd_queue->submit_rpc(RPC_CMD_SET_TENSOR_2D, input.data(), input.size());
     RPC_STATUS_ASSERT(status);
@@ -1563,7 +1616,7 @@ static void ggml_backend_rpc_set_tensor_async(ggml_backend_t backend,
                                               size_t         offset,
                                               size_t         size) {
     ggml_backend_rpc_context * rpc_ctx = (ggml_backend_rpc_context *) backend->context;
-    RPC_STATUS_ASSERT(rpc_ctx->cmd_queue->submit_set_tensor(serialize_tensor(tensor), data, offset, size));
+    rpc_set_tensor(*rpc_ctx->cmd_queue, tensor, data, offset, size);
 }
 
 static void ggml_backend_rpc_get_tensor_async(ggml_backend_t      backend,
@@ -2088,14 +2141,17 @@ ggml_tensor * rpc_server::deserialize_tensor(struct ggml_context * ctx, const rp
 
 bool rpc_server::set_tensor(const std::vector<uint8_t> & input) {
     sync_all_backends();
-    // serialization format: | rpc_tensor | offset (8 bytes) | data (size bytes) |
-    if (input.size() < sizeof(rpc_tensor) + sizeof(uint64_t)) {
+    // serialization format: | rpc_tensor | cache_flag (1 byte) | offset (8 bytes) | data (size bytes) |
+    uint8_t cache_flag;
+    uint64_t offset;
+    const size_t header_size = sizeof(rpc_tensor) + sizeof(cache_flag) + sizeof(offset);
+    if (input.size() < header_size) {
         return false;
     }
     const rpc_tensor * in_tensor = (const rpc_tensor *)input.data();
-    uint64_t offset;
-    memcpy(&offset, input.data() + sizeof(rpc_tensor), sizeof(offset));
-    const size_t size = input.size() - sizeof(rpc_tensor) - sizeof(offset);
+    memcpy(&cache_flag, input.data() + sizeof(rpc_tensor), sizeof(cache_flag));
+    memcpy(&offset, input.data() + sizeof(rpc_tensor) + sizeof(cache_flag), sizeof(offset));
+    const size_t size = input.size() - header_size;
 
     struct ggml_init_params params {
         /*.mem_size   =*/ ggml_tensor_overhead(),
@@ -2124,8 +2180,8 @@ bool rpc_server::set_tensor(const std::vector<uint8_t> & input) {
         }
     }
 
-    const void * data = input.data() + sizeof(rpc_tensor) + sizeof(offset);
-    if (cache_dir && size > HASH_THRESHOLD) {
+    const void * data = input.data() + header_size;
+    if (cache_dir && cache_flag) {
         uint64_t hash = fnv_hash((const uint8_t*)data, size);
         char hash_str[17];
         snprintf(hash_str, sizeof(hash_str), "%016" PRIx64, hash);
@@ -2163,19 +2219,22 @@ static bool validate_tensor_2d_region(const char * func, const rpc_tensor & in_t
 
 bool rpc_server::set_tensor_2d(const std::vector<uint8_t> & input) {
     sync_all_backends();
-    // serialization format: | rpc_tensor | offset (8 bytes) | size (8 bytes) | n_copies (8 bytes) | stride (8 bytes) | data (size * n_copies bytes) |
-    if (input.size() < sizeof(rpc_tensor) + 4*sizeof(uint64_t)) {
+    // serialization format: | rpc_tensor | cache_flag (1 byte) | offset (8 bytes) | size (8 bytes) | n_copies (8 bytes) | stride (8 bytes) | data (size * n_copies bytes) |
+    uint8_t cache_flag;
+    const size_t header_size = sizeof(rpc_tensor) + sizeof(cache_flag) + 4*sizeof(uint64_t);
+    if (input.size() < header_size) {
         return false;
     }
     const rpc_tensor * in_tensor = (const rpc_tensor *)input.data();
     uint64_t header[4];
-    memcpy(header, input.data() + sizeof(rpc_tensor), sizeof(header));
+    memcpy(&cache_flag, input.data() + sizeof(rpc_tensor), sizeof(cache_flag));
+    memcpy(header, input.data() + sizeof(rpc_tensor) + sizeof(cache_flag), sizeof(header));
     const uint64_t offset   = header[0];
     const uint64_t size     = header[1];
     const uint64_t n_copies = header[2];
     const uint64_t stride   = header[3];
 
-    const uint64_t data_size = input.size() - sizeof(rpc_tensor) - 4*sizeof(uint64_t);
+    const uint64_t data_size = input.size() - header_size;
     if (n_copies == 0 || size == 0 || size > data_size / n_copies || size * n_copies != data_size) {
         return false;
     }
@@ -2200,8 +2259,8 @@ bool rpc_server::set_tensor_2d(const std::vector<uint8_t> & input) {
         return false;
     }
 
-    const void * data = input.data() + sizeof(rpc_tensor) + 4*sizeof(uint64_t);
-    if (cache_dir && data_size > HASH_THRESHOLD) {
+    const void * data = input.data() + header_size;
+    if (cache_dir && cache_flag) {
         uint64_t hash = fnv_hash((const uint8_t *) data, data_size);
         char hash_str[17];
         snprintf(hash_str, sizeof(hash_str), "%016" PRIx64, hash);
@@ -3382,13 +3441,42 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
     }
 }
 
-void ggml_backend_rpc_start_server(const char * endpoint, const char * cache_dir,
-                                   size_t n_threads, size_t n_devices, ggml_backend_dev_t * devices) {
-    if (n_devices == 0 || devices == nullptr) {
-        fprintf(stderr, "Invalid arguments to ggml_backend_rpc_start_server\n");
-        return;
-    }
+struct ggml_backend_rpc_server {
     std::vector<ggml_backend_t> backends;
+    std::string cache_dir;
+    bool has_cache_dir = false;
+    std::string host;
+    socket_ptr server_socket;
+    socket_ptr client_socket;
+    std::mutex client_mutex;
+    std::atomic<bool> stop_requested{false};
+    std::atomic<bool> running{false};
+    bool transport_initialized = false;
+
+    ~ggml_backend_rpc_server() {
+        client_socket.reset();
+        server_socket.reset();
+        if (transport_initialized) {
+            rpc_transport_shutdown();
+        }
+        for (auto backend : backends) {
+            ggml_backend_free(backend);
+        }
+    }
+};
+
+ggml_backend_rpc_server_t ggml_backend_rpc_server_create(
+        const char * endpoint, const char * cache_dir,
+        size_t n_threads, size_t n_devices, ggml_backend_dev_t * devices) {
+    if (n_devices == 0 || devices == nullptr) {
+        fprintf(stderr, "Invalid arguments to ggml_backend_rpc_server_create\n");
+        return nullptr;
+    }
+    auto server = std::make_unique<ggml_backend_rpc_server>();
+    server->has_cache_dir = cache_dir != nullptr;
+    if (server->has_cache_dir) {
+        server->cache_dir = cache_dir;
+    }
     printf("Starting RPC server v%d.%d.%d\n",
         RPC_PROTO_MAJOR_VERSION,
         RPC_PROTO_MINOR_VERSION,
@@ -3405,9 +3493,9 @@ void ggml_backend_rpc_start_server(const char * endpoint, const char * cache_dir
         auto backend = ggml_backend_dev_init(dev, nullptr);
         if (!backend) {
             fprintf(stderr, "Failed to create backend for device %s\n", dev->iface.get_name(dev));
-            return;
+            return nullptr;
         }
-        backends.push_back(backend);
+        server->backends.push_back(backend);
         ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
         if (reg) {
             auto ggml_backend_set_n_threads_fn = (ggml_backend_set_n_threads_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_set_n_threads");
@@ -3417,10 +3505,9 @@ void ggml_backend_rpc_start_server(const char * endpoint, const char * cache_dir
         }
     }
 
-    std::string host;
     int port;
-    if (!parse_endpoint(endpoint, host, port)) {
-        return;
+    if (!parse_endpoint(endpoint, server->host, port)) {
+        return nullptr;
     }
 
 #ifdef GGML_RPC_RDMA
@@ -3430,29 +3517,79 @@ void ggml_backend_rpc_start_server(const char * endpoint, const char * cache_dir
 #endif // GGML_RPC_RDMA
     if (!rpc_transport_init()) {
         fprintf(stderr, "Failed to initialize RPC transport\n");
-        return;
+        return nullptr;
     }
-    auto server_socket = socket_t::create_server(host.c_str(), port);
-    if (server_socket == nullptr) {
+    server->transport_initialized = true;
+    server->server_socket         = socket_t::create_server(server->host.c_str(), port);
+    if (server->server_socket == nullptr) {
         fprintf(stderr, "Failed to create server socket\n");
+        return nullptr;
+    }
+    return server.release();
+}
+
+void ggml_backend_rpc_server_run(ggml_backend_rpc_server_t server) {
+    if (server == nullptr || server->running.exchange(true)) {
         return;
     }
-    while (true) {
-        auto client_socket = server_socket->accept();
+    while (!server->stop_requested.load()) {
+        bool timed_out     = false;
+        auto client_socket = server->server_socket->accept(100, &timed_out);
         if (client_socket == nullptr) {
-            fprintf(stderr, "Failed to accept client connection\n");
-            return;
+            if (timed_out) {
+                continue;
+            }
+            break;
+        }
+        {
+            std::lock_guard<std::mutex> lock(server->client_mutex);
+            if (server->stop_requested.load()) {
+                client_socket->shutdown();
+                break;
+            }
+            server->client_socket = client_socket;
         }
         printf("Accepted client connection\n");
         fflush(stdout);
-        rpc_serve_client(backends, cache_dir, host, client_socket);
+        rpc_serve_client(
+            server->backends,
+            server->has_cache_dir ? server->cache_dir.c_str() : nullptr,
+            server->host,
+            client_socket);
+        {
+            std::lock_guard<std::mutex> lock(server->client_mutex);
+            server->client_socket.reset();
+        }
         printf("Client connection closed\n");
         fflush(stdout);
     }
-    rpc_transport_shutdown();
-    for (auto backend : backends) {
-        ggml_backend_free(backend);
+    server->running.store(false);
+}
+
+void ggml_backend_rpc_server_stop(ggml_backend_rpc_server_t server) {
+    if (server == nullptr) {
+        return;
     }
+    server->stop_requested.store(true);
+    std::lock_guard<std::mutex> lock(server->client_mutex);
+    if (server->client_socket != nullptr) {
+        server->client_socket->shutdown();
+    }
+}
+
+void ggml_backend_rpc_server_free(ggml_backend_rpc_server_t server) {
+    delete server;
+}
+
+void ggml_backend_rpc_start_server(const char * endpoint, const char * cache_dir,
+                                   size_t n_threads, size_t n_devices, ggml_backend_dev_t * devices) {
+    ggml_backend_rpc_server_t server = ggml_backend_rpc_server_create(
+        endpoint, cache_dir, n_threads, n_devices, devices);
+    if (server == nullptr) {
+        return;
+    }
+    ggml_backend_rpc_server_run(server);
+    ggml_backend_rpc_server_free(server);
 }
 
 static const char * ggml_backend_rpc_device_get_name(ggml_backend_dev_t dev) {
@@ -3841,6 +3978,18 @@ static void * ggml_backend_rpc_get_proc_address(ggml_backend_reg_t reg, const ch
     }
     if (std::strcmp(name, "ggml_backend_rpc_start_server") == 0) {
         return (void *)ggml_backend_rpc_start_server;
+    }
+    if (std::strcmp(name, "ggml_backend_rpc_server_create") == 0) {
+        return (void *)ggml_backend_rpc_server_create;
+    }
+    if (std::strcmp(name, "ggml_backend_rpc_server_run") == 0) {
+        return (void *)ggml_backend_rpc_server_run;
+    }
+    if (std::strcmp(name, "ggml_backend_rpc_server_stop") == 0) {
+        return (void *)ggml_backend_rpc_server_stop;
+    }
+    if (std::strcmp(name, "ggml_backend_rpc_server_free") == 0) {
+        return (void *)ggml_backend_rpc_server_free;
     }
     if (std::strcmp(name, "ggml_backend_comm_init") == 0) {
         return (void *)ggml_backend_rpc_comm_init;

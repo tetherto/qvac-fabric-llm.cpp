@@ -296,7 +296,7 @@ struct llama_file_disk::impl {
                         alignment = 1;
                         init_fp("rb");
                         seek(curr_off, SEEK_SET);
-                        read_raw_unsafe(ptr, len);
+                        read_raw_unsafe(static_cast<char *>(ptr) + bytes_read, len - bytes_read);
                         return;
                     }
                     throw std::runtime_error(format("read error: %s", strerror(errno)));
@@ -316,28 +316,82 @@ struct llama_file_disk::impl {
         }
     }
 
-    void read_aligned_chunk(void * dest, size_t size) {
-        size_t offset = tell();
-        off_t aligned_offset = offset & ~(alignment - 1);
-        off_t offset_from_alignment = offset - aligned_offset;
-        size_t bytes_to_read = (offset_from_alignment + size + alignment - 1) & ~(alignment - 1);
+    size_t read_raw_unsafe_at(void * ptr, size_t len, size_t offset) const {
+        int read_fd = fd != -1 ? fd : fileno(fp);
+        std::unique_ptr<FILE, int (*)(FILE *)> buffered(nullptr, &std::fclose);
+        size_t done = 0;
+        while (done < len) {
+            ssize_t ret = pread(read_fd, static_cast<char *>(ptr) + done, len - done, offset + done);
+            if (ret < 0) {
+                if (errno == EINTR) {
+                    continue;
+                }
+                if (fd != -1 && !buffered && (errno == EINVAL || errno == EFAULT)) {
+                    LLAMA_LOG_WARN("%s: Falling back to buffered IO due to %s\n", __func__, strerror(errno));
+                    // Keep the direct-IO descriptor valid for the other readers.
+                    buffered.reset(ggml_fopen(fname.c_str(), "rb"));
+                    if (!buffered) {
+                        throw std::runtime_error(format("failed to open %s: %s", fname.c_str(), strerror(errno)));
+                    }
+                    read_fd = fileno(buffered.get());
+                    continue;
+                }
+                throw std::runtime_error(format("pread failed: %s", strerror(errno)));
+            }
+            if (ret == 0) {
+                break;
+            }
+            done += static_cast<size_t>(ret);
+        }
+        return done;
+    }
 
-        void * raw_buffer = nullptr;
-        int ret = posix_memalign(&raw_buffer, alignment, bytes_to_read);
-        if (ret != 0) {
-            throw std::runtime_error(format("posix_memalign failed with error %d", ret));
+    void read_aligned_chunk(void * dest, size_t size) {
+        struct read_buffer {
+            void * data = nullptr;
+            size_t capacity = 0;
+            size_t alignment = 0;
+            ~read_buffer() { free(data); }
+        };
+        // Share a bounded buffer across all shards read by this thread.
+        thread_local read_buffer bounce;
+        size_t offset = tell();
+        if (offset > this->size || size > this->size - offset) {
+            throw std::runtime_error("unexpectedly reached end of file");
         }
 
-        struct aligned_buffer_deleter {
-            void operator()(void * p) const { free(p); }
-        };
-        std::unique_ptr<void, aligned_buffer_deleter> buffer(raw_buffer);
+        while (size > 0) {
+            if (!has_direct_io()) {
+                seek(offset, SEEK_SET);
+                read_raw_unsafe(dest, size);
+                return;
+            }
+            const size_t aligned_offset = offset & ~(alignment - 1);
+            const size_t skip = offset - aligned_offset;
+            const size_t limit = std::max<size_t>(8 * 1024 * 1024, alignment);
+            const size_t bytes_to_read = std::min(limit, (skip + size + alignment - 1) & ~(alignment - 1));
+            const size_t to_copy = std::min(size, bytes_to_read - skip);
 
-        seek(aligned_offset, SEEK_SET);
-        read_raw_unsafe(buffer.get(), bytes_to_read);
+            if (bytes_to_read > bounce.capacity || alignment > bounce.alignment) {
+                void * data = nullptr;
+                int ret = posix_memalign(&data, alignment, bytes_to_read);
+                if (ret != 0) {
+                    throw std::runtime_error(format("posix_memalign failed with error %d", ret));
+                }
+                free(bounce.data);
+                bounce.data = data;
+                bounce.capacity = bytes_to_read;
+                bounce.alignment = alignment;
+            }
 
-        uintptr_t actual_data = reinterpret_cast<uintptr_t>(buffer.get()) + offset_from_alignment;
-        memcpy(dest, reinterpret_cast<void *>(actual_data), size);
+            seek(aligned_offset, SEEK_SET);
+            read_raw_unsafe(bounce.data, bytes_to_read);
+            memcpy(dest, static_cast<char *>(bounce.data) + skip, to_copy);
+            dest = static_cast<char *>(dest) + to_copy;
+            offset += to_copy;
+            size -= to_copy;
+        }
+        seek(offset, SEEK_SET);
     }
 
     void read_raw(void * ptr, size_t len) {
@@ -427,6 +481,9 @@ void llama_file_disk::read_raw(void * ptr, size_t len) { pimpl->read_raw(ptr, le
 void llama_file_disk::read_raw_unsafe(void * ptr, size_t len) { pimpl->read_raw(ptr, len); }
 #else
 void llama_file_disk::read_raw_unsafe(void * ptr, size_t len) { pimpl->read_raw_unsafe(ptr, len); }
+size_t llama_file_disk::read_raw_unsafe_at(void * ptr, size_t len, size_t offset) const {
+    return pimpl->read_raw_unsafe_at(ptr, len, offset);
+}
 #endif
 
 #ifdef _WIN32
