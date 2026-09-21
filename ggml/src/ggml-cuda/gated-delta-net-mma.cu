@@ -638,7 +638,10 @@ static bool gdn_init(int device) {
 #elif defined(GGML_USE_MUSA)
         const bool supported = false;
 #else
-        const bool supported = info.cc == GGML_CUDA_CC_ADA_LOVELACE || info.cc == GGML_CUDA_CC_BLACKWELL || info.cc == GGML_CUDA_CC_DGX_SPARK;
+        // Older PTX can JIT on these GPUs, but lacks the Ampere MMA kernel body.
+        const bool supported = ampere_mma_available(info.cc) &&
+                               (info.cc == GGML_CUDA_CC_ADA_LOVELACE || info.cc == GGML_CUDA_CC_BLACKWELL ||
+                                info.cc == GGML_CUDA_CC_DGX_SPARK);
 #endif
         if (!supported || sizeof(gdn_shared) > info.smpbo) {
             return;
