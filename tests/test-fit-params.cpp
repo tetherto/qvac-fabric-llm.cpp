@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <cstdint>
 #include <vector>
+#include <stdexcept>
 
 constexpr int64_t GiB = 1024LL * 1024 * 1024;
 
@@ -99,7 +100,92 @@ static void test_auto_cache_preserves_context_fitting() {
         common_fit_auto_moe_cache(mparams, cparams, 8, 1, false, true), true);
 }
 
+// Inject an exception from the probe's logger to exercise unwinding before
+// any of the explicit model/context failure checks can restore the callback.
+static void test_probe_logger_restoration() {
+    ggml_log_callback original_callback;
+    void * original_data;
+    llama_log_get(&original_callback, &original_data);
+    struct injected_exception {};
+    bool inject = true;
+    const auto callback = +[](ggml_log_level, const char *, void * data) {
+        if (*static_cast<bool *>(data)) {
+            throw injected_exception{};
+        }
+    };
+    llama_log_set(callback, &inject);
+    auto mparams = llama_model_default_params();
+    auto cparams = llama_context_default_params();
+    std::vector<ggml_backend_dev_t> devices;
+    uint32_t layers = 0, context = 0, experts = 0;
+    bool caught = false;
+    try {
+        common_get_device_memory_data("/nonexistent-fit-test/model.gguf", &mparams, &cparams, devices,
+                                      layers, context, experts, GGML_LOG_LEVEL_ERROR);
+    } catch (const injected_exception &) {
+        caught = true;
+    }
+    inject = false;
+    ggml_log_callback restored_callback;
+    void * restored_data;
+    llama_log_get(&restored_callback, &restored_data);
+    expect_i64("probe exception injected", caught, true);
+    expect_i64("probe restores callback", restored_callback == callback, true);
+    expect_i64("probe restores callback data", restored_data == &inject, true);
+    // A second probe verifies that unwinding released the serialization mutex.
+    try {
+        common_get_device_memory_data("/nonexistent-fit-test/model.gguf", &mparams, &cparams, devices,
+                                      layers, context, experts, GGML_LOG_LEVEL_ERROR);
+    } catch (const std::runtime_error &) {
+    }
+    llama_log_get(&restored_callback, &restored_data);
+    expect_i64("failed load restores callback", restored_callback == callback, true);
+    expect_i64("failed load restores callback data", restored_data == &inject, true);
+    llama_log_set(original_callback, original_data);
+}
+
+// Programmatic callers need not pad explicit overrides to the fitter's
+// maximum output size. ASan checks both the snapshot and error rollback.
+static void test_compact_override_rollback() {
+    for (bool fail : { false, true }) {
+        for (size_t count : { size_t(0), size_t(1), size_t(3) }) {
+            std::vector<llama_model_tensor_buft_override> overrides(count + 1);
+            for (size_t i = 0; i < count; ++i) {
+                overrides[i] = { "blk.*", nullptr };
+            }
+            overrides[count] = { nullptr, nullptr };
+            overrides.shrink_to_fit();
+            const auto original = overrides;
+            auto mparams = llama_model_default_params();
+            auto cparams = llama_context_default_params();
+            mparams.tensor_buft_overrides = overrides.data();
+            if (fail) {
+                mparams.split_mode = LLAMA_SPLIT_MODE_TENSOR;
+            }
+            const auto original_ngl = mparams.n_gpu_layers;
+            const auto original_ctx = cparams.n_ctx;
+            std::vector<float> split(llama_max_devices(), 0.0f);
+            std::vector<size_t> margins(llama_max_devices(), 0);
+            const auto status = common_fit_params(
+                "/nonexistent-fit-test/model.gguf", &mparams, &cparams,
+                split.data(), overrides.data(), margins.data(), 0, false, GGML_LOG_LEVEL_ERROR);
+            expect_i64("fit returns expected failure status", status,
+                fail ? COMMON_PARAMS_FIT_STATUS_FAILURE : COMMON_PARAMS_FIT_STATUS_ERROR);
+            expect_i64("rollback preserves override pointer", mparams.tensor_buft_overrides == overrides.data(), true);
+            expect_i64("rollback preserves GPU layers", mparams.n_gpu_layers, original_ngl);
+            expect_u32("rollback preserves context", cparams.n_ctx, original_ctx);
+            for (size_t i = 0; i <= count; ++i) {
+                expect_i64("rollback preserves pattern", overrides[i].pattern == original[i].pattern, true);
+                expect_i64("rollback preserves buffer type", overrides[i].buft == original[i].buft, true);
+            }
+        }
+    }
+}
+
 int main() {
+    ggml_time_init();
+    test_compact_override_rollback();
+    test_probe_logger_restoration();
     test_automatic_acceleration();
     test_auto_cache_preserves_context_fitting();
     // --- common_fit_shared_pool_deficit ---
