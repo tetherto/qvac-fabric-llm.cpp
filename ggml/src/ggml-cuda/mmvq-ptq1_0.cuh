@@ -460,6 +460,10 @@ static bool mul_mat_vec_ptq1_0_pt_switch(
         ncols_dst < 1 || ncols_dst > PTQ1_0_PT_MAX_COLS || 2 * (ncols_x / QK_PTQ1_0) * ncols_dst > PTQ1_0_PT_SMEM_FLOATS) {
         return false;
     }
+    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    if (ncols_dst > 1 && GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_BLACKWELL) {
+        return false; // the multi-column reduction exceeds the backend tolerance on Blackwell
+    }
     switch (ncols_dst) {
         case 1: mul_mat_vec_ptq1_0_pt_launch<1>(vx, vy, fusion, dst, ncols_x, nrows_x, stride_row_x, stride_col_y, stride_col_dst, stream); break;
         case 2: mul_mat_vec_ptq1_0_pt_launch<2>(vx, vy, fusion, dst, ncols_x, nrows_x, stride_row_x, stride_col_y, stride_col_dst, stream); break;
