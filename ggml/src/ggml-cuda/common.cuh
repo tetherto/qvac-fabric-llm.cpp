@@ -986,6 +986,44 @@ struct ggml_cuda_type_traits<GGML_TYPE_Q2_0> {
 };
 
 template<>
+struct ggml_cuda_type_traits<GGML_TYPE_PQ2_0> {
+    static constexpr int qk = QK_PQ2_0;
+    static constexpr int qr = QR_PQ2_0;
+    static constexpr int qi = QI_PQ2_0;
+};
+
+// Decode PTQ1_0 in the CPU codec's base-3 order.
+static __device__ __forceinline__ int ptq1_0_trit(const block_ptq1_0 * x, const int e) {
+    uint8_t b;
+    int n;
+    if (e < 80) {                       // qs[0..15], chunk of 16
+        b = x->qs[e & 15];              n = e >> 4;
+    } else if (e < 120) {               // qs[16..23], chunk of 8
+        const int t = e - 80;
+        b = x->qs[16 + (t & 7)];        n = t >> 3;
+    } else {                            // qh[0..1], four trits per byte
+        const int t = e - 120;
+        b = x->qh[t & 1];               n = t >> 1;
+    }
+
+    uint32_t v = b;
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        if (i < n) {
+            v = (v * 3) & 0xFF;
+        }
+    }
+    return (int) ((v * 3) >> 8) - 1;
+}
+
+template<>
+struct ggml_cuda_type_traits<GGML_TYPE_PTQ1_0> {
+    static constexpr int qk = QK_PTQ1_0;
+    static constexpr int qr = QR_PTQ1_0;
+    static constexpr int qi = QI_PTQ1_0;
+};
+
+template<>
 struct ggml_cuda_type_traits<GGML_TYPE_Q4_0> {
     static constexpr int qk = QK4_0;
     static constexpr int qr = QR4_0;
