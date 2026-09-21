@@ -53,12 +53,10 @@ var<storage, read_write> dst: array<DataType>;
 var<uniform> params: Params;
 #endif
 @compute @workgroup_size(WG_SIZE)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>,
-        @builtin(num_workgroups) nwg: vec3<u32>) {
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
-    let index = gid.x + gid.y * nwg.x * WG_SIZE;
-    if (index < params.ne) {
-        var i = index;
+    if (gid.x < params.ne) {
+        var i = gid.x;
         let i3 = i / (params.ne2 * params.ne1 * params.ne0);
         i = i % (params.ne2 * params.ne1 * params.ne0);
         let i2 = i / (params.ne1 * params.ne0);
@@ -74,9 +72,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>,
                              ni[2] * params.stride_src0_2 +
                              ni[3] * params.stride_src0_3;
 #ifdef SRC_OVERLAP
-            dst[params.offset_dst + index] = merged_src[params.offset_src0 + src_i];
+            dst[params.offset_dst + gid.x] = merged_src[params.offset_src0 + src_i];
 #else
-            dst[params.offset_dst + index] = src0[params.offset_src0 + src_i];
+            dst[params.offset_dst + gid.x] = src0[params.offset_src0 + src_i];
 #endif
         } else {
             ni[params.dim] -= params.src0_nedim;
@@ -85,9 +83,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>,
                              ni[2] * params.stride_src1_2 +
                              ni[3] * params.stride_src1_3;
 #ifdef SRC_OVERLAP
-            dst[params.offset_dst + index] = merged_src[params.offset_src1 + src_i];
+            dst[params.offset_dst + gid.x] = merged_src[params.offset_src1 + src_i];
 #else
-            dst[params.offset_dst + index] = src1[params.offset_src1 + src_i];
+            dst[params.offset_dst + gid.x] = src1[params.offset_src1 + src_i];
 #endif
         }
     }

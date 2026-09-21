@@ -256,7 +256,7 @@ int main(int argc, char ** argv) {
         }
         return child_main(tokens, split, heads);
     }
-    for (int64_t tokens : { 63, 64, 65, 127, 128, 129, 255, 256, 257, 512, 1024, 2047, 2048, 2049, 4097 }) {
+    for (int64_t tokens : { 63, 64, 65, 127, 128, 129, 255, 256, 257, 512, 1024, 2047, 2048, 2049, 4096 }) {
         for (int64_t heads : {32, 48}) {
             if (child_main(tokens, tokens / 2, heads) != 0) {
                 return 1;

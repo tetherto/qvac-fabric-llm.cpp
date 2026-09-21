@@ -2538,11 +2538,8 @@ static webgpu_encoded_op ggml_webgpu_concat(webgpu_context & ctx,
         entries.push_back(ggml_webgpu_make_tensor_bind_group_entry(ctx, 2, dst));
     }
 
-    uint32_t wg_x;
-    uint32_t wg_y;
-    compute_2d_workgroups(CEIL_DIV(ne, decisions->wg_size),
-                          ctx->global_ctx->capabilities.limits.maxComputeWorkgroupsPerDimension, wg_x, wg_y);
-    return ggml_backend_webgpu_build(ctx, pipeline, params, entries, wg_x, wg_y);
+    uint32_t wg_x = CEIL_DIV(ne, decisions->wg_size);
+    return ggml_backend_webgpu_build(ctx, pipeline, params, entries, wg_x);
 }
 
 static webgpu_encoded_op ggml_webgpu_repeat(webgpu_context & ctx, ggml_tensor * src0, ggml_tensor * dst) {
@@ -2677,8 +2674,7 @@ static webgpu_encoded_op ggml_webgpu_row_norm(webgpu_context & ctx, ggml_tensor 
         (uint32_t) src->ne[0],
         (uint32_t) src->ne[1],
         (uint32_t) src->ne[2],
-        ggml_webgpu_u32_from_f32(ggml_get_op_params_f32(dst, 0)),  // epsilon, treated as f32 in the shader
-        (uint32_t) ggml_nrows(src),
+        ggml_webgpu_u32_from_f32(ggml_get_op_params_f32(dst, 0))  // epsilon, treated as f32 in the shader
     };
 
     ggml_webgpu_shader_lib_context shader_lib_ctx = {};
@@ -2693,11 +2689,7 @@ static webgpu_encoded_op ggml_webgpu_row_norm(webgpu_context & ctx, ggml_tensor 
     if (!decisions->inplace) {
         entries.push_back(ggml_webgpu_make_tensor_bind_group_entry(ctx, 1, dst));
     }
-    uint32_t wg_x;
-    uint32_t wg_y;
-    compute_2d_workgroups(ggml_nrows(src), ctx->global_ctx->capabilities.limits.maxComputeWorkgroupsPerDimension, wg_x,
-                          wg_y);
-    return ggml_backend_webgpu_build(ctx, pipeline, params, entries, wg_x, wg_y);
+    return ggml_backend_webgpu_build(ctx, pipeline, params, entries, ggml_nrows(src));
 }
 
 static webgpu_encoded_op ggml_webgpu_rope(webgpu_context & ctx,

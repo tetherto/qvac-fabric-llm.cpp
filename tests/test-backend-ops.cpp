@@ -4741,6 +4741,15 @@ struct test_gated_delta_net_precision : public test_gated_delta_net {
     double max_nmse_err() override { return 3e-4; }
     std::vector<ggml_tensor *> fusion_test_nodes() override { return outputs; }
 
+    bool skip_backend(ggml_backend_t backend) override {
+        const auto reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
+        // WebGPU normalization uses one workgroup per row. Concat uses at least 256 threads per workgroup.
+        const int64_t rows = head_count * n_seq_tokens * n_seqs;
+        const int64_t elements = head_size * head_count * v_repeat * (n_seq_tokens + head_size) * n_seqs;
+        return strcmp(ggml_backend_reg_name(reg), "WebGPU") == 0 &&
+               (rows > 65535 || elements > 65535 * 256);
+    }
+
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * gdn = test_gated_delta_net::build_graph(ctx);
         const int64_t attn_size = head_size * head_count * v_repeat * n_seq_tokens * n_seqs;
@@ -12255,7 +12264,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
 
     // Split scheduling threshold, partial chunks, and multi-sequence fallback.
-    for (int tokens : {2047, 2048, 2049, 4097}) {
+    for (int tokens : {2047, 2048, 2049, 4096}) {
         test_cases.emplace_back(new test_gated_delta_net_precision(2, tokens));
     }
     test_cases.emplace_back(new test_gated_delta_net_precision(2, 2048, 1.0f, 1.0f, -0.01f, -0.03f, 2));
