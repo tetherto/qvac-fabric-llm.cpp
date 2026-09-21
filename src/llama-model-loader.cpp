@@ -1776,6 +1776,7 @@ bool llama_model_loader::load_all_data(
         std::atomic<size_t> next_item{0};
         std::atomic<bool>   any_failed{false};
         std::mutex          err_mutex;
+        std::mutex          upload_mutex;
         std::string         err_msg;
 
         auto worker = [&]() {
@@ -1790,7 +1791,6 @@ bool llama_model_loader::load_all_data(
                     const pending_read & pr = pending_reads[i];
                     const auto & f = files.at(pr.idx);
 
-                    const int    fd    = f->file_id();
                     const size_t align = f->read_alignment();
 
                     // O_DIRECT needs the offset, the length and the destination
@@ -1808,24 +1808,13 @@ bool llama_model_loader::load_all_data(
                         acap = want;
                     }
 
-                    size_t got = 0;
-                    while (got < want) {
-                        const ssize_t r = pread(fd, (char *) abuf + got, want - got, aoff + (off_t) got);
-                        if (r < 0) {
-                            if (errno == EINTR) {
-                                continue;
-                            }
-                            throw std::runtime_error(format("pread failed: %s", strerror(errno)));
-                        }
-                        if (r == 0) {
-                            break; // short final window at end of file
-                        }
-                        got += (size_t) r;
-                    }
+                    const size_t got = f->read_raw_unsafe_at(abuf, want, aoff);
                     if (got < skip + pr.size) {
                         throw std::runtime_error(format("short read for tensor '%s'", ggml_get_name(pr.tensor)));
                     }
 
+                    // Backend uploads can mutate shared state, including OpenCL conversion kernels.
+                    std::lock_guard<std::mutex> lock(upload_mutex);
                     ggml_backend_tensor_set(pr.tensor, (char *) abuf + skip, 0, pr.size);
                 }
             } catch (const std::exception & e) {
@@ -1838,9 +1827,18 @@ bool llama_model_loader::load_all_data(
         };
 
         std::vector<std::thread> pool;
+        n_load_threads = std::min<size_t>(n_load_threads, pending_reads.size());
         pool.reserve(n_load_threads);
-        for (int t = 0; t < n_load_threads; ++t) {
-            pool.emplace_back(worker);
+        try {
+            for (int t = 0; t < n_load_threads; ++t) {
+                pool.emplace_back(worker);
+            }
+        } catch (...) {
+            any_failed.store(true);
+            for (auto & t : pool) {
+                t.join();
+            }
+            throw;
         }
         for (auto & t : pool) {
             t.join();

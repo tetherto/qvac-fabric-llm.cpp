@@ -319,6 +319,22 @@ llama_build(test-multi-instance-repro.cpp)
 llama_build_and_test(test-arg-parser.cpp)
 llama_build_and_test(test-model-resolution.cpp)
 llama_build_and_test(test-model-load-meta-only.cpp)
+
+if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    add_executable(test-mmap-direct-io test-mmap-direct-io.cpp ../src/llama-mmap.cpp ../src/llama-impl.cpp)
+    target_include_directories(test-mmap-direct-io PRIVATE ../src ../include)
+    target_link_libraries(test-mmap-direct-io PRIVATE ggml)
+    target_compile_features(test-mmap-direct-io PRIVATE cxx_std_17)
+    target_link_options(test-mmap-direct-io PRIVATE -Wl,--wrap=pread -Wl,--wrap=read -Wl,--wrap=posix_memalign)
+    if (LLAMA_TESTS_INSTALL)
+        install(TARGETS test-mmap-direct-io RUNTIME)
+    endif()
+    llama_test(test-mmap-direct-io)
+
+    llama_build_and_test(test-model-load-direct-io.cpp)
+    target_include_directories(test-model-load-direct-io PRIVATE ../src ../ggml/src)
+    set_tests_properties(test-mmap-direct-io test-model-load-direct-io PROPERTIES SKIP_RETURN_CODE 77)
+endif()
 # the test serves its repos from an httplib server, and the library links it privately
 target_link_libraries(test-model-resolution PRIVATE cpp-httplib)
 
