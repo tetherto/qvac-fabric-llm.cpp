@@ -8,10 +8,12 @@
 #include "../src/llama-ext.h"
 
 #include <array>
+#include <algorithm>
 #include <cassert>
 #include <stdexcept>
 #include <cinttypes>
 #include <set>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -29,9 +31,15 @@ class common_params_fit_exception : public std::runtime_error {
     using std::runtime_error::runtime_error;
 };
 
+static std::mutex & common_fit_logger_mutex() {
+    static std::mutex mutex;
+    return mutex;
+}
+
 // RAII: send llama logs below min_level to the debug log
+// the scope also serializes the temporary logger override across all fit/memory probes
 struct common_fit_log_scope {
-    common_fit_log_scope(ggml_log_level min_level) : min_level(min_level) {
+    common_fit_log_scope(ggml_log_level min_level) : lock(common_fit_logger_mutex()), min_level(min_level) {
         llama_log_get(&original_logger.callback, &original_logger.user_data);
         llama_log_set([](ggml_log_level level, const char * text, void * user_data) {
             const common_fit_log_scope * self = (const common_fit_log_scope *) user_data;
@@ -48,6 +56,8 @@ struct common_fit_log_scope {
     common_fit_log_scope & operator=(const common_fit_log_scope &) = delete;
 
 private:
+    // declared first: taken before the logger is swapped and released after the destructor restores it
+    std::lock_guard<std::mutex> lock;
     struct {
         ggml_log_callback callback;
         void * user_data;
@@ -70,14 +80,15 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
     mparams_copy.no_alloc  = true;
     mparams_copy.load_mode = LLAMA_LOAD_MODE_NONE;
 
-    llama_model * model = llama_model_load_from_file(path_model, mparams_copy);
+    llama_model_ptr model_owner(llama_model_load_from_file(path_model, mparams_copy));
+    llama_model * model = model_owner.get();
     if (model == nullptr) {
         throw std::runtime_error("failed to load model");
     }
 
-    llama_context * ctx = llama_init_from_model(model, *cparams);
+    llama_context_ptr ctx_owner(llama_init_from_model(model, *cparams));
+    llama_context * ctx = ctx_owner.get();
     if (ctx == nullptr) {
-        llama_model_free(model);
         throw common_params_fit_exception("failed to create llama_context from model");
     }
 
@@ -156,9 +167,6 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
     hp_n_expert    = llama_model_n_expert(model);
 
     common_memory_breakdown_print(ctx);
-
-    llama_free(ctx);
-    llama_model_free(model);
 
     return ret;
 }
@@ -1213,11 +1221,27 @@ enum common_params_fit_status common_fit_params(
     const int64_t t0_us = llama_time_us();
     common_params_fit_status status = COMMON_PARAMS_FIT_STATUS_SUCCESS;
     // The impl mutates the params while it works (e.g. n_ctx during the
-    // context-reduction probe). Callers that ignore the status — including
-    // common_init_from_params — would otherwise load with a half-mutated
-    // configuration after a FAILURE, silently clamping the context.
+    // context-reduction probe). Callers that continue after failure would
+    // otherwise load with a half-mutated configuration, silently clamping
+    // the context.
     const llama_model_params   mparams_original = *mparams;
     const llama_context_params cparams_original = *cparams;
+    // The structs only hold pointers to these caller-owned writable buffers.
+    std::vector<float> split_original;
+    std::vector<llama_model_tensor_buft_override> overrides_original;
+    if (tensor_split) {
+        split_original.assign(tensor_split, tensor_split + llama_max_devices());
+    }
+    if (tensor_buft_overrides) {
+        // Explicit overrides can be compact. Save through the terminator only.
+        // Restoring the terminator also hides any fitted entries.
+        for (size_t i = 0; i < llama_max_tensor_buft_overrides(); ++i) {
+            overrides_original.push_back(tensor_buft_overrides[i]);
+            if (!tensor_buft_overrides[i].pattern) {
+                break;
+            }
+        }
+    }
     try {
         common_params_fit_impl(
             path_model, mparams, cparams, tensor_split, tensor_buft_overrides, margins, n_ctx_min, extra, prefetch_weights_auto, log_level);
@@ -1234,6 +1258,8 @@ enum common_params_fit_status common_fit_params(
         status = COMMON_PARAMS_FIT_STATUS_ERROR;
     }
     if (status != COMMON_PARAMS_FIT_STATUS_SUCCESS) {
+        std::copy(split_original.begin(), split_original.end(), tensor_split);
+        std::copy(overrides_original.begin(), overrides_original.end(), tensor_buft_overrides);
         *mparams = mparams_original;
         *cparams = cparams_original;
     }

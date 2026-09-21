@@ -1296,7 +1296,8 @@ void common_fit_apply(common_params & params, llama_model_params & mparams, llam
         /*.shares_model =*/ !has_draft, // an MTP context runs on the weights of the main model
     };
 
-    common_fit_params(params.model.path.c_str(), &mparams, &cparams,
+    const int64_t fit_start_us = llama_time_us();
+    const auto fit_status = common_fit_params(params.model.path.c_str(), &mparams, &cparams,
         params.tensor_split,
         params.tensor_buft_overrides.data(),
         params.fit_params_target.data(),
@@ -1304,6 +1305,16 @@ void common_fit_apply(common_params & params, llama_model_params & mparams, llam
         has_draft || spec_mtp ? &extra : nullptr,
         params.prefetch_weights_auto,
         params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
+    if (fit_status == COMMON_PARAMS_FIT_STATUS_SUCCESS) {
+        // Keep the user's scalar settings for subsequent draft and MTP contexts.
+        COM_INF("fit completed in %.2f seconds: n_gpu_layers = %d, n_ctx = %u, moe_cache_size = %zu, prefetch_weights = %s\n",
+                (llama_time_us() - fit_start_us) * 1e-6, mparams.n_gpu_layers, cparams.n_ctx,
+                (size_t) cparams.moe_cache_size, cparams.prefetch_weights ? "on" : "off");
+    } else {
+        COM_WRN("fit %s after %.2f seconds; continuing with original parameters\n",
+                fit_status == COMMON_PARAMS_FIT_STATUS_FAILURE ? "failed" : "encountered an error",
+                (llama_time_us() - fit_start_us) * 1e-6);
+    }
 }
 common_init_result::common_init_result() : pimpl(new impl{}) {}
 
