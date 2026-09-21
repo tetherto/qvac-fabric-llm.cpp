@@ -490,9 +490,11 @@ static ggml_backend_reg_t ggml_backend_load_best(const char * name, bool silent,
 #ifdef GGML_BACKEND_DIR
         search_paths.push_back(fs::u8path(GGML_BACKEND_DIR));
 #endif
-        // default search paths: executable directory, current directory
+        // default search paths: executable directory, and current directory outside Windows
         search_paths.push_back(get_executable_path());
+#ifndef _WIN32
         search_paths.push_back(fs::current_path());
+#endif
 
         // Android does not require prepending path, the .apk will have embedded the dynamic .so, only the name is needed for dlopen
         // TODO add here prebuild/ search patch for Desktop platforms where we want to support dynamic loading
