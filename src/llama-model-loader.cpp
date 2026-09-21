@@ -1499,7 +1499,9 @@ bool llama_model_loader::load_all_data(
 
     // Buffer size: balance between memory usage and I/O efficiency
     // 64MB works well for NVMe drives
-    const size_t buffer_size = alignment != 1 ? 64 * 1024 * 1024 + 2 * alignment : 1 * 1024 * 1024;
+    const size_t buffer_size = alignment != 1 ? 64 * 1024 * 1024 : 1 * 1024 * 1024;
+    // Leave room to align the read destination without reducing the payload capacity.
+    const size_t host_buffer_size = buffer_size + alignment - 1;
 
     struct async_upload_resources {
         ggml_backend_ptr backend;
@@ -1562,7 +1564,7 @@ bool llama_model_loader::load_all_data(
 
         // If the backend is supported, create pinned memory buffers and events for synchronisation.
         for (size_t idx = 0; idx < n_buffers; ++idx) {
-            auto * buf = ggml_backend_buft_alloc_buffer(host_buft, buffer_size);
+            auto * buf = ggml_backend_buft_alloc_buffer(host_buft, host_buffer_size);
 
             if (!buf) {
                 LLAMA_LOG_DEBUG("%s: failed to allocate host buffer for async uploads for device %s\n", func,
