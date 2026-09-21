@@ -1,5 +1,12 @@
 #include "llama-model-loader.h"
 
+#ifndef _WIN32
+#include <unistd.h>
+#include <atomic>
+#include <thread>
+#include <mutex>
+#endif
+
 #include "ggml-alloc.h"
 #include "ggml-cpp.h"
 #include "ggml.h"
@@ -607,7 +614,7 @@ llama_model_loader::llama_model_loader(
     if (!fname_empty || is_buffer) {
         // Load the main GGUF
         struct ggml_context * ctx = NULL;
-        gguf_file_load main_gguf(&ctx, load_input);
+        gguf_file_load main_gguf(&ctx, load_input, this->use_direct_io);
 
         if (load_input_variant::variant_supports_split_load_from_memory(load_input)) {
             incremental_splits_tensor_load.emplace(ctx, *this, main_gguf, std::move(*tensor_list));
@@ -1492,7 +1499,9 @@ bool llama_model_loader::load_all_data(
 
     // Buffer size: balance between memory usage and I/O efficiency
     // 64MB works well for NVMe drives
-    const size_t buffer_size = alignment != 1 ? 64 * 1024 * 1024 + 2 * alignment : 1 * 1024 * 1024;
+    const size_t buffer_size = alignment != 1 ? 64 * 1024 * 1024 : 1 * 1024 * 1024;
+    // Leave room to align the read destination without reducing the payload capacity.
+    const size_t host_buffer_size = buffer_size + alignment - 1;
 
     struct async_upload_resources {
         ggml_backend_ptr backend;
@@ -1555,7 +1564,7 @@ bool llama_model_loader::load_all_data(
 
         // If the backend is supported, create pinned memory buffers and events for synchronisation.
         for (size_t idx = 0; idx < n_buffers; ++idx) {
-            auto * buf = ggml_backend_buft_alloc_buffer(host_buft, buffer_size);
+            auto * buf = ggml_backend_buft_alloc_buffer(host_buft, host_buffer_size);
 
             if (!buf) {
                 LLAMA_LOG_DEBUG("%s: failed to allocate host buffer for async uploads for device %s\n", func,
@@ -1604,6 +1613,18 @@ bool llama_model_loader::load_all_data(
             ggml_backend_reg_get_proc_address(reg, "ggml_backend_end_async_upload") : nullptr;
         GGML_ASSERT((begin_async_upload == nullptr) == (end_async_upload == nullptr));
     }
+
+    // Tensors that can be read straight from a direct-IO file descriptor are
+    // deferred and uploaded by a pool of threads. A single thread reading and
+    // copying the whole model saturates neither the NVMe nor the interconnect.
+    struct pending_read { struct ggml_tensor * tensor; size_t offs; size_t size; uint16_t idx; };
+    std::vector<pending_read> pending_reads;
+    int n_load_threads = 1;
+#ifndef _WIN32
+    if (const char * e = getenv("LLAMA_LOAD_THREADS")) {
+        n_load_threads = std::max(1, atoi(e));
+    }
+#endif
 
     for (struct ggml_tensor * cur = ggml_get_first_tensor(ctx); cur != NULL; cur = ggml_get_next_tensor(ctx, cur)) {
         const auto * weight = get_weight(ggml_get_name(cur));
@@ -1732,6 +1753,11 @@ bool llama_model_loader::load_all_data(
                     if (check_tensors && !ggml_validate_row_data(cur->type, src, n_size)) {
                         throw std::runtime_error(format("tensor '%s' has invalid data", ggml_get_name(cur)));
                     }
+                } else if (n_load_threads > 1 && !check_tensors &&
+                           file->has_direct_io() && file->file_id() != -1) {
+                    // read in parallel after the walk; pread() is position-based
+                    // so the shared descriptor is safe to use from many threads
+                    pending_reads.push_back({ cur, weight->offs, n_size, weight->idx });
                 } else {
                     read_buf.resize(n_size);
                     file->seek(weight->offs, SEEK_SET);
@@ -1746,6 +1772,95 @@ bool llama_model_loader::load_all_data(
 
         size_done += n_size;
     }
+
+#ifndef _WIN32
+    if (!pending_reads.empty()) {
+        size_t max_read_size = 0;
+        for (const auto & pr : pending_reads) {
+            const size_t align = files.at(pr.idx)->read_alignment();
+            const size_t skip = pr.offs & (align - 1);
+            max_read_size = std::max(max_read_size, (skip + pr.size + align - 1) & ~(align - 1));
+        }
+        // Each worker retains at most max_read_size bytes, including while waiting to upload.
+        // Keep whole-tensor uploads for backends that require them; an oversized tensor uses one worker.
+        constexpr size_t staging_budget = 256 * 1024 * 1024;
+        const size_t max_staging_workers = std::max<size_t>(1, staging_budget / std::max<size_t>(1, max_read_size));
+        n_load_threads = std::min<size_t>(n_load_threads, std::min(pending_reads.size(), max_staging_workers));
+
+        std::atomic<size_t> next_item{0};
+        std::atomic<bool>   any_failed{false};
+        std::mutex          err_mutex;
+        std::mutex          upload_mutex;
+        std::string         err_msg;
+
+        auto worker = [&]() {
+            void * abuf = nullptr;
+            size_t acap = 0;
+            try {
+                for (;;) {
+                    const size_t i = next_item.fetch_add(1);
+                    if (i >= pending_reads.size() || any_failed.load()) {
+                        break;
+                    }
+                    const pending_read & pr = pending_reads[i];
+                    const auto & f = files.at(pr.idx);
+
+                    const size_t align = f->read_alignment();
+
+                    // O_DIRECT needs the offset, the length and the destination
+                    // all aligned, so read a padded window into an aligned buffer
+                    const off_t  aoff = (off_t) (pr.offs & ~(size_t) (align - 1));
+                    const size_t skip = pr.offs - (size_t) aoff;
+                    const size_t want = (skip + pr.size + align - 1) & ~(size_t) (align - 1);
+
+                    if (want > acap) {
+                        free(abuf);
+                        abuf = nullptr;
+                        if (posix_memalign(&abuf, align, want) != 0) {
+                            throw std::runtime_error("posix_memalign failed during parallel load");
+                        }
+                        acap = want;
+                    }
+
+                    const size_t got = f->read_raw_unsafe_at(abuf, want, aoff);
+                    if (got < skip + pr.size) {
+                        throw std::runtime_error(format("short read for tensor '%s'", ggml_get_name(pr.tensor)));
+                    }
+
+                    // Backend uploads can mutate shared state, including OpenCL conversion kernels.
+                    std::lock_guard<std::mutex> lock(upload_mutex);
+                    ggml_backend_tensor_set(pr.tensor, (char *) abuf + skip, 0, pr.size);
+                }
+            } catch (const std::exception & e) {
+                std::lock_guard<std::mutex> lock(err_mutex);
+                if (!any_failed.exchange(true)) {
+                    err_msg = e.what();
+                }
+            }
+            free(abuf);
+        };
+
+        std::vector<std::thread> pool;
+        pool.reserve(n_load_threads);
+        try {
+            for (int t = 0; t < n_load_threads; ++t) {
+                pool.emplace_back(worker);
+            }
+        } catch (...) {
+            any_failed.store(true);
+            for (auto & t : pool) {
+                t.join();
+            }
+            throw;
+        }
+        for (auto & t : pool) {
+            t.join();
+        }
+        if (any_failed.load()) {
+            throw std::runtime_error(err_msg);
+        }
+    }
+#endif
 
     // free temporary resources used for async uploads
     for (const auto & event : upload.events) {

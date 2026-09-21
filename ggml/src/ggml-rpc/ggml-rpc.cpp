@@ -849,6 +849,9 @@ class rpc_command_queue {
     }
 
   private:
+    std::condition_variable queue_cv;
+    size_t                  queued_bytes = 0;
+
     rpc_command_queue(std::string endpoint, socket_ptr sock) : endpoint(std::move(endpoint)), sock(std::move(sock)) {}
 
     static void signal_failed(rpc_queue_cmd & cmd) {
@@ -866,16 +869,40 @@ class rpc_command_queue {
     }
 
     bool enqueue_locked(rpc_queue_cmd && cmd) {
+        const size_t cmd_bytes = cmd.data.size();
         {
-            std::lock_guard<std::mutex> lock(mutex);
+            std::unique_lock<std::mutex> lock(mutex);
+            // Bound the amount of payload waiting to be sent. A single producer
+            // self-throttles because it blocks reading the next tensor, but with
+            // several producers the queue grows without limit and the process is
+            // OOM-killed. queued_bytes == 0 still admits one oversized command,
+            // so a payload larger than the cap can never deadlock.
+            queue_cv.wait(lock, [&] {
+                return shutdown || failed || queued_bytes == 0 ||
+                       queued_bytes + cmd_bytes <= max_queued_bytes();
+            });
             if (shutdown || failed) {
                 signal_failed(cmd);
                 return false;
             }
+            queued_bytes += cmd_bytes;
             commands.push_back(std::move(cmd));
         }
         cv.notify_one();
         return true;
+    }
+
+    static size_t max_queued_bytes() {
+        static const size_t cap = [] {
+            if (const char * e = getenv("GGML_RPC_QUEUE_MAX_MB")) {
+                const long v = atol(e);
+                if (v > 0) {
+                    return (size_t) v * 1024 * 1024;
+                }
+            }
+            return (size_t) 4 * 1024 * 1024 * 1024; // 4 GiB
+        }();
+        return cap;
     }
 
     bool execute(rpc_queue_cmd & cmd) {
@@ -926,7 +953,13 @@ class rpc_command_queue {
                 cmd = std::move(commands.front());
                 commands.pop_front();
             }
+            const size_t cmd_bytes = cmd.data.size();
             if (execute(cmd)) {
+                {
+                    std::lock_guard<std::mutex> lock(mutex);
+                    queued_bytes -= std::min(queued_bytes, cmd_bytes);
+                }
+                queue_cv.notify_all();
                 continue;
             }
 
@@ -936,6 +969,7 @@ class rpc_command_queue {
                 failed = true;
                 pending.swap(commands);
             }
+            queue_cv.notify_all();
             signal_failed(cmd);
             for (auto & queued : pending) {
                 signal_failed(queued);
