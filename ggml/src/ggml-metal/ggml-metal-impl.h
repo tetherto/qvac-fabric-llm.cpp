@@ -1354,6 +1354,10 @@ typedef struct {
     int32_t  len;
 } ggml_metal_kargs_argsort_merge;
 
+// Use one threadgroup per FWHT row for folded model widths.
+#define GGML_METAL_FWHT_TG_MIN_N 512
+#define GGML_METAL_FWHT_TG_NT    256
+
 typedef struct {
     int32_t nrows;
 } ggml_metal_kargs_fwht;

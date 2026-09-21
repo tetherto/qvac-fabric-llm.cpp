@@ -1668,10 +1668,13 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                 op->src[0]->ne[3] > 0 && op->src[1]->ne[3] > 0 &&
                 op->src[2]->ne[3] % op->src[0]->ne[3] == 0 && op->src[2]->ne[3] % op->src[1]->ne[3] == 0;
         case GGML_OP_MUL_MAT:
-            // the FWHT kernels read an F16 source directly; every other F16 src1 path
-            // still goes through ggml_metal_supports_mul_mat_op
-            if (op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F16 &&
-                ggml_metal_op_mul_mat_use_fwht(op)) {
+            if (ggml_metal_op_mul_mat_use_fwht(op)) {
+                const int64_t n = op->src[1]->ne[0];
+                if (n >= GGML_METAL_FWHT_TG_MIN_N &&
+                    (dev->mtl_device.maxThreadsPerThreadgroup.width < GGML_METAL_FWHT_TG_NT ||
+                     dev->props.max_theadgroup_memory_size < (size_t) n * sizeof(float))) {
+                    return false;
+                }
                 return has_simdgroup_reduction;
             }
             return ggml_metal_supports_mul_mat_op(

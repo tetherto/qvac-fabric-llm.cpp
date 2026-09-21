@@ -7,7 +7,8 @@
 
 // must stay in sync with the kernel_fwht_<type>_<N> templates in ggml-metal.metal
 static bool ggml_metal_fwht_supported_size(int64_t n) {
-    return n == 64 || n == 128 || n == 256 || n == 512 || n == 1024;
+    return n == 64 || n == 128 || n == 256 || n == 512 || n == 1024 ||
+           n == 2048 || n == 4096 || n == 8192;
 }
 
 // supports_op and dispatch must use the same FWHT conditions.
