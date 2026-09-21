@@ -6,6 +6,10 @@
 #include <limits>
 #include <mutex>
 
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+#include "gated-delta-net-split.cuh"
+#endif
+
 namespace {
 
 constexpr int GDN_D = 128;
@@ -430,8 +434,9 @@ static __global__ __launch_bounds__(GDN_THREADS, 1) void gdn_persistent(const bf
 }
 
 struct gdn_workspace {
-    size_t elements = 0;
-    size_t bytes    = 0;
+    bool   value_split = false;
+    size_t elements    = 0;
+    size_t bytes       = 0;
 };
 
 static bool gdn_size_mul(size_t & value, size_t factor) {
@@ -472,9 +477,52 @@ static bool gdn_init(int device) {
     return available[device];
 }
 
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+static bool gdn_split_init(int device) {
+    static std::once_flag once[GGML_CUDA_MAX_DEVICES];
+    static bool           available[GGML_CUDA_MAX_DEVICES] = {};
+    std::call_once(once[device], [device] {
+        ggml_cuda_set_device(device);
+        const auto status =
+            cudaFuncSetAttribute((const void *) gdn_value_split::gdn_fused, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                 gdn_value_split::SHARED_BYTES);
+        available[device] = status == cudaSuccess;
+        if (status != cudaSuccess) {
+            (void) cudaGetLastError();
+        }
+    });
+    return available[device];
+}
+
+static bool gdn_use_value_split(int device, const ggml_cuda_gdn_mma_args & args) {
+    const auto & info = ggml_cuda_info().devices[device];
+    if (!ampere_mma_available(info.cc) || (info.cc != GGML_CUDA_CC_BLACKWELL && info.cc != GGML_CUDA_CC_DGX_SPARK) ||
+        args.n_tokens < 512 || args.n_tokens > INT_MAX - gdn_value_split::CHUNK || args.n_seqs > 65535 ||
+        args.n_seqs > (info.nsm - 1) / args.H) {
+        return false;
+    }
+    // Four independent value slices increase the block count when heads/sequences underfill the GPU.
+    // The fused loads require contiguous Q/K and head-contiguous V; other layouts use the existing path.
+    const uintptr_t input_alignment = uintptr_t(args.q) | uintptr_t(args.k) | uintptr_t(args.v);
+    return (input_alignment & 15) == 0 && args.rq3 == 1 && args.sq1 == GDN_D && args.sq2 == GDN_D * args.H_k &&
+           args.sq3 == args.n_tokens * args.sq2 && args.sv1 == GDN_D && args.sv2 % 4 == 0 &&
+           args.sv3 == args.n_tokens * args.sv2 && args.sb1 == 1 && args.sb2 == args.H &&
+           args.sb3 == args.n_tokens * args.H && gdn_split_init(device);
+}
+#endif
+
 static bool gdn_plan(int device, const ggml_cuda_gdn_mma_args & args, gdn_workspace & workspace) {
     if (!args.eligible || (args.H != 16 && args.H != 32 && args.H != 48 && args.H != 64) || args.H_k != 16 ||
-        args.n_tokens < 64 || args.n_seqs <= 0 || !gdn_init(device)) {
+        args.n_tokens < 64 || args.n_seqs <= 0) {
+        return false;
+    }
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    if (gdn_use_value_split(device, args)) {
+        workspace.value_split = true;
+        return true;
+    }
+#endif
+    if (!gdn_init(device)) {
         return false;
     }
     const int cc = ggml_cuda_info().devices[device].cc;
@@ -496,7 +544,7 @@ static bool gdn_plan(int device, const ggml_cuda_gdn_mma_args & args, gdn_worksp
         return false;
     }
 
-    workspace = { elements, bytes };
+    workspace = { false, elements, bytes };
     return true;
 }
 
@@ -521,8 +569,20 @@ size_t ggml_cuda_gdn_mma_get_alloc_size(int device, const ggml_cuda_gdn_mma_args
 
 bool ggml_cuda_gdn_mma_launch(int device, const ggml_cuda_gdn_mma_args & args, cudaStream_t stream) {
     gdn_workspace workspace;
-    if (!args.workspace || !args.state_out || !gdn_plan(device, args, workspace) ||
-        workspace.bytes > args.workspace_size) {
+    if (!args.state_out || !gdn_plan(device, args, workspace)) {
+        return false;
+    }
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    if (workspace.value_split) {
+        gdn_value_split::gdn_fused<<<dim3(args.H * 4, args.n_seqs), gdn_value_split::NTHREADS,
+                                     gdn_value_split::SHARED_BYTES, stream>>>(
+            args.n_tokens, args.H_k, args.H, GDN_D, args.q, args.k, args.v, args.g, args.beta, args.dst, args.state,
+            args.state_out, args.sv2);
+        CUDA_CHECK(cudaGetLastError());
+        return true;
+    }
+#endif
+    if (!args.workspace || workspace.bytes > args.workspace_size) {
         return false;
     }
     auto *    q      = static_cast<bf16 *>(args.workspace);
