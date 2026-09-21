@@ -121,6 +121,8 @@ jobs:
 
   # TODO: provision AMX-compatible machine
   #cpu-amx:
+  #  needs: authorize
+  #  if: needs.authorize.outputs.allowed == 'true'
   #  runs-on: [self-hosted, Linux, CPU, AMX]
 
   #  steps:
