@@ -215,6 +215,8 @@ jobs:
 
   # TODO: provision AMD GPU machine
   # amd-vulkan:
+  #   needs: authorize
+  #   if: needs.authorize.outputs.allowed == 'true'
   #   runs-on: [self-hosted, Linux, AMD]
 
   #   steps:
