@@ -18,17 +18,8 @@ concurrency:
     group: ${{ github.workflow }}-${{ github.event.pull_request.number || (github.ref == 'refs/heads/master' && github.run_id) || github.ref }}
     cancel-in-progress: true
 
-permissions:
-    contents: read
-
 jobs:
-    authorize:
-        permissions: {}
-        uses: ./.github/workflows/reusable-authorize-self-hosted.yml
-
     pre-tokenizer-hashes:
-        needs: authorize
-        if: needs.authorize.outputs.allowed == 'true'
         runs-on: [self-hosted, fast]
 
         steps:

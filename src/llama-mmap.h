@@ -29,6 +29,10 @@ struct llama_file {
 
     virtual void read_raw(void * ptr, size_t len) = 0;
     virtual void read_raw_unsafe(void * ptr, size_t len) { read_raw(ptr, len); }
+#ifndef _WIN32
+    // Position-independent read; returns zero if unsupported. Direct IO requires aligned arguments.
+    virtual size_t read_raw_unsafe_at(void *, size_t, size_t) const { return 0; }
+#endif
     virtual void read_aligned_chunk(void * dest, size_t size) { read_raw(dest, size); }
     virtual uint32_t read_u32() = 0;
 
@@ -55,6 +59,9 @@ struct llama_file_disk : public llama_file {
 
     void read_raw(void * ptr, size_t len) override;
     void read_raw_unsafe(void * ptr, size_t len) override;
+#ifndef _WIN32
+    size_t read_raw_unsafe_at(void * ptr, size_t len, size_t offset) const override;
+#endif
     void read_aligned_chunk(void * dest, size_t size) override;
     uint32_t read_u32() override;
 

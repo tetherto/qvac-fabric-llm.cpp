@@ -25,13 +25,7 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  authorize:
-    permissions: {}
-    uses: ./.github/workflows/reusable-authorize-self-hosted.yml
-
   python-type-check:
-    needs: authorize
-    if: needs.authorize.outputs.allowed == 'true'
     runs-on: qvac-ubuntu2404-x64
     name: python type-check
     steps:

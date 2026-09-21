@@ -59,13 +59,7 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  authorize:
-    permissions: {}
-    uses: ./.github/workflows/reusable-authorize-self-hosted.yml
-
   server:
-    needs: authorize
-    if: needs.authorize.outputs.allowed == 'true'
     runs-on: [self-hosted, CPU, Linux, llama-server]
 
     strategy:
