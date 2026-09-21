@@ -715,8 +715,10 @@ class ModelBase:
         )
         weight_names: list[str] = []
         inverse_weight_names: list[str] = []
+
         def unavailable_tensor() -> Tensor:
             raise AssertionError("tensor data is unavailable during metadata validation")
+
         for record in tensor_records:
             if not isinstance(record, dict) or not isinstance(record.get("name"), str):
                 raise ValueError("Hadamard manifest has an invalid tensor record")
