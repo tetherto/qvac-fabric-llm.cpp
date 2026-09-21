@@ -42,7 +42,9 @@ static float max_quantization_error_for(ggml_type type) {
         case GGML_TYPE_Q1_0:    return MAX_QUANTIZATION_TOTAL_ERROR_BINARY;
         case GGML_TYPE_TQ1_0:
         case GGML_TYPE_TQ2_0:
-        case GGML_TYPE_Q2_0:    return MAX_QUANTIZATION_TOTAL_ERROR_TERNARY;
+        case GGML_TYPE_Q2_0:
+        case GGML_TYPE_PQ2_0:
+        case GGML_TYPE_PTQ1_0:  return MAX_QUANTIZATION_TOTAL_ERROR_TERNARY;
         case GGML_TYPE_TBQ3_0:
         case GGML_TYPE_TBQ4_0:
         case GGML_TYPE_TBQ3_0_64:
@@ -72,7 +74,9 @@ static float max_dot_product_error_for(ggml_type type) {
         case GGML_TYPE_Q1_0:    return MAX_DOT_PRODUCT_ERROR_BINARY;
         case GGML_TYPE_TQ1_0:
         case GGML_TYPE_TQ2_0:
-        case GGML_TYPE_Q2_0:    return MAX_DOT_PRODUCT_ERROR_TERNARY;
+        case GGML_TYPE_Q2_0:
+        case GGML_TYPE_PQ2_0:
+        case GGML_TYPE_PTQ1_0:  return MAX_DOT_PRODUCT_ERROR_TERNARY;
         case GGML_TYPE_TBQ3_0:
         case GGML_TYPE_TBQ4_0:
         case GGML_TYPE_TBQ3_0_64:
