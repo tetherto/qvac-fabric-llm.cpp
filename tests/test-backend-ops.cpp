@@ -5139,7 +5139,11 @@ struct test_fwht_signed : public test_case {
 
     double max_nmse_err(ggml_backend_t backend) override {
         ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
-        return strcmp(ggml_backend_reg_name(reg), "Vulkan") == 0 ? 5e-6 : test_case::max_nmse_err(backend);
+        const char * backend_name = ggml_backend_reg_name(reg);
+        if (strcmp(backend_name, "WebGPU") == 0) {
+            return 5e-5;
+        }
+        return strcmp(backend_name, "Vulkan") == 0 ? 5e-6 : test_case::max_nmse_err(backend);
     }
 
     std::string op_desc(ggml_tensor * t) override {

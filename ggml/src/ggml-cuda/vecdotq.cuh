@@ -864,7 +864,7 @@ static __device__ __forceinline__ float vec_dot_ptq1_0_q8_1(const void * __restr
     const block_ptq1_0 * bq      = (const block_ptq1_0 *) vbq + kbx;
     int                  sumi[4] = { 0, 0, 0, 0 };
 
-#    pragma unroll
+#    pragma unroll 4
     for (int m = 0; m < 16; ++m) {
         uint32_t v = bq->qs[m];
 #    pragma unroll
@@ -877,7 +877,7 @@ static __device__ __forceinline__ float vec_dot_ptq1_0_q8_1(const void * __restr
         }
     }
 
-#    pragma unroll
+#    pragma unroll 4
     for (int m = 0; m < 8; ++m) {
         uint32_t v = bq->qs[16 + m];
 #    pragma unroll
