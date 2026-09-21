@@ -131,6 +131,13 @@ jobs:
           python3 -m venv .venv
           .venv/bin/pip install -r tools/server/tests/requirements.txt
 
+      # QVAC-24501: the harness binds a fixed 8080 unless PORT is set, and both
+      # legs can land on one fleet host. Colliding legs either fail to bind or -
+      # worse - one leg's tests drive the other leg's server and pass against a
+      # binary built with the wrong sanitizer.
+      - name: Pick a server port for this runner
+        run: echo "PORT=$(.github/scripts/pick-server-port.sh)" >> "$GITHUB_ENV"
+
       - name: Tests
         id: server_integration_tests
         if: ${{ (!matrix.disabled_on_pr || !github.event.pull_request) }}

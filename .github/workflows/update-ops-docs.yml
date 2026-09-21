@@ -18,18 +18,23 @@ permissions:
     contents: read
 
 jobs:
+    runner_names:
+        permissions:
+            contents: read
+        uses: ./.github/workflows/reusable-runner-names.yml
+
     authorize:
         permissions: {}
         uses: ./.github/workflows/reusable-authorize-self-hosted.yml
 
     update-ops-docs:
-        needs: authorize
+        needs: [authorize, runner_names]
         if: needs.authorize.outputs.allowed == 'true'
         # QVAC-24501: upstream's [self-hosted, fast, ARM64] needs a custom `fast`
         # label the qvac fleet does not carry. The job only runs
         # scripts/create_ops_docs.py and diffs the result, so it does not need
         # ARM64 either - the general-purpose fleet CPU box is enough.
-        runs-on: qvac-ubuntu2404-x64
+        runs-on: ${{ needs.runner_names.outputs.qvac_ubuntu2404_x64 }}
 
         steps:
         - name: Checkout repository

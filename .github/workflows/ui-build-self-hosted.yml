@@ -2,16 +2,18 @@ name: UI Build (self-hosted)
 
 on:
   workflow_call:
+    inputs:
+      # QVAC-24501: taken from the caller rather than declared here. A reusable
+      # workflow's own runner_names job is a second hosted job per run echoing
+      # the same constants, and ui-self-hosted.yml already runs one.
+      runs_on:
+        description: "Runner label for the build job, from the caller's runner_names job"
+        required: true
+        type: string
 
 jobs:
-  runner_names:
-    permissions:
-      contents: read
-    uses: ./.github/workflows/reusable-runner-names.yml
-
   build:
-    needs: runner_names
-    runs-on: ${{ needs.runner_names.outputs.qvac_ubuntu2404_x64 }}
+    runs-on: ${{ inputs.runs_on }}
     timeout-minutes: 20
     env:
       BRANCH_NAME: ${{ github.head_ref || github.ref_name }}

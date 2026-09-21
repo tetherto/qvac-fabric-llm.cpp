@@ -62,9 +62,11 @@ jobs:
 
   ui-build:
     name: Build static output
-    needs: authorize
+    needs: [authorize, runner_names]
     if: needs.authorize.outputs.allowed == 'true'
     uses: ./.github/workflows/ui-build-self-hosted.yml
+    with:
+      runs_on: ${{ needs.runner_names.outputs.qvac_ubuntu2404_x64 }}
 
   ui-checks:
     name: Checks

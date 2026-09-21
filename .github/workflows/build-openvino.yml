@@ -41,6 +41,18 @@ jobs:
   # No authorize job here: its only consumer was ubuntu-24-openvino, now if:false.
   # Left in place it would still request the fork-ci environment on a fork PR and
   # ask a required reviewer to approve a gate that gates nothing.
+  #
+  # RESTORE IT BEFORE FLIPPING `if: false` BACK, or a fork PR runs arbitrary code
+  # on [self-hosted, Linux, Intel, OpenVINO]. Nothing checks this for you - the
+  # validator never looks at authorize:
+  #
+  #   authorize:
+  #     permissions: {}
+  #     uses: ./.github/workflows/reusable-authorize-self-hosted.yml
+  #
+  #   ubuntu-24-openvino:
+  #     needs: authorize
+  #     if: needs.authorize.outputs.allowed == 'true'
   ubuntu-24-openvino:
     # QVAC-24501: needs Intel + OpenVINO hardware the fleet does not have, so this
     # queued 24h and was cancelled on every run. openvino-windows-2022 below stays

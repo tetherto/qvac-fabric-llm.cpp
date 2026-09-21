@@ -46,6 +46,9 @@ const ADDON_WORKFLOWS = new Set([
   'server-self-hosted.yml',
   'server-sanitize.yml',
   'build-cmake-pkg.yml',
+  'build-sanitize.yml',
+  'pre-tokenizer-hashes.yml',
+  'update-ops-docs.yml',
 ])
 
 const KEY = '[a-z][a-z0-9_]*'
@@ -246,10 +249,121 @@ export function hasRunnerNamesJob(source) {
   return /^\s+runner_names:\s*$/m.test(source) && source.includes(`uses: ${REUSABLE_USES}`)
 }
 
+const RUNNER_NAMES_OUTPUTS = 'needs.runner_names.outputs'
+
+/**
+ * Split a workflow into its jobs. Line-based, like the rest of this module: a
+ * job owns every line until the next key at its own indent.
+ */
+export function parseJobs(source) {
+  const lines = source.split(/\r?\n/)
+  const jobs = []
+  let inJobs = false
+  let jobIndent = null
+  let current = null
+
+  const close = () => {
+    if (current) jobs.push(current)
+    current = null
+  }
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i]
+    if (!inJobs) {
+      if (/^jobs:\s*$/.test(line)) inJobs = true
+      continue
+    }
+    // A key back at column 0 ends the mapping.
+    if (line.trim() !== '' && !/^\s/.test(line)) {
+      close()
+      inJobs = false
+      continue
+    }
+
+    const key = line.match(/^(\s+)([A-Za-z_][\w.-]*):\s*(.*)$/)
+    if (key) {
+      const indent = key[1].length
+      if (jobIndent === null) jobIndent = indent
+      if (indent === jobIndent) {
+        close()
+        current = { name: key[2], line: i + 1, indent, lines: [] }
+        continue
+      }
+    }
+    if (current) current.lines.push(line)
+  }
+  close()
+  return jobs
+}
+
+function unquote(token) {
+  return token.trim().replace(/^['"]|['"]$/g, '')
+}
+
+/** Derived, not assumed: workflows here nest at both 2 and 4 spaces. */
+function propertyIndentOf(job) {
+  let indent = null
+  for (const line of job.lines) {
+    const key = line.match(/^(\s+)[A-Za-z_][\w.-]*:/)
+    if (!key) continue
+    if (indent === null || key[1].length < indent) indent = key[1].length
+  }
+  return indent
+}
+
+/** Job names listed in a job's own `needs:`, in any of the three YAML forms. */
+export function declaredNeeds(job) {
+  const needs = []
+  const propertyIndent = propertyIndentOf(job)
+  if (propertyIndent === null) return needs
+
+  for (let i = 0; i < job.lines.length; i++) {
+    const line = job.lines[i]
+    const match = line.match(/^(\s+)needs:\s*(.*?)\s*$/)
+    // Indent check: the job's own `needs:`, not one inside a step script.
+    if (!match || match[1].length !== propertyIndent) continue
+
+    const value = match[2].replace(/\s+#.*$/, '').trim()
+    if (value === '') {
+      // Block sequence.
+      for (let j = i + 1; j < job.lines.length; j++) {
+        const item = job.lines[j].match(/^\s+-\s*(.+?)\s*$/)
+        if (!item) break
+        needs.push(unquote(item[1]))
+      }
+      continue
+    }
+
+    const array = value.match(/^\[(.*)\]$/)
+    if (array) needs.push(...array[1].split(',').map(unquote).filter(Boolean))
+    else needs.push(unquote(value))
+  }
+
+  return needs
+}
+
+/**
+ * Two ways a consumer loses its label - no `runner_names` job in the file, or a
+ * job reading its outputs without depending on it. Both resolve `runs-on` to
+ * the empty string and leave the job unschedulable while the YAML stays valid.
+ */
 export function findMissingRunnerNamesNeeds(relativePath, source) {
-  if (!source.includes('needs.runner_names.outputs')) return []
-  if (hasRunnerNamesJob(source)) return []
-  return [{ file: relativePath, message: `references needs.runner_names.outputs but has no runner_names job using ${REUSABLE_USES}` }]
+  if (!source.includes(RUNNER_NAMES_OUTPUTS)) return []
+  if (!hasRunnerNamesJob(source)) {
+    return [{ file: relativePath, message: `references ${RUNNER_NAMES_OUTPUTS} but has no runner_names job using ${REUSABLE_USES}` }]
+  }
+
+  const findings = []
+  for (const job of parseJobs(source)) {
+    if (!job.lines.some((line) => line.includes(RUNNER_NAMES_OUTPUTS))) continue
+    if (declaredNeeds(job).includes('runner_names')) continue
+    findings.push({
+      file: relativePath,
+      line: job.line,
+      message: `job "${job.name}" reads ${RUNNER_NAMES_OUTPUTS} but does not list runner_names in its own needs:`,
+    })
+  }
+  return findings
 }
 
 function sameSet(a, b) {

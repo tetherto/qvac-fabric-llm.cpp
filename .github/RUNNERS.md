@@ -8,9 +8,10 @@ single file instead of grepping every workflow.
 ## Scope
 
 This catalog is deliberately narrow. It manages **only** the `qvac-*` fleet
-labels in QVAC-authored workflows (`build-self-hosted.yml`, `ui-self-hosted.yml`,
-`ui-build-self-hosted.yml`, `python-*`, `code-style`, `check-vendor`,
-`editorconfig`). It does **not** touch:
+labels, in the workflows listed in `ADDON_WORKFLOWS`
+([`.github/scripts/lib/runner-names.mjs`](./scripts/lib/runner-names.mjs)) —
+that list is the enforcement boundary, and a workflow wired to the catalog but
+missing from it is not validated at all. It does **not** touch:
 
 - GitHub rolling aliases (`ubuntu-latest`, …) or upstream llama.cpp hosted images
   (`ubuntu-24.04`, `windows-2025`, `macos-26`, …)
@@ -43,11 +44,41 @@ jobs:
     steps: ...
 ```
 
+A reusable workflow called with `uses:` cannot read the caller's `needs:`, so it
+takes the label as a `workflow_call` input instead of declaring its own
+`runner_names` job — see `ui-build-self-hosted.yml`. A second `runner_names` job
+would otherwise burn another GitHub-hosted job per run to echo the same
+constants.
+
+## Wiring a job to the catalog
+
+Both lines matter. `runs-on:` is evaluated before any step runs, so a job that
+reads `needs.runner_names.outputs.*` without listing `runner_names` in its own
+`needs:` resolves the label to the empty string and becomes unschedulable while
+the YAML stays valid:
+
+```yaml
+jobs:
+  runner_names:
+    permissions:
+      contents: read
+    uses: ./.github/workflows/reusable-runner-names.yml
+
+  my-job:
+    needs: [authorize, runner_names]   # runner_names, not just authorize
+    if: needs.authorize.outputs.allowed == 'true'
+    runs-on: ${{ needs.runner_names.outputs.qvac_ubuntu2404_x64 }}
+```
+
+`validate-runner-names.mjs` checks this per job, and also fails a workflow that
+adds a new entry to `ADDON_WORKFLOWS`-listed files while hardcoding a catalog
+label.
+
 ## Changing a label
 
 1. Edit `.github/runners.yaml`.
 2. Regenerate: `node .github/scripts/sync-runner-names.mjs`
 3. Test: `node --test .github/scripts/test/runner-names.test.mjs`
 
-CI enforces both invariants via
+CI enforces all of it via
 [`runner-names-validate.yml`](./workflows/runner-names-validate.yml).

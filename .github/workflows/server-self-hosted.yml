@@ -90,6 +90,12 @@ jobs:
           source venv/bin/activate
           pip install -r requirements.txt
 
+      # QVAC-24501: the harness binds a fixed 8080 unless PORT is set, and this
+      # Mac runs several runner accounts - build-self-hosted.yml's GPU lanes are
+      # routinely on it at the same time.
+      - name: Pick a server port for this runner
+        run: echo "PORT=$(.github/scripts/pick-server-port.sh)" >> "$GITHUB_ENV"
+
       - name: Tests (GPUx1)
         id: server_integration_tests
         if: ${{ !github.event.pull_request }}
@@ -151,6 +157,12 @@ jobs:
           source venv/bin/activate
           pip install -r requirements.txt
 
+      # QVAC-24501: same fixed-8080 problem. The box has one physical GPU already
+      # shared by four build lanes, so these four tests.sh runs contend for VRAM
+      # too - that part needs fleet capacity, not a workflow change.
+      - name: Pick a server port for this runner
+        run: echo "PORT=$(.github/scripts/pick-server-port.sh)" >> "$GITHUB_ENV"
+
       - name: Tests (GPUx1)
         id: server_integration_tests
         if: ${{ !github.event.pull_request }}
@@ -187,10 +199,13 @@ jobs:
           ./tests.sh
 
   server-kleidiai:
-    # QVAC-24501: ah-ubuntu_22_04-c8g_8x is an upstream Actuated Graviton4 pool.
-    # The fleet has no arm64 Linux runner, so this queued 24h and was cancelled on
-    # every run. Same call as cpu-arm64-graviton4-kleidiai in build-self-hosted.yml.
-    if: false  # no matching hardware
+    # QVAC-24501: ah-ubuntu_22_04-c8g_8x is an Actuated pool - a third-party
+    # service upstream subscribes to, not a GitHub image - and the fleet has no
+    # arm64 Linux box to repoint it at. Never executed a step here: every run
+    # queued to the 24h ceiling and was cancelled.
+    # TO RESTORE: add an arm64 Linux fleet runner and a catalog entry, or
+    # subscribe to Actuated. See QVAC-23796.
+    if: false  # no runner: arm64 Linux, Actuated-only pool
     runs-on: ah-ubuntu_22_04-c8g_8x
 
     steps:
