@@ -950,7 +950,8 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
         params.cors_origins = "localhost";
     }
 
-    // pad tensor_buft_overrides for llama_params_fit:
+    // Pad writable space for llama_params_fit with null entries, preserving
+    // the terminator required by common_model_params_to_llama (including back()).
     const size_t ntbo = llama_max_tensor_buft_overrides();
     while (params.tensor_buft_overrides.size() < ntbo) {
         params.tensor_buft_overrides.push_back({nullptr, nullptr});
