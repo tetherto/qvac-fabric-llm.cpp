@@ -950,8 +950,6 @@ static size_t ggml_backend_cuda_buffer_type_get_alloc_size(ggml_backend_buffer_t
     size_t size;
     if (tensor->op == GGML_OP_FLASH_ATTN_EXT) {
         size = ggml_cuda_flash_attn_ext_get_alloc_size(buft_ctx->device, tensor);
-    } else if (tensor->op == GGML_OP_GATED_DELTA_NET) {
-        size = ggml_cuda_gated_delta_net_get_alloc_size(buft_ctx->device, tensor);
     } else {
         size = ggml_nbytes(tensor);
     }

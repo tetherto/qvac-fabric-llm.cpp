@@ -2,7 +2,6 @@
 
 #include "common.cuh"
 
-#include <cstddef>
 #include <cstdint>
 
 struct ggml_cuda_gdn_mma_args {
@@ -14,8 +13,6 @@ struct ggml_cuda_gdn_mma_args {
     const float * state;
     float *       dst;
     float *       state_out;
-    void *        workspace;
-    size_t        workspace_size;
 
     int64_t H;
     int64_t H_k;
@@ -36,5 +33,4 @@ struct ggml_cuda_gdn_mma_args {
 };
 
 bool ggml_cuda_gdn_mma_available(int device, const ggml_cuda_gdn_mma_args & args);
-size_t ggml_cuda_gdn_mma_get_alloc_size(int device, const ggml_cuda_gdn_mma_args & args, size_t logical_size);
 bool ggml_cuda_gdn_mma_launch(int device, const ggml_cuda_gdn_mma_args & args, cudaStream_t stream);

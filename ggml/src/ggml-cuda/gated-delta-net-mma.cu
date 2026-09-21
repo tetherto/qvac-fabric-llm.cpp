@@ -1,491 +1,405 @@
+// Chunked value tiling follows lukdmine/llama.cpp gdn-fused-v2, b6ceb2f6703ed70c3ddf62330b3f57aeae487207.
 #include "gated-delta-net-mma.cuh"
-#include "common.cuh"
 #include "mma.cuh"
 
 #include <climits>
-#include <limits>
 #include <mutex>
 
-#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
-#include "gated-delta-net-split.cuh"
-#endif
-
 namespace {
-
-constexpr int GDN_D = 128;
-constexpr int GDN_WARPS = 8;
-constexpr int GDN_THREADS = 32 * GDN_WARPS;
+constexpr int D     = 128;
+constexpr int WARPS = 8;
+using bf16          = nv_bfloat16;
 #ifdef GGML_USE_HIP
-constexpr int GDN_CHUNK = 32;
-constexpr int GDN_N = 16;
+constexpr int N = 16;
 #else
-constexpr int GDN_CHUNK = 64;
-constexpr int GDN_N = 8;
+constexpr int N = 8;
 #endif
 
-using bf16 = nv_bfloat16;
+template <int R, int C> struct matrix {
+    bf16 hi[R * C], lo[R * C];
 
-// Buffers alias only after their consumers have finished. The ROCm chunk
-// leaves enough LDS for the full BF16 state within the 64 KiB block limit.
-struct alignas(128) gdn_shared {
-    union {
-        bf16 q[GDN_CHUNK * GDN_D];
-        bf16 value_hi[GDN_CHUNK * GDN_D];
-    };
-    bf16 k[GDN_CHUNK * GDN_D];
-    bf16 qk[GDN_CHUNK * GDN_CHUNK];
-    float inverse[GDN_CHUNK * GDN_CHUNK];
-    union {
-        float lower[GDN_CHUNK * GDN_CHUNK];
-        bf16 state[GDN_D * GDN_D];
-        bf16 value_lo[GDN_CHUNK * GDN_D];
-    };
-    float prefix[GDN_CHUNK];
-    float beta[GDN_CHUNK];
+    static __device__ __forceinline__ int index(int r, int c) {
+#ifdef GGML_USE_HIP
+        return r * C + c;
+#else
+        return r * C + (c ^ ((r & ((C / 8 - 1) & 7)) * 8));
+#endif
+    }
+
+    __device__ __forceinline__ void store2(int r, int c, float2 x) {
+        const int    i                            = index(r, c);
+        const auto   h                            = __float22bfloat162_rn(x);
+        const float2 rounded                      = __bfloat1622float2(h);
+        *reinterpret_cast<nv_bfloat162 *>(hi + i) = h;
+        *reinterpret_cast<nv_bfloat162 *>(lo + i) =
+            __float22bfloat162_rn(make_float2(x.x - rounded.x, x.y - rounded.y));
+    }
+
+    __device__ __forceinline__ void store(int r, int c, float x) {
+        const int  i = index(r, c);
+        const bf16 h = __float2bfloat16(x);
+        hi[i]        = h;
+        lo[i]        = __float2bfloat16(x - __bfloat162float(h));
+    }
 };
 
-__device__ __forceinline__ int gdn_index(int row, int col, int stride) {
-#ifdef GGML_USE_HIP
-    return row * stride + col;
-#else
-    return row * stride + (col ^ ((row & (stride / 8 - 1) & 7) << 3));
-#endif
-}
+template <int C, int V> struct alignas(128) shared {
+    matrix<C, D> q, k;
+    matrix<C, C> p, inverse;
+    matrix<C, V> delta;
+
+    union {
+        matrix<D, V> state;
+        matrix<C, V> solved;
+    } scratch;
+
+    float lower[C * C], prefix[C], beta[C];
+
+    static __device__ __forceinline__ int lower_index(int r, int c) { return r * C + c; }
+};
 
 #if defined(AMPERE_MMA_AVAILABLE) || (defined(AMD_WMMA_AVAILABLE) && defined(RDNA3))
 using namespace ggml_cuda_mma;
-#ifdef GGML_USE_HIP
-using gdn_acc = tile<16, 16, float, DATA_LAYOUT_J_MAJOR>;
-using gdn_a = tile<16, 8, nv_bfloat162, DATA_LAYOUT_I_MAJOR_MIRRORED>;
-using gdn_b = gdn_a;
-#else
-using gdn_acc = tile<16, 8, float>;
-using gdn_a = tile<16, 8, nv_bfloat162>;
-using gdn_b = tile<8, 8, nv_bfloat162>;
-#endif
+#    ifdef GGML_USE_HIP
+using acc    = tile<16, 16, float, DATA_LAYOUT_J_MAJOR>;
+using a_tile = tile<16, 8, nv_bfloat162, DATA_LAYOUT_I_MAJOR_MIRRORED>;
+using b_tile = a_tile;
+#    else
+using acc    = tile<16, 8, float>;
+using a_tile = tile<16, 8, nv_bfloat162>;
+using b_tile = tile<8, 8, nv_bfloat162>;
+#    endif
 
-template<int stride_t, bool transpose_t = false>
-struct gdn_bf16_view {
-    const bf16 * data;
-    __device__ __forceinline__ float get(int row, int col) const {
-        return __bfloat162float(data[transpose_t ? gdn_index(col, row, stride_t) : gdn_index(row, col, stride_t)]);
+template <class T, bool TRANS, int R, int C>
+__device__ __forceinline__ T load(const matrix<R, C> & m, int row, int col, bool low) {
+    T            t;
+    const bf16 * data = low ? m.lo : m.hi;
+#    ifdef GGML_USE_HIP
+#        pragma unroll
+    for (int i = 0; i < T::ne; ++i) {
+        const int  r = row + T::get_i(i), c = col + 2 * T::get_j(i);
+        const bf16 x = data[TRANS ? m.index(c, r) : m.index(r, c)];
+        const bf16 y = data[TRANS ? m.index(c + 1, r) : m.index(r, c + 1)];
+        t.x[i]       = __float22bfloat162_rn(make_float2(__bfloat162float(x), __bfloat162float(y)));
     }
-};
-
-struct gdn_inverse_view {
-    const float * data;
-    __device__ __forceinline__ float get(int row, int col) const {
-        return data[row * GDN_CHUNK + col];
-    }
-};
-
-struct gdn_key_low_view {
-    const bf16 * data;
-    int64_t stride;
-    int valid;
-    __device__ __forceinline__ float get(int row, int col) const {
-        return row < valid ? __bfloat162float(data[row * stride + col]) : 0.0f;
-    }
-};
-
-template<class tile_t, bool low_t = false, class view_t>
-__device__ __forceinline__ tile_t gdn_load(const view_t & src, int row, int col) {
-    tile_t result;
-#pragma unroll
-    for (int i = 0; i < tile_t::ne; ++i) {
-        const int r = row + tile_t::get_i(i);
-        const int c = col + 2 * tile_t::get_j(i);
-        float x = src.get(r, c);
-        float y = src.get(r, c + 1);
-        if constexpr (low_t) {
-            x -= __bfloat162float(__float2bfloat16(x));
-            y -= __bfloat162float(__float2bfloat16(y));
-        }
-        result.x[i] = __float22bfloat162_rn(make_float2(x, y));
-    }
-    return result;
-}
-
-template<int k_t, class a_view_t, class b_view_t>
-__device__ __forceinline__ void gdn_product(gdn_acc & acc, const a_view_t & a, const b_view_t & b, int row, int col) {
-#pragma unroll
-    for (int k = 0; k < k_t; k += 16) {
-        const auto ra = gdn_load<gdn_a>(a, row, k);
-        const auto rb = gdn_load<gdn_b>(b, col, k);
-        mma(acc, ra, rb);
-    }
-}
-
-__device__ __forceinline__ void gdn_store_value(gdn_shared & smem, const gdn_acc & acc, int row, int col) {
-#pragma unroll
-    for (int i = 0; i < gdn_acc::ne; ++i) {
-        const int index = gdn_index(col + gdn_acc::get_j(i), row + gdn_acc::get_i(i), GDN_D);
-        const bf16 hi = __float2bfloat16(acc.x[i]);
-        smem.value_hi[index] = hi;
-        smem.value_lo[index] = __float2bfloat16(acc.x[i] - __bfloat162float(hi));
-    }
-}
-#endif
-
-static __global__ void gdn_prepack(
-        const float * q, const float * k, bf16 * packed_q, bf16 * packed_k, bf16 * packed_k_low,
-        int64_t H_k, int64_t tokens, int64_t sequences, int64_t rq3, int64_t sq1, int64_t sq2, int64_t sq3) {
-    const int64_t index = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
-    if (index >= sequences * tokens * H_k * GDN_D) {
-        return;
-    }
-    const int d = index % GDN_D;
-    const int64_t row = index / GDN_D;
-    const int h = row % H_k;
-    const int t = (row / H_k) % tokens;
-    const int seq = row / (H_k * tokens);
-    const int64_t src = (seq / rq3) * sq3 + t * sq2 + h * sq1 + d;
-    packed_q[index] = __float2bfloat16(q[src]);
-    const bf16 high = __float2bfloat16(k[src]);
-    packed_k[index] = high;
-    packed_k_low[index] = __float2bfloat16(k[src] - __bfloat162float(high));
-}
-
-#if defined(AMPERE_MMA_AVAILABLE) || (defined(AMD_WMMA_AVAILABLE) && defined(RDNA3))
-__device__ __forceinline__ void gdn_prepare_chunk(gdn_shared &  smem,
-                                                  const bf16 *  packed_q,
-                                                  const bf16 *  packed_k,
-                                                  const float * g,
-                                                  const float * beta,
-                                                  int64_t       q_offset,
-                                                  int64_t       chunk,
-                                                  int           valid,
-                                                  int           seq,
-                                                  int           head,
-                                                  int64_t       H_k,
-                                                  int64_t       sb1,
-                                                  int64_t       sb2,
-                                                  int64_t       sb3,
-                                                  float         scale) {
+#    else
     const int lane = threadIdx.x;
-    const int warp = threadIdx.y;
-    const int tid  = warp * 32 + lane;
-    for (int i = tid; i < GDN_CHUNK * GDN_D; i += GDN_THREADS) {
-        const int     t     = i / GDN_D;
-        const int     d     = i % GDN_D;
-        const int64_t src   = q_offset + (chunk + t) * H_k * GDN_D + d;
-        const int     index = gdn_index(t, d, GDN_D);
-        smem.q[index]       = t < valid ? packed_q[src] : __float2bfloat16(0.0f);
-        smem.k[index]       = t < valid ? packed_k[src] : __float2bfloat16(0.0f);
+    int       r, c;
+    if constexpr (TRANS) {
+        r = col + (lane & 15);
+        c = row + (T::I == 16 ? (lane / 16) * 8 : 0);
+    } else {
+        r = row + (lane % T::I);
+        c = col + ((lane / T::I) & 1) * 8;
     }
-    if (tid == 0) {
-        float prefix = 0.0f;
-        for (int t = 0; t < GDN_CHUNK; ++t) {
-            const int64_t src = seq * sb3 + head * sb1 + (chunk + t) * sb2;
-            prefix += t < valid ? g[src] : 0.0f;
-            smem.prefix[t] = prefix;
-            smem.beta[t]   = t < valid ? beta[src] : 0.0f;
-        }
-    }
-    __syncthreads();
-    const gdn_bf16_view<GDN_D> queries{ smem.q }, keys{ smem.k };
-    for (int tile_index = warp % 4; tile_index < GDN_CHUNK * GDN_CHUNK / (16 * GDN_N); tile_index += 4) {
-        const int row = (tile_index / (GDN_CHUNK / GDN_N)) * 16;
-        const int col = (tile_index % (GDN_CHUNK / GDN_N)) * GDN_N;
-        gdn_acc   acc;
-        if (warp < 4) {
-            gdn_product<GDN_D>(acc, keys, keys, row, col);
+    const unsigned address = (unsigned) __cvta_generic_to_shared(data + m.index(r, c));
+    unsigned *     x       = reinterpret_cast<unsigned *>(t.x);
+    if constexpr (T::I == 16) {
+        if constexpr (TRANS) {
+            asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];"
+                         : "=r"(x[0]), "=r"(x[2]), "=r"(x[1]), "=r"(x[3])
+                         : "r"(address)
+                         : "memory");
         } else {
-            gdn_product<GDN_D>(acc, queries, keys, row, col);
+            asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];"
+                         : "=r"(x[0]), "=r"(x[1]), "=r"(x[2]), "=r"(x[3])
+                         : "r"(address)
+                         : "memory");
         }
-#    pragma unroll
-        for (int i = 0; i < gdn_acc::ne; ++i) {
-            const int r = row + gdn_acc::get_i(i);
-            const int c = col + gdn_acc::get_j(i);
-            if (warp < 4) {
-                smem.lower[r * GDN_CHUNK + c] =
-                    r < valid && c < r ? acc.x[i] * smem.beta[r] * expf(smem.prefix[r] - smem.prefix[c]) : 0.0f;
-            } else {
-                const float x = r < valid && c <= r ? acc.x[i] * scale * expf(smem.prefix[r] - smem.prefix[c]) : 0.0f;
-                smem.qk[gdn_index(r, c, GDN_CHUNK)] = __float2bfloat16(x);
-            }
-        }
-    }
-    __syncthreads();
-    // Invert the unit lower-triangular system in FP32, one row per warp.
-    for (int row = warp; row < GDN_CHUNK; row += GDN_WARPS) {
-        float x[GDN_CHUNK / 32];
-#    pragma unroll
-        for (int j = 0; j < GDN_CHUNK / 32; ++j) {
-            const int col = lane + 32 * j;
-            x[j]          = col == row ? 1.0f : -smem.lower[row * GDN_CHUNK + col];
-        }
-        for (int pivot = row - 1; pivot > 0; --pivot) {
-            const float xp = __shfl_sync(0xffffffff, x[pivot / 32], pivot % 32, 32);
-#    pragma unroll
-            for (int j = 0; j < GDN_CHUNK / 32; ++j) {
-                const int col = lane + 32 * j;
-                if (col < pivot) {
-                    x[j] -= xp * smem.lower[pivot * GDN_CHUNK + col];
-                }
-            }
-        }
-#    pragma unroll
-        for (int j = 0; j < GDN_CHUNK / 32; ++j) {
-            smem.inverse[row * GDN_CHUNK + lane + 32 * j] = x[j];
+    } else {
+        if constexpr (TRANS) {
+            asm volatile("ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%0,%1}, [%2];"
+                         : "=r"(x[0]), "=r"(x[1])
+                         : "r"(address)
+                         : "memory");
+        } else {
+            asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0,%1}, [%2];"
+                         : "=r"(x[0]), "=r"(x[1])
+                         : "r"(address)
+                         : "memory");
         }
     }
-    __syncthreads();
+#    endif
+    return t;
+}
+
+// B is addressed as B-transpose. Preserve both BF16 first-order residual terms.
+template <int K, bool TA = false, bool TB = false, int AR, int AC, int BR, int BC>
+__device__ __forceinline__ void product(acc & c, const matrix<AR, AC> & a, const matrix<BR, BC> & b, int row, int col) {
+#    pragma unroll
+    for (int k = 0; k < K; k += 16) {
+        const auto ah = load<a_tile, TA>(a, row, k, false);
+        const auto al = load<a_tile, TA>(a, row, k, true);
+        const auto bh = load<b_tile, TB>(b, col, k, false);
+        const auto bl = load<b_tile, TB>(b, col, k, true);
+        mma(c, al, bh);
+        mma(c, ah, bl);
+        mma(c, ah, bh);
+    }
+}
+
+template <int R, int C> __device__ __forceinline__ void store(matrix<R, C> & m, const acc & x, int r, int c) {
+#    pragma unroll
+#    ifdef GGML_USE_HIP
+    for (int i = 0; i < acc::ne; ++i) {
+        m.store(r + acc::get_i(i), c + acc::get_j(i), x.x[i]);
+    }
+#    else
+    for (int i = 0; i < acc::ne; i += 2) {
+        m.store2(r + acc::get_i(i), c + acc::get_j(i), make_float2(x.x[i], x.x[i + 1]));
+    }
+#    endif
 }
 #endif
 
-static __global__ __launch_bounds__(GDN_THREADS, 1) void gdn_persistent(const bf16 *  packed_q,
-                                                                        const bf16 *  packed_k,
-                                                                        const bf16 *  packed_k_low,
-                                                                        const float * v,
-                                                                        const float * g,
-                                                                        const float * beta,
-                                                                        const float * state_in,
-                                                                        float *       dst,
-                                                                        float *       state_out,
-                                                                        int64_t       H,
-                                                                        int64_t       H_k,
-                                                                        int64_t       tokens,
-                                                                        int64_t       sb1,
-                                                                        int64_t       sb2,
-                                                                        int64_t       sb3,
-                                                                        int64_t       sv1,
-                                                                        int64_t       sv2,
-                                                                        int64_t       sv3,
-                                                                        float         scale) {
+// Each block owns V independent value columns and advances by C tokens.
+// Keep recurrent state in FP32; pack high/residual BF16 operands inside the block.
+template <int C, int V, int BLOCKS = 1>
+static __global__ __launch_bounds__(256, BLOCKS) void gdn_single(ggml_cuda_gdn_mma_args a) {
 #if defined(AMPERE_MMA_AVAILABLE) || (defined(AMD_WMMA_AVAILABLE) && defined(RDNA3))
-    extern __shared__ __align__(128) unsigned char shared_bytes[];
-    auto &                                         smem         = *reinterpret_cast<gdn_shared *>(shared_bytes);
-    const int                                      lane         = threadIdx.x;
-    const int                                      warp         = threadIdx.y;
-    const int                                      tid          = warp * 32 + lane;
-    const int                                      seq          = blockIdx.x / H;
-    const int                                      head         = blockIdx.x % H;
-    const int                                      value_base   = warp * 16;
-    const int64_t                                  state_offset = ((int64_t) seq * H + head) * GDN_D * GDN_D;
-    const int64_t                                  q_offset     = ((int64_t) seq * tokens * H_k + head % H_k) * GDN_D;
-    const int64_t                                  v_offset     = seq * sv3 + head * sv1;
-    float *                                        out          = dst + ((int64_t) seq * tokens * H + head) * GDN_D;
-    // Each warp owns 16 value rows and keeps their FP32 state across chunks.
-    gdn_acc                                        state[GDN_D / GDN_N];
-
+    static_assert(C >= 16 && (C & (C - 1)) == 0 && V % N == 0 && D % V == 0, "invalid GDN tile");
+    extern __shared__ __align__(128) unsigned char bytes[];
+    auto &                                         s    = *reinterpret_cast<shared<C, V> *>(bytes);
+    const int                                      lane = threadIdx.x, warp = threadIdx.y, tid = warp * 32 + lane;
+    const int                                      slice = blockIdx.x % (D / V);
+    const int                                      h     = (blockIdx.x / (D / V)) % a.H;
+    const int                                      seq   = blockIdx.x / ((D / V) * a.H);
+    const int                                      v0    = slice * V;
+    const int64_t                                  soff  = ((int64_t) seq * a.H + h) * D * D;
+    const int64_t                                  qoff  = (seq / a.rq3) * a.sq3 + (h % a.H_k) * a.sq1;
+    const int64_t                                  voff  = seq * a.sv3 + h * a.sv1 + v0;
+    const int64_t                                  goff  = seq * a.sb3 + h * a.sb1;
+    float *                                        out   = a.dst + ((int64_t) seq * a.n_tokens * a.H + h) * D + v0;
+    constexpr int                                  STATE_TILES = (D / 16) * (V / N);
+    constexpr int                                  PER_WARP    = STATE_TILES / WARPS;
+    static_assert(STATE_TILES % WARPS == 0, "state must divide across warps");
+    acc state[PER_WARP];
 #    pragma unroll
-    for (int j = 0; j < GDN_D / GDN_N; ++j) {
+    for (int j = 0; j < PER_WARP; ++j) {
+        const int tile_index = warp + j * WARPS, r = (tile_index / (V / N)) * 16, c = (tile_index % (V / N)) * N;
 #    pragma unroll
-        for (int i = 0; i < gdn_acc::ne; ++i) {
-            const int row = value_base + gdn_acc::get_i(i);
-            const int col = j * GDN_N + gdn_acc::get_j(i);
-            state[j].x[i] = state_in[state_offset + row * GDN_D + col];
+        for (int i = 0; i < acc::ne; ++i) {
+            state[j].x[i] = a.state[soff + (v0 + c + acc::get_j(i)) * D + r + acc::get_i(i)];
         }
     }
-
-    for (int64_t chunk = 0; chunk < tokens; chunk += GDN_CHUNK) {
-        const int valid = min((int64_t) GDN_CHUNK, tokens - chunk);
-
-        gdn_prepare_chunk(smem, packed_q, packed_k, g, beta, q_offset, chunk, valid, seq, head, H_k, sb1, sb2, sb3,
-                          scale);
-
-        const gdn_bf16_view<GDN_D> queries{ smem.q }, keys{ smem.k };
-
-#    pragma unroll
-        for (int j = 0; j < GDN_D / GDN_N; ++j) {
-#    pragma unroll
-            for (int i = 0; i < gdn_acc::ne; ++i) {
-                smem.state[gdn_index(value_base + gdn_acc::get_i(i), j * GDN_N + gdn_acc::get_j(i), GDN_D)] =
-                    __float2bfloat16(state[j].x[i]);
+    auto read_qk = [&](int64_t t, float4 & q, float4 & k) {
+        t += warp;
+        q = k = make_float4(0, 0, 0, 0);
+        if (t < a.n_tokens) {
+            const int64_t off = qoff + t * a.sq2 + 4 * lane;
+            if ((((uintptr_t) (a.q + off) | (uintptr_t) (a.k + off)) & 15) == 0) {
+                q = *reinterpret_cast<const float4 *>(a.q + off);
+                k = *reinterpret_cast<const float4 *>(a.k + off);
+            } else {
+                q = make_float4(a.q[off], a.q[off + 1], a.q[off + 2], a.q[off + 3]);
+                k = make_float4(a.k[off], a.k[off + 1], a.k[off + 2], a.k[off + 3]);
             }
         }
+    };
+    // Carry the first eight input rows across chunks to hide global-load latency.
+    constexpr bool PREFETCH = C == 16 && V == 32;
+    float4         next_q, next_k;
+    if constexpr (PREFETCH) {
+        read_qk(0, next_q, next_k);
+    }
+    for (int64_t t0 = 0; t0 < a.n_tokens; t0 += C) {
+        const int valid = min((int64_t) C, a.n_tokens - t0);
+#    pragma unroll
+        for (int j = 0; j < C / 8; ++j) {
+            const int t = warp + 8 * j, d = 4 * lane;
+            float4    q, k;
+            if (PREFETCH && j == 0) {
+                q = next_q;
+                k = next_k;
+            } else {
+                read_qk(t0 + 8 * j, q, k);
+            }
+            s.q.store2(t, d, make_float2(q.x * a.scale, q.y * a.scale));
+            s.q.store2(t, d + 2, make_float2(q.z * a.scale, q.w * a.scale));
+            s.k.store2(t, d, make_float2(k.x, k.y));
+            s.k.store2(t, d + 2, make_float2(k.z, k.w));
+        }
+        // Load gates in parallel before the FP32 prefix scan.
+        if (warp == 0) {
+            float carry = 0.f;
+            for (int base = 0; base < C; base += 32) {
+                const int   t    = base + lane;
+                float       g    = t < valid ? a.g[goff + (t0 + t) * a.sb2] : 0.f;
+                const float beta = t < valid ? a.beta[goff + (t0 + t) * a.sb2] : 0.f;
+#    pragma unroll
+                for (int offset = 1; offset < 32; offset *= 2) {
+                    const float previous = __shfl_up_sync(0xffffffff, g, offset, 32);
+                    if (lane >= offset) {
+                        g += previous;
+                    }
+                }
+                g += carry;
+                if (t < C) {
+                    s.prefix[t] = g;
+                    s.beta[t]   = beta;
+                }
+                carry = __shfl_sync(0xffffffff, g, 31, 32);
+            }
+        }
+#    pragma unroll
+        for (int j = 0; j < PER_WARP; ++j) {
+            const int ti = warp + j * WARPS;
+            store(s.scratch.state, state[j], (ti / (V / N)) * 16, (ti % (V / N)) * N);
+        }
         __syncthreads();
-        gdn_acc                    residual[GDN_CHUNK / GDN_N];
-        const gdn_bf16_view<GDN_D> state_view{ smem.state };
-        const gdn_key_low_view     key_low{ packed_k_low + q_offset + chunk * H_k * GDN_D, H_k * GDN_D, valid };
+        if constexpr (PREFETCH) {
+            if (t0 + C < a.n_tokens) {
+                read_qk(t0 + C, next_q, next_k);
+            }
+        }
+        // Each projection warp owns one output tile for this configuration.
+        constexpr bool REGISTER_OUTPUT = C == 16 && V == 32;
+        acc            base_output;
+        auto           project = [&]() {
+            if constexpr (V == 32) {
+                if (warp < 4) {
+                    return;
+                }
+            }
+            for (int ti = (V == 32 ? warp - 4 : warp); ti < (C / 16) * (V / N); ti += (V == 32 ? 4 : WARPS)) {
+                const int r = (ti / (V / N)) * 16, c = (ti % (V / N)) * N;
+                acc       qs, ks;
+                product<D, false, true>(qs, s.q, s.scratch.state, r, c);
+                product<D, false, true>(ks, s.k, s.scratch.state, r, c);
 #    pragma unroll
-        for (int j = 0; j < GDN_CHUNK / GDN_N; ++j) {
-            gdn_acc output;
-
-            gdn_product<GDN_D>(output, state_view, queries, value_base, j * GDN_N);
-
-            gdn_product<GDN_D>(residual[j], state_view, keys, value_base, j * GDN_N);
-            gdn_product<GDN_D>(residual[j], state_view, key_low, value_base, j * GDN_N);
+                for (int i = 0; i < acc::ne; ++i) {
+                    const int   t = r + acc::get_i(i), v = c + acc::get_j(i);
+                    const float decay = expf(s.prefix[t]);
+                    const float vv    = t < valid ? a.v[voff + (t0 + t) * a.sv2 + v] : 0.f;
+                    s.delta.store(t, v, s.beta[t] * (vv - decay * ks.x[i]));
+                    if constexpr (REGISTER_OUTPUT) {
+                        base_output.x[i] = decay * qs.x[i];
+                    } else if (t < valid) {
+                        out[(t0 + t) * a.H * D + v] = decay * qs.x[i];
+                    }
+                }
+            }
+        };
+        for (int ti = warp; ti < 2 * (C / 16) * (C / N) && (V != 32 || warp < 4); ti += (V == 32 ? 4 : WARPS)) {
+            const bool gram = ti < (C / 16) * (C / N);
+            const int  t = ti % ((C / 16) * (C / N)), r = (t / (C / N)) * 16, c = (t % (C / N)) * N;
+            acc        x;
+            if (gram) {
+                product<D>(x, s.k, s.k, r, c);
+            } else {
+                product<D>(x, s.q, s.k, r, c);
+            }
 #    pragma unroll
-            for (int i = 0; i < gdn_acc::ne; ++i) {
-                const int   t     = j * GDN_N + gdn_acc::get_j(i);
-                const int   value = value_base + gdn_acc::get_i(i);
-                const float decay = expf(smem.prefix[t]);
-                const float vv    = t < valid ? v[v_offset + (chunk + t) * sv2 + value] : 0.0f;
-                residual[j].x[i]  = (vv - decay * residual[j].x[i]) * smem.beta[t];
-                if (t < valid) {
-                    out[(chunk + t) * H * GDN_D + value] = scale * decay * output.x[i];
+            for (int i = 0; i < acc::ne; ++i) {
+                const int   rr = r + acc::get_i(i), cc = c + acc::get_j(i);
+                const float v = rr < valid && cc <= rr ? x.x[i] * expf(s.prefix[rr] - s.prefix[cc]) : 0.f;
+                if (gram) {
+                    if (cc < rr) {
+                        s.lower[s.lower_index(rr, cc)] = v * s.beta[rr];
+                    }
+                } else {
+                    s.p.store(rr, cc, v);
                 }
             }
         }
-        __syncthreads();
-#    pragma unroll
-        for (int j = 0; j < GDN_CHUNK / GDN_N; ++j) {
-            gdn_store_value(smem, residual[j], value_base, j * GDN_N);
+        if constexpr (V == 32) {
+            project();
         }
         __syncthreads();
-        const gdn_bf16_view<GDN_D, true> values_hi{ smem.value_hi }, values_lo{ smem.value_lo };
-        gdn_a                            a_hi[GDN_CHUNK / 16], a_lo[GDN_CHUNK / 16];
+        for (int row = warp; row < C; row += WARPS) {
+            float x[(C + 31) / 32];
 #    pragma unroll
-        for (int k = 0; k < GDN_CHUNK / 16; ++k) {
-            a_hi[k] = gdn_load<gdn_a>(values_hi, value_base, k * 16);
-            a_lo[k] = gdn_load<gdn_a>(values_lo, value_base, k * 16);
-        }
-        __syncwarp();
-        // Preserve residuals through the solve: a_hi*b_hi + a_lo*b_hi + a_hi*b_lo.
-        // A single BF16 product loses accuracy for weak/zero-decay sequences.
-        const gdn_inverse_view inverse{ smem.inverse };
-#    pragma unroll
-        for (int j = 0; j < GDN_CHUNK / GDN_N; ++j) {
-            gdn_acc delta;
-#    pragma unroll
-            for (int k = 0; k < GDN_CHUNK / 16; ++k) {
-                const auto b_hi = gdn_load<gdn_b>(inverse, j * GDN_N, k * 16);
-                const auto b_lo = gdn_load<gdn_b, true>(inverse, j * GDN_N, k * 16);
-                mma(delta, a_hi[k], b_hi);
-                mma(delta, a_lo[k], b_hi);
-                mma(delta, a_hi[k], b_lo);
+            for (int j = 0; j < (C + 31) / 32; ++j) {
+                const int col = lane + 32 * j;
+                x[j]          = col == row ? 1.f : (col < row ? -s.lower[s.lower_index(row, col)] : 0.f);
             }
-            gdn_store_value(smem, delta, value_base, j * GDN_N);
-        }
-        __syncthreads();
+            for (int pivot = row - 1; pivot > 0; --pivot) {
+                const float xp = __shfl_sync(0xffffffff, x[pivot / 32], pivot % 32, 32);
 #    pragma unroll
-        for (int k = 0; k < GDN_CHUNK / 16; ++k) {
-            a_hi[k] = gdn_load<gdn_a>(values_hi, value_base, k * 16);
-            a_lo[k] = gdn_load<gdn_a>(values_lo, value_base, k * 16);
-        }
-        __syncthreads();
-        for (int i = tid; i < GDN_CHUNK * GDN_D; i += GDN_THREADS) {
-            const int t = i / GDN_D;
-            const int d = i % GDN_D;
-            smem.q[gdn_index(t, d, GDN_D)] =
-                t < valid ? packed_k_low[q_offset + (chunk + t) * H_k * GDN_D + d] : __float2bfloat16(0.0f);
-        }
-        __syncthreads();
-        const gdn_bf16_view<GDN_CHUNK> qk{ smem.qk };
-
-#    pragma unroll
-        for (int j = 0; j < GDN_CHUNK / GDN_N; ++j) {
-            gdn_acc output;
-#    pragma unroll
-            for (int k = 0; k < GDN_CHUNK / 16; ++k) {
-                const auto b = gdn_load<gdn_b>(qk, j * GDN_N, k * 16);
-                mma(output, a_hi[k], b);
-                mma(output, a_lo[k], b);
+                for (int j = 0; j < (C + 31) / 32; ++j) {
+                    const int col = lane + 32 * j;
+                    if (col < pivot) {
+                        x[j] -= xp * s.lower[s.lower_index(pivot, col)];
+                    }
+                }
             }
 #    pragma unroll
-            for (int i = 0; i < gdn_acc::ne; ++i) {
-                const int t = j * GDN_N + gdn_acc::get_j(i);
-                if (t < valid) {
-                    out[(chunk + t) * H * GDN_D + value_base + gdn_acc::get_i(i)] += output.x[i];
+            for (int j = 0; j < (C + 31) / 32; ++j) {
+                if (lane + 32 * j < C) {
+                    s.inverse.store(row, lane + 32 * j, x[j]);
                 }
             }
         }
-
+        if constexpr (V != 32) {
+            project();
+        }
+        __syncthreads();
+        for (int ti = warp; ti < (C / 16) * (V / N); ti += WARPS) {
+            const int r = (ti / (V / N)) * 16, c = (ti % (V / N)) * N;
+            acc       x;
+            product<C, false, true>(x, s.inverse, s.delta, r, c);
+            store(s.scratch.solved, x, r, c);
+        }
+        __syncthreads();
+        for (int ti = (REGISTER_OUTPUT ? warp - 4 : warp); ti < (C / 16) * (V / N) && (!REGISTER_OUTPUT || warp >= 4);
+             ti += WARPS) {
+            const int r = (ti / (V / N)) * 16, c = (ti % (V / N)) * N;
+            acc       x;
+            product<C, false, true>(x, s.p, s.scratch.solved, r, c);
 #    pragma unroll
-        for (int k = 0; k < GDN_CHUNK / 16; ++k) {
-#    pragma unroll
-            for (int i = 0; i < gdn_a::ne; ++i) {
-                const int    t       = k * 16 + 2 * gdn_a::get_j(i);
-                const float2 hi      = __bfloat1622float2(a_hi[k].x[i]);
-                const float2 lo      = __bfloat1622float2(a_lo[k].x[i]);
-                const float  x       = (hi.x + lo.x) * expf(smem.prefix[valid - 1] - smem.prefix[t]);
-                const float  y       = (hi.y + lo.y) * expf(smem.prefix[valid - 1] - smem.prefix[t + 1]);
-                a_hi[k].x[i]         = __float22bfloat162_rn(make_float2(x, y));
-                const float2 rounded = __bfloat1622float2(a_hi[k].x[i]);
-                a_lo[k].x[i]         = __float22bfloat162_rn(make_float2(x - rounded.x, y - rounded.y));
+            for (int i = 0; i < acc::ne; ++i) {
+                const int t = r + acc::get_i(i), v = c + acc::get_j(i);
+                if (t < valid) {
+                    if constexpr (REGISTER_OUTPUT) {
+                        out[(t0 + t) * a.H * D + v] = base_output.x[i] + x.x[i];
+                    } else {
+                        out[(t0 + t) * a.H * D + v] += x.x[i];
+                    }
+                }
             }
         }
-        const gdn_bf16_view<GDN_D, true> keys_t{ smem.k }, keys_low_t{ smem.q };
-        const float                      decay = expf(smem.prefix[valid - 1]);
+        for (int i = tid; i < C * V; i += 256) {
+            const int   t = i / V, v = i % V, j = s.scratch.solved.index(t, v);
+            const float x = __bfloat162float(s.scratch.solved.hi[j]) + __bfloat162float(s.scratch.solved.lo[j]);
+            s.delta.store(t, v, x * expf(s.prefix[valid - 1] - s.prefix[t]));
+        }
+        __syncthreads();
+        const float decay = expf(s.prefix[valid - 1]);
 #    pragma unroll
-        for (int j = 0; j < GDN_D / GDN_N; ++j) {
+        for (int j = 0; j < PER_WARP; ++j) {
+            const int ti = warp + j * WARPS, r = (ti / (V / N)) * 16, c = (ti % (V / N)) * N;
 #    pragma unroll
-            for (int i = 0; i < gdn_acc::ne; ++i) {
+            for (int i = 0; i < acc::ne; ++i) {
                 state[j].x[i] *= decay;
             }
-#    pragma unroll
-            for (int k = 0; k < GDN_CHUNK / 16; ++k) {
-                const auto b_hi = gdn_load<gdn_b>(keys_t, j * GDN_N, k * 16);
-                const auto b_lo = gdn_load<gdn_b>(keys_low_t, j * GDN_N, k * 16);
-                mma(state[j], a_hi[k], b_hi);
-                mma(state[j], a_lo[k], b_hi);
-                mma(state[j], a_hi[k], b_lo);
-            }
+            product<C, true, true>(state[j], s.k, s.delta, r, c);
         }
         __syncthreads();
     }
-
 #    pragma unroll
-    for (int j = 0; j < GDN_D / GDN_N; ++j) {
+    for (int j = 0; j < PER_WARP; ++j) {
+        const int ti = warp + j * WARPS, r = (ti / (V / N)) * 16, c = (ti % (V / N)) * N;
 #    pragma unroll
-        for (int i = 0; i < gdn_acc::ne; ++i) {
-            state_out[state_offset + (value_base + gdn_acc::get_i(i)) * GDN_D + j * GDN_N + gdn_acc::get_j(i)] =
-                state[j].x[i];
+        for (int i = 0; i < acc::ne; ++i) {
+            a.state_out[soff + (v0 + c + acc::get_j(i)) * D + r + acc::get_i(i)] = state[j].x[i];
         }
     }
-
 #else
-    GGML_UNUSED_VARS(packed_q, packed_k, packed_k_low, v, g, beta, state_in, dst, state_out, H, H_k, tokens, sb1, sb2,
-                     sb3, sv1, sv2, sv3, scale);
+    GGML_UNUSED_VARS(a);
     NO_DEVICE_CODE;
 #endif
 }
 
-struct gdn_workspace {
-    bool   value_split = false;
-    size_t elements    = 0;
-    size_t bytes       = 0;
-};
-
-static bool gdn_size_mul(size_t & value, size_t factor) {
-    if (factor != 0 && value > std::numeric_limits<size_t>::max() / factor) {
-        return false;
-    }
-    value *= factor;
-    return true;
-}
-
-static bool gdn_init(int device) {
+template <int C, int V, int BLOCKS = 1> bool init(int device) {
     static std::once_flag once[GGML_CUDA_MAX_DEVICES];
     static bool           available[GGML_CUDA_MAX_DEVICES] = {};
-    GGML_ASSERT(device >= 0 && device < GGML_CUDA_MAX_DEVICES);
     std::call_once(once[device], [device] {
         ggml_cuda_set_device(device);
-        const auto & info = ggml_cuda_info().devices[device];
-#ifdef GGML_USE_HIP
-        const bool supported = info.cc == GGML_CUDA_CC_OFFSET_AMD + 0x1151;
-#elif defined(GGML_USE_MUSA)
-        const bool supported = false;
-#else
-        // Older PTX can JIT on these GPUs, but lacks the Ampere MMA kernel body.
-        const bool supported = ampere_mma_available(info.cc) &&
-                               (info.cc == GGML_CUDA_CC_BLACKWELL || info.cc == GGML_CUDA_CC_DGX_SPARK);
-#endif
-        if (!supported || sizeof(gdn_shared) > info.smpbo) {
+        if (sizeof(shared<C, V>) > ggml_cuda_info().devices[device].smpbo) {
             return;
         }
-        const cudaError_t status = cudaFuncSetAttribute(
-            (const void *) gdn_persistent, cudaFuncAttributeMaxDynamicSharedMemorySize, sizeof(gdn_shared));
-        available[device] = status == cudaSuccess;
-
-        if (status != cudaSuccess) {
-            (void) cudaGetLastError();
-        }
-    });
-    return available[device];
-}
-
-#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
-static bool gdn_split_init(int device) {
-    static std::once_flag once[GGML_CUDA_MAX_DEVICES];
-    static bool           available[GGML_CUDA_MAX_DEVICES] = {};
-    std::call_once(once[device], [device] {
-        ggml_cuda_set_device(device);
-        const auto status =
-            cudaFuncSetAttribute((const void *) gdn_value_split::gdn_fused, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                 gdn_value_split::SHARED_BYTES);
+        const auto status = cudaFuncSetAttribute((const void *) gdn_single<C, V, BLOCKS>,
+                                                 cudaFuncAttributeMaxDynamicSharedMemorySize, sizeof(shared<C, V>));
         available[device] = status == cudaSuccess;
         if (status != cudaSuccess) {
             (void) cudaGetLastError();
@@ -494,107 +408,66 @@ static bool gdn_split_init(int device) {
     return available[device];
 }
 
-static bool gdn_use_value_split(int device, const ggml_cuda_gdn_mma_args & args) {
+enum class gdn_path { ar, slice32_one_block, slice32_two_blocks, slice64, whole_head };
+
+static gdn_path plan(int device, const ggml_cuda_gdn_mma_args & a) {
+    GGML_ASSERT(device >= 0 && device < GGML_CUDA_MAX_DEVICES);
+    if (!a.eligible || a.H_k != 16 || (a.H != 16 && a.H != 32 && a.H != 48 && a.H != 64) || a.n_tokens < 64 ||
+        a.n_tokens > INT64_MAX - 32 || a.n_seqs <= 0 || a.n_seqs > INT_MAX / (a.H * 4)) {
+        return gdn_path::ar;
+    }
     const auto & info = ggml_cuda_info().devices[device];
-    if (!ampere_mma_available(info.cc) || (info.cc != GGML_CUDA_CC_BLACKWELL && info.cc != GGML_CUDA_CC_DGX_SPARK) ||
-        args.n_tokens < 512 || args.n_tokens > INT_MAX - gdn_value_split::CHUNK || args.n_seqs > 65535 ||
-        args.n_seqs > (info.nsm - 1) / args.H) {
-        return false;
+#ifdef GGML_USE_HIP
+    if (info.cc != GGML_CUDA_CC_OFFSET_AMD + 0x1151 || a.n_tokens < 2048) {
+        return gdn_path::ar;
     }
-    // Four independent value slices increase the block count when heads/sequences underfill the GPU.
-    // The fused loads require contiguous Q/K and head-contiguous V; other layouts use the existing path.
-    const uintptr_t input_alignment = uintptr_t(args.q) | uintptr_t(args.k) | uintptr_t(args.v);
-    return (input_alignment & 15) == 0 && args.rq3 == 1 && args.sq1 == GDN_D && args.sq2 == GDN_D * args.H_k &&
-           args.sq3 == args.n_tokens * args.sq2 && args.sv1 == GDN_D && args.sv2 % 4 == 0 &&
-           args.sv3 == args.n_tokens * args.sv2 && args.sb1 == 1 && args.sb2 == args.H &&
-           args.sb3 == args.n_tokens * args.H && gdn_split_init(device);
-}
+    return init<16, 64>(device) ? gdn_path::slice64 : gdn_path::ar;
+#elif defined(GGML_USE_MUSA)
+    GGML_UNUSED_VARS(info);
+    return gdn_path::ar;
+#else
+    if (!ampere_mma_available(info.cc) || (info.cc != GGML_CUDA_CC_BLACKWELL && info.cc != GGML_CUDA_CC_DGX_SPARK)) {
+        return gdn_path::ar;
+    }
+    // Increase the block count when whole heads do not fill the GPU.
+    if (a.n_tokens >= 512 && a.H * a.n_seqs < info.nsm) {
+        // A grid that already fits in one wave benefits from a larger register budget.
+        if (a.H * a.n_seqs * 4 <= info.nsm) {
+            return init<16, 32, 1>(device) ? gdn_path::slice32_one_block : gdn_path::ar;
+        }
+        return init<16, 32, 2>(device) ? gdn_path::slice32_two_blocks : gdn_path::ar;
+    }
+    if (info.cc == GGML_CUDA_CC_BLACKWELL && (a.H == 16 || a.H == 32 || (a.H == 48 && a.n_tokens < 256))) {
+        return gdn_path::ar;
+    }
+    return init<16, 128>(device) ? gdn_path::whole_head : gdn_path::ar;
 #endif
-
-static bool gdn_plan(int device, const ggml_cuda_gdn_mma_args & args, gdn_workspace & workspace) {
-    if (!args.eligible || (args.H != 16 && args.H != 32 && args.H != 48 && args.H != 64) || args.H_k != 16 ||
-        args.n_tokens < 64 || args.n_seqs <= 0) {
-        return false;
-    }
-#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
-    if (gdn_use_value_split(device, args)) {
-        workspace.value_split = true;
-        return true;
-    }
-#endif
-    if (!gdn_init(device)) {
-        return false;
-    }
-    const int cc = ggml_cuda_info().devices[device].cc;
-    // Use WMMA from the shortest prompt size with a measured win on gfx1151.
-    if (cc == GGML_CUDA_CC_OFFSET_AMD + 0x1151 && args.n_tokens < 2048) {
-        return false;
-    }
-    // Persistent MMA regresses with 16/32 value heads on SM120.
-    if (cc == GGML_CUDA_CC_BLACKWELL && (args.H == 16 || args.H == 32 || (args.H == 48 && args.n_tokens < 256))) {
-        return false;
-    }
-    size_t elements = (size_t) args.n_seqs;
-    if (!gdn_size_mul(elements, args.n_tokens) || !gdn_size_mul(elements, args.H_k) || !gdn_size_mul(elements, GDN_D) ||
-        elements > (size_t) INT_MAX * 256) {
-        return false;
-    }
-    size_t bytes = elements;
-    if (!gdn_size_mul(bytes, 3 * sizeof(bf16))) {
-        return false;
-    }
-
-    workspace = { false, elements, bytes };
-    return true;
 }
-
 }  // namespace
 
-bool ggml_cuda_gdn_mma_available(int device, const ggml_cuda_gdn_mma_args & args) {
-    gdn_workspace workspace;
-    return gdn_plan(device, args, workspace);
+bool ggml_cuda_gdn_mma_available(int device, const ggml_cuda_gdn_mma_args & a) {
+    return plan(device, a) != gdn_path::ar;
 }
 
-size_t ggml_cuda_gdn_mma_get_alloc_size(int device, const ggml_cuda_gdn_mma_args & args, size_t logical_size) {
-    gdn_workspace workspace;
-    if (!gdn_plan(device, args, workspace)) {
-        return logical_size;
-    }
-    constexpr size_t alignment = 128;
-    GGML_ASSERT(logical_size <= SIZE_MAX - (alignment - 1));
-    const size_t offset = (logical_size + alignment - 1) & ~(alignment - 1);
-    GGML_ASSERT(offset <= SIZE_MAX - workspace.bytes);
-    return offset + workspace.bytes;
-}
-
-bool ggml_cuda_gdn_mma_launch(int device, const ggml_cuda_gdn_mma_args & args, cudaStream_t stream) {
-    gdn_workspace workspace;
-    if (!args.state_out || !gdn_plan(device, args, workspace)) {
+bool ggml_cuda_gdn_mma_launch(int device, const ggml_cuda_gdn_mma_args & a, cudaStream_t stream) {
+    if (!a.state_out) {
         return false;
     }
-#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
-    if (workspace.value_split) {
-        gdn_value_split::gdn_fused<<<dim3(args.H * 4, args.n_seqs), gdn_value_split::NTHREADS,
-                                     gdn_value_split::SHARED_BYTES, stream>>>(
-            args.n_tokens, args.H_k, args.H, GDN_D, args.q, args.k, args.v, args.g, args.beta, args.dst, args.state,
-            args.state_out, args.sv2);
-        CUDA_CHECK(cudaGetLastError());
-        return true;
+    const auto path = plan(device, a);
+    if (path == gdn_path::ar) {
+        return false;
+    }
+#ifdef GGML_USE_HIP
+    gdn_single<16, 64><<<a.H * a.n_seqs * 2, dim3(32, 8), sizeof(shared<16, 64>), stream>>>(a);
+#else
+    if (path == gdn_path::slice32_two_blocks) {
+        gdn_single<16, 32, 2><<<a.H * a.n_seqs * 4, dim3(32, 8), sizeof(shared<16, 32>), stream>>>(a);
+    } else if (path == gdn_path::slice32_one_block) {
+        gdn_single<16, 32, 1><<<a.H * a.n_seqs * 4, dim3(32, 8), sizeof(shared<16, 32>), stream>>>(a);
+    } else {
+        gdn_single<16, 128><<<a.H * a.n_seqs, dim3(32, 8), sizeof(shared<16, 128>), stream>>>(a);
     }
 #endif
-    if (!args.workspace || workspace.bytes > args.workspace_size) {
-        return false;
-    }
-    auto *    q      = static_cast<bf16 *>(args.workspace);
-    auto *    k      = q + workspace.elements;
-    auto *    low    = k + workspace.elements;
-    const int blocks = (workspace.elements + 255) / 256;
-    gdn_prepack<<<blocks, 256, 0, stream>>>(args.q, args.k, q, k, low, args.H_k, args.n_tokens, args.n_seqs, args.rq3,
-                                            args.sq1, args.sq2, args.sq3);
-    CUDA_CHECK(cudaGetLastError());
-    gdn_persistent<<<args.n_seqs * args.H, dim3(32, GDN_WARPS), sizeof(gdn_shared), stream>>>(
-        q, k, low, args.v, args.g, args.beta, args.state, args.dst, args.state_out, args.H, args.H_k, args.n_tokens,
-        args.sb1, args.sb2, args.sb3, args.sv1, args.sv2, args.sv3, args.scale);
     CUDA_CHECK(cudaGetLastError());
     return true;
 }

@@ -242,8 +242,6 @@ static ggml_cuda_gdn_mma_args ggml_cuda_gdn_mma_args_from_tensor(const ggml_tens
         (const float *) state->data,
         (float *) dst->data,
         nullptr,
-        nullptr,
-        0,
         H,
         q->ne[1],
         v->ne[2],
@@ -261,13 +259,6 @@ static ggml_cuda_gdn_mma_args ggml_cuda_gdn_mma_args_from_tensor(const ggml_tens
         1.0f / sqrtf((float) S_v),
         g->ne[0] == 1 && ggml_get_op_params_i32(dst, 0) == 1 && S_v == 128 && q->ne[0] == 128,
     };
-}
-
-size_t ggml_cuda_gated_delta_net_get_alloc_size(int device, const ggml_tensor * dst) {
-    const size_t logical_size = ggml_nbytes(dst);
-    GGML_ASSERT(dst->op == GGML_OP_GATED_DELTA_NET);
-    return ggml_cuda_gdn_mma_get_alloc_size(
-        device, ggml_cuda_gdn_mma_args_from_tensor(dst), logical_size);
 }
 
 static void ggml_cuda_op_gated_delta_net_impl(
@@ -347,19 +338,8 @@ static void ggml_cuda_op_gated_delta_net_impl(
     {
         ggml_cuda_gdn_mma_args args = ggml_cuda_gdn_mma_args_from_tensor(dst);
         args.state_out = state_d;
-        if (ggml_cuda_gdn_mma_available(ctx.device, args)) {
-            constexpr size_t workspace_alignment = 128;
-            const size_t logical_size = ggml_nbytes(dst);
-            const size_t allocation_size = ggml_backend_buffer_get_alloc_size(dst->buffer, dst);
-            GGML_ASSERT(logical_size <= SIZE_MAX - (workspace_alignment - 1));
-            const size_t workspace_offset =
-                (logical_size + workspace_alignment - 1) & ~(workspace_alignment - 1);
-            GGML_ASSERT(workspace_offset <= allocation_size);
-            args.workspace = (char *) dst->data + workspace_offset;
-            args.workspace_size = allocation_size - workspace_offset;
-            if (ggml_cuda_gdn_mma_launch(ctx.device, args, stream)) {
-                return;
-            }
+        if (ggml_cuda_gdn_mma_launch(ctx.device, args, stream)) {
+            return;
         }
     }
     if (kda) {
