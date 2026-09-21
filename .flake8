@@ -17,3 +17,8 @@ exclude =
     dist  # This is generated with `python build .` for package releases
     scripts/tune
 # max-complexity = 10
+
+# The XDNA NPU kernel generators are standalone build scripts: they are run by
+# hand or by CMake and report progress on stdout.
+per-file-ignores =
+    ggml/src/ggml-xdna/kernels/*.py:NP100
