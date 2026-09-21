@@ -679,7 +679,9 @@ static bool gdn_plan(int device, const ggml_cuda_gdn_mma_args & args, gdn_worksp
     if (cc == GGML_CUDA_CC_OFFSET_AMD + 0x1151 && args.n_tokens < 2048) {
         return false;
     }
-    if (cc == GGML_CUDA_CC_BLACKWELL && (args.H == 16 || (args.H == 32 && args.n_tokens < 512))) {
+    // Blackwell crossover depends on head count; 32 heads need segmented prefill.
+    if (cc == GGML_CUDA_CC_BLACKWELL &&
+        (args.H == 16 || (args.H == 32 && args.n_tokens < 2048) || (args.H == 48 && args.n_tokens < 256))) {
         return false;
     }
     size_t elements = (size_t) args.n_seqs;
