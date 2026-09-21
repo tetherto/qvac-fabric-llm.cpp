@@ -5,6 +5,7 @@
 #include "unary.cuh"
 #include "vecdotq.cuh"
 
+#include <cstdlib>
 #include <cstdint>
 #include <type_traits>
 #include <utility>
@@ -846,7 +847,7 @@ static __global__ void mul_mat_vec_q(
             std::conditional_t<type == GGML_TYPE_Q2_0, block_q2_0, block_pq2_0>>;
         // These packed AoS formats are scoreboard-latency bound on GB10. Prefetch one
         // K iteration ahead; only the first lane that consumes a quant block issues it.
-#pragma unroll (type == GGML_TYPE_Q2_0 ? 2 : 1)
+#pragma unroll
         for (int kbx = tid / (qi/vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
             const int kby = kbx * (qk/QK8_1);
             const int kqs = vdr * (tid % (qi/vdr));
@@ -1005,6 +1006,7 @@ static __global__ void mul_mat_vec_q(
                 }
             }
         }
+    }
     }
 
     __shared__ float tmp_shared[nwarps - 1 > 0 ? nwarps - 1 : 1][ncols_dst][rows_per_cuda_block][warp_size];
@@ -1276,6 +1278,23 @@ static void mul_mat_vec_q_moe_launch(
         stride_channel_x, stride_channel_y, stride_channel_dst,
         ncols_dst, ids_stride);
 }
+static ggml_cuda_q8_1_layout ggml_cuda_q8_1_layout_host(ggml_type type_src0, int ncols_dst, bool has_ids) {
+    const ggml_cuda_q8_1_layout layout = ggml_cuda_q8_1_layout_for(type_src0, ncols_dst, has_ids);
+#if !defined(GGML_USE_HIP)
+    static const bool batch_invariant = std::getenv("GGML_CUDA_BATCH_INVARIANT") != nullptr;
+    if (layout == GGML_CUDA_Q8_1_SOA_ISUM && batch_invariant) {
+        return GGML_CUDA_Q8_1_PT;
+    }
+    if (layout == GGML_CUDA_Q8_1_SOA_ISUM) {
+        const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+        if (GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_AMPERE && cc < GGML_CUDA_CC_ADA_LOVELACE) {
+            return GGML_CUDA_Q8_1_PT;
+        }
+    }
+#endif
+    return layout;
+}
+
 
 template <ggml_type type, bool cutlass_layout = false>
 static void mul_mat_vec_q_switch_ncols_dst(

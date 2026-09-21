@@ -1062,24 +1062,6 @@ static constexpr __host__ __device__ ggml_cuda_q8_1_layout ggml_cuda_q8_1_layout
 #endif
 }
 
-// Host-side wrapper used by both the quantizer call and the kernel switch.
-// Under GGML_CUDA_BATCH_INVARIANT the one-column case must run the same arithmetic as 2-8
-// columns, so it takes the planar layout (the SoA vec-dot sums in a different order).
-// Ampere (sm_80/86, including the 3060/3090/170HX): the #218 PT kernel wins at one column
-// too (+5.9% tg128 vs SoA on a 3060). Ada and newer keep SOA_ISUM at one column (4070 win).
-static inline ggml_cuda_q8_1_layout ggml_cuda_q8_1_layout_host(ggml_type type_src0, int ncols_dst, bool has_ids) {
-    const ggml_cuda_q8_1_layout l = ggml_cuda_q8_1_layout_for(type_src0, ncols_dst, has_ids);
-    if (l == GGML_CUDA_Q8_1_SOA_ISUM && ggml_cuda_batch_invariant()) {
-        return GGML_CUDA_Q8_1_PT;
-    }
-    if (l == GGML_CUDA_Q8_1_SOA_ISUM) {
-        const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
-        if (GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_AMPERE && cc < GGML_CUDA_CC_ADA_LOVELACE) {
-            return GGML_CUDA_Q8_1_PT;
-        }
-    }
-    return l;
-}
 
 // Warp-transposed (SoA) q8_1 activation layout for the ternary MMVQ.
 //
