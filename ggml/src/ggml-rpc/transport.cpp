@@ -8,6 +8,7 @@
 #  endif
 #  include <windows.h>
 #  include <winsock2.h>
+#  include <ws2tcpip.h>
 #else
 #  include <arpa/inet.h>
 #  include <errno.h>
@@ -935,15 +936,20 @@ socket_ptr socket_t::connect(const char * host, int port, int timeout_ms) {
         close_socket(sockfd);
         return nullptr;
     };
-    struct sockaddr_in addr;
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(port);
-    struct hostent * server = gethostbyname(host);
-    if (server == NULL) {
+
+    struct addrinfo hints = {};
+    hints.ai_family   = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+    char port_str[16];
+    snprintf(port_str, sizeof(port_str), "%d", port);
+    struct addrinfo * servinfo = nullptr;
+    if (getaddrinfo(host, port_str, &hints, &servinfo) != 0 || servinfo == nullptr) {
         LOG_ERROR("Cannot resolve host '%s'\n", host);
         return fail();
     }
-    memcpy(&addr.sin_addr.s_addr, server->h_addr, server->h_length);
+    struct sockaddr_in addr;
+    memcpy(&addr, servinfo->ai_addr, sizeof(addr));
+    freeaddrinfo(servinfo);
     if (timeout_ms >= 0) {
         if (!set_non_blocking(sockfd, true)) {
             return fail();
