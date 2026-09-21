@@ -158,14 +158,17 @@ static bool run_graph(
     std::vector<float> previous_full(ggml_nelements(full));
     std::vector<float> previous_first(ggml_nelements(first));
     std::vector<float> previous_second(ggml_nelements(second));
+    const std::pair<ggml_tensor *, std::vector<float> *> replay_outputs[] = {
+        { full, &previous_full },
+        { first, &previous_first },
+        { second, &previous_second },
+    };
     for (int i = 0; i < repeats; ++i) {
         if (ggml_backend_graph_compute(backend, graph) != GGML_STATUS_SUCCESS) {
             return false;
         }
         ggml_backend_synchronize(backend);
-        for (const auto & item : { std::make_pair(full, &previous_full),
-                                  std::make_pair(first, &previous_first),
-                                  std::make_pair(second, &previous_second) }) {
+        for (const auto & item : replay_outputs) {
             std::vector<float> current(ggml_nelements(item.first));
             ggml_backend_tensor_get(item.first, current.data(), 0, ggml_nbytes(item.first));
             if (i > 0 && current != *item.second) {
