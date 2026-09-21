@@ -43,15 +43,9 @@ jobs:
     uses: ./.github/workflows/reusable-authorize-self-hosted.yml
 
   ubuntu-24-openvino:
-    # QVAC-24501: needs Intel + OpenVINO hardware, not present in the fleet, so
-    # this queued for 24h and was killed on every run. Same convention as the
-    # gated jobs in build-self-hosted.yml. Note openvino-windows-2022 below is
-    # deliberately left running - it is on a GitHub image and passes, so it
-    # keeps our only OpenVINO build coverage.
-    #
-    # No `needs: authorize` here: the fork-ci gate (QVAC-24629) only matters for
-    # jobs that can reach the fleet, and this one never starts. Same shape as
-    # gpu-rocm and the other `if: false` jobs in build-self-hosted.yml.
+    # QVAC-24501: needs Intel + OpenVINO hardware the fleet does not have, so this
+    # queued 24h and was cancelled on every run. openvino-windows-2022 below stays
+    # enabled - it is on a GitHub image and keeps our only OpenVINO coverage.
     if: false  # QVAC-23796: no matching hardware
     runs-on: [self-hosted, Linux, Intel, OpenVINO]
 
