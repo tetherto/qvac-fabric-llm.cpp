@@ -25,14 +25,19 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  runner_names:
+    permissions:
+      contents: read
+    uses: ./.github/workflows/reusable-runner-names.yml
+
   authorize:
     permissions: {}
     uses: ./.github/workflows/reusable-authorize-self-hosted.yml
 
   check-vendor:
-    needs: authorize
+    needs: [authorize, runner_names]
     if: needs.authorize.outputs.allowed == 'true'
-    runs-on: qvac-ubuntu2404-x64
+    runs-on: ${{ needs.runner_names.outputs.qvac_ubuntu2404_x64 }}
 
     steps:
       - name: Checkout

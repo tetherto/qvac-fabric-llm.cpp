@@ -6,7 +6,11 @@ on:
 
 jobs:
   find-related:
-    if: github.event.action == 'opened'
+    # QVAC-24501: [self-hosted, opencode] is an upstream agent pool with no
+    # equivalent in the fleet, so every issue opened here started a job that
+    # queued 24h and was cancelled. Disabled rather than repointed - the steps
+    # need the opencode CLI, not just any Linux runner.
+    if: false  # no matching hardware
     runs-on: [self-hosted, opencode]
 
     permissions:

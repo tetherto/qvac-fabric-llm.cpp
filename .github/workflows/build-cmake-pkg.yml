@@ -4,8 +4,16 @@ on:
   workflow_call:
 
 jobs:
+  runner_names:
+    permissions:
+      contents: read
+    uses: ./.github/workflows/reusable-runner-names.yml
+
+  # Dormant: workflow_dispatch/workflow_call only, and nothing calls it today.
+  # Repointed anyway so the first caller does not inherit a 24h queue timeout.
   linux:
-    runs-on: [self-hosted, Linux, CPU]
+    needs: runner_names
+    runs-on: ${{ needs.runner_names.outputs.qvac_ubuntu2204_x64 }}
     steps:
       - uses: actions/checkout@v6
         with:

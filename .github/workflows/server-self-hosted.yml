@@ -57,8 +57,16 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  runner_names:
+    permissions:
+      contents: read
+    uses: ./.github/workflows/reusable-runner-names.yml
+
+  # No authorize gate here: this workflow has no pull_request trigger, only
+  # workflow_dispatch and push to master, so a fork cannot reach these runners.
   server-metal:
-    runs-on: [self-hosted, llama-server, macOS, ARM64]
+    needs: runner_names
+    runs-on: ${{ needs.runner_names.outputs.qvac_macos26_arm64_gpu }}
 
     steps:
       - name: Clone
@@ -118,7 +126,8 @@ jobs:
           ./tests.sh
 
   server-cuda:
-    runs-on: [self-hosted, llama-server, Linux, NVIDIA]
+    needs: runner_names
+    runs-on: ${{ needs.runner_names.outputs.qvac_ubuntu2204_x64_gpu }}
 
     steps:
       - name: Clone
@@ -178,6 +187,10 @@ jobs:
           ./tests.sh
 
   server-kleidiai:
+    # QVAC-24501: ah-ubuntu_22_04-c8g_8x is an upstream Actuated Graviton4 pool.
+    # The fleet has no arm64 Linux runner, so this queued 24h and was cancelled on
+    # every run. Same call as cpu-arm64-graviton4-kleidiai in build-self-hosted.yml.
+    if: false  # no matching hardware
     runs-on: ah-ubuntu_22_04-c8g_8x
 
     steps:

@@ -4,8 +4,14 @@ on:
   workflow_call:
 
 jobs:
+  runner_names:
+    permissions:
+      contents: read
+    uses: ./.github/workflows/reusable-runner-names.yml
+
   build:
-    runs-on: qvac-ubuntu2404-x64
+    needs: runner_names
+    runs-on: ${{ needs.runner_names.outputs.qvac_ubuntu2404_x64 }}
     timeout-minutes: 20
     env:
       BRANCH_NAME: ${{ github.head_ref || github.ref_name }}

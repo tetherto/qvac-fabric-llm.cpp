@@ -59,14 +59,19 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  runner_names:
+    permissions:
+      contents: read
+    uses: ./.github/workflows/reusable-runner-names.yml
+
   authorize:
     permissions: {}
     uses: ./.github/workflows/reusable-authorize-self-hosted.yml
 
   server:
-    needs: authorize
+    needs: [authorize, runner_names]
     if: needs.authorize.outputs.allowed == 'true'
-    runs-on: [self-hosted, CPU, Linux, llama-server]
+    runs-on: ${{ needs.runner_names.outputs.qvac_ubuntu2204_x64 }}
 
     strategy:
       matrix:
