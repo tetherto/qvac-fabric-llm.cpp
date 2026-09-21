@@ -664,9 +664,18 @@ class ModelBase:
             signs = manifest.get("signs")
             if not isinstance(signs, dict) or not signs:
                 raise ValueError("explicit sign mode requires a signs table")
-            for width_str, vec in sorted(signs.items(), key=lambda kv: int(kv[0])):
-                width = int(width_str)
-                # Keep converter validation aligned with runtime validation.
+            sign_items: list[tuple[int, list[int]]] = []
+            for width_str, vec in signs.items():
+                if not isinstance(width_str, str) or not isinstance(vec, list):
+                    raise ValueError("Hadamard signs must map string widths to integer vectors")
+                try:
+                    width = int(width_str)
+                except ValueError as exc:
+                    raise ValueError(f"Invalid Hadamard sign width: {width_str!r}") from exc
+                if any(not isinstance(v, int) for v in vec):
+                    raise ValueError(f"invalid sign vector for width {width}")
+                sign_items.append((width, vec))
+            for width, vec in sorted(sign_items):
                 if width <= 0 or width % block_size != 0:
                     raise ValueError(
                         f"sign width {width} must be positive and a multiple of block size {block_size}"
@@ -674,7 +683,7 @@ class ModelBase:
                 if len(vec) != width or any(v not in (-1, 1) for v in vec):
                     raise ValueError(f"invalid sign vector for width {width}")
                 sign_widths.append(width)
-                sign_values.extend(int(v) for v in vec)
+                sign_values.extend(vec)
 
         tensor_records = manifest.get("tensors")
         if not isinstance(tensor_records, list) or not tensor_records:
@@ -706,6 +715,8 @@ class ModelBase:
         )
         weight_names: list[str] = []
         inverse_weight_names: list[str] = []
+        def unavailable_tensor() -> Tensor:
+            raise AssertionError("tensor data is unavailable during metadata validation")
         for record in tensor_records:
             if not isinstance(record, dict) or not isinstance(record.get("name"), str):
                 raise ValueError("Hadamard manifest has an invalid tensor record")
@@ -714,7 +725,7 @@ class ModelBase:
             role = record.get("role", "fold-before-matmul")
             if role not in ("fold-before-matmul", "inverse-after-lookup"):
                 raise ValueError(f"Unsupported Hadamard tensor role for {record['name']!r}: {role!r}")
-            filtered = self.filter_tensors((record["name"], lambda: None))
+            filtered = self.filter_tensors((record["name"], unavailable_tensor))
             if filtered is None:
                 raise ValueError(f"Hadamard tensor is filtered out: {record['name']!r}")
             mapped = self.map_tensor_name(filtered[0])
