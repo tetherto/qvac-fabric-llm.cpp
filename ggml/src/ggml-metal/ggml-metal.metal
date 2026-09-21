@@ -9286,6 +9286,7 @@ kernel void kernel_fwht(
         constant ggml_metal_kargs_fwht & args,
         device const src_t * src,
         device float * dst,
+        device const float * signs,
         uint3  tgpig[[threadgroup_position_in_grid]],
         ushort sgitg[[simdgroup_index_in_threadgroup]],
         ushort tiisg[[thread_index_in_simdgroup]],
@@ -9301,6 +9302,8 @@ kernel void kernel_fwht(
     if (r >= args.nrows) {
         return;
     }
+    signs += args.n_blk > 0 ? (r % args.n_blk) * N : 0;
+
 
     src += r * N;
     dst += r * N;
@@ -9309,7 +9312,8 @@ kernel void kernel_fwht(
 
     float reg[NE];
     for (int i = 0; i < NE; i++) {
-        reg[i] = src[i*NW + lane]*scale;
+        const float s = args.n_blk > 0 ? signs[i*NW + lane] : 1.0f;
+        reg[i] = float(src[i*NW + lane])*s*scale;
     }
     for (int i = 1; i < NW; i *= 2) {
         for (int j = 0; j < NE; j++) {
@@ -9340,6 +9344,7 @@ kernel void kernel_fwht_tg(
         constant ggml_metal_kargs_fwht & args,
         device const src_t * src,
         device float * dst,
+        device const float * signs,
         uint3  tgpig[[threadgroup_position_in_grid]],
         ushort sgitg[[simdgroup_index_in_threadgroup]],
         ushort tiisg[[thread_index_in_simdgroup]],
@@ -9356,6 +9361,8 @@ kernel void kernel_fwht_tg(
     if (r >= args.nrows) {
         return;
     }
+    signs += args.n_blk > 0 ? (r % args.n_blk) * N : 0;
+
 
     src += r * N;
     dst += r * N;
@@ -9364,7 +9371,8 @@ kernel void kernel_fwht_tg(
 
     float reg[NE];
     for (int i = 0; i < NE; i++) {
-        reg[i] = float(src[i*NT + tid])*scale;
+        const float s = args.n_blk > 0 ? signs[i*NT + tid] : 1.0f;
+        reg[i] = float(src[i*NT + tid])*s*scale;
     }
 
     for (int i = 1; i < NW; i *= 2) {

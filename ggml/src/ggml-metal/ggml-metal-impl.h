@@ -1360,6 +1360,7 @@ typedef struct {
 
 typedef struct {
     int32_t nrows;
+    int32_t n_blk;
 } ggml_metal_kargs_fwht;
 
 typedef struct {
