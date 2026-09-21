@@ -55,6 +55,10 @@ int ggml_metal_try_gdn_cache_fusion(
         int node_idx,
         const struct ggml_tensor ** cache,
         int64_t * slot_stride);
+// mat-mat vs mat-vec dispatch; used by both supports_op and ggml_metal_op_mul_mat*
+bool ggml_metal_op_mul_mat_use_fwht (const struct ggml_tensor * op);
+bool ggml_metal_op_mul_mat_use_mm   (const struct ggml_tensor * op, bool has_simdgroup_mm);
+bool ggml_metal_op_mul_mat_id_use_mm(const struct ggml_tensor * op, bool has_simdgroup_mm);
 
 #ifdef __cplusplus
 }
