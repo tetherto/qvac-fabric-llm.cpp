@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <map>
 #include <mutex>
 #include <set>
 #include <thread>
@@ -23,17 +24,18 @@ static size_t tensor_elements(int i) { return 256 + 8 * i; }
 struct fixture {
     std::vector<std::string> paths;
     size_t first_elements;
+    bool uniform;
 
-    size_t elements(int i) const { return i == 0 ? first_elements : tensor_elements(i); }
+    size_t elements(int i) const { return uniform || i == 0 ? first_elements : tensor_elements(i); }
 
-    fixture(int n_splits, size_t first_elements = 256) : first_elements(first_elements) {
+    fixture(int n_splits, size_t first_elements = 256, bool uniform = false) : first_elements(first_elements), uniform(uniform) {
         for (int split = 0; split < n_splits; ++split) {
             char path[] = "test-model-load-direct-io-XXXXXX";
             int fd = mkstemp(path);
             check(fd >= 0, "mkstemp failed");
             close(fd);
             paths.emplace_back(path);
-            ggml_context_ptr ctx(ggml_init({1024 * 1024 + first_elements * sizeof(float), nullptr, false}));
+            ggml_context_ptr ctx(ggml_init({1024 * 1024 + first_elements * sizeof(float) * (uniform ? n_tensors : 1), nullptr, false}));
             gguf_context_ptr meta(gguf_init_empty());
             gguf_set_val_str(meta.get(), "general.architecture", "llama");
             if (n_splits > 1) {
@@ -152,12 +154,47 @@ struct async_upload_state {
     }
 };
 
-static void test_load(fixture & f, int threads, bool validate, bool async = false) {
+struct staging_usage {
+    std::mutex mutex;
+    std::map<std::thread::id, size_t> capacities;
+
+    size_t retained_bytes() const {
+        size_t total = 0;
+        for (const auto & entry : capacities) {
+            total += entry.second;
+        }
+        return total;
+    }
+};
+
+struct tracked_file : llama_file_disk {
+    staging_usage & usage;
+
+    tracked_file(const char * path, staging_usage & usage) : llama_file_disk(path, "rb", true), usage(usage) {}
+
+    size_t read_raw_unsafe_at(void * ptr, size_t len, size_t offset) const override {
+        {
+            std::lock_guard<std::mutex> lock(usage.mutex);
+            auto & capacity = usage.capacities[std::this_thread::get_id()];
+            capacity = std::max(capacity, len);
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        return llama_file_disk::read_raw_unsafe_at(ptr, len, offset);
+    }
+};
+
+static void test_load(fixture & f, int threads, bool validate, bool async = false, bool track_staging = false) {
     setenv("LLAMA_LOAD_THREADS", std::to_string(threads).c_str(), 1);
     llama_model_loader loader(nullptr, nullptr, nullptr,
             load_input_variant::fname_load_input{f.paths.front(), f.paths}, nullptr,
             LLAMA_LOAD_MODE_DIRECT_IO, validate, false, false, nullptr, nullptr);
     loader.init_mappings(false, nullptr);
+    staging_usage usage;
+    if (track_staging) {
+        for (size_t i = 0; i < f.paths.size(); ++i) {
+            loader.files[i] = std::make_unique<tracked_file>(f.paths[i].c_str(), usage);
+        }
+    }
     ggml_context_ptr ctx(ggml_init({ggml_tensor_overhead() * n_tensors, nullptr, true}));
 
     upload_state state;
@@ -186,6 +223,15 @@ static void test_load(fixture & f, int threads, bool validate, bool async = fals
     }
     llama_buf_map buffers = {{0, buffer.get()}};
     check(loader.load_all_data(loader.size_data, ctx.get(), buffers, nullptr, nullptr, nullptr), "load failed");
+    if (track_staging) {
+        fprintf(stderr, "staging: %zu workers retained %zu bytes\n", usage.capacities.size(), usage.retained_bytes());
+        if (f.first_elements * sizeof(float) > 256 * 1024 * 1024) {
+            check(usage.capacities.size() == 1, "oversized tensor did not limit staging to one worker");
+        } else {
+            check(usage.capacities.size() > 1, "staging test did not exercise parallel reads");
+            check(usage.retained_bytes() <= 256 * 1024 * 1024, "parallel staging exceeded the shared memory budget");
+        }
+    }
     if (async) {
         check(async_state.uploads > n_tensors, "async loader did not split the large tensor into chunks");
         check(!async_state.host_buffers.empty(), "async staging buffers were not allocated");
@@ -194,7 +240,7 @@ static void test_load(fixture & f, int threads, bool validate, bool async = fals
         }
     }
     check(!state.overlap, "backend uploads ran concurrently");
-    if (threads > 1 && !validate) {
+    if (threads > 1 && !validate && !track_staging) {
         check(state.threads.size() > 1, "parallel loader was not exercised");
     }
     for (int i = 0; i < n_tensors; ++i) {
@@ -222,7 +268,11 @@ int main() {
         }
         fixture large(1, 20 * 1024 * 1024);
         test_load(large, 1, false, true);
-        fprintf(stderr, "PASS: direct-IO tensor data, serialized uploads and misaligned async staging buffers\n");
+        fixture parallel(1, 6 * 1024 * 1024, true);
+        test_load(parallel, 32, false, false, true);
+        fixture oversized(1, 68 * 1024 * 1024);
+        test_load(oversized, 32, false, false, true);
+        fprintf(stderr, "PASS: direct-IO tensor data, serialized uploads, misaligned async buffers and bounded parallel staging\n");
     } catch (const std::exception & e) {
         fprintf(stderr, "FAIL: %s\n", e.what());
         return 1;

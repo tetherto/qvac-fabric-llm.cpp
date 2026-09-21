@@ -1775,6 +1775,18 @@ bool llama_model_loader::load_all_data(
 
 #ifndef _WIN32
     if (!pending_reads.empty()) {
+        size_t max_read_size = 0;
+        for (const auto & pr : pending_reads) {
+            const size_t align = files.at(pr.idx)->read_alignment();
+            const size_t skip = pr.offs & (align - 1);
+            max_read_size = std::max(max_read_size, (skip + pr.size + align - 1) & ~(align - 1));
+        }
+        // Each worker retains at most max_read_size bytes, including while waiting to upload.
+        // Keep whole-tensor uploads for backends that require them; an oversized tensor uses one worker.
+        constexpr size_t staging_budget = 256 * 1024 * 1024;
+        const size_t max_staging_workers = std::max<size_t>(1, staging_budget / std::max<size_t>(1, max_read_size));
+        n_load_threads = std::min<size_t>(n_load_threads, std::min(pending_reads.size(), max_staging_workers));
+
         std::atomic<size_t> next_item{0};
         std::atomic<bool>   any_failed{false};
         std::mutex          err_mutex;
@@ -1829,7 +1841,6 @@ bool llama_model_loader::load_all_data(
         };
 
         std::vector<std::thread> pool;
-        n_load_threads = std::min<size_t>(n_load_threads, pending_reads.size());
         pool.reserve(n_load_threads);
         try {
             for (int t = 0; t < n_load_threads; ++t) {
