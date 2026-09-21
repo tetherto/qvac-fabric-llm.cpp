@@ -377,7 +377,8 @@ static bool checked_add_size(size_t a, size_t b, size_t & result) {
 static bool checked_rpc_tensor_size(const rpc_tensor & tensor, size_t & tensor_size) {
     const ggml_type type = (ggml_type) tensor.type;
     const size_t block_size = ggml_blck_size(type);
-    if (tensor.ne[0] % block_size != 0) {
+    const size_t type_size  = ggml_type_size(type);
+    if (block_size == 0 || type_size == 0 || tensor.ne[0] % block_size != 0) {
         return false;
     }
 
@@ -390,7 +391,7 @@ static bool checked_rpc_tensor_size(const rpc_tensor & tensor, size_t & tensor_s
     }
 
     size_t data_size;
-    if (!checked_mul_size(ggml_type_size(type), tensor.ne[0] / block_size, data_size)) {
+    if (!checked_mul_size(type_size, tensor.ne[0] / block_size, data_size)) {
         return false;
     }
     for (uint32_t i = 1; i < GGML_MAX_DIMS; i++) {

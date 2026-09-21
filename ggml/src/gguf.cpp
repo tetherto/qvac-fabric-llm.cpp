@@ -775,18 +775,24 @@ static struct gguf_context * gguf_init_from_reader(const struct gguf_reader & gr
             }
             const size_t  type_size = ggml_type_size(info.t.type);
             const int64_t blck_size = ggml_blck_size(info.t.type);
-
+            const char *  type_name = ggml_type_name(info.t.type);
+            if (type_size == 0 || blck_size == 0 || type_name == nullptr) {
+                GGML_LOG_ERROR("%s: tensor '%s' has unregistered ggml type %d\n",
+                    __func__, info.t.name, (int) info.t.type);
+                ok = false;
+                break;
+            }
             // check that row size is divisible by block size
-            if (blck_size == 0 || info.t.ne[0] % blck_size != 0) {
+            if (info.t.ne[0] % blck_size != 0) {
                 GGML_LOG_ERROR("%s: tensor '%s' of type %d (%s) has %" PRId64 " elements per row, "
                     "not a multiple of block size (%" PRId64 ")\n",
-                    __func__, info.t.name, (int) info.t.type, ggml_type_name(info.t.type), info.t.ne[0], blck_size);
+                    __func__, info.t.name, (int) info.t.type, type_name, info.t.ne[0], blck_size);
                 ok = false;
                 break;
             }
 
             // check that the size of the tensor in bytes is representable
-            if (ok && uint64_t(ggml_nelements(&info.t)/ggml_blck_size(info.t.type)) > SIZE_MAX/ggml_type_size(info.t.type)) {
+            if (uint64_t(ggml_nelements(&info.t)/blck_size) > SIZE_MAX/type_size) {
                 GGML_LOG_ERROR("%s: tensor '%s' with shape (%" PRIi64 ", %" PRIi64 ", %" PRIi64 ", %" PRIi64 ") has a size in bytes > %zu\n",
                     __func__, info.t.name, info.t.ne[0], info.t.ne[1], info.t.ne[2], info.t.ne[3], SIZE_MAX);
                 ok = false;

@@ -99,6 +99,11 @@ typedef sycl::half2 ggml_half2;
 #define QI2_0 (QK2_0 / 32)
 #define QR2_0 1
 
+#define QI_PQ2_0 (QK_PQ2_0 / 32)
+#define QR_PQ2_0 1
+#define QI_PTQ1_0 (QK_PTQ1_0 / 32)
+#define QR_PTQ1_0 1
+
 
 #define QI4_0 (QK4_0 / (4 * QR4_0))
 #define QR4_0 2
@@ -193,6 +198,23 @@ typedef struct {
     uint8_t qs[QK2_0 / 4];   // 2 bits per element
 } block_q2_0;
 static_assert(sizeof(block_q2_0) == sizeof(ggml_half) + QK2_0 / 4, "wrong q2_0 block size/padding");
+
+// Prism Q2_0 with one fp16 scale per 128 weights.
+#define QK_PQ2_0 128
+typedef struct {
+    ggml_half d;                   // delta (scale)
+    uint8_t qs[QK_PQ2_0 / 4];    // 2 bits per element
+} block_pq2_0;
+static_assert(sizeof(block_pq2_0) == sizeof(ggml_half) + QK_PQ2_0 / 4, "wrong pq2_0 block size/padding");
+
+// Prism ternary packing with one fp16 scale per 128 weights.
+#define QK_PTQ1_0 128
+typedef struct {
+    uint8_t qs[(QK_PTQ1_0 - 4*QK_PTQ1_0/64)/5]; // 24 B, 5 trits per byte -> 120 values
+    uint8_t qh[QK_PTQ1_0/64];                   //  2 B, 4 trits per byte ->   8 values
+    ggml_half d;                                // scale
+} block_ptq1_0;
+static_assert(sizeof(block_ptq1_0) == sizeof(ggml_half) + QK_PTQ1_0/64 + (QK_PTQ1_0 - 4*QK_PTQ1_0/64)/5, "wrong ptq1_0 block size/padding");
 
 #define QK4_0 32
 typedef struct {
