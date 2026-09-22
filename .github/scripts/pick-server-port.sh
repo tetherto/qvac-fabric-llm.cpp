@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Print a TCP port for the server integration tests.
+# Print the first port of a free 8-port block for the server integration tests.
 #
 # QVAC-24501: tools/server/tests/utils.py binds 127.0.0.1:8080 unless PORT is
 # set. That was fine on upstream's dedicated llama-server pool where one job
@@ -14,28 +14,42 @@
 # construction. The scan covers what the derivation cannot: two names hashing
 # alike, and ports held by something else.
 #
-# Usage: PORT=$(.github/scripts/pick-server-port.sh)
+# A block, not a single port: some tests need a second server alongside the
+# first (see test_compat_anthropic.py) and offset from PORT to get it. Blocks
+# never overlap, so those offsets stay inside the job's own reservation.
+#
+# Usage: PORT=$(.github/scripts/pick-server-port.sh)   # tests may use PORT+1..+7
 
 set -euo pipefail
 
 readonly RANGE_START=20000
-readonly RANGE_SIZE=20000  # 20000-39999, clear of the ephemeral range
+readonly BLOCK_SIZE=8
+readonly BLOCK_COUNT=2500  # 20000-39999, clear of the ephemeral range
 readonly MAX_PROBES=200
 
 # The fallback keeps this usable outside CI.
 seed="${RUNNER_NAME:-${HOSTNAME:-local}}"
-base=$(( RANGE_START + $(printf '%s' "$seed" | cksum | cut -d' ' -f1) % RANGE_SIZE ))
+first_block=$(( $(printf '%s' "$seed" | cksum | cut -d' ' -f1) % BLOCK_COUNT ))
 
 for (( probe = 0; probe < MAX_PROBES; probe++ )); do
-    port=$(( RANGE_START + (base - RANGE_START + probe) % RANGE_SIZE ))
+    block=$(( (first_block + probe) % BLOCK_COUNT ))
+    base=$(( RANGE_START + block * BLOCK_SIZE ))
 
-    # A successful connect means something is already listening.
-    if ! (exec 3<>"/dev/tcp/127.0.0.1/${port}") 2>/dev/null; then
-        echo "${port}"
+    free=1
+    for (( offset = 0; offset < BLOCK_SIZE; offset++ )); do
+        # A successful connect means something is already listening.
+        if (exec 3<>"/dev/tcp/127.0.0.1/$(( base + offset ))") 2>/dev/null; then
+            exec 3>&- 2>/dev/null || true
+            free=0
+            break
+        fi
+    done
+
+    if (( free )); then
+        echo "${base}"
         exit 0
     fi
-    exec 3>&- 2>/dev/null || true
 done
 
-echo "pick-server-port: no free port in ${MAX_PROBES} probes from ${base} (seed: ${seed})" >&2
+echo "pick-server-port: no free ${BLOCK_SIZE}-port block in ${MAX_PROBES} probes (seed: ${seed})" >&2
 exit 1
