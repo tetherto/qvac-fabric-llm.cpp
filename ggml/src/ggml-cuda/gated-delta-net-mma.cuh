@@ -32,5 +32,4 @@ struct ggml_cuda_gdn_mma_args {
     bool    eligible;
 };
 
-bool ggml_cuda_gdn_mma_available(int device, const ggml_cuda_gdn_mma_args & args);
 bool ggml_cuda_gdn_mma_launch(int device, const ggml_cuda_gdn_mma_args & args, cudaStream_t stream);

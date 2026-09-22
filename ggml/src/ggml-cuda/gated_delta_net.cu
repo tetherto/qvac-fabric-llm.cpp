@@ -288,6 +288,8 @@ static void ggml_cuda_op_gated_delta_net_impl(
     GGML_ASSERT(neq1 == nek1);
     const int64_t neqk1 = neq1;
 
+    GGML_ASSERT(neq3 > 0 && nev3 >= neq3 && nev3 % neq3 == 0);
+    GGML_ASSERT(nek3 == neq3);
     const int64_t rq3 = nev3 / neq3;
 
     const float * q_d = (const float *) src_q->data;

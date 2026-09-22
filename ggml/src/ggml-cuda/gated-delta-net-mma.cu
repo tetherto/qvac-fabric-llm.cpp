@@ -21,7 +21,7 @@ template <int R, int C> struct matrix {
 #ifdef GGML_USE_HIP
         return r * C + c;
 #else
-        return r * C + (c ^ ((r & ((C / 8 - 1) & 7)) * 8));
+        return ggml_cuda_mma::swizzle_bytes<true, nv_bfloat162>(r, c / 2, C / 2) / 2 + c % 2;
 #endif
     }
 
@@ -74,54 +74,24 @@ using a_tile = tile<16, 8, nv_bfloat162>;
 using b_tile = tile<8, 8, nv_bfloat162>;
 #    endif
 
-template <class T, bool TRANS, int R, int C>
-__device__ __forceinline__ T load(const matrix<R, C> & m, int row, int col, bool low) {
-    T            t;
+template <class tile_t, bool TRANS, int R, int C>
+__device__ __forceinline__ tile_t load(const matrix<R, C> & m, int row, int col, bool low) {
+    tile_t       t;
     const bf16 * data = low ? m.lo : m.hi;
 #    ifdef GGML_USE_HIP
 #        pragma unroll
-    for (int i = 0; i < T::ne; ++i) {
-        const int  r = row + T::get_i(i), c = col + 2 * T::get_j(i);
+    for (int i = 0; i < tile_t::ne; ++i) {
+        const int  r = row + tile_t::get_i(i), c = col + 2 * tile_t::get_j(i);
         const bf16 x = data[TRANS ? m.index(c, r) : m.index(r, c)];
         const bf16 y = data[TRANS ? m.index(c + 1, r) : m.index(r, c + 1)];
         t.x[i]       = __float22bfloat162_rn(make_float2(__bfloat162float(x), __bfloat162float(y)));
     }
 #    else
-    const int lane = threadIdx.x;
-    int       r, c;
+    const auto * packed = reinterpret_cast<const nv_bfloat162 *>(data);
     if constexpr (TRANS) {
-        r = col + (lane & 15);
-        c = row + (T::I == 16 ? (lane / 16) * 8 : 0);
+        load_ldmatrix_trans<true>(t, packed, col, row / 2, C / 2);
     } else {
-        r = row + (lane % T::I);
-        c = col + ((lane / T::I) & 1) * 8;
-    }
-    const unsigned address = (unsigned) __cvta_generic_to_shared(data + m.index(r, c));
-    unsigned *     x       = reinterpret_cast<unsigned *>(t.x);
-    if constexpr (T::I == 16) {
-        if constexpr (TRANS) {
-            asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];"
-                         : "=r"(x[0]), "=r"(x[2]), "=r"(x[1]), "=r"(x[3])
-                         : "r"(address)
-                         : "memory");
-        } else {
-            asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];"
-                         : "=r"(x[0]), "=r"(x[1]), "=r"(x[2]), "=r"(x[3])
-                         : "r"(address)
-                         : "memory");
-        }
-    } else {
-        if constexpr (TRANS) {
-            asm volatile("ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%0,%1}, [%2];"
-                         : "=r"(x[0]), "=r"(x[1])
-                         : "r"(address)
-                         : "memory");
-        } else {
-            asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0,%1}, [%2];"
-                         : "=r"(x[0]), "=r"(x[1])
-                         : "r"(address)
-                         : "memory");
-        }
+        load_ldmatrix<true>(t, packed, row, col / 2, C / 2);
     }
 #    endif
     return t;
@@ -256,9 +226,9 @@ static __global__ __launch_bounds__(256, BLOCKS) void gdn_single(ggml_cuda_gdn_m
                 read_qk(t0 + C, next_q, next_k);
             }
         }
-        // Each projection warp owns one output tile for this configuration.
-        constexpr bool REGISTER_OUTPUT = C == 16 && V == 32;
-        acc            base_output;
+        // V32 overlaps Gram work with one output tile per projection warp.
+        constexpr bool SPLIT_PROJECTION = C == 16 && V == 32;
+        acc            base_output[((C / 16) * (V / N) + WARPS - 1) / WARPS];
         auto           project = [&]() {
             if constexpr (V == 32) {
                 if (warp < 4) {
@@ -276,11 +246,7 @@ static __global__ __launch_bounds__(256, BLOCKS) void gdn_single(ggml_cuda_gdn_m
                     const float decay = expf(s.prefix[t]);
                     const float vv    = t < valid ? a.v[voff + (t0 + t) * a.sv2 + v] : 0.f;
                     s.delta.store(t, v, s.beta[t] * (vv - decay * ks.x[i]));
-                    if constexpr (REGISTER_OUTPUT) {
-                        base_output.x[i] = decay * qs.x[i];
-                    } else if (t < valid) {
-                        out[(t0 + t) * a.H * D + v] = decay * qs.x[i];
-                    }
+                    base_output[ti / WARPS].x[i] = decay * qs.x[i];
                 }
             }
         };
@@ -345,7 +311,7 @@ static __global__ __launch_bounds__(256, BLOCKS) void gdn_single(ggml_cuda_gdn_m
             store(s.scratch.solved, x, r, c);
         }
         __syncthreads();
-        for (int ti = (REGISTER_OUTPUT ? warp - 4 : warp); ti < (C / 16) * (V / N) && (!REGISTER_OUTPUT || warp >= 4);
+        for (int ti = (SPLIT_PROJECTION ? warp - 4 : warp); ti < (C / 16) * (V / N) && (!SPLIT_PROJECTION || warp >= 4);
              ti += WARPS) {
             const int r = (ti / (V / N)) * 16, c = (ti % (V / N)) * N;
             acc       x;
@@ -354,11 +320,7 @@ static __global__ __launch_bounds__(256, BLOCKS) void gdn_single(ggml_cuda_gdn_m
             for (int i = 0; i < acc::ne; ++i) {
                 const int t = r + acc::get_i(i), v = c + acc::get_j(i);
                 if (t < valid) {
-                    if constexpr (REGISTER_OUTPUT) {
-                        out[(t0 + t) * a.H * D + v] = base_output.x[i] + x.x[i];
-                    } else {
-                        out[(t0 + t) * a.H * D + v] += x.x[i];
-                    }
+                    out[(t0 + t) * a.H * D + v] = base_output[ti / WARPS].x[i] + x.x[i];
                 }
             }
         }
@@ -417,7 +379,7 @@ enum class gdn_path { ar, slice32_one_block, slice32_two_blocks, slice64, whole_
 static gdn_path plan(int device, const ggml_cuda_gdn_mma_args & a) {
     GGML_ASSERT(device >= 0 && device < GGML_CUDA_MAX_DEVICES);
     if (!a.eligible || a.H_k != 16 || (a.H != 16 && a.H != 32 && a.H != 48 && a.H != 64) || a.n_tokens < 64 ||
-        a.n_tokens > INT64_MAX - 32 || a.n_seqs <= 0 || a.n_seqs > INT_MAX / (a.H * 4)) {
+        a.n_tokens > INT64_MAX - 32 || a.rq3 <= 0 || a.n_seqs <= 0 || a.n_seqs > INT_MAX / (a.H * 4)) {
         return gdn_path::ar;
     }
     const auto & info = ggml_cuda_info().devices[device];
@@ -430,28 +392,22 @@ static gdn_path plan(int device, const ggml_cuda_gdn_mma_args & a) {
     GGML_UNUSED_VARS(info);
     return gdn_path::ar;
 #else
+    // Enable only architectures benchmarked for this schedule. MMA support alone does not imply a speedup.
     if (!ampere_mma_available(info.cc) || (info.cc != GGML_CUDA_CC_BLACKWELL && info.cc != GGML_CUDA_CC_DGX_SPARK)) {
         return gdn_path::ar;
     }
-    // Increase the block count when whole heads do not fill the GPU.
-    if (a.n_tokens >= 512 && a.H * a.n_seqs < info.nsm) {
+    // Value splitting pays off when whole heads leave at least half the SMs idle.
+    if (a.H * a.n_seqs * 2 <= info.nsm) {
         // A grid that already fits in one wave benefits from a larger register budget.
         if (a.H * a.n_seqs * 4 <= info.nsm) {
             return init<16, 32, 1>(device) ? gdn_path::slice32_one_block : gdn_path::ar;
         }
         return init<16, 32, 2>(device) ? gdn_path::slice32_two_blocks : gdn_path::ar;
     }
-    if (info.cc == GGML_CUDA_CC_BLACKWELL && (a.H == 16 || a.H == 32 || (a.H == 48 && a.n_tokens < 256))) {
-        return gdn_path::ar;
-    }
     return init<16, 128>(device) ? gdn_path::whole_head : gdn_path::ar;
 #endif
 }
 }  // namespace
-
-bool ggml_cuda_gdn_mma_available(int device, const ggml_cuda_gdn_mma_args & a) {
-    return plan(device, a) != gdn_path::ar;
-}
 
 bool ggml_cuda_gdn_mma_launch(int device, const ggml_cuda_gdn_mma_args & a, cudaStream_t stream) {
     if (!a.state_out) {
