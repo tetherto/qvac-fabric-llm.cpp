@@ -50,6 +50,8 @@ static constexpr __host__ __device__ int ptq1_0_pt_rows_per_block(const int ncol
     return ncols_dst == 1 ? 1 : 2;
 }
 
+#if !defined(GGML_USE_HIP)
+
 // number of 128-element blocks in a row padded to MATRIX_ROW_PADDING
 static __host__ __device__ __forceinline__ int ptq1_0_pt_nblk(const int ncols_x) {
     return ((ncols_x + MATRIX_ROW_PADDING - 1) / MATRIX_ROW_PADDING) * (MATRIX_ROW_PADDING / QK_PTQ1_0);
@@ -477,3 +479,5 @@ static bool mul_mat_vec_ptq1_0_pt_switch(
     }
     return true;
 }
+
+#endif
