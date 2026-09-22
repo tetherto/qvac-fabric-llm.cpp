@@ -565,17 +565,19 @@ static ggml_backend_reg_t ggml_backend_load_best(const char * name, bool silent,
         }
     }
 
-#ifdef __ANDROID__
-    // Android can load an APK-embedded library by filename without a path.
+#ifndef _WIN32
+    // Let the platform loader resolve libraries outside the explicit search paths.
     if (best_path.empty()) {
         // From worst to best
         std::vector<fs::path> names = { name_path };
+#    ifdef __ANDROID__
         if (strcmp(name, "cpu") == 0) {
             names.emplace_back("cpu-android_armv8.0_1");
             names.emplace_back("cpu-android_armv8.2_1");
             names.emplace_back("cpu-android_armv8.2_2");
             names.emplace_back("cpu-android_armv8.6_1");
         }
+#    endif
         for (size_t scoreOffset = 0; scoreOffset < names.size(); ++scoreOffset) {
             const auto & loopNamePath = names[scoreOffset];
             // Try loading backend with just the library name, leave to dlopen path resolution.
