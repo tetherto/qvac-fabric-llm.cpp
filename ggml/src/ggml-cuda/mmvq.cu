@@ -1347,7 +1347,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
         // When K is small, increase rows_per_block to match nwarps so each warp has more work to do
         // Trigger when the full thread block covers all K blocks in a single loop iteration and few threads remain idle.
         const int  nwarps = calc_nwarps(type, c_ncols_dst, table_id);
-        bool       use    = !has_ids && nwarps > 1 && blocks_per_row_x < nwarps * blocks_per_iter_1warp;
+        bool       use    = (!has_ids || (type == GGML_TYPE_PQ2_0 && nrows_x % nwarps == 0)) && nwarps > 1 && blocks_per_row_x < nwarps * blocks_per_iter_1warp;
         // on CDNA the small_k geometry (rows_per_block = nwarps) is several times slower than the default split-K geometry for these types, and with wave64 it triggers for every K < 4096 projection
         if (GGML_CUDA_CC_IS_CDNA(cc) && (type == GGML_TYPE_Q1_0 || type == GGML_TYPE_Q2_0 || type == GGML_TYPE_PQ2_0)) {
             use = false;
