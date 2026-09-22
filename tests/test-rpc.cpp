@@ -254,26 +254,30 @@ int main() {
         const size_t cached_output_stride = cached_row_size + 3 * sizeof(float);
         std::vector<uint8_t> cached_input(cached_input_stride * cached_rows);
         std::vector<uint8_t> cached_output(cached_output_stride * cached_rows, 0);
-        for (size_t row = 0; row < cached_rows; row++) {
-            for (size_t i = 0; i < cached_row_size; i++) {
-                cached_input[row * cached_input_stride + i] = (uint8_t) (row + i);
+        for (bool weights : { false, true }) {
+            ggml_backend_buffer_set_usage(buffer_cached.get(), weights ? GGML_BACKEND_BUFFER_USAGE_WEIGHTS : GGML_BACKEND_BUFFER_USAGE_COMPUTE);
+            ggml_set_name(tensor_cached, weights ? "rpc_weight_2d" : "rpc_activation_2d");
+            for (size_t row = 0; row < cached_rows; row++) {
+                for (size_t i = 0; i < cached_row_size; i++) {
+                    cached_input[row * cached_input_stride + i] = (uint8_t) (row + i + (weights ? 1 : 0));
+                }
             }
-        }
 
-        ggml_backend_tensor_set_2d_async(backend_a.get(), tensor_cached, cached_input.data(), 0, cached_row_size,
-                                         cached_rows, tensor_cached->nb[1], cached_input_stride);
-        ggml_backend_synchronize(backend_a.get());
-        ggml_backend_tensor_memset(tensor_cached, 0, 0, ggml_nbytes(tensor_cached));
-        ggml_backend_tensor_set_2d_async(backend_a.get(), tensor_cached, cached_input.data(), 0, cached_row_size,
-                                         cached_rows, tensor_cached->nb[1], cached_input_stride);
-        ggml_backend_tensor_get_2d_async(backend_a.get(), tensor_cached, cached_output.data(), 0, cached_row_size,
-                                         cached_rows, tensor_cached->nb[1], cached_output_stride);
-        ggml_backend_synchronize(backend_a.get());
-        for (size_t row = 0; row < cached_rows; row++) {
-            if (memcmp(cached_input.data() + row * cached_input_stride,
-                       cached_output.data() + row * cached_output_stride, cached_row_size) != 0) {
-                fprintf(stderr, "cached 2D RPC transfer mismatch\n");
-                return 1;
+            ggml_backend_tensor_set_2d_async(backend_a.get(), tensor_cached, cached_input.data(), 0, cached_row_size,
+                                             cached_rows, tensor_cached->nb[1], cached_input_stride);
+            ggml_backend_synchronize(backend_a.get());
+            ggml_backend_tensor_memset(tensor_cached, 0, 0, ggml_nbytes(tensor_cached));
+            ggml_backend_tensor_set_2d_async(backend_a.get(), tensor_cached, cached_input.data(), 0, cached_row_size,
+                                             cached_rows, tensor_cached->nb[1], cached_input_stride);
+            ggml_backend_tensor_get_2d_async(backend_a.get(), tensor_cached, cached_output.data(), 0, cached_row_size,
+                                             cached_rows, tensor_cached->nb[1], cached_output_stride);
+            ggml_backend_synchronize(backend_a.get());
+            for (size_t row = 0; row < cached_rows; row++) {
+                if (memcmp(cached_input.data() + row * cached_input_stride,
+                           cached_output.data() + row * cached_output_stride, cached_row_size) != 0) {
+                    fprintf(stderr, "cached 2D RPC transfer mismatch\n");
+                    return 1;
+                }
             }
         }
     }
