@@ -1816,6 +1816,18 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     // The last h-row of one process() call needs the first token of the NEXT
     // call to pair with, so it's stashed here until that next call fires.
     std::vector<std::vector<float>> pending_h;   // [n_seq][n_embd]
+    std::vector<llama_pos>          pending_pos;
+    std::vector<llama_pos>          verify_pos_first;
+    std::vector<float>              h_zero;      // [n_embd] row for a first token with no pending pair
+
+    // the first token of a sequence pairs with the pending embedding of a
+    // previous run only when that run ended at the preceding position;
+    // otherwise (state reset / rewind) the row is zeroed
+    const float * pending_row(llama_seq_id seq_id, llama_pos pos_beg) const {
+        return pending_pos[seq_id] >= 0 && pending_pos[seq_id] + 1 == pos_beg
+            ? pending_h[seq_id].data()
+            : h_zero.data();
+    }
 
     std::vector<int32_t> i_batch_beg;
     std::vector<int32_t> i_batch_end;
@@ -1902,6 +1914,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         this->n_max = this->params.n_max;
 
         pending_h.assign(n_seq, std::vector<float>(n_embd, 0.0f));
+        pending_pos.assign(n_seq, -1);
+        verify_pos_first.assign(n_seq, -1);
+        h_zero.assign(n_embd, 0.0f);
 
         i_last.assign(n_seq, -1);
         i_batch_beg.assign(n_seq, -1);
@@ -2008,7 +2023,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 GGML_ASSERT(n_tokens <= n_batch_tgt && "the target batch exceeds the h_nextn device buffer");
                 for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
                     if (i_batch_beg[seq_id] >= 0) {
-                        llama_set_embeddings_nextn_rows(ctx_tgt, n_batch_tgt + seq_id, 1, pending_h[seq_id].data());
+                        const llama_pos pos_beg = batch_in.tokens[i_batch_beg[seq_id]].pos[0];
+                        llama_set_embeddings_nextn_rows(ctx_tgt, n_batch_tgt + seq_id, 1, pending_row(seq_id, pos_beg));
                     }
                 }
             }
@@ -2031,7 +2047,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 }
 
                 const float * h_row = k == i_batch_beg[seq_id]
-                    ? pending_h[seq_id].data()
+                    ? pending_row(seq_id, t.pos[0])
                     : h_tgt + (size_t) (k - 1) * n_embd;
 
                 batch.set_embd_state(idx, { h_row, 1, (size_t) n_embd });
@@ -2090,6 +2106,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             const int32_t h_offset = is_mem_shared && !all_rows_output ? i_batch_end[seq_id] : i_batch_beg[seq_id];
 
             verify_h_rows[seq_id] = h_rows;
+            verify_pos_first[seq_id] = batch_in.tokens[h_offset].pos[0];
+            pending_pos[seq_id]      = batch_in.tokens[i_batch_end[seq_id]].pos[0];
 
             if (dev_rows) {
                 // the rows stay on the device until the next target decode, only the pending row comes to the host
@@ -2289,6 +2307,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         }
 
         const int32_t i_h = std::min<int32_t>(n_accepted, n_rows - 1);
+        pending_pos[seq_id] = verify_pos_first[seq_id] + i_h;
         if (dev_rows) {
             // process() already fetched the last row
             if (i_h != n_rows - 1) {
@@ -2305,9 +2324,15 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             return false;
         }
 
-        const size_t row_bytes = (size_t) n_embd * sizeof(float);
-        data.resize(row_bytes);
-        std::memcpy(data.data(), pending_h[seq_id].data(), row_bytes);
+        if (pending_pos[seq_id] < 0) {
+            return false;
+        }
+
+        const auto & h = pending_h[seq_id];
+        const llama_pos pos = pending_pos[seq_id];
+        data.resize(sizeof(llama_pos) + h.size() * sizeof(float));
+        std::memcpy(data.data(), &pos, sizeof(llama_pos));
+        std::memcpy(data.data() + sizeof(llama_pos), h.data(), h.size() * sizeof(float));
         return true;
     }
 
@@ -2316,11 +2341,27 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             return;
         }
 
-        const size_t row_bytes = (size_t) n_embd * sizeof(float);
-        if (data.size() != row_bytes) {
+        auto & h = pending_h[seq_id];
+        if (data.empty()) {
+            std::fill(h.begin(), h.end(), 0.0f);
+            pending_pos[seq_id] = -1;
             return;
         }
-        std::memcpy(pending_h[seq_id].data(), data.data(), row_bytes);
+        const size_t expected_size = sizeof(llama_pos) + h.size() * sizeof(float);
+        if (data.size() != expected_size) {
+            SPC_WRN("bad MTP state: seq=%d, size=%zu/%zu; ignoring\n", (int) seq_id, data.size(), expected_size);
+            return;
+        }
+
+        llama_pos pos = -1;
+        std::memcpy(&pos, data.data(), sizeof(llama_pos));
+        if (pos < 0) {
+            SPC_WRN("invalid MTP state position for seq_id=%d: got %d - ignoring\n", (int) seq_id, (int) pos);
+            return;
+        }
+
+        pending_pos[seq_id] = pos;
+        std::memcpy(h.data(), data.data() + sizeof(llama_pos), h.size() * sizeof(float));
     }
 };
 
