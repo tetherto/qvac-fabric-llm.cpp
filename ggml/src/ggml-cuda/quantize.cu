@@ -712,7 +712,7 @@ void quantize_mmq_fp4_cuda(
     }
 }
 
-#ifdef GGML_CUDA_CUTLASS
+#ifdef GGML_CUDA_CUTLASS_BLOCKSCALED
 void quantize_cutlass_nvfp4_cuda(
         const float * x, void * vy, uint8_t * block_scales, float * row_scales, bool use_aligned_float8,
         int64_t n_cols, int64_t n_cols_padded, int64_t stride_row, int64_t n_rows, cudaStream_t stream) {

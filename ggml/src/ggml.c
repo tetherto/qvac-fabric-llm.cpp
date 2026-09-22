@@ -1006,6 +1006,14 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .to_float                 = (ggml_to_float_t) dequantize_row_pq4_0_64,
         .from_float_ref           = (ggml_from_float_t) quantize_row_pq4_0_64_ref,
     },
+    [GGML_TYPE_F8_E4M3] = {
+        .type_name                = "f8_e4m3",
+        .blck_size                = 1,
+        .type_size                = 1,
+        .is_quantized             = false,
+        .to_float                 = (ggml_to_float_t) ggml_f8_e4m3_to_fp32_row,
+        .from_float_ref           = NULL,
+    },
 };
 
 const struct ggml_type_traits * ggml_get_type_traits(enum ggml_type type) {
@@ -1522,6 +1530,7 @@ enum ggml_type ggml_ftype_to_ggml_type(enum ggml_ftype ftype) {
         case GGML_FTYPE_MOSTLY_Q4_1:          wtype = GGML_TYPE_Q4_1;  break;
         case GGML_FTYPE_MOSTLY_Q1_0:          wtype = GGML_TYPE_Q1_0;  break;
         case GGML_FTYPE_MOSTLY_Q2_0:          wtype = GGML_TYPE_Q2_0;  break;
+        case GGML_FTYPE_MOSTLY_F8_E4M3:       wtype = GGML_TYPE_F8_E4M3; break;
         case GGML_FTYPE_MOSTLY_Q5_0:          wtype = GGML_TYPE_Q5_0;  break;
         case GGML_FTYPE_MOSTLY_Q5_1:          wtype = GGML_TYPE_Q5_1;  break;
         case GGML_FTYPE_MOSTLY_Q8_0:          wtype = GGML_TYPE_Q8_0;  break;
@@ -3466,6 +3475,24 @@ struct ggml_tensor * ggml_mul_mat(
     result->op     = GGML_OP_MUL_MAT;
     result->src[0] = a;
     result->src[1] = b;
+
+    return result;
+}
+
+struct ggml_tensor * ggml_mul_mat_blockscaled(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * a_scale,
+        struct ggml_tensor  * b) {
+    GGML_ASSERT(a->type == GGML_TYPE_F8_E4M3);
+    GGML_ASSERT(a_scale->type == GGML_TYPE_F32);
+    GGML_ASSERT(a->ne[2] == 1 && a->ne[3] == 1);
+    GGML_ASSERT(a->ne[0] % GGML_F8_E4M3_SCALE_BLOCK == 0 && a->ne[1] % GGML_F8_E4M3_SCALE_BLOCK == 0);
+    GGML_ASSERT(a_scale->ne[0] == a->ne[1]/GGML_F8_E4M3_SCALE_BLOCK && a_scale->ne[1] == a->ne[0]/GGML_F8_E4M3_SCALE_BLOCK);
+    GGML_ASSERT(ggml_is_contiguous(a) && ggml_is_contiguous(a_scale));
+
+    struct ggml_tensor * result = ggml_mul_mat(ctx, a, b);
+    result->src[2] = a_scale;
 
     return result;
 }
@@ -5725,6 +5752,23 @@ enum ggml_prec ggml_flash_attn_ext_get_prec(
     const int32_t prec_i32 = ggml_get_op_params_i32(a, 3);
 
     return (enum ggml_prec) prec_i32;
+}
+
+void ggml_flash_attn_ext_set_kv_used(
+        struct ggml_tensor * a,
+        int32_t              n_kv_used) {
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
+    GGML_ASSERT(a->src[3] == NULL); // the implicit mask replaces the mask tensor
+    GGML_ASSERT(n_kv_used >= a->src[0]->ne[1] && n_kv_used <= a->src[1]->ne[1]);
+
+    ggml_set_op_params_i32(a, 4, n_kv_used); // 3 is the precision
+}
+
+int32_t ggml_flash_attn_ext_get_kv_used(
+        const struct ggml_tensor * a) {
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
+
+    return ggml_get_op_params_i32(a, 4);
 }
 
 void ggml_flash_attn_ext_add_sinks(

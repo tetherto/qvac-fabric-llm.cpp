@@ -11,6 +11,8 @@
 #include "server-common.h"
 
 #include <sstream>
+#include <system_error>
+#include <thread>
 
 using json = nlohmann::ordered_json;
 
@@ -1690,6 +1692,55 @@ json server_task_result_apply_lora::to_json() {
 //
 // server_prompt_cache
 //
+
+// a single thread faults in about 2 GB/s of fresh pages, slower than the device copy that follows
+static server_prompt_buffer server_prompt_buffer_alloc(size_t n, int n_threads) {
+    server_prompt_buffer buf;
+    if (n == 0) {
+        return buf;
+    }
+    buf.ptr.reset(new uint8_t[n]);
+    buf.n = n;
+
+    constexpr size_t page      = 4096;
+    constexpr size_t min_chunk = 64ull*1024ull*1024ull;
+
+    const int nt = std::max(1, std::min(n_threads, (int) (n / min_chunk)));
+
+    auto touch = [&](int t) {
+        const size_t i0 = n * t / nt;
+        const size_t i1 = n * (t + 1) / nt;
+        for (size_t i = i0; i < i1; i += page) {
+            buf.ptr[i] = 0;
+        }
+    };
+
+    if (nt == 1) {
+        touch(0);
+        return buf;
+    }
+
+    std::vector<std::thread> workers;
+    workers.reserve(nt);
+    int t = 0;
+    try {
+        for (; t < nt; t++) {
+            workers.emplace_back(touch, t);
+        }
+    } catch (const std::system_error & e) {
+        SRV_WRN("failed to start a page fault thread, continuing on the calling thread: %s\n", e.what());
+    }
+    for (auto & w : workers) {
+        w.join();
+    }
+    // chunks that did not get a thread
+    for (; t < nt; t++) {
+        touch(t);
+    }
+
+    return buf;
+}
+
 size_t server_prompt_cache::size() const {
     size_t res = 0;
 
@@ -1759,13 +1810,13 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
         }
     }
 
-    std::vector<uint8_t> state_data_tgt;
-    std::vector<uint8_t> state_data_dft;
+    server_prompt_buffer state_data_tgt;
+    server_prompt_buffer state_data_dft;
 
     // check if we can allocate enough memory for the new state
     try {
-        state_data_tgt.resize(state_size_tgt);
-        state_data_dft.resize(state_size_dft);
+        state_data_tgt = server_prompt_buffer_alloc(state_size_tgt, n_threads);
+        state_data_dft = server_prompt_buffer_alloc(state_size_dft, n_threads);
     } catch (const std::bad_alloc & e) {
         SRV_ERR("failed to allocate memory for prompt cache state: %s\n", e.what());
 
@@ -1839,7 +1890,6 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
             }
 
             data.clear();
-            data.shrink_to_fit();
         }
 
         {
@@ -1857,7 +1907,6 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
                 }
 
                 data.clear();
-                data.shrink_to_fit();
             }
         }
 

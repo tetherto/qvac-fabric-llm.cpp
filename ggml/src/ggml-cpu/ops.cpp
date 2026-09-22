@@ -6457,6 +6457,7 @@ void ggml_compute_forward_clamp(
         case GGML_TYPE_I32:
         case GGML_TYPE_I64:
         case GGML_TYPE_F64:
+        case GGML_TYPE_F8_E4M3:
         GGML_CASE_TBQ_TYPES:
         case GGML_TYPE_COUNT:
             {
@@ -9207,6 +9208,7 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
     GGML_ASSERT((v->type == GGML_TYPE_F32 || v_to_float  ) && "fattn: unsupported V-type");
 
     int ith = params->ith;
+    const int32_t n_kv_used = mask ? 0 : ggml_flash_attn_ext_get_kv_used(dst);
 
     for (int ir = ir0; ir < ir1; ++ir) {
         // q indices
@@ -9248,7 +9250,10 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
         // loop over n_kv and n_head_kv
         // ref: https://arxiv.org/pdf/2112.05682.pdf
 
-        for (int64_t ic = ic_start; ic < ic_end; ++ic) {
+        // implicit causal mask (no mask tensor): row iq1 attends cells [0, iq1 + n_kv_used - N]
+        const int64_t ic_row_end = n_kv_used > 0 ? MIN(ic_end, iq1 + (n_kv_used - N) + 1) : ic_end;
+
+        for (int64_t ic = ic_start; ic < ic_row_end; ++ic) {
             const float mv = mp ? slope*GGML_CPU_FP16_TO_FP32(mp[ic]) : 0.0f;
             if (mv == -INFINITY) {
                 continue;
@@ -9828,7 +9833,9 @@ static void ggml_compute_forward_flash_attn_ext_f16(
         const int64_t dr = (nr + nchunk - 1) / nchunk;
 
         static constexpr int64_t Q_TILE_SZ  = ggml_fa_tile_config::Q;
-        bool use_tiled = !use_ref &&
+        // the implicit causal mask (n_kv_used, no mask tensor) is implemented by the one_chunk path only
+        const bool implicit_mask = dst->src[3] == NULL && ggml_flash_attn_ext_get_kv_used(dst) > 0;
+        bool use_tiled = !use_ref && !implicit_mask &&
                                (q->type == GGML_TYPE_F32 &&
                                 kv_is_f32_or_f16 &&
                                 k->type == v->type &&

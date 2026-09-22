@@ -12,3 +12,7 @@ void ggml_cuda_op_gated_delta_net(ggml_backend_cuda_context & ctx, ggml_tensor *
 // same op, but writes the snapshot(s) into the cache instead of dst (see ggml_cuda_try_gdn_cache_fusion)
 void ggml_cuda_op_gated_delta_net_fused_cache(ggml_backend_cuda_context & ctx, ggml_tensor * dst,
                                               ggml_cuda_gated_delta_net_fused_cache cache);
+
+// whether the op runs on the FlashInfer SM90 AOT kernel (library loaded, Hopper, S_v 128, at least 64 tokens, K 1):
+// the fused conv kernel packs the kernel's bf16 q/k/v inputs (ctx.gdn_pack) only for such a node
+bool ggml_cuda_gated_delta_net_flashinfer_aot(const ggml_tensor * dst);

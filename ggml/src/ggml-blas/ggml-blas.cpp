@@ -424,6 +424,11 @@ static bool ggml_backend_blas_device_supports_op(ggml_backend_dev_t dev, const s
                 return false;
             }
 
+            // F8_E4M3 weights carry 128x128 block scales in src[2] that a plain row dequantize would ignore
+            if (src0->type == GGML_TYPE_F8_E4M3) {
+                return false;
+            }
+
             return ggml_is_contiguous(src0) &&
                    ggml_is_contiguous(src1) &&
                    src1->type == GGML_TYPE_F32 &&

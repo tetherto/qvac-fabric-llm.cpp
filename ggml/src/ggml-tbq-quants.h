@@ -3,6 +3,10 @@
 #define GGML_COMMON_DECL_C
 #include "ggml-common.h"
 
+// ggml-common.h skips this header in the GPU DECL contexts, but the declarations below need the block layouts
+// whatever includes them (e.g. ggml-quants.h from a SYCL host translation unit)
+#include "ggml-tbq-types.h"
+
 #include "ggml.h"
 
 // GGML internal header

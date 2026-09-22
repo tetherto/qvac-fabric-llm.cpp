@@ -1522,6 +1522,9 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
         case GGML_OP_ROLL:
             return ggml_is_contiguous(op->src[0]);
         case GGML_OP_FLASH_ATTN_EXT:
+            if (op->src[3] == NULL && ggml_flash_attn_ext_get_kv_used(op) > 0) {
+                return false; // implicit causal mask (n_kv_used) is CPU/CUDA only
+            }
             // for new head sizes, add checks here
             if (op->src[0]->ne[0] != 32 &&
                 op->src[0]->ne[0] != 40 &&
@@ -1638,7 +1641,7 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
         case GGML_OP_SOLVE_TRI:
         case GGML_OP_MUL_MAT:
         case GGML_OP_MUL_MAT_ID:
-            return op->src[0]->type != GGML_TYPE_TQ1_0 && has_simdgroup_reduction && op->src[0]->type != GGML_TYPE_NVFP4 && !ggml_is_tbq_or_pq(op->src[0]->type);
+            return op->src[0]->type != GGML_TYPE_TQ1_0 && has_simdgroup_reduction && op->src[0]->type != GGML_TYPE_NVFP4 && op->src[0]->type != GGML_TYPE_F8_E4M3 && !ggml_is_tbq_or_pq(op->src[0]->type);
         case GGML_OP_SET:
         case GGML_OP_CPY:
         case GGML_OP_DUP:
@@ -1702,7 +1705,7 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                 };
             }
         case GGML_OP_GET_ROWS:
-            return op->src[0]->type != GGML_TYPE_NVFP4 && op->src[0]->type != GGML_TYPE_TQ1_0;
+            return op->src[0]->type != GGML_TYPE_NVFP4 && op->src[0]->type != GGML_TYPE_F8_E4M3 && op->src[0]->type != GGML_TYPE_TQ1_0;
         case GGML_OP_SET_ROWS:
             {
                 if (op->src[0]->type == GGML_TYPE_F16) {

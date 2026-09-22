@@ -23,6 +23,7 @@
 #include <fstream>
 #include <iostream>
 #include <iterator>
+#include <mutex>
 #include <regex>
 #include <sstream>
 #include <string>
@@ -2337,6 +2338,132 @@ bool common_prompt_batch_decode(
 
     return true;
 }
+
+// common_state_buffer
+
+namespace {
+
+// freed blocks wait here for the next blob of a size that fits; large fresh allocations come from mmap and every
+// page of them is faulted in again on the first write, which costs more than the device copy that follows
+struct common_state_block_pool {
+    struct block {
+        uint8_t * ptr;
+        size_t    cap;
+    };
+
+    static constexpr size_t max_idle_bytes = 1024ull*1024ull*1024ull;
+
+    std::mutex mutex;
+    std::vector<block> idle;
+    size_t idle_bytes = 0;
+
+    // smallest idle block that fits, else a new one
+    block acquire(size_t n) {
+        std::lock_guard<std::mutex> lock(mutex);
+        auto best = idle.end();
+        for (auto it = idle.begin(); it != idle.end(); ++it) {
+            if (it->cap >= n && (best == idle.end() || it->cap < best->cap)) {
+                best = it;
+            }
+        }
+        if (best != idle.end()) {
+            const block res = *best;
+            idle.erase(best);
+            idle_bytes -= res.cap;
+            return res;
+        }
+        return { new uint8_t[n], n };
+    }
+
+    void release(block b) {
+        std::lock_guard<std::mutex> lock(mutex);
+        if (idle_bytes + b.cap <= max_idle_bytes) {
+            idle.push_back(b);
+            idle_bytes += b.cap;
+            return;
+        }
+        delete[] b.ptr;
+    }
+};
+
+// never destroyed: state buffers may outlive every other static
+common_state_block_pool & common_state_block_pool_get() {
+    static common_state_block_pool * pool = new common_state_block_pool();
+    return *pool;
+}
+
+} // namespace
+
+common_state_buffer::common_state_buffer(const common_state_buffer & other) {
+    resize(other.n);
+    if (n > 0) {
+        memcpy(ptr, other.ptr, n);
+    }
+}
+
+common_state_buffer::common_state_buffer(common_state_buffer && other) noexcept : ptr(other.ptr), cap(other.cap), n(other.n) {
+    other.ptr = nullptr;
+    other.cap = 0;
+    other.n   = 0;
+}
+
+common_state_buffer & common_state_buffer::operator=(const common_state_buffer & other) {
+    if (this != &other) {
+        resize(other.n);
+        if (n > 0) {
+            memcpy(ptr, other.ptr, n);
+        }
+    }
+    return *this;
+}
+
+common_state_buffer & common_state_buffer::operator=(common_state_buffer && other) noexcept {
+    if (this != &other) {
+        release();
+        ptr = other.ptr;
+        cap = other.cap;
+        n   = other.n;
+        other.ptr = nullptr;
+        other.cap = 0;
+        other.n   = 0;
+    }
+    return *this;
+}
+
+common_state_buffer::~common_state_buffer() {
+    release();
+}
+
+void common_state_buffer::release() {
+    if (ptr) {
+        common_state_block_pool_get().release({ ptr, cap });
+    }
+    ptr = nullptr;
+    cap = 0;
+    n   = 0;
+}
+
+void common_state_buffer::resize(size_t n_new) {
+    if (n_new == 0) {
+        release();
+        return;
+    }
+    if (cap >= n_new) {
+        n = n_new;
+        return;
+    }
+    release();
+    const auto b = common_state_block_pool_get().acquire(n_new);
+    ptr = b.ptr;
+    cap = b.cap;
+    n   = n_new;
+}
+
+void common_state_buffer::clear() {
+    release();
+}
+
+// common_prompt_checkpoint
 
 size_t common_prompt_checkpoint::size() const {
     return data_tgt.size() + data_dft.size() + data_spec.size();

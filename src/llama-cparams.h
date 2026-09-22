@@ -40,6 +40,7 @@ struct llama_cparams {
     bool offload_kqv;
     bool flash_attn;
     bool auto_fa;
+    bool attn_implicit_mask; // FA without a mask tensor for one contiguous sequence (ggml_flash_attn_ext_set_kv_used); backend-probed
     bool fused_gdn_ar;       // use fused gated delta net (autoregressive)
     bool fused_gdn_ch;       // use fused gated delta net (chunked)
     bool auto_fgdn;

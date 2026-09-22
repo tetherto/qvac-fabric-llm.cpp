@@ -5998,6 +5998,10 @@ static bool do_ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, cons
 
                 ggml_type src0_type = op->src[0]->type;
 
+                if (src0_type == GGML_TYPE_F8_E4M3) {
+                    return false;
+                }
+
                 // TODO: The configuration below needs more work to be supported with oneDNN
                 if (ggml_is_permuted(a) && !ggml_is_contiguous(a) &&
                     a->ne[2] > 1 && a->ne[3] > 1 && src0_type == GGML_TYPE_F16) {
@@ -6320,6 +6324,9 @@ static bool do_ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, cons
         case GGML_OP_SOLVE_TRI:
             return op->src[0]->ne[0] <= SYCL_SOLVE_TRI_MAX_N && op->src[1]->ne[0] <= SYCL_SOLVE_TRI_MAX_K;
         case GGML_OP_FLASH_ATTN_EXT:
+            if (op->src[3] == nullptr && ggml_flash_attn_ext_get_kv_used(op) > 0) {
+                return false; // implicit causal mask (n_kv_used) is CPU/CUDA only
+            }
             return ggml_sycl_flash_attn_ext_supported(device, op);
         default:
             return false;

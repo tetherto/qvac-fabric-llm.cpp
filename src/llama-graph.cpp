@@ -63,6 +63,18 @@ static bool can_reuse_kq_mask(
     return res;
 }
 
+// > 0 when the ubatch attends with the implicit causal mask instead of a mask tensor (see ggml_flash_attn_ext_set_kv_used)
+static int32_t llm_graph_attn_implicit_mask_n_kv_used(
+        const llama_kv_cache_context * mctx,
+        const llama_ubatch & ubatch,
+        const llama_cparams & cparams) {
+    if (!cparams.attn_implicit_mask || !cparams.flash_attn || !cparams.causal_attn || ubatch.n_tokens < llama_kv_cache::n_tokens_min_implicit_mask) {
+        return 0;
+    }
+
+    return mctx->get_n_kv_used();
+}
+
 // impl
 
 void llm_graph_input_embd::set_input(const llama_ubatch * ubatch) {
@@ -483,6 +495,15 @@ void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
     if (self_v_rot && self_v_rot->buffer) {
         mctx->set_input_v_rot(self_v_rot);
     }
+
+    // the implicit causal mask has no tensor to fill: the extent lives in the flash-attn op params, and it moves
+    // with the cache, so refresh it here rather than rebuilding the graph for every ubatch
+    if (!fa_implicit.empty()) {
+        n_kv_used = (int32_t) mctx->get_n_kv_used();
+        for (ggml_tensor * node : fa_implicit) {
+            ggml_flash_attn_ext_set_kv_used(node, n_kv_used);
+        }
+    }
 }
 
 bool llm_graph_input_attn_kv::can_reuse(const llm_graph_params & params) {
@@ -494,8 +515,11 @@ bool llm_graph_input_attn_kv::can_reuse(const llm_graph_params & params) {
 
     res &= self_k_idxs->ne[0] == params.ubatch.n_tokens;
   //res &= self_v_idxs->ne[0] == params.ubatch.n_tokens; // TODO: need to move this to the unified cache and check there
-
-    res &= can_reuse_kq_mask(self_kq_mask, mctx, params.ubatch, params.cparams);
+    // only the mask mode has to match: set_input refreshes the extent itself
+    res &= (n_kv_used > 0) == (llm_graph_attn_implicit_mask_n_kv_used(mctx, params.ubatch, params.cparams) > 0);
+    if (n_kv_used == 0) {
+        res &= can_reuse_kq_mask(self_kq_mask, mctx, params.ubatch, params.cparams);
+    }
 
     return res;
 }
@@ -1063,7 +1087,17 @@ void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
     mctx->get_attn()->set_input_k_idxs(inp_attn->self_k_idxs, ubatch);
     mctx->get_attn()->set_input_v_idxs(inp_attn->self_v_idxs, ubatch);
 
-    mctx->get_attn()->set_input_kq_mask(inp_attn->self_kq_mask, ubatch, cparams.causal_attn);
+    if (inp_attn->self_kq_mask) {
+        mctx->get_attn()->set_input_kq_mask(inp_attn->self_kq_mask, ubatch, cparams.causal_attn);
+    }
+
+    // same as llm_graph_input_attn_kv::set_input: the implicit mask carries its extent in the op params
+    if (!inp_attn->fa_implicit.empty()) {
+        inp_attn->n_kv_used = (int32_t) mctx->get_attn()->get_n_kv_used();
+        for (ggml_tensor * node : inp_attn->fa_implicit) {
+            ggml_flash_attn_ext_set_kv_used(node, inp_attn->n_kv_used);
+        }
+    }
 
     if (inp_attn->self_k_rot) {
         mctx->get_attn()->set_input_k_rot(inp_attn->self_k_rot);
@@ -1096,7 +1130,12 @@ bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
     res &= inp_attn->self_k_idxs->ne[0] == params.ubatch.n_tokens;
   //res &= inp_attn->self_v_idxs->ne[0] == params.ubatch.n_tokens; // TODO: need to move this to the unified cache and check there
 
-    res &= can_reuse_kq_mask(inp_attn->self_kq_mask, mctx->get_attn(), params.ubatch, params.cparams);
+    // only the mask mode has to match: the attention input refreshes the extent in its own set_input
+    res &= (inp_attn->n_kv_used > 0) ==
+           (llm_graph_attn_implicit_mask_n_kv_used(mctx->get_attn(), params.ubatch, params.cparams) > 0);
+    if (inp_attn->n_kv_used == 0) {
+        res &= can_reuse_kq_mask(inp_attn->self_kq_mask, mctx->get_attn(), params.ubatch, params.cparams);
+    }
 
     res &= inp_rs->s_copy->ne[0] == mctx->get_recr()->get_n_rs();
 
@@ -1488,10 +1527,15 @@ ggml_tensor * llm_graph_context::build_lora_mm(
           ggml_tensor * w,
           ggml_tensor * cur,
           ggml_tensor * w_s) const {
-    ggml_tensor * res = ggml_mul_mat(ctx0, w, cur);
-
-    if (w_s) {
-        res = ggml_mul(ctx0, res, w_s);
+    ggml_tensor * res;
+    if (w->type == GGML_TYPE_F8_E4M3) {
+        GGML_ASSERT(w_s && "F8_E4M3 weight without its block scale tensor");
+        res = ggml_mul_mat_blockscaled(ctx0, w, w_s, cur);
+    } else {
+        res = ggml_mul_mat(ctx0, w, cur);
+        if (w_s) {
+            res = ggml_mul(ctx0, res, w_s);
+        }
     }
 
     for (const auto & lora : *loras) {
@@ -1520,6 +1564,7 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
           ggml_tensor * cur, // ggml_tensor * b
           ggml_tensor * ids,
           ggml_tensor * w_s) const {
+    GGML_ASSERT(w->type != GGML_TYPE_F8_E4M3 && "F8_E4M3 is not supported for mul_mat_id");
     ggml_tensor * res = ggml_mul_mat_id(ctx0, w, cur, ids);
 
     if (w_s) {
@@ -1704,7 +1749,12 @@ ggml_tensor * llm_graph_context::build_ffn(
     GGML_ASSERT(!gate_s || !gate || gate->type != GGML_TYPE_NVFP4 || !has_lora(gate));
     GGML_ASSERT(!down_s || !down || down->type != GGML_TYPE_NVFP4 || !has_lora(down));
 
-    ggml_tensor * tmp = up ? build_lora_mm(up, cur) : cur;
+    // F8_E4M3 block scales ride on the mul_mat itself instead of a post-multiply
+    const bool up_f8   = up   && up->type   == GGML_TYPE_F8_E4M3;
+    const bool gate_f8 = gate && gate->type == GGML_TYPE_F8_E4M3;
+    const bool down_f8 = down && down->type == GGML_TYPE_F8_E4M3;
+
+    ggml_tensor * tmp = up ? build_lora_mm(up, cur, up_f8 ? up_s : nullptr) : cur;
     cb(tmp, "ffn_up", il);
 
     if (up_b) {
@@ -1712,7 +1762,7 @@ ggml_tensor * llm_graph_context::build_ffn(
         cb(tmp, "ffn_up_b", il);
     }
 
-    if (up_s) {
+    if (up_s && !up_f8) {
         tmp = ggml_mul(ctx0, tmp, up_s);
         cb(tmp, "ffn_up_s", il);
     }
@@ -1721,12 +1771,12 @@ ggml_tensor * llm_graph_context::build_ffn(
         switch (type_gate) {
             case LLM_FFN_SEQ:
                 {
-                    cur = build_lora_mm(gate, tmp);
+                    cur = build_lora_mm(gate, tmp, gate_f8 ? gate_s : nullptr);
                     cb(cur, "ffn_gate", il);
                 } break;
             case LLM_FFN_PAR:
                 {
-                    cur = build_lora_mm(gate, cur);
+                    cur = build_lora_mm(gate, cur, gate_f8 ? gate_s : nullptr);
                     cb(cur, "ffn_gate", il);
                 } break;
         }
@@ -1736,7 +1786,7 @@ ggml_tensor * llm_graph_context::build_ffn(
             cb(cur, "ffn_gate_b", il);
         }
 
-        if (gate_s) {
+        if (gate_s && !gate_f8) {
             cur = ggml_mul(ctx0, cur, gate_s);
             cb(cur, "ffn_gate_s", il);
         }
@@ -1847,7 +1897,7 @@ ggml_tensor * llm_graph_context::build_ffn(
     }
 
     if (down) {
-        cur = build_lora_mm(down, cur);
+        cur = build_lora_mm(down, cur, down_f8 ? down_s : nullptr);
         if (arch == LLM_ARCH_GLM4 || arch == LLM_ARCH_GLM4_MOE || arch == LLM_ARCH_JAIS2) {
             // GLM4, GLM4_MOE, and JAIS2 seem to have numerical issues with half-precision accumulators
             ggml_mul_mat_set_prec(cur, GGML_PREC_F32);
@@ -1862,7 +1912,7 @@ ggml_tensor * llm_graph_context::build_ffn(
         cur = ggml_add(ctx0, cur, down_b);
     }
 
-    if (down_s) {
+    if (down_s && !down_f8) {
         cur = ggml_mul(ctx0, cur, down_s);
         cb(cur, "ffn_down_s", il);
     }
@@ -2540,7 +2590,10 @@ ggml_tensor * llm_graph_context::build_attn_mha(
          ggml_tensor * sinks,
          ggml_tensor * v_mla,
                float   kq_scale,
-                 int   il) const {
+                 int   il,
+             int32_t   n_kv_used,
+  std::vector<ggml_tensor *> * fa_implicit) const {
+    GGML_ASSERT(kq_mask != nullptr || n_kv_used == 0 || (cparams.flash_attn && kq_b == nullptr));
     const bool v_trans = v->nb[1] > v->nb[2];
 
     // split the batch into streams if needed
@@ -2577,6 +2630,13 @@ ggml_tensor * llm_graph_context::build_attn_mha(
 
         ggml_flash_attn_ext_add_sinks(cur, sinks);
         ggml_flash_attn_ext_set_prec (cur, GGML_PREC_F32);
+        if (kq_mask == nullptr && n_kv_used > 0) {
+            ggml_flash_attn_ext_set_kv_used(cur, n_kv_used);
+            // the cache extent changes every ubatch, so set_input refreshes it instead of rebuilding the graph
+            if (fa_implicit) {
+                fa_implicit->push_back(cur);
+            }
+        }
 
         if (v_mla) {
 #if 0
@@ -2757,9 +2817,12 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
 
         inp->self_k_idxs = mctx_cur->build_input_k_idxs(ctx0, ubatch);
         inp->self_v_idxs = mctx_cur->build_input_v_idxs(ctx0, ubatch);
-
-        inp->self_kq_mask = build_attn_inp_kq_mask(ctx0, mctx_cur, ubatch, cparams);
-        inp->self_kq_mask_cnv = inp->self_kq_mask;
+        // implicit causal mask (prefill-sized batches of one contiguous sequence): no mask tensor to fill and upload
+        inp->n_kv_used = llm_graph_attn_implicit_mask_n_kv_used(mctx_cur, ubatch, cparams);
+        if (inp->n_kv_used == 0) {
+            inp->self_kq_mask = build_attn_inp_kq_mask(ctx0, mctx_cur, ubatch, cparams);
+            inp->self_kq_mask_cnv = inp->self_kq_mask;
+        }
     }
 
     inp->self_k_rot = mctx_cur->build_input_k_rot(ctx0);
@@ -2834,7 +2897,7 @@ ggml_tensor * llm_graph_context::build_attn(
         v = mctx_cur->get_v(ctx0, il);
     }
 
-    if (kq_mask->ne[0] != k->ne[2]) {
+    if (kq_mask && kq_mask->ne[0] != k->ne[2]) {
         GGML_ASSERT(k->ne[2] <= kq_mask->ne[0]);
         kq_mask = ggml_view_4d(ctx0, kq_mask,
                 k->ne[2], kq_mask->ne[1], kq_mask->ne[2], kq_mask->ne[3],
@@ -2842,7 +2905,8 @@ ggml_tensor * llm_graph_context::build_attn(
         kq_mask = ggml_cont(ctx0, kq_mask);
     }
 
-    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il);
+    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il, inp->get_n_kv_used(),
+                                       &inp->fa_implicit);
     cb(cur, "kqv_out", il);
 
     if (inp->self_v_rot) {

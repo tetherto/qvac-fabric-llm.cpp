@@ -337,11 +337,20 @@ public:
 
     ggml_tensor * get_kq_mask() const { return self_kq_mask_cnv; }
 
+    // > 0: no mask tensor, the attention uses the implicit causal mask over cells [0, n_kv_used) (see build_attn_mha)
+    int32_t get_n_kv_used() const { return n_kv_used; }
+
     ggml_tensor * self_k_idxs = nullptr; // I64 [n_batch]
     ggml_tensor * self_v_idxs = nullptr; // I64 [n_batch] or [n_batch*n_embd_v_gqa]
 
-    ggml_tensor * self_kq_mask     = nullptr; // F32/F16 [n_kv, n_batch/n_stream, 1, n_stream]
+    ggml_tensor * self_kq_mask     = nullptr; // F32/F16 [n_kv, n_batch/n_stream, 1, n_stream], null with the implicit mask
     ggml_tensor * self_kq_mask_cnv = nullptr; //         [n_kv, n_batch/n_stream, 1, n_stream]
+
+    int32_t n_kv_used = 0;
+
+    // the flash-attn nodes built with the implicit mask; set_input refreshes their extent so a reused graph
+    // serves the next ubatch without a rebuild
+    std::vector<ggml_tensor *> fa_implicit;
 
     // note: assumes v_rot^2 == I
     ggml_tensor * self_k_rot = nullptr;
@@ -1135,11 +1144,14 @@ struct llm_graph_context {
             ggml_tensor * k,       // [n_embd_head_k, n_head_k, n_tokens]
             ggml_tensor * v,       // [n_embd_head_v, n_head_v, n_tokens] (v_trans = false)
             ggml_tensor * kq_b,
-            ggml_tensor * kq_mask,
+            ggml_tensor * kq_mask, // null with the implicit causal mask (n_kv_used > 0, flash attention only)
             ggml_tensor * sinks,   // [n_head_q]
             ggml_tensor * v_mla,   // [n_embd_head_v_mla, n_embd_head_v, n_head_v]
                   float   kq_scale,
-                    int   il) const;
+                    int   il,
+                int32_t   n_kv_used = 0,
+            // receives the flash-attn nodes built with the implicit mask, so set_input can refresh their extent
+            std::vector<ggml_tensor *> * fa_implicit = nullptr) const;
 
     llm_graph_input_attn_no_cache * build_attn_inp_no_cache() const;
 

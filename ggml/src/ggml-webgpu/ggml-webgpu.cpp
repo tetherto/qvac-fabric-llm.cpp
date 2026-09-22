@@ -4409,6 +4409,9 @@ static bool ggml_backend_webgpu_device_supports_op(ggml_backend_dev_t dev, const
             break;
         case GGML_OP_FLASH_ATTN_EXT:
             {
+                if (op->src[3] == nullptr && ggml_flash_attn_ext_get_kv_used(op) > 0) {
+                    return false;  // implicit causal mask (n_kv_used) is CPU/CUDA only
+                }
                 // conservative support checks for whether the more resource-intensive shader paths
                 // can be used, to avoid cases where flash_attn is assigned to the CPU later on
                 supports_op = src0->type == GGML_TYPE_F32 &&
@@ -4472,7 +4475,10 @@ static bool ggml_backend_webgpu_device_supports_op(ggml_backend_dev_t dev, const
         case GGML_OP_RMS_NORM:
         case GGML_OP_NORM:
         case GGML_OP_L2_NORM:
-            supports_op = (op->type == GGML_TYPE_F32 && src0->type == GGML_TYPE_F32) && ggml_is_contiguous_rows(src0);
+            // one workgroup per row: more rows than the dispatch limit cannot be encoded at all
+            supports_op = (op->type == GGML_TYPE_F32 && src0->type == GGML_TYPE_F32) && ggml_is_contiguous_rows(src0) &&
+                          ggml_nrows(src0) <=
+                              (int64_t) ctx->webgpu_global_ctx->capabilities.limits.maxComputeWorkgroupsPerDimension;
             break;
         case GGML_OP_ROPE:
             supports_op = op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16;

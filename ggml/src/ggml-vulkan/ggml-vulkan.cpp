@@ -21229,6 +21229,9 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
             }
         case GGML_OP_FLASH_ATTN_EXT:
             {
+                if (op->src[3] == nullptr && ggml_flash_attn_ext_get_kv_used(op) > 0) {
+                    return false; // implicit causal mask (n_kv_used) is CPU/CUDA only
+                }
                 bool coopmat2 = device->coopmat2;
                 uint32_t HSK = op->src[1]->ne[0];
                 uint32_t HSV = op->src[2]->ne[0];
