@@ -1,0 +1,249 @@
+#version 450
+// Adapted from the CUDA GDN kernel and lukdmine/llama.cpp gdn-fused-v2 (b6ceb2f6703ed70c3ddf62330b3f57aeae487207).
+#extension GL_EXT_control_flow_attributes : require
+#ifdef BFLOAT16
+#extension GL_EXT_bfloat16 : require
+#define REAL bfloat16_t
+#else
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#define REAL float16_t
+#endif
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+
+layout(local_size_x = 256) in;
+const uint V = 32;
+const uint WARPS = 8;
+layout(push_constant) uniform Parameters {
+    uint H, n_tokens, n_seqs, s_off;
+    uint sq1, sq2, sq3;
+    uint sv1, sv2, sv3;
+    uint sb1, sb2, sb3;
+    uint neq1, rq3;
+    float scale;
+    uint K;
+};
+layout(binding = 0) readonly buffer QBuf { float data_q[]; };
+layout(binding = 1) readonly buffer KBuf { float data_k[]; };
+layout(binding = 2) readonly buffer VBuf { float data_v[]; };
+layout(binding = 3) readonly buffer GBuf { float data_g[]; };
+layout(binding = 4) readonly buffer BetaBuf { float data_beta[]; };
+layout(binding = 5) readonly buffer StateBuf { float data_state[]; };
+layout(binding = 6) buffer DstBuf { float data_dst[]; };
+
+const uint C = 16;
+const uint D = 128;
+// Pad rows to reduce shared-memory bank conflicts in transposed loads.
+const uint DS = D + 8;
+const uint THREADS = WARPS * 32;
+const uint COL_TILES = V / 16;
+const uint QS = 512;
+const uint KS = QS + C * V;
+const uint Q = 0;
+const uint KEY = Q + C * DS;
+const uint P = KEY + C * DS;
+const uint INV = P + C * C;
+const uint DELTA = INV + C * C;
+const uint STATE = DELTA + C * V;
+const uint SIZE = STATE + D * V;
+shared REAL hi[SIZE], lo[SIZE];
+shared float tmp[WARPS * 16 * 16];
+shared float prefix[C], beta[C];
+#ifndef BFLOAT16
+shared float value_range[WARPS];
+#endif
+
+#define ACC coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>
+#define MAT_A coopmat<REAL, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA>
+#define MAT_B coopmat<REAL, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB>
+
+void pack(uint i, float x) {
+#ifdef BFLOAT16
+    hi[i] = REAL(x);
+    lo[i] = REAL(x - float(hi[i]));
+#else
+    // Use a seven-bit high mantissa and retain the residual in a second FP16 component.
+    uint bits = floatBitsToUint(x);
+    precise float rounded = uintBitsToFloat((bits + 0x7fffu + ((bits >> 16) & 1u)) & 0xffff0000u);
+    hi[i] = REAL(rounded);
+    lo[i] = REAL(x - rounded);
+#endif
+}
+
+void product(inout ACC sum, uint a, uint as, bool ta, uint b, uint bs, bool tb, uint count) {
+    [[unroll]] for (uint k = 0; k < count; k += 16) {
+        MAT_A ah, al;
+        MAT_B bh, bl;
+        if (ta) {
+            coopMatLoad(ah, hi, a + k * as, as, gl_CooperativeMatrixLayoutColumnMajor);
+            coopMatLoad(al, lo, a + k * as, as, gl_CooperativeMatrixLayoutColumnMajor);
+        } else {
+            coopMatLoad(ah, hi, a + k, as, gl_CooperativeMatrixLayoutRowMajor);
+            coopMatLoad(al, lo, a + k, as, gl_CooperativeMatrixLayoutRowMajor);
+        }
+        if (tb) {
+            coopMatLoad(bh, hi, b + k, bs, gl_CooperativeMatrixLayoutColumnMajor);
+            coopMatLoad(bl, lo, b + k, bs, gl_CooperativeMatrixLayoutColumnMajor);
+        } else {
+            coopMatLoad(bh, hi, b + k * bs, bs, gl_CooperativeMatrixLayoutRowMajor);
+            coopMatLoad(bl, lo, b + k * bs, bs, gl_CooperativeMatrixLayoutRowMajor);
+        }
+        sum = coopMatMulAdd(al, bh, sum);
+        sum = coopMatMulAdd(ah, bl, sum);
+        sum = coopMatMulAdd(ah, bh, sum);
+    }
+}
+
+void main() {
+    const uint tid = gl_LocalInvocationIndex;
+    const uint warp = gl_SubgroupID;
+    const uint lane = gl_SubgroupInvocationID;
+    const uint h = gl_WorkGroupID.x;
+    const uint seq = gl_WorkGroupID.y;
+    const uint v0 = gl_WorkGroupID.z * V;
+    const uint soff = (seq * H + h) * D * D;
+    const uint qoff = (seq / rq3) * sq3 + (h % neq1) * sq1;
+    const uint voff = seq * sv3 + h * sv1 + v0;
+    const uint goff = seq * sb3 + h * sb1;
+    const uint outoff = (seq * n_tokens * H + h) * D + v0;
+    ACC state[2];
+    [[unroll]] for (uint j = 0; j < 2; ++j) {
+        const uint ti = warp + j * WARPS, r = (ti / COL_TILES) * 16, c = (ti % COL_TILES) * 16;
+        coopMatLoad(state[j], data_state, soff + (v0 + c) * D + r, D, gl_CooperativeMatrixLayoutColumnMajor);
+    }
+    for (uint t0 = 0; t0 < n_tokens; t0 += C) {
+        const uint valid = min(C, n_tokens - t0);
+        float value_scale = 1.0;
+#ifndef BFLOAT16
+        // Scale this chunk's values and state together; their recurrence is linear.
+        float peak = 0.0;
+        [[unroll]] for (uint j = 0; j < 2; ++j) {
+            for (uint i = 0; i < state[j].length(); ++i) {
+                peak = max(peak, abs(state[j][i]));
+            }
+        }
+        for (uint i = tid; i < valid * V; i += THREADS) {
+            peak = max(peak, abs(data_v[voff + (t0 + i / V) * sv2 + i % V]));
+        }
+        for (uint mask = 16; mask > 0; mask /= 2) {
+            peak = max(peak, subgroupShuffleXor(peak, mask));
+        }
+        if (lane == 0) {
+            value_range[warp] = peak;
+        }
+        barrier();
+        for (uint i = 0; i < WARPS; ++i) {
+            peak = max(peak, value_range[i]);
+        }
+        value_scale = exp2(clamp(ceil(log2(max(peak, 1e-30))) - 8.0, -100.0, 120.0));
+#endif
+        [[unroll]] for (uint j = 0; j < 2; ++j) {
+            const uint ti = warp + j * WARPS, r = (ti / COL_TILES) * 16, c = (ti % COL_TILES) * 16;
+            state[j] *= 1.0 / value_scale;
+            coopMatStore(state[j], tmp, warp * 256, 16, gl_CooperativeMatrixLayoutRowMajor);
+            subgroupMemoryBarrierShared();
+            subgroupBarrier();
+            for (uint i = lane; i < 256; i += 32) {
+                pack(STATE + (r + i / 16) * V + c + i % 16, tmp[warp * 256 + i]);
+            }
+            subgroupMemoryBarrierShared();
+            subgroupBarrier();
+        }
+        for (uint i = tid; i < C * D; i += THREADS) {
+            const uint t = i / D, d = i % D;
+            const uint off = qoff + (t0 + t) * sq2 + d;
+            pack(Q + t * DS + d, t < valid ? data_q[off] * scale : 0.0);
+            pack(KEY + t * DS + d, t < valid ? data_k[off] : 0.0);
+        }
+        if (warp == 0) {
+            float g = lane < valid ? data_g[goff + (t0 + lane) * sb2] : 0.0;
+            for (uint offset = 1; offset < 16; offset *= 2) {
+                const float previous = subgroupShuffle(g, lane >= offset ? lane - offset : 0);
+                if (lane >= offset) {
+                    g += previous;
+                }
+            }
+            if (lane < C) {
+                prefix[lane] = g;
+                beta[lane] = lane < valid ? data_beta[goff + (t0 + lane) * sb2] : 0.0;
+            }
+        }
+        barrier();
+        // Gram matrices and state projections occupy disjoint scratch regions.
+        if (warp < 2) {
+            ACC x = ACC(0.0);
+            product(x, warp == 0 ? KEY : Q, DS, false, KEY, DS, true, D);
+            coopMatStore(x, tmp, warp * C * C, C, gl_CooperativeMatrixLayoutRowMajor);
+        } else if (warp < 2 + 2 * COL_TILES) {
+            const uint col = ((warp - 2) % COL_TILES) * 16;
+            ACC x = ACC(0.0);
+            product(x, warp < 2 + COL_TILES ? Q : KEY, DS, false, STATE + col, V, false, D);
+            coopMatStore(x, tmp, (warp < 2 + COL_TILES ? QS : KS) + col, V, gl_CooperativeMatrixLayoutRowMajor);
+        }
+        barrier();
+        for (uint i = tid; i < C * C; i += THREADS) {
+            const uint r = i / C, c = i % C;
+            const float decay = exp(prefix[r] - prefix[c]);
+            tmp[i] = c < r && r < valid ? tmp[i] * decay * beta[r] : 0.0;
+            pack(P + i, c <= r && r < valid ? tmp[256 + i] * decay : 0.0);
+        }
+        for (uint i = tid; i < C * V; i += THREADS) {
+            const uint t = i / V, v = i % V;
+            const float decay = exp(prefix[t]);
+            const float vv = t < valid ? data_v[voff + (t0 + t) * sv2 + v] / value_scale : 0.0;
+            pack(DELTA + i, beta[t] * (vv - decay * tmp[KS + i]));
+            tmp[QS + i] *= decay;
+        }
+        barrier();
+        for (uint row = warp; row < C; row += WARPS) {
+            float x = lane == row ? 1.0 : (lane < row ? -tmp[row * C + lane] : 0.0);
+            for (int pivot = int(row) - 1; pivot > 0; --pivot) {
+                const float xp = subgroupShuffle(x, uint(pivot));
+                if (lane < uint(pivot)) {
+                    x -= xp * tmp[uint(pivot) * C + lane];
+                }
+            }
+            if (lane < C) {
+                pack(INV + row * C + lane, x);
+            }
+        }
+        barrier();
+        if (warp < COL_TILES) {
+            ACC x = ACC(0.0);
+            product(x, INV, C, false, DELTA + warp * 16, V, false, C);
+            coopMatStore(x, tmp, warp * 16, V, gl_CooperativeMatrixLayoutRowMajor);
+        }
+        barrier();
+        for (uint i = tid; i < C * V; i += THREADS) {
+            pack(STATE + i, tmp[i]);
+        }
+        barrier();
+        if (warp < COL_TILES) {
+            ACC x = ACC(0.0);
+            product(x, P, C, false, STATE + warp * 16, V, false, C);
+            coopMatStore(x, tmp, KS + warp * 16, V, gl_CooperativeMatrixLayoutRowMajor);
+        }
+        barrier();
+        for (uint i = tid; i < C * V; i += THREADS) {
+            const uint t = i / V, v = i % V;
+            if (t < valid) {
+                data_dst[outoff + (t0 + t) * H * D + v] = (tmp[QS + i] + tmp[KS + i]) * value_scale;
+            }
+            pack(DELTA + i, tmp[i] * exp(prefix[valid - 1] - prefix[t]));
+        }
+        barrier();
+        [[unroll]] for (uint j = 0; j < 2; ++j) {
+            const uint ti = warp + j * WARPS, r = (ti / COL_TILES) * 16, c = (ti % COL_TILES) * 16;
+            state[j] *= exp(prefix[valid - 1]);
+            product(state[j], KEY + r, DS, true, DELTA + c, V, false, C);
+            state[j] *= value_scale;
+        }
+        barrier();
+    }
+    [[unroll]] for (uint j = 0; j < 2; ++j) {
+        const uint ti = warp + j * WARPS, r = (ti / COL_TILES) * 16, c = (ti % COL_TILES) * 16;
+        coopMatStore(state[j], data_dst, s_off + soff + (v0 + c) * D + r, D, gl_CooperativeMatrixLayoutColumnMajor);
+    }
+}

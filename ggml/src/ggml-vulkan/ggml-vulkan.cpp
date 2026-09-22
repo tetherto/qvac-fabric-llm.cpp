@@ -897,6 +897,7 @@ struct vk_device_struct {
     bool coopmat_acc_f32_support {};
     bool coopmat_acc_f16_support {};
     bool coopmat_bf16_support {};
+    bool coopmat_bf16_support_16x16x16_f32acc {};
     bool coopmat_support_16x16x16_f16acc {};
     bool coopmat_support_16x16x16_f32acc {};
     bool coopmat1_fa_support {};
@@ -1171,6 +1172,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_gated_linear_attn_f32;
     // [size_idx][kda] where size_idx: 0=d16, 1=d32, 2=d64, 3=d128
     vk_pipeline pipeline_gated_delta_net[4][2];
+    vk_pipeline pipeline_gated_delta_net_cm;
     // [size_idx][kda] where size_idx: 0=d32, 1=d64, 2=d128 (no d16 backward; falls back to CPU)
     vk_pipeline pipeline_gated_delta_net_back[3][2];
     vk_pipeline pipeline_ssm_scan_f32_d128;
@@ -6980,6 +6982,29 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 
     ggml_vk_create_pipeline(device, device->pipeline_gated_linear_attn_f32, "gated_linear_attn_f32", gated_linear_attn_f32_len, gated_linear_attn_f32_data, "main", 6, sizeof(vk_op_gated_linear_attn_push_constants), {1, 1, 1}, {}, 1);
 
+#if defined(GGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
+    // This tile layout regresses on RADV; keep its existing recurrent kernel.
+    if (device->vendor_id == VK_VENDOR_ID_NVIDIA && device->coopmat_support &&
+        device->subgroup_shuffle && device->subgroup_require_full_support &&
+        device->subgroup_size_control && device->subgroup_min_size <= 32 && device->subgroup_max_size >= 32 &&
+        device->max_workgroup_size_log2 >= 8 && device->properties.limits.maxComputeSharedMemorySize >= 46208) {
+#if defined(GGML_VULKAN_BFLOAT16_GLSLC_SUPPORT)
+        if (device->coopmat_bf16_support && device->coopmat_bf16_support_16x16x16_f32acc &&
+            device->properties.limits.maxComputeSharedMemorySize >= 46208) {
+            ggml_vk_create_pipeline(device, device->pipeline_gated_delta_net_cm, "gated_delta_net_bf16_cm1",
+                gated_delta_net_bf16_cm1_len, gated_delta_net_bf16_cm1_data, "main", 7,
+                sizeof(vk_op_gated_delta_net_push_constants), {1, 1, 32}, {}, 1, true, true, 32);
+        } else
+#endif
+        if (device->coopmat_support_16x16x16_f32acc && device->fp16 &&
+            device->properties.limits.maxComputeSharedMemorySize >= 46240) {
+            ggml_vk_create_pipeline(device, device->pipeline_gated_delta_net_cm, "gated_delta_net_f16_cm1",
+                gated_delta_net_f16_cm1_len, gated_delta_net_f16_cm1_data, "main", 7,
+                sizeof(vk_op_gated_delta_net_push_constants), {1, 1, 32}, {}, 1, true, true, 32);
+        }
+    }
+#endif
+
     {
         const uint32_t gdn_sizes[] = {16, 32, 64, 128};
         const char * gdn_names[][2] = {
@@ -8202,6 +8227,9 @@ static vk_device ggml_vk_get_device(size_t idx) {
                     prop.ResultType == VK_COMPONENT_TYPE_FLOAT32_KHR &&
                     (vk::ScopeKHR)prop.scope == vk::ScopeKHR::eSubgroup
                 ) {
+                    if (prop.MSize == 16 && prop.NSize == 16 && prop.KSize == 16) {
+                        device->coopmat_bf16_support_16x16x16_f32acc = true;
+                    }
                     // coopmat sizes not set yet
                     if (device->coopmat_m == 0) {
                         device->coopmat_bf16_support = true;
@@ -13733,6 +13761,13 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
         if (src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
             const uint32_t S_v = dst->src[2]->ne[0];
             const uint32_t kda = (dst->src[3]->ne[0] == (int64_t)S_v) ? 1 : 0;
+            const int64_t heads = dst->src[2]->ne[1];
+            if (ctx->device->pipeline_gated_delta_net_cm && S_v == 128 && kda == 0 &&
+                src0->ne[0] == 128 && src0->ne[1] == 16 &&
+                (heads == 16 || heads == 32 || heads == 48 || heads == 64) &&
+                dst->src[2]->ne[2] >= 512 && ggml_get_op_params_i32(dst, 0) == 1) {
+                return ctx->device->pipeline_gated_delta_net_cm;
+            }
             uint32_t si;
             switch (S_v) {
                 case 16:  si = 0; break;
