@@ -1,4 +1,3 @@
-// Chunked value tiling follows lukdmine/llama.cpp gdn-fused-v2, b6ceb2f6703ed70c3ddf62330b3f57aeae487207.
 #include "gated-delta-net-mma.cuh"
 #include "mma.cuh"
 
@@ -27,12 +26,17 @@ template <int R, int C> struct matrix {
     }
 
     __device__ __forceinline__ void store2(int r, int c, float2 x) {
+#ifdef GGML_USE_MUSA
+        store(r, c, x.x);
+        store(r, c + 1, x.y);
+#else
         const int    i                            = index(r, c);
         const auto   h                            = __float22bfloat162_rn(x);
         const float2 rounded                      = __bfloat1622float2(h);
         *reinterpret_cast<nv_bfloat162 *>(hi + i) = h;
         *reinterpret_cast<nv_bfloat162 *>(lo + i) =
             __float22bfloat162_rn(make_float2(x.x - rounded.x, x.y - rounded.y));
+#endif
     }
 
     __device__ __forceinline__ void store(int r, int c, float x) {
