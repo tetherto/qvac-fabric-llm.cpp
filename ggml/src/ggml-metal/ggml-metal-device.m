@@ -1212,6 +1212,7 @@ static bool ggml_metal_supports_mul_mat_op(
         bool src0_f16_has_mv,
         bool mm_path) {
     if (!has_simdgroup_reduction ||
+        ggml_is_tbq_or_pq(op->src[0]->type) ||
         op->src[0]->type == GGML_TYPE_NVFP4 ||
         op->src[0]->type == GGML_TYPE_TQ1_0) {
         return false;

@@ -6157,7 +6157,7 @@ void kernel_mul_mv_ptq1_0_f32_impl(
 
     device const block_ptq1_0 * ax[nr0];
     for (int row = 0; row < nr0; ++row) {
-        const uint64_t offset0 = (first_row + row)*args.nb01 + (i12/FC_mul_mv_r2)*args.nb02 + (i13/FC_mul_mv_r3)*args.nb03;
+        const uint64_t offset0 = min(first_row + row, args.ne01 - 1)*args.nb01 + (i12/FC_mul_mv_r2)*args.nb02 + (i13/FC_mul_mv_r3)*args.nb03;
         ax[row] = (device const block_ptq1_0 *) ((device char *) src0 + offset0);
     }
 
@@ -6310,7 +6310,7 @@ void kernel_mul_mv_pq2_0_f32_impl(
 
     device const block_pq2_0 * ax[nr0];
     for (int row = 0; row < nr0; ++row) {
-        const uint64_t offset0 = (first_row + row)*args.nb01 + (i12/FC_mul_mv_r2)*args.nb02 + (i13/FC_mul_mv_r3)*args.nb03;
+        const uint64_t offset0 = min(first_row + row, args.ne01 - 1)*args.nb01 + (i12/FC_mul_mv_r2)*args.nb02 + (i13/FC_mul_mv_r3)*args.nb03;
         ax[row] = (device const block_pq2_0 *) ((device char *) src0 + offset0);
     }
 
