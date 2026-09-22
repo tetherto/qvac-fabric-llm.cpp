@@ -6241,6 +6241,18 @@ kernel void kernel_mul_mv_ptq1_0_f32(
     kernel_mul_mv_ptq1_0_f32_impl<N_R0_PTQ1_0, constant ggml_metal_kargs_mul_mv &>(args, src0, src1, dst, nullptr, tgpig, tiisg, sgitg);
 }
 
+[[host_name("kernel_mul_mv_ptq1_0_f32_r4")]]
+kernel void kernel_mul_mv_ptq1_0_f32_r4(
+        constant ggml_metal_kargs_mul_mv & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    kernel_mul_mv_ptq1_0_f32_impl<N_R0_PTQ1_0_R4, constant ggml_metal_kargs_mul_mv &>(args, src0, src1, dst, nullptr, tgpig, tiisg, sgitg);
+}
+
 // PQ2_0 and Q2_0 dot against coefficients staged by the caller (same codec, group 128 vs 64). A byte is a base-4 fraction of
 // 256: with u = b/256 and g_k = floor(4^k*u), exact in fp32, the floor chain peels the
 // fields from the top down, g_1 = t_3, g_2 - 4*g_1 = t_2, g_3 - 4*g_2 = t_1 and

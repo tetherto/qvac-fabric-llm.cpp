@@ -990,7 +990,12 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
         case GGML_TYPE_PTQ1_0:
             {
                 nsg = N_SG_PTQ1_0;
-                nr0 = N_R0_PTQ1_0;
+                if (ne11 == 1 && ((ne01 == 5120 && ne00 == 17408) || (ne01 == 10240 && ne00 == 5120))) {
+                    nr0 = N_R0_PTQ1_0_R4;
+                    suffix = "_r4";
+                } else {
+                    nr0 = N_R0_PTQ1_0;
+                }
             } break;
         case GGML_TYPE_Q4_0:
             {
