@@ -574,9 +574,8 @@ void ggml_vec_dot_pq2_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const vo
 
     float sumf = 0.0f;
 
-#if (defined(__AVX512VNNI__) && defined(__AVX512VL__)) || defined(__AVXVNNI__)
-    // AVX-VNNI / AVX-512-VNNI: unpack 2-bit codes c in {0,1,2,3} (value = c-1), then
-    // dot((c-1), qy) = dpbusd(c, qy) - dpbusd(1, qy). Group 128 = four q8_0 sub-blocks.
+#if defined(__AVX2__)
+    // Unpack 2-bit codes c in {0,1,2,3}, then dot((c-1), qy) = dot(c, qy) - dot(1, qy).
     const __m256i ones   = _mm256_set1_epi8(1);
     const __m128i idxlo  = _mm_setr_epi8(0,0,0,0,1,1,1,1,2,2,2,2,3,3,3,3);
     const __m128i idxhi  = _mm_setr_epi8(4,4,4,4,5,5,5,5,6,6,6,6,7,7,7,7);
@@ -596,8 +595,14 @@ void ggml_vec_dot_pq2_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const vo
             r0 = _mm256_and_si256(_mm256_srli_epi16(_mm256_mullo_epi16(r0, mul), 6), three);
             r1 = _mm256_and_si256(_mm256_srli_epi16(_mm256_mullo_epi16(r1, mul), 6), three);
             __m256i codes = _mm256_permute4x64_epi64(_mm256_packus_epi16(r0, r1), 0xD8);
+#if (defined(__AVX512VNNI__) && defined(__AVX512VL__)) || defined(__AVXVNNI__)
             const int dp = hsum_i32_8(GGML_DPBUSD_256(_mm256_setzero_si256(), codes, qy));
             const int sy = hsum_i32_8(GGML_DPBUSD_256(_mm256_setzero_si256(), ones,  qy));
+#else
+            const __m256i ones16 = _mm256_set1_epi16(1);
+            const int dp = hsum_i32_8(_mm256_madd_epi16(_mm256_maddubs_epi16(codes, qy), ones16));
+            const int sy = hsum_i32_8(_mm256_madd_epi16(_mm256_maddubs_epi16(ones, qy), ones16));
+#endif
             sumi += d1 * (float)(dp - sy);
         }
         sumf += d0 * sumi;
@@ -628,10 +633,8 @@ void ggml_vec_dot_pq2_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const vo
     *s = sumf;
 }
 
-// PTQ1_0 x Q8_0 with AVX-VNNI / AVX-512-VNNI.
-// Decode trits to codes in {0,1,2}, then dot(code - 1, qy) = dpbusd(code, qy) - dpbusd(ones, qy).
 void ggml_vec_dot_ptq1_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
-#if (defined(__AVX512VNNI__) && defined(__AVX512VL__)) || defined(__AVXVNNI__)
+#if defined(__AVX2__)
     const int qk = QK_PTQ1_0;
     const int nb = n / qk;
 
@@ -703,8 +706,14 @@ void ggml_vec_dot_ptq1_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const v
             const block_q8_0 * GGML_RESTRICT yb = &y[i * 4 + k];
             const float d1 = GGML_CPU_FP16_TO_FP32(yb->d);
             const __m256i qy = _mm256_loadu_si256((const __m256i *) yb->qs);
+#if (defined(__AVX512VNNI__) && defined(__AVX512VL__)) || defined(__AVXVNNI__)
             const int dp = hsum_i32_8(GGML_DPBUSD_256(_mm256_setzero_si256(), cc[k], qy));
             const int sy = hsum_i32_8(GGML_DPBUSD_256(_mm256_setzero_si256(), ones, qy));
+#else
+            const __m256i ones16 = _mm256_set1_epi16(1);
+            const int dp = hsum_i32_8(_mm256_madd_epi16(_mm256_maddubs_epi16(cc[k], qy), ones16));
+            const int sy = hsum_i32_8(_mm256_madd_epi16(_mm256_maddubs_epi16(ones, qy), ones16));
+#endif
             sumi += d1 * (float) (dp - sy);
         }
         sumf += d0 * sumi;
