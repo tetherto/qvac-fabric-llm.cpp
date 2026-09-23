@@ -46,7 +46,7 @@ DESIGN_ENV = {
 def tag(extra: str = "") -> str:
     src = []
     for f in sorted(os.listdir(KERNEL_DIR)):
-        if not f.endswith(".py") or f == "design_tag.py":
+        if not f.endswith((".py", ".cc")) or f == "design_tag.py":
             continue
         with open(os.path.join(KERNEL_DIR, f), "rb") as fh:
             src.append(f + "\0" + fh.read().decode(errors="replace"))

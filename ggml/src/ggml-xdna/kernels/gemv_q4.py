@@ -3,7 +3,11 @@
 applied to the accumulator (gemv_q4.cc).
 
   rm -rf ~/.npu/cache && python3 gemv_q4.py -d npu2 --fmt q4g32
-  rm -rf ~/.npu/cache && python3 gemv_q4.py -d npu2 --fmt q8g16 -K 2048 -N 4096
+  rm -rf ~/.npu/cache && python3 gemv_q4.py -d npu2 --fmt q8g16 -K 2048 -N 4096 --n-core 64
+
+The q8 example needs --n-core 64: the shape alone derives 128, and two
+int8 code planes plus the parameter planes then ask for more L1 than a
+core has.
 
 The core program depends only on (format, N_CORE, K_TILE), so one artifact per
 format serves every shape and the backend builds its own instruction stream

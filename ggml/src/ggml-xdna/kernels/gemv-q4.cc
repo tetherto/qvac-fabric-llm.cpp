@@ -462,7 +462,7 @@ static void gemv_q4g32(const uint8_t *w, const int32_t *a32, float *out)
     constexpr int PARAM_BYTES = 4 * VEC;           // d8[32], m8[32] bf16
     constexpr int BLOCK = CODE_BYTES + PARAM_BYTES;
     constexpr int SBG   = 256 / Q4_GROUP;          // groups to a super-block
-    constexpr int NSUP  = K_TILE_Q4 / 256 > 0 ? K_TILE_Q4 / 256 : 1;
+    constexpr int NSUP  = K_TILE / 256 > 0 ? K_TILE / 256 : 1;
     constexpr int SUP_BYTES = 4 * VEC * 2;
 
     const uint8_t *a = (const uint8_t *)a32;
@@ -636,7 +636,7 @@ static void gemv_q8g16(const uint8_t *w, const int32_t *a32, float *out)
     constexpr int PARAM_BYTES = 4 * VEC;       // d8[32], m8[32] bf16
     constexpr int BLOCK = CODE_BYTES + PARAM_BYTES;
     constexpr int SBG   = 256 / Q8_GROUP;
-    constexpr int NSUP  = K_TILE_Q4 / 256 > 0 ? K_TILE_Q4 / 256 : 1;
+    constexpr int NSUP  = K_TILE / 256 > 0 ? K_TILE / 256 : 1;
     constexpr int SUP_BYTES = 4 * VEC * 2;
 
     const uint8_t *a = (const uint8_t *)a32;
