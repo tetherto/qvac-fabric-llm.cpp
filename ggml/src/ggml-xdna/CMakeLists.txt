@@ -48,7 +48,7 @@ set(XDNA_GEMM_M_BIG 256)    # base prefill M block
 set(XDNA_TILE_M_BIG 32)     # bf16 prefill per-core M tile
 set(XDNA_TILE_M_BIG_I8 64)  # int8 prefill per-core M tile
 set(XDNA_GEMM_M_BIG_EXTRA 512 2048)   # extra prefill M blocks (baked variants)
-set(XDNA_GATED_FMT 1 CACHE STRING
+set(GGML_XDNA_GATED_FMT 1 CACHE STRING
     "ggml-xdna: gated activation layout baked into the fused layer (0 = 4-bit, for a Q4_K ssm_out; 1 = 8-bit, for Q5_K/Q6_K)")
 set(XDNA_TILE_K 64)         # per-core K tile (larger = fewer C reloads per call)
 set(XDNA_TILE_N 64)         # per-core N tile (wider = longer B DDR bursts)
@@ -64,7 +64,7 @@ target_compile_definitions(ggml-xdna PRIVATE
     GGML_XDNA_TILE_N=${XDNA_TILE_N}
     GGML_XDNA_N_COLS=${XDNA_N_COLS}
     GGML_XDNA_N_COMPUTE_ROWS=${XDNA_N_COMPUTE_ROWS}
-    GGML_XDNA_GATED_FMT=${XDNA_GATED_FMT}
+    GGML_XDNA_GATED_FMT=${GGML_XDNA_GATED_FMT}
 )
 
 # NPU kernels are compiled out-of-line by kernels/gemm.py (IRON/MLIR-AIE) at
@@ -272,7 +272,7 @@ if (GGML_XDNA_BUILD_KERNELS)
     set(FL_INSTS  "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/fused_layer.insts.bin")
     add_custom_command(
         OUTPUT ${FL_XCLBIN} ${FL_INSTS}
-        COMMAND ${CMAKE_COMMAND} -E env GATED_FMT=${XDNA_GATED_FMT}
+        COMMAND ${CMAKE_COMMAND} -E env GATED_FMT=${GGML_XDNA_GATED_FMT}
                 ${GEMM_PYTHON} "${GEMM_DIR}/fused_layer.py"
                 -d npu2
                 --xclbin-path ${FL_XCLBIN}
@@ -313,7 +313,7 @@ if (GGML_XDNA_BUILD_KERNELS)
 
     add_custom_command(
         OUTPUT ${GV_XCLBIN} ${GV_INSTS}
-        COMMAND ${CMAKE_COMMAND} -E env GATED_FMT=${XDNA_GATED_FMT}
+        COMMAND ${CMAKE_COMMAND} -E env GATED_FMT=${GGML_XDNA_GATED_FMT}
                 ${GEMM_PYTHON} "${GEMM_DIR}/gemv_q4.py"
                 -d npu2 --fmt q8g16
                 -K 1024 -N 1024
@@ -344,7 +344,7 @@ if (GGML_XDNA_BUILD_KERNELS)
     endforeach()
     add_custom_command(
         OUTPUT ${XDNA_TAGGED_ARTIFACTS}
-        COMMAND ${CMAKE_COMMAND} -E env GATED_FMT=${XDNA_GATED_FMT}
+        COMMAND ${CMAKE_COMMAND} -E env GATED_FMT=${GGML_XDNA_GATED_FMT}
                 ${GEMM_PYTHON} "${GEMM_DIR}/design_tag.py"
                 --stamp-dir ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}
                 --extra npu2

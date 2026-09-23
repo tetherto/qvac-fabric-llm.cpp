@@ -122,6 +122,8 @@ prefill kernels); the fused layer never fires there.
 - Linux with an AMD NPU2 (XDNA2) device; it shows up as `/dev/accel/accel0` and
   in `xrt-smi examine`.
 - XRT 2.25.37 under `/opt/xilinx/xrt`, with its tools on the `PATH`.
+- libuuid development files (Ubuntu: `uuid-dev`). The XRT headers include
+  `<uuid/uuid.h>` and the link needs `-luuid`; XRT does not bring either.
 - A Python interpreter with IRON (mlir-aie + llvm-aie) to compile the kernels.
   Verified against mlir-aie 1.4.3: the RTP buffer bases in `xdna-seq.h` are read
   back from that toolchain's placement, so a version bump needs them re-read
@@ -204,8 +206,8 @@ disables the NPU path it names, and the default is the fast one.
 | `GGML_XDNA_CONV` | 1 | `0` runs the prefill conv on the host |
 | `GGML_XDNA_GDN` | 0 | `1` runs the GDN prefill body on the array |
 | `GGML_XDNA_FA` | 0 | `1` runs flash-attention prefill on the array |
-| `GGML_XDNA_GEMV_PROMOTE` | 0 | `1` lets one GEMV dispatch mix weight formats |
-| `GGML_XDNA_SPIN` | 0 | `1` polls for kernel completion instead of blocking |
+| `GGML_XDNA_GEMV_PROMOTE` | 1 | `0` stops one GEMV dispatch mixing weight formats |
+| `GGML_XDNA_SPIN` | 1 | `0` blocks for kernel completion instead of polling |
 
 ## Troubleshooting
 

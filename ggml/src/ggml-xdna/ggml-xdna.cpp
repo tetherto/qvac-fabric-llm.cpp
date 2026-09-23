@@ -363,7 +363,12 @@ struct xdna_rec_session {
     // (xdna-rec-gemv.h), so the layer never changes hardware context.
     xdna_rec_gemv * gv = nullptr;
     xdna_rec_layer_host host;
-    bool seeded = false;
+    bool seeded = false;          // core/gemv built and state seeded once
+    // Set when a prefill ubatch made the llama recurrent cache authoritative
+    // again. The session key tells concurrent sequences apart by their cell
+    // row, but a later request reuses that row, so without re-seeding the
+    // device would carry the previous sequence's conv history and ssm state.
+    bool reseed = false;
     std::vector<uint8_t> feed0;        // one-time feed host buffer (hist+qkv+conv W)
     std::vector<uint8_t> x;            // per-token host buffer (eg/beta/scale tails)
     std::vector<float> hattn, hout, hff;
@@ -770,6 +775,27 @@ static bool xdna_rec_run(ggml_backend_xdna_context * ctx, xdna_rec_plan & p,
         s->hout.resize((size_t) g.d_out);
         s->hff.resize((size_t) g.d_out);
         s->aq.resize(KGATE);
+    } else if (s->reseed) {
+        const float * ch = !s->cap_conv.empty() ? s->cap_conv.data()
+                                                : xdna_rec_tdata(p.n_convst, 3 * CH);
+        const float * st = !s->cap_ss.empty() ? s->cap_ss.data()
+                                              : xdna_rec_tdata(p.n_sstate, state_floats());
+        if (!ch || !st) {
+            GGML_LOG_ERROR("%s: fused layer %d: no recurrent state to re-seed\n",
+                           "ggml-xdna", p.il);
+            return false;
+        }
+        // Only the state: the core, the GEMV and the fused stream are the same
+        // design and stay as they are. xdna_rec_core_begin re-uploads the feed
+        // object and rewinds the token counter, it allocates nothing.
+        xdna_rec_pack_begin(s->host, ch, qkv, s->feed0);
+        if (!xdna_rec_core_begin(s->core, s->feed0.data(), s->host.w_ssm_norm)) {
+            return false;
+        }
+        if (!xdna_rec_core_seed(s->core, st)) {
+            return false;
+        }
+        s->reseed = false;
     }
 
     const float * hres = !s->cap_hres.empty() ? s->cap_hres.data()
@@ -1102,6 +1128,14 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
     // Size the host-fallback pool for this chunk (xdna_glue_threads).
     xdna_glue_set_n_tokens(cgraph);
 
+    // A prefill ubatch rewrites the recurrent cache, so every live session has
+    // to take its state from there again on the next token (xdna_rec_session).
+    if (g_glue_n_tokens > 1) {
+        for (auto & kv : ctx->rec) {
+            kv.second->reseed = true;
+        }
+    }
+
     // Per-op NPU kernels are suppressed while the fused layer path is active
     // (default when the fused xclbins are present): the fused run owns the
     // recurrent layers and everything else falls back to the CPU glue.
@@ -1250,8 +1284,8 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                         std::memcpy(s->cap_qkv.data(), node->data,
                                     xdna_rec_pack::CH * sizeof(float));
                         break;
-                    case 1: // conv seed (only consumed at the one-time seed)
-                        if (!s->seeded) {
+                    case 1: // conv seed (consumed when seeding or re-seeding)
+                        if (!s->seeded || s->reseed) {
                             s->cap_conv.resize(3 * xdna_rec_pack::CH);
                             std::memcpy(s->cap_conv.data(), node->data,
                                         3 * xdna_rec_pack::CH * sizeof(float));
@@ -1259,7 +1293,7 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                         break;
                     case 2: { // ssm seed (only consumed at the one-time seed)
                         const int64_t n = xdna_rec_pack::state_floats();
-                        if (!s->seeded) {
+                        if (!s->seeded || s->reseed) {
                             s->cap_ss.resize((size_t) n);
                             std::memcpy(s->cap_ss.data(), node->data, (size_t) n * sizeof(float));
                         }
