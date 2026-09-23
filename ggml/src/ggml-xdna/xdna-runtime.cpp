@@ -244,7 +244,7 @@ bool xdna_run_wait(xrt::run & run) {
         // ones sit on a floor of about 125 us where their weights need 60.
         // The decode is sequential, so the thread that would block here has
         // nothing else to do with the time.
-        static const bool spin = xdna_env_on("GGML_XDNA_SPIN");
+        static const bool spin = xdna_env_int("GGML_XDNA_SPIN", 1) != 0;
         if (spin) {
             for (int i = 0; i < (1 << 22); i++) {
                 const ert_cmd_state s = run.state();
