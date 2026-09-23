@@ -765,7 +765,10 @@ class ModelBase:
             for index, name in enumerate(weight_names):
                 match = fused_pattern.fullmatch(name)
                 if match:
-                    fused_layers.add(int(match.group("bid")))
+                    bid = int(match.group("bid"))
+                    if bid in fused_layers:
+                        raise ValueError(f"duplicate Hadamard fused expert record for layer {bid}")
+                    fused_layers.add(bid)
                     continue
                 for kind, pattern in split_patterns.items():
                     match = pattern.fullmatch(name)

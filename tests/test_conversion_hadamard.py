@@ -106,6 +106,10 @@ def test_hadamard_metadata_uses_fused_expert_name(tmp_path):
             [folded("blk.0.ffn_gate_exps.weight"), folded("blk.0.ffn_gate_exps.weight")],
             "duplicate Hadamard split",
         ),
+        (
+            [folded("blk.0.ffn_gate_up_exps.weight"), folded("blk.0.ffn_gate_up_exps.weight")],
+            "duplicate Hadamard fused",
+        ),
     ],
 )
 def test_hadamard_metadata_rejects_unsafe_fusion(tmp_path, tensors, message):
@@ -113,6 +117,7 @@ def test_hadamard_metadata_rejects_unsafe_fusion(tmp_path, tensors, message):
 
     with pytest.raises(ValueError, match=message):
         model.add_hadamard_metadata()
+    assert model.gguf_writer.values == {}
 
 
 def test_hadamard_metadata_rejects_qwen3_moe(tmp_path):
