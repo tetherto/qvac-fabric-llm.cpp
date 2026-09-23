@@ -52,7 +52,13 @@ env:
   LLAMA_ARG_LOG_TIMESTAMPS: 1
 
 jobs:
+  authorize:
+    permissions: {}
+    uses: ./.github/workflows/reusable-authorize-self-hosted.yml
+
   cpu-x64-high-perf:
+    needs: authorize
+    if: needs.authorize.outputs.allowed == 'true'
     runs-on: qvac-ubuntu2204-x64
 
     steps:

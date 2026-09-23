@@ -54,7 +54,13 @@ env:
   LLAMA_ARG_LOG_TIMESTAMPS: 1
 
 jobs:
+  authorize:
+    permissions: {}
+    uses: ./.github/workflows/reusable-authorize-self-hosted.yml
+
   gpu-webgpu-nvidia:
+    needs: authorize
+    if: needs.authorize.outputs.allowed == 'true'
     # runs-on: "hf-jobs-t4-small:ubuntu26_04"
     runs-on: qvac-ubuntu2404-x64-gpu
 
@@ -113,6 +119,8 @@ jobs:
           save: true
 
   gpu-webgpu-apple:
+    needs: authorize
+    if: needs.authorize.outputs.allowed == 'true'
     runs-on: qvac-macos26-arm64-gpu
 
     steps:

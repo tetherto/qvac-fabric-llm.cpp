@@ -51,7 +51,13 @@ env:
   LLAMA_ARG_LOG_TIMESTAMPS: 1
 
 jobs:
+  authorize:
+    permissions: {}
+    uses: ./.github/workflows/reusable-authorize-self-hosted.yml
+
   cuda:
+    needs: authorize
+    if: needs.authorize.outputs.allowed == 'true'
     runs-on: "hf-jobs-t4-medium:cuda13"
 
     steps:
@@ -123,6 +129,8 @@ jobs:
           GGML_CUDA_DEVICES=4 ./build/bin/test-llama-archs -s 1
 
   metal:
+    needs: authorize
+    if: needs.authorize.outputs.allowed == 'true'
     runs-on: [self-hosted, macOS, ARM64]
 
     steps:
@@ -163,6 +171,8 @@ jobs:
           GGML_METAL_DEVICES=4 ./build/bin/test-llama-archs -s 1
 
   rocm:
+    needs: authorize
+    if: needs.authorize.outputs.allowed == 'true'
     runs-on: [self-hosted, Linux, gfx1201, 1accel]
     container: "rocm/dev-ubuntu-24.04:7.2.4-complete"
 
@@ -236,6 +246,8 @@ jobs:
           GGML_CUDA_DEVICES=4 ./build/bin/test-llama-archs -s 1
 
   vulkan-nvidia:
+    needs: authorize
+    if: needs.authorize.outputs.allowed == 'true'
     runs-on: "hf-jobs-t4-small:ubuntu26_04"
 
     steps:
@@ -303,6 +315,8 @@ jobs:
           ./build/bin/test-llama-archs -s 1
 
   vulkan-amd:
+    needs: authorize
+    if: needs.authorize.outputs.allowed == 'true'
     runs-on: [self-hosted, Linux, gfx1201, 1accel]
     container: "ubuntu:26.04"
 
@@ -371,6 +385,8 @@ jobs:
           ./build/bin/test-llama-archs -s 1
 
   webgpu-nvidia:
+    needs: authorize
+    if: needs.authorize.outputs.allowed == 'true'
     runs-on: "hf-jobs-t4-small:ubuntu26_04"
 
     steps:
