@@ -63,16 +63,8 @@ jobs:
         id: checkout
         uses: actions/checkout@v6
 
-      - name: Install dependencies
-        run: |
-          sudo apt update
-          sudo apt install -y software-properties-common
-          sudo add-apt-repository ppa:deadsnakes/ppa
-          sudo apt update
-          sudo apt install -y build-essential cmake libxcb-xinput0 libxcb-xinerama0 libxcb-cursor-dev libvulkan1 mesa-vulkan-drivers libglvnd0 libgl1 libglx0 libegl1 libgles2 libssl-dev time unzip wget python3.12 python3.12-venv
-          sudo update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.12 1
-          sudo update-alternatives --config python3
-
+      # No `sudo apt install` step: the self-hosted runners are de-sudoed, and these
+      # packages are already provisioned fleet-wide on the runners.
       - name: ccache
         uses: ggml-org/ccache-action@v1.2.24
         with:

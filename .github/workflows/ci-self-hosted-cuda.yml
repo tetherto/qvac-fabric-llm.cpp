@@ -64,11 +64,8 @@ jobs:
         id: checkout
         uses: actions/checkout@v6
 
-      - name: Install dependencies
-        run: |
-          sudo apt update
-          sudo apt install -y cmake libssl-dev time unzip wget python3 python3-venv python3-pip
-
+      # No `sudo apt install` step: the self-hosted runners are de-sudoed, and these
+      # packages are already provisioned fleet-wide on the runners.
       - name: ccache
         uses: ggml-org/ccache-action@v1.2.24
         with:
