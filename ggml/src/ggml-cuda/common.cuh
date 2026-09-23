@@ -1399,6 +1399,7 @@ struct ggml_backend_cuda_context {
 #endif
 
     int curr_stream_no = 0;
+    uint64_t mlp_fusion_count = 0;
 
 #ifdef USE_CUDA_GRAPH
     // Map from first_node_ptr to cuda_graph - allows multiple graphs per context

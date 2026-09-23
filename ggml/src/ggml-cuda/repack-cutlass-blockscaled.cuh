@@ -3,15 +3,15 @@
 #include "common.cuh"
 
 static __host__ __device__ __forceinline__ int64_t ggml_cuda_cutlass_blockscaled_scale_offset(
-        int row, int scale_block, int scale_blocks_padded) {
-    const int inner_k       = scale_block % 4;
-    const int inner_m       = (row % 128) / 32;
-    const int outer_m       = row % 32;
-    const int k_tile        = scale_block / 4;
-    const int m_tile        = row / 128;
-    const int k_tile_stride = 512;
-    const int m_tile_stride = (scale_blocks_padded / 4) * k_tile_stride;
-    return (int64_t) m_tile * m_tile_stride + (int64_t) k_tile * k_tile_stride +
+        int64_t row, int64_t scale_block, int64_t scale_blocks_padded) {
+    const int64_t inner_k       = scale_block % 4;
+    const int64_t inner_m       = (row % 128) / 32;
+    const int64_t outer_m       = row % 32;
+    const int64_t k_tile        = scale_block / 4;
+    const int64_t m_tile        = row / 128;
+    const int64_t k_tile_stride = 512;
+    const int64_t m_tile_stride = (scale_blocks_padded / 4) * k_tile_stride;
+    return m_tile * m_tile_stride + k_tile * k_tile_stride +
         outer_m * 16 + inner_m * 4 + inner_k;
 }
 
