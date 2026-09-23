@@ -990,7 +990,7 @@ void xdna_ops_plan_gemv(xdna_ops * ops, const struct ggml_cgraph * cgraph,
         // at 56 GB/s and ~150 us a dispatch that is worth it up to about 8 MB,
         // and the projections this joins are far under.
         // GGML_XDNA_GEMV_PROMOTE=0 keeps a group to one natural format.
-        static const bool promote = xdna_env_on("GGML_XDNA_GEMV_PROMOTE");
+        static const bool promote = xdna_env_int("GGML_XDNA_GEMV_PROMOTE", 1) != 0;
         enum ggml_type gtype = node->src[0]->type;
         for (int j = i + 1; j < cgraph->n_nodes; j++) {
             struct ggml_tensor * cand = cgraph->nodes[j];

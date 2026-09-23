@@ -58,7 +58,7 @@ static bool ggml_xdna_is_view_op(enum ggml_op op) {
 // ---------------------------------------------------------------------------
 
 static bool xdna_glue_active(void) {
-    return xdna_env_on("GGML_XDNA_GLUE");
+    return xdna_env_int("GGML_XDNA_GLUE", 1) != 0;
 }
 
 // True when `op` is claimed by the backend and should be glued (CPU-run) when
