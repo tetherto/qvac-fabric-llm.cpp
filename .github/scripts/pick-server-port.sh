@@ -24,7 +24,11 @@ set -euo pipefail
 
 readonly RANGE_START=20000
 readonly BLOCK_SIZE=8
-readonly BLOCK_COUNT=2500  # 20000-39999, clear of the ephemeral range
+# 20000-32767. The ceiling is ip_local_port_range's default floor of 32768: a
+# block above it can already hold an outbound connection's source port, which a
+# connect probe cannot see (it only detects listeners), so the block would be
+# reported free and llama-server would fail to bind later.
+readonly BLOCK_COUNT=1596
 readonly MAX_PROBES=200
 
 # The fallback keeps this usable outside CI.
