@@ -3828,15 +3828,122 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
     return false;
 }
 
-// try and fuse nodes and return the number of nodes to skip
-static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
+static const ggml_tensor * ggml_cuda_get_mul_mat_scale(const ggml_tensor * scale_node, const ggml_tensor * mm_node) {
+    const bool scale_lhs_mm = scale_node->src[0] == mm_node;
+    const bool scale_rhs_mm = scale_node->src[1] == mm_node;
+    if (!scale_lhs_mm && !scale_rhs_mm) {
+        return nullptr;
+    }
 
+    const ggml_tensor * scale = scale_lhs_mm ? scale_node->src[1] : scale_node->src[0];
+    if (mm_node->src[0]->type != GGML_TYPE_NVFP4 || scale_node->type != GGML_TYPE_F32 || scale->type != GGML_TYPE_F32 ||
+        !ggml_is_contiguous(scale) || ggml_nelements(scale) != 1 || !ggml_are_same_shape(scale_node, mm_node)) {
+        return nullptr;
+    }
+
+    return scale;
+}
+
+struct ggml_cuda_mlp_bf16_match {
+    ggml_tensor *       first_mm   = nullptr;
+    ggml_tensor *       second_mm  = nullptr;
+    ggml_tensor *       gate_mm    = nullptr;
+    ggml_tensor *       up_mm      = nullptr;
+    ggml_tensor *       gate_mul   = nullptr;
+    ggml_tensor *       up_mul     = nullptr;
+    ggml_tensor *       glu        = nullptr;
+    ggml_tensor *       down_mm    = nullptr;
+    const ggml_tensor * input      = nullptr;
+    const ggml_tensor * gate_scale = nullptr;
+    const ggml_tensor * up_scale   = nullptr;
+};
+
+static bool ggml_cuda_match_mlp_bf16(const ggml_cgraph * cgraph, int i, ggml_cuda_mlp_bf16_match & match) {
+    match = {};
+    static const bool disable =
+        getenv("GGML_CUDA_DISABLE_MLP_BF16_FP4") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_MLP_BF16_FP4")) != 0;
+    if (disable || i + 5 >= cgraph->n_nodes) {
+        return false;
+    }
+    if (cgraph->nodes[i]->op != GGML_OP_MUL_MAT || cgraph->nodes[i]->src[1] == nullptr ||
+        ggml_nrows(cgraph->nodes[i]->src[1]) <= MMVQ_MAX_BATCH_SIZE) {
+        return false;
+    }
+
+    const ggml_op ops[] = {
+        GGML_OP_MUL_MAT, GGML_OP_MUL, GGML_OP_MUL_MAT, GGML_OP_MUL, GGML_OP_GLU, GGML_OP_MUL_MAT,
+    };
+    const int out_nodes[] = { i + 5 };
+    if (!ggml_can_fuse_subgraph(cgraph, i, 6, ops, out_nodes, 1)) {
+        return false;
+    }
+
+    ggml_tensor *       mm0    = cgraph->nodes[i];
+    ggml_tensor *       mul0   = cgraph->nodes[i + 1];
+    ggml_tensor *       mm1    = cgraph->nodes[i + 2];
+    ggml_tensor *       mul1   = cgraph->nodes[i + 3];
+    ggml_tensor *       glu    = cgraph->nodes[i + 4];
+    ggml_tensor *       down   = cgraph->nodes[i + 5];
+    const ggml_tensor * scale0 = ggml_cuda_get_mul_mat_scale(mul0, mm0);
+    const ggml_tensor * scale1 = ggml_cuda_get_mul_mat_scale(mul1, mm1);
+    if (scale0 == nullptr || scale1 == nullptr || mm0->src[1] != mm1->src[1] ||
+        ggml_get_glu_op(glu) != GGML_GLU_OP_SWIGLU || down->src[1] != glu || down->src[0] == nullptr ||
+        down->src[0]->type != GGML_TYPE_NVFP4) {
+        return false;
+    }
+
+    if (glu->src[0] == mul0 && glu->src[1] == mul1) {
+        match.gate_mm    = mm0;
+        match.gate_mul   = mul0;
+        match.gate_scale = scale0;
+        match.up_mm      = mm1;
+        match.up_mul     = mul1;
+        match.up_scale   = scale1;
+    } else if (glu->src[0] == mul1 && glu->src[1] == mul0) {
+        match.gate_mm    = mm1;
+        match.gate_mul   = mul1;
+        match.gate_scale = scale1;
+        match.up_mm      = mm0;
+        match.up_mul     = mul0;
+        match.up_scale   = scale0;
+    } else {
+        return false;
+    }
+
+    match.first_mm  = mm0;
+    match.second_mm = mm1;
+    match.glu       = glu;
+    match.down_mm   = down;
+    match.input     = mm0->src[1];
+
+    const int materialized_nodes[] = { i + 4 };
+    return ggml_cuda_check_fusion_memory_ranges(cgraph, i, 5, materialized_nodes, 1);
+}
+
+struct ggml_cuda_cutlass_activation_plan;
+static int ggml_cuda_try_fuse_mlp_bf16(ggml_backend_cuda_context *         cuda_ctx,
+                                       ggml_cgraph *                       cgraph,
+                                       int                                 i,
+                                       ggml_cuda_cutlass_activation_plan & activation_plan);
+
+// try and fuse nodes and return the number of nodes to skip
+static int ggml_cuda_try_fuse(ggml_backend_cuda_context *         cuda_ctx,
+                              ggml_cgraph *                       cgraph,
+                              int                                 i,
+                              ggml_cuda_cutlass_activation_plan * activation_plan) {
     static bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
     if (disable_fusion) {
         return 0;
     }
 
     ggml_tensor * node = cgraph->nodes[i];
+
+    if (activation_plan != nullptr) {
+        const int nodes_to_skip = ggml_cuda_try_fuse_mlp_bf16(cuda_ctx, cgraph, i, *activation_plan);
+        if (nodes_to_skip != 0) {
+            return nodes_to_skip;
+        }
+    }
 
     // gated_delta_net -> cpy: scatter recurrent-state snapshots into the cache
     if (node->op == GGML_OP_GATED_DELTA_NET) {
@@ -4023,23 +4130,6 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     bool fused_mul_mat_vec = false;
     int  fused_node_count  = 0;
 
-    auto get_mul_mat_scale = [](const ggml_tensor * scale_node, const ggml_tensor * mm_node) -> const ggml_tensor * {
-        const bool scale_lhs_mm = scale_node->src[0] == mm_node;
-        const bool scale_rhs_mm = scale_node->src[1] == mm_node;
-        if (!scale_lhs_mm && !scale_rhs_mm) {
-            return nullptr;
-        }
-
-        const ggml_tensor * scale = scale_lhs_mm ? scale_node->src[1] : scale_node->src[0];
-        if (mm_node->src[0]->type != GGML_TYPE_NVFP4 || scale_node->type != GGML_TYPE_F32 ||
-                scale->type != GGML_TYPE_F32 || !ggml_is_contiguous(scale) || ggml_nelements(scale) != 1 ||
-                !ggml_are_same_shape(scale_node, mm_node)) {
-            return nullptr;
-        }
-
-        return scale;
-    };
-
     auto get_mul_mat_id_scale = [](const ggml_tensor * reshape, const ggml_tensor * repeat, const ggml_tensor * getrows,
             const ggml_tensor * scale_node, const ggml_tensor * mm_node) -> const ggml_tensor * {
         if (repeat->src[0] != reshape || getrows->src[0] != repeat || getrows->src[1] != mm_node->src[2]) {
@@ -4126,8 +4216,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                     continue;
                 }
 
-                const ggml_tensor * gate_scale = get_mul_mat_scale(gate_scale_n, gate_n);
-                const ggml_tensor * up_scale   = get_mul_mat_scale(up_scale_n, up_n);
+                const ggml_tensor * gate_scale = ggml_cuda_get_mul_mat_scale(gate_scale_n, gate_n);
+                const ggml_tensor * up_scale   = ggml_cuda_get_mul_mat_scale(up_scale_n, up_n);
                 if (!gate_scale || !up_scale) {
                     continue;
                 }
@@ -4410,7 +4500,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
             const ggml_tensor * scale = nullptr;
             if (op == GGML_OP_MUL_MAT) {
-                scale = get_mul_mat_scale(scale_node, mm_node);
+                scale = ggml_cuda_get_mul_mat_scale(scale_node, mm_node);
             } else {
                 scale = get_mul_mat_id_scale(cgraph->nodes[i + 1], cgraph->nodes[i + 2], cgraph->nodes[i + 3], scale_node, mm_node);
             }
@@ -4645,17 +4735,38 @@ struct ggml_cuda_cutlass_activation_plan {
         int                                 last                = 0;
         int                                 slot                = 0;
         size_t                              workspace_offset    = 0;
+        size_t                              workspace_size      = 0;
         bool                                prepared            = false;
         ggml_cuda_cutlass_activation        activation = {};
     };
 
+    struct mlp {
+        ggml_cuda_mlp_bf16_match            match;
+        size_t                              group_index   = 0;
+        size_t                              gate_offset   = 0;
+        size_t                              up_offset     = 0;
+        size_t                              output_offset = 0;
+        ggml_cuda_cutlass_activation_layout output_layout;
+        bool                                ready = false;
+        ggml_cuda_cutlass_activation        output_activation;
+    };
+
     std::vector<group>                              groups;
+    std::vector<mlp>                                mlps;
     std::unordered_map<const ggml_tensor *, size_t> node_groups;
+    std::unordered_map<const ggml_tensor *, size_t> mlp_first_nodes;
+    std::unordered_map<const ggml_tensor *, size_t> mlp_down_nodes;
     std::unique_ptr<ggml_cuda_pool_alloc<char>>     direct_workspace;
     char *                                          workspace      = nullptr;
     size_t                                          workspace_size = 0;
 
     const ggml_cuda_cutlass_activation * prepare(ggml_backend_cuda_context & ctx, const ggml_tensor * node) {
+        const auto down_it = mlp_down_nodes.find(node);
+        if (down_it != mlp_down_nodes.end()) {
+            mlp & mlp_plan = mlps[down_it->second];
+            return mlp_plan.ready ? &mlp_plan.output_activation : nullptr;
+        }
+
         const auto it = node_groups.find(node);
         if (it == node_groups.end()) {
             return nullptr;
@@ -4672,6 +4783,75 @@ struct ggml_cuda_cutlass_activation_plan {
             activation_group.prepared = true;
         }
         return &activation_group.activation;
+    }
+
+    ggml_cuda_cutlass_result run_mlp(ggml_backend_cuda_context & ctx, const ggml_tensor * node) {
+#ifndef GGML_CUDA_CUTLASS
+        GGML_UNUSED_VARS(ctx, node);
+        return ggml_cuda_cutlass_result::fallback;
+#else
+        const auto it = mlp_first_nodes.find(node);
+        if (it == mlp_first_nodes.end()) {
+            return ggml_cuda_cutlass_result::fallback;
+        }
+
+        struct stream_reset {
+            ggml_backend_cuda_context & ctx;
+
+            ~stream_reset() { ctx.curr_stream_no = 0; }
+        } reset{ ctx };
+
+        ctx.curr_stream_no = 0;
+        if (workspace == nullptr) {
+            return ggml_cuda_cutlass_result::fallback;
+        }
+
+        mlp &                                mlp_plan         = mlps[it->second];
+        group &                              activation_group = groups[mlp_plan.group_index];
+        const ggml_cuda_cutlass_activation * input_activation = prepare(ctx, mlp_plan.match.first_mm);
+        if (input_activation == nullptr) {
+            return ggml_cuda_cutlass_result::fallback;
+        }
+
+        char * group_workspace = workspace + activation_group.workspace_offset;
+        void * gate            = group_workspace + mlp_plan.gate_offset;
+        void * up              = group_workspace + mlp_plan.up_offset;
+
+        const ggml_cuda_cutlass_result gate_result = ggml_cuda_cutlass_mul_mat_prequantized_bf16(
+            ctx, mlp_plan.match.gate_mm->src[0], mlp_plan.match.input, mlp_plan.match.gate_mm, *input_activation, gate);
+        if (gate_result != ggml_cuda_cutlass_result::success) {
+            return gate_result;
+        }
+
+        const ggml_cuda_cutlass_result up_result = ggml_cuda_cutlass_mul_mat_prequantized_bf16(
+            ctx, mlp_plan.match.up_mm->src[0], mlp_plan.match.input, mlp_plan.match.up_mm, *input_activation, up);
+        if (up_result != ggml_cuda_cutlass_result::success) {
+            return up_result;
+        }
+
+        char *    output     = group_workspace + mlp_plan.output_offset;
+        uint8_t * scales     = (uint8_t *) output + mlp_plan.output_layout.offset_scales;
+        float *   row_scales = (float *) (output + mlp_plan.output_layout.offset_rows);
+        quantize_cutlass_nvfp4_swiglu_bf16_cuda(
+            (const nv_bfloat16 *) gate, (const nv_bfloat16 *) up, (const float *) mlp_plan.match.gate_scale->data,
+            (const float *) mlp_plan.match.up_scale->data, (float *) mlp_plan.match.glu->data, output, scales,
+            row_scales, mlp_plan.output_layout.k, mlp_plan.output_layout.k_padded, mlp_plan.output_layout.m,
+            ctx.stream());
+        CUDA_CHECK(cudaGetLastError());
+
+        mlp_plan.output_activation = {
+            (const uint8_t *) output,
+            scales,
+            row_scales,
+            mlp_plan.output_layout.m,
+            mlp_plan.output_layout.k,
+            mlp_plan.output_layout.k_padded,
+            mlp_plan.output_layout.type,
+        };
+        mlp_plan.ready = true;
+        ++ctx.mlp_fusion_count;
+        return ggml_cuda_cutlass_result::success;
+#endif
     }
 
     void allocate_direct(ggml_backend_cuda_context & ctx) {
@@ -4707,6 +4887,56 @@ static bool ggml_cuda_tensor_ranges_overlap(const ggml_tensor * a, const ggml_te
         return true;
     }
     return a_begin < b_begin + b_size && b_begin < a_begin + a_size;
+}
+
+static bool ggml_cuda_append_aligned_workspace(size_t & size, size_t allocation, size_t & offset) {
+    if (size > SIZE_MAX - 127) {
+        return false;
+    }
+    offset = GGML_PAD(size, (size_t) 128);
+    if (allocation > SIZE_MAX - offset) {
+        return false;
+    }
+    size = offset + allocation;
+    return true;
+}
+
+static bool ggml_cuda_preflight_mlp_bf16(ggml_backend_cuda_context &           ctx,
+                                         const ggml_cuda_mlp_bf16_match &      match,
+                                         ggml_cuda_cutlass_activation_layout & output_layout,
+                                         size_t &                              bf16_size) {
+    ggml_cuda_cutlass_activation_layout gate_layout;
+    ggml_cuda_cutlass_activation_layout up_layout;
+    if (!ggml_cuda_cutlass_get_activation_layout(ctx, match.gate_mm->src[0], match.input, match.gate_mm, gate_layout) ||
+        !ggml_cuda_cutlass_get_activation_layout(ctx, match.up_mm->src[0], match.input, match.up_mm, up_layout) ||
+        !ggml_cuda_cutlass_get_activation_layout(ctx, match.down_mm->src[0], match.glu, match.down_mm, output_layout) ||
+        match.glu->buffer == nullptr ||
+        ggml_backend_buffer_get_type(match.glu->buffer) != ggml_backend_cuda_buffer_type(ctx.device) ||
+        match.glu->type != GGML_TYPE_F32 || !ggml_is_contiguous(match.glu) ||
+        match.gate_mm->src[0]->ne[1] != match.up_mm->src[0]->ne[1] ||
+        !ggml_are_same_shape(match.gate_mm, match.up_mm) || !ggml_are_same_shape(match.gate_mm, match.glu) ||
+        gate_layout.type != up_layout.type || gate_layout.m != up_layout.m || gate_layout.k != up_layout.k ||
+        gate_layout.k_padded != up_layout.k_padded || output_layout.type != GGML_TYPE_NVFP4 ||
+        output_layout.k != match.glu->ne[0]) {
+        return false;
+    }
+
+    const ggml_tensor * live_tensors[] = {
+        match.input,         match.gate_scale,      match.up_scale, match.gate_mm->src[0],
+        match.up_mm->src[0], match.down_mm->src[0], match.down_mm,
+    };
+    for (const ggml_tensor * live : live_tensors) {
+        if (live == nullptr || ggml_cuda_tensor_ranges_overlap(match.glu, live)) {
+            return false;
+        }
+    }
+
+    const int64_t ne = ggml_nelements(match.glu);
+    if (ne <= 0 || (uint64_t) ne > SIZE_MAX / sizeof(nv_bfloat16)) {
+        return false;
+    }
+    bf16_size = (size_t) ne * sizeof(nv_bfloat16);
+    return true;
 }
 
 static ggml_cuda_cutlass_activation_plan ggml_cuda_build_cutlass_activation_plan(ggml_backend_cuda_context * cuda_ctx,
@@ -4774,11 +5004,19 @@ static ggml_cuda_cutlass_activation_plan ggml_cuda_build_cutlass_activation_plan
         }
 
         if (activation_group == nullptr) {
-            plan.groups.push_back({ node->src[1], layout, {}, i, i });
+            plan.groups.emplace_back();
             activation_group = &plan.groups.back();
+            activation_group->src1           = node->src[1];
+            activation_group->layout         = layout;
+            activation_group->first          = i;
+            activation_group->last           = i;
+            activation_group->workspace_size = layout.size_allocation;
         }
         activation_group->nodes.push_back(node);
         activation_group->last = i;
+    }
+    if (plan.groups.empty()) {
+        return plan;
     }
 
     for (auto it = plan.groups.begin(); it != plan.groups.end();) {
@@ -4829,6 +5067,62 @@ static ggml_cuda_cutlass_activation_plan ggml_cuda_build_cutlass_activation_plan
               [](const ggml_cuda_cutlass_activation_plan::group & a,
                  const ggml_cuda_cutlass_activation_plan::group & b) { return a.first < b.first; });
 
+    for (int i = 0; i + 5 < cgraph->n_nodes; ++i) {
+        ggml_cuda_mlp_bf16_match match;
+        if (!ggml_cuda_match_mlp_bf16(cgraph, i, match)) {
+            continue;
+        }
+
+        ggml_cuda_cutlass_activation_layout output_layout;
+        size_t                              bf16_size;
+        if (!ggml_cuda_preflight_mlp_bf16(*cuda_ctx, match, output_layout, bf16_size)) {
+            continue;
+        }
+
+        size_t group_index = plan.groups.size();
+        for (size_t j = 0; j < plan.groups.size(); ++j) {
+            const auto & nodes = plan.groups[j].nodes;
+            if (std::find(nodes.begin(), nodes.end(), match.first_mm) != nodes.end() &&
+                std::find(nodes.begin(), nodes.end(), match.second_mm) != nodes.end()) {
+                group_index = j;
+                break;
+            }
+        }
+        if (group_index == plan.groups.size()) {
+            continue;
+        }
+
+        node_location first_location;
+        node_location down_location;
+        const auto    first_it = locations.find(match.first_mm);
+        const auto    down_it  = locations.find(match.down_mm);
+        if (first_it != locations.end()) {
+            first_location = first_it->second;
+        }
+        if (down_it != locations.end()) {
+            down_location = down_it->second;
+        }
+        // The fused projections and packing run on stream 0. Keep event-owned nodes on the normal path.
+        if (first_location.event != nullptr || down_location.event != nullptr) {
+            continue;
+        }
+        auto & activation_group = plan.groups[group_index];
+
+        ggml_cuda_cutlass_activation_plan::mlp mlp_plan;
+        mlp_plan.match         = match;
+        mlp_plan.group_index   = group_index;
+        mlp_plan.output_layout = output_layout;
+        size_t group_size      = activation_group.workspace_size;
+        if (!ggml_cuda_append_aligned_workspace(group_size, bf16_size, mlp_plan.gate_offset) ||
+            !ggml_cuda_append_aligned_workspace(group_size, bf16_size, mlp_plan.up_offset) ||
+            !ggml_cuda_append_aligned_workspace(group_size, output_layout.size_allocation, mlp_plan.output_offset)) {
+            continue;
+        }
+        activation_group.workspace_size = group_size;
+        activation_group.last = std::max(activation_group.last, i + 5);
+        plan.mlps.push_back(std::move(mlp_plan));
+    }
+
     std::vector<int>    slot_last;
     std::vector<size_t> slot_sizes;
     for (ggml_cuda_cutlass_activation_plan::group & activation_group : plan.groups) {
@@ -4838,10 +5132,10 @@ static ggml_cuda_cutlass_activation_plan ggml_cuda_build_cutlass_activation_plan
         }
         if (slot == slot_last.size()) {
             slot_last.push_back(activation_group.last);
-            slot_sizes.push_back(activation_group.layout.size_allocation);
+            slot_sizes.push_back(activation_group.workspace_size);
         } else {
             slot_last[slot]  = activation_group.last;
-            slot_sizes[slot] = std::max(slot_sizes[slot], activation_group.layout.size_allocation);
+            slot_sizes[slot] = std::max(slot_sizes[slot], activation_group.workspace_size);
         }
         activation_group.slot = (int) slot;
     }
@@ -4865,8 +5159,23 @@ static ggml_cuda_cutlass_activation_plan ggml_cuda_build_cutlass_activation_plan
             plan.node_groups[node] = i;
         }
     }
+    for (size_t i = 0; i < plan.mlps.size(); ++i) {
+        plan.mlp_first_nodes[plan.mlps[i].match.first_mm] = i;
+        plan.mlp_down_nodes[plan.mlps[i].match.down_mm]   = i;
+    }
 
     return plan;
+}
+
+static int ggml_cuda_try_fuse_mlp_bf16(ggml_backend_cuda_context *         cuda_ctx,
+                                       ggml_cgraph *                       cgraph,
+                                       int                                 i,
+                                       ggml_cuda_cutlass_activation_plan & activation_plan) {
+    const ggml_cuda_cutlass_result result = activation_plan.run_mlp(*cuda_ctx, cgraph->nodes[i]);
+    if (result == ggml_cuda_cutlass_result::success) {
+        return 4;
+    }
+    return ggml_cuda_cutlass_result_can_fallback(result) ? 0 : -1;
 }
 
 static bool ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context *         cuda_ctx,
@@ -4955,8 +5264,13 @@ static bool ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context *    
                     continue;
                 }
 
-                int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
+                int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i, &activation_plan);
 
+                if (nodes_to_skip < 0) {
+                    GGML_LOG_ERROR("%s: fusion failed %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
+                    cuda_ctx->curr_stream_no = 0;
+                    return false;
+                }
                 if (nodes_to_skip != 0) {
 #ifdef GGML_CUDA_DEBUG
                     const int last_fused = i + nodes_to_skip;
@@ -6479,6 +6793,11 @@ static bool ggml_backend_cuda_device_supports_async_upload(
 #endif
 }
 
+static uint64_t ggml_backend_cuda_mlp_fusion_count(ggml_backend_t backend) {
+    const auto * ctx = (const ggml_backend_cuda_context *) backend->context;
+    return ctx->mlp_fusion_count;
+}
+
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
     if (strcmp(name, "ggml_backend_comm_init") == 0) {
@@ -6504,6 +6823,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_dev_supports_async_upload") == 0) {
         return (void *)ggml_backend_cuda_device_supports_async_upload;
+    }
+    if (strcmp(name, "ggml_backend_cuda_mlp_fusion_count") == 0) {
+        return (void *)ggml_backend_cuda_mlp_fusion_count;
     }
 #ifdef GGML_CUDA_CUTLASS
     if (strcmp(name, "ggml_backend_begin_async_upload") == 0) {
