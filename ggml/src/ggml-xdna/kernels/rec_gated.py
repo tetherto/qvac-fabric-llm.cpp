@@ -49,6 +49,18 @@ EPS = 1e-6
 
 GATED_SRC = Path(__file__).resolve().parent / "rec-gated.cc"
 
+# rec-gated.cc needs the same geometry the merged design compiles it with
+# (attn_gdn_gated.py): without these defines it does not compile at all, and
+# the output object has to cover the activation the gated stage writes at
+# ACT_OFF, not just the scratch before it.
+ACT_TILE = 2112
+ACT_OFF = 10496
+GATED_FMT = int(os.environ.get("GATED_FMT", "1"))
+ACTN = (1 + K // (128 if GATED_FMT == 1 else 256)) * ACT_TILE
+OUTN = ACT_OFF + ACTN
+GATED_FLAGS = ["-O2", "-DNDEBUG", f"-DK_GATE={K}", f"-DACT_TILE={ACT_TILE}",
+               f"-DACT_OFF={ACT_OFF}", "-DACT_SPLIT=0", f"-DGATED_FMT={GATED_FMT}"]
+
 
 def _gated_src():
     return GATED_SRC.read_text()
@@ -56,17 +68,16 @@ def _gated_src():
 
 @iron.jit
 def rec_gated(*, dev_name: CompileTime[str] = "npu2"):
-    OUTN = K * 4 + K + 4                     # gated f32 scratch + aq + d_a
     AZ_T = np.ndarray[(1 + 2 * S_V,), np.dtype[np.float32]]  # [hh|attn|z]
     GM_T = np.ndarray[(S_V,), np.dtype[np.float32]]
     OUT_T = np.ndarray[(OUTN,), np.dtype[np.uint8]]
 
     kh = iron.ExternalFunction(name="ggml_xdna_gated_head", source_string=_gated_src(),
                                arg_types=[OUT_T, AZ_T, GM_T],
-                               compile_flags=["-O2", "-DNDEBUG"], inline=True)
+                               compile_flags=GATED_FLAGS, inline=True)
     kf = iron.ExternalFunction(name="ggml_xdna_gated_fin", source_string=_gated_src(),
                                arg_types=[OUT_T],
-                               compile_flags=["-O2", "-DNDEBUG"], inline=True)
+                               compile_flags=GATED_FLAGS, inline=True)
 
     az3 = ObjectFifo(AZ_T, name="gaz3", depth=2)
     az2 = az3.cons().forward(obj_type=AZ_T, name="gaz2", tile=Tile(0, 1))
@@ -195,7 +206,6 @@ def main():
 
     az_bo = mk_bo(az)
     gm_bo = mk_bo(gamma)
-    OUTN = K * 4 + K + 4
     out_bo = xrt.bo(dev, OUTN, xrt.bo.host_only, 0)
 
     run = xrt.run(kernel)
