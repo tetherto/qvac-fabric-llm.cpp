@@ -1262,7 +1262,6 @@ class ModelBase:
         logger.info("Set model quantization version")
         self.gguf_writer.add_quantization_version(gguf.GGML_QUANT_VERSION)
 
-
     def write_vocab(self):
         raise NotImplementedError("write_vocab() must be implemented in subclasses")
 
