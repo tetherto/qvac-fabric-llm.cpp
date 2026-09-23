@@ -1024,10 +1024,20 @@ def _run_gemm(design, opts) -> None:
     print("  read C   : %.3f ms (%.1f%%)" % (stats_avg[4], 100 * stats_avg[4] / wall))
 
     if not opts.no_verify:
+        # B here is the effective (dequantised) weight, so this isolates the
+        # kernel from the quantisation error. Judge it relative to the result
+        # scale: bf16 carries 8 mantissa bits, so a correct run lands orders
+        # below the default, while a wrong one lands near 1.
         C_ref = A.astype(np.float32) @ B.astype(np.float32)
         C = c_host[0:host_M, :]
         err = np.max(np.abs(C - C_ref))
-        print("verify     : max abs err %.4g (bf16 tolerance ~1e-2)" % err)
+        scale = float(np.max(np.abs(C_ref)))
+        rel = err / scale if scale > 0.0 else err
+        print("verify     : max abs err %.4g, relative %.4g (tolerance %.4g)"
+              % (err, rel, opts.tolerance))
+        if not (rel <= opts.tolerance):
+            sys.exit("verify failed: relative error %.4g over tolerance %.4g"
+                     % (rel, opts.tolerance))
 
     if trace_words is not None:
         _save_trace(trace_words)
@@ -1090,6 +1100,8 @@ def main() -> None:
                         help="Compute cols to trace (0..n_aie_cols-1); default all")
     parser.add_argument("--trace-egress", type=int, default=0, dest="trace_egress",
                         help="Shim column the trace packets are routed to (default: 0)")
+    parser.add_argument("--tolerance", type=float, default=1e-2,
+                        help="relative error the verify accepts (default 1e-2)")
     parser.add_argument("--no-verify", action="store_true",
                         help="Skip the numpy reference check")
     parser.add_argument("--hang", action="store_true",

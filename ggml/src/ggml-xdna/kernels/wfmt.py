@@ -41,7 +41,9 @@ def tile_bytes(fmt: str, k: int, n: int) -> int:
     if fmt == "q4g32":
         return k * n // 2 + 2 * (k // Q4_GROUP) * n * 4
     if fmt == "q8g16":
-        return k * n + 2 * (k // Q8_GROUP) * n * 4
+        # one scale pair per group, no min plane: dequant_q8g16_bf16 reads
+        # the codes then a single [2 * ng, n] bf16 block
+        return k * n + (k // Q8_GROUP) * n * 4
     raise ValueError(f"unknown weight format {fmt!r}")
 
 
@@ -114,12 +116,12 @@ def pack_tile(fmt: str, codes: np.ndarray, d: np.ndarray, m: np.ndarray | None,
     if fmt == "q4g32":
         body = ((flat[0::2].astype(np.uint8) & 0xF)
                 | ((flat[1::2].astype(np.uint8) & 0xF) << 4))
-        params = np.concatenate([split_pairs(d).reshape(-1),
-                                 split_pairs(m).reshape(-1)])
     else:
         body = flat.astype(np.int8).view(np.uint8)
-        params = np.concatenate([split_pairs(d).reshape(-1),
-                                 split_pairs(m).reshape(-1)])
+    planes = [split_pairs(d).reshape(-1)]
+    if m is not None:
+        planes.append(split_pairs(m).reshape(-1))
+    params = np.concatenate(planes)
     return np.concatenate([body, params.view(np.uint8)])
 
 
