@@ -1804,7 +1804,9 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     }
 
     if (ml.incremental_splits_tensor_load.has_value()) {
-        // Already did incremental load.
+        if (!ml.no_alloc) {
+            initialize_hadamard_transforms();
+        }
         print_backend_buffers_info(n_gpu_layers);
         return true;
     }
@@ -1812,7 +1814,13 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     ml.init_mappings(true, use_mlock ? &pimpl->mlock_mmaps : nullptr);
     pimpl->mappings.reserve(ml.mappings.size());
 
-    return create_backend_buffers(ml.size_data, ml, use_mmap_buffer, use_mlock, n_gpu_layers);
+    if (!create_backend_buffers(ml.size_data, ml, use_mmap_buffer, use_mlock, n_gpu_layers)) {
+        return false;
+    }
+    if (!ml.no_alloc) {
+        initialize_hadamard_transforms();
+    }
+    return true;
 }
 
 bool llama_model::create_split_backend_buffers(
@@ -1867,125 +1875,7 @@ bool llama_model::create_split_backend_buffers(
     return creation_success;
 }
 
-bool llama_model::create_backend_buffers(std::size_t size_data,
-                                         llama_model_loader & ml,
-                                         const bool use_mmap_buffer,
-                                         const bool use_mlock,
-                                         const int32_t n_gpu_layers,
-                                         bool do_print_backend_buffers_info) {
-    // create the backend buffers
-    std::vector<std::pair<ggml_context *, llama_buf_map>> ctx_buf_maps;
-    ctx_buf_maps.reserve(ml.ctx_map.size());
-
-    // Ensure we have enough capacity for the maximum backend buffer we will potentially create
-    const size_t n_max_backend_buffer = ml.ctx_map.size() * ml.files.size();
-    pimpl->ctxs_bufs.reserve(n_max_backend_buffer);
-
-    for (auto & [buft, ctx_ptr] : ml.ctx_map) {
-        ggml_context * ctx = ctx_ptr.get();
-
-        // skip contexts without tensors
-        if (ggml_get_first_tensor(ctx) == nullptr) {
-            continue;
-        }
-
-        llama_buf_map buf_map;
-        buf_map.reserve(n_max_backend_buffer);
-
-        // check if it is possible to use buffer_from_host_ptr with this buffer type
-        ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
-        if (!dev) {
-            // FIXME: workaround for CPU backend buft having a NULL device
-            dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
-            if (!dev) {
-                throw std::runtime_error(format("%s: no CPU backend found", __func__));
-            }
-        }
-        ggml_backend_dev_props props;
-        ggml_backend_dev_get_props(dev, &props);
-        bool buffer_from_host_ptr_supported = props.caps.buffer_from_host_ptr;
-        bool is_default_buft = buft == ggml_backend_dev_buffer_type(dev);
-
-        std::vector<ggml_backend_buffer_ptr> bufs;
-        if (ml.use_mmap && use_mmap_buffer && buffer_from_host_ptr_supported && is_default_buft) {
-            GGML_ASSERT(!ml.no_alloc);
-            for (uint32_t idx = 0; idx < ml.files.size(); idx++) {
-                // only the mmap region containing the tensors in the model is mapped to the backend buffer
-                // this is important for metal with apple silicon: if the entire model could be mapped to a metal buffer,
-                //     then we could just use metal for all layers
-                // this allows using partial offloading when the model size exceeds the metal buffer size, but not the RAM size
-                void * addr = nullptr;
-                size_t first, last; // NOLINT
-                ml.get_mapping_range(&first, &last, &addr, idx, ctx);
-                if (first >= last) {
-                    continue;
-                }
-                const size_t max_size = ggml_get_max_tensor_size(ctx);
-                ggml_backend_buffer_t buf = ggml_backend_dev_buffer_from_host_ptr(dev, (char *) addr + first, last - first, max_size);
-                if (buf == nullptr) {
-                    throw std::runtime_error(format("unable to allocate %s buffer", ggml_backend_buft_name(buft)));
-                }
-                bufs.emplace_back(buf);
-                buf_map.emplace(idx, buf);
-            }
-        } else {
-            ggml_backend_buffer_t buf;
-            if (ml.no_alloc) {
-                buf = ggml_backend_buft_alloc_buffer(buft, /*size =*/ 0); // dummy buffer
-                for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
-                    t->buffer = buf; // set dummy buffer for weights so that the backend scheduler won't try to allocate them
-                }
-            } else {
-                buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft); // real buffer
-            }
-            if (buf == nullptr) {
-                throw std::runtime_error(format("unable to allocate %s buffer", ggml_backend_buft_name(buft)));
-            }
-            // the no_alloc buffer is a zero-size dummy with no base address, nothing to lock
-            if (use_mlock && !ml.no_alloc && ggml_backend_buffer_is_host(buf)) {
-                pimpl->mlock_bufs.emplace_back(new llama_mlock);
-                auto & mlock_buf = pimpl->mlock_bufs.back();
-                mlock_buf->init   (ggml_backend_buffer_get_base(buf));
-                mlock_buf->grow_to(ggml_backend_buffer_get_size(buf));
-            }
-            bufs.emplace_back(buf);
-            for (uint32_t idx = 0; idx < ml.files.size(); idx++) {
-                buf_map.emplace(idx, buf);
-            }
-        }
-
-        for (auto & buf : bufs) {
-            // indicate that this buffer contains weights
-            // this is used by ggml_backend_sched to improve op scheduling: ops that use a weight are preferably scheduled to the backend that contains the weight
-            ggml_backend_buffer_set_usage(buf.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
-        }
-
-        pimpl->ctxs_bufs.emplace_back(std::move(ctx_ptr), std::move(bufs));
-
-        ctx_buf_maps.emplace_back(ctx, buf_map);
-    }
-
-    if(do_print_backend_buffers_info) {
-        print_backend_buffers_info(n_gpu_layers);
-    }
-
-    if (ml.no_alloc) {
-        return true;
-    }
-
-    // load tensor data
-    for (auto & [ctx, buf_map] : ctx_buf_maps) {
-        if (!ml.load_all_data(size_data, ctx, buf_map, use_mlock ? &pimpl->mlock_mmaps : NULL, params.progress_callback, params.progress_callback_user_data)) {
-            return false;
-        }
-    }
-
-    if (use_mmap_buffer) {
-        for (auto & mapping : ml.mappings) {
-            pimpl->mappings.emplace_back(std::move(mapping));
-        }
-    }
-
+void llama_model::initialize_hadamard_transforms() {
     if (!hadamard_weight_blocks.empty() || !hadamard_inverse_blocks.empty()) {
         struct hadamard_rotation {
             uint32_t block_size;
@@ -2155,6 +2045,127 @@ bool llama_model::create_backend_buffers(std::size_t size_data,
                 __func__, hadamard_rotations.size() + hadamard_inverses.size(), hadamard_inverses.size(),
                 rotations.size(), sign_tensors.size());
     }
+}
+
+bool llama_model::create_backend_buffers(std::size_t size_data,
+                                         llama_model_loader & ml,
+                                         const bool use_mmap_buffer,
+                                         const bool use_mlock,
+                                         const int32_t n_gpu_layers,
+                                         bool do_print_backend_buffers_info) {
+    // create the backend buffers
+    std::vector<std::pair<ggml_context *, llama_buf_map>> ctx_buf_maps;
+    ctx_buf_maps.reserve(ml.ctx_map.size());
+
+    // Ensure we have enough capacity for the maximum backend buffer we will potentially create
+    const size_t n_max_backend_buffer = ml.ctx_map.size() * ml.files.size();
+    pimpl->ctxs_bufs.reserve(n_max_backend_buffer);
+
+    for (auto & [buft, ctx_ptr] : ml.ctx_map) {
+        ggml_context * ctx = ctx_ptr.get();
+
+        // skip contexts without tensors
+        if (ggml_get_first_tensor(ctx) == nullptr) {
+            continue;
+        }
+
+        llama_buf_map buf_map;
+        buf_map.reserve(n_max_backend_buffer);
+
+        // check if it is possible to use buffer_from_host_ptr with this buffer type
+        ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
+        if (!dev) {
+            // FIXME: workaround for CPU backend buft having a NULL device
+            dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+            if (!dev) {
+                throw std::runtime_error(format("%s: no CPU backend found", __func__));
+            }
+        }
+        ggml_backend_dev_props props;
+        ggml_backend_dev_get_props(dev, &props);
+        bool buffer_from_host_ptr_supported = props.caps.buffer_from_host_ptr;
+        bool is_default_buft = buft == ggml_backend_dev_buffer_type(dev);
+
+        std::vector<ggml_backend_buffer_ptr> bufs;
+        if (ml.use_mmap && use_mmap_buffer && buffer_from_host_ptr_supported && is_default_buft) {
+            GGML_ASSERT(!ml.no_alloc);
+            for (uint32_t idx = 0; idx < ml.files.size(); idx++) {
+                // only the mmap region containing the tensors in the model is mapped to the backend buffer
+                // this is important for metal with apple silicon: if the entire model could be mapped to a metal buffer,
+                //     then we could just use metal for all layers
+                // this allows using partial offloading when the model size exceeds the metal buffer size, but not the RAM size
+                void * addr = nullptr;
+                size_t first, last; // NOLINT
+                ml.get_mapping_range(&first, &last, &addr, idx, ctx);
+                if (first >= last) {
+                    continue;
+                }
+                const size_t max_size = ggml_get_max_tensor_size(ctx);
+                ggml_backend_buffer_t buf = ggml_backend_dev_buffer_from_host_ptr(dev, (char *) addr + first, last - first, max_size);
+                if (buf == nullptr) {
+                    throw std::runtime_error(format("unable to allocate %s buffer", ggml_backend_buft_name(buft)));
+                }
+                bufs.emplace_back(buf);
+                buf_map.emplace(idx, buf);
+            }
+        } else {
+            ggml_backend_buffer_t buf;
+            if (ml.no_alloc) {
+                buf = ggml_backend_buft_alloc_buffer(buft, /*size =*/ 0); // dummy buffer
+                for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+                    t->buffer = buf; // set dummy buffer for weights so that the backend scheduler won't try to allocate them
+                }
+            } else {
+                buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft); // real buffer
+            }
+            if (buf == nullptr) {
+                throw std::runtime_error(format("unable to allocate %s buffer", ggml_backend_buft_name(buft)));
+            }
+            // the no_alloc buffer is a zero-size dummy with no base address, nothing to lock
+            if (use_mlock && !ml.no_alloc && ggml_backend_buffer_is_host(buf)) {
+                pimpl->mlock_bufs.emplace_back(new llama_mlock);
+                auto & mlock_buf = pimpl->mlock_bufs.back();
+                mlock_buf->init   (ggml_backend_buffer_get_base(buf));
+                mlock_buf->grow_to(ggml_backend_buffer_get_size(buf));
+            }
+            bufs.emplace_back(buf);
+            for (uint32_t idx = 0; idx < ml.files.size(); idx++) {
+                buf_map.emplace(idx, buf);
+            }
+        }
+
+        for (auto & buf : bufs) {
+            // indicate that this buffer contains weights
+            // this is used by ggml_backend_sched to improve op scheduling: ops that use a weight are preferably scheduled to the backend that contains the weight
+            ggml_backend_buffer_set_usage(buf.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+        }
+
+        pimpl->ctxs_bufs.emplace_back(std::move(ctx_ptr), std::move(bufs));
+
+        ctx_buf_maps.emplace_back(ctx, buf_map);
+    }
+
+    if(do_print_backend_buffers_info) {
+        print_backend_buffers_info(n_gpu_layers);
+    }
+
+    if (ml.no_alloc) {
+        return true;
+    }
+
+    // load tensor data
+    for (auto & [ctx, buf_map] : ctx_buf_maps) {
+        if (!ml.load_all_data(size_data, ctx, buf_map, use_mlock ? &pimpl->mlock_mmaps : NULL, params.progress_callback, params.progress_callback_user_data)) {
+            return false;
+        }
+    }
+
+    if (use_mmap_buffer) {
+        for (auto & mapping : ml.mappings) {
+            pimpl->mappings.emplace_back(std::move(mapping));
+        }
+    }
+
     return true;
 }
 

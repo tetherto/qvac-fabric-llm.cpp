@@ -740,6 +740,8 @@ struct llama_model {
         uint16_t idx, std::map<std::pair<ggml_backend_buffer_type_t, uint16_t>, ggml_context_ptr> & ctx_split_map,
         llama_model_loader & ml, bool use_mmap_buffer, bool use_mlock, int32_t n_gpu_layers);
 
+    void initialize_hadamard_transforms();
+
     void print_backend_buffers_info(int32_t n_gpu_layers);
 
     std::string arch_name() const;

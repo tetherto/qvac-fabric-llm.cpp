@@ -10,6 +10,7 @@
 #include "ggml-cpp.h"
 #include "llama.h"
 #include "llama-cpp.h"
+#include "uint8-buff-stream.h"
 
 // TODO: replace with #include "llama-ext.h" in the future
 #include "../src/llama-arch.h"
@@ -24,6 +25,7 @@
 #include <random>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -1065,6 +1067,93 @@ static void add_hadamard_metadata(gguf_context * ctx, uint32_t block_size = 256,
     gguf_set_arr_str(ctx, "prism.hadamard.inverse_weight_names", inverse_names, 1);
 }
 
+static std::string save_model_to_string(llama_model_saver & saver) {
+    FILE * file = tmpfile();
+    GGML_ASSERT(file);
+    saver.save(file);
+    GGML_ASSERT(fseek(file, 0, SEEK_END) == 0);
+    const long size = ftell(file);
+    GGML_ASSERT(size >= 0);
+    rewind(file);
+    std::string data((size_t) size, '\0');
+    GGML_ASSERT(fread(data.data(), 1, data.size(), file) == data.size());
+    fclose(file);
+    return data;
+}
+
+static void test_hadamard_split_futures(bool with_hadamard) {
+    const size_t seed = 1234;
+    auto metadata = get_gguf_ctx(LLM_ARCH_LLAMA, false);
+    auto source = get_model_and_ctx(metadata.get(), nullptr, seed, {});
+
+    llama_model_saver source_saver(source.first.get());
+    source_saver.add_kv_from_model();
+    source_saver.add_tensors_from_model();
+
+    const int64_t n_tensors = gguf_get_n_tensors(source_saver.gguf_ctx);
+    std::vector<std::string> split_data;
+    std::string tensor_list;
+    bool found_token_embd = false;
+    bool found_output = false;
+
+    for (int split = 0; split < 2; ++split) {
+        gguf_context_ptr split_ctx(gguf_init_empty());
+        gguf_set_kv(split_ctx.get(), source_saver.gguf_ctx);
+        gguf_set_val_u16(split_ctx.get(), "split.no", split);
+        gguf_set_val_u16(split_ctx.get(), "split.count", 2);
+        gguf_set_val_i32(split_ctx.get(), "split.tensors.count", (int32_t) n_tensors);
+        if (with_hadamard) {
+            add_hadamard_metadata(split_ctx.get());
+        }
+        llama_model_saver split_saver(LLM_ARCH_LLAMA, split_ctx.get());
+
+        for (int64_t i = 0; i < n_tensors; ++i) {
+            const char * name = gguf_get_tensor_name(source_saver.gguf_ctx, i);
+            if (split == 0) {
+                tensor_list += name;
+                tensor_list += '\n';
+            }
+            const bool is_token_embd = strcmp(name, "token_embd.weight") == 0;
+            const bool is_output = strcmp(name, "output.weight") == 0;
+            found_token_embd |= is_token_embd;
+            found_output |= is_output;
+            if ((split == 0) != is_token_embd) {
+                continue;
+            }
+            const ggml_tensor * tensor = source.first->get_tensor(name);
+            GGML_ASSERT(tensor);
+            split_saver.add_tensor(tensor);
+        }
+        split_data.push_back(save_model_to_string(split_saver));
+    }
+    GGML_ASSERT(found_token_embd && found_output);
+
+    const char * paths[] = {
+        "hadamard-split-00001-of-00002.gguf",
+        "hadamard-split-00002-of-00002.gguf",
+    };
+    const char * tensor_list_path = "hadamard-split.tensors.txt";
+    const char * context = with_hadamard ? "hadamard-split-test" : "plain-split-test";
+    std::thread fulfill_thread([&]() {
+        std::vector<uint8_t> list_data(tensor_list.begin(), tensor_list.end());
+        auto list_buf = std::make_unique<Uint8BufferStreamBuf>(std::move(list_data));
+        GGML_ASSERT(llama_model_load_fulfill_split_future(tensor_list_path, context, std::move(list_buf)));
+        for (size_t i = 0; i < 2; ++i) {
+            std::vector<uint8_t> data(split_data[i].begin(), split_data[i].end());
+            auto split_buf = std::make_unique<Uint8BufferStreamBuf>(std::move(data));
+            GGML_ASSERT(llama_model_load_fulfill_split_future(paths[i], context, std::move(split_buf)));
+        }
+    });
+
+    auto params = llama_model_default_params();
+    params.load_mode = LLAMA_LOAD_MODE_NONE;
+    llama_model * loaded = llama_model_load_from_split_futures(paths, 2, context, tensor_list_path, params);
+    fulfill_thread.join();
+    GGML_ASSERT(loaded);
+    GGML_ASSERT(loaded->hadamard_rotations.size() == (with_hadamard ? 1 : 0));
+    llama_model_free(loaded);
+}
+
 static void test_hadamard_tied_output() {
     const size_t seed = 1234;
     auto metadata = get_gguf_ctx(LLM_ARCH_QWEN35, false);
@@ -1229,6 +1318,8 @@ static void test_hadamard_mtp_arch(llm_arch arch, bool moe) {
 static int test_hadamard_contracts() {
     test_hadamard_invalid_block();
     test_hadamard_tied_output();
+    test_hadamard_split_futures(false);
+    test_hadamard_split_futures(true);
     test_hadamard_mtp_arch(LLM_ARCH_QWEN35, false);
     test_hadamard_mtp_arch(LLM_ARCH_QWEN35MOE, true);
     test_hadamard_mtp_arch(LLM_ARCH_QWEN3NEXT, true);
