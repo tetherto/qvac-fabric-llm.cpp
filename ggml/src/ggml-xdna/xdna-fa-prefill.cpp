@@ -65,12 +65,6 @@ struct fa_runner {
     xdna_buffer *  kv   = nullptr;          // all chunks of one layer
     size_t         kv_chunks = 0;           // chunks the kv BO holds
     std::vector<xdna_buffer *> kv_view;     // one window per chunk
-    // What the kv BO currently holds, so a ubatch repacks only the keys the
-    // cache grew by. Keyed on the cache tensors' data pointers: a different
-    // layer is a different pointer and repacks from scratch.
-    const void *   kv_k = nullptr;
-    const void *   kv_v = nullptr;
-    int64_t        kv_packed = 0;
 };
 
 static fa_runner g_fa;
@@ -117,10 +111,15 @@ static bool fa_pf_enabled(void) {
 }
 
 // The kernel derives its mask from the key and query positions, so a mask that
-// is anything but plain causal would be silently ignored. Check it instead of
-// assuming: three rows, each all the way across, is cheap next to the op.
+// is anything but plain causal would be silently ignored. Every row has to be
+// checked: a packed-sequence mask can differ in one row and nowhere else.
+//
+// The check needs the mask contents, and a graph node has no data until the
+// scheduler allocates it. Declining then is the only safe answer, because a
+// node this backend accepts it must also be able to run - xdna_ops_compute
+// returning false fails the whole graph rather than falling back to the host.
 static bool mask_is_causal(const ggml_tensor * m, int64_t n_kv, int64_t n_tokens) {
-    if (!m) {
+    if (!m || !m->data) {
         return false;
     }
     if (m->type != GGML_TYPE_F16 || m->ne[0] < n_kv || m->ne[1] < n_tokens) {
@@ -130,12 +129,7 @@ static bool mask_is_causal(const ggml_tensor * m, int64_t n_kv, int64_t n_tokens
         return false;
     }
     const int64_t npast = n_kv - n_tokens;
-    const int64_t probe[3] = { 0, n_tokens / 2, n_tokens - 1 };
-    for (int p = 0; p < 3; p++) {
-        const int64_t t = probe[p];
-        if (t < 0) {
-            continue;
-        }
+    for (int64_t t = 0; t < n_tokens; t++) {
         const ggml_fp16_t * row =
             (const ggml_fp16_t *) ((const char *) m->data + t * m->nb[1]);
         for (int64_t j = 0; j < n_kv; j++) {
@@ -254,9 +248,6 @@ static bool fa_kv_reserve(xdna_device * dev, size_t chunks) {
     g_fa.kv_view.clear();
     xdna_buffer_free(g_fa.kv);
     g_fa.kv = xdna_buffer_alloc(dev, chunks * kv_chunk_bytes());
-    g_fa.kv_k = nullptr;
-    g_fa.kv_v = nullptr;
-    g_fa.kv_packed = 0;
     if (!g_fa.kv) {
         g_fa.kv_chunks = 0;
         return false;
@@ -277,9 +268,8 @@ static bool fa_kv_reserve(xdna_device * dev, size_t chunks) {
 // stay zero: they are never visible - every query sits before them - but they
 // still multiply a weight of exp(-huge), so they have to be finite.
 //
-// j0 is normally the previous call's n_kv: within a prompt the cache only ever
-// grows at the end, and this buffer is kept per layer, so a ubatch repacks the
-// keys it added rather than the whole cache.
+// j0 is where packing starts. The caller passes 0: see xdna_fa_prefill_run for
+// why resuming from a previous call is not safe without a cache identity.
 static void pack_kv(const ggml_tensor * k, const ggml_tensor * v,
                     uint16_t * dst, int64_t j0, int64_t n_kv) {
     using namespace fa_pf;
@@ -341,23 +331,24 @@ bool xdna_fa_prefill_run(struct xdna_device * dev, struct ggml_tensor * node) {
     const size_t  chunks   = (size_t) ((n_kv + KCHUNK - 1) / KCHUNK);
     const int64_t rounds   = n_tokens / MBLK;
 
-    const bool kv_grew = g_fa.kv && g_fa.kv_k == k->data && g_fa.kv_v == v->data &&
-                         g_fa.kv_packed <= n_kv && g_fa.kv_chunks >= chunks;
-    const int64_t j0 = kv_grew ? g_fa.kv_packed : 0;
+    // Pack the whole window every time. The previous version kept what it had
+    // already packed and appended, keyed on the cache tensors' data pointers
+    // and a nondecreasing n_kv. That does not hold: a new prompt reuses the
+    // same cache storage, so the pointers match and n_kv can reach the old
+    // length again while the keys underneath are different ones, and the
+    // retained prefix is then the previous prompt's. A context shift rewrites
+    // the cache in place the same way. Restoring the incremental path needs an
+    // identity for the cache contents - a generation counter, or a sequence id
+    // - which this interface does not carry today.
     if (!fa_kv_reserve(dev, chunks)) {
         return false;
     }
     {
         uint16_t * kvh = (uint16_t *) g_fa.kv->bo.map();
-        if (j0 == 0) {
-            std::memset(kvh, 0, g_fa.kv_chunks * kv_chunk_bytes());
-        }
-        pack_kv(k, v, kvh, j0, n_kv);
+        std::memset(kvh, 0, g_fa.kv_chunks * kv_chunk_bytes());
+        pack_kv(k, v, kvh, 0, n_kv);
         xdna_buffer_sync_to_device_range(g_fa.kv, chunks * kv_chunk_bytes(), 0);
     }
-    g_fa.kv_k = k->data;
-    g_fa.kv_v = v->data;
-    g_fa.kv_packed = n_kv;
 
     int32_t * qh = (int32_t *) g_fa.q->bo.map();
     for (int64_t rd = 0; rd < rounds; rd++) {
