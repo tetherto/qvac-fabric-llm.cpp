@@ -4726,12 +4726,6 @@ static bool ggml_cuda_cutlass_activation_sharing_enabled() {
     return !disabled;
 }
 
-static bool ggml_cuda_glu_elide_enabled() {
-    static const bool disabled = getenv("GGML_CUDA_DISABLE_GLU_ELIDE") != nullptr &&
-                                 std::atoi(getenv("GGML_CUDA_DISABLE_GLU_ELIDE")) != 0;
-    return !disabled;
-}
-
 struct ggml_cuda_cutlass_activation_plan {
     struct group {
         const ggml_tensor *                 src1 = nullptr;
@@ -4755,7 +4749,6 @@ struct ggml_cuda_cutlass_activation_plan {
         size_t                              up_offset     = 0;
         size_t                              output_offset = 0;
         ggml_cuda_cutlass_activation_layout output_layout;
-        bool                                skip_glu_write = false;
         bool                                ready = false;
         ggml_cuda_cutlass_activation        output_activation;
     };
@@ -4796,6 +4789,10 @@ struct ggml_cuda_cutlass_activation_plan {
     }
 
     ggml_cuda_cutlass_result run_mlp(ggml_backend_cuda_context & ctx, const ggml_tensor * node) {
+#ifndef GGML_CUDA_CUTLASS
+        GGML_UNUSED_VARS(ctx, node);
+        return ggml_cuda_cutlass_result::fallback;
+#else
         const auto it = mlp_first_nodes.find(node);
         if (it == mlp_first_nodes.end()) {
             return ggml_cuda_cutlass_result::fallback;
@@ -4877,10 +4874,9 @@ struct ggml_cuda_cutlass_activation_plan {
         char *    output     = group_workspace + mlp_plan.output_offset;
         uint8_t * scales     = (uint8_t *) output + mlp_plan.output_layout.offset_scales;
         float *   row_scales = (float *) (output + mlp_plan.output_layout.offset_rows);
-        float * glu = mlp_plan.skip_glu_write ? nullptr : (float *) mlp_plan.match.glu->data;
         quantize_cutlass_nvfp4_swiglu_bf16_cuda(
             (const nv_bfloat16 *) gate, (const nv_bfloat16 *) up, (const float *) mlp_plan.match.gate_scale->data,
-            (const float *) mlp_plan.match.up_scale->data, glu, output, scales,
+            (const float *) mlp_plan.match.up_scale->data, (float *) mlp_plan.match.glu->data, output, scales,
             row_scales, mlp_plan.output_layout.k, mlp_plan.output_layout.k_padded, mlp_plan.output_layout.m,
             ctx.stream());
         CUDA_CHECK(cudaGetLastError());
@@ -4896,6 +4892,7 @@ struct ggml_cuda_cutlass_activation_plan {
         };
         mlp_plan.ready = true;
         return ggml_cuda_cutlass_result::success;
+#endif
     }
 
     bool replaces_concurrent_event(const ggml_tensor * fork) const {
@@ -5241,15 +5238,6 @@ static ggml_cuda_cutlass_activation_plan ggml_cuda_build_cutlass_activation_plan
         mlp_plan.match         = match;
         mlp_plan.group_index   = group_index;
         mlp_plan.output_layout = output_layout;
-        // glu has no consumers outside the fused subgraph; its write only exists so the
-        // down projection can fall back to the canonical path. skip it when the down GEMM
-        // is guaranteed to take the prequantized path and the row fits in shared memory
-        mlp_plan.skip_glu_write =
-            ggml_cuda_glu_elide_enabled() &&
-            (uint64_t) output_layout.k <= SIZE_MAX / sizeof(float) &&
-            (size_t) output_layout.k * sizeof(float) + 1024 <= ggml_cuda_info().devices[cuda_ctx->device].smpbo &&
-            ggml_cuda_cutlass_mul_mat_prequantized_supported(
-                *cuda_ctx, match.down_mm->src[0], match.glu, match.down_mm);
         size_t group_size      = activation_group.workspace_size;
         if (!ggml_cuda_append_aligned_workspace(group_size, bf16_size, mlp_plan.gate_offset) ||
             !ggml_cuda_append_aligned_workspace(group_size, bf16_size, mlp_plan.up_offset) ||
