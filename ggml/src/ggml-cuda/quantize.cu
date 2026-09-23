@@ -2,7 +2,9 @@
 #include "repack-cutlass-blockscaled.cuh"
 #include "unary.cuh"
 
+#include <climits>
 #include <cstdint>
+#include <mutex>
 
 #if defined(BLACKWELL_MMA_AVAILABLE)
 // this maps to 256-bit loads in PTX on supported devices,
@@ -736,7 +738,7 @@ static __global__ void quantize_cutlass_nvfp4_swiglu_bf16(const nv_bfloat16 * __
                                                           int64_t n_cols_padded,
                                                           bool use_smem) {
 #    if defined(BLACKWELL_MMA_AVAILABLE)
-    // row_buf stages the swiglu result in shared memory, avoiding the glu global round-trip
+    // row_buf avoids reading the materialized GLU back from global memory.
     extern __shared__ float row_buf[];
 
     const int64_t row        = blockIdx.x;
@@ -752,9 +754,7 @@ static __global__ void quantize_cutlass_nvfp4_swiglu_bf16(const nv_bfloat16 * __
         if (use_smem) {
             row_buf[col] = value;
         }
-        if (glu != nullptr) {
-            glu[row_offset + col] = value;
-        }
+        glu[row_offset + col] = value;
         amax = fmaxf(amax, fabsf(value));
     }
 
@@ -860,19 +860,30 @@ void quantize_cutlass_nvfp4_swiglu_bf16_cuda(const nv_bfloat16 * gate,
     GGML_ASSERT(n_cols % QK_NVFP4 == 0 && n_cols_padded >= n_cols && n_cols_padded % 128 == 0);
     GGML_ASSERT(n_cols > 0 && (uint64_t) n_cols <= SIZE_MAX / sizeof(float));
     const size_t row_bytes = (size_t) n_cols * sizeof(float);
-    const size_t smpbo     = ggml_cuda_info().devices[ggml_cuda_get_device()].smpbo;
-    // 1KB margin: max dynamic smem is smpbo minus the kernel's static shared usage
-    const bool   use_smem  = row_bytes + 1024 <= smpbo;
-    GGML_ASSERT(glu != nullptr || use_smem);
-    if (use_smem) {
-        static size_t smem_configured[GGML_CUDA_MAX_DEVICES] = {};
-        const int     id = ggml_cuda_get_device();
-        if (smem_configured[id] < row_bytes) {
-            CUDA_CHECK(cudaFuncSetAttribute(
-                quantize_cutlass_nvfp4_swiglu_bf16, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) row_bytes));
-            smem_configured[id] = row_bytes;
+    const int id = ggml_cuda_get_device();
+    static std::once_flag smem_once[GGML_CUDA_MAX_DEVICES];
+    static size_t         smem_limit[GGML_CUDA_MAX_DEVICES] = {};
+    std::call_once(smem_once[id], [id] {
+        cudaFuncAttributes attr;
+        cudaError_t status = cudaFuncGetAttributes(&attr, quantize_cutlass_nvfp4_swiglu_bf16);
+        if (status == cudaSuccess) {
+            const size_t smpbo = ggml_cuda_info().devices[id].smpbo;
+            // Leave room for static shared memory and the driver's per-block reservation.
+            const size_t reserve = attr.sharedSizeBytes + 1024;
+            const size_t limit   = smpbo > reserve ? smpbo - reserve : 0;
+            if (limit > 0 && limit <= INT_MAX) {
+                status = cudaFuncSetAttribute(quantize_cutlass_nvfp4_swiglu_bf16,
+                                              cudaFuncAttributeMaxDynamicSharedMemorySize, (int) limit);
+                if (status == cudaSuccess) {
+                    smem_limit[id] = limit;
+                }
+            }
         }
-    }
+        if (status != cudaSuccess) {
+            (void) cudaGetLastError();
+        }
+    });
+    const bool use_smem = row_bytes <= smem_limit[id];
     CUDA_CHECK(
         cudaMemsetAsync(block_scales, 0, (size_t) GGML_PAD(n_rows, 128) * (n_cols_padded / QK_NVFP4_SUB), stream));
     quantize_cutlass_nvfp4_swiglu_bf16<<<(unsigned) n_rows, CUDA_QUANTIZE_BLOCK_SIZE_MMQ, use_smem ? row_bytes : 0,

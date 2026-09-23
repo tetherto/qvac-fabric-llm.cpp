@@ -4736,8 +4736,6 @@ struct ggml_cuda_cutlass_activation_plan {
         int                                 slot                = 0;
         size_t                              workspace_offset    = 0;
         size_t                              workspace_size      = 0;
-        const ggml_cuda_concurrent_event *  replaced_event      = nullptr;
-        const ggml_tensor *                 replaced_event_fork = nullptr;
         bool                                prepared            = false;
         ggml_cuda_cutlass_activation        activation = {};
     };
@@ -4758,7 +4756,6 @@ struct ggml_cuda_cutlass_activation_plan {
     std::unordered_map<const ggml_tensor *, size_t> node_groups;
     std::unordered_map<const ggml_tensor *, size_t> mlp_first_nodes;
     std::unordered_map<const ggml_tensor *, size_t> mlp_down_nodes;
-    std::vector<const ggml_tensor *>                replaced_event_forks;
     std::unique_ptr<ggml_cuda_pool_alloc<char>>     direct_workspace;
     char *                                          workspace      = nullptr;
     size_t                                          workspace_size = 0;
@@ -4820,56 +4817,17 @@ struct ggml_cuda_cutlass_activation_plan {
         void * gate            = group_workspace + mlp_plan.gate_offset;
         void * up              = group_workspace + mlp_plan.up_offset;
 
-        const ggml_cuda_concurrent_event * event         = activation_group.replaced_event;
-        bool                               event_started = false;
-        const auto                         join_event    = [&]() {
-            ctx.curr_stream_no = 0;
-            if (!event_started) {
-                return;
-            }
-            for (int i = 1; i <= event->n_streams; ++i) {
-                CUDA_CHECK(cudaEventRecord(event->join_events[i - 1], ctx.stream(ctx.device, i)));
-                CUDA_CHECK(cudaStreamWaitEvent(ctx.stream(), event->join_events[i - 1]));
-            }
-            event_started = false;
-        };
-
-        int gate_stream = 0;
-        int up_stream   = 0;
-        if (event != nullptr) {
-            const auto gate_it = event->stream_mapping.find(mlp_plan.match.gate_mm);
-            const auto up_it   = event->stream_mapping.find(mlp_plan.match.up_mm);
-            if (gate_it == event->stream_mapping.end() || up_it == event->stream_mapping.end() ||
-                gate_it->second <= 0 || gate_it->second > event->n_streams || up_it->second <= 0 ||
-                up_it->second > event->n_streams) {
-                return ggml_cuda_cutlass_result::fallback;
-            }
-            gate_stream = gate_it->second;
-            up_stream   = up_it->second;
-
-            CUDA_CHECK(cudaEventRecord(event->fork_event, ctx.stream()));
-            for (int i = 1; i <= event->n_streams; ++i) {
-                CUDA_CHECK(cudaStreamWaitEvent(ctx.stream(ctx.device, i), event->fork_event));
-            }
-            event_started = true;
-        }
-
-        ctx.curr_stream_no                         = gate_stream;
         const ggml_cuda_cutlass_result gate_result = ggml_cuda_cutlass_mul_mat_prequantized_bf16(
             ctx, mlp_plan.match.gate_mm->src[0], mlp_plan.match.input, mlp_plan.match.gate_mm, *input_activation, gate);
         if (gate_result != ggml_cuda_cutlass_result::success) {
-            join_event();
             return gate_result;
         }
 
-        ctx.curr_stream_no                       = up_stream;
         const ggml_cuda_cutlass_result up_result = ggml_cuda_cutlass_mul_mat_prequantized_bf16(
             ctx, mlp_plan.match.up_mm->src[0], mlp_plan.match.input, mlp_plan.match.up_mm, *input_activation, up);
         if (up_result != ggml_cuda_cutlass_result::success) {
-            join_event();
             return up_result;
         }
-        join_event();
 
         char *    output     = group_workspace + mlp_plan.output_offset;
         uint8_t * scales     = (uint8_t *) output + mlp_plan.output_layout.offset_scales;
@@ -4891,12 +4849,9 @@ struct ggml_cuda_cutlass_activation_plan {
             mlp_plan.output_layout.type,
         };
         mlp_plan.ready = true;
+        ++ctx.mlp_fusion_count;
         return ggml_cuda_cutlass_result::success;
 #endif
-    }
-
-    bool replaces_concurrent_event(const ggml_tensor * fork) const {
-        return std::find(replaced_event_forks.begin(), replaced_event_forks.end(), fork) != replaced_event_forks.end();
     }
 
     void allocate_direct(ggml_backend_cuda_context & ctx) {
@@ -5064,88 +5019,10 @@ static ggml_cuda_cutlass_activation_plan ggml_cuda_build_cutlass_activation_plan
         return plan;
     }
 
-    for (int i = 0; i + 5 < cgraph->n_nodes; ++i) {
-        ggml_cuda_mlp_bf16_match match;
-        if (!ggml_cuda_match_mlp_bf16(cgraph, i, match)) {
-            continue;
-        }
-
-        ggml_cuda_cutlass_activation_plan::group * activation_group = nullptr;
-        for (auto & candidate : plan.groups) {
-            if (candidate.nodes.size() != 2) {
-                continue;
-            }
-            const bool has_first =
-                std::find(candidate.nodes.begin(), candidate.nodes.end(), match.first_mm) != candidate.nodes.end();
-            const bool has_second =
-                std::find(candidate.nodes.begin(), candidate.nodes.end(), match.second_mm) != candidate.nodes.end();
-            if (has_first && has_second) {
-                activation_group = &candidate;
-                break;
-            }
-        }
-        if (activation_group == nullptr) {
-            continue;
-        }
-
-        const auto first_it  = locations.find(match.first_mm);
-        const auto second_it = locations.find(match.second_mm);
-        if (first_it == locations.end() || second_it == locations.end() || first_it->second.event == nullptr ||
-            first_it->second.event != second_it->second.event) {
-            continue;
-        }
-
-        const node_location &              location = first_it->second;
-        const ggml_cuda_concurrent_event * event    = location.event;
-        if (location.fork + 1 != i || location.join != i + 4 || event->join_node != match.glu ||
-            event->stream_mapping.size() != 4 || event->original_order.size() != 4 ||
-            locations.find(match.down_mm) != locations.end()) {
-            continue;
-        }
-
-        bool event_exact = true;
-        for (int j = 0; j < 4; ++j) {
-            const ggml_tensor * branch_node = cgraph->nodes[i + j];
-            const auto          branch_it   = locations.find(branch_node);
-            if (event->original_order[j] != branch_node || branch_it == locations.end() ||
-                branch_it->second.event != event) {
-                event_exact = false;
-                break;
-            }
-        }
-        if (!event_exact) {
-            continue;
-        }
-
-        const ggml_tensor * fork     = cgraph->nodes[location.fork];
-        const auto          event_it = cuda_ctx->stream_context().concurrent_events.find(fork);
-        if (event_it == cuda_ctx->stream_context().concurrent_events.end() || &event_it->second != event) {
-            continue;
-        }
-
-        ggml_cuda_cutlass_activation_layout output_layout;
-        size_t                              bf16_size;
-        if (!ggml_cuda_preflight_mlp_bf16(*cuda_ctx, match, output_layout, bf16_size)) {
-            continue;
-        }
-        size_t checked_size = activation_group->workspace_size;
-        size_t ignored_offset;
-        if (!ggml_cuda_append_aligned_workspace(checked_size, bf16_size, ignored_offset) ||
-            !ggml_cuda_append_aligned_workspace(checked_size, bf16_size, ignored_offset) ||
-            !ggml_cuda_append_aligned_workspace(checked_size, output_layout.size_allocation, ignored_offset)) {
-            continue;
-        }
-
-        activation_group->replaced_event      = event;
-        activation_group->replaced_event_fork = fork;
-        activation_group->first               = location.fork;
-        activation_group->last                = i + 5;
-    }
-
     for (auto it = plan.groups.begin(); it != plan.groups.end();) {
         bool          safe = it->nodes.size() >= 2;
         node_location location;
-        if (safe && it->replaced_event == nullptr) {
+        if (safe) {
             const auto first_location = locations.find(it->nodes.front());
             if (first_location != locations.end()) {
                 location = first_location->second;
@@ -5162,7 +5039,7 @@ static ggml_cuda_cutlass_activation_plan ggml_cuda_build_cutlass_activation_plan
                 }
             }
         }
-        if (safe && it->replaced_event == nullptr) {
+        if (safe) {
             const int write_start = location.event != nullptr ? location.fork + 1 : it->first;
             const int write_end   = location.event != nullptr ? location.join : it->last;
             for (int i = write_start; i < write_end; ++i) {
@@ -5179,7 +5056,7 @@ static ggml_cuda_cutlass_activation_plan ggml_cuda_build_cutlass_activation_plan
             it = plan.groups.erase(it);
             continue;
         }
-        if (it->replaced_event == nullptr && location.event != nullptr) {
+        if (location.event != nullptr) {
             it->first = location.fork;
             it->last  = location.join;
         }
@@ -5225,14 +5102,11 @@ static ggml_cuda_cutlass_activation_plan ggml_cuda_build_cutlass_activation_plan
         if (down_it != locations.end()) {
             down_location = down_it->second;
         }
-        auto &     activation_group = plan.groups[group_index];
-        const bool replaces_event   = activation_group.replaced_event != nullptr &&
-                                      activation_group.replaced_event == first_location.event &&
-                                      activation_group.replaced_event_fork == cgraph->nodes[activation_group.first];
-        if (!replaces_event &&
-            (first_location.event != down_location.event || first_location.stream != down_location.stream)) {
+        // The fused projections and packing run on stream 0. Keep event-owned nodes on the normal path.
+        if (first_location.event != nullptr || down_location.event != nullptr) {
             continue;
         }
+        auto & activation_group = plan.groups[group_index];
 
         ggml_cuda_cutlass_activation_plan::mlp mlp_plan;
         mlp_plan.match         = match;
@@ -5245,11 +5119,7 @@ static ggml_cuda_cutlass_activation_plan ggml_cuda_build_cutlass_activation_plan
             continue;
         }
         activation_group.workspace_size = group_size;
-        if (replaces_event) {
-            plan.replaced_event_forks.push_back(activation_group.replaced_event_fork);
-        } else if (first_location.event == nullptr) {
-            activation_group.last = std::max(activation_group.last, i + 5);
-        }
+        activation_group.last = std::max(activation_group.last, i + 5);
         plan.mlps.push_back(std::move(mlp_plan));
     }
 
@@ -5285,10 +5155,6 @@ static ggml_cuda_cutlass_activation_plan ggml_cuda_build_cutlass_activation_plan
     for (size_t i = 0; i < plan.groups.size(); ++i) {
         ggml_cuda_cutlass_activation_plan::group & activation_group = plan.groups[i];
         activation_group.workspace_offset                           = slot_offsets[activation_group.slot];
-        if (activation_group.replaced_event != nullptr &&
-            !plan.replaces_concurrent_event(activation_group.replaced_event_fork)) {
-            continue;
-        }
         for (const ggml_tensor * node : activation_group.nodes) {
             plan.node_groups[node] = i;
         }
@@ -5329,7 +5195,7 @@ static bool ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context *    
     ggml_cuda_concurrent_event * concurrent_event           = nullptr;
 
     const auto try_launch_concurrent_event = [&](const ggml_tensor * node) {
-        if (!should_launch_concurrent_events || activation_plan.replaces_concurrent_event(node)) {
+        if (!should_launch_concurrent_events) {
             return;
         }
         if (stream_ctx.concurrent_events.find(node) != stream_ctx.concurrent_events.end()) {
@@ -6927,6 +6793,11 @@ static bool ggml_backend_cuda_device_supports_async_upload(
 #endif
 }
 
+static uint64_t ggml_backend_cuda_mlp_fusion_count(ggml_backend_t backend) {
+    const auto * ctx = (const ggml_backend_cuda_context *) backend->context;
+    return ctx->mlp_fusion_count;
+}
+
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
     if (strcmp(name, "ggml_backend_comm_init") == 0) {
@@ -6952,6 +6823,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_dev_supports_async_upload") == 0) {
         return (void *)ggml_backend_cuda_device_supports_async_upload;
+    }
+    if (strcmp(name, "ggml_backend_cuda_mlp_fusion_count") == 0) {
+        return (void *)ggml_backend_cuda_mlp_fusion_count;
     }
 #ifdef GGML_CUDA_CUTLASS
     if (strcmp(name, "ggml_backend_begin_async_upload") == 0) {

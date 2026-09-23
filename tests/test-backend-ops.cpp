@@ -1236,6 +1236,9 @@ struct test_case {
 
     virtual bool run_whole_graph() { return false; }
     virtual std::vector<ggml_tensor *> fusion_test_nodes() { return {}; }
+    virtual void prepare_graph(ggml_cgraph * graph) { GGML_UNUSED(graph); }
+    virtual uint64_t fusion_count(ggml_backend_t backend) { GGML_UNUSED(backend); return 0; }
+    virtual bool expect_fusion() { return false; }
     virtual bool use_weight_context() { return false; }
     virtual bool use_weight_context_sentinels() { return true; }
     virtual ggml_backend_buffer_type_t weight_buffer_type(ggml_backend_t backend) {
@@ -1438,6 +1441,7 @@ struct test_case {
 
         // build graph
         ggml_build_forward_expand(gf, out);
+        prepare_graph(gf);
 
         // add sentinels as graph nodes so that they are checked in the callback
         for (ggml_tensor * sentinel : sentinels) {
@@ -1530,6 +1534,7 @@ struct test_case {
             fused_nodes_to_verify.push_back(out);
         }
         bool cmp_ok = true;
+        const uint64_t initial_fusion_count = fusion_count(backend1);
         for (int i = 0; i < graph_replays() && cmp_ok && ud.ok; ++i) {
             if (graph_replays() > 1 && ggml_backend_graph_compute(backend1, gf) != GGML_STATUS_SUCCESS) {
                 cmp_ok = false;
@@ -1541,8 +1546,10 @@ struct test_case {
         }
 
         // Create test result
-        bool        test_passed = ud.ok && cmp_ok;
-        std::string error_msg   = test_passed ? "" : (!cmp_ok ? "compare failed" : "test failed");
+        const bool  fusion_ran  = !expect_fusion() || fusion_count(backend1) > initial_fusion_count;
+        bool        test_passed = ud.ok && cmp_ok && fusion_ran;
+        std::string error_msg   = !fusion_ran ? "fusion did not run" :
+                                  test_passed ? "" : (!cmp_ok ? "compare failed" : "test failed");
         test_result result(ggml_backend_name(backend1), current_op_name, vars(), "test", supported, test_passed,
                            error_msg);
 
@@ -5508,17 +5515,25 @@ struct test_cutlass_mlp_bf16 : public test_case {
     static constexpr int n_weights = 3;
 
     const bool                                  reuse_glu;
+    const int64_t                               n_rows;
+    const bool                                  up_before_gate;
     ggml_backend_t                              backend     = nullptr;
     ggml_tensor *                               pair_output = nullptr;
     ggml_tensor *                               materialized_glu = nullptr;
+    ggml_tensor *                               repacked_gate_mm = nullptr;
+    ggml_tensor *                               repacked_gate_mul = nullptr;
+    ggml_tensor *                               repacked_up_mm = nullptr;
+    ggml_tensor *                               repacked_up_mul = nullptr;
     std::array<std::vector<uint8_t>, n_weights> weight_data;
 
-    explicit test_cutlass_mlp_bf16(bool reuse_glu) : reuse_glu(reuse_glu) {}
+    test_cutlass_mlp_bf16(bool reuse_glu, int64_t n_rows = 2048, bool up_before_gate = false) :
+        reuse_glu(reuse_glu), n_rows(n_rows), up_before_gate(up_before_gate) {}
 
     int graph_replays() override { return 4; }
 
     std::string vars() override {
-        return std::string("type=nvfp4,m=576,n=2048,k=576,reuse_glu=") + (reuse_glu ? "yes" : "no");
+        return std::string("type=nvfp4,m=576,n=") + std::to_string(n_rows) + ",k=576,reuse_glu=" +
+               (reuse_glu ? "yes" : "no") + ",up_first=" + (up_before_gate ? "yes" : "no");
     }
 
     std::string op_desc(ggml_tensor * t) override {
@@ -5539,6 +5554,31 @@ struct test_cutlass_mlp_bf16 : public test_case {
     bool run_whole_graph() override { return true; }
 
     std::vector<ggml_tensor *> fusion_test_nodes() override { return { pair_output, materialized_glu }; }
+
+    bool expect_fusion() override { return !reuse_glu; }
+
+    uint64_t fusion_count(ggml_backend_t backend) override {
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
+        using counter_fn = uint64_t (*)(ggml_backend_t);
+        auto counter = (counter_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_mlp_fusion_count");
+        return counter != nullptr ? counter(backend) : 0;
+    }
+
+    void prepare_graph(ggml_cgraph * graph) override {
+        if (!up_before_gate) {
+            return;
+        }
+        ggml_tensor ** nodes = ggml_graph_nodes(graph);
+        for (int i = 0; i + 3 < ggml_graph_n_nodes(graph); ++i) {
+            if (nodes[i] == repacked_gate_mm && nodes[i + 1] == repacked_gate_mul &&
+                nodes[i + 2] == repacked_up_mm && nodes[i + 3] == repacked_up_mul) {
+                std::swap(nodes[i], nodes[i + 2]);
+                std::swap(nodes[i + 1], nodes[i + 3]);
+                return;
+            }
+        }
+        GGML_ABORT("CUTLASS MLP test could not reorder gate/up branches");
+    }
 
     bool use_weight_context() override { return true; }
 
@@ -5598,12 +5638,18 @@ struct test_cutlass_mlp_bf16 : public test_case {
                             ggml_tensor *  down_weight,
                             ggml_tensor *  gate_scale,
                             ggml_tensor *  up_scale,
-                            ggml_tensor ** materialized = nullptr) const {
-        ggml_tensor * gate = ggml_mul(ctx, ggml_mul_mat(ctx, gate_weight, input), gate_scale);
-        ggml_tensor * up   = ggml_mul(ctx, ggml_mul_mat(ctx, up_weight, input), up_scale);
+                            ggml_tensor ** materialized = nullptr) {
+        ggml_tensor * gate_mm = ggml_mul_mat(ctx, gate_weight, input);
+        ggml_tensor * gate    = ggml_mul(ctx, gate_mm, gate_scale);
+        ggml_tensor * up_mm   = ggml_mul_mat(ctx, up_weight, input);
+        ggml_tensor * up      = ggml_mul(ctx, up_mm, up_scale);
         ggml_tensor * glu  = ggml_swiglu_split(ctx, gate, up);
         if (materialized != nullptr) {
             *materialized = glu;
+            repacked_gate_mm  = gate_mm;
+            repacked_gate_mul = gate;
+            repacked_up_mm    = up_mm;
+            repacked_up_mul   = up;
         }
         ggml_tensor * down = ggml_mul_mat(ctx, down_weight, glu);
         if (reuse_glu) {
@@ -5617,7 +5663,7 @@ struct test_cutlass_mlp_bf16 : public test_case {
     ggml_tensor * build_graph(ggml_context * ctx, ggml_context * ctx_weights) override {
         GGML_ASSERT(ctx_weights != nullptr);
         constexpr int64_t m = 576;
-        constexpr int64_t n = 2048;
+        const int64_t n = n_rows;
         constexpr int64_t k = 576;
 
         ggml_tensor * native_gate   = ggml_new_tensor_2d(ctx, GGML_TYPE_NVFP4, k, m);
@@ -12506,6 +12552,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_cutlass_shared_activation());
             test_cases.emplace_back(new test_cutlass_mlp_bf16(false));
             test_cases.emplace_back(new test_cutlass_mlp_bf16(true));
+            test_cases.emplace_back(new test_cutlass_mlp_bf16(false, 129));
+            test_cases.emplace_back(new test_cutlass_mlp_bf16(false, 129, true));
         }
         for (ggml_glu_op glu_op : {GGML_GLU_OP_SWIGLU, GGML_GLU_OP_GEGLU}) {
             test_cases.emplace_back(new test_repacked_mul_mat_vec_fusion(type, glu_op, false, false));
