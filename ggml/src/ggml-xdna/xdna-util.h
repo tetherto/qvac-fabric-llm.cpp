@@ -20,9 +20,3 @@ static inline int xdna_env_int(const char * name, int def) {
     const char * v = getenv(name);
     return v ? atoi(v) : def;
 }
-
-// True when the variable is unset or set to a non-zero number.
-static inline bool xdna_env_on(const char * name) {
-    const char * v = getenv(name);
-    return v == nullptr || atoi(v) != 0;
-}
