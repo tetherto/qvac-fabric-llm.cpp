@@ -42,7 +42,7 @@ It covers one weight set: `Q4_K` for the FFN gate and up, `Q4_K`/`Q5_K`/`Q6_K`
 for `ssm_out`, `Q4_K`/`Q6_K` for the FFN down, plus a `GGML_XDNA_GATED_FMT` that
 matches the `ssm_out` layout. Anything else is refused with an error rather
 than run on the wrong kernels; `GGML_XDNA_FUSED_LAYER=0` forces the per-op path
-instead.
+instead - but see the limitations below before relying on it.
 
 ### Prefill ops
 
@@ -116,6 +116,33 @@ lifetime, keyed by the tensor's data pointer and shape.
 
 Prefill chunks take the same path with `M > 1` (GEMM blocks and the conv/fa/gdn
 prefill kernels); the fused layer never fires there.
+
+## Known limitations
+
+Measured on npu2 (Ryzen AI MAX+ 395), Qwen3.5-0.8B-Q4_K_M, llama-server with
+`-np 1 -b 4096 -ub 4096 --flash-attn off`, requests at `temperature 0`,
+`top_k 1` and `cache_prompt false`.
+
+**Decode does not reproduce run to run.** The same prompt and seed give
+different output about one run in three. This is not state carried between
+requests: three separate server processes, one request each, disagree the same
+way, at a ~1k prompt and at a ~4k one alike. The text stays coherent, so it
+reads as a plausible answer rather than an obvious fault. `GGML_XDNA_CONV=0`
+does not change it, and the per-op decode path is the only arm that repeats.
+
+**The per-op decode path is reproducible but wrong.** With
+`GGML_XDNA_FUSED_LAYER=0` three runs agree byte for byte and all three are
+degenerate - repeated tokens and mixed scripts rather than an answer. So the
+flag the weight-set check points at is not a usable fallback today: a model the
+fused layer refuses cannot be run correctly on this backend at all.
+
+**`kernels/gdn_v.py --run` cannot run.** It imports `ref_delta_layer` and
+`check_real`, neither of which is in the tree, and stops before it reaches the
+device. Its `--tolerance` gate is therefore untested.
+
+**A build writes into the source tree.** `kernels/design_tag.py` regenerates
+`xdna-design-tag.h`, which is tracked, so `git status` reports the working tree
+as modified after every build.
 
 ## Requirements
 
