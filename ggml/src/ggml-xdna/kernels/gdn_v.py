@@ -208,6 +208,8 @@ def main():
     ap.add_argument("--qmodel",
                     default="/home/asherstnev/.cache/llama.cpp/qwen3.5-0.8b-q4km.gguf")
     ap.add_argument("--tokens", type=int, nargs="+", default=[5, 6, 7])
+    ap.add_argument("--tolerance", type=float, default=0.05,
+                    help="relative error the verify accepts (default 0.05)")
     opts = ap.parse_args()
     if opts.dev is None:
         opts.dev = "npu2"
@@ -326,6 +328,7 @@ def main():
     attn_bo = mk_bo(np.zeros(N_VH * S_V, dtype=np.float32), ro=True)
 
     print(f"== ggml_xdna_gdn_v: {T} tokens layer 0 (tokens {opts.tokens}) ==")
+    worst = 0.0
     for t in range(T):
         qkv, z, eg, beta_s = projs[t]
         conv_in = np.concatenate([conv_state, qkv[None, :]], axis=0)
@@ -402,8 +405,13 @@ def main():
               f"| state max_abs = {es:.3e} (rel {er_s:.3e}), sim = {ess:.3e}")
         print(f"     h_attn max_abs = {ea_h:.3e} (rel {er_h:.3e})  "
               f"h_out max_abs = {eo:.3e} (rel {er_o:.3e})")
+        worst = max(worst, er, er_s, er_h, er_o)
     print("xclbin", xclbin_path)
     print(f"tag={opts.tag}")
+    print(f"worst relative error {worst:.3e} (tolerance {opts.tolerance:.3e})")
+    if not (worst <= opts.tolerance):
+        sys.exit(f"gdn_v: relative error {worst:.3e} over tolerance "
+                 f"{opts.tolerance:.3e}")
 
 
 def sim_chunk_bf16(pkv, rows_f32):

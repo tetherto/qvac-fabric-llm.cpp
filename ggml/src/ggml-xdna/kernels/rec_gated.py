@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import sys
 import time
 from pathlib import Path
 
@@ -152,6 +153,8 @@ def main():
     ap.add_argument("--run", action="store_true")
     ap.add_argument("--workdir", type=str, default="build/bin")
     ap.add_argument("--tag", default=None)
+    ap.add_argument("--tolerance", type=float, default=0.05,
+                    help="relative error the verify accepts (default 0.05)")
     opts = ap.parse_args()
     if opts.dev is None:
         opts.dev = "npu2"
@@ -228,6 +231,18 @@ def main():
         print("rec_gated: aq IDENTICAL to host fp64 reference")
     else:
         print(f"rec_gated: {nmis} aq codes differ (fp32 silu vs fp64 reference)")
+    # Judge the dequantised value, not the code count: a code off by one is the
+    # fp32 silu rounding, and counting those says nothing about how far the
+    # result moved.
+    ref = aq_ref.astype(np.float64) * da_ref
+    got = aq.astype(np.float64) * da
+    scale = float(np.abs(ref).max())
+    rel = float(np.abs(got - ref).max()) / scale if scale > 0.0 else 0.0
+    print(f"rec_gated: dequantised relative error {rel:.3e} "
+          f"(tolerance {opts.tolerance:.3e})")
+    if not (rel <= opts.tolerance):
+        sys.exit(f"rec_gated: relative error {rel:.3e} over tolerance "
+                 f"{opts.tolerance:.3e}")
 
 
 if __name__ == "__main__":
