@@ -334,6 +334,24 @@ if (GGML_XDNA_BUILD_KERNELS)
     # name (design_tag.py). One run covers them all, after any of them built:
     # the tag hashes all the design sources, so a change anywhere moves the tag
     # for the designs ninja did not rebuild too.
+    # design_tag.py computes the tag from the design sources; ask it here so the
+    # names below are the ones the stamping step will actually write. Without
+    # this XDNA_DESIGN_TAG is empty, the command declares outputs that never
+    # appear, and the step reruns on every build while install(FILES) points at
+    # files that do not exist.
+    execute_process(
+        COMMAND ${CMAKE_COMMAND} -E env GATED_FMT=${GGML_XDNA_GATED_FMT}
+                ${GEMM_PYTHON} -c
+                "import design_tag; print(design_tag.tag('npu2'))"
+        WORKING_DIRECTORY "${GEMM_DIR}"
+        OUTPUT_VARIABLE XDNA_DESIGN_TAG
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        RESULT_VARIABLE XDNA_DESIGN_TAG_RC
+    )
+    if (NOT XDNA_DESIGN_TAG_RC EQUAL 0 OR XDNA_DESIGN_TAG STREQUAL "")
+        message(FATAL_ERROR "ggml-xdna: could not compute the design tag")
+    endif()
+
     set(XDNA_TAGGED_STEMS fused_layer gemv_n32_r4_c8)
     set(XDNA_TAGGED_ARTIFACTS)
     foreach(TS IN LISTS XDNA_TAGGED_STEMS)
@@ -356,6 +374,12 @@ if (GGML_XDNA_BUILD_KERNELS)
     list(APPEND XDNA_ARTIFACTS ${XDNA_TAGGED_ARTIFACTS})
 
     add_custom_target(ggml-xdna-kernels ALL DEPENDS ${XDNA_ARTIFACTS})
+
+    # design_tag.py also writes xdna-design-tag.h, which the backend includes.
+    # Without this the library compiles before the header is written and the
+    # binary looks for artifacts under the previous tag, so a clean build has to
+    # be run twice before it will load anything.
+    add_dependencies(ggml-xdna ggml-xdna-kernels)
 
     install(FILES ${XDNA_ARTIFACTS} DESTINATION ${CMAKE_INSTALL_BINDIR})
 endif()
