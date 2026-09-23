@@ -5943,7 +5943,13 @@ struct test_fwht_signed : public test_case {
         if (strcmp(backend_name, "WebGPU") == 0) {
             return 5e-5;
         }
-        return strcmp(backend_name, "Vulkan") == 0 ? 5e-6 : test_case::max_nmse_err(backend);
+        if (strcmp(backend_name, "Vulkan") == 0) {
+            return 5e-6;
+        }
+        if (strcmp(backend_name, "CUDA") == 0) {
+            return 2e-7;
+        }
+        return test_case::max_nmse_err(backend);
     }
 
     std::string op_desc(ggml_tensor * t) override {

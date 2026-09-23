@@ -1496,12 +1496,27 @@ static ggml_tensor * llama_apply_hadamard_sign(
     return ggml_mul(ctx, cur, signs);
 }
 
+ggml_tensor * llm_graph_context::build_hadamard_inverse_after_lookup(
+          ggml_tensor * cur,
+    const ggml_tensor * table) const {
+    if (hadamard_inverses && !hadamard_inverses->empty()) {
+        const auto it = hadamard_inverses->find(table);
+        if (it != hadamard_inverses->end()) {
+            cur = llama_mul_mat_hadamard(ctx0, cur, it->second.rot);
+            if (it->second.signs) {
+                cur = llama_apply_hadamard_sign(ctx0, cur, it->second.signs);
+            }
+        }
+    }
+    return cur;
+}
+
 ggml_tensor * llm_graph_context::build_lora_mm(
           ggml_tensor * w,
           ggml_tensor * cur,
           ggml_tensor * w_s) const {
     ggml_tensor * cur_mm = cur;
-    if (hadamard_rotations) {
+    if (hadamard_rotations && !hadamard_rotations->empty()) {
         const auto it = hadamard_rotations->find(w);
         if (it != hadamard_rotations->end()) {
             const auto & t = it->second;
@@ -1553,7 +1568,7 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
           ggml_tensor * ids,
           ggml_tensor * w_s) const {
     ggml_tensor * cur_mm = cur;
-    if (hadamard_rotations) {
+    if (hadamard_rotations && !hadamard_rotations->empty()) {
         const auto it = hadamard_rotations->find(w);
         if (it != hadamard_rotations->end()) {
             const auto & t = it->second;
@@ -2377,16 +2392,7 @@ ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd) const {
 
         cur = ggml_get_rows(ctx0, tok_embd, inp->tokens);
 
-        // Restore folded embedding rows to the primal basis.
-        if (hadamard_inverses) {
-            const auto it = hadamard_inverses->find(tok_embd);
-            if (it != hadamard_inverses->end()) {
-                cur = llama_mul_mat_hadamard(ctx0, cur, it->second.rot);
-                if (it->second.signs) {
-                    cur = llama_apply_hadamard_sign(ctx0, cur, it->second.signs);
-                }
-            }
-        }
+        cur = build_hadamard_inverse_after_lookup(cur, tok_embd);
 
         // apply lora for embedding tokens if needed
         for (const auto & lora : *loras) {

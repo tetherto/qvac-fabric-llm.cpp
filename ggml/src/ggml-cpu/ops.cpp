@@ -13212,6 +13212,7 @@ static void ggml_compute_forward_fwht_impl(const ggml_compute_params * params, g
     GGML_ASSERT(dst->type == GGML_TYPE_F32);
 
     GGML_TENSOR_BINARY_OP_LOCALS
+    GGML_ASSERT(ne00 == ne01 && ne10 == ne00 && ne0 == ne10);
 
     const int ith = params->ith;
     const int nth = params->nth;

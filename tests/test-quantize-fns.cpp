@@ -665,6 +665,29 @@ static void test_tq_quantize_val_boundaries(void) {
     assert(!failed);
 }
 
+static void test_pq2_raw_decode_levels(void) {
+    block_pq2_0 block = {};
+    block.d = ggml_fp32_to_fp16(2.0f);
+    block.qs[0] = 0xe4;
+
+    float decoded[QK_PQ2_0];
+    dequantize_row_pq2_0(&block, decoded, QK_PQ2_0);
+    assert(decoded[0] == -2.0f);
+    assert(decoded[1] ==  0.0f);
+    assert(decoded[2] ==  2.0f);
+    assert(decoded[3] ==  4.0f);
+
+    float ternary[QK_PQ2_0];
+    for (int i = 0; i < QK_PQ2_0; ++i) {
+        ternary[i] = (float) (i % 3 - 1);
+    }
+    quantize_row_pq2_0_ref(ternary, &block, QK_PQ2_0);
+    for (int i = 0; i < QK_PQ2_0; ++i) {
+        const uint8_t code = (block.qs[i / 4] >> (2 * (i % 4))) & 3;
+        assert(code <= 2);
+    }
+}
+
 int main(int argc, char * argv[]) {
     bool verbose = false;
     size_t test_size = 32 * 128;
@@ -714,6 +737,7 @@ int main(int argc, char * argv[]) {
 
     test_tq_forward_inverse_roundtrip();
     test_tq_quantize_val_boundaries();
+    test_pq2_raw_decode_levels();
 
     if (res.num_failed || verbose) {
         printf("%d tests failed\n", res.num_failed);

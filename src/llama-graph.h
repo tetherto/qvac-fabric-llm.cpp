@@ -1031,6 +1031,10 @@ struct llm_graph_context {
              ggml_tensor * cur,
                      int   il) const;
 
+    ggml_tensor * build_hadamard_inverse_after_lookup(
+              ggml_tensor * cur,
+        const ggml_tensor * table) const;
+
     // do mat_mul, while optionally apply lora and per-tensor scale
     ggml_tensor * build_lora_mm(
               ggml_tensor * w,

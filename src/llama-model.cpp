@@ -1213,8 +1213,8 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
         ml.get_key("prism.hadamard.sign_mode", sign_mode);
         ml.get_arr("prism.hadamard.weight_names", weight_names);
 
-        if (block_size == 0 || (block_size & (block_size - 1)) != 0) {
-            throw std::runtime_error(format("invalid prism.hadamard.block_size: %u", block_size));
+        if (block_size == 0 || block_size > 8192 || (block_size & (block_size - 1)) != 0) {
+            throw std::runtime_error(format("invalid prism.hadamard.block_size: %u; maximum is 8192", block_size));
         }
         if (transform != "normalized-sylvester-walsh-hadamard") {
             throw std::runtime_error(format("unsupported prism.hadamard.transform: %s", transform.c_str()));
@@ -1264,7 +1264,6 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
         switch (arch) {
             case LLM_ARCH_LLAMA:
             case LLM_ARCH_QWEN3:
-            case LLM_ARCH_QWEN3MOE:
             case LLM_ARCH_QWEN35:
             case LLM_ARCH_QWEN35MOE:
             case LLM_ARCH_QWEN3NEXT:
@@ -2001,10 +2000,7 @@ bool llama_model::create_backend_buffers(std::size_t size_data,
             { &hadamard_weight_blocks,  &hadamard_rotations },
             { &hadamard_inverse_blocks, &hadamard_inverses  },
         };
-        // inverse (lookup-side) transforms must not inherit a host buffer
-        // type from a CPU-mapped table: the per-token transform would then
-        // ping-pong across the PCIe boundary. Prefer the buffer type the
-        // forward rotations live on (the GPU when layers are offloaded).
+        // Keep lookup-side transforms with forward rotations when layers are offloaded.
         ggml_backend_buffer_type_t preferred_buft = nullptr;
 
         for (const auto & [blocks, target] : groups)
@@ -2012,8 +2008,16 @@ bool llama_model::create_backend_buffers(std::size_t size_data,
             const std::string & weight_name = entry.first;
             const uint32_t block_size = entry.second;
             const ggml_tensor * weight = get_tensor(weight_name.c_str());
+            if (weight == nullptr && weight_name == "output.weight") {
+                weight = output;
+            }
             if (weight == nullptr) {
                 throw std::runtime_error(format("prism.hadamard weight not found: %s", weight_name.c_str()));
+            }
+            if (block_size > (uint64_t) weight->ne[0]) {
+                throw std::runtime_error(format(
+                    "prism.hadamard block size %u exceeds input dimension %lld for %s",
+                    block_size, (long long) weight->ne[0], weight_name.c_str()));
             }
             if (weight->ne[0] % block_size != 0) {
                 throw std::runtime_error(format(
@@ -2024,7 +2028,15 @@ bool llama_model::create_backend_buffers(std::size_t size_data,
                 throw std::runtime_error(format("prism.hadamard weight has no buffer: %s", weight_name.c_str()));
             }
 
-            ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(weight->buffer);
+            ggml_backend_buffer_type_t weight_buft = ggml_backend_buffer_get_type(weight->buffer);
+            ggml_backend_dev_t dev = ggml_backend_buft_get_device(weight_buft);
+            if (!dev) {
+                dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+                if (!dev) {
+                    throw std::runtime_error(format("%s: no CPU backend found", __func__));
+                }
+            }
+            ggml_backend_buffer_type_t buft = ggml_backend_dev_buffer_type(dev);
             if (target == &hadamard_rotations) {
                 preferred_buft = buft;
             } else if (preferred_buft) {

@@ -651,8 +651,8 @@ class ModelBase:
         if not isinstance(transform, dict):
             raise ValueError("Hadamard manifest is missing transform metadata")
         block_size = transform.get("block_size")
-        if not isinstance(block_size, int) or block_size <= 0 or block_size & (block_size - 1):
-            raise ValueError(f"Invalid Hadamard block size: {block_size!r}")
+        if not isinstance(block_size, int) or block_size <= 0 or block_size > 8192 or block_size & (block_size - 1):
+            raise ValueError(f"Invalid Hadamard block size: {block_size!r}; maximum is 8192")
         if transform.get("name") != "normalized-signed-sylvester-walsh-hadamard":
             raise ValueError(f"Unsupported Hadamard transform: {transform.get('name')!r}")
         sign_mode = transform.get("sign_mode")
@@ -693,7 +693,6 @@ class ModelBase:
         _HADAMARD_ARCHS = {
             gguf.MODEL_ARCH.LLAMA,
             gguf.MODEL_ARCH.QWEN3,
-            gguf.MODEL_ARCH.QWEN3MOE,
             gguf.MODEL_ARCH.QWEN35,
             gguf.MODEL_ARCH.QWEN35MOE,
             gguf.MODEL_ARCH.QWEN3NEXT,
@@ -746,6 +745,57 @@ class ModelBase:
                         "verified Hadamard-aware matmul path"
                     )
                 weight_names.append(mapped)
+
+        if self.fuse_gate_up_exps:
+            split_patterns = {
+                kind: re.compile(
+                    "^" + re.escape(gguf.TENSOR_NAMES[key] + ".weight").replace(r"\{bid\}", r"(?P<bid>\d+)") + "$"
+                )
+                for kind, key in (
+                    ("gate", gguf.MODEL_TENSOR.FFN_GATE_EXP),
+                    ("up", gguf.MODEL_TENSOR.FFN_UP_EXP),
+                )
+            }
+            fused_pattern = re.compile(
+                "^" + re.escape(gguf.TENSOR_NAMES[gguf.MODEL_TENSOR.FFN_GATE_UP_EXP] + ".weight")
+                .replace(r"\{bid\}", r"(?P<bid>\d+)") + "$"
+            )
+            split_records: dict[int, dict[str, int]] = {}
+            fused_layers: set[int] = set()
+            for index, name in enumerate(weight_names):
+                match = fused_pattern.fullmatch(name)
+                if match:
+                    fused_layers.add(int(match.group("bid")))
+                    continue
+                for kind, pattern in split_patterns.items():
+                    match = pattern.fullmatch(name)
+                    if not match:
+                        continue
+                    bid = int(match.group("bid"))
+                    layer = split_records.setdefault(bid, {})
+                    if kind in layer:
+                        raise ValueError(f"duplicate Hadamard split expert record for layer {bid}")
+                    layer[kind] = index
+                    break
+
+            replacements: dict[int, str] = {}
+            skipped: set[int] = set()
+            for bid, layer in split_records.items():
+                if bid in fused_layers:
+                    raise ValueError(f"Hadamard manifest mixes fused and split expert weights for layer {bid}")
+                if set(layer) != {"gate", "up"}:
+                    raise ValueError(
+                        f"Hadamard fusion requires both ffn_gate_exps and ffn_up_exps for layer {bid}"
+                    )
+                first, second = sorted(layer.values())
+                replacements[first] = self.format_tensor_name(gguf.MODEL_TENSOR.FFN_GATE_UP_EXP, bid)
+                skipped.add(second)
+
+            weight_names = [
+                replacements.get(index, name)
+                for index, name in enumerate(weight_names)
+                if index not in skipped
+            ]
 
         self.gguf_writer.add_uint32("prism.hadamard.version", 1)
         self.gguf_writer.add_uint32("prism.hadamard.block_size", block_size)
@@ -1212,7 +1262,6 @@ class ModelBase:
         logger.info("Set model quantization version")
         self.gguf_writer.add_quantization_version(gguf.GGML_QUANT_VERSION)
 
-        self.add_hadamard_metadata()
 
     def write_vocab(self):
         raise NotImplementedError("write_vocab() must be implemented in subclasses")
@@ -1392,6 +1441,8 @@ class TextModel(ModelBase):
 
     def prepare_metadata(self, vocab_only: bool):
         super().prepare_metadata(vocab_only=vocab_only)
+        if not vocab_only:
+            self.add_hadamard_metadata()
 
         total_params = self.gguf_writer.get_total_parameter_count()[0]
         # Extract the encoding scheme from the file type name. e.g. 'gguf.LlamaFileType.MOSTLY_Q8_0' --> 'Q8_0'

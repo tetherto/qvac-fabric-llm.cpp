@@ -14,6 +14,7 @@
 // TODO: replace with #include "llama-ext.h" in the future
 #include "../src/llama-arch.h"
 #include "../src/llama-model-saver.h"
+#include "../src/llama-model.h"
 
 #include <cinttypes>
 #include <cstddef>
@@ -69,7 +70,7 @@ static void set_tensor_data(struct ggml_tensor * tensor, void * userdata) {
 }
 
 static void usage(char ** argv) {
-    printf("Usage: %s [-a/--arch arch] [-s/--seed seed] [-v/--verbose] [--mtp-shared|--mtp-shared-cpu|--qsa-unified-multiseq]\n", argv[0]);
+    printf("Usage: %s [-a/--arch arch] [-s/--seed seed] [-v/--verbose] [--mtp-shared|--mtp-shared-cpu|--hadamard-contracts|--qsa-unified-multiseq]\n", argv[0]);
 }
 
 static std::vector<llama_token> get_tokens(const uint32_t n_tokens, const uint32_t n_vocab, const size_t seed){
@@ -1052,11 +1053,198 @@ static int test_mtp_shared(bool cpu) {
     return 0;
 }
 
+static void add_hadamard_metadata(gguf_context * ctx, uint32_t block_size = 256, bool include_attn_q = false) {
+    const char * weight_names[] = { "output.weight", "blk.0.attn_q.weight" };
+    const char * inverse_names[] = { "token_embd.weight" };
+    gguf_set_val_u32(ctx, "prism.hadamard.version", 1);
+    gguf_set_val_u32(ctx, "prism.hadamard.block_size", block_size);
+    gguf_set_val_str(ctx, "prism.hadamard.transform", "normalized-sylvester-walsh-hadamard");
+    gguf_set_val_str(ctx, "prism.hadamard.axis", "input-last-dimension");
+    gguf_set_val_str(ctx, "prism.hadamard.sign_mode", "identity");
+    gguf_set_arr_str(ctx, "prism.hadamard.weight_names", weight_names, include_attn_q ? 2 : 1);
+    gguf_set_arr_str(ctx, "prism.hadamard.inverse_weight_names", inverse_names, 1);
+}
+
+static void test_hadamard_tied_output() {
+    const size_t seed = 1234;
+    auto metadata = get_gguf_ctx(LLM_ARCH_QWEN35, false);
+    auto source = get_model_and_ctx(metadata.get(), nullptr, seed, {});
+
+    llama_model_saver source_saver(source.first.get());
+    source_saver.add_kv_from_model();
+    source_saver.add_tensors_from_model();
+
+    gguf_context_ptr fixture_ctx(gguf_init_empty());
+    gguf_set_kv(fixture_ctx.get(), source_saver.gguf_ctx);
+    add_hadamard_metadata(fixture_ctx.get());
+    llama_model_saver fixture(LLM_ARCH_QWEN35, fixture_ctx.get());
+
+    bool skipped_output = false;
+    for (int64_t i = 0; i < gguf_get_n_tensors(source_saver.gguf_ctx); ++i) {
+        const char * name = gguf_get_tensor_name(source_saver.gguf_ctx, i);
+        if (strcmp(name, "output.weight") == 0) {
+            skipped_output = true;
+            continue;
+        }
+        const ggml_tensor * tensor = source.first->get_tensor(name);
+        GGML_ASSERT(tensor);
+        fixture.add_tensor(tensor);
+    }
+    GGML_ASSERT(skipped_output);
+
+    FILE * file = tmpfile();
+    GGML_ASSERT(file);
+    fixture.save(file);
+    rewind(file);
+
+    auto loaded = get_model_and_ctx(nullptr, file, seed, {});
+    const auto tokens = get_tokens(4, llama_vocab_n_tokens(llama_model_get_vocab(loaded.first.get())), seed);
+    GGML_ASSERT(!get_logits(loaded.first.get(), loaded.second.get(), tokens).empty());
+    fclose(file);
+}
+
+static void test_hadamard_repack() {
+    const size_t seed = 1234;
+    auto metadata = get_gguf_ctx(LLM_ARCH_LLAMA, false);
+    auto source = get_model_and_ctx(metadata.get(), nullptr, seed, {});
+
+    llama_model_saver source_saver(source.first.get());
+    source_saver.add_kv_from_model();
+    source_saver.add_tensors_from_model();
+
+    gguf_context_ptr fixture_ctx(gguf_init_empty());
+    gguf_set_kv(fixture_ctx.get(), source_saver.gguf_ctx);
+    add_hadamard_metadata(fixture_ctx.get(), 256, true);
+    llama_model_saver fixture(LLM_ARCH_LLAMA, fixture_ctx.get());
+    std::vector<ggml_context_ptr> quantized_contexts;
+
+    for (int64_t i = 0; i < gguf_get_n_tensors(source_saver.gguf_ctx); ++i) {
+        const char * name = gguf_get_tensor_name(source_saver.gguf_ctx, i);
+        const ggml_tensor * tensor = source.first->get_tensor(name);
+        GGML_ASSERT(tensor);
+        if (strcmp(name, "output.weight") != 0 && strcmp(name, "blk.0.attn_q.weight") != 0) {
+            fixture.add_tensor(tensor);
+            continue;
+        }
+
+        ggml_init_params params = { 16 * 1024 * 1024, nullptr, false };
+        ggml_context_ptr ctx(ggml_init(params));
+        GGML_ASSERT(ctx);
+        ggml_tensor * quantized = ggml_new_tensor_4d(
+                ctx.get(), GGML_TYPE_Q8_0, tensor->ne[0], tensor->ne[1], tensor->ne[2], tensor->ne[3]);
+        ggml_set_name(quantized, name);
+
+        std::vector<float> data(ggml_nelements(tensor));
+        if (tensor->type == GGML_TYPE_F32) {
+            ggml_backend_tensor_get(tensor, data.data(), 0, ggml_nbytes(tensor));
+        } else {
+            GGML_ASSERT(tensor->type == GGML_TYPE_F16);
+            std::vector<ggml_fp16_t> data_f16(ggml_nelements(tensor));
+            ggml_backend_tensor_get(tensor, data_f16.data(), 0, ggml_nbytes(tensor));
+            ggml_fp16_to_fp32_row(data_f16.data(), data.data(), data.size());
+        }
+        ggml_quantize_chunk(GGML_TYPE_Q8_0, data.data(), quantized->data, 0, ggml_nrows(tensor), tensor->ne[0], nullptr);
+        fixture.add_tensor(quantized);
+        quantized_contexts.emplace_back(std::move(ctx));
+    }
+
+    FILE * file = tmpfile();
+    GGML_ASSERT(file);
+    fixture.save(file);
+    rewind(file);
+
+    auto loaded = get_model_and_ctx(nullptr, file, seed, {});
+    const auto cpu_buft = ggml_backend_dev_buffer_type(ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU));
+    bool tested_extra_buft = false;
+    for (const char * name : { "output.weight", "blk.0.attn_q.weight" }) {
+        const ggml_tensor * weight = loaded.first->get_tensor(name);
+        GGML_ASSERT(weight);
+        const auto it = loaded.first->hadamard_rotations.find(weight);
+        GGML_ASSERT(it != loaded.first->hadamard_rotations.end());
+        if (ggml_backend_buffer_get_type(weight->buffer) != cpu_buft) {
+            GGML_ASSERT(ggml_backend_buffer_get_type(it->second.rot->buffer) == cpu_buft);
+            tested_extra_buft = true;
+        }
+    }
+    GGML_ASSERT(tested_extra_buft);
+    const auto tokens = get_tokens(4, llama_vocab_n_tokens(llama_model_get_vocab(loaded.first.get())), seed);
+    GGML_ASSERT(!get_logits(loaded.first.get(), loaded.second.get(), tokens).empty());
+    fclose(file);
+}
+
+static void test_hadamard_invalid_block() {
+    auto metadata = get_gguf_ctx(LLM_ARCH_QWEN35, false);
+    add_hadamard_metadata(metadata.get(), 16384);
+    auto params = llama_model_default_params();
+    size_t seed = 1234;
+    llama_model_ptr model(llama_model_init_from_user(metadata.get(), set_tensor_data, &seed, params));
+    GGML_ASSERT(!model);
+}
+
+static void test_hadamard_mtp_arch(llm_arch arch, bool moe) {
+    auto metadata = get_gguf_ctx(arch, moe);
+    const std::string prefix = llm_arch_name(arch);
+    gguf_set_val_u32(metadata.get(), (prefix + ".block_count").c_str(), 3);
+    gguf_set_val_u32(metadata.get(), (prefix + ".nextn_predict_layers").c_str(), 1);
+    add_hadamard_metadata(metadata.get());
+
+    auto mp = llama_model_default_params();
+    mp.load_mtp = true;
+    size_t seed = 1234;
+    llama_model_ptr model(llama_model_init_from_user(metadata.get(), set_tensor_data, &seed, mp));
+    GGML_ASSERT(model);
+
+    auto cp = llama_context_default_params();
+    cp.n_ctx = 128;
+    cp.n_batch = cp.n_ubatch = 8;
+    cp.n_outputs_max = cp.n_outputs_max_per_seq = 8;
+    cp.n_seq_max = 1;
+    cp.n_threads = cp.n_threads_batch = 2;
+    llama_context_ptr target(llama_init_from_model(model.get(), cp));
+    GGML_ASSERT(target);
+
+    cp.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
+    cp.ctx_other = target.get();
+    llama_context_ptr draft(llama_init_from_model(model.get(), cp));
+    GGML_ASSERT(draft);
+
+    common_params_speculative params;
+    params.types = { COMMON_SPECULATIVE_TYPE_DRAFT_MTP };
+    params.draft.ctx_tgt = target.get();
+    params.draft.ctx_dft = draft.get();
+    params.draft.backend_sampling = false;
+    common_speculative_ptr spec(common_speculative_init(params, 1));
+    GGML_ASSERT(spec);
+
+    llama_batch batch = llama_batch_init(8, 0, 1);
+    for (int i = 0; i < 8; ++i) {
+        common_batch_add(batch, i, i, { 0 }, true);
+    }
+    common_speculative_begin(spec.get(), 0, {});
+    GGML_ASSERT(llama_decode(target.get(), batch) == 0);
+    GGML_ASSERT(common_speculative_process(spec.get(), batch));
+    llama_batch_free(batch);
+}
+
+static int test_hadamard_contracts() {
+    test_hadamard_invalid_block();
+    test_hadamard_tied_output();
+    test_hadamard_mtp_arch(LLM_ARCH_QWEN35, false);
+    test_hadamard_mtp_arch(LLM_ARCH_QWEN35MOE, true);
+    test_hadamard_mtp_arch(LLM_ARCH_QWEN3NEXT, true);
+    test_hadamard_repack();
+    printf("Hadamard contracts: passed\n");
+    return 0;
+}
+
 int main(int argc, char ** argv) {
     // FIXME these tests are disabled in the CI for macOS-latest-cmake-arm64 because they are segfaulting
     common_init();
     if (argc == 2 && (strcmp(argv[1], "--mtp-shared") == 0 || strcmp(argv[1], "--mtp-shared-cpu") == 0)) {
         return test_mtp_shared(strcmp(argv[1], "--mtp-shared-cpu") == 0);
+    }
+    if (argc == 2 && strcmp(argv[1], "--hadamard-contracts") == 0) {
+        return test_hadamard_contracts();
     }
     std::random_device rd;
 

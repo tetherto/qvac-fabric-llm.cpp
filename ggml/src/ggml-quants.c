@@ -109,7 +109,7 @@ void quantize_row_q2_0_ref(const float * GGML_RESTRICT x, block_q2_0 * GGML_REST
     }
 }
 
-// PQ2_0: identical 2-bit codec to Q2_0, one fp16 scale per 128 weights.
+// PQ2_0 stores raw codes c as c - 1; quantization intentionally emits ternary codes 0 to 2.
 void quantize_row_pq2_0_ref(const float * GGML_RESTRICT x, block_pq2_0 * GGML_RESTRICT y, int64_t k) {
     static const int qk = QK_PQ2_0;
 
