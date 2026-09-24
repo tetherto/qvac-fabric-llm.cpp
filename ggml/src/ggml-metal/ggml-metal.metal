@@ -419,6 +419,7 @@ void quantize_q2_0(device const float * src, device block_q2_0 & dst) {
 }
 
 void quantize_pq2_0(device const float * src, device block_pq2_0 & dst) {
+#pragma METAL fp math_mode(safe)
     float amax = 0.0f;
     for (int j = 0; j < QK_PQ2_0; j++) {
         float a = fabs(src[j]);
@@ -441,6 +442,7 @@ void quantize_pq2_0(device const float * src, device block_pq2_0 & dst) {
 
 template <typename T>
 void quantize_ptq1_0(device const T * src, device block_ptq1_0 & dst) {
+#pragma METAL fp math_mode(safe)
     float amax = 0.0f;
     for (int j = 0; j < QK_PTQ1_0; j++) {
         amax = max(amax, fabs((float) src[j]));
@@ -5495,54 +5497,6 @@ inline float block_q_n_dot_y(device const block_q2_0 * qb_curr, float sumy, thre
     return qb_curr->d * (acc_lo + 2.0f * acc_hi - sumy);
 }
 
-// PQ2_0 dot: same 2-bit codec as Q2_0 at group size 128
-inline float block_q_n_dot_y(device const block_pq2_0 * qb_curr, float sumy, thread float * yl, int il) {
-    device const uint8_t * qs = qb_curr->qs + (il / 4);
-    const uint8_t b0 = qs[0];
-    const uint8_t b1 = qs[1];
-    const uint8_t b2 = qs[2];
-    const uint8_t b3 = qs[3];
-
-    // Accumulate where low bit is set (bits 0,2,4,6 of each byte)
-    float acc_lo = 0.0f;
-    acc_lo += select(0.0f, yl[ 0], bool(b0 & 0x01));
-    acc_lo += select(0.0f, yl[ 1], bool(b0 & 0x04));
-    acc_lo += select(0.0f, yl[ 2], bool(b0 & 0x10));
-    acc_lo += select(0.0f, yl[ 3], bool(b0 & 0x40));
-    acc_lo += select(0.0f, yl[ 4], bool(b1 & 0x01));
-    acc_lo += select(0.0f, yl[ 5], bool(b1 & 0x04));
-    acc_lo += select(0.0f, yl[ 6], bool(b1 & 0x10));
-    acc_lo += select(0.0f, yl[ 7], bool(b1 & 0x40));
-    acc_lo += select(0.0f, yl[ 8], bool(b2 & 0x01));
-    acc_lo += select(0.0f, yl[ 9], bool(b2 & 0x04));
-    acc_lo += select(0.0f, yl[10], bool(b2 & 0x10));
-    acc_lo += select(0.0f, yl[11], bool(b2 & 0x40));
-    acc_lo += select(0.0f, yl[12], bool(b3 & 0x01));
-    acc_lo += select(0.0f, yl[13], bool(b3 & 0x04));
-    acc_lo += select(0.0f, yl[14], bool(b3 & 0x10));
-    acc_lo += select(0.0f, yl[15], bool(b3 & 0x40));
-
-    // Accumulate where high bit is set (bits 1,3,5,7 of each byte)
-    float acc_hi = 0.0f;
-    acc_hi += select(0.0f, yl[ 0], bool(b0 & 0x02));
-    acc_hi += select(0.0f, yl[ 1], bool(b0 & 0x08));
-    acc_hi += select(0.0f, yl[ 2], bool(b0 & 0x20));
-    acc_hi += select(0.0f, yl[ 3], bool(b0 & 0x80));
-    acc_hi += select(0.0f, yl[ 4], bool(b1 & 0x02));
-    acc_hi += select(0.0f, yl[ 5], bool(b1 & 0x08));
-    acc_hi += select(0.0f, yl[ 6], bool(b1 & 0x20));
-    acc_hi += select(0.0f, yl[ 7], bool(b1 & 0x80));
-    acc_hi += select(0.0f, yl[ 8], bool(b2 & 0x02));
-    acc_hi += select(0.0f, yl[ 9], bool(b2 & 0x08));
-    acc_hi += select(0.0f, yl[10], bool(b2 & 0x20));
-    acc_hi += select(0.0f, yl[11], bool(b2 & 0x80));
-    acc_hi += select(0.0f, yl[12], bool(b3 & 0x02));
-    acc_hi += select(0.0f, yl[13], bool(b3 & 0x08));
-    acc_hi += select(0.0f, yl[14], bool(b3 & 0x20));
-    acc_hi += select(0.0f, yl[15], bool(b3 & 0x80));
-
-    return qb_curr->d * (acc_lo + 2.0f * acc_hi - sumy);
-}
 
 // function for calculate inner product between half a q4_0 block and 16 floats (yl), sumy is SUM(yl[i])
 // il indicates where the q4 quants begin (0 or QK4_0/4)
@@ -9429,23 +9383,33 @@ kernel void kernel_fwht_tg(
 typedef decltype(kernel_fwht<64, float>) kernel_fwht_f32_t;
 typedef decltype(kernel_fwht<64, half>)  kernel_fwht_f16_t;
 
-template [[host_name("kernel_fwht_f32_64")]]   kernel kernel_fwht_f32_t kernel_fwht<64,   float>;
-template [[host_name("kernel_fwht_f32_128")]]  kernel kernel_fwht_f32_t kernel_fwht<128,  float>;
-template [[host_name("kernel_fwht_f32_256")]]  kernel kernel_fwht_f32_t kernel_fwht<256,  float>;
-template [[host_name("kernel_fwht_f32_512")]]  kernel kernel_fwht_f32_t kernel_fwht_tg<512,  GGML_METAL_FWHT_TG_NT, float>;
-template [[host_name("kernel_fwht_f32_1024")]] kernel kernel_fwht_f32_t kernel_fwht_tg<1024, GGML_METAL_FWHT_TG_NT, float>;
-template [[host_name("kernel_fwht_f32_2048")]] kernel kernel_fwht_f32_t kernel_fwht_tg<2048, GGML_METAL_FWHT_TG_NT, float>;
-template [[host_name("kernel_fwht_f32_4096")]] kernel kernel_fwht_f32_t kernel_fwht_tg<4096, GGML_METAL_FWHT_TG_NT, float>;
-template [[host_name("kernel_fwht_f32_8192")]] kernel kernel_fwht_f32_t kernel_fwht_tg<8192, GGML_METAL_FWHT_TG_NT, float>;
+template [[host_name("kernel_fwht_f32_64")]]         kernel kernel_fwht_f32_t kernel_fwht<64,   float>;
+template [[host_name("kernel_fwht_f32_128")]]        kernel kernel_fwht_f32_t kernel_fwht<128,  float>;
+template [[host_name("kernel_fwht_f32_256")]]        kernel kernel_fwht_f32_t kernel_fwht<256,  float>;
+template [[host_name("kernel_fwht_f32_512")]]        kernel kernel_fwht_f32_t kernel_fwht_tg<512,  GGML_METAL_FWHT_TG_NT, float>;
+template [[host_name("kernel_fwht_f32_1024")]]       kernel kernel_fwht_f32_t kernel_fwht_tg<1024, GGML_METAL_FWHT_TG_NT, float>;
+template [[host_name("kernel_fwht_f32_2048")]]       kernel kernel_fwht_f32_t kernel_fwht_tg<2048, GGML_METAL_FWHT_TG_NT, float>;
+template [[host_name("kernel_fwht_f32_4096")]]       kernel kernel_fwht_f32_t kernel_fwht_tg<4096, GGML_METAL_FWHT_TG_NT, float>;
+template [[host_name("kernel_fwht_f32_8192")]]       kernel kernel_fwht_f32_t kernel_fwht_tg<8192, GGML_METAL_FWHT_TG_NT, float>;
+template [[host_name("kernel_fwht_f32_512_nt128")]]  kernel kernel_fwht_f32_t kernel_fwht_tg<512,  GGML_METAL_FWHT_TG_NT_FALLBACK, float>;
+template [[host_name("kernel_fwht_f32_1024_nt128")]] kernel kernel_fwht_f32_t kernel_fwht_tg<1024, GGML_METAL_FWHT_TG_NT_FALLBACK, float>;
+template [[host_name("kernel_fwht_f32_2048_nt128")]] kernel kernel_fwht_f32_t kernel_fwht_tg<2048, GGML_METAL_FWHT_TG_NT_FALLBACK, float>;
+template [[host_name("kernel_fwht_f32_4096_nt128")]] kernel kernel_fwht_f32_t kernel_fwht_tg<4096, GGML_METAL_FWHT_TG_NT_FALLBACK, float>;
+template [[host_name("kernel_fwht_f32_8192_nt128")]] kernel kernel_fwht_f32_t kernel_fwht_tg<8192, GGML_METAL_FWHT_TG_NT_FALLBACK, float>;
 
-template [[host_name("kernel_fwht_f16_64")]]   kernel kernel_fwht_f16_t kernel_fwht<64,   half>;
-template [[host_name("kernel_fwht_f16_128")]]  kernel kernel_fwht_f16_t kernel_fwht<128,  half>;
-template [[host_name("kernel_fwht_f16_256")]]  kernel kernel_fwht_f16_t kernel_fwht<256,  half>;
-template [[host_name("kernel_fwht_f16_512")]]  kernel kernel_fwht_f16_t kernel_fwht_tg<512,  GGML_METAL_FWHT_TG_NT, half>;
-template [[host_name("kernel_fwht_f16_1024")]] kernel kernel_fwht_f16_t kernel_fwht_tg<1024, GGML_METAL_FWHT_TG_NT, half>;
-template [[host_name("kernel_fwht_f16_2048")]] kernel kernel_fwht_f16_t kernel_fwht_tg<2048, GGML_METAL_FWHT_TG_NT, half>;
-template [[host_name("kernel_fwht_f16_4096")]] kernel kernel_fwht_f16_t kernel_fwht_tg<4096, GGML_METAL_FWHT_TG_NT, half>;
-template [[host_name("kernel_fwht_f16_8192")]] kernel kernel_fwht_f16_t kernel_fwht_tg<8192, GGML_METAL_FWHT_TG_NT, half>;
+template [[host_name("kernel_fwht_f16_64")]]         kernel kernel_fwht_f16_t kernel_fwht<64,   half>;
+template [[host_name("kernel_fwht_f16_128")]]        kernel kernel_fwht_f16_t kernel_fwht<128,  half>;
+template [[host_name("kernel_fwht_f16_256")]]        kernel kernel_fwht_f16_t kernel_fwht<256,  half>;
+template [[host_name("kernel_fwht_f16_512")]]        kernel kernel_fwht_f16_t kernel_fwht_tg<512,  GGML_METAL_FWHT_TG_NT, half>;
+template [[host_name("kernel_fwht_f16_1024")]]       kernel kernel_fwht_f16_t kernel_fwht_tg<1024, GGML_METAL_FWHT_TG_NT, half>;
+template [[host_name("kernel_fwht_f16_2048")]]       kernel kernel_fwht_f16_t kernel_fwht_tg<2048, GGML_METAL_FWHT_TG_NT, half>;
+template [[host_name("kernel_fwht_f16_4096")]]       kernel kernel_fwht_f16_t kernel_fwht_tg<4096, GGML_METAL_FWHT_TG_NT, half>;
+template [[host_name("kernel_fwht_f16_8192")]]       kernel kernel_fwht_f16_t kernel_fwht_tg<8192, GGML_METAL_FWHT_TG_NT, half>;
+template [[host_name("kernel_fwht_f16_512_nt128")]]  kernel kernel_fwht_f16_t kernel_fwht_tg<512,  GGML_METAL_FWHT_TG_NT_FALLBACK, half>;
+template [[host_name("kernel_fwht_f16_1024_nt128")]] kernel kernel_fwht_f16_t kernel_fwht_tg<1024, GGML_METAL_FWHT_TG_NT_FALLBACK, half>;
+template [[host_name("kernel_fwht_f16_2048_nt128")]] kernel kernel_fwht_f16_t kernel_fwht_tg<2048, GGML_METAL_FWHT_TG_NT_FALLBACK, half>;
+template [[host_name("kernel_fwht_f16_4096_nt128")]] kernel kernel_fwht_f16_t kernel_fwht_tg<4096, GGML_METAL_FWHT_TG_NT_FALLBACK, half>;
+template [[host_name("kernel_fwht_f16_8192_nt128")]] kernel kernel_fwht_f16_t kernel_fwht_tg<8192, GGML_METAL_FWHT_TG_NT_FALLBACK, half>;
 
 // dequantize a quantized KV cache tensor to contiguous F16 before running the F16 flash attention kernels
 // - one thread per block; dispatched separately for K and V
@@ -11198,10 +11162,11 @@ template [[host_name("kernel_cpy_bf16_f32")]]  kernel kernel_cpy_t kernel_cpy_t_
 template [[host_name("kernel_cpy_bf16_bf16")]] kernel kernel_cpy_t kernel_cpy_t_t<bfloat,  bfloat>;
 #endif
 
-template<short QK,
+template<typename T,
+         short QK,
          typename block_q,
-         void (*quantize_func)(device const float *, device block_q &)>
-kernel void kernel_cpy_f32_q(
+         void (*quantize_func)(device const T *, device block_q &)>
+kernel void kernel_cpy_q(
         constant ggml_metal_kargs_cpy & args,
         device const char * src0,
         device char * dst,
@@ -11227,7 +11192,7 @@ kernel void kernel_cpy_f32_q(
     device block_q * dst_data = (device block_q *)(dst + i3*args.nb3 + i2*args.nb2 + i1*args.nb1 + i0*args.nb0);
 
     for (int32_t i00 = iw0*ntg[0] + tpitg.x; i00 < args.nk0;) {
-        device const float * src = (device const float *)(src0 + i03*args.nb03 + i02*args.nb02 + i01*args.nb01 + (i00*QK)*args.nb00);
+        device const T * src = (device const T *)(src0 + i03*args.nb03 + i02*args.nb02 + i01*args.nb01 + (i00*QK)*args.nb00);
 
         quantize_func(src, dst_data[i00]);
 
@@ -11235,55 +11200,21 @@ kernel void kernel_cpy_f32_q(
     }
 }
 
-typedef decltype(kernel_cpy_f32_q<QK8_0,  block_q8_0,  quantize_q8_0>)  cpy_f_q_t;
+typedef decltype(kernel_cpy_q<float, QK8_0, block_q8_0, quantize_q8_0>) cpy_f_q_t;
 
-template [[host_name("kernel_cpy_f32_q8_0")]]   kernel cpy_f_q_t kernel_cpy_f32_q<QK8_0,  block_q8_0,   quantize_q8_0>;
-template [[host_name("kernel_cpy_f32_q1_0")]]   kernel cpy_f_q_t kernel_cpy_f32_q<QK1_0,  block_q1_0,   quantize_q1_0>;
-template [[host_name("kernel_cpy_f32_q2_0")]]   kernel cpy_f_q_t kernel_cpy_f32_q<QK2_0,  block_q2_0,   quantize_q2_0>;
-template [[host_name("kernel_cpy_f32_pq2_0")]]  kernel cpy_f_q_t kernel_cpy_f32_q<QK_PQ2_0, block_pq2_0, quantize_pq2_0>;
-template [[host_name("kernel_cpy_f32_q4_0")]]   kernel cpy_f_q_t kernel_cpy_f32_q<QK4_0,  block_q4_0,   quantize_q4_0>;
-template [[host_name("kernel_cpy_f32_q4_1")]]   kernel cpy_f_q_t kernel_cpy_f32_q<QK4_1,  block_q4_1,   quantize_q4_1>;
-template [[host_name("kernel_cpy_f32_q5_0")]]   kernel cpy_f_q_t kernel_cpy_f32_q<QK5_0,  block_q5_0,   quantize_q5_0>;
-template [[host_name("kernel_cpy_f32_q5_1")]]   kernel cpy_f_q_t kernel_cpy_f32_q<QK5_1,  block_q5_1,   quantize_q5_1>;
-template [[host_name("kernel_cpy_f32_iq4_nl")]] kernel cpy_f_q_t kernel_cpy_f32_q<QK4_NL, block_iq4_nl, quantize_iq4_nl>;
-template [[host_name("kernel_cpy_f32_tq2_0")]]  kernel cpy_f_q_t kernel_cpy_f32_q<QK_K,   block_tq2_0,  quantize_tq2_0>;
+template [[host_name("kernel_cpy_f32_q8_0")]]   kernel cpy_f_q_t kernel_cpy_q<float, QK8_0,  block_q8_0,   quantize_q8_0>;
+template [[host_name("kernel_cpy_f32_q1_0")]]   kernel cpy_f_q_t kernel_cpy_q<float, QK1_0,  block_q1_0,   quantize_q1_0>;
+template [[host_name("kernel_cpy_f32_q2_0")]]   kernel cpy_f_q_t kernel_cpy_q<float, QK2_0,  block_q2_0,   quantize_q2_0>;
+template [[host_name("kernel_cpy_f32_pq2_0")]]  kernel cpy_f_q_t kernel_cpy_q<float, QK_PQ2_0, block_pq2_0, quantize_pq2_0>;
+template [[host_name("kernel_cpy_f32_ptq1_0")]] kernel cpy_f_q_t kernel_cpy_q<float, QK_PTQ1_0, block_ptq1_0, quantize_ptq1_0<float>>;
+template [[host_name("kernel_cpy_f16_ptq1_0")]] kernel cpy_f_q_t kernel_cpy_q<half, QK_PTQ1_0, block_ptq1_0, quantize_ptq1_0<half>>;
+template [[host_name("kernel_cpy_f32_q4_0")]]   kernel cpy_f_q_t kernel_cpy_q<float, QK4_0,  block_q4_0,   quantize_q4_0>;
+template [[host_name("kernel_cpy_f32_q4_1")]]   kernel cpy_f_q_t kernel_cpy_q<float, QK4_1,  block_q4_1,   quantize_q4_1>;
+template [[host_name("kernel_cpy_f32_q5_0")]]   kernel cpy_f_q_t kernel_cpy_q<float, QK5_0,  block_q5_0,   quantize_q5_0>;
+template [[host_name("kernel_cpy_f32_q5_1")]]   kernel cpy_f_q_t kernel_cpy_q<float, QK5_1,  block_q5_1,   quantize_q5_1>;
+template [[host_name("kernel_cpy_f32_iq4_nl")]] kernel cpy_f_q_t kernel_cpy_q<float, QK4_NL, block_iq4_nl, quantize_iq4_nl>;
+template [[host_name("kernel_cpy_f32_tq2_0")]]  kernel cpy_f_q_t kernel_cpy_q<float, QK_K,   block_tq2_0,  quantize_tq2_0>;
 
-template <typename T>
-kernel void kernel_cpy_ptq1_0(
-        constant ggml_metal_kargs_cpy & args,
-        device const char * src0,
-        device char * dst,
-        uint3   tgpig[[threadgroup_position_in_grid]],
-        ushort3 tpitg[[thread_position_in_threadgroup]],
-        ushort3   ntg[[threads_per_threadgroup]]) {
-    const int32_t i03 = tgpig[2];
-    const int32_t i02 = tgpig[1];
-    const int32_t i01 = ntg[1] == 1 ? tgpig[0] % args.ne01 : tgpig[0] * ntg[1] + tpitg.y;
-    const int32_t iw0 = ntg[1] == 1 ? tgpig[0] / args.ne01 : 0;
-
-    if (i01 >= args.ne01) {
-        return;
-    }
-
-    const int64_t n = i03 * args.ne02 * args.ne01 * args.ne00 + i02 * args.ne01 * args.ne00 + i01 * args.ne00;
-    const int32_t i3 = n / (args.ne2 * args.ne1 * args.ne0);
-    const int32_t i2 = (n - i3 * args.ne2 * args.ne1 * args.ne0) / (args.ne1 * args.ne0);
-    const int32_t i1 = (n - i3 * args.ne2 * args.ne1 * args.ne0 - i2 * args.ne1 * args.ne0) / args.ne0;
-    const int32_t i0 = (n - i3 * args.ne2 * args.ne1 * args.ne0 - i2 * args.ne1 * args.ne0 - i1 * args.ne0) / QK_PTQ1_0;
-
-    device block_ptq1_0 * dst_data = (device block_ptq1_0 *) (dst + i3 * args.nb3 + i2 * args.nb2 + i1 * args.nb1 + i0 * args.nb0);
-
-    for (int32_t i00 = iw0 * ntg[0] + tpitg.x; i00 < args.nk0;) {
-        device const T * src = (device const T *) (src0 + i03 * args.nb03 + i02 * args.nb02 + i01 * args.nb01 + (i00 * QK_PTQ1_0) * args.nb00);
-        quantize_ptq1_0(src, dst_data[i00]);
-        break;
-    }
-}
-
-typedef decltype(kernel_cpy_ptq1_0<float>) kernel_cpy_ptq1_0_t;
-
-template [[host_name("kernel_cpy_f32_ptq1_0")]] kernel kernel_cpy_ptq1_0_t kernel_cpy_ptq1_0<float>;
-template [[host_name("kernel_cpy_f16_ptq1_0")]] kernel kernel_cpy_ptq1_0_t kernel_cpy_ptq1_0<half>;
 
 template<typename T4x4, typename block_q, short nl, void (*dequantize_func)(device const block_q *, short, thread T4x4 &)>
 kernel void kernel_cpy_q_f32(
@@ -14762,7 +14693,7 @@ template [[host_name("kernel_mul_mv_id_q8_0_f32")]]    kernel kernel_mul_mv_id_t
 template [[host_name("kernel_mul_mv_id_q1_0_f32")]]    kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_q1_0_f32_impl<N_R0_Q1_0>>>;
 template [[host_name("kernel_mul_mv_id_q2_0_f32")]]    kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_q2_0_f32_impl<N_R0_Q2_0>>>;
 template [[host_name("kernel_mul_mv_id_pq2_0_f32")]]   kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_pq2_0_f32_impl<N_R0_PQ2_0>>>;
-template [[host_name("kernel_mul_mv_id_ptq1_0_f32")]]  kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_ptq1_0_f32_impl<N_R0_ID_PTQ1_0>>>;
+template [[host_name("kernel_mul_mv_id_ptq1_0_f32")]]  kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_ptq1_0_f32_impl<N_R0_PTQ1_0_ID>>>;
 template [[host_name("kernel_mul_mv_id_q4_0_f32")]]    kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<mul_vec_q_n_f32_impl<block_q4_0, N_R0_Q4_0>>>;
 template [[host_name("kernel_mul_mv_id_q4_1_f32")]]    kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<mul_vec_q_n_f32_impl<block_q4_1, N_R0_Q4_1>>>;
 template [[host_name("kernel_mul_mv_id_q5_0_f32")]]    kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<mul_vec_q_n_f32_impl<block_q5_0, N_R0_Q5_0>>>;

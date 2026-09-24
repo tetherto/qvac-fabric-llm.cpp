@@ -1668,15 +1668,31 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                 op->src[0]->ne[2] == op->src[2]->ne[2] && op->src[1]->ne[2] == op->src[2]->ne[2] &&
                 op->src[0]->ne[3] > 0 && op->src[1]->ne[3] > 0 &&
                 op->src[2]->ne[3] % op->src[0]->ne[3] == 0 && op->src[2]->ne[3] % op->src[1]->ne[3] == 0;
+        case GGML_OP_SOLVE_TRI:
+            return op->src[0]->type != GGML_TYPE_TQ1_0 &&
+                has_simdgroup_reduction &&
+                op->src[0]->type != GGML_TYPE_NVFP4 &&
+                !ggml_is_tbq_or_pq(op->src[0]->type);
         case GGML_OP_MUL_MAT:
             if (ggml_metal_op_mul_mat_use_fwht(op)) {
-                const int64_t n = op->src[1]->ne[0];
-                if (n >= GGML_METAL_FWHT_TG_MIN_N &&
-                    (dev->mtl_device.maxThreadsPerThreadgroup.width < GGML_METAL_FWHT_TG_NT ||
-                     dev->props.max_theadgroup_memory_size < (size_t) n * sizeof(float))) {
+                if (!has_simdgroup_reduction) {
                     return false;
                 }
-                return has_simdgroup_reduction;
+
+                const int64_t n = op->src[1]->ne[0];
+                int nth = n >= GGML_METAL_FWHT_TG_MIN_N ? GGML_METAL_FWHT_TG_NT : 0;
+                if (nth != 0 && dev->props.max_theadgroup_memory_size < (size_t) n * sizeof(float)) {
+                    return false;
+                }
+
+                struct ggml_metal_pipeline_with_params pipeline =
+                    ggml_metal_library_get_pipeline_fwht(dev->library, n, op->src[1]->type, nth);
+                if (nth != 0 && (!pipeline.pipeline || ggml_metal_pipeline_max_theads_per_threadgroup(pipeline) < nth)) {
+                    nth = GGML_METAL_FWHT_TG_NT_FALLBACK;
+                    pipeline = ggml_metal_library_get_pipeline_fwht(dev->library, n, op->src[1]->type, nth);
+                }
+
+                return pipeline.pipeline && (nth == 0 || ggml_metal_pipeline_max_theads_per_threadgroup(pipeline) >= nth);
             }
             return ggml_metal_supports_mul_mat_op(
                     has_simdgroup_reduction, op, true,
@@ -1753,7 +1769,7 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                 };
             }
         case GGML_OP_GET_ROWS:
-            return op->src[0]->type != GGML_TYPE_NVFP4 && op->src[0]->type != GGML_TYPE_TQ1_0 && op->src[0]->type != GGML_TYPE_PQ2_0 && op->src[0]->type != GGML_TYPE_PTQ1_0;
+            return op->src[0]->type != GGML_TYPE_NVFP4 && op->src[0]->type != GGML_TYPE_TQ1_0;
         case GGML_OP_SET_ROWS:
             {
                 if (op->src[0]->type == GGML_TYPE_F16) {

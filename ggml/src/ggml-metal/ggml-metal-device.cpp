@@ -935,6 +935,11 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_meta
     return res;
 }
 
+// Measured Bonsai projection shapes.
+static bool ggml_metal_is_bonsai_ptq1_0_r4_shape(int64_t ne00, int64_t ne01) {
+    return (ne01 == 5120 && ne00 == 17408) || (ne01 == 10240 && ne00 == 5120);
+}
+
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_metal_library_t lib, const ggml_tensor * op) {
     GGML_TENSOR_LOCALS( int32_t, ne0, op->src[0], ne);
     GGML_TENSOR_LOCALS( int32_t, ne1, op->src[1], ne);
@@ -990,7 +995,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
         case GGML_TYPE_PTQ1_0:
             {
                 nsg = N_SG_PTQ1_0;
-                if (ne11 == 1 && ((ne01 == 5120 && ne00 == 17408) || (ne01 == 10240 && ne00 == 5120))) {
+                if (ne11 == 1 && ggml_metal_is_bonsai_ptq1_0_r4_shape(ne00, ne01)) {
                     nr0 = N_R0_PTQ1_0_R4;
                     suffix = "_r4";
                 } else {
@@ -1239,7 +1244,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_id(ggml_m
         case GGML_TYPE_PTQ1_0:
             {
                 nsg = N_SG_PTQ1_0;
-                nr0 = N_R0_ID_PTQ1_0;
+                nr0 = N_R0_PTQ1_0_ID;
             } break;
         case GGML_TYPE_Q4_0:
             {
@@ -1643,11 +1648,15 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_argsort_merge(gg
     return res;
 }
 
-ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_fwht(ggml_metal_library_t lib, int n, ggml_type tsrc) {
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_fwht(ggml_metal_library_t lib, int n, ggml_type tsrc, int nth) {
     char base[256];
     char name[256];
 
-    snprintf(base, 256, "kernel_fwht_%s_%d", ggml_type_name(tsrc), n);
+    if (nth == GGML_METAL_FWHT_TG_NT_FALLBACK) {
+        snprintf(base, 256, "kernel_fwht_%s_%d_nt%d", ggml_type_name(tsrc), n, nth);
+    } else {
+        snprintf(base, 256, "kernel_fwht_%s_%d", ggml_type_name(tsrc), n);
+    }
     snprintf(name, 256, "%s", base);
 
     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);

@@ -896,10 +896,19 @@ static ggml_backend_feature * ggml_backend_metal_get_features(ggml_backend_reg_t
     GGML_UNUSED(reg);
 }
 
+static uint64_t ggml_backend_metal_fwht_fusion_count(ggml_backend_t backend) {
+    GGML_ASSERT(ggml_backend_is_metal(backend));
+    return ggml_metal_get_fusion_count((ggml_metal_t) backend->context, GGML_OP_MUL_MAT);
+}
+
 static void * ggml_backend_metal_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     if (strcmp(name, "ggml_backend_get_features") == 0) {
         return (void *)ggml_backend_metal_get_features;
     }
+    if (strcmp(name, "ggml_backend_metal_fwht_fusion_count") == 0) {
+        return (void *)ggml_backend_metal_fwht_fusion_count;
+    }
+
 
     return NULL;
 

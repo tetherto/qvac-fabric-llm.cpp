@@ -31,7 +31,7 @@
 #define N_SG_PQ2_0 2
 #define N_R0_PTQ1_0 5
 #define N_R0_PTQ1_0_R4 4
-#define N_R0_ID_PTQ1_0 4
+#define N_R0_PTQ1_0_ID 4
 #define N_SG_PTQ1_0 1
 
 #define N_R0_Q4_0 4
@@ -1359,6 +1359,7 @@ typedef struct {
 // Use one threadgroup per FWHT row for folded model widths.
 #define GGML_METAL_FWHT_TG_MIN_N 512
 #define GGML_METAL_FWHT_TG_NT    256
+#define GGML_METAL_FWHT_TG_NT_FALLBACK 128
 
 typedef struct {
     int32_t nrows;
