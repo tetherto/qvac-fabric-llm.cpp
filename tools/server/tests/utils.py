@@ -670,7 +670,7 @@ def parallel_function_calls(function_list: List[Tuple[Callable[..., Any], Tuple[
             result = func(*args)
             results[index] = result
         except Exception as e:
-            exceptions.append((index, str(e)))
+            exceptions.append((index, e))
 
     with ThreadPoolExecutor() as executor:
         futures = []
@@ -684,9 +684,12 @@ def parallel_function_calls(function_list: List[Tuple[Callable[..., Any], Tuple[
 
     # Check if there were any exceptions
     if exceptions:
+        exceptions.sort(key=lambda x: x[0])
         print("Exceptions occurred:")
         for index, error in exceptions:
             print(f"Function at index {index}: {error}")
+        # raise the real error, else the caller fails later on a None result
+        raise exceptions[0][1]
 
     return results
 
