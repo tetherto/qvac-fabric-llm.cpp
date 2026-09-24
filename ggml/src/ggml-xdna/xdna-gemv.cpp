@@ -1226,12 +1226,15 @@ bool xdna_gemv_pair_prep_raw(xdna_gemv_pair * p, const float * res,
     if (!p || !res || !gam) {
         return false;
     }
+    // The fused path reaches this right after the core dispatch drained the
+    // projection into this buffer, so pull that drain back before the host
+    // half is written: the flush below covers the whole buffer and would
+    // otherwise land the host's stale image of those tiles on top of it.
+    xdna_buffer_sync_from_device(p->a);
     gemv_pack_act(p->g1, nullptr, (uint8_t *) p->a->bo.map(), 0,
                   pair_last_flags(p), res, gam);
     // The whole buffer, not just the host's half of a tile: a partial flush
-    // does not deliver the array's drain to the next dispatch at all. It is
-    // safe because the caller read the buffer back since the last dispatch
-    // wrote it (see xdna_gemv_pair_prep_raw).
+    // does not deliver the array's drain to the next dispatch at all.
     xdna_buffer_sync_to_device(p->a);
     return true;
 }
@@ -1306,9 +1309,10 @@ static bool xdna_gemv_pair_run_impl(xdna_gemv_pair * p, const float * act,
         // every tile, so the staging copy cannot be pushed over the buffer: it
         // holds a stale acc. Write the host's part in place instead and flush
         // the whole buffer - a partial flush does not deliver the drain to the
-        // next dispatch at all. That is only safe because the host copy is
-        // usually the array's own values: the caller read the buffer back since
-        // the last dispatch wrote it (see xdna_gemv_pair_prep_raw).
+        // next dispatch at all. The buffer has to be pulled back first: the
+        // flush covers the whole thing, so without the pull the host's stale
+        // image lands on top of what the array just wrote.
+        xdna_buffer_sync_from_device(p->a);
         gemv_pack_act(p->g1, nullptr, (uint8_t *) p->a->bo.map(), 0, last,
                       res, gam);
         xdna_buffer_sync_to_device(p->a);
