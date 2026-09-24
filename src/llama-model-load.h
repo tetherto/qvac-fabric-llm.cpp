@@ -67,6 +67,9 @@ struct IncrementalSplitsTensorLoad {
 
     uint16_t get_split_idx_for_tensor(const char * tensor_name) const;
 
+    /// @returns True if the tensor-list file names this tensor, even if its split is not loaded yet.
+    bool is_expected_tensor(const std::string & tensor_name) const { return expected_tensors.count(tensor_name) > 0; }
+
     std::size_t get_split_data_size(uint16_t split_idx) const;
 
     static bool tensor_ignored(const std::optional<IncrementalSplitsTensorLoad> & splits_tensor_load,
