@@ -965,6 +965,7 @@ static __device__ __forceinline__ float vec_dot_ptq1_0_q8_1(const void * __restr
 #else
     // Unreachable on CUDA: mul_mat_vec_q routes every PTQ1_0 ncols_dst through
     // vec_dot_ptq1_0_q8_1_multi, which needs the column base for the warp-transposed q8 layout.
+    NO_DEVICE_CODE;
     GGML_UNUSED(vbq);
     GGML_UNUSED(bq8_1);
     GGML_UNUSED(kbx);

@@ -32,8 +32,7 @@
 // dedicated 2D kernel geometry, see mul_mat_vec_ptq1_0_pt below
 #define PTQ1_0_PT_THREADS      128
 #define PTQ1_0_PT_MAX_ROWS     16
-#define PTQ1_0_PT_MAX_COLS     8    // equals MMVQ_MAX_BATCH_SIZE, checked in mmvq.cu
-#define PTQ1_0_PT_SMEM_FLOATS  4096 // 16 KiB of partial sums per weight matrix, dynamic
+#define PTQ1_0_PT_MAX_COLS     8
 
 // the PT path is CUDA only; HIP keeps the block_q8_1 layout and the old vec_dot
 static constexpr __host__ __device__ bool ptq1_0_pt_enabled() {
@@ -233,6 +232,185 @@ static __device__ __forceinline__ void ptq1_0_pt_block_dot(
     }
 }
 
+template <int nrows>
+static __device__ __forceinline__ void ptq1_0_mmvq_prefetch(
+        const void * vx, const int kbx_offset, const int stride_row_x, const int kbx_prefetch) {
+#if defined(__CUDA_ARCH__) && !defined(GGML_USE_MUSA)
+#pragma unroll
+    for (int i = 0; i < nrows; ++i) {
+        const block_ptq1_0 * ptr = (const block_ptq1_0 *) vx + kbx_offset + i*stride_row_x + kbx_prefetch;
+        asm volatile("prefetch.global.L2 [%0];" :: "l"(__cvta_generic_to_global(ptr)));
+    }
+#else
+    GGML_UNUSED(vx);
+    GGML_UNUSED(kbx_offset);
+    GGML_UNUSED(stride_row_x);
+    GGML_UNUSED(kbx_prefetch);
+#endif
+}
+
+template <int ncols, int nrows, bool has_gate, bool y_soa>
+static __device__ __forceinline__ void ptq1_0_mmvq_dot(
+        const void * vx, const void * vgate, const block_q8_1 * y,
+        const int kbx_offset, const int stride_row_x, const int stride_col_y,
+        const int kbx, const int ncols_x,
+        float (&tmp)[ncols][nrows], float (&tmp_gate)[ncols][nrows]) {
+    static_assert(!y_soa || ncols == 1);
+    if constexpr (y_soa) {
+#pragma unroll
+        for (int i = 0; i < nrows; ++i) {
+            float dots[ncols];
+            vec_dot_ptq1_0_q8_1_multi<ncols>(vx, y, kbx_offset + i*stride_row_x + kbx, kbx, stride_col_y, dots);
+#pragma unroll
+            for (int j = 0; j < ncols; ++j) {
+                tmp[j][i] += dots[j];
+            }
+            if constexpr (has_gate) {
+                vec_dot_ptq1_0_q8_1_multi<ncols>(vgate, y, kbx_offset + i*stride_row_x + kbx, kbx, stride_col_y, dots);
+#pragma unroll
+                for (int j = 0; j < ncols; ++j) {
+                    tmp_gate[j][i] += dots[j];
+                }
+            }
+        }
+        return;
+    }
+
+    const int nblk = ptq1_0_pt_nblk(ncols_x);
+    const char * ycol[ncols];
+#pragma unroll
+    for (int j = 0; j < ncols; ++j) {
+        ycol[j] = (const char *) (y + j*stride_col_y);
+    }
+    const block_ptq1_0 * bq[nrows];
+#pragma unroll
+    for (int i = 0; i < nrows; ++i) {
+        bq[i] = (const block_ptq1_0 *) vx + kbx_offset + i*stride_row_x + kbx;
+    }
+    float dots[ncols][nrows];
+    ptq1_0_pt_block_dot<ncols, nrows>(bq, ycol, kbx, nblk, dots);
+#pragma unroll
+    for (int j = 0; j < ncols; ++j) {
+#pragma unroll
+        for (int i = 0; i < nrows; ++i) {
+            tmp[j][i] += dots[j][i];
+        }
+    }
+
+    if constexpr (has_gate) {
+        const block_ptq1_0 * bg[nrows];
+#pragma unroll
+        for (int i = 0; i < nrows; ++i) {
+            bg[i] = (const block_ptq1_0 *) vgate + kbx_offset + i*stride_row_x + kbx;
+        }
+        ptq1_0_pt_block_dot<ncols, nrows>(bg, ycol, kbx, nblk, dots);
+#pragma unroll
+        for (int j = 0; j < ncols; ++j) {
+#pragma unroll
+            for (int i = 0; i < nrows; ++i) {
+                tmp_gate[j][i] += dots[j][i];
+            }
+        }
+    }
+}
+
+template <int nrows>
+static __device__ __forceinline__ void ptq1_0_mmvq_moe_dot(
+        const void * vx, const block_q8_1 * y, const int kbx_offset,
+        const int stride_row_x, const int kbx, const int ncols_x, float (&tmp)[nrows]) {
+    const int nblk = ptq1_0_pt_nblk(ncols_x);
+    const char * ycol[1] = { (const char *) y };
+    const block_ptq1_0 * bq[nrows];
+#pragma unroll
+    for (int i = 0; i < nrows; ++i) {
+        bq[i] = (const block_ptq1_0 *) vx + kbx_offset + i*stride_row_x + kbx;
+    }
+    float dots[1][nrows];
+    ptq1_0_pt_block_dot<1, nrows>(bq, ycol, kbx, nblk, dots);
+#pragma unroll
+    for (int i = 0; i < nrows; ++i) {
+        tmp[i] += dots[0][i];
+    }
+}
+
+template <int ncols, bool has_fusion, bool has_gate, int warp_size>
+static __device__ __forceinline__ void ptq1_0_mmvq_small_k(
+        const void * vx, const void * vgate, const block_q8_1 * y,
+        const ggml_cuda_mm_fusion_args_device fusion, float * dst,
+        const bool has_ids, const bool use_bias, const bool use_gate_bias, const ggml_glu_op active_glu,
+        const int kbx_offset, const int stride_row_x, const int stride_col_y, const int blocks_per_row_x,
+        const int row0, const int stride_col_dst, const int sample_dst, const int stride_sample_dst,
+        const int channel_x, const int channel_dst, const int stride_channel_dst) {
+    const int warp = threadIdx.y;
+    const int lane = threadIdx.x;
+    const bool row_ok = uint32_t(row0 + warp) < (uint32_t) stride_col_dst;
+    float acc[ncols] = { 0.0f };
+    float acc_gate[ncols] = { 0.0f };
+
+    if (row_ok) {
+        const int kbx_row = kbx_offset + warp*stride_row_x;
+        for (int kbx = lane; kbx < blocks_per_row_x; kbx += warp_size) {
+            float dots[ncols];
+            vec_dot_ptq1_0_q8_1_multi<ncols>(vx, y, kbx_row + kbx, kbx, stride_col_y, dots);
+#pragma unroll
+            for (int j = 0; j < ncols; ++j) {
+                acc[j] += dots[j];
+            }
+            if constexpr (has_gate) {
+                vec_dot_ptq1_0_q8_1_multi<ncols>(vgate, y, kbx_row + kbx, kbx, stride_col_y, dots);
+#pragma unroll
+                for (int j = 0; j < ncols; ++j) {
+                    acc_gate[j] += dots[j];
+                }
+            }
+        }
+    }
+#pragma unroll
+    for (int j = 0; j < ncols; ++j) {
+        acc[j] = warp_reduce_sum<warp_size>(acc[j]);
+        if constexpr (has_gate) {
+            acc_gate[j] = warp_reduce_sum<warp_size>(acc_gate[j]);
+        }
+    }
+    if (lane != 0 || !row_ok) {
+        return;
+    }
+
+    float * dst_row = dst + sample_dst*stride_sample_dst + channel_dst*stride_channel_dst + row0 + warp;
+    const uint32_t channel_bias = has_ids ? channel_x : channel_dst;
+    const int64_t bias_off = sample_dst*stride_sample_dst + channel_bias*stride_channel_dst + row0 + warp;
+#pragma unroll
+    for (int j = 0; j < ncols; ++j) {
+        float result = acc[j];
+        if constexpr (has_fusion) {
+            if (use_bias) {
+                result += ((const float *) fusion.x_bias)[bias_off + j*stride_col_dst];
+            }
+            if constexpr (has_gate) {
+                float gate_value = acc_gate[j];
+                if (use_gate_bias) {
+                    gate_value += ((const float *) fusion.gate_bias)[bias_off + j*stride_col_dst];
+                }
+                switch (active_glu) {
+                    case GGML_GLU_OP_SWIGLU:
+                        result *= ggml_cuda_op_silu_single(gate_value);
+                        break;
+                    case GGML_GLU_OP_GEGLU:
+                        result *= ggml_cuda_op_gelu_single(gate_value);
+                        break;
+                    case GGML_GLU_OP_SWIGLU_OAI:
+                        result = ggml_cuda_op_swiglu_oai_single(gate_value, result);
+                        break;
+                    default:
+                        result *= gate_value;
+                        break;
+                }
+            }
+        }
+        dst_row[j*stride_col_dst] = result;
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Dedicated PTQ1_0 mat-vec for plain 2D MUL_MAT (no batch dims, no expert ids).
 //
@@ -250,11 +428,22 @@ static __device__ __forceinline__ void ptq1_0_pt_block_dot(
 // count.
 // ---------------------------------------------------------------------------
 
-// rows_per_cta: fill whole 128-thread iterations where possible, within the shared memory budget
-static __host__ int ptq1_0_pt_rows_per_cta(const int blocks_per_row, const int ncols_dst, const int nrows_x, const int rows_per_item) {
-    int rmax = PTQ1_0_PT_SMEM_FLOATS / (ncols_dst * (blocks_per_row + 1));
-    rmax = rmax < rows_per_item ? rows_per_item : (rmax > PTQ1_0_PT_MAX_ROWS ? PTQ1_0_PT_MAX_ROWS : rmax);
+struct ptq1_0_pt_launch_config {
+    int rows_per_cta;
+    size_t smem;
+};
+
+static __host__ ptq1_0_pt_launch_config ptq1_0_pt_config(
+        const int blocks_per_row, const int ncols_dst, const int rows_per_item,
+        const bool has_gate, const size_t max_smem) {
+    const size_t smem_per_row = (size_t) ncols_dst * (blocks_per_row + 1) * sizeof(float) * (has_gate ? 2 : 1);
+    int rmax = (int) (max_smem / smem_per_row);
+    rmax = rmax > PTQ1_0_PT_MAX_ROWS ? PTQ1_0_PT_MAX_ROWS : rmax;
     rmax -= rmax % rows_per_item;
+    if (rmax < rows_per_item) {
+        return { 0, 0 };
+    }
+
     int best = rows_per_item;
     double best_util = 0.0;
     for (int r = rows_per_item; r <= rmax; r += rows_per_item) {
@@ -269,8 +458,7 @@ static __host__ int ptq1_0_pt_rows_per_cta(const int blocks_per_row, const int n
             break;
         }
     }
-    GGML_UNUSED(nrows_x);
-    return best;
+    return { best, smem_per_row * best };
 }
 
 #ifndef PTQ1_0_PT_MINB_34
@@ -310,6 +498,8 @@ static __global__ void mul_mat_vec_ptq1_0_pt(
     for (int j = 0; j < ncols; ++j) {
         ycol[j] = (const char *) ((const block_q8_1 *) vy + j*stride_col_y);
     }
+
+    ggml_cuda_pdl_sync();
 
     const int n_items = (rows_per_cta / ROWS) * bpr;
     for (int idx = tid; idx < n_items; idx += PTQ1_0_PT_THREADS) {
@@ -420,24 +610,21 @@ template <int ncols>
 static void mul_mat_vec_ptq1_0_pt_launch(
         const void * vx, const void * vy, const ggml_cuda_mm_fusion_args_device & fusion, float * dst,
         const int ncols_x, const int nrows_x, const int stride_row_x, const int stride_col_y, const int stride_col_dst,
-        cudaStream_t stream) {
+        const ptq1_0_pt_launch_config config, cudaStream_t stream) {
     constexpr int ROWS = ncols <= 2 ? 4 : (ncols <= 4 ? PTQ1_0_PT_ROWS_34 : 2); // rows per work item: independent blocks per thread for latency hiding, activation reuse across rows
     const int bpr = ncols_x / QK_PTQ1_0;
     const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr;
     const bool has_gate   = fusion.gate != nullptr;
 
-    const int rows_per_cta = ptq1_0_pt_rows_per_cta(bpr, ncols, nrows_x, ROWS);
     const uint3 bpr_fd = init_fastdiv_values((uint32_t) bpr);
-    const uint3 rpc_fd = init_fastdiv_values((uint32_t) rows_per_cta);
-    const dim3 block_nums((nrows_x + rows_per_cta - 1) / rows_per_cta, 1, 1);
+    const uint3 rpc_fd = init_fastdiv_values((uint32_t) config.rows_per_cta);
+    const dim3 block_nums((nrows_x + config.rows_per_cta - 1) / config.rows_per_cta, 1, 1);
     const dim3 block_dims(PTQ1_0_PT_THREADS, 1, 1);
-
-    const size_t smem = (size_t) ncols * rows_per_cta * (bpr + 1) * sizeof(float) * (has_gate ? 2 : 1);
-    const ggml_cuda_kernel_launch_params lp = ggml_cuda_kernel_launch_params(block_nums, block_dims, smem, stream);
+    const ggml_cuda_kernel_launch_params lp = ggml_cuda_kernel_launch_params(block_nums, block_dims, config.smem, stream);
 
 #define PTQ1_0_PT_LAUNCH(FUS, GATE)                                                                                      \
     ggml_cuda_kernel_launch(mul_mat_vec_ptq1_0_pt<ncols, ROWS, FUS, GATE>, lp,                                           \
-        vx, vy, fusion, dst, ncols_x, nrows_x, stride_row_x, stride_col_y, stride_col_dst, rows_per_cta, bpr_fd, rpc_fd)
+        vx, vy, fusion, dst, ncols_x, nrows_x, stride_row_x, stride_col_y, stride_col_dst, config.rows_per_cta, bpr_fd, rpc_fd)
 
     if (has_fusion) {
         GGML_ASSERT(ncols == 1 && "fusion only supported for ncols_dst=1");
@@ -459,22 +646,30 @@ static bool mul_mat_vec_ptq1_0_pt_switch(
         const int stride_row_x, const int stride_col_y, const int stride_col_dst,
         const int nchannels_dst, const int nsamples_dst, cudaStream_t stream) {
     if (!ptq1_0_pt_enabled() || nchannels_dst != 1 || nsamples_dst != 1 || ncols_x % QK_PTQ1_0 != 0 ||
-        ncols_dst < 1 || ncols_dst > PTQ1_0_PT_MAX_COLS || 2 * (ncols_x / QK_PTQ1_0) * ncols_dst > PTQ1_0_PT_SMEM_FLOATS) {
+        ncols_dst < 1 || ncols_dst > PTQ1_0_PT_MAX_COLS) {
         return false;
     }
-    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
-    if (ncols_dst > 1 && GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_BLACKWELL) {
-        return false; // the multi-column reduction exceeds the backend tolerance on Blackwell
+    const int device = ggml_cuda_get_device();
+    const int cc = ggml_cuda_info().devices[device].cc;
+    if (ncols_dst > 1 && cc == GGML_CUDA_CC_BLACKWELL) {
+        return false; // RTX 5090 sm_120 exceeds the NMSE tolerance at 2-4 columns.
+    }
+    const int rows_per_item = ncols_dst <= 2 ? 4 : (ncols_dst <= 4 ? PTQ1_0_PT_ROWS_34 : 2);
+    const bool has_gate = fusion.gate != nullptr;
+    const ptq1_0_pt_launch_config config = ptq1_0_pt_config(
+        ncols_x / QK_PTQ1_0, ncols_dst, rows_per_item, has_gate, ggml_cuda_info().devices[device].smpb);
+    if (config.rows_per_cta == 0) {
+        return false;
     }
     switch (ncols_dst) {
-        case 1: mul_mat_vec_ptq1_0_pt_launch<1>(vx, vy, fusion, dst, ncols_x, nrows_x, stride_row_x, stride_col_y, stride_col_dst, stream); break;
-        case 2: mul_mat_vec_ptq1_0_pt_launch<2>(vx, vy, fusion, dst, ncols_x, nrows_x, stride_row_x, stride_col_y, stride_col_dst, stream); break;
-        case 3: mul_mat_vec_ptq1_0_pt_launch<3>(vx, vy, fusion, dst, ncols_x, nrows_x, stride_row_x, stride_col_y, stride_col_dst, stream); break;
-        case 4: mul_mat_vec_ptq1_0_pt_launch<4>(vx, vy, fusion, dst, ncols_x, nrows_x, stride_row_x, stride_col_y, stride_col_dst, stream); break;
-        case 5: mul_mat_vec_ptq1_0_pt_launch<5>(vx, vy, fusion, dst, ncols_x, nrows_x, stride_row_x, stride_col_y, stride_col_dst, stream); break;
-        case 6: mul_mat_vec_ptq1_0_pt_launch<6>(vx, vy, fusion, dst, ncols_x, nrows_x, stride_row_x, stride_col_y, stride_col_dst, stream); break;
-        case 7: mul_mat_vec_ptq1_0_pt_launch<7>(vx, vy, fusion, dst, ncols_x, nrows_x, stride_row_x, stride_col_y, stride_col_dst, stream); break;
-        case 8: mul_mat_vec_ptq1_0_pt_launch<8>(vx, vy, fusion, dst, ncols_x, nrows_x, stride_row_x, stride_col_y, stride_col_dst, stream); break;
+        case 1: mul_mat_vec_ptq1_0_pt_launch<1>(vx, vy, fusion, dst, ncols_x, nrows_x, stride_row_x, stride_col_y, stride_col_dst, config, stream); break;
+        case 2: mul_mat_vec_ptq1_0_pt_launch<2>(vx, vy, fusion, dst, ncols_x, nrows_x, stride_row_x, stride_col_y, stride_col_dst, config, stream); break;
+        case 3: mul_mat_vec_ptq1_0_pt_launch<3>(vx, vy, fusion, dst, ncols_x, nrows_x, stride_row_x, stride_col_y, stride_col_dst, config, stream); break;
+        case 4: mul_mat_vec_ptq1_0_pt_launch<4>(vx, vy, fusion, dst, ncols_x, nrows_x, stride_row_x, stride_col_y, stride_col_dst, config, stream); break;
+        case 5: mul_mat_vec_ptq1_0_pt_launch<5>(vx, vy, fusion, dst, ncols_x, nrows_x, stride_row_x, stride_col_y, stride_col_dst, config, stream); break;
+        case 6: mul_mat_vec_ptq1_0_pt_launch<6>(vx, vy, fusion, dst, ncols_x, nrows_x, stride_row_x, stride_col_y, stride_col_dst, config, stream); break;
+        case 7: mul_mat_vec_ptq1_0_pt_launch<7>(vx, vy, fusion, dst, ncols_x, nrows_x, stride_row_x, stride_col_y, stride_col_dst, config, stream); break;
+        case 8: mul_mat_vec_ptq1_0_pt_launch<8>(vx, vy, fusion, dst, ncols_x, nrows_x, stride_row_x, stride_col_y, stride_col_dst, config, stream); break;
         default: return false;
     }
     return true;

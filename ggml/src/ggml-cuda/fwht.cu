@@ -1,7 +1,6 @@
 #include "common.cuh"
 #include "fwht.cuh"
 
-#include <cstdlib>
 
 template <typename T>
 __device__ __forceinline__ float fwht_load(const T value) {
@@ -244,20 +243,7 @@ static bool fwht_launch(ggml_backend_cuda_context & ctx, const T * src_d, float 
         default:
             break;
     }
-    // From 512 up, one block of FWHT_BLOCK_THREADS per row (fwht_cuda_block).
-    // The older kernels were the largest single kernel of a decode step at these widths.
-    // GGML_CUDA_FWHT_LEGACY=1 restores them for A/B.
-#define FWHT_SMEM_CASE(NN) \
-        case NN: { \
-            const dim3 g((unsigned) rows, 1, 1), b(FWHT_SMEM_THREADS, 1, 1); \
-            const ggml_cuda_kernel_launch_params lp = ggml_cuda_kernel_launch_params(g, b, 0, stream); \
-            if (signs) { \
-                ggml_cuda_kernel_launch(fwht_cuda_smem<NN, T, true>,  lp, src_d, dst_d, rows, scale, signs, n_blk); \
-            } else { \
-                ggml_cuda_kernel_launch(fwht_cuda_smem<NN, T, false>, lp, src_d, dst_d, rows, scale, nullptr, 1); \
-            } \
-            return true; \
-        }
+    // The legacy N=512 kernel is faster for high row counts. Wider sizes use one block per row.
 #define FWHT_BLOCK_CASE(NN) \
         case NN: { \
             const dim3 g((unsigned) rows, 1, 1), b(FWHT_BLOCK_THREADS, 1, 1); \
@@ -269,22 +255,8 @@ static bool fwht_launch(ggml_backend_cuda_context & ctx, const T * src_d, float 
             } \
             return true; \
         }
-    static const bool legacy = getenv("GGML_CUDA_FWHT_LEGACY") != nullptr;
-    if (legacy) {
-        switch (n) {
-            FWHT_CASE(512)
-            FWHT_CASE(1024)
-            FWHT_CASE(2048)
-            FWHT_SMEM_CASE(4096)
-#ifndef GGML_USE_MUSA
-            FWHT_SMEM_CASE(8192)
-#endif
-            default:
-                return false;
-        }
-    }
     switch (n) {
-        FWHT_BLOCK_CASE(512)
+        FWHT_CASE(512)
         FWHT_BLOCK_CASE(1024)
         FWHT_BLOCK_CASE(2048)
         FWHT_BLOCK_CASE(4096)
@@ -292,7 +264,6 @@ static bool fwht_launch(ggml_backend_cuda_context & ctx, const T * src_d, float 
         FWHT_BLOCK_CASE(8192)
 #endif
 #undef FWHT_CASE
-#undef FWHT_SMEM_CASE
 #undef FWHT_BLOCK_CASE
         default:
             return false;
