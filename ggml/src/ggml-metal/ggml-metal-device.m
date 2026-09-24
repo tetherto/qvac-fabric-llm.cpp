@@ -1635,9 +1635,21 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
             return true;
         case GGML_OP_GATED_DELTA_NET:
             return has_simdgroup_reduction && op->src[2]->ne[0] % 32 == 0;
-        case GGML_OP_SOLVE_TRI:
         case GGML_OP_MUL_MAT:
+            if (op->src[0]->type == GGML_TYPE_PQ2_0 || op->src[0]->type == GGML_TYPE_PTQ1_0) {
+                return false;
+            }
+            if (ggml_get_op_params_i32(op, 1) == GGML_HINT_SRC0_IS_HADAMARD &&
+                op->src[1]->type == GGML_TYPE_F16) {
+                return false;
+            }
+            return op->src[0]->type != GGML_TYPE_TQ1_0 && has_simdgroup_reduction && op->src[0]->type != GGML_TYPE_NVFP4 && !ggml_is_tbq_or_pq(op->src[0]->type);
+        case GGML_OP_SOLVE_TRI:
+            return op->src[0]->type != GGML_TYPE_TQ1_0 && has_simdgroup_reduction && op->src[0]->type != GGML_TYPE_NVFP4 && !ggml_is_tbq_or_pq(op->src[0]->type);
         case GGML_OP_MUL_MAT_ID:
+            if (op->src[0]->type == GGML_TYPE_PQ2_0 || op->src[0]->type == GGML_TYPE_PTQ1_0) {
+                return false;
+            }
             return op->src[0]->type != GGML_TYPE_TQ1_0 && has_simdgroup_reduction && op->src[0]->type != GGML_TYPE_NVFP4 && !ggml_is_tbq_or_pq(op->src[0]->type);
         case GGML_OP_SET:
         case GGML_OP_CPY:
@@ -1702,7 +1714,7 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                 };
             }
         case GGML_OP_GET_ROWS:
-            return op->src[0]->type != GGML_TYPE_NVFP4 && op->src[0]->type != GGML_TYPE_TQ1_0;
+            return op->src[0]->type != GGML_TYPE_NVFP4 && op->src[0]->type != GGML_TYPE_TQ1_0 && op->src[0]->type != GGML_TYPE_PQ2_0 && op->src[0]->type != GGML_TYPE_PTQ1_0;
         case GGML_OP_SET_ROWS:
             {
                 if (op->src[0]->type == GGML_TYPE_F16) {

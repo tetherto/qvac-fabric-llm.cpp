@@ -701,6 +701,14 @@ struct llama_model {
     // gguf metadata
     std::unordered_map<std::string, std::string> gguf_kv;
 
+    // Activation-side transforms for Hadamard-folded GGUF tensors.
+    std::unordered_map<std::string, uint32_t> hadamard_weight_blocks;
+    std::unordered_map<std::string, uint32_t> hadamard_inverse_blocks;
+    std::map<uint32_t, std::vector<int32_t>> hadamard_sign_data;
+    bool hadamard_gdn_v_grouped = false;
+    llama_hadamard_rotations hadamard_rotations;
+    llama_hadamard_rotations hadamard_inverses;
+
     // list of devices used in this model
     std::vector<llama_device> devices;
 
@@ -731,6 +739,8 @@ struct llama_model {
     bool create_split_backend_buffers(
         uint16_t idx, std::map<std::pair<ggml_backend_buffer_type_t, uint16_t>, ggml_context_ptr> & ctx_split_map,
         llama_model_loader & ml, bool use_mmap_buffer, bool use_mlock, int32_t n_gpu_layers);
+
+    void initialize_hadamard_transforms();
 
     void print_backend_buffers_info(int32_t n_gpu_layers);
 
