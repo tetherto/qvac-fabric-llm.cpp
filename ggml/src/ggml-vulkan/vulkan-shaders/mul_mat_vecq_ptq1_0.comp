@@ -38,19 +38,8 @@ layout (constant_id = 3) const uint CG = 3;
 
 uint a_offset, b_offset, d_offset;
 
-#if defined(PTQ1_0_MUL3_SHIFT)
-#define MUL3(v) (((v) << 1u) + (v))
-#elif defined(PTQ1_0_MUL3_PK16)
-#define MUL3(v) pack32(unpack16(v) * u16vec2(3us, 3us))
-#else
 #define MUL3(v) ((v) * 3u)
-#endif
-
-#ifdef PTQ1_0_DOT_NOSAT
-#define DOT4(a, b, acc) ((acc) + dotPacked4x8EXT((a), (b)))
-#else
 #define DOT4(a, b, acc) dotPacked4x8AccSatEXT((a), (b), (acc))
-#endif
 
 // One trit level from the 16-bit lanes vl (bytes 0,2) and vh (bytes 1,3): after w = v*3 the trit is in byte 1/3 and the residue in byte 0/2.
 // The activation words are pre-masked (bytes 0,2 zero; yh = y1,y3 in bytes 1,3; yl = y0,y2 moved to bytes 1,3), so the dot product ignores the residue.

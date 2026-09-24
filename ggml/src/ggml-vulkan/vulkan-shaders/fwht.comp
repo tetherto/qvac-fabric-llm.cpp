@@ -18,8 +18,10 @@ layout(local_size_x_id = 0, local_size_y_id = 2, local_size_z = 1) in;
 layout(push_constant) uniform parameter
 {
     uint n_rows;
+    uint n_blk;
     uint src_offset;
     uint dst_offset;
+    uint sign_offset;
     float scale;
 };
 
@@ -31,6 +33,7 @@ layout(binding = 0, std430) readonly buffer A {
 #endif
 };
 layout(binding = 1, std430) writeonly buffer D { float data_d[]; };
+layout(binding = 2, std430) readonly buffer S { float data_s[]; };
 
 const uint EL_W = N / BLOCK_SIZE;
 
@@ -64,7 +67,16 @@ void main() {
 
         [[unroll]]
         for (uint i = 0; i < EL_W; ++i) {
-            reg[i] = row < n_rows ? float(data_a[src_offset + row_offset + i * BLOCK_SIZE + tid]) * scale : 0.0;
+            const uint elem = i * BLOCK_SIZE + tid;
+            if (row < n_rows) {
+                float sign = 1.0;
+                if (n_blk > 0) {
+                    sign = data_s[sign_offset + (row % n_blk) * N + elem];
+                }
+                reg[i] = float(data_a[src_offset + row_offset + elem]) * sign * scale;
+            } else {
+                reg[i] = 0.0;
+            }
         }
 
 #ifdef FWHT_SHMEM
