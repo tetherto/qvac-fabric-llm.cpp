@@ -126,11 +126,6 @@ static const char * rpc_cmd_name(enum rpc_cmd cmd) {
     }
 }
 
-// Protocol minor that introduced RPC_CMD_SET_TENSOR_2D_HASH. The client must not
-// send it to a server that announced an older minor at HELLO: such a server
-// answers "Unknown command" and closes the connection.
-static constexpr uint8_t RPC_PROTO_MINOR_SET_TENSOR_2D_HASH = 1;
-
 // Try a hash lookup first when data size is larger than this threshold
 const size_t HASH_THRESHOLD = 10 * 1024 * 1024;
 
@@ -1342,8 +1337,8 @@ static void ggml_backend_rpc_buffer_set_tensor_2d(ggml_backend_buffer_t buffer, 
     rpc_tensor rpc_tensor = serialize_tensor(tensor);
     LOG_DBG2("[%s] tensor: %s, offset: %zu, size: %s, n_copies: %zu, stride: %zu\n", __func__,
              rpc_log_format_tensor(tensor).c_str(), offset, rpc_log_format_size(size).c_str(), n_copies, stride_tensor);
-    // input serialization format: | rpc_tensor | offset (8 bytes) | size (8 bytes) | n_copies (8 bytes) | stride (8 bytes) | data (size * n_copies bytes) |
-    const size_t header_size = sizeof(rpc_tensor) + 4*sizeof(uint64_t);
+    // input serialization format: | rpc_tensor | cache_flag (1 byte) | offset (8 bytes) | size (8 bytes) | n_copies (8 bytes) | stride (8 bytes) | data (size * n_copies bytes) |
+    const size_t header_size = sizeof(rpc_tensor) + sizeof(uint8_t) + 4*sizeof(uint64_t);
     size_t data_size;
     size_t input_size;
     GGML_ASSERT(checked_mul_size(size, n_copies, data_size));
@@ -1354,14 +1349,14 @@ static void ggml_backend_rpc_buffer_set_tensor_2d(ggml_backend_buffer_t buffer, 
     uint8_t * dest = input.data();
     memcpy(dest, &rpc_tensor, sizeof(rpc_tensor));
     dest += sizeof(rpc_tensor);
+    uint8_t * cache_flag = dest++;
     uint64_t header[4] = { offset, size, n_copies, stride_tensor };
     memcpy(dest, header, sizeof(header));
     dest += sizeof(header);
     for (size_t i = 0; i < n_copies; i++) {
         memcpy(dest + i*size, (const char *)data + i*stride_data, size);
     }
-    // a 108.0 server does not know RPC_CMD_SET_TENSOR_2D_HASH; send it the plain transfer
-    if (data_size > HASH_THRESHOLD && ctx->cmd_queue->server_minor() >= RPC_PROTO_MINOR_SET_TENSOR_2D_HASH) {
+    if (rpc_use_hash_cache(tensor, data_size)) {
         rpc_msg_set_tensor_2d_hash_req request;
         request.tensor   = rpc_tensor;
         request.offset   = offset;
@@ -1376,6 +1371,7 @@ static void ggml_backend_rpc_buffer_set_tensor_2d(ggml_backend_buffer_t buffer, 
         if (response.result) {
             return;
         }
+        *cache_flag = 1;
     }
     bool status = ctx->cmd_queue->submit_rpc(RPC_CMD_SET_TENSOR_2D, input.data(), input.size());
     RPC_STATUS_ASSERT(status);
@@ -2383,19 +2379,22 @@ static bool validate_tensor_2d_region(const char * func, const rpc_tensor & in_t
 
 bool rpc_server::set_tensor_2d(const std::vector<uint8_t> & input) {
     sync_all_backends();
-    // serialization format: | rpc_tensor | offset (8 bytes) | size (8 bytes) | n_copies (8 bytes) | stride (8 bytes) | data (size * n_copies bytes) |
-    if (input.size() < sizeof(rpc_tensor) + 4*sizeof(uint64_t)) {
+    // serialization format: | rpc_tensor | cache_flag (1 byte) | offset (8 bytes) | size (8 bytes) | n_copies (8 bytes) | stride (8 bytes) | data (size * n_copies bytes) |
+    uint8_t cache_flag;
+    const size_t header_size = sizeof(rpc_tensor) + sizeof(cache_flag) + 4*sizeof(uint64_t);
+    if (input.size() < header_size) {
         return false;
     }
     const rpc_tensor * in_tensor = (const rpc_tensor *)input.data();
     uint64_t header[4];
-    memcpy(header, input.data() + sizeof(rpc_tensor), sizeof(header));
+    memcpy(&cache_flag, input.data() + sizeof(rpc_tensor), sizeof(cache_flag));
+    memcpy(header, input.data() + sizeof(rpc_tensor) + sizeof(cache_flag), sizeof(header));
     const uint64_t offset   = header[0];
     const uint64_t size     = header[1];
     const uint64_t n_copies = header[2];
     const uint64_t stride   = header[3];
 
-    const uint64_t data_size = input.size() - sizeof(rpc_tensor) - 4*sizeof(uint64_t);
+    const uint64_t data_size = input.size() - header_size;
     if (n_copies == 0 || size == 0 || size > data_size / n_copies || size * n_copies != data_size) {
         return false;
     }
@@ -2421,8 +2420,8 @@ bool rpc_server::set_tensor_2d(const std::vector<uint8_t> & input) {
         return false;
     }
 
-    const void * data = input.data() + sizeof(rpc_tensor) + 4*sizeof(uint64_t);
-    if (cache_dir && data_size > HASH_THRESHOLD) {
+    const void * data = input.data() + header_size;
+    if (cache_dir && cache_flag) {
         uint64_t hash = fnv_hash((const uint8_t *) data, data_size);
         char hash_str[17];
         snprintf(hash_str, sizeof(hash_str), "%016" PRIx64, hash);
