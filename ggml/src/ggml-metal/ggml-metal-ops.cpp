@@ -2885,7 +2885,11 @@ int ggml_metal_op_gated_delta_net(ggml_metal_op_t ctx, int idx) {
 
     const int nsg = pipeline.nsg;
 
-    ggml_metal_encoder_dispatch_threadgroups(enc, (op->src[2]->ne[0] + nsg - 1)/nsg, op->src[2]->ne[1], op->src[2]->ne[3], 32, nsg, 1);
+    if (pipeline.gdn_c8) {
+        ggml_metal_encoder_dispatch_threadgroups(enc, (ne20 + 31)/32, ne21, ne23, 32, nsg, 1);
+    } else {
+        ggml_metal_encoder_dispatch_threadgroups(enc, (op->src[2]->ne[0] + nsg - 1)/nsg, op->src[2]->ne[1], op->src[2]->ne[3], 32, nsg, 1);
+    }
 
     return n_fuse;
 }

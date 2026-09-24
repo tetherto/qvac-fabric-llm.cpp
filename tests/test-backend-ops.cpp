@@ -4649,16 +4649,19 @@ struct test_gated_delta_net : public test_case {
     const bool    kda;
     const int64_t K; // snapshot slot count: 1 = final-only, >1 = last K states
     const bool    check_grad;
+    const bool    v_padded;
+    const bool    q_seq_broadcast;
 
     std::string vars() override {
-        return VARS_TO_STR9(type, head_count, head_size, n_seq_tokens, n_seqs, v_repeat, permuted, kda, K);
+        return VARS_TO_STR9(type, head_count, head_size, n_seq_tokens, n_seqs, v_repeat, permuted, kda, K) +
+            (v_padded ? ",v_padded=1" : "") + (q_seq_broadcast ? ",q_seq_broadcast=1" : "");
     }
 
     test_gated_delta_net(ggml_type type = GGML_TYPE_F32,
             int64_t head_count = 4, int64_t head_size = 16, int64_t n_seq_tokens = 1, int64_t n_seqs = 1,
-            int v_repeat = 1, bool permuted = false, bool kda = false, int64_t K = 1, bool check_grad = false)
+            int v_repeat = 1, bool permuted = false, bool kda = false, int64_t K = 1, bool check_grad = false, bool v_padded = false, bool q_seq_broadcast = false)
         : type(type), head_count(head_count), head_size(head_size), n_seq_tokens(n_seq_tokens), n_seqs(n_seqs),
-          v_repeat(v_repeat), permuted(permuted), kda(kda), K(K), check_grad(check_grad) {}
+          v_repeat(v_repeat), permuted(permuted), kda(kda), K(K), check_grad(check_grad), v_padded(v_padded), q_seq_broadcast(q_seq_broadcast) {}
 
     bool   grad_precise() override { return true; }
     double max_maa_err()  override { return 2e-2; }
@@ -4668,15 +4671,22 @@ struct test_gated_delta_net : public test_case {
         ggml_tensor * q;
         ggml_tensor * k;
         ggml_tensor * v;
+        const int64_t q_seqs = q_seq_broadcast ? 1 : n_seqs;
         if (permuted) {
             // create with dims 1 and 2 swapped, then permute back to get non-contiguous layout
-            q = ggml_permute(ctx, ggml_new_tensor_4d(ctx, type, head_size, n_seq_tokens, head_count, n_seqs), 0, 2, 1, 3);
-            k = ggml_permute(ctx, ggml_new_tensor_4d(ctx, type, head_size, n_seq_tokens, head_count, n_seqs), 0, 2, 1, 3);
+            q = ggml_permute(ctx, ggml_new_tensor_4d(ctx, type, head_size, n_seq_tokens, head_count, q_seqs), 0, 2, 1, 3);
+            k = ggml_permute(ctx, ggml_new_tensor_4d(ctx, type, head_size, n_seq_tokens, head_count, q_seqs), 0, 2, 1, 3);
             v = ggml_permute(ctx, ggml_new_tensor_4d(ctx, type, head_size, n_seq_tokens, head_count * v_repeat, n_seqs), 0, 2, 1, 3);
         } else {
-            q = ggml_new_tensor_4d(ctx, type, head_size, head_count, n_seq_tokens, n_seqs);
-            k = ggml_new_tensor_4d(ctx, type, head_size, head_count, n_seq_tokens, n_seqs);
-            v = ggml_new_tensor_4d(ctx, type, head_size, head_count * v_repeat, n_seq_tokens, n_seqs);
+            q = ggml_new_tensor_4d(ctx, type, head_size, head_count, n_seq_tokens, q_seqs);
+            k = ggml_new_tensor_4d(ctx, type, head_size, head_count, n_seq_tokens, q_seqs);
+            if (v_padded) {
+                ggml_tensor * storage = ggml_new_tensor_4d(ctx, type, head_size, 2 * head_count * v_repeat, n_seq_tokens, n_seqs);
+                v = ggml_view_4d(ctx, storage, head_size, head_count * v_repeat, n_seq_tokens, n_seqs,
+                        storage->nb[1], storage->nb[2], storage->nb[3], 0);
+            } else {
+                v = ggml_new_tensor_4d(ctx, type, head_size, head_count * v_repeat, n_seq_tokens, n_seqs);
+            }
         }
         ggml_set_name(q, "q");
         ggml_set_name(k, "k");
@@ -12534,6 +12544,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128,  512, 1, 2));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128,  513, 1, 3));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128,  513, 2, 2, true));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128,  129, 2, 2, false, false, 1, false, true));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32,  4, 128,   65, 1));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32,  8, 128,   65, 1));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128,   65, 2, 1, false, false, 1, false, false, true));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 2048, 1, 2));
     // Keep the WebGPU dispatch below 65535 workgroups (32 per token for this shape).
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 2047, 2, 3));
@@ -12556,6 +12570,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(/*H=*/4, /*S=*/32, /*T=*/4, /*seqs=*/1, /*K=*/4));
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(/*H=*/4, /*S=*/32, /*T=*/1, /*seqs=*/2, /*K=*/1));
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(/*H=*/8, /*S=*/64, /*T=*/8, /*seqs=*/2, /*K=*/3));
+    test_cases.emplace_back(new test_gated_delta_net_cache_fusion(/*H=*/16, /*S=*/128, /*T=*/65, /*seqs=*/1, /*K=*/1));
 
     // head sizes spanning the backend threadgroup-shape decisions (columns per thread,
     // threads per threadgroup); every power of two the backends accept.
@@ -13115,6 +13130,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 256, 1)); // PP-256
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 512, 1)); // PP-512
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 1024, 1)); // PP-1024
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 64, 1, 2));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 256, 1, 2));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 512, 1, 2));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 1024, 1, 2));
     // Small model configs (fewer heads = less GPU occupancy for autoregressive)
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 64, 1));   // 4h PP-64
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 256, 1));  // 4h PP-256

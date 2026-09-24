@@ -718,6 +718,58 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_rwkv(ggml_metal_
 }
 
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_gated_delta_net(ggml_metal_library_t lib, const ggml_tensor * op) {
+    // The MLX-style SIMD-group path currently handles scalar-gate prefill
+    // with one final-state snapshot. Other layouts and modes use the sequential kernel.
+    // The chunked solve requires L2-normalized keys for stable results.
+    const bool use_mlx_c8 =
+        ggml_metal_device_get_props(ggml_metal_library_get_device(lib))->has_simdgroup_mm &&
+        op->src[0]->type == GGML_TYPE_F32 &&
+        op->src[1]->type == GGML_TYPE_F32 &&
+        op->src[2]->type == GGML_TYPE_F32 &&
+        op->src[3]->type == GGML_TYPE_F32 &&
+        op->src[4]->type == GGML_TYPE_F32 &&
+        op->src[5]->type == GGML_TYPE_F32 &&
+        op->src[0]->ne[0] == 128 &&
+        op->src[1]->ne[0] == 128 &&
+        op->src[2]->ne[0] == 128 &&
+        op->src[3]->ne[0] == 1 &&
+        op->src[0]->ne[1] == op->src[1]->ne[1] &&
+        op->src[0]->ne[2] == op->src[2]->ne[2] &&
+        op->src[1]->ne[2] == op->src[2]->ne[2] &&
+        op->src[0]->ne[3] == op->src[2]->ne[3] &&
+        op->src[1]->ne[3] == op->src[2]->ne[3] &&
+        op->src[3]->ne[1] == op->src[2]->ne[1] &&
+        op->src[4]->ne[1] == op->src[2]->ne[1] &&
+        op->src[3]->ne[2] == op->src[2]->ne[2] &&
+        op->src[4]->ne[2] == op->src[2]->ne[2] &&
+        op->src[3]->ne[3] == op->src[2]->ne[3] &&
+        op->src[4]->ne[3] == op->src[2]->ne[3] &&
+        op->src[2]->ne[1] * op->src[2]->ne[3] >= 8 &&
+        op->src[2]->ne[2] >= 16 &&
+        ggml_get_op_params_i32(op, 0) == 1 &&
+        ggml_is_contiguous(op->src[0]) &&
+        ggml_is_contiguous(op->src[1]) &&
+        op->src[2]->nb[0] == sizeof(float) &&
+        op->src[2]->nb[1] == 128*sizeof(float) &&
+        op->src[2]->nb[2] >= op->src[2]->ne[1]*op->src[2]->nb[1] &&
+        op->src[2]->nb[3] >= op->src[2]->ne[2]*op->src[2]->nb[2] &&
+        op->src[2]->nb[2] % sizeof(float) == 0 &&
+        op->src[2]->nb[3] % sizeof(float) == 0 &&
+        ggml_is_contiguous(op->src[3]) &&
+        ggml_is_contiguous(op->src[4]) &&
+        ggml_is_contiguous(op->src[5]);
+    if (use_mlx_c8) {
+        ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, "kernel_gated_delta_net_mlx_c8");
+        if (!res.pipeline) {
+            res = ggml_metal_library_compile_pipeline(lib, "kernel_gated_delta_net_mlx_c8", "kernel_gated_delta_net_mlx_c8", nullptr);
+        }
+        if (res.pipeline) {
+            res.nsg = 4;
+            res.gdn_c8 = true;
+            return res;
+        }
+    }
+
     char base[256];
     char name[256];
 

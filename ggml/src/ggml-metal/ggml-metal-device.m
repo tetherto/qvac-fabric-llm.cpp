@@ -367,6 +367,7 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline(ggml_meta
         /*.smem     =*/ 0,
         /*.c4       =*/ false,
         /*.cnt      =*/ false,
+        /*.gdn_c8   =*/ false,
         /*.nth      =*/ 0,
     };
 
@@ -386,6 +387,7 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_compile_pipeline(ggml_
         /*.smem     =*/ 0,
         /*.c4       =*/ false,
         /*.cnt      =*/ false,
+        /*.gdn_c8   =*/ false,
         /*.nth      =*/ 0,
     };
 
@@ -1634,7 +1636,10 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
         case GGML_OP_RWKV_WKV7:
             return true;
         case GGML_OP_GATED_DELTA_NET:
-            return has_simdgroup_reduction && op->src[2]->ne[0] % 32 == 0;
+            return has_simdgroup_reduction && op->src[2]->ne[0] % 32 == 0 &&
+                op->src[0]->ne[2] == op->src[2]->ne[2] && op->src[1]->ne[2] == op->src[2]->ne[2] &&
+                op->src[0]->ne[3] > 0 && op->src[1]->ne[3] > 0 &&
+                op->src[2]->ne[3] % op->src[0]->ne[3] == 0 && op->src[2]->ne[3] % op->src[1]->ne[3] == 0;
         case GGML_OP_MUL_MAT:
             if (op->src[0]->type == GGML_TYPE_PQ2_0 || op->src[0]->type == GGML_TYPE_PTQ1_0) {
                 return false;

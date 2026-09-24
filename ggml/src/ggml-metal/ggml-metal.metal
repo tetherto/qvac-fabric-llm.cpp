@@ -3698,6 +3698,8 @@ kernel void kernel_gated_delta_net_impl(
 
     const uint i01 = i21 % args.ne01;
     const uint i11 = i21 % args.ne11;
+    const uint iq3 = i23 / (args.ne23 / args.ne03);
+    const uint ik3 = i23 / (args.ne23 / args.ne13);
 
     const float scale = 1.0f / sqrt((float)S_v);
 
@@ -3709,8 +3711,8 @@ kernel void kernel_gated_delta_net_impl(
 
     device float * dst_attn = (device float *) (dst) + (i23*args.ne22*args.ne21 + i21)*S_v + i20;
 
-    device const float * q_ptr = (device const float *) (q + i23*args.nb03 + i01*args.nb01);
-    device const float * k_ptr = (device const float *) (k + i23*args.nb13 + i11*args.nb11);
+    device const float * q_ptr = (device const float *) (q + iq3*args.nb03 + i01*args.nb01);
+    device const float * k_ptr = (device const float *) (k + ik3*args.nb13 + i11*args.nb11);
     device const float * v_ptr = (device const float *) (v + i23*args.nb23 + i21*args.nb21);
 
     device const float * b_ptr = (device const float *) (b) + (i23*args.ne22*args.ne21 + i21);
@@ -3780,6 +3782,297 @@ typedef decltype(kernel_gated_delta_net_impl<float4, 4>) kernel_gated_delta_net_
 template [[host_name("kernel_gated_delta_net_f32_1")]] kernel kernel_gated_delta_net_t kernel_gated_delta_net_impl<float,  1>;
 template [[host_name("kernel_gated_delta_net_f32_2")]] kernel kernel_gated_delta_net_t kernel_gated_delta_net_impl<float2, 2>;
 template [[host_name("kernel_gated_delta_net_f32_4")]] kernel kernel_gated_delta_net_t kernel_gated_delta_net_impl<float4, 4>;
+
+// Derived from MLX gated_delta_update.h (MIT License, Apple Inc.).
+/*
+MIT License
+
+Copyright (c) 2023 Apple Inc.
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+*/
+#define AT(TILE, IDX) TILE.thread_elements()[IDX]
+#define SUB(TILE0, TILE1, TILE2)                \
+  {                                             \
+    AT(TILE0, 0) = AT(TILE1, 0) - AT(TILE2, 0); \
+    AT(TILE0, 1) = AT(TILE1, 1) - AT(TILE2, 1); \
+  }
+#define ADD(TILE0, TILE1, TILE2)                \
+  {                                             \
+    AT(TILE0, 0) = AT(TILE1, 0) + AT(TILE2, 0); \
+    AT(TILE0, 1) = AT(TILE1, 1) + AT(TILE2, 1); \
+  }
+#define FMA(TILE0, S, TILE1, TILE2)                 \
+  {                                                 \
+    AT(TILE0, 0) = S * AT(TILE1, 0) + AT(TILE2, 0); \
+    AT(TILE0, 1) = S * AT(TILE1, 1) + AT(TILE2, 1); \
+  }
+
+#define SCALE(TILE0, S) \
+  {                     \
+    AT(TILE0, 0) *= S;  \
+    AT(TILE0, 1) *= S;  \
+  }
+#define SCALE2(TILE0, S0, S1) \
+  {                           \
+    AT(TILE0, 0) *= S0;       \
+    AT(TILE0, 1) *= S1;       \
+  }
+#define SCALE_TRI(TILE0, S0, S1)            \
+  {                                         \
+    AT(TILE0, 0) *= fn > fm ? 0.f : S0;     \
+    AT(TILE0, 1) *= fn + 1 > fm ? 0.f : S1; \
+  }
+#define SCALE_TRIEQ(TILE0, S0, S1)           \
+  {                                          \
+    AT(TILE0, 0) *= fn >= fm ? 0.f : S0;     \
+    AT(TILE0, 1) *= fn + 1 >= fm ? 0.f : S1; \
+  }
+
+// lambdas are not supported in metal 14 so porting to macros.
+
+// non transposed
+#define LOAD_M(M, SRC, LD, B)                                                  \
+  if constexpr (B) {                                                           \
+    AT(M, 0) =                                                                 \
+        static_cast<float>((fm < valid_rows) ? ((SRC)[fm * (LD) + fn]) : 0.f); \
+    AT(M, 1) = static_cast<float>(                                             \
+        (fm < valid_rows) ? ((SRC)[fm * (LD) + fn + 1]) : 0.f);                \
+  } else {                                                                     \
+    AT(M, 0) = static_cast<float>((SRC)[fm * (LD) + fn]);                      \
+    AT(M, 1) = static_cast<float>((SRC)[fm * (LD) + fn + 1]);                  \
+  }
+
+// transposed load: sequence is the column -> mask fn / fn+1
+#define LOAD_MT(M, SRC, LD, B)                                                 \
+  if constexpr (B) {                                                           \
+    AT(M, 0) =                                                                 \
+        static_cast<float>((fn < valid_rows) ? ((SRC)[fn * (LD) + fm]) : 0.f); \
+    AT(M, 1) = static_cast<float>(                                             \
+        (fn + 1 < valid_rows) ? ((SRC)[(fn + 1) * (LD) + fm]) : 0.f);          \
+  } else {                                                                     \
+    AT(M, 0) = static_cast<float>((SRC)[fn * (LD) + fm]);                      \
+    AT(M, 1) = static_cast<float>((SRC)[(fn + 1) * (LD) + fm]);                \
+  }
+
+#define PROCESS_CHUNK_SG(B, S_tile, VALID)                                     \
+  {                                                                            \
+    const short valid_rows = (VALID);                                          \
+    simdgroup_barrier(mem_flags::mem_threadgroup);                             \
+                                                                               \
+    float g_val = (thread_index_in_simdgroup < (uint)valid_rows)               \
+        ? g_[thread_index_in_simdgroup * Hv + hv_idx]                                                      \
+        : 0.0f;                                                                \
+                                                                               \
+    float gamma_val = simd_prefix_inclusive_sum(g_val);                        \
+                                                                               \
+    if (thread_index_in_simdgroup < C) {                                       \
+      gamma[thread_index_in_simdgroup] = gamma_val;                            \
+    }                                                                          \
+    simdgroup_barrier(mem_flags::mem_threadgroup);                             \
+                                                                               \
+    float gamma_fm = metal::fast::exp(gamma[fm]);                              \
+    float gamma_fmdfn = metal::fast::exp(gamma[fm] - gamma[fn]);               \
+    float gamma_fmdfn1 = metal::fast::exp(gamma[fm] - gamma[fn + 1]);          \
+    float gamma_Cdfn = metal::fast::exp(gamma[C - 1] - gamma[fn]);             \
+    float gamma_Cdfn1 = metal::fast::exp(gamma[C - 1] - gamma[fn + 1]);        \
+    float gamma_C = metal::fast::exp(gamma[C - 1]);                            \
+                                                                               \
+    float beta_fm = (fm < valid_rows) ? beta_[fm * Hv + hv_idx] : 0.0f;        \
+                                                                               \
+    KKt_tile = make_filled_simdgroup_matrix<float, 8>(0.f);                    \
+    _Pragma("clang loop unroll(full)")                                                      \
+    for (int kk = 0; kk < Dk; kk += 8) {                                       \
+      LOAD_M(K_tile, k_ + kk, Dk * Hk, B)                                      \
+      LOAD_MT(KT_tile, k_ + kk, Dk * Hk, B)                                    \
+      simdgroup_multiply_accumulate(KKt_tile, K_tile, KT_tile, KKt_tile);      \
+    }                                                                          \
+                                                                               \
+    KKtK_tile = KKt_tile;                                                      \
+    SCALE_TRIEQ(KKtK_tile, beta_fm, beta_fm)                                   \
+                                                                               \
+    simdgroup_float8x8 Tinv, P;                                                \
+    AT(P, 0) = AT(KKtK_tile, 0);                                               \
+    AT(P, 1) = AT(KKtK_tile, 1);                                               \
+    SUB(Tinv, I_tile, KKtK_tile)                                               \
+                                                                               \
+    _Pragma("clang loop unroll(full)")                                                      \
+    for (int step = 1; (1 << step) < C; step++) {                              \
+      simdgroup_multiply(P, P, P);                                             \
+      simdgroup_multiply_accumulate(Tinv, Tinv, P, Tinv);                      \
+    }                                                                          \
+                                                                               \
+    WS_tile = make_filled_simdgroup_matrix<float, 8>(0.f);                     \
+    _Pragma("clang loop unroll(full)")                                                      \
+    for (int kk = 0; kk < Dk; kk += 8) {                                       \
+      LOAD_M(K_tile, k_ + kk, Dk * Hk, B)                                      \
+      SCALE(K_tile, beta_fm)                                                   \
+      simdgroup_multiply(W_tile, Tinv, K_tile);                                \
+      SCALE(W_tile, gamma_fm)                                                  \
+      simdgroup_multiply_accumulate(WS_tile, W_tile, S_tile[kk / 8], WS_tile); \
+    }                                                                          \
+                                                                               \
+    SCALE_TRI(Tinv, gamma_fmdfn, gamma_fmdfn1)                                 \
+                                                                               \
+    LOAD_M(V_tile, v_ + dv_idx, args.ns22, B)                                  \
+    SCALE(V_tile, beta_fm)                                                     \
+    simdgroup_multiply(U_tile, Tinv, V_tile);                                  \
+    SUB(delta_tile, U_tile, WS_tile)                                           \
+                                                                               \
+    tmp_tile = make_filled_simdgroup_matrix<float, 8>(0.f);                    \
+    QKt_tile = make_filled_simdgroup_matrix<float, 8>(0.f);                    \
+    _Pragma("clang loop unroll(full)")                                                      \
+    for (int kk = 0; kk < Dk; kk += 8) {                                       \
+      LOAD_M(Q_tile, q_ + kk, Hk * Dk, B)                                      \
+      LOAD_MT(K_tile, k_ + kk, Hk * Dk, B)                                     \
+      simdgroup_multiply_accumulate(QKt_tile, Q_tile, K_tile, QKt_tile);       \
+      SCALE(Q_tile, gamma_fm)                                                  \
+      simdgroup_multiply_accumulate(                                           \
+          tmp_tile, Q_tile, S_tile[kk / 8], tmp_tile);                         \
+    }                                                                          \
+                                                                               \
+    SCALE_TRI(QKt_tile, gamma_fmdfn, gamma_fmdfn1)                             \
+                                                                               \
+    simdgroup_multiply_accumulate(out_tile, QKt_tile, delta_tile, tmp_tile);   \
+                                                                               \
+    if (fm < valid_rows) {                                                     \
+      y[ulong(fm) * ulong(Hv) * ulong(Dv) + ulong(dv_idx) + ulong(fn)] = AT(out_tile, 0) * (1.0f / sqrt(128.0f));       \
+      y[ulong(fm) * ulong(Hv) * ulong(Dv) + ulong(dv_idx) + ulong(fn + 1)] = AT(out_tile, 1) * (1.0f / sqrt(128.0f));   \
+    }                                                                          \
+                                                                               \
+    _Pragma("clang loop unroll(full)")                                                      \
+    for (int kk = 0; kk < Dk; kk += 8) {                                       \
+      LOAD_MT(K_tile, k_ + kk, Hk * Dk, B)                                     \
+      SCALE2(K_tile, gamma_Cdfn, gamma_Cdfn1)                                  \
+      simdgroup_multiply(KD_tile, K_tile, delta_tile);                         \
+      FMA(S_tile[kk / 8], gamma_C, S_tile[kk / 8], KD_tile)                    \
+    }                                                                          \
+  }
+
+kernel void kernel_gated_delta_net_mlx_c8(
+    constant ggml_metal_kargs_gated_delta_net & args [[buffer(0)]],
+    const device float* q [[buffer(1)]],
+    const device float* k [[buffer(2)]],
+    const device float* v [[buffer(3)]],
+    const device float* g [[buffer(4)]],
+    const device float* beta [[buffer(5)]],
+    const device float* state_in [[buffer(6)]],
+    device float* y [[buffer(7)]],
+    device float* cache [[buffer(8)]],
+    uint3 tgpig [[threadgroup_position_in_grid]],
+    uint3 thread_position_in_threadgroup [[thread_position_in_threadgroup]],
+    uint thread_index_in_simdgroup [[thread_index_in_simdgroup]]) {
+  constexpr int Dk = 128, Dv = 128, C = 8;
+  const int Hk = args.ne01;
+  const int Hv = args.ne21;
+  const int T = args.ne22;
+  const ulong n = ulong(tgpig.z) * ulong(Hv) + ulong(tgpig.y);
+  const int b_idx = tgpig.z;
+  const int hv_idx = tgpig.y;
+  const int hk_idx = hv_idx % Hk;
+
+  const short qid = thread_index_in_simdgroup / 4;
+  const short fm = (qid & 4) +
+      ((thread_index_in_simdgroup / 2) % 4); // row coordinate of the held tile
+  const short fn = (qid & 2) * 2 +
+      (thread_index_in_simdgroup % 2) * 2; // column coordinate of the held tile
+
+  auto dv_idx = tgpig.x * 32 + thread_position_in_threadgroup.y * 8;
+  const short sg_id = thread_position_in_threadgroup.y; // 0..3
+
+  // set up pointers
+  // g: [B, T, Hv] (log gate)
+  auto g_ = g + ulong(b_idx) * ulong(T) * ulong(Hv);
+
+  // q, k: [B, T, Hk, Dk]
+  auto q_ = q + ulong(b_idx) * (args.nb03 / sizeof(float)) + ulong(hk_idx) * (args.nb01 / sizeof(float));
+  auto k_ = k + ulong(b_idx) * (args.nb13 / sizeof(float)) + ulong(hk_idx) * (args.nb11 / sizeof(float));
+
+  // v, y: [B, T, Hv, Dv]
+  device float* out_base = y;
+  y += ulong(b_idx) * ulong(T) * ulong(Hv) * ulong(Dv) + ulong(hv_idx) * ulong(Dv);
+  auto v_ = v + ulong(b_idx) * (args.nb23 / sizeof(float)) + ulong(hv_idx) * (args.nb21 / sizeof(float));
+  auto beta_ = beta + ulong(b_idx) * ulong(T) * ulong(Hv);
+
+  // state_in, state_out: [B, Hv, Dv, Dk]
+  auto i_state = state_in + (n * ulong(Dv) + ulong(dv_idx)) * ulong(Dk);
+  const ulong attn_size = ulong(T) * ulong(Hv) * ulong(Dv) * ulong(args.ne23);
+  auto o_state = (args.fuse_cache ? cache : out_base + attn_size) + (n * ulong(Dv) + ulong(dv_idx)) * ulong(Dk);
+
+  simdgroup_float8x8 S_tile[Dk / 8];
+
+  // simdgroup matrices
+  simdgroup_float8x8 V_tile, K_tile, KT_tile, Q_tile;
+  simdgroup_float8x8 W_tile, U_tile;
+  simdgroup_float8x8 WS_tile;
+  simdgroup_float8x8 delta_tile;
+  simdgroup_float8x8 tmp_tile;
+  simdgroup_float8x8 QKt_tile;
+  simdgroup_float8x8 out_tile;
+  simdgroup_float8x8 KD_tile;
+
+  // tiles for WY form computation
+  simdgroup_float8x8 KKtK_tile, KKt_tile;
+
+  threadgroup float gamma_all[C * 4];
+  threadgroup float* gamma = gamma_all + sg_id * C;
+
+  simdgroup_float8x8 I_tile = make_filled_simdgroup_matrix<float, 8>(0.f);
+  AT(I_tile, 0) = (fm == fn) ? 1.0f : 0.0f;
+  AT(I_tile, 1) = (fm == fn + 1) ? 1.0f : 0.0f;
+
+  // load initial state into registers
+  for (int kk = 0; kk < Dk; kk += 8) {
+    simdgroup_load(S_tile[kk / 8], i_state + kk, Dk, ulong2(0, 0), true);
+  }
+
+  int t = 0;
+  for (; t + C <= T; t += C) {
+    PROCESS_CHUNK_SG(false, S_tile, C);
+    q_ += C * Hk * Dk;
+    k_ += C * Hk * Dk;
+    v_ += C * args.ns22;
+    beta_ += C * Hv;
+    y += C * Hv * Dv;
+    g_ += C * Hv;
+  }
+  if (t < T) {
+    PROCESS_CHUNK_SG(true, S_tile, short(T - t));
+  }
+
+  _Pragma("clang loop unroll(full)")
+  for (int kk = 0; kk < Dk; kk += 8) {
+    simdgroup_store(S_tile[kk / 8], o_state + kk, Dk, ulong2(0, 0), true);
+  }
+}
+
+#undef AT
+#undef SUB
+#undef ADD
+#undef FMA
+#undef SCALE
+#undef SCALE2
+#undef SCALE_TRI
+#undef SCALE_TRIEQ
+#undef LOAD_M
+#undef LOAD_MT
+#undef PROCESS_CHUNK_SG
 
 // Backward of gated_delta_net.
 constant short FC_gdn_back_S_v [[function_constant(FC_GATED_DELTA_NET + 10)]];
