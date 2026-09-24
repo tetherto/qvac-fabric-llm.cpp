@@ -339,6 +339,15 @@ if (GGML_XDNA_BUILD_KERNELS)
     # this XDNA_DESIGN_TAG is empty, the command declares outputs that never
     # appear, and the step reruns on every build while install(FILES) points at
     # files that do not exist.
+    #
+    # The tag is a configure-time value, so the sources it hashes have to
+    # re-run configure when they change. Without that an incremental build
+    # stamps files under the new tag while the declared outputs and the install
+    # list still carry the old one.
+    file(GLOB XDNA_TAG_SOURCES CONFIGURE_DEPENDS
+         "${GEMM_DIR}/*.py" "${GEMM_DIR}/*.cc")
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+                 ${XDNA_TAG_SOURCES})
     execute_process(
         COMMAND ${CMAKE_COMMAND} -E env GATED_FMT=${GGML_XDNA_GATED_FMT}
                 ${GEMM_PYTHON} -c
