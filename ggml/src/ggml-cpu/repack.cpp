@@ -10,11 +10,24 @@
 #include "traits.h"
 
 #include "arch-fallback.h"
+#include "vec.h"
+
+#ifndef CACHE_LINE_SIZE
+#if defined(__POWER9_VECTOR__)
+#define CACHE_LINE_SIZE 128
+#elif defined(__VXE__) || defined(__VXE2__)
+#define CACHE_LINE_SIZE 256
+#else
+#define CACHE_LINE_SIZE 64
+#endif
+#endif
+static const size_t CACHE_LINE_SIZE_F32 = CACHE_LINE_SIZE / sizeof(float);
 
 #include <cmath>
 #include <cstring>
 #include <cassert>
 #include <cstdio>  // for GGML_ASSERT
+#include <type_traits>
 
 #include "repack.h"
 
@@ -4157,50 +4170,6 @@ class tensor_traits_base : public ggml::cpu::tensor_traits {
 
 template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PARAM_TYPE> class tensor_traits : public tensor_traits_base {
 
-    bool work_size(int /* n_threads */, const struct ggml_tensor * op, size_t & size) override {
-        // not realy a GGML_TYPE_Q8_0 but same size.
-        switch (op->op) {
-            case GGML_OP_MUL_MAT:
-                {
-                    size = ggml_row_size(PARAM_TYPE, ggml_nelements(op->src[1]));
-                    return true;
-                }
-            case GGML_OP_MUL_MAT_ID:
-                {
-                    size = ggml_row_size(PARAM_TYPE, ggml_nelements(op->src[1]));
-                    size = GGML_PAD(size, sizeof(int64_t)); // + padding for next block.
-
-                    const int64_t ne02 = op->src[0]->ne[2]; // n_as, n_expert
-                    const int64_t ne12 = op->src[1]->ne[2]; // n_tokens
-
-                    const size_t sizeof_mmid_row_mapping = sizeof(int64_t);
-
-                    size += sizeof_mmid_row_mapping*ne02*(ne12 + 1);
-
-                    return true;
-                }
-            default:
-                // GGML_ABORT("fatal error");
-                break;
-        }
-        return false;
-    }
-
-    bool compute_forward(struct ggml_compute_params * params, struct ggml_tensor * op) override {
-        switch (op->op) {
-            case GGML_OP_MUL_MAT:
-                forward_mul_mat(params, op);
-                return true;
-            case GGML_OP_MUL_MAT_ID:
-                forward_mul_mat_id(params, op);
-                return true;
-            default:
-                // GGML_ABORT("fatal error");
-                break;
-        }
-        return false;
-    }
-
     void forward_mul_mat_one_chunk(ggml_compute_params * params,
                                    ggml_tensor *         op,
                                    int64_t               src0_start,
@@ -4516,6 +4485,156 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
 #undef MMID_MATRIX_ROW
     }
 
+    static void dequantize_repacked_row_q8_0(const void * row_group_data, int row_in_group,
+                                              float * dst, int64_t nb) {
+        using packed_block = block<8, NB_COLS>;
+        const packed_block * blocks = (const packed_block *) row_group_data;
+        const int p = row_in_group;
+        for (int64_t b = 0; b < nb; b++) {
+            const float scale = GGML_FP16_TO_FP32(blocks[b].d[p]);
+            for (int j = 0; j < QK8_0; j++) {
+                const int group = j / 4;
+                const int offset_in_group = j % 4;
+                const int8_t q = blocks[b].qs[group * (NB_COLS * 4) + p * 4 + offset_in_group];
+                dst[b * QK8_0 + j] = (float)q * scale;
+            }
+        }
+    }
+
+    static void dequantize_repacked_row_q4_0(const void * row_group_data, int row_in_group,
+                                              float * dst, int64_t nb) {
+        using packed_block = block<4, NB_COLS>;
+        const packed_block * blocks = (const packed_block *) row_group_data;
+        const int p = row_in_group;
+        for (int64_t b = 0; b < nb; b++) {
+            const float scale = GGML_FP16_TO_FP32(blocks[b].d[p]);
+            for (int j = 0; j < QK4_0; j++) {
+                const int group = j / 4;
+                const int offset_in_group = j % 4;
+                const int byte_idx = group * (NB_COLS * 2) + p * 2 + offset_in_group / 2;
+                const uint8_t byte_val = ((const uint8_t *)blocks[b].qs)[byte_idx];
+                int8_t q;
+                if (offset_in_group % 2 == 0) {
+                    q = (int8_t)(byte_val & 0xF) - 8;
+                } else {
+                    q = (int8_t)(byte_val >> 4) - 8;
+                }
+                dst[b * QK4_0 + j] = (float)q * scale;
+            }
+        }
+    }
+
+    void forward_out_prod(ggml_compute_params * params, ggml_tensor * op) {
+        const ggml_tensor * src0 = op->src[0];
+        const ggml_tensor * src1 = op->src[1];
+        ggml_tensor *       dst  = op;
+
+        GGML_TENSOR_BINARY_OP_LOCALS
+
+        const int ith = params->ith;
+        const int nth = params->nth;
+
+        GGML_ASSERT(src1->type == GGML_TYPE_F32);
+        GGML_ASSERT(dst->type == GGML_TYPE_F32);
+        GGML_ASSERT(ne0 == ne00);
+        GGML_ASSERT(ne1 == ne10);
+
+        if (ith == 0) {
+            ggml_vec_set_f32(ne0*ne1*ne2*ne3, (float *)dst->data, 0);
+        }
+        ggml_barrier(params->threadpool);
+
+        const int64_t nr = ne1*ne2*ne3;
+        const int64_t dr = (nr + nth - 1)/nth;
+        const int64_t ir0 = dr*ith;
+        const int64_t ir1 = MIN(ir0 + dr, nr);
+
+        const int64_t nb_per_row = ne00 / ggml_blck_size(src0->type);
+        const size_t src0_repacked_row_group_stride = (size_t)nb01 * NB_COLS;
+
+        float * wdata = (float *) params->wdata + (ne0 + CACHE_LINE_SIZE_F32) * ith;
+
+        for (int64_t ir = ir0; ir < ir1; ++ir) {
+            const int64_t i3 = ir/(ne2*ne1);
+            const int64_t i2 = (ir - i3*ne2*ne1)/ne1;
+            const int64_t i1 = (ir - i3*ne2*ne1 - i2*ne1);
+
+            for (int64_t i01 = 0; i01 < ne01; ++i01) {
+                const int64_t group = i01 / NB_COLS;
+                const int     p     = (int)(i01 % NB_COLS);
+
+                const char * group_data = (const char *)src0->data + group * src0_repacked_row_group_stride + i2*nb02 + i3*nb03;
+
+                if constexpr (std::is_same_v<BLOC_TYPE, block_q8_0>) {
+                    dequantize_repacked_row_q8_0(group_data, p, wdata, nb_per_row);
+                } else if constexpr (std::is_same_v<BLOC_TYPE, block_q4_0>) {
+                    dequantize_repacked_row_q4_0(group_data, p, wdata, nb_per_row);
+                } else {
+                    // TODO: add support for Q4_K, Q5_K, Q6_K, Q2_K, IQ4_NL, MXFP4
+                    ggml_get_type_traits(src0->type)->to_float(
+                        (const char *)src0->data + i01*nb01 + i2*nb02 + i3*nb03, wdata, ne0);
+                }
+
+                float * s1 = (float *) ((char *) src1->data + (i1*nb10 + i01*nb11 + i2*nb12 + i3*nb13));
+                float * d  = (float *) ((char *)  dst->data + (          i1*nb1  + i2*nb2  + i3*nb3));
+                ggml_vec_mad_f32(ne0, d, wdata, *s1);
+            }
+        }
+    }
+
+    bool work_size(int n_threads, const struct ggml_tensor * op, size_t & size) override {
+        switch (op->op) {
+            case GGML_OP_MUL_MAT:
+                {
+                    size = ggml_row_size(PARAM_TYPE, ggml_nelements(op->src[1]));
+                    return true;
+                }
+            case GGML_OP_MUL_MAT_ID:
+                {
+                    size = ggml_row_size(PARAM_TYPE, ggml_nelements(op->src[1]));
+                    size = GGML_PAD(size, sizeof(int64_t));
+
+                    const int64_t ne02 = op->src[0]->ne[2];
+                    const int64_t ne12 = op->src[1]->ne[2];
+
+                    const size_t sizeof_mmid_row_mapping = sizeof(int64_t);
+
+                    size += sizeof_mmid_row_mapping*ne02*(ne12 + 1);
+
+                    return true;
+                }
+            case GGML_OP_OUT_PROD:
+                {
+                    const int64_t ne00 = op->src[0]->ne[0];
+                    // forward_out_prod slices wdata per thread: ne00 floats + cache line each
+                    size = (ne00 + CACHE_LINE_SIZE_F32) * sizeof(float) * n_threads;
+                    return true;
+                }
+            default:
+                // GGML_ABORT("fatal error");
+                break;
+        }
+        return false;
+    }
+
+    bool compute_forward(struct ggml_compute_params * params, struct ggml_tensor * op) override {
+        switch (op->op) {
+            case GGML_OP_MUL_MAT:
+                forward_mul_mat(params, op);
+                return true;
+            case GGML_OP_MUL_MAT_ID:
+                forward_mul_mat_id(params, op);
+                return true;
+            case GGML_OP_OUT_PROD:
+                forward_out_prod(params, op);
+                return true;
+            default:
+                // GGML_ABORT("fatal error");
+                break;
+        }
+        return false;
+    }
+
     int repack(struct ggml_tensor * t, const void * data, size_t data_size) override {
         GGML_LOG_DEBUG("%s: repack tensor %s with %s_%dx%d\n", __func__, t->name, ggml_type_name(t->type),
                        (int) NB_COLS, (int) INTER_SIZE);
@@ -4732,13 +4851,16 @@ static enum ggml_status ggml_backend_cpu_repack_buffer_init_tensor(ggml_backend_
 
 static void ggml_backend_cpu_repack_buffer_set_tensor(ggml_backend_buffer_t buffer, struct ggml_tensor * tensor,
                                                        const void * data, size_t offset, size_t size) {
-    GGML_ASSERT(offset == 0);
-    GGML_ASSERT(size == ggml_nbytes(tensor));
-
     auto tensor_traits = (ggml::cpu::repack::tensor_traits_base *) tensor->extra;
-    auto OK            = tensor_traits->repack(tensor, data, size);
-
-    GGML_ASSERT(OK == 0);
+    if (tensor_traits) {
+        GGML_ASSERT(offset == 0);
+        GGML_ASSERT(size == ggml_nbytes(tensor));
+        auto OK = tensor_traits->repack(tensor, data, size);
+        GGML_ASSERT(OK == 0);
+    } else {
+        // F32/F16 tensors have no repack traits — plain memcpy
+        memcpy((char *) tensor->data + offset, data, size);
+    }
     GGML_UNUSED(buffer);
 }
 
@@ -4746,6 +4868,13 @@ static const char * ggml_backend_cpu_repack_buffer_type_get_name(ggml_backend_bu
     return "CPU_REPACK";
 
     GGML_UNUSED(buft);
+}
+
+static bool ggml_backend_cpu_repack_buffer_type_is_host(ggml_backend_buffer_type_t buft) {
+    // CPU_REPACK buffers are allocated in host memory (via the CPU buffer allocator)
+    // and are directly accessible via tensor->data pointers.
+    GGML_UNUSED(buft);
+    return true;
 }
 
 static ggml_backend_buffer_t ggml_backend_cpu_repack_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
@@ -4758,8 +4887,7 @@ static ggml_backend_buffer_t ggml_backend_cpu_repack_buffer_type_alloc_buffer(gg
     buffer->buft              = buft;
     buffer->iface.init_tensor = ggml_backend_cpu_repack_buffer_init_tensor;
     buffer->iface.set_tensor  = ggml_backend_cpu_repack_buffer_set_tensor;
-    buffer->iface.get_tensor  = nullptr;
-    buffer->iface.cpy_tensor  = nullptr;
+
     return buffer;
 }
 
@@ -4803,12 +4931,24 @@ class extra_buffer_type : ggml::cpu::extra_buffer_type {
             //if (op->src[1]->type == GGML_TYPE_Q8_0) {
             //    return true;
             //}
+        } else if (op->op == GGML_OP_OUT_PROD
+                && op->src[0]->buffer
+                && (ggml_n_dims(op->src[0]) == 2)
+                && op->src[0]->buffer->buft == ggml_backend_cpu_repack_buffer_type()
+                && ggml_repack_get_optimal_repack_type(op->src[0])
+                ) {
+            if (op->src[1]->buffer && !ggml_backend_buft_is_host(op->src[1]->buffer->buft)) {
+                return false;
+            }
+            if (op->src[1]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32) {
+                return true;
+            }
         }
         return false;
     }
 
     ggml::cpu::tensor_traits * get_tensor_traits(const struct ggml_tensor * op) override {
-        if (op->op == GGML_OP_MUL_MAT || op->op == GGML_OP_MUL_MAT_ID) {
+        if (op->op == GGML_OP_MUL_MAT || op->op == GGML_OP_MUL_MAT_ID || op->op == GGML_OP_OUT_PROD) {
             if (op->src[0]->buffer && op->src[0]->buffer->buft == ggml_backend_cpu_repack_buffer_type()) {
                 return (ggml::cpu::tensor_traits *) op->src[0]->extra;
             }

@@ -864,6 +864,7 @@ static void ggml_backend_openvino_device_get_props(ggml_backend_dev_t dev, ggml_
         /* .buffer_from_host_ptr  = */ false,
         /* .events                = */ false,
         /* .mmap_support          = */ true,
+        /* .copy_stream           = */ false,
     };
 }
 
@@ -1254,10 +1255,13 @@ static ggml_openvino_op_support is_op_supported_case(const ggml_tensor * op) {
             return {false, "MUL_MAT_ID with BF16 weights on GPU is not supported"};
         }
         // GPU MUL_MAT_ID uses a Gather+MatMul fallback because the GPU plugin rejects internal
-        // GatherMatmul for these test shapes. Skip cases that would materialize a large selected
-        // expert-weight temporary.
-        if (ggml_openvino_get_device_name() == "GPU" && mul_mat_id_requires_large_tmp(op)) {
-            return {false, "MUL_MAT_ID requires large temporary on GPU"};
+        // GatherMatmul for these test shapes, and packed MXFP4 weights materialize the selected
+        // experts on every device (translate_mul_mat_id_mxfp4_packed). Skip cases that would
+        // materialize a large selected expert-weight temporary.
+        const bool materializes_tmp = ggml_openvino_get_device_name() == "GPU" ||
+                                      (op->src[0] != nullptr && op->src[0]->type == GGML_TYPE_MXFP4);
+        if (materializes_tmp && mul_mat_id_requires_large_tmp(op)) {
+            return {false, "MUL_MAT_ID requires large temporary"};
         }
         break;
     }

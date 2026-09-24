@@ -1,0 +1,105 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : require
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform parameter {
+    uint n_tokens;
+    uint n_iter;
+    float eps;
+    uint mixes_nb0;
+    uint mixes_nb1;
+    uint mixes_offset;
+    uint scale_nb0;
+    uint scale_offset;
+    uint base_nb0;
+    uint base_offset;
+    uint dst_nb0;
+    uint dst_nb1;
+    uint dst_nb2;
+    uint dst_offset;
+} p;
+
+layout(binding = 0) readonly buffer MixesBuf { float data_mixes[]; };
+layout(binding = 1) readonly buffer ScaleBuf { float data_scale[]; };
+layout(binding = 2) readonly buffer BaseBuf { float data_base[]; };
+layout(binding = 3) writeonly buffer DstBuf { float data_dst[]; };
+
+void norm_cols(inout float comb[16]) {
+    for (uint idst = 0; idst < 4; ++idst) {
+        precise float sum = p.eps;
+        for (uint isrc = 0; isrc < 4; ++isrc) {
+            sum = sum + comb[idst + 4*isrc];
+        }
+
+        const float inv_sum = 1.0 / sum;
+        for (uint isrc = 0; isrc < 4; ++isrc) {
+            comb[idst + 4*isrc] = comb[idst + 4*isrc] * inv_sum;
+        }
+    }
+}
+
+void norm_rows(inout float comb[16]) {
+    for (uint isrc = 0; isrc < 4; ++isrc) {
+        precise float sum = p.eps;
+        for (uint idst = 0; idst < 4; ++idst) {
+            sum = sum + comb[idst + 4*isrc];
+        }
+
+        const float inv_sum = 1.0 / sum;
+        for (uint idst = 0; idst < 4; ++idst) {
+            comb[idst + 4*isrc] = comb[idst + 4*isrc] * inv_sum;
+        }
+    }
+}
+
+void main() {
+    const uint it = gl_GlobalInvocationID.x;
+    if (it >= p.n_tokens) {
+        return;
+    }
+
+    const uint comb_offset = 8;
+    const float scale_comb = data_scale[p.scale_offset + 2*p.scale_nb0];
+    precise float comb[16];
+
+    for (uint isrc = 0; isrc < 4; ++isrc) {
+        precise float max_value = uintBitsToFloat(0xFF800000);
+        for (uint idst = 0; idst < 4; ++idst) {
+            const uint idx = idst + 4*isrc;
+            const float xv = data_mixes[p.mixes_offset + (comb_offset + idx)*p.mixes_nb0 + it*p.mixes_nb1];
+            const float bv = data_base[p.base_offset + (comb_offset + idx)*p.base_nb0];
+            const float value = xv * scale_comb + bv;
+            comb[idx] = value;
+            max_value = max(max_value, value);
+        }
+
+        precise float sum = 0.0;
+        for (uint idst = 0; idst < 4; ++idst) {
+            const uint idx = idst + 4*isrc;
+            const float value = exp(comb[idx] - max_value);
+            comb[idx] = value;
+            sum = sum + value;
+        }
+
+        const float inv_sum = 1.0 / sum;
+        for (uint idst = 0; idst < 4; ++idst) {
+            const uint idx = idst + 4*isrc;
+            comb[idx] = comb[idx] * inv_sum + p.eps;
+        }
+    }
+
+    norm_cols(comb);
+    for (uint i = 1; i < p.n_iter; ++i) {
+        norm_rows(comb);
+        norm_cols(comb);
+    }
+
+    for (uint isrc = 0; isrc < 4; ++isrc) {
+        for (uint idst = 0; idst < 4; ++idst) {
+            const uint idx = idst + 4*isrc;
+            data_dst[p.dst_offset + idst*p.dst_nb0 + isrc*p.dst_nb1 + it*p.dst_nb2] = comb[idx];
+        }
+    }
+}

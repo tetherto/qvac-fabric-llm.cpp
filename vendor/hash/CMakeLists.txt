@@ -32,7 +32,9 @@ set_source_files_properties(${VENDOR_SRCS} PROPERTIES COMPILE_OPTIONS ${NO_WARN_
 set_source_files_properties(sha1/sha1.c PROPERTIES LANGUAGE CXX)
 
 # expose the vendor/ root so consumers can include via "hash/hash.h"
-target_include_directories(${TARGET} PUBLIC ..)
+target_include_directories(${TARGET} PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/..>
+    $<INSTALL_INTERFACE:${LLAMA_INCLUDE_INSTALL_DIR}>)
 
 # internal includes of the vendored sources, e.g. sha256.c -> "rotate-bits/rotate-bits.h"
 target_include_directories(${TARGET} PRIVATE .)

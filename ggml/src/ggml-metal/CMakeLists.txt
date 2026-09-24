@@ -50,6 +50,7 @@ set(METALLIB_KERNEL_SOURCES
     kernels/argsort.metal
     kernels/pool.metal
     kernels/misc.metal
+    kernels/out_prod.metal
 )
 
 if (GGML_METAL_EMBED_LIBRARY)

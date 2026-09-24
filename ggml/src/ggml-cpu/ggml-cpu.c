@@ -281,6 +281,7 @@ static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
     },
     [GGML_TYPE_Q8_1] = {
         .from_float               = quantize_row_q8_1,
+        .vec_dot                  = ggml_vec_dot_q8_1_q8_1,
         .vec_dot_type             = GGML_TYPE_Q8_1,
         .nrows                    = 1,
     },
@@ -410,6 +411,54 @@ static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
         .vec_dot_type             = GGML_TYPE_Q8_K,
         .nrows                    = 1,
     },
+    [GGML_TYPE_TBQ3_0] = {
+        .from_float               = quantize_row_tbq3_0,
+        .vec_dot                  = ggml_vec_dot_tbq3_0_q8_0,
+        .vec_dot_type             = GGML_TYPE_Q8_0,
+        .nrows                    = 1,
+    },
+    [GGML_TYPE_TBQ4_0] = {
+        .from_float               = quantize_row_tbq4_0,
+        .vec_dot                  = ggml_vec_dot_tbq4_0_q8_0,
+        .vec_dot_type             = GGML_TYPE_Q8_0,
+        .nrows                    = 1,
+    },
+    [GGML_TYPE_TBQ3_0_64] = {
+        .from_float               = quantize_row_tbq3_0_64,
+        .vec_dot                  = ggml_vec_dot_tbq3_0_64_q8_0,
+        .vec_dot_type             = GGML_TYPE_Q8_0,
+        .nrows                    = 1,
+    },
+    [GGML_TYPE_TBQ4_0_64] = {
+        .from_float               = quantize_row_tbq4_0_64,
+        .vec_dot                  = ggml_vec_dot_tbq4_0_64_q8_0,
+        .vec_dot_type             = GGML_TYPE_Q8_0,
+        .nrows                    = 1,
+    },
+    [GGML_TYPE_PQ3_0] = {
+        .from_float               = quantize_row_pq3_0,
+        .vec_dot                  = ggml_vec_dot_pq3_0_q8_0,
+        .vec_dot_type             = GGML_TYPE_Q8_0,
+        .nrows                    = 1,
+    },
+    [GGML_TYPE_PQ3_0_64] = {
+        .from_float               = quantize_row_pq3_0_64,
+        .vec_dot                  = ggml_vec_dot_pq3_0_64_q8_0,
+        .vec_dot_type             = GGML_TYPE_Q8_0,
+        .nrows                    = 1,
+    },
+    [GGML_TYPE_PQ4_0] = {
+        .from_float               = quantize_row_pq4_0,
+        .vec_dot                  = ggml_vec_dot_pq4_0_q8_0,
+        .vec_dot_type             = GGML_TYPE_Q8_0,
+        .nrows                    = 1,
+    },
+    [GGML_TYPE_PQ4_0_64] = {
+        .from_float               = quantize_row_pq4_0_64,
+        .vec_dot                  = ggml_vec_dot_pq4_0_64_q8_0,
+        .vec_dot_type             = GGML_TYPE_Q8_0,
+        .nrows                    = 1,
+    },
     [GGML_TYPE_I32] = {
         .from_float               = (ggml_from_float_t) ggml_cpu_fp32_to_i32,
     },
@@ -417,6 +466,33 @@ static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
 
 const struct ggml_type_traits_cpu * ggml_get_type_traits_cpu(enum ggml_type type) {
     return &type_traits_cpu[type];
+}
+
+struct vec_dot_selection {
+    ggml_vec_dot_t vec_dot;
+    enum ggml_type vec_dot_type;
+};
+
+static struct vec_dot_selection ggml_cpu_select_vec_dot(
+        const struct ggml_tensor * src0,
+        const struct ggml_tensor * src1) {
+
+    struct vec_dot_selection selection = {
+        .vec_dot      = type_traits_cpu[src0->type].vec_dot,
+        .vec_dot_type = type_traits_cpu[src0->type].vec_dot_type,
+    };
+
+    if (src0->type == GGML_TYPE_TQ2_0 && src1 != NULL) {
+        if (src1->type == GGML_TYPE_Q8_1) {
+            selection.vec_dot      = ggml_vec_dot_tq2_0_q8_1;
+            selection.vec_dot_type = GGML_TYPE_Q8_1;
+        } else if (src1->type == GGML_TYPE_Q8_0) {
+            selection.vec_dot      = ggml_vec_dot_tq2_0_q8_0;
+            selection.vec_dot_type = GGML_TYPE_Q8_0;
+        }
+    }
+
+    return selection;
 }
 
 //
@@ -1165,7 +1241,8 @@ void ggml_set_f32_nd(const struct ggml_tensor * tensor, int i0, int i1, int i2, 
 static void ggml_compute_forward_mul_mat_one_chunk(
     const struct ggml_compute_params * params,
     struct ggml_tensor * dst,
-    const enum ggml_type type,
+    ggml_vec_dot_t vec_dot,
+    enum ggml_type vec_dot_type,
     const int64_t num_rows_per_vec_dot,
     const int64_t ir0_start,
     const int64_t ir0_end,
@@ -1178,10 +1255,6 @@ static void ggml_compute_forward_mul_mat_one_chunk(
     GGML_TENSOR_BINARY_OP_LOCALS
 
     const bool src1_cont = ggml_is_contiguous(src1);
-
-    ggml_vec_dot_t const vec_dot      = type_traits_cpu[type].vec_dot;
-    enum ggml_type const vec_dot_type = type_traits_cpu[type].vec_dot_type;
-
     // broadcast factors
     const int64_t r2 = ne12 / ne02;
     const int64_t r3 = ne13 / ne03;
@@ -1270,9 +1343,11 @@ void ggml_compute_forward_mul_mat(
     const int ith = params->ith;
     const int nth = params->nth;
 
-    enum ggml_type           const vec_dot_type         = type_traits_cpu[src0->type].vec_dot_type;
-    ggml_from_float_t        const from_float           = type_traits_cpu[vec_dot_type].from_float;
-    int64_t                  const vec_dot_num_rows     = type_traits_cpu[src0->type].nrows;
+    struct vec_dot_selection vds = ggml_cpu_select_vec_dot(src0, src1);
+    ggml_vec_dot_t    vec_dot      = vds.vec_dot;
+    enum ggml_type    vec_dot_type = vds.vec_dot_type;
+    ggml_from_float_t const from_float = type_traits_cpu[vec_dot_type].from_float;
+    int64_t const vec_dot_num_rows = type_traits_cpu[src0->type].nrows;
 
     GGML_ASSERT(ne0 == ne01);
     GGML_ASSERT(ne1 == ne11);
@@ -1449,7 +1524,7 @@ UseGgmlGemm2:;
         if ((nr0 % 2 != 0) || (ne11 % 2 != 0) || ((ir0_end - ir0_start) % 2 != 0) || ((ir1_end - ir1_start) % 2 != 0)) {
             num_rows_per_vec_dot = 1;
         }
-        ggml_compute_forward_mul_mat_one_chunk(params, dst, src0->type, num_rows_per_vec_dot, ir0_start, ir0_end, ir1_start, ir1_end);
+        ggml_compute_forward_mul_mat_one_chunk(params, dst, vec_dot, vec_dot_type, num_rows_per_vec_dot, ir0_start, ir0_end, ir1_start, ir1_end);
 
         if (nth >= nchunk0 * nchunk1) {
             break;
@@ -1472,6 +1547,8 @@ static void ggml_compute_forward_mul_mat_id_one_chunk(
     struct ggml_tensor * dst,
     const struct ggml_tensor * src0,
     const struct ggml_tensor * src1,
+    ggml_vec_dot_t vec_dot,
+    enum ggml_type vec_dot_type,
     const struct ggml_tensor * ids,
     const int64_t cur_a,
     const int64_t ir0_start,
@@ -1485,11 +1562,6 @@ static void ggml_compute_forward_mul_mat_id_one_chunk(
     const void * wdata) {
 
     GGML_TENSOR_BINARY_OP_LOCALS
-
-    const enum ggml_type type = src0->type;
-
-    ggml_vec_dot_t    const vec_dot      = type_traits_cpu[type].vec_dot;
-    enum ggml_type    const vec_dot_type = type_traits_cpu[type].vec_dot_type;
 
     const int64_t blck_0 = 16;
     const int64_t blck_1 = 16;
@@ -1556,7 +1628,13 @@ static void ggml_compute_forward_mul_mat_id(
 
     const bool src1_cont = ggml_is_contiguous(src1);
 
-    enum ggml_type    const vec_dot_type    = type_traits_cpu[type].vec_dot_type;
+    ggml_vec_dot_t vec_dot;
+    enum ggml_type vec_dot_type;
+    {
+        struct vec_dot_selection vds = ggml_cpu_select_vec_dot(src0, src1);
+        vec_dot      = vds.vec_dot;
+        vec_dot_type = vds.vec_dot_type;
+    }
     ggml_from_float_t const from_float      = type_traits_cpu[vec_dot_type].from_float;
 
     // we don't support permuted src0 or src1
@@ -1717,7 +1795,7 @@ static void ggml_compute_forward_mul_mat_id(
             const int64_t ir1_end = MIN(ir1_start + dr1, nr1);
 
             ggml_compute_forward_mul_mat_id_one_chunk(
-                dst, src0, src1, ids, cur_a,
+                dst, src0, src1, vec_dot, vec_dot_type, ids, cur_a,
                 ir0_start, ir0_end, ir1_start, ir1_end,
                 src0_cur, matrix_rows, row_size, src1_cont, wdata
             );
@@ -1822,6 +1900,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_count_equal(params, tensor);
             } break;
+        case GGML_OP_COUNT_EQUAL_MASKED:
+            {
+                ggml_compute_forward_count_equal_masked(params, tensor);
+            } break;
         case GGML_OP_REPEAT:
             {
                 ggml_compute_forward_repeat(params, tensor);
@@ -1837,6 +1919,18 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
         case GGML_OP_SILU_BACK:
             {
                 ggml_compute_forward_silu_back(params, tensor);
+            } break;
+        case GGML_OP_GELU_BACK:
+            {
+                ggml_compute_forward_gelu_back(params, tensor);
+            } break;
+        case GGML_OP_GEGLU_BACK:
+            {
+                ggml_compute_forward_geglu_back(params, tensor);
+            } break;
+        case GGML_OP_SIGMOID_BACK:
+            {
+                ggml_compute_forward_sigmoid_back(params, tensor);
             } break;
         case GGML_OP_NORM:
             {
@@ -1858,6 +1952,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_l2_norm(params, tensor);
             } break;
+        case GGML_OP_L2_NORM_BACK:
+            {
+                ggml_compute_forward_l2_norm_back(params, tensor);
+            } break;
         case GGML_OP_MUL_MAT:
             {
                 ggml_compute_forward_mul_mat(params, tensor);
@@ -1865,6 +1963,14 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
         case GGML_OP_MUL_MAT_ID:
             {
                 ggml_compute_forward_mul_mat_id(params, tensor);
+            } break;
+        case GGML_OP_MUL_MAT_ID_BACK_A:
+            {
+                ggml_compute_forward_mul_mat_id_back_a(params, tensor);
+            } break;
+        case GGML_OP_MUL_MAT_ID_BACK_B:
+            {
+                ggml_compute_forward_mul_mat_id_back_b(params, tensor);
             } break;
         case GGML_OP_OUT_PROD:
             {
@@ -2037,6 +2143,14 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_ssm_conv(params, tensor);
             } break;
+        case GGML_OP_SSM_CONV_BACK_SX:
+            {
+                ggml_compute_forward_ssm_conv_back_sx(params, tensor);
+            } break;
+        case GGML_OP_SSM_CONV_BACK_C:
+            {
+                ggml_compute_forward_ssm_conv_back_c(params, tensor);
+            } break;
         case GGML_OP_SSM_SCAN:
             {
                 ggml_compute_forward_ssm_scan(params, tensor);
@@ -2085,6 +2199,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_gated_delta_net(params, tensor);
             } break;
+        case GGML_OP_GATED_DELTA_NET_BACK:
+            {
+                ggml_compute_forward_gated_delta_net_back(params, tensor);
+            } break;
         case GGML_OP_LIGHTNING_INDEXER:
             {
                 ggml_compute_forward_lightning_indexer(params, tensor);
@@ -2129,6 +2247,16 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
         case GGML_OP_CROSS_ENTROPY_LOSS_BACK:
             {
                 ggml_compute_forward_cross_entropy_loss_back(params, tensor);
+            }
+            break;
+        case GGML_OP_CROSS_ENTROPY_LOSS_MASKED:
+            {
+                ggml_compute_forward_cross_entropy_loss_masked(params, tensor);
+            }
+            break;
+        case GGML_OP_CROSS_ENTROPY_LOSS_MASKED_BACK:
+            {
+                ggml_compute_forward_cross_entropy_loss_masked_back(params, tensor);
             }
             break;
         case GGML_OP_OPT_STEP_ADAMW:
@@ -2281,9 +2409,11 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_COUNT_EQUAL:
         case GGML_OP_SOLVE_TRI:
         case GGML_OP_GATED_DELTA_NET:
+        case GGML_OP_GATED_DELTA_NET_BACK:
         case GGML_OP_DSV4_HC_COMB:
         case GGML_OP_DSV4_HC_PRE:
         case GGML_OP_DSV4_HC_POST:
+        case GGML_OP_COUNT_EQUAL_MASKED:
             {
                 n_tasks = n_threads;
             } break;
@@ -2345,16 +2475,22 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
             }
             break;
         case GGML_OP_SILU_BACK:
+        case GGML_OP_GELU_BACK:
+        case GGML_OP_GEGLU_BACK:
+        case GGML_OP_SIGMOID_BACK:
         case GGML_OP_MUL:
         case GGML_OP_DIV:
         case GGML_OP_NORM:
         case GGML_OP_RMS_NORM:
         case GGML_OP_RMS_NORM_BACK:
         case GGML_OP_L2_NORM:
+        case GGML_OP_L2_NORM_BACK:
         case GGML_OP_GROUP_NORM:
         case GGML_OP_CONCAT:
         case GGML_OP_MUL_MAT:
         case GGML_OP_MUL_MAT_ID:
+        case GGML_OP_MUL_MAT_ID_BACK_A:
+        case GGML_OP_MUL_MAT_ID_BACK_B:
         case GGML_OP_OUT_PROD:
             {
                 n_tasks = n_threads;
@@ -2424,6 +2560,8 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_FLASH_ATTN_EXT:
         case GGML_OP_FLASH_ATTN_BACK:
         case GGML_OP_SSM_CONV:
+        case GGML_OP_SSM_CONV_BACK_SX:
+        case GGML_OP_SSM_CONV_BACK_C:
         case GGML_OP_SSM_SCAN:
         case GGML_OP_LIGHTNING_INDEXER:
             {
@@ -2484,6 +2622,8 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
             } break;
         case GGML_OP_CROSS_ENTROPY_LOSS:
         case GGML_OP_CROSS_ENTROPY_LOSS_BACK:
+        case GGML_OP_CROSS_ENTROPY_LOSS_MASKED:
+        case GGML_OP_CROSS_ENTROPY_LOSS_MASKED_BACK:
         case GGML_OP_OPT_STEP_ADAMW:
         case GGML_OP_OPT_STEP_SGD:
             {
@@ -2873,12 +3013,14 @@ struct ggml_cplan ggml_graph_plan(
                         }
                     } break;
                 case GGML_OP_COUNT_EQUAL:
+                case GGML_OP_COUNT_EQUAL_MASKED:
                     {
                         cur = ggml_type_size(node->type)*n_tasks;
                     } break;
                 case GGML_OP_MUL_MAT:
                     {
-                        const enum ggml_type vec_dot_type = type_traits_cpu[node->src[0]->type].vec_dot_type;
+                        struct vec_dot_selection vds = ggml_cpu_select_vec_dot(node->src[0], node->src[1]);
+                        enum ggml_type vec_dot_type = vds.vec_dot_type;
 
                         if (node->src[1]->type != vec_dot_type) {
                             cur = ggml_row_size(vec_dot_type, ggml_nelements(node->src[1]));
@@ -2895,7 +3037,8 @@ struct ggml_cplan ggml_graph_plan(
                         const struct ggml_tensor * src0 = node->src[0];
                         const struct ggml_tensor * src1 = node->src[1];
                         const struct ggml_tensor * ids = node->src[2];
-                        const enum ggml_type vec_dot_type = type_traits_cpu[src0->type].vec_dot_type;
+                        struct vec_dot_selection vds = ggml_cpu_select_vec_dot(src0, src1);
+                        enum ggml_type vec_dot_type = vds.vec_dot_type;
                         const int n_as = src0->ne[2];
                         // src1
                         if (src1->type != vec_dot_type) {
@@ -3028,6 +3171,19 @@ struct ggml_cplan ggml_graph_plan(
                         const int64_t K   = ggml_get_op_params_i32(node, 0);
                         const int64_t per_thread = S_v + (K > 1 ? S_v * S_v : 0);
                         cur = per_thread * sizeof(float) * n_tasks;
+                    } break;
+                case GGML_OP_GATED_DELTA_NET_BACK:
+                    {
+                        const int64_t S_v      = node->src[2]->ne[0];
+                        const int64_t n_tokens = node->src[2]->ne[2];
+
+                        const int64_t per_thread = (n_tokens + 2) * S_v * S_v + 8 * S_v;
+                        cur = per_thread * sizeof(float) * n_tasks;
+                    } break;
+                case GGML_OP_CROSS_ENTROPY_LOSS_MASKED:
+                case GGML_OP_CROSS_ENTROPY_LOSS_MASKED_BACK:
+                    {
+                        cur = ggml_type_size(node->type)*(n_tasks + node->src[0]->ne[0]*n_tasks) + sizeof(int64_t)*n_tasks;
                     } break;
                 case GGML_OP_COUNT:
                     {

@@ -5,8 +5,10 @@
 #include <memory>
 #include <openvino/op/add.hpp>
 #include <openvino/op/constant.hpp>
+#include <openvino/op/convert.hpp>
 #include <openvino/op/reduce_sum.hpp>
 #include <openvino/op/unsqueeze.hpp>
+#include <openvino/op/util/precision_sensitive_attribute.hpp>
 
 namespace ov {
 namespace frontend {
@@ -35,7 +37,33 @@ OutputVector translate_add(const NodeContext & context) {
 
     auto input_0 = process_view_input_new(context, 0);
     auto input_1 = process_view_input_new(context, 1);
-    auto res = std::make_shared<ov::op::v1::Add>(input_0, input_1);
+
+    // ggml allows ADD with mismatched src types (e.g. an f16 residual plus an
+    // f32 addend): it adds in f32 and rounds once into the dst type. OV Add
+    // requires matching input types, so upcast to f32, add, and convert to the
+    // dst type. The precision-sensitive marks keep the GPU plugin from
+    // compressing the f32 math back to f16, which would round the addend a
+    // second time.
+    const bool mixed_types = input_0.get_element_type() != input_1.get_element_type();
+    if (mixed_types) {
+        input_0 = std::make_shared<ov::op::v0::Convert>(input_0, ov::element::f32);
+        input_1 = std::make_shared<ov::op::v0::Convert>(input_1, ov::element::f32);
+    }
+
+    ov::Output<ov::Node> res = std::make_shared<ov::op::v1::Add>(input_0, input_1);
+
+    if (mixed_types) {
+        ov::mark_as_precision_sensitive(res.get_node_shared_ptr()->input(0));
+        ov::mark_as_precision_sensitive(res.get_node_shared_ptr()->input(1));
+
+        const auto output_type = context.get_output_type();
+        if (res.get_element_type() != output_type) {
+            auto output_convert = std::make_shared<ov::op::v0::Convert>(res, output_type);
+            ov::mark_as_precision_sensitive(output_convert->input(0));
+            res = output_convert;
+        }
+    }
+
     return rename_outputs_with_suffix({res}, context.get_name());
 }
 
