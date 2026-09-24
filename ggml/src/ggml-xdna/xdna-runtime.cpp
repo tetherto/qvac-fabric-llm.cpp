@@ -135,6 +135,13 @@ xdna_buffer * xdna_buffer_alloc(xdna_device * dev, size_t bytes) {
     try {
         buf->bo    = xrt::bo(dev->device, bytes, xrt::bo::flags::host_only, 0);
         buf->bytes = bytes;
+        // Zero on allocation. Several buffers are only partly written by the
+        // host and partly by the array, and a whole-buffer flush then pushes
+        // whatever the host never wrote back to the device. Without this the
+        // bytes a kernel reads out of those holes are the allocator's
+        // leftovers and differ from process to process.
+        std::memset(buf->bo.map(), 0, bytes);
+        buf->bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
     } catch (const std::exception & e) {
         GGML_LOG_ERROR("%s: failed to allocate %zu-byte BO: %s\n", "xdna-runtime", bytes, e.what());
         delete buf;
