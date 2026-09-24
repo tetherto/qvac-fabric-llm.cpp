@@ -261,6 +261,7 @@ endif()
 
 llama_build(test-llama-archs.cpp)
 llama_test(test-llama-archs NAME test-mtp-shared-cpu ARGS --mtp-shared-cpu)
+llama_test(test-llama-archs NAME test-hadamard-contracts ARGS --hadamard-contracts)
 if (GGML_CUDA)
     llama_test(test-llama-archs NAME test-mtp-shared ARGS --mtp-shared)
 endif()

@@ -2171,6 +2171,11 @@ void llama_model::print_backend_buffers_info(const int32_t n_gpu_layers) {
 // read and check the prism.hadamard metadata, and record the folded weights (load_tensors_hadamard makes the tensors)
 void llama_model_base::load_hparams_hadamard(llama_model_loader & ml) {
     uint32_t hadamard_version = 0;
+    // user-provided metadata has no tensor index (load_tensors_hadamard checks the binding instead),
+    // and an incremental split load only knows the tensors of the splits read so far
+    const bool weights_known = ml.set_tensor_data == nullptr;
+    const bool has_output = ml.get_weight("output.weight") ||
+        (ml.incremental_splits_tensor_load && ml.incremental_splits_tensor_load->is_expected_tensor("output.weight"));
     ml.get_key(LLM_KV_PRISM_HADAMARD_TIED_OUTPUT, hdmd.tied_output, false);
     if (ml.get_key(LLM_KV_PRISM_HADAMARD_VERSION, hadamard_version, false)) {
         if (hadamard_version != 1 && hadamard_version != 2) {
@@ -2180,7 +2185,7 @@ void llama_model_base::load_hparams_hadamard(llama_model_loader & ml) {
         if ((hadamard_version == 2) != hdmd.tied_output) {
             throw std::runtime_error("prism.hadamard version 2 requires tied_output=true; version 1 forbids it");
         }
-        if (hdmd.tied_output && ml.get_weight("output.weight")) {
+        if (hdmd.tied_output && weights_known && has_output) {
             throw std::runtime_error("prism.hadamard.tied_output requires output.weight to be absent");
         }
 
@@ -2196,8 +2201,8 @@ void llama_model_base::load_hparams_hadamard(llama_model_loader & ml) {
         ml.get_key(LLM_KV_PRISM_HADAMARD_SIGN_MODE, sign_mode);
         ml.get_arr(LLM_KV_PRISM_HADAMARD_WEIGHT_NAMES, weight_names);
 
-        if (block_size == 0 || (block_size & (block_size - 1)) != 0) {
-            throw std::runtime_error(format("invalid prism.hadamard.block_size: %u", block_size));
+        if (block_size == 0 || block_size > 8192 || (block_size & (block_size - 1)) != 0) {
+            throw std::runtime_error(format("invalid prism.hadamard.block_size: %u; maximum is 8192", block_size));
         }
         if (transform != "normalized-sylvester-walsh-hadamard") {
             throw std::runtime_error(format("unsupported prism.hadamard.transform: %s", transform.c_str()));
@@ -2327,7 +2332,7 @@ void llama_model_base::load_hparams_hadamard(llama_model_loader & ml) {
             throw std::runtime_error("prism.hadamard.tied_output requires a latent token embedding");
         }
         hdmd.weight_blocks.emplace("token_embd.weight", it->second);
-    } else if (hdmd.inverse_blocks.count("token_embd.weight") && !ml.get_weight("output.weight")) {
+    } else if (hdmd.inverse_blocks.count("token_embd.weight") && weights_known && !has_output) {
         throw std::runtime_error("a tied Hadamard output requires version 2 and tied_output=true");
     }
 }
@@ -2379,11 +2384,14 @@ void llama_model_base::load_tensors_hadamard() {
             }
 
             ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(weight->buffer);
-            // CPU extra buffer types (e.g. CPU_REPACK) only accept tensors they can repack
-            if (ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft)) {
-                if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
-                    buft = ggml_backend_dev_buffer_type(dev);
-                }
+            // CPU extra buffer types (e.g. CPU_REPACK) only accept tensors they can repack,
+            // and host-pointer types (e.g. CPU_Mapped) have no device, so both use the plain CPU type
+            ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
+            if (!dev) {
+                dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+            }
+            if (dev && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+                buft = ggml_backend_dev_buffer_type(dev);
             }
             if (target == &hdmd.rot) {
                 preferred_buft = buft;
