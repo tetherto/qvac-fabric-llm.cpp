@@ -487,9 +487,13 @@ bool xdna_rec_core_run(xdna_rec_core * core, int t, const void * qkv,
     }
     upload(core->x, x);
     // Upload the per-token z into the azg z lanes (head h at h*AZGN + SV).
-    // The host map keeps the seeded gamma/hh and zero attn lanes; the attn
-    // lanes are overwritten by the gdn stage before the gated phase reads them,
-    // so a full-buffer sync is safe.
+    // The attn lanes are the array's own output from the previous token and
+    // the gamma/hh lanes were seeded once, so pull the buffer back before
+    // writing the z lanes: the flush below covers the whole buffer and would
+    // otherwise put a stale host image over the attn lanes. The gdn stage does
+    // rewrite them before the gated phase reads them, but nothing should
+    // depend on that ordering for the buffer to be correct.
+    xdna_buffer_sync_from_device(core->azg);
     float * azg = (float *) core->azg->bo.map();
     for (int h = 0; h < NVH; h++) {
         std::memcpy(azg + (int64_t) h * AZGN + SV, z + (int64_t) h * SV,
