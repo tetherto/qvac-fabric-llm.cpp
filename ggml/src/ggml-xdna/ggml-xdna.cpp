@@ -1140,9 +1140,20 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
     // (default when the fused xclbins are present): the fused run owns the
     // recurrent layers and everything else falls back to the CPU glue.
     ctx->ops.isolation = xdna_rec_active();
-    // Projections outside the fused layers go through the decode GEMV on the
-    // merged artifact, which is the context the layers leave resident.
-    ctx->ops.fused_gemv = ctx->ops.isolation && !xdna_fused_xclbin().empty();
+    // Projections outside the fused layers can go through the decode GEMV on
+    // the merged artifact, which is the context the layers leave resident.
+    // They stay on the host by default: that route is both faster (about 38
+    // against 30 t/s on the 0.8B, because the packed format moves more bytes
+    // at a lower rate) and the only one that has not been caught diverging.
+    // Over 120 runs the array route still produced two whose logits differ
+    // from the rest, against none in 48 on the host route. The switch keeps
+    // the array route reachable for anyone measuring NPU residency or power,
+    // where the extra work belongs on the device; that arm is not reproducible
+    // today.
+    ctx->ops.fused_gemv = false;
+    if (xdna_env_int("GGML_XDNA_GEMV_GROUP", 0) != 0) {
+        ctx->ops.fused_gemv = ctx->ops.isolation && !xdna_fused_xclbin().empty();
+    }
 
     // Fused decode linear layers: scan this chunk for complete recurrent
     // layers of a single-token decode; each fires once in the dispatch loop
