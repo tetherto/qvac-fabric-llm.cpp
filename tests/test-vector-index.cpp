@@ -2947,14 +2947,14 @@ void check_delta_log_alternating_writers() {
     for (uint64_t id : ids) {
         CHECK(ggml_vec_index_contains(writer_a, id) == 1);
     }
-    CHECK(ggml_vec_index_len(writer_a) == static_cast<size_t>(ids.size()));
+    CHECK(ggml_vec_index_len(writer_a) == static_cast<int>(ids.size()));
 
     auto * loaded = ggml_vec_index_load_with_delta(snapshot.c_str(), delta.c_str());
     CHECK(loaded != nullptr);
     for (uint64_t id : ids) {
         CHECK(ggml_vec_index_contains(loaded, id) == 1);
     }
-    CHECK(ggml_vec_index_len(loaded) == static_cast<size_t>(ids.size()));
+    CHECK(ggml_vec_index_len(loaded) == static_cast<int>(ids.size()));
 
     ggml_vec_index_free(loaded);
     ggml_vec_index_free(writer_d);
