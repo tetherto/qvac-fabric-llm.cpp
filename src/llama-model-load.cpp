@@ -7,7 +7,7 @@
 
 #include "llama-model-loader.h"
 
-gguf_file_load::gguf_file_load(struct ggml_context ** ctx, load_input_t load_input) :
+gguf_file_load::gguf_file_load(struct ggml_context ** ctx, load_input_t load_input, bool use_direct_io) :
     params({
         /*.no_alloc = */ true,
         /*.ctx      = */ ctx,
@@ -19,7 +19,9 @@ gguf_file_load::gguf_file_load(struct ggml_context ** ctx, load_input_t load_inp
         if (!meta) {
             throw std::runtime_error(format("%s: failed to load model from %s", __func__, file_input.fname.c_str()));
         }
-        file = std::make_unique<llama_file_disk>(file_input.fname.c_str(), "rb");
+        // Pass the load mode through: without it the weight files are always
+        // opened buffered and -lm dio silently degrades to "mmap disabled".
+        file = std::make_unique<llama_file_disk>(file_input.fname.c_str(), "rb", use_direct_io);
     } else if (std::holds_alternative<buffer_future_load_input>(load_input)) {
         const auto & future_input = std::get<buffer_future_load_input>(load_input);
         auto         future_file =
@@ -41,17 +43,19 @@ gguf_file_load::gguf_file_load(struct ggml_context ** ctx, load_input_t load_inp
 }
 
 gguf_file_load SplitLoad::load_split_gguf(struct ggml_context ** ctx, const char * fname_split,
-                                          load_input_t & load_input, std::vector<std::string> & splits) {
+                                          load_input_t & load_input, std::vector<std::string> & splits,
+                                          bool use_direct_io) {
     using namespace load_input_variant;
     if (std::holds_alternative<fname_load_input>(load_input)) {
-        return gguf_file_load(ctx, fname_load_input{ fname_split, splits });
+        return gguf_file_load(ctx, fname_load_input{ fname_split, splits }, use_direct_io);
     }
     if (std::holds_alternative<buffer_future_load_input>(load_input)) {
         auto future_input = std::get<buffer_future_load_input>(load_input);
         return gguf_file_load(
-            ctx, buffer_future_load_input{ fname_split, future_input.context, splits, future_input.tensor_list_file });
+            ctx, buffer_future_load_input{ fname_split, future_input.context, splits, future_input.tensor_list_file },
+            use_direct_io);
     }
-    return gguf_file_load(ctx, load_input);
+    return gguf_file_load(ctx, load_input, use_direct_io);
 }
 
 SplitLoad::SplitLoad(load_input_t & load_input, load_input_variant::fname_load_input base_split, uint16_t idx,
@@ -79,7 +83,8 @@ struct ggml_context * SplitLoad::load(llama_model_loader & ml) {
     const char * fname_split = base_split.splits[idx].c_str();
     LLAMA_LOG_INFO("loading split-file %s\n", fname_split);
 
-    gguf_file_load     split_gguf = gguf_file_load(load_split_gguf(&ctx, fname_split, load_input, base_split.splits));
+    gguf_file_load     split_gguf =
+        gguf_file_load(load_split_gguf(&ctx, fname_split, load_input, base_split.splits, ml.use_direct_io));
     gguf_context_ptr & split_meta = split_gguf.meta;
 
     if (idx > 0) {

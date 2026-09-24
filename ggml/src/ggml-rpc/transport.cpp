@@ -12,7 +12,7 @@
 #  include <arpa/inet.h>
 #  include <errno.h>
 #  include <fcntl.h>
-#  include <sys/select.h>
+#  include <poll.h>
 #  include <sys/socket.h>
 #  include <sys/types.h>
 #  include <netinet/in.h>
@@ -20,6 +20,7 @@
 #  include <netdb.h>
 #  include <unistd.h>
 #endif
+#include <algorithm>
 #include <chrono>
 #include <cstdlib>
 #include <mutex>
@@ -29,9 +30,6 @@
 #ifdef GGML_RPC_RDMA
 #  include <infiniband/verbs.h>
 #  include <time.h>
-#  ifndef _WIN32
-#    include <poll.h>
-#  endif
 #endif // GGML_RPC_RDMA
 
 #ifdef _WIN32
@@ -483,7 +481,11 @@ bool socket_t::impl::send_data(const void * data, size_t size) {
     size_t bytes_sent = 0;
     while (bytes_sent < size) {
         size_t size_to_send = std::min(size - bytes_sent, MAX_CHUNK_SIZE);
-        ssize_t n = send(fd, (const char *)data + bytes_sent, size_to_send, 0);
+        int flags = 0;
+#ifdef MSG_NOSIGNAL
+        flags = MSG_NOSIGNAL;
+#endif
+        ssize_t n = send(fd, (const char *)data + bytes_sent, size_to_send, flags);
         if (n < 0) {
             GGML_LOG_ERROR("send failed (bytes_sent=%zu, size_to_send=%zu)\n",
                            bytes_sent, size_to_send);
@@ -613,6 +615,18 @@ bool socket_t::set_timeout(int timeout_ms) {
     return pimpl->set_timeout(timeout_ms);
 }
 
+void socket_t::shutdown() {
+#ifdef _WIN32
+    if (pimpl->fd != INVALID_SOCKET) {
+        ::shutdown(pimpl->fd, SD_BOTH);
+    }
+#else
+    if (pimpl->fd >= 0) {
+        ::shutdown(pimpl->fd, SHUT_RDWR);
+    }
+#endif
+}
+
 void socket_t::get_caps(uint8_t * local_caps) {
     return pimpl->get_caps(local_caps);
 }
@@ -637,11 +651,29 @@ static void close_socket(sockfd_t sockfd) {
 #endif
 }
 
+static bool socket_error_is_interrupted() {
+#ifdef _WIN32
+    return WSAGetLastError() == WSAEINTR;
+#else
+    return errno == EINTR;
+#endif
+}
+
 static bool set_no_delay(sockfd_t sockfd) {
     int flag = 1;
     // set TCP_NODELAY to disable Nagle's algorithm
     int ret = setsockopt(sockfd, IPPROTO_TCP, TCP_NODELAY, (char *)&flag, sizeof(int));
     return ret == 0;
+}
+
+static bool set_no_sigpipe(sockfd_t sockfd) {
+#if !defined(_WIN32) && !defined(MSG_NOSIGNAL) && defined(SO_NOSIGPIPE)
+    int flag = 1;
+    return setsockopt(sockfd, SOL_SOCKET, SO_NOSIGPIPE, (char *)&flag, sizeof(int)) == 0;
+#else
+    (void) sockfd;
+    return true;
+#endif
 }
 
 static bool set_non_blocking(sockfd_t sockfd, bool enabled) {
@@ -663,38 +695,76 @@ static bool set_reuse_addr(sockfd_t sockfd) {
     return ret == 0;
 }
 
-socket_ptr socket_t::accept(int timeout_ms) {
-    if (timeout_ms >= 0) {
-        fd_set readfds;
-        FD_ZERO(&readfds);
-        FD_SET(pimpl->fd, &readfds);
-
-        struct timeval timeout = {
-            /*.tv_sec  =*/ timeout_ms / 1000,
-            /*.tv_usec =*/ (timeout_ms % 1000) * 1000,
-        };
-#ifdef _WIN32
-        const int ready = select(0, &readfds, NULL, NULL, &timeout);
-#else
-        const int ready = select(pimpl->fd + 1, &readfds, NULL, NULL, &timeout);
-#endif
-        if (ready <= 0) {
-            if (ready < 0) {
-                GGML_LOG_ERROR("Failed to wait for incoming connection\n");
+socket_ptr socket_t::accept(int timeout_ms, bool * timed_out) {
+    if (timed_out != nullptr) {
+        *timed_out = false;
+    }
+    auto deadline = std::chrono::steady_clock::time_point::max();
+    if (timeout_ms > 0) {
+        deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+    }
+    while (true) {
+        if (timeout_ms >= 0) {
+            int wait_ms = timeout_ms;
+            if (timeout_ms > 0) {
+                const auto remaining = deadline - std::chrono::steady_clock::now();
+                if (remaining <= std::chrono::steady_clock::duration::zero()) {
+                    if (timed_out != nullptr) {
+                        *timed_out = true;
+                    }
+                    return nullptr;
+                }
+                wait_ms = std::max(1, (int) std::chrono::duration_cast<std::chrono::milliseconds>(remaining).count());
             }
+#ifdef _WIN32
+            fd_set readfds;
+            FD_ZERO(&readfds);
+            FD_SET(pimpl->fd, &readfds);
+
+            struct timeval timeout = {
+                /*.tv_sec  =*/ wait_ms / 1000,
+                /*.tv_usec =*/ (wait_ms % 1000) * 1000,
+            };
+            const int ready = select(0, &readfds, NULL, NULL, &timeout);
+#else
+            struct pollfd pfd   = { pimpl->fd, POLLIN, 0 };
+            const int     ready = poll(&pfd, 1, wait_ms);
+#endif
+            if (ready == 0) {
+                if (timed_out != nullptr) {
+                    *timed_out = true;
+                }
+                return nullptr;
+            }
+            if (ready < 0) {
+                if (socket_error_is_interrupted()) {
+                    continue;
+                }
+                GGML_LOG_ERROR("Failed to wait for incoming connection\n");
+                return nullptr;
+            }
+        }
+
+        auto client_socket_fd = ::accept(pimpl->fd, NULL, NULL);
+        if (!is_valid_fd(client_socket_fd)) {
+            if (socket_error_is_interrupted()) {
+                continue;
+            }
+            GGML_LOG_ERROR("Failed to accept incoming connection\n");
             return nullptr;
         }
+        if (!set_no_delay(client_socket_fd)) {
+            GGML_LOG_ERROR("Failed to set TCP_NODELAY\n");
+            close_socket(client_socket_fd);
+            return nullptr;
+        }
+        if (!set_no_sigpipe(client_socket_fd)) {
+            GGML_LOG_ERROR("Failed to suppress SIGPIPE\n");
+            close_socket(client_socket_fd);
+            return nullptr;
+        }
+        return socket_ptr(new socket_t(std::make_unique<impl>(client_socket_fd)));
     }
-
-    auto client_socket_fd = ::accept(pimpl->fd, NULL, NULL);
-    if (!is_valid_fd(client_socket_fd)) {
-        return nullptr;
-    }
-    if (!set_no_delay(client_socket_fd)) {
-        GGML_LOG_ERROR("Failed to set TCP_NODELAY\n");
-        return nullptr;
-    }
-    return socket_ptr(new socket_t(std::make_unique<impl>(client_socket_fd)));
 }
 
 socket_ptr socket_t::create_server(const char * host, int port) {
@@ -757,6 +827,7 @@ socket_ptr socket_t::connect(const char * host, int port, int timeout_ms) {
                 return fail();
             }
 #endif
+#ifdef _WIN32
             fd_set writefds;
             FD_ZERO(&writefds);
             FD_SET(sockfd, &writefds);
@@ -764,10 +835,10 @@ socket_ptr socket_t::connect(const char * host, int port, int timeout_ms) {
                 /*.tv_sec  =*/ timeout_ms / 1000,
                 /*.tv_usec =*/ (timeout_ms % 1000) * 1000,
             };
-#ifdef _WIN32
             const int ready = select(0, NULL, &writefds, NULL, &timeout);
 #else
-            const int ready = select(sockfd + 1, NULL, &writefds, NULL, &timeout);
+            struct pollfd pfd   = { sockfd, POLLOUT, 0 };
+            const int     ready = poll(&pfd, 1, timeout_ms);
 #endif
             if (ready <= 0) {
                 return fail();
@@ -793,26 +864,31 @@ socket_ptr socket_t::connect(const char * host, int port, int timeout_ms) {
         GGML_LOG_ERROR("Failed to set TCP_NODELAY\n");
         return fail();
     }
+    if (!set_no_sigpipe(sockfd)) {
+        GGML_LOG_ERROR("Failed to suppress SIGPIPE\n");
+        return fail();
+    }
     return socket_ptr(new socket_t(std::make_unique<impl>(sockfd)));
 }
 
 #ifdef _WIN32
 static std::mutex g_rpc_transport_mu;
-static bool g_rpc_transport_wsa_started = false;
+static size_t     g_rpc_transport_users = 0;
 #endif
 
 bool rpc_transport_init() {
 #ifdef _WIN32
     std::lock_guard<std::mutex> lock(g_rpc_transport_mu);
-    if (g_rpc_transport_wsa_started) {
+    if (g_rpc_transport_users > 0) {
+        g_rpc_transport_users++;
         return true;
     }
     WSADATA wsaData;
-    int res = WSAStartup(MAKEWORD(2, 2), &wsaData);
+    int     res = WSAStartup(MAKEWORD(2, 2), &wsaData);
     if (res != 0) {
         return false;
     }
-    g_rpc_transport_wsa_started = true;
+    g_rpc_transport_users = 1;
     return true;
 #else
     return true;
@@ -822,10 +898,13 @@ bool rpc_transport_init() {
 void rpc_transport_shutdown() {
 #ifdef _WIN32
     std::lock_guard<std::mutex> lock(g_rpc_transport_mu);
-    if (!g_rpc_transport_wsa_started) {
+    if (g_rpc_transport_users == 0) {
+        return;
+    }
+    g_rpc_transport_users--;
+    if (g_rpc_transport_users > 0) {
         return;
     }
     WSACleanup();
-    g_rpc_transport_wsa_started = false;
 #endif
 }
