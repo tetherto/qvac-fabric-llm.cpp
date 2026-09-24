@@ -106,10 +106,11 @@ lifetime, keyed by the tensor's data pointer and shape.
 1. The scheduler has placed the ops here because `supports_op` claimed them.
 2. `graph_compute` pre-scans the chunk and plans a fused run for every complete
    recurrent layer it finds.
-3. The dispatch loop runs the rest of the chunk: projections on the decode GEMV
-   (projections that read the same activation are grouped into one dispatch),
-   prefill kernels where they apply, and the host glue batched over runs of
-   consecutive host ops.
+3. The dispatch loop runs the rest of the chunk: the projections outside the
+   fused layers (on the host by default, or on the decode GEMV with
+   `GGML_XDNA_GEMV_GROUP=1`, which groups the projections reading the same
+   activation into one dispatch), prefill kernels where they apply, and the
+   host glue batched over runs of consecutive host ops.
 4. At a layer's fire point the fused run executes and writes `h_attn`/`h_out`
    directly into the layer's add tensors; the layer's own conv/gdn/ffn nodes are
    marked consumed and skipped.
@@ -123,12 +124,22 @@ Measured on npu2 (Ryzen AI MAX+ 395), Qwen3.5-0.8B-Q4_K_M, llama-server with
 `-np 1 -b 4096 -ub 4096 --flash-attn off`, requests at `temperature 0`,
 `top_k 1` and `cache_prompt false`.
 
-**Decode does not reproduce run to run.** The same prompt and seed give
-different output about one run in three. This is not state carried between
-requests: three separate server processes, one request each, disagree the same
-way, at a ~1k prompt and at a ~4k one alike. The text stays coherent, so it
-reads as a plausible answer rather than an obvious fault. `GGML_XDNA_CONV=0`
-does not change it, and the per-op decode path is the only arm that repeats.
+**`GGML_XDNA_GEMV_GROUP=1` does not reproduce run to run.** With the
+projections outside the fused layers on the decode GEMV, separate processes
+given the same prompt and seed sometimes disagree: 2 of 120 runs produced a
+different set of logits. The default path, which keeps those projections on
+the host, has not been caught doing it in 48 runs, and is also the faster of
+the two, so the array route is off unless the switch asks for it. Keeping it
+reachable matters for measuring NPU residency and power, where the work
+belongs on the device; we are still looking for the cause and will update this
+when we know more.
+
+Measure this on the logits, not on the generated text. The perturbation is
+small enough that the argmax token is usually unchanged, so the output is
+byte-identical while the numbers behind it are not. In one series of 12 runs
+every one of 256 positions picked the same token in all 12, and the top-5
+logprobs still split 11 to 1. Ask `llama-server` for `n_probs` and compare
+those.
 
 **The per-op decode path is reproducible but wrong.** With
 `GGML_XDNA_FUSED_LAYER=0` three runs agree byte for byte and all three are
@@ -220,8 +231,10 @@ OMP_WAIT_POLICY=PASSIVE ./build/bin/llama-server -m model.gguf \
 
 ### Environment
 
-The knobs below are for bisecting a regression rather than tuning: each one
-disables the NPU path it names, and the default is the fast one.
+The knobs below are for bisecting a regression rather than tuning. The ones
+that default to `1` name an NPU path that `0` disables; the ones that default
+to `0` name a path that `1` turns on. Either way the default is the arm the
+backend is tested on.
 
 | variable | default | effect |
 | :-- | :-- | :-- |
@@ -234,6 +247,7 @@ disables the NPU path it names, and the default is the fast one.
 | `GGML_XDNA_GDN` | 0 | `1` runs the GDN prefill body on the array |
 | `GGML_XDNA_FA` | 0 | `1` runs flash-attention prefill on the array |
 | `GGML_XDNA_GEMV_PROMOTE` | 1 | `0` stops one GEMV dispatch mixing weight formats |
+| `GGML_XDNA_GEMV_GROUP` | 0 | `1` moves the projections outside the fused layers onto the decode GEMV; slower, and not reproducible - see the limitations |
 | `GGML_XDNA_SPIN` | 1 | `0` blocks for kernel completion instead of polling |
 
 ## Troubleshooting
