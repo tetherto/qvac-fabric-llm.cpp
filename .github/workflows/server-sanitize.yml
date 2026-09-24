@@ -36,6 +36,9 @@ env:
   LLAMA_ARG_LOG_PREFIX: 1
   LLAMA_ARG_LOG_TIMESTAMPS: 1
   LLAMA_ARG_LOG_VERBOSITY: 10
+  # QVAC-25533: fleet hosts are shared. With one thread per core, one descheduled thread stalls every graph node.
+  LLAMA_ARG_THREADS: 4
+  OMP_WAIT_POLICY: PASSIVE
 
 # QVAC divergence from upstream. Reachable outcomes:
 #
