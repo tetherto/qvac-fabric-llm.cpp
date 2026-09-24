@@ -1,0 +1,35 @@
+# Specialized GitHub Actions runner labels for qvac-fabric-llm.cpp CI.
+# Edit this file, then run: node .github/scripts/sync-runner-names.mjs
+#
+# SCOPE (QVAC-14347 rollout): this catalog governs the QVAC self-hosted fleet
+# labels (`qvac-*`) used by QVAC-authored workflows. It deliberately does NOT
+# manage:
+#   - GitHub rolling aliases (ubuntu-latest, macos-latest, windows-latest)
+#   - upstream llama.cpp hosted images (ubuntu-24.04, windows-2025, macos-26, …)
+#   - upstream / third-party self-hosted pools that are not the QVAC fleet
+#     ([self-hosted, Linux, Intel], ah-* Actuated runners, ai-run-*). Those live
+#     in upstream-synced workflows; centralizing them would diverge this fork
+#     from ggml-org/llama.cpp.
+#
+# QVAC-24501 amends that last point for the pools this fork cannot reach at all.
+# [self-hosted, llama-server, …] matches no runner here, so server-self-hosted
+# and server-sanitize queued 24h and were cancelled on every run since the fork
+# was created. Those jobs now use fleet labels from this catalog. Diverging from
+# upstream is the lesser cost against CI that has never produced a result.
+# ah-* and ai-run-* pools stay upstream's: the jobs on them are disabled where
+# no fleet hardware matches, not repointed.
+#
+# FORMAT CONTRACT: a flat `key: value # comment` list, one entry per line. The
+# parser (.github/scripts/lib/runner-names.mjs) is line-based, not YAML. A value
+# is EITHER a bare single label OR a flow array of bare tokens. Do not quote
+# values or nest maps (the parser fails loudly).
+#
+# It also does NOT manage `matrix.os` identities or `matrix.os == '...'`
+# conditionals (frozen logical identities).
+
+# QVAC self-hosted fleet
+qvac_ubuntu2404_x64: qvac-ubuntu2404-x64 # Self-hosted Ubuntu 24.04 x64 CPU
+qvac_ubuntu2204_x64: qvac-ubuntu2204-x64 # Self-hosted Ubuntu 22.04 x64 CPU
+qvac_ubuntu2204_x64_gpu: qvac-ubuntu2204-x64-gpu # Self-hosted Ubuntu 22.04 x64 NVIDIA GPU
+qvac_ubuntu2404_x64_gpu: qvac-ubuntu2404-x64-gpu # Self-hosted Ubuntu 24.04 x64 NVIDIA GPU
+qvac_macos26_arm64_gpu: qvac-macos26-arm64-gpu # Self-hosted Apple Silicon GPU/Metal

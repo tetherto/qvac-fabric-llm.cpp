@@ -51,21 +51,28 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  runner_names:
+    permissions:
+      contents: read
+    uses: ./.github/workflows/reusable-runner-names.yml
+
   authorize:
     permissions: {}
     uses: ./.github/workflows/reusable-authorize-self-hosted.yml
 
   ui-build:
     name: Build static output
-    needs: authorize
+    needs: [authorize, runner_names]
     if: needs.authorize.outputs.allowed == 'true'
     uses: ./.github/workflows/ui-build-self-hosted.yml
+    with:
+      runs_on: ${{ needs.runner_names.outputs.qvac_ubuntu2404_x64 }}
 
   ui-checks:
     name: Checks
-    needs: [ui-build, authorize]
+    needs: [ui-build, authorize, runner_names]
     if: needs.authorize.outputs.allowed == 'true'
-    runs-on: qvac-ubuntu2404-x64
+    runs-on: ${{ needs.runner_names.outputs.qvac_ubuntu2404_x64 }}
     continue-on-error: true
     timeout-minutes: 30
     steps:
@@ -113,9 +120,9 @@ jobs:
 
   e2e-tests:
     name: E2E Tests
-    needs: [ui-build, authorize]
+    needs: [ui-build, authorize, runner_names]
     if: needs.authorize.outputs.allowed == 'true'
-    runs-on: qvac-ubuntu2404-x64
+    runs-on: ${{ needs.runner_names.outputs.qvac_ubuntu2404_x64 }}
     timeout-minutes: 30
     steps:
       - name: Checkout code

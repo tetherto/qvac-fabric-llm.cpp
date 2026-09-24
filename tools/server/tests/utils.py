@@ -287,6 +287,11 @@ class ServerProcess:
             server_args.append("--backend_sampling")
         if self.gcp_compat:
             env["AIP_MODE"] = "PREDICTION"
+            # QVAC-24501: the GCP compat path reads its port from AIP_HTTP_PORT
+            # and discards --port (tools/server/server-http.cpp:72), defaulting
+            # to 8080. Without this, PORT is ignored and every gcp test binds
+            # 8080 - which collides with any co-located job on a fleet host.
+            env["AIP_HTTP_PORT"] = str(self.server_port)
 
         args = [str(arg) for arg in [server_path, *server_args]]
         print(f"tests: starting server with: {' '.join(args)}")

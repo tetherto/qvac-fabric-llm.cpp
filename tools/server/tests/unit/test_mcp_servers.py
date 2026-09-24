@@ -37,7 +37,10 @@ def _start_server_with_mcp(mcp_json: str, **kwargs) -> ServerProcess:
     srv = ServerPreset.router()
     srv.server_tools = "all"
     srv.no_ui = True
-    srv.server_port = 8085  # avoid conflict with load_all() which uses 8080
+    # QVAC-24501: offset from the port ServerProcess resolved, never a literal -
+    # a literal ignores PORT and can reach another job's llama-server on a shared
+    # fleet host. Still clear of load_all()'s server, which uses the base port.
+    srv.server_port += 5
     srv.mcp_servers_json = mcp_json
     for k, v in kwargs.items():
         setattr(srv, k, v)
@@ -183,7 +186,7 @@ def test_mcp_tools_not_listed_when_not_configured():
     server = ServerPreset.router()
     server.server_tools = "all"
     server.no_ui = True
-    server.server_port = 8085
+    server.server_port += 5  # see _start_server_with_mcp
     server.start()
 
     try:
@@ -250,7 +253,7 @@ def test_mcp_tools_via_json_config_file():
         server = ServerPreset.router()
         server.server_tools = "all"
         server.no_ui = True
-        server.server_port = 8085
+        server.server_port += 5  # see _start_server_with_mcp
         server.mcp_servers_config = config_path
         server.start()
 
@@ -468,7 +471,7 @@ def test_mcp_config_file_errors():
     server = ServerPreset.router()
     server.server_tools = "all"
     server.no_ui = True
-    server.server_port = 8085
+    server.server_port += 5  # see _start_server_with_mcp
     server.mcp_servers_json = "not valid json"
     try:
         server.start()
@@ -480,7 +483,7 @@ def test_mcp_config_file_errors():
     server = ServerPreset.router()
     server.server_tools = "all"
     server.no_ui = True
-    server.server_port = 8085
+    server.server_port += 5  # see _start_server_with_mcp
     server.mcp_servers_config = "/nonexistent/path.json"
     try:
         server.start()

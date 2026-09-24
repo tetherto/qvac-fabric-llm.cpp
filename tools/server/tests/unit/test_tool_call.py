@@ -21,7 +21,10 @@ def create_server():
     global server
     server = ServerPreset.tinyllama2()
     server.model_alias = "tinyllama-2-tool-call"
-    server.server_port = 8081
+    # QVAC-24501: offset from the port ServerProcess resolved, never a literal.
+    # A literal ignores PORT, and fleet hosts run several runner accounts side
+    # by side, so a fixed port can reach another job's llama-server.
+    server.server_port += 1
     server.n_slots = 1
     server.n_ctx = 8192
     server.n_batch = 2048
