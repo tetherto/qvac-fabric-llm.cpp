@@ -3698,6 +3698,8 @@ kernel void kernel_gated_delta_net_impl(
 
     const uint i01 = i21 % args.ne01;
     const uint i11 = i21 % args.ne11;
+    const uint iq3 = i23 / (args.ne23 / args.ne03);
+    const uint ik3 = i23 / (args.ne23 / args.ne13);
 
     const float scale = 1.0f / sqrt((float)S_v);
 
@@ -3709,8 +3711,8 @@ kernel void kernel_gated_delta_net_impl(
 
     device float * dst_attn = (device float *) (dst) + (i23*args.ne22*args.ne21 + i21)*S_v + i20;
 
-    device const float * q_ptr = (device const float *) (q + i23*args.nb03 + i01*args.nb01);
-    device const float * k_ptr = (device const float *) (k + i23*args.nb13 + i11*args.nb11);
+    device const float * q_ptr = (device const float *) (q + iq3*args.nb03 + i01*args.nb01);
+    device const float * k_ptr = (device const float *) (k + ik3*args.nb13 + i11*args.nb11);
     device const float * v_ptr = (device const float *) (v + i23*args.nb23 + i21*args.nb21);
 
     device const float * b_ptr = (device const float *) (b) + (i23*args.ne22*args.ne21 + i21);
@@ -3872,6 +3874,7 @@ SOFTWARE.
 #define PROCESS_CHUNK_SG(B, S_tile, VALID)                                     \
   {                                                                            \
     const short valid_rows = (VALID);                                          \
+    simdgroup_barrier(mem_flags::mem_threadgroup);                             \
                                                                                \
     float g_val = (thread_index_in_simdgroup < (uint)valid_rows)               \
         ? g_[thread_index_in_simdgroup * Hv + hv_idx]                                                      \
@@ -3949,8 +3952,8 @@ SOFTWARE.
     simdgroup_multiply_accumulate(out_tile, QKt_tile, delta_tile, tmp_tile);   \
                                                                                \
     if (fm < valid_rows) {                                                     \
-      y[fm * Hv * Dv + dv_idx + fn] = AT(out_tile, 0) * (1.0f / sqrt(128.0f));       \
-      y[fm * Hv * Dv + dv_idx + fn + 1] = AT(out_tile, 1) * (1.0f / sqrt(128.0f));   \
+      y[ulong(fm) * ulong(Hv) * ulong(Dv) + ulong(dv_idx) + ulong(fn)] = AT(out_tile, 0) * (1.0f / sqrt(128.0f));       \
+      y[ulong(fm) * ulong(Hv) * ulong(Dv) + ulong(dv_idx) + ulong(fn + 1)] = AT(out_tile, 1) * (1.0f / sqrt(128.0f));   \
     }                                                                          \
                                                                                \
     _Pragma("clang loop unroll(full)")                                                      \
@@ -3979,7 +3982,7 @@ kernel void kernel_gated_delta_net_mlx_c8(
   const int Hk = args.ne01;
   const int Hv = args.ne21;
   const int T = args.ne22;
-  const int n = tgpig.z * Hv + tgpig.y;
+  const ulong n = ulong(tgpig.z) * ulong(Hv) + ulong(tgpig.y);
   const int b_idx = tgpig.z;
   const int hv_idx = tgpig.y;
   const int hk_idx = hv_idx % Hk;
@@ -3995,22 +3998,22 @@ kernel void kernel_gated_delta_net_mlx_c8(
 
   // set up pointers
   // g: [B, T, Hv] (log gate)
-  auto g_ = g + b_idx * T * Hv;
+  auto g_ = g + ulong(b_idx) * ulong(T) * ulong(Hv);
 
   // q, k: [B, T, Hk, Dk]
-  auto q_ = q + b_idx * T * Hk * Dk + hk_idx * Dk;
-  auto k_ = k + b_idx * T * Hk * Dk + hk_idx * Dk;
+  auto q_ = q + ulong(b_idx) * (args.nb03 / sizeof(float)) + ulong(hk_idx) * (args.nb01 / sizeof(float));
+  auto k_ = k + ulong(b_idx) * (args.nb13 / sizeof(float)) + ulong(hk_idx) * (args.nb11 / sizeof(float));
 
   // v, y: [B, T, Hv, Dv]
   device float* out_base = y;
-  y += b_idx * T * Hv * Dv + hv_idx * Dv;
-  auto v_ = v + b_idx * (args.nb23 / sizeof(float)) + hv_idx * (args.nb21 / sizeof(float));
-  auto beta_ = beta + b_idx * T * Hv;
+  y += ulong(b_idx) * ulong(T) * ulong(Hv) * ulong(Dv) + ulong(hv_idx) * ulong(Dv);
+  auto v_ = v + ulong(b_idx) * (args.nb23 / sizeof(float)) + ulong(hv_idx) * (args.nb21 / sizeof(float));
+  auto beta_ = beta + ulong(b_idx) * ulong(T) * ulong(Hv);
 
   // state_in, state_out: [B, Hv, Dv, Dk]
-  auto i_state = state_in + (n * Dv + dv_idx) * Dk;
-  const uint attn_size = T * Hv * Dv * args.ne23;
-  auto o_state = (args.fuse_cache ? cache : out_base + attn_size) + (n * Dv + dv_idx) * Dk;
+  auto i_state = state_in + (n * ulong(Dv) + ulong(dv_idx)) * ulong(Dk);
+  const ulong attn_size = ulong(T) * ulong(Hv) * ulong(Dv) * ulong(args.ne23);
+  auto o_state = (args.fuse_cache ? cache : out_base + attn_size) + (n * ulong(Dv) + ulong(dv_idx)) * ulong(Dk);
 
   simdgroup_float8x8 S_tile[Dk / 8];
 
@@ -4040,7 +4043,6 @@ kernel void kernel_gated_delta_net_mlx_c8(
   }
 
   int t = 0;
-  _Pragma("clang loop unroll(full)")
   for (; t + C <= T; t += C) {
     PROCESS_CHUNK_SG(false, S_tile, C);
     q_ += C * Hk * Dk;

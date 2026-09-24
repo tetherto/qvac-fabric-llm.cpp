@@ -56,6 +56,7 @@ struct ggml_metal_pipeline_with_params {
 
     bool c4;
     bool cnt;
+    bool gdn_c8;
 
     int nth;
 };
