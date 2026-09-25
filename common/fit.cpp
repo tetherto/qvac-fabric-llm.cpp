@@ -1,17 +1,18 @@
 #include "fit.h"
 
-#include "../src/llama-ext.h"
-#include "llama-cpp.h"
 #include "log.h"
+#include "llama-cpp.h"
 
-#include <algorithm>
+#include "../src/llama-ext.h"
+
 #include <array>
+#include <algorithm>
 #include <cassert>
-#include <cinttypes>
 #include <exception>
-#include <mutex>
-#include <set>
 #include <stdexcept>
+#include <cinttypes>
+#include <set>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -50,6 +51,8 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
         std::exception_ptr callback_exception;
         std::mutex         callback_exception_mutex;
 
+        // Do not let a throwing callback unwind through llama's extern "C" frames: on MSVC that
+        // skipped the logger restore. Capture it here and rethrow from C++ after each call.
         void log(ggml_log_level level, const char * text) {
             try {
                 const ggml_log_level level_eff = level >= min_level ? level : GGML_LOG_LEVEL_DEBUG;
@@ -77,9 +80,9 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
     llama_log_get(&ud.original_logger.callback, &ud.original_logger.user_data);
     ud.min_level = log_level;
 
-    llama_log_set([](ggml_log_level level, const char * text,
-                     void * user_data) { ((user_data_t *) user_data)->log(level, text); },
-                  &ud);
+    llama_log_set([](ggml_log_level level, const char * text, void * user_data) {
+        ((user_data_t *) user_data)->log(level, text);
+    }, &ud);
 
     llama_model_params mparams_copy = *mparams;
     mparams_copy.no_alloc  = true;
@@ -129,6 +132,7 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
     {
         ggml_backend_dev_t cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
         if (cpu_dev == nullptr) {
+            ud.rethrow_callback_exception();
             throw std::runtime_error("no CPU backend found");
         }
         size_t free;

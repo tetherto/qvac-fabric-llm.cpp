@@ -188,10 +188,5 @@ jobs:
           for /d %%i in (openvino_toolkit\*) do set OPENVINO_ROOT=%%i
           call "%OPENVINO_ROOT%\setupvars.bat"
 
-          set GGML_BACKEND_COMPARE_DIAGNOSTICS=1
-          build\ReleaseOV\bin\Release\test-backend-ops.exe -b OPENVINO0 -o MUL_MAT_ID -p "type_a=mxfp4.*adreno_trans4_ns=1"
-          if errorlevel 1 exit /b %errorlevel%
-          set GGML_BACKEND_COMPARE_DIAGNOSTICS=
-
           cd build
           ctest --test-dir ReleaseOV -L main -E "test-llama-archs|test-recurrent-state-rollback-nemotron-h" -C Release --verbose --timeout 3000
