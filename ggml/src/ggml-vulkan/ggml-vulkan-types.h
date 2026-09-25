@@ -56,6 +56,7 @@ typedef struct VkPhysicalDeviceCooperativeMatrixDecodeVectorFeaturesNV {
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cerrno>
 
 #include <cmath>
@@ -1626,6 +1627,8 @@ struct ggml_backend_vk_context {
     bool fused_topk_qsa {};
     bool fused_hc_post_gate {};
     rms_norm_mode fused_rms_norm_mode {RMS_NORM_COUNT};
+    bool fused_fwht_signed {};
+    std::atomic<uint64_t> fwht_fusion_count {};
 
     // for GGML_VK_PERF_LOGGER
     std::unique_ptr<vk_perf_logger> perf_logger;
