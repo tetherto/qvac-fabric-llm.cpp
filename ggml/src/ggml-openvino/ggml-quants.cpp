@@ -991,7 +991,8 @@ OvWeight process_weight_tensor(const ggml_tensor * tensor, const void * data, vo
     const bool for_gather_matmul = tensor->ne[2] > 1;
     const bool zp_is_f16 = !layout.is_requant && (use_bias || for_gather_matmul);
 
-    const bool is_3d_mxfp4_moe = tensor->type == GGML_TYPE_MXFP4 && (tensor->ne[2] > 1 || tensor->ne[3] > 1);
+    const bool is_3d_mxfp4_moe = tensor->type == GGML_TYPE_MXFP4 && (tensor->ne[2] > 1 || tensor->ne[3] > 1) &&
+                                 ggml_openvino_mxfp4_moe_use_packed();
     if (is_3d_mxfp4_moe) {
         ov::Shape packed_shape = {static_cast<size_t>(tensor->ne[3]),
                                   static_cast<size_t>(tensor->ne[2]),

@@ -80,6 +80,10 @@ void ggml_openvino_init_device_config();
 // Get the device name
 const std::string & ggml_openvino_get_device_name();
 
+// Whether 3D MXFP4 MoE experts keep the packed ggml block layout (GPU only). Other devices
+// extract them into the f4e2m1/f8e8m0 chain that fuses into GatherMatmulCompressed.
+bool ggml_openvino_mxfp4_moe_use_packed();
+
 // Environment variable accessors. All GGML_OPENVINO_* env vars are read once
 // during backend init and cached on the device config; consumers must go
 // through these helpers (never call ::getenv directly) so behavior stays
