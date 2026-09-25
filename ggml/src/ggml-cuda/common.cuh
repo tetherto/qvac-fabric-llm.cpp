@@ -741,6 +741,20 @@ static __device__ __forceinline__ int ggml_cuda_dp4a(const int a, const int b, i
 #endif // defined(GGML_USE_HIP)
 }
 
+// c += dot(a as 4 unsigned bytes, b as 4 signed bytes). Used by the ternary paths that keep the raw
+// digits {0,1,2} and subtract the exact integer activation sum once per block instead of biasing
+// every word (two SIMD ops per 4 weights). PTX dp4a takes mixed .u32.s32 operand types directly.
+static __device__ __forceinline__ int ggml_cuda_dp4a_us(const unsigned int a, const int b, int c) {
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && __CUDA_ARCH__ >= GGML_CUDA_CC_DP4A
+    asm("dp4a.u32.s32 %0, %1, %2, %3;" : "=r"(c) : "r"(a), "r"(b), "r"(c));
+    return c;
+#else
+    const uint8_t * a8 = (const uint8_t *) &a;
+    const int8_t  * b8 = (const int8_t *)  &b;
+    return c + (int) a8[0]*b8[0] + (int) a8[1]*b8[1] + (int) a8[2]*b8[2] + (int) a8[3]*b8[3];
+#endif
+}
+
 static __device__ __forceinline__ void ggml_cuda_mad(float & acc, const float v, const float u) {
     acc += v*u;
 }
@@ -984,6 +998,94 @@ struct ggml_cuda_type_traits<GGML_TYPE_Q2_0> {
     static constexpr int qr = QR2_0;
     static constexpr int qi = QI2_0;
 };
+
+template<>
+struct ggml_cuda_type_traits<GGML_TYPE_PQ2_0> {
+    static constexpr int qk = QK_PQ2_0;
+    static constexpr int qr = QR_PQ2_0;
+    static constexpr int qi = QI_PQ2_0;
+};
+
+// Decode PTQ1_0 in the CPU codec's base-3 order.
+static __device__ __forceinline__ int ptq1_0_trit(const block_ptq1_0 * x, const int e) {
+    uint8_t b;
+    int n;
+    if (e < 80) {                       // qs[0..15], chunk of 16
+        b = x->qs[e & 15];              n = e >> 4;
+    } else if (e < 120) {               // qs[16..23], chunk of 8
+        const int t = e - 80;
+        b = x->qs[16 + (t & 7)];        n = t >> 3;
+    } else {                            // qh[0..1], four trits per byte
+        const int t = e - 120;
+        b = x->qh[t & 1];               n = t >> 1;
+    }
+
+    uint32_t v = b;
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        if (i < n) {
+            v = (v * 3) & 0xFF;
+        }
+    }
+    return (int) ((v * 3) >> 8) - 1;
+}
+
+template<>
+struct ggml_cuda_type_traits<GGML_TYPE_PTQ1_0> {
+    static constexpr int qk = QK_PTQ1_0;
+    static constexpr int qr = QR_PTQ1_0;
+    static constexpr int qi = QI_PTQ1_0;
+};
+
+// Activation (src1) q8_1 layouts produced by quantize_row_q8_1_cuda and consumed by the MMVQ kernels.
+// Every layout keeps block_q8_1's bytes per row, so launcher strides in block_q8_1 units are valid
+// for all three; only the byte order inside a column differs.
+enum ggml_cuda_q8_1_layout : int {
+    GGML_CUDA_Q8_1_AOS      = 0, // plain block_q8_1 array (every type except the PTQ1_0 cases below)
+    GGML_CUDA_Q8_1_SOA_ISUM = 1, // PTQ1_0, one column: warp-transposed, exact int sums (ggml_cuda_ptq1_q8_word)
+    GGML_CUDA_Q8_1_PT       = 2, // PTQ1_0, 2-8 columns or MoE ids: planar-transposed (mmvq-ptq1_0.cuh)
+};
+
+// The single decision both sides (quantizer, kernel) must agree on. Column count is the first
+// cut: 2-8 columns and MoE (ids) always take the planar-transposed kernel. One-column decode
+// is architecture-specific and is resolved on the host (ggml_cuda_q8_1_layout_host): this
+// constexpr helper only knows column count, so it reports the Ada default (SOA_ISUM at 1-col).
+static constexpr __host__ __device__ ggml_cuda_q8_1_layout ggml_cuda_q8_1_layout_for(ggml_type type_src0, int ncols_dst, bool has_ids) {
+#if defined(GGML_USE_HIP)
+    GGML_UNUSED(type_src0); GGML_UNUSED(ncols_dst); GGML_UNUSED(has_ids);
+    return GGML_CUDA_Q8_1_AOS;
+#else
+    if (type_src0 != GGML_TYPE_PTQ1_0) {
+        return GGML_CUDA_Q8_1_AOS;
+    }
+    return (ncols_dst == 1 && !has_ids) ? GGML_CUDA_Q8_1_SOA_ISUM : GGML_CUDA_Q8_1_PT;
+#endif
+}
+
+
+// Warp-transposed (SoA) q8_1 activation layout for the ternary MMVQ.
+//
+// One PTQ1_0 K-block (128 weights) consumes 4 block_q8_1 = 36 words (32 qs + 4 ds). In the
+// small-K MMVQ geometry each lane owns one K-block, so with the plain AoS layout a warp-wide
+// load of "word w" touches 32 lines 144 B apart: ~36 L1 wavefronts per instruction, ~1300 per
+// K-iteration against ~250 for the weights themselves. That LSU traffic, not GDDR, capped the
+// PTQ1 GEMV near 370 GB/s on Ada. Here K-blocks are grouped by 32 and word w of the group is
+// stored contiguously, so the same load is 32 consecutive words = 1 wavefront.
+// Bytes per column are unchanged when K is padded to a multiple of 32*128 = 4096.
+#define GGML_CUDA_PTQ1_Q8_GROUP_KB     32
+#define GGML_CUDA_PTQ1_Q8_WORDS_PER_KB 36
+#define GGML_CUDA_PTQ1_Q8_GROUP_WORDS  (GGML_CUDA_PTQ1_Q8_GROUP_KB * GGML_CUDA_PTQ1_Q8_WORDS_PER_KB)
+#define GGML_CUDA_PTQ1_K_PAD           (GGML_CUDA_PTQ1_Q8_GROUP_KB * QK_PTQ1_0)
+
+// Word offset (within one activation column) of word w (0..7 = qs words, 8 = ds) of block_q8_1 ib.
+static constexpr __host__ __device__ int ggml_cuda_ptq1_q8_word(int ib, int w) {
+    const int kb   = ib >> 2;
+    const int sub  = ib & 3;
+    const int g    = kb >> 5;
+    const int lane = kb & 31;
+    const int ww   = w < 8 ? sub * 8 + w : 32 + sub;
+    return g * GGML_CUDA_PTQ1_Q8_GROUP_WORDS + ww * GGML_CUDA_PTQ1_Q8_GROUP_KB + lane;
+}
 
 template<>
 struct ggml_cuda_type_traits<GGML_TYPE_Q4_0> {

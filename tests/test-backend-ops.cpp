@@ -11435,6 +11435,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F32, 8192, 1, 8192));
     test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F16, 4096, 1, 4096));
     test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F16, 8192, 1, 8192));
+    test_cases.emplace_back(new test_fwht_signed(512, 512, 1));
+    test_cases.emplace_back(new test_fwht_signed(512, 512, 1, GGML_TYPE_F16));
     test_cases.emplace_back(new test_fwht_signed(1024, 5120, 1));
     test_cases.emplace_back(new test_fwht_signed(1024, 5120, 32));
     test_cases.emplace_back(new test_fwht_signed(1024, 6144, 7, GGML_TYPE_F16));
@@ -11508,6 +11510,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_PTQ1_0, GGML_TYPE_F32, 4, 2, false, 70, n, 2048));
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_PQ2_0, GGML_TYPE_F32, 4, 2, false, 70, n, 2048));
     }
+    test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_PTQ1_0, GGML_GLU_OP_SWIGLU, 1, 8, 196608,
+        false, 1, 1, false, false, true, false, {1, 1}));
     test_cases.emplace_back(new test_ternary_f16_reference(GGML_TYPE_PTQ1_0, false));
     test_cases.emplace_back(new test_ternary_f16_reference(GGML_TYPE_PQ2_0, false));
     test_cases.emplace_back(new test_ternary_f16_reference(GGML_TYPE_PTQ1_0, true));
@@ -13037,6 +13041,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F32, 256, 2048, 256));
     test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F32, 512, 1, 512));
     test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F32, 512, 2048, 512));
+    test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F32, 1024, 1, 1024));
+    test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F32, 1024, 2048, 1024));
+    test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F32, 2048, 1, 2048));
+    test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F32, 2048, 2048, 2048));
 
     test_cases.emplace_back(new test_solve_tri(GGML_TYPE_F32, { 64, 64, 4, 4 }, { 32, 64, 4, 4 }));
     test_cases.emplace_back(new test_solve_tri(GGML_TYPE_F32, { 128, 128, 4, 2 }, { 32, 128, 4, 2 }));
