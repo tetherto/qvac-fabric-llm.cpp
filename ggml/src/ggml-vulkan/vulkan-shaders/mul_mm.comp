@@ -102,6 +102,9 @@ layout (binding = 0) readonly buffer BUF_Q3_K     { block_q3_K data[];     } a_q
 layout (binding = 0) readonly buffer BUF_Q4_K     { block_q4_K data[];     } a_q4_k;
 layout (binding = 0) readonly buffer BUF_Q5_K     { block_q5_K data[];     } a_q5_k;
 layout (binding = 0) readonly buffer BUF_Q6_K     { block_q6_K data[];     } a_q6_k;
+#if defined(ADRENO)
+layout (binding = 0) readonly buffer BUF_Q8_0     { block_q8_0 data[];     } a_q8_0;
+#endif
 layout (binding = 0) readonly buffer BUF_TQ1_0    { block_tq1_0 data[];    } a_tq1_0;
 layout (binding = 0) readonly buffer BUF_TQ2_0    { block_tq2_0 data[];    } a_tq2_0;
 // Packed16 aliases
@@ -200,6 +203,9 @@ shared FLOAT_TYPEV2 buf_b[BN * SHMEM_STRIDE];
 shared ACC_TYPE coopmat_stage[TM * TN * NUM_WARPS];
 #endif
 
+#if defined(DATA_A_PTQ1_0)
+#include "ptq1_0.glsl"
+#endif
 #include "mul_mm_id_funcs.glsl"
 #include "mul_mm_funcs.glsl"
 
@@ -362,86 +368,24 @@ void main() {
     }
 #endif
 
-    for (uint block = start_k; block < end_k; block += BK) {
-        [[unroll]] for (uint l = 0; l < BM; l += loadstride_a) {
-            load_a_to_shmem(pos_a, loadr_a, loadc_a + l, ir * BM + loadc_a + l, block, end_k);
-        }
-        #ifdef MUL_MAT_ID
-        if (gl_LocalInvocationID.x < required_work_items) {
-        #endif
-        [[unroll]] for (uint l = 0; l < BN; l += loadstride_b) {
+    // Only the last tile in M/N can hang past the end of A/B. Branch between two
+    // whole copies of the K loop so interior tiles keep a load path with no
+    // bounds checks and no branches around the tile loads.
+    const bool bounds_check_a = ir * BM + BM > p.M;
 #if !defined(MUL_MAT_ID)
-            load_b_to_shmem(pos_b, loadr_b, loadc_b + l, ic * BN + loadc_b + l, block, end_k);
+    const bool bounds_check_b = ic * BN + BN > p.N;
 #else
-            load_b_to_shmem(pos_b, loadr_b, loadc_b + l, ic, _ne1, block, end_k);
-#endif
-        }
-        #ifdef MUL_MAT_ID
-        }
-        #endif
-
-        barrier();
-
-        pos_a += BK / LOAD_VEC_A_EFF;
-        pos_b += BK / LOAD_VEC_B_EFF;
-
-#ifdef COOPMAT
-#ifdef MUL_MAT_ID
-        if (warp_c < required_warp_c) {
-#endif
-        [[unroll]] for (uint i = 0; i < BK; i += TK) {
-            [[unroll]] for (uint cm_row = 0; cm_row < cms_per_row; cm_row++) {
-                // Load from shared into cache
-                coopMatLoad(cache_a, buf_a, a_shmem_index(warp_r * WM + cm_row * TM, i / 2), a_shmem_stride(), gl_CooperativeMatrixLayoutRowMajor);
-
-                [[unroll]] for (uint cm_col = 0; cm_col < cms_per_col; cm_col++) {
-                    coopMatLoad(cache_b, buf_b, (warp_c * WN + cm_col * TN) * SHMEM_STRIDE + i / 2, SHMEM_STRIDE, gl_CooperativeMatrixLayoutColumnMajor);
-
-                    sums[cm_col * cms_per_row + cm_row] = coopMatMulAdd(cache_a, cache_b, sums[cm_col * cms_per_row + cm_row]);
-                }
-            }
-        }
-#ifdef MUL_MAT_ID
-        }
-#endif
-#else
-        [[unroll]] for (uint i = 0; i < BK / BK_STEP; i++) {
-            // Load from shared into cache
-            [[unroll]] for (uint wsir = 0; wsir < WMITER; wsir++) {
-                [[unroll]] for (uint j = 0; j < TM; j++) {
-                #if defined(DATA_A_F32) || defined(DATA_A_F16)
-                    cache_a[wsir * TM + j].xy = buf_a[(warp_r * WM + wsir * WSUBM + tiwr * TM + j) * SHMEM_STRIDE + 2 * i    ];
-                    cache_a[wsir * TM + j].zw = buf_a[(warp_r * WM + wsir * WSUBM + tiwr * TM + j) * SHMEM_STRIDE + 2 * i + 1];
-                #else
-                    cache_a[wsir * TM + j] = buf_a[(warp_r * WM + wsir * WSUBM + tiwr * TM + j) * SHMEM_STRIDE + i];
-                #endif
-                }
-            }
-
-            [[unroll]] for (uint wsic = 0; wsic < WNITER; wsic++) {
-                [[unroll]] for (uint cc = 0; cc < TN; cc++) {
-                #if defined(DATA_A_F32) || defined(DATA_A_F16)
-                    cache_b.xy = buf_b[(warp_c * WN + wsic * WSUBN + tiwc * TN + cc) * SHMEM_STRIDE + 2 * i    ];
-                    cache_b.zw = buf_b[(warp_c * WN + wsic * WSUBN + tiwc * TN + cc) * SHMEM_STRIDE + 2 * i + 1];
-                #else
-                    cache_b = buf_b[(warp_c * WN + wsic * WSUBN + tiwc * TN + cc) * SHMEM_STRIDE + i];
-                #endif
-
-                    [[unroll]] for (uint wsir = 0; wsir < WMITER; wsir++) {
-                        [[unroll]] for (uint cr = 0; cr < TM / 2; cr++) {
-                            // [WNITER][TN][WMITER][TM / 2] -> [wsic][cc][wsir][cr]
-                            const uint sums_idx = (wsic * TN + cc) * WMITER * (TM / 2) + wsir * (TM / 2) + cr;
-                            sums[sums_idx].x = dot_product(cache_a[wsir * TM + 2 * cr    ], cache_b, sums[sums_idx].x);
-                            sums[sums_idx].y = dot_product(cache_a[wsir * TM + 2 * cr + 1], cache_b, sums[sums_idx].y);
-                        }
-                    }
-                }
-            }
-
-        }
+    const bool bounds_check_b = ic * BN + BN > _ne1;
 #endif
 
-        barrier();
+    if (!bounds_check_a && !bounds_check_b) {
+#define MM_LOAD_BOUNDS_CHECK false
+#include "mul_mm_k_loop.glsl"
+#undef MM_LOAD_BOUNDS_CHECK
+    } else {
+#define MM_LOAD_BOUNDS_CHECK true
+#include "mul_mm_k_loop.glsl"
+#undef MM_LOAD_BOUNDS_CHECK
     }
 
 #if defined(ACC_TYPE_MAX)

@@ -1,6 +1,7 @@
 #include "ggml-metal-fusion.h"
 
 #include "ggml-backend-impl.h"
+#include "ggml-metal-common.h"
 #include "ggml-metal-device.h"
 
 #include <algorithm>
@@ -195,6 +196,66 @@ static bool ggml_metal_fusion_check_snake(
     return types_ok && shape_ok && dim_ok && contig_ok && x_in_add == x;
 }
 
+// true if the byte ranges of two tensors overlap in the same Metal buffer
+static bool ggml_metal_fusion_overlap(const ggml_tensor * a, const ggml_tensor * b) {
+    ggml_backend_buffer_t ba = a->view_src ? a->view_src->buffer : a->buffer;
+    ggml_backend_buffer_t bb = b->view_src ? b->view_src->buffer : b->buffer;
+
+    const ggml_metal_buffer_id bid_a = ggml_metal_buffer_get_id((ggml_metal_buffer_t) ba->context, a);
+    const ggml_metal_buffer_id bid_b = ggml_metal_buffer_get_id((ggml_metal_buffer_t) bb->context, b);
+
+    if (bid_a.metal == nullptr || bid_a.metal != bid_b.metal) {
+        return false;
+    }
+
+    return bid_a.offs <= bid_b.offs
+        ? bid_b.offs - bid_a.offs < ggml_nbytes(a)
+        : bid_a.offs - bid_b.offs < ggml_nbytes(b);
+}
+
+// MUL + MUL_MAT(hadamard): the sign vector folds into the FWHT kernel, so the MUL is elided.
+// the MUL_MAT reads the MUL through a RESHAPE, which is not a chain link, so the checks live
+// here (unsafe = true); the encoder verifies MUL/RESHAPE have no other consumers.
+static bool ggml_metal_fusion_check_fwht_signed(
+        const ggml_metal_fusion      * fusion,
+        const ggml_tensor * const    * nodes,
+              ggml_metal_fusion_mode   mode) {
+    GGML_UNUSED(fusion);
+
+    const ggml_tensor * mul     = nodes[0];
+    const ggml_tensor * mm      = nodes[1];
+    const ggml_tensor * reshape = mm->src[1];
+
+    if (reshape == nullptr || reshape->op != GGML_OP_RESHAPE || reshape->src[0] != mul ||
+        !ggml_metal_op_mul_mat_use_fwht(mm)) {
+        return false;
+    }
+
+    const ggml_tensor * x     = ggml_are_same_shape(mul, mul->src[0]) ? mul->src[0] : mul->src[1];
+    const ggml_tensor * signs = x == mul->src[0] ? mul->src[1] : mul->src[0];
+    const int64_t n = mm->src[0]->ne[0];
+
+    const bool ok =
+        signs->type == GGML_TYPE_F32 &&
+        signs->ne[1] == 1 && signs->ne[2] == 1 && signs->ne[3] == 1 &&
+        x->type == GGML_TYPE_F32 && mul->type == GGML_TYPE_F32 && mm->type == GGML_TYPE_F32 &&
+        ggml_is_contiguous(x) && ggml_is_contiguous(signs) && ggml_is_contiguous(mm) &&
+        signs->ne[0] == x->ne[0] && signs->ne[0] % n == 0;
+
+    if (!ok) {
+        return false;
+    }
+
+    if (mode == GGML_METAL_FUSION_FULL) {
+        // the kernel reads x and writes mm in one pass
+        if (ggml_metal_fusion_overlap(x, mm)) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
 // ---- patterns ------------------------------------------------------------
 
 static const ggml_op ops_norm_mul[]         = { GGML_OP_NORM, GGML_OP_MUL };
@@ -212,6 +273,8 @@ static const ggml_op ops_snake[] = { GGML_OP_MUL, GGML_OP_SIN, GGML_OP_SQR, GGML
 
 static const ggml_op ops_gdn_cache[] = { GGML_OP_GATED_DELTA_NET, GGML_OP_CPY };
 
+static const ggml_op ops_fwht_signed[] = { GGML_OP_MUL, GGML_OP_MUL_MAT };
+
 static const ggml_metal_fusion ggml_metal_fusions[] = {
     { GGML_METAL_FUSION_NORM_MUL,     ops_norm_mul,         2, false, ggml_metal_fusion_check_norm },
     { GGML_METAL_FUSION_NORM_MUL_ADD, ops_norm_mul_add,     3, false, ggml_metal_fusion_check_norm },
@@ -225,6 +288,7 @@ static const ggml_metal_fusion ggml_metal_fusions[] = {
     { GGML_METAL_FUSION_ADD_CHAIN,    ops_add_7,            7, false, ggml_metal_fusion_check_add_chain },
     { GGML_METAL_FUSION_SNAKE,        ops_snake,            5, false, ggml_metal_fusion_check_snake },
     { GGML_METAL_FUSION_GDN_CACHE,    ops_gdn_cache,        2, true,  ggml_metal_fusion_check_gdn_cache },
+    { GGML_METAL_FUSION_FWHT_SIGNED,  ops_fwht_signed,      2, true,  ggml_metal_fusion_check_fwht_signed },
 };
 
 const ggml_metal_fusion * ggml_metal_fusion_all(int * n) {

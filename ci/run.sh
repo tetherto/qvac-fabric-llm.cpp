@@ -63,6 +63,16 @@ sd=`dirname $0`
 cd $sd/../
 SRC=`pwd`
 
+# nproc is used for -j and quantize thread counts; macOS often lacks GNU coreutils
+if ! command -v nproc >/dev/null 2>&1; then
+    if command -v sysctl >/dev/null 2>&1; then
+        nproc() { sysctl -n hw.logicalcpu 2>/dev/null || sysctl -n hw.ncpu; }
+    else
+        echo "Error: nproc not found. Install coreutils (provides nproc)."
+        exit 1
+    fi
+fi
+
 CMAKE_EXTRA="-DLLAMA_FATAL_WARNINGS=${LLAMA_FATAL_WARNINGS:-ON} -DLLAMA_OPENSSL=OFF -DGGML_SCHED_NO_REALLOC=ON"
 CTEST_EXTRA=""
 
@@ -168,6 +178,15 @@ if [ ! -z ${GG_BUILD_NO_SVE} ]; then
     CMAKE_EXTRA="${CMAKE_EXTRA} -DGGML_NATIVE=OFF -DGGML_CPU_ARM_ARCH=armv8.5-a+fp16+i8mm"
 fi
 
+# Disable native CPU optimizations for low-perf builds to ensure binary
+# compatibility with the (often heterogeneous) CI runner pool. Must be applied
+# at the top level so BOTH gg_run_ctest_debug and gg_run_ctest_release pick it
+# up — otherwise the debug build (which runs first) compiles with -march=native
+# and can SIGILL on a runner whose microarch is older than the build host.
+if [ ! -z ${GG_BUILD_LOW_PERF} ]; then
+    CMAKE_EXTRA="${CMAKE_EXTRA} -DGGML_NATIVE=OFF"
+fi
+
 if [ -n "${GG_BUILD_KLEIDIAI}" ]; then
     echo ">>===== Enabling KleidiAI support"
     CMAKE_EXTRA="${CMAKE_EXTRA:+$CMAKE_EXTRA } -DGGML_CPU_KLEIDIAI=ON"
@@ -257,6 +276,11 @@ function gg_run_ctest_release {
 
     # Check required binaries are installed
     gg_check_build_requirements
+
+    # Disable native CPU optimizations for low-perf builds to ensure compatibility
+    if [ ! -z ${GG_BUILD_LOW_PERF} ]; then
+        CMAKE_EXTRA="${CMAKE_EXTRA} -DGGML_NATIVE=OFF"
+    fi
 
     (cmake -G "${CMAKE_GENERATOR}" -DCMAKE_BUILD_TYPE=Release ${CMAKE_EXTRA} .. ) 2>&1 | tee -a $OUT/${ci}-cmake.log
     (time cmake --build . --config Release -j$(nproc)) 2>&1 | tee -a $OUT/${ci}-make.log
@@ -642,6 +666,10 @@ function gg_check_build_requirements {
         echo 'unzip not found, please install'
         exit 1
     fi
+
+    if ! command -v nproc &> /dev/null; then
+        gg_printf 'nproc not found, please install coreutils'
+    fi
 }
 
 function gg_run_test_backend_ops {
@@ -705,6 +733,11 @@ if [ -z ${GG_BUILD_LOW_PERF} ]; then
 
     pip install -r ${SRC}/requirements.txt --disable-pip-version-check
     pip install --editable gguf-py --disable-pip-version-check
+    pip install jinja2 --disable-pip-version-check
+    if ! python3 -c "import jinja2"; then
+        echo "Error: jinja2 is not importable after pip install"
+        exit 1
+    fi
 fi
 
 ret=0

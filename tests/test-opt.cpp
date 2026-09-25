@@ -64,7 +64,8 @@ static helper_ctx_data helper_get_ctx_data(
         const bool              optimizer_defaults = true,
         int64_t                 nbatch_logical     = 1,
         int64_t                 nbatch_physical    = 1,
-        enum ggml_opt_loss_type loss_type          = GGML_OPT_LOSS_TYPE_SUM) {
+        enum ggml_opt_loss_type loss_type          = GGML_OPT_LOSS_TYPE_SUM,
+        float                   loss_scale         = 1.0f) {
     std::vector<ggml_opt_dataset_t> datasets(ndata);
     for (int64_t ndata_shard = 1; ndata_shard <= ndata; ++ndata_shard) {
         ggml_opt_dataset_t dataset = ggml_opt_dataset_init(
@@ -145,6 +146,7 @@ static helper_ctx_data helper_get_ctx_data(
     opt_params.outputs     = outputs;
     opt_params.opt_period  = opt_period;
     opt_params.optimizer   = optim;
+    opt_params.loss_scale  = loss_scale;
     if (!optimizer_defaults) {
         opt_params.get_opt_pars = helper_get_test_opt_pars;
     }
@@ -839,6 +841,145 @@ static std::pair<int, int> test_regression(
     return std::make_pair(npass, ntest);
 }
 
+static ggml_opt_optimizer_params helper_get_opt_pars_wd(void * userdata) {
+    ggml_opt_optimizer_params result = ggml_opt_get_default_optimizer_params(userdata);
+
+    result.adamw.alpha = 0.1f;
+    result.adamw.beta1 = 0.9f;
+    result.adamw.beta2 = 0.999f;
+    result.adamw.eps   = 1e-8f;
+    result.adamw.wd    = 0.1f;
+    result.sgd.alpha   = 0.1f;
+    result.sgd.wd      = 0.1f;
+
+    return result;
+}
+
+static std::pair<int, int> test_loss_scale(
+        enum ggml_opt_optimizer_type optim, ggml_backend_sched_t backend_sched, ggml_backend_t backend) {
+    int ntest = 0;
+    int npass = 0;
+
+    const float scales[2] = { 1.0f, 1e-3f };
+    float       results[2] = { 0.0f, 0.0f };
+
+    for (int is = 0; is < 2; ++is) {
+        struct helper_ctx_data cd = helper_get_ctx_data(
+            optim, backend_sched, backend, /*init_opt_ctx =*/ false, /*optimizer_defaults =*/ true,
+            /*nbatch_logical =*/ 1, /*nbatch_physical =*/ 1, GGML_OPT_LOSS_TYPE_SUM, scales[is]);
+
+        cd.opt_params.get_opt_pars = helper_get_opt_pars_wd;
+        cd.opt_ctx = ggml_opt_init(cd.opt_params);
+
+        for (int idata = 0; idata < ndata; ++idata) {
+            const float idataf = idata;
+            ggml_opt_alloc(cd.opt_ctx, /*backward =*/ true);
+            ggml_backend_tensor_set(cd.inputs, &idataf, 0, ggml_nbytes(cd.inputs));
+            ggml_opt_eval(cd.opt_ctx, cd.result);
+        }
+
+        ggml_backend_tensor_get(cd.weights, &results[is], 0, sizeof(float));
+
+        helper_free_ctx_data(cd);
+    }
+
+    const bool subtest_ok = almost_equal(results[0], results[1], 1e-4);
+    printf("  %s(subtest=weights_after_scaled_backward, optimizer=%s): unscaled=%f scaled=%f ",
+           __func__, ggml_opt_optimizer_name(optim), results[0], results[1]);
+    print_ok(subtest_ok);
+    if (subtest_ok) {
+        npass++;
+    }
+    ntest++;
+
+    return std::make_pair(npass, ntest);
+}
+
+static std::pair<int, int> test_loss_scale_state(
+        enum ggml_opt_optimizer_type optim, ggml_backend_sched_t backend_sched, ggml_backend_t backend) {
+    int ntest = 0;
+    int npass = 0;
+
+    const char * fname = "test-opt-loss-scale-state.gguf";
+
+    // reference: six steps entirely at scale 1e-3
+    float w_ref = 0.0f;
+    {
+        struct helper_ctx_data cd = helper_get_ctx_data(
+            optim, backend_sched, backend, /*init_opt_ctx =*/ false, /*optimizer_defaults =*/ true,
+            /*nbatch_logical =*/ 1, /*nbatch_physical =*/ 1, GGML_OPT_LOSS_TYPE_SUM, 1e-3f);
+        cd.opt_params.get_opt_pars = helper_get_opt_pars_wd;
+        cd.opt_ctx = ggml_opt_init(cd.opt_params);
+
+        for (int idata = 0; idata < ndata; ++idata) {
+            const float idataf = idata;
+            ggml_opt_alloc(cd.opt_ctx, /*backward =*/ true);
+            ggml_backend_tensor_set(cd.inputs, &idataf, 0, ggml_nbytes(cd.inputs));
+            ggml_opt_eval(cd.opt_ctx, cd.result);
+        }
+        ggml_backend_tensor_get(cd.weights, &w_ref, 0, sizeof(float));
+        helper_free_ctx_data(cd);
+    }
+
+    // first half at scale 1.0, state saved
+    float w_mid = 0.0f;
+    {
+        struct helper_ctx_data cd = helper_get_ctx_data(
+            optim, backend_sched, backend, /*init_opt_ctx =*/ false, /*optimizer_defaults =*/ true,
+            /*nbatch_logical =*/ 1, /*nbatch_physical =*/ 1, GGML_OPT_LOSS_TYPE_SUM, 1.0f);
+        cd.opt_params.get_opt_pars = helper_get_opt_pars_wd;
+        cd.opt_ctx = ggml_opt_init(cd.opt_params);
+
+        for (int idata = 0; idata < ndata/2; ++idata) {
+            const float idataf = idata;
+            ggml_opt_alloc(cd.opt_ctx, /*backward =*/ true);
+            ggml_backend_tensor_set(cd.inputs, &idataf, 0, ggml_nbytes(cd.inputs));
+            ggml_opt_eval(cd.opt_ctx, cd.result);
+        }
+        ggml_backend_tensor_get(cd.weights, &w_mid, 0, sizeof(float));
+        ggml_opt_save_state(cd.opt_ctx, fname);
+        helper_free_ctx_data(cd);
+    }
+
+    // second half at scale 1e-3, resumed from that state
+    float w_resumed = 0.0f;
+    {
+        struct helper_ctx_data cd = helper_get_ctx_data(
+            optim, backend_sched, backend, /*init_opt_ctx =*/ false, /*optimizer_defaults =*/ true,
+            /*nbatch_logical =*/ 1, /*nbatch_physical =*/ 1, GGML_OPT_LOSS_TYPE_SUM, 1e-3f);
+        cd.opt_params.get_opt_pars = helper_get_opt_pars_wd;
+        cd.opt_ctx = ggml_opt_init(cd.opt_params);
+
+        ggml_backend_tensor_set(cd.weights, &w_mid, 0, sizeof(float));
+        ggml_opt_load_state(cd.opt_ctx, fname);
+        ggml_opt_load_tensors(cd.opt_ctx, fname);
+
+        for (int idata = ndata/2; idata < ndata; ++idata) {
+            const float idataf = idata;
+            ggml_opt_alloc(cd.opt_ctx, /*backward =*/ true);
+            ggml_backend_tensor_set(cd.inputs, &idataf, 0, ggml_nbytes(cd.inputs));
+            ggml_opt_eval(cd.opt_ctx, cd.result);
+        }
+        ggml_backend_tensor_get(cd.weights, &w_resumed, 0, sizeof(float));
+        helper_free_ctx_data(cd);
+    }
+
+    remove(fname);
+
+    // the first half ran unscaled, so only the momenta carried across the scale change are
+    // being checked here; they must reproduce the reference trajectory
+    const bool subtest_ok = almost_equal(w_ref, w_resumed, 1e-3);
+    printf("  %s(subtest=weights_after_rescaled_resume, optimizer=%s): reference=%f resumed=%f ",
+           __func__, ggml_opt_optimizer_name(optim), w_ref, w_resumed);
+    print_ok(subtest_ok);
+    if (subtest_ok) {
+        npass++;
+    }
+    ntest++;
+
+    return std::make_pair(npass, ntest);
+}
+
 static std::pair<int, int> test_backend(
     ggml_backend_sched_t backend_sched, ggml_backend_t backend, enum ggml_opt_optimizer_type optim) {
     int npass = 0;
@@ -851,6 +992,16 @@ static std::pair<int, int> test_backend(
     }
     {
         std::pair<int, int> partial = test_grad(optim, backend_sched, backend);
+        npass += partial.first;
+        ntest += partial.second;
+    }
+    {
+        std::pair<int, int> partial = test_loss_scale(optim, backend_sched, backend);
+        npass += partial.first;
+        ntest += partial.second;
+    }
+    {
+        std::pair<int, int> partial = test_loss_scale_state(optim, backend_sched, backend);
         npass += partial.first;
         ntest += partial.second;
     }

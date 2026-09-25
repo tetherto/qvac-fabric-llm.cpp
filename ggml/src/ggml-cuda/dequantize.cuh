@@ -43,6 +43,35 @@ static __device__ __forceinline__ void dequantize_q2_0(const void * vx, const in
     v.y = (c1 - 1) * d;
 }
 
+
+static __device__ __forceinline__ void dequantize_ptq1_0(const void * vx, const int64_t ib, const int iqs, float2 & v){
+    const block_ptq1_0 * x = (const block_ptq1_0 *) vx;
+
+    const float d = x[ib].d;
+
+    v.x = ptq1_0_trit(&x[ib], iqs + 0) * d;
+    v.y = ptq1_0_trit(&x[ib], iqs + 1) * d;
+}
+
+static __device__ __forceinline__ void dequantize_pq2_0(const void * vx, const int64_t ib, const int iqs, float2 & v){
+    const block_pq2_0 * x = (const block_pq2_0 *) vx;
+
+    const float d = x[ib].d;
+
+    // Same 2-bit codec as Q2_0 (per-element indexing is block-size independent).
+    const int byte_index_0 = iqs / 4;
+    const int bit_offset_0 = (iqs % 4) * 2;
+
+    const int byte_index_1 = (iqs + 1) / 4;
+    const int bit_offset_1 = ((iqs + 1) % 4) * 2;
+
+    const int c0 = (x[ib].qs[byte_index_0] >> bit_offset_0) & 0x3;
+    const int c1 = (x[ib].qs[byte_index_1] >> bit_offset_1) & 0x3;
+
+    v.x = (c0 - 1) * d;
+    v.y = (c1 - 1) * d;
+}
+
 static __device__ __forceinline__ void dequantize_q4_0(const void * vx, const int64_t ib, const int iqs, float2 & v){
     const block_q4_0 * x = (const block_q4_0 *) vx;
 
@@ -141,6 +170,23 @@ static __device__ __forceinline__ void dequantize_q2_K(const void * vx, const in
     y[l+32] = ggml_cuda_cast<dst_t>(dall * (x[ib].scales[is+2] & 0xF) * ((q >> 2) & 3) - dmin * (x[ib].scales[is+2] >> 4));
     y[l+64] = ggml_cuda_cast<dst_t>(dall * (x[ib].scales[is+4] & 0xF) * ((q >> 4) & 3) - dmin * (x[ib].scales[is+4] >> 4));
     y[l+96] = ggml_cuda_cast<dst_t>(dall * (x[ib].scales[is+6] & 0xF) * ((q >> 6) & 3) - dmin * (x[ib].scales[is+6] >> 4));
+}
+
+template<typename dst_t>
+static __device__ __forceinline__ void dequantize_tq2_0(const void * vx, const int64_t ib, dst_t * yy, const int tid) {
+    const block_tq2_0 * x = (const block_tq2_0 *) vx;
+
+    const int64_t n = tid/32;
+    const int64_t l = tid - 32*n;
+
+    const uint8_t q = x[ib].qs[32*n + l];
+    dst_t * y = yy + 128*n;
+
+    const float d = x[ib].d;
+    y[l+ 0] = ggml_cuda_cast<dst_t>(d * (float) (int) (((q >> 0) & 3) - 1));
+    y[l+32] = ggml_cuda_cast<dst_t>(d * (float) (int) (((q >> 2) & 3) - 1));
+    y[l+64] = ggml_cuda_cast<dst_t>(d * (float) (int) (((q >> 4) & 3) - 1));
+    y[l+96] = ggml_cuda_cast<dst_t>(d * (float) (int) (((q >> 6) & 3) - 1));
 }
 
 template<typename dst_t>

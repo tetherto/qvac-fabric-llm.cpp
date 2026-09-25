@@ -75,6 +75,150 @@ kernel void kernel_argsort_f32_i32(
 template [[host_name("kernel_argsort_f32_i32_asc")]]  kernel argsort_t kernel_argsort_f32_i32<GGML_SORT_ORDER_ASC>;
 template [[host_name("kernel_argsort_f32_i32_desc")]] kernel argsort_t kernel_argsort_f32_i32<GGML_SORT_ORDER_DESC>;
 
+// fused softmax -> top-k -> get_rows for MoE decode (see ggml-cuda/topk-moe.cu)
+// one simdgroup per token, 4 tokens per threadgroup
+template<int n_experts>
+static inline void topk_moe_softmax(thread float * vals, ushort lane) {
+    constexpr int experts_per_thread = (n_experts > N_SIMDWIDTH) ? n_experts / N_SIMDWIDTH : 1;
+
+    float max_val = -INFINITY;
+    FOR_UNROLL (int i = 0; i < experts_per_thread; i++) {
+        const int idx = lane + i * N_SIMDWIDTH;
+        if (n_experts % N_SIMDWIDTH == 0 || idx < n_experts) {
+            max_val = max(max_val, vals[i]);
+        }
+    }
+    max_val = simd_max(max_val);
+
+    float sum = 0.f;
+    FOR_UNROLL (int i = 0; i < experts_per_thread; i++) {
+        const int idx = lane + i * N_SIMDWIDTH;
+        if (n_experts % N_SIMDWIDTH == 0 || idx < n_experts) {
+            const float val = exp(vals[i] - max_val);
+            vals[i] = val;
+            sum += val;
+        } else {
+            // keep pads below the -FLT_MAX that NaN logits become, so they are never selected
+            vals[i] = -INFINITY;
+        }
+    }
+    sum = simd_sum(sum);
+    const float inv_sum = 1.0f / sum;
+    FOR_UNROLL (int i = 0; i < experts_per_thread; i++) {
+        const int idx = lane + i * N_SIMDWIDTH;
+        if (n_experts % N_SIMDWIDTH == 0 || idx < n_experts) {
+            vals[i] *= inv_sum;
+        }
+    }
+}
+
+template<int n_experts>
+kernel void kernel_topk_moe(
+        constant ggml_metal_kargs_topk_moe & args,
+        device const float * logits,
+        device       float * weights,
+        device     int32_t * ids,
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    constexpr int NW = N_SIMDWIDTH;
+    constexpr int experts_per_thread = (n_experts > NW) ? n_experts / NW : 1;
+
+    const int row = tgpig.x * 4 + sgitg;
+    if (row >= args.n_rows) {
+        return;
+    }
+
+    device const float * row_logits  = logits  + (int64_t) n_experts * row;
+    device       float * row_weights = weights + (int64_t) args.n_expert_used * row;
+    device     int32_t * row_ids     = ids     + (int64_t) n_experts * row;
+
+    float wt[experts_per_thread];
+    FOR_UNROLL (int i = 0; i < experts_per_thread; i++) {
+        wt[i] = -INFINITY;
+    }
+    FOR_UNROLL (int i = 0; i < n_experts; i += NW) {
+        const int expert = i + tiisg;
+        wt[i / NW] = (n_experts % NW == 0 || expert < n_experts) ? row_logits[expert] : -INFINITY;
+    }
+
+    topk_moe_softmax<n_experts>(wt, tiisg);
+
+    FOR_UNROLL (int i = 0; i < experts_per_thread; i++) {
+        if (isnan(wt[i])) {
+            wt[i] = -FLT_MAX;
+        }
+    }
+
+    float wt_sum = 0.f;
+    float output_weights[experts_per_thread];
+    FOR_UNROLL (int i = 0; i < experts_per_thread; i++) {
+        output_weights[i] = 0.f;
+    }
+
+    for (int k = 0; k < args.n_expert_used; k++) {
+        float max_val    = wt[0];
+        int   max_expert = tiisg;
+
+        FOR_UNROLL (int i = 1; i < experts_per_thread; i++) {
+            const int expert = tiisg + i * NW;
+            if ((n_experts % NW == 0 || expert < n_experts) && wt[i] > max_val) {
+                max_val    = wt[i];
+                max_expert = expert;
+            }
+        }
+
+        for (int mask = NW / 2; mask > 0; mask /= 2) {
+            const float val    = simd_shuffle_xor(max_val, mask);
+            const int   expert = simd_shuffle_xor(max_expert, mask);
+            if (val > max_val || (val == max_val && expert < max_expert)) {
+                max_val    = val;
+                max_expert = expert;
+            }
+        }
+
+        if ((max_expert & (NW - 1)) == tiisg) {
+            wt[max_expert / NW] = -INFINITY;
+        }
+
+        if ((k & (NW - 1)) == tiisg) {
+            output_weights[k / NW] = max_val;
+        }
+
+        if ((max_expert & (NW - 1)) == tiisg) {
+            row_ids[k] = max_expert;
+            if (args.with_norm != 0) {
+                wt_sum += max_val;
+            }
+        }
+    }
+
+    if (args.with_norm != 0) {
+        wt_sum = simd_sum(wt_sum);
+        wt_sum = max(wt_sum, args.clamp_val);
+        const float inv_sum = 1.0f / wt_sum;
+        FOR_UNROLL (int i = 0; i < experts_per_thread; i++) {
+            output_weights[i] *= inv_sum;
+        }
+    }
+
+    FOR_UNROLL (int i = 0; i < experts_per_thread; i++) {
+        const int idx = i * NW + tiisg;
+        if (idx < args.n_expert_used) {
+            row_weights[idx] = output_weights[i] * args.scale_val;
+        }
+    }
+}
+
+typedef decltype(kernel_topk_moe<8>) kernel_topk_moe_t;
+
+template [[host_name("kernel_topk_moe_8")]]   kernel kernel_topk_moe_t kernel_topk_moe<8>;
+template [[host_name("kernel_topk_moe_16")]]  kernel kernel_topk_moe_t kernel_topk_moe<16>;
+template [[host_name("kernel_topk_moe_32")]]  kernel kernel_topk_moe_t kernel_topk_moe<32>;
+template [[host_name("kernel_topk_moe_64")]]  kernel kernel_topk_moe_t kernel_topk_moe<64>;
+template [[host_name("kernel_topk_moe_128")]] kernel kernel_topk_moe_t kernel_topk_moe<128>;
+template [[host_name("kernel_topk_moe_256")]] kernel kernel_topk_moe_t kernel_topk_moe<256>;
+
 typedef void (argsort_merge_t)(
         constant   ggml_metal_kargs_argsort_merge & args,
         device const char    * src0,

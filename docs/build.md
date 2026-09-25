@@ -303,6 +303,10 @@ The following compilation options are also available to tweak performance:
 | GGML_CUDA_FA_QUANTS           | `all` or `type_K-type_V` list | q4_0-q4_0;q8_0-q8_0;f16-f16;bf16-bf16 | Select which K/V type combinations to compile the FlashAttention CUDA kernels for. `all` compiles every combination, but compilation takes much longer. Otherwise a `;`-separated list of `type_K-type_V` pairs; f16-f16 is always compiled. Combinations that were not compiled fall back to f16-f16 kernel with a warning. Legal types: f16, bf16, q4_0, q4_1, q5_0, q5_1, q8_0. |
 | GGML_CUDA_FA_ALL_QUANTS       | Boolean                | false   | Deprecated alias for `GGML_CUDA_FA_QUANTS=all`.                                                                                                                                                                                                                                                                                                                               |
 
+`GGML_CUDA_CUTLASS=ON` enables optional block-scaled matrix multiplication for dense MXFP4 and NVFP4 weights on SM120/SM121 Blackwell GPUs. It requires CUDA 12.9 or newer. CMake downloads the pinned CUTLASS release unless `FETCHCONTENT_SOURCE_DIR_CUTLASS` points to a local CUTLASS source tree.
+
+Weights are repacked during loading without changing the GGUF format. Small batches use the repacked MMVQ kernels; larger batches use CUTLASS where supported, with the existing CUDA kernels as a fallback. MXFP4 uses FP8 activations and NVFP4 uses FP4 activations for CUTLASS prefill. Measure model accuracy as well as prompt processing and generation speed when enabling this option. `--no-repack`, `GGML_CUDA_FORCE_MMQ`, and `GGML_CUDA_FORCE_CUBLAS` disable automatic placement in the repacked buffer.
+
 ## MUSA
 
 This provides GPU acceleration using a Moore Threads GPU. Make sure to have the [MUSA SDK](https://developer.mthreads.com/musa/musa-sdk) installed.

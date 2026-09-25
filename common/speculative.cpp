@@ -1351,6 +1351,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     // The last h-row of one process() call needs the first token of the NEXT
     // call to pair with, so it's stashed here until that next call fires.
     std::vector<std::vector<float>> pending_h;   // [n_seq][n_embd]
+    std::vector<llama_pos>          pending_pos;
+    std::vector<llama_pos>          verify_pos_first;
 
     std::vector<int32_t> i_batch_beg;
     std::vector<int32_t> i_batch_end;
@@ -1434,6 +1436,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         this->n_max = this->params.n_max;
 
         pending_h.assign(n_seq, std::vector<float>(n_embd, 0.0f));
+        pending_pos.assign(n_seq, -1);
+        verify_pos_first.assign(n_seq, -1);
 
         i_last.assign(n_seq, -1);
         i_batch_beg.assign(n_seq, -1);
@@ -1543,7 +1547,12 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     continue;
                 }
 
-                set_h(i_batch_beg[seq_id], pending_h[seq_id].data());
+                const llama_pos pos_beg = batch_in.pos[i_batch_beg[seq_id]];
+                if (pending_pos[seq_id] >= 0 && pending_pos[seq_id] + 1 == pos_beg) {
+                    set_h(i_batch_beg[seq_id], pending_h[seq_id].data());
+                } else {
+                    std::memset(batch.embd + (size_t) i_batch_beg[seq_id] * n_embd, 0, row_bytes);
+                }
             }
 
             auto * mem_dft = llama_get_memory(ctx_dft);
@@ -1573,6 +1582,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             if (chain_heads) {
                 llama_set_nextn_layer_offset(ctx_dft, 0); // restore default for non-draft decodes
             }
+            // Catch-up decode is async; finish before the target reuses shared compute buffers.
+            llama_synchronize(ctx_dft);
             if (!ok) {
                 return false;
             }
@@ -1585,6 +1596,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
             const int32_t n_rows = i_batch_end[seq_id] - i_batch_beg[seq_id] + 1;
             verify_h_rows[seq_id] = n_rows;
+            verify_pos_first[seq_id] = batch_in.pos[i_batch_beg[seq_id]];
+            pending_pos[seq_id]      = batch_in.pos[i_batch_end[seq_id]];
             verify_h[seq_id].resize((size_t) n_rows * n_embd);
 
             for (int32_t i = 0; i < n_rows; ++i) {
@@ -1763,6 +1776,52 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         const int32_t i_h = std::min<int32_t>(n_accepted, n_rows - 1);
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
         std::memcpy(pending_h[seq_id].data(), verify_h[seq_id].data() + (size_t) i_h * n_embd, row_bytes);
+        pending_pos[seq_id] = verify_pos_first[seq_id] + i_h;
+    }
+
+    bool get_state(llama_seq_id seq_id, std::vector<uint8_t> & data) const override {
+        if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
+            return false;
+        }
+
+        if (pending_pos[seq_id] < 0) {
+            return false;
+        }
+
+        const auto & h = pending_h[seq_id];
+        const llama_pos pos = pending_pos[seq_id];
+        data.resize(sizeof(llama_pos) + h.size() * sizeof(float));
+        std::memcpy(data.data(), &pos, sizeof(llama_pos));
+        std::memcpy(data.data() + sizeof(llama_pos), h.data(), h.size() * sizeof(float));
+        return true;
+    }
+
+    void set_state(llama_seq_id seq_id, const std::vector<uint8_t> & data) override {
+        if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
+            return;
+        }
+
+        auto & h = pending_h[seq_id];
+        if (data.empty()) {
+            std::fill(h.begin(), h.end(), 0.0f);
+            pending_pos[seq_id] = -1;
+            return;
+        }
+        const size_t expected_size = sizeof(llama_pos) + h.size() * sizeof(float);
+        if (data.size() != expected_size) {
+            SPC_WRN("bad MTP state: seq=%d, size=%zu/%zu; ignoring\n", (int) seq_id, data.size(), expected_size);
+            return;
+        }
+
+        llama_pos pos = -1;
+        std::memcpy(&pos, data.data(), sizeof(llama_pos));
+        if (pos < 0) {
+            SPC_WRN("invalid MTP state position for seq_id=%d: got %d - ignoring\n", (int) seq_id, (int) pos);
+            return;
+        }
+
+        pending_pos[seq_id] = pos;
+        std::memcpy(h.data(), data.data() + sizeof(llama_pos), h.size() * sizeof(float));
     }
 };
 
@@ -2544,6 +2603,7 @@ common_speculative_init_result::common_speculative_init_result(
 
     if (spec_mtp) {
         cparams.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
+        cparams.ctx_other_share_compute = true;
     }
 
     // the draft context holds as many tokens per sequence as the target context

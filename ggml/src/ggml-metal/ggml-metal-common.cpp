@@ -7,6 +7,23 @@
 
 #include <vector>
 
+// must stay in sync with the kernel_fwht_<type>_<N> templates in kernels/misc.metal
+static bool ggml_metal_fwht_supported_size(int64_t n) {
+    return n == 64 || n == 128 || n == 256 || n == 512 || n == 1024 ||
+           n == 2048 || n == 4096 || n == 8192;
+}
+
+// supports_op and dispatch must use the same FWHT conditions.
+bool ggml_metal_op_mul_mat_use_fwht(const struct ggml_tensor * op) {
+    return ggml_get_op_params_i32(op, 1) == GGML_HINT_SRC0_IS_HADAMARD &&
+           op->type == GGML_TYPE_F32 &&
+           (op->src[1]->type == GGML_TYPE_F32 || op->src[1]->type == GGML_TYPE_F16) &&
+           ggml_is_contiguous(op->src[1]) &&
+           ggml_is_contiguous(op) &&
+           ggml_are_same_shape(op->src[1], op) &&
+           ggml_metal_fwht_supported_size(op->src[1]->ne[0]);
+}
+
 bool ggml_metal_op_mul_mat_use_mm(const struct ggml_tensor * op, bool has_simdgroup_mm) {
     const int64_t ne00 = op->src[0]->ne[0];
     const int64_t ne11 = op->src[1]->ne[1];
@@ -207,6 +224,9 @@ struct node_info {
 
     std::vector<ggml_tensor *> fused;
 
+    // outputs of the fused group other than dst() (e.g. the ids of a fused topk-moe)
+    std::vector<ggml_tensor *> extra_dsts;
+
     ggml_op op() const {
         return node->op;
     }
@@ -246,6 +266,12 @@ static std::vector<int> ggml_metal_graph_optimize_reorder(const std::vector<node
             }
         }
 
+        for (const auto * d : node.extra_dsts) {
+            if (!ggml_mem_ranges_add_dst(mrs, d)) {
+                return false;
+            }
+        }
+
         return ggml_mem_ranges_add_dst(mrs, node.dst());
     };
 
@@ -266,6 +292,12 @@ static std::vector<int> ggml_metal_graph_optimize_reorder(const std::vector<node
                         return false;
                     }
                 }
+            }
+        }
+
+        for (const auto * d : node.extra_dsts) {
+            if (!ggml_mem_ranges_check_dst(mrs, d)) {
+                return false;
             }
         }
 
@@ -390,6 +422,85 @@ static std::vector<int> ggml_metal_graph_optimize_reorder(const std::vector<node
     return res;
 }
 
+// extra nodes to keep with gf->nodes[i] so later reorder cannot split a metal fusion
+// extra_dsts receives the outputs of the pack other than the last node (see node_info::extra_dsts)
+static int ggml_metal_graph_optimize_pack(const ggml_cgraph * gf, int i, std::vector<ggml_tensor *> & extra_dsts) {
+    const int n = gf->n_nodes;
+    ggml_tensor ** nodes = gf->nodes;
+
+    if (nodes[i]->op == GGML_OP_SOFT_MAX) {
+        // keep in sync with ggml_metal_op_try_topk_moe
+        static const ggml_op topk_ops[] = {
+            GGML_OP_SOFT_MAX, GGML_OP_RESHAPE, GGML_OP_ARGSORT, GGML_OP_VIEW, GGML_OP_GET_ROWS,
+            GGML_OP_RESHAPE, GGML_OP_SUM_ROWS, GGML_OP_CLAMP, GGML_OP_DIV, GGML_OP_RESHAPE,
+            GGML_OP_SCALE,
+        };
+        const int lens[] = { 11, 10, 6, 5 };
+        for (int n_ops : lens) {
+            if (i + n_ops > n) {
+                continue;
+            }
+            const int outs[] = { i + 3, i + n_ops - 1 };
+            if (ggml_can_fuse_subgraph(gf, i, n_ops, topk_ops, outs, 2)) {
+                extra_dsts.push_back(nodes[outs[0]]);
+                return n_ops - 1;
+            }
+        }
+    }
+
+    const ggml_op op0 = nodes[i]->op;
+    if (op0 == GGML_OP_MUL_MAT || op0 == GGML_OP_MUL_MAT_ID) {
+        if (i + 3 <= n) {
+            const ggml_op ops[] = { op0, op0, GGML_OP_GLU };
+            const int out[] = { i + 2 };
+            if (ggml_can_fuse_subgraph(gf, i, 3, ops, out, 1)) {
+                return 2;
+            }
+        }
+        if (op0 == GGML_OP_MUL_MAT_ID && i + 4 <= n) {
+            const ggml_op ops[] = { GGML_OP_MUL_MAT_ID, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_GLU };
+            const int out[] = { i + 3 };
+            if (ggml_can_fuse_subgraph(gf, i, 4, ops, out, 1)) {
+                return 3;
+            }
+        }
+        if (op0 == GGML_OP_MUL_MAT_ID && i + 2 <= n) {
+            const ggml_op ops[] = { GGML_OP_MUL_MAT_ID, GGML_OP_MUL };
+            const int out[] = { i + 1 };
+            if (ggml_can_fuse_subgraph(gf, i, 2, ops, out, 1) &&
+                    (nodes[i + 1]->src[0] == nodes[i] || nodes[i + 1]->src[1] == nodes[i])) {
+                return 1;
+            }
+        }
+    }
+
+    if (op0 == GGML_OP_SSM_CONV && i + 2 <= n) {
+        const ggml_op ops[] = { GGML_OP_SSM_CONV, GGML_OP_UNARY };
+        const int out[] = { i + 1 };
+        if (ggml_can_fuse_subgraph(gf, i, 2, ops, out, 1) &&
+                ggml_get_unary_op(nodes[i + 1]) == GGML_UNARY_OP_SILU) {
+            return 1;
+        }
+    }
+
+    if (op0 == GGML_OP_UNARY && i + 2 <= n) {
+        const ggml_unary_op uop = ggml_get_unary_op(nodes[i]);
+        if (uop == GGML_UNARY_OP_SILU ||
+                uop == GGML_UNARY_OP_SIGMOID ||
+                uop == GGML_UNARY_OP_SOFTPLUS) {
+            const ggml_op ops[] = { GGML_OP_UNARY, GGML_OP_MUL };
+            const int out[] = { i + 1 };
+            if (ggml_can_fuse_subgraph(gf, i, 2, ops, out, 1) &&
+                    (nodes[i + 1]->src[0] == nodes[i] || nodes[i + 1]->src[1] == nodes[i]) &&
+                    ggml_are_same_shape(nodes[i]->src[0], nodes[i + 1])) {
+                return 1;
+            }
+        }
+    }
+
+    return 0;
+}
+
 void ggml_graph_optimize(ggml_cgraph * gf) {
     const int n = gf->n_nodes;
 
@@ -406,12 +517,18 @@ void ggml_graph_optimize(ggml_cgraph * gf) {
         node_info node = {
             /*.node =*/ gf->nodes[i],
             /*.fused =*/ {},
+            /*.extra_dsts =*/ {},
         };
 
-        const int f = ggml_metal_fusion_max(gf, i);
+        int n_extra = ggml_metal_fusion_max(gf, i) - 1;
+
+        if (n_extra == 0) {
+            // no table fusion starts here - try the downstream packing patterns
+            n_extra = ggml_metal_graph_optimize_pack(gf, i, node.extra_dsts);
+        }
 
         // add the fused tensors into the node info so we can unfuse them later
-        for (int k = 1; k < f; k++) {
+        for (int k = 0; k < n_extra; k++) {
             ++i;
 
             // the .dst() becomes the last fused tensor
