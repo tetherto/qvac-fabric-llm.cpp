@@ -433,7 +433,7 @@ struct ptq1_0_pt_launch_config {
     size_t smem;
 };
 
-static __host__ ptq1_0_pt_launch_config ptq1_0_pt_config(
+static constexpr __host__ ptq1_0_pt_launch_config ptq1_0_pt_config(
         const int blocks_per_row, const int ncols_dst, const int rows_per_item,
         const bool has_gate, const size_t max_smem) {
     const size_t smem_per_row = (size_t) ncols_dst * (blocks_per_row + 1) * sizeof(float) * (has_gate ? 2 : 1);
@@ -460,6 +460,10 @@ static __host__ ptq1_0_pt_launch_config ptq1_0_pt_config(
     }
     return { best, smem_per_row * best };
 }
+
+static_assert(ptq1_0_pt_config(1536, 1, 4, true, 49152).rows_per_cta == 0, "gated PTQ1_0 K=196608 must fall back at 48 KiB");
+static_assert(ptq1_0_pt_config(1535, 1, 4, true, 49152).smem == 49152, "gated PTQ1_0 must admit the 48 KiB boundary");
+static_assert(ptq1_0_pt_config(1536, 1, 4, false, 49152).rows_per_cta == 4, "ungated PTQ1_0 K=196608 must fit at 48 KiB");
 
 #ifndef PTQ1_0_PT_MINB_34
 #define PTQ1_0_PT_MINB_34 3
