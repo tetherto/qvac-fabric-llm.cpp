@@ -69,6 +69,7 @@ constexpr int CLIP_PREPROC_MAX_TILES_LIMIT = 256;
 #define KEY_PROJ_SAMPLE_WINDOW_SIDE "clip.vision.projector.window_side"
 #define KEY_PROJ_SPATIAL_OFFSETS    "clip.vision.projector.spatial_offsets"
 #define KEY_SPATIAL_MERGE_SIZE      "clip.vision.spatial_merge_size"
+#define KEY_SWIGLU_CLAMP            "clip.vision.swiglu_clamp"
 
 #define KEY_MM_PATCH_MERGE_TYPE    "clip.vision.mm_patch_merge_type"
 #define KEY_IMAGE_GRID_PINPOINTS   "clip.vision.image_grid_pinpoints"
@@ -482,6 +483,7 @@ enum projector_type {
     PROJECTOR_TYPE_DEEPSEEKOCR2,
     PROJECTOR_TYPE_LFM2A,
     PROJECTOR_TYPE_GLM4V,
+    PROJECTOR_TYPE_GLM5V,
     PROJECTOR_TYPE_YOUTUVL,
     PROJECTOR_TYPE_YASA2,
     PROJECTOR_TYPE_KIMIK25,
@@ -545,6 +547,7 @@ static std::map<projector_type, std::string> PROJECTOR_TYPE_NAMES = {
     { PROJECTOR_TYPE_DEEPSEEKOCR2,      "deepseekocr2"},
     { PROJECTOR_TYPE_LFM2A,             "lfm2a"},
     { PROJECTOR_TYPE_GLM4V,             "glm4v"},
+    { PROJECTOR_TYPE_GLM5V,             "glm5v"},
     { PROJECTOR_TYPE_YOUTUVL,           "youtuvl"},
     { PROJECTOR_TYPE_YASA2,             "yasa2"},
     { PROJECTOR_TYPE_KIMIK25,           "kimik25"},

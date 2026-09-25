@@ -1822,7 +1822,7 @@ ggml_tensor * llm_graph_context::build_ffn(
                         tmp = ggml_clamp(ctx0, tmp, -limit, limit);
                         cb(tmp, "ffn_up_clamped", il);
 
-                        if (arch == LLM_ARCH_DEEPSEEK4 || (arch == LLM_ARCH_DFLASH && hparams.dsv4_hc_mult > 0)) {
+                        if (arch == LLM_ARCH_DEEPSEEK4 || arch == LLM_ARCH_GLM5_NEXT || (arch == LLM_ARCH_DFLASH && hparams.dsv4_hc_mult > 0)) {
                             cur = ggml_clamp(ctx0, cur, -INFINITY, limit);
                             cb(cur, "ffn_gate_clamped", il);
                             cur = ggml_swiglu_split(ctx0, cur, tmp);
@@ -2236,7 +2236,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
                         up = ggml_clamp(ctx0, up, -limit, limit);
                         cb(up, "ffn_moe_up_clamped", il);
 
-                        if (arch == LLM_ARCH_DEEPSEEK4 || (arch == LLM_ARCH_DFLASH && hparams.dsv4_hc_mult > 0)) {
+                        if (arch == LLM_ARCH_DEEPSEEK4 || arch == LLM_ARCH_GLM5_NEXT || (arch == LLM_ARCH_DFLASH && hparams.dsv4_hc_mult > 0)) {
                             cur = ggml_clamp(ctx0, cur, -INFINITY, limit);
                             cb(cur, "ffn_moe_gate_clamped", il);
                             cur = ggml_swiglu_split(ctx0, cur, up);
@@ -2609,7 +2609,8 @@ ggml_tensor * llm_graph_context::build_attn_mha(
          ggml_tensor * sinks,
          ggml_tensor * v_mla,
                float   kq_scale,
-                 int   il) const {
+                 int   il,
+             int64_t   n_kv_max) const {
     const bool v_trans = v->nb[1] > v->nb[2];
 
     // split the batch into streams if needed
@@ -2645,6 +2646,10 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         res->add_fused_node({LLM_FUSED_OP_FLASH_ATTN, cur, il});
 
         ggml_flash_attn_ext_add_sinks(cur, sinks);
+        if (n_kv_max > 0) {
+            GGML_ASSERT(n_kv_max <= INT32_MAX);
+            ggml_flash_attn_ext_set_n_kv_max(cur, (int32_t) n_kv_max);
+        }
         ggml_flash_attn_ext_set_prec (cur, GGML_PREC_F32);
 
         if (v_mla) {
