@@ -16,6 +16,7 @@ ggml_metal_t ggml_metal_init(ggml_metal_device_t dev);
 void ggml_metal_free(ggml_metal_t ctx);
 
 const char * ggml_metal_get_name(ggml_metal_t ctx);
+uint64_t ggml_metal_get_fusion_count(ggml_metal_t ctx, enum ggml_op op);
 
 void ggml_metal_synchronize(ggml_metal_t ctx);
 

@@ -1236,9 +1236,11 @@ struct test_case {
 
     virtual bool run_whole_graph() { return false; }
     virtual std::vector<ggml_tensor *> fusion_test_nodes() { return {}; }
+    virtual std::pair<ggml_tensor *, ggml_tensor *> backend_self_compare_nodes() { return {nullptr, nullptr}; }
     virtual void prepare_graph(ggml_cgraph * graph) { GGML_UNUSED(graph); }
     virtual uint64_t fusion_count(ggml_backend_t backend) { GGML_UNUSED(backend); return 0; }
     virtual bool expect_fusion() { return false; }
+    virtual bool expect_no_fusion() { return false; }
     virtual bool use_weight_context() { return false; }
     virtual bool use_weight_context_sentinels() { return true; }
     virtual ggml_backend_buffer_type_t weight_buffer_type(ggml_backend_t backend) {
@@ -1366,6 +1368,7 @@ struct test_case {
         }
 
         ggml_tensor * out = build_graph(ctx.get(), ctx_weights.get());
+        const auto self_compare_nodes = backend_self_compare_nodes();
         current_op_name   = op_desc(out);
         check_for_f16_tensor(ctx.get());
 
@@ -1392,7 +1395,10 @@ struct test_case {
         // check if the backends support the ops
         bool supported = true;
         std::string unsupported_str;
-        for (ggml_backend_t backend : {backend1, backend2}) {
+        ggml_backend_t backends[] = {backend1, backend2};
+        const int n_backends = self_compare_nodes.first != nullptr ? 1 : 2;
+        for (int i_backend = 0; i_backend < n_backends; ++i_backend) {
+            ggml_backend_t backend = backends[i_backend];
             for (ggml_tensor * t = ggml_get_first_tensor(ctx.get()); t != NULL; t = ggml_get_next_tensor(ctx.get(), t)) {
                 if (!ggml_backend_supports_op(backend, t)) {
                     supported = false;
@@ -1535,21 +1541,31 @@ struct test_case {
         }
         bool cmp_ok = true;
         const uint64_t initial_fusion_count = fusion_count(backend1);
-        for (int i = 0; i < graph_replays() && cmp_ok && ud.ok; ++i) {
-            if (graph_replays() > 1 && ggml_backend_graph_compute(backend1, gf) != GGML_STATUS_SUCCESS) {
-                cmp_ok = false;
-                break;
+        if (self_compare_nodes.first != nullptr) {
+            cmp_ok = ggml_backend_graph_compute(backend1, gf) == GGML_STATUS_SUCCESS;
+            if (cmp_ok) {
+                callback(0, self_compare_nodes.first, self_compare_nodes.second, &ud);
             }
-            cmp_ok = ggml_backend_compare_graph_backend(backend1, backend2, gf, callback, &ud,
-                                                       run_whole_graph() ? fused_nodes_to_verify.data() : nullptr,
-                                                       fused_nodes_to_verify.size());
+        } else {
+            for (int i = 0; i < graph_replays() && cmp_ok && ud.ok; ++i) {
+                if (graph_replays() > 1 && ggml_backend_graph_compute(backend1, gf) != GGML_STATUS_SUCCESS) {
+                    cmp_ok = false;
+                    break;
+                }
+                cmp_ok = ggml_backend_compare_graph_backend(backend1, backend2, gf, callback, &ud,
+                                                           run_whole_graph() ? fused_nodes_to_verify.data() : nullptr,
+                                                           fused_nodes_to_verify.size());
+            }
         }
 
         // Create test result
-        const bool  fusion_ran  = !expect_fusion() || fusion_count(backend1) > initial_fusion_count;
-        bool        test_passed = ud.ok && cmp_ok && fusion_ran;
-        std::string error_msg   = !fusion_ran ? "fusion did not run" :
-                                  test_passed ? "" : (!cmp_ok ? "compare failed" : "test failed");
+        const uint64_t final_fusion_count = fusion_count(backend1);
+        const bool fusion_ran = !expect_fusion() || final_fusion_count > initial_fusion_count;
+        const bool fusion_skipped = !expect_no_fusion() || final_fusion_count == initial_fusion_count;
+        bool test_passed = ud.ok && cmp_ok && fusion_ran && fusion_skipped;
+        std::string error_msg = !fusion_ran ? "fusion did not run" :
+                                !fusion_skipped ? "fusion ran unexpectedly" :
+                                test_passed ? "" : (!cmp_ok ? "compare failed" : "test failed");
         test_result result(ggml_backend_name(backend1), current_op_name, vars(), "test", supported, test_passed,
                            error_msg);
 
@@ -5938,13 +5954,46 @@ struct test_fwht_signed : public test_case {
     const int64_t width;
     const int64_t n_tokens;
     const ggml_type type_x;
+    const bool overlap;
+
+    ggml_tensor * overlap_base = nullptr;
+    ggml_tensor * output = nullptr;
+    mutable bool has_fusion_counter = false;
 
     test_fwht_signed(int64_t blk = 1024, int64_t width = 5120, int64_t n_tokens = 7,
-                     ggml_type type_x = GGML_TYPE_F32)
-        : blk(blk), width(width), n_tokens(n_tokens), type_x(type_x) {}
+                     ggml_type type_x = GGML_TYPE_F32, bool overlap = false)
+        : blk(blk), width(width), n_tokens(n_tokens), type_x(type_x), overlap(overlap) {
+        GGML_ASSERT(!overlap || type_x == GGML_TYPE_F32);
+    }
 
     std::string vars() override {
-        return VARS_TO_STR4(blk, width, n_tokens, type_x);
+        return VARS_TO_STR5(blk, width, n_tokens, type_x, overlap);
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    bool skip_backend(ggml_backend_t backend) override {
+        if (!overlap) {
+            return false;
+        }
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
+        return strcmp(ggml_backend_reg_name(reg), "MTL") != 0;
+    }
+
+    uint64_t fusion_count(ggml_backend_t backend) override {
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
+        using counter_fn = uint64_t (*)(ggml_backend_t);
+        auto counter = (counter_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_metal_fwht_fusion_count");
+        has_fusion_counter = counter != nullptr;
+        return counter != nullptr ? counter(backend) : 0;
+    }
+
+    bool expect_fusion() override {
+        return type_x == GGML_TYPE_F32 && !overlap && has_fusion_counter;
+    }
+
+    bool expect_no_fusion() override {
+        return overlap && has_fusion_counter;
     }
 
     double max_nmse_err(ggml_backend_t backend) override {
@@ -5970,18 +6019,36 @@ struct test_fwht_signed : public test_case {
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, blk, blk);
         ggml_set_name(a, "a");
-        ggml_tensor * x = ggml_new_tensor_2d(ctx, type_x, width, n_tokens);
+
+        ggml_tensor * x = nullptr;
+        if (overlap) {
+            overlap_base = ::ggml_new_tensor_1d(ctx, GGML_TYPE_F32, width * n_tokens + 1);
+            ggml_set_name(overlap_base, "x_base");
+            x = ggml_view_2d(ctx, overlap_base, width, n_tokens, width * sizeof(float), 0);
+        } else {
+            x = ggml_new_tensor_2d(ctx, type_x, width, n_tokens);
+        }
         ggml_set_name(x, "x");
+
         ggml_tensor * s = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, width);
         ggml_set_name(s, "s");
 
         ggml_tensor * signs = type_x == s->type ? s : ggml_cast(ctx, s, type_x);
         ggml_tensor * cur = ggml_mul(ctx, x, signs);
         cur = ggml_reshape_2d(ctx, cur, blk, width / blk * n_tokens);
-        ggml_tensor * out = ggml_mul_mat(ctx, a, cur);
-        ggml_mul_mat_set_hint(out, GGML_HINT_SRC0_IS_HADAMARD);
-        ggml_set_name(out, "out");
-        return out;
+        output = ggml_mul_mat(ctx, a, cur);
+        ggml_mul_mat_set_hint(output, GGML_HINT_SRC0_IS_HADAMARD);
+        ggml_set_name(output, "out");
+        return output;
+    }
+
+    void prepare_graph(ggml_cgraph * graph) override {
+        GGML_UNUSED(graph);
+        if (overlap) {
+            GGML_ASSERT(overlap_base != nullptr && overlap_base->data != nullptr);
+            output->data = (char *) overlap_base->data + sizeof(float);
+            output->buffer = overlap_base->buffer;
+        }
     }
 
     void initialize_tensors(ggml_context * ctx) override {
@@ -6175,6 +6242,93 @@ struct test_mul_mat_id : public test_case {
 
     void initialize_tensors(ggml_context * ctx) override {
         init_mul_mat_id_tensors(ctx, n_mats);
+    }
+};
+
+struct test_ternary_f16_reference : public test_case {
+    const ggml_type type_a;
+    const bool use_ids;
+
+    ggml_tensor * candidate = nullptr;
+    ggml_tensor * reference = nullptr;
+
+    test_ternary_f16_reference(ggml_type type_a, bool use_ids) : type_a(type_a), use_ids(use_ids) {
+        GGML_ASSERT(type_a == GGML_TYPE_PQ2_0 || type_a == GGML_TYPE_PTQ1_0);
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR2(type_a, use_ids);
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    bool skip_backend(ggml_backend_t backend) override {
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
+        return strcmp(ggml_backend_reg_name(reg), "MTL") != 0;
+    }
+
+    std::pair<ggml_tensor *, ggml_tensor *> backend_self_compare_nodes() override {
+        return {candidate, reference};
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return ggml_op_name(use_ids ? GGML_OP_MUL_MAT_ID : GGML_OP_MUL_MAT);
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        if (use_ids) {
+            ggml_tensor * as = ggml_new_tensor_3d(ctx, type_a, 2048, 70, 4);
+            ggml_set_name(as, "as");
+            ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 2, 32);
+            ggml_set_name(ids, "ids");
+            ggml_tensor * b = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, 2048, 2, 32);
+            ggml_set_name(b, "b");
+            ggml_tensor * b_ref = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 2048, 2, 32);
+            ggml_set_name(b_ref, "b_ref");
+            candidate = ggml_mul_mat_id(ctx, as, b, ids);
+            reference = ggml_mul_mat_id(ctx, as, b_ref, ids);
+        } else {
+            ggml_tensor * a = ggml_new_tensor_2d(ctx, type_a, 1024, 67);
+            ggml_set_name(a, "a");
+            ggml_tensor * b = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, 1024, 16);
+            ggml_set_name(b, "b");
+            ggml_tensor * b_ref = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1024, 16);
+            ggml_set_name(b_ref, "b_ref");
+            candidate = ggml_mul_mat(ctx, a, b);
+            reference = ggml_mul_mat(ctx, a, b_ref);
+        }
+        ggml_set_name(candidate, "candidate_f16");
+        ggml_set_name(reference, "reference_f32");
+        return ggml_add(ctx, candidate, reference);
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "b") == 0 || strcmp(t->name, "b_ref") == 0) {
+                std::vector<float> data(ggml_nelements(t));
+                for (size_t i = 0; i < data.size(); ++i) {
+                    data[i] = ((int) (i * 17 % 31) - 15) / 16.0f;
+                }
+                if (t->type == GGML_TYPE_F16) {
+                    std::vector<ggml_fp16_t> data_f16(data.size());
+                    ggml_fp32_to_fp16_row(data.data(), data_f16.data(), data.size());
+                    ggml_backend_tensor_set(t, data_f16.data(), 0, data_f16.size() * sizeof(ggml_fp16_t));
+                } else {
+                    ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(float));
+                }
+            } else if (t->type == GGML_TYPE_I32) {
+                std::vector<int32_t> data(ggml_nelements(t));
+                for (size_t i = 0; i < data.size(); ++i) {
+                    data[i] = i % 4;
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(int32_t));
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
     }
 };
 
@@ -11289,6 +11443,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_fwht_signed(8192, 8192, 1));
     test_cases.emplace_back(new test_fwht_signed(4096, 4096, 1, GGML_TYPE_F16));
     test_cases.emplace_back(new test_fwht_signed(8192, 8192, 1, GGML_TYPE_F16));
+    test_cases.emplace_back(new test_fwht_signed(1024, 5120, 1, GGML_TYPE_F32, true));
     test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F32, 32, 1, 32)); // too small (N<64)
     test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F16, 64, 1, 64));
     test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F16, 128, 1, 128));
@@ -11353,6 +11508,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_PTQ1_0, GGML_TYPE_F32, 4, 2, false, 70, n, 2048));
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_PQ2_0, GGML_TYPE_F32, 4, 2, false, 70, n, 2048));
     }
+    test_cases.emplace_back(new test_ternary_f16_reference(GGML_TYPE_PTQ1_0, false));
+    test_cases.emplace_back(new test_ternary_f16_reference(GGML_TYPE_PQ2_0, false));
+    test_cases.emplace_back(new test_ternary_f16_reference(GGML_TYPE_PTQ1_0, true));
+    test_cases.emplace_back(new test_ternary_f16_reference(GGML_TYPE_PQ2_0, true));
 
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32, 2880, 32, 2880, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 2880, 32, 2880, {1, 1}, {1, 1}));
@@ -12876,6 +13035,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F32, 64, 2048, 64));
     test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F32, 128, 2048, 128));
     test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F32, 256, 2048, 256));
+    test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F32, 512, 1, 512));
     test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F32, 512, 2048, 512));
 
     test_cases.emplace_back(new test_solve_tri(GGML_TYPE_F32, { 64, 64, 4, 4 }, { 32, 64, 4, 4 }));

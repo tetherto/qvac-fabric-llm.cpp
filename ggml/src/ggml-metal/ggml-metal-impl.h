@@ -27,6 +27,13 @@
 #define N_R0_Q2_0 8
 #define N_SG_Q2_0 2
 
+#define N_R0_PQ2_0 8
+#define N_SG_PQ2_0 2
+#define N_R0_PTQ1_0 5
+#define N_R0_PTQ1_0_R4 4
+#define N_R0_PTQ1_0_ID 4
+#define N_SG_PTQ1_0 1
+
 #define N_R0_Q4_0 4
 #define N_SG_Q4_0 2
 // glu holds 2 accs per row, so use fewer rows per simdgroup
@@ -1349,8 +1356,14 @@ typedef struct {
     int32_t  len;
 } ggml_metal_kargs_argsort_merge;
 
+// Use one threadgroup per FWHT row for folded model widths.
+#define GGML_METAL_FWHT_TG_MIN_N 512
+#define GGML_METAL_FWHT_TG_NT    256
+#define GGML_METAL_FWHT_TG_NT_FALLBACK 128
+
 typedef struct {
     int32_t nrows;
+    int32_t n_blk;
 } ggml_metal_kargs_fwht;
 
 typedef struct {
