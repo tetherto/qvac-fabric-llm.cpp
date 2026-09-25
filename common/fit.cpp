@@ -46,115 +46,120 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
             ggml_log_callback callback;
             void * user_data;
         } original_logger;
-        ggml_log_level min_level; // prints below this log level go to debug log
 
-        ~user_data_t() {
-            llama_log_set(original_logger.callback, original_logger.user_data);
-        }
+        ggml_log_level min_level;  // prints below this log level go to debug log
     };
     user_data_t ud;
     llama_log_get(&ud.original_logger.callback, &ud.original_logger.user_data);
     ud.min_level = log_level;
 
-    llama_log_set([](ggml_log_level level, const char * text, void * user_data) {
-        const user_data_t * ud = (const user_data_t *) user_data;
-        const ggml_log_level level_eff = level >= ud->min_level ? level : GGML_LOG_LEVEL_DEBUG;
-        ud->original_logger.callback(level_eff, text, ud->original_logger.user_data);
-    }, &ud);
+    llama_log_set(
+        [](ggml_log_level level, const char * text, void * user_data) {
+            const user_data_t *  ud        = (const user_data_t *) user_data;
+            const ggml_log_level level_eff = level >= ud->min_level ? level : GGML_LOG_LEVEL_DEBUG;
+            ud->original_logger.callback(level_eff, text, ud->original_logger.user_data);
+        },
+        &ud);
 
-    llama_model_params mparams_copy = *mparams;
-    mparams_copy.no_alloc  = true;
-    mparams_copy.load_mode = LLAMA_LOAD_MODE_NONE;
+    try {
+        llama_model_params mparams_copy = *mparams;
+        mparams_copy.no_alloc           = true;
+        mparams_copy.load_mode          = LLAMA_LOAD_MODE_NONE;
 
-    llama_model_ptr model_owner(llama_model_load_from_file(path_model, mparams_copy));
-    llama_model * model = model_owner.get();
-    if (model == nullptr) {
-        throw std::runtime_error("failed to load model");
-    }
-
-    llama_context_ptr ctx_owner(llama_init_from_model(model, *cparams));
-    llama_context * ctx = ctx_owner.get();
-    if (ctx == nullptr) {
-        throw common_params_fit_exception("failed to create llama_context from model");
-    }
-
-    const size_t nd = llama_model_n_devices(model);
-    std::vector<llama_device_memory_data> ret(nd + 1);
-
-    llama_memory_breakdown memory_breakdown = llama_get_memory_breakdown(ctx);
-
-    for (const auto & [buft, mb] : memory_breakdown) {
-        if (ggml_backend_buft_is_host(buft)) {
-            ret.back().mb.model   += mb.model;
-            ret.back().mb.context += mb.context;
-            ret.back().mb.compute += mb.compute;
-            continue;
+        llama_model_ptr model_owner(llama_model_load_from_file(path_model, mparams_copy));
+        llama_model *   model = model_owner.get();
+        if (model == nullptr) {
+            throw std::runtime_error("failed to load model");
         }
 
-        ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
-        if (!dev) {
-            continue;
+        llama_context_ptr ctx_owner(llama_init_from_model(model, *cparams));
+        llama_context *   ctx = ctx_owner.get();
+        if (ctx == nullptr) {
+            throw common_params_fit_exception("failed to create llama_context from model");
+        }
+
+        const size_t                          nd = llama_model_n_devices(model);
+        std::vector<llama_device_memory_data> ret(nd + 1);
+
+        llama_memory_breakdown memory_breakdown = llama_get_memory_breakdown(ctx);
+
+        for (const auto & [buft, mb] : memory_breakdown) {
+            if (ggml_backend_buft_is_host(buft)) {
+                ret.back().mb.model += mb.model;
+                ret.back().mb.context += mb.context;
+                ret.back().mb.compute += mb.compute;
+                continue;
+            }
+
+            ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
+            if (!dev) {
+                continue;
+            }
+            for (size_t i = 0; i < nd; i++) {
+                if (dev == llama_model_get_device(model, i)) {
+                    ret[i].mb.model += mb.model;
+                    ret[i].mb.context += mb.context;
+                    ret[i].mb.compute += mb.compute;
+                    break;
+                }
+            }
+        }
+
+        {
+            ggml_backend_dev_t cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+            if (cpu_dev == nullptr) {
+                throw std::runtime_error("no CPU backend found");
+            }
+            size_t free;
+            size_t total;
+            ggml_backend_dev_memory(cpu_dev, &free, &total);
+            ret.back().free  = free;
+            ret.back().total = total;
         }
         for (size_t i = 0; i < nd; i++) {
-            if (dev == llama_model_get_device(model, i)) {
-                ret[i].mb.model   += mb.model;
-                ret[i].mb.context += mb.context;
-                ret[i].mb.compute += mb.compute;
-                break;
+            ggml_backend_dev_t dev = llama_model_get_device(model, i);
+
+            size_t free;
+            size_t total;
+            ggml_backend_dev_memory(dev, &free, &total);
+
+            // Some non-GPU accelerator backends, such as BLAS, report 0/0 and rely on
+            // the host-memory fallback. For GPU-like backends, keep 0/0 so --fit does
+            // not assign anything to a device with an unknown memory budget.
+            if (free == 0 && total == 0) {
+                const enum ggml_backend_dev_type type = ggml_backend_dev_type(dev);
+                if (type == GGML_BACKEND_DEVICE_TYPE_GPU || type == GGML_BACKEND_DEVICE_TYPE_IGPU) {
+                    LOG_WRN("%s: device %s did not report memory; --fit will not use it\n", __func__,
+                            ggml_backend_dev_name(dev));
+                } else {
+                    free  = ret.back().free;
+                    total = ret.back().total;
+                }
             }
+            ret[i].free  = free;
+            ret[i].total = total;
         }
-    }
 
-    {
-        ggml_backend_dev_t cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
-        if (cpu_dev == nullptr) {
-            throw std::runtime_error("no CPU backend found");
+        devs.clear();
+        for (int i = 0; i < llama_model_n_devices(model); i++) {
+            devs.push_back(llama_model_get_device(model, i));
         }
-        size_t free;
-        size_t total;
-        ggml_backend_dev_memory(cpu_dev, &free, &total);
-        ret.back().free  = free;
-        ret.back().total = total;
-    }
-    for (size_t i = 0; i < nd; i++) {
-        ggml_backend_dev_t dev = llama_model_get_device(model, i);
 
-        size_t free;
-        size_t total;
-        ggml_backend_dev_memory(dev, &free, &total);
-
-        // Some non-GPU accelerator backends, such as BLAS, report 0/0 and rely on
-        // the host-memory fallback. For GPU-like backends, keep 0/0 so --fit does
-        // not assign anything to a device with an unknown memory budget.
-        if (free == 0 && total == 0) {
-            const enum ggml_backend_dev_type type = ggml_backend_dev_type(dev);
-            if (type == GGML_BACKEND_DEVICE_TYPE_GPU || type == GGML_BACKEND_DEVICE_TYPE_IGPU) {
-                LOG_WRN("%s: device %s did not report memory; --fit will not use it\n",
-                        __func__, ggml_backend_dev_name(dev));
-            } else {
-                free  = ret.back().free;
-                total = ret.back().total;
-            }
+        hp_ngl = llama_model_n_layer(model);
+        if (mparams->load_mtp) {
+            hp_ngl += llama_model_n_layer_nextn(model);
         }
-        ret[i].free  = free;
-        ret[i].total = total;
+        hp_n_ctx_train = llama_model_n_ctx_train(model);
+        hp_n_expert    = llama_model_n_expert(model);
+
+        common_memory_breakdown_print(ctx);
+
+        llama_log_set(ud.original_logger.callback, ud.original_logger.user_data);
+        return ret;
+    } catch (...) {
+        llama_log_set(ud.original_logger.callback, ud.original_logger.user_data);
+        throw;
     }
-
-    devs.clear();
-    for (int i = 0; i < llama_model_n_devices(model); i++) {
-        devs.push_back(llama_model_get_device(model, i));
-    }
-
-    hp_ngl         = llama_model_n_layer(model);
-    if (mparams->load_mtp) {
-        hp_ngl    += llama_model_n_layer_nextn(model);
-    }
-    hp_n_ctx_train = llama_model_n_ctx_train(model);
-    hp_n_expert    = llama_model_n_expert(model);
-
-    common_memory_breakdown_print(ctx);
-
-    return ret;
 }
 
 common_device_memory_data_vec common_get_device_memory_data(

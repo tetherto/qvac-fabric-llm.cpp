@@ -113,11 +113,18 @@ static void test_probe_logger_restoration() {
             throw injected_exception{};
         }
     };
+#ifdef _WIN32
+    // C++ exceptions cannot safely unwind through a C callback across Windows DLL boundaries.
+    inject = false;
+#endif
     llama_log_set(callback, &inject);
     auto mparams = llama_model_default_params();
     auto cparams = llama_context_default_params();
     std::vector<ggml_backend_dev_t> devices;
     uint32_t layers = 0, context = 0, experts = 0;
+    ggml_log_callback               restored_callback;
+    void *                          restored_data;
+#ifndef _WIN32
     bool caught = false;
     try {
         common_get_device_memory_data("/nonexistent-fit-test/model.gguf", &mparams, &cparams, devices,
@@ -126,13 +133,12 @@ static void test_probe_logger_restoration() {
         caught = true;
     }
     inject = false;
-    ggml_log_callback restored_callback;
-    void * restored_data;
     llama_log_get(&restored_callback, &restored_data);
     expect_i64("probe exception injected", caught, true);
     expect_i64("probe restores callback", restored_callback == callback, true);
     expect_i64("probe restores callback data", restored_data == &inject, true);
-    // A second probe verifies that unwinding released the serialization mutex.
+#endif
+    // A failed load verifies that restoration released the serialization mutex.
     try {
         common_get_device_memory_data("/nonexistent-fit-test/model.gguf", &mparams, &cparams, devices,
                                       layers, context, experts, GGML_LOG_LEVEL_ERROR);

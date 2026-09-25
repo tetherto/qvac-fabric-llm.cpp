@@ -19,7 +19,10 @@ on:
     types: [opened, synchronize, reopened]
     paths: [
       '.github/workflows/build-openvino.yml',
-      'ggml/src/ggml-openvino/**'
+      'common/fit.cpp',
+      'ggml/src/ggml-openvino/**',
+      'src/llama-impl.cpp',
+      'tests/test-backend-ops.cpp'
     ]
 
 # QVAC divergence from upstream: dedupe per PR and per branch, so a re-push or

@@ -5904,6 +5904,11 @@ struct test_mul_mat_id_adreno_repack : public test_mul_mat_id {
 
     std::string vars() override { return test_mul_mat_id::vars() + ",adreno_trans4_ns=1"; }
 
+    bool skip_backend(ggml_backend_t backend) override {
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
+        return strcmp(ggml_backend_reg_name(reg), "OpenCL") != 0;
+    }
+
     void initialize_tensors(ggml_context * ctx) override {
         roundtrip_ok = init_mul_mat_id_adreno_repack_tensors(ctx, n_mats);
     }
