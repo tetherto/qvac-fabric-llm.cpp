@@ -56,6 +56,7 @@ typedef struct VkPhysicalDeviceCooperativeMatrixDecodeVectorFeaturesNV {
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cerrno>
 
 #include <cmath>
@@ -679,6 +680,12 @@ static constexpr std::array<ggml_type, 9> lightning_indexer_k_types = {
 
 class vk_memory_logger;
 
+// Wide FWHT pipelines use shared memory when per-lane register pressure exceeds the limit.
+static constexpr uint32_t GGML_VK_FWHT_NUM_SIZES         = 8;
+static constexpr uint32_t GGML_VK_FWHT_MAX_SUBGROUP_N    = 2048;
+static constexpr uint32_t GGML_VK_FWHT_MAX_SUBGROUP_EL_W = 64;
+static constexpr uint32_t GGML_VK_FWHT_ROWS              = 4;
+
 struct vk_device_struct {
     std::recursive_mutex mutex;
     std::mutex queue_submit_mutex;
@@ -994,7 +1001,10 @@ struct vk_device_struct {
     vk_pipeline pipeline_sum_rows_f32;
     vk_pipeline pipeline_cross_entropy_loss_f32, pipeline_cross_entropy_loss_f32_wg512;
     vk_pipeline pipeline_cross_entropy_loss_back_f32, pipeline_cross_entropy_loss_back_f32_wg512;
-    vk_pipeline pipeline_fwht_f32[4];
+    vk_pipeline pipeline_fwht_f32[GGML_VK_FWHT_NUM_SIZES];
+    vk_pipeline pipeline_fwht_f16[GGML_VK_FWHT_NUM_SIZES];
+    // rows a workgroup covers, chosen per width when the pipeline is built
+    uint32_t fwht_rows_per_wg[GGML_VK_FWHT_NUM_SIZES] = {};
     vk_pipeline pipeline_cumsum_f32;
     vk_pipeline pipeline_cumsum_small_f32;
     vk_pipeline pipeline_cumsum_multipass1_f32;
@@ -1561,6 +1571,8 @@ struct ggml_backend_vk_context {
     bool fused_topk_qsa {};
     bool fused_hc_post_gate {};
     rms_norm_mode fused_rms_norm_mode {RMS_NORM_COUNT};
+    bool fused_fwht_signed {};
+    std::atomic<uint64_t> fwht_fusion_count {};
 
     // for GGML_VK_PERF_LOGGER
     std::unique_ptr<vk_perf_logger> perf_logger;
