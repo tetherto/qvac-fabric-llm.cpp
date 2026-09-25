@@ -30,3 +30,24 @@ include = [
 [overrides.rules]
 unsupported-operator = "ignore"
 not-subscriptable = "ignore"
+
+# The XDNA NPU kernel generators build IRON/MLIR-AIE designs. That toolchain
+# (aie.*, pyxrt, ml_dtypes) is not pip-installable and is not in requirements,
+# so its imports never resolve and every type behind them is Unknown.
+#
+# IRON also declares a tile type as np.ndarray[(N,), np.dtype[T]]. That is the
+# shape the toolchain expects and it is passed as a value, not used to annotate
+# anything, but it is not a valid type expression.
+[[overrides]]
+include = [
+    "./ggml/src/ggml-xdna/kernels/**",
+]
+
+[overrides.rules]
+unresolved-import = "ignore"
+unresolved-attribute = "ignore"
+not-subscriptable = "ignore"
+invalid-type-form = "ignore"
+invalid-type-arguments = "ignore"
+invalid-argument-type = "ignore"
+invalid-assignment = "ignore"
