@@ -636,7 +636,6 @@ void matmul_shaders(bool fp16, MatMulIdType matmul_id_type, bool coopmat, bool c
         if (coopmat2 && (tname == "tbq3_0" || tname == "tbq4_0" || tname == "pq3_0" || tname == "pq4_0")) {
             continue;
         }
-        // PTQ1_0 and PQ2_0 have no coopmat2 decoder in dequant_funcs_cm2.glsl, so no mul_mm_cm2 for them; they use the scalar and coopmat1 matmul paths
 
         std::string data_a_key = "DATA_A_" + to_uppercase(tname);
         // For aligned matmul loads
