@@ -2775,8 +2775,18 @@ bool ggml_backend_compare_graph_backend(ggml_backend_t backend1, ggml_backend_t 
             struct ggml_cgraph g1v = ggml_graph_view(g1, i, i + 1);
             struct ggml_cgraph g2v = ggml_graph_view(g2, i, i + 1);
 
+            if (getenv("GGML_BACKEND_COMPARE_DIAGNOSTICS")) {
+                fprintf(stderr, "DIAG compute %s start\n", ggml_backend_name(backend1));
+            }
             ggml_backend_graph_compute(backend1, &g1v);
+            if (getenv("GGML_BACKEND_COMPARE_DIAGNOSTICS")) {
+                fprintf(stderr, "DIAG compute %s done\n", ggml_backend_name(backend1));
+                fprintf(stderr, "DIAG compute %s start\n", ggml_backend_name(backend2));
+            }
             ggml_backend_graph_compute(backend2, &g2v);
+            if (getenv("GGML_BACKEND_COMPARE_DIAGNOSTICS")) {
+                fprintf(stderr, "DIAG compute %s done\n", ggml_backend_name(backend2));
+            }
 
             if (ggml_is_view_op(t1->op)) {
                 continue;

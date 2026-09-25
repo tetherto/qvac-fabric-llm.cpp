@@ -1445,9 +1445,15 @@ struct test_case {
         }
 
         // randomize tensors
+        if (getenv("GGML_BACKEND_COMPARE_DIAGNOSTICS")) {
+            fprintf(stderr, "DIAG initialize %s start\n", vars().c_str());
+        }
         initialize_tensors(ctx.get());
         if (ctx_weights) {
             initialize_tensors(ctx_weights.get());
+        }
+        if (getenv("GGML_BACKEND_COMPARE_DIAGNOSTICS")) {
+            fprintf(stderr, "DIAG initialize %s done\n", vars().c_str());
         }
 
         // compare
@@ -1535,9 +1541,15 @@ struct test_case {
                 cmp_ok = false;
                 break;
             }
+            if (getenv("GGML_BACKEND_COMPARE_DIAGNOSTICS")) {
+                fprintf(stderr, "DIAG compare %s start\n", vars().c_str());
+            }
             cmp_ok = ggml_backend_compare_graph_backend(backend1, backend2, gf, callback, &ud,
                                                        run_whole_graph() ? fused_nodes_to_verify.data() : nullptr,
                                                        fused_nodes_to_verify.size());
+            if (getenv("GGML_BACKEND_COMPARE_DIAGNOSTICS")) {
+                fprintf(stderr, "DIAG compare %s done\n", vars().c_str());
+            }
         }
 
         // Create test result
@@ -5903,11 +5915,6 @@ struct test_mul_mat_id_adreno_repack : public test_mul_mat_id {
         test_mul_mat_id(type_a, GGML_TYPE_F32, n_mats, n_used, bcast, m, n, k) {}
 
     std::string vars() override { return test_mul_mat_id::vars() + ",adreno_trans4_ns=1"; }
-
-    bool skip_backend(ggml_backend_t backend) override {
-        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
-        return strcmp(ggml_backend_reg_name(reg), "OpenCL") != 0;
-    }
 
     void initialize_tensors(ggml_context * ctx) override {
         roundtrip_ok = init_mul_mat_id_adreno_repack_tensors(ctx, n_mats);
