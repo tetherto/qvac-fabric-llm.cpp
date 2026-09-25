@@ -239,6 +239,7 @@ class Keys:
             LOCAL_BLOCKS = "{arch}.attention.indexer.local_blocks"  # MSA
             TYPES      = "{arch}.attention.indexer.types"
             KPOOL             = "{arch}.attention.indexer.kpool"              # GLM5-Next
+            INDEX_SHARE_MTP   = "{arch}.attention.indexer.index_share_mtp"    # GLM5-Next
             KPOOL_SELECT_TAIL = "{arch}.attention.indexer.kpool_select_tail"  # GLM5-Next
             SOURCE_LAYERS          = "{arch}.attention.indexer.source_layers"
             CANDIDATE_SOURCE_LAYER = "{arch}.attention.indexer.candidate_source_layer"
