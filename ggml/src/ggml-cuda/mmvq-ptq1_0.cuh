@@ -651,8 +651,8 @@ static bool mul_mat_vec_ptq1_0_pt_switch(
     }
     const int device = ggml_cuda_get_device();
     const int cc = ggml_cuda_info().devices[device].cc;
-    if (ncols_dst > 1 && cc == GGML_CUDA_CC_BLACKWELL) {
-        return false; // RTX 5090 sm_120 exceeds the NMSE tolerance at 2-4 columns.
+    if (ncols_dst > 1 && cc >= GGML_CUDA_CC_BLACKWELL) {
+        return false; // RTX 5090 sm_120 exceeds the NMSE tolerance at 2-4 columns; leave newer GPUs on the generic path.
     }
     const int rows_per_item = ncols_dst <= 2 ? 4 : (ncols_dst <= 4 ? PTQ1_0_PT_ROWS_34 : 2);
     const bool has_gate = fusion.gate != nullptr;
