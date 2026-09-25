@@ -343,6 +343,90 @@ static bool ggml_metal_fusion_check_snake(
     return types_ok && shape_ok && dim_ok && contig_ok && x_in_add == x;
 }
 
+// true if the byte ranges of two tensors overlap in the same Metal buffer
+static bool ggml_metal_fusion_overlap(const ggml_tensor * a, const ggml_tensor * b) {
+    ggml_backend_buffer_t ba = a->view_src ? a->view_src->buffer : a->buffer;
+    ggml_backend_buffer_t bb = b->view_src ? b->view_src->buffer : b->buffer;
+
+    const ggml_metal_buffer_id bid_a = ggml_metal_buffer_get_id((ggml_metal_buffer_t) ba->context, a);
+    const ggml_metal_buffer_id bid_b = ggml_metal_buffer_get_id((ggml_metal_buffer_t) bb->context, b);
+
+    if (bid_a.metal == nullptr || bid_a.metal != bid_b.metal) {
+        return false;
+    }
+
+    return bid_a.offs <= bid_b.offs
+        ? bid_b.offs - bid_a.offs < ggml_nbytes(a)
+        : bid_a.offs - bid_b.offs < ggml_nbytes(b);
+}
+
+// MUL + MUL_MAT(hadamard): the sign vector folds into the FWHT kernel, so the MUL is elided.
+// the MUL_MAT reads the MUL through a RESHAPE, which is not a chain link, so the checks live
+// here (unsafe = true): the raw pattern MUL -> RESHAPE -> MUL_MAT must be consecutive and the
+// MUL/RESHAPE must have no other consumers.
+static bool ggml_metal_fusion_check_fwht_signed(
+        const ggml_metal_fusion      * fusion,
+        const ggml_tensor * const    * nodes,
+        const ggml_cgraph            * gf,
+        const int                    * node_idxs,
+              int                      idx,
+              ggml_metal_fusion_mode   mode) {
+    const std::vector<ggml_op> & ops_all = fusion->ops_all;
+
+    const int raw_start = node_idxs[idx];
+    const int raw_end   = node_idxs[idx + 1];
+    const int raw_count = raw_end - raw_start + 1;
+
+    if (raw_count != (int) ops_all.size()) {
+        return false;
+    }
+
+    int raw_idxs[GGML_METAL_FUSION_MAX];
+    for (int i = 0; i < raw_count; ++i) {
+        raw_idxs[i] = raw_start + i;
+        if (gf->nodes[raw_start + i]->op != ops_all[i]) {
+            return false;
+        }
+    }
+
+    const ggml_tensor * mul     = nodes[0];
+    const ggml_tensor * reshape = gf->nodes[raw_start + 1];
+    const ggml_tensor * mm      = nodes[1];
+
+    // the fusion table has no device handle, so the threadgroup-memory bound of the wide FWHT
+    // kernels is not checked here; the encoder (ggml_metal_op_fwht_signed_elidable) re-checks
+    // against the device and falls back to the unfused MUL + MUL_MAT when it does not fit
+    if (reshape->src[0] != mul || mm->src[1] != reshape ||
+        !ggml_metal_op_mul_mat_use_fwht(mm, SIZE_MAX)) {
+        return false;
+    }
+
+    const ggml_tensor * x     = ggml_are_same_shape(mul, mul->src[0]) ? mul->src[0] : mul->src[1];
+    const ggml_tensor * signs = x == mul->src[0] ? mul->src[1] : mul->src[0];
+    const int64_t n = mm->src[0]->ne[0];
+
+    const bool ok =
+        signs->type == GGML_TYPE_F32 &&
+        signs->ne[1] == 1 && signs->ne[2] == 1 && signs->ne[3] == 1 &&
+        x->type == GGML_TYPE_F32 && mul->type == GGML_TYPE_F32 && mm->type == GGML_TYPE_F32 &&
+        ggml_is_contiguous(x) && ggml_is_contiguous(signs) && ggml_is_contiguous(mm) &&
+        signs->ne[0] == x->ne[0] && signs->ne[0] % n == 0;
+
+    if (!ok) {
+        return false;
+    }
+
+    if (mode == GGML_METAL_FUSION_FULL) {
+        // the kernel reads x and writes mm in one pass
+        if (ggml_metal_fusion_overlap(x, mm)) {
+            return false;
+        }
+    }
+
+    const int outputs[1] = { raw_end };
+    return ggml_can_fuse_subgraph_ext(gf, raw_idxs, raw_count, ops_all.data(), outputs, 1);
+}
+
 #define GGML_METAL_TOPK_MOE_MAX_EXPERTS 1024
 
 // SOFT_MAX + ARGSORT + GET_ROWS (plus optional norm/scale) for MoE routing.
@@ -880,6 +964,9 @@ static const std::vector<ggml_op> ops_snake = { GGML_OP_MUL, GGML_OP_SIN, GGML_O
 
 static const std::vector<ggml_op> ops_gdn_cache = { GGML_OP_GATED_DELTA_NET, GGML_OP_CPY };
 
+// the RESHAPE is an empty op: it is part of the raw pattern (alloc deps) but not of the fused chain
+static const std::vector<ggml_op> ops_fwht_signed = { GGML_OP_MUL, GGML_OP_RESHAPE, GGML_OP_MUL_MAT };
+
 static const std::vector<ggml_op> ops_ssm_conv_silu = { GGML_OP_SSM_CONV, GGML_OP_UNARY };
 
 static const std::vector<ggml_op> ops_mul_mv_glu         = { GGML_OP_MUL_MAT,    GGML_OP_MUL_MAT,    GGML_OP_GLU };
@@ -1081,7 +1168,13 @@ static const std::vector<ggml_metal_fusion> ggml_metal_fusions = {
     { GGML_METAL_FUSION_MUL_MV_GLU,     ops_mul_mv_id_glu_stkd,     {},     true,  ggml_metal_fusion_check_mul_mv_glu_stacked },
     { GGML_METAL_FUSION_MUL_MV_ID_MUL,  ops_mul_mv_id_mul,          {},     true,  ggml_metal_fusion_check_mul_mv_id_mul },
     { GGML_METAL_FUSION_UNARY_MUL,      ops_unary_mul,              {},     false, ggml_metal_fusion_check_unary_mul },
+    { GGML_METAL_FUSION_FWHT_SIGNED,    ops_fwht_signed,            {},     true,  ggml_metal_fusion_check_fwht_signed },
 };
+
+ggml_metal_fusion_id ggml_metal_fusion_id_at(int idx) {
+    GGML_ASSERT(idx >= 0 && idx < (int) ggml_metal_fusions.size());
+    return ggml_metal_fusions[idx].id;
+}
 
 // ---- alloc deps -----------------------------------------------------------
 

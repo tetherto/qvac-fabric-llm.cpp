@@ -1029,6 +1029,26 @@ static void ggml_backend_metal_fusion_set_enabled(ggml_backend_fusion_t finfo, b
     ggml_metal_fusion_info_set_enabled((struct ggml_metal_fusion_info *) finfo, enabled);
 }
 
+// signed FWHT fusion counter for test-backend-ops; the first call turns the device stats on
+static uint64_t ggml_backend_metal_fwht_fusion_count(ggml_backend_t backend) {
+    GGML_ASSERT(ggml_backend_is_metal(backend));
+
+    struct ggml_metal_fusion_info * finfo = ggml_metal_device_get_fusion_info((ggml_metal_device_t) backend->device->context);
+    ggml_metal_fusion_info_stats_init(finfo);
+
+    // the counters are indexed like the fusion table
+    const int n = ggml_metal_fusion_info_n_fusions(finfo);
+
+    uint64_t res = 0;
+    for (int i = 0; i < n; i++) {
+        if (ggml_metal_fusion_id_at(i) == GGML_METAL_FUSION_FWHT_SIGNED) {
+            res += ggml_metal_fusion_info_count(finfo, i);
+        }
+    }
+
+    return res;
+}
+
 static void * ggml_backend_metal_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     if (strcmp(name, "ggml_backend_get_features") == 0) {
         return (void *)ggml_backend_metal_get_features;
@@ -1067,6 +1087,9 @@ static void * ggml_backend_metal_get_proc_address(ggml_backend_reg_t reg, const 
     }
     if (strcmp(name, "ggml_backend_fusion_set_enabled") == 0) {
         return (void *)ggml_backend_metal_fusion_set_enabled;
+    }
+    if (strcmp(name, "ggml_backend_metal_fwht_fusion_count") == 0) {
+        return (void *)ggml_backend_metal_fwht_fusion_count;
     }
 
     return NULL;
