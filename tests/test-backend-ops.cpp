@@ -5955,35 +5955,44 @@ struct test_fwht_signed : public test_case {
     const int64_t n_tokens;
     const ggml_type type_x;
     const bool overlap;
+    const bool unaligned_sign;
 
     ggml_tensor * overlap_base = nullptr;
     ggml_tensor * output = nullptr;
     mutable bool has_fusion_counter = false;
 
     test_fwht_signed(int64_t blk = 1024, int64_t width = 5120, int64_t n_tokens = 7,
-                     ggml_type type_x = GGML_TYPE_F32, bool overlap = false)
-        : blk(blk), width(width), n_tokens(n_tokens), type_x(type_x), overlap(overlap) {
-        GGML_ASSERT(!overlap || type_x == GGML_TYPE_F32);
+                     ggml_type type_x = GGML_TYPE_F32, bool overlap = false, bool unaligned_sign = false)
+        : blk(blk), width(width), n_tokens(n_tokens), type_x(type_x), overlap(overlap), unaligned_sign(unaligned_sign) {
+        GGML_ASSERT((!overlap && !unaligned_sign) || type_x == GGML_TYPE_F32);
+        GGML_ASSERT(!overlap || !unaligned_sign);
     }
 
     std::string vars() override {
-        return VARS_TO_STR5(blk, width, n_tokens, type_x, overlap);
+        return VARS_TO_STR6(blk, width, n_tokens, type_x, overlap, unaligned_sign);
     }
 
     bool run_whole_graph() override { return true; }
 
     bool skip_backend(ggml_backend_t backend) override {
-        if (!overlap) {
+        if (!overlap && !unaligned_sign) {
             return false;
         }
         ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
-        return strcmp(ggml_backend_reg_name(reg), "MTL") != 0;
+        const char * name = ggml_backend_reg_name(reg);
+        if (unaligned_sign) {
+            return strcmp(name, "Vulkan") != 0;
+        }
+        return strcmp(name, "MTL") != 0 && strcmp(name, "Vulkan") != 0;
     }
 
     uint64_t fusion_count(ggml_backend_t backend) override {
         ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
+        const char * name = ggml_backend_reg_name(reg);
+        const char * symbol = strcmp(name, "Vulkan") == 0 ?
+            "ggml_backend_vk_fwht_fusion_count" : "ggml_backend_metal_fwht_fusion_count";
         using counter_fn = uint64_t (*)(ggml_backend_t);
-        auto counter = (counter_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_metal_fwht_fusion_count");
+        auto counter = (counter_fn) ggml_backend_reg_get_proc_address(reg, symbol);
         has_fusion_counter = counter != nullptr;
         return counter != nullptr ? counter(backend) : 0;
     }
@@ -6030,7 +6039,14 @@ struct test_fwht_signed : public test_case {
         }
         ggml_set_name(x, "x");
 
-        ggml_tensor * s = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, width);
+        ggml_tensor * s;
+        if (unaligned_sign) {
+            ggml_tensor * s_base = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, width + 1);
+            ggml_set_name(s_base, "s_base");
+            s = ggml_view_1d(ctx, s_base, width, sizeof(float));
+        } else {
+            s = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, width);
+        }
         ggml_set_name(s, "s");
 
         ggml_tensor * signs = type_x == s->type ? s : ggml_cast(ctx, s, type_x);
@@ -6266,7 +6282,8 @@ struct test_ternary_f16_reference : public test_case {
 
     bool skip_backend(ggml_backend_t backend) override {
         ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
-        return strcmp(ggml_backend_reg_name(reg), "MTL") != 0;
+        const char * name = ggml_backend_reg_name(reg);
+        return strcmp(name, "MTL") != 0 && strcmp(name, "Vulkan") != 0;
     }
 
     std::pair<ggml_tensor *, ggml_tensor *> backend_self_compare_nodes() override {
@@ -11439,6 +11456,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_fwht_signed(512, 512, 1, GGML_TYPE_F16));
     test_cases.emplace_back(new test_fwht_signed(1024, 5120, 1));
     test_cases.emplace_back(new test_fwht_signed(1024, 5120, 32));
+    test_cases.emplace_back(new test_fwht_signed(1024, 5120, 32, GGML_TYPE_F32, false, true));
     test_cases.emplace_back(new test_fwht_signed(1024, 6144, 7, GGML_TYPE_F16));
     test_cases.emplace_back(new test_fwht_signed(1024, 17408, 3));
     test_cases.emplace_back(new test_fwht_signed(4096, 4096, 1));

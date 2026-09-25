@@ -230,6 +230,21 @@ void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uin
             const uint k_pair = row * LOAD_VEC_A / 2;
             store_a(col, k_pair,     FLOAT_TYPEV2(v.xy));
             store_a(col, k_pair + 1, FLOAT_TYPEV2(v.zw));
+#elif defined(DATA_A_PTQ1_0)
+            const uint idx = pos_a + col * p.stride_a / LOAD_VEC_A + row;
+
+            const uint ib  = idx / 16;
+            const uint grp = idx & 0xfu;      // which 8-element group inside the block
+            const uint e0  = grp * 8u;
+
+            const float d = float(data_a[ib].d);
+
+            const uint k_pair = row * LOAD_VEC_A / 2;
+            [[unroll]] for (uint l = 0; l < 4; ++l) {
+                store_a(col, k_pair + l, FLOAT_TYPEV2(
+                    ptq1_0_trit(ib, 0u, e0 + 2u*l)      * d,
+                    ptq1_0_trit(ib, 0u, e0 + 2u*l + 1u) * d));
+            }
 #elif defined(DATA_A_Q1_0)
             const uint idx = pos_a + col * p.stride_a / LOAD_VEC_A + row;
 
@@ -319,6 +334,18 @@ void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uin
 
             const uint k_pair = row * LOAD_VEC_A / 2;
             store_a(col, k_pair, FLOAT_TYPEV2(v.xy));
+#elif defined(DATA_A_PQ2_0)
+            const uint idx = pos_a + col * p.stride_a / LOAD_VEC_A + row;
+
+            const uint ib = idx / 32;
+            const uint iqs = idx & 0x1fu;
+
+            const FLOAT_TYPE d = FLOAT_TYPE(data_a[ib].d);
+            const uint bits = uint(data_a[ib].qs[iqs]);
+
+            const uint k_pair = row * LOAD_VEC_A / 2;
+            store_a(col, k_pair,     d * (FLOAT_TYPEV2(bits & 3u, (bits >> 2u) & 3u) - FLOAT_TYPEV2(1.0f)));
+            store_a(col, k_pair + 1, d * (FLOAT_TYPEV2((bits >> 4u) & 3u, bits >> 6u) - FLOAT_TYPEV2(1.0f)));
 #elif defined(DATA_A_TBQ3_0) || defined(DATA_A_PQ3_0) || defined(DATA_A_TBQ3_0_64) || defined(DATA_A_PQ3_0_64) || \
       defined(DATA_A_TBQ4_0) || defined(DATA_A_PQ4_0) || defined(DATA_A_TBQ4_0_64) || defined(DATA_A_PQ4_0_64)
             // LOAD_VEC_A is 2 for TBQ/PQ 3/4-bit variants (see vulkan-shaders-gen.cpp).
