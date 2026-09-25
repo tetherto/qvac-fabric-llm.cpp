@@ -3241,7 +3241,7 @@ static int ggml_metal_op_fwht_impl(ggml_metal_op_t ctx, ggml_tensor * op, ggml_t
         pipeline = ggml_metal_library_get_pipeline_fwht(lib, n, src->type, nth);
     }
     if (!pipeline.pipeline || (nth != 0 && ggml_metal_pipeline_max_theads_per_threadgroup(pipeline) < nth)) {
-        return 0;
+        GGML_ABORT("FWHT pipeline unavailable: n=%lld, type=%s, nth=%d", (long long) n, ggml_type_name(src->type), nth);
     }
 
     const int th_max = ggml_metal_pipeline_max_theads_per_threadgroup(pipeline);
@@ -3333,9 +3333,7 @@ static int ggml_metal_op_fwht_signed(ggml_metal_op_t ctx, int idx) {
         ggml_metal_op_concurrency_reset(ctx);
     }
 
-    if (!ggml_metal_op_fwht_impl(ctx, mm, x, signs)) {
-        return 0;
-    }
+    ggml_metal_op_fwht_impl(ctx, mm, x, signs);
     __atomic_fetch_add(&ctx->fuse_cnt[GGML_OP_MUL_MAT], 1, __ATOMIC_RELAXED);
     if (ctx->debug_fusion > 0) {
         GGML_LOG_INFO("%s: fused signed FWHT\n", __func__);

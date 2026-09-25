@@ -1,14 +1,20 @@
+import os
+import tempfile
 import pytest
 from utils import *
 
 server = ServerPreset.tinyllama2()
 
-
-def get_slots():
-    res = server.make_request("GET", "/slots")
-    assert res.status_code == 200
-    return {slot["id"]: slot for slot in res.body}
-
+class LogReader:
+    def __init__(self, path):
+        self.path = path
+        self.pos = 0
+    def drain(self):
+        with open(self.path) as f:
+            f.seek(self.pos)
+            content = f.read()
+            self.pos = f.tell()
+        return content
 
 @pytest.fixture(autouse=True)
 def create_server():
@@ -20,6 +26,9 @@ def create_server():
     server.server_slots = True
     server.cache_ram = 100
     server.kv_unified = True
+    server.debug = True
+    fd, server.log_path = tempfile.mkstemp(suffix='.log')
+    os.close(fd)
     yield
 
 
@@ -36,6 +45,10 @@ LONG_PROMPT = (
 def test_clear_and_restore():
     global server
     server.start()
+    log = LogReader(server.log_path)
+
+    # verify feature is enabled
+    assert "__TEST_TAG_CACHE_IDLE_SLOTS_ENABLED__" in log.drain()
 
     res = server.make_request("POST", "/completion", data={
         "prompt": LONG_PROMPT,
@@ -45,9 +58,8 @@ def test_clear_and_restore():
     assert res.status_code == 200
     original_prompt_n = res.body["timings"]["prompt_n"]
 
-    slots = get_slots()
-    assert slots[0]["n_prompt_tokens"] > 0
-    assert slots[1].get("n_prompt_tokens", 0) == 0
+    # Slot 0 is the only slot with KV — should NOT be cleared
+    assert "__TEST_TAG_CACHE_IDLE_SLOT__" not in log.drain()
 
     # Launching slot 1 clears idle slot 0
     res = server.make_request("POST", "/completion", data={
@@ -56,34 +68,43 @@ def test_clear_and_restore():
         "cache_prompt": True,
     })
     assert res.status_code == 200
-    slots = get_slots()
-    assert slots[0]["n_prompt_tokens"] == 0
-    assert slots[1]["n_prompt_tokens"] > 0
+    assert "__TEST_TAG_CACHE_IDLE_SLOT__" in log.drain()
 
-    # Re-send same prompt to restore from cache-ram
+    # Re-send same prompt — should restore from cache-ram
     res = server.make_request("POST", "/completion", data={
         "prompt": LONG_PROMPT,
         "cache_prompt": True,
     })
     assert res.status_code == 200
 
+    # TODO: Apply this fix to all exact match log tests
+    # rely on timings to detect cache restore
+    # relying on exact log text is brittle, even more on rebases with upstream
+    # Otherwise we can see job failing like this:
+    # https://github.com/tetherto/qvac-fabric-llm.cpp/actions/runs/30584847301/job/91013698180?pr=190
     assert res.body["timings"]["cache_n"] > 0
     assert res.body["timings"]["prompt_n"] < original_prompt_n
 
+    # consume remaining logs for test cleanliness
+    _ = log.drain()
 
-    # Follow-up: slot 0 kept its KV, no clearing needed
+    # Follow-up — slot 0 kept its KV, no clearing needed
     res = server.make_request("POST", "/completion", data={
         "prompt": LONG_PROMPT + " The knight finally reached the castle gates.",
         "cache_prompt": True,
     })
     assert res.status_code == 200
-    assert res.body["timings"]["cache_n"] > 0
+    assert "__TEST_TAG_CACHE_IDLE_SLOT__" not in log.drain()
 
 
 def test_disabled_with_flag():
     global server
     server.no_cache_idle_slots = True
     server.start()
+    log = LogReader(server.log_path)
+
+    # Feature should not be enabled
+    assert "__TEST_TAG_CACHE_IDLE_SLOTS_ENABLED__" not in log.drain()
 
     res = server.make_request("POST", "/completion", data={
         "prompt": LONG_PROMPT,
@@ -92,13 +113,11 @@ def test_disabled_with_flag():
     })
     assert res.status_code == 200
 
-    # Request on different slot should not trigger clearing
+    # Request on different slot — should NOT trigger clearing
     res = server.make_request("POST", "/completion", data={
         "prompt": "The quick brown fox",
         "id_slot": 1,
         "cache_prompt": True,
     })
     assert res.status_code == 200
-    slots = get_slots()
-    assert slots[0]["n_prompt_tokens"] > 0
-    assert slots[1]["n_prompt_tokens"] > 0
+    assert "__TEST_TAG_CACHE_IDLE_SLOT__" not in log.drain()
