@@ -241,6 +241,9 @@ void xdna_rec_core_free(xdna_rec_core * core) {
     xdna_buffer_free(core->gstate);
     xdna_buffer_free(core->azg);
     xdna_buffer_free(core->out);
+    // Allocated by xdna_rec_core_fuse_so, which runs once per recurrent layer:
+    // without this every model load leaks one of these per layer.
+    xdna_buffer_free(core->gbuf);
     if (core->kern) {
         xdna_kernel_free(core->kern);
     }
