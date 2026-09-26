@@ -651,6 +651,63 @@ static xdna_rec_session * xdna_rec_session_get(ggml_backend_xdna_context * ctx,
     return s;
 }
 
+// A session reseeds when llama's recurrent cache becomes authoritative again.
+// Two signals, and the first one alone is not enough:
+//
+// - A graph of more than one token is a prefill: it reads the cache and writes
+//   its result there, so the device's copy is stale afterwards.
+// - A graph that zeroes a session's cell is a new sequence in that cell
+//   (llama's rs_z). This is the one a one-token prompt has and the token count
+//   misses, and without it a second request on the same slot decoded on top of
+//   the first one's state.
+//
+// Only the flag is set here; nothing is written into llama's memory. Writing
+// the device's state back into the cache - so a prefill that continues the
+// sequence picks up where the decode left it - belongs with the fused-layer
+// work that makes it correct for every request, not here.
+static void xdna_rec_mark_cache_reset(ggml_backend_xdna_context * ctx,
+                                      const ggml_cgraph * cgraph) {
+    if (ctx->rec.empty()) {
+        return;
+    }
+    // A prefill ubatch rewrites the cache for every live session.
+    if (g_glue_n_tokens > 1) {
+        for (auto & kv : ctx->rec) {
+            kv.second->reseed = true;
+        }
+    }
+    const auto cache_row = [](const ggml_tensor * t, int & il) -> bool {
+        const ggml_tensor * b = t && t->view_src ? t->view_src : t;
+        const char * n = b ? ggml_get_name(b) : nullptr;
+        if (!n) {
+            return false;
+        }
+        if (strncmp(n, "cache_s_l", 9) == 0 || strncmp(n, "cache_r_l", 9) == 0) {
+            il = atoi(n + 9);
+            return true;
+        }
+        return false;
+    };
+    for (int i = 0; i < cgraph->n_nodes; i++) {
+        const ggml_tensor * n = cgraph->nodes[i];
+        // rs_z: an in-place scale by zero of one whole cell, empty when no
+        // cell is cleared.
+        int il = -1;
+        if (n->op != GGML_OP_SCALE || !n->view_src || !cache_row(n, il) ||
+            ggml_nelements(n) <= 0) {
+            continue;
+        }
+        const size_t row_b = (size_t) ggml_nelements(n) * sizeof(float);
+        const size_t off   = (size_t) ((const char *) n->data -
+                                       (const char *) n->view_src->data);
+        const int64_t row = (int64_t) (off / row_b);
+        const auto it = ctx->rec.find(std::make_pair(il, row));
+        if (it != ctx->rec.end() && it->second) {
+            it->second->reseed = true;
+        }
+    }
+}
+
 static const float * xdna_rec_tdata(const ggml_tensor * t, int64_t want) {
     if (!t || !t->data || t->type != GGML_TYPE_F32 || t->ne[0] * t->ne[1] < want) {
         return nullptr;
@@ -816,6 +873,16 @@ static bool xdna_rec_run(ggml_backend_xdna_context * ctx, xdna_rec_plan & p,
     if (to_act_pre && xdna_rec_core_ffn_fused(s->core) &&
         !xdna_gemv_pair_prep_raw(s->gv->ffn, hres, s->host.w_post_norm)) {
         return false;
+    }
+    // This run drains the projection and the FFN into the pair's activation
+    // buffer. Mark those ranges before it starts so the reads below can tell a
+    // drain from the previous token's contents. Both flags, not just the one
+    // guarding the prep above: a fuse_so that failed after setting so_to_act
+    // leaves nothing to drain, and a mark nobody overwrites would spin the
+    // read out.
+    if (s->gv->ffn && xdna_rec_core_so_fused(s->core) &&
+        xdna_rec_core_so_to_act(s->core)) {
+        xdna_gemv_pair_mark_out(s->gv->ffn);
     }
     if (!xdna_rec_core_run(s->core, t, t == 0 ? nullptr : qkv,
                            s->x.data(), z, s->aq.data(), &s->d_a)) {
@@ -1128,13 +1195,11 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
     // Size the host-fallback pool for this chunk (xdna_glue_threads).
     xdna_glue_set_n_tokens(cgraph);
 
-    // A prefill ubatch rewrites the recurrent cache, so every live session has
-    // to take its state from there again on the next token (xdna_rec_session).
-    if (g_glue_n_tokens > 1) {
-        for (auto & kv : ctx->rec) {
-            kv.second->reseed = true;
-        }
-    }
+    // Reseed every session whose state in llama's cache has been rewritten:
+    // a prefill ubatch, and a cell this graph zeroes for a new sequence. The
+    // token count alone used to stand for both and missed a request whose
+    // prompt is a single token.
+    xdna_rec_mark_cache_reset(ctx, cgraph);
 
     // Per-op NPU kernels are suppressed while the fused layer path is active
     // (default when the fused xclbins are present): the fused run owns the
