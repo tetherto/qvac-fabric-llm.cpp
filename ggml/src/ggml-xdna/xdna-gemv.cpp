@@ -1004,21 +1004,18 @@ bool xdna_gemv_run_packed(xdna_gemv * g, const void * act_tiles, float * out) {
     const size_t n = (size_t) (1 + g->geom.n_tiles()) * g->geom.act_tile_bytes();
     std::memcpy(g->a->bo.map(), act_tiles, n);
     xdna_buffer_sync_to_device_range(g->a, n, 0);
+    xdna_buffer_mark(g->o, (size_t) g->geom.n_real * sizeof(float));
     if (!xdna_run_restart(g->run) || !xdna_run_wait(g->run)) {
         return false;
     }
-    xdna_buffer_sync_from_device(g->o);
-    std::memcpy(out, g->o->bo.map(), (size_t) g->geom.n_real * sizeof(float));
-    return true;
+    return xdna_buffer_download(g->o, out, (size_t) g->geom.n_real * sizeof(float));
 }
 
 bool xdna_gemv_read_out(xdna_gemv * g, float * out) {
     if (!g || !out) {
         return false;
     }
-    xdna_buffer_sync_from_device(g->o);
-    std::memcpy(out, g->o->bo.map(), (size_t) g->geom.n_real * sizeof(float));
-    return true;
+    return xdna_buffer_download(g->o, out, (size_t) g->geom.n_real * sizeof(float));
 }
 
 bool xdna_gemv_run(xdna_gemv * g, const float * act, float * out) {
@@ -1030,20 +1027,24 @@ bool xdna_gemv_run(xdna_gemv * g, const float * act, float * out) {
     std::memcpy(g->a->bo.map(), g->host_a.data(), g->host_a.size());
     xdna_buffer_sync_to_device(g->a);
 
+    xdna_buffer_mark(g->o, g->o->bytes);
     if (!xdna_run_restart(g->run)) {
         return false;
     }
     if (!xdna_run_wait(g->run)) {
         return false;
     }
-    xdna_buffer_sync_from_device(g->o);
-
     // The group scales are applied on the device, so nothing is left here.
-    const float * raw = (const float *) g->o->bo.map();
     if (!geom.epilogue) {
-        std::memcpy(out, raw, (size_t) geom.n_real * sizeof(float));
-    } else {
+        return xdna_buffer_download(g->o, out, (size_t) geom.n_real * sizeof(float));
+    }
+    {
         // Every 32-lane group carries 16 valid floats and a zeroed tail.
+        g->settled.resize(g->o->bytes);
+        if (!xdna_buffer_download(g->o, g->settled.data(), g->o->bytes)) {
+            return false;
+        }
+        const float * raw = (const float *) g->settled.data();
         const int LANE = geom.lane();
         const int half = LANE / 2;
         for (int u = 0; u < geom.N / LANE; u++) {
@@ -1245,10 +1246,25 @@ bool xdna_gemv_pair_out_from_tail(xdna_gemv_pair * p, float * out) {
     if (!p || !out) {
         return false;
     }
-    xdna_buffer_sync_from_device(p->a);
-    std::memcpy(out, (const uint8_t *) p->a->bo.map() + p->o_tail_off,
-                (size_t) p->g2.n_real * sizeof(float));
-    return true;
+    return xdna_buffer_download(p->a, out, (size_t) p->g2.n_real * sizeof(float),
+                                p->o_tail_off);
+}
+
+// The parts of the activation buffer a fused run writes: the projection's
+// drain at the front of every g1 tile (the host writes the residual and gamma
+// past it, never the front) and the g2 output in the tail. Marked before the
+// run so that the reads that follow it can tell the drain from the previous
+// token's contents. The g2 activation region between them is set once at
+// create time and is never touched by either side again, so it stays out.
+void xdna_gemv_pair_mark_out(xdna_gemv_pair * p) {
+    if (!p || !p->a) {
+        return;
+    }
+    const size_t kt_bytes = (size_t) p->g1.k_tile() * sizeof(float);
+    for (int t = 0; t < p->g1.n_tiles(); t++) {
+        xdna_buffer_mark(p->a, kt_bytes, (size_t) (t + 1) * XDNA_GEMV_ACT_TILE);
+    }
+    xdna_buffer_mark(p->a, (size_t) p->g2.n_real * sizeof(float), p->o_tail_off);
 }
 
 
@@ -1256,12 +1272,11 @@ bool xdna_gemv_pair_dispatch(xdna_gemv_pair * p, float * out) {
     if (!p || !out) {
         return false;
     }
+    xdna_buffer_mark(p->o, (size_t) p->g2.n_real * sizeof(float));
     if (!xdna_run_restart(p->run) || !xdna_run_wait(p->run)) {
         return false;
     }
-    xdna_buffer_sync_from_device(p->o);
-    std::memcpy(out, p->o->bo.map(), (size_t) p->g2.n_real * sizeof(float));
-    return true;
+    return xdna_buffer_download(p->o, out, (size_t) p->g2.n_real * sizeof(float));
 }
 
 static bool xdna_gemv_pair_run_impl(xdna_gemv_pair * p, const float * act,
@@ -1322,11 +1337,10 @@ static bool xdna_gemv_pair_run_impl(xdna_gemv_pair * p, const float * act,
         xdna_buffer_sync_to_device_range(p->a, p->host_a.size(), 0);
     }
 
+    xdna_buffer_mark(p->o, (size_t) p->g2.n_real * sizeof(float));
     if (!xdna_run_restart(p->run) || !xdna_run_wait(p->run)) {
         return false;
     }
-    xdna_buffer_sync_from_device(p->o);
-    std::memcpy(out, p->o->bo.map(), (size_t) p->g2.n_real * sizeof(float));
-    return true;
+    return xdna_buffer_download(p->o, out, (size_t) p->g2.n_real * sizeof(float));
 }
 

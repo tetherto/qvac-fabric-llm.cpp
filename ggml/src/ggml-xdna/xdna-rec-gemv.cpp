@@ -189,14 +189,14 @@ bool xdna_rec_gemv_acc_from_tiles(xdna_rec_gemv * m, float * acc) {
     if (!a) {
         return false;
     }
-    xdna_buffer_sync_from_device(a);
-    const uint8_t * base = (const uint8_t *) a->bo.map();
     const int kt = xdna_gemv_pair_k_tile(m->ffn);
     const int nt = xdna_gemv_pair_n_tiles(m->ffn);
     for (int t = 0; t < nt; t++) {
-        std::memcpy(acc + (size_t) t * kt,
-                    base + (size_t) (t + 1) * XDNA_GEMV_ACT_TILE,
-                    (size_t) kt * sizeof(float));
+        if (!xdna_buffer_download(a, acc + (size_t) t * kt,
+                                  (size_t) kt * sizeof(float),
+                                  (size_t) (t + 1) * XDNA_GEMV_ACT_TILE)) {
+            return false;
+        }
     }
     return true;
 }

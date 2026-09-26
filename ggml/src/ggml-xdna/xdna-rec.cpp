@@ -512,6 +512,11 @@ bool xdna_rec_core_run(xdna_rec_core * core, int t, const void * qkv,
     // on the gated drain before the projection's activation fill reads it.
     xdna_buffer * args[6] = { core->feed, core->x, core->pkvb, core->gstate,
                               core->azg, core->out };
+    // out layout: [gated f32 scratch KGATE*4][aq int8 KGATE][d_a f32]. Mark the
+    // codes and their scale before the run so the read after it can tell the
+    // array's write from the previous token's contents.
+    xdna_buffer_mark(core->out, (size_t) KGATE + sizeof(float),
+                     (size_t) KGATE * 4);
     if (core->so_fused) {
         if (!xdna_run_restart(core->so_run) || !xdna_run_wait(core->so_run)) {
             return false;
@@ -523,14 +528,18 @@ bool xdna_rec_core_run(xdna_rec_core * core, int t, const void * qkv,
         }
     }
 
-    // out layout: [gated f32 scratch KGATE*4][aq int8 KGATE][d_a f32]
-    xdna_buffer_sync_from_device(core->out);
+    // out layout: [gated f32 scratch KGATE*4][aq int8 KGATE][d_a f32]. Read
+    // against the mark set before the dispatch: a run reports completion
+    // before its last writes are readable, and the codes are exactly such a
+    // read.
     if (core->so_fused) {
         xdna_buffer_sync_from_device(core->x);
     }
-    const uint8_t * omap = (const uint8_t *) core->out->bo.map();
-    std::memcpy(aq, omap + KGATE * 4, (size_t) KGATE);
-    std::memcpy(d_a, omap + KGATE * 4 + KGATE, sizeof(float));
+    if (!xdna_buffer_download(core->out, aq, (size_t) KGATE, (size_t) KGATE * 4) ||
+        !xdna_buffer_download(core->out, d_a, sizeof(float),
+                              (size_t) KGATE * 4 + KGATE)) {
+        return false;
+    }
     core->token = t + 1;
     return true;
 }
