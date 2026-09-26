@@ -242,6 +242,7 @@ struct xdna_gemv {
     std::vector<uint8_t> host_a;  // staging for the activation tiles
     // The buffer set never changes, so the run is built once and restarted.
     xrt::run run;
+    std::vector<uint8_t> settled;  // staging for a settled output read
 };
 
 // Load the artifact for `geom`, allocate the buffer set and upload `packed`
@@ -316,6 +317,11 @@ bool xdna_gemv_pair_dispatch(xdna_gemv_pair * p, float * out);
 // Read what a fused run left in the tail of the activation buffer, for the
 // layer whose FFN rides the core's own stream.
 bool xdna_gemv_pair_out_from_tail(xdna_gemv_pair * p, float * out);
+
+// Mark the parts of the activation buffer a fused run writes, before that run
+// is submitted, so the reads that follow it know a drain from the previous
+// token's contents. See xdna_buffer_mark.
+void xdna_gemv_pair_mark_out(xdna_gemv_pair * p);
 
 // True when this pair's first phase reads raw tiles, so the dispatch before it
 // can drain into them; and the buffer those tiles live in.
