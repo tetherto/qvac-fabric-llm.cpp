@@ -92,6 +92,16 @@ def _tagged(src: str, t: str) -> str:
     return os.path.join(d, f"{stem}_{t}{ext}")
 
 
+def _tag_copy(src: str, t: str) -> None:
+    """Copy an artifact to its tagged name.
+
+    Deliberately not copy2. The tagged file is one output of a rule whose other
+    inputs are every design artifact, so a preserved source timestamp can leave
+    it older than an input and ninja reruns the stamping step on every build.
+    """
+    shutil.copyfile(src, _tagged(src, t))
+
+
 def stamp(xclbin_path, insts_path=None, extra: str = ""):
     """Copy the artifact under its tagged name and refresh the tag header."""
     t = tag(extra)
@@ -99,21 +109,31 @@ def stamp(xclbin_path, insts_path=None, extra: str = ""):
     for src in (xclbin_path, insts_path):
         src = str(src) if src is not None else None
         if src and os.path.exists(src):
-            shutil.copy2(src, _tagged(src, t))
+            _tag_copy(src, t)
 
 
-def stamp_all(bindir: str, extra: str = "") -> None:
+def stamp_all(bindir: str, extra: str = "", stamp_file: str | None = None) -> None:
     """Tagged copies for every stem the backend loads, after any design
     rebuilt. The tag covers all the design sources, so one design changing
     moves the tag for all of them, and the designs ninja did not rebuild have
-    no stamp of their own to run."""
+    no stamp of their own to run.
+
+    `stamp_file` is the rule's declared output. The tagged copies cannot be
+    declared at configure time - their names carry a tag that only exists after
+    the designs are built - so the build tracks this file and treats them as
+    byproducts. It is written unconditionally: an output that keeps an older
+    timestamp than its inputs makes ninja rerun the step on every build.
+    """
     t = tag(extra)
     _write_header(t)
     for stem in KNOWN_STEMS:
         for ext in (".xclbin", ".insts.bin"):
             src = os.path.join(bindir, stem + ext)
             if os.path.exists(src):
-                shutil.copy2(src, _tagged(src, t))
+                _tag_copy(src, t)
+    if stamp_file:
+        with open(stamp_file, "w") as fh:
+            fh.write(f"{t}\n")
     print(f"design tag {t} (stamp-all)")
 
 
@@ -121,9 +141,10 @@ if __name__ == "__main__":
     import argparse
     ap = argparse.ArgumentParser(prog="design_tag")
     ap.add_argument("--stamp-dir", default=None)
+    ap.add_argument("--stamp-file", default=None)
     ap.add_argument("--extra", default="")
     opts = ap.parse_args()
     if opts.stamp_dir:
-        stamp_all(opts.stamp_dir, opts.extra)
+        stamp_all(opts.stamp_dir, opts.extra, opts.stamp_file)
     else:
         print(tag(opts.extra))
