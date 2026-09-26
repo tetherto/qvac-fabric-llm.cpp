@@ -17,6 +17,10 @@
 // reductions at all - only ROWS-wide vector MACs. Row-major would need two
 // aie::reduce_add per row per token, and those do not overlap.
 
+#ifndef GDN_SCALE
+#define GDN_SCALE 0.08838834764831845f   // 1/sqrt(128)
+#endif
+
 #ifndef DH
 #define DH 128
 #endif
@@ -43,7 +47,7 @@ extern "C" void ggml_xdna_gdn_token_bf16(
     const bfloat16 * v = tok + 2 * DH + (int) j0;
     const float      eg    = (float) tok[3 * DH];
     const float      beta  = (float) tok[3 * DH + 1];
-    const float      scale = 0.08838834764831845f;
+    const float      scale = GDN_SCALE;
     bfloat16 * state = packed;
     bfloat16 * attn  = packed + ROWS * DH + (int) t * ROWS;
 
