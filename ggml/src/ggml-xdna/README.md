@@ -124,15 +124,28 @@ Measured on npu2 (Ryzen AI MAX+ 395), Qwen3.5-0.8B-Q4_K_M, llama-server with
 `-np 1 -b 4096 -ub 4096 --flash-attn off`, requests at `temperature 0`,
 `top_k 1` and `cache_prompt false`.
 
+**A request with a one-token prompt runs on the previous request's state.**
+The on-device recurrent state is re-seeded from the llama cache when a prefill
+ubatch rewrites it, and that is detected from the ubatch token count - which
+cannot tell a one-token prompt from a decode step. Six identical one-token
+`/completion` calls in one server process, at `temperature 0` with a fixed
+seed, returned five different answers. A prompt of two tokens or more is not
+affected. This is a live defect, not a tuning knob; it is being fixed.
+
 **`GGML_XDNA_GEMV_GROUP=1` does not reproduce run to run.** With the
 projections outside the fused layers on the decode GEMV, separate processes
 given the same prompt and seed sometimes disagree: 2 of 120 runs produced a
 different set of logits. The default path, which keeps those projections on
-the host, has not been caught doing it in 48 runs, and is also the faster of
-the two, so the array route is off unless the switch asks for it. Keeping it
-reachable matters for measuring NPU residency and power, where the work
-belongs on the device; we are still looking for the cause and will update this
-when we know more.
+the host, is also the faster of the two, so the array route is off unless the
+switch asks for it. Keeping it reachable matters for measuring NPU residency
+and power, where the work belongs on the device; we are still looking for the
+cause and will update this when we know more.
+
+What the default path has been measured on, so the claim is not read wider
+than it is: 48 runs of one request in a fresh process, and 12 repeated
+multi-token requests inside one process, none of which diverged. A report of
+two 1466-token requests in one process differing has not reproduced here. The
+one-token case above does diverge and is a separate defect.
 
 Measure this on the logits, not on the generated text. The perturbation is
 small enough that the argmax token is usually unchanged, so the output is
