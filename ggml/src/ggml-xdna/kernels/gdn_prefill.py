@@ -56,7 +56,11 @@ MEMTILE_BYTES = 512 * 1024
 
 def _fns(S: int, CS: int):
     src = (Path(__file__).resolve().parent / "gdn-prefill.cc").read_text()
-    flags = [f"-DDH={S}", f"-DROWS={ROWS}", "-DVEC=16"]
+    # The attention scale follows the head size; the kernel cannot derive it
+    # itself, and leaving it baked at 1/sqrt(128) silently scaled every
+    # score wrong for any other --S the harness accepts.
+    flags = [f"-DDH={S}", f"-DROWS={ROWS}", "-DVEC=16",
+             f"-DGDN_SCALE={1.0 / math.sqrt(S):.17g}f"]
     digest = hashlib.sha256((src + "".join(flags)).encode()).hexdigest()[:8]
     tok_t_ty = np.ndarray[(3 * S + 2,), np.dtype[bfloat16]]
     packed_ty = np.ndarray[(ROWS * S + CS * ROWS,), np.dtype[bfloat16]]
