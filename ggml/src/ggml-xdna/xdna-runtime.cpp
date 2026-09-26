@@ -9,6 +9,7 @@
 
 #include <chrono>
 #include <cstdlib>
+#include <immintrin.h>
 #include <cstring>
 #include <map>
 #include <memory>
@@ -191,6 +192,112 @@ void xdna_buffer_sync_from_device(xdna_buffer * buf) {
     }
 }
 
+// --- reading what the array wrote -----------------------------------------
+//
+// A dispatch reports completion before the last of its DMA writes is readable,
+// and a read taken in that window hands back - and caches - the previous
+// contents of the buffer. There is no host-side barrier for it: the completion
+// is honest and the cache ioctl above does nothing on this platform. So the
+// read has to be able to tell a landed write from a pending one, and that is
+// what the pattern below is for: mark the range before the dispatch, read
+// until the mark is gone.
+
+// Only whole words can carry the pattern.
+static size_t xdna_markable(size_t bytes) {
+    return bytes & ~(size_t) (sizeof(uint32_t) - 1);
+}
+
+static void xdna_poison_range(void * p, size_t bytes) {
+    uint32_t * words = (uint32_t *) p;
+    const size_t n = bytes / sizeof(uint32_t);
+    for (size_t i = 0; i < n; i++) {
+        words[i] = XDNA_POISON_F32;
+    }
+}
+
+static size_t xdna_poison_left(const void * p, size_t bytes) {
+    const uint32_t * words = (const uint32_t *) p;
+    const size_t n = bytes / sizeof(uint32_t);
+    size_t left = 0;
+    for (size_t i = 0; i < n; i++) {
+        left += (words[i] == XDNA_POISON_F32);
+    }
+    return left;
+}
+
+static void xdna_cache_writeback(void * p, size_t bytes) {
+#if defined(__x86_64__) || defined(__i386__)
+    const size_t line = 64;
+    uintptr_t a = (uintptr_t) p & ~(uintptr_t) (line - 1);
+    const uintptr_t end = ((uintptr_t) p + bytes + line - 1) & ~(uintptr_t) (line - 1);
+    for (; a < end; a += line) {
+        _mm_clflush((const void *) a);
+    }
+    _mm_mfence();
+#else
+    (void) p;
+    (void) bytes;
+#endif
+}
+
+void xdna_buffer_mark(xdna_buffer * buf, size_t bytes, size_t offset) {
+    if (!buf || bytes == 0 || offset >= buf->bytes) {
+        return;
+    }
+    if (bytes > buf->bytes - offset) {
+        bytes = buf->bytes - offset;
+    }
+    bytes = xdna_markable(bytes);
+    if (bytes == 0) {
+        return;
+    }
+    uint8_t * base = (uint8_t *) buf->bo.map() + offset;
+    xdna_poison_range(base, bytes);
+    // Written back, not left dirty: our own cache lines could otherwise land
+    // on top of what the device writes.
+    xdna_cache_writeback(base, bytes);
+}
+
+bool xdna_buffer_download(xdna_buffer * buf, void * dst, size_t bytes,
+                          size_t offset) {
+    if (!buf || !dst || bytes == 0 || offset >= buf->bytes) {
+        return false;
+    }
+    if (bytes > buf->bytes - offset) {
+        bytes = buf->bytes - offset;
+    }
+    bytes = xdna_markable(bytes);
+    if (bytes == 0) {
+        return false;
+    }
+    uint8_t * base = (uint8_t *) buf->bo.map() + offset;
+    // Bounded by the drain, not by a guess: the pattern is the evidence, and
+    // it disappears exactly when the device's write lands. A pass is a pause,
+    // not a timer sleep - sleep_for(2us) costs a tick and measures about 80us.
+    static const int passes = xdna_env_int("GGML_XDNA_SETTLE_PASSES", 2000);
+    static const int pause_loops = xdna_env_int("GGML_XDNA_SETTLE_PAUSE", 400);
+    for (int pass = 0;; pass++) {
+        std::memcpy(dst, base, bytes);
+        if (xdna_poison_left(dst, bytes) == 0) {
+            return true;
+        }
+        if (pass >= passes) {
+            GGML_LOG_WARN("%s: %zu bytes at %zu still hold the mark after %d "
+                          "passes; the device has not written them\n",
+                          "xdna-runtime", bytes, offset, passes);
+            return false;
+        }
+        for (int i = 0; i < pause_loops; i++) {
+#if defined(__x86_64__) || defined(__i386__)
+            _mm_pause();
+#endif
+        }
+        // A platform whose device writes are not coherent with the CPU caches
+        // needs the read range dropped before looking again.
+        xdna_cache_writeback((void *) base, bytes);
+    }
+}
+
 // --- execution -------------------------------------------------------------
 
 // Configure a run for `kern` with `n_args` host buffers (ABI: 0=opcode,
@@ -199,7 +306,10 @@ static xrt::run make_run(xdna_kernel * kern, xdna_buffer ** args, size_t n_args)
     xrt::run run(kern->kernel);
     run.set_arg(0, XAIE_NPU_OPCODE_RUN);
     run.set_arg(1, kern->insts_bo);
-    run.set_arg(2, kern->insts_bytes);
+    // Instruction words, not bytes: the stream is a TXN blob that carries its
+    // own end, so a count four times too large ran anyway, but it is not what
+    // the argument means.
+    run.set_arg(2, (int64_t) (kern->insts_bytes / (int64_t) sizeof(uint32_t)));
     for (size_t i = 0; i < n_args; i++) {
         run.set_arg((int) (3 + i), args[i]->bo);
     }

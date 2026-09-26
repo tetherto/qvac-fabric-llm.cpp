@@ -42,9 +42,34 @@ xdna_buffer * xdna_buffer_sub(xdna_buffer * parent, size_t offset, size_t bytes)
 
 void xdna_buffer_free(xdna_buffer * buf);
 
-// Make device-side writes to a mapped BO visible to the host (cache
-// invalidation). Read the data through the BO's own map afterwards.
+// Make device-side writes to a mapped BO visible to the host. On this platform
+// XRT never issues the driver's cache-maintenance ioctl for a host_only BO and
+// the mapping is ordinary cacheable memory; what it does here is nothing. The
+// mark/download pair below is what actually makes such a read safe.
 void xdna_buffer_sync_from_device(xdna_buffer * buf);
+
+// The pattern xdna_buffer_mark leaves in a range the device is about to
+// overwrite: a quiet NaN with a payload of its own, which no kernel in this
+// backend produces.
+static constexpr uint32_t XDNA_POISON_F32 = 0x7FC0DEADu;
+
+// Mark the range [offset, offset+bytes) as not yet written by the device, and
+// write the pattern through the CPU caches: left dirty, our own lines could
+// land on top of the device's output.
+//
+// A dispatch reports completion before its last writes are readable, so a read
+// taken right after it can return the previous contents. There is no barrier
+// for that from the host - the completion is honest and the cache ioctl does
+// nothing - so the read has to tell a landed write from a pending one, which
+// is what the pattern is for.
+void xdna_buffer_mark(xdna_buffer * buf, size_t bytes, size_t offset = 0);
+
+// Copy a marked range out, returning only once every word of it has been
+// written by the device, i.e. once the pattern is gone. `dst` must hold
+// `bytes`. Returns false when the pattern survived every pass; the copy is
+// made either way, so the caller keeps working on the last value it saw.
+bool xdna_buffer_download(xdna_buffer * buf, void * dst, size_t bytes,
+                          size_t offset = 0);
 
 // Make host-side writes to the mapped memory visible to the NPU.
 void xdna_buffer_sync_to_device(xdna_buffer * buf);
