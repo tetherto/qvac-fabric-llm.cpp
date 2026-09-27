@@ -49,6 +49,14 @@ K = N_VH * S_V
 EPS = 1e-6
 
 GATED_SRC = Path(__file__).resolve().parent / "rec-gated.cc"
+SILU_H = Path(__file__).resolve().parent / "silu-f32.h"
+
+
+def _with_silu(src: str) -> str:
+    """The sources compile inline, away from this directory, so the shared
+    fp32 silu is pasted in where they include it."""
+    return src.replace('#include "silu-f32.h"', SILU_H.read_text())
+
 
 # rec-gated.cc needs the same geometry the merged design compiles it with
 # (attn_gdn_gated.py): without these defines it does not compile at all, and
@@ -64,7 +72,7 @@ GATED_FLAGS = ["-O2", "-DNDEBUG", f"-DK_GATE={K}", f"-DACT_TILE={ACT_TILE}",
 
 
 def _gated_src():
-    return GATED_SRC.read_text()
+    return _with_silu(GATED_SRC.read_text())
 
 
 @iron.jit

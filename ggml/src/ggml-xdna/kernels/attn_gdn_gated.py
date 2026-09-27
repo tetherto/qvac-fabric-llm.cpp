@@ -1,6 +1,13 @@
 #!/usr/bin/env python3
 # attn_gdn_gated.py -*- Python -*-
 #
+# Precision (part of the design, so part of its tag - the tag hashes these
+# .py files only): every stage kernel rounds fp32 -> bf16 to nearest-even
+# (the core's default truncates, which drifted the recurrence). The gated
+# stage computes silu(z) in fp32 (silu-f32.h); the conv stage keeps the
+# hardware tanh, whose fp32 replacement cost 1.4 ms a token for KLD
+# 0.0050 -> 0.0042.
+#
 # A-half of the fused recurrent layer: the merged conv+norm+gdn design PLUS the
 # rec_gated epilogue tile, all in ONE xclbin / ONE per-token run, with no host
 # attn round trip.  Channel verdict (probe #1): a shim column exposes 2 MM2S +
@@ -114,7 +121,7 @@ H2_SRC = Path(__file__).resolve().parent / "gated-h2.cc"
 
 
 def _gated_h2_src():
-    return H2_SRC.read_text()
+    return rec_gated._with_silu(H2_SRC.read_text())
 
 
 # ---- merged conv + norm + gdn + gated design (park workers) ----------------
@@ -322,7 +329,7 @@ def build_core(dev_name: str = "npu2"):
 
         workers.append(Worker(
             conv_fn, [f2.cons(), x12.prod(), h12.prod(), conv_k],
-            tile=Tile(col, 2), stack_size=0xD00))
+            tile=Tile(col, 2), stack_size=0x1000))  # the fp32 silu needs 4096 B
         rt_args += [f3.prod(tile=Tile(col, 0)),
                     x23.cons(tile=Tile(CONV_X_COL[col], 0)),
                     h23.cons(tile=Tile(CONV_H_COL[col], 0))]
