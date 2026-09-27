@@ -7,14 +7,19 @@
 #include <xrt/experimental/xrt_xclbin.h>
 #include <xrt/xrt_kernel.h>
 
+#include <algorithm>
 #include <chrono>
+#include <cstdio>
 #include <cstdlib>
-#include <immintrin.h>
 #include <cstring>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <system_error>
+
+#if defined(__x86_64__) || defined(__i386__)
+#include <immintrin.h>
+#endif
 
 namespace fs = std::filesystem;
 
@@ -139,8 +144,8 @@ xdna_buffer * xdna_buffer_alloc(xdna_device * dev, size_t bytes) {
         // Zero on allocation. Several buffers are only partly written by the
         // host and partly by the array, and a whole-buffer flush then pushes
         // whatever the host never wrote back to the device. Without this the
-        // bytes a kernel reads out of those holes are the allocator's
-        // leftovers and differ from process to process.
+        // bytes a kernel reads out of those holes are the allocator's leftovers
+        // and differ from process to process.
         std::memset(buf->bo.map(), 0, bytes);
         buf->bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
     } catch (const std::exception & e) {
@@ -192,39 +197,11 @@ void xdna_buffer_sync_from_device(xdna_buffer * buf) {
     }
 }
 
-// --- reading what the array wrote -----------------------------------------
-//
-// A dispatch reports completion before the last of its DMA writes is readable,
-// and a read taken in that window hands back - and caches - the previous
-// contents of the buffer. There is no host-side barrier for it: the completion
-// is honest and the cache ioctl above does nothing on this platform. So the
-// read has to be able to tell a landed write from a pending one, and that is
-// what the pattern below is for: mark the range before the dispatch, read
-// until the mark is gone.
-
-// Only whole words can carry the pattern.
-static size_t xdna_markable(size_t bytes) {
-    return bytes & ~(size_t) (sizeof(uint32_t) - 1);
-}
-
-static void xdna_poison_range(void * p, size_t bytes) {
-    uint32_t * words = (uint32_t *) p;
-    const size_t n = bytes / sizeof(uint32_t);
-    for (size_t i = 0; i < n; i++) {
-        words[i] = XDNA_POISON_F32;
-    }
-}
-
-static size_t xdna_poison_left(const void * p, size_t bytes) {
-    const uint32_t * words = (const uint32_t *) p;
-    const size_t n = bytes / sizeof(uint32_t);
-    size_t left = 0;
-    for (size_t i = 0; i < n; i++) {
-        left += (words[i] == XDNA_POISON_F32);
-    }
-    return left;
-}
-
+// Write a range back through the caches. The pattern a mark leaves is written
+// by the host, so its lines are dirty; a device write to the same address can
+// be overtaken by them when they are evicted. Nothing else here needs this:
+// the host's own activation writes are read only by the array, which waits for
+// them, and a read leaves its lines clean.
 static void xdna_cache_writeback(void * p, size_t bytes) {
 #if defined(__x86_64__) || defined(__i386__)
     const size_t line = 64;
@@ -240,6 +217,73 @@ static void xdna_cache_writeback(void * p, size_t bytes) {
 #endif
 }
 
+static void xdna_poison_range(void * p, size_t bytes) {
+    uint32_t * words = (uint32_t *) p;
+    const size_t n = bytes / sizeof(uint32_t);
+    for (size_t i = 0; i < n; i++) {
+        words[i] = XDNA_POISON_F32;
+    }
+}
+
+static bool xdna_poison_any(const void * p, size_t bytes) {
+    const uint32_t * words = (const uint32_t *) p;
+    const size_t n = bytes / sizeof(uint32_t);
+#if defined(__x86_64__) || defined(__i386__)
+    const __m128i pat = _mm_set1_epi32((int) XDNA_POISON_F32);
+    size_t i = 0;
+    for (; i + 4 <= n; i += 4) {
+        const __m128i v = _mm_loadu_si128((const __m128i *) (words + i));
+        if (_mm_movemask_epi8(_mm_cmpeq_epi32(v, pat)) != 0) {
+            return true;
+        }
+    }
+    for (; i < n; i++) {
+        if (words[i] == XDNA_POISON_F32) {
+            return true;
+        }
+    }
+    return false;
+#else
+    for (size_t i = 0; i < n; i++) {
+        if (words[i] == XDNA_POISON_F32) {
+            return true;
+        }
+    }
+    return false;
+#endif
+}
+
+// The pattern is four bytes wide, so a range is marked and checked a word at a
+// time; a byte count that is not a multiple of four keeps its tail unmarked
+// and unread, which is what every caller reads anyway.
+static size_t xdna_markable(size_t bytes) {
+    return bytes & ~(size_t) (sizeof(uint32_t) - 1);
+}
+
+// The pass budget and its pause. Bounded by the drain, not by a guess: the
+// pattern is the evidence, and it disappears exactly when the device's write
+// lands. A pass is a pause, not a timer sleep - sleep_for(2us) costs a tick
+// and measures about 80us.
+static int xdna_settle_passes(void) {
+    static const int passes = xdna_env_int("GGML_XDNA_SETTLE_PASSES", 2000);
+    return passes;
+}
+
+static void xdna_settle_pause(void) {
+    static const int pause_loops = xdna_env_int("GGML_XDNA_SETTLE_PAUSE", 400);
+    for (int i = 0; i < pause_loops; i++) {
+#if defined(__x86_64__) || defined(__i386__)
+        _mm_pause();
+#endif
+    }
+}
+
+static void xdna_settle_give_up(size_t bytes, size_t offset) {
+    GGML_LOG_WARN("%s: %zu bytes at %zu still hold the mark after %d passes; "
+                  "the device has not written them\n",
+                  "xdna-runtime", bytes, offset, xdna_settle_passes());
+}
+
 void xdna_buffer_mark(xdna_buffer * buf, size_t bytes, size_t offset) {
     if (!buf || bytes == 0 || offset >= buf->bytes) {
         return;
@@ -253,8 +297,6 @@ void xdna_buffer_mark(xdna_buffer * buf, size_t bytes, size_t offset) {
     }
     uint8_t * base = (uint8_t *) buf->bo.map() + offset;
     xdna_poison_range(base, bytes);
-    // Written back, not left dirty: our own cache lines could otherwise land
-    // on top of what the device writes.
     xdna_cache_writeback(base, bytes);
 }
 
@@ -271,30 +313,43 @@ bool xdna_buffer_download(xdna_buffer * buf, void * dst, size_t bytes,
         return false;
     }
     uint8_t * base = (uint8_t *) buf->bo.map() + offset;
-    // Bounded by the drain, not by a guess: the pattern is the evidence, and
-    // it disappears exactly when the device's write lands. A pass is a pause,
-    // not a timer sleep - sleep_for(2us) costs a tick and measures about 80us.
-    static const int passes = xdna_env_int("GGML_XDNA_SETTLE_PASSES", 2000);
-    static const int pause_loops = xdna_env_int("GGML_XDNA_SETTLE_PAUSE", 400);
     for (int pass = 0;; pass++) {
         std::memcpy(dst, base, bytes);
-        if (xdna_poison_left(dst, bytes) == 0) {
+        if (!xdna_poison_any(dst, bytes)) {
             return true;
         }
-        if (pass >= passes) {
-            GGML_LOG_WARN("%s: %zu bytes at %zu still hold the mark after %d "
-                          "passes; the device has not written them\n",
-                          "xdna-runtime", bytes, offset, passes);
+        if (pass >= xdna_settle_passes()) {
+            xdna_settle_give_up(bytes, offset);
             return false;
         }
-        for (int i = 0; i < pause_loops; i++) {
-#if defined(__x86_64__) || defined(__i386__)
-            _mm_pause();
-#endif
+        xdna_settle_pause();
+        xdna_cache_writeback(base, bytes);
+    }
+}
+
+uint8_t * xdna_buffer_wait_written(xdna_buffer * buf, size_t bytes,
+                                   size_t offset) {
+    if (!buf || bytes == 0 || offset >= buf->bytes) {
+        return nullptr;
+    }
+    if (bytes > buf->bytes - offset) {
+        bytes = buf->bytes - offset;
+    }
+    bytes = xdna_markable(bytes);
+    if (bytes == 0) {
+        return nullptr;
+    }
+    uint8_t * base = (uint8_t *) buf->bo.map() + offset;
+    for (int pass = 0;; pass++) {
+        if (!xdna_poison_any(base, bytes)) {
+            return base;
         }
-        // A platform whose device writes are not coherent with the CPU caches
-        // needs the read range dropped before looking again.
-        xdna_cache_writeback((void *) base, bytes);
+        if (pass >= xdna_settle_passes()) {
+            xdna_settle_give_up(bytes, offset);
+            return nullptr;
+        }
+        xdna_settle_pause();
+        xdna_cache_writeback(base, bytes);
     }
 }
 
