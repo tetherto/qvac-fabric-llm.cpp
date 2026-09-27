@@ -118,31 +118,35 @@ static bool xdna_concat_fast(struct ggml_tensor * dst) {
             const int64_t na   = a->ne[0];
             const int64_t nb   = b->ne[0];
             const int64_t ne0  = dst->ne[0];
-            const int64_t n_c  = dst->ne[1] * dst->ne[2] * dst->ne[3];
-            const float * ad = (const float *) a->data;
-            const float * bd = (const float *) b->data;
-            float * dd = (float *) dst->data;
+            const int64_t n_c  = dst->ne[1];
             constexpr int TC = 16;
             constexpr int TT = 16;
+            // One slice per sequence (dims 2 and 3) with its own strides: b
+            // is a transposed view, so its slices are not n_c rows apart.
+            for (int64_t i3 = 0; i3 < dst->ne[3]; i3++)
+            for (int64_t i2 = 0; i2 < dst->ne[2]; i2++) {
+            const char * ad = (const char *) a->data + i2 * a->nb[2] + i3 * a->nb[3];
+            const char * bd = (const char *) b->data + i2 * b->nb[2] + i3 * b->nb[3];
+            float * dd = (float *) ((char *) dst->data + i2 * dst->nb[2] + i3 * dst->nb[3]);
             for (int64_t c0 = 0; c0 < n_c; c0 += TC) {
                 const int nc = (int) std::min<int64_t>(TC, n_c - c0);
                 for (int c = 0; c < nc; c++) {
                     std::memcpy(dd + (c0 + c) * ne0,
-                                (const char *) ad + (size_t) (c0 + c) * a->nb[1],
+                                ad + (size_t) (c0 + c) * a->nb[1],
                                 (size_t) na * sizeof(float));
                 }
                 for (int64_t t0 = 0; t0 < nb; t0 += TT) {
                     const int nt = (int) std::min<int64_t>(TT, nb - t0);
                     for (int t = 0; t < nt; t++) {
                         const float * srow = (const float *)
-                            ((const char *) bd + (size_t) (t0 + t) * b->nb[0] +
-                             (size_t) c0 * b->nb[1]);
+                            (bd + (size_t) (t0 + t) * b->nb[0] + (size_t) c0 * b->nb[1]);
                         const int64_t drow = na + t0 + t;
                         for (int c = 0; c < nc; c++) {
                             dd[(c0 + c) * ne0 + drow] = srow[c];
                         }
                     }
                 }
+            }
             }
             return true;
         }
