@@ -1591,9 +1591,174 @@ static ggml_backend_t ggml_backend_xdna_device_init_backend(ggml_backend_dev_t d
     return ggml_backend_xdna_init();
 }
 
+
+// ---------------------------------------------------------------------------
+// The backend's buffer type: host memory the array can read.
+//
+// Tensors llama allocates on this device - the KV cache among them - used to
+// live in the CPU buffer type, plain host memory no DMA can address. They now
+// live in XRT host BOs, mapped, so the host glue works on them exactly as
+// before (the buffer type is host) and a design can bind the BO a tensor sits
+// in as an argument (xdna_host_bo_of). Model weights loaded by mmap still come
+// through buffer_from_host_ptr and are repacked into BOs of their own as
+// before.
+// ---------------------------------------------------------------------------
+
+struct xdna_host_bo_entry {
+    xdna_buffer * bo;
+    size_t        bytes;
+};
+
+static std::mutex & xdna_host_bo_mu(void) {
+    static std::mutex m;
+    return m;
+}
+
+static std::map<uintptr_t, xdna_host_bo_entry> & xdna_host_bos(void) {
+    static std::map<uintptr_t, xdna_host_bo_entry> m;
+    return m;
+}
+
+// The BO a host pointer of this buffer type lies in, and its byte offset
+// there; null when the pointer is not in one.
+xdna_buffer * xdna_host_bo_of(const void * p, size_t * offset) {
+    std::lock_guard<std::mutex> lk(xdna_host_bo_mu());
+    auto & m = xdna_host_bos();
+    auto it = m.upper_bound((uintptr_t) p);
+    if (it == m.begin()) {
+        return nullptr;
+    }
+    --it;
+    const uintptr_t off = (uintptr_t) p - it->first;
+    if (off >= it->second.bytes) {
+        return nullptr;
+    }
+    if (offset) {
+        *offset = (size_t) off;
+    }
+    return it->second.bo;
+}
+
+static void xdna_hb_free(ggml_backend_buffer_t buffer) {
+    xdna_buffer * bo = (xdna_buffer *) buffer->context;
+    {
+        std::lock_guard<std::mutex> lk(xdna_host_bo_mu());
+        xdna_host_bos().erase((uintptr_t) bo->bo.map());
+    }
+    xdna_buffer_free(bo);
+}
+
+static void * xdna_hb_base(ggml_backend_buffer_t buffer) {
+    return ((xdna_buffer *) buffer->context)->bo.map();
+}
+
+static void xdna_hb_memset(ggml_backend_buffer_t buffer, struct ggml_tensor * tensor,
+                           uint8_t value, size_t offset, size_t size) {
+    GGML_UNUSED(buffer);
+    memset((char *) tensor->data + offset, value, size);
+}
+
+static void xdna_hb_set(ggml_backend_buffer_t buffer, struct ggml_tensor * tensor,
+                        const void * data, size_t offset, size_t size) {
+    GGML_UNUSED(buffer);
+    memcpy((char *) tensor->data + offset, data, size);
+}
+
+static void xdna_hb_get(ggml_backend_buffer_t buffer, const struct ggml_tensor * tensor,
+                        void * data, size_t offset, size_t size) {
+    GGML_UNUSED(buffer);
+    memcpy(data, (const char *) tensor->data + offset, size);
+}
+
+static bool xdna_hb_cpy(ggml_backend_buffer_t buffer, const struct ggml_tensor * src,
+                        struct ggml_tensor * dst) {
+    GGML_UNUSED(buffer);
+    if (ggml_backend_buffer_is_host(src->buffer)) {
+        memcpy(dst->data, src->data, ggml_nbytes(src));
+        return true;
+    }
+    return false;
+}
+
+static void xdna_hb_clear(ggml_backend_buffer_t buffer, uint8_t value) {
+    memset(xdna_hb_base(buffer), value, buffer->size);
+}
+
+static const struct ggml_backend_buffer_i xdna_hb_iface = {
+    /* .free_buffer   = */ xdna_hb_free,
+    /* .get_base      = */ xdna_hb_base,
+    /* .init_tensor   = */ nullptr,
+    /* .memset_tensor = */ xdna_hb_memset,
+    /* .set_tensor    = */ xdna_hb_set,
+    /* .get_tensor    = */ xdna_hb_get,
+    /* .set_tensor_2d = */ nullptr,
+    /* .get_tensor_2d = */ nullptr,
+    /* .cpy_tensor    = */ xdna_hb_cpy,
+    /* .clear         = */ xdna_hb_clear,
+    /* .reset         = */ nullptr,
+};
+
+static const char * xdna_hbt_name(ggml_backend_buffer_type_t buft) {
+    GGML_UNUSED(buft);
+    return "XDNA_Host";
+}
+
+static ggml_backend_buffer_t xdna_hbt_alloc(ggml_backend_buffer_type_t buft, size_t size) {
+    ggml_backend_xdna_context * ctx = ggml_xdna_device_context();
+    // A zero-size buffer is legal in ggml; a BO is not.
+    xdna_buffer * bo = ctx && ctx->device ? xdna_buffer_alloc(ctx->device, std::max<size_t>(size, 4096))
+                                          : nullptr;
+    if (!bo) {
+        GGML_LOG_WARN("%s: no BO for a %zu-byte buffer; using host memory the array "
+                      "cannot read\n", "ggml-xdna", size);
+        return ggml_backend_buft_alloc_buffer(ggml_backend_cpu_buffer_type(), size);
+    }
+    {
+        std::lock_guard<std::mutex> lk(xdna_host_bo_mu());
+        xdna_host_bos()[(uintptr_t) bo->bo.map()] = { bo, bo->bytes };
+    }
+    return ggml_backend_buffer_init(buft, xdna_hb_iface, bo, size);
+}
+
+static size_t xdna_hbt_alignment(ggml_backend_buffer_type_t buft) {
+    GGML_UNUSED(buft);
+    return 64;
+}
+
+static bool xdna_hbt_is_host(ggml_backend_buffer_type_t buft) {
+    GGML_UNUSED(buft);
+    return true;
+}
+
+static ggml_backend_buffer_type_t xdna_host_buffer_type(void) {
+    // The device is filled in on first use: the registry is built after this
+    // file's statics.
+    static struct ggml_backend_buffer_type buft = {
+        /* .iface   = */ {
+            /* .get_name       = */ xdna_hbt_name,
+            /* .alloc_buffer   = */ xdna_hbt_alloc,
+            /* .get_alignment  = */ xdna_hbt_alignment,
+            /* .get_max_size   = */ nullptr,
+            /* .get_alloc_size = */ nullptr,
+            /* .is_host        = */ xdna_hbt_is_host,
+        },
+        /* .device  = */ nullptr,
+        /* .context = */ nullptr,
+    };
+    if (!buft.device) {
+        buft.device = ggml_backend_reg_dev_get(ggml_backend_xdna_reg(), 0);
+    }
+    return &buft;
+}
+
 static ggml_backend_buffer_type_t ggml_backend_xdna_device_get_buffer_type(ggml_backend_dev_t dev) {
     GGML_UNUSED(dev);
-    return ggml_backend_cpu_buffer_type();
+    // GGML_XDNA_HOST_BO=0 keeps the plain CPU buffer type.
+    static const bool bo = [] {
+        const char * e = getenv("GGML_XDNA_HOST_BO");
+        return !(e && e[0] == '0');
+    }();
+    return bo ? xdna_host_buffer_type() : ggml_backend_cpu_buffer_type();
 }
 
 static ggml_backend_buffer_t ggml_backend_xdna_device_buffer_from_host_ptr(ggml_backend_dev_t dev, void * ptr, size_t size, size_t max_tensor_size) {
