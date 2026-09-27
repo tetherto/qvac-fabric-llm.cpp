@@ -342,11 +342,14 @@ bool xdna_conv_prefill_run(struct xdna_device * dev, struct ggml_tensor * node) 
         }
         {
             xdna_buffer * args[2] = { g_conv.xw, g_conv.out };
+            // Marked before the submit: the scatter below runs as soon as the
+            // wait returns, and a read taken in that window would see the
+            // previous batch's tiles.
+            xdna_buffer_mark(g_conv.out, g_conv.out->bytes);
             xrt::run run = xdna_kernel_run_start(g_conv.kern, args, 2);
             if (!xdna_run_wait(run)) {
                 return false;
             }
-            xdna_buffer_sync_from_device(g_conv.out);
         }
 
         // Scatter the real tiles of this batch into dst (token-major rows).
@@ -362,9 +365,19 @@ bool xdna_conv_prefill_run(struct xdna_device * dev, struct ggml_tensor * node) 
                 const int64_t row = k % rows_per_col;
                 const size_t slot_k = (size_t) col * MB * rows_per_col +
                                       (size_t) mb * rows_per_col + (size_t) row;
-                const ggml_bf16_t * ok = o + slot_k * TILE_OUT;
                 const int64_t ch0 = tl.c0 + col * KC;
                 const int64_t c_lim = std::min<int64_t>(KC, nr - ch0);
+                if (c_lim <= 0) {
+                    continue;
+                }
+                // Only the slots this batch reads are waited for; a short last
+                // batch leaves the ones past its tiles marked, and nothing
+                // reads those.
+                if (!xdna_buffer_wait_written(g_conv.out, (size_t) TILE_OUT * ELT,
+                                              slot_k * TILE_OUT * ELT)) {
+                    return false;
+                }
+                const ggml_bf16_t * ok = o + slot_k * TILE_OUT;
                 if (c_lim <= 0) {
                     continue;
                 }
