@@ -531,6 +531,11 @@ static bool gemm_compute_i8(xdna_ops * ops, struct ggml_tensor * node) {
             }
             {
                 xdna_buffer * args[3] = { bo_a[bank], wb->bo, bo_c[bank] };
+                // The block this run will write, marked before it is submitted:
+                // the readback below cannot tell a landed write from one still
+                // pending, and the last block of the op is read the moment its
+                // wait returns.
+                xdna_buffer_mark(bo_c[bank], (size_t) mc * N * sizeof(int32_t));
                 runs[bank] = xdna_kernel_run_start(kern, args, 3);
                 if (!runs[bank]) {
                     GGML_LOG_ERROR("%s: int8 GEMM submit failed M=%d K=%d N=%d\n", "xdna-ops", M, K, N);
@@ -543,12 +548,13 @@ static bool gemm_compute_i8(xdna_ops * ops, struct ggml_tensor * node) {
                     GGML_LOG_ERROR("%s: int8 GEMM wait failed M=%d K=%d N=%d node=%s\n", "xdna-ops", M, K, N, node->name ? node->name : "?");
                     return false;
                 }
-                {
-                    xdna_buffer_sync_from_device(bo_c[pend]);
+                const size_t pmc_bytes =
+                    (size_t) std::min(Mk, M - pend_mb * Mk) * N * sizeof(int32_t);
+                const int32_t * c = (const int32_t *) xdna_buffer_wait_written(bo_c[pend], pmc_bytes);
+                if (!c) {
+                    return false;
                 }
-                {
-                    fold_block(pend_mb, (const int32_t *) bo_c[pend]->bo.map());
-                }
+                fold_block(pend_mb, c);
                 {
                     xdna_kernel_pool_release_buffer(ops->pool, bo_a[pend]);
                     xdna_kernel_pool_release_buffer(ops->pool, bo_c[pend]);
@@ -566,12 +572,13 @@ static bool gemm_compute_i8(xdna_ops * ops, struct ggml_tensor * node) {
             GGML_LOG_ERROR("%s: int8 GEMM final wait failed M=%d K=%d N=%d node=%s\n", "xdna-ops", M, K, N, node->name ? node->name : "?");
             return false;
         }
-        {
-            xdna_buffer_sync_from_device(bo_c[pend]);
+        const size_t pmc_bytes =
+            (size_t) std::min(Mk, M - pend_mb * Mk) * N * sizeof(int32_t);
+        const int32_t * c = (const int32_t *) xdna_buffer_wait_written(bo_c[pend], pmc_bytes);
+        if (!c) {
+            return false;
         }
-        {
-            fold_block(pend_mb, (const int32_t *) bo_c[pend]->bo.map());
-        }
+        fold_block(pend_mb, c);
         {
             xdna_kernel_pool_release_buffer(ops->pool, bo_a[pend]);
             xdna_kernel_pool_release_buffer(ops->pool, bo_c[pend]);
@@ -698,6 +705,10 @@ static bool gemm_compute(xdna_ops * ops, struct ggml_tensor * node) {
 
             xdna_buffer * args[3] = { pr.bo_a, bo_w, pr.bo_c };
             {
+                // Marked before the submit: the readback below cannot tell a
+                // landed write from one still pending, and the trailing banks
+                // are read the moment finalize's waits return.
+                xdna_buffer_mark(pr.bo_c, (size_t) mc * N * sizeof(float));
                 pr.run = xdna_kernel_run_start(kern, args, 3);
                 if (!pr.run) {
                     GGML_LOG_ERROR("%s: GEMM submit failed M=%d K=%d N=%d kernel=gemm_K%d_N%d_b%d\n",
@@ -721,11 +732,12 @@ static bool gemm_compute(xdna_ops * ops, struct ggml_tensor * node) {
                 // is exact and the readback drops to mc*N elements.
                 const xdna_ops::pending_m_block & pmb = op.m_blocks[prev.mb_idx];
                 const int pmc = std::min(Mk, M - pmb.m0);
-                {
-                    xdna_buffer_sync_from_device(prev.bo_c);
+                const float * c = (const float *) xdna_buffer_wait_written(
+                    prev.bo_c, (size_t) pmc * N * sizeof(float));
+                if (!c) {
+                    return false;
                 }
                 {
-                    const float * c = (const float *) prev.bo_c->bo.map();
                     for (int m = 0; m < pmc; m++) {
                         float * dst = (float *) ((char *) node->data +
                                                  (size_t) (op.m_off + pmb.m0 + m) * node->nb[1]);
@@ -792,8 +804,11 @@ bool xdna_ops_finalize(xdna_ops * ops) {
         for (auto & mb : op.m_blocks) {
             const int mc = std::min(Mk, op.M - mb.m0);
             for (auto & pr : mb.runs) {
-                xdna_buffer_sync_from_device(pr.bo_c);
-                const float * c = (const float *) pr.bo_c->bo.map();
+                const float * c = (const float *) xdna_buffer_wait_written(
+                    pr.bo_c, (size_t) mc * op.N * sizeof(float));
+                if (!c) {
+                    return false;
+                }
                 for (int m = 0; m < mc; m++) {
                     float * dst = (float *) ((char *) op.node->data +
                                              (size_t) (op.m_off + mb.m0 + m) * op.node->nb[1]);
