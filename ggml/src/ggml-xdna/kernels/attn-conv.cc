@@ -5,6 +5,7 @@
 // @GPO@ and @SLOT@ are filled in per build (CONV_GPO / CONV_SLOT); see
 // attn_cn.py.
 #include <aie_api/aie.hpp>
+#include "silu-f32.h"
 using namespace aie;
 // gather fp32 src[base + i*stride] into an aligned bf16 buffer; the bf16
 // conversion is the silu/gdn accum trick verbatim
@@ -20,6 +21,10 @@ static inline void f32gb(const float * src, int base, int stride, bfloat16 * dst
     }
 }
 extern "C" void ggml_xdna_attn_conv(const float * feed0, float * x0, float * hist0) {
+    // Round fp32 -> bf16 to nearest-even. The core's default rounding mode
+    // truncates toward zero, and the taps and weights rounded here came
+    // out biased toward zero (see gdn-v.cc).
+    aie::set_rounding(aie::rounding_mode::conv_even);
     // An object carries @GPO@ feed groups, not one: a 4 KB transfer never
     // reaches the shim's rate, and the stage's time is all transfer.
     for (int gpo_ = 0; gpo_ < @GPO@; ++gpo_) {
@@ -31,13 +36,9 @@ extern "C" void ggml_xdna_attn_conv(const float * feed0, float * x0, float * his
     // With a short slot the weights are not in the object at all - this is the
     // diagnostic that prices the stage's bytes, and its output is wrong.
     const float * w = @SLOT@ < @FEED_N@ ? feed : feed + @F_W@;
-    alignas(64) bfloat16 gb[32];
     alignas(64) bfloat16 hb[3][32];
     alignas(64) bfloat16 wb[4][32];
     alignas(64) bfloat16 qv_b[32];
-    const auto reg_half16 = aie::broadcast<bfloat16, 16>(0.5f);
-    const auto reg_half32 = aie::broadcast<bfloat16, 32>(0.5f);
-    const auto reg_one32 = aie::broadcast<bfloat16, 32>(1.0f);
     // conv dot per 32 channels: gathered bf16 taps x weights -> fp32 accum
     for (int c = 0; c < @S_V@; c += 32) {
         for (int t = 0; t < 3; ++t) {
@@ -61,25 +62,10 @@ extern "C" void ggml_xdna_attn_conv(const float * feed0, float * x0, float * his
         hist[c*3+1] = hi[c*3+2];
         hist[c*3+2] = qv[c];
     }
-    // silu(a) = a*0.5*(1+tanh(a/2)) in bf16 (swiglu_mm.cc silu epilogue verbatim)
-    for (int o = 0; o < @S_V@; o += 32) {
-        for (int j = 0; j < 2; j++) {
-            aie::accum<accfloat, 16> ga;
-            ga.from_vector(aie::load_v<16>(x + o + j * 16), 0);
-            aie::store_v(gb + j * 16, ga.to_vector<bfloat16>());
-        }
-        aie::vector<bfloat16, 32> input = aie::load_v<32>(gb);
-        auto half_lo = aie::mul(input.extract<16>(0), reg_half16);
-        auto half_hi = aie::mul(input.extract<16>(1), reg_half16);
-        auto tanh_lo = aie::tanh<bfloat16>(half_lo.to_vector<float>());
-        auto tanh_hi = aie::tanh<bfloat16>(half_hi.to_vector<float>());
-        aie::vector<bfloat16, 32> tanh_half_x = aie::concat(tanh_lo, tanh_hi);
-        aie::vector<bfloat16, 32> sig =
-            aie::mul(aie::add(tanh_half_x, reg_one32), reg_half32).to_vector<bfloat16>();
-        auto silu = aie::mul(input, sig).to_vector<bfloat16>();
-        aie::accum<accfloat, 32> wa;
-        wa.from_vector(silu, 0);
-        aie::store_v(x + o, wa.to_vector<float>());
+    // silu on the hardware tanh, around fp32 accumulators (silu-f32.h: the
+    // fp32 silu here costs 1.4 ms a token for KLD 0.0050 -> 0.0042)
+    for (int o = 0; o < @S_V@; o += 16) {
+        aie::store_v(x + o, silu_hw(aie::load_v<16>(x + o)));
     }
     }
 }
