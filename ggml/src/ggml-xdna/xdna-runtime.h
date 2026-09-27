@@ -44,8 +44,7 @@ void xdna_buffer_free(xdna_buffer * buf);
 
 // Make device-side writes to a mapped BO visible to the host. On this platform
 // XRT never issues the driver's cache-maintenance ioctl for a host_only BO and
-// the mapping is ordinary cacheable memory; what it does here is nothing. The
-// mark/download pair below is what actually makes such a read safe.
+// the mapping is ordinary cacheable memory; what it does here is nothing.
 void xdna_buffer_sync_from_device(xdna_buffer * buf);
 
 // The pattern xdna_buffer_mark leaves in a range the device is about to
@@ -58,11 +57,22 @@ static constexpr uint32_t XDNA_POISON_F32 = 0x7FC0DEADu;
 // land on top of the device's output.
 //
 // A dispatch reports completion before its last writes are readable, so a read
-// taken right after it can return the previous contents. There is no barrier
-// for that from the host - the completion is honest and the cache ioctl does
-// nothing - so the read has to tell a landed write from a pending one, which
-// is what the pattern is for.
+// taken right after it can return the previous contents of the buffer. There
+// is no barrier for that from the host - the completion is honest and the
+// cache ioctl does nothing - so the read has to tell a landed write from a
+// pending one, which is what the pattern is for.
 void xdna_buffer_mark(xdna_buffer * buf, size_t bytes, size_t offset = 0);
+
+// Wait until the device has written every word of [offset, offset+bytes) and
+// return the buffer's map at that offset, so the caller reads it in place; or
+// nullptr when the pattern survived every pass.
+//
+// The same evidence as xdna_buffer_download without the copy, for a reader
+// that consumes the range once and can walk the device's memory directly - a
+// GEMM's C block folded straight into its destination, where a staging copy
+// would double the bytes moved.
+uint8_t * xdna_buffer_wait_written(xdna_buffer * buf, size_t bytes,
+                                   size_t offset = 0);
 
 // Copy a marked range out, returning only once every word of it has been
 // written by the device, i.e. once the pattern is gone. `dst` must hold
