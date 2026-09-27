@@ -370,15 +370,20 @@ bool xdna_fa_prefill_run(struct xdna_device * dev, struct ggml_tensor * node) {
                 xdna_buffer_sync_to_device(g_fa.q);
             }
             xdna_buffer * args[3] = { g_fa.q, g_fa.kv_view[c], g_fa.o };
+            // Every chunk accumulates into the whole output object, so the
+            // last chunk of the round is the one the readback below waits on.
+            xdna_buffer_mark(g_fa.o, g_fa.o->bytes);
             xrt::run run = xdna_kernel_run_start(g_fa.kern, args, 3);
             if (!xdna_run_wait(run)) {
                 return false;
             }
         }
-        xdna_buffer_sync_from_device(g_fa.o);
 
         // dst is [D, n_head, n_tokens]; a core's object holds O transposed.
-        const float * o = (const float *) g_fa.o->bo.map();
+        const float * o = (const float *) xdna_buffer_wait_written(g_fa.o, g_fa.o->bytes);
+        if (!o) {
+            return false;
+        }
         for (int h = 0; h < H; h++) {
             for (int r = 0; r < ROWS; r++) {
                 const float * ob = o + ((size_t) h * ROWS + r) * ACC_N;
