@@ -7,6 +7,7 @@
 #include <stdint.h>
 #include <math.h>
 #include <aie_api/aie.hpp>
+#include "silu-f32.h"
 using namespace aie;
 
 #if ATTN_ONCHIP
@@ -40,8 +41,6 @@ extern "C" void ggml_xdna_gated_h2(uint8_t * out, const float * azg4) {
 #endif
     const float * z = azg + 128;
     const float * gamma = azg + 256;
-    const auto bc_h = aie::broadcast<float, 16>(0.5f);
-    const auto bc1 = aie::broadcast<bfloat16, 16>(1.0f);
     // Vector sum of squares; the scalar loop this replaces was 128 dependent
     // float adds per head.
     aie::vector<float, 16> sq = aie::zeros<float, 16>();
@@ -59,12 +58,9 @@ extern "C" void ggml_xdna_gated_h2(uint8_t * out, const float * azg4) {
         auto a16 = aie::load_v<16>(a + i);
         auto z16 = aie::load_v<16>(z + i);
         auto g16 = aie::load_v<16>(gamma + i);
-        auto t16 = aie::mul(z16, bc_h).to_vector<float>();
-        auto thb = aie::tanh(t16);
-        auto th  = aie::mul(thb, bc1).to_vector<float>();
-        auto thh = aie::mul(th, bc_h).to_vector<float>();
-        auto sig = aie::add(thh, bc_h);
-        auto silu = aie::mul(z16, sig).to_vector<float>();
+        // silu(z) in fp32: the hw tanh's bf16 result was this stage's
+        // largest error (silu-f32.h)
+        auto silu = silu_f32(z16);
         auto g1 = aie::mul(a16, bc_r).to_vector<float>();
         auto g2 = aie::mul(g1, g16).to_vector<float>();
         aie::vector<float, 16> g = aie::mul(g2, silu).to_vector<float>();
