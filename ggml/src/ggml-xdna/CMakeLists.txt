@@ -282,6 +282,10 @@ if (GGML_XDNA_BUILD_KERNELS)
                 "${GEMM_DIR}/gemv-zero.cc" "${GEMM_DIR}/attn_cn.py"
                 "${GEMM_DIR}/gdn_v.py" "${GEMM_DIR}/rec_gated.py"
                 "${GEMM_DIR}/rec_post.py"
+                "${GEMM_DIR}/attn-conv.cc" "${GEMM_DIR}/attn-norm.cc"
+                "${GEMM_DIR}/gdn-v.cc" "${GEMM_DIR}/rec-gated.cc"
+                "${GEMM_DIR}/gated-h2.cc"
+                "${GEMM_DIR}/silu-f32.h"
         WORKING_DIRECTORY "${GEMM_DIR}"
         COMMENT "ggml-xdna: compiling the merged recurrent layer"
         VERBATIM
