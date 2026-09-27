@@ -19,6 +19,7 @@
 #include <stdint.h>
 #include <math.h>
 #include <aie_api/aie.hpp>
+#include "silu-f32.h"
 using namespace aie;
 
 // az per head = [attn 128][z 128][hh] (hh at the tail keeps attn/z 64B-aligned;
@@ -28,8 +29,6 @@ extern "C" void ggml_xdna_gated_head(uint8_t * out, const float * az, const floa
     float * gbuf = (float *)out + hh * 128;
     const float * a = az;
     const float * z = az + 128;
-    const auto bc_h = aie::broadcast<float, 16>(0.5f);
-    const auto bc1 = aie::broadcast<bfloat16, 16>(1.0f);
     float ms = 0.0f;
     for (int i = 0; i < 128; i++) ms += a[i] * a[i];
     const float rsc = 1.0f / aie::sqrt(ms / 128.0f + 1e-6f);
@@ -38,13 +37,8 @@ extern "C" void ggml_xdna_gated_head(uint8_t * out, const float * az, const floa
         auto a16 = aie::load_v<16>(a + i);
         auto z16 = aie::load_v<16>(z + i);
         auto g16 = aie::load_v<16>(gamma + i);
-        // silu(z) = z * 0.5*(1+tanh(z/2)); tanh is hw bf16, lifted to float
-        auto t16 = aie::mul(z16, bc_h).to_vector<float>();
-        auto thb = aie::tanh(t16);
-        auto th  = aie::mul(thb, bc1).to_vector<float>();
-        auto thh = aie::mul(th, bc_h).to_vector<float>();
-        auto sig = aie::add(thh, bc_h);
-        auto silu = aie::mul(z16, sig).to_vector<float>();
+        // silu(z) in fp32: the hw tanh's bf16 result was this stage's largest error
+        auto silu = silu_f32(z16);
         auto g1 = aie::mul(a16, bc_r).to_vector<float>();
         auto g2 = aie::mul(g1, g16).to_vector<float>();
         aie::vector<float, 16> g = aie::mul(g2, silu).to_vector<float>();

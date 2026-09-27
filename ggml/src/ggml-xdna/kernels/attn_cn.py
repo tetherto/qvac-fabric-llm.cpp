@@ -77,7 +77,8 @@ def _fill(template: str, **kw) -> str:
 
 def _conv_src(gpo: int = 1, feed_slot: int = 0):
     slot = feed_slot or FEED_N
-    return _fill(CONV_SRC.read_text(),
+    silu = (Path(__file__).resolve().parent / "silu-f32.h").read_text()
+    return _fill(CONV_SRC.read_text().replace('#include "silu-f32.h"', silu),
                  GPO=gpo, SLOT=slot, S_V=S_V, F_H=F_H, F_Q=F_Q,
                  F_W=F_W, FEED_N=FEED_N)
 

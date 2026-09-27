@@ -8,6 +8,11 @@
 using namespace aie;
 extern "C" void ggml_xdna_gdn_v(const float * pkv, const bfloat16 * rows,
                       bfloat16 * sout, float * attn) {
+    // Round fp32 -> bf16 to nearest-even. The core's default rounding mode
+    // truncates toward zero, and the state rows stored here every token then
+    // shrink by ~2^-9 a step, coherently: the recurrence drifted 20-30% off
+    // the reference over a few hundred tokens (KLD 0.126 for the fused path).
+    aie::set_rounding(aie::rounding_mode::conv_even);
     const float * v16 = pkv + @O_V@;
     const float eg = pkv[@O_EG@];
     const float b = pkv[@O_EG@+1];
