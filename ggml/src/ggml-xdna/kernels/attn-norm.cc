@@ -21,6 +21,10 @@ static inline float rsqrtf_scalar(float x) {
     return r;
 }
 extern "C" void @NAME@(const float * in, float * out) {
+    // Round fp32 -> bf16 to nearest-even. The core's default rounding mode
+    // truncates toward zero, and every q and k handed to the recurrence
+    // came out biased toward zero (see gdn-v.cc).
+    aie::set_rounding(aie::rounding_mode::conv_even);
     // in = [ q(128) | k(128) | v(128) | eg | b | scale ]; out = the head's pkv
     // chunks, all eight or one half of them
     const float * q = in;
