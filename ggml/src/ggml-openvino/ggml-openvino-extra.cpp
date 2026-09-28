@@ -281,7 +281,7 @@ ggml_openvino_extracted_layout ggml_openvino_get_extracted_layout(const ggml_ten
     }
 
     // Most quantized weights use the existing 2D extraction path. 3D expert weights for
-    // MUL_MAT_ID (MoE) are also supported, either as MXFP4 (packed on GPU, dedicated branch below) or via the
+    // MUL_MAT_ID (MoE) are also supported, either as packed MXFP4 on GPU/NPU or via the
     // generic sizing math below, which is shape-agnostic (based on total element count). Only reject 4D.
     if (tensor->ne[3] != 1) {
         return layout;
