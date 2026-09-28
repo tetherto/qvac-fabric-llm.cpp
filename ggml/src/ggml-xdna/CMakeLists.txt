@@ -55,7 +55,7 @@ set(XDNA_TILE_N 64)         # per-core N tile (wider = longer B DDR bursts)
 set(XDNA_N_COLS 8)          # AIE columns
 set(XDNA_N_COMPUTE_ROWS 4)  # compute tile rows
 
-target_compile_definitions(ggml-xdna PRIVATE
+set(XDNA_GEOMETRY_DEFS
     GGML_XDNA_GEMM_M=${XDNA_GEMM_M}
     GGML_XDNA_TILE_M=${XDNA_TILE_M}
     GGML_XDNA_TILE_M_BIG=${XDNA_TILE_M_BIG}
@@ -66,6 +66,7 @@ target_compile_definitions(ggml-xdna PRIVATE
     GGML_XDNA_N_COMPUTE_ROWS=${XDNA_N_COMPUTE_ROWS}
     GGML_XDNA_GATED_FMT=${GGML_XDNA_GATED_FMT}
 )
+target_compile_definitions(ggml-xdna PRIVATE ${XDNA_GEOMETRY_DEFS})
 
 # NPU kernels are compiled out-of-line by kernels/gemm.py (IRON/MLIR-AIE) at
 # build time. Each variant is a (K N) tuple; M and the tiles are fixed by the
@@ -395,4 +396,24 @@ if (GGML_XDNA_BUILD_KERNELS)
     add_dependencies(ggml-xdna ggml-xdna-kernels)
 
     install(FILES ${XDNA_ARTIFACTS} DESTINATION ${CMAKE_INSTALL_BINDIR})
+endif()
+
+# Host-only tests of what a device cannot check for itself: which weight
+# conversions the repacker accepts. They compile the backend sources they test
+# directly, open no device and run in ctest wherever the backend builds.
+option(GGML_XDNA_BUILD_TESTS "ggml-xdna: build the host-only backend tests" ON)
+if (GGML_XDNA_BUILD_TESTS)
+    set(XDNA_TESTS
+        "test-xdna-repack|xdna-quant.cpp"
+    )
+    foreach(t IN LISTS XDNA_TESTS)
+        string(REPLACE "|" ";" T ${t})
+        list(GET T 0 NAME)
+        list(GET T 1 SRC)
+        add_executable(${NAME} tests/${NAME}.cpp ${SRC})
+        target_include_directories(${NAME} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/..)
+        target_link_libraries(${NAME} PRIVATE ggml-base)
+        target_compile_definitions(${NAME} PRIVATE ${XDNA_GEOMETRY_DEFS})
+        add_test(NAME ${NAME} COMMAND ${NAME} ${CMAKE_RUNTIME_OUTPUT_DIRECTORY})
+    endforeach()
 endif()
