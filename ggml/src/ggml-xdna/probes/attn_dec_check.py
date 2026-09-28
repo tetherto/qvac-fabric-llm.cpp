@@ -122,4 +122,3 @@ for h in range(H):
     worst = max(worst, rel)
     print(f"h{h} m={mm:.3f}/{m:.3f} lse={lse:.4f}/{lse_ref:.4f} rel={rel:.3e}")
 print("worst", worst)
-

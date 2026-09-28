@@ -162,9 +162,9 @@ def build(dev_name: str = "npu2"):
                 k_pv, k_end, Buffer(p_ty, name=f"p{col}_{i}"),
                 Buffer(ml_ty, name=f"ml{col}_{i}"), Buffer(n_ty, name=f"n{col}_{i}"), pidx],
                 tile=Tile(col, 2 + i), stack_size=0xE00))
-    eps = ([f.prod(tile=Tile(col, 0)) for col, f in enumerate(q_col)] +
-           [kv_in[g][h].prod(tile=Tile(kv_col(g, h), 0)) for g in range(2) for h in range(2)] +
-           [f.cons(tile=Tile(col, 0)) for col, f in enumerate(o_col)])
+    eps = ([f.prod(tile=Tile(col, 0)) for col, f in enumerate(q_col)]
+           + [kv_in[g][h].prod(tile=Tile(kv_col(g, h), 0)) for g in range(2) for h in range(2)]
+           + [f.cons(tile=Tile(col, 0)) for col, f in enumerate(o_col)])
     return workers, eps
 
 

@@ -110,6 +110,8 @@ print(f"{FMT}: {got.size} values, max |err| {np.abs(got - ref).max():.3e}, "
 idx = np.nonzero(ulp > 1.01)[0]
 for i in idx[:12]:
     st, rem = divmod(i, 128 * 64)
-    kb, rem = divmod(rem, 512); nb, rem = divmod(rem, 8 * T); si, ti = divmod(rem, T)
+    kb, rem = divmod(rem, 512)
+    nb, rem = divmod(rem, 8 * T)
+    si, ti = divmod(rem, T)
     print(f"  tile/step {st} row {kb*8+si} col {nb*T+ti}: got {got[i]:.5g} ref {ref[i]:.5g} ref_bf {ref_bf[i]:.5g}")
 print("PASS" if bad == 0 else "FAIL")
