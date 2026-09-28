@@ -674,6 +674,8 @@ struct rpc_queue_cmd {
     std::shared_ptr<rpc_pending_get_2d> pending_get_2d;
 };
 
+static constexpr auto RPC_BUSY_SPIN_IDLE_TIME = std::chrono::milliseconds(100);
+
 class rpc_command_queue {
   public:
     static std::shared_ptr<rpc_command_queue> create(const std::string & endpoint) {
@@ -1000,12 +1002,13 @@ class rpc_command_queue {
     }
 
     void worker_loop() {
+        auto last_cmd = std::chrono::steady_clock::now();
         while (true) {
             rpc_queue_cmd cmd;
             {
                 std::unique_lock<std::mutex> lock(mutex);
-                if (busy_spin_users == 0) {
-                    cv.wait(lock, [this] { return shutdown || !commands.empty() || busy_spin_users != 0; });
+                if (busy_spin_users == 0 || std::chrono::steady_clock::now() - last_cmd >= RPC_BUSY_SPIN_IDLE_TIME) {
+                    cv.wait(lock, [this] { return shutdown || !commands.empty(); });
                 }
                 if (shutdown && commands.empty()) {
                     return;
@@ -1025,7 +1028,9 @@ class rpc_command_queue {
                 commands.pop_front();
             }
             const size_t cmd_bytes = cmd.data.size();
-            if (execute(cmd)) {
+            const bool success = execute(cmd);
+            last_cmd = std::chrono::steady_clock::now();
+            if (success) {
                 {
                     std::lock_guard<std::mutex> lock(mutex);
                     queued_bytes -= std::min(queued_bytes, cmd_bytes);

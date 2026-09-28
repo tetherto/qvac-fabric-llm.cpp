@@ -142,6 +142,8 @@ To force plain TCP without rebuilding, set `GGML_RPC_NO_RDMA` on either peer:
 $ GGML_RPC_NO_RDMA=1 bin/ggml-rpc-server
 ```
 
+On Linux, after 100 ms without a completion, the transport waits for a completion event so an idle connection does not keep a CPU core busy.
+
 ### Direct all-reduce
 
 Tensor split with a power-of-two number of RPC devices (2, 4, 8, 16, ...) uses recursive-doubling (butterfly) all-reduce. In round `k`, rank `r` exchanges its accumulated tensor with rank `r XOR (1 << k)` and adds the received sum. After `log2(N)` rounds, every rank has the full sum. Tensor data travels directly between servers, without passing through the main host. Each rank sends a full tensor per round; this is not a bandwidth-optimal reduce-scatter/all-gather algorithm for large tensors.
@@ -154,7 +156,7 @@ Allow the communication port through the firewall and ensure that the servers ca
 
 #### Testing direct all-reduce
 
-Graph and collective commands are queued asynchronously; synchronization and readback report deferred transport failures. While a direct communicator is active, its client dispatchers busy-poll to reduce command latency. This trades CPU time for lower dispatch latency. Set `GGML_RPC_NO_BUSY_SPIN=1` on the main host to use sleeping dispatchers for an A/B comparison. Polling stops when the last shared communicator handle is released.
+Graph and collective commands are queued asynchronously; synchronization and readback report deferred transport failures. While a direct communicator is active, its client dispatchers busy-poll for up to 100 ms after a command, then sleep until the next command. Set `GGML_RPC_NO_BUSY_SPIN=1` on the main host to use sleeping dispatchers throughout for an A/B comparison.
 
 The local test runner starts isolated CPU RPC servers; it needs Python 3 but no GPU or model:
 
