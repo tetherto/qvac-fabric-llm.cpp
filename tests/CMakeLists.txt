@@ -223,6 +223,8 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     # llama_build_and_test(test-double-float.cpp) # SLOW
 
     llama_build(test-llama-archs.cpp)
+    llama_test(test-llama-archs NAME test-glm5-kpool-sequences ARGS --glm5-kpool-sequences)
+    llama_test(test-llama-archs NAME test-glm5-invalid-metadata ARGS --glm5-invalid-metadata)
     llama_test(test-llama-archs NAME test-mtp-shared-cpu ARGS --mtp-shared-cpu)
     llama_test(test-llama-archs NAME test-hadamard-contracts ARGS --hadamard-contracts)
     if (GGML_CUDA)

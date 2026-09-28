@@ -35,6 +35,9 @@ struct fixture_params {
     const char * proj_type = "visionpsy";
     bool write_preproc_image_size = true;
     int override_no_upscale = -1; // what the caller passes in clip_context_params
+    int spatial_merge_size = 2;
+    int image_min_pixels = 4096;
+    int image_max_pixels = 262144;
 };
 
 // Minimal vision mmproj metadata: everything load_hparams reads as required, plus the two keys
@@ -62,6 +65,12 @@ static std::string write_fixture(const char * name, const fixture_params & p) {
         gguf_set_val_u32(ctx, KEY_PREPROC_IMAGE_SIZE, (uint32_t) p.preproc_image_size);
     }
     gguf_set_val_bool(ctx, KEY_PREPROC_NO_UPSCALE, p.no_upscale);
+    if (std::string(p.proj_type) == "glm5v") {
+        gguf_set_val_u32(ctx, KEY_SPATIAL_MERGE_SIZE, (uint32_t) p.spatial_merge_size);
+        gguf_set_val_f32(ctx, KEY_SWIGLU_CLAMP, 8.0f);
+        gguf_set_val_u32(ctx, KEY_IMAGE_MIN_PIXELS, (uint32_t) p.image_min_pixels);
+        gguf_set_val_u32(ctx, KEY_IMAGE_MAX_PIXELS, (uint32_t) p.image_max_pixels);
+    }
 
     const float mean_std[3] = { 0.0f, 0.0f, 0.0f };
     gguf_set_arr_data(ctx, KEY_IMAGE_MEAN, GGUF_TYPE_FLOAT32, mean_std, 3);
@@ -137,6 +146,21 @@ static void expect_passes_validation(const char * name, const fixture_params & p
 }
 
 int main() {
+    // GLM5V uses the common n_merge validation before its image preprocessor can divide by it.
+    {
+        fixture_params p = { 512, 2048, false };
+        p.proj_type = "glm5v";
+        expect_passes_validation("glm5v-valid", p);
+        p.spatial_merge_size = 0;
+        expect_rejected("glm5v-zero-merge", p, "n_merge (0)");
+        p.spatial_merge_size = 2;
+        p.image_min_pixels = 0;
+        expect_rejected("glm5v-zero-min-pixels", p, "GLM5V image_min_pixels");
+        p.image_min_pixels = 4096;
+        p.image_max_pixels = 0;
+        expect_rejected("glm5v-zero-max-pixels", p, "GLM5V image_min_pixels");
+    }
+
     // The shipped shape: 512 slices, 2048 cap. Both variants must get past validation.
     expect_passes_validation("valid-base",  { 512, 2048, false });
     expect_passes_validation("valid-flash", { 512, 2048, true });

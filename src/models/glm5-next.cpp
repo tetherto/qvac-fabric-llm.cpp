@@ -1,10 +1,17 @@
 #include "models.h"
 #include "llama-memory-hybrid-idx.h"
 
+#include <stdexcept>
+
 // GLM5-Next (GLM-5.3-Flash): hybrid KDA (linear) + nope MLA with a k-pool DSA indexer,
 // mHC residual streams, DeepSeek-style MoE.
 
 void llama_model_glm5_next::load_arch_hparams(llama_model_loader & ml) {
+    ml.get_key(LLM_KV_NEXTN_PREDICT_LAYERS,       hparams.n_layer_nextn, false);
+    if (hparams.n_layer_nextn >= hparams.n_layer_all) {
+        throw std::runtime_error(format("%s must be less than block_count (%u), got %u",
+                ml.llm_kv(LLM_KV_NEXTN_PREDICT_LAYERS).c_str(), hparams.n_layer_all, hparams.n_layer_nextn));
+    }
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_EPS,     hparams.f_norm_eps, false);
     ml.get_key(LLM_KV_ATTENTION_KEY_LENGTH_MLA,    hparams.n_embd_head_k_mla_impl);
@@ -42,7 +49,17 @@ void llama_model_glm5_next::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_ATTENTION_INDEXER_TOP_K,             hparams.indexer_top_k);
     ml.get_key(LLM_KV_ATTENTION_INDEXER_KPOOL,             hparams.indexer_kpool);
     ml.get_key(LLM_KV_ATTENTION_INDEXER_KPOOL_SELECT_TAIL, hparams.indexer_kpool_select_tail, false);
-    GGML_ASSERT(hparams.indexer_kpool > 1 && hparams.indexer_top_k % hparams.indexer_kpool == 0);
+    if (hparams.indexer_kpool <= 1) {
+        throw std::runtime_error(format("%s must be greater than one, got %u",
+                ml.llm_kv(LLM_KV_ATTENTION_INDEXER_KPOOL).c_str(), hparams.indexer_kpool));
+    }
+    if (hparams.indexer_top_k < hparams.indexer_kpool ||
+            hparams.indexer_top_k % hparams.indexer_kpool != 0) {
+        throw std::runtime_error(format("%s must be a positive multiple of %s (%u), got %u",
+                ml.llm_kv(LLM_KV_ATTENTION_INDEXER_TOP_K).c_str(),
+                ml.llm_kv(LLM_KV_ATTENTION_INDEXER_KPOOL).c_str(),
+                hparams.indexer_kpool, hparams.indexer_top_k));
+    }
     std::fill(hparams.is_indexer_full_impl.begin(), hparams.is_indexer_full_impl.end(), 1);
     ml.get_key_or_arr(LLM_KV_ATTENTION_INDEXER_TYPES, hparams.is_indexer_full_impl, hparams.n_layer(), false);
 
@@ -50,7 +67,10 @@ void llama_model_glm5_next::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_HYPER_CONNECTION_COUNT,               hparams.dsv4_hc_mult);
     ml.get_key(LLM_KV_HYPER_CONNECTION_SINKHORN_ITERATIONS, hparams.dsv4_hc_sinkhorn_iters);
     ml.get_key(LLM_KV_HYPER_CONNECTION_EPSILON,             hparams.dsv4_hc_eps);
-    GGML_ASSERT(hparams.dsv4_hc_mult == 4 && "mHC with hc_mult != 4 is not supported");
+    if (hparams.dsv4_hc_mult != 4) {
+        throw std::runtime_error(format("%s must be 4, got %u",
+                ml.llm_kv(LLM_KV_HYPER_CONNECTION_COUNT).c_str(), hparams.dsv4_hc_mult));
+    }
 
     switch (hparams.n_layer()) {
         case 45: type = LLM_TYPE_320B_A18B; break; // GLM-5.3-Flash
