@@ -50,6 +50,7 @@ unresolved-import = "ignore"
 [[overrides]]
 include = [
     "./ggml/src/ggml-xdna/kernels/**",
+    "./ggml/src/ggml-xdna/probes/**",
 ]
 
 [overrides.rules]
