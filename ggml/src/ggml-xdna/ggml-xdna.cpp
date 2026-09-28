@@ -356,6 +356,13 @@ struct ggml_backend_xdna_context {
     // sequence is identified by the row its recurrent-memory cell occupies in
     // the cache tensor.
     std::map<std::pair<int, int64_t>, struct xdna_rec_session *> rec;
+
+    // Backends (llama contexts) alive on this context. The sessions and the
+    // packed weights above belong to a model; when the last backend is freed
+    // they are released with it (xdna_release_model_state), so a model loaded
+    // afterwards - possibly at the same addresses - starts from nothing.
+    std::mutex life_mutex;
+    int        n_backends = 0;
 };
 
 // One fused-layer session (per recurrent block). Owns the three runners and
@@ -1053,9 +1060,40 @@ static const char * ggml_backend_xdna_get_name(ggml_backend_t backend) {
     return "XDNA";
 }
 
+static void xdna_rec_session_free(xdna_rec_session * s) {
+    if (!s) {
+        return;
+    }
+    // The core's fused projection run binds the GEMV's buffers: core first.
+    xdna_rec_core_free(s->core);
+    xdna_rec_gemv_free(s->gv);
+    delete s;
+}
+
+// Release what was built from a model: the fused-layer sessions (their device
+// state, their packed weights, and host pointers into the model's tensors)
+// and the packed weights of the per-op kernels. The kernel pool and the
+// prefill runners hold no model data and stay.
+static void xdna_release_model_state(ggml_backend_xdna_context * ctx) {
+    const size_t n = ctx->rec.size();
+    for (auto & kv : ctx->rec) {
+        xdna_rec_session_free(kv.second);
+    }
+    ctx->rec.clear();
+    xdna_ops_release_weights(&ctx->ops);
+    GGML_LOG_DEBUG("%s: released %zu fused-layer sessions and the packed weights\n", "ggml-xdna", n);
+}
+
 static void ggml_backend_xdna_free(ggml_backend_t backend) {
-    // The context is a process-wide singleton; it is not freed here.
-    GGML_UNUSED(backend);
+    // The context is a process-wide singleton; it is not freed here, but what
+    // it built from the model goes with the last backend.
+    ggml_backend_xdna_context * ctx = (ggml_backend_xdna_context *) backend->context;
+    {
+        std::lock_guard<std::mutex> lock(ctx->life_mutex);
+        if (--ctx->n_backends == 0) {
+            xdna_release_model_state(ctx);
+        }
+    }
     delete backend;
 }
 
@@ -1527,6 +1565,10 @@ ggml_backend_t ggml_backend_xdna_init(void) {
         /* .device  = */ ggml_backend_reg_dev_get(ggml_backend_xdna_reg(), 0),
         /* .context = */ ctx,
     };
+    {
+        std::lock_guard<std::mutex> lock(ctx->life_mutex);
+        ctx->n_backends++;
+    }
 
     return backend;
 }
