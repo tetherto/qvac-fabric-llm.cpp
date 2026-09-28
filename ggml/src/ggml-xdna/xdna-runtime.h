@@ -48,6 +48,12 @@ struct xdna_arena_scope {
     ~xdna_arena_scope();
 };
 
+// Free the arena's chunks once nothing carved out of them is left; false, and
+// nothing freed, while a view or a scope still is. What the backend built
+// from a model goes with its last context, so the next model's decode starts
+// a fresh arena rather than growing the old one.
+bool xdna_arena_release(void);
+
 // A window onto an existing buffer, for handing a kernel one slice of a larger
 // one: the sequence's descriptors always read from offset zero, so a design
 // that walks a buffer in chunks needs a view per chunk rather than an offset
