@@ -589,6 +589,11 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
         if (src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_1 && src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
             return src_ss[1];
         }
+        if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED &&
+                src_ss[1].axis >= GGML_BACKEND_SPLIT_AXIS_2 && src_ss[1].axis < GGML_MAX_DIMS) {
+            // The matrix is shared; independent batches of the RHS stay on their devices.
+            return src_ss[1];
+        }
         if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_0 && src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_0) {
             GGML_ASSERT(split_states_equal(src_ss[0], src_ss[1]));
             return {assume_sync ? GGML_BACKEND_SPLIT_AXIS_MIRRORED : GGML_BACKEND_SPLIT_AXIS_PARTIAL, {0}, {1}, 1};
@@ -968,7 +973,15 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             case GGML_OP_DIAG_MASK_ZERO: {
                 split_state = handle_generic(src_ss, /*scalar_only =*/ true);
             } break;
-            case GGML_OP_SOFT_MAX:
+            case GGML_OP_SOFT_MAX: {
+                // A shared mask broadcasts over independently sharded query heads.
+                if (src_ss[0].axis >= GGML_BACKEND_SPLIT_AXIS_1 && src_ss[0].axis < GGML_MAX_DIMS &&
+                        src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
+                    split_state = src_ss[0];
+                } else {
+                    split_state = handle_generic(src_ss, /*scalar_only =*/ false);
+                }
+            } break;
             case GGML_OP_SOFT_MAX_BACK: {
                 split_state = handle_generic(src_ss, /*scalar_only =*/ false);
             } break;
@@ -2048,6 +2061,13 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 auto skip_unrelated = [&]() {
                     while (id + 1 < cgraph->n_nodes) {
                         ggml_tensor * next = cgraph->nodes[id+1];
+                        if (next->view_src != nullptr && ggml_backend_buffer_is_host(next->view_src->buffer)) {
+                            if (next->view_src == node) {
+                                break;
+                            }
+                            id++;
+                            continue;
+                        }
                         if (ggml_backend_meta_get_split_state(next, false).axis != GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
                             break;
                         }
@@ -2060,7 +2080,8 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                                 safe = false;
                                 break;
                             }
-                            if (ggml_backend_meta_get_split_state(next->src[s], false).axis != GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
+                            if (!ggml_backend_buffer_is_meta(next->src[s]->buffer) ||
+                                    ggml_backend_meta_get_split_state(next->src[s], false).axis != GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
                                 safe = false;
                                 break;
                             }
@@ -2079,6 +2100,8 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 {
                     ggml_tensor * next = cgraph->nodes[id+1];
                     if (next->op == GGML_OP_ADD_ID && next->src[0] == node &&
+                            ggml_backend_buffer_is_meta(next->src[1]->buffer) &&
+                            ggml_backend_buffer_is_meta(next->src[2]->buffer) &&
                             ggml_backend_meta_get_split_state(next->src[1], false).axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL &&
                             ggml_backend_meta_get_split_state(next->src[2], false).axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
                         node = next;
@@ -2095,6 +2118,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                     }
                     ggml_tensor * next = cgraph->nodes[id+1];
                     if (next->op == GGML_OP_MUL && next->src[0] == node &&
+                            ggml_backend_buffer_is_meta(next->src[1]->buffer) &&
                             ggml_backend_meta_get_split_state(next->src[1], false).axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
                         node = next;
                         id++;
@@ -2193,6 +2217,14 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 return i_delayed;
             };
 
+            // A graph may end with host-backed views. Flush the final device subgraph
+            // at its last compute node; the views themselves require no device work.
+            int i_last_device = cgraph->n_nodes - 1;
+            while (i_last_device >= 0 && cgraph->nodes[i_last_device]->view_src != nullptr &&
+                    ggml_backend_buffer_is_host(cgraph->nodes[i_last_device]->view_src->buffer)) {
+                i_last_device--;
+            }
+
             int i_start = 0;
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
@@ -2203,7 +2235,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 if (split_state.axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL) {
                     max_tmp_size = std::max(max_tmp_size, ggml_nbytes(node));
                 }
-                const bool new_subgraph = i + 1 == cgraph->n_nodes || split_state.axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL;
+                const bool new_subgraph = i == i_last_device || split_state.axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL;
                 if (!new_subgraph) {
                     continue;
                 }
@@ -2233,6 +2265,10 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 }
                 n_subgraphs++;
                 i_start = i + 1;
+            }
+            while (i_start < cgraph->n_nodes && cgraph->nodes[i_start]->view_src != nullptr &&
+                    ggml_backend_buffer_is_host(cgraph->nodes[i_start]->view_src->buffer)) {
+                i_start++;
             }
             GGML_ASSERT(i_start == cgraph->n_nodes);
         }

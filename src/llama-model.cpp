@@ -400,6 +400,7 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     static const std::regex pattern_attn_out_b_weight("blk\\.\\d*\\.attn_output_b\\.weight");
     static const std::regex pattern_attn_q_b_weight ("blk\\.\\d*\\.attn_q_b\\.weight");
     static const std::regex pattern_attn_gate_weight("blk\\.\\d*\\.attn_gate.weight");
+    static const std::regex pattern_attn_kv_b_weight("blk\\.\\d*\\.attn_(k|v)_b.weight");
 
     static const std::regex pattern_ssm_dt          ("blk\\.\\d*\\.ssm_dt.bias");
     static const std::regex pattern_ssm_a           ("blk\\.\\d*\\.ssm_a");
@@ -411,6 +412,8 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     static const std::regex pattern_s_cache         ("cache_s_l\\d*");
     static const std::regex pattern_ssm_conv1d      ("blk\\.\\d*\\.ssm_conv1d.weight");
     static const std::regex pattern_ssm_out_weight  ("blk\\.\\d*\\.ssm_out.weight");
+    static const std::regex pattern_kda_conv        ("blk\\.\\d*\\.ssm_conv1d_(q|k|v).weight");
+    static const std::regex pattern_kda_head_weight ("blk\\.\\d*\\.ssm_(f_b|g_b).weight");
 
     static const std::regex pattern_ffn_up_weight     ("blk\\.\\d*\\.ffn_up(_exps)?.weight");
     static const std::regex pattern_ffn_up_bias       ("blk\\.\\d*\\.ffn_up(_exps)?.bias");
@@ -513,6 +516,33 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
                 return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0, "ffn_down_shexp.weight");
             }
         }
+        if (ud->model->arch == LLM_ARCH_GLM5_NEXT) {
+            // The KDA state is laid out as Q, K, V histories followed by per-head scan state.
+            // Each device needs the same heads in all projections, gates, and state tensors.
+            if (std::regex_match(tensor_name, pattern_r_cache) ||
+                    std::regex_match(tensor_name, pattern_s_cache) ||
+                    std::regex_match(tensor_name, pattern_ssm_dt) ||
+                    std::regex_match(tensor_name, pattern_ssm_a)) {
+                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0, "attn_output.weight");
+            }
+            if (std::regex_match(tensor_name, pattern_kda_conv)) {
+                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_2, "attn_output.weight");
+            }
+            if (std::regex_match(tensor_name, pattern_kda_head_weight) ||
+                    std::regex_match(tensor_name, pattern_ssm_beta)) {
+                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "attn_output.weight");
+            }
+            // MLA stores one latent KV head, shared by every query-head shard.
+            if (std::regex_match(tensor_name, pattern_kv_cache)) {
+                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+            }
+            if (std::regex_match(tensor_name, pattern_attn_q_b_weight)) {
+                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "attn_output.weight");
+            }
+            if (std::regex_match(tensor_name, pattern_attn_kv_b_weight)) {
+                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_2);
+            }
+        }
 
         // the qsa indexer has one key head and its projections are mirrored, so its cache cannot be split
         if (std::regex_match(tensor_name, pattern_idx_cache)) {
@@ -612,6 +642,11 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     };
 
     auto get_split_segments = [&](int axis, uint32_t il) -> std::vector<std::pair<int64_t, uint32_t>> {
+        if (ud->model->arch == LLM_ARCH_GLM5_NEXT && std::regex_match(tensor_name, pattern_r_cache)) {
+            const int64_t conv_state_size = (hparams.ssm_d_conv - 1) * hparams.n_embd_head_kda * hparams.n_head(il);
+            GGML_ASSERT(tensor->ne[axis] == 3 * conv_state_size);
+            return {{conv_state_size, 3}};
+        }
         // TODO: clarify why this is necessary specifically for these models
         // TODO: deduplicate condition [TAG_SPLIT_QGATE_QWEN]
         if (ud->model->arch == LLM_ARCH_QWEN3NEXT || ud->model->arch == LLM_ARCH_QWEN35 || ud->model->arch == LLM_ARCH_QWEN35MOE ||
@@ -698,6 +733,32 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     };
 
     auto get_split_granularity = [&](int64_t blck_size, uint32_t il, const std::vector<std::pair<int64_t, uint32_t>> & segments) -> std::vector<int64_t> {
+        if (ud->model->arch == LLM_ARCH_GLM5_NEXT) {
+            const int64_t head_dim = hparams.is_recr(il) ? hparams.n_embd_head_kda : hparams.n_embd_head_v_mla();
+            const int64_t head_granularity = std::lcm(blck_size, head_dim);
+            if (std::regex_match(tensor_name, pattern_r_cache)) {
+                return {head_granularity * (hparams.ssm_d_conv - 1)};
+            }
+            if (std::regex_match(tensor_name, pattern_s_cache)) {
+                return {head_granularity * head_dim};
+            }
+            if (std::regex_match(tensor_name, pattern_kda_conv) ||
+                    std::regex_match(tensor_name, pattern_attn_kv_b_weight) ||
+                    std::regex_match(tensor_name, pattern_ssm_a) ||
+                    std::regex_match(tensor_name, pattern_ssm_beta)) {
+                return {1}; // one whole head on axis 2, or one scalar per head
+            }
+            if (std::regex_match(tensor_name, pattern_kda_head_weight) ||
+                    std::regex_match(tensor_name, pattern_ssm_dt) ||
+                    std::regex_match(tensor_name, pattern_q_weight) ||
+                    std::regex_match(tensor_name, pattern_kv_weight) ||
+                    std::regex_match(tensor_name, pattern_attn_out_weight)) {
+                return {head_granularity};
+            }
+            if (std::regex_match(tensor_name, pattern_attn_q_b_weight)) {
+                return {std::lcm(blck_size, int64_t(hparams.n_embd_head_k_mla()))};
+            }
+        }
         // for better performance it may make sense to round up blck_size to a higher power of 2 so that more efficient kernels can be used
         if (hparams.is_recr(il)) {
             // linear attention
