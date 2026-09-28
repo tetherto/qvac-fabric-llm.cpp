@@ -58,13 +58,11 @@ def scalars(g, beta):
 
 rng = np.random.default_rng(5)
 nrm = lambda x: x / np.linalg.norm(x, axis=-1, keepdims=True)
-q = nrm(rng.standard_normal((T, H, D)))
-k = nrm(rng.standard_normal((T, H, D)))
+q = nrm(rng.standard_normal((T, H, D))); k = nrm(rng.standard_normal((T, H, D)))
 if CORR:
     base = rng.standard_normal((T // 16, H, D))
     k = nrm(np.repeat(base, 16, axis=0) + 0.1 * rng.standard_normal((T, H, D)))
-v = rng.standard_normal((T, H, D))
-beta = 1 / (1 + np.exp(-rng.standard_normal((T, H)) - (3.0 if CORR else 0.0)))
+v = rng.standard_normal((T, H, D)); beta = 1 / (1 + np.exp(-rng.standard_normal((T, H)) - (3.0 if CORR else 0.0)))
 g = -np.log1p(np.exp(rng.standard_normal((T, H)))) * GS
 S0 = rng.standard_normal((H, D, D)) * 0.1
 qb, kb, vb = (x.astype(np.float32).astype(bf16) for x in (q, k, v))
@@ -75,8 +73,7 @@ for col in range(COLS):
     for i in range(4):
         hd, h = gm.core_of(col, i)
         fx, lss[hd] = scalars(g[:, hd], beta[:, hd])
-        hdr = np.zeros(IN_N // 2, np.int32)
-        hdr[0] = NCH
+        hdr = np.zeros(IN_N // 2, np.int32); hdr[0] = NCH
         hdr[1] = np.array([2.0 ** lss[hd]], np.float32).view(np.int32)[0]
         xin[col, 0, i] = hdr.view(bf16)
         # the state as ggml keeps it: the core's value columns, each a row of
@@ -97,8 +94,7 @@ run = lambda: gm.gdn(x_t, o_t, NCH=NCH)
 run()
 o_t._sync_from_device()
 ob = o_t.numpy().reshape(COLS, NO, 4, O_N)
-got = np.zeros((T, H, D))
-S_got = np.zeros((H, D, D))
+got = np.zeros((T, H, D)); S_got = np.zeros((H, D, D))
 for col in range(COLS):
     for i in range(4):
         hd, h = gm.core_of(col, i)
@@ -108,23 +104,19 @@ for col in range(COLS):
         st = ob[col, NCH:NCH + 8, i].reshape(DV, D).astype(np.float64)
         S_got[hd][:, h * DV:(h + 1) * DV] = st.T
 
-ref = np.zeros((T, H, D))
-S = S0.copy()
+ref = np.zeros((T, H, D)); S = S0.copy()
 for hd in range(H):
     for t in range(T):
-        S[hd] *= np.exp(g[t, hd])
-        delta = beta[t, hd] * (v[t, hd] - S[hd].T @ k[t, hd])
+        S[hd] *= np.exp(g[t, hd]); delta = beta[t, hd] * (v[t, hd] - S[hd].T @ k[t, hd])
         S[hd] += np.outer(k[t, hd], delta)
         ref[t, hd] = (S[hd].T @ q[t, hd]) / np.sqrt(D)
 e = lambda a, b: np.sqrt(((a - b) ** 2).mean() / (b ** 2).mean())
 # the floor: the same recurrence on the bf16-rounded inputs the array gets
-rr = np.zeros((T, H, D))
-Sb = S0.copy()
+rr = np.zeros((T, H, D)); Sb = S0.copy()
 qf, kf, vf = (x.astype(np.float64) for x in (qb, kb, vb))
 for hd in range(H):
     for t in range(T):
-        Sb[hd] *= np.exp(g[t, hd])
-        delta = beta[t, hd] * (vf[t, hd] - Sb[hd].T @ kf[t, hd])
+        Sb[hd] *= np.exp(g[t, hd]); delta = beta[t, hd] * (vf[t, hd] - Sb[hd].T @ kf[t, hd])
         Sb[hd] += np.outer(kf[t, hd], delta)
         rr[t, hd] = (Sb[hd].T @ qf[t, hd]) / np.sqrt(D)
 print(f"  floor (bf16 inputs, exact arithmetic): out rel {e(rr, ref):.3e}; array against it {e(got, rr):.3e}")

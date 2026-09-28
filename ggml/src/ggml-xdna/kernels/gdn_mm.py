@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # gdn_mm.py -*- Python -*-
 #
-# The prefill gated delta rule on the mmul (FLM_PREFILL_PLAN.md, step 3) for
+# The prefill gated delta rule on the mmul for
 # Qwen3.5's recurrent layers: 16 heads, S = 128. Every core runs
 # kernels/gdn-mm.cc and holds one head's state for half of the value columns
 # for the whole ubatch:
@@ -31,6 +31,8 @@ from pathlib import Path
 import ml_dtypes
 import numpy as np
 
+import kernelsrc
+
 import aie.iron as iron
 from aie.iron import Buffer, CompileTime, In, ObjectFifo, Out, Program, Runtime, Worker
 from aie.iron.controlflow import range_
@@ -48,7 +50,7 @@ N_STATE_IN, N_STATE_OUT = 4, 8
 bf16 = ml_dtypes.bfloat16
 
 _here = Path(__file__).resolve().parent
-_src = (_here / "gdn-mm.cc").read_text()
+_src = kernelsrc.load(_here / "gdn-mm.cc")
 _flags = [f"-DGDN_C={C}"]
 _obj = "gdnmm_" + hashlib.md5((_src + str(_flags)).encode()).hexdigest()[:8] + ".o"
 
@@ -120,8 +122,8 @@ def build(dev_name: str = "npu2"):
                                                  Buffer(st_ty, name=f"st{col}_{i}"),
                                                  Buffer(n_ty, name=f"n{col}_{i}")],
                                   tile=Tile(col, 2 + i), stack_size=0xA80))
-    eps = ([f.prod(tile=Tile(col, 0)) for col, f in enumerate(x_col)]
-           + [f.cons(tile=Tile(col, 0)) for col, f in enumerate(o_col)])
+    eps = ([f.prod(tile=Tile(col, 0)) for col, f in enumerate(x_col)] +
+           [f.cons(tile=Tile(col, 0)) for col, f in enumerate(o_col)])
     return workers, eps
 
 

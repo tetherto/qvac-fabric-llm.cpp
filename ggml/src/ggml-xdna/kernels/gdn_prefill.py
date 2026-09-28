@@ -32,6 +32,8 @@ from pathlib import Path
 import numpy as np
 from ml_dtypes import bfloat16
 
+import kernelsrc
+
 import aie.iron as iron
 from aie.iron import CompileTime, In, ObjectFifo, Out, Program, Runtime, Worker
 from aie.iron.controlflow import range_
@@ -54,14 +56,18 @@ L1_BUDGET = 60 * 1024
 MEMTILE_BYTES = 512 * 1024
 
 
+def _attn_scale(S: int) -> float:
+    return 1.0 / math.sqrt(S)
+
+
 def _fns(S: int, CS: int):
-    src = (Path(__file__).resolve().parent / "gdn-prefill.cc").read_text()
-    # The attention scale follows the head size; the kernel cannot derive it
-    # itself, and leaving it baked at 1/sqrt(128) silently scaled every
-    # score wrong for any other --S the harness accepts.
+    src = kernelsrc.load(Path(__file__).resolve().parent / "gdn-prefill.cc")
+    # The kernel's attention scale is the harness's own, passed in rather than
+    # the compile-time 1/sqrt(128) the device used to bake in.
     flags = [f"-DDH={S}", f"-DROWS={ROWS}", "-DVEC=16",
-             f"-DGDN_SCALE={1.0 / math.sqrt(S):.17g}f"]
+             f"-DGDN_SCALE_F={_attn_scale(S)!r}f"]
     digest = hashlib.sha256((src + "".join(flags)).encode()).hexdigest()[:8]
+    strip_ty = np.ndarray[(ROWS * S,), np.dtype[bfloat16]]
     tok_t_ty = np.ndarray[(3 * S + 2,), np.dtype[bfloat16]]
     packed_ty = np.ndarray[(ROWS * S + CS * ROWS,), np.dtype[bfloat16]]
     token = ExternalFunction(
@@ -134,6 +140,7 @@ def ggml_xdna_gdn_prefill(
     token_fn, copy_fn = _fns(S, CS)
 
     tok_t_ty = np.ndarray[(tok_elems,), np.dtype[bfloat16]]
+    strip_ty = np.ndarray[(ROWS * S,), np.dtype[bfloat16]]
     packed_ty = np.ndarray[(packed_n,), np.dtype[bfloat16]]
 
     tok_col_n = hpc * CS * tok_elems
@@ -233,7 +240,7 @@ def _compile_kwargs(opts) -> dict:
 def _ref(q, k, v, g, beta, state):
     S = q.shape[-1]
     CS = q.shape[0]
-    scale = 1.0 / math.sqrt(S)
+    scale = _attn_scale(S)
     s = state.copy()
     attn = np.empty((CS, S), dtype=np.float32)
     for t in range(CS):
@@ -245,7 +252,7 @@ def _ref(q, k, v, g, beta, state):
 
 
 def _run_and_verify(opts) -> None:
-    S, H, CS, NC = opts.S, opts.heads, opts.CS, opts.chunks
+    S, H, CS, COLS, NC = opts.S, opts.heads, opts.CS, opts.cols, opts.chunks
     n_strips = S // ROWS
     tok_elems = 3 * S + 2
     packed_n = ROWS * S + CS * ROWS

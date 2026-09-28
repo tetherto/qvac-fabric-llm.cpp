@@ -29,6 +29,8 @@ from pathlib import Path
 import ml_dtypes
 import numpy as np
 
+import kernelsrc
+
 import aie.iron as iron
 from aie.iron import Buffer, CompileTime, In, ObjectFifo, Out, Program, Runtime, Worker
 from aie.iron.controlflow import range_
@@ -48,7 +50,7 @@ OUT_N = 2 * OBJ                             # bf16 a core's output object
 bf16 = ml_dtypes.bfloat16
 
 _here = Path(__file__).resolve().parent
-_src = (_here / "gdn-conv.cc").read_text()
+_src = kernelsrc.load(_here / "gdn-conv.cc")
 _obj = "gdncv_" + hashlib.md5(_src.encode()).hexdigest()[:8] + ".o"
 
 in_ty = np.ndarray[(IN_N,), np.dtype[np.float32]]
@@ -104,8 +106,8 @@ def build(dev_name: str = "npu2"):
             workers.append(Worker(core, fn_args=[cores_in[col][h][p].cons(), cores_out[col][i].prod(),
                                                  k_hdr, k_chunk, Buffer(n_ty, name=f"n{col}_{i}")],
                                   tile=Tile(col, 2 + i), stack_size=0x1200))
-    eps = ([f.prod(tile=Tile(col, 0)) for col, h, f in ins]
-           + [f.cons(tile=Tile(col, 0)) for col, f in enumerate(outs)])
+    eps = ([f.prod(tile=Tile(col, 0)) for col, h, f in ins] +
+           [f.cons(tile=Tile(col, 0)) for col, f in enumerate(outs)])
     return workers, eps
 
 

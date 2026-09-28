@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # attn_mm.py -*- Python -*-
 #
-# Prefill attention on the mmul (FLM_PREFILL_PLAN.md, step 4) for Qwen3.5's
+# Prefill attention on the mmul for Qwen3.5's
 # full-attention layers: 8 query heads, 2 KV heads, D = 256, causal. Every
 # core runs kernels/attn-mm.cc.
 #
@@ -41,6 +41,8 @@ from pathlib import Path
 import ml_dtypes
 import numpy as np
 
+import kernelsrc
+
 import aie.iron as iron
 from aie.iron import Buffer, CompileTime, In, ObjectFifo, Out, Program, Runtime, Worker
 from aie.iron.controlflow import range_
@@ -56,7 +58,7 @@ PASS = 64                                # positions a pass
 bf16 = ml_dtypes.bfloat16
 
 _here = Path(__file__).resolve().parent
-_src = (_here / "attn-mm.cc").read_text()
+_src = kernelsrc.load(_here / "attn-mm.cc")
 _flags = [f"-DFA_R={R}", f"-DFA_DH={DH}", f"-DFA_NK={NK}"]
 _obj = "attmm_" + hashlib.md5((_src + str(_flags)).encode()).hexdigest()[:8] + ".o"
 
@@ -160,9 +162,9 @@ def build(dev_name: str = "npu2"):
                 k_pv, k_end, Buffer(p_ty, name=f"p{col}_{i}"),
                 Buffer(ml_ty, name=f"ml{col}_{i}"), Buffer(n_ty, name=f"n{col}_{i}"), pidx],
                 tile=Tile(col, 2 + i), stack_size=0xE00))
-    eps = ([f.prod(tile=Tile(col, 0)) for col, f in enumerate(q_col)]
-           + [kv_in[g][h].prod(tile=Tile(kv_col(g, h), 0)) for g in range(2) for h in range(2)]
-           + [f.cons(tile=Tile(col, 0)) for col, f in enumerate(o_col)])
+    eps = ([f.prod(tile=Tile(col, 0)) for col, f in enumerate(q_col)] +
+           [kv_in[g][h].prod(tile=Tile(kv_col(g, h), 0)) for g in range(2) for h in range(2)] +
+           [f.cons(tile=Tile(col, 0)) for col, f in enumerate(o_col)])
     return workers, eps
 
 

@@ -1,7 +1,7 @@
-# One expander/multiplier pair of the prefill GEMM (FLM_PREFILL_PLAN.md, step
-# 1, build order 2) against numpy: C (M x 64) = A (M x K) @ W (K x 64), W the
-# decode GEMV tiles of one core, expanded on tile (0, 2) (gemm-expand.cc) and
-# handed over in shared memory to the mmul on its neighbour (0, 3).
+# One expander/multiplier pair of the prefill GEMM against numpy: C (M x 64) =
+# A (M x K) @ W (K x 64), W the decode GEMV tiles of one core, expanded on tile
+# (0, 2) (gemm-expand.cc) and handed over in shared memory to the mmul on its
+# neighbour (0, 3).
 # On the bench, in the IRON env:
 #   NPU_CACHE_HOME=$(mktemp -d) python probes/pair_check.py q4g32|q8g16 [K] [bfp16]
 import hashlib
@@ -41,8 +41,6 @@ t_ty = np.ndarray[(TB,), np.dtype[np.uint8]]
 b_ty = np.ndarray[(KS * N_CORE,), np.dtype[bf16]]
 a_ty = np.ndarray[(M * KS,), np.dtype[bf16]]
 c_ty = np.ndarray[(M * N_CORE,), np.dtype[np.float32]]
-
-
 def make_mm():
     return akernels.mm(M, KS, N_CORE, input_dtype=bf16, output_dtype=np.float32,
                        vectorized=True, emulate_bf16_mmul_with_bfp16=BFP)
@@ -168,7 +166,7 @@ print(f"{FMT} K={K} {'bfp16' if BFP else 'bf16'}: rel rms err {rel:.3e}, "
 print("PASS" if rel < (2e-2 if BFP else 2e-3) else "FAIL")
 
 # timing: the same call repeated; a step is 64 x 128 x 64 MACs
-import time  # noqa: E402
+import time
 ITERS = 20
 ts = []
 for _ in range(ITERS):
