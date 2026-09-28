@@ -400,7 +400,8 @@ endif()
 
 # Host-only tests of what a device cannot check for itself: which weight
 # conversions the repacker accepts. They compile the backend sources they test
-# directly, open no device and run in ctest wherever the backend builds.
+# directly and open no device. tests/CMakeLists.txt adds them to ctest: testing
+# is enabled there, after this directory is configured.
 option(GGML_XDNA_BUILD_TESTS "ggml-xdna: build the host-only backend tests" ON)
 if (GGML_XDNA_BUILD_TESTS)
     set(XDNA_TESTS
@@ -414,6 +415,5 @@ if (GGML_XDNA_BUILD_TESTS)
         target_include_directories(${NAME} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/..)
         target_link_libraries(${NAME} PRIVATE ggml-base)
         target_compile_definitions(${NAME} PRIVATE ${XDNA_GEOMETRY_DEFS})
-        add_test(NAME ${NAME} COMMAND ${NAME} ${CMAKE_RUNTIME_OUTPUT_DIRECTORY})
     endforeach()
 endif()
