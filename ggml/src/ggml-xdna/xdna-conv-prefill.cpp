@@ -91,12 +91,14 @@ void xdna_conv_prefill_direct_add(const struct ggml_tensor * concat,
 }
 
 static bool conv_pf_enabled(void) {
-    // On by default (GGML_XDNA_CONV=0 falls back to the host conv). The per-op
-    // conv still round-trips its input and output through DDR, so it costs
-    // ~10% of prefill throughput against the host, but the op belongs on the
-    // array, and the bf16 BOs plus the vectorised pack/scatter keep that gap
-    // small.
-    if (xdna_env_int("GGML_XDNA_CONV", 1) == 0) {
+    // Off by default (GGML_XDNA_CONV=1 runs it here). Its own xclbin sits
+    // between the in-projection GEMM and the next one, so a call pays two
+    // context switches (~2.5 ms each) for a KW = 4 conv the host does in well
+    // under a millisecond: 18 calls cost 89 ms of a 391 ms pp512 pass, and the
+    // host conv is pp512 1302 -> 1614 t/s, pp4096 1163 -> 1363, at the same
+    // prefill KLD (0.00411). It returns to the array as the in-projection
+    // GEMM's epilogue (FLM_PREFILL_PLAN.md), not as a design of its own.
+    if (xdna_env_int("GGML_XDNA_CONV", 0) == 0) {
         return false;
     }
     for (const auto & dir : xdna_kernel_search_dirs()) {
