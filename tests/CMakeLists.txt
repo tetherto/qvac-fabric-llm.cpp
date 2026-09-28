@@ -543,6 +543,12 @@ llama_build_and_test(test-autorelease.cpp       LABEL "model")
 llama_build_and_test(test-backend-sampler.cpp   LABEL "model")
 llama_build_and_test(test-laya.cpp)
 
+# XDNA NPU: load, run and free a model several times in one process (#293).
+# Self-skipping when no XDNA device is registered.
+if (GGML_XDNA)
+    llama_build_and_test(test-xdna-reload.cpp       LABEL "model")
+endif()
+
 # Test for state restore with fragmented KV cache
 # Requires a model, uses same args pattern as test-thread-safety
 llama_build_and_test(test-state-restore-fragmented.cpp LABEL "model" ARGS -m "${MODEL_DEST}")
