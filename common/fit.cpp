@@ -52,8 +52,7 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
         std::mutex         callback_exception_mutex;
         std::atomic<bool>  callback_failed = false;
 
-        // Do not let a throwing callback unwind through llama's extern "C" frames: on MSVC that
-        // skipped the logger restore. Capture it here and rethrow from C++ after each call.
+        // Keep callback exceptions inside the wrapper, then rethrow after the llama call so the logger guard restores.
         void log(ggml_log_level level, const char * text) {
             if (callback_failed.load(std::memory_order_acquire)) {
                 return;
