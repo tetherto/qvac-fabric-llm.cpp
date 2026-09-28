@@ -18,6 +18,7 @@
 #include <memory>
 #include <mutex>
 #include <system_error>
+#include <unordered_set>
 
 #if defined(__x86_64__) || defined(__i386__)
 #include <immintrin.h>
@@ -149,11 +150,12 @@ void xdna_kernel_free(xdna_kernel * kern) {
 // The decode's arena: the buffers its designs name, carved out of a few large
 // BOs so that a whole token's streams can be joined into one command - a run
 // has only a handful of buffer arguments, and every layer's buffers then sit
-// in one of them. Grown in chunks as the decode's objects are created; never
-// freed (they live as long as the process does).
+// in one of them. Grown in chunks as the decode's objects are created; freed
+// once nothing carved out of them is left (xdna_arena_release).
 namespace {
 struct xdna_arena_state {
     std::vector<xdna_buffer *> chunks;
+    std::unordered_set<const xdna_buffer *> views;   // handed out, not yet freed
     size_t used = 0;          // in the last chunk
     int    depth = 0;         // open xdna_arena_scope's
 };
@@ -196,8 +198,22 @@ static xdna_buffer * xdna_arena_alloc(xdna_device * dev, size_t bytes) {
     xdna_buffer * buf = xdna_buffer_sub(chunk, g_arena.used, bytes);
     if (buf) {
         g_arena.used += need;
+        g_arena.views.insert(buf);
     }
     return buf;   // zeroed: the chunk was, and nothing else had this range
+}
+
+bool xdna_arena_release(void) {
+    std::lock_guard<std::mutex> lock(g_arena_mutex);
+    if (g_arena.depth > 0 || !g_arena.views.empty()) {
+        return false;
+    }
+    for (xdna_buffer * c : g_arena.chunks) {
+        delete c;
+    }
+    g_arena.chunks.clear();
+    g_arena.used = 0;
+    return true;
 }
 
 xdna_buffer * xdna_buffer_alloc(xdna_device * dev, size_t bytes) {
@@ -253,6 +269,10 @@ xdna_buffer * xdna_buffer_sub(xdna_buffer * parent, size_t offset, size_t bytes)
 }
 
 void xdna_buffer_free(xdna_buffer * buf) {
+    if (buf && buf->root) {
+        std::lock_guard<std::mutex> lock(g_arena_mutex);
+        g_arena.views.erase(buf);
+    }
     delete buf;
 }
 
