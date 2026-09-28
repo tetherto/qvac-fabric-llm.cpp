@@ -282,6 +282,18 @@ struct gemv_timer {
 
 // A named slice of work nested inside one of the other timers, e.g. the host's
 // half of a fused-layer fire. Only ever reported next to that timer.
+// GGML_XDNA_PROF_TRACE=<file> (with GGML_XDNA_PROF=1): every section and
+// glue flush as "<name>\t<start ns>\t<end ns>" on the steady clock
+// (CLOCK_MONOTONIC), to line up with a power sampler's timestamps.
+inline void trace_span(const char * key, uint64_t t0, uint64_t t1) {
+    static FILE * f = getenv("GGML_XDNA_PROF_TRACE") ? fopen(getenv("GGML_XDNA_PROF_TRACE"), "w") : nullptr;
+    if (f) {
+        std::lock_guard<std::mutex> lk(S().mu);
+        fprintf(f, "%s\t%llu\t%llu\n", key, (unsigned long long) t0, (unsigned long long) t1);
+        fflush(f);
+    }
+}
+
 struct section_timer {
     uint64_t    t0 = 0;
     const char * key;
@@ -297,7 +309,8 @@ struct section_timer {
             return;
         }
         on = false;
-        const uint64_t dt = now_ns() - t0;
+        const uint64_t t1 = now_ns(), dt = t1 - t0;
+        trace_span(key, t0, t1);
         std::lock_guard<std::mutex> lk(S().mu);
         cur_bucket().section[key].add(dt);
     }
@@ -321,7 +334,8 @@ struct glue_timer {
         if (!on) {
             return;
         }
-        const uint64_t dt = now_ns() - t0;
+        const uint64_t t1 = now_ns(), dt = t1 - t0;
+        trace_span("glue", t0, t1);
         std::lock_guard<std::mutex> lk(S().mu);
         buckets & b = cur_bucket();
         b.glue[sig].add(dt);
