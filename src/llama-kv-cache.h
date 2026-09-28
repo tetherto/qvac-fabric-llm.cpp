@@ -114,7 +114,9 @@ public:
         const  layer_reuse_cb & reuse,
         const  layer_share_cb & share,
         // a model can hold more than one cache, so the tensor names have to stay unique
-                 const char *   name_tag = "");
+                 const char *   name_tag = "",
+        // extra K streams past the cells, used for k-pool private rows
+                     uint32_t   n_stream_k_extra = 0);
 
     ~llama_kv_cache() = default;
 
