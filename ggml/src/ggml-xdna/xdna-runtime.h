@@ -27,12 +27,26 @@ xdna_kernel * xdna_kernel_load_hw(xdna_device * dev, const char * xclbin_path);
 // must be the same handle used for the data buffers.
 bool xdna_kernel_bind_insts(xdna_device * dev, xdna_kernel * kern, const uint32_t * insts, size_t n_words);
 
+// Overwrite a bound stream with one of the same length, for a dispatch whose
+// counts and offsets change from run to run while its shape does not. Runs
+// read the instruction buffer each time they start.
+bool xdna_kernel_rewrite_insts(xdna_kernel * kern, const uint32_t * insts, size_t n_words);
+
 void xdna_kernel_free(xdna_kernel * kern);
 
 // --- buffer ----------------------------------------------------------------
 
 // Allocate a host-visible device buffer object of `bytes` bytes.
 xdna_buffer * xdna_buffer_alloc(xdna_device * dev, size_t bytes);
+
+// While one is open, xdna_buffer_alloc carves buffers out of the decode's
+// arena (GGML_XDNA_ARENA_MB chunks, 256; 0: never) instead of giving each its
+// own BO, so a token's streams can be joined into one command. Open it while
+// creating the objects the decode's queued runs name.
+struct xdna_arena_scope {
+    xdna_arena_scope();
+    ~xdna_arena_scope();
+};
 
 // A window onto an existing buffer, for handing a kernel one slice of a larger
 // one: the sequence's descriptors always read from offset zero, so a design
@@ -46,6 +60,15 @@ void xdna_buffer_free(xdna_buffer * buf);
 // XRT never issues the driver's cache-maintenance ioctl for a host_only BO and
 // the mapping is ordinary cacheable memory; what it does here is nothing.
 void xdna_buffer_sync_from_device(xdna_buffer * buf);
+// Invalidate part of a buffer, for a range the array wrote while the host
+// may hold older cache lines of it.
+void xdna_buffer_sync_from_device_range(xdna_buffer * buf, size_t bytes, size_t offset);
+// Read `bytes` from a buffer the array writes into. A dispatch can report
+// completion before its last writes are visible to the host, and a read taken
+// in that window hands back - and caches - the previous contents. Read,
+// invalidate the cache, read again, and keep reading while the value changes.
+void xdna_buffer_read_settled(xdna_buffer * buf, void * dst, size_t bytes,
+                              size_t offset = 0);
 
 // The pattern xdna_buffer_mark leaves in a range the device is about to
 // overwrite: a quiet NaN with a payload of its own, which no kernel in this
@@ -105,6 +128,27 @@ xrt::run xdna_kernel_run_start(xdna_kernel * kern, xdna_buffer ** args, size_t n
 
 // Wait for a started run. Returns true on success.
 bool xdna_run_wait(xrt::run & run);
+
+// Batched submission. Between xdna_batch_begin(k) and xdna_batch_wait(), a
+// run given to xdna_run_submit is not started on its own: it joins an
+// xrt::runlist on its kernel's hardware context, and a list goes to the
+// device once it holds k runs (and at the wait). The NPU's cost is per
+// command - the driver, the firmware and a completion interrupt each - and at
+// ~1300 commands a second the SoC's power stays ~8 W above what the same
+// work in a few commands costs. Any run started otherwise (xdna_run_restart)
+// submits what the batch holds first, so the order on the device is kept.
+// Runs that went through a batch are waited by xdna_batch_wait, not one by
+// one. Outside a batch xdna_run_submit is xdna_run_restart.
+// k < 0 is token mode: the runs' streams are joined into one command, sent
+// at the wait or before any run started otherwise (the token's first run
+// starts on its own, GGML_XDNA_BATCH_LEAD). A run joins only with its buffers
+// given, and the join renames each buffer to the root BO it is a view of -
+// the decode's arena (xdna_arena_scope) is what keeps those few.
+void xdna_batch_begin(int k);
+bool xdna_run_submit(struct xdna_kernel * kern, xrt::run & run,
+                     struct xdna_buffer * const * args = nullptr, size_t n_args = 0);
+bool xdna_batch_wait(void);
+bool xdna_batch_active(void);
 
 // --- kernel pool -----------------------------------------------------------
 
