@@ -2878,6 +2878,9 @@ struct ggml_backend_vk_context {
     ggml_vk_garbage_collector gc;
     size_t prealloc_size_x, prealloc_size_y, prealloc_size_split_k, prealloc_size_add_rms_partials, prealloc_size_add_rms_partials_offset, prealloc_size_tile;
     vk_buffer prealloc_x, prealloc_y, prealloc_split_k, prealloc_add_rms_partials, prealloc_tile, sync_staging;
+    vk_buffer batch_staging;
+    size_t batch_staging_used = 0;
+    bool batch_staging_unavailable = false;
     vk::Fence fence, almost_ready_fence;
     bool submit_pending {};
     bool almost_ready_fence_pending {};
@@ -18830,6 +18833,7 @@ static void ggml_vk_cleanup(ggml_backend_vk_context * ctx) {
     ggml_vk_destroy_buffer(ctx->prealloc_split_k);
     ggml_vk_destroy_buffer(ctx->prealloc_add_rms_partials);
     ggml_vk_destroy_buffer(ctx->sync_staging);
+    ggml_vk_destroy_buffer(ctx->batch_staging);
     ggml_vk_destroy_buffer(ctx->prealloc_tile);
 
     ctx->prealloc_y_last_pipeline_used = nullptr;
@@ -19164,6 +19168,66 @@ static ggml_backend_buffer_type_t ggml_backend_vk_get_default_buffer_type(ggml_b
     return &ctx->device->buffer_type;
 }
 
+// Each slice stays live until ggml_vk_synchronize has waited for all compute submissions.
+static bool ggml_vk_batch_upload(ggml_backend_vk_context * ctx, vk_context & cpy_ctx, vk_buffer & buf,
+                                size_t dst_offset, const void * data, size_t size, size_t n_copies,
+                                size_t stride_tensor, size_t stride_data) {
+    static const bool enabled = [] {
+        const char * value = getenv("GGML_VK_BATCH_UPLOADS");
+        return value != nullptr && strcmp(value, "0") != 0;
+    }();
+    constexpr size_t batch_capacity = 64 * 1024 * 1024;
+    if (!enabled || ctx->batch_staging_unavailable || ctx->device->async_use_transfer_queue ||
+        ctx->device->serialize_submissions || size % 4 != 0 || dst_offset % 4 != 0 ||
+        stride_tensor % 4 != 0 || n_copies == 0 || size > batch_capacity / n_copies) {
+        return false;
+    }
+    const size_t staging_size = size * n_copies;
+    if (ctx->batch_staging == nullptr) {
+        const vk::BufferCreateInfo buffer_info{
+            {}, batch_capacity, vk::BufferUsageFlagBits::eTransferSrc,
+            vk::SharingMode::eExclusive, 0, nullptr,
+        };
+        VmaAllocationCreateInfo alloc_info = {};
+        alloc_info.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
+        alloc_info.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT |
+            VMA_ALLOCATION_CREATE_MAPPED_BIT;
+        alloc_info.requiredFlags = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+        try {
+            ctx->batch_staging = ggml_vk_create_buffer(ctx->device, buffer_info, alloc_info);
+        } catch (const vk::SystemError & e) {
+            ctx->batch_staging_unavailable = true;
+            GGML_LOG_WARN("ggml_vulkan: batched staging unavailable, using synchronous uploads (%s)\n", e.what());
+            return false;
+        }
+    }
+    if (staging_size > batch_capacity - ctx->batch_staging_used) {
+        ggml_vk_synchronize(ctx);
+        cpy_ctx = ggml_vk_get_compute_ctx(ctx);
+    }
+    const size_t staging_offset = ctx->batch_staging_used;
+    ctx->batch_staging_used += staging_size;
+    auto * staging_data = static_cast<uint8_t *>(ctx->batch_staging->info.pMappedData) + staging_offset;
+    if (size == stride_data) {
+        memcpy(staging_data, data, staging_size);
+    } else {
+        for (size_t i = 0; i < n_copies; i++) {
+            memcpy(staging_data + i * size, static_cast<const uint8_t *>(data) + i * stride_data, size);
+        }
+    }
+    std::vector<vk::BufferCopy> slices(size == stride_tensor ? 1 : n_copies);
+    if (size == stride_tensor) {
+        slices[0] = vk::BufferCopy{staging_offset, dst_offset, staging_size};
+    } else {
+        for (size_t i = 0; i < n_copies; i++) {
+            slices[i] = vk::BufferCopy{staging_offset + i * size, dst_offset + i * stride_tensor, size};
+        }
+    }
+    ggml_vk_sync_buffers(nullptr, cpy_ctx);
+    cpy_ctx->s->buffer->buf.copyBuffer(ctx->batch_staging->buffer, buf->buffer, slices);
+    return true;
+}
+
 static void ggml_backend_vk_set_tensor_2d_async(ggml_backend_t backend, ggml_tensor * tensor, const void * data, size_t offset,
                                                 size_t size, size_t n_copies, size_t stride_tensor, size_t stride_data) {
     VK_LOG_DEBUG("ggml_backend_vk_set_tensor_2d_async(" << size << ", " << n_copies << ")");
@@ -19189,6 +19253,10 @@ static void ggml_backend_vk_set_tensor_2d_async(ggml_backend_t backend, ggml_ten
     auto dst_offset = vk_tensor_offset(tensor) + tensor->view_offs + offset;
 
     bool ret = ggml_vk_buffer_write_2d_async(cpy_ctx, buf, dst_offset, data, stride_data, stride_tensor, size, n_copies);
+
+    if (!ret) {
+        ret = ggml_vk_batch_upload(ctx, cpy_ctx, buf, dst_offset, data, size, n_copies, stride_tensor, stride_data);
+    }
 
     if (!ret) {
         const size_t staging_size = size * n_copies;
@@ -19442,6 +19510,8 @@ static void ggml_vk_synchronize(ggml_backend_vk_context * ctx) {
         }
         ctx->compute_ctx.reset();
     }
+    // All submissions reading the staging arena have completed.
+    ctx->batch_staging_used = 0;
 }
 
 static void ggml_backend_vk_synchronize(ggml_backend_t backend) {
