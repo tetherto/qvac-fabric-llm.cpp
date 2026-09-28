@@ -58,9 +58,14 @@ int xdna_gemv_geom::n_sup() const {
 }
 
 size_t xdna_gemv_geom::tile_bytes() const {
+    // The q4g32 tile's size for both: the design has one object size, and an
+    // 8-bit tile in groups of 32 is 152 lanes' worth of bytes against 168, so
+    // it is padded to it (the kernel reads its blocks and super-block records
+    // from the front and never the tail).
     const int lg = n_core() / lane();
-    const int ng = k_tile() / group();
-    return (size_t) lg * (ng * block_bytes(fmt, lane()) + n_sup() * sup_bytes(lane()));
+    const int kt_q4 = fmt == XDNA_WFMT_Q4G32 ? k_tile() : 2 * k_tile();
+    return (size_t) lg * ((kt_q4 / XDNA_Q4G32_GROUP) * block_bytes(XDNA_WFMT_Q4G32, lane()) +
+                          n_sup() * sup_bytes(lane()));
 }
 
 bool xdna_gemv_geom::valid() const {
@@ -74,7 +79,7 @@ bool xdna_gemv_geom::valid() const {
     }
     // One descriptor per chunk for the activations and one for the output,
     // plus the weight descriptor, all inside the shim's 16 ids.
-    return N % chunk() == 0 && n_out() >= 1 && n_out() <= xdna_gemv_max_chunks();
+    return N % chunk() == 0 && n_out() >= 1 && (uncapped || n_out() <= xdna_gemv_max_chunks());
 }
 
 std::string xdna_gemv_geom::stem() const {
@@ -108,9 +113,10 @@ std::string xdna_gemv_geom::seq_key() const {
 }
 
 xdna_gemv_geom xdna_gemv_variant(enum ggml_type type, int64_t K, int64_t N,
-                                 bool epilogue, xdna_gemv_split split) {
+                                 bool epilogue, xdna_gemv_split split, bool uncapped) {
     xdna_gemv_geom g;
     g.epilogue = epilogue;
+    g.uncapped = uncapped;
     if (split == XDNA_GEMV_SPLIT_FUSED) {
         g.rows_v   = XDNA_GEMV_ROWS_FUSED;
         g.n_core_v = XDNA_GEMV_N_CORE_FUSED;
@@ -239,8 +245,9 @@ gemv_shim_map shim_map_for(const xdna_gemv_geom & geom) {
             {0, 1}, {1, 1}, {2, 1}, {3, 0}, {4, 1}, {5, 1}, {6, 0}, {7, 1},
         };
         // Four streams, not eight: two columns to a stream (fused_layer.py's
-        // OUT_GROUP).
-        static const shim_ep O[] = { {2, 1}, {3, 0}, {4, 0}, {6, 1} };
+        // OUT_GROUP). With the pool on rows 4-5 the placer put the last one on
+        // column 4's second channel.
+        static const shim_ep O[] = { {2, 1}, {3, 0}, {4, 0}, {4, 1} };
         m.o_group = 2;
         for (int c = 0; c < XDNA_GEMV_COLS; c++) {
             m.w[c] = W[c];
@@ -280,8 +287,8 @@ bool xdna_gemv_seq_build_pair(xdna_seq * seq, const xdna_gemv_geom & g1,
     if (!seq || !g1.valid() || !g2.valid() || !g1.epilogue || g2.epilogue) {
         return false;
     }
-    if (g1.rows() != 1 || g1.n_core() != g2.n_core() || g1.cols != g2.cols) {
-        return false;   // one core to a column, and the same core width
+    if (g1.rows() != g2.rows() || g1.n_core() != g2.n_core() || g1.cols != g2.cols) {
+        return false;   // one pool: the same rows and core width on both sides
     }
     const gemv_shim_map map = shim_map_for(g1);   // one artifact, one map
     const int og  = map.o_group;
@@ -310,7 +317,7 @@ bool xdna_gemv_seq_build_pair(xdna_seq * seq, const xdna_gemv_geom & g1,
     // out for the outputs, and a descriptor written over while its transfer
     // is in flight is lost silently.
     // One descriptor per activation fill, for each of the two dispatches.
-    const int n_ab = 2;
+    const int n_ab = po.act_replay ? 3 : 2;
     for (int pass = 0; pass < 2; pass++) {
         for (int c = 0; c < g1.cols; c++) {
             take_bd(map.w[c].col);
@@ -378,27 +385,56 @@ bool xdna_gemv_seq_build_pair(xdna_seq * seq, const xdna_gemv_geom & g1,
         fill_acts_on(g, base, map.a, a_a);
     };
 
+    // The first dispatch's fill; see xdna_gemv_pair_opts::act_replay.
+    const auto fill_g1 = [&]() {
+        if (!po.act_replay || g1.n_out() <= 1) {
+            fill_acts_on(g1, po.a_base, map.a, a_a);
+            return;
+        }
+        const xdna_gemv_geom & g = g1;
+        const size_t base = po.a_base;
+        // The header tile, then the body queued n_out times over.
+        const size_t atb_ = g.act_tile_bytes();
+        const uint32_t hb = next_fixed(map.a.col);
+        xdna_bd bd;
+        linear_bd(bd, atb_, (uint32_t) base);
+        xdna_seq_blockwrite(seq, map.a.col, 0, hb, &bd);
+        xdna_seq_ddr_patch(seq, map.a.col, 0, hb, a_a, (uint32_t) base);
+        xdna_seq_push_queue(seq, map.a.col, 0, hb, xdna_dma_dir::MM2S,
+                            map.a.ch, false, 0);
+        const uint32_t bb   = next_fixed(map.a.col);
+        const uint32_t boff = (uint32_t) (base + atb_);
+        linear_bd(bd, (size_t) g.n_tiles() * atb_, boff);
+        xdna_seq_blockwrite(seq, map.a.col, 0, bb, &bd);
+        xdna_seq_ddr_patch(seq, map.a.col, 0, bb, a_a, boff);
+        xdna_seq_push_queue(seq, map.a.col, 0, bb, xdna_dma_dir::MM2S,
+                            map.a.ch, false, (uint32_t) (g.n_out() - 1));
+    };
+
     // ---- the epilogue pair, draining into the second dispatch's activation
     fill_weights(g1, po.w_base);
     // The first phase's tiles are the previous dispatch's drain, so its host
     // half comes from somewhere the host owns alone.
-    fill_acts_on(g1, po.a_base, map.a, a_a);
+    fill_g1();
 
     const int    mid_chunk = g1.chunk() / 2;
     const int    mid_core  = g1.n_core() / 2;
-    // One descriptor per output stream, so it carries og cores' blocks. They
-    // are consecutive blocks of the second dispatch's activation, and a
-    // stream's first core always starts a tile (og * mid_core divides the
+    // Cores a stream joins: og columns of g1.rows() cores, in the order the
+    // array lays them out - column by column, a column's rows in turn.
+    const int    s_cores   = og * g1.rows();
+    // One descriptor per output stream, so it carries s_cores cores' blocks.
+    // They are consecutive blocks of the second dispatch's activation, and a
+    // stream's first core always starts a tile (s_cores * mid_core divides the
     // second dispatch's k_tile), so the run stays linear.
     //
     // And one descriptor for the whole stream, not one a chunk: a chunk
     // advances the destination by exactly mid_chunk/k_tile activation tiles,
     // so the chunks are a fixed stride apart. A descriptor per chunk hangs the
     // array on a joined stream - see xdna_gemv_seq_build.
-    const size_t obj_b     = (size_t) og * g1.n_core() * sizeof(float);
+    const size_t obj_b     = (size_t) s_cores * g1.n_core() * sizeof(float);
     const size_t oc_stride = (size_t) (mid_chunk / g2.k_tile()) * XDNA_GEMV_ACT_TILE;
     for (int c = 0; c < n_o; c++) {
-        const int mid0 = c * og * mid_core;
+        const int mid0 = c * s_cores * mid_core;
         const int t    = mid0 / g2.k_tile();
         const int blk  = (mid0 % g2.k_tile()) / mid_core;
         const uint32_t off = (uint32_t) (po.a_base + a2_off +
@@ -523,7 +559,7 @@ bool xdna_gemv_seq_build(xdna_seq * seq, const xdna_gemv_geom & geom,
     };
 
     // Weights: one linear run per column, ordered [col][chunk][tile][row].
-    for (int c = 0; c < geom.cols; c++) {
+    for (int c = 0; c < geom.cols && !o_.skip_w; c++) {
         {
             const uint32_t off   = (uint32_t) (woff0 + (size_t) c * span);
             const uint32_t bd_id = take_bd(map.w[c].col);
@@ -558,7 +594,23 @@ bool xdna_gemv_seq_build(xdna_seq * seq, const xdna_gemv_geom & geom,
         xdna_seq_push_queue(seq, ep.col, 0, bd_id, xdna_dma_dir::MM2S,
                             ep.ch, false, 0);
     };
-    fill_act_on(map.a, a_a, (uint32_t) aoff0);
+    if (o_.act_replay && n_out > 1) {
+        const uint32_t hb = take_bd(map.a.col);
+        xdna_bd bd;
+        linear_bd(bd, atb, (uint32_t) aoff0);
+        xdna_seq_blockwrite(seq, map.a.col, 0, hb, &bd);
+        xdna_seq_ddr_patch(seq, map.a.col, 0, hb, a_a, (uint32_t) aoff0);
+        xdna_seq_push_queue(seq, map.a.col, 0, hb, xdna_dma_dir::MM2S, map.a.ch, false, 0);
+        const uint32_t bb   = take_bd(map.a.col);
+        const uint32_t boff = (uint32_t) (aoff0 + atb);
+        linear_bd(bd, (size_t) nt * atb, boff);
+        xdna_seq_blockwrite(seq, map.a.col, 0, bb, &bd);
+        xdna_seq_ddr_patch(seq, map.a.col, 0, bb, a_a, boff);
+        xdna_seq_push_queue(seq, map.a.col, 0, bb, xdna_dma_dir::MM2S, map.a.ch, false,
+                            (uint32_t) (n_out - 1));
+    } else if (!o_.skip_act) {
+        fill_act_on(map.a, a_a, (uint32_t) aoff0);
+    }
 
     if (o_.stages == 2) {
         return done();
@@ -595,14 +647,36 @@ bool xdna_gemv_seq_build(xdna_seq * seq, const xdna_gemv_geom & geom,
     if (og > 1) {
         for (int c = 0; c < n_o; c++) {
             const uint32_t bd_id = take_bd(map.o[c].col);
-            const uint32_t off   = (uint32_t) (ooff0 +
+            uint32_t off   = (uint32_t) (ooff0 +
                 (size_t) c * (o_.out_stream_stride ? o_.out_stream_stride
                                                    : (uint32_t) out_b));
+            int      arg   = a_o;
             xdna_bd bd;
-            strided_bd(bd, out_b, (uint32_t) n_out,
-                       (size_t) geom.chunk() * sizeof(float), off);
+            if (o_.out_dest) {
+                // The stream's values in runs of blk_floats, scattered.
+                const xdna_gemv_out_dest & d = o_.out_dest[c];
+                if (d.arg < 0 || d.blk_floats == 0 ||
+                    (size_t) d.blk_floats * d.n_blk * sizeof(float) != out_b) {
+                    GGML_LOG_ERROR("%s: gemv: output stream %d: destination "
+                                   "does not cover the stream\n", "xdna-gemv", c);
+                    return false;
+                }
+                off = d.off;
+                arg = d.arg;
+                bd.buf_len   = d.blk_floats * d.n_blk * (uint32_t) n_out;
+                bd.buf_off   = off;
+                bd.d0_size   = d.blk_floats;
+                bd.d0_stride = 1;
+                bd.d1_size   = d.n_blk;
+                bd.d1_stride = d.blk_stride / 4;
+                bd.d2_stride = d.chunk_stride / 4;
+                bd.ax_cache  = 2;
+            } else {
+                strided_bd(bd, out_b, (uint32_t) n_out,
+                           (size_t) geom.chunk() * sizeof(float), off);
+            }
             xdna_seq_blockwrite(seq, map.o[c].col, 0, bd_id, &bd);
-            xdna_seq_ddr_patch(seq, map.o[c].col, 0, bd_id, a_o, off);
+            xdna_seq_ddr_patch(seq, map.o[c].col, 0, bd_id, arg, off);
             xdna_seq_issue_token(seq, map.o[c].col, 0, xdna_dma_dir::S2MM,
                                  map.o[c].ch, 0xF);
             xdna_seq_push_queue(seq, map.o[c].col, 0, bd_id, xdna_dma_dir::S2MM,
@@ -664,6 +738,25 @@ bool xdna_gemv_seq_build(xdna_seq * seq, const xdna_gemv_geom & geom,
         }
     }
     return done();
+}
+
+void xdna_gemv_endpoints(const xdna_gemv_geom & geom, xdna_gemv_ep w[XDNA_GEMV_COLS],
+                         xdna_gemv_ep * a, xdna_gemv_ep o[XDNA_GEMV_COLS], int * n_o) {
+    const gemv_shim_map m = shim_map_for(geom);
+    for (int c = 0; c < XDNA_GEMV_COLS; c++) {
+        w[c] = { m.w[c].col, m.w[c].ch };
+        o[c] = { m.o[c].col, m.o[c].ch };
+    }
+    *a = { m.a.col, m.a.ch };
+    *n_o = m.n_o();
+}
+
+int xdna_gemv_out_streams(const xdna_gemv_geom & geom) {
+    return shim_map_for(geom).n_o();
+}
+
+int xdna_gemv_stream_floats(const xdna_gemv_geom & geom) {
+    return shim_map_for(geom).o_group * geom.rows() * geom.n_core();
 }
 
 // --- weight packing ---------------------------------------------------------
@@ -734,7 +827,7 @@ bool xdna_gemv_pack_weights(const xdna_gemv_geom & geom,
         // cannot take a wider type.
         if (!w || w->ne[0] != K ||
             (geom.fmt != XDNA_WFMT_Q8G16 &&
-             xdna_wfmt_gemv_for(w->type) != geom.fmt)) {
+             xdna_wfmt_gemv_for(xdna_gemv_type_of(w)) != geom.fmt)) {
             return false;
         }
         for (int64_t r0 = 0; r0 < w->ne[1]; r0++) {
@@ -921,6 +1014,8 @@ static void gemv_pack_act(const xdna_gemv_geom & geom, const float * act,
     int32_t * hdr = (int32_t *) dst;
     hdr[0] = geom.n_tiles();
     hdr[1] = geom.n_out();
+    hdr[2] = 0;   // words 2 and 3: the pool's attention mode, off for a projection
+    hdr[3] = 0;
     hdr[XDNA_GEMV_ACT_TILE / 4 - 1] = fmt_word;
     hdr[XDNA_GEMV_ACT_TILE / 4 - 2] = 0;
 
@@ -997,6 +1092,11 @@ static void gemv_pack_act(const xdna_gemv_geom & geom, const float * act,
     }
 }
 
+void xdna_gemv_pack_act_into(const xdna_gemv_geom & geom, const float * act,
+                             uint8_t * dst) {
+    gemv_pack_act(geom, act, dst, 0, geom.epilogue ? 1 : 0);
+}
+
 bool xdna_gemv_run_packed(xdna_gemv * g, const void * act_tiles, float * out) {
     if (!g || !act_tiles || !out || g->geom.n_out() != 1) {
         return false;
@@ -1015,7 +1115,10 @@ bool xdna_gemv_read_out(xdna_gemv * g, float * out) {
     if (!g || !out) {
         return false;
     }
-    return xdna_buffer_download(g->o, out, (size_t) g->geom.n_real * sizeof(float));
+    // Nothing marks this output before its run: a settled read, as the
+    // queued path has it.
+    xdna_buffer_read_settled(g->o, out, (size_t) g->geom.n_real * sizeof(float));
+    return true;
 }
 
 bool xdna_gemv_run(xdna_gemv * g, const float * act, float * out) {
@@ -1082,7 +1185,7 @@ xdna_gemv_pair * xdna_gemv_pair_create(xdna_kernel_pool * pool,
                        "xdna-gemv", g1.stem().c_str(), g2.stem().c_str());
         return nullptr;
     }
-    if (!g1.epilogue || g2.epilogue || g1.rows() != 1 ||
+    if (!g1.epilogue || g2.epilogue || g1.rows() != g2.rows() ||
         g1.n_core() != g2.n_core() || g1.cols != g2.cols) {
         return nullptr;
     }
@@ -1096,7 +1199,7 @@ xdna_gemv_pair * xdna_gemv_pair_create(xdna_kernel_pool * pool,
         // One descriptor carries a whole output stream, so the blocks the
         // cores it joins produce have to sit inside one activation tile of the
         // second dispatch.
-        const int run = (g1.n_core() / 2) * shim_map_for(g1).o_group;
+        const int run = (g1.n_core() / 2) * shim_map_for(g1).o_group * g1.rows();
         if (run == 0 || g2.k_tile() % run != 0) {
             GGML_LOG_ERROR("%s: gemv pair: an output stream straddles two "
                            "activation tiles (%d values against a %d tile)\n",
@@ -1197,6 +1300,8 @@ static void gemv_pack_act_host_half(const xdna_gemv_geom & geom, uint8_t * dst,
     int32_t * hdr = (int32_t *) dst;
     hdr[0] = geom.n_tiles();
     hdr[1] = geom.n_out();
+    hdr[2] = 0;   // words 2 and 3: the pool's attention mode, off for a projection
+    hdr[3] = 0;
     hdr[XDNA_GEMV_ACT_TILE / 4 - 1] = geom.fmt == XDNA_WFMT_Q4G32 ? 0 : 1;
     hdr[XDNA_GEMV_ACT_TILE / 4 - 2] = 0;
     for (int t = 0; t < geom.n_tiles(); t++) {
@@ -1220,6 +1325,131 @@ static void gemv_pack_act_host_half(const xdna_gemv_geom & geom, uint8_t * dst,
 // and group that tile the way the second dispatch's format reads it (bit 3).
 static int32_t pair_last_flags(const xdna_gemv_pair * p) {
     return 1 | 4 | (p->g2.fmt == XDNA_WFMT_Q8G16 ? 8 : 0);
+}
+
+void xdna_seq_row_io(xdna_seq * seq, int res_arg, uint32_t acc_off, uint32_t hres_off,
+                     int g_arg, uint32_t g_off, uint32_t h_off) {
+    // gemv_q4.py PRO_SIDE_COL / PRO_EMIT_COL
+    constexpr uint32_t SCOL = 6, SCH = 1, ECOL = 5, ECH = 0, SBD = 11, EBD = 14;
+    const size_t row = (size_t) XDNA_RES_D * sizeof(float);
+    xdna_bd ba, bh, bg, be;
+    linear_bd(ba, row, acc_off);
+    linear_bd(bh, row, hres_off);
+    linear_bd(bg, row, g_off);
+    linear_bd(be, row, h_off);
+    ba.next_bd = SBD + 1;
+    ba.use_next = true;
+    bh.next_bd = SBD + 2;
+    bh.use_next = true;
+    xdna_seq_blockwrite(seq, SCOL, 0, SBD, &ba);
+    xdna_seq_ddr_patch(seq, SCOL, 0, SBD, res_arg, ba.buf_off);
+    xdna_seq_blockwrite(seq, SCOL, 0, SBD + 1, &bh);
+    xdna_seq_ddr_patch(seq, SCOL, 0, SBD + 1, res_arg, bh.buf_off);
+    xdna_seq_blockwrite(seq, SCOL, 0, SBD + 2, &bg);
+    xdna_seq_ddr_patch(seq, SCOL, 0, SBD + 2, g_arg, bg.buf_off);
+    xdna_seq_issue_token(seq, SCOL, 0, xdna_dma_dir::MM2S, SCH, 0xF);
+    xdna_seq_push_queue(seq, SCOL, 0, SBD, xdna_dma_dir::MM2S, SCH, true, 0);
+    xdna_seq_blockwrite(seq, ECOL, 0, EBD, &be);
+    xdna_seq_ddr_patch(seq, ECOL, 0, EBD, res_arg, be.buf_off);
+    xdna_seq_issue_token(seq, ECOL, 0, xdna_dma_dir::S2MM, ECH, 0xF);
+    xdna_seq_push_queue(seq, ECOL, 0, EBD, xdna_dma_dir::S2MM, ECH, true, 0);
+}
+
+void xdna_seq_row_io_gates(xdna_seq * seq, int res_arg, uint32_t acc_off, uint32_t hres_off,
+                           int g_arg, uint32_t g_off, uint32_t h_off,
+                           int ab_arg, uint32_t ab_off, uint32_t ab_words,
+                           int x_arg, uint32_t x_off, uint32_t x_stride, uint32_t x_heads) {
+    constexpr uint32_t SCOL = 6, SCH = 1, ECOL = 5, ECH = 0, SBD = 11, EBD = 14;
+    const size_t row = (size_t) XDNA_RES_D * sizeof(float);
+    xdna_bd ba, bh, bg, bw, be, bt;
+    linear_bd(ba, row, acc_off);
+    linear_bd(bh, row, hres_off);
+    linear_bd(bg, row, g_off);
+    linear_bd(bw, (size_t) ab_words * 4, ab_off);
+    linear_bd(be, row, h_off);
+    ba.next_bd = SBD + 1; ba.use_next = true;
+    bh.next_bd = SBD + 2; bh.use_next = true;
+    bg.next_bd = SBD + 3; bg.use_next = true;
+    // the tails: 3 words a head, and the object's rest one head-set further
+    // on each time, past x
+    bt.buf_len   = 256;
+    bt.buf_off   = x_off;
+    bt.d0_size   = 3;
+    bt.d0_stride = 1;
+    bt.d1_size   = x_heads;
+    bt.d1_stride = x_stride;
+    bt.d2_stride = x_stride * x_heads;
+    bt.ax_cache  = 2;
+    be.next_bd = EBD + 1; be.use_next = true;
+    xdna_seq_blockwrite(seq, SCOL, 0, SBD, &ba);
+    xdna_seq_ddr_patch(seq, SCOL, 0, SBD, res_arg, ba.buf_off);
+    xdna_seq_blockwrite(seq, SCOL, 0, SBD + 1, &bh);
+    xdna_seq_ddr_patch(seq, SCOL, 0, SBD + 1, res_arg, bh.buf_off);
+    xdna_seq_blockwrite(seq, SCOL, 0, SBD + 2, &bg);
+    xdna_seq_ddr_patch(seq, SCOL, 0, SBD + 2, g_arg, bg.buf_off);
+    xdna_seq_blockwrite(seq, SCOL, 0, SBD + 3, &bw);
+    xdna_seq_ddr_patch(seq, SCOL, 0, SBD + 3, ab_arg, bw.buf_off);
+    xdna_seq_issue_token(seq, SCOL, 0, xdna_dma_dir::MM2S, SCH, 0xF);
+    xdna_seq_push_queue(seq, SCOL, 0, SBD, xdna_dma_dir::MM2S, SCH, true, 0);
+    xdna_seq_blockwrite(seq, ECOL, 0, EBD, &be);
+    xdna_seq_ddr_patch(seq, ECOL, 0, EBD, res_arg, be.buf_off);
+    xdna_seq_blockwrite(seq, ECOL, 0, EBD + 1, &bt);
+    xdna_seq_ddr_patch(seq, ECOL, 0, EBD + 1, x_arg, bt.buf_off);
+    xdna_seq_issue_token(seq, ECOL, 0, xdna_dma_dir::S2MM, ECH, 0xF);
+    xdna_seq_push_queue(seq, ECOL, 0, EBD, xdna_dma_dir::S2MM, ECH, true, 0);
+}
+
+void xdna_seq_row_wait(xdna_seq * seq) {
+    xdna_seq_wait_token(seq, 6, 0, xdna_dma_dir::MM2S, 1);
+    xdna_seq_wait_token(seq, 5, 0, xdna_dma_dir::S2MM, 0);
+}
+
+int32_t xdna_gemv_pair_last_flags(const xdna_gemv_pair * p) {
+    return pair_last_flags(p);
+}
+
+bool xdna_gemv_row_act(const xdna_gemv_geom & geom, uint8_t * dst, float eps, bool res,
+                       int32_t last_flags, int gates) {
+    constexpr int AW = XDNA_GEMV_ACT_TILE / 4;
+    const int nt = geom.n_tiles();
+    const int D  = geom.K;
+    if (!dst || nt * geom.k_tile() != D || D % 512 != 0) {
+        return false;
+    }
+    const int32_t fmt_word = geom.fmt == XDNA_WFMT_Q4G32 ? 0 : 1;
+    int32_t eps_w;
+    std::memcpy(&eps_w, &eps, 4);
+    std::memset(dst, 0, geom.act_bytes());
+    int32_t * hdr = (int32_t *) dst;
+    hdr[0] = nt;
+    hdr[1] = geom.n_out();
+    hdr[AW - 1] = fmt_word;
+    for (int c = 0; c < geom.n_out(); c++) {
+        for (int k = 0; k < nt; k++) {
+            int32_t * t = (int32_t *) (dst + (size_t) (1 + c * nt + k) * XDNA_GEMV_ACT_TILE);
+            t[512] = gates;
+            t[513] = res ? 1 : 0;
+            t[514] = eps_w;
+            t[515] = D;
+            t[516] = fmt_word;
+            t[517] = k;
+            t[518] = 4;
+            t[AW - 1] = fmt_word;
+            t[AW - 2] = (1 << 5) | (k == nt - 1 ? last_flags : 0);
+            if (c == 0 && k == 0) {
+                t[AW - 6] = D / 512 * (res ? 3 : 2);
+                t[AW - 7] = D / 256;
+            }
+            // the gates on the last tile of the last chunk: the pool is on
+            // that chunk while the prologue computes them
+            if (gates && c == geom.n_out() - 1 && k == nt - 1) {
+                t[510] = 1;
+                t[AW - 6] += 1 + gates;
+                t[AW - 7] += 1;
+            }
+        }
+    }
+    return true;
 }
 
 bool xdna_gemv_pair_prep_raw(xdna_gemv_pair * p, const float * res,

@@ -20,6 +20,7 @@
 // calls the packers here (the C++ mirror of the python persist harness in
 // kernels/attn_cn.py / gdn_v.py / rec_gated.py).
 
+#include "xdna-gemv.h"
 #include "xdna-runtime.h"
 #include "xdna-seq.h"
 
@@ -149,7 +150,34 @@ struct xdna_rec_core {
 
     struct xdna_gemv * so_gemv = nullptr;
     xrt::run      so_run;
+    std::vector<xdna_buffer *> so_args;   // so_run's, for a joined token stream
     bool          so_fused = false;
+
+    // The layer's in-projection at the head of the same stream
+    // (xdna_rec_core_set_inproj): its weights follow ssm_out's in argument 6,
+    // its activation follows ssm_out's in argument 7, and it drains qkv into
+    // the feed's windows and z into azg's lanes, so the host uploads neither.
+    bool          inproj = false;
+    xdna_gemv_geom in_geom;
+    std::vector<uint8_t> in_packed;  // until the stream is built
+    size_t        in_w_off = 0;
+    size_t        in_a_off = 0;
+    std::vector<uint8_t> in_host_a;
+    xdna_buffer * w6 = nullptr;      // [ssm_out weights | in-proj weights]
+    xdna_buffer * a7 = nullptr;      // [ssm_out activation | in-proj activation]
+    // The layer boundary on the prologue (xdna_rec_core_set_rows): the
+    // residual rows every fused layer binds as argument 9, and the two norms'
+    // gammas, rows of a7.
+    bool          rows = false;
+    xdna_buffer * res = nullptr;
+    std::vector<float> g_attn, g_post;
+    float         eps_attn = 0.0f, eps_post = 0.0f;
+    size_t        g_attn_off = 0, g_post_off = 0;
+    // The GDN gates on the prologue too: [constants | ssm_alpha | ssm_beta
+    // rows, bf16] in w6 at ab_off, x's tails emitted into x.
+    bool          gates = false;
+    std::vector<uint8_t> ab;
+    size_t        ab_off = 0;
 
     bool          pkv_onchip = false;
     int           act_arg = 5;
@@ -185,6 +213,12 @@ bool xdna_rec_core_begin(xdna_rec_core * core, const void * feed0,
 // (state_bytes/4 floats), or zero when NULL. Call once before the first token.
 bool xdna_rec_core_seed(xdna_rec_core * core, const void * state);
 
+// The recurrent state the device carries, in llama's cache layout: the conv
+// history (3 taps a channel, channel-major, 3*CH floats) and the ssm state
+// (state_floats(), from its bf16 copy). What xdna_rec_core_begin and
+// xdna_rec_core_seed take, read back.
+bool xdna_rec_core_read_state(xdna_rec_core * core, float * conv_hist, float * ssm);
+
 // Run the conv+norm+gdn+gated stage for token `t`: t == 0 reuses the qkv
 // already inside feed0; t > 0 uploads only the F_Q qkv window of every conv
 // block from `qkv` (feed_blocks*sv floats). x is re-uploaded every token and z
@@ -209,6 +243,31 @@ size_t xdna_rec_core_out_off(const xdna_rec_core * core);
 bool xdna_rec_core_fuse_so(xdna_rec_core * core, struct xdna_kernel_pool * pool,
                            struct xdna_gemv * so, struct xdna_gemv_pair * ffn);
 
+// Put the layer's in-projection at the head of the stream xdna_rec_core_fuse_so
+// builds (so call this first). `geom` and `packed` come from
+// xdna_rec_inproj_pack; the stream drains qkv and z where the core reads them.
+bool xdna_rec_core_set_inproj(xdna_rec_core * core, const struct xdna_gemv_geom & geom,
+                              const std::vector<uint8_t> & packed);
+
+// Take the layer's input and hand its output through the residual rows
+// (xdna-gemv.h XDNA_RES_*) instead of the host: the in-projection's input is
+// the prologue's norm of F + A, ssm_out drains into S, the FFN's input is the
+// norm of H + S (h_attn into A) and its output lands in F. Call before
+// xdna_rec_core_fuse_so, with the in-projection set.
+bool xdna_rec_core_set_rows(xdna_rec_core * core, struct xdna_buffer * res,
+                            const float * gamma_attn, float eps_attn,
+                            const float * gamma_post, float eps_post);
+
+// And the gates, from the same row: alpha = W_a x, beta = W_b x (NVH rows of
+// D each, f32), dt and a (NVH each) - x's per-head tails (exp(gate), beta,
+// the scale) become the prologue's, and the host writes x no more.
+bool xdna_rec_core_set_gates(xdna_rec_core * core, const float * w_alpha,
+                             const float * w_beta, const float * dt, const float * a);
+
+// The in-projection's input row for the next run: the layer's normed input,
+// quantized into the stream's activation.
+bool xdna_rec_core_inproj_act(xdna_rec_core * core, const float * act);
+
 // True when the fused run is bound and xdna_rec_core_run will also project.
 bool xdna_rec_core_so_fused(const xdna_rec_core * core);
 
@@ -219,6 +278,14 @@ bool xdna_rec_core_so_to_act(const xdna_rec_core * core);
 // True when the layer's FFN is in that same dispatch, so the caller only has
 // to read its output back.
 bool xdna_rec_core_ffn_fused(const xdna_rec_core * core);
+
+// With the in-projection in the stream, `qkv` and `z` are not read (pass
+// null): the run produces them.
+// Start the fused run without waiting for it, for a layer whose boundary and
+// gates are the array's (xdna_rec_core_set_gates): it takes nothing from the
+// host and hands nothing back but the rows. The caller waits on the returned
+// run before anything reads what it wrote. Null when the core cannot.
+xrt::run * xdna_rec_core_launch(xdna_rec_core * core, int t);
 
 bool xdna_rec_core_run(xdna_rec_core * core, int t, const void * qkv,
                        const void * x, const float * z, int8_t * aq,

@@ -40,8 +40,11 @@ void xdna_seq_blockwrite(xdna_seq * seq, uint32_t col, uint32_t row, uint32_t bd
     seq->ops.push_back((bd->d0_size & 0x3FF) << BD_D0_SIZE_SHIFT | ((bd->d0_stride - 1) & 0xFFFFF));
     seq->ops.push_back(BD_D1_BURST | (bd->d1_size & 0x3FF) << BD_D1_SIZE_SHIFT | ((bd->d1_stride - 1) & 0xFFFFF));
     seq->ops.push_back((bd->ax_cache & 0xFF) << BD_D2_CACHE_SHIFT | ((bd->d2_stride - 1) & 0xFFFFF));
-    seq->ops.push_back(((bd->iter_size - 1) & 0x3FF) << BD_ITER_SIZE_SHIFT | ((bd->iter_stride - 1) & 0xFFFFF));
-    seq->ops.push_back(xdna_txn::bd_ctrl(bd->next_bd, bd->valid, 0, 0, false, 0, 0));
+    // The iteration wrap is six bits (bits 25:20); above it sits the
+    // iteration's current count, which a fresh descriptor starts at zero.
+    seq->ops.push_back(((bd->iter_size - 1) & 0x3F) << BD_ITER_SIZE_SHIFT | ((bd->iter_stride - 1) & 0xFFFFF));
+    seq->ops.push_back(xdna_txn::bd_ctrl(bd->next_bd & 0xF, bd->valid, 0, 0, false, 0, 0) |
+                       (bd->use_next ? 1u << 26 : 0u));
 }
 
 // The firmware translates a buffer address itself only for the first five
