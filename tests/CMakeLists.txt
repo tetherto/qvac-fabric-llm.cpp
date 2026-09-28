@@ -421,6 +421,13 @@ llama_build_and_test(test-backend-sampler.cpp   LABEL "model")
 # Self-skipping when no XDNA device is registered.
 if (GGML_XDNA)
     llama_build_and_test(test-xdna-reload.cpp       LABEL "model")
+    # The host-only backend tests are built with the backend
+    # (ggml/src/ggml-xdna/CMakeLists.txt); they need no model and no device.
+    foreach(t test-xdna-repack)
+        if (TARGET ${t})
+            add_test(NAME ${t} COMMAND ${t} ${CMAKE_RUNTIME_OUTPUT_DIRECTORY})
+        endif()
+    endforeach()
 endif()
 
 # Test for state restore with fragmented KV cache
