@@ -22,7 +22,8 @@
 //   for j in N_CORE/32 lane groups:
 //     for g in K_TILE/GROUP groups:
 //       codes   GROUP rows of 32 columns; q4g32 packs two per byte, low
-//               nibble first, q8g16 one int8 per value
+//               nibble first, the 8-bit form one int8 per value (both
+//               groups of 32; the 8-bit tile is padded to the 4-bit size)
 //       params  d8[32], m8[32] bf16: this group's integer scale and min for
 //               each of the 32 columns
 //   then, for j in N_CORE/32 lane groups, for s in NSUP super-blocks:
@@ -103,83 +104,46 @@ inline aie::vector<float, VEC> pair_to_f32(const bfloat16 *hi, const bfloat16 *l
 // polynomial in f32 instead: exp(-x) = 2^-n * exp(-f) with |f| <= ln2/2, and a
 // Newton reciprocal. The volume is 16 lanes per core per chunk, so the cost of
 // working in f32 here does not matter.
+// 1 / d in fp32 lanes: a bit-trick guess and three Newton steps. Shared by
+// silu and the quantizer rather than inlined into both.
+__attribute__((noinline)) aie::vector<float, 16> recip_f32(const aie::vector<float, 16> d)
+{
+    const auto two = aie::broadcast<float, 16>(2.0f);
+    auto r = aie::sub(aie::broadcast<int32, 16>(0x7EF311C7), d.cast_to<int32>()).cast_to<float>();
+    for (int it = 0; it < 3; ++it) {
+        r = aie::mul(r, aie::sub(two, aie::mul(d, r).to_vector<float>(0))).to_vector<float>(0);
+    }
+    return r;
+}
+
 inline aie::vector<float, 16> silu_f32(const aie::vector<float, 16> &x)
 {
-#ifndef SILU_STEP
-#define SILU_STEP 0
-#endif
 #if defined(SILU_IDENTITY)
     // Diagnostic: the epilogue runs but the nonlinearity is the identity, so
     // a failure can only be the plumbing around it.
     return x;
 #else
-    const aie::vector<float, 16> one = aie::broadcast<float, 16>(1.0f);
-
-    // sigma(x) = 1/(1+exp(-x)), computed on x itself rather than on |x|. The
-    // series below is accurate across the whole clamped range, so there is no
-    // reduction whose sign has to be undone afterwards - no magnitude taken
-    // off the bit pattern, no sign bit held live across the exponential, no
-    // final 1-2r correction. That correction was the one step the device got
-    // wrong once a core owned two lane groups instead of one: probing the
-    // intermediates showed the reciprocal exact and only the sign fold after
-    // it destroyed.
-    //
-    // The clamp keeps exp(-x) inside f32; beyond it sigma is already 0 or 1 to
-    // f32 precision. The product uses the unclamped x, which is what silu is
-    // outside the clamp anyway.
-    const aie::vector<float, 16> xc =
-        aie::max(aie::min(x, aie::broadcast<float, 16>(40.0f)),
-                 aie::broadcast<float, 16>(-40.0f));
-
-    // exp(-xc) by repeated squaring: at t = -xc/256 the argument is small
-    // enough that a degree-5 series is good to ~2e-8, and eight squarings
-    // bring the range back. All multiplies and adds, so there is no
-    // exponent-field arithmetic and no int-float round trip to get wrong.
-    constexpr float INV_256 = 1.0f / 256.0f;
-    const aie::vector<float, 16> t =
-        aie::mul(xc, aie::broadcast<float, 16>(-INV_256)).to_vector<float>(0);
-
-    aie::vector<float, 16> e = aie::broadcast<float, 16>(1.0f / 5.0f);
-    e = aie::add(aie::mul(e, t).to_vector<float>(0), aie::broadcast<float, 16>(1.0f / 4.0f));
-    e = aie::add(aie::mul(e, t).to_vector<float>(0), aie::broadcast<float, 16>(1.0f / 3.0f));
-    e = aie::add(aie::mul(e, t).to_vector<float>(0), aie::broadcast<float, 16>(1.0f / 2.0f));
-    e = aie::add(aie::mul(e, t).to_vector<float>(0), one);
-    e = aie::add(aie::mul(e, t).to_vector<float>(0), one);
-#if SILU_STEP == 1
-    return xc;
-#endif
-    // Written out rather than looped: this sits inside the lane-group loop,
-    // and a loop nested there is scheduled together with the outer one.
-    e = aie::mul(e, e).to_vector<float>(0);
-    e = aie::mul(e, e).to_vector<float>(0);
-    e = aie::mul(e, e).to_vector<float>(0);
-    e = aie::mul(e, e).to_vector<float>(0);
-    e = aie::mul(e, e).to_vector<float>(0);
-    e = aie::mul(e, e).to_vector<float>(0);
-    e = aie::mul(e, e).to_vector<float>(0);
-    e = aie::mul(e, e).to_vector<float>(0);
-#if SILU_STEP == 2
-    return e;
-#endif
-    const aie::vector<float, 16> a = aie::add(e, one);
-#if SILU_STEP == 3
-    return a;
-#endif
-
-    // 1/a by Newton, r <- r*(2 - a*r). The AIE reciprocal table is bf16 and
-    // ships for AIE2 only; a > 0 here, so the bit-pattern seed is well behaved
-    // at ~3% and three steps reach f32.
-    const aie::vector<int32, 16> abits = a.cast_to<int32>();
-    aie::vector<float, 16> r =
-        aie::sub(aie::broadcast<int32, 16>(0x7EF311C3), abits).cast_to<float>();
-    const aie::vector<float, 16> two = aie::broadcast<float, 16>(2.0f);
-    r = aie::mul(r, aie::sub(two, aie::mul(a, r).to_vector<float>(0))).to_vector<float>(0);
-    r = aie::mul(r, aie::sub(two, aie::mul(a, r).to_vector<float>(0))).to_vector<float>(0);
-    r = aie::mul(r, aie::sub(two, aie::mul(a, r).to_vector<float>(0))).to_vector<float>(0);
-#if SILU_STEP == 4 || SILU_STEP == 5
-    return r;
-#endif
-    return aie::mul(x, r).to_vector<float>(0);
+    // sigma(x) = 1 / (1 + exp(-x)): exp(-x) = 2^n * 2^f from the exponent
+    // bits and a degree-6 polynomial on f in [-0.5, 0.5] (~2e-7), then the
+    // reciprocal by a bit-trick guess and three Newton steps. The same as
+    // silu-f32.h; the repeated-squaring form it replaces was 1.4 KB larger in
+    // a program memory the attention mode needs.
+    const auto bc = [](float v) { return aie::broadcast<float, 16>(v); };
+    auto t = aie::mul(x, bc(-1.4426950408889634f)).to_vector<float>(0);
+    t = aie::min(aie::max(t, bc(-126.0f)), bc(126.0f));
+    const auto magic = bc(12582912.0f);
+    const auto tm = aie::add(t, magic);
+    const auto f  = aie::sub(t, aie::sub(tm, magic));
+    const auto ni = aie::sub(tm.cast_to<int32>(), magic.cast_to<int32>());
+    auto p = aie::add(aie::mul(f, bc(1.5403530393381606e-4f)).to_vector<float>(0), bc(1.3333558146428443e-3f));
+    p = aie::add(aie::mul(p, f).to_vector<float>(0), bc(9.6181291076284772e-3f));
+    p = aie::add(aie::mul(p, f).to_vector<float>(0), bc(5.5504108664821580e-2f));
+    p = aie::add(aie::mul(p, f).to_vector<float>(0), bc(2.4022650695910071e-1f));
+    p = aie::add(aie::mul(p, f).to_vector<float>(0), bc(6.9314718055994531e-1f));
+    p = aie::add(aie::mul(p, f).to_vector<float>(0), bc(1.0f));
+    const auto sc = aie::upshift(aie::add(ni, aie::broadcast<int32, 16>(127)), 23).cast_to<float>();
+    const auto d = aie::add(aie::mul(p, sc).to_vector<float>(0), bc(1.0f));
+    return aie::mul(x, recip_f32(d)).to_vector<float>(0);
 #endif
 }
 
@@ -197,40 +161,47 @@ inline aie::vector<float, 16> silu_f32(const aie::vector<float, 16> &x)
 // A quantization group is 32 values and a core owns N_CORE/2 of them, so this
 // needs a core at least 64 columns wide; the fused layer's geometry is 128.
 // `grp` is the consumer's activation group, not this kernel's: the tile is
-// read back by whichever format the next dispatch's weights are in, and q4g32
-// groups 32 values where q8g16 groups 16.
+// read back by whichever format the next dispatch's weights are in (both
+// group 32 values now; the flag stays for a build with other groups).
 inline void store_quant(float *out, const float *mid, int n, int GRP)
 {
+    // All in vector lanes: the core's scalar unit has no FPU, and the scalar
+    // form of this - a divide, a reciprocal, a compare and a clamp per value -
+    // pulled in ~3 KB of software float that the GEMV cores' program memory
+    // could not spare. Codes round to nearest-even (the 1.5 * 2^23 trick) and
+    // the reciprocal is a bit-trick guess refined by Newton.
     int8_t * codes = (int8_t *) out;
     float *  par   = out + (N_CORE / 2) / 4;    // after the codes, as f32 slots
     const auto absmask = aie::broadcast<int32, 16>(0x7FFFFFFF);
+    const auto magic   = aie::broadcast<float, 16>(12582912.0f);
+    const auto magici  = magic.cast_to<int32>();
+    const auto lo      = aie::broadcast<float, 16>(-127.0f);
+    const auto hi      = aie::broadcast<float, 16>(127.0f);
     for (int g = 0; g < n / GRP; g++) {
         const float * v = mid + g * GRP;
         aie::vector<float, 16> vmax = aie::zeros<float, 16>();
         for (int i = 0; i < GRP; i += 16) {
             auto x = aie::load_v<16>(v + i);
-            // aie::abs does not hold for f32 here; mask the sign bit.
             vmax = aie::max(vmax, aie::bit_and(x.cast_to<int32>(), absmask)
                                       .cast_to<float>());
         }
-        alignas(64) float lanes[16];
-        aie::store_v(lanes, vmax);
-        float amax = 0.0f;
-        for (int i = 0; i < 16; i++) {
-            if (lanes[i] > amax) amax = lanes[i];
+        // amax in every lane; a zero group gets a harmless scale (its codes
+        // are zero whatever the scale is)
+        const auto am = aie::max(aie::broadcast<float, 16>(aie::reduce_max(vmax)),
+                                 aie::broadcast<float, 16>(1e-30f));
+        const auto inv = aie::mul(recip_f32(am), hi).to_vector<float>(0);   // 127 / amax
+        const auto dv  = aie::mul(am, aie::broadcast<float, 16>(1.0f / 127.0f)).to_vector<float>(0);
+        aie::vector<float, 16> qsum = aie::zeros<float, 16>();
+        for (int i = 0; i < GRP; i += 16) {
+            auto t = aie::mul(aie::load_v<16>(v + i), inv).to_vector<float>(0);
+            t = aie::min(aie::max(t, lo), hi);
+            const auto tm = aie::add(t, magic);
+            qsum = aie::add(qsum, aie::sub(tm, magic));
+            const auto qi = aie::sub(tm.cast_to<int32>(), magici);
+            aie::store_v(codes + g * GRP + i, aie::pack(aie::pack(qi)));
         }
-        const float d   = amax > 0.0f ? amax / 127.0f : 1.0f;
-        const float inv = 1.0f / d;
-        int sum = 0;
-        for (int i = 0; i < GRP; i++) {
-            float t = v[i] * inv;
-            if (t > 127.0f) t = 127.0f; else if (t < -127.0f) t = -127.0f;
-            const int q = (int) (t >= 0.0f ? t + 0.5f : t - 0.5f);
-            codes[g * GRP + i] = (int8_t) q;
-            sum += q;
-        }
-        par[g]             = (float) sum;
-        par[n / GRP + g]   = d;
+        par[g]           = aie::reduce_add(qsum);
+        par[n / GRP + g] = dv[0];
     }
 }
 
@@ -290,7 +261,7 @@ extern "C" {
 #define Q4_GROUP 32
 #endif
 #ifndef Q8_GROUP
-#define Q8_GROUP 16
+#define Q8_GROUP 32
 #endif
 
 // ACT_RAW: the GEMV cores read a tile a prologue core built, which means one
@@ -319,132 +290,54 @@ extern "C" {
 // dispatch boundary at all.
 #define ACT_FIRST_W (ACT_TILE / 4 - 5)
 #if ACT_PRO
-// Where a tile carries numbers instead of codes the host packed. The codes a
-// raw tile would have held are the prologue's output, not its input, so the
-// whole tile up to the trailing words is free:
-//
-//   +0                 acc, K_TILE f32   - written by the dispatch before this
-//   +4*K_TILE          hres, K_TILE bf16 - the residual, from the host
-//   +6*K_TILE          gamma, K_TILE bf16 - the norm's weight, from the host
-//
-// 2048 B at K_TILE 256, inside the 2104 a tile leaves. acc is f32 and the
-// other two are not, because acc is the one a shim descriptor delivers
-// straight out of the projection that produced it - and a DMA cannot convert.
-#ifndef ACT_RAW_OFF
-#define ACT_RAW_OFF 0
-#endif
+// The prologue tile: every activation object passes it on the way to the
+// cores. Tiles with flags bit 5 are the attention layer's and the layer
+// boundary's work (act-att.cc, appended to this build); every other one
+// passes through.
 
-// The FFN's activation, built on the core out of what the dispatch before it
-// left in DDR instead of by the host. A tile carries three bf16 runs at
-// ACT_RAW_OFF - the projection's output, the residual and the norm's gamma -
-// and this turns them into the codes and group parameters the matmul reads:
-//
-//   h = acc + hres            the residual add
-//   ss += h*h                 the norm's reduction, running over the chunk
-//   x = h * gamma             per channel, so it has to precede quantization
-//   code, gsum, gd = quant(x) the same per-group scale gemv_pack_act applies
-//
-// The rsqrt is deliberately absent. It is one scalar over the whole row, the
-// matmul is linear in the activation, and the epilogue is where the
-// nonlinearity needs it - so it is applied to the accumulator there, which
-// also means a tile can be quantized before the reduction it belongs to has
-// finished.
-//
-// Vector code because the core's program memory is full: the scalar form of
-// the same function overflowed .text by 1120 bytes.
-static float g_ss;   // summed over a chunk's tiles, spent at the last one
-
-// Only the q4g32 path carries it: the stage that needs an activation built on
-// the array is the FFN's gate/up, and that is the Q4_K one. Every bound is a
-// constant so the loops collapse - with k_tile and the group width passed in,
-// the same function was twice the size and did not fit.
-__attribute__((noinline)) void act_prologue(const uint8_t *acc,
-                                            const uint8_t *hst, int8_t *code,
-                                            float *gsum, float *gd)
+// Scalar float arithmetic has no hardware on this core: every divide,
+// multiply, add, compare and int conversion was a software routine, 2.4 KB of
+// a program the attention layer's work needs. These do it in a vector lane.
+static inline aie::vector<float, 16> v_bc(float a) { return aie::broadcast<float, 16>(a); }
+// An fp32 vector product is several of the MAC's bf16 ones, a few hundred
+// bytes inline each: out of line, once.
+__attribute__((noinline)) aie::vector<float, 16> vmul(const aie::vector<float, 16> a,
+                                                      const aie::vector<float, 16> b)
 {
-    constexpr int KT = K_TILE_Q4;
-    constexpr int GRP = Q4_GROUP;
-    const float    *pa = (const float *) acc;
-    const bfloat16 *pr = (const bfloat16 *) hst;
-    const bfloat16 *pg = pr + KT;
-    float ss = 0.0f;
-    for (int g = 0; g < KT / GRP; g++) {
-        alignas(32) float xb[GRP];
-        float amax = 0.0f;
-        for (int p = 0; p < GRP; p += 16) {
-            const int o = g * GRP + p;
-            aie::accum<accfloat, 16> hr, hg;
-            hr.from_vector(aie::load_v<16>(pr + o));
-            hg.from_vector(aie::load_v<16>(pg + o));
-            const aie::vector<float, 16> h =
-                aie::add(aie::load_v<16>(pa + o), hr.to_vector<float>(0));
-            ss += aie::reduce_add(aie::mul(h, h).to_vector<float>(0));
-            const aie::vector<float, 16> x =
-                aie::mul(h, hg.to_vector<float>(0)).to_vector<float>(0);
-            const float m = aie::reduce_max(aie::abs(x));
-            amax = m > amax ? m : amax;
-            aie::store_v(xb + p, x);
-        }
-        const float inv = amax > 0.0f ? 127.0f / amax : 1.0f;
-        int sum = 0;
-        for (int p = 0; p < GRP; p += 16) {
-            const aie::vector<float, 16> q =
-                aie::mul(aie::load_v<16>(xb + p),
-                         aie::broadcast<float, 16>(inv)).to_vector<float>(0);
-            const aie::vector<int32_t, 16> qi = aie::to_fixed<int32_t>(q, 0);
-            aie::store_v(code + g * GRP + p, aie::pack(aie::pack(qi)));
-            sum += aie::reduce_add(qi);
-        }
-        gsum[g] = (float) sum;
-        gd[g]   = amax * (1.0f / 127.0f);
-    }
-    g_ss += ss;
+    return aie::mul(a, b).to_vector<float>(0);
 }
-// The prologue core's entry point. One object in, one out, with nothing
-// remembered between dispatches but the running reduction - which the epi
-// flag ends. Anything the tile does not carry itself would have to be
-// counted, and a count that drifts from what the stream pushes deadlocks.
+__attribute__((noinline)) float v_div(float a, float b)
+{
+    return vmul(v_bc(a), recip_f32(v_bc(b))).get(0);
+}
+static inline float v_mul(float a, float b) { return vmul(v_bc(a), v_bc(b)).get(0); }
+static inline float v_add(float a, float b) { return aie::add(v_bc(a), v_bc(b)).get(0); }
+static inline float v_max(float a, float b) { return aie::max(v_bc(a), v_bc(b)).get(0); }
+static inline float v_i2f(int i) { return aie::to_float(aie::broadcast<int32, 16>(i), 0).get(0); }
+// a > 0 for a finite value: the sign and the bits, as an integer
+static inline bool v_pos(float a) { int32_t w; __builtin_memcpy(&w, &a, 4); return w > 0; }
+
+// act-att.cc
+void quant_tile(const float *x, int n, int grp, int8_t *code);
+
 extern "C" {
 
-// `in` is the tile the dispatch before this one drained into - acc and nothing
-// else, so no host ever writes it. `hst` is the host's half: the residual,
-// gamma and the words that describe the tile, in a buffer no dispatch writes.
-// Keeping the two apart is the whole point: writes from the host and from the
-// array hold in one order only when they are not to the same buffer.
+// An attention layer's tile (act-att.cc, appended to this build).
+void act_att_tile(const int32_t *in, int32_t *out);
+
 void ggml_xdna_act_pro(const int32_t *in, const int32_t *hst, int32_t *out)
 {
     const int flags = hst[ACT_TILE / 4 - 2];
-    if (!((flags >> 4) & 1)) {
-        // Not a raw tile: pass it through. From the host's half when there are
-        // two buffers - it is the authoritative description, and the tiles are
-        // written only by a dispatch, which does not write the header at all.
-        const int32_t *src = (hst == in) ? in : hst;
-        for (int i = 0; i < ACT_TILE / 4; i++) {
-            out[i] = src[i];
-        }
+    if ((flags >> 5) & 1) {
+        act_att_tile(in, out);
         return;
     }
-    if (hst[ACT_FIRST_W]) {
-        g_ss = 0.0f;
-    }
-    uint8_t *o8 = (uint8_t *) out;
-    // One buffer for both inputs means the tile carries its own host half, at
-    // the offset the host packs it to; two buffers mean the host half starts
-    // at zero in its own.
-    const uint8_t *h8 = (const uint8_t *) hst +
-                        (hst == in ? 4 * K_TILE_Q4 : 0);
-    act_prologue((const uint8_t *) in, h8, (int8_t *) o8,
-                 (float *) (o8 + K_TILE_Q4),
-                 (float *) (o8 + K_TILE_Q4) + K_TILE_Q4 / Q4_GROUP);
-    out[ACT_TILE / 4 - 1] = hst[ACT_TILE / 4 - 1];
-    out[ACT_TILE / 4 - 2] = flags;
-    if (flags & 1) {
-        // Last tile of the chunk: the reduction is complete, so the scalar
-        // the epilogue needs travels with it. Every chunk replays the same
-        // tiles, so the sum starts again here.
-        const int d = hst[ACT_D_W];
-        const float mean = g_ss / (float) (d > 0 ? d : 1);
-        ((float *) out)[ACT_RMS_W] = 1.0f / aie::sqrt(mean + 1e-6f);
+    // Every other tile passes through. (The raw tiles the host half-packed
+    // for this tile to finish are gone: the layer boundaries are rows now,
+    // act-att.cc's mode 4.)
+    (void) hst;
+    for (int i = 0; i < ACT_TILE / 4; i += 16) {
+        aie::store_v(out + i, aie::load_v<16>(in + i));
     }
 }
 
@@ -486,8 +379,9 @@ static void gemv_q4g32(const uint8_t *w, const int32_t *a32, float *out)
     // because the same artifact also serves the per-op path, where the host
     // reads the f32 back.
     const int qout = (flags >> 2) & 1;
-    // Bit 3: group the tile it writes by 16 rather than 32, because the
-    // dispatch that reads it is q8g16.
+    // Bit 3: group the tile it writes by Q8_GROUP rather than Q4_GROUP,
+    // because the dispatch that reads it is the 8-bit form (the two are both
+    // 32 now, so it changes nothing).
     const int g16 = (flags >> 3) & 1;
     constexpr int BLK_B = N_CORE * 4;              // bytes a core's object holds
     constexpr int GPB   = (N_CORE / 2) / Q4_GROUP; // groups in one such block
@@ -626,7 +520,7 @@ static void gemv_q4g32(const uint8_t *w, const int32_t *a32, float *out)
     event1();
 }
 
-// q8g16: signed 8-bit codes, w = q*d.
+// The 8-bit form: signed 8-bit codes, w = q*d + m, groups of Q8_GROUP.
 static void gemv_q8g16(const uint8_t *w, const int32_t *a32, float *out)
 {
     constexpr int K_TILE = K_TILE_Q8;

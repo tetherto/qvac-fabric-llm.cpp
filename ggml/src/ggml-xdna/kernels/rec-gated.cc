@@ -98,11 +98,10 @@ extern "C" void ggml_xdna_gated_fin(uint8_t * out) {
     // The same codes again in the GEMV's activation tile layout, but with a
     // scale and a code sum per group of 32 rather than one for the row: a
     // group scale is local to the values a core holds, which is what the
-    // projection's kernel reads. Only the 4-bit weight form is covered - the
-    // 8-bit one groups by 16 - so the host keeps the other.
+    // projection's kernel reads, in either weight form's tiles.
     {
 #if defined(GATED_FMT) && GATED_FMT == 1
-        // The 8-bit weight form: tiles of 128 codes, groups of 16, the layout
+        // The 8-bit weight form: tiles of 128 codes, groups of 32, the layout
         // the projection's q8 kernel reads. Which form the model needs is a
         // property of its ssm_out weights - Q5_K and Q6_K are the 8-bit form -
         // so the design is built per model (GATED_FMT=1) and the tag covers it.
@@ -121,6 +120,10 @@ extern "C" void ggml_xdna_gated_fin(uint8_t * out) {
         int32_t * hdr = (int32_t *)act;
         hdr[0] = NT;
         hdr[1] = 1;
+        // words 2 and 3 select the pool's attention mode (attn-dec.cc): this
+        // object is reused, so they are cleared, never left to its last use
+        hdr[2] = 0;
+        hdr[3] = 0;
         hdr[ACT_TILE / 4 - 2] = 0;
 #if defined(GATED_FMT) && GATED_FMT == 1
         hdr[ACT_TILE / 4 - 1] = 1;
@@ -132,20 +135,26 @@ extern "C" void ggml_xdna_gated_fin(uint8_t * out) {
             int8 * code = (int8 *)tile;
 #if defined(GATED_FMT) && GATED_FMT == 1
             float * gsum = (float *)(tile + 128);
-            float * gd = gsum + 8;
-            for (int g = 0; g < 8; g++) {
-                const float * v = gbuf + t * 128 + g * 16;
+            float * gd = gsum + 4;
+            for (int g = 0; g < 4; g++) {
+                const float * v = gbuf + t * 128 + g * 32;
                 const auto v0 = aie::load_v<16>(v);
-                const auto a0 = aie::bit_and(v0.cast_to<int32>(), absmask)
-                                    .cast_to<float>();
+                const auto v1 = aie::load_v<16>(v + 16);
+                const auto a0 = aie::max(
+                    aie::bit_and(v0.cast_to<int32>(), absmask).cast_to<float>(),
+                    aie::bit_and(v1.cast_to<int32>(), absmask).cast_to<float>());
                 const float ga = aie::reduce_max(a0);
                 const float gdv = ga > 0.0f ? ga / 127.0f : 1.0f;
                 const auto ginv = aie::broadcast<float, 16>(1.0f / gdv);
                 auto q0 = aie::mul(v0, ginv).to_vector<float>();
+                auto q1 = aie::mul(v1, ginv).to_vector<float>();
                 q0 = aie::min(aie::max(q0, vlo), vhi);
+                q1 = aie::min(aie::max(q1, vlo), vhi);
                 const auto i0 = aie::sub(aie::add(q0, magic).cast_to<int32>(), magici);
-                aie::store_v(code + g * 16, aie::pack(aie::pack(i0)));
-                gsum[g] = (float) aie::reduce_add(i0);
+                const auto i1 = aie::sub(aie::add(q1, magic).cast_to<int32>(), magici);
+                aie::store_v(code + g * 32, aie::pack(aie::pack(i0)));
+                aie::store_v(code + g * 32 + 16, aie::pack(aie::pack(i1)));
+                gsum[g] = (float) (aie::reduce_add(i0) + aie::reduce_add(i1));
                 gd[g] = gdv;
             }
             ((int32_t *)tile)[ACT_TILE / 4 - 2] = 0;

@@ -2,6 +2,7 @@
 #include "xdna-gemv.h"
 #include "xdna-seq.h"
 #include "xdna-util.h"
+#include "xdna-prof.h"
 
 #include "ggml-impl.h"
 #include "ggml.h"
@@ -15,6 +16,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <memory>
 #include <string>
 
@@ -206,7 +208,9 @@ xdna_rec_core * xdna_rec_core_create(xdna_device * dev, const xdna_rec_geom & g,
     }
 
     core->feed = xdna_buffer_alloc(dev, (size_t) g.feed_bytes);
-    core->x    = xdna_buffer_alloc(dev, (size_t) g.x_bytes);
+    // Past x, room for the rest of the prologue's tail object when the gates
+    // are the array's (xdna_seq_row_io_gates: 5 more head-sets of it).
+    core->x    = xdna_buffer_alloc(dev, (size_t) g.x_bytes * 7);
     // Sized by the larger of the two gated layouts, like `out` below: the
     // activation the norm writes has to fit whichever one the artifact is.
     core->pkvb = xdna_buffer_alloc(dev,
@@ -244,6 +248,8 @@ void xdna_rec_core_free(xdna_rec_core * core) {
     // Allocated by xdna_rec_core_fuse_so, which runs once per recurrent layer:
     // without this every model load leaks one of these per layer.
     xdna_buffer_free(core->gbuf);
+    xdna_buffer_free(core->w6);
+    xdna_buffer_free(core->a7);
     if (core->kern) {
         xdna_kernel_free(core->kern);
     }
@@ -273,6 +279,28 @@ bool xdna_rec_core_begin(xdna_rec_core * core, const void * feed0,
     }
     xdna_buffer_sync_to_device(core->azg);
     core->token = 0;
+    return true;
+}
+
+bool xdna_rec_core_read_state(xdna_rec_core * core, float * conv_hist, float * ssm) {
+    using namespace xdna_rec_pack;
+    if (!core || !core->feed || !core->gstate || !conv_hist || !ssm) {
+        return false;
+    }
+    xdna_buffer_sync_from_device(core->feed);
+    const float * feed = (const float *) core->feed->bo.map();
+    for (int64_t b = 0; b < core->g.feed_blocks; b++) {
+        std::memcpy(conv_hist + (size_t) b * SV * 3,
+                    feed + (size_t) b * core->g.feed_block_floats,
+                    (size_t) SV * 3 * sizeof(float));
+    }
+    xdna_buffer_sync_from_device(core->gstate);
+    const uint16_t * st = (const uint16_t *) core->gstate->bo.map();
+    const size_t n = (size_t) core->g.state_bytes / sizeof(float);
+    for (size_t i = 0; i < n; i++) {
+        const uint32_t w = (uint32_t) st[i] << 16;
+        std::memcpy(ssm + i, &w, sizeof(float));
+    }
     return true;
 }
 
@@ -307,8 +335,132 @@ size_t xdna_rec_core_out_off(const xdna_rec_core * core) {
 const void * xdna_rec_core_act(const xdna_rec_core * core) {
     // The gated stage drains the activation into the projection's own
     // argument, so that is where it is read from.
+    if (core && core->a7) {
+        return core->a7->bo.map();
+    }
     return core && core->so_gemv ? core->so_gemv->a->bo.map() : nullptr;
 }
+
+bool xdna_rec_core_set_inproj(xdna_rec_core * core, const xdna_gemv_geom & geom,
+                              const std::vector<uint8_t> & packed) {
+    if (!core || core->so_fused || !geom.valid() || !geom.fused_v ||
+        packed.size() != geom.weight_bytes()) {
+        return false;
+    }
+    core->in_geom   = geom;
+    core->in_packed = packed;
+    core->inproj    = true;
+    return true;
+}
+
+bool xdna_rec_core_set_rows(xdna_rec_core * core, xdna_buffer * res,
+                            const float * gamma_attn, float eps_attn,
+                            const float * gamma_post, float eps_post) {
+    if (!core || !core->inproj || core->so_fused || !res || !gamma_attn || !gamma_post ||
+        core->in_geom.K != XDNA_RES_D) {
+        return false;
+    }
+    core->rows = true;
+    core->res = res;
+    core->g_attn.assign(gamma_attn, gamma_attn + XDNA_RES_D);
+    core->g_post.assign(gamma_post, gamma_post + XDNA_RES_D);
+    core->eps_attn = eps_attn;
+    core->eps_post = eps_post;
+    return true;
+}
+
+bool xdna_rec_core_set_gates(xdna_rec_core * core, const float * w_alpha,
+                              const float * w_beta, const float * dt, const float * a) {
+    using namespace xdna_rec_pack;
+    if (!core || !core->rows || core->so_fused || !w_alpha || !w_beta || !dt || !a) {
+        return false;
+    }
+    // [constants: dt[16], a[16], the scale, padded to 512 words | 32 rows]
+    const size_t n = 512 * 4 + (size_t) 2 * NVH * XDNA_RES_D * 2;
+    core->ab.assign(n, 0);
+    float * c = (float *) core->ab.data();
+    for (int h = 0; h < NVH; h++) {
+        c[h] = dt[h];
+        c[NVH + h] = a[h];
+    }
+    c[2 * NVH] = 1.0f / std::sqrt((float) SV);
+    uint16_t * w = (uint16_t *) (core->ab.data() + 512 * 4);
+    for (size_t i = 0; i < (size_t) NVH * XDNA_RES_D; i++) {
+        w[i] = xdna_bf16(w_alpha[i]);
+        w[(size_t) NVH * XDNA_RES_D + i] = xdna_bf16(w_beta[i]);
+    }
+    core->gates = true;
+    return true;
+}
+
+bool xdna_rec_core_inproj_act(xdna_rec_core * core, const float * act) {
+    if (!core || !core->inproj || !core->a7 || !act) {
+        return false;
+    }
+    const size_t n = core->in_geom.act_bytes();
+    core->in_host_a.resize(n);
+    xdna_gemv_pack_act_into(core->in_geom, act, core->in_host_a.data());
+    std::memcpy((uint8_t *) core->a7->bo.map() + core->in_a_off,
+                core->in_host_a.data(), n);
+    // Only this window: the ssm_out half of the buffer is the array's.
+    xdna_buffer_sync_to_device_range(core->a7, n, core->in_a_off);
+    return true;
+}
+
+namespace {
+
+// The in-projection as the head of a fused stream. Its descriptors start from
+// zero on every column - nothing has run before it - and it waits for its own
+// drains, so the core's stream after it can hand the same ids out again.
+bool build_inproj_head(const xdna_rec_core * core, xdna_seq * seq) {
+    using namespace xdna_rec_pack;
+    const xdna_gemv_geom & g = core->in_geom;
+    const int n_o = xdna_gemv_out_streams(g);
+    const int sw  = xdna_gemv_stream_floats(g);
+    const int sv  = (int) core->g.sv;
+    if (n_o < 2 || n_o > XDNA_GEMV_COLS || sv <= 0 || sw % sv != 0 ||
+        sv != SV) {
+        return false;
+    }
+    const uint32_t nb    = (uint32_t) (sw / sv);   // blocks a stream carries per chunk
+    const uint32_t fblk  = (uint32_t) core->g.feed_block_floats * 4;
+    const uint32_t fq    = (uint32_t) core->g.feed_qkv_off * 4;
+    xdna_gemv_out_dest dst[XDNA_GEMV_COLS];
+    for (int c = 0; c < n_o - 1; c++) {
+        // Stream c of chunk j holds qkv blocks (j*(n_o-1) + c)*nb ...: each
+        // one lands in its block's F_Q window.
+        dst[c].arg          = 0;
+        dst[c].off          = (uint32_t) c * nb * fblk + fq;
+        dst[c].blk_floats   = (uint32_t) sv;
+        dst[c].n_blk        = nb;
+        dst[c].blk_stride   = fblk;
+        dst[c].chunk_stride = (uint32_t) (n_o - 1) * nb * fblk;
+    }
+    // The last stream holds z, nb heads per chunk, into each head's z lane.
+    xdna_gemv_out_dest & zd = dst[n_o - 1];
+    zd.arg          = 4;
+    zd.off          = (uint32_t) SV * 4;
+    zd.blk_floats   = (uint32_t) sv;
+    zd.n_blk        = nb;
+    zd.blk_stride   = (uint32_t) AZGN * 4;
+    zd.chunk_stride = nb * (uint32_t) AZGN * 4;
+
+    xdna_gemv_seq_opts opt;
+    opt.bd_base  = 0;
+    opt.w_arg    = 6;
+    opt.w_off    = (uint32_t) core->in_w_off;
+    opt.act_arg  = 7;
+    opt.act_off  = (uint32_t) core->in_a_off;
+    opt.o_arg    = 8;
+    opt.out_dest = dst;
+    return xdna_gemv_seq_build(seq, g, &opt);
+}
+
+size_t align_up(size_t v, size_t a) {
+    return (v + a - 1) / a * a;
+}
+
+} // namespace
 
 // The core and the ssm_out projection as one dispatch. Two dispatches measure
 // 282 + 109 us a layer where the merged one measures 339, which is the array's
@@ -355,6 +507,75 @@ bool xdna_rec_core_fuse_so(xdna_rec_core * core, xdna_kernel_pool * pool,
     // the gated stage has just written, so the fused stream reads it where it
     // lies instead of copying it out and back.
     xdna_seq seq = core->base_seq;
+    if (core->inproj) {
+        // [in-projection | core | ssm_out]: the head drains qkv and z where
+        // the core's fills read them, then the core's own stream as built.
+        core->in_w_off = align_up(so->geom.weight_bytes(), 4096);
+        core->in_a_off = align_up(so->geom.act_bytes(), 4096);
+        xdna_seq head = core->base_seq;
+        head.ops.clear();
+        head.n_instr = 0;
+        for (uint32_t & b : head.bd_used) {
+            b = 0;
+        }
+        if (core->rows) {
+            // its input: h = F + A into H, rms_norm(h) * gamma into its tiles
+            core->g_attn_off = align_up(core->in_a_off + core->in_geom.act_bytes(), 4096);
+            core->g_post_off = core->g_attn_off + (size_t) XDNA_RES_D * sizeof(float);
+            if (core->gates) {
+                using namespace xdna_rec_pack;
+                // after the in-projection's weights, which follow ssm_out's
+                core->ab_off = align_up(core->in_w_off + core->in_geom.weight_bytes(), 4096);
+                xdna_seq_row_io_gates(&head, 9, XDNA_RES_F, XDNA_RES_A, 7,
+                                      (uint32_t) core->g_attn_off, XDNA_RES_H,
+                                      6, (uint32_t) core->ab_off, (uint32_t) (core->ab.size() / 4),
+                                      1, (uint32_t) (3 * SV * 4), (uint32_t) HEADNORM, (uint32_t) NVH);
+            } else {
+                xdna_seq_row_io(&head, 9, XDNA_RES_F, XDNA_RES_A, 7, (uint32_t) core->g_attn_off,
+                                XDNA_RES_H);
+            }
+        }
+        if (!build_inproj_head(core, &head)) {
+            GGML_LOG_ERROR("%s: in-projection head: stream build failed\n", "xdna-rec");
+            return false;
+        }
+        if (core->rows) {
+            xdna_seq_row_wait(&head);
+        }
+        // ssm_out's weights before the core's stages, not after: the pool is
+        // idle while they run and the weight channels are the pool's own, so
+        // the fill runs as far ahead as the MemTile's fifo lets it. Its
+        // descriptors are the ones it always had, after the core's: the head
+        // has been waited for, and the FFN's row reserves the top of the file
+        // (xdna_seq_row_io) while ssm_out is still in flight.
+        uint32_t w_used[XDNA_SEQ_MAX_COLS] = {};
+        {
+            xdna_seq w = head;
+            w.ops.clear();
+            w.n_instr = 0;
+            for (int c = 0; c < XDNA_SEQ_MAX_COLS; c++) {
+                w.bd_used[c] = core->base_seq.bd_used[c];
+            }
+            xdna_gemv_seq_opts wo;
+            wo.bd_base = -1;
+            wo.w_arg   = 6;
+            wo.w_off   = 0;
+            wo.stages  = 1;
+            if (!xdna_gemv_seq_build(&w, so->geom, &wo)) {
+                return false;
+            }
+            head.ops.insert(head.ops.end(), w.ops.begin(), w.ops.end());
+            head.n_instr += w.n_instr;
+            std::copy(std::begin(w.bd_used), std::end(w.bd_used), std::begin(w_used));
+        }
+        head.ops.insert(head.ops.end(), core->base_seq.ops.begin(),
+                        core->base_seq.ops.end());
+        head.n_instr += core->base_seq.n_instr;
+        for (int c = 0; c < XDNA_SEQ_MAX_COLS; c++) {
+            head.bd_used[c] = std::max(core->base_seq.bd_used[c], w_used[c]);
+        }
+        seq = head;
+    }
     // Two rules decide this mapping. Only the low argument indices can be
     // patched - the same stream naming arguments six through eight times out
     // where naming zero through two runs - so the two halves share the core's
@@ -375,19 +596,65 @@ bool xdna_rec_core_fuse_so(xdna_rec_core * core, xdna_kernel_pool * pool,
     // and a tile holds K_TILE = 256, so they line up one to one, and the first
     // tile is the header. Nothing of the projection's result reaches the host
     // between the two dispatches after this.
-    if (ffn && xdna_gemv_pair_raw_act(ffn)) {
+    if (core->rows && core->inproj && ffn) {
+        // into S: the FFN's row reads it
+        opt.o_arg   = 9;
+        opt.out_off = XDNA_RES_S;
+        core->so_to_act = true;
+    } else if (ffn && xdna_gemv_pair_raw_act(ffn)) {
         opt.out_off = XDNA_GEMV_ACT_TILE;
         opt.out_stream_stride = XDNA_GEMV_ACT_TILE;
         core->so_to_act = true;
     }
+    opt.skip_w = core->inproj;   // queued before the core's stages
     if (!xdna_gemv_seq_build(&seq, so->geom, &opt)) {
         return false;
     }
-    // The FFN is a dispatch of its own after this one: appending it to the
-    // same stream needs its activation's host half written before the
-    // dispatch that drains acc into the same buffer, and that order does not
-    // hold on this platform.
+    // The FFN after it, in the same stream: the projection has just drained
+    // into its raw tiles, and their host half - the residual and gamma - is
+    // written before the dispatch starts (xdna_gemv_pair_prep_raw), so the
+    // stream has everything the prologue reads. Its weights follow the
+    // in-projection's in argument 6, and its output lands in the tail of its
+    // own activation buffer (argument 8), since it has no argument left.
+    // GGML_XDNA_FUSE_FFN=0 keeps it a dispatch of its own.
     core->ffn_fused = false;
+    size_t ffn_w_off = 0;
+    const bool fuse_ffn = core->inproj && core->so_to_act && ffn &&
+                          !(getenv("GGML_XDNA_FUSE_FFN") &&
+                            getenv("GGML_XDNA_FUSE_FFN")[0] == '0');
+    if (fuse_ffn) {
+        ffn_w_off = align_up(core->in_w_off + core->in_geom.weight_bytes(), 4096);
+        if (core->gates) {
+            ffn_w_off = align_up(core->ab_off + core->ab.size(), 4096);
+        }
+        xdna_gemv_pair_opts po;
+        po.w_arg   = 6;
+        po.w_base  = (uint32_t) ffn_w_off;
+        po.a_arg   = 8;
+        po.a_base  = 0;
+        po.o_arg   = 8;
+        po.o_base  = (uint32_t) ffn->o_tail_off;
+        po.bd_base = 0;
+        po.act_replay = true;
+        if (core->rows) {
+            // its input: h_attn = H + S into A, rms_norm(h_attn) * gamma
+            // into its tiles, per chunk in DDR; its output into F
+            xdna_seq_row_io(&seq, 9, XDNA_RES_S, XDNA_RES_H, 7, (uint32_t) core->g_post_off,
+                            XDNA_RES_A);
+            po.o_arg = 9;
+            po.o_base = XDNA_RES_F;
+            po.act_replay = false;
+        }
+        if (!xdna_gemv_seq_build_pair(&seq, ffn->g1, ffn->g2, ffn->w2_off,
+                                      ffn->a2_off, &po)) {
+            GGML_LOG_ERROR("%s: FFN pair: stream build failed\n", "xdna-rec");
+            return false;
+        }
+        if (core->rows) {
+            xdna_seq_row_wait(&seq);
+        }
+        core->ffn_fused = true;
+    }
     const std::vector<uint32_t> words = xdna_seq_build(&seq);
     if (words.empty()) {
         return false;
@@ -400,7 +667,18 @@ bool xdna_rec_core_fuse_so(xdna_rec_core * core, xdna_kernel_pool * pool,
     // lazily in the middle of NPU work. That is what made the fused dispatch
     // time out at random: the same stream would run or hang from one process
     // to the next.
-    core->so_kern = pool ? xdna_kernel_pool_get_built(pool, "rec_core_so",
+    // Shared by name, so the name has to say which stream it is: layers whose
+    // weights pack into different formats build different streams (the FFN's
+    // down projection is Q4_K in some layers and Q6_K in others), and a
+    // layer bound to another's stream runs its own buffers through the wrong
+    // shapes - garbage, or a hang.
+    uint64_t h = 1469598103934665603ull;
+    for (uint32_t v : words) {
+        h = (h ^ v) * 1099511628211ull;
+    }
+    char kname[48];
+    snprintf(kname, sizeof(kname), "rec_core_so_%016llx", (unsigned long long) h);
+    core->so_kern = pool ? xdna_kernel_pool_get_built(pool, kname,
                                                       stem.c_str(),
                                                       words.data(), words.size())
                          : nullptr;
@@ -421,22 +699,55 @@ bool xdna_rec_core_fuse_so(xdna_rec_core * core, xdna_kernel_pool * pool,
     }
     core->gbuf_out_off = (size_t) opt.out_off;
     xdna_buffer * tiles = core->so_to_act ? xdna_gemv_pair_act_buf(ffn) : so->o;
+    xdna_buffer * wb = so->w;
+    xdna_buffer * abuf = so->a;
+    if (core->inproj) {
+        // One buffer per argument, both projections in it.
+        const size_t ffn_wb = core->ffn_fused ? ffn->w2_off + ffn->g2.weight_bytes() : 0;
+        const size_t wn = core->ffn_fused ? ffn_w_off + ffn_wb
+                                          : core->in_w_off + core->in_geom.weight_bytes();
+        const size_t an = core->rows ? core->g_post_off + (size_t) XDNA_RES_D * sizeof(float)
+                                     : core->in_a_off + core->in_geom.act_bytes();
+        core->w6 = xdna_buffer_alloc(core->dev, wn);
+        core->a7 = xdna_buffer_alloc(core->dev, an);
+        if (!core->w6 || !core->a7) {
+            return false;
+        }
+        uint8_t * w = (uint8_t *) core->w6->bo.map();
+        std::memset(w, 0, wn);
+        std::memcpy(w, so->w->bo.map(), so->geom.weight_bytes());
+        std::memcpy(w + core->in_w_off, core->in_packed.data(), core->in_packed.size());
+        if (core->gates) {
+            std::memcpy(w + core->ab_off, core->ab.data(), core->ab.size());
+        }
+        if (core->ffn_fused) {
+            std::memcpy(w + ffn_w_off, ffn->w->bo.map(), ffn_wb);
+        }
+        xdna_buffer_sync_to_device(core->w6);
+        std::memset(core->a7->bo.map(), 0, an);
+        std::vector<uint8_t>().swap(core->in_packed);
+        wb = core->w6;
+        abuf = core->a7;
+    }
     xdna_buffer * a10[10] = { core->feed, core->x, core->pkvb, core->gstate,
-                              core->azg, core->out, so->w, so->a, tiles,
-                              tiles };
-    core->so_run = xdna_kernel_run_make(core->so_kern, a10, 9);
+                              core->azg, core->out, wb, abuf, tiles,
+                              core->rows ? core->res : tiles };
+    core->so_run = xdna_kernel_run_make(core->so_kern, a10, core->rows ? 10 : 9);
+    core->so_args.assign(a10, a10 + (core->rows ? 10 : 9));
     // The projection reads its activation from the window of this buffer that
     // the gated stage writes in the same dispatch. On the first token there is
     // nothing there yet, and a zero tile count means the cores never take the
     // weights the stream has already pushed - so the dispatch waits forever on
     // transfers that cannot drain. Seed a valid empty activation once.
     {
-        xdna_buffer * ab = so->a;
+        xdna_buffer * ab = abuf;
         uint8_t * m = (uint8_t *) ab->bo.map() + opt.act_off;
         std::memset(m, 0, (size_t) so->geom.act_bytes());
         int32_t * h = (int32_t *) m;
         h[0] = so->geom.n_tiles();
         h[1] = so->geom.n_out();
+        h[2] = 0;   // attention mode off (attn-dec.cc)
+        h[3] = 0;
         for (int t = 0; t <= so->geom.n_tiles(); t++) {
             int32_t * tl = (int32_t *) (m + (size_t) t * XDNA_GEMV_ACT_TILE);
             tl[XDNA_GEMV_ACT_TILE / 4 - 1] =
@@ -445,6 +756,27 @@ bool xdna_rec_core_fuse_so(xdna_rec_core * core, xdna_kernel_pool * pool,
                 (t == so->geom.n_tiles() && so->geom.epilogue) ? 1 : 0;
         }
         xdna_buffer_sync_to_device(ab);
+        if (core->rows) {
+            // The two rows' tiles and gammas, fixed: the prologue takes the
+            // rest from the residual rows every token.
+            uint8_t * a7m = (uint8_t *) core->a7->bo.map();
+            if (!xdna_gemv_row_act(core->in_geom, a7m + core->in_a_off, core->eps_attn, true, 0,
+                                   core->gates ? 2 * xdna_rec_pack::NVH : 0) ||
+                !xdna_gemv_row_act(ffn->g1, (uint8_t *) ffn->a->bo.map(), core->eps_post, true,
+                                   xdna_gemv_pair_last_flags(ffn))) {
+                return false;
+            }
+            std::memcpy(a7m + core->g_attn_off, core->g_attn.data(), (size_t) XDNA_RES_D * 4);
+            std::memcpy(a7m + core->g_post_off, core->g_post.data(), (size_t) XDNA_RES_D * 4);
+            xdna_buffer_sync_to_device(core->a7);
+            xdna_buffer_sync_to_device(ffn->a);
+        } else if (core->inproj) {
+            // A valid row for the head too, for the same reason.
+            std::vector<float> zero((size_t) core->in_geom.K, 0.0f);
+            if (!xdna_rec_core_inproj_act(core, zero.data())) {
+                return false;
+            }
+        }
     }
     core->so_gemv  = so;
     core->so_fused = true;
@@ -463,22 +795,37 @@ bool xdna_rec_core_ffn_fused(const xdna_rec_core * core) {
     return core && core->ffn_fused;
 }
 
+xrt::run * xdna_rec_core_launch(xdna_rec_core * core, int t) {
+    if (!core || !core->so_fused || !core->rows || !core->gates || !core->inproj ||
+        t != core->token || t == 0) {
+        return nullptr;
+    }
+    if (!xdna_run_submit(core->so_kern, core->so_run, core->so_args.data(),
+                         core->so_args.size())) {
+        return nullptr;
+    }
+    core->token = t + 1;
+    return &core->so_run;
+}
+
 bool xdna_rec_core_run(xdna_rec_core * core, int t, const void * qkv,
                        const void * x, const float * z, int8_t * aq,
                        float * d_a) {
     using namespace xdna_rec_pack;
-    if (!core || !core->kern || t != core->token || !x || !z || !aq || !d_a) {
+    if (!core || !core->kern || t != core->token || !x || (!z && !core->inproj) ||
+        !aq || !d_a) {
         GGML_LOG_ERROR("%s: core run: bad call (t=%d token=%d)\n", "xdna-rec", t,
                        core ? core->token : -1);
         return false;
     }
-    if (t > 0) {
+    if (t > 0 && !core->inproj) {
         if (!qkv) {
             GGML_LOG_ERROR("%s: core run: t>0 needs the qkv window\n", "xdna-rec");
             return false;
         }
         // Upload only the F_Q qkv window of each conv block: the F_H history
         // (device conv state) is never written by the host after t=0.
+        xdna_prof::section_timer st("rec: feed qkv windows (memcpy+sync)");
         char * map = (char *) core->feed->bo.map();
         const char * src = (const char *) qkv;
         const size_t win_bytes = (size_t) core->g.sv * sizeof(float);
@@ -488,21 +835,29 @@ bool xdna_rec_core_run(xdna_rec_core * core, int t, const void * qkv,
             core->feed->bo.sync(XCL_BO_SYNC_BO_TO_DEVICE, win_bytes, off);
         }
     }
-    upload(core->x, x);
-    // Upload the per-token z into the azg z lanes (head h at h*AZGN + SV).
-    // The attn lanes are the array's own output from the previous token and
-    // the gamma/hh lanes were seeded once, so pull the buffer back before
-    // writing the z lanes: the flush below covers the whole buffer and would
-    // otherwise put a stale host image over the attn lanes. The gdn stage does
-    // rewrite them before the gated phase reads them, but nothing should
-    // depend on that ordering for the buffer to be correct.
-    xdna_buffer_sync_from_device(core->azg);
-    float * azg = (float *) core->azg->bo.map();
-    for (int h = 0; h < NVH; h++) {
-        std::memcpy(azg + (int64_t) h * AZGN + SV, z + (int64_t) h * SV,
-                    (size_t) SV * sizeof(float));
+    if (!core->gates) {
+        xdna_prof::section_timer st("rec: x upload");
+        std::memcpy(core->x->bo.map(), x, (size_t) core->g.x_bytes);
+        xdna_buffer_sync_to_device_range(core->x, (size_t) core->g.x_bytes, 0);
     }
-    xdna_buffer_sync_to_device(core->azg);
+    xdna_prof::section_timer st_z("rec: azg z lanes (sync back+copy+sync)");
+    if (!core->inproj) {
+        // Upload the per-token z into the azg z lanes (head h at h*AZGN + SV).
+        // The attn lanes are the array's own output from the previous token and the
+        // gamma/hh lanes were seeded once, so pull the buffer back before writing
+        // the z lanes: the flush below covers the whole buffer and would otherwise
+        // put a stale host image over the attn lanes. The gdn stage does rewrite
+        // them before the gated phase reads them, but nothing should depend on that
+        // ordering for the buffer to be correct.
+        xdna_buffer_sync_from_device(core->azg);
+        float * azg = (float *) core->azg->bo.map();
+        for (int h = 0; h < NVH; h++) {
+            std::memcpy(azg + (int64_t) h * AZGN + SV, z + (int64_t) h * SV,
+                        (size_t) SV * sizeof(float));
+        }
+        xdna_buffer_sync_to_device(core->azg);
+    }
+    st_z.stop();
 
     // The fused run (conv+norm+gdn+gated, and the ssm_out projection when it
     // is appended): the kernel reads the feed, x tails and the azg z lanes,
@@ -517,6 +872,7 @@ bool xdna_rec_core_run(xdna_rec_core * core, int t, const void * qkv,
     // array's write from the previous token's contents.
     xdna_buffer_mark(core->out, (size_t) KGATE + sizeof(float),
                      (size_t) KGATE * 4);
+    xdna_prof::section_timer st_run("rec: core dispatch (restart+wait)");
     if (core->so_fused) {
         if (!xdna_run_restart(core->so_run) || !xdna_run_wait(core->so_run)) {
             return false;
@@ -528,6 +884,8 @@ bool xdna_rec_core_run(xdna_rec_core * core, int t, const void * qkv,
         }
     }
 
+    st_run.stop();
+    xdna_prof::section_timer st_out("rec: out readback");
     // out layout: [gated f32 scratch KGATE*4][aq int8 KGATE][d_a f32]. Read
     // against the mark set before the dispatch: a run reports completion
     // before its last writes are readable, and the codes are exactly such a

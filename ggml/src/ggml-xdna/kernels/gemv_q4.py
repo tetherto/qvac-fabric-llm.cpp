@@ -42,7 +42,7 @@ import ml_dtypes
 import numpy as np
 
 import aie.iron as iron
-from aie.iron import CompileTime, In, ObjectFifo, Out, Program, Runtime, Worker
+from aie.iron import Buffer, CompileTime, In, ObjectFifo, Out, Program, Runtime, Worker
 from aie.iron.controlflow import range_
 from aie.iron.kernel import ExternalFunction
 from aie.iron.kernels._common import _include_dirs
@@ -53,7 +53,19 @@ from aie.utils.hostruntime.argparse import add_compile_args
 from aie.utils.hostruntime.cli import run_design_cli
 from aie.utils.verify import assert_pass
 
-from wfmt import Q4_GROUP, Q8_GROUP, group_size, split_pairs
+from wfmt import Q4_GROUP, split_pairs
+
+# The decode GEMV's 8-bit groups are 32 values (the prologue's tile cache
+# is 64-byte strided for them), not wfmt's 16 (the prefill's
+# dequant GEMM, which does not use them): every type it packs has per-32
+# parameters but Q6_K, and the f32 rescale a group costs is half the kernel's
+# arithmetic on that form, so a group of 16 paid it twice for nothing on Q5_K.
+Q8_GROUP = 32
+
+
+def group_size(fmt: str) -> int:
+    return Q4_GROUP if fmt == "q4g32" else Q8_GROUP
+
 
 CORES_PER_COL = 4
 # Which compute rows of a column the design places its cores on. Rows 2..5 are
@@ -94,27 +106,51 @@ def tile_bytes(fmt: str, k_tile: int, n_core: int) -> int:
     # it shares an artifact with, so both are given the larger record count and
     # the two sizes stay equal.
     nsup = max(1, (k_tile if fmt == "q4g32" else 2 * k_tile) // 256)
-    code = Q4_GROUP * vec // 2 if fmt == "q4g32" else Q8_GROUP * vec
+    if fmt != "q4g32":
+        # 32-value 8-bit groups make the tile smaller than the q4g32 one; it
+        # is padded to that size, the one object size the design streams.
+        return tile_bytes("q4g32", 2 * k_tile, n_core)
+    code = Q4_GROUP * vec // 2
     return lg * (ng * (code + 4 * vec) + nsup * 4 * vec * 2)
 
 
-def _kernels(fmt: str, k_tile: int, n_core: int):
-    src = (Path(__file__).resolve().parent / "gemv-q4.cc").read_text()
+# The epilogue's quantizer (store_quant in gemv-q4.cc) runs in vector lanes:
+# its scalar form pulled ~3 KB of software float into a program memory that
+# attention mode needs.
+# silu is exp from the exponent bits and a polynomial, and it shares its
+# reciprocal with the quantizer (recip_f32): 1.6 KB more for the same reason.
+def _kernel_flags(fmt: str, k_tile: int, n_core: int) -> list:
     # The kernel's tile size has to be the one the design streams. Taking it
     # from the table instead of the argument silently mismatched whenever
     # --k-tile was given, which reads as a device fault rather than a build
     # mistake.
     kt = {"q4g32": K_TILES["q4g32"], "q8g16": K_TILES["q8g16"]}
     kt[fmt] = k_tile
-    flags = [f"-DK_TILE_Q4={kt['q4g32']}", f"-DK_TILE_Q8={kt['q8g16']}",
-             f"-DACT_TILE={ACT_TILE}", f"-DN_CORE={n_core}",
-             f"-DQ4_GROUP={Q4_GROUP}", f"-DQ8_GROUP={Q8_GROUP}",
-             f"-DGEMV_VEC={vec_for(n_core)}",
-             # ACT_RAW builds the per-tile quantizer into the core (gemv_q4.cc),
-             # so a producer on the array can hand this dispatch numbers rather
-             # than codes. It costs about a kilobyte of a program memory that is
-             # already full, so it is off unless a design asks for it.
-             f"-DACT_RAW={int(__import__('os').environ.get('ACT_RAW', '0'))}"]
+    return [f"-DK_TILE_Q4={kt['q4g32']}", f"-DK_TILE_Q8={kt['q8g16']}",
+            f"-DACT_TILE={ACT_TILE}", f"-DN_CORE={n_core}",
+            f"-DQ4_GROUP={Q4_GROUP}", f"-DQ8_GROUP={Q8_GROUP}",
+            f"-DGEMV_VEC={vec_for(n_core)}",
+            # ACT_RAW builds the per-tile quantizer into the core (gemv_q4.cc),
+            # so a producer on the array can hand this dispatch numbers rather
+            # than codes. It costs about a kilobyte of a program memory that is
+            # already full, so it is off unless a design asks for it.
+            f"-DACT_RAW={int(__import__('os').environ.get('ACT_RAW', '0'))}"]
+
+
+# The prologue tile's own streams (act-att.cc): a side input from DDR and an
+# output to DDR - the attention layer's work and the layer boundary's rows,
+# a row quantized once and its tiles copied, the gates on its last tile -
+# output to DDR, on the shim channels the layer leaves free.
+PRO_SIDE_TY = np.ndarray[(512,), np.dtype[np.int32]]
+PRO_EMIT_TY = np.ndarray[(256,), np.dtype[np.int32]]
+PRO_CNT_TY = np.ndarray[(2,), np.dtype[np.int32]]
+PRO_SIDE_COL = 6
+PRO_EMIT_COL = 5
+
+
+def _kernels(fmt: str, k_tile: int, n_core: int):
+    src = (Path(__file__).resolve().parent / "gemv-q4.cc").read_text()
+    flags = _kernel_flags(fmt, k_tile, n_core)
 
     # The prologue is a build of its own: its quantizer is about a kilobyte of
     # program memory and the GEMV cores have none spare, so it is linked into
@@ -124,17 +160,20 @@ def _kernels(fmt: str, k_tile: int, n_core: int):
     pro_flags = [f for f in flags if not f.startswith("-DACT_RAW")] + \
                 ["-DACT_RAW=0", "-DACT_PRO=1"]
     digest = hashlib.sha256((src + "\0".join(flags)).encode()).hexdigest()[:8]
-    pdigest = hashlib.sha256((src + "\0".join(pro_flags)).encode()).hexdigest()[:8]
+    # The attention layer's prologue work (act-att.cc) shares the object.
+    psrc = src + "\n" + (Path(__file__).resolve().parent / "act-att.cc").read_text()
+    pdigest = hashlib.sha256((psrc + "\0".join(pro_flags)).encode()).hexdigest()[:8]
     w_ty = np.ndarray[(tile_bytes(fmt, k_tile, n_core),), np.dtype[np.uint8]]
     a_ty = np.ndarray[(ACT_TILE // 4,), np.dtype[np.int32]]
     o_ty = np.ndarray[(n_core,), np.dtype[np.float32]]
     a_raw_ty = np.ndarray[(ACT_TILE // 4,), np.dtype[np.int32]]
-    pro_tile = ExternalFunction(
-        "ggml_xdna_act_pro",
-        object_file_name=f"actpro_{n_core}_{pdigest}.o",
-        source_string=src,
-        arg_types=[a_raw_ty, a_raw_ty, a_raw_ty],
-        compile_flags=pro_flags)
+    pmk = lambda name, tys: ExternalFunction(
+        name, object_file_name=f"actpro_{n_core}_{pdigest}.o",
+        source_string=psrc, arg_types=tys, compile_flags=pro_flags)
+    pro_tile = (pmk("ggml_xdna_act_pro", [a_raw_ty, a_raw_ty, a_raw_ty]),
+                pmk("ggml_xdna_act_cnt", [a_raw_ty, PRO_CNT_TY]),
+                pmk("ggml_xdna_act_side", [PRO_SIDE_TY, a_raw_ty]),
+                pmk("ggml_xdna_act_emit", [PRO_EMIT_TY, a_raw_ty]))
     gemv = ExternalFunction(
         "ggml_xdna_gemv",
         object_file_name=f"gemv_{n_core}_{digest}.o",
@@ -154,6 +193,150 @@ def _kernels(fmt: str, k_tile: int, n_core: int):
         compile_flags=flags,
     )
     return gemv, zero, pro_tile
+
+
+def _kernels_lead(fmt: str, k_tile: int, n_core: int):
+    """The kernels of the lead core of a two-row pair (build_gemv's PAIR).
+
+    The lead's output object carries both cores' blocks, so its GEMV and zero
+    take a buffer twice n_core long. The C code writes n_core values through a
+    pointer either way; what differs is the buffer type the design declares,
+    and one symbol cannot be declared with two types - so the same source is
+    built again under another name."""
+    kdir = Path(__file__).resolve().parent
+    src = (kdir / "gemv-q4.cc").read_text()
+    zsrc = (kdir / "gemv-zero.cc").read_text()
+    msrc = (kdir / "gemv-merge.cc").read_text()
+    flags = _kernel_flags(fmt, k_tile, n_core)
+    gflags = flags + ["-Dggml_xdna_gemv=ggml_xdna_gemv_lead"]
+    zflags = flags + ["-Dggml_xdna_gemv_zero=ggml_xdna_gemv_zero_lead"]
+    dg = lambda s_, f_: hashlib.sha256((s_ + "\0".join(f_)).encode()).hexdigest()[:8]
+    w_ty = np.ndarray[(tile_bytes(fmt, k_tile, n_core),), np.dtype[np.uint8]]
+    a_ty = np.ndarray[(ACT_TILE // 4,), np.dtype[np.int32]]
+    o_ty = np.ndarray[(n_core,), np.dtype[np.float32]]
+    o2_ty = np.ndarray[(2 * n_core,), np.dtype[np.float32]]
+    gemv_l = ExternalFunction(
+        "ggml_xdna_gemv_lead",
+        object_file_name=f"gemvl_{n_core}_{dg(src, gflags)}.o",
+        source_string=src, arg_types=[w_ty, a_ty, o2_ty],
+        include_dirs=_include_dirs(), compile_flags=gflags)
+    zero_l = ExternalFunction(
+        "ggml_xdna_gemv_zero_lead",
+        object_file_name=f"gemv_zerol_{n_core}_{dg(zsrc, zflags)}.o",
+        source_string=zsrc, arg_types=[o2_ty],
+        include_dirs=_include_dirs(), compile_flags=zflags)
+    merge = ExternalFunction(
+        "ggml_xdna_gemv_merge",
+        object_file_name=f"gemv_merge_{n_core}_{dg(msrc, flags)}.o",
+        source_string=msrc, arg_types=[o_ty, o2_ty],
+        include_dirs=_include_dirs(), compile_flags=flags)
+    return gemv_l, zero_l, merge
+
+
+# The decode-attention kernels of the pool cores (attn-dec.cc): one object per
+# core, so the three functions share its state. The lead's emit writes into
+# its two-block output object, the partner's into the hand-over buffer.
+AD_PIECES = 33
+# att_chunk (mmul) tiles its chunk into a per-core scratch (bank 3) as bf16 for the
+# QK and PV matrix multiplies; word 514 of the first q tile skips the
+# arithmetic (a diagnostic of the DMA). The eighths of a converted row are
+# stored with constant extract indices.
+AD_SCR = 2 * 32 * 64
+
+
+def _kernels_att(fmt: str, k_tile: int, n_core: int, lead: bool):
+    kdir = Path(__file__).resolve().parent
+    src = (kdir / "attn-dec.cc").read_text()
+    sfx = "_lead" if lead else ""
+    flags = [f"-DACT_TILE={ACT_TILE}", f"-DN_CORE={n_core}"]
+    if lead:
+        flags += ["-Dggml_xdna_att_q=ggml_xdna_att_q_lead",
+                  "-Dggml_xdna_att_chunk=ggml_xdna_att_chunk_lead",
+                  "-Dggml_xdna_att_emit=ggml_xdna_att_emit_lead"]
+    dg = hashlib.sha256((src + "\0".join(flags)).encode()).hexdigest()[:8]
+    obj = f"attdec{sfx}_{n_core}_{dg}.o"
+    w_ty = np.ndarray[(tile_bytes(fmt, k_tile, n_core),), np.dtype[np.uint8]]
+    a_ty = np.ndarray[(ACT_TILE // 4,), np.dtype[np.int32]]
+    e_ty = np.ndarray[((2 if lead else 1) * n_core,), np.dtype[np.float32]]
+    mk = lambda name, tys: ExternalFunction(
+        name + sfx, object_file_name=obj, source_string=src, arg_types=tys,
+        include_dirs=_include_dirs(), compile_flags=flags)
+    s_ty = np.ndarray[(AD_SCR,), np.dtype[ml_dtypes.bfloat16]]
+    return (mk("ggml_xdna_att_q", [a_ty]), mk("ggml_xdna_att_chunk", [w_ty, s_ty]),
+            mk("ggml_xdna_att_emit", [e_ty]))
+
+
+def _core_lead_att(w_in, a_in, p_in, out, gemv, zero, merge, att_q, att_chunk, att_emit, scr):
+    # _core_lead, and after it the attention mode: header words 2 and 3 are
+    # the W objects to take (the core's index object and its chunks) and 1 to
+    # run it. A projection's header has both zero, so it never enters here.
+    hdr = a_in.acquire(1)
+    n_tiles = hdr[0]
+    n_out = hdr[1]
+    n_att = hdr[2]
+    att_on = hdr[3]
+    a_in.release(1)
+    for _ in range_(n_out):
+        o = out.acquire(1)
+        zero(o)
+        for _ in range_(n_tiles):
+            w = w_in.acquire(1)
+            a = a_in.acquire(1)
+            gemv(w, a, o)
+            w_in.release(1)
+            a_in.release(1)
+        p = p_in.acquire(1)
+        merge(p, o)
+        p_in.release(1)
+        out.release(1)
+    for _ in range_(att_on):
+        for _ in range_(2):
+            a = a_in.acquire(1)
+            att_q(a)
+            a_in.release(1)
+        for _ in range_(n_att):
+            w = w_in.acquire(1)
+            att_chunk(w, scr)
+            w_in.release(1)
+        for _ in range_(AD_PIECES):
+            o = out.acquire(1)
+            att_emit(o)
+            p = p_in.acquire(1)
+            merge(p, o)
+            p_in.release(1)
+            out.release(1)
+
+
+def _core_part_att(w_in, a_in, out, gemv, zero, att_q, att_chunk, att_emit, scr):
+    hdr = a_in.acquire(1)
+    n_tiles = hdr[0]
+    n_out = hdr[1]
+    n_att = hdr[2]
+    att_on = hdr[3]
+    a_in.release(1)
+    for _ in range_(n_out):
+        o = out.acquire(1)
+        zero(o)
+        for _ in range_(n_tiles):
+            w = w_in.acquire(1)
+            a = a_in.acquire(1)
+            gemv(w, a, o)
+            w_in.release(1)
+            a_in.release(1)
+        out.release(1)
+    for _ in range_(att_on):
+        for _ in range_(2):
+            a = a_in.acquire(1)
+            att_q(a)
+            a_in.release(1)
+        for _ in range_(n_att):
+            w = w_in.acquire(1)
+            att_chunk(w, scr)
+            w_in.release(1)
+        for _ in range_(AD_PIECES):
+            o = out.acquire(1)
+            att_emit(o)
+            out.release(1)
 
 
 # 3072 bytes of core stack, not the 1024 default. The epilogue keeps a
@@ -202,15 +385,49 @@ def _core(w_in, a_in, out, gemv, zero):
         out.release(1)
 
 
+def _core_lead(w_in, a_in, p_in, out, gemv, zero, merge):
+    # The lead of a two-row pair: its own block into the first half of the
+    # output object, then the partner's block - handed over through the memory
+    # the two tiles share - copied into the second half. One object leaves the
+    # column instead of two, which is the point: a MemTile takes four streams
+    # from the north, and the column's stages already spend three of them.
+    hdr = a_in.acquire(1)
+    n_tiles = hdr[0]
+    n_out = hdr[1]
+    a_in.release(1)
+    for _ in range_(n_out):
+        o = out.acquire(1)
+        zero(o)
+        for _ in range_(n_tiles):
+            w = w_in.acquire(1)
+            a = a_in.acquire(1)
+            gemv(w, a, o)
+            w_in.release(1)
+            a_in.release(1)
+        p = p_in.acquire(1)
+        merge(p, o)
+        p_in.release(1)
+        out.release(1)
+
+
 # The design body, separable from the Program it is wrapped in so the same
 # array configuration can be built on its own or alongside another design in
 # one xclbin (fused_layer.py). Returns what a Program needs: the workers, the
 # runtime argument list and the sequence over it.
 def build_gemv(FMT: str, K: int, N: int, K_TILE: int, COLS: int,
-               N_CORE: int = 0, ROWS_MAP: str = ROWS_ALL, OUT_GROUP: int = 0):
+               N_CORE: int = 0, ROWS_MAP: str = ROWS_ALL, OUT_GROUP: int = 0,
+               PAIR: bool = False, ATT: bool = False):
     # "2,3,4,5" for every column, or one such list per column separated by "|".
     rows_map = _rows_map(ROWS_MAP, COLS)
     ROWS = len(rows_map[0])
+    # PAIR: a column's two cores leave it as one stream. The second row's core
+    # hands its block to the first through the memory the two tiles share, and
+    # the first sends both - the same object, in the same order, a MemTile join
+    # of the two rows would make, so the host sees an ordinary two-row pool.
+    if PAIR and ROWS != 2:
+        raise ValueError(f"PAIR needs two rows a column, got {ROWS}")
+    if PAIR and any(abs(r[0] - r[1]) != 1 for r in rows_map):
+        raise ValueError(f"PAIR needs the two rows adjacent: {ROWS_MAP}")
     n_cores = COLS * ROWS
     # N_CORE fixes the core program; K and N only set the runtime counts. The
     # standalone path derives them from the shape it is asked to check.
@@ -245,6 +462,7 @@ def build_gemv(FMT: str, K: int, N: int, K_TILE: int, COLS: int,
     # object; the kernel casts the payload back to bytes.
     a_ty = np.ndarray[(ab // 4,), np.dtype[np.int32]]
     o_ty = np.ndarray[(n_core,), np.dtype[np.float32]]
+    o_col_ty = np.ndarray[(ROWS * n_core,), np.dtype[np.float32]]
 
     w_all_ty = np.ndarray[(COLS * n_out * NT * ROWS * tb,), np.dtype[np.uint8]]
     # The header object, then the K tiles once per output chunk. The repeats
@@ -271,11 +489,16 @@ def build_gemv(FMT: str, K: int, N: int, K_TILE: int, COLS: int,
     # Only where a column has one core: the four-row standalone design splits
     # a column's object four ways, and the extra descriptors that needs push
     # its output join past the MemTile's budget.
+    # In the merged design (PAIR) four, so ssm_out's weights and the FFN's
+    # first stream in while the core's stages hold the array - except on the
+    # last column, whose MemTile's descriptors the core's stages have taken
+    # (one more object there does not place; five anywhere does not either).
     wdepth = 2
+    wdepths = [4] * (COLS - 1) + [2] if PAIR else [wdepth] * COLS
     w_shim, o_shim = [], []
     w_core = []
     for c in range(COLS):
-        wf = ObjectFifo(w_col_ty, name=f"inW{c}", depth=wdepth)
+        wf = ObjectFifo(w_col_ty, name=f"inW{c}", depth=wdepths[c])
         w_core.append(wf.cons().split(
             offsets=[i * tb for i in range(ROWS)],
             obj_types=[w_ty] * ROWS,
@@ -292,18 +515,21 @@ def build_gemv(FMT: str, K: int, N: int, K_TILE: int, COLS: int,
     OG = OUT_GROUP or 1
     OG = max(1, min(OG, COLS))
     o_core = [None] * COLS
+    # In a pair a column contributes one part, twice a core's block.
+    PR = 1 if PAIR else ROWS
+    p_ty = o_col_ty if PAIR else o_ty
     for g0 in range(0, COLS, OG):
         og = min(OG, COLS - g0)
         grp_ty = np.ndarray[(og * ROWS * n_core,), np.dtype[np.float32]]
         of = ObjectFifo(grp_ty, name=f"outO{g0}", depth=2)
         parts = of.prod().join(
-            offsets=[k * n_core for k in range(og * ROWS)],
-            obj_types=[o_ty] * (og * ROWS),
-            depths=[2] * (og * ROWS),
-            names=[f"outO{g0}_{k}" for k in range(og * ROWS)],
+            offsets=[k * (ROWS // PR) * n_core for k in range(og * PR)],
+            obj_types=[p_ty] * (og * PR),
+            depths=[2] * (og * PR),
+            names=[f"outO{g0}_{k}" for k in range(og * PR)],
         )
         for ci in range(og):
-            o_core[g0 + ci] = parts[ci * ROWS:(ci + 1) * ROWS]
+            o_core[g0 + ci] = parts[ci * PR:(ci + 1) * PR]
         o_shim.append(of)
 
     # ACT_RAW: a tile of its own between the broadcast and the cores. It turns
@@ -333,28 +559,83 @@ def build_gemv(FMT: str, K: int, N: int, K_TILE: int, COLS: int,
         # separate buffers is what makes the order of the writes stop
         # mattering - host and array writes to one buffer hold in one order
         # only, and a layer in a single dispatch needs the other one.
-        def _pro1(a_in, a_out, ktile):
+        # With the side streams: before its output a tile may take side
+        # objects and emit objects of its own, as many as the tile says (the
+        # counts are the kernel's, so a tile that does not ask takes none).
+        p_side = ObjectFifo(PRO_SIDE_TY, name="proS", depth=2)
+        p_emit = ObjectFifo(PRO_EMIT_TY, name="proE", depth=2)
+
+        def _pro1(a_in, a_out, s_in, e_out, ktile, kcnt, kside, kemit, cnt):
             # One buffer for both: the tile is its own host half. Correct
             # wherever the host writes the whole tile, which is every stream
             # that does not yet feed the second input.
             i_ = a_in.acquire(1)
+            kcnt(i_, cnt)
+            for _ in range_(cnt[0]):
+                s_ = s_in.acquire(1)
+                kside(s_, i_)
+                s_in.release(1)
+            for _ in range_(cnt[1]):
+                e_ = e_out.acquire(1)
+                kemit(e_, i_)
+                e_out.release(1)
             o_ = a_out.acquire(1)
             ktile(i_, i_, o_)
             a_in.release(1)
             a_out.release(1)
 
-        pro_workers = [Worker(_pro1, fn_args=[a_shim.cons(), a_q.prod(), pro_tile],
+        pro_workers = [Worker(_pro1, fn_args=[a_shim.cons(), a_q.prod(),
+                                              p_side.cons(), p_emit.prod(),
+                                              *pro_tile,
+                                              Buffer(PRO_CNT_TY, name="proC")],
                               tile=Tile(pro_col, pro_row),
-                              stack_size=0x1000)]
+                              stack_size=0x1300,
+                              # act-att.cc's state: the combine's o and its
+                              # output, the q tile, the K/V rows, the gates
+                              data_size=33792)]
         a_cons = a_q
 
-    workers = pro_workers + [
-        Worker(_core, fn_args=[w_core[c][i].cons(), a_cons.cons(),
-                               o_core[c][i].prod(), gemv, zero],
-               tile=Tile(c, rows_map[c][i]),
-               stack_size=3072)
-        for c in range(COLS) for i in range(ROWS)
-    ]
+    if PAIR:
+        gemv_l, zero_l, merge = _kernels_lead(FMT, K_TILE, n_core)
+        workers = list(pro_workers)
+        if ATT:
+            att_l = _kernels_att(FMT, K_TILE, n_core, True)
+            att_p = _kernels_att(FMT, K_TILE, n_core, False)
+        for c in range(COLS):
+            # Adjacent tiles, so the hand-over is shared memory, not a stream.
+            pj = ObjectFifo(o_ty, name=f"pj{c}", depth=2)
+            if ATT:
+                workers.append(Worker(
+                    _core_lead_att, fn_args=[w_core[c][0].cons(), a_cons.cons(),
+                                             pj.cons(), o_core[c][0].prod(),
+                                             gemv_l, zero_l, merge, *att_l,
+                                             Buffer(np.ndarray[(AD_SCR,), np.dtype[ml_dtypes.bfloat16]],
+                                                    name=f"adscr{c}_0", mem_bank=3)],
+                    tile=Tile(c, rows_map[c][0]), stack_size=4928))
+                workers.append(Worker(
+                    _core_part_att, fn_args=[w_core[c][1].cons(), a_cons.cons(),
+                                             pj.prod(), gemv, zero, *att_p,
+                                             Buffer(np.ndarray[(AD_SCR,), np.dtype[ml_dtypes.bfloat16]],
+                                                    name=f"adscr{c}_1", mem_bank=3)],
+                    tile=Tile(c, rows_map[c][1]), stack_size=4928))
+                continue
+            workers.append(Worker(
+                _core_lead, fn_args=[w_core[c][0].cons(), a_cons.cons(),
+                                     pj.cons(), o_core[c][0].prod(),
+                                     gemv_l, zero_l, merge],
+                tile=Tile(c, rows_map[c][0]), stack_size=4928))
+            workers.append(Worker(
+                _core, fn_args=[w_core[c][1].cons(), a_cons.cons(),
+                                pj.prod(), gemv, zero],
+                tile=Tile(c, rows_map[c][1]), stack_size=4928))
+    else:
+        workers = pro_workers + [
+            Worker(_core, fn_args=[w_core[c][i].cons(), a_cons.cons(),
+                                   o_core[c][i].prod(), gemv, zero],
+                   tile=Tile(c, rows_map[c][i]),
+                   stack_size=4928)
+            for c in range(COLS) for i in range(ROWS)
+        ]
 
     def flat_tap(total, offset, count):
         return TensorAccessPattern([1, total], offset, [1, count], [0, 1])
@@ -372,9 +653,16 @@ def build_gemv(FMT: str, K: int, N: int, K_TILE: int, COLS: int,
     # backend's hand-built stream has to know which column carries it.
     a_prod = a_shim.prod(tile=Tile(4, 0))
     o_conss = [o.cons() for o in o_shim]
+    if act_pro:
+        o_conss = o_conss + [p_side.prod(tile=Tile(PRO_SIDE_COL, 0)),
+                             p_emit.cons(tile=Tile(PRO_EMIT_COL, 0))]
     a_words = (1 + n_out * NT) * ab // 4
 
-    def seq(a_w, a_a, a_o, wp, ap, op):
+    def seq(a_w, a_a, a_o, *rest):
+        # With the prologue a fourth buffer comes first: the residual rows the
+        # layers hand each other (xdna-gemv.h XDNA_RES_*), which its side
+        # streams read and write.
+        a_r, wp, ap, op = rest if act_pro else (None, *rest)
         # One descriptor per stream per column, whatever the chunk count. A
         # shim tile has sixteen buffer descriptors for all of its channels, and
         # a descriptor per chunk needs 1 + (1 + n_out*NT) + n_out of them: past
@@ -390,8 +678,14 @@ def build_gemv(FMT: str, K: int, N: int, K_TILE: int, COLS: int,
             wp[c].fill(a_w, tap=flat_tap(COLS * span, c * span, span), group=gi)
         # The header and every chunk's tiles are already consecutive.
         ap.fill(a_a, tap=flat_tap(a_words, 0, a_words), group=gi)
+        if act_pro:
+            # The prologue's side streams, for the allocation only: the
+            # backend builds its own streams.
+            op[-2].fill(a_r, tap=flat_tap(4096, 0, 512), group=gi)
         gi.finish()
         go = TaskGroup()
+        if act_pro:
+            op[-1].drain(a_r, tap=flat_tap(4096, 0, 256), wait=True, group=go)
         for gi_, g0 in enumerate(range(0, COLS, OG)):
             og = min(OG, COLS - g0)
             # The group's slice of every chunk: chunks are one array pass apart
@@ -402,6 +696,9 @@ def build_gemv(FMT: str, K: int, N: int, K_TILE: int, COLS: int,
                 wait=True, group=go)
         go.finish()
 
+    if act_pro:
+        r_ty = np.ndarray[(4096,), np.dtype[np.float32]]
+        return workers, [w_all_ty, a_all_ty, o_all_ty, r_ty, w_prods, a_prod, o_conss], seq
     return workers, [w_all_ty, a_all_ty, o_all_ty, w_prods, a_prod, o_conss], seq
 
 
@@ -454,7 +751,8 @@ def pack_weight_tile(fmt: str, codes: np.ndarray, d8: np.ndarray, m8: np.ndarray
             par = np.concatenate([split_pairs(dS[r:r + 1, cs]).reshape(-1),
                                   split_pairs(mS[r:r + 1, cs]).reshape(-1)])
             sups.append(par.view(np.uint8))
-    return np.concatenate(blocks + sups)
+    t = np.concatenate(blocks + sups)
+    return np.concatenate([t, np.zeros(tile_bytes(fmt, k_tile, n_core) - t.size, np.uint8)])
 
 
 def quantize_act(fmt: str, x: np.ndarray) -> tuple[np.ndarray, np.ndarray]:

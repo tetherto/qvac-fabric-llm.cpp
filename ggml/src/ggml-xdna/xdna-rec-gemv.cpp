@@ -4,6 +4,7 @@
 #include "ggml.h"
 
 #include <algorithm>
+#include <cstdio>
 #include <cstring>
 #include <memory>
 
@@ -22,7 +23,7 @@ bool pack_stage(const struct ggml_tensor * const * ws, int n_w,
     if (!ws || n_w <= 0 || !ws[0]) {
         return false;
     }
-    out.geom = xdna_gemv_variant(ws[0]->type, K, N, epilogue, split);
+    out.geom = xdna_gemv_variant(xdna_gemv_type_of(ws[0]), K, N, epilogue, split);
     if (!out.geom.valid()) {
         return false;
     }
@@ -38,6 +39,52 @@ bool pack_stage(const struct ggml_tensor * const * ws, int n_w,
 }
 
 } // namespace
+
+bool xdna_rec_inproj_pack(const struct ggml_tensor * w_qkv,
+                          const struct ggml_tensor * w_z,
+                          xdna_rec_inproj & out) {
+    if (!w_qkv || !w_z || w_qkv->ne[0] != w_z->ne[0]) {
+        return false;
+    }
+    const int64_t K = w_qkv->ne[0];
+    const int n_q = (int) w_qkv->ne[1];
+    const int n_z = (int) w_z->ne[1];
+    // The group decides the one format both take: q8g16 holds either, so a
+    // group whose members differ packs as the wider one.
+    xdna_gemv_geom g = xdna_gemv_variant(xdna_gemv_type_of(w_qkv), K, n_q + n_z, false,
+                                         XDNA_GEMV_SPLIT_FUSED);
+    const xdna_gemv_geom gz = xdna_gemv_variant(xdna_gemv_type_of(w_z), K, n_q + n_z, false,
+                                                XDNA_GEMV_SPLIT_FUSED);
+    if (!g.valid() || !gz.valid()) {
+        return false;
+    }
+    if (gz.fmt == XDNA_WFMT_Q8G16) {
+        g = gz;
+    }
+    const int n_o = xdna_gemv_out_streams(g);
+    const int sw  = xdna_gemv_stream_floats(g);
+    const int n_c = g.n_out();
+    // Exactly: every stream but the last full of qkv, the last full of z.
+    if (n_o < 2 || g.N != n_q + n_z || g.chunk() != n_o * sw ||
+        n_q != (n_o - 1) * sw * n_c || n_z != sw * n_c) {
+        return false;
+    }
+    std::vector<int32_t> colmap((size_t) g.N);
+    for (int j = 0; j < n_c; j++) {
+        for (int c = 0; c < n_o; c++) {
+            for (int r = 0; r < sw; r++) {
+                const int n = j * g.chunk() + c * sw + r;
+                colmap[(size_t) n] = c < n_o - 1 ? (j * (n_o - 1) + c) * sw + r
+                                                 : n_q + j * sw + r;
+            }
+        }
+    }
+    const struct ggml_tensor * ws[2] = { w_qkv, w_z };
+    out.geom  = g;
+    out.n_qkv = n_q;
+    out.n_z   = n_z;
+    return xdna_gemv_pack_weights(g, ws, 2, colmap.data(), out.packed);
+}
 
 xdna_rec_gemv * xdna_rec_gemv_create(xdna_kernel_pool * pool,
                                      const struct ggml_tensor * w_so,
@@ -191,6 +238,8 @@ bool xdna_rec_gemv_acc_from_tiles(xdna_rec_gemv * m, float * acc) {
     }
     const int kt = xdna_gemv_pair_k_tile(m->ffn);
     const int nt = xdna_gemv_pair_n_tiles(m->ffn);
+    m->settled.resize(a->bytes);
+    xdna_buffer_read_settled(a, m->settled.data(), a->bytes);
     for (int t = 0; t < nt; t++) {
         if (!xdna_buffer_download(a, acc + (size_t) t * kt,
                                   (size_t) kt * sizeof(float),
@@ -198,6 +247,20 @@ bool xdna_rec_gemv_acc_from_tiles(xdna_rec_gemv * m, float * acc) {
             return false;
         }
     }
+    return true;
+}
+
+bool xdna_rec_gemv_fused_results(xdna_rec_gemv * m, float * acc, float * ffn_out) {
+    if (!m || !m->ffn || !acc || !ffn_out) {
+        return false;
+    }
+    xdna_gemv_pair * p = m->ffn;
+    const size_t tail = p->o_tail_off + (size_t) p->g2.n_real * sizeof(float);
+    if (!xdna_rec_gemv_acc_from_tiles(m, acc) || m->settled.size() < tail) {
+        return false;
+    }
+    std::memcpy(ffn_out, m->settled.data() + p->o_tail_off,
+                (size_t) p->g2.n_real * sizeof(float));
     return true;
 }
 
@@ -241,6 +304,131 @@ bool xdna_rec_gemv_ffn_run(xdna_rec_gemv * m, const float * hff,
     const int n = m->n_out;
     for (int i = 0; i < n; i++) {
         h_out[i] = h_attn[i] + m->acc[i];
+    }
+    return true;
+}
+
+// --- attention tail --------------------------------------------------------
+
+xdna_rec_tail * xdna_rec_tail_create(xdna_kernel_pool * pool,
+                                     const struct ggml_tensor * w_o,
+                                     const struct ggml_tensor * w_gate,
+                                     const struct ggml_tensor * w_up,
+                                     const struct ggml_tensor * w_down,
+                                     xdna_buffer * res, const float * gamma, float eps) {
+    if (!res || !gamma) {
+        return nullptr;
+    }
+    std::unique_ptr<xdna_rec_tail> t(new xdna_rec_tail);
+    t->gv = xdna_rec_gemv_create(pool, w_o, w_gate, w_up, w_down);
+    if (!t->gv || !t->gv->ffn || !xdna_gemv_pair_raw_act(t->gv->ffn)) {
+        xdna_rec_tail_free(t.release());
+        return nullptr;
+    }
+    xdna_gemv * so = t->gv->so;
+    xdna_gemv_pair * ffn = t->gv->ffn;
+    const size_t ffn_w_off = (so->geom.weight_bytes() + 4095) / 4096 * 4096;
+    const size_t ffn_wb = ffn->w2_off + ffn->g2.weight_bytes();
+
+    // [attn_output -> S | the prologue's row: h_attn = H + S into A, the norm
+    // into the FFN's tiles | gate+up -> down into F]: arguments 0 (weights),
+    // 1 (the projection's activation, then gamma), 2 (the FFN's activation
+    // buffer) and 3 (the residual rows).
+    const size_t g_off = (so->geom.act_bytes() + 4095) / 4096 * 4096;
+    xdna_seq seq;
+    xdna_gemv_seq_opts o;
+    o.bd_base = 0;
+    o.w_arg   = 0;
+    o.act_arg = 1;
+    o.o_arg   = 3;
+    o.out_off = XDNA_RES_S;
+    xdna_gemv_pair_opts po;
+    po.w_arg   = 0;
+    po.w_base  = (uint32_t) ffn_w_off;
+    po.a_arg   = 2;
+    po.o_arg   = 3;
+    po.o_base  = XDNA_RES_F;
+    po.bd_base = 0;
+    po.act_replay = false;
+    bool ok = xdna_gemv_seq_build(&seq, so->geom, &o);
+    xdna_seq_row_io(&seq, 3, XDNA_RES_S, XDNA_RES_H, 1, (uint32_t) g_off, XDNA_RES_A);
+    ok = ok && xdna_gemv_seq_build_pair(&seq, ffn->g1, ffn->g2, ffn->w2_off,
+                                        ffn->a2_off, &po);
+    xdna_seq_row_wait(&seq);
+    if (!ok) {
+        GGML_LOG_ERROR("%s: attention tail: stream build failed\n", "xdna-rec-gemv");
+        xdna_rec_tail_free(t.release());
+        return nullptr;
+    }
+    const std::vector<uint32_t> words = xdna_seq_build(&seq);
+    // Pooled by content: layers whose down projection packs differently build
+    // different streams.
+    uint64_t h = 1469598103934665603ull;
+    for (uint32_t v : words) {
+        h = (h ^ v) * 1099511628211ull;
+    }
+    char kname[48];
+    snprintf(kname, sizeof(kname), "rec_tail_%016llx", (unsigned long long) h);
+    t->kern = xdna_kernel_pool_get_built(pool, kname, so->geom.stem().c_str(),
+                                         words.data(), words.size());
+    t->w = xdna_buffer_alloc(so->dev, ffn_w_off + ffn_wb);
+    t->a = xdna_buffer_alloc(so->dev, g_off + (size_t) XDNA_RES_D * sizeof(float));
+    if (!t->kern || !t->w || !t->a) {
+        xdna_rec_tail_free(t.release());
+        return nullptr;
+    }
+    uint8_t * w = (uint8_t *) t->w->bo.map();
+    std::memset(w, 0, ffn_w_off + ffn_wb);
+    std::memcpy(w, so->w->bo.map(), so->geom.weight_bytes());
+    std::memcpy(w + ffn_w_off, ffn->w->bo.map(), ffn_wb);
+    xdna_buffer_sync_to_device(t->w);
+    t->host_a.resize(so->geom.act_bytes());
+    std::memset(t->a->bo.map(), 0, g_off + (size_t) XDNA_RES_D * sizeof(float));
+    std::memcpy((uint8_t *) t->a->bo.map() + g_off, gamma, (size_t) XDNA_RES_D * sizeof(float));
+    xdna_buffer_sync_to_device(t->a);
+    if (!xdna_gemv_row_act(ffn->g1, (uint8_t *) ffn->a->bo.map(), eps, true,
+                           xdna_gemv_pair_last_flags(ffn))) {
+        xdna_rec_tail_free(t.release());
+        return nullptr;
+    }
+    xdna_buffer_sync_to_device(ffn->a);
+    t->res = res;
+    xdna_buffer * args[4] = { t->w, t->a, xdna_gemv_pair_act_buf(ffn), res };
+    t->run = xdna_kernel_run_make(t->kern, args, 4);
+    return t.release();
+}
+
+void xdna_rec_tail_free(xdna_rec_tail * t) {
+    if (!t) {
+        return;
+    }
+    xdna_buffer_free(t->w);
+    xdna_buffer_free(t->a);
+    xdna_rec_gemv_free(t->gv);
+    delete t;
+}
+
+bool xdna_rec_tail_run(xdna_rec_tail * t, const float * act, const float * hres,
+                       float * h_attn, float * h_out) {
+    if (!t || !act || !hres || !h_attn || !h_out) {
+        return false;
+    }
+    xdna_rec_gemv * m = t->gv;
+    xdna_gemv_pack_act_into(m->so->geom, act, t->host_a.data());
+    std::memcpy(t->a->bo.map(), t->host_a.data(), t->host_a.size());
+    xdna_buffer_sync_to_device_range(t->a, t->host_a.size(), 0);
+    // the residual as the row the FFN's boundary reads
+    std::memcpy((uint8_t *) t->res->bo.map() + XDNA_RES_H, hres,
+                (size_t) XDNA_RES_D * sizeof(float));
+    xdna_buffer_sync_to_device_range(t->res, (size_t) XDNA_RES_D * sizeof(float), XDNA_RES_H);
+    if (!xdna_run_restart(t->run) || !xdna_run_wait(t->run)) {
+        return false;
+    }
+    std::vector<float> r2((size_t) 2 * XDNA_RES_D);
+    xdna_buffer_read_settled(t->res, r2.data(), r2.size() * sizeof(float), XDNA_RES_A);
+    for (int i = 0; i < m->n_out; i++) {
+        h_attn[i] = r2[(size_t) i];
+        h_out[i]  = r2[(size_t) i] + r2[(size_t) (XDNA_RES_D + i)];
     }
     return true;
 }

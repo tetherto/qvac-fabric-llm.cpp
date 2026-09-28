@@ -12,6 +12,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
+#include <vector>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -98,6 +100,7 @@ xdna_kernel * xdna_kernel_load_hw(xdna_device * dev, const char * xclbin_path) {
         }
 
         xdna_kernel * kern = new xdna_kernel;
+        kern->device      = dev->device;
         kern->context     = context;
         kern->kernel      = xrt::kernel(*context, kernels[0].get_name());
         kern->xclbin_name = xclbin_path_str;
@@ -119,11 +122,22 @@ bool xdna_kernel_bind_insts(xdna_device * dev, xdna_kernel * kern, const uint32_
                                     xrt::bo::flags::cacheable, kern->kernel.group_id(1));
         std::memcpy(kern->insts_bo.map(), insts, (size_t) kern->insts_bytes);
         kern->insts_bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+        kern->insts_host.assign(insts, insts + n_words);
         return true;
     } catch (const std::exception & e) {
         GGML_LOG_ERROR("%s: failed to bind instruction stream: %s\n", "xdna-runtime", e.what());
         return false;
     }
+}
+
+bool xdna_kernel_rewrite_insts(xdna_kernel * kern, const uint32_t * insts, size_t n_words) {
+    if (!kern || !insts || (int64_t) (n_words * sizeof(uint32_t)) != kern->insts_bytes) {
+        return false;
+    }
+    std::memcpy(kern->insts_bo.map(), insts, (size_t) kern->insts_bytes);
+    kern->insts_bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+    kern->insts_host.assign(insts, insts + n_words);
+    return true;
 }
 
 void xdna_kernel_free(xdna_kernel * kern) {
@@ -132,11 +146,72 @@ void xdna_kernel_free(xdna_kernel * kern) {
 
 // --- buffer ----------------------------------------------------------------
 
+// The decode's arena: the buffers its designs name, carved out of a few large
+// BOs so that a whole token's streams can be joined into one command - a run
+// has only a handful of buffer arguments, and every layer's buffers then sit
+// in one of them. Grown in chunks as the decode's objects are created; never
+// freed (they live as long as the process does).
+namespace {
+struct xdna_arena_state {
+    std::vector<xdna_buffer *> chunks;
+    size_t used = 0;          // in the last chunk
+    int    depth = 0;         // open xdna_arena_scope's
+};
+xdna_arena_state g_arena;
+std::mutex       g_arena_mutex;
+
+size_t arena_chunk_bytes() {
+    static const size_t v = (size_t) xdna_env_int("GGML_XDNA_ARENA_MB", 256) << 20;
+    return v;
+}
+} // namespace
+
+xdna_arena_scope::xdna_arena_scope() {
+    std::lock_guard<std::mutex> lock(g_arena_mutex);
+    g_arena.depth++;
+}
+
+xdna_arena_scope::~xdna_arena_scope() {
+    std::lock_guard<std::mutex> lock(g_arena_mutex);
+    g_arena.depth--;
+}
+
+static xdna_buffer * xdna_buffer_alloc_own(xdna_device * dev, size_t bytes);
+
+static xdna_buffer * xdna_arena_alloc(xdna_device * dev, size_t bytes) {
+    std::lock_guard<std::mutex> lock(g_arena_mutex);
+    if (g_arena.depth <= 0 || arena_chunk_bytes() == 0) {
+        return nullptr;
+    }
+    const size_t need = (bytes + 4095) / 4096 * 4096;
+    if (g_arena.chunks.empty() || g_arena.used + need > g_arena.chunks.back()->bytes) {
+        xdna_buffer * c = xdna_buffer_alloc_own(dev, std::max(arena_chunk_bytes(), need));
+        if (!c) {
+            return nullptr;
+        }
+        g_arena.chunks.push_back(c);
+        g_arena.used = 0;
+    }
+    xdna_buffer * chunk = g_arena.chunks.back();
+    xdna_buffer * buf = xdna_buffer_sub(chunk, g_arena.used, bytes);
+    if (buf) {
+        g_arena.used += need;
+    }
+    return buf;   // zeroed: the chunk was, and nothing else had this range
+}
+
 xdna_buffer * xdna_buffer_alloc(xdna_device * dev, size_t bytes) {
     if (!dev) {
         GGML_LOG_ERROR("%s: buffer alloc: no device\n", "xdna-runtime");
         return nullptr;
     }
+    if (xdna_buffer * a = xdna_arena_alloc(dev, bytes)) {
+        return a;
+    }
+    return xdna_buffer_alloc_own(dev, bytes);
+}
+
+static xdna_buffer * xdna_buffer_alloc_own(xdna_device * dev, size_t bytes) {
     xdna_buffer * buf = new xdna_buffer;
     try {
         buf->bo    = xrt::bo(dev->device, bytes, xrt::bo::flags::host_only, 0);
@@ -166,6 +241,8 @@ xdna_buffer * xdna_buffer_sub(xdna_buffer * parent, size_t offset, size_t bytes)
     try {
         buf->bo    = xrt::bo(parent->bo, bytes, offset);
         buf->bytes = bytes;
+        buf->root     = parent->root ? parent->root : parent;
+        buf->root_off = parent->root_off + offset;
     } catch (const std::exception & e) {
         GGML_LOG_ERROR("%s: failed to view %zu+%zu of a BO: %s\n",
                        "xdna-runtime", offset, bytes, e.what());
@@ -353,6 +430,47 @@ uint8_t * xdna_buffer_wait_written(xdna_buffer * buf, size_t bytes,
     }
 }
 
+void xdna_buffer_sync_from_device_range(xdna_buffer * buf, size_t bytes, size_t offset) {
+    if (buf && bytes) {
+        buf->bo.sync(XCL_BO_SYNC_BO_FROM_DEVICE, bytes, offset);
+    }
+}
+
+void xdna_buffer_read_settled(xdna_buffer * buf, void * dst, size_t bytes,
+                              size_t offset) {
+    if (!buf || !dst || bytes == 0) {
+        return;
+    }
+    if (offset >= buf->bytes) {
+        return;
+    }
+    if (bytes > buf->bytes - offset) {
+        bytes = buf->bytes - offset;
+    }
+    uint8_t * base = (uint8_t *) buf->bo.map() + offset;
+    // Spin, not sleep: a sleep_for(20us) costs a timer tick and measured about
+    // 80us, and this is paid once per read.
+    const auto spin_us = [](int us) {
+        const std::chrono::steady_clock::time_point until =
+            std::chrono::steady_clock::now() + std::chrono::microseconds(us);
+        while (std::chrono::steady_clock::now() < until) {
+        }
+    };
+    static const int settle_us = xdna_env_int("GGML_XDNA_SETTLE_US", 20);
+    xdna_buffer_sync_from_device(buf);
+    std::memcpy(dst, base, bytes);
+    for (int attempt = 0; attempt < 4; attempt++) {
+        if (settle_us > 0) {
+            spin_us(settle_us);
+        }
+        xdna_buffer_sync_from_device(buf);
+        if (std::memcmp(dst, base, bytes) == 0) {
+            return;
+        }
+        std::memcpy(dst, base, bytes);
+    }
+}
+
 // --- execution -------------------------------------------------------------
 
 // Configure a run for `kern` with `n_args` host buffers (ABI: 0=opcode,
@@ -384,7 +502,403 @@ xrt::run xdna_kernel_run_make(xdna_kernel * kern, xdna_buffer ** args, size_t n_
     }
 }
 
+namespace {
+struct xdna_batch_state {
+    int k = 0;                        // runs a list; 0 = not batching
+    std::vector<std::unique_ptr<xrt::runlist>> sent;
+    std::unique_ptr<xrt::runlist> cur;
+    const xrt::hw_context * cur_ctx = nullptr;
+    int n_cur = 0;
+    int lead = 0;                     // runs still to start on their own
+    std::vector<xrt::run *> direct;   // the ones that were
+    // token mode: the runs' streams joined into one command at the send
+    bool token = false;
+    int  join  = 0;                   // runs a joined command, 0: all of them
+    struct entry {
+        xdna_kernel * kern;
+        xrt::run *    run;
+        std::vector<xdna_buffer *> args;
+    };
+    std::vector<entry> tok;
+    std::vector<xrt::run> tok_runs;   // sent, to wait for
+    // the joined commands' kernels and instruction BOs, one a command of the
+    // token (a BO in flight cannot be rewritten), reused token to token
+    std::vector<xdna_kernel> joined;
+    std::vector<size_t> joined_cap;
+    std::vector<uint32_t> words;
+};
+xdna_batch_state g_batch;
+
+constexpr uint32_t APERTURE = 0x80000000u;   // xdna-seq.cpp: args >= 5
+constexpr uint32_t XLAT_ARGS = 5;
+
+// Words a TXN op takes (xdna-seq.h); 0 for one this does not know.
+uint32_t op_words(uint32_t op) {
+    switch (op) {
+        case 0x00: return 6;    // write
+        case 0x01: return 12;   // blockwrite
+        case 0x03: return 7;    // maskwrite
+        case 0x80: return 4;    // wait for a task-complete token
+        case 0x81: return 12;   // DDR patch
+        default:   return 0;
+    }
+}
+
+bool token_start_each() {
+    auto & b = g_batch;
+    for (auto & e : b.tok) {
+        try {
+            e.run->start();
+        } catch (const std::exception & ex) {
+            GGML_LOG_ERROR("%s: run start exception: %s\n", "xdna-runtime", ex.what());
+            return false;
+        }
+        b.direct.push_back(e.run);
+    }
+    b.tok.clear();
+    return true;
+}
+
+// One command for everything collected: the streams back to back, each
+// DDR patch renamed to the root BO its buffer lives in (one argument slot a
+// root) at the buffer's offset in it. Falls back to a command each when the
+// roots do not fit the firmware-translated slots or a stream does not parse.
+bool token_send() {
+    auto & b = g_batch;
+    if (b.tok.empty()) {
+        return true;
+    }
+    std::vector<xdna_buffer *> roots;
+    // Roots take slots 5 to 9, the ones whose offset carries the DDR aperture
+    // and which the firmware does not translate (xdna-seq.cpp) - the slots the
+    // per-layer streams already name for their weights.
+    constexpr int slot0 = (int) XLAT_ARGS;
+    const auto slot_of = [&](xdna_buffer * a) -> int {
+        xdna_buffer * r = a->root ? a->root : a;
+        for (size_t i = 0; i < roots.size(); i++) {
+            if (roots[i] == r) {
+                return slot0 + (int) i;
+            }
+        }
+        roots.push_back(r);
+        return slot0 + (int) roots.size() - 1;
+    };
+    std::vector<uint32_t> & w = b.words;
+    w.assign(4, 0);
+    uint32_t n_instr = 0;
+    size_t prev_start = 4, cur_start = 4;
+    for (auto & e : b.tok) {
+        prev_start = cur_start;
+        cur_start  = w.size();
+        const std::vector<uint32_t> & in = e.kern->insts_host;
+        if (in.size() < 4 || e.kern->context != b.tok[0].kern->context) {
+            return token_start_each();
+        }
+        if (w[0] == 0) {
+            w[0] = in[0];
+            w[1] = in[1];
+        }
+        n_instr += in[2];
+        // The run's leading weight fills (a BD, its patch and its MM2S push on
+        // one column, descriptor 0) go before the previous run's trailing
+        // waits, so the next layer's weights stream in while the last one's
+        // outputs drain - when that run's tail since its last wait before them
+        // does not write the descriptor. +1.2% tok/s; the rest of a layer's
+        // head reads what the previous layer is still writing.
+        constexpr bool hoist = true;
+        std::vector<char> moved;
+        if (hoist && w.size() > 4) {
+            moved.assign(in.size(), 0);
+            // the previous run's trailing waits in w, and its tail before them
+            size_t tw = w.size();
+            while (tw >= 8 && w[tw - 4] == 0x80) {
+                tw -= 4;
+            }
+            size_t j = 4;
+            for (; j < in.size() && in[j] != 0x80;) {
+                const uint32_t nw = op_words(in[j]);
+                if (nw == 0) {
+                    break;
+                }
+                if (in[j] == 0x01 && j + 12 + 12 + 6 <= in.size() && in[j + 12] == 0x81 &&
+                    in[j + 24] == 0x00) {
+                    const uint32_t r = in[j + 2], col = (r >> 25) & 0x7F;
+                    const uint32_t bd = ((r & 0xFFFFF) - 0x1D000) / 0x20;
+                    const uint32_t pr = in[j + 26] & 0xFFFFF, pcol = (in[j + 26] >> 25) & 0x7F;
+                    const bool mm2s = pr >= 0x1D214 && pr < 0x1D224;
+                    if (bd == 0 && pcol == col && mm2s && (in[j + 28] & 0xF) == 0) {
+                        // the previous run's tail since its last wait before the
+                        // trailing block must not write (col, bd 0)
+                        bool clash = false;
+                        size_t tail0 = prev_start;
+                        for (size_t q = prev_start; q < tw;) {
+                            const uint32_t qn = op_words(w[q]);
+                            if (qn == 0) { clash = true; break; }
+                            if (w[q] == 0x80) tail0 = q;
+                            q += qn;
+                        }
+                        for (size_t q = tail0; !clash && q < tw;) {
+                            const uint32_t qn = op_words(w[q]);
+                            if (w[q] == 0x01 && ((w[q + 2] >> 25) & 0x7F) == col &&
+                                (((w[q + 2] & 0xFFFFF) - 0x1D000) / 0x20) == 0) {
+                                clash = true;
+                            }
+                            q += qn;
+                        }
+                        if (!clash) {
+                            for (size_t q = j; q < j + 30; q++) moved[q] = 1;
+                            j += 30;
+                            continue;
+                        }
+                    }
+                }
+                j += nw;
+            }
+        }
+        if (hoist && !moved.empty()) {
+            // splice the moved groups in before the trailing waits
+            size_t tw = w.size();
+            while (tw >= 8 && w[tw - 4] == 0x80) {
+                tw -= 4;
+            }
+            std::vector<uint32_t> ins;
+            for (size_t q = 4; q < in.size();) {
+                const uint32_t qn = op_words(in[q]);
+                if (qn == 0) break;
+                if (moved[q]) {
+                    ins.insert(ins.end(), in.begin() + q, in.begin() + q + qn);
+                }
+                q += qn;
+            }
+            // relocate the patches in `ins` as the main loop would
+            for (size_t q = 0; q < ins.size();) {
+                const uint32_t qn = op_words(ins[q]);
+                if (ins[q] == 0x81) {
+                    const uint32_t arg = ins[q + 8];
+                    uint32_t off = ins[q + 10];
+                    if (arg >= XLAT_ARGS) off &= ~APERTURE;
+                    if (arg >= e.args.size() || !e.args[arg]) return token_start_each();
+                    xdna_buffer * a = e.args[arg];
+                    const int s2 = slot_of(a);
+                    const uint64_t noff = (uint64_t) a->root_off + off;
+                    if (s2 >= 10 || noff >= APERTURE) return token_start_each();
+                    ins[q + 8]  = (uint32_t) s2;
+                    ins[q + 10] = (uint32_t) noff | (s2 >= (int) XLAT_ARGS ? APERTURE : 0u);
+                }
+                q += qn;
+            }
+            w.insert(w.begin() + (long) tw, ins.begin(), ins.end());
+        }
+        for (size_t i = 4; i < in.size();) {
+            if (!moved.empty() && moved[i]) {
+                i += op_words(in[i]);
+                continue;
+            }
+            const uint32_t nw = op_words(in[i]);
+            if (nw == 0 || i + nw > in.size()) {
+                return token_start_each();
+            }
+            const size_t at = w.size();
+            w.insert(w.end(), in.begin() + i, in.begin() + i + nw);
+            if (in[i] == 0x81) {
+                const uint32_t arg = in[i + 8];
+                uint32_t off = in[i + 10];
+                if (arg >= XLAT_ARGS) {
+                    off &= ~APERTURE;
+                }
+                if (arg >= e.args.size() || !e.args[arg]) {
+                    return token_start_each();
+                }
+                xdna_buffer * a = e.args[arg];
+                const int s = slot_of(a);
+                const uint64_t noff = (uint64_t) a->root_off + off;
+                if (s >= 10 || (s < slot0) || noff >= APERTURE ||
+                    (slot0 < (int) XLAT_ARGS && s >= (int) XLAT_ARGS)) {
+                    return token_start_each();
+                }
+                w[at + 8]  = (uint32_t) s;
+                w[at + 10] = (uint32_t) noff | (s >= (int) XLAT_ARGS ? APERTURE : 0u);
+            }
+            i += nw;
+        }
+    }
+    w[2] = n_instr;
+    w[3] = (uint32_t) (w.size() * sizeof(uint32_t));
+    const size_t bytes = w.size() * sizeof(uint32_t);
+    try {
+        const size_t ji = b.tok_runs.size();
+        if (b.joined.size() <= ji) {
+            b.joined.resize(ji + 1);
+            b.joined_cap.resize(ji + 1, 0);
+        }
+        xdna_kernel & j = b.joined[ji];
+        xdna_kernel * k0 = b.tok[0].kern;
+        if (j.context != k0->context || b.joined_cap[ji] < bytes) {
+            j.device  = k0->device;
+            j.context = k0->context;
+            j.kernel  = k0->kernel;
+            b.joined_cap[ji] = bytes * 2;
+            j.insts_bo = xrt::bo(j.device, b.joined_cap[ji], xrt::bo::flags::cacheable,
+                                 j.kernel.group_id(1));
+        }
+        std::memcpy(j.insts_bo.map(), w.data(), bytes);
+        j.insts_bo.sync(XCL_BO_SYNC_BO_TO_DEVICE, bytes, 0);
+        xrt::run run(j.kernel);
+        run.set_arg(0, XAIE_NPU_OPCODE_RUN);
+        run.set_arg(1, j.insts_bo);
+        run.set_arg(2, (uint32_t) w.size());
+        for (int s = 0; s < 10; s++) {
+            // every slot below the first root's gets one too: the argument list
+            // is positional
+            const int r = s < slot0 ? 0 : s - slot0;
+            if (r < (int) roots.size()) {
+                run.set_arg(3 + s, roots[(size_t) r]->bo);
+            }
+        }
+        run.start();
+        b.tok_runs.push_back(std::move(run));
+    } catch (const std::exception & ex) {
+        GGML_LOG_ERROR("%s: joined token stream exception: %s\n", "xdna-runtime", ex.what());
+        return false;
+    }
+    b.tok.clear();
+    return true;
+}
+
+bool batch_send() {
+    auto & b = g_batch;
+    if (b.token) {
+        return token_send();
+    }
+    if (!b.cur || b.n_cur == 0) {
+        return true;
+    }
+    try {
+        b.cur->execute();
+    } catch (const std::exception & e) {
+        GGML_LOG_ERROR("%s: runlist execute exception: %s\n", "xdna-runtime", e.what());
+        return false;
+    }
+    b.sent.push_back(std::move(b.cur));
+    b.cur_ctx = nullptr;
+    b.n_cur = 0;
+    return true;
+}
+} // namespace
+
+void xdna_batch_begin(int k) {
+    g_batch.token = k < 0;
+    g_batch.join  = k < -1 ? -k : 0;
+    g_batch.k = k != 0 ? 1 << 30 : 0;
+    if (k > 0) {
+        g_batch.k = k;
+    }
+    // The token's first run starts on its own: the array has work while the
+    // host prepares the first list, instead of waiting for all of it.
+    static const int lead = [] {
+        const char * e = getenv("GGML_XDNA_BATCH_LEAD");
+        return e ? atoi(e) : 1;
+    }();
+    g_batch.lead = lead;
+}
+
+bool xdna_batch_active(void) {
+    return g_batch.k > 0;
+}
+
+bool xdna_run_submit(xdna_kernel * kern, xrt::run & run, xdna_buffer * const * args,
+                     size_t n_args) {
+    auto & b = g_batch;
+    if (b.k <= 0 || !kern || !kern->context) {
+        return xdna_run_restart(run);
+    }
+    if (b.token && args && !kern->insts_host.empty()) {
+        if (b.lead > 0 && b.tok.empty() && b.tok_runs.empty()) {
+            b.lead--;
+            if (!xdna_run_restart(run)) {
+                return false;
+            }
+            b.direct.push_back(&run);
+            return true;
+        }
+        b.tok.push_back({ kern, &run, std::vector<xdna_buffer *>(args, args + n_args) });
+        if (b.join > 0 && (int) b.tok.size() >= b.join) {
+            return token_send();
+        }
+        return true;
+    }
+    if (b.token) {
+        // a run the token cannot join: what it holds goes first
+        if (!token_send()) {
+            return false;
+        }
+        if (!xdna_run_restart(run)) {
+            return false;
+        }
+        b.direct.push_back(&run);
+        return true;
+    }
+    if (b.lead > 0 && !b.cur && b.sent.empty()) {
+        b.lead--;
+        if (!xdna_run_restart(run)) {
+            return false;
+        }
+        b.direct.push_back(&run);
+        return true;
+    }
+    try {
+        if (b.cur && b.cur_ctx != kern->context.get() && !batch_send()) {
+            return false;
+        }
+        if (!b.cur) {
+            b.cur     = std::make_unique<xrt::runlist>(*kern->context);
+            b.cur_ctx = kern->context.get();
+        }
+        b.cur->add(run);
+        if (++b.n_cur >= b.k) {
+            return batch_send();
+        }
+        return true;
+    } catch (const std::exception & e) {
+        GGML_LOG_ERROR("%s: runlist add exception: %s\n", "xdna-runtime", e.what());
+        return false;
+    }
+}
+
+bool xdna_batch_wait(void) {
+    auto & b = g_batch;
+    bool ok = batch_send();
+    for (xrt::run * r : b.direct) {
+        ok = xdna_run_wait(*r) && ok;
+    }
+    b.direct.clear();
+    for (xrt::run & r : b.tok_runs) {
+        ok = xdna_run_wait(r) && ok;
+    }
+    b.tok_runs.clear();
+    for (auto & l : b.sent) {
+        try {
+            l->wait();
+            if (l->state() != ERT_CMD_STATE_COMPLETED) {
+                GGML_LOG_ERROR("%s: runlist state %d\n", "xdna-runtime", (int) l->state());
+                ok = false;
+            }
+        } catch (const std::exception & e) {
+            GGML_LOG_ERROR("%s: runlist wait exception: %s\n", "xdna-runtime", e.what());
+            ok = false;
+        }
+    }
+    b.sent.clear();
+    b.k = 0;
+    b.token = false;
+    return ok;
+}
+
 bool xdna_run_restart(xrt::run & run) {
+    // anything a batch holds goes first, so the device sees the host's order
+    if ((g_batch.cur || !g_batch.tok.empty()) && !batch_send()) {
+        return false;
+    }
     try {
         run.start();
         return true;
@@ -399,6 +913,9 @@ xrt::run xdna_kernel_run_start(xdna_kernel * kern, xdna_buffer ** args, size_t n
         GGML_LOG_ERROR("%s: run start: null kernel/args or no buffers\n", "xdna-runtime");
         return xrt::run{};
     }
+    if ((g_batch.cur || !g_batch.tok.empty()) && !batch_send()) {
+        return xrt::run{};
+    }
     try {
         xrt::run run = make_run(kern, args, n_args);
         run.start();
@@ -411,14 +928,17 @@ xrt::run xdna_kernel_run_start(xdna_kernel * kern, xdna_buffer ** args, size_t n
 
 bool xdna_run_wait(xrt::run & run) {
     try {
-        // Poll before blocking. A dispatch shorter than XRT's completion path
-        // measures as that path and not as its own work: the decode's short
-        // ones sit on a floor of about 125 us where their weights need 60.
-        // The decode is sequential, so the thread that would block here has
-        // nothing else to do with the time.
-        static const bool spin = xdna_env_int("GGML_XDNA_SPIN", 1) != 0;
-        if (spin) {
-            for (int i = 0; i < (1 << 22); i++) {
+        // Block, do not poll. Polling kept a core at full power for 70% of a
+        // decode token (it waits once a token for its whole queue, ~20 ms) -
+        // the host energy FLM does not spend - and bought nothing: blocking
+        // measured the same tok/s in the server, at 0.29 of the CPU time
+        // polling 200 us before blocking took. GGML_XDNA_SPIN_US polls that
+        // long first; -1 polls without limit, as it used to by default.
+        static const int spin_us = xdna_env_int("GGML_XDNA_SPIN_US", 0);
+        if (spin_us != 0) {
+            const auto until = std::chrono::steady_clock::now() +
+                               std::chrono::microseconds(spin_us < 0 ? 0 : spin_us);
+            for (;;) {
                 const ert_cmd_state s = run.state();
                 if (s == ERT_CMD_STATE_COMPLETED) {
                     return true;
@@ -427,6 +947,9 @@ bool xdna_run_wait(xrt::run & run) {
                     s == ERT_CMD_STATE_TIMEOUT) {
                     GGML_LOG_ERROR("%s: kernel spin state %d\n", "xdna-runtime", (int) s);
                     return false;
+                }
+                if (spin_us > 0 && std::chrono::steady_clock::now() >= until) {
+                    break;
                 }
             }
         }
