@@ -36,11 +36,12 @@ static const char * fmt_name(xdna_wfmt f) {
 }
 
 // The pairs the backend asks for: each type's own GEMV format, Q4_K widened
-// into the 8-bit form so one format can cover a whole decode, and Q5_K/Q6_K
-// requantized into the 4-bit form (GGML_XDNA_W4).
+// into the 8-bit form so one format can cover a whole decode, Q5_K/Q6_K
+// requantized into the 4-bit form (GGML_XDNA_W4), and Q8_0 into the 8-bit one.
 static bool supported(ggml_type t, xdna_wfmt f) {
     return (f != XDNA_WFMT_NONE && f == xdna_wfmt_gemv_for(t)) || (t == GGML_TYPE_Q4_K && f == XDNA_WFMT_Q8G16) ||
-           ((t == GGML_TYPE_Q5_K || t == GGML_TYPE_Q6_K) && f == XDNA_WFMT_Q4G32);
+           ((t == GGML_TYPE_Q5_K || t == GGML_TYPE_Q6_K) && f == XDNA_WFMT_Q4G32) ||
+           (t == GGML_TYPE_Q8_0 && f == XDNA_WFMT_Q8G16);
 }
 
 int main(void) {
