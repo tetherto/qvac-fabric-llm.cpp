@@ -41,8 +41,9 @@ recurrent state stays on the device between tokens.
 It covers one weight set: `Q4_K` for the FFN gate and up, `Q4_K`/`Q5_K`/`Q6_K`
 for `ssm_out`, `Q4_K`/`Q6_K` for the FFN down, plus a `GGML_XDNA_GATED_FMT` that
 matches the `ssm_out` layout. Anything else is refused with an error rather
-than run on the wrong kernels; `GGML_XDNA_FUSED_LAYER=0` forces the per-op path
-instead - but see the limitations below before relying on it.
+than run on the wrong kernels: prefill still runs on the array, and the first
+decode graph fails. Which quants hit this, and the requantization that avoids
+it, are under Build below.
 
 ### Prefill ops
 
@@ -98,8 +99,10 @@ Weights are packed into q4g32 (Q4_K: 4-bit codes plus an int8 scale and min per
 32 values) or q8g16 (Q4_K/Q5_K/Q6_K: int8 codes plus scale and min per 16).
 Both decode as `w = q*d + m` and both are exact with respect to the ggml block
 they come from, so a single kernel streams either and the GEMV never switches
-hardware context. The packed weights live in a device buffer for the process
-lifetime, keyed by the tensor's data pointer and shape.
+hardware context. The packed weights live in a device buffer keyed by the
+tensor's data pointer and shape until the last context on the backend is
+freed; so do the fused-layer sessions. A model loaded after that starts from
+nothing, even at the same addresses.
 
 ### One decode token
 
@@ -124,14 +127,6 @@ Measured on npu2 (Ryzen AI MAX+ 395), Qwen3.5-0.8B-Q4_K_M, llama-server with
 `-np 1 -b 4096 -ub 4096 --flash-attn off`, requests at `temperature 0`,
 `top_k 1` and `cache_prompt false`.
 
-**A request with a one-token prompt runs on the previous request's state.**
-The on-device recurrent state is re-seeded from the llama cache when a prefill
-ubatch rewrites it, and that is detected from the ubatch token count - which
-cannot tell a one-token prompt from a decode step. Six identical one-token
-`/completion` calls in one server process, at `temperature 0` with a fixed
-seed, returned five different answers. A prompt of two tokens or more is not
-affected. This is a live defect, not a tuning knob; it is being fixed.
-
 **`GGML_XDNA_GEMV_GROUP=1` does not reproduce run to run.** With the
 projections outside the fused layers on the decode GEMV, separate processes
 given the same prompt and seed sometimes disagree: 2 of 120 runs produced a
@@ -143,9 +138,13 @@ cause and will update this when we know more.
 
 What the default path has been measured on, so the claim is not read wider
 than it is: 48 runs of one request in a fresh process, and 12 repeated
-multi-token requests inside one process, none of which diverged. A report of
-two 1466-token requests in one process differing has not reproduced here. The
-one-token case above does diverge and is a separate defect.
+multi-token requests inside one process, none of which diverged. Then five
+fresh server processes, each given six one-token prompts, four 1466-token
+prompts and three of each interleaved, every request with `n_probs 5`: all 30
+one-token answers were one result, all 20 long ones another, and the
+interleaved runs matched them - a one-token request after a long one is
+answered exactly as on its own. The report of two 1466-token requests in one
+process differing has not reproduced.
 
 Measure this on the logits, not on the generated text. The perturbation is
 small enough that the argmax token is usually unchanged, so the output is
@@ -157,12 +156,8 @@ those.
 **The per-op decode path is reproducible but wrong.** With
 `GGML_XDNA_FUSED_LAYER=0` three runs agree byte for byte and all three are
 degenerate - repeated tokens and mixed scripts rather than an answer. So the
-flag the weight-set check points at is not a usable fallback today: a model the
-fused layer refuses cannot be run correctly on this backend at all.
-
-**`kernels/gdn_v.py --run` cannot run.** It imports `ref_delta_layer` and
-`check_real`, neither of which is in the tree, and stops before it reaches the
-device. Its `--tolerance` gate is therefore untested.
+flag is a bisection switch, not a way to run a model the fused layer refuses:
+requantize that model instead (see Build).
 
 **A build writes into the source tree.** `kernels/design_tag.py` regenerates
 `xdna-design-tag.h`, which is tracked, so `git status` reports the working tree
@@ -179,8 +174,8 @@ as modified after every build.
   Verified against mlir-aie 1.4.3: the RTP buffer bases in `xdna-seq.h` are read
   back from that toolchain's placement, so a version bump needs them re-read
   from a freshly compiled project (the header says which values).
-- A model the fused decode path covers (see above), or any model for the per-op
-  path.
+- A model the fused decode path covers (see above and the requantization under
+  Build).
 
 ## Build
 
@@ -205,8 +200,21 @@ cmake --build build -j$(nproc)
   stage writes: `0` is the 4-bit form for a `Q4_K` `ssm_out`, `1` the 8-bit form
   for `Q5_K`/`Q6_K`. It is compiled into the artifact and into the backend, and
   the backend refuses a model whose `ssm_out` needs the other one. Q4_K_M
-  quants differ here: `qwen3.5-0.8b-q4km.gguf` leaves `ssm_out` at Q5_K (the
-  default), LM Studio's leaves it at Q4_K (`-DGGML_XDNA_GATED_FMT=0`).
+  quants differ here:
+  - `qwen3.5-0.8b-q4km.gguf` leaves `ssm_out` at Q5_K: the default covers it.
+  - LM Studio's leaves it at Q4_K: `-DGGML_XDNA_GATED_FMT=0`.
+  - The stock `Qwen/Qwen3.5-0.8B` `Q4_K_M` leaves half of them at `Q8_0`
+    (9 x Q4_K + 9 x Q8_0 on the 0.8B), which is outside the set entirely, so
+    neither value helps; it fails as
+    `fused layer 0: unsupported fused weight set (so=q8_0 gate=q4_K up=q4_K
+    down=q6_K)`.
+
+  Requantizing with `ssm_out` pinned to a covered type gives a model the fused
+  layer accepts on the default `GATED_FMT=1`:
+
+  ```sh
+  llama-quantize --tensor-type ssm_out=q5_K Qwen3.5-0.8B-BF16.gguf out.gguf Q4_K_M
+  ```
 
 Artifacts, all in the build output directory (`build/bin` by default):
 
@@ -262,6 +270,9 @@ backend is tested on.
 | `GGML_XDNA_GEMV_PROMOTE` | 1 | `0` stops one GEMV dispatch mixing weight formats |
 | `GGML_XDNA_GEMV_GROUP` | 0 | `1` moves the projections outside the fused layers onto the decode GEMV; slower, and not reproducible - see the limitations |
 | `GGML_XDNA_SPIN` | 1 | `0` blocks for kernel completion instead of polling |
+| `GGML_XDNA_HOST_BO` | 1 | `0` keeps llama's tensors in the plain CPU buffer type instead of XRT host BOs |
+| `GGML_XDNA_SETTLE_PASSES` | 2000 | reads of a marked output before a read gives up (`xdna_buffer_mark`) |
+| `GGML_XDNA_SETTLE_PAUSE` | 400 | pause loops between two such reads |
 
 ## Troubleshooting
 
@@ -276,9 +287,32 @@ backend is tested on.
   `GGML_XDNA_FUSED_LAYER=0` is set. Without it the decode still runs, on the
   per-op kernels.
 - **`unsupported fused weight set`** - the model's quantization is outside the
-  set the fused kernels were built for; run it with `GGML_XDNA_FUSED_LAYER=0`.
+  set the fused kernels were built for. Prefill runs, then the first decode
+  graph fails; under `llama-bench` the `ggml-xdna` line is not shown and all
+  that is printed is `failed to run gen warmup`. Requantize as shown under
+  Build. `GGML_XDNA_FUSED_LAYER=0` is a bisection switch, not a way to run it
+  (see the limitations).
 - **No NPU** - the backend still registers (llama.cpp expects every accelerator
   device to answer) but claims no ops, so everything runs on the CPU.
+
+## Checks
+
+- `test-xdna-repack` (ctest, no device) - which (type, format) repacks are
+  accepted, and that a refused one writes nothing and an accepted one exactly
+  its row.
+- `tests/test-xdna-reload -m model.gguf` - load, run and free a model several
+  times in one process; the tokens must match every cycle and the device
+  buffers held after a free must not grow.
+- `kernels/fused_core_check.py -d npu2` - the fused core's norm on edge-case
+  heads against `ggml_l2_norm`, and three tokens of its state update against
+  ggml's CPU gated delta rule.
+- `kernels/gemm.py --run`, `kernels/gemv_q4.py`, `kernels/gdn_prefill.py`
+  (also `--S 64`), `kernels/rec_gated.py --run` - each kernel against NumPy,
+  nonzero exit on a mismatch.
+
+The kernel scripts need XRT's environment (`source /opt/xilinx/xrt/setup.sh`):
+without `pyxrt` IRON cannot see the NPU and compiles for its default
+architecture.
 
 ## Code layout
 
