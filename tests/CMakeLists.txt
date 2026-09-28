@@ -618,6 +618,12 @@ llama_build_and_test(test-autorelease.cpp       LABEL "model")
 llama_build_and_test(test-backend-sampler.cpp   LABEL "model")
 llama_build_and_test(test-laya.cpp)
 
+# XDNA NPU: load, run and free a model several times in one process (#293).
+# Self-skipping when no XDNA device is registered.
+if (GGML_XDNA)
+    llama_build_and_test(test-xdna-reload.cpp       LABEL "model")
+endif()
+
 if (APPLE)
     llama_build(test-rset-release.cpp)
 endif()
