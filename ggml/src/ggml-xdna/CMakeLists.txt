@@ -112,6 +112,12 @@ endif()
 if (GGML_XDNA_BUILD_KERNELS)
     set(GEMM_DIR "${CMAKE_CURRENT_SOURCE_DIR}/kernels")
     set(XDNA_ARTIFACTS "")
+    # The shared kernel headers are pasted into each source by kernelsrc.py, so
+    # a design must rebuild when one of them changes.
+    set(XDNA_KERNEL_HEADERS
+        "${GEMM_DIR}/xdna-vec.h"
+        "${GEMM_DIR}/xdna-math.h"
+    )
 
     # Geometry: the decode M block (native bf16 r=4) plus every prefill M block
     # (bfp16 r=8 / int8 r=8; the two routes bake different tile_m). Stems must
@@ -154,7 +160,7 @@ if (GGML_XDNA_BUILD_KERNELS)
                     ${BFP16_ARGS}
                     --xclbin-path ${XCLBIN}
                     --insts-path ${INSTS}
-            DEPENDS "${GEMM_DIR}/gemm.py"
+            DEPENDS "${GEMM_DIR}/gemm.py" ${XDNA_KERNEL_HEADERS}
             WORKING_DIRECTORY "${GEMM_DIR}"
             COMMENT "ggml-xdna: compiling GEMM kernel M${M_VAL} K1024 N2048 bfp16=${BFP16_VAL} c${XDNA_N_COLS}"
             VERBATIM
@@ -187,7 +193,7 @@ if (GGML_XDNA_BUILD_KERNELS)
                     -d npu2
                     --xclbin-path ${INT8_XCLBIN}
                     --insts-path ${INT8_INSTS}
-            DEPENDS "${GEMM_DIR}/gemm.py"
+            DEPENDS "${GEMM_DIR}/gemm.py" ${XDNA_KERNEL_HEADERS}
             WORKING_DIRECTORY "${GEMM_DIR}"
             COMMENT "ggml-xdna: compiling int8 GEMM kernel M${M_VAL} K1024 N2048 c${XDNA_N_COLS}"
             VERBATIM
@@ -210,7 +216,7 @@ if (GGML_XDNA_BUILD_KERNELS)
                 -d npu2
                 --xclbin-path ${GDN_PREFILL_XCLBIN}
                 --insts-path ${GDN_PREFILL_INSTS}
-        DEPENDS "${GEMM_DIR}/gdn_prefill.py" "${GEMM_DIR}/gdn-prefill.cc"
+        DEPENDS "${GEMM_DIR}/gdn_prefill.py" "${GEMM_DIR}/gdn-prefill.cc" ${XDNA_KERNEL_HEADERS}
         WORKING_DIRECTORY "${GEMM_DIR}"
         COMMENT "ggml-xdna: compiling GDN prefill kernel S128 H16 CS64"
         VERBATIM
@@ -235,7 +241,7 @@ if (GGML_XDNA_BUILD_KERNELS)
                 --bf16
                 --xclbin-path ${CONV_XCLBIN}
                 --insts-path ${CONV_INSTS}
-        DEPENDS "${GEMM_DIR}/conv.py" "${GEMM_DIR}/conv-ssm.cc"
+        DEPENDS "${GEMM_DIR}/conv.py" "${GEMM_DIR}/conv-ssm.cc" ${XDNA_KERNEL_HEADERS}
         WORKING_DIRECTORY "${GEMM_DIR}"
         COMMENT "ggml-xdna: compiling conv kernel C16 T256 KW4 MB8 (token-major, bf16)"
         VERBATIM
@@ -257,14 +263,14 @@ if (GGML_XDNA_BUILD_KERNELS)
                 --cols 8 --KVH 2 --MT 32 --JT 8 --NMB 1 --NJ 64
                 --xclbin-path ${FA_XCLBIN}
                 --insts-path ${FA_INSTS}
-        DEPENDS "${GEMM_DIR}/fa.py" "${GEMM_DIR}/attn-fa.cc"
+        DEPENDS "${GEMM_DIR}/fa.py" "${GEMM_DIR}/attn-fa.cc" ${XDNA_KERNEL_HEADERS}
         WORKING_DIRECTORY "${GEMM_DIR}"
         COMMENT "ggml-xdna: compiling flash attention kernel D256 MT32 JT8 NJ64"
         VERBATIM
     )
     list(APPEND XDNA_ARTIFACTS ${FA_XCLBIN} ${FA_INSTS})
 
-    # Prefill GEMM (pgemm.py + gemm-expand.cc, FLM_PREFILL_PLAN.md step 1):
+    # Prefill GEMM (pgemm.py + gemm-expand.cc):
     # every core expands the decode GEMV's own weight tiles into bf16 and runs
     # the bfp16 mmul. The cores read their loop counts from the first A object,
     # so one artifact covers every M, K, N and both tile formats; the runner
@@ -279,7 +285,7 @@ if (GGML_XDNA_BUILD_KERNELS)
                 -d npu2
                 --xclbin-path ${PG_XCLBIN}
                 --insts-path ${PG_INSTS}
-        DEPENDS "${GEMM_DIR}/pgemm.py" "${GEMM_DIR}/gemm-expand.cc"
+        DEPENDS "${GEMM_DIR}/pgemm.py" "${GEMM_DIR}/gemm-expand.cc" ${XDNA_KERNEL_HEADERS}
                 "${GEMM_DIR}/gemv_q4.py" "${GEMM_DIR}/wfmt.py"
         WORKING_DIRECTORY "${GEMM_DIR}"
         COMMENT "ggml-xdna: compiling the prefill GEMM"
@@ -287,7 +293,7 @@ if (GGML_XDNA_BUILD_KERNELS)
     )
     list(APPEND XDNA_ARTIFACTS ${PG_XCLBIN} ${PG_INSTS})
 
-    # Prefill attention (attn_mm.py + attn-mm.cc, FLM_PREFILL_PLAN.md step 4):
+    # Prefill attention (attn_mm.py + attn-mm.cc):
     # the six full-attention layers on the mmul, the cores driven by a header
     # (passes, the ubatch's first position), so one artifact covers every
     # length; the runner (xdna-attn-mm.cpp) builds each call's TXN stream.
@@ -300,16 +306,16 @@ if (GGML_XDNA_BUILD_KERNELS)
                 -d npu2
                 --xclbin-path ${AM_XCLBIN}
                 --insts-path ${AM_INSTS}
-        DEPENDS "${GEMM_DIR}/attn_mm.py" "${GEMM_DIR}/attn-mm.cc"
+        DEPENDS "${GEMM_DIR}/attn_mm.py" "${GEMM_DIR}/attn-mm.cc" ${XDNA_KERNEL_HEADERS}
         WORKING_DIRECTORY "${GEMM_DIR}"
         COMMENT "ggml-xdna: compiling the prefill attention"
         VERBATIM
     )
     list(APPEND XDNA_ARTIFACTS ${AM_XCLBIN} ${AM_INSTS})
 
-    # Prefill gated delta rule (gdn_mm.py + gdn-mm.cc, FLM_PREFILL_PLAN.md
-    # step 3): the recurrent layers' state on the array for the whole ubatch,
-    # the cores driven by a header, one artifact for every length; the runner
+    # Prefill gated delta rule (gdn_mm.py + gdn-mm.cc): the recurrent layers'
+    # state on the array for the whole ubatch, the cores driven by a header, one
+    # artifact for every length; the runner
     # (xdna-gdn-mm.cpp) builds each call's TXN stream.
     set(GM_STEM "gdn_mm_c8")
     set(GM_XCLBIN "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/${GM_STEM}.xclbin")
@@ -320,7 +326,7 @@ if (GGML_XDNA_BUILD_KERNELS)
                 -d npu2
                 --xclbin-path ${GM_XCLBIN}
                 --insts-path ${GM_INSTS}
-        DEPENDS "${GEMM_DIR}/gdn_mm.py" "${GEMM_DIR}/gdn-mm.cc"
+        DEPENDS "${GEMM_DIR}/gdn_mm.py" "${GEMM_DIR}/gdn-mm.cc" ${XDNA_KERNEL_HEADERS}
         WORKING_DIRECTORY "${GEMM_DIR}"
         COMMENT "ggml-xdna: compiling the prefill gated delta rule"
         VERBATIM
@@ -340,7 +346,7 @@ if (GGML_XDNA_BUILD_KERNELS)
                 -d npu2
                 --xclbin-path ${GC_XCLBIN}
                 --insts-path ${GC_INSTS}
-        DEPENDS "${GEMM_DIR}/gdn_conv.py" "${GEMM_DIR}/gdn-conv.cc"
+        DEPENDS "${GEMM_DIR}/gdn_conv.py" "${GEMM_DIR}/gdn-conv.cc" ${XDNA_KERNEL_HEADERS}
         WORKING_DIRECTORY "${GEMM_DIR}"
         COMMENT "ggml-xdna: compiling the GDN conv input"
         VERBATIM
@@ -367,17 +373,13 @@ if (GGML_XDNA_BUILD_KERNELS)
                 -d npu2
                 --xclbin-path ${FL_XCLBIN}
                 --insts-path ${FL_INSTS}
-        DEPENDS "${GEMM_DIR}/fused_layer.py" "${GEMM_DIR}/attn_gdn_gated.py"
+        DEPENDS "${GEMM_DIR}/fused_layer.py" ${XDNA_KERNEL_HEADERS}
                 "${GEMM_DIR}/gemv_q4.py" "${GEMM_DIR}/gemv-q4.cc"
                 "${GEMM_DIR}/gemv-zero.cc" "${GEMM_DIR}/gemv-merge.cc"
-                "${GEMM_DIR}/attn_cn.py"
-                "${GEMM_DIR}/gdn_v.py" "${GEMM_DIR}/rec_gated.py"
-                "${GEMM_DIR}/rec_post.py"
                 "${GEMM_DIR}/attn-conv.cc" "${GEMM_DIR}/attn-norm.cc"
                 "${GEMM_DIR}/gdn-v.cc" "${GEMM_DIR}/rec-gated.cc"
                 "${GEMM_DIR}/gated-h2.cc" "${GEMM_DIR}/attn-dec.cc"
                 "${GEMM_DIR}/act-att.cc"
-                "${GEMM_DIR}/silu-f32.h"
         WORKING_DIRECTORY "${GEMM_DIR}"
         COMMENT "ggml-xdna: compiling the merged recurrent layer"
         VERBATIM
@@ -418,7 +420,7 @@ if (GGML_XDNA_BUILD_KERNELS)
                 --cols ${XDNA_GEMV_COLS}
                 --xclbin-path ${GV_XCLBIN}
                 --insts-path ${GV_INSTS}
-        DEPENDS "${GEMM_DIR}/gemv_q4.py" "${GEMM_DIR}/gemv-q4.cc"
+        DEPENDS "${GEMM_DIR}/gemv_q4.py" "${GEMM_DIR}/gemv-q4.cc" ${XDNA_KERNEL_HEADERS}
                 "${GEMM_DIR}/gemv-zero.cc" "${GEMM_DIR}/wfmt.py"
         WORKING_DIRECTORY "${GEMM_DIR}"
         COMMENT "ggml-xdna: compiling decode GEMV ${GV_STEM}"
@@ -471,7 +473,7 @@ if (GGML_XDNA_BUILD_KERNELS)
                 ${GEMM_PYTHON} "${GEMM_DIR}/design_tag.py"
                 --stamp-dir ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}
                 --extra npu2
-        DEPENDS ${XDNA_ARTIFACTS} "${GEMM_DIR}/design_tag.py"
+        DEPENDS ${XDNA_ARTIFACTS} "${GEMM_DIR}/design_tag.py" ${XDNA_KERNEL_HEADERS}
         WORKING_DIRECTORY "${GEMM_DIR}"
         COMMENT "ggml-xdna: stamping kernel artifacts with the design tag"
         VERBATIM

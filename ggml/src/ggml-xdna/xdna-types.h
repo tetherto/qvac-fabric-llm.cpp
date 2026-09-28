@@ -40,11 +40,16 @@ struct xdna_kernel {
 
 // A host-visible device buffer object (BO).
 struct xdna_buffer {
-    xrt::bo bo;
-    size_t  bytes = 0;
+    xrt::bo       bo;
+    // The host mapping, taken once when the buffer is created. xrt::bo::map()
+    // can fail, and it is the only way to reach the BO's memory, so the pointer
+    // is cached here where the failure can still be reported and the buffer
+    // freed: a buffer that exists always has a valid mapping.
+    void *        data     = nullptr;
+    size_t        bytes    = 0;
     // The BO this one is a view of (null: its own) and where in it: what a
     // joined stream names instead of this buffer.
-    xdna_buffer * root = nullptr;
+    xdna_buffer * root     = nullptr;
     size_t        root_off = 0;
 };
 
@@ -55,7 +60,7 @@ struct xdna_buffer {
 struct xdna_kernel_pool {
     struct pool_entry {
         xdna_buffer * buf;
-        uint64_t      seq;   // idle stamp, lower = older
+        uint64_t      seq;  // idle stamp, lower = older
     };
 
     static constexpr size_t MAX_POOL_SIZE = 16;

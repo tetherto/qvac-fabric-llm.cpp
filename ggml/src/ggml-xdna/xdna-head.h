@@ -20,9 +20,11 @@ struct xdna_buffer;
 // weight's shape or type does not serve. With `res` and the output norm's
 // gamma and epsilon the head can also take its input from the residual rows
 // (xdna-gemv.h XDNA_RES_*): rms_norm(F + A) * gamma on the prologue.
-xdna_head * xdna_head_create(struct xdna_kernel_pool * pool, const struct ggml_tensor * w,
-                             struct xdna_buffer * res = nullptr, const float * gamma = nullptr,
-                             float eps = 0.0f);
+xdna_head * xdna_head_create(struct xdna_kernel_pool *  pool,
+                             const struct ggml_tensor * w,
+                             struct xdna_buffer *       res   = nullptr,
+                             const float *              gamma = nullptr,
+                             float                      eps   = 0.0f);
 void        xdna_head_free(xdna_head * h);
 
 // logits = W x for one row x of the weight's K.
@@ -30,6 +32,6 @@ bool xdna_head_run(xdna_head * h, const float * x, float * logits);
 
 // Whether the head takes its input from the rows; start it so, without
 // waiting, and read its logits once the returned run has been waited for.
-bool       xdna_head_rows(const xdna_head * h);
-xrt::run * xdna_head_start_rows(xdna_head * h);
-void       xdna_head_read(xdna_head * h, float * logits);
+bool               xdna_head_rows(const xdna_head * h);
+xrt::run *         xdna_head_start_rows(xdna_head * h);
+[[nodiscard]] bool xdna_head_read(xdna_head * h, float * logits);

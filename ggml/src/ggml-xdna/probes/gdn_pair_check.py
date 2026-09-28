@@ -1,6 +1,6 @@
-# One head of the prefill gated delta rule on the mmul (FLM_PREFILL_PLAN.md,
-# step 3, build order 1) against ggml's token recurrence: two cores, each
-# holding the state for half of the value columns (kernels/gdn-mm.cc).
+# One head of the prefill gated delta rule on the mmul against ggml's token
+# recurrence: two cores, each holding the state for half of the value columns
+# (kernels/gdn-mm.cc).
 # On the bench, in the IRON env:
 #   NPU_CACHE_HOME=$(mktemp -d) python probes/gdn_pair_check.py [chunks] [gate scale]
 import hashlib
@@ -99,10 +99,8 @@ def unblk(x, r, c):
 
 rng = np.random.default_rng(0)
 nrm = lambda x: x / np.linalg.norm(x, axis=-1, keepdims=True)
-q = nrm(rng.standard_normal((T, D)))
-k = nrm(rng.standard_normal((T, D)))
-v = rng.standard_normal((T, D))
-beta = 1 / (1 + np.exp(-rng.standard_normal(T)))
+q = nrm(rng.standard_normal((T, D))); k = nrm(rng.standard_normal((T, D)))
+v = rng.standard_normal((T, D)); beta = 1 / (1 + np.exp(-rng.standard_normal(T)))
 g = -np.log1p(np.exp(rng.standard_normal(T))) * GS
 S0 = rng.standard_normal((D, D)) * 0.1
 qb, kb, vb = (x.astype(np.float32).astype(bf16) for x in (q, k, v))
@@ -124,18 +122,15 @@ for c in range(NCH):
     sc = 1 / np.sqrt(D)
     f = np.concatenate([2.0 ** (gam + ls), 2.0 ** (gam + ls) * sc, 2.0 ** (gam[-1] - gam - lsn), bt,
                         blk(np.where(lo_, bt[:, None] * Dm, 0.0)), blk(np.where(le_, Dm * sc, 0.0))]).astype(np.float32)
-    tail = np.zeros(32, np.int32)
-    tail[0] = shift
+    tail = np.zeros(32, np.int32); tail[0] = shift
     fxs.append(np.concatenate([f.view(np.int32), tail]).view(bf16))
     ls = ls_new + shift
 xin = np.zeros((2, NIN, IN_N), bf16)
 for h in range(2):
-    hdr = np.zeros(IN_N // 2, np.int32)
-    hdr[0] = NCH
+    hdr = np.zeros(IN_N // 2, np.int32); hdr[0] = NCH
     xin[h, 0] = hdr.view(bf16)
     s = S0[:, h * DV:(h + 1) * DV].astype(np.float32)
-    shi = s.astype(bf16)
-    slo = (s - shi.astype(np.float32)).astype(bf16)
+    shi = s.astype(bf16); slo = (s - shi.astype(np.float32)).astype(bf16)
     parts = np.concatenate([blk(shi), blk(slo)])
     for p in range(4):
         xin[h, 1 + p, :4096] = parts[p * 4096:(p + 1) * 4096]
@@ -151,20 +146,16 @@ x_t._sync_to_device()
 pair(x_t, o_t)
 o_t._sync_from_device()
 ob = o_t.numpy().reshape(2, NOUT, O_N)
-got = np.zeros((T, D))
-S_got = np.zeros((D, D))
+got = np.zeros((T, D)); S_got = np.zeros((D, D))
 for h in range(2):
     for c in range(NCH):
         got[c * C:(c + 1) * C, h * DV:(h + 1) * DV] = unblk(ob[h, c], C, DV)
     st = ob[h, NCH:NCH + 8].reshape(-1).view(bf16).astype(np.float64)
     S_got[:, h * DV:(h + 1) * DV] = 2.0 ** ls * (unblk(st[:DK * DV], DK, DV) + unblk(st[DK * DV:], DK, DV))
 
-S = S0.copy()
-ref = np.zeros((T, D))
+S = S0.copy(); ref = np.zeros((T, D))
 for t in range(T):
-    S *= np.exp(g[t])
-    delta = beta[t] * (v[t] - S.T @ k[t])
-    S += np.outer(k[t], delta)
+    S *= np.exp(g[t]); delta = beta[t] * (v[t] - S.T @ k[t]); S += np.outer(k[t], delta)
     ref[t] = (S.T @ q[t]) / np.sqrt(D)
 e = lambda a, b: np.sqrt(((a - b) ** 2).mean() / (b ** 2).mean())
 print(f"{NCH} chunks ({T} tokens), gate x{GS}: out rel {e(got, ref):.3e}  state rel {e(S_got, S):.3e}")
