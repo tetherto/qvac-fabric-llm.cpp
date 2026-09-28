@@ -10190,6 +10190,45 @@ struct test_mul_mat_fusion_w4a8 : public test_mul_mat_fusion {
     }
 };
 
+// A scheduler weight copy has OP_NONE but may be reused after its matmul.
+// The fused gate/up/GLU kernel must not write its output into that input.
+struct test_mul_mat_vec_fusion_alias : public test_case {
+    const ggml_type type;
+    ggml_tensor * gate = nullptr;
+    ggml_tensor * out = nullptr;
+
+    explicit test_mul_mat_vec_fusion_alias(ggml_type type) : type(type) {}
+
+    std::string vars() override { return VARS_TO_STR1(type); }
+    std::string op_desc(ggml_tensor *) override { return "MUL_MAT_VEC_FUSION_ALIAS"; }
+    bool run_whole_graph() override { return true; }
+    double max_nmse_err() override { return 5e-3; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        constexpr int n_experts = 8;
+        gate = ggml_new_tensor_3d(ctx, type, 256, 2048, n_experts);
+        ggml_set_name(gate, "staged_gate");
+        ggml_tensor * up = ggml_dup_tensor(ctx, gate);
+        ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 256, 1, 1);
+        ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_experts, 1);
+        ggml_set_name(ids, "ids");
+        ggml_tensor * g = ggml_mul_mat_id(ctx, gate, x, ids);
+        ggml_tensor * u = ggml_mul_mat_id(ctx, up, x, ids);
+        out = ggml_glu_split(ctx, g, u, GGML_GLU_OP_SWIGLU);
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        init_mul_mat_id_tensors(ctx, 8);
+        // Simulate allocator reuse of a dead gate copy. The ordinary sequence
+        // is valid; fusion would overwrite later experts while reading them.
+        const size_t offset = ggml_nbytes(gate) / 2;
+        GGML_ASSERT(offset + ggml_nbytes(out) <= ggml_nbytes(gate));
+        out->data = static_cast<char *>(gate->data) + offset;
+        out->buffer = gate->buffer;
+    }
+};
+
 // GGML_OP_UNARY + GGML_OP_MUL
 struct test_unary_mul_fusion : public test_case {
     const ggml_type type;
@@ -15815,6 +15854,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat_fusion_w4a8(GGML_TYPE_NVFP4, GGML_GLU_OP_SWIGLU, 150,  2560, 256, true, 16, 8, false, false, true, true));
     // K = 2048: few-row MMQ, where enabled, takes the gate and up matmuls instead of the fused MMQ path
     test_cases.emplace_back(new test_mul_mat_fusion(GGML_TYPE_Q4_K,   GGML_GLU_OP_SWIGLU,         9,   128, 2048, false, 1, 1, false, false, true, false, { 1, 1 }));
+    for (ggml_type type : { GGML_TYPE_IQ2_XS, GGML_TYPE_Q4_0 }) {
+        test_cases.emplace_back(new test_mul_mat_vec_fusion_alias(type));
+    }
 
     // stacked gate/up weights split into two views
     for (ggml_type type : { GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K }) {
