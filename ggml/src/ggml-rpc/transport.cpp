@@ -156,7 +156,7 @@ struct socket_t::impl {
     bool tcp_peer_closed();
     bool rdma_activate(uint32_t remote_qpn, uint32_t remote_psn, const uint8_t * remote_gid);
     bool rdma_poll(struct ibv_cq * cq, struct ibv_wc * wc);
-    bool rdma_wait_event();
+    bool rdma_wait_event(std::chrono::steady_clock::time_point deadline);
 
     std::unique_ptr<rdma_conn> rdma;
     rdma_local_info            rdma_local = {};
@@ -419,16 +419,30 @@ bool socket_t::impl::rdma_activate(uint32_t remote_qpn, uint32_t remote_psn, con
     return true;
 }
 
-// Sleep until the completion channel has an event or the TCP peer closes.
-bool socket_t::impl::rdma_wait_event() {
+// Sleep until the completion channel has an event, the TCP peer closes or the deadline passes.
+bool socket_t::impl::rdma_wait_event(std::chrono::steady_clock::time_point deadline) {
     rdma_conn * c = rdma.get();
     // POLLHUP and POLLERR are always reported, the TCP socket carries no data after the RDMA upgrade
     struct pollfd pfds[2] = {
         { c->ch->fd, POLLIN,    0 },
         { fd,        POLLRDHUP, 0 },
     };
-    if (poll(pfds, 2, -1) < 0) {
+    int remaining_ms = -1;
+    if (deadline != std::chrono::steady_clock::time_point::max()) {
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= deadline) {
+            GGML_LOG_ERROR("RDMA operation timed out\n");
+            return false;
+        }
+        remaining_ms = std::max(1, (int) std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now).count());
+    }
+    const int n = poll(pfds, 2, remaining_ms);
+    if (n < 0) {
         return errno == EINTR;
+    }
+    if (n == 0) {
+        GGML_LOG_ERROR("RDMA operation timed out\n");
+        return false;
     }
     if (pfds[1].revents & (POLLHUP | POLLERR | POLLRDHUP)) {
         return false;
@@ -463,7 +477,7 @@ bool socket_t::impl::rdma_poll(struct ibv_cq * cq, struct ibv_wc * wc) {
         if (n < 0) return false;
         if (armed) {
             // armed and still empty: sleep until the next completion
-            if (!rdma_wait_event()) {
+            if (!rdma_wait_event(deadline)) {
                 return false;
             }
             armed = false;
