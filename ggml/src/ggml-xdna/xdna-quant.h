@@ -67,19 +67,17 @@
 
 // Group sizes and on-wire group strides.
 enum {
-    XDNA_Q4G32_GROUP = 32,
-    XDNA_Q8G16_GROUP = 32,
+    XDNA_Q4G32_GROUP     = 32,
+    XDNA_Q8G16_GROUP     = 32,
     // A record is one ggml super-block, whatever the group width.
     XDNA_SB_VALUES       = 256,
-    XDNA_SB_PARAM        = 8,        // dS_hi, dS_lo, mS_hi, mS_lo
+    XDNA_SB_PARAM        = 8,  // dS_hi, dS_lo, mS_hi, mS_lo
     XDNA_Q4G32_CODE      = XDNA_Q4G32_GROUP / 2,
     XDNA_Q8G16_CODE      = XDNA_Q8G16_GROUP,
-    XDNA_Q4G32_SB_GROUPS = XDNA_SB_VALUES / XDNA_Q4G32_GROUP,   // 8
-    XDNA_Q8G16_SB_GROUPS = XDNA_SB_VALUES / XDNA_Q8G16_GROUP,   // 8
-    XDNA_Q4G32_SB_BYTES  = XDNA_Q4G32_SB_GROUPS * XDNA_Q4G32_CODE +
-                           2 * XDNA_Q4G32_SB_GROUPS + XDNA_SB_PARAM,   // 152
-    XDNA_Q8G16_SB_BYTES  = XDNA_Q8G16_SB_GROUPS * XDNA_Q8G16_CODE +
-                           2 * XDNA_Q8G16_SB_GROUPS + XDNA_SB_PARAM,   // 280
+    XDNA_Q4G32_SB_GROUPS = XDNA_SB_VALUES / XDNA_Q4G32_GROUP,                                                  // 8
+    XDNA_Q8G16_SB_GROUPS = XDNA_SB_VALUES / XDNA_Q8G16_GROUP,                                                  // 8
+    XDNA_Q4G32_SB_BYTES  = XDNA_Q4G32_SB_GROUPS * XDNA_Q4G32_CODE + 2 * XDNA_Q4G32_SB_GROUPS + XDNA_SB_PARAM,  // 152
+    XDNA_Q8G16_SB_BYTES  = XDNA_Q8G16_SB_GROUPS * XDNA_Q8G16_CODE + 2 * XDNA_Q8G16_SB_GROUPS + XDNA_SB_PARAM,  // 280
 };
 
 // Which NPU format a ggml type repacks into.
@@ -101,8 +99,7 @@ bool xdna_wfmt_repack_row(enum ggml_type type, const void * src, int64_t k, void
 // Repack `src` into an explicitly chosen format. Only Q4_K has a choice: it
 // repacks into q4g32 by default and into q8g16 when asked, which is what lets
 // the GEMV keep every type on one format.
-bool xdna_wfmt_repack_row_as(enum ggml_type type, xdna_wfmt fmt, const void * src,
-                             int64_t k, void * dst);
+bool xdna_wfmt_repack_row_as(enum ggml_type type, xdna_wfmt fmt, const void * src, int64_t k, void * dst);
 
 // The format the decode GEMV uses for `type`. Both widths pack into the same
 // tile size, so a single artifact streams either and the GEMV never switches
