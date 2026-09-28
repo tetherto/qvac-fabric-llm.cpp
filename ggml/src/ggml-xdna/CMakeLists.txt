@@ -350,7 +350,7 @@ if (GGML_XDNA_BUILD_KERNELS)
     # stamps files under the new tag while the declared outputs and the install
     # list still carry the old one.
     file(GLOB XDNA_TAG_SOURCES CONFIGURE_DEPENDS
-         "${GEMM_DIR}/*.py" "${GEMM_DIR}/*.cc")
+         "${GEMM_DIR}/*.py" "${GEMM_DIR}/*.cc" "${GEMM_DIR}/*.h")
     set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
                  ${XDNA_TAG_SOURCES})
     execute_process(
