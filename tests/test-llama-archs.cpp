@@ -180,6 +180,7 @@ static void usage(char ** argv) {
     LOG("  --mtp-shared[-cpu]       Run only the shared native-MTP buffer test (must be the sole argument)\n");
     LOG("  --hadamard-contracts     Run only the Hadamard GGUF contract test (must be the sole argument)\n");
     LOG("  --glm5-kpool-sequences   Run only the GLM5 k-pool sequence edit and shared-token test\n");
+    LOG("  --glm5-invalid-metadata  Run only the GLM5 invalid-metadata rejection test\n");
     LOG("  --qsa-unified-multiseq   Run only the QSA unified multi-sequence test\n\n");
     LOG("Examples:\n");
     LOG("  %s\n", argv[0]);
@@ -2267,6 +2268,36 @@ static int test_glm5_kpool_sequences() {
     return 0;
 }
 
+static int test_glm5_invalid_metadata() {
+    init_normal_pool(1234, 0.1f); // fill_normal draws from the shared pool (upstream 8542e94350f)
+    struct invalid_case {
+        const char * key;
+        uint32_t value;
+    };
+    const invalid_case cases[] = {
+        {"glm5-next.nextn_predict_layers", 2},
+        {"glm5-next.attention.indexer.kpool", 0},
+        {"glm5-next.attention.indexer.top_k", 0},
+        {"glm5-next.attention.indexer.top_k", 5},
+        {"glm5-next.hyper_connection.count", 3},
+    };
+
+    for (const auto & test : cases) {
+        auto metadata = get_gguf_ctx(LLM_ARCH_GLM5_NEXT, true);
+        gguf_set_val_u32(metadata.get(), test.key, test.value);
+        auto params = llama_model_default_params();
+        tensor_data_params tensor_params = { 1234, 0.1f };
+        llama_model_ptr model(llama_model_init_from_user(metadata.get(), set_tensor_data, &tensor_params, params));
+        if (model) {
+            printf("FAIL: GLM5 accepted %s=%u\n", test.key, test.value);
+            return 1;
+        }
+    }
+
+    printf("GLM5 invalid metadata rejected without aborting\n");
+    return 0;
+}
+
 int main(int argc, char ** argv) {
     // init the logger at max verbosity. filter with a custom callback respecting the user-configure verbosity
     common_log_set_verbosity_thold(LOG_LEVEL_DEBUG);
@@ -2281,6 +2312,9 @@ int main(int argc, char ** argv) {
     }
     if (argc == 2 && strcmp(argv[1], "--glm5-kpool-sequences") == 0) {
         return test_glm5_kpool_sequences();
+    }
+    if (argc == 2 && strcmp(argv[1], "--glm5-invalid-metadata") == 0) {
+        return test_glm5_invalid_metadata();
     }
     std::random_device rd;
 
