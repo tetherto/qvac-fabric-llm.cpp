@@ -1796,10 +1796,7 @@ static ggml_backend_buffer_type_t xdna_host_buffer_type(void) {
 static ggml_backend_buffer_type_t ggml_backend_xdna_device_get_buffer_type(ggml_backend_dev_t dev) {
     GGML_UNUSED(dev);
     // GGML_XDNA_HOST_BO=0 keeps the plain CPU buffer type.
-    static const bool bo = [] {
-        const char * e = getenv("GGML_XDNA_HOST_BO");
-        return !(e && e[0] == '0');
-    }();
+    static const bool bo = xdna_env_int("GGML_XDNA_HOST_BO", 1) != 0;
     return bo ? xdna_host_buffer_type() : ggml_backend_cpu_buffer_type();
 }
 
