@@ -4051,10 +4051,12 @@ static bool ggml_cuda_check_fusion_memory_ranges(const ggml_cgraph * cgraph,
             for (int src_idx = 0; src_idx < GGML_MAX_SRC; ++src_idx) {
                 const ggml_tensor * src = cgraph->nodes[j]->src[src_idx];
 
-                if (!src || src->op == GGML_OP_NONE || src == logits_may_alias) {
+                if (!src || src == logits_may_alias) {
                     continue;
                 }
 
+                // Scheduler copies are OP_NONE tensors too. Their storage can be
+                // reused after the original operation, but fusion keeps it live.
                 if (nodes_overlap(dst, src)) {
                     bool found = false;
 
