@@ -122,8 +122,8 @@ def build(dev_name: str = "npu2"):
                                                  Buffer(st_ty, name=f"st{col}_{i}"),
                                                  Buffer(n_ty, name=f"n{col}_{i}")],
                                   tile=Tile(col, 2 + i), stack_size=0xA80))
-    eps = ([f.prod(tile=Tile(col, 0)) for col, f in enumerate(x_col)] +
-           [f.cons(tile=Tile(col, 0)) for col, f in enumerate(o_col)])
+    eps = ([f.prod(tile=Tile(col, 0)) for col, f in enumerate(x_col)]
+           + [f.cons(tile=Tile(col, 0)) for col, f in enumerate(o_col)])
     return workers, eps
 
 
