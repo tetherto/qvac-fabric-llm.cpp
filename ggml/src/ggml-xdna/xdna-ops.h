@@ -149,6 +149,12 @@ void xdna_ops_plan_gemv(xdna_ops * ops, const struct ggml_cgraph * cgraph,
 // Discover the GEMM xclbin and set up the fixed geometry.
 void xdna_ops_init(xdna_ops * ops, xdna_kernel_pool * pool);
 
+// Free everything packed from a model's weights: the GEMM weight BOs (bf16
+// and int8) and the decode GEMV runners. They are keyed by the address of the
+// weights, which a later model can reuse, so they must not outlive the model
+// they were packed from. The next use packs again.
+void xdna_ops_release_weights(xdna_ops * ops);
+
 // True when `op` can be run on the NPU. Dispatches per-op (only GEMM so far).
 bool xdna_ops_supported(const xdna_ops * ops, const struct ggml_tensor * op);
 

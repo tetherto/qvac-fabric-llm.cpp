@@ -1128,6 +1128,35 @@ static bool gemm_supported(const xdna_ops * ops, const struct ggml_tensor * op) 
 
 // --- public API -------------------------------------------------------------
 
+void xdna_ops_release_weights(xdna_ops * ops) {
+    {
+        std::lock_guard<std::mutex> lock(ops->weight_mutex);
+        for (auto & kv : ops->weight_bo) {
+            xdna_buffer_free(kv.second);
+        }
+        ops->weight_bo.clear();
+    }
+    {
+        std::lock_guard<std::mutex> lock(ops->int8_mutex);
+        for (auto & kv : ops->int8_wbo_map) {
+            if (kv.second) {
+                xdna_buffer_free(kv.second->bo);
+            }
+            delete kv.second;
+        }
+        ops->int8_wbo_map.clear();
+    }
+    {
+        std::lock_guard<std::mutex> lock(ops->gemv_mutex);
+        for (auto & kv : ops->gemv) {
+            xdna_gemv_free(kv.second);
+        }
+        ops->gemv.clear();
+    }
+    ops->gemv_groups.clear();
+    ops->gemv_group_of.clear();
+}
+
 void xdna_ops_init(xdna_ops * ops, xdna_kernel_pool * pool) {
     ops->pool = pool;
     ops->gemm_tiles = xdna_gemm_tiles{};
