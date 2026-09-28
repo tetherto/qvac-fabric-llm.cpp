@@ -236,7 +236,6 @@ def _run_and_verify(opts) -> None:
     x = rng.standard_normal((MB, c_tot, T + KW - 1), dtype=np.float32)
     w = rng.standard_normal((MB, c_tot, KW), dtype=np.float32)
     bf16 = int(getattr(opts, "bf16", 0))
-    dt = np.dtype[bfloat16] if bf16 else np.dtype[np.float32]
     if bf16:
         # Quantize the operands before the reference so the check measures the
         # kernel and not the bf16 rounding of its inputs.
