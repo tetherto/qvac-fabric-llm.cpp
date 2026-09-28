@@ -6,9 +6,11 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <set>
+#include <string>
 #include <vector>
 
 namespace {
@@ -85,9 +87,12 @@ void repack_q4k_block(const block_q4_K * b, uint8_t * dst) {
     std::memcpy(dst + NG * XDNA_Q4G32_CODE + 2 * NG, p, sizeof(p));
 }
 
-// Repack one Q6_K super-block (256 values) into sixteen q8g16 groups. Q6_K is
-// symmetric with one int8 scale per 16 values, so the mapping is 1:1 and the
-// 6-bit code (-32..31) fits an int8 exactly.
+// Repack one Q6_K super-block (256 values) into eight 32-value groups. Q6_K
+// is symmetric with one int8 scale per 16 values, so a group holds two of
+// them: the group scale is the larger (by magnitude), the super-block's d is
+// quartered, and each code becomes 4 * q * s / S, rounded - exact for the
+// half whose scale is S (4 * q fits an int8 for q in -32..31), and two bits
+// finer than the source's own step for the other.
 void repack_q6k_block(const block_q6_K * b, uint8_t * dst) {
     const float d = GGML_FP16_TO_FP32(b->d);
 
@@ -108,21 +113,28 @@ void repack_q6k_block(const block_q6_K * b, uint8_t * dst) {
     }
 
     constexpr int NG = XDNA_Q8G16_SB_GROUPS;
+    constexpr int H  = XDNA_Q8G16_GROUP / 2;   // Q6_K's 16
     std::memset(dst, 0, XDNA_Q8G16_SB_BYTES);
     int8_t * d8 = (int8_t *) (dst + NG * XDNA_Q8G16_CODE);
     for (int g = 0; g < NG; g++) {
-        std::memcpy(dst + (size_t) g * XDNA_Q8G16_CODE,
-                    q + g * XDNA_Q8G16_GROUP, XDNA_Q8G16_GROUP);
-        d8[g] = b->scales[g];   // already the int8 the f16 d scales
+        const int s0 = b->scales[2 * g], s1 = b->scales[2 * g + 1];
+        const int S  = std::abs(s0) >= std::abs(s1) ? s0 : s1;
+        int8_t * out = (int8_t *) (dst + (size_t) g * XDNA_Q8G16_CODE);
+        for (int i = 0; S != 0 && i < XDNA_Q8G16_GROUP; i++) {
+            const int sh = i < H ? s0 : s1;
+            const int v  = (int) std::lrint(4.0 * q[g * XDNA_Q8G16_GROUP + i] * sh / S);
+            out[i] = (int8_t) std::min(127, std::max(-128, v));
+        }
+        d8[g] = (int8_t) S;
     }
     // Q6_K is symmetric: the min is zero, and so is every m8.
     uint16_t p[4] = { 0, 0, 0, 0 };
-    split_bf16(d, &p[0], &p[1]);
+    split_bf16(d * 0.25f, &p[0], &p[1]);
     std::memcpy(dst + NG * XDNA_Q8G16_CODE + 2 * NG, p, sizeof(p));
 }
 
-// Q4_K into q8g16: the same affine parameters as q4g32 carries, but with the
-// codes widened to int8 and written to both 16-halves of each 32-group.
+// Q4_K into the 8-bit form: the same affine parameters as q4g32 carries, with
+// the codes widened to int8.
 void repack_q4k_block_g16(const block_q4_K * b, uint8_t * dst) {
     const float d    = GGML_FP16_TO_FP32(b->d);
     const float dmin = GGML_FP16_TO_FP32(b->dmin);
@@ -131,22 +143,18 @@ void repack_q4k_block_g16(const block_q4_K * b, uint8_t * dst) {
     std::memset(dst, 0, XDNA_Q8G16_SB_BYTES);
     int8_t * d8 = (int8_t *) (dst + NG * XDNA_Q8G16_CODE);
     int8_t * m8 = d8 + NG;
-    for (int g = 0; g < 8; g++) {
+    for (int g = 0; g < NG; g++) {
         uint8_t sc = 0;
         uint8_t mn = 0;
         q4k_scale_min(g, b->scales, &sc, &mn);
         const uint8_t * q = b->qs + (g / 2) * 32;
         const bool high = (g & 1) != 0;
-
-        for (int h = 0; h < 2; h++) {
-            uint8_t * out = dst + (size_t) (2 * g + h) * XDNA_Q8G16_CODE;
-            for (int i = 0; i < XDNA_Q8G16_GROUP; i++) {
-                const int k = h * XDNA_Q8G16_GROUP + i;
-                out[i] = high ? (uint8_t) (q[k] >> 4) : (uint8_t) (q[k] & 0x0F);
-            }
-            d8[2 * g + h] = (int8_t) sc;
-            m8[2 * g + h] = (int8_t) mn;
+        uint8_t * out = dst + (size_t) g * XDNA_Q8G16_CODE;
+        for (int i = 0; i < XDNA_Q8G16_GROUP; i++) {
+            out[i] = high ? (uint8_t) (q[i] >> 4) : (uint8_t) (q[i] & 0x0F);
         }
+        d8[g] = (int8_t) sc;
+        m8[g] = (int8_t) mn;
     }
     uint16_t p[4];
     split_bf16(d,     &p[0], &p[1]);
@@ -155,7 +163,7 @@ void repack_q4k_block_g16(const block_q4_K * b, uint8_t * dst) {
 }
 
 // Q5_K has Q4_K's affine per-32 structure with a fifth bit in a separate
-// plane, so the code is 0..31 and the parameters are shared by both halves.
+// plane, so the code is 0..31 and a group is one of its 32-value blocks.
 void repack_q5k_block(const block_q5_K * b, uint8_t * dst) {
     const float d    = GGML_FP16_TO_FP32(b->d);
     const float dmin = GGML_FP16_TO_FP32(b->dmin);
@@ -164,25 +172,21 @@ void repack_q5k_block(const block_q5_K * b, uint8_t * dst) {
     std::memset(dst, 0, XDNA_Q8G16_SB_BYTES);
     int8_t * d8 = (int8_t *) (dst + NG * XDNA_Q8G16_CODE);
     int8_t * m8 = d8 + NG;
-    for (int g = 0; g < 8; g++) {
+    for (int g = 0; g < NG; g++) {
         uint8_t sc = 0;
         uint8_t mn = 0;
         q4k_scale_min(g, b->scales, &sc, &mn);
         const uint8_t * ql = b->qs + (g / 2) * 32;
         const uint8_t * qh = b->qh;
         const bool high = (g & 1) != 0;
-
-        for (int h = 0; h < 2; h++) {
-            uint8_t * out = dst + (size_t) (2 * g + h) * XDNA_Q8G16_CODE;
-            for (int i = 0; i < XDNA_Q8G16_GROUP; i++) {
-                const int k  = h * XDNA_Q8G16_GROUP + i;
-                const int lo = high ? (ql[k] >> 4) : (ql[k] & 0x0F);
-                const int hi = (qh[k] >> g) & 1;
-                out[i] = (uint8_t) (lo | (hi << 4));
-            }
-            d8[2 * g + h] = (int8_t) sc;
-            m8[2 * g + h] = (int8_t) mn;
+        uint8_t * out = dst + (size_t) g * XDNA_Q8G16_CODE;
+        for (int i = 0; i < XDNA_Q8G16_GROUP; i++) {
+            const int lo = high ? (ql[i] >> 4) : (ql[i] & 0x0F);
+            const int hi = (qh[i] >> g) & 1;
+            out[i] = (uint8_t) (lo | (hi << 4));
         }
+        d8[g] = (int8_t) sc;
+        m8[g] = (int8_t) mn;
     }
     uint16_t p[4];
     split_bf16(d,     &p[0], &p[1]);
@@ -216,10 +220,67 @@ xdna_wfmt xdna_wfmt_gemv_for(enum ggml_type type) {
     }
 }
 
+enum ggml_type xdna_gemv_type_of(const struct ggml_tensor * w) {
+    static const std::vector<std::string> sel = [] {
+        std::vector<std::string> v;
+        // Every attn_qkv and attn_v by default: measured one tensor at a time
+        // the KLD adds up, and these are the best tok/s per unit of it -
+        // 47.5 -> 52.4 tok/s at 1k for decode KLD 0.0051 -> 0.0122. ffn_down
+        // pays about half as much speed for the same accuracy.
+        const char * e = getenv("GGML_XDNA_W4");
+        if (!e) {
+            e = "attn_qkv,attn_v";
+        }
+        std::string cur;
+        for (const char * p = e ? e : ""; ; p++) {
+            if (*p == ',' || *p == '\0') {
+                if (!cur.empty()) {
+                    v.push_back(cur);
+                }
+                cur.clear();
+                if (*p == '\0') {
+                    break;
+                }
+            } else if (*p != ' ') {
+                cur += *p;
+            }
+        }
+        return v;
+    }();
+    if (!w || (w->type != GGML_TYPE_Q5_K && w->type != GGML_TYPE_Q6_K) || sel.empty()) {
+        return w ? w->type : GGML_TYPE_COUNT;
+    }
+    std::string name = w->name;
+    const std::string sfx = ".weight";
+    if (name.size() > sfx.size() && name.compare(name.size() - sfx.size(), sfx.size(), sfx) == 0) {
+        name.resize(name.size() - sfx.size());
+    }
+    if (name.find("ssm_out") != std::string::npos) {
+        return w->type;
+    }
+    for (const std::string & e : sel) {
+        if (name == e || (name.size() > e.size() &&
+                          name.compare(name.size() - e.size(), e.size(), e) == 0 &&
+                          name[name.size() - e.size() - 1] == '.')) {
+            return GGML_TYPE_Q4_K;
+        }
+    }
+    return w->type;
+}
+
 bool xdna_wfmt_repack_row_as(enum ggml_type type, xdna_wfmt fmt, const void * src,
                              int64_t k, void * dst) {
     if (!src || !dst || k <= 0 || k % QK_K) {
         return false;
+    }
+    if (fmt == XDNA_WFMT_Q4G32 && (type == GGML_TYPE_Q5_K || type == GGML_TYPE_Q6_K)) {
+        // Chosen for the 4-bit form (xdna_gemv_type_of): re-quantized to Q4_K
+        // from its dequantized values, then packed as one.
+        std::vector<float> f((size_t) k);
+        std::vector<block_q4_K> q((size_t) (k / QK_K));
+        ggml_get_type_traits(type)->to_float(src, f.data(), k);
+        quantize_row_q4_K_ref(f.data(), q.data(), k);
+        return xdna_wfmt_repack_row(GGML_TYPE_Q4_K, q.data(), k, dst);
     }
     if (fmt != XDNA_WFMT_Q8G16 || type != GGML_TYPE_Q4_K) {
         // Every other pair falls through to the repacker for `type`, which

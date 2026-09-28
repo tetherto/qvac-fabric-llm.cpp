@@ -12,13 +12,13 @@
 # the decode. Configured together there is nothing to alternate between.
 #
 # How they fit. An AIE2P column has four compute rows (2..5); the array is
-# eight columns. The core takes exactly one row in each column - conv on row 2
-# of columns 0-1, norm on row 3 of columns 2-3, the gated epilogue on row 4 of
-# column 2 and gdn on row 4 of columns 4-7 - so two further rows are free in
-# every column, though not the same two. The GEMV takes those, sixteen cores of
-# 64 output columns each, which is the same 1024 columns per pass as the
-# standalone eight-column design and the same weight bandwidth, since every
-# column still streams.
+# eight columns. The core's stages take rows 2 and 3 - conv on row 2 of columns
+# 0-1, the gated epilogue on row 2 of column 2, gdn on row 2 of columns 4-7, the
+# activation prologue and post_norm on row 3 of columns 0-1, norm on row 3 of
+# columns 4-7 - and the GEMV takes rows 4 and 5 of every column: a pool of
+# sixteen cores of 64 output columns each, FastFlowLM's pool size
+# (FLM_DECODE_KERNELS.md). A pass is the same 1024 columns as the standalone
+# eight-column design, and every column streams its own weights.
 #
 # Getting the two to fit was entirely a question of DMA channels, not compute
 # tiles. The array has 16 shim channels in each direction and 6 per MemTile,
@@ -58,15 +58,17 @@ import gemv_q4 as gq
 
 # The rows the core leaves free, per column. Kept next to the core's own
 # placement constants: if those move, this must move with them.
-# One compute row per column - row 5, which the core never uses - and 128
-# output columns per core. A pass still covers 1024 columns and every column
-# still streams, but with a single core per column the shim feeds it directly:
-# no weight split and no output join, so the GEMV needs no MemTile channels at
-# all, and those are what the two designs run out of.
-ROWS_FREE = "5"
+# Rows 4 and 5 of every column, each column's weights split between its two
+# cores in its MemTile. What decides the fit is not the tiles but the MemTile's
+# four streams from the north: every stream leaving the core rows for a MemTile
+# or the shim passes through one, and in columns 4-7 gdn already spends three.
+# So a column's two cores leave it as ONE stream - the row-5 core hands its
+# block to the row-4 core through the memory the tiles share (gemv_q4.py's
+# PAIR). Two streams a column do not route.
+ROWS_FREE = "4,5"
 
 COLS = 8
-N_CORE = 128
+N_CORE = 64
 
 # Columns sharing one output stream. A core's output is half a kilobyte a
 # chunk against tens of kilobytes of weights a tile, so joining the outputs in
@@ -80,7 +82,7 @@ OUT_GROUP = 2
 # hashes the generator and the files it is told about, not the C++ a design
 # happens to read at generation time, and a cached artifact built from an
 # older kernel is indistinguishable from a logic bug in the new one.
-@iron.jit(source_files=["gemv-q4.cc", "gemv-zero.cc"])
+@iron.jit(source_files=["gemv-q4.cc", "gemv-zero.cc", "gemv-merge.cc"])
 def fused_layer(
     feed: In,
     x: In,
@@ -91,6 +93,7 @@ def fused_layer(
     weights: In,
     acts: In,
     out: Out,
+    res: In,
     *,
     dev_name: CompileTime[str] = "npu2",
     FMT: CompileTime[str] = "q4g32",
@@ -111,7 +114,7 @@ def fused_layer(
     _os.environ["ACT_RAW"] = "1"
     cw, ca, cseq = ag.build_core(dev_name)
     gw, ga, gseq = gq.build_gemv(FMT, K, N, K_TILE, COLS, N_CORE, ROWS_FREE,
-                                 OUT_GROUP)
+                                 OUT_GROUP, PAIR=True, ATT=True)
 
     # Each half consumes exactly its own runtime arguments, in the order they
     # were concatenated, so the merged sequence just splits the list.

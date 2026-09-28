@@ -21,4 +21,5 @@ exclude =
 # The XDNA NPU kernel generators are standalone build scripts: they are run by
 # hand or by CMake and report progress on stdout.
 per-file-ignores =
-    ggml/src/ggml-xdna/kernels/*.py:NP100
+    ggml/src/ggml-xdna/kernels/*.py:NP100,E731
+    ggml/src/ggml-xdna/probes/*.py:NP100,E731,E741

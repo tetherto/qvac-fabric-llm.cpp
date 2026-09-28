@@ -93,7 +93,7 @@ N_OBJ_GDN = N_VH * N_OBJ // NC_GDN   # 32 chunk objects per gdn column
 
 STATE_N = N_VH * N_OBJ * gdn_v.ROWS  # 128 * 2048 bf16 rows-values
 
-GATED_COL = NC_CONV                  # 2 (first norm column; row 4 worker)
+GATED_COL = NC_CONV                  # 2 (first norm column; row 2 worker)
 
 # 3*S_V+1 is what a head needs (attn | z | gamma | hh); the stride is rounded
 # up to a multiple of the 16-lane vector so that a head inside a multi-head
@@ -411,7 +411,7 @@ def build_core(dev_name: str = "npu2"):
     if not onchip:
         rt_args += [no23.cons(tile=Tile(ncol0 + 1, 0))]
 
-    # ---- gdn: cols GDN_COL0..7, row 4 ----
+    # ---- gdn: cols GDN_COL0..7, row 2 (rows 4-5 are the GEMV pool's) ----
     # One stream for all four gdn columns instead of one each. A shim tile has
     # two DMA channels in each direction, so four columns of independent
     # streams take eight of the array's sixteen - more than the whole design
@@ -515,7 +515,7 @@ def build_core(dev_name: str = "npu2"):
         workers.append(Worker(
             gdn_fn, [p2[gi][0].cons(), s2[gi].cons(),
                      o12[gi].prod(), a12[gi].prod(), gdn_k],
-            tile=Tile(gcol0 + gi, 4), stack_size=0x3000))
+            tile=Tile(gcol0 + gi, 2), stack_size=0x3000))
     if not onchip:
         rt_args += [p3.prod(tile=Tile(PKV_COL, 0))]
     rt_args += [s3[g].prod(tile=Tile(S_COLS[g], 0)) for g in range(SG)]
@@ -523,7 +523,7 @@ def build_core(dev_name: str = "npu2"):
     if not att_onchip:
         rt_args += [a23.cons(tile=Tile(AZG_COL, 0))]
 
-    # ---- gated: col GATED_COL (= first norm column), row 4 ----
+    # ---- gated: col GATED_COL (= first norm column), row 2 ----
     gcol = GATED_COL
     # The stage is one tile consuming its heads one after another, and what it
     # spends its time on is the handshake, not the arithmetic - stubbing both
@@ -584,14 +584,14 @@ def build_core(dev_name: str = "npu2"):
         workers.append(Worker(gated_fn_on_s,
                               [az2.cons(), a23.cons(), gt12.prod(),
                                ga12.prod(), kh, kf],
-                              tile=Tile(gcol, 4), stack_size=0x3000))
+                              tile=Tile(gcol, 2), stack_size=0x3000))
     elif att_onchip:
         workers.append(Worker(gated_fn_on,
                               [az2.cons(), a23.cons(), gt12.prod(), kh, kf],
-                              tile=Tile(gcol, 4), stack_size=0x3000))
+                              tile=Tile(gcol, 2), stack_size=0x3000))
     else:
         workers.append(Worker(gated_fn, [az2.cons(), gt12.prod(), kh, kf],
-                              tile=Tile(gcol, 4), stack_size=0x3000))
+                              tile=Tile(gcol, 2), stack_size=0x3000))
     # The fill is on the attn column's shim, not this one: the GEMV's eight
     # weight streams want a tile each (gemv_q4.py) and this column's other
     # MM2S carries the norm x. The route crosses columns, which costs nothing
