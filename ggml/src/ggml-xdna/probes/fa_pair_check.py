@@ -86,10 +86,10 @@ def pair(q: In, kv: In, o: Out):
 
     rt = Runtime(seq, [np.ndarray[(2 * R * DH,), np.dtype[bf16]],
                        np.ndarray[(2 * NT * 2 * NK * DH,), np.dtype[bf16]],
-                       np.ndarray[(2 * R * DH,), np.dtype[np.float32]]] +
-                 [f.prod(tile=Tile(1, 0)) for f in fq] +
-                 [f.prod(tile=Tile(0, 0)) for f in fkv] +
-                 [f.cons(tile=Tile(0, 0)) for f in fo])
+                       np.ndarray[(2 * R * DH,), np.dtype[np.float32]]]
+                 + [f.prod(tile=Tile(1, 0)) for f in fq]
+                 + [f.prod(tile=Tile(0, 0)) for f in fkv]
+                 + [f.cons(tile=Tile(0, 0)) for f in fo])
     return Program(iron.get_current_device(), rt, workers=ws).resolve_program()
 
 

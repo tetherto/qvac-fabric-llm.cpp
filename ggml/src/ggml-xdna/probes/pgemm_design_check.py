@@ -96,6 +96,8 @@ def untiled(h):
         mr, kb, r, e = j // 512, (j // 64) % 8, (j // 8) % 8, j % 8
         o[(mr * 8 + r) * 64 + kb * 8 + e] = h[j]
     return o
+
+
 hdr = untiled(hdr)
 np.copyto(a_t.numpy(), np.concatenate([hdr, hdr, ablk.reshape(-1)]))
 w_t._sync_to_device()
