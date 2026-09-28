@@ -25,8 +25,7 @@ bool xdna_conv_prefill_supported(const struct ggml_tensor * node);
 // with the channels contiguous, taken before the graph's CPY overwrites the
 // conv state with this step's tail. It must outlive the graph.
 void xdna_conv_prefill_direct_reset(void);
-void xdna_conv_prefill_direct_add(const struct ggml_tensor * concat,
-                                  const float * hist, int64_t rows);
+void xdna_conv_prefill_direct_add(const struct ggml_tensor * concat, const float * hist, int64_t rows);
 
 // Run the op: tile the conv over channel groups and token tiles, pack x/w into
 // the token-major xw buffer, run MB-tile batches, scatter out into the ggml

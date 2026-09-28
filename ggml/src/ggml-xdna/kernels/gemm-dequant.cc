@@ -34,73 +34,50 @@
 // native multiply-accumulates into the f32 accumulator, and only the result is
 // rounded to bf16 - the same rounding the bf16 GEMM applies anyway.
 
-#include <aie_api/aie.hpp>
+#include "xdna-vec.h"
+
 #include <stdint.h>
 
-namespace {
+#include <aie_api/aie.hpp>
 
-// The core's default rounding mode is toward -inf, which biases about half the
-// weights by one bf16 ulp against ggml's round-half-to-even. Setting the mode
-// once per call makes the accumulator's own bf16 conversion match exactly, so
-// no fixup is needed on the store path.
-inline void set_round_half_even()
-{
-    aie::set_rounding(aie::rounding_mode::conv_even);
-}
-
-// Widen a T-lane f32 pattern to a full 32-lane vector by repeating it. Every
-// value of a sub-tile shares one group along K, so its scale depends only on
-// the column, and the column index repeats every MAC_T lanes.
-template <int T> inline aie::vector<bfloat16, 32> repeat_to_32(const aie::vector<bfloat16, T> &v)
-{
-    static_assert(T <= 32 && (32 % T) == 0, "MAC_T must divide the 32-lane vector");
-    if constexpr (T == 32) {
-        return v;
-    } else {
-        return repeat_to_32<2 * T>(aie::concat(v, v));
-    }
-}
-
-} // namespace
+namespace {}  // namespace
 
 extern "C" {
 
 #ifndef K_TILE
-#define K_TILE 64
+#    define K_TILE 64
 #endif
 #ifndef N_TILE
-#define N_TILE 64
+#    define N_TILE 64
 #endif
 #ifndef MAC_S
-#define MAC_S 8
+#    define MAC_S 8
 #endif
 #ifndef MAC_T
-#define MAC_T 8
+#    define MAC_T 8
 #endif
 #ifndef Q4_GROUP
-#define Q4_GROUP 32
+#    define Q4_GROUP 32
 #endif
 
 // q4g32: unsigned 4-bit codes, w = q * d + m.
-void dequant_q4g32_bf16(const uint8_t *in, bfloat16 *out)
-{
-    constexpr int KB = K_TILE / MAC_S;      // sub-tile rows
-    constexpr int NB = N_TILE / MAC_T;      // sub-tile cols
-    constexpr int VEC = 32;                 // lanes per vector op
-    constexpr int ST = MAC_S * MAC_T;       // values per sub-tile
-    constexpr int CH = ST / VEC;            // vector ops per sub-tile
-    constexpr int NG = K_TILE / Q4_GROUP;   // groups along K in this tile
-    constexpr int KG = Q4_GROUP / MAC_S;    // sub-tile rows per group
+void dequant_q4g32_bf16(const uint8_t * in, bfloat16 * out) {
+    constexpr int NB         = N_TILE / MAC_T;     // sub-tile cols
+    constexpr int VEC        = 32;                 // lanes per vector op
+    constexpr int ST         = MAC_S * MAC_T;      // values per sub-tile
+    constexpr int CH         = ST / VEC;           // vector ops per sub-tile
+    constexpr int NG         = K_TILE / Q4_GROUP;  // groups along K in this tile
+    constexpr int KG         = Q4_GROUP / MAC_S;   // sub-tile rows per group
     constexpr int CODE_BYTES = K_TILE * N_TILE / 2;
     static_assert(ST % VEC == 0, "sub-tile must be a whole number of vectors");
 
-    const uint8_t *__restrict pC = in;
-    const bfloat16 *__restrict pD = (const bfloat16 *)(in + CODE_BYTES);
-    const bfloat16 *__restrict pM = pD + 2 * NG * N_TILE;
+    const uint8_t * __restrict pC  = in;
+    const bfloat16 * __restrict pD = (const bfloat16 *) (in + CODE_BYTES);
+    const bfloat16 * __restrict pM = pD + 2 * NG * N_TILE;
 
     event0();
-    set_round_half_even();
-    const aie::vector<bfloat16, VEC> one = aie::broadcast<bfloat16, VEC>((bfloat16)1.0f);
+    xdna::round_half_even();
+    const aie::vector<bfloat16, VEC> one = aie::broadcast<bfloat16, VEC>((bfloat16) 1.0f);
 
     // Column block outermost, then group: the four parameter vectors are then
     // loaded once per (nb, g) and the inner run is KG*CH straight vector ops
@@ -109,82 +86,83 @@ void dequant_q4g32_bf16(const uint8_t *in, bfloat16 *out)
     for (int nb = 0; nb < NB; nb++) {
         const int n0 = nb * MAC_T;
         for (int g = 0; g < NG; g++) {
-            const bfloat16 *dg = pD + 2 * g * N_TILE;
-            const bfloat16 *mg = pM + 2 * g * N_TILE;
-            const aie::vector<bfloat16, VEC> dhi = repeat_to_32<MAC_T>(aie::load_v<MAC_T>(dg + n0));
-            const aie::vector<bfloat16, VEC> dlo = repeat_to_32<MAC_T>(aie::load_v<MAC_T>(dg + N_TILE + n0));
-            const aie::vector<bfloat16, VEC> mhi = repeat_to_32<MAC_T>(aie::load_v<MAC_T>(mg + n0));
-            const aie::vector<bfloat16, VEC> mlo = repeat_to_32<MAC_T>(aie::load_v<MAC_T>(mg + N_TILE + n0));
+            const bfloat16 *                 dg  = pD + 2 * g * N_TILE;
+            const bfloat16 *                 mg  = pM + 2 * g * N_TILE;
+            const aie::vector<bfloat16, VEC> dhi = xdna::repeat_to_32<MAC_T>(aie::load_v<MAC_T>(dg + n0));
+            const aie::vector<bfloat16, VEC> dlo = xdna::repeat_to_32<MAC_T>(aie::load_v<MAC_T>(dg + N_TILE + n0));
+            const aie::vector<bfloat16, VEC> mhi = xdna::repeat_to_32<MAC_T>(aie::load_v<MAC_T>(mg + n0));
+            const aie::vector<bfloat16, VEC> mlo = xdna::repeat_to_32<MAC_T>(aie::load_v<MAC_T>(mg + N_TILE + n0));
 
-            bfloat16 *__restrict pO = out + (size_t)(g * KG * NB + nb) * ST;
-            for (int i = 0; i < KG * CH; i++)
+            bfloat16 * __restrict pO = out + (size_t) (g * KG * NB + nb) * ST;
+            for (int i = 0; i < KG * CH; i++) {
                 chess_prepare_for_pipelining chess_loop_range(KG * CH, ) {
                     // VEC nibbles -> uint8 -> uint16 -> bf16 (values 0..15).
-                    aie::vector<uint4, VEC> q4 = aie::load_v<VEC>((const uint4 *)pC);
+                    aie::vector<uint4, VEC> q4 = aie::load_v<VEC>((const uint4 *) pC);
                     pC += VEC / 2;
-                    aie::vector<uint8, VEC> q8 = aie::unpack(q4);
-                    aie::vector<uint16, VEC> q16 = aie::unpack(q8);
+                    aie::vector<uint8, VEC>    q8  = aie::unpack(q4);
+                    aie::vector<uint16, VEC>   q16 = aie::unpack(q8);
                     // q is exact in bf16, so every product is exact in the f32
                     // accumulator: w = q*d_hi + q*d_lo + m_hi + m_lo.
-                    aie::vector<bfloat16, VEC> qb = aie::to_float<bfloat16>(q16, 0);
-                    aie::accum<accfloat, VEC> acc = aie::mul(qb, dhi);
-                    acc = aie::mac(acc, qb, dlo);
-                    acc = aie::mac(acc, mhi, one);
-                    acc = aie::mac(acc, mlo, one);
+                    aie::vector<bfloat16, VEC> qb  = aie::to_float<bfloat16>(q16, 0);
+                    aie::accum<accfloat, VEC>  acc = aie::mul(qb, dhi);
+                    acc                            = aie::mac(acc, qb, dlo);
+                    acc                            = aie::mac(acc, mhi, one);
+                    acc                            = aie::mac(acc, mlo, one);
                     aie::store_v(pO + (i % CH) * VEC, acc.template to_vector<bfloat16>(0));
                     if ((i % CH) == CH - 1) {
                         pO += (size_t) NB * ST;
                     }
                 }
+            }
         }
     }
     event1();
 }
 
 // q8g16: signed 8-bit codes, w = q * d (the min plane is absent).
-void dequant_q8g16_bf16(const uint8_t *in, bfloat16 *out)
-{
-    constexpr int NB = N_TILE / MAC_T;
-    constexpr int VEC = 32;
-    constexpr int ST = MAC_S * MAC_T;
-    constexpr int CH = ST / VEC;
-    constexpr int Q8_GROUP = 16;
-    constexpr int NG = K_TILE / Q8_GROUP;
-    constexpr int KG = Q8_GROUP / MAC_S;
+void dequant_q8g16_bf16(const uint8_t * in, bfloat16 * out) {
+    constexpr int NB         = N_TILE / MAC_T;
+    constexpr int VEC        = 32;
+    constexpr int ST         = MAC_S * MAC_T;
+    constexpr int CH         = ST / VEC;
+    constexpr int Q8_GROUP   = 16;
+    constexpr int NG         = K_TILE / Q8_GROUP;
+    constexpr int KG         = Q8_GROUP / MAC_S;
     constexpr int CODE_BYTES = K_TILE * N_TILE;
     static_assert(ST % VEC == 0, "sub-tile must be a whole number of vectors");
     static_assert(Q8_GROUP % MAC_S == 0, "a sub-tile row must sit inside one group");
 
-    const int8_t *__restrict pC = (const int8_t *)in;
-    const bfloat16 *__restrict pD = (const bfloat16 *)(in + CODE_BYTES);
+    const int8_t * __restrict pC   = (const int8_t *) in;
+    const bfloat16 * __restrict pD = (const bfloat16 *) (in + CODE_BYTES);
 
     event0();
-    set_round_half_even();
+    xdna::round_half_even();
 
     for (int nb = 0; nb < NB; nb++) {
         const int n0 = nb * MAC_T;
         for (int g = 0; g < NG; g++) {
-            const bfloat16 *dg = pD + 2 * g * N_TILE;
-            const aie::vector<bfloat16, VEC> dhi = repeat_to_32<MAC_T>(aie::load_v<MAC_T>(dg + n0));
-            const aie::vector<bfloat16, VEC> dlo = repeat_to_32<MAC_T>(aie::load_v<MAC_T>(dg + N_TILE + n0));
+            const bfloat16 *                 dg  = pD + 2 * g * N_TILE;
+            const aie::vector<bfloat16, VEC> dhi = xdna::repeat_to_32<MAC_T>(aie::load_v<MAC_T>(dg + n0));
+            const aie::vector<bfloat16, VEC> dlo = xdna::repeat_to_32<MAC_T>(aie::load_v<MAC_T>(dg + N_TILE + n0));
 
-            bfloat16 *__restrict pO = out + (size_t)(g * KG * NB + nb) * ST;
-            for (int i = 0; i < KG * CH; i++)
+            bfloat16 * __restrict pO = out + (size_t) (g * KG * NB + nb) * ST;
+            for (int i = 0; i < KG * CH; i++) {
                 chess_prepare_for_pipelining chess_loop_range(KG * CH, ) {
                     aie::vector<int8, VEC> q8 = aie::load_v<VEC>(pC);
                     pC += VEC;
-                    aie::vector<int16, VEC> q16 = aie::unpack(q8);
-                    aie::vector<bfloat16, VEC> qb = aie::to_float<bfloat16>(q16, 0);
-                    aie::accum<accfloat, VEC> acc = aie::mul(qb, dhi);
-                    acc = aie::mac(acc, qb, dlo);
+                    aie::vector<int16, VEC>    q16 = aie::unpack(q8);
+                    aie::vector<bfloat16, VEC> qb  = aie::to_float<bfloat16>(q16, 0);
+                    aie::accum<accfloat, VEC>  acc = aie::mul(qb, dhi);
+                    acc                            = aie::mac(acc, qb, dlo);
                     aie::store_v(pO + (i % CH) * VEC, acc.template to_vector<bfloat16>(0));
                     if ((i % CH) == CH - 1) {
                         pO += (size_t) NB * ST;
                     }
                 }
+            }
         }
     }
     event1();
 }
 
-} // extern "C"
+}  // extern "C"

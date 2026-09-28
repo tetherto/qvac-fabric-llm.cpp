@@ -1,7 +1,10 @@
 #define NOCPP
 
-#include <aie_api/aie.hpp>
+#include "xdna-math.h"
+
 #include <stdint.h>
+
+#include <aie_api/aie.hpp>
 
 // Qwen3.5 GDN prefill step. Semantics match GGML_OP_GATED_DELTA_NET (K=1,
 // scalar gate): each state row r in [j0, j0+ROWS):
@@ -17,18 +20,20 @@
 // reductions at all - only ROWS-wide vector MACs. Row-major would need two
 // aie::reduce_add per row per token, and those do not overlap.
 
-#ifndef GDN_SCALE
-#define GDN_SCALE 0.08838834764831845f   // 1/sqrt(128)
-#endif
-
 #ifndef DH
-#define DH 128
+#    define DH 128
 #endif
 #ifndef ROWS
-#define ROWS 64
+#    define ROWS 64
 #endif
 #ifndef VEC
-#define VEC 16
+#    define VEC 16
+#endif
+// The attention scale 1/sqrt(S), which the generator compiles in: the head size
+// is a build-time geometry, and S is not always 128. The default is the S = 128
+// value the header carries, so a build that passes no macro is unchanged.
+#ifndef GDN_SCALE_F
+#    define GDN_SCALE_F xdna::GDN_SCALE
 #endif
 
 extern "C" void ggml_xdna_gdn_copy_strip(bfloat16 * dst, bfloat16 * src) {
@@ -37,19 +42,15 @@ extern "C" void ggml_xdna_gdn_copy_strip(bfloat16 * dst, bfloat16 * src) {
     }
 }
 
-extern "C" void ggml_xdna_gdn_token_bf16(
-    bfloat16 * packed,
-    bfloat16 * tok,
-    int32_t t,
-    int32_t j0) {
-    const bfloat16 * q = tok;
-    const bfloat16 * k = tok + DH;
-    const bfloat16 * v = tok + 2 * DH + (int) j0;
+extern "C" void ggml_xdna_gdn_token_bf16(bfloat16 * packed, bfloat16 * tok, int32_t t, int32_t j0) {
+    const bfloat16 * q     = tok;
+    const bfloat16 * k     = tok + DH;
+    const bfloat16 * v     = tok + 2 * DH + (int) j0;
     const float      eg    = (float) tok[3 * DH];
     const float      beta  = (float) tok[3 * DH + 1];
-    const float      scale = GDN_SCALE;
-    bfloat16 * state = packed;
-    bfloat16 * attn  = packed + ROWS * DH + (int) t * ROWS;
+    const float      scale = GDN_SCALE_F;
+    bfloat16 *       state = packed;
+    bfloat16 *       attn  = packed + ROWS * DH + (int) t * ROWS;
 
     // the default floor mode biases every bf16 state store, and the error
     // compounds linearly over the recurrence
@@ -60,27 +61,25 @@ extern "C" void ggml_xdna_gdn_token_bf16(
     ::aie::accum<accfloat, ROWS> sk = ::aie::zeros<accfloat, ROWS>();
 #pragma clang loop unroll_count(8)
     for (int i = 0; i < DH; i++) {
-        sk = ::aie::mac(sk, ::aie::load_v<ROWS>(state + i * ROWS),
-                        ::aie::broadcast<bfloat16, ROWS>(k[i]));
+        sk = ::aie::mac(sk, ::aie::load_v<ROWS>(state + i * ROWS), ::aie::broadcast<bfloat16, ROWS>(k[i]));
     }
 
     ::aie::accum<accfloat, ROWS> va;
     // j0 = ROWS leaves v short of the ROWS-wide load alignment
     va.from_vector(::aie::load_unaligned_v<ROWS>(v));
-    auto df = ::aie::sub(va.to_vector<float>(),
-                         ::aie::mul(sk.to_vector<float>(), eg).to_vector<float>());
+    auto df = ::aie::sub(va.to_vector<float>(), ::aie::mul(sk.to_vector<float>(), eg).to_vector<float>());
     ::aie::accum<accfloat, ROWS> da;
     da.from_vector(::aie::mul(df, beta).to_vector<float>());
     const auto dl = da.to_vector<bfloat16>();
 
-    ::aie::accum<accfloat, ROWS> at = ::aie::zeros<accfloat, ROWS>();
-    const auto egv = ::aie::broadcast<bfloat16, ROWS>((bfloat16) eg);
+    ::aie::accum<accfloat, ROWS> at  = ::aie::zeros<accfloat, ROWS>();
+    const auto                   egv = ::aie::broadcast<bfloat16, ROWS>((bfloat16) eg);
 #pragma clang loop unroll_count(8)
     for (int i = 0; i < DH; i++) {
-        bfloat16 * p = state + i * ROWS;
-        auto acc = ::aie::mul(::aie::load_v<ROWS>(p), egv);
-        acc = ::aie::mac(acc, dl, ::aie::broadcast<bfloat16, ROWS>(k[i]));
-        const auto nv = acc.to_vector<bfloat16>();
+        bfloat16 * p   = state + i * ROWS;
+        auto       acc = ::aie::mul(::aie::load_v<ROWS>(p), egv);
+        acc            = ::aie::mac(acc, dl, ::aie::broadcast<bfloat16, ROWS>(k[i]));
+        const auto nv  = acc.to_vector<bfloat16>();
         ::aie::store_v(p, nv);
         at = ::aie::mac(at, nv, ::aie::broadcast<bfloat16, ROWS>(q[i]));
     }
