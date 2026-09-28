@@ -123,7 +123,7 @@ jobs:
           cd build
           # Metal Paravirtual devices are difficult to support -> disable
           # ref: https://github.com/ggml-org/llama.cpp/pull/19802#issuecomment-4013704023
-          ctest -L main -E "test-llama-archs|test-llama-context|test-speculative-rejection-sampling" --verbose --timeout 1800
+          ctest -L main -E "test-llama-archs|test-glm5-kpool-sequences|test-llama-context|test-speculative-rejection-sampling|test-save-load-state|test-recurrent-state-rollback" --verbose --timeout 1800
 
       - name: Vector-index static pkg-config smoke
         id: vector_index_static_pkg_config
