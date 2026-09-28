@@ -2,10 +2,10 @@
 
 #include <stddef.h>
 
-// The prefill gated delta rule on the mmul (kernels/gdn_mm.py,
-// FLM_PREFILL_PLAN.md step 3): GGML_OP_GATED_DELTA_NET of Qwen3.5's recurrent
-// layers - 16 heads, S = 128, a scalar gate, one sequence, one state
-// snapshot. The state stays on the array for the whole ubatch.
+// The prefill gated delta rule on the mmul (kernels/gdn_mm.py):
+// GGML_OP_GATED_DELTA_NET of Qwen3.5's recurrent layers - 16 heads, S = 128, a
+// scalar gate, one sequence, one state snapshot. The state stays on the array
+// for the whole ubatch.
 // GGML_XDNA_GDN_MM=0 leaves it to the host.
 
 struct ggml_tensor;
@@ -25,9 +25,10 @@ bool xdna_gdn_mm_run(struct xdna_kernel_pool * pool, struct ggml_tensor * node);
 // reader that falls back to the host).
 struct xdna_gdn_rows {
     const float * base  = nullptr;
-    size_t        o_col = 0;   // floats a column
+    size_t        o_col = 0;  // floats a column
     int           n_tok = 0;
 };
+
 void xdna_gdn_mm_keep_clear(void);
 void xdna_gdn_mm_keep(const struct ggml_tensor * node);
 bool xdna_gdn_mm_rows(const struct ggml_tensor * node, struct xdna_gdn_rows * rows);
@@ -40,15 +41,16 @@ bool xdna_gdn_mm_materialize(const struct ggml_tensor * node);
 // live (at the concat). The run of `node` then lays out only the headers,
 // the state and the exponents.
 struct xdna_gdn_conv_in {
-    const struct ggml_tensor * x     = nullptr;   // qkv^T, [T, channels], channels contiguous
-    const struct ggml_tensor * state = nullptr;   // [KW - 1, channels]
-    const struct ggml_tensor * w     = nullptr;   // [KW, channels]
-    struct ggml_tensor *       state_out = nullptr;   // the CPY: the new state, contiguous
-    float   eps_q = 0.0f, eps_k = 0.0f;
-    long long q_off = 0, k_off = 0, v_off = 0;    // channels
+    const struct ggml_tensor * x         = nullptr;              // qkv^T, [T, channels], channels contiguous
+    const struct ggml_tensor * state     = nullptr;              // [KW - 1, channels]
+    const struct ggml_tensor * w         = nullptr;              // [KW, channels]
+    struct ggml_tensor *       state_out = nullptr;              // the CPY: the new state, contiguous
+    float                      eps_q = 0.0f, eps_k = 0.0f;
+    long long                  q_off = 0, k_off = 0, v_off = 0;  // channels
 };
 
-bool xdna_gdn_mm_prepare(struct xdna_kernel_pool * pool, const struct ggml_tensor * node,
+bool xdna_gdn_mm_prepare(struct xdna_kernel_pool *       pool,
+                         const struct ggml_tensor *      node,
                          const struct xdna_gdn_conv_in & in);
 
 // The same on the array (kernels/gdn_conv.py; GGML_XDNA_GDN_CONV=0: off):
@@ -57,7 +59,8 @@ bool xdna_gdn_mm_prepare(struct xdna_kernel_pool * pool, const struct ggml_tenso
 // convolves it there into the next run's input; the host writes only the
 // state's rows before the tokens and the new state.
 struct xdna_buffer;
-bool xdna_gdn_conv_supported(void);
+bool                 xdna_gdn_conv_supported(void);
 struct xdna_buffer * xdna_gdn_conv_input(struct xdna_kernel_pool * pool, int n_tok, int channels, size_t * off);
-bool xdna_gdn_mm_prepare_npu(struct xdna_kernel_pool * pool, const struct ggml_tensor * node,
-                             const struct xdna_gdn_conv_in & in);
+bool                 xdna_gdn_mm_prepare_npu(struct xdna_kernel_pool *       pool,
+                                             const struct ggml_tensor *      node,
+                                             const struct xdna_gdn_conv_in & in);

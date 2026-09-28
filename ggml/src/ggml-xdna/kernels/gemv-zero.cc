@@ -6,13 +6,12 @@
 #include <aie_api/aie.hpp>
 
 #ifndef N_CORE
-#define N_CORE 64
+#    define N_CORE 64
 #endif
 
-extern "C" void ggml_xdna_gemv_zero(float *out)
-{
-    constexpr int VEC = 32;
-    const aie::vector<float, VEC> z = aie::zeros<float, VEC>();
+extern "C" void ggml_xdna_gemv_zero(float * out) {
+    constexpr int                 VEC = 32;
+    const aie::vector<float, VEC> z   = aie::zeros<float, VEC>();
     for (int j = 0; j < N_CORE / VEC; j++) {
         aie::store_v(out + j * VEC, z);
     }

@@ -63,8 +63,7 @@ inline bool list_glue(void) {
     return v;
 }
 
-template <typename T>
-inline void glue_names(T * const * nodes, size_t n, int64_t n_tokens) {
+template <typename T> inline void glue_names(T * const * nodes, size_t n, int64_t n_tokens) {
     static int left = 400;
     if (!list_glue() || n_tokens != 1 || left <= 0) {
         return;
@@ -80,14 +79,13 @@ inline void glue_names(T * const * nodes, size_t n, int64_t n_tokens) {
 using clock_t = std::chrono::steady_clock;
 
 inline uint64_t now_ns(void) {
-    return (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
-               clock_t::now().time_since_epoch())
-        .count();
+    return (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(clock_t::now().time_since_epoch()).count();
 }
 
 struct accum {
     uint64_t ns = 0;
     uint64_t n  = 0;
+
     void add(uint64_t dt) {
         ns += dt;
         n++;
@@ -98,14 +96,14 @@ struct accum {
 // classes (steady decode / warm-up decode / other) so a report over `steady`
 // never mixes in the one-time setup cost or a prefill chunk's glue.
 struct buckets {
-    std::map<int, accum>         fused_layer;   // key: GDN layer index (il)
-    std::map<std::string, accum> gemv;          // key: weight name(s)
-    std::map<std::string, accum> glue;          // key: op-type signature
-    std::map<std::string, uint64_t> glue_op_count; // key: op name, exact node count
+    std::map<int, accum>            fused_layer;    // key: GDN layer index (il)
+    std::map<std::string, accum>    gemv;           // key: weight name(s)
+    std::map<std::string, accum>    glue;           // key: op-type signature
+    std::map<std::string, uint64_t> glue_op_count;  // key: op name, exact node count
     // Time spent inside one of the buckets above, broken down. Reported on its
     // own and never added into the sum: every section is already counted by
     // the timer it nests in.
-    std::map<std::string, accum> section;
+    std::map<std::string, accum>    section;
 };
 
 struct state {
@@ -185,8 +183,8 @@ inline void ensure_atexit_registered(void) {
 // g_glue_n_tokens == 1, already computed by the caller before this is
 // constructed - every timer nested inside the call reads what this decided.
 struct call_timer {
-    uint64_t t0     = 0;
-    bool     on     = false;
+    uint64_t t0        = 0;
+    bool     on        = false;
     bool     is_decode = false;
 
     explicit call_timer(bool decode) : on(enabled()), is_decode(decode) {
@@ -202,12 +200,13 @@ struct call_timer {
         }
         t0 = now_ns();
     }
+
     ~call_timer() {
         if (!on) {
             return;
         }
-        const uint64_t dt = now_ns() - t0;
-        state & s = S();
+        const uint64_t              dt = now_ns() - t0;
+        state &                     s  = S();
         std::lock_guard<std::mutex> lk(s.mu);
         if (!is_decode) {
             s.other_total.add(dt);
@@ -227,12 +226,13 @@ struct fused_layer_timer {
     int      il;
     bool     on;
     bool     to_warmup = false;  // fire-granularity, not call-granularity - see state::fl_*
+
     explicit fused_layer_timer(int il_) : il(il_), on(enabled()) {
         if (!on) {
             return;
         }
         {
-            state & s = S();
+            state &                     s = S();
             std::lock_guard<std::mutex> lk(s.mu);
             if (!s.fl_first_token_done) {
                 if (il <= s.fl_last_il) {
@@ -249,14 +249,15 @@ struct fused_layer_timer {
         }
         t0 = now_ns();
     }
+
     ~fused_layer_timer() {
         if (!on) {
             return;
         }
-        const uint64_t dt = now_ns() - t0;
-        state & s = S();
+        const uint64_t              dt = now_ns() - t0;
+        state &                     s  = S();
         std::lock_guard<std::mutex> lk(s.mu);
-        buckets & b = to_warmup ? s.warmup : s.steady;
+        buckets &                   b = to_warmup ? s.warmup : s.steady;
         b.fused_layer[il].add(dt);
     }
 };
@@ -265,16 +266,18 @@ struct gemv_timer {
     uint64_t    t0 = 0;
     std::string key;
     bool        on;
+
     explicit gemv_timer(std::string k) : key(std::move(k)), on(enabled()) {
         if (on) {
             t0 = now_ns();
         }
     }
+
     ~gemv_timer() {
         if (!on) {
             return;
         }
-        const uint64_t dt = now_ns() - t0;
+        const uint64_t              dt = now_ns() - t0;
         std::lock_guard<std::mutex> lk(S().mu);
         cur_bucket().gemv[key].add(dt);
     }
@@ -286,7 +289,10 @@ struct gemv_timer {
 // glue flush as "<name>\t<start ns>\t<end ns>" on the steady clock
 // (CLOCK_MONOTONIC), to line up with a power sampler's timestamps.
 inline void trace_span(const char * key, uint64_t t0, uint64_t t1) {
-    static FILE * f = getenv("GGML_XDNA_PROF_TRACE") ? fopen(getenv("GGML_XDNA_PROF_TRACE"), "w") : nullptr;
+    static FILE * f = [] {
+        const char * path = getenv("GGML_XDNA_PROF_TRACE");
+        return path ? fopen(path, "w") : nullptr;
+    }();
     if (f) {
         std::lock_guard<std::mutex> lk(S().mu);
         fprintf(f, "%s\t%llu\t%llu\n", key, (unsigned long long) t0, (unsigned long long) t1);
@@ -295,41 +301,48 @@ inline void trace_span(const char * key, uint64_t t0, uint64_t t1) {
 }
 
 struct section_timer {
-    uint64_t    t0 = 0;
+    uint64_t     t0 = 0;
     const char * key;
-    bool        on;
+    bool         on;
+
     explicit section_timer(const char * k) : key(k), on(enabled()) {
         if (on) {
             t0 = now_ns();
         }
     }
+
     // Ends the section early; the destructor then does nothing.
     void stop() {
         if (!on) {
             return;
         }
-        on = false;
+        on                = false;
         const uint64_t t1 = now_ns(), dt = t1 - t0;
         trace_span(key, t0, t1);
         std::lock_guard<std::mutex> lk(S().mu);
         cur_bucket().section[key].add(dt);
     }
+
     ~section_timer() { stop(); }
 };
 
 // `sig` is the batch's op-type signature (see header comment); `op_names`
 // lists every node's op name (with duplicates) for the exact per-op count.
 struct glue_timer {
-    uint64_t                t0 = 0;
+    uint64_t                 t0 = 0;
     std::string              sig;
     std::vector<std::string> op_names;
-    bool                      on;
-    glue_timer(std::string s, std::vector<std::string> ops)
-        : sig(std::move(s)), op_names(std::move(ops)), on(enabled()) {
+    bool                     on;
+
+    glue_timer(std::string s, std::vector<std::string> ops) :
+        sig(std::move(s)),
+        op_names(std::move(ops)),
+        on(enabled()) {
         if (on) {
             t0 = now_ns();
         }
     }
+
     ~glue_timer() {
         if (!on) {
             return;
@@ -337,7 +350,7 @@ struct glue_timer {
         const uint64_t t1 = now_ns(), dt = t1 - t0;
         trace_span("glue", t0, t1);
         std::lock_guard<std::mutex> lk(S().mu);
-        buckets & b = cur_bucket();
+        buckets &                   b = cur_bucket();
         b.glue[sig].add(dt);
         for (auto & o : op_names) {
             b.glue_op_count[o]++;
@@ -363,6 +376,10 @@ inline std::string glue_signature(const std::vector<std::string> & op_names) {
     return sig;
 }
 
+static inline double us_per_fire(uint64_t ns, uint64_t n) {
+    return n ? (double) ns / (double) n / 1e3 : 0.0;
+}
+
 inline void print_bucket(const char * label, const buckets & b, double denom_tokens) {
     if (b.fused_layer.empty() && b.gemv.empty() && b.glue.empty()) {
         return;
@@ -374,14 +391,11 @@ inline void print_bucket(const char * label, const buckets & b, double denom_tok
     for (const auto & kv : b.fused_layer) {
         const accum & a = kv.second;
         fl_ns += a.ns;
-        fl_n  += a.n;
-        fprintf(stderr,
-                "    layer %2d: %6" PRIu64 " fires, %8.1f us/fire, %9.1f us/token\n",
-                kv.first, a.n, a.n ? (double) a.ns / a.n / 1e3 : 0.0,
-                denom_tokens > 0 ? (double) a.ns / 1e3 / denom_tokens : 0.0);
+        fl_n += a.n;
+        fprintf(stderr, "    layer %2d: %6" PRIu64 " fires, %8.1f us/fire, %9.1f us/token\n", kv.first, a.n,
+                us_per_fire(a.ns, a.n), denom_tokens > 0 ? (double) a.ns / 1e3 / denom_tokens : 0.0);
     }
-    fprintf(stderr, "    TOTAL: %" PRIu64 " fires, %.1f us/fire avg, %.1f us/token\n",
-            fl_n, fl_n ? (double) fl_ns / fl_n / 1e3 : 0.0,
+    fprintf(stderr, "    TOTAL: %" PRIu64 " fires, %.1f us/fire avg, %.1f us/token\n", fl_n, us_per_fire(fl_ns, fl_n),
             denom_tokens > 0 ? (double) fl_ns / 1e3 / denom_tokens : 0.0);
 
     uint64_t gv_ns = 0, gv_n = 0;
@@ -389,13 +403,11 @@ inline void print_bucket(const char * label, const buckets & b, double denom_tok
     for (const auto & kv : b.gemv) {
         const accum & a = kv.second;
         gv_ns += a.ns;
-        gv_n  += a.n;
-        fprintf(stderr, "    %-60s %6" PRIu64 " fires, %8.1f us/fire, %9.1f us/token\n",
-                kv.first.c_str(), a.n, a.n ? (double) a.ns / a.n / 1e3 : 0.0,
-                denom_tokens > 0 ? (double) a.ns / 1e3 / denom_tokens : 0.0);
+        gv_n += a.n;
+        fprintf(stderr, "    %-60s %6" PRIu64 " fires, %8.1f us/fire, %9.1f us/token\n", kv.first.c_str(), a.n,
+                us_per_fire(a.ns, a.n), denom_tokens > 0 ? (double) a.ns / 1e3 / denom_tokens : 0.0);
     }
-    fprintf(stderr, "    TOTAL: %" PRIu64 " fires, %.1f us/fire avg, %.1f us/token\n",
-            gv_n, gv_n ? (double) gv_ns / gv_n / 1e3 : 0.0,
+    fprintf(stderr, "    TOTAL: %" PRIu64 " fires, %.1f us/fire avg, %.1f us/token\n", gv_n, us_per_fire(gv_ns, gv_n),
             denom_tokens > 0 ? (double) gv_ns / 1e3 / denom_tokens : 0.0);
 
     uint64_t gl_ns = 0, gl_n = 0;
@@ -403,32 +415,27 @@ inline void print_bucket(const char * label, const buckets & b, double denom_tok
     for (const auto & kv : b.glue) {
         const accum & a = kv.second;
         gl_ns += a.ns;
-        gl_n  += a.n;
-        fprintf(stderr, "    %-60s %6" PRIu64 " flushes, %8.1f us/flush, %9.1f us/token\n",
-                kv.first.c_str(), a.n, a.n ? (double) a.ns / a.n / 1e3 : 0.0,
-                denom_tokens > 0 ? (double) a.ns / 1e3 / denom_tokens : 0.0);
+        gl_n += a.n;
+        fprintf(stderr, "    %-60s %6" PRIu64 " flushes, %8.1f us/flush, %9.1f us/token\n", kv.first.c_str(), a.n,
+                us_per_fire(a.ns, a.n), denom_tokens > 0 ? (double) a.ns / 1e3 / denom_tokens : 0.0);
     }
-    fprintf(stderr, "    TOTAL: %" PRIu64 " flushes, %.1f us/flush avg, %.1f us/token\n",
-            gl_n, gl_n ? (double) gl_ns / gl_n / 1e3 : 0.0,
-            denom_tokens > 0 ? (double) gl_ns / 1e3 / denom_tokens : 0.0);
+    fprintf(stderr, "    TOTAL: %" PRIu64 " flushes, %.1f us/flush avg, %.1f us/token\n", gl_n,
+            us_per_fire(gl_ns, gl_n), denom_tokens > 0 ? (double) gl_ns / 1e3 / denom_tokens : 0.0);
     fprintf(stderr, "  host-glue exact node counts by op type (independent of batching):\n");
     for (const auto & kv : b.glue_op_count) {
-        fprintf(stderr, "    %-20s %" PRIu64 " nodes%s\n", kv.first.c_str(), kv.second,
-                denom_tokens > 0 ? "" : "");
+        fprintf(stderr, "    %-20s %" PRIu64 " nodes\n", kv.first.c_str(), kv.second);
     }
 
     if (!b.section.empty()) {
         fprintf(stderr, "  nested sections (already inside the buckets above, NOT in the sum):\n");
         for (const auto & kv : b.section) {
             const accum & a = kv.second;
-            fprintf(stderr, "    %-60s %6" PRIu64 " times, %8.1f us/each, %9.1f us/token\n",
-                    kv.first.c_str(), a.n, a.n ? (double) a.ns / a.n / 1e3 : 0.0,
-                    denom_tokens > 0 ? (double) a.ns / 1e3 / denom_tokens : 0.0);
+            fprintf(stderr, "    %-60s %6" PRIu64 " times, %8.1f us/each, %9.1f us/token\n", kv.first.c_str(), a.n,
+                    us_per_fire(a.ns, a.n), denom_tokens > 0 ? (double) a.ns / 1e3 / denom_tokens : 0.0);
         }
     }
 
-    fprintf(stderr,
-            "  captured sum (fused_layer + gemv + glue): %.1f us/token\n",
+    fprintf(stderr, "  captured sum (fused_layer + gemv + glue): %.1f us/token\n",
             denom_tokens > 0 ? (double) (fl_ns + gv_ns + gl_ns) / 1e3 / denom_tokens : 0.0);
 }
 
@@ -455,7 +462,7 @@ inline uint64_t mode_fire_count(const std::map<int, accum> & fl) {
 }
 
 inline void print_summary(void) {
-    state & s = S();
+    state &                     s = S();
     std::lock_guard<std::mutex> lk(s.mu);
     fprintf(stderr, "\n[xdna-prof] GGML_XDNA_PROF summary (stderr, at process exit)\n");
     fprintf(stderr,
@@ -480,15 +487,18 @@ inline void print_summary(void) {
     const uint64_t n_tok_i = mode_fire_count(s.steady.fused_layer);
     const double   n_tok   = (double) n_tok_i;
     fprintf(stderr,
-            "\n[xdna-prof] decode steady state: %" PRIu64 " graph_compute calls, "
-            "inferred as %" PRIu64 " real decode tokens (the mode of each GDN "
+            "\n[xdna-prof] decode steady state: %" PRIu64
+            " graph_compute calls, "
+            "inferred as %" PRIu64
+            " real decode tokens (the mode of each GDN "
             "layer's fire count - a token can span more than one call, so this "
             "is not the same number; see the per-layer fire counts below, "
             "they should all agree)\n",
             s.decode_total.n, n_tok_i);
     if (n_tok_i) {
-        fprintf(stderr, "  whole ggml_backend_xdna_graph_compute(): %.1f us/token total "
-                        "(%.1f us/call, %" PRIu64 " calls)\n",
+        fprintf(stderr,
+                "  whole ggml_backend_xdna_graph_compute(): %.1f us/token total "
+                "(%.1f us/call, %" PRIu64 " calls)\n",
                 (double) s.decode_total.ns / 1e3 / n_tok,
                 s.decode_total.n ? (double) s.decode_total.ns / 1e3 / (double) s.decode_total.n : 0.0,
                 s.decode_total.n);
@@ -501,19 +511,25 @@ inline void print_summary(void) {
         // consumed-set/rec_caps bookkeeping, and anything else the dispatch
         // loop does between the instrumented calls.
         uint64_t fl = 0, gv = 0, gl = 0;
-        for (auto & kv : s.steady.fused_layer) fl += kv.second.ns;
-        for (auto & kv : s.steady.gemv)        gv += kv.second.ns;
-        for (auto & kv : s.steady.glue)        gl += kv.second.ns;
-        const double captured_us  = (double) (fl + gv + gl) / 1e3 / n_tok;
-        const double whole_us     = (double) s.decode_total.ns / 1e3 / n_tok;
+        for (auto & kv : s.steady.fused_layer) {
+            fl += kv.second.ns;
+        }
+        for (auto & kv : s.steady.gemv) {
+            gv += kv.second.ns;
+        }
+        for (auto & kv : s.steady.glue) {
+            gl += kv.second.ns;
+        }
+        const double captured_us = (double) (fl + gv + gl) / 1e3 / n_tok;
+        const double whole_us    = (double) s.decode_total.ns / 1e3 / n_tok;
         fprintf(stderr,
                 "  remainder (whole call - fused_layer - gemv - glue): %.1f us/token "
                 "(%.1f%% of the whole graph_compute call)\n",
                 whole_us - captured_us, whole_us > 0 ? 100.0 * (whole_us - captured_us) / whole_us : 0.0);
     }
 
-    fprintf(stderr, "\n[xdna-prof] other (non single-token, e.g. prefill) graph_compute calls: %"
-                    PRIu64 ", %.3f ms total\n",
+    fprintf(stderr,
+            "\n[xdna-prof] other (non single-token, e.g. prefill) graph_compute calls: %" PRIu64 ", %.3f ms total\n",
             s.other_total.n, (double) s.other_total.ns / 1e6);
     print_bucket("other breakdown", s.other, s.other_total.n ? (double) s.other_total.n : 0.0);
     fprintf(stderr, "[xdna-prof] end of summary\n\n");

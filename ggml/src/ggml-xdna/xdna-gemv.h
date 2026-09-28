@@ -33,12 +33,12 @@
 // The baked core geometry, shared by every shape. Must agree with the
 // XDNA_GEMV_* variables in this directory's CMakeLists and with gemv_q4.py.
 enum {
-    XDNA_GEMV_N_CORE = 32,     // output columns a core owns
-    XDNA_GEMV_K_TILE_Q4 = 512, // K per streamed tile, 4-bit codes
-    XDNA_GEMV_K_TILE_Q8 = 256, // K per streamed tile, 8-bit codes
-    XDNA_GEMV_ACT_TILE  = 2112,// codes, per-group sums and scales, flags, width
-    XDNA_GEMV_COLS   = 8,      // AIE columns the design instantiates
-    XDNA_GEMV_ROWS   = 4,      // compute rows per column
+    XDNA_GEMV_N_CORE          = 32,    // output columns a core owns
+    XDNA_GEMV_K_TILE_Q4       = 512,   // K per streamed tile, 4-bit codes
+    XDNA_GEMV_K_TILE_Q8       = 256,   // K per streamed tile, 8-bit codes
+    XDNA_GEMV_ACT_TILE        = 2112,  // codes, per-group sums and scales, flags, width
+    XDNA_GEMV_COLS            = 8,     // AIE columns the design instantiates
+    XDNA_GEMV_ROWS            = 4,     // compute rows per column
     // The split that shares the array with the fused layer's GDN core
     // (kernels/fused_layer.py): rows 4 and 5 of every column, a pool of
     // sixteen cores of 64 output columns, a column's weights split between its
@@ -62,14 +62,14 @@ enum xdna_gemv_split {
 
 // One decode GEMV: the baked geometry plus the shape this dispatch runs.
 struct xdna_gemv_geom {
-    xdna_wfmt fmt = XDNA_WFMT_NONE;
-    int K      = 0;    // rows of the weight (activation length)
-    int N      = 0;    // output length rounded up to a whole pass of the array
-    int n_real = 0;    // columns the weight actually has
-    int cols = XDNA_GEMV_COLS;
+    xdna_wfmt fmt      = XDNA_WFMT_NONE;
+    int       K        = 0;  // rows of the weight (activation length)
+    int       N        = 0;  // output length rounded up to a whole pass of the array
+    int       n_real   = 0;  // columns the weight actually has
+    int       cols     = XDNA_GEMV_COLS;
     // The FFN's activation closes on the cores: the dispatch runs the gate and
     // up projections together and returns silu(gate)*up, half as many values.
-    bool epilogue = false;
+    bool      epilogue = false;
 
     // Carried per geometry rather than read from the enums, so both array
     // splits can be built and one chosen at run time.
@@ -82,51 +82,61 @@ struct xdna_gemv_geom {
     // the output descriptors are reused chunk after chunk (the head, 243).
     bool uncapped = false;
 
-    int  rows()   const { return rows_v; }
-    int  n_core() const { return n_core_v; }
+    int rows() const { return rows_v; }
+
+    int n_core() const { return n_core_v; }
+
     // A 4-bit tile spans twice the K of an 8-bit one, which is what makes
     // both the same number of bytes.
-    int  k_tile() const {
+    int k_tile() const {
         if (fused_v) {
-            return fmt == XDNA_WFMT_Q4G32 ? XDNA_GEMV_K_TILE_Q4_FUSED
-                                          : XDNA_GEMV_K_TILE_Q8_FUSED;
+            return fmt == XDNA_WFMT_Q4G32 ? XDNA_GEMV_K_TILE_Q4_FUSED : XDNA_GEMV_K_TILE_Q8_FUSED;
         }
         return fmt == XDNA_WFMT_Q4G32 ? XDNA_GEMV_K_TILE_Q4 : XDNA_GEMV_K_TILE_Q8;
     }
-    int  cores()  const { return cols * rows_v; }
+
+    int cores() const { return cols * rows_v; }
+
     // Output columns one pass over the array produces.
-    int  chunk()  const { return cores() * n_core_v; }
-    int  n_out()  const { return N / chunk(); }
+    int chunk() const { return cores() * n_core_v; }
+
+    int n_out() const { return N / chunk(); }
+
     // Values a core writes per chunk: the epilogue folds two into one.
-    int  out_per_core() const { return epilogue ? n_core_v / 2 : n_core_v; }
-    int  n_tiles() const { return K / k_tile(); }
-    int  group()  const { return fmt == XDNA_WFMT_Q4G32 ? XDNA_Q4G32_GROUP : XDNA_Q8G16_GROUP; }
+    int out_per_core() const { return epilogue ? n_core_v / 2 : n_core_v; }
+
+    int n_tiles() const { return K / k_tile(); }
+
+    int group() const { return fmt == XDNA_WFMT_Q4G32 ? XDNA_Q4G32_GROUP : XDNA_Q8G16_GROUP; }
+
     // Packed bytes of one (k_tile x n_core) weight tile.
     size_t tile_bytes() const;
     // Super-block records a tile carries per lane group; see tile_bytes().
     int    n_sup() const;
+
     // Columns one multiply covers on the core. AIE2P's int8 datapath is 64
     // lanes wide; a core narrower than that has to stay at 32. Mirrors
     // vec_for() in kernels/gemv_q4.py.
-    int    lane() const { return n_core() >= 64 ? 64 : 32; }
+    int lane() const { return n_core() >= 64 ? 64 : 32; }
+
     // Sized for the wider code, so one object type serves both.
     size_t act_tile_bytes() const { return XDNA_GEMV_ACT_TILE; }
+
     // The count header, then the K tiles once per output chunk. The repeats
     // are held in DDR rather than replayed by re-pointing a descriptor per
     // chunk, so the whole activation stream is one descriptor: a shim tile has
     // sixteen descriptor ids for all of its channels, and a stream that fills
     // them loses transfers when one is reprogrammed before it has drained.
-    size_t act_bytes() const {
-        return (size_t) (1 + n_out() * n_tiles()) * act_tile_bytes();
-    }
+    size_t act_bytes() const { return (size_t) (1 + n_out() * n_tiles()) * act_tile_bytes(); }
+
     // Per column: every output chunk, every K tile, every row.
-    size_t col_weight_bytes() const {
-        return (size_t) n_out() * n_tiles() * rows_v * tile_bytes();
-    }
+    size_t col_weight_bytes() const { return (size_t) n_out() * n_tiles() * rows_v * tile_bytes(); }
+
     size_t weight_bytes() const { return (size_t) cols * col_weight_bytes(); }
+
     size_t out_bytes() const { return (size_t) N * sizeof(float); }
 
-    bool valid() const;
+    bool        valid() const;
     // Artifact stem: one per format, e.g. "gemv_q4g32_n32_t512_c8".
     std::string stem() const;
     // Cache key of the instruction stream, which does depend on the shape.
@@ -169,64 +179,63 @@ std::string xdna_gemv_stem(xdna_gemv_split split);
 // fused split), which drains with one descriptor per stream.
 struct xdna_gemv_out_dest {
     int      arg          = -1;
-    uint32_t off          = 0;    // bytes
+    uint32_t off          = 0;  // bytes
     uint32_t blk_floats   = 0;
     uint32_t n_blk        = 0;
-    uint32_t blk_stride   = 0;    // bytes
-    uint32_t chunk_stride = 0;    // bytes
+    uint32_t blk_stride   = 0;  // bytes
+    uint32_t chunk_stride = 0;  // bytes
 };
 
 struct xdna_gemv_seq_opts {
-    int      arg_base = 0;
-    int      bd_base  = 0;   // -1 = after the stream's own descriptors
+    int                        arg_base          = 0;
+    int                        bd_base           = 0;  // -1 = after the stream's own descriptors
     // Negative means arg_base + 0 / 1 / 2, a buffer set of its own.
-    int      w_arg    = -1;
-    int      act_arg  = -1;
-    int      o_arg    = -1;
-    uint32_t w_off    = 0;   // the weights' offset in their argument
-    uint32_t act_off  = 0;   // the activation's offset in its argument
-    uint32_t out_off  = 0;   // the output's offset in its argument
+    int                        w_arg             = -1;
+    int                        act_arg           = -1;
+    int                        o_arg             = -1;
+    uint32_t                   w_off             = 0;  // the weights' offset in their argument
+    uint32_t                   act_off           = 0;  // the activation's offset in its argument
+    uint32_t                   out_off           = 0;  // the output's offset in its argument
     // Bytes between one output stream's destination and the next. Zero means
     // they are consecutive, which is a plain output buffer. Set it to the
     // activation tile size and the projection drains straight into the tiles
     // the next dispatch reads - one stream to a tile, because a stream carries
     // exactly a tile's worth of columns - so its result never goes near the
     // host and the two dispatches can share a runlist.
-    uint32_t out_stream_stride = 0;
+    uint32_t                   out_stream_stride = 0;
     // One destination per output stream (xdna_gemv_out_streams of them), in
     // place of o_arg/out_off; null keeps the plain output layout.
-    const xdna_gemv_out_dest * out_dest = nullptr;
+    const xdna_gemv_out_dest * out_dest          = nullptr;
     // The activation was queued earlier in the stream (so the prologue can
     // take it while an earlier phase runs): no fill of it here.
-    bool     skip_act = false;
+    bool                       skip_act          = false;
     // The weights were queued earlier in the stream (so they stream in while
     // an earlier phase holds the array): no fill of them here.
-    bool     skip_w   = false;
+    bool                       skip_w            = false;
     // The activation's body (the K tiles) is in DDR once and queued n_out
     // times over, after the header, instead of a copy per chunk.
-    bool     act_replay = false;
+    bool                       act_replay        = false;
     // Bisecting an appended stream: 1 = weights only, 2 = and the activation,
     // 3 = and the output descriptors but no wait, 0 = the whole thing.
-    int      stages   = 0;
+    int                        stages            = 0;
 };
 
-bool xdna_gemv_seq_build(struct xdna_seq * seq, const xdna_gemv_geom & geom,
-                         const xdna_gemv_seq_opts * opt = nullptr);
+bool xdna_gemv_seq_build(struct xdna_seq * seq, const xdna_gemv_geom & geom, const xdna_gemv_seq_opts * opt = nullptr);
 
 // Where the pair's three buffers are named and based, so the same two phases
 // can be appended to somebody else's stream instead of standing alone. The
 // defaults are the standalone dispatch: arguments 0, 1, 2 from offset zero,
 // descriptors from zero.
 struct xdna_gemv_pair_opts {
-    int      w_arg  = 0;
-    int      a_arg  = 1;
-    int      o_arg  = 2;
-    uint32_t w_base = 0;
-    uint32_t a_base = 0;
-    uint32_t o_base = 0;
+    int      w_arg      = 0;
+    int      a_arg      = 1;
+    int      o_arg      = 2;
+    uint32_t w_base     = 0;
+    uint32_t a_base     = 0;
+    uint32_t o_base     = 0;
     // Descriptors are reused, not added to: by the time this section runs,
     // every transfer before it in the stream has been waited for.
-    int      bd_base = 0;
+    int      bd_base    = 0;
     // The first dispatch reads one body of K tiles once per output chunk -
     // the queue repeats its descriptor - instead of per-chunk copies of it in
     // DDR. The copies are the host's to make, so a stream whose activation is
@@ -238,17 +247,21 @@ struct xdna_gemv_pair_opts {
 // Build the two-phase stream; see xdna_gemv_pair. `w2_off` and `a2_off` are
 // where the second dispatch's weights and activation sit in the shared
 // buffers, relative to the bases in `opt`.
-bool xdna_gemv_seq_build_pair(struct xdna_seq * seq, const xdna_gemv_geom & g1,
-                              const xdna_gemv_geom & g2,
-                              size_t w2_off, size_t a2_off,
+bool xdna_gemv_seq_build_pair(struct xdna_seq *           seq,
+                              const xdna_gemv_geom &      g1,
+                              const xdna_gemv_geom &      g2,
+                              size_t                      w2_off,
+                              size_t                      a2_off,
                               const xdna_gemv_pair_opts * opt = nullptr);
 
 // The geometry that serves a [K x N] weight of `type`, or an invalid one when
 // none does. N is the total across the weights of one dispatch.
-xdna_gemv_geom xdna_gemv_variant(enum ggml_type type, int64_t K, int64_t N,
-                                 bool epilogue = false,
-                                 xdna_gemv_split split = XDNA_GEMV_SPLIT_DEFAULT,
-                                 bool uncapped = false);
+xdna_gemv_geom xdna_gemv_variant(enum ggml_type  type,
+                                 int64_t         K,
+                                 int64_t         N,
+                                 bool            epilogue = false,
+                                 xdna_gemv_split split    = XDNA_GEMV_SPLIT_DEFAULT,
+                                 bool            uncapped = false);
 
 // Pack ggml-quantized [K x N_i] weights (N_i rows of K) into the tile order
 // the design streams: [aie-col][chunk][tile][row], each tile lane-group major.
@@ -259,10 +272,11 @@ xdna_gemv_geom xdna_gemv_variant(enum ggml_type type, int64_t K, int64_t N,
 // `colmap`, when given, maps each destination column to an index in the
 // concatenated weights: with the epilogue a core must own the gate half and
 // the up half of the same values, which is not their concatenated order.
-bool xdna_gemv_pack_weights(const xdna_gemv_geom & geom,
-                            const struct ggml_tensor * const * ws, int n_w,
-                            const int32_t * colmap,
-                            std::vector<uint8_t> & dst);
+bool xdna_gemv_pack_weights(const xdna_gemv_geom &             geom,
+                            const struct ggml_tensor * const * ws,
+                            int                                n_w,
+                            const int32_t *                    colmap,
+                            std::vector<uint8_t> &             dst);
 
 // The column map for an epilogue dispatch of `geom`, in concatenated order
 // with the gate weight first.
@@ -276,16 +290,22 @@ int xdna_gemv_out_streams(const xdna_gemv_geom & geom);
 
 // Where the pool meets the shim: a column's weight channel, the activation
 // broadcast, and the output streams (column pairs on the fused split).
-struct xdna_gemv_ep { int col; int ch; };
-void xdna_gemv_endpoints(const xdna_gemv_geom & geom, xdna_gemv_ep w[XDNA_GEMV_COLS],
-                         xdna_gemv_ep * a, xdna_gemv_ep o[XDNA_GEMV_COLS], int * n_o);
-int xdna_gemv_stream_floats(const xdna_gemv_geom & geom);
+struct xdna_gemv_ep {
+    int col;
+    int ch;
+};
+
+void xdna_gemv_endpoints(const xdna_gemv_geom & geom,
+                         xdna_gemv_ep           w[XDNA_GEMV_COLS],
+                         xdna_gemv_ep *         a,
+                         xdna_gemv_ep           o[XDNA_GEMV_COLS],
+                         int *                  n_o);
+int  xdna_gemv_stream_floats(const xdna_gemv_geom & geom);
 
 // Quantize one activation row into `dst` (geom.act_bytes()), exactly as a
 // standalone dispatch of `geom` would, for a stream that reads it from a
 // buffer of somebody else's.
-void xdna_gemv_pack_act_into(const xdna_gemv_geom & geom, const float * act,
-                             uint8_t * dst);
+void xdna_gemv_pack_act_into(const xdna_gemv_geom & geom, const float * act, uint8_t * dst);
 
 // A loaded GEMV runner: the weight BO is filled once per tensor and stays on
 // the device; only the activation row crosses per call.
@@ -294,19 +314,20 @@ struct xdna_gemv {
     xdna_kernel *  kern = nullptr;
     xdna_gemv_geom geom;
 
-    xdna_buffer * w = nullptr;    // packed weights (persistent)
-    xdna_buffer * a = nullptr;    // int8 activation codes + group sums
-    xdna_buffer * o = nullptr;    // f32 partials, before the activation scale
+    xdna_buffer * w = nullptr;     // packed weights (persistent)
+    xdna_buffer * a = nullptr;     // int8 activation codes + group sums
+    xdna_buffer * o = nullptr;     // f32 partials, before the activation scale
 
-    std::vector<uint8_t> host_a;  // staging for the activation tiles
+    std::vector<uint8_t> host_a;   // staging for the activation tiles
     std::vector<uint8_t> settled;  // staging for a settled output read
     // The buffer set never changes, so the run is built once and restarted.
-    xrt::run run;
+    xrt::run             run;
 };
 
 // Load the artifact for `geom`, allocate the buffer set and upload `packed`
 // (which must be geom.weight_bytes()). Returns nullptr on failure.
-xdna_gemv * xdna_gemv_create(struct xdna_kernel_pool * pool, const xdna_gemv_geom & geom,
+xdna_gemv * xdna_gemv_create(struct xdna_kernel_pool *    pool,
+                             const xdna_gemv_geom &       geom,
                              const std::vector<uint8_t> & packed);
 
 void xdna_gemv_free(xdna_gemv * g);
@@ -332,20 +353,20 @@ struct xdna_gemv_pair {
     xdna_buffer * a = nullptr;    // [g1 activation][g2 activation]
     xdna_buffer * o = nullptr;    // g2's output
 
-    size_t w2_off = 0;            // byte offset of g2's weights
-    size_t a2_off = 0;            // byte offset of g2's activation
+    size_t w2_off     = 0;        // byte offset of g2's weights
+    size_t a2_off     = 0;        // byte offset of g2's activation
     size_t o_tail_off = 0;        // where the output sits when it has no argument
 
     std::vector<uint8_t> host_a;  // staging for g1's activation only
-    xrt::run run;
+    xrt::run             run;
 };
 
 // Load the artifact, allocate the buffer set, upload both weight sets and
 // prime g2's activation headers (the cores fill its codes every token).
-xdna_gemv_pair * xdna_gemv_pair_create(struct xdna_kernel_pool * pool,
-                                       const xdna_gemv_geom & g1,
+xdna_gemv_pair * xdna_gemv_pair_create(struct xdna_kernel_pool *    pool,
+                                       const xdna_gemv_geom &       g1,
                                        const std::vector<uint8_t> & packed1,
-                                       const xdna_gemv_geom & g2,
+                                       const xdna_gemv_geom &       g2,
                                        const std::vector<uint8_t> & packed2);
 
 void xdna_gemv_pair_free(xdna_gemv_pair * p);
@@ -358,8 +379,7 @@ bool xdna_gemv_pair_run(xdna_gemv_pair * p, const float * act, float * out);
 // design's prologue tile does the residual add, the reduction, gamma and the
 // quantization. Nothing of the layer's transition is left on the host, which
 // is what lets a layer's two dispatches go into one runlist.
-bool xdna_gemv_pair_run_raw(xdna_gemv_pair * p, const float * acc,
-                            const float * res, const float * gam, float * out);
+bool xdna_gemv_pair_run_raw(xdna_gemv_pair * p, const float * acc, const float * res, const float * gam, float * out);
 
 // Write the host's half of a raw activation - the residual and gamma - before
 // the dispatch that drains the rest of it into the same tiles, and dispatch
@@ -369,13 +389,11 @@ bool xdna_gemv_pair_run_raw(xdna_gemv_pair * p, const float * acc,
 // back from the device since the last dispatch wrote it: every path that does
 // this copies the previous dispatch's drain back first (the collect and
 // out_from_tail calls).
-bool xdna_gemv_pair_prep_raw(xdna_gemv_pair * p, const float * res,
-                             const float * gam);
+bool xdna_gemv_pair_prep_raw(xdna_gemv_pair * p, const float * res, const float * gam);
 bool xdna_gemv_pair_dispatch(xdna_gemv_pair * p, float * out);
 
 // Read what a fused run left in the tail of the activation buffer, for the
 // layer whose FFN rides the core's own stream.
-bool xdna_gemv_pair_out_from_tail(xdna_gemv_pair * p, float * out);
 
 // Mark the parts of the activation buffer a fused run writes, before that run
 // is submitted, so the reads that follow it know a drain from the previous
@@ -389,11 +407,11 @@ int32_t xdna_gemv_pair_last_flags(const xdna_gemv_pair * p);
 // mode): h, the attention/mixer output, h_attn and the FFN output, D floats
 // each, in one buffer every layer's dispatch binds.
 enum {
-    XDNA_RES_D   = 1024,
-    XDNA_RES_H   = 0,                       // byte offsets
-    XDNA_RES_S   = 1 * XDNA_RES_D * 4,
-    XDNA_RES_A   = 2 * XDNA_RES_D * 4,
-    XDNA_RES_F   = 3 * XDNA_RES_D * 4,
+    XDNA_RES_D     = 1024,
+    XDNA_RES_H     = 0,  // byte offsets
+    XDNA_RES_S     = 1 * XDNA_RES_D * 4,
+    XDNA_RES_A     = 2 * XDNA_RES_D * 4,
+    XDNA_RES_F     = 3 * XDNA_RES_D * 4,
     XDNA_RES_BYTES = 4 * XDNA_RES_D * 4,
 };
 
@@ -405,8 +423,12 @@ enum {
 // row is not D = n_tiles * k_tile with D a multiple of 512.
 // `gates` > 0 (a GDN in-projection: 32) makes the last tile of the last chunk
 // take the gates' constants and weight rows and emit x's tails (act-att.cc).
-bool xdna_gemv_row_act(const xdna_gemv_geom & geom, uint8_t * dst, float eps, bool res,
-                       int32_t last_flags, int gates = 0);
+bool xdna_gemv_row_act(const xdna_gemv_geom & geom,
+                       uint8_t *              dst,
+                       float                  eps,
+                       bool                   res,
+                       int32_t                last_flags,
+                       int                    gates = 0);
 
 // The prologue's side streams for a row-mode input (act-att.cc mode 4):
 // acc, the residual and gamma to the prologue, h back to `h_off`. Rows are
@@ -414,25 +436,40 @@ bool xdna_gemv_row_act(const xdna_gemv_geom & geom, uint8_t * dst, float eps, bo
 // `g_arg`. Uses the side channel's descriptors 11-13 and the output's 14, so
 // it has to come after whatever used them has been waited for, and
 // xdna_seq_row_wait after the projection that takes the row.
-void xdna_seq_row_io(struct xdna_seq * seq, int res_arg, uint32_t acc_off, uint32_t hres_off,
-                     int g_arg, uint32_t g_off, uint32_t h_off);
+void xdna_seq_row_io(struct xdna_seq * seq,
+                     int               res_arg,
+                     uint32_t          acc_off,
+                     uint32_t          hres_off,
+                     int               g_arg,
+                     uint32_t          g_off,
+                     uint32_t          h_off);
 void xdna_seq_row_wait(struct xdna_seq * seq);
 
 // The same with a GDN layer's gates: after gamma the constants and weight
 // rows (`ab_words` words at `ab_off` of `ab_arg`), and after h x's tails, 3
 // words a head `x_stride` words apart from `x_off` of `x_arg` - the object's
 // other 208 words into the `x_junk` words that follow x.
-void xdna_seq_row_io_gates(struct xdna_seq * seq, int res_arg, uint32_t acc_off,
-                           uint32_t hres_off, int g_arg, uint32_t g_off, uint32_t h_off,
-                           int ab_arg, uint32_t ab_off, uint32_t ab_words,
-                           int x_arg, uint32_t x_off, uint32_t x_stride, uint32_t x_heads);
+void xdna_seq_row_io_gates(struct xdna_seq * seq,
+                           int               res_arg,
+                           uint32_t          acc_off,
+                           uint32_t          hres_off,
+                           int               g_arg,
+                           uint32_t          g_off,
+                           uint32_t          h_off,
+                           int               ab_arg,
+                           uint32_t          ab_off,
+                           uint32_t          ab_words,
+                           int               x_arg,
+                           uint32_t          x_off,
+                           uint32_t          x_stride,
+                           uint32_t          x_heads);
 
 // True when this pair's first phase reads raw tiles, so the dispatch before it
 // can drain into them; and the buffer those tiles live in.
-bool xdna_gemv_pair_raw_act(const xdna_gemv_pair * p);
+bool                 xdna_gemv_pair_raw_act(const xdna_gemv_pair * p);
 struct xdna_buffer * xdna_gemv_pair_act_buf(xdna_gemv_pair * p);
-int xdna_gemv_pair_k_tile(const xdna_gemv_pair * p);
-int xdna_gemv_pair_n_tiles(const xdna_gemv_pair * p);
+int                  xdna_gemv_pair_k_tile(const xdna_gemv_pair * p);
+int                  xdna_gemv_pair_n_tiles(const xdna_gemv_pair * p);
 
 // Run one decode token: quantize `act` (K floats) to int8 with a scale per
 // group, run the kernel and write `out` (N floats). Returns false on failure.

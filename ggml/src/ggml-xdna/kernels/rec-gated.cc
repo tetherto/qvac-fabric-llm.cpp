@@ -9,41 +9,60 @@
 // State is carried in the OUT object so ggml_xdna_gated_head and ggml_xdna_gated_fin can share it
 // without cross-TU statics (IRON compiles each ExternalFunction from the same
 // source into its own TU). OUT layout:
-//   [0 .. 8191]      gated f32 scratch (2048 floats), written per head
-//   [8192 .. 10239]  aq int8 codes, one scale for the row
-//   [10240 .. 10243] d_a f32
-//   [ACT_OFF ..]     the same values as ssm_out's GEMV activation: a header
-//                    tile then one per k_tile, int8 codes with a scale and a
-//                    code sum per group of 32. Writing it here is what lets
-//                    the projection read it without a repack on the host.
-#include <stdint.h>
+//   [0 .. AQ_OFF)      gated f32 scratch (GATED_N floats), written per head
+//   [AQ_OFF .. DA_OFF) aq int8 codes, one scale for the row
+//   [DA_OFF .. DA_OFF + 4) d_a f32
+//   [ACT_OFF ..]       the same values as ssm_out's GEMV activation: a header
+//                      tile then one per k_tile, int8 codes with a scale and a
+//                      code sum per group of GATED_GRP. Writing it here is what
+//                      lets the projection read it without a repack on the host.
+#include "xdna-math.h"
+
 #include <math.h>
+#include <stdint.h>
+
 #include <aie_api/aie.hpp>
-#include "silu-f32.h"
 using namespace aie;
 
-// az per head = [attn 128][z 128][hh] (hh at the tail keeps attn/z 64B-aligned;
-// each call finds its slot by hh).
+namespace {
+
+constexpr int GATED_D   = 128;               // head dim: attn, z and gamma
+constexpr int GATED_N   = K_GATE;            // values in a row
+constexpr int GATED_HH  = 2 * GATED_D;       // the head's slot in [attn][z][hh]
+constexpr int AQ_OFF    = GATED_N * 4;       // int8 codes after the f32 scratch
+constexpr int DA_OFF    = AQ_OFF + GATED_N;  // the row's scale
+constexpr int GATED_GRP = 32;                // values a group scale covers
+
+#if defined(GATED_FMT) && GATED_FMT == 1
+// The 8-bit weight form: tiles of 128 codes, the layout the projection's q8
+// kernel reads. Q5_K and Q6_K are the 8-bit form, so the design is built per
+// model (GATED_FMT=1) and the tag covers the flag.
+constexpr int GATED_KT   = 128;
+constexpr int GATED_FMTW = 1;
+#else
+constexpr int GATED_KT   = 256;
+constexpr int GATED_FMTW = 0;
+#endif
+constexpr int GATED_NG = GATED_KT / GATED_GRP;  // groups a tile
+
+// The last two words of an activation tile: the flags and the code width.
+constexpr int ACT_FLAGS_W = ACT_TILE / 4 - 2;
+constexpr int ACT_WIDTH_W = ACT_TILE / 4 - 1;
+
+}  // namespace
+
+// az per head = [attn GATED_D][z GATED_D][hh] (hh at the tail keeps attn/z
+// 64B-aligned; each call finds its slot by hh).
 extern "C" void ggml_xdna_gated_head(uint8_t * out, const float * az, const float * gamma) {
-    const int hh = (int)az[256];
-    float * gbuf = (float *)out + hh * 128;
-    const float * a = az;
-    const float * z = az + 128;
-    float ms = 0.0f;
-    for (int i = 0; i < 128; i++) ms += a[i] * a[i];
-    const float rsc = 1.0f / aie::sqrt(ms / 128.0f + 1e-6f);
-    const auto bc_r = aie::broadcast<float, 16>(rsc);
-    for (int i = 0; i < 128; i += 16) {
-        auto a16 = aie::load_v<16>(a + i);
-        auto z16 = aie::load_v<16>(z + i);
-        auto g16 = aie::load_v<16>(gamma + i);
-        // silu(z) in fp32: the hw tanh's bf16 result was this stage's largest error
-        auto silu = silu_f32(z16);
-        auto g1 = aie::mul(a16, bc_r).to_vector<float>();
-        auto g2 = aie::mul(g1, g16).to_vector<float>();
-        aie::vector<float, 16> g = aie::mul(g2, silu).to_vector<float>();
-        aie::store_v(gbuf + i, g);
+    const int     hh   = (int) az[GATED_HH];
+    float *       gbuf = (float *) out + hh * GATED_D;
+    const float * a    = az;
+    const float * z    = az + GATED_D;
+    float         ms   = 0.0f;
+    for (int i = 0; i < GATED_D; i++) {
+        ms += a[i] * a[i];
     }
+    xdna::gated_head(gbuf, a, z, gamma, xdna::rms_scale(ms, GATED_D, xdna::RMS_EPS));
 }
 
 #if ACT_SPLIT
@@ -51,146 +70,78 @@ extern "C" void ggml_xdna_gated_fin(uint8_t * out, uint8_t * actbuf) {
 #else
 extern "C" void ggml_xdna_gated_fin(uint8_t * out) {
 #endif
-    const float * gbuf = (const float *)out;
-    // Both passes are vector work. They used to be scalar loops over 2048
-    // floats with a divide per element, which measured as the single most
+    const float *          gbuf    = (const float *) out;
+    // Both passes are vector work. They used to be scalar loops over the
+    // row with a divide per element, which measured as the single most
     // expensive thing in the fused core - more than the per-head epilogue and
     // four times the data movement of the whole stage.
-    aie::vector<float, 16> vmax = aie::zeros<float, 16>();
-    const auto absmask = aie::broadcast<int32, 16>(0x7FFFFFFF);
-    for (int k = 0; k < 2048; k += 16) {
-        auto v = aie::load_v<16>(gbuf + k);
+    aie::vector<float, 16> vmax    = aie::zeros<float, 16>();
+    const auto             absmask = aie::broadcast<int32, 16>(0x7FFFFFFF);
+    for (int k = 0; k < GATED_N; k += 16) {
+        auto v  = aie::load_v<16>(gbuf + k);
         // aie::abs does not hold for f32 on this target; mask the sign bit.
         auto av = aie::bit_and(v.cast_to<int32>(), absmask).cast_to<float>();
-        vmax = aie::max(vmax, av);
+        vmax    = aie::max(vmax, av);
     }
     alignas(64) float lanes[16];
     aie::store_v(lanes, vmax);
     float amax = 0.0f;
     for (int i = 0; i < 16; i++) {
-        if (lanes[i] > amax) amax = lanes[i];
-    }
-
-    const float da = amax > 0.0f ? amax / 127.0f : 1.0f;
-    // One divide for the whole buffer instead of 2048 of them.
-    const float inv = 1.0f / da;
-    // The float-to-int step goes through the "magic constant": adding
-    // 1.5*2^23 puts the rounded integer in the low mantissa bits, and
-    // subtracting the constant's own bit pattern leaves it as an int32. The
-    // library's to_fixed does not hold on this target, and the scalar loop
-    // this replaces was the other half of the stage.
-    const auto vinv  = aie::broadcast<float, 16>(inv);
-    const auto vlo   = aie::broadcast<float, 16>(-128.0f);
-    const auto vhi   = aie::broadcast<float, 16>(127.0f);
-    const auto magic = aie::broadcast<float, 16>(12582912.0f);
-    const auto magici = magic.cast_to<int32>();
-    int8 * aq = (int8 *)(out + 8192);
-    for (int k = 0; k < 2048; k += 16) {
-        auto v = aie::mul(aie::load_v<16>(gbuf + k), vinv).to_vector<float>();
-        v = aie::min(aie::max(v, vlo), vhi);
-        // aie::add of two vectors is a vector, not an accumulator.
-        auto qi = aie::sub(aie::add(v, magic).cast_to<int32>(), magici);
-        aie::store_v(aq + k, aie::pack(aie::pack(qi)));
-    }
-    float * dap = (float *)(out + 10240);
-    dap[0] = da;
-
-    // The same codes again in the GEMV's activation tile layout, but with a
-    // scale and a code sum per group of 32 rather than one for the row: a
-    // group scale is local to the values a core holds, which is what the
-    // projection's kernel reads, in either weight form's tiles.
-    {
-#if defined(GATED_FMT) && GATED_FMT == 1
-        // The 8-bit weight form: tiles of 128 codes, groups of 32, the layout
-        // the projection's q8 kernel reads. Which form the model needs is a
-        // property of its ssm_out weights - Q5_K and Q6_K are the 8-bit form -
-        // so the design is built per model (GATED_FMT=1) and the tag covers it.
-        const int NT = K_GATE / 128;
-#else
-        const int NT = K_GATE / 256;
-#endif
-        // A drain of its own when the activation is split off: the projection
-        // that reads it back in the same stream needs a plainly patched
-        // descriptor, and the gated output's own drain cannot have one.
-#if ACT_SPLIT
-        uint8_t * act = actbuf;
-#else
-        uint8_t * act = out + ACT_OFF;
-#endif
-        int32_t * hdr = (int32_t *)act;
-        hdr[0] = NT;
-        hdr[1] = 1;
-        // words 2 and 3 select the pool's attention mode (attn-dec.cc): this
-        // object is reused, so they are cleared, never left to its last use
-        hdr[2] = 0;
-        hdr[3] = 0;
-        hdr[ACT_TILE / 4 - 2] = 0;
-#if defined(GATED_FMT) && GATED_FMT == 1
-        hdr[ACT_TILE / 4 - 1] = 1;
-#else
-        hdr[ACT_TILE / 4 - 1] = 0;
-#endif
-        for (int t = 0; t < NT; t++) {
-            uint8_t * tile = act + (1 + t) * ACT_TILE;
-            int8 * code = (int8 *)tile;
-#if defined(GATED_FMT) && GATED_FMT == 1
-            float * gsum = (float *)(tile + 128);
-            float * gd = gsum + 4;
-            for (int g = 0; g < 4; g++) {
-                const float * v = gbuf + t * 128 + g * 32;
-                const auto v0 = aie::load_v<16>(v);
-                const auto v1 = aie::load_v<16>(v + 16);
-                const auto a0 = aie::max(
-                    aie::bit_and(v0.cast_to<int32>(), absmask).cast_to<float>(),
-                    aie::bit_and(v1.cast_to<int32>(), absmask).cast_to<float>());
-                const float ga = aie::reduce_max(a0);
-                const float gdv = ga > 0.0f ? ga / 127.0f : 1.0f;
-                const auto ginv = aie::broadcast<float, 16>(1.0f / gdv);
-                auto q0 = aie::mul(v0, ginv).to_vector<float>();
-                auto q1 = aie::mul(v1, ginv).to_vector<float>();
-                q0 = aie::min(aie::max(q0, vlo), vhi);
-                q1 = aie::min(aie::max(q1, vlo), vhi);
-                const auto i0 = aie::sub(aie::add(q0, magic).cast_to<int32>(), magici);
-                const auto i1 = aie::sub(aie::add(q1, magic).cast_to<int32>(), magici);
-                aie::store_v(code + g * 32, aie::pack(aie::pack(i0)));
-                aie::store_v(code + g * 32 + 16, aie::pack(aie::pack(i1)));
-                gsum[g] = (float) (aie::reduce_add(i0) + aie::reduce_add(i1));
-                gd[g] = gdv;
-            }
-            ((int32_t *)tile)[ACT_TILE / 4 - 2] = 0;
-            ((int32_t *)tile)[ACT_TILE / 4 - 1] = 1;
-#else
-            float * gsum = (float *)(tile + 256);
-            float * gd = gsum + 8;
-            for (int g = 0; g < 8; g++) {
-                const float * v = gbuf + t * 256 + g * 32;
-                const auto v0 = aie::load_v<16>(v);
-                const auto v1 = aie::load_v<16>(v + 16);
-                const auto a0 = aie::bit_and(v0.cast_to<int32>(), absmask)
-                                    .cast_to<float>();
-                const auto a1 = aie::bit_and(v1.cast_to<int32>(), absmask)
-                                    .cast_to<float>();
-                // reduce_max, not a scalar scan of the sixteen lanes: at
-                // sixty-four groups a branchy scalar loop per group cost the
-                // stage 50 us.
-                const float ga = aie::reduce_max(aie::max(a0, a1));
-                const float gdv = ga > 0.0f ? ga / 127.0f : 1.0f;
-                const auto ginv = aie::broadcast<float, 16>(1.0f / gdv);
-                auto q0 = aie::mul(v0, ginv).to_vector<float>();
-                auto q1 = aie::mul(v1, ginv).to_vector<float>();
-                q0 = aie::min(aie::max(q0, vlo), vhi);
-                q1 = aie::min(aie::max(q1, vlo), vhi);
-                const auto i0 = aie::sub(aie::add(q0, magic).cast_to<int32>(), magici);
-                const auto i1 = aie::sub(aie::add(q1, magic).cast_to<int32>(), magici);
-                aie::store_v(code + g * 32, aie::pack(aie::pack(i0)));
-                aie::store_v(code + g * 32 + 16, aie::pack(aie::pack(i1)));
-                gsum[g] = (float) aie::reduce_add(aie::add(i0, i1));
-                gd[g] = gdv;
-            }
-            ((int32_t *)tile)[ACT_TILE / 4 - 2] = 0;
-            ((int32_t *)tile)[ACT_TILE / 4 - 1] = 0;
-#endif
+        if (lanes[i] > amax) {
+            amax = lanes[i];
         }
     }
 
+    const float da   = amax > 0.0f ? amax / xdna::CODE_MAX : 1.0f;
+    // One divide for the whole row instead of GATED_N of them.
+    const float inv  = 1.0f / da;
+    const auto  vinv = aie::broadcast<float, 16>(inv);
+    const auto  vlo  = aie::broadcast<float, 16>(xdna::CODE_MIN);
+    const auto  vhi  = aie::broadcast<float, 16>(xdna::CODE_MAX);
+    int8 *      aq   = (int8 *) (out + AQ_OFF);
+    for (int k = 0; k < GATED_N; k += 16) {
+        const auto v = aie::mul(aie::load_v<16>(gbuf + k), vinv).to_vector<float>();
+        aie::store_v(aq + k, aie::pack(aie::pack(xdna::quant_i32(v, vlo, vhi))));
+    }
+    float * dap = (float *) (out + DA_OFF);
+    dap[0]      = da;
+
+    // The same codes again in the GEMV's activation tile layout, but with a
+    // scale and a code sum per group of GATED_GRP rather than one for the row:
+    // a group scale is local to the values a core holds, which is what the
+    // projection's kernel reads, in either weight form's tiles.
+    //
+    // A drain of its own when the activation is split off: the projection that
+    // reads it back in the same stream needs a plainly patched descriptor, and
+    // the gated output's own drain cannot have one.
+#if ACT_SPLIT
+    uint8_t * act = actbuf;
+#else
+    uint8_t * act = out + ACT_OFF;
+#endif
+    int32_t * hdr    = (int32_t *) act;
+    hdr[0]           = K_GATE / GATED_KT;
+    hdr[1]           = 1;
+    // words 2 and 3 select the pool's attention mode (attn-dec.cc): this
+    // object is reused, so they are cleared, never left to its last use
+    hdr[2]           = 0;
+    hdr[3]           = 0;
+    hdr[ACT_FLAGS_W] = 0;
+    hdr[ACT_WIDTH_W] = GATED_FMTW;
+    for (int t = 0; t < K_GATE / GATED_KT; t++) {
+        uint8_t * tile = act + (1 + t) * ACT_TILE;
+        int8 *    code = (int8 *) tile;
+        float *   gsum = (float *) (tile + GATED_KT);
+        float *   gd   = gsum + GATED_NG;
+        for (int g = 0; g < GATED_NG; g++) {
+            const float * v = gbuf + t * GATED_KT + g * GATED_GRP;
+            float         gd_g;
+            const int     sum = xdna::quant_group(aie::load_v<16>(v), aie::load_v<16>(v + 16), vlo,
+                                                  (int8_t *) (code + g * GATED_GRP), gd_g);
+            gsum[g]           = (float) sum;
+            gd[g]             = gd_g;
+        }
+        ((int32_t *) tile)[ACT_FLAGS_W] = 0;
+        ((int32_t *) tile)[ACT_WIDTH_W] = GATED_FMTW;
+    }
 }

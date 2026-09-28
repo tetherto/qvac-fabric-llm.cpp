@@ -8,11 +8,10 @@
 #include <aie_api/aie.hpp>
 
 #ifndef N_CORE
-#define N_CORE 64
+#    define N_CORE 64
 #endif
 
-extern "C" void ggml_xdna_gemv_merge(const float *p, float *o)
-{
+extern "C" void ggml_xdna_gemv_merge(const float * p, float * o) {
     constexpr int VEC = 16;
     for (int j = 0; j < N_CORE / VEC; j++) {
         aie::store_v(o + N_CORE + j * VEC, aie::load_v<VEC>(p + j * VEC));

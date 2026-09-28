@@ -1,13 +1,13 @@
-# The chunked gated delta rule (FLM_PREFILL_PLAN.md, step 3) against ggml's
+# The chunked gated delta rule against ggml's
 # token recurrence (ggml_compute_forward_gated_delta_net), on the host, with
 # and without bf16 rounding of every matmul operand (the state kept exact):
 #   python3 probes/gdn_chunk_ref.py [tokens] [chunk] [doubling|inverse] [gate scale]
 # ("doubling": T by products of rounded matmuls, as the array would form it)
-# Per chunk (Γ = exp of the cumulative gate, D[t, s] = Γ_t / Γ_s):
-#   T = (I + tril(β K K^T ⊙ D, -1))^-1
-#   U = T (β V),  W = T (β Γ K),  Δ = U - W S0
-#   O = scale (Γ Q S0 + tril(Q K^T ⊙ D) Δ)
-#   S = Γ_C S0 + ((Γ_C / Γ) K)^T Δ
+# Per chunk (G = exp of the cumulative gate, D[t, s] = G_t / G_s):
+#   T = (I + tril(beta K K^T * D, -1))^-1
+#   U = T (beta V),  W = T (beta G K),  Delta = U - W S0
+#   O = scale (G Q S0 + tril(Q K^T * D) Delta)
+#   S = G_C S0 + ((G_C / G) K)^T Delta
 import numpy as np
 import sys
 try:
@@ -53,7 +53,7 @@ def chunked(rnd):
         n = len(b)
         gam = np.cumsum(gg)
         G = np.exp(gam)
-        Dm = np.exp(gam[:, None] - gam[None, :])                 # Γ_t / Γ_s
+        Dm = np.exp(gam[:, None] - gam[None, :])                 # G_t / G_s
         L = np.tril(b[:, None] * Dm * (rnd(K) @ rnd(K).T), -1)
         if DOUBLING:
             # (I + L)^-1 for a strictly lower L: (I - L)(I + L^2)(I + L^4)...,

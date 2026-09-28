@@ -35,7 +35,12 @@ from aie.utils.hostruntime.argparse import add_compile_args
 from aie.utils.hostruntime.cli import run_design_cli
 from aie.utils.verify import assert_pass
 
-from wfmt import (dequant_fn, group_size, pack_tile, tile_bytes,
+import sys
+from pathlib import Path as _Path
+
+sys.path.insert(0, str(_Path(__file__).resolve().parent.parent / "kernels"))
+
+from wfmt import (dequant_fn, group_size, pack_tile, tile_bytes,  # noqa: E402
                   unpack_reference)
 
 K_TILE = 64
