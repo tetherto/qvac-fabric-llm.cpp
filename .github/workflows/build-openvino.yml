@@ -19,6 +19,8 @@ on:
     types: [opened, synchronize, reopened]
     paths: [
       '.github/workflows/build-openvino.yml',
+      'common/fit.cpp',
+      'tests/test-fit-params.cpp',
       'ggml/src/ggml-openvino/**'
     ]
 

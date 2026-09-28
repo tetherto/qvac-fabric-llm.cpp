@@ -1,18 +1,18 @@
 #include "fit.h"
 
-#include "log.h"
-#include "llama-cpp.h"
-
 #include "../src/llama-ext.h"
+#include "llama-cpp.h"
+#include "log.h"
 
-#include <array>
 #include <algorithm>
+#include <array>
+#include <atomic>
 #include <cassert>
-#include <exception>
-#include <stdexcept>
 #include <cinttypes>
-#include <set>
+#include <exception>
 #include <mutex>
+#include <set>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -50,10 +50,14 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
         ggml_log_level min_level; // prints below this log level go to debug log
         std::exception_ptr callback_exception;
         std::mutex         callback_exception_mutex;
+        std::atomic<bool>  callback_failed = false;
 
         // Do not let a throwing callback unwind through llama's extern "C" frames: on MSVC that
         // skipped the logger restore. Capture it here and rethrow from C++ after each call.
         void log(ggml_log_level level, const char * text) {
+            if (callback_failed.load(std::memory_order_acquire)) {
+                return;
+            }
             try {
                 const ggml_log_level level_eff = level >= min_level ? level : GGML_LOG_LEVEL_DEBUG;
                 original_logger.callback(level_eff, text, original_logger.user_data);
@@ -62,6 +66,7 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
                 if (!callback_exception) {
                     callback_exception = std::current_exception();
                 }
+                callback_failed.store(true, std::memory_order_release);
             }
         }
 

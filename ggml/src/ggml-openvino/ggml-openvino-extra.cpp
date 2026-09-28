@@ -157,10 +157,10 @@ const std::string & ggml_openvino_get_device_name() {
     return ggml_openvino_get_device_config().device_name;
 }
 
-// The packed path gathers the selected experts per token and decodes them to f32, so its
-// temporary grows with n_tokens. On the CPU plugin that ran test-backend-ops out of memory.
+// The CPU path extracts MXFP4 weights to avoid a temporary that grows with n_tokens.
+// Other devices keep the packed representation.
 bool ggml_openvino_mxfp4_moe_use_packed() {
-    return ggml_openvino_get_device_name() == "GPU";
+    return ggml_openvino_get_device_name() != "CPU";
 }
 
 // Get the value of a GGML_OPENVINO_* env var as a string. Returns
