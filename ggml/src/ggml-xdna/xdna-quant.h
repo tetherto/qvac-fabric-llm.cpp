@@ -16,21 +16,24 @@
 //
 //   q4g32  32 values: 16 B packed nibbles + an int8 scale and min  (0.594 B/val)
 //          w[i] = q[i] * d + m,  q unsigned [0,15]   - exact for Q4_K
-//   q8g16  16 values: 16 B int8 codes + an int8 scale and min      (1.19 B/val)
-//          w[i] = q[i] * d + m,  q signed            - exact for Q4_K,
-//          Q5_K and Q6_K alike
+//   q8g16  32 values: 32 B int8 codes + an int8 scale and min      (1.09 B/val;
+//          a GEMV tile pads it to the 4-bit tile, so the stream is unchanged)
+//          w[i] = q[i] * d + m,  q signed            - exact for Q4_K and
+//          Q5_K, two bits finer than the source for half of each Q6_K group
 //
 // Both decode with the same affine expression, so one AIE kernel shape serves
 // both.
 //
 // q8g16 covers every quantized type the decode path sees, which is what lets
-// the GEMV run from a single artifact. A group of 16 rather than 32 is what
-// makes that exact: Q6_K carries one scale per 16 values, so a group of 32
-// would have to merge two of them, while Q4_K's per-32 affine group simply
-// repeats across its two halves. The cost over the 4-bit form is 0.75 B per
-// value on the Q4_K tensors, which buys away a hardware-context switch per
-// weight format - and those measured 2.5 ms against 0.1 ms for the work
-// itself.
+// the GEMV run from a single artifact. The name is historical: its groups were
+// 16 values, which kept Q6_K (one scale per 16) exact, until the f32 rescale a
+// group costs turned out to be half the kernel's arithmetic on this form - a
+// group of 16 paid it twice on Q5_K and Q4_K, whose parameters are per 32. Now
+// a Q6_K group merges two scales into the larger one (xdna-quant.cpp). The
+// cost over the 4-bit form is ~0.5 B per value on the Q4_K tensors, which buys
+// away a hardware-context switch per weight format - and those measured 2.5 ms
+// against 0.1 ms for the work itself. An 8-bit tile is smaller than the 4-bit
+// one in groups of 32 and is padded to it (xdna_gemv_geom::tile_bytes).
 //
 // A group's scale and min are an int8 each, scaled by a bf16 pair shared by
 // the 256 values of a ggml super-block. That is not an approximation of the
@@ -65,18 +68,18 @@
 // Group sizes and on-wire group strides.
 enum {
     XDNA_Q4G32_GROUP = 32,
-    XDNA_Q8G16_GROUP = 16,
+    XDNA_Q8G16_GROUP = 32,
     // A record is one ggml super-block, whatever the group width.
     XDNA_SB_VALUES       = 256,
     XDNA_SB_PARAM        = 8,        // dS_hi, dS_lo, mS_hi, mS_lo
     XDNA_Q4G32_CODE      = XDNA_Q4G32_GROUP / 2,
     XDNA_Q8G16_CODE      = XDNA_Q8G16_GROUP,
     XDNA_Q4G32_SB_GROUPS = XDNA_SB_VALUES / XDNA_Q4G32_GROUP,   // 8
-    XDNA_Q8G16_SB_GROUPS = XDNA_SB_VALUES / XDNA_Q8G16_GROUP,   // 16
+    XDNA_Q8G16_SB_GROUPS = XDNA_SB_VALUES / XDNA_Q8G16_GROUP,   // 8
     XDNA_Q4G32_SB_BYTES  = XDNA_Q4G32_SB_GROUPS * XDNA_Q4G32_CODE +
                            2 * XDNA_Q4G32_SB_GROUPS + XDNA_SB_PARAM,   // 152
     XDNA_Q8G16_SB_BYTES  = XDNA_Q8G16_SB_GROUPS * XDNA_Q8G16_CODE +
-                           2 * XDNA_Q8G16_SB_GROUPS + XDNA_SB_PARAM,   // 296
+                           2 * XDNA_Q8G16_SB_GROUPS + XDNA_SB_PARAM,   // 280
 };
 
 // Which NPU format a ggml type repacks into.
@@ -105,3 +108,12 @@ bool xdna_wfmt_repack_row_as(enum ggml_type type, xdna_wfmt fmt, const void * sr
 // tile size, so a single artifact streams either and the GEMV never switches
 // hardware context.
 xdna_wfmt xdna_wfmt_gemv_for(enum ggml_type type);
+
+// The type a decode GEMV packs `w` as: its own, or Q4_K for a Q5_K/Q6_K
+// weight chosen for the 4-bit form (re-quantized at load, see
+// xdna_wfmt_repack_row_as). GGML_XDNA_W4 is the choice, a comma-separated
+// list of tensor names without ".weight" ("blk.3.ffn_down") or roles, which
+// match every layer ("ffn_down"); unset, it is "attn_qkv,attn_v", and set
+// empty, nothing is. ssm_out is never chosen: the gated stage's
+// activation layout for it is fixed at build time (GGML_XDNA_GATED_FMT).
+enum ggml_type xdna_gemv_type_of(const struct ggml_tensor * w);
