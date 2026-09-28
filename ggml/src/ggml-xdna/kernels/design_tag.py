@@ -44,9 +44,12 @@ DESIGN_ENV = {
 
 
 def tag(extra: str = "") -> str:
+    # Every source that goes into an artifact: the generators, the C/C++ they
+    # compile, and the shared headers. design_tag.py is excluded so the tag can
+    # not depend on the hash of the code computing it.
     src = []
     for f in sorted(os.listdir(KERNEL_DIR)):
-        if not f.endswith((".py", ".cc")) or f == "design_tag.py":
+        if f == "design_tag.py" or not f.endswith((".py", ".h", ".cc")):
             continue
         with open(os.path.join(KERNEL_DIR, f), "rb") as fh:
             src.append(f + "\0" + fh.read().decode(errors="replace"))
