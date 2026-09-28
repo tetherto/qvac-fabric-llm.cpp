@@ -2247,6 +2247,9 @@ static void xdna_release_model_state(ggml_backend_xdna_context * ctx) {
     ctx->res_dirty      = false;
     ctx->pending_failed = false;
     xdna_ops_release_weights(&ctx->ops);
+    if (!xdna_arena_release()) {
+        GGML_LOG_WARN("%s: the decode arena is still in use; kept\n", "ggml-xdna");
+    }
     GGML_LOG_DEBUG("%s: released %zu fused-layer sessions and the packed weights\n", "ggml-xdna", n);
 }
 
