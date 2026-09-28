@@ -38,15 +38,23 @@ int n_valid, core_id, chunk_i, piece_i, skip;
 // 32 f16 values to bf16: drop three mantissa bits (rounded), rebias the
 // exponent (15 -> 127), flush subnormals and zero to zero. AIE2P has no fp16
 // arithmetic; the cache is f16 because that is llama's default.
-inline aie::vector<bfloat16, 32> f16_to_bf16(const uint16_t *src)
+inline aie::vector<bfloat16, 32> f16_bits_to_bf16(const aie::vector<int16, 32> &h)
 {
-    const aie::vector<int16, 32> h = aie::load_v<32>((const int16 *) src);
     const auto sign = aie::bit_and(h, aie::broadcast<int16, 32>((int16) 0x8000));
     const auto mag  = aie::bit_and(h, aie::broadcast<int16, 32>((int16) 0x7FFF));
-    auto b = aie::add(aie::downshift(aie::add(mag, aie::broadcast<int16, 32>((int16) 4)), 3),
-                      aie::broadcast<int16, 32>((int16) 0x3800));
+    // the mantissa's three low bits rounded off (to nearest even, the
+    // kernel's mode) through the accumulator: aie::downshift wraps every
+    // call in crrnd saves and restores
+    aie::accum<acc32, 32> ma;
+    ma.from_vector(mag, 0);
+    auto b = aie::add(ma.to_vector<int16>(3), aie::broadcast<int16, 32>((int16) 0x3800));
     b = aie::select(b, aie::zeros<int16, 32>(), aie::lt(mag, aie::broadcast<int16, 32>((int16) 0x0400)));
     return aie::bit_or(b, sign).cast_to<bfloat16>();
+}
+
+inline aie::vector<bfloat16, 32> f16_to_bf16(const uint16_t *src)
+{
+    return f16_bits_to_bf16(aie::load_v<32>((const int16 *) src));
 }
 
 __attribute__((noinline)) aie::vector<float, 16> exp_v(const aie::vector<float, 16> &x)
@@ -135,22 +143,42 @@ void ggml_xdna_att_chunk(uint8_t *w, bfloat16 *scr)
 
 #pragma clang loop unroll(disable)
     for (int g = 0; g < AD_KVH; g++) {
-        // to bf16, into the tiles
+        // to bf16, into the tiles, two positions at once: their rows are
+        // adjacent in a tile, one 256-bit store a block (a lone last row is
+        // paired with zeros - the pad rows must stay finite, P V reads them)
         // K and V rows alike: the chunk's V follows its K, the tiles too
 #pragma clang loop unroll(disable)
-        for (int r = 0; r < 2 * valid; r++) {
-            const int kv = r >= valid, p = r - kv * valid;
-            const uint16_t *src = K + kv * AD_P * AD_KVH * AD_D + (p * AD_KVH + g) * AD_D;
-            bfloat16 *dst = scr + kv * AD_NB * AD_TILE + p * 8;
+        for (int kv = 0; kv < 2; kv++) {
+            const uint16_t *base = K + kv * AD_P * AD_KVH * AD_D + g * AD_D;
+            bfloat16 *tile = scr + kv * AD_NB * AD_TILE;
 #pragma clang loop unroll(disable)
-            for (int i = 0; i < AD_D / 32; i++) {
-                const auto x = f16_to_bf16(src + 32 * i);
-                // constant lanes: a runtime extract index picks the wrong eighth
-                bfloat16 *d = dst + 4 * i * AD_TILE;
-                aie::store_v(d,                x.template extract<8>(0));
-                aie::store_v(d + AD_TILE,      x.template extract<8>(1));
-                aie::store_v(d + 2 * AD_TILE,  x.template extract<8>(2));
-                aie::store_v(d + 3 * AD_TILE,  x.template extract<8>(3));
+            for (int p = 0; p < valid; p += 2) {
+                const uint16_t *s0 = base + p * AD_KVH * AD_D;
+                const bool two = p + 1 < valid;
+                const uint16_t *s1 = two ? s0 + AD_KVH * AD_D : s0;
+                // the lone row's partner zeroed by a mask, not a branch: a
+                // branch in the body keeps its loads from overlapping
+                const aie::vector<uint16, 32> keep = aie::broadcast<uint16, 32>(two ? 0xFFFF : 0);
+                bfloat16 *dst = tile + p * 8;
+                // the next step's raw values load while this one converts
+                // (the load past the row's end stays inside the W object)
+                aie::vector<int16, 32> h0 = aie::load_v<32>((const int16 *) s0);
+                aie::vector<int16, 32> h1 = aie::load_v<32>((const int16 *) s1);
+#pragma clang loop unroll(disable)
+                for (int i = 0; i < AD_D / 32; i++) {
+                    const aie::vector<int16, 32> n0 = aie::load_v<32>((const int16 *) (s0 + 32 * (i + 1)));
+                    const aie::vector<int16, 32> n1 = aie::load_v<32>((const int16 *) (s1 + 32 * (i + 1)));
+                    const auto x0 = f16_bits_to_bf16(h0);
+                    const auto x1 = aie::bit_and(f16_bits_to_bf16(h1).cast_to<uint16>(), keep).cast_to<bfloat16>();
+                    h0 = n0;
+                    h1 = n1;
+                    const auto z = aie::interleave_zip(x0, x1, 8);
+                    bfloat16 *d = dst + 4 * i * AD_TILE;
+                    aie::store_v(d,               z.first.template extract<16>(0));
+                    aie::store_v(d + AD_TILE,     z.first.template extract<16>(1));
+                    aie::store_v(d + 2 * AD_TILE, z.second.template extract<16>(0));
+                    aie::store_v(d + 3 * AD_TILE, z.second.template extract<16>(1));
+                }
             }
         }
 
@@ -204,14 +232,19 @@ void ggml_xdna_att_chunk(uint8_t *w, bfloat16 *scr)
         ea.from_vector(aie::concat(e_lo, e_hi), 0);
         const aie::vector<bfloat16, 32> pv = aie::transpose(ea.template to_vector<bfloat16>(), 8, 4);
 
-        // O[4 heads][8 dims] per block += P V through the MMUL
+        // O[4 heads][8 dims] per block += P V through the MMUL, two
+        // independent blocks an iteration (four cost the pool core's program
+        // memory more than they gave)
 #pragma clang loop unroll(disable)
-        for (int b = 0; b < AD_NB; b++) {
-            aie::accum<accfloat, 32> acc;
-            acc.from_vector(aie::load_v<32>(Og + b * 32), 0);
-            aie::mmul<4, 8, 8, bfloat16, bfloat16> mm(acc);
-            mm.mac(pv, aie::load_v<64>(Vt + b * AD_TILE));
-            aie::store_v(Og + b * 32, mm.template to_vector<float>());
+        for (int b = 0; b < AD_NB; b += 2) {
+            aie::accum<accfloat, 32> c0, c1;
+            c0.from_vector(aie::load_v<32>(Og + b * 32), 0);
+            c1.from_vector(aie::load_v<32>(Og + (b + 1) * 32), 0);
+            aie::mmul<4, 8, 8, bfloat16, bfloat16> m0(c0), m1(c1);
+            m0.mac(pv, aie::load_v<64>(Vt + b * AD_TILE));
+            m1.mac(pv, aie::load_v<64>(Vt + (b + 1) * AD_TILE));
+            aie::store_v(Og + b * 32, m0.template to_vector<float>());
+            aie::store_v(Og + (b + 1) * 32, m1.template to_vector<float>());
         }
     }
 }
