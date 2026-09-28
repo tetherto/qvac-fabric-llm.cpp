@@ -1,0 +1,47 @@
+diff --git a/ggml/src/ggml-cuda/convert.cu b/ggml/src/ggml-cuda/convert.cu
+index f58731c5d..f7de365c0 100644
+--- a/ggml/src/ggml-cuda/convert.cu
++++ b/ggml/src/ggml-cuda/convert.cu
+@@ -463,8 +463,42 @@ static void convert_unary_cuda(const void * vx, dst_t * y,
+         (vx, y, ne00, ne01, ne0203, ne02_fdv, s01, s02, s03);
+ }
+ 
++// contiguous convert, 8 elements per thread through 16-byte loads and stores; needs k % 8 == 0 and 16-byte aligned pointers
++template <typename src_t, typename dst_t>
++static __global__ void convert_unary_vec8(const src_t * __restrict__ x, dst_t * __restrict__ y, const int64_t n8) {
++    const int64_t i = (int64_t) blockDim.x*blockIdx.x + threadIdx.x;
++    if (i >= n8) {
++        return;
++    }
++    constexpr int nv_src = sizeof(src_t)*8 / sizeof(int4);
++    constexpr int nv_dst = sizeof(dst_t)*8 / sizeof(int4);
++    int4 in[nv_src];
++    int4 out[nv_dst];
++#pragma unroll
++    for (int j = 0; j < nv_src; j++) {
++        in[j] = ((const int4 *) (x + 8*i))[j];
++    }
++    const src_t * s = (const src_t *) in;
++    dst_t       * d = (dst_t       *) out;
++#pragma unroll
++    for (int j = 0; j < 8; j++) {
++        d[j] = ggml_cuda_cast<dst_t>(s[j]);
++    }
++#pragma unroll
++    for (int j = 0; j < nv_dst; j++) {
++        ((int4 *) (y + 8*i))[j] = out[j];
++    }
++}
++
+ template <typename src_t, typename dst_t>
+ static void convert_unary_cont_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
++    const bool aligned = (reinterpret_cast<uintptr_t>(vx) | reinterpret_cast<uintptr_t>(y)) % sizeof(int4) == 0;
++    if (k % 8 == 0 && aligned) {
++        const int64_t n8 = k / 8;
++        const dim3 num_blocks((unsigned) ((n8 + CUDA_DEQUANTIZE_BLOCK_SIZE - 1) / CUDA_DEQUANTIZE_BLOCK_SIZE), 1, 1);
++        convert_unary_vec8<src_t, dst_t><<<num_blocks, CUDA_DEQUANTIZE_BLOCK_SIZE, 0, stream>>>((const src_t *) vx, y, n8);
++        return;
++    }
+     convert_unary_cuda<src_t>(vx, y, k, 1, 1, 1, k, k, k, stream);
+ }
+ 

@@ -1,0 +1,829 @@
+diff --git a/ggml/src/ggml-cuda/gated_delta_net.cu b/ggml/src/ggml-cuda/gated_delta_net.cu
+index 62f4db728..d1b3d8872 100644
+--- a/ggml/src/ggml-cuda/gated_delta_net.cu
++++ b/ggml/src/ggml-cuda/gated_delta_net.cu
+@@ -725,6 +725,91 @@ __global__ void gated_delta_net_flashinfer_unpack_cuda(
+     }
+ }
+ 
++// 8 consecutive d per thread: two float4 loads and one 16-byte bf16x8 store per tensor, the same round-to-nearest as
++// the scalar kernel; used when S is a multiple of 8 and every stride and base pointer keeps the loads 16-byte aligned
++static __device__ __forceinline__ void gdn_pack8_bf16(const float * src, __nv_bfloat16 * dst) {
++    const float4 a = *(const float4 *) src;
++    const float4 b = *(const float4 *) (src + 4);
++    union { __nv_bfloat162 h[4]; uint4 u; } r;
++    r.h[0] = __float22bfloat162_rn(make_float2(a.x, a.y));
++    r.h[1] = __float22bfloat162_rn(make_float2(a.z, a.w));
++    r.h[2] = __float22bfloat162_rn(make_float2(b.x, b.y));
++    r.h[3] = __float22bfloat162_rn(make_float2(b.z, b.w));
++    *(uint4 *) dst = r.u;
++}
++
++__global__ void gated_delta_net_flashinfer_prepare8_cuda(
++        const float * q,
++        const float * k,
++        const float * v,
++        const float * g,
++        const float * beta,
++        __nv_bfloat16 * q_bf16,
++        __nv_bfloat16 * k_bf16,
++        __nv_bfloat16 * v_bf16,
++        float * alpha,
++        float * beta_packed,
++        int64_t S,
++        int64_t H_q,
++        int64_t H_v,
++        int64_t n_tokens,
++        int64_t n_seqs,
++        int64_t sq1,
++        int64_t sq2,
++        int64_t sq3,
++        int64_t sv1,
++        int64_t sv2,
++        int64_t sv3,
++        int64_t sb1,
++        int64_t sb2,
++        int64_t sb3,
++        int64_t rq3) {
++    const int64_t idx = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
++    const int64_t S8  = S / 8;
++    const int64_t n8  = n_seqs * n_tokens * H_v * S8;
++    if (idx >= n8) {
++        return;
++    }
++
++    ggml_cuda_pdl_sync();
++    const int64_t d8 = idx % S8;
++    const int64_t ih = (idx / S8) % H_v;
++    const int64_t it = (idx / (S8 * H_v)) % n_tokens;
++    const int64_t is = idx / (S8 * H_v * n_tokens);
++
++    gdn_pack8_bf16(v + is * sv3 + it * sv2 + ih * sv1 + d8 * 8, v_bf16 + idx * 8);
++    if (d8 == 0) {
++        const int64_t gate_idx = is * n_tokens * H_v + it * H_v + ih;
++        const int64_t src_gate_idx = is * sb3 + it * sb2 + ih * sb1;
++        alpha[gate_idx] = expf(g[src_gate_idx]);
++        beta_packed[gate_idx] = beta[src_gate_idx];
++    }
++
++    // keep ggml's grouped-value head mapping (h_v % H_q) by materializing equal-head q/k
++    const int64_t iq3 = is / rq3;
++    const int64_t iq1 = ih % H_q;
++    const int64_t src_idx = iq3 * sq3 + it * sq2 + iq1 * sq1 + d8 * 8;
++    gdn_pack8_bf16(q + src_idx, q_bf16 + idx * 8);
++    gdn_pack8_bf16(k + src_idx, k_bf16 + idx * 8);
++}
++
++__global__ void gated_delta_net_flashinfer_unpack8_cuda(
++        const __nv_bfloat16 * src, float * dst, int64_t n8) {
++    const int64_t idx = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
++    if (idx >= n8) {
++        return;
++    }
++    ggml_cuda_pdl_sync();
++    union { uint4 u; __nv_bfloat162 h[4]; } r;
++    r.u = *(const uint4 *) (src + idx * 8);
++    const float2 f0 = __bfloat1622float2(r.h[0]);
++    const float2 f1 = __bfloat1622float2(r.h[1]);
++    const float2 f2 = __bfloat1622float2(r.h[2]);
++    const float2 f3 = __bfloat1622float2(r.h[3]);
++    *(float4 *) (dst + idx * 8)     = make_float4(f0.x, f0.y, f1.x, f1.y);
++    *(float4 *) (dst + idx * 8 + 4) = make_float4(f2.x, f2.y, f3.x, f3.y);
++}
++
+ __global__ void gated_delta_net_flashinfer_cu_seqlens_cuda(
+         int64_t * cu_seqlens, int64_t n_tokens, int64_t n_seqs) {
+     const int64_t idx = threadIdx.x;
+@@ -766,14 +851,28 @@ static bool launch_gated_delta_net_flashinfer_aot(
+     ggml_cuda_pool_alloc<int64_t> cu_seqlens(ctx.pool(), n_seqs + 1);
+     ggml_cuda_pool_alloc<uint8_t> tensormaps(ctx.pool(), tensormaps_bytes);
+ 
++    // the 8-wide pack needs S a multiple of 8, strides that are multiples of 4 floats and 16-byte aligned bases; the
++    // pool buffers are aligned by construction
++    const bool vec8 = S_v % 8 == 0 && sq1 % 4 == 0 && sq2 % 4 == 0 && sq3 % 4 == 0 && sv1 % 4 == 0 && sv2 % 4 == 0 && sv3 % 4 == 0 &&
++        (uintptr_t) q_d % 16 == 0 && (uintptr_t) k_d % 16 == 0 && (uintptr_t) v_d % 16 == 0 && (uintptr_t) dst_d % 16 == 0;
++    const size_t prepare_threads = vec8 ? v_elements / 8 : v_elements;
++
+     const int threads = 256;
+     ggml_cuda_kernel_launch_params prepare_params(
+-        dim3((v_elements + threads - 1) / threads, 1, 1), dim3(threads, 1, 1), 0, stream);
+-    ggml_cuda_kernel_launch(gated_delta_net_flashinfer_prepare_cuda, prepare_params,
+-        q_d, k_d, v_d, g_d, b_d,
+-        q_bf16.get(), k_bf16.get(), v_bf16.get(), alpha.get(), beta.get(),
+-        S_v, H_q, H, n_tokens, n_seqs,
+-        sq1, sq2, sq3, sv1, sv2, sv3, sb1, sb2, sb3, rq3);
++        dim3((prepare_threads + threads - 1) / threads, 1, 1), dim3(threads, 1, 1), 0, stream);
++    if (vec8) {
++        ggml_cuda_kernel_launch(gated_delta_net_flashinfer_prepare8_cuda, prepare_params,
++            q_d, k_d, v_d, g_d, b_d,
++            q_bf16.get(), k_bf16.get(), v_bf16.get(), alpha.get(), beta.get(),
++            S_v, H_q, H, n_tokens, n_seqs,
++            sq1, sq2, sq3, sv1, sv2, sv3, sb1, sb2, sb3, rq3);
++    } else {
++        ggml_cuda_kernel_launch(gated_delta_net_flashinfer_prepare_cuda, prepare_params,
++            q_d, k_d, v_d, g_d, b_d,
++            q_bf16.get(), k_bf16.get(), v_bf16.get(), alpha.get(), beta.get(),
++            S_v, H_q, H, n_tokens, n_seqs,
++            sq1, sq2, sq3, sv1, sv2, sv3, sb1, sb2, sb3, rq3);
++    }
+ 
+     ggml_cuda_kernel_launch_params cu_params(
+         dim3(1, 1, 1), dim3(n_seqs + 1, 1, 1), 0, stream);
+@@ -791,9 +890,14 @@ static bool launch_gated_delta_net_flashinfer_aot(
+     }
+ 
+     ggml_cuda_kernel_launch_params unpack_params(
+-        dim3((v_elements + threads - 1) / threads, 1, 1), dim3(threads, 1, 1), 0, stream);
+-    ggml_cuda_kernel_launch(gated_delta_net_flashinfer_unpack_cuda, unpack_params,
+-        out_bf16.get(), dst_d, (int64_t) v_elements);
++        dim3((prepare_threads + threads - 1) / threads, 1, 1), dim3(threads, 1, 1), 0, stream);
++    if (vec8) {
++        ggml_cuda_kernel_launch(gated_delta_net_flashinfer_unpack8_cuda, unpack_params,
++            out_bf16.get(), dst_d, (int64_t) (v_elements / 8));
++    } else {
++        ggml_cuda_kernel_launch(gated_delta_net_flashinfer_unpack_cuda, unpack_params,
++            out_bf16.get(), dst_d, (int64_t) v_elements);
++    }
+     return true;
+ }
+ #endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 2a9469171..4f8962ff8 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -3408,9 +3408,18 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
+ // ssm_conv -> [add bias] -> silu, followed by per-head l2 norms of channel slices of the silu output (views), each
+ // optionally scaled; the graph builder emits these as one run of nodes (views, l2 norms, scales and the permutes that
+ // feed the delta-net op), so the run is scanned from the silu on and everything in it is skipped after the fused
+-// launch. Returns the number of nodes to skip after the ssm_conv, 0 when the pattern is absent.
+-static int ggml_cuda_try_ssm_conv_l2_fusion(const ggml_cgraph * cgraph, int node_idx,
+-                                            ggml_tensor *& bias_add, ggml_tensor *& silu, ggml_cuda_ssm_conv_l2 & l2) {
++// launch. The parsed run: the conv, an optional bias add, the silu, then the norms and their folded scales
++struct ggml_cuda_ssm_conv_l2_match {
++    ggml_tensor * bias_add;
++    ggml_tensor * silu;
++    int n_base;                             // nodes up to and including the silu
++    int l2_idx[GGML_CUDA_SSM_CONV_MAX_L2];  // graph index of each l2 norm
++    int out_idx[GGML_CUDA_SSM_CONV_MAX_L2]; // graph index of the tensor the kernel writes for it (the norm or its scale)
++};
++
++// parses the run without the fusability checks; returns its node count, 0 when the pattern is absent
++static int ggml_cuda_match_ssm_conv_l2_run(const ggml_cgraph * cgraph, int node_idx, ggml_cuda_ssm_conv_l2_match & m,
++                                           ggml_cuda_ssm_conv_l2 & l2) {
+     constexpr int max_nodes = 31; // run length limit: ggml_can_fuse_subgraph asserts count < 32
+     constexpr int head_dim  = 128; // one block of the conv kernel
+ 
+@@ -3422,16 +3431,18 @@ static int ggml_cuda_try_ssm_conv_l2_fusion(const ggml_cgraph * cgraph, int node
+     } else {
+         return 0;
+     }
+-    bias_add = n_base == 3 ? cgraph->nodes[node_idx + 1] : nullptr;
+-    silu     = cgraph->nodes[node_idx + n_base - 1];
++    m.n_base   = n_base;
++    m.bias_add = n_base == 3 ? cgraph->nodes[node_idx + 1] : nullptr;
++    m.silu     = cgraph->nodes[node_idx + n_base - 1];
++    const ggml_tensor * silu = m.silu;
+     const int64_t n_ch = silu->ne[0];
+     if (silu->nb[0] != sizeof(float) || n_ch % head_dim != 0) {
+         return 0;
+     }
+ 
+     l2 = {};
+-    int l2_idx[GGML_CUDA_SSM_CONV_MAX_L2];  // graph index of each l2 norm
+-    int out_idx[GGML_CUDA_SSM_CONV_MAX_L2]; // graph index of the tensor the kernel writes for it (the norm or its scale)
++    int * l2_idx  = m.l2_idx;
++    int * out_idx = m.out_idx;
+ 
+     int j = node_idx + n_base;
+     for (; j < cgraph->n_nodes && j - node_idx < max_nodes; ++j) {
+@@ -3507,19 +3518,37 @@ static int ggml_cuda_try_ssm_conv_l2_fusion(const ggml_cgraph * cgraph, int node
+     if (l2.n == 0) {
+         return 0;
+     }
++    return j - node_idx;
++}
++
++// whether node k of a matched run is never written: the conv, the bias add, a norm folded into its scale
++static bool ggml_cuda_ssm_conv_l2_elided(const ggml_cuda_ssm_conv_l2_match & m, const ggml_cuda_ssm_conv_l2 & l2, int node_idx, int k) {
++    bool elided = k < m.n_base - 1;
++    for (int r = 0; r < l2.n; ++r) {
++        elided = elided || (node_idx + k == m.l2_idx[r] && m.out_idx[r] != m.l2_idx[r]);
++    }
++    return elided;
++}
++
++// Returns the number of nodes to skip after the ssm_conv, 0 when the pattern is absent or not fusable
++static int ggml_cuda_try_ssm_conv_l2_fusion(const ggml_cgraph * cgraph, int node_idx,
++                                            ggml_tensor *& bias_add, ggml_tensor *& silu, ggml_cuda_ssm_conv_l2 & l2) {
++    constexpr int max_nodes = 31;
++    ggml_cuda_ssm_conv_l2_match m;
++    const int count = ggml_cuda_match_ssm_conv_l2_run(cgraph, node_idx, m, l2);
++    if (count == 0) {
++        return 0;
++    }
++    bias_add = m.bias_add;
++    silu     = m.silu;
+ 
+     // every node of the run is an output except the conv, the bias add and a norm folded into its scale
+-    const int count = j - node_idx;
+     enum ggml_op ops[max_nodes];
+     int outputs[max_nodes];
+     int n_outputs = 0;
+     for (int k = 0; k < count; ++k) {
+         ops[k] = cgraph->nodes[node_idx + k]->op;
+-        bool elided = k < n_base - 1;
+-        for (int r = 0; r < l2.n; ++r) {
+-            elided = elided || (node_idx + k == l2_idx[r] && out_idx[r] != l2_idx[r]);
+-        }
+-        if (!elided) {
++        if (!ggml_cuda_ssm_conv_l2_elided(m, l2, node_idx, k)) {
+             outputs[n_outputs++] = node_idx + k;
+         }
+     }
+@@ -3529,9 +3558,9 @@ static int ggml_cuda_try_ssm_conv_l2_fusion(const ggml_cgraph * cgraph, int node
+ 
+     // the written buffers (silu output, norm outputs) must not overlap the conv inputs
+     int written[1 + GGML_CUDA_SSM_CONV_MAX_L2];
+-    written[0] = node_idx + n_base - 1;
++    written[0] = node_idx + m.n_base - 1;
+     for (int r = 0; r < l2.n; ++r) {
+-        written[1 + r] = out_idx[r];
++        written[1 + r] = m.out_idx[r];
+     }
+     if (!ggml_cuda_check_fusion_memory_ranges(cgraph, node_idx, count, written, 1 + l2.n)) {
+         return 0;
+@@ -3646,9 +3675,10 @@ static int ggml_cuda_try_gdn_gates_fusion(const ggml_cgraph * cgraph, int node_i
+ 
+ // the conv input of a recurrent layer: get_rows of the state rows -> [views] -> concat with the transposed new tokens
+ // -> view of the last d_conv-1 columns -> cpy into the state cache. The run may hold the zero-sized "extra state"
+-// nodes the graph builder emits (a get_rows and a cpy over 0 rows) and any views. Returns the nodes to skip after
+-// the get_rows, 0 when the run is absent.
+-static int ggml_cuda_try_conv_state_fusion(const ggml_cgraph * cgraph, int node_idx, ggml_cuda_conv_state_args & a) {
++// nodes the graph builder emits (a get_rows and a cpy over 0 rows) and any views. Parses the run and fills the
++// geometry and pointers without the fusability checks; returns the node count from the get_rows through the cpy,
++// 0 when the run is absent
++static int ggml_cuda_match_conv_state_run(const ggml_cgraph * cgraph, int node_idx, ggml_cuda_conv_state_args & a, int & concat_idx) {
+     constexpr int max_nodes = 31;
+     const int end = std::min(cgraph->n_nodes, node_idx + max_nodes);
+ 
+@@ -3687,7 +3717,7 @@ static int ggml_cuda_try_conv_state_fusion(const ggml_cgraph * cgraph, int node_
+     if (concat == nullptr || ggml_get_op_params_i32(concat, 0) != 0 || concat->type != GGML_TYPE_F32 || !ggml_is_contiguous(concat)) {
+         return 0;
+     }
+-    const int concat_idx = j;
++    concat_idx = j;
+     const ggml_tensor * st = concat->src[0]; // [d_conv-1, n_ch, n_seqs] view of the gathered rows
+     const ggml_tensor * xt = concat->src[1]; // [n_t, n_ch, n_seqs] transpose of the new tokens [n_ch, n_t, n_seqs]
+     const int64_t n_state = st->ne[0];
+@@ -3729,8 +3759,32 @@ static int ggml_cuda_try_conv_state_fusion(const ggml_cgraph * cgraph, int node_
+         return 0;
+     }
+ 
++    a.n_ch          = n_ch;
++    a.d_conv        = n_state + 1;
++    a.n_t           = n_t;
++    a.n_seqs        = n_seqs;
++    a.states        = (const float *) states->data;
++    a.idx           = (const int32_t *) idx->data;
++    a.x             = (const float *) xt->data;
++    a.conv_in       = (float *) concat->data;
++    a.cache         = (float *) upd->data;
++    a.states_stride = states->nb[1]/sizeof(float);
++    a.x_stride_t    = xt->nb[0]/sizeof(float);
++    a.x_stride_s    = xt->nb[2]/sizeof(float);
++    a.cache_stride  = upd->nb[1]/sizeof(float);
++    return j - node_idx + 1;
++}
++
++// Returns the nodes to skip after the get_rows, 0 when the run is absent or outside the small-batch kernel
++static int ggml_cuda_try_conv_state_fusion(const ggml_cgraph * cgraph, int node_idx, ggml_cuda_conv_state_args & a) {
++    constexpr int max_nodes = 31;
++    int concat_idx = -1;
++    const int count = ggml_cuda_match_conv_state_run(cgraph, node_idx, a, concat_idx);
++    if (count == 0) {
++        return 0;
++    }
++
+     // every node but the get_rows is an output (views, the zero-sized extras, the concat and the cpy)
+-    const int count = j - node_idx + 1;
+     enum ggml_op ops[max_nodes];
+     int outputs[max_nodes];
+     int n_outputs = 0;
+@@ -3748,32 +3802,110 @@ static int ggml_cuda_try_conv_state_fusion(const ggml_cgraph * cgraph, int node_
+     // and overwritten by another in the same launch, and above a few tokens the per-channel loop is uncoalesced,
+     // so both keep the separate launches. conv_in is a fresh buffer: the inputs are live at the concat node, but
+     // the ranges are checked anyway
+-    a.n_ch   = n_ch;
+-    a.d_conv = n_state + 1;
+-    a.n_t    = n_t;
+-    a.n_seqs = n_seqs;
+     if (!ggml_cuda_conv_state_supported(a)) {
+         return 0;
+     }
++    const ggml_tensor * rows   = cgraph->nodes[node_idx];
++    const ggml_tensor * concat = cgraph->nodes[concat_idx];
+     auto disjoint = [](const void * p, size_t n, const ggml_tensor * t) {
+         const uintptr_t a0 = (uintptr_t) p, a1 = a0 + n;
+         const uintptr_t b0 = (uintptr_t) t->data, b1 = b0 + ggml_backend_buft_get_alloc_size(t->buffer->buft, t);
+         return a1 <= b0 || b1 <= a0;
+     };
+-    if (!disjoint(concat->data, ggml_nbytes(concat), xt) || !disjoint(concat->data, ggml_nbytes(concat), states) ||
+-        !disjoint(concat->data, ggml_nbytes(concat), idx)) {
++    if (!disjoint(concat->data, ggml_nbytes(concat), concat->src[1]) || !disjoint(concat->data, ggml_nbytes(concat), rows->src[0]) ||
++        !disjoint(concat->data, ggml_nbytes(concat), rows->src[1])) {
+         return 0;
+     }
++    return count - 1;
++}
+ 
+-    a.states        = (const float *) states->data;
+-    a.idx           = (const int32_t *) idx->data;
+-    a.x             = (const float *) xt->data;
+-    a.conv_in       = (float *) concat->data;
+-    a.cache         = (float *) upd->data;
+-    a.states_stride = states->nb[1]/sizeof(float);
+-    a.x_stride_t    = xt->nb[0]/sizeof(float);
+-    a.x_stride_s    = xt->nb[2]/sizeof(float);
+-    a.cache_stride  = upd->nb[1]/sizeof(float);
++// the prefill form of the conv-state run: the same get_rows -> concat -> cpy run directly followed by the
++// ssm_conv -> [add] -> silu -> l2-norm run, one sequence above the small-batch token limit. The concat and the
++// transposed copy are never materialized: one kernel reads the state row and the token projection, writes the silu
++// output, the norms and the next state row. Returns the nodes to skip after the get_rows, 0 when absent
++static int ggml_cuda_try_conv_tokens_fusion(const ggml_cgraph * cgraph, int node_idx, ggml_cuda_ssm_conv_tokens_args & ta,
++                                            ggml_cuda_ssm_conv_l2 & l2) {
++    constexpr int max_nodes = 31;
++    ggml_cuda_conv_state_args a;
++    int concat_idx = -1;
++    const int count0 = ggml_cuda_match_conv_state_run(cgraph, node_idx, a, concat_idx);
++    if (count0 == 0 || a.n_seqs != 1 || a.n_t <= GGML_CUDA_CONV_STATE_MAX_T) {
++        return 0;
++    }
++    const int conv_idx = node_idx + count0;
++    if (conv_idx >= cgraph->n_nodes) {
++        return 0;
++    }
++    const ggml_tensor * conv = cgraph->nodes[conv_idx];
++    const ggml_tensor * w    = conv->src[1];
++    if (conv->op != GGML_OP_SSM_CONV || conv->src[0] != cgraph->nodes[concat_idx] || w->type != GGML_TYPE_F32 ||
++        w->ne[0] != a.d_conv || w->ne[1] != a.n_ch || w->nb[0] != sizeof(float)) {
++        return 0;
++    }
++    ggml_cuda_ssm_conv_l2_match m;
++    const int count1 = ggml_cuda_match_ssm_conv_l2_run(cgraph, conv_idx, m, l2);
++    if (count1 == 0) {
++        return 0;
++    }
++    const ggml_tensor * silu = m.silu;
++    if (!ggml_is_contiguous(silu) || silu->ne[0] != a.n_ch || silu->ne[1] != a.n_t || silu->ne[2] != 1 || silu->ne[3] != 1) {
++        return 0;
++    }
++    const ggml_tensor * bias = nullptr;
++    if (m.bias_add != nullptr) {
++        bias = m.bias_add->src[0] == conv ? m.bias_add->src[1] : m.bias_add->src[0];
++        if (bias->type != GGML_TYPE_F32 || !ggml_is_contiguous(bias) || ggml_nelements(bias) != a.n_ch) {
++            return 0;
++        }
++    }
++
++    // one run: every node is an output except the get_rows, the concat, the conv, the bias add and the folded norms
++    const int count = count0 + count1;
++    if (count > max_nodes) {
++        return 0;
++    }
++    enum ggml_op ops[max_nodes];
++    int outputs[max_nodes];
++    int n_outputs = 0;
++    for (int k = 0; k < count; ++k) {
++        ops[k] = cgraph->nodes[node_idx + k]->op;
++        const bool elided = k == 0 || node_idx + k == concat_idx ||
++            (k >= count0 && ggml_cuda_ssm_conv_l2_elided(m, l2, conv_idx, k - count0));
++        if (!elided) {
++            outputs[n_outputs++] = node_idx + k;
++        }
++    }
++    if (!ggml_can_fuse_subgraph(cgraph, node_idx, count, ops, outputs, n_outputs)) {
++        return 0;
++    }
++
++    // the written buffers (silu output, norm outputs) must not overlap the token projection; the next state row may
++    // be the gathered row (each thread reads its elements before it writes them)
++    int written[1 + GGML_CUDA_SSM_CONV_MAX_L2];
++    written[0] = conv_idx + m.n_base - 1;
++    for (int r = 0; r < l2.n; ++r) {
++        written[1 + r] = m.out_idx[r];
++    }
++    if (!ggml_cuda_check_fusion_memory_ranges(cgraph, node_idx, count, written, 1 + l2.n)) {
++        return 0;
++    }
++
++    ta.states        = a.states;
++    ta.idx           = a.idx;
++    ta.x             = a.x;
++    ta.w             = (const float *) w->data;
++    ta.bias          = bias != nullptr ? (const float *) bias->data : nullptr;
++    ta.y             = (float *) silu->data;
++    ta.cache         = a.cache;
++    ta.states_stride = a.states_stride;
++    ta.x_stride_t    = a.x_stride_t;
++    ta.w_stride      = w->nb[1]/sizeof(float);
++    ta.n_ch          = a.n_ch;
++    ta.d_conv        = a.d_conv;
++    ta.n_t           = a.n_t;
++    if (!ggml_cuda_ssm_conv_tokens_supported(ta)) {
++        return 0;
++    }
+     return count - 1;
+ }
+ 
+@@ -3801,8 +3933,16 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+         }
+     }
+ 
+-    // recurrent conv input: get_rows of the state row -> concat with the new tokens -> cpy of the tail back to the cache
++    // recurrent conv input: get_rows of the state row -> concat with the new tokens -> cpy of the tail back to the cache;
++    // prefill batches of one sequence take the conv, silu and norms along and never materialize the concat
+     if (node->op == GGML_OP_GET_ROWS) {
++        ggml_cuda_ssm_conv_tokens_args ta;
++        ggml_cuda_ssm_conv_l2 l2;
++        const int tokens_to_skip = ggml_cuda_try_conv_tokens_fusion(cgraph, i, ta, l2);
++        if (tokens_to_skip > 0) {
++            ggml_cuda_op_ssm_conv_tokens(*cuda_ctx, ta, l2);
++            return tokens_to_skip;
++        }
+         ggml_cuda_conv_state_args a;
+         const int nodes_to_skip = ggml_cuda_try_conv_state_fusion(cgraph, i, a);
+         if (nodes_to_skip > 0) {
+diff --git a/ggml/src/ggml-cuda/ssm-conv.cu b/ggml/src/ggml-cuda/ssm-conv.cu
+index 0e23ea743..964232b67 100644
+--- a/ggml/src/ggml-cuda/ssm-conv.cu
++++ b/ggml/src/ggml-cuda/ssm-conv.cu
+@@ -1,4 +1,5 @@
+ #include "common.cuh"
++#include "conv-state.cuh"
+ #include "ssm-conv.cuh"
+ #include "unary.cuh"
+ 
+@@ -257,3 +258,102 @@ void ggml_cuda_op_ssm_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst, g
+                           out->nb[2], nc, nr, n_t, n_s, no_l2, stream);
+     }
+ }
++
++// one block = 128 consecutive channels (one head of a norm slice) x a tile of split_t tokens; the d_conv inputs of a
++// channel sit in registers, the first d_conv-1 come from the state row (first tile) or from the previous tokens.
++// Same accumulation order as ssm_conv_long_token_f32, so the sums are bit-identical to the concat path
++template <int d_conv, bool with_l2, int split_t>
++static __global__ void ssm_conv_tokens_f32(const ggml_cuda_ssm_conv_tokens_args a, const ggml_cuda_ssm_conv_l2 l2) {
++    constexpr int split_ch = 128;
++    ggml_cuda_pdl_lc();
++    const int tid       = threadIdx.x;
++    const int ch_base   = blockIdx.x*split_ch;
++    const int c         = ch_base + tid;
++    const int t0        = blockIdx.y*split_t;
++    const int local_n_t = min(split_t, a.n_t - t0);
++
++    __shared__ float s_red[2][WARP_SIZE];
++    const int l2_slice = with_l2 ? ssm_conv_l2_slice<split_ch>(l2, ch_base) : -1;
++
++    // weights and bias never depend on the previous kernel: load them before the grid dependency
++    float w[d_conv];
++#pragma unroll
++    for (int j = 0; j < d_conv; j++) {
++        w[j] = a.w[c*a.w_stride + j];
++    }
++    const float b = a.bias != nullptr ? a.bias[c] : 0.0f;
++
++    ggml_cuda_pdl_sync();
++    float win[d_conv];
++    if (t0 == 0) {
++        const float * st = a.states + a.idx[0]*a.states_stride + c*(d_conv - 1);
++#pragma unroll
++        for (int j = 0; j < d_conv - 1; j++) {
++            win[j] = st[j];
++        }
++    } else {
++#pragma unroll
++        for (int j = 0; j < d_conv - 1; j++) {
++            win[j] = a.x[(t0 - (d_conv - 1) + j)*a.x_stride_t + c];
++        }
++    }
++
++    for (int i = 0; i < local_n_t; i++) {
++        win[d_conv - 1] = a.x[(t0 + i)*a.x_stride_t + c];
++        float sumf = 0.0f;
++#pragma unroll
++        for (int j = 0; j < d_conv; j++) {
++            sumf += win[j]*w[j];
++        }
++        sumf += b;
++        const float y = ggml_cuda_op_silu_single(sumf);
++        a.y[(t0 + i)*(int64_t) a.n_ch + c] = y;
++        if constexpr (with_l2) {
++            if (l2_slice >= 0) { // block-uniform
++                ssm_conv_l2_row<split_ch>(l2, l2_slice, ch_base, t0 + i, 0, tid, y, s_red[i & 1]);
++            }
++        }
++#pragma unroll
++        for (int j = 0; j < d_conv - 1; j++) {
++            win[j] = win[j + 1];
++        }
++    }
++
++    // the next state row = the last d_conv-1 tokens; only the first tile's blocks read the state row, and the same
++    // thread read its elements above, so writing the row in place is safe
++    if (blockIdx.y == 0) {
++        float * cache = a.cache + c*(d_conv - 1);
++#pragma unroll
++        for (int j = 0; j < d_conv - 1; j++) {
++            cache[j] = a.x[(a.n_t - (d_conv - 1) + j)*a.x_stride_t + c];
++        }
++    }
++}
++
++bool ggml_cuda_ssm_conv_tokens_supported(const ggml_cuda_ssm_conv_tokens_args & a) {
++    return (a.d_conv == 3 || a.d_conv == 4 || a.d_conv == 5 || a.d_conv == 9) &&
++        a.n_ch % 128 == 0 && a.n_t > GGML_CUDA_CONV_STATE_MAX_T;
++}
++
++void ggml_cuda_op_ssm_conv_tokens(ggml_backend_cuda_context & ctx, const ggml_cuda_ssm_conv_tokens_args & a, const ggml_cuda_ssm_conv_l2 & l2) {
++    GGML_ASSERT(ggml_cuda_ssm_conv_tokens_supported(a));
++    constexpr int split_t = 32;
++    const dim3 blocks(a.n_ch/128, (a.n_t + split_t - 1)/split_t, 1);
++    const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(blocks, 128, 0, ctx.stream());
++
++    auto launch = [&](auto NC) {
++        constexpr int d_conv = decltype(NC)::value;
++        if (l2.n > 0) {
++            ggml_cuda_kernel_launch(ssm_conv_tokens_f32<d_conv, true, split_t>, launch_params, a, l2);
++        } else {
++            ggml_cuda_kernel_launch(ssm_conv_tokens_f32<d_conv, false, split_t>, launch_params, a, l2);
++        }
++    };
++    switch (a.d_conv) {
++        case 3: launch(std::integral_constant<int, 3>{}); break;
++        case 4: launch(std::integral_constant<int, 4>{}); break;
++        case 5: launch(std::integral_constant<int, 5>{}); break;
++        case 9: launch(std::integral_constant<int, 9>{}); break;
++        default: GGML_ABORT("ssm_conv_tokens: unsupported d_conv");
++    }
++}
+diff --git a/ggml/src/ggml-cuda/ssm-conv.cuh b/ggml/src/ggml-cuda/ssm-conv.cuh
+index 6e1d91a58..bc47188ba 100644
+--- a/ggml/src/ggml-cuda/ssm-conv.cuh
++++ b/ggml/src/ggml-cuda/ssm-conv.cuh
+@@ -19,3 +19,27 @@ struct ggml_cuda_ssm_conv_l2 {
+ 
+ void ggml_cuda_op_ssm_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_tensor * bias_add_node = nullptr, ggml_tensor * silu_dst = nullptr,
+                            const ggml_cuda_ssm_conv_l2 * l2 = nullptr);
++
++// the conv of one sequence straight from the token-major projection: the first d_conv-1 inputs of a channel come
++// from its state row, the rest from x; writes silu(conv + bias) as [n_ch, n_t], the per-head L2 norms of the q/k
++// slices, and the next state row (the last d_conv-1 tokens of x). Prefill batches only (n_t above the conv_state_pack
++// limit); consecutive threads own consecutive channels so every x read and y write is coalesced
++struct ggml_cuda_ssm_conv_tokens_args {
++    const float   * states;        // [state_size, mem_size]; row idx[0] holds [n_ch][d_conv-1]
++    const int32_t * idx;           // [1]
++    const float   * x;             // [n_ch, n_t], token stride x_stride_t floats
++    const float   * w;             // [d_conv, n_ch], channel stride w_stride floats
++    const float   * bias;          // [n_ch] or nullptr
++    float         * y;             // [n_ch, n_t] contiguous (the silu output)
++    float         * cache;         // [n_ch][d_conv-1] the next state row (may be the row states[idx[0]])
++    int64_t states_stride;
++    int64_t x_stride_t;
++    int64_t w_stride;
++    int     n_ch;
++    int     d_conv;                // 3, 4, 5 or 9
++    int     n_t;                   // > GGML_CUDA_CONV_STATE_MAX_T
++};
++
++bool ggml_cuda_ssm_conv_tokens_supported(const ggml_cuda_ssm_conv_tokens_args & a);
++
++void ggml_cuda_op_ssm_conv_tokens(ggml_backend_cuda_context & ctx, const ggml_cuda_ssm_conv_tokens_args & a, const ggml_cuda_ssm_conv_l2 & l2);
+diff --git a/src/models/qwen35.cpp b/src/models/qwen35.cpp
+index 309dd4324..738fa84c4 100644
+--- a/src/models/qwen35.cpp
++++ b/src/models/qwen35.cpp
+@@ -388,10 +388,6 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
+ 
+     ggml_tensor * conv_input = build_conv_state(inp, conv_states_all, qkv_mixed, conv_kernel_size, conv_channels, il);
+ 
+-    ggml_tensor * state = build_rs(inp, ssm_states_all, hparams.n_embd_s(), n_seqs);
+-    state = ggml_reshape_4d(ctx0, state, head_v_dim, head_v_dim, num_v_heads, n_seqs);
+-    cb(state, "state_predelta", il);
+-
+     ggml_tensor * conv_output_proper = ggml_ssm_conv(ctx0, conv_input, conv_kernel);
+     cb(conv_output_proper, "conv_output_raw", il);
+ 
+@@ -432,6 +428,17 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
+     q_conv = ggml_l2_norm(ctx0, q_conv, eps_norm);
+     k_conv = ggml_l2_norm(ctx0, k_conv, eps_norm);
+ 
++    // the conv chain goes into the graph before the SSM-state gather so a backend can fuse the state gather, the conv,
++    // the silu and the norms as one run; the zero-sized view keeps the projection's buffer reserved past the norms
++    // (the fused kernel reads it while writing the conv output; the allocator would otherwise reuse it in place)
++    ggml_build_forward_expand(gf, q_conv);
++    ggml_build_forward_expand(gf, k_conv);
++    ggml_build_forward_expand(gf, ggml_view_1d(ctx0, qkv_mixed, 0, 0));
++
++    ggml_tensor * state = build_rs(inp, ssm_states_all, hparams.n_embd_s(), n_seqs);
++    state = ggml_reshape_4d(ctx0, state, head_v_dim, head_v_dim, num_v_heads, n_seqs);
++    cb(state, "state_predelta", il);
++
+     //q_conv = ggml_cont_4d(ctx0, q_conv, head_k_dim, num_k_heads, n_seq_tokens, n_seqs);
+     //k_conv = ggml_cont_4d(ctx0, k_conv, head_k_dim, num_k_heads, n_seq_tokens, n_seqs);
+     //v_conv = ggml_cont_4d(ctx0, v_conv, head_v_dim, num_v_heads, n_seq_tokens, n_seqs);
+diff --git a/src/models/qwen35moe.cpp b/src/models/qwen35moe.cpp
+index 38f2a5798..ab53c11a0 100644
+--- a/src/models/qwen35moe.cpp
++++ b/src/models/qwen35moe.cpp
+@@ -412,10 +412,6 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_attn_linear(
+ 
+     ggml_tensor * conv_input = build_conv_state(inp, conv_states_all, qkv_mixed, conv_kernel_size, conv_channels, il);
+ 
+-    ggml_tensor * state = build_rs(inp, ssm_states_all, hparams.n_embd_s(), n_seqs);
+-    state = ggml_reshape_4d(ctx0, state, head_v_dim, head_v_dim, num_v_heads, n_seqs);
+-    cb(state, "state_predelta", il);
+-
+     ggml_tensor * conv_output_proper = ggml_ssm_conv(ctx0, conv_input, conv_kernel);
+     cb(conv_output_proper, "conv_output_raw", il);
+ 
+@@ -456,6 +452,17 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_attn_linear(
+     q_conv = ggml_l2_norm(ctx0, q_conv, eps_norm);
+     k_conv = ggml_l2_norm(ctx0, k_conv, eps_norm);
+ 
++    // the conv chain goes into the graph before the SSM-state gather so a backend can fuse the state gather, the conv,
++    // the silu and the norms as one run; the zero-sized view keeps the projection's buffer reserved past the norms
++    // (the fused kernel reads it while writing the conv output; the allocator would otherwise reuse it in place)
++    ggml_build_forward_expand(gf, q_conv);
++    ggml_build_forward_expand(gf, k_conv);
++    ggml_build_forward_expand(gf, ggml_view_1d(ctx0, qkv_mixed, 0, 0));
++
++    ggml_tensor * state = build_rs(inp, ssm_states_all, hparams.n_embd_s(), n_seqs);
++    state = ggml_reshape_4d(ctx0, state, head_v_dim, head_v_dim, num_v_heads, n_seqs);
++    cb(state, "state_predelta", il);
++
+     //q_conv = ggml_cont_4d(ctx0, q_conv, head_k_dim, num_k_heads, n_seq_tokens, n_seqs);
+     //k_conv = ggml_cont_4d(ctx0, k_conv, head_k_dim, num_k_heads, n_seq_tokens, n_seqs);
+     //v_conv = ggml_cont_4d(ctx0, v_conv, head_v_dim, num_v_heads, n_seq_tokens, n_seqs);
+diff --git a/src/models/qwen3next.cpp b/src/models/qwen3next.cpp
+index 0808fd87a..970d5f9af 100644
+--- a/src/models/qwen3next.cpp
++++ b/src/models/qwen3next.cpp
+@@ -468,10 +468,6 @@ ggml_tensor * llama_model_qwen3next::graph::build_layer_attn_linear(
+ 
+     ggml_tensor * conv_input = build_conv_state(inp, conv_states_all, qkv_mixed, conv_kernel_size, conv_channels, il);
+ 
+-    ggml_tensor * state = build_rs(inp, ssm_states_all, hparams.n_embd_s(), n_seqs);
+-    state = ggml_reshape_4d(ctx0, state, head_v_dim, head_v_dim, num_v_heads, n_seqs);
+-    cb(state, "state_predelta", il);
+-
+     ggml_tensor * conv_output_proper = ggml_ssm_conv(ctx0, conv_input, conv_kernel);
+     cb(conv_output_proper, "conv_output_raw", il);
+ 
+@@ -512,6 +508,17 @@ ggml_tensor * llama_model_qwen3next::graph::build_layer_attn_linear(
+     q_conv = ggml_l2_norm(ctx0, q_conv, eps_norm);
+     k_conv = ggml_l2_norm(ctx0, k_conv, eps_norm);
+ 
++    // the conv chain goes into the graph before the SSM-state gather so a backend can fuse the state gather, the conv,
++    // the silu and the norms as one run; the zero-sized view keeps the projection's buffer reserved past the norms
++    // (the fused kernel reads it while writing the conv output; the allocator would otherwise reuse it in place)
++    ggml_build_forward_expand(gf, q_conv);
++    ggml_build_forward_expand(gf, k_conv);
++    ggml_build_forward_expand(gf, ggml_view_1d(ctx0, qkv_mixed, 0, 0));
++
++    ggml_tensor * state = build_rs(inp, ssm_states_all, hparams.n_embd_s(), n_seqs);
++    state = ggml_reshape_4d(ctx0, state, head_v_dim, head_v_dim, num_v_heads, n_seqs);
++    cb(state, "state_predelta", il);
++
+     //q_conv = ggml_cont_4d(ctx0, q_conv, head_k_dim, num_k_heads, n_seq_tokens, n_seqs);
+     //k_conv = ggml_cont_4d(ctx0, k_conv, head_k_dim, num_k_heads, n_seq_tokens, n_seqs);
+     //v_conv = ggml_cont_4d(ctx0, v_conv, head_v_dim, num_v_heads, n_seq_tokens, n_seqs);
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index bde33e4a0..00d270def 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -4601,6 +4601,96 @@ struct test_conv_state : public test_case {
+     }
+ };
+ 
++// the conv-state run followed by the conv chain of a gated delta net (ssm_conv, [bias], silu, per-head q/k l2 norms):
++// the model graph order (state write-back before the conv), so a backend can fuse the whole chain at prefill
++struct test_conv_state_ssm_conv : public test_case {
++    const int64_t d_conv;
++    const int64_t head_dim;
++    const int64_t n_head;
++    const int64_t n_t;
++    const int64_t n_seqs;
++    const int64_t mem_size;
++    const bool    fuse_bias;
++
++    std::string op_desc(ggml_tensor * t) override {
++        GGML_UNUSED(t);
++        return "CONV_STATE_SSM_CONV";
++    }
++
++    bool run_whole_graph() override { return true; }
++
++    std::string vars() override {
++        return VARS_TO_STR7(d_conv, head_dim, n_head, n_t, n_seqs, mem_size, fuse_bias);
++    }
++
++    test_conv_state_ssm_conv(int64_t d_conv = 4, int64_t head_dim = 128, int64_t n_head = 4, int64_t n_t = 64, int64_t n_seqs = 1,
++                             int64_t mem_size = 4, bool fuse_bias = false)
++        : d_conv(d_conv), head_dim(head_dim), n_head(n_head), n_t(n_t), n_seqs(n_seqs), mem_size(mem_size), fuse_bias(fuse_bias) {}
++
++    ggml_tensor * build_graph(ggml_context * ctx) override {
++        const int64_t n_ch       = 3*n_head*head_dim; // q, k, v slices
++        const int64_t state_size = (d_conv - 1)*n_ch;
++
++        ggml_tensor * states = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, state_size, mem_size);
++        ggml_tensor * idx    = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_seqs);
++        ggml_tensor * x      = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_ch, n_t, n_seqs);
++        ggml_tensor * b      = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d_conv, n_ch);
++        ggml_set_name(states, "states");
++        ggml_set_name(idx, "idx");
++        ggml_set_name(x, "x");
++        ggml_set_name(b, "b");
++
++        ggml_tensor * rows = ggml_get_rows(ctx, states, idx);
++        ggml_tensor * st   = ggml_reshape_3d(ctx, rows, d_conv - 1, n_ch, n_seqs);
++        ggml_tensor * conv_input = ggml_concat(ctx, st, ggml_transpose(ctx, x), 0);
++        ggml_set_name(conv_input, "conv_input");
++
++        ggml_tensor * last = ggml_view_3d(ctx, conv_input, d_conv - 1, n_ch, n_seqs, conv_input->nb[1], conv_input->nb[2],
++                                          ggml_row_size(conv_input->type, n_t));
++        ggml_tensor * upd  = ggml_view_2d(ctx, states, state_size, n_seqs, states->nb[1], (mem_size - n_seqs)*states->nb[1]);
++        ggml_tensor * next = ggml_cpy(ctx, last, upd);
++
++        ggml_tensor * conv = ggml_ssm_conv(ctx, conv_input, b);
++        if (fuse_bias) {
++            ggml_tensor * bias = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_ch);
++            ggml_set_name(bias, "bias");
++            conv = ggml_add(ctx, conv, bias);
++        }
++        conv = ggml_silu(ctx, conv);
++
++        const size_t nb_ch = ggml_row_size(conv->type, n_ch);
++        auto slice = [&](int64_t i) {
++            return ggml_view_4d(ctx, conv, head_dim, n_head, n_t, n_seqs, ggml_row_size(conv->type, head_dim), nb_ch, nb_ch*n_t,
++                                i*n_head*head_dim*ggml_element_size(conv));
++        };
++        ggml_tensor * q = ggml_l2_norm(ctx, slice(0), 1e-6f);
++        ggml_tensor * k = ggml_l2_norm(ctx, slice(1), 1e-6f);
++        ggml_tensor * v = slice(2);
++        ggml_tensor * sum = ggml_add(ctx, ggml_add(ctx, q, k), v);
++
++        // the state write-back is visited first so the graph order matches the model's; one output covers the conv
++        // output (v), both norms and the next state rows
++        ggml_tensor * out = ggml_concat(ctx, next, ggml_reshape_2d(ctx, sum, head_dim*n_head*n_t, n_seqs), 0);
++        ggml_set_name(out, "out");
++        return out;
++    }
++
++    void initialize_tensors(ggml_context * ctx) override {
++        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
++            if (t->type == GGML_TYPE_I32) {
++                // gather from the rows that are written (the in-place update) and from others
++                std::vector<int32_t> data(ggml_nelements(t));
++                for (int64_t i = 0; i < ggml_nelements(t); i++) {
++                    data[i] = (i % 2 == 0) ? (int32_t) (mem_size - n_seqs + i) : (int32_t) (i % mem_size);
++                }
++                ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(int32_t));
++            } else {
++                init_tensor_uniform(t, -1.0f, 1.0f);
++            }
++        }
++    }
++};
++
+ // GGML_OP_SSM_SCAN
+ struct test_ssm_scan : public test_case {
+     const ggml_type type;
+@@ -10663,6 +10753,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+             {4, 512, 1, 2, 4}, {4, 512, 16, 1, 4} }) {
+         test_cases.emplace_back(new test_conv_state(d_conv, n_ch, n_t, n_seqs, mem));
+     }
++    // the prefill chain: conv-state run, then conv + silu + q/k norms, fused as one launch on CUDA for one sequence
++    for (auto [d_conv, head_dim, n_head, n_t, n_seqs, mem, bias] : std::vector<std::array<int64_t, 7>>{
++            {4, 128, 4, 64, 1, 4, 0}, {4, 128, 4, 4096, 1, 8, 0}, {4, 128, 4, 100, 1, 4, 1}, {4, 128, 4, 1, 1, 4, 0},
++            {4, 128, 4, 64, 2, 4, 0}, {9, 128, 2, 40, 1, 4, 0}, {4, 128, 4, 9, 1, 4, 0} }) {
++        test_cases.emplace_back(new test_conv_state_ssm_conv(d_conv, head_dim, n_head, n_t, n_seqs, mem, bias != 0));
++    }
+ 
+     // fused ssm_conv + (optional) bias_add + silu. The bias-only graph (no silu) is intentionally
+     // not tested since there's no fusion for that pattern in ggml_cuda_can_fuse.
+@@ -11989,6 +12085,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 4096, 1, 3));
+     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 4033, 1, 3));
+     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32,  4, 128,  127, 2, 2));
++    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128,   64, 1, 3, true)); // permuted input, vectorized pack
+     // chunked prefix followed by a serial tail that must hold all K snapshots (tail exactly K, and tail > K)
+     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64,  68, 1, 1, false, false, /*K=*/4));
+     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 100, 2, 1, false, false, /*K=*/4));
+@@ -12522,6 +12619,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+     test_cases.emplace_back(new test_ssm_conv_bias_silu(GGML_TYPE_F32, {4,   3328, 1, 1}, {4, 3328, 1, 1}, true));  // generate
+     // qwen35 (Qwen3.8-27B) gated delta net input chain at decode: conv + silu + q/k norms, gate projections
+     test_cases.emplace_back(new test_ssm_conv_l2(4, 128, 16, 1, 1, false));
++    test_cases.emplace_back(new test_conv_state_ssm_conv(4, 128, 26, 4096, 1, 8, false)); // prefill chain, 9984 channels
+     test_cases.emplace_back(new test_gdn_gates(GGML_TYPE_BF16, 5120, 48, 1, false));
+     test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 128, 64, 48, 1, 512, 1)); // prefill
+     test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 128, 64, 48, 1, 1,   1)); // generate

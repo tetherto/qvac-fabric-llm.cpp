@@ -1,0 +1,204 @@
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index 8cc49295a..19006a8ed 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -270,9 +270,19 @@ struct server_slot {
+             return false;
+         }
+ 
+-        llama_state_seq_get_data_ext(ctx_tgt, cur->data.main.data(), cur_size_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
++        // the buffers are not zero-initialized, so a short write must not leave a partial entry in the cache
++        size_t n_tgt = llama_state_seq_get_data_ext(ctx_tgt, cur->data.main.data(), cur_size_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
++        size_t n_dft = cur_size_dft;
+         if (ctx_dft) {
+-            llama_state_seq_get_data_ext(ctx_dft, cur->data.drft.data(), cur_size_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE);
++            n_dft = llama_state_seq_get_data_ext(ctx_dft, cur->data.drft.data(), cur_size_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE);
++        }
++
++        if (n_tgt != cur_size_tgt || n_dft != cur_size_dft) {
++            SRV_ERR("failed to save state: wrote %zu + %zu of %zu + %zu bytes\n", n_tgt, n_dft, cur_size_tgt, cur_size_dft);
++
++            prompt_cache.states.pop_back();
++
++            return false;
+         }
+ 
+         return true;
+@@ -1323,7 +1333,7 @@ private:
+             }
+             SRV_TRC("%s", "use `--cache-ram 0` to disable the prompt cache\n");
+ 
+-            prompt_cache = std::make_unique<server_prompt_cache>(params_base.cache_ram_mib, n_ctx);
++            prompt_cache = std::make_unique<server_prompt_cache>(params_base.cache_ram_mib, n_ctx, params_base.cpuparams.n_threads);
+         } else {
+             SRV_TRC("%s", "prompt cache is disabled - use `--cache-ram N` to enable it\n");
+         }
+diff --git a/tools/server/server-task.cpp b/tools/server/server-task.cpp
+index 258cdcf8f..41590ad3d 100644
+--- a/tools/server/server-task.cpp
++++ b/tools/server/server-task.cpp
+@@ -11,6 +11,8 @@
+ #include "server-common.h"
+ 
+ #include <sstream>
++#include <system_error>
++#include <thread>
+ 
+ using json = nlohmann::ordered_json;
+ 
+@@ -1690,6 +1692,55 @@ json server_task_result_apply_lora::to_json() {
+ //
+ // server_prompt_cache
+ //
++
++// a single thread faults in about 2 GB/s of fresh pages, slower than the device copy that follows
++static server_prompt_buffer server_prompt_buffer_alloc(size_t n, int n_threads) {
++    server_prompt_buffer buf;
++    if (n == 0) {
++        return buf;
++    }
++    buf.ptr.reset(new uint8_t[n]);
++    buf.n = n;
++
++    constexpr size_t page      = 4096;
++    constexpr size_t min_chunk = 64ull*1024ull*1024ull;
++
++    const int nt = std::max(1, std::min(n_threads, (int) (n / min_chunk)));
++
++    auto touch = [&](int t) {
++        const size_t i0 = n * t / nt;
++        const size_t i1 = n * (t + 1) / nt;
++        for (size_t i = i0; i < i1; i += page) {
++            buf.ptr[i] = 0;
++        }
++    };
++
++    if (nt == 1) {
++        touch(0);
++        return buf;
++    }
++
++    std::vector<std::thread> workers;
++    workers.reserve(nt);
++    int t = 0;
++    try {
++        for (; t < nt; t++) {
++            workers.emplace_back(touch, t);
++        }
++    } catch (const std::system_error & e) {
++        SRV_WRN("failed to start a page fault thread, continuing on the calling thread: %s\n", e.what());
++    }
++    for (auto & w : workers) {
++        w.join();
++    }
++    // chunks that did not get a thread
++    for (; t < nt; t++) {
++        touch(t);
++    }
++
++    return buf;
++}
++
+ size_t server_prompt_cache::size() const {
+     size_t res = 0;
+ 
+@@ -1759,13 +1810,13 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
+         }
+     }
+ 
+-    std::vector<uint8_t> state_data_tgt;
+-    std::vector<uint8_t> state_data_dft;
++    server_prompt_buffer state_data_tgt;
++    server_prompt_buffer state_data_dft;
+ 
+     // check if we can allocate enough memory for the new state
+     try {
+-        state_data_tgt.resize(state_size_tgt);
+-        state_data_dft.resize(state_size_dft);
++        state_data_tgt = server_prompt_buffer_alloc(state_size_tgt, n_threads);
++        state_data_dft = server_prompt_buffer_alloc(state_size_dft, n_threads);
+     } catch (const std::bad_alloc & e) {
+         SRV_ERR("failed to allocate memory for prompt cache state: %s\n", e.what());
+ 
+@@ -1839,7 +1890,6 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
+             }
+ 
+             data.clear();
+-            data.shrink_to_fit();
+         }
+ 
+         {
+@@ -1857,7 +1907,6 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
+                 }
+ 
+                 data.clear();
+-                data.shrink_to_fit();
+             }
+         }
+ 
+diff --git a/tools/server/server-task.h b/tools/server/server-task.h
+index 25ff01512..26a67ceab 100644
+--- a/tools/server/server-task.h
++++ b/tools/server/server-task.h
+@@ -3,10 +3,12 @@
+ #include "common.h"
+ #include "llama.h"
+ 
++#include <algorithm>
+ #include <string>
+ #include <unordered_set>
+ #include <list>
+ #include <map>
++#include <memory>
+ 
+ // TODO: prevent including the whole server-common.h as we only use server_tokens
+ #include "server-common.h"
+@@ -586,9 +588,24 @@ struct server_prompt {
+     }
+ };
+ 
++// state buffer without value-initialization: the pages are faulted in by server_prompt_cache::alloc
++struct server_prompt_buffer {
++    std::unique_ptr<uint8_t[]> ptr;
++    size_t n = 0;
++
++    uint8_t * data() { return ptr.get(); }
++    size_t size() const { return n; }
++    bool empty() const { return n == 0; }
++
++    void clear() {
++        ptr.reset();
++        n = 0;
++    }
++};
++
+ struct server_prompt_data {
+-    std::vector<uint8_t> main;
+-    std::vector<uint8_t> drft;
++    server_prompt_buffer main;
++    server_prompt_buffer drft;
+ 
+     size_t size() const {
+         return main.size() + drft.size();
+@@ -611,9 +628,10 @@ struct server_prompt_cache_state {
+ };
+ 
+ struct server_prompt_cache {
+-    server_prompt_cache(int32_t limit_size_mib, size_t limit_tokens) {
++    server_prompt_cache(int32_t limit_size_mib, size_t limit_tokens, int n_threads) {
+         this->limit_size   = 1024ull*1024ull*(limit_size_mib < 0 ? 0 : limit_size_mib);
+         this->limit_tokens = limit_tokens;
++        this->n_threads    = std::max(1, n_threads);
+     }
+ 
+     std::list<server_prompt_cache_state> states;
+@@ -624,6 +642,9 @@ struct server_prompt_cache {
+     // in tokens, 0 = no limit
+     size_t limit_tokens = 0;
+ 
++    // threads used to fault in the pages of a new state buffer
++    int n_threads = 1;
++
+     size_t size() const;
+ 
+     size_t n_tokens() const;
