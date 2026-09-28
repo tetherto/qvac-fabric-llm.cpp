@@ -132,4 +132,3 @@ print("worst", worst)
 if failed:
     sys.exit(f"attn_dec_check: FAIL on heads {failed} (rel tolerance {REL_TOL}, lse tolerance {LSE_TOL})")
 print("attn_dec_check: PASS")
-
