@@ -1249,14 +1249,14 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
     ctx->ops.isolation = xdna_rec_active();
     // Projections outside the fused layers can go through the decode GEMV on
     // the merged artifact, which is the context the layers leave resident.
-    // They stay on the host by default: that route is both faster (about 38
-    // against 30 t/s on the 0.8B, because the packed format moves more bytes
-    // at a lower rate) and the only one that has not been caught diverging.
-    // Over 120 runs the array route still produced two whose logits differ
-    // from the rest, against none in 48 on the host route. The switch keeps
-    // the array route reachable for anyone measuring NPU residency or power,
-    // where the extra work belongs on the device; that arm is not reproducible
-    // today.
+    // They stay on the host by default, the route the reproducibility series
+    // was run on: five fresh servers, each given six one-token and four
+    // 1466-token requests and three of each interleaved, gave one answer for
+    // every one-token request and one for every long one, logits included.
+    // The array route (GGML_XDNA_GEMV_GROUP=1) answered six repeated one-token
+    // requests in one process the same, but has not been through that series.
+    // The switch keeps it reachable for anyone measuring NPU residency or
+    // power, where the extra work belongs on the device.
     ctx->ops.fused_gemv = false;
     if (xdna_env_int("GGML_XDNA_GEMV_GROUP", 0) != 0) {
         ctx->ops.fused_gemv = ctx->ops.isolation && !xdna_fused_xclbin().empty();
