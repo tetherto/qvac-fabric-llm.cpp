@@ -84,9 +84,9 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
     llama_log_get(&ud.original_logger.callback, &ud.original_logger.user_data);
     ud.min_level = log_level;
 
-    llama_log_set([](ggml_log_level level, const char * text, void * user_data) {
-        ((user_data_t *) user_data)->log(level, text);
-    }, &ud);
+    llama_log_set([](ggml_log_level level, const char * text,
+                     void * user_data) { ((user_data_t *) user_data)->log(level, text); },
+                  &ud);
 
     llama_model_params mparams_copy = *mparams;
     mparams_copy.no_alloc  = true;

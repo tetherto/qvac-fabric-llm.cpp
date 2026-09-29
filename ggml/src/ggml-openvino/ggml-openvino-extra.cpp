@@ -157,12 +157,6 @@ const std::string & ggml_openvino_get_device_name() {
     return ggml_openvino_get_device_config().device_name;
 }
 
-// The CPU path extracts MXFP4 weights to avoid a temporary that grows with n_tokens.
-// Other devices keep the packed representation.
-bool ggml_openvino_mxfp4_moe_use_packed() {
-    return ggml_openvino_get_device_name() != "CPU";
-}
-
 // Get the value of a GGML_OPENVINO_* env var as a string. Returns
 // default_value when the var is unset or set to an empty string.
 const char * ggml_openvino_getenv_str(const char * var, const char * default_value) {
@@ -281,7 +275,7 @@ ggml_openvino_extracted_layout ggml_openvino_get_extracted_layout(const ggml_ten
     }
 
     // Most quantized weights use the existing 2D extraction path. 3D expert weights for
-    // MUL_MAT_ID (MoE) are also supported, either as packed MXFP4 on GPU/NPU or via the
+    // MUL_MAT_ID (MoE) are also supported, either as MXFP4 (packed, dedicated branch below) or via the
     // generic sizing math below, which is shape-agnostic (based on total element count). Only reject 4D.
     if (tensor->ne[3] != 1) {
         return layout;
@@ -296,8 +290,7 @@ ggml_openvino_extracted_layout ggml_openvino_get_extracted_layout(const ggml_ten
     int64_t n_elements = ggml_nelements(tensor);
     const size_t alignment = 64;  // Good for SIMD
 
-    if (tensor->type == GGML_TYPE_MXFP4 && (tensor->ne[2] > 1 || tensor->ne[3] > 1) &&
-        ggml_openvino_mxfp4_moe_use_packed()) {
+    if (tensor->type == GGML_TYPE_MXFP4 && (tensor->ne[2] > 1 || tensor->ne[3] > 1)) {
         layout.weights_per_block = 32;
         layout.is_symmetric = true;
         layout.weights_size = ggml_nbytes(tensor);

@@ -4,6 +4,7 @@
 #include "gather_matmul.hpp"
 #include "ggml-openvino/ggml-openvino-extra.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <cstring>
 #include <limits>
@@ -117,6 +118,28 @@ ov::Output<ov::Node> translate_mul_mat_id_mxfp4_packed(const NodeContext & conte
     const int64_t k_blocks = static_cast<int64_t>(packed_shape[3]);
     const int64_t qk = 32;
     const int64_t cols = k_blocks * qk;
+
+    if (ggml_openvino_get_device_name() == "CPU" && ids.get_partial_shape().is_static() &&
+        activations.get_partial_shape().is_static()) {
+        const ov::Shape id_shape = ids.get_shape();
+        if (id_shape.size() == 4 && id_shape[3] != 0 && rows != 0 && cols != 0) {
+            // The CPU JIT uses signed 32-bit gather offsets for the decoded weights.
+            static constexpr size_t max_selected_bytes = 512ULL << 20;
+            const size_t max_chunk_tokens = max_selected_bytes / sizeof(float) / id_shape[3] / rows / cols;
+            const size_t n_tokens = id_shape[2];
+            if (max_chunk_tokens > 0 && n_tokens > max_chunk_tokens) {
+                ov::OutputVector chunks;
+                chunks.reserve((n_tokens + max_chunk_tokens - 1) / max_chunk_tokens);
+                for (size_t begin = 0; begin < n_tokens; begin += max_chunk_tokens) {
+                    const size_t end = std::min(n_tokens, begin + max_chunk_tokens);
+                    chunks.push_back(translate_mul_mat_id_mxfp4_packed(context, expert_weights,
+                                                                       slice_axis(activations, 1, begin, end),
+                                                                       slice_axis(ids, 2, begin, end)));
+                }
+                return std::make_shared<ov::op::v0::Concat>(chunks, 1);
+            }
+        }
+    }
 
     auto packed_shape_4d = const_i64({n_expert, rows, k_blocks, 17});
     expert_weights = std::make_shared<ov::op::v1::Reshape>(expert_weights, packed_shape_4d, false);
