@@ -407,7 +407,38 @@ llama_model * llama_model_create(llama_model_loader & ml, const llama_model_para
 struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const struct ggml_tensor * tensor, void * userdata) {
     const llama_meta_device_get_split_state_userdata * ud = (const llama_meta_device_get_split_state_userdata *) userdata;
     const llama_hparams & hparams = ud->model->hparams;
-    const std::string tensor_name = tensor->name;
+    std::string tensor_name = tensor->name;
+
+    // optimizer state tensors follow the split of their parameter tensor
+    static const char * const opt_prefixes[] = {"grad acc for ", "AdamW m for ", "AdamW v for "};
+    for (const char * prefix : opt_prefixes) {
+        const size_t n = strlen(prefix);
+        if (tensor_name.compare(0, n, prefix) == 0) {
+            tensor_name = tensor_name.substr(n);
+            break;
+        }
+    }
+
+    // LoRA factors follow the split of their base tensor: a shares the input dim, b shares the output dim
+    static const char * const lora_suffixes[] = {".lora_a", ".lora_b"};
+    for (const char * suffix : lora_suffixes) {
+        const size_t n = strlen(suffix);
+        if (tensor_name.size() > n && tensor_name.compare(tensor_name.size() - n, n, suffix) == 0) {
+            const ggml_tensor * base = ud->model->get_tensor(tensor_name.substr(0, tensor_name.size() - n).c_str());
+            GGML_ASSERT(base != nullptr);
+            const ggml_backend_meta_split_state base_split_state = llama_meta_device_get_split_state(base, userdata);
+            const bool is_a = suffix[n - 1] == 'a';
+            if ((is_a && base_split_state.axis == GGML_BACKEND_SPLIT_AXIS_0) || (!is_a && base_split_state.axis == GGML_BACKEND_SPLIT_AXIS_1)) {
+                return base_split_state;
+            }
+            return {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1};
+        }
+    }
+    // one kv head is mirrored and q is split by head, but only with separate q/k/v tensors: a fused qkv keeps its
+    // kv segments split, so it also keeps the group granularity and the split cache
+    auto single_kv_head = [&](uint32_t il) -> bool {
+        return hparams.n_head_kv(il) == 1 && ud->model->get_tensor(("blk." + std::to_string(il) + ".attn_qkv.weight").c_str()) == nullptr;
+    };
     const bool is_dsv4 = ud->model->arch == LLM_ARCH_DEEPSEEK4 || ud->model->arch == LLM_ARCH_DEEPSEEK41 ||
         (ud->model->arch == LLM_ARCH_DFLASH && hparams.dsv4_hc_mult > 0);
 
@@ -588,14 +619,23 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
 
         // standard attention
         if (std::regex_match(tensor_name, pattern_q_weight) || std::regex_match(tensor_name, pattern_kv_weight)) {
-            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "attn_output.weight", "ssm_out.weight");
+            tensor_config tc = get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "attn_output.weight", "ssm_out.weight");
+            // a single kv head cannot be split, k/v are mirrored and q is split by head
+            if (single_kv_head(tc.il) && std::regex_match(tensor_name, pattern_kv_weight)) {
+                tc.axis = GGML_BACKEND_SPLIT_AXIS_MIRRORED;
+            }
+            return tc;
         }
         // routed value experts {n_embd, n_embd_v_gqa, n_expert} produce V, so they split like attn_v
         if (std::regex_match(tensor_name, pattern_v_exps_weight)) {
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "attn_output.weight");
         }
         if (std::regex_match(tensor_name, pattern_q_bias) || std::regex_match(tensor_name, pattern_kv_bias)) {
-            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0, "attn_output.weight", "ssm_out.weight");
+            tensor_config tc = get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0, "attn_output.weight", "ssm_out.weight");
+            if (single_kv_head(tc.il) && std::regex_match(tensor_name, pattern_kv_bias)) {
+                tc.axis = GGML_BACKEND_SPLIT_AXIS_MIRRORED;
+            }
+            return tc;
         }
         if (std::regex_match(tensor_name, pattern_qkv_weight)) {
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "attn_output.weight", "ssm_out.weight");
@@ -608,7 +648,11 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
         }
         if (std::regex_match(tensor_name, pattern_kv_cache) || std::regex_match(tensor_name, pattern_attn_sinks) ||
                 std::regex_match(tensor_name, pattern_attn_gate_bias)) {
-            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0, "attn_output.weight");
+            tensor_config tc = get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0, "attn_output.weight");
+            if (single_kv_head(tc.il) && std::regex_match(tensor_name, pattern_kv_cache)) {
+                tc.axis = GGML_BACKEND_SPLIT_AXIS_MIRRORED;
+            }
+            return tc;
         }
         if (std::regex_match(tensor_name, pattern_attn_out_weight)) {
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0);
@@ -663,7 +707,8 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
 
         // output
         if (std::regex_match(tensor_name, pattern_output_weight)) {
-            if (is_dsv4) {
+            // the loss needs full logit rows, so the output projection stays mirrored when training
+            if (is_dsv4 || ud->model->training()) {
                 return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
             }
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1);
@@ -671,6 +716,9 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
         if (std::regex_match(tensor_name, pattern_output_bias)) {
             const ggml_tensor * output_weight = ud->model->get_tensor("output.weight");
             GGML_ASSERT(output_weight != nullptr);
+            if (ud->model->training()) {
+                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+            }
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0);
         }
 
@@ -825,8 +873,8 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
                 return std::vector<int64_t>(segments.size(), granularity_qkv * head_dim);
             }
         } else {
-            // regular attention
-            const uint32_t n_gqa    = hparams.n_gqa(il);
+            // regular attention, with a single mirrored kv head the q heads are split individually
+            const uint32_t n_gqa    = single_kv_head(il) ? 1 : hparams.n_gqa(il);
             const uint32_t n_embd_q = n_gqa * hparams.n_embd_head_k(il);
 
             // to handle head sizes like 80, only increase granularity while it doesn't cause underutilization
@@ -2674,6 +2722,10 @@ bool llama_model::no_alloc() const {
     return params.no_alloc;
 }
 
+bool llama_model::training() const {
+    return params.training;
+}
+
 std::map<ggml_backend_buffer_type_t, size_t> llama_model::memory_breakdown() const {
     std::map<ggml_backend_buffer_type_t, size_t> ret;
     for (const auto & [ctx, bufs] : pimpl->ctxs_bufs) {
@@ -3029,6 +3081,9 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
         return nullptr;
     }
 
+    // the transposed V cache writes single elements with global row indices, this does not split across devices
+    const bool v_trans = !cparams.flash_attn && split_mode() != LLAMA_SPLIT_MODE_TENSOR;
+
     switch (arch) {
         // Models that need specific instantiation should be handled in the
         // switch statement
@@ -3063,7 +3118,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                         params.no_alloc,
                         params.type_k,
                         params.type_v,
-                        !cparams.flash_attn,
+                        v_trans,
                         cparams.offload_kqv,
                         cparams.kv_unified,
                         cparams.n_ctx_seq,
@@ -3090,7 +3145,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             hparams,
                             params.type_k,
                             params.type_v,
-                            !cparams.flash_attn,
+                            v_trans,
                             cparams.offload_kqv,
                             cparams.kv_unified,
                             cparams.n_ctx_seq,
@@ -3115,7 +3170,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             params.no_alloc,
                             params.type_k,
                             params.type_v,
-                            !cparams.flash_attn,
+                            v_trans,
                             cparams.offload_kqv,
                             cparams.kv_unified,
                             cparams.n_ctx_seq,
@@ -3182,7 +3237,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                     /* no_alloc          */ params.no_alloc,
                     /* attn_type_k       */ params.type_k,
                     /* attn_type_v       */ params.type_v,
-                    /* attn_v_trans      */ !cparams.flash_attn,
+                    /* attn_v_trans      */ v_trans,
                     /* attn_kv_size      */ cparams.n_ctx_seq,
                     /* attn_n_swa        */ hparams.n_swa,
                     /* attn_swa_type     */ hparams.swa_type,
@@ -3207,7 +3262,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             hparams,
                             params.type_k,
                             params.type_v,
-                            !cparams.flash_attn,
+                            v_trans,
                             cparams.offload_kqv,
                             cparams.kv_unified,
                             cparams.n_ctx_seq,
@@ -3227,7 +3282,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             params.no_alloc,
                             params.type_k,
                             params.type_v,
-                            !cparams.flash_attn,
+                            v_trans,
                             cparams.offload_kqv,
                             cparams.kv_unified,
                             cparams.n_ctx_seq,
@@ -3254,7 +3309,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             hparams,
                             params.type_k,
                             params.type_v,
-                            !cparams.flash_attn,
+                            v_trans,
                             cparams.offload_kqv,
                             cparams.kv_unified,
                             cparams.n_ctx_seq,
@@ -3278,7 +3333,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             params.no_alloc,
                             params.type_k,
                             params.type_v,
-                            !cparams.flash_attn,
+                            v_trans,
                             cparams.offload_kqv,
                             params.swa_full,
                             cparams.kv_unified,
@@ -3305,7 +3360,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             params.no_alloc,
                             params.type_k,
                             params.type_v,
-                            !cparams.flash_attn,
+                            v_trans,
                             cparams.offload_kqv,
                             params.swa_full,
                             cparams.kv_unified,
@@ -3322,7 +3377,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             params.no_alloc,
                             params.type_k,
                             params.type_v,
-                            !cparams.flash_attn,
+                            v_trans,
                             cparams.offload_kqv,
                             params.swa_full,
                             cparams.kv_unified,
@@ -3345,7 +3400,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             params.no_alloc,
                             params.type_k,
                             params.type_v,
-                            !cparams.flash_attn,
+                            v_trans,
                             cparams.offload_kqv,
                             params.swa_full,
                             cparams.kv_unified,
@@ -3435,7 +3490,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* no_alloc          */ params.no_alloc,
                             /* attn_type_k       */ params.type_k,
                             /* attn_type_v       */ params.type_v,
-                            /* attn_v_trans      */ !cparams.flash_attn,
+                            /* attn_v_trans      */ v_trans,
                             /* attn_swa_full     */ params.swa_full,
                             /* attn_kv_size      */ cparams.n_ctx_seq,
                             /* attn_n_ubatch     */ cparams.n_ubatch,
@@ -3455,7 +3510,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* no_alloc          */ params.no_alloc,
                             /* attn_type_k       */ params.type_k,
                             /* attn_type_v       */ params.type_v,
-                            /* attn_v_trans      */ !cparams.flash_attn,
+                            /* attn_v_trans      */ v_trans,
                             /* attn_kv_size      */ cparams.n_ctx_seq,
                             /* attn_n_swa        */ hparams.n_swa,
                             /* attn_swa_type     */ hparams.swa_type,
@@ -3475,7 +3530,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* no_alloc          */ params.no_alloc,
                             /* attn_type_k       */ params.type_k,
                             /* attn_type_v       */ params.type_v,
-                            /* attn_v_trans      */ !cparams.flash_attn,
+                            /* attn_v_trans      */ v_trans,
                             /* attn_kv_size      */ cparams.n_ctx_seq,
                             /* attn_n_swa        */ hparams.n_swa,
                             /* attn_swa_type     */ hparams.swa_type,
@@ -3535,7 +3590,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                     params.no_alloc,
                                     params.type_k,
                                     params.type_v,
-                                    !cparams.flash_attn,
+                                    v_trans,
                                     cparams.offload_kqv,
                                     params.swa_full,
                                     cparams.kv_unified,
@@ -3552,7 +3607,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                     params.no_alloc,
                                     params.type_k,
                                     params.type_v,
-                                    !cparams.flash_attn,
+                                    v_trans,
                                     cparams.offload_kqv,
                                     params.swa_full,
                                     cparams.kv_unified,
@@ -3573,7 +3628,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                 hparams,
                                 params.type_k,
                                 params.type_v,
-                                !cparams.flash_attn,
+                                v_trans,
                                 cparams.offload_kqv,
                                 cparams.kv_unified,
                                 cparams.n_ctx_seq,
@@ -3647,6 +3702,7 @@ llama_model_params llama_model_default_params() {
         /*.no_host                     =*/ false,
         /*.no_alloc                    =*/ false,
         /*.load_mtp                    =*/ false,
+        /*.training                    =*/ false,
     };
 
     return result;
