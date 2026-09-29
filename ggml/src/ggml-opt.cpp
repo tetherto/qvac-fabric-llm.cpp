@@ -572,6 +572,7 @@ static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
             ggml_tensor * node = opt_ctx->gf->nodes[i];
             if ((accumulate && (node->flags & GGML_TENSOR_FLAG_PARAM)) || (node->flags & GGML_TENSOR_FLAG_LOSS)) {
                 opt_ctx->grad_accs[i] = ggml_new_tensor(opt_ctx->ctx_static, GGML_TYPE_F32, GGML_MAX_DIMS, node->ne);
+                ggml_format_name(opt_ctx->grad_accs[i], "grad acc for %s", node->name);
             } else {
                 opt_ctx->grad_accs[i] = nullptr;
             }

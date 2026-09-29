@@ -111,6 +111,8 @@ int main(int argc, char ** argv) {
 
     llama_backend_init();
     llama_numa_init(params.numa);
+    params.training = true;
+
     // load the model and apply lora adapter, if any
     auto llama_init = common_init_from_params(params);
 
