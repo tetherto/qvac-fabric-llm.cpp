@@ -609,6 +609,7 @@ struct common_params {
 
     size_t moe_cache_size = 0;    // GPU cache size in bytes for the MoE experts kept in the CPU, split among the GPUs like the layers
     bool   moe_cache_auto = true; // size the MoE cache when fitting a MoE model
+    bool   moe_cache_auto_explicit = false; // user requested auto sizing on any supported backend
 
     common_conversation_mode conversation_mode = COMMON_CONVERSATION_MODE_AUTO;
 
