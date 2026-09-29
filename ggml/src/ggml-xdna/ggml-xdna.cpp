@@ -3278,8 +3278,8 @@ static enum ggml_status xdna_graph_compute_impl(ggml_backend_xdna_context * ctx,
     // is written, which needs every reader to be such a MUL_MAT.
     std::unordered_set<const struct ggml_tensor *>                             norm_a;
     std::unordered_map<const struct ggml_tensor *, struct ggml_tensor *>       norm_add;
-    std::unordered_map<const struct ggml_tensor *, int>                        node_at;  // node index in graph order
     std::unordered_map<const struct ggml_tensor *, const struct ggml_tensor *> gated_a;
+    std::unordered_map<const struct ggml_tensor *, int>                        node_at;  // node index in graph order
     std::unordered_set<const struct ggml_tensor *>                             gate_a;
     g_norm_mul.clear();
     xdna_gdn_mm_keep_clear();
@@ -3351,23 +3351,49 @@ static enum ggml_status xdna_graph_compute_impl(ggml_backend_xdna_context * ctx,
             for (const struct ggml_tensor * t : readers[v]) {
                 ok = ok && t->op == GGML_OP_MUL_MAT && t->src[1] == v && xdna_pgemm_supported(t);
             }
+            // the GDN output the norm reads: left where the array wrote it when
+            // nothing else reads its rows (xdna_gdn_mm_keep)
+            const struct ggml_tensor * x      = r->src[0];
+            const struct ggml_tensor * gdn    = x->view_src;
+            const int64_t              attn_b = (int64_t) 128 * 16 * g->ne[2] * (int64_t) sizeof(float);
+            bool keep = ok && x->op == GGML_OP_VIEW && gdn && gdn->op == GGML_OP_GATED_DELTA_NET && x->view_offs == 0 &&
+                        x->ne[0] == 128 && x->ne[1] == 16 && x->nb[1] == 128 * sizeof(float) &&
+                        x->nb[2] == (size_t) 128 * 16 * sizeof(float) && readers[x].size() == 1 &&
+                        xdna_gdn_mm_supported(gdn) && !(gdn->flags & GGML_TENSOR_FLAG_OUTPUT);
+            for (const struct ggml_tensor * u : readers[gdn]) {
+                keep = keep && u->op == GGML_OP_VIEW && (u == x || (int64_t) u->view_offs >= attn_b);
+            }
+            // The run reads the norm's input and the gate at the gating MUL,
+            // but their last readers are the RMS_NORM and the SILU, earlier:
+            // the allocator may hand their memory to a node in between. On the
+            // 4B the gate projection lands exactly on the GDN output (both
+            // [4096, n_tokens]), so the run read the gate as x (prefill KLD
+            // 6.8). Only when nothing computed in between writes over them.
+            if (ok) {
+                const auto overwritten = [&](const struct ggml_tensor * t, const struct ggml_tensor * last_reader) {
+                    const char * t0 = (const char *) t->data;
+                    const char * t1 = t0 + ggml_nbytes(t);
+                    for (int j = node_at[last_reader] + 1; j < node_at[g]; j++) {
+                        const struct ggml_tensor * n = cgraph->nodes[j];
+                        if (consumed.count(n) || ggml_xdna_is_view_op(n->op) || !n->data) {
+                            continue;
+                        }
+                        const char * n0 = (const char *) n->data;
+                        if (n0 < t1 && t0 < n0 + ggml_nbytes(n)) {
+                            return true;
+                        }
+                    }
+                    return false;
+                };
+                // x does not matter when the GDN leaves its rows on the array
+                // for the run to read (the 0.8B's case, where x is overwritten)
+                ok = !overwritten(sl->src[0], sl) && (keep || !overwritten(x, r));
+            }
             if (ok) {
                 gated_a[g] = v;
                 consumed.insert(r);
                 consumed.insert(m);
                 consumed.insert(sl);
-                // the GDN output the norm reads: left where the array wrote
-                // it when nothing else reads its rows (xdna_gdn_mm_keep)
-                const struct ggml_tensor * x      = r->src[0];
-                const struct ggml_tensor * gdn    = x->view_src;
-                const int64_t              attn_b = (int64_t) 128 * 16 * g->ne[2] * (int64_t) sizeof(float);
-                bool keep = x->op == GGML_OP_VIEW && gdn && gdn->op == GGML_OP_GATED_DELTA_NET && x->view_offs == 0 &&
-                            x->ne[0] == 128 && x->ne[1] == 16 && x->nb[1] == 128 * sizeof(float) &&
-                            x->nb[2] == (size_t) 128 * 16 * sizeof(float) && readers[x].size() == 1 &&
-                            xdna_gdn_mm_supported(gdn) && !(gdn->flags & GGML_TENSOR_FLAG_OUTPUT);
-                for (const struct ggml_tensor * u : readers[gdn]) {
-                    keep = keep && u->op == GGML_OP_VIEW && (u == x || (int64_t) u->view_offs >= attn_b);
-                }
                 if (keep) {
                     xdna_gdn_mm_keep(gdn);
                 }
