@@ -2638,10 +2638,8 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
     };
 
     // Preferentially use backend-specific allreduce_tensor_async (e.g. NCCL for CUDA), use a generic fallback if unavailable:
-    auto allreduce_fallback = [&](size_t i) -> ggml_status {
-        std::vector<ggml_cgraph *> step_cgraphs(n_backends, nullptr);
-
-        // Zero out nodes that were disabled due to having a zero-sized slice:
+    // Zero out nodes that were disabled due to having a zero-sized slice, they still take part in the all-reduce:
+    auto zero_disabled = [&](size_t i) -> ggml_status {
         for (size_t j = 0; j < n_backends; j++) {
             auto & bcj = backend_ctx->backend_configs[j];
             ggml_tensor * node = bcj.cgraphs[i].cgraph_main->nodes[bcj.cgraphs[i].cgraph_main->n_nodes - 1];
@@ -2650,23 +2648,28 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             }
             if (ggml_nelements(node) > 0) {
                 ggml_tensor * node_zero = get_node_aux(node);
+                // FILL never reads the stale data, SCALE by 0 would keep a NaN or inf left in the reused compute buffer
                 node_zero->op = GGML_OP_FILL;
-                node_zero->src[0] = node; // only used for the shape, the data is not read
+                node_zero->src[0] = node;
                 ggml_set_op_params_f32(node_zero, 0, 0.0f);
                 node_zero->data = node->data;
                 node_zero->buffer = node->buffer;
                 node_zero->flags |= GGML_TENSOR_FLAG_COMPUTE;
 
-                step_cgraphs[j] = get_cgraph_aux();
-                step_cgraphs[j]->nodes[0] = node_zero;
-                step_cgraphs[j]->n_nodes = 1;
-                const ggml_status status = ggml_backend_graph_compute_async(bcj.backend, step_cgraphs[j]);
+                ggml_cgraph * cgraph_zero = get_cgraph_aux();
+                cgraph_zero->nodes[0] = node_zero;
+                cgraph_zero->n_nodes = 1;
+                const ggml_status status = ggml_backend_graph_compute_async(bcj.backend, cgraph_zero);
                 if (status != GGML_STATUS_SUCCESS) {
                     return status;
                 }
             }
         }
-        std::fill(step_cgraphs.begin(), step_cgraphs.end(), nullptr);
+        return GGML_STATUS_SUCCESS;
+    };
+
+    auto allreduce_fallback = [&](size_t i) -> ggml_status {
+        std::vector<ggml_cgraph *> step_cgraphs(n_backends, nullptr);
 
         auto push_data = [&](const size_t j_src, const size_t j_dst, const size_t i_buf) {
             assert(step_cgraphs[j_dst] == nullptr);
@@ -2766,6 +2769,10 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         }
 
         if (n_backends > 1 && i < backend_ctx->n_subgraphs - 1) {
+            const ggml_status status = zero_disabled(i);
+            if (status != GGML_STATUS_SUCCESS) {
+                return status;
+            }
             bool backend_allreduce_success = false;
             if (backend_ctx->comm_ctx) {
                 std::vector<ggml_tensor *> nodes;
