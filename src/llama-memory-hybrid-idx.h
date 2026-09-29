@@ -153,8 +153,8 @@ public:
     uint32_t get_n_stream() const;
 
     // glm5-next, complete pools of kpool consecutive positions per sequence, scored as whole pools.
-    uint32_t get_n_kpool    () const; // Padded pool count, where the last pool is always unused.
-    uint32_t get_n_kpool_new() const; // Pool slots reserved for this ubatch; at least one for a stable decode graph.
+    uint32_t get_n_kpool    (const llama_ubatch & ubatch) const; // Padded pool count, where the last pool is always unused.
+    uint32_t get_n_kpool_new(const llama_ubatch & ubatch) const; // Pool slots reserved for this ubatch; at least one for a stable decode graph.
     bool get_kpool_cache_safe() const;
     void set_input_kpool(ggml_tensor * pool_cells, ggml_tensor * pool_idxs, ggml_tensor * pool_mask, ggml_tensor * tail_idxs,
                          ggml_tensor * gather_mask, bool gather, ggml_tensor * new_pool_idxs, ggml_tensor * new_pool_rep,
@@ -187,6 +187,9 @@ private:
 
     // The ubatch kpool_st was built for, guards against reads before apply.
     size_t i_kpool = SIZE_MAX;
+
+    // Full-cache contexts build scheduler reservation graphs before the batch has cache slots.
+    bool kpool_reserve = false;
 
     // Whether this context tracks k-pool states.
     bool kpool_track() const;

@@ -272,13 +272,13 @@ public:
         bool res = true;
 
         res &= k_idxs->ne[0]     == params.ubatch.n_tokens;
-        res &= pool_cells->ne[0] == mctx->get_n_kpool();
+        res &= pool_cells->ne[0] == mctx->get_n_kpool(params.ubatch);
         res &= pool_mask->ne[1]  == params.ubatch.n_tokens;
         res &= tail_idxs->ne[1]  == params.ubatch.n_tokens;
         // The scatter mask shape follows n_kv.
         res &= n_kv              == idx->get_n_kv();
         // The new pool path reserves one dummy slot when no pool is completed.
-        res &= n_new             == mctx->get_n_kpool_new();
+        res &= n_new             == mctx->get_n_kpool_new(params.ubatch);
         res &= cache_safe        == mctx->get_kpool_cache_safe();
 
         return res;
@@ -307,9 +307,9 @@ llama_model_glm5_next::llm_graph_input_kpool * llama_model_glm5_next::graph::bui
     GGML_ASSERT(mctx_idx != nullptr);
 
     const uint32_t kpool  = hparams.indexer_kpool;
-    const uint32_t n_pool = mctx_hyb->get_n_kpool();
+    const uint32_t n_pool = mctx_hyb->get_n_kpool(ubatch);
     const uint32_t n_kv   = mctx_idx->get_n_kv();
-    const uint32_t n_new  = mctx_hyb->get_n_kpool_new();
+    const uint32_t n_new  = mctx_hyb->get_n_kpool_new(ubatch);
     const bool cache_safe = mctx_hyb->get_kpool_cache_safe();
 
     // the fused lightning indexer wants an f16 mask
