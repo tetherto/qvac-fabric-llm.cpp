@@ -27,6 +27,32 @@ static void expect_u32(const char * label, uint32_t got, uint32_t want) {
     }
 }
 
+static void test_auto_cache_backends() {
+    struct backend_case {
+        const char * name;
+        bool default_auto;
+        bool explicit_auto;
+    };
+    const backend_case cases[] = {
+        {"CUDA",   true,  true},
+        {"Vulkan", false, true},
+        {"ROCm",   false, true},
+        {"MUSA",   false, true},
+        {"SYCL",   false, true},
+        {"MTL",    false, true},
+        {"OpenCL", false, false},
+        {"CPU",    false, true},
+        {"RPC",    false, true},
+        {"",       false, true},
+        {nullptr,  false, true},
+    };
+    for (const auto & tc : cases) {
+        const char * label = tc.name ? tc.name : "unknown backend";
+        expect_i64(label, common_fit_auto_moe_cache_backend(tc.name, false), tc.default_auto);
+        expect_i64(label, common_fit_auto_moe_cache_backend(tc.name, true), tc.explicit_auto);
+    }
+}
+
 static void test_automatic_acceleration() {
     // Each row starts from the CLI's automatic defaults. Exercise both model
     // types: MoE should select caching, dense should select prefetch.
@@ -186,6 +212,7 @@ int main() {
     ggml_time_init();
     test_compact_override_rollback();
     test_probe_logger_restoration();
+    test_auto_cache_backends();
     test_automatic_acceleration();
     test_auto_cache_preserves_context_fitting();
     // --- common_fit_shared_pool_deficit ---

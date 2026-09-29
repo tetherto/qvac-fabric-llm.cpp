@@ -1304,7 +1304,8 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
             params.fit_params_target.data(),
             params.fit_params_min_ctx,
             params.prefetch_weights_auto,
-            params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
+            params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR,
+            params.moe_cache_auto_explicit);
         if (fit_status == COMMON_PARAMS_FIT_STATUS_SUCCESS) {
             // Keep the user's scalar settings for subsequent draft and MTP contexts.
             COM_INF("fit completed in %.2f seconds: n_gpu_layers = %d, n_ctx = %u, moe_cache_size = %zu, prefetch_weights = %s\n",

@@ -2854,10 +2854,11 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_env("LLAMA_ARG_CPU_MOE"));
     add_opt(common_arg(
         {"--moe-cache-mib"}, "N|auto",
-        "persistent GPU MoE expert cache size in MiB (default: auto with --fit)",
+        "persistent GPU MoE expert cache size in MiB (default: auto with --fit on CUDA, off otherwise; auto opts in on supported backends)",
         [](common_params & params, const std::string & value) {
             if (value == "auto") {
                 params.moe_cache_auto = true;
+                params.moe_cache_auto_explicit = true;
                 params.moe_cache_size = 0;
                 return;
             }
@@ -2868,6 +2869,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
                 throw std::invalid_argument("invalid value");
             }
             params.moe_cache_auto = false;
+            params.moe_cache_auto_explicit = false;
             params.moe_cache_size = size_t(size_mib) * 1024 * 1024;
         }
     ).set_env("LLAMA_ARG_MOE_CACHE_MIB"));

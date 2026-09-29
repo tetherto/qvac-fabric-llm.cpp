@@ -249,6 +249,13 @@ static bool ggml_dev_shares_host_memory(ggml_backend_dev_t dev) {
     return props.memory_unified;
 }
 
+bool common_fit_auto_moe_cache_backend(const char * backend_name, bool explicit_auto) {
+    if (backend_name && std::string(backend_name) == "OpenCL") {
+        return false;
+    }
+    return explicit_auto || (backend_name && std::string(backend_name) == "CUDA");
+}
+
 bool common_fit_auto_moe_cache(
         const llama_model_params & mparams, const llama_context_params & cparams,
         uint32_t n_expert, size_t n_devices, bool shares_host, bool cache_supported) {
@@ -273,7 +280,7 @@ bool common_fit_auto_prefetch_weights(
 static void common_params_fit_impl(
         const char * path_model, struct llama_model_params * mparams, struct llama_context_params * cparams,
         float * tensor_split, struct llama_model_tensor_buft_override * tensor_buft_overrides,
-        size_t * margins_s, uint32_t n_ctx_min, bool prefetch_weights_auto, enum ggml_log_level log_level) {
+        size_t * margins_s, uint32_t n_ctx_min, bool prefetch_weights_auto, enum ggml_log_level log_level, bool moe_cache_auto_explicit) {
     if (mparams->split_mode == LLAMA_SPLIT_MODE_TENSOR) {
         throw common_params_fit_exception("llama_params_fit is not implemented for SPLIT_MODE_TENSOR, abort");
     }
@@ -313,10 +320,11 @@ static void common_params_fit_impl(
         supports_copy_stream[id] = props.caps.copy_stream;
     }
 
-    bool cache_supported = true;
+    bool cache_supported = false;
     if (nd == 1) {
         const ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(devs[0]);
-        cache_supported = reg == nullptr || std::string(ggml_backend_reg_name(reg)) != "OpenCL";
+        cache_supported = common_fit_auto_moe_cache_backend(
+            reg ? ggml_backend_reg_name(reg) : nullptr, moe_cache_auto_explicit);
     }
     const bool auto_moe_cache = common_fit_auto_moe_cache(
         *mparams, *cparams, hp_nex, nd, nd == 1 && shares_host[0], cache_supported);
@@ -461,7 +469,7 @@ static void common_params_fit_impl(
     if (auto_prefetch) {
         cparams->prefetch_weights = true;
         common_params_fit_impl(
-            path_model, mparams, cparams, tensor_split, tensor_buft_overrides, margins_s, n_ctx_min, false, log_level);
+            path_model, mparams, cparams, tensor_split, tensor_buft_overrides, margins_s, n_ctx_min, false, log_level, moe_cache_auto_explicit);
         if (mparams->n_gpu_layers == default_mparams.n_gpu_layers) {
             cparams->prefetch_weights = false;
         } else {
@@ -777,7 +785,7 @@ static void common_params_fit_impl(
     if (auto_moe_cache_size > 0) {
         cparams->moe_cache_size = auto_moe_cache_size;
         common_params_fit_impl(
-            path_model, mparams, cparams, tensor_split, tensor_buft_overrides, margins_s, n_ctx_min, prefetch_weights_auto, log_level);
+            path_model, mparams, cparams, tensor_split, tensor_buft_overrides, margins_s, n_ctx_min, prefetch_weights_auto, log_level, moe_cache_auto_explicit);
         return;
     }
 
@@ -1043,7 +1051,8 @@ enum common_params_fit_status common_fit_params(
         size_t * margins,
         uint32_t n_ctx_min,
         bool prefetch_weights_auto,
-        ggml_log_level log_level) {
+        ggml_log_level log_level,
+        bool moe_cache_auto_explicit) {
     const int64_t t0_us = llama_time_us();
     common_params_fit_status status = COMMON_PARAMS_FIT_STATUS_SUCCESS;
     // The impl mutates the params while it works (e.g. n_ctx during the
@@ -1070,7 +1079,7 @@ enum common_params_fit_status common_fit_params(
     }
     try {
         common_params_fit_impl(
-            path_model, mparams, cparams, tensor_split, tensor_buft_overrides, margins, n_ctx_min, prefetch_weights_auto, log_level);
+            path_model, mparams, cparams, tensor_split, tensor_buft_overrides, margins, n_ctx_min, prefetch_weights_auto, log_level, moe_cache_auto_explicit);
         LOG_TRC("%s: successfully fit params to free device memory\n", __func__);
     } catch (const common_params_fit_exception & e) {
         LOG_WRN("%s: failed to fit params to free device memory: %s\n", __func__, e.what());

@@ -27,9 +27,12 @@ common_params_fit_status common_fit_params(
                              size_t * margins,               // margins of memory to leave per device in bytes
                            uint32_t   n_ctx_min,             // minimum context size to set when trying to reduce memory use
                                bool   prefetch_weights_auto, // enable prefetch when fitting a dense model
-                     ggml_log_level   log_level);            // minimum log level to print during fitting, lower levels go to debug log
+                     ggml_log_level   log_level,              // minimum log level to print during fitting, lower levels go to debug log
+                               bool   moe_cache_auto_explicit = false); // opt in to automatic caching on non-CUDA backends
 
 // Automatic acceleration policies, exposed for hardware-independent tests.
+bool common_fit_auto_moe_cache_backend(const char * backend_name, bool explicit_auto);
+
 bool common_fit_auto_moe_cache(
         const llama_model_params & mparams, const llama_context_params & cparams,
         uint32_t n_expert, size_t n_devices, bool shares_host, bool cache_supported);
