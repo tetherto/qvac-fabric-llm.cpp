@@ -7,6 +7,8 @@
 #include "llama-context.h"
 #include "ggml.h"
 
+#include <vector>
+
 
 bool llama_lora_validate_training_params(const struct llama_lora_training_params * params);
 
@@ -26,4 +28,4 @@ struct llama_adapter_lora * llama_lora_create_adapter(
 
 bool llama_lora_allocate_buffers(
     struct llama_adapter_lora * adapter,
-    struct llama_model * model);
+    const std::vector<ggml_backend_buffer_type_t> & bufts);

@@ -1,6 +1,7 @@
 #include "llama-lora-training.h"
 
 #include <cstring>
+#include <map>
 #include <random>
 #include <filesystem>
 
@@ -174,38 +175,52 @@ static void llama_lora_init_tensor_weights(struct ggml_tensor * lora_a, struct g
 
 bool llama_lora_allocate_buffers(
         struct llama_adapter_lora * adapter,
-        struct llama_model * model) {
-
-    if (!adapter || !model) {
+        const std::vector<ggml_backend_buffer_type_t> & bufts) {
+    if (!adapter || adapter->ctxs.empty() || adapter->ctxs.size() != bufts.size()) {
+        LLAMA_LOG_ERROR("LoRA adapter contexts and buffer types do not match\n");
         return false;
     }
 
-    std::map<ggml_backend_buffer_type_t, ggml_context *> ctx_map;
-
-    // LoRA tensors are F32/F16 and need a buffer type that:
-    //  1. Supports training ops (OPT_STEP_ADAMW, gradient accumulation)
-    //  2. Can handle set_tensor for floating-point types
-    // CPU_REPACK buffers crash on F32/F16 (NULL repack traits), and GPU
-    // buffers may not support OPT_STEP_ADAMW on all devices. Use a plain
-    // host-accessible CPU buffer — the scheduler handles cross-backend
-    // copies for forward/backward passes automatically.
-    ggml_backend_buffer_type_t buft = ggml_backend_cpu_buffer_type();
-
-    if (adapter->ctxs.empty()) {
-        LLAMA_LOG_ERROR("No contexts found in adapter\n");
-        return false;
+    for (size_t i = 0; i < adapter->ctxs.size(); i++) {
+        ggml_backend_buffer_ptr buf { ggml_backend_alloc_ctx_tensors_from_buft(adapter->ctxs[i].get(), bufts[i]) };
+        if (!buf) {
+            LLAMA_LOG_ERROR("Failed to allocate LoRA buffer of type %s\n", ggml_backend_buft_name(bufts[i]));
+            return false;
+        }
+        LLAMA_LOG_INFO("LoRA buffer %s size = %.2f MiB\n", ggml_backend_buft_name(bufts[i]), ggml_backend_buffer_get_size(buf.get())/1024.0/1024.0);
+        adapter->bufs.emplace_back(std::move(buf));
     }
-    ggml_context * lora_ctx = adapter->ctxs[0].get();
-
-    ggml_backend_buffer_ptr buf { ggml_backend_alloc_ctx_tensors_from_buft(lora_ctx, buft) };
-    if (!buf) {
-        LLAMA_LOG_ERROR("Failed to allocate buffer for LoRA adapter\n");
-        return false;
-    }
-    LLAMA_LOG_INFO("LoRA buffer size = %.2f MiB\n", ggml_backend_buffer_get_size(buf.get())/1024.0/1024.0);
-    adapter->bufs.emplace_back(std::move(buf));
 
     return true;
+}
+
+// optimizer updates are in-place views of the param, so the scheduler cannot move them off its buffer
+static bool llama_lora_buft_supports_optimizer(ggml_backend_buffer_type_t buft) {
+    ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
+    if (!dev) {
+        return false;
+    }
+
+    ggml_init_params ip = {
+        /*.mem_size   =*/ 16 * ggml_tensor_overhead(),
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+    ggml_context_ptr ctx { ggml_init(ip) };
+    if (!ctx) {
+        return false;
+    }
+
+    // the optimizer type is chosen later in llama_opt_init, so require both
+    ggml_tensor * param = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_F32, 64);
+    ggml_set_param(param);
+    ggml_tensor * grad  = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_F32, 64);
+    ggml_tensor * m     = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_F32, 64);
+    ggml_tensor * v     = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_F32, 64);
+    ggml_tensor * adamw = ggml_opt_step_adamw(ctx.get(), param, grad, m, v, ggml_new_tensor_1d(ctx.get(), GGML_TYPE_F32, 7));
+    ggml_tensor * sgd   = ggml_opt_step_sgd(ctx.get(), param, grad, ggml_new_tensor_1d(ctx.get(), GGML_TYPE_F32, 2));
+
+    return ggml_backend_dev_supports_op(dev, adamw) && ggml_backend_dev_supports_op(dev, sgd);
 }
 
 struct llama_adapter_lora * llama_lora_create_adapter(
@@ -237,12 +252,37 @@ struct llama_adapter_lora * llama_lora_create_adapter(
         const size_t margin          = 64 * 1024;
         const size_t estimated_lora_mem = 2 * lora_pair_count * tensor_overhead + margin;
 
-        ggml_context * lora_ctx = llama_lora_create_context(estimated_lora_mem);
-        if (!lora_ctx) {
-            throw std::runtime_error("Failed to create LoRA context");
-        }
-
-        adapter->ctxs.emplace_back(lora_ctx);
+        std::map<ggml_backend_buffer_type_t, ggml_context *> ctx_map;
+        std::map<ggml_backend_buffer_type_t, ggml_backend_buffer_type_t> buft_map;
+        std::vector<ggml_backend_buffer_type_t> ctx_bufts;
+        auto ctx_for_base = [&](const ggml_tensor * base) -> ggml_context * {
+            ggml_backend_buffer_type_t base_buft = ggml_backend_buffer_get_type(base->buffer);
+            auto bit = buft_map.find(base_buft);
+            if (bit == buft_map.end()) {
+                ggml_backend_buffer_type_t lora_buft = base_buft;
+                if (ggml_backend_buft_is_host(base_buft)) {
+                    lora_buft = ggml_backend_cpu_buffer_type();
+                } else if (!llama_lora_buft_supports_optimizer(base_buft)) {
+                    LLAMA_LOG_WARN("%s: %s does not support the optimizer step, LoRA factors stay on the CPU\n",
+                                   __func__, ggml_backend_buft_name(base_buft));
+                    lora_buft = ggml_backend_cpu_buffer_type();
+                }
+                bit = buft_map.emplace(base_buft, lora_buft).first;
+            }
+            ggml_backend_buffer_type_t buft = bit->second;
+            auto it = ctx_map.find(buft);
+            if (it != ctx_map.end()) {
+                return it->second;
+            }
+            ggml_context * ctx = llama_lora_create_context(estimated_lora_mem);
+            if (!ctx) {
+                throw std::runtime_error("Failed to create LoRA context");
+            }
+            adapter->ctxs.emplace_back(ctx);
+            ctx_bufts.push_back(buft);
+            ctx_map[buft] = ctx;
+            return ctx;
+        };
         int created_count = 0;
 
         for (const auto & tensor_pair : model->tensors_by_name) {
@@ -260,7 +300,7 @@ struct llama_adapter_lora * llama_lora_create_adapter(
             struct ggml_tensor * lora_a = nullptr;
             struct ggml_tensor * lora_b = nullptr;
 
-            llama_lora_create_tensor_pair(lora_ctx, tensor_name.c_str(), base_tensor, params->rank, &lora_a, &lora_b);
+            llama_lora_create_tensor_pair(ctx_for_base(base_tensor), tensor_name.c_str(), base_tensor, params->rank, &lora_a, &lora_b);
             created_count++;
             adapter->ab_map[tensor_name] = llama_adapter_lora_weight(lora_a, lora_b);
         }
@@ -269,7 +309,7 @@ struct llama_adapter_lora * llama_lora_create_adapter(
             throw std::runtime_error("No suitable tensors found for LoRA adaptation");
         }
 
-        if (!llama_lora_allocate_buffers(adapter, model)) {
+        if (!llama_lora_allocate_buffers(adapter, ctx_bufts)) {
             throw std::runtime_error("Failed to allocate LoRA buffers");
         }
 
