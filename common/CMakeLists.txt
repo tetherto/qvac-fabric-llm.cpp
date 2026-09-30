@@ -76,6 +76,7 @@ set(${TARGET}_HEADERS
     json-schema-to-grammar.h
     json-schema.h
     json.h
+    laya.h
     log.h
     ngram-cache.h
     ngram-map.h
@@ -125,6 +126,7 @@ add_library(${TARGET} STATIC
     json-schema.h
     json.cpp
     json.h
+    laya.cpp
     llguidance.cpp
     log.cpp
     ngram-cache.cpp
