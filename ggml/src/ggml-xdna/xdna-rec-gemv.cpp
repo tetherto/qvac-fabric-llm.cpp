@@ -243,8 +243,7 @@ bool xdna_rec_gemv_acc_from_tiles(xdna_rec_gemv * m, float * acc) {
         return false;
     }
     for (int t = 0; t < nt; t++) {
-        if (!xdna_buffer_download(a, acc + (size_t) t * kt,
-                                  (size_t) kt * sizeof(float),
+        if (!xdna_buffer_download(a, acc + (size_t) t * kt, (size_t) kt * sizeof(float),
                                   (size_t) (t + 1) * XDNA_GEMV_ACT_TILE)) {
             return false;
         }

@@ -392,13 +392,13 @@ bool xdna_gemv_pair_run_raw(xdna_gemv_pair * p, const float * acc, const float *
 bool xdna_gemv_pair_prep_raw(xdna_gemv_pair * p, const float * res, const float * gam);
 bool xdna_gemv_pair_dispatch(xdna_gemv_pair * p, float * out);
 
-// Read what a fused run left in the tail of the activation buffer, for the
-// layer whose FFN rides the core's own stream.
-
 // Mark the parts of the activation buffer a fused run writes, before that run
 // is submitted, so the reads that follow it know a drain from the previous
 // token's contents. See xdna_buffer_mark.
 void xdna_gemv_pair_mark_out(xdna_gemv_pair * p);
+
+// Read what a fused run left in the tail of the activation buffer, for the
+// layer whose FFN rides the core's own stream.
 
 // The flag word the last tile of each of the pair's first-phase chunks carries.
 int32_t xdna_gemv_pair_last_flags(const xdna_gemv_pair * p);
