@@ -97,6 +97,8 @@ llama-server -m target.gguf -md DFlash2.gguf \
     --spec-type draft-dflash2 --spec-draft-n-max 7 -fa on --jinja
 ```
 
+Reconvert older DFlash2 GGUFs for image or video inputs; the draft needs the target's M-RoPE metadata.
+
 `--spec-draft-p-min P` truncates the draft at the first step whose selector probability falls below `P`.
 
 With `--spec-draft-sampling probabilistic`, the draft samples the path at the request's temperature
