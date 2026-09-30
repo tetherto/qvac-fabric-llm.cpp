@@ -1,5 +1,6 @@
 #include "models.h"
 
+#include "llama-adapter.h"
 #include "llama-impl.h"
 #include "llama-kv-cache.h"
 #include "llama-kv-cache-iswa.h"
@@ -275,6 +276,78 @@ llama_model_dflash::graph<true>::graph(const llama_model & model, const llm_grap
     ggml_build_forward_expand(gf, cur);
 }
 
+// the target token ids of the draft vocabulary, in draft-logit column order
+class llm_graph_input_draft_vocab : public llm_graph_input_i {
+public:
+    explicit llm_graph_input_draft_vocab(const std::vector<int32_t> & ranges) : ids_host(llama_draft_vocab_ids(ranges)) {}
+    virtual ~llm_graph_input_draft_vocab() = default;
+
+    void set_input(const llama_ubatch * ubatch) override {
+        GGML_UNUSED(ubatch);
+        ggml_backend_tensor_set(ids, ids_host.data(), 0, ggml_nbytes(ids));
+    }
+
+    ggml_tensor * ids = nullptr; // I32 [n_draft_vocab]
+
+    const std::vector<int32_t> ids_host;
+};
+
+static ggml_tensor * build_inp_draft_vocab(llm_graph_context & g, const std::vector<int32_t> & ranges) {
+    auto inp = std::make_unique<llm_graph_input_draft_vocab>(ranges);
+
+    inp->ids = ggml_new_tensor_1d(g.ctx0, GGML_TYPE_I32, (int64_t) inp->ids_host.size());
+    ggml_set_input(inp->ids);
+
+    ggml_tensor * ids = inp->ids;
+    g.res->add_input(std::move(inp));
+
+    return ids;
+}
+
+// build_draft_vocab_logits views row ranges of the stored head: its owner must keep the row layout, and the view
+// skips the input rotation and LoRA delta of build_lora_mm
+static bool dflash_head_rows_viewable(const llm_graph_context & g, const llama_model & owner, ggml_tensor * output) {
+    if (owner.has_backend_layout(output)) {
+        return false;
+    }
+    if (g.hadamard_rotations && g.hadamard_rotations->count(output) > 0) {
+        return false;
+    }
+    for (const auto & lora : *g.loras) {
+        if (lora.first->get_weight(output) != nullptr) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// logits over the draft vocabulary: one mat-mul per row range of the head
+static ggml_tensor * build_draft_vocab_logits(ggml_context * ctx, ggml_tensor * output, ggml_tensor * output_s,
+        ggml_tensor * cur, const std::vector<int32_t> & ranges) {
+    ggml_tensor * logits = nullptr;
+    for (size_t r = 0; r < ranges.size(); r += 2) {
+        ggml_tensor * w = ggml_view_2d(ctx, output, output->ne[0], ranges[r + 1] - ranges[r], output->nb[1], ranges[r]*output->nb[1]);
+        ggml_tensor * l = ggml_mul_mat(ctx, w, cur);
+        logits = logits ? ggml_concat(ctx, logits, l, 0) : l;
+    }
+    return output_s ? ggml_mul(ctx, logits, output_s) : logits;
+}
+
+// logits over a reduced vocabulary placed at their target token ids of an n_vocab-wide -inf row
+static ggml_tensor * build_vocab_scatter(ggml_context * ctx, ggml_tensor * logits, ggml_tensor * ids, int64_t n_vocab) {
+    const int64_t n_draft_vocab = logits->ne[0];
+    const int64_t n_rows        = logits->ne[1];
+
+    GGML_ASSERT(ids->ne[0] == n_draft_vocab);
+
+    ggml_tensor * full = ggml_fill(ctx, ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, n_vocab, n_rows), -INFINITY);
+    full = ggml_set_rows(ctx, full,
+            ggml_reshape_3d(ctx, logits, 1,             n_draft_vocab, n_rows),
+            ggml_reshape_3d(ctx, ids,    n_draft_vocab, 1,             1));
+
+    return ggml_reshape_2d(ctx, full, n_vocab, n_rows);
+}
+
 // DSpark (DFlash + Markov & Confidence head): Markov bias on the draft logits, chained per block position
 static void build_dspark_markov_head(llm_graph_context & g, const llama_model & model, ggml_tensor * tokens) {
     ggml_context * ctx0 = g.ctx0;
@@ -417,12 +490,10 @@ static ggml_tensor * build_dflash2_conv(
     }
     ggml_tensor * blocks = ggml_reshape_3d(ctx0, hidden, hidden_size, block_size, n_blocks);
     ggml_tensor * coeffs = ggml_reshape_4d(ctx0, dynamic, n_groups, kernel_size, 2, n_tokens);
-    ggml_tensor * coeffs_side = ggml_view_3d(ctx0, coeffs, n_groups, kernel_size, n_tokens,
-            coeffs->nb[1], coeffs->nb[3], side * coeffs->nb[2]);
+    ggml_tensor * coeffs_side = ggml_view_4d(ctx0, coeffs, 1, n_groups, kernel_size, n_tokens,
+            coeffs->nb[0], coeffs->nb[1], coeffs->nb[3], side * coeffs->nb[2]);
 
-    ggml_tensor * coeff_all = ggml_cont(ctx0, coeffs_side);
-    coeff_all = ggml_reshape_4d(ctx0, coeff_all, 1, n_groups, kernel_size, n_tokens);
-    coeff_all = ggml_repeat_4d(ctx0, coeff_all, group_size, n_groups, kernel_size, n_tokens);
+    ggml_tensor * coeff_all = ggml_repeat_4d(ctx0, coeffs_side, group_size, n_groups, kernel_size, n_tokens);
 
     ggml_tensor * base_side = ggml_reshape_4d(ctx0,
             ggml_view_1d(ctx0, base, hidden_size * kernel_size, side * base->nb[2]),
@@ -444,14 +515,12 @@ static ggml_tensor * build_dflash2_conv(
                 values = zeros;
             }
         }
-        values = ggml_reshape_2d(ctx0, values, hidden_size, n_tokens);
+        values = ggml_reshape_4d(ctx0, values, group_size, n_groups, 1, n_tokens);
 
-        ggml_tensor * weight = ggml_reshape_2d(ctx0,
-                ggml_cont(ctx0, ggml_view_4d(ctx0, weight_all, group_size, n_groups, 1, n_tokens,
-                        weight_all->nb[1], weight_all->nb[2], weight_all->nb[3], tap * weight_all->nb[2])),
-                hidden_size, n_tokens);
+        ggml_tensor * weight = ggml_view_4d(ctx0, weight_all, group_size, n_groups, 1, n_tokens,
+                weight_all->nb[1], weight_all->nb[2], weight_all->nb[3], tap * weight_all->nb[2]);
 
-        ggml_tensor * term = ggml_mul(ctx0, weight, values);
+        ggml_tensor * term = ggml_reshape_2d(ctx0, ggml_mul(ctx0, values, weight), hidden_size, n_tokens);
         result = result ? ggml_add(ctx0, result, term) : term;
     }
     return result;
@@ -459,7 +528,8 @@ static ggml_tensor * build_dflash2_conv(
 
 // DFlash2 selector: top-k candidates per block position plus the pairwise
 // transition scores, packed into the nextn output slot for the CPU-side walk.
-static void build_dflash2_selector(llm_graph_context & g, const llama_model & model, ggml_tensor * tokens) {
+static void build_dflash2_selector(llm_graph_context & g, const llama_model & model, ggml_tensor * tokens,
+        ggml_tensor * logits, ggml_tensor * draft_ids) {
     ggml_context * ctx0 = g.ctx0;
     auto         & res  = g.res;
 
@@ -471,7 +541,7 @@ static void build_dflash2_selector(llm_graph_context & g, const llama_model & mo
     const int64_t rank     = hparams.dflash_selector_rank;
     const int64_t n_blocks = g.ubatch.n_seqs_unq;
     GGML_ASSERT(n_blocks > 0 && n_tokens % n_blocks == 0);
-    GGML_ASSERT(res->t_logits->ne[1] == n_tokens);
+    GGML_ASSERT(logits->ne[1] == n_tokens);
     if (!tokens) {
         return;
     }
@@ -480,10 +550,14 @@ static void build_dflash2_selector(llm_graph_context & g, const llama_model & mo
     const int64_t block_size = std::min<int64_t>(tokens_per_block, hparams.dflash_block_size);
     const int64_t row_used   = top_k + top_k * top_k;
 
-    ggml_tensor * candidates  = ggml_top_k(ctx0, res->t_logits, top_k);
-    ggml_tensor * logits_rows = ggml_reshape_3d(ctx0, res->t_logits, 1, res->t_logits->ne[0], n_tokens);
+    ggml_tensor * cand_cols   = ggml_top_k(ctx0, logits, top_k);
+    ggml_tensor * logits_rows = ggml_reshape_3d(ctx0, logits, 1, logits->ne[0], n_tokens);
     ggml_tensor * unary       = ggml_reshape_2d(ctx0,
-            ggml_get_rows(ctx0, logits_rows, candidates), top_k, n_tokens);
+            ggml_get_rows(ctx0, logits_rows, cand_cols), top_k, n_tokens);
+    // with draft_ids, the logit columns are the draft vocabulary and draft_ids maps them to token ids
+    ggml_tensor * candidates  = !draft_ids ? cand_cols : ggml_reshape_2d(ctx0,
+            ggml_get_rows(ctx0, ggml_reshape_2d(ctx0, draft_ids, 1, draft_ids->ne[0]), ggml_reshape_1d(ctx0, cand_cols, top_k * n_tokens)),
+            top_k, n_tokens);
     ggml_tensor * gate        = g.build_lora_mm(model.dflash_selector_hidden, res->t_embd);
 
     // Everything below indexes [.., tokens_per_block, n_blocks]: the block
@@ -757,17 +831,22 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
     res->t_embd = cur;
 
     // lm_head from the target model (shared via ctx_other)
+    const llama_model * head_owner = &model;
     auto * output   = model.output;
     auto * output_s = model.output_s;
     if (output == nullptr) {
         GGML_ASSERT(cparams.ctx_other != nullptr);
-        const auto * model_other = llama_get_model(cparams.ctx_other);
-        GGML_ASSERT(model_other->output != nullptr && "DFlash decoder requires the target model's output projection");
-        output   = model_other->output;
-        output_s = model_other->output_s;
+        head_owner = llama_get_model(cparams.ctx_other);
+        GGML_ASSERT(head_owner->output != nullptr && "DFlash decoder requires the target model's output projection");
+        output   = head_owner->output;
+        output_s = head_owner->output_s;
     }
 
-    cur = build_lora_mm(output, cur, output_s);
+    // DFlash2 draft vocabulary: logits over row ranges of the head only
+    const bool    use_draft_vocab = !cparams.draft_vocab.empty() && dflash_head_rows_viewable(*this, *head_owner, output);
+    ggml_tensor * draft_ids       = use_draft_vocab ? build_inp_draft_vocab(*this, cparams.draft_vocab) : nullptr;
+
+    cur = use_draft_vocab ? build_draft_vocab_logits(ctx0, output, output_s, cur, cparams.draft_vocab) : build_lora_mm(output, cur, output_s);
 
     // DFlash2 feeds these logits to the selector, so they need the target's output
     // transforms; DFlash1 and DSpark read them through the sampler instead
@@ -782,20 +861,16 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
         }
     }
 
+    ggml_tensor * logits_draft = cur;
+
     // reduced-draft-vocab exports: scatter the draft logits to the target vocabulary via d2t
     if (model.d2t) {
-        const int64_t n_draft_vocab = cur->ne[0];
-        const int64_t n_outputs     = cur->ne[1];
-        const int64_t n_vocab       = (int64_t) model.vocab.n_tokens();
-
         GGML_ASSERT(model.d2t->type == GGML_TYPE_I64);
-        GGML_ASSERT(model.d2t->ne[0] == n_draft_vocab);
-
-        ggml_tensor * logits = ggml_fill(ctx0, ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, 1, n_vocab, n_outputs), -INFINITY);
-        cur = ggml_set_rows(ctx0, logits,
-                ggml_reshape_3d(ctx0, cur,       1,             n_draft_vocab, n_outputs),
-                ggml_reshape_3d(ctx0, model.d2t, n_draft_vocab, 1,             1));
-        cur = ggml_reshape_2d(ctx0, cur, n_vocab, n_outputs);
+        cur = build_vocab_scatter(ctx0, cur, model.d2t, model.vocab.n_tokens());
+    }
+    // requested logits keep the target vocabulary width, with -inf outside the draft vocabulary
+    if (draft_ids && n_outputs > 0) {
+        cur = build_vocab_scatter(ctx0, cur, draft_ids, model.vocab.n_tokens());
     }
     cb(cur, "result_output", -1);
     res->t_logits = cur;
@@ -808,7 +883,7 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
     }
 
     if (model.dflash_selector_hidden) {
-        build_dflash2_selector(*this, model, inp_tokens);
+        build_dflash2_selector(*this, model, inp_tokens, draft_ids ? logits_draft : res->t_logits, draft_ids);
     }
 }
 

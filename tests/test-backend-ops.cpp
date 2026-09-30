@@ -8811,6 +8811,45 @@ struct test_cpy_batch : public test_case {
     }
 };
 
+// a repeat and a mul that read strided views which skip part of a dimension, as the DFlash2 dynamic conv does for one side and one kernel tap
+struct test_repeat_mul_view : public test_case {
+    const std::array<int64_t, 4> ne; // group size, groups, kernel taps, tokens
+    const int64_t side;
+    const int64_t tap;
+
+    std::string vars() override {
+        return VARS_TO_STR3(ne, side, tap);
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "REPEAT_MUL_VIEW";
+    }
+
+    test_repeat_mul_view(std::array<int64_t, 4> ne = {8, 16, 4, 7}, int64_t side = 1, int64_t tap = 2)
+        : ne(ne), side(side), tap(tap) {
+        GGML_ASSERT(side < 2 && tap < ne[2]);
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * coeffs = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, ne[1], ne[2], 2, ne[3]);
+        ggml_tensor * values = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, ne[0], ne[1], 1, ne[3]);
+        ggml_set_name(coeffs, "coeffs");
+        ggml_set_name(values, "values");
+
+        ggml_tensor * coeffs_side = ggml_view_4d(ctx, coeffs, 1, ne[1], ne[2], ne[3],
+                coeffs->nb[0], coeffs->nb[1], coeffs->nb[3], side*coeffs->nb[2]);
+        ggml_tensor * weight_all  = ggml_repeat_4d(ctx, coeffs_side, ne[0], ne[1], ne[2], ne[3]);
+        ggml_tensor * weight      = ggml_view_4d(ctx, weight_all, ne[0], ne[1], 1, ne[3],
+                weight_all->nb[1], weight_all->nb[2], weight_all->nb[3], tap*weight_all->nb[2]);
+
+        ggml_tensor * out = ggml_mul(ctx, values, weight);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+};
+
 // mul_mat with src1 in [0, 1]: a zero-mean src1 hides errors in the zero point or the min of a quantized src0
 struct test_mul_mat_pos : public test_mul_mat {
     using test_mul_mat::test_mul_mat;
@@ -11375,6 +11414,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             }
         }
     }
+    // an id table lookup: one-element rows
+    test_cases.emplace_back(new test_get_rows(GGML_TYPE_I32, 1, 100000, 128, 1, 1, false));
 
     test_cases.emplace_back(new test_get_rows_back(GGML_TYPE_F32, 1, 8, 2, 1, false));
     test_cases.emplace_back(new test_get_rows_back(GGML_TYPE_F32, 1, 70000, 4, 1, false)); // row count > CUDA grid-y limit (65535)
@@ -12327,6 +12368,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_cpy_batch(1000,  8,  3));
     test_cases.emplace_back(new test_cpy_batch(1000,  8,  4, CPY_BATCH_DST_SAME));
     test_cases.emplace_back(new test_cpy_batch(1000,  8,  4, CPY_BATCH_DST_HALF));
+
+    // DFlash2 dynamic conv: strided views into REPEAT and MUL
+    for (int64_t side : {0, 1}) {
+        test_cases.emplace_back(new test_repeat_mul_view({8,  16, 4, 7}, side, 0));
+        test_cases.emplace_back(new test_repeat_mul_view({32, 40, 4, 9}, side, 3));
+    }
 
     // few src1 rows (speculative verify): odd m, a single K block, long K, every tile width, broadcast batches
     for (int64_t n : {2, 3, 5, 8, 9, 13, 16}) {

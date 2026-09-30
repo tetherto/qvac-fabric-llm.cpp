@@ -88,6 +88,19 @@ llama-server -m Qwen3.8-27B.gguf -md Qwen3.8-27B-DFlash2.gguf \
 The target GGUF must use the same tokenizer as the draft.
 Reconvert older DFlash2 GGUFs for image or video inputs; the draft needs the target's M-RoPE metadata.
 
+A DFlash2 drafter can propose tokens from part of the vocabulary only.
+`--spec-draft-vocab` takes ascending, disjoint `[begin, end)` token id ranges. The drafter computes its output head over those rows only, and the target still verifies over the full vocabulary, so the output is unchanged.
+Tokens outside the ranges are never drafted, which can lower acceptance for text that uses them.
+Each range adds a mat-mul and a concat to the draft graph, so a few wide ranges cost less than many narrow ones.
+The ranges have no effect when the draft output head has a LoRA adapter or a Hadamard rotation, or when the loader stores it in a repacked or split buffer type, such as `CPU_REPACK` for a quantized head on the CPU. The drafter then uses the full vocabulary.
+Invalid ranges, ranges that cover fewer tokens than the drafter's selector top-k, a speculative type other than `draft-dflash`, or a drafter that is not DFlash2 or has a reduced (d2t) vocabulary stop the speculative setup with an error.
+For the Qwen3.8 DFlash2 drafter, `0:98304,248032:248320` keeps the first 98304 tokens and the special tokens at the end of the vocabulary:
+
+```bash
+llama-server -m Qwen3.8-27B.gguf -md Qwen3.8-27B-DFlash2.gguf \
+    --spec-type draft-dflash --spec-draft-n-max 7 --spec-draft-vocab 0:98304,248032:248320 -fa on --jinja
+```
+
 See:
 
 - #22105
@@ -267,6 +280,10 @@ Use exactly one of these options:
 --spec-draft-p-min, --draft-p-min       P
                                         minimum speculative decoding probability (greedy) (default: 0.00)
                                         (env: LLAMA_ARG_SPEC_DRAFT_P_MIN)
+--spec-draft-vocab                      B:E[,B:E...]
+                                        token id ranges [B, E) a DFlash2 drafter may propose; the target still verifies over the full vocabulary
+                                        (default: full vocabulary)
+                                        (env: LLAMA_ARG_SPEC_DRAFT_VOCAB)
 --spec-draft-ngl, -ngld, --gpu-layers-draft, --n-gpu-layers-draft  N
                                         max. number of draft model layers to store in VRAM, either an exact number, 'auto', or 'all' (default: auto)
                                         (env: LLAMA_ARG_N_GPU_LAYERS_DRAFT)
