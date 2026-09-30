@@ -830,6 +830,9 @@ static common_laya_result laya_predict(llama_context * ctx, const json & request
 
     const int max_len      = request.value("max_len",      cfg.max_len);
     const int head_max_len = request.value("head_max_len", cfg.head_max_len);
+    if (max_len <= 0 || head_max_len <= 0) {
+        throw std::invalid_argument("max_len and head_max_len must be positive, got " + std::to_string(max_len) + " and " + std::to_string(head_max_len));
+    }
 
     const bool batch_request = request.contains("states");
     const json states = batch_request ? request["states"] : json::array({ request.value("state", json()) });
