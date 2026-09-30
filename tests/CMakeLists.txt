@@ -360,6 +360,7 @@ llama_build(test-multi-instance-repro.cpp)
 llama_build_and_test(test-arg-parser.cpp)
 llama_build_and_test(test-model-resolution.cpp)
 llama_build_and_test(test-model-load-meta-only.cpp)
+llama_build_and_test(test-dflash-loader.cpp)
 
 if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
     add_executable(test-mmap-direct-io test-mmap-direct-io.cpp ../src/llama-mmap.cpp ../src/llama-impl.cpp)

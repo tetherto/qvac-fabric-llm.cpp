@@ -74,6 +74,19 @@ llama-server -m Qwen3-4B.gguf -md Qwen3-4B-DFlash.gguf \
 
 `--spec-draft-n-max` is clamped to the draft model's trained block size.
 
+DFlash2 drafts add grouped convolution and a candidate selector. The selector is detected from the checkpoint; use the same `draft-dflash` type.
+For example, convert `incoai/Qwen3.8-27B-DFlash2` against its target tokenizer, then start the server:
+
+```bash
+python convert_hf_to_gguf.py incoai/Qwen3.8-27B-DFlash2 \
+    --target-model-dir Qwen/Qwen3.8-27B --outtype bf16 --outfile Qwen3.8-27B-DFlash2.gguf
+
+llama-server -m Qwen3.8-27B.gguf -md Qwen3.8-27B-DFlash2.gguf \
+    --spec-type draft-dflash --spec-draft-n-max 7 -fa on --jinja
+```
+
+The target GGUF must use the same tokenizer as the draft.
+
 See:
 
 - #22105
