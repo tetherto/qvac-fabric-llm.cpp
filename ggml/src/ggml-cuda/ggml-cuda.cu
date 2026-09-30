@@ -540,6 +540,7 @@ static ggml_cuda_device_info ggml_cuda_init() {
         info.devices[id].integrated = false; // Temporarily disabled due to issues with corrupted output (e.g. #15034)
         info.devices[id].nsm        = prop.multiProcessorCount;
         info.devices[id].smpb       = prop.sharedMemPerBlock;
+        info.devices[id].l2_size    = prop.l2CacheSize;
         info.devices[id].warp_size  = prop.warpSize;
 
 #ifndef GGML_USE_MUSA
