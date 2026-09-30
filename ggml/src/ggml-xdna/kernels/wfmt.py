@@ -116,8 +116,8 @@ def pack_tile(fmt: str, codes: np.ndarray, d: np.ndarray, m: np.ndarray | None,
     k, n = codes.shape
     flat = codes.reshape(-1)[code_order(k, n, s, t)]
     if fmt == "q4g32":
-        body = ((flat[0::2].astype(np.uint8) & 0xF)
-                | ((flat[1::2].astype(np.uint8) & 0xF) << 4))
+        body = ((flat[0::2].astype(np.uint8) & 0xF) |
+                ((flat[1::2].astype(np.uint8) & 0xF) << 4))
     else:
         body = flat.astype(np.int8).view(np.uint8)
     # q8g16 carries no min, so its callers pass m=None and no plane is written.

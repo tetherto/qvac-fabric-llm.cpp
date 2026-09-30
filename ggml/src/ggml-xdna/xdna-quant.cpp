@@ -315,6 +315,15 @@ bool xdna_wfmt_repack_row_as(enum ggml_type type, xdna_wfmt fmt, const void * sr
     if (!src || !dst || k <= 0 || k % QK_K) {
         return false;
     }
+    // The write below is sized by the requested format, not by the source type,
+    // so a pair this function does not carry has to be refused here: forwarding
+    // it to xdna_wfmt_repack_row would size the output by the source and write
+    // past a buffer the caller sized for the format it asked for.
+    const bool four_bit = type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K || type == GGML_TYPE_Q6_K;
+    const bool eight_bit = four_bit || type == GGML_TYPE_Q8_0;
+    if (!((fmt == XDNA_WFMT_Q4G32 && four_bit) || (fmt == XDNA_WFMT_Q8G16 && eight_bit))) {
+        return false;
+    }
     if (fmt == XDNA_WFMT_Q4G32 && (type == GGML_TYPE_Q5_K || type == GGML_TYPE_Q6_K)) {
         // Chosen for the 4-bit form (xdna_gemv_type_of): re-quantized to Q4_K
         // from its dequantized values, then packed as one.
@@ -333,14 +342,6 @@ bool xdna_wfmt_repack_row_as(enum ggml_type type, xdna_wfmt fmt, const void * sr
         return true;
     }
     if (fmt != XDNA_WFMT_Q8G16 || type != GGML_TYPE_Q4_K) {
-        // Every other pair falls through to the repacker for `type`, which
-        // writes that type's own format and ignores `fmt`. Asking for a
-        // narrower one than the repacker produces overruns the caller's
-        // buffer - Q6_K into Q4G32 sizes 152 bytes per 256 values and gets
-        // 296 - so only the pair this function actually honours is accepted.
-        if (fmt != xdna_wfmt_gemv_for(type)) {
-            return false;
-        }
         return xdna_wfmt_repack_row(type, src, k, dst);
     }
     // Q4_K into the 8-bit affine form, so one format covers the whole decode.
