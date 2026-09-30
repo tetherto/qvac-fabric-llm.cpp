@@ -11794,6 +11794,20 @@ static const ggml_type other_types[] = {
     GGML_TYPE_BF16,
 };
 
+// quantized mat-vec with 5-8 columns: an odd row count leaves a partial last workgroup when rows are grouped;
+// k 512 and 1024 select the subgroup and the large workgroup pipelines on Vulkan
+static void add_mul_mat_vec_row_tail_cases(std::vector<std::unique_ptr<test_case>> & test_cases) {
+    const int64_t odd_rows = 67;
+    for (ggml_type type_a : {GGML_TYPE_Q2_0, GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1, GGML_TYPE_Q8_0,
+                             GGML_TYPE_MXFP4, GGML_TYPE_Q2_K, GGML_TYPE_Q3_K, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K}) {
+        for (int64_t k : {512, 1024}) {
+            for (int64_t n : {5, 6, 7, 8}) {
+                test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, odd_rows, n, k, {1, 1}, {1, 1}));
+            }
+        }
+    }
+}
+
 #ifdef _MSC_VER
 // Workaround long compile time with msvc
 #pragma optimize("", off)
@@ -12870,6 +12884,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_ternary_f16_reference(GGML_TYPE_PQ2_0, false));
     test_cases.emplace_back(new test_ternary_f16_reference(GGML_TYPE_PTQ1_0, true));
     test_cases.emplace_back(new test_ternary_f16_reference(GGML_TYPE_PQ2_0, true));
+    add_mul_mat_vec_row_tail_cases(test_cases);
 
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32, 2880, 32, 2880, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 2880, 32, 2880, {1, 1}, {1, 1}));

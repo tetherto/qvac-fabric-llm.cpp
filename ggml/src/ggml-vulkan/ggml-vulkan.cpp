@@ -6221,7 +6221,13 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     }
     // RDNA3: above four columns, static 4 rows for all types bench faster than the default
     const bool is_rdna3 = device->vendor_id == VK_VENDOR_ID_AMD && device->architecture == AMD_RDNA3;
-    auto const &rm_int_n = [&](uint32_t rows, uint32_t i) { return (is_rdna3 && i >= 4) ? 4u : rows; };
+    // NVIDIA: above four columns, 2 rows per workgroup halve the re-reads of the quantized columns
+    const bool is_nvidia = device->vendor_id == VK_VENDOR_ID_NVIDIA;
+    const uint32_t rm_int_nvidia_multi_col = 2;
+    const uint32_t rm_int_nvidia_min_col_idx = 4;
+    auto const &rm_int_n = [&](uint32_t rows, uint32_t i) {
+        return (is_rdna3 && i >= 4) ? 4u : (is_nvidia && i >= rm_int_nvidia_min_col_idx) ? rm_int_nvidia_multi_col : rows;
+    };
     // RDNA3: Static 4 rows for all types bench faster than the default
     auto const &rm_id = [&](uint32_t rows) { return is_rdna3 ? 4u : rows; };
     uint32_t rm_iq = 2 * rm_kq;
