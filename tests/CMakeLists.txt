@@ -499,6 +499,8 @@ llama_build_and_test(test-backend-sampler.cpp   LABEL "model behavior backend")
 # mtmd, so it is intentionally outside the LLAMA_MTMD block below.
 llama_build_and_test(test-opencl-fa-chunking.cpp)
 
+llama_build_and_test(test-laya.cpp)
+
 if (APPLE)
     llama_build(test-rset-release.cpp)
 endif()
