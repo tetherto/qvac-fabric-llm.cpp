@@ -38,12 +38,13 @@ void llama_model_laya::load_arch_hparams(llama_model_loader & ml) {
     if (n_decision_layer > (uint32_t) hparams.n_layer()) {
         throw std::runtime_error(format("laya: %u decision blocks, at most %u (the encoder layers) are supported", n_decision_layer, hparams.n_layer()));
     }
-    if (n_act < 1 || n_act > 64) {
-        throw std::runtime_error(format("laya: act head with %u outputs, expected 1 to 64", n_act));
-    }
     // at least 2 so that the top-2 features are defined, at most 255 as in the option-count feature
     if (n_max_options < 2 || n_max_options > 255) {
         throw std::runtime_error(format("laya: %u option slots, expected 2 to 255", n_max_options));
+    }
+    // any number of act outputs (decision.act_out must match it), as long as the output row size fits an int32
+    if (n_act < 1 || (uint64_t) n_act + n_max_options > (uint64_t) INT32_MAX) {
+        throw std::runtime_error(format("laya: act head with %u outputs, expected at least 1 and fewer than %u", n_act, (uint32_t) INT32_MAX - n_max_options));
     }
 
     hparams.n_cls_out = n_act + n_max_options;
