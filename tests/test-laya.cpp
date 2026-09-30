@@ -165,8 +165,10 @@ static void write_model(const std::string & path, const model_desc & desc) {
         add("decision.scorer_out.bias",    { 1 });
         add("decision.act.weight",         { n_embd + 4, n_act_hidden });
         add("decision.act.bias",           { n_act_hidden });
-        add("decision.act_out.weight",     { n_act_hidden, (int64_t) desc.act_count });
-        add("decision.act_out.bias",       { (int64_t) desc.act_count });
+        // the tensors keep a valid shape when only the metadata is wrong
+        const int64_t n_act_out = desc.act_count > 0 ? desc.act_count : n_act;
+        add("decision.act_out.weight",     { n_act_hidden, n_act_out });
+        add("decision.act_out.bias",       { n_act_out });
     }
 
     if (!gguf_write_to_file(gguf, path.c_str(), false)) {
@@ -368,6 +370,7 @@ int main(int argc, char ** argv) {
             { "laya", 2, false, 256,         n_act, 3 },
             { "laya", n_layer + 1, false, n_max_options, n_act, 3 }, // more decision blocks than encoder layers
             { "laya", 2, false, n_max_options, n_act, 2 },           // not the 3 question types
+            { "laya", 2, false, n_max_options, 0,     3 },           // no act outputs
         };
         const std::string path = dir + "/test-laya-invalid.gguf";
         for (size_t i = 0; i < sizeof(invalid)/sizeof(invalid[0]); ++i) {
