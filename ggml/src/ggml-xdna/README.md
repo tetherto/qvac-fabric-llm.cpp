@@ -41,9 +41,9 @@ recurrent state stays on the device between tokens.
 It covers one weight set: `Q4_K` for the FFN gate and up, `Q4_K`/`Q5_K`/`Q6_K`
 for `ssm_out`, `Q4_K`/`Q6_K` for the FFN down, plus a `GGML_XDNA_GATED_FMT` that
 matches the `ssm_out` layout. Anything else is refused with an error rather
-than run on the wrong kernels; the refusal names the weight set, and the two
-ways on are to requantize `ssm_out` (see Build) or to put the decode on the
-per-op path with `GGML_XDNA_FUSED_LAYER=0` (see Troubleshooting).
+than run on the wrong kernels; the refusal names the weight set. The way on is
+to requantize `ssm_out` (see Build). `GGML_XDNA_FUSED_LAYER=0` is a bisection
+switch, not a way to run a model this layer refuses.
 
 The designs are also built for one residual width (1024, `XDNA_RES_D`). A model
 whose residual stream is wider - Qwen3.5-2B is 2048 - cannot be handed a
@@ -143,8 +143,8 @@ prefill kernels); the fused layer never fires there.
   Verified against mlir-aie 1.4.3: the RTP buffer bases in `xdna-seq.h` are read
   back from that toolchain's placement, so a version bump needs them re-read
   from a freshly compiled project (the header says which values).
-- A model the fused decode path covers (see above), or any model for the per-op
-  path.
+- A model the fused decode path covers (see above). A refused quantization is
+  not run by setting `GGML_XDNA_FUSED_LAYER=0`; requantize `ssm_out` (see Build).
 
 ## Build
 
@@ -183,8 +183,9 @@ cmake --build build -j$(nproc)
   A `ssm_out` outside `Q4_K`/`Q5_K`/`Q6_K` is refused whatever `GATED_FMT` is -
   a stock `Qwen/Qwen3.5-0.8B Q4_K_M` leaves half of them at `Q8_0` and prints
   `unsupported fused weight set (so=q8_0 gate=q4_K up=q4_K down=q6_K)`. The
-  `--tensor-type ssm_out=q5_K` recipe above is the way onto the fused path;
-  `GGML_XDNA_FUSED_LAYER=0` runs such a model on the per-op path instead.
+  `--tensor-type ssm_out=q5_K` recipe above is the way onto the fused path.
+  `GGML_XDNA_FUSED_LAYER=0` does not run this model. It only moves a model the
+  fused layer accepts onto the per-op kernels, for a bisection.
 
 Artifacts, all in the build output directory (`build/bin` by default):
 
@@ -227,7 +228,7 @@ disables the NPU path it names, and the default is the fast one.
 
 | variable | default | effect |
 | :-- | :-- | :-- |
-| `GGML_XDNA_FUSED_LAYER` | 1 | `0` runs the decode on the per-op kernels instead of the fused layer |
+| `GGML_XDNA_FUSED_LAYER` | 1 | bisection switch: `0` leaves the fused layer off. It does not run a model the layer refuses |
 | `GGML_XDNA_GEMV_GROUP` | 1 | `0` keeps the decode projections outside the fused layer on the host |
 | `GGML_XDNA_GEMV_PROMOTE` | 1 | `0` keeps one GEMV dispatch to a single weight format |
 | `GGML_XDNA_GLUE` | 1 | `0` stops the backend claiming the host ops of a decode chunk |
@@ -262,14 +263,15 @@ default to the fast path and are read where they are used.
   shows is `llama_bench: error: failed to run gen warmup`.
 - **The fused layer is not used at all** - no tagged `fused_layer` artifact was
   found (check the build output dir and the tag in `xdna-design-tag.h`), or
-  `GGML_XDNA_FUSED_LAYER=0` is set. Without it the decode still runs, on the
-  per-op kernels.
+  `GGML_XDNA_FUSED_LAYER=0` is set. The flag is a bisection switch for a model
+  the fused layer accepts: that decode then uses the per-op kernels. A model
+  the layer refuses is not this case.
 - **`unsupported fused weight set (...)`** - the model's quantization is outside
   the set the fused kernels were built for and no `GATED_FMT` value covers it
   (a `Q8_0` `ssm_out` is the common case). Requantize the tensor, e.g.
-  `llama-quantize --tensor-type ssm_out=q5_K model-f16.gguf out.gguf Q4_K_M`,
-  or run it on the per-op path with `GGML_XDNA_FUSED_LAYER=0`. The failure has
-  the same shape as the layout mismatch above.
+  `llama-quantize --tensor-type ssm_out=q5_K model-f16.gguf out.gguf Q4_K_M`.
+  The failure has the same shape as the layout mismatch above.
+  `GGML_XDNA_FUSED_LAYER=0` is not a way to run this model.
 - **No NPU** - the backend still registers (llama.cpp expects every accelerator
   device to answer) but claims no ops, so everything runs on the CPU.
 
