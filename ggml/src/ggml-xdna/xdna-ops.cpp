@@ -561,9 +561,8 @@ static bool gemm_compute_i8(xdna_ops * ops, struct ggml_tensor * node) {
                                    node->name ? node->name : "?");
                     return false;
                 }
-                const size_t pmc_bytes =
-                    (size_t) std::min(Mk, M - pend_mb * Mk) * N * sizeof(int32_t);
-                const int32_t * c = (const int32_t *) xdna_buffer_wait_written(bo_c[pend], pmc_bytes);
+                const size_t    pmc_bytes = (size_t) std::min(Mk, M - pend_mb * Mk) * N * sizeof(int32_t);
+                const int32_t * c         = (const int32_t *) xdna_buffer_wait_written(bo_c[pend], pmc_bytes);
                 if (!c) {
                     return false;
                 }
@@ -584,9 +583,8 @@ static bool gemm_compute_i8(xdna_ops * ops, struct ggml_tensor * node) {
         if (!xdna_run_wait(runs[pend])) {
             return false;
         }
-        const size_t pmc_bytes =
-            (size_t) std::min(Mk, M - pend_mb * Mk) * N * sizeof(int32_t);
-        const int32_t * c = (const int32_t *) xdna_buffer_wait_written(bo_c[pend], pmc_bytes);
+        const size_t    pmc_bytes = (size_t) std::min(Mk, M - pend_mb * Mk) * N * sizeof(int32_t);
+        const int32_t * c         = (const int32_t *) xdna_buffer_wait_written(bo_c[pend], pmc_bytes);
         if (!c) {
             return false;
         }
@@ -734,9 +732,8 @@ static bool gemm_compute(xdna_ops * ops, struct ggml_tensor * node) {
                 // block are zero (the padded A rows are zeroed), so the prefix
                 // is exact and the readback drops to mc*N elements.
                 const xdna_ops::pending_m_block & pmb = op.m_blocks[prev.mb_idx];
-                const int pmc = std::min(Mk, M - pmb.m0);
-                const float * c = (const float *) xdna_buffer_wait_written(
-                    prev.bo_c, (size_t) pmc * N * sizeof(float));
+                const int                         pmc = std::min(Mk, M - pmb.m0);
+                const float * c = (const float *) xdna_buffer_wait_written(prev.bo_c, (size_t) pmc * N * sizeof(float));
                 if (!c) {
                     return false;
                 }
@@ -804,8 +801,7 @@ bool xdna_ops_finalize(xdna_ops * ops) {
         for (auto & mb : op.m_blocks) {
             const int mc = std::min(Mk, op.M - mb.m0);
             for (auto & pr : mb.runs) {
-                const float * c = ok ? (const float *) xdna_buffer_wait_written(pr.bo_c, (size_t) mc * op.N * sizeof(float))
-                                     : nullptr;
+                const float * c = ok ? (const float *) xdna_buffer_wait_written(pr.bo_c, (size_t) mc * op.N * sizeof(float)) : nullptr;
                 if (!c) {
                     ok = false;
                     continue;
@@ -996,7 +992,7 @@ void xdna_ops_plan_gemv(xdna_ops *                                             o
         // at 56 GB/s and ~150 us a dispatch that is worth it up to about 8 MB,
         // and the projections this joins are far under.
         // GGML_XDNA_GEMV_PROMOTE=0 keeps a group to one natural format.
-        static const bool promote = (xdna_env_int("GGML_XDNA_GEMV_PROMOTE", 1) != 0);
+        static const bool promote = xdna_env_int("GGML_XDNA_GEMV_PROMOTE", 1) != 0;
         enum ggml_type    gtype   = node->src[0]->type;
         for (int j = i + 1; j < cgraph->n_nodes; j++) {
             struct ggml_tensor * cand = cgraph->nodes[j];
@@ -1150,6 +1146,7 @@ void xdna_ops_release_weights(xdna_ops * ops) {
     ops->gemv_groups.clear();
     ops->gemv_group_of.clear();
 }
+
 
 // Checked stand-in for sscanf(name, "gemm_..._M%d_K%d_N%d_c%d"): every literal
 // separator must match and each field is a decimal integer, clamped on

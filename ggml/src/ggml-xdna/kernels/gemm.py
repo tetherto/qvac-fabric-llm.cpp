@@ -70,9 +70,23 @@ def _packed_split(tb: int) -> int:
     return g
 
 
+def _use_bfp16(opts) -> bool:
+    """Whether this build uses the bfp16-emulated bf16 mmul.
+
+    That mmul is r=8 and requires dim_m % (2*r) == 0, so `tile_m` has to be a
+    multiple of 16; the decode M-block (M32, tile_m 8) is not, and CMake builds
+    it with --no-bfp16. Pick the native r=4 kernel there rather than fail
+    inside Peano on the micro-kernel's static_assert.
+    """
+    return (opts.dtype.split("_")[0] == "bf16" and not getattr(opts, "no_bfp16", False)
+            and opts.tile_m % 16 == 0)
+
+
 def _validate(opts) -> None:
     dtype_in_str = opts.dtype.split("_")[0]
     r, s, t = MICROKERNEL_MAC_DIM[dtype_in_str]
+    if _use_bfp16(opts):
+        r = 8
 
     if opts.M % (2 * r) != 0:
         raise SystemExit(f"-M ({opts.M}) must be a multiple of 2*r ({2 * r})")
@@ -124,7 +138,7 @@ def _compile_kwargs(opts) -> dict:
         "dtype_out_str": dtype_out_str,
         "dev_name":     opts.dev,
         # bfp16 emulation is a bf16-only path (int8 uses the native int8 mmul).
-        "emulate_bf16_mmul_with_bfp16": 0 if dtype_in_str != "bf16" or getattr(opts, "no_bfp16", False) else 1,
+        "emulate_bf16_mmul_with_bfp16": 1 if _use_bfp16(opts) else 0,
         "WFMT":         getattr(opts, "wfmt", "none") or "none",
         "trace_size":   getattr(opts, "trace_size", 0),
         "trace_rows":   tuple(getattr(opts, "trace_rows", None) or ()),
