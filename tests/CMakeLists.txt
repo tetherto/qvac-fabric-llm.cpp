@@ -267,6 +267,7 @@ llama_test(test-llama-archs NAME test-glm5-kpool-sequences ARGS --glm5-kpool-seq
 llama_test(test-llama-archs NAME test-glm5-invalid-metadata ARGS --glm5-invalid-metadata)
 llama_test(test-llama-archs NAME test-mtp-shared-cpu ARGS --mtp-shared-cpu)
 llama_test(test-llama-archs NAME test-hadamard-contracts ARGS --hadamard-contracts)
+llama_test(test-llama-archs NAME test-layer-inp-pos-min ARGS --layer-inp-pos-min)
 if (GGML_CUDA)
     llama_test(test-llama-archs NAME test-mtp-shared ARGS --mtp-shared)
 endif()
