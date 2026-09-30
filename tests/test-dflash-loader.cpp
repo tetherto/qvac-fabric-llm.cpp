@@ -66,6 +66,7 @@ enum class case_type {
     legacy,
     dspark,
     valid_selector,
+    oversized_top_k,
     missing_rank,
     missing_predecessor,
     missing_conv_projection,
@@ -133,7 +134,7 @@ static bool write_model(case_type kind, bool tensor_backed = false, int32_t n_ta
         if (kind != case_type::missing_rank) {
             gguf_set_val_u32(gguf, "dflash.selector_rank", 4);
         }
-        gguf_set_val_u32(gguf, "dflash.selector_top_k", SELECTOR_TOP_K);
+        gguf_set_val_u32(gguf, "dflash.selector_top_k", kind == case_type::oversized_top_k ? UINT32_MAX : SELECTOR_TOP_K);
     }
 
     for (const auto & ti : tensors) {
@@ -267,6 +268,7 @@ int main() {
         { case_type::legacy,                  "legacy DFlash",                true  },
         { case_type::dspark,                  "legacy DSpark",                true  },
         { case_type::valid_selector,          "complete DFlash2",             true  },
+        { case_type::oversized_top_k,         "UINT32_MAX top-k",             false },
         { case_type::missing_rank,            "incomplete selector metadata", false },
         { case_type::missing_predecessor,     "missing selector codebook",    false },
         { case_type::missing_conv_projection, "missing conv projection",      false },
