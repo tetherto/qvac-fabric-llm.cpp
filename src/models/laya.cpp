@@ -1,0 +1,313 @@
+#include "models.h"
+
+#include <algorithm>
+#include <cmath>
+#include <limits>
+
+// Laya decision checkpoints: https://github.com/NandhaKishorM/laya
+//
+// Each sequence is one question over one state:
+//
+//   [CLS] <type> question: <instructions> [SEP] [MASK] option0 [MASK] option1 ... [SEP] <state> [SEP]
+//
+// The ModernBert encoder output gets the embedding of the question type, runs through the decision
+// blocks, and the hidden state at every [MASK] marker is scored into one logit per option. With
+// LLAMA_POOLING_TYPE_RANK every sequence yields n_cls_out = n_act + n_max_options floats:
+//
+//   [act logits (n_act), option logits in marker order (n_max_options, zero after the last option)]
+
+void llama_model_laya::load_arch_hparams(llama_model_loader & ml) {
+    llama_model_modern_bert::load_arch_hparams(ml);
+
+    // the checkpoints use the exact (erf) GELU of torch.nn.GELU
+    if (hparams.llm_ffn_op == LLM_FFN_GEGLU) {
+        hparams.llm_ffn_op = LLM_FFN_GEGLU_ERF;
+    }
+
+    ml.get_key(LLM_KV_DECISION_BLOCK_COUNT, n_decision_layer);
+    ml.get_key(LLM_KV_DECISION_ACT_COUNT,   n_act);
+    ml.get_key(LLM_KV_DECISION_MAX_OPTIONS, n_max_options);
+    ml.get_arr(LLM_KV_DECISION_QTYPE_TOKENS, qtype_tokens);
+
+    GGML_ASSERT(qtype_tokens.size() == 3 && "laya: expected the tokens of the choice, score and noul question types");
+
+    hparams.n_cls_out = n_act + n_max_options;
+}
+
+void llama_model_laya::load_arch_tensors(llama_model_loader & ml) {
+    llama_model_modern_bert::load_arch_tensors(ml);
+
+    LLAMA_LOAD_LOCALS;
+
+    const int64_t n_ff_dec  = ml.get_tensor_meta(tn(LLM_TENSOR_DECISION_FFN_UP, "weight", 0).str().c_str())->ne[1];
+    const int64_t n_act_hid = ml.get_tensor_meta(tn(LLM_TENSOR_DECISION_ACT,    "weight").str().c_str())->ne[1];
+
+    decision_type_embd = create_tensor(tn(LLM_TENSOR_DECISION_TYPE_EMBD, "weight"), {n_embd, 3}, 0);
+
+    decision_layers.resize(n_decision_layer);
+    for (uint32_t i = 0; i < n_decision_layer; ++i) {
+        auto & layer = decision_layers[i];
+
+        layer.attn_norm   = create_tensor(tn(LLM_TENSOR_DECISION_ATTN_NORM, "weight", i), {n_embd}, 0);
+        layer.attn_norm_b = create_tensor(tn(LLM_TENSOR_DECISION_ATTN_NORM, "bias",   i), {n_embd}, 0);
+        layer.wqkv        = create_tensor(tn(LLM_TENSOR_DECISION_ATTN_QKV,  "weight", i), {n_embd, 3*n_embd}, 0);
+        layer.bqkv        = create_tensor(tn(LLM_TENSOR_DECISION_ATTN_QKV,  "bias",   i), {3*n_embd}, 0);
+        layer.wo          = create_tensor(tn(LLM_TENSOR_DECISION_ATTN_OUT,  "weight", i), {n_embd, n_embd}, 0);
+        layer.bo          = create_tensor(tn(LLM_TENSOR_DECISION_ATTN_OUT,  "bias",   i), {n_embd}, 0);
+        layer.ffn_norm    = create_tensor(tn(LLM_TENSOR_DECISION_FFN_NORM,  "weight", i), {n_embd}, 0);
+        layer.ffn_norm_b  = create_tensor(tn(LLM_TENSOR_DECISION_FFN_NORM,  "bias",   i), {n_embd}, 0);
+        layer.ffn_up      = create_tensor(tn(LLM_TENSOR_DECISION_FFN_UP,    "weight", i), {n_embd, n_ff_dec}, 0);
+        layer.ffn_up_b    = create_tensor(tn(LLM_TENSOR_DECISION_FFN_UP,    "bias",   i), {n_ff_dec}, 0);
+        layer.ffn_down    = create_tensor(tn(LLM_TENSOR_DECISION_FFN_DOWN,  "weight", i), {n_ff_dec, n_embd}, 0);
+        layer.ffn_down_b  = create_tensor(tn(LLM_TENSOR_DECISION_FFN_DOWN,  "bias",   i), {n_embd}, 0);
+    }
+
+    decision_scorer_norm   = create_tensor(tn(LLM_TENSOR_DECISION_SCORER_NORM, "weight"), {n_embd}, 0);
+    decision_scorer_norm_b = create_tensor(tn(LLM_TENSOR_DECISION_SCORER_NORM, "bias"),   {n_embd}, 0);
+    decision_scorer        = create_tensor(tn(LLM_TENSOR_DECISION_SCORER,      "weight"), {n_embd, n_embd}, 0);
+    decision_scorer_b      = create_tensor(tn(LLM_TENSOR_DECISION_SCORER,      "bias"),   {n_embd}, 0);
+    decision_scorer_out    = create_tensor(tn(LLM_TENSOR_DECISION_SCORER_OUT,  "weight"), {n_embd, 1}, 0);
+    decision_scorer_out_b  = create_tensor(tn(LLM_TENSOR_DECISION_SCORER_OUT,  "bias"),   {1}, 0);
+
+    // the act head also reads 4 features of the option distribution
+    decision_act       = create_tensor(tn(LLM_TENSOR_DECISION_ACT,     "weight"), {n_embd + 4, n_act_hid}, 0);
+    decision_act_b     = create_tensor(tn(LLM_TENSOR_DECISION_ACT,     "bias"),   {n_act_hid}, 0);
+    decision_act_out   = create_tensor(tn(LLM_TENSOR_DECISION_ACT_OUT, "weight"), {n_act_hid, n_act}, 0);
+    decision_act_out_b = create_tensor(tn(LLM_TENSOR_DECISION_ACT_OUT, "bias"),   {n_act}, 0);
+}
+
+std::unique_ptr<llm_graph_context> llama_model_laya::build_arch_graph(const llm_graph_params & params) const {
+    return std::make_unique<graph>(*this, params);
+}
+
+// most [MASK] markers in one sequence of the ubatch, at least 2 so that the top-2 features are defined
+static int64_t laya_n_options(const llama_ubatch & ubatch, llama_token mask) {
+    std::vector<int64_t> n_opt(ubatch.n_seqs_unq, 0);
+
+    int64_t res = 2;
+    for (uint32_t i = 0; ubatch.token && i < ubatch.n_tokens; ++i) {
+        if (ubatch.token[i] == mask) {
+            const int32_t s = ubatch.seq_idx[ubatch.seq_id[i][0]];
+            res = std::max(res, ++n_opt[s]);
+        }
+    }
+
+    return res;
+}
+
+// per-sequence inputs of the decision head, derived from the tokens of each sequence
+class llm_graph_input_laya : public llm_graph_input_i {
+public:
+    llm_graph_input_laya(const llama_model_laya & model, int64_t n_opt) : model(model), n_opt(n_opt) {}
+    virtual ~llm_graph_input_laya() = default;
+
+    void set_input(const llama_ubatch * ubatch) override {
+        const int64_t n_tokens = ubatch->n_tokens;
+        const int64_t n_seqs   = ubatch->n_seqs_unq;
+
+        const llama_token mask = model.vocab.token_mask();
+
+        // the first two positions of each sequence: [CLS] and the question type
+        std::vector<llama_pos> pos_first(n_seqs, std::numeric_limits<llama_pos>::max());
+        for (int64_t i = 0; i < n_tokens; ++i) {
+            GGML_ASSERT(ubatch->n_seq_id[i] == 1 && "laya: a token can only belong to one sequence");
+            const int32_t s = ubatch->seq_idx[ubatch->seq_id[i][0]];
+            pos_first[s] = std::min(pos_first[s], ubatch->pos[i]);
+        }
+
+        std::vector<int32_t> seq_qtype(n_seqs, -1);
+        std::vector<std::vector<std::pair<llama_pos, int32_t>>> markers(n_seqs);
+        for (int64_t i = 0; i < n_tokens; ++i) {
+            const int32_t     s   = ubatch->seq_idx[ubatch->seq_id[i][0]];
+            const llama_token tok = ubatch->token ? ubatch->token[i] : LLAMA_TOKEN_NULL;
+
+            if (ubatch->pos[i] == pos_first[s] + 1) {
+                for (size_t q = 0; q < model.qtype_tokens.size(); ++q) {
+                    if (tok == model.qtype_tokens[q]) {
+                        seq_qtype[s] = q;
+                    }
+                }
+            }
+            if (tok == mask) {
+                markers[s].emplace_back(ubatch->pos[i], i);
+            }
+        }
+
+        for (int64_t s = 0; s < n_seqs; ++s) {
+            if (seq_qtype[s] < 0) {
+                LLAMA_LOG_WARN("%s: sequence does not start with a laya question type, using 'choice'\n", __func__);
+                seq_qtype[s] = 0;
+            }
+        }
+
+        std::vector<int32_t> qtypes(n_tokens);
+        for (int64_t i = 0; i < n_tokens; ++i) {
+            qtypes[i] = seq_qtype[ubatch->seq_idx[ubatch->seq_id[i][0]]];
+        }
+
+        // padding points at row 0 and is masked out by opt_keep
+        std::vector<int32_t> rows(n_opt*n_seqs, 0);
+        std::vector<float>   keep(n_opt*n_seqs, 0.0f);
+        for (int64_t s = 0; s < n_seqs; ++s) {
+            GGML_ASSERT((int64_t) markers[s].size() <= n_opt);
+            std::sort(markers[s].begin(), markers[s].end());
+            for (size_t j = 0; j < markers[s].size(); ++j) {
+                rows[s*n_opt + j] = markers[s][j].second;
+                keep[s*n_opt + j] = 1.0f;
+            }
+        }
+
+        ggml_backend_tensor_set(qtype, qtypes.data(), 0, ggml_nbytes(qtype));
+        if (opt_rows) {
+            ggml_backend_tensor_set(opt_rows, rows.data(), 0, ggml_nbytes(opt_rows));
+            ggml_backend_tensor_set(opt_keep, keep.data(), 0, ggml_nbytes(opt_keep));
+        }
+    }
+
+    ggml_tensor * qtype    = nullptr; // I32 [n_tokens]      question type of the sequence of each token
+    ggml_tensor * opt_rows = nullptr; // I32 [n_opt*n_seqs]  row of each option marker, in position order
+    ggml_tensor * opt_keep = nullptr; // F32 [n_opt, n_seqs] 1 for a marker, 0 for padding
+
+    const llama_model_laya & model;
+    const int64_t n_opt;
+};
+
+llama_model_laya::graph::graph(const llama_model & model, const llm_graph_params & params) : llama_model_modern_bert::graph(params) {
+    const auto & laya = static_cast<const llama_model_laya &>(model);
+
+    // the decision blocks attend over every token, so reduce to the output rows only at the end
+    ggml_tensor * inp_out_ids = build_inp_out_ids();
+
+    ggml_tensor * cur = build_encoder(model, nullptr);
+
+    const bool decide = cparams.embeddings && pooling_type == LLAMA_POOLING_TYPE_RANK;
+
+    const int64_t n_seqs = ubatch.n_seqs_unq;
+    const int64_t n_opt  = laya_n_options(ubatch, model.vocab.token_mask());
+
+    GGML_ASSERT(n_opt <= (int64_t) laya.n_max_options && "laya: a question has more options than the model outputs");
+
+    auto inp = std::make_unique<llm_graph_input_laya>(laya, n_opt);
+
+    inp->qtype = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
+    ggml_set_input(inp->qtype);
+
+    if (decide) {
+        inp->opt_rows = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_opt*n_seqs);
+        ggml_set_input(inp->opt_rows);
+
+        inp->opt_keep = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_opt, n_seqs);
+        ggml_set_input(inp->opt_keep);
+    }
+
+    ggml_tensor * inp_qtype = inp->qtype;
+    ggml_tensor * opt_rows  = inp->opt_rows;
+    ggml_tensor * opt_keep  = inp->opt_keep;
+
+    res->add_input(std::move(inp));
+
+    cur = ggml_add(ctx0, cur, ggml_get_rows(ctx0, laya.decision_type_embd, inp_qtype));
+    cb(cur, "decision_inp", -1);
+
+    // decision blocks: bidirectional attention over the whole sequence, no positional encoding
+    const int64_t n_head_dec  = std::max<int64_t>(1, n_embd/64);
+    const int64_t n_embd_head = n_embd/n_head_dec;
+
+    for (uint32_t i = 0; i < laya.n_decision_layer; ++i) {
+        const auto & layer = laya.decision_layers[i];
+
+        // the block weights live with encoder layer i
+        const int il = i;
+
+        ggml_tensor * inpL = cur;
+
+        cur = build_norm(cur, layer.attn_norm, layer.attn_norm_b, LLM_NORM, il);
+        cb(cur, "decision_attn_norm", il);
+
+        ggml_tensor * qkv = build_lora_mm(layer.wqkv, cur);
+        qkv = ggml_add(ctx0, qkv, layer.bqkv);
+        cb(qkv, "decision_wqkv", il);
+
+        ggml_tensor * Qcur = ggml_view_3d(ctx0, qkv, n_embd_head, n_head_dec, n_tokens, n_embd_head*ggml_element_size(qkv), qkv->nb[1], 0*n_embd*ggml_element_size(qkv));
+        ggml_tensor * Kcur = ggml_view_3d(ctx0, qkv, n_embd_head, n_head_dec, n_tokens, n_embd_head*ggml_element_size(qkv), qkv->nb[1], 1*n_embd*ggml_element_size(qkv));
+        ggml_tensor * Vcur = ggml_view_3d(ctx0, qkv, n_embd_head, n_head_dec, n_tokens, n_embd_head*ggml_element_size(qkv), qkv->nb[1], 2*n_embd*ggml_element_size(qkv));
+
+        ggml_build_forward_expand(gf, Qcur);
+        ggml_build_forward_expand(gf, Kcur);
+        ggml_build_forward_expand(gf, Vcur);
+
+        cur = build_attn_mha(Qcur, Kcur, Vcur, nullptr, inp_attn->get_kq_mask(), nullptr, nullptr,
+                1.0f/sqrtf(float(n_embd_head)), il);
+        cb(cur, "decision_kqv_out", il);
+
+        cur = build_lora_mm(layer.wo, cur);
+        cur = ggml_add(ctx0, cur, layer.bo);
+
+        ggml_tensor * ffn_inp = ggml_add(ctx0, cur, inpL);
+        cb(ffn_inp, "decision_ffn_inp", il);
+
+        cur = build_norm(ffn_inp, layer.ffn_norm, layer.ffn_norm_b, LLM_NORM, il);
+        cb(cur, "decision_ffn_norm", il);
+
+        cur = build_ffn(cur,
+                layer.ffn_up,   layer.ffn_up_b,   nullptr,
+                nullptr,        nullptr,          nullptr,
+                layer.ffn_down, layer.ffn_down_b, nullptr,
+                nullptr,
+                LLM_FFN_RELU, LLM_FFN_SEQ, il);
+
+        cur = ggml_add(ctx0, cur, ffn_inp);
+        cb(cur, "decision_out", il);
+    }
+
+    if (decide) {
+        // one logit per option marker, masked like logits.masked_fill(~marker_mask, -1e4)
+        ggml_tensor * opt = ggml_get_rows(ctx0, cur, opt_rows);
+        opt = build_norm(opt, laya.decision_scorer_norm, laya.decision_scorer_norm_b, LLM_NORM, -1);
+        opt = ggml_add(ctx0, build_lora_mm(laya.decision_scorer, opt), laya.decision_scorer_b);
+        opt = ggml_gelu_erf(ctx0, opt);
+        opt = ggml_add(ctx0, build_lora_mm(laya.decision_scorer_out, opt), laya.decision_scorer_out_b);
+        opt = ggml_reshape_2d(ctx0, opt, n_opt, n_seqs);
+        opt = ggml_add(ctx0, ggml_mul(ctx0, opt, opt_keep), ggml_scale_bias(ctx0, opt_keep, 1e4f, -1e4f));
+        cb(opt, "decision_opt_logits", -1);
+
+        // act features: top-1 probability, top-1 margin, normalized entropy, option count / 255
+        ggml_tensor * p = ggml_soft_max(ctx0, opt);
+
+        ggml_tensor * top = ggml_cont(ctx0, ggml_argsort_top_k(ctx0, p, 2));
+        top = ggml_get_rows(ctx0, ggml_reshape_3d(ctx0, p, 1, n_opt, n_seqs), top);
+        top = ggml_reshape_2d(ctx0, top, 2, n_seqs);
+
+        ggml_tensor * top1 = ggml_view_2d(ctx0, top, 1, n_seqs, top->nb[1], 0);
+        ggml_tensor * top2 = ggml_view_2d(ctx0, top, 1, n_seqs, top->nb[1], ggml_element_size(top));
+
+        ggml_tensor * k = ggml_clamp(ctx0, ggml_sum_rows(ctx0, opt_keep), 2.0f, INFINITY);
+
+        ggml_tensor * ent = ggml_mul(ctx0, p, ggml_log(ctx0, ggml_clamp(ctx0, p, 1e-9f, INFINITY)));
+        ent = ggml_div(ctx0, ggml_scale(ctx0, ggml_sum_rows(ctx0, ent), -1.0f), ggml_log(ctx0, k));
+
+        ggml_tensor * feats = ggml_concat(ctx0, ggml_cont(ctx0, top1), ggml_sub(ctx0, top1, top2), 0);
+        feats = ggml_concat(ctx0, feats, ent, 0);
+        feats = ggml_concat(ctx0, feats, ggml_scale(ctx0, k, 1.0f/255.0f), 0);
+        cb(feats, "decision_act_feats", -1);
+
+        ggml_tensor * act = ggml_get_rows(ctx0, cur, build_inp_cls());
+        act = ggml_concat(ctx0, act, feats, 0);
+        act = ggml_add(ctx0, build_lora_mm(laya.decision_act, act), laya.decision_act_b);
+        act = ggml_gelu_erf(ctx0, act);
+        act = ggml_add(ctx0, build_lora_mm(laya.decision_act_out, act), laya.decision_act_out_b);
+        cb(act, "decision_act_logits", -1);
+
+        ggml_tensor * out = ggml_concat(ctx0, act, opt, 0);
+        out = ggml_pad(ctx0, out, hparams.n_cls_out - out->ne[0], 0, 0, 0);
+        cb(out, "result_embd_pooled", -1);
+
+        res->t_embd_pooled = out;
+        ggml_build_forward_expand(gf, out);
+    }
+
+    cur = ggml_get_rows(ctx0, cur, inp_out_ids);
+
+    res->t_embd = cur;
+    ggml_build_forward_expand(gf, cur);
+}

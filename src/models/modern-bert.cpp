@@ -72,6 +72,13 @@ std::unique_ptr<llm_graph_context> llama_model_modern_bert::build_arch_graph(con
 }
 
 llama_model_modern_bert::graph::graph(const llama_model & model, const llm_graph_params & params) : llm_graph_context(params) {
+    ggml_tensor * cur = build_encoder(model, build_inp_out_ids());
+
+    res->t_embd = cur;
+    ggml_build_forward_expand(gf, cur);
+}
+
+ggml_tensor * llama_model_modern_bert::graph::build_encoder(const llama_model & model, ggml_tensor * inp_out_ids) {
     const int64_t n_embd_head = hparams.n_embd_head_v();
 
     GGML_ASSERT(n_embd_head == hparams.n_embd_head_k());
@@ -88,9 +95,7 @@ llama_model_modern_bert::graph::graph(const llama_model & model, const llm_graph
     inpL = build_norm(inpL, model.tok_norm, nullptr, LLM_NORM, 0);
     cb(inpL, "inp_norm", 0);
 
-    ggml_tensor * inp_out_ids = build_inp_out_ids();
-
-    auto * inp_attn = build_attn_inp_no_cache();
+    inp_attn = build_attn_inp_no_cache();
 
     for (int il = 0; il < n_layer; ++il) {
         const float freq_base_l  = model.get_rope_freq_base(cparams, il);
@@ -169,6 +174,5 @@ llama_model_modern_bert::graph::graph(const llama_model & model, const llm_graph
             LLM_NORM, -1);
     cb(cur, "final_norm_out", -1);
 
-    res->t_embd = cur;
-    ggml_build_forward_expand(gf, cur);
+    return cur;
 }
