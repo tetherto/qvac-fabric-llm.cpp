@@ -2719,9 +2719,33 @@ common_speculative_output_limits common_speculative_get_output_limits(
     };
 }
 
+// --spec-draft-vocab restricts a DFlash2 drafter only; it is applied before any speculative state changes, so a rejected value leaves the contexts as they were
+static void common_speculative_apply_draft_vocab(const common_params_speculative & params) {
+    const auto & ranges = params.draft.vocab_ranges;
+    if (ranges.empty()) {
+        return;
+    }
+
+    const bool has_dflash = std::find(params.types.begin(), params.types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH) != params.types.end();
+    if (!has_dflash || params.draft.ctx_dft == nullptr) {
+        throw std::runtime_error("--spec-draft-vocab needs --spec-type draft-dflash and a draft model");
+    }
+
+    if (ranges.size() % 2 != 0 || !llama_set_draft_vocab(params.draft.ctx_dft, ranges.data(), (int32_t) ranges.size()/2)) {
+        const llama_model * model = llama_get_model(params.draft.ctx_dft);
+        throw std::runtime_error("--spec-draft-vocab needs a DFlash2 drafter with a full-vocabulary head and non-empty, ascending, disjoint ranges within its " +
+                std::to_string(llama_vocab_n_tokens(llama_model_get_vocab(model))) + "-token vocabulary that cover at least its " +
+                std::to_string(llama_model_dflash_selector_top_k(model)) + " selector candidates");
+    }
+
+    LOG_INF("%s: draft vocabulary: %zu token id ranges\n", __func__, ranges.size()/2);
+}
+
 // initialization of the speculative decoding system
 //
 common_speculative * common_speculative_init(common_params_speculative & params, uint32_t n_seq) {
+    common_speculative_apply_draft_vocab(params);
+
     // Compute the implementations to use based on the config and their order of preference
     std::vector<common_speculative_config> configs = {}; // list of speculative configs to try
     {

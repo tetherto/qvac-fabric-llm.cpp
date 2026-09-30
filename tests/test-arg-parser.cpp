@@ -229,6 +229,12 @@ static void test(void) {
     argv = {"binary_name", "-lm", "hello"};
     assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
 
+    // draft vocabulary ranges are B:E pairs of integers (llama_set_draft_vocab checks their order and bounds)
+    for (const char * ranges : {"0:10:20", "7", "a:5", "5:9x", "0:10,"}) {
+        argv = {"binary_name", "--spec-draft-vocab", ranges};
+        assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
+    }
+
     printf("test-arg-parser: test valid usage\n\n");
 
     argv = {"binary_name", "-m", "model_file.gguf"};
@@ -273,6 +279,10 @@ static void test(void) {
         argv = {"binary_name", "--spec-synth-len", "3.4x"};
         assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), synth_params, LLAMA_EXAMPLE_SERVER));
     }
+
+    argv = {"binary_name", "--spec-draft-vocab", "0:98304,248032:248320"};
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
+    assert((params.speculative.draft.vocab_ranges == std::vector<int32_t>{0, 98304, 248032, 248320}));
 
     argv = {"binary_name", "-lm", "none"};
     assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));

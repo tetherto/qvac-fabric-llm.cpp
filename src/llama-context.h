@@ -126,6 +126,7 @@ struct llama_context {
     void set_embeddings_layer_inp(uint32_t lid, bool enable);
     void set_embeddings_layer_inp_pos_min(llama_seq_id seq_id, llama_pos pos_min);
     void set_nextn_layer_offset(int32_t offset);
+    bool set_draft_vocab(const int32_t * ranges, int32_t n_ranges);
     void set_causal_attn(bool value);
     void set_warmup(bool value);
 

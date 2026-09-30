@@ -331,6 +331,8 @@ struct common_params_speculative_draft {
 
     bool backend_sampling = true; // offload draft sampling to the backend (default: on)
 
+    std::vector<int32_t> vocab_ranges; // [begin, end) token id pairs a DFlash2 drafter may propose (empty = all)
+
     common_params_model mparams;
 
     llama_context * ctx_tgt = nullptr;

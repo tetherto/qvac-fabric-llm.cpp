@@ -251,6 +251,29 @@ std::vector<std::string> common_arg::get_env() const {
 // utils
 //
 
+static int32_t parse_token_id(const std::string & value) {
+    size_t n_parsed = 0;
+    const int32_t id = std::stoi(value, &n_parsed);
+    if (n_parsed != value.size()) {
+        throw std::invalid_argument("invalid token id: " + value);
+    }
+    return id;
+}
+
+// parses "B:E[,B:E...]" into [begin, end) token id pairs; llama_set_draft_vocab checks their order and bounds
+static std::vector<int32_t> parse_token_ranges(const std::string & value) {
+    std::vector<int32_t> ranges;
+    for (const auto & range : string_split<std::string>(value, ',')) {
+        const auto bounds = string_split<std::string>(range, ':');
+        if (bounds.size() != 2) {
+            throw std::invalid_argument("invalid token range: " + range);
+        }
+        ranges.push_back(parse_token_id(bounds[0]));
+        ranges.push_back(parse_token_id(bounds[1]));
+    }
+    return ranges;
+}
+
 // Helper function to parse tensor buffer override strings
 static void parse_tensor_buffer_overrides(const std::string & value, std::vector<llama_model_tensor_buft_override> & overrides) {
     ggml_backend_load_all();
@@ -4318,6 +4341,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.speculative.draft.p_min = std::stof(value);
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_P_MIN"));
+    add_opt(common_arg(
+        {"--spec-draft-vocab"}, "B:E[,B:E...]",
+        "token id ranges [B, E) a DFlash2 drafter may propose; the target still verifies over the full vocabulary\n"
+        "(default: full vocabulary)",
+        [](common_params & params, const std::string & value) {
+            params.speculative.draft.vocab_ranges = parse_token_ranges(value);
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_VOCAB"));
     add_opt(common_arg(
         {"--spec-draft-backend-sampling"},
         {"--no-spec-draft-backend-sampling"},
