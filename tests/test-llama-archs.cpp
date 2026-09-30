@@ -78,7 +78,7 @@ static void set_tensor_data(struct ggml_tensor * tensor, void * userdata) {
 }
 
 static void usage(char ** argv) {
-    printf("Usage: %s [-a/--arch arch] [-s/--seed seed] [-o/--out dir] [-v N] [-h/--help] [--mtp-shared|--mtp-shared-cpu|--hadamard-contracts|--qsa-unified-multiseq|--glm5-kpool-sequences|--glm5-invalid-metadata]\n", argv[0]);
+    printf("Usage: %s [-a/--arch arch] [-s/--seed seed] [-o/--out dir] [-v N] [-h/--help] [--mtp-shared|--mtp-shared-cpu|--hadamard-contracts|--qsa-unified-multiseq|--glm5-kpool-sequences|--glm5-invalid-metadata|--layer-inp-pos-min]\n", argv[0]);
 }
 
 static std::vector<llama_token> get_tokens(const uint32_t n_tokens, const uint32_t n_vocab, const size_t seed){
@@ -1646,6 +1646,78 @@ static int test_glm5_invalid_metadata() {
     return 0;
 }
 
+static constexpr uint32_t  LAYER_INP_LID       = 1;
+static constexpr uint32_t  LAYER_INP_N_TOKENS  = 128; // two ubatches of 64
+static constexpr llama_pos LAYER_INP_POS_MIN   = 80;  // skips the first ubatch and part of the second
+static constexpr float     LAYER_INP_STALE     = 1.0e30f;
+static constexpr float     LAYER_INP_TOLERANCE = 1.0e-4f;
+
+static void fill_layer_inp_stale(llama_context * ctx, size_t n_floats) {
+    std::fill_n(llama_get_embeddings_layer_inp(ctx, LAYER_INP_LID), n_floats, LAYER_INP_STALE);
+}
+
+static std::vector<float> decode_layer_inp(llama_context * ctx, const std::vector<llama_token> & tokens, size_t n_floats) {
+    llama_memory_clear(llama_get_memory(ctx), true);
+    llama_batch batch = llama_batch_init(tokens.size(), 0, 1);
+    for (size_t i = 0; i < tokens.size(); ++i) {
+        common_batch_add(batch, tokens[i], i, {0}, i + 1 == tokens.size());
+    }
+    const int rc = llama_decode(ctx, batch);
+    llama_batch_free(batch);
+    GGML_ASSERT(rc == 0);
+
+    const float * rows = llama_get_embeddings_layer_inp(ctx, LAYER_INP_LID);
+    return std::vector<float>(rows, rows + n_floats);
+}
+
+// rows below first_row keep the stale data, the other rows match the reference
+static bool layer_inp_rows_match(const std::vector<float> & rows, const std::vector<float> & ref, size_t n_embd, size_t first_row) {
+    for (size_t i = 0; i < rows.size(); ++i) {
+        const bool ok = i / n_embd < first_row ? rows[i] == LAYER_INP_STALE :
+            std::fabs(rows[i] - ref[i]) <= LAYER_INP_TOLERANCE * std::max(1.0f, std::fabs(ref[i]));
+        if (!ok) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// layer input rows are copied from the first row at or above the sequence's pos_min, -1 copies all rows again
+static bool test_layer_inp_pos_min_arch(llm_arch arch) {
+    auto metadata = get_gguf_ctx(arch, false);
+    auto loaded = get_model_and_ctx(metadata.get(), nullptr, 1234, {});
+    llama_model * model = loaded.first.get();
+    llama_context * ctx = loaded.second.get();
+    llama_set_embeddings_layer_inp(ctx, LAYER_INP_LID, true);
+
+    const size_t n_embd   = llama_model_n_embd(model);
+    const size_t n_floats = n_embd * LAYER_INP_N_TOKENS;
+    const auto   tokens   = get_tokens(LAYER_INP_N_TOKENS, llama_vocab_n_tokens(llama_model_get_vocab(model)), 1234);
+    const std::vector<float> ref = decode_layer_inp(ctx, tokens, n_floats);
+
+    fill_layer_inp_stale(ctx, n_floats);
+    llama_set_embeddings_layer_inp_pos_min(ctx, 0, LAYER_INP_POS_MIN);
+    const bool skipped = layer_inp_rows_match(decode_layer_inp(ctx, tokens, n_floats), ref, n_embd, LAYER_INP_POS_MIN);
+
+    fill_layer_inp_stale(ctx, n_floats);
+    llama_set_embeddings_layer_inp_pos_min(ctx, 0, -1);
+    const bool all = layer_inp_rows_match(decode_layer_inp(ctx, tokens, n_floats), ref, n_embd, 0);
+
+    if (!skipped || !all) {
+        printf("FAIL: %s layer input rows (pos_min %d: %s, pos_min -1: %s)\n", llm_arch_name(arch), LAYER_INP_POS_MIN,
+                skipped ? "ok" : "wrong", all ? "ok" : "wrong");
+    }
+    return skipped && all;
+}
+
+static int test_layer_inp_pos_min() {
+    const bool ok = test_layer_inp_pos_min_arch(LLM_ARCH_LLAMA) && test_layer_inp_pos_min_arch(LLM_ARCH_QWEN35);
+    if (ok) {
+        printf("layer input pos_min tests passed\n");
+    }
+    return ok ? 0 : 1;
+}
+
 int main(int argc, char ** argv) {
     // init the logger at max verbosity. filter with a custom callback respecting the user-configure verbosity
     common_log_set_verbosity_thold(LOG_LEVEL_DEBUG);
@@ -1662,6 +1734,9 @@ int main(int argc, char ** argv) {
     }
     if (argc == 2 && strcmp(argv[1], "--glm5-invalid-metadata") == 0) {
         return test_glm5_invalid_metadata();
+    }
+    if (argc == 2 && strcmp(argv[1], "--layer-inp-pos-min") == 0) {
+        return test_layer_inp_pos_min();
     }
     std::random_device rd;
 

@@ -1056,6 +1056,9 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         for (uint32_t k = 0; k < target_layer_ids_n; ++k) {
             llama_set_embeddings_layer_inp(ctx_tgt, (uint32_t) target_layer_ids[k], true);
         }
+        for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+            set_prompt_end(seq_id, -1);
+        }
 
         // DFlash2 reads its selector lattice from h_nextn and never consumes raw logits.
         llama_set_embeddings_nextn(ctx_dft, true, /*masked*/ !is_dflash2);
@@ -1084,7 +1087,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             return;
         }
 
-        prompt_pos_end[seq_id] = -1;
+        set_prompt_end(seq_id, -1);
 
         const int32_t N = (int32_t) prompt.size();
         if (N <= 0) {
@@ -1102,15 +1105,23 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     void set_prompt_end(llama_seq_id seq_id, llama_pos pos_end) override {
         if (seq_id >= 0 && seq_id < (llama_seq_id) n_seq) {
             prompt_pos_end[seq_id] = pos_end;
+            // the target skips the device-to-host copy of the rows that are never injected
+            llama_set_embeddings_layer_inp_pos_min(params.ctx_tgt, seq_id, attended_pos_min(seq_id));
         }
     }
 
-    // first row of [beg, end] that a draft anchored at the prompt end can attend
-    int32_t first_attended_row(const llama_batch & batch_in, llama_seq_id seq_id, int32_t beg, int32_t end) const {
+    // lowest position a draft anchored at the prompt end can attend (-1 = all)
+    llama_pos attended_pos_min(llama_seq_id seq_id) const {
         if (attn_window <= 0 || prompt_pos_end[seq_id] < 0) {
-            return beg;
+            return -1;
         }
-        const llama_pos pos_min = prompt_pos_end[seq_id] - attn_window + 1;
+        return prompt_pos_end[seq_id] - attn_window + 1;
+    }
+
+    // first row of [beg, end] that a draft anchored at the prompt end can attend
+    // prompt positions increase, so every row read from here on is at or above attended_pos_min()
+    int32_t first_attended_row(const llama_batch & batch_in, llama_seq_id seq_id, int32_t beg, int32_t end) const {
+        const llama_pos pos_min = attended_pos_min(seq_id);
         while (beg <= end && batch_in.pos[beg] < pos_min) {
             ++beg;
         }

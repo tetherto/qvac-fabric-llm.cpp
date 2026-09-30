@@ -124,6 +124,7 @@ struct llama_context {
     void set_embeddings (bool value);
     void set_embeddings_nextn(bool value, bool masked);
     void set_embeddings_layer_inp(uint32_t lid, bool enable);
+    void set_embeddings_layer_inp_pos_min(llama_seq_id seq_id, llama_pos pos_min);
     void set_nextn_layer_offset(int32_t offset);
     void set_causal_attn(bool value);
     void set_warmup(bool value);
@@ -259,7 +260,11 @@ private:
 
     // async-copy enabled layer-input tensors (per cparams.output_layer_inp)
     // from backend into host-side embd_layer_inp buffers
-    void extract_layer_inputs(const llm_graph_result * res, size_t token_offset, size_t n_tokens);
+    void extract_layer_inputs(const llm_graph_result * res, const llama_ubatch & ubatch, size_t token_offset);
+
+    // first ubatch row whose layer inputs are read, rows before it are not copied
+    uint32_t layer_inp_first_row(const llama_ubatch & ubatch) const;
+    bool     layer_inp_row_read (const llama_ubatch & ubatch, uint32_t i) const;
 
     //
     // graph
@@ -333,6 +338,9 @@ private:
     // host buffers for output layer input embeddings, per layer
     // populated when cparams.output_layer_inp[il] is true
     std::vector<buffer_view<float>> embd_layer_inp;
+
+    // per sequence: layer input rows at lower positions are not read (-1 = all rows are read)
+    std::vector<llama_pos> embd_layer_inp_pos_min;
 
     struct sampling_info {
         // !samplers.empty() to check if any samplers are active

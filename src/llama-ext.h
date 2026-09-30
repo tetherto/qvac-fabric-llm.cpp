@@ -110,6 +110,10 @@ LLAMA_API float * llama_get_embeddings_nextn_ith(struct llama_context * ctx, int
 // Set whether the context outputs the input embeddings of a specific layer
 LLAMA_API void llama_set_embeddings_layer_inp(struct llama_context * ctx, uint32_t lid, bool value);
 
+// Output the layer input rows of each ubatch only from its first row at a position >= pos_min of the row's sequence (-1 = all rows)
+// The skipped rows keep stale data and must not be read
+LLAMA_API void llama_set_embeddings_layer_inp_pos_min(struct llama_context * ctx, llama_seq_id seq_id, llama_pos pos_min);
+
 // mirrors:
 // LLAMA_API float * llama_get_embeddings(struct llama_context * ctx);
 LLAMA_API float * llama_get_embeddings_layer_inp(struct llama_context * ctx, uint32_t lid);
