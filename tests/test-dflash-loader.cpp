@@ -23,6 +23,7 @@ static constexpr float REL_TOLERANCE = 1e-3f;
 static constexpr float RMS_NORM_EPS = 1e-5f;
 // the fused-encoder check extracts two target layers, so its features are wider than the decoder input
 static constexpr int32_t N_FUSED_TARGET_LAYERS = 2;
+static constexpr uint32_t N_SWA = 8;
 
 struct tensor_info {
     const char * name;
@@ -70,6 +71,8 @@ enum class case_type {
     missing_rank,
     missing_predecessor,
     missing_conv_projection,
+    sliding_window,
+    full_attention_window,
 };
 
 // the encoder fc takes n_target_layers concatenated features
@@ -128,6 +131,11 @@ static bool write_model(case_type kind, bool tensor_backed = false, int32_t n_ta
     gguf_set_arr_data(gguf, "dflash.target_layers", GGUF_TYPE_INT32, target_layers.data(), n_target_layers);
 
     gguf_set_val_u32(gguf, "dflash.block_size", 4);
+    if (kind == case_type::sliding_window || kind == case_type::full_attention_window) {
+        const bool is_swa = kind == case_type::sliding_window;
+        gguf_set_val_u32(gguf, "dflash.attention.sliding_window", N_SWA);
+        gguf_set_arr_data(gguf, "dflash.attention.sliding_window_pattern", GGUF_TYPE_BOOL, &is_swa, 1);
+    }
     if (kind != case_type::legacy && kind != case_type::dspark) {
         gguf_set_val_u32(gguf, "dflash.conv_kernel_size", 2);
         gguf_set_val_u32(gguf, "dflash.conv_group_size", 4);
@@ -258,6 +266,20 @@ static bool check_fused_encoder() {
     return ok;
 }
 
+// the attention window bounds prompt rows a draft can attend: only a drafter whose every layer is SWA has one
+static bool check_attn_window(case_type kind, int32_t expected) {
+    if (!write_model(kind)) {
+        return false;
+    }
+    llama_model_params params = llama_model_default_params();
+    params.no_alloc = true;
+    params.load_mode = LLAMA_LOAD_MODE_NONE;
+    llama_model * model = llama_model_load_from_file(PATH, params);
+    const bool ok = model && llama_model_attn_window(model) == expected;
+    llama_model_free(model);
+    return ok;
+}
+
 int main() {
     llama_backend_init();
     const struct {
@@ -295,6 +317,12 @@ int main() {
     }
     if (!check_fused_encoder()) {
         fprintf(stderr, "FAIL: an injection batch at the encoder input width was not encoded by fc and the encoder norm\n");
+        ++failures;
+    }
+    if (!check_attn_window(case_type::sliding_window, (int32_t) N_SWA) ||
+        !check_attn_window(case_type::full_attention_window, 0) ||
+        !check_attn_window(case_type::valid_selector, 0)) {
+        fprintf(stderr, "FAIL: the attention window must equal the sliding window only when every layer uses it\n");
         ++failures;
     }
     std::remove(PATH);

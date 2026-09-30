@@ -215,6 +215,9 @@ struct common_speculative_impl {
     // (optional) serialize/restore per-seq internal state (e.g. eagle3's deferred boundary).
     virtual bool get_state(llama_seq_id /*seq_id*/, std::vector<uint8_t> & /*data*/) const { return false; }
     virtual void set_state(llama_seq_id /*seq_id*/, const std::vector<uint8_t> & /*data*/) {}
+
+    // (optional) position right after the prompt about to be processed for seq_id
+    virtual void set_prompt_end(llama_seq_id /*seq_id*/, llama_pos /*pos_end*/) {}
 };
 
 struct common_speculative_impl_draft_simple : public common_speculative_impl {
@@ -1010,6 +1013,10 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     // inject target features from the target's device buffer instead of host copies (env LLAMA_DFLASH_DEV=0 disables)
     bool use_dev_features = false;
 
+    // prompt rows more than attn_window positions before a seq's prompt end are never attended (0 = all are)
+    int32_t                attn_window = 0;
+    std::vector<llama_pos> prompt_pos_end;
+
     common_speculative_impl_draft_dflash(const common_params_speculative & params, uint32_t n_seq)
         : common_speculative_impl_draft_dflash(params, n_seq, COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH)
     {
@@ -1089,6 +1096,9 @@ protected:
         batch        = common_batch(ctx_dft);
         batch_inject = common_batch(ctx_dft);
 
+        attn_window = llama_model_attn_window(model_dft);
+        prompt_pos_end.assign(n_seq, -1);
+
         smpls.resize(n_seq);
         for (auto & s : smpls) {
             common_params_sampling sparams;
@@ -1117,6 +1127,9 @@ protected:
         // turn on extraction of the target layers' input embeddings
         for (uint32_t k = 0; k < target_layer_ids_n; ++k) {
             llama_set_embeddings_layer_inp(ctx_tgt, (uint32_t) target_layer_ids[k], true);
+        }
+        for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+            set_prompt_end(seq_id, -1);
         }
 
         // the device buffer keeps layers in ascending id order, the fc input expects target_layer_ids order
@@ -1164,6 +1177,8 @@ public:
             return;
         }
 
+        set_prompt_end(seq_id, -1);
+
         const int32_t N = (int32_t) prompt.size();
         if (N <= 0) {
             return;
@@ -1175,6 +1190,32 @@ public:
                     "Drafts may degrade.\n",
                     __func__, (int) pos_max, N - 1);
         }
+    }
+
+    void set_prompt_end(llama_seq_id seq_id, llama_pos pos_end) override {
+        if (seq_id >= 0 && seq_id < (llama_seq_id) n_seq) {
+            prompt_pos_end[seq_id] = pos_end;
+            // the target skips the device-to-host copy of the rows that are never injected
+            llama_set_embeddings_layer_inp_pos_min(params.ctx_tgt, seq_id, attended_pos_min(seq_id));
+        }
+    }
+
+    // lowest position a draft anchored at the prompt end can attend (-1 = all)
+    llama_pos attended_pos_min(llama_seq_id seq_id) const {
+        if (attn_window <= 0 || prompt_pos_end[seq_id] < 0) {
+            return -1;
+        }
+        return prompt_pos_end[seq_id] - attn_window + 1;
+    }
+
+    // first row of [beg, end] that a draft anchored at the prompt end can attend
+    // prompt positions increase, so every row read from here on is at or above attended_pos_min()
+    int32_t first_attended_row(const common_batch & batch_in, llama_seq_id seq_id, int32_t beg, int32_t end) const {
+        const llama_pos pos_min = attended_pos_min(seq_id);
+        while (beg <= end && batch_in.tokens[beg].pos[0] < pos_min) {
+            ++beg;
+        }
+        return beg;
     }
 
     bool process(const common_batch & batch_in) override {
@@ -1215,6 +1256,10 @@ public:
 
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
             if (i_batch_beg[seq_id] < 0) {
+                continue;
+            }
+            i_batch_beg[seq_id] = first_attended_row(batch_in, seq_id, i_batch_beg[seq_id], i_batch_end[seq_id]);
+            if (i_batch_beg[seq_id] > i_batch_end[seq_id]) {
                 continue;
             }
             const int32_t n_rows = i_batch_end[seq_id] - i_batch_beg[seq_id] + 1;
@@ -3456,6 +3501,16 @@ void common_speculative_begin(common_speculative * spec, llama_seq_id seq_id, co
         common_time_meas tm(impl->t_begin_us, !impl->gen_perf);
         impl->begin(seq_id, prompt);
         impl->n_call_begin++;
+    }
+}
+
+void common_speculative_set_prompt_end(common_speculative * spec, llama_seq_id seq_id, llama_pos pos_end) {
+    if (spec == nullptr) {
+        return;
+    }
+
+    for (auto & impl : spec->impls) {
+        impl->set_prompt_end(seq_id, pos_end);
     }
 }
 

@@ -611,6 +611,9 @@ extern "C" {
     LLAMA_API int32_t llama_model_n_head_kv    (const struct llama_model * model);
     LLAMA_API int32_t llama_model_n_swa        (const struct llama_model * model);
 
+    // Positions every layer attends back from a query when all layers use a standard sliding window, else 0
+    LLAMA_API int32_t llama_model_attn_window(const struct llama_model * model);
+
     // Get the model's RoPE frequency scaling factor
     LLAMA_API float llama_model_rope_freq_scale_train(const struct llama_model * model);
 
@@ -1198,6 +1201,10 @@ extern "C" {
 
     // Set whether the context outputs the input embeddings of a specific layer
     LLAMA_API void llama_set_embeddings_layer_inp(struct llama_context * ctx, uint32_t lid, bool value);
+
+    // Output the layer input rows of each ubatch only from its first row at a position >= pos_min of the row's sequence (-1 = all rows)
+    // The skipped rows keep stale data and must not be read
+    LLAMA_API void llama_set_embeddings_layer_inp_pos_min(struct llama_context * ctx, llama_seq_id seq_id, llama_pos pos_min);
 
     // Get the input embeddings of a specific layer, mirroring llama_get_embeddings()
     LLAMA_API float * llama_get_embeddings_layer_inp(struct llama_context * ctx, uint32_t lid);

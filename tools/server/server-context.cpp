@@ -341,6 +341,9 @@ struct server_slot {
 
     server_prompt prompt;
 
+    // storage of the checkpoints discarded by the current task
+    server_checkpoint_pool ckpt_pool;
+
     bool prompt_save(server_prompt_cache & prompt_cache) const {
         if (prompt.tokens.size() == 0) {
             return false;
@@ -441,6 +444,7 @@ struct server_slot {
             spec_i_batch.clear();
             spec_ckpt.clear();
         }
+        ckpt_pool.clear();
         generated_tokens.clear();
         generated_token_probs.clear();
         json_schema = json();
@@ -2654,7 +2658,7 @@ private:
                 SLT_TRC(slot, "erasing context checkpoint too close to an earlier one (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
                         cur.pos_min, cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024);
 
-                it = slot.prompt.checkpoints.erase(it);
+                it = slot.ckpt_pool.discard(slot.prompt.checkpoints, it);
                 continue;
             }
 
@@ -2669,7 +2673,7 @@ private:
             SLT_WRN(slot, "erasing old context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
                     cur.pos_min, cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024);
 
-            slot.prompt.checkpoints.erase(slot.prompt.checkpoints.begin());
+            slot.ckpt_pool.discard(slot.prompt.checkpoints, slot.prompt.checkpoints.begin());
         }
 
         // replace an existing checkpoint at the same n_tokens instead of appending a duplicate
@@ -2678,15 +2682,14 @@ private:
             for (auto it = slot.prompt.checkpoints.begin(); it != slot.prompt.checkpoints.end(); ) {
                 if ((*it)->n_tokens == n_tokens_new) {
                     SLT_TRC(slot, "superseding context checkpoint at n_tokens = %" PRId64 "\n", (*it)->n_tokens);
-                    it = slot.prompt.checkpoints.erase(it);
+                    it = slot.ckpt_pool.discard(slot.prompt.checkpoints, it);
                 } else {
                     ++it;
                 }
             }
         }
 
-        auto ckpt = std::make_shared<common_prompt_checkpoint>();
-        auto & cur = *ckpt;
+        auto & cur = slot.ckpt_pool.add(slot.prompt.checkpoints);
 
         cur.id_task = id_task;
 
@@ -2699,8 +2702,6 @@ private:
         cur.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
         // stash the draft's speculative state with the checkpoint
         common_speculative_get_state(spec.get(), slot.id, cur.data_spec);
-
-        slot.prompt.checkpoints.push_back(std::move(ckpt));
 
         SLT_TRC(slot,
                 "created context checkpoint %d of %d (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
@@ -4223,7 +4224,7 @@ private:
                                     const auto & cur = **it;
                                     if (cur.pos_max > pos_next || cur.n_tokens > n_prefix) {
                                         SLT_TRC(slot, "erased invalidated context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_swa = %d, pos_next = %d, size = %.3f MiB)\n", cur.pos_min, cur.pos_max, cur.n_tokens, n_swa, pos_next, (float) cur.size() / 1024 / 1024);
-                                        it = slot.prompt.checkpoints.erase(it);
+                                        it = slot.ckpt_pool.discard(slot.prompt.checkpoints, it);
                                     } else {
                                         ++it;
                                     }
@@ -4244,6 +4245,8 @@ private:
                         metrics.add_prompt_cached(n_past);
 
                         slot.prompt.tokens.keep_first(n_past);
+
+                        common_speculative_set_prompt_end(spec.get(), slot.id, input_tokens.pos_next());
 
                         // this is to signal the client that the request has started processing
                         if (slot.task->params.stream) {
