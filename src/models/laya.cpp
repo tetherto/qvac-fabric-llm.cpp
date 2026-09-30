@@ -1,6 +1,7 @@
 #include "models.h"
 
 #include <algorithm>
+#include <cinttypes>
 #include <cmath>
 #include <limits>
 
@@ -87,8 +88,10 @@ static int64_t laya_n_options(const llama_ubatch & ubatch, llama_token mask) {
     int64_t res = 2;
     for (uint32_t i = 0; ubatch.token && i < ubatch.n_tokens; ++i) {
         if (ubatch.token[i] == mask) {
-            const int32_t s = ubatch.seq_idx[ubatch.seq_id[i][0]];
-            res = std::max(res, ++n_opt[s]);
+            for (int32_t j = 0; j < ubatch.n_seq_id[i]; ++j) {
+                const int32_t s = ubatch.seq_idx[ubatch.seq_id[i][j]];
+                res = std::max(res, ++n_opt[s]);
+            }
         }
     }
 
@@ -110,26 +113,30 @@ public:
         // the first two positions of each sequence: [CLS] and the question type
         std::vector<llama_pos> pos_first(n_seqs, std::numeric_limits<llama_pos>::max());
         for (int64_t i = 0; i < n_tokens; ++i) {
-            GGML_ASSERT(ubatch->n_seq_id[i] == 1 && "laya: a token can only belong to one sequence");
-            const int32_t s = ubatch->seq_idx[ubatch->seq_id[i][0]];
-            pos_first[s] = std::min(pos_first[s], ubatch->pos[i]);
+            for (int32_t j = 0; j < ubatch->n_seq_id[i]; ++j) {
+                const int32_t s = ubatch->seq_idx[ubatch->seq_id[i][j]];
+                pos_first[s] = std::min(pos_first[s], ubatch->pos[i]);
+            }
         }
 
         std::vector<int32_t> seq_qtype(n_seqs, -1);
         std::vector<std::vector<std::pair<llama_pos, int32_t>>> markers(n_seqs);
         for (int64_t i = 0; i < n_tokens; ++i) {
-            const int32_t     s   = ubatch->seq_idx[ubatch->seq_id[i][0]];
             const llama_token tok = ubatch->token ? ubatch->token[i] : LLAMA_TOKEN_NULL;
 
-            if (ubatch->pos[i] == pos_first[s] + 1) {
-                for (size_t q = 0; q < model.qtype_tokens.size(); ++q) {
-                    if (tok == model.qtype_tokens[q]) {
-                        seq_qtype[s] = q;
+            for (int32_t j = 0; j < ubatch->n_seq_id[i]; ++j) {
+                const int32_t s = ubatch->seq_idx[ubatch->seq_id[i][j]];
+
+                if (ubatch->pos[i] == pos_first[s] + 1) {
+                    for (size_t q = 0; q < model.qtype_tokens.size(); ++q) {
+                        if (tok == model.qtype_tokens[q]) {
+                            seq_qtype[s] = q;
+                        }
                     }
                 }
-            }
-            if (tok == mask) {
-                markers[s].emplace_back(ubatch->pos[i], i);
+                if (tok == mask) {
+                    markers[s].emplace_back(ubatch->pos[i], i);
+                }
             }
         }
 
@@ -140,6 +147,7 @@ public:
             }
         }
 
+        // a token shared by several sequences takes the question type of its first one
         std::vector<int32_t> qtypes(n_tokens);
         for (int64_t i = 0; i < n_tokens; ++i) {
             qtypes[i] = seq_qtype[ubatch->seq_idx[ubatch->seq_id[i][0]]];
@@ -149,8 +157,11 @@ public:
         std::vector<int32_t> rows(n_opt*n_seqs, 0);
         std::vector<float>   keep(n_opt*n_seqs, 0.0f);
         for (int64_t s = 0; s < n_seqs; ++s) {
-            GGML_ASSERT((int64_t) markers[s].size() <= n_opt);
+            // beyond the output width only the first markers are scored, see the graph
             std::sort(markers[s].begin(), markers[s].end());
+            if ((int64_t) markers[s].size() > n_opt) {
+                markers[s].resize(n_opt);
+            }
             for (size_t j = 0; j < markers[s].size(); ++j) {
                 rows[s*n_opt + j] = markers[s][j].second;
                 keep[s*n_opt + j] = 1.0f;
@@ -183,9 +194,15 @@ llama_model_laya::graph::graph(const llama_model & model, const llm_graph_params
     const bool decide = cparams.embeddings && pooling_type == LLAMA_POOLING_TYPE_RANK;
 
     const int64_t n_seqs = ubatch.n_seqs_unq;
-    const int64_t n_opt  = laya_n_options(ubatch, model.vocab.token_mask());
 
-    GGML_ASSERT(n_opt <= (int64_t) laya.n_max_options && "laya: a question has more options than the model outputs");
+    // input that did not come through common_laya_predict (e.g. /embeddings with many "[MASK]" in the text)
+    // may carry more markers than the output row holds: score the first ones instead of aborting
+    int64_t n_opt = laya_n_options(ubatch, model.vocab.token_mask());
+    if (n_opt > (int64_t) laya.n_max_options) {
+        LLAMA_LOG_WARN("%s: a sequence has %" PRId64 " [MASK] option markers, only the first %u are scored\n",
+                __func__, n_opt, laya.n_max_options);
+        n_opt = laya.n_max_options;
+    }
 
     auto inp = std::make_unique<llm_graph_input_laya>(laya, n_opt);
 
