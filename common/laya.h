@@ -10,6 +10,9 @@
 //       "refund":     {"type": "noul",   "instructions": "The customer asks for a refund."}
 //     },
 //     "max_len": 512, "head_max_len": 192                 // optional, default to the checkpoint's budgets
+//
+// A question may also set "option_order", a permutation of its option indices: slot s of the sequence
+// shows option option_order[s], and the answer is reported in the canonical option order.
 //   }
 //
 // The response follows laya's Agent.predict (for "state") and Agent.predict_batch (for "states"):
@@ -32,7 +35,7 @@ struct common_laya_sequence {
     std::vector<llama_token> tokens;
     std::vector<int32_t>     markers;  // position of each option marker
     std::vector<float>       act;      // act head logits
-    std::vector<float>       logits;   // option logits, uncalibrated
+    std::vector<float>       logits;   // option logits, uncalibrated, in slot order (see "option_order")
 };
 
 struct common_laya_result {

@@ -5,11 +5,13 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
-#include <charconv>
 #include <cmath>
 #include <cstdio>
+#include <iomanip>
+#include <locale>
 #include <map>
 #include <set>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -34,10 +36,23 @@ static std::string py_float(double v) {
         return v > 0 ? "Infinity" : "-Infinity";
     }
 
-    // shortest round-trip digits
-    char buf[64];
-    auto res = std::to_chars(buf, buf + sizeof(buf), v, std::chars_format::scientific);
-    std::string sci(buf, res.ptr);
+    // the shortest digits that round-trip (17 significant digits always do), independent of the
+    // global locale; floating-point std::to_chars is not available on every deployment target.
+    // A candidate that overflows (2e+308 for DBL_MAX) fails the parse instead of comparing equal.
+    std::string sci;
+    for (int prec = 0; prec <= 16; ++prec) {
+        std::ostringstream os;
+        os.imbue(std::locale::classic());
+        os << std::scientific << std::setprecision(prec) << v;
+        sci = os.str();
+
+        std::istringstream is(sci);
+        is.imbue(std::locale::classic());
+        double back = 0.0;
+        if ((is >> back) && back == v) {
+            break;
+        }
+    }
 
     const size_t epos = sci.find('e');
     const int    exp  = std::stoi(sci.substr(epos + 1));
@@ -300,10 +315,24 @@ struct laya_question {
     std::string id;
     int         type; // index into QTYPE_NAMES
     std::string ins;
-    json        crit;            // choice: object label -> description, score: array, noul: object or null
-    std::vector<json> labels;    // choice answer keys, in option order
+
+    // choice: (label, description) per option; a label keeps its JSON type and is the answer key
+    std::vector<std::pair<json, json>> choices;
+
+    // score: the level descriptions
+    json levels = json::array();
+
+    // noul: the descriptions keyed "false" / "true", and the labels shown for them
+    json        noul_crit  = json::object();
     std::string noul_false = "false";
     std::string noul_true  = "true";
+
+    // option_order[s] is the option shown in slot s; empty for the canonical order
+    std::vector<int> option_order;
+
+    size_t n_options() const {
+        return type == 0 ? choices.size() : type == 1 ? levels.size() : 2;
+    }
 };
 
 static std::string render_criterion(const json & v) {
@@ -314,37 +343,52 @@ static bool is_empty_criterion(const json & v) {
     return v.is_null() || (v.is_string() && v.get<std::string>().empty());
 }
 
+[[noreturn]] static void question_error(const std::string & id, const std::string & msg) {
+    throw std::invalid_argument("question '" + id + "': " + msg);
+}
+
+static bool is_blank(const std::string & s) {
+    return s.find_first_not_of(" \t\n\r\f\v") == std::string::npos;
+}
+
 // Agent._check_question + Agent._to_internal
 static laya_question parse_question(const std::string & id, const json & q) {
-    auto fail = [&](const std::string & msg) {
-        throw std::invalid_argument("question '" + id + "': " + msg);
-    };
-
+    if (is_blank(id)) {
+        throw std::invalid_argument("question id must be a non-empty string, got " + py_json_str(id));
+    }
     if (!q.is_object()) {
-        fail("definition must be an object");
+        question_error(id, "definition must be an object");
     }
 
     laya_question res;
     res.id = id;
 
-    const std::string type = q.value("type", "");
+    const json type = q.value("type", json());
     res.type = -1;
-    for (int t = 0; t < 3; ++t) {
-        if (type == QTYPE_NAMES[t]) {
+    for (int t = 0; t < 3 && type.is_string(); ++t) {
+        if (type.get<std::string>() == QTYPE_NAMES[t]) {
             res.type = t;
         }
     }
     if (res.type < 0) {
-        fail("unknown type '" + type + "'; use one of choice, noul, score");
+        question_error(id, "unknown type " + py_dumps(type) + "; use one of choice, noul, score");
     }
+
     if (!q.contains("instructions")) {
-        fail("no 'instructions'");
+        question_error(id, "no 'instructions'; add the text the model should answer");
     }
-    res.ins = q["instructions"].is_string() ? q["instructions"].get<std::string>() : py_dumps(q["instructions"]);
+    const json & ins = q["instructions"];
+    if (ins.is_null()) {
+        question_error(id, "'instructions' must not be null; add the text the model should answer");
+    }
+    if ((ins.is_string() && is_blank(ins.get<std::string>())) || ((ins.is_array() || ins.is_object()) && ins.empty())) {
+        question_error(id, "'instructions' must not be empty; add the text the model should answer");
+    }
+    res.ins = ins.is_string() ? ins.get<std::string>() : py_dumps(ins);
 
     const json crit = q.value("criteria", json());
     if (q.contains("labels") && res.type != 2) {
-        fail("'labels' is only supported for noul questions");
+        question_error(id, "'labels' is only supported for noul questions");
     }
 
     switch (res.type) {
@@ -352,61 +396,57 @@ static laya_question parse_question(const std::string & id, const json & q) {
             {
                 if (crit.is_array()) {
                     std::set<std::string> seen;
-                    res.crit = json::object();
                     for (const auto & label : crit) {
                         if (label.is_null() || label.is_array() || label.is_object()) {
-                            fail("a choice label must be a string, number or bool");
+                            question_error(id, "a choice label must be a string, number or bool");
                         }
                         if (!seen.insert(py_key_identity(label)).second) {
-                            fail("choice label " + py_dumps(label) + " repeats another label");
+                            question_error(id, "choice label " + py_dumps(label) + " repeats another label (1, 1.0 and true are one key)");
                         }
-                        res.labels.push_back(label);
-                        res.crit[py_json_key(label)] = nullptr;
+                        res.choices.emplace_back(label, nullptr);
                     }
                 } else if (crit.is_object()) {
-                    res.crit = crit;
                     for (const auto & [key, val] : crit.items()) {
-                        res.labels.push_back(key);
+                        res.choices.emplace_back(key, val);
                     }
                 } else {
-                    fail("a choice question takes 'criteria' as an object of label -> description, or a list of labels");
+                    question_error(id, "a choice question takes 'criteria' as an object of label -> description, or a list of labels");
                 }
-                if (res.labels.empty()) {
-                    fail("a choice question needs at least one criterion");
+                if (res.choices.empty()) {
+                    question_error(id, "a choice question needs at least one criterion");
                 }
             } break;
         case 1:
             {
                 if (!crit.is_array() || crit.empty()) {
-                    fail("a score question takes 'criteria' as a non-empty list of level descriptions");
+                    question_error(id, "a score question takes 'criteria' as a non-empty list of level descriptions");
                 }
                 for (const auto & c : crit) {
                     if (c.is_null()) {
-                        fail("score levels cannot be null");
+                        question_error(id, "score levels cannot be null");
                     }
                 }
-                res.crit = crit;
+                res.levels = crit;
             } break;
         case 2:
             {
-                res.crit = json::object();
                 if (crit.is_object()) {
                     for (const auto & [key, val] : crit.items()) {
                         std::string k = key;
                         std::transform(k.begin(), k.end(), k.begin(), ::tolower);
                         if (k != "true" && k != "false") {
-                            fail("a noul question takes 'criteria' keyed only 'true'/'false'");
+                            question_error(id, "a noul question takes 'criteria' keyed only 'true'/'false'");
                         }
-                        res.crit[k] = val;
+                        res.noul_crit[k] = val;
                     }
                 } else if (!crit.is_null()) {
-                    fail("a noul question takes 'criteria' as an object with optional 'true'/'false' descriptions");
+                    question_error(id, "a noul question takes 'criteria' as an object with optional 'true'/'false' descriptions");
                 }
                 if (q.contains("labels")) {
                     const json & labels = q["labels"];
                     if (!labels.is_object() || labels.size() != 2 || !labels.contains("false") || !labels.contains("true") ||
                         !labels["false"].is_string() || !labels["true"].is_string()) {
-                        fail("noul labels must map exactly 'false' and 'true' to distinct non-empty strings");
+                        question_error(id, "noul labels must map exactly 'false' and 'true' to distinct non-empty strings");
                     }
                     auto strip = [](std::string s) {
                         const auto b = s.find_first_not_of(" \t\n\r\f\v");
@@ -416,10 +456,27 @@ static laya_question parse_question(const std::string & id, const json & q) {
                     res.noul_false = strip(labels["false"].get<std::string>());
                     res.noul_true  = strip(labels["true"].get<std::string>());
                     if (res.noul_false.empty() || res.noul_true.empty() || res.noul_false == res.noul_true) {
-                        fail("noul labels must map exactly 'false' and 'true' to distinct non-empty strings");
+                        question_error(id, "noul labels must map exactly 'false' and 'true' to distinct non-empty strings");
                     }
                 }
             } break;
+    }
+
+    if (q.contains("option_order")) {
+        // slot s shows option order[s]: anything but a permutation would drop or repeat an option
+        const json & order = q["option_order"];
+        const size_t n = res.n_options();
+        bool ok = order.is_array() && order.size() == n;
+        std::vector<int> seen(n, 0);
+        for (size_t s = 0; ok && s < n; ++s) {
+            ok = order[s].is_number_integer() && order[s].get<int64_t>() >= 0 && order[s].get<int64_t>() < (int64_t) n && !seen[order[s].get<int64_t>()]++;
+            if (ok) {
+                res.option_order.push_back(order[s].get<int>());
+            }
+        }
+        if (!ok) {
+            question_error(id, "'option_order' must be a permutation of range(" + std::to_string(n) + ") -- one slot per option, each option once -- got " + py_dumps(order));
+        }
     }
 
     return res;
@@ -431,22 +488,20 @@ static std::vector<std::string> render_options(const laya_question & q) {
     switch (q.type) {
         case 0:
             {
-                size_t i = 0;
-                for (const auto & [key, val] : q.crit.items()) {
-                    const std::string label = py_str(q.labels[i++]);
-                    opts.push_back(is_empty_criterion(val) ? label : label + ": " + render_criterion(val));
+                for (const auto & [label, desc] : q.choices) {
+                    opts.push_back(is_empty_criterion(desc) ? py_str(label) : py_str(label) + ": " + render_criterion(desc));
                 }
             } break;
         case 1:
             {
-                for (size_t i = 0; i < q.crit.size(); ++i) {
-                    opts.push_back("level " + std::to_string(i) + ": " + render_criterion(q.crit[i]));
+                for (size_t i = 0; i < q.levels.size(); ++i) {
+                    opts.push_back("level " + std::to_string(i) + ": " + render_criterion(q.levels[i]));
                 }
             } break;
         case 2:
             {
-                const json f = q.crit.value("false", json());
-                const json t = q.crit.value("true",  json());
+                const json f = q.noul_crit.value("false", json());
+                const json t = q.noul_crit.value("true",  json());
                 opts.push_back(q.noul_false + ": " + (is_empty_criterion(f) ? "no, the statement does not hold" : render_criterion(f)));
                 opts.push_back(q.noul_true  + ": " + (is_empty_criterion(t) ? "yes, the statement holds"        : render_criterion(t)));
             } break;
@@ -476,11 +531,19 @@ static laya_item build_sequence(const laya_tokenizer & tok, const laya_question 
 
     std::vector<llama_token> head_ids = tok.tokenize(std::string(QTYPE_NAMES[q.type]) + " question: " + replace_all(q.ins, tok.mask_text, " "));
 
+    // slot s shows option option_order[s]
+    std::vector<int> order = q.option_order;
+    if (order.empty()) {
+        for (size_t i = 0; i < opts.size(); ++i) {
+            order.push_back(i);
+        }
+    }
+
     std::vector<std::vector<llama_token>> opt_ids;
     int n_opt_tokens = 0;
-    for (const auto & opt : opts) {
+    for (int i : order) {
         std::vector<llama_token> o = { tok.mask };
-        const auto opt_tokens = tok.tokenize(" " + replace_all(opt, tok.mask_text, " "), 48);
+        const auto opt_tokens = tok.tokenize(" " + replace_all(opts[i], tok.mask_text, " "), 48);
         o.insert(o.end(), opt_tokens.begin(), opt_tokens.end());
         n_opt_tokens += o.size();
         opt_ids.push_back(std::move(o));
@@ -634,9 +697,21 @@ static json decode_answer(const laya_config & cfg, const laya_question & q, cons
         p[i] = std::exp(p[i] - zmax);
         sum += p[i];
     }
-    size_t argmax = 0;
     for (size_t i = 0; i < k; ++i) {
         p[i] /= sum;
+    }
+
+    // the row comes back in slot order, everything below indexes by option (unpermute_probs)
+    if (q.option_order.size() == k) {
+        std::vector<double> canonical(k);
+        for (size_t s = 0; s < k; ++s) {
+            canonical[q.option_order[s]] = p[s];
+        }
+        p = canonical;
+    }
+
+    size_t argmax = 0;
+    for (size_t i = 0; i < k; ++i) {
         if (p[i] > p[argmax]) {
             argmax = i;
         }
@@ -661,10 +736,11 @@ static json decode_answer(const laya_config & cfg, const laya_question & q, cons
     switch (q.type) {
         case 0:
             {
-                ans["choice"] = q.labels[argmax];
+                ans["choice"] = q.choices[argmax].first;
+                // labels that are equal as JSON keys (1 and "1") share one entry, as json.dumps + loads would leave them
                 json probs = json::object();
                 for (size_t i = 0; i < k; ++i) {
-                    probs[py_json_key(q.labels[i])] = round4(p[i]);
+                    probs[py_json_key(q.choices[i].first)] = round4(p[i]);
                 }
                 ans["probabilities"] = probs;
                 ans["confidence"] = round4(confidence_from_probs(p));
@@ -678,8 +754,8 @@ static json decode_answer(const laya_config & cfg, const laya_question & q, cons
                 ans["score"] = round4(score);
                 json legend = json::object();
                 json probs  = json::object();
-                for (size_t i = 0; i < q.crit.size(); ++i) {
-                    legend[std::to_string(i)] = q.crit[i];
+                for (size_t i = 0; i < q.levels.size(); ++i) {
+                    legend[std::to_string(i)] = render_criterion(q.levels[i]);
                 }
                 for (size_t i = 0; i < k; ++i) {
                     probs[std::to_string(i)] = round4(p[i]);
