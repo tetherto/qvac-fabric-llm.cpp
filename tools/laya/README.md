@@ -45,6 +45,8 @@ The request holds one state or a list of states, and the questions to answer ove
 
 - `"states": [...]` instead of `"state"` returns a list with one result per state.
 - `"max_len"` and `"head_max_len"` override the checkpoint's token budgets.
+- A question's `"option_order"` (a permutation of its option indices) changes the order the options are shown in;
+  the answer still lists them in their original order.
 - A state can be a string, an object, or a list. Objects and lists are serialized as `json.dumps` would. Lists are
   conversations, so a list that does not fit keeps its newest turns.
 
