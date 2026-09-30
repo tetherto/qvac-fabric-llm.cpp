@@ -182,7 +182,10 @@ own - a one-token request after a long one is answered exactly as on its own.
 With `GGML_XDNA_GEMV_GROUP=0` the same series splits the one-token answers two
 ways: the first request of every process differs from the ones after it, by at
 most 2e-6 in a log-probability, and does so the same way in every process; the
-long ones are still one result.
+long ones are still one result. That series was on XRT 2.25.37. Older XRT is
+not supported: 2.21.75 has been seen to fail a ~1.2 GB host-memory BO
+allocation at startup, and the decode was not reproducible on that
+installation. The version is not checked at run time.
 
 Measure this on the logits, not on the generated text. The perturbation a
 nondeterministic read leaves is small enough that the argmax token is usually
@@ -212,7 +215,10 @@ as modified after every build.
 
 - Linux with an AMD NPU2 (XDNA2) device; it shows up as `/dev/accel/accel0` and
   in `xrt-smi examine`.
-- XRT 2.25.37 under `/opt/xilinx/xrt`, with its tools on the `PATH`.
+- XRT 2.25.37 under `/opt/xilinx/xrt`, with its tools on the `PATH`. Older XRT
+  is not supported: 2.21.75 has been seen to fail a ~1.2 GB host-memory BO
+  allocation at startup and the decode was not reproducible on that
+  installation. The version is not checked at run time.
 - libuuid development files (Ubuntu: `uuid-dev`). The XRT headers include
   `<uuid/uuid.h>` and the link needs `-luuid`; XRT does not bring either.
 - A Python interpreter with IRON (mlir-aie + llvm-aie) to compile the kernels.

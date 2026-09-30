@@ -131,6 +131,13 @@ struct a_layout {
     uint64_t            epoch = 0;
     xdna_buffer *       bo    = nullptr;
     size_t              cap   = 0;
+    // A one-slab layout's rows from z_rows on are zero in z_bo, for K z_K and
+    // z_nmb blocks: the next call of that geometry clears only the rows the
+    // last one wrote past its own M, not the whole slab again.
+    const xdna_buffer * z_bo   = nullptr;
+    int                 z_K    = 0;
+    int                 z_nmb  = 0;
+    int                 z_rows = 0;
 };
 
 // A's layout for M rows of K: whole pairs of 128-row blocks in slabs of an
@@ -166,12 +173,16 @@ struct a_geom {
 // them); in an odd half's rows each pair of K steps swapped, the order its
 // cores take them in. `row(m, o, sw)` writes row m, its K step st ^ sw at
 // o + st * MB * KS.
-template <class Row> bool lay_slab(const a_geom & ag, xdna_buffer * bo, int sl, int M, int K, Row row) {
+// `upto` rows of the slab are written (the rest are known to be zero
+// already); -1 is all of them.
+template <class Row> bool lay_slab(const a_geom & ag, xdna_buffer * bo, int sl, int M, int K, Row row, int upto = -1) {
     const int  nstep = K / KS;
     const int  m0 = sl * ag.slab * MBLK, nmb = ag.blocks(sl);
+    const int  nr = upto < 0 ? nmb * MBLK : std::min(upto, nmb * MBLK);
     uint16_t * ab = (uint16_t *) ((char *) bo->data + ag.base(sl));
-#pragma omp parallel for num_threads(xdna_host_threads())
-    for (int rr = 0; rr < nmb * MBLK; rr++) {
+    // a few rows are cheaper than waking the team
+#pragma omp parallel for num_threads(xdna_host_threads()) if (nr >= 32)
+    for (int rr = 0; rr < nr; rr++) {
         const int  m = m0 + rr;
         const int  b = rr / MBLK, hf = (rr % MBLK) / MB, r = rr % MB;
         uint16_t * o = ab + ((size_t) (hf * (nmb + 1) + b) * MB * K + (size_t) r * KS);
@@ -593,10 +604,22 @@ bool xdna_pgemm_supported(const ggml_tensor * op) {
     }
     const ggml_tensor * w = op->src[0];
     const ggml_tensor * a = op->src[1];
-    if (!w || !a || a->ne[1] < MB || a->type != GGML_TYPE_F32 || op->type != GGML_TYPE_F32) {
+    // Any M, not just a whole tile. A short prompt used to fall to the bf16
+    // GEMM, which packs every weight it touches into bf16 (two bytes a
+    // parameter) and keeps it for the life of the context: 9 GiB for a 9B on
+    // a 15-token prompt, which is what stopped a full context from fitting the
+    // host BOs. The kernel below handles M under its tile already - the rows
+    // past M are zeroed in A's layout, and the output of a call whose M is not
+    // a whole block leaves through the staging buffers, where the host copies
+    // only the M real rows.
+    if (!w || !a || a->ne[1] <= 0 || a->type != GGML_TYPE_F32 || op->type != GGML_TYPE_F32) {
         return false;
     }
-    if (w->ne[2] * w->ne[3] != 1 || a->ne[2] * a->ne[3] != 1 || w->ne[0] != a->ne[0]) {
+    // A contiguous activation of more than two dimensions is its rows one
+    // after another: ssm_out reads [d_inner, n_seq_tokens, n_seqs]. Taking it
+    // only when n_seqs is 1 put a request's ssm_out on the array alone and on
+    // the host beside other requests, so its logits changed with the batch.
+    if (w->ne[2] * w->ne[3] != 1 || w->ne[0] != a->ne[0] || ggml_nrows(op) != ggml_nrows(a)) {
         return false;
     }
     if (!ggml_is_contiguous(w) || !ggml_is_contiguous(a) || !ggml_is_contiguous(op)) {
@@ -646,7 +669,7 @@ bool pgemm_call(xdna_kernel_pool *  pool,
                 const pg_dst *      ov   = nullptr,
                 a_layout *          fuse = nullptr) {
     const xdna_gemv_geom & g     = ws->geom;
-    const int              M     = (int) a->ne[1];
+    const int              M     = (int) ggml_nrows(a);  // contiguous, so a row is nb[1] after the last
     const int              K     = g.K;
     const int              nch   = g.n_out();
     const int              objs  = nch * (glu ? 1 : 2);  // C objects a column's block
@@ -688,8 +711,9 @@ bool pgemm_call(xdna_kernel_pool *  pool,
             if (al->bo) {
                 xdna_buffer_free(al->bo);
             }
-            al->bo  = xdna_buffer_alloc(pool->device, need);
-            al->cap = al->bo ? need : 0;
+            al->bo   = xdna_buffer_alloc(pool->device, need);
+            al->cap  = al->bo ? need : 0;
+            al->z_bo = nullptr;  // new memory, and maybe the old pointer
         }
         al->src = nullptr;  // valid once every slab is laid out
     }
@@ -723,26 +747,45 @@ bool pgemm_call(xdna_kernel_pool *  pool,
     }
     // slab sl's rows (lay_slab)
     auto pack = [&](int sl) {
-        return lay_slab(ag, al->bo, sl, M, K, [&](int m, uint16_t * o, int sw) {
-            const float * row = (const float *) ((const char *) a->data + (size_t) m * a->nb[1]);
+        const auto row = [&](int m, uint16_t * o, int sw) {
+            const float * r = (const float *) ((const char *) a->data + (size_t) m * a->nb[1]);
             for (int st = 0; st < nstep; st++) {
-                bf16_row(row + (size_t) (st ^ sw) * KS, o + (size_t) st * MB * KS, KS);
+                bf16_row(r + (size_t) (st ^ sw) * KS, o + (size_t) st * MB * KS, KS);
             }
-        });
+        };
+        if (n_sl != 1) {
+            al->z_bo = nullptr;
+            return lay_slab(ag, al->bo, sl, M, K, row);
+        }
+        // A short M lays out a few rows of a 128-row block: the zero rows past
+        // it are left from the last call of this geometry, and only the rows
+        // it wrote past this M are cleared again.
+        const int  nmb   = blocks_of(0);
+        const bool known = al->z_bo == al->bo && al->z_K == K && al->z_nmb == nmb;
+        const bool ok    = lay_slab(ag, al->bo, sl, M, K, row, known ? std::max(M, al->z_rows) : -1);
+        al->z_bo         = ok ? al->bo : nullptr;
+        al->z_K          = K;
+        al->z_nmb        = nmb;
+        al->z_rows       = M;
+        return ok;
     };
     // C from a staging buffer (row-major, ldc_s floats a row) into dst, when
     // the array could not write dst itself
     auto unpack = [&](xdna_buffer * bo, int m0, int rows) {
-        if (!xdna_buffer_sync_from_device_range(bo, (size_t) rows * ldc_s * 4, 0)) {
+        // only the real rows: a short M would otherwise drop the cache over
+        // a whole 128-row block of staging (3 MB for a 6144-wide projection)
+        const int real = std::max(0, std::min(rows, M - m0));
+        if (real == 0) {
+            return true;
+        }
+        if (!xdna_buffer_sync_from_device_range(bo, (size_t) real * ldc_s * 4, 0)) {
             return false;
         }
         const float * c = (const float *) bo->data;
-#pragma omp parallel for num_threads(xdna_host_threads())
-        for (int r = 0; r < rows; r++) {
-            if (m0 + r < M) {
-                std::memcpy((char *) node->data + (size_t) (m0 + r) * node->nb[1], c + (size_t) r * ldc_s,
-                            (size_t) N * sizeof(float));
-            }
+#pragma omp parallel for num_threads(xdna_host_threads()) if (real >= 32)
+        for (int r = 0; r < real; r++) {
+            std::memcpy((char *) node->data + (size_t) (m0 + r) * node->nb[1], c + (size_t) r * ldc_s,
+                        (size_t) N * sizeof(float));
         }
         return true;
     };
@@ -976,7 +1019,7 @@ bool xdna_pgemm_norm_supported(const ggml_tensor * mul) {
     const int64_t       K = mul->ne[0];
     return x && x->type == GGML_TYPE_F32 && ggml_are_same_shape(x, mul) && ggml_are_same_shape(r, mul) &&
            x->nb[0] == sizeof(float) && ggml_is_contiguous(mul) && ggml_is_contiguous(g) && ggml_nelements(g) == K &&
-           mul->ne[2] * mul->ne[3] == 1 && K % KS == 0 && mul->ne[1] >= MB;
+           mul->ne[2] * mul->ne[3] == 1 && K % KS == 0;
 }
 
 bool xdna_pgemm_add_supported(const ggml_tensor * add, const ggml_tensor * mul) {
@@ -1232,8 +1275,8 @@ bool xdna_pgemm_run_gate(xdna_kernel_pool * pool, const ggml_tensor * g, const x
 
 bool xdna_pgemm_pair_supported(const ggml_tensor * a, const ggml_tensor * b) {
     if (!a || !b || a == b || !xdna_pgemm_supported(a) || !xdna_pgemm_supported(b) || a->src[1] != b->src[1] ||
-        a->src[0]->type != b->src[0]->type) {
-        return false;
+        a->src[0]->type != b->src[0]->type || a->src[1]->ne[2] * a->src[1]->ne[3] != 1) {
+        return false;  // the pair counts its rows in ne[1]
     }
     // one chunk for both, where each would stream all of A for its own; a
     // wider pair would give up C written straight into its nodes
