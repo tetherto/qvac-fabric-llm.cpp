@@ -37,6 +37,8 @@ static inline const float * xdna_attn_mm_row(const struct xdna_attn_rows * r, lo
     return r->base + (size_t) c * r->o_col + ((size_t) p * 4 + i0) * 4096 + (size_t) row * 128;
 }
 
+// A new graph: its mask may be the last one's memory rewritten.
+void xdna_attn_mm_graph_begin(void);
 void xdna_attn_mm_keep_clear(void);
 void xdna_attn_mm_keep(const struct ggml_tensor * node);
 bool xdna_attn_mm_rows(const struct ggml_tensor * node, struct xdna_attn_rows * rows);

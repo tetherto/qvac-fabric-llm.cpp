@@ -187,7 +187,12 @@ bool xdna_att_run(xdna_att *    a,
         if (!v.kern) {
             return false;  // the pool names the kernel it could not load
         }
-    } else if (!xdna_kernel_rewrite_insts(v.kern, words.data(), words.size())) {
+    }
+    // Every call, the first one included: the pool keys a kernel by its name,
+    // and one it already held under this name - an earlier layer's or object's
+    // at the same address, freed with the model state - carries that one's
+    // stream. Run as it was, a second context's first decode hung on it.
+    if (!xdna_kernel_rewrite_insts(v.kern, words.data(), words.size())) {
         return false;  // xdna-runtime names the stream and the reason
     }
     if (v.kbo != kbo || v.vbo != vbo) {
