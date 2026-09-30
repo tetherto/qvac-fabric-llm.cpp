@@ -91,6 +91,38 @@ REQUESTS = [
             "flag": {"type": "noul", "instructions": "The text\tcontains tabs."},
         },
     },
+    {
+        # labels of mixed JSON types, option_order on every question type, structured score levels,
+        # floats that need Python's repr in the serialized state
+        "states": [
+            {"amounts": [0.1, 1 / 3, 1e22, 123456789012345678.0, -0.0, 2.5e-8, 1.7976931348623157e308], "note": "refund please"},
+        ],
+        "questions": {
+            "mixed": {"type": "choice", "instructions": "Pick one", "criteria": [1, "1", "other"]},
+            "ordered": {"type": "choice", "instructions": "Which team?", "criteria": ["billing", "technical", "sales"],
+                        "option_order": [2, 0, 1]},
+            "levels": {"type": "score", "instructions": "How urgent?", "criteria": [1, {"desc": "high"}, "urgent"],
+                       "option_order": [1, 2, 0]},
+            "flipped": {"type": "noul", "instructions": "The customer asks for a refund.", "option_order": [1, 0]},
+        },
+    },
+]
+
+# question definitions both implementations must reject
+INVALID = [
+    ("", {"type": "noul", "instructions": "x"}),
+    ("q", {"type": 1, "instructions": "x"}),
+    ("q", {"type": "noul", "instructions": None}),
+    ("q", {"type": "noul", "instructions": "   "}),
+    ("q", {"type": "noul", "instructions": []}),
+    ("q", {"type": "noul", "instructions": {}}),
+    ("q", {"type": "choice", "instructions": "x", "criteria": [1, 1.0]}),
+    ("q", {"type": "choice", "instructions": "x", "criteria": [True, 1]}),
+    ("q", {"type": "choice", "instructions": "x", "criteria": ["a", "b"], "option_order": [0, 0]}),
+    ("q", {"type": "choice", "instructions": "x", "criteria": ["a", "b"], "option_order": [0]}),
+    ("q", {"type": "choice", "instructions": "x", "criteria": ["a", "b"], "option_order": [0.0, 1.0]}),
+    ("q", {"type": "noul", "instructions": "x", "option_order": [True, False]}),
+    ("q", {"type": "score", "instructions": "x", "criteria": ["a", None]}),
 ]
 
 
@@ -144,8 +176,15 @@ def compare_answers(ref, out, tol):
     mismatches = []
     for qid, a in ref["answers"].items():
         b = out["answers"][qid]
-        if a["type"] == "choice" and a["choice"] != b["choice"]:
+        if set(a) != set(b):
+            mismatches.append(f"{qid}: answer fields {sorted(a)} != {sorted(b)}")
+            continue
+        if a["type"] == "choice" and (a["choice"] != b["choice"] or type(a["choice"]) is not type(b["choice"])):
             mismatches.append(f"{qid}: choice {a['choice']!r} != {b['choice']!r}")
+        if a.get("legend") != b.get("legend"):
+            mismatches.append(f"{qid}: legend {a.get('legend')} != {b.get('legend')}")
+        if list(a.get("probabilities", {})) != list(b.get("probabilities", {})):
+            mismatches.append(f"{qid}: probability keys {list(a.get('probabilities', {}))} != {list(b.get('probabilities', {}))}")
         for key in ("score", "noul", "confidence", "answer_confidence"):
             if key in a:
                 worst = max(worst, abs(a[key] - b[key]))
@@ -206,6 +245,20 @@ def main():
 
         print(f"request {n}: {len(ref_rows)} rows, max |logit diff| {max_logit:.2e}, max rel act logit diff {max_act:.2e}, "
               f"max answer diff {worst:.4f}")
+
+    for qid, qdef in INVALID:
+        try:
+            agent._check_question(qid, qdef)
+            ref_ok = True
+        except ValueError:
+            ref_ok = False
+        proc = subprocess.run([args.bin, "-m", args.gguf, "-p", json.dumps({"state": "x", "questions": {qid: qdef}})] + args.extra,
+                              capture_output=True, text=True)
+        if ref_ok or proc.returncode == 0:
+            failed = True
+            print(f"FAIL invalid question {qid!r}: {qdef}: reference {'accepts' if ref_ok else 'rejects'}, "
+                  f"llama-laya {'accepts' if proc.returncode == 0 else 'rejects'}")
+    print(f"invalid questions: {len(INVALID)} checked")
 
     print("FAILED" if failed else "OK")
     return 1 if failed else 0
