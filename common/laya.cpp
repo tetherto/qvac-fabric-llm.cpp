@@ -808,7 +808,7 @@ void common_laya_context_params(llama_context_params & cparams, uint32_t n_batch
     cparams.n_ctx        = n_batch; // no KV cache: the context only has to hold one batch
     cparams.n_batch      = n_batch;
     cparams.n_ubatch     = n_batch; // the decision head needs every sequence in one ubatch
-    cparams.n_seq_max    = llama_max_parallel_sequences();
+    cparams.n_seq_max    = std::min<uint32_t>(llama_max_parallel_sequences(), n_batch); // at most one sequence per token
     cparams.kv_unified   = true;
 }
 
