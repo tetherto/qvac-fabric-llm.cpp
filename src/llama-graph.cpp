@@ -4096,6 +4096,11 @@ void llm_graph_context::build_pooling(
         return;
     }
 
+    // the arch graph already produced its own pooled output (e.g. the laya decision head)
+    if (res->t_embd_pooled) {
+        return;
+    }
+
     ggml_tensor * inp = res->t_embd;
 
     //// find result_norm tensor for input

@@ -164,6 +164,7 @@ TEXT_MODEL_MAP: dict[str, str] = {
     "KevModel": "lev",
     "LevModel": "lev",
     "NimbleModel": "lev",
+    "LayaDecisionModel": "bert",
     "Lfm25AudioTokenizer": "lfm2",
     "Lfm2BidirectionalForMaskedLM": "lfm2",
     "Lfm2BidirectionalModel": "lfm2",
