@@ -106,16 +106,20 @@ bool artifact_present() {
 // causal mask would be silently wrong: the positions before the ubatch are
 // read off its first row (llama pads n_kv past them, the padding masked),
 // and every row is checked all the way across. -1: not causal.
-int64_t mask_past(const ggml_tensor * m, int64_t n_kv, int64_t n_tokens) {
+int64_t mask_scan(const ggml_tensor * m, int64_t n_kv, int64_t n_tokens) {
     // m->data is null while the scheduler is still deciding: supports_op runs
     // before graph_reserve allocates, so reading the mask here would fault.
     if (!m || !m->data || m->type != GGML_TYPE_F16 || m->ne[0] < n_kv || m->ne[1] < n_tokens || m->ne[2] != 1 ||
         m->ne[3] != 1) {
         return -1;
     }
-    const ggml_fp16_t * row0  = (const ggml_fp16_t *) m->data;
-    int64_t             npast = -1;
-    while (npast + 1 < n_kv && ggml_fp16_to_fp32(row0[npast + 1]) == 0.0f) {
+    // On the f16 bits: a visible key is 0.0 (0x0000 or 0x8000), a hidden one
+    // below -1e30, which in f16 is only -inf (0xFC00). Converting each value
+    // to f32 cost pp4096 18% (1604 -> 1309 t/s): the whole mask, every
+    // attention layer of every ubatch, twice a node.
+    const uint16_t * row0  = (const uint16_t *) m->data;
+    int64_t          npast = -1;
+    while (npast + 1 < n_kv && (row0[npast + 1] & 0x7FFF) == 0) {
         npast++;
     }
     if (npast < 0 || npast + n_tokens > n_kv) {
@@ -124,16 +128,53 @@ int64_t mask_past(const ggml_tensor * m, int64_t n_kv, int64_t n_tokens) {
     // Every row, not a sample of three: the design derives its own causal mask
     // from the positions, so a row it would hide a key for has to be rejected.
     for (int64_t t = 0; t < n_tokens; t++) {
-        const ggml_fp16_t * row = (const ggml_fp16_t *) ((const char *) m->data + t * m->nb[1]);
-        for (int64_t j = 0; j < n_kv; j++) {
-            const float v       = ggml_fp16_to_fp32(row[j]);
-            const bool  visible = j <= npast + t;
-            if (visible ? v != 0.0f : !(v < -1.0e30f)) {
-                return -1;
-            }
+        const uint16_t * row = (const uint16_t *) ((const char *) m->data + t * m->nb[1]);
+        const int64_t    vis = npast + t + 1;
+        uint16_t         bad = 0;
+        for (int64_t j = 0; j < vis; j++) {
+            bad |= row[j] & 0x7FFF;
+        }
+        for (int64_t j = vis; j < n_kv; j++) {
+            bad |= row[j] ^ 0xFC00;
+        }
+        if (bad) {
+            return -1;
         }
     }
     return npast;
+}
+
+// Every attention layer of a graph reads the same mask, and each asks twice
+// (supported, then run): scanning it each time was 12 whole-mask passes an
+// ubatch on the 0.8B, n_tokens x n_kv values each - 8% of a 16k prompt's
+// prefill energy. The answer is kept for the graph (xdna_attn_mm_graph_begin
+// starts a new one: a new ubatch rewrites the mask in place).
+struct mask_memo {
+    std::mutex   mtx;
+    uint64_t     epoch = 1, at = 0;
+    const void * data  = nullptr;
+    int64_t      n_kv = 0, n_tokens = 0, ne0 = 0;
+    size_t       nb1    = 0;
+    int64_t      result = -1;
+} g_mask;
+
+int64_t mask_past(const ggml_tensor * m, int64_t n_kv, int64_t n_tokens) {
+    if (!m || !m->data) {
+        return -1;
+    }
+    std::lock_guard<std::mutex> lock(g_mask.mtx);
+    if (g_mask.at == g_mask.epoch && g_mask.data == m->data && g_mask.n_kv == n_kv && g_mask.n_tokens == n_tokens &&
+        g_mask.ne0 == m->ne[0] && g_mask.nb1 == m->nb[1]) {
+        return g_mask.result;
+    }
+    g_mask.result   = mask_scan(m, n_kv, n_tokens);
+    g_mask.at       = g_mask.epoch;
+    g_mask.data     = m->data;
+    g_mask.n_kv     = n_kv;
+    g_mask.n_tokens = n_tokens;
+    g_mask.ne0      = m->ne[0];
+    g_mask.nb1      = m->nb[1];
+    return g_mask.result;
 }
 
 xdna_bd linear_bd(uint32_t words) {
@@ -447,6 +488,11 @@ bool xdna_attn_mm_run(xdna_kernel_pool * pool, ggml_tensor * node) {
         xdna_kernel_pool_release_buffer(pool, bo_o);
     }
     return ok;
+}
+
+void xdna_attn_mm_graph_begin(void) {
+    std::lock_guard<std::mutex> lock(g_mask.mtx);
+    g_mask.epoch++;
 }
 
 void xdna_attn_mm_release(void) {

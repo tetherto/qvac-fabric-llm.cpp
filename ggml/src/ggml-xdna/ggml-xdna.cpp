@@ -2658,6 +2658,8 @@ static enum ggml_status xdna_graph_compute_impl(ggml_backend_xdna_context * ctx,
         ctx->att_flushed.clear();
         // and the prefill GEMM's activation layouts were the last graph's
         xdna_pgemm_graph_begin();
+        // as is the attention mask the prefill attention checked
+        xdna_attn_mm_graph_begin();
     }
 
     // Whole-call timer (GGML_XDNA_PROF=1): must be constructed right after
@@ -2873,7 +2875,7 @@ static enum ggml_status xdna_graph_compute_impl(ggml_backend_xdna_context * ctx,
     // (xdna_pgemm_glu_fused_supported), the cores write it as that
     // projection's A directly (glu_to_a).
     std::unordered_set<const struct ggml_tensor *> glu_fused, glu_to_a;
-    if (g_glue_n_tokens >= 64) {
+    if (g_glue_n_tokens > 1) {
         std::unordered_map<const struct ggml_tensor *, int>                        uses;
         std::unordered_map<const struct ggml_tensor *, const struct ggml_tensor *> reader;
         for (int i = 0; i < cgraph->n_nodes; i++) {
@@ -3057,7 +3059,7 @@ static enum ggml_status xdna_graph_compute_impl(ggml_backend_xdna_context * ctx,
 
     std::vector<mm_pair>                                   pairs;
     std::unordered_map<const struct ggml_tensor *, size_t> pair_of, pair_at;
-    if (g_glue_n_tokens >= 64) {
+    if (g_glue_n_tokens > 1) {
         auto free_mm = [&](const struct ggml_tensor * t) {
             return t->op == GGML_OP_MUL_MAT && !consumed.count(t) && !qkv_of.count(t) && !pair_of.count(t) &&
                    !(t->flags & GGML_TENSOR_FLAG_OUTPUT);
@@ -3103,7 +3105,7 @@ static enum ggml_status xdna_graph_compute_impl(ggml_backend_xdna_context * ctx,
     g_norm_mul.clear();
     xdna_gdn_mm_keep_clear();
     xdna_attn_mm_keep_clear();
-    if (g_glue_n_tokens >= 64) {
+    if (g_glue_n_tokens > 1) {
         std::unordered_map<const struct ggml_tensor *, std::vector<const struct ggml_tensor *>> readers;
         for (int i = 0; i < cgraph->n_nodes; i++) {
             const struct ggml_tensor * t = cgraph->nodes[i];
