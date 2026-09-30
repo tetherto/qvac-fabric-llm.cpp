@@ -67,6 +67,7 @@ def _fns(S: int, CS: int):
     flags = [f"-DDH={S}", f"-DROWS={ROWS}", "-DVEC=16",
              f"-DGDN_SCALE_F={_attn_scale(S)!r}f"]
     digest = hashlib.sha256((src + "".join(flags)).encode()).hexdigest()[:8]
+    strip_ty = np.ndarray[(ROWS * S,), np.dtype[bfloat16]]
     tok_t_ty = np.ndarray[(3 * S + 2,), np.dtype[bfloat16]]
     packed_ty = np.ndarray[(ROWS * S + CS * ROWS,), np.dtype[bfloat16]]
     token = ExternalFunction(
@@ -139,6 +140,7 @@ def ggml_xdna_gdn_prefill(
     token_fn, copy_fn = _fns(S, CS)
 
     tok_t_ty = np.ndarray[(tok_elems,), np.dtype[bfloat16]]
+    strip_ty = np.ndarray[(ROWS * S,), np.dtype[bfloat16]]
     packed_ty = np.ndarray[(packed_n,), np.dtype[bfloat16]]
 
     tok_col_n = hpc * CS * tok_elems
@@ -250,7 +252,7 @@ def _ref(q, k, v, g, beta, state):
 
 
 def _run_and_verify(opts) -> None:
-    S, H, CS, NC = opts.S, opts.heads, opts.CS, opts.chunks
+    S, H, CS, COLS, NC = opts.S, opts.heads, opts.CS, opts.cols, opts.chunks
     n_strips = S // ROWS
     tok_elems = 3 * S + 2
     packed_n = ROWS * S + CS * ROWS

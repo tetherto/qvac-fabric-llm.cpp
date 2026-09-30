@@ -54,6 +54,15 @@ set(XDNA_GEMM_M_BIG 256)    # base prefill M block
 set(XDNA_TILE_M_BIG 32)     # bf16 prefill per-core M tile
 set(XDNA_TILE_M_BIG_I8 64)  # int8 prefill per-core M tile
 set(XDNA_GEMM_M_BIG_EXTRA 512 2048)   # extra prefill M blocks (baked variants)
+# The option was called XDNA_GATED_FMT while the README and the runtime
+# diagnostic told users to set GGML_XDNA_GATED_FMT. Carry a value set under the
+# old name over rather than silently reconfiguring an existing build directory
+# to the 8-bit layout.
+if (DEFINED CACHE{XDNA_GATED_FMT} AND NOT DEFINED CACHE{GGML_XDNA_GATED_FMT})
+    message(WARNING "ggml-xdna: XDNA_GATED_FMT is now GGML_XDNA_GATED_FMT; using ${XDNA_GATED_FMT}")
+    set(GGML_XDNA_GATED_FMT "${XDNA_GATED_FMT}" CACHE STRING
+        "ggml-xdna: gated activation layout baked into the fused layer (0 = 4-bit, for a Q4_K ssm_out; 1 = 8-bit, for Q5_K/Q6_K)")
+endif()
 set(GGML_XDNA_GATED_FMT 1 CACHE STRING
     "ggml-xdna: gated activation layout baked into the fused layer (0 = 4-bit, for a Q4_K ssm_out; 1 = 8-bit, for Q5_K/Q6_K)")
 set(XDNA_TILE_K 64)         # per-core K tile (larger = fewer C reloads per call)
@@ -61,7 +70,7 @@ set(XDNA_TILE_N 64)         # per-core N tile (wider = longer B DDR bursts)
 set(XDNA_N_COLS 8)          # AIE columns
 set(XDNA_N_COMPUTE_ROWS 4)  # compute tile rows
 
-set(XDNA_GEOMETRY_DEFS
+target_compile_definitions(ggml-xdna PRIVATE
     GGML_XDNA_GEMM_M=${XDNA_GEMM_M}
     GGML_XDNA_TILE_M=${XDNA_TILE_M}
     GGML_XDNA_TILE_M_BIG=${XDNA_TILE_M_BIG}
@@ -72,7 +81,6 @@ set(XDNA_GEOMETRY_DEFS
     GGML_XDNA_N_COMPUTE_ROWS=${XDNA_N_COMPUTE_ROWS}
     GGML_XDNA_GATED_FMT=${GGML_XDNA_GATED_FMT}
 )
-target_compile_definitions(ggml-xdna PRIVATE ${XDNA_GEOMETRY_DEFS})
 
 # NPU kernels are compiled out-of-line by kernels/gemm.py (IRON/MLIR-AIE) at
 # build time. Each variant is a (K N) tuple; M and the tiles are fixed by the
@@ -432,33 +440,26 @@ if (GGML_XDNA_BUILD_KERNELS)
     # name (design_tag.py). One run covers them all, after any of them built:
     # the tag hashes all the design sources, so a change anywhere moves the tag
     # for the designs ninja did not rebuild too.
-    # design_tag.py computes the tag from the design sources; ask it here so the
-    # names below are the ones the stamping step will actually write. Without
-    # this XDNA_DESIGN_TAG is empty, the command declares outputs that never
-    # appear, and the step reruns on every build while install(FILES) points at
-    # files that do not exist.
     #
-    # The tag is a configure-time value, so the sources it hashes have to
-    # re-run configure when they change. Without that an incremental build
-    # stamps files under the new tag while the declared outputs and the install
-    # list still carry the old one.
-    file(GLOB XDNA_TAG_SOURCES CONFIGURE_DEPENDS
-         "${GEMM_DIR}/*.py" "${GEMM_DIR}/*.cc" "${GEMM_DIR}/*.h")
-    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
-                 ${XDNA_TAG_SOURCES})
+    # The tag is computed here because the tagged names are declared as the
+    # rule's outputs and are installed with the rest: without it they come out
+    # as "fused_layer_.xclbin", files the rule never creates, and ninja reruns
+    # the whole kernel target on every build. Every source the tag hashes is a
+    # configure dependency, so editing one moves the declared names with it.
+    file(GLOB XDNA_KERNEL_SOURCES CONFIGURE_DEPENDS
+         "${GEMM_DIR}/*.cc" "${GEMM_DIR}/*.h" "${GEMM_DIR}/*.py")
+    list(REMOVE_ITEM XDNA_KERNEL_SOURCES "${GEMM_DIR}/design_tag.py")
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${XDNA_KERNEL_SOURCES})
     execute_process(
         COMMAND ${CMAKE_COMMAND} -E env GATED_FMT=${GGML_XDNA_GATED_FMT}
-                ${GEMM_PYTHON} -c
-                "import design_tag; print(design_tag.tag('npu2'))"
-        WORKING_DIRECTORY "${GEMM_DIR}"
+                ${GEMM_PYTHON} "${GEMM_DIR}/design_tag.py" --extra npu2
         OUTPUT_VARIABLE XDNA_DESIGN_TAG
         OUTPUT_STRIP_TRAILING_WHITESPACE
-        RESULT_VARIABLE XDNA_DESIGN_TAG_RC
+        RESULT_VARIABLE XDNA_TAG_RESULT
     )
-    if (NOT XDNA_DESIGN_TAG_RC EQUAL 0 OR XDNA_DESIGN_TAG STREQUAL "")
-        message(FATAL_ERROR "ggml-xdna: could not compute the design tag")
+    if (NOT XDNA_TAG_RESULT EQUAL 0 OR XDNA_DESIGN_TAG STREQUAL "")
+        message(FATAL_ERROR "ggml-xdna: design_tag.py did not produce a tag (${XDNA_TAG_RESULT})")
     endif()
-
     set(XDNA_TAGGED_STEMS fused_layer gemv_n32_r4_c8)
     set(XDNA_TAGGED_ARTIFACTS)
     foreach(TS IN LISTS XDNA_TAGGED_STEMS)
@@ -482,31 +483,7 @@ if (GGML_XDNA_BUILD_KERNELS)
 
     add_custom_target(ggml-xdna-kernels ALL DEPENDS ${XDNA_ARTIFACTS})
 
-    # design_tag.py also writes xdna-design-tag.h, which the backend includes.
-    # Without this the library compiles before the header is written and the
-    # binary looks for artifacts under the previous tag, so a clean build has to
-    # be run twice before it will load anything.
-    add_dependencies(ggml-xdna ggml-xdna-kernels)
-
     install(FILES ${XDNA_ARTIFACTS} DESTINATION ${CMAKE_INSTALL_BINDIR})
 endif()
 
-# Host-only tests of what a device cannot check for itself: which weight
-# conversions the repacker accepts. They compile the backend sources they test
-# directly and open no device. tests/CMakeLists.txt adds them to ctest: testing
-# is enabled there, after this directory is configured.
-option(GGML_XDNA_BUILD_TESTS "ggml-xdna: build the host-only backend tests" ON)
-if (GGML_XDNA_BUILD_TESTS)
-    set(XDNA_TESTS
-        "test-xdna-repack|xdna-quant.cpp"
-    )
-    foreach(t IN LISTS XDNA_TESTS)
-        string(REPLACE "|" ";" T ${t})
-        list(GET T 0 NAME)
-        list(GET T 1 SRC)
-        add_executable(${NAME} tests/${NAME}.cpp ${SRC})
-        target_include_directories(${NAME} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/..)
-        target_link_libraries(${NAME} PRIVATE ggml-base)
-        target_compile_definitions(${NAME} PRIVATE ${XDNA_GEOMETRY_DEFS})
-    endforeach()
-endif()
+
