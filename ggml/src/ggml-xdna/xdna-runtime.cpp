@@ -12,29 +12,27 @@
 #include <chrono>
 #include <climits>
 #include <cstddef>
-#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#if defined(__x86_64__) || defined(__i386__)
+#include <immintrin.h>
+#endif
 #include <map>
 #include <memory>
+#include <thread>
 #include <mutex>
 #include <system_error>
 #include <unordered_set>
 #include <vector>
 
-#if defined(__x86_64__) || defined(__i386__)
-#include <immintrin.h>
-#endif
-
 namespace fs = std::filesystem;
 
-namespace {
 // A TXN stream is a 4-word header plus fixed-size instructions: word 2 is the
 // instruction count and word 3 the total size in bytes (xdna-seq.h). A stream
 // whose header does not describe it would dispatch garbage, so it is rejected
 // before anything reaches the device. `name` identifies the stream.
-bool insts_stream_ok(const char * name, const uint32_t * insts, size_t n_words) {
+bool xdna_insts_stream_ok(const char * name, const uint32_t * insts, size_t n_words) {
     const auto fail = [&](const char * reason, uint32_t n_instr, uint32_t bytes) {
         GGML_LOG_ERROR("%s: instruction stream %s: %s (%u instructions and %u bytes declared, %zu bytes actual)\n",
                        "xdna-runtime", name, reason, n_instr, bytes, n_words * sizeof(uint32_t));
@@ -51,7 +49,6 @@ bool insts_stream_ok(const char * name, const uint32_t * insts, size_t n_words) 
     }
     return true;
 }
-}  // namespace
 
 // NPU kernel ABI: arg 0 is the opcode, where 3 = RUN the instruction stream.
 static constexpr int XAIE_NPU_OPCODE_RUN = 3;
@@ -202,7 +199,7 @@ bool xdna_insts_read_file(const char * path, std::vector<uint32_t> & out) {
         out.clear();
         return false;
     }
-    if (!insts_stream_ok(path, out.data(), out.size())) {
+    if (!xdna_insts_stream_ok(path, out.data(), out.size())) {
         out.clear();
         return false;
     }
@@ -214,7 +211,7 @@ bool xdna_kernel_bind_insts(xdna_device * dev, xdna_kernel * kern, const uint32_
         GGML_LOG_ERROR("%s: bind insts: null device/kernel/insts or empty stream\n", "xdna-runtime");
         return false;
     }
-    if (!insts_stream_ok(kern->xclbin_name.c_str(), insts, n_words)) {
+    if (!xdna_insts_stream_ok(kern->xclbin_name.c_str(), insts, n_words)) {
         return false;
     }
     try {
@@ -252,7 +249,7 @@ bool xdna_kernel_rewrite_insts(xdna_kernel * kern, const uint32_t * insts, size_
                        kern->xclbin_name.c_str(), n_words, (long long) kern->insts_bytes);
         return false;
     }
-    if (!insts_stream_ok(kern->xclbin_name.c_str(), insts, n_words)) {
+    if (!xdna_insts_stream_ok(kern->xclbin_name.c_str(), insts, n_words)) {
         return false;
     }
     try {
@@ -287,7 +284,7 @@ void xdna_kernel_free(xdna_kernel * kern) {
 namespace {
 struct xdna_arena_state {
     std::vector<xdna_buffer *>              chunks;
-    std::unordered_set<const xdna_buffer *> views;      // handed out, not yet freed
+    std::unordered_set<const xdna_buffer *> views;  // handed out, not yet freed
     size_t                                  used  = 0;  // in the last chunk
     int                                     depth = 0;  // open xdna_arena_scope's
 };
@@ -456,15 +453,51 @@ bool xdna_buffer_sync_to_device_range(xdna_buffer * buf, size_t bytes, size_t of
     return buf && (bytes == 0 || xdna_bo_sync(buf->bo, XCL_BO_SYNC_BO_TO_DEVICE, bytes, offset));
 }
 
-// Write a range back through the caches. The pattern a mark leaves is written
-// by the host, so its lines are dirty; a device write to the same address can
-// be overtaken by them when they are evicted. Nothing else here needs this:
-// the host's own activation writes are read only by the array, which waits for
-// them, and a read leaves its lines clean.
+bool xdna_buffer_sync_from_device(xdna_buffer * buf) {
+    return buf && (buf->bytes == 0 || xdna_bo_sync(buf->bo, XCL_BO_SYNC_BO_FROM_DEVICE, buf->bytes, 0));
+}
+
+bool xdna_buffer_sync_from_device_range(xdna_buffer * buf, size_t bytes, size_t offset) {
+    return buf && (bytes == 0 || xdna_bo_sync(buf->bo, XCL_BO_SYNC_BO_FROM_DEVICE, bytes, offset));
+}
+
+// --- reading what the array wrote ------------------------------------------
+//
+// A dispatch reports completion before the last of its DMA writes is readable,
+// and a read taken in that window hands back - and caches - the previous
+// contents of the buffer. There is no host-side barrier for it: the completion
+// is honest, and the cache ioctl above does nothing on this platform for a
+// host_only BO. So the read has to tell a landed write from a pending one, and
+// that is what the pattern is for: mark the range before the dispatch, read
+// until the mark is gone.
+
+// Only whole words can carry the pattern.
+static size_t xdna_markable(size_t bytes) {
+    return bytes & ~(size_t) (sizeof(uint32_t) - 1);
+}
+
+static void xdna_poison_range(void * p, size_t bytes) {
+    uint32_t *   words = (uint32_t *) p;
+    const size_t n     = bytes / sizeof(uint32_t);
+    for (size_t i = 0; i < n; i++) {
+        words[i] = XDNA_POISON_F32;
+    }
+}
+
+static size_t xdna_poison_left(const void * p, size_t bytes) {
+    const uint32_t * words = (const uint32_t *) p;
+    const size_t     n     = bytes / sizeof(uint32_t);
+    size_t           left  = 0;
+    for (size_t i = 0; i < n; i++) {
+        left += (words[i] == XDNA_POISON_F32);
+    }
+    return left;
+}
+
 static void xdna_cache_writeback(void * p, size_t bytes) {
 #if defined(__x86_64__) || defined(__i386__)
     const size_t line = 64;
-    uintptr_t a = (uintptr_t) p & ~(uintptr_t) (line - 1);
+    uintptr_t    a    = (uintptr_t) p & ~(uintptr_t) (line - 1);
     const uintptr_t end = ((uintptr_t) p + bytes + line - 1) & ~(uintptr_t) (line - 1);
     for (; a < end; a += line) {
         _mm_clflush((const void *) a);
@@ -474,73 +507,6 @@ static void xdna_cache_writeback(void * p, size_t bytes) {
     (void) p;
     (void) bytes;
 #endif
-}
-
-static void xdna_poison_range(void * p, size_t bytes) {
-    uint32_t * words = (uint32_t *) p;
-    const size_t n = bytes / sizeof(uint32_t);
-    for (size_t i = 0; i < n; i++) {
-        words[i] = XDNA_POISON_F32;
-    }
-}
-
-static bool xdna_poison_any(const void * p, size_t bytes) {
-    const uint32_t * words = (const uint32_t *) p;
-    const size_t n = bytes / sizeof(uint32_t);
-#if defined(__x86_64__) || defined(__i386__)
-    const __m128i pat = _mm_set1_epi32((int) XDNA_POISON_F32);
-    size_t i = 0;
-    for (; i + 4 <= n; i += 4) {
-        const __m128i v = _mm_loadu_si128((const __m128i *) (words + i));
-        if (_mm_movemask_epi8(_mm_cmpeq_epi32(v, pat)) != 0) {
-            return true;
-        }
-    }
-    for (; i < n; i++) {
-        if (words[i] == XDNA_POISON_F32) {
-            return true;
-        }
-    }
-    return false;
-#else
-    for (size_t i = 0; i < n; i++) {
-        if (words[i] == XDNA_POISON_F32) {
-            return true;
-        }
-    }
-    return false;
-#endif
-}
-
-// The pattern is four bytes wide, so a range is marked and checked a word at a
-// time; a byte count that is not a multiple of four keeps its tail unmarked
-// and unread, which is what every caller reads anyway.
-static size_t xdna_markable(size_t bytes) {
-    return bytes & ~(size_t) (sizeof(uint32_t) - 1);
-}
-
-// The pass budget and its pause. Bounded by the drain, not by a guess: the
-// pattern is the evidence, and it disappears exactly when the device's write
-// lands. A pass is a pause, not a timer sleep - sleep_for(2us) costs a tick
-// and measures about 80us.
-static int xdna_settle_passes(void) {
-    static const int passes = xdna_env_int("GGML_XDNA_SETTLE_PASSES", 2000);
-    return passes;
-}
-
-static void xdna_settle_pause(void) {
-    static const int pause_loops = xdna_env_int("GGML_XDNA_SETTLE_PAUSE", 400);
-    for (int i = 0; i < pause_loops; i++) {
-#if defined(__x86_64__) || defined(__i386__)
-        _mm_pause();
-#endif
-    }
-}
-
-static void xdna_settle_give_up(size_t bytes, size_t offset) {
-    GGML_LOG_WARN("%s: %zu bytes at %zu still hold the mark after %d passes; "
-                  "the device has not written them\n",
-                  "xdna-runtime", bytes, offset, xdna_settle_passes());
 }
 
 void xdna_buffer_mark(xdna_buffer * buf, size_t bytes, size_t offset) {
@@ -556,39 +522,13 @@ void xdna_buffer_mark(xdna_buffer * buf, size_t bytes, size_t offset) {
     }
     uint8_t * base = (uint8_t *) buf->data + offset;
     xdna_poison_range(base, bytes);
+    // Written back, not left dirty: our own cache lines could otherwise land
+    // on top of what the device writes.
     xdna_cache_writeback(base, bytes);
 }
 
-bool xdna_buffer_download(xdna_buffer * buf, void * dst, size_t bytes,
-                          size_t offset) {
-    if (!buf || !dst || bytes == 0 || offset >= buf->bytes) {
-        return false;
-    }
-    if (bytes > buf->bytes - offset) {
-        bytes = buf->bytes - offset;
-    }
-    bytes = xdna_markable(bytes);
-    if (bytes == 0) {
-        return false;
-    }
-    uint8_t * base = (uint8_t *) buf->data + offset;
-    for (int pass = 0;; pass++) {
-        std::memcpy(dst, base, bytes);
-        if (!xdna_poison_any(dst, bytes)) {
-            return true;
-        }
-        if (pass >= xdna_settle_passes()) {
-            xdna_settle_give_up(bytes, offset);
-            return false;
-        }
-        xdna_settle_pause();
-        xdna_cache_writeback(base, bytes);
-    }
-}
-
-uint8_t * xdna_buffer_wait_written(xdna_buffer * buf, size_t bytes,
-                                   size_t offset) {
-    if (!buf || bytes == 0 || offset >= buf->bytes) {
+uint8_t * xdna_buffer_wait_written(xdna_buffer * buf, size_t bytes, size_t offset) {
+    if (!buf || !buf->data || bytes == 0 || offset >= buf->bytes) {
         return nullptr;
     }
     if (bytes > buf->bytes - offset) {
@@ -599,25 +539,64 @@ uint8_t * xdna_buffer_wait_written(xdna_buffer * buf, size_t bytes,
         return nullptr;
     }
     uint8_t * base = (uint8_t *) buf->data + offset;
+    static const int passes      = xdna_env_int("GGML_XDNA_SETTLE_PASSES", 2000);
+    static const int pause_loops = xdna_env_int("GGML_XDNA_SETTLE_PAUSE", 400);
     for (int pass = 0;; pass++) {
-        if (!xdna_poison_any(base, bytes)) {
+        if (xdna_poison_left(base, bytes) == 0) {
             return base;
         }
-        if (pass >= xdna_settle_passes()) {
-            xdna_settle_give_up(bytes, offset);
+        if (pass >= passes) {
+            GGML_LOG_WARN("%s: %zu bytes at %zu still hold the mark after %d "
+                          "passes; the device has not written them\n",
+                          "xdna-runtime", bytes, offset, passes);
             return nullptr;
         }
-        xdna_settle_pause();
-        xdna_cache_writeback(base, bytes);
+        for (int i = 0; i < pause_loops; i++) {
+#if defined(__x86_64__) || defined(__i386__)
+            _mm_pause();
+#endif
+        }
+        xdna_cache_writeback((void *) base, bytes);
     }
 }
 
-bool xdna_buffer_sync_from_device(xdna_buffer * buf) {
-    return buf && (buf->bytes == 0 || xdna_bo_sync(buf->bo, XCL_BO_SYNC_BO_FROM_DEVICE, buf->bytes, 0));
-}
-
-bool xdna_buffer_sync_from_device_range(xdna_buffer * buf, size_t bytes, size_t offset) {
-    return buf && (bytes == 0 || xdna_bo_sync(buf->bo, XCL_BO_SYNC_BO_FROM_DEVICE, bytes, offset));
+bool xdna_buffer_download(xdna_buffer * buf, void * dst, size_t bytes, size_t offset) {
+    if (!buf || !buf->data || !dst || bytes == 0 || offset >= buf->bytes) {
+        return false;
+    }
+    if (bytes > buf->bytes - offset) {
+        bytes = buf->bytes - offset;
+    }
+    bytes = xdna_markable(bytes);
+    if (bytes == 0) {
+        return false;
+    }
+    uint8_t * base = (uint8_t *) buf->data + offset;
+    // Bounded by the drain, not by a guess: the pattern is the evidence, and it
+    // disappears exactly when the device's write lands. A pass is a pause, not
+    // a timer sleep - sleep_for(2us) costs a tick and measures about 80us.
+    static const int passes      = xdna_env_int("GGML_XDNA_SETTLE_PASSES", 2000);
+    static const int pause_loops = xdna_env_int("GGML_XDNA_SETTLE_PAUSE", 400);
+    for (int pass = 0;; pass++) {
+        std::memcpy(dst, base, bytes);
+        if (xdna_poison_left(dst, bytes) == 0) {
+            return true;
+        }
+        if (pass >= passes) {
+            GGML_LOG_WARN("%s: %zu bytes at %zu still hold the mark after %d "
+                          "passes; the device has not written them\n",
+                          "xdna-runtime", bytes, offset, passes);
+            return false;
+        }
+        for (int i = 0; i < pause_loops; i++) {
+#if defined(__x86_64__) || defined(__i386__)
+            _mm_pause();
+#endif
+        }
+        // A platform whose device writes are not coherent with the CPU caches
+        // needs the read range dropped before looking again.
+        xdna_cache_writeback((void *) base, bytes);
+    }
 }
 
 bool xdna_buffer_read_settled(xdna_buffer * buf, void * dst, size_t bytes, size_t offset) {
@@ -667,9 +646,6 @@ static xrt::run make_run(xdna_kernel * kern, xdna_buffer ** args, size_t n_args)
     xrt::run run(kern->kernel);
     run.set_arg(0, XAIE_NPU_OPCODE_RUN);
     run.set_arg(1, kern->insts_bo);
-    // Instruction words, not bytes: the stream is a TXN blob that carries its
-    // own end, so a count four times too large ran anyway, but it is not what
-    // the argument means.
     run.set_arg(2, (uint32_t) (kern->insts_bytes / (int64_t) sizeof(uint32_t)));
     for (size_t i = 0; i < n_args; i++) {
         run.set_arg((int) (3 + i), args[i]->bo);
@@ -1172,39 +1148,68 @@ xrt::run xdna_kernel_run_start(xdna_kernel * kern, xdna_buffer ** args, size_t n
 }
 
 bool xdna_run_wait(xrt::run & run) {
-    try {
-        // Block, do not poll. Polling kept a core at full power for 70% of a
-        // decode token (it waits once a token for its whole queue, ~20 ms) -
-        // the host energy FLM does not spend - and bought nothing: blocking
-        // measured the same tok/s in the server, at 0.29 of the CPU time
-        // polling 200 us before blocking took. GGML_XDNA_SPIN_US polls that
-        // long first; -1 polls without limit, as it used to by default.
-        static const int spin_us = xdna_env_int("GGML_XDNA_SPIN_US", 0);
-        if (spin_us != 0) {
-            const auto until = std::chrono::steady_clock::now() + std::chrono::microseconds(spin_us < 0 ? 0 : spin_us);
-            for (;;) {
-                const ert_cmd_state s = run.state();
-                if (s == ERT_CMD_STATE_COMPLETED) {
-                    return true;
-                }
-                if (s == ERT_CMD_STATE_ERROR || s == ERT_CMD_STATE_ABORT || s == ERT_CMD_STATE_TIMEOUT) {
-                    GGML_LOG_ERROR("%s: kernel spin state %d\n", "xdna-runtime", (int) s);
-                    return false;
-                }
-                if (spin_us > 0 && std::chrono::steady_clock::now() >= until) {
-                    break;
+    // A signal interrupts the wait's own ioctl, and the shim answers that with
+    // an exception - "unexpected command state" - rather than a state. The
+    // command is still the array's, so the wait is retried while it is in
+    // flight: without this a Ctrl+C reads as a dead command, the decode fails
+    // and the tool reports an error instead of stopping.
+    for (int attempt = 0;; attempt++) {
+        try {
+            // Block, do not poll. Polling kept a core at full power for 70% of a
+            // decode token (it waits once a token for its whole queue, ~20 ms) -
+            // the host energy FLM does not spend - and bought nothing: blocking
+            // measured the same tok/s in the server, at 0.29 of the CPU time
+            // polling 200 us before blocking took. GGML_XDNA_SPIN_US polls that
+            // long first; -1 polls without limit, as it used to by default.
+            static const int spin_us = xdna_env_int("GGML_XDNA_SPIN_US", 0);
+            if (spin_us != 0) {
+                const auto until =
+                    std::chrono::steady_clock::now() + std::chrono::microseconds(spin_us < 0 ? 0 : spin_us);
+                for (;;) {
+                    const ert_cmd_state s = run.state();
+                    if (s == ERT_CMD_STATE_COMPLETED) {
+                        return true;
+                    }
+                    if (s == ERT_CMD_STATE_ERROR || s == ERT_CMD_STATE_ABORT || s == ERT_CMD_STATE_TIMEOUT) {
+                        GGML_LOG_ERROR("%s: kernel spin state %d\n", "xdna-runtime", (int) s);
+                        return false;
+                    }
+                    if (spin_us > 0 && std::chrono::steady_clock::now() >= until) {
+                        break;
+                    }
                 }
             }
+            const ert_cmd_state st = run.wait();
+            if (st != ERT_CMD_STATE_COMPLETED) {
+                GGML_LOG_ERROR("%s: kernel wait state %d\n", "xdna-runtime", (int) st);
+                return false;
+            }
+            return true;
+        } catch (const std::exception & e) {
+            ert_cmd_state state = ERT_CMD_STATE_NEW;
+            bool         known = false;
+            try {
+                state = run.state();
+                known = true;
+            } catch (...) {
+            }
+            if (known && state == ERT_CMD_STATE_COMPLETED) {
+                return true;
+            }
+            // A state that is dead is the old path; one still in flight is the
+            // interrupted wait, and that is retried.
+            if (known && (state == ERT_CMD_STATE_ERROR || state == ERT_CMD_STATE_ABORT ||
+                          state == ERT_CMD_STATE_TIMEOUT)) {
+                GGML_LOG_ERROR("%s: kernel wait exception: %s (state %d)\n", "xdna-runtime", e.what(), (int) state);
+                return false;
+            }
+            if (attempt >= 8) {
+                GGML_LOG_ERROR("%s: kernel wait exception: %s (state %d, %d retries)\n", "xdna-runtime", e.what(),
+                               known ? (int) state : -1, attempt);
+                return false;
+            }
+            std::this_thread::sleep_for(std::chrono::microseconds(200));
         }
-        const ert_cmd_state st = run.wait();
-        if (st != ERT_CMD_STATE_COMPLETED) {
-            GGML_LOG_ERROR("%s: kernel wait state %d\n", "xdna-runtime", (int) st);
-            return false;
-        }
-        return true;
-    } catch (const std::exception & e) {
-        GGML_LOG_ERROR("%s: kernel wait exception: %s\n", "xdna-runtime", e.what());
-        return false;
     }
 }
 

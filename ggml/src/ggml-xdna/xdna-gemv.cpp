@@ -1466,22 +1466,12 @@ bool xdna_gemv_pair_prep_raw(xdna_gemv_pair * p, const float * res, const float 
     return xdna_buffer_sync_to_device(p->a);
 }
 
-
-// The output a fused run left in the tail of the activation buffer.
-bool xdna_gemv_pair_out_from_tail(xdna_gemv_pair * p, float * out) {
-    if (!p || !out) {
-        return false;
-    }
-    return xdna_buffer_download(p->a, out, (size_t) p->g2.n_real * sizeof(float),
-                                p->o_tail_off);
-}
-
 // The parts of the activation buffer a fused run writes: the projection's
 // drain at the front of every g1 tile (the host writes the residual and gamma
 // past it, never the front) and the g2 output in the tail. Marked before the
 // run so that the reads that follow it can tell the drain from the previous
-// token's contents. The g2 activation region between them is set once at
-// create time and is never touched by either side again, so it stays out.
+// token's contents. The g2 activation region between them is set once at create
+// time and is never touched by either side again, so it stays out.
 void xdna_gemv_pair_mark_out(xdna_gemv_pair * p) {
     if (!p || !p->a) {
         return;
@@ -1492,7 +1482,6 @@ void xdna_gemv_pair_mark_out(xdna_gemv_pair * p) {
     }
     xdna_buffer_mark(p->a, (size_t) p->g2.n_real * sizeof(float), p->o_tail_off);
 }
-
 
 bool xdna_gemv_pair_dispatch(xdna_gemv_pair * p, float * out) {
     if (!p || !out) {
