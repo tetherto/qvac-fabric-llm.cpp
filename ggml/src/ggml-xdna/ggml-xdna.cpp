@@ -2580,9 +2580,8 @@ static void xdna_rec_session_free(xdna_rec_session * s) {
 
 // Release what was built from a model: the fused-layer sessions (their device
 // state, their packed weights, and host pointers into the model's tensors),
-// the per-op kernels' packed weights, and the decode arena their buffers were
-// carved out of. The kernel pool and the prefill runners hold no model data
-// and stay.
+// the per-op kernels' packed weights, the prefill GEMM's packed weights, and
+// the decode arena their buffers were carved out of. The kernel pool stays.
 static void xdna_release_model_state(ggml_backend_xdna_context * ctx) {
     const size_t n = ctx->rec.size();
     xdna_pending_wait(ctx);
@@ -2611,6 +2610,7 @@ static void xdna_release_model_state(ggml_backend_xdna_context * ctx) {
     ctx->res_dirty      = false;
     ctx->pending_failed = false;
     xdna_ops_release_weights(&ctx->ops);
+    xdna_pgemm_release();
     if (!xdna_arena_release()) {
         GGML_LOG_WARN("%s: the decode arena is still in use; kept\n", "ggml-xdna");
     }
