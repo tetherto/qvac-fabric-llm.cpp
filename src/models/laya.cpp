@@ -4,6 +4,7 @@
 #include <cinttypes>
 #include <cmath>
 #include <limits>
+#include <stdexcept>
 
 // Laya decision checkpoints: https://github.com/NandhaKishorM/laya
 //
@@ -15,7 +16,7 @@
 // blocks, and the hidden state at every [MASK] marker is scored into one logit per option. With
 // LLAMA_POOLING_TYPE_RANK every sequence yields n_cls_out = n_act + n_max_options floats:
 //
-//   [act logits (n_act), option logits in marker order (n_max_options, zero after the last option)]
+//   [act logits (n_act), option logits in marker order (n_max_options, zero after the sequence's last option)]
 
 void llama_model_laya::load_arch_hparams(llama_model_loader & ml) {
     llama_model_modern_bert::load_arch_hparams(ml);
@@ -30,7 +31,20 @@ void llama_model_laya::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_DECISION_MAX_OPTIONS, n_max_options);
     ml.get_arr(LLM_KV_DECISION_QTYPE_TOKENS, qtype_tokens);
 
-    GGML_ASSERT(qtype_tokens.size() == 3 && "laya: expected the tokens of the choice, score and noul question types");
+    if (qtype_tokens.size() != 3) {
+        throw std::runtime_error(format("laya: expected the first tokens of the 3 question types, got %zu", qtype_tokens.size()));
+    }
+    // the decision blocks are placed with the encoder layer of the same index
+    if (n_decision_layer > (uint32_t) hparams.n_layer()) {
+        throw std::runtime_error(format("laya: %u decision blocks, at most %u (the encoder layers) are supported", n_decision_layer, hparams.n_layer()));
+    }
+    if (n_act < 1 || n_act > 64) {
+        throw std::runtime_error(format("laya: act head with %u outputs, expected 1 to 64", n_act));
+    }
+    // at least 2 so that the top-2 features are defined, at most 255 as in the option-count feature
+    if (n_max_options < 2 || n_max_options > 255) {
+        throw std::runtime_error(format("laya: %u option slots, expected 2 to 255", n_max_options));
+    }
 
     hparams.n_cls_out = n_act + n_max_options;
 }
@@ -40,8 +54,13 @@ void llama_model_laya::load_arch_tensors(llama_model_loader & ml) {
 
     LLAMA_LOAD_LOCALS;
 
-    const int64_t n_ff_dec  = ml.get_tensor_meta(tn(LLM_TENSOR_DECISION_FFN_UP, "weight", 0).str().c_str())->ne[1];
-    const int64_t n_act_hid = ml.get_tensor_meta(tn(LLM_TENSOR_DECISION_ACT,    "weight").str().c_str())->ne[1];
+    // widths the reference hard-codes (4*d, 256), read from the tensors; a missing tensor is reported by create_tensor
+    auto width = [&](const LLM_TN_IMPL & name) -> int64_t {
+        const ggml_tensor * meta = ml.get_tensor_meta(name.str().c_str());
+        return meta ? meta->ne[1] : 0;
+    };
+    const int64_t n_ff_dec  = n_decision_layer > 0 ? width(tn(LLM_TENSOR_DECISION_FFN_UP, "weight", 0)) : 0;
+    const int64_t n_act_hid = width(tn(LLM_TENSOR_DECISION_ACT, "weight"));
 
     decision_type_embd = create_tensor(tn(LLM_TENSOR_DECISION_TYPE_EMBD, "weight"), {n_embd, 3}, 0);
 
@@ -79,6 +98,12 @@ void llama_model_laya::load_arch_tensors(llama_model_loader & ml) {
 
 std::unique_ptr<llm_graph_context> llama_model_laya::build_arch_graph(const llm_graph_params & params) const {
     return std::make_unique<graph>(*this, params);
+}
+
+// nn.LayerNorm in the reference head: PyTorch's default eps, independent of the encoder's
+static ggml_tensor * laya_head_norm(ggml_context * ctx, ggml_tensor * x, ggml_tensor * w, ggml_tensor * b) {
+    x = ggml_norm(ctx, x, 1e-5f);
+    return ggml_add(ctx, ggml_mul(ctx, x, w), b);
 }
 
 // most [MASK] markers in one sequence of the ubatch, at least 2 so that the top-2 features are defined
@@ -238,7 +263,7 @@ llama_model_laya::graph::graph(const llama_model & model, const llm_graph_params
 
         ggml_tensor * inpL = cur;
 
-        cur = build_norm(cur, layer.attn_norm, layer.attn_norm_b, LLM_NORM, il);
+        cur = laya_head_norm(ctx0, cur, layer.attn_norm, layer.attn_norm_b);
         cb(cur, "decision_attn_norm", il);
 
         ggml_tensor * qkv = build_lora_mm(layer.wqkv, cur);
@@ -263,7 +288,7 @@ llama_model_laya::graph::graph(const llama_model & model, const llm_graph_params
         ggml_tensor * ffn_inp = ggml_add(ctx0, cur, inpL);
         cb(ffn_inp, "decision_ffn_inp", il);
 
-        cur = build_norm(ffn_inp, layer.ffn_norm, layer.ffn_norm_b, LLM_NORM, il);
+        cur = laya_head_norm(ctx0, ffn_inp, layer.ffn_norm, layer.ffn_norm_b);
         cb(cur, "decision_ffn_norm", il);
 
         cur = build_ffn(cur,
@@ -280,16 +305,20 @@ llama_model_laya::graph::graph(const llama_model & model, const llm_graph_params
     if (decide) {
         // one logit per option marker, masked like logits.masked_fill(~marker_mask, -1e4)
         ggml_tensor * opt = ggml_get_rows(ctx0, cur, opt_rows);
-        opt = build_norm(opt, laya.decision_scorer_norm, laya.decision_scorer_norm_b, LLM_NORM, -1);
+        opt = laya_head_norm(ctx0, opt, laya.decision_scorer_norm, laya.decision_scorer_norm_b);
         opt = ggml_add(ctx0, build_lora_mm(laya.decision_scorer, opt), laya.decision_scorer_b);
         opt = ggml_gelu_erf(ctx0, opt);
         opt = ggml_add(ctx0, build_lora_mm(laya.decision_scorer_out, opt), laya.decision_scorer_out_b);
         opt = ggml_reshape_2d(ctx0, opt, n_opt, n_seqs);
-        opt = ggml_add(ctx0, ggml_mul(ctx0, opt, opt_keep), ggml_scale_bias(ctx0, opt_keep, 1e4f, -1e4f));
-        cb(opt, "decision_opt_logits", -1);
+
+        // the output keeps 0 in every slot past a sequence's options, whatever else shares the batch
+        ggml_tensor * opt_out = ggml_mul(ctx0, opt, opt_keep);
+        cb(opt_out, "decision_opt_logits", -1);
+
+        ggml_tensor * opt_masked = ggml_add(ctx0, opt_out, ggml_scale_bias(ctx0, opt_keep, 1e4f, -1e4f));
 
         // act features: top-1 probability, top-1 margin, normalized entropy, option count / 255
-        ggml_tensor * p = ggml_soft_max(ctx0, opt);
+        ggml_tensor * p = ggml_soft_max(ctx0, opt_masked);
 
         ggml_tensor * top = ggml_cont(ctx0, ggml_argsort_top_k(ctx0, p, 2));
         top = ggml_get_rows(ctx0, ggml_reshape_3d(ctx0, p, 1, n_opt, n_seqs), top);
@@ -315,7 +344,7 @@ llama_model_laya::graph::graph(const llama_model & model, const llm_graph_params
         act = ggml_add(ctx0, build_lora_mm(laya.decision_act_out, act), laya.decision_act_out_b);
         cb(act, "decision_act_logits", -1);
 
-        ggml_tensor * out = ggml_concat(ctx0, act, opt, 0);
+        ggml_tensor * out = ggml_concat(ctx0, act, opt_out, 0);
         out = ggml_pad(ctx0, out, hparams.n_cls_out - out->ne[0], 0, 0, 0);
         cb(out, "result_embd_pooled", -1);
 

@@ -5,6 +5,7 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstdio>
 #include <iomanip>
@@ -229,6 +230,9 @@ struct laya_tokenizer {
         cls       = llama_vocab_bos(vocab);
         sep       = llama_vocab_sep(vocab);
         mask      = llama_vocab_mask(vocab);
+        if (cls == LLAMA_TOKEN_NULL || sep == LLAMA_TOKEN_NULL || mask == LLAMA_TOKEN_NULL) {
+            throw std::invalid_argument("the model vocabulary has no [CLS], [SEP] or [MASK] token");
+        }
         mask_text = llama_vocab_get_text(vocab, mask);
         metaspace = llama_vocab_type(vocab) == LLAMA_VOCAB_TYPE_SPM;
 
@@ -433,7 +437,7 @@ static laya_question parse_question(const std::string & id, const json & q) {
                 if (crit.is_object()) {
                     for (const auto & [key, val] : crit.items()) {
                         std::string k = key;
-                        std::transform(k.begin(), k.end(), k.begin(), ::tolower);
+                        std::transform(k.begin(), k.end(), k.begin(), [](unsigned char c) { return (char) std::tolower(c); });
                         if (k != "true" && k != "false") {
                             question_error(id, "a noul question takes 'criteria' keyed only 'true'/'false'");
                         }
@@ -513,20 +517,25 @@ static std::vector<std::string> render_options(const laya_question & q) {
 // sequences
 //
 
-struct laya_item {
+// the part of a sequence that depends only on the question: [CLS] head [SEP] [MASK] opt0 [MASK] opt1 ... [SEP]
+struct laya_head {
     std::vector<llama_token> ids;
     std::vector<int32_t>     markers;
 
     size_t n_options          = 0;
     size_t n_options_distinct = 0;
     int    tokens_per_option  = -1; // -1: not capped
+};
+
+struct laya_item {
+    std::vector<llama_token> ids;
+    std::vector<int32_t>     markers;
 
     size_t state_tokens_dropped = 0;
 };
 
-// build_sequence
-static laya_item build_sequence(const laya_tokenizer & tok, const laya_question & q, const std::vector<llama_token> & state_ids,
-        int max_len, int head_max_len, bool truncate_left) {
+// build_sequence, up to the state
+static laya_head build_head(const laya_tokenizer & tok, const laya_question & q, int head_max_len) {
     const auto opts = render_options(q);
 
     std::vector<llama_token> head_ids = tok.tokenize(std::string(QTYPE_NAMES[q.type]) + " question: " + replace_all(q.ins, tok.mask_text, " "));
@@ -549,12 +558,12 @@ static laya_item build_sequence(const laya_tokenizer & tok, const laya_question 
         opt_ids.push_back(std::move(o));
     }
 
-    laya_item item;
+    laya_head head;
 
     int opt_budget = head_max_len - n_opt_tokens;
     if (opt_budget < 16) {
         const int per = std::max(4, (head_max_len - 16) / std::max<int>(1, opt_ids.size()));
-        item.tokens_per_option = per;
+        head.tokens_per_option = per;
         n_opt_tokens = 0;
         for (auto & o : opt_ids) {
             if ((int) o.size() > per) {
@@ -569,15 +578,30 @@ static laya_item build_sequence(const laya_tokenizer & tok, const laya_question 
         head_ids.resize(n_head);
     }
 
-    auto & ids = item.ids;
+    auto & ids = head.ids;
     ids.push_back(tok.cls);
     ids.insert(ids.end(), head_ids.begin(), head_ids.end());
     ids.push_back(tok.sep);
     for (const auto & o : opt_ids) {
-        item.markers.push_back(ids.size());
+        head.markers.push_back(ids.size());
         ids.insert(ids.end(), o.begin(), o.end());
     }
     ids.push_back(tok.sep);
+
+    head.n_options          = opt_ids.size();
+    head.n_options_distinct = std::set<std::vector<llama_token>>(opt_ids.begin(), opt_ids.end()).size();
+
+    return head;
+}
+
+// build_sequence: the question head, then as much of the state as fits, then [SEP], cut at max_len
+static laya_item build_sequence(const laya_head & head, const std::vector<llama_token> & state_ids, llama_token sep,
+        int max_len, bool truncate_left) {
+    laya_item item;
+    item.ids     = head.ids;
+    item.markers = head.markers;
+
+    auto & ids = item.ids;
 
     const size_t room = std::max<int>(0, max_len - (int) ids.size() - 1);
     const size_t n_st = std::min(room, state_ids.size());
@@ -587,15 +611,12 @@ static laya_item build_sequence(const laya_tokenizer & tok, const laya_question 
     } else {
         ids.insert(ids.end(), state_ids.begin(), state_ids.begin() + n_st);
     }
-    ids.push_back(tok.sep);
+    ids.push_back(sep);
 
     if ((int) ids.size() > max_len) {
         ids.resize(max_len);
     }
     item.markers.erase(std::remove_if(item.markers.begin(), item.markers.end(), [&](int32_t m) { return m >= max_len; }), item.markers.end());
-
-    item.n_options          = opt_ids.size();
-    item.n_options_distinct = std::set<std::vector<llama_token>>(opt_ids.begin(), opt_ids.end()).size();
 
     return item;
 }
@@ -791,14 +812,21 @@ void common_laya_context_params(llama_context_params & cparams, uint32_t n_batch
     cparams.kv_unified   = true;
 }
 
-struct laya_row {
-    size_t    state;
-    size_t    question;
-    size_t    state_tokens;
-    laya_item item;
+struct common_laya {
+    llama_context * ctx;
+
+    laya_tokenizer tok;
+    laya_config    cfg;
+
+    int    n_act;
+    size_t n_max_options;
 };
 
-static common_laya_result laya_predict(llama_context * ctx, const json & request) {
+void common_laya_deleter::operator()(common_laya * laya) {
+    delete laya;
+}
+
+common_laya_ptr common_laya_init(llama_context * ctx) {
     const llama_model * model = llama_get_model(ctx);
 
     char arch[64] = {};
@@ -810,19 +838,44 @@ static common_laya_result laya_predict(llama_context * ctx, const json & request
         throw std::invalid_argument("the context must use LLAMA_POOLING_TYPE_RANK, see common_laya_context_params");
     }
 
-    const int n_batch = std::min(llama_n_batch(ctx), llama_n_ubatch(ctx));
-
-    const int n_cls_out = llama_model_n_cls_out(model);
     int n_act = 0;
     {
         char buf[32] = {};
         llama_model_meta_val_str(model, "laya.decision.act_count", buf, sizeof(buf));
         n_act = std::atoi(buf);
     }
-    const size_t n_max_options = n_cls_out - n_act;
+    const int n_cls_out = llama_model_n_cls_out(model);
+    if (n_act < 1 || n_cls_out <= n_act) {
+        throw std::invalid_argument("the model has " + std::to_string(n_cls_out) + " outputs per sequence for " + std::to_string(n_act) + " act outputs");
+    }
 
-    const laya_tokenizer tok(llama_model_get_vocab(model));
-    const laya_config    cfg = load_config(model);
+    return common_laya_ptr(new common_laya {
+        /*.ctx           =*/ ctx,
+        /*.tok           =*/ laya_tokenizer(llama_model_get_vocab(model)),
+        /*.cfg           =*/ load_config(model),
+        /*.n_act         =*/ n_act,
+        /*.n_max_options =*/ (size_t) (n_cls_out - n_act),
+    });
+}
+
+struct laya_row {
+    size_t    state;
+    size_t    question;
+    size_t    state_tokens;
+    laya_item item;
+};
+
+static common_laya_result laya_predict(const common_laya & laya, const json & request) {
+    llama_context * ctx = laya.ctx;
+
+    const laya_tokenizer & tok = laya.tok;
+    const laya_config    & cfg = laya.cfg;
+
+    const int    n_act         = laya.n_act;
+    const size_t n_max_options = laya.n_max_options;
+    const int    n_cls_out     = n_act + (int) n_max_options;
+
+    const int n_batch = std::min(llama_n_batch(ctx), llama_n_ubatch(ctx));
 
     if (!request.is_object()) {
         throw std::invalid_argument("the request must be an object");
@@ -850,9 +903,15 @@ static common_laya_result laya_predict(llama_context * ctx, const json & request
         throw std::invalid_argument("questions must be an object of question id -> definition");
     }
 
+    // everything up to the state depends only on the question
     std::vector<laya_question> questions;
+    std::vector<laya_head>     heads;
     for (const auto & [id, qdef] : qdefs.items()) {
         questions.push_back(parse_question(id, qdef));
+        heads.push_back(build_head(tok, questions.back(), head_max_len));
+        if (heads.back().n_options > n_max_options) {
+            throw std::invalid_argument("question '" + id + "' has more than " + std::to_string(n_max_options) + " options");
+        }
     }
 
     // Agent._encode_state
@@ -866,12 +925,9 @@ static common_laya_result laya_predict(llama_context * ctx, const json & request
         const auto state_ids = tok.tokenize(replace_all(text, tok.mask_text, " "));
 
         for (size_t qi = 0; qi < questions.size(); ++qi) {
-            laya_item item = build_sequence(tok, questions[qi], state_ids, max_len, head_max_len, truncate_left);
-            if (item.markers.size() != render_options(questions[qi]).size()) {
+            laya_item item = build_sequence(heads[qi], state_ids, tok.sep, max_len, truncate_left);
+            if (item.markers.size() != heads[qi].n_options) {
                 throw std::invalid_argument("question '" + questions[qi].id + "' options exceed head_max_len=" + std::to_string(head_max_len));
-            }
-            if (item.markers.size() > n_max_options) {
-                throw std::invalid_argument("question '" + questions[qi].id + "' has more than " + std::to_string(n_max_options) + " options");
             }
             if ((int) item.ids.size() > n_batch) {
                 throw std::invalid_argument("a sequence of " + std::to_string(item.ids.size()) + " tokens does not fit the batch size " + std::to_string(n_batch));
@@ -965,11 +1021,12 @@ static common_laya_result laya_predict(llama_context * ctx, const json & request
                 truncated_questions.push_back(q.id);
             }
 
-            if (item.n_options_distinct < item.n_options) {
+            const auto & head = heads[rows[r].question];
+            if (head.n_options_distinct < head.n_options) {
                 collapsed[q.id] = {
-                    { "total",             item.n_options },
-                    { "distinct",          item.n_options_distinct },
-                    { "tokens_per_option", item.tokens_per_option < 0 ? json() : json(item.tokens_per_option) },
+                    { "total",             head.n_options },
+                    { "distinct",          head.n_options_distinct },
+                    { "tokens_per_option", head.tokens_per_option < 0 ? json() : json(head.tokens_per_option) },
                 };
             }
         }
@@ -994,17 +1051,17 @@ static common_laya_result laya_predict(llama_context * ctx, const json & request
     return res;
 }
 
-common_laya_result common_laya_predict(llama_context * ctx, const json & request) {
+common_laya_result common_laya_predict(const common_laya * laya, const json & request) {
     try {
-        return laya_predict(ctx, request);
+        return laya_predict(*laya, request);
     } catch (const json::exception & e) {
         // a value of the wrong type in the request
         throw std::invalid_argument(e.what());
     }
 }
 
-void common_laya_warmup(llama_context * ctx) {
-    common_laya_predict(ctx, {
+void common_laya_warmup(const common_laya * laya) {
+    common_laya_predict(laya, {
         { "state",     "warmup" },
         { "questions", { { "warmup", { { "type", "noul" }, { "instructions", "warmup" } } } } },
     });
