@@ -689,8 +689,9 @@ static int save_models(const llm_arch target_arch, const size_t seed, const int 
     return 0;
 }
 
-// A unified cache has one cell-to-block map for every sequence. Image patches can share a
-// temporal position, so until QSA has sequence-local ranks this configuration must stay dense.
+// A unified cache holds every sequence, but QSA pools each sequence's cells in its own order, and image
+// patches sharing a temporal position get distinct ranks. With every block inside the budget the sparse
+// path must then match dense attention.
 static int test_qsa_unified_multiseq(size_t seed) {
     struct observed_nodes {
         bool top_k = false;
@@ -772,10 +773,10 @@ static int test_qsa_unified_multiseq(size_t seed) {
     const auto actual   = decode(sparse.second.get(), image);
     const auto expected = decode(dense.second.get(), image);
 
-    GGML_ASSERT(!observed.top_k);
+    GGML_ASSERT(observed.top_k);
     GGML_ASSERT(nmse(actual, expected) < 1e-8);
 
-    printf("QSA unified multi-sequence fallback test passed\n");
+    printf("QSA unified multi-sequence test passed\n");
     return 0;
 }
 
