@@ -14576,6 +14576,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // overflow: n_tokens > K — only the last K snapshots kept.
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 32,   8, 1, 1, false, false, /*K=*/3));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64,  16, 2, 1, false, false, /*K=*/4));
+    // chunked MMA head plus serial snapshot tail; 70 tokens at K=8 leaves the head below the chunked minimum.
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128,  72, 1, 3, false, false, /*K=*/8));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128,  70, 1, 3, false, false, /*K=*/8));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 520, 1, 2, false, false, /*K=*/4));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 513, 2, 3, false, false, /*K=*/8));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 200, 2, 2, true,  false, /*K=*/4));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 130, 2, 1, false, false, /*K=*/4, false, false, true));
 
     // gdn + cache cpy fusion (K > 1)
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 4, 32,   2, 1, 2));
@@ -14585,6 +14592,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 4, 32,   8, 1, 4));
     // K == 1 prefill with head_size 128 selects the Metal MLX C8 kernel
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 16, 128, 65, 1, 1));
+    // chunked head plus serial snapshot tail
+    test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 16, 128,  72, 1, 8));
+    test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 16, 128, 200, 2, 4));
 
     // head sizes spanning the backend threadgroup-shape decisions (columns per thread,
     // threads per threadgroup); every power of two the backends accept.
