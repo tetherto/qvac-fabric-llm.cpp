@@ -754,9 +754,13 @@ class DFlashModel(Qwen3Model):
             return False
         with open(self.target_model_dir / "config.json", "r", encoding="utf-8") as f:
             cfg = json.load(f)
-        cfg = cfg.get("text_config", cfg)
-        rope = cfg.get("rope_parameters") or cfg.get("rope_scaling") or {}
-        return "mrope_section" in rope
+        text_cfg = {**cfg, **cfg.get("text_config", {})}
+        rope = text_cfg.get("rope_parameters") or text_cfg.get("rope_scaling") or {}
+        if "mrope_section" in rope:
+            return True
+        # targets such as Qwen3.5 write default M-RoPE sections when their config omits them
+        from . import get_model_class
+        return issubclass(get_model_class(get_model_architecture(cfg, ModelType.TEXT)), _Qwen35MRopeMixin)
 
     @classmethod
     def filter_tensors(cls, item: tuple[str, Callable[[], Tensor]]) -> tuple[str, Callable[[], Tensor]] | None:

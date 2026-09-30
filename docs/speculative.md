@@ -86,6 +86,7 @@ llama-server -m Qwen3.8-27B.gguf -md Qwen3.8-27B-DFlash2.gguf \
 ```
 
 The target GGUF must use the same tokenizer as the draft.
+Reconvert older DFlash2 GGUFs for image or video inputs; the draft needs the target's M-RoPE metadata.
 
 See:
 
