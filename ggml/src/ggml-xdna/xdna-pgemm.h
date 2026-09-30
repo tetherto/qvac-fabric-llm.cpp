@@ -22,6 +22,10 @@ bool xdna_pgemm_supported(const struct ggml_tensor * op);
 // share an input belong to the previous one.
 void xdna_pgemm_graph_begin(void);
 
+// Drop the packed weights. They are keyed by a tensor's data pointer, which
+// does not survive the model that owned it.
+void xdna_pgemm_release(void);
+
 // Run `node` to completion and write its f32 output.
 bool xdna_pgemm_run(struct xdna_kernel_pool * pool, struct ggml_tensor * node);
 

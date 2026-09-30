@@ -647,6 +647,15 @@ void xdna_pgemm_graph_begin(void) {
     g_pg.unwritten.clear();
 }
 
+void xdna_pgemm_release(void) {
+    std::lock_guard<std::mutex> lock(g_pg.mtx);
+    for (auto & kv : g_pg.w) {
+        xdna_buffer_free(kv.second.bo);
+        kv.second.bo = nullptr;
+    }
+    g_pg.w.clear();
+}
+
 namespace {
 
 // One call: C (M x N, f32, into `node`) = A (a, M x K) times the packed
