@@ -122,7 +122,9 @@ pip install torch "transformers>=5" git+https://github.com/NandhaKishorM/laya
 python tools/laya/compare-laya.py --model-dir laya-multilingual --gguf laya-multilingual-f16.gguf --bin build/bin/llama-laya --ngl 99
 ```
 
-The script requires the token sequences to be identical, then compares the raw logits and the decoded answers.
+The script requires identical token sequences and option marker positions, then checks the raw option and act logits
+and the decoded answers against tolerances. The defaults hold for f32 weights on CPU and CUDA; for f16 weights pass
+wider ones, e.g. `--logit-tol 0.15 --act-tol 0.01 --tol 0.015`. It also checks that malformed questions are rejected.
 
 ## Not supported
 

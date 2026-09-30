@@ -7,23 +7,29 @@
 // - the encoder is ModernBert's: with no decision blocks and a zero type embedding, the per-token
 //   output of a laya model equals the one of a modern-bert model with the same weights
 // - models with invalid decision metadata fail to load instead of aborting
+// - requests through common_laya_predict (common/laya.h): the response structure, the sequence layout, the
+//   calibration and option_order decoding against the raw outputs, batch packing, truncation, and
+//   malformed requests
 //
 // usage: test-laya [directory for the generated models]
 
 #include "ggml.h"
 #include "gguf.h"
+#include "laya.h"
 #include "llama.h"
+
+#include <nlohmann/json.hpp>
 
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <random>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
 // tiny model
-static const int n_vocab       = 40;
 static const int n_embd        = 64;
 static const int n_head        = 2;
 static const int n_layer       = 3;
@@ -32,8 +38,44 @@ static const int n_act         = 2;
 static const int n_act_hidden  = 16;
 static const int n_max_options = 8;
 
-// vocabulary: specials, the three question-type tokens, byte for '\n', then filler
-enum : llama_token { T_PAD = 0, T_SEP = 1, T_CLS = 2, T_UNK = 3, T_MASK = 4, T_CHOICE = 5, T_SCORE = 6, T_NOUL = 7, T_NL = 8, T_WORD = 9 };
+// vocabulary: specials, the three question-type tokens, then the byte tokens (T_WORD on, also used as filler)
+enum : llama_token { T_PAD = 0, T_SEP = 1, T_CLS = 2, T_UNK = 3, T_MASK = 4, T_CHOICE = 5, T_SCORE = 6, T_NOUL = 7, T_WORD = 8 };
+
+#define SP "\xe2\x96\x81" // U+2581, the SPM space
+
+struct vocab_entry {
+    std::string text;
+    float       score;
+    int32_t     type; // 1 normal, 3 control, 6 byte
+};
+
+// a byte-fallback SPM vocabulary like mmBERT's: every byte, the letters, and merges that form
+// "\u2581choice", "\u2581score" and "\u2581noul", so that real text tokenizes and each question starts
+// with its type token
+static std::vector<vocab_entry> make_vocab() {
+    std::vector<vocab_entry> v = {
+        { "<pad>", 0, 3 }, { "<eos>", 0, 3 }, { "<bos>", 0, 3 }, { "<unk>", 0, 3 }, { "<mask>", 0, 3 },
+        { SP "choice", 10, 1 }, { SP "score", 10, 1 }, { SP "noul", 10, 1 },
+    };
+    for (int b = 0; b < 256; ++b) {
+        char buf[8];
+        snprintf(buf, sizeof(buf), "<0x%02X>", b);
+        v.push_back({ buf, 0, 6 });
+    }
+    v.push_back({ SP, -1, 1 });
+    for (char c = 'a'; c <= 'z'; ++c) {
+        v.push_back({ std::string(1, c), -1, 1 });
+    }
+    for (const char * word : { "choice", "score", "noul" }) {
+        const std::string w = word;
+        for (size_t n = 1; n < w.size(); ++n) {
+            v.push_back({ SP + w.substr(0, n), 10, 1 });
+        }
+    }
+    return v;
+}
+
+static const int n_vocab = (int) make_vocab().size();
 
 static int n_failed = 0;
 
@@ -78,22 +120,17 @@ static void write_model(const std::string & path, const model_desc & desc) {
         gguf_set_val_u32 (gguf, "laya.decision.act_count",   desc.act_count);
         gguf_set_val_u32 (gguf, "laya.decision.max_options", desc.max_options);
         gguf_set_arr_data(gguf, "laya.decision.qtype_tokens", GGUF_TYPE_INT32, qtype_tokens, desc.n_qtype_tokens);
-        gguf_set_val_str (gguf, "laya.decision.config", R"({"max_len": 128, "head_max_len": 64, "temperature": [1.0, 1.0, 1.0]})");
+        gguf_set_val_str (gguf, "laya.decision.config", R"({"max_len": 512, "head_max_len": 128, "temperature": [1.0, 1.0, 1.0]})");
     }
 
-    std::vector<std::string> tokens = { "<pad>", "<eos>", "<bos>", "<unk>", "<mask>", "\xe2\x96\x81" "choice", "\xe2\x96\x81" "score", "\xe2\x96\x81" "noul", "<0x0A>" };
-    std::vector<float>   scores;
-    std::vector<int32_t> types;
-    for (int i = (int) tokens.size(); i < n_vocab; ++i) {
-        tokens.push_back("\xe2\x96\x81" "w" + std::to_string(i));
-    }
-    for (int i = 0; i < n_vocab; ++i) {
-        scores.push_back(-(float) i);
-        types.push_back(i <= T_MASK ? 3 /* control */ : i == T_NL ? 6 /* byte */ : 1 /* normal */);
-    }
+    const auto vocab = make_vocab();
     std::vector<const char *> token_ptrs;
-    for (const auto & t : tokens) {
-        token_ptrs.push_back(t.c_str());
+    std::vector<float>        scores;
+    std::vector<int32_t>      types;
+    for (const auto & e : vocab) {
+        token_ptrs.push_back(e.text.c_str());
+        scores.push_back(e.score);
+        types.push_back(e.type);
     }
     gguf_set_val_str (gguf, "tokenizer.ggml.model", "llama");
     gguf_set_val_str (gguf, "tokenizer.ggml.pre",   "default");
@@ -290,6 +327,306 @@ static bool all_finite(const std::vector<float> & v) {
     return true;
 }
 
+//
+// requests through common_laya_predict
+//
+
+using json = nlohmann::ordered_json;
+
+struct laya_env {
+    llama_model   * model = nullptr;
+    llama_context * ctx   = nullptr;
+
+    laya_env(const std::string & path, uint32_t n_batch, enum llama_pooling_type pooling = LLAMA_POOLING_TYPE_RANK) {
+        llama_model_params mparams = llama_model_default_params();
+        mparams.n_gpu_layers = 0;
+        model = llama_model_load_from_file(path.c_str(), mparams);
+        if (!model) {
+            fprintf(stderr, "failed to load %s\n", path.c_str());
+            exit(1);
+        }
+        llama_context_params cparams = llama_context_default_params();
+        common_laya_context_params(cparams, n_batch);
+        cparams.pooling_type    = pooling;
+        cparams.n_threads       = 4;
+        cparams.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
+        cparams.op_offload      = false;
+        ctx = llama_init_from_model(model, cparams);
+        if (!ctx) {
+            fprintf(stderr, "failed to create a context for %s\n", path.c_str());
+            exit(1);
+        }
+    }
+
+    ~laya_env() {
+        llama_free(ctx);
+        llama_model_free(model);
+    }
+};
+
+static std::vector<double> softmax(const std::vector<float> & z) {
+    double zmax = -INFINITY;
+    for (float x : z) {
+        zmax = std::max<double>(zmax, x);
+    }
+    std::vector<double> p;
+    double sum = 0.0;
+    for (float x : z) {
+        p.push_back(std::exp(x - zmax));
+        sum += p.back();
+    }
+    for (double & x : p) {
+        x /= sum;
+    }
+    return p;
+}
+
+// numbers within tol, everything else equal
+static bool json_close(const json & a, const json & b, double tol) {
+    if (a.is_number() && b.is_number()) {
+        return std::fabs(a.get<double>() - b.get<double>()) <= tol;
+    }
+    if (a.type() != b.type() || a.size() != b.size()) {
+        return false;
+    }
+    if (a.is_object()) {
+        auto ib = b.begin();
+        for (auto ia = a.begin(); ia != a.end(); ++ia, ++ib) {
+            if (ia.key() != ib.key() || !json_close(ia.value(), ib.value(), tol)) {
+                return false;
+            }
+        }
+        return true;
+    }
+    if (a.is_array()) {
+        for (size_t i = 0; i < a.size(); ++i) {
+            if (!json_close(a[i], b[i], tol)) {
+                return false;
+            }
+        }
+        return true;
+    }
+    return a == b;
+}
+
+static void test_requests(const std::string & laya_path, const std::string & mbert_path) {
+    laya_env env(laya_path, 512);
+    const common_laya_ptr laya = common_laya_init(env.ctx);
+    common_laya_warmup(laya.get());
+
+    // a valid request: every question type, typed labels, structured criteria, option_order, three kinds of state
+    const json request = json::parse(R"({
+        "states": [
+            "my payment failed twice, please refund the duplicate",
+            {"subject": "invoice", "amount": 129.5, "items": [1, 2.0, true, null]},
+            [{"role": "user", "content": "hello"}, {"role": "user", "content": "cancel my plan"}]
+        ],
+        "questions": {
+            "pick":    {"type": "choice", "instructions": "which team", "criteria": {"alpha": "billing", "beta": {"n": 2}, "gamma": ""}},
+            "labels":  {"type": "choice", "instructions": "which label", "criteria": ["a", 2, true]},
+            "rate":    {"type": "score",  "instructions": "how urgent", "criteria": ["low", {"desc": "mid"}, 3]},
+            "flag":    {"type": "noul",   "instructions": "a refund is requested", "labels": {"false": "no", "true": "yes"}},
+            "ordered": {"type": "choice", "instructions": "which queue", "criteria": ["x", "y", "z"], "option_order": [2, 0, 1]}
+        }
+    })");
+
+    const common_laya_result res = common_laya_predict(laya.get(), request);
+
+    const json & response = res.response;
+    CHECK(response.is_array() && response.size() == 3, "expected one result per state");
+    CHECK(res.sequences.size() == 3*5, "expected one sequence per state and question, got %zu", res.sequences.size());
+
+    struct expected_q { const char * id; llama_token type_token; size_t n_options; std::vector<int> order; };
+    const std::vector<expected_q> expected = {
+        { "pick",    T_CHOICE, 3, {} },
+        { "labels",  T_CHOICE, 3, {} },
+        { "rate",    T_SCORE,  3, {} },
+        { "flag",    T_NOUL,   2, {} },
+        { "ordered", T_CHOICE, 3, { 2, 0, 1 } },
+    };
+
+    for (size_t r = 0; r < res.sequences.size() && response.is_array() && response.size() == 3; ++r) {
+        const auto & seq = res.sequences[r];
+        const auto & q   = expected[r % expected.size()];
+        const json & ans = response[seq.state]["answers"][q.id];
+
+        CHECK(seq.question == q.id, "sequence %zu is for question %s, expected %s", r, seq.question.c_str(), q.id);
+
+        // [CLS] <type> ... [SEP], a [MASK] at every marker
+        CHECK(seq.tokens.size() > 2 && seq.tokens.front() == T_CLS && seq.tokens.back() == T_SEP, "%s: sequence does not start with [CLS] and end with [SEP]", q.id);
+        CHECK(seq.tokens.size() > 1 && seq.tokens[1] == q.type_token, "%s: token after [CLS] is %d, expected the question type %d", q.id, seq.tokens[1], q.type_token);
+        CHECK(seq.markers.size() == q.n_options, "%s: %zu markers, expected %zu", q.id, seq.markers.size(), q.n_options);
+        for (int32_t m : seq.markers) {
+            CHECK(m >= 0 && m < (int32_t) seq.tokens.size() && seq.tokens[m] == T_MASK, "%s: marker %d is not a [MASK]", q.id, m);
+        }
+        CHECK(seq.logits.size() == seq.markers.size() && seq.act.size() == (size_t) n_act, "%s: unexpected raw output sizes", q.id);
+
+        // the answer follows from the raw logits: temperature 1, softmax, back to option order
+        std::vector<double> p = softmax(seq.logits);
+        if (!q.order.empty()) {
+            std::vector<double> canonical(p.size());
+            for (size_t s = 0; s < p.size(); ++s) {
+                canonical[q.order[s]] = p[s];
+            }
+            p = canonical;
+        }
+        const size_t argmax = std::max_element(p.begin(), p.end()) - p.begin();
+
+        const std::string type = ans.value("type", "");
+        if (type == "choice") {
+            const json & probs = ans["probabilities"];
+            CHECK(probs.size() == p.size(), "%s: %zu probabilities, expected %zu", q.id, probs.size(), p.size());
+            size_t i = 0;
+            for (auto it = probs.begin(); it != probs.end() && i < p.size(); ++it, ++i) {
+                CHECK(std::fabs(it.value().get<double>() - p[i]) < 1e-4, "%s: probability %zu is %g, raw logits give %g", q.id, i, it.value().get<double>(), p[i]);
+            }
+        } else if (type == "score") {
+            double score = 0.0;
+            for (size_t i = 0; i < p.size(); ++i) {
+                score += i*p[i];
+            }
+            CHECK(std::fabs(ans["score"].get<double>() - score) < 1e-4, "%s: score %g, raw logits give %g", q.id, ans["score"].get<double>(), score);
+        } else if (type == "noul") {
+            CHECK(std::fabs(ans["noul"].get<double>() - p[1]) < 1e-4, "%s: noul %g, raw logits give %g", q.id, ans["noul"].get<double>(), p[1]);
+        } else {
+            CHECK(false, "%s: unexpected answer type '%s'", q.id, type.c_str());
+        }
+        CHECK(std::fabs(ans["answer_confidence"].get<double>() - p[argmax]) < 1e-4, "%s: answer_confidence does not match the raw logits", q.id);
+        CHECK(std::fabs(ans["action"]["act_probability"].get<double>() - softmax(seq.act)[0]) < 1e-4, "%s: act_probability does not match the raw act logits", q.id);
+
+        if (std::string(q.id) == "pick") {
+            const char * labels[3] = { "alpha", "beta", "gamma" };
+            CHECK(ans["choice"] == labels[argmax], "pick: choice %s, expected %s", ans["choice"].dump().c_str(), labels[argmax]);
+        }
+        if (std::string(q.id) == "labels") {
+            // labels keep their JSON types, probability keys are the JSON key strings
+            const json labels = json::array({ "a", 2, true });
+            CHECK(ans["choice"] == labels[argmax], "labels: choice %s, expected %s", ans["choice"].dump().c_str(), labels[argmax].dump().c_str());
+            std::vector<std::string> keys;
+            for (auto it = ans["probabilities"].begin(); it != ans["probabilities"].end(); ++it) {
+                keys.push_back(it.key());
+            }
+            CHECK((keys == std::vector<std::string>{ "a", "2", "true" }), "labels: unexpected probability keys");
+        }
+        if (std::string(q.id) == "rate") {
+            CHECK(ans["legend"] == json::parse(R"({"0": "low", "1": "{\"desc\": \"mid\"}", "2": "3"})"), "rate: legend %s", ans["legend"].dump().c_str());
+        }
+    }
+
+    // usage: the tokens of the state's sequences, no truncation
+    for (size_t st = 0; st < 3 && response.is_array() && response.size() == 3; ++st) {
+        size_t n_tokens = 0;
+        for (const auto & seq : res.sequences) {
+            if (seq.state == st) {
+                n_tokens += seq.tokens.size();
+            }
+        }
+        const json & usage = response[st]["usage"];
+        CHECK(usage["input_tokens"].get<size_t>() == n_tokens, "state %zu: input_tokens %zu, sequences hold %zu", st, usage["input_tokens"].get<size_t>(), n_tokens);
+        CHECK(usage["state_tokens"].get<size_t>() > 0 && usage["truncated"] == false, "state %zu: unexpected state usage %s", st, usage.dump().c_str());
+    }
+
+    // batch packing: the same answers from one forward pass or from many small ones
+    {
+        const json packed_request = json::parse(R"({
+            "states": ["first ticket about a refund", "second ticket about a crash", "third ticket", "fourth"],
+            "questions": {
+                "pick": {"type": "choice", "instructions": "which team", "criteria": ["billing", "technical"]},
+                "flag": {"type": "noul", "instructions": "urgent"}
+            },
+            "max_len": 96
+        })");
+
+        laya_env small(laya_path, 128);
+        const common_laya_ptr laya_small = common_laya_init(small.ctx);
+
+        const common_laya_result one  = common_laya_predict(laya.get(),       packed_request);
+        const common_laya_result many = common_laya_predict(laya_small.get(), packed_request);
+        CHECK(one.n_passes < many.n_passes, "expected fewer forward passes with the larger batch, got %d and %d", one.n_passes, many.n_passes);
+        CHECK(json_close(one.response, many.response, 2e-4), "answers depend on the batch size:\n%s\n%s", one.response.dump().c_str(), many.response.dump().c_str());
+
+        // a sequence that does not fit the batch is a request error
+        json too_long = packed_request;
+        too_long["max_len"] = 1000;
+        too_long["states"] = json::array({ std::string(600, 'a') + " b" });
+        bool threw = false;
+        try {
+            common_laya_predict(laya_small.get(), too_long);
+        } catch (const std::invalid_argument &) {
+            threw = true;
+        }
+        CHECK(threw, "a sequence longer than the batch did not throw std::invalid_argument");
+    }
+
+    // truncation: a long state is cut to max_len and reported
+    {
+        std::string long_state;
+        for (int i = 0; i < 100; ++i) {
+            long_state += "word ";
+        }
+        const json truncated_request = {
+            { "state", long_state },
+            { "questions", { { "flag", { { "type", "noul" }, { "instructions", "x" } } }, { "rate", { { "type", "score" }, { "instructions", "y" }, { "criteria", { "a", "b" } } } } } },
+            { "max_len", 160 }, // longer than the heads (character-level tokens), shorter than head + state
+        };
+        const common_laya_result tr = common_laya_predict(laya.get(), truncated_request);
+        const json & usage = tr.response["usage"];
+        CHECK(usage["truncated"] == true && usage["state_tokens_dropped"].get<size_t>() > 0, "truncation not reported: %s", usage.dump().c_str());
+        CHECK(usage["truncated_questions"].size() == 2, "expected both questions truncated: %s", usage.dump().c_str());
+        for (const auto & seq : tr.sequences) {
+            CHECK(seq.tokens.size() <= 160 && seq.tokens.back() == T_SEP, "sequence of %zu tokens, max_len 160", seq.tokens.size());
+        }
+    }
+
+    // malformed requests throw std::invalid_argument
+    {
+        const char * malformed[] = {
+            R"([])",
+            R"({"state": "x", "questions": []})",
+            R"({"states": "x", "questions": {}})",
+            R"({"state": null, "questions": {"q": {"type": "noul", "instructions": "x"}}})",
+            R"({"state": "x", "questions": {"q": {"type": "maybe", "instructions": "x"}}})",
+            R"({"state": "x", "questions": {"q": {"type": "noul"}}})",
+            R"({"state": "x", "questions": {"q": {"type": "noul", "instructions": null}}})",
+            R"({"state": "x", "questions": {"": {"type": "noul", "instructions": "x"}}})",
+            R"({"state": "x", "questions": {"q": {"type": "choice", "instructions": "x", "criteria": []}}})",
+            R"({"state": "x", "questions": {"q": {"type": "choice", "instructions": "x", "criteria": [1, 1.0]}}})",
+            R"({"state": "x", "questions": {"q": {"type": "choice", "instructions": "x", "criteria": ["a", "b"], "option_order": [0, 0]}}})",
+            R"({"state": "x", "questions": {"q": {"type": "score", "instructions": "x", "criteria": ["a", null]}}})",
+            R"({"state": "x", "questions": {"q": {"type": "choice", "instructions": "x", "criteria": ["a", "b", "c", "d", "e", "f", "g", "h", "i"]}}})",
+            R"({"state": "x", "questions": {"q": {"type": "noul", "instructions": "x"}}, "max_len": -1})",
+            R"({"state": "x", "questions": {"q": {"type": "noul", "instructions": "x"}}, "head_max_len": 0})",
+            R"({"state": "x", "questions": {"q": {"type": "noul", "instructions": "x"}}, "max_len": "big"})",
+        };
+        for (const char * m : malformed) {
+            bool invalid = false;
+            try {
+                common_laya_predict(laya.get(), json::parse(m));
+            } catch (const std::invalid_argument &) {
+                invalid = true;
+            } catch (const std::exception & e) {
+                fprintf(stderr, "  %s threw %s\n", m, e.what());
+            }
+            CHECK(invalid, "malformed request did not throw std::invalid_argument: %s", m);
+        }
+    }
+
+    // contexts common_laya cannot use
+    {
+        laya_env mbert(mbert_path, 512, LLAMA_POOLING_TYPE_NONE);
+        laya_env none(laya_path, 512, LLAMA_POOLING_TYPE_NONE);
+        for (llama_context * ctx : { mbert.ctx, none.ctx }) {
+            bool invalid = false;
+            try {
+                common_laya_init(ctx);
+            } catch (const std::invalid_argument &) {
+                invalid = true;
+            }
+            CHECK(invalid, "common_laya_init accepted a context it cannot use");
+        }
+    }
+}
+
 int main(int argc, char ** argv) {
     const std::string dir = argc > 1 ? argv[1] : ".";
     const std::string laya_path   = dir + "/test-laya.gguf";
@@ -360,6 +697,8 @@ int main(int argc, char ** argv) {
         }
         CHECK(d < 1e-5f, "laya encoder output differs from modern-bert: max diff %g", d);
     }
+
+    test_requests(laya_path, mbert_path);
 
     {
         // invalid decision metadata: the load fails instead of aborting or sizing buffers from it

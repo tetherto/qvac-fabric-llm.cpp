@@ -4,8 +4,10 @@
     pip install torch "transformers>=5" git+https://github.com/NandhaKishorM/laya
     python tools/laya/compare-laya.py --model-dir path/to/laya --gguf laya.gguf --bin build/bin/llama-laya
 
-For every request both implementations build the token sequences, which must match exactly, and
-the raw option / act logits and the decoded answers are compared.
+For every request both implementations build the token sequences and option marker positions, which
+must match exactly, and the raw option / act logits and the decoded answers must match within the
+tolerances. The defaults hold for f32 weights on CPU and CUDA; f16 weights or reduced-precision
+backends need wider ones, e.g. --logit-tol 0.15 --act-tol 0.01 --tol 0.015 for f16 on CUDA.
 """
 
 from __future__ import annotations
@@ -207,6 +209,9 @@ def main():
     parser.add_argument("--ngl", type=int, default=None)
     # the reference's own bf16 GPU path moves the probabilities by up to ~2e-2 from its fp32 path
     parser.add_argument("--tol", type=float, default=5e-3, help="tolerance on the decoded probabilities")
+    parser.add_argument("--logit-tol", type=float, default=0.05, help="tolerance on the raw option logits")
+    # the act head is saturated (logits in the thousands), so it is compared relative to its scale
+    parser.add_argument("--act-tol", type=float, default=5e-3, help="relative tolerance on the raw act logits")
     parser.add_argument("extra", nargs="*", help="extra llama-laya arguments, after --")
     args = parser.parse_args()
 
@@ -231,9 +236,20 @@ def main():
                 print(f"FAIL {where}: tokens differ at {i}: ref {a['ids'][max(0, i - 3):i + 5]} llama {b['ids'][max(0, i - 3):i + 5]} "
                       f"(lengths {len(a['ids'])} / {len(b['ids'])})")
                 continue
-            max_logit = max(max_logit, float(np.abs(a["logits"] - np.array(b["logits"])).max()))
-            # the act head is saturated (logits in the thousands), so compare relative to its scale
-            max_act = max(max_act, float(np.abs(a["act"] - np.array(b["act"])).max() / max(1.0, np.abs(a["act"]).max())))
+            if list(a["markers"]) != list(b["markers"]):
+                failed = True
+                print(f"FAIL {where}: option markers {list(a['markers'])} != {list(b['markers'])}")
+                continue
+            d_logit = float(np.abs(a["logits"] - np.array(b["logits"])).max())
+            d_act = float(np.abs(a["act"] - np.array(b["act"])).max() / max(1.0, np.abs(a["act"]).max()))
+            if d_logit > args.logit_tol:
+                failed = True
+                print(f"FAIL {where}: option logits differ by {d_logit:.2e} (--logit-tol {args.logit_tol})")
+            if d_act > args.act_tol:
+                failed = True
+                print(f"FAIL {where}: act logits differ by {d_act:.2e} relative (--act-tol {args.act_tol})")
+            max_logit = max(max_logit, d_logit)
+            max_act = max(max_act, d_act)
 
         worst = 0.0
         for ref, out in zip(ref_results, out_results):
