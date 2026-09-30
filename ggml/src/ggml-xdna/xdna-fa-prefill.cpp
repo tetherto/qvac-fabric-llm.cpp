@@ -108,13 +108,8 @@ static bool fa_pf_enabled(void) {
 }
 
 // The kernel derives its mask from the key and query positions, so a mask that
-// is anything but plain causal would be silently ignored. Every row has to be
-// checked: a packed-sequence mask can differ in one row and nowhere else.
-//
-// The check needs the mask contents, and a graph node has no data until the
-// scheduler allocates it. Declining then is the only safe answer, because a
-// node this backend accepts it must also be able to run - xdna_ops_compute
-// returning false fails the whole graph rather than falling back to the host.
+// is anything but plain causal would be silently ignored. Check it instead of
+// assuming: every row, each all the way across, is cheap next to the op.
 static bool mask_is_causal(const ggml_tensor * m, int64_t n_kv, int64_t n_tokens) {
     if (!m) {
         return false;
@@ -280,8 +275,9 @@ static bool fa_kv_reserve(xdna_device * dev, size_t chunks) {
 // stay zero: they are never visible - every query sits before them - but they
 // still multiply a weight of exp(-huge), so they have to be finite.
 //
-// j0 is where packing starts. The caller passes 0: see xdna_fa_prefill_run for
-// why resuming from a previous call is not safe without a cache identity.
+// j0 is normally the previous call's n_kv: within a prompt the cache only ever
+// grows at the end, and this buffer is kept per layer, so a ubatch repacks the
+// keys it added rather than the whole cache.
 static void pack_kv(const ggml_tensor * k, const ggml_tensor * v, uint16_t * dst, int64_t j0, int64_t n_kv) {
     using namespace fa_pf;
     const uint16_t * tbl = f16_bf16_table();
@@ -341,15 +337,12 @@ bool xdna_fa_prefill_run(struct xdna_device * dev, struct ggml_tensor * node) {
     const size_t  chunks   = (size_t) ((n_kv + KCHUNK - 1) / KCHUNK);
     const int64_t rounds   = n_tokens / MBLK;
 
-    // Pack the whole window every time. The previous version kept what it had
-    // already packed and appended, keyed on the cache tensors' data pointers
-    // and a nondecreasing n_kv. That does not hold: a new prompt reuses the
-    // same cache storage, so the pointers match and n_kv can reach the old
-    // length again while the keys underneath are different ones, and the
-    // retained prefix is then the previous prompt's. A context shift rewrites
-    // the cache in place the same way. Restoring the incremental path needs an
-    // identity for the cache contents - a generation counter, or a sequence id
-    // - which this interface does not carry today.
+    // The window is packed whole on every call. Reusing the previous pack is
+    // only sound if the keys and values only grew, and nothing here proves
+    // that: a prompt can reuse the same cache storage and overwrite it while
+    // reaching the same or a longer n_kv, and attention would then read the
+    // previous prompt's keys. The incremental state is gone; the cost is
+    // O(n_kv) per ubatch, and this route is opt-in.
     if (!fa_kv_reserve(dev, chunks)) {
         return false;
     }
@@ -380,8 +373,8 @@ bool xdna_fa_prefill_run(struct xdna_device * dev, struct ggml_tensor * node) {
                 return false;
             }
             xdna_buffer * args[3] = { g_fa.q, g_fa.kv_view[c], g_fa.o };
-            // Every chunk accumulates into the whole output object, so the
-            // last chunk of the round is the one the readback below waits on.
+            // Every chunk accumulates into the whole output object, so the last
+            // chunk of the round is the one the readback below waits on.
             xdna_buffer_mark(g_fa.o, g_fa.o->bytes);
             xrt::run      run     = xdna_kernel_run_start(g_fa.kern, args, 3);
             if (!xdna_run_wait(run)) {

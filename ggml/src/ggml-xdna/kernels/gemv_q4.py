@@ -68,7 +68,6 @@ Q8_GROUP = 32
 def group_size(fmt: str) -> int:
     return Q4_GROUP if fmt == "q4g32" else Q8_GROUP
 
-
 CORES_PER_COL = 4
 # Which compute rows of a column the design places its cores on. Rows 2..5 are
 # the compute rows of an AIE2P column (0 is shim, 1 is mem). The default takes
@@ -79,8 +78,6 @@ ROWS_ALL = "2,3,4,5"
 # Columns one multiply covers. AIE2P's int8 datapath is 64 lanes wide, so a
 # core at least that many columns wide builds at 64 and does twice the work per
 # multiply; a narrower one has to stay at 32.
-
-
 def vec_for(n_core: int) -> int:
     return 64 if n_core >= 64 else 32
 
@@ -116,6 +113,8 @@ def tile_bytes(fmt: str, k_tile: int, n_core: int) -> int:
     return lg * (ng * (code + 4 * vec) + nsup * 4 * vec * 2)
 
 
+
+
 # The epilogue's quantizer (store_quant in gemv-q4.cc) runs in vector lanes:
 # its scalar form pulled ~3 KB of software float into a program memory that
 # attention mode needs.
@@ -129,14 +128,14 @@ def _kernel_flags(fmt: str, k_tile: int, n_core: int) -> list:
     kt = {"q4g32": K_TILES["q4g32"], "q8g16": K_TILES["q8g16"]}
     kt[fmt] = k_tile
     return [f"-DK_TILE_Q4={kt['q4g32']}", f"-DK_TILE_Q8={kt['q8g16']}",
-            f"-DACT_TILE={ACT_TILE}", f"-DN_CORE={n_core}",
-            f"-DQ4_GROUP={Q4_GROUP}", f"-DQ8_GROUP={Q8_GROUP}",
-            f"-DGEMV_VEC={vec_for(n_core)}",
-            # ACT_RAW builds the per-tile quantizer into the core (gemv_q4.cc),
-            # so a producer on the array can hand this dispatch numbers rather
-            # than codes. It costs about a kilobyte of a program memory that is
-            # already full, so it is off unless a design asks for it.
-            f"-DACT_RAW={int(__import__('os').environ.get('ACT_RAW', '0'))}"]
+             f"-DACT_TILE={ACT_TILE}", f"-DN_CORE={n_core}",
+             f"-DQ4_GROUP={Q4_GROUP}", f"-DQ8_GROUP={Q8_GROUP}",
+             f"-DGEMV_VEC={vec_for(n_core)}",
+             # ACT_RAW builds the per-tile quantizer into the core (gemv_q4.cc),
+             # so a producer on the array can hand this dispatch numbers rather
+             # than codes. It costs about a kilobyte of a program memory that is
+             # already full, so it is off unless a design asks for it.
+             f"-DACT_RAW={int(__import__('os').environ.get('ACT_RAW', '0'))}"]
 
 
 # The prologue tile's own streams (act-att.cc): a side input from DDR and an
@@ -512,6 +511,9 @@ def build_gemv(FMT: str, K: int, N: int, K_TILE: int, COLS: int,
         ))
         w_shim.append(wf)
 
+
+
+
     # OUT_GROUP columns share one output stream, joined in a MemTile. A core's
     # output is half a kilobyte a chunk where its weights are tens of
     # kilobytes a tile, so the join costs nothing and gives the array back a
@@ -735,6 +737,7 @@ def pack_weight_tile(fmt: str, codes: np.ndarray, d8: np.ndarray, m8: np.ndarray
     k_tile, n_core = codes.shape
     VEC = vec_for(n_core)
     grp = group_size(fmt)
+    sbg = 256 // grp
     ng = k_tile // grp
     nsup = max(1, (k_tile if fmt == "q4g32" else 2 * k_tile) // 256)
     blocks, sups = [], []
@@ -743,8 +746,8 @@ def pack_weight_tile(fmt: str, codes: np.ndarray, d8: np.ndarray, m8: np.ndarray
         for g in range(ng):
             blk = codes[g * grp:(g + 1) * grp, cs].reshape(-1)
             if fmt == "q4g32":
-                blocks.append(((blk[0::2].astype(np.uint8) & 0xF)
-                               | ((blk[1::2].astype(np.uint8) & 0xF) << 4)))
+                blocks.append(((blk[0::2].astype(np.uint8) & 0xF) |
+                               ((blk[1::2].astype(np.uint8) & 0xF) << 4)))
             else:
                 blocks.append(blk.astype(np.int8).view(np.uint8))
             blocks.append(d8[g, cs].astype(np.float32)
@@ -863,8 +866,8 @@ def _run_and_verify(opts) -> None:
         colmap = np.empty(N, dtype=np.int64)
         for u in range(N // VEC):
             for i in range(VEC):
-                colmap[u * VEC + i] = (u * half + (i % half)
-                                       + (0 if i < half else N // 2))
+                colmap[u * VEC + i] = (u * half + (i % half) +
+                                       (0 if i < half else N // 2))
 
     ref = (aq.astype(np.float64) @ w.astype(np.float64)).astype(np.float32)
     if opts.epilogue:
@@ -900,7 +903,7 @@ def _run_and_verify(opts) -> None:
     tiles = [pack_act_tile(fmt, a[t * K_TILE:(t + 1) * K_TILE],
                            d_a[t * (K_TILE // grp):(t + 1) * (K_TILE // grp)],
                            int(opts.epilogue and t == NT - 1),
-                           0)
+                       0)
              for t in range(NT)]
     abuf = np.concatenate([hdr.view(np.uint8)] + tiles * n_out)
 

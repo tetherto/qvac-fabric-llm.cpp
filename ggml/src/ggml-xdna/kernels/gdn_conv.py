@@ -106,8 +106,8 @@ def build(dev_name: str = "npu2"):
             workers.append(Worker(core, fn_args=[cores_in[col][h][p].cons(), cores_out[col][i].prod(),
                                                  k_hdr, k_chunk, Buffer(n_ty, name=f"n{col}_{i}")],
                                   tile=Tile(col, 2 + i), stack_size=0x1200))
-    eps = ([f.prod(tile=Tile(col, 0)) for col, h, f in ins]
-           + [f.cons(tile=Tile(col, 0)) for col, f in enumerate(outs)])
+    eps = ([f.prod(tile=Tile(col, 0)) for col, h, f in ins] +
+           [f.cons(tile=Tile(col, 0)) for col, f in enumerate(outs)])
     return workers, eps
 
 

@@ -911,9 +911,8 @@ bool xdna_rec_core_run(xdna_rec_core * core,
     st_run.stop();
     xdna_prof::section_timer st_out("rec: out readback");
     // out layout: [gated f32 scratch KGATE*4][aq int8 KGATE][d_a f32]. Read
-    // against the mark set before the dispatch: a run reports completion
-    // before its last writes are readable, and the codes are exactly such a
-    // read.
+    // against the mark set before the dispatch: a run reports completion before
+    // its last writes are readable, and the codes are exactly such a read.
     if (core->so_fused && !xdna_buffer_sync_from_device(core->x)) {
         return false;
     }

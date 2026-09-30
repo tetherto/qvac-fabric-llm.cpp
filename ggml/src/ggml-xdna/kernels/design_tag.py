@@ -96,17 +96,30 @@ def _tagged(src: str, t: str) -> str:
     return os.path.join(d, f"{stem}_{t}{ext}")
 
 
+def _tag_copy(src: str, t: str) -> None:
+    """Copy an artifact to its tagged name, without the source's timestamp.
+
+    Deliberately not copy2: the tagged file is one output of a rule whose other
+    inputs are the design artifacts, so a preserved source timestamp can leave
+    it older than an input, and ninja reruns the stamping step every build.
+    """
+    shutil.copyfile(src, _tagged(src, t))
+
+
 def stamp(xclbin_path, insts_path=None, extra: str = ""):
-    """Copy the artifact under its tagged name and refresh the tag header."""
+    """Copy the artifact under its tagged name.
+
+    The tag header is refreshed by the build's own stamping step (stamp_all,
+    run from the kernel rule), never from here: a standalone compile has none
+    of the build's knobs in its environment, so writing it would relabel the
+    build tree with a tag the backend then binds against other artifacts.
+    """
+    files = [str(p) for p in (xclbin_path, insts_path) if p and os.path.exists(str(p))]
+    if not files:
+        return
     t = tag(extra)
-    _write_header(t)
-    # copyfile, not copy2: each tagged copy is an output of a rule whose inputs
-    # are every design artifact, and a preserved source timestamp can leave it
-    # older than an input, so ninja reruns the stamping step on every build.
-    for src in (xclbin_path, insts_path):
-        src = str(src) if src is not None else None
-        if src and os.path.exists(src):
-            shutil.copyfile(src, _tagged(src, t))
+    for src in files:
+        _tag_copy(src, t)
 
 
 def _prune_stale(bindir: str, keep: str) -> int:
@@ -135,7 +148,7 @@ def stamp_all(bindir: str, extra: str = "") -> None:
         for ext in (".xclbin", ".insts.bin"):
             src = os.path.join(bindir, stem + ext)
             if os.path.exists(src):
-                shutil.copyfile(src, _tagged(src, t))  # not copy2: see stamp()
+                _tag_copy(src, t)
     stale = _prune_stale(bindir, t)
     print(f"design tag {t} (stamp-all)" + (f", {stale} stale artifact(s) removed" if stale else ""))
 
