@@ -174,6 +174,9 @@ struct common_speculative_impl {
     // (optional) serialize/restore per-seq internal state (e.g. eagle3's deferred boundary).
     virtual bool get_state(llama_seq_id /*seq_id*/, std::vector<uint8_t> & /*data*/) const { return false; }
     virtual void set_state(llama_seq_id /*seq_id*/, const std::vector<uint8_t> & /*data*/) {}
+
+    // (optional) position right after the prompt about to be processed for seq_id
+    virtual void set_prompt_end(llama_seq_id /*seq_id*/, llama_pos /*pos_end*/) {}
 };
 
 struct common_speculative_impl_draft_simple : public common_speculative_impl {
@@ -941,6 +944,10 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     const int32_t * target_layer_ids   = nullptr; // model_dft's extract layer indices
     uint32_t        target_layer_ids_n = 0;
 
+    // prompt rows more than attn_window positions before a seq's prompt end are never attended (0 = all are)
+    int32_t                attn_window = 0;
+    std::vector<llama_pos> prompt_pos_end;
+
     common_speculative_impl_draft_dflash(const common_params_speculative & params, uint32_t n_seq,
             common_speculative_type type = COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH)
         : common_speculative_impl(type, n_seq, params.draft.n_max)
@@ -1010,6 +1017,9 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         batch        = llama_batch_init(llama_n_batch(ctx_dft), 0,          n_seq);
         batch_inject = llama_batch_init(llama_n_ubatch(ctx_dft), n_embd_enc, n_seq);
 
+        attn_window = llama_model_attn_window(model_dft);
+        prompt_pos_end.assign(n_seq, -1);
+
         // embd batches on an M-RoPE draft need 4 position rows per token
         is_mrope = llama_model_rope_type(model_dft) == LLAMA_ROPE_TYPE_MROPE;
         if (is_mrope) {
@@ -1074,6 +1084,8 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             return;
         }
 
+        prompt_pos_end[seq_id] = -1;
+
         const int32_t N = (int32_t) prompt.size();
         if (N <= 0) {
             return;
@@ -1085,6 +1097,24 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     "Drafts may degrade.\n",
                     __func__, (int) pos_max, N - 1);
         }
+    }
+
+    void set_prompt_end(llama_seq_id seq_id, llama_pos pos_end) override {
+        if (seq_id >= 0 && seq_id < (llama_seq_id) n_seq) {
+            prompt_pos_end[seq_id] = pos_end;
+        }
+    }
+
+    // first row of [beg, end] that a draft anchored at the prompt end can attend
+    int32_t first_attended_row(const llama_batch & batch_in, llama_seq_id seq_id, int32_t beg, int32_t end) const {
+        if (attn_window <= 0 || prompt_pos_end[seq_id] < 0) {
+            return beg;
+        }
+        const llama_pos pos_min = prompt_pos_end[seq_id] - attn_window + 1;
+        while (beg <= end && batch_in.pos[beg] < pos_min) {
+            ++beg;
+        }
+        return beg;
     }
 
     bool process(const llama_batch & batch_in) override {
@@ -1126,6 +1156,10 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
             if (i_batch_beg[seq_id] < 0) {
+                continue;
+            }
+            i_batch_beg[seq_id] = first_attended_row(batch_in, seq_id, i_batch_beg[seq_id], i_batch_end[seq_id]);
+            if (i_batch_beg[seq_id] > i_batch_end[seq_id]) {
                 continue;
             }
             const int32_t n_rows = i_batch_end[seq_id] - i_batch_beg[seq_id] + 1;
@@ -2847,6 +2881,16 @@ void common_speculative_begin(common_speculative * spec, llama_seq_id seq_id, co
         common_time_meas tm(impl->t_begin_us, !impl->gen_perf);
         impl->begin(seq_id, prompt);
         impl->n_call_begin++;
+    }
+}
+
+void common_speculative_set_prompt_end(common_speculative * spec, llama_seq_id seq_id, llama_pos pos_end) {
+    if (spec == nullptr) {
+        return;
+    }
+
+    for (auto & impl : spec->impls) {
+        impl->set_prompt_end(seq_id, pos_end);
     }
 }
 

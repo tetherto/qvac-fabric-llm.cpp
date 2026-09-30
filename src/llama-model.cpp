@@ -3421,6 +3421,14 @@ int32_t llama_model_n_head_kv(const llama_model * model) {
     return model->hparams.n_head_kv();
 }
 
+int32_t llama_model_attn_window(const llama_model * model) {
+    const auto & hparams = model->hparams;
+    if (hparams.swa_type != LLAMA_SWA_TYPE_STANDARD || !hparams.is_swa_all()) {
+        return 0;
+    }
+    return (int32_t) hparams.n_swa;
+}
+
 int32_t llama_model_n_swa(const llama_model * model) {
     // dsv4 kv-cache has SWA but it cannot be used as a rollback because of
     // other compression ratios, so we return 0 here

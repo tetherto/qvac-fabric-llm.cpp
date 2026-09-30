@@ -393,6 +393,9 @@ struct llama_hparams {
     // return true if one of the layers is SWA
     bool is_swa_any() const;
 
+    // return true if every layer is SWA
+    bool is_swa_all() const;
+
     bool is_swa(uint32_t il) const;
 
     bool is_indexer_full(uint32_t il) const;
