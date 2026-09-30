@@ -3694,6 +3694,64 @@ static int ggml_cuda_try_gdn_cache_fusion(
     return skip;
 }
 
+// true if a CPY between f32 views of two different tensors can start a copy batch
+static bool ggml_cuda_cpy_batch_can_start(const ggml_tensor * a) {
+    return a->op == GGML_OP_CPY && (a->flags & GGML_TENSOR_FLAG_COMPUTE) && a->src[0]->type == GGML_TYPE_F32 &&
+        a->type == GGML_TYPE_F32 && a->src[0]->view_src && a->view_src && a->src[0]->view_src != a->view_src;
+}
+
+// true if CPY b moves the same view layout between the same two tensors as CPY a
+static bool ggml_cuda_cpy_same_layout(const ggml_tensor * a, const ggml_tensor * b) {
+    return b->op == GGML_OP_CPY && (b->flags & GGML_TENSOR_FLAG_COMPUTE) &&
+        b->src[0]->type == a->src[0]->type && b->type == a->type &&
+        b->src[0]->view_src == a->src[0]->view_src && b->view_src == a->view_src &&
+        ggml_are_same_shape(a->src[0], b->src[0]) && ggml_are_same_stride(a->src[0], b->src[0]) &&
+        ggml_are_same_shape(a, b) && ggml_are_same_stride(a, b);
+}
+
+static bool ggml_cuda_tensor_ranges_overlap(const ggml_tensor * a, const ggml_tensor * b);
+
+// whether copy next writes where a batched copy reads or writes, or reads where one of them writes
+static bool ggml_cuda_cpy_batch_conflicts(const ggml_tensor * const * batched, int n, const ggml_tensor * next) {
+    for (int k = 0; k < n; ++k) {
+        const ggml_tensor * prev = batched[k];
+        if (ggml_cuda_tensor_ranges_overlap(next, prev) || ggml_cuda_tensor_ranges_overlap(next->src[0], prev) ||
+            ggml_cuda_tensor_ranges_overlap(next, prev->src[0])) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// the same-layout f32 view copies from node_idx on, with only views in between; returns the nodes to skip
+static int ggml_cuda_try_cpy_batch(const ggml_cgraph * cgraph, int node_idx, ggml_cuda_cpy_batch & batch) {
+    const ggml_tensor * first = cgraph->nodes[node_idx];
+    if (!ggml_cuda_cpy_batch_can_start(first)) {
+        return 0;
+    }
+
+    const ggml_tensor * batched[GGML_CUDA_CPY_BATCH_MAX] = { first };
+    batch.n           = 1;
+    batch.src_offs[0] = 0;
+    batch.dst_offs[0] = 0;
+
+    int skip = 0;
+    for (int j = node_idx + 1; j < cgraph->n_nodes && batch.n < GGML_CUDA_CPY_BATCH_MAX; ++j) {
+        const ggml_tensor * next = cgraph->nodes[j];
+        if (ggml_cuda_is_view_or_noop(next)) {
+            continue;
+        }
+        if (!ggml_cuda_cpy_same_layout(first, next) || ggml_cuda_cpy_batch_conflicts(batched, batch.n, next)) {
+            break;
+        }
+        batch.src_offs[batch.n] = (const char *) next->src[0]->data - (const char *) first->src[0]->data;
+        batch.dst_offs[batch.n] = (const char *) next->src[1]->data - (const char *) first->src[1]->data;
+        batched[batch.n++]      = next;
+        skip                    = j - node_idx;
+    }
+    return skip;
+}
+
 static bool ggml_cuda_topk_moe_fusion(const struct ggml_cgraph * cgraph, int node_idx, ggml_cuda_topk_moe_args & args) {
     args.sigmoid         = false;
     args.sqrt_softplus   = false;
@@ -4450,6 +4508,16 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context *         cuda_ctx,
                           __func__, node->name, nodes_to_skip);
 #endif
             ggml_cuda_op_gated_delta_net_fused_cache(*cuda_ctx, node, fused_state_cpy);
+            return nodes_to_skip;
+        }
+    }
+
+    // consecutive same-layout copies between two tensors run as one launch
+    if (node->op == GGML_OP_CPY) {
+        ggml_cuda_cpy_batch batch;
+        const int nodes_to_skip = ggml_cuda_try_cpy_batch(cgraph, i, batch);
+        if (nodes_to_skip > 0) {
+            ggml_cuda_cpy_f32_batch(*cuda_ctx, node->src[0], node->src[1], batch);
             return nodes_to_skip;
         }
     }
