@@ -397,6 +397,7 @@ llama_build(test-multi-instance-repro.cpp)
 llama_build_and_test(test-arg-parser.cpp  LABEL behavior)
 llama_build_and_test(test-model-resolution.cpp  LABEL behavior)
 llama_build_and_test(test-model-load-meta-only.cpp  LABEL behavior)
+llama_build_and_test(test-dflash-loader.cpp LABEL behavior)
 
 if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
     add_executable(test-mmap-direct-io test-mmap-direct-io.cpp ../src/llama-mmap.cpp ../src/llama-impl.cpp)
