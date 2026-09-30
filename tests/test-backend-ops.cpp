@@ -9214,6 +9214,21 @@ static std::string var_to_str(cpy_batch_dst dst) {
     return "unknown";
 }
 
+enum cpy_batch_order {
+    CPY_BATCH_ORDER_ADJACENT, // views first, then the copies back to back
+    CPY_BATCH_ORDER_BUILD,    // builder order: the views of each copy right before it
+    CPY_BATCH_ORDER_READER,   // builder order with a read of the first copy's destination before the second copy
+};
+
+static std::string var_to_str(cpy_batch_order order) {
+    switch (order) {
+        case CPY_BATCH_ORDER_ADJACENT: return "adjacent";
+        case CPY_BATCH_ORDER_BUILD:    return "build";
+        case CPY_BATCH_ORDER_READER:   return "reader";
+    }
+    return "unknown";
+}
+
 // copies from overlapping windows of one tensor into views of another, adjacent in the graph, which backends may batch.
 // reads of the whole destination before and after the copies must not run concurrently with them.
 struct test_cpy_batch : public test_case {
@@ -9221,12 +9236,14 @@ struct test_cpy_batch : public test_case {
     const int64_t n_tok;
     const int64_t n_cpy;
     const cpy_batch_dst dst;
+    const cpy_batch_order order;
     std::vector<ggml_tensor *> cpys;
-    ggml_tensor * pre  = nullptr;
-    ggml_tensor * post = nullptr;
+    ggml_tensor * pre    = nullptr;
+    ggml_tensor * post   = nullptr;
+    ggml_tensor * reader = nullptr;
 
     std::string vars() override {
-        return VARS_TO_STR4(n_cols, n_tok, n_cpy, dst);
+        return VARS_TO_STR5(n_cols, n_tok, n_cpy, dst, order);
     }
 
     std::string op_desc(ggml_tensor * t) override {
@@ -9240,12 +9257,17 @@ struct test_cpy_batch : public test_case {
         std::vector<ggml_tensor *> nodes = cpys;
         nodes.push_back(pre);
         nodes.push_back(post);
+        if (reader) {
+            nodes.push_back(reader);
+        }
         return nodes;
     }
 
-    test_cpy_batch(int64_t n_cols, int64_t n_tok, int64_t n_cpy, cpy_batch_dst dst = CPY_BATCH_DST_DISJOINT)
-        : n_cols(n_cols), n_tok(n_tok), n_cpy(n_cpy), dst(dst) {
+    test_cpy_batch(int64_t n_cols, int64_t n_tok, int64_t n_cpy, cpy_batch_dst dst = CPY_BATCH_DST_DISJOINT,
+                   cpy_batch_order order = CPY_BATCH_ORDER_ADJACENT)
+        : n_cols(n_cols), n_tok(n_tok), n_cpy(n_cpy), dst(dst), order(order) {
         GGML_ASSERT(n_cpy <= n_tok + 1);
+        GGML_ASSERT(order != CPY_BATCH_ORDER_READER || n_cpy >= 2);
     }
 
     size_t dst_offset(const ggml_tensor * slots, int64_t i) const {
@@ -9278,6 +9300,12 @@ struct test_cpy_batch : public test_case {
         post = ggml_add(ctx, pre, slots);
         ggml_set_name(post, "out");
 
+        reader = nullptr;
+        if (order == CPY_BATCH_ORDER_READER) {
+            reader = ggml_scale(ctx, cpys[0], 3.0f);
+            ggml_set_name(reader, "reader");
+        }
+
         return post;
     }
 
@@ -9293,8 +9321,14 @@ struct test_cpy_batch : public test_case {
     }
 
     void prepare_graph(ggml_cgraph * gf) override {
-        for (ggml_tensor * c : cpys) {
-            ggml_build_forward_expand(gf, c);
+        for (size_t i = 0; i < cpys.size(); ++i) {
+            ggml_build_forward_expand(gf, cpys[i]);
+            if (i == 0 && reader) {
+                ggml_build_forward_expand(gf, reader);
+            }
+        }
+        if (order != CPY_BATCH_ORDER_ADJACENT) {
+            return;
         }
 
         ggml_tensor ** nodes = ggml_graph_nodes(gf);
@@ -13030,6 +13064,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_cpy_batch(1000,  8,  3));
     test_cases.emplace_back(new test_cpy_batch(1000,  8,  4, CPY_BATCH_DST_SAME));
     test_cases.emplace_back(new test_cpy_batch(1000,  8,  4, CPY_BATCH_DST_HALF));
+    test_cases.emplace_back(new test_cpy_batch(1000,  8,  8, CPY_BATCH_DST_DISJOINT, CPY_BATCH_ORDER_BUILD));
+    test_cases.emplace_back(new test_cpy_batch(1000,  20, 18, CPY_BATCH_DST_DISJOINT, CPY_BATCH_ORDER_BUILD));
+    test_cases.emplace_back(new test_cpy_batch(1000,  8,  8, CPY_BATCH_DST_DISJOINT, CPY_BATCH_ORDER_READER));
 
     // DFlash2 dynamic conv: strided views into REPEAT and MUL
     for (int64_t side : {0, 1}) {
