@@ -24,6 +24,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -51,10 +52,23 @@ struct common_laya_result {
 // context parameters for common_laya_predict: every sequence must fit into one batch of n_batch tokens
 void common_laya_context_params(llama_context_params & cparams, uint32_t n_batch = 2048);
 
+// A laya model ready for requests: the model is checked and its tokenizer and configuration are prepared
+// once. It evaluates on ctx, so use one per context and do not call it from two threads at once.
+struct common_laya;
+
+struct common_laya_deleter {
+    void operator()(common_laya * laya);
+};
+
+typedef std::unique_ptr<common_laya, common_laya_deleter> common_laya_ptr;
+
+// throws std::invalid_argument when ctx does not hold a laya model set up by common_laya_context_params
+common_laya_ptr common_laya_init(llama_context * ctx);
+
 // Answers a request. The sequences of all states and questions are packed into as few forward passes as the
 // context batch allows. A malformed request throws std::invalid_argument, a failed evaluation std::runtime_error.
-common_laya_result common_laya_predict(llama_context * ctx, const nlohmann::ordered_json & request);
+common_laya_result common_laya_predict(const common_laya * laya, const nlohmann::ordered_json & request);
 
 // Evaluates one short decision, to initialize the backends before timing or serving requests
 // (the generic warmup batch is not a laya sequence).
-void common_laya_warmup(llama_context * ctx);
+void common_laya_warmup(const common_laya * laya);

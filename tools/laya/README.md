@@ -72,7 +72,8 @@ llama_context_params cparams = llama_context_default_params();
 common_laya_context_params(cparams); // embeddings, RANK pooling, one 2048-token ubatch per pass
 llama_context * ctx = llama_init_from_model(model, cparams);
 
-common_laya_warmup(ctx); // optional, keeps backend initialization out of the first request
+common_laya_ptr laya = common_laya_init(ctx); // checks the model, prepares its tokenizer and configuration once
+common_laya_warmup(laya.get());                // optional, keeps backend initialization out of the first request
 
 auto request = nlohmann::ordered_json::parse(R"({
     "state": "My payment failed twice",
@@ -80,7 +81,7 @@ auto request = nlohmann::ordered_json::parse(R"({
 })");
 
 try {
-    common_laya_result res = common_laya_predict(ctx, request);
+    common_laya_result res = common_laya_predict(laya.get(), request);
     std::string choice = res.response["answers"]["department"]["choice"];
 } catch (const std::invalid_argument & e) {
     // malformed request: unknown question type, missing criteria, sequence longer than the batch, ...
@@ -93,7 +94,7 @@ try {
 - `res.sequences` holds the token ids, marker positions and raw act / option logits of every (state, question) pair.
 - `res.n_tokens`, `res.n_passes` and `res.t_ms` describe the forward passes.
 
-A context is not thread-safe: use one context per thread, or serialize the calls.
+A `common_laya` evaluates on its context, which is not thread-safe: use one context per thread, or serialize the calls.
 
 ## How it maps to the model
 

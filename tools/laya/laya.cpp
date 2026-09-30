@@ -76,9 +76,11 @@ int main(int argc, char ** argv) {
     }
 
     try {
-        common_laya_warmup(ctx);
+        const common_laya_ptr laya = common_laya_init(ctx);
 
-        const common_laya_result res = common_laya_predict(ctx, request);
+        common_laya_warmup(laya.get());
+
+        const common_laya_result res = common_laya_predict(laya.get(), request);
 
         if (params.verbose_prompt) {
             for (const auto & seq : res.sequences) {
