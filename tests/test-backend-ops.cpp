@@ -7016,6 +7016,80 @@ struct test_mul_mat_pq2_0_codes : public test_case {
     }
 };
 
+enum mul_mat_offset_operand {
+    MUL_MAT_OFFSET_WEIGHT,
+    MUL_MAT_OFFSET_INPUT,
+};
+
+static const char * mul_mat_offset_operand_name(mul_mat_offset_operand operand) {
+    switch (operand) {
+        case MUL_MAT_OFFSET_WEIGHT: return "weight";
+        case MUL_MAT_OFFSET_INPUT:  return "input";
+    }
+    return "unknown";
+}
+
+// GGML_OP_MUL_MAT (n_mats == 0) or GGML_OP_MUL_MAT_ID with the weight or the input one element or block past the start
+// of its buffer
+struct test_mul_mat_operand_offset : public test_case {
+    const ggml_type type;
+    const int n_mats;
+    const int64_t m;
+    const int64_t n;
+    const int64_t k;
+    const mul_mat_offset_operand operand;
+
+    static constexpr int n_used = 2;
+
+    std::string vars() override {
+        return VARS_TO_STR5(type, n_mats, m, n, k) + ",offset=" + mul_mat_offset_operand_name(operand);
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    test_mul_mat_operand_offset(ggml_type type, int n_mats, int64_t m, int64_t n, int64_t k, mul_mat_offset_operand operand)
+        : type(type), n_mats(n_mats), m(m), n(n), k(k), operand(operand) {}
+
+    ggml_tensor * new_operand(ggml_context * ctx, ggml_type t, int64_t ne0, int64_t ne1, int64_t ne2, bool offset) {
+        if (!offset) {
+            return ggml_new_tensor_3d(ctx, t, ne0, ne1, ne2);
+        }
+        ggml_tensor * storage = ggml_new_tensor_1d(ctx, t, ne0*ne1*ne2 + ggml_blck_size(t));
+        ggml_set_name(storage, "storage");
+        const size_t row = ggml_row_size(t, ne0);
+        return ggml_view_3d(ctx, storage, ne0, ne1, ne2, row, row*ne1, ggml_type_size(t));
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * w = new_operand(ctx, type, k, m, std::max(n_mats, 1), operand == MUL_MAT_OFFSET_WEIGHT);
+        ggml_set_name(w, "w");
+
+        ggml_tensor * out;
+        if (n_mats == 0) {
+            ggml_tensor * x = new_operand(ctx, GGML_TYPE_F32, k, n, 1, operand == MUL_MAT_OFFSET_INPUT);
+            ggml_set_name(x, "x");
+            out = ggml_mul_mat(ctx, w, x);
+        } else {
+            ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_mats, n);
+            ggml_set_name(ids, "ids");
+            ids = ggml_view_2d(ctx, ids, n_used, n, ids->nb[1], 0);
+            ggml_set_name(ids, "view_of_ids");
+            ggml_tensor * x = new_operand(ctx, GGML_TYPE_F32, k, n_used, n, operand == MUL_MAT_OFFSET_INPUT);
+            ggml_set_name(x, "x");
+            out = ggml_mul_mat_id(ctx, w, x, ids);
+        }
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        init_mul_mat_id_tensors(ctx, std::max(n_mats, 1));
+    }
+};
+
 struct test_ternary_f16_reference : public test_case {
     const ggml_type type_a;
     const bool use_ids;
@@ -13487,6 +13561,23 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                             test_cases.emplace_back(new test_mul_mat_id(type_a, type_b, n_mats, n_used, b, m, n, k));
                         }
                     }
+                }
+            }
+        }
+    }
+
+    // single MUL_MAT columns, f16 weights and an offset input to a quantized weight above 4 columns (MMQ on some GPUs) are
+    // left out: CUDA cannot read them at this offset yet, and Metal miscomputes the f16 weights
+    const int64_t offset_quant_input_cols_max = 4;
+    for (int n_mats : {0, 4}) {
+        for (int n : {1, 4, 8, 32}) {
+            if (n_mats == 0 && n == 1) {
+                continue;
+            }
+            for (ggml_type type : {GGML_TYPE_F32, GGML_TYPE_Q4_0}) {
+                test_cases.emplace_back(new test_mul_mat_operand_offset(type, n_mats, 64, n, 256, MUL_MAT_OFFSET_WEIGHT));
+                if (type == GGML_TYPE_F32 || n <= offset_quant_input_cols_max) {
+                    test_cases.emplace_back(new test_mul_mat_operand_offset(type, n_mats, 64, n, 256, MUL_MAT_OFFSET_INPUT));
                 }
             }
         }
