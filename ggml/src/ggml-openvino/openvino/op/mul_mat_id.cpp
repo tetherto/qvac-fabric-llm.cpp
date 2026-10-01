@@ -118,8 +118,9 @@ ov::Output<ov::Node> translate_mul_mat_id_mxfp4_packed(const NodeContext & conte
     const int64_t k_blocks = static_cast<int64_t>(packed_shape[3]);
     const int64_t qk = 32;
     const int64_t cols = k_blocks * qk;
+    const bool is_cpu = ggml_openvino_get_device_name() == "CPU";
 
-    if (ggml_openvino_get_device_name() == "CPU") {
+    if (is_cpu) {
         const ov::PartialShape id_shape = ids.get_partial_shape();
         const ov::PartialShape act_shape = activations.get_partial_shape();
         if (id_shape.rank().is_static() && id_shape.rank().get_length() == 4 && act_shape.rank().is_static() &&
@@ -176,7 +177,7 @@ ov::Output<ov::Node> translate_mul_mat_id_mxfp4_packed(const NodeContext & conte
     auto scale_byte = slice_axis(selected_packed_weights, 4, 0, 1);
     auto qs = slice_axis(selected_packed_weights, 4, 1, 17);
     ov::Output<ov::Node> weights_f32;
-    if (ggml_openvino_get_device_name() == "CPU") {
+    if (is_cpu) {
         std::vector<float> low_lut(256);
         std::vector<float> high_lut(256);
         for (size_t i = 0; i < low_lut.size(); ++i) {

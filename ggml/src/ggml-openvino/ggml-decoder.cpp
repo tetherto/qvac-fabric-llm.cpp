@@ -705,8 +705,7 @@ ov::PartialShape GgmlOvDecoder::get_graph_input_shape(const ggml_tensor * op,
 
     } else if (is_output_idx(input, op)) {
         // output index
-        input_shape =
-            ov::PartialShape{1, 1, 1, (m_is_static || m_fixed_token_shape) ? m_compute_params.output_len : -1};
+        input_shape = ov::PartialShape{1, 1, 1, m_is_static ? m_compute_params.output_len : -1};
 
     } else if (is_inp_mask(input, op)) {
         // mask

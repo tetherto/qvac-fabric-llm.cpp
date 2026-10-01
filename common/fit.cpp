@@ -1,18 +1,19 @@
 #include "fit.h"
 
-#include "../src/llama-ext.h"
-#include "llama-cpp.h"
 #include "log.h"
+#include "llama-cpp.h"
 
-#include <algorithm>
+#include "../src/llama-ext.h"
+
 #include <array>
+#include <algorithm>
 #include <atomic>
 #include <cassert>
+#include <stdexcept>
 #include <cinttypes>
 #include <exception>
-#include <mutex>
 #include <set>
-#include <stdexcept>
+#include <mutex>
 #include <string>
 #include <vector>
 
