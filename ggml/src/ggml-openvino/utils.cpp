@@ -192,7 +192,18 @@ enum ggml_status ov_graph_compute_dynamic(ggml_cgraph * cgraph, std::shared_ptr<
     // graph shape is identical across all decode steps, so memoize by graph_key: compute
     // graph_key first (a few hundred us), and if the same key is already in decoder_cache
     // we know the graph is not splitted (only not-splitted graphs get inserted there).
-    graph_key key(cgraph);
+    int64_t fixed_token_count = 0;
+    if (device == "CPU" && !is_naive(cgraph)) {
+        for (int i = 0; i < cgraph->n_nodes; ++i) {
+            const ggml_tensor * node = cgraph->nodes[i];
+            if (node->op == GGML_OP_MUL_MAT_ID && node->src[0] != nullptr && node->src[0]->type == GGML_TYPE_MXFP4) {
+                fixed_token_count = node->src[2]->ne[1];
+                break;
+            }
+        }
+    }
+    const bool fixed_token_shape = fixed_token_count > 0;
+    graph_key key(cgraph, fixed_token_count);
     bool key_seen = false;
     if (!cache_disabled) {
         std::lock_guard<std::mutex> map_lock(r_ctx->ctx_mutex);
@@ -352,7 +363,11 @@ enum ggml_status ov_graph_compute_dynamic(ggml_cgraph * cgraph, std::shared_ptr<
                 mc_config.erase("CACHE_MODE");
             }
             if (!model_cache_dir.empty() && !model_is_splitted) {
-                const uint64_t extra_cfg = ggml_openvino_model_cache_extra_cfg(device, stateful);
+                uint64_t extra_cfg = ggml_openvino_model_cache_extra_cfg(device, stateful);
+                if (fixed_token_shape) {
+                    extra_cfg ^= 0x6d78667034666978ULL;
+                    extra_cfg ^= static_cast<uint64_t>(fixed_token_count);
+                }
                 model_fp = ggml_openvino_model_fingerprint(cgraph, device, /*fa=*/true, m_params.rope_params,
                                                            15, extra_cfg);
                 blob_path = ggml_openvino_model_cache_blob_path(model_cache_dir, model_fp);
@@ -377,8 +392,9 @@ enum ggml_status ov_graph_compute_dynamic(ggml_cgraph * cgraph, std::shared_ptr<
                         for (const auto & n : GgmlOvDecoder::collect_weight_names(cgraph)) {
                             weight_names[n] = nullptr;
                         }
-                        ggml_decoder = std::make_shared<GgmlOvDecoder>(cgraph, m_params, c_params, weight_names,
-                                                                       is_static, stateful, model_is_splitted);
+                        ggml_decoder =
+                            std::make_shared<GgmlOvDecoder>(cgraph, m_params, c_params, weight_names, is_static,
+                                                            stateful, model_is_splitted, false, 256, fixed_token_shape);
                         infer_request = std::make_shared<ov::InferRequest>(cm.create_infer_request());
                         entry->ptr = ggml_decoder;
                         // Names must match the decoder's ggml-tensor keys. The non-cached
@@ -412,8 +428,9 @@ enum ggml_status ov_graph_compute_dynamic(ggml_cgraph * cgraph, std::shared_ptr<
             } else {
                 auto model_weights = GgmlOvDecoder::create_weight_nodes(cgraph);
 
-                ggml_decoder = std::make_shared<GgmlOvDecoder>(cgraph, m_params, c_params, model_weights, is_static,
-                                                               stateful, model_is_splitted);
+                ggml_decoder =
+                    std::make_shared<GgmlOvDecoder>(cgraph, m_params, c_params, model_weights, is_static, stateful,
+                                                    model_is_splitted, false, 256, fixed_token_shape);
                 decoder_end_time = ggml_time_us();
 
                 auto input_model = std::make_shared<ov::frontend::ggml::InputModel>(ggml_decoder);

@@ -119,15 +119,18 @@ ov::Output<ov::Node> translate_mul_mat_id_mxfp4_packed(const NodeContext & conte
     const int64_t qk = 32;
     const int64_t cols = k_blocks * qk;
 
-    if (ggml_openvino_get_device_name() == "CPU" && ids.get_partial_shape().is_static() &&
-        activations.get_partial_shape().is_static()) {
-        const ov::Shape id_shape = ids.get_shape();
-        if (id_shape.size() == 4 && id_shape[3] != 0 && rows != 0 && cols != 0) {
+    if (ggml_openvino_get_device_name() == "CPU") {
+        const ov::PartialShape id_shape = ids.get_partial_shape();
+        const ov::PartialShape act_shape = activations.get_partial_shape();
+        if (id_shape.rank().is_static() && id_shape.rank().get_length() == 4 && act_shape.rank().is_static() &&
+            act_shape.rank().get_length() == 4 && id_shape[3].is_static() && id_shape[3].get_length() != 0 &&
+            rows != 0 && cols != 0) {
             // The CPU JIT uses signed 32-bit gather offsets for the decoded weights.
             static constexpr size_t max_selected_bytes = 512ULL << 20;
-            const size_t max_chunk_tokens = max_selected_bytes / sizeof(float) / id_shape[3] / rows / cols;
-            const size_t n_tokens = id_shape[2];
-            if (max_chunk_tokens > 0 && n_tokens > max_chunk_tokens) {
+            const size_t max_chunk_tokens =
+                std::max<size_t>(1, max_selected_bytes / sizeof(float) / id_shape[3].get_length() / rows / cols);
+            if (id_shape[2].is_static() && act_shape[1].is_static() && id_shape[2].get_length() > max_chunk_tokens) {
+                const size_t n_tokens = id_shape[2].get_length();
                 ov::OutputVector chunks;
                 chunks.reserve((n_tokens + max_chunk_tokens - 1) / max_chunk_tokens);
                 for (size_t begin = 0; begin < n_tokens; begin += max_chunk_tokens) {
@@ -167,19 +170,35 @@ ov::Output<ov::Node> translate_mul_mat_id_mxfp4_packed(const NodeContext & conte
     e8m0_lut[0] = std::numeric_limits<float>::min() / 2.0f;
     e8m0_lut[255] = std::numeric_limits<float>::quiet_NaN();
 
-    auto f4_lut = ov::op::v0::Constant::create(ov::element::f32, ov::Shape{f4e2m1_lut.size()}, f4e2m1_lut);
     auto scale_lut = ov::op::v0::Constant::create(ov::element::f32, ov::Shape{e8m0_lut.size()}, e8m0_lut);
 
     auto selected_packed_weights = std::make_shared<ov::op::v8::Gather>(expert_weights, ids, gather_axis);
     auto scale_byte = slice_axis(selected_packed_weights, 4, 0, 1);
     auto qs = slice_axis(selected_packed_weights, 4, 1, 17);
-    auto low = std::make_shared<ov::op::v13::BitwiseAnd>(
-        qs, ov::op::v0::Constant::create(ov::element::u8, ov::Shape{}, {0x0F}), ov::op::AutoBroadcastType::NUMPY);
-    auto high_shift = std::make_shared<ov::op::v15::BitwiseRightShift>(
-        qs, ov::op::v0::Constant::create(ov::element::u8, ov::Shape{}, {4}), ov::op::AutoBroadcastType::NUMPY);
-    auto nibbles = std::make_shared<ov::op::v0::Concat>(ov::OutputVector{low, high_shift}, 4);
-    auto nibble_indices = std::make_shared<ov::op::v0::Convert>(nibbles, ov::element::i32);
-    auto weights_f32 = std::make_shared<ov::op::v8::Gather>(f4_lut, nibble_indices, gather_axis);
+    ov::Output<ov::Node> weights_f32;
+    if (ggml_openvino_get_device_name() == "CPU") {
+        std::vector<float> low_lut(256);
+        std::vector<float> high_lut(256);
+        for (size_t i = 0; i < low_lut.size(); ++i) {
+            low_lut[i] = f4e2m1_lut[i & 0x0F];
+            high_lut[i] = f4e2m1_lut[i >> 4];
+        }
+        auto low_lut_node = ov::op::v0::Constant::create(ov::element::f32, ov::Shape{low_lut.size()}, low_lut);
+        auto high_lut_node = ov::op::v0::Constant::create(ov::element::f32, ov::Shape{high_lut.size()}, high_lut);
+        auto byte_indices = std::make_shared<ov::op::v0::Convert>(qs, ov::element::i32);
+        auto low = std::make_shared<ov::op::v8::Gather>(low_lut_node, byte_indices, gather_axis);
+        auto high = std::make_shared<ov::op::v8::Gather>(high_lut_node, byte_indices, gather_axis);
+        weights_f32 = std::make_shared<ov::op::v0::Concat>(ov::OutputVector{low, high}, 4);
+    } else {
+        auto f4_lut = ov::op::v0::Constant::create(ov::element::f32, ov::Shape{f4e2m1_lut.size()}, f4e2m1_lut);
+        auto low = std::make_shared<ov::op::v13::BitwiseAnd>(
+            qs, ov::op::v0::Constant::create(ov::element::u8, ov::Shape{}, {0x0F}), ov::op::AutoBroadcastType::NUMPY);
+        auto high = std::make_shared<ov::op::v15::BitwiseRightShift>(
+            qs, ov::op::v0::Constant::create(ov::element::u8, ov::Shape{}, {4}), ov::op::AutoBroadcastType::NUMPY);
+        auto nibbles = std::make_shared<ov::op::v0::Concat>(ov::OutputVector{low, high}, 4);
+        auto nibble_indices = std::make_shared<ov::op::v0::Convert>(nibbles, ov::element::i32);
+        weights_f32 = std::make_shared<ov::op::v8::Gather>(f4_lut, nibble_indices, gather_axis);
+    }
 
     auto scale_indices = std::make_shared<ov::op::v0::Convert>(scale_byte, ov::element::i32);
     auto scales_f32 = std::make_shared<ov::op::v8::Gather>(scale_lut, scale_indices, gather_axis);
