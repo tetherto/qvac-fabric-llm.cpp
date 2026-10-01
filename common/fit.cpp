@@ -7,9 +7,11 @@
 
 #include <array>
 #include <algorithm>
+#include <atomic>
 #include <cassert>
 #include <stdexcept>
 #include <cinttypes>
+#include <exception>
 #include <set>
 #include <mutex>
 #include <string>
@@ -47,6 +49,33 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
             void * user_data;
         } original_logger;
         ggml_log_level min_level; // prints below this log level go to debug log
+        std::exception_ptr callback_exception;
+        std::mutex         callback_exception_mutex;
+        std::atomic<bool>  callback_failed = false;
+
+        // Keep callback exceptions inside the wrapper, then rethrow after the llama call so the logger guard restores.
+        void log(ggml_log_level level, const char * text) {
+            if (callback_failed.load(std::memory_order_acquire)) {
+                return;
+            }
+            try {
+                const ggml_log_level level_eff = level >= min_level ? level : GGML_LOG_LEVEL_DEBUG;
+                original_logger.callback(level_eff, text, original_logger.user_data);
+            } catch (...) {
+                const std::lock_guard<std::mutex> lock(callback_exception_mutex);
+                if (!callback_exception) {
+                    callback_exception = std::current_exception();
+                }
+                callback_failed.store(true, std::memory_order_release);
+            }
+        }
+
+        void rethrow_callback_exception() {
+            const std::lock_guard<std::mutex> lock(callback_exception_mutex);
+            if (callback_exception) {
+                std::rethrow_exception(callback_exception);
+            }
+        }
 
         ~user_data_t() {
             llama_log_set(original_logger.callback, original_logger.user_data);
@@ -56,23 +85,23 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
     llama_log_get(&ud.original_logger.callback, &ud.original_logger.user_data);
     ud.min_level = log_level;
 
-    llama_log_set([](ggml_log_level level, const char * text, void * user_data) {
-        const user_data_t * ud = (const user_data_t *) user_data;
-        const ggml_log_level level_eff = level >= ud->min_level ? level : GGML_LOG_LEVEL_DEBUG;
-        ud->original_logger.callback(level_eff, text, ud->original_logger.user_data);
-    }, &ud);
+    llama_log_set([](ggml_log_level level, const char * text,
+                     void * user_data) { ((user_data_t *) user_data)->log(level, text); },
+                  &ud);
 
     llama_model_params mparams_copy = *mparams;
     mparams_copy.no_alloc  = true;
     mparams_copy.load_mode = LLAMA_LOAD_MODE_NONE;
 
     llama_model_ptr model_owner(llama_model_load_from_file(path_model, mparams_copy));
+    ud.rethrow_callback_exception();
     llama_model * model = model_owner.get();
     if (model == nullptr) {
         throw std::runtime_error("failed to load model");
     }
 
     llama_context_ptr ctx_owner(llama_init_from_model(model, *cparams));
+    ud.rethrow_callback_exception();
     llama_context * ctx = ctx_owner.get();
     if (ctx == nullptr) {
         throw common_params_fit_exception("failed to create llama_context from model");
@@ -108,6 +137,7 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
     {
         ggml_backend_dev_t cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
         if (cpu_dev == nullptr) {
+            ud.rethrow_callback_exception();
             throw std::runtime_error("no CPU backend found");
         }
         size_t free;
@@ -153,6 +183,9 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
     hp_n_expert    = llama_model_n_expert(model);
 
     common_memory_breakdown_print(ctx);
+    ctx_owner.reset();
+    model_owner.reset();
+    ud.rethrow_callback_exception();
 
     return ret;
 }
