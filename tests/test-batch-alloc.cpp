@@ -285,6 +285,17 @@ static void test_init(testing & t) {
     });
 }
 
+// checks that the ubatch rows hold the batch_builder embeddings of the given batch indices
+static void assert_embd_rows(testing & t, const llama_ubatch & ub, uint32_t n_embd, std::initializer_list<int32_t> rows) {
+    t.assert_equal(rows.size(), (size_t) ub.n_tokens);
+    uint32_t i = 0;
+    for (const int32_t row : rows) {
+        t.assert_equal(100.0f*row,     ub.embd[i*n_embd]);
+        t.assert_equal(100.0f*row + 1, ub.embd[i*n_embd + 1]);
+        ++i;
+    }
+}
+
 static void test_split(testing & t) {
     llama_vocab vocab;
 
@@ -409,6 +420,44 @@ static void test_split(testing & t) {
         t.assert_equal(2, ub.n_seq_id[0]);
         t.assert_equal(0, ub.seq_idx[0]);
         t.assert_equal(1, ub.seq_idx[1]);
+    });
+
+    t.test("split_embd_rows_disjoint", [&](testing & t) {
+        batch_builder bb;
+        for (int i = 0; i < 4; ++i) {
+            bb.add(i, {0}, i == 3);
+        }
+        for (int i = 0; i < 2; ++i) {
+            bb.add(i, {1}, i == 1);
+        }
+
+        llama_batch_allocr ba(1);
+        t.assert_true(ba.init(bb.make(), vocab, nullptr, bb.n_embd, 4, false));
+
+        // the first ubatch interleaves both sequences, so its rows are gathered, not contiguous
+        const llama_ubatch ub0 = ba.split_equal(8, false, 0);
+        const llama_ubatch ub1 = ba.split_equal(8, false, 0);
+        assert_embd_rows(t, ub0, bb.n_embd, {0, 1, 4, 5});
+        assert_embd_rows(t, ub1, bb.n_embd, {2, 3});
+    });
+
+    t.test("split_embd_storage_reused", [&](testing & t) {
+        batch_builder bb;
+        for (int i = 0; i < 3; ++i) {
+            bb.add(i, {0}, i == 2);
+        }
+
+        llama_batch_allocr ba(1);
+        t.assert_true(ba.init(bb.make(), vocab, nullptr, bb.n_embd, 4, false));
+        const llama_ubatch ub0 = ba.split_simple(3);
+        assert_embd_rows(t, ub0, bb.n_embd, {0, 1, 2});
+
+        bb.embd[0] = -1.0f;
+        t.assert_true(ba.init(bb.make(), vocab, nullptr, bb.n_embd, 4, false));
+        const llama_ubatch ub1 = ba.split_simple(3);
+        t.assert_true("the next batch reuses the embeddings storage", ub1.embd == ub0.embd);
+        t.assert_equal("the next batch rows are copied", -1.0f, ub1.embd[0]);
+        t.assert_equal(100.0f*2, ub1.embd[2*bb.n_embd]);
     });
 
     t.test("split_seq_per_sequence", [&](testing & t) {
