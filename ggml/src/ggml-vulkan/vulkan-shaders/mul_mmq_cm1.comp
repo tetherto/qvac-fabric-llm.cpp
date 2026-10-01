@@ -8,6 +8,7 @@
 #extension GL_KHR_shader_subgroup_basic : require
 #extension GL_KHR_cooperative_matrix : require
 #extension GL_KHR_memory_scope_semantics : enable
+#extension GL_KHR_shader_subgroup_shuffle : enable
 
 #if defined(MUL_MAT_ID_USE_SUBGROUPS)
 #extension GL_KHR_shader_subgroup_ballot : enable
@@ -36,6 +37,11 @@ layout (binding = 0) readonly buffer A_PACKED32 {A_TYPE_PACKED32 data_a_packed32
 #endif
 layout (binding = 1) readonly buffer B {block_q8_1_x4_packed128 data_b[];};
 layout (binding = 2) writeonly buffer D {D_TYPE data_d[];};
+
+#ifndef D16
+// f32 output: four adjacent rows of a column go out as one 128-bit store
+layout (binding = 2) writeonly buffer D4 {vec4 data_d4[];};
+#endif
 
 #ifdef MUL_MAT_ID
 layout (binding = 3) readonly buffer IDS {int data_ids[];};
@@ -85,6 +91,7 @@ layout (constant_id = 9) const uint TK = 16;
 layout (constant_id = 10) const uint WARP = 32;
 layout (constant_id = 11) const uint DEVICE_ARCH = 0; // vk_device_architecture (ggml-vulkan.cpp)
 #define VK_ARCH_AMD_RDNA4 5u
+layout (constant_id = 12) const uint PACKSTORE = 1; // 0: per-element f32 stores (GGML_VK_MMQ_PACKSTORE=0)
 
 #define BK 32
 #ifdef MUL_MAT_ID
@@ -125,6 +132,25 @@ const uint CM_ELEMS = (TM * TN) / WARP;
 #define ACC_BIAS_BITS 0x4B400000
 #define ACC_BIAS_F    12582912.0f
 const bool USE_MAGIC_BIAS = WARP != 32;
+
+// RDNA3/3.5 wave32 accumulator: lane l holds column l % 16, rows (l / 16) + 2e. Two shuffles with the lane 16
+// away give each lane four adjacent rows of its column: for element group e..e+3 the low half stores rows
+// 2e..2e+3 and the high half rows 2e+4..2e+7, so every lane writes one vec4 per four elements instead of four
+// scattered dwords. All lanes must reach the shuffles, so the caller only branches on uniform values.
+#ifndef D16
+const uint PACK_F32 = PACKSTORE * uint(DEVICE_ARCH != VK_ARCH_AMD_RDNA4) * uint(WARP == 32) * uint(TM == 16) * uint(TN == 16);
+
+void store_f32x4(const uint idx, const uint row_g, const vec4 v) {
+    if (row_g + 3 < p.M) {
+        data_d4[idx / 4] = v;
+    } else {
+        // ragged tail: never write past the row end
+        if (row_g     < p.M) { data_d[idx]     = v.x; }
+        if (row_g + 1 < p.M) { data_d[idx + 1] = v.y; }
+        if (row_g + 2 < p.M) { data_d[idx + 2] = v.z; }
+    }
+}
+#endif
 
 // Accumulator row for element e: RDNA4 blocked, RDNA3/3.5 interleaved.
 uint cm_elem_row(uint e) {
@@ -453,6 +479,34 @@ void main() {
     const uint dc = ic * BN + b_col0;
 
 #ifdef MUL_MAT_ID
+#ifndef D16
+    if (PACK_F32 != 0) {
+        if ((p.stride_d % 4) == 0 && (p.batch_stride_d % 4) == 0) {
+            const bool lo_half = gl_SubgroupInvocationID < 16;
+            [[unroll]] for (uint r = 0; r < cms_per_row; r++) {
+                [[unroll]] for (uint c = 0; c < cms_per_col; c++) {
+                    const uint tile_idx = r * cms_per_col + c;
+                    const uint col_i = dc + c * TN + elem_col0;
+                    [[unroll]] for (uint e = 0; e < CM_ELEMS; e += 4) {
+                        const float a0 = float(sums[tile_idx * CM_ELEMS + e]);
+                        const float a1 = float(sums[tile_idx * CM_ELEMS + e + 1]);
+                        const float a2 = float(sums[tile_idx * CM_ELEMS + e + 2]);
+                        const float a3 = float(sums[tile_idx * CM_ELEMS + e + 3]);
+                        const float r0 = subgroupShuffleXor(lo_half ? a2 : a0, 16);
+                        const float r1 = subgroupShuffleXor(lo_half ? a3 : a1, 16);
+                        const vec4 v = lo_half ? vec4(a0, r0, a1, r1) : vec4(r0, a2, r1, a3);
+                        const uint row_g = dr + r * TM + 2u * e + (lo_half ? 0u : 4u);
+                        if (col_i < _ne1) {
+                            const u16vec2 row_idx = row_ids[col_i - ic * BN];
+                            store_f32x4(row_idx.y * p.batch_stride_d + row_idx.x * p.stride_d + row_g, row_g, v);
+                        }
+                    }
+                }
+            }
+            return;
+        }
+    }
+#endif
     [[unroll]] for (uint r = 0; r < cms_per_row; r++) {
         [[unroll]] for (uint c = 0; c < cms_per_col; c++) {
             const uint tile_idx = r * cms_per_col + c;
@@ -471,6 +525,34 @@ void main() {
     }
 #else
     const uint offsets = batch_idx * p.batch_stride_d + ik * p.batch_stride_d * p.num_batches;
+
+#ifndef D16
+    if (PACK_F32 != 0) {
+        if ((p.stride_d % 4) == 0 && (offsets % 4) == 0) {
+            const bool lo_half = gl_SubgroupInvocationID < 16;
+            [[unroll]] for (uint r = 0; r < cms_per_row; r++) {
+                [[unroll]] for (uint c = 0; c < cms_per_col; c++) {
+                    const uint tile_idx = r * cms_per_col + c;
+                    const uint col_g = dc + c * TN + elem_col0;
+                    [[unroll]] for (uint e = 0; e < CM_ELEMS; e += 4) {
+                        const float a0 = float(sums[tile_idx * CM_ELEMS + e]);
+                        const float a1 = float(sums[tile_idx * CM_ELEMS + e + 1]);
+                        const float a2 = float(sums[tile_idx * CM_ELEMS + e + 2]);
+                        const float a3 = float(sums[tile_idx * CM_ELEMS + e + 3]);
+                        const float r0 = subgroupShuffleXor(lo_half ? a2 : a0, 16);
+                        const float r1 = subgroupShuffleXor(lo_half ? a3 : a1, 16);
+                        const vec4 v = lo_half ? vec4(a0, r0, a1, r1) : vec4(r0, a2, r1, a3);
+                        const uint row_g = dr + r * TM + 2u * e + (lo_half ? 0u : 4u);
+                        if (col_g < p.N) {
+                            store_f32x4(offsets + col_g * p.stride_d + row_g, row_g, v);
+                        }
+                    }
+                }
+            }
+            return;
+        }
+    }
+#endif
 
     [[unroll]] for (uint r = 0; r < cms_per_row; r++) {
         [[unroll]] for (uint c = 0; c < cms_per_col; c++) {
