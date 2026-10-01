@@ -19,6 +19,8 @@ import subprocess
 import sys
 import time
 
+from qvac_bench_db import DbPreflightError, make_pusher
+
 REPO_ROOT: Path = Path(__file__).resolve().parent.parent
 WORKDIR: Path = REPO_ROOT / "bench-workdir"
 RESULTS_DIR: Path = WORKDIR / "results"
@@ -335,6 +337,12 @@ def build_parser():
              "Files already present are reused; only missing ones are downloaded."
     )
     p.add_argument("--clean-unused", action="store_true")
+    p.add_argument(
+        "--db-url",
+        default=os.environ.get("DATABASE_URL"),
+        help="Postgres/TimescaleDB URL to push results to as they complete "
+             "(default: $DATABASE_URL; no push when unset)"
+    )
 
     return p
 
@@ -1272,6 +1280,7 @@ def bench_driver(
     builds: Sequence[Build],
     options: OptionsType,
     report_options: OptionsType,
+    db_url: str | None = None,
 ) -> None:
     WORKDIR.mkdir(exist_ok=True)
     RESULTS_DIR.mkdir(exist_ok=True)
@@ -1279,6 +1288,13 @@ def bench_driver(
     IMAGES_DIR.mkdir(exist_ok=True)
 
     options = benchmark.default_options | options
+
+    try:
+        pusher = make_pusher(db_url)
+        if pusher:
+            pusher.ping()
+    except DbPreflightError as e:
+        sys.exit(f"db: {e}")
 
     log("driver", f"downloading models for benchmark")
     for model in models:
@@ -1335,10 +1351,12 @@ def bench_driver(
                 "branch": build.branch,
                 "backend": build.backend,
                 "model": model.file,
-                "date": datetime.datetime.now().isoformat(),
+                "date": datetime.datetime.now(datetime.timezone.utc).isoformat(),
                 "options": run_ctx.options,
                 "gpus": allgpuinfo(),
             }
+            if os.environ.get("CI_JOB_URL"):
+                status["run_url"] = os.environ["CI_JOB_URL"]
 
             try:
                 if run_ctx.options["warmup"] > 0:
@@ -1360,7 +1378,15 @@ def bench_driver(
             with statuspath.open("w") as f:
                 json.dump(status, f, indent=2)
 
+            if pusher:
+                pusher.push_run(benchmark.result_path_stem(run_ctx))
+
             time.sleep(run_ctx.options["cooldown"])
+
+    if pusher:
+        # Catch-up pass: runs skipped as already successful, plus anything the
+        # per-run push missed. Upserts are idempotent.
+        pusher.push_results_dir(RESULTS_DIR, f"{benchmark.name}-*")
 
     dfs = []
     for (build, worktree) in builds_with_worktrees:
@@ -1413,6 +1439,7 @@ def main() -> None:
         builds,
         config.get("options", {}),
         config.get("report_options", {}),
+        db_url=args.db_url,
     )
 
 
