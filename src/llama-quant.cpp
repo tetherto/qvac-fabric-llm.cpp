@@ -321,6 +321,12 @@ static bool tensor_allows_quantization(const llama_model_quantize_params * param
     quantize &= name != LLM_TN(arch)(LLM_TENSOR_POS_EMBD,    "weight");
     quantize &= name != LLM_TN(arch)(LLM_TENSOR_TOKEN_TYPES, "weight");
 
+    // keep the small tensors of the laya decision head (the act head reads n_embd + 4 inputs)
+    quantize &= name != LLM_TN(arch)(LLM_TENSOR_DECISION_TYPE_EMBD,  "weight");
+    quantize &= name != LLM_TN(arch)(LLM_TENSOR_DECISION_SCORER_OUT, "weight");
+    quantize &= name != LLM_TN(arch)(LLM_TENSOR_DECISION_ACT,        "weight");
+    quantize &= name != LLM_TN(arch)(LLM_TENSOR_DECISION_ACT_OUT,    "weight");
+
     // do not quantize Mamba/Kimi's small conv1d weights
     // NOTE: can't use LLM_TN here because the layer number is not known
     quantize &= name.find("ssm_conv1d") == std::string::npos;

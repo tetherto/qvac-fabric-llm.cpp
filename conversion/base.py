@@ -1312,6 +1312,14 @@ class ModelBase:
                 config = json.load(f)
             return config
 
+        # Laya decision checkpoints keep the encoder config under encoder/ next to
+        # rl_agent_config.json, and have no top-level config.json
+        if not (dir_model / "config.json").is_file() and (dir_model / "rl_agent_config.json").is_file():
+            with open(dir_model / "encoder" / "config.json", "r", encoding="utf-8") as f:
+                config = json.load(f)
+            config["architectures"] = ["LayaDecisionModel"]
+            return config
+
         try:
             # for security reason, we don't allow loading remote code by default
             # if a model need remote code, we will fallback to config.json

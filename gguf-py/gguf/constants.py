@@ -296,6 +296,13 @@ class Keys:
     class Classifier:
         OUTPUT_LABELS = "{arch}.classifier.output_labels"
 
+    class Decision:
+        BLOCK_COUNT  = "{arch}.decision.block_count"
+        ACT_COUNT    = "{arch}.decision.act_count"
+        MAX_OPTIONS  = "{arch}.decision.max_options"
+        QTYPE_TOKENS = "{arch}.decision.qtype_tokens"
+        CONFIG       = "{arch}.decision.config"
+
     class ShortConv:
         L_CACHE = "{arch}.shortconv.l_cache"
 
@@ -488,6 +495,7 @@ class MODEL_ARCH(IntEnum):
     REFACT           = auto()
     BERT             = auto()
     MODERN_BERT      = auto()
+    LAYA             = auto()
     NOMIC_BERT       = auto()
     NOMIC_BERT_MOE   = auto()
     NEO_BERT         = auto()
@@ -848,6 +856,18 @@ class MODEL_TENSOR(IntEnum):
     CLS                  = auto() # classifier
     CLS_OUT              = auto() # classifier output projection
     CLS_NORM             = auto()
+    DECISION_TYPE_EMBD   = auto() # decision head (laya)
+    DECISION_ATTN_NORM   = auto()
+    DECISION_ATTN_QKV    = auto()
+    DECISION_ATTN_OUT    = auto()
+    DECISION_FFN_NORM    = auto()
+    DECISION_FFN_UP      = auto()
+    DECISION_FFN_DOWN    = auto()
+    DECISION_SCORER_NORM = auto()
+    DECISION_SCORER      = auto()
+    DECISION_SCORER_OUT  = auto()
+    DECISION_ACT         = auto()
+    DECISION_ACT_OUT     = auto()
     CONV1D               = auto()
     CONVNEXT_DW          = auto()
     CONVNEXT_NORM        = auto()
@@ -1226,6 +1246,7 @@ MODEL_ARCH_NAMES: dict[MODEL_ARCH, str] = {
     MODEL_ARCH.REFACT:           "refact",
     MODEL_ARCH.BERT:             "bert",
     MODEL_ARCH.MODERN_BERT:      "modern-bert",
+    MODEL_ARCH.LAYA:             "laya",
     MODEL_ARCH.NOMIC_BERT:       "nomic-bert",
     MODEL_ARCH.NOMIC_BERT_MOE:   "nomic-bert-moe",
     MODEL_ARCH.NEO_BERT:         "neo-bert",
@@ -1585,6 +1606,18 @@ TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
     MODEL_TENSOR.CLS:                       "cls",
     MODEL_TENSOR.CLS_OUT:                   "cls.output",
     MODEL_TENSOR.CLS_NORM:                  "cls.norm",
+    MODEL_TENSOR.DECISION_TYPE_EMBD:        "decision.type_embd",
+    MODEL_TENSOR.DECISION_ATTN_NORM:        "decision.blk.{bid}.attn_norm",
+    MODEL_TENSOR.DECISION_ATTN_QKV:         "decision.blk.{bid}.attn_qkv",
+    MODEL_TENSOR.DECISION_ATTN_OUT:         "decision.blk.{bid}.attn_output",
+    MODEL_TENSOR.DECISION_FFN_NORM:         "decision.blk.{bid}.ffn_norm",
+    MODEL_TENSOR.DECISION_FFN_UP:           "decision.blk.{bid}.ffn_up",
+    MODEL_TENSOR.DECISION_FFN_DOWN:         "decision.blk.{bid}.ffn_down",
+    MODEL_TENSOR.DECISION_SCORER_NORM:      "decision.scorer_norm",
+    MODEL_TENSOR.DECISION_SCORER:           "decision.scorer",
+    MODEL_TENSOR.DECISION_SCORER_OUT:       "decision.scorer_out",
+    MODEL_TENSOR.DECISION_ACT:              "decision.act",
+    MODEL_TENSOR.DECISION_ACT_OUT:          "decision.act_out",
     MODEL_TENSOR.CONV1D:                    "conv1d",
     MODEL_TENSOR.CONVNEXT_DW:               "convnext.{bid}.dw",
     MODEL_TENSOR.CONVNEXT_NORM:             "convnext.{bid}.norm",
@@ -2410,6 +2443,29 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.CLS,
         MODEL_TENSOR.CLS_OUT,
         MODEL_TENSOR.CLS_NORM,
+    ],
+    MODEL_ARCH.LAYA: [
+        MODEL_TENSOR.TOKEN_EMBD,
+        MODEL_TENSOR.TOKEN_EMBD_NORM,
+        MODEL_TENSOR.OUTPUT_NORM,
+        MODEL_TENSOR.ATTN_NORM,
+        MODEL_TENSOR.ATTN_OUT,
+        MODEL_TENSOR.ATTN_QKV,
+        MODEL_TENSOR.FFN_UP,
+        MODEL_TENSOR.FFN_DOWN,
+        MODEL_TENSOR.FFN_NORM,
+        MODEL_TENSOR.DECISION_TYPE_EMBD,
+        MODEL_TENSOR.DECISION_ATTN_NORM,
+        MODEL_TENSOR.DECISION_ATTN_QKV,
+        MODEL_TENSOR.DECISION_ATTN_OUT,
+        MODEL_TENSOR.DECISION_FFN_NORM,
+        MODEL_TENSOR.DECISION_FFN_UP,
+        MODEL_TENSOR.DECISION_FFN_DOWN,
+        MODEL_TENSOR.DECISION_SCORER_NORM,
+        MODEL_TENSOR.DECISION_SCORER,
+        MODEL_TENSOR.DECISION_SCORER_OUT,
+        MODEL_TENSOR.DECISION_ACT,
+        MODEL_TENSOR.DECISION_ACT_OUT,
     ],
     MODEL_ARCH.NOMIC_BERT: [
         MODEL_TENSOR.TOKEN_EMBD,

@@ -71,6 +71,7 @@ set(${TARGET}_HEADERS
     http.h
     imatrix-loader.h
     json-schema-to-grammar.h
+    laya.h
     log.h
     ngram-cache.h
     ngram-map.h
@@ -114,6 +115,7 @@ add_library(${TARGET} STATIC
     hf-cache.cpp
     imatrix-loader.cpp
     json-schema-to-grammar.cpp
+    laya.cpp
     llguidance.cpp
     log.cpp
     ngram-cache.cpp

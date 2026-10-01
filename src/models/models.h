@@ -350,6 +350,67 @@ struct llama_model_modern_bert : public llama_model_base {
 
     struct graph : public llm_graph_context {
         graph(const llama_model & model, const llm_graph_params & params);
+
+    protected:
+        // for derived graphs that build on the encoder output
+        graph(const llm_graph_params & params) : llm_graph_context(params) {}
+
+        // encoder output after the final norm, reduced to the inp_out_ids rows when given
+        ggml_tensor * build_encoder(const llama_model & model, ggml_tensor * inp_out_ids);
+
+        llm_graph_input_attn_no_cache * inp_attn = nullptr;
+    };
+
+    std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
+};
+
+
+// ModernBert encoder with the typed decision head of https://github.com/NandhaKishorM/laya
+struct llama_model_laya : public llama_model_modern_bert {
+    llama_model_laya(const struct llama_model_params & params) : llama_model_modern_bert(params) {}
+    void load_arch_hparams(llama_model_loader & ml) override;
+    void load_arch_tensors(llama_model_loader & ml) override;
+
+    // pre-norm transformer encoder layer (nn.TransformerEncoderLayer, norm_first=True)
+    struct decision_layer {
+        ggml_tensor * attn_norm   = nullptr;
+        ggml_tensor * attn_norm_b = nullptr;
+        ggml_tensor * wqkv        = nullptr;
+        ggml_tensor * bqkv        = nullptr;
+        ggml_tensor * wo          = nullptr;
+        ggml_tensor * bo          = nullptr;
+        ggml_tensor * ffn_norm    = nullptr;
+        ggml_tensor * ffn_norm_b  = nullptr;
+        ggml_tensor * ffn_up      = nullptr;
+        ggml_tensor * ffn_up_b    = nullptr;
+        ggml_tensor * ffn_down    = nullptr;
+        ggml_tensor * ffn_down_b  = nullptr;
+    };
+
+    uint32_t n_decision_layer = 0;
+    uint32_t n_act            = 0; // act head outputs
+    uint32_t n_max_options    = 0; // option logits per output row
+
+    // first token of "<type> question:" for the question types choice, score, noul
+    std::vector<int32_t> qtype_tokens;
+
+    ggml_tensor * decision_type_embd = nullptr;
+
+    std::vector<decision_layer> decision_layers;
+
+    ggml_tensor * decision_scorer_norm   = nullptr;
+    ggml_tensor * decision_scorer_norm_b = nullptr;
+    ggml_tensor * decision_scorer        = nullptr;
+    ggml_tensor * decision_scorer_b      = nullptr;
+    ggml_tensor * decision_scorer_out    = nullptr;
+    ggml_tensor * decision_scorer_out_b  = nullptr;
+    ggml_tensor * decision_act           = nullptr;
+    ggml_tensor * decision_act_b         = nullptr;
+    ggml_tensor * decision_act_out       = nullptr;
+    ggml_tensor * decision_act_out_b     = nullptr;
+
+    struct graph : public llama_model_modern_bert::graph {
+        graph(const llama_model & model, const llm_graph_params & params);
     };
 
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
