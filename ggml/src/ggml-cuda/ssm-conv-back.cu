@@ -15,8 +15,8 @@ static_assert(std::is_trivially_copyable_v<ggml_cuda_ssm_conv_back_sx_kargs>);
 struct ggml_cuda_ssm_conv_back_c_kargs {
     uint32_t nc, ncs, nr, n_t, n_s;
     uint32_t grad_nb0, grad_nb1, grad_nb2;
-    uint sx_nb0, sx_nb1, sx_nb2;
-    uint dst_nb1;
+    uint32_t sx_nb0, sx_nb1, sx_nb2;
+    uint32_t dst_nb1;
 };
 static_assert(std::is_trivially_copyable_v<ggml_cuda_ssm_conv_back_c_kargs>);
 
@@ -144,20 +144,19 @@ ggml_cuda_op_ssm_conv_back_sx(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     const uint32_t n_t = (uint32_t)grad_out->ne[1];
     const uint32_t n_s = (uint32_t)dst->ne[2];
 
-    const ggml_cuda_ssm_conv_back_sx_kargs args = {
-        .nc       = nc,
-        .ncs      = ncs,
-        .nr       = nr,
-        .n_t      = n_t,
-        .n_s      = n_s,
-        .grad_nb0 = (uint32_t)grad_out->nb[0]/fsz,
-        .grad_nb1 = (uint32_t)grad_out->nb[1]/fsz,
-        .grad_nb2 = (uint32_t)grad_out->nb[2]/fsz,
-        .dst_nb0  = (uint32_t)dst->nb[0]/fsz,
-        .dst_nb1  = (uint32_t)dst->nb[1]/fsz,
-        .dst_nb2  = (uint32_t)dst->nb[2]/fsz,
-        .c_nb1    = (uint32_t)c->nb[1]/fsz,
-    };
+    ggml_cuda_ssm_conv_back_sx_kargs args{};
+    args.nc             = nc;
+    args.ncs            = ncs;
+    args.nr             = nr;
+    args.n_t            = n_t;
+    args.n_s            = n_s;
+    args.grad_nb0       = (uint32_t) grad_out->nb[0] / fsz;
+    args.grad_nb1       = (uint32_t) grad_out->nb[1] / fsz;
+    args.grad_nb2       = (uint32_t) grad_out->nb[2] / fsz;
+    args.dst_nb0        = (uint32_t) dst->nb[0] / fsz;
+    args.dst_nb1        = (uint32_t) dst->nb[1] / fsz;
+    args.dst_nb2        = (uint32_t) dst->nb[2] / fsz;
+    args.c_nb1          = (uint32_t) c->nb[1] / fsz;
     cudaStream_t stream = ctx.stream();
     launch_op_ssm_conv_back_sx(data_grad, data_c, data_dst, stream, args);
 }
@@ -185,20 +184,19 @@ ggml_cuda_op_ssm_conv_back_c(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
     const uint32_t n_t = (uint32_t)grad_out->ne[1];
     const uint32_t n_s = (uint32_t)grad_out->ne[2];
 
-    const ggml_cuda_ssm_conv_back_c_kargs args = {
-        .nc       = nc,
-        .ncs      = ncs,
-        .nr       = nr,
-        .n_t      = n_t,
-        .n_s      = n_s,
-        .grad_nb0 = (uint32_t)grad_out->nb[0]/fsz,
-        .grad_nb1 = (uint32_t)grad_out->nb[1]/fsz,
-        .grad_nb2 = (uint32_t)grad_out->nb[2]/fsz,
-        .sx_nb0  = (uint32_t)sx->nb[0]/fsz,
-        .sx_nb1  = (uint32_t)sx->nb[1]/fsz,
-        .sx_nb2  = (uint32_t)sx->nb[2]/fsz,
-        .dst_nb1 = (uint32_t)dst->nb[1]/fsz,
-    };
+    ggml_cuda_ssm_conv_back_c_kargs args{};
+    args.nc             = nc;
+    args.ncs            = ncs;
+    args.nr             = nr;
+    args.n_t            = n_t;
+    args.n_s            = n_s;
+    args.grad_nb0       = (uint32_t) grad_out->nb[0] / fsz;
+    args.grad_nb1       = (uint32_t) grad_out->nb[1] / fsz;
+    args.grad_nb2       = (uint32_t) grad_out->nb[2] / fsz;
+    args.sx_nb0         = (uint32_t) sx->nb[0] / fsz;
+    args.sx_nb1         = (uint32_t) sx->nb[1] / fsz;
+    args.sx_nb2         = (uint32_t) sx->nb[2] / fsz;
+    args.dst_nb1        = (uint32_t) dst->nb[1] / fsz;
     cudaStream_t stream = ctx.stream();
     launch_op_ssm_conv_back_c(data_grad, data_sx, data_dst, stream, args);
 }
