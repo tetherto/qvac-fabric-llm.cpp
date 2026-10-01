@@ -40,7 +40,7 @@ def write_manifest(path: Path, tensors, block_size=256):
 
 def make_model(tmp_path: Path, arch, tensors, fuse=False, block_size=256) -> Any:
     write_manifest(tmp_path, tensors, block_size)
-    model = object.__new__(ModelBase)
+    model: Any = object.__new__(ModelBase)
     model.dir_model = tmp_path
     model.model_arch = arch
     model.fuse_gate_up_exps = fuse
