@@ -306,6 +306,10 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe, const 
     } else if (arch == LLM_ARCH_LIMITE) {
         n_head  = 4;
         n_layer = 4; // dense connections on the last two layers
+    } else if (arch == LLM_ARCH_GLM5_NEXT) {
+        n_embd = 128;
+        n_head = 8;
+        n_ff   = 192;
     } else if (arch == LLM_ARCH_DEEPSEEK2
             || arch == LLM_ARCH_DEEPSEEK32
             || arch == LLM_ARCH_GLM_DSA
@@ -319,10 +323,7 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe, const 
             || arch == LLM_ARCH_HY_V4
             || arch == LLM_ARCH_XING4_0) {
         n_embd = 128;
-        // The tensor-parallel Meta fixture uses two devices. Give GLM5 one
-        // attention head per device so its head-sharded MLA tensors remain
-        // split on the same batch axis after reshape and permute.
-        n_head = arch == LLM_ARCH_GLM5_NEXT ? 2 : 1;
+        n_head = 1;
         n_ff   = 192;
         if (arch == LLM_ARCH_MISTRAL_LARGE4) {
             n_layer = 4; // cover NoPE, shared indexer and KV sharing layers
@@ -1535,7 +1536,10 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
                 char nmse_str[12] = {0};
                 char mixed_str[12] = {0};
 
-                bool skip = !arch_supported(arch) || (dc.split_mode == LLAMA_SPLIT_MODE_TENSOR && dc.devs.empty());
+                // GLM5 query and indexer head counts are not divisible by three.
+                const bool unsupported_glm5_split =
+                    arch == LLM_ARCH_GLM5_NEXT && dc.split_mode == LLAMA_SPLIT_MODE_TENSOR && dc.devs.size() == 3;
+                bool skip = !arch_supported(arch) || (dc.split_mode == LLAMA_SPLIT_MODE_TENSOR && dc.devs.empty()) || unsupported_glm5_split;
                 bool test_executed = false;
                 bool test_ok = true;
                 if (!skip) {
