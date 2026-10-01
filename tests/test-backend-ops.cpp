@@ -15598,6 +15598,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // MUL_MAT_ID+MUL on the GEMM path (router weights applied in the int8 MMQ epilogue on Vulkan):
+    // ragged expert counts, ragged M (packed vec4 tail) and odd M (per-element store)
+    for (ggml_type type_a : {GGML_TYPE_Q8_0, GGML_TYPE_IQ4_NL, GGML_TYPE_Q4_K}) {
+        test_cases.emplace_back(new test_mul_mat_id_fusion(type_a, GGML_TYPE_F32, 32, 10, false, 256, 129, 512, 1, true));
+        test_cases.emplace_back(new test_mul_mat_id_fusion(type_a, GGML_TYPE_F32, 16,  4, false,  36, 300, 512, 1, true));
+        test_cases.emplace_back(new test_mul_mat_id_fusion(type_a, GGML_TYPE_F32, 16,  4, false, 199,  67, 512, 1, true));
+    }
+
     for (ggml_type type_a : base_types) {
         for (ggml_type type_b : {GGML_TYPE_F32, GGML_TYPE_F16}) {
             for (int n : {1, 16}) {
