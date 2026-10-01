@@ -107,23 +107,6 @@ static ggml_tensor * laya_head_norm(ggml_context * ctx, ggml_tensor * x, ggml_te
     return ggml_add(ctx, ggml_mul(ctx, x, w), b);
 }
 
-// most [MASK] markers in one sequence of the ubatch, at least 2 so that the top-2 features are defined
-static int64_t laya_n_options(const llama_ubatch & ubatch, llama_token mask) {
-    std::vector<int64_t> n_opt(ubatch.n_seqs_unq, 0);
-
-    int64_t res = 2;
-    for (uint32_t i = 0; ubatch.token && i < ubatch.n_tokens; ++i) {
-        if (ubatch.token[i] == mask) {
-            for (int32_t j = 0; j < ubatch.n_seq_id[i]; ++j) {
-                const int32_t s = ubatch.seq_idx[ubatch.seq_id[i][j]];
-                res = std::max(res, ++n_opt[s]);
-            }
-        }
-    }
-
-    return res;
-}
-
 // per-sequence inputs of the decision head, derived from the tokens of each sequence
 class llm_graph_input_laya : public llm_graph_input_i {
 public:
@@ -183,9 +166,12 @@ public:
         std::vector<int32_t> rows(n_opt*n_seqs, 0);
         std::vector<float>   keep(n_opt*n_seqs, 0.0f);
         for (int64_t s = 0; s < n_seqs; ++s) {
-            // beyond the output width only the first markers are scored, see the graph
+            // input that did not come through common_laya_predict (e.g. /embeddings with many "[MASK]" in the text)
+            // may carry more markers than the output row holds: score the first ones instead of aborting
             std::sort(markers[s].begin(), markers[s].end());
             if ((int64_t) markers[s].size() > n_opt) {
+                LLAMA_LOG_WARN("%s: a sequence has %zu [MASK] option markers, only the first %" PRId64 " are scored\n",
+                        __func__, markers[s].size(), n_opt);
                 markers[s].resize(n_opt);
             }
             for (size_t j = 0; j < markers[s].size(); ++j) {
@@ -221,14 +207,9 @@ llama_model_laya::graph::graph(const llama_model & model, const llm_graph_params
 
     const int64_t n_seqs = ubatch.n_seqs_unq;
 
-    // input that did not come through common_laya_predict (e.g. /embeddings with many "[MASK]" in the text)
-    // may carry more markers than the output row holds: score the first ones instead of aborting
-    int64_t n_opt = laya_n_options(ubatch, model.vocab.token_mask());
-    if (n_opt > (int64_t) laya.n_max_options) {
-        LLAMA_LOG_WARN("%s: a sequence has %" PRId64 " [MASK] option markers, only the first %u are scored\n",
-                __func__, n_opt, laya.n_max_options);
-        n_opt = laya.n_max_options;
-    }
+    // every sequence gets all the option slots, padded and masked out by opt_keep: the graph shape must not depend on
+    // the token values, or the graph reserved with dummy tokens is too small for a real batch
+    const int64_t n_opt = laya.n_max_options;
 
     auto inp = std::make_unique<llm_graph_input_laya>(laya, n_opt);
 
@@ -346,7 +327,6 @@ llama_model_laya::graph::graph(const llama_model & model, const llm_graph_params
         cb(act, "decision_act_logits", -1);
 
         ggml_tensor * out = ggml_concat(ctx0, act, opt_out, 0);
-        out = ggml_pad(ctx0, out, hparams.n_cls_out - out->ne[0], 0, 0, 0);
         cb(out, "result_embd_pooled", -1);
 
         res->t_embd_pooled = out;
