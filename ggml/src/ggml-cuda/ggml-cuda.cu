@@ -4469,6 +4469,94 @@ static int ggml_cuda_try_fuse_mlp_bf16(ggml_backend_cuda_context *         cuda_
                                        int                                 i,
                                        ggml_cuda_cutlass_activation_plan & activation_plan);
 
+#define GGML_CUDA_GDN_STATE_GATHER_WINDOW 64
+
+// index of the gated_delta_net's state input (the get_rows or its reshape), or -1 when a node between the two
+// writes the get_rows source states or its row ids
+static int ggml_cuda_gdn_state_input_idx(const ggml_cgraph * cgraph, int get_rows_idx, int gdn_idx) {
+    const ggml_tensor * get_rows = cgraph->nodes[get_rows_idx];
+    const ggml_tensor * state    = cgraph->nodes[gdn_idx]->src[5];
+
+    int state_idx = state == get_rows ? get_rows_idx : -1;
+    for (int j = get_rows_idx + 1; j < gdn_idx; ++j) {
+        const ggml_tensor * n = cgraph->nodes[j];
+        if (n == state) {
+            state_idx = j;
+        } else if (!ggml_cuda_is_view_or_noop(n) && (ggml_cuda_tensor_ranges_overlap(n, get_rows->src[0]) ||
+                                                      ggml_cuda_tensor_ranges_overlap(n, get_rows->src[1]))) {
+            return -1;
+        }
+    }
+    return state_idx;
+}
+
+// the gated_delta_net may read its state rows from the get_rows source: one sequence, no chunked prefix, gather used
+// only by the gdn and not an output, row-aligned snapshot cache fusion, no writer of the source states or ids between
+static bool ggml_cuda_gdn_reads_state_rows(const ggml_cgraph * cgraph, int get_rows_idx, int gdn_idx) {
+    const ggml_tensor * get_rows = cgraph->nodes[get_rows_idx];
+    const ggml_tensor * gdn      = cgraph->nodes[gdn_idx];
+    const ggml_tensor * state    = gdn->src[5];
+    if (get_rows->op != GGML_OP_GET_ROWS || gdn->op != GGML_OP_GATED_DELTA_NET ||
+        ((get_rows->flags | state->flags) & GGML_TENSOR_FLAG_OUTPUT) ||
+        (state != get_rows && (state->op != GGML_OP_RESHAPE || state->src[0] != get_rows))) {
+        return false;
+    }
+
+    const ggml_tensor * states = get_rows->src[0];
+    const ggml_tensor * ids    = get_rows->src[1];
+    const ggml_tensor * v      = gdn->src[2];
+    const int64_t       D      = v->ne[0] * v->ne[0] * v->ne[1];
+    const int64_t       K      = ggml_get_op_params_i32(gdn, 0);
+    if (v->ne[3] != 1 || v->ne[2] > K || states->type != GGML_TYPE_F32 || get_rows->type != GGML_TYPE_F32 ||
+        ids->type != GGML_TYPE_I32 || ggml_nelements(ids) != 1 || states->ne[0] != D || !ggml_is_contiguous(states)) {
+        return false;
+    }
+
+    const int state_idx = ggml_cuda_gdn_state_input_idx(cgraph, get_rows_idx, gdn_idx);
+    if (state_idx < 0 || ggml_node_get_use_count(cgraph, get_rows_idx) != 1 ||
+        ggml_node_get_use_count(cgraph, state_idx) != 1) {
+        return false;
+    }
+
+    ggml_cuda_gated_delta_net_fused_cache cache;
+    if (ggml_cuda_try_gdn_cache_fusion(cgraph, gdn_idx, cache) <= 0) {
+        return false;
+    }
+    // with every snapshot slot aligned to the state rows, an element is only read and written by the warp owning it
+    const ptrdiff_t snapshot_offset = (const char *) cache.data - (const char *) states->data;
+    const int64_t   slot_bytes      = cache.slot_stride * (int64_t) sizeof(float);
+    return snapshot_offset % (ptrdiff_t) states->nb[1] == 0 && slot_bytes % (int64_t) states->nb[1] == 0;
+}
+
+// index of the gated_delta_net that reads the rows of this get_rows itself, or -1
+static int ggml_cuda_gdn_state_gather_consumer(const ggml_cgraph * cgraph, int get_rows_idx) {
+    const int end = std::min(cgraph->n_nodes, get_rows_idx + 1 + GGML_CUDA_GDN_STATE_GATHER_WINDOW);
+    for (int j = get_rows_idx + 1; j < end; ++j) {
+        if (cgraph->nodes[j]->op == GGML_OP_GATED_DELTA_NET) {
+            return ggml_cuda_gdn_reads_state_rows(cgraph, get_rows_idx, j) ? j : -1;
+        }
+    }
+    return -1;
+}
+
+// index of the get_rows whose rows this gated_delta_net reads itself, or -1
+static int ggml_cuda_gdn_state_gather_source(const ggml_cgraph * cgraph, int gdn_idx) {
+    const ggml_tensor * state    = cgraph->nodes[gdn_idx]->src[5];
+    const ggml_tensor * get_rows = state->op == GGML_OP_RESHAPE ? state->src[0] : state;
+    const int           begin    = std::max(0, gdn_idx - GGML_CUDA_GDN_STATE_GATHER_WINDOW);
+    for (int j = gdn_idx - 1; j >= begin; --j) {
+        if (cgraph->nodes[j] == get_rows) {
+            return ggml_cuda_gdn_state_gather_consumer(cgraph, j) == gdn_idx ? j : -1;
+        }
+    }
+    return -1;
+}
+
+static bool ggml_cuda_fusion_disabled() {
+    static const bool disabled = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
+    return disabled;
+}
+
 // the per-row operand of a binary op whose other operand is prev: f32, one value per mul_mat row
 static const ggml_tensor * ggml_cuda_mmvf_act_row_operand(const ggml_tensor * op, const ggml_tensor * prev, int64_t nrows) {
     const ggml_tensor * other = op->src[0] == prev ? op->src[1] : (op->src[1] == prev ? op->src[0] : nullptr);
@@ -4550,8 +4638,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context *         cuda_ctx,
                               ggml_cgraph *                       cgraph,
                               int                                 i,
                               ggml_cuda_cutlass_activation_plan * activation_plan) {
-    static bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
-    if (disable_fusion) {
+    if (ggml_cuda_fusion_disabled()) {
         return 0;
     }
 
@@ -4581,6 +4668,12 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context *         cuda_ctx,
         ggml_cuda_gated_delta_net_fused_cache fused_state_cpy;
         const int nodes_to_skip = ggml_cuda_try_gdn_cache_fusion(cgraph, i, fused_state_cpy);
         if (nodes_to_skip > 0) {
+            const int gather_idx = ggml_cuda_gdn_state_gather_source(cgraph, i);
+            if (gather_idx >= 0) {
+                const ggml_tensor * get_rows = cgraph->nodes[gather_idx];
+                fused_state_cpy.state_src  = (const float *) get_rows->src[0]->data;
+                fused_state_cpy.state_rows = (const int32_t *) get_rows->src[1]->data;
+            }
 #ifdef GGML_CUDA_DEBUG
             GGML_LOG_INFO("%s: fused gated_delta_net snapshot copies for %s (skipped %d nodes)\n",
                           __func__, node->name, nodes_to_skip);
@@ -5940,6 +6033,12 @@ static bool ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context *    
                 }
 
                 if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+                    continue;
+                }
+
+                // a later gated_delta_net reads these state rows from the cache itself
+                if (node->op == GGML_OP_GET_ROWS && !ggml_cuda_fusion_disabled() &&
+                    ggml_cuda_gdn_state_gather_consumer(cgraph, i) >= 0) {
                     continue;
                 }
 
