@@ -103,7 +103,7 @@ static __global__ void __launch_bounds__(CUDA_CONCAT_BLOCK_SIZE)
           uint64_t   nb12,
           uint64_t   nb13,
            int64_t   ne0,
-           int64_t /*ne1*/,
+           int64_t   ne1,
            int64_t /*ne2*/,
            int64_t /*ne3*/,
           uint64_t   nb0,
@@ -114,7 +114,11 @@ static __global__ void __launch_bounds__(CUDA_CONCAT_BLOCK_SIZE)
 
     const int64_t i3 = blockIdx.z;
     const int64_t i2 = blockIdx.y;
-    const int64_t i1 = blockIdx.x;
+    const int64_t i1 = (int64_t) blockIdx.x * blockDim.y + threadIdx.y;
+
+    if (i1 >= ne1) {
+        return;
+    }
 
     const T * x;
 
@@ -163,9 +167,14 @@ static void concat_cuda(const ggml_tensor * src0, const ggml_tensor * src1, ggml
     } else {
         GGML_ASSERT(!ggml_is_quantized(src0->type));
 
-        dim3 grid_dim(dst->ne[1], dst->ne[2], dst->ne[3]);
+        // rows shorter than a block share it, so a block still moves CUDA_CONCAT_BLOCK_SIZE values
+        const int64_t block_x = std::max<int64_t>(1, std::min<int64_t>(dst->ne[0], CUDA_CONCAT_BLOCK_SIZE));
+        const int64_t block_y = CUDA_CONCAT_BLOCK_SIZE / block_x;
+
+        const dim3 block_dim(block_x, block_y, 1);
+        const dim3 grid_dim((dst->ne[1] + block_y - 1) / block_y, dst->ne[2], dst->ne[3]);
         auto launch_kernel = [&](auto dim) {
-            concat_non_cont<T, dim><<<grid_dim, CUDA_CONCAT_BLOCK_SIZE, 0, stream>>>(
+            concat_non_cont<T, dim><<<grid_dim, block_dim, 0, stream>>>(
                 (const char *) src0->data, (const char *) src1->data, (char *) dst->data,
                 src0->ne[0], src0->ne[1], src0->ne[2], src0->ne[3],
                 src0->nb[0], src0->nb[1], src0->nb[2], src0->nb[3],
