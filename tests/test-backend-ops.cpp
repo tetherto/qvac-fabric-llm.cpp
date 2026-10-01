@@ -4233,6 +4233,12 @@ struct test_rms_norm : public test_case {
             bool inplace = false)
         : type(type), ne(ne), v(v), eps(eps), inplace(inplace) {}
 
+    // WebGPU dispatches one workgroup per row in X and caps a dispatch dimension at 65535 workgroups
+    bool skip_backend(ggml_backend_t backend) override {
+        const char * name = ggml_backend_reg_name(ggml_backend_dev_backend_reg(ggml_backend_get_device(backend)));
+        return strcmp(name, "WebGPU") == 0 && ne[1] * ne[2] * ne[3] > 65535;
+    }
+
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * a = ggml_new_tensor(ctx, type, 4, ne.data());
         ggml_set_param(a);
@@ -4266,6 +4272,106 @@ struct test_rms_norm : public test_case {
 
     bool grad_precise() override {
         return true;
+    }
+};
+
+struct test_rms_norm_mul_mul : public test_case {
+    const std::array<int64_t, 4> ne;
+    const float eps;
+    const bool gated, proj, v;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "RMS_NORM_MUL_MUL";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR5(ne, eps, gated, proj, v);
+    }
+
+    // WebGPU stages F32 MUL_MAT operands in F16 workgroup memory, so use its F16 NMSE floor.
+    // See https://github.com/ggml-org/llama.cpp/pull/22976 for the F16 floor.
+    double max_nmse_err(ggml_backend_t backend) override {
+        if (gated && proj) {
+            ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
+            if (strcmp(ggml_backend_reg_name(reg), "WebGPU") == 0) {
+                return std::max(test_case::max_nmse_err(backend), 1e-6);
+            }
+        }
+        return test_case::max_nmse_err(backend);
+    }
+
+    test_rms_norm_mul_mul(std::array<int64_t, 4> ne = {128, 48, 9, 1}, float eps = 1e-6f, bool gated = true, bool proj = false, bool v = false)
+        : ne(ne), eps(eps), gated(gated), proj(proj), v(v) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a;
+        if (v) {
+            ggml_tensor * big = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, ne[0] * 3, ne[1], ne[2], ne[3]);
+            ggml_set_name(big, "big");
+            a = ggml_view_4d(ctx, big, ne[0], ne[1], ne[2], ne[3], big->nb[1], big->nb[2], big->nb[3], ne[0] * sizeof(float));
+        } else {
+            a = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
+            ggml_set_name(a, "a");
+        }
+        ggml_tensor * w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, ne[0]);
+        ggml_set_name(w, "w");
+
+        ggml_tensor * out = ggml_mul(ctx, ggml_rms_norm(ctx, a, eps), w);
+        if (gated) {
+            ggml_tensor * z;
+            if (proj) {
+                ggml_tensor * zin = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 64, ne[2] * ne[3]);
+                ggml_set_name(zin, "zin");
+                ggml_tensor * wz = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 64, ne[0] * ne[1]);
+                ggml_set_name(wz, "wz");
+                z = ggml_reshape_4d(ctx, ggml_mul_mat(ctx, wz, zin), ne[0], ne[1], ne[2], ne[3]);
+            } else {
+                z = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
+                ggml_set_name(z, "z");
+            }
+            out = ggml_mul(ctx, out, ggml_sigmoid(ctx, z));
+        }
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
+struct test_rms_norm_scale_short : public test_case {
+    const std::array<int64_t, 4> ne;
+    const float eps;
+    const bool v;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "RMS_NORM_SCALE";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR3(ne, eps, v);
+    }
+
+    test_rms_norm_scale_short(std::array<int64_t, 4> ne = {128, 16, 9, 1}, float eps = 1e-6f, bool v = false)
+        : ne(ne), eps(eps), v(v) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a;
+        if (v) {
+            ggml_tensor * big = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, ne[0] * ne[1] * 3, ne[2], ne[3], 1);
+            ggml_set_name(big, "big");
+            a = ggml_view_4d(ctx, big, ne[0], ne[1], ne[2], ne[3], ne[0] * sizeof(float), big->nb[1], big->nb[2], ne[0] * ne[1] * sizeof(float));
+        } else {
+            a = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
+            ggml_set_name(a, "a");
+        }
+        const float n = (float) ne[0];
+        ggml_tensor * out = ggml_scale(ctx, ggml_rms_norm(ctx, a, eps / n), 1.0f / sqrtf(n));
+        ggml_set_name(out, "out");
+        return out;
     }
 };
 
@@ -14608,6 +14714,30 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_rms_norm_mul_rope({n, 3, 2, 1}, 1e-6f, false, false, true, GGML_ROPE_TYPE_NORMAL, true, false));
         test_cases.emplace_back(new test_rms_norm_mul_add(GGML_TYPE_F32, {n, 3, 2, 1}, 1e-6f, false, false, false, false, true));
     }
+
+    // short rows (Vulkan rms_norm_small: one subgroup per row): odd row counts, views, a grid past 65535 workgroups
+    test_cases.emplace_back(new test_rms_norm(GGML_TYPE_F32, {128, 7, 3, 1}, false, 1e-6f));
+    test_cases.emplace_back(new test_rms_norm(GGML_TYPE_F32, {256, 33, 1, 1}, false, 1e-6f));
+    test_cases.emplace_back(new test_rms_norm(GGML_TYPE_F32, {255, 3, 5, 2}, false, 1e-5f));
+    test_cases.emplace_back(new test_rms_norm(GGML_TYPE_F32, {256, 66, 2, 2}, true, 1e-6f));    // view: {128, 33, 1, 1}
+    test_cases.emplace_back(new test_rms_norm(GGML_TYPE_F32, {254, 6, 10, 2}, true, 1e-5f));    // view: {127, 3, 5, 1}
+    test_cases.emplace_back(new test_rms_norm(GGML_TYPE_F32, {256, 1, 1, 1}, false, 1e-6f));
+    test_cases.emplace_back(new test_rms_norm(GGML_TYPE_F32, {128, 4097, 1, 1}, false, 1e-6f));
+    test_cases.emplace_back(new test_rms_norm(GGML_TYPE_F32, {16, 270001, 1, 1}, false, 1e-6f));
+    test_cases.emplace_back(new test_rms_norm(GGML_TYPE_F32, {128, 5, 4, 3}, false, 1e-6f, true));
+    for (bool gated : { false, true }) {
+        test_cases.emplace_back(new test_rms_norm_mul_mul({128, 48, 9, 1}, 1e-6f, gated));
+        test_cases.emplace_back(new test_rms_norm_mul_mul({100, 3, 5, 2}, 1e-6f, gated));
+        test_cases.emplace_back(new test_rms_norm_mul_mul({256, 8, 3, 1}, 1e-6f, gated, false, true));
+        test_cases.emplace_back(new test_rms_norm_mul_mul({128, 48, 33, 1}, 1e-6f, gated, true));
+        test_cases.emplace_back(new test_rms_norm_mul_mul({512, 4, 3, 1}, 1e-6f, gated));   // too wide for the short-row kernel
+    }
+    test_cases.emplace_back(new test_rms_norm_scale_short({128, 16, 9, 1}));
+    test_cases.emplace_back(new test_rms_norm_scale_short({128, 16, 9, 1}, 1e-6f, true));
+    test_cases.emplace_back(new test_rms_norm_scale_short({100, 3, 5, 2}));
+    test_cases.emplace_back(new test_rms_norm_scale_short({256, 8, 3, 1}, 1e-5f, true));
+    test_cases.emplace_back(new test_rms_norm_scale_short({128, 16, 333, 1}));
+    test_cases.emplace_back(new test_rms_norm_scale_short({512, 4, 3, 1}));   // too wide for the short-row kernel: unfused
 
     for (ggml_type set_rows_type : { GGML_TYPE_F32, GGML_TYPE_F16 }) {
         test_cases.emplace_back(new test_rms_norm_mul_rope({ 256, 1, 1, 1 }, 1e-6f, false, true, false, GGML_ROPE_TYPE_NORMAL, false, false, set_rows_type));
