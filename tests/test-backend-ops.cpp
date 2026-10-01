@@ -5324,6 +5324,163 @@ struct test_gated_delta_net_cache_fusion : public test_case {
     }
 };
 
+enum gdn_state_gather_mode {
+    GDN_GATHER_PLAIN,
+    GDN_GATHER_WRITER_BETWEEN,  // a copy into the gathered cache row runs between the get_rows and the gdn
+    GDN_GATHER_SECOND_CONSUMER, // the get_rows output is also read by another op
+    GDN_GATHER_STATE_OUTPUT,    // the gathered state is a graph output
+};
+
+static const char * gdn_state_gather_mode_name(gdn_state_gather_mode mode) {
+    switch (mode) {
+        case GDN_GATHER_PLAIN:           return "plain";
+        case GDN_GATHER_WRITER_BETWEEN:  return "writer_between";
+        case GDN_GATHER_SECOND_CONSUMER: return "second_consumer";
+        case GDN_GATHER_STATE_OUTPUT:    return "state_output";
+    }
+    return "?";
+}
+
+// get_rows of the recurrent state cache -> GATED_DELTA_NET -> snapshots copied back into the same cache, as in the
+// recurrent rollback graph; the gathered row may be one of the rows the snapshots overwrite
+struct test_gated_delta_net_state_gather : public test_case {
+    const int64_t head_count;
+    const int64_t head_size;
+    const int64_t n_seq_tokens;
+    const int64_t n_seqs;
+    const int64_t K;
+    const int32_t row; // cache row each sequence gathers (offset by the sequence index)
+    const gdn_state_gather_mode mode;
+
+    ggml_tensor * get_rows {};
+    ggml_tensor * state {};
+    ggml_tensor * writer {};
+    ggml_tensor * out {};
+
+    // log decay per token: small enough that the gathered state still shows in every output and snapshot
+    static constexpr float g_min    = -1.0f;
+    static constexpr float g_max    = -1e-4f;
+    static constexpr float beta_min = 0.0f;
+    static constexpr float beta_max = 1.0f;
+    static constexpr float v_min    = -0.3f;
+    static constexpr float v_max    = 5.0f;
+    static constexpr float l2_eps   = 1e-6f;
+
+    std::string vars() override {
+        return VARS_TO_STR6(head_count, head_size, n_seq_tokens, n_seqs, K, row) + ",mode=" + gdn_state_gather_mode_name(mode);
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "GATED_DELTA_NET_STATE_GATHER";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::vector<ggml_tensor *> fusion_test_nodes() override {
+        if (mode == GDN_GATHER_STATE_OUTPUT) {
+            return { out, state };
+        }
+        return {};
+    }
+
+    double max_maa_err() override { return 2e-2; }
+
+    test_gated_delta_net_state_gather(int64_t head_count, int64_t head_size, int64_t n_seq_tokens, int64_t n_seqs,
+                                      int64_t K, int32_t row, gdn_state_gather_mode mode = GDN_GATHER_PLAIN)
+        : head_count(head_count), head_size(head_size), n_seq_tokens(n_seq_tokens), n_seqs(n_seqs), K(K), row(row),
+          mode(mode) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * q    = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, head_size, head_count, n_seq_tokens, n_seqs);
+        ggml_tensor * k    = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, head_size, head_count, n_seq_tokens, n_seqs);
+        ggml_tensor * v    = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, head_size, head_count, n_seq_tokens, n_seqs);
+        ggml_tensor * g    = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, head_count, n_seq_tokens, n_seqs);
+        ggml_tensor * beta = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, head_count, n_seq_tokens, n_seqs);
+        ggml_set_name(q, "q");
+        ggml_set_name(k, "k");
+        ggml_set_name(v, "v");
+        ggml_set_name(g, "g");
+        ggml_set_name(beta, "beta");
+
+        q = ggml_l2_norm(ctx, q, l2_eps);
+        k = ggml_l2_norm(ctx, k, l2_eps);
+
+        // cache rows: n_seqs cells per rollback slot, K slots
+        const int64_t D = head_size * head_size * head_count;
+        ggml_tensor * cache = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, D, n_seqs * K);
+        ggml_set_name(cache, "cache");
+
+        ggml_tensor * ids = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_seqs);
+        ggml_set_name(ids, "ids");
+
+        get_rows = ggml_get_rows(ctx, cache, ids);
+        state    = ggml_reshape_4d(ctx, get_rows, head_size, head_size, head_count, n_seqs);
+        if (mode == GDN_GATHER_STATE_OUTPUT) {
+            ggml_set_output(state);
+        }
+        ggml_tensor * gdn = ggml_gated_delta_net(ctx, q, k, v, g, beta, state, K);
+
+        const int64_t attn_elems = head_size * head_count * n_seq_tokens * n_seqs;
+        const int64_t n_written  = n_seq_tokens < K ? n_seq_tokens : K;
+
+        ggml_tensor * attn = ggml_view_1d(ctx, gdn, attn_elems, 0);
+        ggml_tensor * src  = ggml_view_3d(ctx, gdn, D, n_seqs, n_written,
+            ggml_row_size(GGML_TYPE_F32, D), ggml_row_size(GGML_TYPE_F32, D * n_seqs), ggml_row_size(GGML_TYPE_F32, attn_elems));
+        ggml_tensor * dst  = ggml_view_3d(ctx, cache, D, n_seqs, n_written, cache->nb[1], n_seqs * cache->nb[1], 0);
+
+        ggml_tensor * written = ggml_cpy(ctx, src, dst);
+
+        // visit the cpy first so it follows the gdn, and compare every written snapshot value
+        out = ggml_concat(ctx, ggml_reshape_1d(ctx, written, D * n_seqs * n_written), attn, 0);
+        if (mode == GDN_GATHER_SECOND_CONSUMER) {
+            out = ggml_concat(ctx, out, ggml_reshape_1d(ctx, ggml_scale(ctx, get_rows, 1.0f), D * n_seqs), 0);
+        }
+        if (mode == GDN_GATHER_WRITER_BETWEEN) {
+            ggml_tensor * fill = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, D);
+            ggml_set_name(fill, "fill");
+            writer = ggml_cpy(ctx, fill, ggml_view_1d(ctx, cache, D, row * cache->nb[1]));
+        }
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    // the copy into the gathered row (and its view of the cache) goes right after the get_rows
+    void prepare_graph(ggml_cgraph * gf) override {
+        if (writer == nullptr) {
+            return;
+        }
+        ggml_build_forward_expand(gf, writer);
+        ggml_tensor ** nodes   = ggml_graph_nodes(gf);
+        const int      n_nodes = ggml_graph_n_nodes(gf);
+        ggml_tensor ** gather  = std::find(nodes, nodes + n_nodes, get_rows);
+        ggml_tensor ** first   = std::find(nodes, nodes + n_nodes, writer->src[1]);
+        GGML_ASSERT(gather < first);
+        std::rotate(gather + 1, first, nodes + n_nodes);
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (ggml_is_view_op(t->op)) { continue; }
+            if (strcmp(t->name, "ids") == 0) {
+                std::vector<int32_t> data(n_seqs);
+                for (int64_t s = 0; s < n_seqs; ++s) {
+                    data[s] = (int32_t) ((row + s) % (n_seqs * K));
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, n_seqs * sizeof(int32_t));
+            } else if (strcmp(t->name, "g") == 0) {
+                init_tensor_uniform(t, g_min, g_max);
+            } else if (strcmp(t->name, "beta") == 0) {
+                init_tensor_uniform(t, beta_min, beta_max);
+            } else if (strcmp(t->name, "v") == 0) {
+                init_tensor_uniform(t, v_min, v_max);
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 // GGML_OP_GATED_DELTA_NET_BACK
 struct test_gated_delta_net_back : public test_case {
     const ggml_type type;
@@ -14985,6 +15142,21 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // chunked head plus serial snapshot tail
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 16, 128,  72, 1, 8));
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 16, 128, 200, 2, 4));
+    // the gathered state row is a snapshot slot this gdn overwrites (first, middle, last, unwritten) or a plain decode
+    test_cases.emplace_back(new test_gated_delta_net_state_gather(/*H=*/4, /*S=*/32, /*T=*/2, /*seqs=*/1, /*K=*/2, /*row=*/0));
+    test_cases.emplace_back(new test_gated_delta_net_state_gather(/*H=*/4, /*S=*/32, /*T=*/4, /*seqs=*/1, /*K=*/4, /*row=*/2));
+    test_cases.emplace_back(new test_gated_delta_net_state_gather(/*H=*/4, /*S=*/64, /*T=*/3, /*seqs=*/1, /*K=*/8, /*row=*/6));
+    test_cases.emplace_back(new test_gated_delta_net_state_gather(/*H=*/16, /*S=*/128, /*T=*/8, /*seqs=*/1, /*K=*/8, /*row=*/7));
+    test_cases.emplace_back(new test_gated_delta_net_state_gather(/*H=*/16, /*S=*/128, /*T=*/8, /*seqs=*/1, /*K=*/8, /*row=*/3));
+    test_cases.emplace_back(new test_gated_delta_net_state_gather(/*H=*/16, /*S=*/128, /*T=*/1, /*seqs=*/1, /*K=*/1, /*row=*/0));
+    // not fused: several sequences, or more tokens than snapshot slots
+    test_cases.emplace_back(new test_gated_delta_net_state_gather(/*H=*/4, /*S=*/32, /*T=*/2, /*seqs=*/2, /*K=*/2, /*row=*/1));
+    test_cases.emplace_back(new test_gated_delta_net_state_gather(/*H=*/4, /*S=*/32, /*T=*/6, /*seqs=*/1, /*K=*/2, /*row=*/1));
+    // not fused: a copy into the gathered row between get_rows and gdn, a second reader of the gather, a state output
+    for (gdn_state_gather_mode mode : { GDN_GATHER_WRITER_BETWEEN, GDN_GATHER_SECOND_CONSUMER, GDN_GATHER_STATE_OUTPUT }) {
+        test_cases.emplace_back(new test_gated_delta_net_state_gather(/*H=*/4, /*S=*/32, /*T=*/4, /*seqs=*/1, /*K=*/4, /*row=*/2, mode));
+        test_cases.emplace_back(new test_gated_delta_net_state_gather(/*H=*/16, /*S=*/128, /*T=*/8, /*seqs=*/1, /*K=*/8, /*row=*/3, mode));
+    }
 
     // head sizes spanning the backend threadgroup-shape decisions (columns per thread,
     // threads per threadgroup); every power of two the backends accept.
