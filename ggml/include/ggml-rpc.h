@@ -15,15 +15,16 @@ extern "C" {
 // HELLO fields are uint8_t on the wire, so the value must stay <= 255.
 // upstream b11514 owns 8 (fork 108); the fork wire diverged at pick 300
 // (command queue, session ids, acks), so fork majors here run one ahead of
-// the b11259 fork: 109 adds butterfly communicator rounds and round-tagged
-// peer frames (b11259 fork: 108). Not wire-compatible with fork 108/109.
-// 109.1 adds RPC_CMD_SET_TENSOR_2D_HASH (b11259 fork: 108.1). A minor bump is
-// additive: the client still accepts a server with an older minor and must
-// gate every command introduced by a later minor on the minor the server
-// announces at HELLO.
-#define RPC_PROTO_MAJOR_VERSION    109
-#define RPC_PROTO_MINOR_VERSION    1
-#define RPC_PROTO_PATCH_VERSION    2
+// the b11259 fork:
+// 109 adds butterfly communicator rounds and round-tagged peer frames
+//     (b11259 fork: 108); 109.1 adds RPC_CMD_SET_TENSOR_2D_HASH.
+// 110 adds cache flags to SET_TENSOR and SET_TENSOR_2D (b11259 fork: 109).
+// A minor bump is additive: the client still accepts a server with an older
+// minor and must gate every command introduced by a later minor on the minor
+// the server announces at HELLO.
+#define RPC_PROTO_MAJOR_VERSION    110
+#define RPC_PROTO_MINOR_VERSION    0
+#define RPC_PROTO_PATCH_VERSION    0
 
 #ifdef  __cplusplus
 static_assert(GGML_OP_COUNT == 114, "GGML_OP_COUNT has changed - update RPC_PROTO_PATCH_VERSION");
