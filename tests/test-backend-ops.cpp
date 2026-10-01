@@ -5890,6 +5890,41 @@ struct test_mul_mat : public test_case {
     }
 };
 
+// GGML_OP_MUL_MAT with a permuted (non-dim01-contiguous) src0 and a contiguous src1
+struct test_mul_mat_permuted_src0 : public test_case {
+    const ggml_type type_a;
+    const int64_t m;
+    const int64_t n;
+    const int64_t k;
+    const std::array<int64_t, 2> bs;
+
+    std::string vars() override {
+        return VARS_TO_STR5(type_a, m, n, k, bs);
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    test_mul_mat_permuted_src0(ggml_type type_a = GGML_TYPE_Q8_0, int64_t m = 16, int64_t n = 16, int64_t k = 256,
+            std::array<int64_t, 2> bs = {2, 3})
+        : type_a(type_a), m(m), n(n), k(k), bs(bs) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor_4d(ctx, type_a, k, bs[0], m, bs[1]);
+        ggml_set_name(a, "a");
+        a = ggml_permute(ctx, a, 0, 2, 1, 3);
+        ggml_set_name(a, "a_permuted");
+
+        ggml_tensor * b = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, k, n, bs[0], bs[1]);
+        ggml_set_name(b, "b");
+
+        ggml_tensor * out = ggml_mul_mat(ctx, a, b);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 static ggml_backend_buffer_type_t test_repacked_weight_buffer_type(ggml_backend_t backend) {
     ggml_backend_dev_t dev = ggml_backend_get_device(backend);
     ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
@@ -13809,6 +13844,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
             // test cases with large batch size
             test_cases.emplace_back(new test_mul_mat(type_a, type_b, 16, 8, 256, {1536, 1}, {1, 1}));
+        }
+    }
+
+    // only src0 permuted: the reformatted src0 must not be paired with a q8_1 src1
+    for (ggml_type type_a : {GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_Q8_0}) {
+        for (int64_t n : {1, 16}) {
+            test_cases.emplace_back(new test_mul_mat_permuted_src0(type_a, 16, n, 256));
         }
     }
 
