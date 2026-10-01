@@ -17,7 +17,10 @@
 #include "../src/llama-model-saver.h"
 #include "../src/llama-model.h"
 
+#include <algorithm>
+#include <bitset>
 #include <cinttypes>
+#include <cmath>
 #include <cstddef>
 #include <cstdio>
 #include <cstring>
@@ -1419,6 +1422,127 @@ static void test_hadamard_mtp_arch(llm_arch arch, bool moe) {
     llama_batch_free(batch);
 }
 
+// normalized Sylvester Walsh-Hadamard entry, the transform prism.hadamard folds with
+static float hadamard_entry(int64_t row, int64_t col, int64_t n) {
+    const float scale = 1.0f / std::sqrt(float(n));
+    return std::bitset<64>(uint64_t(row & col)).count() % 2 ? -scale : scale;
+}
+
+// H is symmetric and H * H = I: one H folds a head row, and one H stores a latent embedding row
+static void fold_row(float * row, int64_t n) {
+    std::vector<float> folded(n, 0.0f);
+    for (int64_t i = 0; i < n; ++i) {
+        for (int64_t j = 0; j < n; ++j) {
+            folded[i] += hadamard_entry(i, j, n) * row[j];
+        }
+    }
+    std::copy(folded.begin(), folded.end(), row);
+}
+
+static void fold_rows(std::vector<float> & rows, int64_t n) {
+    for (size_t r = 0; r < rows.size(); r += n) {
+        fold_row(rows.data() + r, n);
+    }
+}
+
+static std::vector<float> get_tensor_f32(const ggml_tensor * tensor) {
+    std::vector<float> data(ggml_nelements(tensor));
+    if (tensor->type == GGML_TYPE_F32) {
+        ggml_backend_tensor_get(tensor, data.data(), 0, ggml_nbytes(tensor));
+    } else {
+        GGML_ASSERT(tensor->type == GGML_TYPE_F16);
+        std::vector<ggml_fp16_t> data_f16(data.size());
+        ggml_backend_tensor_get(tensor, data_f16.data(), 0, ggml_nbytes(tensor));
+        ggml_fp16_to_fp32_row(data_f16.data(), data.data(), data.size());
+    }
+    return data;
+}
+
+// a copy of the target with prism.hadamard metadata and its token_embd and output rows folded, which leaves its logits unchanged
+static FILE * save_folded_target(llm_arch arch, const llama_model * model) {
+    llama_model_saver source_saver(model);
+    source_saver.add_kv_from_model();
+    source_saver.add_tensors_from_model();
+
+    gguf_context_ptr fixture_ctx(gguf_init_empty());
+    gguf_set_kv(fixture_ctx.get(), source_saver.gguf_ctx);
+    add_hadamard_metadata(fixture_ctx.get(), model->hparams.n_embd);
+    llama_model_saver fixture(arch, fixture_ctx.get());
+
+    ggml_init_params params = { 16 * 1024 * 1024, nullptr, false };
+    ggml_context_ptr folded_ctx(ggml_init(params));
+    GGML_ASSERT(folded_ctx);
+    for (int64_t i = 0; i < gguf_get_n_tensors(source_saver.gguf_ctx); ++i) {
+        const char * name = gguf_get_tensor_name(source_saver.gguf_ctx, i);
+        const ggml_tensor * tensor = model->get_tensor(name);
+        GGML_ASSERT(tensor);
+        if (strcmp(name, "token_embd.weight") != 0 && strcmp(name, "output.weight") != 0) {
+            fixture.add_tensor(tensor);
+            continue;
+        }
+        std::vector<float> rows = get_tensor_f32(tensor);
+        fold_rows(rows, tensor->ne[0]);
+        ggml_tensor * folded = ggml_new_tensor_2d(folded_ctx.get(), GGML_TYPE_F32, tensor->ne[0], tensor->ne[1]);
+        ggml_set_name(folded, name);
+        memcpy(folded->data, rows.data(), ggml_nbytes(folded));
+        fixture.add_tensor(folded);
+    }
+
+    FILE * file = tmpfile();
+    GGML_ASSERT(file);
+    fixture.save(file);
+    rewind(file);
+    return file;
+}
+
+// a DFlash drafter as loaded from a file without token_embd and output, so it reads the target's through ctx_other
+static llama_model_ptr get_borrowing_dflash(size_t seed) {
+    auto metadata = get_gguf_ctx(LLM_ARCH_DFLASH, false);
+    // DFlash reads the window pattern as a per-layer array; keep the drafter full-attention
+    gguf_remove_key(metadata.get(), "dflash.attention.sliding_window");
+    const int32_t target_layers[] = { 1 };
+    gguf_set_arr_data(metadata.get(), "dflash.target_layers", GGUF_TYPE_INT32, target_layers, 1);
+    llama_model_ptr draft(llama_model_init_from_user(metadata.get(), set_tensor_data, &seed, llama_model_default_params()));
+    GGML_ASSERT(draft);
+    // user-initialized models create optional tensors too
+    draft->tok_embd = nullptr;
+    draft->output = nullptr;
+    return draft;
+}
+
+static std::vector<float> get_borrowed_draft_logits(llama_model * draft, llama_context * target, const std::vector<llama_token> & tokens) {
+    auto cp = llama_context_default_params();
+    cp.n_ctx = 128;
+    cp.n_batch = cp.n_ubatch = 8;
+    cp.n_seq_max = 1;
+    cp.n_threads = cp.n_threads_batch = 2;
+    cp.ctx_other = target;
+    llama_context_ptr ctx(llama_init_from_model(draft, cp));
+    GGML_ASSERT(ctx);
+    llama_set_causal_attn(ctx.get(), false);
+    return get_logits(draft, ctx.get(), tokens);
+}
+
+// a drafter that borrows a Hadamard-folded target's embeddings and head drafts the same logits as with the plain target
+static void test_hadamard_dflash_borrowed_io() {
+    const size_t seed = 1234;
+    auto metadata = get_gguf_ctx(LLM_ARCH_QWEN35, false);
+    auto plain = get_model_and_ctx(metadata.get(), nullptr, seed, {});
+    FILE * target_file = save_folded_target(LLM_ARCH_QWEN35, plain.first.get());
+    auto folded = get_model_and_ctx(nullptr, target_file, seed, {});
+    GGML_ASSERT(!folded.first->hadamard_rotations.empty() && !folded.first->hadamard_inverses.empty());
+
+    const auto tokens = get_tokens(4, llama_vocab_n_tokens(llama_model_get_vocab(plain.first.get())), seed);
+    GGML_ASSERT(nmse(get_logits(plain.first.get(), plain.second.get(), tokens),
+                     get_logits(folded.first.get(), folded.second.get(), tokens)) < 1e-6);
+
+    llama_model_ptr draft = get_borrowing_dflash(seed);
+    const auto from_plain  = get_borrowed_draft_logits(draft.get(), plain.second.get(), tokens);
+    const auto from_folded = get_borrowed_draft_logits(draft.get(), folded.second.get(), tokens);
+    GGML_ASSERT(nmse(from_plain, from_folded) < 1e-6);
+    fclose(target_file);
+}
+
 static int test_hadamard_contracts() {
     test_hadamard_invalid_block();
     test_hadamard_tied_output();
@@ -1428,6 +1552,7 @@ static int test_hadamard_contracts() {
     test_hadamard_mtp_arch(LLM_ARCH_QWEN35MOE, true);
     test_hadamard_mtp_arch(LLM_ARCH_QWEN3NEXT, true);
     test_hadamard_repack();
+    test_hadamard_dflash_borrowed_io();
     printf("Hadamard contracts: passed\n");
     return 0;
 }

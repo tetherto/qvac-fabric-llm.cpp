@@ -672,7 +672,7 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
 
     ggml_tensor * inp_tokens = inp->tokens;
 
-    ggml_tensor * inpL = ggml_get_rows(ctx0, tok_embd, inp->tokens);
+    ggml_tensor * inpL = build_hadamard_inverse_after_lookup(ggml_get_rows(ctx0, tok_embd, inp->tokens), tok_embd);
     cb(inpL, "inp_noise_embd", -1);
 
     res->add_input(std::move(inp));

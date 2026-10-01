@@ -414,6 +414,10 @@ private:
 
     llm_graph_result * gf_res_prev_active = nullptr;
 
+    // the model's Hadamard transforms plus the target's when tensors are borrowed through ctx_other
+    llama_hadamard_rotations hadamard_rotations;
+    llama_hadamard_rotations hadamard_inverses;
+
     // one-time Hadamard transform-coverage check on the first built graph
     bool hadamard_verified = false;
 

@@ -232,6 +232,15 @@ llama_context::llama_context(
         }
     }
 
+    hadamard_rotations = model.hadamard_rotations;
+    hadamard_inverses  = model.hadamard_inverses;
+    if (cparams.ctx_other) {
+        // entries are keyed by tensor, so the target's never collide with the model's own
+        const llama_model & model_other = cparams.ctx_other->get_model();
+        hadamard_rotations.insert(model_other.hadamard_rotations.begin(), model_other.hadamard_rotations.end());
+        hadamard_inverses.insert(model_other.hadamard_inverses.begin(), model_other.hadamard_inverses.end());
+    }
+
     if (params.ctx_other_share_compute && params.ctx_type == LLAMA_CONTEXT_TYPE_MTP && params.ctx_other != nullptr &&
         &params.ctx_other->get_model() == &model &&
         cparams.n_seq_max == 1 && params.ctx_other->n_seq_max() == 1) {
@@ -2654,8 +2663,8 @@ ggml_cgraph * llama_context::graph_reserve(
 
     // verify transform coverage on the pristine graph: after scheduling,
     // cross-backend copies break the producer chain the check follows
-    if (!hadamard_verified && gf && (!model.hadamard_rotations.empty() || !model.hadamard_inverses.empty())) {
-        llama_verify_hadamard_graph(gf, model.hadamard_rotations, model.hadamard_inverses);
+    if (!hadamard_verified && gf && (!hadamard_rotations.empty() || !hadamard_inverses.empty())) {
+        llama_verify_hadamard_graph(gf, hadamard_rotations, hadamard_inverses);
         hadamard_verified = true;
     }
 
@@ -2698,8 +2707,8 @@ llm_graph_params llama_context::graph_params(
         /*.loras       =*/ loras.get(),
         /*.mctx        =*/ mctx,
         /*.cross       =*/ &cross,
-        /*.hadamard_rotations =*/ &model.hadamard_rotations,
-        /*.hadamard_inverses  =*/ &model.hadamard_inverses,
+        /*.hadamard_rotations =*/ &hadamard_rotations,
+        /*.hadamard_inverses  =*/ &hadamard_inverses,
         /*.samplers    =*/ sampling.samplers,
         /*.n_outputs   =*/ n_outputs,
         /*.cb          =*/ graph_get_cb(),
