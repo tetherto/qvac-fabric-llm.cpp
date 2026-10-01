@@ -484,6 +484,22 @@ if (GGML_BACKEND_DL AND NOT EMSCRIPTEN)
         STUB_ZERO_PATH="$<TARGET_FILE:test-backend-loader-stub-zero>"
         STUB_OK_PATH="$<TARGET_FILE:test-backend-loader-stub-ok>")
     set_tests_properties(test-backend-loader PROPERTIES SKIP_RETURN_CODE 77)
+
+    # Windows only: a third stub imports a DLL built outside the executable's
+    # directory, so it loads only when the loader adds %CUDA_PATH%\bin\x64.
+    if (WIN32)
+        add_library(test-backend-loader-dep SHARED test-backend-loader-dep.cpp)
+        set_target_properties(test-backend-loader-dep PROPERTIES
+            RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/loader-dep)
+        add_library(test-backend-loader-stub-dep MODULE test-backend-loader-stub.cpp)
+        target_include_directories(test-backend-loader-stub-dep PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
+        target_link_libraries(test-backend-loader-stub-dep PRIVATE ggml-base test-backend-loader-dep)
+        target_compile_definitions(test-backend-loader-stub-dep PRIVATE STUB_NAME="STUB_DEP" STUB_SCORE_FROM_DEP)
+        add_dependencies(test-backend-loader test-backend-loader-stub-dep)
+        target_compile_definitions(test-backend-loader PRIVATE
+            STUB_DEP_PATH="$<TARGET_FILE:test-backend-loader-stub-dep>"
+            DEP_DLL_PATH="$<TARGET_FILE:test-backend-loader-dep>")
+    endif()
 endif()
 
 llama_build_and_test(test-model-load-cancel.cpp       LABEL "model")

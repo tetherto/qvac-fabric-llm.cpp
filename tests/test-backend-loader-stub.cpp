@@ -1,6 +1,8 @@
-// Stub backend module for test-backend-loader. Built twice, with STUB_NAME and
-// STUB_SCORE set per copy. It registers no devices and appends one line to the
-// file named by GGML_LOADER_TEST_LOG each time the loader scores it.
+// Stub backend module for test-backend-loader. Built once per case, with STUB_NAME
+// and STUB_SCORE set per copy. It registers no devices and appends one line to the
+// file named by GGML_LOADER_TEST_LOG each time the loader scores it. With
+// STUB_SCORE_FROM_DEP the score comes from an imported DLL, so the module only
+// loads when that DLL is found.
 
 #include "ggml-backend-impl.h"
 
@@ -11,6 +13,11 @@
 #    define STUB_EXPORT extern "C" __declspec(dllexport)
 #else
 #    define STUB_EXPORT extern "C" __attribute__((visibility("default")))
+#endif
+
+#ifdef STUB_SCORE_FROM_DEP
+extern "C" __declspec(dllimport) int loader_test_dep_score(void);
+#    define STUB_SCORE loader_test_dep_score()
 #endif
 
 static const char * stub_get_name(ggml_backend_reg_t) {

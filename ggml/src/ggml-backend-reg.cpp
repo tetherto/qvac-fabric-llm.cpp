@@ -491,7 +491,54 @@ static fs::path backend_filename_extension() {
 #endif
 }
 
+#ifdef _WIN32
+// The Windows loader does not search PATH, so the CUDA module's runtime DLLs are
+// resolved from the user's CUDA install instead of being bundled. CUDA 13 keeps
+// them in %CUDA_PATH%\bin\x64, which CUDA 12 installs do not have. The directory
+// is searched only while the CUDA module loads; LOAD_LIBRARY_SEARCH_DEFAULT_DIRS
+// in dl_load_library includes user directories.
+class cuda_runtime_dll_directory {
+  public:
+    explicit cuda_runtime_dll_directory(bool enabled) {
+        if (!enabled) {
+            return;
+        }
+        const wchar_t * cuda_path = _wgetenv(L"CUDA_PATH");
+        if (cuda_path == nullptr || *cuda_path == L'\0') {
+            GGML_LOG_DEBUG("%s: CUDA_PATH is not set, CUDA runtime DLLs will not be found\n", __func__);
+            return;
+        }
+        const fs::path  bin_dir = fs::path(cuda_path) / L"bin" / L"x64";
+        std::error_code ec;
+        if (!fs::is_directory(bin_dir, ec)) {
+            GGML_LOG_INFO("%s: %s not found, CUDA backend needs a CUDA 13 install\n", __func__,
+                          path_str(bin_dir).c_str());
+            return;
+        }
+        cookie = AddDllDirectory(bin_dir.c_str());
+        if (cookie == nullptr) {
+            GGML_LOG_INFO("%s: AddDllDirectory(%s) failed: %lu\n", __func__, path_str(bin_dir).c_str(), GetLastError());
+        }
+    }
+
+    ~cuda_runtime_dll_directory() {
+        if (cookie != nullptr) {
+            RemoveDllDirectory(cookie);
+        }
+    }
+
+    cuda_runtime_dll_directory(const cuda_runtime_dll_directory &)             = delete;
+    cuda_runtime_dll_directory & operator=(const cuda_runtime_dll_directory &) = delete;
+
+  private:
+    DLL_DIRECTORY_COOKIE cookie = nullptr;
+};
+#endif
+
 static ggml_backend_reg_t ggml_backend_load_best(const char * name, bool silent, const char * user_search_path) {
+#ifdef _WIN32
+    const cuda_runtime_dll_directory cuda_dlls(striequals(name, "cuda"));
+#endif
     // enumerate all the files that match [lib]ggml-name-*.[so|dll] in the search paths
     const fs::path name_path = fs::u8path(name);
     const fs::path file_prefix = backend_filename_prefix().native() + name_path.native();

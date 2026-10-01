@@ -5,6 +5,7 @@
 //   - the best scoring module wins over a zero-score one
 //   - a module reachable through two directory entries is scored once
 //   - GGML_DISABLE_CUDA stops the cuda search entirely
+//   - on Windows, a cuda module's runtime DLL resolves from %CUDA_PATH%\bin\x64
 
 #include "ggml-backend.h"
 
@@ -130,6 +131,33 @@ int main() {
     check(find_reg("STUB_OK") == nullptr, "GGML_DISABLE_CUDA keeps the cuda search off");
     check(count_scores(log, "STUB_OK") == 0 && count_scores(log, "STUB_ZERO") == 0,
           "GGML_DISABLE_CUDA scores no cuda module");
+
+#ifdef STUB_DEP_PATH
+    // The Windows loader does not search PATH, so a CUDA module's runtime DLLs are
+    // found only through %CUDA_PATH%\bin\x64.
+    const fs::path dep_dir  = dir / "dep";
+    const fs::path cuda_dir = dir / "cuda";
+    fs::create_directories(dep_dir, ec);
+    fs::create_directories(cuda_dir / "bin" / "x64", ec);
+    fs::copy_file(STUB_DEP_PATH, dep_dir / (std::string(k_prefix) + "dep" + k_ext), ec);
+    check(!ec, "copy dependent stub");
+    fs::copy_file(DEP_DLL_PATH, cuda_dir / "bin" / "x64" / fs::path(DEP_DLL_PATH).filename(), ec);
+    check(!ec, "copy dependency into fake CUDA_PATH");
+
+    set_env("CUDA_PATH", nullptr);
+    ggml_backend_load_all_from_path(dep_dir.string().c_str());
+    check(find_reg("STUB_DEP") == nullptr, "module with an unresolved runtime DLL is not registered");
+
+    set_env("CUDA_PATH", dir.string().c_str());
+    ggml_backend_load_all_from_path(dep_dir.string().c_str());
+    check(find_reg("STUB_DEP") == nullptr, "CUDA_PATH without bin\\x64 is not used");
+
+    set_env("CUDA_PATH", cuda_dir.string().c_str());
+    ggml_backend_load_all_from_path(dep_dir.string().c_str());
+    set_env("CUDA_PATH", nullptr);
+    check(count_regs("STUB_DEP") == 1, "runtime DLL is resolved from CUDA_PATH\\bin\\x64");
+    unload_all("STUB_DEP");
+#endif
 
     fs::remove_all(dir, ec);
     printf("%s\n", failures == 0 ? "PASS" : "FAILED");
