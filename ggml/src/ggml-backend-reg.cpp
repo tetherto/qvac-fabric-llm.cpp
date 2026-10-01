@@ -1,17 +1,20 @@
+#include "ggml-backend-dl.h"
 #include "ggml-backend-impl.h"
 #include "ggml-backend.h"
-#include "ggml-backend-dl.h"
 #include "ggml-impl.h"
+
 #include <algorithm>
+#include <cctype>
 #include <cstring>
 #include <filesystem>
 #include <limits>
 #include <memory>
+#include <regex>
 #include <string>
 #include <type_traits>
+#include <unordered_set>
+#include <utility>
 #include <vector>
-#include <cctype>
-#include <regex>
 
 #ifdef _WIN32
 #    define WIN32_LEAN_AND_MEAN
@@ -120,7 +123,12 @@ struct ggml_backend_registry {
 
     ggml_backend_registry() {
 #ifdef GGML_USE_CUDA
+    // Add runtime disable check
+    if (getenv("GGML_DISABLE_CUDA") == nullptr) {
         register_backend(ggml_backend_cuda_reg());
+    } else {
+        GGML_LOG_DEBUG("CUDA backend disabled by GGML_DISABLE_CUDA environment variable\n");
+    }
 #endif
 #ifdef GGML_USE_METAL
         register_backend(ggml_backend_metal_reg());
@@ -236,6 +244,10 @@ struct ggml_backend_registry {
             return nullptr;
         }
 
+        return load_backend(path, silent, std::move(handle));
+    }
+
+    ggml_backend_reg_t load_backend(const fs::path & path, bool silent, dl_handle_ptr handle) {
         auto backend_init_fn = (ggml_backend_init_t) dl_get_sym(handle.get(), "ggml_backend_init");
         if (!backend_init_fn) {
             if (!silent) {
@@ -508,19 +520,56 @@ static ggml_backend_reg_t ggml_backend_load_best(const char * name, bool silent,
 
     int best_score = 0;
     fs::path best_path;
+    dl_handle_ptr   best_handle;
     std::error_code ec;
+    std::unordered_set<std::string> attempted_paths;
+    std::vector<std::pair<fs::path, std::string>> load_failures;
 
-    auto tryEntryWithScore = [&best_score, &best_path, silent, _func = __func__](const fs::path & entryPath,
-                                                                                 int              scoreOffset = 1) {
+    auto markAttempted = [&attempted_paths](const fs::path & path, bool name_only) {
+        std::string key;
+        if (name_only) {
+            key = "name:" + path_str(path);
+        } else {
+            std::error_code path_ec;
+            fs::path        canonical_path = fs::weakly_canonical(path, path_ec);
+            if (path_ec) {
+                path_ec.clear();
+                canonical_path = fs::absolute(path, path_ec);
+            }
+            if (path_ec) {
+                canonical_path = path;
+            }
+            key = "path:" + path_str(canonical_path.lexically_normal());
+        }
+#ifdef _WIN32
+        std::transform(key.begin(), key.end(), key.begin(), [](unsigned char c) { return std::tolower(c); });
+#endif
+        return attempted_paths.insert(std::move(key)).second;
+    };
+
+    auto tryEntryWithScore = [&best_score, &best_path, &best_handle, &markAttempted, &load_failures, silent, _func = __func__](
+                                 const fs::path & entryPath, int scoreOffset = 1, bool name_only = false) {
+        if (!markAttempted(entryPath, name_only)) {
+            return;
+        }
         dl_handle_ptr handle{ dl_load_library(entryPath) };
-        if (!handle && !silent) {
-            GGML_LOG_ERROR("%s: failed to load %s: %s\n", _func, path_str(entryPath).c_str(), dl_error());
+        if (!handle) {
+            const char * error_ptr = dl_error();
+            const std::string error = error_ptr != nullptr ? error_ptr : "unknown loader error";
+            if (!silent) {
+                GGML_LOG_DEBUG("%s: failed to load %s: %s\n", _func, path_str(entryPath).c_str(), error.c_str());
+            }
+            load_failures.emplace_back(entryPath, error);
         }
         if (handle) {
             auto score_fn = (ggml_backend_score_t) dl_get_sym(handle.get(), "ggml_backend_score");
             int  s        = 1;
             if (score_fn) {
-                s = score_fn() + scoreOffset;
+                const int backend_score = score_fn();
+                if (backend_score == 0) {
+                    return;
+                }
+                s = backend_score + scoreOffset;
             }
 #ifdef NDEBUG
             GGML_LOG_DEBUG("%s: %s score: %d\n", _func, path_str(entryPath).c_str(), s);
@@ -528,6 +577,7 @@ static ggml_backend_reg_t ggml_backend_load_best(const char * name, bool silent,
             if (s > best_score) {
                 best_score = s;
                 best_path  = entryPath;
+                best_handle = std::move(handle);
             }
         }
     };
@@ -542,6 +592,7 @@ static ggml_backend_reg_t ggml_backend_load_best(const char * name, bool silent,
             continue;
         }
         GGML_LOG_INFO("%s: searching for %s in %s\n", __func__, path_str(name_path).c_str(), path_str(search_path).c_str());
+        std::vector<fs::path> candidates;
         std::error_code dir_ec;
         fs::directory_iterator dir_it(search_path, fs::directory_options::skip_permission_denied, dir_ec);
         if (dir_ec) {
@@ -554,9 +605,13 @@ static ggml_backend_reg_t ggml_backend_load_best(const char * name, bool silent,
                 auto filename = entry.path().filename();
                 auto ext = entry.path().extension();
                 if (filename.native().find(file_prefix) == 0 && ext == file_extension) {
-                    tryEntryWithScore(entry.path());
+                    candidates.push_back(entry.path());
                 }
             }
+        }
+        std::sort(candidates.begin(), candidates.end());
+        for (const auto & candidate : candidates) {
+            tryEntryWithScore(candidate);
         }
     }
 
@@ -566,7 +621,9 @@ static ggml_backend_reg_t ggml_backend_load_best(const char * name, bool silent,
             fs::path filename = backend_filename_prefix().native() + name_path.native() + backend_filename_extension().native();
             fs::path path = search_path / filename;
             if (std::error_code ec; fs::exists(path, ec)) {
-                return get_reg().load_backend(path, silent);
+                if (markAttempted(path, false)) {
+                    return get_reg().load_backend(path, silent);
+                }
             } else {
                 if (ec) {
                     GGML_LOG_DEBUG("%s: posix_stat(%s) failure, error-message: %s\n", __func__, path_str(path).c_str(), ec.message().c_str());
@@ -593,12 +650,20 @@ static ggml_backend_reg_t ggml_backend_load_best(const char * name, bool silent,
             // Try loading backend with just the library name, leave to dlopen path resolution.
             fs::path     filename     = backend_filename_prefix().native() + loopNamePath.native() +
                                 backend_filename_extension().native();
-            tryEntryWithScore(filename, 1+scoreOffset);
+            tryEntryWithScore(filename, 1 + scoreOffset, true);
         }
     }
 #endif
 
-    return get_reg().load_backend(best_path, silent);
+    if (!best_handle) {
+        if (!silent) {
+            for (const auto & failure : load_failures) {
+                GGML_LOG_ERROR("%s: failed to load %s: %s\n", __func__, path_str(failure.first).c_str(), failure.second.c_str());
+            }
+        }
+        return nullptr;
+    }
+    return get_reg().load_backend(best_path, silent, std::move(best_handle));
 }
 
 void ggml_backend_load_all() {
@@ -662,7 +727,16 @@ void ggml_backend_load_all_from_path(const char * dir_path) {
     ggml_backend_load_best("blas", silent, dir_path);
     ggml_backend_load_best("zendnn", silent, dir_path);
     ggml_backend_load_best("cann", silent, dir_path);
-    ggml_backend_load_best("cuda", silent, dir_path);
+    // QVAC-23763: the static path above is compiled out of DL builds, so the
+    // check is repeated here for every DL build.
+    //
+    // GGML_DISABLE_VULKAN has no equivalent guard here, so on a DL build it is
+    // a no-op and the two env vars behave differently.
+    if (getenv("GGML_DISABLE_CUDA") == nullptr) {
+        ggml_backend_load_best("cuda", silent, dir_path);
+    } else {
+        GGML_LOG_DEBUG("CUDA backend disabled by GGML_DISABLE_CUDA environment variable\n");
+    }
     ggml_backend_load_best("hip", silent, dir_path);
     ggml_backend_load_best("metal", silent, dir_path);
     ggml_backend_load_best("rpc", silent, dir_path);

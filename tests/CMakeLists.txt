@@ -452,6 +452,40 @@ llama_build_and_test(test-copy-tbq-subgroups.cpp)
 # mtmd, so it is intentionally outside the LLAMA_MTMD block below.
 llama_build_and_test(test-opencl-fa-chunking.cpp)
 
+# QVAC-23763: the CUDA arch-availability registration guard. Self-skips with 77
+# when no CUDA registry is present, which covers non-CUDA builds and DL builds
+# whose module scores 0. A static CUDA build without a GPU runs the
+# empty-registry check, and CUDA-equipped runners exercise the kept-device path. The virtual-device case catches a
+# gross group split, not the one-device case.
+llama_build_and_test(test-cuda-arch-registration.cpp)
+set_tests_properties(test-cuda-arch-registration PROPERTIES SKIP_RETURN_CODE 77)
+llama_test(test-cuda-arch-registration NAME test-cuda-arch-registration-virtual)
+set_tests_properties(test-cuda-arch-registration-virtual PROPERTIES
+    SKIP_RETURN_CODE 77
+    ENVIRONMENT "GGML_CUDA_DEVICES=4")
+
+# QVAC-23763: backend loader checks that need no GPU. Two stub modules stand in
+# for CUDA modules: zero-score rejection, attempted-path dedupe and the
+# GGML_DISABLE_CUDA guard. Without GGML_BACKEND_DL the loader is compiled out.
+if (GGML_BACKEND_DL AND NOT EMSCRIPTEN)
+    foreach (stub IN ITEMS zero ok)
+        string(TOUPPER ${stub} stub_upper)
+        add_library(test-backend-loader-stub-${stub} MODULE test-backend-loader-stub.cpp)
+        target_include_directories(test-backend-loader-stub-${stub} PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
+        target_link_libraries(test-backend-loader-stub-${stub} PRIVATE ggml-base)
+        target_compile_definitions(test-backend-loader-stub-${stub} PRIVATE STUB_NAME="STUB_${stub_upper}")
+    endforeach()
+    target_compile_definitions(test-backend-loader-stub-zero PRIVATE STUB_SCORE=0)
+    target_compile_definitions(test-backend-loader-stub-ok   PRIVATE STUB_SCORE=5)
+
+    llama_build_and_test(test-backend-loader.cpp)
+    add_dependencies(test-backend-loader test-backend-loader-stub-zero test-backend-loader-stub-ok)
+    target_compile_definitions(test-backend-loader PRIVATE
+        STUB_ZERO_PATH="$<TARGET_FILE:test-backend-loader-stub-zero>"
+        STUB_OK_PATH="$<TARGET_FILE:test-backend-loader-stub-ok>")
+    set_tests_properties(test-backend-loader PROPERTIES SKIP_RETURN_CODE 77)
+endif()
+
 llama_build_and_test(test-model-load-cancel.cpp       LABEL "model")
 llama_build_and_test(test-model-load-disk.cpp         LABEL "model")
 llama_build_and_test(test-model-load-memory.cpp       LABEL "model")
