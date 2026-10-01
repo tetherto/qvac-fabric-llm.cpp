@@ -40,6 +40,7 @@
 #include "ggml-cuda/mmq-cutlass.cuh"
 #include "ggml-cuda/mmq.cuh"
 #include "ggml-cuda/mmvf.cuh"
+#include "ggml-cuda/mmvf-act.cuh"
 #include "ggml-cuda/mmvq.cuh"
 #include "ggml-cuda/mmid-back.cuh"
 #include "ggml-cuda/moe-weighted-reduction.cuh"
@@ -4468,6 +4469,82 @@ static int ggml_cuda_try_fuse_mlp_bf16(ggml_backend_cuda_context *         cuda_
                                        int                                 i,
                                        ggml_cuda_cutlass_activation_plan & activation_plan);
 
+// the per-row operand of a binary op whose other operand is prev: f32, one value per mul_mat row
+static const ggml_tensor * ggml_cuda_mmvf_act_row_operand(const ggml_tensor * op, const ggml_tensor * prev, int64_t nrows) {
+    const ggml_tensor * other = op->src[0] == prev ? op->src[1] : (op->src[1] == prev ? op->src[0] : nullptr);
+    if (other == nullptr || other->type != GGML_TYPE_F32 || !ggml_is_contiguous(other) || other->ne[0] != nrows ||
+        ggml_nelements(other) != nrows) {
+        return nullptr;
+    }
+    return other;
+}
+
+// an f32 mul_mat that mul_mat_vec_f32_act can run (only where the unfused mul_mat would go to cuBLAS)
+static bool ggml_cuda_can_use_mmvf_act(const ggml_tensor * mm) {
+    return mm->op == GGML_OP_MUL_MAT && mm->src[0]->type == GGML_TYPE_F32 && mm->src[1]->type == GGML_TYPE_F32 &&
+        ggml_get_op_params_i32(mm, 1) == GGML_HINT_NONE &&
+        !ggml_backend_buft_is_cuda_repacked(ggml_backend_buffer_get_type(mm->src[0]->buffer)) &&
+        ggml_cuda_should_use_mmvf_act(mm);
+}
+
+// mul_mat -> reshape -> add bias -> softplus -> mul scale, bias and scale one value per row
+static int ggml_cuda_try_mmvf_act_softplus_gate(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i) {
+    const ggml_op ops[]       = { GGML_OP_MUL_MAT, GGML_OP_RESHAPE, GGML_OP_ADD, GGML_OP_UNARY, GGML_OP_MUL };
+    const int     out_nodes[] = { i + 4 };
+    if (!ggml_can_fuse_subgraph(cgraph, i, 5, ops, out_nodes, 1) ||
+        !ggml_cuda_check_fusion_memory_ranges(cgraph, i, 5, out_nodes, 1)) {
+        return 0;
+    }
+
+    const ggml_tensor * mm      = cgraph->nodes[i];
+    const ggml_tensor * reshape = cgraph->nodes[i + 1];
+    const ggml_tensor * add     = cgraph->nodes[i + 2];
+    const ggml_tensor * unary   = cgraph->nodes[i + 3];
+    ggml_tensor *       mul     = cgraph->nodes[i + 4];
+    const int64_t       nrows   = mm->ne[0];
+    const ggml_tensor * bias    = ggml_cuda_mmvf_act_row_operand(add, reshape, nrows);
+    const ggml_tensor * scale   = ggml_cuda_mmvf_act_row_operand(mul, unary, nrows);
+
+    if (reshape->src[0] != mm || reshape->ne[0] != nrows || unary->src[0] != add ||
+        ggml_get_unary_op(unary) != GGML_UNARY_OP_SOFTPLUS || bias == nullptr || scale == nullptr ||
+        add->type != GGML_TYPE_F32 || unary->type != GGML_TYPE_F32 || mul->type != GGML_TYPE_F32 ||
+        !ggml_are_same_shape(add, reshape) || !ggml_are_same_shape(mul, add) || !ggml_is_contiguous(mul)) {
+        return 0;
+    }
+    ggml_cuda_mul_mat_vec_f32_act(ctx, mm->src[0], mm->src[1], bias, scale, GGML_CUDA_MMVF_ACT_SOFTPLUS_GATE, mul);
+    return 4;
+}
+
+// mul_mat -> reshape -> sigmoid, unless the sigmoid starts a top-k MoE gate (left to that fusion)
+static int ggml_cuda_try_mmvf_act_sigmoid(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i) {
+    const ggml_op ops[]       = { GGML_OP_MUL_MAT, GGML_OP_RESHAPE, GGML_OP_UNARY };
+    const int     out_nodes[] = { i + 2 };
+    if (!ggml_can_fuse_subgraph(cgraph, i, 3, ops, out_nodes, 1) ||
+        !ggml_cuda_check_fusion_memory_ranges(cgraph, i, 3, out_nodes, 1)) {
+        return 0;
+    }
+
+    const ggml_tensor * mm      = cgraph->nodes[i];
+    const ggml_tensor * reshape = cgraph->nodes[i + 1];
+    ggml_tensor *       unary   = cgraph->nodes[i + 2];
+
+    ggml_cuda_topk_moe_args topk_args;
+    if (reshape->src[0] != mm || unary->src[0] != reshape || ggml_get_unary_op(unary) != GGML_UNARY_OP_SIGMOID ||
+        unary->type != GGML_TYPE_F32 || !ggml_is_contiguous(unary) || ggml_cuda_topk_moe_fusion(cgraph, i + 2, topk_args)) {
+        return 0;
+    }
+    ggml_cuda_mul_mat_vec_f32_act(ctx, mm->src[0], mm->src[1], nullptr, nullptr, GGML_CUDA_MMVF_ACT_SIGMOID, unary);
+    return 2;
+}
+
+static int ggml_cuda_try_mmvf_act_fusion(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i) {
+    if (!ggml_cuda_can_use_mmvf_act(cgraph->nodes[i])) {
+        return 0;
+    }
+    const int nodes_to_skip = ggml_cuda_try_mmvf_act_softplus_gate(ctx, cgraph, i);
+    return nodes_to_skip > 0 ? nodes_to_skip : ggml_cuda_try_mmvf_act_sigmoid(ctx, cgraph, i);
+}
+
 // try and fuse nodes and return the number of nodes to skip
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context *         cuda_ctx,
                               ggml_cgraph *                       cgraph,
@@ -4519,6 +4596,13 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context *         cuda_ctx,
         const int nodes_to_skip = ggml_cuda_try_cpy_batch(cgraph, i, batch);
         if (nodes_to_skip > 0) {
             ggml_cuda_cpy_f32_batch(*cuda_ctx, node->src[0], node->src[1], batch);
+            return nodes_to_skip;
+        }
+    }
+
+    if (node->op == GGML_OP_MUL_MAT) {
+        const int nodes_to_skip = ggml_cuda_try_mmvf_act_fusion(*cuda_ctx, cgraph, i);
+        if (nodes_to_skip > 0) {
             return nodes_to_skip;
         }
     }
