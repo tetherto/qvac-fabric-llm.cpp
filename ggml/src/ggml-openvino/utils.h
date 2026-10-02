@@ -16,14 +16,11 @@
 
 struct graph_key {
     int n_nodes;
-    int64_t fixed_token_count;
     std::string first_node_name;
     std::string last_node_name;
     std::vector<std::string> input_src_names;
 
-    graph_key(const ggml_cgraph * cgraph, int64_t fixed_token_count = 0) :
-        n_nodes(cgraph->n_nodes),
-        fixed_token_count(fixed_token_count) {
+    graph_key(const ggml_cgraph * cgraph) : n_nodes(cgraph->n_nodes) {
         if (n_nodes > 0) {
             first_node_name = cgraph->nodes[0]->name;
             last_node_name = cgraph->nodes[n_nodes - 1]->name;
@@ -67,16 +64,14 @@ struct graph_key {
     }
 
     bool operator==(const graph_key & other) const {
-        return n_nodes == other.n_nodes && fixed_token_count == other.fixed_token_count &&
-               first_node_name == other.first_node_name && last_node_name == other.last_node_name &&
-               input_src_names == other.input_src_names;
+        return n_nodes == other.n_nodes && first_node_name == other.first_node_name &&
+               last_node_name == other.last_node_name && input_src_names == other.input_src_names;
     }
 };
 
 struct graph_key_hash {
     size_t operator()(const graph_key & key) const {
         size_t hash = std::hash<int>{}(key.n_nodes);
-        hash ^= std::hash<int64_t>{}(key.fixed_token_count) + 0x9e3779b9 + (hash << 6) + (hash >> 2);
         if (key.n_nodes > 0) {
             hash ^= std::hash<std::string>{}(key.first_node_name) + 0x9e3779b9 + (hash << 6) + (hash >> 2);
             hash ^= std::hash<std::string>{}(key.last_node_name) + 0x9e3779b9 + (hash << 6) + (hash >> 2);
