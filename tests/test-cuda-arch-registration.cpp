@@ -5,7 +5,9 @@
 // card below the compiled floor enumerated, won backend selection over Vulkan,
 // and then aborted at the first kernel launch instead of falling back.
 //
-// Skips with 77 when no CUDA registry is present, so it runs everywhere.
+// Skips with 77 when no CUDA registry is present, so it runs everywhere. A DL
+// build whose module covers no device has no registry either, so the forced
+// skip case is checked by non-DL builds.
 
 #include "ggml-backend.h"
 
@@ -101,12 +103,9 @@ int main() {
             fprintf(stderr, "FAIL: every CUDA device was skipped and no CPU or GPU device remains\n");
             fails++;
         } else {
-            // Deliberately not phrased as "all devices were skipped". An empty
-            // registry is also what a machine with no NVIDIA card at all
-            // produces, and nothing here can tell the two apart: skipped
-            // devices leave the registry entirely and the unfiltered count is
-            // not reachable through ggml-backend.h, which is all this test uses. Passing this is not evidence
-            // the guard fired. See the note at the end of this file.
+            // An empty registry is also what a machine with no NVIDIA card
+            // produces. Only the GGML_CUDA_TEST_SKIP_DEVICES check below can
+            // tell the two apart.
             printf("CUDA registry is empty (no covered device, or no device at all); "
                    "a non-CUDA fallback device is present\n");
         }
@@ -173,10 +172,8 @@ int main() {
     // failure (one card losing a single virtual device), so that case passes
     // too. It catches a gross split, not a subtle one.
     //
-    // Making this tight needs the skipped count to be observable rather than
-    // inferred. CUDA-equipped CI currently exercises the kept-device path;
-    // a build with its architecture floor above that GPU is needed to exercise
-    // the skip path.
+    // The GGML_CUDA_TEST_SKIP_DEVICES case at the end exercises the skip path
+    // on any CUDA host, without a build whose arch floor is above the GPU.
     if (!per_card.empty()) {
         size_t lo = SIZE_MAX, hi = 0;
         for (const auto & kv : per_card) {
@@ -186,6 +183,38 @@ int main() {
         printf("surviving cards=%zu virtual devices per card=%zu..%zu\n", per_card.size(), lo, hi);
         if (hi - lo > 1) {
             fprintf(stderr, "FAIL: one physical card was partially skipped (%zu..%zu per card)\n", lo, hi);
+            fails++;
+        }
+    }
+
+    // GGML_CUDA_TEST_SKIP_DEVICES makes registration treat the listed physical
+    // devices as uncovered, so the skip path runs on any CUDA host. Skipping
+    // every card must empty the registry; skipping some must drop at least
+    // those, and the checks above then cover the remapped indices.
+    const char * skip_env = getenv("GGML_CUDA_TEST_SKIP_DEVICES");
+    auto         physical_count_fn =
+        (int (*)(void)) ggml_backend_reg_get_proc_address(cuda, "ggml_backend_cuda_physical_device_count");
+    if (skip_env != nullptr && physical_count_fn != nullptr) {
+        const int physical    = physical_count_fn();
+        bool      skipped[64] = {};
+        int       n_skipped   = 0;
+        for (const char * p = skip_env; *p != '\0';) {
+            char *     end = nullptr;
+            const long id  = strtol(p, &end, 10);
+            if (end == p) {
+                break;
+            }
+            if (id >= 0 && id < physical && id < 64 && !skipped[id]) {
+                skipped[id] = true;
+                n_skipped++;
+            }
+            p = *end == ',' ? end + 1 : end;
+        }
+        const size_t kept_max = (size_t) (physical - n_skipped);
+        printf("physical devices=%d skipped by env=%d surviving cards=%zu\n", physical, n_skipped, per_card.size());
+        if (per_card.size() > kept_max) {
+            fprintf(stderr, "FAIL: %zu cards survived, at most %zu expected after skipping %d\n", per_card.size(),
+                    kept_max, n_skipped);
             fails++;
         }
     }
