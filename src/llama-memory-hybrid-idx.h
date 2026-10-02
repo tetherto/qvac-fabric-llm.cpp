@@ -94,7 +94,10 @@ public:
     // The model's indexer pool size.
     uint32_t get_kpool() const { return hparams_idx.indexer_kpool; }
 
-    // Which cells of a sequence make up which pool of kpool consecutive positions.
+    // Whether pools are kpool consecutive cells in sequence order (qwen4exp) instead of kpool consecutive positions.
+    bool get_kpool_by_order() const { return hparams_idx.indexer_kpool_by_order; }
+
+    // Which cells of a sequence make up which pool of kpool consecutive positions (or cells, in order mode).
     // It is kept here because it outlives the batch: pools are fixed by the positions relative to the
     // sequence's first one, so a ubatch only ever appends to it. Sequence edits drop it, see mem_idx_stale.
     struct kpool_layout;
@@ -201,15 +204,16 @@ public:
     // streams in the current slot info, the `ns` of get_k/get_v; 1 if unified
     uint32_t get_n_stream() const;
 
-    // glm5-next, complete pools of kpool consecutive positions per sequence, scored as whole pools.
+    // glm5-next and qwen4exp, complete pools of kpool cells per sequence, scored as whole pools.
     uint32_t get_n_kpool    () const; // Padded pool count, where the last pool is always unused.
-    uint32_t get_n_kpool_new() const; // Exact count of pools completed by the current ubatch.
+    uint32_t get_n_kpool_new() const; // Pools to re-pool this ubatch, padded to a stable bound, never below 1.
     bool get_kpool_cache_safe() const;
     kpool_access get_kpool_access(ggml_context * ctx, int32_t il, int64_t n_embd) const;
     ggml_tensor * gather_mla_rows(ggml_context * ctx, ggml_tensor * idxs, int64_t n_rows, int64_t n_embd, int32_t il) const;
+    // new_pool_pos (I32 [4*n_new]): M-RoPE position of each new pool's first member, for pooled keys rotated at pooling time
     void set_input_kpool(ggml_tensor * pool_cells, ggml_tensor * pool_idxs, ggml_tensor * pool_mask, ggml_tensor * tail_idxs,
                          ggml_tensor * gather_mask, bool gather, ggml_tensor * new_pool_idxs, ggml_tensor * new_pool_rep,
-                         const llama_ubatch * ubatch) const;
+                         const llama_ubatch * ubatch, ggml_tensor * new_pool_pos = nullptr) const;
     void set_input_qsa(ggml_tensor * cell_blk, ggml_tensor * blk_cells, ggml_tensor * blk_pos,
                        ggml_tensor * bias, const llama_ubatch * ubatch, uint32_t ratio,
                        bool blk_bias, bool causal_attn) const;
@@ -220,6 +224,10 @@ private:
     // streams per ubatch, read from the slot infos before ctx_idx takes them
     // declared first, so it is initialised while sinfos_idx is still intact
     const std::vector<uint32_t> ns_ubatch;
+
+    // the indexer cells of each ubatch, kept for pools in cache order (qwen4exp): token s*n + i of ubatch u
+    // sits in cell idxs[s][i] of stream strm[s] of sinfos_kpool[u], and several cells can share a position
+    const slot_info_vec_t sinfos_kpool;
 
     // null unless the model has an indexer
     const llama_memory_context_ptr ctx_idx;
