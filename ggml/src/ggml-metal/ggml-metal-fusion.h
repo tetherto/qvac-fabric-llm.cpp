@@ -3,7 +3,8 @@
 // every fusable subgraph is declared exactly once as a ggml_metal_fusion entry in
 // the table in ggml-metal-fusion.cpp. both the graph optimizer (ggml_metal_fusion_max)
 // and the op encoders (ggml_metal_fusion_next) consult this same table with the same device
-// properties, so the two phases can never disagree about what can be fused.
+// properties. a check that passes in FULL mode also passes in STRUCTURAL mode, so the encoders
+// fuse only groups that the optimizer may pack.
 
 #pragma once
 
@@ -22,8 +23,8 @@ struct ggml_metal_device_props;
 #define GGML_METAL_FUSION_MAX 16
 
 typedef enum ggml_metal_fusion_mode {
-    // structural checks only; used by the graph optimizer, at which point the graph
-    // tensors are not allocated yet, so buffer placement cannot be verified
+    // structural checks for the graph optimizer, which runs before the graph tensors are allocated (weights
+    // already are); a check may skip conditions that differ between batch sizes, and so accept more than FULL
     GGML_METAL_FUSION_STRUCTURAL = 0,
     // full checks, including buffer placement; used by the op encoders
     GGML_METAL_FUSION_FULL,

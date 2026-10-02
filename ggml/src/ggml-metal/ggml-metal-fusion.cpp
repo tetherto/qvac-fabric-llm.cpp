@@ -268,8 +268,8 @@ static bool ggml_metal_fusion_check_fwht_signed(
     return true;
 }
 
-// MUL_MAT + ADD: the few-row MMA store adds a same-shape residual, so the device must run the mat-mul on the MMA kernels
-// the kernel reads the mat-mul inputs while it writes the sum, so in FULL mode the sum may overlap only the residual, in place
+// MUL_MAT + ADD of an f32 non-weight: the reorder packs it without reading row counts, so ubatch sizes share one order;
+// the encoder fuses only a same-shape residual in the few-row MMA store, which the sum may overlap only in place
 static bool ggml_metal_fusion_check_mul_mat_add(
         const ggml_metal_fusion      * fusion,
         const ggml_tensor * const    * nodes,
@@ -279,6 +279,16 @@ static bool ggml_metal_fusion_check_mul_mat_add(
 
     const ggml_tensor * mm  = nodes[0];
     const ggml_tensor * add = nodes[1];
+
+    if (ggml_metal_mul_mat_add_operand(mm, add) == nullptr ||
+        !ggml_metal_mul_mat_may_use_mma(mm, props->supports_gpu_family_apple7, props->has_tensor)) {
+        return false;
+    }
+
+    if (mode == GGML_METAL_FUSION_STRUCTURAL) {
+        return true;
+    }
+
     const ggml_tensor * res = ggml_metal_mul_mat_add_residual(mm, add);
 
     if (res == nullptr || ggml_metal_mul_mat_use_nc(mm) ||
@@ -286,12 +296,8 @@ static bool ggml_metal_fusion_check_mul_mat_add(
         return false;
     }
 
-    if (mode == GGML_METAL_FUSION_FULL) {
-        return !ggml_metal_fusion_overlap(add, mm->src[0]) && !ggml_metal_fusion_overlap(add, mm->src[1]) &&
-            (add->data == res->data || !ggml_metal_fusion_overlap(add, res));
-    }
-
-    return true;
+    return !ggml_metal_fusion_overlap(add, mm->src[0]) && !ggml_metal_fusion_overlap(add, mm->src[1]) &&
+        (add->data == res->data || !ggml_metal_fusion_overlap(add, res));
 }
 
 // true if CPY a copies an f32 view of one tensor into an f32 view of another and can start a batch
