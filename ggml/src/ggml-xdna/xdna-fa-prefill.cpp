@@ -1,15 +1,15 @@
 #include "xdna-fa-prefill.h"
+
 #include "ggml-impl.h"
-#include "xdna-util.h"
 #include "xdna-runtime.h"
 #include "xdna-types.h"
+#include "xdna-util.h"
 
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
-#include <fstream>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -31,14 +31,14 @@
 
 namespace fa_pf {
 
-constexpr int D    = 256;   // head dim
-constexpr int H    = 8;     // query heads (== columns)
-constexpr int KVH  = 2;     // key/value heads
-constexpr int MT   = 32;    // queries per core = vector lanes
-constexpr int JT   = 8;     // keys per tile
-constexpr int ROWS = 4;     // cores per column
-constexpr int NJ   = 64;    // key tiles per dispatch
-constexpr int QHDR = 16;    // int32 of header ahead of a query block
+constexpr int D    = 256;                  // head dim
+constexpr int H    = 8;                    // query heads (== columns)
+constexpr int KVH  = 2;                    // key/value heads
+constexpr int MT   = 32;                   // queries per core = vector lanes
+constexpr int JT   = 8;                    // keys per tile
+constexpr int ROWS = 4;                    // cores per column
+constexpr int NJ   = 64;                   // key tiles per dispatch
+constexpr int QHDR = 16;                   // int32 of header ahead of a query block
 
 constexpr int MBLK   = ROWS * MT;          // 128 queries per dispatch
 constexpr int KCHUNK = NJ * JT;            // 512 keys per dispatch
@@ -50,33 +50,36 @@ constexpr float SCALE = 0.0625f;           // 1/sqrt(256), baked into the kernel
 
 constexpr const char * STEM = "fa_prefill_bf16_D256_MT32_JT8_NJ64_c8";
 
-static size_t q_bytes()  { return (size_t) H * ROWS * Q_N * sizeof(int32_t); }
-static size_t o_bytes()  { return (size_t) H * ROWS * ACC_N * sizeof(float); }
-static size_t kv_chunk_bytes() { return (size_t) KVH * NJ * KV_N * sizeof(uint16_t); }
+static size_t q_bytes() {
+    return (size_t) H * ROWS * Q_N * sizeof(int32_t);
+}
 
-} // namespace fa_pf
+static size_t o_bytes() {
+    return (size_t) H * ROWS * ACC_N * sizeof(float);
+}
+
+static size_t kv_chunk_bytes() {
+    return (size_t) KVH * NJ * KV_N * sizeof(uint16_t);
+}
+
+}  // namespace fa_pf
+
+namespace {
 
 struct fa_runner {
-    std::mutex     mtx;
-    xdna_device *  dev  = nullptr;
-    xdna_kernel *  kern = nullptr;
-    xdna_buffer *  q    = nullptr;
-    xdna_buffer *  o    = nullptr;
-    xdna_buffer *  kv   = nullptr;          // all chunks of one layer
-    size_t         kv_chunks = 0;           // chunks the kv BO holds
-    std::vector<xdna_buffer *> kv_view;     // one window per chunk
+    std::mutex                 mtx;
+    xdna_device *              dev       = nullptr;
+    xdna_kernel *              kern      = nullptr;
+    xdna_buffer *              q         = nullptr;
+    xdna_buffer *              o         = nullptr;
+    xdna_buffer *              kv        = nullptr;  // all chunks of one layer
+    size_t                     kv_chunks = 0;        // chunks the kv BO holds
+    std::vector<xdna_buffer *> kv_view;              // one window per chunk
 };
 
-static fa_runner g_fa;
+}  // namespace
 
-static inline uint16_t f32_to_bf16(float f) {
-    uint32_t u;
-    std::memcpy(&u, &f, sizeof(u));
-    // round to nearest even; the state is bf16 throughout, so a floor here
-    // biases every key and value the same way
-    const uint32_t r = (u + 0x7fff + ((u >> 16) & 1)) >> 16;
-    return (uint16_t) r;
-}
+static fa_runner g_fa;
 
 // f16 -> bf16 by table. The cache is f16 and the kernel is bf16, so this runs
 // over every key and value of every attention layer of every ubatch - tens of
@@ -86,7 +89,7 @@ static const uint16_t * f16_bf16_table(void) {
     static const std::vector<uint16_t> t = []() {
         std::vector<uint16_t> v(1 << 16);
         for (int i = 0; i < (1 << 16); i++) {
-            v[i] = f32_to_bf16(ggml_fp16_to_fp32((ggml_fp16_t) (uint16_t) i));
+            v[i] = xdna_bf16(ggml_fp16_to_fp32((uint16_t) i));
         }
         return v;
     }();
@@ -101,25 +104,14 @@ static bool fa_pf_enabled(void) {
     if (xdna_env_int("GGML_XDNA_FA", 0) == 0) {
         return false;
     }
-    for (const auto & dir : xdna_kernel_search_dirs()) {
-        std::error_code ec;
-        if (std::filesystem::exists(dir / (std::string(fa_pf::STEM) + ".xclbin"), ec)) {
-            return true;
-        }
-    }
-    return false;
+    return !xdna_artifact_find(fa_pf::STEM, false).xclbin.empty();
 }
 
 // The kernel derives its mask from the key and query positions, so a mask that
-// is anything but plain causal would be silently ignored. Every row has to be
-// checked: a packed-sequence mask can differ in one row and nowhere else.
-//
-// The check needs the mask contents, and a graph node has no data until the
-// scheduler allocates it. Declining then is the only safe answer, because a
-// node this backend accepts it must also be able to run - xdna_ops_compute
-// returning false fails the whole graph rather than falling back to the host.
+// is anything but plain causal would be silently ignored. Check it instead of
+// assuming: every row, each all the way across, is cheap next to the op.
 static bool mask_is_causal(const ggml_tensor * m, int64_t n_kv, int64_t n_tokens) {
-    if (!m || !m->data) {
+    if (!m) {
         return false;
     }
     if (m->type != GGML_TYPE_F16 || m->ne[0] < n_kv || m->ne[1] < n_tokens) {
@@ -128,13 +120,16 @@ static bool mask_is_causal(const ggml_tensor * m, int64_t n_kv, int64_t n_tokens
     if (m->ne[2] != 1 || m->ne[3] != 1) {
         return false;
     }
+    // supports_op runs before the scheduler allocates the graph, so m->data may be null here.
+    if (!m->data) {
+        return false;
+    }
     const int64_t npast = n_kv - n_tokens;
     for (int64_t t = 0; t < n_tokens; t++) {
-        const ggml_fp16_t * row =
-            (const ggml_fp16_t *) ((const char *) m->data + t * m->nb[1]);
+        const ggml_fp16_t * row = (const ggml_fp16_t *) ((const char *) m->data + t * m->nb[1]);
         for (int64_t j = 0; j < n_kv; j++) {
-            const float v = ggml_fp16_to_fp32(row[j]);
-            const bool visible = j <= npast + t;
+            const float v       = ggml_fp16_to_fp32(row[j]);
+            const bool  visible = j <= npast + t;
             if (visible ? v != 0.0f : !(v < -1.0e30f)) {
                 return false;
             }
@@ -156,10 +151,10 @@ bool xdna_fa_prefill_supported(const struct ggml_tensor * node) {
         return false;
     }
     if (node->src[4]) {
-        return false;   // sinks
+        return false;  // sinks
     }
-    if (q->type != GGML_TYPE_F32 || k->type != GGML_TYPE_F16 ||
-        v->type != GGML_TYPE_F16 || node->type != GGML_TYPE_F32) {
+    if (q->type != GGML_TYPE_F32 || k->type != GGML_TYPE_F16 || v->type != GGML_TYPE_F16 ||
+        node->type != GGML_TYPE_F32) {
         return false;
     }
     // q is [D, n_tokens, n_head], k/v are [D, n_kv, n_head_kv].
@@ -182,53 +177,60 @@ bool xdna_fa_prefill_supported(const struct ggml_tensor * node) {
     float params[3] = { 0.0f, 0.0f, 0.0f };
     std::memcpy(params, node->op_params, sizeof(params));
     if (params[0] != SCALE || params[1] != 0.0f || params[2] != 0.0f) {
-        return false;   // scale baked into the kernel; no ALiBi, no softcap
+        return false;  // scale baked into the kernel; no ALiBi, no softcap
     }
     return mask_is_causal(m, n_kv, n_tokens);
 }
 
+// Drop everything the runner holds; the caller holds g_fa.mtx.
+static void fa_unload(void) {
+    for (auto * v : g_fa.kv_view) {
+        xdna_buffer_free(v);
+    }
+    g_fa.kv_view.clear();
+    xdna_buffer_free(g_fa.kv);
+    xdna_buffer_free(g_fa.q);
+    xdna_buffer_free(g_fa.o);
+    xdna_kernel_free(g_fa.kern);
+    g_fa.kv        = nullptr;
+    g_fa.q         = nullptr;
+    g_fa.o         = nullptr;
+    g_fa.kern      = nullptr;
+    g_fa.dev       = nullptr;
+    g_fa.kv_chunks = 0;
+}
+
 // Load the kernel once: xclbin, the compiled .insts.bin (the schedule is fixed
-// - the chunking is host-side), and the query/output BOs.
+// - the chunking is host-side), and the query/output BOs. The caller holds
+// g_fa.mtx.
 static bool fa_load(xdna_device * dev) {
     using namespace fa_pf;
-    std::lock_guard<std::mutex> lock(g_fa.mtx);
     if (g_fa.kern) {
-        return true;
-    }
-    std::string xclbin, insts;
-    for (const auto & dir : xdna_kernel_search_dirs()) {
-        std::error_code ec;
-        const std::string fx = (dir / (std::string(STEM) + ".xclbin")).string();
-        const std::string fi = (dir / (std::string(STEM) + ".insts.bin")).string();
-        if (std::filesystem::exists(fx, ec) && std::filesystem::exists(fi, ec)) {
-            xclbin = fx;
-            insts  = fi;
-            break;
+        if (g_fa.dev == dev) {
+            return true;
         }
+        // One runner, one device: never hand this device's kernel to another.
+        fa_unload();
     }
-    if (xclbin.empty()) {
+    const xdna_artifact art = xdna_artifact_find(STEM, true);
+    if (art.xclbin.empty()) {
         return false;
     }
-    std::ifstream f(insts, std::ios::binary);
-    std::vector<char> words((std::istreambuf_iterator<char>(f)),
-                            std::istreambuf_iterator<char>());
-    if (words.empty() || words.size() % sizeof(uint32_t)) {
-        return false;
+    std::vector<uint32_t> words;
+    if (!xdna_insts_read_file(art.insts.c_str(), words)) {
+        return false;  // xdna-runtime names the stream and the reason
     }
     g_fa.dev  = dev;
-    g_fa.kern = xdna_kernel_load_hw(dev, xclbin.c_str());
-    if (!g_fa.kern ||
-        !xdna_kernel_bind_insts(dev, g_fa.kern, (const uint32_t *) words.data(),
-                                words.size() / sizeof(uint32_t))) {
-        xdna_kernel_free(g_fa.kern);
-        g_fa.kern = nullptr;
+    g_fa.kern = xdna_kernel_load_hw(dev, art.xclbin.c_str());
+    if (!g_fa.kern || !xdna_kernel_bind_insts(dev, g_fa.kern, words.data(), words.size())) {
+        // xdna-runtime names the xclbin and the reason
+        fa_unload();
         return false;
     }
     g_fa.q = xdna_buffer_alloc(dev, q_bytes());
     g_fa.o = xdna_buffer_alloc(dev, o_bytes());
-    if (!g_fa.q || !g_fa.o) {
-        xdna_kernel_free(g_fa.kern);
-        g_fa.kern = nullptr;
+    if (!g_fa.q || !g_fa.o || !g_fa.q->data || !g_fa.o->data) {
+        fa_unload();
         return false;
     }
     return true;
@@ -247,20 +249,25 @@ static bool fa_kv_reserve(xdna_device * dev, size_t chunks) {
     }
     g_fa.kv_view.clear();
     xdna_buffer_free(g_fa.kv);
-    g_fa.kv = xdna_buffer_alloc(dev, chunks * kv_chunk_bytes());
-    if (!g_fa.kv) {
-        g_fa.kv_chunks = 0;
+    g_fa.kv        = xdna_buffer_alloc(dev, chunks * kv_chunk_bytes());
+    g_fa.kv_chunks = 0;  // set only once every view exists, so a partial resize is never reused
+    if (!g_fa.kv || !g_fa.kv->data) {
         return false;
     }
-    g_fa.kv_chunks = chunks;
     for (size_t c = 0; c < chunks; c++) {
-        xdna_buffer * v = xdna_buffer_sub(g_fa.kv, c * kv_chunk_bytes(),
-                                          kv_chunk_bytes());
+        xdna_buffer * v = xdna_buffer_sub(g_fa.kv, c * kv_chunk_bytes(), kv_chunk_bytes());
         if (!v) {
+            for (auto * w : g_fa.kv_view) {
+                xdna_buffer_free(w);
+            }
+            g_fa.kv_view.clear();
+            xdna_buffer_free(g_fa.kv);
+            g_fa.kv = nullptr;
             return false;
         }
         g_fa.kv_view.push_back(v);
     }
+    g_fa.kv_chunks = chunks;
     return true;
 }
 
@@ -268,24 +275,22 @@ static bool fa_kv_reserve(xdna_device * dev, size_t chunks) {
 // stay zero: they are never visible - every query sits before them - but they
 // still multiply a weight of exp(-huge), so they have to be finite.
 //
-// j0 is where packing starts. The caller passes 0: see xdna_fa_prefill_run for
-// why resuming from a previous call is not safe without a cache identity.
-static void pack_kv(const ggml_tensor * k, const ggml_tensor * v,
-                    uint16_t * dst, int64_t j0, int64_t n_kv) {
+// j0 is normally the previous call's n_kv: within a prompt the cache only ever
+// grows at the end, and this buffer is kept per layer, so a ubatch repacks the
+// keys it added rather than the whole cache.
+static void pack_kv(const ggml_tensor * k, const ggml_tensor * v, uint16_t * dst, int64_t j0, int64_t n_kv) {
     using namespace fa_pf;
     const uint16_t * tbl = f16_bf16_table();
     for (int64_t j = j0; j < n_kv; j++) {
         const int64_t c  = j / KCHUNK;
         const int64_t jl = j % KCHUNK;
-        uint16_t * cb = dst + (size_t) c * (KVH * NJ * KV_N);
+        uint16_t *    cb = dst + (size_t) c * ((size_t) KVH * NJ * KV_N);
         for (int g = 0; g < KVH; g++) {
-            uint16_t * tb = cb + (size_t) g * NJ * KV_N + (size_t) (jl / JT) * KV_N;
-            const uint16_t * kr =
-                (const uint16_t *) ((const char *) k->data + j * k->nb[1] + g * k->nb[2]);
-            const uint16_t * vr =
-                (const uint16_t *) ((const char *) v->data + j * v->nb[1] + g * v->nb[2]);
-            uint16_t * kd = tb + (size_t) (jl % JT) * D;
-            uint16_t * vd = tb + (size_t) (JT + jl % JT) * D;
+            uint16_t *       tb = cb + (size_t) g * NJ * KV_N + (size_t) (jl / JT) * KV_N;
+            const uint16_t * kr = (const uint16_t *) ((const char *) k->data + j * k->nb[1] + g * k->nb[2]);
+            const uint16_t * vr = (const uint16_t *) ((const char *) v->data + j * v->nb[1] + g * v->nb[2]);
+            uint16_t *       kd = tb + (size_t) (jl % JT) * D;
+            uint16_t *       vd = tb + (size_t) (JT + jl % JT) * D;
             for (int d = 0; d < D; d++) {
                 kd[d] = tbl[kr[d]];
                 vd[d] = tbl[vr[d]];
@@ -302,10 +307,9 @@ static void pack_q(const ggml_tensor * q, int32_t * dst, int64_t m0) {
         for (int r = 0; r < ROWS; r++) {
             uint16_t * qb = (uint16_t *) (dst + ((size_t) h * ROWS + r) * Q_N + QHDR);
             for (int i = 0; i < MT; i++) {
-                const char * src = (const char *) q->data +
-                                   (m0 + r * MT + i) * q->nb[1] + h * q->nb[2];
+                const char * src = (const char *) q->data + (m0 + (int64_t) r * MT + i) * q->nb[1] + h * q->nb[2];
                 for (int d = 0; d < D; d++) {
-                    qb[(size_t) d * MT + i] = f32_to_bf16(((const float *) src)[d]);
+                    qb[(size_t) d * MT + i] = xdna_bf16(((const float *) src)[d]);
                 }
             }
         }
@@ -314,6 +318,8 @@ static void pack_q(const ggml_tensor * q, int32_t * dst, int64_t m0) {
 
 bool xdna_fa_prefill_run(struct xdna_device * dev, struct ggml_tensor * node) {
     using namespace fa_pf;
+    // One dispatch at a time: the runner's buffers are shared by every layer.
+    std::lock_guard<std::mutex> lock(g_fa.mtx);
     if (!xdna_fa_prefill_supported(node)) {
         return false;
     }
@@ -331,49 +337,46 @@ bool xdna_fa_prefill_run(struct xdna_device * dev, struct ggml_tensor * node) {
     const size_t  chunks   = (size_t) ((n_kv + KCHUNK - 1) / KCHUNK);
     const int64_t rounds   = n_tokens / MBLK;
 
-    // Pack the whole window every time. The previous version kept what it had
-    // already packed and appended, keyed on the cache tensors' data pointers
-    // and a nondecreasing n_kv. That does not hold: a new prompt reuses the
-    // same cache storage, so the pointers match and n_kv can reach the old
-    // length again while the keys underneath are different ones, and the
-    // retained prefix is then the previous prompt's. A context shift rewrites
-    // the cache in place the same way. Restoring the incremental path needs an
-    // identity for the cache contents - a generation counter, or a sequence id
-    // - which this interface does not carry today.
+    // The window is packed whole on every call. Reusing the previous pack is
+    // only sound if the keys and values only grew, and nothing here proves
+    // that: a prompt can reuse the same cache storage and overwrite it while
+    // reaching the same or a longer n_kv, and attention would then read the
+    // previous prompt's keys. The incremental state is gone; the cost is
+    // O(n_kv) per ubatch, and this route is opt-in.
     if (!fa_kv_reserve(dev, chunks)) {
         return false;
     }
     {
-        uint16_t * kvh = (uint16_t *) g_fa.kv->bo.map();
+        uint16_t * kvh = (uint16_t *) g_fa.kv->data;
         std::memset(kvh, 0, g_fa.kv_chunks * kv_chunk_bytes());
         pack_kv(k, v, kvh, 0, n_kv);
-        xdna_buffer_sync_to_device_range(g_fa.kv, chunks * kv_chunk_bytes(), 0);
+        if (!xdna_buffer_sync_to_device_range(g_fa.kv, chunks * kv_chunk_bytes(), 0)) {
+            return false;
+        }
     }
 
-    int32_t * qh = (int32_t *) g_fa.q->bo.map();
+    int32_t * qh = (int32_t *) g_fa.q->data;
     for (int64_t rd = 0; rd < rounds; rd++) {
         const int64_t m0 = rd * MBLK;
-        {
-            pack_q(q, qh, m0);
-        }
+        { pack_q(q, qh, m0); }
         for (size_t c = 0; c < chunks; c++) {
             for (int h = 0; h < H; h++) {
                 for (int r = 0; r < ROWS; r++) {
                     int32_t * hdr = qh + ((size_t) h * ROWS + r) * Q_N;
-                    hdr[0] = c == 0;
-                    hdr[1] = c == chunks - 1;
-                    hdr[2] = (int32_t) (c * NJ);
-                    hdr[3] = (int32_t) (npast + m0);
+                    hdr[0]        = c == 0;
+                    hdr[1]        = c == chunks - 1;
+                    hdr[2]        = (int32_t) (c * NJ);
+                    hdr[3]        = (int32_t) (npast + m0);
                 }
             }
-            {
-                xdna_buffer_sync_to_device(g_fa.q);
+            if (!xdna_buffer_sync_to_device(g_fa.q)) {
+                return false;
             }
             xdna_buffer * args[3] = { g_fa.q, g_fa.kv_view[c], g_fa.o };
-            // Every chunk accumulates into the whole output object, so the
-            // last chunk of the round is the one the readback below waits on.
+            // Every chunk accumulates into the whole output object, so the last
+            // chunk of the round is the one the readback below waits on.
             xdna_buffer_mark(g_fa.o, g_fa.o->bytes);
-            xrt::run run = xdna_kernel_run_start(g_fa.kern, args, 3);
+            xrt::run      run     = xdna_kernel_run_start(g_fa.kern, args, 3);
             if (!xdna_run_wait(run)) {
                 return false;
             }
@@ -388,9 +391,8 @@ bool xdna_fa_prefill_run(struct xdna_device * dev, struct ggml_tensor * node) {
             for (int r = 0; r < ROWS; r++) {
                 const float * ob = o + ((size_t) h * ROWS + r) * ACC_N;
                 for (int i = 0; i < MT; i++) {
-                    float * out = (float *) ((char *) node->data +
-                                             h * node->nb[1] +
-                                             (m0 + r * MT + i) * node->nb[2]);
+                    float * out =
+                        (float *) ((char *) node->data + h * node->nb[1] + (m0 + (int64_t) r * MT + i) * node->nb[2]);
                     for (int d = 0; d < D; d++) {
                         out[d] = ob[(size_t) d * MT + i];
                     }

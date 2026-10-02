@@ -2,9 +2,7 @@
 # data movement: the mmul (64 x 128 x 64 bf16 -> f32) and the expander (one
 # K step of a tile), each called REP times inside one core's loop.
 #   NPU_CACHE_HOME=$(mktemp -d) python probes/pair_speed.py mm|exp [q8]
-import hashlib
-import sys
-import time
+import hashlib, sys, time
 from pathlib import Path
 import ml_dtypes
 import numpy as np
@@ -67,7 +65,7 @@ def spd(x: In, o: Out):
 
         def body(xi, oo, kexp, b):
             t = xi.acquire(1)
-            oo.acquire(1)
+            cc = oo.acquire(1)
             for _ in range_(REP):
                 kexp(t, b, 0, 1 if Q8 else 0)
             xi.release(1)

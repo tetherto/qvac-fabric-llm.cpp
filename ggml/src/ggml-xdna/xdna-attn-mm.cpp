@@ -1,10 +1,10 @@
 #include "xdna-attn-mm.h"
 
 #include "ggml-impl.h"
+#include "xdna-norm.h"
 #include "xdna-runtime.h"
 #include "xdna-seq.h"
 #include "xdna-util.h"
-#include "xdna-norm.h"
 
 #include <algorithm>
 #include <cmath>
@@ -33,37 +33,36 @@
 
 namespace {
 
-constexpr const char * STEM = "attn_mm_c8";
-constexpr int COLS = 8;
-constexpr int H    = 8;                 // query heads
-constexpr int KVH  = 2;                 // KV heads
-constexpr int D    = 256;
-constexpr int DH   = 128;               // a core's half of D
-constexpr int R    = 32;                // rows a pair
-constexpr int NK   = 32;                // keys a tile
-constexpr int PASS = 64;                // positions a pass
-constexpr int Q_OBJ  = R * DH;          // bf16 a core's Q object
-constexpr int KV_OBJ = 2 * NK * DH;     // bf16 a tile object
-constexpr int O_OBJ  = R * DH;          // f32 a core's O object
-constexpr int KV_RING = 3;              // K/V descriptors in flight a stream
-constexpr float SCALE = 0.0625f;
+constexpr const char * STEM    = "attn_mm_c8";
+constexpr int          COLS    = 8;
+constexpr int          H       = 8;            // query heads
+constexpr int          KVH     = 2;            // KV heads
+constexpr int          D       = 256;
+constexpr int          DH      = 128;          // a core's half of D
+constexpr int          R       = 32;           // rows a pair
+constexpr int          NK      = 32;           // keys a tile
+constexpr int          PASS    = 64;           // positions a pass
+constexpr int          Q_OBJ   = R * DH;       // bf16 a core's Q object
+constexpr int          KV_OBJ  = 2 * NK * DH;  // bf16 a tile object
+constexpr int          O_OBJ   = R * DH;       // f32 a core's O object
+constexpr int          KV_RING = 3;            // K/V descriptors in flight a stream
+constexpr float        SCALE   = 0.0625f;
 
-int kv_col(int s) { return 4 * (s / 2) + s % 2; }
+int kv_col(int s) {
+    return 4 * (s / 2) + s % 2;
+}
 
-int tiles_of(int64_t p0, int p) { return (int) ((p0 + (int64_t) p * PASS + PASS + NK - 1) / NK); }
-
-int host_threads() {
-    static const int n = std::max(1, std::min(16, (int) std::thread::hardware_concurrency() / 2));
-    return n;
+int tiles_of(int64_t p0, int p) {
+    return (int) ((p0 + (int64_t) p * PASS + PASS + NK - 1) / NK);
 }
 
 // A layer's K/V in the tile layout, kept across ubatches: within a sequence
 // the cache only grows at the end, so a ubatch packs only its own rows.
 struct kv_cache {
-    xdna_buffer * bo = nullptr;
-    int64_t cap_tiles = 0;              // tiles a stream holds
-    int64_t packed = 0;                 // keys packed
-    uint64_t print = 0;                 // of the keys packed (kv_print)
+    xdna_buffer * bo        = nullptr;
+    int64_t       cap_tiles = 0;  // tiles a stream holds
+    int64_t       packed    = 0;  // keys packed
+    uint64_t      print     = 0;  // of the keys packed (kv_print)
 };
 
 // A fingerprint of keys [0, n): the rows 0 and n - 1 of both KV heads, so a
@@ -83,31 +82,23 @@ uint64_t kv_print(const ggml_tensor * k, int64_t n) {
 }
 
 struct runner {
-    std::mutex mtx;
-    xdna_kernel * kern = nullptr;
+    std::mutex                                 mtx;
+    xdna_kernel *                              kern = nullptr;
     std::unordered_map<const void *, kv_cache> kv;
     // the nodes whose output stays in their output buffer (xdna_attn_mm_keep),
     // and the last such run's
-    std::vector<const ggml_tensor *> keep;
-    const ggml_tensor * kept      = nullptr;
-    xdna_buffer *       kept_bo   = nullptr;
-    xdna_kernel_pool *  kept_pool = nullptr;
-    size_t              kept_col  = 0;
-    int64_t             kept_tok  = 0;
+    std::vector<const ggml_tensor *>           keep;
+    const ggml_tensor *                        kept      = nullptr;
+    xdna_buffer *                              kept_bo   = nullptr;
+    xdna_kernel_pool *                         kept_pool = nullptr;
+    size_t                                     kept_col  = 0;
+    int64_t                                    kept_tok  = 0;
 };
 
 runner g_am;
 
 bool artifact_present() {
-    static const bool present = [] {
-        for (const auto & dir : xdna_kernel_search_dirs()) {
-            std::error_code ec;
-            if (std::filesystem::exists(dir / (std::string(STEM) + ".xclbin"), ec)) {
-                return true;
-            }
-        }
-        return false;
-    }();
+    static const bool present = !xdna_artifact_find(STEM, false).xclbin.empty();
     return present;
 }
 
@@ -115,16 +106,20 @@ bool artifact_present() {
 // causal mask would be silently wrong: the positions before the ubatch are
 // read off its first row (llama pads n_kv past them, the padding masked),
 // and every row is checked all the way across. -1: not causal.
-int64_t mask_past(const ggml_tensor * m, int64_t n_kv, int64_t n_tokens) {
+int64_t mask_scan(const ggml_tensor * m, int64_t n_kv, int64_t n_tokens) {
     // m->data is null while the scheduler is still deciding: supports_op runs
     // before graph_reserve allocates, so reading the mask here would fault.
-    if (!m || !m->data || m->type != GGML_TYPE_F16 || m->ne[0] < n_kv || m->ne[1] < n_tokens ||
-        m->ne[2] != 1 || m->ne[3] != 1) {
+    if (!m || !m->data || m->type != GGML_TYPE_F16 || m->ne[0] < n_kv || m->ne[1] < n_tokens || m->ne[2] != 1 ||
+        m->ne[3] != 1) {
         return -1;
     }
-    const ggml_fp16_t * row0 = (const ggml_fp16_t *) m->data;
-    int64_t npast = -1;
-    while (npast + 1 < n_kv && ggml_fp16_to_fp32(row0[npast + 1]) == 0.0f) {
+    // On the f16 bits: a visible key is 0.0 (0x0000 or 0x8000), a hidden one
+    // below -1e30, which in f16 is only -inf (0xFC00). Converting each value
+    // to f32 cost pp4096 18% (1604 -> 1309 t/s): the whole mask, every
+    // attention layer of every ubatch, twice a node.
+    const uint16_t * row0  = (const uint16_t *) m->data;
+    int64_t          npast = -1;
+    while (npast + 1 < n_kv && (row0[npast + 1] & 0x7FFF) == 0) {
         npast++;
     }
     if (npast < 0 || npast + n_tokens > n_kv) {
@@ -133,32 +128,71 @@ int64_t mask_past(const ggml_tensor * m, int64_t n_kv, int64_t n_tokens) {
     // Every row, not a sample of three: the design derives its own causal mask
     // from the positions, so a row it would hide a key for has to be rejected.
     for (int64_t t = 0; t < n_tokens; t++) {
-        const ggml_fp16_t * row = (const ggml_fp16_t *) ((const char *) m->data + t * m->nb[1]);
-        for (int64_t j = 0; j < n_kv; j++) {
-            const float v = ggml_fp16_to_fp32(row[j]);
-            const bool visible = j <= npast + t;
-            if (visible ? v != 0.0f : !(v < -1.0e30f)) {
-                return -1;
-            }
+        const uint16_t * row = (const uint16_t *) ((const char *) m->data + t * m->nb[1]);
+        const int64_t    vis = npast + t + 1;
+        uint16_t         bad = 0;
+        for (int64_t j = 0; j < vis; j++) {
+            bad |= row[j] & 0x7FFF;
+        }
+        for (int64_t j = vis; j < n_kv; j++) {
+            bad |= row[j] ^ 0xFC00;
+        }
+        if (bad) {
+            return -1;
         }
     }
     return npast;
+}
+
+// Every attention layer of a graph reads the same mask, and each asks twice
+// (supported, then run): scanning it each time was 12 whole-mask passes an
+// ubatch on the 0.8B, n_tokens x n_kv values each - 8% of a 16k prompt's
+// prefill energy. The answer is kept for the graph (xdna_attn_mm_graph_begin
+// starts a new one: a new ubatch rewrites the mask in place).
+struct mask_memo {
+    std::mutex   mtx;
+    uint64_t     epoch = 1, at = 0;
+    const void * data  = nullptr;
+    int64_t      n_kv = 0, n_tokens = 0, ne0 = 0;
+    size_t       nb1    = 0;
+    int64_t      result = -1;
+} g_mask;
+
+int64_t mask_past(const ggml_tensor * m, int64_t n_kv, int64_t n_tokens) {
+    if (!m || !m->data) {
+        return -1;
+    }
+    std::lock_guard<std::mutex> lock(g_mask.mtx);
+    if (g_mask.at == g_mask.epoch && g_mask.data == m->data && g_mask.n_kv == n_kv && g_mask.n_tokens == n_tokens &&
+        g_mask.ne0 == m->ne[0] && g_mask.nb1 == m->nb[1]) {
+        return g_mask.result;
+    }
+    g_mask.result   = mask_scan(m, n_kv, n_tokens);
+    g_mask.at       = g_mask.epoch;
+    g_mask.data     = m->data;
+    g_mask.n_kv     = n_kv;
+    g_mask.n_tokens = n_tokens;
+    g_mask.ne0      = m->ne[0];
+    g_mask.nb1      = m->nb[1];
+    return g_mask.result;
 }
 
 xdna_bd linear_bd(uint32_t words) {
     xdna_bd bd;
     bd.buf_len   = words;
     bd.d0_stride = bd.d1_stride = bd.d2_stride = 1;
-    bd.ax_cache  = 2;
+    bd.ax_cache                                = 2;
     return bd;
 }
 
 std::vector<uint32_t> build_seq(int npass, int64_t p0, int64_t cap_tiles) {
-    xdna_seq seq;
-    const uint32_t q_col = (uint32_t) (1 + npass) * 4 * Q_OBJ * 2;     // bytes a column
-    const uint32_t o_col = (uint32_t) npass * 4 * O_OBJ * 4;
+    xdna_seq       seq;
+    const uint32_t q_col     = (uint32_t) (1 + npass) * 4 * Q_OBJ * 2;  // bytes a column
+    const uint32_t o_col     = (uint32_t) npass * 4 * O_OBJ * 4;
     const uint32_t kv_stream = (uint32_t) cap_tiles * KV_OBJ * 2;
-    auto is_kv_col = [](int c) { return c == 0 || c == 1 || c == 4 || c == 5; };
+    auto           is_kv_col = [](int c) {
+        return c == 0 || c == 1 || c == 4 || c == 5;
+    };
     for (int c = 0; c < COLS; c++) {
         xdna_bd bd = linear_bd(q_col / 4);
         xdna_seq_blockwrite(&seq, c, 0, 0, &bd);
@@ -167,7 +201,7 @@ std::vector<uint32_t> build_seq(int npass, int64_t p0, int64_t cap_tiles) {
     }
     for (int c = 0; c < COLS; c++) {
         const uint32_t id = is_kv_col(c) ? 1 + KV_RING : 1;
-        xdna_bd bd = linear_bd(o_col / 4);
+        xdna_bd        bd = linear_bd(o_col / 4);
         xdna_seq_blockwrite(&seq, c, 0, id, &bd);
         xdna_seq_ddr_patch(&seq, c, 0, id, 2, (uint32_t) c * o_col);
         xdna_seq_issue_token(&seq, c, 0, xdna_dma_dir::S2MM, 0, 0xF);
@@ -205,24 +239,30 @@ std::vector<uint32_t> build_seq(int npass, int64_t p0, int64_t cap_tiles) {
 // keys of the first one before j0 again, the same values); the rest of the
 // last tile zero (finite: every query before them masks them). Rows convert
 // in vectors, then scatter into the tiles.
-void pack_kv(const ggml_tensor * k, const ggml_tensor * v, uint16_t * dst, int64_t cap_tiles,
-             int64_t j0, int64_t n_kv) {
+void pack_kv(const ggml_tensor * k,
+             const ggml_tensor * v,
+             uint16_t *          dst,
+             int64_t             cap_tiles,
+             int64_t             j0,
+             int64_t             n_kv) {
     const int64_t t0 = j0 / NK, t1 = (n_kv + NK - 1) / NK;
-#pragma omp parallel for collapse(2) num_threads(host_threads())
+#pragma omp parallel for collapse(2) num_threads(xdna_host_threads())
     for (int64_t t = t0; t < t1; t++) {
         for (int s = 0; s < 4; s++) {
-            const int g = s / 2, h = s % 2;
-            uint16_t * o = dst + ((size_t) s * cap_tiles + t) * KV_OBJ;
-            uint16_t * ov = o + NK * DH;
+            const int            g = s / 2, h = s % 2;
+            uint16_t *           o  = dst + ((size_t) s * cap_tiles + t) * KV_OBJ;
+            uint16_t *           ov = o + (size_t) NK * DH;
             alignas(64) uint16_t kb[NK][DH];
             alignas(64) uint16_t vb[NK][DH];
             for (int jj = 0; jj < NK; jj++) {
                 const int64_t j = t * NK + jj;
                 if (j < n_kv) {
-                    xdna_f16_to_bf16_row((const uint16_t *) ((const char *) k->data + j * k->nb[1] + g * k->nb[2]) + h * DH,
-                                         kb[jj], DH);
-                    xdna_f16_to_bf16_row((const uint16_t *) ((const char *) v->data + j * v->nb[1] + g * v->nb[2]) + h * DH,
-                                         vb[jj], DH);
+                    xdna_f16_to_bf16_row(
+                        (const uint16_t *) ((const char *) k->data + j * k->nb[1] + g * k->nb[2]) + (size_t) h * DH,
+                        kb[jj], DH);
+                    xdna_f16_to_bf16_row(
+                        (const uint16_t *) ((const char *) v->data + j * v->nb[1] + g * v->nb[2]) + (size_t) h * DH,
+                        vb[jj], DH);
                 } else {
                     std::memset(kb[jj], 0, sizeof(kb[jj]));
                     std::memset(vb[jj], 0, sizeof(vb[jj]));
@@ -231,7 +271,8 @@ void pack_kv(const ggml_tensor * k, const ggml_tensor * v, uint16_t * dst, int64
             // K (key/8, d/8, 8, 8): a key's 8 d a run
             for (int jj = 0; jj < NK; jj++) {
                 for (int d8 = 0; d8 < DH / 8; d8++) {
-                    std::memcpy(o + ((jj / 8) * (DH / 8) + d8) * 64 + (jj % 8) * 8, &kb[jj][d8 * 8], 16);
+                    std::memcpy(o + (size_t) ((jj / 8) * (DH / 8) + d8) * 64 + (size_t) (jj % 8) * 8,
+                                &kb[jj][(size_t) d8 * 8], 16);
                 }
             }
             // V^T (d/8, key/8, 8, 8): a d's 8 keys a run
@@ -244,26 +285,25 @@ void pack_kv(const ggml_tensor * k, const ggml_tensor * v, uint16_t * dst, int64
     }
 }
 
-} // namespace
+}  // namespace
 
 bool xdna_attn_mm_supported(const ggml_tensor * node) {
-    if (!node || node->op != GGML_OP_FLASH_ATTN_EXT || xdna_env_int("GGML_XDNA_FA_MM", 1) == 0 ||
-        !artifact_present()) {
+    if (!node || node->op != GGML_OP_FLASH_ATTN_EXT || xdna_env_int("GGML_XDNA_FA_MM", 1) == 0 || !artifact_present()) {
         return false;
     }
     const ggml_tensor * q = node->src[0];
     const ggml_tensor * k = node->src[1];
     const ggml_tensor * v = node->src[2];
     if (!q || !k || !v || node->src[4]) {
-        return false;   // sinks
+        return false;  // sinks
     }
     if (q->type != GGML_TYPE_F32 || k->type != GGML_TYPE_F16 || v->type != GGML_TYPE_F16 ||
         node->type != GGML_TYPE_F32) {
         return false;
     }
     // q is [D, n_tokens, n_head], k/v are [D, n_kv, n_head_kv]
-    if (q->ne[0] != D || q->ne[2] != H || q->ne[3] != 1 || k->ne[0] != D || v->ne[0] != D ||
-        k->ne[2] != KVH || v->ne[2] != KVH || k->ne[1] != v->ne[1]) {
+    if (q->ne[0] != D || q->ne[2] != H || q->ne[3] != 1 || k->ne[0] != D || v->ne[0] != D || k->ne[2] != KVH ||
+        v->ne[2] != KVH || k->ne[1] != v->ne[1]) {
         return false;
     }
     const int64_t n_tokens = q->ne[1];
@@ -284,35 +324,29 @@ bool xdna_attn_mm_supported(const ggml_tensor * node) {
     float params[3] = { 0.0f, 0.0f, 0.0f };
     std::memcpy(params, node->op_params, sizeof(params));
     if (params[0] != SCALE || params[1] != 0.0f || params[2] != 0.0f) {
-        return false;   // the scale is in the host's Q; no ALiBi, no softcap
+        return false;  // the scale is in the host's Q; no ALiBi, no softcap
     }
     return mask_past(node->src[3], n_kv, n_tokens) >= 0;
 }
 
 bool xdna_attn_mm_run(xdna_kernel_pool * pool, ggml_tensor * node) {
     std::lock_guard<std::mutex> lock(g_am.mtx);
-    const ggml_tensor * q = node->src[0];
-    const ggml_tensor * k = node->src[1];
-    const ggml_tensor * v = node->src[2];
-    const int64_t n_tokens = q->ne[1];
+    const ggml_tensor *         q        = node->src[0];
+    const ggml_tensor *         k        = node->src[1];
+    const ggml_tensor *         v        = node->src[2];
+    const int64_t               n_tokens = q->ne[1];
     // the keys up to the ubatch's last position; past them llama's padding
-    const int64_t p0       = mask_past(node->src[3], k->ne[1], n_tokens);
-    const int64_t n_kv     = p0 + n_tokens;
-    const int     npass    = (int) ((n_tokens + PASS - 1) / PASS);
+    const int64_t               p0       = mask_past(node->src[3], k->ne[1], n_tokens);
+    const int64_t               n_kv     = p0 + n_tokens;
+    const int                   npass    = (int) ((n_tokens + PASS - 1) / PASS);
     if (p0 < 0) {
+        GGML_LOG_ERROR("%s: the mask is not plain causal\n", "xdna-attn-mm");
         return false;
     }
-    const int64_t t_need   = tiles_of(p0, npass - 1);
+    const int64_t t_need = tiles_of(p0, npass - 1);
 
     if (!g_am.kern) {
-        for (const auto & dir : xdna_kernel_search_dirs()) {
-            const std::filesystem::path x = dir / (std::string(STEM) + ".xclbin");
-            std::error_code ec;
-            if (std::filesystem::exists(x, ec)) {
-                g_am.kern = xdna_kernel_load_hw(pool->device, x.c_str());
-                break;
-            }
-        }
+        g_am.kern = xdna_kernel_find(pool->device, STEM);
         if (!g_am.kern) {
             return false;
         }
@@ -322,34 +356,39 @@ bool xdna_attn_mm_run(xdna_kernel_pool * pool, ggml_tensor * node) {
     // its own rows, and all of them when the sequence starts over
     kv_cache & kc = g_am.kv[k->data];
     // a copy that ends where this ubatch starts, of this sequence's keys
-    int64_t j0 = (p0 > 0 && kc.packed == p0 && kc.print == kv_print(k, p0)) ? p0 : 0;
+    int64_t    j0 = (p0 > 0 && kc.packed == p0 && kc.print == kv_print(k, p0)) ? p0 : 0;
     if (!kc.bo || kc.cap_tiles < t_need) {
         if (kc.bo) {
             xdna_buffer_free(kc.bo);
         }
         kc.cap_tiles = (t_need + 255) / 256 * 256;
-        kc.bo = xdna_buffer_alloc(pool->device, (size_t) 4 * kc.cap_tiles * KV_OBJ * 2);
+        kc.bo        = xdna_buffer_alloc(pool->device, (size_t) 4 * kc.cap_tiles * KV_OBJ * 2);
         if (!kc.bo) {
             kc.cap_tiles = 0;
             return false;
         }
         j0 = 0;
     }
-    uint16_t * kvh = (uint16_t *) kc.bo->bo.map();
+    if (!kc.bo->data) {
+        return false;
+    }
+    uint16_t * kvh = (uint16_t *) kc.bo->data;
     pack_kv(k, v, kvh, kc.cap_tiles, j0, n_kv);
     // the tiles past n_kv that a pass streams are zero from the allocation
     // or a longer earlier sequence - finite either way, and masked
     const int64_t t0 = j0 / NK, t1 = (n_kv + NK - 1) / NK;
     for (int st = 0; st < 4; st++) {
-        xdna_buffer_sync_to_device_range(kc.bo, (size_t) (t1 - t0) * KV_OBJ * 2,
-                                         ((size_t) st * kc.cap_tiles + t0) * KV_OBJ * 2);
+        if (!xdna_buffer_sync_to_device_range(kc.bo, (size_t) (t1 - t0) * KV_OBJ * 2,
+                                              ((size_t) st * kc.cap_tiles + t0) * KV_OBJ * 2)) {
+            return false;
+        }
     }
     kc.packed = n_kv;
     kc.print  = kv_print(k, n_kv);
 
     const std::vector<uint32_t> insts = build_seq(npass, p0, kc.cap_tiles);
     if (!xdna_kernel_bind_insts(pool->device, g_am.kern, insts.data(), insts.size())) {
-        return false;
+        return false;  // xdna-runtime names the stream and the reason
     }
 
     if (g_am.kept_bo) {
@@ -357,43 +396,45 @@ bool xdna_attn_mm_run(xdna_kernel_pool * pool, ggml_tensor * node) {
         g_am.kept_bo = nullptr;
         g_am.kept    = nullptr;
     }
-    const bool keep = std::find(g_am.keep.begin(), g_am.keep.end(), node) != g_am.keep.end();
-    const size_t q_col = (size_t) (1 + npass) * 4 * Q_OBJ;      // bf16 a column
-    const size_t o_col = (size_t) npass * 4 * O_OBJ;            // f32 a column
-    xdna_buffer * bo_q = xdna_kernel_pool_acquire_buffer(pool, COLS * q_col * 2);
-    xdna_buffer * bo_o = xdna_kernel_pool_acquire_buffer(pool, COLS * o_col * 4);
-    if (!bo_q || !bo_o) {
+    const bool    keep  = std::find(g_am.keep.begin(), g_am.keep.end(), node) != g_am.keep.end();
+    const size_t  q_col = (size_t) (1 + npass) * 4 * Q_OBJ;  // bf16 a column
+    const size_t  o_col = (size_t) npass * 4 * O_OBJ;        // f32 a column
+    xdna_buffer * bo_q  = xdna_kernel_pool_acquire_buffer(pool, COLS * q_col * 2);
+    xdna_buffer * bo_o  = xdna_kernel_pool_acquire_buffer(pool, COLS * o_col * 4);
+    if (!bo_q || !bo_o || !bo_q->data || !bo_o->data) {
         return false;
     }
 
     // Q: per column the header, then per pass and core Q half^T of its 32
     // rows (the group's 4 heads x 8 positions); past the ubatch zero
-    uint16_t * qh = (uint16_t *) bo_q->bo.map();
+    uint16_t *  qh = (uint16_t *) bo_q->data;
     const float qs = (float) (M_LOG2E / 16.0);
-#pragma omp parallel for num_threads(host_threads())
+#pragma omp parallel for num_threads(xdna_host_threads())
     for (int cp = 0; cp < COLS * (1 + npass); cp++) {
-        const int c = cp / (1 + npass), p = cp % (1 + npass) - 1;
+        const int  c = cp / (1 + npass), p = cp % (1 + npass) - 1;
         uint16_t * col = qh + (size_t) c * q_col + (size_t) (p + 1) * 4 * Q_OBJ;
         if (p < 0) {
             std::memset(col, 0, (size_t) 4 * Q_OBJ * 2);
             for (int i = 0; i < 4; i++) {
                 int32_t * hw = (int32_t *) (col + (size_t) i * Q_OBJ);
-                hw[0] = npass;
-                hw[1] = (int32_t) p0;
+                hw[0]        = npass;
+                hw[1]        = (int32_t) p0;
             }
             continue;
         }
         const int g = c / 4;
         for (int i = 0; i < 4; i++) {
-            const int pidx = (c - 4 * g) * 2 + i / 2, h = i % 2;
-            uint16_t * o = col + (size_t) i * Q_OBJ;
+            const int            pidx = (c - 4 * g) * 2 + i / 2, h = i % 2;
+            uint16_t *           o = col + (size_t) i * Q_OBJ;
             alignas(64) uint16_t qb[R][DH];
             for (int row = 0; row < R; row++) {
-                const int hh = row / 8;
-                const int64_t t = (int64_t) p * PASS + pidx * 8 + row % 8;
+                const int     hh = row / 8;
+                const int64_t t  = (int64_t) p * PASS + (int64_t) pidx * 8 + row % 8;
                 if (t < n_tokens) {
-                    xdna_scaled_bf16_row((const float *) ((const char *) q->data + t * q->nb[1] + (4 * g + hh) * q->nb[2]) + h * DH,
-                                         qs, qb[row], DH);
+                    xdna_scaled_bf16_row(
+                        (const float *) ((const char *) q->data + t * q->nb[1] + (4 * g + hh) * q->nb[2]) +
+                            (size_t) h * DH,
+                        qs, qb[row], DH);
                 } else {
                     std::memset(qb[row], 0, sizeof(qb[row]));
                 }
@@ -405,36 +446,36 @@ bool xdna_attn_mm_run(xdna_kernel_pool * pool, ggml_tensor * node) {
             }
         }
     }
-    xdna_buffer_sync_to_device_range(bo_q, COLS * q_col * 2, 0);   // the pool's BO may be larger
+    // the pool's BO may be larger
+    if (!xdna_buffer_sync_to_device_range(bo_q, COLS * q_col * 2, 0)) {
+        return false;
+    }
 
     xdna_buffer * args[3] = { bo_q, kc.bo, bo_o };
-    xrt::run run = xdna_kernel_run_start(g_am.kern, args, 3);
-    const bool ok = xdna_run_wait(run);
+    xrt::run      run     = xdna_kernel_run_start(g_am.kern, args, 3);
+    const bool    run_ok  = xdna_run_wait(run);
+    const bool    ok      = run_ok && xdna_buffer_sync_from_device_range(bo_o, COLS * o_col * 4, 0);
     if (ok) {
         // O: dst is [D, n_head, n_tokens]
-        xdna_buffer_sync_from_device_range(bo_o, COLS * o_col * 4, 0);
-        const float * ob = (const float *) bo_o->bo.map();
-#pragma omp parallel for num_threads(host_threads())
+        const float * ob = (const float *) bo_o->data;
+#pragma omp parallel for num_threads(xdna_host_threads())
         for (int cp = 0; cp < (keep ? 0 : COLS * npass); cp++) {
             const int c = cp / npass, p = cp % npass, g = c / 4;
             for (int i = 0; i < 4; i++) {
-                const int pidx = (c - 4 * g) * 2 + i / 2, h = i % 2;
+                const int     pidx = (c - 4 * g) * 2 + i / 2, h = i % 2;
                 const float * o = ob + (size_t) c * o_col + ((size_t) p * 4 + i) * O_OBJ;
                 for (int row = 0; row < R; row++) {
-                    const int64_t t = (int64_t) p * PASS + pidx * 8 + row % 8;
+                    const int64_t t = (int64_t) p * PASS + (int64_t) pidx * 8 + row % 8;
                     if (t >= n_tokens) {
                         continue;
                     }
-                    float * dst = (float *) ((char *) node->data + (4 * g + row / 8) * node->nb[1] +
-                                             t * node->nb[2]) + h * DH;
+                    float * dst = (float *) ((char *) node->data + (4 * g + row / 8) * node->nb[1] + t * node->nb[2]) +
+                                  (size_t) h * DH;
                     // the MemTile leaves the core's rows as rows
                     std::memcpy(dst, o + (size_t) row * DH, DH * sizeof(float));
                 }
             }
         }
-    } else {
-        GGML_LOG_ERROR("%s: run failed n_tokens=%lld n_kv=%lld\n", "xdna-attn-mm",
-                       (long long) n_tokens, (long long) n_kv);
     }
     xdna_kernel_pool_release_buffer(pool, bo_q);
     if (ok && keep) {
@@ -447,6 +488,11 @@ bool xdna_attn_mm_run(xdna_kernel_pool * pool, ggml_tensor * node) {
         xdna_kernel_pool_release_buffer(pool, bo_o);
     }
     return ok;
+}
+
+void xdna_attn_mm_graph_begin(void) {
+    std::lock_guard<std::mutex> lock(g_mask.mtx);
+    g_mask.epoch++;
 }
 
 void xdna_attn_mm_keep_clear(void) {
@@ -464,7 +510,7 @@ bool xdna_attn_mm_rows(const ggml_tensor * node, xdna_attn_rows * rows) {
     if (!node || g_am.kept != node || !g_am.kept_bo) {
         return false;
     }
-    rows->base     = (const float *) g_am.kept_bo->bo.map();
+    rows->base     = (const float *) g_am.kept_bo->data;
     rows->o_col    = g_am.kept_col;
     rows->n_tokens = g_am.kept_tok;
     return true;
@@ -476,14 +522,14 @@ bool xdna_attn_mm_materialize(const ggml_tensor * node) {
         return false;
     }
     xdna_attn_rows r;
-    r.base = (const float *) g_am.kept_bo->bo.map();
-    r.o_col = g_am.kept_col;
+    r.base     = (const float *) g_am.kept_bo->data;
+    r.o_col    = g_am.kept_col;
     r.n_tokens = g_am.kept_tok;
-#pragma omp parallel for num_threads(host_threads())
+#pragma omp parallel for num_threads(xdna_host_threads())
     for (int64_t t = 0; t < r.n_tokens; t++) {
         for (int h = 0; h < H; h++) {
-            const float * p0 = xdna_attn_mm_row(&r, t, h);
-            float * dst = (float *) ((char *) node->data + h * node->nb[1] + t * node->nb[2]);
+            const float * p0  = xdna_attn_mm_row(&r, t, h);
+            float *       dst = (float *) ((char *) node->data + h * node->nb[1] + t * node->nb[2]);
             std::memcpy(dst, p0, DH * sizeof(float));
             std::memcpy(dst + DH, p0 + O_OBJ, DH * sizeof(float));
         }

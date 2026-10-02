@@ -23,6 +23,33 @@ std::vector<std::filesystem::path> xdna_kernel_search_dirs(void);
 // later with xdna_kernel_bind_insts. Returns nullptr on failure.
 xdna_kernel * xdna_kernel_load_hw(xdna_device * dev, const char * xclbin_path);
 
+// The artifacts of one design, as full paths.
+struct xdna_artifact {
+    std::string xclbin;
+    std::string insts;
+};
+
+// First search dir that holds `stem`'s artifacts; xclbin is empty when none
+// does. `need_insts` also requires the instruction stream in that same dir.
+xdna_artifact xdna_artifact_find(const char * stem, bool need_insts);
+
+// xdna_artifact_find(stem, false), loaded into a kernel handle; nullptr when
+// the xclbin is absent or the load fails.
+xdna_kernel * xdna_kernel_find(xdna_device * dev, const char * stem);
+
+// Validate a TXN stream against its own header, in 32-bit words: word 2 is the
+// instruction count and word 3 the total size in bytes. `n_words` is the stream
+// length in words, which is also what the run's instruction-count argument
+// takes (xrt argument 2), not a byte count.
+bool xdna_insts_stream_ok(const char * name, const uint32_t * insts, size_t n_words);
+
+// Read a `.insts.bin` into `words` and validate it as a TXN stream: a size
+// that is not whole words, or a header that does not describe the file, is an
+// ERROR naming the file, its declared count and byte size, and the actual
+// size, instead of a garbage dispatch. Prefer this over reading the artifact
+// directly; every stream is checked again by xdna_kernel_bind_insts.
+bool xdna_insts_read_file(const char * path, std::vector<uint32_t> & words);
+
 // Bind an in-memory instruction stream (TXN words) to a loaded kernel. `dev`
 // must be the same handle used for the data buffers.
 bool xdna_kernel_bind_insts(xdna_device * dev, xdna_kernel * kern, const uint32_t * insts, size_t n_words);
@@ -49,9 +76,9 @@ struct xdna_arena_scope {
 };
 
 // Free the arena's chunks once nothing carved out of them is left; false, and
-// nothing freed, while a view or a scope still is. What the backend built
-// from a model goes with its last context, so the next model's decode starts
-// a fresh arena rather than growing the old one.
+// nothing freed, while a view or a scope still is. What the backend built from
+// a model goes with its last context, so the next model's decode starts a
+// fresh arena rather than growing the old one.
 bool xdna_arena_release(void);
 
 // A window onto an existing buffer, for handing a kernel one slice of a larger
@@ -62,19 +89,13 @@ xdna_buffer * xdna_buffer_sub(xdna_buffer * parent, size_t offset, size_t bytes)
 
 void xdna_buffer_free(xdna_buffer * buf);
 
-// Make device-side writes to a mapped BO visible to the host. On this platform
-// XRT never issues the driver's cache-maintenance ioctl for a host_only BO and
-// the mapping is ordinary cacheable memory; what it does here is nothing.
-void xdna_buffer_sync_from_device(xdna_buffer * buf);
+// Make device-side writes to a mapped BO visible to the host (cache
+// invalidation). Read the data through the BO's own map afterwards. False when
+// the buffer is missing or XRT rejected the sync; zero bytes is a no-op.
+[[nodiscard]] bool xdna_buffer_sync_from_device(xdna_buffer * buf);
 // Invalidate part of a buffer, for a range the array wrote while the host
 // may hold older cache lines of it.
-void xdna_buffer_sync_from_device_range(xdna_buffer * buf, size_t bytes, size_t offset);
-// Read `bytes` from a buffer the array writes into. A dispatch can report
-// completion before its last writes are visible to the host, and a read taken
-// in that window hands back - and caches - the previous contents. Read,
-// invalidate the cache, read again, and keep reading while the value changes.
-void xdna_buffer_read_settled(xdna_buffer * buf, void * dst, size_t bytes,
-                              size_t offset = 0);
+[[nodiscard]] bool xdna_buffer_sync_from_device_range(xdna_buffer * buf, size_t bytes, size_t offset);
 
 // The pattern xdna_buffer_mark leaves in a range the device is about to
 // overwrite: a quiet NaN with a payload of its own, which no kernel in this
@@ -83,39 +104,37 @@ static constexpr uint32_t XDNA_POISON_F32 = 0x7FC0DEADu;
 
 // Mark the range [offset, offset+bytes) as not yet written by the device, and
 // write the pattern through the CPU caches: left dirty, our own lines could
-// land on top of the device's output.
-//
-// A dispatch reports completion before its last writes are readable, so a read
-// taken right after it can return the previous contents of the buffer. There
-// is no barrier for that from the host - the completion is honest and the
-// cache ioctl does nothing - so the read has to tell a landed write from a
-// pending one, which is what the pattern is for.
+// land on top of the device's output. Mark before the dispatch that writes it.
 void xdna_buffer_mark(xdna_buffer * buf, size_t bytes, size_t offset = 0);
 
 // Wait until the device has written every word of [offset, offset+bytes) and
 // return the buffer's map at that offset, so the caller reads it in place; or
 // nullptr when the pattern survived every pass.
 //
-// The same evidence as xdna_buffer_download without the copy, for a reader
-// that consumes the range once and can walk the device's memory directly - a
-// GEMM's C block folded straight into its destination, where a staging copy
-// would double the bytes moved.
-uint8_t * xdna_buffer_wait_written(xdna_buffer * buf, size_t bytes,
-                                   size_t offset = 0);
+// The same evidence as xdna_buffer_download without the copy, for a reader that
+// consumes the range once and can walk the device's memory directly - a GEMM's
+// C block folded straight into its destination, where a staging copy would
+// double the bytes moved.
+uint8_t * xdna_buffer_wait_written(xdna_buffer * buf, size_t bytes, size_t offset = 0);
 
 // Copy a marked range out, returning only once every word of it has been
 // written by the device, i.e. once the pattern is gone. `dst` must hold
-// `bytes`. Returns false when the pattern survived every pass; the copy is
-// made either way, so the caller keeps working on the last value it saw.
-bool xdna_buffer_download(xdna_buffer * buf, void * dst, size_t bytes,
-                          size_t offset = 0);
+// `bytes`. Returns false when the pattern survived every pass; the copy is made
+// either way, so the caller keeps working on the last value it saw.
+bool xdna_buffer_download(xdna_buffer * buf, void * dst, size_t bytes, size_t offset = 0);
+// Read `bytes` from a buffer the array writes into. A dispatch can report
+// completion before its last writes are visible to the host, and a read taken
+// in that window hands back - and caches - the previous contents. Read,
+// invalidate the cache, read again, and keep reading while the value changes.
+// False when a sync failed; `dst` then holds the last read taken.
+[[nodiscard]] bool xdna_buffer_read_settled(xdna_buffer * buf, void * dst, size_t bytes, size_t offset = 0);
 
 // Make host-side writes to the mapped memory visible to the NPU.
-void xdna_buffer_sync_to_device(xdna_buffer * buf);
+[[nodiscard]] bool xdna_buffer_sync_to_device(xdna_buffer * buf);
 
 // Flush only part of a buffer. Needed when the device writes into the rest of
 // it and a full flush would push the stale host copy over what it wrote.
-void xdna_buffer_sync_to_device_range(xdna_buffer * buf, size_t bytes, size_t offset);
+[[nodiscard]] bool xdna_buffer_sync_to_device_range(xdna_buffer * buf, size_t bytes, size_t offset);
 
 // --- execution -------------------------------------------------------------
 
@@ -151,8 +170,10 @@ bool xdna_run_wait(xrt::run & run);
 // given, and the join renames each buffer to the root BO it is a view of -
 // the decode's arena (xdna_arena_scope) is what keeps those few.
 void xdna_batch_begin(int k);
-bool xdna_run_submit(struct xdna_kernel * kern, xrt::run & run,
-                     struct xdna_buffer * const * args = nullptr, size_t n_args = 0);
+bool xdna_run_submit(struct xdna_kernel *         kern,
+                     xrt::run &                   run,
+                     struct xdna_buffer * const * args   = nullptr,
+                     size_t                       n_args = 0);
 bool xdna_batch_wait(void);
 bool xdna_batch_active(void);
 
@@ -164,8 +185,11 @@ void xdna_kernel_pool_scan(xdna_kernel_pool * pool);
 // Load (or fetch from cache) a kernel for `name` with an in-memory built
 // instruction stream: on a miss, load the hw from `xclbin_name` and bind the
 // stream. A failed lookup is cached and not retried.
-xdna_kernel * xdna_kernel_pool_get_built(xdna_kernel_pool * pool, const std::string & name,
-                                         const char * xclbin_name, const uint32_t * insts, size_t n_words);
+xdna_kernel * xdna_kernel_pool_get_built(xdna_kernel_pool *  pool,
+                                         const std::string & name,
+                                         const char *        xclbin_name,
+                                         const uint32_t *    insts,
+                                         size_t              n_words);
 
 // Acquire a device buffer of at least `bytes` bytes, reusing an idle one from
 // the pool when possible.

@@ -41,15 +41,25 @@ recurrent state stays on the device between tokens.
 It covers one weight set: `Q4_K` for the FFN gate and up, `Q4_K`/`Q5_K`/`Q6_K`
 for `ssm_out`, `Q4_K`/`Q6_K` for the FFN down, plus a `GGML_XDNA_GATED_FMT` that
 matches the `ssm_out` layout. Anything else is refused with an error rather
-than run on the wrong kernels: prefill still runs on the array, and the first
-decode graph fails. Which quants hit this, and the requantization that avoids
-it, are under Build below.
+than run on the wrong kernels; the refusal names the weight set. The way on is
+to requantize `ssm_out` (see Build). `GGML_XDNA_FUSED_LAYER=0` is a bisection
+switch, not a way to run a model this layer refuses.
+
+The designs are also built for one residual width (1024, `XDNA_RES_D`). A model
+whose residual stream is wider - Qwen3.5-2B is 2048 - cannot be handed a
+recurrent layer at all: its decode falls back by itself and stays on the array
+as far as the width allows. The recurrent bodies (conv, GDN, norms, GLU) run on
+the host, while the projections keep the decode GEMV on the same array, the
+decode attention stays on the pool and the head stays on the array. One warning
+names the width when it happens. `GGML_XDNA_FUSED_LAYER=0` still forces the
+per-op path for a model the fused design does cover.
 
 ### Prefill ops
 
 | op | kernel | default |
 | :-- | :-- | :-- |
-| `SSM_CONV`, from 64 tokens | `kernels/conv.py` | on, `GGML_XDNA_CONV=0` for the host |
+| `SSM_CONV`, from 64 tokens | `kernels/conv.py` | opt-in, `GGML_XDNA_CONV=1`; the host is cheaper and is what runs otherwise |
+| the prefill GDN's conv input | `kernels/gdn_conv.py` | on with the GDN, `GGML_XDNA_GDN_CONV=0` for the host |
 | `GATED_DELTA_NET` | `kernels/gdn_prefill.py` | opt-in, `GGML_XDNA_GDN=1` |
 | `FLASH_ATTN_EXT`, plain causal mask only | `kernels/fa.py` | opt-in, `GGML_XDNA_FA=1` |
 
@@ -99,21 +109,18 @@ Weights are packed into q4g32 (Q4_K: 4-bit codes plus an int8 scale and min per
 32 values) or q8g16 (Q4_K/Q5_K/Q6_K: int8 codes plus scale and min per 16).
 Both decode as `w = q*d + m` and both are exact with respect to the ggml block
 they come from, so a single kernel streams either and the GEMV never switches
-hardware context. The packed weights live in a device buffer keyed by the
-tensor's data pointer and shape until the last context on the backend is
-freed; so do the fused-layer sessions. A model loaded after that starts from
-nothing, even at the same addresses.
+hardware context. The packed weights live in a device buffer for the process
+lifetime, keyed by the tensor's data pointer and shape.
 
 ### One decode token
 
 1. The scheduler has placed the ops here because `supports_op` claimed them.
 2. `graph_compute` pre-scans the chunk and plans a fused run for every complete
    recurrent layer it finds.
-3. The dispatch loop runs the rest of the chunk: the projections outside the
-   fused layers (on the host by default, or on the decode GEMV with
-   `GGML_XDNA_GEMV_GROUP=1`, which groups the projections reading the same
-   activation into one dispatch), prefill kernels where they apply, and the
-   host glue batched over runs of consecutive host ops.
+3. The dispatch loop runs the rest of the chunk: projections on the decode GEMV
+   (projections that read the same activation are grouped into one dispatch),
+   prefill kernels where they apply, and the host glue batched over runs of
+   consecutive host ops.
 4. At a layer's fire point the fused run executes and writes `h_attn`/`h_out`
    directly into the layer's add tensors; the layer's own conv/gdn/ffn nodes are
    marked consumed and skipped.
@@ -121,61 +128,23 @@ nothing, even at the same addresses.
 Prefill chunks take the same path with `M > 1` (GEMM blocks and the conv/fa/gdn
 prefill kernels); the fused layer never fires there.
 
-## Known limitations
-
-Measured on npu2 (Ryzen AI MAX+ 395), Qwen3.5-0.8B-Q4_K_M, llama-server with
-`-np 1 -b 4096 -ub 4096 --flash-attn off`, requests at `temperature 0`,
-`top_k 1` and `cache_prompt false`.
-
-**`GGML_XDNA_GEMV_GROUP=1` does not reproduce run to run.** With the
-projections outside the fused layers on the decode GEMV, separate processes
-given the same prompt and seed sometimes disagree: 2 of 120 runs produced a
-different set of logits. The default path, which keeps those projections on
-the host, is also the faster of the two, so the array route is off unless the
-switch asks for it. Keeping it reachable matters for measuring NPU residency
-and power, where the work belongs on the device; we are still looking for the
-cause and will update this when we know more.
-
-What the default path has been measured on, so the claim is not read wider
-than it is: 48 runs of one request in a fresh process, and 12 repeated
-multi-token requests inside one process, none of which diverged. Then five
-fresh server processes, each given six one-token prompts, four 1466-token
-prompts and three of each interleaved, every request with `n_probs 5`: all 30
-one-token answers were one result, all 20 long ones another, and the
-interleaved runs matched them - a one-token request after a long one is
-answered exactly as on its own. The report of two 1466-token requests in one
-process differing has not reproduced.
-
-Measure this on the logits, not on the generated text. The perturbation is
-small enough that the argmax token is usually unchanged, so the output is
-byte-identical while the numbers behind it are not. In one series of 12 runs
-every one of 256 positions picked the same token in all 12, and the top-5
-logprobs still split 11 to 1. Ask `llama-server` for `n_probs` and compare
-those.
-
-**The per-op decode path is reproducible but wrong.** With
-`GGML_XDNA_FUSED_LAYER=0` three runs agree byte for byte and all three are
-degenerate - repeated tokens and mixed scripts rather than an answer. So the
-flag is a bisection switch, not a way to run a model the fused layer refuses:
-requantize that model instead (see Build).
-
-**A build writes into the source tree.** `kernels/design_tag.py` regenerates
-`xdna-design-tag.h`, which is tracked, so `git status` reports the working tree
-as modified after every build.
-
 ## Requirements
 
 - Linux with an AMD NPU2 (XDNA2) device; it shows up as `/dev/accel/accel0` and
   in `xrt-smi examine`.
-- XRT 2.25.37 under `/opt/xilinx/xrt`, with its tools on the `PATH`.
-- libuuid development files (Ubuntu: `uuid-dev`). The XRT headers include
-  `<uuid/uuid.h>` and the link needs `-luuid`; XRT does not bring either.
+- XRT 2.25.37 under `/opt/xilinx/xrt`, with its tools on the `PATH`. Older XRT
+  is not supported: 2.21.75 has been seen to fail a ~1.2 GB host-memory BO
+  allocation at startup and the decode was not reproducible on that
+  installation. The version is not checked at run time.
+- The libuuid development files (`uuid-dev` on Ubuntu). XRT's headers include
+  `<uuid/uuid.h>` and the link needs `-luuid`, and XRT brings neither, so a
+  build fails on the include and then on the link without them.
 - A Python interpreter with IRON (mlir-aie + llvm-aie) to compile the kernels.
   Verified against mlir-aie 1.4.3: the RTP buffer bases in `xdna-seq.h` are read
   back from that toolchain's placement, so a version bump needs them re-read
   from a freshly compiled project (the header says which values).
-- A model the fused decode path covers (see above and the requantization under
-  Build).
+- A model the fused decode path covers (see above). A refused quantization is
+  not run by setting `GGML_XDNA_FUSED_LAYER=0`; requantize `ssm_out` (see Build).
 
 ## Build
 
@@ -199,22 +168,24 @@ cmake --build build -j$(nproc)
 - `GGML_XDNA_GATED_FMT` (default 1) selects the activation layout the gated
   stage writes: `0` is the 4-bit form for a `Q4_K` `ssm_out`, `1` the 8-bit form
   for `Q5_K`/`Q6_K`. It is compiled into the artifact and into the backend, and
-  the backend refuses a model whose `ssm_out` needs the other one. Q4_K_M
-  quants differ here:
-  - `qwen3.5-0.8b-q4km.gguf` leaves `ssm_out` at Q5_K: the default covers it.
-  - LM Studio's leaves it at Q4_K: `-DGGML_XDNA_GATED_FMT=0`.
-  - The stock `Qwen/Qwen3.5-0.8B` `Q4_K_M` leaves half of them at `Q8_0`
-    (9 x Q4_K + 9 x Q8_0 on the 0.8B), which is outside the set entirely, so
-    neither value helps; it fails as
-    `fused layer 0: unsupported fused weight set (so=q8_0 gate=q4_K up=q4_K
-    down=q6_K)`.
-
-  Requantizing with `ssm_out` pinned to a covered type gives a model the fused
-  layer accepts on the default `GATED_FMT=1`:
+  the backend refuses a model whose `ssm_out` needs the other one. Which type a
+  quant ends up with is a property of the quant, not of its name:
+  `llama-quantize ... Q4_K_M` built from this tree leaves `ssm_out` at `Q4_K`
+  (so the fused layer needs `-DGGML_XDNA_GATED_FMT=0`), while other `Q4_K_M`
+  conversions leave it at `Q5_K` (the default). Check the model with
+  `llama-gguf model.gguf r n | grep ssm_out`, or read the refusal the backend
+  prints. To keep the default `GATED_FMT=1`, requantize that one tensor:
 
   ```sh
-  llama-quantize --tensor-type ssm_out=q5_K Qwen3.5-0.8B-BF16.gguf out.gguf Q4_K_M
+  llama-quantize --tensor-type ssm_out=q5_K model-f16.gguf out.gguf Q4_K_M
   ```
+
+  A `ssm_out` outside `Q4_K`/`Q5_K`/`Q6_K` is refused whatever `GATED_FMT` is -
+  a stock `Qwen/Qwen3.5-0.8B Q4_K_M` leaves half of them at `Q8_0` and prints
+  `unsupported fused weight set (so=q8_0 gate=q4_K up=q4_K down=q6_K)`. The
+  `--tensor-type ssm_out=q5_K` recipe above is the way onto the fused path.
+  `GGML_XDNA_FUSED_LAYER=0` does not run this model. It only moves a model the
+  fused layer accepts onto the per-op kernels, for a bisection.
 
 Artifacts, all in the build output directory (`build/bin` by default):
 
@@ -252,27 +223,31 @@ OMP_WAIT_POLICY=PASSIVE ./build/bin/llama-server -m model.gguf \
 
 ### Environment
 
-The knobs below are for bisecting a regression rather than tuning. The ones
-that default to `1` name an NPU path that `0` disables; the ones that default
-to `0` name a path that `1` turns on. Either way the default is the arm the
-backend is tested on.
+The knobs below are for bisecting a regression rather than tuning: each one
+disables the NPU path it names, and the default is the fast one.
 
 | variable | default | effect |
 | :-- | :-- | :-- |
-| `GGML_XDNA_FUSED_LAYER` | 1 | `0` runs the decode on the per-op kernels instead of the fused layer |
+| `GGML_XDNA_FUSED_LAYER` | 1 | bisection switch: `0` leaves the fused layer off. It does not run a model the layer refuses |
+| `GGML_XDNA_GEMV_GROUP` | 1 | `0` keeps the decode projections outside the fused layer on the host |
+| `GGML_XDNA_GEMV_PROMOTE` | 1 | `0` keeps one GEMV dispatch to a single weight format |
 | `GGML_XDNA_GLUE` | 1 | `0` stops the backend claiming the host ops of a decode chunk |
 | `GGML_XDNA_GLUE_THREADS` | 4 | host-fallback threads for a decode-sized chunk |
 | `GGML_XDNA_GLUE_THREADS_BIG` | 16 | host-fallback threads for a chunk of 32 tokens or more |
 | `GGML_XDNA_INT8` | 1 | `0` drops the native int8 prefill GEMM |
-| `GGML_XDNA_CONV` | 1 | `0` runs the prefill conv on the host |
-| `GGML_XDNA_GDN` | 0 | `1` runs the GDN prefill body on the array |
-| `GGML_XDNA_FA` | 0 | `1` runs flash-attention prefill on the array |
-| `GGML_XDNA_GEMV_PROMOTE` | 1 | `0` stops one GEMV dispatch mixing weight formats |
-| `GGML_XDNA_GEMV_GROUP` | 0 | `1` moves the projections outside the fused layers onto the decode GEMV; slower, and not reproducible - see the limitations |
-| `GGML_XDNA_SPIN` | 1 | `0` blocks for kernel completion instead of polling |
-| `GGML_XDNA_HOST_BO` | 1 | `0` keeps llama's tensors in the plain CPU buffer type instead of XRT host BOs |
-| `GGML_XDNA_SETTLE_PASSES` | 2000 | reads of a marked output before a read gives up (`xdna_buffer_mark`) |
-| `GGML_XDNA_SETTLE_PAUSE` | 400 | pause loops between two such reads |
+| `GGML_XDNA_PGEMM` | 1 | `0` takes the prefill GEMM off the array |
+| `GGML_XDNA_GDN_MM` | 1 | `0` takes the prefill gated delta rule off the array |
+| `GGML_XDNA_GDN_CONV` | 1 | `0` runs the prefill GDN's conv input on the host |
+| `GGML_XDNA_FA_MM` | 1 | `0` takes prefill attention off the array |
+| `GGML_XDNA_CONV` | 0 | `1` runs the standalone prefill conv on the array; the host is what runs otherwise |
+| `GGML_XDNA_GDN` | 0 | `1` runs the older GDN prefill body on the array |
+| `GGML_XDNA_FA` | 0 | `1` runs the older flash-attention prefill on the array |
+| `GGML_XDNA_SPIN_US` | 0 | poll this many microseconds for completion before blocking; `-1` polls until it completes |
+
+The remaining `GGML_XDNA_*` variables (`HEAD`, `QUEUE`, `INPROJ`, `ATTN`,
+`ATTN_LAYER`, `ATTN_TAIL`, `HOST_BO`, `PGEMM_*`, `ARENA_MB`, `BATCH`, `TOKEN`,
+`SETTLE_US`, `FA_MM_MIN`, `GDN_IN`) select or size one dispatch each; they
+default to the fast path and are read where they are used.
 
 ## Troubleshooting
 
@@ -281,38 +256,24 @@ backend is tested on.
   `cmake --build build --target ggml-xdna-kernels && cmake --build build`.
 - **`ssm_out is ..., which needs the ...-bit activation layout, but the kernels
   were built with GATED_FMT=...`** - the model and the kernel build disagree.
-  Reconfigure with the `-DGGML_XDNA_GATED_FMT` the message names and rebuild.
+  Reconfigure with the `-DGGML_XDNA_GATED_FMT` the message names and rebuild
+  (`cmake --build build --target ggml-xdna-kernels && cmake --build build`), or
+  requantize `ssm_out` to the other form (see Build). The refusal stops the
+  first decode graph, so prefill still runs and, under `llama-bench`, all that
+  shows is `llama_bench: error: failed to run gen warmup`.
 - **The fused layer is not used at all** - no tagged `fused_layer` artifact was
   found (check the build output dir and the tag in `xdna-design-tag.h`), or
-  `GGML_XDNA_FUSED_LAYER=0` is set. Without it the decode still runs, on the
-  per-op kernels.
-- **`unsupported fused weight set`** - the model's quantization is outside the
-  set the fused kernels were built for. Prefill runs, then the first decode
-  graph fails; under `llama-bench` the `ggml-xdna` line is not shown and all
-  that is printed is `failed to run gen warmup`. Requantize as shown under
-  Build. `GGML_XDNA_FUSED_LAYER=0` is a bisection switch, not a way to run it
-  (see the limitations).
+  `GGML_XDNA_FUSED_LAYER=0` is set. The flag is a bisection switch for a model
+  the fused layer accepts: that decode then uses the per-op kernels. A model
+  the layer refuses is not this case.
+- **`unsupported fused weight set (...)`** - the model's quantization is outside
+  the set the fused kernels were built for and no `GATED_FMT` value covers it
+  (a `Q8_0` `ssm_out` is the common case). Requantize the tensor, e.g.
+  `llama-quantize --tensor-type ssm_out=q5_K model-f16.gguf out.gguf Q4_K_M`.
+  The failure has the same shape as the layout mismatch above.
+  `GGML_XDNA_FUSED_LAYER=0` is not a way to run this model.
 - **No NPU** - the backend still registers (llama.cpp expects every accelerator
   device to answer) but claims no ops, so everything runs on the CPU.
-
-## Checks
-
-- `test-xdna-repack` (ctest, no device) - which (type, format) repacks are
-  accepted, and that a refused one writes nothing and an accepted one exactly
-  its row.
-- `tests/test-xdna-reload -m model.gguf` - load, run and free a model several
-  times in one process; the tokens must match every cycle and the device
-  buffers held after a free must not grow.
-- `kernels/fused_core_check.py -d npu2` - the fused core's norm on edge-case
-  heads against `ggml_l2_norm`, and three tokens of its state update against
-  ggml's CPU gated delta rule.
-- `kernels/gemm.py --run`, `kernels/gemv_q4.py`, `kernels/gdn_prefill.py`
-  (also `--S 64`), `kernels/rec_gated.py --run` - each kernel against NumPy,
-  nonzero exit on a mismatch.
-
-The kernel scripts need XRT's environment (`source /opt/xilinx/xrt/setup.sh`):
-without `pyxrt` IRON cannot see the NPU and compiles for its default
-architecture.
 
 ## Code layout
 

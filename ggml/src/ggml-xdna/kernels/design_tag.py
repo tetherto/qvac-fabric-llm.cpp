@@ -12,6 +12,7 @@
 # other is not - which is exactly the state the tagged name turns into a loud
 # failure.
 
+import glob
 import hashlib
 import os
 import shutil
@@ -96,37 +97,51 @@ def _tagged(src: str, t: str) -> str:
 
 
 def _tag_copy(src: str, t: str) -> None:
-    """Copy an artifact to its tagged name.
+    """Copy an artifact to its tagged name, without the source's timestamp.
 
-    Deliberately not copy2. The tagged file is one output of a rule whose other
-    inputs are every design artifact, so a preserved source timestamp can leave
-    it older than an input and ninja reruns the stamping step on every build.
+    Deliberately not copy2: the tagged file is one output of a rule whose other
+    inputs are the design artifacts, so a preserved source timestamp can leave
+    it older than an input, and ninja reruns the stamping step every build.
     """
     shutil.copyfile(src, _tagged(src, t))
 
 
 def stamp(xclbin_path, insts_path=None, extra: str = ""):
-    """Copy the artifact under its tagged name and refresh the tag header."""
+    """Copy the artifact under its tagged name.
+
+    The tag header is refreshed by the build's own stamping step (stamp_all,
+    run from the kernel rule), never from here: a standalone compile has none
+    of the build's knobs in its environment, so writing it would relabel the
+    build tree with a tag the backend then binds against other artifacts.
+    """
+    files = [str(p) for p in (xclbin_path, insts_path) if p and os.path.exists(str(p))]
+    if not files:
+        return
     t = tag(extra)
-    _write_header(t)
-    for src in (xclbin_path, insts_path):
-        src = str(src) if src is not None else None
-        if src and os.path.exists(src):
-            _tag_copy(src, t)
+    for src in files:
+        _tag_copy(src, t)
 
 
-def stamp_all(bindir: str, extra: str = "", stamp_file: str | None = None) -> None:
+def _prune_stale(bindir: str, keep: str) -> int:
+    """Drop tagged copies of an older design. Only the current tag is ever
+    loaded, so every other one is dead weight that also hides which artifact is
+    live - after enough tag changes the directory is a pile of them."""
+    removed = 0
+    for stem in KNOWN_STEMS:
+        for ext in (".xclbin", ".insts.bin"):
+            for path in glob.glob(os.path.join(bindir, f"{stem}_*{ext}")):
+                mid = os.path.basename(path)[len(stem) + 1 : -len(ext)]
+                if len(mid) == 12 and mid != keep and all(c in "0123456789abcdef" for c in mid):
+                    os.remove(path)
+                    removed += 1
+    return removed
+
+
+def stamp_all(bindir: str, extra: str = "") -> None:
     """Tagged copies for every stem the backend loads, after any design
     rebuilt. The tag covers all the design sources, so one design changing
     moves the tag for all of them, and the designs ninja did not rebuild have
-    no stamp of their own to run.
-
-    `stamp_file` is the rule's declared output. The tagged copies cannot be
-    declared at configure time - their names carry a tag that only exists after
-    the designs are built - so the build tracks this file and treats them as
-    byproducts. It is written unconditionally: an output that keeps an older
-    timestamp than its inputs makes ninja rerun the step on every build.
-    """
+    no stamp of their own to run."""
     t = tag(extra)
     _write_header(t)
     for stem in KNOWN_STEMS:
@@ -134,20 +149,17 @@ def stamp_all(bindir: str, extra: str = "", stamp_file: str | None = None) -> No
             src = os.path.join(bindir, stem + ext)
             if os.path.exists(src):
                 _tag_copy(src, t)
-    if stamp_file:
-        with open(stamp_file, "w") as fh:
-            fh.write(f"{t}\n")
-    print(f"design tag {t} (stamp-all)")
+    stale = _prune_stale(bindir, t)
+    print(f"design tag {t} (stamp-all)" + (f", {stale} stale artifact(s) removed" if stale else ""))
 
 
 if __name__ == "__main__":
     import argparse
     ap = argparse.ArgumentParser(prog="design_tag")
     ap.add_argument("--stamp-dir", default=None)
-    ap.add_argument("--stamp-file", default=None)
     ap.add_argument("--extra", default="")
     opts = ap.parse_args()
     if opts.stamp_dir:
-        stamp_all(opts.stamp_dir, opts.extra, opts.stamp_file)
+        stamp_all(opts.stamp_dir, opts.extra)
     else:
         print(tag(opts.extra))

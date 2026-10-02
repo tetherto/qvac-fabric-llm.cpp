@@ -28,27 +28,27 @@ struct ggml_tensor;
 struct xdna_kernel_pool;
 
 struct xdna_rec_gemv {
-    xdna_gemv * so   = nullptr;   // ssm_out    [K_gate x d_out]
+    xdna_gemv *      so    = nullptr;  // ssm_out    [K_gate x d_out]
     // The FFN is one dispatch when the pair can be built: the epilogue writes
     // its quantized activation straight into what the down projection reads,
     // so the two share an instruction stream. `act` and `down` are the
     // fallback, two dispatches with the activation going through the host.
-    xdna_gemv_pair * ffn = nullptr;
-    xdna_gemv * act  = nullptr;   // gate | up  [d_out x 2*d_ff] -> silu(g)*u
-    xdna_gemv * down = nullptr;   // down       [d_ff x d_out]
-    int n_out = 0;                // the down projection's real width
+    xdna_gemv_pair * ffn   = nullptr;
+    xdna_gemv *      act   = nullptr;  // gate | up  [d_out x 2*d_ff] -> silu(g)*u
+    xdna_gemv *      down  = nullptr;  // down       [d_ff x d_out]
+    int              n_out = 0;        // the down projection's real width
 
-    std::vector<float> a;    // the gdn output, dequantized from its int8 codes
-    std::vector<float> mid;  // the FFN activation the epilogue returns
-    std::vector<float> acc;  // a projection's output, before the residual add
-    std::vector<uint8_t> settled;  // staging for a settled read of a buffer
+    std::vector<float>   a;            // the gdn output, dequantized from its int8 codes
+    std::vector<float>   mid;          // the FFN activation the epilogue returns
+    std::vector<float>   acc;          // a projection's output, before the residual add
+    std::vector<uint8_t> settled;      // staging for a settled read of a buffer
 };
 
 // Pack the four weights into the GEMV layouts and load the runners. The
 // weights must be types the GEMV route covers (Q4_K for gate/up; Q4_K, Q5_K or
 // Q6_K for ssm_out and down) and their shapes must tile the array exactly.
 // Returns nullptr when any of that does not hold.
-xdna_rec_gemv * xdna_rec_gemv_create(struct xdna_kernel_pool * pool,
+xdna_rec_gemv * xdna_rec_gemv_create(struct xdna_kernel_pool *  pool,
                                      const struct ggml_tensor * w_so,
                                      const struct ggml_tensor * w_gate,
                                      const struct ggml_tensor * w_up,
@@ -63,28 +63,28 @@ void xdna_rec_gemv_free(xdna_rec_gemv * m);
 // prologue tile and the epilogue); the host writes the projection's input and
 // the tiles' host half, and adds the two residuals from what comes back.
 struct xdna_rec_tail {
-    xdna_rec_gemv * gv   = nullptr;   // so = attn_output, and the FFN pair
-    xdna_kernel *   kern = nullptr;   // pooled, shared by every layer with this stream
-    xdna_buffer *   w    = nullptr;   // [attn_output weights | FFN weights]
-    xdna_buffer *   a    = nullptr;   // attn_output's activation, then gamma
-    xdna_buffer *   res  = nullptr;   // the residual rows (not owned)
+    xdna_rec_gemv *      gv   = nullptr;  // so = attn_output, and the FFN pair
+    xdna_kernel *        kern = nullptr;  // pooled, shared by every layer with this stream
+    xdna_buffer *        w    = nullptr;  // [attn_output weights | FFN weights]
+    xdna_buffer *        a    = nullptr;  // attn_output's activation, then gamma
+    xdna_buffer *        res  = nullptr;  // the residual rows (not owned)
     std::vector<uint8_t> host_a;
-    xrt::run        run;
+    xrt::run             run;
 };
 
-xdna_rec_tail * xdna_rec_tail_create(struct xdna_kernel_pool * pool,
+xdna_rec_tail * xdna_rec_tail_create(struct xdna_kernel_pool *  pool,
                                      const struct ggml_tensor * w_o,
                                      const struct ggml_tensor * w_gate,
                                      const struct ggml_tensor * w_up,
                                      const struct ggml_tensor * w_down,
-                                     struct xdna_buffer * res, const float * gamma,
-                                     float eps);
-void xdna_rec_tail_free(xdna_rec_tail * t);
+                                     struct xdna_buffer *       res,
+                                     const float *              gamma,
+                                     float                      eps);
+void            xdna_rec_tail_free(xdna_rec_tail * t);
 
 // h_attn = hres + W_o * act; h_out = h_attn + FFN(rms_norm(h_attn) * gamma),
 // the boundary on the prologue through the residual rows `res`.
-bool xdna_rec_tail_run(xdna_rec_tail * t, const float * act, const float * hres,
-                       float * h_attn, float * h_out);
+bool xdna_rec_tail_run(xdna_rec_tail * t, const float * act, const float * hres, float * h_attn, float * h_out);
 
 // The layer's in-projection - attn_qkv and attn_gate against the normed input
 // - packed for the head of the core's own stream. Its values come off the
@@ -95,12 +95,11 @@ bool xdna_rec_tail_run(xdna_rec_tail * t, const float * act, const float * hres,
 struct xdna_rec_inproj {
     xdna_gemv_geom       geom;
     std::vector<uint8_t> packed;
-    int n_qkv = 0;   // qkv values
-    int n_z   = 0;   // z values
+    int                  n_qkv = 0;  // qkv values
+    int                  n_z   = 0;  // z values
 };
-bool xdna_rec_inproj_pack(const struct ggml_tensor * w_qkv,
-                          const struct ggml_tensor * w_z,
-                          xdna_rec_inproj & out);
+
+bool xdna_rec_inproj_pack(const struct ggml_tensor * w_qkv, const struct ggml_tensor * w_z, xdna_rec_inproj & out);
 
 // The ssm_out GEMV, for appending its stream to the core's.
 struct xdna_gemv * xdna_rec_gemv_so(xdna_rec_gemv * m);
@@ -108,21 +107,26 @@ struct xdna_gemv * xdna_rec_gemv_so(xdna_rec_gemv * m);
 // Collect a projection the fused core dispatch has already run: reads the
 // device output and adds the residual, which is all xdna_rec_gemv_so_run does
 // once its dispatch is somebody else's.
-bool xdna_rec_gemv_so_collect(xdna_rec_gemv * m, const void * out, size_t off,
-                              const void * act, const float * hres,
-                              float * h_attn);
+bool xdna_rec_gemv_so_collect(xdna_rec_gemv * m,
+                              const void *    out,
+                              size_t          off,
+                              const void *    act,
+                              const float *   hres,
+                              float *         h_attn);
 
 // h_attn = hres + W_so * a. `act_tiles`, when given and the weight is the
 // 4-bit form, is the activation the core's gated stage already wrote in the
 // GEMV's tile layout, so nothing is dequantized or repacked here; otherwise
 // the int8 codes and their row scale are used.
-bool xdna_rec_gemv_so_run(xdna_rec_gemv * m, const void * act_tiles,
-                          const int8_t * aq, float d_a,
-                          const float * hres, float * h_attn);
+bool xdna_rec_gemv_so_run(xdna_rec_gemv * m,
+                          const void *    act_tiles,
+                          const int8_t *  aq,
+                          float           d_a,
+                          const float *   hres,
+                          float *         h_attn);
 
 // h_out = h_attn + W_down * (silu(W_gate * hff) * (W_up * hff)).
-bool xdna_rec_gemv_ffn_run(xdna_rec_gemv * m, const float * hff,
-                           const float * h_attn, float * h_out);
+bool xdna_rec_gemv_ffn_run(xdna_rec_gemv * m, const float * hff, const float * h_attn, float * h_out);
 
 // The projection's result read out of the FFN's activation tiles, where the
 // fused dispatch drained it. `acc` takes n_out floats.
@@ -136,6 +140,9 @@ bool xdna_rec_gemv_fused_results(xdna_rec_gemv * m, float * acc, float * ffn_out
 // h_out = h_attn + W_down * (silu(W_gate * x) * (W_up * x)) with
 // x = rms_norm(acc + hres) * gamma computed on the array's prologue tile, so
 // the host does nothing between the layer's two dispatches.
-bool xdna_rec_gemv_ffn_run_raw(xdna_rec_gemv * m, const float * acc,
-                               const float * hres, const float * gamma,
-                               const float * h_attn, float * h_out);
+bool xdna_rec_gemv_ffn_run_raw(xdna_rec_gemv * m,
+                               const float *   acc,
+                               const float *   hres,
+                               const float *   gamma,
+                               const float *   h_attn,
+                               float *         h_out);

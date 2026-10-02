@@ -2,7 +2,7 @@
 
 #include <stddef.h>
 
-// The prefill GEMM (kernels/pgemm.py, FLM_PREFILL_PLAN.md step 1): a
+// The prefill GEMM (kernels/pgemm.py): a
 // quantized MUL_MAT at prefill batch size on the whole array, every core
 // expanding the decode GEMV's own packed weight tiles into bf16 and running
 // the bfp16 mmul. One artifact serves every shape: the cores read their loop
@@ -22,6 +22,10 @@ bool xdna_pgemm_supported(const struct ggml_tensor * op);
 // share an input belong to the previous one.
 void xdna_pgemm_graph_begin(void);
 
+// Drop the packed weights. They are keyed by a tensor's data pointer, which
+// does not survive the model that owned it.
+void xdna_pgemm_release(void);
+
 // Run `node` to completion and write its f32 output.
 bool xdna_pgemm_run(struct xdna_kernel_pool * pool, struct ggml_tensor * node);
 
@@ -29,8 +33,10 @@ bool xdna_pgemm_run(struct xdna_kernel_pool * pool, struct ggml_tensor * node);
 // N floats from byte `off` of `bo`, which has room for M rounded up to 128
 // rows. The node's own data is not written.
 struct xdna_buffer;
-bool xdna_pgemm_run_into(struct xdna_kernel_pool * pool, struct ggml_tensor * node,
-                         struct xdna_buffer * bo, size_t off);
+bool xdna_pgemm_run_into(struct xdna_kernel_pool * pool,
+                         struct ggml_tensor *      node,
+                         struct xdna_buffer *      bo,
+                         size_t                    off);
 
 // A SWIGLU of two such MUL_MATs of one activation (the FFN's gate and up,
 // weights of one type) the array runs whole: one call, the cores applying
@@ -67,8 +73,10 @@ bool xdna_pgemm_gated_supported(const struct ggml_tensor * g, const struct ggml_
 // With `xr` the norm's input rows are read where the GDN run left them
 // (xdna_gdn_mm_rows: D = 128, 16 heads) instead of from its node.
 struct xdna_gdn_rows;
-bool xdna_pgemm_run_gated(struct xdna_kernel_pool * pool, const struct ggml_tensor * g,
-                          const struct ggml_tensor * v, const struct xdna_gdn_rows * xr);
+bool xdna_pgemm_run_gated(struct xdna_kernel_pool *    pool,
+                          const struct ggml_tensor *   g,
+                          const struct ggml_tensor *   v,
+                          const struct xdna_gdn_rows * xr);
 
 // An attention output times its gate, g = a * SIGMOID(c) (c a CONT of the
 // gate's view, or the gate itself), read by prefill GEMMs: laid out straight
@@ -79,7 +87,8 @@ bool xdna_pgemm_gate_supported(const struct ggml_tensor * g);
 // With `ar` the attention output is read where its run left it
 // (xdna_attn_mm_rows: 8 heads of 256) instead of from its node.
 struct xdna_attn_rows;
-bool xdna_pgemm_run_gate(struct xdna_kernel_pool * pool, const struct ggml_tensor * g,
+bool xdna_pgemm_run_gate(struct xdna_kernel_pool *     pool,
+                         const struct ggml_tensor *    g,
                          const struct xdna_attn_rows * ar);
 
 // Two such MUL_MATs of one activation that fit one chunk together (the
@@ -87,5 +96,8 @@ bool xdna_pgemm_run_gate(struct xdna_kernel_pool * pool, const struct ggml_tenso
 // into a_out and b_out, rows of each one's N floats - for the caller to copy
 // into the nodes once the graph reaches them. The nodes are not written.
 bool xdna_pgemm_pair_supported(const struct ggml_tensor * a, const struct ggml_tensor * b);
-bool xdna_pgemm_run_pair(struct xdna_kernel_pool * pool, const struct ggml_tensor * a,
-                         const struct ggml_tensor * b, float * a_out, float * b_out);
+bool xdna_pgemm_run_pair(struct xdna_kernel_pool *  pool,
+                         const struct ggml_tensor * a,
+                         const struct ggml_tensor * b,
+                         float *                    a_out,
+                         float *                    b_out);
