@@ -1,6 +1,7 @@
 #include "models.h"
 #include "llama-memory-hybrid-idx.h"
 
+#include <cstring>
 #include <stdexcept>
 
 // GLM5-Next (GLM-5.3-Flash): hybrid KDA (linear) + nope MLA with a k-pool DSA indexer,
@@ -344,14 +345,33 @@ llama_model_glm5_next::llm_graph_input_kpool * llama_model_glm5_next::graph::bui
 
     inp->n_kv = n_kv;
 
-    // Gather selected latents for small decode batches when n_kv exceeds n_sel.
+    // Gather selected latents for small decode batches when n_kv exceeds n_sel, unless every DSA layer can use CUDA sparse FA.
     {
         constexpr int64_t max_ub = 16;
 
         const int64_t n_top_pool = std::min<int64_t>(n_pool, hparams.indexer_top_k / kpool);
         const int64_t n_sel      = kpool*n_top_pool + (hparams.indexer_kpool_select_tail ? kpool - 1 : 0);
         inp->n_sel = (uint32_t) n_sel;
-        inp->gather = (int64_t) n_tokens <= max_ub && (int64_t) n_kv > n_sel;
+        // the CUDA sparse FA kernels take one query per sequence or full 8-query tiles, and must beat the dense pass
+        const int64_t q_per_seq = ubatch.n_seq_tokens;
+        const bool sparse_query_width = q_per_seq == 1 || q_per_seq > 4;
+        const int64_t n_gather = (q_per_seq == 1 ? 1 : 8)*n_sel;
+        bool use_cuda_sparse_fa = cparams.flash_attn && sparse_query_width &&
+            (int64_t) n_kv >= std::max<int64_t>(4096, 2*n_gather);
+        if (use_cuda_sparse_fa) {
+            for (int il = 0; il < n_layer; ++il) {
+                if (hparams.is_recr(il)) {
+                    continue;
+                }
+                const ggml_backend_dev_t dev = model.dev_layer(il);
+                const ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+                if (!reg || strcmp(ggml_backend_reg_name(reg), "CUDA") != 0) {
+                    use_cuda_sparse_fa = false;
+                    break;
+                }
+            }
+        }
+        inp->gather = !use_cuda_sparse_fa && (int64_t) n_tokens <= max_ub && (int64_t) n_kv > n_sel;
 
         // Both paths read the slot mask: gather adds it to the scores, scatter maps its dead slots to dump rows.
         inp->gather_mask = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, n_sel, 1, 1, n_tokens);
