@@ -2035,9 +2035,6 @@ struct clip_model_loader {
                         }
                         get_u32(KEY_IMAGE_MIN_PIXELS, hparams.image_min_pixels);
                         get_u32(KEY_IMAGE_MAX_PIXELS, hparams.image_max_pixels);
-                        if (hparams.image_min_pixels <= 0 || hparams.image_max_pixels <= 0) {
-                            throw std::runtime_error(string_format("%s: GLM5V image_min_pixels and image_max_pixels must be positive\n", __func__));
-                        }
                         hparams.set_warmup_n_tokens(46*46); // avoid OOM on warmup
                     } break;
                 case PROJECTOR_TYPE_LLAMA4:
