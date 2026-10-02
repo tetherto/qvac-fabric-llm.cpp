@@ -50,6 +50,7 @@ void llama_model_glm5_next::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_ATTENTION_INDEXER_TOP_K,             hparams.indexer_top_k);
     ml.get_key(LLM_KV_ATTENTION_INDEXER_KPOOL,             hparams.indexer_kpool);
     ml.get_key(LLM_KV_ATTENTION_INDEXER_KPOOL_SELECT_TAIL, hparams.indexer_kpool_select_tail, false);
+    ml.get_key(LLM_KV_ATTENTION_INDEXER_INDEX_SHARE_MTP,   hparams.indexer_index_share_mtp,   false);
     if (hparams.indexer_kpool <= 1) {
         throw std::runtime_error(format("%s must be greater than one, got %u",
                 ml.llm_kv(LLM_KV_ATTENTION_INDEXER_KPOOL).c_str(), hparams.indexer_kpool));
