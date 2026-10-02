@@ -106,6 +106,14 @@
 
 static_assert(sizeof(half) == sizeof(ggml_fp16_t), "wrong fp16 size");
 
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+#    define GGML_CUDA_RUNTIME_PROBE 1
+#endif
+
+#ifdef GGML_CUDA_RUNTIME_PROBE
+static __global__ void ggml_cuda_arch_probe() {}
+#endif
+
 #define GGML_LOG_WARN_ONCE(str) \
     { static std::once_flag warn_flag; std::call_once(warn_flag, []() { GGML_LOG_WARN(str); }); }
 
@@ -126,6 +134,218 @@ static int ggml_cuda_get_physical_device(int device) {
     const ggml_cuda_device_info & info = ggml_cuda_info();
     GGML_ASSERT(device >= 0 && device < info.device_count);
     return info.devices[device].physical_device;
+}
+
+#ifdef GGML_CUDA_RUNTIME_PROBE
+// The probe must know whether it created a primary context, so it can release
+// it. Builds without GGML_USE_VMM do not link the driver API, so the two calls
+// it needs are fetched through cudart instead.
+struct ggml_cuda_ctx_state_api {
+    using device_get_t = CUresult (*)(CUdevice *, int);
+    using ctx_state_t  = CUresult (*)(CUdevice, unsigned int *, int *);
+
+    device_get_t device_get = nullptr;
+    ctx_state_t  ctx_state  = nullptr;
+
+    ggml_cuda_ctx_state_api() {
+#    ifdef GGML_USE_VMM
+        device_get = cuDeviceGet;
+        ctx_state  = cuDevicePrimaryCtxGetState;
+#    elif CUDART_VERSION >= 12050
+        device_get = (device_get_t) entry_point("cuDeviceGet");
+        ctx_state  = (ctx_state_t) entry_point("cuDevicePrimaryCtxGetState");
+#    endif
+    }
+
+#    if !defined(GGML_USE_VMM) && CUDART_VERSION >= 12050
+    static void * entry_point(const char * symbol) {
+        void *                          fn     = nullptr;
+        cudaDriverEntryPointQueryResult status = cudaDriverEntryPointSymbolNotFound;
+        if (cudaGetDriverEntryPointByVersion(symbol, &fn, 12000, cudaEnableDefault, &status) != cudaSuccess ||
+            status != cudaDriverEntryPointSuccess) {
+            (void) cudaGetLastError();
+            return nullptr;
+        }
+        return fn;
+    }
+#    endif
+
+    bool available() const { return device_get != nullptr && ctx_state != nullptr; }
+};
+
+static const ggml_cuda_ctx_state_api & ggml_cuda_ctx_state() {
+    static const ggml_cuda_ctx_state_api api;
+    return api;
+}
+
+// Unknown counts as active, so the caller never resets a context it cannot see.
+static bool ggml_cuda_primary_ctx_active(const int physical_device) {
+    const ggml_cuda_ctx_state_api & api = ggml_cuda_ctx_state();
+    CUdevice                        device;
+    unsigned int                    flags  = 0;
+    int                             active = 0;
+    if (!api.available() || api.device_get(&device, physical_device) != CUDA_SUCCESS ||
+        api.ctx_state(device, &flags, &active) != CUDA_SUCCESS) {
+        return true;
+    }
+    return active != 0;
+}
+
+// Errors meaning this build's code cannot run on the device. Anything else, such
+// as a GPU held by another process or out of memory, keeps the device.
+static bool ggml_cuda_is_code_load_error(const cudaError_t err) {
+    switch (err) {
+        case cudaErrorNoKernelImageForDevice:
+        case cudaErrorInvalidKernelImage:
+        case cudaErrorUnsupportedPtxVersion:
+        case cudaErrorInvalidPtx:
+        case cudaErrorInsufficientDriver:
+        case cudaErrorJitCompilerNotFound:
+        case cudaErrorJitCompilationDisabled:
+            return true;
+        default:
+            return false;
+    }
+}
+#endif
+
+// Spans one pass over the devices. The current device is restored once at the
+// end instead of after every probe, since cudaSetDevice recreates its primary
+// context each time.
+struct ggml_cuda_probe_scope {
+    int  previous_device     = -1;
+    bool previous_was_active = true;
+    bool device_changed      = false;
+
+#ifdef GGML_CUDA_RUNTIME_PROBE
+    ggml_cuda_probe_scope() {
+        if (cudaGetDevice(&previous_device) != cudaSuccess) {
+            (void) cudaGetLastError();
+            previous_device = -1;
+            return;
+        }
+        previous_was_active = ggml_cuda_primary_ctx_active(previous_device);
+    }
+
+    ~ggml_cuda_probe_scope() {
+        if (previous_device < 0 || !device_changed) {
+            return;
+        }
+        const cudaError_t restore_result = cudaSetDevice(previous_device);
+        if (restore_result != cudaSuccess) {
+            GGML_LOG_WARN("%s: failed to restore CUDA device %d: %s\n", __func__, previous_device,
+                          cudaGetErrorString(restore_result));
+            (void) cudaGetLastError();
+        } else if (!previous_was_active) {
+            (void) cudaDeviceReset();
+            (void) cudaGetLastError();
+        }
+    }
+#endif
+};
+
+// Test hook: GGML_CUDA_TEST_SKIP_DEVICES lists physical device ids to treat as
+// unable to load this build's code, so the skip path runs on any CUDA host.
+static bool ggml_cuda_test_skipped(const int physical_device) {
+    const char * env = getenv("GGML_CUDA_TEST_SKIP_DEVICES");
+    while (env != nullptr && *env != '\0') {
+        char *     end = nullptr;
+        const long id  = strtol(env, &end, 10);
+        if (end == env) {
+            return false;
+        }
+        if (id == physical_device) {
+            return true;
+        }
+        env = *end == ',' ? end + 1 : end;
+    }
+    return false;
+}
+
+static cudaError_t ggml_cuda_device_code_loadable_uncached(ggml_cuda_probe_scope & scope, const int physical_device) {
+#ifndef GGML_CUDA_RUNTIME_PROBE
+    GGML_UNUSED(scope);
+    GGML_UNUSED(physical_device);
+    return cudaSuccess;
+#else
+    // Without the driver calls the probe could not tell whether it created a
+    // primary context and would leave about 500 MiB on every GPU, so only the
+    // compiled arch check applies then.
+    if (!ggml_cuda_ctx_state().available()) {
+        GGML_LOG_DEBUG("%s: CUDA driver context state is unavailable, skipping the load probe\n", __func__);
+        return cudaSuccess;
+    }
+
+    // cudaSetDevice creates the primary context, about 500 MiB on an RTX 5090.
+    // Reset every context the probe created, so a GPU the process never uses
+    // keeps no memory.
+    const bool probed_was_active = physical_device == scope.previous_device ?
+                                       scope.previous_was_active :
+                                       ggml_cuda_primary_ctx_active(physical_device);
+
+    scope.device_changed                = scope.device_changed || physical_device != scope.previous_device;
+    const cudaError_t set_device_result = cudaSetDevice(physical_device);
+    if (set_device_result != cudaSuccess) {
+        (void) cudaGetLastError();
+        return set_device_result;
+    }
+
+    cudaFuncAttributes attributes;
+    const cudaError_t  probe_result = cudaFuncGetAttributes(&attributes, ggml_cuda_arch_probe);
+    if (probe_result != cudaSuccess) {
+        (void) cudaGetLastError();
+    }
+    if (!probed_was_active) {
+        (void) cudaDeviceReset();
+        (void) cudaGetLastError();
+    }
+    return probe_result;
+#endif
+}
+
+static bool ggml_cuda_device_code_loadable(ggml_cuda_probe_scope & scope,
+                                           const int               physical_device,
+                                           const bool              log_failure = true) {
+    static std::mutex cache_mutex;
+    struct cached_probe {
+        bool        checked      = false;
+        bool        test_skipped = false;
+        cudaError_t result       = cudaSuccess;
+    };
+    static cached_probe cache[GGML_CUDA_MAX_DEVICES] = {};
+
+    std::lock_guard<std::mutex> lock(cache_mutex);
+    cached_probe &              entry = cache[physical_device];
+    if (!entry.checked) {
+        entry.test_skipped = ggml_cuda_test_skipped(physical_device);
+        if (!entry.test_skipped) {
+            entry.result = ggml_cuda_device_code_loadable_uncached(scope, physical_device);
+        }
+        entry.checked = true;
+    }
+    if (entry.test_skipped) {
+        if (log_failure) {
+            GGML_LOG_WARN("%s: physical device %d skipped by GGML_CUDA_TEST_SKIP_DEVICES\n", __func__, physical_device);
+        }
+        return false;
+    }
+    if (entry.result == cudaSuccess) {
+        return true;
+    }
+#ifdef GGML_CUDA_RUNTIME_PROBE
+    if (!ggml_cuda_is_code_load_error(entry.result)) {
+        if (log_failure) {
+            GGML_LOG_WARN("%s: CUDA probe on physical device %d failed, keeping the device: %s\n", __func__,
+                          physical_device, cudaGetErrorString(entry.result));
+        }
+        return true;
+    }
+#endif
+    if (log_failure) {
+        GGML_LOG_WARN("%s: CUDA code cannot load on physical device %d: %s\n", __func__, physical_device,
+                      cudaGetErrorString(entry.result));
+    }
+    return false;
 }
 
 // this is faster on Windows
@@ -564,6 +784,22 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
         granularity(ggml_cuda_info().devices[device].vmm_granularity) {
     }
 
+    bool reserve_address() {
+#    if defined(GGML_USE_HIP)
+        CU_CHECK(cuMemAddressReserve(&pool_addr, CUDA_POOL_VMM_MAX_SIZE, 0, 0, 0));
+        return true;
+#    else
+        const CUresult result = cuMemAddressReserve(&pool_addr, CUDA_POOL_VMM_MAX_SIZE, 0, 0, 0);
+        if (result == CUDA_SUCCESS) {
+            return true;
+        }
+        GGML_LOG_WARN("%s: failed to reserve the %zu MiB VMM pool on device %d: %s; falling back to cudaMalloc\n",
+                      __func__, CUDA_POOL_VMM_MAX_SIZE / (1024 * 1024), physical_device, cu_get_error_str(result));
+        pool_addr = 0;
+        return false;
+#    endif
+    }
+
     ~ggml_cuda_pool_vmm() {
         if (pool_addr != 0) {
 #if defined(GGML_USE_HIP)
@@ -572,7 +808,9 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
                 CU_CHECK(cuMemUnmap(mapping.first, mapping.second));
             }
 #else
-            CU_CHECK(cuMemUnmap(pool_addr, pool_size));
+            if (pool_size > 0) {
+                CU_CHECK(cuMemUnmap(pool_addr, pool_size));
+            }
 #endif
             CU_CHECK(cuMemAddressFree(pool_addr, CUDA_POOL_VMM_MAX_SIZE));
         }
@@ -600,12 +838,8 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
             CUmemGenericAllocationHandle handle;
             CU_CHECK(cuMemCreate(&handle, reserve_size, &prop, 0));
 
-            // reserve virtual address space (if not already reserved)
-            if (pool_addr == 0) {
-                CU_CHECK(cuMemAddressReserve(&pool_addr, CUDA_POOL_VMM_MAX_SIZE, 0, 0, 0));
-            }
-
             // map at the end of the pool
+            GGML_ASSERT(pool_addr != 0);
             CUdeviceptr start_ptr = (CUdeviceptr)((char *)(pool_addr) + pool_size);
             CU_CHECK(cuMemMap(start_ptr, reserve_size, 0, handle, 0));
 #if defined(GGML_USE_HIP)
@@ -692,13 +926,47 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
         GGML_ASSERT(ptr == (void *) ((char *)(pool_addr) + pool_used));
     }
 };
+
+static std::atomic<bool> ggml_cuda_vmm_failed[GGML_CUDA_MAX_DEVICES] = {};
+
+struct ggml_cuda_pool_vmm_fallback : public ggml_cuda_pool {
+    int                             device;
+    int                             physical_device;
+    std::unique_ptr<ggml_cuda_pool> pool;
+
+    explicit ggml_cuda_pool_vmm_fallback(int device) :
+        device(device),
+        physical_device(ggml_cuda_get_physical_device(device)) {}
+
+    void * alloc(size_t size, size_t * actual_size) override {
+        if (!pool) {
+            if (!ggml_cuda_vmm_failed[physical_device].load(std::memory_order_relaxed)) {
+                std::unique_ptr<ggml_cuda_pool_vmm> vmm_pool(new ggml_cuda_pool_vmm(device));
+                if (vmm_pool->reserve_address()) {
+                    pool = std::move(vmm_pool);
+                } else {
+                    ggml_cuda_vmm_failed[physical_device].store(true, std::memory_order_relaxed);
+                }
+            }
+            if (!pool) {
+                pool.reset(new ggml_cuda_pool_leg(device));
+            }
+        }
+        return pool->alloc(size, actual_size);
+    }
+
+    void free(void * ptr, size_t size) override {
+        GGML_ASSERT(pool != nullptr);
+        pool->free(ptr, size);
+    }
+};
 #endif // defined(GGML_USE_VMM)
 
 std::unique_ptr<ggml_cuda_pool> ggml_backend_cuda_context::new_pool_for_device(int                  device,
                                                                                [[maybe_unused]] int stream_no) {
 #if defined(GGML_USE_VMM)
     if (ggml_cuda_info().devices[device].vmm) {
-        return std::unique_ptr<ggml_cuda_pool>(new ggml_cuda_pool_vmm(device));
+        return std::unique_ptr<ggml_cuda_pool>(new ggml_cuda_pool_vmm_fallback(device));
     }
 #endif // defined(GGML_USE_VMM)
     return std::unique_ptr<ggml_cuda_pool>(new ggml_cuda_pool_leg(device));
@@ -971,11 +1239,17 @@ static const ggml_backend_buffer_type_i ggml_backend_cuda_buffer_type_interface 
     /* .is_host          = */ NULL,
 };
 
+// maps a raw CUDA device id to its registry entry, or null if it was skipped
+static ggml_backend_dev_t ggml_backend_cuda_reg_find_device(int device);
+
 ggml_backend_buffer_type_t ggml_backend_cuda_buffer_type(int device) {
     static std::mutex mutex;
     std::lock_guard<std::mutex> lock(mutex);
 
-    if (device >= ggml_backend_cuda_get_device_count()) {
+    // The lower bound must be explicit: the skipped-device check below indexes
+    // the table with this id. Matches the bound ggml_backend_cuda_init already
+    // has.
+    if (device < 0 || device >= ggml_backend_cuda_get_device_count()) {
         return nullptr;
     }
 
@@ -985,13 +1259,35 @@ ggml_backend_buffer_type_t ggml_backend_cuda_buffer_type(int device) {
 
     if (!ggml_backend_cuda_buffer_type_initialized) {
         for (int i = 0; i < ggml_backend_cuda_get_device_count(); i++) {
+            ggml_backend_dev_t dev = ggml_backend_cuda_reg_find_device(i);
+            if (dev == nullptr) {
+                // Skipped at registration. Leave the slot zero-initialised
+                // rather than building a plausible-looking buffer type with a
+                // null device and a context nothing will ever free.
+                continue;
+            }
             ggml_backend_cuda_buffer_types[i] = {
                 /* .iface    = */ ggml_backend_cuda_buffer_type_interface,
-                /* .device   = */ ggml_backend_reg_dev_get(ggml_backend_cuda_reg(), i),
+                /* .device   = */ dev,
                 /* .context  = */ new ggml_backend_cuda_buffer_type_context{i, GGML_CUDA_NAME + std::to_string(i)},
             };
         }
         ggml_backend_cuda_buffer_type_initialized = true;
+    }
+
+    // Read the cached mapping rather than re-deriving it. The table above is
+    // filled for every device id below the unfiltered count, so a null .device
+    // is exactly "this id was skipped at registration".
+    //
+    // Deliberately after the init block, not before it: this function is called
+    // per tensor copy through the GGML_ASSERT in set_tensor_async and friends,
+    // and GGML_ASSERT is not compiled out, so calling
+    // ggml_backend_cuda_reg_find_device() here would take a second global mutex
+    // and rescan the registry on every host<->device transfer. The answer never
+    // changes once registration has run.
+    if (ggml_backend_cuda_buffer_types[device].device == nullptr) {
+        GGML_LOG_ERROR("%s: device %d was skipped at registration, CUDA code cannot load on it\n", __func__, device);
+        return nullptr;
     }
 
     return &ggml_backend_cuda_buffer_types[device];
@@ -1245,7 +1541,7 @@ static ggml_backend_buffer_type_t ggml_backend_cuda_repacked_buffer_type(int dev
     static std::mutex mutex;
     std::lock_guard<std::mutex> lock(mutex);
 
-    if (device >= ggml_backend_cuda_get_device_count()) {
+    if (device < 0 || device >= ggml_backend_cuda_get_device_count()) {
         return nullptr;
     }
 
@@ -1253,16 +1549,20 @@ static ggml_backend_buffer_type_t ggml_backend_cuda_repacked_buffer_type(int dev
     static bool initialized = false;
     if (!initialized) {
         for (int i = 0; i < ggml_backend_cuda_get_device_count(); ++i) {
+            ggml_backend_dev_t dev = ggml_backend_cuda_reg_find_device(i);
+            if (dev == nullptr) {
+                continue;
+            }
             buffer_types[i] = {
                 /* .iface    = */ ggml_backend_cuda_repacked_buffer_type_interface,
-                /* .device   = */ ggml_backend_reg_dev_get(ggml_backend_cuda_reg(), i),
-                /* .context  = */ new ggml_backend_cuda_buffer_type_context{
-                    i, GGML_CUDA_NAME + std::to_string(i) + "_REPACK"},
+                /* .device   = */ dev,
+                /* .context  = */
+                new ggml_backend_cuda_buffer_type_context{ i, GGML_CUDA_NAME + std::to_string(i) + "_REPACK" },
             };
         }
         initialized = true;
     }
-    return &buffer_types[device];
+    return buffer_types[device].device != nullptr ? &buffer_types[device] : nullptr;
 }
 
 #endif
@@ -1615,6 +1915,24 @@ static ggml_backend_buffer_t ggml_backend_cuda_host_buffer_type_alloc_buffer(ggm
 }
 
 ggml_backend_buffer_type_t ggml_backend_cuda_host_buffer_type() {
+    // QVAC-23763: with an empty CUDA registry ggml_backend_reg_dev_get hits its
+    // GGML_ASSERT and aborts - the exact failure mode this change exists to
+    // remove. Returning null lets the caller fall back to an unpinned host
+    // buffer instead.
+    //
+    // Skipping every device is one way to get an empty registry, but not the
+    // first: ggml_cuda_init() already returns device_count == 0 when
+    // cudaGetDeviceCount fails, so a driverless host reached the same abort
+    // before this change. The guard is a pre-existing fix and belongs upstream
+    // rather than only here.
+    //
+    // Not reachable through ggml_backend_dev_host_buffer_type(), which needs a
+    // device and so implies the registry is non-empty; reachable through this
+    // function's own GGML_BACKEND_API export in a statically linked build.
+    if (ggml_backend_reg_dev_count(ggml_backend_cuda_reg()) == 0) {
+        return nullptr;
+    }
+
     static struct ggml_backend_buffer_type ggml_backend_cuda_buffer_type_host = {
         /* .iface    = */ {
             /* .get_name         = */ ggml_backend_cuda_host_buffer_type_name,
@@ -1624,6 +1942,10 @@ ggml_backend_buffer_type_t ggml_backend_cuda_host_buffer_type() {
             /* .get_alloc_size   = */ ggml_backend_cpu_buffer_type()->iface.get_alloc_size,
             /* .is_host          = */ ggml_backend_cpu_buffer_type()->iface.is_host,
         },
+        // registry index, not a CUDA device id: this is the first surviving
+        // device, which is what a process-wide pinned host buffer wants. Do not
+        // route it through ggml_backend_cuda_reg_find_device(), which maps raw
+        // ids and returns null when CUDA device 0 is the skipped one.
         /* .device   = */ ggml_backend_reg_dev_get(ggml_backend_cuda_reg(), 0),
         /* .context  = */ nullptr,
     };
@@ -6983,10 +7305,13 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t 
         features.push_back({ "FA_QUANTS", GGML_CUDA_FA_QUANTS });
     #endif
 
+    // Only registered devices count, so a skipped card cannot advertise its features.
     {
-        const auto & info = ggml_cuda_info();
-        for (int id = 0; id < info.device_count; ++id) {
-            if (blackwell_mma_available(info.devices[id].cc)) {
+        const auto & info    = ggml_cuda_info();
+        const auto * reg_ctx = (const ggml_backend_cuda_reg_context *) ggml_backend_cuda_reg()->context;
+        for (ggml_backend_dev_t dev : reg_ctx->devices) {
+            const auto * dev_ctx = (const ggml_backend_cuda_device_context *) dev->context;
+            if (blackwell_mma_available(info.devices[dev_ctx->device].cc)) {
                 features.push_back({ "BLACKWELL_NATIVE_FP4", "1"});
                 break;
             }
@@ -7039,8 +7364,16 @@ static uint64_t ggml_backend_cuda_mlp_fusion_count(ggml_backend_t backend) {
     return ctx->mlp_fusion_count;
 }
 
+// Physical devices before skipping, so tests can tell a skipped card from an absent one.
+static int ggml_backend_cuda_physical_device_count(void) {
+    return ggml_cuda_info().physical_device_count;
+}
+
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
+    if (strcmp(name, "ggml_backend_cuda_physical_device_count") == 0) {
+        return (void *)ggml_backend_cuda_physical_device_count;
+    }
     if (strcmp(name, "ggml_backend_comm_init") == 0) {
         return (void *)ggml_backend_cuda_comm_init;
     }
@@ -7100,9 +7433,33 @@ ggml_backend_reg_t ggml_backend_cuda_reg() {
 
             const ggml_cuda_device_info & info = ggml_cuda_info();
             const bool virtual_devices = info.device_count > info.physical_device_count;
+            bool                          physical_code_checked[GGML_CUDA_MAX_DEVICES]  = {};
+            bool                          physical_code_loadable[GGML_CUDA_MAX_DEVICES] = {};
+            ggml_cuda_probe_scope         probe_scope;
 
             for (int i = 0; i < info.device_count; i++) {
                 const int physical_id = info.devices[i].physical_device;
+                const int cc = info.devices[i].cc;
+
+                // QVAC-23763: skip a device when this build's CUDA code cannot
+                // load on it, so it never enumerates and the consumer can fall
+                // through instead of aborting at the first kernel launch.
+                //
+                // All virtual devices on one card read the same props, so they
+                // share a cc and are skipped or kept as a group.
+                if (!physical_code_checked[physical_id]) {
+                    physical_code_checked[physical_id] = true;
+                    const bool compiled_code_available = ggml_cuda_compiled_code_available(cc);
+                    physical_code_loadable[physical_id] =
+                        compiled_code_available && ggml_cuda_device_code_loadable(probe_scope, physical_id);
+                    if (!compiled_code_available) {
+                        GGML_LOG_WARN("%s: skipping physical device %d (%s): no kernels compiled for compute capability %d.%d\n",
+                                      __func__, physical_id, ggml_cuda_device_description(i).c_str(), cc / 100, (cc % 100) / 10);
+                    }
+                }
+                if (!physical_code_loadable[physical_id]) {
+                    continue;
+                }
 
                 ggml_backend_cuda_device_context * dev_ctx = new ggml_backend_cuda_device_context;
                 dev_ctx->device = i;
@@ -7142,9 +7499,28 @@ ggml_backend_reg_t ggml_backend_cuda_reg() {
     return &reg;
 }
 
+// never call this from inside the registration loop above: it re-enters
+// ggml_backend_cuda_reg(), whose mutex is not recursive
+static ggml_backend_dev_t ggml_backend_cuda_reg_find_device(int device) {
+    ggml_backend_cuda_reg_context * ctx = (ggml_backend_cuda_reg_context *) ggml_backend_cuda_reg()->context;
+    for (ggml_backend_dev_t dev : ctx->devices) {
+        if (((ggml_backend_cuda_device_context *) dev->context)->device == device) {
+            return dev;
+        }
+    }
+    return nullptr;
+}
+
 ggml_backend_t ggml_backend_cuda_init(int device) {
     if (device < 0 || device >= ggml_backend_cuda_get_device_count()) {
         GGML_LOG_ERROR("%s: invalid device %d\n", __func__, device);
+        return nullptr;
+    }
+
+    // the count above is unfiltered, so a skipped device gets this far
+    ggml_backend_dev_t dev = ggml_backend_cuda_reg_find_device(device);
+    if (dev == nullptr) {
+        GGML_LOG_ERROR("%s: device %d was skipped at registration, CUDA code cannot load on it\n", __func__, device);
         return nullptr;
     }
 
@@ -7157,11 +7533,83 @@ ggml_backend_t ggml_backend_cuda_init(int device) {
     ggml_backend_t cuda_backend = new ggml_backend {
         /* .guid    = */ ggml_backend_cuda_guid(),
         /* .iface   = */ ggml_backend_cuda_interface,
-        /* .device  = */ ggml_backend_reg_dev_get(ggml_backend_cuda_reg(), device),
+        /* .device  = */ dev,
         /* .context = */ ctx,
     };
 
     return cuda_backend;
 }
 
+#ifdef GGML_BACKEND_DL
+static int ggml_cuda_backend_score() {
+#    if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+    const ggml_cuda_device_info & info                                 = ggml_cuda_info();
+    bool                          physical_seen[GGML_CUDA_MAX_DEVICES] = {};
+    int                           loadable_devices                     = 0;
+    int                           exact_devices                        = 0;
+    ggml_cuda_probe_scope         probe_scope;
+
+    for (int i = 0; i < info.device_count; ++i) {
+        const int physical_id = info.devices[i].physical_device;
+        if (physical_seen[physical_id]) {
+            continue;
+        }
+        physical_seen[physical_id] = true;
+
+        const int cc = info.devices[i].cc;
+        if (ggml_cuda_compiled_code_available(cc) && ggml_cuda_device_code_loadable(probe_scope, physical_id, false)) {
+            ++loadable_devices;
+            exact_devices += ggml_cuda_arch_is_exact(cc) ? 1 : 0;
+        }
+    }
+#    else
+    int physical_device_count = 0;
+    const cudaError_t count_result          = cudaGetDeviceCount(&physical_device_count);
+    if (count_result != cudaSuccess) {
+        GGML_LOG_INFO("%s: failed to initialize CUDA: %s\n", __func__, cudaGetErrorString(count_result));
+        (void) cudaGetLastError();
+        return 0;
+    }
+    if (physical_device_count > GGML_CUDA_MAX_DEVICES) {
+        GGML_LOG_WARN("%s: %d CUDA devices exceed the supported maximum of %d\n", __func__, physical_device_count,
+                      GGML_CUDA_MAX_DEVICES);
+        return 0;
+    }
+
+    int          scored_physical_device_count = physical_device_count;
+    const char * devices_env                  = getenv("GGML_CUDA_DEVICES");
+    if (devices_env != nullptr && physical_device_count > 0) {
+        const int requested = atoi(devices_env);
+        if (requested > 0) {
+            scored_physical_device_count = std::min(requested, physical_device_count);
+        }
+    }
+
+    int                   loadable_devices = 0;
+    int                   exact_devices    = 0;
+    ggml_cuda_probe_scope probe_scope;
+    for (int physical_id = 0; physical_id < scored_physical_device_count; ++physical_id) {
+        cudaDeviceProp prop;
+        const cudaError_t prop_result = cudaGetDeviceProperties(&prop, physical_id);
+        if (prop_result != cudaSuccess) {
+            GGML_LOG_INFO("%s: cudaGetDeviceProperties(%d) failed: %s\n", __func__, physical_id,
+                          cudaGetErrorString(prop_result));
+            (void) cudaGetLastError();
+            return 0;
+        }
+        const int cc = 100 * prop.major + 10 * prop.minor;
+        if (ggml_cuda_compiled_code_available(cc) && ggml_cuda_device_code_loadable(probe_scope, physical_id, false)) {
+            ++loadable_devices;
+            exact_devices += ggml_cuda_arch_is_exact(cc) ? 1 : 0;
+        }
+    }
+    if (scored_physical_device_count > 0 && loadable_devices == 0) {
+        GGML_LOG_INFO("%s: no loadable CUDA devices for this module\n", __func__);
+    }
+#    endif
+    return ggml_cuda_arch_score_impl(loadable_devices, exact_devices);
+}
+
+GGML_BACKEND_DL_SCORE_IMPL(ggml_cuda_backend_score)
+#endif
 GGML_BACKEND_DL_IMPL(ggml_backend_cuda_reg)

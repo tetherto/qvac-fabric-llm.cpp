@@ -1,17 +1,20 @@
+#include "ggml-backend-dl.h"
 #include "ggml-backend-impl.h"
 #include "ggml-backend.h"
-#include "ggml-backend-dl.h"
 #include "ggml-impl.h"
+
 #include <algorithm>
+#include <cctype>
 #include <cstring>
 #include <filesystem>
 #include <limits>
 #include <memory>
+#include <regex>
 #include <string>
 #include <type_traits>
+#include <unordered_set>
+#include <utility>
 #include <vector>
-#include <cctype>
-#include <regex>
 
 #ifdef _WIN32
 #    define WIN32_LEAN_AND_MEAN
@@ -19,6 +22,9 @@
 #        define NOMINMAX
 #    endif
 #    include <windows.h>
+
+#    include <cwchar>
+#    include <cwctype>
 #elif defined(__APPLE__)
 #    include <mach-o/dyld.h>
 #    include <dlfcn.h>
@@ -114,13 +120,29 @@ struct ggml_backend_reg_entry {
     dl_handle_ptr handle;
 };
 
+// GGML_DISABLE_<NAME>, such as GGML_DISABLE_CUDA, keeps a backend from loading
+// in static and DL builds alike.
+static bool ggml_backend_disabled_by_env(const char * name) {
+    std::string var = "GGML_DISABLE_";
+    for (const char * c = name; *c != '\0'; ++c) {
+        var += (char) std::toupper((unsigned char) *c);
+    }
+    if (getenv(var.c_str()) == nullptr) {
+        return false;
+    }
+    GGML_LOG_DEBUG("%s backend disabled by %s environment variable\n", name, var.c_str());
+    return true;
+}
+
 struct ggml_backend_registry {
     std::vector<ggml_backend_reg_entry> backends;
     std::vector<ggml_backend_dev_t> devices;
 
     ggml_backend_registry() {
 #ifdef GGML_USE_CUDA
-        register_backend(ggml_backend_cuda_reg());
+        if (!ggml_backend_disabled_by_env("cuda")) {
+            register_backend(ggml_backend_cuda_reg());
+        }
 #endif
 #ifdef GGML_USE_METAL
         register_backend(ggml_backend_metal_reg());
@@ -129,12 +151,9 @@ struct ggml_backend_registry {
         register_backend(ggml_backend_sycl_reg());
 #endif
 #ifdef GGML_USE_VULKAN
-    // Add runtime disable check
-    if (getenv("GGML_DISABLE_VULKAN") == nullptr) {
-        register_backend(ggml_backend_vk_reg());
-    } else {
-        GGML_LOG_DEBUG("Vulkan backend disabled by GGML_DISABLE_VULKAN environment variable\n");
-    }
+        if (!ggml_backend_disabled_by_env("vulkan")) {
+            register_backend(ggml_backend_vk_reg());
+        }
 #endif
 #ifdef GGML_USE_WEBGPU
         register_backend(ggml_backend_webgpu_reg());
@@ -236,6 +255,10 @@ struct ggml_backend_registry {
             return nullptr;
         }
 
+        return load_backend(path, silent, std::move(handle));
+    }
+
+    ggml_backend_reg_t load_backend(const fs::path & path, bool silent, dl_handle_ptr handle) {
         auto backend_init_fn = (ggml_backend_init_t) dl_get_sym(handle.get(), "ggml_backend_init");
         if (!backend_init_fn) {
             if (!silent) {
@@ -479,7 +502,81 @@ static fs::path backend_filename_extension() {
 #endif
 }
 
+#ifdef _WIN32
+// The Windows loader does not search PATH, so the CUDA module's runtime DLLs are
+// resolved from the user's CUDA install instead of being bundled. CUDA 13 keeps
+// them in <toolkit>\bin\x64, which CUDA 12 installs do not have. CUDA_PATH names
+// only the last toolkit installed, so every CUDA_PATH_V* toolkit is added too;
+// the DLL names carry the CUDA major, so toolkits of different majors never
+// shadow each other. The directories are searched only while the CUDA module
+// loads; LOAD_LIBRARY_SEARCH_DEFAULT_DIRS in dl_load_library includes them.
+class cuda_runtime_dll_directory {
+  public:
+    explicit cuda_runtime_dll_directory(bool enabled) {
+        if (!enabled) {
+            return;
+        }
+        std::vector<std::wstring> roots;
+        if (const wchar_t * cuda_path = _wgetenv(L"CUDA_PATH"); cuda_path != nullptr && *cuda_path != L'\0') {
+            roots.emplace_back(cuda_path);
+        }
+        if (wchar_t * env = GetEnvironmentStringsW(); env != nullptr) {
+            static const std::wstring prefix = L"CUDA_PATH_V";
+            for (const wchar_t * entry = env; *entry != L'\0'; entry += wcslen(entry) + 1) {
+                const std::wstring var(entry);
+                const size_t       eq = var.find(L'=');
+                if (var.compare(0, prefix.size(), prefix) == 0 && eq != std::wstring::npos && eq + 1 < var.size()) {
+                    roots.push_back(var.substr(eq + 1));
+                }
+            }
+            FreeEnvironmentStringsW(env);
+        }
+
+        std::unordered_set<std::wstring> added;
+        for (const auto & root : roots) {
+            const fs::path  bin_dir = fs::path(root) / L"bin" / L"x64";
+            std::error_code ec;
+            std::wstring    key = bin_dir.lexically_normal().wstring();
+            std::transform(key.begin(), key.end(), key.begin(), ::towlower);
+            if (!fs::is_directory(bin_dir, ec) || !added.insert(key).second) {
+                continue;
+            }
+            if (DLL_DIRECTORY_COOKIE cookie = AddDllDirectory(bin_dir.c_str()); cookie != nullptr) {
+                cookies.push_back(cookie);
+            } else {
+                GGML_LOG_INFO("%s: AddDllDirectory(%s) failed: %lu\n", __func__, path_str(bin_dir).c_str(),
+                              GetLastError());
+            }
+        }
+        if (cookies.empty()) {
+            GGML_LOG_DEBUG(
+                "%s: no CUDA toolkit with bin\\x64 in CUDA_PATH or CUDA_PATH_V*, "
+                "CUDA backend needs a CUDA 13 install\n",
+                __func__);
+        }
+    }
+
+    ~cuda_runtime_dll_directory() {
+        for (DLL_DIRECTORY_COOKIE cookie : cookies) {
+            RemoveDllDirectory(cookie);
+        }
+    }
+
+    cuda_runtime_dll_directory(const cuda_runtime_dll_directory &)             = delete;
+    cuda_runtime_dll_directory & operator=(const cuda_runtime_dll_directory &) = delete;
+
+  private:
+    std::vector<DLL_DIRECTORY_COOKIE> cookies;
+};
+#endif
+
 static ggml_backend_reg_t ggml_backend_load_best(const char * name, bool silent, const char * user_search_path) {
+    if (ggml_backend_disabled_by_env(name)) {
+        return nullptr;
+    }
+#ifdef _WIN32
+    const cuda_runtime_dll_directory cuda_dlls(striequals(name, "cuda"));
+#endif
     // enumerate all the files that match [lib]ggml-name-*.[so|dll] in the search paths
     const fs::path name_path = fs::u8path(name);
     const fs::path file_prefix = backend_filename_prefix().native() + name_path.native();
@@ -507,20 +604,58 @@ static ggml_backend_reg_t ggml_backend_load_best(const char * name, bool silent,
     }
 
     int best_score = 0;
+    bool                                          found_candidate = false;
     fs::path best_path;
+    dl_handle_ptr   best_handle;
     std::error_code ec;
+    std::unordered_set<std::string> attempted_paths;
+    std::vector<std::pair<fs::path, std::string>> load_failures;
 
-    auto tryEntryWithScore = [&best_score, &best_path, silent, _func = __func__](const fs::path & entryPath,
-                                                                                 int              scoreOffset = 1) {
+    auto markAttempted = [&attempted_paths](const fs::path & path, bool name_only) {
+        std::string key;
+        if (name_only) {
+            key = "name:" + path_str(path);
+        } else {
+            std::error_code path_ec;
+            fs::path        canonical_path = fs::weakly_canonical(path, path_ec);
+            if (path_ec) {
+                path_ec.clear();
+                canonical_path = fs::absolute(path, path_ec);
+            }
+            if (path_ec) {
+                canonical_path = path;
+            }
+            key = "path:" + path_str(canonical_path.lexically_normal());
+        }
+#ifdef _WIN32
+        std::transform(key.begin(), key.end(), key.begin(), [](unsigned char c) { return std::tolower(c); });
+#endif
+        return attempted_paths.insert(std::move(key)).second;
+    };
+
+    auto tryEntryWithScore = [&best_score, &best_path, &best_handle, &markAttempted, &load_failures, silent, _func = __func__](
+                                 const fs::path & entryPath, int scoreOffset = 1, bool name_only = false) {
+        if (!markAttempted(entryPath, name_only)) {
+            return;
+        }
         dl_handle_ptr handle{ dl_load_library(entryPath) };
-        if (!handle && !silent) {
-            GGML_LOG_ERROR("%s: failed to load %s: %s\n", _func, path_str(entryPath).c_str(), dl_error());
+        if (!handle) {
+            const char * error_ptr = dl_error();
+            const std::string error = error_ptr != nullptr ? error_ptr : "unknown loader error";
+            if (!silent) {
+                GGML_LOG_DEBUG("%s: failed to load %s: %s\n", _func, path_str(entryPath).c_str(), error.c_str());
+            }
+            load_failures.emplace_back(entryPath, error);
         }
         if (handle) {
             auto score_fn = (ggml_backend_score_t) dl_get_sym(handle.get(), "ggml_backend_score");
             int  s        = 1;
             if (score_fn) {
-                s = score_fn() + scoreOffset;
+                const int backend_score = score_fn();
+                if (backend_score == 0) {
+                    return;
+                }
+                s = backend_score + scoreOffset;
             }
 #ifdef NDEBUG
             GGML_LOG_DEBUG("%s: %s score: %d\n", _func, path_str(entryPath).c_str(), s);
@@ -528,6 +663,7 @@ static ggml_backend_reg_t ggml_backend_load_best(const char * name, bool silent,
             if (s > best_score) {
                 best_score = s;
                 best_path  = entryPath;
+                best_handle = std::move(handle);
             }
         }
     };
@@ -542,6 +678,7 @@ static ggml_backend_reg_t ggml_backend_load_best(const char * name, bool silent,
             continue;
         }
         GGML_LOG_INFO("%s: searching for %s in %s\n", __func__, path_str(name_path).c_str(), path_str(search_path).c_str());
+        std::vector<fs::path> candidates;
         std::error_code dir_ec;
         fs::directory_iterator dir_it(search_path, fs::directory_options::skip_permission_denied, dir_ec);
         if (dir_ec) {
@@ -554,9 +691,16 @@ static ggml_backend_reg_t ggml_backend_load_best(const char * name, bool silent,
                 auto filename = entry.path().filename();
                 auto ext = entry.path().extension();
                 if (filename.native().find(file_prefix) == 0 && ext == file_extension) {
-                    tryEntryWithScore(entry.path());
+                    candidates.push_back(entry.path());
                 }
             }
+        }
+        // A tie keeps the first filename. The arm64 CUDA 13 and CUDA 12 Jetson
+        // modules ship disjoint archs and runtimes, so no device scores on both.
+        std::sort(candidates.begin(), candidates.end());
+        found_candidate = found_candidate || !candidates.empty();
+        for (const auto & candidate : candidates) {
+            tryEntryWithScore(candidate);
         }
     }
 
@@ -566,7 +710,9 @@ static ggml_backend_reg_t ggml_backend_load_best(const char * name, bool silent,
             fs::path filename = backend_filename_prefix().native() + name_path.native() + backend_filename_extension().native();
             fs::path path = search_path / filename;
             if (std::error_code ec; fs::exists(path, ec)) {
-                return get_reg().load_backend(path, silent);
+                if (markAttempted(path, false)) {
+                    return get_reg().load_backend(path, silent);
+                }
             } else {
                 if (ec) {
                     GGML_LOG_DEBUG("%s: posix_stat(%s) failure, error-message: %s\n", __func__, path_str(path).c_str(), ec.message().c_str());
@@ -576,8 +722,10 @@ static ggml_backend_reg_t ggml_backend_load_best(const char * name, bool silent,
     }
 
 #ifndef _WIN32
-    // Let the platform loader resolve libraries outside the explicit search paths.
-    if (best_path.empty()) {
+    // Let the platform loader resolve libraries outside the explicit search paths,
+    // only when the search paths had none. A module there that scored 0 was
+    // rejected on purpose, and the loader could resolve to it or a stale copy.
+    if (!found_candidate) {
         // From worst to best
         std::vector<fs::path> names = { name_path };
 #    ifdef __ANDROID__
@@ -593,12 +741,20 @@ static ggml_backend_reg_t ggml_backend_load_best(const char * name, bool silent,
             // Try loading backend with just the library name, leave to dlopen path resolution.
             fs::path     filename     = backend_filename_prefix().native() + loopNamePath.native() +
                                 backend_filename_extension().native();
-            tryEntryWithScore(filename, 1+scoreOffset);
+            tryEntryWithScore(filename, 1 + scoreOffset, true);
         }
     }
 #endif
 
-    return get_reg().load_backend(best_path, silent);
+    if (!best_handle) {
+        if (!silent) {
+            for (const auto & failure : load_failures) {
+                GGML_LOG_ERROR("%s: failed to load %s: %s\n", __func__, path_str(failure.first).c_str(), failure.second.c_str());
+            }
+        }
+        return nullptr;
+    }
+    return get_reg().load_backend(best_path, silent, std::move(best_handle));
 }
 
 void ggml_backend_load_all() {
