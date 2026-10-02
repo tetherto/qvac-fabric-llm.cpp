@@ -1043,6 +1043,16 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
     }
 
     ggml_tensor * inpL = ggml_get_rows(ctx0, tok_embd, inp_tokens);
+
+    // a Hadamard-latent table (also the target's, borrowed) stores rotated rows; restore the primal basis
+    if (hdmd) {
+        if (const auto it = hdmd->inv.find(tok_embd); it != hdmd->inv.end()) {
+            inpL = llama_mul_mat_hadamard(ctx0, inpL, it->second.rot);
+            if (it->second.signs) {
+                inpL = ggml_mul(ctx0, inpL, it->second.signs);
+            }
+        }
+    }
     if (hparams.f_embedding_scale != 0.0f) {
         inpL = ggml_scale(ctx0, inpL, hparams.f_embedding_scale);
     }

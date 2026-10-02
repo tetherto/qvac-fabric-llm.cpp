@@ -255,6 +255,16 @@ llama_context::llama_context(
         }
     }
 
+    hdmd = std::make_unique<llama_hadamard>();
+    hdmd->rot = model.hdmd.rot;
+    hdmd->inv = model.hdmd.inv;
+    if (cparams.ctx_other) {
+        // entries are keyed by tensor, so the target's never collide with the model's own
+        const llama_model & model_other = cparams.ctx_other->get_model();
+        hdmd->rot.insert(model_other.hdmd.rot.begin(), model_other.hdmd.rot.end());
+        hdmd->inv.insert(model_other.hdmd.inv.begin(), model_other.hdmd.inv.end());
+    }
+
     if (params.ctx_other_share_compute && params.ctx_type == LLAMA_CONTEXT_TYPE_MTP && params.ctx_other != nullptr &&
         &params.ctx_other->get_model() == &model &&
         cparams.n_seq_max == 1 && params.ctx_other->n_seq_max() == 1) {
@@ -2762,8 +2772,8 @@ ggml_cgraph * llama_context::graph_reserve(
     auto * gf = model.build_graph(gparams);
 
     // check the graph before scheduling: cross-backend copies break the producer chain that the check follows
-    if (!hadamard_verified && gf && (!model.hdmd.rot.empty() || !model.hdmd.inv.empty())) {
-        llama_verify_hadamard_graph(gf, model.hdmd.rot, model.hdmd.inv, moe_cache.get());
+    if (!hadamard_verified && gf && (!hdmd->rot.empty() || !hdmd->inv.empty())) {
+        llama_verify_hadamard_graph(gf, hdmd->rot, hdmd->inv, moe_cache.get());
         hadamard_verified = true;
     }
 
@@ -2809,7 +2819,7 @@ llm_graph_params llama_context::graph_params(
         /*.cross       =*/ &cross,
         /*.moe_cache   =*/ moe_cache.get(),
         /*.prec_policy =*/ &model.prec_policy,
-        /*.hdmd        =*/ model.hdmd.rot.empty() ? nullptr : &model.hdmd,
+        /*.hdmd        =*/ hdmd->rot.empty() && hdmd->inv.empty() ? nullptr : hdmd.get(),
         /*.samplers    =*/ sampling.samplers,
         /*.n_outputs   =*/ n_outputs,
         /*.cb          =*/ graph_get_cb(),
