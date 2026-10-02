@@ -16,6 +16,7 @@ import argparse
 import json
 import subprocess
 import sys
+from typing import Any
 
 import numpy as np
 
@@ -135,14 +136,14 @@ def run_reference(agent, req):
         agent._check_question(qid, questions[qid])
     internal = {qid: agent._to_internal(questions[qid]) for qid in ids}
 
-    rows = []
+    rows: list[dict[str, Any]] = []
     for s, state in enumerate(states):
         items = agent._encode_state(state, ids, internal)
         for qid, item in zip(ids, items):
             rows.append({"state": s, "question": qid, "ids": item["ids"], "markers": item["markers"], "item": item})
 
     import torch
-    from laya.common import collate_items
+    from laya.common import collate_items  # ty: ignore[unresolved-import]
     for row in rows:
         b = collate_items([[row["item"]]], agent.tok.pad_token_id)
         with torch.no_grad():
@@ -215,7 +216,7 @@ def main():
     parser.add_argument("extra", nargs="*", help="extra llama-laya arguments, after --")
     args = parser.parse_args()
 
-    from laya import Agent
+    from laya import Agent  # ty: ignore[unresolved-import]
     agent = Agent(args.model_dir, device="cpu")
 
     failed = False
