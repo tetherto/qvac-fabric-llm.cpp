@@ -67,9 +67,15 @@ int64_t ggml_metal_mul_mv_mma_k_step(enum ggml_type type, int rt);
 // true if the few-row MMA kernels take mat-mul op on a device with these properties. they fill simdgroup matrices
 // per lane, so they need a GPU with native simdgroup matrices (MTLGPUFamilyApple7+), not one enabled by the probe
 bool ggml_metal_mul_mat_use_mma(const struct ggml_tensor * op, bool has_native_simdgroup_mm, bool has_tensor);
+// true if the device, the hadamard hint and the types allow the few-row MMA kernels for mat-mul op. it reads no shapes or
+// strides, so a decision based on it is the same for every batch size, and use_mma can still reject the op
+bool ggml_metal_mul_mat_may_use_mma(const struct ggml_tensor * op, bool has_native_simdgroup_mm, bool has_tensor);
 // true if the 2-row Q4_0 kernel takes mat-mul op instead of the MMA kernels
 bool ggml_metal_mul_mat_use_nc(const struct ggml_tensor * op);
-// the residual that add sums with mat-mul mm if it is a same-shape contiguous f32 tensor, else NULL
+// the f32 operand that f32 add sums with mat-mul mm, if mm is exactly one of its operands and the other one is not a
+// weight (a bias), else NULL. it reads no shapes, so it gives the same answer for every batch size
+const struct ggml_tensor * ggml_metal_mul_mat_add_operand(const struct ggml_tensor * mm, const struct ggml_tensor * add);
+// the operand of ggml_metal_mul_mat_add_operand if it is a same-shape contiguous residual of mm, else NULL
 const struct ggml_tensor * ggml_metal_mul_mat_add_residual(const struct ggml_tensor * mm, const struct ggml_tensor * add);
 
 #ifdef __cplusplus

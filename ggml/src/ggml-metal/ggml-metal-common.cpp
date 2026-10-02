@@ -62,7 +62,7 @@ int ggml_metal_mul_mv_mma_rt(const struct ggml_tensor * op) {
     return op->src[1]->ne[1] > GGML_METAL_MMA_TILE_ROWS ? 2 : 1;
 }
 
-int64_t ggml_metal_mul_mv_mma_k_step(enum ggml_type type, int rt) {
+static bool ggml_metal_mul_mv_mma_type_supported(enum ggml_type type) {
     switch (type) {
         case GGML_TYPE_F32:
         case GGML_TYPE_F16:
@@ -74,9 +74,15 @@ int64_t ggml_metal_mul_mv_mma_k_step(enum ggml_type type, int rt) {
         case GGML_TYPE_Q4_K:
         case GGML_TYPE_Q5_K:
         case GGML_TYPE_Q6_K:
-            break;
+            return true;
         default:
-            return 0;
+            return false;
+    }
+}
+
+int64_t ggml_metal_mul_mv_mma_k_step(enum ggml_type type, int rt) {
+    if (!ggml_metal_mul_mv_mma_type_supported(type)) {
+        return 0;
     }
     return ggml_metal_mul_mv_mma_kind(type, rt) == GGML_METAL_MMA_KIND_BLK ? ggml_blck_size(type) : GGML_METAL_MMA_K_CHUNK;
 }
@@ -101,23 +107,50 @@ static bool ggml_metal_mul_mat_mma_shape_ok(const struct ggml_tensor * op) {
         src1->nb[0] == sizeof(float) && src1->nb[1] % 16 == 0 && src1->nb[2] % 16 == 0 && src1->nb[3] % 16 == 0;
 }
 
+static bool ggml_metal_mma_device_ok(bool has_native_simdgroup_mm, bool has_tensor) {
+    return has_native_simdgroup_mm && !has_tensor;
+}
+
 bool ggml_metal_mul_mat_use_mma(const struct ggml_tensor * op, bool has_native_simdgroup_mm, bool has_tensor) {
     // the FWHT kernel takes the hadamard mat-muls first
-    return has_native_simdgroup_mm && !has_tensor && !ggml_metal_op_mul_mat_use_fwht(op) && ggml_metal_mul_mat_mma_shape_ok(op);
+    return ggml_metal_mma_device_ok(has_native_simdgroup_mm, has_tensor) && !ggml_metal_op_mul_mat_use_fwht(op) &&
+        ggml_metal_mul_mat_mma_shape_ok(op);
+}
+
+bool ggml_metal_mul_mat_may_use_mma(const struct ggml_tensor * op, bool has_native_simdgroup_mm, bool has_tensor) {
+    return ggml_metal_mma_device_ok(has_native_simdgroup_mm, has_tensor) &&
+        ggml_get_op_params_i32(op, 1) != GGML_HINT_SRC0_IS_HADAMARD &&
+        ggml_metal_mul_mv_mma_type_supported(op->src[0]->type) && op->src[1]->type == GGML_TYPE_F32;
 }
 
 bool ggml_metal_mul_mat_use_nc(const struct ggml_tensor * op) {
     return op->src[0]->type == GGML_TYPE_Q4_0 && op->src[1]->ne[1] == N_NC_Q4_0;
 }
 
-const struct ggml_tensor * ggml_metal_mul_mat_add_residual(const struct ggml_tensor * mm, const struct ggml_tensor * add) {
+// true if t is or views a tensor in a buffer marked as weights, such as a bias; the model loader marks its buffers before
+// any graph is optimized, and tensors in unmarked or not yet allocated buffers count as non-weights in both phases
+static bool ggml_metal_tensor_is_weight(const struct ggml_tensor * t) {
+    const ggml_tensor * base = t->view_src != NULL ? t->view_src : t;
+
+    return base->buffer != NULL && ggml_backend_buffer_get_usage(base->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS;
+}
+
+const struct ggml_tensor * ggml_metal_mul_mat_add_operand(const struct ggml_tensor * mm, const struct ggml_tensor * add) {
     if (add->op != GGML_OP_ADD || (add->src[0] == mm) == (add->src[1] == mm)) {
         return NULL;
     }
 
-    const ggml_tensor * res = add->src[0] == mm ? add->src[1] : add->src[0];
+    const ggml_tensor * other = add->src[0] == mm ? add->src[1] : add->src[0];
 
-    const bool ok = res->type == GGML_TYPE_F32 && add->type == GGML_TYPE_F32 && ggml_are_same_shape(res, mm) &&
+    const bool ok = other->type == GGML_TYPE_F32 && add->type == GGML_TYPE_F32 && !ggml_metal_tensor_is_weight(other);
+
+    return ok ? other : NULL;
+}
+
+const struct ggml_tensor * ggml_metal_mul_mat_add_residual(const struct ggml_tensor * mm, const struct ggml_tensor * add) {
+    const ggml_tensor * res = ggml_metal_mul_mat_add_operand(mm, add);
+
+    const bool ok = res != NULL && ggml_are_same_shape(res, mm) &&
         ggml_is_contiguous(res) && ggml_is_contiguous(mm) && ggml_is_contiguous(add);
 
     return ok ? res : NULL;
