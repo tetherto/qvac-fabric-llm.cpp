@@ -6871,6 +6871,51 @@ struct test_mul_mat_id : public test_case {
     }
 };
 
+// GGML_OP_MUL_MAT_ID with a permuted (non-dim01-contiguous) expert bank and a contiguous src1
+struct test_mul_mat_id_permuted_src0 : public test_case {
+    const ggml_type type_a;
+    const int n_mats;
+    const int n_used;
+    const int64_t m;
+    const int64_t n;
+    const int64_t k;
+
+    std::string vars() override {
+        return VARS_TO_STR6(type_a, n_mats, n_used, m, n, k);
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    test_mul_mat_id_permuted_src0(ggml_type type_a, int n_mats, int n_used, int64_t m, int64_t n, int64_t k)
+        : type_a(type_a), n_mats(n_mats), n_used(n_used), m(m), n(n), k(k) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        // experts are interleaved row by row in memory, so the bank is not dim01-contiguous
+        ggml_tensor * as = ggml_new_tensor_3d(ctx, type_a, k, n_mats, m);
+        ggml_set_name(as, "as");
+        as = ggml_permute(ctx, as, 0, 2, 1, 3);
+        ggml_set_name(as, "as_permuted");
+
+        ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_mats, n);
+        ggml_set_name(ids, "ids");
+        ids = ggml_view_2d(ctx, ids, n_used, n, ids->nb[1], 0);
+        ggml_set_name(ids, "view_of_ids");
+
+        ggml_tensor * b = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k, n_used, n);
+        ggml_set_name(b, "b");
+
+        ggml_tensor * out = ggml_mul_mat_id(ctx, as, b, ids);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        init_mul_mat_id_tensors(ctx, n_mats);
+    }
+};
+
 enum mul_mat_offset_operand {
     MUL_MAT_OFFSET_WEIGHT,
     MUL_MAT_OFFSET_INPUT,
@@ -13176,6 +13221,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (ggml_type type_a : {GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_Q8_0}) {
         for (int64_t n : {1, 16}) {
             test_cases.emplace_back(new test_mul_mat_permuted_src0(type_a, 16, n, 256));
+            test_cases.emplace_back(new test_mul_mat_id_permuted_src0(type_a, 4, 2, 16, n, 256));
         }
     }
 
