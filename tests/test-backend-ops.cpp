@@ -9443,8 +9443,17 @@ struct test_mul_mat_act_topk_moe : public test_case {
     ggml_tensor * selected_experts {};
     ggml_tensor * weights {};
 
+    // a power-of-two step keeps every logit exact in TF32, f16 and bf16
+    static constexpr float logit_ramp_min  = -1.0f;
+    static constexpr float logit_ramp_step = 1.0f / 32;
+
     test_mul_mat_act_topk_moe(int64_t n_expert, int64_t n_tokens, int64_t k, int n_expert_used)
-        : n_expert(n_expert), n_tokens(n_tokens), k(k), n_expert_used(n_expert_used) {}
+        : n_expert(n_expert), n_tokens(n_tokens), k(k), n_expert_used(n_expert_used) {
+        GGML_ASSERT(n_tokens > 0 && k % n_tokens == 0 && (block() & (block() - 1)) == 0);
+    }
+
+    // the K positions each token reads; a power of two keeps the ramp divided by it exact
+    int64_t block() const { return k / n_tokens; }
 
     std::string vars() override {
         return VARS_TO_STR4(n_expert, n_tokens, k, n_expert_used) + ",topk_moe=1";
@@ -9479,23 +9488,69 @@ struct test_mul_mat_act_topk_moe : public test_case {
 
     std::vector<ggml_tensor *> fusion_test_nodes() override { return { selected_experts, weights }; }
 
-    // the selected experts may come out in a different order
+    // the selected experts of a token may come out in another order
     double err(const float * a, const float * b, size_t n) override {
         std::vector<float> a2(a, a + n);
         std::vector<float> b2(b, b + n);
-        std::sort(a2.begin(), a2.end());
-        std::sort(b2.begin(), b2.end());
+        sort_per_token(a2);
+        sort_per_token(b2);
         return nmse(a2.data(), b2.data(), n);
     }
 
+    void sort_per_token(std::vector<float> & v) const {
+        const size_t per_token = n_expert_used;
+        GGML_ASSERT(v.size() % per_token == 0);
+        for (size_t i = 0; i < v.size(); i += per_token) {
+            std::sort(v.begin() + i, v.begin() + i + per_token);
+        }
+    }
+
+    // token t sums a block of ones in x against its block of w, a ramp shuffled per token and divided by the block size,
+    // so every partial sum is exact: random logits can fall within mat-mul rounding (TF32 on CUDA) of each other
     void initialize_tensors(ggml_context * ctx) override {
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
             if (strcmp(t->name, "w") == 0) {
-                mul_mat_act_init_weight(t, k);
+                init_logit_ramp_weights(t);
+            } else if (strcmp(t->name, "x") == 0) {
+                init_block_inputs(t);
             } else {
                 init_tensor_uniform(t);
             }
         }
+    }
+
+    std::vector<float> logit_ramp() const {
+        std::vector<float> ramp(n_expert);
+        for (int64_t e = 0; e < n_expert; e++) {
+            ramp[e] = (logit_ramp_min + logit_ramp_step * e) / block();
+        }
+        return ramp;
+    }
+
+    // writes ramp[e] into the block of token t in the row of expert e of w
+    void fill_token_block(std::vector<float> & w_data, const std::vector<float> & ramp, int64_t t) const {
+        for (int64_t e = 0; e < n_expert; e++) {
+            std::fill_n(w_data.begin() + e*k + t*block(), block(), ramp[e]);
+        }
+    }
+
+    void init_logit_ramp_weights(ggml_tensor * w) {
+        std::default_random_engine rng(std::random_device{}());
+        std::vector<float> ramp = logit_ramp();
+        std::vector<float> data(ggml_nelements(w));
+        for (int64_t t = 0; t < n_tokens; t++) {
+            std::shuffle(ramp.begin(), ramp.end(), rng);
+            fill_token_block(data, ramp, t);
+        }
+        ggml_backend_tensor_set(w, data.data(), 0, ggml_nbytes(w));
+    }
+
+    void init_block_inputs(ggml_tensor * x) {
+        std::vector<float> data(ggml_nelements(x), 0.0f);
+        for (int64_t t = 0; t < n_tokens; t++) {
+            std::fill_n(data.begin() + t*k + t*block(), block(), 1.0f);
+        }
+        ggml_backend_tensor_set(x, data.data(), 0, ggml_nbytes(x));
     }
 };
 
