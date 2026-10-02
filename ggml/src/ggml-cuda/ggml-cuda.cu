@@ -106,7 +106,7 @@
 
 static_assert(sizeof(half) == sizeof(ggml_fp16_t), "wrong fp16 size");
 
-#if defined(GGML_USE_VMM) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 #    define GGML_CUDA_RUNTIME_PROBE 1
 #endif
 
@@ -137,13 +137,55 @@ static int ggml_cuda_get_physical_device(int device) {
 }
 
 #ifdef GGML_CUDA_RUNTIME_PROBE
+// The probe must know whether it created a primary context, so it can release
+// it. Builds without GGML_USE_VMM do not link the driver API, so the two calls
+// it needs are fetched through cudart instead.
+struct ggml_cuda_ctx_state_api {
+    using device_get_t = CUresult (*)(CUdevice *, int);
+    using ctx_state_t  = CUresult (*)(CUdevice, unsigned int *, int *);
+
+    device_get_t device_get = nullptr;
+    ctx_state_t  ctx_state  = nullptr;
+
+    ggml_cuda_ctx_state_api() {
+#    ifdef GGML_USE_VMM
+        device_get = cuDeviceGet;
+        ctx_state  = cuDevicePrimaryCtxGetState;
+#    elif CUDART_VERSION >= 12050
+        device_get = (device_get_t) entry_point("cuDeviceGet");
+        ctx_state  = (ctx_state_t) entry_point("cuDevicePrimaryCtxGetState");
+#    endif
+    }
+
+#    if !defined(GGML_USE_VMM) && CUDART_VERSION >= 12050
+    static void * entry_point(const char * symbol) {
+        void *                          fn     = nullptr;
+        cudaDriverEntryPointQueryResult status = cudaDriverEntryPointSymbolNotFound;
+        if (cudaGetDriverEntryPointByVersion(symbol, &fn, 12000, cudaEnableDefault, &status) != cudaSuccess ||
+            status != cudaDriverEntryPointSuccess) {
+            (void) cudaGetLastError();
+            return nullptr;
+        }
+        return fn;
+    }
+#    endif
+
+    bool available() const { return device_get != nullptr && ctx_state != nullptr; }
+};
+
+static const ggml_cuda_ctx_state_api & ggml_cuda_ctx_state() {
+    static const ggml_cuda_ctx_state_api api;
+    return api;
+}
+
 // Unknown counts as active, so the caller never resets a context it cannot see.
 static bool ggml_cuda_primary_ctx_active(const int physical_device) {
-    CUdevice     device;
-    unsigned int flags  = 0;
-    int          active = 0;
-    if (cuDeviceGet(&device, physical_device) != CUDA_SUCCESS ||
-        cuDevicePrimaryCtxGetState(device, &flags, &active) != CUDA_SUCCESS) {
+    const ggml_cuda_ctx_state_api & api = ggml_cuda_ctx_state();
+    CUdevice                        device;
+    unsigned int                    flags  = 0;
+    int                             active = 0;
+    if (!api.available() || api.device_get(&device, physical_device) != CUDA_SUCCESS ||
+        api.ctx_state(device, &flags, &active) != CUDA_SUCCESS) {
         return true;
     }
     return active != 0;
@@ -222,13 +264,18 @@ static bool ggml_cuda_test_skipped(const int physical_device) {
 
 static cudaError_t ggml_cuda_device_code_loadable_uncached(ggml_cuda_probe_scope & scope, const int physical_device) {
 #ifndef GGML_CUDA_RUNTIME_PROBE
-    // Without GGML_USE_VMM the driver API is not linked, so the probe could not
-    // tell whether it created a primary context and would leave about 500 MiB on
-    // every GPU. Those builds rely on the compiled arch check alone.
     GGML_UNUSED(scope);
     GGML_UNUSED(physical_device);
     return cudaSuccess;
 #else
+    // Without the driver calls the probe could not tell whether it created a
+    // primary context and would leave about 500 MiB on every GPU, so only the
+    // compiled arch check applies then.
+    if (!ggml_cuda_ctx_state().available()) {
+        GGML_LOG_DEBUG("%s: CUDA driver context state is unavailable, skipping the load probe\n", __func__);
+        return cudaSuccess;
+    }
+
     // cudaSetDevice creates the primary context, about 500 MiB on an RTX 5090.
     // Reset every context the probe created, so a GPU the process never uses
     // keeps no memory.
