@@ -60,6 +60,9 @@ void llama_model_glm5_next::load_arch_hparams(llama_model_loader & ml) {
                 ml.llm_kv(LLM_KV_ATTENTION_INDEXER_KPOOL).c_str(),
                 hparams.indexer_kpool, hparams.indexer_top_k));
     }
+    // pool consecutive cells in sequence order: a sequence edit can leave gaps in the positions, and runs of
+    // consecutive positions would then strand the surviving cells outside both the pools and the tail
+    hparams.indexer_kpool_by_order = true;
     std::fill(hparams.is_indexer_full_impl.begin(), hparams.is_indexer_full_impl.end(), 1);
     ml.get_key_or_arr(LLM_KV_ATTENTION_INDEXER_TYPES, hparams.is_indexer_full_impl, hparams.n_layer(), false);
 

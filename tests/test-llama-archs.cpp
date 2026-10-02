@@ -1487,7 +1487,9 @@ static int test_glm5_kpool_sequences() {
     decode({{30, 4, {1}}, {31, 5, {1}}, {32, 6, {1}}, {33, 7, {1}}});
     selected.indices.clear();
     decode({{40, 8, {0, 1}}});
-    GGML_ASSERT(unique_count() >= 13); // shared prefix once, both unique branches, current token
+    // a token in several sequences attends to its first sequence only, as the KQ mask does:
+    // the shared prefix once, seq 0's branch and the current token
+    GGML_ASSERT(unique_count() >= 9);
 
     printf("GLM5 k-pool sequence edit and shared-token tests passed\n");
     return 0;
