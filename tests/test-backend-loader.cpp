@@ -5,7 +5,7 @@
 //   - the best scoring module wins over a zero-score one
 //   - a module reachable through two directory entries is scored once
 //   - GGML_DISABLE_CUDA stops the cuda search entirely
-//   - on Windows, a cuda module's runtime DLL resolves from %CUDA_PATH%\bin\x64
+//   - on Windows, a cuda module's runtime DLL resolves from CUDA_PATH or CUDA_PATH_V*
 
 #include "ggml-backend.h"
 
@@ -20,11 +20,20 @@
 namespace fs = std::filesystem;
 
 #ifdef _WIN32
+#    define WIN32_LEAN_AND_MEAN
+#    ifndef NOMINMAX
+#        define NOMINMAX
+#    endif
+#    include <windows.h>
+
 static const char * const k_prefix = "qvac-ggml-cuda-";
 static const char * const k_ext    = ".dll";
 
+// Both the CRT copy, read by getenv, and the process block, read by
+// GetEnvironmentStrings, are updated.
 static void set_env(const char * name, const char * value) {
     _putenv_s(name, value ? value : "");
+    SetEnvironmentVariableA(name, value);
 }
 #else
 static const char * const k_prefix = "libqvac-ggml-cuda-";
@@ -156,6 +165,15 @@ int main() {
     ggml_backend_load_all_from_path(dep_dir.string().c_str());
     set_env("CUDA_PATH", nullptr);
     check(count_regs("STUB_DEP") == 1, "runtime DLL is resolved from CUDA_PATH\\bin\\x64");
+    unload_all("STUB_DEP");
+
+    // CUDA_PATH names only the last toolkit installed, which may be an older major.
+    set_env("CUDA_PATH", dir.string().c_str());
+    set_env("CUDA_PATH_V13_0", cuda_dir.string().c_str());
+    ggml_backend_load_all_from_path(dep_dir.string().c_str());
+    set_env("CUDA_PATH", nullptr);
+    set_env("CUDA_PATH_V13_0", nullptr);
+    check(count_regs("STUB_DEP") == 1, "runtime DLL is resolved from CUDA_PATH_V13_0 when CUDA_PATH has no bin\\x64");
     unload_all("STUB_DEP");
 #endif
 

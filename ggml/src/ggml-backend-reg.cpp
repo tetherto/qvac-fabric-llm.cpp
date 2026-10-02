@@ -22,6 +22,9 @@
 #        define NOMINMAX
 #    endif
 #    include <windows.h>
+
+#    include <cwchar>
+#    include <cwctype>
 #elif defined(__APPLE__)
 #    include <mach-o/dyld.h>
 #    include <dlfcn.h>
@@ -117,18 +120,29 @@ struct ggml_backend_reg_entry {
     dl_handle_ptr handle;
 };
 
+// GGML_DISABLE_<NAME>, such as GGML_DISABLE_CUDA, keeps a backend from loading
+// in static and DL builds alike.
+static bool ggml_backend_disabled_by_env(const char * name) {
+    std::string var = "GGML_DISABLE_";
+    for (const char * c = name; *c != '\0'; ++c) {
+        var += (char) std::toupper((unsigned char) *c);
+    }
+    if (getenv(var.c_str()) == nullptr) {
+        return false;
+    }
+    GGML_LOG_DEBUG("%s backend disabled by %s environment variable\n", name, var.c_str());
+    return true;
+}
+
 struct ggml_backend_registry {
     std::vector<ggml_backend_reg_entry> backends;
     std::vector<ggml_backend_dev_t> devices;
 
     ggml_backend_registry() {
 #ifdef GGML_USE_CUDA
-    // Add runtime disable check
-    if (getenv("GGML_DISABLE_CUDA") == nullptr) {
-        register_backend(ggml_backend_cuda_reg());
-    } else {
-        GGML_LOG_DEBUG("CUDA backend disabled by GGML_DISABLE_CUDA environment variable\n");
-    }
+        if (!ggml_backend_disabled_by_env("cuda")) {
+            register_backend(ggml_backend_cuda_reg());
+        }
 #endif
 #ifdef GGML_USE_METAL
         register_backend(ggml_backend_metal_reg());
@@ -137,12 +151,9 @@ struct ggml_backend_registry {
         register_backend(ggml_backend_sycl_reg());
 #endif
 #ifdef GGML_USE_VULKAN
-    // Add runtime disable check
-    if (getenv("GGML_DISABLE_VULKAN") == nullptr) {
-        register_backend(ggml_backend_vk_reg());
-    } else {
-        GGML_LOG_DEBUG("Vulkan backend disabled by GGML_DISABLE_VULKAN environment variable\n");
-    }
+        if (!ggml_backend_disabled_by_env("vulkan")) {
+            register_backend(ggml_backend_vk_reg());
+        }
 #endif
 #ifdef GGML_USE_WEBGPU
         register_backend(ggml_backend_webgpu_reg());
@@ -494,35 +505,59 @@ static fs::path backend_filename_extension() {
 #ifdef _WIN32
 // The Windows loader does not search PATH, so the CUDA module's runtime DLLs are
 // resolved from the user's CUDA install instead of being bundled. CUDA 13 keeps
-// them in %CUDA_PATH%\bin\x64, which CUDA 12 installs do not have. The directory
-// is searched only while the CUDA module loads; LOAD_LIBRARY_SEARCH_DEFAULT_DIRS
-// in dl_load_library includes user directories.
+// them in <toolkit>\bin\x64, which CUDA 12 installs do not have. CUDA_PATH names
+// only the last toolkit installed, so every CUDA_PATH_V* toolkit is added too;
+// the DLL names carry the CUDA major, so toolkits of different majors never
+// shadow each other. The directories are searched only while the CUDA module
+// loads; LOAD_LIBRARY_SEARCH_DEFAULT_DIRS in dl_load_library includes them.
 class cuda_runtime_dll_directory {
   public:
     explicit cuda_runtime_dll_directory(bool enabled) {
         if (!enabled) {
             return;
         }
-        const wchar_t * cuda_path = _wgetenv(L"CUDA_PATH");
-        if (cuda_path == nullptr || *cuda_path == L'\0') {
-            GGML_LOG_DEBUG("%s: CUDA_PATH is not set, CUDA runtime DLLs will not be found\n", __func__);
-            return;
+        std::vector<std::wstring> roots;
+        if (const wchar_t * cuda_path = _wgetenv(L"CUDA_PATH"); cuda_path != nullptr && *cuda_path != L'\0') {
+            roots.emplace_back(cuda_path);
         }
-        const fs::path  bin_dir = fs::path(cuda_path) / L"bin" / L"x64";
-        std::error_code ec;
-        if (!fs::is_directory(bin_dir, ec)) {
-            GGML_LOG_INFO("%s: %s not found, CUDA backend needs a CUDA 13 install\n", __func__,
-                          path_str(bin_dir).c_str());
-            return;
+        if (wchar_t * env = GetEnvironmentStringsW(); env != nullptr) {
+            static const std::wstring prefix = L"CUDA_PATH_V";
+            for (const wchar_t * entry = env; *entry != L'\0'; entry += wcslen(entry) + 1) {
+                const std::wstring var(entry);
+                const size_t       eq = var.find(L'=');
+                if (var.compare(0, prefix.size(), prefix) == 0 && eq != std::wstring::npos && eq + 1 < var.size()) {
+                    roots.push_back(var.substr(eq + 1));
+                }
+            }
+            FreeEnvironmentStringsW(env);
         }
-        cookie = AddDllDirectory(bin_dir.c_str());
-        if (cookie == nullptr) {
-            GGML_LOG_INFO("%s: AddDllDirectory(%s) failed: %lu\n", __func__, path_str(bin_dir).c_str(), GetLastError());
+
+        std::unordered_set<std::wstring> added;
+        for (const auto & root : roots) {
+            const fs::path  bin_dir = fs::path(root) / L"bin" / L"x64";
+            std::error_code ec;
+            std::wstring    key = bin_dir.lexically_normal().wstring();
+            std::transform(key.begin(), key.end(), key.begin(), ::towlower);
+            if (!fs::is_directory(bin_dir, ec) || !added.insert(key).second) {
+                continue;
+            }
+            if (DLL_DIRECTORY_COOKIE cookie = AddDllDirectory(bin_dir.c_str()); cookie != nullptr) {
+                cookies.push_back(cookie);
+            } else {
+                GGML_LOG_INFO("%s: AddDllDirectory(%s) failed: %lu\n", __func__, path_str(bin_dir).c_str(),
+                              GetLastError());
+            }
+        }
+        if (cookies.empty()) {
+            GGML_LOG_DEBUG(
+                "%s: no CUDA toolkit with bin\\x64 in CUDA_PATH or CUDA_PATH_V*, "
+                "CUDA backend needs a CUDA 13 install\n",
+                __func__);
         }
     }
 
     ~cuda_runtime_dll_directory() {
-        if (cookie != nullptr) {
+        for (DLL_DIRECTORY_COOKIE cookie : cookies) {
             RemoveDllDirectory(cookie);
         }
     }
@@ -531,11 +566,14 @@ class cuda_runtime_dll_directory {
     cuda_runtime_dll_directory & operator=(const cuda_runtime_dll_directory &) = delete;
 
   private:
-    DLL_DIRECTORY_COOKIE cookie = nullptr;
+    std::vector<DLL_DIRECTORY_COOKIE> cookies;
 };
 #endif
 
 static ggml_backend_reg_t ggml_backend_load_best(const char * name, bool silent, const char * user_search_path) {
+    if (ggml_backend_disabled_by_env(name)) {
+        return nullptr;
+    }
 #ifdef _WIN32
     const cuda_runtime_dll_directory cuda_dlls(striequals(name, "cuda"));
 #endif
@@ -566,6 +604,7 @@ static ggml_backend_reg_t ggml_backend_load_best(const char * name, bool silent,
     }
 
     int best_score = 0;
+    bool                                          found_candidate = false;
     fs::path best_path;
     dl_handle_ptr   best_handle;
     std::error_code ec;
@@ -656,7 +695,10 @@ static ggml_backend_reg_t ggml_backend_load_best(const char * name, bool silent,
                 }
             }
         }
+        // A tie keeps the first filename. The arm64 CUDA 13 and CUDA 12 Jetson
+        // modules ship disjoint archs and runtimes, so no device scores on both.
         std::sort(candidates.begin(), candidates.end());
+        found_candidate = found_candidate || !candidates.empty();
         for (const auto & candidate : candidates) {
             tryEntryWithScore(candidate);
         }
@@ -680,8 +722,10 @@ static ggml_backend_reg_t ggml_backend_load_best(const char * name, bool silent,
     }
 
 #ifndef _WIN32
-    // Let the platform loader resolve libraries outside the explicit search paths.
-    if (best_path.empty()) {
+    // Let the platform loader resolve libraries outside the explicit search paths,
+    // only when the search paths had none. A module there that scored 0 was
+    // rejected on purpose, and the loader could resolve to it or a stale copy.
+    if (!found_candidate) {
         // From worst to best
         std::vector<fs::path> names = { name_path };
 #    ifdef __ANDROID__
@@ -774,16 +818,7 @@ void ggml_backend_load_all_from_path(const char * dir_path) {
     ggml_backend_load_best("blas", silent, dir_path);
     ggml_backend_load_best("zendnn", silent, dir_path);
     ggml_backend_load_best("cann", silent, dir_path);
-    // QVAC-23763: the static path above is compiled out of DL builds, so the
-    // check is repeated here for every DL build.
-    //
-    // GGML_DISABLE_VULKAN has no equivalent guard here, so on a DL build it is
-    // a no-op and the two env vars behave differently.
-    if (getenv("GGML_DISABLE_CUDA") == nullptr) {
-        ggml_backend_load_best("cuda", silent, dir_path);
-    } else {
-        GGML_LOG_DEBUG("CUDA backend disabled by GGML_DISABLE_CUDA environment variable\n");
-    }
+    ggml_backend_load_best("cuda", silent, dir_path);
     ggml_backend_load_best("hip", silent, dir_path);
     ggml_backend_load_best("metal", silent, dir_path);
     ggml_backend_load_best("rpc", silent, dir_path);

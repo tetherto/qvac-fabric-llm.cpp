@@ -463,6 +463,12 @@ llama_test(test-cuda-arch-registration NAME test-cuda-arch-registration-virtual)
 set_tests_properties(test-cuda-arch-registration-virtual PROPERTIES
     SKIP_RETURN_CODE 77
     ENVIRONMENT "GGML_CUDA_DEVICES=4")
+# Forces physical device 0 to be skipped: all of a one-GPU host, the mixed
+# skipped-then-kept case on a two-GPU host.
+llama_test(test-cuda-arch-registration NAME test-cuda-arch-registration-skip)
+set_tests_properties(test-cuda-arch-registration-skip PROPERTIES
+    SKIP_RETURN_CODE 77
+    ENVIRONMENT "GGML_CUDA_TEST_SKIP_DEVICES=0")
 
 # QVAC-23763: backend loader checks that need no GPU. Two stub modules stand in
 # for CUDA modules: zero-score rejection, attempted-path dedupe and the
