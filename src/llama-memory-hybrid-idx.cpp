@@ -11,10 +11,7 @@
 
 
 #include <cassert>
-#include <cstdint>
 #include <iterator>
-#include <map>
-#include <set>
 #include <stdexcept>
 
 //
@@ -623,14 +620,14 @@ static std::vector<uint32_t> llama_memory_hybrid_idx_ns(const llama_kv_cache::sl
 // The kpool layout of one ubatch.
 struct llama_memory_hybrid_idx_context::kpool_state {
     struct seq {
+        llama_pos pos_min = 0;
         uint32_t  strm    = 0; // Stream holding this sequence's cells
-        std::vector<std::pair<llama_pos, uint32_t>> cells; // Position and cell pairs, sorted by position. Merged layouts use global cell indices.
+        std::vector<std::pair<llama_pos, uint32_t>> cells; // Position and stream local cell pairs, sorted by position.
         std::vector<uint32_t> pools;
         std::vector<uint8_t>  is_new;
     };
 
     std::vector<seq> seqs;
-    std::vector<uint32_t> token_seq; // Layout used by each token; shared tokens use a merged layout.
 
     uint32_t n_pool_real = 0;
     uint32_t n_new       = 0;
@@ -798,8 +795,8 @@ llama_memory_hybrid_idx_context::kpool_state llama_memory_hybrid_idx_context::kp
             }
         }
     } else {
-        // Sequence IDs need not be stream indices. Resolve every valid ID through the cache mapping.
-        for (llama_seq_id s = 0; s < (llama_seq_id) kv->get_n_seq_ids(); ++s) {
+        // When kv is non unified, one stream per sequence, so streams never share cells. Cell indices stay stream-local.
+        for (llama_seq_id s = 0; s < (llama_seq_id) n_stream_kv; ++s) {
             const auto & cells = kv->get_cells(s);
             if (cells.seq_pos_min(s) < 0) {
                 continue;
@@ -822,10 +819,28 @@ llama_memory_hybrid_idx_context::kpool_state llama_memory_hybrid_idx_context::kp
             std::sort(sq.cells.begin(), sq.cells.end());
         }
 
-        // Group live cells by rank. Edits can leave gaps in positions; grouping only
-        // consecutive positions would strand surviving cells outside pools and the tail.
-        for (size_t j = 0; j + kpool <= sq.cells.size(); j += kpool) {
-            sq.pools.push_back((uint32_t) j);
+        sq.pos_min = sq.cells.front().first;
+
+        // Pools start at the first valid token
+        for (size_t j = 0; j + kpool <= sq.cells.size(); ) {
+            const llama_pos p0 = sq.cells[j].first;
+            if ((p0 - sq.pos_min) % (llama_pos) kpool != 0) {
+                ++j;
+                continue;
+            }
+            bool ok = true;
+            for (uint32_t k = 1; k < kpool; ++k) {
+                if (sq.cells[j + k].first != p0 + (llama_pos) k) {
+                    ok = false;
+                    break;
+                }
+            }
+            if (ok) {
+                sq.pools.push_back((uint32_t) j);
+                j += kpool;
+            } else {
+                ++j;
+            }
         }
 
         st.n_pool_real += (uint32_t) sq.pools.size();
@@ -851,61 +866,11 @@ llama_memory_hybrid_idx_context::kpool_state llama_memory_hybrid_idx_context::kp
     kpool_state st = kpool_build_layout();
 
     const uint32_t kpool = mem->get_kpool();
-    const uint32_t kv_size = mem->get_mem_idx()->get_size();
-
-    // A token can be shared by several sequences in a unified cache. Pool their
-    // union once so shared cells cannot occupy multiple top-k selection slots.
-    st.token_seq.resize(ubatch.n_tokens);
-    std::map<std::vector<llama_seq_id>, uint32_t> merged_layouts;
-    for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
-        GGML_ASSERT(ubatch.n_seq_id[i] > 0);
-        if (ubatch.n_seq_id[i] == 1) {
-            st.token_seq[i] = (uint32_t) ubatch.seq_id[i][0];
-            continue;
-        }
-
-        std::vector<llama_seq_id> ids(ubatch.seq_id[i], ubatch.seq_id[i] + ubatch.n_seq_id[i]);
-        std::sort(ids.begin(), ids.end());
-        ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
-        if (ids.size() == 1) {
-            st.token_seq[i] = (uint32_t) ids[0];
-            continue;
-        }
-        const auto found = merged_layouts.find(ids);
-        if (found != merged_layouts.end()) {
-            st.token_seq[i] = found->second;
-            continue;
-        }
-
-        kpool_state::seq merged;
-        std::set<uint32_t> seen;
-        for (const llama_seq_id id : ids) {
-            GGML_ASSERT(id >= 0 && id < LLAMA_MAX_SEQ);
-            const auto & sq = st.seqs[id];
-            for (const auto & [pos, cell] : sq.cells) {
-                const uint32_t global_cell = sq.strm*kv_size + cell;
-                if (seen.insert(global_cell).second) {
-                    merged.cells.emplace_back(pos, global_cell);
-                }
-            }
-        }
-        std::sort(merged.cells.begin(), merged.cells.end());
-        for (size_t j = 0; j + kpool <= merged.cells.size(); j += kpool) {
-            merged.pools.push_back((uint32_t) j);
-        }
-
-        const uint32_t layout = (uint32_t) st.seqs.size();
-        st.n_pool_real += (uint32_t) merged.pools.size();
-        st.seqs.push_back(std::move(merged));
-        st.token_seq[i] = layout;
-        merged_layouts.emplace(std::move(ids), layout);
-        st.cache_safe = false;
-    }
 
     // Pools touched by this ubatch are re-pooled, shared cells cannot cache sequence relative pools.
     const bool all_new = !st.cache_safe || (mem_idx_stale_batch && i_cur == 0);
 
-    std::vector<std::vector<llama_pos>> upos(st.seqs.size());
+    std::vector<std::vector<llama_pos>> upos(LLAMA_MAX_SEQ);
     if (!all_new) {
         for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
             for (int32_t k = 0; k < ubatch.n_seq_id[i]; ++k) {
@@ -919,7 +884,7 @@ llama_memory_hybrid_idx_context::kpool_state llama_memory_hybrid_idx_context::kp
         }
     }
 
-    for (uint32_t s = 0; s < st.seqs.size(); ++s) {
+    for (llama_seq_id s = 0; s < LLAMA_MAX_SEQ; ++s) {
         auto & sq = st.seqs[s];
 
         sq.is_new.assign(sq.pools.size(), all_new ? 1 : 0);
@@ -935,10 +900,9 @@ llama_memory_hybrid_idx_context::kpool_state llama_memory_hybrid_idx_context::kp
 
         for (size_t pi = 0; pi < sq.pools.size(); ++pi) {
             const llama_pos p0 = sq.cells[sq.pools[pi]].first;
-            const llama_pos p1 = sq.cells[sq.pools[pi] + kpool - 1].first;
 
             auto it = std::lower_bound(up.begin(), up.end(), p0);
-            if (it != up.end() && *it <= p1) {
+            if (it != up.end() && *it < p0 + (llama_pos) kpool) {
                 sq.is_new[pi] = 1;
                 st.n_new++;
             }
@@ -1027,9 +991,11 @@ void llama_memory_hybrid_idx_context::set_input_kpool(ggml_tensor * pool_cells, 
     };
 
     // Sequences present in this ubatch, pools of absent sequences must fall on the scatter sentinel row.
-    std::vector<uint8_t> seq_in_ub(st.seqs.size(), 0);
+    std::vector<uint8_t> seq_in_ub(LLAMA_MAX_SEQ, 0);
     for (uint32_t i = 0; i < n_tokens; ++i) {
-        seq_in_ub[st.token_seq[i]] = 1;
+        for (int32_t k = 0; k < ubatch->n_seq_id[i]; ++k) {
+            seq_in_ub[ubatch->seq_id[i][k]] = 1;
+        }
     }
 
     // Use the first ubatch cell for padded gathers.
@@ -1060,7 +1026,7 @@ void llama_memory_hybrid_idx_context::set_input_kpool(ggml_tensor * pool_cells, 
     }
 
     // pools are laid out per sequence
-    std::vector<uint32_t>  seq_pool_start(st.seqs.size(), 0);
+    std::vector<uint32_t>  seq_pool_start(LLAMA_MAX_SEQ, 0);
     std::vector<llama_pos> pool_end;
     pool_end.reserve(n_pool);
 
@@ -1070,7 +1036,7 @@ void llama_memory_hybrid_idx_context::set_input_kpool(ggml_tensor * pool_cells, 
     int64_t * nrep  = new_pool_rep != nullptr ? (int64_t *) new_pool_rep->data : nullptr;
 
     uint32_t i_new = 0;
-    for (uint32_t s = 0; s < st.seqs.size(); ++s) {
+    for (llama_seq_id s = 0; s < LLAMA_MAX_SEQ; ++s) {
         const auto & sq = st.seqs[s];
         seq_pool_start[s] = (uint32_t) pool_end.size();
 
@@ -1123,14 +1089,14 @@ void llama_memory_hybrid_idx_context::set_input_kpool(ggml_tensor * pool_cells, 
         }
     }
 
-    // A shared token selects from its deduplicated union layout.
+    // a pool is visible when it belongs to the token's sequence and ends at or before it
     auto fill_mask = [&](auto * data) {
         using T = std::remove_pointer_t<decltype(data)>;
         const T keep = llama_cast<T>(0.0f);
         const T drop = llama_cast<T>(-INFINITY);
 
         for (uint32_t i = 0; i < n_tokens; ++i) {
-            const uint32_t     s = st.token_seq[i];
+            const llama_seq_id s = ubatch->seq_id[i][0];
             const llama_pos    p = ubatch->pos[i];
 
             T * row = data + (size_t) i*n_pool;
@@ -1158,21 +1124,22 @@ void llama_memory_hybrid_idx_context::set_input_kpool(ggml_tensor * pool_cells, 
 
     int32_t * tidx = (int32_t *) tail_idxs->data;
     for (uint32_t i = 0; i < n_tokens; ++i) {
-        const uint32_t     s = st.token_seq[i];
+        const llama_seq_id s = ubatch->seq_id[i][0];
         const llama_pos    p = ubatch->pos[i];
         const auto & sq = st.seqs[s];
 
-        const auto visible_end = std::upper_bound(sq.cells.begin(), sq.cells.end(), std::make_pair(p, UINT32_MAX));
-        const size_t n_visible = (size_t) (visible_end - sq.cells.begin());
-        const uint32_t n_tail = (uint32_t) (n_visible % kpool);
+        const uint32_t n_tail = (uint32_t) ((p - sq.pos_min + 1) % (llama_pos) kpool);
 
         for (uint32_t k = 0; k < kpool - 1; ++k) {
             int32_t cell = sentinel;
             bool    real = false;
             if (k < n_tail) {
-                const uint32_t idx = sq.cells[n_visible - 1 - k].second;
-                cell = (int32_t) (gather ? gcell(sq, idx) : (int64_t) idx);
-                real = true;
+                const llama_pos pt = p - (llama_pos) k;
+                auto it = std::lower_bound(sq.cells.begin(), sq.cells.end(), std::make_pair(pt, 0u));
+                if (it != sq.cells.end() && it->first == pt) {
+                    cell = (int32_t) (gather ? gcell(sq, it->second) : (int64_t) it->second);
+                    real = true;
+                }
             }
             tidx[(size_t) i*(kpool - 1) + k] = cell;
 

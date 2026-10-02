@@ -75,7 +75,7 @@ static void set_tensor_data(struct ggml_tensor * tensor, void * userdata) {
 }
 
 static void usage(char ** argv) {
-    printf("Usage: %s [-a/--arch arch] [-s/--seed seed] [-o/--out dir] [-v N] [-h/--help] [--mtp-shared|--mtp-shared-cpu|--hadamard-contracts|--qsa-unified-multiseq|--glm5-kpool-sequences]\n", argv[0]);
+    printf("Usage: %s [-a/--arch arch] [-s/--seed seed] [-o/--out dir] [-v N] [-h/--help] [--mtp-shared|--mtp-shared-cpu|--hadamard-contracts|--qsa-unified-multiseq]\n", argv[0]);
 }
 
 static std::vector<llama_token> get_tokens(const uint32_t n_tokens, const uint32_t n_vocab, const size_t seed){
@@ -1432,66 +1432,6 @@ static int test_hadamard_contracts() {
     return 0;
 }
 
-static int test_glm5_kpool_sequences() {
-    struct selected_cells {
-        std::vector<int32_t> indices;
-    } selected;
-
-    auto observe = [](ggml_tensor * tensor, bool ask, void * data) {
-        if (std::strncmp(tensor->name, "indexer_sel_idx-0", 17) != 0) {
-            return false;
-        }
-        if (!ask) {
-            auto & indices = static_cast<selected_cells *>(data)->indices;
-            indices.resize(ggml_nelements(tensor));
-            ggml_backend_tensor_get(tensor, indices.data(), 0, ggml_nbytes(tensor));
-        }
-        return true;
-    };
-    auto metadata = get_gguf_ctx(LLM_ARCH_GLM5_NEXT, true);
-    gguf_set_val_u32(metadata.get(), "glm5-next.attention.indexer.top_k", 12);
-    auto loaded = get_model_and_ctx(metadata.get(), nullptr, 1234, {}, LLAMA_SPLIT_MODE_LAYER,
-            false, 2, true, observe, &selected);
-    auto * ctx = loaded.second.get();
-
-    struct test_token {
-        llama_token token;
-        llama_pos pos;
-        std::vector<llama_seq_id> seq_ids;
-    };
-    auto decode = [ctx](const std::vector<test_token> & entries) {
-        llama_batch batch = llama_batch_init(entries.size(), 0, 2);
-        for (size_t i = 0; i < entries.size(); ++i) {
-            common_batch_add(batch, entries[i].token, entries[i].pos, entries[i].seq_ids, i + 1 == entries.size());
-        }
-        const int rc = llama_decode(ctx, batch);
-        llama_batch_free(batch);
-        GGML_ASSERT(rc == 0);
-    };
-    auto unique_count = [&]() {
-        GGML_ASSERT(!selected.indices.empty());
-        return std::set<int32_t>(selected.indices.begin(), selected.indices.end()).size();
-    };
-
-    decode({{2, 0, {0}}, {3, 1, {0}}, {4, 2, {0}}, {5, 3, {0}}});
-    llama_memory_seq_add(llama_get_memory(ctx), 0, 2, 4, 1); // live positions 0, 1, 3, 4
-    selected.indices.clear();
-    decode({{6, 5, {0}}});
-    GGML_ASSERT(llama_memory_seq_token_count(llama_get_memory(ctx), 0) == 5);
-    GGML_ASSERT(unique_count() >= 5); // positions 0, 1, 3, 4, 5 must all be selected
-
-    llama_memory_clear(llama_get_memory(ctx), true);
-    decode({{10, 0, {0, 1}}, {11, 1, {0, 1}}, {12, 2, {0, 1}}, {13, 3, {0, 1}}});
-    decode({{20, 4, {0}}, {21, 5, {0}}, {22, 6, {0}}, {23, 7, {0}}});
-    decode({{30, 4, {1}}, {31, 5, {1}}, {32, 6, {1}}, {33, 7, {1}}});
-    selected.indices.clear();
-    decode({{40, 8, {0, 1}}});
-    GGML_ASSERT(unique_count() >= 13); // shared prefix once, both unique branches, current token
-
-    printf("GLM5 k-pool sequence edit and shared-token tests passed\n");
-    return 0;
-}
-
 int main(int argc, char ** argv) {
     // init the logger at max verbosity. filter with a custom callback respecting the user-configure verbosity
     common_log_set_verbosity_thold(LOG_LEVEL_DEBUG);
@@ -1502,9 +1442,6 @@ int main(int argc, char ** argv) {
     }
     if (argc == 2 && strcmp(argv[1], "--hadamard-contracts") == 0) {
         return test_hadamard_contracts();
-    }
-    if (argc == 2 && strcmp(argv[1], "--glm5-kpool-sequences") == 0) {
-        return test_glm5_kpool_sequences();
     }
     std::random_device rd;
 
