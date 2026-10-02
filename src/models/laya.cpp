@@ -260,7 +260,7 @@ llama_model_laya::graph::graph(const llama_model & model, const llm_graph_params
         ggml_build_forward_expand(gf, Kcur);
         ggml_build_forward_expand(gf, Vcur);
 
-        cur = build_attn_mha(Qcur, Kcur, Vcur, nullptr, inp_attn->get_kq_mask(), nullptr, nullptr,
+        cur = build_attn_mha(Qcur, Kcur, Vcur, nullptr, inp_attn->get_kq_mask(), nullptr, nullptr, 0,
                 1.0f/sqrtf(float(n_embd_head)), il);
         cb(cur, "decision_kqv_out", il);
 
