@@ -356,7 +356,18 @@ ggml_tensor * llama_model_dflash::graph_base::build_inp_tokens() {
 ggml_tensor * llama_model_dflash::graph_base::build_layers(ggml_tensor * inp_tokens) {
     const float kq_scale = hparams.f_attention_scale != 0.0f ? hparams.f_attention_scale : 1.0f/sqrtf(float(n_embd_head));
 
-    ggml_tensor * inpL = ggml_get_rows(ctx0, get_tok_embd(*this, model), inp_tokens);
+    ggml_tensor * tok_embd = get_tok_embd(*this, model);
+    ggml_tensor * inpL = ggml_get_rows(ctx0, tok_embd, inp_tokens);
+
+    // a Hadamard-latent table (also the target's, borrowed) stores rotated rows; restore the primal basis
+    if (hdmd) {
+        if (const auto it = hdmd->inv.find(tok_embd); it != hdmd->inv.end()) {
+            inpL = llama_mul_mat_hadamard(ctx0, inpL, it->second.rot);
+            if (it->second.signs) {
+                inpL = ggml_mul(ctx0, inpL, it->second.signs);
+            }
+        }
+    }
     if (hparams.f_embedding_scale != 0.0f) {
         inpL = ggml_scale(ctx0, inpL, hparams.f_embedding_scale);
     }
