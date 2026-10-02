@@ -314,11 +314,11 @@ void llama_memory_hybrid_idx::state_drop(llama_seq_id seq_id) {
         return;
     }
 
-    get_mem_attn()->state_clear(seq_id);
+    get_mem_attn()->seq_rm(seq_id, -1, -1);
     get_mem_recr()->seq_rm(seq_id, -1, -1);
 
     if (mem_idx) {
-        mem_idx->state_clear(seq_id);
+        mem_idx->seq_rm(seq_id, -1, -1);
         mem_idx_stale_set(seq_id, 0);
         // clearing this sequence can end a sharing the survivor would otherwise keep flagged (see seq_rm)
         if (kpool_layout_shared()) {
