@@ -1686,6 +1686,36 @@ json server_task_result_apply_lora::to_json() {
 }
 
 //
+// server_checkpoint_pool
+//
+std::list<common_prompt_checkpoint>::iterator server_checkpoint_pool::discard(
+        std::list<common_prompt_checkpoint> & checkpoints,
+        std::list<common_prompt_checkpoint>::iterator it) {
+    auto next = std::next(it);
+    spare.splice(spare.end(), checkpoints, it);
+    return next;
+}
+
+common_prompt_checkpoint & server_checkpoint_pool::add(std::list<common_prompt_checkpoint> & checkpoints) {
+    if (spare.empty()) {
+        return checkpoints.emplace_back();
+    }
+
+    checkpoints.splice(checkpoints.end(), spare, spare.begin());
+
+    // the speculative state is optional, a stale one must not be restored with the new checkpoint
+    auto & cur = checkpoints.back();
+    cur.id_task = -1;
+    cur.data_spec.clear();
+
+    return cur;
+}
+
+void server_checkpoint_pool::clear() {
+    spare.clear();
+}
+
+//
 // server_prompt_cache
 //
 size_t server_prompt_cache::size() const {

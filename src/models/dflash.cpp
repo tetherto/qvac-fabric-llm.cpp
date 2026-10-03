@@ -135,7 +135,9 @@ void llama_model_dflash::load_arch_tensors(llama_model_loader &) {
         if (n_embd % hparams.dflash_conv_group_size != 0) {
             throw std::runtime_error("DFlash2 hidden size must be divisible by conv_group_size");
         }
-        if (n_embd < hparams.dflash_selector_top_k * (hparams.dflash_selector_top_k + 1)) {
+        // exact in uint64 for any uint32 top_k; int64 overflows at UINT32_MAX
+        const uint64_t top_k = hparams.dflash_selector_top_k;
+        if ((uint64_t) n_embd < top_k * (top_k + 1)) {
             throw std::runtime_error("DFlash2 hidden size is too small for the selector lattice");
         }
 
