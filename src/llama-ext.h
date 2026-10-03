@@ -107,6 +107,15 @@ LLAMA_API float * llama_get_embeddings_nextn(struct llama_context * ctx);
 // LLAMA_API float * llama_get_embeddings_ith(struct llama_context * ctx, int32_t i);
 LLAMA_API float * llama_get_embeddings_nextn_ith(struct llama_context * ctx, int32_t i);
 
+// Reuse the first MTP step's sparse attention selection at later draft steps.
+LLAMA_API bool llama_set_mtp_dsa_index_share(struct llama_context * ctx, bool enabled);
+LLAMA_API bool llama_set_mtp_dsa_capture(struct llama_context * ctx, bool enabled);
+// Nonempty selections require the row width and one unique sequence ID per row.
+// nullptr/0 clears the selection; malformed shapes return false.
+LLAMA_API bool llama_set_mtp_dsa_selection(struct llama_context * ctx, const int32_t * data, size_t size, size_t width = 0, const llama_seq_id * seq_ids = nullptr);
+// Optional sequence IDs describe the captured row order, which can differ from input order.
+LLAMA_API const int32_t * llama_get_mtp_dsa_selection(struct llama_context * ctx, size_t * size, const llama_seq_id ** seq_ids = nullptr);
+
 // Set whether the context outputs the input embeddings of a specific layer
 LLAMA_API void llama_set_embeddings_layer_inp(struct llama_context * ctx, uint32_t lid, bool value);
 

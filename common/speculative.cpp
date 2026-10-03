@@ -1316,6 +1316,13 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     std::vector<int>                i_last;
     std::vector<std::vector<float>> chain_h;
 
+    bool dsa_index_share = false;
+    size_t dsa_sel_width = 0;
+    std::vector<std::vector<int32_t>> dsa_sel;
+    std::vector<int32_t> dsa_sel_batch;
+    size_t dsa_captures = 0;
+    size_t dsa_staged_steps = 0;
+
     common_speculative_impl_draft_mtp(const common_params_speculative & params, uint32_t n_seq)
         : common_speculative_impl(COMMON_SPECULATIVE_TYPE_DRAFT_MTP, n_seq)
         , params(params.draft)
@@ -1328,6 +1335,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         GGML_ASSERT(n_embd == llama_model_n_embd_out(llama_get_model(ctx_tgt)) &&
                 "MTP input row width must match the target h_nextn width");
         n_mtp_layers = std::max(1, (int) llama_model_n_layer_nextn(llama_get_model(ctx_dft)));
+        dsa_index_share = llama_set_mtp_dsa_index_share(ctx_dft, true);
+        if (dsa_index_share) {
+            dsa_sel.resize(n_seq);
+        }
 
         SPC_TRC("%s", "adding speculative implementation 'draft-mtp'\n");
         SPC_TRC("- n_max=%d, n_min=%d, p_min=%.2f, n_embd=%d, backend_sampling=%d\n", this->params.n_max, this->params.n_min, this->params.p_min, n_embd, (int) this->params.backend_sampling);
@@ -1395,10 +1406,14 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         verify_h.assign(n_seq, {});
         verify_h_rows.assign(n_seq, 0);
+        SPC_TRC("- dsa_index_share=%d\n", (int) dsa_index_share);
     }
 
     ~common_speculative_impl_draft_mtp() override {
         auto * ctx_dft = this->params.ctx_dft;
+        if (dsa_index_share) {
+            SPC_TRC("- dsa_index_share: captures=%zu, staged_steps=%zu\n", dsa_captures, dsa_staged_steps);
+        }
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) backend_chains.size(); ++seq_id) {
             if (backend_chains[seq_id] == nullptr) {
                 continue;
@@ -1410,11 +1425,80 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         }
         backend_chains.clear();
 
+        if (dsa_index_share && ctx_dft != nullptr) {
+            llama_set_mtp_dsa_index_share(ctx_dft, false);
+        }
+
         if (batch.token != nullptr) {
             free(batch.token);
             batch.token = nullptr;
         }
         llama_batch_free(batch);
+    }
+
+    void reset_dsa_index_share() {
+        if (!dsa_index_share) {
+            return;
+        }
+        llama_set_mtp_dsa_capture(params.ctx_dft, false);
+        llama_set_mtp_dsa_selection(params.ctx_dft, nullptr, 0);
+        dsa_sel_width = 0;
+        dsa_sel_batch.clear();
+        for (auto & row : dsa_sel) {
+            row.clear();
+        }
+    }
+
+    bool capture_dsa_index_share(const llama_batch & current) {
+        size_t n = 0;
+        const llama_seq_id * captured_seqs = nullptr;
+        const int32_t * sel = llama_get_mtp_dsa_selection(params.ctx_dft, &n, &captured_seqs);
+        if (sel == nullptr || current.n_tokens <= 0 || n == 0 || n % (size_t) current.n_tokens != 0) {
+            return false;
+        }
+        const size_t width = n / (size_t) current.n_tokens;
+        for (auto & row : dsa_sel) {
+            row.clear();
+        }
+        for (int32_t k = 0; k < current.n_tokens; ++k) {
+            if (current.n_seq_id[k] != 1) {
+                return false;
+            }
+            const llama_seq_id seq_id = captured_seqs[k];
+            if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq || !dsa_sel[seq_id].empty()) {
+                return false;
+            }
+            dsa_sel[seq_id].resize(width);
+            std::memcpy(dsa_sel[seq_id].data(), sel + (size_t) k*width, width*sizeof(int32_t));
+        }
+        dsa_sel_width = width;
+        ++dsa_captures;
+        return true;
+    }
+
+    bool stage_dsa_index_share(const llama_batch & current) {
+        if (dsa_sel_width == 0 || current.n_tokens <= 0) {
+            return false;
+        }
+        dsa_sel_batch.resize(dsa_sel_width*(size_t) current.n_tokens);
+        for (int32_t k = 0; k < current.n_tokens; ++k) {
+            if (current.n_seq_id[k] != 1) {
+                return false;
+            }
+            const llama_seq_id seq_id = current.seq_id[k][0];
+            if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq || dsa_sel[seq_id].size() != dsa_sel_width) {
+                return false;
+            }
+            std::copy(dsa_sel[seq_id].begin(), dsa_sel[seq_id].end(), dsa_sel_batch.begin() + (size_t) k*dsa_sel_width);
+        }
+        std::vector<llama_seq_id> seq_ids(current.n_tokens);
+        for (int32_t k = 0; k < current.n_tokens; ++k) {
+            seq_ids[k] = current.seq_id[k][0];
+        }
+        const bool staged = llama_set_mtp_dsa_selection(params.ctx_dft, dsa_sel_batch.data(), dsa_sel_batch.size(),
+                dsa_sel_width, seq_ids.data());
+        dsa_staged_steps += staged;
+        return staged;
     }
 
     void begin(llama_seq_id seq_id, const llama_tokens & prompt) override {
@@ -1466,6 +1550,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         auto * ctx_tgt = this->params.ctx_tgt;
         auto * ctx_dft = this->params.ctx_dft;
+
+        reset_dsa_index_share();
 
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
 
@@ -1565,6 +1651,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     void draft(common_speculative_draft_params_vec & dparams) override {
         auto & ctx_dft = params.ctx_dft;
 
+        reset_dsa_index_share();
+
         common_batch_clear(batch);
 
         // keep track of which sequences are still drafting
@@ -1613,10 +1701,29 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 llama_set_nextn_layer_offset(ctx_dft, i);
             }
 
+            // The head rewind can clear staged cache state, so stage after it.
+            if (dsa_index_share && i > 0 && dsa_sel_width > 0 && !stage_dsa_index_share(batch)) {
+                SPC_TRC("%s", "DSA index sharing fallback: incompatible draft batch; recomputing indexer\n");
+                reset_dsa_index_share();
+            }
+
+            if (dsa_index_share && i == 0) {
+                llama_set_mtp_dsa_capture(ctx_dft, true);
+            }
+
             int ret = llama_decode(ctx_dft, batch);
             if (ret != 0) {
                 SPC_ERR("llama_decode[%d] returned %d\n", i, ret);
                 break;
+            }
+
+            if (dsa_index_share && i == 0) {
+                const bool captured = capture_dsa_index_share(batch);
+                llama_set_mtp_dsa_capture(ctx_dft, false);
+                if (!captured) {
+                    SPC_TRC("%s", "DSA index sharing fallback: capture unavailable; recomputing indexer\n");
+                    reset_dsa_index_share();
+                }
             }
 
             // rebuild the batch for the next step: the growing-KV paths re-add only the
@@ -1696,6 +1803,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
             ++i;
         }
+
+        reset_dsa_index_share();
 
         if (chain_heads) {
             llama_set_nextn_layer_offset(ctx_dft, 0); // restore default for non-draft decodes

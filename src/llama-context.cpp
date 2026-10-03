@@ -7,6 +7,7 @@
 #include "llama-batch.h"
 #include "llama-io.h"
 #include "llama-memory.h"
+#include "llama-memory-hybrid-idx.h"
 #include "llama-mmap.h"
 #include "llama-moe-cache.h"
 #include "llama-model.h"
@@ -1141,6 +1142,89 @@ float * llama_context::get_embeddings_nextn_ith(int32_t i) {
     }
 }
 
+bool llama_context::set_mtp_dsa_index_share(bool enabled) {
+    if (model.arch != LLM_ARCH_GLM5_NEXT || cparams.ctx_type != LLAMA_CONTEXT_TYPE_MTP || memory == nullptr) {
+        return false;
+    }
+    enabled = enabled && model.hparams.indexer_index_share_mtp;
+    auto * mem = static_cast<llama_memory_hybrid_idx *>(memory.get());
+    if (mem->get_mtp_dsa_index_share() != enabled) {
+        mem->set_mtp_dsa_index_share(enabled);
+        sched_need_reserve = true;
+    }
+    if (!enabled) {
+        mtp_dsa_capture = false;
+    }
+    return enabled;
+}
+
+bool llama_context::set_mtp_dsa_capture(bool enabled) {
+    if (model.arch != LLM_ARCH_GLM5_NEXT || cparams.ctx_type != LLAMA_CONTEXT_TYPE_MTP || memory == nullptr) {
+        return false;
+    }
+    auto * mem = static_cast<llama_memory_hybrid_idx *>(memory.get());
+    mtp_dsa_capture = enabled && mem->get_mtp_dsa_index_share();
+    return mtp_dsa_capture;
+}
+
+bool llama_context::set_mtp_dsa_selection(const int32_t * data, size_t size, size_t width, const llama_seq_id * seq_ids) {
+    if (model.arch != LLM_ARCH_GLM5_NEXT || cparams.ctx_type != LLAMA_CONTEXT_TYPE_MTP || memory == nullptr) {
+        return false;
+    }
+    auto * mem = static_cast<llama_memory_hybrid_idx *>(memory.get());
+    if (!mem->get_mtp_dsa_index_share()) {
+        return false;
+    }
+    return mem->set_mtp_dsa_selection(data, size, width, seq_ids);
+}
+
+const int32_t * llama_context::get_mtp_dsa_selection(size_t * size, const llama_seq_id ** seq_ids) {
+    if (seq_ids != nullptr) {
+        *seq_ids = nullptr;
+    }
+    if (size != nullptr) {
+        *size = 0;
+    }
+    if (mtp_dsa_sel_invalid || mtp_dsa_sel_raw.empty() || mtp_dsa_sel_raw.size() != mtp_dsa_sel_mask.size() ||
+            mtp_dsa_sel_width == 0 || mtp_dsa_sel_raw.size() != mtp_dsa_sel_width*mtp_dsa_sel_seq.size() ||
+            mtp_dsa_sel_gather.size() != mtp_dsa_sel_seq.size()) {
+        return nullptr;
+    }
+
+    auto * mem = static_cast<llama_memory_hybrid_idx *>(memory.get());
+    const auto * idx = mem->get_mem_idx();
+    const int64_t kv_size = idx->get_size();
+    mtp_dsa_sel.resize(mtp_dsa_sel_raw.size());
+    for (size_t row = 0; row < mtp_dsa_sel_seq.size(); ++row) {
+        const llama_seq_id seq_id = mtp_dsa_sel_seq[row];
+        if (seq_id < 0) {
+            return nullptr;
+        }
+        const auto & cells = idx->get_cells(seq_id);
+        const int64_t stream_base = mtp_dsa_sel_gather[row] ? (int64_t) idx->get_stream(seq_id)*kv_size : 0;
+        for (size_t j = 0; j < mtp_dsa_sel_width; ++j) {
+            const size_t i = row*mtp_dsa_sel_width + j;
+            if (mtp_dsa_sel_mask[i] != 0.0f) {
+                mtp_dsa_sel[i] = -1;
+                continue;
+            }
+            const int64_t cell = (int64_t) mtp_dsa_sel_raw[i] - stream_base;
+            if (cell < 0 || (uint64_t) cell >= cells.size() || cells.is_empty((uint32_t) cell) ||
+                    !cells.seq_has((uint32_t) cell, seq_id)) {
+                return nullptr;
+            }
+            mtp_dsa_sel[i] = cells.pos_get((uint32_t) cell);
+        }
+    }
+    if (size != nullptr) {
+        *size = mtp_dsa_sel.size();
+    }
+    if (seq_ids != nullptr) {
+        *seq_ids = mtp_dsa_sel_seq.data();
+    }
+    return mtp_dsa_sel.data();
+}
+
 float * llama_context::get_embeddings_layer_inp(uint32_t lid) {
     output_reorder();
 
@@ -1899,6 +1983,17 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
     output_swaps.clear();
 
+    if (!mtp_dsa_sel_raw.empty()) {
+        synchronize();
+    }
+    mtp_dsa_sel_raw.clear();
+    mtp_dsa_sel_mask.clear();
+    mtp_dsa_sel_seq.clear();
+    mtp_dsa_sel.clear();
+    mtp_dsa_sel_width = 0;
+    mtp_dsa_sel_gather.clear();
+    mtp_dsa_sel_invalid = false;
+
     sched_reserve();
 
     bool did_optimize = false;
@@ -2027,6 +2122,45 @@ int llama_context::decode(const llama_batch & batch_inp) {
         auto * t_logits  = res->get_logits();
         auto * t_embd    = cparams.embeddings       ? res->get_embd()     : nullptr;
         auto * t_h_nextn = cparams.embeddings_nextn ? res->get_h_nextn()  : nullptr;
+
+        auto * t_mtp_sel  = res->get_mtp_dsa_sel();
+        auto * t_mtp_mask = res->get_mtp_dsa_mask();
+        if (mtp_dsa_capture && !mtp_dsa_sel_invalid && (t_mtp_sel != nullptr || t_mtp_mask != nullptr)) {
+            GGML_ASSERT(t_mtp_sel != nullptr && t_mtp_mask != nullptr);
+            GGML_ASSERT(t_mtp_sel->type == GGML_TYPE_I32 && t_mtp_mask->type == GGML_TYPE_F32);
+            GGML_ASSERT(ggml_is_contiguous(t_mtp_sel) && ggml_is_contiguous(t_mtp_mask));
+            GGML_ASSERT(t_mtp_sel->ne[0] == t_mtp_mask->ne[0] && t_mtp_sel->ne[1] == (int64_t) ubatch.n_tokens);
+            GGML_ASSERT(ggml_nelements(t_mtp_sel) == ggml_nelements(t_mtp_mask));
+
+            const size_t width = (size_t) t_mtp_sel->ne[0];
+            if (mtp_dsa_sel_width == 0) {
+                mtp_dsa_sel_width = width;
+                mtp_dsa_sel_raw.resize(width*n_tokens_all);
+                mtp_dsa_sel_mask.resize(width*n_tokens_all);
+                mtp_dsa_sel_seq.resize(n_tokens_all, -1);
+                mtp_dsa_sel_gather.resize(n_tokens_all, 0);
+            }
+            if (width != mtp_dsa_sel_width) {
+                // Different pool widths cannot be combined into one reusable selection.
+                mtp_dsa_sel_invalid = true;
+            } else {
+                for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+                    if (ubatch.n_seq_id[i] != 1) {
+                        mtp_dsa_sel_invalid = true;
+                        break;
+                    }
+                    mtp_dsa_sel_seq[(size_t) n_tokens_prev + i] = ubatch.seq_id[i][0];
+                    mtp_dsa_sel_gather[(size_t) n_tokens_prev + i] = res->get_mtp_dsa_gather();
+                }
+
+                const size_t offset = width*(size_t) n_tokens_prev;
+                ggml_backend_t backend_sel = ggml_backend_sched_get_tensor_backend(sched.get(), t_mtp_sel);
+                ggml_backend_t backend_mask = ggml_backend_sched_get_tensor_backend(sched.get(), t_mtp_mask);
+                GGML_ASSERT(backend_sel != nullptr && backend_mask != nullptr);
+                ggml_backend_tensor_get_async(backend_sel, t_mtp_sel, mtp_dsa_sel_raw.data() + offset, 0, ggml_nbytes(t_mtp_sel));
+                ggml_backend_tensor_get_async(backend_mask, t_mtp_mask, mtp_dsa_sel_mask.data() + offset, 0, ggml_nbytes(t_mtp_mask));
+            }
+        }
 
         if (t_embd && res->get_embd_pooled()) {
             t_embd = res->get_embd_pooled();
@@ -4220,6 +4354,32 @@ float * llama_get_embeddings_nextn_ith(llama_context * ctx, int32_t i) {
     ctx->synchronize();
 
     return ctx->get_embeddings_nextn_ith(i);
+}
+
+bool llama_set_mtp_dsa_index_share(llama_context * ctx, bool enabled) {
+    return ctx != nullptr && ctx->set_mtp_dsa_index_share(enabled);
+}
+
+bool llama_set_mtp_dsa_capture(llama_context * ctx, bool enabled) {
+    return ctx != nullptr && ctx->set_mtp_dsa_capture(enabled);
+}
+
+bool llama_set_mtp_dsa_selection(llama_context * ctx, const int32_t * data, size_t size, size_t width, const llama_seq_id * seq_ids) {
+    return ctx != nullptr && ctx->set_mtp_dsa_selection(data, size, width, seq_ids);
+}
+
+const int32_t * llama_get_mtp_dsa_selection(llama_context * ctx, size_t * size, const llama_seq_id ** seq_ids) {
+    if (seq_ids != nullptr) {
+        *seq_ids = nullptr;
+    }
+    if (ctx == nullptr) {
+        if (size != nullptr) {
+            *size = 0;
+        }
+        return nullptr;
+    }
+    ctx->synchronize();
+    return ctx->get_mtp_dsa_selection(size, seq_ids);
 }
 
 float * llama_get_embeddings_layer_inp(llama_context * ctx, uint32_t lid) {
