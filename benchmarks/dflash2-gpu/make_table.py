@@ -12,6 +12,8 @@ import statistics
 from pathlib import Path
 from urllib.parse import quote
 
+from manifest import runtime_fingerprint
+
 BASE_SHA = "20e89b5a0b87f9f79e640e0bc3e209b9e192bc52"
 TF_SHA = "6ea5ade26c4335491c50275af0be32b81f75f525"
 MODEL_SHA = "ede16c7b36e578ca87a8c70e011e4b4633a32c831c0ce76d0f474582384e671d"
@@ -133,6 +135,17 @@ def validate_config(data: dict, arm: str, lane_id: str, index: dict, root: Path)
     require(isinstance(manifest.get("command"), list) and manifest["command"], "missing exact launch command")
     require(positive(manifest.get("created_unix_s")), "missing launch timestamp")
     require(isinstance(manifest.get("environment"), dict), "missing backend environment")
+    if not tf:
+        artifacts = manifest.get("runtime_artifacts")
+        require(isinstance(artifacts, dict) and artifacts, "missing executable/shared-library identities")
+        require(all(isinstance(name, str) and isinstance(item, dict) and digest(item.get("sha256"))
+                    and isinstance(item.get("path"), str) and item["path"]
+                    for name, item in artifacts.items()), "invalid runtime artifact identity")
+        launcher = Path(manifest["command"][0]).name
+        require(artifacts.get(launcher, {}).get("sha256") == manifest["binary_sha256"],
+                "runtime launcher identity mismatch")
+        require(manifest.get("runtime_sha256") == runtime_fingerprint(artifacts),
+                "runtime fingerprint mismatch")
     source = TF_SHA if tf else index["baseline_sha" if arm.endswith("base") else "candidate_sha"]
     require(config["source_sha"] == source, "source pin mismatch")
     require(config["fixture_sha256"] == data["provenance"].get("fixture_sha256") == FIXTURE_SHA, "fixture hash mismatch")
@@ -260,8 +273,9 @@ def comparable(records: list[dict], cross_engine: bool = False) -> None:
             else:
                 require(left["request"] == right["request"], "paired request mismatch")
     for arm in {r["arm"] for r in records}:
-        binaries = {r["data"]["provenance"]["manifest"]["binary_sha256"] for r in records if r["arm"] == arm}
-        require(len(binaries) == 1, "mixed binaries within an arm")
+        identity_key = "binary_sha256" if arm == "tf" else "runtime_sha256"
+        binaries = {r["data"]["provenance"]["manifest"][identity_key] for r in records if r["arm"] == arm}
+        require(len(binaries) == 1, "mixed executable/shared-library runtimes within an arm")
         if cross_engine:
             same_arm = [r for r in records if r["arm"] == arm]
             comparable(same_arm)

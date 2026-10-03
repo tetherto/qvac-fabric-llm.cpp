@@ -77,6 +77,10 @@ The complete `text` must be present and its UTF-8 SHA256 must equal `text_sha256
 
 `provenance.manifest` must contain matching `label`, `device`, `backend`, `draft_width`, a full `binary_sha256`, exact `command` array, `environment` object, and positive `created_unix_s` recording the distinct server launch. The client and canonical fixture hashes must be present in `provenance.client_sha256` and `provenance.fixture_sha256`. Different client revisions cannot be paired. A launch timestamp is recorded evidence of orchestration, not a substitute for actually restarting the server.
 
+Fabric also requires `runtime_artifacts`, mapping the executable and resolved build-directory shared-library names to `{path, sha256}`, and `runtime_sha256`, the SHA256 of the sorted compact JSON name-to-hash map. Each arm must keep this entire runtime identity fixed across its blocks: changing a backend shared library can leave the `llama-server` launcher hash unchanged. Symlink aliases are deduplicated.
+
+Loader overrides (`LD_LIBRARY_PATH`, `LD_PRELOAD`, `DYLD_LIBRARY_PATH`, `DYLD_INSERT_LIBRARIES`) are recorded. Build-file hashes do not by themselves prove which paths the loader chose; retain matching runtime canary evidence. Older artifacts without this proof remain provisional and are not rewritten.
+
 The parent normalizes verified startup/build logs into `provenance.manifest.lane.report_config`. This explicit schema avoids guessing among staging-host manifest variants. Missing proof withholds the comparison; it is never silently inferred from a model name or requested flag. Preserve the original manifest and logs. Example Fabric speculative config:
 
 ```json

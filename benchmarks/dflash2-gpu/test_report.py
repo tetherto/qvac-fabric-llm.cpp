@@ -39,6 +39,12 @@ def make_result(lane_id, arm, label, timestamp, pp: float = 100, tg: float = 10)
                 "lane": {"report_config": config, "runtime_evidence": runtime}, "draft_width": 0 if arm.startswith("serial_") else 7,
                 "binary_sha256": ("b" if arm.endswith("base") else "c") * 64,
                 "command": ["/fixture/llama-server", "-c", "16384"], "environment": {}, "created_unix_s": timestamp}
+    manifest["runtime_artifacts"] = {
+        "llama-server": {"path": "/fixture/llama-server", "sha256": manifest["binary_sha256"]},
+        "libggml-backend.so": {"path": "/fixture/libggml-backend.so", "sha256": ("b" if arm.endswith("base") else "c") * 64}}
+    manifest["runtime_sha256"] = hashlib.sha256(json.dumps(
+        {name: value["sha256"] for name, value in manifest["runtime_artifacts"].items()},
+        sort_keys=True, separators=(",", ":")).encode()).hexdigest()
     runs = []
     for prompt_index in range(3):
         request = {"prompt": f"fixture-{prompt_index}", "temperature": 0, "max_tokens": 1024,
@@ -156,6 +162,16 @@ class ReportGates(unittest.TestCase):
                 change(data)
                 save(path, data)
                 self.assert_withheld()
+
+    def test_changed_backend_library_cannot_hide_behind_same_launcher(self):
+        def change_library(data):
+            manifest = data["provenance"]["manifest"]
+            manifest["runtime_artifacts"]["libggml-backend.so"]["sha256"] = "e" * 64
+            manifest["runtime_sha256"] = hashlib.sha256(json.dumps(
+                {name: value["sha256"] for name, value in manifest["runtime_artifacts"].items()},
+                sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        self.mutate(change_library)
+        self.assert_withheld()
 
     def test_wrong_order_reused_launch_and_omitted_selection_rejected(self):
         original = copy.deepcopy(self.index)
