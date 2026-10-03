@@ -179,6 +179,7 @@ if (LLAMA_LLGUIDANCE)
 endif ()
 
 llama_build(test-recurrent-state-rollback.cpp)
+llama_build(test-speculative-quality.cpp)
 llama_build(test-save-load-state.cpp)
 
 if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
@@ -273,6 +274,27 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
         set_tests_properties(test-recurrent-state-rollback PROPERTIES
             FIXTURES_REQUIRED generate-models
         )
+
+        find_package(Python3 COMPONENTS Interpreter QUIET)
+        if (Python3_Interpreter_FOUND AND GGML_CPU AND NOT EMSCRIPTEN)
+            # Fault injection is compiled only into this test helper, never llama.
+            set(LLAMA_TEST_NAME test-speculative-quality-wrong-slot)
+            llama_build(test-speculative-quality.cpp)
+            unset(LLAMA_TEST_NAME)
+            target_compile_definitions(test-speculative-quality-wrong-slot PRIVATE LLAMA_SPECULATIVE_QUALITY_WRONG_SLOT)
+            if (MSVC)
+                target_compile_options(test-speculative-quality-wrong-slot PRIVATE /fp:fast)
+            elseif (CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+                target_compile_options(test-speculative-quality-wrong-slot PRIVATE -ffast-math)
+            endif()
+            add_test(NAME test-speculative-quality
+                COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_speculative_quality.py
+                    --tool $<TARGET_FILE:test-speculative-quality>
+                    --wrong-slot-tool $<TARGET_FILE:test-speculative-quality-wrong-slot>
+                    --models "${MODEL_DIR}" -v)
+            set_tests_properties(test-speculative-quality PROPERTIES
+                FIXTURES_REQUIRED generate-models LABELS main TIMEOUT 300)
+        endif()
         llama_test(
             test-recurrent-state-rollback
             NAME test-recurrent-state-rollback-dsv4

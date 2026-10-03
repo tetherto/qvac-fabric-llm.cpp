@@ -478,3 +478,67 @@ statistics ngram_map_k: #calls(b,g,a) = 6 1690 26, #gen drafts = 26, #acc drafts
 
 To measure the end-to-end effect of speculative decoding (throughput, latency, and draft acceptance) across diverse prompts, see the SPEED-Bench client in [tools/server/bench/speed-bench](../tools/server/bench/speed-bench/README.md).
 It runs against a running `llama-server` and can compare a baseline run against a speculative-decoding run.
+
+### Teacher-forced cross-build quality
+
+`test-speculative-quality` compares full-vocabulary FP32 logits under identical
+teacher-forced prefixes, including recurrent-state rollback and replay. It works
+with ordinary decoder models, not only speculative drafters. Build it with
+`cmake --build build --target test-speculative-quality`.
+
+Provide a JSON array of tokenizer-produced integer IDs: the fixed prefix followed
+by the known continuation (1–1024 tokens; use exactly 1024 for campaign runs).
+Token IDs must be valid for the loaded model. The first continuation token is
+scored against the final **prefill** logit; each subsequent token is scored against
+the preceding position. The last input token is decoded but has no next-token
+label. No sampling or retokenization is performed.
+
+```bash
+args=(-m model.gguf -ngl 99 -fa on -c 16384 -b 2048 -ub 512 -ctk f16 -ctv f16
+      --quality-tokens tokens.json --quality-prefix 10000
+      --quality-width 8 --quality-rs 7 --quality-rollback 7)
+base/bin/test-speculative-quality "${args[@]}" --quality-record reference.logits
+candidate/bin/test-speculative-quality "${args[@]}" --quality-reference reference.logits
+```
+
+All `--quality-*` arguments are local to this tool. Standard common model/backend
+arguments are accepted; context defaults to 16384 and can be reduced for tiny
+fixtures. Base-model logits are measured without adapters or control vectors.
+`--quality-width` sets verification batch rows; `--quality-rs` sets recurrent
+rollback snapshots from the start of prefill. The diagnostic prints actual
+snapshot count and its GDN mapping, `K = n_rs_seq + 1` for recurrent models.
+Rollback must be smaller than width and no greater than the snapshot count.
+After each verify batch, the tool removes/replays that many trailing positions
+on sequence 0; the final partial batch uses `min(rollback, batch_rows)`.
+Use width 1 / rs 0 / rollback 0 for a serial control.
+
+`--quality-record -` writes binary data to stdout; `--quality-reference -` reads
+stdin, allowing SSH streaming without a remote reference file. Diagnostics,
+`quality_schedule`, `quality_metrics`, and `quality_error` JSON lines use stderr.
+The version-1 stream consists of eight-byte `LLQLOGIT`, little-endian uint32
+version and JSON-header length, the UTF-8 header, then rows containing uint32
+phase (0=prefill, 1=verify, 2=replay), uint32 input position and full-vocabulary
+little-endian FP32 bit patterns. Header metadata includes every input ID, actual
+context/batch/cache settings, schedule and scored-row count. Comparison rejects
+incompatible metadata, row schedules, truncation, trailing data and nonfinite
+logits before reporting successful metrics. Keep model/source/device hashes in
+the accompanying run manifest.
+
+The tool reports bit-exact row count, top-token agreement, float64
+KL(reference || candidate), next-token NLL and candidate/reference perplexity.
+Exit status is nonzero unless agreement is at least 0.99, mean KL at most 0.002
+and perplexity ratio at most 1.01, both overall and separately for replay rows.
+These are numerical-fidelity gates, not downstream task-accuracy measurements.
+An overflowing perplexity ratio is JSON `null`; its finite log ratio remains
+available and fails the gate.
+
+The `test-speculative-quality` CTest uses generated local Qwen35 and dense Llama
+fixtures, with no downloads. It covers serial/ragged/replay schedules, next-token
+alignment, pipes/files, corrupt/nonfinite references (also under fast-math), and
+a test-only wrong recurrent snapshot. Tiny random models can attenuate state
+errors below final-logit precision, so a separate same-build oracle compares
+replay cache state against a fresh context restored from the pending checkpoint.
+Both arms decode the identical suffix in the same batch shape.
+The correct-slot control must pass and the planted wrong slot must fail this
+state invariant; the numerical thresholds are not weakened. The shared generated
+models and normal tool contain no fault injection or test-only state reads.
