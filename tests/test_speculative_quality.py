@@ -40,6 +40,23 @@ def unpack_reference(data):
     return meta, rows
 
 
+def corrupt_verification_tops(data, tokens, count):
+    _, rows = unpack_reference(data)
+    corrupted = bytearray(data)
+    changed = 0
+    near_tie_margin = 1e-4
+    for phase, position, logits, offset in rows:
+        if phase != 1:
+            continue
+        order = sorted(range(len(logits)), key=logits.__getitem__, reverse=True)
+        wrong = next(index for index in order[1:] if index != tokens[position + 1])
+        struct.pack_into("<f", corrupted, offset + 8 + 4 * wrong, max(logits) + near_tie_margin)
+        changed += 1
+        if changed == count:
+            return corrupted
+    raise AssertionError("not enough verification rows to exercise dilution")
+
+
 class QualityToolTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -132,6 +149,28 @@ class QualityToolTest(unittest.TestCase):
         self.assertFalse(metrics["passed"])
         self.assertEqual(metrics["top_token_agreement"], 0)
         self.assertGreater(metrics["mean_kl"], 0.002)
+
+    def test_exact_replays_cannot_hide_verification_regression(self):
+        continuation = 128
+        prefix = 24
+        tokens = [(i * 37 + 11) % 128 for i in range(prefix + continuation)]
+        token_file = self.root / "phase-gates.json"
+        token_file.write_text(json.dumps(tokens))
+        schedule = {"token_file": token_file, "prefix": prefix, "width": 8, "rs": 7,
+                    "rollback": 7, "context": 256}
+        recorded = self.invoke("--quality-record", "-", **schedule)
+        self.assertEqual(recorded.returncode, 0, recorded.stderr.decode())
+        corrupted = corrupt_verification_tops(recorded.stdout, tokens, count=2)
+        result = self.compare(corrupted, **schedule)
+        metrics = diagnostic(result, "quality_metrics")
+        self.assertGreaterEqual(metrics["top_token_agreement"], 0.99)
+        self.assertLessEqual(metrics["mean_kl"], 0.002)
+        self.assertLessEqual(metrics["perplexity_ratio"], 1.01)
+        self.assertTrue(metrics["replay"]["passed"])
+        self.assertEqual(result.returncode, 1, result.stderr.decode())
+        self.assertLess(metrics["primary"]["top_token_agreement"], 0.99)
+        self.assertFalse(metrics["primary"]["passed"])
+        self.assertFalse(metrics["passed"])
 
     def test_nonfinite_reference_rejected(self):
         for bits in [0x7F800000, 0xFF800000, 0x7FC00001, 0x7F800001]:

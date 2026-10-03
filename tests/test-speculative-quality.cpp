@@ -465,6 +465,7 @@ static int run_quality(common_params & params, const quality_options & options) 
     file.header(metadata); // Reject incompatible schedules before any decoding.
     std::vector<float> reference(recording ? 0 : vocab);
     quality_metrics metrics;
+    quality_metrics primary_metrics;
     quality_metrics replay_metrics;
     uint32_t written = 0;
     uint32_t replay_rows = 0;
@@ -483,6 +484,8 @@ static int run_quality(common_params & params, const quality_options & options) 
             metrics.merge(row);
             if (phase == 2) {
                 replay_metrics.merge(row);
+            } else {
+                primary_metrics.merge(row);
             }
         }
         ++written;
@@ -491,11 +494,12 @@ static int run_quality(common_params & params, const quality_options & options) 
 
     batch_owner owned_batch(llama_n_batch(ctx.get()));
     llama_batch & batch = owned_batch.batch;
+    const std::vector<llama_seq_id> sequence_ids = { 0 };
     const auto decode = [&](uint32_t begin, uint32_t count, bool all_logits) {
         common_batch_clear(batch);
         for (uint32_t i = 0; i < count; ++i) {
             const uint32_t pos = begin + i;
-            common_batch_add(batch, tokens[pos], pos, { 0 }, all_logits || pos + 1 == options.prefix);
+            common_batch_add(batch, tokens[pos], pos, sequence_ids, all_logits || pos + 1 == options.prefix);
         }
         if (llama_decode(ctx.get(), batch) != 0) {
             throw std::runtime_error("decode failed at position " + std::to_string(begin));
@@ -547,6 +551,8 @@ static int run_quality(common_params & params, const quality_options & options) 
                     { "continuation_rows", continuation }, { "replay_rows", replay_rows }, { "passed", true } };
     if (!recording) {
         result.update(metrics.result());
+        result["primary"] = primary_metrics.result();
+        result["passed"] = result["primary"]["passed"].get<bool>();
         if (replay_metrics.rows > 0) {
             result["replay"] = replay_metrics.result();
             result["passed"] = result["passed"].get<bool>() && result["replay"]["passed"].get<bool>();

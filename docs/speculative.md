@@ -527,7 +527,9 @@ the accompanying run manifest.
 The tool reports bit-exact row count, top-token agreement, float64
 KL(reference || candidate), next-token NLL and candidate/reference perplexity.
 Exit status is nonzero unless agreement is at least 0.99, mean KL at most 0.002
-and perplexity ratio at most 1.01, both overall and separately for replay rows.
+and perplexity ratio at most 1.01 for primary (prefill/verification) rows and
+replay rows independently. Combined metrics are informational: exact replay
+rows must not dilute a failing verification result.
 These are numerical-fidelity gates, not downstream task-accuracy measurements.
 An overflowing perplexity ratio is JSON `null`; its finite log ratio remains
 available and fails the gate.
