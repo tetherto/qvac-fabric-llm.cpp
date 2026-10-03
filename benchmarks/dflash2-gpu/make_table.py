@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import random
@@ -208,6 +209,9 @@ def load_record(path: Path, arm: str, lane_id: str, index: dict, root: Path) -> 
             require(isinstance(request.get("prompt"), str) and request["prompt"], "missing rendered prompt")
             require(arm == "tf" or request.get("cache_prompt") is False, "prompt reuse not disabled")
             require(digest(run.get("text_sha256")), "missing full output hash")
+            require(isinstance(run.get("text"), str) and bool(run["text"]), "missing full output text")
+            require(hashlib.sha256(run["text"].encode()).hexdigest() == run["text_sha256"],
+                    "full output hash does not match saved text")
             require(positive(run.get("ttft_s")) and positive(run.get("decode_s")), "invalid client timing")
             require(not (run.get("extras") or {}).get("error"), "native server error")
             for metric, expected in (("decode_tps", 1023 / run["decode_s"]), ("prefill_tps", 10000 / run["ttft_s"])):

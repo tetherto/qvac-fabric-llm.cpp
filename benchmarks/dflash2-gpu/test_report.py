@@ -1,6 +1,7 @@
 """Deterministic behavioral tests of the campaign acceptance/report gates."""
 
 import copy
+import hashlib
 import json
 import math
 import tempfile
@@ -45,7 +46,9 @@ def make_result(lane_id, arm, label, timestamp, pp: float = 100, tg: float = 10)
         runs.append({"prompt_index": prompt_index, "prompt_tokens": 10000, "completion_tokens": 1024,
                      "cached_tokens": 0, "cache_status": "reported", "request": request, "ok": True,
                      "checks": {k: True for k in ("prompt_tokens", "completion_tokens", "cached_zero", "server_error_free", "positive_intervals")},
-                     "text_sha256": "f" * 64, "ttft_s": 10000 / pp, "decode_s": 1023 / tg,
+                     "text": "complete synthetic answer",
+                     "text_sha256": hashlib.sha256(b"complete synthetic answer").hexdigest(),
+                     "ttft_s": 10000 / pp, "decode_s": 1023 / tg,
                      "server": {"prefill_tps": pp, "decode_tps": tg}, "prefill_tps": pp, "decode_tps": tg})
     return {"label": label, "engine": "tf" if arm == "tf" else "fabric", "complete": True, "error": None,
             "runs": runs, "summary": {"all_ok": True, "server_prefill_tps": pp, "decode_tps": tg,
@@ -125,6 +128,8 @@ class ReportGates(unittest.TestCase):
                    lambda d: d["runs"].pop(), lambda d: d.update(complete=False),
                    lambda d: d["runs"][0].update(completion_tokens=1023),
                    lambda d: d["runs"][0]["checks"].update(server_error_free=False),
+                   lambda d: d["runs"][0].pop("text"),
+                   lambda d: d["runs"][0].update(text="truncated answer"),
                    lambda d: d["provenance"]["manifest"]["lane"].pop("report_config")]
         for change in changes:
             with self.subTest(change=change):
