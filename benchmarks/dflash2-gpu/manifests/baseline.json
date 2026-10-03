@@ -1,0 +1,310 @@
+{
+  "baseline_sha": "20e89b5a0b87f9f79e640e0bc3e209b9e192bc52",
+  "source_archive_sha256": "e6e7a445c03f1c2d62b3e5e93e441fccd5bc96d180f9cb9a5be71c86a3ee229c",
+  "target_sha256": "ede16c7b36e578ca87a8c70e011e4b4633a32c831c0ce76d0f474582384e671d",
+  "draft_sha256": "ef6a1340ed018cc58f53efd3613312c719b9ebf72b5586a046214c7ba366b297",
+  "validated_rows": 72,
+  "scope": "Baseline width selection only; one independent launch per width with three fixed fixtures. No candidate speedup, confidence or production quality claim.",
+  "lanes": [
+    {
+      "lane": "metal",
+      "frozen_draft_width": 7,
+      "recordings": [
+        {
+          "lane": "metal",
+          "width": 3,
+          "prefill_tps": 306.86876634459765,
+          "decode_tps": 49.91238416676023,
+          "artifact": "/Users/pratiknarola/workstuff/fabric-bench-dflash2/results-gpu-next/mac/base-metal-n3-characterize.json",
+          "result_sha256": "0027da7f96c61fef63818ee4ad51ea35d4f151a356603e965a8526410b9938f7",
+          "binary_sha256": "b3d65ce13ea66ef017627180c8b8ffafd322702a46c5236ed25a36c4e7b1e117",
+          "cmake_cache_sha256": "5ffeab464f59c55dc070d77d9c1fb1cf2fbd17dd8d473c8dc45d4224c34e82db",
+          "fixture_sha256": "cf991cd976528946657d122b6315ef73acd1f800ac68f07221b64e45833d5a83"
+        },
+        {
+          "lane": "metal",
+          "width": 5,
+          "prefill_tps": 306.8626455181023,
+          "decode_tps": 54.61802436848827,
+          "artifact": "/Users/pratiknarola/workstuff/fabric-bench-dflash2/results-gpu-next/mac/base-metal-n5-characterize.json",
+          "result_sha256": "3fe4a420647e45d73ce27142ee96448ad3a43cbd652fce499d7a7a24f38ff79f",
+          "binary_sha256": "b3d65ce13ea66ef017627180c8b8ffafd322702a46c5236ed25a36c4e7b1e117",
+          "cmake_cache_sha256": "5ffeab464f59c55dc070d77d9c1fb1cf2fbd17dd8d473c8dc45d4224c34e82db",
+          "fixture_sha256": "cf991cd976528946657d122b6315ef73acd1f800ac68f07221b64e45833d5a83"
+        },
+        {
+          "lane": "metal",
+          "width": 7,
+          "prefill_tps": 306.7599650514507,
+          "decode_tps": 55.37614931801325,
+          "artifact": "/Users/pratiknarola/workstuff/fabric-bench-dflash2/results-gpu-next/mac/base-metal-n7-characterize.json",
+          "result_sha256": "887ac1f024eab2d352a4a39fce27cf0bab9854ec5cc969da3a49148c501b1054",
+          "binary_sha256": "b3d65ce13ea66ef017627180c8b8ffafd322702a46c5236ed25a36c4e7b1e117",
+          "cmake_cache_sha256": "5ffeab464f59c55dc070d77d9c1fb1cf2fbd17dd8d473c8dc45d4224c34e82db",
+          "fixture_sha256": "cf991cd976528946657d122b6315ef73acd1f800ac68f07221b64e45833d5a83"
+        },
+        {
+          "lane": "metal",
+          "width": 0,
+          "prefill_tps": 311.9220668954303,
+          "decode_tps": 31.525637745632988,
+          "artifact": "/Users/pratiknarola/workstuff/fabric-bench-dflash2/results-gpu-next/mac/base-metal-n0-characterize.json",
+          "result_sha256": "3ce6d63544ac046a79f257f9afd3a1ecf143569ec683f1668b9b9504dfd00c2f",
+          "binary_sha256": "b3d65ce13ea66ef017627180c8b8ffafd322702a46c5236ed25a36c4e7b1e117",
+          "cmake_cache_sha256": "5ffeab464f59c55dc070d77d9c1fb1cf2fbd17dd8d473c8dc45d4224c34e82db",
+          "fixture_sha256": "cf991cd976528946657d122b6315ef73acd1f800ac68f07221b64e45833d5a83"
+        }
+      ]
+    },
+    {
+      "lane": "rtx5090-cuda",
+      "frozen_draft_width": 7,
+      "recordings": [
+        {
+          "lane": "rtx5090-cuda",
+          "width": 3,
+          "prefill_tps": 4245.2299534935055,
+          "decode_tps": 170.1620117076865,
+          "artifact": "/Users/pratiknarola/workstuff/fabric-bench-dflash2/results-gpu-next/rtx5090/base-cuda-n3-characterize.json",
+          "result_sha256": "e4a1f34014440efd8844ba097aec9c6e6af7ff24407ad0ea4f4ef5ef536ab2ee",
+          "binary_sha256": "18e3fc95e81e303024687e13b55dcacc56d6d0068071af62e1fba829db17eb9f",
+          "cmake_cache_sha256": "a3e8cc52c3d6765a70d9c13f7b10bfcc876bf0c16504d7f5bcb687040dd5e1e6",
+          "fixture_sha256": "cf991cd976528946657d122b6315ef73acd1f800ac68f07221b64e45833d5a83"
+        },
+        {
+          "lane": "rtx5090-cuda",
+          "width": 5,
+          "prefill_tps": 4184.277243515312,
+          "decode_tps": 173.6725520254811,
+          "artifact": "/Users/pratiknarola/workstuff/fabric-bench-dflash2/results-gpu-next/rtx5090/base-cuda-n5-characterize.json",
+          "result_sha256": "4697a52c4d5d4ec673f372904ceab003c74e10a05a8f2c875abea68f52158f0a",
+          "binary_sha256": "18e3fc95e81e303024687e13b55dcacc56d6d0068071af62e1fba829db17eb9f",
+          "cmake_cache_sha256": "a3e8cc52c3d6765a70d9c13f7b10bfcc876bf0c16504d7f5bcb687040dd5e1e6",
+          "fixture_sha256": "cf991cd976528946657d122b6315ef73acd1f800ac68f07221b64e45833d5a83"
+        },
+        {
+          "lane": "rtx5090-cuda",
+          "width": 7,
+          "prefill_tps": 4158.54364474726,
+          "decode_tps": 175.90645936913913,
+          "artifact": "/Users/pratiknarola/workstuff/fabric-bench-dflash2/results-gpu-next/rtx5090/base-cuda-n7-characterize.json",
+          "result_sha256": "6b0cd489ee947ab21e92b0b20af4e12e14fc8dea88df7e59fcc60ad00e076ffb",
+          "binary_sha256": "18e3fc95e81e303024687e13b55dcacc56d6d0068071af62e1fba829db17eb9f",
+          "cmake_cache_sha256": "a3e8cc52c3d6765a70d9c13f7b10bfcc876bf0c16504d7f5bcb687040dd5e1e6",
+          "fixture_sha256": "cf991cd976528946657d122b6315ef73acd1f800ac68f07221b64e45833d5a83"
+        },
+        {
+          "lane": "rtx5090-cuda",
+          "width": 0,
+          "prefill_tps": 4290.609871577756,
+          "decode_tps": 82.57362218907414,
+          "artifact": "/Users/pratiknarola/workstuff/fabric-bench-dflash2/results-gpu-next/rtx5090/base-cuda-n0-characterize.json",
+          "result_sha256": "233e6ddef89ec9ad467cb4b4958435a1240994e63564f54e7fc33aa1c2fea783",
+          "binary_sha256": "18e3fc95e81e303024687e13b55dcacc56d6d0068071af62e1fba829db17eb9f",
+          "cmake_cache_sha256": "a3e8cc52c3d6765a70d9c13f7b10bfcc876bf0c16504d7f5bcb687040dd5e1e6",
+          "fixture_sha256": "cf991cd976528946657d122b6315ef73acd1f800ac68f07221b64e45833d5a83"
+        }
+      ]
+    },
+    {
+      "lane": "rtx5090-vulkan",
+      "frozen_draft_width": 5,
+      "recordings": [
+        {
+          "lane": "rtx5090-vulkan",
+          "width": 3,
+          "prefill_tps": 2672.591266987324,
+          "decode_tps": 139.1122295941587,
+          "artifact": "/Users/pratiknarola/workstuff/fabric-bench-dflash2/results-gpu-next/rtx5090/base-vulkan-n3-characterize.json",
+          "result_sha256": "bd1dd01a569962ace76bc257ba2a330231ecf8e6ec61f76df5c65a28d6eac3e6",
+          "binary_sha256": "aa25ab93c5fb57ef61f9bb9abf2e691d73c12cea3089f66884cada3e723c6287",
+          "cmake_cache_sha256": "c78b423b2edb5bb300eef0db82f96e57ac8b845b738f11b7dd6030c0d06d4d26",
+          "fixture_sha256": "cf991cd976528946657d122b6315ef73acd1f800ac68f07221b64e45833d5a83"
+        },
+        {
+          "lane": "rtx5090-vulkan",
+          "width": 5,
+          "prefill_tps": 2644.1400040402464,
+          "decode_tps": 139.9288041936456,
+          "artifact": "/Users/pratiknarola/workstuff/fabric-bench-dflash2/results-gpu-next/rtx5090/base-vulkan-n5-characterize.json",
+          "result_sha256": "0735adc18b86bc358aea5e8ff61a92ddfd4f89d54d78872dff0fd0d96a760de8",
+          "binary_sha256": "aa25ab93c5fb57ef61f9bb9abf2e691d73c12cea3089f66884cada3e723c6287",
+          "cmake_cache_sha256": "c78b423b2edb5bb300eef0db82f96e57ac8b845b738f11b7dd6030c0d06d4d26",
+          "fixture_sha256": "cf991cd976528946657d122b6315ef73acd1f800ac68f07221b64e45833d5a83"
+        },
+        {
+          "lane": "rtx5090-vulkan",
+          "width": 7,
+          "prefill_tps": 2636.7010861626454,
+          "decode_tps": 116.84028532824884,
+          "artifact": "/Users/pratiknarola/workstuff/fabric-bench-dflash2/results-gpu-next/rtx5090/base-vulkan-n7-characterize.json",
+          "result_sha256": "3aa0db235a652d132ed04628b5f1cf6ec262bb4a65d549c52bc5c0355a76bc59",
+          "binary_sha256": "aa25ab93c5fb57ef61f9bb9abf2e691d73c12cea3089f66884cada3e723c6287",
+          "cmake_cache_sha256": "c78b423b2edb5bb300eef0db82f96e57ac8b845b738f11b7dd6030c0d06d4d26",
+          "fixture_sha256": "cf991cd976528946657d122b6315ef73acd1f800ac68f07221b64e45833d5a83"
+        },
+        {
+          "lane": "rtx5090-vulkan",
+          "width": 0,
+          "prefill_tps": 2835.7065361334235,
+          "decode_tps": 75.5703030540026,
+          "artifact": "/Users/pratiknarola/workstuff/fabric-bench-dflash2/results-gpu-next/rtx5090/base-vulkan-n0-characterize.json",
+          "result_sha256": "591207848a6429a836a85f429b991210f423f81c7c0c7c3c1744f62d797f9fde",
+          "binary_sha256": "aa25ab93c5fb57ef61f9bb9abf2e691d73c12cea3089f66884cada3e723c6287",
+          "cmake_cache_sha256": "c78b423b2edb5bb300eef0db82f96e57ac8b845b738f11b7dd6030c0d06d4d26",
+          "fixture_sha256": "cf991cd976528946657d122b6315ef73acd1f800ac68f07221b64e45833d5a83"
+        }
+      ]
+    },
+    {
+      "lane": "spark-cuda",
+      "frozen_draft_width": 7,
+      "recordings": [
+        {
+          "lane": "spark-cuda",
+          "width": 3,
+          "prefill_tps": 1036.1260903284365,
+          "decode_tps": 29.680056783819698,
+          "artifact": "/Users/pratiknarola/workstuff/fabric-bench-dflash2/results-gpu-next/spark/base-cuda-n3-characterize.json",
+          "result_sha256": "b74fa2e4d38ce138677ce6dcaeb9a62a12747a7936b3b0067d122b5b7b9d9e51",
+          "binary_sha256": "81a04c6db10afc85a3d8790466da24e99ee36331b885581ea35f1790d6789a35",
+          "cmake_cache_sha256": "dfa9bdd0037871f9d0b99fe81bbae2c5ba582d0d906e5b4a1242d37c2250ce42",
+          "fixture_sha256": "cf991cd976528946657d122b6315ef73acd1f800ac68f07221b64e45833d5a83"
+        },
+        {
+          "lane": "spark-cuda",
+          "width": 5,
+          "prefill_tps": 1024.5859648116195,
+          "decode_tps": 30.934539929194017,
+          "artifact": "/Users/pratiknarola/workstuff/fabric-bench-dflash2/results-gpu-next/spark/base-cuda-n5-characterize.json",
+          "result_sha256": "38837b2738dcc3869531ce2ec7b5f176fb8ccef36eacf1bd23cabcd8516f3e72",
+          "binary_sha256": "81a04c6db10afc85a3d8790466da24e99ee36331b885581ea35f1790d6789a35",
+          "cmake_cache_sha256": "dfa9bdd0037871f9d0b99fe81bbae2c5ba582d0d906e5b4a1242d37c2250ce42",
+          "fixture_sha256": "cf991cd976528946657d122b6315ef73acd1f800ac68f07221b64e45833d5a83"
+        },
+        {
+          "lane": "spark-cuda",
+          "width": 7,
+          "prefill_tps": 1016.3663439635767,
+          "decode_tps": 32.67300287359969,
+          "artifact": "/Users/pratiknarola/workstuff/fabric-bench-dflash2/results-gpu-next/spark/base-cuda-n7-characterize.json",
+          "result_sha256": "c55b1be651eaa3b70d548a5f5345aaf46615c3cb408fb2994e63463646215892",
+          "binary_sha256": "81a04c6db10afc85a3d8790466da24e99ee36331b885581ea35f1790d6789a35",
+          "cmake_cache_sha256": "dfa9bdd0037871f9d0b99fe81bbae2c5ba582d0d906e5b4a1242d37c2250ce42",
+          "fixture_sha256": "cf991cd976528946657d122b6315ef73acd1f800ac68f07221b64e45833d5a83"
+        },
+        {
+          "lane": "spark-cuda",
+          "width": 0,
+          "prefill_tps": 1044.5446046659808,
+          "decode_tps": 13.295133902059957,
+          "artifact": "/Users/pratiknarola/workstuff/fabric-bench-dflash2/results-gpu-next/spark/base-cuda-n0-characterize.json",
+          "result_sha256": "edc1ee6b5999be74d8a10a21c9a267f62cd8850e1bff1367df121104c23f635e",
+          "binary_sha256": "81a04c6db10afc85a3d8790466da24e99ee36331b885581ea35f1790d6789a35",
+          "cmake_cache_sha256": "dfa9bdd0037871f9d0b99fe81bbae2c5ba582d0d906e5b4a1242d37c2250ce42",
+          "fixture_sha256": "cf991cd976528946657d122b6315ef73acd1f800ac68f07221b64e45833d5a83"
+        }
+      ]
+    },
+    {
+      "lane": "spark-vulkan",
+      "frozen_draft_width": 5,
+      "recordings": [
+        {
+          "lane": "spark-vulkan",
+          "width": 3,
+          "prefill_tps": 747.7323707325885,
+          "decode_tps": 25.10422076944828,
+          "artifact": "/Users/pratiknarola/workstuff/fabric-bench-dflash2/results-gpu-next/spark/base-vulkan-n3-characterize.json",
+          "result_sha256": "2d3dbfd67faddaada76bdd6edaee89c1b4db290e0c498c2cd540423eaad21620",
+          "binary_sha256": "52bc009b2185fc66b6c0bda893eab96d7111ef6b40940018cd52d108f001b82a",
+          "cmake_cache_sha256": "bcdcca479823f98f2d45ce0e657f4e5108f19762cb8781714a5073726793e234",
+          "fixture_sha256": "cf991cd976528946657d122b6315ef73acd1f800ac68f07221b64e45833d5a83"
+        },
+        {
+          "lane": "spark-vulkan",
+          "width": 5,
+          "prefill_tps": 734.3067989613378,
+          "decode_tps": 27.727271715109268,
+          "artifact": "/Users/pratiknarola/workstuff/fabric-bench-dflash2/results-gpu-next/spark/base-vulkan-n5-characterize.json",
+          "result_sha256": "a2ca2a0e846459fa3e4011d824f1d26b4901e4d9e61ad9f9b62efee97530218c",
+          "binary_sha256": "52bc009b2185fc66b6c0bda893eab96d7111ef6b40940018cd52d108f001b82a",
+          "cmake_cache_sha256": "bcdcca479823f98f2d45ce0e657f4e5108f19762cb8781714a5073726793e234",
+          "fixture_sha256": "cf991cd976528946657d122b6315ef73acd1f800ac68f07221b64e45833d5a83"
+        },
+        {
+          "lane": "spark-vulkan",
+          "width": 7,
+          "prefill_tps": 736.4831588764303,
+          "decode_tps": 26.527463556734535,
+          "artifact": "/Users/pratiknarola/workstuff/fabric-bench-dflash2/results-gpu-next/spark/base-vulkan-n7-characterize.json",
+          "result_sha256": "6095ee0d5592dbacb5d540ef066937ac990b660c1464ca0898d9211c6f93de37",
+          "binary_sha256": "52bc009b2185fc66b6c0bda893eab96d7111ef6b40940018cd52d108f001b82a",
+          "cmake_cache_sha256": "bcdcca479823f98f2d45ce0e657f4e5108f19762cb8781714a5073726793e234",
+          "fixture_sha256": "cf991cd976528946657d122b6315ef73acd1f800ac68f07221b64e45833d5a83"
+        },
+        {
+          "lane": "spark-vulkan",
+          "width": 0,
+          "prefill_tps": 758.1170071723934,
+          "decode_tps": 11.754102454580703,
+          "artifact": "/Users/pratiknarola/workstuff/fabric-bench-dflash2/results-gpu-next/spark/base-vulkan-n0-characterize.json",
+          "result_sha256": "82c9aeb542c5efb95415b758d62071ca47fb1313e1e3f9a945b0a31ef684d30d",
+          "binary_sha256": "52bc009b2185fc66b6c0bda893eab96d7111ef6b40940018cd52d108f001b82a",
+          "cmake_cache_sha256": "bcdcca479823f98f2d45ce0e657f4e5108f19762cb8781714a5073726793e234",
+          "fixture_sha256": "cf991cd976528946657d122b6315ef73acd1f800ac68f07221b64e45833d5a83"
+        }
+      ]
+    },
+    {
+      "lane": "strix-vulkan",
+      "frozen_draft_width": 3,
+      "recordings": [
+        {
+          "lane": "strix-vulkan",
+          "width": 3,
+          "prefill_tps": 312.3820952829116,
+          "decode_tps": 26.533973397775526,
+          "artifact": "/Users/pratiknarola/workstuff/fabric-bench-dflash2/results-gpu-next/strix/base-vulkan-n3-characterize.json",
+          "result_sha256": "d4d0d56ce1193a94076c71b5fc3c17f0eb86eb140ebbb32c2aa800ac208c44ec",
+          "binary_sha256": "aa25ab93c5fb57ef61f9bb9abf2e691d73c12cea3089f66884cada3e723c6287",
+          "cmake_cache_sha256": "0345de9521267df0648456fa1d886b17a65d71230acc6e61f3c7e25db7df5ebc",
+          "fixture_sha256": "cf991cd976528946657d122b6315ef73acd1f800ac68f07221b64e45833d5a83"
+        },
+        {
+          "lane": "strix-vulkan",
+          "width": 5,
+          "prefill_tps": 310.0419582882571,
+          "decode_tps": 26.237869081623856,
+          "artifact": "/Users/pratiknarola/workstuff/fabric-bench-dflash2/results-gpu-next/strix/base-vulkan-n5-characterize.json",
+          "result_sha256": "9c39012ed1da9735810ff0e3e920ffe46cfc9873f213b5b7e032b5114d1bbec5",
+          "binary_sha256": "aa25ab93c5fb57ef61f9bb9abf2e691d73c12cea3089f66884cada3e723c6287",
+          "cmake_cache_sha256": "0345de9521267df0648456fa1d886b17a65d71230acc6e61f3c7e25db7df5ebc",
+          "fixture_sha256": "cf991cd976528946657d122b6315ef73acd1f800ac68f07221b64e45833d5a83"
+        },
+        {
+          "lane": "strix-vulkan",
+          "width": 7,
+          "prefill_tps": 298.2435038314896,
+          "decode_tps": 24.485749753590795,
+          "artifact": "/Users/pratiknarola/workstuff/fabric-bench-dflash2/results-gpu-next/strix/base-vulkan-n7-characterize.json",
+          "result_sha256": "878e7c862d3aa722f1f34dc7750716c24f02af9c3e6d22339add1e8878caf32a",
+          "binary_sha256": "aa25ab93c5fb57ef61f9bb9abf2e691d73c12cea3089f66884cada3e723c6287",
+          "cmake_cache_sha256": "0345de9521267df0648456fa1d886b17a65d71230acc6e61f3c7e25db7df5ebc",
+          "fixture_sha256": "cf991cd976528946657d122b6315ef73acd1f800ac68f07221b64e45833d5a83"
+        },
+        {
+          "lane": "strix-vulkan",
+          "width": 0,
+          "prefill_tps": 293.0742767740131,
+          "decode_tps": 12.525085220842746,
+          "artifact": "/Users/pratiknarola/workstuff/fabric-bench-dflash2/results-gpu-next/strix/base-vulkan-n0-characterize.json",
+          "result_sha256": "d7c74294864bfe2838ec6b00fd40850c0de109c18cf2c72e7436901b5bff0496",
+          "binary_sha256": "aa25ab93c5fb57ef61f9bb9abf2e691d73c12cea3089f66884cada3e723c6287",
+          "cmake_cache_sha256": "0345de9521267df0648456fa1d886b17a65d71230acc6e61f3c7e25db7df5ebc",
+          "fixture_sha256": "cf991cd976528946657d122b6315ef73acd1f800ac68f07221b64e45833d5a83"
+        }
+      ]
+    }
+  ]
+}

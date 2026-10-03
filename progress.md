@@ -1,7 +1,7 @@
 # DFlash2 GPU performance campaign
 
 ## Status
-Campaign isolated at `perf/dflash2-gpu-next`, base `20e89b5a0b87f9f79e640e0bc3e209b9e192bc52`. Existing PR branches remain read-only. All six lanes are built and pass exact-workload canaries; width3/5/7/serial baseline characterization is running. No optimization or speedup is claimed.
+Campaign isolated at `perf/dflash2-gpu-next`, base `20e89b5a0b87f9f79e640e0bc3e209b9e192bc52`. Existing PR branches remain read-only. Baseline characterization is complete: 72/72 rows pass exact workload/cache/output-hash gates. TensorFold comparisons and measured optimization experiments are underway; no optimization or speedup is accepted yet.
 
 Scope clarification: all prefill and decode optimizations are eligible, not only speculative-decoding paths. Rank general matmul, attention, recurrent kernels, graph scheduling/fusions, memory traffic and synchronization by measured end-to-end savings. Fixed workload, model precision and quality gates remain unchanged.
 
@@ -15,21 +15,23 @@ Scope clarification: all prefill and decode optimizations are eligible, not only
 Raw artifacts: `/Users/pratiknarola/workstuff/fabric-bench-dflash2/results-gpu-next/`. Record source/binary/toolchain/model/fixture hashes, full requests/outputs, cache counters and actual GPU identity. Historical measurements are not the pinned baseline.
 
 ## Scoreboard
-| Lane | Baseline prefill/decode | Candidate | Quality | Status |
+| Lane | Baseline prefill/decode tok/s | Candidate | Quality | Frozen n_max |
 | --- | --- | --- | --- | --- |
-| M3 Ultra Metal | full baseline pending | unmeasured | unmeasured | exact-workload canary passed |
-| RTX 5090 CUDA | full baseline pending | unmeasured | unmeasured | exact-workload canary passed |
-| RTX 5090 Vulkan | full baseline pending | unmeasured | unmeasured | exact-workload canary passed |
-| GB10 CUDA | full baseline pending | unmeasured | unmeasured | exact-workload canary passed |
-| GB10 Vulkan | full baseline pending | unmeasured | unmeasured | exact-workload canary passed |
-| Radeon 8060S Vulkan | full baseline pending | unmeasured | unmeasured | exact-workload canary passed |
+| M3 Ultra Metal | 306.760 / 55.376 | unmeasured | unmeasured | 7 |
+| RTX 5090 CUDA | 4158.544 / 175.906 | unmeasured | unmeasured | 7 |
+| RTX 5090 Vulkan | 2644.140 / 139.929 | unmeasured | unmeasured | 5 |
+| GB10 CUDA | 1016.366 / 32.673 | unmeasured | unmeasured | 7 |
+| GB10 Vulkan | 734.307 / 27.727 | unmeasured | unmeasured | 5 |
+| Radeon 8060S Vulkan | 312.382 / 26.534 | unmeasured | unmeasured | 3 |
+
+Three fixed fixtures per width/launch; selected medians, not independent-launch confidence. All widths and serial controls are retained in `results-gpu-next/baseline-selections.json`.
 
 ## Hypothesis ledger
 | ID | Hypothesis and prediction | Cheapest refutation / actual-path proof | Result | Verdict / next action |
 | --- | --- | --- | --- | --- |
 | H01 | Metal rollback K>1 excludes existing chunked GDN; prefix+serial-tail can reduce prefill time while retaining snapshot semantics | Actual server graph T512, q/k[128,16,512,1], v[128,48,512,1], scalar gate; pipeline prints K4 at n_max3 and uses serial f32_4 plus cache fusion | Source and reached-path exclusion confirmed; numerical fidelity and saved time unmeasured | PROVISIONAL gain; qualify existing chunked numerics and op cost before editing |
 | H02 | Vulkan serial GDN is an avoidable prefill cost | Current Strix server profiler works with GGML_VK_PERF_LOGGER=1 and verbosity5; explicit stage boundaries, count*mean aggregation, no triplet double-count | GDN is1.95% of diagnostic prefill, while q4_0 GEMM57.68%, attention13.32%, CONCAT5.09%; 16-token diagnostic, not acceptance timing | PROVISIONAL gain, lower priority; profile GEMM/attention/CONCAT first without ruling out a smaller GDN improvement |
-| H03 | CUDA few-row dispatch has a better measured crossover | Trace target/drafter types and compare existing routes on actual shapes and adjacent widths | No measurement | PROVISIONAL; keep current thresholds until evidence |
+| H03 | CUDA few-row dispatch has a better measured crossover | Nsight external capture plus diagnostic NVTX preload maps all726148 kernels to actual API phases; no inference-source change | Q4_0 MMVQ rows8 is51.49% of profiled decode kernel work; Q4_0 MMQ+fixup62.95% of prefill kernel work | PROVISIONAL crossover; compare existing routes at observed shapes, preserve numerical gates |
 | H04 | Shared DFlash2 scratch allocation/copies materially affect rounds | Profile allocation/copy/wait share on Spark | No measurement | PROVISIONAL; no speculative refactor |
 
 Each experiment appends configuration, prediction, canary, commands/artifacts, observed result, first divergence, mechanism evidence, quality/performance verdict and next action. DID_NOT_RUN is not REFUTED. Three consecutive refutations require independent review before another edit.
@@ -47,3 +49,8 @@ Each experiment appends configuration, prediction, canary, commands/artifacts, o
 - Native quality fixture producer passed on Metal: exact10000 prefix IDs plus1024 returned IDs, zero cached tokens, no truncation; SHA `36420931ce54888d414336e58ca435b66d350811396bce8e3a654206c4e90666`. Full token/request/response equality verified on the controller. Two additional fixture-rejection tests passed.
 - Harness port check initially rejected a recently stopped listener's address. No live listener existed; the production server itself uses SO_REUSEADDR (`tools/server/server-http.cpp:165`). Matching that option allowed the Metal diagnostic collector to start. Updated launcher is used for serialized characterization; no inference code changed.
 - Strix diagnostic ranking is saved in `results-gpu-next/strix/profile-canary-debug/profile-summary.json`: q4_0 GEMV50.72%, q8_0 GEMV8.38%, q6_K GEMV7.93% of profiled decode. Exact dominant shapes are17408x5120 and5120x17408, n4 verify/n512 prefill. Profiled-stage denominators include synchronization/log overhead and are not clean production acceptance timings.
+- Controller has171GiB free; actual target vocabulary is248320 (`cuda5090-stage/base-cuda-n7-characterize-diagnostic.log:155`). One1024-row FP32 reference needs1017118720 logit bytes before headers/replays. Keep bounded active references on the controller and archive large immutable references under Spark's campaign root (2.7TiB available), streaming through SSH; preserve hashes/metadata locally. Do not perform archive I/O on Spark during timed performance runs.
+- Report integration caught a missing integrity check: a well-formed hash alone admitted missing/truncated full output. Two regression cases failed before requiring actual UTF-8 text/hash equality. All24 harness/report tests passed after the fix; the CLI also rendered all six real canaries as provisional observations and withheld every unmeasured gain.
+- Quality-tool review found that exact replay rows could dilute primary agreement below99%. A real tiny-model regression reproduced 98.44% primary agreement being accepted through a99.16% combined score. Primary and replay now gate independently; the sequence-ID vector is reused instead of allocating per decoded token. Nine CLI behavioral tests and a512-prefix/1024-continuation smoke pass (1024 exact primary and895 exact replay rows). This is CPU fixture proof, not production GPU fidelity.
+- Metal isolated-op evidence: 61 exact-shape cases and7 normalized GDN checks pass. At T512/H16/v_repeat3/stride40960, K1 chunked522us vsK8 serial966us. These are proxies, not production shares; actual normalized-input capture is pending. The attempted shader trace did not run successfully (SIGKILL, missing-template export); cause unconfirmed.
+- Spark's old TensorFold/Torch environment and user cache are absent at the inspected paths; Docker API access was denied. New worker is checking permitted runtime routes before declaring a prerequisite unreachable. Metal's isolated TensorFold0.6.4 installation succeeded; benchmark still pending. Prior worker termination did not invalidate completed raw artifacts.
