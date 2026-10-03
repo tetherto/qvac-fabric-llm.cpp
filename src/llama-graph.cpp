@@ -1973,6 +1973,11 @@ ggml_tensor * llm_graph_context::build_ffn(
                 cur = ggml_geglu(ctx0, cur);
                 cb(cur, "ffn_geglu", il);
             } break;
+        case LLM_FFN_GEGLU_ERF:
+            {
+                cur = ggml_geglu_erf(ctx0, cur);
+                cb(cur, "ffn_geglu_erf", il);
+            } break;
         case LLM_FFN_REGLU:
             {
                 cur = ggml_reglu(ctx0, cur);
@@ -3788,6 +3793,11 @@ void llm_graph_context::build_pooling(
         ggml_tensor * cls_out_b,
         ggml_tensor * cls_norm) const {
     if (!cparams.embeddings) {
+        return;
+    }
+
+    // the arch graph already produced its own pooled output (e.g. the laya decision head)
+    if (res->t_embd_pooled) {
         return;
     }
 
