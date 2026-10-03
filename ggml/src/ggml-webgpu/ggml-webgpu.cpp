@@ -400,6 +400,14 @@ static size_t ggml_webgpu_tensor_align_offset(webgpu_context & ctx, const ggml_t
     return ggml_webgpu_tensor_align_offset(t, ctx->global_ctx->capabilities.limits.minStorageBufferOffsetAlignment);
 }
 
+// true if a mat-mul operand elem_offset elements into its binding, with its strides, allows the vec4 shader loads and stores
+static bool ggml_webgpu_mul_mat_vec4_aligned(const ggml_tensor * t, uint32_t elem_offset) {
+    const size_t type_size = ggml_type_size(t->type);
+    return elem_offset % WEBGPU_MUL_MAT_VEC4_ELEMS == 0 && (t->nb[1] / type_size) % WEBGPU_MUL_MAT_VEC4_ELEMS == 0 &&
+           (t->nb[2] / type_size) % WEBGPU_MUL_MAT_VEC4_ELEMS == 0 &&
+           (t->nb[3] / type_size) % WEBGPU_MUL_MAT_VEC4_ELEMS == 0;
+}
+
 static size_t ggml_webgpu_tensor_binding_size(const ggml_tensor * t, size_t alignment) {
     return ROUNDUP_POW2(ggml_nbytes(t) + ggml_webgpu_tensor_misalignment(t, alignment),
                         WEBGPU_STORAGE_BUF_BINDING_MULT);
@@ -1613,9 +1621,12 @@ static webgpu_encoded_op ggml_webgpu_mul_mat(webgpu_context & ctx,
     // Determine if this is a mat-vec operation
     bool use_mat_vec = (dst->ne[1] <= 4);
 
-    // use MMVQ path for mat-vec
-    bool use_mmvq = ggml_webgpu_can_use_mmvq(src0, src1, ctx->global_ctx->capabilities.supports_dot_product,
-                                             ctx->global_ctx->vendor);
+    // use MMVQ path for mat-vec; its quantize pass reads src1 in vec4
+    const uint32_t src1_elem_offset =
+        (uint32_t) (ggml_webgpu_tensor_misalignment(ctx, src1) / ggml_type_size(src1->type));
+    const bool use_mmvq = ggml_webgpu_can_use_mmvq(src0, src1, ctx->global_ctx->capabilities.supports_dot_product,
+                                                   ctx->global_ctx->vendor) &&
+                          ggml_webgpu_mul_mat_vec4_aligned(src1, src1_elem_offset);
 
     ggml_webgpu_shader_lib_context shader_lib_ctx = {};
 
@@ -1638,17 +1649,8 @@ static webgpu_encoded_op ggml_webgpu_mul_mat(webgpu_context & ctx,
     std::vector<webgpu_dispatch_desc> dispatches;
     const bool src_overlap = ggml_webgpu_tensor_binding_overlap(ctx->global_ctx, src0, src1) && !use_mmvq;
 
-    if (use_mat_vec) {
-        if (use_mmvq) {
-            ggml_webgpu_quantize_q8_dispatch(ctx, src0, src1, dst, dispatches);
-        }
-        pipeline = ctx->shader_lib->get_mul_mat_vec_pipeline(shader_lib_ctx, src_overlap);
-    } else {
-        pipeline = ctx->shader_lib->get_mul_mat_fast_pipeline(shader_lib_ctx, src_overlap);
-    }
-
     uint32_t offset_src0   = (uint32_t) (ggml_webgpu_tensor_misalignment(ctx, src0) / ggml_type_size(src0->type));
-    uint32_t offset_src1   = (uint32_t) (ggml_webgpu_tensor_misalignment(ctx, src1) / ggml_type_size(src1->type));
+    uint32_t offset_src1   = src1_elem_offset;
     size_t   merged_offset = 0;
     size_t   merged_size   = 0;
     if (src_overlap) {
@@ -1659,11 +1661,25 @@ static webgpu_encoded_op ggml_webgpu_mul_mat(webgpu_context & ctx,
         offset_src0   = ggml_webgpu_tensor_merged_element_offset(src0, merged_range);
         offset_src1   = ggml_webgpu_tensor_merged_element_offset(src1, merged_range);
     }
+    const uint32_t offset_dst = (uint32_t) (ggml_webgpu_tensor_misalignment(ctx, dst) / ggml_type_size(dst->type));
+
+    // the mat-vec shaders store dst per element, the tiled ones in vec4
+    const bool srcs_vec4_aligned =
+        ggml_webgpu_mul_mat_vec4_aligned(src0, offset_src0) && ggml_webgpu_mul_mat_vec4_aligned(src1, offset_src1);
+    if (use_mat_vec) {
+        if (use_mmvq) {
+            ggml_webgpu_quantize_q8_dispatch(ctx, src0, src1, dst, dispatches);
+        }
+        pipeline = ctx->shader_lib->get_mul_mat_vec_pipeline(shader_lib_ctx, src_overlap, srcs_vec4_aligned, use_mmvq);
+    } else {
+        pipeline = ctx->shader_lib->get_mul_mat_fast_pipeline(
+            shader_lib_ctx, src_overlap, srcs_vec4_aligned && ggml_webgpu_mul_mat_vec4_aligned(dst, offset_dst));
+    }
 
     // Build params
     std::vector<uint32_t> params = { offset_src0,
                                      offset_src1,
-                                     (uint32_t) (ggml_webgpu_tensor_misalignment(ctx, dst) / ggml_type_size(dst->type)),
+                                     offset_dst,
                                      (uint32_t) dst->ne[0],
                                      (uint32_t) dst->ne[1],
                                      (uint32_t) src0->ne[0],
@@ -1754,11 +1770,17 @@ static webgpu_encoded_op ggml_webgpu_mul_mat_id_vec(webgpu_context & ctx,
     shader_lib_ctx.supports_subgroups             = ctx->global_ctx->capabilities.supports_subgroups;
     shader_lib_ctx.max_wg_size = ctx->global_ctx->capabilities.limits.maxComputeInvocationsPerWorkgroup;
 
-    webgpu_pipeline pipeline = ctx->shader_lib->get_mul_mat_id_vec_pipeline(shader_lib_ctx);
+    const uint32_t offset_src0 = (uint32_t) (ggml_webgpu_tensor_misalignment(ctx, src0) / ggml_type_size(src0->type));
+    const uint32_t offset_src1 = (uint32_t) (ggml_webgpu_tensor_misalignment(ctx, src1) / ggml_type_size(src1->type));
+
+    // the shader stores dst per element
+    webgpu_pipeline pipeline = ctx->shader_lib->get_mul_mat_id_vec_pipeline(
+        shader_lib_ctx,
+        ggml_webgpu_mul_mat_vec4_aligned(src0, offset_src0) && ggml_webgpu_mul_mat_vec4_aligned(src1, offset_src1));
 
     std::vector<uint32_t> params = {
-        (uint32_t) (ggml_webgpu_tensor_misalignment(ctx, src0) / ggml_type_size(src0->type)),
-        (uint32_t) (ggml_webgpu_tensor_misalignment(ctx, src1) / ggml_type_size(src1->type)),
+        offset_src0,
+        offset_src1,
         (uint32_t) (ggml_webgpu_tensor_misalignment(ctx, src2) / ggml_type_size(src2->type)),
         (uint32_t) (ggml_webgpu_tensor_misalignment(ctx, dst) / ggml_type_size(dst->type)),
         (uint32_t) src0->ne[0],
@@ -1819,8 +1841,15 @@ static webgpu_encoded_op ggml_webgpu_mul_mat_id(webgpu_context & ctx,
 
     std::vector<webgpu_dispatch_desc> dispatches;
 
+    const uint32_t offset_src0  = (uint32_t) (ggml_webgpu_tensor_misalignment(ctx, src0) / ggml_type_size(src0->type));
+    const uint32_t offset_src1  = (uint32_t) (ggml_webgpu_tensor_misalignment(ctx, src1) / ggml_type_size(src1->type));
+    const uint32_t offset_dst   = (uint32_t) (ggml_webgpu_tensor_misalignment(ctx, dst) / ggml_type_size(dst->type));
+    const bool     vec4_aligned = ggml_webgpu_mul_mat_vec4_aligned(src0, offset_src0) &&
+                                  ggml_webgpu_mul_mat_vec4_aligned(src1, offset_src1) &&
+                                  ggml_webgpu_mul_mat_vec4_aligned(dst, offset_dst);
+
     gather_pipeline = ctx->shader_lib->get_mul_mat_id_gather_pipeline(shader_lib_ctx);
-    main_pipeline   = ctx->shader_lib->get_mul_mat_id_pipeline(shader_lib_ctx);
+    main_pipeline   = ctx->shader_lib->get_mul_mat_id_pipeline(shader_lib_ctx, vec4_aligned);
 
     const uint32_t param_n_expert      = (uint32_t) src0->ne[2];
     const uint32_t param_n_expert_used = (uint32_t) dst->ne[1];
@@ -1872,9 +1901,9 @@ static webgpu_encoded_op ggml_webgpu_mul_mat_id(webgpu_context & ctx,
 
     // params for mul_mat_id.wgsl
     std::vector<uint32_t> main_params = {
-        (uint32_t) (ggml_webgpu_tensor_misalignment(ctx, src0) / ggml_type_size(src0->type)),
-        (uint32_t) (ggml_webgpu_tensor_misalignment(ctx, src1) / ggml_type_size(src1->type)),
-        (uint32_t) (ggml_webgpu_tensor_misalignment(ctx, dst) / ggml_type_size(dst->type)),
+        offset_src0,
+        offset_src1,
+        offset_dst,
         (uint32_t) src0->ne[0],
         (uint32_t) src0->ne[1],
         param_n_expert,
@@ -3689,7 +3718,28 @@ static void ggml_backend_webgpu_buffer_set_tensor(ggml_backend_buffer_t buffer,
 
     size_t total_offset = ggml_webgpu_tensor_offset(tensor) + offset;
 
-    buf_ctx->global_ctx->queue.WriteBuffer(buf_ctx->buffer, total_offset, data, (size / 4) * 4);
+    // WriteBuffer needs the offset and the size to be multiples of 4.
+    // Write the misaligned head bytes using compute memset, then increment total_offset
+    // and data pointer so that they are 4-aligned.
+    if (total_offset % 4 != 0) {
+        size_t lane = total_offset % 4;  // in-word lane the head starts at (the tail below always starts at 0)
+        size_t head = std::min<size_t>(4 - lane, size);
+
+        // Pack head bytes into a uint32_t
+        uint32_t head_val = 0;
+        for (size_t i = 0; i < head; i++) {
+            ((uint8_t *) &head_val)[lane + i] = ((const uint8_t *) data)[i];
+        }
+        ggml_backend_webgpu_buffer_memset(buf_ctx->global_ctx, buf_ctx->buffer, head_val, total_offset, head);
+
+        total_offset += head;
+        size -= head;
+        data = (const uint8_t *) data + head;
+    }
+
+    if (size > 0) {
+        buf_ctx->global_ctx->queue.WriteBuffer(buf_ctx->buffer, total_offset, data, (size / 4) * 4);
+    }
 
     if (size % 4 != 0) {
         // If size is not a multiple of 4, we need to memset the remaining bytes

@@ -12148,6 +12148,42 @@ static void ggml_vk_dsv4_hc_post(ggml_backend_vk_context * ctx, vk_context& subc
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { x_buf, r_buf, p_buf, c_buf, d_buf }, pc, { n_embd, n_tokens, 1 });
 }
 
+static bool ggml_vk_mul_mat_needs_split(const vk_device & device, const ggml_tensor * src0, const ggml_tensor * dst) {
+    return dst->ne[2] == 1 && dst->ne[3] == 1 && ggml_nbytes(src0) > device->properties.limits.maxStorageBufferRange;
+}
+
+// f16 src0 and src1 both with a 0213 permutation, one output column and batch size 1
+static bool ggml_vk_mul_mat_use_vec_p021(const vk_device & device, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst) {
+    return src0->type == GGML_TYPE_F16 && ggml_is_permuted(src0) && ggml_is_permuted(src1) && dst->ne[1] == 1 &&
+        src0->nb[0] <= src0->nb[2] &&
+        src0->nb[2] <= src0->nb[1] &&
+        src0->nb[1] <= src0->nb[3] &&
+        src1->nb[0] <= src1->nb[2] &&
+        src1->nb[2] <= src1->nb[1] &&
+        src1->nb[1] <= src1->nb[3] &&
+        src0->ne[3] == 1 &&
+        src1->ne[3] == 1 &&
+        src0->ne[1] <= device->properties.limits.maxComputeWorkGroupCount[1] &&
+        src1->ne[2] <= device->properties.limits.maxComputeWorkGroupCount[2];
+}
+
+static bool ggml_vk_mul_mat_use_vec_nc(const vk_device & device, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst) {
+    return src0->type == GGML_TYPE_F16 && !ggml_is_contiguous(src0) && !ggml_is_transposed(src1) && dst->ne[1] == 1 &&
+        !ggml_is_permuted(src0) && !ggml_is_permuted(src1) &&
+        src0->ne[3] <= device->properties.limits.maxComputeWorkGroupCount[0] &&
+        src0->ne[1] <= device->properties.limits.maxComputeWorkGroupCount[1] &&
+        src1->ne[2] <= device->properties.limits.maxComputeWorkGroupCount[2];
+}
+
+// the p021 and nc mat-vec paths take src1 at an offset that is not descriptor-aligned; FWHT does too,
+// but a fused node skips FWHT, so it does not count here
+static bool ggml_vk_mul_mat_allows_misaligned_src1(const vk_device & device, const ggml_tensor * dst) {
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
+    return !ggml_vk_mul_mat_needs_split(device, src0, dst) &&
+        (ggml_vk_mul_mat_use_vec_p021(device, src0, src1, dst) || ggml_vk_mul_mat_use_vec_nc(device, src0, src1, dst));
+}
+
 static void ggml_vk_mul_mat(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx) {
     ggml_tensor * dst = cgraph->nodes[node_idx];
     ggml_tensor * src0 = dst->src[0];
@@ -12158,9 +12194,7 @@ static void ggml_vk_mul_mat(ggml_backend_vk_context * ctx, vk_context& subctx, c
     // where the M dimension is very large.
     // Split_k doesn't work with M splitting.
     // This only supports batchsize == 1.
-    const size_t nbytes = ggml_nbytes(src0);
-    const bool needs_split = dst->ne[2] == 1 && dst->ne[3] == 1 && nbytes > ctx->device->properties.limits.maxStorageBufferRange;
-    if (needs_split) {
+    if (ggml_vk_mul_mat_needs_split(ctx->device, src0, dst)) {
         // Choose the number of rows that can fit (and divide by two, to allow for any additional offsets)
         const uint32_t M_split = ctx->device->properties.limits.maxStorageBufferRange / (2 * src0->nb[1]);
         uint32_t m_offset = 0;
@@ -12183,24 +12217,9 @@ static void ggml_vk_mul_mat(ggml_backend_vk_context * ctx, vk_context& subctx, c
         }
     } else if (ggml_vk_can_use_fwht(ctx, src1, dst)) {
         ggml_vk_fwht(ctx, subctx, src1, nullptr, dst);
-    } else if (src0->type == GGML_TYPE_F16 && ggml_is_permuted(src0) && ggml_is_permuted(src1) && dst->ne[1] == 1 &&
-        // detect 0213 permutation, and batch size of 1
-        src0->nb[0] <= src0->nb[2] &&
-        src0->nb[2] <= src0->nb[1] &&
-        src0->nb[1] <= src0->nb[3] &&
-        src1->nb[0] <= src1->nb[2] &&
-        src1->nb[2] <= src1->nb[1] &&
-        src1->nb[1] <= src1->nb[3] &&
-        src0->ne[3] == 1 &&
-        src1->ne[3] == 1 &&
-        src0->ne[1] <= ctx->device->properties.limits.maxComputeWorkGroupCount[1] &&
-        src1->ne[2] <= ctx->device->properties.limits.maxComputeWorkGroupCount[2]) {
+    } else if (ggml_vk_mul_mat_use_vec_p021(ctx->device, src0, src1, dst)) {
         ggml_vk_mul_mat_vec_p021_f16_f32(ctx, subctx, cgraph, node_idx);
-    } else if (src0->type == GGML_TYPE_F16 && !ggml_is_contiguous(src0) && !ggml_is_transposed(src1) && dst->ne[1] == 1 &&
-               !ggml_is_permuted(src0) && !ggml_is_permuted(src1) &&
-               src0->ne[3] <= ctx->device->properties.limits.maxComputeWorkGroupCount[0] &&
-               src0->ne[1] <= ctx->device->properties.limits.maxComputeWorkGroupCount[1] &&
-               src1->ne[2] <= ctx->device->properties.limits.maxComputeWorkGroupCount[2]) {
+    } else if (ggml_vk_mul_mat_use_vec_nc(ctx->device, src0, src1, dst)) {
         ggml_vk_mul_mat_vec_nc_f16_f32(ctx, subctx, cgraph, node_idx);
     // With one output row, B^T*A has the same flat output as A^T*B.
     } else if (ctx->num_additional_fused_ops == 0 &&
@@ -21656,6 +21675,25 @@ static ggml_backend_t ggml_backend_vk_device_init(ggml_backend_dev_t dev, const 
     return ggml_backend_vk_init(ctx->device);
 }
 
+static bool ggml_backend_vk_device_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft);
+
+// A tensor in a buffer this device cannot use is copied by the scheduler into an aligned allocation;
+// otherwise the shader reads it in place, so its offset must be a valid storage-buffer descriptor offset.
+static bool ggml_vk_read_in_place_offset_aligned(ggml_backend_dev_t dev, const ggml_tensor * t) {
+    const ggml_tensor * base = t->view_src ? t->view_src : t;
+    if (base->buffer != nullptr && !ggml_backend_vk_device_supports_buft(dev, base->buffer->buft)) {
+        return true;
+    }
+    ggml_backend_vk_device_context * ctx = (ggml_backend_vk_device_context *)dev->context;
+    const vk_device & device = ggml_vk_get_device(ctx->device);
+    const uint64_t align = device->properties.limits.minStorageBufferOffsetAlignment;
+    // a tensor without memory yet will start at a multiple of align, the alignment of the Vulkan buffer type
+    if (base->data == nullptr) {
+        return t->view_offs % align == 0;
+    }
+    return (vk_tensor_offset(t) + t->view_offs) % align == 0;
+}
+
 static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
     ggml_backend_vk_device_context * ctx = (ggml_backend_vk_device_context *)dev->context;
     const vk_device& device = ggml_vk_get_device(ctx->device);
@@ -21836,6 +21874,15 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                 if (op->src[0]->type == GGML_TYPE_BF16 && op->src[1]->type == GGML_TYPE_F16) {
                     // We currently don't have a bf16 x f16 shader, or an fp16->bf16 copy shader.
                     // So don't support this combination for now.
+                    return false;
+                }
+                // the mat-mul paths bind src0 and the ids at their own offset, without allow_misalign
+                if (!ggml_vk_read_in_place_offset_aligned(dev, op->src[0]) ||
+                    (op->op == GGML_OP_MUL_MAT_ID && !ggml_vk_read_in_place_offset_aligned(dev, op->src[2]))) {
+                    return false;
+                }
+                if (!ggml_vk_read_in_place_offset_aligned(dev, op->src[1]) &&
+                    !(op->op == GGML_OP_MUL_MAT && ggml_vk_mul_mat_allows_misaligned_src1(device, op))) {
                     return false;
                 }
 

@@ -11,6 +11,26 @@ const int CUDA_CPY_TILE_DIM_2D = 32; // 2D tile dimension for transposed blocks
 const int CUDA_CPY_BLOCK_NM = 8;     // block size of 3rd dimension if available
 const int CUDA_CPY_BLOCK_ROWS = 8;   // block dimension for marching through rows
 
+// byte offsets of flattened element i in the source and destination layouts
+static __device__ __forceinline__ void cpy_scalar_offsets(const int64_t i,
+        const int64_t ne00, const int64_t ne01, const int64_t ne02, const int64_t nb00, const int64_t nb01, const int64_t nb02,
+        const int64_t nb03, const int64_t ne10, const int64_t ne11, const int64_t ne12, const int64_t nb10, const int64_t nb11,
+        const int64_t nb12, const int64_t nb13, int64_t & x_offset, int64_t & dst_offset) {
+    // determine indices i03/i13, i02/i12, i01/i11, i00/i10 as a function of index i of flattened tensor
+    // then combine those indices with the corresponding byte offsets to get the total offsets
+    const int64_t i03 = i/(ne00 * ne01 * ne02);
+    const int64_t i02 = (i - i03*ne00*ne01*ne02 )/ (ne00*ne01);
+    const int64_t i01 = (i - i03*ne00*ne01*ne02  -  i02*ne01*ne00) / ne00;
+    const int64_t i00 = i - i03*ne00*ne01*ne02 - i02*ne01*ne00 - i01*ne00;
+    x_offset = i00*nb00 + i01*nb01 + i02*nb02 + i03 * nb03;
+
+    const int64_t i13 = i/(ne10 * ne11 * ne12);
+    const int64_t i12 = (i - i13*ne10*ne11*ne12) / (ne10*ne11);
+    const int64_t i11 = (i - i13*ne10*ne11*ne12 - i12*ne10*ne11) / ne10;
+    const int64_t i10 = i - i13*ne10*ne11*ne12 - i12*ne10*ne11 - i11*ne10;
+    dst_offset = i10*nb10 + i11*nb11 + i12*nb12 + i13 * nb13;
+}
+
 template <cpy_kernel_t cpy_1>
 static __global__ void cpy_scalar(const char * cx, char * cdst, const int64_t ne,
                                   const int64_t ne00, const int64_t ne01, const int64_t ne02, const int64_t nb00, const int64_t nb01, const int64_t nb02,
@@ -23,22 +43,33 @@ static __global__ void cpy_scalar(const char * cx, char * cdst, const int64_t ne
         return;
     }
 
-    // determine indices i03/i13, i02/i12, i01/i11, i00/i10 as a function of index i of flattened tensor
-    // then combine those indices with the corresponding byte offsets to get the total offsets
-    const int64_t i03 = i/(ne00 * ne01 * ne02);
-    const int64_t i02 = (i - i03*ne00*ne01*ne02 )/ (ne00*ne01);
-    const int64_t i01 = (i - i03*ne00*ne01*ne02  -  i02*ne01*ne00) / ne00;
-    const int64_t i00 = i - i03*ne00*ne01*ne02 - i02*ne01*ne00 - i01*ne00;
-    const int64_t x_offset = i00*nb00 + i01*nb01 + i02*nb02 + i03 * nb03;
-
-    const int64_t i13 = i/(ne10 * ne11 * ne12);
-    const int64_t i12 = (i - i13*ne10*ne11*ne12) / (ne10*ne11);
-    const int64_t i11 = (i - i13*ne10*ne11*ne12 - i12*ne10*ne11) / ne10;
-    const int64_t i10 = i - i13*ne10*ne11*ne12 - i12*ne10*ne11 - i11*ne10;
-    const int64_t dst_offset = i10*nb10 + i11*nb11 + i12*nb12 + i13 * nb13;
+    int64_t x_offset;
+    int64_t dst_offset;
+    cpy_scalar_offsets(i, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13, x_offset, dst_offset);
 
     ggml_cuda_pdl_sync();
     cpy_1(cx + x_offset, cdst + dst_offset);
+}
+
+// cpy_scalar for batch.n copies of one layout; blockIdx.y selects the copy
+template <cpy_kernel_t cpy_1>
+static __global__ void cpy_scalar_batch(const char * cx, char * cdst, const ggml_cuda_cpy_batch batch, const int64_t ne,
+                                        const int64_t ne00, const int64_t ne01, const int64_t ne02, const int64_t nb00, const int64_t nb01, const int64_t nb02,
+                                        const int64_t nb03, const int64_t ne10, const int64_t ne11, const int64_t ne12, const int64_t nb10, const int64_t nb11,
+                                        const int64_t nb12, const int64_t nb13) {
+    ggml_cuda_pdl_lc();
+    const int64_t i = (int64_t)blockDim.x*blockIdx.x + threadIdx.x;
+
+    if (i >= ne) {
+        return;
+    }
+
+    int64_t x_offset;
+    int64_t dst_offset;
+    cpy_scalar_offsets(i, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13, x_offset, dst_offset);
+
+    ggml_cuda_pdl_sync();
+    cpy_1(cx + batch.src_offs[blockIdx.y] + x_offset, cdst + batch.dst_offs[blockIdx.y] + dst_offset);
 }
 
 template <typename T>
@@ -424,6 +455,25 @@ static bool ggml_cuda_cpy_as_memcpy_2d(const ggml_tensor * src0, const ggml_tens
     dpitch = src1->nb[d];
 
     return spitch >= width && dpitch >= width;
+}
+
+void ggml_cuda_cpy_f32_batch(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, ggml_tensor * src1,
+                             const ggml_cuda_cpy_batch & batch) {
+    GGML_ASSERT(src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32);
+    GGML_ASSERT(batch.n >= 1 && batch.n <= GGML_CUDA_CPY_BATCH_MAX);
+
+    const int64_t ne = ggml_nelements(src0);
+    GGML_ASSERT(ne == ggml_nelements(src1));
+
+    const int64_t num_blocks = (ne + CUDA_CPY_BLOCK_SIZE - 1) / CUDA_CPY_BLOCK_SIZE;
+    GGML_ASSERT(num_blocks <= INT_MAX);
+
+    const ggml_cuda_kernel_launch_params launch_params =
+        ggml_cuda_kernel_launch_params(dim3((unsigned) num_blocks, (unsigned) batch.n), CUDA_CPY_BLOCK_SIZE, 0, ctx.stream());
+    ggml_cuda_kernel_launch(cpy_scalar_batch<cpy_1_scalar<float, float>>, launch_params,
+        (const char *) src0->data, (char *) src1->data, batch, ne,
+        src0->ne[0], src0->ne[1], src0->ne[2], src0->nb[0], src0->nb[1], src0->nb[2], src0->nb[3],
+        src1->ne[0], src1->ne[1], src1->ne[2], src1->nb[0], src1->nb[1], src1->nb[2], src1->nb[3]);
 }
 
 void ggml_cuda_cpy(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, ggml_tensor * src1) {

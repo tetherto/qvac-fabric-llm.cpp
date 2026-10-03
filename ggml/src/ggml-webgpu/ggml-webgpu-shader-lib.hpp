@@ -48,6 +48,9 @@
 #define WEBGPU_MUL_MAT_SUBGROUP_TILE_K_FLOAT 32
 #define WEBGPU_MUL_MAT_SUBGROUP_TILE_K_QUANT 32
 
+// elements of one load or store of the vectorized mat-mul shaders
+#define WEBGPU_MUL_MAT_VEC4_ELEMS 4u
+
 // Matrix-vector multiplication parameters
 #define WEBGPU_MUL_MAT_VEC_WG_SIZE 256
 
@@ -1956,17 +1959,19 @@ class ggml_webgpu_shader_lib {
         return quantize_q8_pipelines[key];
     }
 
-    webgpu_pipeline get_mul_mat_vec_pipeline(const ggml_webgpu_shader_lib_context & context, bool src_overlap) {
+    webgpu_pipeline get_mul_mat_vec_pipeline(const ggml_webgpu_shader_lib_context & context,
+                                             bool                                   src_overlap,
+                                             bool                                   vec4_aligned,
+                                             bool                                   use_mmvq) {
         ggml_webgpu_mul_mat_vec_pipeline_key key = {};
         key.src0_type                            = context.src0->type;
         key.src1_type                            = context.src1->type;
-        key.vectorized = (context.src0->ne[0] % 4 == 0 &&
-                          (context.src0->type == GGML_TYPE_F32 || context.src0->type == GGML_TYPE_F16)) ?
-                             1 :
-                             0;
-        key.num_cols   = context.dst->ne[1];
-        key.use_mmvq =
-            ggml_webgpu_can_use_mmvq(context.src0, context.src1, context.supports_dot_product, context.vendor);
+        key.vectorized  = (vec4_aligned && context.src0->ne[0] % WEBGPU_MUL_MAT_VEC4_ELEMS == 0 &&
+                           (context.src0->type == GGML_TYPE_F32 || context.src0->type == GGML_TYPE_F16)) ?
+                              1 :
+                              0;
+        key.num_cols    = context.dst->ne[1];
+        key.use_mmvq    = use_mmvq;
         key.src_overlap = src_overlap;
 
         auto it = mul_mat_vec_pipelines.find(key);
@@ -2101,11 +2106,14 @@ class ggml_webgpu_shader_lib {
         return mul_mat_vec_pipelines[key];
     }
 
-    webgpu_pipeline get_mul_mat_fast_pipeline(const ggml_webgpu_shader_lib_context & context, bool src_overlap) {
+    webgpu_pipeline get_mul_mat_fast_pipeline(const ggml_webgpu_shader_lib_context & context,
+                                              bool                                   src_overlap,
+                                              bool                                   vec4_aligned) {
         ggml_webgpu_mul_mat_pipeline_key key = {};
         key.src0_type                        = context.src0->type;
         key.src1_type                        = context.src1->type;
-        key.vectorized          = (context.src0->ne[0] % 4 == 0 && context.dst->ne[0] % 4 == 0 &&
+        key.vectorized          = (vec4_aligned && context.src0->ne[0] % WEBGPU_MUL_MAT_VEC4_ELEMS == 0 &&
+                                   context.dst->ne[0] % WEBGPU_MUL_MAT_VEC4_ELEMS == 0 &&
                                    (context.src0->type == GGML_TYPE_F32 || context.src0->type == GGML_TYPE_F16)) ?
                                       1 :
                                       0;
@@ -2284,12 +2292,13 @@ class ggml_webgpu_shader_lib {
         return pipeline;
     }
 
-    webgpu_pipeline get_mul_mat_id_pipeline(const ggml_webgpu_shader_lib_context & context) {
+    webgpu_pipeline get_mul_mat_id_pipeline(const ggml_webgpu_shader_lib_context & context, bool vec4_aligned) {
         ggml_webgpu_mul_mat_id_pipeline_key key = {};
         key.src0_type                           = context.src0->type;
         key.src1_type                           = context.src1->type;
         key.n_experts                           = context.src0->ne[2];
-        key.vectorized = (context.src0->ne[0] % 4 == 0 && context.src0->ne[1] % 4 == 0 &&
+        key.vectorized = (vec4_aligned && context.src0->ne[0] % WEBGPU_MUL_MAT_VEC4_ELEMS == 0 &&
+                          context.src0->ne[1] % WEBGPU_MUL_MAT_VEC4_ELEMS == 0 &&
                           (context.src0->type == GGML_TYPE_F32 || context.src0->type == GGML_TYPE_F16)) ?
                              1 :
                              0;
@@ -2408,12 +2417,12 @@ class ggml_webgpu_shader_lib {
         return mul_mat_id_pipelines[key];
     }
 
-    webgpu_pipeline get_mul_mat_id_vec_pipeline(const ggml_webgpu_shader_lib_context & context) {
+    webgpu_pipeline get_mul_mat_id_vec_pipeline(const ggml_webgpu_shader_lib_context & context, bool vec4_aligned) {
         ggml_webgpu_mul_mat_id_pipeline_key key = {};
         key.src0_type                           = context.src0->type;
         key.src1_type                           = context.src1->type;
         key.n_experts                           = context.src0->ne[2];
-        key.vectorized = (context.src0->ne[0] % 4 == 0 &&
+        key.vectorized = (vec4_aligned && context.src0->ne[0] % WEBGPU_MUL_MAT_VEC4_ELEMS == 0 &&
                           (context.src0->type == GGML_TYPE_F32 || context.src0->type == GGML_TYPE_F16)) ?
                              1 :
                              0;
