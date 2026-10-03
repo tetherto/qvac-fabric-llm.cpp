@@ -9,6 +9,7 @@ import math
 import random
 import re
 import statistics
+from collections import Counter
 from pathlib import Path
 from urllib.parse import quote
 
@@ -246,13 +247,31 @@ def load_record(path: Path, arm: str, lane_id: str, index: dict, root: Path) -> 
     return record
 
 
+def check_cross_engine_sessions(records: list[dict]) -> None:
+    first_arm = records[0]["arm"]
+    prompts = {row["prompt_index"]: row["request"]["prompt"] for record in records
+               if record["arm"] == first_arm for row in record["data"]["runs"]}
+    for record in records:
+        for row in record["data"]["runs"]:
+            require(prompts.get(row["prompt_index"]) == row["request"]["prompt"],
+                    "cross-engine rendered prompt mismatch")
+    for arm in {record["arm"] for record in records}:
+        selected = [record["data"] for record in records if record["arm"] == arm]
+        counts = Counter(row["prompt_index"] for data in selected for row in data["runs"])
+        require(set(counts) == set(prompts) and len(set(counts.values())) == 1,
+                "cross-engine sessions need equal coverage of every selected prompt")
+        launches = [data["provenance"]["manifest"]["created_unix_s"] for data in selected]
+        require(len(set(launches)) == len(launches), "reused cross-engine server launch")
+        require(len({data["label"] for data in selected}) == len(selected), "reused cross-engine launch label")
+
+
 def comparable(records: list[dict], cross_engine: bool = False) -> None:
     require(all(r["error"] is None for r in records), "invalid selected result")
     require(all(r["proof_error"] is None for r in records), "missing or incompatible configuration/runtime proof")
     first = records[0]
     cross_keys = ("fixture_sha256", "context", "parallel", "greedy", "gpu_id")
-    def config_key(record):
-        if cross_engine:
+    def config_key(record, across_engines=cross_engine):
+        if across_engines:
             return {k: record["config"][k] for k in cross_keys}
         fields = TF_CONFIG_FIELDS if record["arm"] == "tf" else CONFIG_FIELDS
         if record["arm"] != "tf" and record["data"]["provenance"]["manifest"]["draft_width"] != 0:
@@ -262,15 +281,15 @@ def comparable(records: list[dict], cross_engine: bool = False) -> None:
             runtime = record["data"]["provenance"]["manifest"]["lane"]["runtime_evidence"]
             normalized["runtime_evidence"] = {k: runtime[k] for k in RUNTIME_FIELDS}
         return normalized
+    if cross_engine:
+        check_cross_engine_sessions(records)
     for record in records[1:]:
         require(config_key(record) == config_key(first), "workload/backend configuration mismatch")
         a, b = first["data"], record["data"]
         require(a["provenance"]["client_sha256"] == b["provenance"]["client_sha256"], "client revision mismatch")
-        require([r["prompt_index"] for r in a["runs"]] == [r["prompt_index"] for r in b["runs"]], "paired prompt mismatch")
-        for left, right in zip(a["runs"], b["runs"]):
-            if cross_engine:
-                require(left["request"]["prompt"] == right["request"]["prompt"], "cross-engine rendered prompt mismatch")
-            else:
+        if not cross_engine:
+            require([r["prompt_index"] for r in a["runs"]] == [r["prompt_index"] for r in b["runs"]], "paired prompt mismatch")
+            for left, right in zip(a["runs"], b["runs"]):
                 require(left["request"] == right["request"], "paired request mismatch")
     for arm in {r["arm"] for r in records}:
         identity_key = "binary_sha256" if arm == "tf" else "runtime_sha256"
@@ -278,7 +297,8 @@ def comparable(records: list[dict], cross_engine: bool = False) -> None:
         require(len(binaries) == 1, "mixed executable/shared-library runtimes within an arm")
         if cross_engine:
             same_arm = [r for r in records if r["arm"] == arm]
-            comparable(same_arm)
+            require(all(config_key(record, False) == config_key(same_arm[0], False) for record in same_arm),
+                    "workload/backend configuration mismatch within an engine")
 
 
 def block_logs(records: list[dict], metric: str) -> float:
@@ -328,6 +348,24 @@ def comparison(lane: dict, records: dict[Path, dict], root: Path, arms: tuple[st
     return result
 
 
+def selected_sessions(lane: dict, arm: str, prompts: list[int]) -> list[tuple[str, list[int]]]:
+    selections = lane.get(arm, [])
+    require(isinstance(selections, list), f"{arm} must be an explicit selection list")
+    if arm != "tf":
+        return [(path, prompts) for path in selections]
+    result = []
+    for selection in selections:
+        require(isinstance(selection, dict), "TensorFold selection needs path and prompt_indices")
+        selected = selection.get("prompt_indices")
+        require(isinstance(selected, list) and selected and all(type(p) is int and p in prompts for p in selected)
+                and len(set(selected)) == len(selected), "invalid TensorFold session prompt_indices")
+        result.append((selection.get("path"), selected))
+    counts = Counter(prompt for _, selected in result for prompt in selected)
+    require(not selections or (set(counts) == set(prompts) and len(set(counts.values())) == 1),
+            "TensorFold selections need equal coverage of every selected prompt")
+    return result
+
+
 def analyze(index_path: Path) -> dict:
     index_path = index_path.resolve()
     root = index_path.parent
@@ -352,13 +390,12 @@ def analyze(index_path: Path) -> dict:
             require(type(lane.get("draft_width")) is int and lane["draft_width"] in (3, 5, 7), "baseline selected draft_width must be 3, 5 or 7")
         records = {}
         for arm in ARMS:
-            paths = lane.get(arm, [])
-            require(isinstance(paths, list), f"{lane_id}.{arm} must be an explicit path list")
-            for path in paths:
+            for path, selected_prompts in selected_sessions(lane, arm, prompts):
                 resolved = resolve(root, path)
                 require(resolved not in seen, f"result selected more than once: {path}")
                 seen.add(resolved)
-                records[resolved] = load_record(resolved, arm, lane_id, index, root)
+                record_index = dict(index, prompt_indices=selected_prompts)
+                records[resolved] = load_record(resolved, arm, lane_id, record_index, root)
         result["lanes"][lane_id] = {"records": records, "spec": comparison(lane, records, root, ("base", "candidate"), "blocks", **boot),
                                     "serial": comparison(lane, records, root, ("serial_base", "serial_candidate"), "serial_blocks", **boot)}
     failures = [lane_id for lane_id, lane in result["lanes"].items()
@@ -377,6 +414,20 @@ def rates(records: list[dict], arm: str) -> str:
         return "UNMEASURED"
     suffix = " (PROVISIONAL: missing/incompatible proof)" if any(r["proof_error"] for r in selected) else ""
     return " / ".join(f"{statistics.median(r['data']['summary'][m] for r in selected):.2f}" for m in METRICS) + suffix
+
+
+def cross_engine_rates(records: list[dict], arm: str) -> list[float]:
+    rows = [row for record in records if record["arm"] == arm for row in record["data"]["runs"]]
+    prompts = sorted({row["prompt_index"] for row in rows})
+    rates_by_metric = []
+    for metric in METRICS:
+        per_prompt = []
+        for prompt in prompts:
+            values = [row["server"]["prefill_tps"] if metric == "server_prefill_tps" else row[metric]
+                      for row in rows if row["prompt_index"] == prompt]
+            per_prompt.append(statistics.median(values))
+        rates_by_metric.append(statistics.median(per_prompt))
+    return rates_by_metric
 
 
 def evidence_sections(index: dict, root: Path) -> list[str]:
@@ -478,9 +529,11 @@ def report(result: dict) -> str:
             try:
                 require(any(r["arm"] == arm for r in selected) and any(r["arm"] == "tf" for r in selected), "missing selection")
                 comparable(selected, cross_engine=True)
-                ratios = [statistics.median(r["data"]["summary"][m] for r in selected if r["arm"] == arm)
-                          / statistics.median(r["data"]["summary"][m] for r in selected if r["arm"] == "tf") for m in METRICS]
-                rows.append([lane_id + " / " + arm, rates(records, "tf"), f"{ratios[0]:.4f}x", f"{ratios[1]:.4f}x"])
+                tf_rates = cross_engine_rates(selected, "tf")
+                fabric_rates = cross_engine_rates(selected, arm)
+                ratios = [fabric / tf for fabric, tf in zip(fabric_rates, tf_rates)]
+                rows.append([lane_id + " / " + arm, " / ".join(f"{value:.2f}" for value in tf_rates),
+                             f"{ratios[0]:.4f}x", f"{ratios[1]:.4f}x"])
             except (ValueError, KeyError, TypeError) as error:
                 rows.append([lane_id + " / " + arm, rates(records, "tf"), "UNMEASURED: " + str(error), "UNMEASURED"])
     lines += markdown_table(["Lane / Fabric arm", "TF pp / tg", "Prefill Fabric/TF", "Decode Fabric/TF"], rows)

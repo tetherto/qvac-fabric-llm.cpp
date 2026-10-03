@@ -101,6 +101,19 @@ class ReportGates(unittest.TestCase):
         save(path, data)
         return path
 
+    def add_tensorfold_sessions(self, sessions, lane_id="metal"):
+        selected = []
+        for position, indices in enumerate(sessions):
+            name = f"{lane_id}-tf-{position}.json"
+            data = make_result(lane_id, "tf", name, 500 + position)
+            data["runs"] = [data["runs"][i] for i in indices]
+            config = data["provenance"]["manifest"]["lane"]["report_config"]
+            data["provenance"]["manifest"]["lane"]["report_config"] = {k: config[k] for k in table.TF_CONFIG_FIELDS}
+            save(self.root / name, data)
+            selected.append({"path": name, "prompt_indices": list(indices)})
+        self.index["lanes"][lane_id]["tf"] = selected
+        save(self.path, self.index)
+
     def assert_withheld(self):
         result = table.analyze(self.path)
         self.assertEqual(result["aggregate"], {})
@@ -264,13 +277,7 @@ class ReportGates(unittest.TestCase):
 
     def test_tensorfold_format_difference_and_no_vulkan_ratio(self):
         for lane_id in ("metal", "rtx5090-vulkan"):
-            name = lane_id + "-tf.json"
-            data = make_result(lane_id, "tf", name, 500)
-            config = data["provenance"]["manifest"]["lane"]["report_config"]
-            data["provenance"]["manifest"]["lane"]["report_config"] = {k: config[k] for k in table.TF_CONFIG_FIELDS}
-            save(self.root / name, data)
-            self.index["lanes"][lane_id]["tf"] = [name]
-        save(self.path, self.index)
+            self.add_tensorfold_sessions([(0, 1, 2)], lane_id)
         result = table.analyze(self.path)
         self.assertIsNone(result["aggregate_error"])
         text = table.report(result)
@@ -278,6 +285,41 @@ class ReportGates(unittest.TestCase):
         self.assertIn("| metal / candidate | 100.00 / 10.00 | 2.0000x | 1.5000x |", tf_section)
         self.assertIn("| rtx5090-vulkan | n/a: no TensorFold Vulkan backend | n/a | n/a |", tf_section)
         self.assertIn("engine-plus-format", text)
+
+    def test_tensorfold_independent_launches_match_each_prompt(self):
+        self.add_tensorfold_sessions([(0,), (1,), (2,)])
+        result = table.analyze(self.path)
+        selected = [r for r in result["lanes"]["metal"]["records"].values() if r["arm"] in ("candidate", "tf")]
+        table.comparable(selected, cross_engine=True)
+        self.assertEqual(table.cross_engine_rates(selected, "candidate"), [200, 15])
+        self.assertEqual(table.cross_engine_rates(selected, "tf"), [100, 10])
+        self.assertIn("| metal / candidate | 100.00 / 10.00 | 2.0000x | 1.5000x |", table.report(result))
+
+    def test_tensorfold_declared_coverage_must_be_complete_and_balanced(self):
+        for sessions in ([(0,), (1,)], [(0, 1, 2), (0,)]):
+            with self.subTest(sessions=sessions):
+                self.add_tensorfold_sessions(sessions)
+                with self.assertRaisesRegex(ValueError, "equal coverage"):
+                    table.analyze(self.path)
+
+    def test_tensorfold_independent_launches_still_require_same_configuration(self):
+        self.add_tensorfold_sessions([(0,), (1,), (2,)])
+        path = self.root / self.index["lanes"]["metal"]["tf"][1]["path"]
+        original = table.load_json(path)
+        changes = [
+            lambda d: d["runs"][0]["request"].update(prompt="different rendered prompt"),
+            lambda d: d["provenance"]["manifest"]["lane"]["report_config"]["backend_config"].update(precision="changed"),
+            lambda d: d["provenance"]["manifest"].update(created_unix_s=500),
+        ]
+        for change in changes:
+            with self.subTest(change=change):
+                data = copy.deepcopy(original)
+                change(data)
+                save(path, data)
+                result = table.analyze(self.path)
+                selected = [r for r in result["lanes"]["metal"]["records"].values() if r["arm"] in ("candidate", "tf")]
+                with self.assertRaises(ValueError):
+                    table.comparable(selected, cross_engine=True)
 
     def test_tensorfold_uncached_evidence_must_exist_at_pinned_revision(self):
         data = make_result("metal", "tf", "tf-evidenced", 500)
