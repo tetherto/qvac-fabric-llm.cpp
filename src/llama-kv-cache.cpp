@@ -1318,6 +1318,10 @@ uint32_t llama_kv_cache::get_size() const {
     return cells.size();
 }
 
+uint32_t llama_kv_cache::get_n_seq_max() const {
+    return n_seq_max;
+}
+
 uint32_t llama_kv_cache::get_n_stream() const {
     return n_stream;
 }
@@ -1367,10 +1371,6 @@ uint32_t llama_kv_cache::get_stream(llama_seq_id seq_id) const {
     GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < seq_to_stream.size());
 
     return seq_to_stream[seq_id];
-}
-
-uint32_t llama_kv_cache::get_n_seq_ids() const {
-    return (uint32_t) seq_to_stream.size();
 }
 
 uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {
@@ -2958,10 +2958,6 @@ ggml_type llama_kv_cache_context::type_v() const {
 
 ggml_tensor * llama_kv_cache_context::get_k(ggml_context * ctx, int32_t il) const {
     return kv->get_k(ctx, il, n_kv, sinfos[i_cur]);
-}
-
-ggml_tensor * llama_kv_cache_context::get_k_storage(int32_t il) const {
-    return kv->get_k_storage(il);
 }
 
 ggml_tensor * llama_kv_cache_context::get_v(ggml_context * ctx, int32_t il) const {

@@ -395,9 +395,9 @@ class Keys:
         IMAGE_MEAN            = "clip.vision.image_mean"
         IMAGE_STD             = "clip.vision.image_std"
         SPATIAL_MERGE_SIZE    = "clip.vision.spatial_merge_size"
+        SWIGLU_CLAMP          = "clip.vision.swiglu_clamp"
         EXPERT_COUNT_PER_LAYER = "clip.vision.expert_count_per_layer" # dots3note pyramid MoE, 0 = dense layer
         EXPERT_USED_COUNT     = "clip.vision.expert_used_count"
-        SWIGLU_CLAMP          = "clip.vision.swiglu_clamp"
         USE_GELU              = "clip.use_gelu"
         USE_SILU              = "clip.use_silu"
         N_WA_PATTERN          = "clip.vision.n_wa_pattern"     # used by qwen2.5vl

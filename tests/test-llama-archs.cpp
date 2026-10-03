@@ -135,6 +135,7 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
             || arch == LLM_ARCH_KIMI_LINEAR
             || arch == LLM_ARCH_BAILINGMOE3
             || arch == LLM_ARCH_KIMI_K3
+            || arch == LLM_ARCH_GLM5_NEXT
             || arch == LLM_ARCH_MISTRAL4
             || arch == LLM_ARCH_HY_V4) {
         n_embd = 128;
@@ -220,8 +221,8 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
             || arch == LLM_ARCH_BAILINGMOE3
             || arch == LLM_ARCH_KIMI_K3
             || arch == LLM_ARCH_GLM5_NEXT
-            || arch == LLM_ARCH_MISTRAL4
-            || arch == LLM_ARCH_HY_V4) {
+            || arch == LLM_ARCH_HY_V4
+            || arch == LLM_ARCH_MISTRAL4) {
         // GLM5 next MLA is nope only, the cache row is the compressed latent alone.
         ms.add_kv(LLM_KV_ATTENTION_KEY_LENGTH,       arch == LLM_ARCH_GLM5_NEXT ? uint32_t(512) : uint32_t(576));
         ms.add_kv(LLM_KV_ATTENTION_VALUE_LENGTH,     uint32_t(512));
@@ -1611,7 +1612,9 @@ static int test_glm5_kpool_sequences() {
     decode({{30, 4, {1}}, {31, 5, {1}}, {32, 6, {1}}, {33, 7, {1}}});
     selected.indices.clear();
     decode({{40, 8, {0, 1}}});
-    GGML_ASSERT(unique_count() >= 13); // shared prefix once, both unique branches, current token
+    // a token in several sequences attends to its first sequence only, as the KQ mask does:
+    // the shared prefix once, seq 0's branch and the current token
+    GGML_ASSERT(unique_count() >= 9);
 
     printf("GLM5 k-pool sequence edit and shared-token tests passed\n");
     return 0;

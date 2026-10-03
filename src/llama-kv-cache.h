@@ -157,8 +157,8 @@ public:
     //
 
     uint32_t get_size()     const;
+    uint32_t get_n_seq_max() const;
     uint32_t get_n_stream() const;
-    uint32_t get_n_seq_ids() const;
 
     bool get_has_shift() const;
 
@@ -410,9 +410,6 @@ public:
     // get views of the current state of the cache
     ggml_tensor * get_k(ggml_context * ctx, int32_t il) const;
     ggml_tensor * get_v(ggml_context * ctx, int32_t il) const;
-
-    // The full K storage tensor of the layer, spanning all streams.
-    ggml_tensor * get_k_storage(int32_t il) const;
 
     // store k_cur and v_cur in the cache based on the provided head location
     // note: the heads in k_cur and v_cur should be laid out contiguously in memory
