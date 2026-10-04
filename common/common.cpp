@@ -1798,6 +1798,7 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     // Disable weight repacking for training loads, backward ops can't read
     // repacked layouts.
     mparams.use_extra_bufts = !params.no_extra_bufts && !params.training;
+    mparams.training        = params.training;
     mparams.no_host         = params.no_host;
 
     if (params.kv_overrides.empty()) {
