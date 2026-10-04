@@ -1279,7 +1279,8 @@ mtmd_image_preproc_out mtmd_image_preprocessor_idefics3::preprocess(const clip_i
     const clip_image_size original_size = img.get_size();
 
     // old gguf files have no preprocessor longest size, custom token limits also need the generic size below
-    if (hparams.image_longest_edge > 0 && hparams.image_min_pixels <= 0 && hparams.image_max_pixels <= 0) {
+    // no_upscale is only applied by the generic size below
+    if (!hparams.image_no_upscale && hparams.image_longest_edge > 0 && hparams.image_min_pixels <= 0 && hparams.image_max_pixels <= 0) {
         const int    tile_size    = hparams.image_size;
         const int    longest_edge = hparams.image_longest_edge;
         const double aspect_ratio = (double) original_size.width / original_size.height;
