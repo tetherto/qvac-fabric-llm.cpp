@@ -2692,6 +2692,15 @@ ggml_tensor * rpc_server::create_node(uint64_t id,
     }
     result->view_offs = tensor->view_offs;
     if (result->extra != nullptr && result->view_src != nullptr && result->view_src->extra != nullptr) {
+        // Backends address a view through the parent's extra plus view_offs, so it must
+        // land where the bounds-checked data is.
+        if (ggml_nbytes(result) != 0 &&
+            (result->buffer != result->view_src->buffer ||
+             tensor->view_offs > UINTPTR_MAX - (uintptr_t) result->view_src->data ||
+             (char *) result->view_src->data + tensor->view_offs != (char *) result->data)) {
+            GGML_LOG_ERROR("[%s] view '%s' does not match its view_src\n", __func__, tensor->name);
+            return nullptr;
+        }
         result->extra = result->view_src->extra;
     }
     return result;
