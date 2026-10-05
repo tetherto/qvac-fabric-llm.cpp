@@ -178,7 +178,8 @@ uint64_t ggml_openvino_model_fingerprint(const ggml_cgraph * cgraph,
                                          bool fa,
                                          const int32_t * rope_params,
                                          int rope_len,
-                                         uint64_t extra_cfg) {
+                                         uint64_t extra_cfg,
+                                         int64_t fixed_token_count) {
     uint64_t h = FNV_OFFSET;
 
     // Topology: node count + each node's op and name (cheap, and distinguishes
@@ -200,6 +201,11 @@ uint64_t ggml_openvino_model_fingerprint(const ggml_cgraph * cgraph,
         h = fnv1a(h, rope_params, sizeof(int32_t) * static_cast<size_t>(rope_len));
     }
     h = fnv1a_u64(h, extra_cfg);
+    if (fixed_token_count > 0) {
+        constexpr char token_shape_tag[] = "fixed-token-shape";
+        h = fnv1a(h, token_shape_tag, sizeof(token_shape_tag) - 1);
+        h = fnv1a_u64(h, static_cast<uint64_t>(fixed_token_count));
+    }
     const std::string ver = ov_version_string();
     h = fnv1a(h, ver.data(), ver.size());
 

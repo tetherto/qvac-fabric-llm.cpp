@@ -1222,12 +1222,6 @@ static bool is_op_unsupported_case(const ggml_tensor * op) {
         if (ggml_openvino_get_device_name() == "GPU" && mul_mat_id_requires_large_tmp(op)) {
             return true;
         }
-        // The CPU plugin indexes the packed MXFP4 temporary with signed 32-bit byte offsets, so a
-        // temporary over 2 GiB reads out of bounds.
-        if (ggml_openvino_get_device_name() == "CPU" && op->src[0] != nullptr && op->src[0]->type == GGML_TYPE_MXFP4 &&
-            mul_mat_id_requires_large_tmp(op)) {
-            return true;
-        }
         break;
     }
     case GGML_OP_ROPE: {
