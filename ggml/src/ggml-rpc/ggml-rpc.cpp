@@ -1854,6 +1854,32 @@ private:
     void sync_all_backends();
     bool get_cached_file(uint64_t hash, std::vector<uint8_t> & data);
     ggml_tensor * deserialize_tensor(struct ggml_context * ctx, const rpc_tensor * tensor);
+    // Backend tensor extras (e.g. OpenCL's per-tensor device handles and re-laid-out weights)
+    // live in tensor->extra, but every command deserializes a fresh tensor. Keep them server-side.
+    struct extra_key {
+        ggml_backend_buffer_t buffer;
+        void *                data;
+        int32_t               type;
+        int64_t               ne[GGML_MAX_DIMS];
+        size_t                nb[GGML_MAX_DIMS];
+        bool operator==(const extra_key & o) const {
+            return buffer == o.buffer && data == o.data && type == o.type &&
+                   memcmp(ne, o.ne, sizeof(ne)) == 0 && memcmp(nb, o.nb, sizeof(nb)) == 0;
+        }
+    };
+    struct extra_key_hash {
+        size_t operator()(const extra_key & k) const {
+            size_t h = std::hash<const void *>()(k.buffer) ^ (std::hash<const void *>()(k.data) << 1) ^ ((size_t) k.type << 7);
+            for (int i = 0; i < GGML_MAX_DIMS; i++) {
+                h = h * 1099511628211ull ^ (size_t) k.ne[i] ^ (k.nb[i] << 3);
+            }
+            return h;
+        }
+    };
+    static extra_key make_extra_key(const ggml_tensor * t);
+    void attach_extra(ggml_tensor * t);
+    void remember_extra(const ggml_tensor * t);
+    void forget_extras(ggml_backend_buffer_t buffer);
     ggml_tensor * create_node(uint64_t id,
                               struct ggml_context * ctx,
                               const std::unordered_map<uint64_t, const rpc_tensor*> & tensor_ptrs,
@@ -1882,6 +1908,9 @@ private:
     std::string bind_host;
     const char * cache_dir;
     std::unordered_set<ggml_backend_buffer_t> buffers;
+    std::unordered_map<extra_key, void *, extra_key_hash> tensor_extras;
+    std::unordered_map<ggml_backend_buffer_t, bool> buffer_uses_extras;
+    std::vector<uint8_t> pad_staging; // see rpc_padded_src
     // computed graphs cached per backend, keyed by uid
     std::vector<std::unordered_map<uint64_t, stored_graph>> stored_graphs;
     std::vector<comm_state> comm_states;
@@ -1999,6 +2028,7 @@ bool rpc_server::free_buffer(const rpc_msg_free_buffer_req & request) {
         GGML_LOG_ERROR("[%s] buffer not found\n", __func__);
         return false;
     }
+    forget_extras(buffer);
     ggml_backend_buffer_free(buffer);
     buffers.erase(buffer);
     return true;
@@ -2061,6 +2091,61 @@ bool rpc_server::memset_tensor(const rpc_msg_memset_tensor_req & request) {
             __func__, (void *) tensor->buffer, tensor->data, request.offset, request.size, request.value);
     ggml_backend_tensor_memset(tensor, request.value, request.offset, request.size);
     return true;
+}
+
+rpc_server::extra_key rpc_server::make_extra_key(const ggml_tensor * t) {
+    extra_key k {};
+    k.buffer = t->buffer;
+    k.data   = t->data;
+    k.type   = t->type;
+    for (int i = 0; i < GGML_MAX_DIMS; i++) {
+        k.ne[i] = t->ne[i];
+        k.nb[i] = t->nb[i];
+    }
+    return k;
+}
+
+// Give a freshly deserialized tensor the extra its backend created for it earlier, or create it
+// once with the buffer's init_tensor. Backends whose init_tensor leaves extra unset are skipped.
+void rpc_server::attach_extra(ggml_tensor * t) {
+    if (t->buffer == nullptr || t->data == nullptr || t->buffer->iface.init_tensor == nullptr) {
+        return;
+    }
+    auto uses = buffer_uses_extras.find(t->buffer);
+    if (uses != buffer_uses_extras.end() && !uses->second) {
+        return;
+    }
+    const extra_key key = make_extra_key(t);
+    auto it = tensor_extras.find(key);
+    if (it != tensor_extras.end()) {
+        t->extra = it->second;
+        return;
+    }
+    // View relationships are resolved later (create_node); initialize as a standalone tensor.
+    ggml_tensor * view_src = t->view_src;
+    t->view_src = nullptr;
+    t->buffer->iface.init_tensor(t->buffer, t);
+    t->view_src = view_src;
+    if (uses == buffer_uses_extras.end()) {
+        buffer_uses_extras[t->buffer] = t->extra != nullptr;
+    }
+    if (t->extra != nullptr) {
+        tensor_extras[key] = t->extra;
+    }
+}
+
+// set_tensor may replace the extra (e.g. OpenCL re-lays out quantized weights); keep the new one.
+void rpc_server::remember_extra(const ggml_tensor * t) {
+    if (t->extra != nullptr && t->buffer != nullptr) {
+        tensor_extras[make_extra_key(t)] = t->extra;
+    }
+}
+
+void rpc_server::forget_extras(ggml_backend_buffer_t buffer) {
+    buffer_uses_extras.erase(buffer);
+    for (auto it = tensor_extras.begin(); it != tensor_extras.end();) {
+        it = it->first.buffer == buffer ? tensor_extras.erase(it) : std::next(it);
+    }
 }
 
 ggml_tensor * rpc_server::deserialize_tensor(struct ggml_context * ctx, const rpc_tensor * tensor) {
@@ -2141,9 +2226,41 @@ ggml_tensor * rpc_server::deserialize_tensor(struct ggml_context * ctx, const rp
         result->data = ggml_backend_buffer_get_base(result->buffer);
     }
     ggml_set_name(result, tensor->name);
+    attach_extra(result);
     return result;
 }
 
+
+// Backends that re-lay out quantized tensors (e.g. OpenCL) read ggml_nbytes(t) bytes from each
+// copy's source, whatever the write size. Short writes go through a staging buffer that stays
+// zeroed between writes, so they never read past `data` and cost only their own size.
+struct rpc_padded_src {
+    std::vector<uint8_t> & staging;
+    const void *           ptr;
+    size_t                 used = 0;
+
+    rpc_padded_src(std::vector<uint8_t> & staging, const ggml_tensor * t, const void * data, size_t avail,
+                   size_t last_copy) : staging(staging), ptr(data) {
+        if (t->extra == nullptr || !ggml_is_quantized(t->type)) {
+            return;
+        }
+        const size_t need = last_copy + ggml_nbytes(t);
+        if (avail >= need) {
+            return;
+        }
+        if (staging.size() < need) {
+            staging.resize(need, 0);
+        }
+        memcpy(staging.data(), data, avail);
+        used = avail;
+        ptr  = staging.data();
+    }
+    ~rpc_padded_src() {
+        if (used != 0) {
+            memset(staging.data(), 0, used);
+        }
+    }
+};
 
 bool rpc_server::set_tensor(const std::vector<uint8_t> & input) {
     sync_all_backends();
@@ -2197,7 +2314,9 @@ bool rpc_server::set_tensor(const std::vector<uint8_t> & input) {
         ofs.write((const char *)data, size);
         GGML_LOG_INFO("[%s] saved to '%s'\n", __func__, cache_file.string().c_str());
     }
-    ggml_backend_tensor_set(tensor, data, offset, size);
+    rpc_padded_src src(pad_staging, tensor, data, size, 0);
+    ggml_backend_tensor_set(tensor, src.ptr, offset, size);
+    remember_extra(tensor);
     return true;
 }
 
@@ -2275,7 +2394,9 @@ bool rpc_server::set_tensor_2d(const std::vector<uint8_t> & input) {
         ofs.write((const char *) data, data_size);
         GGML_LOG_INFO("[%s] saved to '%s'\n", __func__, cache_file.string().c_str());
     }
-    ggml_backend_tensor_set_2d(tensor, data, offset, size, n_copies, stride, size);
+    rpc_padded_src src(pad_staging, tensor, data, data_size, (n_copies - 1)*size);
+    ggml_backend_tensor_set_2d(tensor, src.ptr, offset, size, n_copies, stride, size);
+    remember_extra(tensor);
     return true;
 }
 
@@ -2337,7 +2458,9 @@ bool rpc_server::set_tensor_hash(const rpc_msg_set_tensor_hash_req & request, rp
             return false;
         }
     }
-    ggml_backend_tensor_set(tensor, cached_file.data(), request.offset, size);
+    rpc_padded_src src(pad_staging, tensor, cached_file.data(), size, 0);
+    ggml_backend_tensor_set(tensor, src.ptr, request.offset, size);
+    remember_extra(tensor);
     response.result = 1;
     return true;
 }
@@ -2380,8 +2503,10 @@ bool rpc_server::set_tensor_2d_hash(
         return false;
     }
 
-    ggml_backend_tensor_set_2d(tensor, cached_file.data(), request.offset, request.size, request.n_copies,
-                               request.stride, request.size);
+    rpc_padded_src src(pad_staging, tensor, cached_file.data(), data_size, (request.n_copies - 1)*request.size);
+    ggml_backend_tensor_set_2d(tensor, src.ptr, request.offset, request.size, request.n_copies, request.stride,
+                               request.size);
+    remember_extra(tensor);
     response.result = 1;
     return true;
 }
@@ -2405,18 +2530,15 @@ bool rpc_server::init_tensor(const rpc_msg_init_tensor_req & request) {
     // Call the backend's buffer_init_tensor function
     ggml_backend_buffer_t buffer = tensor->buffer;
     if (buffer && buffer->iface.init_tensor) {
-        buffer->iface.init_tensor(buffer, tensor);
+        // deserialize_tensor already attached a server-side extra for backends that use one.
+        if (tensor->extra == nullptr) {
+            buffer->iface.init_tensor(buffer, tensor);
+            remember_extra(tensor);
+        }
     } else {
         if (!buffer) {
             GGML_LOG_ERROR("Tensor with null buffer passed to init_tensor function\n");
         }
-    }
-
-    if (tensor->extra != nullptr) {
-        // This pointer can either be passed around client/server, or probably better stored server-side and kept track of.
-        // Currently unimplemented.
-        GGML_LOG_ERROR("tensor->extra populated by the backend, this is currently unsupported.\n");
-        return false;
     }
 
     return true;
@@ -2605,6 +2727,18 @@ ggml_tensor * rpc_server::create_node(uint64_t id,
         }
     }
     result->view_offs = tensor->view_offs;
+    if (result->extra != nullptr && result->view_src != nullptr && result->view_src->extra != nullptr) {
+        // Backends address a view through the parent's extra plus view_offs, so it must
+        // land where the bounds-checked data is.
+        if (ggml_nbytes(result) != 0 &&
+            (result->buffer != result->view_src->buffer ||
+             tensor->view_offs > UINTPTR_MAX - (uintptr_t) result->view_src->data ||
+             (char *) result->view_src->data + tensor->view_offs != (char *) result->data)) {
+            GGML_LOG_ERROR("[%s] view '%s' does not match its view_src\n", __func__, tensor->name);
+            return nullptr;
+        }
+        result->extra = result->view_src->extra;
+    }
     return result;
 }
 
