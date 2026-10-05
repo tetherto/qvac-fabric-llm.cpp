@@ -10065,16 +10065,18 @@ struct ggml_backend_opencl_buffer_context {
     std::vector<ggml_tensor_extra_cl_q6_K *> temp_tensor_extras_q6_K;
     std::vector<ggml_tensor_extra_cl_q6_K *> temp_tensor_extras_q6_K_in_use;
 
-    // q8_0 tensors with AoS->SoA layout conversion installed by set_tensor.
+    // Extras of q8_0 tensors with AoS->SoA layout conversion installed by set_tensor.
+    // Keyed by extra, not by tensor: an RPC server sees a new ggml_tensor for every
+    // command, while the extra stays the same.
     // Two types of tensors get SOA'ed - normal weights and MoE weights.
     // In Q8_0's case, we only have normal weights. If we ever have Q8_0 as MoE
     // weights, they need to be added to this set in `set_tensors`.
-    std::unordered_set<const ggml_tensor *> q8_0_soa_tensors;
+    std::unordered_set<const void *> q8_0_soa_tensors;
 
     // Same for q4_0. KV-cache q4_0 tensors are allocated but never pass
     // through set_tensor, so they stay AoS and aren't in this set.
     // In Q4_0's case, in addition to normal weights, we have MoE weights.
-    std::unordered_set<const ggml_tensor *> q4_0_soa_tensors;
+    std::unordered_set<const void *> q4_0_soa_tensors;
 
     // The buffer_context is initially created by ggml_backend_buft_alloc_buffer
     // before any tensor is initialized (at the beginning of alloc_tensor_range).
@@ -10416,7 +10418,7 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
             extra->q_img = clCreateImage(context, CL_MEM_READ_ONLY, &img_format_q, &img_desc_q, NULL, &err);
             tensor->extra = extra;
             // MoE tensors are also SOA'ed
-            ctx->q4_0_soa_tensors.insert(tensor);
+            ctx->q4_0_soa_tensors.insert(extra);
 
             return;
         }
@@ -10445,7 +10447,7 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
         CL_CHECK(clReleaseMemObject(data_device));
 
         tensor->extra = extra;
-        ctx->q4_0_soa_tensors.insert(tensor);
+        ctx->q4_0_soa_tensors.insert(extra);
 
         // transpose the weights and scales
 #ifdef GGML_OPENCL_USE_ADRENO_KERNELS
@@ -11086,7 +11088,7 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
         CL_CHECK(clReleaseMemObject(data_device));
 
         tensor->extra = extra;
-        ctx->q8_0_soa_tensors.insert(tensor);
+        ctx->q8_0_soa_tensors.insert(extra);
 
         // Generic dp4a MoE path (opt-in GGML_OPENCL_Q8_MOE_DP4A)
 #ifdef GGML_OPENCL_USE_ADRENO_KERNELS
@@ -13732,7 +13734,7 @@ static bool ggml_cl_is_q8_0_soa(const ggml_tensor * tensor) {
         return false;
     }
     const ggml_tensor * key = tensor->view_src != nullptr ? tensor->view_src : tensor;
-    return ctx->q8_0_soa_tensors.count(key) > 0;
+    return key->extra != nullptr && ctx->q8_0_soa_tensors.count(key->extra) > 0;
 }
 
 // check if a Q4_0 tensor has been SOA'ed in set_tensor
@@ -13746,7 +13748,7 @@ static bool ggml_cl_is_q4_0_soa(const ggml_tensor * tensor) {
         return false;
     }
     const ggml_tensor * key = tensor->view_src != nullptr ? tensor->view_src : tensor;
-    return ctx->q4_0_soa_tensors.count(key) > 0;
+    return key->extra != nullptr && ctx->q4_0_soa_tensors.count(key->extra) > 0;
 }
 
 static void ggml_cl_set_rows(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
