@@ -155,6 +155,12 @@ if (CUDAToolkit_FOUND)
                              ${GGML_SOURCES_CUDA}
                             )
 
+    # A second CUDA build, such as a CUDA 12 module next to a CUDA 13 one, needs
+    # its own file name. The loader still finds it by the qvac-ggml-cuda prefix.
+    if (GGML_BACKEND_DL AND GGML_CUDA_MODULE_SUFFIX)
+        set_target_properties(ggml-cuda PROPERTIES OUTPUT_NAME "qvac-ggml-cuda${GGML_CUDA_MODULE_SUFFIX}")
+    endif()
+
 
     if (GGML_CUDA_GRAPHS)
         add_compile_definitions(GGML_CUDA_USE_GRAPHS)
