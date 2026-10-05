@@ -32,8 +32,7 @@ uint64_t ggml_openvino_model_fingerprint(const ggml_cgraph * cgraph,
                                          bool fa,
                                          const int32_t * rope_params,
                                          int rope_len,
-                                         uint64_t extra_cfg,
-                                         int64_t fixed_token_count = 0);
+                                         uint64_t extra_cfg);
 
 // Path to the compiled-blob file for a fingerprint (<dir>/<hex>.blob).
 std::string ggml_openvino_model_cache_blob_path(const std::string & dir, uint64_t fingerprint);

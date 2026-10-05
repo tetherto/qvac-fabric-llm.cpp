@@ -43,10 +43,8 @@ GgmlOvDecoder::GgmlOvDecoder(ggml_cgraph * cgraph,
                              bool is_stateful,
                              bool model_is_splitted,
                              bool is_prefill,
-                             int prefill_chunk_size,
-                             bool fixed_token_shape) :
+                             int prefill_chunk_size) :
     m_is_static(is_static),
-    m_fixed_token_shape(fixed_token_shape),
     m_is_stateful(is_stateful),
     m_is_prefill(is_prefill),
     m_naive(false),
@@ -696,7 +694,7 @@ ov::PartialShape GgmlOvDecoder::get_graph_input_shape(const ggml_tensor * op,
 
     if (is_inp_tok(input, op) || is_inp_pos(input, op)) {
         // tokens or positions
-        int len = m_is_static ? (m_is_prefill ? m_prefill_chunk_size : 1) : m_fixed_token_shape ? input->ne[0] : -1;
+        int len = m_is_static ? (m_is_prefill ? m_prefill_chunk_size : 1) : -1;
         if (m_is_static && is_inp_pos(input, op)) {
             // IMROPE stacks n_planes (t/h/w/e) position planes back to back
             len *= get_inp_pos_n_planes(op);
@@ -715,9 +713,6 @@ ov::PartialShape GgmlOvDecoder::get_graph_input_shape(const ggml_tensor * op,
             input_shape = ov::PartialShape{1, 1, -1, -1};
         } else {
             input_shape = ov::PartialShape{-1, 1, -1, -1};
-            if (m_fixed_token_shape) {
-                input_shape[2] = input->ne[1];
-            }
         }
 
     } else if (is_kvcache(input, op)) {
@@ -739,7 +734,7 @@ ov::PartialShape GgmlOvDecoder::get_graph_input_shape(const ggml_tensor * op,
 
     } else if (is_kv_idx(input, op)) {
         // kv update index
-        int len = m_is_static ? (m_is_prefill ? m_prefill_chunk_size : 1) : m_fixed_token_shape ? input->ne[0] : -1;
+        int len = m_is_static ? (m_is_prefill ? m_prefill_chunk_size : 1) : -1;
         input_shape = ov::PartialShape{1, 1, 1, len};
 
     } else if (is_inp_s_copy(input, op) || is_s_copy_leaf(input)) {
@@ -1432,9 +1427,7 @@ ov::PartialShape GgmlOvDecoder::get_view_input_ov_shape(int node_idx,
             if (dynamic_it != m_node_dynamic_dims.end() && dynamic_it->second != -1) {
                 int dynamic_dim_index = dynamic_it->second;
                 // GGML uses reverse indexing, so convert to OpenVINO indexing
-                shape[3 - dynamic_dim_index] = m_is_static         ? get_static_n_tokens() :
-                                               m_fixed_token_shape ? tensor->ne[dynamic_dim_index] :
-                                                                     -1;
+                shape[3 - dynamic_dim_index] = m_is_static ? get_static_n_tokens() : -1;
             }
 
             return shape;
@@ -1459,9 +1452,7 @@ ov::PartialShape GgmlOvDecoder::get_view_input_src_ov_shape(int node_idx,
                 if (dynamic_it != m_node_dynamic_dims.end() && dynamic_it->second != -1) {
                     int dynamic_dim_index = dynamic_it->second;
                     // GGML uses reverse indexing, so convert to OpenVINO indexing
-                    shape[3 - dynamic_dim_index] = m_is_static         ? get_static_n_tokens() :
-                                                   m_fixed_token_shape ? src_tensor->ne[dynamic_dim_index] :
-                                                                         -1;
+                    shape[3 - dynamic_dim_index] = m_is_static ? get_static_n_tokens() : -1;
                 }
 
                 return shape;
