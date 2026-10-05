@@ -1652,6 +1652,11 @@ struct llama_model_dflash : public llama_model_base {
         llm_graph_input_attn_kv      * inp_attn      = nullptr;
         llm_graph_input_attn_kv_iswa * inp_attn_iswa = nullptr;
 
+        // set by build_logits: the DFlash2 draft vocabulary ids (null when it is unused) and the logits before any
+        // scatter to the target vocabulary
+        ggml_tensor * draft_ids    = nullptr;
+        ggml_tensor * logits_draft = nullptr;
+
         graph_base(const llm_graph_params & params);
 
         ggml_tensor * build_inject();

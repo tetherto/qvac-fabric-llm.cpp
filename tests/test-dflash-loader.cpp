@@ -2,6 +2,10 @@
 #include "ggml.h"
 #include "gguf.h"
 #include "llama.h"
+#include "llama-context.h"
+#include "llama-model.h"
+#include "llama-ext.h"
+#include "speculative.h"
 
 #include <algorithm>
 #include <cmath>
@@ -10,19 +14,29 @@
 #include <cstring>
 #include <iterator>
 #include <numeric>
+#include <stdexcept>
 #include <vector>
 
 static constexpr const char * PATH = "test-dflash-loader.gguf";
-static constexpr int64_t N_EMBD = 16;
+// a whole Q4_0 block per head row, so the CPU backend can repack a quantized head
+static constexpr int64_t N_EMBD = 32;
 static constexpr int32_t N_BLOCK = 4;
-static constexpr int64_t N_VOCAB = 16;
+// room for one-token draft vocabulary ranges whose graph nodes outgrow the DFlash2 base budget of 1024
+static constexpr int64_t N_VOCAB = 512;
 static constexpr int64_t N_FF = 32;
 static constexpr size_t TENSOR_DATA_BYTES = 1024 * 1024;
 static constexpr int32_t SELECTOR_TOP_K = 2;
+// two [begin, end) ranges, so the head views are concatenated
+static constexpr int32_t DRAFT_VOCAB_RANGES[] = { 2, 4, 10, 14 };
+static constexpr int32_t N_DRAFT_VOCAB_RANGES = 2;
+// one range with fewer ids than the selector top-k
+static constexpr int32_t UNDERSIZED_DRAFT_VOCAB_RANGE[] = { 2, 2 + SELECTOR_TOP_K - 1 };
 static constexpr float REL_TOLERANCE = 1e-3f;
 static constexpr float RMS_NORM_EPS = 1e-5f;
 // the fused-encoder check extracts two target layers, so its features are wider than the decoder input
 static constexpr int32_t N_FUSED_TARGET_LAYERS = 2;
+// rows of a reduced (d2t) draft head
+static constexpr int64_t N_REDUCED_HEAD = 8;
 static constexpr uint32_t N_SWA = 8;
 
 struct tensor_info {
@@ -52,9 +66,10 @@ static const tensor_info SELECTOR_TENSORS[] = {
     { "selector_successor.weight",   { 4, N_VOCAB, 0 } },
     { "selector_hidden.weight",      { N_EMBD, 4, 0 } },
     { "blk.0.attn_conv_base",        { N_EMBD, 2, 2 } },
-    { "blk.0.attn_conv_proj.weight", { N_EMBD, 16, 0 } },
+    // 2 * kernel * (N_EMBD / group) projected values, N_EMBD for kernel 2 and group 4
+    { "blk.0.attn_conv_proj.weight", { N_EMBD, N_EMBD, 0 } },
     { "blk.0.ffn_conv_base",         { N_EMBD, 2, 2 } },
-    { "blk.0.ffn_conv_proj.weight",  { N_EMBD, 16, 0 } },
+    { "blk.0.ffn_conv_proj.weight",  { N_EMBD, N_EMBD, 0 } },
 };
 
 static const tensor_info DSPARK_TENSORS[] = {
@@ -71,15 +86,41 @@ enum class case_type {
     missing_rank,
     missing_predecessor,
     missing_conv_projection,
+    reduced_head,
+    quantized_head,
     sliding_window,
     full_attention_window,
 };
 
-// the encoder fc takes n_target_layers concatenated features
-static void set_fc_width(std::vector<tensor_info> & tensors, int32_t n_target_layers) {
+static bool in_draft_vocab(int64_t id) {
+    for (int32_t r = 0; r < N_DRAFT_VOCAB_RANGES; ++r) {
+        if (id >= DRAFT_VOCAB_RANGES[2*r] && id < DRAFT_VOCAB_RANGES[2*r + 1]) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// head rows with distinct logits that favor the ids outside the draft vocabulary; Q4_0 stores the constant rows exactly
+static void fill_output_head(ggml_tensor * head) {
+    std::vector<float> rows(N_VOCAB * N_EMBD);
+    for (int64_t r = 0; r < N_VOCAB; ++r) {
+        std::fill_n(rows.data() + r*N_EMBD, N_EMBD, (in_draft_vocab(r) ? -1.0f : 1.0f) * float(r + 1));
+    }
+    ggml_quantize_chunk(head->type, rows.data(), head->data, 0, N_VOCAB, N_EMBD, nullptr);
+}
+
+static ggml_type tensor_type(case_type kind, const char * name) {
+    return kind == case_type::quantized_head && std::strcmp(name, "output.weight") == 0 ? GGML_TYPE_Q4_0 : GGML_TYPE_F32;
+}
+
+// the encoder fc takes n_target_layers concatenated features and the head has n_head rows
+static void set_io_widths(std::vector<tensor_info> & tensors, int32_t n_target_layers, int64_t n_head) {
     for (auto & ti : tensors) {
         if (std::strcmp(ti.name, "fc.weight") == 0) {
             ti.ne[0] = N_EMBD * n_target_layers;
+        } else if (std::strcmp(ti.name, "output.weight") == 0) {
+            ti.ne[1] = n_head;
         }
     }
 }
@@ -91,6 +132,16 @@ static void fill_identity_fc(float * data, int64_t n_in) {
     }
 }
 
+static void add_d2t(ggml_context * ctx, gguf_context * gguf, bool tensor_backed) {
+    ggml_tensor * d2t = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, N_REDUCED_HEAD);
+    ggml_set_name(d2t, "d2t");
+    if (tensor_backed) {
+        auto * ids = static_cast<int64_t *>(d2t->data);
+        std::iota(ids, ids + N_REDUCED_HEAD, 0);
+    }
+    gguf_add_tensor(gguf, d2t);
+}
+
 static bool write_model(case_type kind, bool tensor_backed = false, int32_t n_target_layers = 1) {
     std::vector<tensor_info> tensors(std::begin(BASE_TENSORS), std::end(BASE_TENSORS));
     if (kind == case_type::dspark) {
@@ -100,7 +151,7 @@ static bool write_model(case_type kind, bool tensor_backed = false, int32_t n_ta
         tensors.push_back({ "token_embd.weight", { N_EMBD, N_VOCAB, 0 } });
         tensors.push_back({ "output.weight", { N_EMBD, N_VOCAB, 0 } });
     }
-    set_fc_width(tensors, n_target_layers);
+    set_io_widths(tensors, n_target_layers, kind == case_type::reduced_head ? N_REDUCED_HEAD : N_VOCAB);
     if (kind != case_type::legacy && kind != case_type::dspark) {
         for (size_t i = 0; i < std::size(SELECTOR_TENSORS); ++i) {
             if ((kind == case_type::missing_predecessor && i == 0) ||
@@ -111,7 +162,8 @@ static bool write_model(case_type kind, bool tensor_backed = false, int32_t n_ta
         }
     }
 
-    const size_t mem_size = ggml_tensor_overhead() * tensors.size() + (tensor_backed ? TENSOR_DATA_BYTES : 0);
+    // one more tensor for d2t
+    const size_t mem_size = ggml_tensor_overhead() * (tensors.size() + 1) + (tensor_backed ? TENSOR_DATA_BYTES : 0);
     std::vector<uint8_t> mem(mem_size);
     ggml_init_params ip = { mem_size, mem.data(), !tensor_backed };
     ggml_context * ctx = ggml_init(ip);
@@ -146,20 +198,31 @@ static bool write_model(case_type kind, bool tensor_backed = false, int32_t n_ta
     }
 
     for (const auto & ti : tensors) {
-        ggml_tensor * t = ti.ne[2] > 0 ? ggml_new_tensor_3d(ctx, GGML_TYPE_F32, ti.ne[0], ti.ne[1], ti.ne[2]) :
-                ti.ne[1] > 0 ? ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ti.ne[0], ti.ne[1]) :
-                ggml_new_tensor_1d(ctx, GGML_TYPE_F32, ti.ne[0]);
+        const ggml_type type = tensor_type(kind, ti.name);
+        ggml_tensor * t = ti.ne[2] > 0 ? ggml_new_tensor_3d(ctx, type, ti.ne[0], ti.ne[1], ti.ne[2]) :
+                ti.ne[1] > 0 ? ggml_new_tensor_2d(ctx, type, ti.ne[0], ti.ne[1]) :
+                ggml_new_tensor_1d(ctx, type, ti.ne[0]);
         ggml_set_name(t, ti.name);
         if (tensor_backed) {
             auto * data = static_cast<float *>(t->data);
-            std::fill_n(data, ggml_nelements(t), 0.0f);
-            if (std::strcmp(ti.name, "output_norm.weight") == 0 || std::strcmp(ti.name, "enc.output_norm.weight") == 0) {
+            std::memset(t->data, 0, ggml_nbytes(t));
+            // token 0 embeds as 1..N_EMBD, so the decoder output and the head logits are not zero
+            if (std::strcmp(ti.name, "token_embd.weight") == 0) {
+                for (int64_t i = 0; i < N_EMBD; ++i) {
+                    data[i] = float(i + 1);
+                }
+            } else if (std::strcmp(ti.name, "output_norm.weight") == 0 || std::strcmp(ti.name, "enc.output_norm.weight") == 0) {
                 std::fill_n(data, N_EMBD, 1.0f);
             } else if (std::strcmp(ti.name, "fc.weight") == 0) {
                 fill_identity_fc(data, ti.ne[0]);
+            } else if (std::strcmp(ti.name, "output.weight") == 0 && ti.ne[1] == N_VOCAB) {
+                fill_output_head(t);
             }
         }
         gguf_add_tensor(gguf, t);
+    }
+    if (kind == case_type::reduced_head) {
+        add_d2t(ctx, gguf, tensor_backed);
     }
     const bool ok = gguf_write_to_file(gguf, PATH, !tensor_backed);
     gguf_free(gguf);
@@ -183,6 +246,136 @@ static bool observe_tensor(ggml_tensor * tensor, bool ask, void * user_data) {
         ggml_backend_tensor_get(tensor, observed.values.data(), 0, ggml_nbytes(tensor));
     }
     return true;
+}
+
+// one block of token 0 at positions 0..N_BLOCK-1 on an empty cache, with logits for every token when asked
+static bool decode_block(llama_context * ctx, bool logits) {
+    llama_memory_clear(llama_get_memory(ctx), true);
+    llama_batch batch = llama_batch_init(N_BLOCK, 0, 1);
+    batch.n_tokens = N_BLOCK;
+    for (int32_t i = 0; i < N_BLOCK; ++i) {
+        batch.token[i] = 0;
+        batch.pos[i] = i;
+        batch.n_seq_id[i] = 1;
+        batch.seq_id[i][0] = 0;
+        batch.logits[i] = logits;
+    }
+    const bool decoded = llama_decode(ctx, batch) == 0;
+    llama_batch_free(batch);
+    return decoded;
+}
+
+static bool read_last_logits(llama_context * ctx, std::vector<float> & logits) {
+    const float * row = llama_get_logits_ith(ctx, N_BLOCK - 1);
+    if (!row) {
+        return false;
+    }
+    logits.assign(row, row + N_VOCAB);
+    return true;
+}
+
+// every selector candidate after the anchor lies in the draft vocabulary
+static bool candidates_in_draft_vocab(llama_context * ctx) {
+    const float * lattice = llama_get_embeddings_nextn(ctx);
+    if (!lattice) {
+        return false;
+    }
+    for (int32_t i = 1; i < N_BLOCK; ++i) {
+        for (int32_t k = 0; k < SELECTOR_TOP_K; ++k) {
+            if (!in_draft_vocab((int64_t) lattice[i*N_EMBD + k])) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+// the restricted row keeps the full width: -inf outside the draft vocabulary, the full-head logit inside
+static bool logits_match_draft_vocab(const std::vector<float> & restricted, const std::vector<float> & full) {
+    for (int64_t id = 0; id < N_VOCAB; ++id) {
+        const bool ok = in_draft_vocab(id)
+            ? std::fabs(restricted[id] - full[id]) <= REL_TOLERANCE * std::max(1.0f, std::fabs(full[id]))
+            : restricted[id] == -INFINITY;
+        if (!ok) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool rejects_undersized_draft_vocab(llama_context * ctx) {
+    return !llama_set_draft_vocab(ctx, UNDERSIZED_DRAFT_VOCAB_RANGE, 1) && ctx->get_cparams().draft_vocab.empty();
+}
+
+static bool run_draft_vocab_decodes(llama_context * ctx) {
+    std::vector<float> full;
+    std::vector<float> restricted;
+    return decode_block(ctx, true) && read_last_logits(ctx, full) && rejects_undersized_draft_vocab(ctx) &&
+        llama_set_draft_vocab(ctx, DRAFT_VOCAB_RANGES, N_DRAFT_VOCAB_RANGES) &&
+        decode_block(ctx, false) && candidates_in_draft_vocab(ctx) &&
+        decode_block(ctx, true) && read_last_logits(ctx, restricted) && logits_match_draft_vocab(restricted, full);
+}
+
+// one-token ranges over the whole vocabulary
+static std::vector<int32_t> one_token_ranges() {
+    std::vector<int32_t> ranges;
+    for (int32_t id = 0; id < N_VOCAB; ++id) {
+        ranges.push_back(id);
+        ranges.push_back(id + 1);
+    }
+    return ranges;
+}
+
+static bool run_many_ranges_decode(llama_context * ctx) {
+    const std::vector<int32_t> ranges = one_token_ranges();
+    return llama_set_draft_vocab(ctx, ranges.data(), (int32_t) ranges.size()/2) && decode_block(ctx, false);
+}
+
+static bool rejects_draft_vocab(llama_context * ctx) {
+    return !llama_set_draft_vocab(ctx, DRAFT_VOCAB_RANGES, N_DRAFT_VOCAB_RANGES);
+}
+
+// runs run on a draft context of the tensor-backed DFlash2 model of kind
+static bool run_on_dflash2_context(case_type kind, bool (*run)(llama_context *)) {
+    if (!write_model(kind, true)) {
+        return false;
+    }
+    llama_model_params mparams = llama_model_default_params();
+    mparams.n_gpu_layers = 0;
+    llama_model * model = llama_model_load_from_file(PATH, mparams);
+    if (!model) {
+        return false;
+    }
+    llama_context_params cparams = llama_context_default_params();
+    cparams.n_ctx = N_EMBD;
+    cparams.n_batch = N_BLOCK;
+    cparams.n_ubatch = N_BLOCK;
+    llama_context * ctx = llama_init_from_model(model, cparams);
+
+    bool ok = false;
+    if (ctx) {
+        llama_set_causal_attn(ctx, false);
+        llama_set_embeddings_nextn(ctx, true, false);
+        ok = run(ctx);
+    }
+    llama_free(ctx);
+    llama_model_free(model);
+    return ok;
+}
+
+// a DFlash2 drafter with a draft vocabulary proposes only ids in the ranges and still returns full-width logits
+static bool check_draft_vocab_graph() {
+    return run_on_dflash2_context(case_type::valid_selector, run_draft_vocab_decodes);
+}
+
+// every range adds graph nodes, so a vocabulary of one-token ranges needs a larger graph
+static bool check_many_draft_vocab_ranges() {
+    return run_on_dflash2_context(case_type::valid_selector, run_many_ranges_decode);
+}
+
+// the ranges are target token ids, which do not index the rows of a reduced (d2t) head
+static bool check_reduced_head_draft_vocab() {
+    return run_on_dflash2_context(case_type::reduced_head, rejects_draft_vocab);
 }
 
 // target features whose rows differ in scale, so the rms norm changes every row
@@ -220,6 +413,25 @@ static bool values_match(const std::vector<float> & values, const std::vector<fl
         }
     }
     return true;
+}
+
+// a head the loader stored repacked or split has no row views, so the drafter ignores the ranges and returns the full-head logits
+static bool run_ignored_draft_vocab_decodes(llama_context * ctx) {
+    std::vector<float> full;
+    std::vector<float> ignored;
+    return decode_block(ctx, true) && read_last_logits(ctx, full) &&
+        llama_set_draft_vocab(ctx, DRAFT_VOCAB_RANGES, N_DRAFT_VOCAB_RANGES) &&
+        decode_block(ctx, true) && read_last_logits(ctx, ignored) && values_match(ignored, full);
+}
+
+static bool run_quantized_head_decodes(llama_context * ctx) {
+    const llama_model * model = llama_get_model(ctx);
+    return model->has_backend_layout(model->output) ? run_ignored_draft_vocab_decodes(ctx) : run_draft_vocab_decodes(ctx);
+}
+
+// the CPU backend may repack a Q4_0 head, interleaving rows that a view at an arbitrary row does not address
+static bool check_quantized_head_draft_vocab() {
+    return run_on_dflash2_context(case_type::quantized_head, run_quantized_head_decodes);
 }
 
 static bool decode_target_features(llama_context * ctx, const std::vector<float> & features, int64_t n_embd_enc) {
@@ -266,6 +478,21 @@ static bool check_fused_encoder() {
     return ok;
 }
 
+static bool extraction_enabled(const llama_context * ctx) {
+    const std::vector<bool> & layers = ctx->get_cparams().embeddings_layer_inp;
+    return std::find(layers.begin(), layers.end(), true) != layers.end();
+}
+
+static bool spec_init_rejects(common_params_speculative & params) {
+    try {
+        common_speculative_free(common_speculative_init(params, 1));
+    } catch (const std::runtime_error &) {
+        return true;
+    }
+    return false;
+}
+
+// a draft vocabulary for a drafter without a selector stops the speculative setup and leaves the target context unchanged
 // the attention window bounds prompt rows a draft can attend: only a drafter whose every layer is SWA has one
 static bool check_attn_window(case_type kind, int32_t expected) {
     if (!write_model(kind)) {
@@ -276,6 +503,38 @@ static bool check_attn_window(case_type kind, int32_t expected) {
     params.load_mode = LLAMA_LOAD_MODE_NONE;
     llama_model * model = llama_model_load_from_file(PATH, params);
     const bool ok = model && llama_model_attn_window(model) == expected;
+    llama_model_free(model);
+    return ok;
+}
+
+static bool check_rejected_draft_vocab() {
+    if (!write_model(case_type::legacy, true)) {
+        return false;
+    }
+    llama_model_params mparams = llama_model_default_params();
+    mparams.n_gpu_layers = 0;
+    llama_model * model = llama_model_load_from_file(PATH, mparams);
+    if (!model) {
+        return false;
+    }
+    llama_context_params cparams = llama_context_default_params();
+    cparams.n_ctx = N_EMBD;
+    cparams.n_batch = N_BLOCK;
+    cparams.n_ubatch = N_BLOCK;
+    llama_context * ctx_tgt = llama_init_from_model(model, cparams);
+    llama_context * ctx_dft = llama_init_from_model(model, cparams);
+
+    bool ok = false;
+    if (ctx_tgt && ctx_dft) {
+        common_params_speculative params;
+        params.types = { COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH };
+        params.draft.ctx_tgt = ctx_tgt;
+        params.draft.ctx_dft = ctx_dft;
+        params.draft.vocab_ranges = { 0, (int32_t) N_VOCAB };
+        ok = spec_init_rejects(params) && !extraction_enabled(ctx_tgt);
+    }
+    llama_free(ctx_dft);
+    llama_free(ctx_tgt);
     llama_model_free(model);
     return ok;
 }
@@ -315,14 +574,34 @@ int main() {
         }
         llama_model_free(model);
     }
-    if (!check_fused_encoder()) {
-        fprintf(stderr, "FAIL: an injection batch at the encoder input width was not encoded by fc and the encoder norm\n");
+    if (!check_draft_vocab_graph()) {
+        fprintf(stderr, "FAIL: DFlash2 draft vocabulary: candidate outside the ranges or logits not restricted to them\n");
+        ++failures;
+    }
+    if (!check_quantized_head_draft_vocab()) {
+        fprintf(stderr, "FAIL: DFlash2 draft vocabulary with a Q4_0 head: the logits are wrong, or the ranges were kept for a repacked head\n");
+        ++failures;
+    }
+    if (!check_rejected_draft_vocab()) {
+        fprintf(stderr, "FAIL: a rejected draft vocabulary did not stop the setup or left target extraction on\n");
+        ++failures;
+    }
+    if (!check_many_draft_vocab_ranges()) {
+        fprintf(stderr, "FAIL: a draft vocabulary of one-token ranges did not decode\n");
+        ++failures;
+    }
+    if (!check_reduced_head_draft_vocab()) {
+        fprintf(stderr, "FAIL: a DFlash2 drafter with a reduced (d2t) head accepted a draft vocabulary\n");
         ++failures;
     }
     if (!check_attn_window(case_type::sliding_window, (int32_t) N_SWA) ||
         !check_attn_window(case_type::full_attention_window, 0) ||
         !check_attn_window(case_type::valid_selector, 0)) {
         fprintf(stderr, "FAIL: the attention window must equal the sliding window only when every layer uses it\n");
+        ++failures;
+    }
+    if (!check_fused_encoder()) {
+        fprintf(stderr, "FAIL: an injection batch at the encoder input width was not encoded by fc and the encoder norm\n");
         ++failures;
     }
     std::remove(PATH);

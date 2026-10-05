@@ -1040,6 +1040,9 @@ struct llama_model {
 
     bool has_tensor_overrides() const;
 
+    // true if the loader stored the weight in a backend-specific layout (repacked or split), so views of its rows are not valid
+    bool has_backend_layout(const struct ggml_tensor * weight) const;
+
     const struct ggml_tensor * get_tensor(const char * name) const;
 
     // the RoPE of a layer, used by both the model graph and the K-shift

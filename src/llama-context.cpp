@@ -1582,6 +1582,27 @@ ggml_backend_t llama_context::backend_from_dev(ggml_backend_dev_t dev) const {
     return nullptr;
 }
 
+bool llama_context::set_draft_vocab(const int32_t * ranges, int32_t n_ranges) {
+    // the ranges select rows of a full-vocabulary DFlash2 head, which a reduced (d2t) head does not have
+    const bool has_full_dflash2_head = model.arch == LLM_ARCH_DFLASH && model.dflash_selector_hidden && !model.d2t;
+    if (n_ranges < 0 || (n_ranges > 0 && !has_full_dflash2_head)) {
+        return false;
+    }
+
+    // the selector picks its top-k candidates from the draft vocabulary
+    std::vector<int32_t> draft_vocab(ranges, ranges + 2*n_ranges);
+    if (!llama_draft_vocab_is_valid(draft_vocab, model.vocab.n_tokens(), (int32_t) model.hparams.dflash_selector_top_k)) {
+        return false;
+    }
+
+    if (cparams.draft_vocab != draft_vocab) {
+        cparams.draft_vocab = std::move(draft_vocab);
+        sched_need_reserve  = true;
+    }
+
+    return true;
+}
+
 void llama_context::layer_inp_dev_alloc() {
     synchronize();
 
@@ -3063,7 +3084,8 @@ uint32_t llama_context::graph_max_nodes() const {
         // The selector lattice scales with the draft block size; 12u was calibrated
         // on block-8 drafters, so scale the budget for larger blocks (e.g. Ripple's 16).
         const uint32_t block_scale = std::max<uint32_t>(1u, model.hparams.dflash_block_size/8u);
-        res = std::max<uint32_t>(1024u, 12u*block_scale*model.n_tensors());
+        const uint32_t n_draft_vocab_ranges = cparams.draft_vocab.size()/2;
+        res = std::max<uint32_t>(1024u, 12u*block_scale*model.n_tensors()) + LLAMA_DRAFT_VOCAB_NODES_PER_RANGE*n_draft_vocab_ranges;
     } else {
         // Note: inference mode would only need (1024u, 8u*n_tensors), but these values
         // are bumped to support LoRA finetuning which requires more graph nodes.
@@ -5129,6 +5151,10 @@ void llama_set_embeddings_layer_inp_pos_min(llama_context * ctx, llama_seq_id se
 
 void llama_set_nextn_layer_offset(llama_context * ctx, int32_t offset) {
     ctx->set_nextn_layer_offset(offset);
+}
+
+bool llama_set_draft_vocab(llama_context * ctx, const int32_t * ranges, int32_t n_ranges) {
+    return ctx->set_draft_vocab(ranges, n_ranges);
 }
 
 llama_memory_t llama_get_memory(const struct llama_context * ctx) {

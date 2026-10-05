@@ -1235,6 +1235,12 @@ extern "C" {
     // The paired context (llama_context_params::ctx_other), e.g. the target context of a draft context; may be nullptr
     LLAMA_API struct llama_context * llama_get_ctx_other(struct llama_context * ctx);
 
+    // Restrict the tokens a DFlash2 drafter proposes to n_ranges ascending, disjoint [ranges[2*i], ranges[2*i + 1]) token id ranges.
+    // n_ranges == 0 restores the full vocabulary and succeeds for any model. Otherwise returns false and leaves the context unchanged
+    // for a model other than DFlash2, a DFlash2 drafter with a reduced (d2t) vocabulary, or invalid ranges, including ranges that
+    // cover fewer ids than the drafter's selector top-k.
+    LLAMA_API bool llama_set_draft_vocab(struct llama_context * ctx, const int32_t * ranges, int32_t n_ranges);
+
     //
     // backend sampling API [EXPERIMENTAL]
     // note: use only if the llama_context was created with at least one llama_sampler_seq_config
