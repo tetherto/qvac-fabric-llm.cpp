@@ -213,6 +213,8 @@ option(GGML_CUDA_NCCL                       "ggml: use NVIDIA Collective Comm. L
 set   (GGML_CUDA_COMPRESSION_MODE "size" CACHE STRING
                                             "ggml: cuda link binary compression mode; requires cuda 12.8+")
 set_property(CACHE GGML_CUDA_COMPRESSION_MODE PROPERTY STRINGS "none;speed;balance;size")
+set   (GGML_CUDA_MODULE_SUFFIX "" CACHE STRING
+                                            "ggml: suffix for the CUDA backend module name, so two CUDA builds can share one directory")
 
 option(GGML_HIP                             "ggml: use HIP"                                   OFF)
 option(GGML_HIP_GRAPHS                      "ggml: use HIP graph"                              ON)
