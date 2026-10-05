@@ -150,6 +150,12 @@ LLAMA_API bool llama_batch_ext_set_decision_order(struct llama_batch_ext * batch
 // Label of option i of a decision model ("<arch>.decision.labels"), nullptr past the last one
 LLAMA_API const char * llama_model_decision_label(const struct llama_model * model, uint32_t i);
 
+// Restrict the tokens a DFlash2 drafter proposes to n_ranges ascending, disjoint [ranges[2*i], ranges[2*i + 1]) token id ranges.
+// n_ranges == 0 restores the full vocabulary and succeeds for any model. Otherwise returns false and leaves the context unchanged
+// for a model other than DFlash2, a DFlash2 drafter with a reduced (d2t) vocabulary, or invalid ranges, including ranges that
+// cover fewer ids than the drafter's selector top-k.
+LLAMA_API bool llama_set_draft_vocab(struct llama_context * ctx, const int32_t * ranges, int32_t n_ranges);
+
 // mirrors:
 // LLAMA_API float * llama_get_embeddings(struct llama_context * ctx);
 LLAMA_API float * llama_get_embeddings_nextn(struct llama_context * ctx);
