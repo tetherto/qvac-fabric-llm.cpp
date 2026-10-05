@@ -25097,6 +25097,8 @@ static void ggml_cl_argsort(ggml_backend_t backend, const ggml_tensor * src0, co
 
     int order = (enum ggml_sort_order) dst->op_params[0];
 
+    // the kernel is built lazily; supports_op is not always called first (e.g. behind an RPC server)
+    load_cl_kernels_argsort(backend_ctx);
     cl_kernel kernel = backend_ctx->kernel_argsort_f32_i32;
 
     CL_CHECK(clSetKernelArg(kernel,   0, sizeof(cl_mem),            &extra0->data_device));
