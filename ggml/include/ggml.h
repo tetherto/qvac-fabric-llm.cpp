@@ -588,7 +588,7 @@ extern "C" {
         GGML_OP_FILL,
 
         GGML_OP_FLASH_ATTN_EXT,
-        GGML_OP_FLASH_ATTN_BACK,
+        GGML_OP_FLASH_ATTN_EXT_BACK,
         GGML_OP_SSM_CONV,
         GGML_OP_SSM_CONV_BACK_SX,
         GGML_OP_SSM_CONV_BACK_C,
@@ -2592,14 +2592,27 @@ extern "C" {
             struct ggml_tensor * a,
             struct ggml_tensor * sinks);
 
-    // TODO: needs to be adapted to ggml_flash_attn_ext
-    GGML_API struct ggml_tensor * ggml_flash_attn_back(
-           struct ggml_context * ctx,
-           struct ggml_tensor  * q,
-           struct ggml_tensor  * k,
-           struct ggml_tensor  * v,
-           struct ggml_tensor  * d,
-           bool                  masked);
+    enum ggml_flash_attn_ext_back_target {
+        GGML_FLASH_ATTN_EXT_BACK_STATS = 0, // [2, n_batch, n_head, ne3]: (logsumexp, dot(grad_o, o)) per q row
+        GGML_FLASH_ATTN_EXT_BACK_DQ    = 1, // same shape as q
+        GGML_FLASH_ATTN_EXT_BACK_DKV   = 2, // [n_embd_k, n_kv, n_head_kv, 2*ne3]: dk in ne3 [0, ne3), dv in [ne3, 2*ne3)
+    };
+
+    // backward of ggml_flash_attn_ext in 3 passes, the softmax is recomputed per row
+    // o:      the ggml_flash_attn_ext result, its op_params are reused
+    // grad_o: gradient of o, same shape
+    // stats:  result of the STATS target, NULL for STATS
+    // requires n_embd_k == n_embd_v, no sinks, max_bias == 0, logit_softcap == 0
+    GGML_API struct ggml_tensor * ggml_flash_attn_ext_back(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * v,
+            struct ggml_tensor  * mask,
+            struct ggml_tensor  * o,
+            struct ggml_tensor  * grad_o,
+            struct ggml_tensor  * stats,
+            enum ggml_flash_attn_ext_back_target target);
 
     GGML_API struct ggml_tensor * ggml_ssm_conv(
             struct ggml_context * ctx,
