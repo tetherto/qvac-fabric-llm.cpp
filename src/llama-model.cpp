@@ -1318,6 +1318,9 @@ struct llama_model::impl {
     // contexts where the model tensors metadata is stored as well as the corresponding buffers:
     std::vector<std::pair<ggml_context_ptr, std::vector<ggml_backend_buffer_ptr>>> ctxs_bufs;
 
+    // weight buffers of a buffer type other than the device default or a host type
+    std::unordered_set<ggml_backend_buffer_t> backend_layout_bufs;
+
     buft_list_t cpu_buft_list;
     std::map<ggml_backend_dev_t, buft_list_t> gpu_buft_list;
 
@@ -2279,6 +2282,8 @@ bool llama_model::create_backend_buffers(std::size_t size_data,
         ggml_backend_dev_get_props(dev, &props);
         bool buffer_from_host_ptr_supported = props.caps.buffer_from_host_ptr;
         bool is_default_buft = buft == ggml_backend_dev_buffer_type(dev);
+        // extra, preferred and split buffer types may repack weights or split them across devices
+        const bool is_backend_layout = !is_default_buft && !ggml_backend_buft_is_host(buft);
 
         std::vector<ggml_backend_buffer_ptr> bufs;
 
@@ -2336,6 +2341,9 @@ bool llama_model::create_backend_buffers(std::size_t size_data,
             // indicate that this buffer contains weights
             // this is used by ggml_backend_sched to improve op scheduling: ops that use a weight are preferably scheduled to the backend that contains the weight
             ggml_backend_buffer_set_usage(buf.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+            if (is_backend_layout) {
+                pimpl->backend_layout_bufs.insert(buf.get());
+            }
         }
 
         pimpl->ctxs_bufs.emplace_back(std::move(ctx_ptr), std::move(bufs));
@@ -2801,6 +2809,10 @@ ggml_backend_buffer_type_t llama_model::select_buft(int il) const {
 
 bool llama_model::has_tensor_overrides() const {
     return pimpl->has_tensor_overrides;
+}
+
+bool llama_model::has_backend_layout(const ggml_tensor * weight) const {
+    return pimpl->backend_layout_bufs.count(weight->buffer) > 0;
 }
 
 const ggml_tensor * llama_model::get_tensor(const char * name) const {
