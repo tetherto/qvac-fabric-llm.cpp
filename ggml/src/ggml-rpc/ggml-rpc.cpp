@@ -1956,6 +1956,7 @@ private:
     std::unordered_set<ggml_backend_buffer_t> buffers;
     std::unordered_map<extra_key, void *, extra_key_hash> tensor_extras;
     std::unordered_map<ggml_backend_buffer_t, bool> buffer_uses_extras;
+    std::vector<uint8_t> pad_staging; // see rpc_padded_src
     // computed graphs cached per backend, keyed by uid
     std::vector<std::unordered_map<uint64_t, stored_graph>> stored_graphs;
     std::vector<comm_state> comm_states;
@@ -2283,6 +2284,37 @@ ggml_tensor * rpc_server::deserialize_tensor(struct ggml_context * ctx, const rp
 }
 
 
+// Backends that re-lay out quantized tensors (e.g. OpenCL) read ggml_nbytes(t) bytes from each
+// copy's source, whatever the write size. Short writes go through a staging buffer that stays
+// zeroed between writes, so they never read past `data` and cost only their own size.
+struct rpc_padded_src {
+    std::vector<uint8_t> & staging;
+    const void *           ptr;
+    size_t                 used = 0;
+
+    rpc_padded_src(std::vector<uint8_t> & staging, const ggml_tensor * t, const void * data, size_t avail,
+                   size_t last_copy) : staging(staging), ptr(data) {
+        if (t->extra == nullptr || !ggml_is_quantized(t->type)) {
+            return;
+        }
+        const size_t need = last_copy + ggml_nbytes(t);
+        if (avail >= need) {
+            return;
+        }
+        if (staging.size() < need) {
+            staging.resize(need, 0);
+        }
+        memcpy(staging.data(), data, avail);
+        used = avail;
+        ptr  = staging.data();
+    }
+    ~rpc_padded_src() {
+        if (used != 0) {
+            memset(staging.data(), 0, used);
+        }
+    }
+};
+
 bool rpc_server::set_tensor(const std::vector<uint8_t> & input) {
     sync_all_backends();
     // serialization format: | rpc_tensor | cache_flag (1 byte) | offset (8 bytes) | data (size bytes) |
@@ -2335,7 +2367,8 @@ bool rpc_server::set_tensor(const std::vector<uint8_t> & input) {
         ofs.write((const char *)data, size);
         GGML_LOG_INFO("[%s] saved to '%s'\n", __func__, cache_file.string().c_str());
     }
-    ggml_backend_tensor_set(tensor, data, offset, size);
+    rpc_padded_src src(pad_staging, tensor, data, size, 0);
+    ggml_backend_tensor_set(tensor, src.ptr, offset, size);
     remember_extra(tensor);
     return true;
 }
@@ -2414,7 +2447,8 @@ bool rpc_server::set_tensor_2d(const std::vector<uint8_t> & input) {
         ofs.write((const char *) data, data_size);
         GGML_LOG_INFO("[%s] saved to '%s'\n", __func__, cache_file.string().c_str());
     }
-    ggml_backend_tensor_set_2d(tensor, data, offset, size, n_copies, stride, size);
+    rpc_padded_src src(pad_staging, tensor, data, data_size, (n_copies - 1)*size);
+    ggml_backend_tensor_set_2d(tensor, src.ptr, offset, size, n_copies, stride, size);
     remember_extra(tensor);
     return true;
 }
@@ -2477,7 +2511,8 @@ bool rpc_server::set_tensor_hash(const rpc_msg_set_tensor_hash_req & request, rp
             return false;
         }
     }
-    ggml_backend_tensor_set(tensor, cached_file.data(), request.offset, size);
+    rpc_padded_src src(pad_staging, tensor, cached_file.data(), size, 0);
+    ggml_backend_tensor_set(tensor, src.ptr, request.offset, size);
     remember_extra(tensor);
     response.result = 1;
     return true;
@@ -2521,8 +2556,9 @@ bool rpc_server::set_tensor_2d_hash(
         return false;
     }
 
-    ggml_backend_tensor_set_2d(tensor, cached_file.data(), request.offset, request.size, request.n_copies,
-                               request.stride, request.size);
+    rpc_padded_src src(pad_staging, tensor, cached_file.data(), data_size, (request.n_copies - 1)*request.size);
+    ggml_backend_tensor_set_2d(tensor, src.ptr, request.offset, request.size, request.n_copies, request.stride,
+                               request.size);
     remember_extra(tensor);
     response.result = 1;
     return true;
