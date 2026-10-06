@@ -12,6 +12,11 @@ from aie.iron.controlflow import range_
 from aie.iron.kernel import ExternalFunction
 from aie.iron.kernels._common import _include_dirs
 
+# The kernel includes the shared headers (xdna-math.h, xdna-vec.h), which do not
+# compile beside the source string: kernelsrc pastes them in, as the designs do.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "kernels"))
+import kernelsrc  # noqa: E402
+
 ACT_TILE = 2112
 TB = 10752
 D, H, G, KVH, P = 256, 8, 4, 2, 5
@@ -23,7 +28,7 @@ REL_TOL = 5e-2
 LSE_TOL = 1e-1
 PIECES = 33
 
-src = (Path(__file__).resolve().parent.parent / "kernels" / "attn-dec.cc").read_text()
+src = kernelsrc.load(Path(__file__).resolve().parent.parent / "kernels" / "attn-dec.cc")
 flags = [f"-DACT_TILE={ACT_TILE}", "-DN_CORE=64"]
 a_ty = np.ndarray[(ACT_TILE // 4,), np.dtype[np.int32]]
 w_ty = np.ndarray[(TB,), np.dtype[np.uint8]]
