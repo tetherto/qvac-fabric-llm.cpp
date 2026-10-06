@@ -12,6 +12,9 @@
 #endif
 
 extern "C" void ggml_xdna_gemv_merge(const float * p, float * o) {
+    // The rounding mode is the core's, left by whatever ran on it before:
+    // set it, or the first dispatch after another design rounds differently.
+    aie::set_rounding(aie::rounding_mode::conv_even);
     constexpr int VEC = 16;
     for (int j = 0; j < N_CORE / VEC; j++) {
         aie::store_v(o + N_CORE + j * VEC, aie::load_v<VEC>(p + j * VEC));
