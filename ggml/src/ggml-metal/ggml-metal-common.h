@@ -64,8 +64,8 @@ struct ggml_metal_fwht_operands {
 };
 struct ggml_metal_fwht_operands ggml_metal_fwht_signed_operands(const struct ggml_tensor * mul);
 
-// the few-row MMA kernel for a src0 type and rt src1 tiles: per 32-weight block (q4_0, q8_0 with one tile), q5_K, or the generic 64-weight chunk kernel
-enum ggml_metal_mma_kind { GGML_METAL_MMA_KIND_BLK, GGML_METAL_MMA_KIND_Q5_K, GGML_METAL_MMA_KIND_GEN };
+// the few-row MMA kernel for a src0 type and rt src1 tiles: per 32-weight block (q4_0, q8_0 with one tile), q5_K, pq2_0, or the generic 64-weight chunk kernel
+enum ggml_metal_mma_kind { GGML_METAL_MMA_KIND_BLK, GGML_METAL_MMA_KIND_Q5_K, GGML_METAL_MMA_KIND_PQ2_0, GGML_METAL_MMA_KIND_GEN };
 enum ggml_metal_mma_kind ggml_metal_mul_mv_mma_kind(enum ggml_type type, int rt);
 // the src1 tiles of the few-row MMA kernels for mat-mul op: one 8-row tile, or two above 8 rows
 int ggml_metal_mul_mv_mma_rt(const struct ggml_tensor * op);

@@ -2062,6 +2062,161 @@ template [[host_name("kernel_mul_mv_mma_q5_K_f32_nt1_rt2")]] kernel mul_mv_mma_t
 template [[host_name("kernel_mul_mv_mma_q5_K_f32_nt2_rt2")]] kernel mul_mv_mma_t kernel_mul_mv_mma_q5_K_f32<2, 2>;
 template [[host_name("kernel_mul_mv_mma_q5_K_f32_nt4_rt2")]] kernel mul_mv_mma_t kernel_mul_mv_mma_q5_K_f32<4, 2>;
 
+// pq2_0 runs over 64-weight halves h of a block. A lane (m, j) holds qs bytes 16*h + 2*j .. 16*h + 2*j + 3 (j even) as a ushort2,
+// and MMA step s takes field s%4 of the low (s < 4) or high byte of each ushort: the exact half q - 1.
+inline half2 mul_mv_mma_pq2_0_frag(ushort2 q, short s) {
+    constexpr ushort field_mask = 0x0003;
+    constexpr half   q_bias     = mma_f16_1024 + 1.0h;
+
+    const ushort2 qq = s < 4 ? q : q >> 8;
+    return mul_mv_mma_1024_plus((qq >> (2*(s%4))) & field_mask) - q_bias;
+}
+
+template<short NT>
+inline void load_mma_pq2_0_a(device const ushort * const x[NT], int ih, short fn, thread ushort2 * q, thread float * d) {
+    // a block is d, then the quants of its two halves
+    constexpr short us_blk  = sizeof(block_pq2_0)/2;
+    constexpr short us_half = QK_PQ2_0/16;
+
+    const int off = (ih/2)*us_blk + (ih%2)*us_half;
+
+    FOR_UNROLL (short t = 0; t < NT; ++t) {
+        device const ushort * qs = x[t] + off;
+        q[t] = ushort2(qs[0], qs[1]);
+        d[t] = as_type<half>(x[t][(ih/2)*us_blk - 1 - fn]);
+    }
+}
+
+// B lane k = fm holds src1 values 8*k .. 8*k + 7 of a half
+template<short RT>
+inline void load_mma_pq2_0_b(device const float4 * const y[RT][2], int ih, thread float4 (*b)[2][2]) {
+    constexpr short f4_half = QK_PQ2_0/8;
+
+    FOR_UNROLL (short rt = 0; rt < RT; ++rt) {
+        FOR_UNROLL (short e = 0; e < 2; ++e) {
+            b[rt][e][0] = y[rt][e][f4_half*ih + 0];
+            b[rt][e][1] = y[rt][e][f4_half*ih + 1];
+        }
+    }
+}
+
+// few-row mat-mat for pq2_0: the MMAs take the exact q - 1 and the block scale goes into the accumulation, as in kernel_mul_mv_mma_blk
+template<short NT, short RT>
+kernel void kernel_mul_mv_mma_pq2_0_f32(
+        constant ggml_metal_kargs_mul_mv_ext & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        device const char * src2,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    const short NSG = FC_mul_mv_mma_nsg;
+
+    // loading the src1 values of the next half during the MMAs pays only with one src1 tile and the widest src0 tile;
+    // elsewhere the registers it holds cost more occupancy than it hides
+    constexpr bool prefetch_b = RT == 1 && NT == 4;
+
+    const mul_mv_mma_tile tile = mul_mv_mma_tile_init<NT, RT>(args, tgpig, tiisg);
+
+    device const ushort * x[NT];
+    FOR_UNROLL (short t = 0; t < NT; ++t) {
+        x[t] = (device const ushort *) mul_mv_mma_src0_row(tile, args, src0, t) + 1 + tile.fn;
+    }
+
+    device const float4 * y[RT][2];
+    FOR_UNROLL (short rt = 0; rt < RT; ++rt) {
+        FOR_UNROLL (short e = 0; e < 2; ++e) {
+            y[rt][e] = (device const float4 *) mul_mv_mma_src1_row(tile, args, src1, rt, e) + 2*tile.fm;
+        }
+    }
+
+    float acc[RT][NT][2] = {};
+
+    const int nh = FC_mul_mv_mma_ne00/(QK_PQ2_0/2);
+
+    ushort2 q[NT];
+    float   d[NT];
+    float4  b[RT][2][2];
+
+    const int ih0 = min((int) sgitg, nh - 1);
+    load_mma_pq2_0_a<NT>(x, ih0, tile.fn, q, d);
+    if (prefetch_b) {
+        load_mma_pq2_0_b<RT>(y, ih0, b);
+    }
+
+    for (int ih = sgitg; ih < nh; ih += NSG) {
+        ushort2 qc[NT];
+        float   dc[NT];
+        float4  bc[RT][2][2];
+
+        FOR_UNROLL (short t = 0; t < NT; ++t) {
+            qc[t] = q[t];
+            dc[t] = d[t];
+        }
+        if (prefetch_b) {
+            FOR_UNROLL (short rt = 0; rt < RT; ++rt) {
+                FOR_UNROLL (short e = 0; e < 2; ++e) {
+                    bc[rt][e][0] = b[rt][e][0];
+                    bc[rt][e][1] = b[rt][e][1];
+                }
+            }
+        } else {
+            load_mma_pq2_0_b<RT>(y, ih, bc);
+        }
+
+        const int ihn = min(ih + NSG, nh - 1);
+        load_mma_pq2_0_a<NT>(x, ihn, tile.fn, q, d);
+        if (prefetch_b) {
+            load_mma_pq2_0_b<RT>(y, ihn, b);
+        }
+
+        simdgroup_float8x8 mp[RT][NT];
+        FOR_UNROLL (short rt = 0; rt < RT; ++rt) {
+            FOR_UNROLL (short t = 0; t < NT; ++t) {
+                mp[rt][t] = make_filled_simdgroup_matrix<float, 8>(0.0f);
+            }
+        }
+
+        FOR_UNROLL (short s = 0; s < 8; ++s) {
+            simdgroup_float8x8 mb[RT];
+            FOR_UNROLL (short rt = 0; rt < RT; ++rt) {
+                mb[rt].thread_elements()[0] = bc[rt][0][s/4][s%4];
+                mb[rt].thread_elements()[1] = bc[rt][1][s/4][s%4];
+            }
+
+            FOR_UNROLL (short t = 0; t < NT; ++t) {
+                const half2 h = mul_mv_mma_pq2_0_frag(qc[t], s);
+
+                simdgroup_half8x8 ma;
+                ma.thread_elements()[0] = h.x;
+                ma.thread_elements()[1] = h.y;
+
+                FOR_UNROLL (short rt = 0; rt < RT; ++rt) {
+                    simdgroup_multiply_accumulate(mp[rt][t], ma, mb[rt], mp[rt][t]);
+                }
+            }
+        }
+
+        FOR_UNROLL (short t = 0; t < NT; ++t) {
+            FOR_UNROLL (short rt = 0; rt < RT; ++rt) {
+                acc[rt][t][0] = fma(dc[t], mp[rt][t].thread_elements()[0], acc[rt][t][0]);
+                acc[rt][t][1] = fma(dc[t], mp[rt][t].thread_elements()[1], acc[rt][t][1]);
+            }
+        }
+    }
+
+    mul_mv_mma_store<NT, RT>(acc, args, src2, dst, shmem, tile, tiisg, sgitg);
+}
+
+template [[host_name("kernel_mul_mv_mma_pq2_0_f32_nt1_rt1")]] kernel mul_mv_mma_t kernel_mul_mv_mma_pq2_0_f32<1, 1>;
+template [[host_name("kernel_mul_mv_mma_pq2_0_f32_nt2_rt1")]] kernel mul_mv_mma_t kernel_mul_mv_mma_pq2_0_f32<2, 1>;
+template [[host_name("kernel_mul_mv_mma_pq2_0_f32_nt4_rt1")]] kernel mul_mv_mma_t kernel_mul_mv_mma_pq2_0_f32<4, 1>;
+template [[host_name("kernel_mul_mv_mma_pq2_0_f32_nt1_rt2")]] kernel mul_mv_mma_t kernel_mul_mv_mma_pq2_0_f32<1, 2>;
+template [[host_name("kernel_mul_mv_mma_pq2_0_f32_nt2_rt2")]] kernel mul_mv_mma_t kernel_mul_mv_mma_pq2_0_f32<2, 2>;
+template [[host_name("kernel_mul_mv_mma_pq2_0_f32_nt4_rt2")]] kernel mul_mv_mma_t kernel_mul_mv_mma_pq2_0_f32<4, 2>;
+
 // few-row mat-mat for any type with a 16-weight dequantizer: a lane dequantizes 16 consecutive weights of a 64-weight chunk once for all src1 rows.
 // MMA step s at MMA-k index j reads chunk weight 16*(j/2) + 8*(j%2) + s.
 template<short NT, short RT, typename block_q, short nl, void (*dequantize_func)(device const block_q *, short, thread float4x4 &)>
@@ -2165,7 +2320,6 @@ MUL_MV_MMA_GEN("q5_0", block_q5_0, 2,     dequantize_q5_0)
 MUL_MV_MMA_GEN("q5_1", block_q5_1, 2,     dequantize_q5_1)
 MUL_MV_MMA_GEN("q4_K", block_q4_K, QK_NL, dequantize_q4_K)
 MUL_MV_MMA_GEN("q6_K", block_q6_K, QK_NL, dequantize_q6_K)
-MUL_MV_MMA_GEN("pq2_0", block_pq2_0, 8,   dequantize_pq2_0)
 #if defined(GGML_METAL_HAS_BF16)
 MUL_MV_MMA_GEN("bf16", bfloat4x4,  1,     dequantize_bf16)
 #endif
