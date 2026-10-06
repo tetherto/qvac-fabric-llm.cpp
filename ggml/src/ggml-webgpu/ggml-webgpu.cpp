@@ -16,9 +16,9 @@
 
 #include <webgpu/webgpu_cpp.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cstdint>
-#include <algorithm>
 #include <cstring>
 #ifdef GGML_WEBGPU_GPU_PROFILE
 #    include <iomanip>
