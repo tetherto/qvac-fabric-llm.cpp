@@ -95,6 +95,10 @@ struct llama_context {
 
     float * get_embeddings_nextn();
     float * get_embeddings_nextn_ith(int32_t i);
+    bool set_mtp_dsa_index_share(bool enabled);
+    bool set_mtp_dsa_capture(bool enabled);
+    bool set_mtp_dsa_selection(const int32_t * data, size_t size, size_t width = 0, const llama_seq_id * seq_ids = nullptr);
+    const int32_t * get_mtp_dsa_selection(size_t * size, const llama_seq_id ** seq_ids = nullptr);
 
     float * get_embeddings_layer_inp(uint32_t lid);
 
@@ -326,6 +330,15 @@ private:
     // populated only when cparams.embeddings_nextn is enabled and the model graph
     // sets llm_graph_result::t_h_nextn
     buffer_view<float> embd_nextn = {nullptr, 0};
+
+    std::vector<int32_t> mtp_dsa_sel_raw;
+    std::vector<float> mtp_dsa_sel_mask;
+    std::vector<llama_seq_id> mtp_dsa_sel_seq;
+    std::vector<int32_t> mtp_dsa_sel;
+    size_t mtp_dsa_sel_width = 0;
+    std::vector<uint8_t> mtp_dsa_sel_gather;
+    bool mtp_dsa_capture = false;
+    bool mtp_dsa_sel_invalid = false;
 
     // host buffers for output layer input embeddings, per layer
     // populated when cparams.output_layer_inp[il] is true

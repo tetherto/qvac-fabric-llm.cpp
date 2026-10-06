@@ -882,6 +882,9 @@ public:
     ggml_tensor * get_embd()        const { return t_embd; }
     ggml_tensor * get_embd_pooled() const { return t_embd_pooled; }
     ggml_tensor * get_h_nextn()     const { return t_h_nextn; }
+    ggml_tensor * get_mtp_dsa_sel()  const { return t_mtp_dsa_sel; }
+    ggml_tensor * get_mtp_dsa_mask() const { return t_mtp_dsa_mask; }
+    bool get_mtp_dsa_gather() const { return mtp_dsa_gather; }
 
     ggml_tensor * get_layer_inp(int il) const { return t_layer_inp[il]; }
 
@@ -917,6 +920,9 @@ public:
     ggml_tensor * t_embd        = nullptr;
     ggml_tensor * t_embd_pooled = nullptr;
     ggml_tensor * t_h_nextn     = nullptr; // [n_embd, n_outputs] hidden state before final output norm
+    ggml_tensor * t_mtp_dsa_sel  = nullptr; // [n_sel, n_tokens] first MTP sparse selection
+    ggml_tensor * t_mtp_dsa_mask = nullptr; // [n_sel, 1, 1, n_tokens] selection validity
+    bool mtp_dsa_gather = false;
 
     std::vector<ggml_tensor *> t_layer_inp;
 

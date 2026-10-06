@@ -1,6 +1,8 @@
 #include "common.h"
 #include "speculative.h"
 #include "../src/llama-context.h"
+#include "../src/llama-memory-hybrid-idx.h"
+#include "../src/llama-batch.h"
 #include "../ggml/src/ggml-backend-impl.h"
 #include <set>
 #include "log.h"
@@ -18,6 +20,7 @@
 #include "../src/llama-model.h"
 
 #include <cinttypes>
+#include <cmath>
 #include <cstddef>
 #include <cstdio>
 #include <cstring>
@@ -72,7 +75,7 @@ static void set_tensor_data(struct ggml_tensor * tensor, void * userdata) {
 }
 
 static void usage(char ** argv) {
-    printf("Usage: %s [-a/--arch arch] [-s/--seed seed] [-v/--verbose] [--mtp-shared|--mtp-shared-cpu|--hadamard-contracts|--qsa-unified-multiseq|--glm5-kpool-sequences|--glm5-invalid-metadata]\n", argv[0]);
+    printf("Usage: %s [-a/--arch arch] [-s/--seed seed] [-v/--verbose] [--mtp-shared|--mtp-shared-cpu|--hadamard-contracts|--qsa-unified-multiseq|--glm5-kpool-sequences|--glm5-mtp|--glm5-invalid-metadata]\n", argv[0]);
 }
 
 static std::vector<llama_token> get_tokens(const uint32_t n_tokens, const uint32_t n_vocab, const size_t seed){
@@ -1407,6 +1410,207 @@ static int test_glm5_kpool_sequences() {
     return 0;
 }
 
+static std::vector<llama_tokens> run_glm5_mtp(bool share, bool tail, bool shared_kv, int n_seq, int ubatch) {
+    auto metadata = get_gguf_ctx(LLM_ARCH_GLM5_NEXT, true);
+    gguf_set_val_u32(metadata.get(), "glm5-next.block_count", 3);
+    gguf_set_val_u32(metadata.get(), "glm5-next.nextn_predict_layers", 1);
+    gguf_set_val_bool(metadata.get(), "glm5-next.attention.indexer.index_share_mtp", share);
+    gguf_set_val_bool(metadata.get(), "glm5-next.attention.indexer.kpool_select_tail", tail);
+    const uint32_t n_head_kv[] = { 1, 0, 1 };
+    gguf_set_arr_data(metadata.get(), "glm5-next.attention.head_count_kv", GGUF_TYPE_UINT32, n_head_kv, 3);
+
+    auto mp = llama_model_default_params();
+    mp.load_mtp = true;
+    size_t seed = 1234;
+    llama_model_ptr model(llama_model_init_from_user(metadata.get(), set_tensor_data, &seed, mp));
+    GGML_ASSERT(model);
+
+    auto cp = llama_context_default_params();
+    cp.n_ctx = 256;
+    cp.kv_unified = true;
+    cp.n_batch = 64;
+    cp.n_ubatch = ubatch;
+    cp.n_outputs_max = cp.n_outputs_max_per_seq = 64;
+    cp.n_seq_max = n_seq;
+    cp.n_threads = cp.n_threads_batch = 2;
+    struct eval_counts { int score = 0; int attention = 0; int finite = 0; int zero_attention = 0; } counts;
+    cp.cb_eval = [](ggml_tensor * tensor, bool ask, void * data) {
+        auto & counts = *static_cast<eval_counts *>(data);
+        if (ask && std::strstr(tensor->name, "indexer_score") != nullptr) {
+            ++counts.score;
+        }
+        if (ask && std::strstr(tensor->name, "mtp_attn_out") != nullptr) {
+            ++counts.attention;
+        }
+        const bool attention = std::strstr(tensor->name, "kq_soft_max_gathered") != nullptr;
+        const bool check = attention || std::strstr(tensor->name, "h_nextn") != nullptr ||
+                           std::strstr(tensor->name, "result_output") != nullptr;
+        if (ask) {
+            return check;
+        }
+        if (check) {
+            GGML_ASSERT(tensor->type == GGML_TYPE_F32);
+            std::vector<float> values(ggml_nelements(tensor));
+            ggml_backend_tensor_get(tensor, values.data(), 0, ggml_nbytes(tensor));
+            for (float value : values) {
+                GGML_ASSERT(std::isfinite(value));
+            }
+            if (attention && std::all_of(values.begin(), values.end(), [](float value) { return value == 0.0f; })) {
+                ++counts.zero_attention;
+            }
+            ++counts.finite;
+        }
+        return true;
+    };
+    cp.cb_eval_user_data = &counts;
+    llama_context_ptr target(llama_init_from_model(model.get(), cp));
+    GGML_ASSERT(target);
+    cp.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
+    cp.ctx_other = target.get();
+    llama_context_ptr draft(llama_init_from_model(model.get(), cp));
+    GGML_ASSERT(draft);
+
+    common_params_speculative params;
+    params.types = { COMMON_SPECULATIVE_TYPE_DRAFT_MTP };
+    params.draft.ctx_tgt = target.get();
+    params.draft.ctx_dft = draft.get();
+    params.draft.backend_sampling = false;
+    params.draft.p_min = 0.0f;
+    params.draft.n_max = 3;
+    common_speculative_ptr spec(common_speculative_init(params, n_seq));
+    GGML_ASSERT(spec);
+
+    llama_batch batch = llama_batch_init(64, 0, 1);
+    // Submit reverse sequence order; captured rows must retain their own sequence IDs.
+    for (int seq = (shared_kv ? 1 : n_seq) - 1; seq >= 0; --seq) {
+        common_batch_clear(batch);
+        for (int i = 0; i < 33; ++i) {
+            common_batch_add(batch, (i + seq) % 64, i, { seq }, true);
+        }
+        common_speculative_begin(spec.get(), seq, {});
+        GGML_ASSERT(llama_decode(target.get(), batch) == 0);
+        // Check the actual target rows consumed by MTP, not just greedy token IDs.
+        for (int i = 0; i < batch.n_tokens; ++i) {
+            const float * hidden = llama_get_embeddings_nextn_ith(target.get(), i);
+            GGML_ASSERT(hidden != nullptr);
+            for (int j = 0; j < llama_model_n_embd_out(model.get()); ++j) {
+                GGML_ASSERT(std::isfinite(hidden[j]));
+            }
+        }
+        GGML_ASSERT(common_speculative_process(spec.get(), batch));
+    }
+    llama_batch_free(batch);
+    if (shared_kv) {
+        llama_memory_seq_cp(llama_get_memory(target.get()), 0, 1, -1, -1);
+        llama_memory_seq_cp(llama_get_memory(draft.get()), 0, 1, -1, -1);
+    }
+    size_t n_capture = 0;
+    GGML_ASSERT(draft->get_mtp_dsa_selection(&n_capture) == nullptr && n_capture == 0);
+    if (!tail && ubatch == 1) {
+        GGML_ASSERT(counts.zero_attention > 0);
+    }
+    counts = {};
+
+    GGML_ASSERT(!draft->set_mtp_dsa_selection(nullptr, 5));
+    if (share) {
+        auto * mem = static_cast<llama_memory_hybrid_idx *>(draft->get_memory());
+        const int32_t saved[] = { 1, 2, 3, 4 };
+        llama_seq_id seqs[] = { 0, 1 };
+        int32_t n_ids[] = { 1, 1 };
+        llama_seq_id * row_ids[] = { &seqs[0], &seqs[1] };
+        llama_ubatch ub = {};
+        ub.n_tokens = 1;
+        ub.n_seq_id = n_ids;
+        ub.seq_id = row_ids;
+        GGML_ASSERT(draft->set_mtp_dsa_selection(saved, 4, 4, seqs));
+        GGML_ASSERT(mem->can_reuse_mtp_dsa_selection(4, ub));
+        ub.n_tokens = 2; // equal element count does not imply equal row width
+        GGML_ASSERT(!mem->can_reuse_mtp_dsa_selection(2, ub));
+        if (n_seq == 2) {
+            GGML_ASSERT(draft->set_mtp_dsa_selection(saved, 4, 2, seqs));
+            std::swap(row_ids[0], row_ids[1]);
+            GGML_ASSERT(mem->can_reuse_mtp_dsa_selection(2, ub));
+            ub.n_tokens = 1;
+            GGML_ASSERT(mem->can_reuse_mtp_dsa_selection(2, ub));
+        }
+        GGML_ASSERT(draft->set_mtp_dsa_selection(nullptr, 0));
+    }
+
+    std::vector<llama_tokens> results(n_seq);
+    for (int seq = 0; seq < (shared_kv ? 1 : n_seq); ++seq) {
+        auto & dp = common_speculative_get_draft_params(spec.get(), seq);
+        dp.drafting = true;
+        dp.n_past   = 33;
+        dp.id_last  = (32 + seq) % 64;
+        dp.result   = &results[seq];
+    }
+    const int64_t start = ggml_time_us();
+    common_speculative_draft(spec.get());
+    const double elapsed_ms = (ggml_time_us() - start)/1000.0;
+    for (int seq = 0; seq < (shared_kv ? 1 : n_seq); ++seq) {
+        GGML_ASSERT(results[seq].size() == 3);
+    }
+    GGML_ASSERT(counts.attention >= 2);
+    GGML_ASSERT(counts.finite > 0);
+    GGML_ASSERT(share ? counts.score < 2*counts.attention : counts.score > 0);
+    printf("GLM5 MTP share=%d tail=%d shared_kv=%d seq=%d ub=%d: %.3f ms, score=%d attention=%d\n",
+            share, tail, shared_kv, n_seq, ubatch, elapsed_ms, counts.score, counts.attention);
+    if (share && shared_kv) {
+        // A multi-owner token cannot be mapped to one reusable selection row.
+        llama_memory_clear(llama_get_memory(draft.get()), true);
+        llama_batch multi = llama_batch_init(1, llama_model_n_embd_out(model.get()), 2);
+        multi.token = (llama_token *) malloc(sizeof(llama_token));
+        std::fill(multi.embd, multi.embd + llama_model_n_embd_out(model.get()), 0.0f);
+        common_batch_add(multi, 1, 0, { 0, 1 }, true);
+        GGML_ASSERT(draft->set_mtp_dsa_capture(true));
+        GGML_ASSERT(llama_decode(draft.get(), multi) == 0);
+        draft->synchronize();
+        size_t count = 0;
+        GGML_ASSERT(draft->get_mtp_dsa_selection(&count) == nullptr && count == 0);
+        free(multi.token);
+        multi.token = nullptr;
+        llama_batch_free(multi);
+    }
+    return results;
+}
+
+static int test_glm5_mtp() {
+    for (bool tail : { false, true }) {
+        for (int scenario = 0; scenario < 4; ++scenario) {
+            const bool shared_kv = scenario == 1;
+            const int n_seq = scenario == 0 ? 1 : 2;
+            const int ubatch = scenario == 3 ? 1 : 32;
+            const auto baseline = run_glm5_mtp(false, tail, shared_kv, n_seq, ubatch);
+            const auto shared   = run_glm5_mtp(true,  tail, shared_kv, n_seq, ubatch);
+            // The frozen selection is an approximation. This deterministic toy model
+            // should retain its greedy drafts, even though logits need not be identical.
+            GGML_ASSERT(baseline == shared);
+        }
+    }
+    for (bool dense_nextn : { false, true }) {
+        auto metadata = get_gguf_ctx(LLM_ARCH_GLM5_NEXT, true);
+        const uint32_t heads[] = { 1, 0, 1, 1 };
+        const int layers = dense_nextn ? 3 : 4;
+        gguf_set_val_u32(metadata.get(), "glm5-next.block_count", layers);
+        gguf_set_val_u32(metadata.get(), "glm5-next.nextn_predict_layers", dense_nextn ? 1 : 2);
+        gguf_set_arr_data(metadata.get(), "glm5-next.attention.head_count_kv", GGUF_TYPE_UINT32, heads, layers);
+        if (dense_nextn) {
+            gguf_set_val_u32(metadata.get(), "glm5-next.leading_dense_block_count", 3);
+        }
+        auto mp = llama_model_default_params();
+        mp.load_mtp = true;
+        size_t seed = 1234;
+        llama_model_ptr model(llama_model_init_from_user(metadata.get(), set_tensor_data, &seed, mp));
+        GGML_ASSERT(model);
+        auto cp = llama_context_default_params();
+        cp.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
+        llama_context_ptr draft(llama_init_from_model(model.get(), cp));
+        GGML_ASSERT(!draft);
+    }
+    printf("GLM5 NextN MTP graph, sequence mapping and index sharing passed\n");
+    return 0;
+}
+
 static int test_glm5_invalid_metadata() {
     struct invalid_case {
         const char * key;
@@ -1447,6 +1651,9 @@ int main(int argc, char ** argv) {
     }
     if (argc == 2 && strcmp(argv[1], "--glm5-kpool-sequences") == 0) {
         return test_glm5_kpool_sequences();
+    }
+    if (argc == 2 && strcmp(argv[1], "--glm5-mtp") == 0) {
+        return test_glm5_mtp();
     }
     if (argc == 2 && strcmp(argv[1], "--glm5-invalid-metadata") == 0) {
         return test_glm5_invalid_metadata();
