@@ -449,6 +449,19 @@ bool xdna_attn_mm_run(xdna_kernel_pool * pool, ggml_tensor * node) {
     return ok;
 }
 
+void xdna_attn_mm_release(void) {
+    std::lock_guard<std::mutex> lock(g_am.mtx);
+    for (auto & kv : g_am.kv) {
+        xdna_buffer_free(kv.second.bo);
+    }
+    g_am.kv.clear();
+    if (g_am.kept_bo) {
+        xdna_kernel_pool_release_buffer(g_am.kept_pool, g_am.kept_bo);
+        g_am.kept_bo = nullptr;
+        g_am.kept    = nullptr;
+    }
+}
+
 void xdna_attn_mm_keep_clear(void) {
     std::lock_guard<std::mutex> lock(g_am.mtx);
     g_am.keep.clear();
