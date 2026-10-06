@@ -547,6 +547,9 @@ llama_build_and_test(test-laya.cpp)
 # device, no model; self-skipping when no XDNA device is registered.
 if (GGML_XDNA)
     llama_build_and_test(test-xdna-graph.cpp)
+    # Two llama contexts computing at once (-m model.gguf). Self-skipping
+    # without a model or a device.
+    llama_build_and_test(test-xdna-contexts.cpp LABEL "model")
 endif()
 
 # Test for state restore with fragmented KV cache
