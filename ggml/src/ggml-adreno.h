@@ -6,11 +6,9 @@
 // Header-only (inline) and dependency-free so the unit test can exercise the
 // pure parsing logic without linking the ggml runtime or needing a GPU.
 //
-// Mirrors the Adreno-version policy used by qvac-fabric-llm.cpp's ggml fork so
-// the speech stack (whisper / parakeet / tts) selects GPU backends the same
-// way the LLM stack does: on Android, detect the GPU through Vulkan (present
-// on virtually every Android GPU) and only fall back to OpenCL for Adreno,
-// whose Vulkan compute path is unstable.
+// Adreno-version policy shared by the LLM and speech stacks: on Android, detect
+// the GPU through Vulkan (present on virtually every Android GPU) and only fall
+// back to OpenCL for Adreno, whose Vulkan compute path is unstable.
 
 #include <algorithm>
 #include <cctype>

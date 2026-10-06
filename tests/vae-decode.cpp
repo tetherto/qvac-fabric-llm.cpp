@@ -3,7 +3,7 @@
 // vae-decode: load the REAL ACE-Step Oobleck VAE decoder weights (GGUF) and run a
 // full decode on the CPU backend, writing a 48 kHz stereo WAV.
 //
-// Exercises the two custom ops we ported into ggml-speech (ggml_col2im_1d +
+// Exercises the two custom ops of this ggml tree (ggml_col2im_1d +
 // ggml_snake) end-to-end on real bf16 weights, with weight_norm fusion at load.
 //
 // Usage:  vae-decode [model.gguf] [out.wav] [T_latent] [threads]

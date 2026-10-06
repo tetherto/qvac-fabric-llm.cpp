@@ -1,9 +1,9 @@
-// vae-common.h: shared helpers for the ACE-Step Oobleck VAE bring-up on ggml-speech.
+// vae-common.h: shared helpers for the ACE-Step Oobleck VAE bring-up on ggml.
 // GGUF loader + weight_norm fusion + graph ops (conv1d, snake,
 // col2im-based conv_t1d, res_unit) + encoder/decoder builders + WAV I/O.
 //
 // Logic ported from acestep.cpp src/vae.h and src/vae-enc.h. The two custom ops
-// (ggml_col2im_1d + ggml_snake) live in our ggml-speech fork; everything else is
+// (ggml_col2im_1d + ggml_snake) live in this ggml tree; everything else is
 // stock ggml. F32 activations, bf16 weights fused to F16 at load.
 #pragma once
 
@@ -32,7 +32,7 @@ struct GGUF {
 };
 
 // Read the whole file into a heap buffer. This deliberately avoids POSIX mmap
-// (open/mmap/munmap in <sys/mman.h> etc.): ggml-speech is a cross-platform
+// (open/mmap/munmap in <sys/mman.h> etc.): ggml is a cross-platform
 // vcpkg port and these test targets must also compile on MSVC/Windows, which
 // have no <sys/mman.h>. The test GGUFs fit comfortably in RAM, so a plain read
 // is equivalent to the previous read-only mapping for `gdata()`'s pointer math.

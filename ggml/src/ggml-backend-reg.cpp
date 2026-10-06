@@ -705,7 +705,7 @@ namespace {
 // or a negative sentinel: -2 if `reg` is null, -1 if no Adreno GPU is present.
 // Vulkan is used as the probe because it is present on virtually every Android
 // GPU, so the GPU can be identified before deciding whether to load OpenCL.
-// Mirrors qvac-fabric-llm.cpp's ggml fork (the LLM stack's backend selection).
+// The LLM and speech stacks share this backend-selection policy.
 int ggml_backend_min_adreno_version(ggml_backend_reg_t reg) {
     if (reg == nullptr) {
         return -2;
@@ -756,9 +756,8 @@ void ggml_backend_load_all_from_path(const char * dir_path) {
     // OpenCL is only useful (and stable) for ggml on Adreno GPUs; on every
     // other GPU the Adreno-tuned OpenCL kernels are either unsupported or buggy.
     // On Android, use the already-loaded Vulkan backend to detect the GPU and
-    // only keep OpenCL for an Adreno that benefits from it. This mirrors
-    // qvac-fabric-llm.cpp's ggml fork so the speech stack selects backends the
-    // same way the LLM stack does. Off Android (or when no Vulkan backend is
+    // only keep OpenCL for an Adreno that benefits from it. The LLM and speech
+    // stacks share this policy. Off Android (or when no Vulkan backend is
     // present) behaviour is unchanged: OpenCL is loaded unconditionally here.
     bool load_opencl = true;
 #ifdef __ANDROID__
