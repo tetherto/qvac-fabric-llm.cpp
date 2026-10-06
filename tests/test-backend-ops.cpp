@@ -5680,6 +5680,11 @@ struct test_mul_mat : public test_case {
         if ((type_a == GGML_TYPE_MXFP4 || type_a == GGML_TYPE_NVFP4) && backend_has_feature(backend, "BLACKWELL_NATIVE_FP4")) {
             return 2e-2;
         }
+        // WebGPU stages f32 operands as f16 and has no f32-precision path for GGML_PREC_F32 to select
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
+        if (prec_f32 && strcmp(ggml_backend_reg_name(reg), "WebGPU") == 0) {
+            return test_case::max_nmse_err(backend);
+        }
         return max_nmse_err();
     }
 
