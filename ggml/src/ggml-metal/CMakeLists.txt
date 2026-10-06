@@ -113,7 +113,7 @@ endif() # GGML_METAL_EMBED_LIBRARY
 
 if (NOT GGML_METAL_EMBED_LIBRARY)
     install(
-        FILES src/ggml-metal/ggml-metal.metal
+        FILES ${CMAKE_CURRENT_SOURCE_DIR}/ggml-metal.metal
         PERMISSIONS
             OWNER_READ
             OWNER_WRITE

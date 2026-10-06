@@ -658,11 +658,11 @@ static webgpu_encoded_op ggml_backend_webgpu_build(webgpu_context &             
     });
 }
 
-static void ggml_backend_webgpu_buffer_memset(webgpu_global_context & ctx,
-                                              wgpu::Buffer &          buf,
-                                              uint32_t                value,
-                                              size_t                  offset,
-                                              size_t                  size) {
+static void ggml_backend_webgpu_buffer_memset_chunk(webgpu_global_context & ctx,
+                                                    wgpu::Buffer &          buf,
+                                                    uint32_t                value,
+                                                    size_t                  offset,
+                                                    size_t                  size) {
     std::vector<uint32_t>             params  = { (uint32_t) offset, (uint32_t) size, value };
     std::vector<wgpu::BindGroupEntry> entries = { ggml_webgpu_make_bind_group_entry(0, buf, 0, buf.GetSize()) };
     size_t                            bytes_per_wg =
@@ -695,6 +695,21 @@ static void ggml_backend_webgpu_buffer_memset(webgpu_global_context & ctx,
     wgpu::CommandBuffer              command  = encoder.Finish();
     std::vector<wgpu::CommandBuffer> commands = { command };
     ctx->queue.Submit(commands.size(), commands.data());
+}
+
+// One dispatch covers at most maxComputeWorkgroupsPerDimension workgroups, so a
+// large range (a whole-buffer clear) is split into chunks of that many bytes.
+static void ggml_backend_webgpu_buffer_memset(webgpu_global_context & ctx,
+                                              wgpu::Buffer &          buf,
+                                              uint32_t                value,
+                                              size_t                  offset,
+                                              size_t                  size) {
+    const size_t bytes_per_wg =
+        ctx->capabilities.limits.maxComputeInvocationsPerWorkgroup * ctx->capabilities.memset_bytes_per_thread;
+    const size_t max_chunk = (size_t) ctx->capabilities.limits.maxComputeWorkgroupsPerDimension * bytes_per_wg;
+    for (size_t done = 0; done < size; done += max_chunk) {
+        ggml_backend_webgpu_buffer_memset_chunk(ctx, buf, value, offset + done, std::min(size - done, max_chunk));
+    }
 }
 
 /** End WebGPU Actions */

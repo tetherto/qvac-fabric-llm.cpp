@@ -28,10 +28,12 @@ endfunction()
 # The installed shared libraries and the Vulkan loader must be found at run time
 # without an rpath into the scratch prefix.
 function(expose_installed_libraries)
-    set(dirs "${prefix}/lib" "${prefix}/bin")
+    set(dirs "${prefix}/lib" "${prefix}/bin" ${GGML_CONSUMER_EXTRA_LIB_DIRS})
     if (DEFINED ENV{VULKAN_SDK})
         list(APPEND dirs "$ENV{VULKAN_SDK}/lib")
     endif()
+    string(REPLACE ";" "|" GGML_CONSUMER_RPATH "${dirs}")
+    set(GGML_CONSUMER_RPATH "${GGML_CONSUMER_RPATH}" PARENT_SCOPE)
     if (WIN32)
         set(sep ";")
         set(var PATH)
@@ -59,6 +61,7 @@ function(build_and_run_consumer)
     run_checked(${CMAKE_COMMAND} -S "${GGML_CONSUMER_SOURCE_DIR}" -B "${consumer_build}"
         "-DCMAKE_PREFIX_PATH=${prefix}"
         "-DGGML_CONSUMER_EXPECT_CPU=${GGML_CONSUMER_EXPECT_CPU}"
+        "-DGGML_CONSUMER_RPATH=${GGML_CONSUMER_RPATH}"
         ${build_type_args})
     run_checked(${CMAKE_COMMAND} --build "${consumer_build}" --target run-consumer ${config_args})
 endfunction()
@@ -93,6 +96,10 @@ function(check_lib_names_exist libs libdir)
 endfunction()
 
 function(check_pkg_config)
+    if (WIN32)
+        message(STATUS "pkg-config metadata is not a supported consumer path on Windows, skipping")
+        return()
+    endif()
     find_program(PKG_CONFIG_EXECUTABLE NAMES pkg-config pkgconf)
     if (NOT PKG_CONFIG_EXECUTABLE)
         message(STATUS "pkg-config not found, skipping the metadata check")

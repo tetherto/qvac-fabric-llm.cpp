@@ -26,7 +26,7 @@ static size_t expected_backend_count(bool vulkan_disabled) {
 static bool every_built_backend_registered(size_t expected) {
     const size_t registered = ggml_backend_reg_count();
     printf("registered %zu backends, expected at least %zu\n", registered, expected);
-    return check(registered >= expected, "every built backend registers through the configured library prefix");
+    return check(registered >= expected, "the CPU and RPC backends register through the configured library prefix");
 }
 
 static bool vulkan_stays_unloaded() {

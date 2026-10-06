@@ -6,6 +6,11 @@ project(ggml-package-consumer C CXX)
 # ggml::ggml-vector-index when the package ships it.
 option(GGML_CONSUMER_EXPECT_CPU "the package links the CPU backend statically" OFF)
 
+# Run-time search path for the installed shared libraries and their loaders,
+# passed as a |-separated list because the driver hands it over in one argument.
+set(GGML_CONSUMER_RPATH "" CACHE STRING "run-time library directories for the consumer")
+string(REPLACE "|" ";" CMAKE_BUILD_RPATH "${GGML_CONSUMER_RPATH}")
+
 find_package(ggml CONFIG REQUIRED)
 
 add_executable(consumer main.cpp)

@@ -431,6 +431,9 @@ llama_build_and_test(test-copy-tbq-subgroups.cpp)
 # mtmd, so it is intentionally outside the LLAMA_MTMD block below.
 llama_build_and_test(test-opencl-fa-chunking.cpp)
 
+# Counts the backends that must register on any host: the CPU family (once) and
+# RPC. GPU and BLAS modules may be absent at run time when their driver or
+# runtime library is missing, so they are not required.
 function(ggml_count_built_backends out_var)
     set(count 0)
     set(cpu_seen OFF)
@@ -440,7 +443,7 @@ function(ggml_count_built_backends out_var)
                 set(cpu_seen ON)
                 math(EXPR count "${count} + 1")
             endif()
-        else()
+        elseif (backend STREQUAL "ggml-rpc")
             math(EXPR count "${count} + 1")
         endif()
     endforeach()
@@ -493,9 +496,14 @@ if (NOT LLAMA_USE_SYSTEM_GGML)
     else()
         set(GGML_CONSUMER_EXPECT_CPU OFF)
     endif()
+    set(GGML_CONSUMER_EXTRA_LIB_DIRS "")
+    if (GGML_VULKAN AND Vulkan_LIBRARY)
+        get_filename_component(GGML_CONSUMER_EXTRA_LIB_DIRS "${Vulkan_LIBRARY}" DIRECTORY)
+    endif()
     add_test(NAME test-package-consumer
         COMMAND ${CMAKE_COMMAND}
             -DGGML_BUILD_DIR=${CMAKE_BINARY_DIR}
+            -DGGML_CONSUMER_EXTRA_LIB_DIRS=${GGML_CONSUMER_EXTRA_LIB_DIRS}
             -DGGML_CONSUMER_SOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}/package-consumer
             -DGGML_LIB_OUTPUT_PREFIX=${GGML_LIB_OUTPUT_PREFIX}
             -DGGML_CONSUMER_EXPECT_CPU=${GGML_CONSUMER_EXPECT_CPU}
