@@ -154,7 +154,7 @@ export DYLD_LIBRARY_PATH=$VIRGL_BUILD_DIR/src
 export VIRGL_APIR_BACKEND_LIBRARY="$LLAMA_MAC_BUILD/bin/libggml-virtgpu-backend.dylib"
 
 # For llama.cpp remotingbackend to load the ggml-metal backend
-export APIR_LLAMA_CPP_GGML_LIBRARY_PATH="$LLAMA_MAC_BUILD/bin/libggml-metal.dylib"
+export APIR_LLAMA_CPP_GGML_LIBRARY_PATH="$LLAMA_MAC_BUILD/bin/libqvac-ggml-metal.dylib"
 export APIR_LLAMA_CPP_GGML_LIBRARY_REG=ggml_backend_metal_reg
 ```
 

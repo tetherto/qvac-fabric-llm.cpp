@@ -70,9 +70,9 @@ To generate an installable "package" simply use cmake --install:
 ```
 [d]/workspace> cmake --install build-snapdragon --prefix pkg-snapdragon/llama.cpp
 -- Install configuration: "Release"
--- Installing: /workspace/pkg-snapdragon/llama.cpp/lib/libggml-cpu.so
--- Installing: /workspace/pkg-snapdragon/llama.cpp/lib/libggml-opencl.so
--- Installing: /workspace/pkg-snapdragon/llama.cpp/lib/libggml-hexagon.so
+-- Installing: /workspace/pkg-snapdragon/llama.cpp/lib/libqvac-ggml-cpu.so
+-- Installing: /workspace/pkg-snapdragon/llama.cpp/lib/libqvac-ggml-opencl.so
+-- Installing: /workspace/pkg-snapdragon/llama.cpp/lib/libqvac-ggml-hexagon.so
 -- Installing: /workspace/pkg-snapdragon/llama.cpp/lib/libggml-htp-v73.so
 -- Installing: /workspace/pkg-snapdragon/llama.cpp/lib/libggml-htp-v75.so
 -- Installing: /workspace/pkg-snapdragon/llama.cpp/lib/libggml-htp-v79.so

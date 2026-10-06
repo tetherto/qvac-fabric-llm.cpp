@@ -85,13 +85,13 @@ _Configuration Key_.
 - **Examples**:
   ```bash
   # macOS with Metal backend
-  export APIR_LLAMA_CPP_GGML_LIBRARY_PATH="/opt/llama.cpp/lib/libggml-metal.dylib"
+  export APIR_LLAMA_CPP_GGML_LIBRARY_PATH="/opt/llama.cpp/lib/libqvac-ggml-metal.dylib"
 
   # Linux with CUDA backend
-  export APIR_LLAMA_CPP_GGML_LIBRARY_PATH="/opt/llama.cpp/lib/libggml-cuda.so"
+  export APIR_LLAMA_CPP_GGML_LIBRARY_PATH="/opt/llama.cpp/lib/libqvac-ggml-cuda.so"
 
   # macOS or Linux with Vulkan backend
-  export APIR_LLAMA_CPP_GGML_LIBRARY_PATH="/opt/llama.cpp/lib/libggml-vulkan.so"
+  export APIR_LLAMA_CPP_GGML_LIBRARY_PATH="/opt/llama.cpp/lib/libqvac-ggml-vulkan.so"
   ```
 
 ### APIR_LLAMA_CPP_GGML_LIBRARY_REG
@@ -162,7 +162,7 @@ Here's an example configuration for a macOS host with Metal backend:
 export VIRGL_APIR_BACKEND_LIBRARY="/opt/llama.cpp/lib/libggml-virtgpu-backend.dylib"
 
 # Backend configuration
-export APIR_LLAMA_CPP_GGML_LIBRARY_PATH="/opt/llama.cpp/lib/libggml-metal.dylib"
+export APIR_LLAMA_CPP_GGML_LIBRARY_PATH="/opt/llama.cpp/lib/libqvac-ggml-metal.dylib"
 export APIR_LLAMA_CPP_GGML_LIBRARY_REG="ggml_backend_metal_reg"
 
 # Optional logging

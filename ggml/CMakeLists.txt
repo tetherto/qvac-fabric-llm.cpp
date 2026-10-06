@@ -194,9 +194,9 @@ option(GGML_SCHED_NO_REALLOC                "ggml: disallow reallocations in ggm
 # When non-empty, ggml libs land on disk as `lib<prefix>ggml-*.{a,so,dll}` and the
 # runtime backend loader looks for the same prefix. CMake target names and the
 # `find_package(ggml CONFIG)` package name are unchanged. Defaults to
-# `qvac-speech-` on the speech branch to match the loader's compiled-in default
-# in `ggml-backend-reg.cpp`.
-set(GGML_LIB_OUTPUT_PREFIX "qvac-speech-" CACHE STRING
+# `qvac-` to match the loader's compiled-in default in `ggml-backend-reg.cpp`,
+# so every qvac ggml consumer ships `qvac-ggml-*` backend modules.
+set(GGML_LIB_OUTPUT_PREFIX "qvac-" CACHE STRING
     "ggml: prefix for built ggml library filenames")
 
 # 3rd party libs / backends

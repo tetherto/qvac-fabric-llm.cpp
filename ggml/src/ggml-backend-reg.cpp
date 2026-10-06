@@ -475,8 +475,8 @@ static fs::path get_executable_path() {
 // `ggml_backend_load_best` only matches the unprefixed names. Define
 // `GGML_BACKEND_DL_PROJECT_PREFIX` (a string literal, e.g.
 // "parakeet-") at compile time and the loader will instead search for
-// "<prefix>ggml-*" / "lib<prefix>ggml-*". Default behaviour (macro
-// undefined) is byte-equal to upstream.
+// "<prefix>ggml-*" / "lib<prefix>ggml-*". Without the macro the loader
+// falls back to the `qvac-` prefix that `GGML_LIB_OUTPUT_PREFIX` defaults to.
 static fs::path backend_filename_prefix() {
 #if defined(GGML_BACKEND_DL_PROJECT_PREFIX)
 #ifdef _WIN32
@@ -486,9 +486,9 @@ static fs::path backend_filename_prefix() {
 #endif
 #else
 #ifdef _WIN32
-    return fs::u8path("qvac-speech-ggml-");
+    return fs::u8path("qvac-ggml-");
 #else
-    return fs::u8path("libqvac-speech-ggml-");
+    return fs::u8path("libqvac-ggml-");
 #endif
 #endif
 }
