@@ -3328,7 +3328,7 @@ int ggml_metal_op_pool_1d(ggml_metal_op_t ctx, int idx) {
     return 1;
 }
 
-static int ggml_metal_op_fwht_impl(ggml_metal_op_t ctx, ggml_tensor * op, ggml_tensor * src, ggml_tensor * signs) {
+static int ggml_metal_op_fwht_impl(ggml_metal_op_t ctx, ggml_tensor * op, const ggml_tensor * src, const ggml_tensor * signs) {
     ggml_metal_library_t lib = ctx->lib;
     ggml_metal_encoder_t enc = ctx->enc;
 
@@ -3412,8 +3412,7 @@ static int ggml_metal_op_fwht_signed(ggml_metal_op_t ctx, int idx) {
     ggml_tensor * mul = ctx->node(idx);
     ggml_tensor * mm  = ctx->node(idx + 1);
 
-    ggml_tensor * x     = ggml_are_same_shape(mul, mul->src[0]) ? mul->src[0] : mul->src[1];
-    ggml_tensor * signs = x == mul->src[0] ? mul->src[1] : mul->src[0];
+    const auto [x, signs] = ggml_metal_fwht_signed_operands(mul);
 
     // the encode loop pre-checked the mul only
     ggml_metal_op_fusion_concurrency(ctx, idx, 2);

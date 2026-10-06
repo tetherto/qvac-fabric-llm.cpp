@@ -56,6 +56,14 @@ bool ggml_metal_op_mul_mat_use_fwht (const struct ggml_tensor * op);
 bool ggml_metal_op_mul_mat_use_mm   (const struct ggml_tensor * op, bool has_simdgroup_mm);
 bool ggml_metal_op_mul_mat_id_use_mm(const struct ggml_tensor * op, bool has_simdgroup_mm);
 
+// the activation and the sign vector of the sign MUL of a signed FWHT: x has the shape of the MUL. with one row both
+// operands do and x is src[0]; the FWHT then reads both at the same offsets, so their order does not change the product
+struct ggml_metal_fwht_operands {
+    const struct ggml_tensor * x;
+    const struct ggml_tensor * signs;
+};
+struct ggml_metal_fwht_operands ggml_metal_fwht_signed_operands(const struct ggml_tensor * mul);
+
 // the few-row MMA kernel for a src0 type and rt src1 tiles: per 32-weight block (q4_0, q8_0 with one tile), q5_K, or the generic 64-weight chunk kernel
 enum ggml_metal_mma_kind { GGML_METAL_MMA_KIND_BLK, GGML_METAL_MMA_KIND_Q5_K, GGML_METAL_MMA_KIND_GEN };
 enum ggml_metal_mma_kind ggml_metal_mul_mv_mma_kind(enum ggml_type type, int rt);

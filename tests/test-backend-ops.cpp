@@ -6317,32 +6317,36 @@ struct test_fwht_signed : public test_case {
     const ggml_type type_x;
     const bool overlap;
     const bool unaligned_sign;
+    const bool alias; // the output reuses the input memory exactly (in place)
 
     ggml_tensor * overlap_base = nullptr;
     ggml_tensor * output = nullptr;
     mutable bool has_fusion_counter = false;
 
     test_fwht_signed(int64_t blk = 1024, int64_t width = 5120, int64_t n_tokens = 7,
-                     ggml_type type_x = GGML_TYPE_F32, bool overlap = false, bool unaligned_sign = false)
-        : blk(blk), width(width), n_tokens(n_tokens), type_x(type_x), overlap(overlap), unaligned_sign(unaligned_sign) {
-        GGML_ASSERT((!overlap && !unaligned_sign) || type_x == GGML_TYPE_F32);
-        GGML_ASSERT(!overlap || !unaligned_sign);
+                     ggml_type type_x = GGML_TYPE_F32, bool overlap = false, bool unaligned_sign = false, bool alias = false)
+        : blk(blk), width(width), n_tokens(n_tokens), type_x(type_x), overlap(overlap), unaligned_sign(unaligned_sign), alias(alias) {
+        GGML_ASSERT((!overlap && !unaligned_sign && !alias) || type_x == GGML_TYPE_F32);
+        GGML_ASSERT((int) overlap + (int) unaligned_sign + (int) alias <= 1);
     }
 
     std::string vars() override {
-        return VARS_TO_STR6(blk, width, n_tokens, type_x, overlap, unaligned_sign);
+        return VARS_TO_STR7(blk, width, n_tokens, type_x, overlap, unaligned_sign, alias);
     }
 
     bool run_whole_graph() override { return true; }
 
     bool skip_backend(ggml_backend_t backend) override {
-        if (!overlap && !unaligned_sign) {
+        if (!overlap && !unaligned_sign && !alias) {
             return false;
         }
         ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
         const char * name = ggml_backend_reg_name(reg);
         if (unaligned_sign) {
             return strcmp(name, "Vulkan") != 0;
+        }
+        if (alias) {
+            return strcmp(name, "MTL") != 0;
         }
         return strcmp(name, "MTL") != 0 && strcmp(name, "Vulkan") != 0;
     }
@@ -6391,7 +6395,7 @@ struct test_fwht_signed : public test_case {
         ggml_set_name(a, "a");
 
         ggml_tensor * x = nullptr;
-        if (overlap) {
+        if (overlap || alias) {
             overlap_base = ::ggml_new_tensor_1d(ctx, GGML_TYPE_F32, width * n_tokens + 1);
             ggml_set_name(overlap_base, "x_base");
             x = ggml_view_2d(ctx, overlap_base, width, n_tokens, width * sizeof(float), 0);
@@ -6421,9 +6425,9 @@ struct test_fwht_signed : public test_case {
 
     void prepare_graph(ggml_cgraph * graph) override {
         GGML_UNUSED(graph);
-        if (overlap) {
+        if (overlap || alias) {
             GGML_ASSERT(overlap_base != nullptr && overlap_base->data != nullptr);
-            output->data = (char *) overlap_base->data + sizeof(float);
+            output->data = (char *) overlap_base->data + (overlap ? sizeof(float) : 0);
             output->buffer = overlap_base->buffer;
         }
     }
@@ -12473,6 +12477,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_fwht_signed(4096, 4096, 1, GGML_TYPE_F16));
     test_cases.emplace_back(new test_fwht_signed(8192, 8192, 1, GGML_TYPE_F16));
     test_cases.emplace_back(new test_fwht_signed(1024, 5120, 1, GGML_TYPE_F32, true));
+    test_cases.emplace_back(new test_fwht_signed(1024, 6144, 1, GGML_TYPE_F32, false, false, true));
+    test_cases.emplace_back(new test_fwht_signed(1024, 6144, 7, GGML_TYPE_F32, false, false, true));
+    test_cases.emplace_back(new test_fwht_signed(256, 512, 3, GGML_TYPE_F32, false, false, true));
     test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F32, 32, 1, 32)); // too small (N<64)
     test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F16, 64, 1, 64));
     test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F16, 128, 1, 128));

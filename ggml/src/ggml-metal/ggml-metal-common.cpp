@@ -26,6 +26,11 @@ bool ggml_metal_op_mul_mat_use_fwht(const struct ggml_tensor * op) {
            ggml_metal_fwht_supported_size(op->src[1]->ne[0]);
 }
 
+struct ggml_metal_fwht_operands ggml_metal_fwht_signed_operands(const struct ggml_tensor * mul) {
+    const bool x_first = ggml_are_same_shape(mul, mul->src[0]);
+    return { x_first ? mul->src[0] : mul->src[1], x_first ? mul->src[1] : mul->src[0] };
+}
+
 bool ggml_metal_op_mul_mat_use_mm(const struct ggml_tensor * op, bool has_simdgroup_mm) {
     const int64_t ne00 = op->src[0]->ne[0];
     const int64_t ne11 = op->src[1]->ne[1];

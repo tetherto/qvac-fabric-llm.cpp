@@ -236,6 +236,17 @@ static bool ggml_metal_fusion_overlap(const ggml_tensor * a, const ggml_tensor *
         : bid_a.offs - bid_b.offs < ggml_nbytes(b);
 }
 
+// true if a and b visit the same bytes in the same element order: the same layout, or both contiguous with equal sizes
+static bool ggml_metal_fusion_same_linear_layout(const ggml_tensor * a, const ggml_tensor * b) {
+    return a->type == b->type && ggml_nbytes(a) == ggml_nbytes(b) &&
+        (ggml_are_same_layout(a, b) || (ggml_is_contiguous(a) && ggml_is_contiguous(b)));
+}
+
+// true if the byte ranges of a and b overlap, except when b is exactly a: the same data in the same linear layout
+static bool ggml_metal_fusion_partial_overlap(const ggml_tensor * a, const ggml_tensor * b) {
+    return !(a->data == b->data && ggml_metal_fusion_same_linear_layout(a, b)) && ggml_metal_fusion_overlap(a, b);
+}
+
 // MUL + MUL_MAT(hadamard): the sign vector folds into the FWHT kernel, so the MUL is elided.
 // the MUL_MAT reads the MUL through a RESHAPE, which is not a chain link, so the checks live
 // here (unsafe = true); the encoder verifies MUL/RESHAPE have no other consumers.
@@ -256,8 +267,7 @@ static bool ggml_metal_fusion_check_fwht_signed(
         return false;
     }
 
-    const ggml_tensor * x     = ggml_are_same_shape(mul, mul->src[0]) ? mul->src[0] : mul->src[1];
-    const ggml_tensor * signs = x == mul->src[0] ? mul->src[1] : mul->src[0];
+    const auto [x, signs] = ggml_metal_fwht_signed_operands(mul);
     const int64_t n = mm->src[0]->ne[0];
 
     const bool ok =
@@ -272,8 +282,8 @@ static bool ggml_metal_fusion_check_fwht_signed(
     }
 
     if (mode == GGML_METAL_FUSION_FULL) {
-        // the kernel reads x and writes mm in one pass
-        if (ggml_metal_fusion_overlap(x, mm)) {
+        // the kernel reads x and writes mm in one pass; each thread writes only the elements it read, so an exact alias is safe
+        if (ggml_metal_fusion_partial_overlap(x, mm)) {
             return false;
         }
     }
