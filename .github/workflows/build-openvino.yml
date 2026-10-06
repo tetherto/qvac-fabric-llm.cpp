@@ -116,9 +116,10 @@ jobs:
     env:
       # Windows runner VMs can advertise unusable AMX: https://github.com/actions/runner-images/issues/14483
       ONEDNN_MAX_CPU_ISA: AVX512_CORE
-      # Sync versions in build-openvino.yml, ci-self-hosted-openvino.yml, release.yml, release-publish.yml, build-cache.yml, .devops/openvino.Dockerfile, docs/backend/OPENVINO.md
-      OPENVINO_VERSION_MAJOR: "2026.4.1"
-      OPENVINO_VERSION_FULL: "2026.4.1.22982.07f9c262b05"
+      # 2026.4.x selects bf16 from CPUID, and oneDNN has no AVX512_CORE kernel for that product.
+      # 2026.3.1 still asks oneDNN, so the ISA cap keeps inference in f32.
+      OPENVINO_VERSION_MAJOR: "2026.3.1"
+      OPENVINO_VERSION_FULL: "2026.3.1.22476.56d9685302d"
 
     steps:
       - name: Clone
