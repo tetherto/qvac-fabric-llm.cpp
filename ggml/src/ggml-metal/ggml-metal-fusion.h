@@ -41,6 +41,7 @@ typedef enum ggml_metal_fusion_id {
     GGML_METAL_FUSION_SNAKE,        // MUL + SIN + SQR + MUL + ADD
     GGML_METAL_FUSION_GDN_CACHE,    // GATED_DELTA_NET + CPY (write snapshots into the recurrent cache)
     GGML_METAL_FUSION_FWHT_SIGNED,  // MUL + MUL_MAT(hadamard) (sign vector folded into the FWHT)
+    GGML_METAL_FUSION_RMS_NORM_FWHT, // RMS_NORM + MUL + MUL + MUL_MAT(hadamard) (normalized row into the signed FWHT)
     GGML_METAL_FUSION_MUL_MAT_ADD,  // MUL_MAT + ADD (residual added in the few-row MMA store)
     GGML_METAL_FUSION_CPY_BATCH,    // CPY x N (N in [2, GGML_METAL_CPY_BATCH_MAX]), one dispatch
 } ggml_metal_fusion_id;

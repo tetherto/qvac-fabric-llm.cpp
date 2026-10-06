@@ -432,6 +432,47 @@ kernel void kernel_fwht(
         dst[i*NW + lane] = reg[i];
     }
 }
+
+// in-register FWHT of an N-block spread over NT threads (NE = N/NT values each, element i*NT + tid)
+template<int N, int NT>
+static inline void fwht_tg_butterfly(thread float * reg, threadgroup float * shmem, int tid) {
+    constexpr int NW = N_SIMDWIDTH;
+    constexpr int NE = N / NT;
+
+    for (int i = 1; i < NW; i *= 2) {
+        for (int j = 0; j < NE; j++) {
+            const float val  = reg[j];
+            const float val2 = simd_shuffle_xor(val, i);
+            reg[j] = (tid & i) == 0 ? val2 + val : val2 - val;
+        }
+    }
+
+    for (int i = NW; i < NT; i *= 2) {
+        for (int j = 0; j < NE; j++) {
+            shmem[j*NT + tid] = reg[j];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (int j = 0; j < NE; j++) {
+            const float val  = reg[j];
+            const float val2 = shmem[j*NT + (tid ^ i)];
+            reg[j] = (tid & i) == 0 ? val2 + val : val2 - val;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    for (int i = NT; i < N; i *= 2) {
+        const int step = i / NT;
+        for (int j = 0; j < NE; j += (2 * step)) {
+            for (int k = 0; k < step; k++) {
+                const float x = reg[j + k ];
+                const float y = reg[j + k + step];
+                reg[j + k]        = x + y;
+                reg[j + k + step] = x - y;
+            }
+        }
+    }
+}
+
 template<int N, int NT, typename src_t>
 kernel void kernel_fwht_tg(
         constant ggml_metal_kargs_fwht & args,
@@ -468,43 +509,91 @@ kernel void kernel_fwht_tg(
         reg[i] = float(src[i*NT + tid])*s*scale;
     }
 
-    for (int i = 1; i < NW; i *= 2) {
-        for (int j = 0; j < NE; j++) {
-            const float val  = reg[j];
-            const float val2 = simd_shuffle_xor(val, i);
-            reg[j] = (tid & i) == 0 ? val2 + val : val2 - val;
-        }
-    }
-
-    for (int i = NW; i < NT; i *= 2) {
-        for (int j = 0; j < NE; j++) {
-            shmem[j*NT + tid] = reg[j];
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        for (int j = 0; j < NE; j++) {
-            const float val  = reg[j];
-            const float val2 = shmem[j*NT + (tid ^ i)];
-            reg[j] = (tid & i) == 0 ? val2 + val : val2 - val;
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-
-    for (int i = NT; i < N; i *= 2) {
-        const int step = i / NT;
-        for (int j = 0; j < NE; j += (2 * step)) {
-            for (int k = 0; k < step; k++) {
-                const float x = reg[j + k ];
-                const float y = reg[j + k + step];
-                reg[j + k]        = x + y;
-                reg[j + k + step] = x - y;
-            }
-        }
-    }
+    fwht_tg_butterfly<N, NT>(reg, shmem, tid);
 
     for (int i = 0; i < NE; i++) {
         dst[i*NT + tid] = reg[i];
     }
 }
+
+// RMS_NORM + MUL (weight) + signed FWHT: one threadgroup per FWHT block of a row; each recomputes the row sum, so a
+// single decode row still spreads over n_blk threadgroups
+template<int N, int NT>
+kernel void kernel_rms_norm_mul_fwht(
+        constant ggml_metal_kargs_rms_norm_fwht & args,
+        device const float * src,
+        device const float * weight,
+        device const float * signs,
+        device       float * dst,
+        device       float * dst_norm,
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]],
+        ushort tiisg[[thread_index_in_simdgroup]]) {
+
+    constexpr int NW  = N_SIMDWIDTH;
+    constexpr int NE  = N / NT;
+    constexpr int NSG = NT / NW;
+
+    threadgroup float shmem[N];
+
+    const int64_t r = tgpig.x / args.n_blk;
+    const int     b = tgpig.x % args.n_blk;
+
+    const int tid = sgitg * NW + tiisg;
+
+    device const float * x = src + r*args.ne00;
+
+    // float4 loads keep the per-thread chain of dependent loads short (ne00 is a multiple of N; the fusion check aligns rows)
+    device const float4 * x4 = (device const float4 *) x;
+
+    float sumf = 0.0f;
+    for (int i = tid; i < args.ne00/4; i += NT) {
+        sumf += dot(x4[i], x4[i]);
+    }
+    sumf = simd_sum(sumf);
+
+    if (tiisg == 0) {
+        shmem[sgitg] = sumf;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    sumf = simd_sum(tiisg < NSG ? shmem[tiisg] : 0.0f);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const float rms   = 1.0f/sqrt(sumf/args.ne00 + args.eps);
+    const float scale = 1.0f/sqrt((float) N);
+
+    const int64_t offs = r*args.ne00 + b*N;
+
+    float reg[NE];
+    for (int i = 0; i < NE; i++) {
+        const int j = b*N + i*NT + tid;
+        const float y = (x[j]*rms)*weight[j];
+        if (args.write_norm) {
+            dst_norm[offs + i*NT + tid] = y;
+        }
+        reg[i] = y*signs[j]*scale;
+    }
+
+    fwht_tg_butterfly<N, NT>(reg, shmem, tid);
+
+    for (int i = 0; i < NE; i++) {
+        dst[offs + i*NT + tid] = reg[i];
+    }
+}
+
+typedef decltype(kernel_rms_norm_mul_fwht<1024, GGML_METAL_FWHT_TG_NT>) kernel_rms_norm_mul_fwht_t;
+
+template [[host_name("kernel_rms_norm_mul_fwht_f32_512")]]        kernel kernel_rms_norm_mul_fwht_t kernel_rms_norm_mul_fwht<512,  GGML_METAL_FWHT_TG_NT>;
+template [[host_name("kernel_rms_norm_mul_fwht_f32_1024")]]       kernel kernel_rms_norm_mul_fwht_t kernel_rms_norm_mul_fwht<1024, GGML_METAL_FWHT_TG_NT>;
+template [[host_name("kernel_rms_norm_mul_fwht_f32_2048")]]       kernel kernel_rms_norm_mul_fwht_t kernel_rms_norm_mul_fwht<2048, GGML_METAL_FWHT_TG_NT>;
+template [[host_name("kernel_rms_norm_mul_fwht_f32_4096")]]       kernel kernel_rms_norm_mul_fwht_t kernel_rms_norm_mul_fwht<4096, GGML_METAL_FWHT_TG_NT>;
+template [[host_name("kernel_rms_norm_mul_fwht_f32_8192")]]       kernel kernel_rms_norm_mul_fwht_t kernel_rms_norm_mul_fwht<8192, GGML_METAL_FWHT_TG_NT>;
+template [[host_name("kernel_rms_norm_mul_fwht_f32_512_nt128")]]  kernel kernel_rms_norm_mul_fwht_t kernel_rms_norm_mul_fwht<512,  GGML_METAL_FWHT_TG_NT_FALLBACK>;
+template [[host_name("kernel_rms_norm_mul_fwht_f32_1024_nt128")]] kernel kernel_rms_norm_mul_fwht_t kernel_rms_norm_mul_fwht<1024, GGML_METAL_FWHT_TG_NT_FALLBACK>;
+template [[host_name("kernel_rms_norm_mul_fwht_f32_2048_nt128")]] kernel kernel_rms_norm_mul_fwht_t kernel_rms_norm_mul_fwht<2048, GGML_METAL_FWHT_TG_NT_FALLBACK>;
+template [[host_name("kernel_rms_norm_mul_fwht_f32_4096_nt128")]] kernel kernel_rms_norm_mul_fwht_t kernel_rms_norm_mul_fwht<4096, GGML_METAL_FWHT_TG_NT_FALLBACK>;
+template [[host_name("kernel_rms_norm_mul_fwht_f32_8192_nt128")]] kernel kernel_rms_norm_mul_fwht_t kernel_rms_norm_mul_fwht<8192, GGML_METAL_FWHT_TG_NT_FALLBACK>;
 
 
 typedef decltype(kernel_fwht<64, float>) kernel_fwht_f32_t;

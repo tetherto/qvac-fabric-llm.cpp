@@ -6424,6 +6424,59 @@ struct test_mul_mat_hadamard : public test_mul_mat {
 };
 
 // sign flip + reshape + FWHT-hint matmul, the fusable Hadamard activation path
+// normalized Sylvester Hadamard matrix
+static void init_tensor_hadamard(ggml_tensor * t) {
+    const int64_t n_cols = t->ne[0];
+    const int64_t n_rows = ggml_nrows(t);
+    std::vector<float> data(n_cols * n_rows);
+    float scale = 1.0f / sqrtf((float)n_cols);
+    for (int64_t r = 0; r < n_rows; r++) {
+        for (int64_t i = 0; i < n_cols; i++) {
+            int pop = 0;
+            int64_t val = r & i;
+            while (val) { pop += (val & 1); val >>= 1; }
+            data[r * n_cols + i] = (pop % 2 == 0) ? scale : -scale;
+        }
+    }
+    ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(float));
+}
+
+static void init_tensor_signs(ggml_tensor * t) {
+    std::vector<float> data(ggml_nelements(t));
+    for (size_t i = 0; i < data.size(); i++) {
+        data[i] = (i % 3 == 0) ? -1.0f : 1.0f;
+    }
+    ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(float));
+}
+
+// "a" is the Hadamard matrix and "s" the sign vector of a signed FWHT graph; other float tensors are uniform
+static void init_tensors_hadamard_signed(ggml_context * ctx) {
+    for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+        if (strcmp(t->name, "a") == 0) {
+            init_tensor_hadamard(t);
+        } else if (strcmp(t->name, "s") == 0) {
+            init_tensor_signs(t);
+        } else if (t->type == GGML_TYPE_F32 || t->type == GGML_TYPE_F16) {
+            init_tensor_uniform(t);
+        }
+    }
+}
+
+// error bound of a graph ending in a Hadamard MUL_MAT: some backends run it as a dense product, not an exact FWHT
+static double hadamard_max_nmse_err(ggml_backend_t backend, double fallback) {
+    const char * backend_name = ggml_backend_reg_name(ggml_backend_dev_backend_reg(ggml_backend_get_device(backend)));
+    if (strcmp(backend_name, "WebGPU") == 0) {
+        return 5e-5;
+    }
+    if (strcmp(backend_name, "Vulkan") == 0) {
+        return 5e-6;
+    }
+    if (strcmp(backend_name, "CUDA") == 0) {
+        return 2e-7;
+    }
+    return fallback;
+}
+
 struct test_fwht_signed : public test_case {
     const int64_t blk;
     const int64_t width;
@@ -6485,18 +6538,7 @@ struct test_fwht_signed : public test_case {
     }
 
     double max_nmse_err(ggml_backend_t backend) override {
-        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
-        const char * backend_name = ggml_backend_reg_name(reg);
-        if (strcmp(backend_name, "WebGPU") == 0) {
-            return 5e-5;
-        }
-        if (strcmp(backend_name, "Vulkan") == 0) {
-            return 5e-6;
-        }
-        if (strcmp(backend_name, "CUDA") == 0) {
-            return 2e-7;
-        }
-        return test_case::max_nmse_err(backend);
+        return hadamard_max_nmse_err(backend, test_case::max_nmse_err(backend));
     }
 
     std::string op_desc(ggml_tensor * t) override {
@@ -6547,31 +6589,90 @@ struct test_fwht_signed : public test_case {
     }
 
     void initialize_tensors(ggml_context * ctx) override {
-        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
-            if (strcmp(t->name, "a") == 0) {
-                const int64_t n_cols = t->ne[0];
-                const int64_t n_rows = ggml_nrows(t);
-                std::vector<float> data(n_cols * n_rows);
-                float scale = 1.0f / sqrtf((float)n_cols);
-                for (int64_t r = 0; r < n_rows; r++) {
-                    for (int64_t i = 0; i < n_cols; i++) {
-                        int pop = 0;
-                        int64_t val = r & i;
-                        while (val) { pop += (val & 1); val >>= 1; }
-                        data[r * n_cols + i] = (pop % 2 == 0) ? scale : -scale;
-                    }
-                }
-                ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(float));
-            } else if (strcmp(t->name, "s") == 0) {
-                std::vector<float> data(ggml_nelements(t));
-                for (size_t i = 0; i < data.size(); i++) {
-                    data[i] = (i % 3 == 0) ? -1.0f : 1.0f;
-                }
-                ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(float));
-            } else if (t->type == GGML_TYPE_F32 || t->type == GGML_TYPE_F16) {
-                init_tensor_uniform(t);
-            }
+        init_tensors_hadamard_signed(ctx);
+    }
+};
+
+// GGML_OP_RMS_NORM + GGML_OP_MUL + signed FWHT (the input of a Hadamard-folded projection)
+struct test_rms_norm_fwht : public test_case {
+    const int64_t blk;
+    const int64_t width;
+    const int64_t n_tokens;
+    const bool norm_used; // the weighted norm also feeds the output
+    const bool x_misaligned; // x starts one float into its buffer, so the float4 reads of the fused kernel would be unaligned
+
+    static constexpr const char * fusion_label = "RMS_NORM+MUL+MUL+MUL_MAT";
+
+    mutable bool has_fusion_label = false;
+
+    test_rms_norm_fwht(int64_t blk = 1024, int64_t width = 5120, int64_t n_tokens = 1, bool norm_used = false, bool x_misaligned = false)
+        : blk(blk), width(width), n_tokens(n_tokens), norm_used(norm_used), x_misaligned(x_misaligned) {}
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "RMS_NORM_FWHT";
+    }
+
+    double max_nmse_err(ggml_backend_t backend) override {
+        return hadamard_max_nmse_err(backend, test_case::max_nmse_err(backend));
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR5(blk, width, n_tokens, norm_used, x_misaligned);
+    }
+
+    uint64_t fusion_count(ggml_backend_t backend) override {
+        const int64_t count = backend_fusion_label_count(backend, fusion_label);
+        has_fusion_label = count >= 0;
+        return has_fusion_label ? (uint64_t) count : 0;
+    }
+
+    bool expect_fusion() override {
+        return has_fusion_label && !x_misaligned;
+    }
+
+    bool expect_no_fusion() override {
+        return has_fusion_label && x_misaligned;
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, blk, blk);
+        ggml_set_name(a, "a");
+
+        ggml_tensor * x = nullptr;
+        if (x_misaligned) {
+            ggml_tensor * x_base = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, width*n_tokens + 1);
+            ggml_set_name(x_base, "x_base");
+            x = ggml_view_2d(ctx, x_base, width, n_tokens, width*sizeof(float), sizeof(float));
+        } else {
+            x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, width, n_tokens);
         }
+        ggml_set_name(x, "x");
+
+        ggml_tensor * w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, width);
+        ggml_set_name(w, "w");
+
+        ggml_tensor * s = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, width);
+        ggml_set_name(s, "s");
+
+        ggml_tensor * y   = ggml_mul(ctx, ggml_rms_norm(ctx, x, 1e-6f), w);
+        ggml_tensor * cur = ggml_reshape_2d(ctx, ggml_mul(ctx, y, s), blk, width / blk * n_tokens);
+
+        ggml_tensor * out = ggml_mul_mat(ctx, a, cur);
+        ggml_mul_mat_set_hint(out, GGML_HINT_SRC0_IS_HADAMARD);
+
+        if (norm_used) {
+            out = ggml_add(ctx, ggml_reshape_2d(ctx, out, width, n_tokens), y);
+        }
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        init_tensors_hadamard_signed(ctx);
     }
 };
 
@@ -12601,6 +12702,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_fwht_signed(1024, 6144, 1, GGML_TYPE_F32, false, false, true));
     test_cases.emplace_back(new test_fwht_signed(1024, 6144, 7, GGML_TYPE_F32, false, false, true));
     test_cases.emplace_back(new test_fwht_signed(256, 512, 3, GGML_TYPE_F32, false, false, true));
+    for (bool norm_used : { false, true }) {
+        test_cases.emplace_back(new test_rms_norm_fwht(1024, 5120, 1, norm_used));
+        test_cases.emplace_back(new test_rms_norm_fwht(1024, 5120, 7, norm_used));
+        test_cases.emplace_back(new test_rms_norm_fwht(1024, 17408, 3, norm_used));
+        test_cases.emplace_back(new test_rms_norm_fwht(512, 2048, 4, norm_used));
+        test_cases.emplace_back(new test_rms_norm_fwht(8192, 8192, 2, norm_used));
+    }
+    test_cases.emplace_back(new test_rms_norm_fwht(1024, 5120, 3, false, true));
     test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F32, 32, 1, 32)); // too small (N<64)
     test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F16, 64, 1, 64));
     test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F16, 128, 1, 128));

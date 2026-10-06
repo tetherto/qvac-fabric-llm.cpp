@@ -5405,10 +5405,108 @@ static bool ggml_metal_op_norm_gate_elidable(ggml_metal_op_t ctx, int idx) {
     return ggml_can_fuse_subgraph_ext(ctx->graph(), gis, 4, ops, &gis[3], 1);
 }
 
+static constexpr int GGML_METAL_RMS_NORM_FWHT_N_OPS = 4;
+
+// graph index of tensor t among the graph nodes in [gi0, gi1), or -1
+static int ggml_metal_op_find_graph_node(ggml_metal_op_t ctx, int gi0, int gi1, const ggml_tensor * t) {
+    for (int k = gi0; k < gi1; ++k) {
+        if (ctx->graph()->nodes[k] == t) {
+            return k;
+        }
+    }
+    return -1;
+}
+
+// the fusion table matched RMS_NORM + MUL + MUL + MUL_MAT(hadamard) structurally, and the sign MUL reaches the
+// MUL_MAT through a RESHAPE: the group fuses when no intermediate but the weighted norm has other consumers, and
+// *write_norm tells whether the weighted norm does
+static bool ggml_metal_op_rms_norm_fwht_elidable(ggml_metal_op_t ctx, int idx, bool * write_norm) {
+    static constexpr ggml_op ops[5] = { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_MUL, GGML_OP_RESHAPE, GGML_OP_MUL_MAT };
+
+    const ggml_tensor * mul = ctx->node(idx + 1);
+    const ggml_tensor * mm  = ctx->node(idx + 3);
+
+    const int gi_rs = ggml_metal_op_find_graph_node(ctx, ctx->graph_idx(idx + 2) + 1, ctx->graph_idx(idx + 3), mm->src[1]);
+    if (gi_rs < 0) {
+        return false;
+    }
+
+    const int gis[5]  = { ctx->graph_idx(idx), ctx->graph_idx(idx + 1), ctx->graph_idx(idx + 2), gi_rs, ctx->graph_idx(idx + 3) };
+    const int outs[2] = { gis[4], gis[1] };
+
+    *write_norm = false;
+    if (ggml_can_fuse_subgraph_ext(ctx->graph(), gis, 5, ops, outs, 1)) {
+        return true;
+    }
+
+    *write_norm = true;
+    return mul->data != mm->data && ggml_can_fuse_subgraph_ext(ctx->graph(), gis, 5, ops, outs, 2);
+}
+
+// the fused kernel for FWHT blocks of n, with *nth threads per threadgroup (the fallback width if the default does not fit)
+static ggml_metal_pipeline_with_params ggml_metal_op_rms_norm_fwht_pipeline(ggml_metal_library_t lib, int64_t n, int * nth) {
+    *nth = GGML_METAL_FWHT_TG_NT;
+    auto pipeline = ggml_metal_library_get_pipeline_rms_norm_fwht(lib, n, *nth);
+    if (!pipeline.pipeline || ggml_metal_pipeline_max_theads_per_threadgroup(pipeline) < *nth) {
+        *nth = GGML_METAL_FWHT_TG_NT_FALLBACK;
+        pipeline = ggml_metal_library_get_pipeline_rms_norm_fwht(lib, n, *nth);
+    }
+    return pipeline;
+}
+
+// returns the number of fused nodes, or 0 when the group cannot fuse
+static int ggml_metal_op_rms_norm_fwht(ggml_metal_op_t ctx, int idx) {
+    ggml_tensor * norm  = ctx->node(idx);
+    ggml_tensor * mul   = ctx->node(idx + 1);
+    ggml_tensor * mul_s = ctx->node(idx + 2);
+    ggml_tensor * mm    = ctx->node(idx + 3);
+
+    bool write_norm = false;
+    if (!ggml_metal_op_rms_norm_fwht_elidable(ctx, idx, &write_norm)) {
+        return 0;
+    }
+
+    const int64_t n = mm->src[0]->ne[0];
+
+    int nth = 0;
+    auto pipeline = ggml_metal_op_rms_norm_fwht_pipeline(ctx->lib, n, &nth);
+    if (!pipeline.pipeline || ggml_metal_pipeline_max_theads_per_threadgroup(pipeline) < nth) {
+        return 0;
+    }
+
+    ggml_metal_kargs_rms_norm_fwht args = {
+        /*.ne00       =*/ (int32_t) norm->ne[0],
+        /*.n_blk      =*/ (int32_t) (norm->ne[0] / n),
+        /*.eps        =*/ ggml_get_op_params_f32(norm, 0),
+        /*.write_norm =*/ write_norm ? 1 : 0,
+    };
+
+    ggml_metal_op_fusion_concurrency(ctx, idx, GGML_METAL_RMS_NORM_FWHT_N_OPS);
+
+    ggml_metal_encoder_t enc = ctx->enc;
+    ggml_metal_encoder_set_pipeline(enc, pipeline);
+    ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(norm->src[0]),  1);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(mul->src[1]),   2);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(mul_s->src[1]), 3);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(mm),            4);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(write_norm ? mul : mm), 5);
+
+    ggml_metal_encoder_dispatch_threadgroups(enc, ggml_nrows(norm)*args.n_blk, 1, 1, nth, 1, 1);
+
+    if (ggml_metal_fusion_info_debug(ctx->finfo) > 1) {
+        GGML_LOG_DEBUG("%s: fuse: RMS_NORM + MUL + MUL + MUL_MAT (signed FWHT), write_norm = %d\n", __func__, args.write_norm);
+    }
+
+    return GGML_METAL_RMS_NORM_FWHT_N_OPS;
+}
+
 // true if the encoder can elide the nodes that the fusion table matched for the norm at idx: the consumer checks that
 // need the graph, for the patterns whose table check leaves them to the encoder
 static bool ggml_metal_op_norm_fusion_elidable(ggml_metal_op_t ctx, int idx, const ggml_metal_fusion * fusion) {
+    bool write_norm = false;
     switch (fusion->id) {
+        case GGML_METAL_FUSION_RMS_NORM_FWHT: return ggml_metal_op_rms_norm_fwht_elidable(ctx, idx, &write_norm);
         case GGML_METAL_FUSION_RMS_NORM_GATE: return ggml_metal_op_norm_gate_elidable(ctx, idx);
         default:                              return true;
     }
@@ -5476,6 +5574,17 @@ int ggml_metal_op_norm(ggml_metal_op_t ctx, int idx) {
     // d[2] = add(d[1], c)
     if (use_fusion) {
         const ggml_metal_fusion * fusion = ggml_metal_op_norm_fusion(ctx, idx);
+
+        if (fusion && fusion->id == GGML_METAL_FUSION_RMS_NORM_FWHT) {
+            const int n_fwht = ggml_metal_op_rms_norm_fwht(ctx, idx);
+            if (n_fwht > 0) {
+                ctx->count_fusions(fusion);
+                return n_fwht;
+            }
+
+            // no fused pipeline fits this device: run the norm alone
+            fusion = nullptr;
+        }
 
         if (fusion && fusion->id == GGML_METAL_FUSION_RMS_NORM_GATE) {
             n_fuse   = fusion->n_ops;

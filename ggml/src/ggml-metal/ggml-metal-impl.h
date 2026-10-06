@@ -1433,6 +1433,13 @@ typedef struct {
 } ggml_metal_kargs_fwht;
 
 typedef struct {
+    int32_t ne00;       // row width
+    int32_t n_blk;      // FWHT blocks per row
+    float   eps;
+    int32_t write_norm; // also store the weighted norm, which has other consumers
+} ggml_metal_kargs_rms_norm_fwht;
+
+typedef struct {
     int64_t  ne0;
     float    start;
     float    step;
