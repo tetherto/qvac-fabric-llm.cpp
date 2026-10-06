@@ -589,6 +589,8 @@ struct ggml_backend_xdna_context {
     // other's in-projection buffer gone). The array runs one command stream at
     // a time anyway, so this costs nothing a single context had.
     std::mutex compute_mutex;
+    // The backend whose graph is computing (under compute_mutex).
+    ggml_backend_t cur_backend = nullptr;
     // Attention-layer tails (attn_output + the FFN, one dispatch), per layer.
     // Stateless, so one per layer serves every sequence.
     std::map<int, struct xdna_rec_tail *>                        tails;
@@ -827,6 +829,14 @@ static bool xdna_res_touch(ggml_backend_xdna_context * ctx, const ggml_tensor * 
 struct xdna_rec_session {
     int                  il   = -1;
     int64_t              row  = -1;       // the sequence whose state it holds
+    // The llama context (backend) that sequence belongs to, and its recurrent
+    // cache: every context's sequences start at row 0, so the row alone does
+    // not tell two contexts apart. The state goes back into own_s / own_r.
+    ggml_backend_t       owner   = nullptr;
+    float *              own_s   = nullptr;
+    float *              own_r   = nullptr;
+    size_t               own_s_b = 0;
+    size_t               own_r_b = 0;
     xdna_rec_core *      core = nullptr;  // fused_layer.xclbin (conv+norm+gdn+gated)
     // The layer's projections, on the decode GEMV of the same design
     // (xdna-rec-gemv.h), so the layer never changes hardware context.
@@ -1858,6 +1868,12 @@ static int64_t xdna_rec_seq_row(const xdna_rec_plan & p) {
     return 0;
 }
 
+// The session carries this graph's sequence on the device: the same cell of
+// the same context.
+static bool xdna_rec_holds(const ggml_backend_xdna_context * ctx, const xdna_rec_session * s, int64_t row) {
+    return s && s->seeded && s->owner == ctx->cur_backend && s->row == row;
+}
+
 // Find (or create) the fused session for a recurrent block; which sequence it
 // holds is its own `row`.
 static xdna_rec_session * xdna_rec_session_get(ggml_backend_xdna_context * ctx, int il) {
@@ -2012,7 +2028,7 @@ static void xdna_rec_follow_cache(ggml_backend_xdna_context * ctx, const ggml_cg
         xdna_rec_session * s   = kv.second;
         const int          il  = kv.first.first;
         const int64_t      row = s ? s->row : -1;
-        if (!s || !s->seeded) {
+        if (!s || !s->seeded || s->owner != ctx->cur_backend) {
             continue;
         }
         if (zeroed.count(std::make_pair(il, row))) {
@@ -2162,18 +2178,17 @@ static bool xdna_rec_run(ggml_backend_xdna_context *               ctx,
     // session reseeds from this one's (the graph read it, since the session
     // did not count as seeded for this row, see the node skip in the graph
     // walk).
+    // Another context's sequence goes back into that context's cache, which
+    // is alive while its backend is (ggml_backend_xdna_free drops the state
+    // of a backend that goes).
     const int64_t row = xdna_rec_seq_row(p);
-    if (s->seeded && s->row != row) {
+    if (s->seeded && !xdna_rec_holds(ctx, s, row)) {
         xdna_pending_wait(ctx);
-        const ggml_tensor * ts = p.n_sstate->src[0];
-        const ggml_tensor * tr = p.n_convst->src[0];
-        const size_t        ns = (size_t) state_floats();
-        const size_t        nr = (size_t) 3 * CH;
-        if (!ts || !tr || ts->type != GGML_TYPE_F32 || tr->type != GGML_TYPE_F32 || !ts->data || !tr->data ||
-            s->row < 0 || ggml_nbytes(ts) < (size_t) (s->row + 1) * ns * sizeof(float) ||
-            ggml_nbytes(tr) < (size_t) (s->row + 1) * nr * sizeof(float) ||
-            !xdna_rec_core_read_state(s->core, (float *) tr->data + (size_t) s->row * nr,
-                                      (float *) ts->data + (size_t) s->row * ns)) {
+        const size_t ns = (size_t) state_floats();
+        const size_t nr = (size_t) 3 * CH;
+        if (!s->own_s || !s->own_r || s->row < 0 || s->own_s_b < (size_t) (s->row + 1) * ns * sizeof(float) ||
+            s->own_r_b < (size_t) (s->row + 1) * nr * sizeof(float) ||
+            !xdna_rec_core_read_state(s->core, s->own_r + (size_t) s->row * nr, s->own_s + (size_t) s->row * ns)) {
             GGML_LOG_WARN(
                 "%s: fused layer %d: cannot write sequence row %lld's state "
                 "back to llama's cache\n",
@@ -2338,6 +2353,16 @@ static bool xdna_rec_run(ggml_backend_xdna_context *               ctx,
             return false;
         }
         s->seeded = true;
+        {
+            const ggml_tensor * ts = p.n_sstate->src[0];
+            const ggml_tensor * tr = p.n_convst->src[0];
+            const bool          ok = ts && tr && ts->type == GGML_TYPE_F32 && tr->type == GGML_TYPE_F32;
+            s->owner               = ctx->cur_backend;
+            s->own_s               = ok ? (float *) ts->data : nullptr;
+            s->own_r               = ok ? (float *) tr->data : nullptr;
+            s->own_s_b             = ok ? ggml_nbytes(ts) : 0;
+            s->own_r_b             = ok ? ggml_nbytes(tr) : 0;
+        }
         s->x.resize((size_t) g.x_bytes);
         s->hattn.resize((size_t) g.d_out);
         s->hout.resize((size_t) g.d_out);
@@ -2630,6 +2655,16 @@ static void ggml_backend_xdna_free(ggml_backend_t backend) {
     // The context is a process-wide singleton; it is not freed here, but what
     // it built from the model goes with the last backend.
     ggml_backend_xdna_context * ctx = (ggml_backend_xdna_context *) backend->context;
+    // Its sequences' state has nowhere to go back to: the cache goes with it.
+    {
+        std::lock_guard<std::mutex> compute(ctx->compute_mutex);
+        for (auto & kv : ctx->rec) {
+            if (kv.second && kv.second->owner == backend) {
+                kv.second->seeded = false;
+                kv.second->owner  = nullptr;
+            }
+        }
+    }
     {
         std::lock_guard<std::mutex> lock(ctx->life_mutex);
         if (--ctx->n_backends == 0) {
@@ -2908,7 +2943,7 @@ static enum ggml_status xdna_graph_compute_impl(ggml_backend_xdna_context * ctx,
         // into it feed nothing this graph reads: from the layer's first node
         // on, everything the fire does not read is the fire's.
         const auto it      = ctx->rec.find(std::make_pair(pl.il, (int64_t) 0));
-        const bool seeded  = it != ctx->rec.end() && it->second->seeded && it->second->row == xdna_rec_seq_row(pl);
+        const bool seeded  = it != ctx->rec.end() && xdna_rec_holds(ctx, it->second, xdna_rec_seq_row(pl));
         int        i_first = pl.i_conv;
         if (seeded && pl.n_act) {
             for (int j = 0; j < pl.i_conv; j++) {
@@ -3493,7 +3528,7 @@ static enum ggml_status xdna_graph_compute_impl(ggml_backend_xdna_context * ctx,
             }
             // a seed is taken when the session will reseed: not seeded, or
             // seeded with another sequence's state (xdna_rec_run switches)
-            const bool reseed = s && (!s->seeded || s->row != xdna_rec_seq_row(*c.p));
+            const bool reseed = s && !xdna_rec_holds(ctx, s, xdna_rec_seq_row(*c.p));
             if (s && node->type == GGML_TYPE_F32 && node->data) {
                 switch (c.kind) {
                     case 0:  // qkv
@@ -3980,6 +4015,7 @@ static enum ggml_status xdna_graph_compute_impl(ggml_backend_xdna_context * ctx,
 static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
     ggml_backend_xdna_context * ctx = (ggml_backend_xdna_context *) backend->context;
     std::lock_guard<std::mutex>  compute(ctx->compute_mutex);
+    ctx->cur_backend = backend;
     try {
         const enum ggml_status status = xdna_graph_compute_impl(ctx, cgraph);
         ctx->cur_node                 = nullptr;
