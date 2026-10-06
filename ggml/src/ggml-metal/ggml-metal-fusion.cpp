@@ -236,6 +236,16 @@ static bool ggml_metal_fusion_overlap(const ggml_tensor * a, const ggml_tensor *
         : bid_a.offs - bid_b.offs < ggml_nbytes(b);
 }
 
+// true if every row of f32 tensor t starts 16-byte aligned, so a kernel can read it as float4
+static bool ggml_metal_fusion_float4_rows(const ggml_tensor * t) {
+    constexpr size_t align = 4*sizeof(float);
+
+    ggml_backend_buffer_t buf = t->view_src ? t->view_src->buffer : t->buffer;
+    const ggml_metal_buffer_id bid = ggml_metal_buffer_get_id((ggml_metal_buffer_t) buf->context, t);
+
+    return bid.offs % align == 0 && t->nb[1] % align == 0 && t->nb[2] % align == 0 && t->nb[3] % align == 0;
+}
+
 // true if a and b visit the same bytes in the same element order: the same layout, or both contiguous with equal sizes
 static bool ggml_metal_fusion_same_linear_layout(const ggml_tensor * a, const ggml_tensor * b) {
     return a->type == b->type && ggml_nbytes(a) == ggml_nbytes(b) &&
@@ -245,6 +255,45 @@ static bool ggml_metal_fusion_same_linear_layout(const ggml_tensor * a, const gg
 // true if the byte ranges of a and b overlap, except when b is exactly a: the same data in the same linear layout
 static bool ggml_metal_fusion_partial_overlap(const ggml_tensor * a, const ggml_tensor * b) {
     return !(a->data == b->data && ggml_metal_fusion_same_linear_layout(a, b)) && ggml_metal_fusion_overlap(a, b);
+}
+
+// RMS_NORM + MUL + UNARY(SILU) + MUL: the gated norm silu(z)*(norm(x)*w); the UNARY reads the gate, not the chain, so
+// the checks live here (unsafe = true) and the encoder verifies that the intermediates have no other consumers
+static bool ggml_metal_fusion_check_rms_norm_gate(
+        const ggml_metal_fusion      * fusion,
+        const ggml_tensor * const    * nodes,
+        const ggml_metal_device_props * props,
+              ggml_metal_fusion_mode   mode) {
+    GGML_UNUSED(fusion);
+    GGML_UNUSED(props);
+
+    const ggml_tensor * norm  = nodes[0];
+    const ggml_tensor * mul   = nodes[1];
+    const ggml_tensor * act   = nodes[2];
+    const ggml_tensor * gated = nodes[3];
+
+    const ggml_tensor * x = norm->src[0];
+    const ggml_tensor * w = mul->src[1];
+    const ggml_tensor * z = act->src[0];
+
+    const bool ok =
+        mul->src[0] == norm && ggml_get_unary_op(act) == GGML_UNARY_OP_SILU && gated->src[0] == mul && gated->src[1] == act &&
+        x->type == GGML_TYPE_F32 && w->type == GGML_TYPE_F32 && z->type == GGML_TYPE_F32 &&
+        norm->type == GGML_TYPE_F32 && mul->type == GGML_TYPE_F32 && act->type == GGML_TYPE_F32 && gated->type == GGML_TYPE_F32 &&
+        w->ne[0] == x->ne[0] && ggml_is_contiguous_rows(w) && ggml_is_contiguous_rows(z) &&
+        ggml_are_same_shape(mul, norm) && ggml_are_same_shape(act, norm) && ggml_are_same_shape(gated, norm);
+
+    if (!ok) {
+        return false;
+    }
+
+    if (mode != GGML_METAL_FUSION_FULL) {
+        return true;
+    }
+
+    // the kernel reads the gate as float4 rows when the rows are a multiple of 4 wide
+    return !ggml_metal_fusion_partial_overlap(x, gated) && !ggml_metal_fusion_partial_overlap(z, gated) &&
+        (x->ne[0] % 4 != 0 || ggml_metal_fusion_float4_rows(z));
 }
 
 // MUL + MUL_MAT(hadamard): the sign vector folds into the FWHT kernel, so the MUL is elided.
@@ -400,6 +449,7 @@ static const ggml_op ops_norm_mul_add[]     = { GGML_OP_NORM, GGML_OP_MUL, GGML_
 static const ggml_op ops_rms_norm_mul[]     = { GGML_OP_RMS_NORM, GGML_OP_MUL };
 static const ggml_op ops_rms_norm_mul_add[] = { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ADD };
 static const ggml_op ops_rms_norm_scale[]   = { GGML_OP_RMS_NORM, GGML_OP_SCALE };
+static const ggml_op ops_rms_norm_gate[]    = { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_UNARY, GGML_OP_MUL };
 
 static const ggml_op ops_add_2[] = { GGML_OP_ADD, GGML_OP_ADD };
 static const ggml_op ops_add_3[] = { GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD };
@@ -427,6 +477,7 @@ static const ggml_metal_fusion ggml_metal_fusions[] = {
     { GGML_METAL_FUSION_NORM_MUL,     ops_rms_norm_mul,     2, false, ggml_metal_fusion_check_norm },
     { GGML_METAL_FUSION_NORM_MUL_ADD, ops_rms_norm_mul_add, 3, false, ggml_metal_fusion_check_norm },
     { GGML_METAL_FUSION_RMS_NORM_SCALE, ops_rms_norm_scale, 2, false, ggml_metal_fusion_check_rms_norm_scale },
+    { GGML_METAL_FUSION_RMS_NORM_GATE,  ops_rms_norm_gate,  4, true,  ggml_metal_fusion_check_rms_norm_gate },
     { GGML_METAL_FUSION_ADD_CHAIN,    ops_add_2,            2, false, ggml_metal_fusion_check_add_chain },
     { GGML_METAL_FUSION_ADD_CHAIN,    ops_add_3,            3, false, ggml_metal_fusion_check_add_chain },
     { GGML_METAL_FUSION_ADD_CHAIN,    ops_add_4,            4, false, ggml_metal_fusion_check_add_chain },
@@ -606,6 +657,56 @@ int ggml_metal_fusion_info_stats_get(const struct ggml_metal_fusion_info * finfo
 
 // find the longest pattern matching the node sequence starting at idx
 // (idx is a position in node_idxs, which maps to graph node indices)
+// true if fusion matches the nodes starting at idx (a position in node_idxs) in `mode` on a device with props
+static bool ggml_metal_fusion_matches(
+        const ggml_metal_fusion * fusion,
+        const ggml_cgraph * gf,
+        const int * node_idxs,
+        int n_idxs,
+        int idx,
+        const ggml_metal_device_props * props,
+        ggml_metal_fusion_mode mode) {
+    if (idx + fusion->n_ops > n_idxs) {
+        return false;
+    }
+
+    const ggml_tensor * nodes[GGML_METAL_FUSION_MAX];
+
+    // the op sequence must match exactly
+    for (int j = 0; j < fusion->n_ops; j++) {
+        nodes[j] = gf->nodes[node_idxs[idx + j]];
+        if (nodes[j]->op != fusion->ops[j]) {
+            return false;
+        }
+    }
+
+    if (!fusion->unsafe) {
+        // common element-wise chain constraints: each node reads the previous one,
+        // and all nodes have the same shape
+        for (int j = 1; j < fusion->n_ops; j++) {
+            if (nodes[j]->src[0] != nodes[j - 1] && nodes[j]->src[1] != nodes[j - 1]) {
+                return false;
+            }
+            if (!ggml_are_same_shape(nodes[j], nodes[j - 1])) {
+                return false;
+            }
+        }
+
+        // all current fusions are single-output elision chains, so the last node is the only output
+        // TODO: multi-output fusions: store pattern-relative offsets in the table and translate them here
+        int outputs_buf[1];
+        outputs_buf[0] = node_idxs[idx + fusion->n_ops - 1];
+
+        // structural subgraph checks (op sequence, elidable uses, view containment)
+        if (!ggml_can_fuse_subgraph_ext(gf, node_idxs + idx, fusion->n_ops, fusion->ops, outputs_buf, 1)) {
+            return false;
+        }
+    }
+
+    // pattern-specific checks (the sole validator for unsafe patterns)
+    return !fusion->check || fusion->check(fusion, nodes, props, mode);
+}
+
 const ggml_metal_fusion * ggml_metal_fusion_next(
         const ggml_cgraph * gf,
         const int * node_idxs,
@@ -624,58 +725,7 @@ const ggml_metal_fusion * ggml_metal_fusion_next(
         const ggml_metal_fusion * fusion = &all[i];
 
         // only look for a longer match than the current best
-        if (fusion->n_ops <= best) {
-            continue;
-        }
-        if (idx + fusion->n_ops > n_idxs) {
-            continue;
-        }
-
-        const ggml_tensor * nodes[GGML_METAL_FUSION_MAX];
-
-        // the op sequence must match exactly
-        bool ok = true;
-        for (int j = 0; j < fusion->n_ops; j++) {
-            nodes[j] = gf->nodes[node_idxs[idx + j]];
-            if (nodes[j]->op != fusion->ops[j]) {
-                ok = false;
-                break;
-            }
-        }
-        if (!ok) {
-            continue;
-        }
-
-        if (!fusion->unsafe) {
-            // common element-wise chain constraints: each node reads the previous one,
-            // and all nodes have the same shape
-            for (int j = 1; j < fusion->n_ops && ok; j++) {
-                if (nodes[j]->src[0] != nodes[j - 1] && nodes[j]->src[1] != nodes[j - 1]) {
-                    ok = false;
-                    break;
-                }
-                if (!ggml_are_same_shape(nodes[j], nodes[j - 1])) {
-                    ok = false;
-                    break;
-                }
-            }
-            if (!ok) {
-                continue;
-            }
-
-            // all current fusions are single-output elision chains, so the last node is the only output
-            // TODO: multi-output fusions: store pattern-relative offsets in the table and translate them here
-            int outputs_buf[1];
-            outputs_buf[0] = node_idxs[idx + fusion->n_ops - 1];
-
-            // structural subgraph checks (op sequence, elidable uses, view containment)
-            if (!ggml_can_fuse_subgraph_ext(gf, node_idxs + idx, fusion->n_ops, fusion->ops, outputs_buf, 1)) {
-                continue;
-            }
-        }
-
-        // pattern-specific checks (the sole validator for unsafe patterns)
-        if (fusion->check && !fusion->check(fusion, nodes, props, mode)) {
+        if (fusion->n_ops <= best || !ggml_metal_fusion_matches(fusion, gf, node_idxs, n_idxs, idx, props, mode)) {
             continue;
         }
 
@@ -686,6 +736,46 @@ const ggml_metal_fusion * ggml_metal_fusion_next(
     *n_out = best;
 
     return res;
+}
+
+// insert fusion into the n_max-entry list out of *n_out entries, kept longest first (table order between equal lengths)
+static void ggml_metal_fusion_insert_longest_first(const ggml_metal_fusion ** out, int * n_out, int n_max, const ggml_metal_fusion * fusion) {
+    int pos = *n_out;
+    while (pos > 0 && out[pos - 1]->n_ops < fusion->n_ops) {
+        pos--;
+    }
+    if (pos >= n_max) {
+        return;
+    }
+
+    const int n_keep = std::min(*n_out, n_max - 1);
+    for (int i = n_keep; i > pos; i--) {
+        out[i] = out[i - 1];
+    }
+    out[pos] = fusion;
+    *n_out = n_keep + 1;
+}
+
+int ggml_metal_fusion_candidates(
+        const ggml_cgraph * gf,
+        const int * node_idxs,
+        int n_idxs,
+        int idx,
+        const ggml_metal_device_props * props,
+        ggml_metal_fusion_mode mode,
+        const ggml_metal_fusion ** out,
+        int n_max) {
+    int n = 0;
+    const ggml_metal_fusion * all = ggml_metal_fusion_all(&n);
+
+    int n_out = 0;
+    for (int i = 0; i < n; i++) {
+        if (ggml_metal_fusion_matches(&all[i], gf, node_idxs, n_idxs, idx, props, mode)) {
+            ggml_metal_fusion_insert_longest_first(out, &n_out, n_max, &all[i]);
+        }
+    }
+
+    return n_out;
 }
 
 // optimize phase: maximum number of nodes starting at idx (a raw sequential graph index) that

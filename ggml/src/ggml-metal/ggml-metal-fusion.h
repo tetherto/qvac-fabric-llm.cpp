@@ -36,6 +36,7 @@ typedef enum ggml_metal_fusion_id {
     GGML_METAL_FUSION_NORM_MUL,     // NORM/RMS_NORM + MUL
     GGML_METAL_FUSION_NORM_MUL_ADD, // NORM/RMS_NORM + MUL + ADD
     GGML_METAL_FUSION_RMS_NORM_SCALE, // RMS_NORM + SCALE
+    GGML_METAL_FUSION_RMS_NORM_GATE,  // RMS_NORM + MUL + UNARY(SILU) + MUL (gated norm)
     GGML_METAL_FUSION_ADD_CHAIN,    // ADD x N (N in [2, 7])
     GGML_METAL_FUSION_SNAKE,        // MUL + SIN + SQR + MUL + ADD
     GGML_METAL_FUSION_GDN_CACHE,    // GATED_DELTA_NET + CPY (write snapshots into the recurrent cache)
@@ -103,6 +104,18 @@ const ggml_metal_fusion * ggml_metal_fusion_next(
         const struct ggml_metal_device_props * props,
         ggml_metal_fusion_mode mode,
         int * n_out);
+
+// compute phase: every fusion starting at idx that matches in `mode` on a device with props, longest first (table order
+// between equal lengths). writes at most n_max of them, the longest, to out and returns their number.
+int ggml_metal_fusion_candidates(
+        const struct ggml_cgraph * gf,
+        const int * node_idxs,
+        int n_idxs,
+        int idx,
+        const struct ggml_metal_device_props * props,
+        ggml_metal_fusion_mode mode,
+        const ggml_metal_fusion ** out,
+        int n_max);
 
 // optimize phase: maximum number of nodes starting at idx (a raw sequential graph index) that
 // could be fused on a device with props, chaining patterns back-to-back. returns at least 1.

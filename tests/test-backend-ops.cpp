@@ -4109,6 +4109,120 @@ struct test_rms_norm_scale : public test_case {
     }
 };
 
+// count of a fusion label from the generic fusion debugging API, or -1 if the backend does not report the label
+static int64_t backend_fusion_label_count(ggml_backend_t backend, const char * label) {
+    using fusion_get_t = void * (*)(ggml_backend_dev_t);
+    using stats_init_t = void   (*)(void *);
+    using stats_get_t  = int    (*)(void *, const char **, uint64_t *, int);
+
+    ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+
+    auto api_get        = (fusion_get_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_fusion_get");
+    auto api_stats_init = (stats_init_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_fusion_stats_init");
+    auto api_stats_get  = (stats_get_t)  ggml_backend_reg_get_proc_address(reg, "ggml_backend_fusion_stats_get");
+    if (!api_get || !api_stats_init || !api_stats_get) {
+        return -1;
+    }
+
+    void * finfo = api_get(dev);
+    api_stats_init(finfo);
+
+    const int n = api_stats_get(finfo, nullptr, nullptr, 0);
+    std::vector<const char *> labels(n, nullptr);
+    std::vector<uint64_t>     counts(n, 0);
+    api_stats_get(finfo, labels.data(), counts.data(), n);
+
+    for (int i = 0; i < n; i++) {
+        if (strcmp(labels[i], label) == 0) {
+            return (int64_t) counts[i];
+        }
+    }
+    return -1;
+}
+
+// GGML_OP_RMS_NORM + GGML_OP_MUL + SILU gate (the gated norm of the gated delta net output)
+struct test_rms_norm_mul_gate : public test_case {
+    const std::array<int64_t, 4> ne;
+    const bool norm_used; // the weighted norm also feeds the output, so the fusion must not fire
+    const int64_t z_offs; // the gate starts this many floats into its buffer
+    const int64_t z_pad;  // floats of padding after each gate row
+
+    // the fused kernel reads float4 gate rows when ne[0] % 4 == 0, so they must be 16-byte aligned
+    bool z_misaligned() const {
+        return ne[0] % 4 == 0 && (z_offs % 4 != 0 || z_pad % 4 != 0);
+    }
+
+    static constexpr const char * fusion_label = "RMS_NORM+MUL+UNARY+MUL";
+
+    mutable bool has_fusion_label = false;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "RMS_NORM_MUL_GATE";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR4(ne, norm_used, z_offs, z_pad);
+    }
+
+    uint64_t fusion_count(ggml_backend_t backend) override {
+        const int64_t count = backend_fusion_label_count(backend, fusion_label);
+        has_fusion_label = count >= 0;
+        return has_fusion_label ? (uint64_t) count : 0;
+    }
+
+    bool expect_fusion() override {
+        return has_fusion_label && !norm_used && !z_misaligned();
+    }
+
+    bool expect_no_fusion() override {
+        return has_fusion_label && (norm_used || z_misaligned());
+    }
+
+    test_rms_norm_mul_gate(std::array<int64_t, 4> ne = {128, 48, 1, 1}, bool norm_used = false, int64_t z_offs = 0, int64_t z_pad = 0)
+        : ne(ne), norm_used(norm_used), z_offs(z_offs), z_pad(z_pad) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
+        ggml_set_name(x, "x");
+
+        ggml_tensor * w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, ne[0]);
+        ggml_set_name(w, "w");
+
+        ggml_tensor * z = nullptr;
+        if (z_offs == 0 && z_pad == 0) {
+            z = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
+        } else {
+            const int64_t row = ne[0] + z_pad;
+            ggml_tensor * z_base = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, z_offs + row*ne[1]*ne[2]*ne[3]);
+            ggml_set_name(z_base, "z_base");
+            z = ggml_view_4d(ctx, z_base, ne[0], ne[1], ne[2], ne[3], row*sizeof(float), row*ne[1]*sizeof(float),
+                             row*ne[1]*ne[2]*sizeof(float), z_offs*sizeof(float));
+        }
+        ggml_set_name(z, "z");
+
+        ggml_tensor * y    = ggml_mul(ctx, ggml_rms_norm(ctx, x, 1e-6f), w);
+        ggml_tensor * gate = ggml_silu(ctx, z);
+        ggml_tensor * out  = ggml_mul(ctx, y, gate);
+
+        if (norm_used) {
+            out = ggml_add(ctx, out, y);
+        }
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            init_tensor_uniform(t, -10.f, 10.f);
+        }
+    }
+};
+
 // GGML_OP_ADD + GGML_OP_ADD (fused residual chain)
 struct test_add_add : public test_case {
     const ggml_type type;
@@ -12336,6 +12450,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_rms_norm_scale(ne, 1e-6f/ne[0], 1.0f/sqrtf((float) ne[0])));
         test_cases.emplace_back(new test_rms_norm_scale(ne, 1e-6f, 0.5f, 0.25f));
     }
+
+    for (std::array<int64_t, 4> ne : std::vector<std::array<int64_t, 4>>{ { 128, 48, 1, 1 }, { 128, 48, 8, 1 }, { 1025, 5, 4, 3 } }) {
+        test_cases.emplace_back(new test_rms_norm_mul_gate(ne));
+    }
+    test_cases.emplace_back(new test_rms_norm_mul_gate({ 128, 48, 1, 1 }, true));
+    test_cases.emplace_back(new test_rms_norm_mul_gate({ 128, 48, 1, 1 }, false, 1, 0));
+    test_cases.emplace_back(new test_rms_norm_mul_gate({ 128, 48, 2, 1 }, false, 0, 1));
 
     test_cases.emplace_back(new test_rms_norm_mul_add(GGML_TYPE_F32, { 1536, 1, 1, 1 }, 1e-6f, false, false, true));
     test_cases.emplace_back(new test_rms_norm_mul_add(GGML_TYPE_F32, { 256, 4, 1, 1 }, 1e-6f, false, false, true));

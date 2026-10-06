@@ -100,6 +100,14 @@ struct ggml_metal_op {
         return ggml_metal_fusion_next(gf, idxs.data(), (int) idxs.size(), i0, ggml_metal_device_get_props(dev), mode, n_out);
     }
 
+    // consult the fusion table for every pattern starting at i0, longest first; writes at most n_max to out
+    int fusion_candidates(int i0, enum ggml_metal_fusion_mode mode, const ggml_metal_fusion ** out, int n_max) const {
+        assert(use_fusion());
+        assert(i0 >= 0 && i0 < n_nodes());
+
+        return ggml_metal_fusion_candidates(gf, idxs.data(), (int) idxs.size(), i0, ggml_metal_device_get_props(dev), mode, out, n_max);
+    }
+
     // whether to attempt fusion; the toggle lives in the shared fusion debugging context owned
     // by the device (initialized from GGML_METAL_FUSION_DISABLE, overridable by the test)
     bool use_fusion() const {
@@ -5372,6 +5380,53 @@ int ggml_metal_op_group_norm(ggml_metal_op_t ctx, int idx) {
     return 1;
 }
 
+// the most fusion table entries that can start at one norm node
+static constexpr int GGML_METAL_NORM_FUSION_CANDIDATES = 8;
+
+// slot i (1 or 2) of the fused norm kernel reads t, broadcast over the norm rows
+static void ggml_metal_op_norm_set_operand(ggml_metal_kargs_norm & args, ggml_metal_buffer_id * bid_fuse, int i, const ggml_tensor * t) {
+    bid_fuse[i - 1] = ggml_metal_get_buffer_id(t);
+
+    args.nef1[i] = t->ne[1];
+    args.nef2[i] = t->ne[2];
+    args.nef3[i] = t->ne[3];
+
+    args.nbf1[i] = t->nb[1];
+    args.nbf2[i] = t->nb[2];
+    args.nbf3[i] = t->nb[3];
+}
+
+// the gated norm fusion elides the norm, the weighted norm and the activation, so none may have other consumers
+static bool ggml_metal_op_norm_gate_elidable(ggml_metal_op_t ctx, int idx) {
+    static constexpr ggml_op ops[4] = { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_UNARY, GGML_OP_MUL };
+
+    const int gis[4] = { ctx->graph_idx(idx), ctx->graph_idx(idx + 1), ctx->graph_idx(idx + 2), ctx->graph_idx(idx + 3) };
+
+    return ggml_can_fuse_subgraph_ext(ctx->graph(), gis, 4, ops, &gis[3], 1);
+}
+
+// true if the encoder can elide the nodes that the fusion table matched for the norm at idx: the consumer checks that
+// need the graph, for the patterns whose table check leaves them to the encoder
+static bool ggml_metal_op_norm_fusion_elidable(ggml_metal_op_t ctx, int idx, const ggml_metal_fusion * fusion) {
+    switch (fusion->id) {
+        case GGML_METAL_FUSION_RMS_NORM_GATE: return ggml_metal_op_norm_gate_elidable(ctx, idx);
+        default:                              return true;
+    }
+}
+
+// the longest fusion for the norm at idx that the table matches and the encoder can elide, or nullptr
+static const ggml_metal_fusion * ggml_metal_op_norm_fusion(ggml_metal_op_t ctx, int idx) {
+    const ggml_metal_fusion * candidates[GGML_METAL_NORM_FUSION_CANDIDATES];
+    const int n_candidates = ctx->fusion_candidates(idx, GGML_METAL_FUSION_FULL, candidates, GGML_METAL_NORM_FUSION_CANDIDATES);
+
+    for (int i = 0; i < n_candidates; i++) {
+        if (ggml_metal_op_norm_fusion_elidable(ctx, idx, candidates[i])) {
+            return candidates[i];
+        }
+    }
+    return nullptr;
+}
+
 int ggml_metal_op_norm(ggml_metal_op_t ctx, int idx) {
     ggml_tensor * op = ctx->node(idx);
 
@@ -5412,7 +5467,7 @@ int ggml_metal_op_norm(ggml_metal_op_t ctx, int idx) {
 
     int n_fuse = 1;
 
-    bool fuse_scale = false;
+    int epilogue = GGML_METAL_NORM_EPI_NONE;
 
     ggml_metal_buffer_id bid_fuse[2] = { bid_src0, bid_src0 };
 
@@ -5420,26 +5475,29 @@ int ggml_metal_op_norm(ggml_metal_op_t ctx, int idx) {
     // d[1] = mul(d[0], b)
     // d[2] = add(d[1], c)
     if (use_fusion) {
-        int n = 1;
-        const ggml_metal_fusion * fusion = ctx->can_fuse(idx, GGML_METAL_FUSION_FULL, &n);
+        const ggml_metal_fusion * fusion = ggml_metal_op_norm_fusion(ctx, idx);
+
+        if (fusion && fusion->id == GGML_METAL_FUSION_RMS_NORM_GATE) {
+            n_fuse   = fusion->n_ops;
+            epilogue = GGML_METAL_NORM_EPI_SILU_GATE;
+
+            ctx->count_fusions(fusion);
+
+            ggml_metal_op_norm_set_operand(args, bid_fuse, 1, ctx->node(idx + 1)->src[1]);
+            ggml_metal_op_norm_set_operand(args, bid_fuse, 2, ctx->node(idx + 2)->src[0]);
+
+            if (debug_fusion > 1) {
+                GGML_LOG_DEBUG("%s: fuse: %s + MUL + UNARY(SILU) + MUL\n", __func__, ggml_op_name(op->op));
+            }
+        }
 
         if (fusion && (fusion->id == GGML_METAL_FUSION_NORM_MUL || fusion->id == GGML_METAL_FUSION_NORM_MUL_ADD)) {
-            n_fuse = n;
+            n_fuse = fusion->n_ops;
 
             ctx->count_fusions(fusion);
 
             for (int i = 1; i < n_fuse; i++) {
-                const ggml_tensor * fn = ctx->node(idx + i);
-
-                bid_fuse[i - 1] = ggml_metal_get_buffer_id(fn->src[1]);
-
-                args.nef1[i] = fn->src[1]->ne[1];
-                args.nef2[i] = fn->src[1]->ne[2];
-                args.nef3[i] = fn->src[1]->ne[3];
-
-                args.nbf1[i] = fn->src[1]->nb[1];
-                args.nbf2[i] = fn->src[1]->nb[2];
-                args.nbf3[i] = fn->src[1]->nb[3];
+                ggml_metal_op_norm_set_operand(args, bid_fuse, i, ctx->node(idx + i)->src[1]);
             }
 
             if (debug_fusion > 1) {
@@ -5453,8 +5511,8 @@ int ggml_metal_op_norm(ggml_metal_op_t ctx, int idx) {
         }
 
         if (fusion && fusion->id == GGML_METAL_FUSION_RMS_NORM_SCALE) {
-            n_fuse     = n;
-            fuse_scale = true;
+            n_fuse   = fusion->n_ops;
+            epilogue = GGML_METAL_NORM_EPI_SCALE;
 
             ctx->count_fusions(fusion);
 
@@ -5481,7 +5539,7 @@ int ggml_metal_op_norm(ggml_metal_op_t ctx, int idx) {
         }
     }
 
-    auto pipeline = ggml_metal_library_get_pipeline_norm(lib, op, n_fuse, fuse_scale);
+    auto pipeline = ggml_metal_library_get_pipeline_norm(lib, op, n_fuse, epilogue);
 
     int nth = 32; // SIMD width
 

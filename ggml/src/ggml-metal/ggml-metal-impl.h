@@ -663,6 +663,11 @@ typedef struct {
     uint64_t nbs2;
 } ggml_metal_kargs_mul_mv_id;
 
+// epilogues of the fused rms_norm kernel, with the arithmetic of the unfused kernels
+#define GGML_METAL_NORM_EPI_NONE      0
+#define GGML_METAL_NORM_EPI_SCALE     1 // scale*y + bias (SCALE)
+#define GGML_METAL_NORM_EPI_SILU_GATE 2 // silu(g)*y (UNARY(SILU) + MUL)
+
 // NORM
 // RMS_NORM
 typedef struct {

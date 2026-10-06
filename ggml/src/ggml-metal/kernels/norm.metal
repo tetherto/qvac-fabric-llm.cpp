@@ -101,8 +101,8 @@ template [[host_name("kernel_norm_mul_add_f32_4")]] kernel kernel_norm_fuse_t ke
 // F == 1 : rms_norm (no fuse)
 // F == 2 : rms_norm + mul
 // F == 3 : rms_norm + mul + add
-// S      : rms_norm + scale (F == 1), same arithmetic as the SCALE kernel
-template <typename T, short F, bool S = false>
+// E      : epilogue (GGML_METAL_NORM_EPI_*): SCALE with F == 1, SILU_GATE (gate in src1_1) with F == 2
+template <typename T, short F, short E = GGML_METAL_NORM_EPI_NONE>
 kernel void kernel_rms_norm_fuse_impl(
         constant ggml_metal_kargs_norm & args,
         device const char * src0,
@@ -152,14 +152,18 @@ kernel void kernel_rms_norm_fuse_impl(
 
     device T * y = (device T *) (dst + i03*args.nb3 + i02*args.nb2 + i01*args.nb1);
     for (int i00 = tpitg.x; i00 < args.ne00_t; i00 += ntg.x) {
-        if (F == 1 && !S) {
+        if (F == 1 && E == GGML_METAL_NORM_EPI_NONE) {
             y[i00] = (x[i00]*scale);
         }
-        if (F == 1 && S) {
+        if (F == 1 && E == GGML_METAL_NORM_EPI_SCALE) {
             y[i00] = args.scale*(x[i00]*scale) + args.bias;
         }
-        if (F == 2) {
+        if (F == 2 && E == GGML_METAL_NORM_EPI_NONE) {
             y[i00] = (x[i00]*scale)*f0[i00];
+        }
+        if (F == 2 && E == GGML_METAL_NORM_EPI_SILU_GATE) {
+            const T g = f1[i00];
+            y[i00] = (g/(1 + exp(-g)))*((x[i00]*scale)*f0[i00]);
         }
         if (F == 3) {
             y[i00] = (x[i00]*scale)*f0[i00] + f1[i00];
@@ -177,8 +181,11 @@ template [[host_name("kernel_rms_norm_f32_4")]]         kernel kernel_rms_norm_f
 template [[host_name("kernel_rms_norm_mul_f32_4")]]     kernel kernel_rms_norm_fuse_t kernel_rms_norm_fuse_impl<float4, 2>;
 template [[host_name("kernel_rms_norm_mul_add_f32_4")]] kernel kernel_rms_norm_fuse_t kernel_rms_norm_fuse_impl<float4, 3>;
 
-template [[host_name("kernel_rms_norm_scale_f32")]]   kernel kernel_rms_norm_fuse_t kernel_rms_norm_fuse_impl<float,  1, true>;
-template [[host_name("kernel_rms_norm_scale_f32_4")]] kernel kernel_rms_norm_fuse_t kernel_rms_norm_fuse_impl<float4, 1, true>;
+template [[host_name("kernel_rms_norm_scale_f32")]]   kernel kernel_rms_norm_fuse_t kernel_rms_norm_fuse_impl<float,  1, GGML_METAL_NORM_EPI_SCALE>;
+template [[host_name("kernel_rms_norm_scale_f32_4")]] kernel kernel_rms_norm_fuse_t kernel_rms_norm_fuse_impl<float4, 1, GGML_METAL_NORM_EPI_SCALE>;
+
+template [[host_name("kernel_rms_norm_mul_silu_f32")]]   kernel kernel_rms_norm_fuse_t kernel_rms_norm_fuse_impl<float,  2, GGML_METAL_NORM_EPI_SILU_GATE>;
+template [[host_name("kernel_rms_norm_mul_silu_f32_4")]] kernel kernel_rms_norm_fuse_t kernel_rms_norm_fuse_impl<float4, 2, GGML_METAL_NORM_EPI_SILU_GATE>;
 
 kernel void kernel_rms_norm_back(
         constant ggml_metal_kargs_rms_norm_back & args,
