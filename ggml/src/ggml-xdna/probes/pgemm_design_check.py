@@ -88,12 +88,16 @@ hdr = pg.header(M, K, N, Q8, GLU)
 np.copyto(w_t.numpy(), wbuf)
 # the header through the MemTile's tiling: bf16 j of it sent where the
 # tiling reads output j from
+
+
 def untiled(h):
     o = np.zeros_like(h)
     for j in range(64):
         mr, kb, r, e = j // 512, (j // 64) % 8, (j // 8) % 8, j % 8
         o[(mr * 8 + r) * 64 + kb * 8 + e] = h[j]
     return o
+
+
 hdr = untiled(hdr)
 np.copyto(a_t.numpy(), np.concatenate([hdr, hdr, ablk.reshape(-1)]))
 w_t._sync_to_device()

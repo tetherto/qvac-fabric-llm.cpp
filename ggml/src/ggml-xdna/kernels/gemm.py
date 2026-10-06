@@ -42,6 +42,8 @@ from aie.utils.hostruntime.argparse import add_compile_args
 from aie.utils.hostruntime.cli import run_design_cli
 import aie.iron.kernels as akernels
 
+import wfmt
+
 
 # bf16 -> f32 and int8 -> int32 (native AIE2P int8 x int8 mmul).
 DTYPE_COMBOS = {
@@ -57,9 +59,6 @@ MICROKERNEL_MAC_DIM = {
     "bf16": (4, 8, 8),
     "int8": (8, 8, 8),
 }
-
-
-import wfmt
 
 
 def _packed_split(tb: int) -> int:
@@ -79,8 +78,8 @@ def _use_bfp16(opts) -> bool:
     it with --no-bfp16. Pick the native r=4 kernel there rather than fail
     inside Peano on the micro-kernel's static_assert.
     """
-    return (opts.dtype.split("_")[0] == "bf16" and not getattr(opts, "no_bfp16", False) and
-            opts.tile_m % 16 == 0)
+    return (opts.dtype.split("_")[0] == "bf16" and not getattr(opts, "no_bfp16", False)
+            and opts.tile_m % 16 == 0)
 
 
 def _validate(opts) -> None:
@@ -638,8 +637,6 @@ def _run_gemm(design, opts) -> None:
         opts.dev = "npu2" if resolve_target_arch(rtdev) == "aie2p" else "npu"
 
     _validate(opts)
-
-    GEMM_K_MAX = 1024
 
     Mk = opts.M
     N = opts.N

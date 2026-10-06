@@ -40,7 +40,7 @@ from pathlib import Path as _Path
 
 sys.path.insert(0, str(_Path(__file__).resolve().parent.parent / "kernels"))
 
-from wfmt import (MAC_S, MAC_T, dequant_fn, group_size, pack_tile, tile_bytes,
+from wfmt import (dequant_fn, group_size, pack_tile, tile_bytes,  # noqa: E402
                   unpack_reference)
 
 K_TILE = 64
@@ -85,8 +85,6 @@ def dequant_b(
 
     rt = Runtime(seq, [in_all_ty, out_all_ty, of_in.prod(), of_out.cons()])
     return Program(iron.get_current_device(), rt, workers=[worker]).resolve_program()
-
-
 
 
 def _run_and_verify(opts) -> None:
