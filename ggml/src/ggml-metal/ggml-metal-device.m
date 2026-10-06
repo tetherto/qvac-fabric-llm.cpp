@@ -763,7 +763,9 @@ static bool ggml_metal_probe_dispatch(struct ggml_metal_device * dev, struct ggm
     }];
     [cmd_buf commit];
     const int64_t timeout_ns = 2 * NSEC_PER_SEC;
-    if (dispatch_semaphore_wait(done, dispatch_time(DISPATCH_TIME_NOW, timeout_ns)) != 0) {
+    const bool completed = dispatch_semaphore_wait(done, dispatch_time(DISPATCH_TIME_NOW, timeout_ns)) == 0;
+    dispatch_release(done);
+    if (!completed) {
         GGML_LOG_WARN("%s: probe kernel did not complete within %lld ms\n", __func__, timeout_ns / 1000000);
         return false;
     }

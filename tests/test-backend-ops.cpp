@@ -159,8 +159,9 @@ static void init_tensor_kq_mask(ggml_tensor * tensor, float min = -1.0f, float m
 
     GGML_TENSOR_LOCALS( int32_t, ne, tensor, ne);
 
-    std::vector<float>       data_f32(ne0*ne1*ne2*ne3);
-    std::vector<ggml_fp16_t> data_f16(ne0*ne1*ne2*ne3);
+    const size_t n_elements = (size_t) ne0*ne1*ne2*ne3;
+    std::vector<float>       data_f32(n_elements);
+    std::vector<ggml_fp16_t> data_f16(n_elements);
 
     std::random_device rd;
     std::mt19937 gen(rd());
@@ -194,7 +195,7 @@ static void init_tensor_kq_mask(ggml_tensor * tensor, float min = -1.0f, float m
         }
     }
 
-    ggml_fp32_to_fp16_row(data_f32.data(), data_f16.data(), ne0*ne1*ne2*ne3);
+    ggml_fp32_to_fp16_row(data_f32.data(), data_f16.data(), n_elements);
 
     ggml_backend_tensor_set(tensor, data_f16.data(), 0, data_f16.size()*sizeof(ggml_fp16_t));
 }
@@ -207,7 +208,7 @@ static void init_tensor_tril(ggml_tensor * tensor, float min = -1.0f, float max 
     GGML_TENSOR_LOCALS(int32_t, ne, tensor, ne);
     GGML_TENSOR_LOCALS(size_t, nb, tensor, nb);
 
-    std::vector<float> data_f32(ne0*ne1*ne2*ne3);
+    std::vector<float> data_f32((size_t) ne0*ne1*ne2*ne3);
 
     std::random_device rd;
     std::mt19937 gen(rd());
@@ -286,8 +287,8 @@ static double nmse(const float * a, const float * b, size_t n) {
         float a_i = a[i];
         float b_i = b[i];
 
-        mse_a_b += (a_i - b_i) * (a_i - b_i);
-        mse_a_0 += a_i * a_i;
+        mse_a_b += (double) (a_i - b_i) * (a_i - b_i);
+        mse_a_0 += (double) a_i * a_i;
     }
 
     return mse_a_b / mse_a_0;
@@ -2392,11 +2393,11 @@ struct test_get_rows : public test_case {
             if (t->type == GGML_TYPE_I32) {
                 if (ggml_is_view_op(t->op)) { continue; }
                 // rows
-                std::vector<int> data(r*be1*be2);
+                std::vector<int> data((size_t) r*be1*be2);
                 for (int i = 0; i < r*be1*be2; i++) {
                     data[i] = rand() % m;
                 }
-                ggml_backend_tensor_set(t, data.data(), 0, r * be1 * be2 * sizeof(int));
+                ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(int));
             } else {
                 init_tensor_uniform(t);
             }
@@ -2445,11 +2446,11 @@ struct test_get_rows_back : public test_case {
             if (t->type == GGML_TYPE_I32) {
                 if (ggml_is_view_op(t->op)) { continue; }
                 // rows
-                std::vector<int> data(r*b);
+                std::vector<int> data((size_t) r*b);
                 for (int i = 0; i < r*b; i++) {
                     data[i] = rand() % m;
                 }
-                ggml_backend_tensor_set(t, data.data(), 0, r * b * sizeof(int));
+                ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(int));
             } else {
                 init_tensor_uniform(t);
             }
@@ -2567,7 +2568,7 @@ struct test_set_rows : public test_case {
             if (type_src == GGML_TYPE_F16) {
                 err_estimate *= 16.0f;
             }
-            err_estimate /= 0.25f*float(ne[0] * r * ne[2]*nr23[0] * ne[3]*nr23[1]);
+            err_estimate /= 0.25*double(ne[0] * r * ne[2]*nr23[0] * ne[3]*nr23[1]);
             return err_estimate;
         }
         return 1e-7;
@@ -10946,7 +10947,7 @@ public:
         // compute the transposed [n_tokens, n_embd] V matrix
         struct ggml_tensor * v_cur_t = ggml_transpose(ctx, ggml_reshape_2d(ctx, v_cur, hp.n_embd_gqa(), hp.n_tokens));
 
-        struct ggml_tensor * k_cache_view = ggml_view_1d(ctx, k_l, hp.n_tokens*hp.n_embd_gqa(),
+        struct ggml_tensor * k_cache_view = ggml_view_1d(ctx, k_l, (int64_t) hp.n_tokens*hp.n_embd_gqa(),
                 (ggml_row_size(k_l->type, hp.n_embd_gqa()))*hp.kv_head);
 
         struct ggml_tensor * v_cache_view = ggml_view_2d(ctx, v_l, hp.n_tokens, hp.n_embd_gqa(),
@@ -10990,7 +10991,7 @@ public:
 
         struct ggml_tensor * kqv_merged = ggml_permute(ctx, kqv, 0, 2, 1, 3);
 
-        struct ggml_tensor * cur = ggml_cont_2d(ctx, kqv_merged, hp.n_embd_head*hp.n_head, hp.n_tokens);
+        struct ggml_tensor * cur = ggml_cont_2d(ctx, kqv_merged, (int64_t) hp.n_embd_head*hp.n_head, hp.n_tokens);
 
         struct ggml_tensor * wo = ggml_new_tensor_2d(ctx, GGML_TYPE_Q4_0, hp.n_embd, hp.n_embd);
         cur = ggml_mul_mat(ctx, wo, cur);

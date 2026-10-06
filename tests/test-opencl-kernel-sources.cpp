@@ -56,8 +56,19 @@ std::string strip_string_literals(const std::string & text) {
     return std::regex_replace(text, std::regex("\"([^\"\\\\]|\\\\.)*\""), "\"\"");
 }
 
+std::string strip_carriage_returns(const std::string & text) {
+    std::string out;
+    out.reserve(text.size());
+    for (char c : text) {
+        if (c != '\r') {
+            out.push_back(c);
+        }
+    }
+    return out;
+}
+
 std::string normalize(const std::string & text) {
-    return strip_string_literals(strip_preprocessor(strip_comments(text)));
+    return strip_string_literals(strip_preprocessor(strip_comments(strip_carriage_returns(text))));
 }
 
 bool is_identifier_char(char c) {
@@ -219,6 +230,18 @@ bool detector_flags_redefinition() {
     return found.size() == 1 && found[0] == "kernel_a";
 }
 
+bool detector_ignores_carriage_returns() {
+    const std::string source =
+        "#define DUP(x) kernel void x(void) { } \\\r\n"
+        "    kernel void x(void) { }\r\n"
+        "kernel void kernel_b(global float * x) {\r\n"
+        "    if (x[0] > 0.0f) {\r\n"
+        "        x[0] = 0.0f;\r\n"
+        "    }\r\n"
+        "}\r\n";
+    return duplicate_definitions(source).empty();
+}
+
 bool detector_accepts_distinct_definitions() {
     const std::string source =
         "#define DUP(x) kernel void x(void) { } \\\n"
@@ -237,7 +260,7 @@ bool detector_accepts_distinct_definitions() {
 } // namespace
 
 int main(int argc, char ** argv) {
-    if (!detector_flags_redefinition() || !detector_accepts_distinct_definitions()) {
+    if (!detector_flags_redefinition() || !detector_accepts_distinct_definitions() || !detector_ignores_carriage_returns()) {
         fprintf(stderr, "duplicate-definition detector self-check failed\n");
         return 1;
     }
