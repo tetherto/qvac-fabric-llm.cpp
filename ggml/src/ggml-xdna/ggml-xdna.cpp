@@ -3639,9 +3639,17 @@ static enum ggml_status xdna_graph_compute_impl(ggml_backend_xdna_context * ctx,
             }
             size_t        off = 0;
             xdna_buffer * bo  = xdna_gdn_conv_input(ctx->ops.pool, (int) node->ne[1], (int) node->ne[0], &off);
+            // Only when the GEMM's rows fit what is left of the conv's buffer
+            // (it writes an even count of 128-row blocks, the buffer holds the
+            // tokens rounded up to 128 and two chunks): otherwise the
+            // projection goes to its node and the conv input is prepared on
+            // the host, as a refused call would have had it, without the call
+            // logging an error for every layer.
+            const bool    fits =
+                bo && off + xdna_pgemm_into_rows((int) node->ne[1]) * node->ne[0] * sizeof(float) <= bo->bytes;
             {
                 xdna_prof::section_timer st("prefill: pgemm");
-                p.qkv_ok = bo && xdna_pgemm_run_into(ctx->ops.pool, node, bo, off);
+                p.qkv_ok = fits && xdna_pgemm_run_into(ctx->ops.pool, node, bo, off);
             }
             if (!p.qkv_ok && !xdna_ops_compute(&ctx->ops, node)) {
                 return GGML_STATUS_FAILED;
