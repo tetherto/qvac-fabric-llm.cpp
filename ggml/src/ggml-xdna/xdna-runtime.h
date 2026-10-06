@@ -184,7 +184,9 @@ void xdna_kernel_pool_scan(xdna_kernel_pool * pool);
 
 // Load (or fetch from cache) a kernel for `name` with an in-memory built
 // instruction stream: on a miss, load the hw from `xclbin_name` and bind the
-// stream. A failed lookup is cached and not retried.
+// stream. Cached by name and stream content together, so two different
+// streams under one name never share a kernel. A failed lookup is cached and
+// not retried.
 xdna_kernel * xdna_kernel_pool_get_built(xdna_kernel_pool *  pool,
                                          const std::string & name,
                                          const char *        xclbin_name,
