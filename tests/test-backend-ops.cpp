@@ -3862,6 +3862,12 @@ struct test_supertonic_mm_epilogue : public test_case {
         return prec_f32 ? 1e-9 : 5e-4;
     }
 
+    // WebGPU has no f32-precision matmul path, so GGML_PREC_F32 cannot tighten its tolerance.
+    double max_nmse_err(ggml_backend_t backend) override {
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
+        return strcmp(ggml_backend_reg_name(reg), "WebGPU") == 0 ? 5e-4 : max_nmse_err();
+    }
+
     bool run_whole_graph() override { return true; }
 
     test_supertonic_mm_epilogue(ggml_type type_a, int64_t m, int64_t n, int64_t k, int mode, bool prec_f32 = false,

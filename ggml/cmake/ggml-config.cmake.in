@@ -154,6 +154,12 @@ set_and_check(GGML_LIB_DIR "@PACKAGE_GGML_LIB_INSTALL_DIR@")
 # Include the exported targets file
 include("${CMAKE_CURRENT_LIST_DIR}/ggml-targets.cmake")
 
+# The exported static targets carry the fetched OpenMP runtime only as an
+# empty build-interface placeholder, so attach the installed runtime here.
+if (TARGET ggml::ggml-base AND GGML_OPENMP_FETCHED_LIBRARY)
+    set_property(TARGET ggml::ggml-base APPEND PROPERTY INTERFACE_LINK_LIBRARIES "${GGML_OPENMP_FETCHED_LIBRARY}")
+endif()
+
 if(NOT TARGET ggml::ggml)
     find_package(Threads REQUIRED)
 
