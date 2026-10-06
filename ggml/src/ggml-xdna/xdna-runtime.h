@@ -65,6 +65,9 @@ void xdna_kernel_free(xdna_kernel * kern);
 
 // Allocate a host-visible device buffer object of `bytes` bytes.
 xdna_buffer * xdna_buffer_alloc(xdna_device * dev, size_t bytes);
+// BO allocations that failed in this process so far (the warning that
+// a model does not fit compares it around a graph).
+int xdna_buffer_alloc_failures(void);
 
 // While one is open, xdna_buffer_alloc carves buffers out of the decode's
 // arena (GGML_XDNA_ARENA_MB chunks, 256; 0: never) instead of giving each its
@@ -184,7 +187,9 @@ void xdna_kernel_pool_scan(xdna_kernel_pool * pool);
 
 // Load (or fetch from cache) a kernel for `name` with an in-memory built
 // instruction stream: on a miss, load the hw from `xclbin_name` and bind the
-// stream. A failed lookup is cached and not retried.
+// stream. Cached by name and stream content together, so two different
+// streams under one name never share a kernel. A failed lookup is cached and
+// not retried.
 xdna_kernel * xdna_kernel_pool_get_built(xdna_kernel_pool *  pool,
                                          const std::string & name,
                                          const char *        xclbin_name,
