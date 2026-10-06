@@ -13,6 +13,9 @@ string(REPLACE "|" ";" CMAKE_BUILD_RPATH "${GGML_CONSUMER_RPATH}")
 
 find_package(ggml CONFIG REQUIRED)
 
+get_target_property(GGML_CONSUMER_BASE_LINK ggml::ggml-base INTERFACE_LINK_LIBRARIES)
+message(STATUS "consumer: ggml::ggml-base links ${GGML_CONSUMER_BASE_LINK}")
+
 add_executable(consumer main.cpp)
 target_compile_features(consumer PRIVATE cxx_std_17)
 target_link_libraries(consumer PRIVATE ggml::ggml-base ggml::all)

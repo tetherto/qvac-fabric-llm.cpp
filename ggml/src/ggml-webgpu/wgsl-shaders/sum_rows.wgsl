@@ -15,7 +15,8 @@ struct Params {
 
     ne0: u32,
     ne1: u32,
-    ne2: u32
+    ne2: u32,
+    n_rows: u32
 };
 
 @group(0) @binding(2)
@@ -25,9 +26,15 @@ var<workgroup> shared_sum: array<f32, WG_SIZE>;
 
 @compute @workgroup_size(WG_SIZE)
 fn main(@builtin(workgroup_id) wid: vec3<u32>,
+        @builtin(num_workgroups) nwg: vec3<u32>,
         @builtin(local_invocation_id) lid: vec3<u32>) {
 
-    var i = wid.x;
+    // rows are spread over a 2D grid so large row counts stay under the per-dimension limit
+    let row = wid.x + wid.y * nwg.x;
+    if (row >= params.n_rows) {
+        return;
+    }
+    var i = row;
     let i3 = i / (params.ne2 * params.ne1);
     i = i % (params.ne2 * params.ne1);
     let i2 = i / params.ne1;
@@ -50,6 +57,6 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>,
     }
 
     if (lid.x == 0) {
-        dst[params.offset_dst + wid.x] = shared_sum[0];
+        dst[params.offset_dst + row] = shared_sum[0];
     }
 }
