@@ -5129,9 +5129,13 @@ struct test_ssm_scan : public test_case {
     const bool    xbc_overlap;
     const int64_t K;
     const bool    weak_decay;
+    const bool    dst_in_gap;
+    const bool    ids_in_gap;
+    ggml_tensor * output_gap = nullptr;
+    ggml_tensor * output = nullptr;
 
     std::string vars() override {
-        return VARS_TO_STR10(type, d_state, head_dim, n_head, n_group, n_seq_tokens, n_seqs, xbc_overlap, K, weak_decay);
+        return VARS_TO_STR12(type, d_state, head_dim, n_head, n_group, n_seq_tokens, n_seqs, xbc_overlap, K, weak_decay, dst_in_gap, ids_in_gap);
     }
 
     test_ssm_scan(ggml_type type = GGML_TYPE_F32,
@@ -5143,8 +5147,10 @@ struct test_ssm_scan : public test_case {
             int64_t n_seqs = 32,
             bool xbc_overlap = false,
             int64_t K = 1,
-            bool weak_decay = false)
-        : type(type), d_state(d_state), head_dim(head_dim), n_head(n_head), n_group(n_group), n_seq_tokens(n_seq_tokens), n_seqs(n_seqs), xbc_overlap(xbc_overlap), K(K), weak_decay(weak_decay) {}
+            bool weak_decay = false,
+            bool dst_in_gap = false,
+            bool ids_in_gap = false)
+        : type(type), d_state(d_state), head_dim(head_dim), n_head(n_head), n_group(n_group), n_seq_tokens(n_seq_tokens), n_seqs(n_seqs), xbc_overlap(xbc_overlap), K(K), weak_decay(weak_decay), dst_in_gap(dst_in_gap), ids_in_gap(ids_in_gap) {}
 
     double max_nmse_err() override {
         // SSD path (head_dim > 1) uses FP16 intermediates (M matrix, X_dt); Mamba-1 is pure FP32.
@@ -5155,6 +5161,11 @@ struct test_ssm_scan : public test_case {
         ggml_tensor * s   = ggml_new_tensor_4d(ctx, type, d_state,  head_dim,     n_head,       n_seqs);
         ggml_tensor * dt  = ggml_new_tensor_3d(ctx, type, n_head,   n_seq_tokens, n_seqs);
         ggml_tensor * A   = ggml_new_tensor_2d(ctx, type, (head_dim > 1) ? 1 : d_state, n_head);
+        if (dst_in_gap) {
+            GGML_ASSERT(xbc_overlap);
+            output_gap = ggml_new_tensor_1d(ctx, type, head_dim * n_head * n_seqs * (n_seq_tokens + d_state * K));
+        }
+        ggml_tensor * ids = ids_in_gap ? ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_seqs) : nullptr;
         ggml_tensor * x;
         ggml_tensor * B;
         ggml_tensor * C;
@@ -5172,11 +5183,22 @@ struct test_ssm_scan : public test_case {
             B = ggml_new_tensor_4d(ctx, type, d_state,  n_group, n_seq_tokens, n_seqs);
             C = ggml_new_tensor_4d(ctx, type, d_state,  n_group, n_seq_tokens, n_seqs);
         }
-        ggml_tensor * ids = ggml_new_tensor_1d(ctx, GGML_TYPE_I32,  n_seqs);
-        ggml_tensor * out = ggml_ssm_scan(ctx, s, x, dt, A, B, C, ids, K);
-        return out;
+        if (ids == nullptr) {
+            ids = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_seqs);
+        }
+        output = ggml_ssm_scan(ctx, s, x, dt, A, B, C, ids, K);
+        return output;
     }
 
+    void prepare_graph(ggml_cgraph * graph) override {
+        GGML_UNUSED(graph);
+        if (dst_in_gap) {
+            // Put the output between dt and x/B/C without overwriting an input.
+            GGML_ASSERT(ggml_nbytes(output_gap) == ggml_nbytes(output));
+            output->data = output_gap->data;
+            output->buffer = output_gap->buffer;
+        }
+    }
 
     void initialize_tensors(ggml_context * ctx) override {
         std::random_device rd;
@@ -13322,6 +13344,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 128, 64, 16, 2, 32, 4)); // Mamba-2
     test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 256, 64,  8, 2, 32, 4)); // Falcon-H1
     test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 128, 128, 4, 4, 16, 2, true)); // x/B/C overlap
+    for (bool ids_in_gap : {false, true}) {
+        test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 128, 128, 4, 4, 16, 2, true, 3, false, true, ids_in_gap));
+    }
     test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 128, 80, 128, 1, 256, 1)); // Nemotron-9B SSD path
     test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 128, 80, 128, 1, 512, 1)); // Nemotron-9B SSD multi-chunk (2 aligned chunks)
     test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 128, 64, 80, 8, 300, 2)); // Mamba-2 SSD multi-chunk (partial 2nd chunk, 2 seqs)
