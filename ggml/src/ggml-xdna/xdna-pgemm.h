@@ -30,9 +30,11 @@ void xdna_pgemm_release(void);
 bool xdna_pgemm_run(struct xdna_kernel_pool * pool, struct ggml_tensor * node);
 
 // Run `node` into a buffer of the backend's own instead of its data: rows of
-// N floats from byte `off` of `bo`, which has room for M rounded up to 128
+// N floats from byte `off` of `bo`, which has room for xdna_pgemm_into_rows(M)
 // rows. The node's own data is not written.
 struct xdna_buffer;
+// The rows a call of M rows writes in place: an even count of 128-row blocks.
+size_t xdna_pgemm_into_rows(int M);
 bool xdna_pgemm_run_into(struct xdna_kernel_pool * pool,
                          struct ggml_tensor *      node,
                          struct xdna_buffer *      bo,
