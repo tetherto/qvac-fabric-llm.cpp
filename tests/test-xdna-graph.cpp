@@ -10,6 +10,11 @@
 // SQR, RMS_NORM, MUL, MUL_MAT, that reader must still see the sum - it saw
 // whatever the sum's memory held before.
 //
+// A one-token projection computed again with new activations, on the fused
+// route (the decode GEMV) and the per-op one (GGML_XDNA_FUSED_LAYER=0, the
+// prefill GEMM): a later graph must not reuse the A an earlier one laid out
+// for the same tensor.
+//
 // Every intermediate is cleared before each backend runs, so a node read
 // before it was written shows as zeros instead of as the other backend's
 // result. Skips (exit 0) when no XDNA device is registered.
@@ -21,6 +26,7 @@
 
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <random>
 #include <vector>
@@ -143,6 +149,23 @@ static bool run(norm_graph & g, ggml_backend_t be, std::vector<std::vector<float
     return true;
 }
 
+// one Q4_K projection of a single token, the same graph object every run
+static norm_graph build_one_token(ggml_backend_t cpu, int64_t K, int64_t N) {
+    norm_graph g;
+    ggml_init_params ip = { ggml_tensor_overhead() * 8 + ggml_graph_overhead(), nullptr, true };
+    g.ctx               = ggml_init(ip);
+    ggml_tensor * x     = ggml_new_tensor_2d(g.ctx, GGML_TYPE_F32, K, 1);
+    ggml_tensor * p     = ggml_new_tensor_2d(g.ctx, GGML_TYPE_Q4_K, K, N);
+    g.inputs            = { x, p };
+    ggml_tensor * out   = ggml_mul_mat(g.ctx, p, x);
+    ggml_set_name(out, "proj");
+    g.gf = ggml_new_graph(g.ctx);
+    ggml_build_forward_expand(g.gf, out);
+    g.checked = { out };
+    g.buf     = ggml_backend_alloc_ctx_tensors(g.ctx, cpu);
+    return g;
+}
+
 int main(void) {
     ggml_backend_load_all();
     ggml_backend_dev_t dev = xdna_device();
@@ -178,6 +201,27 @@ int main(void) {
         ggml_backend_buffer_free(g.buf);
         ggml_free(g.ctx);
     }
+
+    for (const char * route : { "fused", "per-op" }) {
+        // the NPU computes the graph again with new activations; the CPU's
+        // answer for each set is computed right before it
+        setenv("GGML_XDNA_FUSED_LAYER", std::strcmp(route, "fused") == 0 ? "1" : "0", 1);
+        norm_graph g = build_one_token(cpu, 1024, 1024);
+        for (uint32_t seed : { 1u, 2u, 3u }) {
+            std::vector<std::vector<float>> want, got;
+            if (!run(g, cpu, want, seed) || !run(g, npu, got, seed)) {
+                std::printf("test-xdna-graph: compute failed\n");
+                return 1;
+            }
+            const double e  = nmse(want[0], got[0]);
+            const bool   ok = e < tol;
+            passed          = passed && ok;
+            std::printf("MUL_MAT one token, %-6s run %u nmse %.3g %s\n", route, seed, e, ok ? "ok" : "FAIL");
+        }
+        ggml_backend_buffer_free(g.buf);
+        ggml_free(g.ctx);
+    }
+    unsetenv("GGML_XDNA_FUSED_LAYER");
 
     ggml_backend_free(npu);
     ggml_backend_free(cpu);
