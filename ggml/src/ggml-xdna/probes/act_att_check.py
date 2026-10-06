@@ -128,8 +128,10 @@ if MODE == "prep":
     gq = rng.standard_normal(D).astype(np.float32) * 0.3 + 1
     gk = rng.standard_normal(D).astype(np.float32) * 0.3 + 1
     ang = 777 * 10000.0 ** (-np.arange(NROT // 2) * 2.0 / NROT)
-    cos = np.zeros(128, np.float32); sin = np.zeros(128, np.float32)
-    cos[:NROT // 2] = np.cos(ang); sin[:NROT // 2] = np.sin(ang)
+    cos = np.zeros(128, np.float32)
+    sin = np.zeros(128, np.float32)
+    cos[:NROT // 2] = np.cos(ang)
+    sin[:NROT // 2] = np.sin(ang)
     q = rng.standard_normal((H, D)).astype(np.float32) * 3
     k = rng.standard_normal((2, D)).astype(np.float32) * 2
     v = rng.standard_normal((2, D)).astype(np.float32)
@@ -174,7 +176,8 @@ elif MODE == "combine":
     st = np.zeros((16, 2112), np.float32)
     ms = rng.standard_normal((16, 8)).astype(np.float32) * 3
     ls = rng.uniform(0.5, 5, (16, 8)).astype(np.float32)
-    ls[15] = 0; ms[15] = -1e30          # a core past the valid positions
+    ls[15] = 0
+    ms[15] = -1e30          # a core past the valid positions
     os_ = rng.standard_normal((16, 8, D)).astype(np.float32)
     os_[15] = 0
     for c in range(16):
