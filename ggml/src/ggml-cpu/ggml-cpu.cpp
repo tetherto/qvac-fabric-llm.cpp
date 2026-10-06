@@ -695,6 +695,10 @@ static ggml_backend_feature * ggml_backend_cpu_get_features(ggml_backend_reg_t r
 }
 
 static void * ggml_backend_cpu_get_proc_address(ggml_backend_reg_t reg, const char * name) {
+    // Metadata-only memory planners must also work with dynamically loaded CPUs.
+    if (strcmp(name, "ggml_graph_plan") == 0) {
+        return (void *)ggml_graph_plan;
+    }
     if (strcmp(name, "ggml_backend_set_n_threads") == 0) {
         ggml_backend_set_n_threads_t fct = ggml_backend_cpu_set_n_threads;
         return (void *)fct;

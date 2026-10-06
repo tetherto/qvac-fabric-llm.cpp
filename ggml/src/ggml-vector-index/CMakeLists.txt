@@ -115,7 +115,7 @@ elseif (NOT WIN32 AND NOT DEFINED ENV{ONEAPI_ROOT})
     list(APPEND GGML_VECTOR_INDEX_PC_MATH_LIBS "-lm")
 endif()
 
-if (LLAMA_BUILD_TESTS)
+if (GGML_BUILD_TESTS OR LLAMA_BUILD_TESTS)
     add_library(ggml-vector-index-test STATIC ${GGML_VECTOR_INDEX_SOURCES})
     target_compile_features(ggml-vector-index-test PRIVATE cxx_std_17)
     target_compile_definitions(ggml-vector-index-test PRIVATE GGML_VEC_INDEX_TEST_HOOKS)

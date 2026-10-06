@@ -16,6 +16,12 @@ to_bf16_cuda_t ggml_get_to_bf16_cuda(ggml_type type);
 
 to_fp32_cuda_t ggml_get_to_fp32_cuda(ggml_type type);
 
+// y[r][i] = float(x[r][i]) + bias[i] for nrows contiguous rows of ne0 half or
+// bfloat16 values: the f32 conversion of a GEMM's half-precision output with a
+// row bias added in the same pass.
+void ggml_cuda_convert_add_row_bias(ggml_type type, const void * x, const float * bias, float * y, int64_t ne0,
+                                    int64_t nrows, cudaStream_t stream);
+
 // TODO more general support for non-contiguous inputs
 
 template<typename T>

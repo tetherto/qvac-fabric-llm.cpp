@@ -43,6 +43,12 @@ add_library(${HTP_LIB} SHARED
     pad-ops.c
     argsort-ops.c
     im2col-ops.c
+    conv-2d-dw-ops.c
+    timestep-embedding-ops.c
+    snake-ops.c
+    col2im-1d-ops.c
+    transpose-ops.c
+    depthwise-conv-1d-ops.c
 )
 
 target_compile_definitions(${HTP_LIB} PRIVATE

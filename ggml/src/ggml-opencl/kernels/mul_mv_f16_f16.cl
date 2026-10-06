@@ -18,7 +18,12 @@
 #define REQD_SUBGROUP_SIZE_128 __attribute__((qcom_reqd_sub_group_size("full")))
 #endif
 
-#define N_F16_F16 4
+// Columns of src1 handled per workgroup. src0 (for a conv1d this is the im2col
+// matrix, up to 110 MB) is re-swept once per column group, so DRAM traffic scales
+// as ceil(ne11/N_F16_F16); the extra re-reads of x WITHIN a workgroup are cache
+// hits. Raising this from 4 to 16 cuts the re-sweeps 4x and keeps the scalar
+// accumulator, so register pressure is unchanged.
+#define N_F16_F16 16
 
 #ifdef ADRENO_GPU
 REQD_SUBGROUP_SIZE_64

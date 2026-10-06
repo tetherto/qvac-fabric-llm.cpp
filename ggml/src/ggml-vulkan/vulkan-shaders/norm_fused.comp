@@ -1,0 +1,89 @@
+#version 450
+
+#include "types.glsl"
+#include "utils.glsl"
+
+#extension GL_EXT_control_flow_attributes : enable
+#define BLOCK_SIZE 512
+
+// Fused layer norm: d = norm(a) * g (+ b), one workgroup per row.
+// g and b broadcast onto a's shape via fastmod (like src1 in generic_binary_head.glsl).
+layout (push_constant) uniform parameter
+{
+    uint ne00; uint ne01; uint ne02; uint nrows;
+    uint ne10; uint ne11; uint ne12; uint ne13; uint nb10; uint nb11; uint nb12; uint nb13;
+    uint ne20; uint ne21; uint ne22; uint ne23; uint nb20; uint nb21; uint nb22; uint nb23;
+    float param1;
+} p;
+
+layout (constant_id = 0) const bool do_add = false;
+
+layout(local_size_x = BLOCK_SIZE, local_size_y = 1, local_size_z = 1) in;
+
+layout (binding = 0) readonly buffer A {A_TYPE data_a[];};
+layout (binding = 1) readonly buffer G {B_TYPE data_g[];};
+layout (binding = 2) readonly buffer B {B_TYPE data_b[];};
+layout (binding = 3) writeonly buffer D {D_TYPE data_d[];};
+
+shared vec2 sum[BLOCK_SIZE];
+
+uint weight_row_offset(uint i01, uint i02, uint i03, uint ne1, uint ne2, uint ne3, uint nb1, uint nb2, uint nb3) {
+    return fastmod(i03, ne3)*nb3 + fastmod(i02, ne2)*nb2 + fastmod(i01, ne1)*nb1;
+}
+
+// precise (NoContraction) keeps the mul and add separately rounded like the unfused ops; the
+// function boundary stops the decoration from spreading to the row statistics (see norm.comp).
+float apply_weight_bias(float n, float g, float b) {
+    precise float scaled = n * g;
+    if (do_add) {
+        precise float biased = scaled + b;
+        return biased;
+    }
+    return scaled;
+}
+
+void main() {
+    const uint row = gl_WorkGroupID.z * 262144 + gl_WorkGroupID.y * 512 + gl_WorkGroupID.x;
+    const uint tid = gl_LocalInvocationID.x;
+
+    // The workgroup count is rounded up to a multiple of 512 (GGML_OP_NORM element
+    // sizing in ggml-vulkan.cpp); phantom rows must not write out of bounds.
+    if (row >= p.nrows) {
+        return;
+    }
+
+    sum[tid] = vec2(0.0f, 0.0f);
+
+    [[unroll]] for (uint col = tid; col < p.ne00; col += BLOCK_SIZE) {
+        const float xi = float(data_a[row*p.ne00 + col]);
+        sum[tid].x += xi;
+        sum[tid].y += xi * xi;
+    }
+
+    // sum up partial sums and write back result
+    barrier();
+    [[unroll]] for (int s = BLOCK_SIZE / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            sum[tid] += sum[tid + s];
+        }
+        barrier();
+    }
+
+    const float mean = sum[0].x / p.ne00;
+    const float var = sum[0].y / p.ne00 - mean * mean;
+    const float inv_std = inversesqrt(var + p.param1);
+
+    const uint i01 = fastmod(row, p.ne01);
+    const uint i02 = fastmod(row / p.ne01, p.ne02);
+    const uint i03 = (row / p.ne01) / p.ne02;
+
+    const uint g_row = weight_row_offset(i01, i02, i03, p.ne11, p.ne12, p.ne13, p.nb11, p.nb12, p.nb13);
+    const uint b_row = weight_row_offset(i01, i02, i03, p.ne21, p.ne22, p.ne23, p.nb21, p.nb22, p.nb23);
+
+    [[unroll]] for (uint col = tid; col < p.ne00; col += BLOCK_SIZE) {
+        const float n = (float(data_a[row*p.ne00 + col]) - mean) * inv_std;
+        const float g = float(data_g[g_row + fastmod(col, p.ne10)*p.nb10]);
+        const float b = do_add ? float(data_b[b_row + fastmod(col, p.ne20)*p.nb20]) : 0.0f;
+        data_d[row*p.ne00 + col] = D_TYPE(apply_weight_bias(n, g, b));
+    }
+}

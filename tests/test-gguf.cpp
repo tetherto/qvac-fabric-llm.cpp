@@ -437,7 +437,7 @@ get_handcrafted_file(const unsigned int seed, const enum handcrafted_file_type h
             name += "_" + std::to_string(i);
         }
         if (hft == HANDCRAFTED_TENSORS_BAD_NAME_SIZE) {
-            name += "_with_a_very_long_name_which_is_longer_than_what_is_allowed_for_ggml_tensors";
+            name += "_" + std::string(GGML_MAX_NAME, 'x');
             GGML_ASSERT(name.length() >= GGML_MAX_NAME);
         }
         {

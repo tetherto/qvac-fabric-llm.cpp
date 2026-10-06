@@ -165,11 +165,31 @@ constexpr int ggml_cuda_highest_compiled_arch_impl(const int arch, const int cur
 constexpr int ggml_cuda_highest_compiled_arch(const int arch) {
     return ggml_cuda_highest_compiled_arch_impl(arch, 0, __CUDA_ARCH_LIST__);
 }
+
+static_assert(ggml_cuda_highest_compiled_arch_impl(750, 0, 800, 860, 890) == -1,
+              "a device below every compiled arch must resolve to -1 so registration can skip it");
+static_assert(ggml_cuda_highest_compiled_arch_impl(800, 0, 800, 860, 890) == 800,
+              "a device matching the compiled floor must resolve to that floor");
+static_assert(ggml_cuda_highest_compiled_arch_impl(890, 0, 800, 860, 890) == 890,
+              "a device with an exact compiled arch must resolve to it");
+static_assert(ggml_cuda_highest_compiled_arch_impl(1200, 0, 800, 860, 890) == 890,
+              "a device above every compiled arch must resolve to the highest compiled one");
 #else
 static int ggml_cuda_highest_compiled_arch(const int arch) {
     return arch;
 }
 #endif // __CUDA_ARCH_LIST__
+
+// Assumes the arch list contains a virtual (PTX) floor the driver can JIT
+// forward from, which nvcc's default and this repo's pinned architecture
+// lists provide; with a real-only list a device above the floor would pass
+// even though no PTX exists for it.
+static bool ggml_cuda_compiled_code_available(const int cc) {
+    if (!GGML_CUDA_CC_IS_NVIDIA(cc)) {
+        return true;
+    }
+    return ggml_cuda_highest_compiled_arch(cc) > 0;
+}
 
 // ---------------------------------------------------------------------------------------------------------
 
@@ -739,6 +759,23 @@ static __device__ __forceinline__ int ggml_cuda_dp4a(const int a, const int b, i
 #endif // __CUDA_ARCH__ >= GGML_CUDA_CC_DP4A || defined(GGML_USE_MUSA)
 
 #endif // defined(GGML_USE_HIP)
+}
+
+#define GGML_CUDA_MAX_GRIDDIM_Y 65535
+#define GGML_CUDA_MAX_GRIDDIM_Z 65535
+
+template <typename F>
+static __device__ __forceinline__ void ggml_cuda_for_each_grid_y(const int64_t count, F && body) {
+    for (int64_t i = blockIdx.y; i < count; i += gridDim.y) {
+        body(i);
+    }
+}
+
+template <typename F>
+static __device__ __forceinline__ void ggml_cuda_for_each_grid_z(const int64_t count, F && body) {
+    for (int64_t i = blockIdx.z; i < count; i += gridDim.z) {
+        body(i);
+    }
 }
 
 static __device__ __forceinline__ void ggml_cuda_mad(float & acc, const float v, const float u) {

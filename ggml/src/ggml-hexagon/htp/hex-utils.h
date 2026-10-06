@@ -42,15 +42,12 @@ static inline void hex_l2fetch_block(const void * addr, size_t size) {
 #define HEX_L2_FLUSH_WQ_THRESHOLD  (4 * 1024)
 #define HEX_L2_FLUSH_ALL_THRESHOLD (4 * 1024 * 1024)
 
+// Per-line Q6_dccleaninva is not enough for data handed between the ops of
+// one batch; the QuRT range operation is.
 static inline void hex_l2flush(void * addr, size_t size) {
     const uint32_t s = ((uint32_t) addr) & ~(HEX_L2_LINE_SIZE - 1);
     const uint32_t e = (((uint32_t) addr) + size + HEX_L2_LINE_SIZE - 1) & ~(HEX_L2_LINE_SIZE - 1);
-    for (uint32_t i = s; i < e; i += HEX_L2_BLOCK_SIZE) {
-        Q6_dccleaninva_A((void *) i + HEX_L2_LINE_SIZE * 0);
-        Q6_dccleaninva_A((void *) i + HEX_L2_LINE_SIZE * 1);
-        Q6_dccleaninva_A((void *) i + HEX_L2_LINE_SIZE * 2);
-        Q6_dccleaninva_A((void *) i + HEX_L2_LINE_SIZE * 3);
-    }
+    qurt_mem_cache_clean((qurt_addr_t) s, e - s, QURT_MEM_CACHE_FLUSH_INVALIDATE, QURT_MEM_DCACHE);
 }
 
 static inline void hex_pause() {

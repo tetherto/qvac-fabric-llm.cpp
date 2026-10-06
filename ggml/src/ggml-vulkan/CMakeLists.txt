@@ -7,6 +7,7 @@ if (POLICY CMP0147)
 endif()
 
 find_package(Vulkan COMPONENTS glslc REQUIRED)
+find_package(SPIRV-Headers QUIET)
 
 if (DEFINED ENV{VULKAN_SDK})
     list(APPEND CMAKE_PREFIX_PATH "$ENV{VULKAN_SDK}")
@@ -129,13 +130,18 @@ if (Vulkan_FOUND)
     )
 
     target_link_libraries(ggml-vulkan PRIVATE Vulkan::Vulkan)
-    target_include_directories(ggml-vulkan
-        PRIVATE
-            ${CMAKE_CURRENT_BINARY_DIR}
-            ../../../vendor
+    if (TARGET SPIRV-Headers::SPIRV-Headers)
+        target_link_libraries(ggml-vulkan PRIVATE $<BUILD_INTERFACE:SPIRV-Headers::SPIRV-Headers>)
+    endif()
+    target_include_directories(ggml-vulkan PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
 
-    )
-    if (ANDROID)
+    if (GGML_BUILD_TESTS)
+        target_compile_definitions(ggml-vulkan PRIVATE GGML_VULKAN_TESTING)
+    endif()
+
+    target_include_directories(ggml-vulkan PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/vendor)
+
+    if (ANDROID AND NOT TARGET SPIRV-Headers::SPIRV-Headers)
         # The Android NDK ships only the C Vulkan headers (vulkan/vulkan.h). The
         # ggml Vulkan backend additionally needs the C++ bindings
         # (vulkan/vulkan.hpp) and SPIRV-Headers (spirv/unified1/spirv.hpp), which
@@ -268,6 +274,11 @@ if (Vulkan_FOUND)
     set_source_files_properties(${_ggml_vk_shader_files} PROPERTIES HEADER_FILE_ONLY TRUE)
     target_sources(ggml-vulkan PRIVATE ${_ggml_vk_shader_files})
 
+    set(_ggml_vk_genshaders_strip_args)
+    if (GGML_VULKAN_STRIP_SHADER_PAYLOADS)
+        list(APPEND _ggml_vk_genshaders_strip_args --strip-payloads)
+    endif()
+
     # Because external projects do not provide source-level tracking,
     # the vulkan-shaders-gen sources need to be explicitly added to
     # ensure that changes will cascade into shader re-generation.
@@ -283,6 +294,7 @@ if (Vulkan_FOUND)
         COMMAND ${_ggml_vk_genshaders_cmd}
             --output-dir ${_ggml_vk_output_dir}
             --target-hpp ${_ggml_vk_header}
+            ${_ggml_vk_genshaders_strip_args}
             --target-common-cpp ${_ggml_vk_common_cpp}
         DEPENDS ${_ggml_vk_shaders_gen_sources}
                 vulkan-shaders-gen
@@ -303,6 +315,7 @@ if (Vulkan_FOUND)
                 --output-dir ${_ggml_vk_output_dir}
                 --target-hpp ${_ggml_vk_header}
                 --target-cpp ${_ggml_vk_target_cpp}
+                ${_ggml_vk_genshaders_strip_args}
             DEPENDS ${file_full}
                     ${_ggml_vk_shaders_gen_sources}
                     vulkan-shaders-gen

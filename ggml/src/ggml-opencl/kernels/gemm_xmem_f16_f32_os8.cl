@@ -24,6 +24,28 @@ __kernel void adreno_xmem_pack_src_f32(
     write_imageh(src_img, (int2)(x, y), v);
 }
 
+// Same packing as adreno_xmem_pack_src_f32, for an F16 source. Used when the packed
+// operand is a conv1d im2col activation, which ggml_conv_1d emits as F16.
+__kernel void adreno_xmem_pack_src_f16(
+    __global const void * src_void,
+    ulong offset,
+    __write_only image2d_t src_img,
+    int K,
+    int N) {
+    const int x = get_global_id(0);
+    const int y = get_global_id(1);
+    const int kpack = K / 4;
+
+    if (x >= N || y >= kpack) {
+        return;
+    }
+
+    __global const half * src = (__global const half *)((__global const char *)src_void + offset);
+    const int base = x*K + y*4;
+    const half4 v = (half4)(src[base + 0], src[base + 1], src[base + 2], src[base + 3]);
+    write_imageh(src_img, (int2)(x, y), v);
+}
+
 __kernel void adreno_xmem_prepack_weight_f16(
     __global half4 * dst,
     __global const void * src_void,
@@ -105,14 +127,14 @@ __kernel void kernel_gemm_xmem_f16_f32_os8(
         return;
     }
 
-    half4 r0 = (half4)(0.0h);
-    half4 r1 = (half4)(0.0h);
-    half4 r2 = (half4)(0.0h);
-    half4 r3 = (half4)(0.0h);
-    half4 r4 = (half4)(0.0h);
-    half4 r5 = (half4)(0.0h);
-    half4 r6 = (half4)(0.0h);
-    half4 r7 = (half4)(0.0h);
+    float4 r0 = (float4)(0.0f);
+    float4 r1 = (float4)(0.0f);
+    float4 r2 = (float4)(0.0f);
+    float4 r3 = (float4)(0.0f);
+    float4 r4 = (float4)(0.0f);
+    float4 r5 = (float4)(0.0f);
+    float4 r6 = (float4)(0.0f);
+    float4 r7 = (float4)(0.0f);
 
     int f_offset = Z*kpack*32;
     int subgroup_id = (int)(0x1F & qcom_get_physical_sub_group_id());
@@ -131,90 +153,98 @@ __kernel void kernel_gemm_xmem_f16_f32_os8(
         f_offset += 64;
         qcom_sub_group_sync(QCOM_CLK_CONST_LOAD_SYNC);
 
-        r0 += src0.x * weights_cache[0].s0123;
-        r0 += src0.y * weights_cache[0].s4567;
-        r0 += src0.z * weights_cache[0].s89ab;
-        r0 += src0.w * weights_cache[0].scdef;
-        r1 += src0.x * weights_cache[1].s0123;
-        r1 += src0.y * weights_cache[1].s4567;
-        r1 += src0.z * weights_cache[1].s89ab;
-        r1 += src0.w * weights_cache[1].scdef;
-        r2 += src0.x * weights_cache[2].s0123;
-        r2 += src0.y * weights_cache[2].s4567;
-        r2 += src0.z * weights_cache[2].s89ab;
-        r2 += src0.w * weights_cache[2].scdef;
-        r3 += src0.x * weights_cache[3].s0123;
-        r3 += src0.y * weights_cache[3].s4567;
-        r3 += src0.z * weights_cache[3].s89ab;
-        r3 += src0.w * weights_cache[3].scdef;
-        r4 += src0.x * weights_cache[4].s0123;
-        r4 += src0.y * weights_cache[4].s4567;
-        r4 += src0.z * weights_cache[4].s89ab;
-        r4 += src0.w * weights_cache[4].scdef;
-        r5 += src0.x * weights_cache[5].s0123;
-        r5 += src0.y * weights_cache[5].s4567;
-        r5 += src0.z * weights_cache[5].s89ab;
-        r5 += src0.w * weights_cache[5].scdef;
-        r6 += src0.x * weights_cache[6].s0123;
-        r6 += src0.y * weights_cache[6].s4567;
-        r6 += src0.z * weights_cache[6].s89ab;
-        r6 += src0.w * weights_cache[6].scdef;
-        r7 += src0.x * weights_cache[7].s0123;
-        r7 += src0.y * weights_cache[7].s4567;
-        r7 += src0.z * weights_cache[7].s89ab;
-        r7 += src0.w * weights_cache[7].scdef;
+        r0 += convert_float4(src0.x * weights_cache[0].s0123);
+        r0 += convert_float4(src0.y * weights_cache[0].s4567);
+        r0 += convert_float4(src0.z * weights_cache[0].s89ab);
+        r0 += convert_float4(src0.w * weights_cache[0].scdef);
+        r1 += convert_float4(src0.x * weights_cache[1].s0123);
+        r1 += convert_float4(src0.y * weights_cache[1].s4567);
+        r1 += convert_float4(src0.z * weights_cache[1].s89ab);
+        r1 += convert_float4(src0.w * weights_cache[1].scdef);
+        r2 += convert_float4(src0.x * weights_cache[2].s0123);
+        r2 += convert_float4(src0.y * weights_cache[2].s4567);
+        r2 += convert_float4(src0.z * weights_cache[2].s89ab);
+        r2 += convert_float4(src0.w * weights_cache[2].scdef);
+        r3 += convert_float4(src0.x * weights_cache[3].s0123);
+        r3 += convert_float4(src0.y * weights_cache[3].s4567);
+        r3 += convert_float4(src0.z * weights_cache[3].s89ab);
+        r3 += convert_float4(src0.w * weights_cache[3].scdef);
+        r4 += convert_float4(src0.x * weights_cache[4].s0123);
+        r4 += convert_float4(src0.y * weights_cache[4].s4567);
+        r4 += convert_float4(src0.z * weights_cache[4].s89ab);
+        r4 += convert_float4(src0.w * weights_cache[4].scdef);
+        r5 += convert_float4(src0.x * weights_cache[5].s0123);
+        r5 += convert_float4(src0.y * weights_cache[5].s4567);
+        r5 += convert_float4(src0.z * weights_cache[5].s89ab);
+        r5 += convert_float4(src0.w * weights_cache[5].scdef);
+        r6 += convert_float4(src0.x * weights_cache[6].s0123);
+        r6 += convert_float4(src0.y * weights_cache[6].s4567);
+        r6 += convert_float4(src0.z * weights_cache[6].s89ab);
+        r6 += convert_float4(src0.w * weights_cache[6].scdef);
+        r7 += convert_float4(src0.x * weights_cache[7].s0123);
+        r7 += convert_float4(src0.y * weights_cache[7].s4567);
+        r7 += convert_float4(src0.z * weights_cache[7].s89ab);
+        r7 += convert_float4(src0.w * weights_cache[7].scdef);
 
-        r0 += src1.x * weights_cache[8].s0123;
-        r0 += src1.y * weights_cache[8].s4567;
-        r0 += src1.z * weights_cache[8].s89ab;
-        r0 += src1.w * weights_cache[8].scdef;
-        r1 += src1.x * weights_cache[9].s0123;
-        r1 += src1.y * weights_cache[9].s4567;
-        r1 += src1.z * weights_cache[9].s89ab;
-        r1 += src1.w * weights_cache[9].scdef;
-        r2 += src1.x * weights_cache[10].s0123;
-        r2 += src1.y * weights_cache[10].s4567;
-        r2 += src1.z * weights_cache[10].s89ab;
-        r2 += src1.w * weights_cache[10].scdef;
-        r3 += src1.x * weights_cache[11].s0123;
-        r3 += src1.y * weights_cache[11].s4567;
-        r3 += src1.z * weights_cache[11].s89ab;
-        r3 += src1.w * weights_cache[11].scdef;
-        r4 += src1.x * weights_cache[12].s0123;
-        r4 += src1.y * weights_cache[12].s4567;
-        r4 += src1.z * weights_cache[12].s89ab;
-        r4 += src1.w * weights_cache[12].scdef;
-        r5 += src1.x * weights_cache[13].s0123;
-        r5 += src1.y * weights_cache[13].s4567;
-        r5 += src1.z * weights_cache[13].s89ab;
-        r5 += src1.w * weights_cache[13].scdef;
-        r6 += src1.x * weights_cache[14].s0123;
-        r6 += src1.y * weights_cache[14].s4567;
-        r6 += src1.z * weights_cache[14].s89ab;
-        r6 += src1.w * weights_cache[14].scdef;
-        r7 += src1.x * weights_cache[15].s0123;
-        r7 += src1.y * weights_cache[15].s4567;
-        r7 += src1.z * weights_cache[15].s89ab;
-        r7 += src1.w * weights_cache[15].scdef;
+        r0 += convert_float4(src1.x * weights_cache[8].s0123);
+        r0 += convert_float4(src1.y * weights_cache[8].s4567);
+        r0 += convert_float4(src1.z * weights_cache[8].s89ab);
+        r0 += convert_float4(src1.w * weights_cache[8].scdef);
+        r1 += convert_float4(src1.x * weights_cache[9].s0123);
+        r1 += convert_float4(src1.y * weights_cache[9].s4567);
+        r1 += convert_float4(src1.z * weights_cache[9].s89ab);
+        r1 += convert_float4(src1.w * weights_cache[9].scdef);
+        r2 += convert_float4(src1.x * weights_cache[10].s0123);
+        r2 += convert_float4(src1.y * weights_cache[10].s4567);
+        r2 += convert_float4(src1.z * weights_cache[10].s89ab);
+        r2 += convert_float4(src1.w * weights_cache[10].scdef);
+        r3 += convert_float4(src1.x * weights_cache[11].s0123);
+        r3 += convert_float4(src1.y * weights_cache[11].s4567);
+        r3 += convert_float4(src1.z * weights_cache[11].s89ab);
+        r3 += convert_float4(src1.w * weights_cache[11].scdef);
+        r4 += convert_float4(src1.x * weights_cache[12].s0123);
+        r4 += convert_float4(src1.y * weights_cache[12].s4567);
+        r4 += convert_float4(src1.z * weights_cache[12].s89ab);
+        r4 += convert_float4(src1.w * weights_cache[12].scdef);
+        r5 += convert_float4(src1.x * weights_cache[13].s0123);
+        r5 += convert_float4(src1.y * weights_cache[13].s4567);
+        r5 += convert_float4(src1.z * weights_cache[13].s89ab);
+        r5 += convert_float4(src1.w * weights_cache[13].scdef);
+        r6 += convert_float4(src1.x * weights_cache[14].s0123);
+        r6 += convert_float4(src1.y * weights_cache[14].s4567);
+        r6 += convert_float4(src1.z * weights_cache[14].s89ab);
+        r6 += convert_float4(src1.w * weights_cache[14].scdef);
+        r7 += convert_float4(src1.x * weights_cache[15].s0123);
+        r7 += convert_float4(src1.y * weights_cache[15].s4567);
+        r7 += convert_float4(src1.z * weights_cache[15].s89ab);
+        r7 += convert_float4(src1.w * weights_cache[15].scdef);
     } while (coord_s < kpack);
 
     int coord_s_out = Z*8;
-    if (coord_s_out < npack) { write_imageh(dst_img, (int2)(X, coord_s_out), r0); coord_s_out++; }
-    if (coord_s_out < npack) { write_imageh(dst_img, (int2)(X, coord_s_out), r1); coord_s_out++; }
-    if (coord_s_out < npack) { write_imageh(dst_img, (int2)(X, coord_s_out), r2); coord_s_out++; }
-    if (coord_s_out < npack) { write_imageh(dst_img, (int2)(X, coord_s_out), r3); coord_s_out++; }
-    if (coord_s_out < npack) { write_imageh(dst_img, (int2)(X, coord_s_out), r4); coord_s_out++; }
-    if (coord_s_out < npack) { write_imageh(dst_img, (int2)(X, coord_s_out), r5); coord_s_out++; }
-    if (coord_s_out < npack) { write_imageh(dst_img, (int2)(X, coord_s_out), r6); coord_s_out++; }
-    if (coord_s_out < npack) { write_imageh(dst_img, (int2)(X, coord_s_out), r7); }
+    if (coord_s_out < npack) { write_imageh(dst_img, (int2)(X, coord_s_out), convert_half4(r0)); coord_s_out++; }
+    if (coord_s_out < npack) { write_imageh(dst_img, (int2)(X, coord_s_out), convert_half4(r1)); coord_s_out++; }
+    if (coord_s_out < npack) { write_imageh(dst_img, (int2)(X, coord_s_out), convert_half4(r2)); coord_s_out++; }
+    if (coord_s_out < npack) { write_imageh(dst_img, (int2)(X, coord_s_out), convert_half4(r3)); coord_s_out++; }
+    if (coord_s_out < npack) { write_imageh(dst_img, (int2)(X, coord_s_out), convert_half4(r4)); coord_s_out++; }
+    if (coord_s_out < npack) { write_imageh(dst_img, (int2)(X, coord_s_out), convert_half4(r5)); coord_s_out++; }
+    if (coord_s_out < npack) { write_imageh(dst_img, (int2)(X, coord_s_out), convert_half4(r6)); coord_s_out++; }
+    if (coord_s_out < npack) { write_imageh(dst_img, (int2)(X, coord_s_out), convert_half4(r7)); }
 }
 
+// acc_void folds a tap-sum ADD into this store: the caller passes the addend and
+// has_acc = 1, and dst becomes the ADD's destination. Bit-exact against running the ADD
+// separately, which also converts the half to f32 first and then adds in f32 -- the same
+// two operations in the same order. When has_acc is 0 the caller passes dst_void again,
+// so the argument is always a valid buffer and the branch is uniform across the group.
 __kernel void adreno_xmem_store_dst_f32(
     __read_only image2d_t dst_img,
     __global void * dst_void,
     ulong offset,
     int M,
-    int N) {
+    int N,
+    __global void * acc_void,
+    ulong acc_offset,
+    int has_acc) {
     const int x = get_global_id(0);
     const int y = get_global_id(1);
     const int npack = (M + 3) / 4;
@@ -224,10 +254,51 @@ __kernel void adreno_xmem_store_dst_f32(
     }
 
     __global float * dst = (__global float *)((__global char *)dst_void + offset);
+    __global const float * acc = (__global const float *)((__global char *)acc_void + acc_offset);
     const half4 hv = read_imageh(dst_img, smp_zero, (int2)(x, y));
     const int m = y*4;
-    if (m + 0 < M) dst[x*M + m + 0] = (float)hv.s0;
-    if (m + 1 < M) dst[x*M + m + 1] = (float)hv.s1;
-    if (m + 2 < M) dst[x*M + m + 2] = (float)hv.s2;
-    if (m + 3 < M) dst[x*M + m + 3] = (float)hv.s3;
+    const int b = x*M + m;
+    if (m + 0 < M) dst[b + 0] = has_acc ? acc[b + 0] + (float)hv.s0 : (float)hv.s0;
+    if (m + 1 < M) dst[b + 1] = has_acc ? acc[b + 1] + (float)hv.s1 : (float)hv.s1;
+    if (m + 2 < M) dst[b + 2] = has_acc ? acc[b + 2] + (float)hv.s2 : (float)hv.s2;
+    if (m + 3 < M) dst[b + 3] = has_acc ? acc[b + 3] + (float)hv.s3 : (float)hv.s3;
+}
+
+// Transposed store, for the operand-swapped dispatch: the caller computed C[m][n] with
+// the SMALL operand as xmem's M, so ggml's dst wants it at dst[m*N_full + n] rather than
+// dst[n*M + m]. Consecutive x are consecutive n, so unlike the untransposed store above
+// (which strides by M) these writes coalesce.
+// acc_void folds the tap-sum ADD in, exactly as in the untransposed store above.
+__kernel void adreno_xmem_store_dst_f32_t(
+    __read_only image2d_t dst_img,
+    __global void * dst_void,
+    ulong offset,
+    int M,
+    int N,
+    int N_full,
+    int n0,
+    __global void * acc_void,
+    ulong acc_offset,
+    int has_acc) {
+    const int x = get_global_id(0);
+    const int y = get_global_id(1);
+    const int npack = (M + 3) / 4;
+
+    if (x >= N || y >= npack) {
+        return;
+    }
+
+    __global float * dst = (__global float *)((__global char *)dst_void + offset);
+    __global const float * acc = (__global const float *)((__global char *)acc_void + acc_offset);
+    const half4 hv = read_imageh(dst_img, smp_zero, (int2)(x, y));
+    const int  m   = y*4;
+    const long col = (long)n0 + (long)x;
+    const long b0  = (long)(m + 0)*N_full + col;
+    const long b1  = (long)(m + 1)*N_full + col;
+    const long b2  = (long)(m + 2)*N_full + col;
+    const long b3  = (long)(m + 3)*N_full + col;
+    if (m + 0 < M) dst[b0] = has_acc ? acc[b0] + (float)hv.s0 : (float)hv.s0;
+    if (m + 1 < M) dst[b1] = has_acc ? acc[b1] + (float)hv.s1 : (float)hv.s1;
+    if (m + 2 < M) dst[b2] = has_acc ? acc[b2] + (float)hv.s2 : (float)hv.s2;
+    if (m + 3 < M) dst[b3] = has_acc ? acc[b3] + (float)hv.s3 : (float)hv.s3;
 }

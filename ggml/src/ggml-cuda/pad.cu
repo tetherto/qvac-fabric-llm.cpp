@@ -10,22 +10,19 @@ __device__ __forceinline__ int64_t wrap_around(int64_t coord, int64_t size) {
 static __global__ void pad_f32(const float * src, size_t s00, size_t s01, size_t s02, size_t s03, float * dst,
                                const int lp0, const int rp0, const int lp1, const int rp1,
                                const int lp2, const int rp2, const int lp3, const int rp3,
-                               const int ne0, const int ne1, const int ne2, const int ne3,
+                               const int64_t ne0, const int64_t ne1, const int64_t ne2, const int64_t ne3,
                                const bool circular) {
-    // blockIdx.z: i3*ne2+i2
-    // blockIdx.y: i1
-    // blockIDx.x: i0 / CUDA_PAD_BLOCK_SIZE
-    // gridDim.y:  ne1
-    int i0 = threadIdx.x + blockIdx.x * blockDim.x;
-    int i1 = blockIdx.y;
-    int i2 = blockIdx.z % ne2;
-    int i3 = blockIdx.z / ne2;
-
-    if (i0 >= ne0 || i1 >= ne1 || i2 >= ne2 || i3 >= ne3) {
+    const int64_t i0 = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i0 >= ne0) {
         return;
     }
 
-    const int64_t dst_idx = i3 * (ne0 * ne1 * ne2) + i2 * (ne0 * ne1) + i1 * ne0 + i0;
+    ggml_cuda_for_each_grid_y(ne1, [&](const int64_t i1) {
+    ggml_cuda_for_each_grid_z(ne2 * ne3, [&](const int64_t iz) {
+    const int64_t i2 = iz % ne2;
+    const int64_t i3 = iz / ne2;
+
+    const int64_t dst_idx = i3 * ne0 * ne1 * ne2 + i2 * ne0 * ne1 + i1 * ne0 + i0;
 
     if (!circular) {
         if ((i0 >= lp0 && i0 < ne0 - rp0) && (i1 >= lp1 && i1 < ne1 - rp1) && (i2 >= lp2 && i2 < ne2 - rp2) &&
@@ -58,16 +55,21 @@ static __global__ void pad_f32(const float * src, size_t s00, size_t s01, size_t
 
         dst[dst_idx] = src[src_idx];
     }
+    });
+    });
 }
 
 
 static void pad_f32_cuda(const float * src, size_t s00, size_t s01, size_t s02, size_t s03, float * dst,
     const int lp0, const int rp0, const int lp1, const int rp1,
     const int lp2, const int rp2, const int lp3, const int rp3,
-    const int ne0, const int ne1, const int ne2, const int ne3,
+    const int64_t ne0, const int64_t ne1, const int64_t ne2, const int64_t ne3,
     const bool circular, cudaStream_t stream) {
-    int  num_blocks = (ne0 + CUDA_PAD_BLOCK_SIZE - 1) / CUDA_PAD_BLOCK_SIZE;
-    dim3 gridDim(num_blocks, ne1, ne2 * ne3);
+    const int64_t num_blocks = (ne0 + CUDA_PAD_BLOCK_SIZE - 1) / CUDA_PAD_BLOCK_SIZE;
+    const int64_t ne23       = ne2 * ne3;
+    dim3 gridDim((unsigned int) num_blocks,
+                 (unsigned int) MIN(ne1,  (int64_t) GGML_CUDA_MAX_GRIDDIM_Y),
+                 (unsigned int) MIN(ne23, (int64_t) GGML_CUDA_MAX_GRIDDIM_Z));
     pad_f32<<<gridDim, CUDA_PAD_BLOCK_SIZE, 0, stream>>>(src, s00, s01, s02, s03, dst,
                                                          lp0, rp0, lp1, rp1, lp2, rp2, lp3, rp3,
                                                          ne0, ne1, ne2, ne3, circular);

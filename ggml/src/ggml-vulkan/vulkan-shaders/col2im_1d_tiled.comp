@@ -1,0 +1,91 @@
+#version 450
+
+#include "types.glsl"
+
+// Tiled col2im_1d: stages the input slab for a TILE_T x TILE_OC output tile in
+// shared memory; same t_in summation order as col2im_1d.comp, so bit-identical.
+
+layout (push_constant) uniform parameter
+{
+    uint T_out;
+    uint OC;
+    uint K_OC;   // K*OC == src ne0
+    uint T_in;
+    uint K;
+    int  s0;     // stride
+    int  p0;     // padding cropped from both sides
+} p;
+
+layout (binding = 0) readonly  buffer A {float data_a[];};   // columns [K*OC, T_in]
+layout (binding = 1) writeonly buffer D {float data_d[];};   // signal  [T_out, OC]
+
+#define TILE_T      64
+#define TILE_OC     64
+#define SMEM_FLOATS 12288
+#define N_THREADS   1024
+
+layout(local_size_x = N_THREADS, local_size_y = 1, local_size_z = 1) in;
+
+shared float smem[SMEM_FLOATS];
+
+void main() {
+    const uint tile_t0 = gl_WorkGroupID.x * TILE_T;
+    const uint oc0     = gl_WorkGroupID.y * TILE_OC;
+    const uint tid     = gl_LocalInvocationID.x;
+
+    // Contributing input rows for t_abs in [tile_t0 + p0, tile_t0 + TILE_T - 1 + p0].
+    const int t_abs0 = int(tile_t0) + p.p0;
+    const int t_abs1 = t_abs0 + TILE_T - 1;
+    int t_in_min = (t_abs0 - int(p.K) + 1 + p.s0 - 1) / p.s0;
+    if (t_in_min < 0) {
+        t_in_min = 0;
+    }
+    int t_in_max = t_abs1 / p.s0;
+    if (t_in_max >= int(p.T_in)) {
+        t_in_max = int(p.T_in) - 1;
+    }
+
+    const int  n_tin = t_in_max - t_in_min + 1;  // <= 0 when the tile is fully cropped
+    const uint row_w = TILE_OC * p.K;
+
+    if (n_tin > 0) {
+        const uint total = uint(n_tin) * row_w;
+        for (uint i = tid; i < total; i += N_THREADS) {
+            const uint row = i / row_w;
+            const uint rem = i - row * row_w;
+            const uint oc  = oc0 + rem / p.K;
+            // oc*K + rem%K stays below K_OC for a valid oc; zero-pad the rest.
+            smem[i] = (oc < p.OC)
+                ? data_a[uint(t_in_min + int(row)) * p.K_OC + oc * p.K + (rem % p.K)]
+                : 0.0f;
+        }
+    }
+    barrier();
+
+    for (uint o = tid; o < TILE_T * TILE_OC; o += N_THREADS) {
+        const uint t_l   = o % TILE_T;
+        const uint oc_l  = o / TILE_T;
+        const uint t_out = tile_t0 + t_l;
+        const uint oc    = oc0 + oc_l;
+        if (t_out >= p.T_out || oc >= p.OC) {
+            continue;
+        }
+        const int t_abs = int(t_out) + p.p0;
+        int lo = (t_abs - int(p.K) + 1 + p.s0 - 1) / p.s0;
+        if (lo < t_in_min) {
+            lo = t_in_min;
+        }
+        int hi = t_abs / p.s0;
+        if (hi > t_in_max) {
+            hi = t_in_max;
+        }
+        float sum = 0.0f;
+        for (int t_in = lo; t_in <= hi; ++t_in) {
+            const int k = t_abs - t_in * p.s0;
+            if (k >= 0 && k < int(p.K)) {
+                sum += smem[uint(t_in - t_in_min) * row_w + oc_l * p.K + uint(k)];
+            }
+        }
+        data_d[t_out + oc * p.T_out] = sum;
+    }
+}

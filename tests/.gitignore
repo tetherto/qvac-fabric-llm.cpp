@@ -1,5 +1,6 @@
 *
 !*.*
+!package-consumer/
 !snapshots/
 !turbovec-golden-gen/
 !turbovec-golden-gen/Cargo.toml
