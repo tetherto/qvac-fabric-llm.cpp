@@ -789,7 +789,7 @@ kernel void kernel_mul_mv_ptq1_0_f32_r4(
     kernel_mul_mv_ptq1_0_f32_impl<N_R0_PTQ1_0_R4, constant ggml_metal_kargs_mul_mv &>(args, src0, src1, dst, nullptr, tgpig, tiisg, sgitg);
 }
 
-// PQ2_0 and Q2_0 dot against coefficients staged by the caller (same codec, group 128 vs 64). A byte is a base-4 fraction of
+// Q2_0 dot against coefficients staged by the caller. A byte is a base-4 fraction of
 // 256: with u = b/256 and g_k = floor(4^k*u), exact in fp32, the floor chain peels the
 // fields from the top down, g_1 = t_3, g_2 - 4*g_1 = t_2, g_3 - 4*g_2 = t_1 and
 // b - 4*g_3 = t_0, because plain bit packing keeps field 0 in the low bits. Summing
@@ -812,6 +812,35 @@ inline float q2_dot_coeffs(device const block_t * qb, float sumy, thread const f
         acc += floor(16.0f*u)*c[4*j + 1];
         acc += floor(64.0f*u)*c[4*j + 2];
         acc +=              b*c[4*j + 3];
+    }
+
+    return qb->d * (acc - sumy);
+}
+
+// element 0 of both 16-bit lanes of a word holding 8 + 8 PQ2_0 elements
+constexpr constant static uint pq2_0_lane_field_mask = 0x00030003;
+
+// 2^24/4^k undoes the scale of a field at bits 2k of a lane read as a half
+constexpr constant static float pq2_0_field_scale[4] = { 16777216.0f, 4194304.0f, 1048576.0f, 262144.0f };
+
+// Dot of 16 PQ2_0 elements with y*pq2_0_field_scale[e%4]. A field t at bits 2k of a lane read as a half is the subnormal
+// t*4^k*2^-24; the explicit half to float conversion is lossless (MSL 8.6) and yields a normal float, so no arithmetic
+// sees a subnormal input (MSL 8.1 may flush those) and each fma adds exactly t*y with no int to float convert.
+inline float pq2_0_dot_lanes(device const block_pq2_0 * qb, float sumy, thread const float * c, short il) {
+    device const ushort * q16 = (device const ushort *) (qb->qs + il/4);
+
+    const uint lo = as_type<uint>(ushort2(q16[0], q16[1]));
+    const uint hi = lo >> 8;
+
+    float acc = 0.f;
+
+    FOR_UNROLL (short k = 0; k < 4; ++k) {
+        const float2 a = float2(as_type<half2>(lo & (pq2_0_lane_field_mask << 2*k)));
+        const float2 b = float2(as_type<half2>(hi & (pq2_0_lane_field_mask << 2*k)));
+        acc += a[0]*c[k];
+        acc += b[0]*c[k + 4];
+        acc += a[1]*c[k + 8];
+        acc += b[1]*c[k + 12];
     }
 
     return qb->d * (acc - sumy);
@@ -860,24 +889,15 @@ void kernel_mul_mv_pq2_0_f32_impl(
     device const float * yb = y + ix*QK_PQ2_0 + il;
 
     for (int ib = ix; ib < nb; ib += N_SIMDWIDTH/8) {
-        // stage the 16 activations once as base-4 collapse coefficients, reused per row;
-        // the floor chain yields fields top down, so the coefficients pair y_3 with g_1
         float sumy = 0.f;
 
-        FOR_UNROLL (short j = 0; j < 4; j++) {
-            const float y0 = yb[4*j + 0];
-            const float y1 = yb[4*j + 1];
-            const float y2 = yb[4*j + 2];
-            const float y3 = yb[4*j + 3];
-            sumy += (y0 + y1) + (y2 + y3);
-            yl[4*j + 0] = y3 - 4.0f*y2;
-            yl[4*j + 1] = y2 - 4.0f*y1;
-            yl[4*j + 2] = y1 - 4.0f*y0;
-            yl[4*j + 3] = y0;
+        FOR_UNROLL (short i = 0; i < 16; i++) {
+            sumy += yb[i];
+            yl[i] = yb[i]*pq2_0_field_scale[i%4];
         }
 
         FOR_UNROLL (short row = 0; row < nr0; row++) {
-            sumf[row] += q2_dot_coeffs(ax[row] + ib, sumy, yl, il);
+            sumf[row] += pq2_0_dot_lanes(ax[row] + ib, sumy, yl, il);
         }
 
         yb += QK_PQ2_0 * (N_SIMDWIDTH/8);

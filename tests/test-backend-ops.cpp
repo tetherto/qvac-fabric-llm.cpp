@@ -6944,6 +6944,78 @@ struct test_mul_mat_id : public test_case {
     }
 };
 
+// PQ2_0 mat-vec with a non-zero 2-bit code in every element and only positive activations: a backend that flushes or
+// drops the field of any bit position loses a quarter of a same-signed sum, far beyond the error bound
+struct test_mul_mat_pq2_0_codes : public test_case {
+    static constexpr int64_t QK = 128;
+
+    const int64_t m;
+    const int64_t k;
+
+    test_mul_mat_pq2_0_codes(int64_t m, int64_t k) : m(m), k(k) {}
+
+    std::string vars() override { return VARS_TO_STR2(m, k); }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MUL_MAT";
+    }
+
+    double max_nmse_err() override { return 5e-4; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor_2d(ctx, GGML_TYPE_PQ2_0, k, m);
+        ggml_set_name(a, "a");
+        ggml_tensor * b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, 1);
+        ggml_set_name(b, "b");
+        ggml_tensor * out = ggml_mul_mat(ctx, a, b);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    // block: fp16 scale, then 2-bit codes with element j at byte j/4, bits 2*(j%4); codes cycle through 1, 2, 3
+    static void fill_block(uint8_t * blk, int64_t row, int64_t ib) {
+        const ggml_fp16_t d = ggml_fp32_to_fp16(0.5f + (float) (ib % 7) / 8.0f);
+        memcpy(blk, &d, sizeof(d));
+        uint8_t * qs = blk + sizeof(d);
+        memset(qs, 0, QK/4);
+        for (int64_t j = 0; j < QK; ++j) {
+            const uint8_t code = 1 + (row + ib*QK + j) % 3;
+            qs[j/4] |= code << (2*(j%4));
+        }
+    }
+
+    void init_codes(ggml_tensor * t) {
+        GGML_ASSERT(ggml_blck_size(t->type) == QK && ggml_type_size(t->type) == sizeof(ggml_fp16_t) + QK/4);
+        std::vector<uint8_t> data(ggml_nbytes(t));
+        const int64_t nb = k/QK;
+        for (int64_t row = 0; row < m; ++row) {
+            for (int64_t ib = 0; ib < nb; ++ib) {
+                fill_block(data.data() + (row*nb + ib)*ggml_type_size(t->type), row, ib);
+            }
+        }
+        ggml_backend_tensor_set(t, data.data(), 0, data.size());
+    }
+
+    static void init_positive(ggml_tensor * t) {
+        std::vector<float> data(ggml_nelements(t));
+        for (size_t i = 0; i < data.size(); ++i) {
+            data[i] = 0.25f + (float) (i*37 % 64) / 64.0f;
+        }
+        ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(float));
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type == GGML_TYPE_PQ2_0) {
+                init_codes(t);
+            } else {
+                init_positive(t);
+            }
+        }
+    }
+};
+
 struct test_ternary_f16_reference : public test_case {
     const ggml_type type_a;
     const bool use_ids;
@@ -12892,6 +12964,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
     test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_PTQ1_0, GGML_GLU_OP_SWIGLU, 1, 8, 196608,
         false, 1, 1, false, false, true, false, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat_pq2_0_codes(67, 1024));
+    test_cases.emplace_back(new test_mul_mat_pq2_0_codes(67, 5120));
     test_cases.emplace_back(new test_ternary_f16_reference(GGML_TYPE_PTQ1_0, false));
     test_cases.emplace_back(new test_ternary_f16_reference(GGML_TYPE_PQ2_0, false));
     test_cases.emplace_back(new test_ternary_f16_reference(GGML_TYPE_PTQ1_0, true));
