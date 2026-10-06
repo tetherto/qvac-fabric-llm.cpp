@@ -1,6 +1,7 @@
 # One-core check of the prologue's attention work (act-att.cc) against numpy.
 # On the bench, in the IRON env:
-#   NPU_CACHE_HOME=$(mktemp -d) python probes/act_att_check.py prep|combine|pass
+#   NPU_CACHE_HOME=$(mktemp -d) python probes/act_att_check.py prep|combine|gates|row4|row8|pass
+# Each mode checks its results against a tolerance and exits nonzero on a miss.
 # A fresh NPU_CACHE_HOME per kernel edit: iron.jit reuses a cached artifact.
 import hashlib
 import sys
@@ -16,6 +17,14 @@ from aie.iron.kernel import ExternalFunction
 from aie.iron.kernels._common import _include_dirs
 
 MODE = sys.argv[1] if len(sys.argv) > 1 else "prep"
+failed = []
+
+
+def check(what, ok):
+    if not ok:
+        failed.append(what)
+
+
 ACT = 2112
 AW = ACT // 4
 D, H, NROT = 256, 8, 64
@@ -64,7 +73,7 @@ def pro(main: In, side: In, emit: Out, out: Out, *, NM: CompileTime[int],
 
     w = Worker(body, fn_args=[fm.cons(), fo.prod(), fs.cons(), fe.prod(), k_pro, k_cnt,
                               k_side, k_emit, Buffer(c_ty, name="cnt")], stack_size=0x1300,
-               data_size=28672)
+               data_size=32832)
 
     def seq(m_h, s_h, e_h, o_h, mi, si, eo, oo):
         mi.fill(m_h)
@@ -144,6 +153,7 @@ if MODE == "prep":
             rel = np.abs(got - ref).max() / np.abs(ref).max()
             worst = max(worst, rel)
             print(f"q t{t} h{hh} max rel {rel:.2e}")
+            check(f"q t{t} h{hh}", np.all(np.isfinite(got)) and rel < 1e-2)
         print("words", o[t, 512:515])
     kk = e[:256].view(np.float16).astype(np.float32).reshape(2, D)
     vv = e[256:512].view(np.float16).astype(np.float32).reshape(2, D)
@@ -152,6 +162,8 @@ if MODE == "prep":
         rel = np.abs(kk[g] - ref.astype(np.float16).astype(np.float32)).max()
         print(f"k g{g} max abs vs f16 ref {rel:.2e}")
         print(f"v g{g} max abs vs f16 ref {np.abs(vv[g] - v[g].astype(np.float16)).max():.2e}")
+        check(f"k g{g}", rel == 0)
+        check(f"v g{g}", np.array_equal(vv[g], v[g].astype(np.float16).astype(np.float32)))
     print("worst q", worst)
 
 elif MODE == "combine":
@@ -207,9 +219,11 @@ elif MODE == "combine":
         print("tile", kk, "flags", o[kk, AW - 2], "fmt", o[kk, AW - 1])
     rel = np.linalg.norm(got - ref) / np.linalg.norm(ref)
     print(f"combine rel {rel:.3e} (int8 group quantization alone ~4e-3)")
+    check("combine", np.all(np.isfinite(got)) and rel < 2e-2)
     g = ref.reshape(-1, 32)
     dq = np.where(np.abs(g).max(1) > 0, np.abs(g).max(1) / 127, 1)
     qref = (np.clip(np.rint(g / dq[:, None]), -127, 127) * dq[:, None]).reshape(-1)
+    check("combine vs quantized", np.linalg.norm(got - qref) / np.linalg.norm(qref) < 1e-2)
     print(f"vs the reference quantized the same way: rel {np.linalg.norm(got - qref) / np.linalg.norm(qref):.3e}, "
           f"codes differing {(np.abs(got - qref) > 1e-6 * np.abs(qref).max()).sum()} of 2048")
 
@@ -254,6 +268,9 @@ elif MODE == "gates":
     tl = e[1024:1024 + 48].view(np.float32).reshape(16, 3)
     print("gates: eg rel", np.abs(tl[:, 0] / eg - 1).max(), "beta rel", np.abs(tl[:, 1] / b - 1).max(),
           "scale", tl[0, 2], sc)
+    check("gates eg", np.abs(tl[:, 0] / eg - 1).max() < 1e-3)
+    check("gates beta", np.abs(tl[:, 1] / b - 1).max() < 1e-3)
+    check("gates scale", np.all(tl[:, 2] == sc))
 
 elif MODE in ("row4", "row8"):
     # the layer boundary: h = acc + residual out, rms_norm(h) * gamma in tiles,
@@ -282,6 +299,7 @@ elif MODE in ("row4", "row8"):
     ulp = np.abs(hd.view(np.int32).astype(np.int64) - h.view(np.int32).astype(np.int64))
     print("h exact:", np.array_equal(hd, h), "max ulps", ulp.max(), "differing", (ulp > 0).sum(),
           "max rel", (np.abs(hd - h) / np.abs(h)).max())
+    check("h", np.all(np.isfinite(hd)) and (np.abs(hd - h) / np.abs(h)).max() < 1e-5)
     x = (h / np.sqrt(np.mean(h.astype(np.float64) ** 2) + eps) * gam).astype(np.float32)
     g = x.reshape(-1, grp)
     dq = np.where(np.abs(g).max(1) > 0, np.abs(g).max(1) / 127, 1).astype(np.float32)
@@ -293,6 +311,8 @@ elif MODE in ("row4", "row8"):
         worst = max(worst, np.abs(codes.astype(int) - qref).max())
         print(f"chunk {c}: codes off by at most {np.abs(codes.astype(int) - qref).max()}, "
               f"scale rel {np.abs(gd / dq - 1).max():.1e}, flags {o[c * nt + nt - 1, AW - 2]}")
+        check(f"chunk {c} codes", np.abs(codes.astype(int) - qref).max() <= 1)
+        check(f"chunk {c} scale", np.abs(gd / dq - 1).max() < 1e-5)
 
 else:
     # a tile without bit 5 passes through untouched
@@ -300,3 +320,8 @@ else:
     main[:, AW - 2] = 0
     e, o = run(main, np.zeros((0, 512), np.int32), 0)
     print("pass identical:", np.array_equal(o, main))
+    check("pass", np.array_equal(o, main))
+
+if failed:
+    sys.exit(f"act_att_check {MODE}: FAIL on {', '.join(failed)}")
+print(f"act_att_check {MODE}: PASS")
