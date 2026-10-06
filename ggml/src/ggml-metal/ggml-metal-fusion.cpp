@@ -376,6 +376,37 @@ static bool ggml_metal_fusion_check_rms_norm_fwht(
         (!ggml_metal_fusion_overlap(x, mm) && !ggml_metal_fusion_overlap(x, mul) && ggml_metal_fusion_float4_rows(x));
 }
 
+// CONT + signed FWHT: the FWHT loads each element of the CONT output from the CONT source view, so the source may not
+// overlap the output; the MUL reads the CONT through a RESHAPE, so the encoder checks the consumers (unsafe = true)
+static bool ggml_metal_fusion_check_cont_fwht(
+        const ggml_metal_fusion      * fusion,
+        const ggml_tensor * const    * nodes,
+        const ggml_metal_device_props * props,
+              ggml_metal_fusion_mode   mode) {
+    const ggml_tensor * cont = nodes[0];
+    const ggml_tensor * mul  = nodes[1];
+    const ggml_tensor * mm   = nodes[2];
+
+    // the CONT output is never read, so only the structure of the signed FWHT matters
+    if (!ggml_metal_fusion_check_fwht_signed(fusion, nodes + 1, props, GGML_METAL_FUSION_STRUCTURAL)) {
+        return false;
+    }
+
+    const ggml_tensor * x   = ggml_metal_fwht_signed_operands(mul).x;
+    const ggml_tensor * src = cont->src[0];
+
+    const bool ok =
+        (x == cont || (x->op == GGML_OP_RESHAPE && x->src[0] == cont)) &&
+        src->type == GGML_TYPE_F32 && cont->type == GGML_TYPE_F32 &&
+        ggml_nelements(cont) <= INT32_MAX && mm->src[0]->ne[0] >= GGML_METAL_FWHT_TG_MIN_N;
+
+    if (!ok) {
+        return false;
+    }
+
+    return mode != GGML_METAL_FUSION_FULL || !ggml_metal_fusion_overlap(src, mm);
+}
+
 // MUL_MAT + ADD of an f32 non-weight: the reorder packs it without reading row counts, so ubatch sizes share one order;
 // the encoder fuses only a same-shape residual in the few-row MMA store, which the sum may overlap only in place
 static bool ggml_metal_fusion_check_mul_mat_add(
@@ -498,6 +529,7 @@ static const ggml_op ops_snake[] = { GGML_OP_MUL, GGML_OP_SIN, GGML_OP_SQR, GGML
 static const ggml_op ops_gdn_cache[] = { GGML_OP_GATED_DELTA_NET, GGML_OP_CPY };
 
 static const ggml_op ops_fwht_signed[] = { GGML_OP_MUL, GGML_OP_MUL_MAT };
+static const ggml_op ops_cont_fwht[] = { GGML_OP_CONT, GGML_OP_MUL, GGML_OP_MUL_MAT };
 static const ggml_op ops_rms_norm_fwht[] = { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_MUL, GGML_OP_MUL_MAT };
 
 static const ggml_op ops_mul_mat_add[] = { GGML_OP_MUL_MAT, GGML_OP_ADD };
@@ -525,6 +557,7 @@ static const ggml_metal_fusion ggml_metal_fusions[] = {
     { GGML_METAL_FUSION_GDN_CACHE,    ops_gdn_cache,        2, true,  ggml_metal_fusion_check_gdn_cache },
     { GGML_METAL_FUSION_FWHT_SIGNED,  ops_fwht_signed,      2, true,  ggml_metal_fusion_check_fwht_signed },
     { GGML_METAL_FUSION_RMS_NORM_FWHT, ops_rms_norm_fwht,   4, true,  ggml_metal_fusion_check_rms_norm_fwht },
+    { GGML_METAL_FUSION_CONT_FWHT,     ops_cont_fwht,       3, true,  ggml_metal_fusion_check_cont_fwht },
     { GGML_METAL_FUSION_MUL_MAT_ADD,  ops_mul_mat_add,      2, false, ggml_metal_fusion_check_mul_mat_add },
     // longest batch first, so ggml_metal_fusion_next checks no shorter batch once one matches
     { GGML_METAL_FUSION_CPY_BATCH,    ops_cpy_batch,       16, true,  ggml_metal_fusion_check_cpy_batch },

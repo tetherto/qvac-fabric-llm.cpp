@@ -6676,6 +6676,93 @@ struct test_rms_norm_fwht : public test_case {
     }
 };
 
+// CONT of a strided view + sign MUL + Hadamard MUL_MAT (the grouped feature order of a Hadamard-folded projection)
+struct test_cont_fwht : public test_case {
+    const int64_t hd;      // the CONT input is x viewed as [hd, nk, rep] with nk and rep swapped
+    const int64_t nk;
+    const int64_t rep;
+    const int64_t blk;
+    const int64_t n_tokens;
+    const bool    permuted; // permuted view, else every other row of a wider tensor
+    const bool    cont_used; // the CONT also feeds the output, so the fusion must not fire
+    const bool    cont_2d;   // the CONT itself reshapes the view to [width, n_tokens], as the non-FA attention output does
+
+    static constexpr const char * fusion_label = "CONT+MUL+MUL_MAT";
+
+    mutable bool has_fusion_label = false;
+
+    test_cont_fwht(int64_t hd, int64_t nk, int64_t rep, int64_t blk, int64_t n_tokens, bool permuted = true, bool cont_used = false,
+                   bool cont_2d = false)
+        : hd(hd), nk(nk), rep(rep), blk(blk), n_tokens(n_tokens), permuted(permuted), cont_used(cont_used), cont_2d(cont_2d) {}
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "CONT_FWHT";
+    }
+
+    double max_nmse_err(ggml_backend_t backend) override {
+        return hadamard_max_nmse_err(backend, test_case::max_nmse_err(backend));
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR8(hd, nk, rep, blk, n_tokens, permuted, cont_used, cont_2d);
+    }
+
+    uint64_t fusion_count(ggml_backend_t backend) override {
+        const int64_t count = backend_fusion_label_count(backend, fusion_label);
+        has_fusion_label = count >= 0;
+        return has_fusion_label ? (uint64_t) count : 0;
+    }
+
+    bool expect_fusion() override {
+        return has_fusion_label && !cont_used;
+    }
+
+    bool expect_no_fusion() override {
+        return has_fusion_label && cont_used;
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t width = hd*nk*rep;
+
+        ggml_tensor * a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, blk, blk);
+        ggml_set_name(a, "a");
+
+        ggml_tensor * s = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, width);
+        ggml_set_name(s, "s");
+
+        ggml_tensor * view = nullptr;
+        if (permuted) {
+            ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, width, n_tokens);
+            ggml_set_name(x, "x");
+            view = ggml_permute(ctx, ggml_reshape_4d(ctx, x, hd, nk, rep, n_tokens), 0, 2, 1, 3);
+        } else {
+            ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, width, 2*n_tokens);
+            ggml_set_name(x, "x");
+            view = ggml_view_2d(ctx, x, width, n_tokens, 2*x->nb[1], x->nb[1]);
+        }
+
+        ggml_tensor * xc  = cont_2d ? ggml_cont_2d(ctx, view, width, n_tokens) : ggml_reshape_2d(ctx, ggml_cont(ctx, view), width, n_tokens);
+        ggml_tensor * cur = ggml_reshape_2d(ctx, ggml_mul(ctx, xc, s), blk, width / blk * n_tokens);
+
+        ggml_tensor * out = ggml_mul_mat(ctx, a, cur);
+        ggml_mul_mat_set_hint(out, GGML_HINT_SRC0_IS_HADAMARD);
+
+        if (cont_used) {
+            out = ggml_add(ctx, ggml_reshape_2d(ctx, out, width, n_tokens), xc);
+        }
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        init_tensors_hadamard_signed(ctx);
+    }
+};
+
 static void init_mul_mat_id_ids(ggml_context * ctx, int n_mats) {
     std::random_device rd;
     std::default_random_engine rng(rd());
@@ -12710,6 +12797,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_rms_norm_fwht(8192, 8192, 2, norm_used));
     }
     test_cases.emplace_back(new test_rms_norm_fwht(1024, 5120, 3, false, true));
+    for (int64_t n_tokens : { 1, 8, 512 }) {
+        test_cases.emplace_back(new test_cont_fwht(128, 16, 3, 1024, n_tokens));
+    }
+    test_cases.emplace_back(new test_cont_fwht(64, 4, 2, 512, 3));
+    test_cases.emplace_back(new test_cont_fwht(128, 4, 4, 512, 5, false));
+    test_cases.emplace_back(new test_cont_fwht(128, 16, 3, 1024, 2, true, true));
+    for (int64_t n_tokens : { 1, 8 }) {
+        test_cases.emplace_back(new test_cont_fwht(128, 16, 3, 1024, n_tokens, true, false, true));
+    }
+    test_cases.emplace_back(new test_cont_fwht(128, 4, 4, 512, 5, false, false, true));
     test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F32, 32, 1, 32)); // too small (N<64)
     test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F16, 64, 1, 64));
     test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F16, 128, 1, 128));

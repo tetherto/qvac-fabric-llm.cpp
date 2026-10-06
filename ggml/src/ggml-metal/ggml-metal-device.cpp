@@ -1887,14 +1887,15 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_fwht(ggml_metal_
     return res;
 }
 
-ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_rms_norm_fwht(ggml_metal_library_t lib, int n, int nth) {
+// threadgroup FWHT kernels named <prefix>_<n>, with an _nt<nth> suffix for the fallback width
+static ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_fwht_tg_kernel(ggml_metal_library_t lib, const char * prefix, int n, int nth) {
     char base[256];
     char name[256];
 
     if (nth == GGML_METAL_FWHT_TG_NT_FALLBACK) {
-        snprintf(base, 256, "kernel_rms_norm_mul_fwht_f32_%d_nt%d", n, nth);
+        snprintf(base, 256, "%s_%d_nt%d", prefix, n, nth);
     } else {
-        snprintf(base, 256, "kernel_rms_norm_mul_fwht_f32_%d", n);
+        snprintf(base, 256, "%s_%d", prefix, n);
     }
     snprintf(name, 256, "%s", base);
 
@@ -1904,6 +1905,14 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_rms_norm_fwht(gg
     }
 
     return res;
+}
+
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_rms_norm_fwht(ggml_metal_library_t lib, int n, int nth) {
+    return ggml_metal_library_get_pipeline_fwht_tg_kernel(lib, "kernel_rms_norm_mul_fwht_f32", n, nth);
+}
+
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_fwht_gather(ggml_metal_library_t lib, int n, int nth) {
+    return ggml_metal_library_get_pipeline_fwht_tg_kernel(lib, "kernel_fwht_gather_f32", n, nth);
 }
 
 // note: reuse the argsort kernel for the bitonic top_k fallback

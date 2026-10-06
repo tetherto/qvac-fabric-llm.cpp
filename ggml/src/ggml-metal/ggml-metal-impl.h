@@ -1440,6 +1440,18 @@ typedef struct {
 } ggml_metal_kargs_rms_norm_fwht;
 
 typedef struct {
+    int32_t  nrows;
+    int32_t  n_blk;
+    int32_t  ne0;   // shape of the CONT source view: CONT copies in source element order, whatever its own shape
+    int32_t  ne1;
+    int32_t  ne2;
+    uint64_t nb0;   // byte strides of the CONT source view
+    uint64_t nb1;
+    uint64_t nb2;
+    uint64_t nb3;
+} ggml_metal_kargs_fwht_gather;
+
+typedef struct {
     int64_t  ne0;
     float    start;
     float    step;

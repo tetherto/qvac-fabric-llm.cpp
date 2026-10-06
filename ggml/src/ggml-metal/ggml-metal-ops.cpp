@@ -3206,8 +3206,22 @@ static int ggml_metal_op_try_fusion(ggml_metal_op_t ctx, int idx, ggml_metal_fus
     return n;
 }
 
+static int ggml_metal_op_cont_fwht(ggml_metal_op_t ctx, int idx);
+
 int ggml_metal_op_cpy(ggml_metal_op_t ctx, int idx) {
     ggml_tensor * op = ctx->node(idx);
+
+    if (op->op == GGML_OP_CONT && ctx->use_fusion()) {
+        int n = 1;
+        const ggml_metal_fusion * fusion = ctx->can_fuse(idx, GGML_METAL_FUSION_FULL, &n);
+        if (fusion && fusion->id == GGML_METAL_FUSION_CONT_FWHT) {
+            const int n_fwht = ggml_metal_op_cont_fwht(ctx, idx);
+            if (n_fwht > 0) {
+                ctx->count_fusions(fusion);
+                return n_fwht;
+            }
+        }
+    }
 
     ggml_metal_library_t lib = ctx->lib;
     ggml_metal_encoder_t enc = ctx->enc;
@@ -5443,13 +5457,15 @@ static bool ggml_metal_op_rms_norm_fwht_elidable(ggml_metal_op_t ctx, int idx, b
     return mul->data != mm->data && ggml_can_fuse_subgraph_ext(ctx->graph(), gis, 5, ops, outs, 2);
 }
 
-// the fused kernel for FWHT blocks of n, with *nth threads per threadgroup (the fallback width if the default does not fit)
-static ggml_metal_pipeline_with_params ggml_metal_op_rms_norm_fwht_pipeline(ggml_metal_library_t lib, int64_t n, int * nth) {
+using ggml_metal_fwht_tg_getter = ggml_metal_pipeline_with_params (*)(ggml_metal_library_t lib, int n, int nth);
+
+// a fused threadgroup FWHT kernel for blocks of n, with *nth threads per threadgroup (the fallback width if the default does not fit)
+static ggml_metal_pipeline_with_params ggml_metal_op_fwht_tg_pipeline(ggml_metal_library_t lib, ggml_metal_fwht_tg_getter get, int64_t n, int * nth) {
     *nth = GGML_METAL_FWHT_TG_NT;
-    auto pipeline = ggml_metal_library_get_pipeline_rms_norm_fwht(lib, n, *nth);
+    auto pipeline = get(lib, n, *nth);
     if (!pipeline.pipeline || ggml_metal_pipeline_max_theads_per_threadgroup(pipeline) < *nth) {
         *nth = GGML_METAL_FWHT_TG_NT_FALLBACK;
-        pipeline = ggml_metal_library_get_pipeline_rms_norm_fwht(lib, n, *nth);
+        pipeline = get(lib, n, *nth);
     }
     return pipeline;
 }
@@ -5469,7 +5485,7 @@ static int ggml_metal_op_rms_norm_fwht(ggml_metal_op_t ctx, int idx) {
     const int64_t n = mm->src[0]->ne[0];
 
     int nth = 0;
-    auto pipeline = ggml_metal_op_rms_norm_fwht_pipeline(ctx->lib, n, &nth);
+    auto pipeline = ggml_metal_op_fwht_tg_pipeline(ctx->lib, ggml_metal_library_get_pipeline_rms_norm_fwht, n, &nth);
     if (!pipeline.pipeline || ggml_metal_pipeline_max_theads_per_threadgroup(pipeline) < nth) {
         return 0;
     }
@@ -5499,6 +5515,89 @@ static int ggml_metal_op_rms_norm_fwht(ggml_metal_op_t ctx, int idx) {
     }
 
     return GGML_METAL_RMS_NORM_FWHT_N_OPS;
+}
+
+static constexpr int GGML_METAL_CONT_FWHT_N_OPS = 3;
+
+// the fusion table matched CONT + MUL + MUL_MAT(hadamard) structurally; the MUL reads the CONT (directly or through a
+// RESHAPE) and the MUL_MAT reads the MUL through a RESHAPE, so the group fuses when no intermediate has another consumer
+static bool ggml_metal_op_cont_fwht_elidable(ggml_metal_op_t ctx, int idx) {
+    const ggml_tensor * cont = ctx->node(idx);
+    const ggml_tensor * mul  = ctx->node(idx + 1);
+    const ggml_tensor * mm   = ctx->node(idx + 2);
+
+    const ggml_tensor * x = ggml_metal_fwht_signed_operands(mul).x;
+
+    const int gi_cont = ctx->graph_idx(idx);
+    const int gi_mul  = ctx->graph_idx(idx + 1);
+    const int gi_mm   = ctx->graph_idx(idx + 2);
+
+    const int gi_rs_x  = x == cont ? gi_cont : ggml_metal_op_find_graph_node(ctx, gi_cont + 1, gi_mul, x);
+    const int gi_rs_mm = ggml_metal_op_find_graph_node(ctx, gi_mul + 1, gi_mm, mm->src[1]);
+    if (gi_rs_x < 0 || gi_rs_mm < 0) {
+        return false;
+    }
+
+    if (x == cont) {
+        static constexpr ggml_op ops[4] = { GGML_OP_CONT, GGML_OP_MUL, GGML_OP_RESHAPE, GGML_OP_MUL_MAT };
+        const int gis[4] = { gi_cont, gi_mul, gi_rs_mm, gi_mm };
+        return ggml_can_fuse_subgraph_ext(ctx->graph(), gis, 4, ops, &gi_mm, 1);
+    }
+
+    static constexpr ggml_op ops[5] = { GGML_OP_CONT, GGML_OP_RESHAPE, GGML_OP_MUL, GGML_OP_RESHAPE, GGML_OP_MUL_MAT };
+    const int gis[5] = { gi_cont, gi_rs_x, gi_mul, gi_rs_mm, gi_mm };
+    return ggml_can_fuse_subgraph_ext(ctx->graph(), gis, 5, ops, &gi_mm, 1);
+}
+
+// returns the number of fused nodes, or 0 when the group cannot fuse
+static int ggml_metal_op_cont_fwht(ggml_metal_op_t ctx, int idx) {
+    ggml_tensor * cont = ctx->node(idx);
+    ggml_tensor * mul  = ctx->node(idx + 1);
+    ggml_tensor * mm   = ctx->node(idx + 2);
+
+    if (!ggml_metal_op_cont_fwht_elidable(ctx, idx)) {
+        return 0;
+    }
+
+    const ggml_tensor * signs = ggml_metal_fwht_signed_operands(mul).signs;
+    const ggml_tensor * src   = cont->src[0];
+
+    const int64_t n = mm->src[0]->ne[0];
+
+    int nth = 0;
+    auto pipeline = ggml_metal_op_fwht_tg_pipeline(ctx->lib, ggml_metal_library_get_pipeline_fwht_gather, n, &nth);
+    if (!pipeline.pipeline || ggml_metal_pipeline_max_theads_per_threadgroup(pipeline) < nth) {
+        return 0;
+    }
+
+    ggml_metal_kargs_fwht_gather args = {
+        /*.nrows =*/ (int32_t) (ggml_nelements(cont) / n),
+        /*.n_blk =*/ (int32_t) (signs->ne[0] / n),
+        /*.ne0   =*/ (int32_t) src->ne[0],
+        /*.ne1   =*/ (int32_t) src->ne[1],
+        /*.ne2   =*/ (int32_t) src->ne[2],
+        /*.nb0   =*/ src->nb[0],
+        /*.nb1   =*/ src->nb[1],
+        /*.nb2   =*/ src->nb[2],
+        /*.nb3   =*/ src->nb[3],
+    };
+
+    ggml_metal_op_fusion_concurrency(ctx, idx, GGML_METAL_CONT_FWHT_N_OPS);
+
+    ggml_metal_encoder_t enc = ctx->enc;
+    ggml_metal_encoder_set_pipeline(enc, pipeline);
+    ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(src),   1);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(mm),    2);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(signs), 3);
+
+    ggml_metal_encoder_dispatch_threadgroups(enc, args.nrows, 1, 1, nth, 1, 1);
+
+    if (ggml_metal_fusion_info_debug(ctx->finfo) > 1) {
+        GGML_LOG_DEBUG("%s: fuse: CONT + MUL + MUL_MAT (signed FWHT gather)\n", __func__);
+    }
+
+    return GGML_METAL_CONT_FWHT_N_OPS;
 }
 
 // true if the encoder can elide the nodes that the fusion table matched for the norm at idx: the consumer checks that

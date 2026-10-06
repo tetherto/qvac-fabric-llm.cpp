@@ -582,6 +582,65 @@ kernel void kernel_rms_norm_mul_fwht(
     }
 }
 
+// element f of a contiguous CONT output: the f-th element of the CONT source view in its own shape
+static inline float fwht_gather_load(constant ggml_metal_kargs_fwht_gather & args, device const char * src, int f) {
+    const int i0 = f % args.ne0;
+    const int i1 = (f / args.ne0) % args.ne1;
+    const int i2 = (f / args.ne0 / args.ne1) % args.ne2;
+    const int i3 =  f / args.ne0 / args.ne1 / args.ne2;
+
+    return *(device const float *) (src + i0*args.nb0 + i1*args.nb1 + i2*args.nb2 + i3*args.nb3);
+}
+
+// CONT + signed FWHT: kernel_fwht_tg with its input loaded through the CONT source view instead of the CONT output
+template<int N, int NT>
+kernel void kernel_fwht_gather(
+        constant ggml_metal_kargs_fwht_gather & args,
+        device const char  * src,
+        device       float * dst,
+        device const float * signs,
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]],
+        ushort tiisg[[thread_index_in_simdgroup]]) {
+
+    constexpr int NW = N_SIMDWIDTH;
+    constexpr int NE = N / NT;
+
+    threadgroup float shmem[N];
+
+    const float scale = 1.0f / sqrt((float) N);
+
+    const int r   = tgpig.x;
+    const int tid = sgitg * NW + tiisg;
+
+    signs += (r % args.n_blk) * N;
+    dst   += r * N;
+
+    float reg[NE];
+    for (int i = 0; i < NE; i++) {
+        reg[i] = fwht_gather_load(args, src, r*N + i*NT + tid)*signs[i*NT + tid]*scale;
+    }
+
+    fwht_tg_butterfly<N, NT>(reg, shmem, tid);
+
+    for (int i = 0; i < NE; i++) {
+        dst[i*NT + tid] = reg[i];
+    }
+}
+
+typedef decltype(kernel_fwht_gather<1024, GGML_METAL_FWHT_TG_NT>) kernel_fwht_gather_t;
+
+template [[host_name("kernel_fwht_gather_f32_512")]]        kernel kernel_fwht_gather_t kernel_fwht_gather<512,  GGML_METAL_FWHT_TG_NT>;
+template [[host_name("kernel_fwht_gather_f32_1024")]]       kernel kernel_fwht_gather_t kernel_fwht_gather<1024, GGML_METAL_FWHT_TG_NT>;
+template [[host_name("kernel_fwht_gather_f32_2048")]]       kernel kernel_fwht_gather_t kernel_fwht_gather<2048, GGML_METAL_FWHT_TG_NT>;
+template [[host_name("kernel_fwht_gather_f32_4096")]]       kernel kernel_fwht_gather_t kernel_fwht_gather<4096, GGML_METAL_FWHT_TG_NT>;
+template [[host_name("kernel_fwht_gather_f32_8192")]]       kernel kernel_fwht_gather_t kernel_fwht_gather<8192, GGML_METAL_FWHT_TG_NT>;
+template [[host_name("kernel_fwht_gather_f32_512_nt128")]]  kernel kernel_fwht_gather_t kernel_fwht_gather<512,  GGML_METAL_FWHT_TG_NT_FALLBACK>;
+template [[host_name("kernel_fwht_gather_f32_1024_nt128")]] kernel kernel_fwht_gather_t kernel_fwht_gather<1024, GGML_METAL_FWHT_TG_NT_FALLBACK>;
+template [[host_name("kernel_fwht_gather_f32_2048_nt128")]] kernel kernel_fwht_gather_t kernel_fwht_gather<2048, GGML_METAL_FWHT_TG_NT_FALLBACK>;
+template [[host_name("kernel_fwht_gather_f32_4096_nt128")]] kernel kernel_fwht_gather_t kernel_fwht_gather<4096, GGML_METAL_FWHT_TG_NT_FALLBACK>;
+template [[host_name("kernel_fwht_gather_f32_8192_nt128")]] kernel kernel_fwht_gather_t kernel_fwht_gather<8192, GGML_METAL_FWHT_TG_NT_FALLBACK>;
+
 typedef decltype(kernel_rms_norm_mul_fwht<1024, GGML_METAL_FWHT_TG_NT>) kernel_rms_norm_mul_fwht_t;
 
 template [[host_name("kernel_rms_norm_mul_fwht_f32_512")]]        kernel kernel_rms_norm_mul_fwht_t kernel_rms_norm_mul_fwht<512,  GGML_METAL_FWHT_TG_NT>;
