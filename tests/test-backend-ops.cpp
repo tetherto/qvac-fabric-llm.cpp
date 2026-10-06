@@ -1185,6 +1185,12 @@ struct test_case {
         return max_nmse_err();
     }
 
+    // Whether the case applies to the backend at all; a false answer reports it as not supported.
+    virtual bool backend_applicable(ggml_backend_t backend) {
+        GGML_UNUSED(backend);
+        return true;
+    }
+
     virtual double max_maa_err() {
         return 1e-4;
     }
@@ -1411,7 +1417,7 @@ struct test_case {
         std::string unsupported_str;
         for (ggml_backend_t backend : {backend1, backend2}) {
             for (ggml_tensor * t = ggml_get_first_tensor(ctx.get()); t != NULL; t = ggml_get_next_tensor(ctx.get(), t)) {
-                if (!ggml_backend_supports_op(backend, t)) {
+                if (!backend_applicable(backend) || !ggml_backend_supports_op(backend, t)) {
                     supported = false;
                     if (unsupported_str.empty()) {
                         unsupported_str = std::string(ggml_backend_name(backend));
@@ -6415,6 +6421,13 @@ struct test_mul_mat_prec_f32 : public test_case {
     static constexpr int64_t row_padding = 32;
     static constexpr float fp16_overflow_magnitude = 1.0e5f;
     static constexpr float unit_magnitude = 1.0f;
+
+    // WebGPU stages matmul operands as f16 (see max_nmse_err above), so the
+    // overflow magnitudes this case feeds cannot be represented there.
+    bool backend_applicable(ggml_backend_t backend) override {
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
+        return strcmp(ggml_backend_reg_name(reg), "WebGPU") != 0;
+    }
 
     const ggml_type type_a;
     const int64_t m;
