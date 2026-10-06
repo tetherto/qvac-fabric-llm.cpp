@@ -199,7 +199,7 @@ static void decoder_create(VAE & m, ggml_context * ctx) {
         const int C = b.out_ch;
         b.sa  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1, b.in_ch);
         b.sb  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1, b.in_ch);
-        b.ctw = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, b.in_ch, b.kernel * b.out_ch);
+        b.ctw = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, b.in_ch, (int64_t) b.kernel * b.out_ch);
         b.ctb = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, b.out_ch);
         for (int r = 0; r < 3; ++r) {
             ResUnit & ru = b.ru[r];

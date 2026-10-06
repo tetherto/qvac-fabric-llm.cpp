@@ -119,9 +119,9 @@ static bool col2im_1d_vtcm_fit(struct htp_col2im_1d_vtcm * v, uint32_t n_threads
     v->plan_bytes       = v->base.stride * VLEN;
     for (uint32_t band = COL2IM_1D_VTCM_MAX_BAND; band >= COL2IM_1D_VTCM_MIN_BAND; band /= 2) {
         v->band             = band;
-        v->off_tmp          = hex_round_up(col2im_1d_band_cols(v, band) * k_oc * sizeof(float), VLEN);
+        v->off_tmp          = hex_round_up((size_t) col2im_1d_band_cols(v, band) * k_oc * sizeof(float), VLEN);
         v->off_out          = v->off_tmp + v->taps_per_output * VLEN;
-        v->bytes_per_thread = v->off_out + hex_round_up(v->base.channels * band * sizeof(float), VLEN);
+        v->bytes_per_thread = v->off_out + hex_round_up((size_t) v->base.channels * band * sizeof(float), VLEN);
         if (v->plan_bytes + (size_t) v->bytes_per_thread * n_threads <= vtcm_size) {
             return true;
         }

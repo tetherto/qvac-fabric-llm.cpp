@@ -310,9 +310,9 @@ static void flash_attn_ext_f16_thread(unsigned int nth, unsigned int ith, void *
     const uint32_t DK = nek0;
     const uint32_t DV = nev0;
 
-    const size_t size_q_row = DK * ((q->type == HTP_TYPE_F32) ? 4 : 2);
-    const size_t size_k_row = DK * ((k->type == HTP_TYPE_F32) ? 4 : 2);
-    const size_t size_v_row = DV * ((v->type == HTP_TYPE_F32) ? 4 : 2);
+    const size_t size_q_row = (size_t) DK * ((q->type == HTP_TYPE_F32) ? 4 : 2);
+    const size_t size_k_row = (size_t) DK * ((k->type == HTP_TYPE_F32) ? 4 : 2);
+    const size_t size_v_row = (size_t) DV * ((v->type == HTP_TYPE_F32) ? 4 : 2);
 
     // Scratchpad buffers for Q, K, V, Mask, and VKQ32 accumulator
     uint8_t * spad_q = factx->spad_q + factx->size_q_block * ith;

@@ -317,10 +317,10 @@ static void im2col_1d_tiled_layout(struct htp_im2col_1d_tiled * t, uint32_t tile
     t->tile_w           = tile_w;
     t->stride_f32       = hex_round_up(span, IM2COL_1D_F32_ALIGN);
     t->stride_f16       = hex_round_up(span, IM2COL_1D_F16_ALIGN);
-    t->off_f16          = hex_round_up(IC * t->stride_f32 * sizeof(float), VLEN);
-    t->off_tmp          = t->off_f16 + hex_round_up(IC * t->stride_f16 * sizeof(__fp16), VLEN);
+    t->off_f16          = hex_round_up((size_t) IC * t->stride_f32 * sizeof(float), VLEN);
+    t->off_tmp          = t->off_f16 + hex_round_up((size_t) IC * t->stride_f16 * sizeof(__fp16), VLEN);
     t->off_out          = t->off_tmp + t->n_gather * VLEN;
-    t->bytes_per_thread = t->off_out + hex_round_up(tile_w * PS * sizeof(__fp16), VLEN);
+    t->bytes_per_thread = t->off_out + hex_round_up((size_t) tile_w * PS * sizeof(__fp16), VLEN);
 }
 
 static bool im2col_1d_gather_fits(const struct htp_im2col_1d_tiled * t) {
