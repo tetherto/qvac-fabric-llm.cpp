@@ -54,6 +54,9 @@ constexpr int ACT_WIDTH_W = ACT_TILE / 4 - 1;
 // az per head = [attn GATED_D][z GATED_D][hh] (hh at the tail keeps attn/z
 // 64B-aligned; each call finds its slot by hh).
 extern "C" void ggml_xdna_gated_head(uint8_t * out, const float * az, const float * gamma) {
+    // The rounding mode is the core's, left by whatever ran on it before:
+    // set it, or the first dispatch after another design rounds differently.
+    aie::set_rounding(aie::rounding_mode::conv_even);
     const int     hh   = (int) az[GATED_HH];
     float *       gbuf = (float *) out + hh * GATED_D;
     const float * a    = az;
@@ -67,8 +70,14 @@ extern "C" void ggml_xdna_gated_head(uint8_t * out, const float * az, const floa
 
 #if ACT_SPLIT
 extern "C" void ggml_xdna_gated_fin(uint8_t * out, uint8_t * actbuf) {
+    // The rounding mode is the core's, left by whatever ran on it before:
+    // set it, or the first dispatch after another design rounds differently.
+    aie::set_rounding(aie::rounding_mode::conv_even);
 #else
 extern "C" void ggml_xdna_gated_fin(uint8_t * out) {
+    // The rounding mode is the core's, left by whatever ran on it before:
+    // set it, or the first dispatch after another design rounds differently.
+    aie::set_rounding(aie::rounding_mode::conv_even);
 #endif
     const float *          gbuf    = (const float *) out;
     // Both passes are vector work. They used to be scalar loops over the
