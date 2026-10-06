@@ -46,6 +46,9 @@ constexpr int ACT_WIDTH_W = @PACT@ / 4 - 1;
 }  // namespace
 
 extern "C" void ggml_xdna_post_norm(const float * in, uint8_t * out) {
+    // The rounding mode is the core's, left by whatever ran on it before:
+    // set it, or the first dispatch after another design rounds differently.
+    aie::set_rounding(aie::rounding_mode::conv_even);
     event0();
     const float * so         = in;
     const float * res        = in + @PD@;
