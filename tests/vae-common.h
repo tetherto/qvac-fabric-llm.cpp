@@ -347,12 +347,17 @@ static ggml_tensor * build_encode(ggml_context * ctx, Encoder * m, ggml_tensor *
 // ------------------------------------------------------------- WAV I/O
 // Read a 16-bit PCM WAV (mono or stereo). Returns interleaved f32 [T, 2] (mono
 // duplicated to stereo), sets *T and *rate. Returns empty on failure.
+static bool read_exact(FILE * f, void * dst, size_t size, size_t count) {
+    return fread(dst, size, count, f) == count;
+}
+
 static std::vector<float> wav_read(const char * path, int * T, int * rate) {
     FILE * f = fopen(path, "rb");
     if (!f) { fprintf(stderr, "[WAV] cannot open %s\n", path); return {}; }
-    char riff[4]; fread(riff, 1, 4, f);
-    uint32_t rsz; fread(&rsz, 4, 1, f);
-    char wave[4]; fread(wave, 1, 4, f);
+    char riff[4]; uint32_t rsz; char wave[4];
+    if (!read_exact(f, riff, 1, 4) || !read_exact(f, &rsz, 4, 1) || !read_exact(f, wave, 1, 4)) {
+        fprintf(stderr, "[WAV] truncated header\n"); fclose(f); return {};
+    }
     if (memcmp(riff, "RIFF", 4) || memcmp(wave, "WAVE", 4)) { fprintf(stderr, "[WAV] not RIFF/WAVE\n"); fclose(f); return {}; }
 
     uint16_t channels = 0, bits = 0; uint32_t srate = 0;
@@ -361,17 +366,17 @@ static std::vector<float> wav_read(const char * path, int * T, int * rate) {
         char id[4]; if (fread(id, 1, 4, f) != 4) break;
         uint32_t sz; if (fread(&sz, 4, 1, f) != 1) break;
         if (!memcmp(id, "fmt ", 4)) {
-            uint16_t fmt; fread(&fmt, 2, 1, f); fread(&channels, 2, 1, f);
-            fread(&srate, 4, 1, f);
-            uint32_t byte_rate; fread(&byte_rate, 4, 1, f);
-            uint16_t block_align; fread(&block_align, 2, 1, f);
-            fread(&bits, 2, 1, f);
+            uint16_t fmt; uint32_t byte_rate; uint16_t block_align;
+            if (!read_exact(f, &fmt, 2, 1) || !read_exact(f, &channels, 2, 1) || !read_exact(f, &srate, 4, 1) ||
+                !read_exact(f, &byte_rate, 4, 1) || !read_exact(f, &block_align, 2, 1) || !read_exact(f, &bits, 2, 1)) {
+                fprintf(stderr, "[WAV] truncated fmt chunk\n"); fclose(f); return {};
+            }
             if (sz > 16) fseek(f, sz - 16, SEEK_CUR);
         } else if (!memcmp(id, "data", 4)) {
             if (bits != 16) { fprintf(stderr, "[WAV] only 16-bit PCM supported (got %d)\n", bits); fclose(f); return {}; }
             int n_samp = (int) (sz / 2);            // total int16 samples (all channels)
             std::vector<int16_t> pcm(n_samp);
-            fread(pcm.data(), 2, n_samp, f);
+            if (!read_exact(f, pcm.data(), 2, n_samp)) { fprintf(stderr, "[WAV] truncated data chunk\n"); fclose(f); return {}; }
             int frames = n_samp / channels;
             out.resize((size_t) frames * 2);
             for (int t = 0; t < frames; t++) {
@@ -413,7 +418,8 @@ static void wav_write(const char * path, const float * l, const float * r, int n
     for (int i = 0; i < n; i++) {
         auto c16 = [&](float x) -> int16_t {
             float v = x * gain * 32767.0f;
-            if (v > 32767.0f) v = 32767.0f; if (v < -32768.0f) v = -32768.0f;
+            if (v > 32767.0f) { v = 32767.0f; }
+            if (v < -32768.0f) { v = -32768.0f; }
             return (int16_t) lrintf(v);
         };
         w16((uint16_t) c16(l[i])); w16((uint16_t) c16(r[i]));

@@ -202,7 +202,6 @@ static bool is_pow2(uint32_t x) { return x > 1 && (x & (x-1)) == 0; }
 
 #define VK_VENDOR_ID_AMD 0x1002
 #define VK_VENDOR_ID_APPLE 0x106b
-#define VK_VENDOR_ID_ARM 0x13b5
 #define VK_VENDOR_ID_INTEL 0x8086
 #define VK_VENDOR_ID_NVIDIA 0x10de
 #define VK_VENDOR_ID_QUALCOMM 0x5143
@@ -17004,7 +17003,7 @@ static void ggml_vk_norm_fused(ggml_backend_vk_context * ctx, vk_context& subctx
         (uint32_t)(gamma->nb[0] / gamma_type_size), (uint32_t)(gamma->nb[1] / gamma_type_size), (uint32_t)(gamma->nb[2] / gamma_type_size), (uint32_t)(gamma->nb[3] / gamma_type_size),
         (uint32_t)beta->ne[0], (uint32_t)beta->ne[1], (uint32_t)beta->ne[2], (uint32_t)beta->ne[3],
         (uint32_t)(beta->nb[0] / beta_type_size), (uint32_t)(beta->nb[1] / beta_type_size), (uint32_t)(beta->nb[2] / beta_type_size), (uint32_t)(beta->nb[3] / beta_type_size),
-        ((const float *)norm->op_params)[0],
+        ggml_get_op_params_f32(norm, 0),
     });
 }
 

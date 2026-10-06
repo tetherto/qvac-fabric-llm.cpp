@@ -7,7 +7,6 @@ if (POLICY CMP0147)
 endif()
 
 find_package(Vulkan COMPONENTS glslc REQUIRED)
-find_package(SPIRV-Headers QUIET)
 
 if (DEFINED ENV{VULKAN_SDK})
     list(APPEND CMAKE_PREFIX_PATH "$ENV{VULKAN_SDK}")
@@ -29,6 +28,24 @@ endif()
 # Add options to disable cooperative matrix support
 option(GGML_VULKAN_DISABLE_COOPMAT "Disable VK_KHR_cooperative_matrix support" OFF)
 option(GGML_VULKAN_DISABLE_COOPMAT2 "Disable VK_NV_cooperative_matrix2 support" OFF)
+
+# A SPIRV-Headers package whose include directories are missing (seen with some
+# Homebrew installs) fails the generate step once the target is linked, while
+# the Vulkan SDK already provides the headers on the include path.
+function(ggml_vk_spirv_headers_usable out_var)
+    set(${out_var} OFF PARENT_SCOPE)
+    if (NOT TARGET SPIRV-Headers::SPIRV-Headers)
+        return()
+    endif()
+    get_target_property(_spirv_includes SPIRV-Headers::SPIRV-Headers INTERFACE_INCLUDE_DIRECTORIES)
+    foreach (_spirv_dir IN LISTS _spirv_includes)
+        if (NOT EXISTS "${_spirv_dir}")
+            message(STATUS "ggml-vulkan: ignoring SPIRV-Headers, missing include dir ${_spirv_dir}")
+            return()
+        endif()
+    endforeach()
+    set(${out_var} ON PARENT_SCOPE)
+endfunction()
 
 function(detect_host_compiler)
     if (CMAKE_HOST_SYSTEM_NAME STREQUAL "Windows")
@@ -130,7 +147,8 @@ if (Vulkan_FOUND)
     )
 
     target_link_libraries(ggml-vulkan PRIVATE Vulkan::Vulkan)
-    if (TARGET SPIRV-Headers::SPIRV-Headers)
+    ggml_vk_spirv_headers_usable(GGML_VK_SPIRV_HEADERS_USABLE)
+    if (GGML_VK_SPIRV_HEADERS_USABLE)
         target_link_libraries(ggml-vulkan PRIVATE $<BUILD_INTERFACE:SPIRV-Headers::SPIRV-Headers>)
     endif()
     target_include_directories(ggml-vulkan PRIVATE ${CMAKE_CURRENT_BINARY_DIR})

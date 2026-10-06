@@ -5657,9 +5657,9 @@ static struct ggml_tensor * ggml_supertonic_layer_norm_channel_impl(
             a->ne[0], a->ne[1], a->ne[2], a->ne[3]);
 
     // op_params: [eps (f32), layout (i32)].
-    float params[2];
+    int32_t params[2];
     memcpy(&params[0], &eps, sizeof(float));
-    ((int32_t *) &params[1])[0] = layout;
+    params[1] = layout;
     ggml_set_op_params(result, params, sizeof(params));
 
     result->op     = GGML_OP_SUPERTONIC_LAYER_NORM_CHANNEL;

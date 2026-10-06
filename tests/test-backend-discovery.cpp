@@ -15,13 +15,12 @@ static bool check(bool ok, const char * what) {
 }
 
 static size_t expected_backend_count(bool vulkan_disabled) {
-    size_t expected = GGML_TEST_BACKEND_COUNT;
 #ifdef GGML_TEST_HAS_VULKAN
-    if (vulkan_disabled) {
-        expected -= 1;
-    }
+    return vulkan_disabled ? GGML_TEST_BACKEND_COUNT - 1 : GGML_TEST_BACKEND_COUNT;
+#else
+    (void) vulkan_disabled;
+    return GGML_TEST_BACKEND_COUNT;
 #endif
-    return expected;
 }
 
 static bool every_built_backend_registered(size_t expected) {

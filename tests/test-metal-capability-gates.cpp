@@ -47,7 +47,9 @@ int main() {
     ggml_context * ctx = ggml_init(params);
     ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, TIMESTEPS, CHANNELS);
 
-    const bool ok = layer_norm_channel_rejected(dev, ctx, x) & bias_gelu_still_supported(dev, ctx, x);
+    const bool rejected  = layer_norm_channel_rejected(dev, ctx, x);
+    const bool supported = bias_gelu_still_supported(dev, ctx, x);
+    const bool ok = rejected && supported;
     ggml_free(ctx);
     return ok ? 0 : 1;
 }
