@@ -12,6 +12,7 @@
 #include <set>
 #include <functional>
 #include <map>
+#include <tuple>
 #include <unordered_map>
 
 struct ggml_cgraph;
@@ -1057,6 +1058,10 @@ struct llm_graph_context {
     ggml_context * ctx0 = nullptr;
     ggml_cgraph  * gf   = nullptr;
 
+    // activation transforms of this graph by (input, rot, signs, perm), shared by the folded weights that read the same input
+    using hadamard_act_key = std::tuple<const ggml_tensor *, const ggml_tensor *, const ggml_tensor *, int64_t, int64_t, int64_t>;
+    mutable std::map<hadamard_act_key, ggml_tensor *> hadamard_acts;
+
     llm_graph_context(const llm_graph_params & params);
     virtual ~llm_graph_context() = default;
 
@@ -1073,6 +1078,11 @@ struct llm_graph_context {
     ggml_tensor * build_hadamard_inverse_after_lookup(
               ggml_tensor * cur,
         const ggml_tensor * table) const;
+
+    // the activation-side transform of a folded weight, built once per input
+    ggml_tensor * build_hadamard_activation(
+                     ggml_tensor * cur,
+        const llama_hadamard_transform & t) const;
 
     // do mat_mul, while optionally apply lora and per-tensor scale
     ggml_tensor * build_lora_mm(
