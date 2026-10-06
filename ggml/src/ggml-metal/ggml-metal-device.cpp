@@ -2417,8 +2417,9 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_group_norm(ggml_
     return res;
 }
 
-ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_norm(ggml_metal_library_t lib, const ggml_tensor * op, int n_fuse) {
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_norm(ggml_metal_library_t lib, const ggml_tensor * op, int n_fuse, bool fuse_scale) {
     assert(op->op == GGML_OP_NORM || op->op == GGML_OP_RMS_NORM);
+    GGML_ASSERT(!fuse_scale || (op->op == GGML_OP_RMS_NORM && n_fuse == 2));
 
     GGML_ASSERT(ggml_is_contiguous_rows(op->src[0]));
 
@@ -2441,7 +2442,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_norm(ggml_metal_
         case GGML_OP_RMS_NORM:
             switch (n_fuse) {
                 case 1: snprintf(base, 256, "kernel_rms_norm_f32%s", suffix);         break;
-                case 2: snprintf(base, 256, "kernel_rms_norm_mul_f32%s", suffix);     break;
+                case 2: snprintf(base, 256, "kernel_rms_norm_%s_f32%s", fuse_scale ? "scale" : "mul", suffix); break;
                 case 3: snprintf(base, 256, "kernel_rms_norm_mul_add_f32%s", suffix); break;
                 default: GGML_ABORT("fatal error");
             } break;

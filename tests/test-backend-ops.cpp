@@ -4071,6 +4071,44 @@ struct test_rms_norm_mul_add : public test_case {
     }
 };
 
+// GGML_OP_RMS_NORM + GGML_OP_SCALE (the gated delta net q/k l2 norm)
+struct test_rms_norm_scale : public test_case {
+    const std::array<int64_t, 4> ne;
+    const float eps;
+    const float scale;
+    const float bias;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "RMS_NORM_SCALE";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR4(ne, eps, scale, bias);
+    }
+
+    test_rms_norm_scale(std::array<int64_t, 4> ne = {128, 16, 1, 1}, float eps = 1e-6f, float scale = 0.25f, float bias = 0.0f)
+        : ne(ne), eps(eps), scale(scale), bias(bias) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
+        ggml_set_name(a, "a");
+
+        ggml_tensor * out = ggml_scale_bias(ctx, ggml_rms_norm(ctx, a, eps), scale, bias);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            init_tensor_uniform(t, -10.f, 10.f);
+        }
+    }
+};
+
 // GGML_OP_ADD + GGML_OP_ADD (fused residual chain)
 struct test_add_add : public test_case {
     const ggml_type type;
@@ -12288,6 +12326,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_add_add(GGML_TYPE_F16, GGML_TYPE_F16, { n, 5, 4, 3 }, false, false));
         test_cases.emplace_back(new test_add_add(GGML_TYPE_F16, GGML_TYPE_F32, { n, 5, 4, 3 }, false, false));
         test_cases.emplace_back(new test_add_add(GGML_TYPE_F16, GGML_TYPE_F32, { n, 5, 4, 3 }, true, false));
+    }
+
+    for (std::array<int64_t, 4> ne : std::vector<std::array<int64_t, 4>>{ { 128, 16, 1, 1 }, { 128, 16, 7, 1 }, { 1025, 5, 4, 3 } }) {
+        test_cases.emplace_back(new test_rms_norm_scale(ne, 1e-6f/ne[0], 1.0f/sqrtf((float) ne[0])));
+        test_cases.emplace_back(new test_rms_norm_scale(ne, 1e-6f, 0.5f, 0.25f));
     }
 
     test_cases.emplace_back(new test_rms_norm_mul_add(GGML_TYPE_F32, { 1536, 1, 1, 1 }, 1e-6f, false, false, true));

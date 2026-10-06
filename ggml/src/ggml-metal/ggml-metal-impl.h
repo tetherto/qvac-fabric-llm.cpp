@@ -678,6 +678,8 @@ typedef struct {
     uint64_t nbf1[3];
     uint64_t nbf2[3];
     uint64_t nbf3[3];
+    float    scale; // fused SCALE
+    float    bias;  // fused SCALE
 } ggml_metal_kargs_norm;
 
 typedef struct {

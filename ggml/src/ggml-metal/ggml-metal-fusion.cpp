@@ -63,6 +63,19 @@ static bool ggml_metal_fusion_check_norm(
     return true;
 }
 
+// RMS_NORM + SCALE: the norm kernel applies the scale and bias, so both outputs must stay F32
+static bool ggml_metal_fusion_check_rms_norm_scale(
+        const ggml_metal_fusion      * fusion,
+        const ggml_tensor * const    * nodes,
+        const ggml_metal_device_props * props,
+              ggml_metal_fusion_mode   mode) {
+    GGML_UNUSED(fusion);
+    GGML_UNUSED(props);
+    GGML_UNUSED(mode);
+
+    return nodes[1]->src[0] == nodes[0] && nodes[0]->type == GGML_TYPE_F32 && nodes[1]->type == GGML_TYPE_F32;
+}
+
 // ADD x N: each ADD reads the previous ADD as src0, and all addends must share layout
 // (and, in FULL mode, live in the same Metal buffer)
 static bool ggml_metal_fusion_check_add_chain(
@@ -376,6 +389,7 @@ static const ggml_op ops_norm_mul[]         = { GGML_OP_NORM, GGML_OP_MUL };
 static const ggml_op ops_norm_mul_add[]     = { GGML_OP_NORM, GGML_OP_MUL, GGML_OP_ADD };
 static const ggml_op ops_rms_norm_mul[]     = { GGML_OP_RMS_NORM, GGML_OP_MUL };
 static const ggml_op ops_rms_norm_mul_add[] = { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ADD };
+static const ggml_op ops_rms_norm_scale[]   = { GGML_OP_RMS_NORM, GGML_OP_SCALE };
 
 static const ggml_op ops_add_2[] = { GGML_OP_ADD, GGML_OP_ADD };
 static const ggml_op ops_add_3[] = { GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD };
@@ -402,6 +416,7 @@ static const ggml_metal_fusion ggml_metal_fusions[] = {
     { GGML_METAL_FUSION_NORM_MUL_ADD, ops_norm_mul_add,     3, false, ggml_metal_fusion_check_norm },
     { GGML_METAL_FUSION_NORM_MUL,     ops_rms_norm_mul,     2, false, ggml_metal_fusion_check_norm },
     { GGML_METAL_FUSION_NORM_MUL_ADD, ops_rms_norm_mul_add, 3, false, ggml_metal_fusion_check_norm },
+    { GGML_METAL_FUSION_RMS_NORM_SCALE, ops_rms_norm_scale, 2, false, ggml_metal_fusion_check_rms_norm_scale },
     { GGML_METAL_FUSION_ADD_CHAIN,    ops_add_2,            2, false, ggml_metal_fusion_check_add_chain },
     { GGML_METAL_FUSION_ADD_CHAIN,    ops_add_3,            3, false, ggml_metal_fusion_check_add_chain },
     { GGML_METAL_FUSION_ADD_CHAIN,    ops_add_4,            4, false, ggml_metal_fusion_check_add_chain },
