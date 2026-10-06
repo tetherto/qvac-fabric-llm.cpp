@@ -142,7 +142,7 @@ def build(dev_name: str = "npu2"):
     # W: shim -> the MemTile's slot buffer -> the cores, the MemTile's side
     # programmed by the host per call (xdna-pgemm.cpp), so a chunk's tiles
     # are read from DDR once and replayed for every M block
-    flows, locks, dmas, wslots = [], [], [], []
+    flows, locks, dmas = [], [], []
     w_core = []
     for col in range(COLS):
         mt, sh = Tile(col, 1), Tile(col, 0)
@@ -244,8 +244,8 @@ def build(dev_name: str = "npu2"):
                 x[r][mb].prod(), x[r][1 - mb].cons(), mm.zero, mm, k_hdr, k_exp, k_out,
                 Buffer(acc_ty, name=f"acc{col}_{i}"), Buffer(n_ty, name=f"n{col}_{i}"), mb],
                 tile=Tile(col, 2 + i), stack_size=0x800))
-    eps = ([f.prod(tile=Tile(6 + mb, 0)) for mb, f in enumerate(a_src)] +
-           [f.cons(tile=Tile(col, 0)) for col, f in enumerate(c_col)])
+    eps = ([f.prod(tile=Tile(6 + mb, 0)) for mb, f in enumerate(a_src)]
+           + [f.cons(tile=Tile(col, 0)) for col, f in enumerate(c_col)])
     return workers, eps, (flows, locks, dmas)
 
 
@@ -283,8 +283,6 @@ def pgemm(w: In, a: In, c: Out, *, M: CompileTime[int] = 512, K: CompileTime[int
         ai, co = e[:2], e[2:]
         # (a zero stride only in the outermost dimension: the M blocks are
         # fills of their own, the chunks' repeat of A is a zero stride)
-        span = NCH * NT * 2 * TB
-        q = 2 * TB // 512
         n = NSTEP * MB * KS
         for mb in range(2):
             ai[mb].fill(a_h, tap=TensorAccessPattern([1, A_ELEMS], mb * HDR, [1, HDR], [0, 1]))

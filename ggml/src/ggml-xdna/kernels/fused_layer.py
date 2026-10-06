@@ -45,16 +45,29 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
+from pathlib import Path
 
 import numpy as np
 
+try:
+    from ml_dtypes import bfloat16
+except Exception:
+    bfloat16 = None   # design host dtype helper; real imports in --run
+
 import aie.iron as iron
-from aie.iron import CompileTime, In, Out, Program, Runtime
-from aie.iron.device import from_name
+from aie.helpers.dialects.scf import _for as range_
+from aie.helpers.taplib import TensorAccessPattern
+from aie.iron import (
+    CompileTime, In, ObjectFifo, Out, Program, Runtime, TaskGroup, Worker,
+)
+from aie.iron.device import Tile, from_name
 from aie.utils.hostruntime.argparse import add_compile_args
 from aie.utils.hostruntime.cli import run_design_cli
 
 import gemv_q4 as gq
+import kernelsrc
+
 
 # The rows the core leaves free, per column. Kept next to the core's own
 # placement constants: if those move, this must move with them.
@@ -109,25 +122,6 @@ OUT_GROUP = 2
 # Host writes, per token: qkv into each conv feed slot, [eg,b,scale] into each
 # head's x_bo tail.
 
-
-import argparse
-import os
-import sys
-from pathlib import Path
-
-import numpy as np
-
-import kernelsrc
-
-import aie.iron as iron
-from aie.iron import (
-    CompileTime, ObjectFifo, Program, Runtime, TaskGroup, Worker,
-    WorkerRuntimeBarrier,
-)
-from aie.iron.device import from_name, Tile
-from aie.helpers.taplib import TensorAccessPattern
-from aie.helpers.dialects.scf import _for as range_
-from aie.utils.hostruntime.argparse import add_compile_args
 
 CH = 6144
 S_V = 128
@@ -212,28 +206,6 @@ def _norm_src(name: str = "ggml_xdna_attn_norm", half: int = -1, one: int = -1):
 # 387 fp32 (1548 B), state 2048 bf16 (4096 B), state' 4096 B, attn 16 fp32.
 
 
-import argparse
-import os
-import sys
-import time
-from pathlib import Path
-
-import numpy as np
-
-try:
-    from ml_dtypes import bfloat16
-except Exception:
-    bfloat16 = None   # design host dtype helper; real imports in --run
-
-import aie.iron as iron
-from aie.iron import (
-    CompileTime, ObjectFifo, Program, Runtime, TaskGroup, Worker,
-)
-from aie.iron.device import from_name, Tile
-from aie.helpers.taplib import TensorAccessPattern
-from aie.helpers.dialects.scf import _for as range_
-from aie.utils.hostruntime.argparse import add_compile_args
-
 S_V = 128
 N_VH = 16
 CHUNK = 16                 # state rows per (head,chunk) object
@@ -286,22 +258,6 @@ rounding boundaries (fp32/bf16-tanh silu vs fp64 exp silu).
 """
 
 
-import argparse
-import os
-import sys
-import time
-from pathlib import Path
-
-import numpy as np
-
-import kernelsrc
-
-import aie.iron as iron
-from aie.iron import CompileTime, ObjectFifo, Program, Runtime, TaskGroup, Worker
-from aie.iron.device import from_name, Tile
-from aie.helpers.taplib import TensorAccessPattern
-from aie.utils.hostruntime.argparse import add_compile_args
-
 S_V = 128
 N_VH = 16
 K = N_VH * S_V
@@ -334,10 +290,6 @@ D        = 1024
 ACT_TILE = 2112
 GROUP    = 32
 
-
-from pathlib import Path
-
-import kernelsrc
 
 POST_SRC = Path(__file__).resolve().parent / "rec-post.cc"
 
@@ -391,33 +343,7 @@ def _post_src(d: int = D, k_tile: int = 256, act_tile: int = ACT_TILE) -> str:
 # lanes host-seeded), arg5 out (10244 B: gated f32 scratch + aq + d_a).
 
 
-import os
-import sys
-from pathlib import Path
-
-import hashlib
-
-import numpy as np
-
-try:
-    from ml_dtypes import bfloat16
-except Exception:
-    bfloat16 = None
-
-import aie.iron as iron
-from aie.iron import (
-    CompileTime, ObjectFifo, Program, Runtime, TaskGroup, Worker,
-)
-from aie.iron.device import from_name, Tile
-from aie.helpers.taplib import TensorAccessPattern
-from aie.helpers.dialects.scf import _for as range_
-import kernelsrc
-
 # ---- stage geometry (attn_cn + gdn_v + rec_gated constants) -------------------------
-
-
-
-
 NC_CONV = 2                 # conv columns (cols 0-1)
 CN_CONV = CN        # 24 conv feed groups per conv column
 NC_NORM = 2                 # norm columns (cols 2-3)
@@ -534,11 +460,11 @@ def build_core(dev_name: str = "npu2"):
                                    object_file_name=_sobj("ggml_xdna_attn_norm", norm_src, sflags),
                                    compile_flags=sflags, inline=True)
     norm_kj = [[iron.ExternalFunction(
-                    name=f"normj{gi}_{half}", source_string=norm_src_j[gi][half],
-                    arg_types=[HN_T, PKV_T],
-                    object_file_name=_sobj(f"normj{gi}_{half}",
-                                           norm_src_j[gi][half], sflags),
-                    compile_flags=sflags, inline=True)
+                name=f"normj{gi}_{half}", source_string=norm_src_j[gi][half],
+                arg_types=[HN_T, PKV_T],
+                object_file_name=_sobj(f"normj{gi}_{half}",
+                                       norm_src_j[gi][half], sflags),
+                compile_flags=sflags, inline=True)
                 for half in range(2)] for gi in range(NC_GDN)]
     gdn_k = iron.ExternalFunction(name="ggml_xdna_gdn_v", source_string=gdn_src,
                                   arg_types=[PKV_T, ROWS_T, ROWS_T, ATT_T],
@@ -669,7 +595,6 @@ def build_core(dev_name: str = "npu2"):
                     x23.cons(tile=Tile(CONV_X_COL[col], 0)),
                     h23.cons(tile=Tile(CONV_H_COL[col], 0))]
 
-
     # ---- norm: cols NC_CONV..NC_CONV+NC_NORM-1, row 3 ----
     # One stream in and one out for the whole stage rather than one per column.
     # The heads interleave across the columns instead of splitting into blocks
@@ -759,7 +684,6 @@ def build_core(dev_name: str = "npu2"):
     # did before.
     gcol0 = GDN_COL0
     PKV4_T  = np.ndarray[(NC_GDN * PKV_N,), np.dtype[np.float32]]
-    ROWS4_T = np.ndarray[(NC_GDN * ROWS,), np.dtype[bfloat16]]
 
     # One stream per MemTile, not all four on one: a MemTile has six DMA
     # channels each way, and a four-way split or join needs five of them. So
@@ -951,7 +875,6 @@ def build_core(dev_name: str = "npu2"):
     # projection's output, the residual and gamma the host wrote into the
     # activation the next dispatch reads, which is what lets a layer's two
     # dispatches go into one stream.
-    POST_COL = NC_CONV + 1
     pi3 = ObjectFifo(POSTI_T, name="pni3", depth=1)
     pi2 = pi3.cons().forward(obj_type=POSTI_T, name="pni2", depth=1)
     po23 = ObjectFifo(POSTO_T, name="pno23", depth=1)
@@ -1013,7 +936,6 @@ def build_core(dev_name: str = "npu2"):
         gact = nxt() if act_split else None
         pfill = nxt()
         pdrain = nxt()
-
 
         # conv cols col-major, a round being gpo consecutive feed groups: they
         # are contiguous in the feed buffer and land on gpo consecutive heads
