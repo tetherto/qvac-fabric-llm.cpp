@@ -17,6 +17,10 @@ TB = 10752
 D, H, G, KVH, P = 256, 8, 4, 2, 5
 NCH = int(sys.argv[1]) if len(sys.argv) > 1 else 4
 QS = float(sys.argv[2]) if len(sys.argv) > 2 else 1.0
+# Pass/fail: each head's output against the f32 softmax over the bf16-rounded
+# K and V (a bf16 kernel lands near 2e-2), and its log-sum-exp.
+REL_TOL = 5e-2
+LSE_TOL = 1e-1
 PIECES = 33
 
 src = (Path(__file__).resolve().parent.parent / "kernels" / "attn-dec.cc").read_text()
@@ -103,6 +107,7 @@ st = ot.numpy()
 
 qbf = q.astype(ml_dtypes.bfloat16).astype(np.float32)
 worst = 0
+failed = []
 for h in range(H):
     g = h // 4
     Kc = K[covered, g].astype(ml_dtypes.bfloat16).astype(np.float32)
@@ -121,4 +126,9 @@ for h in range(H):
     lse = mm + np.log(ll) if ll > 0 else float("nan")
     worst = max(worst, rel)
     print(f"h{h} m={mm:.3f}/{m:.3f} lse={lse:.4f}/{lse_ref:.4f} rel={rel:.3e}")
+    if not (np.all(np.isfinite(got)) and rel < REL_TOL and abs(lse - lse_ref) < LSE_TOL):
+        failed.append(h)
 print("worst", worst)
+if failed:
+    sys.exit(f"attn_dec_check: FAIL on heads {failed} (rel tolerance {REL_TOL}, lse tolerance {LSE_TOL})")
+print("attn_dec_check: PASS")
