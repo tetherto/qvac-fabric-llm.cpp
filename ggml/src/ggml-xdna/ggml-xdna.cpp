@@ -3054,6 +3054,7 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
     // is written, which needs every reader to be such a MUL_MAT.
     std::unordered_set<const struct ggml_tensor *> norm_a;
     std::unordered_map<const struct ggml_tensor *, struct ggml_tensor *> norm_add;
+    std::unordered_map<const struct ggml_tensor *, int> node_at;  // node index in graph order
     std::unordered_map<const struct ggml_tensor *, const struct ggml_tensor *> gated_a;
     std::unordered_set<const struct ggml_tensor *> gate_a;
     g_norm_mul.clear();
@@ -3063,6 +3064,7 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
         std::unordered_map<const struct ggml_tensor *, std::vector<const struct ggml_tensor *>> readers;
         for (int i = 0; i < cgraph->n_nodes; i++) {
             const struct ggml_tensor * t = cgraph->nodes[i];
+            node_at[t] = i;
             for (int j = 0; j < GGML_MAX_SRC; j++) {
                 if (t->src[j] && (j == 0 || t->src[j] != t->src[j - 1])) {
                     readers[t->src[j]].push_back(t);
@@ -3088,7 +3090,13 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                 consumed.insert(r);
                 // the residual sum the norm reads, in the same pass
                 struct ggml_tensor * ad = r->src[0];
-                if (xdna_pgemm_add_supported(ad, m) && !consumed.count(ad)) {
+                bool ad_ok = xdna_pgemm_add_supported(ad, m) && !consumed.count(ad);
+                // the sum is written at this MUL and not where the ADD sits: a
+                // reader that runs earlier would see the ADD's buffer unwritten
+                for (const struct ggml_tensor * t : readers[ad]) {
+                    ad_ok = ad_ok && (t == r || node_at[t] > i);
+                }
+                if (ad_ok) {
                     norm_add[m] = ad;
                     consumed.insert(ad);
                 }
