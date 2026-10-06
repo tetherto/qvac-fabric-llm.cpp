@@ -952,6 +952,10 @@ bool xdna_pgemm_run(xdna_kernel_pool * pool, ggml_tensor * node) {
     return pgemm_call(pool, node->src[1], ws, node, (int) w->ne[1], false);
 }
 
+size_t xdna_pgemm_into_rows(int M) {
+    return (size_t) a_geom(M, KS).n_blk * MBLK;
+}
+
 bool xdna_pgemm_run_into(xdna_kernel_pool * pool, ggml_tensor * node, xdna_buffer * bo, size_t off) {
     std::lock_guard<std::mutex> lock(g_pg.mtx);
     const ggml_tensor *         w  = node->src[0];
@@ -1308,7 +1312,11 @@ bool xdna_pgemm_run_pair(xdna_kernel_pool *  pool,
     const int     na = (int) a->src[0]->ne[1], nb = (int) b->src[0]->ne[1];
     const int     ldc  = (na + nb + 2 * NC - 1) / (2 * NC) * (2 * NC);
     const int     M    = (int) a->src[1]->ne[1];
-    const size_t  rows = (size_t) (M + MBLK - 1) / MBLK * MBLK;
+    // as many rows as the call writes: an even count of blocks (a_geom). A
+    // whole block only, as this was, refused every M under 129 - the warm-up
+    // and every short prompt - with "the destination cannot take the output
+    // directly", 18 times a graph on the 0.8B, and ran the pair one by one.
+    const size_t  rows = xdna_pgemm_into_rows(M);
     xdna_buffer * bo   = xdna_kernel_pool_acquire_buffer(pool, rows * ldc * 4);
     if (!bo || !bo->data) {
         return false;
