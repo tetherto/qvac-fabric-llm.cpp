@@ -14136,7 +14136,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {16, 1},  1025,  64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 2, 1, 3}));
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {16, 1}, 16384,   1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
 
-    // few query rows at long KV with grouped-query heads: backends may run the heads that share a KV head together
+    // few query rows at long KV: backends may run the heads that share a KV head together or split the KV over workgroups
     for (int64_t hs : { 64, 128, 256 }) {
         for (int64_t nr2 : { 1, 2, 4, 6, 8 }) {
             for (int64_t kv : { 1056, 4100 }) {
@@ -14148,11 +14148,22 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
     for (int64_t nb : { 1, 4 }) {
         test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 1025, nb, true,  false, 8.0f,  0.0f, GGML_PREC_F32, GGML_TYPE_F16,  GGML_TYPE_F16));
-        test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {6, 1}, 1025, nb, true,  false, 0.0f, 10.0f, GGML_PREC_F32, GGML_TYPE_F16,  GGML_TYPE_F16));
+        test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {6, 1}, 4100, nb, true,  false, 0.0f, 10.0f, GGML_PREC_F32, GGML_TYPE_F16,  GGML_TYPE_F16));
         test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 2}, 1025, nb, true,  true,  0.0f,  0.0f, GGML_PREC_F32, GGML_TYPE_F16,  GGML_TYPE_F16));
         test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 4100, nb, true,  false, 0.0f,  0.0f, GGML_PREC_F32, GGML_TYPE_F16,  GGML_TYPE_F16, {0, 2, 1, 3}));
         test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 4100, nb, true,  false, 0.0f,  0.0f, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
         test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {8, 1}, 4100, nb, false, false, 0.0f,  0.0f, GGML_PREC_F32, GGML_TYPE_F16,  GGML_TYPE_F16));
+    }
+    for (ggml_type type_KV : { GGML_TYPE_BF16, GGML_TYPE_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1 }) {
+        test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {4, 1}, 2100, 5, true, true, 0.0f, 0.0f, GGML_PREC_F32, type_KV, type_KV));
+    }
+    for (ggml_type type_KV : { GGML_TYPE_F16, GGML_TYPE_Q8_0 }) {
+        test_cases.emplace_back(new test_flash_attn_ext(576, 512, 1, {8, 1}, 1024, 8, true, false, 0.0f, 0.0f, GGML_PREC_F32, type_KV, type_KV, {0, 1, 2, 3}, true, true));
+    }
+    // short KV that a backend may still split over many workgroups, most of which then get no KV block
+    for (int64_t nb : { 4, 19 }) {
+        test_cases.emplace_back(new test_flash_attn_ext(512, 512, 2, {4, 1},  520, nb, true, nb == 19, 0.0f, 0.0f, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {6, 1}, 1024, nb, true, nb == 19, 0.0f, 0.0f, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     }
 
     // MLA shape: the V cache is a sub-view of the K cache, with quantized KV

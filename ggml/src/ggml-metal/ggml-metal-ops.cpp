@@ -29,6 +29,15 @@ static constexpr int     GGML_METAL_MMA_NSG_FEW_ROWS  = 32;
 static constexpr int     GGML_METAL_MMA_NSG_MID_ROWS  = 16;
 static constexpr int     GGML_METAL_MMA_NSG_MANY_ROWS = 8;
 
+// flash attention KV split for a few query rows: workgroups (one per lane of the vec reduce kernel), and the batch sizes,
+// KV length, Q elements (rows x head size) and QK products (rows x KV x head size) per head where it was measured faster
+static constexpr int     GGML_METAL_FA_KV_SPLIT_NWG          = 32;
+static constexpr int64_t GGML_METAL_FA_KV_SPLIT_MIN_ROWS     = 4;
+static constexpr int64_t GGML_METAL_FA_KV_SPLIT_MAX_ROWS     = 19;
+static constexpr int64_t GGML_METAL_FA_KV_SPLIT_MIN_KV       = 256;
+static constexpr int64_t GGML_METAL_FA_KV_SPLIT_MIN_Q_ELEMS  = 512;
+static constexpr int64_t GGML_METAL_FA_KV_SPLIT_MIN_QK_ELEMS = 1024*1024;
+
 static ggml_metal_buffer_id ggml_metal_get_buffer_id(const ggml_tensor * t) {
     if (!t) {
         return { nullptr, 0 };
@@ -4211,14 +4220,36 @@ int ggml_metal_op_add_id(ggml_metal_op_t ctx, int idx) {
     return 1;
 }
 
-bool ggml_metal_op_flash_attn_ext_use_vec(const ggml_tensor * op) {
+// the non-vec kernel reads the K/V once per tile of 8 query rows, the vec kernel once per 1-2 rows; with the KV split,
+// the few threadgroups of a small batch still fill the GPU. the two kernels sum in different orders, so a batch that
+// crosses these bounds as the KV grows changes kernel and its results in the last bits
+static bool ggml_metal_op_flash_attn_ext_use_kv_split(const ggml_tensor * op) {
+    assert(op->op == GGML_OP_FLASH_ATTN_EXT);
+
+    const int64_t ne00 = op->src[0]->ne[0]; // head size
+    const int64_t ne01 = op->src[0]->ne[1]; // batch size
+    const int64_t ne11 = op->src[1]->ne[1]; // KV size
+
+    return ne01 >= GGML_METAL_FA_KV_SPLIT_MIN_ROWS &&
+           ne01 <= GGML_METAL_FA_KV_SPLIT_MAX_ROWS &&
+           ne11 >= GGML_METAL_FA_KV_SPLIT_MIN_KV &&
+           ne01*ne00 >= GGML_METAL_FA_KV_SPLIT_MIN_Q_ELEMS &&
+           ne01*ne11*ne00 >= GGML_METAL_FA_KV_SPLIT_MIN_QK_ELEMS &&
+           ne00 % 32 == 0;
+}
+
+// true if the batch size is small and the head size is supported by the vec kernel
+static bool ggml_metal_op_flash_attn_ext_vec_eligible(const ggml_tensor * op) {
     assert(op->op == GGML_OP_FLASH_ATTN_EXT);
 
     const int64_t ne00 = op->src[0]->ne[0]; // head size
     const int64_t ne01 = op->src[0]->ne[1]; // batch size
 
-    // use vec kernel if the batch size is small and if the head size is supported
     return (ne01 < 20) && (ne00 % 32 == 0);
+}
+
+bool ggml_metal_op_flash_attn_ext_use_vec(const ggml_tensor * op) {
+    return ggml_metal_op_flash_attn_ext_vec_eligible(op) && !ggml_metal_op_flash_attn_ext_use_kv_split(op);
 }
 
 // ref: https://github.com/ggml-org/llama.cpp/pull/27390
@@ -4404,7 +4435,9 @@ size_t ggml_metal_op_flash_attn_ext_extra_blk(const ggml_tensor * op) {
         return res;
     }
 
-    const bool is_vec = ggml_metal_op_flash_attn_ext_use_vec(op);
+    // the vec layout is the larger one: reserve it whenever the vec kernel may run, so the size does not change when
+    // the KV split moves the batch to the non-vec kernel
+    const bool is_vec = ggml_metal_op_flash_attn_ext_vec_eligible(op);
 
     // this optimization is not useful for the vector kernels
     // note: always reserve the blk buffer to avoid graph reallocations
@@ -4510,6 +4543,36 @@ static int ggml_metal_op_flash_attn_ext_vec_nhptg(int64_t n_rep, int64_t nhptg_m
     }
 
     return 1;
+}
+
+// combine the unnormalized results that nwg workgroups wrote to the temp buffer into dst
+static void ggml_metal_op_flash_attn_ext_reduce(ggml_metal_op_t ctx, const ggml_tensor * op, ggml_metal_buffer_id bid_tmp, ggml_metal_buffer_id bid_dst, int32_t nwg) {
+    GGML_TENSOR_LOCALS(int32_t, ne0, op->src[0], ne);
+    GGML_TENSOR_LOCALS(int32_t, ne,  op,         ne);
+
+    // sanity checks
+    assert(ggml_metal_op_flash_attn_ext_extra_tmp(op) != 0);
+
+    GGML_ASSERT(ne01*ne02*ne03 == ne1*ne2*ne3);
+    GGML_ASSERT((uint64_t)ne1*ne2*ne3 <= (1u << 31));
+
+    // sync with the kernel that wrote the temp buffer
+    ggml_metal_op_concurrency_reset(ctx);
+
+    const int32_t nrows = ne1*ne2*ne3;
+
+    ggml_metal_kargs_flash_attn_ext_vec_reduce args = {
+        nrows,
+    };
+
+    auto pipeline = ggml_metal_library_get_pipeline_flash_attn_ext_vec_reduce(ctx->lib, op, op->src[2]->ne[0], nwg);
+
+    ggml_metal_encoder_set_pipeline(ctx->enc, pipeline);
+    ggml_metal_encoder_set_bytes   (ctx->enc, &args, sizeof(args), 0);
+    ggml_metal_encoder_set_buffer  (ctx->enc, bid_tmp, 1);
+    ggml_metal_encoder_set_buffer  (ctx->enc, bid_dst, 2);
+
+    ggml_metal_encoder_dispatch_threadgroups(ctx->enc, nrows, 1, 1, 32*nwg, 1, 1);
 }
 
 int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
@@ -4853,7 +4916,10 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
             /*.logit_softcap =*/ logit_softcap,
         };
 
-        auto pipeline = ggml_metal_library_get_pipeline_flash_attn_ext(lib, op, has_mask, has_sinks, has_bias, has_scap, has_kvpad, nsg, use_kv_f16, ns10, ns20);
+        // workgroups: with the KV split each writes its unnormalized result to the temp buffer for the reduce kernel
+        const int32_t nwg = ggml_metal_op_flash_attn_ext_use_kv_split(op) ? GGML_METAL_FA_KV_SPLIT_NWG : 1;
+
+        auto pipeline = ggml_metal_library_get_pipeline_flash_attn_ext(lib, op, has_mask, has_sinks, has_bias, has_scap, has_kvpad, nsg, nwg, use_kv_f16, ns10, ns20);
 
         ggml_metal_encoder_set_pipeline(enc, pipeline);
         ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
@@ -4864,11 +4930,15 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
         ggml_metal_encoder_set_buffer  (enc, bid_src4, 5);
         ggml_metal_encoder_set_buffer  (enc, bid_pad,  6);
         ggml_metal_encoder_set_buffer  (enc, bid_blk,  7);
-        ggml_metal_encoder_set_buffer  (enc, bid_dst,  8);
+        ggml_metal_encoder_set_buffer  (enc, nwg > 1 ? bid_tmp : bid_dst, 8);
 
         ggml_metal_encoder_set_threadgroup_memory_size(enc, smem, 0);
 
-        ggml_metal_encoder_dispatch_threadgroups(enc, (ne01 + nqptg - 1)/nqptg, ne02, ne03, 32, nsg, 1);
+        ggml_metal_encoder_dispatch_threadgroups(enc, (ne01 + nqptg - 1)/nqptg, ne02, ne03*nwg, 32, nsg, 1);
+
+        if (nwg > 1) {
+            ggml_metal_op_flash_attn_ext_reduce(ctx, op, bid_tmp, bid_dst, nwg);
+        }
 #undef FATTN_SMEM
     } else {
         // half4x4 kernel
@@ -5097,12 +5167,6 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
 
             ggml_metal_encoder_dispatch_threadgroups(enc, (ne01 + nqptg - 1)/nqptg, ne02/nhptg, ne03*nwg, 32, nsg*nhptg, 1);
         } else {
-            // sanity checks
-            assert(ggml_metal_op_flash_attn_ext_extra_tmp(op) != 0);
-
-            GGML_ASSERT(ne01*ne02*ne03 == ne1*ne2*ne3);
-            GGML_ASSERT((uint64_t)ne1*ne2*ne3 <= (1u << 31));
-
             // write the results from each workgroup into a temp buffer
             ggml_metal_encoder_set_buffer(enc, bid_pad, 6);
             ggml_metal_encoder_set_buffer(enc, bid_tmp, 7);
@@ -5110,26 +5174,7 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
             ggml_metal_encoder_set_threadgroup_memory_size(enc, smem, 0);
             ggml_metal_encoder_dispatch_threadgroups(enc, (ne01 + nqptg - 1)/nqptg, ne02/nhptg, ne03*nwg, 32, nsg*nhptg, 1);
 
-            // sync the 2 kernels
-            ggml_metal_op_concurrency_reset(ctx);
-
-            // reduce the results from the workgroups
-            {
-                const int32_t nrows = ne1*ne2*ne3;
-
-                ggml_metal_kargs_flash_attn_ext_vec_reduce args0 = {
-                    nrows,
-                };
-
-                auto pipeline0 = ggml_metal_library_get_pipeline_flash_attn_ext_vec_reduce(lib, op, ne20, nwg);
-
-                ggml_metal_encoder_set_pipeline(enc, pipeline0);
-                ggml_metal_encoder_set_bytes   (enc, &args0, sizeof(args0), 0);
-                ggml_metal_encoder_set_buffer  (enc, bid_tmp, 1);
-                ggml_metal_encoder_set_buffer  (enc, bid_dst, 2);
-
-                ggml_metal_encoder_dispatch_threadgroups(enc, nrows, 1, 1, 32*nwg, 1, 1);
-            }
+            ggml_metal_op_flash_attn_ext_reduce(ctx, op, bid_tmp, bid_dst, nwg);
         }
 #undef FATTN_SMEM
     }
