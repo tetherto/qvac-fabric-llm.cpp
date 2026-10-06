@@ -12966,6 +12966,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         false, 1, 1, false, false, true, false, {1, 1}));
     test_cases.emplace_back(new test_mul_mat_pq2_0_codes(67, 1024));
     test_cases.emplace_back(new test_mul_mat_pq2_0_codes(67, 5120));
+    // fused PQ2_0 gate/up/SWIGLU mat-vec at a Bonsai-2 width with a row tail
+    for (bool use_id : {false, true}) {
+        test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_PQ2_0, GGML_GLU_OP_SWIGLU, 1, 67, 5120,
+            use_id, 4, 2, false, false, true, false, {1, 1}));
+    }
     test_cases.emplace_back(new test_ternary_f16_reference(GGML_TYPE_PTQ1_0, false));
     test_cases.emplace_back(new test_ternary_f16_reference(GGML_TYPE_PQ2_0, false));
     test_cases.emplace_back(new test_ternary_f16_reference(GGML_TYPE_PTQ1_0, true));
@@ -14346,12 +14351,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             false, 16, 8, false, false, true, false, { 1, 1 }));
     }
 
-    for (ggml_type type : { GGML_TYPE_IQ2_XS, GGML_TYPE_Q4_0 }) {
+    for (ggml_type type : { GGML_TYPE_IQ2_XS, GGML_TYPE_Q4_0, GGML_TYPE_PQ2_0 }) {
         test_cases.emplace_back(new test_mul_mat_vec_fusion_alias(type));
     }
 
     // stacked gate/up weights split into two views
-    for (ggml_type type : { GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K }) {
+    for (ggml_type type : { GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_Q8_0, GGML_TYPE_PQ2_0, GGML_TYPE_Q4_0, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K }) {
         test_cases.emplace_back(new test_mul_mat_vec_fusion(type, GGML_GLU_OP_SWIGLU, 1, 32, 256,
             true, 16, 8, false, false, true, false, { 1, 1 }, true));
     }

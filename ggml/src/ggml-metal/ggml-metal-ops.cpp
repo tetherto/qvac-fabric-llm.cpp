@@ -2033,6 +2033,7 @@ static bool ggml_metal_mul_mv_glu_type_ok(enum ggml_type type) {
         case GGML_TYPE_F16:
         case GGML_TYPE_BF16:
         case GGML_TYPE_Q8_0:
+        case GGML_TYPE_PQ2_0:
         case GGML_TYPE_Q4_0:
         case GGML_TYPE_Q4_K:
         case GGML_TYPE_Q5_K:

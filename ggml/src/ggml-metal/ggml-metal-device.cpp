@@ -1622,6 +1622,7 @@ static bool ggml_metal_mul_mv_glu_type_supported(enum ggml_type type) {
         case GGML_TYPE_F16:
         case GGML_TYPE_BF16:
         case GGML_TYPE_Q8_0:
+        case GGML_TYPE_PQ2_0:
         case GGML_TYPE_Q4_0:
         case GGML_TYPE_Q4_K:
         case GGML_TYPE_Q5_K:
@@ -1666,6 +1667,11 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_glu(ggml_
                 nsg = N_SG_Q8_0;
                 nr0 = N_R0_Q8_0;
                 smem = 32*sizeof(float)*N_R0_Q8_0*2;
+            } break;
+        case GGML_TYPE_PQ2_0:
+            {
+                nsg = N_SG_PQ2_0;
+                nr0 = N_R0_PQ2_0_GLU;
             } break;
         case GGML_TYPE_Q4_0:
             {
@@ -1750,6 +1756,11 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_id_glu(gg
                 nsg = N_SG_Q8_0;
                 nr0 = N_R0_Q8_0;
                 smem = 32*sizeof(float)*N_R0_Q8_0*2;
+            } break;
+        case GGML_TYPE_PQ2_0:
+            {
+                nsg = N_SG_PQ2_0;
+                nr0 = N_R0_PQ2_0_GLU;
             } break;
         case GGML_TYPE_Q4_0:
             {

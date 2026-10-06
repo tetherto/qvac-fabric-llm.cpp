@@ -846,13 +846,15 @@ inline float pq2_0_dot_lanes(device const block_pq2_0 * qb, float sumy, thread c
     return qb->d * (acc - sumy);
 }
 
-template<int nr0, typename args_t>
-void kernel_mul_mv_pq2_0_f32_impl(
+// nr0 rows of nmat PQ2_0 matrices times one src1 row. With nmat == 2 the matrices are an up/gate pair sharing the
+// activation and the output is the fused SWIGLU silu(gate)*up.
+template<int nr0, short nmat, typename args_t>
+void kernel_mul_mv_pq2_0_f32_nmat_impl(
         args_t args,
         device const char * src0,
+        device const char * src0_gate,
         device const char * src1,
         device       char * dst,
-        threadgroup  char * shmem,
         uint3  tgpig,
         ushort tiisg,
         ushort sgitg) {
@@ -873,14 +875,17 @@ void kernel_mul_mv_pq2_0_f32_impl(
 
     device const float * y = (device const float *) (src1 + offset1);
 
-    device const block_pq2_0 * ax[nr0];
-    for (int row = 0; row < nr0; ++row) {
-        const uint64_t offset0 = min(first_row + row, args.ne01 - 1)*args.nb01 + (i12/FC_mul_mv_r2)*args.nb02 + (i13/FC_mul_mv_r3)*args.nb03;
-        ax[row] = (device const block_pq2_0 *) ((device char *) src0 + offset0);
+    device const block_pq2_0 * ax[nmat][nr0];
+    FOR_UNROLL (short mat = 0; mat < nmat; ++mat) {
+        device const char * src0_mat = mat == 0 ? src0 : src0_gate;
+        for (int row = 0; row < nr0; ++row) {
+            const uint64_t offset0 = min(first_row + row, args.ne01 - 1)*args.nb01 + (i12/FC_mul_mv_r2)*args.nb02 + (i13/FC_mul_mv_r3)*args.nb03;
+            ax[mat][row] = (device const block_pq2_0 *) (src0_mat + offset0);
+        }
     }
 
     float yl[16];
-    float sumf[nr0] = {0.f};
+    float sumf[nmat][nr0] = {{0.f}};
 
     // group 128: 8 sub-blocks of 16 weights per PQ2_0 block
     const short ix = (tiisg/8);
@@ -896,8 +901,10 @@ void kernel_mul_mv_pq2_0_f32_impl(
             yl[i] = yb[i]*pq2_0_field_scale[i%4];
         }
 
-        FOR_UNROLL (short row = 0; row < nr0; row++) {
-            sumf[row] += pq2_0_dot_lanes(ax[row] + ib, sumy, yl, il);
+        FOR_UNROLL (short mat = 0; mat < nmat; ++mat) {
+            FOR_UNROLL (short row = 0; row < nr0; row++) {
+                sumf[mat][row] += pq2_0_dot_lanes(ax[mat][row] + ib, sumy, yl, il);
+            }
         }
 
         yb += QK_PQ2_0 * (N_SIMDWIDTH/8);
@@ -906,12 +913,44 @@ void kernel_mul_mv_pq2_0_f32_impl(
     device float * dst_f32 = (device float *) dst + (uint64_t)im*args.ne0*args.ne1 + (uint64_t)r1*args.ne0;
 
     for (int row = 0; row < nr0; ++row) {
-        const float tot = simd_sum(sumf[row]);
+        float tot = simd_sum(sumf[0][row]);
+
+        if (nmat == 2) {
+            const float gate = simd_sum(sumf[nmat - 1][row]);
+            tot *= gate / (1.0f + exp(-gate));
+        }
 
         if (tiisg == 0 && first_row + row < args.ne01) {
             dst_f32[first_row + row] = tot;
         }
     }
+}
+
+template<int nr0, typename args_t>
+void kernel_mul_mv_pq2_0_f32_impl(
+        args_t args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem,
+        uint3  tgpig,
+        ushort tiisg,
+        ushort sgitg) {
+    kernel_mul_mv_pq2_0_f32_nmat_impl<nr0, 1, args_t>(args, src0, nullptr, src1, dst, tgpig, tiisg, sgitg);
+}
+
+template<int nr0, typename args_t>
+void kernel_mul_mv_pq2_0_f32_glu_impl(
+        args_t args,
+        device const char * src0,
+        device const char * src0_gate,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem,
+        uint3  tgpig,
+        ushort tiisg,
+        ushort sgitg) {
+    kernel_mul_mv_pq2_0_f32_nmat_impl<nr0, 2, args_t>(args, src0, src0_gate, src1, dst, tgpig, tiisg, sgitg);
 }
 
 [[host_name("kernel_mul_mv_pq2_0_f32")]]
@@ -924,6 +963,19 @@ kernel void kernel_mul_mv_pq2_0_f32(
         ushort tiisg[[thread_index_in_simdgroup]],
         ushort sgitg[[simdgroup_index_in_threadgroup]]) {
     kernel_mul_mv_pq2_0_f32_impl<N_R0_PQ2_0, constant ggml_metal_kargs_mul_mv &>(args, src0, src1, dst, nullptr, tgpig, tiisg, sgitg);
+}
+
+[[host_name("kernel_mul_mv_glu_pq2_0_f32")]]
+kernel void kernel_mul_mv_glu_pq2_0_f32(
+        constant ggml_metal_kargs_mul_mv & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        device const char * src0_gate,
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    kernel_mul_mv_pq2_0_f32_glu_impl<N_R0_PQ2_0_GLU, constant ggml_metal_kargs_mul_mv &>(args, src0, src0_gate, src1, dst, nullptr, tgpig, tiisg, sgitg);
 }
 
 kernel void kernel_mul_mv_q4_0_f32(
@@ -5317,6 +5369,7 @@ template [[host_name("kernel_mul_mv_id_glu_f16_f32_4")]]  kernel kernel_mul_mv_i
 template [[host_name("kernel_mul_mv_id_glu_bf16_f32_4")]] kernel kernel_mul_mv_id_glu_4_t kernel_mul_mv_id_glu<kernel_mul_mv_t_t_4_glu_disp<bfloat, bfloat4, float, float4>>;
 #endif
 template [[host_name("kernel_mul_mv_id_glu_q8_0_f32")]]   kernel kernel_mul_mv_id_glu_t   kernel_mul_mv_id_glu<kernel_mul_mv_q8_0_f32_glu_impl<N_R0_Q8_0>>;
+template [[host_name("kernel_mul_mv_id_glu_pq2_0_f32")]]  kernel kernel_mul_mv_id_glu_t   kernel_mul_mv_id_glu<kernel_mul_mv_pq2_0_f32_glu_impl<N_R0_PQ2_0_GLU>>;
 template [[host_name("kernel_mul_mv_id_glu_q4_0_f32")]]   kernel kernel_mul_mv_id_glu_t   kernel_mul_mv_id_glu<mul_vec_q_n_f32_glu_impl<block_q4_0, N_R0_Q4_0_GLU, ggml_metal_kargs_mul_mv>>;
 template [[host_name("kernel_mul_mv_id_glu_q4_K_f32")]]   kernel kernel_mul_mv_id_glu_t   kernel_mul_mv_id_glu<kernel_mul_mv_q4_K_f32_glu_impl<N_R0_Q4_K>>;
 template [[host_name("kernel_mul_mv_id_glu_q5_K_f32")]]   kernel kernel_mul_mv_id_glu_t   kernel_mul_mv_id_glu<kernel_mul_mv_q5_K_f32_glu_impl<N_R0_Q5_K>>;
