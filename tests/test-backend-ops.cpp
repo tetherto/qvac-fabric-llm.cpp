@@ -5644,6 +5644,8 @@ struct test_rwkv_wkv7 : public test_case {
 
 // GGML_OP_MUL_MAT
 struct test_mul_mat : public test_case {
+    static constexpr double default_nmse_err  = 5e-4;
+    static constexpr double prec_f32_nmse_err = 1e-9;
     const ggml_type type_a;
     const ggml_type type_b;
     const int64_t m;
@@ -5670,9 +5672,9 @@ struct test_mul_mat : public test_case {
         // silently narrowed to fp16, so 1e-9 sits about two orders of magnitude clear of
         // both.
         if (prec_f32 && type_a == GGML_TYPE_F32 && type_b == GGML_TYPE_F32) {
-            return 1e-9;
+            return prec_f32_nmse_err;
         }
-        return 5e-4;
+        return default_nmse_err;
     }
 
     double max_nmse_err(ggml_backend_t backend) override {
@@ -5683,7 +5685,7 @@ struct test_mul_mat : public test_case {
         // WebGPU stages f32 operands as f16 and has no f32-precision path for GGML_PREC_F32 to select
         ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
         if (prec_f32 && strcmp(ggml_backend_reg_name(reg), "WebGPU") == 0) {
-            return test_case::max_nmse_err(backend);
+            return default_nmse_err;
         }
         return max_nmse_err();
     }
