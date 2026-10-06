@@ -9,6 +9,7 @@
 #include <xrt/xrt_kernel.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <climits>
 #include <cstddef>
@@ -310,6 +311,12 @@ xdna_arena_scope::~xdna_arena_scope() {
 
 static xdna_buffer * xdna_buffer_alloc_own(xdna_device * dev, size_t bytes);
 
+static std::atomic<int> g_alloc_failures{ 0 };
+
+int xdna_buffer_alloc_failures(void) {
+    return g_alloc_failures.load();
+}
+
 static xdna_buffer * xdna_arena_alloc(xdna_device * dev, size_t bytes) {
     std::lock_guard<std::mutex> lock(g_arena_mutex);
     if (g_arena.depth <= 0 || arena_chunk_bytes() == 0) {
@@ -380,6 +387,7 @@ static xdna_buffer * xdna_buffer_alloc_own(xdna_device * dev, size_t bytes) {
         std::memset(buf->data, 0, bytes);
         buf->bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
     } catch (const std::exception & e) {
+        g_alloc_failures++;
         GGML_LOG_ERROR("%s: failed to allocate %zu-byte BO: %s\n", "xdna-runtime", bytes, e.what());
         delete buf;
         return nullptr;
