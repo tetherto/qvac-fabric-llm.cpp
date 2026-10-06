@@ -136,10 +136,10 @@ def pgemm(w: In, a: In, c: Out):
 
     rt = Runtime(seq, [np.ndarray[(W_BYTES,), np.dtype[np.uint8]],
                        np.ndarray[(A_ELEMS,), np.dtype[bf16]],
-                       np.ndarray[(C_ELEMS,), np.dtype[np.float32]]] +
-                 [f.prod(tile=Tile(col, 0)) for col, f in enumerate(w_col)] +
-                 [f.prod(tile=Tile(6 + mb, 0)) for mb, f in enumerate(a_f)] +
-                 [f.cons(tile=Tile(col, 0)) for col, f in enumerate(c_col)])
+                       np.ndarray[(C_ELEMS,), np.dtype[np.float32]]]
+                 + [f.prod(tile=Tile(col, 0)) for col, f in enumerate(w_col)]
+                 + [f.prod(tile=Tile(6 + mb, 0)) for mb, f in enumerate(a_f)]
+                 + [f.cons(tile=Tile(col, 0)) for col, f in enumerate(c_col)])
     return Program(iron.get_current_device(), rt, workers=workers).resolve_program()
 
 

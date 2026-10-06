@@ -238,8 +238,8 @@ def main():
             if not np.array_equal(o[O_V:O_V + CHUNK], hn[2 * S_V + j * CHUNK:2 * S_V + (j + 1) * CHUNK]):
                 print(f"FAIL norm {name} chunk {j}: v16 is not the input's slice")
                 failures += 1
-            if not (o[O_EG] == np.float32(hn[O_EG]) and o[O_EG + 1] == np.float32(hn[O_EG + 1]) and
-                    o[O_EG + 2] == np.float32(hn[O_EG + 2])):
+            if not (o[O_EG] == np.float32(hn[O_EG]) and o[O_EG + 1] == np.float32(hn[O_EG + 1])
+                    and o[O_EG + 2] == np.float32(hn[O_EG + 2])):
                 print(f"FAIL norm {name} chunk {j}: eg/b/scale changed")
                 failures += 1
         if not np.any(hn[0:S_V]) and np.any(got[:, S_V:2 * S_V] != 0.0):

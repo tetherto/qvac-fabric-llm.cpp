@@ -41,6 +41,8 @@ t_ty = np.ndarray[(TB,), np.dtype[np.uint8]]
 b_ty = np.ndarray[(KS * N_CORE,), np.dtype[bf16]]
 a_ty = np.ndarray[(M * KS,), np.dtype[bf16]]
 c_ty = np.ndarray[(M * N_CORE,), np.dtype[np.float32]]
+
+
 def make_mm():
     return akernels.mm(M, KS, N_CORE, input_dtype=bf16, output_dtype=np.float32,
                        vectorized=True, emulate_bf16_mmul_with_bfp16=BFP)
@@ -166,7 +168,7 @@ print(f"{FMT} K={K} {'bfp16' if BFP else 'bf16'}: rel rms err {rel:.3e}, "
 print("PASS" if rel < (2e-2 if BFP else 2e-3) else "FAIL")
 
 # timing: the same call repeated; a step is 64 x 128 x 64 MACs
-import time
+import time  # noqa: E402
 ITERS = 20
 ts = []
 for _ in range(ITERS):
