@@ -1238,13 +1238,26 @@ xdna_kernel * xdna_kernel_pool_get_built(xdna_kernel_pool *  pool,
                                          size_t              n_words) {
     std::lock_guard<std::mutex> lock(pool->kernel_mutex);
 
-    auto it = pool->kernels.find(name);
+    // Keyed by the stream as well as the name: a name does not say everything
+    // a stream was built with (the head's leaves out the row length, so a
+    // second model's head ran the first one's stream and the array hung), and
+    // a caller handed another stream bound under its name runs its buffers
+    // through that one. Identical streams still share a kernel.
+    uint64_t h = 1469598103934665603ull;
+    for (size_t i = 0; i < n_words; i++) {
+        h = (h ^ insts[i]) * 1099511628211ull;
+    }
+    char hs[24];
+    snprintf(hs, sizeof(hs), "#%016llx", (unsigned long long) h);
+    const std::string key = name + hs;
+
+    auto it = pool->kernels.find(key);
     if (it != pool->kernels.end()) {
         return it->second;
     }
 
     // nullptr is sticky: a failed lookup is not retried.
-    pool->kernels[name] = nullptr;
+    pool->kernels[key] = nullptr;
 
     // `xclbin_name` is the artifact stem; resolve it to a real path.
     xdna_kernel * kern = xdna_kernel_find(pool->device, xclbin_name);
@@ -1256,7 +1269,7 @@ xdna_kernel * xdna_kernel_pool_get_built(xdna_kernel_pool *  pool,
         xdna_kernel_free(kern);
         return nullptr;
     }
-    pool->kernels[name] = kern;
+    pool->kernels[key] = kern;
     return kern;
 }
 
