@@ -22631,6 +22631,12 @@ static ggml_backend_t ggml_backend_vk_device_init(ggml_backend_dev_t dev, const 
     return ggml_backend_vk_init(ctx->device);
 }
 
+// Shaders without misalignment offsets address their buffers from the bound
+// offset, so a view that starts inside a storage-buffer alignment unit cannot be bound.
+static bool ggml_vk_view_offset_aligned(const vk_device & device, const ggml_tensor * t) {
+    return (t->view_offs & (device->properties.limits.minStorageBufferOffsetAlignment - 1)) == 0;
+}
+
 static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
     ggml_backend_vk_device_context * ctx = (ggml_backend_vk_device_context *)dev->context;
     const vk_device& device = ggml_vk_get_device(ctx->device);
@@ -23342,7 +23348,10 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
             return op->src[0]->type == GGML_TYPE_F32;
         case GGML_OP_CONV_2D_DW:
             return (op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_F16)
-                && op->src[1]->type == GGML_TYPE_F32;
+                && op->src[1]->type == GGML_TYPE_F32
+                && ggml_vk_view_offset_aligned(device, op->src[0])
+                && ggml_vk_view_offset_aligned(device, op->src[1])
+                && ggml_vk_view_offset_aligned(device, op);
         case GGML_OP_POOL_1D:
             return ggml_is_contiguous(op->src[0]) && op->src[0]->type == GGML_TYPE_F32;
         case GGML_OP_POOL_2D:
