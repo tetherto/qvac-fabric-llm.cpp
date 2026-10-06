@@ -2082,6 +2082,10 @@ MUL_MV_MMA_GEN("q5_0", block_q5_0, 2,     dequantize_q5_0)
 MUL_MV_MMA_GEN("q5_1", block_q5_1, 2,     dequantize_q5_1)
 MUL_MV_MMA_GEN("q4_K", block_q4_K, QK_NL, dequantize_q4_K)
 MUL_MV_MMA_GEN("q6_K", block_q6_K, QK_NL, dequantize_q6_K)
+MUL_MV_MMA_GEN("pq2_0", block_pq2_0, 8,   dequantize_pq2_0)
+#if defined(GGML_METAL_HAS_BF16)
+MUL_MV_MMA_GEN("bf16", bfloat4x4,  1,     dequantize_bf16)
+#endif
 
 #undef MUL_MV_MMA_GEN
 
