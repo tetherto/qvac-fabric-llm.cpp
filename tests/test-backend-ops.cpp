@@ -14136,6 +14136,25 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {16, 1},  1025,  64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 2, 1, 3}));
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {16, 1}, 16384,   1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
 
+    // few query rows at long KV with grouped-query heads: backends may run the heads that share a KV head together
+    for (int64_t hs : { 64, 128, 256 }) {
+        for (int64_t nr2 : { 1, 2, 4, 6, 8 }) {
+            for (int64_t kv : { 1056, 4100 }) {
+                for (int64_t nb : { 1, 2, 3, 5, 8, 19 }) {
+                    test_cases.emplace_back(new test_flash_attn_ext(hs, hs, 2, {nr2, 1}, kv, nb, true, nb % 2 == 1, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+                }
+            }
+        }
+    }
+    for (int64_t nb : { 1, 4 }) {
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 1025, nb, true,  false, 8.0f,  0.0f, GGML_PREC_F32, GGML_TYPE_F16,  GGML_TYPE_F16));
+        test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {6, 1}, 1025, nb, true,  false, 0.0f, 10.0f, GGML_PREC_F32, GGML_TYPE_F16,  GGML_TYPE_F16));
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 2}, 1025, nb, true,  true,  0.0f,  0.0f, GGML_PREC_F32, GGML_TYPE_F16,  GGML_TYPE_F16));
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 4100, nb, true,  false, 0.0f,  0.0f, GGML_PREC_F32, GGML_TYPE_F16,  GGML_TYPE_F16, {0, 2, 1, 3}));
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 4100, nb, true,  false, 0.0f,  0.0f, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
+        test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {8, 1}, 4100, nb, false, false, 0.0f,  0.0f, GGML_PREC_F32, GGML_TYPE_F16,  GGML_TYPE_F16));
+    }
+
     // MLA shape: the V cache is a sub-view of the K cache, with quantized KV
     test_cases.emplace_back(new test_flash_attn_ext(576, 512, 1, {8, 1},  113,   1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, true));
     test_cases.emplace_back(new test_flash_attn_ext(576, 512, 1, {8, 1}, 1024,   1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, true));

@@ -1080,6 +1080,7 @@ constant int32_t FC_flash_attn_ext_vec_ns20 [[function_constant(FC_FLASH_ATTN_EX
 constant int32_t FC_flash_attn_ext_vec_nsg  [[function_constant(FC_FLASH_ATTN_EXT_VEC + 22)]];
 constant int32_t FC_flash_attn_ext_vec_nwg  [[function_constant(FC_FLASH_ATTN_EXT_VEC + 23)]];
 constant bool    FC_flash_attn_ext_vec_has_sparse [[function_constant(FC_FLASH_ATTN_EXT_VEC + 5)]];
+constant int32_t FC_flash_attn_ext_vec_nhptg [[function_constant(FC_FLASH_ATTN_EXT_VEC + 24)]];
 
 // compress the finite entries of each KQ mask row into a list of KV indices (ascending order),
 // padded with -1 up to n_kv_max_padded (a multiple of OP_FLASH_ATTN_EXT_VEC_NCPSG)
@@ -1219,20 +1220,26 @@ kernel void kernel_flash_attn_ext_vec(
         threadgroup  half * shmem_f16 [[threadgroup(0)]],
         uint3   tgpig[[threadgroup_position_in_grid]],
         ushort  tiisg[[thread_index_in_simdgroup]],
-        ushort  sgitg[[simdgroup_index_in_threadgroup]]) {
+        ushort  sgitg_tg[[simdgroup_index_in_threadgroup]]) {
     static_assert(DK % 32 == 0, "DK must be divisible by 32");
     static_assert(DV % 32 == 0, "DV must be divisible by 32");
 
-#define NWG  (FC_flash_attn_ext_vec_nwg)
-#define NSG  (FC_flash_attn_ext_vec_nsg)
+#define NWG   (FC_flash_attn_ext_vec_nwg)
+#define NSG   (FC_flash_attn_ext_vec_nsg)
+#define NHPTG (FC_flash_attn_ext_vec_nhptg)
 
 #define NS10 (FC_flash_attn_ext_vec_ns10)
 #define NS20 (FC_flash_attn_ext_vec_ns20)
 
     const short iwg = tgpig[2]%NWG;
 
+    // the threadgroup holds NHPTG heads that share a KV head, each with its own NSG simdgroups and shared memory
+    // (with one head, the indices stay the hardware values so the shared memory offsets fold at compile time)
+    const ushort ihg   = NHPTG > 1 ? sgitg_tg/NSG : 0;
+    const ushort sgitg = NHPTG > 1 ? sgitg_tg%NSG : sgitg_tg;
+
     const ushort iq3 = tgpig[2]/NWG;
-    const ushort iq2 = tgpig[1];
+    const ushort iq2 = tgpig[1]*NHPTG + ihg;
     const ushort iq1 = tgpig[0];
 
     constexpr short DK4 = DK/4;
@@ -1250,6 +1257,8 @@ kernel void kernel_flash_attn_ext_vec(
 
     static_assert(DK4 % NL == 0, "DK4 must be divisible by NL");
     static_assert(DV4 % NL == 0, "DV4 must be divisible by NL");
+
+    shmem_f16 += ihg*(Q*NSG*PK + NSG*SH + 2*NSG*Q*PV);
 
   //const short T = PK + NSG*SH; // shared memory size per query in (half)
 
@@ -1294,10 +1303,12 @@ kernel void kernel_flash_attn_ext_vec(
         }
     }
 
-    // zero out so
-    for (short qq = 0; qq < Q; ++qq) {
-        for (short i = 0; i < DV4/NL; ++i) {
-            so4[qq*DV4 + i*NL] = (o4_t) 0.0f;
+    // zero out so (lanes past NL would index beyond the last row, into the next head's shared memory)
+    if (tiisg < NL) {
+        for (short qq = 0; qq < Q; ++qq) {
+            for (short i = 0; i < DV4/NL; ++i) {
+                so4[qq*DV4 + i*NL] = (o4_t) 0.0f;
+            }
         }
     }
 
@@ -1801,6 +1812,7 @@ kernel void kernel_flash_attn_ext_vec(
 
 #undef NWG
 #undef NSG
+#undef NHPTG
 #undef NS10
 #undef NS20
 }

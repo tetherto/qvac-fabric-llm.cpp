@@ -248,6 +248,7 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_att
         int32_t ne,
         int32_t nsg,
         int32_t nwg,
+        int32_t nhptg,
         bool    use_kv_f16,
         int32_t ns10,
         int32_t ns20);
