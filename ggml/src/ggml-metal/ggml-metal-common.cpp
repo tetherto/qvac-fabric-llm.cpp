@@ -74,6 +74,22 @@ static bool ggml_metal_mul_mv_mma_type_supported(enum ggml_type type) {
         case GGML_TYPE_Q4_K:
         case GGML_TYPE_Q5_K:
         case GGML_TYPE_Q6_K:
+        case GGML_TYPE_BF16:
+        case GGML_TYPE_Q1_0:
+        case GGML_TYPE_Q2_0:
+        case GGML_TYPE_MXFP4:
+        case GGML_TYPE_Q2_K:
+        case GGML_TYPE_Q3_K:
+        case GGML_TYPE_IQ2_XXS:
+        case GGML_TYPE_IQ2_XS:
+        case GGML_TYPE_IQ2_S:
+        case GGML_TYPE_IQ3_XXS:
+        case GGML_TYPE_IQ3_S:
+        case GGML_TYPE_IQ1_S:
+        case GGML_TYPE_IQ1_M:
+        case GGML_TYPE_IQ4_NL:
+        case GGML_TYPE_IQ4_XS:
+        case GGML_TYPE_TQ2_0:
             return true;
         default:
             return false;
@@ -94,6 +110,23 @@ static bool ggml_metal_mul_mat_mma_type_ok(const struct ggml_tensor * op) {
     return step > 0 && src0->ne[0] % step == 0 && src0->nb[0] == ggml_type_size(src0->type);
 }
 
+// the fewest src1 rows of the few-row MMA kernels; the types that start past 2 beat the mat-vec kernels only from there (measured on an M3 Ultra)
+static int64_t ggml_metal_mul_mv_mma_rows_min(enum ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_TQ2_0:
+            return 5;
+        case GGML_TYPE_BF16:
+            return 4;
+        case GGML_TYPE_Q2_0:
+        case GGML_TYPE_Q2_K:
+        case GGML_TYPE_IQ4_NL:
+        case GGML_TYPE_MXFP4:
+            return 3;
+        default:
+            return 2;
+    }
+}
+
 static bool ggml_metal_mul_mat_mma_shape_ok(const struct ggml_tensor * op) {
     const ggml_tensor * src0 = op->src[0];
     const ggml_tensor * src1 = op->src[1];
@@ -102,7 +135,7 @@ static bool ggml_metal_mul_mat_mma_shape_ok(const struct ggml_tensor * op) {
     const bool batch_ok = src1->ne[2] <= INT16_MAX && src1->ne[2]/src0->ne[2] <= INT16_MAX && src1->ne[3]/src0->ne[3] <= INT16_MAX;
 
     return ggml_metal_mul_mat_mma_type_ok(op) && batch_ok &&
-        src1->type == GGML_TYPE_F32 && src1->ne[1] >= 2 && src1->ne[1] <= GGML_METAL_MMA_ROWS_MAX &&
+        src1->type == GGML_TYPE_F32 && src1->ne[1] >= ggml_metal_mul_mv_mma_rows_min(src0->type) && src1->ne[1] <= GGML_METAL_MMA_ROWS_MAX &&
         !ggml_is_transposed(src0) && !ggml_is_transposed(src1) &&
         src1->nb[0] == sizeof(float) && src1->nb[1] % 16 == 0 && src1->nb[2] % 16 == 0 && src1->nb[3] % 16 == 0;
 }
