@@ -22,6 +22,7 @@
 
 #include <algorithm>
 #include <climits>
+#include <sys/resource.h>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -559,6 +560,18 @@ struct xdna_rec_session;
 
 namespace {
 
+// The fused decode objects built from one model's weights: the context's
+// fields of the same names hold those of the model whose graph computes, and
+// every other model's wait in `parked` (xdna_model_use).
+struct xdna_model_objs {
+    std::map<std::pair<int, int64_t>, struct xdna_rec_session *> rec;
+    std::map<int, struct xdna_rec_tail *>                        tails;
+    std::map<int, struct xdna_att_layer *>                       att_layers;
+    struct xdna_head *                                           head       = nullptr;
+    bool                                                         head_tried = false;
+    struct xdna_buffer *                                         res        = nullptr;
+};
+
 // Process-wide context shared by all backend instances.
 struct ggml_backend_xdna_context {
     xdna_device *      device = nullptr;
@@ -587,8 +600,10 @@ struct ggml_backend_xdna_context {
     // sessions and their buffers, the prefill runners - is per process: two
     // llama contexts computing at once raced on all of it (one found the
     // other's in-projection buffer gone). The array runs one command stream at
-    // a time anyway, so this costs nothing a single context had.
-    std::mutex compute_mutex;
+    // a time anyway, so this costs nothing a single context had. Recursive: a
+    // model's weights freed from inside a graph come back through the buffer's
+    // free (xdna_model_drop).
+    std::recursive_mutex compute_mutex;
     // The backend whose graph is computing (under compute_mutex).
     ggml_backend_t cur_backend = nullptr;
     // Attention-layer tails (attn_output + the FFN, one dispatch), per layer.
@@ -645,6 +660,14 @@ struct ggml_backend_xdna_context {
     // decode; `head_tried` so a failure is not retried every token.
     struct xdna_head *         head       = nullptr;
     bool                       head_tried = false;
+    // Whose fused objects the fields above hold: the buffer of the model's
+    // weights (xdna_graph_model), null for weights outside the backend's
+    // buffers. Every other model's are parked here; each goes with its
+    // weights' buffer (xdna_hb_free).
+    const void *                           cur_model = nullptr;
+    std::map<const void *, xdna_model_objs> parked;
+    // Models already told their buffers did not fit (one warning each).
+    std::set<const void *>                 warned_mem;
     // The node the dispatch loop is on, so the exception boundary in
     // ggml_backend_xdna_graph_compute can name it. Null outside a graph.
     const struct ggml_tensor * cur_node   = nullptr;
@@ -2570,6 +2593,36 @@ static void xdna_kernels_warm(xdna_kernel_pool * pool, const xdna_ops * ops, std
     warm_names("gemm_bf16_f32");
 }
 
+// The memlock limit, the usual reason an NPU buffer does not fit (the
+// xdna-driver README sets it unlimited).
+static std::string xdna_memlock_str() {
+    struct rlimit rl {};
+    if (getrlimit(RLIMIT_MEMLOCK, &rl) != 0) {
+        return "memlock limit unknown";
+    }
+    if (rl.rlim_cur == RLIM_INFINITY) {
+        return "memlock unlimited";
+    }
+    return "memlock limit " + std::to_string((unsigned long long) rl.rlim_cur >> 20) + " MiB";
+}
+
+// MemAvailable, in MiB; -1 when it cannot be read.
+static long xdna_mem_available_mib() {
+    FILE * f = fopen("/proc/meminfo", "r");
+    if (!f) {
+        return -1;
+    }
+    char line[256];
+    long kb = -1;
+    while (fgets(line, sizeof(line), f)) {
+        if (sscanf(line, "MemAvailable: %ld kB", &kb) == 1) {
+            break;
+        }
+    }
+    fclose(f);
+    return kb < 0 ? -1 : kb / 1024;
+}
+
 static ggml_backend_xdna_context * ggml_xdna_device_context(void) {
     static ggml_backend_xdna_context ctx;
     static std::once_flag            once;
@@ -2610,13 +2663,17 @@ static void xdna_rec_session_free(xdna_rec_session * s) {
     delete s;
 }
 
-// Release what was built from a model: the fused-layer sessions (their device
-// state, their packed weights, and host pointers into the model's tensors),
-// the per-op kernels' packed weights, the prefill GEMM's packed weights and
-// the prefill attention's K/V copies, and the decode arena their buffers were
-// carved out of. The kernel pool stays.
-static void xdna_release_model_state(ggml_backend_xdna_context * ctx) {
-    const size_t n = ctx->rec.size();
+static void xdna_model_objs_swap(ggml_backend_xdna_context * ctx, xdna_model_objs & o) {
+    std::swap(ctx->rec, o.rec);
+    std::swap(ctx->tails, o.tails);
+    std::swap(ctx->att_layers, o.att_layers);
+    std::swap(ctx->head, o.head);
+    std::swap(ctx->head_tried, o.head_tried);
+    std::swap(ctx->res, o.res);
+}
+
+// Free the current model's fused objects (the context's fields).
+static void xdna_model_objs_free(ggml_backend_xdna_context * ctx) {
     xdna_pending_wait(ctx);
     for (auto & kv : ctx->rec) {
         xdna_rec_session_free(kv.second);
@@ -2630,17 +2687,122 @@ static void xdna_release_model_state(ggml_backend_xdna_context * ctx) {
         xdna_att_layer_free(kv.second);
     }
     ctx->att_layers.clear();
-    xdna_att_free(ctx->att);
-    ctx->att = nullptr;
-    ctx->att_flushed.clear();
     xdna_head_free(ctx->head);
     ctx->head       = nullptr;
     ctx->head_tried = false;
     xdna_buffer_free(ctx->res);
-    ctx->res            = nullptr;
-    ctx->res_lout       = nullptr;
-    ctx->res_resid      = nullptr;
-    ctx->res_dirty      = false;
+    ctx->res       = nullptr;
+    ctx->res_lout  = nullptr;
+    ctx->res_resid = nullptr;
+    ctx->res_dirty = false;
+}
+
+// The weights of the graph's model: the backend buffer of the first weight
+// it reads that lives in one of the backend's own buffers (the token
+// embeddings, read first, usually stay in a CPU one). Several models in
+// one process each get their fused objects built from their own weights; a
+// model whose weights are elsewhere shares the null key.
+static void xdna_hb_free(ggml_backend_buffer_t buffer);
+
+static const void * xdna_graph_model(const ggml_cgraph * cgraph) {
+    for (int i = 0; i < cgraph->n_nodes; i++) {
+        const ggml_tensor * n = cgraph->nodes[i];
+        for (int k = 0; k < GGML_MAX_SRC && n->src[k]; k++) {
+            const ggml_tensor *   t = n->src[k]->view_src ? n->src[k]->view_src : n->src[k];
+            ggml_backend_buffer_t b = t->buffer;
+            if (b && b->iface.free_buffer == xdna_hb_free &&
+                ggml_backend_buffer_get_usage(b) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
+                return b;
+            }
+        }
+    }
+    return nullptr;
+}
+
+// Put the fused objects of `model` in the context's fields, parking the ones
+// there.
+static void xdna_model_use(ggml_backend_xdna_context * ctx, const void * model) {
+    if (model == ctx->cur_model) {
+        return;
+    }
+    xdna_pending_wait(ctx);
+    xdna_model_objs_swap(ctx, ctx->parked[ctx->cur_model]);
+    const auto it = ctx->parked.find(model);
+    if (it != ctx->parked.end()) {
+        xdna_model_objs_swap(ctx, it->second);
+        ctx->parked.erase(it);
+    }
+    ctx->cur_model = model;
+}
+
+// A model's weights are going: so are the fused objects built from them.
+// What they took from the arena stays carved out until the last backend
+// releases it.
+static void xdna_model_drop(ggml_backend_xdna_context * ctx, const void * model) {
+    std::lock_guard<std::recursive_mutex> compute(ctx->compute_mutex);
+    if (model == ctx->cur_model) {
+        xdna_model_objs_free(ctx);
+        return;
+    }
+    const auto it = ctx->parked.find(model);
+    if (it == ctx->parked.end()) {
+        return;
+    }
+    xdna_model_objs_swap(ctx, it->second);
+    xdna_model_objs_free(ctx);
+    xdna_model_objs_swap(ctx, it->second);
+    ctx->parked.erase(it);
+}
+
+// The models whose fused objects the context holds, the current one included.
+static int xdna_models_loaded(const ggml_backend_xdna_context * ctx) {
+    int n = ctx->cur_model ? 1 : 0;
+    for (const auto & kv : ctx->parked) {
+        n += kv.first != nullptr;
+    }
+    return std::max(n, 1);
+}
+
+// An NPU buffer of this graph's model could not be allocated: say so once per
+// model, and whether the graph got past it.
+static void xdna_warn_no_room(ggml_backend_xdna_context * ctx, bool ok) {
+    if (!ctx->warned_mem.insert(ctx->cur_model).second) {
+        return;
+    }
+    const std::string lim = xdna_memlock_str();
+    const long        mib = xdna_mem_available_mib();
+    const int         n   = xdna_models_loaded(ctx);
+    if (ok) {
+        GGML_LOG_WARN(
+            "%s: not all of this model's NPU buffers fit (%s, %ld MiB of RAM available, %d model(s) loaded); "
+            "what did not fit runs on the host, slower\n",
+            "ggml-xdna", lim.c_str(), mib, n);
+    } else {
+        GGML_LOG_ERROR(
+            "%s: out of memory for this model's NPU buffers (%s, %ld MiB of RAM available, %d model(s) "
+            "loaded); the graph failed. Load fewer or smaller models, or a smaller context or batch\n",
+            "ggml-xdna", lim.c_str(), mib, n);
+    }
+}
+
+// Release what was built from a model: the fused-layer sessions (their device
+// state, their packed weights, and host pointers into the model's tensors),
+// the per-op kernels' packed weights, the prefill GEMM's packed weights and
+// the prefill attention's K/V copies, and the decode arena their buffers were
+// carved out of. The kernel pool stays.
+static void xdna_release_model_state(ggml_backend_xdna_context * ctx) {
+    size_t n = ctx->rec.size();
+    xdna_model_objs_free(ctx);
+    for (auto & kv : ctx->parked) {
+        n += kv.second.rec.size();
+        xdna_model_objs_swap(ctx, kv.second);
+        xdna_model_objs_free(ctx);
+    }
+    ctx->parked.clear();
+    ctx->cur_model = nullptr;
+    xdna_att_free(ctx->att);
+    ctx->att = nullptr;
+    ctx->att_flushed.clear();
     ctx->pending_failed = false;
     xdna_ops_release_weights(&ctx->ops);
     xdna_attn_mm_release();
@@ -2657,18 +2819,24 @@ static void ggml_backend_xdna_free(ggml_backend_t backend) {
     ggml_backend_xdna_context * ctx = (ggml_backend_xdna_context *) backend->context;
     // Its sequences' state has nowhere to go back to: the cache goes with it.
     {
-        std::lock_guard<std::mutex> compute(ctx->compute_mutex);
-        for (auto & kv : ctx->rec) {
-            if (kv.second && kv.second->owner == backend) {
-                kv.second->seeded = false;
-                kv.second->owner  = nullptr;
+        std::lock_guard<std::recursive_mutex> compute(ctx->compute_mutex);
+        const auto drop = [backend](std::map<std::pair<int, int64_t>, xdna_rec_session *> & rec) {
+            for (auto & kv : rec) {
+                if (kv.second && kv.second->owner == backend) {
+                    kv.second->seeded = false;
+                    kv.second->owner  = nullptr;
+                }
             }
+        };
+        drop(ctx->rec);
+        for (auto & kv : ctx->parked) {
+            drop(kv.second.rec);
         }
     }
     {
         std::lock_guard<std::mutex> lock(ctx->life_mutex);
         if (--ctx->n_backends == 0) {
-            std::lock_guard<std::mutex> compute(ctx->compute_mutex);
+            std::lock_guard<std::recursive_mutex> compute(ctx->compute_mutex);
             xdna_release_model_state(ctx);
         }
     }
@@ -2840,6 +3008,7 @@ static enum ggml_status xdna_graph_compute_impl(ggml_backend_xdna_context * ctx,
     // the prefill GEMM's activation layouts belong to the graph that laid them
     // out, so every graph starts a new one, whatever its token count
     xdna_pgemm_graph_begin();
+    xdna_model_use(ctx, xdna_graph_model(cgraph));
     if (g_glue_n_tokens > 1) {
         // a prefill rewrites cache rows: flush them all again before the pool reads them
         ctx->att_flushed.clear();
@@ -4014,10 +4183,14 @@ static enum ggml_status xdna_graph_compute_impl(ggml_backend_xdna_context * ctx,
 // impl's early returns and RAII timers keep their semantics inside.
 static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
     ggml_backend_xdna_context * ctx = (ggml_backend_xdna_context *) backend->context;
-    std::lock_guard<std::mutex>  compute(ctx->compute_mutex);
+    std::lock_guard<std::recursive_mutex> compute(ctx->compute_mutex);
     ctx->cur_backend = backend;
     try {
+        const int               failed = xdna_buffer_alloc_failures();
         const enum ggml_status status = xdna_graph_compute_impl(ctx, cgraph);
+        if (xdna_buffer_alloc_failures() != failed) {
+            xdna_warn_no_room(ctx, status == GGML_STATUS_SUCCESS);
+        }
         ctx->cur_node                 = nullptr;
         ctx->cur_index                = -1;
         return status;
@@ -4209,6 +4382,9 @@ xdna_buffer * xdna_host_bo_of(const void * p, size_t * offset) {
 
 static void xdna_hb_free(ggml_backend_buffer_t buffer) {
     xdna_buffer * bo = (xdna_buffer *) buffer->context;
+    if (ggml_backend_buffer_get_usage(buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
+        xdna_model_drop(ggml_xdna_device_context(), buffer);
+    }
     {
         std::lock_guard<std::mutex> lk(xdna_host_bo_mu());
         xdna_host_bos().erase((uintptr_t) bo->data);
@@ -4284,6 +4460,10 @@ static ggml_backend_buffer_t xdna_hbt_alloc(ggml_backend_buffer_type_t buft, siz
     // A zero-size buffer is legal in ggml; a BO is not.
     xdna_buffer * bo = ctx && ctx->device ? xdna_buffer_alloc(ctx->device, std::max<size_t>(size, 4096)) : nullptr;
     if (!bo) {
+        if (ctx && ctx->device) {
+            GGML_LOG_WARN("%s: a %zu MiB buffer does not fit in NPU memory (%s); it is plain host memory instead\n",
+                          "ggml-xdna", size >> 20, xdna_memlock_str().c_str());
+        }
         return ggml_backend_buft_alloc_buffer(ggml_backend_cpu_buffer_type(), size);
     }
     {
