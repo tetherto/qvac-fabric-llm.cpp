@@ -2802,11 +2802,12 @@ static enum ggml_status xdna_graph_compute_impl(ggml_backend_xdna_context * ctx,
 
     // Size the host-fallback pool for this chunk (xdna_glue_threads).
     xdna_glue_set_n_tokens(cgraph);
+    // the prefill GEMM's activation layouts belong to the graph that laid them
+    // out, so every graph starts a new one, whatever its token count
+    xdna_pgemm_graph_begin();
     if (g_glue_n_tokens > 1) {
         // a prefill rewrites cache rows: flush them all again before the pool reads them
         ctx->att_flushed.clear();
-        // and the prefill GEMM's activation layouts were the last graph's
-        xdna_pgemm_graph_begin();
         // as is the attention mask the prefill attention checked
         xdna_attn_mm_graph_begin();
     }
