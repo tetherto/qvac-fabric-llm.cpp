@@ -134,6 +134,15 @@ bool ggml_metal_mul_mat_use_nc(const struct ggml_tensor * op) {
     return op->src[0]->type == GGML_TYPE_Q4_0 && op->src[1]->ne[1] == N_NC_Q4_0;
 }
 
+bool ggml_metal_mul_mat_mv_may_add(const struct ggml_tensor * op) {
+    return op->src[0]->type == GGML_TYPE_PQ2_0 && op->src[1]->type == GGML_TYPE_F32 &&
+        ggml_get_op_params_i32(op, 1) != GGML_HINT_SRC0_IS_HADAMARD;
+}
+
+bool ggml_metal_mul_mat_mv_use_add(const struct ggml_tensor * op) {
+    return ggml_metal_mul_mat_mv_may_add(op) && op->src[1]->ne[1] == 1;
+}
+
 // true if t is or views a tensor in a buffer marked as weights, such as a bias; the model loader marks its buffers before
 // any graph is optimized, and tensors in unmarked or not yet allocated buffers count as non-weights in both phases
 static bool ggml_metal_tensor_is_weight(const struct ggml_tensor * t) {

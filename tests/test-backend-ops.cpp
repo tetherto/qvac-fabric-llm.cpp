@@ -9389,6 +9389,30 @@ struct test_mul_mat_add : public test_case {
     const int64_t k;
     const mul_mat_add_mode mode;
 
+    static constexpr const char * fusion_label = "MUL_MAT+ADD";
+
+    // Metal adds the residual in the one-row PQ2_0 mat-vec store unless the sum overwrites the mat-vec input
+    mutable bool metal_label = false;
+
+    bool metal_mv_fuses() const {
+        return type_a == GGML_TYPE_PQ2_0 && n == 1 && mode != MUL_MAT_ADD_B_INPLACE;
+    }
+
+    uint64_t fusion_count(ggml_backend_t backend) override {
+        const bool metal = strcmp(ggml_backend_reg_name(ggml_backend_dev_backend_reg(ggml_backend_get_device(backend))), "MTL") == 0;
+        const int64_t count = metal ? backend_fusion_label_count(backend, fusion_label) : -1;
+        metal_label = count >= 0;
+        return metal_label ? (uint64_t) count : 0;
+    }
+
+    bool expect_fusion() override {
+        return metal_label && metal_mv_fuses();
+    }
+
+    bool expect_no_fusion() override {
+        return metal_label && type_a == GGML_TYPE_PQ2_0 && n == 1 && mode == MUL_MAT_ADD_B_INPLACE;
+    }
+
     test_mul_mat_add(ggml_type type_a, int64_t m, int64_t n, int64_t k, mul_mat_add_mode mode = MUL_MAT_ADD_MM_RES)
         : type_a(type_a), m(m), n(n), k(k), mode(mode) {
         GGML_ASSERT(mode != MUL_MAT_ADD_B_INPLACE || m == k);
@@ -9413,6 +9437,11 @@ struct test_mul_mat_add : public test_case {
         ggml_tensor * a   = ggml_new_tensor_2d(ctx, type_a,        k, m);
         ggml_tensor * b   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
         ggml_tensor * res = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, m, mode == MUL_MAT_ADD_ROW ? 1 : n);
+
+        if (mode == MUL_MAT_ADD_B_INPLACE) {
+            // as in a model graph, the sum overwrites an activation, not a graph leaf
+            b = ggml_scale(ctx, b, 0.5f);
+        }
 
         ggml_tensor * mm  = ggml_mul_mat(ctx, a, b);
         ggml_tensor * out = nullptr;
@@ -13007,6 +13036,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_repeat_mul_view({8,  16, 4, 7}, side, 0));
         test_cases.emplace_back(new test_repeat_mul_view({32, 40, 4, 9}, side, 3));
     }
+
+    // one src1 row: the PQ2_0 mat-vec store adds the residual, at a row tail and at a Bonsai-2 projection shape
+    for (mul_mat_add_mode mode : {MUL_MAT_ADD_MM_RES, MUL_MAT_ADD_RES_MM, MUL_MAT_ADD_ROW, MUL_MAT_ADD_RES_INPLACE}) {
+        test_cases.emplace_back(new test_mul_mat_add(GGML_TYPE_PQ2_0, 1000, 1, 1024, mode));
+    }
+    test_cases.emplace_back(new test_mul_mat_add(GGML_TYPE_PQ2_0, 2048, 1, 2048, MUL_MAT_ADD_B_INPLACE));
+    test_cases.emplace_back(new test_mul_mat_add(GGML_TYPE_PQ2_0, 5120, 1, 6144));
 
     // few src1 rows (speculative verify): odd m, a single K block, long K, every tile width, broadcast batches
     for (int64_t n : {2, 3, 5, 8, 9, 13, 16}) {

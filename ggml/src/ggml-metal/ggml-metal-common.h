@@ -80,6 +80,11 @@ bool ggml_metal_mul_mat_use_mma(const struct ggml_tensor * op, bool has_native_s
 bool ggml_metal_mul_mat_may_use_mma(const struct ggml_tensor * op, bool has_native_simdgroup_mm, bool has_tensor);
 // true if the 2-row Q4_0 kernel takes mat-mul op instead of the MMA kernels
 bool ggml_metal_mul_mat_use_nc(const struct ggml_tensor * op);
+// true if the types and the hadamard hint of mat-mul op allow a mat-vec kernel that adds a residual in its store. it
+// reads no shapes, like ggml_metal_mul_mat_may_use_mma
+bool ggml_metal_mul_mat_mv_may_add(const struct ggml_tensor * op);
+// true if mat-mul op runs on a mat-vec kernel that can add a residual in its store (one src1 row)
+bool ggml_metal_mul_mat_mv_use_add(const struct ggml_tensor * op);
 // the f32 operand that f32 add sums with mat-mul mm, if mm is exactly one of its operands and the other one is not a
 // weight (a bias), else NULL. it reads no shapes, so it gives the same answer for every batch size
 const struct ggml_tensor * ggml_metal_mul_mat_add_operand(const struct ggml_tensor * mm, const struct ggml_tensor * add);

@@ -420,7 +420,8 @@ static bool ggml_metal_fusion_check_mul_mat_add(
     const ggml_tensor * add = nodes[1];
 
     if (ggml_metal_mul_mat_add_operand(mm, add) == nullptr ||
-        !ggml_metal_mul_mat_may_use_mma(mm, props->supports_gpu_family_apple7, props->has_tensor)) {
+        !(ggml_metal_mul_mat_may_use_mma(mm, props->supports_gpu_family_apple7, props->has_tensor) ||
+          ggml_metal_mul_mat_mv_may_add(mm))) {
         return false;
     }
 
@@ -430,8 +431,11 @@ static bool ggml_metal_fusion_check_mul_mat_add(
 
     const ggml_tensor * res = ggml_metal_mul_mat_add_residual(mm, add);
 
-    if (res == nullptr || ggml_metal_mul_mat_use_nc(mm) ||
-        !ggml_metal_mul_mat_use_mma(mm, props->supports_gpu_family_apple7, props->has_tensor)) {
+    const bool store_adds = ggml_metal_mul_mat_use_mma(mm, props->supports_gpu_family_apple7, props->has_tensor)
+        ? !ggml_metal_mul_mat_use_nc(mm)
+        : ggml_metal_mul_mat_mv_use_add(mm);
+
+    if (res == nullptr || !store_adds) {
         return false;
     }
 

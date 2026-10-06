@@ -265,6 +265,7 @@ constant short FC_mul_mv_r2    [[function_constant(FC_MUL_MV + 3)]];
 constant short FC_mul_mv_r3    [[function_constant(FC_MUL_MV + 4)]];
 constant bool  FC_mul_mv_split [[function_constant(FC_MUL_MV + 5)]];
 constant short FC_mul_mv_id_has_scale [[function_constant(FC_MUL_MV + 6)]];
+constant bool  FC_mul_mv_add   [[function_constant(FC_MUL_MV + 7)]];
 
 template<typename block_q_type, short NR0, typename args_t>
 void mul_vec_q_n_f32_impl(
@@ -847,13 +848,14 @@ inline float pq2_0_dot_lanes(device const block_pq2_0 * qb, float sumy, thread c
 }
 
 // nr0 rows of nmat PQ2_0 matrices times one src1 row. With nmat == 2 the matrices are an up/gate pair sharing the
-// activation and the output is the fused SWIGLU silu(gate)*up.
-template<int nr0, short nmat, typename args_t>
+// activation and the output is the fused SWIGLU silu(gate)*up; with add_res the store adds the same-shape residual src2.
+template<int nr0, short nmat, bool add_res, typename args_t>
 void kernel_mul_mv_pq2_0_f32_nmat_impl(
         args_t args,
         device const char * src0,
         device const char * src0_gate,
         device const char * src1,
+        device const char * src2,
         device       char * dst,
         uint3  tgpig,
         ushort tiisg,
@@ -910,7 +912,10 @@ void kernel_mul_mv_pq2_0_f32_nmat_impl(
         yb += QK_PQ2_0 * (N_SIMDWIDTH/8);
     }
 
-    device float * dst_f32 = (device float *) dst + (uint64_t)im*args.ne0*args.ne1 + (uint64_t)r1*args.ne0;
+    const uint64_t offset_dst = (uint64_t)im*args.ne0*args.ne1 + (uint64_t)r1*args.ne0;
+
+    device       float * dst_f32 = (device       float *) dst + offset_dst;
+    device const float * res_f32 = add_res ? (device const float *) src2 + offset_dst : nullptr;
 
     for (int row = 0; row < nr0; ++row) {
         float tot = simd_sum(sumf[0][row]);
@@ -921,7 +926,7 @@ void kernel_mul_mv_pq2_0_f32_nmat_impl(
         }
 
         if (tiisg == 0 && first_row + row < args.ne01) {
-            dst_f32[first_row + row] = tot;
+            dst_f32[first_row + row] = add_res ? tot + res_f32[first_row + row] : tot;
         }
     }
 }
@@ -936,7 +941,7 @@ void kernel_mul_mv_pq2_0_f32_impl(
         uint3  tgpig,
         ushort tiisg,
         ushort sgitg) {
-    kernel_mul_mv_pq2_0_f32_nmat_impl<nr0, 1, args_t>(args, src0, nullptr, src1, dst, tgpig, tiisg, sgitg);
+    kernel_mul_mv_pq2_0_f32_nmat_impl<nr0, 1, false, args_t>(args, src0, nullptr, src1, nullptr, dst, tgpig, tiisg, sgitg);
 }
 
 template<int nr0, typename args_t>
@@ -950,19 +955,25 @@ void kernel_mul_mv_pq2_0_f32_glu_impl(
         uint3  tgpig,
         ushort tiisg,
         ushort sgitg) {
-    kernel_mul_mv_pq2_0_f32_nmat_impl<nr0, 2, args_t>(args, src0, src0_gate, src1, dst, tgpig, tiisg, sgitg);
+    kernel_mul_mv_pq2_0_f32_nmat_impl<nr0, 2, false, args_t>(args, src0, src0_gate, src1, nullptr, dst, tgpig, tiisg, sgitg);
 }
 
+// with FC_mul_mv_add the store also adds src2, the residual of a fused MUL_MAT + ADD
 [[host_name("kernel_mul_mv_pq2_0_f32")]]
 kernel void kernel_mul_mv_pq2_0_f32(
         constant ggml_metal_kargs_mul_mv & args,
         device const char * src0,
         device const char * src1,
         device       char * dst,
+        device const char * src2,
         uint3  tgpig[[threadgroup_position_in_grid]],
         ushort tiisg[[thread_index_in_simdgroup]],
         ushort sgitg[[simdgroup_index_in_threadgroup]]) {
-    kernel_mul_mv_pq2_0_f32_impl<N_R0_PQ2_0, constant ggml_metal_kargs_mul_mv &>(args, src0, src1, dst, nullptr, tgpig, tiisg, sgitg);
+    if (FC_mul_mv_add) {
+        kernel_mul_mv_pq2_0_f32_nmat_impl<N_R0_PQ2_0, 1, true, constant ggml_metal_kargs_mul_mv &>(args, src0, nullptr, src1, src2, dst, tgpig, tiisg, sgitg);
+    } else {
+        kernel_mul_mv_pq2_0_f32_impl<N_R0_PQ2_0, constant ggml_metal_kargs_mul_mv &>(args, src0, src1, dst, nullptr, tgpig, tiisg, sgitg);
+    }
 }
 
 [[host_name("kernel_mul_mv_glu_pq2_0_f32")]]

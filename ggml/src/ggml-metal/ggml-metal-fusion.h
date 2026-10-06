@@ -43,7 +43,7 @@ typedef enum ggml_metal_fusion_id {
     GGML_METAL_FUSION_FWHT_SIGNED,  // MUL + MUL_MAT(hadamard) (sign vector folded into the FWHT)
     GGML_METAL_FUSION_RMS_NORM_FWHT, // RMS_NORM + MUL + MUL + MUL_MAT(hadamard) (normalized row into the signed FWHT)
     GGML_METAL_FUSION_CONT_FWHT,     // CONT + MUL + MUL_MAT(hadamard) (the signed FWHT gathers the CONT source)
-    GGML_METAL_FUSION_MUL_MAT_ADD,  // MUL_MAT + ADD (residual added in the few-row MMA store)
+    GGML_METAL_FUSION_MUL_MAT_ADD,  // MUL_MAT + ADD (residual added in the few-row MMA or one-row PQ2_0 mat-vec store)
     GGML_METAL_FUSION_CPY_BATCH,    // CPY x N (N in [2, GGML_METAL_CPY_BATCH_MAX]), one dispatch
 } ggml_metal_fusion_id;
 
