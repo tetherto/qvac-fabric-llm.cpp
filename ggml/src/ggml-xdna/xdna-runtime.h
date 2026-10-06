@@ -65,6 +65,9 @@ void xdna_kernel_free(xdna_kernel * kern);
 
 // Allocate a host-visible device buffer object of `bytes` bytes.
 xdna_buffer * xdna_buffer_alloc(xdna_device * dev, size_t bytes);
+// BO allocations that failed in this process so far (the warning that
+// a model does not fit compares it around a graph).
+int xdna_buffer_alloc_failures(void);
 
 // While one is open, xdna_buffer_alloc carves buffers out of the decode's
 // arena (GGML_XDNA_ARENA_MB chunks, 256; 0: never) instead of giving each its
