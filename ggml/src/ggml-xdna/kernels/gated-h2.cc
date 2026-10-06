@@ -23,8 +23,14 @@ constexpr int GH_HH_OFF = 3 * GH_D;  // the head's slot, at the tail
 
 #if ATTN_ONCHIP
 extern "C" void ggml_xdna_gated_h2(uint8_t * out, const float * azg4, const float * att_lo, const float * att_hi) {
+    // The rounding mode is the core's, left by whatever ran on it before:
+    // set it, or the first dispatch after another design rounds differently.
+    aie::set_rounding(aie::rounding_mode::conv_even);
 #else
 extern "C" void ggml_xdna_gated_h2(uint8_t * out, const float * azg4) {
+    // The rounding mode is the core's, left by whatever ran on it before:
+    // set it, or the first dispatch after another design rounds differently.
+    aie::set_rounding(aie::rounding_mode::conv_even);
 #endif
     // One object carries HG heads. The stage is one tile walking them in
     // order, and with a head per object the fifo handshake, not the

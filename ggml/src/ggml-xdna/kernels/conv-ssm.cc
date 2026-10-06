@@ -74,6 +74,9 @@ static_assert(DIM_C % VLEN == 0, "DIM_C must be a multiple of the vector length"
 // (t+i)*C + c: every load is contiguous and aligned, and the KW taps are KW
 // whole vectors rather than a window slid across two.
 extern "C" void ggml_xdna_conv_apply(const conv_elem * __restrict xw, conv_elem * __restrict out) {
+    // The rounding mode is the core's, left by whatever ran on it before:
+    // set it, or the first dispatch after another design rounds differently.
+    aie::set_rounding(aie::rounding_mode::conv_even);
     const conv_elem * const w = xw + (size_t) XROWT * DIM_C;
 
     for (unsigned t = 0; t < DIM_T; t++) {
@@ -103,6 +106,9 @@ static_assert(XROW >= DIM_T + VLEN, "XROW must cover the aligned pair of loads")
 static_assert(DIM_KW <= VLEN, "shuffle tap must fit in one vector");
 
 extern "C" void ggml_xdna_conv_apply(const conv_elem * __restrict xw, conv_elem * __restrict out) {
+    // The rounding mode is the core's, left by whatever ran on it before:
+    // set it, or the first dispatch after another design rounds differently.
+    aie::set_rounding(aie::rounding_mode::conv_even);
     const conv_elem * const w = xw + (size_t) DIM_C * XROW;
 
     for (unsigned c = 0; c < DIM_C; c++) {

@@ -215,6 +215,9 @@ extern "C" {
 void act_att_tile(const int32_t * in, int32_t * out);
 
 void ggml_xdna_act_pro(const int32_t * in, const int32_t * hst, int32_t * out) {
+    // The rounding mode is the core's, left by whatever ran on it before:
+    // set it, or the first dispatch after another design rounds differently.
+    aie::set_rounding(aie::rounding_mode::conv_even);
     const int flags = hst[ACT_FLAGS_W];
     if (flags & xdna::ACT_FLAG_ATTN) {
         act_att_tile(in, out);
@@ -427,6 +430,9 @@ extern "C" {
 // The activation tile carries the code width of this dispatch in its last
 // word, so one entry point serves both.
 void ggml_xdna_gemv(const uint8_t * w, const int32_t * a32, float * out) {
+    // The rounding mode is the core's, left by whatever ran on it before:
+    // set it, or the first dispatch after another design rounds differently.
+    aie::set_rounding(aie::rounding_mode::conv_even);
     if (a32[ACT_WIDTH_W] == 0) {
         gemv_codes<true>(w, a32, out);
     } else {

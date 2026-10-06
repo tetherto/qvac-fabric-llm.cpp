@@ -115,6 +115,9 @@ static const float fa_lane_tbl[64] = {
 };
 
 extern "C" void ggml_xdna_fa_zero(float * acc) {
+    // The rounding mode is the core's, left by whatever ran on it before:
+    // set it, or the first dispatch after another design rounds differently.
+    aie::set_rounding(aie::rounding_mode::conv_even);
     const vf z = ::aie::zeros<float, FA_MT>();
     for (int i = 0; i < FA_D; i++) {
         ::aie::store_v(FA_O(acc) + i * FA_MT, z);
@@ -136,6 +139,9 @@ extern "C" void ggml_xdna_fa_zero(float * acc) {
 //   [0] zero the accumulator (first chunk)   [2] first tile of this chunk
 //   [1] normalise it (last chunk)            [3] keys cached before the batch
 extern "C" void ggml_xdna_fa_step(float * acc, int32_t * qpar, bfloat16 * kv, int32_t jt, int32_t mb, int32_t row) {
+    // The rounding mode is the core's, left by whatever ran on it before:
+    // set it, or the first dispatch after another design rounds differently.
+    aie::set_rounding(aie::rounding_mode::conv_even);
     const bfloat16 * qt    = (const bfloat16 *) (qpar + FA_QHDR);
     const int32_t    jtb   = qpar[2];
     const int32_t    npast = qpar[3];
@@ -211,6 +217,9 @@ extern "C" void ggml_xdna_fa_step(float * acc, int32_t * qpar, bfloat16 * kv, in
 // Divide the accumulated O by l, in place. A row with no visible key cannot
 // happen in a causal batch - every query sees at least itself - so l > 0.
 extern "C" void ggml_xdna_fa_norm(float * acc) {
+    // The rounding mode is the core's, left by whatever ran on it before:
+    // set it, or the first dispatch after another design rounds differently.
+    aie::set_rounding(aie::rounding_mode::conv_even);
     const vf inv = fa_rcp(::aie::load_v<FA_MT>(FA_LV(acc)));
     float *  O   = FA_O(acc);
     for (int d = 0; d < FA_D; d++) {
