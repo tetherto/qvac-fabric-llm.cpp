@@ -746,7 +746,8 @@ void ggml_backend_load_all_from_path(const char * dir_path) {
     // Skip Vulkan dlopen when GGML_DISABLE_VULKAN is set, so GPU work can route
     // to OpenCL on Adreno (Vulkan crashes in vkCmdBindPipeline there). Mirrors
     // the static-link gate above.
-    if (getenv("GGML_DISABLE_VULKAN") == nullptr) {
+    const bool vulkan_disabled = getenv("GGML_DISABLE_VULKAN") != nullptr;
+    if (!vulkan_disabled) {
         ggml_backend_load_best("vulkan", silent, dir_path);
     } else {
         GGML_LOG_INFO("ggml_backend_load_all_from_path: skipping vulkan (GGML_DISABLE_VULKAN set)\n");
@@ -758,10 +759,13 @@ void ggml_backend_load_all_from_path(const char * dir_path) {
     // On Android, use the already-loaded Vulkan backend to detect the GPU and
     // only keep OpenCL for an Adreno that benefits from it. The LLM and speech
     // stacks share this policy. Off Android (or when no Vulkan backend is
-    // present) behaviour is unchanged: OpenCL is loaded unconditionally here.
+    // present, or when Vulkan was disabled explicitly) behaviour is unchanged:
+    // OpenCL is loaded unconditionally here.
     bool load_opencl = true;
 #ifdef __ANDROID__
-    {
+    if (vulkan_disabled) {
+        GGML_LOG_INFO("%s: Vulkan disabled by GGML_DISABLE_VULKAN; loading OpenCL without the Adreno probe\n", __func__);
+    } else {
         ggml_backend_reg_t vulkan_backend = ggml_backend_reg_by_name("vulkan");
         const int min_adreno_version = ggml_backend_min_adreno_version(vulkan_backend);
         const ggml_adreno_backend_policy policy = ggml_adreno_resolve_backend_policy(min_adreno_version);

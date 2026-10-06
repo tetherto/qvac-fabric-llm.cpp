@@ -884,6 +884,9 @@ ggml_metal_device_t ggml_metal_device_init(int device) {
                         ggml_metal_library_free(lib);
                     }
                 }
+                if (getenv("GGML_METAL_SIMDGROUP_REDUCTION_DISABLE") != NULL) {
+                    dev->props.has_simdgroup_reduction = false;
+                }
                 // Only probe simdgroup_mm on Apple GPUs, simdgroup_half8x8 / simdgroup_load(half)
                 // is an Apple-family hardware feature; trying to compile this pipeline on
                 // Intel/AMD Mac GPUs always fails and the existing pipeline compiler logs the
@@ -1650,7 +1653,8 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                        (K == 3 || K == 5 || K == 7);
             }
         case GGML_OP_SUPERTONIC_LAYER_NORM_CHANNEL:
-            return op->src[0]->ne[3] == 1 &&
+            return has_simdgroup_reduction &&
+                   op->src[0]->ne[3] == 1 &&
                    op->src[0]->type == GGML_TYPE_F32 &&
                    op->src[1]->type == GGML_TYPE_F32 &&
                    op->src[2]->type == GGML_TYPE_F32;

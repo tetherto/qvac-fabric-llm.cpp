@@ -361,14 +361,15 @@ if (NOT GGML_LIB_OUTPUT_PREFIX STREQUAL "")
             _ggml_apply_lib_output_prefix(${_lop_target})
         endforeach()
     endif()
-
-    if (TARGET ggml-base)
-        target_compile_definitions(ggml-base PRIVATE
-            GGML_BACKEND_DL_PROJECT_PREFIX="${GGML_LIB_OUTPUT_PREFIX}")
-    endif()
-
-    message(STATUS "ggml: lib output prefix '${GGML_LIB_OUTPUT_PREFIX}'")
 endif()
+
+# the backend loader (ggml-backend-reg.cpp) is part of ggml and must search the same prefix
+if (TARGET ggml)
+    target_compile_definitions(ggml PRIVATE
+        GGML_BACKEND_DL_PROJECT_PREFIX="${GGML_LIB_OUTPUT_PREFIX}")
+endif()
+
+message(STATUS "ggml: lib output prefix '${GGML_LIB_OUTPUT_PREFIX}'")
 
 #
 # tests and examples
