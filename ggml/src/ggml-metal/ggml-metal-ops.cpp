@@ -1424,6 +1424,18 @@ int ggml_metal_op_cumsum(ggml_metal_op_t ctx, int idx) {
     return 1;
 }
 
+// f32 rows copied as float4 need a row length and every row start 16-byte aligned
+static bool ggml_metal_op_get_rows_use_vec4(const ggml_tensor * op) {
+    constexpr size_t align = sizeof(float)*4;
+
+    const ggml_tensor * src0 = op->src[0];
+
+    return src0->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 && src0->ne[0] % 4 == 0 &&
+        src0->nb[1] % align == 0 && src0->nb[2] % align == 0 && src0->nb[3] % align == 0 &&
+        op->nb[1] % align == 0 && op->nb[2] % align == 0 && op->nb[3] % align == 0 &&
+        ggml_metal_get_buffer_id(src0).offs % align == 0 && ggml_metal_get_buffer_id(op).offs % align == 0;
+}
+
 int ggml_metal_op_get_rows(ggml_metal_op_t ctx, int idx) {
     ggml_tensor * op = ctx->node(idx);
 
@@ -1437,10 +1449,12 @@ int ggml_metal_op_get_rows(ggml_metal_op_t ctx, int idx) {
     GGML_TENSOR_LOCALS( int32_t, ne,  op,         ne);
     GGML_TENSOR_LOCALS(uint64_t, nb,  op,         nb);
 
-    auto pipeline = ggml_metal_library_get_pipeline_get_rows(lib, op->src[0]->type);
+    const bool vec4 = ggml_metal_op_get_rows_use_vec4(op);
+
+    auto pipeline = ggml_metal_library_get_pipeline_get_rows(lib, op->src[0]->type, vec4);
 
     ggml_metal_kargs_get_rows args = {
-        /*.ne00t =*/ ggml_is_quantized(op->src[0]->type) ? ne00/16 : ne00,
+        /*.ne00t =*/ vec4 ? ne00/4 : ggml_is_quantized(op->src[0]->type) ? ne00/16 : ne00,
         /*.ne00  =*/ ne00,
         /*.nb01  =*/ nb01,
         /*.nb02  =*/ nb02,

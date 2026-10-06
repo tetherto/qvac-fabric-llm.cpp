@@ -11572,6 +11572,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
 
     test_cases.emplace_back(new test_get_rows(GGML_TYPE_F32, 1, 8, 2, 1, 1, false));
+    // a row length that is not a multiple of 4, and one wide row (a recurrent state)
+    test_cases.emplace_back(new test_get_rows(GGML_TYPE_F32, 258, 5, 4, 1, 1, false, true));
+    test_cases.emplace_back(new test_get_rows(GGML_TYPE_F32, 3*65536, 8, 1, 1, 1, false));
     for (ggml_type type : all_types) {
         for (int b : {1, 7}) {
             for (bool v : {false, true}) {
