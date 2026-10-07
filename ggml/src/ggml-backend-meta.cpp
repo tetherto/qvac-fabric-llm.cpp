@@ -497,6 +497,31 @@ static struct ggml_tensor * ggml_backend_meta_buffer_simple_tensor(const struct 
     return nullptr;
 }
 
+static size_t ggml_backend_meta_inner_extent(const struct ggml_tensor * tensor, int skip_dim) {
+    size_t extent = 0;
+    for (int i = 0; i < GGML_MAX_DIMS; i++) {
+        if (i != skip_dim && tensor->ne[i] > 1) {
+            extent += (size_t) (tensor->ne[i] - 1) * tensor->nb[i];
+        }
+    }
+    return extent;
+}
+
+// Returns the view dim that holds the split axis of the source, or -1.
+// Every other dim of the source and of the view must address bytes inside one slab of that axis.
+static int ggml_backend_meta_view_slab_dim(const struct ggml_tensor * view, const struct ggml_tensor * src, int axis) {
+    const size_t slab = src->nb[axis];
+    if (ggml_backend_meta_inner_extent(src, axis) >= slab) {
+        return -1;
+    }
+    for (int dim = 0; dim < GGML_MAX_DIMS; dim++) {
+        if (view->ne[dim] == src->ne[axis] && view->nb[dim] == slab) {
+            return ggml_backend_meta_inner_extent(view, dim) < slab ? dim : -1;
+        }
+    }
+    return -1;
+}
+
 static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(const struct ggml_tensor * tensor, bool assume_sync);
 
 static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
@@ -836,6 +861,16 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
                 tensor->nb[2] == tensor->src[0]->nb[2]*tensor->ne[3]) {
             // with a single kv head all heads move to dim 3 and repeat_back leaves a partial sum
             return {tensor->ne[2] == 1 ? GGML_BACKEND_SPLIT_AXIS_3 : GGML_BACKEND_SPLIT_AXIS_2, {0}, {1}, 1};
+        }
+        // A view that only regroups dims inside one slab of the outermost split axis keeps the split.
+        // The per-device stride rescale changes only strides above nb[axis].
+        if (axis >= 0 && axis < GGML_MAX_DIMS && tensor->view_offs == tensor->src[0]->view_offs) {
+            const int dim = ggml_backend_meta_view_slab_dim(tensor, tensor->src[0], axis);
+            if (dim >= 0) {
+                ggml_backend_meta_split_state ss = src_ss[0];
+                ss.axis = ggml_backend_meta_split_axis(dim);
+                return ss;
+            }
         }
         GGML_ABORT("view of permuted tensor not implemented");
         //return {GGML_BACKEND_SPLIT_AXIS_UNKNOWN, {0}, {1}, 1};

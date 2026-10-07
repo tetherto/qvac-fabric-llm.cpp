@@ -2695,10 +2695,12 @@ ggml_tensor * llm_graph_context::build_attn_mha(
                  int   il) const {
     const bool v_trans = v->nb[1] > v->nb[2];
 
-    // split the batch into streams if needed
+    // split the batch into streams if needed, stepping over tokens so a permuted q splits correctly
     const auto n_stream = k->ne[3];
+    GGML_ASSERT(q->ne[3] == 1 && q->ne[2] % n_stream == 0);
 
-    q = ggml_view_4d(ctx0, q, q->ne[0], q->ne[1], q->ne[2]/n_stream, n_stream, q->nb[1], q->nb[2], q->nb[3]/n_stream, 0);
+    const int64_t n_stream_tokens = q->ne[2]/n_stream;
+    q = ggml_view_4d(ctx0, q, q->ne[0], q->ne[1], n_stream_tokens, n_stream, q->nb[1], q->nb[2], q->nb[2]*n_stream_tokens, 0);
 
     q = ggml_permute(ctx0, q, 0, 2, 1, 3);
     k = ggml_permute(ctx0, k, 0, 2, 1, 3);

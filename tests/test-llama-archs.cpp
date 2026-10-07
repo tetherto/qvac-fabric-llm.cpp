@@ -78,7 +78,7 @@ static void set_tensor_data(struct ggml_tensor * tensor, void * userdata) {
 }
 
 static void usage(char ** argv) {
-    printf("Usage: %s [-a/--arch arch] [-s/--seed seed] [-o/--out dir] [-v N] [-h/--help] [--mtp-shared|--mtp-shared-cpu|--hadamard-contracts|--qsa-unified-multiseq|--glm5-kpool-sequences|--glm5-invalid-metadata|--layer-inp-pos-min]\n", argv[0]);
+    printf("Usage: %s [-a/--arch arch] [-s/--seed seed] [-o/--out dir] [-v N] [-h/--help] [--mtp-shared|--mtp-shared-cpu|--hadamard-contracts|--qsa-unified-multiseq|--glm5-kpool-sequences|--glm5-multiseq|--glm5-multiseq-gpu|--glm5-invalid-metadata|--layer-inp-pos-min]\n", argv[0]);
 }
 
 static std::vector<llama_token> get_tokens(const uint32_t n_tokens, const uint32_t n_vocab, const size_t seed){
@@ -438,7 +438,8 @@ static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
         struct gguf_context * gguf_ctx, FILE * file, const size_t seed, const std::vector<ggml_backend_dev_t> & devs,
         const llama_split_mode split_mode = LLAMA_SPLIT_MODE_LAYER, bool encode = false,
         uint32_t n_seq_max = 1, bool kv_unified = false,
-        ggml_backend_sched_eval_callback cb_eval = nullptr, void * cb_eval_user_data = nullptr) {
+        ggml_backend_sched_eval_callback cb_eval = nullptr, void * cb_eval_user_data = nullptr,
+        void (*init_tensor)(struct ggml_tensor *, void *) = set_tensor_data) {
     GGML_ASSERT((gguf_ctx == nullptr) != (file == nullptr));
     llama_model_params model_params = llama_model_default_params();
     model_params.progress_callback = silent_model_load_progress;
@@ -461,7 +462,7 @@ static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
 
     size_t tmp = seed;
     llama_model_ptr model(gguf_ctx != nullptr ?
-        llama_model_init_from_user(gguf_ctx, set_tensor_data, &tmp, model_params) :
+        llama_model_init_from_user(gguf_ctx, init_tensor, &tmp, model_params) :
         llama_model_load_from_file_ptr(file, model_params));
     if (!model) {
         throw std::runtime_error("failed to create llama model");
@@ -1661,6 +1662,172 @@ static int test_glm5_kpool_sequences() {
     return 0;
 }
 
+struct glm5_multiseq_config {
+    std::vector<ggml_backend_dev_t> devs;
+    llama_split_mode split_mode;
+    std::string label;
+};
+
+static constexpr uint32_t GLM5_MULTISEQ_N_SEQ   = 3;
+static constexpr uint32_t GLM5_MULTISEQ_N_STEPS = 4;
+static constexpr uint32_t GLM5_MULTISEQ_TOP_K   = 12; // three pools, so the prompts outgrow the selection
+static constexpr double   GLM5_MULTISEQ_MAX_NMSE = 1e-5;
+static const uint32_t     GLM5_MULTISEQ_PROMPT_LEN[GLM5_MULTISEQ_N_SEQ] = {24, 20, 28};
+
+// Decodes the prompts of seqs in one batch, then single-token steps for all of them together.
+// Returns the logits of every output, grouped per sequence.
+static std::map<llama_seq_id, std::vector<float>> glm5_multiseq_decode(
+        llama_context * ctx, const std::vector<std::vector<llama_token>> & prompts, const std::vector<llama_seq_id> & seqs) {
+    const uint32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx)));
+    llama_memory_clear(llama_get_memory(ctx), true);
+
+    std::map<llama_seq_id, std::vector<float>> logits;
+    auto decode = [&](const std::vector<std::pair<llama_seq_id, llama_pos>> & entries, bool prompt) {
+        llama_batch batch = llama_batch_init(entries.size(), 0, 1);
+        std::vector<std::pair<llama_seq_id, int32_t>> outputs;
+        for (size_t i = 0; i < entries.size(); ++i) {
+            const auto [s, pos] = entries[i];
+            const auto & toks = prompts[s];
+            const bool output = !prompt || (size_t) pos + 1 == toks.size();
+            common_batch_add(batch, toks[pos % toks.size()], pos, {s}, output);
+            if (output) {
+                outputs.emplace_back(s, (int32_t) i);
+            }
+        }
+        GGML_ASSERT(llama_decode(ctx, batch) == 0);
+        for (const auto & [s, i] : outputs) {
+            const float * row = llama_get_logits_ith(ctx, i);
+            logits[s].insert(logits[s].end(), row, row + n_vocab);
+        }
+        llama_batch_free(batch);
+    };
+
+    std::vector<std::pair<llama_seq_id, llama_pos>> entries;
+    for (const llama_seq_id s : seqs) {
+        for (llama_pos p = 0; p < (llama_pos) prompts[s].size(); ++p) {
+            entries.emplace_back(s, p);
+        }
+    }
+    decode(entries, true);
+
+    for (uint32_t step = 0; step < GLM5_MULTISEQ_N_STEPS; ++step) {
+        entries.clear();
+        for (const llama_seq_id s : seqs) {
+            entries.emplace_back(s, (llama_pos) (prompts[s].size() + step));
+        }
+        decode(entries, false);
+    }
+    return logits;
+}
+
+struct glm5_multiseq_probe {
+    int64_t max_scatter_streams = 0; // widest stream count seen on the dense DSA mask
+};
+
+static bool glm5_multiseq_observe(ggml_tensor * tensor, bool ask, void * data) {
+    if (ask && std::strncmp(tensor->name, "kq_mask_dsa-", 12) == 0) {
+        auto * probe = static_cast<glm5_multiseq_probe *>(data);
+        probe->max_scatter_streams = std::max(probe->max_scatter_streams, tensor->ne[3]);
+    }
+    return false;
+}
+
+// The default 1e-2 weights make attention uniform, hiding which query rows it reads.
+// Give the DSA attention and indexer unit norms and fan-in scaled projections instead.
+static void set_tensor_data_glm5_attn(struct ggml_tensor * tensor, void * userdata) {
+    const std::string name = tensor->name;
+    const bool attn = name.find(".attn_") != std::string::npos || name.find(".indexer") != std::string::npos;
+    if (!attn || tensor->type != GGML_TYPE_F32) {
+        set_tensor_data(tensor, userdata);
+        return;
+    }
+    const bool norm = string_ends_with(name, "norm.weight");
+    std::mt19937 gen(*(const size_t *) userdata ^ std::hash<std::string>()(name));
+    std::normal_distribution<float> dis(norm ? 1.0f : 0.0f, norm ? 0.1f : 1.0f/std::sqrt((float) tensor->ne[0]));
+    std::vector<float> tmp(ggml_nelements(tensor));
+    for (float & v : tmp) {
+        v = dis(gen);
+    }
+    ggml_backend_tensor_set(tensor, tmp.data(), 0, ggml_nbytes(tensor));
+}
+
+static bool glm5_multiseq_matches(const glm5_multiseq_config & cfg, bool unified) {
+    auto metadata = get_gguf_ctx(LLM_ARCH_GLM5_NEXT, true);
+    gguf_set_val_u32(metadata.get(), "glm5-next.attention.indexer.top_k", GLM5_MULTISEQ_TOP_K);
+    glm5_multiseq_probe probe;
+    auto loaded = get_model_and_ctx(metadata.get(), nullptr, 1234, cfg.devs, cfg.split_mode,
+            false, GLM5_MULTISEQ_N_SEQ, unified, glm5_multiseq_observe, &probe, set_tensor_data_glm5_attn);
+    llama_context * ctx = loaded.second.get();
+    const uint32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(loaded.first.get()));
+
+    std::vector<std::vector<llama_token>> prompts;
+    std::vector<llama_seq_id> all_seqs;
+    for (uint32_t s = 0; s < GLM5_MULTISEQ_N_SEQ; ++s) {
+        prompts.push_back(get_tokens(GLM5_MULTISEQ_PROMPT_LEN[s], n_vocab, 100 + s));
+        all_seqs.push_back((llama_seq_id) s);
+    }
+
+    const auto together = glm5_multiseq_decode(ctx, prompts, all_seqs);
+    const int64_t expected_streams = unified ? 1 : GLM5_MULTISEQ_N_SEQ;
+    bool ok = true;
+    if (probe.max_scatter_streams != expected_streams) {
+        printf("FAIL: GLM5 %s %s batch did not reach the dense DSA mask with %" PRId64 " streams (saw %" PRId64 ")\n",
+                cfg.label.c_str(), unified ? "unified" : "non-unified", expected_streams, probe.max_scatter_streams);
+        ok = false;
+    }
+    for (const llama_seq_id s : all_seqs) {
+        const auto alone = glm5_multiseq_decode(ctx, prompts, {s});
+        const double err = nmse(alone.at(s), together.at(s));
+        printf("GLM5 %s %s seq %d nmse %.3e\n", cfg.label.c_str(), unified ? "unified" : "non-unified", s, err);
+        if (!(err < GLM5_MULTISEQ_MAX_NMSE)) {
+            printf("FAIL: GLM5 %s %s seq %d differs when decoded with other sequences (nmse %.3e)\n",
+                    cfg.label.c_str(), unified ? "unified" : "non-unified", s, err);
+            ok = false;
+        }
+    }
+    return ok;
+}
+
+static std::vector<glm5_multiseq_config> glm5_multiseq_configs(bool gpu) {
+    if (!gpu) {
+        return {{{}, LLAMA_SPLIT_MODE_LAYER, "CPU"}};
+    }
+    std::vector<ggml_backend_dev_t> gpus;
+    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+        if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+            gpus.push_back(dev);
+        }
+    }
+    std::vector<glm5_multiseq_config> configs;
+    if (!gpus.empty()) {
+        configs.push_back({{gpus[0]}, LLAMA_SPLIT_MODE_LAYER, ggml_backend_dev_name(gpus[0])});
+    }
+    // GLM5 query and indexer head counts are not divisible by three.
+    if (gpus.size() >= 2 && gpus.size() != 3) {
+        configs.push_back({gpus, LLAMA_SPLIT_MODE_TENSOR, "Meta"});
+    }
+    return configs;
+}
+
+static int test_glm5_multiseq(bool gpu) {
+    const auto configs = glm5_multiseq_configs(gpu);
+    if (configs.empty()) {
+        printf("GLM5 multi-sequence test skipped: no GPU\n");
+        return 0;
+    }
+    bool ok = true;
+    for (const auto & cfg : configs) {
+        for (bool unified : {true, false}) {
+            ok = glm5_multiseq_matches(cfg, unified) && ok;
+        }
+    }
+    if (ok) {
+        printf("GLM5 concurrent sequences match their solo decodes\n");
+    }
+    return ok ? 0 : 1;
+}
+
 static int test_glm5_invalid_metadata() {
     struct invalid_case {
         const char * key;
@@ -1775,6 +1942,9 @@ int main(int argc, char ** argv) {
     }
     if (argc == 2 && strcmp(argv[1], "--glm5-kpool-sequences") == 0) {
         return test_glm5_kpool_sequences();
+    }
+    if (argc == 2 && (strcmp(argv[1], "--glm5-multiseq") == 0 || strcmp(argv[1], "--glm5-multiseq-gpu") == 0)) {
+        return test_glm5_multiseq(strcmp(argv[1], "--glm5-multiseq-gpu") == 0);
     }
     if (argc == 2 && strcmp(argv[1], "--glm5-invalid-metadata") == 0) {
         return test_glm5_invalid_metadata();
