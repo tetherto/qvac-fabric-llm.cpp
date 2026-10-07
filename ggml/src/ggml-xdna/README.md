@@ -249,6 +249,11 @@ OMP_WAIT_POLICY=PASSIVE ./build/bin/llama-server -m model.gguf \
 - `--poll 0` stops the threadpool busy-polling while the NPU works;
   `OMP_WAIT_POLICY=PASSIVE` does the same for the host fallback pool.
 - Offload as usual: `-ngl 99` puts every layer on the device.
+- Leave flash attention on (`-fa on`, or `auto`, the default). The NPU's
+  attention routes take llama's `FLASH_ATTN_EXT`; with `-fa off` llama builds
+  attention from `MUL_MAT` and `SOFT_MAX`, which run on the host: about half
+  the decode speed on the 0.8B, with ten times the host work. The backend
+  logs a warning once when it sees that.
 
 ### Environment
 
