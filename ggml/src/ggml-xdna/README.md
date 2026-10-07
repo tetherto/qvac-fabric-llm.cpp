@@ -86,12 +86,14 @@ output directory. The backend looks for artifacts in the backend install dir,
 the executable dir and the working directory.
 
 `fused_layer` and `gemv_n32_r4_c8` are loaded under a **design-tagged** name.
-`kernels/design_tag.py` hashes the design sources and the build knobs, writes
-`xdna-design-tag.h`, and the backend includes it, so the name a build produces
-and the name the backend looks for come from one place: an artifact built from
-other sources is invisible (and reported) rather than driven. The tag covers
-the Python designs and the knobs, not the backend's own stream builders - those
-can change without a kernel rebuild.
+`kernels/design_tag.py` hashes the design sources and the build knobs. Configure
+passes that tag to the backend as a compile definition and the build writes it to
+`xdna-design-tag.h` in the build tree, so the name a build produces and the name
+the backend looks for are the same value: an artifact built from other sources is
+invisible (and reported) rather than driven. The tag covers the Python designs
+and the knobs, not the backend's own stream builders - those can change without a
+kernel rebuild. A build that does not generate kernels compiles the committed
+`xdna-design-tag.h` in this directory instead.
 
 The `.insts.bin` files are reference copies. The runtime builds its own TXN
 instruction streams in C++ (`xdna-seq.cpp`, `xdna-seq-attn.cpp`,
@@ -267,7 +269,8 @@ default to the fast path and are read where they are used.
   first decode graph, so prefill still runs and, under `llama-bench`, all that
   shows is `llama_bench: error: failed to run gen warmup`.
 - **The fused layer is not used at all** - no tagged `fused_layer` artifact was
-  found (check the build output dir and the tag in `xdna-design-tag.h`), or
+  found (check the build output dir and the tag the build stamped, also written
+  to `<build>/ggml/src/ggml-xdna/xdna-design-tag.h`), or
   `GGML_XDNA_FUSED_LAYER=0` is set. The flag is a bisection switch for a model
   the fused layer accepts: that decode then uses the per-op kernels. A model
   the layer refuses is not this case.

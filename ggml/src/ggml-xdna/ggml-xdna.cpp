@@ -7,7 +7,6 @@
 #include "xdna-att.h"
 #include "xdna-attn-mm.h"
 #include "xdna-conv-prefill.h"
-#include "xdna-design-tag.h"
 #include "xdna-gdn-mm.h"
 #include "xdna-head.h"
 #include "xdna-norm.h"
@@ -19,6 +18,11 @@
 #include "xdna-runtime.h"
 #include "xdna-types.h"
 #include "xdna-util.h"
+
+// XDNA_DESIGN_TAG comes from the build; a build without kernel generation compiles the committed header.
+#ifndef XDNA_DESIGN_TAG
+#    include "xdna-design-tag.h"
+#endif
 
 #include <algorithm>
 #include <climits>
