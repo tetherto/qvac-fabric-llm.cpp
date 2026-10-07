@@ -2,9 +2,11 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <sstream>
+#include <string>
 
-#ifndef GGML_TEST_BACKEND_COUNT
-#error "GGML_TEST_BACKEND_COUNT must be the number of built backends"
+#ifndef GGML_TEST_REQUIRED_BACKENDS
+#error "GGML_TEST_REQUIRED_BACKENDS must list the backends that register on any host"
 #endif
 
 static bool check(bool ok, const char * what) {
@@ -14,19 +16,20 @@ static bool check(bool ok, const char * what) {
     return ok;
 }
 
-static size_t expected_backend_count(bool vulkan_disabled) {
-#ifdef GGML_TEST_HAS_VULKAN
-    return vulkan_disabled ? GGML_TEST_BACKEND_COUNT - 1 : GGML_TEST_BACKEND_COUNT;
-#else
-    (void) vulkan_disabled;
-    return GGML_TEST_BACKEND_COUNT;
-#endif
+static bool required_backend_registered(const std::string & name) {
+    const bool ok = ggml_backend_reg_by_name(name.c_str()) != nullptr;
+    printf("%s backend %s\n", name.c_str(), ok ? "registered" : "missing");
+    return check(ok, "every required backend registers through the configured library prefix");
 }
 
-static bool every_built_backend_registered(size_t expected) {
-    const size_t registered = ggml_backend_reg_count();
-    printf("registered %zu backends, expected at least %zu\n", registered, expected);
-    return check(registered >= expected, "the CPU and RPC backends register through the configured library prefix");
+static bool every_required_backend_registered() {
+    std::istringstream names(GGML_TEST_REQUIRED_BACKENDS);
+    std::string name;
+    bool ok = true;
+    while (std::getline(names, name, ';')) {
+        ok = required_backend_registered(name) && ok;
+    }
+    return ok;
 }
 
 static bool vulkan_stays_unloaded() {
@@ -46,7 +49,7 @@ int main() {
 
     ggml_backend_load_all();
 
-    bool ok = every_built_backend_registered(expected_backend_count(vulkan_disabled));
+    bool ok = every_required_backend_registered();
     if (vulkan_disabled) {
         ok = vulkan_stays_unloaded() && ok;
         ok = opencl_still_loads() && ok;

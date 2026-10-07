@@ -431,31 +431,26 @@ llama_build_and_test(test-copy-tbq-subgroups.cpp)
 # mtmd, so it is intentionally outside the LLAMA_MTMD block below.
 llama_build_and_test(test-opencl-fa-chunking.cpp)
 
-# Counts the backends that must register on any host: the CPU family (once) and
-# RPC. GPU and BLAS modules may be absent at run time when their driver or
-# runtime library is missing, so they are not required.
-function(ggml_count_built_backends out_var)
-    set(count 0)
-    set(cpu_seen OFF)
+# Names the backends that must register on any host: the CPU family and RPC.
+# GPU and BLAS modules may be absent at run time when their driver or runtime
+# library is missing, so they are not required.
+function(ggml_required_backend_names out_var)
+    set(names "")
     foreach (backend IN LISTS GGML_AVAILABLE_BACKENDS)
-        if (backend MATCHES "^ggml-cpu")
-            if (NOT cpu_seen)
-                set(cpu_seen ON)
-                math(EXPR count "${count} + 1")
-            endif()
+        if (backend MATCHES "^ggml-cpu" AND NOT "CPU" IN_LIST names)
+            list(APPEND names "CPU")
         elseif (backend STREQUAL "ggml-rpc")
-            math(EXPR count "${count} + 1")
+            list(APPEND names "RPC")
         endif()
     endforeach()
-    set(${out_var} ${count} PARENT_SCOPE)
+    set(${out_var} "${names}" PARENT_SCOPE)
 endfunction()
 
 ggml_build_and_test(test-cpu-graph-plan.cpp)
-ggml_count_built_backends(GGML_TEST_BACKEND_COUNT)
+ggml_required_backend_names(GGML_TEST_REQUIRED_BACKENDS)
 ggml_build_and_test(test-backend-discovery.cpp)
-target_compile_definitions(test-backend-discovery PRIVATE GGML_TEST_BACKEND_COUNT=${GGML_TEST_BACKEND_COUNT})
+target_compile_definitions(test-backend-discovery PRIVATE "GGML_TEST_REQUIRED_BACKENDS=\"${GGML_TEST_REQUIRED_BACKENDS}\"")
 if (GGML_VULKAN)
-    target_compile_definitions(test-backend-discovery PRIVATE GGML_TEST_HAS_VULKAN)
     llama_test(test-backend-discovery NAME test-backend-discovery-no-vulkan)
     set_tests_properties(test-backend-discovery-no-vulkan PROPERTIES ENVIRONMENT "GGML_DISABLE_VULKAN=1")
 endif()
