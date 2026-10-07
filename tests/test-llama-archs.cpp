@@ -78,7 +78,7 @@ static void set_tensor_data(struct ggml_tensor * tensor, void * userdata) {
 }
 
 static void usage(char ** argv) {
-    printf("Usage: %s [-a/--arch arch] [-s/--seed seed] [-o/--out dir] [-v N] [-h/--help] [--mtp-shared|--mtp-shared-cpu|--hadamard-contracts|--qsa-unified-multiseq|--glm5-kpool-sequences|--glm5-multiseq|--glm5-multiseq-gpu|--glm5-tensor-oom|--glm5-reserve-covers-context|--glm5-reserve-scrambled-states|--glm5-invalid-metadata|--layer-inp-pos-min]\n", argv[0]);
+    printf("Usage: %s [-a/--arch arch] [-s/--seed seed] [-o/--out dir] [-v N] [-h/--help] [--mtp-shared|--mtp-shared-cpu|--hadamard-contracts|--qsa-unified-multiseq|--glm5-kpool-sequences|--glm5-multiseq|--glm5-multiseq-gpu|--glm5-tensor-oom|--glm5-reserve-covers-context|--glm5-reserve-scrambled-states|--glm5-invalid-metadata|--layer-inp-pos-min|--layer-split-cuda-graph]\n", argv[0]);
 }
 
 static std::vector<llama_token> get_tokens(const uint32_t n_tokens, const uint32_t n_vocab, const size_t seed){
@@ -1788,10 +1788,7 @@ static bool glm5_multiseq_matches(const glm5_multiseq_config & cfg, bool unified
     return ok;
 }
 
-static std::vector<glm5_multiseq_config> glm5_multiseq_configs(bool gpu) {
-    if (!gpu) {
-        return {{{}, LLAMA_SPLIT_MODE_LAYER, "CPU"}};
-    }
+static std::vector<ggml_backend_dev_t> get_gpu_devices() {
     std::vector<ggml_backend_dev_t> gpus;
     for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
         ggml_backend_dev_t dev = ggml_backend_dev_get(i);
@@ -1799,6 +1796,14 @@ static std::vector<glm5_multiseq_config> glm5_multiseq_configs(bool gpu) {
             gpus.push_back(dev);
         }
     }
+    return gpus;
+}
+
+static std::vector<glm5_multiseq_config> glm5_multiseq_configs(bool gpu) {
+    if (!gpu) {
+        return {{{}, LLAMA_SPLIT_MODE_LAYER, "CPU"}};
+    }
+    const std::vector<ggml_backend_dev_t> gpus = get_gpu_devices();
     std::vector<glm5_multiseq_config> configs;
     if (!gpus.empty()) {
         configs.push_back({{gpus[0]}, LLAMA_SPLIT_MODE_LAYER, ggml_backend_dev_name(gpus[0])});
@@ -2430,6 +2435,100 @@ static int test_layer_inp_pos_min() {
     return ok ? 0 : 1;
 }
 
+// Enough layers that the second GPU's split of a two-GPU layer split is launched as one CUDA graph.
+static constexpr uint32_t LAYER_SPLIT_GRAPH_N_LAYER  = 64;
+static constexpr uint32_t LAYER_SPLIT_GRAPH_N_TOKENS = 192;
+static constexpr double   LAYER_SPLIT_GRAPH_MAX_NMSE = 1e-6;
+
+static std::vector<float> get_layer_split_logits(const std::vector<ggml_backend_dev_t> & devs) {
+    auto metadata = get_gguf_ctx(LLM_ARCH_LLAMA, false);
+    gguf_set_val_u32(metadata.get(), "llama.block_count", LAYER_SPLIT_GRAPH_N_LAYER);
+    auto loaded = get_model_and_ctx(metadata.get(), nullptr, 1234, devs);
+    const uint32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(loaded.first.get()));
+    const auto tokens = get_tokens(LAYER_SPLIT_GRAPH_N_TOKENS, n_vocab, 300);
+    return get_logits(loaded.first.get(), loaded.second.get(), tokens);
+}
+
+// The CUDA debug message of a split launched as one graph.
+static constexpr const char * LAYER_SPLIT_GATED_LOG = "waits on another GPU as one graph";
+// A chain longer than the node count from which CUDA launches a split that waits on another GPU as one graph.
+static constexpr int LAYER_SPLIT_CHAIN_NODES = 1024;
+static constexpr int LAYER_SPLIT_CHAIN_ELEMS = 256;
+
+struct gated_log_counter {
+    ggml_log_callback callback  = nullptr;
+    void *            user_data = nullptr;
+    int               n_gated   = 0;
+};
+
+static void count_gated_launch(ggml_log_level level, const char * text, void * user_data) {
+    auto * counter = (gated_log_counter *) user_data;
+    if (strstr(text, LAYER_SPLIT_GATED_LOG) != nullptr) {
+        counter->n_gated++;
+    }
+    counter->callback(level, text, counter->user_data);
+}
+
+// Runs f and returns how many splits CUDA launched as one graph meanwhile.
+template <typename F>
+static int count_gated_launches(F && f) {
+    gated_log_counter counter;
+    ggml_log_get(&counter.callback, &counter.user_data);
+    ggml_log_set(count_gated_launch, &counter);
+    f();
+    ggml_log_set(counter.callback, counter.user_data);
+    return counter.n_gated;
+}
+
+// Copies a tensor from one GPU to another outside the scheduler, then computes a long chain on the destination.
+static void compute_after_bare_copy(ggml_backend_dev_t dev_src, ggml_backend_dev_t dev_dst) {
+    ggml_backend_ptr backend_src(ggml_backend_dev_init(dev_src, nullptr));
+    ggml_backend_ptr backend_dst(ggml_backend_dev_init(dev_dst, nullptr));
+    const size_t mem_size = ggml_tensor_overhead()*(LAYER_SPLIT_CHAIN_NODES + 2) +
+        ggml_graph_overhead_custom(LAYER_SPLIT_CHAIN_NODES + 1, false);
+    ggml_context_ptr ctx_src(ggml_init({ ggml_tensor_overhead(), nullptr, true }));
+    ggml_context_ptr ctx_dst(ggml_init({ mem_size, nullptr, true }));
+
+    ggml_tensor * src = ggml_new_tensor_1d(ctx_src.get(), GGML_TYPE_F32, LAYER_SPLIT_CHAIN_ELEMS);
+    ggml_tensor * dst = ggml_new_tensor_1d(ctx_dst.get(), GGML_TYPE_F32, LAYER_SPLIT_CHAIN_ELEMS);
+    ggml_tensor * out = dst;
+    for (int i = 0; i < LAYER_SPLIT_CHAIN_NODES; i++) {
+        out = ggml_scale(ctx_dst.get(), out, 1.0f);
+    }
+    ggml_cgraph * gf = ggml_new_graph_custom(ctx_dst.get(), LAYER_SPLIT_CHAIN_NODES + 1, false);
+    ggml_build_forward_expand(gf, out);
+
+    ggml_backend_buffer_ptr buf_src(ggml_backend_alloc_ctx_tensors(ctx_src.get(), backend_src.get()));
+    ggml_backend_buffer_ptr buf_dst(ggml_backend_alloc_ctx_tensors(ctx_dst.get(), backend_dst.get()));
+    GGML_ASSERT(buf_src && buf_dst);
+    ggml_backend_tensor_copy_async(backend_src.get(), backend_dst.get(), src, dst);
+    GGML_ASSERT(ggml_backend_graph_compute(backend_dst.get(), gf) == GGML_STATUS_SUCCESS);
+}
+
+static int test_layer_split_cuda_graph() {
+    const std::vector<ggml_backend_dev_t> gpus = get_gpu_devices();
+    if (gpus.size() < 2) {
+        printf("layer split CUDA graph test skipped: needs 2 GPUs\n");
+        return 0;
+    }
+    const auto single = get_layer_split_logits({gpus[0]});
+    std::vector<float> split;
+    const int n_gated_split = count_gated_launches([&]() { split = get_layer_split_logits({gpus[0], gpus[1]}); });
+    const int n_gated_copy  = count_gated_launches([&]() { compute_after_bare_copy(gpus[0], gpus[1]); });
+    const double err = nmse(single, split);
+    printf("layer split over 2 GPUs vs 1 GPU: nmse %.3e, %d splits launched as one graph, %d after a bare copy\n",
+            err, n_gated_split, n_gated_copy);
+    if (!(err < LAYER_SPLIT_GRAPH_MAX_NMSE)) {
+        printf("FAIL: layer split over 2 GPUs differs from 1 GPU\n");
+        return 1;
+    }
+    if (n_gated_split == 0 || n_gated_copy != 0) {
+        printf("FAIL: only a scheduler split that waits on another GPU must launch as one graph\n");
+        return 1;
+    }
+    return 0;
+}
+
 int main(int argc, char ** argv) {
     // init the logger at max verbosity. filter with a custom callback respecting the user-configure verbosity
     common_log_set_verbosity_thold(LOG_LEVEL_DEBUG);
@@ -2456,6 +2555,9 @@ int main(int argc, char ** argv) {
     }
     if (argc == 2 && strcmp(argv[1], "--glm5-reserve-scrambled-states") == 0) {
         return test_glm5_reserve_scrambled_states();
+    }
+    if (argc == 2 && strcmp(argv[1], "--layer-split-cuda-graph") == 0) {
+        return test_layer_split_cuda_graph();
     }
     if (argc == 2 && strcmp(argv[1], "--glm5-invalid-metadata") == 0) {
         return test_glm5_invalid_metadata();

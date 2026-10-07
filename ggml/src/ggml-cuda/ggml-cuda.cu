@@ -5895,6 +5895,16 @@ static bool ggml_cuda_graph_set_enabled(ggml_backend_cuda_context * cuda_ctx, co
 }
 #endif // USE_CUDA_GRAPH
 
+#ifdef USE_CUDA_GRAPH
+// A large split that waits on another backend fills the launch queue and blocks the host, so the host cannot feed the other pipeline stages.
+// Launch such a split as one captured graph.
+static constexpr int GGML_CUDA_GRAPH_GATED_MIN_NODES = 512;
+
+static bool ggml_cuda_graph_launch_as_one(const ggml_cgraph * cgraph) {
+    return cgraph->waits_on_peer && cgraph->n_nodes >= GGML_CUDA_GRAPH_GATED_MIN_NODES;
+}
+#endif // USE_CUDA_GRAPH
+
 static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
 
@@ -5916,7 +5926,12 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
         if (graph_compatible) {
             const bool properties_changed = ggml_cuda_graph_update_required(cuda_ctx, cgraph);
 
-            if (!graph->warmup_complete) {
+            if (ggml_cuda_graph_launch_as_one(cgraph)) {
+                GGML_LOG_DEBUG("%s: launching a split of %d nodes that waits on another GPU as one graph\n", __func__, cgraph->n_nodes);
+                graph->warmup_complete = true;
+                use_cuda_graph = true;
+                cuda_graph_update_required = properties_changed || graph->instance == nullptr;
+            } else if (!graph->warmup_complete) {
                 // Warmup: need at least 2 calls with no property change on the 2nd call
                 if (!properties_changed) {
                     graph->warmup_complete = true;
