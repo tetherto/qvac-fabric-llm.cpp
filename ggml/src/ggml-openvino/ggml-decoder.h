@@ -116,7 +116,8 @@ public:
                   bool is_stateful = false,
                   bool model_is_splitted = false,
                   bool is_prefill = false,
-                  int prefill_chunk_size = 256);
+                  int prefill_chunk_size = 256,
+                  bool fixed_token_shape = false);
 
     // Naive graph decoder
     GgmlOvDecoder(ggml_cgraph * cgraph, std::map<std::string, std::shared_ptr<ov::Node>> & model_weights);
@@ -301,6 +302,7 @@ public:
     void set_compute_params(const ComputeParams & compute_params) { m_compute_params = compute_params; }
 
     bool m_is_static = false;
+    bool m_fixed_token_shape = false;
     bool m_is_stateful = false;
     bool m_is_prefill = false;
     bool m_naive = false;
@@ -405,6 +407,8 @@ private:
     std::set<std::string> m_model_output_names;
     std::vector<NodeInfo> m_node_info_list;
     std::map<ggml_tensor *, int> m_node_dynamic_dims;
+    // Nodes downstream of an inp_out_ids gather. Their dims follow n_outputs, which stays dynamic.
+    std::set<const ggml_tensor *> m_out_ids_derived;
 
     ModelParams m_model_params;
     ComputeParams m_compute_params;

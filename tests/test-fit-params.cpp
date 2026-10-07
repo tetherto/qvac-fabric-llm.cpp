@@ -107,13 +107,20 @@ static void test_probe_logger_restoration() {
     void * original_data;
     llama_log_get(&original_callback, &original_data);
     struct injected_exception {};
-    bool inject = true;
+
+    struct callback_state {
+        bool inject = true;
+        int  calls  = 0;
+    } state;
+
     const auto callback = +[](ggml_log_level, const char *, void * data) {
-        if (*static_cast<bool *>(data)) {
+        auto * state = static_cast<callback_state *>(data);
+        state->calls++;
+        if (state->inject) {
             throw injected_exception{};
         }
     };
-    llama_log_set(callback, &inject);
+    llama_log_set(callback, &state);
     auto mparams = llama_model_default_params();
     auto cparams = llama_context_default_params();
     std::vector<ggml_backend_dev_t> devices;
@@ -125,13 +132,14 @@ static void test_probe_logger_restoration() {
     } catch (const injected_exception &) {
         caught = true;
     }
-    inject = false;
+    state.inject = false;
     ggml_log_callback restored_callback;
     void * restored_data;
     llama_log_get(&restored_callback, &restored_data);
     expect_i64("probe exception injected", caught, true);
+    expect_i64("probe stops calling a failing callback", state.calls, 1);
     expect_i64("probe restores callback", restored_callback == callback, true);
-    expect_i64("probe restores callback data", restored_data == &inject, true);
+    expect_i64("probe restores callback data", restored_data == &state, true);
     // A second probe verifies that unwinding released the serialization mutex.
     try {
         common_get_device_memory_data("/nonexistent-fit-test/model.gguf", &mparams, &cparams, devices,
@@ -140,7 +148,7 @@ static void test_probe_logger_restoration() {
     }
     llama_log_get(&restored_callback, &restored_data);
     expect_i64("failed load restores callback", restored_callback == callback, true);
-    expect_i64("failed load restores callback data", restored_data == &inject, true);
+    expect_i64("failed load restores callback data", restored_data == &state, true);
     llama_log_set(original_callback, original_data);
 }
 
