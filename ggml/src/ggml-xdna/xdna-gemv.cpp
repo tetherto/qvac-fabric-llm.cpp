@@ -1,8 +1,12 @@
 #include "xdna-gemv.h"
 
 #include "ggml-impl.h"
-#include "xdna-design-tag.h"
 #include "xdna-util.h"
+
+// XDNA_DESIGN_TAG comes from the build; a build without kernel generation compiles the committed header.
+#ifndef XDNA_DESIGN_TAG
+#    include "xdna-design-tag.h"
+#endif
 
 #include <algorithm>
 #include <chrono>
