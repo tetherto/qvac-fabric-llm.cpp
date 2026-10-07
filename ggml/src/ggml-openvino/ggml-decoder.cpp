@@ -68,6 +68,19 @@ GgmlOvDecoder::GgmlOvDecoder(ggml_cgraph * cgraph,
 
     set_input_output();
     compute_node_dynamic_dims();
+    if (m_fixed_token_shape) {
+        // cgraph nodes are topologically ordered, so one pass reaches every descendant.
+        for (int i = 0; i < m_cgraph->n_nodes; ++i) {
+            const ggml_tensor * node = m_cgraph->nodes[i];
+            for (int j = 0; j < GGML_MAX_SRC; ++j) {
+                const ggml_tensor * src = node->src[j];
+                if (src != nullptr && (is_output_idx(src, node) || m_out_ids_derived.count(src))) {
+                    m_out_ids_derived.insert(node);
+                    break;
+                }
+            }
+        }
+    }
     compute_model_inputs();
     compute_model_outputs();
 
@@ -1432,9 +1445,10 @@ ov::PartialShape GgmlOvDecoder::get_view_input_ov_shape(int node_idx,
             if (dynamic_it != m_node_dynamic_dims.end() && dynamic_it->second != -1) {
                 int dynamic_dim_index = dynamic_it->second;
                 // GGML uses reverse indexing, so convert to OpenVINO indexing
-                shape[3 - dynamic_dim_index] = m_is_static         ? get_static_n_tokens() :
-                                               m_fixed_token_shape ? tensor->ne[dynamic_dim_index] :
-                                                                     -1;
+                shape[3 - dynamic_dim_index] = m_is_static ? get_static_n_tokens() :
+                                               m_fixed_token_shape && !m_out_ids_derived.count(tensor) ?
+                                                             tensor->ne[dynamic_dim_index] :
+                                                             -1;
             }
 
             return shape;
@@ -1459,9 +1473,10 @@ ov::PartialShape GgmlOvDecoder::get_view_input_src_ov_shape(int node_idx,
                 if (dynamic_it != m_node_dynamic_dims.end() && dynamic_it->second != -1) {
                     int dynamic_dim_index = dynamic_it->second;
                     // GGML uses reverse indexing, so convert to OpenVINO indexing
-                    shape[3 - dynamic_dim_index] = m_is_static         ? get_static_n_tokens() :
-                                                   m_fixed_token_shape ? src_tensor->ne[dynamic_dim_index] :
-                                                                         -1;
+                    shape[3 - dynamic_dim_index] = m_is_static ? get_static_n_tokens() :
+                                                   m_fixed_token_shape && !m_out_ids_derived.count(src_tensor) ?
+                                                                 src_tensor->ne[dynamic_dim_index] :
+                                                                 -1;
                 }
 
                 return shape;

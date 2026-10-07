@@ -203,7 +203,6 @@ enum ggml_status ov_graph_compute_dynamic(ggml_cgraph * cgraph, std::shared_ptr<
             }
         }
     }
-    const bool fixed_token_shape = fixed_token_count > 0;
     graph_key key(cgraph, fixed_token_count);
     bool key_seen = false;
     if (!cache_disabled) {
@@ -212,6 +211,8 @@ enum ggml_status ov_graph_compute_dynamic(ggml_cgraph * cgraph, std::shared_ptr<
     }
 
     bool model_is_splitted = key_seen ? false : is_model_splitted(cgraph);
+    // Split fragments keep dynamic graph inputs, so their views must stay dynamic too.
+    const bool fixed_token_shape = fixed_token_count > 0 && !model_is_splitted;
 
     if (is_naive(cgraph)) {
         if (!model_is_splitted) {

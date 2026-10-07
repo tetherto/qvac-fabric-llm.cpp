@@ -407,6 +407,8 @@ private:
     std::set<std::string> m_model_output_names;
     std::vector<NodeInfo> m_node_info_list;
     std::map<ggml_tensor *, int> m_node_dynamic_dims;
+    // Nodes downstream of an inp_out_ids gather. Their dims follow n_outputs, which stays dynamic.
+    std::set<const ggml_tensor *> m_out_ids_derived;
 
     ModelParams m_model_params;
     ComputeParams m_compute_params;
