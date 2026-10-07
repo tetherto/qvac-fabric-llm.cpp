@@ -1,0 +1,114 @@
+#version 450
+
+#include "types.glsl"
+
+#extension GL_EXT_control_flow_attributes : enable
+
+layout (push_constant) uniform parameter {
+    uint L;
+    uint C;
+    uint B;
+    uint K;
+    uint dilation;
+    uint layout_id;
+    uint causal;
+    uint seg_len;
+    uint has_bias;
+    float eps;
+} p;
+
+layout (binding = 0) readonly buffer X { float data_x[]; };
+layout (binding = 1) readonly buffer W { float data_w[]; };
+layout (binding = 2) readonly buffer Bias { float data_bias[]; };
+layout (binding = 3) readonly buffer G { float data_g[]; };
+layout (binding = 4) readonly buffer Beta { float data_beta[]; };
+layout (binding = 5) writeonly buffer D { float data_d[]; };
+
+layout(local_size_x = 512, local_size_y = 1, local_size_z = 1) in;
+
+#define SUPERTONIC_DW_LN_VALUES_PER_LANE 8
+
+shared vec2 partial[512];
+
+uint offset_tc(uint t, uint c, uint batch) {
+    return batch * p.L * p.C + (p.layout_id == 0u ? t + c * p.L : c + t * p.C);
+}
+
+float depthwise_value(uint t, uint c, uint batch) {
+    const int lo = p.seg_len != 0u ? int((t / p.seg_len) * p.seg_len) : 0;
+    const int hi = p.seg_len != 0u ? lo + int(p.seg_len) : int(p.L);
+    const int k_off = p.causal != 0u ? -(int(p.K) - 1) : -(int(p.K) / 2);
+
+    // Keep the same two-taps-per-lane accumulation tree as the standalone
+    // depthwise shader so the value entering layer norm has identical F32 rounding.
+    precise float pair0 = 0.0f;
+    precise float pair1 = 0.0f;
+    precise float pair2 = 0.0f;
+    precise float pair3 = 0.0f;
+    [[unroll]] for (uint k = 0u; k < 8u; ++k) {
+        if (k < p.K) {
+            int src_t = int(t) + (int(k) + k_off) * int(p.dilation);
+            src_t = clamp(src_t, lo, hi - 1);
+            const float xv = data_x[offset_tc(uint(src_t), c, batch)];
+            const float wv = data_w[c * p.K + k];
+            if (k < 2u) {
+                pair0 = fma(xv, wv, pair0);
+            } else if (k < 4u) {
+                pair1 = fma(xv, wv, pair1);
+            } else if (k < 6u) {
+                pair2 = fma(xv, wv, pair2);
+            } else {
+                pair3 = fma(xv, wv, pair3);
+            }
+        }
+    }
+    precise float left = pair0 + pair1;
+    precise float right = pair2 + pair3;
+    precise float sum = left + right;
+    precise float result = p.has_bias != 0u ? sum + data_bias[c] : sum;
+    return result;
+}
+
+void main() {
+    const uint lane = gl_LocalInvocationID.x;
+    const uint t = gl_WorkGroupID.y;
+    const uint batch = gl_WorkGroupID.z;
+    if (t >= p.L || batch >= p.B) {
+        return;
+    }
+
+    float values[SUPERTONIC_DW_LN_VALUES_PER_LANE];
+    partial[lane] = vec2(0.0f, 0.0f);
+    [[unroll]] for (uint i = 0u; i < SUPERTONIC_DW_LN_VALUES_PER_LANE; ++i) {
+        const uint c = lane + i * 512u;
+        if (c < p.C) {
+            const float value = depthwise_value(t, c, batch);
+            values[i] = value;
+            partial[lane].x += value;
+            partial[lane].y += value * value;
+        }
+    }
+    barrier();
+    [[unroll]] for (uint stride = 256u; stride != 0u; stride >>= 1u) {
+        if (lane < stride) {
+            partial[lane] += partial[lane + stride];
+        }
+        barrier();
+    }
+
+    const float mean = partial[0].x / float(p.C);
+    const float variance = partial[0].y / float(p.C) - mean * mean;
+    const float inv_std = inversesqrt(variance + p.eps);
+
+    [[unroll]] for (uint i = 0u; i < SUPERTONIC_DW_LN_VALUES_PER_LANE; ++i) {
+        const uint c = lane + i * 512u;
+        if (c < p.C) {
+            const uint idx = offset_tc(t, c, batch);
+            // Preserve the standalone layer-norm shader's F32 affine boundaries.
+            precise float normalized = (values[i] - mean) * inv_std;
+            precise float scaled = normalized * data_g[c];
+            precise float shifted = scaled + data_beta[c];
+            data_d[idx] = shifted;
+        }
+    }
+}

@@ -5,8 +5,6 @@
 
 #extension GL_EXT_control_flow_attributes : enable
 
-#define FLT_MAX 3.402823466e+38F
-
 layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
 
 layout (binding = 0) readonly buffer A {A_TYPE data_a[];};
@@ -14,8 +12,19 @@ layout (binding = 1) writeonly buffer D {D_TYPE data_d[];};
 
 layout (constant_id = 0) const uint BLOCK_SIZE = 32;
 
-shared FLOAT_TYPE tmpmax[BLOCK_SIZE];
+shared A_TYPE tmpmax[BLOCK_SIZE];
 shared uint tmp[BLOCK_SIZE];
+
+// ggml_vec_argmax_f32 moves the index on every element equal to the running maximum, so a
+// row's answer is the last index holding the maximum. Reducing lexicographically on
+// (value, index) reproduces that whatever order the lanes visit the row in.
+bool better(A_TYPE va, uint ia, A_TYPE vb, uint ib) {
+    return va > vb || (va == vb && ia > ib);
+}
+
+uint round_up_pow2(uint n) {
+    return n <= 1 ? 1 : (2u << findMSB(n - 1));
+}
 
 void main() {
     const uint row = gl_WorkGroupID.z * 262144 + gl_WorkGroupID.y * 512 + gl_WorkGroupID.x;
@@ -25,31 +34,27 @@ void main() {
         return;
     }
 
-    A_TYPE amax = -FLT_MAX;
-    uint acol = col;
+    A_TYPE amax = uintBitsToFloat(0xFF800000u);
+    uint acol = 0;
 
-    if (col < p.KX) {
-        amax = data_a[row*p.KX + col];
-    }
-
-    for (uint i = col + BLOCK_SIZE; i < p.KX; i += BLOCK_SIZE) {
-        A_TYPE val = data_a[row*p.KX + i];
-        if (val > amax) {
-            amax = val;
+    for (uint i = col; i < p.KX; i += BLOCK_SIZE) {
+        const A_TYPE val = data_a[row*p.KX + i];
+        // the reference form, so a NaN propagates through the scan the same way
+        amax = (amax > val) ? amax : val;
+        if (amax == val) {
             acol = i;
         }
     }
 
-    tmp[col] = acol;
     tmpmax[col] = amax;
+    tmp[col] = acol;
 
     barrier();
-    [[unroll]] for (int s = int(BLOCK_SIZE) / 2; s > 0; s >>= 1) {
-        if (col < s && col + s < p.KX) {
-            if (tmpmax[col] < tmpmax[col + s]) {
-                tmpmax[col] = tmpmax[col + s];
-                tmp[col] = tmp[col + s];
-            }
+    // only the lanes that were given data need reducing, so short rows stop early
+    for (uint s = round_up_pow2(min(BLOCK_SIZE, p.KX)) / 2; s > 0; s >>= 1) {
+        if (col < s && better(tmpmax[col + s], tmp[col + s], tmpmax[col], tmp[col])) {
+            tmpmax[col] = tmpmax[col + s];
+            tmp[col] = tmp[col + s];
         }
         barrier();
     }

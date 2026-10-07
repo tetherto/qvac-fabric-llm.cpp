@@ -37,6 +37,7 @@ layout (push_constant) uniform parameter
     uint32_t OH_OW_IC_KD_KH_KW;
     uint32_t OW_IC_KD_KH_KW;
     uint32_t misalign_offsets;
+    uint32_t OW;
 } p;
 
 uint get_aoffset() { return p.misalign_offsets >> 16; }
@@ -83,6 +84,7 @@ void main() {
     uint32_t OD_OH_OW_IC_KD_KH_KW = p.OD_OH_OW_IC_KD_KH_KW;
     uint32_t OH_OW_IC_KD_KH_KW = p.OH_OW_IC_KD_KH_KW;
     uint32_t OW_IC_KD_KH_KW = p.OW_IC_KD_KH_KW;
+    uint32_t OW = p.OW;
 
     if (i >= IC_KD_KH_KW) {
         return;
@@ -93,32 +95,35 @@ void main() {
     const uint32_t ikh = (i - iic * KD_KH_KW - ikd * KH_KW) / KW;
     const uint32_t ikw = i % KW;
 
-    const uint32_t iow = gl_GlobalInvocationID.y;
-    for (uint32_t iz = gl_GlobalInvocationID.z; iz < N_OD_OH; iz += gl_NumWorkGroups.z) {
-        const uint32_t in_ = iz / OD_OH;
-        const uint32_t iod = (iz - in_*OD_OH) / OH;
-        const uint32_t ioh = iz % OH;
+    uint32_t iow = gl_GlobalInvocationID.y;
+    while (iow < OW) {
+        for (uint32_t iz = gl_GlobalInvocationID.z; iz < N_OD_OH; iz += gl_NumWorkGroups.z) {
+            const uint32_t in_ = iz / OD_OH;
+            const uint32_t iod = (iz - in_*OD_OH) / OH;
+            const uint32_t ioh = iz % OH;
 
-        const uint32_t iiw = iow * s0 + ikw * d0 - p0;
-        const uint32_t iih = ioh * s1 + ikh * d1 - p1;
-        const uint32_t iid = iod * s2 + ikd * d2 - p2;
+            const uint32_t iiw = iow * s0 + ikw * d0 - p0;
+            const uint32_t iih = ioh * s1 + ikh * d1 - p1;
+            const uint32_t iid = iod * s2 + ikd * d2 - p2;
 
-        const BDA_OFFSET_T offset_dst = BDA_OFFSET_T(in_)*OD_OH_OW_IC_KD_KH_KW + BDA_OFFSET_T(iod)*OH_OW_IC_KD_KH_KW + BDA_OFFSET_T(ioh)*OW_IC_KD_KH_KW + BDA_OFFSET_T(iow)*IC_KD_KH_KW + iic*KD_KH_KW + ikd * KH_KW + ikh*KW + ikw;
+            const BDA_OFFSET_T offset_dst = BDA_OFFSET_T(in_)*OD_OH_OW_IC_KD_KH_KW + BDA_OFFSET_T(iod)*OH_OW_IC_KD_KH_KW + BDA_OFFSET_T(ioh)*OW_IC_KD_KH_KW + BDA_OFFSET_T(iow)*IC_KD_KH_KW + iic*KD_KH_KW + ikd * KH_KW + ikh*KW + ikw;
 
-        const uint32_t offset_src = (in_*IC + iic)*nb13 + iid*nb12 + iih*nb11 + iiw*nb10;
+            const uint32_t offset_src = (in_*IC + iic)*nb13 + iid*nb12 + iih*nb11 + iiw*nb10;
 #if BDA
-        D_ptr dst_addr = D_ptr(p.dst_addr + D_SIZE * offset_dst);
-        if (iih >= IH || iiw >= IW || iid >= ID) {
-            dst_addr.d = D_TYPE(0.0f);
-        } else {
-            dst_addr.d = D_TYPE(data_a[offset_src + get_aoffset()]);
-        }
+            D_ptr dst_addr = D_ptr(p.dst_addr + D_SIZE * offset_dst);
+            if (iih >= IH || iiw >= IW || iid >= ID) {
+                dst_addr.d = D_TYPE(0.0f);
+            } else {
+                dst_addr.d = D_TYPE(data_a[offset_src + get_aoffset()]);
+            }
 #else
-        if (iih >= IH || iiw >= IW || iid >= ID) {
-            data_d[offset_dst + get_doffset()] = D_TYPE(0.0f);
-        } else {
-            data_d[offset_dst + get_doffset()] = D_TYPE(data_a[offset_src + get_aoffset()]);
-        }
+            if (iih >= IH || iiw >= IW || iid >= ID) {
+                data_d[offset_dst + get_doffset()] = D_TYPE(0.0f);
+            } else {
+                data_d[offset_dst + get_doffset()] = D_TYPE(data_a[offset_src + get_aoffset()]);
+            }
 #endif
+        }
+        iow += gl_NumWorkGroups.y;
     }
 }

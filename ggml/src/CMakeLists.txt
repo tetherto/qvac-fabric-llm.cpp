@@ -186,6 +186,12 @@ endif()
 
 # ggml
 
+# GGML_BACKEND_DL works with static core when PIC is enabled below.
+
+if (GGML_CPU_STATIC AND GGML_CPU_ALL_VARIANTS)
+    message(FATAL_ERROR "GGML_CPU_STATIC is incompatible with GGML_CPU_ALL_VARIANTS")
+endif()
+
 add_library(ggml-base
             ../include/ggml.h
             ../include/ggml-alloc.h
@@ -329,6 +335,7 @@ if (GGML_OPENMP_FETCH)
         COMMAND ${CMAKE_COMMAND} -E copy_if_different "${GGML_OPENMP_LICENSE}" "${GGML_OPENMP_RUNTIME_OUTPUT_DIR}/LICENSE-LLVM-OpenMP")
     add_dependencies(ggml-base ggml-openmp-runtime)
     install(FILES "${GGML_OPENMP_RUNTIME}" DESTINATION ${CMAKE_INSTALL_BINDIR})
+    install(FILES "${GGML_OPENMP_LIBRARY}" DESTINATION ${CMAKE_INSTALL_LIBDIR})
     install(FILES "${GGML_OPENMP_LICENSE}" DESTINATION ${CMAKE_INSTALL_BINDIR} RENAME LICENSE-LLVM-OpenMP)
 
     set(GGML_OPENMP_TARGET_C ggml-openmp-c)
@@ -365,6 +372,10 @@ if (GGML_OPENMP_ENABLED)
     target_link_libraries(ggml-base PRIVATE ${GGML_OPENMP_TARGET_C} ${GGML_OPENMP_TARGET_CXX})
 endif()
 
+if (DEFINED GGML_MAX_NAME)
+    target_compile_definitions(ggml-base PUBLIC GGML_MAX_NAME=${GGML_MAX_NAME})
+endif()
+
 add_library(ggml
             ggml-backend-dl.cpp
             ggml-backend-reg.cpp)
@@ -393,27 +404,26 @@ if (GGML_VECTOR_INDEX)
 endif()
 
 function(ggml_add_backend_library backend)
-    if (GGML_BACKEND_DL)
+    if (GGML_BACKEND_DL AND NOT (GGML_CPU_STATIC AND ${backend} MATCHES "^ggml-cpu"))
         add_library(${backend} MODULE ${ARGN})
         # write the shared library to the output directory
-        # Set output name with qvac- prefix to match backend_filename_prefix() in ggml-backend-reg.cpp
         set_target_properties(${backend} PROPERTIES
-            LIBRARY_OUTPUT_DIRECTORY ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}
-            OUTPUT_NAME "qvac-${backend}")
+            LIBRARY_OUTPUT_DIRECTORY ${CMAKE_RUNTIME_OUTPUT_DIRECTORY})
         target_compile_definitions(${backend} PRIVATE GGML_BACKEND_DL)
         # Do not add dependency, the User will have to explicitely build and install
         # the available `ggml::ggml-*` backend targets. This is for better integration
         # with cmake-bare
         # add_dependencies(ggml ${backend})
 
+        # Runtime-loaded modules are found by the registry loader, never linked by a
+        # consumer, so they stay out of the exported targets: a package may prune
+        # modules (per-arch CPU tiers) without leaving dangling imported targets.
         if (GGML_BACKEND_DIR)
             install(TARGETS ${backend}
-                    EXPORT ggml-targets
                     LIBRARY DESTINATION ${GGML_BACKEND_DIR}
                     RUNTIME DESTINATION ${GGML_BACKEND_DIR})
         else()
             install(TARGETS ${backend}
-                    EXPORT ggml-targets
                     LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
                     RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
         endif()
@@ -426,7 +436,7 @@ function(ggml_add_backend_library backend)
     target_link_libraries(${backend} PRIVATE ggml-base)
     target_include_directories(${backend} PRIVATE ..)
 
-    if (${BUILD_SHARED_LIBS} OR GGML_BACKEND_DL)
+    if (BUILD_SHARED_LIBS OR GGML_BACKEND_DL)
         target_compile_definitions(${backend} PRIVATE GGML_BACKEND_BUILD)
         target_compile_definitions(${backend} PUBLIC  GGML_BACKEND_SHARED)
     endif()
@@ -461,6 +471,9 @@ function(ggml_add_backend backend)
         if (NOT GGML_BACKEND_DL)
             string(TOUPPER "GGML_USE_${backend}" backend_use)
             target_compile_definitions(ggml PUBLIC ${backend_use})
+        endif()
+        if (GGML_CPU_STATIC AND "${backend}" STREQUAL "CPU")
+            target_compile_definitions(ggml PUBLIC GGML_USE_CPU)
         endif()
     endif()
 endfunction()
@@ -671,6 +684,12 @@ if (BUILD_SHARED_LIBS OR GGML_BACKEND_DL)
     foreach (target ${GGML_CORE_TARGETS})
         set_target_properties(${target} PROPERTIES POSITION_INDEPENDENT_CODE ON)
         target_compile_definitions(${target} PRIVATE GGML_BUILD)
-        target_compile_definitions(${target} PUBLIC  GGML_SHARED)
+        # A static core linked into MODULE backends must not advertise itself
+        # as a DLL: on Windows GGML_SHARED turns GGML_API into
+        # __declspec(dllimport) inside the backend's translation units, and
+        # their __imp_ references cannot be satisfied by the static archive.
+        if (BUILD_SHARED_LIBS OR NOT WIN32)
+            target_compile_definitions(${target} PUBLIC  GGML_SHARED)
+        endif()
     endforeach()
 endif()

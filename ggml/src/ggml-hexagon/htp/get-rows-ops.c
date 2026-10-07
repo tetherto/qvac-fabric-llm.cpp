@@ -148,10 +148,90 @@ static void get_rows_thread_f32_f32_hvx(unsigned int nth, unsigned int ith, void
          ne00, ne01, ne02, ne03, ir0, ir1, ne10, ne11, ne12, ne13, ne0, ne1, ne2, ne3, (unsigned) qt);
 }
 
+static inline float get_rows_bf16_to_f32(uint16_t v) {
+    const uint32_t bits = (uint32_t) v << 16;
+    float          f;
+    memcpy(&f, &bits, sizeof(f));
+    return f;
+}
+
+static void get_rows_widen_row(float * restrict dst, const uint8_t * restrict src, uint32_t n, uint32_t type) {
+    if (type == HTP_TYPE_F16) {
+        const __fp16 * s = (const __fp16 *) src;
+        for (uint32_t i = 0; i < n; i++) {
+            dst[i] = (float) s[i];
+        }
+    } else {
+        const uint16_t * s = (const uint16_t *) src;
+        for (uint32_t i = 0; i < n; i++) {
+            dst[i] = get_rows_bf16_to_f32(s[i]);
+        }
+    }
+}
+
+static void get_rows_thread_half_f32(unsigned int nth, unsigned int ith, void *data) {
+    struct get_rows_context * grctx = (struct get_rows_context *)data;
+    struct htp_ops_context * octx = grctx->octx;
+    get_rows_preamble;
+
+    const uint32_t dr  = grctx->tasks_per_thread;
+    const uint32_t ir0 = dr * ith;
+    if (ir0 >= grctx->total_tasks) {
+        return;
+    }
+    const uint32_t ir1 = MIN(ir0 + dr, grctx->total_tasks);
+
+    const bool     is_i32 = (octx->src[1]->type == HTP_TYPE_I32);
+    const uint32_t type   = octx->src[0]->type;
+    for (uint32_t i = ir0; i < ir1; ++i) {
+        const uint32_t i12 = fastdiv(i, &grctx->get_rows_div_ne10_ne11);
+        const uint32_t rem = i - i12 * ne11 * ne10;
+        const uint32_t i11 = fastdiv(rem, &grctx->get_rows_div_ne10);
+        const uint32_t i10 = rem - i11 * ne10;
+
+        const uintptr_t src1_addr = octx->src[1]->data + i10*nb10 + i11*nb11 + i12*nb12;
+        uint32_t i01 = is_i32 ? *(int32_t *)src1_addr : *(int64_t *)src1_addr;
+
+        if (i01 >= ne01) {
+            continue;
+        }
+
+        const uintptr_t src0_ptr = octx->src[0]->data + i01*nb01 + i11*nb02 + i12*nb03;
+        const uintptr_t dst_ptr  = octx->dst->data    + i10*nb1  + i11*nb2  + i12*nb3;
+        get_rows_widen_row((float *) dst_ptr, (const uint8_t *) src0_ptr, ne00, type);
+    }
+}
+
+static bool get_rows_src_is_half(uint32_t type) {
+    return type == HTP_TYPE_F16 || type == HTP_TYPE_BF16;
+}
+
+static int get_rows_half(struct htp_ops_context * octx) {
+    get_rows_preamble;
+
+    if (octx->src[0]->nb[0] != sizeof(uint16_t) || octx->dst->nb[0] != sizeof(float)) {
+        return HTP_STATUS_NO_SUPPORT;
+    }
+
+    struct get_rows_context grctx;
+    grctx.octx                   = octx;
+    grctx.get_rows_div_ne10      = init_fastdiv_values(octx->src[1]->ne[0]);
+    grctx.get_rows_div_ne10_ne11 = init_fastdiv_values(octx->src[1]->ne[0] * octx->src[1]->ne[1]);
+    grctx.total_tasks            = nr;
+
+    const uint32_t n_threads = MIN(nr, octx->n_threads);
+    if (n_threads == 0) {
+        return HTP_STATUS_OK;
+    }
+    grctx.tasks_per_thread = (nr + n_threads - 1) / n_threads;
+    worker_pool_run_func(octx->ctx->worker_pool, get_rows_thread_half_f32, &grctx, n_threads);
+    return HTP_STATUS_OK;
+}
+
 int op_get_rows(struct htp_ops_context * octx) {
     get_rows_preamble;
 
-    if (octx->src[0]->type != HTP_TYPE_F32) {
+    if (octx->src[0]->type != HTP_TYPE_F32 && !get_rows_src_is_half(octx->src[0]->type)) {
         return HTP_STATUS_NO_SUPPORT;
     }
 
@@ -165,6 +245,10 @@ int op_get_rows(struct htp_ops_context * octx) {
 
     if (octx->flags & HTP_OPFLAGS_SKIP_COMPUTE) {
         return HTP_STATUS_OK;
+    }
+
+    if (get_rows_src_is_half(octx->src[0]->type)) {
+        return get_rows_half(octx);
     }
 
     const uint32_t nb00 = octx->src[0]->nb[0];

@@ -61,4 +61,18 @@ static inline void htp_trace_event_stop(struct htp_thread_trace * tr, uint16_t i
     htp_trace_event(tr, id, info, HTP_TRACE_EVT_STOP);
 }
 
+// Helper for emitting a trace event with an explicit cycles value (not a
+// start/stop pair). Used by the per-phase FA profiler in flash-attn-ops.c to
+// smuggle accumulated pcycles back to the host, since FARF ALWAYS/ERROR
+// messages don't reach logcat on the target Android build.
+static inline void htp_trace_event_raw(struct htp_thread_trace * tr, uint16_t id, uint16_t info, uint32_t cycles) {
+    if (tr->count < tr->max_events) {
+        uint32_t i = tr->count;
+        tr->events[i].id     = id;
+        tr->events[i].info   = info;
+        tr->events[i].cycles = cycles;
+        tr->count++;
+    }
+}
+
 #endif /* HEX_PROFILE_H */

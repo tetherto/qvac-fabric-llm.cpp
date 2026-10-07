@@ -1,0 +1,82 @@
+#version 450
+
+#extension GL_EXT_shader_16bit_storage : require
+
+#include "types.glsl"
+
+// Tiled 1D im2col (KH == OH == 1): stages the contiguous input window for a
+// TILE_OW x TILE_IC tile in shared memory; host-gated by ggml_vk_im2col_1d_use_tiled.
+
+layout (push_constant) uniform parameter
+{
+    BDA_STORAGE_T dst_addr;   // unused by this non-BDA pipeline; keeps the layout
+    uint batch_offset; uint offset_delta;
+    uint IC;
+    uint IW; uint IH;
+    uint OW; uint OH;
+    uint KW; uint KH;
+    uint OH_batch;
+    uint CHW;
+    int s0; int s1;
+    int p0; int p1;
+    int d0; int d1;
+    uint batch_IC;
+} p;
+
+#define TILE_OW     128
+#define TILE_IC     16
+#define SMEM_FLOATS 6144
+#define N_THREADS   512
+
+layout(local_size_x = N_THREADS, local_size_y = 1, local_size_z = 1) in;
+
+layout (binding = 0) readonly  buffer X {A_TYPE data_a[];};
+layout (binding = 1) writeonly buffer D {D_TYPE data_d[];};
+
+shared float smem[SMEM_FLOATS];
+
+void main() {
+    const uint ow0   = gl_WorkGroupID.x * TILE_OW;
+    const uint ic0   = gl_WorkGroupID.y * TILE_IC;
+    const uint batch = gl_WorkGroupID.z;
+    const uint tid   = gl_LocalInvocationID.x;
+
+    // Input window covering iiw for ow in [ow0, ow0 + TILE_OW).
+    const int  win_lo = int(ow0) * p.s0 - p.p0;
+    const uint win_w  = uint(TILE_OW - 1) * uint(p.s0) + (p.KW - 1) * uint(p.d0) + 1;
+
+    const uint src_batch = batch * p.batch_offset;
+
+    // Load: TILE_IC rows x win_w contiguous floats; zero-pad out of range,
+    // matching the generic shader's padding semantics.
+    const uint total = TILE_IC * win_w;
+    for (uint i = tid; i < total; i += N_THREADS) {
+        const uint row = i / win_w;
+        const uint col = i - row * win_w;
+        const int  iiw = win_lo + int(col);
+        const uint ic  = ic0 + row;
+        float v = 0.0f;
+        if (ic < p.IC && iiw >= 0 && iiw < int(p.IW)) {
+            v = float(data_a[src_batch + ic * p.offset_delta + uint(iiw)]);
+        }
+        smem[i] = v;
+    }
+    barrier();
+
+    // Store: kx fastest, then ic, then ow -> contiguous TILE_IC*KW runs in dst.
+    const uint tile_out = TILE_OW * TILE_IC * p.KW;
+    for (uint o = tid; o < tile_out; o += N_THREADS) {
+        const uint kx   = o % p.KW;
+        const uint t1   = o / p.KW;
+        const uint ic_l = t1 % TILE_IC;
+        const uint ow_l = t1 / TILE_IC;
+        const uint ow   = ow0 + ow_l;
+        const uint ic   = ic0 + ic_l;
+        if (ow >= p.OW || ic >= p.IC) {
+            continue;
+        }
+        const int  iiw     = int(ow) * p.s0 + int(kx) * p.d0 - p.p0;
+        const uint dst_row = (batch * p.OW + ow) * p.CHW;
+        data_d[dst_row + ic * p.KW + kx] = D_TYPE(smem[ic_l * win_w + uint(iiw - win_lo)]);
+    }
+}

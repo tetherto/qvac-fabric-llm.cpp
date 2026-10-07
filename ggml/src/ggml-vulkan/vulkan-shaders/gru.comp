@@ -1,0 +1,77 @@
+#version 450
+
+#include "types.glsl"
+
+// Fused batched GRU (PyTorch: gate order r,z,n, reset on hh new-gate, h0=0).
+// whh [H,3H], gi [3H,B,L], bhh [3H] -> dst [H,B,L]; 128-lane WG packs 128/H batch elems.
+#define GRU_MAX_H 128
+
+layout (push_constant) uniform parameter
+{
+    uint H;
+    uint B;
+    uint L;
+    uint reverse;
+} p;
+
+layout (binding = 0) readonly buffer W {float data_whh[];};
+layout (binding = 1) readonly buffer G {float data_gi[];};
+layout (binding = 2) readonly buffer BH {float data_bhh[];};
+layout (binding = 3) writeonly buffer D {float data_d[];};
+
+layout(local_size_x = GRU_MAX_H, local_size_y = 1, local_size_z = 1) in;
+
+shared float h_l[GRU_MAX_H];        // flat, slot-major: h_l[b_local*H + j] == h_l[lane]
+shared float gh_l[3 * GRU_MAX_H];   // flat: gh_l[b_local*3H + g]
+
+void main() {
+    const uint lane    = gl_LocalInvocationID.x;
+    const uint PB      = GRU_MAX_H / p.H;                   // batch elems per WG (uniform)
+    const uint b_local = lane / p.H;                        // slot in this WG
+    const uint j       = lane - b_local * p.H;              // hidden unit
+    const uint b       = gl_WorkGroupID.y * PB + b_local;   // global batch element
+    const uint H3      = 3u * p.H;
+    const uint hbase   = b_local * p.H;                     // == lane - j
+    const uint gbase   = b_local * H3;
+
+    // Ragged (128 % H != 0) and batch-tail lanes idle but run every barrier.
+    const bool lane_live = (b_local < PB) && (b < p.B);
+
+    if (lane_live) {
+        h_l[lane] = 0.0f;                                   // zero initial state
+    }
+    barrier();
+
+    // barrier()s stay in uniform control flow: every lane runs all L steps.
+    for (uint s = 0u; s < p.L; ++s) {
+        const uint t       = (p.reverse != 0u) ? (p.L - 1u - s) : s;
+        const uint gi_base = H3 * b + H3 * p.B * t;
+
+        // pass 1: gh[g] = sum_k whh[k,g]*h[k] + bhh[g] for this lane's 3 gate rows
+        // (CPU reference order: bias added after the accumulation).
+        if (lane_live) {
+            for (uint gg = 0u; gg < 3u; ++gg) {
+                const uint g     = gg * p.H + j;
+                const uint wbase = p.H * g;
+                float acc = 0.0f;
+                for (uint k = 0u; k < p.H; ++k) {
+                    acc += data_whh[wbase + k] * h_l[hbase + k];
+                }
+                gh_l[gbase + g] = acc + data_bhh[g];
+            }
+        }
+        barrier();
+
+        // pass 2: gates + state update (each lane touches only h_l[lane]).
+        // exp/tanh args saturated: some mobile drivers NaN on exp overflow (>~88.7) not +inf; clamps bit-equal in fp32.
+        if (lane_live) {
+            const float r  = 1.0f / (1.0f + exp(min(-(data_gi[gi_base + j] + gh_l[gbase + j]), 88.0f)));
+            const float z  = 1.0f / (1.0f + exp(min(-(data_gi[gi_base + p.H + j] + gh_l[gbase + p.H + j]), 88.0f)));
+            const float nc = tanh(clamp(data_gi[gi_base + 2u * p.H + j] + r * gh_l[gbase + 2u * p.H + j], -15.0f, 15.0f));
+            const float hn = nc + z * (h_l[lane] - nc);
+            data_d[p.H * b + p.H * p.B * t + j] = hn;
+            h_l[lane] = hn;
+        }
+        barrier();
+    }
+}

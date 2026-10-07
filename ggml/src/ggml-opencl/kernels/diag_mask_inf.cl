@@ -33,19 +33,24 @@ kernel void kernel_diag_mask_inf_8(
         ulong offsetd,
         int ne00,
         int ne01,
-        int n_past
+        int n_past,
+        ulong n
 ) {
     src0 = (global float4*)((global char*)src0 + offset0);
     dst = (global float4*)((global char*)dst + offsetd);
 
-    int i = 2*get_global_id(0);
+    ulong gid = get_global_id(0);
+    if (gid >= n) {
+        return;
+    }
+    ulong i = 2*gid;
 
     dst[i+0] = src0[i+0];
     dst[i+1] = src0[i+1];
-    int i4 = 4*i;
-    int i02 = i4/(ne00*ne01); i4 -= i02*ne00*ne01;
-    int i01 = i4/(ne00);      i4 -= i01*ne00;
-    int i00 = i4;
+    ulong i4 = 4*i;
+    ulong i02 = i4/((ulong)ne00*ne01); i4 -= i02*ne00*ne01;
+    ulong i01 = i4/ne00;               i4 -= i01*ne00;
+    ulong i00 = i4;
     for (int k = 3; k >= 0; --k) {
         if (i00 + 4 + k <= n_past + i01) {
             break;

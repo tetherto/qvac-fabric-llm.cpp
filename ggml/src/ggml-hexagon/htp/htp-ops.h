@@ -2,6 +2,8 @@
 #define HTP_OPS_H
 
 #include <assert.h>
+#include <stddef.h>
+#include <stdint.h>
 
 // ggml-common.h must be included prio to this header
 
@@ -25,6 +27,7 @@ enum htp_data_type {
     HTP_TYPE_IQ4_NL = 20,
     HTP_TYPE_I32    = 26,
     HTP_TYPE_I64    = 27,
+    HTP_TYPE_BF16   = 30,
     HTP_TYPE_MXFP4  = 39,
 
     // types used internally for repack, dyn.quant, etc
@@ -70,6 +73,7 @@ enum htp_op_code {
     HTP_OP_UNARY_NEG,
     HTP_OP_UNARY_SOFTPLUS,
     HTP_OP_UNARY_TANH,
+    HTP_OP_UNARY_RELU,
     HTP_OP_GLU_SWIGLU,
     HTP_OP_GLU_SWIGLU_OAI,
     HTP_OP_GLU_GEGLU,
@@ -99,6 +103,12 @@ enum htp_op_code {
     HTP_OP_CONCAT,
     HTP_OP_CLAMP,
     HTP_OP_IM2COL,
+    HTP_OP_CONV_2D_DW,
+    HTP_OP_TIMESTEP_EMBEDDING,
+    HTP_OP_SNAKE,
+    HTP_OP_COL2IM_1D,
+    HTP_OP_UNARY_GELU_ERF,
+    HTP_OP_DEPTHWISE_CONV_1D,
 
     HTP_OP_INVALID
 };
@@ -233,5 +243,24 @@ struct htp_opbatch_rsp {
     uint64_t cycles_stop;    // Stop cycle counter
     // struct htp_prof_desc profs[];  -- dspqueue buf 0
 };
+
+// Fused depthwise 1D convolution: VTCM row pitch (floats) that holds one
+// zero-padded input channel and every tap read of the 32-wide output vectors.
+#define HTP_DW1D_LANES 32
+
+static inline uint32_t htp_dw1d_round_up(uint32_t n) {
+    return (n + HTP_DW1D_LANES - 1) / HTP_DW1D_LANES * HTP_DW1D_LANES;
+}
+
+static inline uint32_t htp_dw1d_in_pitch(uint32_t out_len, uint32_t taps, uint32_t dilation, uint32_t pad,
+                                         uint32_t in_len) {
+    const uint32_t reach  = htp_dw1d_round_up(out_len) + (taps - 1) * dilation;
+    const uint32_t staged = pad + in_len;
+    return htp_dw1d_round_up(reach > staged ? reach : staged);
+}
+
+static inline size_t htp_dw1d_vtcm_bytes(uint32_t channels, uint32_t in_pitch, uint32_t out_pitch) {
+    return (size_t) channels * (in_pitch + out_pitch) * sizeof(float);
+}
 
 #endif /* HTP_OPS_H */

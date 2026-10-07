@@ -237,7 +237,7 @@ def do_test(libggml_path: Path, quick: bool = False, user_type: GGMLQuantization
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Test Python (de)quantization against the reference C implementation")
-    parser.add_argument("--libggml", type=Path, default=Path(__file__).parent.parent.parent / "build" / "bin" / "libggml.so", help="The path to libggml.so")
+    parser.add_argument("--libggml", type=Path, default=Path(__file__).parent.parent.parent / "build" / "bin" / "libqvac-ggml.so", help="The path to libqvac-ggml.so")
     parser.add_argument("--quick", action="store_true", help="Don't quantize with C when it's not strictly necessary")
     parser.add_argument("--type", type=str, help="The quant type to test (all by default)")
 

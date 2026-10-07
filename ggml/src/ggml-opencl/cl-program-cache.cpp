@@ -317,6 +317,9 @@ cl_program_cache_state cl_program_cache_init(cl_device_id device) {
     cl_program_cache_state st;
 
     const char * env = std::getenv("GGML_OPENCL_KERNEL_CACHE_DIR");
+    if (!env || !*env) {
+        env = std::getenv("GGML_OPENCL_CACHE_DIR");
+    }
     if (env && (!std::strcmp(env, "0")    || !std::strcmp(env, "off")  ||
                 !std::strcmp(env, "none") || !std::strcmp(env, "disable") ||
                 !std::strcmp(env, "disabled"))) {

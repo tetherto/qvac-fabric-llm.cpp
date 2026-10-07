@@ -202,6 +202,12 @@ typedef std::unique_ptr<ggml_backend_metal_buffer_type, ggml_backend_metal_buffe
 static ggml_backend_buffer_t ggml_backend_metal_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size, bool shared) {
     ggml_metal_device_t ctx_dev = (ggml_metal_device_t)buft->device->context;
     ggml_metal_buffer_t res = ggml_metal_buffer_init(ctx_dev, size, shared);
+    if (res == NULL) {
+        // Allocator returned NULL (Metal heap exhaustion / transient OS
+        // eviction). Surface the failure as a NULL backend buffer instead
+        // of constructing one whose context is NULL.
+        return NULL;
+    }
 
     // ggml_metal_buffer_init returns NULL on allocation / residency-set failure.
     // Without this guard the next line dereferences a null pointer at offset 0x10
@@ -609,8 +615,17 @@ static int ggml_backend_metal_default_n_cb(void) {
 }
 
 ggml_backend_t ggml_backend_metal_init(void) {
-    ggml_backend_dev_t dev = ggml_backend_reg_dev_get(ggml_backend_metal_reg(), 0);
-    ggml_metal_device_t ctx_dev = (ggml_metal_device_t)dev->context;
+    ggml_backend_reg_t reg = ggml_backend_metal_reg();
+    if (reg == NULL || ggml_backend_reg_dev_count(reg) == 0) {
+        GGML_LOG_ERROR("%s: error: no Metal devices available\n", __func__);
+        return NULL;
+    }
+    ggml_backend_dev_t dev = ggml_backend_reg_dev_get(reg, 0);
+    ggml_metal_device_t ctx_dev = (ggml_metal_device_t)(dev ? dev->context : NULL);
+    if (ctx_dev == NULL) {
+        GGML_LOG_ERROR("%s: error: Metal device init failed - falling back to CPU\n", __func__);
+        return NULL;
+    }
 
     ggml_metal_t ctx = ggml_metal_init(ctx_dev);
     if (ctx == NULL) {
@@ -747,6 +762,8 @@ static ggml_backend_buffer_t ggml_backend_metal_device_buffer_mapped(ggml_backen
 
     ggml_metal_buffer_t res = ggml_metal_buffer_map(ctx_dev, ptr, size, max_tensor_size);
     if (res == NULL) {
+        // Mapping failed (e.g. address range rejected, allocator OOM).
+        // Don't construct a backend buffer wrapping a NULL context.
         return NULL;
     }
 
@@ -914,10 +931,14 @@ static ggml_backend_reg_i ggml_backend_metal_reg_i = {
 };
 
 static ggml_backend_dev_t ggml_backend_metal_device_init(ggml_backend_reg_t reg, int device) {
+    ggml_metal_device_t ctx = ggml_metal_device_get(device);
+    if (ctx == NULL) {
+        return NULL;
+    }
     return new ggml_backend_device {
         /* .iface   = */ ggml_backend_metal_device_i,
         /* .reg     = */ reg,
-        /* .context = */ ggml_metal_device_get(device),
+        /* .context = */ ctx,
     };
 }
 
@@ -957,12 +978,8 @@ ggml_backend_reg_t ggml_backend_metal_reg(void) {
 
             for (int i = 0; i < g_devices; ++i) {
                 auto * dev = ggml_backend_metal_device_init(&reg, i);
-
-                // Skip unusable devices (e.g. paravirtualized GPUs with no working simdgroup
-                // intrinsics).
-                if (!ggml_metal_device_get_props((ggml_metal_device_t)dev->context)->has_simdgroup_reduction) {
-                    GGML_LOG_WARN("%s: skipping Metal device %d (no simdgroup reduction support)\n", __func__, i);
-                    ggml_backend_metal_device_free(dev);
+                if (dev == NULL) {
+                    GGML_LOG_ERROR("%s: error: failed to init Metal device %d - skipping\n", __func__, i);
                     continue;
                 }
 

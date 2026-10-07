@@ -1,0 +1,69 @@
+#version 450
+
+#include "types.glsl"
+#include "generic_unary_head.glsl"
+
+// Large-tile variant of copy_transpose.comp: 64x128 tiles read 512-byte and
+// write 256-byte contiguous segments; host-gated by tensor size and device limits.
+
+#define TILE_I00 64
+#define TILE_I01 128
+
+layout(local_size_x = 512, local_size_y = 1, local_size_z = 1) in;
+
+shared uint sh[TILE_I00][TILE_I01 + 1];
+
+void iter(uvec3 wg_id) {
+    const uint tile_i00 = wg_id.x * TILE_I00;
+    const uint tile_i01 = wg_id.y * TILE_I01;
+    const uint i2  = wg_id.z % p.ne12;
+    const uint i3  = wg_id.z / p.ne12;
+    const uint tid = gl_LocalInvocationID.x;
+
+    // Load: 128 consecutive i01 per i00 row -> contiguous 512 B reads.
+    {
+        const uint col  = tid % TILE_I01;
+        const uint row0 = tid / TILE_I01;  // 0..3
+        const uint i01  = tile_i01 + col;
+        [[unroll]] for (uint r = 0; r < TILE_I00; r += 4) {
+            const uint i00 = tile_i00 + row0 + r;
+            if (i00 < p.ne00 && i01 < p.ne01 && i2 < p.ne02 && i3 < p.ne03) {
+                const uint src_idx = i00 * p.nb00 + i01 * p.nb01 + i2 * p.nb02 + i3 * p.nb03;
+                sh[row0 + r][col] = uint(data_a[get_aoffset() + src_idx]);
+            }
+        }
+    }
+
+    barrier();
+
+    // Store: 64 consecutive i0 per i1 row -> contiguous 256 B writes.
+    {
+        const uint lane = tid % TILE_I00;
+        const uint row0 = tid / TILE_I00;  // 0..7
+        const uint i0   = tile_i00 + lane;
+        [[unroll]] for (uint r = 0; r < TILE_I01; r += 8) {
+            const uint i1 = tile_i01 + row0 + r;
+            if (i0 < p.ne10 && i1 < p.ne11 && i2 < p.ne12 && i3 < p.ne13) {
+                const uint dst_idx = i0 * p.nb10 + i1 * p.nb11 + i2 * p.nb12 + i3 * p.nb13;
+                data_d[get_doffset() + dst_idx] = D_TYPE(sh[lane][row0 + r]);
+            }
+        }
+    }
+}
+
+#define CEIL_DIV(a, b) (((a) + (b) - 1) / (b))
+
+void main() {
+    bool need_barrier = false;
+    for (uint z = gl_WorkGroupID.z; z < p.ne12 * p.ne13; z += gl_NumWorkGroups.z) {
+        for (uint y = gl_WorkGroupID.y; y < CEIL_DIV(p.ne11, TILE_I01); y += gl_NumWorkGroups.y) {
+            for (uint x = gl_WorkGroupID.x; x < CEIL_DIV(p.ne10, TILE_I00); x += gl_NumWorkGroups.x) {
+                if (need_barrier) {
+                    barrier();
+                }
+                need_barrier = true;
+                iter(uvec3(x, y, z));
+            }
+        }
+    }
+}

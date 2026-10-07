@@ -293,6 +293,49 @@ static inline uint32_t dma_queue_capacity(dma_queue * q) {
     return q->ring->capacity;
 }
 
+// Largest stride or row size, and largest row count, one 2D descriptor holds.
+// Assigning more truncates the bit field: from v75 on dma_queue_push hands
+// every transfer to a single descriptor.
+#if __HVX_ARCH__ < 75
+#define DMA_2D_MAX_SPAN 0xffffu
+#else
+#define DMA_2D_MAX_SPAN 0xffffffu
+#endif
+#define DMA_2D_MAX_ROWS 0xffffu
+
+static inline bool dma_2d_fits(size_t dst_stride, size_t src_stride, size_t row_size, size_t nrows) {
+    return dst_stride <= DMA_2D_MAX_SPAN && src_stride <= DMA_2D_MAX_SPAN && row_size <= DMA_2D_MAX_SPAN &&
+           nrows <= DMA_2D_MAX_ROWS;
+}
+
+static inline void dma_queue_copy_each_row(dma_queue * q, dma_ptr dptr, size_t dst_stride, size_t src_stride,
+                                           size_t row_size, size_t nrows) {
+    uint8_t *       dst = (uint8_t *) dptr.dst;
+    const uint8_t * src = (const uint8_t *) dptr.src;
+    for (size_t r = 0; r < nrows; r++) {
+        const dma_ptr row = dma_make_ptr(dst + r * dst_stride, src + r * src_stride);
+        while (!dma_queue_push_single_1d(q, row, row_size)) {
+            dma_queue_flush(q);
+        }
+    }
+    dma_queue_flush(q);
+}
+
+// Copies nrows rows of row_size bytes and drains q, so it must not hold other
+// transfers. One 2D descriptor carries the copy when its fields fit, else one
+// 1D descriptor per row, which keeps any stride exact.
+static inline void dma_queue_copy_rows(dma_queue * q, dma_ptr dptr, size_t dst_stride, size_t src_stride,
+                                       size_t row_size, size_t nrows) {
+    if (!dma_2d_fits(dst_stride, src_stride, row_size, nrows)) {
+        dma_queue_copy_each_row(q, dptr, dst_stride, src_stride, row_size, nrows);
+        return;
+    }
+    while (!dma_queue_push_single_2d(q, dptr, dst_stride, src_stride, row_size, nrows)) {
+        dma_queue_flush(q);
+    }
+    dma_queue_flush(q);
+}
+
 #if __HVX_ARCH__ < 75
 
 // Overflow-safe DMA push: all 2d descriptor fields (row_size, nrows, src_stride, dst_stride) are 16-bit, max 65535.

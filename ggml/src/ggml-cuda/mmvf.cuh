@@ -12,3 +12,8 @@ void ggml_cuda_op_mul_mat_vec_f(
     const int64_t src1_padded_row_size, cudaStream_t stream);
 
 bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, const int64_t * src0_ne, const size_t * src0_nb, int64_t ne11);
+
+// Whether MMVF can serve an explicit GGML_PREC_F32 request for half-precision weights. It
+// reads the activations as f32 and accumulates in f32, where MMF rounds the activations to
+// the weight type for the MMA and overflows past the fp16 range.
+bool ggml_cuda_mmvf_supports_prec_f32(enum ggml_type type, const int64_t * src0_ne, const size_t * src0_nb, int64_t ne11);

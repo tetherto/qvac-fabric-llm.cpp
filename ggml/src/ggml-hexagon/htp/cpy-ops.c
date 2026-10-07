@@ -232,6 +232,107 @@ static void cpy_thread_f32_f16_sameshape(unsigned int nth, unsigned int ith, voi
     }
 }
 
+// Parakeet's subsampler feeds the pointwise matmul with a
+// (permuted) view where dim0 has a huge byte stride (nb00 != elem_size).
+// The row-based sameshape kernels above assume packed inner rows and were
+// dispatched to NO_SUPPORT for this shape. This scalar variant walks every
+// element via its full stride quadruple so it works for arbitrary permuted
+// / strided sources. Performance is unoptimised — kept simple for
+// correctness; can be re-vectorised once we know which axis is packed.
+static void cpy_thread_f32_f16_strided(unsigned int nth, unsigned int ith, void * data) {
+    struct htp_copy_context * ct = (struct htp_copy_context *) data;
+    struct htp_ops_context * octx = ct->octx;
+    cpy_preamble;
+
+    const uint32_t dr  = ct->src0_nrows_per_thread;
+    const uint32_t ir0 = dr * ith;
+    const uint32_t ir1 = (ir0 + dr) < nr ? (ir0 + dr) : nr;
+    if (ir0 >= nr) return;
+
+    for (uint32_t i03 = 0; i03 < ne03; i03++) {
+        for (uint32_t i02 = 0; i02 < ne02; i02++) {
+            for (uint32_t i01 = ir0; i01 < ir1; i01++) {
+                for (uint32_t i00 = 0; i00 < ne00; i00++) {
+                    const uint8_t * src_ptr = (const uint8_t *) src0->data +
+                                              i00*nb00 + i01*nb01 + i02*nb02 + i03*nb03;
+                    uint8_t *       dst_ptr = (uint8_t *) dst->data +
+                                              i00*nb0  + i01*nb1  + i02*nb2  + i03*nb3;
+                    float  x;
+                    memcpy(&x, src_ptr, sizeof(float));
+                    __fp16 y = (__fp16) x;
+                    memcpy(dst_ptr, &y, sizeof(__fp16));
+                }
+            }
+        }
+    }
+}
+
+// Mirror of cpy_thread_f32_f16_strided for the reverse conversion. Same
+// rationale — used when the graph produces a strided f16 source that must
+// be materialised as f32 (post-attention CONT+cast patterns).
+static void cpy_thread_f16_f32_strided(unsigned int nth, unsigned int ith, void * data) {
+    struct htp_copy_context * ct = (struct htp_copy_context *) data;
+    struct htp_ops_context * octx = ct->octx;
+    cpy_preamble;
+
+    const uint32_t dr  = ct->src0_nrows_per_thread;
+    const uint32_t ir0 = dr * ith;
+    const uint32_t ir1 = (ir0 + dr) < nr ? (ir0 + dr) : nr;
+    if (ir0 >= nr) return;
+
+    for (uint32_t i03 = 0; i03 < ne03; i03++) {
+        for (uint32_t i02 = 0; i02 < ne02; i02++) {
+            for (uint32_t i01 = ir0; i01 < ir1; i01++) {
+                for (uint32_t i00 = 0; i00 < ne00; i00++) {
+                    const uint8_t * src_ptr = (const uint8_t *) src0->data +
+                                              i00*nb00 + i01*nb01 + i02*nb02 + i03*nb03;
+                    uint8_t *       dst_ptr = (uint8_t *) dst->data +
+                                              i00*nb0  + i01*nb1  + i02*nb2  + i03*nb3;
+                    __fp16 y;
+                    memcpy(&y, src_ptr, sizeof(__fp16));
+                    float  x = (float) y;
+                    memcpy(dst_ptr, &x, sizeof(float));
+                }
+            }
+        }
+    }
+}
+
+static bool cpy_dst_is_contiguous(const struct htp_tensor * dst, uint32_t elem_size) {
+    return dst->nb[0] == elem_size && dst->nb[1] == dst->ne[0] * dst->nb[0] && dst->nb[2] == dst->ne[1] * dst->nb[1] &&
+           dst->nb[3] == dst->ne[2] * dst->nb[2];
+}
+
+static bool cpy_is_transpose_f32(const struct htp_tensor * src0, const struct htp_tensor * dst) {
+    return src0->type == HTP_TYPE_F32 && dst->type == HTP_TYPE_F32 && src0->ne[0] == dst->ne[0] &&
+           src0->ne[1] == dst->ne[1] && src0->ne[2] == dst->ne[2] && src0->ne[3] == dst->ne[3] &&
+           src0->nb[1] == sizeof(float) && src0->nb[0] > sizeof(float) && cpy_dst_is_contiguous(dst, sizeof(float));
+}
+
+static bool cpy_run_transpose(struct htp_ops_context * octx) {
+    const struct htp_tensor * src0 = octx->src[0];
+    const struct htp_tensor * dst  = octx->dst;
+    if (!cpy_is_transpose_f32(src0, dst)) {
+        return false;
+    }
+    const struct htp_transpose_f32 job = {
+        .octx           = octx,
+        .src            = (const uint8_t *) src0->data,
+        .dst            = (uint8_t *) dst->data,
+        .rows           = src0->ne[0],
+        .cols           = src0->ne[1],
+        .src_row_stride = src0->nb[0],
+        .dst_row_stride = dst->nb[1],
+        .batch2         = src0->ne[2],
+        .batch3         = src0->ne[3],
+        .src_stride2    = src0->nb[2],
+        .src_stride3    = src0->nb[3],
+        .dst_stride2    = dst->nb[2],
+        .dst_stride3    = dst->nb[3],
+    };
+    return htp_transpose_f32(&job);
+}
+
 int op_cpy(struct htp_ops_context * octx) {
     cpy_preamble;
 
@@ -258,25 +359,43 @@ int op_cpy(struct htp_ops_context * octx) {
         return HTP_STATUS_OK;
     }
 
+    if (cpy_run_transpose(octx)) {
+        return HTP_STATUS_OK;
+    }
+
     const bool sametype   = (src0->type == dst->type);
-    const bool transposed = (nb00 > nb01) || (nb0 > nb1);
-    const bool sameshape  = !transposed && (ne00 == ne0 && ne01 == ne1 && ne02 == ne2 && ne03 == ne3);
+    // A singleton dimension can give a permuted tensor nb00 == nb01 even
+    // though elements along dimension zero are not adjacent. Row-copy and
+    // conversion kernels require packed inner rows, not merely !transposed.
+    const bool sameshape  = (ne00 == ne0 && ne01 == ne1 && ne02 == ne2 && ne03 == ne3);
+    const bool packed_rows = nb00 == ct.src0_type_size && nb0 == ct.dst_type_size;
 
     ct.src0_nrows_per_thread = (nr + n_threads - 1) / n_threads;
 
     worker_callback_t copy_fun;
 
-    if (sametype && sameshape) {
+    if (sametype && sameshape && packed_rows) {
         if (src0->type == HTP_TYPE_F32) {
             copy_fun = cpy_thread_f32_sameshape;
         } else {
             copy_fun = cpy_thread_f16_sameshape;
         }
-    } else if (sameshape) {
+    } else if (sameshape && packed_rows) {
         /**/ if (dst->type == HTP_TYPE_F16 && src0->type == HTP_TYPE_F32)
             copy_fun = cpy_thread_f16_f32_sameshape;
         else if (dst->type == HTP_TYPE_F32 && src0->type == HTP_TYPE_F16)
             copy_fun = cpy_thread_f32_f16_sameshape;
+        else
+            return HTP_STATUS_NO_SUPPORT;
+    } else if (sameshape && !sametype) {
+        // Permuted / strided source with a type conversion.
+        // Scalar fallback — see the strided kernels above. Only used when
+        // the type differs; same-type strided sources fall through to the
+        // existing reshape kernels below.
+        /**/ if (dst->type == HTP_TYPE_F16 && src0->type == HTP_TYPE_F32)
+            copy_fun = cpy_thread_f32_f16_strided;
+        else if (dst->type == HTP_TYPE_F32 && src0->type == HTP_TYPE_F16)
+            copy_fun = cpy_thread_f16_f32_strided;
         else
             return HTP_STATUS_NO_SUPPORT;
     } else if (sametype) {

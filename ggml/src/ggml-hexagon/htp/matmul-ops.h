@@ -62,11 +62,15 @@ enum htp_mm_kernel_type {
     HTP_MM_KERNEL_HVX_F32_F32_VTCM,
     HTP_MM_KERNEL_HVX_F32_F32_DDR,
     HTP_MM_KERNEL_HVX_F32_F16_DDR,
+    HTP_MM_KERNEL_HVX_F32_F32_BATCHED, // batched F32xF32 with per-head VTCM caching (attention MULs)
 
     // HVX quantized paths
     HTP_MM_KERNEL_HVX_QUANT_ROW,      // standard row-wise parallel quantization
     HTP_MM_KERNEL_HVX_QUANT_BLOCK,    // parallel block-wise quantization
     HTP_MM_KERNEL_HVX_QUANT_ROW_FLAT, // row-wise fallback flat quantization
+
+    // Small-K convolution lowering: SIMD lanes span independent output rows.
+    HTP_MM_KERNEL_HVX_F16_F16_K9,
 };
 
 // Op-specific struct for precomputed matmul params
@@ -556,6 +560,15 @@ static inline void htp_mm_hvx_vtcm_layout_build(
             }
             case HTP_MM_KERNEL_HVX_F32_F32_VTCM: {
                 size_t f32_src1_row_size = htp_mm_round_up(ne10 * 4, 128);
+                src1_sz = htp_mm_round_up(f32_src1_row_size * src1_nrows, 256);
+                src0_sz = htp_mm_round_up(n_prefetch * src0_row_size_padded, 256) * n_threads;
+                dst_sz  = dst_nrows > 0 ? htp_mm_round_up(dst_row_size, 128) * n_threads : 0;
+                break;
+            }
+            case HTP_MM_KERNEL_HVX_F32_F32_BATCHED: {
+                // Batched F32xF32: per-head src1 cache (one head at a time) + per-thread rolling src0 rows
+                size_t f32_src1_row_size = htp_mm_round_up(ne10 * 4, 128);
+                // src1_nrows here is per-head ne11 (dispatch passes ne11 only, no ne12*ne13)
                 src1_sz = htp_mm_round_up(f32_src1_row_size * src1_nrows, 256);
                 src0_sz = htp_mm_round_up(n_prefetch * src0_row_size_padded, 256) * n_threads;
                 dst_sz  = dst_nrows > 0 ? htp_mm_round_up(dst_row_size, 128) * n_threads : 0;

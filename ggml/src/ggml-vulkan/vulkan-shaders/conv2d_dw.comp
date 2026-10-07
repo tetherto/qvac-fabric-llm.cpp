@@ -1,5 +1,7 @@
 #version 450
 
+#extension GL_EXT_control_flow_attributes : require
+
 #include "types.glsl"
 
 layout (push_constant) uniform parameter
@@ -24,6 +26,69 @@ layout (push_constant) uniform parameter
 layout (binding = 0) readonly buffer A {A_TYPE knl_data[];};
 layout (binding = 1) readonly buffer B {B_TYPE src_data[];};
 layout (binding = 2) writeonly buffer D {D_TYPE dst_data[];};
+
+#ifdef WHCN_V4
+
+// Vectorized 1-D row kernel (host guarantees knl_h==1, stride_x==1, dilation_x==1,
+// knl_w <= MAX_K): one WG per (batch,channel,row), NT outputs/thread from a register window.
+#define WG_SIZE 64
+#define NT 4
+#define MAX_K 8
+
+layout(local_size_x = WG_SIZE, local_size_y = 1, local_size_z = 1) in;
+
+shared FLOAT_TYPE w_sh[MAX_K];
+
+void main() {
+    const uint r     = gl_WorkGroupID.y;           // flattened (n, c, dst_y) — uniform
+    const uint cn    = r / p.dst_h;
+    const uint dst_y = r - cn * p.dst_h;
+    const uint n     = cn / p.channels;
+    const uint c     = cn - n * p.channels;
+
+    if (gl_LocalInvocationID.x < p.knl_w) {        // knl_h == 1 -> channel row at c*knl_w
+        w_sh[gl_LocalInvocationID.x] = FLOAT_TYPE(knl_data[c * p.knl_w + gl_LocalInvocationID.x]);
+    }
+    barrier();                                     // single-wave WG: effectively free
+
+    const uint x0 = (gl_WorkGroupID.x * WG_SIZE + gl_LocalInvocationID.x) * NT;
+    if (x0 >= p.dst_w) {
+        return;                                    // after the only barrier -> safe
+    }
+
+    FLOAT_TYPE sums[NT];
+    [[unroll]] for (uint i = 0; i < NT; ++i) sums[i] = FLOAT_TYPE(0.0);
+
+    const uint src_y = uint(int(dst_y) * p.stride_y - p.pad_y);   // knl_y == 0 only
+    if (src_y < p.src_h) {                         // whole row out of range -> zeros
+        const uint sbase = (n * p.channels + c) * p.src_h * p.src_w + src_y * p.src_w;
+
+        // guarded window loads (unsigned wrap covers src_x < 0), then unguarded,
+        // non-divergent tap loops over registers.
+        FLOAT_TYPE win[NT + MAX_K - 1];
+        [[unroll]] for (uint i = 0; i < NT + MAX_K - 1; ++i) {
+            const uint sx = uint(int(x0) + int(i) - p.pad_x);
+            win[i] = (i < NT + p.knl_w - 1 && sx < p.src_w) ? FLOAT_TYPE(src_data[sbase + sx])
+                                                            : FLOAT_TYPE(0.0);
+        }
+        [[unroll]] for (uint kx = 0; kx < MAX_K; ++kx) {
+            if (kx >= p.knl_w) break;
+            const FLOAT_TYPE wk = w_sh[kx];
+            [[unroll]] for (uint i = 0; i < NT; ++i) {
+                sums[i] = fma(win[i + kx], wk, sums[i]);
+            }
+        }
+    }
+
+    const uint drow = ((n * p.channels + c) * p.dst_h + dst_y) * p.dst_w;
+    [[unroll]] for (uint i = 0; i < NT; ++i) {
+        if (x0 + i < p.dst_w) {
+            dst_data[drow + x0 + i] = D_TYPE(sums[i]);
+        }
+    }
+}
+
+#else
 
 layout(local_size_x = 512, local_size_y = 1, local_size_z = 1) in;
 
@@ -102,4 +167,6 @@ void main() {
 #endif
     dst_data[idx] = D_TYPE(result);
 }
+
+#endif // WHCN_V4
 

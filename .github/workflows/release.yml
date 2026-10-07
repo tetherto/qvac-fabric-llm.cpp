@@ -1051,7 +1051,7 @@ jobs:
       - name: Pack artifacts
         id: pack_artifacts
         run: |
-          7z a -snl llama-bin-win-cuda-${{ matrix.cuda }}-${{ matrix.arch }}.zip .\build\bin\Release\ggml-cuda.dll
+          7z a -snl llama-bin-win-cuda-${{ matrix.cuda }}-${{ matrix.arch }}.zip .\build\bin\Release\qvac-ggml-cuda.dll
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v6

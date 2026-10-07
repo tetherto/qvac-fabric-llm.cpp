@@ -11,6 +11,7 @@ layout (push_constant) uniform parameter
     uint ne0_12mp, ne0_12L;
     uint ne0_1mp, ne0_1L;
     uint nrows;
+    uint square;   // 1: accumulate v*v (fused sqr+mean/sum_rows)
 } p;
 
 uint get_aoffset() { return p.misalign_offsets >> 16; }

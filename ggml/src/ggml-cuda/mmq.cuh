@@ -10,6 +10,10 @@
 #define MMQ_ITER_K_FP4         512
 #define MMQ_NWARPS               8
 
+// Min. percentage of the CUDA blocks in the last wave that has to be doing work for one block per
+// output tile to be preferred over one block per SM with the K dimension split across blocks.
+#define MMQ_TILING_MIN_EFFICIENCY_PERCENT 90
+
 typedef void (*ggml_cuda_mmq_load_tiles_t)(const char * __restrict__ x, int * x_tile, const int kbx0, const int i_max, const int stride);
 typedef void (*ggml_cuda_mmq_vec_dot_t)(const int * __restrict__ x, const int * __restrict__ y, float * __restrict__ sum, const int k00);
 typedef void (*ggml_cuda_mmq_write_back_t)(const float * __restrict__ sum, const int32_t * __restrict__ get_rows_to_sorted,
@@ -1384,6 +1388,27 @@ static size_t mmq_get_nbytes_shared(const ggml_cuda_mmq_config & config, const i
     return nbs_ids + nbs_x + GGML_PAD(nbs_y, config.nthreads*sizeof(int));
 }
 
+static int mmq_get_ntiles_dst(const mmq_args & args, const ggml_cuda_mmq_config & config) {
+    const int nty = (args.nrows_x   + config.I - 1) / config.I;
+    const int ntx = (args.ncols_max + config.J - 1) / config.J;
+    return nty * ntx * args.nchannels_y * args.nsamples_y;
+}
+
+// One CUDA block per output tile if the tiles already keep almost all SMs busy, one block per SM
+// with K split across blocks otherwise.
+static int mmq_get_nblocks_stream_k(const int cc, const int ntiles_dst, const int nsm) {
+    const int nwaves = (ntiles_dst + nsm - 1) / nsm;
+    const int tiles_efficiency_percent = 100 * ntiles_dst / (nsm*nwaves);
+    return GGML_CUDA_CC_IS_NVIDIA(cc) && tiles_efficiency_percent >= MMQ_TILING_MIN_EFFICIENCY_PERCENT ? ntiles_dst : nsm;
+}
+
+// Whether the K dimension of an output tile gets split across CUDA blocks, which makes every block
+// write a partial tile that the fixup kernel then has to read back and sum up.
+static bool mmq_splits_k(const mmq_args & args, const ggml_cuda_mmq_config & config, const int cc, const int nsm) {
+    const int ntiles_dst = mmq_get_ntiles_dst(args, config);
+    return config.stream_k && mmq_get_nblocks_stream_k(cc, ntiles_dst, nsm) != ntiles_dst;
+}
+
 template <ggml_type type, int J, bool fallback>
 static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) {
     const int id = ggml_cuda_get_device();
@@ -1431,9 +1456,7 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
     // For the stream-k kernel it is possible to run it with tiling by setting the number of CUDA blocks equal to the number of tiles.
     // This is worthwhile if the efficiency of tiling is high and skipping the fixup kernel is more important.
     const int ntiles_dst = ntx * nty * ntzw;
-    const int tiles_nwaves = (ntiles_dst + nsm - 1) / nsm;
-    const int tiles_efficiency_percent = 100 * ntiles_dst / (nsm*tiles_nwaves);
-    const dim3 block_nums_stream_k(GGML_CUDA_CC_IS_NVIDIA(cc) && tiles_efficiency_percent >= 90 ? ntiles_dst : nsm, 1, 1);
+    const dim3 block_nums_stream_k(mmq_get_nblocks_stream_k(cc, ntiles_dst, nsm), 1, 1);
 
     GGML_ASSERT(ntiles_dst * blocks_per_ne00_fd.z < (1 << 30)); // Assert that variable kbc will not overflow.
 
@@ -1466,12 +1489,21 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
          ntx_fd);
 }
 
-template <ggml_type type, bool fallback>
-void mul_mat_q_switch_J(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) {
-    const int    id    = ggml_cuda_get_device();
-    const int    cc    = ggml_cuda_info().devices[id].cc;
-    const size_t smpbo = ggml_cuda_info().devices[id].smpbo;
+static int mmq_get_rows_per_warp_host(const ggml_cuda_mmq_config & config, const int cc) {
+    if (amd_mfma_available(cc) || amd_wmma_available(cc)) {
+        return 16;
+    }
+    return config.J >= 48 && config.J % 16 == 0 ? 32 : 16;
+}
 
+static int mmq_get_rows_per_warp_max_host(const int cc) {
+    return amd_mfma_available(cc) || amd_wmma_available(cc) ? 16 : 32;
+}
+
+// Widest tile with the fewest column tiles. Narrower tiles reuse the loaded x data less often, so
+// avoid_k_split restricts the search to those that in exchange do not have to split K.
+template <ggml_type type, bool fallback>
+static int mmq_get_J_best(const mmq_args & args, const int cc, const size_t smpbo, const int nsm, const bool avoid_k_split) {
     int J_best        = 0;
     int ntiles_J_best = INT_MAX;
 
@@ -1485,11 +1517,37 @@ void mul_mat_q_switch_J(ggml_backend_cuda_context & ctx, const mmq_args & args, 
             continue;
         }
 
+        if (avoid_k_split && (mmq_get_rows_per_warp_host(config, cc) != mmq_get_rows_per_warp_max_host(cc) || mmq_splits_k(args, config, cc, nsm))) {
+            continue;
+        }
+
         const int ntiles_x = (args.ncols_max + config.J - 1) / config.J;
 
         if (ntiles_x < ntiles_J_best) {
             J_best = J;
             ntiles_J_best = ntiles_x;
+        }
+    }
+
+    return J_best;
+}
+
+template <ggml_type type, bool fallback>
+void mul_mat_q_switch_J(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) {
+    const int    id    = ggml_cuda_get_device();
+    const int    cc    = ggml_cuda_info().devices[id].cc;
+    const size_t smpbo = ggml_cuda_info().devices[id].smpbo;
+    const int    nsm   = ggml_cuda_info().devices[id].nsm;
+
+    int J_best = mmq_get_J_best<type, fallback>(args, cc, smpbo, nsm, /*avoid_k_split =*/ false);
+
+    // Splitting K makes the partial sums of every tile travel through memory twice, which for few
+    // wide tiles costs more than the x data that a narrower tile has to load again.
+    if (J_best != 0 && mmq_splits_k(args, ggml_cuda_mmq_get_config(type, J_best, fallback, cc), cc, nsm)) {
+        const int J_no_split = mmq_get_J_best<type, fallback>(args, cc, smpbo, nsm, /*avoid_k_split =*/ true);
+
+        if (J_no_split != 0) {
+            J_best = J_no_split;
         }
     }
 

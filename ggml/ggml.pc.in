@@ -6,6 +6,6 @@ includedir=@GGML_PC_INCLUDEDIR@
 Name: ggml
 Description: Tensor library for machine learning
 Version: @GGML_VERSION@
-Libs: -L${libdir} -lggml -lggml-base
+Libs: -L${libdir} -l@GGML_LIB_OUTPUT_PREFIX@ggml -l@GGML_LIB_OUTPUT_PREFIX@ggml-base
 Libs.private: @GGML_PC_LIBS_PRIVATE@
 Cflags: -I${includedir}

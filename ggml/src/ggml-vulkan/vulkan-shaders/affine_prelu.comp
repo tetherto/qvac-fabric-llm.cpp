@@ -1,0 +1,40 @@
+#version 450
+
+#include "types.glsl"
+
+// Fused affine + per-channel PReLU (LavaSR denoiser), scalar op order:
+// out = x*aw[f,c] + ab[f,c] + (max(x,0) + slope[c]*min(x,0)).  One thread per element.
+layout (push_constant) uniform parameter
+{
+    uint ne;   // total dst elements
+    uint F;    // ne0
+    uint FT;   // ne0*ne1 (plane size)
+    uint C;    // ne2 (channels)
+} p;
+
+layout (binding = 0) readonly buffer X  {float data_x[];};
+layout (binding = 1) readonly buffer AW {float data_aw[];};
+layout (binding = 2) readonly buffer AB {float data_ab[];};
+layout (binding = 3) readonly buffer SL {float data_sl[];};
+layout (binding = 4) writeonly buffer D {float data_d[];};
+
+layout(local_size_x = 512, local_size_y = 1, local_size_z = 1) in;
+
+void main() {
+    const uint idx = gl_GlobalInvocationID.z * 262144 + gl_GlobalInvocationID.y * 512 + gl_GlobalInvocationID.x;
+    if (idx >= p.ne) {
+        return;
+    }
+
+    const uint pl = idx / p.FT;        // plane = c + C*b
+    const uint i  = idx - pl * p.FT;   // f + F*t
+    const uint c  = pl % p.C;
+    const uint f  = i % p.F;
+
+    const float xv = data_x[idx];
+    const float r  = max(xv, 0.0f);
+    const float n  = xv - r;
+    const float pr = r + data_sl[c] * n;
+    const float a  = xv * data_aw[c * p.F + f] + data_ab[c * p.F + f];
+    data_d[idx] = a + pr;
+}

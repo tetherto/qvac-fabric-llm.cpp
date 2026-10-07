@@ -589,6 +589,37 @@ to_fp16_cuda_t ggml_get_to_fp16_cuda(ggml_type type) {
     }
 }
 
+template <typename src_t>
+static __global__ void convert_add_row_bias(const src_t * __restrict__ x, const float * __restrict__ bias,
+        float * __restrict__ y, const int64_t ne0, const int64_t nrows) {
+    const int64_t i0 = (int64_t) blockDim.x*blockIdx.x + threadIdx.x;
+    if (i0 >= ne0) {
+        return;
+    }
+    const float b = bias[i0];
+    for (int64_t row = blockIdx.y; row < nrows; row += gridDim.y) {
+        y[row*ne0 + i0] = ggml_cuda_cast<float>(x[row*ne0 + i0]) + b;
+    }
+}
+
+void ggml_cuda_convert_add_row_bias(ggml_type type, const void * x, const float * bias, float * y, int64_t ne0,
+                                    int64_t nrows, cudaStream_t stream) {
+    const dim3 num_blocks((ne0 + CUDA_DEQUANTIZE_BLOCK_SIZE - 1) / CUDA_DEQUANTIZE_BLOCK_SIZE,
+                          (int) std::min(nrows, (int64_t) 65535));
+    switch (type) {
+        case GGML_TYPE_F16:
+            convert_add_row_bias<<<num_blocks, CUDA_DEQUANTIZE_BLOCK_SIZE, 0, stream>>>(
+                (const half *) x, bias, y, ne0, nrows);
+            break;
+        case GGML_TYPE_BF16:
+            convert_add_row_bias<<<num_blocks, CUDA_DEQUANTIZE_BLOCK_SIZE, 0, stream>>>(
+                (const nv_bfloat16 *) x, bias, y, ne0, nrows);
+            break;
+        default:
+            GGML_ABORT("unsupported type for a fused row-bias conversion: %s", ggml_type_name(type));
+    }
+}
+
 to_fp32_cuda_t ggml_get_to_fp32_cuda(ggml_type type) {
     switch (type) {
         case GGML_TYPE_Q1_0:

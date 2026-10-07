@@ -2501,6 +2501,28 @@ typedef decltype(kernel_geglu_quick<float>) kernel_geglu_quick_t;
 template [[host_name("kernel_geglu_quick_f32")]] kernel kernel_geglu_quick_t kernel_geglu_quick<float>;
 template [[host_name("kernel_geglu_quick_f16")]] kernel kernel_geglu_quick_t kernel_geglu_quick<half>;
 
+kernel void kernel_siglu_f32(
+        constant ggml_metal_kargs_glu & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        uint tgpig[[threadgroup_position_in_grid]],
+        uint tpitg[[thread_position_in_threadgroup]],
+        uint   ntg[[threads_per_threadgroup]]) {
+    device const float * src0_row = (device const float *) ((device const char *) src0 + tgpig*args.nb01) + args.i00;
+    device const float * src1_row = (device const float *) ((device const char *) src1 + tgpig*args.nb11) + args.i10;
+    device       float * dst_row  = (device       float *) ((device       char *) dst  + tgpig*args.nb1);
+
+    for (int i0 = tpitg; i0 < args.ne0; i0 += ntg) {
+        const float x0 = src0_row[i0];
+        const float x1 = src1_row[i0];
+
+        const float sigmoid = 1.0f / (1.0f + exp(-x1));
+
+        dst_row[i0] = x0*sigmoid;
+    }
+}
+
 kernel void kernel_op_sum_f32(
         constant ggml_metal_kargs_sum & args,
         device const float * src0,
@@ -5092,6 +5114,63 @@ inline float block_q_n_dot_y(device const block_q5_1 * qb_curr, float sumy, thre
     return d * (acc[0] + acc[1] + acc[2] + acc[3]) + sumy * m;
 }
 
+// These function constants are also declared below for readability next to
+// the kernels that use them, but the helpers here reference them so they
+// must be visible already.
+constant bool FC_mul_mv_has_bias_     [[function_constant(FC_MUL_MV + 5)]];
+constant bool FC_mul_mv_has_residual_ [[function_constant(FC_MUL_MV + 6)]];
+#define FC_mul_mv_has_bias     FC_mul_mv_has_bias_
+#define FC_mul_mv_has_residual FC_mul_mv_has_residual_
+
+// Post-impl bias-and-residual adder used by the Q-variant mul_mv wrappers
+// when fused with either ADD(bias) or ADD(bias) + ADD(residual).  After the
+// impl has written its sums to dst we only need one thread per row to add
+// the extra terms back in.  Bias is a broadcast vector of shape [ne0];
+// residual has the same shape and stride as dst.  Either or both can be
+// disabled via their function constant, in which case the Metal compiler
+// drops the corresponding branch at specialisation time.
+//
+// NOTE: the caller is responsible for selecting which simdgroups invoke
+// this helper.  For kernels where each simdgroup writes to its *own* set
+// of output rows (mul_vec_q_n_f32_impl, where r0 is derived from sgitg)
+// every simdgroup must call this with its own r0.  For kernels where all
+// simdgroups cooperate on the *same* output rows via
+// helper_mv_reduce_and_write (e.g. Q8_0), only sgitg == 0 should call.
+template<short NR0>
+static inline void helper_mv_add_bias(
+        device       char * dst,
+        device const char * bias,
+        device const char * residual,
+        constant ggml_metal_kargs_mul_mv & args,
+        const int r0,
+        const int r1,
+        const int im,
+        ushort tiisg) {
+    if (!FC_mul_mv_has_bias && !FC_mul_mv_has_residual) {
+        return;
+    }
+    if (tiisg != 0) {
+        return;
+    }
+
+    const uint64_t base_off = (uint64_t) im * args.ne0 * args.ne1 + (uint64_t) r1 * args.ne0;
+
+    device       float * dst_f32      = (device       float *) dst + base_off;
+    device const float * bias_f32     = (device const float *) bias;
+    device const float * residual_f32 = (device const float *) residual + base_off;
+
+    for (short row = 0; row < NR0 && r0 + row < args.ne01; ++row) {
+        float v = dst_f32[r0 + row];
+        if (FC_mul_mv_has_bias) {
+            v += bias_f32[r0 + row];
+        }
+        if (FC_mul_mv_has_residual) {
+            v += residual_f32[r0 + row];
+        }
+        dst_f32[r0 + row] = v;
+    }
+}
+
 template<short NR0>
 static inline void helper_mv_reduce_and_write(
         device float * dst_f32,
@@ -5188,7 +5267,10 @@ constant short FC_mul_mv_nxpsg [[function_constant(FC_MUL_MV + 1)]];
 constant short FC_mul_mv_ne12  [[function_constant(FC_MUL_MV + 2)]];
 constant short FC_mul_mv_r2    [[function_constant(FC_MUL_MV + 3)]];
 constant short FC_mul_mv_r3    [[function_constant(FC_MUL_MV + 4)]];
-constant short FC_mul_mv_id_has_scale [[function_constant(FC_MUL_MV + 5)]];
+// FC_mul_mv_has_bias (FC_MUL_MV + 5) and FC_mul_mv_has_residual (FC_MUL_MV + 6) are declared
+// above as FC_mul_mv_has_bias_ / FC_mul_mv_has_residual_ so helper_mv_add_bias can reference
+// them before the kernel wrappers down here; the macros there expose the canonical names.
+constant short FC_mul_mv_id_has_scale [[function_constant(FC_MUL_MV + 7)]];
 
 template<typename block_q_type, short NR0, typename args_t>
 void mul_vec_q_n_f32_impl(
@@ -5525,11 +5607,20 @@ kernel void kernel_mul_mv_q4_0_f32(
         device const char * src0,
         device const char * src1,
         device       char * dst,
+        device const char * bias,
+        device const char * residual,
         threadgroup  char * shmem [[threadgroup(0)]],
         uint3  tgpig[[threadgroup_position_in_grid]],
         ushort tiisg[[thread_index_in_simdgroup]],
         ushort sgitg[[simdgroup_index_in_threadgroup]]) {
     mul_vec_q_n_f32_impl<block_q4_0, N_R0_Q4_0, constant ggml_metal_kargs_mul_mv &>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg);
+    // Each simdgroup in this threadgroup writes its own NR0 output rows,
+    // so every sgitg has to call the helper for its own r0.
+    helper_mv_add_bias<N_R0_Q4_0>(dst, bias, residual, args,
+                                  /*r0=*/ ((int) tgpig.x * FC_mul_mv_nsg + (int) sgitg) * N_R0_Q4_0,
+                                  /*r1=*/ (int) tgpig.y,
+                                  /*im=*/ (int) tgpig.z,
+                                  tiisg);
 }
 
 [[host_name("kernel_mul_mv_glu_q4_0_f32")]]
@@ -5550,11 +5641,18 @@ kernel void kernel_mul_mv_q4_1_f32(
         device const char * src0,
         device const char * src1,
         device       char * dst,
+        device const char * bias,
+        device const char * residual,
         threadgroup  char * shmem [[threadgroup(0)]],
         uint3  tgpig[[threadgroup_position_in_grid]],
         ushort tiisg[[thread_index_in_simdgroup]],
         ushort sgitg[[simdgroup_index_in_threadgroup]]) {
      mul_vec_q_n_f32_impl<block_q4_1, N_R0_Q4_1, constant ggml_metal_kargs_mul_mv &>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg);
+     helper_mv_add_bias<N_R0_Q4_1>(dst, bias, residual, args,
+                                   /*r0=*/ ((int) tgpig.x * FC_mul_mv_nsg + (int) sgitg) * N_R0_Q4_1,
+                                   /*r1=*/ (int) tgpig.y,
+                                   /*im=*/ (int) tgpig.z,
+                                   tiisg);
 }
 
 kernel void kernel_mul_mv_q5_0_f32(
@@ -5562,11 +5660,18 @@ kernel void kernel_mul_mv_q5_0_f32(
         device const char * src0,
         device const char * src1,
         device       char * dst,
+        device const char * bias,
+        device const char * residual,
         threadgroup  char * shmem [[threadgroup(0)]],
         uint3  tgpig[[threadgroup_position_in_grid]],
         ushort tiisg[[thread_index_in_simdgroup]],
         ushort sgitg[[simdgroup_index_in_threadgroup]]) {
     mul_vec_q_n_f32_impl<block_q5_0, N_R0_Q5_0, constant ggml_metal_kargs_mul_mv &>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg);
+    helper_mv_add_bias<N_R0_Q5_0>(dst, bias, residual, args,
+                                  /*r0=*/ ((int) tgpig.x * FC_mul_mv_nsg + (int) sgitg) * N_R0_Q5_0,
+                                  /*r1=*/ (int) tgpig.y,
+                                  /*im=*/ (int) tgpig.z,
+                                  tiisg);
 }
 
 kernel void kernel_mul_mv_q5_1_f32(
@@ -5574,11 +5679,18 @@ kernel void kernel_mul_mv_q5_1_f32(
         device const char * src0,
         device const char * src1,
         device       char * dst,
+        device const char * bias,
+        device const char * residual,
         threadgroup  char * shmem [[threadgroup(0)]],
         uint3  tgpig[[threadgroup_position_in_grid]],
         ushort tiisg[[thread_index_in_simdgroup]],
         ushort sgitg[[simdgroup_index_in_threadgroup]]) {
     mul_vec_q_n_f32_impl<block_q5_1, N_R0_Q5_1, constant ggml_metal_kargs_mul_mv &>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg);
+    helper_mv_add_bias<N_R0_Q5_1>(dst, bias, residual, args,
+                                  /*r0=*/ ((int) tgpig.x * FC_mul_mv_nsg + (int) sgitg) * N_R0_Q5_1,
+                                  /*r1=*/ (int) tgpig.y,
+                                  /*im=*/ (int) tgpig.z,
+                                  tiisg);
 }
 
 template<short NR0, typename args_t>
@@ -5661,11 +5773,23 @@ kernel void kernel_mul_mv_q8_0_f32(
         device const char * src0,
         device const char * src1,
         device       char * dst,
+        device const char * bias,
+        device const char * residual,
         threadgroup  char * shmem [[threadgroup(0)]],
         uint3  tgpig[[threadgroup_position_in_grid]],
         ushort tiisg[[thread_index_in_simdgroup]],
         ushort sgitg[[simdgroup_index_in_threadgroup]]) {
     kernel_mul_mv_q8_0_f32_impl<N_R0_Q8_0, constant ggml_metal_kargs_mul_mv &>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg);
+    // Q8_0 uses helper_mv_reduce_and_write: all simdgroups cooperate on the
+    // *same* output rows, so gate the bias add to sgitg == 0 to avoid
+    // double-counting.  r0 derives from tgpig.x alone.
+    if (sgitg == 0) {
+        helper_mv_add_bias<N_R0_Q8_0>(dst, bias, residual, args,
+                                      /*r0=*/ (int) tgpig.x * N_R0_Q8_0,
+                                      /*r1=*/ (int) tgpig.y,
+                                      /*im=*/ (int) tgpig.z,
+                                      tiisg);
+    }
 }
 
 template<short NR0, typename args_t>
@@ -6992,6 +7116,16 @@ typedef void (im2col_t)(
         uint3   ntg[[threads_per_threadgroup]]);
 
 template <typename T>
+// One threadgroup per output position (in, ioh, iow); its threads walk that position's
+// CHW columns, which are contiguous in dst. So writes are coalesced and the threadgroup
+// is sized from CHW rather than from the kernel window.
+//
+// The previous mapping put (N, KH, KW) in the threadgroup and (IC, OH, OW) in the grid.
+// For a 1-D convolution KH == 1, and audio models decode a single sequence at a time, so
+// N == 1 and the threadgroup degenerated to KW threads -- 7, or 1 for a pointwise conv --
+// against a 32-wide SIMD group, spread over IC*OW threadgroups. Measured on the ACE-Step
+// VAE decoder that cost ~170 ms per im2col whether KW was 7 or 1, i.e. dispatch-bound
+// rather than bandwidth-bound.
 kernel void kernel_im2col(
         constant ggml_metal_kargs_im2col & args,
         device const float * x,
@@ -7000,46 +7134,33 @@ kernel void kernel_im2col(
         uint3  tgpg[[threadgroups_per_grid]],
         uint3 tpitg[[thread_position_in_threadgroup]],
         uint3   ntg[[threads_per_threadgroup]]) {
-//    const int64_t IC = tgpg[0];
+    const int64_t OW = tgpg[0];
     const int64_t OH = tgpg[1];
-    const int64_t OW = tgpg[2];
 
-    const int64_t KH = ntg[1];
-    const int64_t KW = ntg[2];
-
-          int64_t in  = tpitg[0];
-    const int64_t ikh = tpitg[1];
-    const int64_t ikw = tpitg[2];
-
-    const int64_t iic = tgpig[0];
+    const int64_t iow = tgpig[0];
     const int64_t ioh = tgpig[1];
-    const int64_t iow = tgpig[2];
+    const int64_t in  = tgpig[2];
 
-    const int64_t iiw = iow*args.s0 + ikw*args.d0 - args.p0;
-    const int64_t iih = ioh*args.s1 + ikh*args.d1 - args.p1;
-
-    int64_t offset_dst = (in*OH*OW + ioh*OW + iow)*args.CHW + (iic*(KH*KW) + ikh*KW + ikw);
+    const int KW  = args.KW;
+    const int KHW = args.KHW;
 
     device T * pdst = (device T *) (dst);
 
-    if (iih < 0 || iih >= args.IH || iiw < 0 || iiw >= args.IW) {
-        while (in < args.N) {
-            pdst[offset_dst] = 0.0f;
-            offset_dst += ntg[0]*args.CHW*OH*OW;
+    const int64_t offset_row = (in*OH*OW + ioh*OW + iow)*args.CHW;
+    const int64_t offset_bat = in*args.ofs0;
 
-            in += ntg[0];
-        }
-    } else {
-        int64_t offset_src = in*args.ofs0 + iic*args.ofs1 + iih*args.IW + iiw;
+    for (int col = tpitg[0]; col < args.CHW; col += ntg[0]) {
+        const int iic = col / KHW;
+        const int rem = col - iic*KHW;
+        const int ikh = rem / KW;
+        const int ikw = rem - ikh*KW;
 
-        while (in < args.N) {
-            pdst[offset_dst] = x[offset_src];
+        const int64_t iiw = iow*args.s0 + ikw*args.d0 - args.p0;
+        const int64_t iih = ioh*args.s1 + ikh*args.d1 - args.p1;
 
-            offset_dst += ntg[0]*args.CHW*OH*OW;
-            offset_src += ntg[0]*args.ofs0;
-
-            in += ntg[0];
-        }
+        pdst[offset_row + col] = (iih < 0 || iih >= args.IH || iiw < 0 || iiw >= args.IW)
+            ? (T) 0
+            : (T) x[offset_bat + iic*args.ofs1 + iih*args.IW + iiw];
     }
 }
 
@@ -7416,50 +7537,63 @@ typedef void (conv_transpose_1d_t)(
         device const float * src1,
         device        char * dst,
         uint3   tgpig[[threadgroup_position_in_grid]],
-        uint3    tgpg[[threadgroups_per_grid]]);
+        uint3    tgpg[[threadgroups_per_grid]],
+        uint3   tpitg[[thread_position_in_threadgroup]],
+        uint3     ntg[[threads_per_threadgroup]]);
 
 template <typename T>
 kernel void kernel_conv_transpose_1d(
         constant ggml_metal_kargs_conv_transpose_1d & args,
-        device const     T * src0,
-        device const float * src1,
-        device        char * dst,
-        uint3   tgpig[[threadgroup_position_in_grid]],
-        uint3   tgpg[[threadgroups_per_grid]]) {
+        device const     T * src0,    // kernel: [K, OC, IC] row-major
+        device const float * src1,    // input:  [IL, IC] row-major
+        device        char * dst,     // output: [OL, OC]
+        uint3 tgpig[[threadgroup_position_in_grid]],
+        uint3  tgpg[[threadgroups_per_grid]],
+        uint3 tpitg[[thread_position_in_threadgroup]],
+        uint3   ntg[[threads_per_threadgroup]]) {
 
-    // For output position j on the time axis, only input positions
-    //   i such that i*s0 <= j < i*s0 + K
-    // contribute -- i.e. i in [ceil((j - K + 1)/s0), floor(j/s0)]
-    // intersected with [0, IL-1]. That's at most ceil(K/s0) values
-    // (typically 2 for stride==K/2 transposed convs).
-    const int32_t j  = tgpig[0];
-    const int32_t s0 = args.s0;
-    const int32_t K  = args.K;
-    const int32_t IL = args.IL;
+    // grid: (OL, OC, 1), threadgroup: (SIMDGROUP_WIDTH=32, 1, 1)
+    //   each threadgroup computes one output pixel; threads in the simdgroup
+    //   parallelise the reduction across input channels (IC).
+    const int ol  = tgpig.x;
+    const int oc  = tgpig.y;
+    const int OC  = tgpg.y;
+    const int tid = tpitg.x;
+    const int nth = ntg.x;
 
-    int32_t i_min;
-    {
-        int32_t a = j - K + 1;
-        i_min = a <= 0 ? 0 : (a + s0 - 1) / s0; // ceil(a/s0) for a>0
-    }
-    int32_t i_max = j / s0;
-    if (i_max > IL - 1) i_max = IL - 1;
+    const int K  = args.K;
+    const int IL = args.IL;
+    const int IC = args.IC;
+    const int s0 = args.s0;
+
+    // Transposed conv: out[ol, oc] = sum over (i, ic, ki) of
+    //   kernel[ki, oc, ic] * input[i, ic]    where i*s0 + ki == ol
+    // Narrow (i, ki) to the finite set of contributing pairs instead of
+    // the naive O(IC * IL) scan.  For fixed ol the valid i range is:
+    //   max(0, ceil((ol - K + 1)/s0)) <= i <= min(IL-1, ol/s0)
+    int i_start = (ol - K + 1 + s0 - 1) / s0;
+    if (i_start < 0) i_start = 0;
+    int i_end = ol / s0;
+    if (i_end > IL - 1) i_end = IL - 1;
 
     float v = 0.0f;
-    if (i_min <= i_max) {
-        for (int64_t c = 0; c < args.IC; c++) {
-            const int32_t kernel_offset = c * tgpg[1] * K + K * tgpig[1];
-            const int32_t input_offset  = c * IL;
-
-            for (int32_t i = i_min; i <= i_max; i++) {
-                v += float(src0[kernel_offset + j - i * s0]) * src1[input_offset + i];
-            }
+    // Each thread handles a strided slice of IC.
+    for (int ic = tid; ic < IC; ic += nth) {
+        const int kernel_base = (ic * OC + oc) * K;
+        const int input_base  = ic * IL;
+        for (int i = i_start; i <= i_end; ++i) {
+            const int ki = ol - i * s0;
+            v += float(src0[kernel_base + ki]) * src1[input_base + i];
         }
     }
 
-    device float * dst_ptr = (device float *) (dst + tgpig[0] * args.nb0 + tgpig[1] * args.nb1);
+    // Reduce across the 32-thread simdgroup (threadgroup == 1 simdgroup).
+    v = simd_sum(v);
 
-    dst_ptr[0] = v;
+    if (tid == 0) {
+        device float * dst_ptr = (device float *) (dst + ol * args.nb0 + oc * args.nb1);
+        dst_ptr[0] = v;
+    }
 }
 
 template [[host_name("kernel_conv_transpose_1d_f32_f32")]]
@@ -7469,7 +7603,9 @@ kernel void kernel_conv_transpose_1d<float>(
     device const float * src1,
     device        char * dst,
     uint3   tgpig[[threadgroup_position_in_grid]],
-    uint3    tgpg[[threadgroups_per_grid]]);
+    uint3    tgpg[[threadgroups_per_grid]],
+    uint3   tpitg[[thread_position_in_threadgroup]],
+    uint3     ntg[[threads_per_threadgroup]]);
 
 template [[host_name("kernel_conv_transpose_1d_f16_f32")]]
 kernel void kernel_conv_transpose_1d<half>(
@@ -7478,8 +7614,9 @@ kernel void kernel_conv_transpose_1d<half>(
     device const float * src1,
     device        char * dst,
     uint3   tgpig[[threadgroup_position_in_grid]],
-    uint3    tgpg[[threadgroups_per_grid]]);
-
+    uint3    tgpg[[threadgroups_per_grid]],
+    uint3   tpitg[[thread_position_in_threadgroup]],
+    uint3     ntg[[threads_per_threadgroup]]);
 
 template <typename T>
 kernel void kernel_col2im_1d(
@@ -7551,6 +7688,175 @@ template [[host_name("kernel_snake_f16")]]  kernel void kernel_snake<half>(const
 #if defined(GGML_METAL_HAS_BF16)
 template [[host_name("kernel_snake_bf16")]] kernel void kernel_snake<bfloat>(constant ggml_metal_kargs_snake &, device const bfloat *, device const float *, device const float *, device bfloat *, uint, uint, uint);
 #endif
+
+// Gate chunks along ne0 of the LSTM pre-activation tensor (PyTorch/NeMo order), and the
+// result chunks along ne0.  Mirrors enum ggml_lstm_gate / ggml_lstm_out in ggml-impl.h.
+constant uint LSTM_GATE_INPUT  = 0;
+constant uint LSTM_GATE_FORGET = 1;
+constant uint LSTM_GATE_CELL   = 2;
+constant uint LSTM_GATE_OUTPUT = 3;
+constant uint LSTM_N_GATES     = 4;
+constant uint LSTM_OUT_H       = 0;
+constant uint LSTM_OUT_C       = 1;
+constant uint LSTM_N_OUTS      = 2;
+
+// One [h_new, c_new] pair from the gate column `g` and the element's previous cell
+// state. sigmoid / tanh are spelled exactly as the unary kernels spell them.
+static inline void lstm_cell_pair_f32(
+        device const float * g, float c_prev, uint H, uint j,
+        thread float & h_new, thread float & c_new) {
+    const float gi = 1 / (1 + exp(-g[LSTM_GATE_INPUT  * H + j]));
+    const float gf = 1 / (1 + exp(-g[LSTM_GATE_FORGET * H + j]));
+    const float gg = precise::tanh(g[LSTM_GATE_CELL   * H + j]);
+    const float go = 1 / (1 + exp(-g[LSTM_GATE_OUTPUT * H + j]));
+
+    // Metal compiles with fast math; the barrier stops the two products from
+    // contracting into an FMA, which the decomposed mul/mul/add graph cannot do.
+    {
+        #pragma clang fp contract(off)
+        c_new = gf * c_prev + gi * gg;
+    }
+
+    h_new = go * precise::tanh(c_new);
+}
+
+// Fused LSTM cell, one [h_new, c_new] pair per thread over a flat H*N grid-stride loop.
+kernel void kernel_lstm_cell_f32(
+        constant ggml_metal_kargs_lstm_cell & args,
+        device const float * gates,  // [4H, N]
+        device const float * c_prev, // [H, N]
+        device       float * dst,    // [2H, N]
+        uint3 tgpig[[threadgroup_position_in_grid]],
+        uint3  tgpg[[threadgroups_per_grid]],
+        uint3 tpitg[[thread_position_in_threadgroup]],
+        uint3   ntg[[threads_per_threadgroup]]) {
+
+    const uint H        = (uint) args.H;
+    const uint prev_row = (uint) args.prev_row;
+    const uint total    = H * (uint) args.N;
+
+    const uint stride = ntg.x * tgpg.x;
+    for (uint k = tgpig.x * ntg.x + tpitg.x; k < total; k += stride) {
+        const uint n = k / H;
+        const uint j = k - n * H;
+
+        float h_new;
+        float c_new;
+        lstm_cell_pair_f32(gates + n * LSTM_N_GATES * H, c_prev[n * prev_row + j], H, j,
+                           h_new, c_new);
+
+        device float * out = dst + n * LSTM_N_OUTS * H;
+
+        out[LSTM_OUT_H * H + j] = h_new;
+        out[LSTM_OUT_C * H + j] = c_new;
+    }
+}
+
+// Same cell over a packed [h | c] previous state: a column whose mask entry is zero
+// copies its previous pair instead of taking the fresh one.
+kernel void kernel_lstm_cell_masked_f32(
+        constant ggml_metal_kargs_lstm_cell & args,
+        device const float * gates,   // [4H, N]
+        device const float * hc_prev, // [2H, N]
+        device const int   * mask,    // [N] or [1]
+        device       float * dst,     // [2H, N]
+        uint3 tgpig[[threadgroup_position_in_grid]],
+        uint3  tgpg[[threadgroups_per_grid]],
+        uint3 tpitg[[thread_position_in_threadgroup]],
+        uint3   ntg[[threads_per_threadgroup]]) {
+
+    const uint H        = (uint) args.H;
+    const uint prev_row = (uint) args.prev_row;
+    const uint c_base   = (uint) args.c_base;
+    const uint m_stride = (uint) args.mask_stride;
+    const uint total    = H * (uint) args.N;
+
+    const uint stride = ntg.x * tgpg.x;
+    for (uint k = tgpig.x * ntg.x + tpitg.x; k < total; k += stride) {
+        const uint n = k / H;
+        const uint j = k - n * H;
+
+        device const float * p   = hc_prev + n * prev_row;
+        device       float * out = dst     + n * LSTM_N_OUTS * H;
+
+        if (mask[n * m_stride] == 0) {
+            out[LSTM_OUT_H * H + j] = p[j];
+            out[LSTM_OUT_C * H + j] = p[c_base + j];
+            continue;
+        }
+
+        float h_new;
+        float c_new;
+        lstm_cell_pair_f32(gates + n * LSTM_N_GATES * H, p[c_base + j], H, j, h_new, c_new);
+
+        out[LSTM_OUT_H * H + j] = h_new;
+        out[LSTM_OUT_C * H + j] = c_new;
+    }
+}
+
+
+// Result slots along ne0.  Mirrors enum ggml_tdt_step_in / ggml_tdt_step_out in ggml.h.
+constant uint TDT_STEP_IN_T      = 0;
+constant uint TDT_STEP_IN_S      = 1;
+constant uint TDT_STEP_IN_N      = 2;
+constant uint TDT_STEP_OUT_T     = 0;
+constant uint TDT_STEP_OUT_S     = 1;
+constant uint TDT_STEP_OUT_N     = 2;
+constant uint TDT_STEP_OUT_UPD   = 3;
+constant uint TDT_STEP_OUT_HOLD  = 4;
+constant uint TDT_STEP_OUT_FRAME = 5;
+constant uint TDT_STEP_OUT_TOKEN = 6;
+constant uint TDT_STEP_OUT_DUR   = 7;
+
+// Greedy transducer step control, mirroring ggml_tdt_step_i32 in ggml-cpu/ops.cpp.
+kernel void kernel_tdt_step_i32(
+        constant ggml_metal_kargs_tdt_step & args,
+        device const int * token,
+        device const int * dur_idx,
+        device const int * state,
+        device const int * dur_table,
+        device       int * dst) {
+    const int t = state[TDT_STEP_IN_T];
+    const int s = state[TDT_STEP_IN_S];
+    const int n = state[TDT_STEP_IN_N];
+
+    int t_next = t;
+    int s_next = s;
+    int update = 0;
+
+    if (t < n) {
+        const int raw = dur_idx[0];
+        const int di  = raw < 0 ? 0 : (raw < args.n_dur ? raw : args.n_dur - 1);
+        const int dur = args.rnnt ? 0 : dur_table[di];
+        const int adv = args.rnnt ? 1 : (dur > 1 ? dur : 1);
+
+        if (token[0] == args.blank_id) {
+            t_next = t + adv;
+            s_next = 0;
+        } else {
+            update = 1;
+            s_next = s + 1;
+            if ((args.rnnt == 0 && dur > 0) || s_next >= args.max_symbols) {
+                t_next = t + adv;
+                s_next = 0;
+            }
+        }
+    }
+
+    int frame = t_next > n - 1 ? n - 1 : t_next;
+    if (frame < 0) {
+        frame = 0;
+    }
+
+    dst[TDT_STEP_OUT_T]     = t_next;
+    dst[TDT_STEP_OUT_S]     = s_next;
+    dst[TDT_STEP_OUT_N]     = n;
+    dst[TDT_STEP_OUT_UPD]   = update;
+    dst[TDT_STEP_OUT_HOLD]  = 1 - update;
+    dst[TDT_STEP_OUT_FRAME] = frame;
+    dst[TDT_STEP_OUT_TOKEN] = token[0];
+    dst[TDT_STEP_OUT_DUR]   = dur_idx[0];
+}
 
 
 typedef void (conv_transpose_2d_t)(
@@ -7960,12 +8266,19 @@ kernel void kernel_pad_impl(
     const int32_t k0 = tgpig.x/args.ne1;
     const int32_t i1 = tgpig.x - k0*args.ne1;
 
-    const int32_t i03 = i3;
-    const int32_t i02 = i2;
-    const int32_t i01 = i1;
+    // map output coord (i1, i2, i3) back to input coord with front offsets
+    const int32_t i03 = i3 - args.lp3;
+    const int32_t i02 = i2 - args.lp2;
+    const int32_t i01 = i1 - args.lp1;
 
-    device const T * src0_ptr = (device const T *) (src0 + i03*args.nb03 + i02*args.nb02 + i01*args.nb01);
-    device       T * dst_ptr  = (device       T *) (dst  +  i3*args.nb3  +  i2*args.nb2  +  i1*args.nb1);
+    device T * dst_ptr = (device T *) (dst + i3*args.nb3 + i2*args.nb2 + i1*args.nb1);
+
+    const bool row_inside = (i01 >= 0 && i01 < args.ne01 &&
+                             i02 >= 0 && i02 < args.ne02 &&
+                             i03 >= 0 && i03 < args.ne03);
+
+    // walk dim 0 via the byte stride nb00 so non-contiguous (e.g. permuted) inputs are handled
+    device const char * src0_row = src0 + i03*args.nb03 + i02*args.nb02 + i01*args.nb01;
 
     for (int32_t l0 = 0; l0 < 1024; l0 += ntg.x) {
         const int32_t i0 = k0*1024 + tpitg.x + l0;
@@ -7973,8 +8286,10 @@ kernel void kernel_pad_impl(
             break;
         }
 
-        if (i0 < args.ne00 && i1 < args.ne01 && i2 < args.ne02 && i3 < args.ne03) {
-            dst_ptr[i0] = src0_ptr[i0];
+        const int32_t i00 = i0 - args.lp0;
+
+        if (row_inside && i00 >= 0 && i00 < args.ne00) {
+            dst_ptr[i0] = *(device const T *) (src0_row + i00*(sizeof(T)/sizeof(float))*args.nb00);
         } else {
             dst_ptr[i0] = 0.0f;
         }
@@ -7985,6 +8300,37 @@ typedef decltype(kernel_pad_impl<float>) kernel_pad_t;
 
 template [[host_name("kernel_pad_f32")]]   kernel kernel_pad_t kernel_pad_impl<float>;
 template [[host_name("kernel_pad_f32_4")]] kernel kernel_pad_t kernel_pad_impl<float4>;
+
+kernel void kernel_diag_mask_inf_f32(
+    constant   ggml_metal_kargs_diag_mask_inf & args,
+    device  const float * src,
+    device        float * dst,
+    uint3 tgpig[[threadgroup_position_in_grid]],
+    uint3 tpitg[[thread_position_in_threadgroup]],
+    uint3   ntg[[threads_per_threadgroup]]) {
+
+    // Grid layout:
+    //   tgpig.x = row index (0..nrows)
+    //   tgpig.y = tile index across columns
+    //   tpitg.x = column within tile (0..ntg.x)
+
+    const int row = tgpig.x;
+    const int col_base = tgpig.y * ntg.x;
+    const int col = col_base + tpitg.x;
+
+    if (col >= args.ncols) {
+        return;
+    }
+
+    const int i = row * args.ncols + col;
+    const int row_in_channel = row % args.rows_per_channel;
+
+    // Use finite sentinel so subsequent soft_max produces proper zeros
+    // (matches the CUDA implementation).
+    dst[i] = col > args.n_past + row_in_channel
+                ? (src[i] - FLT_MAX)
+                : src[i];
+}
 
 // TODO: this is slow - optimize
 kernel void kernel_pad_reflect_1d_f32(
@@ -8004,19 +8350,410 @@ kernel void kernel_pad_reflect_1d_f32(
     const int64_t i02 = i2;
     const int64_t i01 = i1;
 
-    device const float * src0_ptr = (device const float *) (src0 + i03*args.nb03 + i02*args.nb02 + i01*args.nb01);
+    // Walk dim 0 via byte stride nb00 so non-contiguous (e.g. permuted)
+    // inputs are handled correctly; mirrors the kernel_pad_f32 fix. No
+    // currently-registered test exercises this kernel with a permuted source
+    // (test_pad_reflect_1d is 2D, tfrm-less), but the failure mode would be
+    // identical, so we keep the two kernels in step.
+    device const char  * src0_row = src0 + i03*args.nb03 + i02*args.nb02 + i01*args.nb01;
     device       float * dst_ptr  = (device       float *) (dst  +  i3*args.nb3  +  i2*args.nb2  +  i1*args.nb1);
 
     if (i1 < args.ne01 && i2 < args.ne02 && i3 < args.ne03) {
         for (int i0 = tpitg.x; i0 < args.ne0; i0 += ntg.x) {
+            int64_t i00;
             if (i0 < args.p0) {
-                dst_ptr[i0] = src0_ptr[args.p0 - i0];
+                i00 = args.p0 - i0;
             } else if (i0 < args.ne0 - args.p1) {
-                dst_ptr[i0] = src0_ptr[i0 - args.p0];
+                i00 = i0 - args.p0;
             } else {
-                dst_ptr[i0] = src0_ptr[(args.ne0 - args.p1 - args.p0) - (args.p1 + 1 - (args.ne0 - i0)) - 1];
+                i00 = (args.ne0 - args.p1 - args.p0) - (args.p1 + 1 - (args.ne0 - i0)) - 1;
             }
+            dst_ptr[i0] = *(device const float *) (src0_row + i00*args.nb00);
         }
+    }
+}
+
+// One tap of channel row x_c at time t: the source index clamps to [lo, hi).
+static inline float supertonic_depthwise_tap(device const float * x_c, device const float * w_c,
+                                             int t, int lo, int hi, int k, int dilation, int k_off,
+                                             int sxt, float sum) {
+    int s = t + (k + k_off) * dilation;
+    if (s < lo) s = lo; else if (s >= hi) s = hi - 1;
+    return fma(x_c[(size_t) s * sxt], w_c[k], sum);
+}
+
+// One depthwise output: bias plus the K taps accumulated as an explicit fma chain, so the
+// standalone kernel and the layer-norm fusion compute bit-identical values.
+static inline float supertonic_depthwise_tap_sum(device const float * x_c, device const float * w_c,
+                                                 int t, int lo, int hi, int K, int dilation, int k_off,
+                                                 int sxt, float bias_v) {
+    float sum = bias_v;
+    if (K == 7) {
+        sum = supertonic_depthwise_tap(x_c, w_c, t, lo, hi, 0, dilation, k_off, sxt, sum);
+        sum = supertonic_depthwise_tap(x_c, w_c, t, lo, hi, 1, dilation, k_off, sxt, sum);
+        sum = supertonic_depthwise_tap(x_c, w_c, t, lo, hi, 2, dilation, k_off, sxt, sum);
+        sum = supertonic_depthwise_tap(x_c, w_c, t, lo, hi, 3, dilation, k_off, sxt, sum);
+        sum = supertonic_depthwise_tap(x_c, w_c, t, lo, hi, 4, dilation, k_off, sxt, sum);
+        sum = supertonic_depthwise_tap(x_c, w_c, t, lo, hi, 5, dilation, k_off, sxt, sum);
+        sum = supertonic_depthwise_tap(x_c, w_c, t, lo, hi, 6, dilation, k_off, sxt, sum);
+    } else if (K == 5) {
+        sum = supertonic_depthwise_tap(x_c, w_c, t, lo, hi, 0, dilation, k_off, sxt, sum);
+        sum = supertonic_depthwise_tap(x_c, w_c, t, lo, hi, 1, dilation, k_off, sxt, sum);
+        sum = supertonic_depthwise_tap(x_c, w_c, t, lo, hi, 2, dilation, k_off, sxt, sum);
+        sum = supertonic_depthwise_tap(x_c, w_c, t, lo, hi, 3, dilation, k_off, sxt, sum);
+        sum = supertonic_depthwise_tap(x_c, w_c, t, lo, hi, 4, dilation, k_off, sxt, sum);
+    } else { // K == 3
+        sum = supertonic_depthwise_tap(x_c, w_c, t, lo, hi, 0, dilation, k_off, sxt, sum);
+        sum = supertonic_depthwise_tap(x_c, w_c, t, lo, hi, 1, dilation, k_off, sxt, sum);
+        sum = supertonic_depthwise_tap(x_c, w_c, t, lo, hi, 2, dilation, k_off, sxt, sum);
+    }
+    return sum;
+}
+
+// Supertonic fused depthwise-1D conv with edge-clamp padding + bias add.
+// Replaces the edge_clamp_pad_1d + im2col + mul_mat + add sequence the
+// stock depthwise_same_ggml graph fallback emits. One threadgroup per
+// (channel, batch); threads iterate over the time dimension.
+//
+// Layout (all f32 contiguous):
+//   x:    [L, C, B, 1] memory offset (t, c, batch) -> batch*L*C + c*L + t
+//   w:    [K, 1, C, 1] memory offset (k, 0, c, 0) -> c*K + k
+//   bias: [C]          memory offset c -> c     (omitted when has_bias = 0)
+//   y:    [L, C, B, 1] same layout as x
+kernel void kernel_supertonic_depthwise_1d_f32(
+    constant   ggml_metal_kargs_supertonic_depthwise_1d & args,
+    device  const float * x,
+    device  const float * w,
+    device  const float * bias,
+    device        float * y,
+    uint3 tgpig[[threadgroup_position_in_grid]],
+    uint3 tpitg[[thread_position_in_threadgroup]],
+    uint3   ntg[[threads_per_threadgroup]]) {
+
+    const int c = (int) tgpig.x;
+    const int batch = (int) tgpig.y;
+    if (c >= args.C || batch >= args.B) return;
+
+    const int L        = args.L;
+    const int K        = args.K;
+    const int dilation = args.dilation;
+    const int causal   = args.causal;
+    const int sxt = args.sxt, sxc = args.sxc;
+    const int syt = args.syt, syc = args.syc;
+    const size_t batch_offset = (size_t) batch * L * args.C;
+
+    // Layout-agnostic per-channel base pointers: x[t, c] = x[t*sxt + c*sxc].
+    // w is stored as [K, 1, C] f32 contiguous, so w_c = w + c*K stays.
+    device const float * x_c = x + batch_offset + (size_t) c * sxc;
+    device const float * w_c = w + (size_t) c * K;
+    device       float * y_c = y + batch_offset + (size_t) c * syc;
+
+    const float bias_v = (args.has_bias != 0) ? bias[c] : 0.0f;
+
+    // The k-offset selects the kernel-centre vs causal-left convolution
+    // semantic: symmetric edge-clamp (causal=0) uses offset = -K/2 so the
+    // tap at k = K/2 lands at t; causal (causal=1) uses offset = -(K-1) so
+    // the last tap at k = K-1 lands at t and earlier taps look strictly
+    // left.
+    const int k_off = (causal != 0) ? -(K - 1) : -(K / 2);
+    const int seg_len = args.seg_len;
+
+    for (int t = (int) tpitg.x; t < L; t += (int) ntg.x) {
+        const int lo = seg_len > 0 ? (t / seg_len) * seg_len : 0;
+        const int hi = seg_len > 0 ? lo + seg_len : L;
+        y_c[(size_t) t * syt] = supertonic_depthwise_tap_sum(x_c, w_c, t, lo, hi, K, dilation, k_off, sxt, bias_v);
+    }
+}
+
+// Depthwise taps and the channel layer norm in one dispatch: one threadgroup per timestep
+// keeps its channels' taps in registers and reduces exactly like the standalone kernel.
+kernel void kernel_supertonic_depthwise_1d_layer_norm_f32(
+    constant   ggml_metal_kargs_supertonic_depthwise_1d_layer_norm & args,
+    device  const float * x,
+    device  const float * w,
+    device  const float * bias,
+    device  const float * g,
+    device  const float * b,
+    device        float * y,
+    threadgroup    float * shared [[threadgroup(0)]],
+    uint3 tgpig[[threadgroup_position_in_grid]],
+    uint3 tpitg[[thread_position_in_threadgroup]],
+    uint3   ntg[[threads_per_threadgroup]],
+    uint  sgitg [[simdgroup_index_in_threadgroup]],
+    uint  tiisg [[thread_index_in_simdgroup]]) {
+
+    const int t = (int) tgpig.x;
+    const int batch = (int) tgpig.y;
+    if (t >= args.L || batch >= args.B) return;
+
+    const int L = args.L;
+    const int C = args.C;
+    const int K = args.K;
+    const int dilation = args.dilation;
+    const int sxt = args.sxt, sxc = args.sxc;
+    const int syt = args.syt, syc = args.syc;
+    const int k_off = (args.causal != 0) ? -(K - 1) : -(K / 2);
+    const int seg_len = args.seg_len;
+    const int lo = seg_len > 0 ? (t / seg_len) * seg_len : 0;
+    const int hi = seg_len > 0 ? lo + seg_len : L;
+    const size_t batch_offset = (size_t) batch * L * C;
+
+    float vals[GGML_METAL_SUPERTONIC_DW_LN_MAX_PER_THREAD];
+    for (int i = 0; i < GGML_METAL_SUPERTONIC_DW_LN_MAX_PER_THREAD; ++i) {
+        const int c = (int) tpitg.x + i * (int) ntg.x;
+        if (c < C) {
+            const float bias_v = (args.has_bias != 0) ? bias[c] : 0.0f;
+            vals[i] = supertonic_depthwise_tap_sum(x + batch_offset + (size_t) c * sxc, w + (size_t) c * K,
+                                                   t, lo, hi, K, dilation, k_off, sxt, bias_v);
+        }
+    }
+
+    float my_sum = 0.0f;
+    for (int i = 0; i < GGML_METAL_SUPERTONIC_DW_LN_MAX_PER_THREAD; ++i) {
+        const int c = (int) tpitg.x + i * (int) ntg.x;
+        if (c < C) my_sum += vals[i];
+    }
+    my_sum = simd_sum(my_sum);
+    if (tiisg == 0) {
+        shared[sgitg] = my_sum;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sgitg == 0) {
+        const uint n_sg = (ntg.x + 31) / 32;
+        float total = (tiisg < n_sg) ? shared[tiisg] : 0.0f;
+        total = simd_sum(total);
+        if (tiisg == 0) shared[0] = total;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float mean = shared[0] / (float) C;
+
+    float my_sq = 0.0f;
+    for (int i = 0; i < GGML_METAL_SUPERTONIC_DW_LN_MAX_PER_THREAD; ++i) {
+        const int c = (int) tpitg.x + i * (int) ntg.x;
+        if (c < C) {
+            const float d = vals[i] - mean;
+            my_sq = fma(d, d, my_sq);
+        }
+    }
+    my_sq = simd_sum(my_sq);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tiisg == 0) {
+        shared[sgitg] = my_sq;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sgitg == 0) {
+        const uint n_sg = (ntg.x + 31) / 32;
+        float total = (tiisg < n_sg) ? shared[tiisg] : 0.0f;
+        total = simd_sum(total);
+        if (tiisg == 0) shared[0] = total;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float inv_std = rsqrt(shared[0] / (float) C + args.eps);
+
+    device float * y_t = y + batch_offset + (size_t) t * syt;
+    for (int i = 0; i < GGML_METAL_SUPERTONIC_DW_LN_MAX_PER_THREAD; ++i) {
+        const int c = (int) tpitg.x + i * (int) ntg.x;
+        if (c < C) {
+            const float xv = vals[i];
+            y_t[(size_t) c * syc] = (xv - mean) * inv_std * g[c] + b[c];
+        }
+    }
+}
+
+// Supertonic fused channel-axis layer norm.  Replaces the
+// permute + cont + ggml_norm + mul + add + permute + cont chain that
+// stock ggml_norm requires (since ggml_norm normalises along ne[0]).
+// One threadgroup per timestep; threads stripe over channels.
+//
+// Layout: x and y are f32 contiguous [L, C, B, 1] with element (t, c, batch)
+// at offset batch*L*C + c*L + t. Affine params g, b are f32 [C].
+//
+// Reduction uses simdgroup_sum + threadgroup memory across simdgroups.
+// Assumes threads_per_threadgroup is a multiple of 32 (simdgroup size on
+// Apple GPUs).  Caller picks nth = min(L, 32 * ceil(C / 32)) up to 256.
+kernel void kernel_supertonic_layer_norm_channel_f32(
+    constant   ggml_metal_kargs_supertonic_layer_norm_channel & args,
+    device  const float * x,
+    device  const float * g,
+    device  const float * b,
+    device        float * y,
+    threadgroup    float * shared [[threadgroup(0)]],
+    uint3 tgpig[[threadgroup_position_in_grid]],
+    uint3 tpitg[[thread_position_in_threadgroup]],
+    uint3   ntg[[threads_per_threadgroup]],
+    uint  sgitg [[simdgroup_index_in_threadgroup]],
+    uint  tiisg [[thread_index_in_simdgroup]]) {
+
+    const int t = (int) tgpig.x;
+    const int batch = (int) tgpig.y;
+    if (t >= args.L || batch >= args.B) return;
+
+    const int C = args.C;
+    // Element strides — let the same kernel handle both
+    // [T, C] (sxt=1, sxc=L) and [C, T] (sxt=C, sxc=1) layouts.
+    const int sxt = args.sxt, sxc = args.sxc;
+    const int syt = args.syt, syc = args.syc;
+    const size_t batch_offset = (size_t) batch * args.L * C;
+
+    device const float * x_t = x + batch_offset + (size_t) t * sxt;
+    device       float * y_t = y + batch_offset + (size_t) t * syt;
+
+    // ---- Mean ----
+    float my_sum = 0.0f;
+    for (int c = (int) tpitg.x; c < C; c += (int) ntg.x) {
+        my_sum += x_t[(size_t) c * sxc];
+    }
+    // Simdgroup reduce within the simdgroup.
+    my_sum = simd_sum(my_sum);
+    if (tiisg == 0) {
+        shared[sgitg] = my_sum;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    // First simdgroup reduces partial sums.
+    if (sgitg == 0) {
+        const uint n_sg = (ntg.x + 31) / 32;
+        float total = (tiisg < n_sg) ? shared[tiisg] : 0.0f;
+        total = simd_sum(total);
+        if (tiisg == 0) shared[0] = total;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float mean = shared[0] / (float) C;
+
+    // ---- Variance ----
+    float my_sq = 0.0f;
+    for (int c = (int) tpitg.x; c < C; c += (int) ntg.x) {
+        const float d = x_t[(size_t) c * sxc] - mean;
+        my_sq = fma(d, d, my_sq);
+    }
+    my_sq = simd_sum(my_sq);
+    // Every simdgroup must have read the mean from shared[0] before it is reused below.
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tiisg == 0) {
+        shared[sgitg] = my_sq;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sgitg == 0) {
+        const uint n_sg = (ntg.x + 31) / 32;
+        float total = (tiisg < n_sg) ? shared[tiisg] : 0.0f;
+        total = simd_sum(total);
+        if (tiisg == 0) shared[0] = total;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float inv_std = rsqrt(shared[0] / (float) C + args.eps);
+
+    // ---- Apply affine ----
+    for (int c = (int) tpitg.x; c < C; c += (int) ntg.x) {
+        const float xv = x_t[(size_t) c * sxc];
+        y_t[(size_t) c * syc] = (xv - mean) * inv_std * g[c] + b[c];
+    }
+}
+
+// Supertonic fused (x + bias) * gamma + residual.  Replaces the
+// ggml_add → ggml_mul → ggml_add chain at the end of every ConvNeXt
+// block. One threadgroup per (channel, batch); threads stride over the time
+// dim. bias and gamma are constants for the channel — load once into
+// registers and broadcast across timesteps.
+//
+// Layout: x, residual, y are f32 contiguous [L, C, B, 1] with element
+// (t, c, batch) at offset batch*L*C + c*L + t. bias and gamma are f32 [C].
+kernel void kernel_supertonic_pw2_residual_f32(
+    constant   ggml_metal_kargs_supertonic_pw2_residual & args,
+    device  const float * x,
+    device  const float * bias,
+    device  const float * gamma,
+    device  const float * residual,
+    device        float * y,
+    uint3 tgpig[[threadgroup_position_in_grid]],
+    uint3 tpitg[[thread_position_in_threadgroup]],
+    uint3   ntg[[threads_per_threadgroup]]) {
+
+    const int c = (int) tgpig.x;
+    const int batch = (int) tgpig.y;
+    if (c >= args.C || batch >= args.B) return;
+
+    const int L = args.L;
+    const int sxt = args.sxt, sxc = args.sxc;
+    const int syt = args.syt, syc = args.syc;
+    const int srt = args.srt, src = args.src;
+    const float bv = bias[c];
+    const float gv = gamma[c];
+    const size_t batch_offset = (size_t) batch * L * args.C;
+
+    device const float * x_c = x        + batch_offset + (size_t) c * sxc;
+    device const float * r_c = residual + batch_offset + (size_t) c * src;
+    device       float * y_c = y        + batch_offset + (size_t) c * syc;
+
+    for (int t = (int) tpitg.x; t < L; t += (int) ntg.x) {
+        y_c[(size_t) t * syt] = r_c[(size_t) t * srt] + (x_c[(size_t) t * sxt] + bv) * gv;
+    }
+}
+
+// Fused bias + GELU (erf form):  y[t, c] = gelu_erf(x[t, c] + bias[c])
+//                                        = 0.5 * v * (1 + erf(v / sqrt(2)))
+// Same batched contiguous layouts as pw2_residual. One threadgroup per
+// (channel, batch); threads in the threadgroup stride over the time axis so
+// the per-channel bias load lives in a register for the whole row.
+kernel void kernel_supertonic_bias_gelu_f32(
+    constant   ggml_metal_kargs_supertonic_bias_gelu & args,
+    device  const float * x,
+    device  const float * bias,
+    device        float * y,
+    uint3 tgpig[[threadgroup_position_in_grid]],
+    uint3 tpitg[[thread_position_in_threadgroup]],
+    uint3   ntg[[threads_per_threadgroup]]) {
+
+    const int c = (int) tgpig.x;
+    const int batch = (int) tgpig.y;
+    if (c >= args.C || batch >= args.B) return;
+
+    const int L = args.L;
+    const int sxt = args.sxt, sxc = args.sxc;
+    const int syt = args.syt, syc = args.syc;
+    const float bv = bias[c];
+    const size_t batch_offset = (size_t) batch * L * args.C;
+
+    device const float * x_c = x + batch_offset + (size_t) c * sxc;
+    device       float * y_c = y + batch_offset + (size_t) c * syc;
+
+    // Use the same erf_approx template as kernel_gelu_erf_f32 above
+    // (Abramowitz & Stegun 7.1.26 / Hastings approximation) so the fused
+    // bias_gelu output is bit-identical to the unfused add + gelu_erf path.
+    for (int t = (int) tpitg.x; t < L; t += (int) ntg.x) {
+        const float v = x_c[(size_t) t * sxt] + bv;
+        y_c[(size_t) t * syt] = 0.5f * v * (1.0f + erf_approx<float>(v * SQRT_2_INV));
+    }
+}
+
+// Replicate-pad on the time dimension (ne[0]) of a [L_in, C, 1, 1] f32
+// tensor.  Output is [L_in + pad_left + pad_right, C, 1, 1]; for each
+// output time `t`, we copy from `x[clamp(t - pad_left, 0, L_in - 1), c]`.
+// One threadgroup per channel; threads in the threadgroup stride over
+// the (longer) output time axis.
+kernel void kernel_supertonic_edge_pad_1d_f32(
+    constant   ggml_metal_kargs_supertonic_edge_pad_1d & args,
+    device  const float * x,
+    device        float * y,
+    uint3 tgpig[[threadgroup_position_in_grid]],
+    uint3 tpitg[[thread_position_in_threadgroup]],
+    uint3   ntg[[threads_per_threadgroup]]) {
+
+    const int c = (int) tgpig.x;
+    if (c >= args.C) return;
+
+    const int L_in  = args.L_in;
+    const int L_out = args.L_out;
+    const int pad   = args.pad_left;
+    const int sxt = args.sxt, sxc = args.sxc;
+    const int syt = args.syt, syc = args.syc;
+
+    device const float * x_c = x + (size_t) c * sxc;
+    device       float * y_c = y + (size_t) c * syc;
+
+    for (int t = (int) tpitg.x; t < L_out; t += (int) ntg.x) {
+        int src_t = t - pad;
+        if (src_t < 0)      src_t = 0;
+        if (src_t >= L_in)  src_t = L_in - 1;
+        y_c[(size_t) t * syt] = x_c[(size_t) src_t * sxt];
     }
 }
 
@@ -10214,18 +10951,20 @@ kernel void kernel_cpy_t_t(
         return;
     }
 
-    const int64_t n = i03*args.ne02*args.ne01*args.ne00 + i02*args.ne01*args.ne00 + i01*args.ne00;
+    const int64_t n0 = i03*args.ne02*args.ne01*args.ne00 + i02*args.ne01*args.ne00 + i01*args.ne00;
 
-    const int32_t i3 = n/(args.ne2*args.ne1*args.ne0);
-    const int32_t i2 = (n - i3*args.ne2*args.ne1*args.ne0)/(args.ne1*args.ne0);
-    const int32_t i1 = (n - i3*args.ne2*args.ne1*args.ne0 - i2*args.ne1*args.ne0)/args.ne0;
-    const int32_t i0 = (n - i3*args.ne2*args.ne1*args.ne0 - i2*args.ne1*args.ne0 - i1*args.ne0);
-
-    device T1 * dst_data = (device T1 *) (dst + i3*args.nb3 + i2*args.nb2 + i1*args.nb1 + i0*args.nb0);
-
+    // dst may be strided and shaped differently from src, so map every element
+    // through its own dst coordinates instead of indexing along the src row
     for (int32_t i00 = iw0*ntg[0] + tpitg.x; i00 < args.ne00;) {
+        const int64_t n = n0 + i00;
+
+        const int32_t i3 = n/(args.ne2*args.ne1*args.ne0);
+        const int32_t i2 = (n - i3*args.ne2*args.ne1*args.ne0)/(args.ne1*args.ne0);
+        const int32_t i1 = (n - i3*args.ne2*args.ne1*args.ne0 - i2*args.ne1*args.ne0)/args.ne0;
+        const int32_t i0 = (n - i3*args.ne2*args.ne1*args.ne0 - i2*args.ne1*args.ne0 - i1*args.ne0);
+
         device const T0 * src = (device T0 *)(src0 + i03*args.nb03 + i02*args.nb02 + i01*args.nb01 + i00*args.nb00);
-        dst_data[i00] = (T1) src[0];
+        *(device T1 *) (dst + i3*args.nb3 + i2*args.nb2 + i1*args.nb1 + i0*args.nb0) = (T1) src[0];
         break;
     }
 }
@@ -10246,6 +10985,120 @@ template [[host_name("kernel_cpy_f16_f16")]]   kernel kernel_cpy_t kernel_cpy_t_
 template [[host_name("kernel_cpy_bf16_f32")]]  kernel kernel_cpy_t kernel_cpy_t_t<bfloat,  float>;
 template [[host_name("kernel_cpy_bf16_bf16")]] kernel kernel_cpy_t kernel_cpy_t_t<bfloat,  bfloat>;
 #endif
+
+template<typename T0, typename T1>
+kernel void kernel_cpy_rows_t_t(
+        constant ggml_metal_kargs_cpy & args,
+        device  const char * src0,
+        device        char * dst,
+        uint3   tgpig[[threadgroup_position_in_grid]],
+        ushort  tiitg[[thread_index_in_threadgroup]],
+        ushort3   ntg[[threads_per_threadgroup]]) {
+    const int ne00 = args.ne00;
+    const int ne01 = args.ne01;
+    const int nk0  = args.nk0;
+
+    const int i03 = tgpig[2];
+    const int i02 = tgpig[1];
+    const int i01 = ntg[1] == 1 ? (int) tgpig[0]%ne01 : (int) tgpig[0]*ntg[1] + tiitg/ntg[0];
+    const int iw0 = ntg[1] == 1 ? (int) tgpig[0]/ne01 : 0;
+
+    if (i01 >= ne01) {
+        return;
+    }
+
+    device const T0 * src_row = (device const T0 *)(src0 + i03*args.nb03 + i02*args.nb02 + i01*args.nb01);
+    device       T1 * dst_row = (device       T1 *)(dst  + i03*args.nb3  + i02*args.nb2  + i01*args.nb1);
+
+    const int i0 = iw0*ntg[0] + tiitg%ntg[0];
+
+    for (short k = 0; k < N_CPY_ROW; ++k) {
+        const int i00 = i0 + k*nk0;
+
+        if (i00 < ne00) {
+            dst_row[i00] = (T1) src_row[i00];
+        }
+    }
+}
+
+typedef decltype(kernel_cpy_rows_t_t<float, float>) kernel_cpy_rows_t;
+
+template [[host_name("kernel_cpy_rows_f32_f32")]] kernel kernel_cpy_rows_t kernel_cpy_rows_t_t<float, float>;
+template [[host_name("kernel_cpy_rows_f32_f16")]] kernel kernel_cpy_rows_t kernel_cpy_rows_t_t<float, half>;
+template [[host_name("kernel_cpy_rows_f16_f32")]] kernel kernel_cpy_rows_t kernel_cpy_rows_t_t<half,  float>;
+template [[host_name("kernel_cpy_rows_f16_f16")]] kernel kernel_cpy_rows_t kernel_cpy_rows_t_t<half,  half>;
+
+// the src rows run along ne01, so read the tile along ne01 and write it back along ne00 - both coalesced
+template<typename T0, typename T1>
+static void cpy_transpose_load(
+        constant ggml_metal_kargs_cpy & args,
+        device const char * src_base,
+        threadgroup T1 (&tile)[SZ_CPY_TRANSPOSE][SZ_CPY_TRANSPOSE + 1],
+        int i00_0,
+        int i01_0,
+        ushort2 tpitg) {
+    for (ushort k = 0; k < SZ_CPY_TRANSPOSE; k += N_CPY_TRANSPOSE_ROWS) {
+        const int i00 = i00_0 + tpitg.y + k;
+        const int i01 = i01_0 + tpitg.x;
+
+        if (i00 < args.ne00 && i01 < args.ne01) {
+            device const T0 * src = (device const T0 *)(src_base + i00*args.nb00 + i01*args.nb01);
+
+            tile[tpitg.y + k][tpitg.x] = (T1) *src;
+        }
+    }
+}
+
+template<typename T1>
+static void cpy_transpose_store(
+        constant ggml_metal_kargs_cpy & args,
+        device char * dst_base,
+        threadgroup const T1 (&tile)[SZ_CPY_TRANSPOSE][SZ_CPY_TRANSPOSE + 1],
+        int i00_0,
+        int i01_0,
+        ushort2 tpitg) {
+    for (ushort k = 0; k < SZ_CPY_TRANSPOSE; k += N_CPY_TRANSPOSE_ROWS) {
+        const int i00 = i00_0 + tpitg.x;
+        const int i01 = i01_0 + tpitg.y + k;
+
+        if (i00 < args.ne00 && i01 < args.ne01) {
+            device T1 * dst_row = (device T1 *)(dst_base + i01*args.nb1);
+
+            dst_row[i00] = tile[tpitg.x][tpitg.y + k];
+        }
+    }
+}
+
+template<typename T0, typename T1>
+kernel void kernel_cpy_transpose_t_t(
+        constant ggml_metal_kargs_cpy & args,
+        device  const char * src0,
+        device        char * dst,
+        uint3   tgpig[[threadgroup_position_in_grid]],
+        ushort3 tpitg[[thread_position_in_threadgroup]]) {
+    threadgroup T1 tile[SZ_CPY_TRANSPOSE][SZ_CPY_TRANSPOSE + 1];
+
+    const int ne02 = args.ne02;
+
+    const int i03 = (int) tgpig[2]/ne02;
+    const int i02 = (int) tgpig[2]%ne02;
+
+    const int i00_0 = (int) tgpig[0]*SZ_CPY_TRANSPOSE;
+    const int i01_0 = (int) tgpig[1]*SZ_CPY_TRANSPOSE;
+
+    cpy_transpose_load<T0, T1>(args, src0 + i03*args.nb03 + i02*args.nb02, tile, i00_0, i01_0, tpitg.xy);
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    cpy_transpose_store<T1>(args, dst + i03*args.nb3 + i02*args.nb2, tile, i00_0, i01_0, tpitg.xy);
+}
+
+typedef decltype(kernel_cpy_transpose_t_t<float, float>) kernel_cpy_transpose_t;
+
+template [[host_name("kernel_cpy_transpose_f32_f32")]] kernel kernel_cpy_transpose_t kernel_cpy_transpose_t_t<float, float>;
+template [[host_name("kernel_cpy_transpose_f32_f16")]] kernel kernel_cpy_transpose_t kernel_cpy_transpose_t_t<float, half>;
+template [[host_name("kernel_cpy_transpose_f16_f32")]] kernel kernel_cpy_transpose_t kernel_cpy_transpose_t_t<half,  float>;
+template [[host_name("kernel_cpy_transpose_f16_f16")]] kernel kernel_cpy_transpose_t kernel_cpy_transpose_t_t<half,  half>;
 
 template<short QK,
          typename block_q,
@@ -10344,6 +11197,14 @@ template [[host_name("kernel_cpy_q8_0_f32")]] kernel cpy_q_f_t kernel_cpy_q_f32<
 
 template [[host_name("kernel_cpy_tq2_0_f32")]] kernel cpy_q_f_t kernel_cpy_q_f32<float4x4, block_tq2_0, QK_NL, dequantize_tq2_0>;
 
+// K-quants dequantise in 16-element sub-blocks, which is exactly the group size
+// ggml_metal_op_cpy already assumes for a quantised source (nk0 = ne00/16).
+template [[host_name("kernel_cpy_q2_K_f32")]] kernel cpy_q_f_t kernel_cpy_q_f32<float4x4, block_q2_K, 16, dequantize_q2_K>;
+template [[host_name("kernel_cpy_q3_K_f32")]] kernel cpy_q_f_t kernel_cpy_q_f32<float4x4, block_q3_K, 16, dequantize_q3_K>;
+template [[host_name("kernel_cpy_q4_K_f32")]] kernel cpy_q_f_t kernel_cpy_q_f32<float4x4, block_q4_K, 16, dequantize_q4_K>;
+template [[host_name("kernel_cpy_q5_K_f32")]] kernel cpy_q_f_t kernel_cpy_q_f32<float4x4, block_q5_K, 16, dequantize_q5_K>;
+template [[host_name("kernel_cpy_q6_K_f32")]] kernel cpy_q_f_t kernel_cpy_q_f32<float4x4, block_q6_K, 16, dequantize_q6_K>;
+
 template [[host_name("kernel_cpy_q1_0_f16")]] kernel cpy_q_f_t kernel_cpy_q_f32<half4x4, block_q1_0, 8, dequantize_q1_0>;
 template [[host_name("kernel_cpy_q2_0_f16")]] kernel cpy_q_f_t kernel_cpy_q_f32<half4x4, block_q2_0, 4, dequantize_q2_0>;
 template [[host_name("kernel_cpy_q4_0_f16")]] kernel cpy_q_f_t kernel_cpy_q_f32<half4x4, block_q4_0, 2, dequantize_q4_0>;
@@ -10353,6 +11214,12 @@ template [[host_name("kernel_cpy_q5_1_f16")]] kernel cpy_q_f_t kernel_cpy_q_f32<
 template [[host_name("kernel_cpy_q8_0_f16")]] kernel cpy_q_f_t kernel_cpy_q_f32<half4x4, block_q8_0, 2, dequantize_q8_0>;
 
 template [[host_name("kernel_cpy_tq2_0_f16")]] kernel cpy_q_f_t kernel_cpy_q_f32<half4x4, block_tq2_0, QK_NL, dequantize_tq2_0>;
+
+template [[host_name("kernel_cpy_q2_K_f16")]] kernel cpy_q_f_t kernel_cpy_q_f32<half4x4, block_q2_K, 16, dequantize_q2_K>;
+template [[host_name("kernel_cpy_q3_K_f16")]] kernel cpy_q_f_t kernel_cpy_q_f32<half4x4, block_q3_K, 16, dequantize_q3_K>;
+template [[host_name("kernel_cpy_q4_K_f16")]] kernel cpy_q_f_t kernel_cpy_q_f32<half4x4, block_q4_K, 16, dequantize_q4_K>;
+template [[host_name("kernel_cpy_q5_K_f16")]] kernel cpy_q_f_t kernel_cpy_q_f32<half4x4, block_q5_K, 16, dequantize_q5_K>;
+template [[host_name("kernel_cpy_q6_K_f16")]] kernel cpy_q_f_t kernel_cpy_q_f32<half4x4, block_q6_K, 16, dequantize_q6_K>;
 
 template<typename T>
 kernel void kernel_concat(
@@ -12753,24 +13620,54 @@ constant short FC_mul_mm_ne12  [[function_constant(FC_MUL_MM + 2)]];
 constant short FC_mul_mm_ne13  [[function_constant(FC_MUL_MM + 3)]];
 constant short FC_mul_mm_r2    [[function_constant(FC_MUL_MM + 4)]];
 constant short FC_mul_mm_r3    [[function_constant(FC_MUL_MM + 5)]];
+constant int  FC_mul_mm_epi    [[function_constant(FC_MUL_MM + 6)]];
+constant bool FC_mul_mm_narrow [[function_constant(FC_MUL_MM + 7)]];
+
+// Fused epilogue for dst element (m, n) with value v; off is its flat index including the batch offset.
+// The expressions match the standalone add, bias_gelu and pw2_residual kernels exactly.
+static inline float mul_mm_epilogue(
+        float v,
+        int m,
+        uint64_t off,
+        device const char * bias,
+        device const char * gamma,
+        device const char * residual) {
+    if (FC_mul_mm_epi == GGML_METAL_MM_EPI_NONE) {
+        return v;
+    }
+    const float b = ((device const float *) bias)[m];
+    if (FC_mul_mm_epi == GGML_METAL_MM_EPI_BIAS) {
+        return v + b;
+    }
+    if (FC_mul_mm_epi == GGML_METAL_MM_EPI_BIAS_RESIDUAL) {
+        return (v + b) + ((device const float *) residual)[off];
+    }
+    if (FC_mul_mm_epi == GGML_METAL_MM_EPI_BIAS_GELU) {
+        const float x = v + b;
+        return 0.5f * x * (1.0f + erf_approx<float>(x * SQRT_2_INV));
+    }
+    return ((device const float *) residual)[off] + (v + b) * ((device const float *) gamma)[m];
+}
 
 // each block_q contains 16*nl weights
 #ifdef GGML_METAL_HAS_TENSOR
 template<
+    short BLOCK_X,
     typename SA, typename SA_4x4, typename SA_8x8,
     typename SB, typename SB_2x4, typename SB_8x8,
     typename block_q, short nl, void (*dequantize_func)(device const block_q *, short, thread SA_4x4 &),
     typename T0, typename T0_4x4, typename T1, typename T1_2x4>
-kernel void kernel_mul_mm(
+static void mul_mm_tensor_tile(
         constant ggml_metal_kargs_mul_mm & args,
         device const char * srcA,
         device const char * srcB,
         device       char * dst,
-        threadgroup  char * shmem [[threadgroup(0)]],
-        uint3  tgpig [[threadgroup_position_in_grid]],
-        ushort tiitg [[thread_index_in_threadgroup]],
-        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
-    (void) sgitg;
+        device const char * bias,
+        device const char * gamma,
+        device const char * residual,
+        threadgroup  char * shmem,
+        uint3  tgpig,
+        ushort tiitg) {
 
     // Matrix dimensions: A(M,K) x B(K,N) -> C(M,N)
     const int K = args.ne00;
@@ -12786,7 +13683,7 @@ kernel void kernel_mul_mm(
     const uint64_t offset0 = (i12/FC_mul_mm_r2)*args.nb02 + (i13/FC_mul_mm_r3)*args.nb03;
 
     // Tile dimensions
-    constexpr int NRB = SZ_SIMDGROUP * N_MM_BLOCK_X * N_MM_SIMD_GROUP_X;
+    constexpr int NRB = SZ_SIMDGROUP * BLOCK_X * N_MM_SIMD_GROUP_X;
     constexpr int NRA = SZ_SIMDGROUP * N_MM_BLOCK_Y * N_MM_SIMD_GROUP_Y;
 
     // Tile offsets in output matrix
@@ -12809,16 +13706,15 @@ kernel void kernel_mul_mm(
     auto tB = tensor(ptrB, dextents<int32_t, 2>(K, N), array<int, 2>({1, strideB}));
 
     // Configure matmul operation
-    // note: K is dynamic_extent (clamped to the valid range in PHASE 2), since a static
-    //       N_MM_NK_TOTAL K tile would read src1 out of bounds when K % N_MM_NK_TOTAL != 0
-    // ref: https://github.com/ggml-org/llama.cpp/pull/27064
+    // K is dynamic_extent and clamped per iteration in PHASE 2: a static N_MM_NK_TOTAL
+    // K tile reads src1 out of bounds when K % N_MM_NK_TOTAL != 0 (upstream ggml 33c9ea5e).
     mpp::tensor_ops::matmul2d<
         mpp::tensor_ops::matmul2d_descriptor(
             NRB, NRA, static_cast<int>(dynamic_extent), false, true, true,
             mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate),
         execution_simdgroups<N_MM_SIMD_GROUP_X * N_MM_SIMD_GROUP_Y>> mm;
 
-    auto cT = mm.get_destination_cooperative_tensor<decltype(tB), decltype(tA), float>();
+    auto cT = mm.template get_destination_cooperative_tensor<decltype(tB), decltype(tA), float>();
 
     // Accumulate partial results over K dimension
     for (int loop_k = 0; loop_k < K; loop_k += N_MM_NK_TOTAL) {
@@ -12866,8 +13762,8 @@ kernel void kernel_mul_mm(
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         // === PHASE 2: Tensor matmul ===
-        // Clamp the K extent of both operand tensors to the remaining valid K range so
-        // the dynamic-K op never reads past the K extent of src1 (or the staged A tile).
+        // Clamp the K extent of both operand views to the remaining valid K range so the
+        // dynamic-K op never reads past the K extent of src1 (or the staged A tile).
         const int kExt = min(N_MM_NK_TOTAL, K - loop_k);
 
         auto tAv = tensor(sa, dextents<int32_t, 2>(kExt, NRA), array<int, 2>({1, N_MM_NK_TOTAL}));
@@ -12882,29 +13778,79 @@ kernel void kernel_mul_mm(
     // cT.store handles bounds checking via tD's extents (M, N)
     device float * dstBatch = (device float *)dst + im * N * M;
 
-    auto tD = tensor(dstBatch, dextents<int32_t, 2>(M, N), array<int, 2>({1, M}));
-    cT.store(tD.slice(ra, rb));
+    if (FC_mul_mm_epi == GGML_METAL_MM_EPI_NONE) {
+        auto tD = tensor(dstBatch, dextents<int32_t, 2>(M, N), array<int, 2>({1, M}));
+        cT.store(tD.slice(ra, rb));
+        return;
+    }
+
+    // Fused epilogue: visit this thread's tile elements and store them with bounds checks.
+    const uint64_t batch_off = (uint64_t) im * N * M;
+    using ct_index_t = typename decltype(cT)::thread_index_type;
+    FOR_UNROLL (ct_index_t i = 0; i < cT.get_capacity(); ++i) {
+        if (!cT.is_valid_element(i)) {
+            continue;
+        }
+        const auto ids = cT.get_multidimensional_index(i);
+        const int m = ra + ids[0];
+        const int n = rb + ids[1];
+        if (m < M && n < N) {
+            const uint64_t off = (uint64_t) n * M + m;
+            dstBatch[off] = mul_mm_epilogue(cT[i], m, batch_off + off, bias, gamma, residual);
+        }
+    }
 }
 
-#else
+template<
+    typename SA, typename SA_4x4, typename SA_8x8,
+    typename SB, typename SB_2x4, typename SB_8x8,
+    typename block_q, short nl, void (*dequantize_func)(device const block_q *, short, thread SA_4x4 &),
+    typename T0, typename T0_4x4, typename T1, typename T1_2x4>
+kernel void kernel_mul_mm_tensor(
+        constant ggml_metal_kargs_mul_mm & args,
+        device const char * srcA,
+        device const char * srcB,
+        device       char * dst,
+        device const char * bias,
+        device const char * gamma,
+        device const char * residual,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig [[threadgroup_position_in_grid]],
+        ushort tiitg [[thread_index_in_threadgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    (void) sgitg;
 
+    if (FC_mul_mm_narrow) {
+        mul_mm_tensor_tile<N_MM_BLOCK_X_NARROW, SA, SA_4x4, SA_8x8, SB, SB_2x4, SB_8x8, block_q, nl, dequantize_func, T0, T0_4x4, T1, T1_2x4>(
+                args, srcA, srcB, dst, bias, gamma, residual, shmem, tgpig, tiitg);
+    } else {
+        mul_mm_tensor_tile<N_MM_BLOCK_X, SA, SA_4x4, SA_8x8, SB, SB_2x4, SB_8x8, block_q, nl, dequantize_func, T0, T0_4x4, T1, T1_2x4>(
+                args, srcA, srcB, dst, bias, gamma, residual, shmem, tgpig, tiitg);
+    }
+}
+
+#endif // GGML_METAL_HAS_TENSOR
+
+// Stays compiled even when the tensor API is available. MPP reduces precision internally no
+// matter what type its operands are staged as, so this is the only mul_mm that can honour
+// GGML_PREC_F32, and the f32-operand instantiation below is taken from it on every device.
 template<
     typename S0, typename S0_4x4, typename S0_8x8,
     typename S1, typename S1_2x4, typename S1_8x8,
     typename block_q, short nl, void (*dequantize_func)(device const block_q *, short, thread S0_4x4 &),
     typename T0, typename T0_4x4, typename T1, typename T1_2x4>
-kernel void kernel_mul_mm(
+kernel void kernel_mul_mm_simd(
         constant ggml_metal_kargs_mul_mm & args,
         device const char * src0,
         device const char * src1,
         device       char * dst,
+        device const char * bias,
+        device const char * gamma,
+        device const char * residual,
         threadgroup  char * shmem [[threadgroup(0)]],
         uint3  tgpig[[threadgroup_position_in_grid]],
         ushort tiitg[[thread_index_in_threadgroup]],
         ushort sgitg[[simdgroup_index_in_threadgroup]]) {
-
-    threadgroup S0 * sa = (threadgroup S0 *)(shmem);
-    threadgroup S1 * sb = (threadgroup S1 *)(shmem + 4096);
 
     constexpr int NR0 = 64;
     constexpr int NR1 = 32;
@@ -12912,6 +13858,9 @@ kernel void kernel_mul_mm(
     constexpr int NK  = 32;
     constexpr int NL0 = NK/16;
     constexpr int NL1 = NK/8;
+
+    threadgroup S0 * sa = (threadgroup S0 *)(shmem);
+    threadgroup S1 * sb = (threadgroup S1 *)(shmem + NR0*NK*sizeof(S0));
 
     const int im = tgpig.z;
     const int r0 = tgpig.y*NR0;
@@ -13060,7 +14009,7 @@ kernel void kernel_mul_mm(
         }
     }
 
-    if (!FC_mul_mm_bc_out || (r0 + NR0 <= args.ne0 && r1 + NR1 <= args.ne1)) {
+    if (FC_mul_mm_epi == GGML_METAL_MM_EPI_NONE && (!FC_mul_mm_bc_out || (r0 + NR0 <= args.ne0 && r1 + NR1 <= args.ne1))) {
         // if no bounds checks on the output are needed, we can directly write to device memory
         device float * C = (device float *) dst +
             (r0 + 32*(sgitg &  1)) + \
@@ -13081,7 +14030,20 @@ kernel void kernel_mul_mm(
 
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        if (sgitg == 0) {
+        if (FC_mul_mm_epi != GGML_METAL_MM_EPI_NONE) {
+            // every thread applies the epilogue to a slice of the staged tile
+            constexpr int NUM_THREADS = N_SIMDWIDTH * N_MM_SIMD_GROUP_X * N_MM_SIMD_GROUP_Y;
+            threadgroup const float * tile = (threadgroup const float *) shmem;
+            const uint64_t batch_off = (uint64_t) im*args.ne1*args.ne0;
+            for (int e = tiitg; e < nr1*NR0; e += NUM_THREADS) {
+                const int j = e / NR0;
+                const int i = e % NR0;
+                if (i < nr0) {
+                    const uint64_t off = batch_off + (uint64_t) (r1 + j)*args.ne0 + r0 + i;
+                    ((device float *) dst)[off] = mul_mm_epilogue(tile[e], r0 + i, off, bias, gamma, residual);
+                }
+            }
+        } else if (sgitg == 0) {
             for (int j = tiitg; j < nr1; j += NR1) {
                 device float  * D  = (device float  *) dst + r0 + (r1 + j)*args.ne0 + im*args.ne1*args.ne0;
                 device float4 * D4 = (device float4 *) D;
@@ -13103,7 +14065,13 @@ kernel void kernel_mul_mm(
     }
 }
 
-#endif // GGML_METAL_HAS_TENSOR
+// The tensor API supplies the default instantiations where it exists, since it is faster and its
+// precision is what mul_mm has always delivered for half-staged operands.
+#ifdef GGML_METAL_HAS_TENSOR
+#define kernel_mul_mm_default kernel_mul_mm_tensor
+#else
+#define kernel_mul_mm_default kernel_mul_mm_simd
+#endif
 
 template<short ne20> // n_expert_used
 kernel void kernel_mul_mm_id_map0(
@@ -13480,62 +14448,71 @@ kernel void kernel_mul_mm_id(
 // matrix-matrix multiplication
 //
 
-typedef decltype(kernel_mul_mm<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, float4x4, 1, dequantize_f32, float, float4x4, float, float2x4>) mul_mm_t;
+typedef decltype(kernel_mul_mm_simd<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, float4x4, 1, dequantize_f32, float, float4x4, float, float2x4>) mul_mm_t;
 
-template [[host_name("kernel_mul_mm_f32_f32")]]     kernel mul_mm_t kernel_mul_mm<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   float4x4,      1,     dequantize_f32,     float,  float4x4,  float, float2x4>;
-template [[host_name("kernel_mul_mm_f16_f32")]]     kernel mul_mm_t kernel_mul_mm<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   half4x4,       1,     dequantize_f16,     half,   half4x4,   float, float2x4>;
+template [[host_name("kernel_mul_mm_f32_f32")]]     kernel mul_mm_t kernel_mul_mm_default<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   float4x4,      1,     dequantize_f32,     float,  float4x4,  float, float2x4>;
+
+template [[host_name("kernel_mul_mm_f16_f32")]]     kernel mul_mm_t kernel_mul_mm_default<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   half4x4,       1,     dequantize_f16,     half,   half4x4,   float, float2x4>;
 #if defined(GGML_METAL_HAS_BF16)
-template [[host_name("kernel_mul_mm_bf16_f32")]]    kernel mul_mm_t kernel_mul_mm<bfloat, bfloat4x4, simdgroup_bfloat8x8, bfloat, bfloat2x4, simdgroup_bfloat8x8, bfloat4x4,     1,     dequantize_bf16,    bfloat, bfloat4x4, float, float2x4>;
+template [[host_name("kernel_mul_mm_bf16_f32")]]    kernel mul_mm_t kernel_mul_mm_default<bfloat, bfloat4x4, simdgroup_bfloat8x8, bfloat, bfloat2x4, simdgroup_bfloat8x8, bfloat4x4,     1,     dequantize_bf16,    bfloat, bfloat4x4, float, float2x4>;
 #endif
-template [[host_name("kernel_mul_mm_q1_0_f32")]]    kernel mul_mm_t kernel_mul_mm<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   block_q1_0,    8,     dequantize_q1_0,    float,  float4x4,  float, float2x4>;
-template [[host_name("kernel_mul_mm_q2_0_f32")]]    kernel mul_mm_t kernel_mul_mm<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   block_q2_0,    4,     dequantize_q2_0,    float,  float4x4,  float, float2x4>;
-template [[host_name("kernel_mul_mm_q4_0_f32")]]    kernel mul_mm_t kernel_mul_mm<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   block_q4_0,    2,     dequantize_q4_0,    float,  float4x4,  float, float2x4>;
-template [[host_name("kernel_mul_mm_q4_1_f32")]]    kernel mul_mm_t kernel_mul_mm<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   block_q4_1,    2,     dequantize_q4_1,    float,  float4x4,  float, float2x4>;
-template [[host_name("kernel_mul_mm_q5_0_f32")]]    kernel mul_mm_t kernel_mul_mm<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   block_q5_0,    2,     dequantize_q5_0,    float,  float4x4,  float, float2x4>;
-template [[host_name("kernel_mul_mm_q5_1_f32")]]    kernel mul_mm_t kernel_mul_mm<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   block_q5_1,    2,     dequantize_q5_1,    float,  float4x4,  float, float2x4>;
-template [[host_name("kernel_mul_mm_q8_0_f32")]]    kernel mul_mm_t kernel_mul_mm<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   block_q8_0,    2,     dequantize_q8_0,    float,  float4x4,  float, float2x4>;
-template [[host_name("kernel_mul_mm_mxfp4_f32")]]   kernel mul_mm_t kernel_mul_mm<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   block_mxfp4,   2,     dequantize_mxfp4,   float,  float4x4,  float, float2x4>;
-template [[host_name("kernel_mul_mm_q2_K_f32")]]    kernel mul_mm_t kernel_mul_mm<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   block_q2_K,    QK_NL, dequantize_q2_K,    float,  float4x4,  float, float2x4>;
-template [[host_name("kernel_mul_mm_q3_K_f32")]]    kernel mul_mm_t kernel_mul_mm<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   block_q3_K,    QK_NL, dequantize_q3_K,    float,  float4x4,  float, float2x4>;
-template [[host_name("kernel_mul_mm_q4_K_f32")]]    kernel mul_mm_t kernel_mul_mm<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   block_q4_K,    QK_NL, dequantize_q4_K,    float,  float4x4,  float, float2x4>;
-template [[host_name("kernel_mul_mm_q5_K_f32")]]    kernel mul_mm_t kernel_mul_mm<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   block_q5_K,    QK_NL, dequantize_q5_K,    float,  float4x4,  float, float2x4>;
-template [[host_name("kernel_mul_mm_q6_K_f32")]]    kernel mul_mm_t kernel_mul_mm<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   block_q6_K,    QK_NL, dequantize_q6_K,    float,  float4x4,  float, float2x4>;
-template [[host_name("kernel_mul_mm_iq2_xxs_f32")]] kernel mul_mm_t kernel_mul_mm<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   block_iq2_xxs, QK_NL, dequantize_iq2_xxs, float,  float4x4,  float, float2x4>;
-template [[host_name("kernel_mul_mm_iq2_xs_f32")]]  kernel mul_mm_t kernel_mul_mm<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   block_iq2_xs,  QK_NL, dequantize_iq2_xs,  float,  float4x4,  float, float2x4>;
-template [[host_name("kernel_mul_mm_iq3_xxs_f32")]] kernel mul_mm_t kernel_mul_mm<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   block_iq3_xxs, QK_NL, dequantize_iq3_xxs, float,  float4x4,  float, float2x4>;
-template [[host_name("kernel_mul_mm_iq3_s_f32")]]   kernel mul_mm_t kernel_mul_mm<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   block_iq3_s,   QK_NL, dequantize_iq3_s,   float,  float4x4,  float, float2x4>;
-template [[host_name("kernel_mul_mm_iq2_s_f32")]]   kernel mul_mm_t kernel_mul_mm<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   block_iq2_s,   QK_NL, dequantize_iq2_s,   float,  float4x4,  float, float2x4>;
-template [[host_name("kernel_mul_mm_iq1_s_f32")]]   kernel mul_mm_t kernel_mul_mm<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   block_iq1_s,   QK_NL, dequantize_iq1_s,   float,  float4x4,  float, float2x4>;
-template [[host_name("kernel_mul_mm_iq1_m_f32")]]   kernel mul_mm_t kernel_mul_mm<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   block_iq1_m,   QK_NL, dequantize_iq1_m,   float,  float4x4,  float, float2x4>;
-template [[host_name("kernel_mul_mm_iq4_nl_f32")]]  kernel mul_mm_t kernel_mul_mm<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   block_iq4_nl,  2,     dequantize_iq4_nl,  float,  float4x4,  float, float2x4>;
-template [[host_name("kernel_mul_mm_iq4_xs_f32")]]  kernel mul_mm_t kernel_mul_mm<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   block_iq4_xs,  QK_NL, dequantize_iq4_xs,  float,  float4x4,  float, float2x4>;
-template [[host_name("kernel_mul_mm_tq2_0_f32")]]   kernel mul_mm_t kernel_mul_mm<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   block_tq2_0,   QK_NL, dequantize_tq2_0,   float,  float4x4,  float, float2x4>;
+template [[host_name("kernel_mul_mm_q1_0_f32")]]    kernel mul_mm_t kernel_mul_mm_default<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   block_q1_0,    8,     dequantize_q1_0,    float,  float4x4,  float, float2x4>;
+template [[host_name("kernel_mul_mm_q2_0_f32")]]    kernel mul_mm_t kernel_mul_mm_default<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   block_q2_0,    4,     dequantize_q2_0,    float,  float4x4,  float, float2x4>;
+template [[host_name("kernel_mul_mm_q4_0_f32")]]    kernel mul_mm_t kernel_mul_mm_default<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   block_q4_0,    2,     dequantize_q4_0,    float,  float4x4,  float, float2x4>;
+template [[host_name("kernel_mul_mm_q4_1_f32")]]    kernel mul_mm_t kernel_mul_mm_default<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   block_q4_1,    2,     dequantize_q4_1,    float,  float4x4,  float, float2x4>;
+template [[host_name("kernel_mul_mm_q5_0_f32")]]    kernel mul_mm_t kernel_mul_mm_default<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   block_q5_0,    2,     dequantize_q5_0,    float,  float4x4,  float, float2x4>;
+template [[host_name("kernel_mul_mm_q5_1_f32")]]    kernel mul_mm_t kernel_mul_mm_default<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   block_q5_1,    2,     dequantize_q5_1,    float,  float4x4,  float, float2x4>;
+template [[host_name("kernel_mul_mm_q8_0_f32")]]    kernel mul_mm_t kernel_mul_mm_default<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   block_q8_0,    2,     dequantize_q8_0,    float,  float4x4,  float, float2x4>;
+template [[host_name("kernel_mul_mm_mxfp4_f32")]]   kernel mul_mm_t kernel_mul_mm_default<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   block_mxfp4,   2,     dequantize_mxfp4,   float,  float4x4,  float, float2x4>;
+template [[host_name("kernel_mul_mm_q2_K_f32")]]    kernel mul_mm_t kernel_mul_mm_default<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   block_q2_K,    QK_NL, dequantize_q2_K,    float,  float4x4,  float, float2x4>;
+template [[host_name("kernel_mul_mm_q3_K_f32")]]    kernel mul_mm_t kernel_mul_mm_default<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   block_q3_K,    QK_NL, dequantize_q3_K,    float,  float4x4,  float, float2x4>;
+template [[host_name("kernel_mul_mm_q4_K_f32")]]    kernel mul_mm_t kernel_mul_mm_default<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   block_q4_K,    QK_NL, dequantize_q4_K,    float,  float4x4,  float, float2x4>;
+template [[host_name("kernel_mul_mm_q5_K_f32")]]    kernel mul_mm_t kernel_mul_mm_default<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   block_q5_K,    QK_NL, dequantize_q5_K,    float,  float4x4,  float, float2x4>;
+template [[host_name("kernel_mul_mm_q6_K_f32")]]    kernel mul_mm_t kernel_mul_mm_default<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   block_q6_K,    QK_NL, dequantize_q6_K,    float,  float4x4,  float, float2x4>;
+template [[host_name("kernel_mul_mm_iq2_xxs_f32")]] kernel mul_mm_t kernel_mul_mm_default<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   block_iq2_xxs, QK_NL, dequantize_iq2_xxs, float,  float4x4,  float, float2x4>;
+template [[host_name("kernel_mul_mm_iq2_xs_f32")]]  kernel mul_mm_t kernel_mul_mm_default<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   block_iq2_xs,  QK_NL, dequantize_iq2_xs,  float,  float4x4,  float, float2x4>;
+template [[host_name("kernel_mul_mm_iq3_xxs_f32")]] kernel mul_mm_t kernel_mul_mm_default<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   block_iq3_xxs, QK_NL, dequantize_iq3_xxs, float,  float4x4,  float, float2x4>;
+template [[host_name("kernel_mul_mm_iq3_s_f32")]]   kernel mul_mm_t kernel_mul_mm_default<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   block_iq3_s,   QK_NL, dequantize_iq3_s,   float,  float4x4,  float, float2x4>;
+template [[host_name("kernel_mul_mm_iq2_s_f32")]]   kernel mul_mm_t kernel_mul_mm_default<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   block_iq2_s,   QK_NL, dequantize_iq2_s,   float,  float4x4,  float, float2x4>;
+template [[host_name("kernel_mul_mm_iq1_s_f32")]]   kernel mul_mm_t kernel_mul_mm_default<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   block_iq1_s,   QK_NL, dequantize_iq1_s,   float,  float4x4,  float, float2x4>;
+template [[host_name("kernel_mul_mm_iq1_m_f32")]]   kernel mul_mm_t kernel_mul_mm_default<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   block_iq1_m,   QK_NL, dequantize_iq1_m,   float,  float4x4,  float, float2x4>;
+template [[host_name("kernel_mul_mm_iq4_nl_f32")]]  kernel mul_mm_t kernel_mul_mm_default<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   block_iq4_nl,  2,     dequantize_iq4_nl,  float,  float4x4,  float, float2x4>;
+template [[host_name("kernel_mul_mm_iq4_xs_f32")]]  kernel mul_mm_t kernel_mul_mm_default<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   block_iq4_xs,  QK_NL, dequantize_iq4_xs,  float,  float4x4,  float, float2x4>;
+template [[host_name("kernel_mul_mm_tq2_0_f32")]]   kernel mul_mm_t kernel_mul_mm_default<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   block_tq2_0,   QK_NL, dequantize_tq2_0,   float,  float4x4,  float, float2x4>;
 
-template [[host_name("kernel_mul_mm_f32_f16")]]     kernel mul_mm_t kernel_mul_mm<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   float4x4,      1,     dequantize_f32,     float,  float4x4,  half, half2x4>;
-template [[host_name("kernel_mul_mm_f16_f16")]]     kernel mul_mm_t kernel_mul_mm<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   half4x4,       1,     dequantize_f16,     half,   half4x4,   half, half2x4>;
-template [[host_name("kernel_mul_mm_q1_0_f16")]]    kernel mul_mm_t kernel_mul_mm<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   block_q1_0,    8,     dequantize_q1_0,    float,  float4x4,  half, half2x4>;
-template [[host_name("kernel_mul_mm_q2_0_f16")]]    kernel mul_mm_t kernel_mul_mm<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   block_q2_0,    4,     dequantize_q2_0,    float,  float4x4,  half, half2x4>;
-template [[host_name("kernel_mul_mm_q4_0_f16")]]    kernel mul_mm_t kernel_mul_mm<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   block_q4_0,    2,     dequantize_q4_0,    float,  float4x4,  half, half2x4>;
-template [[host_name("kernel_mul_mm_q4_1_f16")]]    kernel mul_mm_t kernel_mul_mm<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   block_q4_1,    2,     dequantize_q4_1,    float,  float4x4,  half, half2x4>;
-template [[host_name("kernel_mul_mm_q5_0_f16")]]    kernel mul_mm_t kernel_mul_mm<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   block_q5_0,    2,     dequantize_q5_0,    float,  float4x4,  half, half2x4>;
-template [[host_name("kernel_mul_mm_q5_1_f16")]]    kernel mul_mm_t kernel_mul_mm<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   block_q5_1,    2,     dequantize_q5_1,    float,  float4x4,  half, half2x4>;
-template [[host_name("kernel_mul_mm_q8_0_f16")]]    kernel mul_mm_t kernel_mul_mm<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   block_q8_0,    2,     dequantize_q8_0,    float,  float4x4,  half, half2x4>;
-template [[host_name("kernel_mul_mm_mxfp4_f16")]]   kernel mul_mm_t kernel_mul_mm<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   block_mxfp4,   2,     dequantize_mxfp4,   float,  float4x4,  half, half2x4>;
-template [[host_name("kernel_mul_mm_q2_K_f16")]]    kernel mul_mm_t kernel_mul_mm<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   block_q2_K,    QK_NL, dequantize_q2_K,    float,  float4x4,  half, half2x4>;
-template [[host_name("kernel_mul_mm_q3_K_f16")]]    kernel mul_mm_t kernel_mul_mm<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   block_q3_K,    QK_NL, dequantize_q3_K,    float,  float4x4,  half, half2x4>;
-template [[host_name("kernel_mul_mm_q4_K_f16")]]    kernel mul_mm_t kernel_mul_mm<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   block_q4_K,    QK_NL, dequantize_q4_K,    float,  float4x4,  half, half2x4>;
-template [[host_name("kernel_mul_mm_q5_K_f16")]]    kernel mul_mm_t kernel_mul_mm<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   block_q5_K,    QK_NL, dequantize_q5_K,    float,  float4x4,  half, half2x4>;
-template [[host_name("kernel_mul_mm_q6_K_f16")]]    kernel mul_mm_t kernel_mul_mm<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   block_q6_K,    QK_NL, dequantize_q6_K,    float,  float4x4,  half, half2x4>;
-template [[host_name("kernel_mul_mm_iq2_xxs_f16")]] kernel mul_mm_t kernel_mul_mm<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   block_iq2_xxs, QK_NL, dequantize_iq2_xxs, float,  float4x4,  half, half2x4>;
-template [[host_name("kernel_mul_mm_iq2_xs_f16")]]  kernel mul_mm_t kernel_mul_mm<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   block_iq2_xs,  QK_NL, dequantize_iq2_xs,  float,  float4x4,  half, half2x4>;
-template [[host_name("kernel_mul_mm_iq3_xxs_f16")]] kernel mul_mm_t kernel_mul_mm<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   block_iq3_xxs, QK_NL, dequantize_iq3_xxs, float,  float4x4,  half, half2x4>;
-template [[host_name("kernel_mul_mm_iq3_s_f16")]]   kernel mul_mm_t kernel_mul_mm<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   block_iq3_s,   QK_NL, dequantize_iq3_s,   float,  float4x4,  half, half2x4>;
-template [[host_name("kernel_mul_mm_iq2_s_f16")]]   kernel mul_mm_t kernel_mul_mm<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   block_iq2_s,   QK_NL, dequantize_iq2_s,   float,  float4x4,  half, half2x4>;
-template [[host_name("kernel_mul_mm_iq1_s_f16")]]   kernel mul_mm_t kernel_mul_mm<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   block_iq1_s,   QK_NL, dequantize_iq1_s,   float,  float4x4,  half, half2x4>;
-template [[host_name("kernel_mul_mm_iq1_m_f16")]]   kernel mul_mm_t kernel_mul_mm<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   block_iq1_m,   QK_NL, dequantize_iq1_m,   float,  float4x4,  half, half2x4>;
-template [[host_name("kernel_mul_mm_iq4_nl_f16")]]  kernel mul_mm_t kernel_mul_mm<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   block_iq4_nl,  2,     dequantize_iq4_nl,  float,  float4x4,  half, half2x4>;
-template [[host_name("kernel_mul_mm_iq4_xs_f16")]]  kernel mul_mm_t kernel_mul_mm<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   block_iq4_xs,  QK_NL, dequantize_iq4_xs,  float,  float4x4,  half, half2x4>;
-template [[host_name("kernel_mul_mm_tq2_0_f16")]]   kernel mul_mm_t kernel_mul_mm<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   block_tq2_0,   QK_NL, dequantize_tq2_0,   float,  float4x4,  half, half2x4>;
+template [[host_name("kernel_mul_mm_f32_f16")]]     kernel mul_mm_t kernel_mul_mm_default<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   float4x4,      1,     dequantize_f32,     float,  float4x4,  half, half2x4>;
+template [[host_name("kernel_mul_mm_f16_f16")]]     kernel mul_mm_t kernel_mul_mm_default<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   half4x4,       1,     dequantize_f16,     half,   half4x4,   half, half2x4>;
+template [[host_name("kernel_mul_mm_q1_0_f16")]]    kernel mul_mm_t kernel_mul_mm_default<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   block_q1_0,    8,     dequantize_q1_0,    float,  float4x4,  half, half2x4>;
+template [[host_name("kernel_mul_mm_q2_0_f16")]]    kernel mul_mm_t kernel_mul_mm_default<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   block_q2_0,    4,     dequantize_q2_0,    float,  float4x4,  half, half2x4>;
+template [[host_name("kernel_mul_mm_q4_0_f16")]]    kernel mul_mm_t kernel_mul_mm_default<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   block_q4_0,    2,     dequantize_q4_0,    float,  float4x4,  half, half2x4>;
+template [[host_name("kernel_mul_mm_q4_1_f16")]]    kernel mul_mm_t kernel_mul_mm_default<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   block_q4_1,    2,     dequantize_q4_1,    float,  float4x4,  half, half2x4>;
+template [[host_name("kernel_mul_mm_q5_0_f16")]]    kernel mul_mm_t kernel_mul_mm_default<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   block_q5_0,    2,     dequantize_q5_0,    float,  float4x4,  half, half2x4>;
+template [[host_name("kernel_mul_mm_q5_1_f16")]]    kernel mul_mm_t kernel_mul_mm_default<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   block_q5_1,    2,     dequantize_q5_1,    float,  float4x4,  half, half2x4>;
+template [[host_name("kernel_mul_mm_q8_0_f16")]]    kernel mul_mm_t kernel_mul_mm_default<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   block_q8_0,    2,     dequantize_q8_0,    float,  float4x4,  half, half2x4>;
+template [[host_name("kernel_mul_mm_mxfp4_f16")]]   kernel mul_mm_t kernel_mul_mm_default<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   block_mxfp4,   2,     dequantize_mxfp4,   float,  float4x4,  half, half2x4>;
+template [[host_name("kernel_mul_mm_q2_K_f16")]]    kernel mul_mm_t kernel_mul_mm_default<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   block_q2_K,    QK_NL, dequantize_q2_K,    float,  float4x4,  half, half2x4>;
+template [[host_name("kernel_mul_mm_q3_K_f16")]]    kernel mul_mm_t kernel_mul_mm_default<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   block_q3_K,    QK_NL, dequantize_q3_K,    float,  float4x4,  half, half2x4>;
+template [[host_name("kernel_mul_mm_q4_K_f16")]]    kernel mul_mm_t kernel_mul_mm_default<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   block_q4_K,    QK_NL, dequantize_q4_K,    float,  float4x4,  half, half2x4>;
+template [[host_name("kernel_mul_mm_q5_K_f16")]]    kernel mul_mm_t kernel_mul_mm_default<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   block_q5_K,    QK_NL, dequantize_q5_K,    float,  float4x4,  half, half2x4>;
+template [[host_name("kernel_mul_mm_q6_K_f16")]]    kernel mul_mm_t kernel_mul_mm_default<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   block_q6_K,    QK_NL, dequantize_q6_K,    float,  float4x4,  half, half2x4>;
+template [[host_name("kernel_mul_mm_iq2_xxs_f16")]] kernel mul_mm_t kernel_mul_mm_default<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   block_iq2_xxs, QK_NL, dequantize_iq2_xxs, float,  float4x4,  half, half2x4>;
+template [[host_name("kernel_mul_mm_iq2_xs_f16")]]  kernel mul_mm_t kernel_mul_mm_default<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   block_iq2_xs,  QK_NL, dequantize_iq2_xs,  float,  float4x4,  half, half2x4>;
+template [[host_name("kernel_mul_mm_iq3_xxs_f16")]] kernel mul_mm_t kernel_mul_mm_default<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   block_iq3_xxs, QK_NL, dequantize_iq3_xxs, float,  float4x4,  half, half2x4>;
+template [[host_name("kernel_mul_mm_iq3_s_f16")]]   kernel mul_mm_t kernel_mul_mm_default<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   block_iq3_s,   QK_NL, dequantize_iq3_s,   float,  float4x4,  half, half2x4>;
+template [[host_name("kernel_mul_mm_iq2_s_f16")]]   kernel mul_mm_t kernel_mul_mm_default<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   block_iq2_s,   QK_NL, dequantize_iq2_s,   float,  float4x4,  half, half2x4>;
+template [[host_name("kernel_mul_mm_iq1_s_f16")]]   kernel mul_mm_t kernel_mul_mm_default<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   block_iq1_s,   QK_NL, dequantize_iq1_s,   float,  float4x4,  half, half2x4>;
+template [[host_name("kernel_mul_mm_iq1_m_f16")]]   kernel mul_mm_t kernel_mul_mm_default<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   block_iq1_m,   QK_NL, dequantize_iq1_m,   float,  float4x4,  half, half2x4>;
+template [[host_name("kernel_mul_mm_iq4_nl_f16")]]  kernel mul_mm_t kernel_mul_mm_default<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   block_iq4_nl,  2,     dequantize_iq4_nl,  float,  float4x4,  half, half2x4>;
+template [[host_name("kernel_mul_mm_iq4_xs_f16")]]  kernel mul_mm_t kernel_mul_mm_default<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   block_iq4_xs,  QK_NL, dequantize_iq4_xs,  float,  float4x4,  half, half2x4>;
+template [[host_name("kernel_mul_mm_tq2_0_f16")]]   kernel mul_mm_t kernel_mul_mm_default<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   block_tq2_0,   QK_NL, dequantize_tq2_0,   float,  float4x4,  half, half2x4>;
+
+// Every instantiation above stages its operands as half, so an f32 x f32 matmul is multiplied in
+// fp16 even though it accumulates in f32. That is the right default -- roughly twice the
+// throughput, and the error does not matter to most models -- but it is not what GGML_PREC_F32
+// asks for. This variant keeps the operands in f32 end to end and is selected only when the graph
+// requests that precision explicitly. It comes from the simdgroup template on every device
+// because the tensor API cannot express it.
+template [[host_name("kernel_mul_mm_f32_f32_prec")]] kernel mul_mm_t kernel_mul_mm_simd<float,  float4x4,  simdgroup_float8x8,  float,  float2x4,  simdgroup_float8x8,  float4x4,      1,     dequantize_f32,     float,  float4x4,  float, float2x4>;
 
 //
 // indirect matrix-matrix multiplication

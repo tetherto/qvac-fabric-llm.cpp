@@ -790,3 +790,11 @@ vec2 get_dm(uint ib, uint a_offset) {
     return vec2(1, 0);
 }
 #endif
+
+// Every k-quant dequantize() above returns the adjacent element pair (iqs, iqs+1),
+// so four consecutive elements are two calls two indices apart.
+#if defined(DATA_A_QUANT_K)
+vec4 dequantize4(uint ib, uint iqs, uint a_offset) {
+    return vec4(dequantize(ib, iqs, a_offset), dequantize(ib, iqs + 2, a_offset));
+}
+#endif

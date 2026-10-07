@@ -725,9 +725,11 @@ static int execute_op(struct htp_ops_context * octx) {
         case HTP_OP_UNARY_SIGMOID:
         case HTP_OP_UNARY_SILU:
         case HTP_OP_UNARY_GELU:
+        case HTP_OP_UNARY_GELU_ERF:
         case HTP_OP_UNARY_NEG:
         case HTP_OP_UNARY_EXP:
         case HTP_OP_UNARY_TANH:
+        case HTP_OP_UNARY_RELU:
         case HTP_OP_L2_NORM:
             return op_unary(octx);
 
@@ -783,6 +785,21 @@ static int execute_op(struct htp_ops_context * octx) {
 
         case HTP_OP_IM2COL:
             return op_im2col(octx);
+
+        case HTP_OP_CONV_2D_DW:
+            return op_conv_2d_dw(octx);
+
+        case HTP_OP_TIMESTEP_EMBEDDING:
+            return op_timestep_embedding(octx);
+
+        case HTP_OP_SNAKE:
+            return op_snake(octx);
+
+        case HTP_OP_COL2IM_1D:
+            return op_col2im_1d(octx);
+
+        case HTP_OP_DEPTHWISE_CONV_1D:
+            return op_depthwise_conv_1d(octx);
 
         case HTP_OP_CONCAT:
             return op_concat(octx);
@@ -959,6 +976,10 @@ static int proc_op_req(struct htp_ops_context * octx, struct htp_tensor *tens, u
         FARF(HIGH, "prep-dst[%u] #%u: data %p size %u : %u:%u:%u:%u", i, dst_idx, (void*) dst->data, dst->size,
             dst->ne[0], dst->ne[1], dst->ne[2], dst->ne[3]);
     }
+
+    // Dirty lines left by an earlier tensor in the same memory would be written
+    // back over a DMA-written output, so the outputs are flushed as well.
+    htp_tensor_flush_all(octx->ctx, octx->dsts, HTP_OP_MAX_OUTPUTS);
 
     int status = execute_op(octx);
 

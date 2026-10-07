@@ -767,6 +767,53 @@ static void core_mma_chunk_fp16(__fp16 *restrict c, const __fp16 *restrict a, co
 
 // output : fp16 -> f32p
 
+__attribute__((always_inline))
+static inline void hmx_store_output_vec(float *dst, HVX_Vector v, bool aligned) {
+    if (aligned) {
+        *(HVX_Vector *) dst = v;
+    } else {
+        *(HVX_UVector *) dst = v;
+    }
+}
+
+__attribute__((always_inline))
+static inline void transfer_output_full_tiles(
+    float *restrict output_row_base,
+    const float *restrict src2_row_base,
+    const __fp16 *restrict row_base,
+    size_t r1,
+    size_t limit_c_aligned,
+    size_t dst_stride,
+    size_t src2_stride,
+    HVX_Vector one,
+    bool has_row1,
+    bool aligned_stores
+) {
+    #pragma unroll(4)
+    for (size_t c = 0; c < limit_c_aligned; c += HTP_MM_HMX_TILE_N_COLS) {
+        const size_t c0    = c / HTP_MM_HMX_TILE_N_COLS;
+        const __fp16 *tile = row_base + c0 * HTP_MM_HMX_TILE_N_ELMS;
+        HVX_Vector v = ((const HVX_Vector *) tile)[r1];
+        HVX_VectorPair vp = Q6_Wqf32_vmpy_VhfVhf(v, one);
+
+        HVX_Vector v_out0 = Q6_Vsf_equals_Vqf32(Q6_V_lo_W(vp));
+        if (src2_row_base) {
+            HVX_Vector v_src2_0 = hvx_vmemu(src2_row_base + c + 0);
+            v_out0 = hvx_vec_add_f32_f32(v_out0, v_src2_0);
+        }
+        hmx_store_output_vec(output_row_base + c, v_out0, aligned_stores);
+
+        if (has_row1) {
+            HVX_Vector v_out1 = Q6_Vsf_equals_Vqf32(Q6_V_hi_W(vp));
+            if (src2_row_base) {
+                HVX_Vector v_src2_1 = hvx_vmemu(src2_row_base + c + src2_stride);
+                v_out1 = hvx_vec_add_f32_f32(v_out1, v_src2_1);
+            }
+            hmx_store_output_vec(output_row_base + c + dst_stride, v_out1, aligned_stores);
+        }
+    }
+}
+
 static void transfer_output_chunk_fp16_to_fp32_col_chunk(
     float *restrict dst,
     const float *restrict src2,
@@ -787,6 +834,7 @@ static void transfer_output_chunk_fp16_to_fp32_col_chunk(
 
     const size_t limit_c         = hex_smin(c_len, dst_cols);
     const size_t limit_c_aligned = (limit_c & ~31);
+    const bool   aligned_stores  = hex_is_aligned(dst, VLEN) && dst_stride % VLEN_FP32 == 0;
 
     for (size_t r = 0; r < n_rows; r += 2) {
         const size_t r_idx0 = start_row + r + 0;
@@ -796,31 +844,13 @@ static void transfer_output_chunk_fp16_to_fp32_col_chunk(
         float *output_row_base = dst + r * dst_stride;  // global memory row base for row r (and r+1)
         const float *src2_row_base = src2 ? (src2 + r * src2_stride) : NULL;
 
-        #pragma unroll(4)
-        for (size_t c = 0; c < limit_c_aligned; c += HTP_MM_HMX_TILE_N_COLS) {
-            const size_t c0    = c / HTP_MM_HMX_TILE_N_COLS;
-            const __fp16 *tile = row_base + c0 * HTP_MM_HMX_TILE_N_ELMS;
-            HVX_Vector v = ((const HVX_Vector *) tile)[r1];
-            HVX_VectorPair vp = Q6_Wqf32_vmpy_VhfVhf(v, one);
-
-            HVX_Vector *pv_out0 = (HVX_Vector *) (output_row_base + c + 0);
-            HVX_Vector *pv_out1 = (HVX_Vector *) (output_row_base + c + dst_stride);
-
-            HVX_Vector v_out0 = Q6_Vsf_equals_Vqf32(Q6_V_lo_W(vp));
-            if (src2_row_base) {
-                HVX_Vector v_src2_0 = hvx_vmemu(src2_row_base + c + 0);
-                v_out0 = hvx_vec_add_f32_f32(v_out0, v_src2_0);
-            }
-            *pv_out0 = v_out0;
-
-            if (r + 1 < n_rows) {
-                HVX_Vector v_out1 = Q6_Vsf_equals_Vqf32(Q6_V_hi_W(vp));
-                if (src2_row_base) {
-                    HVX_Vector v_src2_1 = hvx_vmemu(src2_row_base + c + src2_stride);
-                    v_out1 = hvx_vec_add_f32_f32(v_out1, v_src2_1);
-                }
-                *pv_out1 = v_out1;
-            }
+        const bool has_row1 = r + 1 < n_rows;
+        if (aligned_stores) {
+            transfer_output_full_tiles(output_row_base, src2_row_base, row_base, r1, limit_c_aligned, dst_stride,
+                                       src2_stride, one, has_row1, true);
+        } else {
+            transfer_output_full_tiles(output_row_base, src2_row_base, row_base, r1, limit_c_aligned, dst_stride,
+                                       src2_stride, one, has_row1, false);
         }
 
         if (limit_c_aligned < limit_c) {
@@ -881,6 +911,42 @@ typedef struct {
 } output_transfer_task_state_t;
 
 // activations : fp32 -> fp16
+
+// Interleave 32 halfs of two activation rows into one row-pair vector of an HMX
+// tile, the same lane order hvx_vec_f32_to_f16_shuff gives F32 rows. Rows past
+// the matrix and columns past k_valid are zero so the padded tile adds nothing.
+static inline HVX_Vector hmx_activation_pair_f16(const __fp16 *row0, const __fp16 *row1, uint32_t n_valid) {
+    HVX_Vector v0 = row0 ? hvx_vmemu(row0) : Q6_V_vzero();
+    HVX_Vector v1 = row1 ? hvx_vmemu(row1) : Q6_V_vzero();
+    if (n_valid < HTP_MM_HMX_TILE_N_COLS) {
+        const HVX_VectorPred mask = Q6_Q_vsetq2_R(n_valid * sizeof(__fp16));
+        v0 = Q6_V_vmux_QVV(mask, v0, Q6_V_vzero());
+        v1 = Q6_V_vmux_QVV(mask, v1, Q6_V_vzero());
+    }
+    return Q6_V_lo_W(Q6_W_vshuff_VVR(v1, v0, -2));
+}
+
+static void transfer_activation_row_pair_fp16(__fp16 *restrict vtcm_dst, const __fp16 *row0, const __fp16 *row1,
+                                              uint32_t r, uint32_t k_block, uint32_t k_valid) {
+    const uint32_t r0 = r / HTP_MM_HMX_TILE_N_ROWS;
+    const uint32_t r1 = r % HTP_MM_HMX_TILE_N_ROWS;
+    for (uint32_t c = 0; c < k_block; c += HTP_MM_HMX_TILE_N_COLS) {
+        const uint32_t n_valid  = k_valid > c ? k_valid - c : 0;
+        const uint32_t tile_idx = r0 * (k_block / HTP_MM_HMX_TILE_N_COLS) + c / HTP_MM_HMX_TILE_N_COLS;
+        HVX_Vector *   tile     = (HVX_Vector *) (vtcm_dst + tile_idx * HTP_MM_HMX_TILE_N_ELMS);
+        tile[r1 / 2] = hmx_activation_pair_f16(row0 ? row0 + c : NULL, row1 ? row1 + c : NULL, n_valid);
+    }
+}
+
+static void transfer_activation_chunk_fp16(__fp16 *restrict vtcm_dst, const __fp16 *restrict src, uint32_t n_rows,
+                                           uint32_t k_block, uint32_t k_stride, uint32_t k_valid) {
+    const uint32_t n_rows_padded = hex_align_up(n_rows, HTP_MM_HMX_TILE_N_ROWS);
+    for (uint32_t r = 0; r < n_rows_padded; r += 2) {
+        const __fp16 *row0 = r < n_rows ? src + (size_t) r * k_stride : NULL;
+        const __fp16 *row1 = r + 1 < n_rows ? src + (size_t) (r + 1) * k_stride : NULL;
+        transfer_activation_row_pair_fp16(vtcm_dst, row0, row1, r, k_block, k_valid);
+    }
+}
 
 static void transfer_activation_chunk_fp32_to_fp16(__fp16 *restrict vtcm_dst, const float *restrict src, uint32_t n_rows, uint32_t k_block, uint32_t k_stride, uint32_t k_valid) {
     const uint32_t n_rows_padded = hex_align_up(n_rows, HTP_MM_HMX_TILE_N_ROWS);

@@ -142,6 +142,131 @@ static inline void hmx_interleave_rows_to_tiles(__fp16 * restrict vtcm_dst,
     }
 }
 
+// F32-source variant of hmx_interleave_rows_to_tiles. Reads row-major F32
+// data from VTCM staging and produces the same transposed [K][N] fp16 tile
+// layout by downcasting on the fly with hvx_vec_f32_to_f16_shuff. The output
+// layout is identical to the F16 version, so downstream HMX kernels are
+// unchanged. src_stride is in units of F32 elements.
+static inline void hmx_interleave_rows_to_tiles_f32(__fp16 * restrict vtcm_dst,
+                                            const float * restrict vtcm_src,
+                                            uint32_t n_cols,
+                                            uint32_t k,
+                                            size_t src_stride,
+                                            uint32_t start_row,
+                                            uint32_t end_row) {
+    assert(k % HMX_FP16_TILE_N_COLS == 0);
+
+    const uint32_t n_k_tiles = k / HMX_FP16_TILE_N_COLS;
+    const HVX_Vector v_scat_base = hvx_vmem(hmx_transpose_scatter_offsets);
+    const HVX_Vector v_scat_step = Q6_V_vsplat_R(4);
+    const HVX_VectorPred q_mask64 = Q6_Q_vsetq_R(64);
+    const bool pair_scatter = (n_k_tiles & 1) == 0;
+    const size_t pair_region = (size_t) (2 * HMX_FP16_TILE_SIZE - 1);
+    const size_t single_region = (size_t) (HMX_FP16_TILE_SIZE - 1);
+    __builtin_assume(k > 0);
+    __builtin_assume(end_row > start_row);
+
+    if (pair_scatter) {
+        const uint32_t c_step        = 2 * HMX_FP16_TILE_N_COLS;                 // 64 elements per iter
+        const size_t   c_byte_step_f = (size_t) c_step * sizeof(float);          // 256 bytes of F32 per iter
+        const size_t   dst_step      = 2 * (size_t) HMX_FP16_TILE_N_ELMS;
+        const uint32_t n_c_iters     = k / c_step;
+
+        for (uint32_t r = start_row; r < end_row; r += 2) {
+            const uint32_t   ct             = r / HMX_FP16_TILE_N_ROWS;
+            const uint32_t   local_r        = r % HMX_FP16_TILE_N_ROWS;
+            const bool       next_row_valid = (r + 1) < end_row && (r + 1) < n_cols;
+            const HVX_Vector v_off0         = Q6_Vw_vadd_VwVw(v_scat_base, Q6_V_vsplat_R(local_r * 4));
+            const HVX_Vector v_off1         = Q6_Vw_vadd_VwVw(v_off0, v_scat_step);
+
+            __fp16 * tile_base = vtcm_dst + (size_t) ct * n_k_tiles * HMX_FP16_TILE_N_ELMS;
+            const uint8_t * p0 = (const uint8_t *) (vtcm_src + r * src_stride);
+            const uint8_t * p1 = next_row_valid ? (const uint8_t *) (vtcm_src + (r + 1) * src_stride) : NULL;
+
+            assert(hex_is_aligned(p0, 128));
+            assert(hex_is_aligned(p1, 128));
+            assert(c_byte_step_f % 128 == 0);
+
+            if (p1) {
+                for (uint32_t i = 0; i < n_c_iters; ++i) {
+                    HVX_Vector v0_lo = hvx_vmem(p0);
+                    HVX_Vector v0_hi = hvx_vmem(p0 + 128);
+                    p0 += c_byte_step_f;
+                    HVX_Vector v1_lo = hvx_vmem(p1);
+                    HVX_Vector v1_hi = hvx_vmem(p1 + 128);
+                    p1 += c_byte_step_f;
+
+                    HVX_Vector v0 = hvx_vec_f32_to_f16(v0_lo, v0_hi);
+                    HVX_Vector v1 = hvx_vec_f32_to_f16(v1_lo, v1_hi);
+
+                    Q6_vscatter_RMVwV((size_t) tile_base, pair_region, v_off0, v0);
+                    Q6_vscatter_RMVwV((size_t) tile_base, pair_region, v_off1, v1);
+                    tile_base += dst_step;
+                }
+            } else {
+                const HVX_Vector vzero = Q6_V_vzero();
+                for (uint32_t i = 0; i < n_c_iters; ++i) {
+                    HVX_Vector v0_lo = hvx_vmem(p0);
+                    HVX_Vector v0_hi = hvx_vmem(p0 + 128);
+                    p0 += c_byte_step_f;
+
+                    HVX_Vector v0 = hvx_vec_f32_to_f16(v0_lo, v0_hi);
+
+                    Q6_vscatter_RMVwV((size_t) tile_base, pair_region, v_off0, v0);
+                    Q6_vscatter_RMVwV((size_t) tile_base, pair_region, v_off1, vzero);
+                    tile_base += dst_step;
+                }
+            }
+        }
+    } else {
+        const uint32_t c_step        = HMX_FP16_TILE_N_COLS;                     // 32 elements per iter
+        const size_t   c_byte_step_f = (size_t) c_step * sizeof(float);          // 128 bytes of F32 per iter
+        const size_t   dst_step      = (size_t) HMX_FP16_TILE_N_ELMS;
+        const uint32_t n_c_iters     = k / c_step;
+
+        for (uint32_t r = start_row; r < end_row; r += 2) {
+            const uint32_t   ct             = r / HMX_FP16_TILE_N_ROWS;
+            const uint32_t   local_r        = r % HMX_FP16_TILE_N_ROWS;
+            const bool       next_row_valid = (r + 1) < end_row && (r + 1) < n_cols;
+            const HVX_Vector v_off0         = Q6_Vw_vadd_VwVw(v_scat_base, Q6_V_vsplat_R(local_r * 4));
+            const HVX_Vector v_off1         = Q6_Vw_vadd_VwVw(v_off0, v_scat_step);
+
+            __fp16 * tile_base = vtcm_dst + (size_t) ct * n_k_tiles * HMX_FP16_TILE_N_ELMS;
+            const uint8_t * p0 = (const uint8_t *) (vtcm_src + r * src_stride);
+            const uint8_t * p1 = next_row_valid ? (const uint8_t *) (vtcm_src + (r + 1) * src_stride) : NULL;
+
+            if (p1) {
+                for (uint32_t i = 0; i < n_c_iters; ++i) {
+                    // 32 F32 elements = 128 bytes into single lo vector; hi zero.
+                    HVX_Vector v0_lo = hvx_vmemu(p0);
+                    p0 += c_byte_step_f;
+                    HVX_Vector v1_lo = hvx_vmemu(p1);
+                    p1 += c_byte_step_f;
+
+                    HVX_Vector v0 = hvx_vec_f32_to_f16(v0_lo, Q6_V_vzero());
+                    HVX_Vector v1 = hvx_vec_f32_to_f16(v1_lo, Q6_V_vzero());
+
+                    Q6_vscatter_QRMVwV(q_mask64, (size_t) tile_base, single_region, v_off0, v0);
+                    Q6_vscatter_QRMVwV(q_mask64, (size_t) tile_base, single_region, v_off1, v1);
+                    tile_base += dst_step;
+                }
+            } else {
+                const HVX_Vector vzero = Q6_V_vzero();
+                for (uint32_t i = 0; i < n_c_iters; ++i) {
+                    HVX_Vector v0_lo = hvx_vmemu(p0);
+                    p0 += c_byte_step_f;
+
+                    HVX_Vector v0 = hvx_vec_f32_to_f16(v0_lo, Q6_V_vzero());
+
+                    Q6_vscatter_QRMVwV(q_mask64, (size_t) tile_base, single_region, v_off0, v0);
+                    Q6_vscatter_QRMVwV(q_mask64, (size_t) tile_base, single_region, v_off1, vzero);
+                    tile_base += dst_step;
+                }
+            }
+        }
+    }
+}
+
 // Interleave row-major FP16 data into column-major tile format.
 // Input: [n_rows, head_dim] row-major.  Output: tile[dim_tile][row_tile].
 // Processes rows [start_row, end_row) for multi-thread slicing.
@@ -187,6 +312,70 @@ static inline void hmx_interleave_cols_to_tiles(__fp16 * restrict tiles_out,
             const HVX_Vector vzero = Q6_V_vzero();
             for (uint32_t c = 0; c < head_dim; c += 64) {
                 HVX_Vector     v0             = *pv_in0++;
+                HVX_VectorPair vp             = Q6_W_vshuff_VVR(vzero, v0, -2);
+                ((HVX_Vector *) tb0)[r1_half] = Q6_V_lo_W(vp);
+                ((HVX_Vector *) tb1)[r1_half] = Q6_V_hi_W(vp);
+                tb0 += tb_step;
+                tb1 += tb_step;
+            }
+        }
+    }
+}
+
+// F32-source variant of hmx_interleave_cols_to_tiles. Reads row-major F32
+// [n_rows, head_dim] from VTCM and downcasts to F16 while producing the same
+// column-major tile[dim_tile][row_tile] output. src_stride is in units of F32
+// elements. Requires head_dim to be a multiple of 64 (one F16 vector) and thus
+// 64 F32 elements = 256 bytes per c-step.
+static inline void hmx_interleave_cols_to_tiles_f32(__fp16 * restrict tiles_out,
+                                            const float * restrict src,
+                                            uint32_t n_rows,
+                                            uint32_t head_dim,
+                                            size_t src_stride,
+                                            uint32_t n_row_tiles,
+                                            uint32_t start_row,
+                                            uint32_t end_row) {
+    __builtin_assume(head_dim > 0);
+    const size_t tile_stride_elms = (size_t) n_row_tiles * HMX_FP16_TILE_N_ELMS;
+
+    for (uint32_t r = start_row; r < end_row; r += 2) {
+        const bool next_row_valid = (r + 1) < end_row && (r + 1) < n_rows;
+
+        const HVX_Vector * pv_in0 = (const HVX_Vector *) (src + r * src_stride);
+        const HVX_Vector * pv_in1 = next_row_valid ? (const HVX_Vector *) (src + (r + 1) * src_stride) : NULL;
+
+        const uint32_t r0      = r / HMX_FP16_TILE_N_ROWS;
+        const uint32_t r1_half = (r % HMX_FP16_TILE_N_ROWS) / 2;
+
+        __fp16 *     tb0     = tiles_out + (size_t) r0 * HMX_FP16_TILE_N_ELMS;
+        __fp16 *     tb1     = tb0 + tile_stride_elms;
+        const size_t tb_step = 2 * tile_stride_elms;
+
+        if (pv_in1) {
+            for (uint32_t c = 0; c < head_dim; c += 64) {
+                // 64 F32 elements = 2 HVX vectors per row
+                HVX_Vector v0_lo = *pv_in0++;
+                HVX_Vector v0_hi = *pv_in0++;
+                HVX_Vector v1_lo = *pv_in1++;
+                HVX_Vector v1_hi = *pv_in1++;
+
+                HVX_Vector v0 = hvx_vec_f32_to_f16(v0_lo, v0_hi);
+                HVX_Vector v1 = hvx_vec_f32_to_f16(v1_lo, v1_hi);
+
+                HVX_VectorPair vp             = Q6_W_vshuff_VVR(v1, v0, -2);
+                ((HVX_Vector *) tb0)[r1_half] = Q6_V_lo_W(vp);
+                ((HVX_Vector *) tb1)[r1_half] = Q6_V_hi_W(vp);
+                tb0 += tb_step;
+                tb1 += tb_step;
+            }
+        } else {
+            const HVX_Vector vzero = Q6_V_vzero();
+            for (uint32_t c = 0; c < head_dim; c += 64) {
+                HVX_Vector v0_lo = *pv_in0++;
+                HVX_Vector v0_hi = *pv_in0++;
+
+                HVX_Vector v0 = hvx_vec_f32_to_f16(v0_lo, v0_hi);
+
                 HVX_VectorPair vp             = Q6_W_vshuff_VVR(vzero, v0, -2);
                 ((HVX_Vector *) tb0)[r1_half] = Q6_V_lo_W(vp);
                 ((HVX_Vector *) tb1)[r1_half] = Q6_V_hi_W(vp);

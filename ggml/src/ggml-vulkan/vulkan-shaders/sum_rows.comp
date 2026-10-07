@@ -19,7 +19,8 @@ void main() {
     const uint col = gl_LocalInvocationID.x;
     const float weight = p.weight;
 
-    // the dispatch is padded up to a multiple of 512 workgroups when nrows > 512
+    // Workgroup count is padded up to a multiple of 512; phantom rows must
+    // not write out of bounds.
     if (row >= p.nrows) {
         return;
     }
@@ -35,7 +36,8 @@ void main() {
     tmp[col] = FLOAT_TYPE(0.0);
 
     for (uint i = col; i < p.n_cols; i += BLOCK_SIZE) {
-        tmp[col] += FLOAT_TYPE(data_a[src_idx + i]);
+        const FLOAT_TYPE v = FLOAT_TYPE(data_a[src_idx + i]);
+        tmp[col] += (p.square != 0) ? v * v : v;
     }
 
     barrier();

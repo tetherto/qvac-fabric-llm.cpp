@@ -10,6 +10,7 @@
 
 #include "hex-dma.h"
 #include "hex-fastdiv.h"
+#include "hvx-erf.h"
 #include "hvx-exp.h"
 #include "hvx-sigmoid.h"
 #include "hvx-utils.h"
@@ -309,6 +310,20 @@ static void gelu_f32(const float * restrict src,
     }
 }
 
+static void gelu_erf_f32(const float * restrict src,
+                         float * restrict dst,
+                         const uint32_t num_rows,
+                         const struct htp_unary_context * uctx) {
+    htp_unary_op_preamble;
+
+    for (uint32_t ir = 0; ir < num_rows; ir++) {
+        const uint8_t * restrict src_local = (const uint8_t *)src + (ir * src0_row_size_aligned);
+        uint8_t * restrict dst_local       = (uint8_t *)dst + (ir * dst_row_size_aligned);
+
+        hvx_gelu_erf_f32_aa(dst_local, src_local, ne0);
+    }
+}
+
 static void tri_f32(const float * restrict src,
                     float * restrict dst,
                     const uint32_t num_rows,
@@ -440,6 +455,48 @@ static void tanh_f32(const float * restrict src,
         uint8_t * restrict dst_local       = (uint8_t *)dst + (ir * dst_row_size_aligned);
 
         hvx_tanh_f32_aa(dst_local, src_local, ne0);
+    }
+}
+
+// relu(x) = max(x, 0) — Q6_Vsf_vmax_VsfVsf handles the elementwise max on
+// 32-bit floats. Aligned-aligned only: callers already guarantee 128-byte
+// alignment for both scratch buffers and 128-byte tail alignment for the
+// last vector. Kept inline here (single caller) rather than added as a new
+// hvx-relu.h since the op has no shared helpers to reuse.
+static inline void hvx_relu_f32_aa(uint8_t * restrict dst,
+                                   const uint8_t * restrict src,
+                                   uint32_t n) {
+    assert((unsigned long) dst % 128 == 0);
+    assert((unsigned long) src % 128 == 0);
+    const HVX_Vector * restrict vsrc = (const HVX_Vector *) src;
+    HVX_Vector       * restrict vdst = (HVX_Vector       *) dst;
+    const HVX_Vector zero = Q6_V_vzero();
+
+    const uint32_t nvec = n / VLEN_FP32;
+    const uint32_t nloe = n % VLEN_FP32;
+
+    uint32_t i = 0;
+    #pragma unroll(4)
+    for (; i < nvec; i++) {
+        vdst[i] = Q6_Vsf_vmax_VsfVsf(vsrc[i], zero);
+    }
+    if (nloe) {
+        HVX_Vector v = Q6_Vsf_vmax_VsfVsf(vsrc[i], zero);
+        hvx_vec_store_a((void *) &vdst[i], nloe * SIZEOF_FP32, v);
+    }
+}
+
+static void relu_f32(const float * restrict src,
+                     float * restrict dst,
+                     const uint32_t num_rows,
+                     const struct htp_unary_context * uctx) {
+    htp_unary_op_preamble;
+
+    for (uint32_t ir = 0; ir < num_rows; ir++) {
+        const uint8_t * restrict src_local = (const uint8_t *)src + (ir * src0_row_size_aligned);
+        uint8_t * restrict dst_local       = (uint8_t *)dst + (ir * dst_row_size_aligned);
+
+        hvx_relu_f32_aa(dst_local, src_local, ne0);
     }
 }
 
@@ -601,8 +658,10 @@ DEFINE_UNARY_TASK(unary_exp,      false, false, exp_f32(src0_vtcm, dst_vtcm, blo
 DEFINE_UNARY_TASK(unary_sigmoid,  false, false, sigmoid_f32(src0_vtcm, dst_vtcm, block_size, uctx))
 DEFINE_UNARY_TASK(unary_silu,     false, false, silu_f32(src0_vtcm, dst_vtcm, block_size, uctx))
 DEFINE_UNARY_TASK(unary_gelu,     false, false, gelu_f32(src0_vtcm, dst_vtcm, block_size, uctx))
+DEFINE_UNARY_TASK(unary_gelu_erf, false, false, gelu_erf_f32(src0_vtcm, dst_vtcm, block_size, uctx))
 DEFINE_UNARY_TASK(unary_softplus, false, false, softplus_f32(src0_vtcm, dst_vtcm, block_size, uctx))
 DEFINE_UNARY_TASK(unary_tanh,     false, false, tanh_f32(src0_vtcm, dst_vtcm, block_size, uctx))
+DEFINE_UNARY_TASK(unary_relu,     false, false, relu_f32(src0_vtcm, dst_vtcm, block_size, uctx))
 DEFINE_UNARY_TASK(l2_norm,        false, false, l2_norm_f32(src0_vtcm, dst_vtcm, block_size, uctx))
 DEFINE_UNARY_TASK(tri,            false, true,  tri_f32(src0_vtcm, dst_vtcm, block_size, ir, uctx))
 
@@ -848,8 +907,10 @@ DEFINE_UNARY_TILED_TASK(unary_exp,      false, hvx_exp_f32(dst_vtcm, src_vtcm, t
 DEFINE_UNARY_TILED_TASK(unary_sigmoid,  false, hvx_sigmoid_f32_aa(dst_vtcm, src_vtcm, tw))
 DEFINE_UNARY_TILED_TASK(unary_silu,     false, tile_silu_f32(dst_vtcm, src_vtcm, tw))
 DEFINE_UNARY_TILED_TASK(unary_gelu,     false, tile_gelu_f32(dst_vtcm, src_vtcm, tw))
+DEFINE_UNARY_TILED_TASK(unary_gelu_erf, false, hvx_gelu_erf_f32_aa(dst_vtcm, src_vtcm, tw))
 DEFINE_UNARY_TILED_TASK(unary_softplus, false, tile_unary_softplus_f32(dst_vtcm, src_vtcm, tw))
 DEFINE_UNARY_TILED_TASK(unary_tanh,     false, hvx_tanh_f32_aa(dst_vtcm, src_vtcm, tw))
+DEFINE_UNARY_TILED_TASK(unary_relu,     false, hvx_relu_f32_aa(dst_vtcm, src_vtcm, tw))
 DEFINE_UNARY_TILED_TASK(tri,            true,  tri_apply_tile_f32(src_vtcm, dst_vtcm, tw, col, i01, ne0, tri_ttype))
 
 static int execute_op_unary_f32(struct htp_ops_context * octx) {
@@ -873,8 +934,10 @@ static int execute_op_unary_f32(struct htp_ops_context * octx) {
         case HTP_OP_UNARY_SIGMOID:   op_type = "sigmoid-f32";      break;
         case HTP_OP_UNARY_SILU:      op_type = "silu-f32";         break;
         case HTP_OP_UNARY_GELU:      op_type = "gelu-f32";         break;
+        case HTP_OP_UNARY_GELU_ERF:  op_type = "gelu-erf-f32";     break;
         case HTP_OP_UNARY_SOFTPLUS:  op_type = "softplus-f32";     break;
         case HTP_OP_UNARY_TANH:      op_type = "tanh-f32";         break;
+        case HTP_OP_UNARY_RELU:      op_type = "relu-f32";         break;
         case HTP_OP_L2_NORM:         op_type = "l2norm-f32";       break;
         case HTP_OP_TRI:             op_type = "tri-f32";          break;
 
@@ -971,8 +1034,10 @@ static int execute_op_unary_f32(struct htp_ops_context * octx) {
                 case HTP_OP_UNARY_SIGMOID:   task_func = unary_task_f32_tiled_unary_sigmoid;  break;
                 case HTP_OP_UNARY_SILU:      task_func = unary_task_f32_tiled_unary_silu;     break;
                 case HTP_OP_UNARY_GELU:      task_func = unary_task_f32_tiled_unary_gelu;     break;
+                case HTP_OP_UNARY_GELU_ERF:  task_func = unary_task_f32_tiled_unary_gelu_erf; break;
                 case HTP_OP_UNARY_SOFTPLUS:  task_func = unary_task_f32_tiled_unary_softplus; break;
                 case HTP_OP_UNARY_TANH:      task_func = unary_task_f32_tiled_unary_tanh;     break;
+                case HTP_OP_UNARY_RELU:      task_func = unary_task_f32_tiled_unary_relu;     break;
                 case HTP_OP_TRI:             task_func = unary_task_f32_tiled_tri;            break;
                 default:                     break;
             }
@@ -990,8 +1055,10 @@ static int execute_op_unary_f32(struct htp_ops_context * octx) {
                 case HTP_OP_UNARY_SIGMOID:   task_func = unary_task_f32_unary_sigmoid;        break;
                 case HTP_OP_UNARY_SILU:      task_func = unary_task_f32_unary_silu;           break;
                 case HTP_OP_UNARY_GELU:      task_func = unary_task_f32_unary_gelu;           break;
+                case HTP_OP_UNARY_GELU_ERF:  task_func = unary_task_f32_unary_gelu_erf;       break;
                 case HTP_OP_UNARY_SOFTPLUS:  task_func = unary_task_f32_unary_softplus;       break;
                 case HTP_OP_UNARY_TANH:      task_func = unary_task_f32_unary_tanh;           break;
+                case HTP_OP_UNARY_RELU:      task_func = unary_task_f32_unary_relu;           break;
                 case HTP_OP_L2_NORM:         task_func = unary_task_f32_l2_norm;              break;
                 case HTP_OP_TRI:             task_func = unary_task_f32_tri;                  break;
                 default:                     break;

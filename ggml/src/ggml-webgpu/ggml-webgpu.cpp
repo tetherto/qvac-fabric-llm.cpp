@@ -16,6 +16,7 @@
 
 #include <webgpu/webgpu_cpp.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <cstring>
@@ -657,11 +658,11 @@ static webgpu_encoded_op ggml_backend_webgpu_build(webgpu_context &             
     });
 }
 
-static void ggml_backend_webgpu_buffer_memset(webgpu_global_context & ctx,
-                                              wgpu::Buffer &          buf,
-                                              uint32_t                value,
-                                              size_t                  offset,
-                                              size_t                  size) {
+static void ggml_backend_webgpu_buffer_memset_chunk(webgpu_global_context & ctx,
+                                                    wgpu::Buffer &          buf,
+                                                    uint32_t                value,
+                                                    size_t                  offset,
+                                                    size_t                  size) {
     std::vector<uint32_t>             params  = { (uint32_t) offset, (uint32_t) size, value };
     std::vector<wgpu::BindGroupEntry> entries = { ggml_webgpu_make_bind_group_entry(0, buf, 0, buf.GetSize()) };
     size_t                            bytes_per_wg =
@@ -694,6 +695,21 @@ static void ggml_backend_webgpu_buffer_memset(webgpu_global_context & ctx,
     wgpu::CommandBuffer              command  = encoder.Finish();
     std::vector<wgpu::CommandBuffer> commands = { command };
     ctx->queue.Submit(commands.size(), commands.data());
+}
+
+// One dispatch covers at most maxComputeWorkgroupsPerDimension workgroups, so a
+// large range (a whole-buffer clear) is split into chunks of that many bytes.
+static void ggml_backend_webgpu_buffer_memset(webgpu_global_context & ctx,
+                                              wgpu::Buffer &          buf,
+                                              uint32_t                value,
+                                              size_t                  offset,
+                                              size_t                  size) {
+    const size_t bytes_per_wg =
+        ctx->capabilities.limits.maxComputeInvocationsPerWorkgroup * ctx->capabilities.memset_bytes_per_thread;
+    const size_t max_chunk = (size_t) ctx->capabilities.limits.maxComputeWorkgroupsPerDimension * bytes_per_wg;
+    for (size_t done = 0; done < size; done += max_chunk) {
+        ggml_backend_webgpu_buffer_memset_chunk(ctx, buf, value, offset + done, std::min(size - done, max_chunk));
+    }
 }
 
 /** End WebGPU Actions */
@@ -3160,7 +3176,8 @@ static webgpu_encoded_op ggml_webgpu_sum_rows(webgpu_context & ctx, ggml_tensor 
                                      total_sum ? 0 : (uint32_t) (src->nb[3] / ggml_type_size(src->type)),
                                      total_sum ? static_cast<uint32_t>(ggml_nelements(src)) : (uint32_t) src->ne[0],
                                      total_sum ? 1 : (uint32_t) src->ne[1],
-                                     total_sum ? 1 : (uint32_t) src->ne[2] };
+                                     total_sum ? 1 : (uint32_t) src->ne[2],
+                                     total_sum ? 1 : (uint32_t) ggml_nrows(dst) };
 
     std::vector<wgpu::BindGroupEntry> entries = { ggml_webgpu_make_tensor_bind_group_entry(ctx, 0, src),
                                                   ggml_webgpu_make_tensor_bind_group_entry(ctx, 1, dst) };
@@ -3172,8 +3189,11 @@ static webgpu_encoded_op ggml_webgpu_sum_rows(webgpu_context & ctx, ggml_tensor 
 
     webgpu_pipeline pipeline = ctx->shader_lib->get_sum_rows_pipeline(shader_lib_ctx);
 
-    uint32_t wg_x = total_sum ? 1 : ggml_nrows(dst);
-    return ggml_backend_webgpu_build(ctx, pipeline, params, entries, wg_x);
+    uint32_t       wg_x;
+    uint32_t       wg_y;
+    const uint32_t total_wg = total_sum ? 1 : ggml_nrows(dst);
+    compute_2d_workgroups(total_wg, ctx->global_ctx->capabilities.limits.maxComputeWorkgroupsPerDimension, wg_x, wg_y);
+    return ggml_backend_webgpu_build(ctx, pipeline, params, entries, wg_x, wg_y);
 }
 
 static bool ggml_webgpu_can_fuse_rms_norm_mul(const struct ggml_cgraph * cgraph, int node_idx) {
@@ -3668,6 +3688,22 @@ static void ggml_backend_webgpu_buffer_memset_tensor(ggml_backend_buffer_t buffe
     WEBGPU_CPU_PROFILE_TOTAL_END(memset_tensor, buf_ctx->global_ctx);
 }
 
+static const size_t WEBGPU_BUFFER_WORD = 4;
+
+// Writes up to one word's worth of bytes starting at any byte offset: the memset shader
+// masks each byte into its lane of the containing word, so the value is packed by lane.
+static void ggml_backend_webgpu_set_partial_word(ggml_backend_webgpu_buffer_context * buf_ctx,
+                                                 const uint8_t *                      bytes,
+                                                 size_t                               offset,
+                                                 size_t                               count) {
+    uint32_t     value = 0;
+    const size_t lane  = offset % WEBGPU_BUFFER_WORD;
+    for (size_t i = 0; i < count; i++) {
+        ((uint8_t *) &value)[lane + i] = bytes[i];
+    }
+    ggml_backend_webgpu_buffer_memset(buf_ctx->global_ctx, buf_ctx->buffer, value, offset, count);
+}
+
 static void ggml_backend_webgpu_buffer_set_tensor(ggml_backend_buffer_t buffer,
                                                   ggml_tensor *         tensor,
                                                   const void *          data,
@@ -3679,23 +3715,24 @@ static void ggml_backend_webgpu_buffer_set_tensor(ggml_backend_buffer_t buffer,
     WEBGPU_LOG_DEBUG("ggml_backend_webgpu_buffer_set_tensor(" << buf_ctx->label << ", " << tensor << ", " << data
                                                               << ", " << offset << ", " << size << ")");
 
-    size_t total_offset = ggml_webgpu_tensor_offset(tensor) + offset;
+    const size_t    total_offset = ggml_webgpu_tensor_offset(tensor) + offset;
+    const uint8_t * bytes        = (const uint8_t *) data;
 
-    buf_ctx->global_ctx->queue.WriteBuffer(buf_ctx->buffer, total_offset, data, (size / 4) * 4);
+    // WriteBuffer needs a 4-byte aligned offset and size; the partial words at either end go through the byte-masked memset
+    const size_t head = std::min(size, (WEBGPU_BUFFER_WORD - total_offset % WEBGPU_BUFFER_WORD) % WEBGPU_BUFFER_WORD);
+    if (head > 0) {
+        ggml_backend_webgpu_set_partial_word(buf_ctx, bytes, total_offset, head);
+    }
 
-    if (size % 4 != 0) {
-        // If size is not a multiple of 4, we need to memset the remaining bytes
-        size_t remaining_size = size % 4;
+    const size_t body_offset = total_offset + head;
+    const size_t body        = ((size - head) / WEBGPU_BUFFER_WORD) * WEBGPU_BUFFER_WORD;
+    if (body > 0) {
+        buf_ctx->global_ctx->queue.WriteBuffer(buf_ctx->buffer, body_offset, bytes + head, body);
+    }
 
-        // pack the remaining bytes into a uint32_t
-        uint32_t val32 = 0;
-
-        for (size_t i = 0; i < remaining_size; i++) {
-            ((uint8_t *) &val32)[i] = ((const uint8_t *) data)[size - remaining_size + i];
-        }
-        // memset the remaining bytes
-        ggml_backend_webgpu_buffer_memset(buf_ctx->global_ctx, buf_ctx->buffer, val32,
-                                          total_offset + (size - remaining_size), remaining_size);
+    const size_t tail = size - head - body;
+    if (tail > 0) {
+        ggml_backend_webgpu_set_partial_word(buf_ctx, bytes + head + body, body_offset + body, tail);
     }
     WEBGPU_CPU_PROFILE_TOTAL_END(set_tensor, buf_ctx->global_ctx);
 }
@@ -3711,14 +3748,13 @@ static void ggml_backend_webgpu_buffer_get_tensor(ggml_backend_buffer_t buffer,
                                                               << ", " << offset << ", " << size << ")");
     wgpu::Device device = buf_ctx->global_ctx->device;
 
-    size_t total_offset = ggml_webgpu_tensor_offset(tensor) + offset;
+    const size_t total_offset = ggml_webgpu_tensor_offset(tensor) + offset;
 
-    size_t final_size = size;
-    if (size % 4 != 0) {
-        // If size is not a multiple of 4, we need to round it up to the next
-        // multiple of 4
-        final_size = size + (4 - (size % 4));
-    }
+    // CopyBufferToBuffer needs a word-aligned offset and size: copy from the containing
+    // word and skip the leading bytes when reading the mapped range back
+    const size_t aligned_offset = total_offset - total_offset % WEBGPU_BUFFER_WORD;
+    const size_t lead           = total_offset - aligned_offset;
+    const size_t final_size     = ((lead + size + WEBGPU_BUFFER_WORD - 1) / WEBGPU_BUFFER_WORD) * WEBGPU_BUFFER_WORD;
 
     std::lock_guard<std::recursive_mutex> lock(buf_ctx->global_ctx->mutex);
 
@@ -3734,7 +3770,7 @@ static void ggml_backend_webgpu_buffer_get_tensor(ggml_backend_buffer_t buffer,
 
     // Copy the data from the buffer to the staging buffer
     wgpu::CommandEncoder encoder = device.CreateCommandEncoder();
-    encoder.CopyBufferToBuffer(buf_ctx->buffer, total_offset, buf_ctx->global_ctx->get_tensor_staging_buf, 0,
+    encoder.CopyBufferToBuffer(buf_ctx->buffer, aligned_offset, buf_ctx->global_ctx->get_tensor_staging_buf, 0,
                                final_size);
     wgpu::CommandBuffer commands = encoder.Finish();
 
@@ -3748,7 +3784,7 @@ static void ggml_backend_webgpu_buffer_get_tensor(ggml_backend_buffer_t buffer,
     const void * mapped_range = buf_ctx->global_ctx->get_tensor_staging_buf.GetConstMappedRange(0, final_size);
 
     // Copy the data from the mapped range to the output buffer
-    std::memcpy(data, mapped_range, size);
+    std::memcpy(data, (const uint8_t *) mapped_range + lead, size);
     buf_ctx->global_ctx->get_tensor_staging_buf.Unmap();
     WEBGPU_CPU_PROFILE_TOTAL_END(get_tensor, buf_ctx->global_ctx);
 }

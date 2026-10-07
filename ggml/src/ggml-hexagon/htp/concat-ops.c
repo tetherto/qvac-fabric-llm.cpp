@@ -13,6 +13,8 @@ struct htp_concat_context {
     struct htp_ops_context * octx;
     uint32_t dim;
     uint32_t nrows_per_thread;
+    int span_dim;
+    uint32_t span_elements[2];
     struct fastdiv_values div_ne0;
     struct fastdiv_values div_ne1;
     struct fastdiv_values div_ne2;
@@ -204,11 +206,60 @@ static void concat_generic(unsigned int nth, unsigned int ith, void * data) {
 
         uint8_t * src_ptr = (uint8_t *)src->data + s3 * src->nb[3] + s2 * src->nb[2] + s1 * src->nb[1] + s0 * src->nb[0];
 
-        if (type_size == 4) {
-            *(float*)dst_ptr = *(float*)src_ptr;
-        } else {
-            *(__fp16*)dst_ptr = *(__fp16*)src_ptr;
+        memcpy(dst_ptr, src_ptr, type_size);
+    }
+}
+
+static void concat_contiguous(unsigned int nth, unsigned int ith, void * data) {
+    const struct htp_concat_context * cctx = (const struct htp_concat_context *) data;
+    const struct htp_ops_context * octx = cctx->octx;
+    const struct htp_tensor * src0 = octx->src[0];
+    const struct htp_tensor * dst = octx->dst;
+    const uint32_t type_size = (dst->type == HTP_TYPE_F32 || dst->type == HTP_TYPE_I32) ? 4 : 2;
+    const uint32_t total_elements = dst->ne[0] * dst->ne[1] * dst->ne[2] * dst->ne[3];
+    const uint32_t chunk_size = total_elements / nth + (total_elements % nth != 0);
+    const uint32_t start_idx = MIN(ith * chunk_size, total_elements);
+    const uint32_t end_idx = start_idx + MIN(chunk_size, total_elements - start_idx);
+
+    // Partition output elements rather than rows so even a single large span
+    // can use all workers. Every copy stops at both the span and worker boundary.
+    for (uint32_t idx = start_idx; idx < end_idx;) {
+        const uint32_t idx1 = fastdiv(idx, &cctx->div_ne0);
+        const uint32_t idx2 = fastdiv(idx1, &cctx->div_ne1);
+        const uint32_t idx3 = fastdiv(idx2, &cctx->div_ne2);
+        uint32_t coord[4] = {
+            idx - idx1 * dst->ne[0],
+            idx1 - idx2 * dst->ne[1],
+            idx2 - idx3 * dst->ne[2],
+            idx3,
+        };
+
+        size_t dst_offset = 0;
+        for (int d = 0; d < 4; ++d) {
+            dst_offset += (size_t) coord[d] * dst->nb[d];
         }
+
+        const uint32_t src_index = coord[cctx->dim] >= src0->ne[cctx->dim];
+        const struct htp_tensor * src = octx->src[src_index];
+        if (src_index != 0) {
+            coord[cctx->dim] -= src0->ne[cctx->dim];
+        }
+
+        size_t src_offset = 0;
+        uint32_t span_offset = 0;
+        uint32_t span_stride = 1;
+        for (int d = 0; d < 4; ++d) {
+            src_offset += (size_t) coord[d] * src->nb[d];
+            if (d <= cctx->span_dim) {
+                span_offset += coord[d] * span_stride;
+                span_stride *= src->ne[d];
+            }
+        }
+
+        const uint32_t count = MIN(cctx->span_elements[src_index] - span_offset, end_idx - idx);
+        memcpy((uint8_t *) dst->data + dst_offset,
+               (const uint8_t *) src->data + src_offset, (size_t) count * type_size);
+        idx += count;
     }
 }
 
@@ -218,6 +269,10 @@ int op_concat(struct htp_ops_context * octx) {
     const struct htp_tensor * dst  = octx->dst;
 
     int dim = octx->op_params[0];
+
+    if (octx->flags & HTP_OPFLAGS_SKIP_COMPUTE) {
+        return HTP_STATUS_OK;
+    }
 
     bool is_2d = dst->ne[2] == 1 && dst->ne[3] == 1;
 
@@ -229,11 +284,34 @@ int op_concat(struct htp_ops_context * octx) {
     struct htp_concat_context cctx;
     cctx.octx = octx;
     cctx.dim = dim;
+    cctx.span_dim = -1;
+    cctx.span_elements[0] = 1;
+    cctx.span_elements[1] = 1;
     cctx.div_ne0 = init_fastdiv_values(dst->ne[0]);
     cctx.div_ne1 = init_fastdiv_values(dst->ne[1]);
     cctx.div_ne2 = init_fastdiv_values(dst->ne[2]);
 
     void (*worker_func)(unsigned int, unsigned int, void *) = concat_generic;
+
+    // Coalesce only a prefix that is contiguous in all three tensors. Stop at
+    // the concat axis: crossing it would interleave the two input buffers.
+    size_t src0_bytes = type_size;
+    size_t src1_bytes = type_size;
+    size_t dst_bytes = type_size;
+    for (int d = 0; d <= dim; ++d) {
+        if (src0->nb[d] != src0_bytes || src1->nb[d] != src1_bytes || dst->nb[d] != dst_bytes) {
+            break;
+        }
+        src0_bytes *= src0->ne[d];
+        src1_bytes *= src1->ne[d];
+        dst_bytes *= dst->ne[d];
+        cctx.span_dim = d;
+        cctx.span_elements[0] *= src0->ne[d];
+        cctx.span_elements[1] *= src1->ne[d];
+    }
+    if (cctx.span_dim >= 0) {
+        worker_func = concat_contiguous;
+    }
 
     if (dim == 0 && is_2d && is_src1_transposed && !is_src0_transposed) {
         n_threads = MIN(dst->ne[1], n_threads);

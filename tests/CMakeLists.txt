@@ -116,6 +116,28 @@ function(llama_build_and_test source)
     set_property(TEST ${TEST_TARGET} PROPERTY LABELS ${LLAMA_TEST_LABEL})
 endfunction()
 
+function(ggml_build_and_test source)
+    include(CMakeParseArguments)
+    set(options HEADER_ONLY)
+    set(oneValueArgs)
+    set(multiValueArgs ARGS INCLUDES)
+    cmake_parse_arguments(GGML_TEST "${options}" "${oneValueArgs}" "${multiValueArgs}" ${ARGN})
+
+    get_filename_component(TEST_TARGET ${source} NAME_WE)
+    add_executable(${TEST_TARGET} ${source})
+    target_compile_features(${TEST_TARGET} PRIVATE cxx_std_17)
+    if (NOT GGML_TEST_HEADER_ONLY)
+        target_link_libraries(${TEST_TARGET} PRIVATE ggml)
+    endif()
+    if (GGML_TEST_INCLUDES)
+        target_include_directories(${TEST_TARGET} PRIVATE ${GGML_TEST_INCLUDES})
+    endif()
+    if (LLAMA_TESTS_INSTALL)
+        install(TARGETS ${TEST_TARGET} RUNTIME)
+    endif()
+    llama_test(${TEST_TARGET} ARGS ${GGML_TEST_ARGS})
+endfunction()
+
 # build test-tokenizer-0 target once and add many tests
 llama_build(test-tokenizer-0.cpp)
 
@@ -408,6 +430,83 @@ llama_build_and_test(test-copy-tbq-subgroups.cpp)
 # wherever OpenCL exists (Adreno devices, desktop OpenCL, PoCL). Does not link
 # mtmd, so it is intentionally outside the LLAMA_MTMD block below.
 llama_build_and_test(test-opencl-fa-chunking.cpp)
+
+# Names the backends that must register on any host, comma separated: the CPU family and RPC.
+# GPU and BLAS modules may be absent at run time when their driver or runtime
+# library is missing, so they are not required.
+function(ggml_required_backend_names out_var)
+    set(names "")
+    foreach (backend IN LISTS GGML_AVAILABLE_BACKENDS)
+        if (backend MATCHES "^ggml-cpu" AND NOT "CPU" IN_LIST names)
+            list(APPEND names "CPU")
+        elseif (backend STREQUAL "ggml-rpc")
+            list(APPEND names "RPC")
+        endif()
+    endforeach()
+    string(REPLACE ";" "," names "${names}")
+    set(${out_var} "${names}" PARENT_SCOPE)
+endfunction()
+
+ggml_build_and_test(test-cpu-graph-plan.cpp)
+ggml_required_backend_names(GGML_TEST_REQUIRED_BACKENDS)
+ggml_build_and_test(test-backend-discovery.cpp)
+target_compile_definitions(test-backend-discovery PRIVATE "GGML_TEST_REQUIRED_BACKENDS=\"${GGML_TEST_REQUIRED_BACKENDS}\"")
+if (GGML_VULKAN)
+    llama_test(test-backend-discovery NAME test-backend-discovery-no-vulkan)
+    set_tests_properties(test-backend-discovery-no-vulkan PROPERTIES ENVIRONMENT "GGML_DISABLE_VULKAN=1")
+endif()
+if (GGML_OPENCL)
+    target_compile_definitions(test-backend-discovery PRIVATE GGML_TEST_HAS_OPENCL)
+endif()
+ggml_build_and_test(test-backend-buft-queries.cpp)
+ggml_build_and_test(test-conv-transpose-1d-scaling.cpp)
+set_tests_properties(test-conv-transpose-1d-scaling PROPERTIES SKIP_RETURN_CODE 77)
+ggml_build_and_test(test-adreno-version.cpp HEADER_ONLY INCLUDES ${PROJECT_SOURCE_DIR}/ggml/src)
+ggml_build_and_test(test-shader-payload-strip.cpp HEADER_ONLY INCLUDES ${PROJECT_SOURCE_DIR}/ggml/src/ggml-vulkan/vulkan-shaders)
+ggml_build_and_test(test-opencl-kernel-sources.cpp HEADER_ONLY ARGS ${PROJECT_SOURCE_DIR}/ggml/src/ggml-opencl/kernels)
+if (GGML_OPENCL)
+    ggml_build_and_test(test-opencl-workgroup.cpp HEADER_ONLY)
+endif()
+if (GGML_METAL)
+    ggml_build_and_test(test-metal-free-memory.cpp HEADER_ONLY)
+    ggml_build_and_test(test-metal-capability-gates.cpp)
+    set_tests_properties(test-metal-capability-gates PROPERTIES ENVIRONMENT "GGML_METAL_SIMDGROUP_REDUCTION_DISABLE=1")
+endif()
+if (GGML_VULKAN AND NOT GGML_BACKEND_DL AND NOT LLAMA_USE_SYSTEM_GGML)
+    target_compile_definitions(ggml-vulkan PRIVATE GGML_VULKAN_TESTING)
+    ggml_build_and_test(test-vulkan-status.cpp)
+    target_link_libraries(test-vulkan-status PRIVATE ggml-vulkan)
+endif()
+if (NOT GGML_BACKEND_DL)
+    ggml_build_and_test(test-snake.cpp)
+    ggml_build_and_test(test-vae-graph.cpp)
+    add_executable(vae-decode vae-decode.cpp)
+    target_link_libraries(vae-decode PRIVATE ggml)
+    add_executable(vae-roundtrip vae-roundtrip.cpp)
+    target_link_libraries(vae-roundtrip PRIVATE ggml)
+endif()
+
+if (NOT LLAMA_USE_SYSTEM_GGML)
+    if (NOT GGML_BACKEND_DL OR GGML_CPU_STATIC)
+        set(GGML_CONSUMER_EXPECT_CPU ON)
+    else()
+        set(GGML_CONSUMER_EXPECT_CPU OFF)
+    endif()
+    set(GGML_CONSUMER_EXTRA_LIB_DIRS "")
+    if (GGML_VULKAN AND Vulkan_LIBRARY)
+        get_filename_component(GGML_CONSUMER_EXTRA_LIB_DIRS "${Vulkan_LIBRARY}" DIRECTORY)
+    endif()
+    add_test(NAME test-package-consumer
+        COMMAND ${CMAKE_COMMAND}
+            -DGGML_BUILD_DIR=${CMAKE_BINARY_DIR}
+            -DGGML_CONSUMER_EXTRA_LIB_DIRS=${GGML_CONSUMER_EXTRA_LIB_DIRS}
+            -DGGML_CONSUMER_SOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}/package-consumer
+            -DGGML_LIB_OUTPUT_PREFIX=${GGML_LIB_OUTPUT_PREFIX}
+            -DGGML_CONSUMER_EXPECT_CPU=${GGML_CONSUMER_EXPECT_CPU}
+            -DGGML_CONSUMER_CONFIG=$<CONFIG>
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/package-consumer/run.cmake)
+    set_property(TEST test-package-consumer PROPERTY LABELS main)
+endif()
 
 llama_build_and_test(test-model-load-cancel.cpp       LABEL "model")
 llama_build_and_test(test-model-load-disk.cpp         LABEL "model")

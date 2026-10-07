@@ -29,6 +29,24 @@ endif()
 option(GGML_VULKAN_DISABLE_COOPMAT "Disable VK_KHR_cooperative_matrix support" OFF)
 option(GGML_VULKAN_DISABLE_COOPMAT2 "Disable VK_NV_cooperative_matrix2 support" OFF)
 
+# A SPIRV-Headers package whose include directories are missing (seen with some
+# Homebrew installs) fails the generate step once the target is linked, while
+# the Vulkan SDK already provides the headers on the include path.
+function(ggml_vk_spirv_headers_usable out_var)
+    set(${out_var} OFF PARENT_SCOPE)
+    if (NOT TARGET SPIRV-Headers::SPIRV-Headers)
+        return()
+    endif()
+    get_target_property(_spirv_includes SPIRV-Headers::SPIRV-Headers INTERFACE_INCLUDE_DIRECTORIES)
+    foreach (_spirv_dir IN LISTS _spirv_includes)
+        if (NOT EXISTS "${_spirv_dir}")
+            message(STATUS "ggml-vulkan: ignoring SPIRV-Headers, missing include dir ${_spirv_dir}")
+            return()
+        endif()
+    endforeach()
+    set(${out_var} ON PARENT_SCOPE)
+endfunction()
+
 function(detect_host_compiler)
     if (CMAKE_HOST_SYSTEM_NAME STREQUAL "Windows")
         find_program(HOST_C_COMPILER NAMES cl gcc clang NO_CMAKE_FIND_ROOT_PATH)
@@ -129,13 +147,19 @@ if (Vulkan_FOUND)
     )
 
     target_link_libraries(ggml-vulkan PRIVATE Vulkan::Vulkan)
-    target_include_directories(ggml-vulkan
-        PRIVATE
-            ${CMAKE_CURRENT_BINARY_DIR}
-            ../../../vendor
+    ggml_vk_spirv_headers_usable(GGML_VK_SPIRV_HEADERS_USABLE)
+    if (GGML_VK_SPIRV_HEADERS_USABLE)
+        target_link_libraries(ggml-vulkan PRIVATE $<BUILD_INTERFACE:SPIRV-Headers::SPIRV-Headers>)
+    endif()
+    target_include_directories(ggml-vulkan PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
 
-    )
-    if (ANDROID)
+    if (GGML_BUILD_TESTS)
+        target_compile_definitions(ggml-vulkan PRIVATE GGML_VULKAN_TESTING)
+    endif()
+
+    target_include_directories(ggml-vulkan PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/vendor)
+
+    if (ANDROID AND NOT TARGET SPIRV-Headers::SPIRV-Headers)
         # The Android NDK ships only the C Vulkan headers (vulkan/vulkan.h). The
         # ggml Vulkan backend additionally needs the C++ bindings
         # (vulkan/vulkan.hpp) and SPIRV-Headers (spirv/unified1/spirv.hpp), which
@@ -268,6 +292,11 @@ if (Vulkan_FOUND)
     set_source_files_properties(${_ggml_vk_shader_files} PROPERTIES HEADER_FILE_ONLY TRUE)
     target_sources(ggml-vulkan PRIVATE ${_ggml_vk_shader_files})
 
+    set(_ggml_vk_genshaders_strip_args)
+    if (GGML_VULKAN_STRIP_SHADER_PAYLOADS)
+        list(APPEND _ggml_vk_genshaders_strip_args --strip-payloads)
+    endif()
+
     # Because external projects do not provide source-level tracking,
     # the vulkan-shaders-gen sources need to be explicitly added to
     # ensure that changes will cascade into shader re-generation.
@@ -283,6 +312,7 @@ if (Vulkan_FOUND)
         COMMAND ${_ggml_vk_genshaders_cmd}
             --output-dir ${_ggml_vk_output_dir}
             --target-hpp ${_ggml_vk_header}
+            ${_ggml_vk_genshaders_strip_args}
             --target-common-cpp ${_ggml_vk_common_cpp}
         DEPENDS ${_ggml_vk_shaders_gen_sources}
                 vulkan-shaders-gen
@@ -303,6 +333,7 @@ if (Vulkan_FOUND)
                 --output-dir ${_ggml_vk_output_dir}
                 --target-hpp ${_ggml_vk_header}
                 --target-cpp ${_ggml_vk_target_cpp}
+                ${_ggml_vk_genshaders_strip_args}
             DEPENDS ${file_full}
                     ${_ggml_vk_shaders_gen_sources}
                     vulkan-shaders-gen

@@ -11,6 +11,10 @@ ggml_add_backend_library(${TARGET_NAME}
 target_link_libraries(${TARGET_NAME} PRIVATE ${OpenCL_LIBRARIES})
 target_include_directories(${TARGET_NAME} PRIVATE ${OpenCL_INCLUDE_DIRS})
 
+if (ANDROID)
+    target_link_libraries(${TARGET_NAME} PRIVATE log)
+endif ()
+
 if (GGML_OPENCL_PROFILING)
     message(STATUS "OpenCL profiling enabled (increases CPU overhead)")
     add_compile_definitions(GGML_OPENCL_PROFILING)
@@ -159,6 +163,7 @@ set(GGML_OPENCL_KERNELS
     moe_sort_by_expert
     mul_mm_f32_f32_l4_lm
     mul_mm_f16_f32_l4_lm
+    mul_mm_f16_f16_l4_lm
     mul_mm_q1_0_f32_l4_lm
     mul_mm_q4_0_f32_l4_lm
     mul_mm_q4_1_f32_l4_lm
@@ -222,14 +227,26 @@ set(GGML_OPENCL_KERNELS
     cumsum
     transpose
     concat
+    gru
+    conv2d_dw
+    zero_upsample
+    channel_shuffle
+    affine_prelu
+    snake
+    col2im_1d
     tsembd
     upscale
     tanh
     exp
     expm1
     abs
+    cos
+    elu
+    leaky_relu
+    sin
     softplus
     pad
+    argmax
     repeat
     mul_mat_f16_f32
     mul_mm_f16_f32_kq_kqv
@@ -245,7 +262,7 @@ set(GGML_OPENCL_KERNELS
 )
 
 if (GGML_OPENCL_USE_ADRENO_KERNELS)
-    list(APPEND GGML_OPENCL_KERNELS gemm_xmem_f16_f32_os8)
+    list(APPEND GGML_OPENCL_KERNELS gemm_xmem_f16_f32_os8 mul_mm_f32_f32_8x4 im2col_bt_f32)
 endif ()
 
 foreach (K ${GGML_OPENCL_KERNELS})

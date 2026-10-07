@@ -9,7 +9,11 @@
 #define N_MM_NK 2
 #define N_MM_NK_TOTAL (SZ_SIMDGROUP * N_MM_NK)
 
+// Two mat-mat N-tile widths. The wide tile amortises the staged A tile over more output columns and
+// holds the higher peak; the narrow one issues fewer padded columns when N is not a multiple of the
+// wide tile. ggml_metal_library_get_pipeline_mul_mm picks per dispatch.
 #define N_MM_BLOCK_X 4
+#define N_MM_BLOCK_X_NARROW 3
 #define N_MM_BLOCK_Y 2
 #define N_MM_SIMD_GROUP_X 2
 #define N_MM_SIMD_GROUP_Y 2
@@ -100,6 +104,13 @@
 #define FC_FLASH_ATTN_EXT_VEC_REDUCE   500
 #define FC_MUL_MV                      600
 #define FC_MUL_MM                      700
+
+// mul_mm epilogue applied at the tile store, selected by function constant FC_MUL_MM + 2.
+#define GGML_METAL_MM_EPI_NONE          0
+#define GGML_METAL_MM_EPI_BIAS          1
+#define GGML_METAL_MM_EPI_BIAS_RESIDUAL 2
+#define GGML_METAL_MM_EPI_BIAS_GELU     3
+#define GGML_METAL_MM_EPI_PW2_RESIDUAL  4
 #define FC_ROPE                        800
 #define FC_SSM_CONV                    900
 #define FC_SOLVE_TRI                   1000
@@ -159,6 +170,15 @@
 
 #define OP_SUM_ROWS_NUM_SUM_ROWS 10
 #define OP_SUM_ROWS_NUM_MEAN     11
+
+// kernel parameters for the cpy fast paths
+//
+// N_CPY_ROW: elements copied per thread when the src rows are contiguous
+// SZ_CPY_TRANSPOSE / N_CPY_TRANSPOSE_ROWS: tile side and tile rows per thread pass of the transpose
+
+#define N_CPY_ROW             8
+#define SZ_CPY_TRANSPOSE      32
+#define N_CPY_TRANSPOSE_ROWS  8
 
 // kernel argument structs
 //
@@ -780,6 +800,25 @@ typedef struct {
     uint64_t nb1;
 } ggml_metal_kargs_conv_transpose_1d;
 
+// fused LSTM cell: gates [4H, N] pre-activations (i | f | g | o along ne0),
+// previous state [H, N] (c_prev) or [2H, N] (h | c, masked form), result [2H, N]
+// with h_new above c_new.
+typedef struct {
+    int32_t H;           // hidden size
+    int32_t N;           // batch (columns)
+    int32_t prev_row;    // elements per column of the previous state: H, or 2H when masked
+    int32_t c_base;      // where c starts inside a previous-state column
+    int32_t mask_stride; // 0 broadcasts a single mask entry over every column
+} ggml_metal_kargs_lstm_cell;
+
+// greedy transducer step control: one [GGML_TDT_STEP_N_OUTS] i32 result row.
+typedef struct {
+    int32_t n_dur;       // entries in the duration table
+    int32_t blank_id;
+    int32_t max_symbols; // symbols allowed at one encoder frame
+    int32_t rnnt;        // 1 = no duration head, advance one frame
+} ggml_metal_kargs_tdt_step;
+
 typedef struct {
     int32_t  T_in;
     int32_t  T_out;
@@ -1245,7 +1284,18 @@ typedef struct {
     uint64_t nb1;
     uint64_t nb2;
     uint64_t nb3;
+    // front padding on each input dim; needed to emulate ggml_pad_ext
+    int32_t  lp0;
+    int32_t  lp1;
+    int32_t  lp2;
+    int32_t  lp3;
 } ggml_metal_kargs_pad;
+
+typedef struct {
+    int32_t ncols;
+    int32_t rows_per_channel;
+    int32_t n_past;
+} ggml_metal_kargs_diag_mask_inf;
 
 typedef struct {
     int64_t  ne00;
@@ -1267,6 +1317,87 @@ typedef struct {
     int32_t  p0;
     int32_t  p1;
 } ggml_metal_kargs_pad_reflect_1d;
+
+typedef struct {
+    int32_t L;
+    int32_t C;
+    int32_t B;
+    int32_t K;
+    int32_t dilation;
+    int32_t has_bias;
+    int32_t causal;   // 0 = symmetric edge-clamp (vector_estimator), 1 = causal-left (vocoder)
+    int32_t seg_len;  // 0 = one segment of L, else clamp inside each seg_len window
+    int32_t sxt;
+    int32_t sxc;
+    int32_t syt;
+    int32_t syc;
+} ggml_metal_kargs_supertonic_depthwise_1d;
+
+typedef struct {
+    int32_t L;
+    int32_t C;
+    int32_t B;
+    float   eps;
+    // Per-axis element strides for x and y.  Lets the same kernel handle
+    // both [T, C] (sxt=1, sxc=L) and [C, T] (sxt=C, sxc=1) layouts.
+    int32_t sxt;  // x stride per time step (in elements)
+    int32_t sxc;  // x stride per channel  (in elements)
+    int32_t syt;  // y stride per time step (in elements)
+    int32_t syc;  // y stride per channel  (in elements)
+} ggml_metal_kargs_supertonic_layer_norm_channel;
+
+// Channels one thread holds in registers between the depthwise taps and the layer-norm reduction.
+#define GGML_METAL_SUPERTONIC_DW_LN_MAX_PER_THREAD 8
+#define GGML_METAL_SUPERTONIC_LAYER_NORM_MAX_SIMDGROUPS 8
+
+typedef struct {
+    int32_t L;
+    int32_t C;
+    int32_t B;
+    int32_t K;
+    int32_t dilation;
+    int32_t has_bias;
+    int32_t causal;
+    int32_t seg_len;
+    int32_t sxt;
+    int32_t sxc;
+    int32_t syt;
+    int32_t syc;
+    float   eps;
+} ggml_metal_kargs_supertonic_depthwise_1d_layer_norm;
+
+typedef struct {
+    int32_t L;
+    int32_t C;
+    int32_t B;
+    int32_t sxt;
+    int32_t sxc;
+    int32_t syt;
+    int32_t syc;
+    int32_t srt;
+    int32_t src;
+} ggml_metal_kargs_supertonic_pw2_residual;
+
+typedef struct {
+    int32_t L;
+    int32_t C;
+    int32_t B;
+    int32_t sxt;
+    int32_t sxc;
+    int32_t syt;
+    int32_t syc;
+} ggml_metal_kargs_supertonic_bias_gelu;
+
+typedef struct {
+    int32_t L_in;
+    int32_t L_out;
+    int32_t C;
+    int32_t pad_left;
+    int32_t sxt;
+    int32_t sxc;
+    int32_t syt;
+    int32_t syc;
+} ggml_metal_kargs_supertonic_edge_pad_1d;
 
 typedef struct {
     int64_t  ne00;

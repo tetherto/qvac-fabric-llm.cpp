@@ -8,7 +8,9 @@
 #endif
 
 #define QK8_0 32
+#ifndef N_SIMDGROUP
 #define N_SIMDGROUP 4
+#endif
 
 #define dequantizeBlockAccum_ns_sgbroadcast_1(total_sums, bits8, scale, y) \
     float shared_y; \
@@ -177,15 +179,15 @@ __kernel void kernel_gemv_noshuffle_q8_0_f32(
         dequantizeBlockAccum_ns_sgbroadcast_1(totalSum, regA, convert_float(regS), regB);
     }
 
-    // reduction in local memory, assumes #wave=4
-    __local float reduceLM[SIMDGROUP_WIDTH * 3];
-    if (groupId == 1) reduceLM[SIMDGROUP_WIDTH * 0 + slid] = totalSum;
-    if (groupId == 2) reduceLM[SIMDGROUP_WIDTH * 1 + slid] = totalSum;
-    if (groupId == 3) reduceLM[SIMDGROUP_WIDTH * 2 + slid] = totalSum;
+    // reduction in local memory, one slot per wave above wave 0
+    __local float reduceLM[SIMDGROUP_WIDTH * (N_SIMDGROUP - 1)];
+    if (groupId > 0) reduceLM[SIMDGROUP_WIDTH * (groupId - 1) + slid] = totalSum;
     barrier(CLK_LOCAL_MEM_FENCE);
-    if (groupId == 0) totalSum += reduceLM[SIMDGROUP_WIDTH * 0 + slid];
-    if (groupId == 0) totalSum += reduceLM[SIMDGROUP_WIDTH * 1 + slid];
-    if (groupId == 0) totalSum += reduceLM[SIMDGROUP_WIDTH * 2 + slid];
+    if (groupId == 0) {
+        for (uint w = 0; w < N_SIMDGROUP - 1; ++w) {
+            totalSum += reduceLM[SIMDGROUP_WIDTH * w + slid];
+        }
+    }
 
     // 1 outputs per fiber in wave 0
     if (groupId == 0) {

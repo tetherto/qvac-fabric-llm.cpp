@@ -1,5 +1,6 @@
 #include "ggml-impl.h"
 #include "ggml-tbq-quants.h"
+#include "ggml-threading.h"
 
 // ====================== TurboQuant (Zandieh et al., ICLR 2026) ======================
 //
@@ -48,66 +49,33 @@ static const float TQ4_CODEBOOK_64[16] = {
      0.25285715281341298f,  0.33074821159014389f,
 };
 
-// xoshiro256** PRNG for deterministic rotation matrix generation
-typedef struct { uint64_t s[4]; } tq_rng_t;
-
-static inline uint64_t tq_rng_rotl(uint64_t x, int k) {
-    return (x << k) | (x >> (64 - k));
-}
-
-static uint64_t tq_rng_next(tq_rng_t * rng) {
-    const uint64_t result = tq_rng_rotl(rng->s[1] * 5, 7) * 9;
-    const uint64_t t = rng->s[1] << 17;
-    rng->s[2] ^= rng->s[0];
-    rng->s[3] ^= rng->s[1];
-    rng->s[1] ^= rng->s[2];
-    rng->s[0] ^= rng->s[3];
-    rng->s[2] ^= t;
-    rng->s[3] = tq_rng_rotl(rng->s[3], 45);
-    return result;
-}
-
-static void tq_rng_seed(tq_rng_t * rng, uint64_t seed) {
-    for (int i = 0; i < 4; i++) {
-        seed += 0x9e3779b97f4a7c15ULL;
-        uint64_t z = seed;
-        z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ULL;
-        z = (z ^ (z >> 27)) * 0x94d049bb133111ebULL;
-        rng->s[i] = z ^ (z >> 31);
-    }
-}
-
-// Not needed for Hadamard transform — kept for potential future use
-// static float tq_rng_normal(tq_rng_t * rng) { ... }
-
 // ====================== Randomized Hadamard Transform ======================
 // Replaces dense O(d²) rotation with O(d log d) butterfly transform.
 // R = (1/√d) · H · D where H is Walsh-Hadamard, D is random ±1 diagonal.
 // R is orthogonal: R^T = (1/√d) · D · H (since H^T=H, D^T=D, H·H=d·I).
 
-// Random sign arrays (±1) for the diagonal D, one per block size, from fixed seeds.
-#define TQ_SIGN_SEED_128 42
-#define TQ_SIGN_SEED_64  43
-static float   tq_signs_128[QK_TQ];
-static float   tq_signs_64[QK_TQ_64];
-static int32_t tq_signs_128_ready = 0;
-static int32_t tq_signs_64_ready  = 0;
-
-static void tq_generate_signs(float * signs, int d, uint64_t seed) {
-    tq_rng_t rng;
-    tq_rng_seed(&rng, seed);
-    for (int i = 0; i < d; i++) {
-        signs[i] = (tq_rng_next(&rng) & 1) ? 1.0f : -1.0f;
-    }
-}
+// Random sign arrays (±1) for the diagonal D, one per block size. They were drawn once
+// from xoshiro256** with seeds 42 (128) and 43 (64) and are fixed here so every thread
+// reads immutable data.
+static const float tq_signs_128[QK_TQ] = {
+    -1.0f, -1.0f, 1.0f, 1.0f, -1.0f, -1.0f, -1.0f, 1.0f, -1.0f, 1.0f, 1.0f, 1.0f, -1.0f, -1.0f, 1.0f, -1.0f,
+    1.0f, -1.0f, 1.0f, -1.0f, 1.0f, 1.0f, 1.0f, 1.0f, -1.0f, -1.0f, -1.0f, -1.0f, -1.0f, -1.0f, 1.0f, -1.0f,
+    -1.0f, -1.0f, -1.0f, -1.0f, 1.0f, 1.0f, -1.0f, 1.0f, 1.0f, 1.0f, 1.0f, -1.0f, 1.0f, 1.0f, -1.0f, 1.0f,
+    1.0f, 1.0f, 1.0f, -1.0f, -1.0f, -1.0f, -1.0f, 1.0f, 1.0f, -1.0f, 1.0f, -1.0f, -1.0f, 1.0f, 1.0f, -1.0f,
+    -1.0f, 1.0f, -1.0f, 1.0f, -1.0f, 1.0f, 1.0f, 1.0f, -1.0f, -1.0f, -1.0f, -1.0f, -1.0f, 1.0f, -1.0f, -1.0f,
+    -1.0f, 1.0f, -1.0f, -1.0f, 1.0f, -1.0f, -1.0f, -1.0f, 1.0f, 1.0f, -1.0f, -1.0f, -1.0f, -1.0f, 1.0f, 1.0f,
+    1.0f, 1.0f, -1.0f, 1.0f, 1.0f, -1.0f, -1.0f, 1.0f, -1.0f, -1.0f, 1.0f, -1.0f, -1.0f, -1.0f, 1.0f, -1.0f,
+    -1.0f, 1.0f, 1.0f, -1.0f, 1.0f, 1.0f, 1.0f, 1.0f, -1.0f, 1.0f, -1.0f, -1.0f, 1.0f, 1.0f, -1.0f, -1.0f,
+};
+static const float tq_signs_64[QK_TQ_64] = {
+    -1.0f, 1.0f, 1.0f, 1.0f, -1.0f, -1.0f, -1.0f, -1.0f, 1.0f, 1.0f, -1.0f, 1.0f, 1.0f, -1.0f, -1.0f, -1.0f,
+    -1.0f, 1.0f, 1.0f, -1.0f, -1.0f, 1.0f, 1.0f, -1.0f, 1.0f, 1.0f, 1.0f, -1.0f, 1.0f, -1.0f, 1.0f, -1.0f,
+    1.0f, -1.0f, 1.0f, -1.0f, -1.0f, 1.0f, -1.0f, 1.0f, 1.0f, -1.0f, -1.0f, -1.0f, -1.0f, 1.0f, -1.0f, 1.0f,
+    -1.0f, -1.0f, -1.0f, -1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, -1.0f, 1.0f, 1.0f, -1.0f, -1.0f, 1.0f, 1.0f,
+};
 
 static const float * tq_get_signs(int d) {
-    if (d == QK_TQ) {
-        if (!tq_signs_128_ready) { tq_generate_signs(tq_signs_128, QK_TQ, TQ_SIGN_SEED_128); tq_signs_128_ready = 1; }
-        return tq_signs_128;
-    }
-    if (!tq_signs_64_ready) { tq_generate_signs(tq_signs_64, QK_TQ_64, TQ_SIGN_SEED_64); tq_signs_64_ready = 1; }
-    return tq_signs_64;
+    return d == QK_TQ ? tq_signs_128 : tq_signs_64;
 }
 
 const float * tq3_codebook_for(int d) {
@@ -198,14 +166,9 @@ void tq_compute_boundaries(const float * cb, float * boundaries, int n) {
 // Norm correction: store MSE-optimal scale alpha = <x, c> / <c, c> instead of
 // ||x||, where c is the codebook reconstruction direction (cb[idx] values).
 // This minimizes ||x - alpha*c||^2 and corrects quantization's norm shrinkage.
-// Controlled by GGML_TQ_NORM_CORRECTION env var (checked once, cached).
+// Controlled by GGML_TQ_NORM_CORRECTION env var, resolved once in a thread-safe way.
 static int tq_norm_correction_enabled(void) {
-    static int cached = -1;
-    if (cached < 0) {
-        const char * env = getenv("GGML_TQ_NORM_CORRECTION");
-        cached = (env && env[0] == '1') ? 1 : 0;
-    }
-    return cached;
+    return ggml_tbq_norm_correction_enabled();
 }
 
 // Shared TQ3 quantize: normalize + binary-search + packed 3-bit write
@@ -505,21 +468,27 @@ size_t quantize_pq4_0_64(const float * GGML_RESTRICT src, void * GGML_RESTRICT d
 // where R is the same structured random projection applied on-the-fly to the query.
 
 // Use distinct seeds from the main Hadamard signs to get independent projections.
-#define QJL_SIGN_SEED_128 137
-#define QJL_SIGN_SEED_64  139
-
-static float   qjl_signs_128[QK_TQ];
-static float   qjl_signs_64[QK_TQ_64];
-static int32_t qjl_signs_128_ready = 0;
-static int32_t qjl_signs_64_ready  = 0;
+// Drawn once from xoshiro256** with seeds 137 (128) and 139 (64), fixed here so every
+// thread reads immutable data.
+static const float qjl_signs_128[QK_TQ] = {
+    -1.0f, 1.0f, -1.0f, -1.0f, 1.0f, 1.0f, -1.0f, -1.0f, -1.0f, -1.0f, -1.0f, -1.0f, -1.0f, 1.0f, -1.0f, -1.0f,
+    1.0f, -1.0f, -1.0f, 1.0f, -1.0f, -1.0f, 1.0f, -1.0f, -1.0f, 1.0f, -1.0f, 1.0f, -1.0f, -1.0f, 1.0f, -1.0f,
+    1.0f, 1.0f, -1.0f, 1.0f, -1.0f, -1.0f, 1.0f, -1.0f, -1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f,
+    -1.0f, 1.0f, -1.0f, 1.0f, 1.0f, -1.0f, 1.0f, 1.0f, -1.0f, 1.0f, -1.0f, 1.0f, 1.0f, -1.0f, -1.0f, -1.0f,
+    1.0f, 1.0f, -1.0f, 1.0f, 1.0f, -1.0f, -1.0f, 1.0f, -1.0f, 1.0f, 1.0f, 1.0f, 1.0f, -1.0f, 1.0f, -1.0f,
+    -1.0f, -1.0f, -1.0f, -1.0f, -1.0f, -1.0f, -1.0f, -1.0f, -1.0f, -1.0f, 1.0f, 1.0f, -1.0f, 1.0f, -1.0f, 1.0f,
+    -1.0f, -1.0f, -1.0f, 1.0f, 1.0f, 1.0f, 1.0f, -1.0f, -1.0f, -1.0f, 1.0f, 1.0f, 1.0f, -1.0f, 1.0f, 1.0f,
+    -1.0f, -1.0f, -1.0f, 1.0f, -1.0f, -1.0f, -1.0f, -1.0f, -1.0f, -1.0f, -1.0f, 1.0f, -1.0f, -1.0f, -1.0f, -1.0f,
+};
+static const float qjl_signs_64[QK_TQ_64] = {
+    1.0f, -1.0f, 1.0f, 1.0f, 1.0f, -1.0f, 1.0f, 1.0f, -1.0f, -1.0f, 1.0f, 1.0f, -1.0f, -1.0f, 1.0f, 1.0f,
+    -1.0f, 1.0f, -1.0f, -1.0f, 1.0f, -1.0f, 1.0f, 1.0f, -1.0f, -1.0f, 1.0f, 1.0f, 1.0f, 1.0f, -1.0f, 1.0f,
+    -1.0f, -1.0f, -1.0f, 1.0f, -1.0f, -1.0f, -1.0f, -1.0f, 1.0f, 1.0f, -1.0f, -1.0f, 1.0f, -1.0f, -1.0f, 1.0f,
+    1.0f, 1.0f, 1.0f, -1.0f, -1.0f, 1.0f, -1.0f, -1.0f, -1.0f, -1.0f, -1.0f, -1.0f, -1.0f, 1.0f, 1.0f, 1.0f,
+};
 
 static const float * qjl_get_signs(int d) {
-    if (d == QK_TQ) {
-        if (!qjl_signs_128_ready) { tq_generate_signs(qjl_signs_128, QK_TQ, QJL_SIGN_SEED_128); qjl_signs_128_ready = 1; }
-        return qjl_signs_128;
-    }
-    if (!qjl_signs_64_ready) { tq_generate_signs(qjl_signs_64, QK_TQ_64, QJL_SIGN_SEED_64); qjl_signs_64_ready = 1; }
-    return qjl_signs_64;
+    return d == QK_TQ ? qjl_signs_128 : qjl_signs_64;
 }
 
 // Apply QJL projection in-place: buf = H * D_qjl * buf

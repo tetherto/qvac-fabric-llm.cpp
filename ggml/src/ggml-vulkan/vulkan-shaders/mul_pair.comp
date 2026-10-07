@@ -1,0 +1,58 @@
+#version 450
+
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_control_flow_attributes : require
+
+#include "types.glsl"
+#include "utils.glsl"
+
+// Fused elementwise pair: d = op2(a * b, c), op2 selected by OP2_ADD.
+// b and c broadcast onto src0's shape via fastmod (like src1 in generic_binary_head.glsl).
+layout (push_constant) uniform parameter
+{
+    uint ne;
+    uint ne00; uint ne01; uint ne02; uint ne03; uint nb00; uint nb01; uint nb02; uint nb03;
+    uint ne10; uint ne11; uint ne12; uint ne13; uint nb10; uint nb11; uint nb12; uint nb13;
+    uint ne20; uint ne21; uint ne22; uint ne23; uint nb20; uint nb21; uint nb22; uint nb23;
+    uint nb30; uint nb31; uint nb32; uint nb33;
+} p;
+
+layout (binding = 0) readonly buffer A {A_TYPE data_a[];};
+layout (binding = 1) readonly buffer B {B_TYPE data_b[];};
+layout (binding = 2) readonly buffer C {A_TYPE data_c[];};
+layout (binding = 3) writeonly buffer D {D_TYPE data_d[];};
+
+const uint num_threads = 256;
+
+layout(local_size_x = num_threads, local_size_y = 1, local_size_z = 1) in;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.z * 262144 + gl_GlobalInvocationID.y * 512 + gl_GlobalInvocationID.x;
+
+    // num_threads * num_iter must equal 512, to match the wg_denoms and idx calculation
+    const uint num_iter = 2;
+
+    [[unroll]] for (uint i = 0; i < num_iter; ++i) {
+        if (idx >= p.ne) {
+            continue;
+        }
+        uint i00, i01, i02, i03;
+        get_indices(idx, i00, i01, i02, i03, p.ne00, p.ne01, p.ne02, p.ne03);
+
+        const uint a_off = i03*p.nb03 + i02*p.nb02 + i01*p.nb01 + i00*p.nb00;
+        const uint b_off = fastmod(i03, p.ne13)*p.nb13 + fastmod(i02, p.ne12)*p.nb12 + fastmod(i01, p.ne11)*p.nb11 + fastmod(i00, p.ne10)*p.nb10;
+        const uint c_off = fastmod(i03, p.ne23)*p.nb23 + fastmod(i02, p.ne22)*p.nb22 + fastmod(i01, p.ne21)*p.nb21 + fastmod(i00, p.ne20)*p.nb20;
+        const uint d_off = i03*p.nb33 + i02*p.nb32 + i01*p.nb31 + i00*p.nb30;
+
+        // precise -> SPIR-V NoContraction: two separately rounded fp32 ops, no FMA
+        precise FLOAT_TYPE prod = FLOAT_TYPE(data_a[a_off]) * FLOAT_TYPE(data_b[b_off]);
+#if OP2_ADD
+        precise FLOAT_TYPE res = prod + FLOAT_TYPE(data_c[c_off]);
+#else
+        precise FLOAT_TYPE res = prod * FLOAT_TYPE(data_c[c_off]);
+#endif
+        data_d[d_off] = D_TYPE(res);
+
+        idx += num_threads;
+    }
+}

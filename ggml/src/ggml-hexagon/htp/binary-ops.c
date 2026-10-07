@@ -723,6 +723,103 @@ static void binary_job_add_id(unsigned int nth, unsigned int ith, void * data) {
     dma_queue_flush(q);
 }
 
+// Macro for scalar op switch (All Unaligned - streaming rows straight from DDR)
+#define COMPUTE_SCALAR_OP_UU(DST, SRC, VAL, TYPE, N) \
+    if(TYPE == HTP_TYPE_F32) { \
+        switch (octx->op) { \
+            case HTP_OP_ADD: hvx_add_scalar_f32_uu(DST, SRC, *(float *)VAL, N); break; \
+            case HTP_OP_SUB: hvx_sub_scalar_f32_uu(DST, SRC, *(float *)VAL, N); break; \
+            case HTP_OP_MUL: hvx_mul_scalar_f32_uu(DST, SRC, *(float *)VAL, N); break; \
+            case HTP_OP_DIV: hvx_mul_scalar_f32_uu(DST, SRC, 1.0f / (*(float *)VAL), N); break; \
+            default: break; \
+        } \
+    } \
+    else { \
+        switch (octx->op) { \
+            case HTP_OP_ADD: hvx_add_scalar_f16_uu(DST, SRC, *(_Float16 *)VAL, N); break; \
+            case HTP_OP_SUB: hvx_sub_scalar_f16_uu(DST, SRC, *(_Float16 *)VAL, N); break; \
+            case HTP_OP_MUL: hvx_mul_scalar_f16_uu(DST, SRC, *(_Float16 *)VAL, N); break; \
+            case HTP_OP_DIV: hvx_div_scalar_f16_uu(DST, SRC, *(_Float16 *)VAL, N); break; \
+            default: break; \
+        } \
+    }
+
+static void binary_direct_repeat_row(const struct htp_ops_context * octx, uint8_t * dst, const uint8_t * src0,
+                                     const uint8_t * src1, uint32_t ne00, uint32_t ne10, uint32_t type, size_t elem_size) {
+    for (uint32_t off = 0; off < ne00; off += ne10) {
+        const uint32_t n = MIN(ne10, ne00 - off);
+        COMPUTE_VECTOR_OP_UUU(dst + off * elem_size, src0 + off * elem_size, src1, type, n);
+    }
+}
+
+static void binary_direct_row(const struct htp_ops_context * octx, uint8_t * dst, const uint8_t * src0,
+                              const uint8_t * src1, uint32_t ne00, uint32_t ne10, uint32_t type) {
+    const size_t elem_size = (type == HTP_TYPE_F32) ? sizeof(float) : sizeof(_Float16);
+    if (ne10 == 1) {
+        COMPUTE_SCALAR_OP_UU(dst, src0, src1, type, ne00);
+    } else if (ne10 == ne00) {
+        COMPUTE_VECTOR_OP_UUU(dst, src0, src1, type, ne00);
+    } else {
+        binary_direct_repeat_row(octx, dst, src0, src1, ne00, ne10, type, elem_size);
+    }
+}
+
+// Rows too long to double-buffer in VTCM stream through the L2 cache instead.
+static void binary_job_direct(unsigned int nth, unsigned int ith, void * data) {
+    struct htp_binary_context * bctx = (struct htp_binary_context *) data;
+    struct htp_ops_context * octx = bctx->octx;
+    htp_binary_preamble;
+
+    const uint32_t total_rows = ne01 * ne02 * ne03;
+    const uint32_t start_row  = bctx->nrows_per_thread * ith;
+    const uint32_t end_row    = MIN(start_row + bctx->nrows_per_thread, total_rows);
+
+    for (uint32_t ir = start_row; ir < end_row; ir++) {
+        const uint32_t i03 = fastdiv(ir, &bctx->src0_dim12_div);
+        const uint32_t rem = ir - i03 * (ne02 * ne01);
+        const uint32_t i02 = fastdiv(rem, &bctx->src0_dim1_div);
+        const uint32_t i01 = rem - i02 * ne01;
+
+        const uint32_t i13 = fastmodulo(i03, ne13, &bctx->src1_dim3_div);
+        const uint32_t i12 = fastmodulo(i02, ne12, &bctx->src1_dim2_div);
+        const uint32_t i11 = fastmodulo(i01, ne11, &bctx->src1_dim1_div);
+
+        binary_direct_row(octx, (uint8_t *) dst->data + i03 * nb3 + i02 * nb2 + i01 * nb1,
+                          (const uint8_t *) src0->data + i03 * nb03 + i02 * nb02 + i01 * nb01,
+                          (const uint8_t *) src1->data + i13 * nb13 + i12 * nb12 + i11 * nb11, ne00, ne10,
+                          src0->type);
+    }
+}
+
+static int execute_op_binary_direct(struct htp_ops_context * octx, uint32_t n_threads) {
+    const struct htp_tensor * src0 = octx->src[0];
+    const struct htp_tensor * src1 = octx->src[1];
+
+    const size_t elem_size = (src0->type == HTP_TYPE_F32) ? sizeof(float) : sizeof(_Float16);
+    if (octx->op == HTP_OP_ADD_ID || src0->nb[0] != elem_size || src1->nb[0] != elem_size ||
+        octx->dst->nb[0] != elem_size || src0->ne[0] % src1->ne[0] != 0) {
+        return HTP_STATUS_VTCM_TOO_SMALL;
+    }
+    if ((octx->flags & HTP_OPFLAGS_SKIP_COMPUTE)) {
+        return HTP_STATUS_OK;
+    }
+
+    const uint32_t src0_nrows = src0->ne[1] * src0->ne[2] * src0->ne[3];
+
+    struct htp_binary_context bctx;
+    bctx.octx             = octx;
+    bctx.nrows_per_thread = (src0_nrows + n_threads - 1) / n_threads;
+    bctx.src0_dim1_div    = init_fastdiv_values(src0->ne[1]);
+    bctx.src0_dim2_div    = init_fastdiv_values(src0->ne[2]);
+    bctx.src0_dim12_div   = init_fastdiv_values(src0->ne[1] * src0->ne[2]);
+    bctx.src1_dim1_div    = init_fastdiv_values(src1->ne[1]);
+    bctx.src1_dim2_div    = init_fastdiv_values(src1->ne[2]);
+    bctx.src1_dim3_div    = init_fastdiv_values(src1->ne[3]);
+
+    worker_pool_run_func(octx->ctx->worker_pool, binary_job_direct, &bctx, n_threads);
+    return HTP_STATUS_OK;
+}
+
 static int execute_op_binary(struct htp_ops_context * octx) {
     const struct htp_tensor * src0 = octx->src[0];
     const struct htp_tensor * src1 = octx->src[1];
@@ -747,15 +844,38 @@ static int execute_op_binary(struct htp_ops_context * octx) {
 
     bool is_transposed = (src0->nb[1] < src0_row_size || src1->nb[1] < src1_row_size || dst->nb[1] < dst_row_size);
 
-    bool is_same_shape = !is_add_id && !is_scalar && !is_transposed &&
-               (src1->ne[0] == src0->ne[0] && src0->ne[0] % VLEN == 0) &&
-               (src1->ne[1] == src0->ne[1] || src1->ne[1] == 1) &&
-               (src1->ne[2] == src0->ne[2] || src1->ne[2] == 1) &&
-               (src1->ne[3] == src0->ne[3] || src1->ne[3] == 1);
+    // `ne[0]` is an element count and VLEN is a byte width, so
+    // the historical `src0->ne[0] % VLEN == 0` check compared apples to oranges
+    // and only accidentally admitted shapes where `ne[0] * elem_size` happened
+    // to be a multiple of 128. Compute the alignment in bytes so all fast
+    // paths that gate on VLEN alignment see the same criterion.
+    bool bytes_aligned = ((size_t) src0->ne[0] * elem_size % VLEN == 0);
+    bool ne0_match     = (src1->ne[0] == src0->ne[0]);
 
-    bool is_row_bcast = is_same_shape && (src1->ne[1] == 1 && src1->ne[2] == 1 && src1->ne[3] == 1);
-    bool is_complex   = !is_add_id && !is_scalar && !is_same_shape && (src1->ne[0] == src0->ne[0]);
-    bool is_repeat    = !is_add_id && !is_scalar && !is_same_shape && (src1->ne[0] != src0->ne[0]);
+    // Single-row broadcast (src1 collapses to one row across the whole src0
+    // tensor) has its own specialised kernel that loads the row into VTCM
+    // once and reuses it, so keep that fast path.
+    bool is_row_bcast = !is_add_id && !is_scalar && !is_transposed &&
+               ne0_match && bytes_aligned &&
+               (src1->ne[1] == 1 && src1->ne[2] == 1 && src1->ne[3] == 1);
+
+    // Only route to `binary_job_vector_same_shape` when src1
+    // truly matches src0 on every non-innermost dim. That kernel DMAs
+    // src1 with height=current_block_size striding by nb11, which reads
+    // past the actual src1 buffer whenever src1 broadcasts on dim 1 (or 2
+    // or 3) — the out-of-bounds bytes come back as the FLT_MAX bit pattern
+    // and propagate through attention as `inf`. Any partial broadcast now
+    // routes to `binary_job_vector_complex`, which fetches each src1 row
+    // via its true broadcast-aware address (fastmodulo on ne1x) and does
+    // not overread.
+    bool is_same_shape = !is_add_id && !is_scalar && !is_transposed &&
+               ne0_match && bytes_aligned &&
+               (src1->ne[1] == src0->ne[1]) &&
+               (src1->ne[2] == src0->ne[2]) &&
+               (src1->ne[3] == src0->ne[3]);
+
+    bool is_complex   = !is_add_id && !is_scalar && !is_row_bcast && !is_same_shape && ne0_match;
+    bool is_repeat    = !is_add_id && !is_scalar && !is_row_bcast && !is_same_shape && !ne0_match;
 
     size_t spad_row_total;
     if (is_same_shape) {
@@ -769,14 +889,13 @@ static int execute_op_binary(struct htp_ops_context * octx) {
     // Adjust for static src1 in row_bcast case
     if (is_row_bcast) {
         size_t needed_static = src1_row_size_aligned;
-        if (octx->ctx->vtcm_size < needed_static) return HTP_STATUS_VTCM_TOO_SMALL;
+        if (octx->ctx->vtcm_size < needed_static) return execute_op_binary_direct(octx, n_threads);
         size_t avail = octx->ctx->vtcm_size - needed_static;
         rows_per_buffer = avail / (n_threads * spad_row_total);
     }
 
     if (rows_per_buffer < 1) {
-        FARF(ERROR, "binary: VTCM too small\n");
-        return HTP_STATUS_VTCM_TOO_SMALL;
+        return execute_op_binary_direct(octx, n_threads);
     }
 
     octx->src0_spad.size_per_thread = rows_per_buffer * 2 * src0_row_size_aligned;
