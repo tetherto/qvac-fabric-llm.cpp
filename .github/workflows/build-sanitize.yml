@@ -129,7 +129,14 @@ jobs:
         if: ${{ matrix.sanitizer != 'UNDEFINED' }}
         run: |
           cd build
-          ctest -L main -E tokenizer --verbose --timeout 900
+          # ThreadSanitizer aborts at start-up ("unexpected memory mapping") when the host
+          # randomizes the address space with the entropy newer kernels use, so the THREAD
+          # lane runs its tests with randomization disabled.
+          launcher=""
+          if [ "${{ matrix.sanitizer }}" = "THREAD" ]; then
+            launcher="setarch $(uname -m) -R"
+          fi
+          $launcher ctest -L main -E tokenizer --verbose --timeout 900
 
       - name: Test vector index (undefined)
         if: ${{ matrix.sanitizer == 'UNDEFINED' }}
