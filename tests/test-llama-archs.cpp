@@ -78,7 +78,7 @@ static void set_tensor_data(struct ggml_tensor * tensor, void * userdata) {
 }
 
 static void usage(char ** argv) {
-    printf("Usage: %s [-a/--arch arch] [-s/--seed seed] [-o/--out dir] [-v N] [-h/--help] [--mtp-shared|--mtp-shared-cpu|--hadamard-contracts|--qsa-unified-multiseq|--glm5-kpool-sequences|--glm5-multiseq|--glm5-multiseq-gpu|--glm5-invalid-metadata|--layer-inp-pos-min]\n", argv[0]);
+    printf("Usage: %s [-a/--arch arch] [-s/--seed seed] [-o/--out dir] [-v N] [-h/--help] [--mtp-shared|--mtp-shared-cpu|--hadamard-contracts|--qsa-unified-multiseq|--glm5-kpool-sequences|--glm5-multiseq|--glm5-multiseq-gpu|--glm5-tensor-oom|--glm5-invalid-metadata|--layer-inp-pos-min]\n", argv[0]);
 }
 
 static std::vector<llama_token> get_tokens(const uint32_t n_tokens, const uint32_t n_vocab, const size_t seed){
@@ -1828,6 +1828,44 @@ static int test_glm5_multiseq(bool gpu) {
     return ok ? 0 : 1;
 }
 
+// Mirrored f16 KV bytes per cell of the test model: 512 latent + 3*128 indexer values on its one DSA layer.
+static constexpr uint64_t GLM5_TENSOR_OOM_BYTES_PER_CELL = 2*(512 + 3*128);
+
+static int test_glm5_tensor_oom() {
+    const auto configs = glm5_multiseq_configs(true);
+    const auto meta = std::find_if(configs.begin(), configs.end(),
+            [](const glm5_multiseq_config & cfg) { return cfg.split_mode == LLAMA_SPLIT_MODE_TENSOR; });
+    if (meta == configs.end()) {
+        printf("GLM5 tensor split OOM test skipped: needs 2 or 4+ GPUs\n");
+        return 0;
+    }
+    size_t free_mem = 0;
+    size_t total_mem = 0;
+    ggml_backend_dev_memory(meta->devs[0], &free_mem, &total_mem);
+    const uint64_t n_ctx = std::min<uint64_t>(INT32_MAX, 2*total_mem/GLM5_TENSOR_OOM_BYTES_PER_CELL);
+
+    auto metadata = get_gguf_ctx(LLM_ARCH_GLM5_NEXT, true);
+    std::vector<ggml_backend_dev_t> devs = meta->devs;
+    devs.push_back(nullptr);
+    llama_model_params mparams = llama_model_default_params();
+    mparams.progress_callback = silent_model_load_progress;
+    mparams.devices = devs.data();
+    mparams.split_mode = LLAMA_SPLIT_MODE_TENSOR;
+    size_t seed = 1234;
+    llama_model_ptr model(llama_model_init_from_user(metadata.get(), set_tensor_data, &seed, mparams));
+    GGML_ASSERT(model);
+
+    llama_context_params cparams = llama_context_default_params();
+    cparams.n_ctx = (uint32_t) n_ctx;
+    llama_context_ptr ctx(llama_init_from_model(model.get(), cparams));
+    if (ctx) {
+        printf("FAIL: GLM5 tensor split created a context of %" PRIu64 " cells\n", n_ctx);
+        return 1;
+    }
+    printf("GLM5 tensor split reports an oversized KV cache without aborting\n");
+    return 0;
+}
+
 static int test_glm5_invalid_metadata() {
     struct invalid_case {
         const char * key;
@@ -1945,6 +1983,9 @@ int main(int argc, char ** argv) {
     }
     if (argc == 2 && (strcmp(argv[1], "--glm5-multiseq") == 0 || strcmp(argv[1], "--glm5-multiseq-gpu") == 0)) {
         return test_glm5_multiseq(strcmp(argv[1], "--glm5-multiseq-gpu") == 0);
+    }
+    if (argc == 2 && strcmp(argv[1], "--glm5-tensor-oom") == 0) {
+        return test_glm5_tensor_oom();
     }
     if (argc == 2 && strcmp(argv[1], "--glm5-invalid-metadata") == 0) {
         return test_glm5_invalid_metadata();

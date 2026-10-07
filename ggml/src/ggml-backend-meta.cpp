@@ -2006,8 +2006,17 @@ static ggml_backend_buffer_t ggml_backend_meta_buffer_type_alloc_buffer(ggml_bac
     std::vector<ggml_backend_buffer_t> bufs;
     bufs.reserve(n_simple_bufts);
     for (size_t i = 0; i < n_simple_bufts; i++) {
-        bufs.push_back(ggml_backend_buft_alloc_buffer(ggml_backend_meta_buft_simple_buft(buft, i), size));
-        GGML_ASSERT(bufs.back() != nullptr);
+        ggml_backend_buffer_type_t simple_buft = ggml_backend_meta_buft_simple_buft(buft, i);
+        bufs.push_back(ggml_backend_buft_alloc_buffer(simple_buft, size));
+        if (bufs.back() == nullptr) {
+            GGML_LOG_ERROR("%s: failed to allocate %zu bytes on %s for split %zu of %zu\n",
+                __func__, size, ggml_backend_buft_name(simple_buft), i, n_simple_bufts);
+            bufs.pop_back();
+            for (ggml_backend_buffer_t buf : bufs) {
+                ggml_backend_buffer_free(buf);
+            }
+            return nullptr;
+        }
         max_size = std::max(max_size, ggml_backend_buffer_get_size(bufs.back()));
     }
     ggml_backend_meta_buffer_context * buf_ctx = new ggml_backend_meta_buffer_context(stc_static, stc_compute_0, stc_compute_1, bufs);
@@ -2066,7 +2075,12 @@ struct ggml_backend_buffer * ggml_backend_meta_alloc_ctx_tensors_from_buft(struc
                 t->buffer = meta_buf_ctx->bufs[i].get();
             }
         }
-        GGML_ASSERT(meta_buf_ctx->bufs[i]);
+        if (!meta_buf_ctx->bufs[i]) {
+            GGML_LOG_ERROR("%s: failed to allocate tensors on %s for split %zu of %zu\n",
+                __func__, ggml_backend_buft_name(simple_buft), i, n_simple_bufts);
+            ggml_backend_buffer_free(meta_buf);
+            return nullptr;
+        }
         meta_buf->size = std::max(meta_buf->size, ggml_backend_buffer_get_size(meta_buf_ctx->bufs[i].get()));
     }
     return meta_buf;
