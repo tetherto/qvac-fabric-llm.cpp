@@ -1224,6 +1224,18 @@ struct llm_graph_context {
                   float   kq_scale,
                     int   il) const;
 
+    // build_attn_mha once per run of consecutive streams in the ubatch, the cache views cannot skip streams
+    // n_embd_v_k > 0: V is a view of the first n_embd_v_k values of K
+    ggml_tensor * build_attn_mha_runs(
+            const llama_kv_cache_context * mctx_cur,
+            ggml_tensor * q,
+            ggml_tensor * kq_mask,
+            ggml_tensor * sinks,
+            ggml_tensor * v_mla,
+                int64_t   n_embd_v_k,
+                  float   kq_scale,
+                    int   il) const;
+
     llm_graph_input_attn_no_cache * build_attn_inp_no_cache() const;
 
     ggml_tensor * build_attn(
