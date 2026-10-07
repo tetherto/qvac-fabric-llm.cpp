@@ -500,6 +500,26 @@ static bool gemm_compute_i8(xdna_ops * ops, struct ggml_tensor * node) {
     int           pend    = -1;
     int           pend_mb = 0;
 
+    // Both banks go back on every exit. A bank that still holds a buffer with a submitted run is waited
+    // first: from the pool the buffer can go to the next call while the array is still writing it.
+    struct banks_release {
+        xdna_ops *    ops;
+        xdna_buffer **a;
+        xdna_buffer **c;
+        xrt::run *    runs;
+        ~banks_release() {
+            for (int i = 0; i < 2; i++) {
+                if (runs[i] && a[i]) {
+                    xdna_run_wait(runs[i]);
+                }
+                xdna_kernel_pool_release_buffer(ops->pool, a[i]);
+                xdna_kernel_pool_release_buffer(ops->pool, c[i]);
+                a[i] = nullptr;
+                c[i] = nullptr;
+            }
+        }
+    } release_banks = { ops, bo_a, bo_c, runs };
+
     for (int k0 = 0; k0 < K; k0 += GEMM_K_MAX) {
         const int      Kb       = std::min(GEMM_K_MAX, K - k0);
         const uint32_t b_offset = (uint32_t) k0 * N;  // int8 bytes into B
@@ -658,6 +678,25 @@ static bool gemm_compute(xdna_ops * ops, struct ggml_tensor * node) {
     xdna_ops::pending_run banks[2];
     int                   bank         = 0;
     int                   pending_bank = -1;  // bank with a submitted, un-waited run
+
+    // Every exit hands the banks back; the success path moves the trailing one into ops->pending instead.
+    // A bank that still holds a buffer with a submitted run is waited first: from the pool the buffer can
+    // go to the next call while the array is still writing it.
+    struct banks_release {
+        xdna_ops *              ops;
+        xdna_ops::pending_run * banks;
+        ~banks_release() {
+            for (int i = 0; i < 2; i++) {
+                if (banks[i].run && banks[i].bo_a) {
+                    xdna_run_wait(banks[i].run);
+                }
+                xdna_kernel_pool_release_buffer(ops->pool, banks[i].bo_a);
+                xdna_kernel_pool_release_buffer(ops->pool, banks[i].bo_c);
+                banks[i].bo_a = nullptr;
+                banks[i].bo_c = nullptr;
+            }
+        }
+    } release_banks = { ops, banks };
 
     for (int k0 = 0; k0 < K; k0 += GEMM_K_MAX) {
         const int      Kb       = std::min(GEMM_K_MAX, K - k0);
