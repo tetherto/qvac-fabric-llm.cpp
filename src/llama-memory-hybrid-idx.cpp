@@ -631,10 +631,11 @@ struct llama_memory_hybrid_idx_context::kpool_state {
 
     std::vector<seq> seqs;
     std::vector<uint32_t> token_seq; // Layout used by each token; shared tokens use a merged layout.
-    std::vector<uint32_t> grp_seq;   // Layout scored by each ubatch sequence group.
+    std::vector<uint32_t> token_off; // Start of each token's layout in its group's pool block.
+    std::vector<std::vector<std::pair<uint32_t, uint32_t>>> grp_pools; // Layout and pool of each slot of a group's pool block.
 
     uint32_t n_pool_real = 0; // Pools over all collected layouts.
-    uint32_t n_pool_grp  = 0; // Pools of the largest scored layout.
+    uint32_t n_pool_grp  = 0; // Pools of the largest group block.
     uint32_t n_new       = 0;
     bool cache_safe      = true;
 };
@@ -662,9 +663,9 @@ llama_memory_hybrid_idx_context::llama_memory_hybrid_idx_context(llama_memory_hy
         new llama_kv_cache_context(mem->get_mem_idx())) {
     if (kpool_track()) {
         kpool_st = std::make_unique<kpool_state>(kpool_build_layout(nullptr));
-        // Shared sequences cannot reuse cached pools and need an extra temporary
-        // for the uncached path, so reserve that worst-case topology.
-        kpool_st->cache_safe = false;
+        // Reserve the cached topology that distinct sequences run, so their graphs fit the reserved plan.
+        // The uncached path of shared sequences is planned when it first runs.
+        kpool_st->cache_safe = true;
         i_kpool  = 0;
         kpool_reserve = true;
         mem_idx_stale_batch = mem->mem_idx_is_stale();
@@ -783,30 +784,7 @@ llama_memory_hybrid_idx_context::kpool_state llama_memory_hybrid_idx_context::kp
     }
 
     if (n_stream_kv == 1) {
-        const auto & cells = kv->get_cells(0);
-
-        std::vector<llama_seq_id> active;
-        for (const llama_seq_id s : wanted) {
-            if (cells.seq_pos_min(s) >= 0) {
-                active.push_back(s);
-            }
-        }
-
-        for (uint32_t i = 0; i < cells.used_max_p1(); ++i) {
-            if (cells.is_empty(i)) {
-                continue;
-            }
-            // A cell shared with any sequence, collected or not, makes cached pools ambiguous.
-            if (cells.seq_count(i) > 1) {
-                st.cache_safe = false;
-            }
-            const llama_pos p = cells.pos_get(i);
-            for (const llama_seq_id s : active) {
-                if (cells.seq_has(i, s)) {
-                    st.seqs[s].cells.emplace_back(p, i);
-                }
-            }
-        }
+        kpool_collect_unified_cells(st, wanted);
     } else {
         // Sequence IDs need not be stream indices. Resolve every valid ID through the cache mapping.
         for (const llama_seq_id s : wanted) {
@@ -847,6 +825,36 @@ llama_memory_hybrid_idx_context::kpool_state llama_memory_hybrid_idx_context::kp
     }
 
     return st;
+}
+
+// Collects the cells of the wanted sequences of a unified cache.
+// A collected cell that another sequence shares makes cached pools ambiguous, so it disables the pool cache.
+void llama_memory_hybrid_idx_context::kpool_collect_unified_cells(kpool_state & st, const std::vector<llama_seq_id> & wanted) const {
+    const auto & cells = mem->get_mem_idx()->get_cells(0);
+
+    std::vector<llama_seq_id> active;
+    for (const llama_seq_id s : wanted) {
+        if (cells.seq_pos_min(s) >= 0) {
+            active.push_back(s);
+        }
+    }
+
+    for (uint32_t i = 0; i < cells.used_max_p1(); ++i) {
+        if (cells.is_empty(i)) {
+            continue;
+        }
+        const llama_pos p = cells.pos_get(i);
+        bool collected = false;
+        for (const llama_seq_id s : active) {
+            if (cells.seq_has(i, s)) {
+                st.seqs[s].cells.emplace_back(p, i);
+                collected = true;
+            }
+        }
+        if (collected && cells.seq_count(i) > 1) {
+            st.cache_safe = false;
+        }
+    }
 }
 
 // Layout of the cells as of this ubatch plus which pools it completes or rewrites.
@@ -918,8 +926,8 @@ llama_memory_hybrid_idx_context::kpool_state llama_memory_hybrid_idx_context::kp
 
     kpool_set_groups(st, ubatch);
     if (!st.cache_safe) {
-        // The uncached path pools the scored layouts in place, one slot per padded pool of every group.
-        st.n_new = kpool_pad(st.n_pool_grp)*ubatch.n_seqs;
+        // The uncached path pools the scored block in place, one slot per padded pool.
+        st.n_new = kpool_pad(st.n_pool_grp)*(uint32_t) st.grp_pools.size();
         return st;
     }
 
@@ -969,20 +977,55 @@ llama_memory_hybrid_idx_context::kpool_state llama_memory_hybrid_idx_context::kp
     return st;
 }
 
-// Every token of a split_equal group shares its sequence set, so the group scores one layout.
-void llama_memory_hybrid_idx_context::kpool_set_groups(kpool_state & st, const llama_ubatch & ubatch) {
+// Every token of a cached split_equal group shares its sequence set, so the group scores one layout.
+// The uncached path, and padded groups that hold more pools than the reserve, score the ubatch as one group:
+// its block holds the layouts of its tokens in order, and each token reads only its own layout.
+void llama_memory_hybrid_idx_context::kpool_set_groups(kpool_state & st, const llama_ubatch & ubatch) const {
     GGML_ASSERT(ubatch.n_seqs > 0 && ubatch.n_tokens == ubatch.n_seqs*ubatch.n_seq_tokens);
 
-    st.grp_seq.resize(ubatch.n_seqs);
-    st.n_pool_grp = 0;
-    for (uint32_t g = 0; g < ubatch.n_seqs; ++g) {
-        const uint32_t layout = st.token_seq[g*ubatch.n_seq_tokens];
-        for (uint32_t t = 1; t < ubatch.n_seq_tokens; ++t) {
-            GGML_ASSERT(st.token_seq[g*ubatch.n_seq_tokens + t] == layout);
+    const uint32_t n_grp = st.cache_safe && kpool_seq_groups_fit(st, ubatch) ? ubatch.n_seqs : 1;
+    const uint32_t n_grp_tokens = ubatch.n_tokens/n_grp;
+    // Pool indices are stream-local on the scatter path, so a block of several layouts is limited to one stream.
+    GGML_ASSERT(n_grp == ubatch.n_seqs || mem->get_mem_idx()->get_n_stream() == 1);
+
+    // Appends the pools of each layout that first appears in tokens [t0, t0 + n_grp_tokens) to block g.
+    auto add_layouts = [&](uint32_t g, uint32_t t0) {
+        std::map<uint32_t, uint32_t> layout_off;
+        auto & block = st.grp_pools[g];
+        for (uint32_t t = t0; t < t0 + n_grp_tokens; ++t) {
+            const uint32_t layout = st.token_seq[t];
+            const auto [it, added] = layout_off.emplace(layout, (uint32_t) block.size());
+            st.token_off[t] = it->second;
+            for (uint32_t ip = 0; added && ip < st.seqs[layout].pools.size(); ++ip) {
+                block.emplace_back(layout, ip);
+            }
         }
-        st.grp_seq[g] = layout;
-        st.n_pool_grp = std::max(st.n_pool_grp, (uint32_t) st.seqs[layout].pools.size());
+        // A cached split_equal group holds one sequence, so its block is the layout the fit check measured.
+        GGML_ASSERT(n_grp == 1 || layout_off.size() == 1);
+    };
+
+    st.grp_pools.assign(n_grp, {});
+    st.token_off.assign(ubatch.n_tokens, 0);
+    st.n_pool_grp = 0;
+    for (uint32_t g = 0; g < n_grp; ++g) {
+        add_layouts(g, g*n_grp_tokens);
+        st.n_pool_grp = std::max(st.n_pool_grp, (uint32_t) st.grp_pools[g].size());
     }
+}
+
+// Per-sequence groups fit when their padded blocks hold no more pools than the reserved groups.
+bool llama_memory_hybrid_idx_context::kpool_seq_groups_fit(const kpool_state & st, const llama_ubatch & ubatch) const {
+    uint32_t largest = 0;
+    for (uint32_t g = 0; g < ubatch.n_seqs; ++g) {
+        largest = std::max(largest, (uint32_t) st.seqs[st.token_seq[g*ubatch.n_seq_tokens]].pools.size());
+    }
+    return (uint64_t) ubatch.n_seqs*kpool_pad(largest) <= kpool_reserved_pools();
+}
+
+// The reserve scores one group per stream, each with the complete pools of a full stream.
+uint64_t llama_memory_hybrid_idx_context::kpool_reserved_pools() const {
+    const auto * kv = mem->get_mem_idx();
+    return (uint64_t) kv->get_n_stream()*kpool_pad(kv->get_size()/mem->get_kpool());
 }
 
 const llama_memory_hybrid_idx_context::kpool_state & llama_memory_hybrid_idx_context::kpool_cur() const {
@@ -991,28 +1034,36 @@ const llama_memory_hybrid_idx_context::kpool_state & llama_memory_hybrid_idx_con
     return *kpool_st;
 }
 
-uint32_t llama_memory_hybrid_idx_context::get_n_kpool(const llama_ubatch & ubatch) const {
+uint32_t llama_memory_hybrid_idx_context::get_n_kpool() const {
     uint64_t n_pool = kpool_cur().n_pool_grp;
     if (kpool_reserve) {
-        // The full context is built before the batch has cache slots. Reserve the
-        // pools that each group of the synthetic worst-case batch will complete.
-        const uint32_t kpool = mem->get_kpool();
-        n_pool += (ubatch.n_seq_tokens + kpool - 1)/kpool;
+        // A group holds at most the complete pools of one full stream.
+        n_pool = std::max<uint64_t>(n_pool, mem->get_mem_idx()->get_size()/mem->get_kpool());
     }
     GGML_ASSERT(n_pool <= UINT32_MAX);
     return kpool_pad((uint32_t) n_pool);
 }
 
+uint32_t llama_memory_hybrid_idx_context::get_n_kpool_groups(const llama_ubatch & ubatch) const {
+    const auto & st = kpool_cur();
+    if (kpool_reserve) {
+        // A unified cache reserves one group with the pools of the whole context.
+        return std::min(ubatch.n_seqs, mem->get_mem_idx()->get_n_stream());
+    }
+    return (uint32_t) st.grp_pools.size();
+}
+
 uint32_t llama_memory_hybrid_idx_context::get_n_kpool_new(const llama_ubatch & ubatch) const {
     const auto & st = kpool_cur();
     if (!st.cache_safe) {
-        return get_n_kpool(ubatch)*ubatch.n_seqs;
+        return get_n_kpool()*(uint32_t) st.grp_pools.size();
     }
     uint64_t n_new = st.n_new;
     if (kpool_reserve) {
-        // A sequence may start one token short of completing a pool.
-        const uint32_t kpool = mem->get_kpool();
-        n_new = (uint64_t) ubatch.n_seqs*((ubatch.n_seq_tokens + kpool - 1)/kpool);
+        // A sequence may start one token short of completing a pool, so any split of the ubatch tokens
+        // over at most its sequences completes at most this many pools.
+        const uint64_t kpool = mem->get_kpool();
+        n_new = std::min<uint64_t>(ubatch.n_tokens, (ubatch.n_tokens + ubatch.n_seqs*(kpool - 1))/kpool);
         if (mem_idx_stale_batch) {
             n_new += st.n_pool_real;
         }
@@ -1040,13 +1091,13 @@ void llama_memory_hybrid_idx_context::set_input_kpool(ggml_tensor * pool_cells, 
     const auto & st = kpool_cur();
 
     const uint32_t n_tokens     = ubatch->n_tokens;
-    const uint32_t n_grp        = ubatch->n_seqs;
-    const uint32_t n_grp_tokens = ubatch->n_seq_tokens;
+    const uint32_t n_grp        = (uint32_t) st.grp_pools.size();
+    const uint32_t n_grp_tokens = n_tokens/n_grp;
     const uint32_t n_pool       = (uint32_t) pool_cells->ne[0]; // per group
     const uint32_t n_new        = st.n_new;
     const uint32_t n_alloc      = std::max(1u, n_new);
 
-    GGML_ASSERT(st.grp_seq.size() == n_grp);
+    GGML_ASSERT(n_grp*n_grp_tokens == n_tokens);
     GGML_ASSERT(n_pool == kpool_pad(st.n_pool_grp) && pool_cells->ne[1] == (int64_t) n_grp);
     GGML_ASSERT(pool_mask->ne[0] == (int64_t) n_pool && pool_mask->ne[1] == (int64_t) n_grp_tokens && pool_mask->ne[3] == (int64_t) n_grp);
     GGML_ASSERT(tail_idxs->ne[0] == (int64_t) kpool - 1 && tail_idxs->ne[1] == (int64_t) n_tokens);
@@ -1101,20 +1152,31 @@ void llama_memory_hybrid_idx_context::set_input_kpool(ggml_tensor * pool_cells, 
     int32_t * nidx  = (int32_t *) new_pool_idxs->data;
     int64_t * nrep  = new_pool_rep != nullptr ? (int64_t *) new_pool_rep->data : nullptr;
 
-    // Each group scores its own layout in a block of n_pool pools, padded pools point at the sentinel.
+    // Each group scores its pool block in n_pool slots, padded slots point at the sentinel.
     // The uncached path pools exactly these blocks, so its new pools are the same slots.
     for (uint32_t g = 0; g < n_grp; ++g) {
-        const auto & sq = st.seqs[st.grp_seq[g]];
+        const auto & block = st.grp_pools[g];
         for (uint32_t ip = 0; ip < n_pool; ++ip) {
             const size_t slot = (size_t) g*n_pool + ip;
-            const bool real = ip < sq.pools.size();
+            if (ip >= block.size()) {
+                pcell[slot] = (int32_t) dummy_cell;
+                for (uint32_t k = 0; k < kpool; ++k) {
+                    pidx[slot*kpool + k] = sentinel;
+                    if (!st.cache_safe) {
+                        nidx[slot*kpool + k] = (int32_t) dummy_cell;
+                    }
+                }
+                continue;
+            }
+            const auto & sq = st.seqs[block[ip].first];
+            const uint32_t j = sq.pools[block[ip].second];
             // The pooled key lives in the last member's row.
-            pcell[slot] = real ? (int32_t) gcell(sq, sq.cells[sq.pools[ip] + kpool - 1].second) : (int32_t) dummy_cell;
+            pcell[slot] = (int32_t) gcell(sq, sq.cells[j + kpool - 1].second);
             for (uint32_t k = 0; k < kpool; ++k) {
-                const uint32_t cell = real ? sq.cells[sq.pools[ip] + k].second : 0;
-                pidx[slot*kpool + k] = !real ? sentinel : (int32_t) (gather ? gcell(sq, cell) : (int64_t) cell);
+                const uint32_t cell = sq.cells[j + k].second;
+                pidx[slot*kpool + k] = (int32_t) (gather ? gcell(sq, cell) : (int64_t) cell);
                 if (!st.cache_safe) {
-                    nidx[slot*kpool + k] = real ? (int32_t) gcell(sq, cell) : (int32_t) dummy_cell;
+                    nidx[slot*kpool + k] = (int32_t) gcell(sq, cell);
                 }
             }
         }
@@ -1146,30 +1208,33 @@ void llama_memory_hybrid_idx_context::set_input_kpool(ggml_tensor * pool_cells, 
         }
     }
 
-    // End position of each scored pool per group, the visible pools of a token are those ending at or before it.
+    // End position of each slot of a group block, the visible pools of a token are those ending at or before it.
     std::vector<std::vector<llama_pos>> pool_end(n_grp);
     for (uint32_t g = 0; g < n_grp; ++g) {
-        const auto & sq = st.seqs[st.grp_seq[g]];
-        pool_end[g].reserve(sq.pools.size());
-        for (const uint32_t j : sq.pools) {
-            pool_end[g].push_back(sq.cells[j + kpool - 1].first);
+        pool_end[g].reserve(st.grp_pools[g].size());
+        for (const auto & [layout, ip] : st.grp_pools[g]) {
+            const auto & sq = st.seqs[layout];
+            pool_end[g].push_back(sq.cells[sq.pools[ip] + kpool - 1].first);
         }
     }
 
-    // A shared token selects from its deduplicated union layout.
+    // A token keeps the visible pools of its own layout, a shared token selects from its deduplicated union layout.
     auto fill_mask = [&](auto * data) {
         using T = std::remove_pointer_t<decltype(data)>;
         const T keep = llama_cast<T>(0.0f);
         const T drop = llama_cast<T>(-INFINITY);
 
         for (uint32_t i = 0; i < n_tokens; ++i) {
-            const auto &    ends = pool_end[i / n_grp_tokens];
+            const uint32_t  off  = st.token_off[i];
+            const auto      ends = pool_end[i / n_grp_tokens].begin() + off;
             const llama_pos p    = ubatch->pos[i];
 
             T * row = data + (size_t) i*n_pool;
-            const uint32_t nv = (uint32_t) (std::upper_bound(ends.begin(), ends.end(), p) - ends.begin());
-            std::fill(row,      row + nv,     keep);
-            std::fill(row + nv, row + n_pool, drop);
+            const size_t n_own = st.seqs[st.token_seq[i]].pools.size();
+            const uint32_t nv = (uint32_t) (std::upper_bound(ends, ends + n_own, p) - ends);
+            std::fill(row,            row + off,      drop);
+            std::fill(row + off,      row + off + nv, keep);
+            std::fill(row + off + nv, row + n_pool,   drop);
 
             // Finite visible pools occupy the first min(nv, n_top) ranked slots.
             if (gm != nullptr) {

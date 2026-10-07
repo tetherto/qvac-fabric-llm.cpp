@@ -6,6 +6,9 @@
 // GLM5-Next (GLM-5.3-Flash): hybrid KDA (linear) + nope MLA with a k-pool DSA indexer,
 // mHC residual streams, DeepSeek-style MoE.
 
+// Largest ubatch that attends over gathered latents instead of the dense selection mask.
+static constexpr uint32_t GLM5_NEXT_GATHER_MAX_TOKENS = 16;
+
 void llama_model_glm5_next::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_NEXTN_PREDICT_LAYERS,       hparams.n_layer_nextn, false);
     if (hparams.n_layer_nextn >= hparams.n_layer_all) {
@@ -61,6 +64,7 @@ void llama_model_glm5_next::load_arch_hparams(llama_model_loader & ml) {
                 ml.llm_kv(LLM_KV_ATTENTION_INDEXER_KPOOL).c_str(),
                 hparams.indexer_kpool, hparams.indexer_top_k));
     }
+    hparams.indexer_gather_max_tokens = GLM5_NEXT_GATHER_MAX_TOKENS;
     std::fill(hparams.is_indexer_full_impl.begin(), hparams.is_indexer_full_impl.end(), 1);
     ml.get_key_or_arr(LLM_KV_ATTENTION_INDEXER_TYPES, hparams.is_indexer_full_impl, hparams.n_layer(), false);
 
@@ -272,9 +276,10 @@ public:
         bool res = true;
 
         res &= k_idxs->ne[0]     == params.ubatch.n_tokens;
-        res &= pool_cells->ne[0] == mctx->get_n_kpool(params.ubatch);
-        res &= pool_cells->ne[1] == params.ubatch.n_seqs;
-        res &= pool_mask->ne[1]  == params.ubatch.n_seq_tokens;
+        const uint32_t n_grp = mctx->get_n_kpool_groups(params.ubatch);
+        res &= pool_cells->ne[0] == mctx->get_n_kpool();
+        res &= pool_cells->ne[1] == n_grp;
+        res &= pool_mask->ne[1]  == params.ubatch.n_tokens/n_grp;
         res &= tail_idxs->ne[1]  == params.ubatch.n_tokens;
         // The scatter mask shape follows n_kv.
         res &= n_kv              == idx->get_n_kv();
@@ -286,9 +291,9 @@ public:
     }
 
     ggml_tensor * k_idxs        = nullptr; // I64     [n_tokens]
-    ggml_tensor * pool_cells    = nullptr; // I32     [n_pool, n_seqs]          cell caching each pool's pooled key, per sequence group
-    ggml_tensor * pool_idxs     = nullptr; // I32     [kpool, n_pool, n_seqs]   member cells per pool, n_kv sentinel for the padded pools
-    ggml_tensor * pool_mask     = nullptr; // F32/F16 [n_pool, n_seq_tokens, 1, n_seqs]
+    ggml_tensor * pool_cells    = nullptr; // I32     [n_pool, n_grp]          cell caching each pool's pooled key, per scored group
+    ggml_tensor * pool_idxs     = nullptr; // I32     [kpool, n_pool, n_grp]   member cells per pool, n_kv sentinel for the padded pools
+    ggml_tensor * pool_mask     = nullptr; // F32/F16 [n_pool, n_tokens/n_grp, 1, n_grp]
     ggml_tensor * tail_idxs     = nullptr; // I32     [kpool - 1, n_tokens]
     ggml_tensor * gather_mask   = nullptr; // F32     [n_sel, 1, 1, n_tokens]
     ggml_tensor * new_pool_idxs = nullptr; // I32     [kpool, n_new]   completed pools or one dummy pool
@@ -308,7 +313,8 @@ llama_model_glm5_next::llm_graph_input_kpool * llama_model_glm5_next::graph::bui
     GGML_ASSERT(mctx_idx != nullptr);
 
     const uint32_t kpool  = hparams.indexer_kpool;
-    const uint32_t n_pool = mctx_hyb->get_n_kpool(ubatch);
+    const uint32_t n_pool = mctx_hyb->get_n_kpool();
+    const uint32_t n_grp  = mctx_hyb->get_n_kpool_groups(ubatch);
     const uint32_t n_kv   = mctx_idx->get_n_kv();
     const uint32_t n_new  = mctx_hyb->get_n_kpool_new(ubatch);
     const bool cache_safe = mctx_hyb->get_kpool_cache_safe();
@@ -319,9 +325,9 @@ llama_model_glm5_next::llm_graph_input_kpool * llama_model_glm5_next::graph::bui
     auto inp = std::make_unique<llm_graph_input_kpool>(mctx_hyb, kpool);
 
     inp->k_idxs     = mctx_idx->build_input_k_idxs(ctx0, ubatch);
-    inp->pool_cells = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, n_pool, ubatch.n_seqs);
-    inp->pool_idxs  = ggml_new_tensor_3d(ctx0, GGML_TYPE_I32, kpool, n_pool, ubatch.n_seqs);
-    inp->pool_mask  = ggml_new_tensor_4d(ctx0, type_mask, n_pool, ubatch.n_seq_tokens, 1, ubatch.n_seqs);
+    inp->pool_cells = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, n_pool, n_grp);
+    inp->pool_idxs  = ggml_new_tensor_3d(ctx0, GGML_TYPE_I32, kpool, n_pool, n_grp);
+    inp->pool_mask  = ggml_new_tensor_4d(ctx0, type_mask, n_pool, n_tokens/n_grp, 1, n_grp);
     inp->tail_idxs  = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, kpool - 1, n_tokens);
     ggml_set_input(inp->pool_cells);
     ggml_set_input(inp->pool_idxs);
@@ -335,9 +341,9 @@ llama_model_glm5_next::llm_graph_input_kpool * llama_model_glm5_next::graph::bui
 
     inp->n_kv = n_kv;
 
-    // Gather for small decode batches unless every DSA layer can use CUDA sparse FA.
+    // Gather for small decode batches unless every DSA layer can use CUDA sparse FA, or when a reserve asks for it.
     {
-        constexpr int64_t max_ub = 16;
+        const int64_t max_ub = hparams.indexer_gather_max_tokens;
 
         const int64_t n_top_pool = std::min<int64_t>(n_pool, hparams.indexer_top_k / kpool);
         const int64_t n_sel      = kpool*n_top_pool + (hparams.indexer_kpool_select_tail ? kpool - 1 : 0);
@@ -361,7 +367,8 @@ llama_model_glm5_next::llm_graph_input_kpool * llama_model_glm5_next::graph::bui
                 }
             }
         }
-        inp->gather = !use_cuda_sparse_fa && (int64_t) n_tokens <= max_ub && (int64_t) n_kv > n_sel;
+        const bool gather_ubatch = cparams.reserve_indexer_gather || (!use_cuda_sparse_fa && (int64_t) n_tokens <= max_ub);
+        inp->gather = gather_ubatch && (int64_t) n_kv > n_sel;
 
         if (inp->gather) {
             inp->gather_mask = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, n_sel, 1, 1, n_tokens);
@@ -583,7 +590,7 @@ ggml_tensor * llama_model_glm5_next::graph::build_kda_layer(
 
     ggml_build_forward_expand(gf,
         ggml_cpy(ctx0, new_state,
-            ggml_view_1d(ctx0, ssm_states_all, hparams.n_embd_s() * n_seqs,
+            ggml_view_2d(ctx0, ssm_states_all, hparams.n_embd_s(), n_seqs, ssm_states_all->nb[1],
                          kv_head * hparams.n_embd_s() * ggml_element_size(ssm_states_all))));
 
     // output gate, then RMSNorm(o) * Sigmoid(g2)
@@ -621,7 +628,7 @@ ggml_tensor * llama_model_glm5_next::graph::build_kpool_select(
     const int64_t n_new          = inp_kpool->n_new;
     GGML_ASSERT(n_grp*n_grp_tokens == n_tokens);
 
-    // Each sequence group scores only its own pools.
+    // Each group scores only its own pool block.
     ggml_tensor * iq = ggml_mul_mat(ctx0, layer.indexer_attn_q_b, qr);
     iq = ggml_reshape_4d(ctx0, iq, n_embd_indexer, n_indexer_head, n_grp_tokens, n_grp);
     cb(iq, "indexer_q", il);

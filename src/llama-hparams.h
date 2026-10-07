@@ -284,6 +284,7 @@ struct llama_hparams {
     uint32_t indexer_top_k     = 0;
     uint32_t indexer_kpool     = 0; // k-pool size
     bool     indexer_kpool_select_tail = true;
+    uint32_t indexer_gather_max_tokens = 0; // ubatches of at most this many tokens can attend over gathered rows, 0 = none
     bool     indexer_index_share_mtp   = false; // MTP iterations reuse one indexer selection
     // MSA
     uint32_t indexer_block_size  = 0;
