@@ -2404,6 +2404,29 @@ static void xdna_concat_tail_fill(struct ggml_tensor * n,
     }
 }
 
+// With flash attention off llama builds attention from MUL_MAT and SOFT_MAX,
+// and every attention route here - the decode pool, the attention layer, the
+// prefill attention - takes FLASH_ATTN_EXT: the attention then runs on the
+// host, the decode at about half the speed (50 against 29 t/s on the 0.8B)
+// with ten times the host work. Nothing fails, so say it, once. Graph
+// computes take the context's lock, so the flag needs none of its own.
+static void xdna_warn_host_attention(const struct ggml_cgraph * cgraph) {
+    static bool said = false;
+    if (said) {
+        return;
+    }
+    for (int i = 0; i < cgraph->n_nodes; i++) {
+        const struct ggml_tensor * n = cgraph->nodes[i];
+        if (n->op == GGML_OP_SOFT_MAX && strncmp(n->name, "kq_soft_max", 11) == 0) {
+            GGML_LOG_WARN("%s: flash attention is off, so attention runs on the host; "
+                          "the NPU takes it with flash attention on (-fa on or auto)\n",
+                          "ggml-xdna");
+            said = true;
+            return;
+        }
+    }
+}
+
 static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
     ggml_backend_xdna_context * ctx = (ggml_backend_xdna_context *) backend->context;
     std::lock_guard<std::mutex>  compute(ctx->compute_mutex);
@@ -2411,6 +2434,8 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
     if (!ctx->device) {
         return GGML_STATUS_SUCCESS;
     }
+
+    xdna_warn_host_attention(cgraph);
 
     // Size the host-fallback pool for this chunk (xdna_glue_threads).
     xdna_glue_set_n_tokens(cgraph);
