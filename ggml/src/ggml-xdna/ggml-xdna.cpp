@@ -3000,6 +3000,18 @@ static void xdna_warn_host_attention(const struct ggml_cgraph * cgraph) {
     }
 }
 
+static ggml_backend_buffer_type_t ggml_backend_xdna_device_get_buffer_type(ggml_backend_dev_t dev);
+
+// A weight in the buffers this device gives its layers: a layer llama offloaded
+// here. With a partial offload the others stay in the CPU's buffers, and their
+// nodes can still land in this graph while some of their readers are in the
+// CPU's, out of this graph's sight. A fusion that leaves a node unwritten (the
+// norm into A) is only safe on the offloaded layers.
+static bool xdna_weight_here(const struct ggml_tensor * w) {
+    return w && w->buffer &&
+           ggml_backend_buffer_get_type(w->buffer) == ggml_backend_xdna_device_get_buffer_type(nullptr);
+}
+
 static enum ggml_status xdna_graph_compute_impl(ggml_backend_xdna_context * ctx, struct ggml_cgraph * cgraph) {
     if (!ctx->device) {
         return GGML_STATUS_SUCCESS;
@@ -3525,17 +3537,22 @@ static enum ggml_status xdna_graph_compute_impl(ggml_backend_xdna_context * ctx,
                 readers[r].size() != 1) {
                 continue;
             }
+            // The norm's output is left unwritten, so its every reader has to
+            // be one of these GEMMs - on an offloaded layer, where they all are
+            // in this graph.
             const auto & rd = readers[m];
-            bool         ok = !rd.empty();
+            bool         ok = !rd.empty() && xdna_weight_here(m->src[1]);
             for (const struct ggml_tensor * t : rd) {
-                ok = ok && t->op == GGML_OP_MUL_MAT && t->src[1] == m && t->src[0] != m && xdna_pgemm_supported(t);
+                ok = ok && t->op == GGML_OP_MUL_MAT && t->src[1] == m && t->src[0] != m && xdna_pgemm_supported(t) &&
+                     xdna_weight_here(t->src[0]);
             }
             if (ok) {
                 norm_a.insert(m);
                 consumed.insert(r);
                 // the residual sum the norm reads, in the same pass
                 struct ggml_tensor * ad    = r->src[0];
-                bool                 ad_ok = xdna_pgemm_add_supported(ad, m) && !consumed.count(ad);
+                // and computed again from its inputs, so this graph's node too
+                bool ad_ok = node_at.count(ad) && xdna_pgemm_add_supported(ad, m) && !consumed.count(ad);
                 // the sum is written at this MUL and not where the ADD sits: a
                 // reader that runs earlier would see the ADD's buffer unwritten
                 for (const struct ggml_tensor * t : readers[ad]) {
