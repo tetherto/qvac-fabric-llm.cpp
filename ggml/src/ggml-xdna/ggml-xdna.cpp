@@ -3274,6 +3274,12 @@ static enum ggml_status xdna_graph_compute_impl(ggml_backend_xdna_context * ctx,
                 }
             }
         }
+        // The fused call computes gate and up again from their weights and
+        // input, so both have to be nodes of this graph. A graph that starts at
+        // the GLU gets them as inputs another backend computed: their input is
+        // not this graph's and its memory is free for the allocator, and their
+        // weights are in that backend's layout (CPU_REPACK).
+        std::unordered_set<const struct ggml_tensor *> in_graph(cgraph->nodes, cgraph->nodes + cgraph->n_nodes);
         for (int i = 0; i < cgraph->n_nodes; i++) {
             struct ggml_tensor * node = cgraph->nodes[i];
             if (!xdna_pgemm_glu_supported(node)) {
@@ -3281,6 +3287,9 @@ static enum ggml_status xdna_graph_compute_impl(ggml_backend_xdna_context * ctx,
             }
             struct ggml_tensor * gate = node->src[0];
             struct ggml_tensor * up   = node->src[1];
+            if (!in_graph.count(gate) || !in_graph.count(up)) {
+                continue;
+            }
             if (uses[gate] != 1 || uses[up] != 1 || (gate->flags & GGML_TENSOR_FLAG_OUTPUT) ||
                 (up->flags & GGML_TENSOR_FLAG_OUTPUT) || consumed.count(gate) || consumed.count(up)) {
                 continue;
@@ -3510,7 +3519,10 @@ static enum ggml_status xdna_graph_compute_impl(ggml_backend_xdna_context * ctx,
                 continue;
             }
             struct ggml_tensor * r = m->src[0];
-            if (consumed.count(r) || (r->flags & GGML_TENSOR_FLAG_OUTPUT) || readers[r].size() != 1) {
+            // The norm is computed again from its input here, so it has to be
+            // this graph's node, not an input another backend produced.
+            if (!node_at.count(r) || consumed.count(r) || (r->flags & GGML_TENSOR_FLAG_OUTPUT) ||
+                readers[r].size() != 1) {
                 continue;
             }
             const auto & rd = readers[m];
