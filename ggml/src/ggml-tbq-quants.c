@@ -1,5 +1,6 @@
 #include "ggml-impl.h"
 #include "ggml-tbq-quants.h"
+#include "ggml-threading.h"
 
 // ====================== TurboQuant (Zandieh et al., ICLR 2026) ======================
 //
@@ -165,14 +166,9 @@ void tq_compute_boundaries(const float * cb, float * boundaries, int n) {
 // Norm correction: store MSE-optimal scale alpha = <x, c> / <c, c> instead of
 // ||x||, where c is the codebook reconstruction direction (cb[idx] values).
 // This minimizes ||x - alpha*c||^2 and corrects quantization's norm shrinkage.
-// Controlled by GGML_TQ_NORM_CORRECTION env var (checked once, cached).
+// Controlled by GGML_TQ_NORM_CORRECTION env var, resolved once in a thread-safe way.
 static int tq_norm_correction_enabled(void) {
-    static int cached = -1;
-    if (cached < 0) {
-        const char * env = getenv("GGML_TQ_NORM_CORRECTION");
-        cached = (env && env[0] == '1') ? 1 : 0;
-    }
-    return cached;
+    return ggml_tbq_norm_correction_enabled();
 }
 
 // Shared TQ3 quantize: normalize + binary-search + packed 3-bit write
