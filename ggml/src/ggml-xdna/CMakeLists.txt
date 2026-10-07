@@ -120,11 +120,14 @@ endif()
 if (GGML_XDNA_BUILD_KERNELS)
     set(GEMM_DIR "${CMAKE_CURRENT_SOURCE_DIR}/kernels")
     set(XDNA_ARTIFACTS "")
-    # The shared kernel headers are pasted into each source by kernelsrc.py, so
-    # a design must rebuild when one of them changes.
+    # The shared kernel headers are pasted into each source by kernelsrc.py, and
+    # the generators import each other. design_tag.py hashes all of it, so a rule
+    # that does not list a file one of its generators reads ships a stale design
+    # under the new tag.
     set(XDNA_KERNEL_HEADERS
         "${GEMM_DIR}/xdna-vec.h"
         "${GEMM_DIR}/xdna-math.h"
+        "${GEMM_DIR}/kernelsrc.py"
     )
 
     # Geometry: the decode M block (native bf16 r=4) plus every prefill M block
@@ -169,6 +172,7 @@ if (GGML_XDNA_BUILD_KERNELS)
                     --xclbin-path ${XCLBIN}
                     --insts-path ${INSTS}
             DEPENDS "${GEMM_DIR}/gemm.py" ${XDNA_KERNEL_HEADERS}
+                    "${GEMM_DIR}/wfmt.py" "${GEMM_DIR}/gemm-dequant.cc"
             WORKING_DIRECTORY "${GEMM_DIR}"
             COMMENT "ggml-xdna: compiling GEMM kernel M${M_VAL} K1024 N2048 bfp16=${BFP16_VAL} c${XDNA_N_COLS}"
             VERBATIM
@@ -202,6 +206,7 @@ if (GGML_XDNA_BUILD_KERNELS)
                     --xclbin-path ${INT8_XCLBIN}
                     --insts-path ${INT8_INSTS}
             DEPENDS "${GEMM_DIR}/gemm.py" ${XDNA_KERNEL_HEADERS}
+                    "${GEMM_DIR}/wfmt.py" "${GEMM_DIR}/gemm-dequant.cc"
             WORKING_DIRECTORY "${GEMM_DIR}"
             COMMENT "ggml-xdna: compiling int8 GEMM kernel M${M_VAL} K1024 N2048 c${XDNA_N_COLS}"
             VERBATIM
@@ -295,6 +300,9 @@ if (GGML_XDNA_BUILD_KERNELS)
                 --insts-path ${PG_INSTS}
         DEPENDS "${GEMM_DIR}/pgemm.py" "${GEMM_DIR}/gemm-expand.cc" ${XDNA_KERNEL_HEADERS}
                 "${GEMM_DIR}/gemv_q4.py" "${GEMM_DIR}/wfmt.py"
+                "${GEMM_DIR}/gemv-q4.cc" "${GEMM_DIR}/gemm-dequant.cc"
+                "${GEMM_DIR}/act-att.cc" "${GEMM_DIR}/attn-dec.cc"
+                "${GEMM_DIR}/gemv-merge.cc" "${GEMM_DIR}/gemv-zero.cc"
         WORKING_DIRECTORY "${GEMM_DIR}"
         COMMENT "ggml-xdna: compiling the prefill GEMM"
         VERBATIM
@@ -386,8 +394,9 @@ if (GGML_XDNA_BUILD_KERNELS)
                 "${GEMM_DIR}/gemv-zero.cc" "${GEMM_DIR}/gemv-merge.cc"
                 "${GEMM_DIR}/attn-conv.cc" "${GEMM_DIR}/attn-norm.cc"
                 "${GEMM_DIR}/gdn-v.cc" "${GEMM_DIR}/rec-gated.cc"
-                "${GEMM_DIR}/gated-h2.cc" "${GEMM_DIR}/attn-dec.cc"
-                "${GEMM_DIR}/act-att.cc"
+                "${GEMM_DIR}/rec-post.cc" "${GEMM_DIR}/gated-h2.cc"
+                "${GEMM_DIR}/attn-dec.cc" "${GEMM_DIR}/act-att.cc"
+                "${GEMM_DIR}/wfmt.py" "${GEMM_DIR}/gemm-dequant.cc"
         WORKING_DIRECTORY "${GEMM_DIR}"
         COMMENT "ggml-xdna: compiling the merged recurrent layer"
         VERBATIM
@@ -430,6 +439,8 @@ if (GGML_XDNA_BUILD_KERNELS)
                 --insts-path ${GV_INSTS}
         DEPENDS "${GEMM_DIR}/gemv_q4.py" "${GEMM_DIR}/gemv-q4.cc" ${XDNA_KERNEL_HEADERS}
                 "${GEMM_DIR}/gemv-zero.cc" "${GEMM_DIR}/wfmt.py"
+                "${GEMM_DIR}/gemm-dequant.cc" "${GEMM_DIR}/act-att.cc"
+                "${GEMM_DIR}/attn-dec.cc" "${GEMM_DIR}/gemv-merge.cc"
         WORKING_DIRECTORY "${GEMM_DIR}"
         COMMENT "ggml-xdna: compiling decode GEMV ${GV_STEM}"
         VERBATIM
