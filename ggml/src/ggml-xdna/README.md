@@ -344,8 +344,8 @@ architecture.
 - The host-built instruction streams and the RTP/shim constants follow the
   mlir-aie placement. The design tag does not cover the toolchain version, so a
   toolchain bump has to be paired with re-reading those constants.
-- One backend context per process holds the dispatch state, so two decodes at
-  once from separate llama contexts share it (single-context use is what is
-  tested).
+- All llama contexts in a process share one backend context. Their graph
+  computes take turns on it (the array runs one command stream at a time
+  anyway).
 - The device reports itself to the scheduler as a GPU while its buffers are host
   memory, so the reported free memory and any `--fit` accounting are nominal.
