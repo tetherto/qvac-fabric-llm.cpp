@@ -4400,12 +4400,71 @@ static void * xdna_hb_base(ggml_backend_buffer_t buffer) {
     return ((xdna_buffer *) buffer->context)->data;
 }
 
+// The fused decode keeps a sequence's recurrent state on the array between
+// tokens; its cache rows hold it only once it is written back (a graph of
+// another context, or one that reads those rows). Reads and writes from
+// outside a graph come through this buffer, and both have to see that.
+// llama_state_seq_get_data - a server's checkpoint - read rows the array had
+// moved on from, and llama_state_seq_set_data - a checkpoint restored, the
+// prompt cache reused - wrote rows a seeded session then ignored: decode went
+// on from the state the restore was meant to undo. So a read of a seeded
+// session's rows, or a copy out of them, writes the state back first, and a
+// write over them unseeds the session, which reseeds from the cache on its
+// next token. Graph computes and these take the same lock.
+static void xdna_rec_follow_io(const void * p, size_t n, bool write) {
+    ggml_backend_xdna_context * ctx = ggml_xdna_device_context();
+    if (!ctx || !ctx->device || !p || n == 0) {
+        return;
+    }
+    std::lock_guard<std::recursive_mutex> compute(ctx->compute_mutex);
+    const char * const a0     = (const char *) p;
+    const char * const a1     = a0 + n;
+    const size_t       ns     = (size_t) xdna_rec_pack::state_floats();
+    const size_t       nr     = (size_t) 3 * xdna_rec_pack::CH;
+    bool               waited = false;
+    const auto         visit  = [&](std::map<std::pair<int, int64_t>, xdna_rec_session *> & rec) {
+        for (auto & kv : rec) {
+            xdna_rec_session * s = kv.second;
+            if (!s || !s->seeded || !s->own_s || !s->own_r || s->row < 0 ||
+                s->own_s_b < (size_t) (s->row + 1) * ns * sizeof(float) ||
+                s->own_r_b < (size_t) (s->row + 1) * nr * sizeof(float)) {
+                continue;
+            }
+            float * const      ss = s->own_s + (size_t) s->row * ns;
+            float * const      rr = s->own_r + (size_t) s->row * nr;
+            const char * const s0 = (const char *) ss;
+            const char * const r0 = (const char *) rr;
+            if (!(a0 < s0 + ns * sizeof(float) && s0 < a1) && !(a0 < r0 + nr * sizeof(float) && r0 < a1)) {
+                continue;
+            }
+            if (write) {
+                s->seeded = false;
+                continue;
+            }
+            if (!waited) {
+                xdna_pending_wait(ctx);
+                waited = true;
+            }
+            if (!xdna_rec_core_read_state(s->core, rr, ss)) {
+                GGML_LOG_WARN("%s: fused layer %d: state readback for a read of its cache failed; it reseeds\n",
+                              "ggml-xdna", s->il);
+                s->seeded = false;
+            }
+        }
+    };
+    visit(ctx->rec);
+    for (auto & kv : ctx->parked) {
+        visit(kv.second.rec);
+    }
+}
+
 static void xdna_hb_memset(ggml_backend_buffer_t buffer,
                            struct ggml_tensor *  tensor,
                            uint8_t               value,
                            size_t                offset,
                            size_t                size) {
     GGML_UNUSED(buffer);
+    xdna_rec_follow_io((char *) tensor->data + offset, size, true);
     memset((char *) tensor->data + offset, value, size);
 }
 
@@ -4415,6 +4474,8 @@ static void xdna_hb_set(ggml_backend_buffer_t buffer,
                         size_t                offset,
                         size_t                size) {
     GGML_UNUSED(buffer);
+    xdna_rec_follow_io(data, size, false);  // a copy out of another seeded row
+    xdna_rec_follow_io((char *) tensor->data + offset, size, true);
     memcpy((char *) tensor->data + offset, data, size);
 }
 
@@ -4424,12 +4485,15 @@ static void xdna_hb_get(ggml_backend_buffer_t      buffer,
                         size_t                     offset,
                         size_t                     size) {
     GGML_UNUSED(buffer);
+    xdna_rec_follow_io((const char *) tensor->data + offset, size, false);
     memcpy(data, (const char *) tensor->data + offset, size);
 }
 
 static bool xdna_hb_cpy(ggml_backend_buffer_t buffer, const struct ggml_tensor * src, struct ggml_tensor * dst) {
     GGML_UNUSED(buffer);
     if (ggml_backend_buffer_is_host(src->buffer)) {
+        xdna_rec_follow_io(src->data, ggml_nbytes(src), false);
+        xdna_rec_follow_io(dst->data, ggml_nbytes(src), true);
         memcpy(dst->data, src->data, ggml_nbytes(src));
         return true;
     }
@@ -4437,6 +4501,7 @@ static bool xdna_hb_cpy(ggml_backend_buffer_t buffer, const struct ggml_tensor *
 }
 
 static void xdna_hb_clear(ggml_backend_buffer_t buffer, uint8_t value) {
+    xdna_rec_follow_io(xdna_hb_base(buffer), buffer->size, true);
     memset(xdna_hb_base(buffer), value, buffer->size);
 }
 
