@@ -65,6 +65,18 @@ public:
             return strm.size();
         }
 
+        // ranges [i0, i0 + n) of streams with consecutive ids
+        std::vector<std::pair<uint32_t, uint32_t>> runs() const {
+            std::vector<std::pair<uint32_t, uint32_t>> res;
+            for (uint32_t i = 0; i < strm.size(); ++i) {
+                if (i == 0 || strm[i] != strm[i - 1] + 1) {
+                    res.push_back({i, 0});
+                }
+                res.back().second++;
+            }
+            return res;
+        }
+
         bool empty() const {
             return idxs.empty();
         }
@@ -162,6 +174,10 @@ public:
 
     bool get_has_shift() const;
 
+    // allow ubatches with non-consecutive streams - the graph must read the cache per run of streams
+    bool get_allow_stream_gaps() const;
+    void set_allow_stream_gaps(bool value);
+
     ggml_type type_k() const;
     ggml_type type_v() const;
 
@@ -193,6 +209,10 @@ public:
     // get views of the current state of the cache
     ggml_tensor * get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
     ggml_tensor * get_v(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
+
+    // views of the streams [i0, i0 + n) of sinfo, which must have consecutive ids
+    ggml_tensor * get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo, uint32_t i0, uint32_t n) const;
+    ggml_tensor * get_v(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo, uint32_t i0, uint32_t n) const;
 
     // width of the K-cache view used by the K-shift graph for this model layer
     int64_t get_k_shift_width(uint32_t il) const;
@@ -276,6 +296,8 @@ private:
 
     const uint32_t n_seq_max = 1;
     const uint32_t n_stream  = 1;
+
+    bool allow_stream_gaps = false;
 
     // required padding
     const uint32_t n_pad = 1;
@@ -410,6 +432,13 @@ public:
     // get views of the current state of the cache
     ggml_tensor * get_k(ggml_context * ctx, int32_t il) const;
     ggml_tensor * get_v(ggml_context * ctx, int32_t il) const;
+
+    // the ubatch streams split in runs of consecutive stream ids: [i0, i0 + n) for run r
+    uint32_t get_n_runs() const;
+    void     get_run(uint32_t r, uint32_t & i0, uint32_t & n) const;
+
+    ggml_tensor * get_k(ggml_context * ctx, int32_t il, uint32_t r) const;
+    ggml_tensor * get_v(ggml_context * ctx, int32_t il, uint32_t r) const;
 
     // The full K storage tensor of the layer, spanning all streams.
     ggml_tensor * get_k_storage(int32_t il) const;
