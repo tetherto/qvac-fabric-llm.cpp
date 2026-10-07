@@ -212,7 +212,7 @@ llama_memory_context_ptr llama_kv_cache_iswa::init_batch(llama_batch_allocr & ba
 
         std::vector<llama_ubatch> ubatches;
         while (true) {
-            auto ubatch = balloc.split_equal(n_ubatch, !unified, 0);
+            auto ubatch = balloc.split_equal(n_ubatch, !unified, 0, kv_base->get_allow_stream_gaps());
 
             if (ubatch.n_tokens == 0) {
                 break;
