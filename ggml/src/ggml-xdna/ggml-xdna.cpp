@@ -851,6 +851,29 @@ static bool xdna_res_touch(ggml_backend_xdna_context * ctx, const ggml_tensor * 
     return true;
 }
 
+// A graph can end at the last fused layer's l_out: the scheduler ends one at
+// a split to another device, an eval callback at the tensor it watches. With
+// no reader in this graph, its reader comes after the graph and takes it from
+// the tensor: write it there. attn_residual stays unwritten - its readers were
+// the layer's own, and its memory may already be another's.
+static bool xdna_res_leave(ggml_backend_xdna_context * ctx, const struct ggml_cgraph * cgraph) {
+    if (!ctx->res_lout || !ctx->res_dirty) {
+        return true;
+    }
+    for (int i = 0; i < cgraph->n_nodes; i++) {
+        const ggml_tensor * node = cgraph->nodes[i];
+        for (int k = 0; k < GGML_MAX_SRC && node->src[k]; k++) {
+            for (const ggml_tensor * t = node->src[k]; t; t = t->view_src) {
+                if (t == ctx->res_lout) {
+                    return true;
+                }
+            }
+        }
+    }
+    ctx->res_resid = nullptr;
+    return xdna_res_materialize(ctx);
+}
+
 // One fused-layer session (per recurrent block). Owns the three runners and
 // the host scratch buffers it reuses every token.
 struct xdna_rec_session {
@@ -3001,6 +3024,18 @@ static void xdna_warn_host_attention(const struct ggml_cgraph * cgraph) {
     }
 }
 
+static ggml_backend_buffer_type_t ggml_backend_xdna_device_get_buffer_type(ggml_backend_dev_t dev);
+
+// A weight in the buffers this device gives its layers: a layer llama offloaded
+// here. With a partial offload the others stay in the CPU's buffers, and their
+// nodes can still land in this graph while some of their readers are in the
+// CPU's, out of this graph's sight. A fusion that leaves a node unwritten (the
+// norm into A) is only safe on the offloaded layers.
+static bool xdna_weight_here(const struct ggml_tensor * w) {
+    return w && w->buffer &&
+           ggml_backend_buffer_get_type(w->buffer) == ggml_backend_xdna_device_get_buffer_type(nullptr);
+}
+
 static enum ggml_status xdna_graph_compute_impl(ggml_backend_xdna_context * ctx, struct ggml_cgraph * cgraph) {
     if (!ctx->device) {
         return GGML_STATUS_SUCCESS;
@@ -3275,6 +3310,12 @@ static enum ggml_status xdna_graph_compute_impl(ggml_backend_xdna_context * ctx,
                 }
             }
         }
+        // The fused call computes gate and up again from their weights and
+        // input, so both have to be nodes of this graph. A graph that starts at
+        // the GLU gets them as inputs another backend computed: their input is
+        // not this graph's and its memory is free for the allocator, and their
+        // weights are in that backend's layout (CPU_REPACK).
+        std::unordered_set<const struct ggml_tensor *> in_graph(cgraph->nodes, cgraph->nodes + cgraph->n_nodes);
         for (int i = 0; i < cgraph->n_nodes; i++) {
             struct ggml_tensor * node = cgraph->nodes[i];
             if (!xdna_pgemm_glu_supported(node)) {
@@ -3282,6 +3323,9 @@ static enum ggml_status xdna_graph_compute_impl(ggml_backend_xdna_context * ctx,
             }
             struct ggml_tensor * gate = node->src[0];
             struct ggml_tensor * up   = node->src[1];
+            if (!in_graph.count(gate) || !in_graph.count(up)) {
+                continue;
+            }
             if (uses[gate] != 1 || uses[up] != 1 || (gate->flags & GGML_TENSOR_FLAG_OUTPUT) ||
                 (up->flags & GGML_TENSOR_FLAG_OUTPUT) || consumed.count(gate) || consumed.count(up)) {
                 continue;
@@ -3511,20 +3555,28 @@ static enum ggml_status xdna_graph_compute_impl(ggml_backend_xdna_context * ctx,
                 continue;
             }
             struct ggml_tensor * r = m->src[0];
-            if (consumed.count(r) || (r->flags & GGML_TENSOR_FLAG_OUTPUT) || readers[r].size() != 1) {
+            // The norm is computed again from its input here, so it has to be
+            // this graph's node, not an input another backend produced.
+            if (!node_at.count(r) || consumed.count(r) || (r->flags & GGML_TENSOR_FLAG_OUTPUT) ||
+                readers[r].size() != 1) {
                 continue;
             }
+            // The norm's output is left unwritten, so its every reader has to
+            // be one of these GEMMs - on an offloaded layer, where they all are
+            // in this graph.
             const auto & rd = readers[m];
-            bool         ok = !rd.empty();
+            bool         ok = !rd.empty() && xdna_weight_here(m->src[1]);
             for (const struct ggml_tensor * t : rd) {
-                ok = ok && t->op == GGML_OP_MUL_MAT && t->src[1] == m && t->src[0] != m && xdna_pgemm_supported(t);
+                ok = ok && t->op == GGML_OP_MUL_MAT && t->src[1] == m && t->src[0] != m && xdna_pgemm_supported(t) &&
+                     xdna_weight_here(t->src[0]);
             }
             if (ok) {
                 norm_a.insert(m);
                 consumed.insert(r);
                 // the residual sum the norm reads, in the same pass
                 struct ggml_tensor * ad    = r->src[0];
-                bool                 ad_ok = xdna_pgemm_add_supported(ad, m) && !consumed.count(ad);
+                // and computed again from its inputs, so this graph's node too
+                bool ad_ok = node_at.count(ad) && xdna_pgemm_add_supported(ad, m) && !consumed.count(ad);
                 // the sum is written at this MUL and not where the ADD sits: a
                 // reader that runs earlier would see the ADD's buffer unwritten
                 for (const struct ggml_tensor * t : readers[ad]) {
@@ -4170,10 +4222,10 @@ static enum ggml_status xdna_graph_compute_impl(ggml_backend_xdna_context * ctx,
     if (!xdna_ops_finalize(&ctx->ops)) {
         return GGML_STATUS_FAILED;
     }
-    const bool queued_ok = xdna_pending_wait(ctx);
+    const bool queued_ok = xdna_pending_wait(ctx) && xdna_res_leave(ctx, cgraph);
     ctx->pending_failed  = false;
-    // Whatever the rows still hold nothing read: the tensors are this graph's,
-    // and their memory may already be another's.
+    // Whatever else the rows still hold nothing reads: the tensors are this
+    // graph's, and their memory may already be another's.
     ctx->res_lout = ctx->res_resid = nullptr;
     if (!queued_ok) {
         ctx->res_dirty = false;
