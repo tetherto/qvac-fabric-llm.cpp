@@ -26,7 +26,7 @@ static bool every_required_backend_registered() {
     std::istringstream names(GGML_TEST_REQUIRED_BACKENDS);
     std::string name;
     bool ok = true;
-    while (std::getline(names, name, ';')) {
+    while (std::getline(names, name, ',')) {
         ok = required_backend_registered(name) && ok;
     }
     return ok;

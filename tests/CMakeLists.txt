@@ -431,7 +431,7 @@ llama_build_and_test(test-copy-tbq-subgroups.cpp)
 # mtmd, so it is intentionally outside the LLAMA_MTMD block below.
 llama_build_and_test(test-opencl-fa-chunking.cpp)
 
-# Names the backends that must register on any host: the CPU family and RPC.
+# Names the backends that must register on any host, comma separated: the CPU family and RPC.
 # GPU and BLAS modules may be absent at run time when their driver or runtime
 # library is missing, so they are not required.
 function(ggml_required_backend_names out_var)
@@ -443,6 +443,7 @@ function(ggml_required_backend_names out_var)
             list(APPEND names "RPC")
         endif()
     endforeach()
+    string(REPLACE ";" "," names "${names}")
     set(${out_var} "${names}" PARENT_SCOPE)
 endfunction()
 
