@@ -27,8 +27,6 @@ static __global__ void init_offsets(int * offsets, const int ncols, const int nr
 }
 #endif  // STRIDED_ITERATOR_AVAILABLE
 
-#ifdef GGML_CUDA_USE_CUB
-
 // returns the suggested maximum number of rows to process during one argsort_f32_i32_cuda_cub() call
 int argsort_f32_i32_cuda_cub_chunk_nrows(const size_t nb01, const int64_t nrows) {
     // perform argsort in chunks up to approximately this size (currently 64MB)
@@ -41,6 +39,8 @@ int argsort_f32_i32_cuda_cub_chunk_nrows(const size_t nb01, const int64_t nrows)
     // limit the resulting amount to total nrows
     return std::min((int64_t) chunk_nrows, nrows);
 }
+
+#ifdef GGML_CUDA_USE_CUB
 
 void argsort_f32_i32_cuda_cub(ggml_cuda_pool & pool,
                               const float *    x,

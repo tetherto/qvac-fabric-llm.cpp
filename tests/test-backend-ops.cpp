@@ -13834,6 +13834,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {2049, 2, 1, 3}, k));
     }
 
+    // One sorted chunk of rows plus one row, and selection over many long rows, with and without ties
+    test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {1024, 16385, 1, 1}, 40));
+    for (bool ties : {false, true}) {
+        test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {2049,  512, 1, 1}, 7,    ties));
+        test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {33024, 512, 1, 1}, 2051, ties));
+    }
+    // More than 2^31 elements, opt-in because it needs about 17 GB
+    if (getenv("GGML_TEST_TOP_K_LARGE") != nullptr) {
+        test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {1024, 2097216, 1, 1}, 40));
+    }
+
     // Large-k, including multi-row and ties (qwen4exp)
     test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, { 1024,  1, 1, 1 }, 1024));
     test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, { 2048,  2, 1, 1 }, 1024));
@@ -15139,6 +15150,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         for (auto nrows : {1, 2, 4, 8, 16, 32}) {
             test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {cols, nrows, 1, 1}, 2048));
         }
+    }
+    // k-pool indexer prefill: one row per ubatch token over the pooled history
+    for (auto cols : {4096, 16384, 65536}) {
+        test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {cols, 512, 1, 1}, 512));
     }
     // backend sampler: one row of the vocab (llama-sampler.cpp top_k)
     for (auto k : {20, 40}) {
