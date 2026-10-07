@@ -392,6 +392,13 @@ struct ggml_backend_xdna_context {
     // afterwards - possibly at the same addresses - starts from nothing.
     std::mutex life_mutex;
     int        n_backends = 0;
+    // One graph compute at a time. Every backend instance is this one context,
+    // and what a compute uses - the runtime's batch (g_batch), the fused-layer
+    // sessions and their buffers, the prefill runners - is per process: two
+    // llama contexts computing at once raced on all of it (one found the
+    // other's in-projection buffer gone). The array runs one command stream at
+    // a time anyway, so this costs nothing a single context had.
+    std::mutex compute_mutex;
     // Attention-layer tails (attn_output + the FFN, one dispatch), per layer.
     // Stateless, so one per layer serves every sequence.
     std::map<int, struct xdna_rec_tail *> tails;
@@ -2261,6 +2268,7 @@ static void ggml_backend_xdna_free(ggml_backend_t backend) {
     {
         std::lock_guard<std::mutex> lock(ctx->life_mutex);
         if (--ctx->n_backends == 0) {
+            std::lock_guard<std::mutex> compute(ctx->compute_mutex);
             xdna_release_model_state(ctx);
         }
     }
@@ -2397,12 +2405,38 @@ static void xdna_concat_tail_fill(struct ggml_tensor * n,
     }
 }
 
+// With flash attention off llama builds attention from MUL_MAT and SOFT_MAX,
+// and every attention route here - the decode pool, the attention layer, the
+// prefill attention - takes FLASH_ATTN_EXT: the attention then runs on the
+// host, the decode at about half the speed (50 against 29 t/s on the 0.8B)
+// with ten times the host work. Nothing fails, so say it, once. Graph
+// computes take the context's lock, so the flag needs none of its own.
+static void xdna_warn_host_attention(const struct ggml_cgraph * cgraph) {
+    static bool said = false;
+    if (said) {
+        return;
+    }
+    for (int i = 0; i < cgraph->n_nodes; i++) {
+        const struct ggml_tensor * n = cgraph->nodes[i];
+        if (n->op == GGML_OP_SOFT_MAX && strncmp(n->name, "kq_soft_max", 11) == 0) {
+            GGML_LOG_WARN("%s: flash attention is off, so attention runs on the host; "
+                          "the NPU takes it with flash attention on (-fa on or auto)\n",
+                          "ggml-xdna");
+            said = true;
+            return;
+        }
+    }
+}
+
 static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
     ggml_backend_xdna_context * ctx = (ggml_backend_xdna_context *) backend->context;
+    std::lock_guard<std::mutex>  compute(ctx->compute_mutex);
 
     if (!ctx->device) {
         return GGML_STATUS_SUCCESS;
     }
+
+    xdna_warn_host_attention(cgraph);
 
     // Size the host-fallback pool for this chunk (xdna_glue_threads).
     xdna_glue_set_n_tokens(cgraph);
