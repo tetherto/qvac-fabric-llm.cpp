@@ -28976,8 +28976,8 @@ static void ggml_cl_gated_delta_net(ggml_backend_t backend, ggml_tensor * dst) {
     const int kda = (src_g->ne[0] == (int64_t) S_v) ? 1 : 0;
 
     // TODO: Optimize when S_v!=128. Not necessary for now as Qwen3.5/6 are all S_v=128
-    // token generation mode (tgpp=0):
-    // process 1 token at a time, so columns per lane (cpl) == 1
+    // token generation mode (tgpp=0), also used for speculative verify batches:
+    // columns per lane (cpl) == 1, so 4x more work-groups than the prefill variant
     // prompt processing mode (tgpp=1):
     // cpl=4 to process 4 tokens for single-token. 4 is chosen for Adreno 750 as per
     // work-item/thread has at most 128 registers.
@@ -28990,7 +28990,7 @@ static void ggml_cl_gated_delta_net(ggml_backend_t backend, ggml_tensor * dst) {
     // subgroups_per_workgroup (spw) can be set to 1,2,4,8,16 for tg and 1,2,4 for pp
     // for S_v=128.
     // Empirically found that when spw=1, we get the best performance for both tg and pp
-    const int tgpp = (n_tokens == 1) ? 0 : 1;
+    const int tgpp = (n_tokens <= GGML_CL_SMALL_BATCH_MAX) ? 0 : 1;
     const int cpl  = (tgpp == 0) ? 1 : 4;
     // spw needs adjustment when S_v != 128
     const int spw  = (tgpp == 0) ? 1 : 1;
