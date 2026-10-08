@@ -1389,6 +1389,8 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_gemm_noshuffle_q8_0_q8_1_dp4a_wimg = nullptr;  // q8_0 dense dp4a, weights via texture (opt-in)
     cl_kernel kernel_gemv_noshuffle_q8_0_f32;
     cl_kernel kernel_gemv_noshuffle_q8_0_f32_splitk;  // split-K across WGs (small-M decode)
+    // 2, 3 and 4 columns (speculative-decoding verification batches)
+    cl_kernel kernel_gemv_noshuffle_q8_0_f32_mc[3] = {nullptr, nullptr, nullptr};
     cl_kernel kernel_gemm_noshuffle_q1_0_f32;
     cl_kernel kernel_gemv_noshuffle_q1_0_f32;
     cl_kernel kernel_gemv_noshuffle_q4_k_f32;
@@ -4560,6 +4562,9 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 
         CL_CHECK((backend_ctx->kernel_gemv_noshuffle_q8_0_f32 = clCreateKernel(prog, "kernel_gemv_noshuffle_q8_0_f32", &err), err));
         CL_CHECK((backend_ctx->kernel_gemv_noshuffle_q8_0_f32_splitk = clCreateKernel(prog, "kernel_gemv_noshuffle_q8_0_f32_splitk", &err), err));
+        CL_CHECK((backend_ctx->kernel_gemv_noshuffle_q8_0_f32_mc[0] = clCreateKernel(prog, "kernel_gemv_noshuffle_q8_0_f32_mc2", &err), err));
+        CL_CHECK((backend_ctx->kernel_gemv_noshuffle_q8_0_f32_mc[1] = clCreateKernel(prog, "kernel_gemv_noshuffle_q8_0_f32_mc3", &err), err));
+        CL_CHECK((backend_ctx->kernel_gemv_noshuffle_q8_0_f32_mc[2] = clCreateKernel(prog, "kernel_gemv_noshuffle_q8_0_f32_mc4", &err), err));
         CL_CHECK(clReleaseProgram(prog));
         GGML_LOG_CONT(".");
     }
@@ -20920,7 +20925,14 @@ static void ggml_cl_mul_mat_q8_0_f32_adreno(ggml_backend_t backend, const ggml_t
     int N = ne1;
     int K = ne00;
 
-    if (ne1 == 1) {
+    // A few columns (a speculative-decoding verification batch) go through the
+    // multi-column GEMV: the large-batch GEMM below pads them to a full tile
+    // and costs several times a GEMV per column.
+    const bool use_multi_col_gemv =
+        ne1 >= 2 && ne1 <= 4 && backend_ctx->kernel_gemv_noshuffle_q8_0_f32_mc[0] != nullptr &&
+        src1->ne[2] == 1 && src1->ne[3] == 1 && ggml_is_contiguous(src1) && ggml_is_contiguous(dst);
+
+    if (ne1 == 1 || use_multi_col_gemv) {
         cl_mem q_img = nullptr;
         cl_mem b_sub_buf = nullptr;
         cl_mem b_img = nullptr;
@@ -20969,8 +20981,9 @@ static void ggml_cl_mul_mat_q8_0_f32_adreno(ggml_backend_t backend, const ggml_t
         const bool q8_splitk_on = q8_splitk_env_set
             ? q8_splitk_env_on
             : (backend_ctx->adreno_gen == ADRENO_GPU_GEN::X2E);
-        if (q8_splitk_on && backend_ctx->kernel_gemv_noshuffle_q8_0_f32_splitk &&
-            ne01 <= 1024 && ne01 % 64 == 0) {
+        // Split-K handles one column only.
+        if (!use_multi_col_gemv && q8_splitk_on &&
+            backend_ctx->kernel_gemv_noshuffle_q8_0_f32_splitk && ne01 <= 1024 && ne01 % 64 == 0) {
             const int    nsg    = 8;
             const int    ksplit = 8;                        // -> 8 * M/64 workgroups
             const size_t gx     = (size_t) CEIL_DIV(ne01, 64) * 64;
@@ -21006,7 +21019,8 @@ static void ggml_cl_mul_mat_q8_0_f32_adreno(ggml_backend_t backend, const ggml_t
             return;
         }
 
-        kernel = backend_ctx->kernel_gemv_noshuffle_q8_0_f32;
+        kernel = use_multi_col_gemv ? backend_ctx->kernel_gemv_noshuffle_q8_0_f32_mc[ne1 - 2]
+                                    : backend_ctx->kernel_gemv_noshuffle_q8_0_f32;
 
         int r2 = 1;
         int r3 = 1;

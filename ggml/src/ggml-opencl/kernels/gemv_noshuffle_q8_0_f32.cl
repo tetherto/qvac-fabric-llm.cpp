@@ -278,3 +278,102 @@ __kernel void kernel_gemv_noshuffle_q8_0_f32(
         if (gid < M) dst[gid] = totalSum;
     }
 }
+
+// Multi-column variants for 2, 3 and 4 columns (speculative-decoding
+// verification batches). Same weight layout as kernel_gemv_noshuffle_q8_0_f32,
+// but each weight block is read and dequantized once and accumulated against
+// every column, so a 2..4-token batch costs close to one GEMV instead of the
+// large-batch GEMM path. Every fiber reads the activations itself: all lanes
+// read the same texels, which the texture cache serves at once, cheaper than
+// broadcasting them through the subgroup once per column.
+inline void gemv_noshuffle_q8_0_f32_mc(
+        __read_only  image1d_buffer_t src0_q,
+        global half  * src0_d,
+        __read_only  image1d_buffer_t src1,
+        global float * dst,
+        ulong offsetd,
+        int ne00,
+        int ne01,
+        local float * reduceLM,  // SIMDGROUP_WIDTH * 3 * 4
+        const int NC)
+{
+    uint groupId = get_local_id(1);
+    uint gid     = get_global_id(0);
+    ushort slid    = get_sub_group_local_id();
+
+    uint K = ne00;
+    uint M = ne01;
+
+    uint LINE_STRIDE_A = M;
+    uint BLOCK_STRIDE_A = 8 * M;   // 32 / 4 = 8
+    uint COL_STRIDE_B = K / 4;     // float4 texels per column
+
+    float sums[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+    // loop along K in block granularity, skip 4 blocks every iter
+    #pragma unroll 1 /* tell compiler not to unroll */
+    for (uint k = groupId; k < (K / QK8_0); k += N_SIMDGROUP) {
+        const float scale = convert_float(src0_d[gid + k * LINE_STRIDE_A]);
+        const uint a_base = gid + k * BLOCK_STRIDE_A;
+        float blockSums[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        // word j of a row's block holds elements 4j..4j+3, B texel j of the block
+        #pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            const float4 a = convert_float4(as_char4(read_imageui(src0_q, a_base + LINE_STRIDE_A * j).x));
+            #pragma unroll
+            for (int c = 0; c < NC; ++c) {
+                blockSums[c] += dot(a, read_imagef(src1, c * COL_STRIDE_B + k * 8 + j));
+            }
+        }
+        #pragma unroll
+        for (int c = 0; c < NC; ++c) {
+            sums[c] += blockSums[c] * scale;
+        }
+    }
+
+    // reduction in local memory, assumes #wave=4
+    #pragma unroll
+    for (int c = 0; c < NC; ++c) {
+        if (groupId > 0) reduceLM[SIMDGROUP_WIDTH * (3 * c + groupId - 1) + slid] = sums[c];
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    if (groupId == 0) {
+        dst = (global float*)((global char*)dst + offsetd);
+        #pragma unroll
+        for (int c = 0; c < NC; ++c) {
+            float total = sums[c];
+            total += reduceLM[SIMDGROUP_WIDTH * (3 * c + 0) + slid];
+            total += reduceLM[SIMDGROUP_WIDTH * (3 * c + 1) + slid];
+            total += reduceLM[SIMDGROUP_WIDTH * (3 * c + 2) + slid];
+            // see kernel_gemv_noshuffle_q8_0_f32 for the row guard
+            if (gid < M) dst[c * M + gid] = total;
+        }
+    }
+}
+
+#define GEMV_NOSHUFFLE_Q8_0_F32_MC(NAME, NC)                                  \
+    REQD_SUBGROUP_SIZE_64_IF_ADRENO                                           \
+    __kernel void NAME(                                                       \
+            __read_only  image1d_buffer_t src0_q,                             \
+            global half  * src0_d,                                            \
+            __read_only  image1d_buffer_t src1,                               \
+            ulong offset1,                                                    \
+            global float * dst,                                               \
+            ulong offsetd,                                                    \
+            int ne00, int ne01, int ne02, int ne10, int ne12,                 \
+            int ne0, int ne1, int r2, int r3)                                 \
+    {                                                                         \
+        __local float reduceLM[SIMDGROUP_WIDTH * 3 * 4];                     \
+        gemv_noshuffle_q8_0_f32_mc(src0_q, src0_d, src1, dst, offsetd, ne00, ne01, reduceLM, NC); \
+    }
+
+#ifdef ADRENO_GPU
+#define REQD_SUBGROUP_SIZE_64_IF_ADRENO REQD_SUBGROUP_SIZE_64
+#else
+#define REQD_SUBGROUP_SIZE_64_IF_ADRENO
+#endif
+
+GEMV_NOSHUFFLE_Q8_0_F32_MC(kernel_gemv_noshuffle_q8_0_f32_mc2, 2)
+GEMV_NOSHUFFLE_Q8_0_F32_MC(kernel_gemv_noshuffle_q8_0_f32_mc3, 3)
+GEMV_NOSHUFFLE_Q8_0_F32_MC(kernel_gemv_noshuffle_q8_0_f32_mc4, 4)
