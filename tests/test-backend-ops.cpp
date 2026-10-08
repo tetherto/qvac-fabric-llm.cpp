@@ -8290,6 +8290,48 @@ struct test_mul_mat_pq2_0_codes : public test_case {
     }
 };
 
+// mul_mat whose src0 is a contiguous reshape of a weight to another row width, e.g. [256, 256] seen as [512, 128]
+struct test_mul_mat_reshaped_a : public test_case {
+    const ggml_type type_a;
+    const int64_t   k_weight;
+    const int64_t   rows_weight;
+    const int64_t   k;
+    const int64_t   n;
+
+    test_mul_mat_reshaped_a(ggml_type type_a, int64_t k_weight, int64_t rows_weight, int64_t k, int64_t n)
+        : type_a(type_a), k_weight(k_weight), rows_weight(rows_weight), k(k), n(n) {}
+
+    std::string vars() override { return VARS_TO_STR5(type_a, k_weight, rows_weight, k, n); }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MUL_MAT";
+    }
+
+    double max_nmse_err() override { return 5e-4; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * w = ggml_new_tensor_2d(ctx, type_a, k_weight, rows_weight);
+        ggml_set_name(w, "w");
+        ggml_tensor * a = ggml_reshape_2d(ctx, w, k, rows_weight*k_weight/k);
+        ggml_set_name(a, "a");
+        ggml_tensor * b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
+        ggml_set_name(b, "b");
+        ggml_tensor * out = ggml_mul_mat(ctx, a, b);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    // only the weight is uploaded, as a model would; the reshape reads the weight's bytes
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->view_src == nullptr) {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 struct test_ternary_f16_reference : public test_case {
     const ggml_type type_a;
     const bool use_ids;
@@ -14890,8 +14932,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
     test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_PTQ1_0, GGML_GLU_OP_SWIGLU, 1, 8, 196608,
         false, 1, 1, false, false, true, false, {1, 1}));
+    // PQ2_0 at prefill widths: the model loader places weights by asking for a 512-column mul_mat
+    for (int64_t n : {512, 513}) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_PQ2_0, GGML_TYPE_F32, 256, n, 256, {1, 1}, {1, 1}));
+    }
     test_cases.emplace_back(new test_mul_mat_pq2_0_codes(67, 1024));
     test_cases.emplace_back(new test_mul_mat_pq2_0_codes(67, 5120));
+    // a PQ2_0 weight reshaped to wider and to narrower rows
+    for (int64_t k : {512, 128}) {
+        test_cases.emplace_back(new test_mul_mat_reshaped_a(GGML_TYPE_PQ2_0, 256, 256, k, 2));
+    }
     // fused PQ2_0 gate/up/SWIGLU mat-vec at a Bonsai-2 width with a row tail
     for (bool use_id : {false, true}) {
         test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_PQ2_0, GGML_GLU_OP_SWIGLU, 1, 67, 5120,
@@ -16829,6 +16879,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         for (int n : {2, 4, 8}) {
             test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32, 17408, n, 5120, {1, 1}, {1, 1}));
         }
+    }
+    // Bonsai-2 27B output head, single token and speculative verify
+    for (int n : {1, 8}) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_PQ2_0, GGML_TYPE_F32, 248320, n, 5120, {1, 1}, {1, 1}));
     }
 
     // delta-net conv input: conv state followed by the transposed qkv of the ubatch

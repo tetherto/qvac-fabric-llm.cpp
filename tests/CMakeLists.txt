@@ -540,6 +540,9 @@ llama_build_and_test(test-backend-sampler.cpp   LABEL "model behavior backend")
 # mtmd, so it is intentionally outside the LLAMA_MTMD block below.
 llama_build_and_test(test-opencl-fa-chunking.cpp)
 
+# Readback of views of OpenCL Q1_0 / PQ2_0 weights, which the backend stores converted. Self-skipping like the above.
+llama_build_and_test(test-opencl-quant-views.cpp)
+
 # QVAC-23763: the CUDA arch-availability registration guard. Self-skips with 77
 # when no CUDA registry is present, which covers non-CUDA builds and DL builds
 # whose module scores 0. A static CUDA build without a GPU runs the
