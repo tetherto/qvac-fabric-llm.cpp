@@ -4363,7 +4363,10 @@ static void ggml_backend_xdna_device_get_memory(ggml_backend_dev_t dev, size_t *
 
 static enum ggml_backend_dev_type ggml_backend_xdna_device_get_type(ggml_backend_dev_t dev) {
     GGML_UNUSED(dev);
-    return GGML_BACKEND_DEVICE_TYPE_GPU;
+    // the NPU has no memory of its own, so it is an integrated device: llama.cpp
+    // then prefers a discrete GPU or an iGPU registered earlier, and sizes the fit
+    // against shared system memory
+    return GGML_BACKEND_DEVICE_TYPE_IGPU;
 }
 
 static void ggml_backend_xdna_device_get_props(ggml_backend_dev_t dev, struct ggml_backend_dev_props * props) {
