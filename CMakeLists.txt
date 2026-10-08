@@ -371,6 +371,12 @@ if (LLAMA_MTMD AND TARGET mtmd)
       TARGETS vendor-hash miniaudio stb
       EXPORT llama-targets)
 
+  # Consumers that inspect images before mtmd decodes them need the same stb
+  # parser, so ship the header the exported stb target points at.
+  install(FILES
+      ${CMAKE_CURRENT_SOURCE_DIR}/vendor/stb/stb_image.h
+    DESTINATION ${LLAMA_INCLUDE_INSTALL_DIR}/stb)
+
   if (NOT LLAMA_BUILD_COMMON) # otherwise already exported above
     install(TARGETS sheredom EXPORT llama-targets)
   endif()
