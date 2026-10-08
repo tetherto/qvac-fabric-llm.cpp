@@ -31,105 +31,114 @@ inline void get_scale_min_k4(
     }
 }
 
+// fetch(v, e, lane) yields element e of `lane`'s activations; ya serves lanes 0 and 2, yb lanes 1 and 3.
+#define ACT_BROADCAST(v, e, lane) sub_group_broadcast(v.e, lane)
+
 #define dequantizeBlockAccum_ns_sgbroadcast_1_hi(total_sums, bits4, scale, minv, y) \
+    dequantizeBlockAccum_ns_fetch_hi(total_sums, bits4, scale, minv, ACT_BROADCAST, y, y)
+
+#define dequantizeBlockAccum_ns_fetch_hi(total_sums, bits4, scale, minv, fetch, ya, yb) \
     float shared_y; \
-    shared_y = sub_group_broadcast(y.s0, 0); \
+    shared_y = fetch(ya, s0, 0); \
     total_sums.s0 += ((bits4.s0 & 0x000F) * scale.s0 - minv.s0) * shared_y; \
     total_sums.s1 += ((bits4.s1 & 0x000F) * scale.s1 - minv.s1) * shared_y; \
-    shared_y = sub_group_broadcast(y.s1, 0); \
+    shared_y = fetch(ya, s1, 0); \
     total_sums.s0 += (((bits4.s0 & 0x00F0) >> 4) * scale.s0 - minv.s0) * shared_y; \
     total_sums.s1 += (((bits4.s1 & 0x00F0) >> 4) * scale.s1 - minv.s1) * shared_y; \
-    shared_y = sub_group_broadcast(y.s2, 0); \
+    shared_y = fetch(ya, s2, 0); \
     total_sums.s0 += (((bits4.s0 & 0x0F00) >> 8) * scale.s0 - minv.s0) * shared_y; \
     total_sums.s1 += (((bits4.s1 & 0x0F00) >> 8) * scale.s1 - minv.s1) * shared_y; \
-    shared_y = sub_group_broadcast(y.s3, 0); \
+    shared_y = fetch(ya, s3, 0); \
     total_sums.s0 += (((bits4.s0 & 0xF000) >> 12) * scale.s0 - minv.s0) * shared_y; \
     total_sums.s1 += (((bits4.s1 & 0xF000) >> 12) * scale.s1 - minv.s1) * shared_y; \
-    shared_y = sub_group_broadcast(y.s4, 0); \
+    shared_y = fetch(ya, s4, 0); \
     total_sums.s0 += ((bits4.s2 & 0x000F) * scale.s0 - minv.s0) * shared_y; \
     total_sums.s1 += ((bits4.s3 & 0x000F) * scale.s1 - minv.s1) * shared_y; \
-    shared_y = sub_group_broadcast(y.s5, 0); \
+    shared_y = fetch(ya, s5, 0); \
     total_sums.s0 += (((bits4.s2 & 0x00F0) >> 4) * scale.s0 - minv.s0) * shared_y; \
     total_sums.s1 += (((bits4.s3 & 0x00F0) >> 4) * scale.s1 - minv.s1) * shared_y; \
-    shared_y = sub_group_broadcast(y.s6, 0); \
+    shared_y = fetch(ya, s6, 0); \
     total_sums.s0 += (((bits4.s2 & 0x0F00) >> 8) * scale.s0 - minv.s0) * shared_y; \
     total_sums.s1 += (((bits4.s3 & 0x0F00) >> 8) * scale.s1 - minv.s1) * shared_y; \
-    shared_y = sub_group_broadcast(y.s7, 0); \
+    shared_y = fetch(ya, s7, 0); \
     total_sums.s0 += (((bits4.s2 & 0xF000) >> 12) * scale.s0 - minv.s0) * shared_y; \
     total_sums.s1 += (((bits4.s3 & 0xF000) >> 12) * scale.s1 - minv.s1) * shared_y; \
-    shared_y = sub_group_broadcast(y.s0, 1); \
+    shared_y = fetch(yb, s0, 1); \
     total_sums.s0 += ((bits4.s4 & 0x000F) * scale.s0 - minv.s0) * shared_y; \
     total_sums.s1 += ((bits4.s5 & 0x000F) * scale.s1 - minv.s1) * shared_y; \
-    shared_y = sub_group_broadcast(y.s1, 1); \
+    shared_y = fetch(yb, s1, 1); \
     total_sums.s0 += (((bits4.s4 & 0x00F0) >> 4) * scale.s0 - minv.s0) * shared_y; \
     total_sums.s1 += (((bits4.s5 & 0x00F0) >> 4) * scale.s1 - minv.s1) * shared_y; \
-    shared_y = sub_group_broadcast(y.s2, 1); \
+    shared_y = fetch(yb, s2, 1); \
     total_sums.s0 += (((bits4.s4 & 0x0F00) >> 8) * scale.s0 - minv.s0) * shared_y; \
     total_sums.s1 += (((bits4.s5 & 0x0F00) >> 8) * scale.s1 - minv.s1) * shared_y; \
-    shared_y = sub_group_broadcast(y.s3, 1); \
+    shared_y = fetch(yb, s3, 1); \
     total_sums.s0 += (((bits4.s4 & 0xF000) >> 12) * scale.s0 - minv.s0) * shared_y; \
     total_sums.s1 += (((bits4.s5 & 0xF000) >> 12) * scale.s1 - minv.s1) * shared_y; \
-    shared_y = sub_group_broadcast(y.s4, 1); \
+    shared_y = fetch(yb, s4, 1); \
     total_sums.s0 += ((bits4.s6 & 0x000F) * scale.s0 - minv.s0) * shared_y; \
     total_sums.s1 += ((bits4.s7 & 0x000F) * scale.s1 - minv.s1) * shared_y; \
-    shared_y = sub_group_broadcast(y.s5, 1); \
+    shared_y = fetch(yb, s5, 1); \
     total_sums.s0 += (((bits4.s6 & 0x00F0) >> 4) * scale.s0 - minv.s0) * shared_y; \
     total_sums.s1 += (((bits4.s7 & 0x00F0) >> 4) * scale.s1 - minv.s1) * shared_y; \
-    shared_y = sub_group_broadcast(y.s6, 1); \
+    shared_y = fetch(yb, s6, 1); \
     total_sums.s0 += (((bits4.s6 & 0x0F00) >> 8) * scale.s0 - minv.s0) * shared_y; \
     total_sums.s1 += (((bits4.s7 & 0x0F00) >> 8) * scale.s1 - minv.s1) * shared_y; \
-    shared_y = sub_group_broadcast(y.s7, 1); \
+    shared_y = fetch(yb, s7, 1); \
     total_sums.s0 += (((bits4.s6 & 0xF000) >> 12) * scale.s0 - minv.s0) * shared_y; \
     total_sums.s1 += (((bits4.s7 & 0xF000) >> 12) * scale.s1 - minv.s1) * shared_y; \
 
 
 #define dequantizeBlockAccum_ns_sgbroadcast_1_lo(total_sums, bits4, scale, minv, y) \
-    shared_y = sub_group_broadcast(y.s0, 2); \
+    dequantizeBlockAccum_ns_fetch_lo(total_sums, bits4, scale, minv, ACT_BROADCAST, y, y)
+
+#define dequantizeBlockAccum_ns_fetch_lo(total_sums, bits4, scale, minv, fetch, ya, yb) \
+    shared_y = fetch(ya, s0, 2); \
     total_sums.s0 += ((bits4.s0 & 0x000F) * scale.s0 - minv.s0) * shared_y; \
     total_sums.s1 += ((bits4.s1 & 0x000F) * scale.s1 - minv.s1) * shared_y; \
-    shared_y = sub_group_broadcast(y.s1, 2); \
+    shared_y = fetch(ya, s1, 2); \
     total_sums.s0 += (((bits4.s0 & 0x00F0) >> 4) * scale.s0 - minv.s0) * shared_y; \
     total_sums.s1 += (((bits4.s1 & 0x00F0) >> 4) * scale.s1 - minv.s1) * shared_y; \
-    shared_y = sub_group_broadcast(y.s2, 2); \
+    shared_y = fetch(ya, s2, 2); \
     total_sums.s0 += (((bits4.s0 & 0x0F00) >> 8) * scale.s0 - minv.s0) * shared_y; \
     total_sums.s1 += (((bits4.s1 & 0x0F00) >> 8) * scale.s1 - minv.s1) * shared_y; \
-    shared_y = sub_group_broadcast(y.s3, 2); \
+    shared_y = fetch(ya, s3, 2); \
     total_sums.s0 += (((bits4.s0 & 0xF000) >> 12) * scale.s0 - minv.s0) * shared_y; \
     total_sums.s1 += (((bits4.s1 & 0xF000) >> 12) * scale.s1 - minv.s1) * shared_y; \
-    shared_y = sub_group_broadcast(y.s4, 2); \
+    shared_y = fetch(ya, s4, 2); \
     total_sums.s0 += ((bits4.s2 & 0x000F) * scale.s0 - minv.s0) * shared_y; \
     total_sums.s1 += ((bits4.s3 & 0x000F) * scale.s1 - minv.s1) * shared_y; \
-    shared_y = sub_group_broadcast(y.s5, 2); \
+    shared_y = fetch(ya, s5, 2); \
     total_sums.s0 += (((bits4.s2 & 0x00F0) >> 4) * scale.s0 - minv.s0) * shared_y; \
     total_sums.s1 += (((bits4.s3 & 0x00F0) >> 4) * scale.s1 - minv.s1) * shared_y; \
-    shared_y = sub_group_broadcast(y.s6, 2); \
+    shared_y = fetch(ya, s6, 2); \
     total_sums.s0 += (((bits4.s2 & 0x0F00) >> 8) * scale.s0 - minv.s0) * shared_y; \
     total_sums.s1 += (((bits4.s3 & 0x0F00) >> 8) * scale.s1 - minv.s1) * shared_y; \
-    shared_y = sub_group_broadcast(y.s7, 2); \
+    shared_y = fetch(ya, s7, 2); \
     total_sums.s0 += (((bits4.s2 & 0xF000) >> 12) * scale.s0 - minv.s0) * shared_y; \
     total_sums.s1 += (((bits4.s3 & 0xF000) >> 12) * scale.s1 - minv.s1) * shared_y; \
-    shared_y = sub_group_broadcast(y.s0, 3); \
+    shared_y = fetch(yb, s0, 3); \
     total_sums.s0 += ((bits4.s4 & 0x000F) * scale.s0 - minv.s0) * shared_y; \
     total_sums.s1 += ((bits4.s5 & 0x000F) * scale.s1 - minv.s1) * shared_y; \
-    shared_y = sub_group_broadcast(y.s1, 3); \
+    shared_y = fetch(yb, s1, 3); \
     total_sums.s0 += (((bits4.s4 & 0x00F0) >> 4) * scale.s0 - minv.s0) * shared_y; \
     total_sums.s1 += (((bits4.s5 & 0x00F0) >> 4) * scale.s1 - minv.s1) * shared_y; \
-    shared_y = sub_group_broadcast(y.s2, 3); \
+    shared_y = fetch(yb, s2, 3); \
     total_sums.s0 += (((bits4.s4 & 0x0F00) >> 8) * scale.s0 - minv.s0) * shared_y; \
     total_sums.s1 += (((bits4.s5 & 0x0F00) >> 8) * scale.s1 - minv.s1) * shared_y; \
-    shared_y = sub_group_broadcast(y.s3, 3); \
+    shared_y = fetch(yb, s3, 3); \
     total_sums.s0 += (((bits4.s4 & 0xF000) >> 12) * scale.s0 - minv.s0) * shared_y; \
     total_sums.s1 += (((bits4.s5 & 0xF000) >> 12) * scale.s1 - minv.s1) * shared_y; \
-    shared_y = sub_group_broadcast(y.s4, 3); \
+    shared_y = fetch(yb, s4, 3); \
     total_sums.s0 += ((bits4.s6 & 0x000F) * scale.s0 - minv.s0) * shared_y; \
     total_sums.s1 += ((bits4.s7 & 0x000F) * scale.s1 - minv.s1) * shared_y; \
-    shared_y = sub_group_broadcast(y.s5, 3); \
+    shared_y = fetch(yb, s5, 3); \
     total_sums.s0 += (((bits4.s6 & 0x00F0) >> 4) * scale.s0 - minv.s0) * shared_y; \
     total_sums.s1 += (((bits4.s7 & 0x00F0) >> 4) * scale.s1 - minv.s1) * shared_y; \
-    shared_y = sub_group_broadcast(y.s6, 3); \
+    shared_y = fetch(yb, s6, 3); \
     total_sums.s0 += (((bits4.s6 & 0x0F00) >> 8) * scale.s0 - minv.s0) * shared_y; \
     total_sums.s1 += (((bits4.s7 & 0x0F00) >> 8) * scale.s1 - minv.s1) * shared_y; \
-    shared_y = sub_group_broadcast(y.s7, 3); \
+    shared_y = fetch(yb, s7, 3); \
     total_sums.s0 += (((bits4.s6 & 0xF000) >> 12) * scale.s0 - minv.s0) * shared_y; \
     total_sums.s1 += (((bits4.s7 & 0xF000) >> 12) * scale.s1 - minv.s1) * shared_y; \
 
@@ -601,7 +610,11 @@ kernel void kernel_gemv_splitk_reduce_f32(
 // Multi-column kernel_gemv_noshuffle_q4_k_f32, built once per MC_N_COLS (2..8): weights load once per K-block and
 // each column runs the 1-column dequant-accumulate (bit-identical to it at the same work-group height).
 #define MC_MAX_NSG 16
+// From MC_STAGE_MIN_COLS columns on, the activations come from a local-memory slice instead of per-column broadcasts.
+#define MC_STAGE_MIN_COLS 4
+#define MC_BLOCK_PIXELS   8 // float4 activation pixels per 32-element block
 
+#if MC_N_COLS < MC_STAGE_MIN_COLS
 #ifdef VECTOR_SUB_GROUP_BROADCAST
 #define Q4K_MC_DEQ_HI dequantizeBlockAccum_ns_sgbroadcast_8_hi
 #define Q4K_MC_DEQ_LO dequantizeBlockAccum_ns_sgbroadcast_8_lo
@@ -615,6 +628,20 @@ kernel void kernel_gemv_splitk_reduce_f32(
                     regB.s4567 = read_imagef(src1, (c) * COL_STRIDE + 1 + slid * 2 + k * 8); } \
     Q4K_MC_DEQ_HI(ts, as_ushort8(regA_hi), regS, regM, regB); \
     Q4K_MC_DEQ_LO(ts, as_ushort8(regA_lo), regS, regM, regB); }
+#else
+// Every lane reads the staged block itself, so the lane argument is not needed.
+#define ACT_LOCAL(v, e, lane) v.e
+// The fence keeps the compiler from hoisting every column's local loads, which spilled registers at n8 on A740.
+#define Q4K_MC_COL(ts, c) { \
+    mem_fence(CLK_LOCAL_MEM_FENCE); \
+    local const float4 * sp = mc_stage + (groupId * MC_N_COLS + (c)) * MC_BLOCK_PIXELS; \
+    const float8 y0 = (float8)(sp[0], sp[1]); \
+    const float8 y1 = (float8)(sp[2], sp[3]); \
+    const float8 y2 = (float8)(sp[4], sp[5]); \
+    const float8 y3 = (float8)(sp[6], sp[7]); \
+    dequantizeBlockAccum_ns_fetch_hi(ts, as_ushort8(regA_hi), regS, regM, ACT_LOCAL, y0, y1); \
+    dequantizeBlockAccum_ns_fetch_lo(ts, as_ushort8(regA_lo), regS, regM, ACT_LOCAL, y2, y3); }
+#endif
 
 // Sums the nsg subgroup partials of one column in subgroup order and stores its two rows.
 inline void reduce_store_col_q4k(float2 ts, uint col, local float2 * lm, uint sg, ushort slid, uint nsg,
@@ -671,6 +698,10 @@ kernel void kernel_gemv_noshuffle_q4_k_f32_mc(
     float2 ts0 = 0.0f, ts1 = 0.0f, ts2 = 0.0f, ts3 = 0.0f;
     float2 ts4 = 0.0f, ts5 = 0.0f, ts6 = 0.0f, ts7 = 0.0f;
 
+#if MC_N_COLS >= MC_STAGE_MIN_COLS
+    local float4 mc_stage[MC_MAX_NSG * MC_N_COLS * MC_BLOCK_PIXELS];
+#endif
+
     for (uint k = groupId; k < (K / 32); k += nsg) {
         uint sb = k / 8;
         uint j  = k % 8;
@@ -697,6 +728,16 @@ kernel void kernel_gemv_noshuffle_q4_k_f32_mc(
         regA_lo.s2 = read_imageui(src0_q, (gid_s + k * BLOCK_STRIDE_A + LINE_STRIDE_A * 6)).x;
         regA_lo.s3 = read_imageui(src0_q, (gid_s + k * BLOCK_STRIDE_A + LINE_STRIDE_A * 7)).x;
 
+#if MC_N_COLS >= MC_STAGE_MIN_COLS
+        // Stage this block's activations for every column in the subgroup's own slice. The first barrier keeps the
+        // previous block's reads ahead of the overwrite, the second makes the writes visible to every lane.
+        sub_group_barrier(CLK_LOCAL_MEM_FENCE);
+        if (slid < MC_N_COLS * MC_BLOCK_PIXELS) {
+            mc_stage[groupId * MC_N_COLS * MC_BLOCK_PIXELS + slid] = read_imagef(src1,
+                (slid / MC_BLOCK_PIXELS) * COL_STRIDE + k * MC_BLOCK_PIXELS + slid % MC_BLOCK_PIXELS);
+        }
+        sub_group_barrier(CLK_LOCAL_MEM_FENCE);
+#endif
         Q4K_MC_COL(ts0, 0);
         Q4K_MC_COL(ts1, 1);
         if (MC_N_COLS > 2) Q4K_MC_COL(ts2, 2);
