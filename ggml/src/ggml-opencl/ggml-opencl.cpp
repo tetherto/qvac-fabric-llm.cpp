@@ -22848,6 +22848,35 @@ static cl_mem ggml_cl_img_pool_get_or_create(
     return img;
 }
 
+// Largest src1 column count handled as a small (speculative verify) batch.
+static constexpr int64_t GGML_CL_SMALL_BATCH_MAX = 8;
+// The small-N f32 GEMV assigns one work-group per output, so it only pays off for skinny weights.
+static constexpr int64_t GGML_CL_F32_SMALL_N_MAX_ROWS = 512;
+static constexpr cl_ulong GGML_CL_FLOAT4_ALIGN = 16;
+
+// The A7X compiler (E031.41) spills registers in the K-loop of the tiled f32/f16 GEMMs and runs them
+// ~10x slower at any ne11, so A7X takes the GEMV kernels. GGML_OPENCL_A7X_F32_LM_BYPASS=0 keeps the tiled GEMMs.
+static bool ggml_cl_a7x_skip_tiled_gemm(const ggml_backend_opencl_context * backend_ctx) {
+    static const char * env    = getenv("GGML_OPENCL_A7X_F32_LM_BYPASS");
+    static const bool   bypass = env == nullptr || env[0] != '0';
+    return bypass && backend_ctx->adreno_gen == ADRENO_GPU_GEN::A7X;
+}
+
+// Small-N f32 GEMV (one 64-thread work-group per output) for verify batches with a skinny weight such as
+// GDN ssm_alpha/ssm_beta. Default on for A7X; GGML_OPENCL_F32_MC=0/1 forces it off/on.
+static bool ggml_cl_use_f32_small_n_gemv(const ggml_backend_opencl_context * backend_ctx,
+                                          const ggml_tensor * src0, const ggml_tensor * src1,
+                                          cl_ulong offset0, cl_ulong offset1) {
+    static const char * env = getenv("GGML_OPENCL_F32_MC");
+    const bool enabled = env != nullptr ? atoi(env) != 0 : backend_ctx->adreno_gen == ADRENO_GPU_GEN::A7X;
+    return enabled &&
+           src1->ne[1] >= 2 && src1->ne[1] <= GGML_CL_SMALL_BATCH_MAX &&
+           src0->ne[1] <= GGML_CL_F32_SMALL_N_MAX_ROWS && src0->ne[0] % 4 == 0 &&
+           src0->ne[2] == 1 && src1->ne[2] == 1 && src1->ne[3] == 1 &&
+           ggml_is_contiguous(src0) && ggml_is_contiguous(src1) &&
+           offset0 % GGML_CL_FLOAT4_ALIGN == 0 && offset1 % GGML_CL_FLOAT4_ALIGN == 0;
+}
+
 static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     GGML_ASSERT(src0);
     GGML_ASSERT(src0->extra);
@@ -23323,30 +23352,12 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
 
     // GEMM using local memory
     // Current BK = 16, so ne00 % 16 == 0
-    //
-    // Certain A7X compiler (E031.41) executes kernel_mul_mm_f32_f32_l4_lm poorly;
-    // matrices with ne11 <= 8 appears OK.
-    // Fallback to the MV style kernels for A7x and ne11 > 8.
-    // Override with GGML_OPENCL_A7X_F32_LM_BYPASS=0.
-    static const char * a7x_f32lm_env    = getenv("GGML_OPENCL_A7X_F32_LM_BYPASS");
-    static const bool   a7x_f32lm_bypass = (a7x_f32lm_env == nullptr || a7x_f32lm_env[0] != '0');
     if (src1t == GGML_TYPE_F32 &&
         ne00 % 16 == 0 &&
-        ne11 > 1 &&
-        !(a7x_f32lm_bypass && src0t == GGML_TYPE_F32 && ne11 > 8 &&
-          backend_ctx->adreno_gen == ADRENO_GPU_GEN::A7X)) {
+        ne11 > 1) {
         switch(src0t) {
             case GGML_TYPE_F32: {
-                // Small-N f32 GEMV for the spec/MTP verify batch: the tiled GEMM
-                // below always computes a full 64x64 tile, so at ne11=3 with a
-                // skinny f32 weight (GDN ssm_alpha/ssm_beta, M=32) it launches one
-                // under-occupied WG at ~2.3% tile utilization. Route to a per-output
-                // (m,n) GEMV (64-thread WG, K-split + __local reduce) instead.
-                // Opt-in GGML_OPENCL_F32_MC=1; 2D contiguous, small N + skinny M only.
-                static const bool f32_mc = (getenv("GGML_OPENCL_F32_MC") != nullptr);
-                if (f32_mc && ne11 >= 2 && ne11 <= 8 && ne01 <= 512 && (ne00 % 4 == 0) &&
-                    ne02 == 1 && ne12 == 1 && ne13 == 1 &&
-                    ggml_is_contiguous(src0) && ggml_is_contiguous(src1)) {
+                if (ggml_cl_use_f32_small_n_gemv(backend_ctx, src0, src1, offset0, offset1)) {
                     cl_kernel kmc = backend_ctx->kernel_gemv_f32_f32_mc;
                     int stride_a = ne00, stride_b = ne00, stride_d = ne01;
                     CL_CHECK(clSetKernelArg(kmc,  0, sizeof(cl_mem),   &extra0->data_device));
@@ -23365,6 +23376,9 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                     size_t lws[3] = {64, 1, 1};
                     backend_ctx->enqueue_ndrange_kernel(kmc, 3, gws, lws, dst);
                     return;
+                }
+                if (ggml_cl_a7x_skip_tiled_gemm(backend_ctx)) {
+                    break;
                 }
                 kernel = backend_ctx->kernel_mul_mm_f32_f32_l4_lm;
                 nth0 = 128; // calculated as (BM*BN)/(TM*TN)
@@ -23439,6 +23453,9 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                     return;
                 }
 #endif
+                if (ggml_cl_a7x_skip_tiled_gemm(backend_ctx) && ne11 <= GGML_CL_SMALL_BATCH_MAX) {
+                    break;
+                }
                 kernel = backend_ctx->kernel_mul_mm_f16_f32_l4_lm;
                 nth0 = 128; // calculated as (BM*BN)/(TM*TN)
 
