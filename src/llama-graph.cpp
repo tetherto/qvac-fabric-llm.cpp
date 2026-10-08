@@ -2855,7 +2855,12 @@ ggml_tensor * llm_graph_context::build_attn_mha_runs(
 
         ggml_tensor * cur = build_attn_mha(q_r, k, v, nullptr, kq_mask_r, sinks, v_mla, 0, kq_scale, il);
 
+        // copy out of the attention node and add it to the graph now, so its temp buffers are freed before the next run
+        cur = ggml_cont(ctx0, cur);
+
         res = res ? ggml_concat(ctx0, res, cur, 1) : cur;
+
+        ggml_build_forward_expand(gf, res);
     }
 
     return res;
