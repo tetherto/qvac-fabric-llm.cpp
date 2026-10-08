@@ -218,7 +218,12 @@ OMP_WAIT_POLICY=PASSIVE ./build/bin/llama-server -m model.gguf \
     --reasoning off --poll 0 --port 8080
 ```
 
-- `--list-devices` shows the NPU; `--device none` forces pure-CPU execution.
+- `--list-devices` shows the NPU as `XDNA0`; `--device none` forces pure-CPU
+  execution.
+- The NPU is an integrated device to llama.cpp. In a build with another GPU
+  backend, llama.cpp by default takes that GPU instead (a discrete one, or an
+  iGPU registered before XDNA, as Vulkan's is); `--device XDNA0` selects the
+  NPU.
 - `--poll 0` stops the threadpool busy-polling while the NPU works;
   `OMP_WAIT_POLICY=PASSIVE` does the same for the host fallback pool.
 - Offload as usual: `-ngl 99` puts every layer on the device.
@@ -316,5 +321,6 @@ default to the fast path and are read where they are used.
 - All llama contexts in a process share one backend context. Their graph
   computes take turns on it (the array runs one command stream at a time
   anyway).
-- The device reports itself to the scheduler as a GPU while its buffers are host
-  memory, so the reported free memory and any `--fit` accounting are nominal.
+- The device reports itself to the scheduler as an integrated GPU: its buffers
+  are host memory, and the free memory it reports is all of system memory, so
+  any `--fit` accounting is nominal.
