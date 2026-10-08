@@ -30472,6 +30472,47 @@ static void ggml_cl_fwht(ggml_backend_t backend, const ggml_tensor * src, ggml_t
     backend_ctx->enqueue_ndrange_kernel(kernel, 2, global, local, dst);
 }
 
+// Largest src1 column count handled as a small (speculative verify) batch.
+static constexpr int64_t GGML_CL_SMALL_BATCH_MAX = 8;
+// The small-N f32 GEMV assigns one work-group per output, so it only pays off for skinny weights.
+static constexpr int64_t GGML_CL_F32_SMALL_N_MAX_ROWS = 512;
+static constexpr cl_ulong GGML_CL_FLOAT4_ALIGN = 16;
+
+// The E031.41 compiler spills registers in the K-loop of the tiled f32 GEMM and runs it ~10x slower at any ne11.
+static constexpr int ADRENO_E031_F32_GEMM_SPILL_MAJOR = 41;
+
+static bool ggml_cl_compiler_spills_f32_gemm(const ggml_backend_opencl_context * backend_ctx) {
+    return backend_ctx->adreno_cl_compiler_version.type == ADRENO_CL_COMPILER_TYPE::E031 &&
+           backend_ctx->adreno_cl_compiler_version.major == ADRENO_E031_F32_GEMM_SPILL_MAJOR;
+}
+
+// A small batch fills few tiles of the tiled f32/f16 GEMMs, so every Adreno takes the GEMV kernels for it; larger
+// f32 batches do so only where the compiler spills. GGML_OPENCL_A7X_F32_LM_BYPASS=0 keeps the tiled GEMMs.
+static bool ggml_cl_skip_tiled_gemm(const ggml_backend_opencl_context * backend_ctx, ggml_type src0t, int64_t ne11) {
+    static const char * env    = getenv("GGML_OPENCL_A7X_F32_LM_BYPASS");
+    static const bool   bypass = env == nullptr || env[0] != '0';
+    if (!bypass || backend_ctx->gpu_family != GPU_FAMILY::ADRENO) {
+        return false;
+    }
+    return ne11 <= GGML_CL_SMALL_BATCH_MAX || (src0t == GGML_TYPE_F32 && ggml_cl_compiler_spills_f32_gemm(backend_ctx));
+}
+
+// Small-N f32 GEMV (one 64-thread work-group per output) for verify batches with a skinny weight such as
+// GDN ssm_alpha/ssm_beta. Default on for every Adreno; GGML_OPENCL_F32_MC=0 turns it off.
+static bool ggml_cl_use_f32_small_n_gemv(const ggml_backend_opencl_context * backend_ctx,
+                                          const ggml_tensor * src0, const ggml_tensor * src1,
+                                          cl_ulong offset0, cl_ulong offset1) {
+    static const char * env = getenv("GGML_OPENCL_F32_MC");
+    static const bool   off = env != nullptr && env[0] == '0';
+    const bool enabled = !off && backend_ctx->gpu_family == GPU_FAMILY::ADRENO;
+    return enabled &&
+           src1->ne[1] >= 2 && src1->ne[1] <= GGML_CL_SMALL_BATCH_MAX &&
+           src0->ne[1] <= GGML_CL_F32_SMALL_N_MAX_ROWS && src0->ne[0] % 4 == 0 &&
+           src0->ne[2] == 1 && src1->ne[2] == 1 && src1->ne[3] == 1 &&
+           ggml_is_contiguous(src0) && ggml_is_contiguous(src1) &&
+           offset0 % GGML_CL_FLOAT4_ALIGN == 0 && offset1 % GGML_CL_FLOAT4_ALIGN == 0;
+}
+
 static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     GGML_ASSERT(src0);
     GGML_ASSERT(src0->extra);
@@ -31033,30 +31074,12 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
 
     // GEMM using local memory
     // Current BK = 16, so ne00 % 16 == 0
-    //
-    // Certain A7X compiler (E031.41) executes kernel_mul_mm_f32_f32_l4_lm poorly;
-    // matrices with ne11 <= 8 appears OK.
-    // Fallback to the MV style kernels for A7x and ne11 > 8.
-    // Override with GGML_OPENCL_A7X_F32_LM_BYPASS=0.
-    static const char * a7x_f32lm_env    = getenv("GGML_OPENCL_A7X_F32_LM_BYPASS");
-    static const bool   a7x_f32lm_bypass = (a7x_f32lm_env == nullptr || a7x_f32lm_env[0] != '0');
     if (src1t == GGML_TYPE_F32 &&
         ne00 % 16 == 0 &&
-        ne11 > 1 &&
-        !(a7x_f32lm_bypass && src0t == GGML_TYPE_F32 && ne11 > 8 &&
-          backend_ctx->adreno_gen == ADRENO_GPU_GEN::A7X)) {
+        ne11 > 1) {
         switch(src0t) {
             case GGML_TYPE_F32: {
-                // Small-N f32 GEMV for the spec/MTP verify batch: the tiled GEMM
-                // below always computes a full 64x64 tile, so at ne11=3 with a
-                // skinny f32 weight (GDN ssm_alpha/ssm_beta, M=32) it launches one
-                // under-occupied WG at ~2.3% tile utilization. Route to a per-output
-                // (m,n) GEMV (64-thread WG, K-split + __local reduce) instead.
-                // Opt-in GGML_OPENCL_F32_MC=1; 2D contiguous, small N + skinny M only.
-                static const bool f32_mc = (getenv("GGML_OPENCL_F32_MC") != nullptr);
-                if (f32_mc && ne11 >= 2 && ne11 <= 8 && ne01 <= 512 && (ne00 % 4 == 0) &&
-                    ne02 == 1 && ne12 == 1 && ne13 == 1 &&
-                    ggml_is_contiguous(src0) && ggml_is_contiguous(src1)) {
+                if (ggml_cl_use_f32_small_n_gemv(backend_ctx, src0, src1, offset0, offset1)) {
                     cl_kernel kmc = backend_ctx->kernel_gemv_f32_f32_mc;
                     int stride_a = ne00, stride_b = ne00, stride_d = ne01;
                     CL_CHECK(clSetKernelArg(kmc,  0, sizeof(cl_mem),   &extra0->data_device));
@@ -31075,6 +31098,9 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                     size_t lws[3] = {64, 1, 1};
                     backend_ctx->enqueue_ndrange_kernel(kmc, 3, gws, lws, dst);
                     return;
+                }
+                if (ggml_cl_skip_tiled_gemm(backend_ctx, src0t, ne11)) {
+                    break;
                 }
                 kernel = backend_ctx->kernel_mul_mm_f32_f32_l4_lm;
                 nth0 = 128; // calculated as (BM*BN)/(TM*TN)
@@ -31149,6 +31175,9 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                     return;
                 }
 #endif
+                if (ggml_cl_skip_tiled_gemm(backend_ctx, src0t, ne11)) {
+                    break;
+                }
                 static const char * mm_narrow_n_env = getenv("GGML_OPENCL_MM_NARROW_N");
                 const bool use_narrow_n = (mm_narrow_n_env == nullptr || mm_narrow_n_env[0] != '0') && ne11 >= 2 && ne11 <= 8;
                 kernel = use_narrow_n ? backend_ctx->kernel_mul_mm_f16_f32_l4_lm_n8 : backend_ctx->kernel_mul_mm_f16_f32_l4_lm;
