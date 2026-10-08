@@ -8,10 +8,29 @@
 #define REQD_SUBGROUP_SIZE_64  __attribute__((qcom_reqd_sub_group_size("half")))
 #endif
 
+// Padded src1 columns per work item: 8 by default, 4 builds kernel_gemm_noshuffle_q6_K_f32_n4 alone in its own program.
+#ifndef Q6K_GEMM_COLS
+#define Q6K_GEMM_COLS 8
+#endif
+#if Q6K_GEMM_COLS == 8
+#define Q6K_GEMM_NAME         kernel_gemm_noshuffle_q6_K_f32
+#define Q6K_GEMM_HALF_T       half8
+#define Q6K_GEMM_COLS_LOG2    3
+#define Q6K_GEMM_LOAD_B(r)    B.s0123 = read_imageh(src1, gy*2 + (r)*n_4 + 0); \
+                              B.s4567 = read_imageh(src1, gy*2 + (r)*n_4 + 1);
+#elif Q6K_GEMM_COLS == 4
+#define Q6K_GEMM_NAME         kernel_gemm_noshuffle_q6_K_f32_n4
+#define Q6K_GEMM_HALF_T       half4
+#define Q6K_GEMM_COLS_LOG2    2
+#define Q6K_GEMM_LOAD_B(r)    B = read_imageh(src1, gy + (r)*n_4);
+#else
+#error "Q6K_GEMM_COLS must be 4 or 8"
+#endif
+
 #ifdef ADRENO_GPU
 REQD_SUBGROUP_SIZE_128
 #endif
-kernel void kernel_gemm_noshuffle_q6_K_f32(
+kernel void Q6K_GEMM_NAME(
         global const ushort * src0_ql,
         global const uchar  * src0_qh,
         global const ushort * src0_s,
@@ -35,8 +54,8 @@ kernel void kernel_gemm_noshuffle_q6_K_f32(
     int gx = get_global_id(1); // m
     int gx_2 = gx << 2;
 
-    half8 c0 = 0, c1 = 0, c2 = 0, c3 = 0;
-    half8 B;
+    Q6K_GEMM_HALF_T c0 = 0, c1 = 0, c2 = 0, c3 = 0;
+    Q6K_GEMM_HALF_T B;
     half4 dequantized_weights;
 
     global const ushort * ptr_ql = src0_ql + gx_2;
@@ -56,9 +75,8 @@ kernel void kernel_gemm_noshuffle_q6_K_f32(
         half4   scale_d = vload4(0, ptr_d + (i/256)*m);  // 1 half scale every 256 elements
 
         // j=0
-        // load 2x 4 elements of activations on N, corresponding to 8 rows on N
-        B.s0123 = read_imageh(src1, gy*2 + (i + 0)*n_4 + 0);
-        B.s4567 = read_imageh(src1, gy*2 + (i + 0)*n_4 + 1);
+        // load the Q6K_GEMM_COLS activations of this work item's columns
+        Q6K_GEMM_LOAD_B(i + 0)
         dequantized_weights.s0 = (convert_half((bits4.s0 & 0x000F) | ((bits2.s0 & 0x03) << 4)) - 32.f) * scale_s.s0 * scale_d.s0;
         dequantized_weights.s1 = (convert_half((bits4.s1 & 0x000F) | ((bits2.s1 & 0x03) << 4)) - 32.f) * scale_s.s1 * scale_d.s1;
         dequantized_weights.s2 = (convert_half((bits4.s2 & 0x000F) | ((bits2.s2 & 0x03) << 4)) - 32.f) * scale_s.s2 * scale_d.s2;
@@ -69,8 +87,7 @@ kernel void kernel_gemm_noshuffle_q6_K_f32(
         c3 += B * dequantized_weights.s3;
 
         // j=1
-        B.s0123 = read_imageh(src1, gy*2 + (i + 1)*n_4 + 0);
-        B.s4567 = read_imageh(src1, gy*2 + (i + 1)*n_4 + 1);
+        Q6K_GEMM_LOAD_B(i + 1)
         dequantized_weights.s0 = (convert_half((((bits4.s0 & 0x00F0) >> 4) | ((bits2.s0 & 0x0C) << 2))) - 32.f) * scale_s.s0 * scale_d.s0;
         dequantized_weights.s1 = (convert_half((((bits4.s1 & 0x00F0) >> 4) | ((bits2.s1 & 0x0C) << 2))) - 32.f) * scale_s.s1 * scale_d.s1;
         dequantized_weights.s2 = (convert_half((((bits4.s2 & 0x00F0) >> 4) | ((bits2.s2 & 0x0C) << 2))) - 32.f) * scale_s.s2 * scale_d.s2;
@@ -81,8 +98,7 @@ kernel void kernel_gemm_noshuffle_q6_K_f32(
         c3 += B * dequantized_weights.s3;
 
         // j=2
-        B.s0123 = read_imageh(src1, gy*2 + (i + 2)*n_4 + 0);
-        B.s4567 = read_imageh(src1, gy*2 + (i + 2)*n_4 + 1);
+        Q6K_GEMM_LOAD_B(i + 2)
         dequantized_weights.s0 = (convert_half((((bits4.s0 & 0x0F00) >> 8) | (bits2.s0 & 0x30))) - 32.f) * scale_s.s0 * scale_d.s0;
         dequantized_weights.s1 = (convert_half((((bits4.s1 & 0x0F00) >> 8) | (bits2.s1 & 0x30))) - 32.f) * scale_s.s1 * scale_d.s1;
         dequantized_weights.s2 = (convert_half((((bits4.s2 & 0x0F00) >> 8) | (bits2.s2 & 0x30))) - 32.f) * scale_s.s2 * scale_d.s2;
@@ -93,8 +109,7 @@ kernel void kernel_gemm_noshuffle_q6_K_f32(
         c3 += B * dequantized_weights.s3;
 
         // j=3
-        B.s0123 = read_imageh(src1, gy*2 + (i + 3)*n_4 + 0);
-        B.s4567 = read_imageh(src1, gy*2 + (i + 3)*n_4 + 1);
+        Q6K_GEMM_LOAD_B(i + 3)
         dequantized_weights.s0 = (convert_half((((bits4.s0 & mask_f000) >> 12) | ((bits2.s0 & mask_c0) >> 2))) - 32.f) * scale_s.s0 * scale_d.s0;
         dequantized_weights.s1 = (convert_half((((bits4.s1 & mask_f000) >> 12) | ((bits2.s1 & mask_c0) >> 2))) - 32.f) * scale_s.s1 * scale_d.s1;
         dequantized_weights.s2 = (convert_half((((bits4.s2 & mask_f000) >> 12) | ((bits2.s2 & mask_c0) >> 2))) - 32.f) * scale_s.s2 * scale_d.s2;
@@ -105,7 +120,7 @@ kernel void kernel_gemm_noshuffle_q6_K_f32(
         c3 += B * dequantized_weights.s3;
     }
 
-    int idx = (gy<<3)*m + (gx<<2);
+    int idx = (gy<<Q6K_GEMM_COLS_LOG2)*m + (gx<<2);
 
     if(idx+3 < m*n_no_padding){
         vstore4((float4)(c0.s0, c1.s0, c2.s0, c3.s0), 0, dst + idx);
@@ -123,6 +138,7 @@ kernel void kernel_gemm_noshuffle_q6_K_f32(
         vstore4((float4)(c0.s3, c1.s3, c2.s3, c3.s3), 0, dst + idx);
         idx += m;
     }
+#if Q6K_GEMM_COLS == 8
     if(idx+3 < m*n_no_padding){
         vstore4((float4)(c0.s4, c1.s4, c2.s4, c3.s4), 0, dst + idx);
         idx += m;
@@ -138,7 +154,10 @@ kernel void kernel_gemm_noshuffle_q6_K_f32(
     if(idx+3 < m*n_no_padding){
         vstore4((float4)(c0.s7, c1.s7, c2.s7, c3.s7), 0, dst + idx);
     }
+#endif
 }
+
+#if Q6K_GEMM_COLS == 8
 
 // Cooperative-K q6_K GEMM for the small-batch (n_q in [2..8]) path. Same idea
 // as the q4_K _cok kernel: WG = (COK_SG lanes x COK_NSG subgroups), each lane
@@ -243,3 +262,4 @@ kernel void kernel_gemm_noshuffle_q6_K_f32_cok(
         if (idx < m*n_no_padding) { dst[idx] = sum.s7; }
     }
 }
+#endif // Q6K_GEMM_COLS == 8

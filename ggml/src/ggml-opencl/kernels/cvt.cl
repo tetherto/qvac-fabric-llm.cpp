@@ -29,6 +29,8 @@
 #define QR8_0                   1
 #define QK1_0                   128
 #define QR1_0                   1
+#define QK_PQ2_0                128
+#define PQ2_0_WORDS             (QK_PQ2_0/16) // 32-bit quant words per block, 16 codes each
 #define QK_K                    256
 #define K_SCALE_SIZE            (3 * QK_K / 64)
 #define K_QUANTS_PER_ITERATION  2
@@ -126,6 +128,14 @@ typedef struct {
     half d;             // delta
     uchar qs[QK1_0/8];  // 1-bit signs (16 bytes)
 } block_q1_0;
+
+//------------------------------------------------------------------------------
+// block_pq2_0
+//------------------------------------------------------------------------------
+typedef struct {
+    half d;                // delta
+    uchar qs[QK_PQ2_0/4];  // 2-bit codes (32 bytes)
+} block_pq2_0;
 
 //------------------------------------------------------------------------------
 // block_q4_0
@@ -281,6 +291,55 @@ kernel void kernel_restore_block_q1_0(
     b->d = *d;
     for (int i = 0; i < QK1_0/8; ++i) {
         b->qs[i] = q[i];
+    }
+}
+
+//------------------------------------------------------------------------------
+// kernel_convert_block_pq2_0
+// Convert block_pq2_0 (AOS) to SOA stored word-major, so consecutive work items
+// of the mat-vec read consecutive rows: 32-bit quant word w of row r at
+// w*n_rows + r, the scale of block b of row r at b*n_rows + r.
+//------------------------------------------------------------------------------
+kernel void kernel_convert_block_pq2_0(
+    global block_pq2_0 * src0,
+    global uint        * dst_q,
+    global half        * dst_d,
+    int                  n_rows,
+    int                  nb_row
+) {
+    const int i = get_global_id(0);
+    const int r = i/nb_row;
+    const int b = i%nb_row;
+
+    global block_pq2_0 * blk = src0 + i;
+
+    dst_d[b*n_rows + r] = blk->d;
+    for (int j = 0; j < PQ2_0_WORDS; ++j) {
+        dst_q[(b*PQ2_0_WORDS + j)*n_rows + r] =
+            as_uint((uchar4)(blk->qs[4*j], blk->qs[4*j + 1], blk->qs[4*j + 2], blk->qs[4*j + 3]));
+    }
+}
+
+kernel void kernel_restore_block_pq2_0(
+    global uint        * src_q,
+    global half        * src_d,
+    global block_pq2_0 * dst,
+    int                  n_rows,
+    int                  nb_row
+) {
+    const int i = get_global_id(0);
+    const int r = i/nb_row;
+    const int b = i%nb_row;
+
+    global block_pq2_0 * blk = dst + i;
+
+    blk->d = src_d[b*n_rows + r];
+    for (int j = 0; j < PQ2_0_WORDS; ++j) {
+        const uchar4 q = as_uchar4(src_q[(b*PQ2_0_WORDS + j)*n_rows + r]);
+        blk->qs[4*j]     = q.s0;
+        blk->qs[4*j + 1] = q.s1;
+        blk->qs[4*j + 2] = q.s2;
+        blk->qs[4*j + 3] = q.s3;
     }
 }
 
