@@ -331,6 +331,18 @@ static std::vector<float> tensor_to_float(const ggml_tensor * t) {
 }
 
 // normalized mean squared error = mse(a, b) / mse(a, 0)
+// Masked positions are written as -inf by some backends and as a finite
+// sentinel (x - FLT_MAX) by others; both read as "masked" and compare equal.
+static const float MASKED_MAGNITUDE = FLT_MAX / 2;
+
+static bool is_masked(float v) {
+    return std::isinf(v) || std::fabs(v) >= MASKED_MAGNITUDE;
+}
+
+static bool masked_mismatch(float a, float b) {
+    return is_masked(a) != is_masked(b) || (is_masked(a) && std::signbit(a) != std::signbit(b));
+}
+
 static double nmse(const float * a, const float * b, size_t n) {
     double mse_a_b = 0.0;
     double mse_a_0 = 0.0;
@@ -339,8 +351,15 @@ static double nmse(const float * a, const float * b, size_t n) {
         float a_i = a[i];
         float b_i = b[i];
 
-        mse_a_b += (a_i - b_i) * (a_i - b_i);
-        mse_a_0 += a_i * a_i;
+        if (masked_mismatch(a_i, b_i)) {
+            return INFINITY;
+        }
+        if (is_masked(a_i)) {
+            continue;
+        }
+
+        mse_a_b += (double) (a_i - b_i) * (a_i - b_i);
+        mse_a_0 += (double) a_i * a_i;
     }
 
     return mse_a_b / mse_a_0;
