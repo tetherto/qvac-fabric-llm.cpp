@@ -3644,6 +3644,7 @@ struct ggml_backend_rpc_server {
     std::string cache_dir;
     bool has_cache_dir = false;
     std::string host;
+    int port = -1;
     socket_ptr server_socket;
     socket_ptr client_socket;
     std::mutex client_mutex;
@@ -3679,7 +3680,6 @@ ggml_backend_rpc_server_t ggml_backend_rpc_server_create(
         RPC_PROTO_MAJOR_VERSION,
         RPC_PROTO_MINOR_VERSION,
         RPC_PROTO_PATCH_VERSION);
-    printf("  endpoint       : %s\n", endpoint);
     printf("  local cache    : %s\n", cache_dir ? cache_dir : "n/a");
     printf("Devices:\n");
     for (size_t i = 0; i < n_devices; i++) {
@@ -3723,7 +3723,14 @@ ggml_backend_rpc_server_t ggml_backend_rpc_server_create(
         fprintf(stderr, "Failed to create server socket\n");
         return nullptr;
     }
+    // port 0 binds an ephemeral port, so report the one the socket got
+    server->port = server->server_socket->local_port();
+    printf("  endpoint       : %s:%d\n", server->host.c_str(), server->port);
     return server.release();
+}
+
+int ggml_backend_rpc_server_get_port(ggml_backend_rpc_server_t server) {
+    return server != nullptr ? server->port : -1;
 }
 
 void ggml_backend_rpc_server_run(ggml_backend_rpc_server_t server) {
@@ -4188,6 +4195,9 @@ static void * ggml_backend_rpc_get_proc_address(ggml_backend_reg_t reg, const ch
     }
     if (std::strcmp(name, "ggml_backend_rpc_server_free") == 0) {
         return (void *)ggml_backend_rpc_server_free;
+    }
+    if (std::strcmp(name, "ggml_backend_rpc_server_get_port") == 0) {
+        return (void *)ggml_backend_rpc_server_get_port;
     }
     if (std::strcmp(name, "ggml_backend_comm_init") == 0) {
         return (void *)ggml_backend_rpc_comm_init;

@@ -40,6 +40,7 @@ GGML_BACKEND_API void ggml_backend_rpc_start_server(const char * endpoint, const
 // create() initializes devices and binds the listening socket synchronously;
 // run() blocks until stop() is requested and must be called from a worker
 // thread. The caller must wait for run() to return before calling free().
+// An endpoint with port 0 binds an ephemeral port; get_port() returns it.
 typedef struct ggml_backend_rpc_server * ggml_backend_rpc_server_t;
 GGML_BACKEND_API ggml_backend_rpc_server_t ggml_backend_rpc_server_create(
         const char * endpoint, const char * cache_dir,
@@ -47,6 +48,8 @@ GGML_BACKEND_API ggml_backend_rpc_server_t ggml_backend_rpc_server_create(
 GGML_BACKEND_API void ggml_backend_rpc_server_run(ggml_backend_rpc_server_t server);
 GGML_BACKEND_API void ggml_backend_rpc_server_stop(ggml_backend_rpc_server_t server);
 GGML_BACKEND_API void ggml_backend_rpc_server_free(ggml_backend_rpc_server_t server);
+// Port the server is listening on, or -1 when server is NULL.
+GGML_BACKEND_API int ggml_backend_rpc_server_get_port(ggml_backend_rpc_server_t server);
 
 GGML_BACKEND_API ggml_backend_reg_t ggml_backend_rpc_reg(void);
 GGML_BACKEND_API ggml_backend_reg_t ggml_backend_rpc_add_server(const char * endpoint);

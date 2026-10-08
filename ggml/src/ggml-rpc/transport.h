@@ -22,6 +22,8 @@ struct socket_t {
     bool flush();
     bool set_timeout(int timeout_ms);
     void shutdown();
+    // Port the socket is bound to, or -1 on error.
+    int local_port() const;
 
     socket_ptr accept(int timeout_ms = -1, bool * timed_out = nullptr);
 
