@@ -56,7 +56,8 @@ jobs:
         id: depends
         run: |
           sudo apt-get update
-          sudo apt-get install build-essential libssl-dev ninja-build
+          # libibverbs-dev turns on the RDMA transport, which loads libibverbs at runtime
+          sudo apt-get install build-essential libssl-dev ninja-build libibverbs-dev
 
       - name: Build
         id: cmake_build
@@ -66,6 +67,18 @@ jobs:
             -DCMAKE_BUILD_TYPE=Release \
             -DGGML_RPC=ON
           time cmake --build build --config Release -j $(nproc)
+
+      - name: Check that the RPC backend does not link libibverbs
+        run: |
+          grep -q '^GGML_RPC_RDMA:BOOL=ON$' build/CMakeCache.txt
+          if readelf -d build/bin/libggml-rpc.so | grep -q libibverbs; then
+            printf '%s\n' "libggml-rpc.so links libibverbs"
+            exit 1
+          fi
+          if nm -D build/bin/libggml-rpc.so | grep -E '[[:space:]]_?ibv_'; then
+            printf '%s\n' "libggml-rpc.so imports or exports ibv symbols"
+            exit 1
+          fi
 
       - name: Download model
         run: |
@@ -99,6 +112,8 @@ jobs:
             exit 1
           fi
           ctest -R '^test-rpc(-transport|-server-port)?$' --verbose
+          # libibverbs is installed, so the servers loaded it and offer RDMA
+          grep -q 'RDMA auto-negotiate enabled' rpc-server-0.log
           if [ "$(grep -c '\[set_tensor_2d\] saved to' rpc-server-0.log)" -ne 1 ]; then
             printf '%s\n' "2D tensor cache test did not record exactly one upload"
             exit 1
@@ -117,3 +132,35 @@ jobs:
             -r 1 2>&1)"
           printf '%s\n' "${pipeline_output}"
           printf '%s\n' "${pipeline_output}" | grep -q "pipeline parallelism enabled"
+
+      - name: Test without libibverbs
+        run: |
+          # new servers must start, and serve over TCP, without the library
+          sudo apt-get purge -y libibverbs1
+          if ldconfig -p | grep -q 'libibverbs\.so\.1'; then
+            printf '%s\n' "libibverbs.so.1 is still installed"
+            exit 1
+          fi
+          cd build
+          LLAMA_CACHE="${PWD}/rpc-tcp-cache-0" bin/ggml-rpc-server -H 127.0.0.1 -p 50052 -d CPU -c > rpc-tcp-server-0.log 2>&1 &
+          rpc_server_0=$!
+          LLAMA_CACHE="${PWD}/rpc-tcp-cache-1" bin/ggml-rpc-server -H 127.0.0.1 -p 50053 -d CPU -c > rpc-tcp-server-1.log 2>&1 &
+          rpc_server_1=$!
+          trap 'kill ${rpc_server_0} ${rpc_server_1} 2>/dev/null || true' EXIT
+          export GGML_RPC_TEST_ENDPOINTS=127.0.0.1:50052,127.0.0.1:50053
+          ready=0
+          for attempt in $(seq 1 50); do
+            kill -0 ${rpc_server_0} ${rpc_server_1}
+            if bin/llama-bench -rpc ${GGML_RPC_TEST_ENDPOINTS} --list-devices > /dev/null 2>&1; then
+              ready=1
+              break
+            fi
+            sleep 0.2
+          done
+          if [ ${ready} -ne 1 ]; then
+            printf '%s\n' "RPC servers did not become ready without libibverbs"
+            exit 1
+          fi
+          ctest -R '^test-rpc(-transport|-server-port)?$' --verbose
+          grep -q 'RDMA unavailable' rpc-tcp-server-0.log
+          grep -q 'RDMA unavailable' rpc-tcp-server-1.log

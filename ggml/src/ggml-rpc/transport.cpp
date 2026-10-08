@@ -35,6 +35,8 @@
 #  include <time.h>
 #  ifdef GGML_RPC_RDMA_APPLE
 #    include "transport-apple.h"
+#  else
+#    include "ibv-drv.h"
 #  endif
 #endif // GGML_RPC_RDMA
 
@@ -221,6 +223,11 @@ bool socket_t::impl::tcp_peer_closed() {
 }
 
 bool socket_t::impl::rdma_probe() {
+    // without libibverbs the caps stay zero and the connection uses TCP
+    if (!ibvdrv_init()) {
+        return false;
+    }
+
     const char * dev_env = std::getenv("GGML_RDMA_DEV");
     const char * gid_env = std::getenv("GGML_RDMA_GID");
 
@@ -1041,4 +1048,19 @@ void rpc_transport_shutdown() {
     }
     WSACleanup();
 #endif
+}
+
+bool rpc_transport_rdma_available() {
+#ifdef GGML_RPC_RDMA
+    if (std::getenv("GGML_RPC_NO_RDMA")) {
+        return false;
+    }
+#  ifdef GGML_RPC_RDMA_APPLE
+    return apple_rdma::available();
+#  else
+    return ibvdrv_init();
+#  endif
+#else
+    return false;
+#endif // GGML_RPC_RDMA
 }

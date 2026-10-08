@@ -192,6 +192,10 @@ static bool rdma_library_present() {
     return present;
 }
 
+bool apple_rdma::available() {
+    return rdma_library_present();
+}
+
 // Called before the endpoints are exchanged: pick the local device facing this
 // peer, create a UC QP and register the frame rings. RDMA is point-to-point, so
 // the device is the one whose GID equals the bootstrap connection's local
