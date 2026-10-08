@@ -1008,6 +1008,7 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_rope_multi_f32, kernel_rope_multi_f16, kernel_rope_vision_f32, kernel_rope_vision_f16;
     cl_kernel kernel_cpy_f16_f16, kernel_cpy_f16_f32, kernel_cpy_f32_f16, kernel_cpy_f32_f32, kernel_cpy_f32_f32_pack, kernel_cpy_i32_i32;
     cl_kernel kernel_cpy_f32_f32_flat = nullptr;
+    cl_kernel kernel_cpy_f32_f32_to_cont;
     cl_kernel kernel_mul_mat_f32_f32;
     cl_kernel kernel_mul_mat_f16_f16;
     cl_kernel kernel_mul_mat_f16_f32_1row;
@@ -1970,6 +1971,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         CL_CHECK((backend_ctx->kernel_cpy_f32_f16 = clCreateKernel(prog, "kernel_cpy_f32_f16", &err), err));
         CL_CHECK((backend_ctx->kernel_cpy_f32_f32 = clCreateKernel(prog, "kernel_cpy_f32_f32", &err), err));
         CL_CHECK((backend_ctx->kernel_cpy_f32_f32_pack = clCreateKernel(prog, "kernel_cpy_f32_f32_pack", &err), err));
+        CL_CHECK((backend_ctx->kernel_cpy_f32_f32_to_cont = clCreateKernel(prog, "kernel_cpy_f32_f32_to_cont", &err), err));
         {   // optional: without it ggml_cl_cpy keeps the row-mapped kernel
             cl_int err_flat = CL_SUCCESS;
             cl_kernel k = clCreateKernel(prog, "kernel_cpy_f32_f32_flat", &err_flat);
@@ -27753,6 +27755,9 @@ static void ggml_cl_scale(ggml_backend_t backend, const ggml_tensor * src0, cons
     backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size_ptr, dst);
 }
 
+// Rows shorter than this are copied with per-element kernels instead of one work-group per row.
+static constexpr int64_t GGML_CL_CPY_SHORT_ROW = 32;
+
 static void ggml_cl_cpy(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     GGML_ASSERT(src0);
     GGML_ASSERT(src0->extra);
@@ -27811,6 +27816,35 @@ static void ggml_cl_cpy(ggml_backend_t backend, const ggml_tensor * src0, const 
         return;
     }
 
+    // Short-row f32 copies into a contiguous tensor (e.g. the recurrent conv-state snapshots, 3 floats per
+    // row) would map a few threads per row; copy one element per work item instead.
+    if (src0t == GGML_TYPE_F32 && src1t == GGML_TYPE_F32 && ne00 < GGML_CL_CPY_SHORT_ROW &&
+        ggml_is_contiguous(src1) && ggml_nelements(src0) == ggml_nelements(src1) &&
+        ggml_nelements(src0) <= (int64_t) UINT32_MAX) {
+        cl_kernel k = backend_ctx->kernel_cpy_f32_f32_to_cont;
+        const cl_uint ne = (cl_uint) ggml_nelements(src0);
+
+        CL_CHECK(clSetKernelArg(k,  0, sizeof(cl_mem),   &extra0->data_device));
+        CL_CHECK(clSetKernelArg(k,  1, sizeof(cl_ulong), &offset0));
+        CL_CHECK(clSetKernelArg(k,  2, sizeof(cl_mem),   &extra1->data_device));
+        CL_CHECK(clSetKernelArg(k,  3, sizeof(cl_ulong), &offset1));
+        CL_CHECK(clSetKernelArg(k,  4, sizeof(int),      &ne00));
+        CL_CHECK(clSetKernelArg(k,  5, sizeof(int),      &ne01));
+        CL_CHECK(clSetKernelArg(k,  6, sizeof(int),      &ne02));
+        CL_CHECK(clSetKernelArg(k,  7, sizeof(cl_uint),  &ne));
+        CL_CHECK(clSetKernelArg(k,  8, sizeof(cl_ulong), &nb00));
+        CL_CHECK(clSetKernelArg(k,  9, sizeof(cl_ulong), &nb01));
+        CL_CHECK(clSetKernelArg(k, 10, sizeof(cl_ulong), &nb02));
+        CL_CHECK(clSetKernelArg(k, 11, sizeof(cl_ulong), &nb03));
+
+        const size_t lsz = MIN((size_t) 64, backend_ctx->max_workgroup_size);
+        size_t global_work_size[] = { ((ne + lsz - 1) / lsz) * lsz, 1, 1 };
+        size_t local_work_size[]  = { lsz, 1, 1 };
+
+        backend_ctx->enqueue_ndrange_kernel(k, 1, global_work_size, local_work_size, src1);
+        return;
+    }
+
     cl_kernel kernel;
 
     switch (src0t) {
@@ -27820,7 +27854,7 @@ static void ggml_cl_cpy(ggml_backend_t backend, const ggml_tensor * src0, const 
                     kernel = backend_ctx->kernel_cpy_f32_f16;
                     break;
                 case GGML_TYPE_F32:
-                    kernel = ne00 < 32 ? backend_ctx->kernel_cpy_f32_f32_pack
+                    kernel = ne00 < GGML_CL_CPY_SHORT_ROW ? backend_ctx->kernel_cpy_f32_f32_pack
                                        : backend_ctx->kernel_cpy_f32_f32;
                     break;
                 default:
