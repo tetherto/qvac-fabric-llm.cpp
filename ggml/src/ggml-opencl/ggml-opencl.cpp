@@ -9165,6 +9165,19 @@ inline bool use_q4_k_bin_kernels(const ggml_backend_opencl_context *backend_ctx,
 #endif
 }
 
+// A q6_K weight on the Adreno noshuffle path (same condition as its set_tensor conversion)
+// never reaches the flat K-quant GEMV.
+static bool ggml_cl_q6_K_uses_noshuffle(const ggml_backend_opencl_context * backend_ctx, const ggml_tensor * tensor) {
+#ifdef GGML_OPENCL_USE_ADRENO_KERNELS
+    return tensor->type == GGML_TYPE_Q6_K && use_adreno_kernels(backend_ctx, tensor) &&
+           !use_flat_gemv_for_large_m_q6_K(backend_ctx, tensor);
+#else
+    GGML_UNUSED(backend_ctx);
+    GGML_UNUSED(tensor);
+    return false;
+#endif
+}
+
 static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
     ggml_backend_opencl_device_context * dev_ctx     = (ggml_backend_opencl_device_context *)dev->context;
     ggml_backend_opencl_context *        backend_ctx = dev_ctx->backend_ctx;
@@ -9427,13 +9440,14 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
                 // The E031.41 compiler (usually with A7x) miscompiles the flat K-quant
                 // GEMV kernels (kernel_mul_mv_q*_K_f32_flat) and makes lm_head run much
                 // slower than it should. So, make it fallback to CPU to preserve performance
-                // for this compiler series.
+                // for this compiler series. A q6_K head on the noshuffle path is faster on the GPU.
                 static const char * a7x_lmhead_env = getenv("GGML_OPENCL_A7X_LMHEAD_CPU");
                 static const bool   a7x_lmhead_cpu = (a7x_lmhead_env == nullptr || a7x_lmhead_env[0] != '0');
                 if (a7x_lmhead_cpu &&
                     backend_ctx->adreno_gen == ADRENO_GPU_GEN::A7X &&
                     (op->src[0]->type == GGML_TYPE_Q4_K || op->src[0]->type == GGML_TYPE_Q5_K ||
                      op->src[0]->type == GGML_TYPE_Q6_K) &&
+                    !ggml_cl_q6_K_uses_noshuffle(backend_ctx, op->src[0]) &&
                     op->src[0]->ne[1] >= 32768) {   // vocab-scale weight; no FFN/attn weight is this tall
                     return false;
                 }
