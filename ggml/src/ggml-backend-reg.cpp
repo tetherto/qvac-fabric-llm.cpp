@@ -1,3 +1,4 @@
+#include "ggml-adreno.h"
 #include "ggml-backend-dl.h"
 #include "ggml-backend-impl.h"
 #include "ggml-backend.h"
@@ -763,45 +764,47 @@ void ggml_backend_load_all() {
 
 #ifdef __ANDROID__
 namespace {
-// Parses adreno version from gpu description or returns -1 if its not Adreno GPU or -3 if failed to parse the version
-int adrenoVersion(const std::string & gpuDescription) {
-    std::regex  adrenoRegex(R"((\d+))");
-    std::smatch matches;
-    if (gpuDescription.find("dreno") != std::string::npos && std::regex_search(gpuDescription, matches, adrenoRegex) && matches.size() > 1) {
-        try {
-            int adrenoVersion = std::stoi(matches[1].str());
-            return adrenoVersion;
-        } catch (std::invalid_argument & e) {
-            GGML_LOG_ERROR("%s: failed to parse adreno version from %s: %s\n", __func__, gpuDescription.c_str(),
-                           e.what());
-            return -3;
-        }
-    }
-    return -1;
-}
-
-// Returns smallest Adreno version among GPU devices or -1 if there is no adreno GPU
-int minAdrenoVersion(ggml_backend_reg_t vulkanBackend) {
-    if (!vulkanBackend) {
+// Smallest Adreno generation among the devices of the Vulkan backend, -2 without
+// a Vulkan backend, -1 when no device is an Adreno GPU.
+int ggml_backend_min_adreno_version(ggml_backend_reg_t reg) {
+    if (reg == nullptr) {
         return -2;
     }
-    int minFoundVersion = std::numeric_limits<int>::max();
-    for (size_t i = 0; i < vulkanBackend->iface.get_device_count(vulkanBackend); i++) {
-        ggml_backend_dev_t dev = vulkanBackend->iface.get_device(vulkanBackend, i);
-        if (!dev) {
+    int min_found = std::numeric_limits<int>::max();
+    for (size_t i = 0; i < ggml_backend_reg_dev_count(reg); i++) {
+        ggml_backend_dev_t dev = ggml_backend_reg_dev_get(reg, i);
+        if (dev == nullptr) {
             continue;
         }
-        auto description = std::string(dev->iface.get_description(dev));
-        GGML_LOG_INFO("%s: found device description: %s\n", __func__, description.c_str());
-        int devAdrenoVersion = adrenoVersion(description);
-        if (devAdrenoVersion > 0) {
-            minFoundVersion = std::min(minFoundVersion, devAdrenoVersion);
+        const char * description = ggml_backend_dev_description(dev);
+        GGML_LOG_INFO("%s: found device description: %s\n", __func__, description ? description : "(null)");
+        const int dev_adreno_version = ggml_adreno_version_from_description(description ? description : "");
+        if (dev_adreno_version > 0) {
+            min_found = std::min(min_found, dev_adreno_version);
         }
     }
-    if (minFoundVersion < std::numeric_limits<int>::max()) {
-        return minFoundVersion;
+    return (min_found < std::numeric_limits<int>::max()) ? min_found : -1;
+}
+
+// Applies the Adreno policy: unloads Vulkan where only the CPU is stable and
+// reports whether OpenCL should be loaded.
+bool ggml_backend_apply_adreno_policy() {
+    ggml_backend_reg_t               vulkan_backend     = ggml_backend_reg_by_name("vulkan");
+    const int                        min_adreno_version = ggml_backend_min_adreno_version(vulkan_backend);
+    const ggml_adreno_backend_policy policy             = ggml_adreno_resolve_backend_policy(min_adreno_version);
+    if (min_adreno_version <= 0) {
+        GGML_LOG_INFO("%s: no Adreno GPU detected (%d); skipping OpenCL, relying on Vulkan/CPU\n", __func__,
+                      min_adreno_version);
+    } else if (policy.unload_vulkan) {
+        GGML_LOG_INFO("%s: Adreno %d detected; removing Vulkan and relying on CPU only\n", __func__,
+                      min_adreno_version);
+        if (vulkan_backend != nullptr) {
+            ggml_backend_unload(vulkan_backend);
+        }
+    } else if (policy.load_opencl) {
+        GGML_LOG_INFO("%s: Adreno %d detected; keeping OpenCL backend\n", __func__, min_adreno_version);
     }
-    return -1;
+    return policy.load_opencl;
 }
 }  // namespace
 #endif
@@ -823,34 +826,29 @@ void ggml_backend_load_all_from_path(const char * dir_path) {
     ggml_backend_load_best("metal", silent, dir_path);
     ggml_backend_load_best("rpc", silent, dir_path);
     ggml_backend_load_best("sycl", silent, dir_path);
+    const bool vulkan_disabled = getenv("GGML_DISABLE_VULKAN") != nullptr;
     ggml_backend_load_best("vulkan", silent, dir_path);
     ggml_backend_load_best("virtgpu", silent, dir_path);
 
-    bool useOpencl = true;
-
-#ifdef __ANDROID__
-    // Logic for buggy backends on Adreno GPUs
-    // Use Vulkan backend to obtain GPU information
-    ggml_backend_reg_t vulkanBackend           = ggml_backend_reg_by_name("vulkan");
-    int                devicesMinAdrenoVersion = minAdrenoVersion(vulkanBackend);
-    if (devicesMinAdrenoVersion <= 0) {
-        GGML_LOG_INFO(
-            "%s: no adreno GPU version found (%d) removing OpenCL backend (if any) to rely on Vulkan/cpu only\n",
-            __func__, devicesMinAdrenoVersion);
-        useOpencl = false;
-    } else if (devicesMinAdrenoVersion > 700) {
-        GGML_LOG_INFO("%s: Adreno GPU version %d found keeping OpenCL backend\n", __func__, devicesMinAdrenoVersion);
-    } else if (devicesMinAdrenoVersion > 600) {
-        GGML_LOG_INFO("%s: Adreno GPU version %d should rely on cpu only\n", __func__, devicesMinAdrenoVersion);
-        if (vulkanBackend) {
-            ggml_backend_unload(vulkanBackend);
-            GGML_LOG_INFO("%s: Vulkan backend removed\n", __func__);
-        }
-        useOpencl = false;
+    // OpenCL is only useful for ggml on Adreno GPUs. On Android the loaded Vulkan
+    // backend identifies the GPU; with Vulkan disabled explicitly OpenCL loads
+    // unconditionally, as off Android.
+    bool load_opencl = true;
+#    ifdef __ANDROID__
+    if (vulkan_disabled) {
+        GGML_LOG_INFO("%s: Vulkan disabled by GGML_DISABLE_VULKAN; loading OpenCL without the Adreno probe\n",
+                      __func__);
+    } else {
+        load_opencl = ggml_backend_apply_adreno_policy();
     }
-#endif
-
-    if(useOpencl) {
+#    else
+    GGML_UNUSED(vulkan_disabled);
+#    endif
+    // GGML_OPENCL_FORCE_LOAD loads OpenCL where the Adreno policy would skip it.
+    if (std::getenv("GGML_OPENCL_FORCE_LOAD") != nullptr) {
+        load_opencl = true;
+    }
+    if (load_opencl) {
         ggml_backend_load_best("opencl", silent, dir_path);
     }
     ggml_backend_load_best("hexagon", silent, dir_path);

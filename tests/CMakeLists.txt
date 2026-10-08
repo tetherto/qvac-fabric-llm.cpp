@@ -534,6 +534,9 @@ if (GGML_BACKEND_DL AND NOT EMSCRIPTEN)
     endif()
 endif()
 
+llama_build_and_test(test-adreno-version.cpp)
+target_include_directories(test-adreno-version PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
+
 llama_build_and_test(test-model-load-cancel.cpp       LABEL "model")
 llama_build_and_test(test-model-load-disk.cpp         LABEL "model")
 llama_build_and_test(test-model-load-memory.cpp       LABEL "model")
