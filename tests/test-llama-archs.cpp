@@ -78,7 +78,7 @@ static void set_tensor_data(struct ggml_tensor * tensor, void * userdata) {
 }
 
 static void usage(char ** argv) {
-    printf("Usage: %s [-a/--arch arch] [-s/--seed seed] [-o/--out dir] [-v N] [-h/--help] [--mtp-shared|--mtp-shared-cpu|--hadamard-contracts|--qsa-unified-multiseq|--glm5-kpool-sequences|--glm5-invalid-metadata|--layer-inp-pos-min]\n", argv[0]);
+    printf("Usage: %s [-a/--arch arch] [-s/--seed seed] [-o/--out dir] [-v N] [-h/--help] [--mtp-shared|--mtp-shared-cpu|--hadamard-contracts|--qsa-unified-multiseq|--glm5-kpool-sequences|--glm5-invalid-metadata|--layer-inp-pos-min|--kv-stream-gaps]\n", argv[0]);
 }
 
 static std::vector<llama_token> get_tokens(const uint32_t n_tokens, const uint32_t n_vocab, const size_t seed){
@@ -1762,6 +1762,57 @@ static int test_layer_inp_pos_min() {
     return ok ? 0 : 1;
 }
 
+// many sequences on non-consecutive KV streams: one attention run per sequence must fit in the graph
+static int test_kv_stream_gaps() {
+    constexpr uint32_t n_layer   = 8;
+    constexpr uint32_t n_seq_max = 256;
+    constexpr uint32_t n_active  = 128;
+
+    auto gguf = get_gguf_ctx(LLM_ARCH_QWEN3, false);
+    gguf_set_val_u32(gguf.get(), "qwen3.block_count", n_layer);
+
+    llama_model_params mp = llama_model_default_params();
+    mp.progress_callback = silent_model_load_progress;
+    size_t seed = 1;
+    llama_model_ptr model(llama_model_init_from_user(gguf.get(), set_tensor_data, &seed, mp));
+    GGML_ASSERT(model);
+
+    const uint32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model.get()));
+
+    for (const auto fa : {LLAMA_FLASH_ATTN_TYPE_DISABLED, LLAMA_FLASH_ATTN_TYPE_ENABLED}) {
+        std::vector<float> logits[2];
+        for (uint32_t stride : {1u, 2u}) {
+            auto cp = llama_context_default_params();
+            cp.n_ctx           = n_seq_max*8;
+            cp.n_batch         = cp.n_ubatch = n_seq_max;
+            cp.n_seq_max       = n_seq_max;
+            cp.kv_unified      = false;
+            cp.flash_attn_type = fa;
+            cp.n_threads       = cp.n_threads_batch = 4;
+            llama_context_ptr ctx(llama_init_from_model(model.get(), cp));
+            GGML_ASSERT(ctx);
+
+            llama_batch batch = llama_batch_init(n_active, 0, 1);
+            for (uint32_t i = 0; i < n_active; ++i) {
+                common_batch_add(batch, (llama_token) (i % n_vocab), 0, { (llama_seq_id) (i*stride) }, true);
+            }
+            GGML_ASSERT(llama_decode(ctx.get(), batch) == 0);
+            llama_batch_free(batch);
+
+            auto & out = logits[stride - 1];
+            for (uint32_t i = 0; i < n_active; ++i) {
+                const float * row = llama_get_logits_ith(ctx.get(), i);
+                GGML_ASSERT(row != nullptr);
+                out.insert(out.end(), row, row + n_vocab);
+            }
+        }
+        GGML_ASSERT(nmse(logits[1], logits[0]) < 1e-8);
+    }
+
+    printf("KV stream gaps test passed\n");
+    return 0;
+}
+
 int main(int argc, char ** argv) {
     // init the logger at max verbosity. filter with a custom callback respecting the user-configure verbosity
     common_log_set_verbosity_thold(LOG_LEVEL_DEBUG);
@@ -1781,6 +1832,9 @@ int main(int argc, char ** argv) {
     }
     if (argc == 2 && strcmp(argv[1], "--layer-inp-pos-min") == 0) {
         return test_layer_inp_pos_min();
+    }
+    if (argc == 2 && strcmp(argv[1], "--kv-stream-gaps") == 0) {
+        return test_kv_stream_gaps();
     }
     std::random_device rd;
 
