@@ -2846,11 +2846,14 @@ ggml_tensor * llm_graph_context::build_attn_mha_runs(
 
         ggml_tensor * q_r = ggml_view_3d(ctx0, q, q->ne[0], q->ne[1], n*n_tps, q->nb[1], q->nb[2], i0*n_tps*q->nb[2]);
 
-        ggml_tensor * kq_mask_r = ggml_view_4d(ctx0, kq_mask,
-                std::min(kq_mask->ne[0], k->ne[2]), kq_mask->ne[1], kq_mask->ne[2], n,
-                kq_mask->nb[1], kq_mask->nb[2], kq_mask->nb[3], i0*kq_mask->nb[3]);
-        if (kq_mask_r->ne[0] != kq_mask->ne[0]) {
-            kq_mask_r = ggml_cont(ctx0, kq_mask_r);
+        ggml_tensor *& kq_mask_r = kq_mask_runs[{kq_mask, r}];
+        if (kq_mask_r == nullptr) {
+            kq_mask_r = ggml_view_4d(ctx0, kq_mask,
+                    std::min(kq_mask->ne[0], k->ne[2]), kq_mask->ne[1], kq_mask->ne[2], n,
+                    kq_mask->nb[1], kq_mask->nb[2], kq_mask->nb[3], i0*kq_mask->nb[3]);
+            if (kq_mask_r->ne[0] != kq_mask->ne[0]) {
+                kq_mask_r = ggml_cont(ctx0, kq_mask_r);
+            }
         }
 
         ggml_tensor * cur = build_attn_mha(q_r, k, v, nullptr, kq_mask_r, sinks, v_mla, 0, kq_scale, il);

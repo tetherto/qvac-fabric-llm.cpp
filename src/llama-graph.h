@@ -1062,6 +1062,9 @@ struct llm_graph_context {
     using hadamard_act_key = std::tuple<const ggml_tensor *, const ggml_tensor *, const ggml_tensor *, int64_t, int64_t, int64_t>;
     mutable std::map<hadamard_act_key, ggml_tensor *> hadamard_acts;
 
+    // per-run views of the kq masks, shared by all layers so the scheduler copies each mask once
+    mutable std::map<std::pair<const ggml_tensor *, uint32_t>, ggml_tensor *> kq_mask_runs;
+
     llm_graph_context(const llm_graph_params & params);
     virtual ~llm_graph_context() = default;
 
