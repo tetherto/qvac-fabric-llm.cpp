@@ -851,6 +851,29 @@ static bool xdna_res_touch(ggml_backend_xdna_context * ctx, const ggml_tensor * 
     return true;
 }
 
+// A graph can end at the last fused layer's l_out: the scheduler ends one at
+// a split to another device, an eval callback at the tensor it watches. With
+// no reader in this graph, its reader comes after the graph and takes it from
+// the tensor: write it there. attn_residual stays unwritten - its readers were
+// the layer's own, and its memory may already be another's.
+static bool xdna_res_leave(ggml_backend_xdna_context * ctx, const struct ggml_cgraph * cgraph) {
+    if (!ctx->res_lout || !ctx->res_dirty) {
+        return true;
+    }
+    for (int i = 0; i < cgraph->n_nodes; i++) {
+        const ggml_tensor * node = cgraph->nodes[i];
+        for (int k = 0; k < GGML_MAX_SRC && node->src[k]; k++) {
+            for (const ggml_tensor * t = node->src[k]; t; t = t->view_src) {
+                if (t == ctx->res_lout) {
+                    return true;
+                }
+            }
+        }
+    }
+    ctx->res_resid = nullptr;
+    return xdna_res_materialize(ctx);
+}
+
 // One fused-layer session (per recurrent block). Owns the three runners and
 // the host scratch buffers it reuses every token.
 struct xdna_rec_session {
@@ -4198,10 +4221,10 @@ static enum ggml_status xdna_graph_compute_impl(ggml_backend_xdna_context * ctx,
     if (!xdna_ops_finalize(&ctx->ops)) {
         return GGML_STATUS_FAILED;
     }
-    const bool queued_ok = xdna_pending_wait(ctx);
+    const bool queued_ok = xdna_pending_wait(ctx) && xdna_res_leave(ctx, cgraph);
     ctx->pending_failed  = false;
-    // Whatever the rows still hold nothing read: the tensors are this graph's,
-    // and their memory may already be another's.
+    // Whatever else the rows still hold nothing reads: the tensors are this
+    // graph's, and their memory may already be another's.
     ctx->res_lout = ctx->res_resid = nullptr;
     if (!queued_ok) {
         ctx->res_dirty = false;
