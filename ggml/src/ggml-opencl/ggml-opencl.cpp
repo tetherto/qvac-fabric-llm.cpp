@@ -122,6 +122,15 @@ static fastdiv_vals init_fastdiv_values(uint64_t d_64) {
     return { mp, L, d, 0 };
 }
 
+// PQ2_0 mat-vec: one kernel variant per src1 column count up to the max (more columns per lane cost more than
+// rereading the weights), lanes per subgroup, rows per lane, subgroups splitting K, and the int8 src1 layout it reads
+static constexpr int PQ2_0_MV_MAX_COLS = 2;
+static constexpr int PQ2_0_MV_LANES    = 64;
+static constexpr int PQ2_0_MV_ROWS     = 4;
+static constexpr int PQ2_0_MV_KSPLIT   = 4;
+static constexpr int PQ2_0_ACT_QK      = 32; // src1 elements per int8 scale
+static constexpr int PQ2_0_ACT_GROUP   = 16; // src1 elements per (scale, scaled sum) entry
+
 enum GPU_FAMILY {
     ADRENO,
     INTEL,
@@ -851,6 +860,9 @@ struct ggml_backend_opencl_context {
     ggml_cl_buffer prealloc_moe_qa;   // int8 quants  [tok_slots * ne00]
     ggml_cl_buffer prealloc_moe_da;   // per-block d  [tok_slots * ne00/32] (half)
     ggml_cl_buffer prealloc_moe_sa;   // per-block s  [tok_slots * ne00/32] (half)
+    // int8 src1 of the PQ2_0 mat-vec and its per-16-element (scale, scaled sum)
+    ggml_cl_buffer prealloc_pq2_0_act_q;
+    ggml_cl_buffer prealloc_pq2_0_act_ds;
     // scratch copy of the router weights to avoid dst aliasing
     ggml_cl_buffer prealloc_moe_combine_w;
     ggml_cl_buffer prealloc_splitk_partial;  // [ksplit * M] partials for split-K GEMV
@@ -1041,6 +1053,7 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_mul_mm_f16_f32_kq;
     cl_kernel kernel_mul_mat_q4_0_f32, kernel_mul_mat_q4_0_f32_v;
     cl_kernel kernel_convert_block_q1_0, kernel_restore_block_q1_0;
+    cl_kernel kernel_convert_block_pq2_0, kernel_restore_block_pq2_0;
     cl_kernel kernel_convert_block_q4_0, kernel_restore_block_q4_0;
     cl_kernel kernel_convert_block_q4_0_trans4_ns, kernel_restore_block_q4_0_trans4_ns;
     cl_kernel kernel_convert_block_q4_1, kernel_restore_block_q4_1;
@@ -1081,6 +1094,8 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_convert_block_iq4_nl_noshuffle;
     cl_kernel kernel_restore_block_iq4_nl_noshuffle;
     cl_kernel kernel_mul_mv_q1_0_f32, kernel_mul_mv_q1_0_f32_flat;
+    cl_kernel kernel_mul_mv_pq2_0_f32_flat[PQ2_0_MV_MAX_COLS] = {};
+    cl_kernel kernel_quantize_pq2_0_act = nullptr;
     cl_kernel kernel_mul_mat_q4_0_f32_1d_8x_flat, kernel_mul_mat_q4_0_f32_1d_16x_flat;
     cl_kernel kernel_mul_mv_q4_1_f32;
     cl_kernel kernel_mul_mv_q4_1_f32_flat;
@@ -1997,6 +2012,8 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 
         CL_CHECK((backend_ctx->kernel_convert_block_q1_0  = clCreateKernel(backend_ctx->program_cvt, "kernel_convert_block_q1_0", &err), err));
         CL_CHECK((backend_ctx->kernel_restore_block_q1_0  = clCreateKernel(backend_ctx->program_cvt, "kernel_restore_block_q1_0", &err), err));
+        CL_CHECK((backend_ctx->kernel_convert_block_pq2_0 = clCreateKernel(backend_ctx->program_cvt, "kernel_convert_block_pq2_0", &err), err));
+        CL_CHECK((backend_ctx->kernel_restore_block_pq2_0 = clCreateKernel(backend_ctx->program_cvt, "kernel_restore_block_pq2_0", &err), err));
         CL_CHECK((backend_ctx->kernel_convert_block_q4_0_noshuffle = clCreateKernel(backend_ctx->program_cvt, "kernel_convert_block_q4_0_noshuffle", &err), err));
         CL_CHECK((backend_ctx->kernel_restore_block_q4_0_noshuffle = clCreateKernel(backend_ctx->program_cvt, "kernel_restore_block_q4_0_noshuffle", &err), err));
         CL_CHECK((backend_ctx->kernel_convert_block_q4_0  = clCreateKernel(backend_ctx->program_cvt, "kernel_convert_block_q4_0", &err), err));
@@ -2582,6 +2599,32 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 
         CL_CHECK((backend_ctx->kernel_mul_mv_q1_0_f32_flat = clCreateKernel(prog, "kernel_mul_mv_q1_0_f32_flat", &err), err));
         CL_CHECK(clReleaseProgram(prog));
+        GGML_LOG_CONT(".");
+    }
+
+    // mul_mv_pq2_0_f32_flat
+    if (backend_ctx->has_integer_dot) {
+#ifdef GGML_OPENCL_EMBED_KERNELS
+        const std::string kernel_src {
+            #include "mul_mv_pq2_0_f32_flat.cl.h"
+        };
+#else
+        const std::string kernel_src = read_file("mul_mv_pq2_0_f32_flat.cl");
+#endif
+        for (int n_cols = 1; n_cols <= PQ2_0_MV_MAX_COLS; ++n_cols) {
+            const std::string opts = compile_opts +
+                " -DN_COLS="   + std::to_string(n_cols) +
+                " -DN_LANES="  + std::to_string(PQ2_0_MV_LANES) +
+                " -DN_ROWS="   + std::to_string(PQ2_0_MV_ROWS) +
+                " -DN_KSPLIT=" + std::to_string(PQ2_0_MV_KSPLIT);
+            cl_program prog = build_program_from_source(backend_ctx, kernel_src.c_str(), opts);
+
+            CL_CHECK((backend_ctx->kernel_mul_mv_pq2_0_f32_flat[n_cols - 1] = clCreateKernel(prog, "kernel_mul_mv_pq2_0_f32_flat", &err), err));
+            if (n_cols == 1) {
+                CL_CHECK((backend_ctx->kernel_quantize_pq2_0_act = clCreateKernel(prog, "kernel_quantize_pq2_0_act", &err), err));
+            }
+            CL_CHECK(clReleaseProgram(prog));
+        }
         GGML_LOG_CONT(".");
     }
 
@@ -9430,6 +9473,11 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
             } else if (op->src[0]->type == GGML_TYPE_Q4_0) {
                 // Non-contig src0 routes through on-device dequant-to-f16.
                 return op->src[1]->type == GGML_TYPE_F32;
+            } else if (op->src[0]->type == GGML_TYPE_PQ2_0) {
+                // its own integer-dot mat-vec serves every src1 width, so the large-batch guard below does not apply;
+                // it reads the word-major layout from the start of the tensor, so views at an offset are declined
+                return backend_ctx->has_integer_dot && op->src[1]->type == GGML_TYPE_F32 &&
+                       ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]) && op->src[0]->view_offs == 0;
             } else if (op->src[0]->type == GGML_TYPE_Q4_1 ||
                        op->src[0]->type == GGML_TYPE_Q5_0  || op->src[0]->type == GGML_TYPE_Q5_1 ||
                        op->src[0]->type == GGML_TYPE_MXFP4 ||
@@ -10254,6 +10302,14 @@ static cl_mem ggml_cl_create_temp_download_buffer(
     return buf;
 }
 
+// PQ2_0 weights are stored word-major over all rows of the tensor; the convert and restore kernels take its shape.
+static void ggml_cl_set_pq2_0_layout_args(cl_kernel kernel, const ggml_tensor * tensor) {
+    const cl_int n_rows = ggml_nrows(tensor);
+    const cl_int nb_row = tensor->ne[0]/ggml_blck_size(tensor->type);
+    CL_CHECK(clSetKernelArg(kernel, 3, sizeof(cl_int), &n_rows));
+    CL_CHECK(clSetKernelArg(kernel, 4, sizeof(cl_int), &nb_row));
+}
+
 static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     ggml_backend_opencl_device_context * dev_ctx = (ggml_backend_opencl_device_context *) buffer->buft->device->context;
     ggml_backend_opencl_context * backend_ctx = dev_ctx->backend_ctx;
@@ -10262,17 +10318,18 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
     cl_command_queue queue = backend_ctx->queue;
 
 #ifdef GGML_OPENCL_SOA_Q
-    if (tensor->type == GGML_TYPE_Q1_0) {
+    if (tensor->type == GGML_TYPE_Q1_0 || tensor->type == GGML_TYPE_PQ2_0) {
         ggml_tensor_extra_cl * extra_orig = (ggml_tensor_extra_cl *)tensor->extra;
         GGML_ASSERT(extra_orig && "Tesnors in OpenCL backend should have been allocated and initialized");
 
         // Allocate the new extra and create aliases from the original.
+        // pq2_0 shares the q1_0 SoA extra: both are one half scale plus packed quant bytes per block.
         ggml_backend_opencl_buffer_context * ctx = (ggml_backend_opencl_buffer_context *) buffer->context;
         ggml_tensor_extra_cl_q1_0 * extra = ctx->ggml_opencl_alloc_temp_tensor_extra_q1_0();
 
-        // q1_0 block = ggml_half d + (QK1_0/8) quant bytes = 2 + 16 = 18 bytes
+        // block = ggml_half d + quant bytes (q1_0: 2 + 16 = 18 bytes, pq2_0: 2 + 32 = 34 bytes)
         size_t size_d = ggml_nelements(tensor)/ggml_blck_size(tensor->type)*sizeof(ggml_fp16_t);
-        size_t size_q = ggml_nelements(tensor)/ggml_blck_size(tensor->type)*(ggml_blck_size(tensor->type)/8);
+        size_t size_q = ggml_nelements(tensor)/ggml_blck_size(tensor->type)*(ggml_type_size(tensor->type) - sizeof(ggml_fp16_t));
         GGML_ASSERT(size_d + size_q == ggml_nbytes(tensor) && "Incorrect tensor size");
 
         cl_int err;
@@ -10304,11 +10361,14 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
             CL_BUFFER_CREATE_TYPE_REGION, &region, &err);
         CL_CHECK(err);
 
-        cl_kernel kernel = backend_ctx->kernel_convert_block_q1_0;
+        cl_kernel kernel = tensor->type == GGML_TYPE_Q1_0 ? backend_ctx->kernel_convert_block_q1_0 : backend_ctx->kernel_convert_block_pq2_0;
 
         CL_CHECK(clSetKernelArg(kernel, 0, sizeof(cl_mem), &data_device));
         CL_CHECK(clSetKernelArg(kernel, 1, sizeof(cl_mem), &extra->q));
         CL_CHECK(clSetKernelArg(kernel, 2, sizeof(cl_mem), &extra->d));
+        if (tensor->type == GGML_TYPE_PQ2_0) {
+            ggml_cl_set_pq2_0_layout_args(kernel, tensor);
+        }
 
         size_t global_work_size[] = {(size_t)ggml_nelements(tensor)/ggml_blck_size(tensor->type), 1, 1};
         size_t local_work_size[] = {64, 1, 1};
@@ -10322,7 +10382,7 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
 
         // q is uint32 (32 sign bits each); d is one half per 128-block.
 #ifdef GGML_OPENCL_USE_ADRENO_KERNELS
-        if (enable_adreno_trans_weight(backend_ctx, tensor)) {
+        if (tensor->type == GGML_TYPE_Q1_0 && enable_adreno_trans_weight(backend_ctx, tensor)) {
             int M = tensor->ne[1];   // ne01
             int K = tensor->ne[0];   // ne00
 
@@ -11903,11 +11963,11 @@ static void ggml_backend_opencl_buffer_get_tensor(ggml_backend_buffer_t buffer, 
     sync_with_other_backends(backend_ctx);
 
 #ifdef GGML_OPENCL_SOA_Q
-    if (tensor->type == GGML_TYPE_Q1_0) {
+    if (tensor->type == GGML_TYPE_Q1_0 || tensor->type == GGML_TYPE_PQ2_0) {
         ggml_tensor_extra_cl_q1_0 * extra = (ggml_tensor_extra_cl_q1_0 *)tensor->extra;
 
 #ifdef GGML_OPENCL_USE_ADRENO_KERNELS
-        if (enable_adreno_trans_weight(backend_ctx, tensor)) {
+        if (tensor->type == GGML_TYPE_Q1_0 && enable_adreno_trans_weight(backend_ctx, tensor)) {
             ggml_cl_buffer buf_trans_q;
             ggml_cl_buffer buf_trans_d;
             ggml_cl_buffer buf_unpacked;
@@ -11945,10 +12005,13 @@ static void ggml_backend_opencl_buffer_get_tensor(ggml_backend_buffer_t buffer, 
         cl_mem data_device = clCreateBuffer(context, CL_MEM_READ_WRITE, ggml_nbytes(tensor), NULL, &err);
         CL_CHECK(err);
 
-        cl_kernel kernel = backend_ctx->kernel_restore_block_q1_0;
+        cl_kernel kernel = tensor->type == GGML_TYPE_Q1_0 ? backend_ctx->kernel_restore_block_q1_0 : backend_ctx->kernel_restore_block_pq2_0;
         CL_CHECK(clSetKernelArg(kernel, 0, sizeof(cl_mem), &extra->q));
         CL_CHECK(clSetKernelArg(kernel, 1, sizeof(cl_mem), &extra->d));
         CL_CHECK(clSetKernelArg(kernel, 2, sizeof(cl_mem), &data_device));
+        if (tensor->type == GGML_TYPE_PQ2_0) {
+            ggml_cl_set_pq2_0_layout_args(kernel, tensor);
+        }
 
         size_t global_work_size[] = {(size_t)ggml_nelements(tensor)/ggml_blck_size(tensor->type), 1, 1};
         size_t local_work_size[] = {1, 1, 1};
@@ -22867,6 +22930,111 @@ static cl_mem ggml_cl_img_pool_get_or_create(
     return img;
 }
 
+// Quantize the whole contiguous src1 once; every mat-vec pass reads the int8 copy.
+static void ggml_cl_quantize_pq2_0_act(ggml_backend_opencl_context * backend_ctx, const ggml_tensor * src1, ggml_tensor * dst) {
+    ggml_tensor_extra_cl * extra1 = (ggml_tensor_extra_cl *) src1->extra;
+    const cl_ulong offset1 = extra1->offset + src1->view_offs;
+
+    const size_t n_elements = ggml_nelements(src1);
+    const cl_int n_blocks   = n_elements/PQ2_0_ACT_QK;
+
+    backend_ctx->prealloc_pq2_0_act_q.allocate(backend_ctx->context, n_elements*sizeof(cl_char));
+    backend_ctx->prealloc_pq2_0_act_ds.allocate(backend_ctx->context, n_elements/PQ2_0_ACT_GROUP*sizeof(cl_float2));
+
+    cl_kernel kernel = backend_ctx->kernel_quantize_pq2_0_act;
+
+    CL_CHECK(clSetKernelArg(kernel, 0, sizeof(cl_mem),   &extra1->data_device));
+    CL_CHECK(clSetKernelArg(kernel, 1, sizeof(cl_ulong), &offset1));
+    CL_CHECK(clSetKernelArg(kernel, 2, sizeof(cl_mem),   &backend_ctx->prealloc_pq2_0_act_q.buffer));
+    CL_CHECK(clSetKernelArg(kernel, 3, sizeof(cl_mem),   &backend_ctx->prealloc_pq2_0_act_ds.buffer));
+    CL_CHECK(clSetKernelArg(kernel, 4, sizeof(cl_int),   &n_blocks));
+
+    const size_t wg_size = 64;
+    size_t global_work_size[] = {(size_t)CEIL_DIV(n_blocks, wg_size)*wg_size, 1, 1};
+    size_t local_work_size[]  = {wg_size, 1, 1};
+
+    backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
+}
+
+// Launch a PQ2_0 mat-vec whose other arguments are set once per src1 matrix, broadcasting src0 matrices over src1.
+static void ggml_cl_enqueue_pq2_0_matrices(ggml_backend_opencl_context * backend_ctx, cl_kernel kernel, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst,
+                                           size_t * global_work_size, size_t * local_work_size) {
+    GGML_ASSERT(src0->view_offs == 0);
+    ggml_tensor_extra_cl * extrad = (ggml_tensor_extra_cl *) dst->extra;
+
+    const int64_t ne12       = src1->ne[2];
+    const int64_t r2         = ne12/src0->ne[2];
+    const int64_t r3         = src1->ne[3]/src0->ne[3];
+    const int64_t n_matrices = ne12*src1->ne[3];
+
+    for (int64_t i = 0; i < n_matrices; ++i) {
+        const int64_t i12 = i%ne12;
+        const int64_t i13 = i/ne12;
+
+        // the first row of this src0 matrix in the word-major layout of the whole tensor
+        const cl_int   mat_row0 = ((i12/r2)*src0->nb[2] + (i13/r3)*src0->nb[3])/src0->nb[1];
+        const cl_int   act_col0 = i*src1->ne[1];
+        const cl_ulong offsetd  = extrad->offset + dst->view_offs + i12*dst->nb[2] + i13*dst->nb[3];
+
+        CL_CHECK(clSetKernelArg(kernel,  5, sizeof(cl_ulong), &offsetd));
+        CL_CHECK(clSetKernelArg(kernel,  9, sizeof(cl_int),   &mat_row0));
+        CL_CHECK(clSetKernelArg(kernel, 10, sizeof(cl_int),   &act_col0));
+
+        backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
+    }
+}
+
+// One PQ2_0 mat-vec pass: n_col_groups groups of n_cols src1 columns, starting at column col0.
+static void ggml_cl_mul_mat_pq2_0_f32_pass(ggml_backend_opencl_context * backend_ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst,
+                                           int n_cols, int n_col_groups, int col0) {
+    // a view keeps its pre-SoA extra; the converted one lives on view_src
+    const ggml_tensor * src0_base = src0->view_src != nullptr ? src0->view_src : src0;
+    ggml_tensor_extra_cl_q1_0 * extra0 = (ggml_tensor_extra_cl_q1_0 *) src0_base->extra;
+    ggml_tensor_extra_cl      * extrad = (ggml_tensor_extra_cl *) dst->extra;
+
+    const cl_int ne00   = src0->ne[0];
+    const cl_int ne01   = src0->ne[1];
+    const cl_int n_rows = ggml_nrows(src0_base);
+    const cl_int ne0    = dst->ne[0];
+
+    cl_kernel kernel = backend_ctx->kernel_mul_mv_pq2_0_f32_flat[n_cols - 1];
+
+    CL_CHECK(clSetKernelArg(kernel,  0, sizeof(cl_mem), &extra0->q));
+    CL_CHECK(clSetKernelArg(kernel,  1, sizeof(cl_mem), &extra0->d));
+    CL_CHECK(clSetKernelArg(kernel,  2, sizeof(cl_mem), &backend_ctx->prealloc_pq2_0_act_q.buffer));
+    CL_CHECK(clSetKernelArg(kernel,  3, sizeof(cl_mem), &backend_ctx->prealloc_pq2_0_act_ds.buffer));
+    CL_CHECK(clSetKernelArg(kernel,  4, sizeof(cl_mem), &extrad->data_device));
+    CL_CHECK(clSetKernelArg(kernel,  6, sizeof(cl_int), &ne00));
+    CL_CHECK(clSetKernelArg(kernel,  7, sizeof(cl_int), &ne01));
+    CL_CHECK(clSetKernelArg(kernel,  8, sizeof(cl_int), &n_rows));
+    CL_CHECK(clSetKernelArg(kernel, 11, sizeof(cl_int), &ne0));
+    CL_CHECK(clSetKernelArg(kernel, 12, sizeof(cl_int), &col0));
+
+    const size_t n_row_groups = CEIL_DIV(ne01, PQ2_0_MV_LANES*PQ2_0_MV_ROWS);
+
+    size_t global_work_size[] = {n_row_groups*PQ2_0_MV_LANES, PQ2_0_MV_KSPLIT, (size_t)n_col_groups};
+    size_t local_work_size[]  = {PQ2_0_MV_LANES, PQ2_0_MV_KSPLIT, 1};
+
+    ggml_cl_enqueue_pq2_0_matrices(backend_ctx, kernel, src0, src1, dst, global_work_size, local_work_size);
+}
+
+// Each weight block is read once per group of up to PQ2_0_MV_MAX_COLS src1 columns.
+static void ggml_cl_mul_mat_pq2_0_f32(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    ggml_backend_opencl_context * backend_ctx = (ggml_backend_opencl_context *) backend->context;
+
+    const int n_full = src1->ne[1]/PQ2_0_MV_MAX_COLS;
+    const int n_tail = src1->ne[1]%PQ2_0_MV_MAX_COLS;
+
+    ggml_cl_quantize_pq2_0_act(backend_ctx, src1, dst);
+
+    if (n_full > 0) {
+        ggml_cl_mul_mat_pq2_0_f32_pass(backend_ctx, src0, src1, dst, PQ2_0_MV_MAX_COLS, n_full, 0);
+    }
+    if (n_tail > 0) {
+        ggml_cl_mul_mat_pq2_0_f32_pass(backend_ctx, src0, src1, dst, n_tail, 1, n_full*PQ2_0_MV_MAX_COLS);
+    }
+}
+
 // Largest src1 column count handled as a small (speculative verify) batch.
 static constexpr int64_t GGML_CL_SMALL_BATCH_MAX = 8;
 // The small-N f32 GEMV assigns one work-group per output, so it only pays off for skinny weights.
@@ -22990,6 +23158,11 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
         return;
     }
 #endif
+
+    if (src0t == GGML_TYPE_PQ2_0 && src1t == GGML_TYPE_F32) {
+        ggml_cl_mul_mat_pq2_0_f32(backend, src0, src1, dst);
+        return;
+    }
 
     int nth0 = 32;
     int nth1 = 1;

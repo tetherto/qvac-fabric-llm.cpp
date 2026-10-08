@@ -61,6 +61,7 @@ However, A6x GPUs in phones are likely not supported due to the outdated driver 
 | DataType               | Status                     |
 |:----------------------:|:--------------------------:|
 | Q1_0                   | Support                    |
+| PQ2_0                  | Support (mat-vec, needs cl_khr_integer_dot_product) |
 | Q4_0                   | Support                    |
 | Q4_1                   | Support                    |
 | Q5_0                   | Support                    |

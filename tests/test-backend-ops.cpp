@@ -12993,6 +12993,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
     test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_PTQ1_0, GGML_GLU_OP_SWIGLU, 1, 8, 196608,
         false, 1, 1, false, false, true, false, {1, 1}));
+    // PQ2_0 at prefill widths: the model loader places weights by asking for a 512-column mul_mat
+    for (int64_t n : {512, 513}) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_PQ2_0, GGML_TYPE_F32, 256, n, 256, {1, 1}, {1, 1}));
+    }
     test_cases.emplace_back(new test_mul_mat_pq2_0_codes(67, 1024));
     test_cases.emplace_back(new test_mul_mat_pq2_0_codes(67, 5120));
     // fused PQ2_0 gate/up/SWIGLU mat-vec at a Bonsai-2 width with a row tail
@@ -14710,6 +14714,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         for (int n : {2, 4, 8}) {
             test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32, 17408, n, 5120, {1, 1}, {1, 1}));
         }
+    }
+    // Bonsai-2 27B output head, single token and speculative verify
+    for (int n : {1, 8}) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_PQ2_0, GGML_TYPE_F32, 248320, n, 5120, {1, 1}, {1, 1}));
     }
 
     // SWIGLU at a 27B-class FFN width, fused [gate|up] vs split operands
