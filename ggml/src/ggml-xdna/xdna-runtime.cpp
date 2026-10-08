@@ -66,8 +66,12 @@ xdna_device * xdna_device_open(void) {
     xdna_device * dev = new xdna_device;
     try {
         dev->device      = xrt::device(0);
-        dev->name        = dev->device.get_info<xrt::info::device::name>();
-        dev->description = dev->device.get_info<xrt::info::device::bdf>();
+        // one NPU per system: named like the other backends' devices (CUDA0,
+        // Vulkan0), so --device takes it unquoted; XRT's name goes in the
+        // description
+        dev->name        = "XDNA0";
+        dev->description = dev->device.get_info<xrt::info::device::name>() + " (" +
+                           dev->device.get_info<xrt::info::device::bdf>() + ")";
     } catch (const std::exception & e) {
         GGML_LOG_ERROR("%s: failed to open NPU device: %s\n", "xdna-runtime", e.what());
         delete dev;
