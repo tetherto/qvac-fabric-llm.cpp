@@ -1459,8 +1459,9 @@ static std::vector<float> get_tensor_f32(const ggml_tensor * tensor) {
     return data;
 }
 
-// a copy of the target with prism.hadamard metadata and its token_embd and output rows folded, which leaves its logits unchanged
-static FILE * save_folded_target(llm_arch arch, const llama_model * model) {
+// a copy of the target with prism.hadamard metadata and its token_embd, output and extra_folded rows folded, which leaves
+// its logits unchanged; the extra weights must read n_embd-wide inputs
+static FILE * save_folded_target(llm_arch arch, const llama_model * model, const std::vector<std::string> & extra_folded = {}) {
     llama_model_saver source_saver(model);
     source_saver.add_kv_from_model();
     source_saver.add_tensors_from_model();
@@ -1468,6 +1469,11 @@ static FILE * save_folded_target(llm_arch arch, const llama_model * model) {
     gguf_context_ptr fixture_ctx(gguf_init_empty());
     gguf_set_kv(fixture_ctx.get(), source_saver.gguf_ctx);
     add_hadamard_metadata(fixture_ctx.get(), model->hparams.n_embd);
+    std::vector<const char *> weight_names = { "output.weight" };
+    for (const std::string & name : extra_folded) {
+        weight_names.push_back(name.c_str());
+    }
+    gguf_set_arr_str(fixture_ctx.get(), "prism.hadamard.weight_names", weight_names.data(), weight_names.size());
     llama_model_saver fixture(arch, fixture_ctx.get());
 
     ggml_init_params params = { 16 * 1024 * 1024, nullptr, false };
@@ -1477,7 +1483,9 @@ static FILE * save_folded_target(llm_arch arch, const llama_model * model) {
         const char * name = gguf_get_tensor_name(source_saver.gguf_ctx, i);
         const ggml_tensor * tensor = model->get_tensor(name);
         GGML_ASSERT(tensor);
-        if (strcmp(name, "token_embd.weight") != 0 && strcmp(name, "output.weight") != 0) {
+        const bool folded_weight = strcmp(name, "token_embd.weight") == 0 || strcmp(name, "output.weight") == 0 ||
+            std::find(extra_folded.begin(), extra_folded.end(), name) != extra_folded.end();
+        if (!folded_weight) {
             fixture.add_tensor(tensor);
             continue;
         }
@@ -1544,6 +1552,40 @@ static void test_hadamard_dflash_borrowed_io() {
     fclose(target_file);
 }
 
+static bool count_hadamard_transforms(ggml_tensor * t, bool ask, void * user_data) {
+    if (ask && t->op == GGML_OP_MUL_MAT && ((const int32_t *) t->op_params)[1] == GGML_HINT_SRC0_IS_HADAMARD) {
+        ++*(int *) user_data;
+    }
+    return false;
+}
+
+// folded weights that read the same activation share one activation transform: ffn_gate and ffn_up of every layer,
+// plus the output head and the token_embd lookup
+static void test_hadamard_shared_input() {
+    const size_t seed = 1234;
+    auto metadata = get_gguf_ctx(LLM_ARCH_QWEN35, false);
+    auto plain = get_model_and_ctx(metadata.get(), nullptr, seed, {});
+    const int n_layer = plain.first->hparams.n_layer();
+
+    std::vector<std::string> extra_folded;
+    for (int il = 0; il < n_layer; ++il) {
+        extra_folded.push_back("blk." + std::to_string(il) + ".ffn_gate.weight");
+        extra_folded.push_back("blk." + std::to_string(il) + ".ffn_up.weight");
+    }
+    FILE * target_file = save_folded_target(LLM_ARCH_QWEN35, plain.first.get(), extra_folded);
+
+    int n_transforms = 0;
+    auto folded = get_model_and_ctx(nullptr, target_file, seed, {}, LLAMA_SPLIT_MODE_LAYER, false, 1, false,
+                                    count_hadamard_transforms, &n_transforms);
+    GGML_ASSERT(folded.first->hadamard_rotations.size() == extra_folded.size() + 1);
+
+    const auto tokens = get_tokens(4, llama_vocab_n_tokens(llama_model_get_vocab(plain.first.get())), seed);
+    GGML_ASSERT(nmse(get_logits(plain.first.get(), plain.second.get(), tokens),
+                     get_logits(folded.first.get(), folded.second.get(), tokens)) < 1e-6);
+    GGML_ASSERT(n_transforms == n_layer + 2);
+    fclose(target_file);
+}
+
 static int test_hadamard_contracts() {
     test_hadamard_invalid_block();
     test_hadamard_tied_output();
@@ -1554,6 +1596,7 @@ static int test_hadamard_contracts() {
     test_hadamard_mtp_arch(LLM_ARCH_QWEN3NEXT, true);
     test_hadamard_repack();
     test_hadamard_dflash_borrowed_io();
+    test_hadamard_shared_input();
     printf("Hadamard contracts: passed\n");
     return 0;
 }

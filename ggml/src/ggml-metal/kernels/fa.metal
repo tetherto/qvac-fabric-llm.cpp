@@ -195,6 +195,7 @@ constant bool FC_flash_attn_ext_bc_mask [[function_constant(FC_FLASH_ATTN_EXT + 
 constant int32_t FC_flash_attn_ext_ns10 [[function_constant(FC_FLASH_ATTN_EXT + 20)]];
 constant int32_t FC_flash_attn_ext_ns20 [[function_constant(FC_FLASH_ATTN_EXT + 21)]];
 constant int32_t FC_flash_attn_ext_nsg  [[function_constant(FC_FLASH_ATTN_EXT + 22)]];
+constant int32_t FC_flash_attn_ext_nwg  [[function_constant(FC_FLASH_ATTN_EXT + 23)]];
 
 // ref: https://arxiv.org/pdf/2307.08691.pdf
 template<
@@ -240,7 +241,12 @@ void kernel_flash_attn_ext_impl(
         uint3   tgpig,
         ushort  tiisg,
         ushort  sgitg) {
-    const ushort iq3 = tgpig[2];
+#define NWG  (FC_flash_attn_ext_nwg)
+
+    // with NWG > 1, workgroup iwg takes every NWG-th KV chunk and writes unnormalized partial results for the reduce
+    const short iwg = tgpig[2]%NWG;
+
+    const ushort iq3 = tgpig[2]/NWG;
     const ushort iq2 = tgpig[1];
     const ushort iq1 = tgpig[0]*Q;
 
@@ -297,7 +303,7 @@ void kernel_flash_attn_ext_impl(
     FOR_UNROLL (short jj = 0; jj < NQ; ++jj) {
         const short j = jj*NSG + sgitg;
 
-        pm2[jj] = (device const half2 *) ((device const char *) mask + (iq1 + j)*args.nb31 + (iq2%args.ne32)*args.nb32 + (iq3%args.ne33)*args.nb33);
+        pm2[jj] = (device const half2 *) ((device const char *) mask + (iq1 + j)*args.nb31 + (iq2%args.ne32)*args.nb32 + (iq3%args.ne33)*args.nb33) + iwg*NW;
     }
 
     {
@@ -348,10 +354,9 @@ void kernel_flash_attn_ext_impl(
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     float S[NQ] = { [0 ... NQ-1] = 0.0f };
+    float M[NQ] = { [0 ... NQ-1] = -FLT_MAX/2 };
 
     {
-        float M[NQ] = { [0 ... NQ-1] = -FLT_MAX/2 };
-
         float slope = 1.0f;
 
         // ALiBi
@@ -366,7 +371,7 @@ void kernel_flash_attn_ext_impl(
 
         // loop over the KV cache
         // each simdgroup handles blocks of Q rows and C columns
-        for (int ic0 = 0; ; ++ic0) {
+        for (int ic0 = iwg; ; ic0 += NWG) {
             int ic = ic0*C;
             if (ic >= args.ne11) {
                 break;
@@ -418,7 +423,7 @@ void kernel_flash_attn_ext_impl(
 
                 if (blk_cur == 0) {
                     FOR_UNROLL (short jj = 0; jj < NQ; ++jj) {
-                        pm2[jj] += NW;
+                        pm2[jj] += NWG*NW;
                     }
 
                     continue;
@@ -434,11 +439,11 @@ void kernel_flash_attn_ext_impl(
                             sm2[j*SH + tiisg] = pm2[jj][tiisg];
                         }
 
-                        pm2[jj] += NW;
+                        pm2[jj] += NWG*NW;
                     }
                 } else if (blk_cur == 2) {
                     FOR_UNROLL (short jj = 0; jj < NQ; ++jj) {
-                        pm2[jj] += NW;
+                        pm2[jj] += NWG*NW;
                     }
                 }
 
@@ -787,7 +792,7 @@ void kernel_flash_attn_ext_impl(
             threadgroup_barrier(mem_flags::mem_threadgroup);
         }
 
-        if (FC_flash_attn_ext_has_sinks) {
+        if (FC_flash_attn_ext_has_sinks && iwg == 0) {
             FOR_UNROLL (short jj = 0; jj < NQ; ++jj) {
                 const short j = jj*NSG + sgitg;
 
@@ -806,6 +811,33 @@ void kernel_flash_attn_ext_impl(
                 }
             }
         }
+    }
+
+    if (NWG > 1) {
+        const int64_t nrows = args.ne3*args.ne2*args.ne1;
+
+        device float4 * dst4 = (device float4 *) dst;
+        device float  * dst1 = (device float  *) dst + nrows*DV*NWG; // the S and M are stored after the results
+
+        for (short jj = 0; jj < NQ; ++jj) {
+            const short j = jj*NSG + sgitg;
+            if (iq1 + j >= args.ne01) {
+                break;
+            }
+
+            const int64_t rid = (int64_t) iq3*args.ne2*args.ne1 + iq2 + (int64_t)(iq1 + j)*args.ne1;
+
+            for (short i = tiisg; i < DV4; i += NW) {
+                dst4[rid*DV4*NWG + NWG*i + iwg] = (float4) so4[j*PV4 + i];
+            }
+
+            if (tiisg == 0) {
+                dst1[rid*(2*NWG) + 2*iwg + 0] = S[jj];
+                dst1[rid*(2*NWG) + 2*iwg + 1] = M[jj];
+            }
+        }
+
+        return;
     }
 
     // store to global memory
@@ -832,6 +864,7 @@ void kernel_flash_attn_ext_impl(
         }
     }
 
+#undef NWG
 #undef NS10
 #undef NS20
 }
@@ -1080,6 +1113,7 @@ constant int32_t FC_flash_attn_ext_vec_ns20 [[function_constant(FC_FLASH_ATTN_EX
 constant int32_t FC_flash_attn_ext_vec_nsg  [[function_constant(FC_FLASH_ATTN_EXT_VEC + 22)]];
 constant int32_t FC_flash_attn_ext_vec_nwg  [[function_constant(FC_FLASH_ATTN_EXT_VEC + 23)]];
 constant bool    FC_flash_attn_ext_vec_has_sparse [[function_constant(FC_FLASH_ATTN_EXT_VEC + 5)]];
+constant int32_t FC_flash_attn_ext_vec_nhptg [[function_constant(FC_FLASH_ATTN_EXT_VEC + 24)]];
 
 // compress the finite entries of each KQ mask row into a list of KV indices (ascending order),
 // padded with -1 up to n_kv_max_padded (a multiple of OP_FLASH_ATTN_EXT_VEC_NCPSG)
@@ -1219,20 +1253,26 @@ kernel void kernel_flash_attn_ext_vec(
         threadgroup  half * shmem_f16 [[threadgroup(0)]],
         uint3   tgpig[[threadgroup_position_in_grid]],
         ushort  tiisg[[thread_index_in_simdgroup]],
-        ushort  sgitg[[simdgroup_index_in_threadgroup]]) {
+        ushort  sgitg_tg[[simdgroup_index_in_threadgroup]]) {
     static_assert(DK % 32 == 0, "DK must be divisible by 32");
     static_assert(DV % 32 == 0, "DV must be divisible by 32");
 
-#define NWG  (FC_flash_attn_ext_vec_nwg)
-#define NSG  (FC_flash_attn_ext_vec_nsg)
+#define NWG   (FC_flash_attn_ext_vec_nwg)
+#define NSG   (FC_flash_attn_ext_vec_nsg)
+#define NHPTG (FC_flash_attn_ext_vec_nhptg)
 
 #define NS10 (FC_flash_attn_ext_vec_ns10)
 #define NS20 (FC_flash_attn_ext_vec_ns20)
 
     const short iwg = tgpig[2]%NWG;
 
+    // the threadgroup holds NHPTG heads that share a KV head, each with its own NSG simdgroups and shared memory
+    // (with one head, the indices stay the hardware values so the shared memory offsets fold at compile time)
+    const ushort ihg   = NHPTG > 1 ? sgitg_tg/NSG : 0;
+    const ushort sgitg = NHPTG > 1 ? sgitg_tg%NSG : sgitg_tg;
+
     const ushort iq3 = tgpig[2]/NWG;
-    const ushort iq2 = tgpig[1];
+    const ushort iq2 = tgpig[1]*NHPTG + ihg;
     const ushort iq1 = tgpig[0];
 
     constexpr short DK4 = DK/4;
@@ -1250,6 +1290,8 @@ kernel void kernel_flash_attn_ext_vec(
 
     static_assert(DK4 % NL == 0, "DK4 must be divisible by NL");
     static_assert(DV4 % NL == 0, "DV4 must be divisible by NL");
+
+    shmem_f16 += ihg*(Q*NSG*PK + NSG*SH + 2*NSG*Q*PV);
 
   //const short T = PK + NSG*SH; // shared memory size per query in (half)
 
@@ -1294,10 +1336,12 @@ kernel void kernel_flash_attn_ext_vec(
         }
     }
 
-    // zero out so
-    for (short qq = 0; qq < Q; ++qq) {
-        for (short i = 0; i < DV4/NL; ++i) {
-            so4[qq*DV4 + i*NL] = (o4_t) 0.0f;
+    // zero out so (lanes past NL would index beyond the last row, into the next head's shared memory)
+    if (tiisg < NL) {
+        for (short qq = 0; qq < Q; ++qq) {
+            for (short i = 0; i < DV4/NL; ++i) {
+                so4[qq*DV4 + i*NL] = (o4_t) 0.0f;
+            }
         }
     }
 
@@ -1801,6 +1845,7 @@ kernel void kernel_flash_attn_ext_vec(
 
 #undef NWG
 #undef NSG
+#undef NHPTG
 #undef NS10
 #undef NS20
 }

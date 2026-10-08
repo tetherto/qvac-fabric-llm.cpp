@@ -1538,6 +1538,33 @@ ggml_tensor * llm_graph_context::build_hadamard_inverse_after_lookup(
     return cur;
 }
 
+ggml_tensor * llm_graph_context::build_hadamard_activation(
+                 ggml_tensor * cur,
+    const llama_hadamard_transform & t) const {
+    const hadamard_act_key key(cur, t.rot, t.signs, t.perm_hd, t.perm_nk, t.perm_rep);
+    const auto it = hadamard_acts.find(key);
+    if (it != hadamard_acts.end()) {
+        return it->second;
+    }
+
+    ggml_tensor * res = cur;
+    if (t.perm_rep > 1) {
+        // tiled [hd, nk, rep] -> grouped [hd, rep, nk] feature order
+        ggml_tensor * x = ggml_is_contiguous(res) ? res : ggml_cont(ctx0, res);
+        const int64_t ne1 = x->ne[1], ne2 = x->ne[2], ne3 = x->ne[3];
+        x = ggml_reshape_4d(ctx0, x, t.perm_hd, t.perm_nk, t.perm_rep, ne1*ne2*ne3);
+        x = ggml_cont(ctx0, ggml_permute(ctx0, x, 0, 2, 1, 3));
+        res = ggml_reshape_4d(ctx0, x, t.perm_hd*t.perm_nk*t.perm_rep, ne1, ne2, ne3);
+    }
+    if (t.signs) {
+        res = llama_apply_hadamard_sign(ctx0, res, t.signs);
+    }
+    res = llama_mul_mat_hadamard(ctx0, res, t.rot);
+
+    hadamard_acts.emplace(key, res);
+    return res;
+}
+
 ggml_tensor * llm_graph_context::build_lora_mm(
           ggml_tensor * w,
           ggml_tensor * cur,
@@ -1546,19 +1573,7 @@ ggml_tensor * llm_graph_context::build_lora_mm(
     if (hadamard_rotations && !hadamard_rotations->empty()) {
         const auto it = hadamard_rotations->find(w);
         if (it != hadamard_rotations->end()) {
-            const auto & t = it->second;
-            if (t.perm_rep > 1) {
-                // tiled [hd, nk, rep] -> grouped [hd, rep, nk] feature order
-                ggml_tensor * x = ggml_is_contiguous(cur_mm) ? cur_mm : ggml_cont(ctx0, cur_mm);
-                const int64_t ne1 = x->ne[1], ne2 = x->ne[2], ne3 = x->ne[3];
-                x = ggml_reshape_4d(ctx0, x, t.perm_hd, t.perm_nk, t.perm_rep, ne1*ne2*ne3);
-                x = ggml_cont(ctx0, ggml_permute(ctx0, x, 0, 2, 1, 3));
-                cur_mm = ggml_reshape_4d(ctx0, x, t.perm_hd*t.perm_nk*t.perm_rep, ne1, ne2, ne3);
-            }
-            if (t.signs) {
-                cur_mm = llama_apply_hadamard_sign(ctx0, cur_mm, t.signs);
-            }
-            cur_mm = llama_mul_mat_hadamard(ctx0, cur_mm, t.rot);
+            cur_mm = build_hadamard_activation(cur, it->second);
         }
     }
 
@@ -1598,19 +1613,7 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
     if (hadamard_rotations && !hadamard_rotations->empty()) {
         const auto it = hadamard_rotations->find(w);
         if (it != hadamard_rotations->end()) {
-            const auto & t = it->second;
-            if (t.perm_rep > 1) {
-                // tiled [hd, nk, rep] -> grouped [hd, rep, nk] feature order
-                ggml_tensor * x = ggml_is_contiguous(cur_mm) ? cur_mm : ggml_cont(ctx0, cur_mm);
-                const int64_t ne1 = x->ne[1], ne2 = x->ne[2], ne3 = x->ne[3];
-                x = ggml_reshape_4d(ctx0, x, t.perm_hd, t.perm_nk, t.perm_rep, ne1*ne2*ne3);
-                x = ggml_cont(ctx0, ggml_permute(ctx0, x, 0, 2, 1, 3));
-                cur_mm = ggml_reshape_4d(ctx0, x, t.perm_hd*t.perm_nk*t.perm_rep, ne1, ne2, ne3);
-            }
-            if (t.signs) {
-                cur_mm = llama_apply_hadamard_sign(ctx0, cur_mm, t.signs);
-            }
-            cur_mm = llama_mul_mat_hadamard(ctx0, cur_mm, t.rot);
+            cur_mm = build_hadamard_activation(cur, it->second);
         }
     }
 
