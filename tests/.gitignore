@@ -1,5 +1,6 @@
 *
 !*.*
+!package-consumer/
 !snapshots/
 !fusion/
 !turbovec-golden-gen/

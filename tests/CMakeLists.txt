@@ -534,6 +534,30 @@ if (GGML_BACKEND_DL AND NOT EMSCRIPTEN)
     endif()
 endif()
 
+# Installs the tree into a scratch prefix, builds a downstream project against it
+# and checks that pkg-config names only libraries that exist in the installed libdir.
+if (NOT LLAMA_USE_SYSTEM_GGML)
+    if (NOT GGML_BACKEND_DL)
+        set(GGML_CONSUMER_EXPECT_CPU ON)
+    else()
+        set(GGML_CONSUMER_EXPECT_CPU OFF)
+    endif()
+    set(GGML_CONSUMER_EXTRA_LIB_DIRS "")
+    if (GGML_VULKAN AND Vulkan_LIBRARY)
+        get_filename_component(GGML_CONSUMER_EXTRA_LIB_DIRS "${Vulkan_LIBRARY}" DIRECTORY)
+    endif()
+    add_test(NAME test-package-consumer
+        COMMAND ${CMAKE_COMMAND}
+            -DGGML_BUILD_DIR=${CMAKE_BINARY_DIR}
+            -DGGML_CONSUMER_EXTRA_LIB_DIRS=${GGML_CONSUMER_EXTRA_LIB_DIRS}
+            -DGGML_CONSUMER_SOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}/package-consumer
+            -DGGML_LIB_OUTPUT_PREFIX=${GGML_LIB_OUTPUT_PREFIX}
+            -DGGML_CONSUMER_EXPECT_CPU=${GGML_CONSUMER_EXPECT_CPU}
+            -DGGML_CONSUMER_CONFIG=$<CONFIG>
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/package-consumer/run.cmake)
+    set_property(TEST test-package-consumer PROPERTY LABELS main)
+endif()
+
 llama_build_and_test(test-model-load-cancel.cpp       LABEL "model")
 llama_build_and_test(test-model-load-disk.cpp         LABEL "model")
 llama_build_and_test(test-model-load-memory.cpp       LABEL "model")

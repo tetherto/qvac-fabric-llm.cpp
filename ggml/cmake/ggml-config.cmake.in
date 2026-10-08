@@ -20,13 +20,26 @@ if (NOT GGML_SHARED_LIB)
     endif()
 
     if (GGML_OPENMP_ENABLED)
-        find_dependency(OpenMP)
         set(GGML_OPENMP_INTERFACE_LINK_LIBRARIES "")
-        if (TARGET OpenMP::OpenMP_C)
-            list(APPEND GGML_OPENMP_INTERFACE_LINK_LIBRARIES OpenMP::OpenMP_C)
-        endif()
-        if (TARGET OpenMP::OpenMP_CXX)
-            list(APPEND GGML_OPENMP_INTERFACE_LINK_LIBRARIES OpenMP::OpenMP_CXX)
+        if (GGML_OPENMP_FETCH)
+            # the fetched LLVM runtime is installed next to the ggml libraries
+            find_library(GGML_OPENMP_FETCHED_LIBRARY NAMES libomp omp
+                HINTS "@PACKAGE_GGML_LIB_INSTALL_DIR@"
+                NO_DEFAULT_PATH)
+            if (NOT GGML_OPENMP_FETCHED_LIBRARY)
+                set(${CMAKE_FIND_PACKAGE_NAME}_FOUND 0)
+                return()
+            endif()
+            message(STATUS "ggml: OpenMP runtime ${GGML_OPENMP_FETCHED_LIBRARY}")
+            list(APPEND GGML_OPENMP_INTERFACE_LINK_LIBRARIES ${GGML_OPENMP_FETCHED_LIBRARY})
+        else()
+            find_dependency(OpenMP)
+            if (TARGET OpenMP::OpenMP_C)
+                list(APPEND GGML_OPENMP_INTERFACE_LINK_LIBRARIES OpenMP::OpenMP_C)
+            endif()
+            if (TARGET OpenMP::OpenMP_CXX)
+                list(APPEND GGML_OPENMP_INTERFACE_LINK_LIBRARIES OpenMP::OpenMP_CXX)
+            endif()
         endif()
         list(APPEND GGML_BASE_INTERFACE_LINK_LIBRARIES ${GGML_OPENMP_INTERFACE_LINK_LIBRARIES})
         list(APPEND GGML_CPU_INTERFACE_LINK_LIBRARIES ${GGML_OPENMP_INTERFACE_LINK_LIBRARIES})
@@ -150,6 +163,12 @@ endif()
 
 # Include the exported targets file
 include("${CMAKE_CURRENT_LIST_DIR}/ggml-targets.cmake")
+
+# The exported static targets carry the fetched OpenMP runtime only as an
+# empty build-interface placeholder, so attach the installed runtime here.
+if (TARGET ggml::ggml-base AND GGML_OPENMP_FETCHED_LIBRARY)
+    set_property(TARGET ggml::ggml-base APPEND PROPERTY INTERFACE_LINK_LIBRARIES "${GGML_OPENMP_FETCHED_LIBRARY}")
+endif()
 
 if(NOT TARGET ggml::ggml)
     find_package(Threads REQUIRED)
