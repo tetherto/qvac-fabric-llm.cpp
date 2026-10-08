@@ -16480,20 +16480,20 @@ static void ggml_cl_pad(ggml_backend_t backend, const ggml_tensor * src0, ggml_t
     const int s_ne2 = src0->ne[2];
     const int s_ne3 = src0->ne[3];
 
-    const int s_nb0 = src0->nb[0];
-    const int s_nb1 = src0->nb[1];
-    const int s_nb2 = src0->nb[2];
-    const int s_nb3 = src0->nb[3];
+    const cl_ulong s_nb0 = src0->nb[0];
+    const cl_ulong s_nb1 = src0->nb[1];
+    const cl_ulong s_nb2 = src0->nb[2];
+    const cl_ulong s_nb3 = src0->nb[3];
 
     const int d_ne0 = dst->ne[0];
     const int d_ne1 = dst->ne[1];
     const int d_ne2 = dst->ne[2];
     const int d_ne3 = dst->ne[3];
 
-    const int d_nb0 = dst->nb[0];
-    const int d_nb1 = dst->nb[1];
-    const int d_nb2 = dst->nb[2];
-    const int d_nb3 = dst->nb[3];
+    const cl_ulong d_nb0 = dst->nb[0];
+    const cl_ulong d_nb1 = dst->nb[1];
+    const cl_ulong d_nb2 = dst->nb[2];
+    const cl_ulong d_nb3 = dst->nb[3];
 
     const int lp0 = ((const int*)(dst->op_params))[0];
     const int rp0 = ((const int*)(dst->op_params))[1];
@@ -16534,6 +16534,8 @@ static void ggml_cl_pad(ggml_backend_t backend, const ggml_tensor * src0, ggml_t
     CL_CHECK(clSetKernelArg(kernel, 25, sizeof(int),       &rp2));
     CL_CHECK(clSetKernelArg(kernel, 26, sizeof(int),       &lp3));
     CL_CHECK(clSetKernelArg(kernel, 27, sizeof(int),       &rp3));
+    const fastdiv_vals ne2_fd = init_fastdiv_values(d_ne2);
+    CL_CHECK(clSetKernelArg(kernel, 28, sizeof(fastdiv_vals), &ne2_fd));
 
     size_t lws0 = 64;
     size_t gws0 = (( (size_t)d_ne0 + lws0 - 1 ) / lws0) * lws0;
