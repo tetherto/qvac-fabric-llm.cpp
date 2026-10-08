@@ -225,8 +225,10 @@
 #define GGML_MAX_N_THREADS      512
 #define GGML_MAX_OP_PARAMS      64
 
+// 128 fits the ACE-Step DiT tensor names that exceed 64 chars. name[] is an inline
+// array in struct ggml_tensor, so every consumer must be rebuilt against this header.
 #ifndef GGML_MAX_NAME
-#   define GGML_MAX_NAME        64
+#   define GGML_MAX_NAME        128
 #endif
 
 #define GGML_DEFAULT_N_THREADS  4

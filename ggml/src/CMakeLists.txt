@@ -367,6 +367,10 @@ if (GGML_OPENMP_ENABLED)
     target_link_libraries(ggml-base PRIVATE ${GGML_OPENMP_TARGET_C} ${GGML_OPENMP_TARGET_CXX})
 endif()
 
+if (DEFINED GGML_MAX_NAME)
+    target_compile_definitions(ggml-base PUBLIC GGML_MAX_NAME=${GGML_MAX_NAME})
+endif()
+
 add_library(ggml
             ggml-backend-dl.cpp
             ggml-backend-reg.cpp)
