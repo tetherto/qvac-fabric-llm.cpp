@@ -1,5 +1,6 @@
 #include "ggml-metal-fusion.h"
 
+#include "ggml-metal-impl.h"
 #include "ggml-metal-common.h"
 #include "ggml-metal-device.h"
 
@@ -102,6 +103,55 @@ static bool ggml_metal_fusion_overlap(const ggml_tensor * a, const ggml_tensor *
     return bid_a.offs <= bid_b.offs
         ? bid_b.offs - bid_a.offs < ggml_nbytes(a)
         : bid_a.offs - bid_b.offs < ggml_nbytes(b);
+}
+
+// true if every row of f32 tensor t starts 16-byte aligned, so a kernel can read it as float4
+static bool ggml_metal_fusion_float4_rows(const ggml_tensor * t) {
+    constexpr size_t align = 4*sizeof(float);
+
+    ggml_backend_buffer_t buf = t->view_src ? t->view_src->buffer : t->buffer;
+    const ggml_metal_buffer_id bid = ggml_metal_buffer_get_id((ggml_metal_buffer_t) buf->context, t);
+
+    return bid.offs % align == 0 && t->nb[1] % align == 0 && t->nb[2] % align == 0 && t->nb[3] % align == 0;
+}
+
+// true if a and b visit the same bytes in the same element order: the same layout, or both contiguous with equal sizes
+static bool ggml_metal_fusion_same_linear_layout(const ggml_tensor * a, const ggml_tensor * b) {
+    return a->type == b->type && ggml_nbytes(a) == ggml_nbytes(b) &&
+        (ggml_are_same_layout(a, b) || (ggml_is_contiguous(a) && ggml_is_contiguous(b)));
+}
+
+// true if the byte ranges of a and b overlap, except when b is exactly a: the same data in the same linear layout
+static bool ggml_metal_fusion_partial_overlap(const ggml_tensor * a, const ggml_tensor * b) {
+    return !(a->data == b->data && ggml_metal_fusion_same_linear_layout(a, b)) && ggml_metal_fusion_overlap(a, b);
+}
+
+// the raw graph indices of an unsafe pattern whose non-empty nodes start at idx: the raw nodes from the first to the
+// last non-empty node must match fusion->ops_all one to one. returns the raw node count, or 0 if they do not
+static int ggml_metal_fusion_raw_span(
+        const ggml_metal_fusion * fusion,
+        const ggml_cgraph       * gf,
+        const int               * node_idxs,
+              int                 idx,
+              int               * raw_idxs) {
+    const std::vector<ggml_op> & ops_all = fusion->ops_all;
+
+    const int raw_start = node_idxs[idx];
+    const int raw_end   = node_idxs[idx + (int) fusion->ops.size() - 1];
+    const int raw_count = raw_end - raw_start + 1;
+
+    if (raw_count != (int) ops_all.size() || raw_count > GGML_METAL_FUSION_MAX) {
+        return 0;
+    }
+
+    for (int i = 0; i < raw_count; ++i) {
+        raw_idxs[i] = raw_start + i;
+        if (gf->nodes[raw_start + i]->op != ops_all[i]) {
+            return 0;
+        }
+    }
+
+    return raw_count;
 }
 
 // ---- pattern checks ------------------------------------------------------
@@ -343,39 +393,13 @@ static bool ggml_metal_fusion_check_snake(
     return types_ok && shape_ok && dim_ok && contig_ok && x_in_add == x;
 }
 
-// MUL + MUL_MAT(hadamard): the sign vector folds into the FWHT kernel, so the MUL is elided.
-// the MUL_MAT reads the MUL through a RESHAPE, which is not a chain link, so the checks live
-// here (unsafe = true): the raw pattern MUL -> RESHAPE -> MUL_MAT must be consecutive and the
-// MUL/RESHAPE must have no other consumers.
-static bool ggml_metal_fusion_check_fwht_signed(
-        const ggml_metal_fusion      * fusion,
-        const ggml_tensor * const    * nodes,
-        const ggml_cgraph            * gf,
-        const int                    * node_idxs,
-              int                      idx,
-              ggml_metal_fusion_mode   mode) {
-    const std::vector<ggml_op> & ops_all = fusion->ops_all;
-
-    const int raw_start = node_idxs[idx];
-    const int raw_end   = node_idxs[idx + 1];
-    const int raw_count = raw_end - raw_start + 1;
-
-    if (raw_count != (int) ops_all.size()) {
-        return false;
-    }
-
-    int raw_idxs[GGML_METAL_FUSION_MAX];
-    for (int i = 0; i < raw_count; ++i) {
-        raw_idxs[i] = raw_start + i;
-        if (gf->nodes[raw_start + i]->op != ops_all[i]) {
-            return false;
-        }
-    }
-
-    const ggml_tensor * mul     = nodes[0];
-    const ggml_tensor * reshape = gf->nodes[raw_start + 1];
-    const ggml_tensor * mm      = nodes[1];
-
+// the signed FWHT MUL -> RESHAPE -> MUL_MAT(hadamard), without the consumer checks: the sign vector folds into the
+// FWHT kernel, which reads x and writes mm in one pass
+static bool ggml_metal_fusion_fwht_signed_ok(
+        const ggml_tensor          * mul,
+        const ggml_tensor          * reshape,
+        const ggml_tensor          * mm,
+              ggml_metal_fusion_mode mode) {
     // the fusion table has no device handle, so the threadgroup-memory bound of the wide FWHT
     // kernels is not checked here; the encoder (ggml_metal_op_fwht_signed_elidable) re-checks
     // against the device and falls back to the unfused MUL + MUL_MAT when it does not fit
@@ -384,8 +408,7 @@ static bool ggml_metal_fusion_check_fwht_signed(
         return false;
     }
 
-    const ggml_tensor * x     = ggml_are_same_shape(mul, mul->src[0]) ? mul->src[0] : mul->src[1];
-    const ggml_tensor * signs = x == mul->src[0] ? mul->src[1] : mul->src[0];
+    const auto [x, signs] = ggml_metal_fwht_signed_operands(mul);
     const int64_t n = mm->src[0]->ne[0];
 
     const bool ok =
@@ -399,15 +422,205 @@ static bool ggml_metal_fusion_check_fwht_signed(
         return false;
     }
 
-    if (mode == GGML_METAL_FUSION_FULL) {
-        // the kernel reads x and writes mm in one pass
-        if (ggml_metal_fusion_overlap(x, mm)) {
-            return false;
-        }
+    // each thread writes only the elements it read, so an exact alias is safe
+    return mode != GGML_METAL_FUSION_FULL || !ggml_metal_fusion_partial_overlap(x, mm);
+}
+
+// MUL + MUL_MAT(hadamard): the sign vector folds into the FWHT kernel, so the MUL is elided.
+// the MUL_MAT reads the MUL through a RESHAPE, which is not a chain link, so the checks live
+// here (unsafe = true): the raw pattern MUL -> RESHAPE -> MUL_MAT must be consecutive and the
+// MUL/RESHAPE must have no other consumers.
+static bool ggml_metal_fusion_check_fwht_signed(
+        const ggml_metal_fusion      * fusion,
+        const ggml_tensor * const    * nodes,
+        const ggml_cgraph            * gf,
+        const int                    * node_idxs,
+              int                      idx,
+              ggml_metal_fusion_mode   mode) {
+    int raw_idxs[GGML_METAL_FUSION_MAX];
+    const int raw_count = ggml_metal_fusion_raw_span(fusion, gf, node_idxs, idx, raw_idxs);
+    if (raw_count == 0) {
+        return false;
     }
 
-    const int outputs[1] = { raw_end };
-    return ggml_can_fuse_subgraph_ext(gf, raw_idxs, raw_count, ops_all.data(), outputs, 1);
+    if (!ggml_metal_fusion_fwht_signed_ok(nodes[0], gf->nodes[raw_idxs[1]], nodes[1], mode)) {
+        return false;
+    }
+
+    const int outputs[1] = { raw_idxs[raw_count - 1] };
+    return ggml_can_fuse_subgraph_ext(gf, raw_idxs, raw_count, fusion->ops_all.data(), outputs, 1);
+}
+
+// RMS_NORM + MUL + UNARY(SILU) + MUL: the gated norm silu(z)*(norm(x)*w); the UNARY reads the gate, not the chain, so
+// the checks live here (unsafe = true) and the norm, the weighted norm and the activation must have no other consumers
+static bool ggml_metal_fusion_check_rms_norm_gate(
+        const ggml_metal_fusion      * fusion,
+        const ggml_tensor * const    * nodes,
+        const ggml_cgraph            * gf,
+        const int                    * node_idxs,
+              int                      idx,
+              ggml_metal_fusion_mode   mode) {
+    const ggml_tensor * norm  = nodes[0];
+    const ggml_tensor * mul   = nodes[1];
+    const ggml_tensor * act   = nodes[2];
+    const ggml_tensor * gated = nodes[3];
+
+    const ggml_tensor * x = norm->src[0];
+    const ggml_tensor * w = mul->src[1];
+    const ggml_tensor * z = act->src[0];
+
+    const bool ok =
+        mul->src[0] == norm && ggml_get_unary_op(act) == GGML_UNARY_OP_SILU && gated->src[0] == mul && gated->src[1] == act &&
+        x->type == GGML_TYPE_F32 && w->type == GGML_TYPE_F32 && z->type == GGML_TYPE_F32 &&
+        norm->type == GGML_TYPE_F32 && mul->type == GGML_TYPE_F32 && act->type == GGML_TYPE_F32 && gated->type == GGML_TYPE_F32 &&
+        w->ne[0] == x->ne[0] && ggml_is_contiguous_rows(w) && ggml_is_contiguous_rows(z) &&
+        ggml_are_same_shape(mul, norm) && ggml_are_same_shape(act, norm) && ggml_are_same_shape(gated, norm);
+
+    if (!ok) {
+        return false;
+    }
+
+    int raw_idxs[GGML_METAL_FUSION_MAX];
+    if (ggml_metal_fusion_raw_span(fusion, gf, node_idxs, idx, raw_idxs) == 0) {
+        return false;
+    }
+
+    // a RESHAPE of the gate is a view of an outside tensor, so only the non-empty nodes are checked for consumers
+    const int outputs[1] = { node_idxs[idx + 3] };
+    if (!ggml_can_fuse_subgraph_ext(gf, node_idxs + idx, 4, fusion->ops.data(), outputs, 1)) {
+        return false;
+    }
+
+    if (mode != GGML_METAL_FUSION_FULL) {
+        return true;
+    }
+
+    // the kernel reads the gate as float4 rows when the rows are a multiple of 4 wide
+    return !ggml_metal_fusion_partial_overlap(x, gated) && !ggml_metal_fusion_partial_overlap(z, gated) &&
+        (x->ne[0] % 4 != 0 || ggml_metal_fusion_float4_rows(z));
+}
+
+// the RMS_NORM_FWHT outputs: the MUL_MAT, and the weighted norm when it has other consumers. returns the output
+// count (1 or 2), or 0 if an intermediate other than the weighted norm has other consumers
+static int ggml_metal_fusion_rms_norm_fwht_outputs(const ggml_cgraph * gf, const int * raw_idxs, const ggml_op * ops) {
+    const int outs[2] = { raw_idxs[4], raw_idxs[1] };
+
+    if (ggml_can_fuse_subgraph_ext(gf, raw_idxs, 5, ops, outs, 1)) {
+        return 1;
+    }
+
+    return ggml_can_fuse_subgraph_ext(gf, raw_idxs, 5, ops, outs, 2) ? 2 : 0;
+}
+
+// RMS_NORM + MUL + signed FWHT: each FWHT block recomputes the sum of its whole input row, so the norm input must
+// not overlap the outputs. the norm and the sign MUL must have no other consumers; the weighted norm may, and the
+// kernel then writes it too (unsafe = true)
+static bool ggml_metal_fusion_check_rms_norm_fwht(
+        const ggml_metal_fusion      * fusion,
+        const ggml_tensor * const    * nodes,
+        const ggml_cgraph            * gf,
+        const int                    * node_idxs,
+              int                      idx,
+              ggml_metal_fusion_mode   mode) {
+    const ggml_tensor * norm  = nodes[0];
+    const ggml_tensor * mul   = nodes[1];
+    const ggml_tensor * mul_s = nodes[2];
+    const ggml_tensor * mm    = nodes[3];
+
+    int raw_idxs[GGML_METAL_FUSION_MAX];
+    const int raw_count = ggml_metal_fusion_raw_span(fusion, gf, node_idxs, idx, raw_idxs);
+    if (raw_count == 0) {
+        return false;
+    }
+
+    if (mul->src[0] != norm || mul_s->src[0] != mul ||
+        !ggml_metal_fusion_fwht_signed_ok(mul_s, gf->nodes[raw_idxs[3]], mm, mode)) {
+        return false;
+    }
+
+    const ggml_tensor * x = norm->src[0];
+    const ggml_tensor * w = mul->src[1];
+    const int64_t n = mm->src[0]->ne[0];
+
+    const bool ok =
+        x->type == GGML_TYPE_F32 && norm->type == GGML_TYPE_F32 && mul->type == GGML_TYPE_F32 && w->type == GGML_TYPE_F32 &&
+        ggml_is_contiguous(x) && ggml_is_contiguous(mul) && ggml_is_contiguous(w) &&
+        ggml_are_same_shape(mul, norm) && ggml_are_same_shape(mul, mul_s) &&
+        w->ne[0] == x->ne[0] && ggml_nrows(w) == 1 && n >= GGML_METAL_FWHT_TG_MIN_N;
+
+    if (!ok) {
+        return false;
+    }
+
+    const int n_outs = ggml_metal_fusion_rms_norm_fwht_outputs(gf, raw_idxs, fusion->ops_all.data());
+    if (n_outs == 0) {
+        return false;
+    }
+
+    if (mode != GGML_METAL_FUSION_FULL) {
+        return true;
+    }
+
+    // the kernel writes the weighted norm and mm separately, and reads the norm input as float4 rows
+    return (n_outs == 1 || mul->data != mm->data) &&
+        !ggml_metal_fusion_overlap(x, mm) && !ggml_metal_fusion_overlap(x, mul) && ggml_metal_fusion_float4_rows(x);
+}
+
+bool ggml_metal_fusion_rms_norm_fwht_write_norm(const struct ggml_cgraph * gf, const int * node_idxs, int idx) {
+    static const ggml_op ops[5] = { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_MUL, GGML_OP_RESHAPE, GGML_OP_MUL_MAT };
+
+    int raw_idxs[5];
+    for (int i = 0; i < 5; ++i) {
+        raw_idxs[i] = node_idxs[idx] + i;
+    }
+
+    return ggml_metal_fusion_rms_norm_fwht_outputs(gf, raw_idxs, ops) == 2;
+}
+
+// CONT + signed FWHT: the FWHT loads each element of the CONT output from the CONT source view, so the source may not
+// overlap the output; the MUL reads the CONT directly or through a RESHAPE, and the MUL_MAT reads the MUL through a
+// RESHAPE, so the checks live here (unsafe = true) and no intermediate may have other consumers
+static bool ggml_metal_fusion_check_cont_fwht(
+        const ggml_metal_fusion      * fusion,
+        const ggml_tensor * const    * nodes,
+        const ggml_cgraph            * gf,
+        const int                    * node_idxs,
+              int                      idx,
+              ggml_metal_fusion_mode   mode) {
+    const ggml_tensor * cont = nodes[0];
+    const ggml_tensor * mul  = nodes[1];
+    const ggml_tensor * mm   = nodes[2];
+
+    int raw_idxs[GGML_METAL_FUSION_MAX];
+    const int raw_count = ggml_metal_fusion_raw_span(fusion, gf, node_idxs, idx, raw_idxs);
+    if (raw_count == 0) {
+        return false;
+    }
+
+    // the CONT output is never read, so only the structure of the signed FWHT matters
+    if (!ggml_metal_fusion_fwht_signed_ok(mul, gf->nodes[raw_idxs[raw_count - 2]], mm, GGML_METAL_FUSION_STRUCTURAL)) {
+        return false;
+    }
+
+    const ggml_tensor * x   = ggml_metal_fwht_signed_operands(mul).x;
+    const ggml_tensor * x_r = raw_count == 5 ? gf->nodes[raw_idxs[1]] : cont;
+    const ggml_tensor * src = cont->src[0];
+
+    const bool ok =
+        x == x_r && (x_r == cont || x_r->src[0] == cont) &&
+        src->type == GGML_TYPE_F32 && cont->type == GGML_TYPE_F32 &&
+        ggml_nelements(cont) <= INT32_MAX && mm->src[0]->ne[0] >= GGML_METAL_FWHT_TG_MIN_N;
+
+    if (!ok) {
+        return false;
+    }
+
+    const int outputs[1] = { raw_idxs[raw_count - 1] };
+    if (!ggml_can_fuse_subgraph_ext(gf, raw_idxs, raw_count, fusion->ops_all.data(), outputs, 1)) {
+        return false;
+    }
+
+    return mode != GGML_METAL_FUSION_FULL || !ggml_metal_fusion_overlap(src, mm);
 }
 
 #define GGML_METAL_TOPK_MOE_MAX_EXPERTS 1024
@@ -743,7 +956,8 @@ static const struct ggml_tensor * ggml_metal_mul_mat_add_residual(const struct g
 }
 
 // MUL_MAT + ADD of an f32 non-weight: the reorder packs it without reading row counts, so ubatch sizes share one order;
-// the encoder fuses only a same-shape residual in the few-row MMA store, which the sum may overlap only in place
+// the encoder fuses only a same-shape residual in the few-row MMA or one-row PQ2_0 mat-vec store, which the sum may
+// overlap only in place
 static bool ggml_metal_fusion_check_mul_mat_add(
         const ggml_metal_fusion       * fusion,
         const ggml_tensor * const     * nodes,
@@ -760,7 +974,7 @@ static bool ggml_metal_fusion_check_mul_mat_add(
     const ggml_tensor * add = nodes[1];
 
     if (ggml_metal_mul_mat_add_operand(mm, add) == nullptr ||
-        !ggml_metal_op_mul_mat_may_use_mma(mm)) {
+        !(ggml_metal_op_mul_mat_may_use_mma(mm) || ggml_metal_mul_mat_mv_may_add(mm))) {
         return false;
     }
 
@@ -770,7 +984,9 @@ static bool ggml_metal_fusion_check_mul_mat_add(
 
     const ggml_tensor * res = ggml_metal_mul_mat_add_residual(mm, add);
 
-    if (res == nullptr || !ggml_metal_op_mul_mat_use_mma(mm)) {
+    const bool store_adds = ggml_metal_op_mul_mat_use_mma(mm) || ggml_metal_mul_mat_mv_use_add(mm);
+
+    if (res == nullptr || !store_adds) {
         return false;
     }
 
@@ -936,6 +1152,9 @@ static const std::vector<ggml_op> ops_norm_scale       = { GGML_OP_NORM, GGML_OP
 static const std::vector<ggml_op> ops_rms_norm_mul     = { GGML_OP_RMS_NORM, GGML_OP_MUL };
 static const std::vector<ggml_op> ops_rms_norm_mul_add = { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ADD };
 static const std::vector<ggml_op> ops_rms_norm_scale   = { GGML_OP_RMS_NORM, GGML_OP_SCALE };
+static const std::vector<ggml_op> ops_rms_norm_gate    = { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_UNARY, GGML_OP_MUL };
+// the UNARY reads the gate through a RESHAPE that the graph places right before it
+static const std::vector<ggml_op> ops_rms_norm_rs_gate = { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_RESHAPE, GGML_OP_UNARY, GGML_OP_MUL };
 
 static const std::vector<ggml_op> ops_add_2 = { GGML_OP_ADD, GGML_OP_ADD };
 static const std::vector<ggml_op> ops_add_3 = { GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD };
@@ -949,6 +1168,10 @@ static const std::vector<ggml_op> ops_gdn_cache = { GGML_OP_GATED_DELTA_NET, GGM
 
 // the RESHAPE is an empty op: it is part of the raw pattern (alloc deps) but not of the fused chain
 static const std::vector<ggml_op> ops_fwht_signed = { GGML_OP_MUL, GGML_OP_RESHAPE, GGML_OP_MUL_MAT };
+static const std::vector<ggml_op> ops_rms_norm_fwht = { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_MUL, GGML_OP_RESHAPE, GGML_OP_MUL_MAT };
+// the MUL reads the CONT directly or through a RESHAPE
+static const std::vector<ggml_op> ops_cont_fwht    = { GGML_OP_CONT, GGML_OP_MUL, GGML_OP_RESHAPE, GGML_OP_MUL_MAT };
+static const std::vector<ggml_op> ops_cont_rs_fwht = { GGML_OP_CONT, GGML_OP_RESHAPE, GGML_OP_MUL, GGML_OP_RESHAPE, GGML_OP_MUL_MAT };
 
 static const std::vector<ggml_op> ops_ssm_conv_silu = { GGML_OP_SSM_CONV, GGML_OP_UNARY };
 
@@ -1125,6 +1348,8 @@ static const std::vector<ggml_metal_fusion> ggml_metal_fusions = {
     { GGML_METAL_FUSION_NORM_MUL,       ops_rms_norm_mul,           {},     false, ggml_metal_fusion_check_norm },
     { GGML_METAL_FUSION_NORM_MUL_ADD,   ops_rms_norm_mul_add,       {},     false, ggml_metal_fusion_check_norm },
     { GGML_METAL_FUSION_NORM_SCALE,     ops_rms_norm_scale,         {},     false, ggml_metal_fusion_check_norm },
+    { GGML_METAL_FUSION_RMS_NORM_GATE,  ops_rms_norm_gate,          {},     true,  ggml_metal_fusion_check_rms_norm_gate },
+    { GGML_METAL_FUSION_RMS_NORM_GATE,  ops_rms_norm_rs_gate,       {},     true,  ggml_metal_fusion_check_rms_norm_gate },
     { GGML_METAL_FUSION_ADD_CHAIN,      ops_add_2,                  {},     false, ggml_metal_fusion_check_add_chain },
     { GGML_METAL_FUSION_ADD_CHAIN,      ops_add_3,                  {},     false, ggml_metal_fusion_check_add_chain },
     { GGML_METAL_FUSION_ADD_CHAIN,      ops_add_4,                  {},     false, ggml_metal_fusion_check_add_chain },
@@ -1152,6 +1377,9 @@ static const std::vector<ggml_metal_fusion> ggml_metal_fusions = {
     { GGML_METAL_FUSION_MUL_MV_ID_MUL,  ops_mul_mv_id_mul,          {},     true,  ggml_metal_fusion_check_mul_mv_id_mul },
     { GGML_METAL_FUSION_UNARY_MUL,      ops_unary_mul,              {},     false, ggml_metal_fusion_check_unary_mul },
     { GGML_METAL_FUSION_FWHT_SIGNED,    ops_fwht_signed,            {},     true,  ggml_metal_fusion_check_fwht_signed },
+    { GGML_METAL_FUSION_RMS_NORM_FWHT,  ops_rms_norm_fwht,          {},     true,  ggml_metal_fusion_check_rms_norm_fwht },
+    { GGML_METAL_FUSION_CONT_FWHT,      ops_cont_fwht,              {},     true,  ggml_metal_fusion_check_cont_fwht },
+    { GGML_METAL_FUSION_CONT_FWHT,      ops_cont_rs_fwht,           {},     true,  ggml_metal_fusion_check_cont_fwht },
 };
 
 ggml_metal_fusion_id ggml_metal_fusion_id_at(int idx) {

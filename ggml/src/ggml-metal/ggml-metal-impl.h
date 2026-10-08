@@ -32,6 +32,8 @@
 
 #define N_R0_PQ2_0 8
 #define N_SG_PQ2_0 2
+// glu holds 2 accs per row
+#define N_R0_PQ2_0_GLU 2
 #define N_R0_PTQ1_0 5
 #define N_R0_PTQ1_0_R4 4
 #define N_R0_PTQ1_0_ID 4
@@ -147,6 +149,7 @@
 
 #define OP_FLASH_ATTN_EXT_VEC_NQPSG 1
 #define OP_FLASH_ATTN_EXT_VEC_NCPSG 32
+#define OP_FLASH_ATTN_EXT_VEC_NHPTG_MAX 4
 
 #define OP_LIGHTNING_INDEXER_DK    128
 #define OP_LIGHTNING_INDEXER_NHPTG   8
@@ -663,6 +666,10 @@ typedef struct {
     uint64_t nbs2;
 } ggml_metal_kargs_mul_mv_id;
 
+// epilogues of the fused rms_norm kernel, with the arithmetic of the unfused kernels
+#define GGML_METAL_NORM_EPI_NONE      0
+#define GGML_METAL_NORM_EPI_SILU_GATE 1 // silu(g)*y (UNARY(SILU) + MUL)
+
 // NORM
 // RMS_NORM
 typedef struct {
@@ -679,6 +686,7 @@ typedef struct {
     uint64_t nbf2[3];
     uint64_t nbf3[3];
     float    scale;
+    float    bias;
 } ggml_metal_kargs_norm;
 
 typedef struct {
@@ -1446,6 +1454,25 @@ typedef struct {
     int32_t nrows;
     int32_t n_blk;
 } ggml_metal_kargs_fwht;
+
+typedef struct {
+    int32_t ne00;       // row width
+    int32_t n_blk;      // FWHT blocks per row
+    float   eps;
+    int32_t write_norm; // also store the weighted norm, which has other consumers
+} ggml_metal_kargs_rms_norm_fwht;
+
+typedef struct {
+    int32_t  nrows;
+    int32_t  n_blk;
+    int32_t  ne0;   // shape of the CONT source view: CONT copies in source element order, whatever its own shape
+    int32_t  ne1;
+    int32_t  ne2;
+    uint64_t nb0;   // byte strides of the CONT source view
+    uint64_t nb1;
+    uint64_t nb2;
+    uint64_t nb3;
+} ggml_metal_kargs_fwht_gather;
 
 typedef struct {
     int64_t  ne0;

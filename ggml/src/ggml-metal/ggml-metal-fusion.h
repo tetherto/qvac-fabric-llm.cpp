@@ -42,11 +42,14 @@ typedef enum ggml_metal_fusion_id {
     GGML_METAL_FUSION_TOPK_MOE,     // SOFT_MAX + ARGSORT + GET_ROWS + norm/scale (MoE routing)
     GGML_METAL_FUSION_MOE_REDUCE,   // MUL + expert VIEWs + ADD chain (MoE output reduction)
     GGML_METAL_FUSION_SSM_CONV_SILU, // SSM_CONV + UNARY (silu)
-    GGML_METAL_FUSION_MUL_MAT_ADD,  // MUL_MAT + ADD (residual added in the few-row MMA store)
+    GGML_METAL_FUSION_MUL_MAT_ADD,  // MUL_MAT + ADD (residual added in the few-row MMA or one-row PQ2_0 mat-vec store)
     GGML_METAL_FUSION_MUL_MV_GLU,   // MUL_MAT(_ID) up + gate + GLU (swiglu), single-token decode
     GGML_METAL_FUSION_MUL_MV_ID_MUL, // MUL_MAT_ID + MUL (routing weights), mat-vec path; yields to MOE_REDUCE
     GGML_METAL_FUSION_UNARY_MUL,    // UNARY (silu/sigmoid/softplus) + MUL
     GGML_METAL_FUSION_FWHT_SIGNED,  // MUL + MUL_MAT(hadamard) (sign vector folded into the FWHT)
+    GGML_METAL_FUSION_RMS_NORM_GATE, // RMS_NORM + MUL + UNARY(silu) + MUL (gated norm)
+    GGML_METAL_FUSION_RMS_NORM_FWHT, // RMS_NORM + MUL + MUL + MUL_MAT(hadamard) (norm folded into the signed FWHT)
+    GGML_METAL_FUSION_CONT_FWHT,     // CONT + MUL + MUL_MAT(hadamard) (gather folded into the signed FWHT)
 } ggml_metal_fusion_id;
 
 struct ggml_metal_fusion; // defined in ggml-metal-fusion.cpp
@@ -99,6 +102,10 @@ const ggml_metal_fusion * ggml_metal_fusion_next(
         int idx,
         ggml_metal_fusion_mode mode,
         int * n_out);
+
+// true if the RMS_NORM_FWHT fusion at idx (a position in node_idxs) also writes the weighted norm, which has
+// consumers outside the fused group
+bool ggml_metal_fusion_rms_norm_fwht_write_norm(const struct ggml_cgraph * gf, const int * node_idxs, int idx);
 
 // optimize phase: maximum number of nodes starting at idx (a raw sequential graph index) that
 // could be fused on a device with props, chaining patterns back-to-back. returns at least 1.
