@@ -206,6 +206,7 @@ inline void get_scale_min_k4(
     total_sums.s1 += ((((bits4.s7 & 0x0F00) >> 8)  | (((bits1.s7 >> 6) & 0x01) << 4))  * scale.s1 - minv.s1) * shared_y.s6; \
     total_sums.s1 += ((((bits4.s7 & 0xF000) >> 12) | (((bits1.s7 >> 7) & 0x01) << 4))  * scale.s1 - minv.s1) * shared_y.s7; \
 
+#ifndef MC_N_COLS
 #ifdef ADRENO_GPU
 REQD_SUBGROUP_SIZE_64
 #endif
@@ -329,27 +330,46 @@ kernel void kernel_gemv_noshuffle_q5_k_f32(
         if (gid * 2 + 1 < M) dst[gid * 2 + 1] = totalSum.s1;
     }
 }
+#endif // MC_N_COLS
 
-// Multi-column (N in [2..4]) variant of the q5_K decode GEMV (spec/MTP verify) =
-// q4_K mc3 + the high-bit qh plane (regH). n_cols = 2..4 (drafted + bonus); routes
-// the small-batch verify OFF the gemm_noshuffle_q5_k dead-zone. n_cols==3 is byte-
-// identical to the original mc3 (col3 disabled, float8 slots 6/7 stay zero).
+#ifdef MC_N_COLS
+// Multi-column kernel_gemv_noshuffle_q5_k_f32, built once per MC_N_COLS (2..8): weights load once per K-block and
+// each column runs the 1-column dequant-accumulate with the same K-split, so it is bit-identical to it.
 #ifdef VECTOR_SUB_GROUP_BROADCAST
-#define MC_DQ5_HI dequantizeBlockAccum_ns_sgbroadcast_8_hi
-#define MC_DQ5_LO dequantizeBlockAccum_ns_sgbroadcast_8_lo
+#define Q5K_MC_DEQ_HI dequantizeBlockAccum_ns_sgbroadcast_8_hi
+#define Q5K_MC_DEQ_LO dequantizeBlockAccum_ns_sgbroadcast_8_lo
 #else
-#define MC_DQ5_HI dequantizeBlockAccum_ns_sgbroadcast_1_hi
-#define MC_DQ5_LO dequantizeBlockAccum_ns_sgbroadcast_1_lo
+#define Q5K_MC_DEQ_HI dequantizeBlockAccum_ns_sgbroadcast_1_hi
+#define Q5K_MC_DEQ_LO dequantizeBlockAccum_ns_sgbroadcast_1_lo
 #endif
-#define MC_COL_Q5K(ts, c) \
-    { if (slid < 4) { regB.s0123 = read_imagef(src1, (c)*COL_STRIDE     + slid*2 + k*8); \
-                      regB.s4567 = read_imagef(src1, (c)*COL_STRIDE + 1 + slid*2 + k*8); } \
-      MC_DQ5_HI(ts, as_ushort8(regA_hi), as_uchar8(regH), regS, regM, regB); \
-      MC_DQ5_LO(ts, as_ushort8(regA_lo), as_uchar8(regH), regS, regM, regB); }
+
+#define Q5K_MC_COL(ts, c) { \
+    if (slid < 4) { regB.s0123 = read_imagef(src1, (c) * COL_STRIDE +     slid * 2 + k * 8); \
+                    regB.s4567 = read_imagef(src1, (c) * COL_STRIDE + 1 + slid * 2 + k * 8); } \
+    Q5K_MC_DEQ_HI(ts, as_ushort8(regA_hi), as_uchar8(regH), regS, regM, regB); \
+    Q5K_MC_DEQ_LO(ts, as_ushort8(regA_lo), as_uchar8(regH), regS, regM, regB); }
+
+// Sums the subgroup partials of one column in subgroup order and stores its two rows.
+inline void reduce_store_col_q5k(float2 ts, uint col, local float2 * lm, uint sg, ushort slid,
+                                 uint gid, uint M, global float * dst) {
+    if (sg > 0) {
+        lm[SUBGROUP_SIZE * (sg - 1) + slid] = ts;
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+    if (sg == 0) {
+        for (uint i = 0; i < NSUBGROUPS - 1; ++i) {
+            ts += lm[SUBGROUP_SIZE * i + slid];
+        }
+        if (gid * 2 + 0 < M) dst[col * M + gid * 2 + 0] = ts.s0;
+        if (gid * 2 + 1 < M) dst[col * M + gid * 2 + 1] = ts.s1;
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+}
+
 #ifdef ADRENO_GPU
 REQD_SUBGROUP_SIZE_64
 #endif
-kernel void kernel_gemv_noshuffle_q5_k_f32_mc3(
+kernel void kernel_gemv_noshuffle_q5_k_f32_mc(
         read_only  image1d_buffer_t src0_q,
         read_only  image1d_buffer_t src0_qh,
         global half2  * src0_d,
@@ -362,8 +382,7 @@ kernel void kernel_gemv_noshuffle_q5_k_f32_mc3(
         int ne01,
         uchar mask_d6,
         uchar mask_d4,
-        uchar mask_hi2,
-        int n_cols)
+        uchar mask_hi2)
 {
     uint groupId = get_local_id(1);
     uint gid     = get_global_id(0);
@@ -377,27 +396,27 @@ kernel void kernel_gemv_noshuffle_q5_k_f32_mc3(
     uint LINE_STRIDE_A_QH  = M / 2;
     uint BLOCK_STRIDE_A_QH = NSUBGROUPS * M / 2;
     uint scales_per_row    = (K / QK_K) * 12;
-    uint COL_STRIDE        = K / 4;   // float4 pixels per activation column
+    uint COL_STRIDE        = K / 4;
+    // Tail lanes (ne01 % 128 != 0) fetch a clamped row; the store guard drops their results.
+    uint gid_s = min(gid, LINE_STRIDE_A - 1);
 
     private uint4   regA_hi, regA_lo;
     private ushort4 regH;
     private half2   regS, regM;
     private float8  regB;
 
-    private float2 ts0 = (float2)(0.0f);
-    private float2 ts1 = (float2)(0.0f);
-    private float2 ts2 = (float2)(0.0f);
-    private float2 ts3 = (float2)(0.0f);
+    float2 ts0 = 0.0f, ts1 = 0.0f, ts2 = 0.0f, ts3 = 0.0f;
+    float2 ts4 = 0.0f, ts5 = 0.0f, ts6 = 0.0f, ts7 = 0.0f;
 
     for (uint k = groupId; k < (K / 32); k += NSUBGROUPS) {
         uint sb = k / 8;
         uint j  = k % 8;
 
-        half2 d   = src0_d[gid + sb * LINE_STRIDE_A];
-        half2 dm  = src0_m[gid + sb * LINE_STRIDE_A];
+        half2 d   = src0_d[gid_s + sb * LINE_STRIDE_A];
+        half2 dm  = src0_m[gid_s + sb * LINE_STRIDE_A];
 
-        global const uchar * sc0 = src0_s + 2 * gid * scales_per_row + sb * 12;
-        global const uchar * sc1 = src0_s + (2 * gid + 1) * scales_per_row + sb * 12;
+        global const uchar * sc0 = src0_s + 2 * gid_s * scales_per_row + sb * 12;
+        global const uchar * sc1 = src0_s + (2 * gid_s + 1) * scales_per_row + sb * 12;
 
         uchar sv0, mn0, sv1, mn1;
         get_scale_min_k4(j, sc0, &sv0, &mn0, mask_d6, mask_d4, mask_hi2);
@@ -406,48 +425,39 @@ kernel void kernel_gemv_noshuffle_q5_k_f32_mc3(
         regS = convert_half2(convert_float2(d)  * convert_float2((uchar2)(sv0, sv1)));
         regM = convert_half2(convert_float2(dm) * convert_float2((uchar2)(mn0, mn1)));
 
-        // high-bit plane + weights loaded ONCE, reused across the columns
-        regH.s0 = as_ushort(read_imageh(src0_qh, (gid + k * BLOCK_STRIDE_A_QH + LINE_STRIDE_A_QH * 0)).x);
-        regH.s1 = as_ushort(read_imageh(src0_qh, (gid + k * BLOCK_STRIDE_A_QH + LINE_STRIDE_A_QH * 1)).x);
-        regH.s2 = as_ushort(read_imageh(src0_qh, (gid + k * BLOCK_STRIDE_A_QH + LINE_STRIDE_A_QH * 2)).x);
-        regH.s3 = as_ushort(read_imageh(src0_qh, (gid + k * BLOCK_STRIDE_A_QH + LINE_STRIDE_A_QH * 3)).x);
+        regH.s0 = as_ushort(read_imageh(src0_qh, (gid_s + k * BLOCK_STRIDE_A_QH + LINE_STRIDE_A_QH * 0)).x);
+        regH.s1 = as_ushort(read_imageh(src0_qh, (gid_s + k * BLOCK_STRIDE_A_QH + LINE_STRIDE_A_QH * 1)).x);
+        regH.s2 = as_ushort(read_imageh(src0_qh, (gid_s + k * BLOCK_STRIDE_A_QH + LINE_STRIDE_A_QH * 2)).x);
+        regH.s3 = as_ushort(read_imageh(src0_qh, (gid_s + k * BLOCK_STRIDE_A_QH + LINE_STRIDE_A_QH * 3)).x);
 
-        regA_hi.s0 = read_imageui(src0_q, (gid + k * BLOCK_STRIDE_A + LINE_STRIDE_A * 0)).x;
-        regA_hi.s1 = read_imageui(src0_q, (gid + k * BLOCK_STRIDE_A + LINE_STRIDE_A * 1)).x;
-        regA_hi.s2 = read_imageui(src0_q, (gid + k * BLOCK_STRIDE_A + LINE_STRIDE_A * 2)).x;
-        regA_hi.s3 = read_imageui(src0_q, (gid + k * BLOCK_STRIDE_A + LINE_STRIDE_A * 3)).x;
-        regA_lo.s0 = read_imageui(src0_q, (gid + k * BLOCK_STRIDE_A + LINE_STRIDE_A * 4)).x;
-        regA_lo.s1 = read_imageui(src0_q, (gid + k * BLOCK_STRIDE_A + LINE_STRIDE_A * 5)).x;
-        regA_lo.s2 = read_imageui(src0_q, (gid + k * BLOCK_STRIDE_A + LINE_STRIDE_A * 6)).x;
-        regA_lo.s3 = read_imageui(src0_q, (gid + k * BLOCK_STRIDE_A + LINE_STRIDE_A * 7)).x;
+        regA_hi.s0 = read_imageui(src0_q, (gid_s + k * BLOCK_STRIDE_A + LINE_STRIDE_A * 0)).x;
+        regA_hi.s1 = read_imageui(src0_q, (gid_s + k * BLOCK_STRIDE_A + LINE_STRIDE_A * 1)).x;
+        regA_hi.s2 = read_imageui(src0_q, (gid_s + k * BLOCK_STRIDE_A + LINE_STRIDE_A * 2)).x;
+        regA_hi.s3 = read_imageui(src0_q, (gid_s + k * BLOCK_STRIDE_A + LINE_STRIDE_A * 3)).x;
+        regA_lo.s0 = read_imageui(src0_q, (gid_s + k * BLOCK_STRIDE_A + LINE_STRIDE_A * 4)).x;
+        regA_lo.s1 = read_imageui(src0_q, (gid_s + k * BLOCK_STRIDE_A + LINE_STRIDE_A * 5)).x;
+        regA_lo.s2 = read_imageui(src0_q, (gid_s + k * BLOCK_STRIDE_A + LINE_STRIDE_A * 6)).x;
+        regA_lo.s3 = read_imageui(src0_q, (gid_s + k * BLOCK_STRIDE_A + LINE_STRIDE_A * 7)).x;
 
-        MC_COL_Q5K(ts0, 0);
-        MC_COL_Q5K(ts1, 1);
-        if (n_cols > 2) MC_COL_Q5K(ts2, 2);
-        if (n_cols > 3) MC_COL_Q5K(ts3, 3);
+        Q5K_MC_COL(ts0, 0);
+        Q5K_MC_COL(ts1, 1);
+        if (MC_N_COLS > 2) Q5K_MC_COL(ts2, 2);
+        if (MC_N_COLS > 3) Q5K_MC_COL(ts3, 3);
+        if (MC_N_COLS > 4) Q5K_MC_COL(ts4, 4);
+        if (MC_N_COLS > 5) Q5K_MC_COL(ts5, 5);
+        if (MC_N_COLS > 6) Q5K_MC_COL(ts6, 6);
+        if (MC_N_COLS > 7) Q5K_MC_COL(ts7, 7);
     }
 
-    // cross-subgroup reduce: pack the (up to 4) columns' float2 into a float8.
-    local float8 reduceLM[SUBGROUP_SIZE * 3];
-    float8 acc = (float8)(ts0.s0, ts0.s1, ts1.s0, ts1.s1, ts2.s0, ts2.s1, ts3.s0, ts3.s1);
-    if (groupId == 1) { reduceLM[SUBGROUP_SIZE * 0 + slid] = acc; }
-    if (groupId == 2) { reduceLM[SUBGROUP_SIZE * 1 + slid] = acc; }
-    if (groupId == 3) { reduceLM[SUBGROUP_SIZE * 2 + slid] = acc; }
-
-    barrier(CLK_LOCAL_MEM_FENCE);
-
-    if (groupId == 0) {
-        acc += reduceLM[SUBGROUP_SIZE * 0 + slid];
-        acc += reduceLM[SUBGROUP_SIZE * 1 + slid];
-        acc += reduceLM[SUBGROUP_SIZE * 2 + slid];
-        dst = (global float*)((global char*)dst + offsetd);
-        // dst is column-major [M rows x n_cols cols]: (row, col) at col*M + row
-        vstore2((float2)(acc.s0, acc.s1), 0, &(dst[0 * M + gid * 2]));
-        vstore2((float2)(acc.s2, acc.s3), 0, &(dst[1 * M + gid * 2]));
-        if (n_cols > 2) vstore2((float2)(acc.s4, acc.s5), 0, &(dst[2 * M + gid * 2]));
-        if (n_cols > 3) vstore2((float2)(acc.s6, acc.s7), 0, &(dst[3 * M + gid * 2]));
-    }
+    local float2 reduceLM[SUBGROUP_SIZE * (NSUBGROUPS - 1)];
+    dst = (global float*)((global char*)dst + offsetd);
+    reduce_store_col_q5k(ts0, 0, reduceLM, groupId, slid, gid, M, dst);
+    reduce_store_col_q5k(ts1, 1, reduceLM, groupId, slid, gid, M, dst);
+    if (MC_N_COLS > 2) reduce_store_col_q5k(ts2, 2, reduceLM, groupId, slid, gid, M, dst);
+    if (MC_N_COLS > 3) reduce_store_col_q5k(ts3, 3, reduceLM, groupId, slid, gid, M, dst);
+    if (MC_N_COLS > 4) reduce_store_col_q5k(ts4, 4, reduceLM, groupId, slid, gid, M, dst);
+    if (MC_N_COLS > 5) reduce_store_col_q5k(ts5, 5, reduceLM, groupId, slid, gid, M, dst);
+    if (MC_N_COLS > 6) reduce_store_col_q5k(ts6, 6, reduceLM, groupId, slid, gid, M, dst);
+    if (MC_N_COLS > 7) reduce_store_col_q5k(ts7, 7, reduceLM, groupId, slid, gid, M, dst);
 }
-#undef MC_COL_Q5K
-#undef MC_DQ5_HI
-#undef MC_DQ5_LO
+#endif // MC_N_COLS

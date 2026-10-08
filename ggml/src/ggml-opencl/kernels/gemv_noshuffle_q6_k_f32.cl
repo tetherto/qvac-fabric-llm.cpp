@@ -190,6 +190,7 @@
     total_sum.s0 += ((float)(((bits4.s6 & 0xF000) >> 12) | ((bits2.s6 & 0xC0) >> 2)) - 32.f) * scale_s.s1 * scale_d.s0 * shared_y; \
     total_sum.s1 += ((float)(((bits4.s7 & 0xF000) >> 12) | ((bits2.s7 & 0xC0) >> 2)) - 32.f) * scale_s.s3 * scale_d.s1 * shared_y; \
 
+#ifndef MC_N_COLS
 #if defined(ADRENO_GPU)
 REQD_SUBGROUP_SIZE_64
 #endif
@@ -296,17 +297,46 @@ kernel void kernel_gemv_noshuffle_q6_K_f32(
         if (gid * 2 + 1 < ne01) dst[gid * 2 + 1] = total_sum.s1;
     }
 }
+#endif // MC_N_COLS
 
-// Multi-column (N=3) q6_K decode GEMV for the spec/MTP verify batch. Same idea
-// as the q4_K mc3: stay on the efficient GEMV path (subgroup broadcast, no
-// transpose) instead of the transposed-GEMM dead-zone. Each K-block's weights
-// (ql/qh, hi+lo) are loaded ONCE and reused across all 3 activation columns.
-// Per-column accumulation is independent and identical to 3 standalone GEMVs
-// => byte-identical; does NOT perturb the lm_head logits / spec accept rate.
+#ifdef MC_N_COLS
+// Multi-column kernel_gemv_noshuffle_q6_K_f32, built once per MC_N_COLS (2..8): weights load once per K-block and
+// each column runs the 1-column dequant-accumulate with the same K-split, so it is bit-identical to it.
+#ifdef VECTOR_SUB_GROUP_BROADCAT
+#define Q6K_MC_DEQ_HI dequantize_block_acc_bcast_8_hi
+#define Q6K_MC_DEQ_LO dequantize_block_acc_bcast_8_lo
+#else
+#define Q6K_MC_DEQ_HI dequantize_block_acc_bcast_1_hi
+#define Q6K_MC_DEQ_LO dequantize_block_acc_bcast_1_lo
+#endif
+
+#define Q6K_MC_COL(ts, c) { \
+    if (slid < 4) { reg_b.s0123 = read_imagef(src1, (c) * col_stride + 0 + slid * 2 + k * 8); \
+                    reg_b.s4567 = read_imagef(src1, (c) * col_stride + 1 + slid * 2 + k * 8); } \
+    Q6K_MC_DEQ_HI(ts, as_ushort8(ql_hi), as_uchar8(qh_hi), reg_d, reg_s, reg_b); \
+    Q6K_MC_DEQ_LO(ts, as_ushort8(ql_lo), as_uchar8(qh_lo), reg_d, reg_s, reg_b); }
+
+// Sums the subgroup partials of one column in subgroup order and stores its two rows.
+inline void reduce_store_col_q6k(float2 ts, int col, local float2 * lm, int sg, ushort slid,
+                                 int gid, int ne01, global float * dst) {
+    if (sg > 0) {
+        lm[SUBGROUP_SIZE * (sg - 1) + slid] = ts;
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+    if (sg == 0) {
+        for (int i = 0; i < NSUBGROUPS - 1; ++i) {
+            ts += lm[SUBGROUP_SIZE * i + slid];
+        }
+        if (gid * 2 + 0 < ne01) dst[col * ne01 + gid * 2 + 0] = ts.s0;
+        if (gid * 2 + 1 < ne01) dst[col * ne01 + gid * 2 + 1] = ts.s1;
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+}
+
 #if defined(ADRENO_GPU)
 REQD_SUBGROUP_SIZE_64
 #endif
-kernel void kernel_gemv_noshuffle_q6_K_f32_mc3(
+kernel void kernel_gemv_noshuffle_q6_K_f32_mc(
     read_only image1d_buffer_t src0_ql,
     read_only image1d_buffer_t src0_qh,
     global half2 * src0_s,
@@ -324,7 +354,9 @@ kernel void kernel_gemv_noshuffle_q6_K_f32_mc3(
     int nb = ne00 / 32;
     int line_stride_a  = ne01 / 2;
     int block_stride_a = NSUBGROUPS * ne01;
-    int COL_STRIDE     = ne00 / 4;   // float4 pixels per activation column
+    int col_stride     = ne00 / 4;
+    // Tail lanes (ne01 % 128 != 0) fetch a clamped row; the store guard drops their results.
+    int gid_s = min(gid, line_stride_a - 1);
 
     uint4   ql_hi, ql_lo;
     ushort4 qh_hi, qh_lo;
@@ -332,78 +364,50 @@ kernel void kernel_gemv_noshuffle_q6_K_f32_mc3(
     char4   reg_s;
     float8  reg_b;
 
-    float2  ts0 = 0.0f, ts1 = 0.0f, ts2 = 0.0f;
+    float2 ts0 = 0.0f, ts1 = 0.0f, ts2 = 0.0f, ts3 = 0.0f;
+    float2 ts4 = 0.0f, ts5 = 0.0f, ts6 = 0.0f, ts7 = 0.0f;
 
     for (int k = grp; k < nb; k += NSUBGROUPS) {
-        reg_d = src0_d[gid + k/8 * line_stride_a];
-        reg_s = as_char4(src0_s[gid + k * line_stride_a]);
+        reg_d = src0_d[gid_s + k/8 * line_stride_a];
+        reg_s = as_char4(src0_s[gid_s + k * line_stride_a]);
 
-        // weights loaded ONCE (hi: blocks 0-3, lo: blocks 4-7), reused x3 cols
-        ql_hi.s0 = read_imageui(src0_ql, gid + k*block_stride_a + line_stride_a*0).x;
-        ql_hi.s1 = read_imageui(src0_ql, gid + k*block_stride_a + line_stride_a*1).x;
-        ql_hi.s2 = read_imageui(src0_ql, gid + k*block_stride_a + line_stride_a*2).x;
-        ql_hi.s3 = read_imageui(src0_ql, gid + k*block_stride_a + line_stride_a*3).x;
-        qh_hi.s0 = as_ushort(read_imageh(src0_qh, gid + k*block_stride_a + line_stride_a*0).x);
-        qh_hi.s1 = as_ushort(read_imageh(src0_qh, gid + k*block_stride_a + line_stride_a*1).x);
-        qh_hi.s2 = as_ushort(read_imageh(src0_qh, gid + k*block_stride_a + line_stride_a*2).x);
-        qh_hi.s3 = as_ushort(read_imageh(src0_qh, gid + k*block_stride_a + line_stride_a*3).x);
+        ql_hi.s0 = read_imageui(src0_ql, gid_s + k*block_stride_a + line_stride_a*0).x;
+        ql_hi.s1 = read_imageui(src0_ql, gid_s + k*block_stride_a + line_stride_a*1).x;
+        ql_hi.s2 = read_imageui(src0_ql, gid_s + k*block_stride_a + line_stride_a*2).x;
+        ql_hi.s3 = read_imageui(src0_ql, gid_s + k*block_stride_a + line_stride_a*3).x;
+        qh_hi.s0 = as_ushort(read_imageh(src0_qh, gid_s + k*block_stride_a + line_stride_a*0).x);
+        qh_hi.s1 = as_ushort(read_imageh(src0_qh, gid_s + k*block_stride_a + line_stride_a*1).x);
+        qh_hi.s2 = as_ushort(read_imageh(src0_qh, gid_s + k*block_stride_a + line_stride_a*2).x);
+        qh_hi.s3 = as_ushort(read_imageh(src0_qh, gid_s + k*block_stride_a + line_stride_a*3).x);
 
-        ql_lo.s0 = read_imageui(src0_ql, gid + k*block_stride_a + line_stride_a*4).x;
-        ql_lo.s1 = read_imageui(src0_ql, gid + k*block_stride_a + line_stride_a*5).x;
-        ql_lo.s2 = read_imageui(src0_ql, gid + k*block_stride_a + line_stride_a*6).x;
-        ql_lo.s3 = read_imageui(src0_ql, gid + k*block_stride_a + line_stride_a*7).x;
-        qh_lo.s0 = as_ushort(read_imageh(src0_qh, gid + k*block_stride_a + line_stride_a*4).x);
-        qh_lo.s1 = as_ushort(read_imageh(src0_qh, gid + k*block_stride_a + line_stride_a*5).x);
-        qh_lo.s2 = as_ushort(read_imageh(src0_qh, gid + k*block_stride_a + line_stride_a*6).x);
-        qh_lo.s3 = as_ushort(read_imageh(src0_qh, gid + k*block_stride_a + line_stride_a*7).x);
+        ql_lo.s0 = read_imageui(src0_ql, gid_s + k*block_stride_a + line_stride_a*4).x;
+        ql_lo.s1 = read_imageui(src0_ql, gid_s + k*block_stride_a + line_stride_a*5).x;
+        ql_lo.s2 = read_imageui(src0_ql, gid_s + k*block_stride_a + line_stride_a*6).x;
+        ql_lo.s3 = read_imageui(src0_ql, gid_s + k*block_stride_a + line_stride_a*7).x;
+        qh_lo.s0 = as_ushort(read_imageh(src0_qh, gid_s + k*block_stride_a + line_stride_a*4).x);
+        qh_lo.s1 = as_ushort(read_imageh(src0_qh, gid_s + k*block_stride_a + line_stride_a*5).x);
+        qh_lo.s2 = as_ushort(read_imageh(src0_qh, gid_s + k*block_stride_a + line_stride_a*6).x);
+        qh_lo.s3 = as_ushort(read_imageh(src0_qh, gid_s + k*block_stride_a + line_stride_a*7).x);
 
-        // Per-column: load only this column's activation (single reg_b live) ->
-        // 1/3 the activation register pressure, cutting the private-mem spill.
-#ifdef VECTOR_SUB_GROUP_BROADCAT
-        { if (slid < 4) { reg_b.s0123 = read_imagef(src1, 0*COL_STRIDE + 0 + slid*2 + k*8);
-                          reg_b.s4567 = read_imagef(src1, 0*COL_STRIDE + 1 + slid*2 + k*8); }
-          dequantize_block_acc_bcast_8_hi(ts0, as_ushort8(ql_hi), as_uchar8(qh_hi), reg_d, reg_s, reg_b);
-          dequantize_block_acc_bcast_8_lo(ts0, as_ushort8(ql_lo), as_uchar8(qh_lo), reg_d, reg_s, reg_b); }
-        { if (slid < 4) { reg_b.s0123 = read_imagef(src1, 1*COL_STRIDE + 0 + slid*2 + k*8);
-                          reg_b.s4567 = read_imagef(src1, 1*COL_STRIDE + 1 + slid*2 + k*8); }
-          dequantize_block_acc_bcast_8_hi(ts1, as_ushort8(ql_hi), as_uchar8(qh_hi), reg_d, reg_s, reg_b);
-          dequantize_block_acc_bcast_8_lo(ts1, as_ushort8(ql_lo), as_uchar8(qh_lo), reg_d, reg_s, reg_b); }
-        { if (slid < 4) { reg_b.s0123 = read_imagef(src1, 2*COL_STRIDE + 0 + slid*2 + k*8);
-                          reg_b.s4567 = read_imagef(src1, 2*COL_STRIDE + 1 + slid*2 + k*8); }
-          dequantize_block_acc_bcast_8_hi(ts2, as_ushort8(ql_hi), as_uchar8(qh_hi), reg_d, reg_s, reg_b);
-          dequantize_block_acc_bcast_8_lo(ts2, as_ushort8(ql_lo), as_uchar8(qh_lo), reg_d, reg_s, reg_b); }
-#else
-        { if (slid < 4) { reg_b.s0123 = read_imagef(src1, 0*COL_STRIDE + 0 + slid*2 + k*8);
-                          reg_b.s4567 = read_imagef(src1, 0*COL_STRIDE + 1 + slid*2 + k*8); }
-          dequantize_block_acc_bcast_1_hi(ts0, as_ushort8(ql_hi), as_uchar8(qh_hi), reg_d, reg_s, reg_b);
-          dequantize_block_acc_bcast_1_lo(ts0, as_ushort8(ql_lo), as_uchar8(qh_lo), reg_d, reg_s, reg_b); }
-        { if (slid < 4) { reg_b.s0123 = read_imagef(src1, 1*COL_STRIDE + 0 + slid*2 + k*8);
-                          reg_b.s4567 = read_imagef(src1, 1*COL_STRIDE + 1 + slid*2 + k*8); }
-          dequantize_block_acc_bcast_1_hi(ts1, as_ushort8(ql_hi), as_uchar8(qh_hi), reg_d, reg_s, reg_b);
-          dequantize_block_acc_bcast_1_lo(ts1, as_ushort8(ql_lo), as_uchar8(qh_lo), reg_d, reg_s, reg_b); }
-        { if (slid < 4) { reg_b.s0123 = read_imagef(src1, 2*COL_STRIDE + 0 + slid*2 + k*8);
-                          reg_b.s4567 = read_imagef(src1, 2*COL_STRIDE + 1 + slid*2 + k*8); }
-          dequantize_block_acc_bcast_1_hi(ts2, as_ushort8(ql_hi), as_uchar8(qh_hi), reg_d, reg_s, reg_b);
-          dequantize_block_acc_bcast_1_lo(ts2, as_ushort8(ql_lo), as_uchar8(qh_lo), reg_d, reg_s, reg_b); }
-#endif
+        Q6K_MC_COL(ts0, 0);
+        Q6K_MC_COL(ts1, 1);
+        if (MC_N_COLS > 2) Q6K_MC_COL(ts2, 2);
+        if (MC_N_COLS > 3) Q6K_MC_COL(ts3, 3);
+        if (MC_N_COLS > 4) Q6K_MC_COL(ts4, 4);
+        if (MC_N_COLS > 5) Q6K_MC_COL(ts5, 5);
+        if (MC_N_COLS > 6) Q6K_MC_COL(ts6, 6);
+        if (MC_N_COLS > 7) Q6K_MC_COL(ts7, 7);
     }
 
-    local float8 reduce_lm[SUBGROUP_SIZE * 3];
-    float8 acc = (float8)(ts0.s0, ts0.s1, ts1.s0, ts1.s1, ts2.s0, ts2.s1, 0.0f, 0.0f);
-    if (grp == 1) { reduce_lm[SUBGROUP_SIZE*0 + slid] = acc; }
-    if (grp == 2) { reduce_lm[SUBGROUP_SIZE*1 + slid] = acc; }
-    if (grp == 3) { reduce_lm[SUBGROUP_SIZE*2 + slid] = acc; }
-
-    barrier(CLK_LOCAL_MEM_FENCE);
-
-    if (grp == 0) {
-        acc += reduce_lm[SUBGROUP_SIZE*0 + slid];
-        acc += reduce_lm[SUBGROUP_SIZE*1 + slid];
-        acc += reduce_lm[SUBGROUP_SIZE*2 + slid];
-        dst = (global float*)((global char*)dst + offsetd);
-        // dst column-major [ne01 rows x 3 cols]: (row, col) at col*ne01 + row
-        vstore2((float2)(acc.s0, acc.s1), 0, &(dst[0*ne01 + gid*2]));
-        vstore2((float2)(acc.s2, acc.s3), 0, &(dst[1*ne01 + gid*2]));
-        vstore2((float2)(acc.s4, acc.s5), 0, &(dst[2*ne01 + gid*2]));
-    }
+    local float2 reduce_lm[SUBGROUP_SIZE * (NSUBGROUPS - 1)];
+    dst = (global float*)((global char*)dst + offsetd);
+    reduce_store_col_q6k(ts0, 0, reduce_lm, grp, slid, gid, ne01, dst);
+    reduce_store_col_q6k(ts1, 1, reduce_lm, grp, slid, gid, ne01, dst);
+    if (MC_N_COLS > 2) reduce_store_col_q6k(ts2, 2, reduce_lm, grp, slid, gid, ne01, dst);
+    if (MC_N_COLS > 3) reduce_store_col_q6k(ts3, 3, reduce_lm, grp, slid, gid, ne01, dst);
+    if (MC_N_COLS > 4) reduce_store_col_q6k(ts4, 4, reduce_lm, grp, slid, gid, ne01, dst);
+    if (MC_N_COLS > 5) reduce_store_col_q6k(ts5, 5, reduce_lm, grp, slid, gid, ne01, dst);
+    if (MC_N_COLS > 6) reduce_store_col_q6k(ts6, 6, reduce_lm, grp, slid, gid, ne01, dst);
+    if (MC_N_COLS > 7) reduce_store_col_q6k(ts7, 7, reduce_lm, grp, slid, gid, ne01, dst);
 }
+#endif // MC_N_COLS
