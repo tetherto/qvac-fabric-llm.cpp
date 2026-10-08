@@ -4,7 +4,7 @@
 
 The Hexagon backend consists of two parts:
 
-  - `libggml-hexagon`
+  - `libqvac-ggml-hexagon`
     This is the regular CPU-side GGML backend library, either shared or statically linked.
 
   - `libggml-htp-vNN`
@@ -15,9 +15,9 @@ Here is an example of the build artifacts:
 
 ```
 ~/src/llama.cpp$ ls -l pkg-adb/llama.cpp/lib/libggml*
-pkg-adb/llama.cpp/lib/libggml-base.so
-pkg-adb/llama.cpp/lib/libggml-cpu.so
-pkg-adb/llama.cpp/lib/libggml-hexagon.so      <<< CPU library
+pkg-adb/llama.cpp/lib/libqvac-ggml-base.so
+pkg-adb/llama.cpp/lib/libqvac-ggml-cpu.so
+pkg-adb/llama.cpp/lib/libqvac-ggml-hexagon.so      <<< CPU library
 pkg-adb/llama.cpp/lib/libggml-htp-v73.so      <<< HTP op/kernels for Hexagon v73
 pkg-adb/llama.cpp/lib/libggml-htp-v75.so
 pkg-adb/llama.cpp/lib/libggml-htp-v79.so

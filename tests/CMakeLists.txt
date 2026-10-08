@@ -513,6 +513,7 @@ if (GGML_BACKEND_DL AND NOT EMSCRIPTEN)
     llama_build_and_test(test-backend-loader.cpp)
     add_dependencies(test-backend-loader test-backend-loader-stub-zero test-backend-loader-stub-ok)
     target_compile_definitions(test-backend-loader PRIVATE
+        GGML_TEST_LIB_PREFIX="${GGML_LIB_OUTPUT_PREFIX}"
         STUB_ZERO_PATH="$<TARGET_FILE:test-backend-loader-stub-zero>"
         STUB_OK_PATH="$<TARGET_FILE:test-backend-loader-stub-ok>")
     set_tests_properties(test-backend-loader PROPERTIES SKIP_RETURN_CODE 77)
@@ -532,6 +533,28 @@ if (GGML_BACKEND_DL AND NOT EMSCRIPTEN)
             STUB_DEP_PATH="$<TARGET_FILE:test-backend-loader-stub-dep>"
             DEP_DLL_PATH="$<TARGET_FILE:test-backend-loader-dep>")
     endif()
+endif()
+
+# Names the backends that must register on any host, comma separated: the CPU family and RPC.
+# GPU and BLAS modules may be absent at run time when their driver or runtime
+# library is missing, so they are not required.
+function(ggml_required_backend_names out_var)
+    set(names "")
+    foreach (backend IN LISTS GGML_AVAILABLE_BACKENDS)
+        if (backend MATCHES "^ggml-cpu" AND NOT "CPU" IN_LIST names)
+            list(APPEND names "CPU")
+        elseif (backend STREQUAL "ggml-rpc")
+            list(APPEND names "RPC")
+        endif()
+    endforeach()
+    string(REPLACE ";" "," names "${names}")
+    set(${out_var} "${names}" PARENT_SCOPE)
+endfunction()
+
+if (NOT LLAMA_USE_SYSTEM_GGML)
+    ggml_required_backend_names(GGML_TEST_REQUIRED_BACKENDS)
+    llama_build_and_test(test-backend-discovery.cpp)
+    target_compile_definitions(test-backend-discovery PRIVATE "GGML_TEST_REQUIRED_BACKENDS=\"${GGML_TEST_REQUIRED_BACKENDS}\"")
 endif()
 
 llama_build_and_test(test-model-load-cancel.cpp       LABEL "model")

@@ -127,7 +127,7 @@ Commands and data are serialized using a custom binary protocol with:
 
 ### Host-side Dependencies
 - virglrenderer with APIR support (pending upstream review)
-- Target backend libraries (libggml-metal, libggml-vulkan, etc.)
+- Target backend libraries (libqvac-ggml-metal, libqvac-ggml-vulkan, etc.)
 
 ## Configuration
 

@@ -486,11 +486,21 @@ static fs::path get_executable_path() {
 #endif
 }
 
+// GGML_BACKEND_DL_PROJECT_PREFIX carries GGML_LIB_OUTPUT_PREFIX from the build so the
+// discovery walk matches the renamed modules; without it the qvac- default applies.
 static fs::path backend_filename_prefix() {
-#ifdef _WIN32
-    return fs::u8path("qvac-ggml-");
+#if defined(GGML_BACKEND_DL_PROJECT_PREFIX)
+#    ifdef _WIN32
+    return fs::u8path(GGML_BACKEND_DL_PROJECT_PREFIX "ggml-");
+#    else
+    return fs::u8path("lib" GGML_BACKEND_DL_PROJECT_PREFIX "ggml-");
+#    endif
 #else
+#    ifdef _WIN32
+    return fs::u8path("qvac-ggml-");
+#    else
     return fs::u8path("libqvac-ggml-");
+#    endif
 #endif
 }
 

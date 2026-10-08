@@ -21,6 +21,7 @@ GGML_METAL=ON
 GGML_METAL_EMBED_LIBRARY=${GGML_METAL_EMBED_LIBRARY:-ON}
 GGML_BLAS_DEFAULT=ON
 GGML_OPENMP=OFF
+GGML_LIB_OUTPUT_PREFIX=qvac-
 
 # Max number of concurrent platform builds
 MAX_PARALLEL_BUILDS=1
@@ -85,6 +86,7 @@ COMMON_CMAKE_ARGS=(
     -DGGML_METAL=${GGML_METAL}
     -DGGML_NATIVE=OFF
     -DGGML_OPENMP=${GGML_OPENMP}
+    -DGGML_LIB_OUTPUT_PREFIX=${GGML_LIB_OUTPUT_PREFIX}
 )
 
 check_required_tool() {
@@ -292,11 +294,11 @@ combine_static_libraries() {
 
     local libs=(
         "${base_dir}/${build_dir}/src/${release_dir}/libllama.a"
-        "${base_dir}/${build_dir}/ggml/src/${release_dir}/libggml.a"
-        "${base_dir}/${build_dir}/ggml/src/${release_dir}/libggml-base.a"
-        "${base_dir}/${build_dir}/ggml/src/${release_dir}/libggml-cpu.a"
-        "${base_dir}/${build_dir}/ggml/src/ggml-metal/${release_dir}/libggml-metal.a"
-        "${base_dir}/${build_dir}/ggml/src/ggml-blas/${release_dir}/libggml-blas.a"
+        "${base_dir}/${build_dir}/ggml/src/${release_dir}/lib${GGML_LIB_OUTPUT_PREFIX}ggml.a"
+        "${base_dir}/${build_dir}/ggml/src/${release_dir}/lib${GGML_LIB_OUTPUT_PREFIX}ggml-base.a"
+        "${base_dir}/${build_dir}/ggml/src/${release_dir}/lib${GGML_LIB_OUTPUT_PREFIX}ggml-cpu.a"
+        "${base_dir}/${build_dir}/ggml/src/ggml-metal/${release_dir}/lib${GGML_LIB_OUTPUT_PREFIX}ggml-metal.a"
+        "${base_dir}/${build_dir}/ggml/src/ggml-blas/${release_dir}/lib${GGML_LIB_OUTPUT_PREFIX}ggml-blas.a"
         "${base_dir}/${build_dir}/tools/mtmd/${release_dir}/libmtmd.a"
         "${base_dir}/${build_dir}/vendor/hash/${release_dir}/libvendor-hash.a"
     )

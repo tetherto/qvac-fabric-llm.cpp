@@ -17,10 +17,10 @@ The above command will create a directory named `install` in the current directo
 which will have the following files in its lib directory:
 ```console
 $ ls install/lib/
-cmake                   libggml.so          libllama-common.so.0      libllama.so.0.1.0  llama.cpp
-libggml-base.so         libggml.so.0        libllama-common.so.0.1.0  libmtmd.so         pkgconfig
-libggml-base.so.0       libggml.so.0.19.0   libllama.so               libmtmd.so.0
-libggml-base.so.0.19.0  libllama-common.so  libllama.so.0             libmtmd.so.0.1.0
+cmake                        libqvac-ggml.so          libllama-common.so.0      libllama.so.0.1.0  llama.cpp
+libqvac-ggml-base.so         libqvac-ggml.so.0        libllama-common.so.0.1.0  libmtmd.so         pkgconfig
+libqvac-ggml-base.so.0       libqvac-ggml.so.0.19.0   libllama.so               libmtmd.so.0
+libqvac-ggml-base.so.0.19.0  libllama-common.so       libllama.so.0             libmtmd.so.0.1.0
 ```
 
 Build/run this project using the installation created above:
@@ -32,7 +32,7 @@ $ ./build.sh
 [100%] Built target test-cmake
 [test-cmake] Using llama.cpp version 0.1.0-dev-b10335
 [test-cmake] Initializing backend...
-load_backend: loaded CPU backend from /path/to/llama.cpp/examples/test-cmake/install/lib/llama.cpp/libggml-cpu-alderlake.so
+load_backend: loaded CPU backend from /path/to/llama.cpp/examples/test-cmake/install/lib/llama.cpp/libqvac-ggml-cpu-alderlake.so
 [test-cmake] Backend initialized.
 ```
 

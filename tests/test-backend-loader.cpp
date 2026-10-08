@@ -26,7 +26,7 @@ namespace fs = std::filesystem;
 #    endif
 #    include <windows.h>
 
-static const char * const k_prefix = "qvac-ggml-cuda-";
+static const char * const k_prefix = GGML_TEST_LIB_PREFIX "ggml-cuda-";
 static const char * const k_ext    = ".dll";
 
 // Both the CRT copy, read by getenv, and the process block, read by
@@ -36,7 +36,7 @@ static void set_env(const char * name, const char * value) {
     SetEnvironmentVariableA(name, value);
 }
 #else
-static const char * const k_prefix = "libqvac-ggml-cuda-";
+static const char * const k_prefix = "lib" GGML_TEST_LIB_PREFIX "ggml-cuda-";
 static const char * const k_ext    = ".so";
 
 static void set_env(const char * name, const char * value) {
