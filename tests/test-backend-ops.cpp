@@ -4886,6 +4886,510 @@ struct test_ssm_conv_bias_silu : public test_case {
     }
 };
 
+// GGML_OP_SUPERTONIC_LAYER_NORM_CHANNEL
+struct test_supertonic_layer_norm_channel : public test_case {
+    const int64_t L;
+    const int64_t C;
+    const int64_t B;
+    const bool ct; // [C, T] layout instead of [T, C]
+    const float eps;
+
+    std::string vars() override {
+        return VARS_TO_STR5(L, C, B, ct, eps);
+    }
+
+    test_supertonic_layer_norm_channel(int64_t L = 139, int64_t C = 512, bool ct = false, float eps = 1e-6f,
+                                       int64_t B = 1)
+        : L(L), C(C), B(B), ct(ct), eps(eps) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ct ? ggml_new_tensor_3d(ctx, GGML_TYPE_F32, C, L, B) : ggml_new_tensor_3d(ctx, GGML_TYPE_F32, L, C, B);
+        ggml_set_name(a, "a");
+        ggml_tensor * g = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, C);
+        ggml_set_name(g, "g");
+        ggml_tensor * b = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, C);
+        ggml_set_name(b, "b");
+
+        ggml_tensor * out = ct ? ggml_supertonic_layer_norm_channel_ct(ctx, a, g, b, eps)
+                               : ggml_supertonic_layer_norm_channel(ctx, a, g, b, eps);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+};
+
+// MUL_MAT followed by an epilogue the Metal backend fuses into its mat-mat kernels
+struct test_supertonic_mm_epilogue : public test_case {
+    // BIAS_RESIDUAL_INPLACE stores the result over the matmul input, which the fusion must refuse.
+    enum epilogue {
+        BIAS = 1,
+        BIAS_RESIDUAL,
+        BIAS_GELU,
+        PW2_RESIDUAL,
+        BIAS_RESIDUAL_INPLACE,
+        BIAS_GELU_TRANSPOSE,
+        PW2_RESIDUAL_TRANSPOSE,
+    };
+
+    const ggml_type type_a;
+    const int64_t m;
+    const int64_t n;
+    const int64_t k;
+    const int64_t B;
+    const int mode;
+    const bool prec_f32;
+
+    std::string vars() override {
+        return VARS_TO_STR7(type_a, m, n, k, B, mode, prec_f32);
+    }
+
+    double max_nmse_err() override {
+        return prec_f32 ? 1e-9 : 5e-4;
+    }
+
+    // WebGPU has no f32-precision matmul path, so GGML_PREC_F32 cannot tighten its tolerance.
+    double max_nmse_err(ggml_backend_t backend) override {
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
+        return strcmp(ggml_backend_reg_name(reg), "WebGPU") == 0 ? 5e-4 : max_nmse_err();
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    test_supertonic_mm_epilogue(ggml_type type_a, int64_t m, int64_t n, int64_t k, int mode, bool prec_f32 = false,
+                                 int64_t B = 1)
+        : type_a(type_a), m(m), n(n), k(k), B(B), mode(mode), prec_f32(prec_f32) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor_2d(ctx, type_a, k, m);
+        ggml_set_name(a, "a");
+        ggml_tensor * b = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k, n, B);
+        ggml_set_name(b, "b");
+        ggml_tensor * mm = ggml_mul_mat(ctx, a, b);
+        if (prec_f32) {
+            ggml_prec_set_acc(mm, GGML_PREC_F32);
+        }
+        ggml_tensor * bias = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, m);
+        ggml_set_name(bias, "bias");
+        ggml_tensor * out = nullptr;
+        if (mode == BIAS) {
+            out = ggml_add(ctx, mm, ggml_reshape_2d(ctx, bias, m, 1));
+        } else if (mode == BIAS_RESIDUAL) {
+            ggml_tensor * residual = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, m, n, B);
+            ggml_set_name(residual, "residual");
+            out = ggml_add(ctx, ggml_add(ctx, mm, ggml_reshape_2d(ctx, bias, m, 1)), residual);
+        } else if (mode == BIAS_RESIDUAL_INPLACE) {
+            GGML_ASSERT(m == k);
+            out = ggml_add_inplace(ctx, b, ggml_add(ctx, mm, ggml_reshape_2d(ctx, bias, m, 1)));
+        } else if (mode == BIAS_GELU) {
+            out = ggml_supertonic_bias_gelu_ct(ctx, mm, bias);
+        } else if (mode == BIAS_GELU_TRANSPOSE) {
+            out = ggml_supertonic_bias_gelu_tc_to_ct(
+                ctx, ggml_cont(ctx, ggml_transpose(ctx, mm)), bias);
+        } else {
+            ggml_tensor * gamma = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, m);
+            ggml_set_name(gamma, "gamma");
+            ggml_tensor * residual = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, m, n, B);
+            ggml_set_name(residual, "residual");
+            out = mode == PW2_RESIDUAL_TRANSPOSE
+                ? ggml_supertonic_pw2_residual_tc_to_ct(
+                    ctx, ggml_cont(ctx, ggml_transpose(ctx, mm)), bias, gamma, residual)
+                : ggml_supertonic_pw2_residual_ct(ctx, mm, bias, gamma, residual);
+        }
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+};
+
+// GGML_OP_SUPERTONIC_EDGE_PAD_1D
+struct test_supertonic_edge_pad_1d : public test_case {
+    const int64_t L;
+    const int64_t C;
+    const int     pad_left;
+    const int     pad_right;
+    const bool    ct;
+
+    std::string vars() override {
+        return VARS_TO_STR5(L, C, pad_left, pad_right, ct);
+    }
+
+    test_supertonic_edge_pad_1d(int64_t L = 37, int64_t C = 8, int pad_left = 3, int pad_right = 2, bool ct = false)
+        : L(L), C(C), pad_left(pad_left), pad_right(pad_right), ct(ct) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x = ct ? ggml_new_tensor_4d(ctx, GGML_TYPE_F32, C, L, 1, 1)
+                             : ggml_new_tensor_4d(ctx, GGML_TYPE_F32, L, C, 1, 1);
+        ggml_set_name(x, "x");
+        ggml_tensor * out = ct ? ggml_supertonic_edge_pad_1d_ct(ctx, x, pad_left, pad_right)
+                               : ggml_supertonic_edge_pad_1d(ctx, x, pad_left, pad_right);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
+// GGML_OP_SUPERTONIC_DEPTHWISE_1D
+struct test_supertonic_depthwise_1d : public test_case {
+    const int64_t L;
+    const int64_t C;
+    const int64_t B;
+    const int64_t K;
+    const int dilation;
+    const bool ct;      // [C, T] layout instead of [T, C]
+    const bool causal;  // causal-left taps ([C, T] only)
+    const int seg_len;  // clamp inside seg_len windows ([C, T] only)
+
+    std::string vars() override {
+        return VARS_TO_STR8(L, C, B, K, dilation, ct, causal, seg_len);
+    }
+
+    test_supertonic_depthwise_1d(int64_t L = 139, int64_t C = 512, int64_t K = 7, int dilation = 3,
+                                 bool ct = true, bool causal = false, int seg_len = 0, int64_t B = 1)
+        : L(L), C(C), B(B), K(K), dilation(dilation), ct(ct), causal(causal), seg_len(seg_len) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ct ? ggml_new_tensor_3d(ctx, GGML_TYPE_F32, C, L, B) : ggml_new_tensor_3d(ctx, GGML_TYPE_F32, L, C, B);
+        ggml_set_name(a, "a");
+        ggml_tensor * w = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, K, 1, C);
+        ggml_set_name(w, "w");
+        ggml_tensor * b = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, C);
+        ggml_set_name(b, "b");
+
+        ggml_tensor * out;
+        if (seg_len > 0) {
+            out = ggml_supertonic_depthwise_1d_ct_segmented(ctx, a, w, b, dilation, seg_len);
+        } else if (causal) {
+            out = ggml_supertonic_depthwise_1d_causal_ct(ctx, a, w, b, dilation);
+        } else if (ct) {
+            out = ggml_supertonic_depthwise_1d_ct(ctx, a, w, b, dilation);
+        } else {
+            out = ggml_supertonic_depthwise_1d(ctx, a, w, b, dilation);
+        }
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+};
+
+// SUPERTONIC_DEPTHWISE_1D followed by SUPERTONIC_LAYER_NORM_CHANNEL, which Metal runs as one dispatch
+struct test_supertonic_depthwise_layer_norm : public test_case {
+    const int64_t L;
+    const int64_t C;
+    const int64_t B;
+    const int64_t K;
+    const int dilation;
+    const bool ct;
+    const bool causal;
+    const int seg_len;
+
+    std::string vars() override {
+        return VARS_TO_STR8(L, C, B, K, dilation, ct, causal, seg_len);
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    test_supertonic_depthwise_layer_norm(int64_t L, int64_t C, int64_t K, int dilation,
+                                         bool ct = true, bool causal = false, int seg_len = 0, int64_t B = 1)
+        : L(L), C(C), B(B), K(K), dilation(dilation), ct(ct), causal(causal), seg_len(seg_len) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ct ? ggml_new_tensor_3d(ctx, GGML_TYPE_F32, C, L, B) : ggml_new_tensor_3d(ctx, GGML_TYPE_F32, L, C, B);
+        ggml_set_name(a, "a");
+        ggml_tensor * w = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, K, 1, C);
+        ggml_set_name(w, "w");
+        ggml_tensor * b = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, C);
+        ggml_set_name(b, "b");
+        ggml_tensor * g = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, C);
+        ggml_set_name(g, "g");
+        ggml_tensor * beta = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, C);
+        ggml_set_name(beta, "beta");
+
+        ggml_tensor * dw;
+        if (seg_len > 0) {
+            dw = ggml_supertonic_depthwise_1d_ct_segmented(ctx, a, w, b, dilation, seg_len);
+        } else if (causal) {
+            dw = ggml_supertonic_depthwise_1d_causal_ct(ctx, a, w, b, dilation);
+        } else if (ct) {
+            dw = ggml_supertonic_depthwise_1d_ct(ctx, a, w, b, dilation);
+        } else {
+            dw = ggml_supertonic_depthwise_1d(ctx, a, w, b, dilation);
+        }
+        const float eps = 1e-6f;
+        ggml_tensor * out = ct ? ggml_supertonic_layer_norm_channel_ct(ctx, dw, g, beta, eps)
+                               : ggml_supertonic_layer_norm_channel(ctx, dw, g, beta, eps);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+};
+
+// GGML_OP_GRU
+struct test_gru : public test_case {
+    const int64_t h;   // hidden size (GPU backends cap at 128)
+    const int64_t b;   // batch
+    const int64_t l;   // sequence length
+    const bool reverse;
+    const float gi_range;  // input-transform magnitude (large values exercise gate saturation)
+
+    std::string vars() override {
+        return VARS_TO_STR5(h, b, l, reverse, gi_range);
+    }
+
+    test_gru(int64_t h = 64, int64_t b = 2, int64_t l = 9, bool reverse = false, float gi_range = 1.0f)
+        : h(h), b(b), l(l), reverse(reverse), gi_range(gi_range) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * whh = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, h, 3 * h);
+        ggml_tensor * gi  = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 3 * h, b, l);
+        ggml_tensor * bhh = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 3 * h);
+        ggml_tensor * out = ggml_gru(ctx, whh, gi, bhh, reverse);
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        // Scale recurrent weights like trained weights (spectral radius < 1): plain U(-1,1) whh
+        // makes the recurrence chaotic, so per-backend fp ULP diffs amplify over l and fail any bound.
+        const float ws = 1.0f / sqrtf((float) h);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->ne[0] == h && t->ne[1] == 3 * h) {
+                init_tensor_uniform(t, -ws, ws);   // whh
+            } else if (t->ne[2] == l && t->ne[0] == 3 * h) {
+                init_tensor_uniform(t, -gi_range, gi_range);   // gi
+            } else {
+                init_tensor_uniform(t, -1.0f, 1.0f);
+            }
+        }
+    }
+};
+
+// GGML_OP_ZERO_UPSAMPLE
+struct test_zero_upsample : public test_case {
+    const std::array<int64_t, 4> ne;
+    const int s;
+    const bool offset;
+
+    std::string vars() override {
+        return VARS_TO_STR3(ne, s, offset);
+    }
+
+    test_zero_upsample(std::array<int64_t, 4> ne = {10, 7, 3, 2}, int s = 2, bool offset = false)
+        : ne(ne), s(s), offset(offset) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = offset ? offset_view(ctx) : ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
+        return ggml_zero_upsample(ctx, a, s);
+    }
+
+    // A contiguous view that starts one element into its storage, so it is
+    // misaligned for backends that bind buffers at an aligned offset.
+    ggml_tensor * offset_view(ggml_context * ctx) {
+        const int64_t elements = ne[0] * ne[1] * ne[2] * ne[3];
+        ggml_tensor * storage = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, elements + 1);
+        ggml_set_name(storage, "zero-upsample-offset-storage");
+        return ggml_view_4d(ctx, storage, ne[0], ne[1], ne[2], ne[3],
+            ne[0] * sizeof(float), ne[0] * ne[1] * sizeof(float),
+            ne[0] * ne[1] * ne[2] * sizeof(float), sizeof(float));
+    }
+};
+
+// GGML_OP_CHANNEL_SHUFFLE
+struct test_channel_shuffle : public test_case {
+    const std::array<int64_t, 4> ne;
+    const int groups;
+
+    std::string vars() override {
+        return VARS_TO_STR2(ne, groups);
+    }
+
+    test_channel_shuffle(std::array<int64_t, 4> ne = {8, 4, 12, 2}, int groups = 2)
+        : ne(ne), groups(groups) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
+        return ggml_channel_shuffle(ctx, a, groups);
+    }
+};
+
+// GGML_OP_AFFINE_PRELU
+struct test_affine_prelu : public test_case {
+    const int64_t f;   // features (ne0)
+    const int64_t t;   // time (ne1)
+    const int64_t c;   // channels (ne2)
+    const int64_t bc;  // batch (ne3)
+
+    std::string vars() override {
+        return VARS_TO_STR4(f, t, c, bc);
+    }
+
+    test_affine_prelu(int64_t f = 16, int64_t t = 10, int64_t c = 6, int64_t bc = 2)
+        : f(f), t(t), c(c), bc(bc) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x     = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, f, t, c, bc);
+        ggml_tensor * aw    = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, f, c);
+        ggml_tensor * ab    = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, f, c);
+        ggml_tensor * slope = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, c);
+        return ggml_affine_prelu(ctx, x, aw, ab, slope);
+    }
+};
+
+// GGML_OP_SNAKE
+struct test_snake : public test_case {
+    const int64_t t;  // time (ne0)
+    const int64_t c;  // channels (ne1)
+
+    std::string vars() override {
+        return VARS_TO_STR2(t, c);
+    }
+
+    test_snake(int64_t t = 32, int64_t c = 8) : t(t), c(c) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x     = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, t, c);
+        ggml_tensor * a     = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1, c);
+        ggml_tensor * inv_b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1, c);
+        ggml_set_name(x, "x");
+        return ggml_snake(ctx, x, a, inv_b);
+    }
+};
+
+// GGML_OP_LSTM_CELL
+struct test_lstm_cell : public test_case {
+    const int64_t h;  // hidden size
+    const int64_t n;  // batch (columns)
+
+    std::string vars() override {
+        return VARS_TO_STR2(h, n);
+    }
+
+    test_lstm_cell(int64_t h = 32, int64_t n = 1) : h(h), n(n) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * gates  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 4*h, n);
+        ggml_tensor * c_prev = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, h, n);
+        ggml_set_name(gates,  "gates");
+        ggml_set_name(c_prev, "c_prev");
+        return ggml_lstm_cell(ctx, gates, c_prev);
+    }
+};
+
+// GGML_OP_LSTM_CELL, masked form over a packed [h | c] previous state
+struct test_lstm_cell_masked : public test_case {
+    const int64_t h;        // hidden size
+    const int64_t n;        // batch (columns)
+    const int32_t mask_val; // 0 holds the previous pair, non-zero takes the fresh one
+    const bool broadcast;   // one mask entry for every column instead of one each
+    const int64_t mask_off; // > 0: the mask is a view this many elements into a longer buffer
+
+    std::string vars() override {
+        return VARS_TO_STR5(h, n, mask_val, broadcast, mask_off);
+    }
+
+    test_lstm_cell_masked(int64_t h = 32, int64_t n = 1, int32_t mask_val = 1, bool broadcast = false,
+                          int64_t mask_off = 0)
+        : h(h), n(n), mask_val(mask_val), broadcast(broadcast), mask_off(mask_off) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t n_mask = broadcast ? 1 : n;
+        ggml_tensor * gates   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 4*h, n);
+        ggml_tensor * hc_prev = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 2*h, n);
+        ggml_tensor * mask    = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, mask_off + n_mask);
+        ggml_set_name(gates,   "gates");
+        ggml_set_name(hc_prev, "hc_prev");
+        ggml_set_name(mask,    "mask");
+        if (mask_off > 0) {
+            mask = ggml_view_1d(ctx, mask, n_mask, mask_off*sizeof(int32_t));
+        }
+        return ggml_lstm_cell_masked(ctx, gates, hc_prev, mask);
+    }
+
+    // The elements before the view hold the opposite value, so a kernel that
+    // ignores the view offset reads the wrong mask.
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (std::string(t->name) == "mask") {
+                std::vector<int32_t> m((size_t) ggml_nelements(t), mask_val);
+                std::fill(m.begin(), m.begin() + mask_off, mask_val == 0 ? 1 : 0);
+                ggml_backend_tensor_set(t, m.data(), 0, m.size()*sizeof(int32_t));
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
+// GGML_OP_TDT_STEP
+struct test_tdt_step : public test_case {
+    const int tok;
+    const int dur_idx;
+    const int t;
+    const int s;
+    const int n_frames;
+    const int blank_id;
+    const int max_symbols;
+    const int rnnt;
+    const int dst_row;  // control-buffer row the step writes, > 0 exercises the view offset
+
+    // Number of rows in the control buffer the step writes into.
+    static constexpr int64_t n_ctl_rows = 2;
+
+    // The value every control row holds before the step runs: a kernel that
+    // ignores the destination view offset leaves the target row at this.
+    static constexpr int32_t ctl_fill = -7;
+
+    // Duration table of the released TDT models, plus the identity table the
+    // engine passes when the GGUF carries no explicit durations.
+    static std::vector<int32_t> durations(int rnnt) {
+        return rnnt ? std::vector<int32_t>{ 0 } : std::vector<int32_t>{ 0, 1, 2, 3, 4 };
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR9(tok, dur_idx, t, s, n_frames, blank_id, max_symbols, rnnt, dst_row);
+    }
+
+    test_tdt_step(int tok = 0, int dur_idx = 0, int t = 0, int s = 0, int n_frames = 8,
+                  int blank_id = 1024, int max_symbols = 10, int rnnt = 0, int dst_row = 1)
+        : tok(tok), dur_idx(dur_idx), t(t), s(s), n_frames(n_frames),
+          blank_id(blank_id), max_symbols(max_symbols), rnnt(rnnt), dst_row(dst_row) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * token = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
+        ggml_tensor * dur   = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
+        ggml_tensor * state = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, GGML_TDT_STEP_N_INS);
+        ggml_tensor * table = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, (int64_t) durations(rnnt).size());
+        ggml_tensor * ctl   = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, GGML_TDT_STEP_N_OUTS, n_ctl_rows);
+        ggml_set_name(token, "token");
+        ggml_set_name(dur,   "dur_idx");
+        ggml_set_name(state, "state");
+        ggml_set_name(table, "dur_table");
+        ggml_set_name(ctl,   "ctl");
+        ggml_tensor * dst = ggml_view_1d(ctx, ctl, GGML_TDT_STEP_N_OUTS,
+                                         (size_t) dst_row * GGML_TDT_STEP_N_OUTS * sizeof(int32_t));
+        return ggml_tdt_step(ctx, token, dur, state, table, dst, blank_id, max_symbols, rnnt);
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        const std::vector<int32_t> table = durations(rnnt);
+        const std::vector<int32_t> state = { t, s, n_frames };
+        const std::vector<int32_t> ctl((size_t) (n_ctl_rows*GGML_TDT_STEP_N_OUTS), ctl_fill);
+        for (ggml_tensor * v = ggml_get_first_tensor(ctx); v != NULL; v = ggml_get_next_tensor(ctx, v)) {
+            if (std::string(v->name) == "token") {
+                ggml_backend_tensor_set(v, &tok, 0, sizeof(int));
+            } else if (std::string(v->name) == "dur_idx") {
+                ggml_backend_tensor_set(v, &dur_idx, 0, sizeof(int));
+            } else if (std::string(v->name) == "state") {
+                ggml_backend_tensor_set(v, state.data(), 0, state.size()*sizeof(int32_t));
+            } else if (std::string(v->name) == "dur_table") {
+                ggml_backend_tensor_set(v, table.data(), 0, table.size()*sizeof(int32_t));
+            } else if (std::string(v->name) == "ctl") {
+                ggml_backend_tensor_set(v, ctl.data(), 0, ctl.size()*sizeof(int32_t));
+            } else if (v->view_src == NULL) {
+                // sentinels and the op output; views alias ctl and must keep its fill
+                init_tensor_uniform(v);
+            }
+        }
+    }
+};
+
 // GGML_OP_SSM_SCAN
 struct test_ssm_scan : public test_case {
     const ggml_type type;
@@ -12697,6 +13201,57 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // Supertonic ConvNeXt shapes: the [T, C] kernel raced on its shared reduction slot for T >= 139.
+    for (bool ct : { false, true }) {
+        for (int64_t L : { 45, 139, 234, 1024 }) {
+            test_cases.emplace_back(new test_supertonic_layer_norm_channel(L, 512, ct));
+        }
+    }
+    test_cases.emplace_back(new test_supertonic_layer_norm_channel(37, 96, true, 1e-6f, 2));
+    for (int64_t K : { 3, 5, 7 }) {
+        test_cases.emplace_back(new test_supertonic_depthwise_1d(139, 512, K, 3, true));
+        test_cases.emplace_back(new test_supertonic_depthwise_1d(139, 512, K, 2, false));
+    }
+    test_cases.emplace_back(new test_supertonic_depthwise_1d(4096, 512, 7, 1, true, true));
+    test_cases.emplace_back(new test_supertonic_depthwise_1d(278, 512, 7, 27, true, false, 139));
+    test_cases.emplace_back(new test_supertonic_depthwise_1d(90, 512, 5, 8, true, false, 45));
+    test_cases.emplace_back(new test_supertonic_depthwise_1d(37, 96, 5, 2, true, false, 0, 2));
+    for (bool ct : { false, true }) {
+        test_cases.emplace_back(new test_supertonic_edge_pad_1d(37, 8, 3, 2, ct));
+        test_cases.emplace_back(new test_supertonic_edge_pad_1d(139, 512, 6, 0, ct));
+        test_cases.emplace_back(new test_supertonic_edge_pad_1d(1, 5, 2, 2, ct));
+    }
+    // Metal fuses the depthwise taps into the following channel layer norm; the last shape exceeds
+    // its per-thread register budget and must fall back to two dispatches.
+    test_cases.emplace_back(new test_supertonic_depthwise_layer_norm(90, 512, 7, 1, true, false, 45));
+    test_cases.emplace_back(new test_supertonic_depthwise_layer_norm(278, 512, 7, 3, true, false, 139));
+    test_cases.emplace_back(new test_supertonic_depthwise_layer_norm(468, 512, 7, 9, true, false, 234));
+    test_cases.emplace_back(new test_supertonic_depthwise_layer_norm(2808, 512, 7, 1, true, true));
+    test_cases.emplace_back(new test_supertonic_depthwise_layer_norm(53, 256, 5, 2, false));
+    test_cases.emplace_back(new test_supertonic_depthwise_layer_norm(54, 64, 5, 1, false));
+    test_cases.emplace_back(new test_supertonic_depthwise_layer_norm(139, 2048, 3, 1, true));
+    test_cases.emplace_back(new test_supertonic_depthwise_layer_norm(139, 2304, 3, 1, true));
+    test_cases.emplace_back(new test_supertonic_depthwise_layer_norm(37, 96, 5, 2, true, false, 0, 2));
+    // Metal fuses these epilogues into its mat-mat kernels; the ragged shapes cover the tile bounds.
+    for (int mode : { 1, 2, 3, 4, 6, 7 }) {
+        for (auto shape : { std::array<int64_t, 3>{512, 139, 512}, std::array<int64_t, 3>{2048, 90, 512}, std::array<int64_t, 3>{512, 468, 2048}, std::array<int64_t, 3>{144, 278, 512}, std::array<int64_t, 3>{100, 37, 96} }) {
+            test_cases.emplace_back(new test_supertonic_mm_epilogue(GGML_TYPE_F32,  shape[0], shape[1], shape[2], mode));
+            test_cases.emplace_back(new test_supertonic_mm_epilogue(GGML_TYPE_F16,  shape[0], shape[1], shape[2], mode));
+            test_cases.emplace_back(new test_supertonic_mm_epilogue(GGML_TYPE_Q8_0, shape[0], shape[1], shape[2], mode));
+        }
+        test_cases.emplace_back(new test_supertonic_mm_epilogue(GGML_TYPE_F16, 100, 37, 100, mode));
+    }
+    for (int mode : { test_supertonic_mm_epilogue::BIAS_GELU,
+                      test_supertonic_mm_epilogue::PW2_RESIDUAL,
+                      test_supertonic_mm_epilogue::BIAS_GELU_TRANSPOSE,
+                      test_supertonic_mm_epilogue::PW2_RESIDUAL_TRANSPOSE }) {
+        test_cases.emplace_back(new test_supertonic_mm_epilogue(GGML_TYPE_F32, 100, 37, 96, mode, false, 2));
+    }
+    for (ggml_type type_a : { GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_Q8_0 }) {
+        test_cases.emplace_back(new test_supertonic_mm_epilogue(type_a, 512, 139, 512, test_supertonic_mm_epilogue::BIAS_RESIDUAL_INPLACE));
+    }
+
+
     test_cases.emplace_back(new test_l2_norm_back());
     test_cases.emplace_back(new test_l2_norm_back(GGML_TYPE_F32, { 1025, 5, 4, 3 }));
     test_cases.emplace_back(new test_l2_norm_back(GGML_TYPE_F32, {   64, 5, 4, 3 }, 1e-6f, true));
@@ -12804,6 +13359,76 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             }
         }
     }
+
+    test_cases.emplace_back(new test_gru(64, 1, 17, false));
+    test_cases.emplace_back(new test_gru(64, 1, 17, true));
+    test_cases.emplace_back(new test_gru(128, 2, 33, false));    // H at the GPU shared-mem cap
+    test_cases.emplace_back(new test_gru(96, 2, 9, true));       // H not a multiple of the warp size
+    test_cases.emplace_back(new test_gru(96, 2, 33, true));      // long L with H > typical warp size
+    test_cases.emplace_back(new test_gru(4, 1953, 33, true));    // LavaSR denoiser DPGRNN shape (tiny H, huge B)
+    test_cases.emplace_back(new test_gru(2, 31, 63, false));     // LavaSR cTFA shape
+    test_cases.emplace_back(new test_gru(64, 1, 17, false, 60.0f));  // saturated gates (large gi: tanh/exp range)
+    test_cases.emplace_back(new test_gru(4, 33, 9, false));          // batch tail: B % PB(32) = 1
+    test_cases.emplace_back(new test_gru(8, 17, 5, true));           // PB=16, tail 1, reverse
+    test_cases.emplace_back(new test_gru(3, 100, 7, false));         // ragged lanes (128 % 3 = 2 idle) + tail
+    test_cases.emplace_back(new test_gru(48, 5, 9, true));           // PB=2, slot spans the wave64 boundary
+    test_cases.emplace_back(new test_gru(2, 300, 11, true));         // small-H variant, multi-WG + tail
+
+    test_cases.emplace_back(new test_gru(64, 1, 17, false, 90.0f));  // past fp32 exp-overflow threshold (~88.7)
+    test_cases.emplace_back(new test_gru(64, 1, 17, false, 150.0f)); // LavaSR-observed activation range
+    test_cases.emplace_back(new test_gru(64, 1, 17, false, 300.0f)); // extreme saturation
+
+    test_cases.emplace_back(new test_zero_upsample({10, 7, 3, 2}, 1));
+    test_cases.emplace_back(new test_zero_upsample({10, 7, 3, 2}, 2));
+    test_cases.emplace_back(new test_zero_upsample({33, 5, 2, 2}, 5));
+    test_cases.emplace_back(new test_zero_upsample({10, 7, 3, 2}, 2, true));
+
+    for (int groups : {1, 2, 3, 4}) {
+        test_cases.emplace_back(new test_channel_shuffle({8, 4, 12, 2}, groups));
+    }
+
+    test_cases.emplace_back(new test_affine_prelu(16, 10, 6, 2));
+    test_cases.emplace_back(new test_affine_prelu(129, 63, 16, 3));
+
+    test_cases.emplace_back(new test_snake(32, 8));
+    test_cases.emplace_back(new test_snake(127, 3));
+
+    for (int64_t h : {32, 640}) {
+        for (int64_t n : {1, 5}) {
+            test_cases.emplace_back(new test_lstm_cell(h, n));
+        }
+    }
+
+    for (int64_t h : {32, 640}) {
+        for (int64_t n : {1, 4}) {
+            for (float mask_val : {0.0f, 1.0f}) {
+                for (bool broadcast : {false, true}) {
+                    test_cases.emplace_back(new test_lstm_cell_masked(h, n, mask_val, broadcast));
+                }
+            }
+        }
+    }
+
+    // The TDT decoder passes the update flag as a view into its control tensor.
+    for (int32_t mask_val : {0, 1}) {
+        test_cases.emplace_back(new test_lstm_cell_masked(640, 1, mask_val, true, 3));
+        test_cases.emplace_back(new test_lstm_cell_masked(32, 4, mask_val, false, 3));
+    }
+
+    // blank, token with dur 0, token with dur > 0, the max_symbols forced advance,
+    // t past the end of the window, and the RNN-T variant (no duration head).
+    test_cases.emplace_back(new test_tdt_step(1024, 2, 3, 0, 8));
+    test_cases.emplace_back(new test_tdt_step(1024, 0, 3, 0, 8));
+    test_cases.emplace_back(new test_tdt_step(7,    0, 3, 0, 8));
+    test_cases.emplace_back(new test_tdt_step(7,    4, 3, 2, 8));
+    test_cases.emplace_back(new test_tdt_step(7,    0, 3, 9, 8));
+    test_cases.emplace_back(new test_tdt_step(7,    0, 8, 1, 8));
+    test_cases.emplace_back(new test_tdt_step(1024, 0, 7, 0, 8));
+    test_cases.emplace_back(new test_tdt_step(7,    0, 3, 0, 8, 1024, 10, 1));
+    test_cases.emplace_back(new test_tdt_step(1024, 0, 3, 0, 8, 1024, 10, 1));
+    // the first row of the control buffer, so the destination view offset is zero
+    test_cases.emplace_back(new test_tdt_step(7,    2, 3, 0, 8, 1024, 10, 0, 0));
+    test_cases.emplace_back(new test_tdt_step(1024, 1, 0, 0, 8, 1024, 10, 0, 0));
 
     // fused ssm_conv + (optional) bias_add + silu. The bias-only graph (no silu) is intentionally
     // not tested since there's no fusion for that pattern in ggml_cuda_can_fuse.

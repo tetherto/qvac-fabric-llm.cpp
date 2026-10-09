@@ -16,12 +16,13 @@ extern "C" {
 // 108 adds butterfly communicator rounds and round-tagged peer frames.
 // 109 adds cache flags to SET_TENSOR and SET_TENSOR_2D.
 // 110 widens rpc_tensor::name with GGML_MAX_NAME 128.
-#define RPC_PROTO_MAJOR_VERSION    110
+// 111 adds the speech ops to the ggml_op enum.
+#define RPC_PROTO_MAJOR_VERSION    111
 #define RPC_PROTO_MINOR_VERSION    0
 #define RPC_PROTO_PATCH_VERSION    0
 
 #ifdef  __cplusplus
-static_assert(GGML_OP_COUNT == 113, "GGML_OP_COUNT has changed - update the RPC protocol version");
+static_assert(GGML_OP_COUNT == 125, "GGML_OP_COUNT has changed - update the RPC protocol version");
 #endif
 
 #define GGML_RPC_MAX_SERVERS       16
