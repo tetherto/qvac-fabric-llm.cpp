@@ -212,7 +212,7 @@ llama_memory_context_ptr llama_kv_cache_iswa::init_batch(llama_batch_allocr & ba
 
         std::vector<llama_ubatch> ubatches;
         while (true) {
-            auto ubatch = balloc.split_equal(n_ubatch, !unified, 0);
+            auto ubatch = balloc.split_equal(n_ubatch, !unified, 0, kv_base->get_allow_stream_gaps());
 
             if (ubatch.n_tokens == 0) {
                 break;
@@ -260,6 +260,10 @@ bool llama_kv_cache_iswa::get_can_shift() const {
     return kv_base->get_can_shift() &&
            kv_swa->get_can_shift() &&
            kv_base->get_size() == kv_swa->get_size();
+}
+
+bool llama_kv_cache_iswa::get_allow_stream_gaps() const {
+    return kv_base->get_allow_stream_gaps();
 }
 
 void llama_kv_cache_iswa::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
