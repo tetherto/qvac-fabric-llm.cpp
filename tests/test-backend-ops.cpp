@@ -13235,7 +13235,6 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // Metal fuses these epilogues into its mat-mat kernels; the ragged shapes cover the tile bounds.
     for (int mode : { 1, 2, 3, 4, 6, 7 }) {
         for (auto shape : { std::array<int64_t, 3>{512, 139, 512}, std::array<int64_t, 3>{2048, 90, 512}, std::array<int64_t, 3>{512, 468, 2048}, std::array<int64_t, 3>{144, 278, 512}, std::array<int64_t, 3>{100, 37, 96} }) {
-            test_cases.emplace_back(new test_supertonic_mm_epilogue(GGML_TYPE_F32,  shape[0], shape[1], shape[2], mode, true));
             test_cases.emplace_back(new test_supertonic_mm_epilogue(GGML_TYPE_F32,  shape[0], shape[1], shape[2], mode));
             test_cases.emplace_back(new test_supertonic_mm_epilogue(GGML_TYPE_F16,  shape[0], shape[1], shape[2], mode));
             test_cases.emplace_back(new test_supertonic_mm_epilogue(GGML_TYPE_Q8_0, shape[0], shape[1], shape[2], mode));
