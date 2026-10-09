@@ -425,6 +425,15 @@ if (GGML_RPC)
     endif()
     llama_test(test-rpc-transport)
 
+    add_executable(test-rpc-server-port test-rpc-server-port.cpp)
+    target_link_libraries(test-rpc-server-port PRIVATE ggml)
+    target_compile_features(test-rpc-server-port PRIVATE cxx_std_17)
+    if (WIN32)
+        target_link_libraries(test-rpc-server-port PRIVATE ws2_32)
+    endif()
+    llama_test(test-rpc-server-port)
+    set_tests_properties(test-rpc-server-port PROPERTIES SKIP_RETURN_CODE 77)
+
     if (NOT GGML_BACKEND_DL AND GGML_CPU AND NOT LLAMA_USE_SYSTEM_GGML)
         # calls the CPU and RPC backends directly and needs the non-public ggml-backend-impl.h
         add_executable(test-rpc-extras test-rpc-extras.cpp)

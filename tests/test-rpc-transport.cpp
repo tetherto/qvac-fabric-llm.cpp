@@ -183,6 +183,37 @@ static bool test_high_fd_accept_timeout() {
     }
     return true;
 }
+
+// open() returns the lowest free descriptor, so a leaked socket changes it
+static int lowest_free_fd() {
+    const int fd = open("/dev/null", O_RDONLY);
+    if (fd >= 0) {
+        close(fd);
+    }
+    return fd;
+}
+
+static bool test_failed_server_closes_socket() {
+    socket_ptr server = socket_t::create_server("127.0.0.1", 0);
+    if (server == nullptr) {
+        fprintf(stderr, "failed to create server socket\n");
+        return false;
+    }
+
+    const int  before   = lowest_free_fd();
+    socket_ptr in_use   = socket_t::create_server("127.0.0.1", server->local_port());
+    socket_ptr bad_host = socket_t::create_server("not-an-address", 0);
+    const int  after    = lowest_free_fd();
+    if (in_use != nullptr || bad_host != nullptr) {
+        fprintf(stderr, "server creation unexpectedly succeeded\n");
+        return false;
+    }
+    if (before < 0 || after != before) {
+        fprintf(stderr, "failed server creation leaked a socket (fd %d -> %d)\n", before, after);
+        return false;
+    }
+    return true;
+}
 #else
 static bool test_transport_ref_count() {
     if (!rpc_transport_init()) {
@@ -202,14 +233,42 @@ static bool test_transport_ref_count() {
 }
 #endif
 
+static bool test_ephemeral_port() {
+    socket_ptr server = socket_t::create_server("127.0.0.1", 0);
+    socket_ptr other  = socket_t::create_server("127.0.0.1", 0);
+    const int  port   = server == nullptr ? -1 : server->local_port();
+    if (port <= 0 || other == nullptr || other->local_port() <= 0 || other->local_port() == port) {
+        fprintf(stderr, "port 0 servers did not get distinct ports\n");
+        return false;
+    }
+
+    socket_ptr client = socket_t::connect("127.0.0.1", port, 1000);
+    socket_ptr peer   = server->accept(1000);
+    if (client == nullptr || peer == nullptr) {
+        fprintf(stderr, "could not connect to the ephemeral port %d\n", port);
+        return false;
+    }
+    return true;
+}
+
+// tests that also run on Windows, after rpc_transport_init()
+static bool test_portable() {
+    return test_ephemeral_port();
+}
+
 int main() {
 #ifdef _WIN32
-    if (!test_transport_ref_count()) {
+    if (!test_transport_ref_count() || !rpc_transport_init()) {
+        return 1;
+    }
+    const bool ok = test_portable();
+    rpc_transport_shutdown();
+    if (!ok) {
         return 1;
     }
 #else
     if (!test_shutdown_send() || !test_accept_timeout() || !test_interrupted_accept_timeout() ||
-        !test_high_fd_accept_timeout()) {
+        !test_high_fd_accept_timeout() || !test_failed_server_closes_socket() || !test_portable()) {
         return 1;
     }
 #endif
