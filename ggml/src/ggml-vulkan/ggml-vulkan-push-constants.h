@@ -142,6 +142,10 @@ struct vk_flash_attn_back_push_constants {
 
     float scale;
     uint32_t mask_enable;
+
+    uint32_t mask_opt;
+    uint32_t mo_stride;
+    uint32_t mo_batch;
 };
 static_assert(sizeof(vk_flash_attn_back_push_constants) <= 128, "sizeof(vk_flash_attn_back_push_constants) must be <= 128");
 

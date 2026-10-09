@@ -46,6 +46,10 @@ layout (push_constant) uniform parameter {
 
     float scale;
     uint32_t mask_enable;
+
+    uint32_t mask_opt;
+    uint32_t mo_stride;
+    uint32_t mo_batch;
 } p;
 
 layout (binding = 0) readonly buffer Q  {vec4       data_qv4[];};
@@ -57,6 +61,10 @@ layout (binding = 5) readonly buffer G  {vec4       data_gv4[];};
 layout (binding = 6) readonly buffer ST {float      data_stats[];};
 layout (binding = 7) writeonly buffer D  {vec4       data_dv4[];};
 layout (binding = 7) writeonly buffer DF {float      data_df[];};
+layout (binding = 8) readonly buffer MO  {uint32_t   data_mask_opt[];};
+
+#define MASK_OPT_ALL_NEG_INF 1
+#define MASK_OPT_ALL_ZERO 2
 
 #define CEIL_DIV(a, b) (((a) + (b) - 1) / (b))
 
@@ -222,10 +230,20 @@ void main() {
         const uint32_t q_offset = iq2 * p.nbq2 + iq3 * p.nbq3;
         const uint32_t o_offset = iq2 * p.nbo1 + iq3 * p.nbo3;
         const uint32_t m_offset = (iq2 % p.nem2) * p.nbm2 + (iq3 % p.nem3) * p.nbm3;
+        const uint32_t mo_offset = ((iq3 % p.nem3) * p.nem2 + (iq2 % p.nem2)) * p.mo_batch + i / 16;
 
         [[dont_unroll]]
         for (uint32_t j = 0; j < Tc; ++j) {
-            if (p.mask_enable != 0) {
+            uint32_t mask_code = 0;
+            if (p.mask_opt != 0) {
+                mask_code = (data_mask_opt[mo_offset + j * p.mo_stride] >> ((i % 16) * 2)) & 3;
+                if (mask_code == MASK_OPT_ALL_NEG_INF) {
+                    continue;
+                }
+            }
+            const bool tile_mask = p.mask_enable != 0 && mask_code != MASK_OPT_ALL_ZERO;
+
+            if (tile_mask) {
                 barrier();
 
                 [[unroll]] for (uint32_t idx = 0; idx < Bc * Br; idx += WorkGroupSize) {
@@ -282,7 +300,7 @@ void main() {
                 float dSf[Br];
                 [[unroll]] for (uint32_t r = 0; r < Br; ++r) {
                     float s = Sf[r][c];
-                    if (p.mask_enable != 0) {
+                    if (tile_mask) {
                         s += masksh[(c * cols_per_iter + col_tid) * masksh_stride + r];
                     }
 
@@ -336,6 +354,7 @@ void main() {
     const uint32_t v_offset = ik2 * p.nbv2 + ik3 * p.nbv3;
     const uint32_t o_offset = iq2 * p.nbo1 + iq3 * p.nbo3;
     const uint32_t m_offset = (iq2 % p.nem2) * p.nbm2 + (iq3 % p.nem3) * p.nbm3;
+    const uint32_t mo_offset = ((iq3 % p.nem3) * p.nem2 + (iq2 % p.nem2)) * p.mo_batch + i * p.mo_stride;
 
     [[unroll]] for (uint32_t idx = 0; idx < Br * HS / 4; idx += WorkGroupSize) {
         const uint32_t d = (idx + tid) % (HS / 4);
@@ -376,7 +395,16 @@ void main() {
 
     [[dont_unroll]]
     for (uint32_t j = 0; j < Tc; ++j) {
-        if (p.mask_enable != 0) {
+        uint32_t mask_code = 0;
+        if (p.mask_opt != 0) {
+            mask_code = (data_mask_opt[mo_offset + j / 16] >> ((j % 16) * 2)) & 3;
+            if (mask_code == MASK_OPT_ALL_NEG_INF) {
+                continue;
+            }
+        }
+        const bool tile_mask = p.mask_enable != 0 && mask_code != MASK_OPT_ALL_ZERO;
+
+        if (tile_mask) {
             barrier();
             [[unroll]] for (uint32_t idx = 0; idx < Bc * Br; idx += WorkGroupSize) {
                 const uint32_t c = (idx + tid) % Bc;
@@ -426,7 +454,7 @@ void main() {
 #if FA_BACK_TARGET == FA_BACK_DQ
                 dPf[r][c] = reduce_dsplit(dPf[r][c]);
 #endif
-                if (p.mask_enable != 0) {
+                if (tile_mask) {
                     Sf[r][c] += masksh[(c * cols_per_iter + col_tid) * masksh_stride + r];
                 } else if (kcol >= p.KV) {
                     Sf[r][c] = NEG_INF;

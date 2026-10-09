@@ -2356,7 +2356,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             default: GGML_ABORT("invalid flash_attn_ext_back target");
         }
 #undef FA_BACK_SPV
-        ggml_vk_create_pipeline(device, fab.second, name, spv_size, spv_data, "main", 8,
+        ggml_vk_create_pipeline(device, fab.second, name, spv_size, spv_data, "main", 9,
                                 sizeof(vk_flash_attn_back_push_constants), {1, 1, 1},
                                 {s.workgroup_size, s.Br, s.Bc, s.HS, s.D_split, s.subgroup_size},
                                 1, true, !ds, !ds ? s.subgroup_size : 0);
@@ -12277,10 +12277,55 @@ static void ggml_vk_flash_attn_ext_back(ggml_backend_vk_context * ctx, vk_contex
     const uint32_t tsk = (uint32_t) ggml_type_size(k->type);
     const uint32_t tsm = (uint32_t) ggml_type_size(GGML_TYPE_F16);
 
+    // skip fully masked tiles using the forward's per-tile mask codes.
+    const uint32_t nem0 = mask ? (uint32_t) mask->ne[0] : 0;
+    const uint32_t nem1 = mask ? (uint32_t) mask->ne[1] : 0;
+    const uint32_t nem2 = mask ? (uint32_t) mask->ne[2] : 1;
+    const uint32_t nem3 = mask ? (uint32_t) mask->ne[3] : 1;
+    const uint32_t mo_rows = target == GGML_FLASH_ATTN_EXT_BACK_DKV ? Bc : Br;
+    const uint32_t mo_cols = target == GGML_FLASH_ATTN_EXT_BACK_DKV ? Br : Bc;
+    const bool use_mask_opt = mask && nem1 >= mo_rows && nem0 >= 16 * mo_cols && nem0 * nem1 > 32768;
+    const uint32_t mo_stride = use_mask_opt ? CEIL_DIV(nem0, 16 * mo_cols) : 0;
+    const uint32_t mo_batch  = use_mask_opt ? mo_stride * CEIL_DIV(nem1, mo_rows) : 0;
+
+    vk_subbuffer mask_opt_buf = q_buf;
+    if (use_mask_opt) {
+        vk_pipeline pipeline_mask_opt = nullptr;
+        {
+            std::lock_guard<std::mutex> guard(device->compile_mutex);
+            auto &pipelines = device->pipeline_fa_mask_opt;
+            auto it = pipelines.find({mo_rows, mo_cols});
+            if (it != pipelines.end()) {
+                pipeline_mask_opt = it->second;
+            } else {
+                pipelines[{mo_rows, mo_cols}] = pipeline_mask_opt = std::make_shared<vk_pipeline_struct>();
+            }
+        }
+        ggml_pipeline_request_descriptor_sets(ctx, pipeline_mask_opt, 1);
+
+        const uint64_t mask_opt_size = sizeof(uint32_t) * mo_batch * nem2 * nem3;
+        if (ctx->prealloc_size_y < mask_opt_size) {
+            ctx->prealloc_size_y = mask_opt_size;
+            ggml_vk_preallocate_buffers(ctx, subctx);
+        }
+        if (ctx->prealloc_y_need_sync) {
+            ggml_vk_sync_buffers(ctx, subctx);
+        }
+        mask_opt_buf = ggml_vk_subbuffer(ctx, ctx->prealloc_y, 0);
+
+        const vk_op_flash_attn_mask_opt_push_constants opt_pc = {
+            nem0, nem1, nem2,
+            (uint32_t) (mask->nb[1] / tsm), (uint32_t) (mask->nb[2] / tsm), (uint32_t) (mask->nb[3] / tsm),
+            mo_stride, mo_batch, mo_batch * nem2,
+        };
+        ggml_vk_dispatch_pipeline(ctx, subctx, pipeline_mask_opt, { mask_buf, mask_opt_buf }, opt_pc,
+                                  { mo_stride, CEIL_DIV(nem1, mo_rows), nem2 * nem3 });
+        ggml_vk_sync_buffers(ctx, subctx);
+    }
+
     const vk_flash_attn_back_push_constants pc = {
         N, KV, neq2, nek2, nek3,
-        mask ? (uint32_t) mask->ne[2] : 1u,
-        mask ? (uint32_t) mask->ne[3] : 1u,
+        nem2, nem3,
         (uint32_t) (q->nb[1] / tsq), (uint32_t) (q->nb[2] / tsq), (uint32_t) (q->nb[3] / tsq),
         (uint32_t) (k->nb[1] / tsk), (uint32_t) (k->nb[2] / tsk), (uint32_t) (k->nb[3] / tsk),
         (uint32_t) (v->nb[1] / tsk), (uint32_t) (v->nb[2] / tsk), (uint32_t) (v->nb[3] / tsk),
@@ -12291,6 +12336,7 @@ static void ggml_vk_flash_attn_ext_back(ggml_backend_vk_context * ctx, vk_contex
         (uint32_t) (dst->nb[1] / tsq), (uint32_t) (dst->nb[2] / tsq), (uint32_t) (dst->nb[3] / tsq),
         scale,
         mask ? 1u : 0u,
+        use_mask_opt ? 1u : 0u, mo_stride, mo_batch,
     };
 
     std::array<uint32_t, 3> elements;
@@ -12301,8 +12347,12 @@ static void ggml_vk_flash_attn_ext_back(ggml_backend_vk_context * ctx, vk_contex
     }
 
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
-        {q_buf, k_buf, v_buf, mask_buf, o_buf, g_buf, stats_buf, dst_buf},
+        {q_buf, k_buf, v_buf, mask_buf, o_buf, g_buf, stats_buf, dst_buf, mask_opt_buf},
         pc, elements);
+
+    if (use_mask_opt) {
+        ctx->prealloc_y_need_sync = true;
+    }
 }
 
 static void ggml_vk_gated_delta_net_back(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {

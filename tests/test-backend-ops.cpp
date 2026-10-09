@@ -10851,9 +10851,10 @@ struct test_flash_attn_ext : public test_case {
         }
     }
 
-    // the finite differences of the summed output are noisy for the many small softmax gradient elements
+    // the finite differences of the summed output are noisy for the many small softmax gradient
+    // elements: with random inputs 1e-2 fails about 1 run in 20 on CPU and GPU alike
     double max_maa_err() override {
-        return 1e-2;
+        return 5e-2;
     }
 
     bool grad_precise() override {
@@ -10890,9 +10891,10 @@ struct test_flash_attn_ext_back : public test_case {
     const ggml_type type_KV;
     std::array<int32_t, 4> permute;
     const ggml_flash_attn_ext_back_target target;
+    const bool mask_zero; // visible mask entries are 0 instead of random, as in training
 
     std::string vars() override {
-        return VARS_TO_STR9(hs, nh, nr23, kv, nb, mask, type_KV, permute, target);
+        return VARS_TO_STR10(hs, nh, nr23, kv, nb, mask, type_KV, permute, target, mask_zero);
     }
 
     double max_nmse_err() override {
@@ -10901,8 +10903,8 @@ struct test_flash_attn_ext_back : public test_case {
 
     test_flash_attn_ext_back(int64_t hs = 64, int64_t nh = 4, std::array<int64_t, 2> nr23 = {1, 1}, int64_t kv = 96, int64_t nb = 8,
                              bool mask = true, ggml_type type_KV = GGML_TYPE_F16, std::array<int32_t, 4> permute = {0, 1, 2, 3},
-                             ggml_flash_attn_ext_back_target target = GGML_FLASH_ATTN_EXT_BACK_DQ)
-        : hs(hs), nh(nh), nr23(nr23), kv(kv), nb(nb), mask(mask), type_KV(type_KV), permute(permute), target(target) {}
+                             ggml_flash_attn_ext_back_target target = GGML_FLASH_ATTN_EXT_BACK_DQ, bool mask_zero = false)
+        : hs(hs), nh(nh), nr23(nr23), kv(kv), nb(nb), mask(mask), type_KV(type_KV), permute(permute), target(target), mask_zero(mask_zero) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         auto const &create_permuted = [&](ggml_type type, int64_t ne0, int64_t ne1, int64_t ne2, int64_t ne3) -> ggml_tensor * {
@@ -10952,7 +10954,11 @@ struct test_flash_attn_ext_back : public test_case {
     void initialize_tensors(ggml_context * ctx) override {
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
             if (strcmp(t->name, "m") == 0) {
-                init_tensor_kq_mask_causal(t);
+                if (mask_zero) {
+                    init_tensor_kq_mask_causal(t, 0.0f, 0.0f);
+                } else {
+                    init_tensor_kq_mask_causal(t);
+                }
             } else {
                 init_tensor_uniform(t);
             }
@@ -14883,6 +14889,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_flash_attn_ext_back( 96, 2, {1, 1},  40,  1, true, GGML_TYPE_F32, {0, 1, 2, 3}, target));
             test_cases.emplace_back(new test_flash_attn_ext_back(256, 2, {8, 1}, 113, 75, true, GGML_TYPE_F16, {0, 1, 2, 3}, target));
             test_cases.emplace_back(new test_flash_attn_ext_back(128, 1, {8, 2},  64, 64, true, GGML_TYPE_F32, {0, 1, 2, 3}, target));
+
+            test_cases.emplace_back(new test_flash_attn_ext_back( 64, 2, {2, 1}, 512, 75, true, GGML_TYPE_F32, {0, 1, 2, 3}, target, true));
+            test_cases.emplace_back(new test_flash_attn_ext_back(128, 2, {4, 1}, 1024, 1024, true, GGML_TYPE_F16, {0, 1, 2, 3}, target, true));
         }
     } // !GGML_SKIP_FLASH_ATTN
 
