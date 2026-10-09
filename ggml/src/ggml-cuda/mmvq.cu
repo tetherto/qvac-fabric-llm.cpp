@@ -869,7 +869,7 @@ static __global__ void mul_mat_vec_q(
 
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == GGML_CUDA_CC_DGX_SPARK
             // start the next iterations' weight loads early
-            if constexpr (mmvq_should_prefetch(type)) {
+            if constexpr (!cutlass_layout && mmvq_should_prefetch(type)) {
                 constexpr int pf_dist = 2; // loop iterations, not blocks
                 const int kbx_pf = kbx + pf_dist*blocks_per_iter;
                 if (kbx_pf < blocks_per_row_x) {
