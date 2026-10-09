@@ -15,7 +15,8 @@ extern "C" {
 // HELLO fields are uint8_t on the wire, so the value must stay <= 255.
 // 108 adds butterfly communicator rounds and round-tagged peer frames.
 // 109 adds cache flags to SET_TENSOR and SET_TENSOR_2D.
-#define RPC_PROTO_MAJOR_VERSION    109
+// 110 widens rpc_tensor::name with GGML_MAX_NAME 128.
+#define RPC_PROTO_MAJOR_VERSION    110
 #define RPC_PROTO_MINOR_VERSION    0
 #define RPC_PROTO_PATCH_VERSION    0
 
