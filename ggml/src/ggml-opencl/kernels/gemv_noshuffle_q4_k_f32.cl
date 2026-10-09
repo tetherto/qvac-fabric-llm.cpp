@@ -31,105 +31,114 @@ inline void get_scale_min_k4(
     }
 }
 
+// fetch(v, e, lane) yields element e of `lane`'s activations; ya serves lanes 0 and 2, yb lanes 1 and 3.
+#define ACT_BROADCAST(v, e, lane) sub_group_broadcast(v.e, lane)
+
 #define dequantizeBlockAccum_ns_sgbroadcast_1_hi(total_sums, bits4, scale, minv, y) \
+    dequantizeBlockAccum_ns_fetch_hi(total_sums, bits4, scale, minv, ACT_BROADCAST, y, y)
+
+#define dequantizeBlockAccum_ns_fetch_hi(total_sums, bits4, scale, minv, fetch, ya, yb) \
     float shared_y; \
-    shared_y = sub_group_broadcast(y.s0, 0); \
+    shared_y = fetch(ya, s0, 0); \
     total_sums.s0 += ((bits4.s0 & 0x000F) * scale.s0 - minv.s0) * shared_y; \
     total_sums.s1 += ((bits4.s1 & 0x000F) * scale.s1 - minv.s1) * shared_y; \
-    shared_y = sub_group_broadcast(y.s1, 0); \
+    shared_y = fetch(ya, s1, 0); \
     total_sums.s0 += (((bits4.s0 & 0x00F0) >> 4) * scale.s0 - minv.s0) * shared_y; \
     total_sums.s1 += (((bits4.s1 & 0x00F0) >> 4) * scale.s1 - minv.s1) * shared_y; \
-    shared_y = sub_group_broadcast(y.s2, 0); \
+    shared_y = fetch(ya, s2, 0); \
     total_sums.s0 += (((bits4.s0 & 0x0F00) >> 8) * scale.s0 - minv.s0) * shared_y; \
     total_sums.s1 += (((bits4.s1 & 0x0F00) >> 8) * scale.s1 - minv.s1) * shared_y; \
-    shared_y = sub_group_broadcast(y.s3, 0); \
+    shared_y = fetch(ya, s3, 0); \
     total_sums.s0 += (((bits4.s0 & 0xF000) >> 12) * scale.s0 - minv.s0) * shared_y; \
     total_sums.s1 += (((bits4.s1 & 0xF000) >> 12) * scale.s1 - minv.s1) * shared_y; \
-    shared_y = sub_group_broadcast(y.s4, 0); \
+    shared_y = fetch(ya, s4, 0); \
     total_sums.s0 += ((bits4.s2 & 0x000F) * scale.s0 - minv.s0) * shared_y; \
     total_sums.s1 += ((bits4.s3 & 0x000F) * scale.s1 - minv.s1) * shared_y; \
-    shared_y = sub_group_broadcast(y.s5, 0); \
+    shared_y = fetch(ya, s5, 0); \
     total_sums.s0 += (((bits4.s2 & 0x00F0) >> 4) * scale.s0 - minv.s0) * shared_y; \
     total_sums.s1 += (((bits4.s3 & 0x00F0) >> 4) * scale.s1 - minv.s1) * shared_y; \
-    shared_y = sub_group_broadcast(y.s6, 0); \
+    shared_y = fetch(ya, s6, 0); \
     total_sums.s0 += (((bits4.s2 & 0x0F00) >> 8) * scale.s0 - minv.s0) * shared_y; \
     total_sums.s1 += (((bits4.s3 & 0x0F00) >> 8) * scale.s1 - minv.s1) * shared_y; \
-    shared_y = sub_group_broadcast(y.s7, 0); \
+    shared_y = fetch(ya, s7, 0); \
     total_sums.s0 += (((bits4.s2 & 0xF000) >> 12) * scale.s0 - minv.s0) * shared_y; \
     total_sums.s1 += (((bits4.s3 & 0xF000) >> 12) * scale.s1 - minv.s1) * shared_y; \
-    shared_y = sub_group_broadcast(y.s0, 1); \
+    shared_y = fetch(yb, s0, 1); \
     total_sums.s0 += ((bits4.s4 & 0x000F) * scale.s0 - minv.s0) * shared_y; \
     total_sums.s1 += ((bits4.s5 & 0x000F) * scale.s1 - minv.s1) * shared_y; \
-    shared_y = sub_group_broadcast(y.s1, 1); \
+    shared_y = fetch(yb, s1, 1); \
     total_sums.s0 += (((bits4.s4 & 0x00F0) >> 4) * scale.s0 - minv.s0) * shared_y; \
     total_sums.s1 += (((bits4.s5 & 0x00F0) >> 4) * scale.s1 - minv.s1) * shared_y; \
-    shared_y = sub_group_broadcast(y.s2, 1); \
+    shared_y = fetch(yb, s2, 1); \
     total_sums.s0 += (((bits4.s4 & 0x0F00) >> 8) * scale.s0 - minv.s0) * shared_y; \
     total_sums.s1 += (((bits4.s5 & 0x0F00) >> 8) * scale.s1 - minv.s1) * shared_y; \
-    shared_y = sub_group_broadcast(y.s3, 1); \
+    shared_y = fetch(yb, s3, 1); \
     total_sums.s0 += (((bits4.s4 & 0xF000) >> 12) * scale.s0 - minv.s0) * shared_y; \
     total_sums.s1 += (((bits4.s5 & 0xF000) >> 12) * scale.s1 - minv.s1) * shared_y; \
-    shared_y = sub_group_broadcast(y.s4, 1); \
+    shared_y = fetch(yb, s4, 1); \
     total_sums.s0 += ((bits4.s6 & 0x000F) * scale.s0 - minv.s0) * shared_y; \
     total_sums.s1 += ((bits4.s7 & 0x000F) * scale.s1 - minv.s1) * shared_y; \
-    shared_y = sub_group_broadcast(y.s5, 1); \
+    shared_y = fetch(yb, s5, 1); \
     total_sums.s0 += (((bits4.s6 & 0x00F0) >> 4) * scale.s0 - minv.s0) * shared_y; \
     total_sums.s1 += (((bits4.s7 & 0x00F0) >> 4) * scale.s1 - minv.s1) * shared_y; \
-    shared_y = sub_group_broadcast(y.s6, 1); \
+    shared_y = fetch(yb, s6, 1); \
     total_sums.s0 += (((bits4.s6 & 0x0F00) >> 8) * scale.s0 - minv.s0) * shared_y; \
     total_sums.s1 += (((bits4.s7 & 0x0F00) >> 8) * scale.s1 - minv.s1) * shared_y; \
-    shared_y = sub_group_broadcast(y.s7, 1); \
+    shared_y = fetch(yb, s7, 1); \
     total_sums.s0 += (((bits4.s6 & 0xF000) >> 12) * scale.s0 - minv.s0) * shared_y; \
     total_sums.s1 += (((bits4.s7 & 0xF000) >> 12) * scale.s1 - minv.s1) * shared_y; \
 
 
 #define dequantizeBlockAccum_ns_sgbroadcast_1_lo(total_sums, bits4, scale, minv, y) \
-    shared_y = sub_group_broadcast(y.s0, 2); \
+    dequantizeBlockAccum_ns_fetch_lo(total_sums, bits4, scale, minv, ACT_BROADCAST, y, y)
+
+#define dequantizeBlockAccum_ns_fetch_lo(total_sums, bits4, scale, minv, fetch, ya, yb) \
+    shared_y = fetch(ya, s0, 2); \
     total_sums.s0 += ((bits4.s0 & 0x000F) * scale.s0 - minv.s0) * shared_y; \
     total_sums.s1 += ((bits4.s1 & 0x000F) * scale.s1 - minv.s1) * shared_y; \
-    shared_y = sub_group_broadcast(y.s1, 2); \
+    shared_y = fetch(ya, s1, 2); \
     total_sums.s0 += (((bits4.s0 & 0x00F0) >> 4) * scale.s0 - minv.s0) * shared_y; \
     total_sums.s1 += (((bits4.s1 & 0x00F0) >> 4) * scale.s1 - minv.s1) * shared_y; \
-    shared_y = sub_group_broadcast(y.s2, 2); \
+    shared_y = fetch(ya, s2, 2); \
     total_sums.s0 += (((bits4.s0 & 0x0F00) >> 8) * scale.s0 - minv.s0) * shared_y; \
     total_sums.s1 += (((bits4.s1 & 0x0F00) >> 8) * scale.s1 - minv.s1) * shared_y; \
-    shared_y = sub_group_broadcast(y.s3, 2); \
+    shared_y = fetch(ya, s3, 2); \
     total_sums.s0 += (((bits4.s0 & 0xF000) >> 12) * scale.s0 - minv.s0) * shared_y; \
     total_sums.s1 += (((bits4.s1 & 0xF000) >> 12) * scale.s1 - minv.s1) * shared_y; \
-    shared_y = sub_group_broadcast(y.s4, 2); \
+    shared_y = fetch(ya, s4, 2); \
     total_sums.s0 += ((bits4.s2 & 0x000F) * scale.s0 - minv.s0) * shared_y; \
     total_sums.s1 += ((bits4.s3 & 0x000F) * scale.s1 - minv.s1) * shared_y; \
-    shared_y = sub_group_broadcast(y.s5, 2); \
+    shared_y = fetch(ya, s5, 2); \
     total_sums.s0 += (((bits4.s2 & 0x00F0) >> 4) * scale.s0 - minv.s0) * shared_y; \
     total_sums.s1 += (((bits4.s3 & 0x00F0) >> 4) * scale.s1 - minv.s1) * shared_y; \
-    shared_y = sub_group_broadcast(y.s6, 2); \
+    shared_y = fetch(ya, s6, 2); \
     total_sums.s0 += (((bits4.s2 & 0x0F00) >> 8) * scale.s0 - minv.s0) * shared_y; \
     total_sums.s1 += (((bits4.s3 & 0x0F00) >> 8) * scale.s1 - minv.s1) * shared_y; \
-    shared_y = sub_group_broadcast(y.s7, 2); \
+    shared_y = fetch(ya, s7, 2); \
     total_sums.s0 += (((bits4.s2 & 0xF000) >> 12) * scale.s0 - minv.s0) * shared_y; \
     total_sums.s1 += (((bits4.s3 & 0xF000) >> 12) * scale.s1 - minv.s1) * shared_y; \
-    shared_y = sub_group_broadcast(y.s0, 3); \
+    shared_y = fetch(yb, s0, 3); \
     total_sums.s0 += ((bits4.s4 & 0x000F) * scale.s0 - minv.s0) * shared_y; \
     total_sums.s1 += ((bits4.s5 & 0x000F) * scale.s1 - minv.s1) * shared_y; \
-    shared_y = sub_group_broadcast(y.s1, 3); \
+    shared_y = fetch(yb, s1, 3); \
     total_sums.s0 += (((bits4.s4 & 0x00F0) >> 4) * scale.s0 - minv.s0) * shared_y; \
     total_sums.s1 += (((bits4.s5 & 0x00F0) >> 4) * scale.s1 - minv.s1) * shared_y; \
-    shared_y = sub_group_broadcast(y.s2, 3); \
+    shared_y = fetch(yb, s2, 3); \
     total_sums.s0 += (((bits4.s4 & 0x0F00) >> 8) * scale.s0 - minv.s0) * shared_y; \
     total_sums.s1 += (((bits4.s5 & 0x0F00) >> 8) * scale.s1 - minv.s1) * shared_y; \
-    shared_y = sub_group_broadcast(y.s3, 3); \
+    shared_y = fetch(yb, s3, 3); \
     total_sums.s0 += (((bits4.s4 & 0xF000) >> 12) * scale.s0 - minv.s0) * shared_y; \
     total_sums.s1 += (((bits4.s5 & 0xF000) >> 12) * scale.s1 - minv.s1) * shared_y; \
-    shared_y = sub_group_broadcast(y.s4, 3); \
+    shared_y = fetch(yb, s4, 3); \
     total_sums.s0 += ((bits4.s6 & 0x000F) * scale.s0 - minv.s0) * shared_y; \
     total_sums.s1 += ((bits4.s7 & 0x000F) * scale.s1 - minv.s1) * shared_y; \
-    shared_y = sub_group_broadcast(y.s5, 3); \
+    shared_y = fetch(yb, s5, 3); \
     total_sums.s0 += (((bits4.s6 & 0x00F0) >> 4) * scale.s0 - minv.s0) * shared_y; \
     total_sums.s1 += (((bits4.s7 & 0x00F0) >> 4) * scale.s1 - minv.s1) * shared_y; \
-    shared_y = sub_group_broadcast(y.s6, 3); \
+    shared_y = fetch(yb, s6, 3); \
     total_sums.s0 += (((bits4.s6 & 0x0F00) >> 8) * scale.s0 - minv.s0) * shared_y; \
     total_sums.s1 += (((bits4.s7 & 0x0F00) >> 8) * scale.s1 - minv.s1) * shared_y; \
-    shared_y = sub_group_broadcast(y.s7, 3); \
+    shared_y = fetch(yb, s7, 3); \
     total_sums.s0 += (((bits4.s6 & 0xF000) >> 12) * scale.s0 - minv.s0) * shared_y; \
     total_sums.s1 += (((bits4.s7 & 0xF000) >> 12) * scale.s1 - minv.s1) * shared_y; \
 
@@ -208,6 +217,7 @@ inline void get_scale_min_k4(
     total_sums.s1 += (((bits4.s7 & 0x0F00) >> 8)  * scale.s1 - minv.s1) * shared_y.s6; \
     total_sums.s1 += (((bits4.s7 & 0xF000) >> 12) * scale.s1 - minv.s1) * shared_y.s7; \
 
+#ifndef MC_N_COLS
 #ifdef ADRENO_GPU
 REQD_SUBGROUP_SIZE_64
 #endif
@@ -594,69 +604,76 @@ kernel void kernel_gemv_splitk_reduce_f32(
     dst = (global float*)((global char*)dst + offsetd);
     dst[r] = acc;
 }
+#endif // MC_N_COLS
 
+#ifdef MC_N_COLS
+// Multi-column kernel_gemv_noshuffle_q4_k_f32, built once per MC_N_COLS (2..8): weights load once per K-block and
+// each column runs the 1-column dequant-accumulate (bit-identical to it at the same work-group height).
+#define MC_MAX_NSG 16
+// From MC_STAGE_MIN_COLS columns on, the activations come from a local-memory slice instead of per-column broadcasts.
+#define MC_STAGE_MIN_COLS 4
+#define MC_BLOCK_PIXELS   8 // float4 activation pixels per 32-element block
+#define Q4K_MC_LOAD_WEIGHTS(kb, a_hi, a_lo) { \
+    const uint kq = (kb); \
+    a_hi.s0 = read_imageui(src0_q, (gid_s + kq * BLOCK_STRIDE_A + LINE_STRIDE_A * 0)).x; \
+    a_hi.s1 = read_imageui(src0_q, (gid_s + kq * BLOCK_STRIDE_A + LINE_STRIDE_A * 1)).x; \
+    a_hi.s2 = read_imageui(src0_q, (gid_s + kq * BLOCK_STRIDE_A + LINE_STRIDE_A * 2)).x; \
+    a_hi.s3 = read_imageui(src0_q, (gid_s + kq * BLOCK_STRIDE_A + LINE_STRIDE_A * 3)).x; \
+    a_lo.s0 = read_imageui(src0_q, (gid_s + kq * BLOCK_STRIDE_A + LINE_STRIDE_A * 4)).x; \
+    a_lo.s1 = read_imageui(src0_q, (gid_s + kq * BLOCK_STRIDE_A + LINE_STRIDE_A * 5)).x; \
+    a_lo.s2 = read_imageui(src0_q, (gid_s + kq * BLOCK_STRIDE_A + LINE_STRIDE_A * 6)).x; \
+    a_lo.s3 = read_imageui(src0_q, (gid_s + kq * BLOCK_STRIDE_A + LINE_STRIDE_A * 7)).x; }
 
-// --- Dequant-once macros for the mc3 verify GEMV (Q4K_MC3_DEQUANT_ONCE) ---
-// The inline dequantizeBlockAccum_* macros recompute the dequantized weight
-// ((code & mask)>>shift)*scale - minv ONCE PER COLUMN (3x), and the flat
-// 32-FMA unroll spills ~430 B of temporaries. These macros split the work:
-// DEQUANT_Q4K_BLOCK computes the 16 weights/row of one 32-block ONCE into a
-// half2[] (row0 in .s0, row1 in .s1) — stored as half, the exact type the
-// inline expression yields (int*half-half), so no extra rounding. MAC_Q4K_BLOCK
-// then accumulates them against a column's broadcast activation in the SAME
-// per-accumulator order as the inline macro. Each weight value and each
-// accumulator's add-chain is bit-for-bit identical => byte-identical output,
-// while the dequant ALU drops 3x->1x and the live set shrinks. Requires the
-// Qualcomm vector sub_group_broadcast (float8); enabled opt-in on Adreno.
-#define DEQ_Q4K_HALF2(b0, b1, msk, sh, scale, minv) \
-    (half2)( ((b0 & msk) >> sh) * scale.s0 - minv.s0, \
-             ((b1 & msk) >> sh) * scale.s1 - minv.s1 )
+#if MC_N_COLS < MC_STAGE_MIN_COLS
+#ifdef VECTOR_SUB_GROUP_BROADCAST
+#define Q4K_MC_DEQ_HI dequantizeBlockAccum_ns_sgbroadcast_8_hi
+#define Q4K_MC_DEQ_LO dequantizeBlockAccum_ns_sgbroadcast_8_lo
+#else
+#define Q4K_MC_DEQ_HI dequantizeBlockAccum_ns_sgbroadcast_1_hi
+#define Q4K_MC_DEQ_LO dequantizeBlockAccum_ns_sgbroadcast_1_lo
+#endif
 
-#define DEQUANT_Q4K_BLOCK(wq, bits, scale, minv) \
-    wq[0]  = DEQ_Q4K_HALF2(bits.s0, bits.s1, 0x000F, 0,  scale, minv); \
-    wq[1]  = DEQ_Q4K_HALF2(bits.s0, bits.s1, 0x00F0, 4,  scale, minv); \
-    wq[2]  = DEQ_Q4K_HALF2(bits.s0, bits.s1, 0x0F00, 8,  scale, minv); \
-    wq[3]  = DEQ_Q4K_HALF2(bits.s0, bits.s1, 0xF000, 12, scale, minv); \
-    wq[4]  = DEQ_Q4K_HALF2(bits.s2, bits.s3, 0x000F, 0,  scale, minv); \
-    wq[5]  = DEQ_Q4K_HALF2(bits.s2, bits.s3, 0x00F0, 4,  scale, minv); \
-    wq[6]  = DEQ_Q4K_HALF2(bits.s2, bits.s3, 0x0F00, 8,  scale, minv); \
-    wq[7]  = DEQ_Q4K_HALF2(bits.s2, bits.s3, 0xF000, 12, scale, minv); \
-    wq[8]  = DEQ_Q4K_HALF2(bits.s4, bits.s5, 0x000F, 0,  scale, minv); \
-    wq[9]  = DEQ_Q4K_HALF2(bits.s4, bits.s5, 0x00F0, 4,  scale, minv); \
-    wq[10] = DEQ_Q4K_HALF2(bits.s4, bits.s5, 0x0F00, 8,  scale, minv); \
-    wq[11] = DEQ_Q4K_HALF2(bits.s4, bits.s5, 0xF000, 12, scale, minv); \
-    wq[12] = DEQ_Q4K_HALF2(bits.s6, bits.s7, 0x000F, 0,  scale, minv); \
-    wq[13] = DEQ_Q4K_HALF2(bits.s6, bits.s7, 0x00F0, 4,  scale, minv); \
-    wq[14] = DEQ_Q4K_HALF2(bits.s6, bits.s7, 0x0F00, 8,  scale, minv); \
-    wq[15] = DEQ_Q4K_HALF2(bits.s6, bits.s7, 0xF000, 12, scale, minv);
+#define Q4K_MC_COL(ts, c) { \
+    if (slid < 4) { regB.s0123 = read_imagef(src1, (c) * COL_STRIDE +     slid * 2 + k * 8); \
+                    regB.s4567 = read_imagef(src1, (c) * COL_STRIDE + 1 + slid * 2 + k * 8); } \
+    Q4K_MC_DEQ_HI(ts, as_ushort8(regA_hi), regS, regM, regB); \
+    Q4K_MC_DEQ_LO(ts, as_ushort8(regA_lo), regS, regM, regB); }
+#else
+// Every lane reads the staged block itself, so the lane argument is not needed.
+#define ACT_LOCAL(v, e, lane) v.e
+// The fence keeps the compiler from hoisting every column's local loads, which spilled registers at n8 on A740.
+#define Q4K_MC_COL(ts, c) { \
+    mem_fence(CLK_LOCAL_MEM_FENCE); \
+    local const float4 * sp = mc_stage + (groupId * MC_N_COLS + (c)) * MC_BLOCK_PIXELS; \
+    const float8 y0 = (float8)(sp[0], sp[1]); \
+    const float8 y1 = (float8)(sp[2], sp[3]); \
+    const float8 y2 = (float8)(sp[4], sp[5]); \
+    const float8 y3 = (float8)(sp[6], sp[7]); \
+    dequantizeBlockAccum_ns_fetch_hi(ts, as_ushort8(regA_hi), regS, regM, ACT_LOCAL, y0, y1); \
+    dequantizeBlockAccum_ns_fetch_lo(ts, as_ushort8(regA_lo), regS, regM, ACT_LOCAL, y2, y3); }
+#endif
 
-// ln0/ln1 = the two source lanes whose activation float8 this block consumes
-// (0,1 for the hi block, 2,3 for the lo block — matching the inline _hi/_lo).
-#define MAC_Q4K_BLOCK(ts, wq, y, ln0, ln1) { \
-    float8 sy = sub_group_broadcast(y, ln0); \
-    ts.s0 += wq[0].s0*sy.s0; ts.s0 += wq[1].s0*sy.s1; ts.s0 += wq[2].s0*sy.s2; ts.s0 += wq[3].s0*sy.s3; \
-    ts.s0 += wq[4].s0*sy.s4; ts.s0 += wq[5].s0*sy.s5; ts.s0 += wq[6].s0*sy.s6; ts.s0 += wq[7].s0*sy.s7; \
-    ts.s1 += wq[0].s1*sy.s0; ts.s1 += wq[1].s1*sy.s1; ts.s1 += wq[2].s1*sy.s2; ts.s1 += wq[3].s1*sy.s3; \
-    ts.s1 += wq[4].s1*sy.s4; ts.s1 += wq[5].s1*sy.s5; ts.s1 += wq[6].s1*sy.s6; ts.s1 += wq[7].s1*sy.s7; \
-    sy = sub_group_broadcast(y, ln1); \
-    ts.s0 += wq[8].s0*sy.s0;  ts.s0 += wq[9].s0*sy.s1;  ts.s0 += wq[10].s0*sy.s2; ts.s0 += wq[11].s0*sy.s3; \
-    ts.s0 += wq[12].s0*sy.s4; ts.s0 += wq[13].s0*sy.s5; ts.s0 += wq[14].s0*sy.s6; ts.s0 += wq[15].s0*sy.s7; \
-    ts.s1 += wq[8].s1*sy.s0;  ts.s1 += wq[9].s1*sy.s1;  ts.s1 += wq[10].s1*sy.s2; ts.s1 += wq[11].s1*sy.s3; \
-    ts.s1 += wq[12].s1*sy.s4; ts.s1 += wq[13].s1*sy.s5; ts.s1 += wq[14].s1*sy.s6; ts.s1 += wq[15].s1*sy.s7; \
+// Sums the nsg subgroup partials of one column in subgroup order and stores its two rows.
+inline void reduce_store_col_q4k(float2 ts, uint col, local float2 * lm, uint sg, ushort slid, uint nsg,
+                                 uint gid, uint M, global float * dst) {
+    if (sg > 0) {
+        lm[SUBGROUP_SIZE * (sg - 1) + slid] = ts;
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+    if (sg == 0) {
+        for (uint i = 0; i < nsg - 1; ++i) {
+            ts += lm[SUBGROUP_SIZE * i + slid];
+        }
+        if (gid * 2 + 0 < M) dst[col * M + gid * 2 + 0] = ts.s0;
+        if (gid * 2 + 1 < M) dst[col * M + gid * 2 + 1] = ts.s1;
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
 }
 
-// Multi-column (N=3) variant of the q4_K decode GEMV, for the speculative /
-// MTP verify batch (ne1=3 = 2 drafts + 1 bonus). Stays on the efficient GEMV
-// path (subgroup-broadcast activation, NSUBGROUPS K-split) instead of the
-// transposed-GEMM dead-zone path. Each K-block's weights (regA_hi/regA_lo) are
-// loaded ONCE and reused across all 3 activation columns — same weight traffic
-// as one decode, ~3x the (cheap) dequant ALU. Per-column accumulation is
-// independent and identical to 3 standalone GEMVs => byte-identical, so it does
-// NOT perturb the lm_head logits / spec accept rate.
 #ifdef ADRENO_GPU
 REQD_SUBGROUP_SIZE_64
 #endif
-kernel void kernel_gemv_noshuffle_q4_k_f32_mc3(
+kernel void kernel_gemv_noshuffle_q4_k_f32_mc(
         read_only  image1d_buffer_t src0_q,
         global half2  * src0_d,
         global half2  * src0_m,
@@ -668,44 +685,49 @@ kernel void kernel_gemv_noshuffle_q4_k_f32_mc3(
         int ne01,
         uchar mask_d6,
         uchar mask_d4,
-        uchar mask_hi2)
+        uchar mask_hi2,
+        local float4 * mc_stage)  // nsg * MC_N_COLS staged blocks, sized by the host
 {
     uint groupId = get_local_id(1);
     uint gid     = get_global_id(0);
     ushort slid  = get_sub_group_local_id();
+    uint nsg     = get_local_size(1);
 
     uint K = ne00;
     uint M = ne01;
 
     uint LINE_STRIDE_A  = M / 2;
-    uint BLOCK_STRIDE_A = NSUBGROUPS * M;
-    uint COL_STRIDE     = K / 4;   // float4 pixels per activation column
+    uint BLOCK_STRIDE_A = 4 * M;
+    uint COL_STRIDE     = K / 4;
+    // Tail lanes (ne01 % 128 != 0) fetch a clamped row; the store guard drops their results.
+    uint gid_s = min(gid, LINE_STRIDE_A - 1);
 
     private uint4  regA_hi, regA_lo;
     private half2  regS, regM;
     private float8 regB;
 
-    private float2 ts0 = (float2)(0.0f);
-    private float2 ts1 = (float2)(0.0f);
-    private float2 ts2 = (float2)(0.0f);
+    float2 ts0 = 0.0f, ts1 = 0.0f, ts2 = 0.0f, ts3 = 0.0f;
+    float2 ts4 = 0.0f, ts5 = 0.0f, ts6 = 0.0f, ts7 = 0.0f;
 
-#ifdef Q4K_MC3_DEQUANT_LDS
-    // One 16-half2 block buffer per WI (reused hi->lo): forces the dequantized
-    // weights into LDS instead of private arrays (which spill to slow global on
-    // Adreno). 64*NSUBGROUPS WIs * 16 half2 = 16 KB; each WI owns its own slot
-    // range (flat*16) -> no cross-lane sharing, no barrier needed.
-    local half2 wstage[SUBGROUP_SIZE * NSUBGROUPS * 16];
-    local half2 * ws = wstage + (groupId * SUBGROUP_SIZE + slid) * 16;
+#if MC_N_COLS >= MC_STAGE_MIN_COLS
+    // The staged path loads the next block's weight words while this block's columns run, hiding their latency.
+    uint4 next_hi, next_lo;
+    Q4K_MC_LOAD_WEIGHTS(min(groupId, K / 32 - 1), next_hi, next_lo);
 #endif
 
-    for (uint k = groupId; k < (K / 32); k += NSUBGROUPS) {
+    for (uint k = groupId; k < (K / 32); k += nsg) {
+#if MC_N_COLS >= MC_STAGE_MIN_COLS
+        regA_hi = next_hi;
+        regA_lo = next_lo;
+        Q4K_MC_LOAD_WEIGHTS(min(k + nsg, K / 32 - 1), next_hi, next_lo);
+#endif
         uint sb = k / 8;
         uint j  = k % 8;
 
-        half2 d   = src0_d[gid + sb * LINE_STRIDE_A];
-        half2 dm  = src0_m[gid + sb * LINE_STRIDE_A];
+        half2 d   = src0_d[gid_s + sb * LINE_STRIDE_A];
+        half2 dm  = src0_m[gid_s + sb * LINE_STRIDE_A];
 
-        global const uchar * sc0 = src0_s + sb * 12 * M + 2 * gid;
+        global const uchar * sc0 = src0_s + sb * 12 * M + 2 * gid_s;
         global const uchar * sc1 = sc0 + 1;
 
         uchar sv0, mn0, sv1, mn1;
@@ -715,109 +737,39 @@ kernel void kernel_gemv_noshuffle_q4_k_f32_mc3(
         regS = convert_half2(convert_float2(d)  * convert_float2((uchar2)(sv0, sv1)));
         regM = convert_half2(convert_float2(dm) * convert_float2((uchar2)(mn0, mn1)));
 
-        // weights loaded ONCE, reused across the 3 columns
-        regA_hi.s0 = read_imageui(src0_q, (gid + k * BLOCK_STRIDE_A + LINE_STRIDE_A * 0)).x;
-        regA_hi.s1 = read_imageui(src0_q, (gid + k * BLOCK_STRIDE_A + LINE_STRIDE_A * 1)).x;
-        regA_hi.s2 = read_imageui(src0_q, (gid + k * BLOCK_STRIDE_A + LINE_STRIDE_A * 2)).x;
-        regA_hi.s3 = read_imageui(src0_q, (gid + k * BLOCK_STRIDE_A + LINE_STRIDE_A * 3)).x;
-        regA_lo.s0 = read_imageui(src0_q, (gid + k * BLOCK_STRIDE_A + LINE_STRIDE_A * 4)).x;
-        regA_lo.s1 = read_imageui(src0_q, (gid + k * BLOCK_STRIDE_A + LINE_STRIDE_A * 5)).x;
-        regA_lo.s2 = read_imageui(src0_q, (gid + k * BLOCK_STRIDE_A + LINE_STRIDE_A * 6)).x;
-        regA_lo.s3 = read_imageui(src0_q, (gid + k * BLOCK_STRIDE_A + LINE_STRIDE_A * 7)).x;
-
-#ifdef Q4K_MC3_DEQUANT_ONCE
-        // Dequant the 32 weights/row (16 hi + 16 lo) ONCE into half2[] (byte-
-        // identical to the inline intermediate), then MAC against each column's
-        // activation. Drops the dequant ALU 3x->1x and the macro-temp spill.
-        half2 wq_hi[16], wq_lo[16];
-        DEQUANT_Q4K_BLOCK(wq_hi, as_ushort8(regA_hi), regS, regM);
-        DEQUANT_Q4K_BLOCK(wq_lo, as_ushort8(regA_lo), regS, regM);
-        { if (slid < 4) { regB.s0123 = read_imagef(src1, 0*COL_STRIDE     + slid*2 + k*8);
-                          regB.s4567 = read_imagef(src1, 0*COL_STRIDE + 1 + slid*2 + k*8); }
-          MAC_Q4K_BLOCK(ts0, wq_hi, regB, 0, 1); MAC_Q4K_BLOCK(ts0, wq_lo, regB, 2, 3); }
-        { if (slid < 4) { regB.s0123 = read_imagef(src1, 1*COL_STRIDE     + slid*2 + k*8);
-                          regB.s4567 = read_imagef(src1, 1*COL_STRIDE + 1 + slid*2 + k*8); }
-          MAC_Q4K_BLOCK(ts1, wq_hi, regB, 0, 1); MAC_Q4K_BLOCK(ts1, wq_lo, regB, 2, 3); }
-        { if (slid < 4) { regB.s0123 = read_imagef(src1, 2*COL_STRIDE     + slid*2 + k*8);
-                          regB.s4567 = read_imagef(src1, 2*COL_STRIDE + 1 + slid*2 + k*8); }
-          MAC_Q4K_BLOCK(ts2, wq_hi, regB, 0, 1); MAC_Q4K_BLOCK(ts2, wq_lo, regB, 2, 3); }
-#elif defined(Q4K_MC3_DEQUANT_LDS)
-        // LDS-staged dequant: dequant a 32-block ONCE into the per-WI LDS slot
-        // (hi pass then lo pass, overwriting), MAC each column from LDS. ts*
-        // receive hi-then-lo in the same order as DEQUANT_ONCE -> byte-identical.
-        // Activations reloaded per pass (cheap, imaged); only one regB + 0 weight
-        // regs live -> the weight working set lives in LDS, not spilled private.
-        DEQUANT_Q4K_BLOCK(ws, as_ushort8(regA_hi), regS, regM);
-        { if (slid < 4) { regB.s0123 = read_imagef(src1, 0*COL_STRIDE     + slid*2 + k*8);
-                          regB.s4567 = read_imagef(src1, 0*COL_STRIDE + 1 + slid*2 + k*8); }
-          MAC_Q4K_BLOCK(ts0, ws, regB, 0, 1); }
-        { if (slid < 4) { regB.s0123 = read_imagef(src1, 1*COL_STRIDE     + slid*2 + k*8);
-                          regB.s4567 = read_imagef(src1, 1*COL_STRIDE + 1 + slid*2 + k*8); }
-          MAC_Q4K_BLOCK(ts1, ws, regB, 0, 1); }
-        { if (slid < 4) { regB.s0123 = read_imagef(src1, 2*COL_STRIDE     + slid*2 + k*8);
-                          regB.s4567 = read_imagef(src1, 2*COL_STRIDE + 1 + slid*2 + k*8); }
-          MAC_Q4K_BLOCK(ts2, ws, regB, 0, 1); }
-        DEQUANT_Q4K_BLOCK(ws, as_ushort8(regA_lo), regS, regM);
-        { if (slid < 4) { regB.s0123 = read_imagef(src1, 0*COL_STRIDE     + slid*2 + k*8);
-                          regB.s4567 = read_imagef(src1, 0*COL_STRIDE + 1 + slid*2 + k*8); }
-          MAC_Q4K_BLOCK(ts0, ws, regB, 2, 3); }
-        { if (slid < 4) { regB.s0123 = read_imagef(src1, 1*COL_STRIDE     + slid*2 + k*8);
-                          regB.s4567 = read_imagef(src1, 1*COL_STRIDE + 1 + slid*2 + k*8); }
-          MAC_Q4K_BLOCK(ts1, ws, regB, 2, 3); }
-        { if (slid < 4) { regB.s0123 = read_imagef(src1, 2*COL_STRIDE     + slid*2 + k*8);
-                          regB.s4567 = read_imagef(src1, 2*COL_STRIDE + 1 + slid*2 + k*8); }
-          MAC_Q4K_BLOCK(ts2, ws, regB, 2, 3); }
-#else
-        // Per-column: load only this column's activation (single regB live at a
-        // time -> 1/3 the activation register pressure vs holding all 3) then
-        // dequant against the shared weights. Cuts the private-mem spill.
-#ifdef VECTOR_SUB_GROUP_BROADCAST
-        { if (slid < 4) { regB.s0123 = read_imagef(src1, 0*COL_STRIDE     + slid*2 + k*8);
-                          regB.s4567 = read_imagef(src1, 0*COL_STRIDE + 1 + slid*2 + k*8); }
-          dequantizeBlockAccum_ns_sgbroadcast_8_hi(ts0, as_ushort8(regA_hi), regS, regM, regB);
-          dequantizeBlockAccum_ns_sgbroadcast_8_lo(ts0, as_ushort8(regA_lo), regS, regM, regB); }
-        { if (slid < 4) { regB.s0123 = read_imagef(src1, 1*COL_STRIDE     + slid*2 + k*8);
-                          regB.s4567 = read_imagef(src1, 1*COL_STRIDE + 1 + slid*2 + k*8); }
-          dequantizeBlockAccum_ns_sgbroadcast_8_hi(ts1, as_ushort8(regA_hi), regS, regM, regB);
-          dequantizeBlockAccum_ns_sgbroadcast_8_lo(ts1, as_ushort8(regA_lo), regS, regM, regB); }
-        { if (slid < 4) { regB.s0123 = read_imagef(src1, 2*COL_STRIDE     + slid*2 + k*8);
-                          regB.s4567 = read_imagef(src1, 2*COL_STRIDE + 1 + slid*2 + k*8); }
-          dequantizeBlockAccum_ns_sgbroadcast_8_hi(ts2, as_ushort8(regA_hi), regS, regM, regB);
-          dequantizeBlockAccum_ns_sgbroadcast_8_lo(ts2, as_ushort8(regA_lo), regS, regM, regB); }
-#else
-        { if (slid < 4) { regB.s0123 = read_imagef(src1, 0*COL_STRIDE     + slid*2 + k*8);
-                          regB.s4567 = read_imagef(src1, 0*COL_STRIDE + 1 + slid*2 + k*8); }
-          dequantizeBlockAccum_ns_sgbroadcast_1_hi(ts0, as_ushort8(regA_hi), regS, regM, regB);
-          dequantizeBlockAccum_ns_sgbroadcast_1_lo(ts0, as_ushort8(regA_lo), regS, regM, regB); }
-        { if (slid < 4) { regB.s0123 = read_imagef(src1, 1*COL_STRIDE     + slid*2 + k*8);
-                          regB.s4567 = read_imagef(src1, 1*COL_STRIDE + 1 + slid*2 + k*8); }
-          dequantizeBlockAccum_ns_sgbroadcast_1_hi(ts1, as_ushort8(regA_hi), regS, regM, regB);
-          dequantizeBlockAccum_ns_sgbroadcast_1_lo(ts1, as_ushort8(regA_lo), regS, regM, regB); }
-        { if (slid < 4) { regB.s0123 = read_imagef(src1, 2*COL_STRIDE     + slid*2 + k*8);
-                          regB.s4567 = read_imagef(src1, 2*COL_STRIDE + 1 + slid*2 + k*8); }
-          dequantizeBlockAccum_ns_sgbroadcast_1_hi(ts2, as_ushort8(regA_hi), regS, regM, regB);
-          dequantizeBlockAccum_ns_sgbroadcast_1_lo(ts2, as_ushort8(regA_lo), regS, regM, regB); }
+#if MC_N_COLS < MC_STAGE_MIN_COLS
+        Q4K_MC_LOAD_WEIGHTS(k, regA_hi, regA_lo);
 #endif
-#endif // Q4K_MC3_DEQUANT_ONCE
+
+#if MC_N_COLS >= MC_STAGE_MIN_COLS
+        // Stage this block's activations for every column in the subgroup's own slice. The first barrier keeps the
+        // previous block's reads ahead of the overwrite, the second makes the writes visible to every lane.
+        sub_group_barrier(CLK_LOCAL_MEM_FENCE);
+        if (slid < MC_N_COLS * MC_BLOCK_PIXELS) {
+            mc_stage[groupId * MC_N_COLS * MC_BLOCK_PIXELS + slid] = read_imagef(src1,
+                (slid / MC_BLOCK_PIXELS) * COL_STRIDE + k * MC_BLOCK_PIXELS + slid % MC_BLOCK_PIXELS);
+        }
+        sub_group_barrier(CLK_LOCAL_MEM_FENCE);
+#endif
+        Q4K_MC_COL(ts0, 0);
+        Q4K_MC_COL(ts1, 1);
+        if (MC_N_COLS > 2) Q4K_MC_COL(ts2, 2);
+        if (MC_N_COLS > 3) Q4K_MC_COL(ts3, 3);
+        if (MC_N_COLS > 4) Q4K_MC_COL(ts4, 4);
+        if (MC_N_COLS > 5) Q4K_MC_COL(ts5, 5);
+        if (MC_N_COLS > 6) Q4K_MC_COL(ts6, 6);
+        if (MC_N_COLS > 7) Q4K_MC_COL(ts7, 7);
     }
 
-    // cross-subgroup reduce: pack the 3 columns' float2 into a float8 (6 used).
-    local float8 reduceLM[SUBGROUP_SIZE * 3];
-    float8 acc = (float8)(ts0.s0, ts0.s1, ts1.s0, ts1.s1, ts2.s0, ts2.s1, 0.0f, 0.0f);
-    if (groupId == 1) { reduceLM[SUBGROUP_SIZE * 0 + slid] = acc; }
-    if (groupId == 2) { reduceLM[SUBGROUP_SIZE * 1 + slid] = acc; }
-    if (groupId == 3) { reduceLM[SUBGROUP_SIZE * 2 + slid] = acc; }
-
-    barrier(CLK_LOCAL_MEM_FENCE);
-
-    if (groupId == 0) {
-        acc += reduceLM[SUBGROUP_SIZE * 0 + slid];
-        acc += reduceLM[SUBGROUP_SIZE * 1 + slid];
-        acc += reduceLM[SUBGROUP_SIZE * 2 + slid];
-        dst = (global float*)((global char*)dst + offsetd);
-        // dst is column-major [M rows x 3 cols]: (row, col) at col*M + row
-        vstore2((float2)(acc.s0, acc.s1), 0, &(dst[0 * M + gid * 2]));
-        vstore2((float2)(acc.s2, acc.s3), 0, &(dst[1 * M + gid * 2]));
-        vstore2((float2)(acc.s4, acc.s5), 0, &(dst[2 * M + gid * 2]));
-    }
+    local float2 reduceLM[SUBGROUP_SIZE * (MC_MAX_NSG - 1)];
+    dst = (global float*)((global char*)dst + offsetd);
+    reduce_store_col_q4k(ts0, 0, reduceLM, groupId, slid, nsg, gid, M, dst);
+    reduce_store_col_q4k(ts1, 1, reduceLM, groupId, slid, nsg, gid, M, dst);
+    if (MC_N_COLS > 2) reduce_store_col_q4k(ts2, 2, reduceLM, groupId, slid, nsg, gid, M, dst);
+    if (MC_N_COLS > 3) reduce_store_col_q4k(ts3, 3, reduceLM, groupId, slid, nsg, gid, M, dst);
+    if (MC_N_COLS > 4) reduce_store_col_q4k(ts4, 4, reduceLM, groupId, slid, nsg, gid, M, dst);
+    if (MC_N_COLS > 5) reduce_store_col_q4k(ts5, 5, reduceLM, groupId, slid, nsg, gid, M, dst);
+    if (MC_N_COLS > 6) reduce_store_col_q4k(ts6, 6, reduceLM, groupId, slid, nsg, gid, M, dst);
+    if (MC_N_COLS > 7) reduce_store_col_q4k(ts7, 7, reduceLM, groupId, slid, nsg, gid, M, dst);
 }
+#endif // MC_N_COLS

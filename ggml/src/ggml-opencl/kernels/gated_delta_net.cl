@@ -87,10 +87,11 @@ kernel void kernel_gated_delta_net(
         global const char * beta_buf,  ulong off_beta,
         global const char * state_buf, ulong off_state,
         global       char * dst_buf,   ulong off_dst,
+        global       char * snap_buf,  ulong off_snap, // state snapshots: the dst tail or the recurrent cache
         uint  H_v,
         uint  n_tokens,
         uint  n_seqs,
-        uint  s_off,
+        uint  snap_slot_stride,                        // floats between snapshot slots
         uint  sq1, uint sq2, uint sq3,
         uint  sv1, uint sv2, uint sv3,
         uint  sb1, uint sb2, uint sb3,
@@ -106,6 +107,7 @@ kernel void kernel_gated_delta_net(
     global const float * data_beta  = (global const float *)(beta_buf  + off_beta);
     global const float * data_state = (global const float *)(state_buf + off_state);
     global       float * data_dst   = (global       float *)(dst_buf   + off_dst);
+    global       float * data_snap  = (global       float *)(snap_buf  + off_snap);
 
     const uint head_id     = get_group_id(0);
     const uint seq_id      = get_group_id(1);
@@ -129,7 +131,6 @@ kernel void kernel_gated_delta_net(
     const uint v_off_base  = seq_id * sv3 + head_id * sv1;
     const uint gb_off_base = seq_id * sb3 + head_id * sb1;
     const uint state_out_base      = (seq_id * H_v + head_id) * state_size;
-    const uint state_size_per_snap = state_size * H_v * n_seqs;
 
     __local float reduce_temp[WG_SIZE];
     __local float * temp_ptr = reduce_temp + sg_id * SUBGROUP_SIZE;
@@ -226,10 +227,10 @@ kernel void kernel_gated_delta_net(
                 #pragma unroll
                 for (uint cg = 0; cg < COLS_PER_LANE_GROUP; cg++) {
                     const uint col = sg_col_base + cg * LANE_GROUPS_PER_SG + lane_group;
-                    const uint slot_base = s_off + (uint)target_slot * state_size_per_snap + state_out_base;
+                    const uint slot_base = (uint)target_slot * snap_slot_stride + state_out_base;
                     #pragma unroll
                     for (uint r = 0; r < ROWS_PER_LANE; r++) {
-                        data_dst[slot_base + col * S_V + r * LANES_PER_COLUMN + lane] = s_shard[cg][r];
+                        data_snap[slot_base + col * S_V + r * LANES_PER_COLUMN + lane] = s_shard[cg][r];
                     }
                 }
             }
@@ -242,7 +243,7 @@ kernel void kernel_gated_delta_net(
             const uint col = sg_col_base + cg * LANE_GROUPS_PER_SG + lane_group;
             #pragma unroll
             for (uint r = 0; r < ROWS_PER_LANE; r++) {
-                data_dst[s_off + state_base + col * S_V + r * LANES_PER_COLUMN + lane] = s_shard[cg][r];
+                data_snap[state_base + col * S_V + r * LANES_PER_COLUMN + lane] = s_shard[cg][r];
             }
         }
     }
