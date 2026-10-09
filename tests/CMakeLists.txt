@@ -423,6 +423,12 @@ if (GGML_RPC)
     if (WIN32)
         target_link_libraries(test-rpc-transport PRIVATE bcrypt ws2_32)
     endif()
+    if (GGML_RPC_RDMA AND NOT APPLE AND NOT WIN32)
+        # build transport.cpp the way ggml-rpc does: RDMA on, libibverbs loaded at runtime
+        target_sources(test-rpc-transport PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src/ggml-rpc/ibv-drv.cpp)
+        target_compile_definitions(test-rpc-transport PRIVATE GGML_RPC_RDMA GGML_RPC_RDMA_DLOPEN)
+        target_link_libraries(test-rpc-transport PRIVATE ${CMAKE_DL_LIBS})
+    endif()
     llama_test(test-rpc-transport)
 
     add_executable(test-rpc-server-port test-rpc-server-port.cpp)

@@ -51,6 +51,10 @@ GGML_BACKEND_API void ggml_backend_rpc_server_free(ggml_backend_rpc_server_t ser
 // Port the server is listening on (always > 0), or -1 when server is NULL.
 GGML_BACKEND_API int ggml_backend_rpc_server_get_port(ggml_backend_rpc_server_t server);
 
+// True when new connections will try RDMA. They fall back to TCP when the peer
+// or the link cannot use it.
+GGML_BACKEND_API bool ggml_backend_rpc_rdma_supported(void);
+
 GGML_BACKEND_API ggml_backend_reg_t ggml_backend_rpc_reg(void);
 GGML_BACKEND_API ggml_backend_reg_t ggml_backend_rpc_add_server(const char * endpoint);
 

@@ -41,3 +41,6 @@ private:
 
 bool rpc_transport_init();
 void rpc_transport_shutdown();
+
+// True when new connections will try RDMA. They fall back to TCP when RDMA fails.
+bool rpc_transport_rdma_available();

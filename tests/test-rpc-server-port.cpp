@@ -71,9 +71,11 @@ int main() {
     auto server_run      = get_proc<decltype(&ggml_backend_rpc_server_run)>(reg, "ggml_backend_rpc_server_run");
     auto server_stop     = get_proc<decltype(&ggml_backend_rpc_server_stop)>(reg, "ggml_backend_rpc_server_stop");
     auto server_free     = get_proc<decltype(&ggml_backend_rpc_server_free)>(reg, "ggml_backend_rpc_server_free");
-    if (!server_create || !server_get_port || !server_run || !server_stop || !server_free) {
+    auto rdma_supported  = get_proc<decltype(&ggml_backend_rpc_rdma_supported)>(reg, "ggml_backend_rpc_rdma_supported");
+    if (!server_create || !server_get_port || !server_run || !server_stop || !server_free || !rdma_supported) {
         return 1;
     }
+    printf("RDMA supported: %s\n", rdma_supported() ? "yes" : "no");
 
     if (server_get_port(nullptr) != -1) {
         fprintf(stderr, "get_port(NULL) did not return -1\n");

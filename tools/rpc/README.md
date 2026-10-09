@@ -132,7 +132,7 @@ The RPC backend can use RDMA instead of TCP for lower latency and higher through
 
 Two providers are supported, each enabled by default when its library is found at build time:
 
-- **Linux**: RoCEv2-capable NICs (e.g. Mellanox ConnectX), via `libibverbs`.
+- **Linux**: RoCEv2-capable NICs (e.g. Mellanox ConnectX), via `libibverbs`. Shared builds load `libibverbs.so.1` at runtime, so a host without it still runs RPC over TCP and the server reports `RDMA unavailable` at startup. Static builds link it.
 - **macOS**: RDMA over Thunderbolt on Apple silicon Macs with Thunderbolt 5, via `librdma`. Requires macOS 26.2 or later, with RDMA enabled once from macOS Recovery via `rdma_ctl enable`. See [TN3205](https://developer.apple.com/documentation/technotes/tn3205-low-latency-communication-with-rdma-over-thunderbolt).
 
 RDMA is point-to-point, so each side uses the local device whose GID matches the address the connection was made on. Connect over the RDMA-capable link -- with Thunderbolt, use the peer's Thunderbolt address in `--rpc`; a connection made over another interface stays on TCP.

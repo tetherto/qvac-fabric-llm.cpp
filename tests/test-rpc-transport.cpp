@@ -1,6 +1,13 @@
 #include "transport.h"
 
+#include <cstdint>
 #include <cstdio>
+#include <cstdlib>
+#include <thread>
+
+#if defined(GGML_RPC_RDMA) && !defined(GGML_RPC_RDMA_APPLE)
+#    include <dlfcn.h>
+#endif
 
 #ifndef _WIN32
 #    include <arpa/inet.h>
@@ -251,9 +258,102 @@ static bool test_ephemeral_port() {
     return true;
 }
 
+// Same order as the HELLO handshake in ggml-rpc.cpp. Without RDMA both sides
+// advertise zero caps and keep using TCP.
+static bool test_caps_handshake() {
+    socket_ptr server = socket_t::create_server("127.0.0.1", 0);
+    if (server == nullptr) {
+        fprintf(stderr, "failed to create server socket\n");
+        return false;
+    }
+
+    bool        server_ok = false;
+    std::thread server_thread([&server, &server_ok] {
+        socket_ptr peer = server->accept(5000);
+        if (peer == nullptr) {
+            return;
+        }
+        uint8_t  client_caps[RPC_CONN_CAPS_SIZE] = {};
+        uint8_t  server_caps[RPC_CONN_CAPS_SIZE] = {};
+        uint32_t value                           = 0;
+        if (!peer->recv_data(client_caps, sizeof(client_caps))) {
+            return;
+        }
+        peer->get_caps(server_caps);
+        if (!peer->send_data(server_caps, sizeof(server_caps)) || !peer->flush()) {
+            return;
+        }
+        peer->update_caps(client_caps);
+        if (!peer->recv_data(&value, sizeof(value))) {
+            return;
+        }
+        value++;
+        server_ok = peer->send_data(&value, sizeof(value)) && peer->flush();
+    });
+
+    bool       client_ok = false;
+    socket_ptr client    = socket_t::connect("127.0.0.1", server->local_port(), 5000);
+    if (client != nullptr) {
+        uint8_t  client_caps[RPC_CONN_CAPS_SIZE] = {};
+        uint8_t  server_caps[RPC_CONN_CAPS_SIZE] = {};
+        uint32_t value                           = 41;
+        client->get_caps(client_caps);
+        if (client->send_data(client_caps, sizeof(client_caps)) && client->flush() &&
+            client->recv_data(server_caps, sizeof(server_caps))) {
+            client->update_caps(server_caps);
+            client_ok = client->send_data(&value, sizeof(value)) && client->flush() &&
+                        client->recv_data(&value, sizeof(value)) && value == 42;
+        }
+    }
+    // close the client so a server thread still waiting for data returns
+    client.reset();
+    server_thread.join();
+    if (!client_ok || !server_ok) {
+        fprintf(stderr, "caps handshake or data exchange failed\n");
+        return false;
+    }
+    return true;
+}
+
+static void set_no_rdma(bool disabled) {
+#ifdef _WIN32
+    _putenv_s("GGML_RPC_NO_RDMA", disabled ? "1" : "");
+#else
+    if (disabled) {
+        setenv("GGML_RPC_NO_RDMA", "1", 1);
+    } else {
+        unsetenv("GGML_RPC_NO_RDMA");
+    }
+#endif
+}
+
+static bool test_rdma_available() {
+#if defined(GGML_RPC_RDMA) && !defined(GGML_RPC_RDMA_APPLE)
+    // RDMA is tried only when libibverbs can be loaded
+    void *     lib      = dlopen("libibverbs.so.1", RTLD_NOW | RTLD_LOCAL);
+    const bool expected = lib != nullptr;
+    if (lib != nullptr) {
+        dlclose(lib);
+    }
+#else
+    const bool expected = false;
+#endif
+    set_no_rdma(false);
+    const bool available = rpc_transport_rdma_available();
+    set_no_rdma(true);
+    const bool disabled = rpc_transport_rdma_available();
+    set_no_rdma(false);
+    printf("RDMA available: %s (expected %s)\n", available ? "yes" : "no", expected ? "yes" : "no");
+    if (available != expected || disabled) {
+        fprintf(stderr, "rpc_transport_rdma_available() returned %d, %d with GGML_RPC_NO_RDMA\n", available, disabled);
+        return false;
+    }
+    return true;
+}
+
 // tests that also run on Windows, after rpc_transport_init()
 static bool test_portable() {
-    return test_ephemeral_port();
+    return test_ephemeral_port() && test_caps_handshake() && test_rdma_available();
 }
 
 int main() {
