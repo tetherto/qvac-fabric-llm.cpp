@@ -140,6 +140,10 @@ bool llama_memory_hybrid_iswa::get_can_shift() const {
     return mem_attn->get_can_shift();
 }
 
+bool llama_memory_hybrid_iswa::get_allow_stream_gaps() const {
+    return mem_attn->get_allow_stream_gaps();
+}
+
 void llama_memory_hybrid_iswa::clear(bool data) {
     mem_attn->clear(data);
     mem_recr->clear(data);
