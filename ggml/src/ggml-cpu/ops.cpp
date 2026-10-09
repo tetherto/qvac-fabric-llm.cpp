@@ -4386,6 +4386,149 @@ static void ggml_compute_forward_geglu_quick(
     }
 }
 
+// ggml_compute_forward_siglu
+
+static void ggml_compute_forward_siglu_f32(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
+    char * src0_d = (char *) src0->data;
+    char * src1_d = (char *) (src1 ? src1->data : src0->data);
+    const size_t src0_o = src0->nb[1];
+    const size_t src1_o = src1 ? src1->nb[1] : src0->nb[1];
+
+    GGML_ASSERT(ggml_is_contiguous_1(src0));
+    GGML_ASSERT(ggml_is_contiguous_1(dst));
+
+    if (src1) {
+        GGML_ASSERT(ggml_is_contiguous_1(src1));
+        GGML_ASSERT(src0->type == src1->type);
+    }
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    const int nc = src1 ? src0->ne[0] : src0->ne[0] / 2;
+    const int nr = ggml_nrows(src0);
+
+    GGML_ASSERT(dst->ne[0] == nc);
+    GGML_ASSERT(ggml_nrows(dst) == nr);
+
+    const int32_t swapped = ggml_get_op_params_i32(dst, 1);
+
+    // rows per thread
+    const int dr = (nr + nth - 1)/nth;
+
+    // row range for this thread
+    const int ir0 = dr*ith;
+    const int ir1 = MIN(ir0 + dr, nr);
+
+    for (int i1 = ir0; i1 < ir1; i1++) {
+        float * src0_p = (float *) (src0_d + i1*src0_o);
+        float * src1_p = (float *) (src1_d + i1*src1_o);
+
+        if (!src1) {
+            src0_p += swapped ? nc : 0;
+            src1_p += swapped ? 0 : nc;
+        }
+
+        ggml_vec_siglu_f32(nc, (float *) ((char *) dst->data + i1*(dst->nb[1])), src0_p, src1_p);
+
+#ifndef NDEBUG
+        for (int k = 0; k < nc; k++) {
+            const float x = ((float *) ((char *) dst->data + i1*( dst->nb[1])))[k];
+            GGML_UNUSED(x);
+            assert(!isnan(x));
+            assert(!isinf(x));
+        }
+#endif // NDEBUG
+    }
+}
+
+static void ggml_compute_forward_siglu_f16(
+    const ggml_compute_params * params,
+    ggml_tensor * dst) {
+
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
+    char * src0_d = (char *) src0->data;
+    char * src1_d = (char *) (src1 ? src1->data : src0->data);
+    const size_t src0_o = src0->nb[1];
+    const size_t src1_o = src1 ? src1->nb[1] : src0->nb[1];
+
+    GGML_ASSERT(ggml_is_contiguous_1(src0));
+    GGML_ASSERT(ggml_is_contiguous_1(dst));
+
+    if (src1) {
+        GGML_ASSERT(ggml_is_contiguous_1(src1));
+        GGML_ASSERT(src0->type == src1->type);
+    }
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    const int nc = src1 ? src0->ne[0] : src0->ne[0] / 2;
+    const int nr = ggml_nrows(src0);
+
+    GGML_ASSERT(dst->ne[0] == nc);
+    GGML_ASSERT(ggml_nrows(dst) == nr);
+
+    const int32_t swapped = ggml_get_op_params_i32(dst, 1);
+
+    // rows per thread
+    const int dr = (nr + nth - 1)/nth;
+
+    // row range for this thread
+    const int ir0 = dr*ith;
+    const int ir1 = MIN(ir0 + dr, nr);
+
+    for (int i1 = ir0; i1 < ir1; i1++) {
+        ggml_fp16_t * src0_p = (ggml_fp16_t *) (src0_d + i1*src0_o);
+        ggml_fp16_t * src1_p = (ggml_fp16_t *) (src1_d + i1*src1_o);
+
+        if (!src1) {
+            src0_p += swapped ? nc : 0;
+            src1_p += swapped ? 0 : nc;
+        }
+
+        ggml_vec_siglu_f16(nc, (ggml_fp16_t *) ((char *) dst->data + i1*(dst->nb[1])), src0_p, src1_p);
+
+#ifndef NDEBUG
+        for (int k = 0; k < nc; k++) {
+            const ggml_fp16_t x = ((ggml_fp16_t *) ((char *) dst->data + i1*( dst->nb[1])))[k];
+            const float v = GGML_FP16_TO_FP32(x);
+            GGML_UNUSED(v);
+            assert(!isnan(v));
+            assert(!isinf(v));
+        }
+#endif // NDEBUG
+    }
+}
+
+static void ggml_compute_forward_siglu(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+
+    const ggml_tensor * src0 = dst->src[0];
+
+    switch (src0->type) {
+        case GGML_TYPE_F32:
+            {
+                ggml_compute_forward_siglu_f32(params, dst);
+            } break;
+        case GGML_TYPE_F16:
+            {
+                ggml_compute_forward_siglu_f16(params, dst);
+            } break;
+        default:
+            {
+                GGML_ABORT("fatal error");
+            }
+    }
+}
+
 // ggml_compute_forward_norm
 
 static void ggml_compute_forward_norm_f32(
@@ -8978,6 +9121,647 @@ void ggml_compute_forward_pad_reflect_1d(
     }
 }
 
+// ggml_compute_forward_supertonic_depthwise_1d
+
+struct supertonic_dw_params {
+    int K;
+    int dilation;
+    int k_off;
+    int seg_len;
+    int ith;
+    int nth;
+};
+
+// Clamp a tap to its segment so padding repeats the edge sample.
+static inline int supertonic_dw_tap(int t, int k, const supertonic_dw_params * p,
+                                    int lo, int hi) {
+    const int s = t + (k + p->k_off) * p->dilation;
+    if (s < lo) return lo;
+    if (s >= hi) return hi - 1;
+    return s;
+}
+
+static inline void supertonic_dw_segment(int t, int seg_len, int L,
+                                         int * lo, int * hi) {
+    *lo = seg_len > 0 ? (t / seg_len) * seg_len : 0;
+    *hi = seg_len > 0 ? *lo + seg_len : L;
+}
+
+static void supertonic_dw_fill_bias(float * y, const float * b, int C) {
+    if (b) {
+        for (int c = 0; c < C; ++c) y[c] = b[c];
+    } else {
+        for (int c = 0; c < C; ++c) y[c] = 0.0f;
+    }
+}
+
+// [T, C]: each channel owns a contiguous run of timesteps, so stripe over
+// channels and keep the tap loop innermost.
+static void supertonic_depthwise_1d_tc(
+        const float * x, const float * w, const float * b, float * y,
+        int L, int C, const supertonic_dw_params * p) {
+    for (int c = p->ith; c < C; c += p->nth) {
+        const float bias_v = b ? b[c] : 0.0f;
+        const float * w_c = w + (size_t) c * p->K;
+        const float * xc = x + (size_t) c * L;
+        float       * yc = y + (size_t) c * L;
+        for (int t = 0; t < L; ++t) {
+            int lo, hi;
+            supertonic_dw_segment(t, p->seg_len, L, &lo, &hi);
+            float sum = bias_v;
+            for (int k = 0; k < p->K; ++k) {
+                sum += xc[supertonic_dw_tap(t, k, p, lo, hi)] * w_c[k];
+            }
+            yc[t] = sum;
+        }
+    }
+}
+
+// [C, T]: each timestep is a contiguous row of channels. Stripe over timesteps
+// and hoist the tap loop outside the channel loop, so every tap reads one
+// contiguous row instead of C-strided singles. Taps still accumulate in
+// ascending k, which keeps the result bit-identical to the [T, C] order.
+static void supertonic_depthwise_1d_ct(
+        const float * x, const float * w, const float * b, float * y,
+        int L, int C, const supertonic_dw_params * p) {
+    for (int t = p->ith; t < L; t += p->nth) {
+        int lo, hi;
+        supertonic_dw_segment(t, p->seg_len, L, &lo, &hi);
+        float * yt = y + (size_t) t * C;
+        supertonic_dw_fill_bias(yt, b, C);
+        for (int k = 0; k < p->K; ++k) {
+            const float * xs = x + (size_t) supertonic_dw_tap(t, k, p, lo, hi) * C;
+            for (int c = 0; c < C; ++c) {
+                yt[c] += xs[c] * w[(size_t) c * p->K + k];
+            }
+        }
+    }
+}
+
+void ggml_compute_forward_supertonic_depthwise_1d(
+        const ggml_compute_params * params,
+              ggml_tensor * dst) {
+
+    const ggml_tensor * x    = dst->src[0]; // [L, C, B, 1] or [C, L, B, 1]
+    const ggml_tensor * w    = dst->src[1]; // [K, 1, C, 1]
+    const ggml_tensor * bias = dst->src[2]; // [C] or NULL
+
+    GGML_ASSERT(x->type == GGML_TYPE_F32);
+    GGML_ASSERT(w->type == GGML_TYPE_F32);
+    GGML_ASSERT(bias == NULL || bias->type == GGML_TYPE_F32);
+    GGML_ASSERT(dst->type == GGML_TYPE_F32);
+
+    const int32_t * opts = (const int32_t *) dst->op_params;
+    const int K        = opts[0];
+    const int dilation = opts[1];
+    const int32_t layout = opts[2];
+    const int32_t causal = opts[3];
+    const int32_t seg_len = opts[4];
+    const int k_off = (causal != 0) ? -(K - 1) : -(K / 2);
+
+    const float * x_data = (const float *) x->data;
+    const float * w_data = (const float *) w->data;
+    const float * b_data = bias ? (const float *) bias->data : NULL;
+          float * y_data = (float *) dst->data;
+
+    const supertonic_dw_params dw = {
+        K, dilation, k_off, seg_len, params->ith, params->nth
+    };
+
+    const size_t batch_stride = (size_t) x->ne[0] * x->ne[1];
+    for (int64_t ib = 0; ib < x->ne[2]; ++ib) {
+        const size_t batch_offset = (size_t) ib * batch_stride;
+        if (layout == 0) {
+            supertonic_depthwise_1d_tc(x_data + batch_offset, w_data, b_data, y_data + batch_offset,
+                (int) x->ne[0], (int) x->ne[1], &dw);
+        } else {
+            supertonic_depthwise_1d_ct(x_data + batch_offset, w_data, b_data, y_data + batch_offset,
+                (int) x->ne[1], (int) x->ne[0], &dw);
+        }
+    }
+}
+
+// ggml_compute_forward_supertonic_layer_norm_channel
+
+void ggml_compute_forward_supertonic_layer_norm_channel(
+        const ggml_compute_params * params,
+              ggml_tensor * dst) {
+
+    const ggml_tensor * x = dst->src[0]; // [L, C, B, 1] or [C, L, B, 1]
+    const ggml_tensor * g = dst->src[1]; // [C]
+    const ggml_tensor * b = dst->src[2]; // [C]
+
+    GGML_ASSERT(x->type == GGML_TYPE_F32);
+    GGML_ASSERT(g->type == GGML_TYPE_F32);
+    GGML_ASSERT(b->type == GGML_TYPE_F32);
+    GGML_ASSERT(dst->type == GGML_TYPE_F32);
+
+    float eps;
+    memcpy(&eps, dst->op_params, sizeof(eps));
+    const int32_t layout = ((const int32_t *) dst->op_params)[1];
+
+    int L, C, sxt, sxc;
+    if (layout == 0) {
+        // [T, C]: T inner.
+        L = (int) x->ne[0];
+        C = (int) x->ne[1];
+        sxt = 1;  sxc = L;
+    } else {
+        // [C, T]: C inner.
+        C = (int) x->ne[0];
+        L = (int) x->ne[1];
+        sxt = C;  sxc = 1;
+    }
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    const float * x_data = (const float *) x->data;
+    const float * g_data = (const float *) g->data;
+    const float * b_data = (const float *) b->data;
+          float * y_data = (float *) dst->data;
+
+    // Layout-agnostic indexing via element strides. Each batch occupies one
+    // contiguous L*C plane and reuses the same affine channel parameters.
+    const size_t batch_stride = (size_t) L * C;
+    for (int64_t ib = 0; ib < x->ne[2]; ++ib) {
+        const size_t batch_offset = (size_t) ib * batch_stride;
+        for (int t = ith; t < L; t += nth) {
+            double mean = 0.0;
+            for (int c = 0; c < C; ++c) mean += x_data[batch_offset + (size_t) t * sxt + (size_t) c * sxc];
+            mean /= (double) C;
+            double var = 0.0;
+            for (int c = 0; c < C; ++c) {
+                const double d = (double) x_data[batch_offset + (size_t) t * sxt + (size_t) c * sxc] - mean;
+                var += d * d;
+            }
+            const float inv = 1.0f / sqrtf((float) (var / (double) C) + eps);
+            for (int c = 0; c < C; ++c) {
+                const size_t offset = batch_offset + (size_t) t * sxt + (size_t) c * sxc;
+                const float xv = x_data[offset];
+                y_data[offset] = (xv - (float) mean) * inv * g_data[c] + b_data[c];
+            }
+        }
+    }
+}
+
+// ggml_compute_forward_supertonic_pw2_residual
+
+// [T, C]: timesteps are contiguous, so stripe over channels and hoist the
+// per-channel bias and gamma out of the inner loop.
+static void supertonic_pw2_residual_tc(
+        const float * x, const float * b, const float * g, const float * r,
+        float * y, int L, int C, int ith, int nth) {
+    for (int c = ith; c < C; c += nth) {
+        const float bv = b[c];
+        const float gv = g[c];
+        const float * xc = x + (size_t) c * L;
+        const float * rc = r + (size_t) c * L;
+        float       * yc = y + (size_t) c * L;
+        for (int t = 0; t < L; ++t) {
+            yc[t] = rc[t] + (xc[t] + bv) * gv;
+        }
+    }
+}
+
+// [C, T]: channels are contiguous, so stripe over timesteps. All four streams
+// are then unit-stride; striping over channels would walk one float per line.
+static void supertonic_pw2_residual_ct(
+        const float * x, const float * b, const float * g, const float * r,
+        float * y, int L, int C, int ith, int nth) {
+    for (int t = ith; t < L; t += nth) {
+        const float * xt = x + (size_t) t * C;
+        const float * rt = r + (size_t) t * C;
+        float       * yt = y + (size_t) t * C;
+        for (int c = 0; c < C; ++c) {
+            yt[c] = rt[c] + (xt[c] + b[c]) * g[c];
+        }
+    }
+}
+
+// Transpose while fusing the pointwise epilogue: x is [T, C], residual/y are
+// [C, T]. Stripe over output timesteps for contiguous residual/output writes.
+static void supertonic_pw2_residual_tc_to_ct(
+        const float * x, const float * b, const float * g, const float * r,
+        float * y, int L, int C, int ith, int nth) {
+    for (int t = ith; t < L; t += nth) {
+        const float * rt = r + (size_t) t * C;
+        float       * yt = y + (size_t) t * C;
+        for (int c = 0; c < C; ++c) {
+            yt[c] = rt[c] + (x[(size_t) c * L + t] + b[c]) * g[c];
+        }
+    }
+}
+
+void ggml_compute_forward_supertonic_pw2_residual(
+        const ggml_compute_params * params,
+              ggml_tensor * dst) {
+
+    const ggml_tensor * x        = dst->src[0]; // [L, C, B, 1] or [C, L, B, 1]
+    const ggml_tensor * bias     = dst->src[1]; // [C]
+    const ggml_tensor * gamma    = dst->src[2]; // [C]
+    const ggml_tensor * residual = dst->src[3]; // same shape as dst
+
+    GGML_ASSERT(x->type == GGML_TYPE_F32);
+    GGML_ASSERT(bias->type == GGML_TYPE_F32);
+    GGML_ASSERT(gamma->type == GGML_TYPE_F32);
+    GGML_ASSERT(residual->type == GGML_TYPE_F32);
+    GGML_ASSERT(dst->type == GGML_TYPE_F32);
+
+    const int32_t layout = ((const int32_t *) dst->op_params)[0];
+
+    const float * x_data   = (const float *) x->data;
+    const float * b_data   = (const float *) bias->data;
+    const float * g_data   = (const float *) gamma->data;
+    const float * r_data   = (const float *) residual->data;
+          float * y_data   = (float *) dst->data;
+
+    const size_t batch_stride = (size_t) x->ne[0] * x->ne[1];
+    for (int64_t ib = 0; ib < x->ne[2]; ++ib) {
+        const size_t batch_offset = (size_t) ib * batch_stride;
+        if (layout == 0) {
+            supertonic_pw2_residual_tc(x_data + batch_offset, b_data, g_data, r_data + batch_offset, y_data + batch_offset,
+                (int) x->ne[0], (int) x->ne[1], params->ith, params->nth);
+        } else if (layout == 1) {
+            supertonic_pw2_residual_ct(x_data + batch_offset, b_data, g_data, r_data + batch_offset, y_data + batch_offset,
+                (int) x->ne[1], (int) x->ne[0], params->ith, params->nth);
+        } else {
+            GGML_ASSERT(layout == 2);
+            supertonic_pw2_residual_tc_to_ct(x_data + batch_offset, b_data, g_data, r_data + batch_offset, y_data + batch_offset,
+                (int) x->ne[0], (int) x->ne[1], params->ith, params->nth);
+        }
+    }
+}
+
+// ggml_compute_forward_supertonic_bias_gelu
+
+static const float kSupertonicInvSqrt2 = 0.7071067811865475f;
+
+static inline float supertonic_bias_gelu_one(float x, float b) {
+    const float v = x + b;
+    return 0.5f * v * (1.0f + erff(v * kSupertonicInvSqrt2));
+}
+
+// [T, C]: timesteps are contiguous, so stripe over channels.
+static void supertonic_bias_gelu_tc(
+        const float * x, const float * b, float * y,
+        int L, int C, int ith, int nth) {
+    for (int c = ith; c < C; c += nth) {
+        const float bv = b[c];
+        const float * xc = x + (size_t) c * L;
+        float       * yc = y + (size_t) c * L;
+        for (int t = 0; t < L; ++t) {
+            yc[t] = supertonic_bias_gelu_one(xc[t], bv);
+        }
+    }
+}
+
+// One contiguous row: y[i] = gelu_erf(x[i] + b[i]). The ISA order here mirrors
+// vec.h exactly, since those blocks are #elif and only one defines
+// ggml_v_gelu_erf. SVE has no vector form and falls through to the scalar tail.
+static void supertonic_bias_gelu_row(float * y, const float * x, const float * b, int n) {
+    int i = 0;
+#if defined(__ARM_FEATURE_SVE) && defined(__aarch64__)
+#elif defined(__ARM_NEON) && defined(__aarch64__)
+    for (; i + 3 < n; i += 4) {
+        vst1q_f32(y + i, ggml_v_gelu_erf(vaddq_f32(vld1q_f32(x + i), vld1q_f32(b + i))));
+    }
+#elif defined(__AVX512F__) && defined(__AVX512DQ__)
+    for (; i + 15 < n; i += 16) {
+        _mm512_storeu_ps(y + i, ggml_v_gelu_erf(
+            _mm512_add_ps(_mm512_loadu_ps(x + i), _mm512_loadu_ps(b + i))));
+    }
+#elif defined(__AVX2__) && defined(__FMA__)
+    for (; i + 7 < n; i += 8) {
+        _mm256_storeu_ps(y + i, ggml_v_gelu_erf(
+            _mm256_add_ps(_mm256_loadu_ps(x + i), _mm256_loadu_ps(b + i))));
+    }
+#elif defined(__SSE2__)
+    for (; i + 3 < n; i += 4) {
+        _mm_storeu_ps(y + i, ggml_v_gelu_erf(
+            _mm_add_ps(_mm_loadu_ps(x + i), _mm_loadu_ps(b + i))));
+    }
+#endif
+    for (; i < n; ++i) {
+        y[i] = supertonic_bias_gelu_one(x[i], b[i]);
+    }
+}
+
+// [C, T]: channels are contiguous, so stripe over timesteps and let each row be
+// a unit-stride pass over x, bias and y. Striping over channels here would make
+// the inner loop walk one float per cache line.
+static void supertonic_bias_gelu_ct(
+        const float * x, const float * b, float * y,
+        int L, int C, int ith, int nth) {
+    for (int t = ith; t < L; t += nth) {
+        supertonic_bias_gelu_row(y + (size_t) t * C, x + (size_t) t * C, b, C);
+    }
+}
+
+static void supertonic_bias_gelu_tc_to_ct(
+        const float * x, const float * b, float * y,
+        int L, int C, int ith, int nth) {
+    for (int t = ith; t < L; t += nth) {
+        float * yt = y + (size_t) t * C;
+        for (int c = 0; c < C; ++c) {
+            yt[c] = supertonic_bias_gelu_one(x[(size_t) c * L + t], b[c]);
+        }
+    }
+}
+
+void ggml_compute_forward_supertonic_bias_gelu(
+        const ggml_compute_params * params,
+              ggml_tensor * dst) {
+
+    const ggml_tensor * x    = dst->src[0]; // [L, C, B, 1] or [C, L, B, 1]
+    const ggml_tensor * bias = dst->src[1]; // [C]
+
+    GGML_ASSERT(x->type    == GGML_TYPE_F32);
+    GGML_ASSERT(bias->type == GGML_TYPE_F32);
+    GGML_ASSERT(dst->type  == GGML_TYPE_F32);
+
+    const int32_t layout = ((const int32_t *) dst->op_params)[0];
+
+    const float * x_data = (const float *) x->data;
+    const float * b_data = (const float *) bias->data;
+          float * y_data = (float *)       dst->data;
+
+    const size_t batch_stride = (size_t) x->ne[0] * x->ne[1];
+    for (int64_t ib = 0; ib < x->ne[2]; ++ib) {
+        const size_t batch_offset = (size_t) ib * batch_stride;
+        if (layout == 0) {
+            supertonic_bias_gelu_tc(x_data + batch_offset, b_data, y_data + batch_offset,
+                (int) x->ne[0], (int) x->ne[1], params->ith, params->nth);
+        } else if (layout == 1) {
+            supertonic_bias_gelu_ct(x_data + batch_offset, b_data, y_data + batch_offset,
+                (int) x->ne[1], (int) x->ne[0], params->ith, params->nth);
+        } else {
+            GGML_ASSERT(layout == 2);
+            supertonic_bias_gelu_tc_to_ct(x_data + batch_offset, b_data, y_data + batch_offset,
+                (int) x->ne[0], (int) x->ne[1], params->ith, params->nth);
+        }
+    }
+}
+
+// ggml_compute_forward_supertonic_edge_pad_1d
+
+void ggml_compute_forward_supertonic_edge_pad_1d(
+        const ggml_compute_params * params,
+              ggml_tensor * dst) {
+
+    const ggml_tensor * x = dst->src[0]; // [L_in, C, 1, 1] or [C, L_in, 1, 1]
+
+    GGML_ASSERT(x->type == GGML_TYPE_F32);
+    GGML_ASSERT(dst->type == GGML_TYPE_F32);
+
+    const int pad_left = ggml_get_op_params_i32(dst, 0);
+    const int32_t layout = ggml_get_op_params_i32(dst, 2);
+
+    int L_in, L_out, C, sxt, sxc, syt, syc;
+    if (layout == 0) {
+        L_in  = (int) x->ne[0];
+        C     = (int) x->ne[1];
+        L_out = (int) dst->ne[0];
+        sxt = 1;     sxc = L_in;   syt = 1;     syc = L_out;
+    } else {
+        C     = (int) x->ne[0];
+        L_in  = (int) x->ne[1];
+        L_out = (int) dst->ne[1];
+        sxt = C;     sxc = 1;      syt = C;     syc = 1;
+    }
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    const float * x_data = (const float *) x->data;
+          float * y_data = (float *)       dst->data;
+
+    // Stripe over channels.  For each output time t, read from
+    // clamp(t - pad_left, 0, L_in - 1); layout flag picks strides.
+    for (int c = ith; c < C; c += nth) {
+        for (int t = 0; t < L_out; ++t) {
+            int src_t = t - pad_left;
+            if (src_t < 0)       src_t = 0;
+            if (src_t >= L_in)   src_t = L_in - 1;
+            y_data[(size_t) t * syt + (size_t) c * syc] =
+                x_data[(size_t) src_t * sxt + (size_t) c * sxc];
+        }
+    }
+}
+
+// ggml_compute_forward_snake
+//
+// Snake activation y = x + sin^2(a*x) * inv_b, with per-channel a and inv_b.
+// x / dst are [T, C] (T = ne0, contiguous); a and inv_b hold one F32 value per
+// channel.  Parallelized over channels (threads own disjoint [c*T, (c+1)*T)
+// bands).  ACE-Step Oobleck VAE.  CPU bring-up: F32 only.
+void ggml_compute_forward_snake(
+        const ggml_compute_params * params,
+              ggml_tensor * dst) {
+
+    const ggml_tensor * x     = dst->src[0];
+    const ggml_tensor * a     = dst->src[1];
+    const ggml_tensor * inv_b = dst->src[2];
+
+    GGML_ASSERT(x->type == GGML_TYPE_F32);
+    GGML_ASSERT(dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(a->type == GGML_TYPE_F32 && inv_b->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(x));
+    GGML_ASSERT(ggml_is_contiguous(dst));
+
+    const int64_t T = x->ne[0];
+    const int64_t C = x->ne[1];
+
+    const float * xd = (const float *) x->data;
+    const float * ad = (const float *) a->data;
+    const float * bd = (const float *) inv_b->data;
+          float * yd = (float *)       dst->data;
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    // Split over channels: each thread owns disjoint time bands.
+    for (int64_t c = ith; c < C; c += nth) {
+        const float ac = ad[c];
+        const float bc = bd[c];
+        const float * xc = xd + c * T;
+              float * yc = yd + c * T;
+        for (int64_t t = 0; t < T; t++) {
+            const float xi = xc[t];
+            const float si = sinf(ac * xi);
+            yc[t] = xi + si * si * bc;
+        }
+    }
+}
+
+// ggml_compute_forward_lstm_cell
+
+// The two products feeding c_new must not contract into an FMA: the decomposed
+// mul/mul/add graph rounds each product, and the fused op has to match it exactly.
+#if defined(__GNUC__) && !defined(__clang__)
+#    pragma GCC push_options
+#    pragma GCC optimize("fp-contract=off")
+#elif defined(_MSC_VER)
+#    pragma fp_contract(off)
+#endif
+
+static float ggml_lstm_cell_sigmoid_f32(float x) {
+    return 1.f / (1.f + expf(-x));
+}
+
+// One [h_new | c_new] pair per index of the flattened H*N grid. A column whose
+// mask entry is zero copies its previous pair instead of computing a fresh one.
+static void ggml_lstm_cell_band_f32(
+        const float * gates, const float * prev, const int32_t * mask, float * dst,
+        int64_t H, int64_t prev_row, int64_t c_base, int64_t mask_stride,
+        int64_t first, int64_t last) {
+#if defined(__clang__)
+    #pragma clang fp contract(off)
+#endif
+    for (int64_t k = first; k < last; k++) {
+        const int64_t n = k / H;
+        const int64_t j = k - n*H;
+
+        const float * p   = prev + n*prev_row;
+        float       * out = dst  + n*GGML_LSTM_N_OUTS*H;
+
+        if (mask && mask[n*mask_stride] == 0) {
+            out[GGML_LSTM_OUT_H*H + j] = p[j];
+            out[GGML_LSTM_OUT_C*H + j] = p[c_base + j];
+            continue;
+        }
+
+        const float * g = gates + n*GGML_LSTM_N_GATES*H;
+
+        const float gi = ggml_lstm_cell_sigmoid_f32(g[GGML_LSTM_GATE_INPUT *H + j]);
+        const float gf = ggml_lstm_cell_sigmoid_f32(g[GGML_LSTM_GATE_FORGET*H + j]);
+        const float gg =                      tanhf(g[GGML_LSTM_GATE_CELL  *H + j]);
+        const float go = ggml_lstm_cell_sigmoid_f32(g[GGML_LSTM_GATE_OUTPUT*H + j]);
+
+        const float c_new = gf*p[c_base + j] + gi*gg;
+
+        out[GGML_LSTM_OUT_H*H + j] = go*tanhf(c_new);
+        out[GGML_LSTM_OUT_C*H + j] = c_new;
+    }
+}
+
+void ggml_compute_forward_lstm_cell(
+        const ggml_compute_params * params,
+              ggml_tensor * dst) {
+
+    const ggml_tensor * gates = dst->src[0];
+    const ggml_tensor * prev  = dst->src[1];
+    const ggml_tensor * mask  = dst->src[2];
+
+    GGML_ASSERT(gates->type == GGML_TYPE_F32);
+    GGML_ASSERT(prev->type  == GGML_TYPE_F32);
+    GGML_ASSERT(dst->type   == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(gates));
+    GGML_ASSERT(ggml_is_contiguous(prev));
+    GGML_ASSERT(ggml_is_contiguous(dst));
+
+    // Unmasked: prev is c_prev [H, N]. Masked: prev is hc_prev [2H, N] and c
+    // starts half a row in.
+    const int64_t H      = dst->ne[0]/GGML_LSTM_N_OUTS;
+    const int64_t c_base = mask ? H : 0;
+    const int64_t total  = H*prev->ne[1];
+
+    // Threads own disjoint bands of the flattened H*N grid.
+    const int64_t per   = (total + params->nth - 1) / params->nth;
+    const int64_t first = per*params->ith;
+    const int64_t last  = MIN(first + per, total);
+
+    ggml_lstm_cell_band_f32((const float *) gates->data, (const float *) prev->data,
+                            mask ? (const int32_t *) mask->data : NULL, (float *) dst->data,
+                            H, prev->ne[0], c_base,
+                            (mask && ggml_nelements(mask) > 1) ? 1 : 0, first, last);
+}
+
+#if defined(__GNUC__) && !defined(__clang__)
+#    pragma GCC pop_options
+#elif defined(_MSC_VER)
+#    pragma fp_contract(on)
+#endif
+
+// ggml_compute_forward_tdt_step
+
+// Reference greedy transducer step control. Every backend kernel mirrors this
+// line by line; see ggml_tdt_step in ggml.h for the semantics.
+static void ggml_tdt_step_i32(
+        int32_t tok, int32_t dur_idx,
+        const int32_t * state, const int32_t * dur_table, int64_t n_dur,
+        int32_t blank_id, int32_t max_symbols, int32_t rnnt,
+        int32_t * dst) {
+    const int32_t t = state[GGML_TDT_STEP_IN_T];
+    const int32_t s = state[GGML_TDT_STEP_IN_S];
+    const int32_t n = state[GGML_TDT_STEP_IN_N];
+
+    int32_t t_next = t;
+    int32_t s_next = s;
+    int32_t update = 0;
+
+    if (t < n) {
+        const int64_t di  = dur_idx < 0 ? 0 : (dur_idx < n_dur ? dur_idx : n_dur - 1);
+        const int32_t dur = rnnt ? 0 : dur_table[di];
+        const int32_t adv = rnnt ? 1 : (dur > 1 ? dur : 1);
+
+        if (tok == blank_id) {
+            t_next = t + adv;
+            s_next = 0;
+        } else {
+            update = 1;
+            s_next = s + 1;
+            if ((!rnnt && dur > 0) || s_next >= max_symbols) {
+                t_next = t + adv;
+                s_next = 0;
+            }
+        }
+    }
+
+    int32_t frame = t_next > n - 1 ? n - 1 : t_next;
+    if (frame < 0) {
+        frame = 0;
+    }
+
+    dst[GGML_TDT_STEP_OUT_T]      = t_next;
+    dst[GGML_TDT_STEP_OUT_S]      = s_next;
+    dst[GGML_TDT_STEP_OUT_N]      = n;
+    dst[GGML_TDT_STEP_OUT_UPDATE] = update;
+    dst[GGML_TDT_STEP_OUT_HOLD]   = 1 - update;
+    dst[GGML_TDT_STEP_OUT_FRAME]  = frame;
+    dst[GGML_TDT_STEP_OUT_TOKEN]  = tok;
+    dst[GGML_TDT_STEP_OUT_DUR]    = dur_idx;
+}
+
+void ggml_compute_forward_tdt_step(
+        const ggml_compute_params * params,
+              ggml_tensor * dst) {
+    if (params->ith != 0) {
+        return;
+    }
+
+    const ggml_tensor * token     = dst->src[0];
+    const ggml_tensor * dur_idx   = dst->src[1];
+    const ggml_tensor * state     = dst->src[2];
+    const ggml_tensor * dur_table = dst->src[3];
+
+    GGML_ASSERT(token->type     == GGML_TYPE_I32);
+    GGML_ASSERT(dur_idx->type   == GGML_TYPE_I32);
+    GGML_ASSERT(state->type     == GGML_TYPE_I32);
+    GGML_ASSERT(dur_table->type == GGML_TYPE_I32);
+    GGML_ASSERT(dst->type       == GGML_TYPE_I32);
+    GGML_ASSERT(ggml_nelements(dst) == GGML_TDT_STEP_N_OUTS);
+
+    int32_t op_params[3];
+    memcpy(op_params, dst->op_params, sizeof(op_params));
+
+    ggml_tdt_step_i32(*(const int32_t *) token->data, *(const int32_t *) dur_idx->data,
+                      (const int32_t *) state->data, (const int32_t *) dur_table->data,
+                      ggml_nelements(dur_table),
+                      op_params[0], op_params[1], op_params[2],
+                      (int32_t *) dst->data);
+}
+
 // ggml_compute_forward_roll
 
 static int64_t ggml_wrap_index(int64_t i, int64_t ne) {
@@ -8987,6 +9771,168 @@ static int64_t ggml_wrap_index(int64_t i, int64_t ne) {
         return i - ne;
     }
     return i;
+}
+
+// Fused batched GRU reference (CPU).  Parallel over batch b; serial over the L time-steps.
+//   whh [H,3H], gi_all [3H,B,L] (precomputed Wih*x+bih), bhh [3H] -> dst [H,B,L].
+void ggml_compute_forward_gru(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+
+    const ggml_tensor * whh    = dst->src[0];  // [H, 3H]
+    const ggml_tensor * gi_all = dst->src[1];  // [3H, B, L]
+    const ggml_tensor * bhh    = dst->src[2];  // [3H]
+
+    GGML_ASSERT(dst->type == GGML_TYPE_F32 && whh->type == GGML_TYPE_F32 &&
+                gi_all->type == GGML_TYPE_F32 && bhh->type == GGML_TYPE_F32);
+
+    const int64_t H  = whh->ne[0];
+    const int64_t H3 = gi_all->ne[0];   // 3H
+    const int64_t B  = gi_all->ne[1];
+    const int64_t L  = gi_all->ne[2];
+    const bool reverse = ggml_get_op_params_i32(dst, 0) != 0;
+
+    const float * whh_d = (const float *) whh->data;    // whh[k + H*g]  (column g = whh_d + H*g)
+    const float * gi_d  = (const float *) gi_all->data; // gi[g + H3*b + H3*B*t]
+    const float * bhh_d = (const float *) bhh->data;    // bhh[g]
+    float *       dst_d = (float *)       dst->data;    // dst[j + H*b + H*B*t]
+
+    std::vector<float> h((size_t) H), gh((size_t) H3);
+
+    const int64_t per = (B + params->nth - 1) / params->nth;
+    const int64_t b0  = (int64_t) params->ith * per;
+    const int64_t b1  = std::min(b0 + per, B);
+
+    for (int64_t b = b0; b < b1; ++b) {
+        for (int64_t j = 0; j < H; ++j) h[j] = 0.0f;   // zero initial state
+        for (int64_t s = 0; s < L; ++s) {
+            const int64_t t  = reverse ? (L - 1 - s) : s;
+            const float * gi = gi_d + (H3 * b + H3 * B * t);
+            for (int64_t g = 0; g < H3; ++g) {          // gh = whh*h + bhh
+                const float * wcol = whh_d + H * g;
+                float acc = 0.0f;
+                for (int64_t k = 0; k < H; ++k) acc += wcol[k] * h[k];
+                gh[g] = acc + bhh_d[g];
+            }
+            float * out = dst_d + (H * b + H * B * t);
+            for (int64_t j = 0; j < H; ++j) {
+                const float r  = 1.0f / (1.0f + expf(-(gi[j]          + gh[j])));
+                const float z  = 1.0f / (1.0f + expf(-(gi[H + j]      + gh[H + j])));
+                const float nc = tanhf(gi[2 * H + j] + r * gh[2 * H + j]);
+                const float hn = nc + z * (h[j] - nc);   // h_new = nc + z*(h - nc)
+                h[j]   = hn;
+                out[j] = hn;
+            }
+        }
+    }
+}
+
+void ggml_compute_forward_zero_upsample(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+
+    const ggml_tensor * src = dst->src[0];
+    GGML_ASSERT(dst->type == GGML_TYPE_F32 && src->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(src) && ggml_is_contiguous(dst));
+
+    const int64_t s  = ggml_get_op_params_i32(dst, 0);
+    const int64_t F  = src->ne[0];
+    const int64_t Fu = dst->ne[0];
+    const int64_t R  = src->ne[1] * src->ne[2] * src->ne[3];   // rows (ne1*ne2*ne3)
+
+    const float * src_data = (const float *) src->data;
+    float       * dst_data = (float *) dst->data;
+
+    // parallel over rows: zero each output row, then scatter the input at stride s.
+    const int64_t per_thread = (R + params->nth - 1) / params->nth;
+    const int64_t start = params->ith * per_thread;
+    const int64_t end   = MIN(start + per_thread, R);
+
+    for (int64_t r = start; r < end; ++r) {
+        const float * sp = src_data + r * F;
+        float       * dp = dst_data + r * Fu;
+        for (int64_t i = 0; i < Fu; ++i) dp[i] = 0.0f;
+        for (int64_t f = 0; f < F; ++f) dp[f * s] = sp[f];
+    }
+}
+
+void ggml_compute_forward_channel_shuffle(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+
+    const ggml_tensor * src = dst->src[0];
+    GGML_ASSERT(dst->type == GGML_TYPE_F32 && src->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(src) && ggml_is_contiguous(dst));
+
+    const int64_t G  = ggml_get_op_params_i32(dst, 0);
+    const int64_t FT = src->ne[0] * src->ne[1];
+    const int64_t C  = src->ne[2];
+    const int64_t Bc = src->ne[3];
+    const int64_t cg = C / G;
+
+    const float * src_data = (const float *) src->data;
+    float       * dst_data = (float *) dst->data;
+
+    // parallel over output planes (c' + C*b): copy the FT plane from the shuffled input channel.
+    const int64_t nplanes = C * Bc;
+    const int64_t per_thread = (nplanes + params->nth - 1) / params->nth;
+    const int64_t start = params->ith * per_thread;
+    const int64_t end   = MIN(start + per_thread, nplanes);
+
+    for (int64_t p = start; p < end; ++p) {
+        const int64_t cprime = p % C;
+        const int64_t b      = p / C;
+        const int64_t in_c   = (cprime % G) * cg + cprime / G;
+        const float * sp = src_data + (in_c + C * b) * FT;
+        float       * dp = dst_data + p * FT;
+        for (int64_t i = 0; i < FT; ++i) dp[i] = sp[i];
+    }
+}
+
+void ggml_compute_forward_affine_prelu(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+
+    const ggml_tensor * x     = dst->src[0];
+    const ggml_tensor * aw    = dst->src[1];
+    const ggml_tensor * ab    = dst->src[2];
+    const ggml_tensor * slope = dst->src[3];
+    GGML_ASSERT(dst->type == GGML_TYPE_F32 && x->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(x) && ggml_is_contiguous(dst));
+
+    const int64_t F  = x->ne[0];
+    const int64_t T  = x->ne[1];
+    const int64_t C  = x->ne[2];
+    const int64_t Bc = x->ne[3];
+
+    const float * xd  = (const float *) x->data;
+    const float * awd = (const float *) aw->data;
+    const float * abd = (const float *) ab->data;
+    const float * sld = (const float *) slope->data;
+    float       * dd  = (float *) dst->data;
+
+    // parallel over planes (c + C*b); per element: affine + per-channel prelu in scalar op order.
+    const int64_t nplanes = C * Bc;
+    const int64_t per_thread = (nplanes + params->nth - 1) / params->nth;
+    const int64_t start = params->ith * per_thread;
+    const int64_t end   = MIN(start + per_thread, nplanes);
+
+    for (int64_t p = start; p < end; ++p) {
+        const int64_t c   = p % C;
+        const float * awc = awd + c * F;
+        const float * abc = abd + c * F;
+        const float   sl  = sld[c];
+        const float * xp  = xd + p * F * T;
+        float       * dp  = dd + p * F * T;
+        for (int64_t i = 0; i < F * T; ++i) {
+            const float xv = xp[i];
+            const float r  = xv > 0.0f ? xv : 0.0f;
+            const float n  = xv - r;
+            const float pr = r + sl * n;
+            const float a  = xv * awc[i % F] + abc[i % F];
+            dp[i] = a + pr;
+        }
+    }
 }
 
 static void ggml_compute_forward_roll_f32(
@@ -10915,6 +11861,10 @@ void ggml_compute_forward_glu(
         case GGML_GLU_OP_SWIGLU_CLAMP:
             {
                 ggml_compute_forward_swiglu_clamp(params, dst);
+            } break;
+        case GGML_GLU_OP_SIGLU:
+            {
+                ggml_compute_forward_siglu(params, dst);
             } break;
         default:
             {
