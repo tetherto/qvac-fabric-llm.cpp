@@ -78,7 +78,7 @@ static void set_tensor_data(struct ggml_tensor * tensor, void * userdata) {
 }
 
 static void usage(char ** argv) {
-    printf("Usage: %s [-a/--arch arch] [-s/--seed seed] [-o/--out dir] [-v N] [-h/--help] [--mtp-shared|--mtp-shared-cpu|--hadamard-contracts|--qsa-unified-multiseq|--glm5-kpool-sequences|--glm5-multiseq|--glm5-multiseq-gpu|--glm5-tensor-oom|--glm5-reserve-covers-context|--glm5-reserve-scrambled-states|--glm5-invalid-metadata|--layer-inp-pos-min|--layer-split-cuda-graph]\n", argv[0]);
+    printf("Usage: %s [-a/--arch arch] [-s/--seed seed] [-o/--out dir] [-v N] [-h/--help] [--mtp-shared|--mtp-shared-cpu|--hadamard-contracts|--qsa-unified-multiseq|--glm5-kpool-sequences|--glm5-multiseq|--glm5-multiseq-gpu|--glm5-tensor-oom|--glm5-split-heads|--glm5-reserve-covers-context|--glm5-reserve-scrambled-states|--glm5-invalid-metadata|--layer-inp-pos-min|--layer-split-cuda-graph]\n", argv[0]);
 }
 
 static std::vector<llama_token> get_tokens(const uint32_t n_tokens, const uint32_t n_vocab, const size_t seed){
@@ -901,10 +901,7 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const in
                 std::string status_roundtrip = "\033[1;33mSKIP\033[0m";
                 char nmse_str[12] = {0};
 
-                // GLM5 query and indexer head counts are not divisible by three.
-                const bool unsupported_glm5_split =
-                    arch == LLM_ARCH_GLM5_NEXT && dc.split_mode == LLAMA_SPLIT_MODE_TENSOR && dc.devs.size() == 3;
-                bool skip = !arch_supported(arch) || (dc.split_mode == LLAMA_SPLIT_MODE_TENSOR && dc.devs.empty()) || unsupported_glm5_split;
+                bool skip = !arch_supported(arch) || (dc.split_mode == LLAMA_SPLIT_MODE_TENSOR && dc.devs.empty());
                 if (!skip) {
                     if (logits_cpu.empty()) {
                         model_and_ctx_cpu = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, {}, LLAMA_SPLIT_MODE_LAYER, encode);
@@ -1808,8 +1805,7 @@ static std::vector<glm5_multiseq_config> glm5_multiseq_configs(bool gpu) {
     if (!gpus.empty()) {
         configs.push_back({{gpus[0]}, LLAMA_SPLIT_MODE_LAYER, ggml_backend_dev_name(gpus[0])});
     }
-    // GLM5 query and indexer head counts are not divisible by three.
-    if (gpus.size() >= 2 && gpus.size() != 3) {
+    if (gpus.size() >= 2) {
         configs.push_back({gpus, LLAMA_SPLIT_MODE_TENSOR, "Meta"});
     }
     return configs;
@@ -1841,7 +1837,7 @@ static int test_glm5_tensor_oom() {
     const auto meta = std::find_if(configs.begin(), configs.end(),
             [](const glm5_multiseq_config & cfg) { return cfg.split_mode == LLAMA_SPLIT_MODE_TENSOR; });
     if (meta == configs.end()) {
-        printf("GLM5 tensor split OOM test skipped: needs 2 or 4+ GPUs\n");
+        printf("GLM5 tensor split OOM test skipped: needs 2+ GPUs\n");
         return 0;
     }
     size_t free_mem = 0;
@@ -1869,6 +1865,240 @@ static int test_glm5_tensor_oom() {
     }
     printf("GLM5 tensor split reports an oversized KV cache without aborting\n");
     return 0;
+}
+
+static constexpr size_t GLM5_SPLIT_HEADS_MAX_DEVICES = 8;
+static constexpr uint32_t GLM5_SPLIT_HEADS_N_TOKENS  = 128;
+static constexpr double GLM5_SPLIT_HEADS_MAX_NMSE    = 1e-4;
+// fractional shares whose float boundaries land on head edges, where rounding can differ between tensors
+static const std::vector<float> GLM5_SPLIT_HEADS_FRACTIONAL = {0.7f, 0.7f, 0.2f};
+
+static ggml_tensor * glm5_quantized_copy(const ggml_tensor * tensor, ggml_type type, std::vector<ggml_context_ptr> & contexts) {
+    GGML_ASSERT(tensor->type == GGML_TYPE_F32);
+    const size_t data_size = ggml_row_size(type, tensor->ne[0]) * ggml_nrows(tensor);
+    ggml_init_params params = { ggml_tensor_overhead() + data_size + GGML_MEM_ALIGN, nullptr, false };
+    ggml_context_ptr ctx(ggml_init(params));
+    GGML_ASSERT(ctx);
+    ggml_tensor * quantized = ggml_new_tensor(ctx.get(), type, GGML_MAX_DIMS, tensor->ne);
+    ggml_set_name(quantized, tensor->name);
+
+    std::vector<float> data(ggml_nelements(tensor));
+    ggml_backend_tensor_get(tensor, data.data(), 0, ggml_nbytes(tensor));
+    ggml_quantize_chunk(type, data.data(), quantized->data, 0, ggml_nrows(tensor), tensor->ne[0], nullptr);
+    contexts.push_back(std::move(ctx));
+    return quantized;
+}
+
+static void glm5_add_fixture_tensors(llama_model_saver & fixture, const gguf_context * source_ctx, const llama_model & source,
+        ggml_type attn_output_type, std::vector<ggml_context_ptr> & contexts) {
+    for (int64_t i = 0; i < gguf_get_n_tensors(source_ctx); ++i) {
+        const ggml_tensor * tensor = source.get_tensor(gguf_get_tensor_name(source_ctx, i));
+        GGML_ASSERT(tensor);
+        const bool quantize = attn_output_type != tensor->type && string_ends_with(tensor->name, ".attn_output.weight");
+        fixture.add_tensor(quantize ? glm5_quantized_copy(tensor, attn_output_type, contexts) : tensor);
+    }
+}
+
+// The GLM5 fixture saved with its attn_output weights in attn_output_type, whose block size sets the head granules.
+static FILE * glm5_save_fixture(ggml_type attn_output_type, size_t seed) {
+    auto metadata = get_gguf_ctx(LLM_ARCH_GLM5_NEXT, true);
+    auto source = get_model_and_ctx(metadata.get(), nullptr, seed, {});
+    llama_model_saver source_saver(source.first.get());
+    source_saver.add_kv_from_model();
+    source_saver.add_tensors_from_model();
+
+    gguf_context_ptr fixture_ctx(gguf_init_empty());
+    gguf_set_kv(fixture_ctx.get(), source_saver.gguf_ctx);
+    llama_model_saver fixture(LLM_ARCH_GLM5_NEXT, fixture_ctx.get());
+    std::vector<ggml_context_ptr> contexts;
+    glm5_add_fixture_tensors(fixture, source_saver.gguf_ctx, *source.first, attn_output_type, contexts);
+
+    FILE * file = tmpfile(); // Can be null on Windows without administrator privileges.
+    if (file != nullptr) {
+        fixture.save(file);
+        rewind(file);
+    }
+    return file;
+}
+
+static std::vector<const ggml_tensor *> glm5_layer_weights(const llama_model & model, uint32_t il) {
+    const std::string prefix = "blk." + std::to_string(il) + ".";
+    std::vector<const ggml_tensor *> tensors;
+    for (const auto & [name, tensor] : model.tensors_by_name) {
+        if (name.compare(0, prefix.size(), prefix) == 0 && name.find(".ffn_") == std::string::npos) {
+            tensors.push_back(tensor);
+        }
+    }
+    return tensors;
+}
+
+// Every non-FFN weight of each layer, plus the recurrent caches of the KDA layers: all of them are split by head.
+static std::vector<std::vector<const ggml_tensor *>> glm5_head_split_tensors(const llama_model & model, ggml_context * ctx_cache) {
+    std::vector<std::vector<const ggml_tensor *>> layers;
+    for (uint32_t il = 0; il < model.hparams.n_layer(); ++il) {
+        layers.push_back(glm5_layer_weights(model, il));
+        if (model.hparams.is_recr(il)) {
+            ggml_tensor * r = ggml_new_tensor_2d(ctx_cache, GGML_TYPE_F32, model.hparams.n_embd_r(), 1);
+            ggml_tensor * s = ggml_new_tensor_2d(ctx_cache, GGML_TYPE_F32, model.hparams.n_embd_s(), 1);
+            ggml_format_name(r, "cache_r_l%u", il);
+            ggml_format_name(s, "cache_s_l%u", il);
+            layers.back().push_back(r);
+            layers.back().push_back(s);
+        }
+    }
+    return layers;
+}
+
+static int64_t glm5_split_total(const std::vector<int64_t> & shares) {
+    int64_t total = 0;
+    for (const int64_t share : shares) {
+        total += share;
+    }
+    return total;
+}
+
+static bool glm5_split_proportions_equal(const std::vector<int64_t> & a, const std::vector<int64_t> & b) {
+    const int64_t total_a = glm5_split_total(a);
+    const int64_t total_b = glm5_split_total(b);
+    for (size_t j = 0; j < a.size(); ++j) {
+        if (a[j]*total_b != b[j]*total_a) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static std::string glm5_split_str(const std::vector<int64_t> & shares) {
+    std::string ret;
+    for (const int64_t share : shares) {
+        ret += (ret.empty() ? "" : "/") + std::to_string(share);
+    }
+    return ret;
+}
+
+// Each segment of a split tensor must give every device the same fraction of the layer's heads as the reference.
+static bool glm5_segments_match(const ggml_backend_meta_split_state & ss, size_t n_devices, const char * name,
+        std::vector<int64_t> & ref, std::string & ref_name, const std::string & label) {
+    for (uint32_t s = 0; s < ss.n_segments; ++s) {
+        const std::vector<int64_t> shares(ss.ne + s*n_devices, ss.ne + (s + 1)*n_devices);
+        if (ref.empty()) {
+            ref = shares;
+            ref_name = name;
+        } else if (!glm5_split_proportions_equal(ref, shares)) {
+            printf("FAIL: %s: %s splits %s, %s splits %s\n", label.c_str(),
+                    ref_name.c_str(), glm5_split_str(ref).c_str(), name, glm5_split_str(shares).c_str());
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool glm5_layer_heads_agree(const llama_model & model, const std::vector<const ggml_tensor *> & tensors, size_t n_devices,
+        const std::string & label) {
+    llama_meta_device_get_split_state_userdata ud = {n_devices, &model};
+    std::vector<int64_t> ref;
+    std::string ref_name;
+    for (const ggml_tensor * tensor : tensors) {
+        const ggml_backend_meta_split_state ss = llama_meta_device_get_split_state(tensor, &ud);
+        if (ss.axis < 0 || ss.axis >= GGML_MAX_DIMS) {
+            continue;
+        }
+        if (!glm5_segments_match(ss, n_devices, tensor->name, ref, ref_name, label)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool glm5_layers_heads_agree(const llama_model & model, const std::vector<std::vector<const ggml_tensor *>> & layers,
+        size_t n_devices, const std::string & label) {
+    bool ok = true;
+    for (size_t il = 0; il < layers.size(); ++il) {
+        const std::string layer_label = label + ", " + std::to_string(n_devices) + " devices, layer " + std::to_string(il);
+        ok = glm5_layer_heads_agree(model, layers[il], n_devices, layer_label) && ok;
+    }
+    return ok;
+}
+
+static llama_model_ptr glm5_load_cpu_model(FILE * file, const float * tensor_split) {
+    rewind(file);
+    ggml_backend_dev_t no_devices[] = {nullptr};
+    llama_model_params mparams = llama_model_default_params();
+    mparams.progress_callback = silent_model_load_progress;
+    mparams.devices = no_devices;
+    mparams.tensor_split = tensor_split;
+    llama_model_ptr model(llama_model_load_from_file_ptr(file, mparams));
+    GGML_ASSERT(model);
+    return model;
+}
+
+static bool glm5_heads_agree_on_device_counts(const llama_model & model, size_t n_devices_min, size_t n_devices_max,
+        const std::string & label) {
+    ggml_init_params params = { 2*model.hparams.n_layer()*ggml_tensor_overhead(), nullptr, true };
+    ggml_context_ptr ctx_cache(ggml_init(params));
+    const auto layers = glm5_head_split_tensors(model, ctx_cache.get());
+
+    bool ok = true;
+    for (size_t n_devices = n_devices_min; n_devices <= n_devices_max; ++n_devices) {
+        ok = glm5_layers_heads_agree(model, layers, n_devices, label) && ok;
+    }
+    return ok;
+}
+
+static bool glm5_split_heads_agree(FILE * file, const std::string & label) {
+    const llama_model_ptr even = glm5_load_cpu_model(file, nullptr);
+    bool ok = glm5_heads_agree_on_device_counts(*even, 2, GLM5_SPLIT_HEADS_MAX_DEVICES, label);
+    const llama_model_ptr fractional = glm5_load_cpu_model(file, GLM5_SPLIT_HEADS_FRACTIONAL.data());
+    const size_t n_fractional = GLM5_SPLIT_HEADS_FRACTIONAL.size();
+    ok = glm5_heads_agree_on_device_counts(*fractional, n_fractional, n_fractional, label + ", -ts 0.7,0.7,0.2") && ok;
+    return ok;
+}
+
+static bool glm5_tensor_split_matches_cpu(FILE * file, size_t seed, const std::string & label) {
+    const std::vector<ggml_backend_dev_t> gpus = get_gpu_devices();
+    if (gpus.size() < 2) {
+        printf("%s: tensor split logits skipped, needs 2+ GPUs\n", label.c_str());
+        return true;
+    }
+    rewind(file);
+    auto cpu = get_model_and_ctx(nullptr, file, seed, {});
+    rewind(file);
+    auto meta = get_model_and_ctx(nullptr, file, seed, gpus, LLAMA_SPLIT_MODE_TENSOR);
+    const auto tokens = get_tokens(GLM5_SPLIT_HEADS_N_TOKENS, llama_vocab_n_tokens(llama_model_get_vocab(cpu.first.get())), seed);
+    const double err = nmse(get_logits(cpu.first.get(), cpu.second.get(), tokens),
+            get_logits(meta.first.get(), meta.second.get(), tokens));
+    printf("%s: tensor split over %zu GPUs, nmse %.3e vs CPU\n", label.c_str(), gpus.size(), err);
+    if (!(err <= GLM5_SPLIT_HEADS_MAX_NMSE)) {
+        printf("FAIL: %s: tensor split logits differ from the CPU\n", label.c_str());
+        return false;
+    }
+    return true;
+}
+
+static bool glm5_split_heads_fixture(ggml_type attn_output_type, size_t seed) {
+    const std::string label = std::string("GLM5 with ") + ggml_type_name(attn_output_type) + " attn_output";
+    FILE * file = glm5_save_fixture(attn_output_type, seed);
+    if (file == nullptr) {
+        printf("%s: skipped, no temporary file\n", label.c_str());
+        return true;
+    }
+    bool ok = glm5_split_heads_agree(file, label);
+    ok = ok && glm5_tensor_split_matches_cpu(file, seed, label);
+    fclose(file);
+    return ok;
+}
+
+// Every tensor of a GLM5 layer must split on the same head boundaries, or an op that mixes them fails the meta ratio check.
+static int test_glm5_split_heads() {
+    const size_t seed = 1234;
+    bool ok = true;
+    for (ggml_type attn_output_type : {GGML_TYPE_F32, GGML_TYPE_Q4_K}) {
+        ok = glm5_split_heads_fixture(attn_output_type, seed) && ok;
+    }
+    if (ok) {
+        printf("GLM5 layer tensors split on the same head boundaries\n");
+    }
+    return ok ? 0 : 1;
 }
 
 static constexpr uint32_t GLM5_RESERVE_N_SEQ = 2;
@@ -2549,6 +2779,9 @@ int main(int argc, char ** argv) {
     }
     if (argc == 2 && strcmp(argv[1], "--glm5-tensor-oom") == 0) {
         return test_glm5_tensor_oom();
+    }
+    if (argc == 2 && strcmp(argv[1], "--glm5-split-heads") == 0) {
+        return test_glm5_split_heads();
     }
     if (argc == 2 && strcmp(argv[1], "--glm5-reserve-covers-context") == 0) {
         return test_glm5_reserve_covers_context();
