@@ -4966,7 +4966,7 @@ struct test_supertonic_mm_epilogue : public test_case {
         ggml_set_name(b, "b");
         ggml_tensor * mm = ggml_mul_mat(ctx, a, b);
         if (prec_f32) {
-            ggml_mul_mat_set_prec(mm, GGML_PREC_F32);
+            ggml_prec_set_acc(mm, GGML_PREC_F32);
         }
         ggml_tensor * bias = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, m);
         ggml_set_name(bias, "bias");
