@@ -78,7 +78,7 @@ static void set_tensor_data(struct ggml_tensor * tensor, void * userdata) {
 }
 
 static void usage(char ** argv) {
-    printf("Usage: %s [-a/--arch arch] [-s/--seed seed] [-o/--out dir] [-v N] [-h/--help] [--mtp-shared|--mtp-shared-cpu|--hadamard-contracts|--qsa-unified-multiseq|--glm5-kpool-sequences|--glm5-invalid-metadata|--layer-inp-pos-min]\n", argv[0]);
+    printf("Usage: %s [-a/--arch arch] [-s/--seed seed] [-o/--out dir] [-v N] [-h/--help] [--mtp-shared|--mtp-shared-cpu|--hadamard-contracts|--qsa-unified-multiseq|--glm5-kpool-sequences|--glm5-multiseq|--glm5-multiseq-gpu|--glm5-tensor-oom|--glm5-split-heads|--glm5-reserve-covers-context|--glm5-reserve-scrambled-states|--glm5-invalid-metadata|--layer-inp-pos-min|--layer-split-cuda-graph]\n", argv[0]);
 }
 
 static std::vector<llama_token> get_tokens(const uint32_t n_tokens, const uint32_t n_vocab, const size_t seed){
@@ -438,7 +438,8 @@ static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
         struct gguf_context * gguf_ctx, FILE * file, const size_t seed, const std::vector<ggml_backend_dev_t> & devs,
         const llama_split_mode split_mode = LLAMA_SPLIT_MODE_LAYER, bool encode = false,
         uint32_t n_seq_max = 1, bool kv_unified = false,
-        ggml_backend_sched_eval_callback cb_eval = nullptr, void * cb_eval_user_data = nullptr) {
+        ggml_backend_sched_eval_callback cb_eval = nullptr, void * cb_eval_user_data = nullptr,
+        void (*init_tensor)(struct ggml_tensor *, void *) = set_tensor_data) {
     GGML_ASSERT((gguf_ctx == nullptr) != (file == nullptr));
     llama_model_params model_params = llama_model_default_params();
     model_params.progress_callback = silent_model_load_progress;
@@ -461,7 +462,7 @@ static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
 
     size_t tmp = seed;
     llama_model_ptr model(gguf_ctx != nullptr ?
-        llama_model_init_from_user(gguf_ctx, set_tensor_data, &tmp, model_params) :
+        llama_model_init_from_user(gguf_ctx, init_tensor, &tmp, model_params) :
         llama_model_load_from_file_ptr(file, model_params));
     if (!model) {
         throw std::runtime_error("failed to create llama model");
@@ -900,10 +901,7 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const in
                 std::string status_roundtrip = "\033[1;33mSKIP\033[0m";
                 char nmse_str[12] = {0};
 
-                // GLM5 query and indexer head counts are not divisible by three.
-                const bool unsupported_glm5_split =
-                    arch == LLM_ARCH_GLM5_NEXT && dc.split_mode == LLAMA_SPLIT_MODE_TENSOR && dc.devs.size() == 3;
-                bool skip = !arch_supported(arch) || (dc.split_mode == LLAMA_SPLIT_MODE_TENSOR && dc.devs.empty()) || unsupported_glm5_split;
+                bool skip = !arch_supported(arch) || (dc.split_mode == LLAMA_SPLIT_MODE_TENSOR && dc.devs.empty());
                 if (!skip) {
                     if (logits_cpu.empty()) {
                         model_and_ctx_cpu = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, {}, LLAMA_SPLIT_MODE_LAYER, encode);
@@ -1661,6 +1659,911 @@ static int test_glm5_kpool_sequences() {
     return 0;
 }
 
+struct glm5_multiseq_config {
+    std::vector<ggml_backend_dev_t> devs;
+    llama_split_mode split_mode;
+    std::string label;
+};
+
+static constexpr uint32_t GLM5_MULTISEQ_N_SEQ   = 3;
+static constexpr uint32_t GLM5_MULTISEQ_N_STEPS = 4;
+static constexpr uint32_t GLM5_MULTISEQ_TOP_K   = 12; // three pools, so the prompts outgrow the selection
+static constexpr double   GLM5_MULTISEQ_MAX_NMSE = 1e-5;
+static const uint32_t     GLM5_MULTISEQ_PROMPT_LEN[GLM5_MULTISEQ_N_SEQ] = {24, 20, 28};
+
+// Decodes the prompts of seqs in one batch, then single-token steps for all of them together.
+// Returns the logits of every output, grouped per sequence.
+static std::map<llama_seq_id, std::vector<float>> glm5_multiseq_decode(
+        llama_context * ctx, const std::vector<std::vector<llama_token>> & prompts, const std::vector<llama_seq_id> & seqs) {
+    const uint32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx)));
+    llama_memory_clear(llama_get_memory(ctx), true);
+
+    std::map<llama_seq_id, std::vector<float>> logits;
+    auto decode = [&](const std::vector<std::pair<llama_seq_id, llama_pos>> & entries, bool prompt) {
+        llama_batch batch = llama_batch_init(entries.size(), 0, 1);
+        std::vector<std::pair<llama_seq_id, int32_t>> outputs;
+        for (size_t i = 0; i < entries.size(); ++i) {
+            const auto [s, pos] = entries[i];
+            const auto & toks = prompts[s];
+            const bool output = !prompt || (size_t) pos + 1 == toks.size();
+            common_batch_add(batch, toks[pos % toks.size()], pos, {s}, output);
+            if (output) {
+                outputs.emplace_back(s, (int32_t) i);
+            }
+        }
+        GGML_ASSERT(llama_decode(ctx, batch) == 0);
+        for (const auto & [s, i] : outputs) {
+            const float * row = llama_get_logits_ith(ctx, i);
+            logits[s].insert(logits[s].end(), row, row + n_vocab);
+        }
+        llama_batch_free(batch);
+    };
+
+    std::vector<std::pair<llama_seq_id, llama_pos>> entries;
+    for (const llama_seq_id s : seqs) {
+        for (llama_pos p = 0; p < (llama_pos) prompts[s].size(); ++p) {
+            entries.emplace_back(s, p);
+        }
+    }
+    decode(entries, true);
+
+    for (uint32_t step = 0; step < GLM5_MULTISEQ_N_STEPS; ++step) {
+        entries.clear();
+        for (const llama_seq_id s : seqs) {
+            entries.emplace_back(s, (llama_pos) (prompts[s].size() + step));
+        }
+        decode(entries, false);
+    }
+    return logits;
+}
+
+struct glm5_multiseq_probe {
+    int64_t max_scatter_streams = 0; // widest stream count seen on the dense DSA mask
+};
+
+static bool glm5_multiseq_observe(ggml_tensor * tensor, bool ask, void * data) {
+    if (ask && std::strncmp(tensor->name, "kq_mask_dsa-", 12) == 0) {
+        auto * probe = static_cast<glm5_multiseq_probe *>(data);
+        probe->max_scatter_streams = std::max(probe->max_scatter_streams, tensor->ne[3]);
+    }
+    return false;
+}
+
+// The default 1e-2 weights make attention uniform, hiding which query rows it reads.
+// Give the DSA attention and indexer unit norms and fan-in scaled projections instead.
+static void set_tensor_data_glm5_attn(struct ggml_tensor * tensor, void * userdata) {
+    const std::string name = tensor->name;
+    const bool attn = name.find(".attn_") != std::string::npos || name.find(".indexer") != std::string::npos;
+    if (!attn || tensor->type != GGML_TYPE_F32) {
+        set_tensor_data(tensor, userdata);
+        return;
+    }
+    const bool norm = string_ends_with(name, "norm.weight");
+    std::mt19937 gen(*(const size_t *) userdata ^ std::hash<std::string>()(name));
+    std::normal_distribution<float> dis(norm ? 1.0f : 0.0f, norm ? 0.1f : 1.0f/std::sqrt((float) tensor->ne[0]));
+    std::vector<float> tmp(ggml_nelements(tensor));
+    for (float & v : tmp) {
+        v = dis(gen);
+    }
+    ggml_backend_tensor_set(tensor, tmp.data(), 0, ggml_nbytes(tensor));
+}
+
+static bool glm5_multiseq_matches(const glm5_multiseq_config & cfg, bool unified) {
+    auto metadata = get_gguf_ctx(LLM_ARCH_GLM5_NEXT, true);
+    gguf_set_val_u32(metadata.get(), "glm5-next.attention.indexer.top_k", GLM5_MULTISEQ_TOP_K);
+    glm5_multiseq_probe probe;
+    auto loaded = get_model_and_ctx(metadata.get(), nullptr, 1234, cfg.devs, cfg.split_mode,
+            false, GLM5_MULTISEQ_N_SEQ, unified, glm5_multiseq_observe, &probe, set_tensor_data_glm5_attn);
+    llama_context * ctx = loaded.second.get();
+    const uint32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(loaded.first.get()));
+
+    std::vector<std::vector<llama_token>> prompts;
+    std::vector<llama_seq_id> all_seqs;
+    for (uint32_t s = 0; s < GLM5_MULTISEQ_N_SEQ; ++s) {
+        prompts.push_back(get_tokens(GLM5_MULTISEQ_PROMPT_LEN[s], n_vocab, 100 + s));
+        all_seqs.push_back((llama_seq_id) s);
+    }
+
+    const auto together = glm5_multiseq_decode(ctx, prompts, all_seqs);
+    const int64_t expected_streams = unified ? 1 : GLM5_MULTISEQ_N_SEQ;
+    bool ok = true;
+    if (probe.max_scatter_streams != expected_streams) {
+        printf("FAIL: GLM5 %s %s batch did not reach the dense DSA mask with %" PRId64 " streams (saw %" PRId64 ")\n",
+                cfg.label.c_str(), unified ? "unified" : "non-unified", expected_streams, probe.max_scatter_streams);
+        ok = false;
+    }
+    for (const llama_seq_id s : all_seqs) {
+        const auto alone = glm5_multiseq_decode(ctx, prompts, {s});
+        const double err = nmse(alone.at(s), together.at(s));
+        printf("GLM5 %s %s seq %d nmse %.3e\n", cfg.label.c_str(), unified ? "unified" : "non-unified", s, err);
+        if (!(err < GLM5_MULTISEQ_MAX_NMSE)) {
+            printf("FAIL: GLM5 %s %s seq %d differs when decoded with other sequences (nmse %.3e)\n",
+                    cfg.label.c_str(), unified ? "unified" : "non-unified", s, err);
+            ok = false;
+        }
+    }
+    return ok;
+}
+
+static std::vector<ggml_backend_dev_t> get_gpu_devices() {
+    std::vector<ggml_backend_dev_t> gpus;
+    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+        if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+            gpus.push_back(dev);
+        }
+    }
+    return gpus;
+}
+
+static std::vector<glm5_multiseq_config> glm5_multiseq_configs(bool gpu) {
+    if (!gpu) {
+        return {{{}, LLAMA_SPLIT_MODE_LAYER, "CPU"}};
+    }
+    const std::vector<ggml_backend_dev_t> gpus = get_gpu_devices();
+    std::vector<glm5_multiseq_config> configs;
+    if (!gpus.empty()) {
+        configs.push_back({{gpus[0]}, LLAMA_SPLIT_MODE_LAYER, ggml_backend_dev_name(gpus[0])});
+    }
+    if (gpus.size() >= 2) {
+        configs.push_back({gpus, LLAMA_SPLIT_MODE_TENSOR, "Meta"});
+    }
+    return configs;
+}
+
+static int test_glm5_multiseq(bool gpu) {
+    const auto configs = glm5_multiseq_configs(gpu);
+    if (configs.empty()) {
+        printf("GLM5 multi-sequence test skipped: no GPU\n");
+        return 0;
+    }
+    bool ok = true;
+    for (const auto & cfg : configs) {
+        for (bool unified : {true, false}) {
+            ok = glm5_multiseq_matches(cfg, unified) && ok;
+        }
+    }
+    if (ok) {
+        printf("GLM5 concurrent sequences match their solo decodes\n");
+    }
+    return ok ? 0 : 1;
+}
+
+// Mirrored f16 KV bytes per cell of the test model: 512 latent + 3*128 indexer values on its one DSA layer.
+static constexpr uint64_t GLM5_TENSOR_OOM_BYTES_PER_CELL = 2*(512 + 3*128);
+
+static int test_glm5_tensor_oom() {
+    const auto configs = glm5_multiseq_configs(true);
+    const auto meta = std::find_if(configs.begin(), configs.end(),
+            [](const glm5_multiseq_config & cfg) { return cfg.split_mode == LLAMA_SPLIT_MODE_TENSOR; });
+    if (meta == configs.end()) {
+        printf("GLM5 tensor split OOM test skipped: needs 2+ GPUs\n");
+        return 0;
+    }
+    size_t free_mem = 0;
+    size_t total_mem = 0;
+    ggml_backend_dev_memory(meta->devs[0], &free_mem, &total_mem);
+    const uint64_t n_ctx = std::min<uint64_t>(INT32_MAX, 2*total_mem/GLM5_TENSOR_OOM_BYTES_PER_CELL);
+
+    auto metadata = get_gguf_ctx(LLM_ARCH_GLM5_NEXT, true);
+    std::vector<ggml_backend_dev_t> devs = meta->devs;
+    devs.push_back(nullptr);
+    llama_model_params mparams = llama_model_default_params();
+    mparams.progress_callback = silent_model_load_progress;
+    mparams.devices = devs.data();
+    mparams.split_mode = LLAMA_SPLIT_MODE_TENSOR;
+    size_t seed = 1234;
+    llama_model_ptr model(llama_model_init_from_user(metadata.get(), set_tensor_data, &seed, mparams));
+    GGML_ASSERT(model);
+
+    llama_context_params cparams = llama_context_default_params();
+    cparams.n_ctx = (uint32_t) n_ctx;
+    llama_context_ptr ctx(llama_init_from_model(model.get(), cparams));
+    if (ctx) {
+        printf("FAIL: GLM5 tensor split created a context of %" PRIu64 " cells\n", n_ctx);
+        return 1;
+    }
+    printf("GLM5 tensor split reports an oversized KV cache without aborting\n");
+    return 0;
+}
+
+static constexpr size_t GLM5_SPLIT_HEADS_MAX_DEVICES = 8;
+static constexpr uint32_t GLM5_SPLIT_HEADS_N_TOKENS  = 128;
+static constexpr double GLM5_SPLIT_HEADS_MAX_NMSE    = 1e-4;
+// fractional shares whose float boundaries land on head edges, where rounding can differ between tensors
+static const std::vector<float> GLM5_SPLIT_HEADS_FRACTIONAL = {0.7f, 0.7f, 0.2f};
+
+static ggml_tensor * glm5_quantized_copy(const ggml_tensor * tensor, ggml_type type, std::vector<ggml_context_ptr> & contexts) {
+    GGML_ASSERT(tensor->type == GGML_TYPE_F32);
+    const size_t data_size = ggml_row_size(type, tensor->ne[0]) * ggml_nrows(tensor);
+    ggml_init_params params = { ggml_tensor_overhead() + data_size + GGML_MEM_ALIGN, nullptr, false };
+    ggml_context_ptr ctx(ggml_init(params));
+    GGML_ASSERT(ctx);
+    ggml_tensor * quantized = ggml_new_tensor(ctx.get(), type, GGML_MAX_DIMS, tensor->ne);
+    ggml_set_name(quantized, tensor->name);
+
+    std::vector<float> data(ggml_nelements(tensor));
+    ggml_backend_tensor_get(tensor, data.data(), 0, ggml_nbytes(tensor));
+    ggml_quantize_chunk(type, data.data(), quantized->data, 0, ggml_nrows(tensor), tensor->ne[0], nullptr);
+    contexts.push_back(std::move(ctx));
+    return quantized;
+}
+
+static void glm5_add_fixture_tensors(llama_model_saver & fixture, const gguf_context * source_ctx, const llama_model & source,
+        ggml_type attn_output_type, std::vector<ggml_context_ptr> & contexts) {
+    for (int64_t i = 0; i < gguf_get_n_tensors(source_ctx); ++i) {
+        const ggml_tensor * tensor = source.get_tensor(gguf_get_tensor_name(source_ctx, i));
+        GGML_ASSERT(tensor);
+        const bool quantize = attn_output_type != tensor->type && string_ends_with(tensor->name, ".attn_output.weight");
+        fixture.add_tensor(quantize ? glm5_quantized_copy(tensor, attn_output_type, contexts) : tensor);
+    }
+}
+
+// The GLM5 fixture saved with its attn_output weights in attn_output_type, whose block size sets the head granules.
+static FILE * glm5_save_fixture(ggml_type attn_output_type, size_t seed) {
+    auto metadata = get_gguf_ctx(LLM_ARCH_GLM5_NEXT, true);
+    auto source = get_model_and_ctx(metadata.get(), nullptr, seed, {});
+    llama_model_saver source_saver(source.first.get());
+    source_saver.add_kv_from_model();
+    source_saver.add_tensors_from_model();
+
+    gguf_context_ptr fixture_ctx(gguf_init_empty());
+    gguf_set_kv(fixture_ctx.get(), source_saver.gguf_ctx);
+    llama_model_saver fixture(LLM_ARCH_GLM5_NEXT, fixture_ctx.get());
+    std::vector<ggml_context_ptr> contexts;
+    glm5_add_fixture_tensors(fixture, source_saver.gguf_ctx, *source.first, attn_output_type, contexts);
+
+    FILE * file = tmpfile(); // Can be null on Windows without administrator privileges.
+    if (file != nullptr) {
+        fixture.save(file);
+        rewind(file);
+    }
+    return file;
+}
+
+static std::vector<const ggml_tensor *> glm5_layer_weights(const llama_model & model, uint32_t il) {
+    const std::string prefix = "blk." + std::to_string(il) + ".";
+    std::vector<const ggml_tensor *> tensors;
+    for (const auto & [name, tensor] : model.tensors_by_name) {
+        if (name.compare(0, prefix.size(), prefix) == 0 && name.find(".ffn_") == std::string::npos) {
+            tensors.push_back(tensor);
+        }
+    }
+    return tensors;
+}
+
+// Every non-FFN weight of each layer, plus the recurrent caches of the KDA layers: all of them are split by head.
+static std::vector<std::vector<const ggml_tensor *>> glm5_head_split_tensors(const llama_model & model, ggml_context * ctx_cache) {
+    std::vector<std::vector<const ggml_tensor *>> layers;
+    for (uint32_t il = 0; il < model.hparams.n_layer(); ++il) {
+        layers.push_back(glm5_layer_weights(model, il));
+        if (model.hparams.is_recr(il)) {
+            ggml_tensor * r = ggml_new_tensor_2d(ctx_cache, GGML_TYPE_F32, model.hparams.n_embd_r(), 1);
+            ggml_tensor * s = ggml_new_tensor_2d(ctx_cache, GGML_TYPE_F32, model.hparams.n_embd_s(), 1);
+            ggml_format_name(r, "cache_r_l%u", il);
+            ggml_format_name(s, "cache_s_l%u", il);
+            layers.back().push_back(r);
+            layers.back().push_back(s);
+        }
+    }
+    return layers;
+}
+
+static int64_t glm5_split_total(const std::vector<int64_t> & shares) {
+    int64_t total = 0;
+    for (const int64_t share : shares) {
+        total += share;
+    }
+    return total;
+}
+
+static bool glm5_split_proportions_equal(const std::vector<int64_t> & a, const std::vector<int64_t> & b) {
+    const int64_t total_a = glm5_split_total(a);
+    const int64_t total_b = glm5_split_total(b);
+    for (size_t j = 0; j < a.size(); ++j) {
+        if (a[j]*total_b != b[j]*total_a) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static std::string glm5_split_str(const std::vector<int64_t> & shares) {
+    std::string ret;
+    for (const int64_t share : shares) {
+        ret += (ret.empty() ? "" : "/") + std::to_string(share);
+    }
+    return ret;
+}
+
+// Each segment of a split tensor must give every device the same fraction of the layer's heads as the reference.
+static bool glm5_segments_match(const ggml_backend_meta_split_state & ss, size_t n_devices, const char * name,
+        std::vector<int64_t> & ref, std::string & ref_name, const std::string & label) {
+    for (uint32_t s = 0; s < ss.n_segments; ++s) {
+        const std::vector<int64_t> shares(ss.ne + s*n_devices, ss.ne + (s + 1)*n_devices);
+        if (ref.empty()) {
+            ref = shares;
+            ref_name = name;
+        } else if (!glm5_split_proportions_equal(ref, shares)) {
+            printf("FAIL: %s: %s splits %s, %s splits %s\n", label.c_str(),
+                    ref_name.c_str(), glm5_split_str(ref).c_str(), name, glm5_split_str(shares).c_str());
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool glm5_layer_heads_agree(const llama_model & model, const std::vector<const ggml_tensor *> & tensors, size_t n_devices,
+        const std::string & label) {
+    llama_meta_device_get_split_state_userdata ud = {n_devices, &model};
+    std::vector<int64_t> ref;
+    std::string ref_name;
+    for (const ggml_tensor * tensor : tensors) {
+        const ggml_backend_meta_split_state ss = llama_meta_device_get_split_state(tensor, &ud);
+        if (ss.axis < 0 || ss.axis >= GGML_MAX_DIMS) {
+            continue;
+        }
+        if (!glm5_segments_match(ss, n_devices, tensor->name, ref, ref_name, label)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool glm5_layers_heads_agree(const llama_model & model, const std::vector<std::vector<const ggml_tensor *>> & layers,
+        size_t n_devices, const std::string & label) {
+    bool ok = true;
+    for (size_t il = 0; il < layers.size(); ++il) {
+        const std::string layer_label = label + ", " + std::to_string(n_devices) + " devices, layer " + std::to_string(il);
+        ok = glm5_layer_heads_agree(model, layers[il], n_devices, layer_label) && ok;
+    }
+    return ok;
+}
+
+static llama_model_ptr glm5_load_cpu_model(FILE * file, const float * tensor_split) {
+    rewind(file);
+    ggml_backend_dev_t no_devices[] = {nullptr};
+    llama_model_params mparams = llama_model_default_params();
+    mparams.progress_callback = silent_model_load_progress;
+    mparams.devices = no_devices;
+    mparams.tensor_split = tensor_split;
+    llama_model_ptr model(llama_model_load_from_file_ptr(file, mparams));
+    GGML_ASSERT(model);
+    return model;
+}
+
+static bool glm5_heads_agree_on_device_counts(const llama_model & model, size_t n_devices_min, size_t n_devices_max,
+        const std::string & label) {
+    ggml_init_params params = { 2*model.hparams.n_layer()*ggml_tensor_overhead(), nullptr, true };
+    ggml_context_ptr ctx_cache(ggml_init(params));
+    const auto layers = glm5_head_split_tensors(model, ctx_cache.get());
+
+    bool ok = true;
+    for (size_t n_devices = n_devices_min; n_devices <= n_devices_max; ++n_devices) {
+        ok = glm5_layers_heads_agree(model, layers, n_devices, label) && ok;
+    }
+    return ok;
+}
+
+static bool glm5_split_heads_agree(FILE * file, const std::string & label) {
+    const llama_model_ptr even = glm5_load_cpu_model(file, nullptr);
+    bool ok = glm5_heads_agree_on_device_counts(*even, 2, GLM5_SPLIT_HEADS_MAX_DEVICES, label);
+    const llama_model_ptr fractional = glm5_load_cpu_model(file, GLM5_SPLIT_HEADS_FRACTIONAL.data());
+    const size_t n_fractional = GLM5_SPLIT_HEADS_FRACTIONAL.size();
+    ok = glm5_heads_agree_on_device_counts(*fractional, n_fractional, n_fractional, label + ", -ts 0.7,0.7,0.2") && ok;
+    return ok;
+}
+
+static bool glm5_tensor_split_matches_cpu(FILE * file, size_t seed, const std::string & label) {
+    const std::vector<ggml_backend_dev_t> gpus = get_gpu_devices();
+    if (gpus.size() < 2) {
+        printf("%s: tensor split logits skipped, needs 2+ GPUs\n", label.c_str());
+        return true;
+    }
+    rewind(file);
+    auto cpu = get_model_and_ctx(nullptr, file, seed, {});
+    rewind(file);
+    auto meta = get_model_and_ctx(nullptr, file, seed, gpus, LLAMA_SPLIT_MODE_TENSOR);
+    const auto tokens = get_tokens(GLM5_SPLIT_HEADS_N_TOKENS, llama_vocab_n_tokens(llama_model_get_vocab(cpu.first.get())), seed);
+    const double err = nmse(get_logits(cpu.first.get(), cpu.second.get(), tokens),
+            get_logits(meta.first.get(), meta.second.get(), tokens));
+    printf("%s: tensor split over %zu GPUs, nmse %.3e vs CPU\n", label.c_str(), gpus.size(), err);
+    if (!(err <= GLM5_SPLIT_HEADS_MAX_NMSE)) {
+        printf("FAIL: %s: tensor split logits differ from the CPU\n", label.c_str());
+        return false;
+    }
+    return true;
+}
+
+static bool glm5_split_heads_fixture(ggml_type attn_output_type, size_t seed) {
+    const std::string label = std::string("GLM5 with ") + ggml_type_name(attn_output_type) + " attn_output";
+    FILE * file = glm5_save_fixture(attn_output_type, seed);
+    if (file == nullptr) {
+        printf("%s: skipped, no temporary file\n", label.c_str());
+        return true;
+    }
+    bool ok = glm5_split_heads_agree(file, label);
+    ok = ok && glm5_tensor_split_matches_cpu(file, seed, label);
+    fclose(file);
+    return ok;
+}
+
+// Every tensor of a GLM5 layer must split on the same head boundaries, or an op that mixes them fails the meta ratio check.
+static int test_glm5_split_heads() {
+    const size_t seed = 1234;
+    bool ok = true;
+    for (ggml_type attn_output_type : {GGML_TYPE_F32, GGML_TYPE_Q4_K}) {
+        ok = glm5_split_heads_fixture(attn_output_type, seed) && ok;
+    }
+    if (ok) {
+        printf("GLM5 layer tensors split on the same head boundaries\n");
+    }
+    return ok ? 0 : 1;
+}
+
+static constexpr uint32_t GLM5_RESERVE_N_SEQ = 2;
+// Sequence 0 starts this fraction of the fill ahead, so the sequence groups differ in pool count.
+static constexpr uint32_t GLM5_RESERVE_LEAD_PARTS = 4;
+// Tokens per sequence of the last span, a gather ubatch with one group per sequence.
+static constexpr uint32_t GLM5_RESERVE_TAIL = 4;
+
+// Decodes n tokens of every prompt s from position p0[s] + off in one batch, so its ubatches hold several sequence groups.
+static void glm5_decode_from(llama_context * ctx, const std::vector<std::vector<llama_token>> & prompts,
+        const std::vector<uint32_t> & p0, uint32_t off, uint32_t n) {
+    llama_batch batch = llama_batch_init(prompts.size()*n, 0, 1);
+    for (size_t s = 0; s < prompts.size(); ++s) {
+        for (uint32_t pos = p0[s] + off; pos < p0[s] + off + n; ++pos) {
+            common_batch_add(batch, prompts[s][pos], pos, {(llama_seq_id) s}, pos + 1 == prompts[s].size());
+        }
+    }
+    GGML_ASSERT(llama_decode(ctx, batch) == 0);
+    llama_batch_free(batch);
+}
+
+// Decodes positions [p0, p1) of every prompt in one batch.
+static void glm5_decode_span(llama_context * ctx, const std::vector<std::vector<llama_token>> & prompts, uint32_t p0, uint32_t p1) {
+    glm5_decode_from(ctx, prompts, std::vector<uint32_t>(prompts.size(), p0), 0, p1 - p0);
+}
+
+// Decodes n tokens of every sequence s from position p0[s], span tokens per sequence and batch.
+static void glm5_decode_spans(llama_context * ctx, const std::vector<std::vector<llama_token>> & prompts,
+        const std::vector<uint32_t> & p0, uint32_t n, uint32_t span) {
+    for (uint32_t done = 0; done < n; done += span) {
+        glm5_decode_from(ctx, prompts, p0, done, std::min(span, n - done));
+    }
+}
+
+// Fills sequence 0 to its share of the cache and the others to a quarter less, then decodes one gather ubatch.
+static void glm5_fill_sequences(llama_context * ctx, uint32_t n_seq, uint32_t n_vocab) {
+    const uint32_t n_share = llama_n_ctx(ctx)/n_seq;
+    const uint32_t n_fill  = n_share - GLM5_RESERVE_TAIL;
+    const uint32_t n_lead  = n_fill/GLM5_RESERVE_LEAD_PARTS;
+    const uint32_t span    = llama_n_batch(ctx)/n_seq;
+    std::vector<std::vector<llama_token>> prompts;
+    for (uint32_t s = 0; s < n_seq; ++s) {
+        prompts.push_back(get_tokens(n_share, n_vocab, 200 + s));
+    }
+    glm5_decode_spans(ctx, {prompts[0]}, {0}, n_lead, span);
+
+    std::vector<uint32_t> p0(n_seq, 0);
+    p0[0] = n_lead;
+    glm5_decode_spans(ctx, prompts, p0, n_fill - n_lead, span);
+
+    std::vector<uint32_t> tail(n_seq, n_fill - n_lead);
+    tail[0] = n_fill;
+    glm5_decode_spans(ctx, prompts, tail, GLM5_RESERVE_TAIL, GLM5_RESERVE_TAIL);
+}
+
+// Fails when a graph decoded since n_planned_reserve needed a new allocation plan.
+static bool glm5_check_no_plans(llama_context * ctx, size_t n_planned_reserve, const std::string & label, const char * what) {
+    const size_t n_planned = ggml_backend_sched_get_n_planned(ctx->get_sched()) - n_planned_reserve;
+    if (n_planned != 0) {
+        printf("FAIL: GLM5 %s %s planned %zu new graphs\n", label.c_str(), what, n_planned);
+        return false;
+    }
+    printf("GLM5 %s %s without re-planning\n", label.c_str(), what);
+    return true;
+}
+
+static bool glm5_decode_after_reserve(const glm5_multiseq_config & cfg, bool unified) {
+    auto metadata = get_gguf_ctx(LLM_ARCH_GLM5_NEXT, true);
+    gguf_set_val_u32(metadata.get(), "glm5-next.attention.indexer.top_k", GLM5_MULTISEQ_TOP_K);
+    auto loaded = get_model_and_ctx(metadata.get(), nullptr, 1234, cfg.devs, cfg.split_mode,
+            false, GLM5_RESERVE_N_SEQ, unified);
+    llama_context * ctx = loaded.second.get();
+    const uint32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(loaded.first.get()));
+    const size_t n_planned = ggml_backend_sched_get_n_planned(ctx->get_sched());
+
+    // a single-token graph replaces the reserved plan, as the server warmup does
+    glm5_decode_span(ctx, {get_tokens(1, n_vocab, 199)}, 0, 1);
+    llama_memory_clear(llama_get_memory(ctx), true);
+    glm5_fill_sequences(ctx, GLM5_RESERVE_N_SEQ, n_vocab);
+    return glm5_check_no_plans(ctx, n_planned, cfg.label, unified ? "unified filled its context" : "non-unified filled its context");
+}
+
+// CUDA decodes GLM5 with sparse FA from this many cells per stream, so a reserve of full streams takes the gather path only on request.
+static constexpr uint32_t GLM5_SPARSE_FA_MIN_CELLS = 4096;
+// A stream count that does not divide the gather token count of the reserve.
+static constexpr uint32_t GLM5_LONG_STREAM_N_SEQ = 3;
+static constexpr uint32_t GLM5_LONG_STREAM_PROMPT = 16;
+static constexpr uint32_t GLM5_LONG_STREAM_STEPS  = 4;
+
+// Decodes one token for every sequence at position pos.
+static void glm5_decode_step(llama_context * ctx, uint32_t n_seq, llama_pos pos, uint32_t n_vocab) {
+    llama_batch batch = llama_batch_init(n_seq, 0, 1);
+    for (uint32_t s = 0; s < n_seq; ++s) {
+        common_batch_add(batch, get_tokens(1, n_vocab, 300 + pos*n_seq + s)[0], pos, {(llama_seq_id) s}, true);
+    }
+    GGML_ASSERT(llama_decode(ctx, batch) == 0);
+    llama_batch_free(batch);
+}
+
+// The reserve holds every stream of a non-unified cache, so its small ubatches must split into all of them.
+// Decode on the still short cache takes the gather path, which full streams reserve only on request.
+static bool glm5_reserve_long_streams(const glm5_multiseq_config & cfg) {
+    auto metadata = get_gguf_ctx(LLM_ARCH_GLM5_NEXT, true);
+    gguf_set_val_u32(metadata.get(), "glm5-next.attention.indexer.top_k", GLM5_MULTISEQ_TOP_K);
+    gguf_set_val_u32(metadata.get(), "glm5-next.context_length", GLM5_SPARSE_FA_MIN_CELLS*GLM5_LONG_STREAM_N_SEQ);
+    auto loaded = get_model_and_ctx(metadata.get(), nullptr, 1234, cfg.devs, cfg.split_mode,
+            false, GLM5_LONG_STREAM_N_SEQ, false);
+    llama_context * ctx = loaded.second.get();
+    const uint32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(loaded.first.get()));
+    const size_t n_planned = ggml_backend_sched_get_n_planned(ctx->get_sched());
+
+    std::vector<std::vector<llama_token>> prompts;
+    for (uint32_t s = 0; s < GLM5_LONG_STREAM_N_SEQ; ++s) {
+        prompts.push_back(get_tokens(GLM5_LONG_STREAM_PROMPT, n_vocab, 400 + s));
+    }
+    glm5_decode_span(ctx, prompts, 0, GLM5_LONG_STREAM_PROMPT);
+    for (uint32_t step = 0; step < GLM5_LONG_STREAM_STEPS; ++step) {
+        glm5_decode_step(ctx, GLM5_LONG_STREAM_N_SEQ, GLM5_LONG_STREAM_PROMPT + step, n_vocab);
+    }
+    return glm5_check_no_plans(ctx, n_planned, cfg.label, "non-unified with long streams decoded");
+}
+
+static constexpr uint32_t GLM5_SPLIT_N_SEQ      = 5;
+static constexpr uint32_t GLM5_SPLIT_CELLS     = 256;
+static constexpr uint32_t GLM5_SPLIT_PROMPT    = 3;
+static constexpr uint32_t GLM5_SPLIT_N_SEQ_GROW = 3;
+static constexpr uint32_t GLM5_SPLIT_GROW      = 5;
+
+// The gather reserve spans all 5 streams with 4 tokens each, but 3 sequences one token short of a pool
+// that take 5 tokens each complete 6 pools of 4, in a graph of the same size.
+static bool glm5_reserve_covers_uneven_split(const glm5_multiseq_config & cfg) {
+    auto metadata = get_gguf_ctx(LLM_ARCH_GLM5_NEXT, true);
+    gguf_set_val_u32(metadata.get(), "glm5-next.attention.indexer.top_k", GLM5_MULTISEQ_TOP_K);
+    gguf_set_val_u32(metadata.get(), "glm5-next.context_length", GLM5_SPLIT_CELLS*GLM5_SPLIT_N_SEQ);
+    auto loaded = get_model_and_ctx(metadata.get(), nullptr, 1234, cfg.devs, cfg.split_mode,
+            false, GLM5_SPLIT_N_SEQ, false);
+    llama_context * ctx = loaded.second.get();
+    const uint32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(loaded.first.get()));
+    const size_t n_planned = ggml_backend_sched_get_n_planned(ctx->get_sched());
+
+    std::vector<std::vector<llama_token>> prompts;
+    for (uint32_t s = 0; s < GLM5_SPLIT_N_SEQ; ++s) {
+        prompts.push_back(get_tokens(GLM5_SPLIT_PROMPT, n_vocab, 500 + s));
+    }
+    glm5_decode_span(ctx, prompts, 0, GLM5_SPLIT_PROMPT);
+
+    std::vector<std::vector<llama_token>> grown;
+    for (uint32_t s = 0; s < GLM5_SPLIT_N_SEQ_GROW; ++s) {
+        grown.push_back(get_tokens(GLM5_SPLIT_PROMPT + GLM5_SPLIT_GROW, n_vocab, 600 + s));
+    }
+    glm5_decode_span(ctx, grown, GLM5_SPLIT_PROMPT, GLM5_SPLIT_PROMPT + GLM5_SPLIT_GROW);
+    return glm5_check_no_plans(ctx, n_planned, cfg.label, "non-unified gather ubatch over fewer streams decoded");
+}
+
+static constexpr uint32_t GLM5_KPOOL_TOP_K       = 12;
+static constexpr double   GLM5_KPOOL_MAX_NMSE    = 1e-5;
+static constexpr uint32_t GLM5_SHARED_PREFIX     = 24; // six pools, shared by sequences 0 and 1
+static constexpr uint32_t GLM5_SHARED_OTHER      = 9;  // two pools and a tail, sequence 2 alone
+static constexpr uint32_t GLM5_SHARED_N_SEQ      = 3;
+static constexpr uint32_t GLM5_RESERVE_SIZE_CELLS = 16384;
+static constexpr uint32_t GLM5_RESERVE_SIZE_N_SEQ = 8;
+static constexpr double   GLM5_RESERVE_SIZE_MAX_RATIO = 1.5;
+static constexpr uint32_t GLM5_SKEW_N_SEQ        = 4;
+static constexpr uint32_t GLM5_SKEW_LONG         = 240; // 60 of the 64 pools of the default 256-cell cache
+static constexpr uint32_t GLM5_SKEW_SHORT        = 3;
+
+struct glm5_pool_probe {
+    int64_t n_new = -1; // pool slots of the last new-pool block of the first DSA layer
+};
+
+static bool glm5_pool_observe(ggml_tensor * tensor, bool ask, void * data) {
+    if (ask && std::strcmp(tensor->name, "indexer_pool_k_new-0") == 0) {
+        static_cast<glm5_pool_probe *>(data)->n_new = tensor->ne[1];
+    }
+    return false;
+}
+
+struct glm5_token {
+    llama_token token;
+    llama_pos pos;
+    std::vector<llama_seq_id> seq_ids;
+};
+
+// Decodes the tokens in one batch, every token an output, and returns the batch result.
+static int glm5_decode_tokens(llama_context * ctx, const std::vector<glm5_token> & tokens) {
+    llama_batch batch = llama_batch_init(tokens.size(), 0, GLM5_SHARED_N_SEQ);
+    for (const auto & t : tokens) {
+        common_batch_add(batch, t.token, t.pos, t.seq_ids, true);
+    }
+    const int rc = llama_decode(ctx, batch);
+    llama_batch_free(batch);
+    return rc;
+}
+
+// Decodes positions [p0, p0 + n) of sequence seq.
+static void glm5_decode_seq(llama_context * ctx, llama_seq_id seq, llama_pos p0, uint32_t n, uint32_t n_vocab) {
+    std::vector<glm5_token> tokens;
+    const auto ids = get_tokens(n, n_vocab, 700 + seq);
+    for (uint32_t i = 0; i < n; ++i) {
+        tokens.push_back({ids[i], p0 + (llama_pos) i, {seq}});
+    }
+    GGML_ASSERT(glm5_decode_tokens(ctx, tokens) == 0);
+}
+
+// Sequences 0 and 1 share a prefix and sequence 2 is independent.
+static void glm5_shared_history(llama_context * ctx, uint32_t n_vocab) {
+    llama_memory_clear(llama_get_memory(ctx), true);
+    glm5_decode_seq(ctx, 0, 0, GLM5_SHARED_PREFIX, n_vocab);
+    llama_memory_seq_cp(llama_get_memory(ctx), 0, 1, -1, -1);
+    glm5_decode_seq(ctx, 2, 0, GLM5_SHARED_OTHER, n_vocab);
+}
+
+// Decodes the next token of each sequence in seqs in one batch and returns the logits per sequence.
+static std::map<llama_seq_id, std::vector<float>> glm5_shared_step(llama_context * ctx, const std::vector<llama_seq_id> & seqs, uint32_t n_vocab) {
+    std::vector<glm5_token> tokens;
+    for (const llama_seq_id s : seqs) {
+        tokens.push_back({(llama_token) (800 + s) % (llama_token) n_vocab, (llama_pos) (s == 2 ? GLM5_SHARED_OTHER : GLM5_SHARED_PREFIX), {s}});
+    }
+    GGML_ASSERT(glm5_decode_tokens(ctx, tokens) == 0);
+    std::map<llama_seq_id, std::vector<float>> logits;
+    for (size_t i = 0; i < seqs.size(); ++i) {
+        const float * row = llama_get_logits_ith(ctx, (int32_t) i);
+        logits[seqs[i]].assign(row, row + n_vocab);
+    }
+    return logits;
+}
+
+// Compares the logits of every sequence of a joint step with a step of that sequence alone.
+static bool glm5_shared_step_matches_solo(llama_context * ctx, const std::map<llama_seq_id, std::vector<float>> & joint, uint32_t n_vocab) {
+    bool ok = true;
+    for (const auto & [s, logits] : joint) {
+        glm5_shared_history(ctx, n_vocab);
+        const double err = nmse(glm5_shared_step(ctx, {s}, n_vocab).at(s), logits);
+        if (!(err < GLM5_KPOOL_MAX_NMSE)) {
+            printf("FAIL: GLM5 shared-prefix step of seq %d differs from its solo step (nmse %.3e)\n", s, err);
+            ok = false;
+        }
+    }
+    return ok;
+}
+
+// An uncached ubatch pools only the real pools of its layouts, and a sequence that shares no cell stays cached.
+static bool glm5_uncached_pools_real_only() {
+    auto metadata = get_gguf_ctx(LLM_ARCH_GLM5_NEXT, true);
+    gguf_set_val_u32(metadata.get(), "glm5-next.attention.indexer.top_k", GLM5_KPOOL_TOP_K);
+    glm5_pool_probe probe;
+    auto loaded = get_model_and_ctx(metadata.get(), nullptr, 1234, {}, LLAMA_SPLIT_MODE_LAYER,
+            false, GLM5_SHARED_N_SEQ, true, glm5_pool_observe, &probe, set_tensor_data_glm5_attn);
+    llama_context * ctx = loaded.second.get();
+    const uint32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(loaded.first.get()));
+    bool ok = true;
+
+    // Sequence 2 completes no pool here, so the cached path pools one dummy slot.
+    glm5_shared_history(ctx, n_vocab);
+    glm5_shared_step(ctx, {2}, n_vocab);
+    if (probe.n_new != 1) {
+        printf("FAIL: GLM5 seq 2 next to a shared prefix pooled %" PRId64 " slots instead of the cached dummy slot\n", probe.n_new);
+        ok = false;
+    }
+
+    // 6 + 6 + 2 real pools fit one padded block of 64 slots.
+    glm5_shared_history(ctx, n_vocab);
+    const auto joint = glm5_shared_step(ctx, {0, 1, 2}, n_vocab);
+    if (probe.n_new != 64) {
+        printf("FAIL: GLM5 uncached step pooled %" PRId64 " slots instead of one block of 64\n", probe.n_new);
+        ok = false;
+    }
+    ok = glm5_shared_step_matches_solo(ctx, joint, n_vocab) && ok;
+    if (ok) {
+        printf("GLM5 uncached ubatch pools only its real pools\n");
+    }
+    return ok;
+}
+
+// Compute buffer bytes over all backends of the context.
+static size_t glm5_compute_buffer_size(llama_context * ctx) {
+    ggml_backend_sched_t sched = ctx->get_sched();
+    size_t size = 0;
+    for (int i = 0; i < ggml_backend_sched_get_n_backends(sched); ++i) {
+        size += ggml_backend_sched_get_buffer_size(sched, ggml_backend_sched_get_backend(sched, i));
+    }
+    return size;
+}
+
+static size_t glm5_unified_reserve_bytes(uint32_t n_seq) {
+    auto metadata = get_gguf_ctx(LLM_ARCH_GLM5_NEXT, true);
+    gguf_set_val_u32(metadata.get(), "glm5-next.attention.indexer.top_k", GLM5_KPOOL_TOP_K);
+    gguf_set_val_u32(metadata.get(), "glm5-next.context_length", GLM5_RESERVE_SIZE_CELLS);
+    auto loaded = get_model_and_ctx(metadata.get(), nullptr, 1234, {}, LLAMA_SPLIT_MODE_LAYER, false, n_seq, true);
+    return glm5_compute_buffer_size(loaded.second.get());
+}
+
+// All sequences of a unified cache hold at most the pools of one stream, so the reserve must not scale with them.
+static bool glm5_unified_reserve_size() {
+    const size_t size_1 = glm5_unified_reserve_bytes(1);
+    const size_t size_n = glm5_unified_reserve_bytes(GLM5_RESERVE_SIZE_N_SEQ);
+    const double ratio  = (double) size_n/size_1;
+    printf("GLM5 unified compute buffer: %zu bytes for 1 sequence, %zu for %u (ratio %.2f)\n", size_1, size_n, GLM5_RESERVE_SIZE_N_SEQ, ratio);
+    if (!(ratio <= GLM5_RESERVE_SIZE_MAX_RATIO)) {
+        printf("FAIL: GLM5 unified reserve grows with the sequence count\n");
+        return false;
+    }
+    return true;
+}
+
+// Positions [p0, p0 + n) of every short sequence, from s0 to the last skew sequence.
+static std::vector<glm5_token> glm5_skew_tokens(llama_seq_id s0, llama_pos p0, uint32_t n, uint32_t n_vocab) {
+    std::vector<glm5_token> tokens;
+    for (llama_seq_id s = s0; s < (llama_seq_id) GLM5_SKEW_N_SEQ; ++s) {
+        for (uint32_t i = 0; i < n; ++i) {
+            tokens.push_back({(llama_token) (s + i) % (llama_token) n_vocab, p0 + (llama_pos) i, {s}});
+        }
+    }
+    return tokens;
+}
+
+// Short sequences next to a long one need more padded per-sequence pools than the reserve holds,
+// so the ubatch scores as one group and fits the reserved plan.
+static bool glm5_unified_skew_without_plans() {
+    auto metadata = get_gguf_ctx(LLM_ARCH_GLM5_NEXT, true);
+    gguf_set_val_u32(metadata.get(), "glm5-next.attention.indexer.top_k", GLM5_KPOOL_TOP_K);
+    auto loaded = get_model_and_ctx(metadata.get(), nullptr, 1234, {}, LLAMA_SPLIT_MODE_LAYER, false, GLM5_SKEW_N_SEQ, true);
+    llama_context * ctx = loaded.second.get();
+    const uint32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(loaded.first.get()));
+    const size_t n_planned = ggml_backend_sched_get_n_planned(ctx->get_sched());
+
+    glm5_decode_seq(ctx, 0, 0, GLM5_SKEW_LONG, n_vocab);
+    GGML_ASSERT(glm5_decode_tokens(ctx, glm5_skew_tokens(1, 0, GLM5_SKEW_SHORT, n_vocab)) == 0);
+    std::vector<glm5_token> step = glm5_skew_tokens(1, GLM5_SKEW_SHORT, 1, n_vocab);
+    step.push_back({1, (llama_pos) GLM5_SKEW_LONG, {0}});
+    GGML_ASSERT(glm5_decode_tokens(ctx, step) == 0);
+    return glm5_check_no_plans(ctx, n_planned, "CPU", "unified with one long and several short sequences decoded");
+}
+
+// split_seq (embeddings) puts a token of sequences {0, 1} and tokens of sequence 0 in one ubatch.
+static bool glm5_split_seq_mixed_layouts() {
+    auto metadata = get_gguf_ctx(LLM_ARCH_GLM5_NEXT, true);
+    gguf_set_val_u32(metadata.get(), "glm5-next.attention.indexer.top_k", GLM5_KPOOL_TOP_K);
+    auto loaded = get_model_and_ctx(metadata.get(), nullptr, 1234, {}, LLAMA_SPLIT_MODE_LAYER, false, 2, true);
+    llama_context * ctx = loaded.second.get();
+    const uint32_t n_embd = llama_model_n_embd(loaded.first.get());
+    llama_set_embeddings(ctx, true);
+
+    const std::vector<glm5_token> shared = {{10, 0, {0, 1}}, {11, 1, {0, 1}}, {12, 2, {0, 1}}, {13, 3, {0, 1}}};
+    const std::vector<glm5_token> own    = {{20, 4, {0}},    {21, 5, {0}},    {22, 6, {0}},    {23, 7, {0}}};
+    auto embeddings = [&](int32_t i0) {
+        std::vector<float> res;
+        for (int32_t i = i0; i < i0 + (int32_t) own.size(); ++i) {
+            const float * row = llama_get_embeddings_ith(ctx, i);
+            res.insert(res.end(), row, row + n_embd);
+        }
+        return res;
+    };
+
+    GGML_ASSERT(glm5_decode_tokens(ctx, shared) == 0);
+    GGML_ASSERT(glm5_decode_tokens(ctx, own) == 0);
+    const auto ref = embeddings(0);
+
+    llama_memory_clear(llama_get_memory(ctx), true);
+    std::vector<glm5_token> mixed = shared;
+    mixed.insert(mixed.end(), own.begin(), own.end());
+    if (glm5_decode_tokens(ctx, mixed) != 0) {
+        printf("FAIL: GLM5 embeddings batch with mixed sequence sets did not decode\n");
+        return false;
+    }
+    const double err = nmse(ref, embeddings((int32_t) shared.size()));
+    if (!(err < GLM5_KPOOL_MAX_NMSE)) {
+        printf("FAIL: GLM5 embeddings of a mixed split_seq ubatch differ from two batches (nmse %.3e)\n", err);
+        return false;
+    }
+    printf("GLM5 split_seq ubatch with mixed sequence sets decoded (nmse %.3e)\n", err);
+    return true;
+}
+
+// Sequence groups of the k-pool indexer: uncached and oversized ubatches, unified reserve size, split_seq.
+static int test_glm5_kpool_groups() {
+    bool ok = glm5_uncached_pools_real_only();
+    ok = glm5_unified_reserve_size() && ok;
+    ok = glm5_unified_skew_without_plans() && ok;
+    ok = glm5_split_seq_mixed_layouts() && ok;
+    return ok ? 0 : 1;
+}
+
+static constexpr uint32_t SCRAMBLE_N_SEQ    = 3;
+static constexpr uint32_t SCRAMBLE_N_TOKENS = 4;
+// Tokens per sequence of a batch of two sequences: a decode step, a gather ubatch, and a prompt ubatch.
+static const uint32_t SCRAMBLE_BATCH_TOKENS[] = {1, 4, 12};
+// Solo decodes in this order give the sequences recurrent state cells out of sequence order.
+static const llama_seq_id SCRAMBLE_ORDER[SCRAMBLE_N_SEQ] = {2, 0, 1};
+
+// Tokens [p0, p0 + n) of every sequence of seqs.
+static std::vector<glm5_token> glm5_seqs_tokens(const std::vector<llama_seq_id> & seqs, llama_pos p0, uint32_t n, uint32_t n_vocab) {
+    std::vector<glm5_token> tokens;
+    for (const llama_seq_id s : seqs) {
+        const auto ids = get_tokens(n, n_vocab, 800 + s);
+        for (uint32_t i = 0; i < n; ++i) {
+            tokens.push_back({ids[i], p0 + (llama_pos) i, {s}});
+        }
+    }
+    return tokens;
+}
+
+// Clears the memory, decodes the sequences alone in SCRAMBLE_ORDER, then n tokens of sequences 1 and 2 in one batch.
+static void glm5_scrambled_batch(llama_context * ctx, uint32_t n, uint32_t n_vocab) {
+    llama_memory_clear(llama_get_memory(ctx), true);
+    for (const llama_seq_id s : SCRAMBLE_ORDER) {
+        glm5_decode_seq(ctx, s, 0, SCRAMBLE_N_TOKENS, n_vocab);
+    }
+    GGML_ASSERT(glm5_decode_tokens(ctx, glm5_seqs_tokens({1, 2}, SCRAMBLE_N_TOKENS, n, n_vocab)) == 0);
+}
+
+// The scrambled batches, then a full prompt ubatch of one sequence, which outgrows a plan sized for them.
+static void glm5_scrambled_batches(llama_context * ctx, uint32_t n_vocab) {
+    for (const uint32_t n : SCRAMBLE_BATCH_TOKENS) {
+        glm5_scrambled_batch(ctx, n, n_vocab);
+    }
+    llama_memory_clear(llama_get_memory(ctx), true);
+    glm5_decode_seq(ctx, 0, 0, llama_n_ubatch(ctx), n_vocab);
+}
+
+// Recurrent state cells follow arrival order, so a ubatch of sequences 1 and 2 also copies the state of sequence 0.
+// No reserve of n_seq_max sequences holds these extra state rows, so the plans grow once and are then reused.
+static bool glm5_scrambled_states_reuse_plans(const glm5_multiseq_config & cfg, bool unified) {
+    auto metadata = get_gguf_ctx(LLM_ARCH_GLM5_NEXT, true);
+    gguf_set_val_u32(metadata.get(), "glm5-next.attention.indexer.top_k", GLM5_MULTISEQ_TOP_K);
+    auto loaded = get_model_and_ctx(metadata.get(), nullptr, 1234, cfg.devs, cfg.split_mode, false, SCRAMBLE_N_SEQ, unified);
+    llama_context * ctx = loaded.second.get();
+    const uint32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(loaded.first.get()));
+
+    glm5_scrambled_batches(ctx, n_vocab);
+    const size_t n_planned = ggml_backend_sched_get_n_planned(ctx->get_sched());
+    glm5_scrambled_batches(ctx, n_vocab);
+    return glm5_check_no_plans(ctx, n_planned, cfg.label,
+            unified ? "unified with scrambled state cells repeated its ubatches" : "non-unified with scrambled state cells repeated its ubatches");
+}
+
+// The first scrambled ubatches re-plan with the same graph size, so ctest runs this without the Debug re-plan abort.
+static int test_glm5_reserve_scrambled_states() {
+    const auto configs = glm5_multiseq_configs(true);
+    if (configs.empty()) {
+        printf("GLM5 scrambled state test skipped: no GPU\n");
+        return 0;
+    }
+    bool ok = true;
+    for (bool unified : {true, false}) {
+        ok = glm5_scrambled_states_reuse_plans(configs.front(), unified) && ok;
+    }
+    return ok ? 0 : 1;
+}
+
+static int test_glm5_reserve_covers_context() {
+    const auto configs = glm5_multiseq_configs(true);
+    if (configs.empty()) {
+        printf("GLM5 reserve test skipped: no GPU\n");
+        return 0;
+    }
+    bool ok = true;
+    for (bool unified : {true, false}) {
+        ok = glm5_decode_after_reserve(configs.front(), unified) && ok;
+    }
+    ok = glm5_reserve_long_streams(configs.front()) && ok;
+    ok = glm5_reserve_covers_uneven_split(configs.front()) && ok;
+    return ok ? 0 : 1;
+}
+
 static int test_glm5_invalid_metadata() {
     struct invalid_case {
         const char * key;
@@ -1762,6 +2665,100 @@ static int test_layer_inp_pos_min() {
     return ok ? 0 : 1;
 }
 
+// Enough layers that the second GPU's split of a two-GPU layer split is launched as one CUDA graph.
+static constexpr uint32_t LAYER_SPLIT_GRAPH_N_LAYER  = 64;
+static constexpr uint32_t LAYER_SPLIT_GRAPH_N_TOKENS = 192;
+static constexpr double   LAYER_SPLIT_GRAPH_MAX_NMSE = 1e-6;
+
+static std::vector<float> get_layer_split_logits(const std::vector<ggml_backend_dev_t> & devs) {
+    auto metadata = get_gguf_ctx(LLM_ARCH_LLAMA, false);
+    gguf_set_val_u32(metadata.get(), "llama.block_count", LAYER_SPLIT_GRAPH_N_LAYER);
+    auto loaded = get_model_and_ctx(metadata.get(), nullptr, 1234, devs);
+    const uint32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(loaded.first.get()));
+    const auto tokens = get_tokens(LAYER_SPLIT_GRAPH_N_TOKENS, n_vocab, 300);
+    return get_logits(loaded.first.get(), loaded.second.get(), tokens);
+}
+
+// The CUDA debug message of a split launched as one graph.
+static constexpr const char * LAYER_SPLIT_GATED_LOG = "waits on another GPU as one graph";
+// A chain longer than the node count from which CUDA launches a split that waits on another GPU as one graph.
+static constexpr int LAYER_SPLIT_CHAIN_NODES = 1024;
+static constexpr int LAYER_SPLIT_CHAIN_ELEMS = 256;
+
+struct gated_log_counter {
+    ggml_log_callback callback  = nullptr;
+    void *            user_data = nullptr;
+    int               n_gated   = 0;
+};
+
+static void count_gated_launch(ggml_log_level level, const char * text, void * user_data) {
+    auto * counter = (gated_log_counter *) user_data;
+    if (strstr(text, LAYER_SPLIT_GATED_LOG) != nullptr) {
+        counter->n_gated++;
+    }
+    counter->callback(level, text, counter->user_data);
+}
+
+// Runs f and returns how many splits CUDA launched as one graph meanwhile.
+template <typename F>
+static int count_gated_launches(F && f) {
+    gated_log_counter counter;
+    ggml_log_get(&counter.callback, &counter.user_data);
+    ggml_log_set(count_gated_launch, &counter);
+    f();
+    ggml_log_set(counter.callback, counter.user_data);
+    return counter.n_gated;
+}
+
+// Copies a tensor from one GPU to another outside the scheduler, then computes a long chain on the destination.
+static void compute_after_bare_copy(ggml_backend_dev_t dev_src, ggml_backend_dev_t dev_dst) {
+    ggml_backend_ptr backend_src(ggml_backend_dev_init(dev_src, nullptr));
+    ggml_backend_ptr backend_dst(ggml_backend_dev_init(dev_dst, nullptr));
+    const size_t mem_size = ggml_tensor_overhead()*(LAYER_SPLIT_CHAIN_NODES + 2) +
+        ggml_graph_overhead_custom(LAYER_SPLIT_CHAIN_NODES + 1, false);
+    ggml_context_ptr ctx_src(ggml_init({ ggml_tensor_overhead(), nullptr, true }));
+    ggml_context_ptr ctx_dst(ggml_init({ mem_size, nullptr, true }));
+
+    ggml_tensor * src = ggml_new_tensor_1d(ctx_src.get(), GGML_TYPE_F32, LAYER_SPLIT_CHAIN_ELEMS);
+    ggml_tensor * dst = ggml_new_tensor_1d(ctx_dst.get(), GGML_TYPE_F32, LAYER_SPLIT_CHAIN_ELEMS);
+    ggml_tensor * out = dst;
+    for (int i = 0; i < LAYER_SPLIT_CHAIN_NODES; i++) {
+        out = ggml_scale(ctx_dst.get(), out, 1.0f);
+    }
+    ggml_cgraph * gf = ggml_new_graph_custom(ctx_dst.get(), LAYER_SPLIT_CHAIN_NODES + 1, false);
+    ggml_build_forward_expand(gf, out);
+
+    ggml_backend_buffer_ptr buf_src(ggml_backend_alloc_ctx_tensors(ctx_src.get(), backend_src.get()));
+    ggml_backend_buffer_ptr buf_dst(ggml_backend_alloc_ctx_tensors(ctx_dst.get(), backend_dst.get()));
+    GGML_ASSERT(buf_src && buf_dst);
+    ggml_backend_tensor_copy_async(backend_src.get(), backend_dst.get(), src, dst);
+    GGML_ASSERT(ggml_backend_graph_compute(backend_dst.get(), gf) == GGML_STATUS_SUCCESS);
+}
+
+static int test_layer_split_cuda_graph() {
+    const std::vector<ggml_backend_dev_t> gpus = get_gpu_devices();
+    if (gpus.size() < 2) {
+        printf("layer split CUDA graph test skipped: needs 2 GPUs\n");
+        return 0;
+    }
+    const auto single = get_layer_split_logits({gpus[0]});
+    std::vector<float> split;
+    const int n_gated_split = count_gated_launches([&]() { split = get_layer_split_logits({gpus[0], gpus[1]}); });
+    const int n_gated_copy  = count_gated_launches([&]() { compute_after_bare_copy(gpus[0], gpus[1]); });
+    const double err = nmse(single, split);
+    printf("layer split over 2 GPUs vs 1 GPU: nmse %.3e, %d splits launched as one graph, %d after a bare copy\n",
+            err, n_gated_split, n_gated_copy);
+    if (!(err < LAYER_SPLIT_GRAPH_MAX_NMSE)) {
+        printf("FAIL: layer split over 2 GPUs differs from 1 GPU\n");
+        return 1;
+    }
+    if (n_gated_split == 0 || n_gated_copy != 0) {
+        printf("FAIL: only a scheduler split that waits on another GPU must launch as one graph\n");
+        return 1;
+    }
+    return 0;
+}
+
 int main(int argc, char ** argv) {
     // init the logger at max verbosity. filter with a custom callback respecting the user-configure verbosity
     common_log_set_verbosity_thold(LOG_LEVEL_DEBUG);
@@ -1774,7 +2771,26 @@ int main(int argc, char ** argv) {
         return test_hadamard_contracts();
     }
     if (argc == 2 && strcmp(argv[1], "--glm5-kpool-sequences") == 0) {
-        return test_glm5_kpool_sequences();
+        const int rc = test_glm5_kpool_sequences();
+        return test_glm5_kpool_groups() != 0 ? 1 : rc;
+    }
+    if (argc == 2 && (strcmp(argv[1], "--glm5-multiseq") == 0 || strcmp(argv[1], "--glm5-multiseq-gpu") == 0)) {
+        return test_glm5_multiseq(strcmp(argv[1], "--glm5-multiseq-gpu") == 0);
+    }
+    if (argc == 2 && strcmp(argv[1], "--glm5-tensor-oom") == 0) {
+        return test_glm5_tensor_oom();
+    }
+    if (argc == 2 && strcmp(argv[1], "--glm5-split-heads") == 0) {
+        return test_glm5_split_heads();
+    }
+    if (argc == 2 && strcmp(argv[1], "--glm5-reserve-covers-context") == 0) {
+        return test_glm5_reserve_covers_context();
+    }
+    if (argc == 2 && strcmp(argv[1], "--glm5-reserve-scrambled-states") == 0) {
+        return test_glm5_reserve_scrambled_states();
+    }
+    if (argc == 2 && strcmp(argv[1], "--layer-split-cuda-graph") == 0) {
+        return test_layer_split_cuda_graph();
     }
     if (argc == 2 && strcmp(argv[1], "--glm5-invalid-metadata") == 0) {
         return test_glm5_invalid_metadata();

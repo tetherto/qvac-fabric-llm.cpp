@@ -53,6 +53,7 @@ struct llama_cparams {
     bool auto_fhc;
     bool no_perf;
     bool warmup;             // TODO: remove [TAG_LLAMA_GRAPH_NO_WARMUP]
+    bool reserve_indexer_gather; // reserving: take the indexer gather path at any cache length
     bool op_offload;
     bool kv_unified;
     bool pipeline_parallel;
