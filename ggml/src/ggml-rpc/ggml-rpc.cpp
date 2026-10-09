@@ -3720,11 +3720,15 @@ ggml_backend_rpc_server_t ggml_backend_rpc_server_create(
     server->transport_initialized = true;
     server->server_socket         = socket_t::create_server(server->host.c_str(), port);
     if (server->server_socket == nullptr) {
-        fprintf(stderr, "Failed to create server socket\n");
+        fprintf(stderr, "Failed to create server socket on %s\n", endpoint);
         return nullptr;
     }
     // port 0 binds an ephemeral port, so report the one the socket got
     server->port = server->server_socket->local_port();
+    if (server->port <= 0) {
+        fprintf(stderr, "Failed to get the server port for %s\n", endpoint);
+        return nullptr;
+    }
     printf("  endpoint       : %s:%d\n", server->host.c_str(), server->port);
     return server.release();
 }

@@ -48,7 +48,7 @@ GGML_BACKEND_API ggml_backend_rpc_server_t ggml_backend_rpc_server_create(
 GGML_BACKEND_API void ggml_backend_rpc_server_run(ggml_backend_rpc_server_t server);
 GGML_BACKEND_API void ggml_backend_rpc_server_stop(ggml_backend_rpc_server_t server);
 GGML_BACKEND_API void ggml_backend_rpc_server_free(ggml_backend_rpc_server_t server);
-// Port the server is listening on, or -1 when server is NULL.
+// Port the server is listening on (always > 0), or -1 when server is NULL.
 GGML_BACKEND_API int ggml_backend_rpc_server_get_port(ggml_backend_rpc_server_t server);
 
 GGML_BACKEND_API ggml_backend_reg_t ggml_backend_rpc_reg(void);
