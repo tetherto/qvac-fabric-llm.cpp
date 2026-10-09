@@ -19,10 +19,11 @@ extern "C" {
 // 109 adds butterfly communicator rounds and round-tagged peer frames
 //     (b11259 fork: 108); 109.1 adds RPC_CMD_SET_TENSOR_2D_HASH.
 // 110 adds cache flags to SET_TENSOR and SET_TENSOR_2D (b11259 fork: 109).
+// 111 widens rpc_tensor::name with GGML_MAX_NAME 128 (temp-11018: 110).
 // A minor bump is additive: the client still accepts a server with an older
 // minor and must gate every command introduced by a later minor on the minor
 // the server announces at HELLO.
-#define RPC_PROTO_MAJOR_VERSION    110
+#define RPC_PROTO_MAJOR_VERSION    111
 #define RPC_PROTO_MINOR_VERSION    0
 #define RPC_PROTO_PATCH_VERSION    0
 
