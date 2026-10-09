@@ -305,6 +305,8 @@ static bool test_caps_handshake() {
                         client->recv_data(&value, sizeof(value)) && value == 42;
         }
     }
+    // close the client so a server thread still waiting for data returns
+    client.reset();
     server_thread.join();
     if (!client_ok || !server_ok) {
         fprintf(stderr, "caps handshake or data exchange failed\n");
