@@ -8047,6 +8047,65 @@ static bool ggml_cl_tensors_overlap(const ggml_tensor * x, const ggml_tensor * y
     return xo < ye && yo < xe;
 }
 
+// Graph nodes graph_compute skips without a dispatch.
+static bool ggml_opencl_is_noop_node(const ggml_tensor * node) {
+    return ggml_is_empty(node) || node->op == GGML_OP_RESHAPE || node->op == GGML_OP_TRANSPOSE ||
+           node->op == GGML_OP_VIEW || node->op == GGML_OP_PERMUTE || node->op == GGML_OP_NONE;
+}
+
+static void ggml_cl_gated_delta_net(ggml_backend_t backend, ggml_tensor * dst, const ggml_tensor * cache_view);
+
+// GATED_DELTA_NET whose state snapshots the next real node, a CPY, scatters into the recurrent cache: the kernel
+// writes the cache view itself and the CPY is skipped. Returns the nodes to skip (0 = no fusion) and the cache view.
+static int ggml_opencl_can_fuse_gdn_cache(const struct ggml_cgraph * cgraph, int node_idx, const ggml_tensor ** cache_view) {
+    const ggml_tensor * gdn = cgraph->nodes[node_idx];
+    // the fused kernel leaves the snapshot tail of its own output unwritten
+    if (gdn->op != GGML_OP_GATED_DELTA_NET || gdn->type != GGML_TYPE_F32 || (gdn->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+        return 0;
+    }
+
+    int cpy_idx = node_idx + 1;
+    while (cpy_idx < cgraph->n_nodes && ggml_opencl_is_noop_node(cgraph->nodes[cpy_idx])) {
+        cpy_idx++;
+    }
+    if (cpy_idx == cgraph->n_nodes) {
+        return 0;
+    }
+    const ggml_tensor * cpy = cgraph->nodes[cpy_idx];
+    if (cpy->op != GGML_OP_CPY || (cpy->flags & GGML_TENSOR_FLAG_OUTPUT) || !(cpy->flags & GGML_TENSOR_FLAG_COMPUTE)) {
+        return 0;
+    }
+
+    const ggml_tensor * v         = gdn->src[2];
+    const int64_t       D         = v->ne[0] * v->ne[0] * v->ne[1];
+    const int64_t       n_seqs    = v->ne[3];
+    const int64_t       n_written = std::min<int64_t>(v->ne[2], ggml_get_op_params_i32(gdn, 0));
+    const size_t        tail_off  = ggml_row_size(GGML_TYPE_F32, v->ne[0] * v->ne[1] * v->ne[2] * n_seqs);
+
+    const ggml_tensor * src = cpy->src[0];
+    if (src->op != GGML_OP_VIEW || src->view_src != gdn || src->view_offs != tail_off || !ggml_is_contiguous(src)) {
+        return 0;
+    }
+
+    // the kernel writes a slot as n_seqs rows of D floats, slots nb[2] apart, with 32-bit indices
+    const ggml_tensor * dst         = cpy->src[1];
+    const int64_t       slot_stride = dst->nb[2] / sizeof(float);
+    if (dst->type != GGML_TYPE_F32 || dst->extra == nullptr ||
+        dst->ne[0] != D || dst->ne[1] != n_seqs || dst->ne[2] != n_written || dst->ne[3] != 1 ||
+        dst->nb[0] != sizeof(float) || dst->nb[1] != (size_t) D * sizeof(float) || dst->nb[2] % sizeof(float) != 0 ||
+        (n_written - 1) * slot_stride + D * n_seqs > (int64_t) UINT32_MAX) {
+        return 0;
+    }
+    for (int s = 0; s < GGML_MAX_SRC && gdn->src[s]; s++) {
+        if (ggml_cl_tensors_overlap(dst, gdn->src[s])) {
+            return 0;
+        }
+    }
+
+    *cache_view = dst;
+    return cpy_idx - node_idx;
+}
+
 // Detect the MoE combine epilogue: router-weight MUL ([n_embd,k,nt] * [1,k,nt]) followed
 // by k VIEWs of it and a (k-1)-long ADD reduction chain producing [n_embd, nt]. When it
 // matches (and the output does not alias the inputs), the whole subgraph collapses to one
@@ -8878,7 +8937,7 @@ static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggm
         //       dependencies.
         sync_with_other_backends(backend);
 
-        if (ggml_is_empty(node) || node->op == GGML_OP_RESHAPE || node->op == GGML_OP_TRANSPOSE || node->op == GGML_OP_VIEW || node->op == GGML_OP_PERMUTE || node->op == GGML_OP_NONE) {
+        if (ggml_opencl_is_noop_node(node)) {
             continue;
         }
 
@@ -8907,6 +8966,8 @@ static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggm
         if (backend_ctx->fuse_moe_combine && !backend_ctx->disable_fusion) {
             ggml_opencl_can_fuse_moe_combine(cgraph, i, &moe_combine_out);
         }
+        const ggml_tensor * gdn_cache_view = nullptr;
+        const int gdn_cache_skip = backend_ctx->disable_fusion ? 0 : ggml_opencl_can_fuse_gdn_cache(cgraph, i, &gdn_cache_view);
 
         // if/else (not `continue`) so every dispatch path reaches the single
         // budget-flush touch point below.
@@ -8948,6 +9009,10 @@ static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggm
         } else if (!backend_ctx->disable_fusion && ggml_opencl_can_fuse(backend_ctx, cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL })) {
             ggml_opencl_op_rms_norm_fused(backend, node, cgraph->nodes[i+1]);
             i++;
+        } else if (gdn_cache_skip > 0) {
+            // The state snapshots go straight into the recurrent cache; the CPY that would scatter them is skipped.
+            ggml_cl_gated_delta_net(backend, node, gdn_cache_view);
+            i += gdn_cache_skip;
 #ifdef GGML_OPENCL_USE_ADRENO_KERNELS
         // Fuse mul_mat(Wg,x) + mul_mat(Wu,x) + glu — fold the FFN's two decode
         // GEMVs and the GLU into one dispatch. q4_K only (guarded below); the
@@ -29193,7 +29258,8 @@ static void ggml_cl_glu(ggml_backend_t backend, const ggml_tensor * src0, const 
     backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
 }
 
-static void ggml_cl_gated_delta_net(ggml_backend_t backend, ggml_tensor * dst) {
+// cache_view, when set, is the recurrent-cache view a fused CPY would fill: the state snapshots are written there.
+static void ggml_cl_gated_delta_net(ggml_backend_t backend, ggml_tensor * dst, const ggml_tensor * cache_view) {
     GGML_ASSERT(dst);
     GGML_ASSERT(dst->extra);
 
@@ -29287,6 +29353,16 @@ static void ggml_cl_gated_delta_net(ggml_backend_t backend, ggml_tensor * dst) {
     const cl_ulong off_state = extra_state->offset + src_state->view_offs;
     const cl_ulong off_dst   = extra_dst->offset   + dst->view_offs;
 
+    cl_mem   snap_mem         = extra_dst->data_device;
+    cl_ulong off_snap         = off_dst + (cl_ulong) s_off * sizeof(float);
+    cl_uint  snap_slot_stride = S_v * S_v * H_v * n_seqs;
+    if (cache_view) {
+        const ggml_tensor_extra_cl * extra_cache = (const ggml_tensor_extra_cl *) cache_view->extra;
+        snap_mem         = extra_cache->data_device;
+        off_snap         = extra_cache->offset + cache_view->view_offs;
+        snap_slot_stride = (cl_uint) (cache_view->nb[2] / sizeof(float));
+    }
+
     int idx = 0;
     CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_mem),   &extra_q->data_device));
     CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_ulong), &off_q));
@@ -29302,10 +29378,12 @@ static void ggml_cl_gated_delta_net(ggml_backend_t backend, ggml_tensor * dst) {
     CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_ulong), &off_state));
     CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_mem),   &extra_dst->data_device));
     CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_ulong), &off_dst));
+    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_mem),   &snap_mem));
+    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_ulong), &off_snap));
     CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_uint),  &H_v));
     CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_uint),  &n_tokens));
     CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_uint),  &n_seqs));
-    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_uint),  &s_off));
+    CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_uint),  &snap_slot_stride));
     CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_uint),  &sq1));
     CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_uint),  &sq2));
     CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_uint),  &sq3));
@@ -29685,7 +29763,7 @@ bool ggml_cl_compute_forward(ggml_backend_t backend, struct ggml_tensor * tensor
             }
             // GDN has 6 source tensors, so it cannot use the standard
             // (src0, src1, dst) func signature. Dispatch directly and return.
-            ggml_cl_gated_delta_net(backend, tensor);
+            ggml_cl_gated_delta_net(backend, tensor, nullptr);
             return true;
         case GGML_OP_CONCAT:
             if (!any_on_device) {
