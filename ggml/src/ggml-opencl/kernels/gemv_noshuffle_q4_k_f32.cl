@@ -613,6 +613,16 @@ kernel void kernel_gemv_splitk_reduce_f32(
 // From MC_STAGE_MIN_COLS columns on, the activations come from a local-memory slice instead of per-column broadcasts.
 #define MC_STAGE_MIN_COLS 4
 #define MC_BLOCK_PIXELS   8 // float4 activation pixels per 32-element block
+#define Q4K_MC_LOAD_WEIGHTS(kb, a_hi, a_lo) { \
+    const uint kq = (kb); \
+    a_hi.s0 = read_imageui(src0_q, (gid_s + kq * BLOCK_STRIDE_A + LINE_STRIDE_A * 0)).x; \
+    a_hi.s1 = read_imageui(src0_q, (gid_s + kq * BLOCK_STRIDE_A + LINE_STRIDE_A * 1)).x; \
+    a_hi.s2 = read_imageui(src0_q, (gid_s + kq * BLOCK_STRIDE_A + LINE_STRIDE_A * 2)).x; \
+    a_hi.s3 = read_imageui(src0_q, (gid_s + kq * BLOCK_STRIDE_A + LINE_STRIDE_A * 3)).x; \
+    a_lo.s0 = read_imageui(src0_q, (gid_s + kq * BLOCK_STRIDE_A + LINE_STRIDE_A * 4)).x; \
+    a_lo.s1 = read_imageui(src0_q, (gid_s + kq * BLOCK_STRIDE_A + LINE_STRIDE_A * 5)).x; \
+    a_lo.s2 = read_imageui(src0_q, (gid_s + kq * BLOCK_STRIDE_A + LINE_STRIDE_A * 6)).x; \
+    a_lo.s3 = read_imageui(src0_q, (gid_s + kq * BLOCK_STRIDE_A + LINE_STRIDE_A * 7)).x; }
 
 #if MC_N_COLS < MC_STAGE_MIN_COLS
 #ifdef VECTOR_SUB_GROUP_BROADCAST
@@ -675,7 +685,8 @@ kernel void kernel_gemv_noshuffle_q4_k_f32_mc(
         int ne01,
         uchar mask_d6,
         uchar mask_d4,
-        uchar mask_hi2)
+        uchar mask_hi2,
+        local float4 * mc_stage)  // nsg * MC_N_COLS staged blocks, sized by the host
 {
     uint groupId = get_local_id(1);
     uint gid     = get_global_id(0);
@@ -699,10 +710,17 @@ kernel void kernel_gemv_noshuffle_q4_k_f32_mc(
     float2 ts4 = 0.0f, ts5 = 0.0f, ts6 = 0.0f, ts7 = 0.0f;
 
 #if MC_N_COLS >= MC_STAGE_MIN_COLS
-    local float4 mc_stage[MC_MAX_NSG * MC_N_COLS * MC_BLOCK_PIXELS];
+    // The staged path loads the next block's weight words while this block's columns run, hiding their latency.
+    uint4 next_hi, next_lo;
+    Q4K_MC_LOAD_WEIGHTS(min(groupId, K / 32 - 1), next_hi, next_lo);
 #endif
 
     for (uint k = groupId; k < (K / 32); k += nsg) {
+#if MC_N_COLS >= MC_STAGE_MIN_COLS
+        regA_hi = next_hi;
+        regA_lo = next_lo;
+        Q4K_MC_LOAD_WEIGHTS(min(k + nsg, K / 32 - 1), next_hi, next_lo);
+#endif
         uint sb = k / 8;
         uint j  = k % 8;
 
@@ -719,14 +737,9 @@ kernel void kernel_gemv_noshuffle_q4_k_f32_mc(
         regS = convert_half2(convert_float2(d)  * convert_float2((uchar2)(sv0, sv1)));
         regM = convert_half2(convert_float2(dm) * convert_float2((uchar2)(mn0, mn1)));
 
-        regA_hi.s0 = read_imageui(src0_q, (gid_s + k * BLOCK_STRIDE_A + LINE_STRIDE_A * 0)).x;
-        regA_hi.s1 = read_imageui(src0_q, (gid_s + k * BLOCK_STRIDE_A + LINE_STRIDE_A * 1)).x;
-        regA_hi.s2 = read_imageui(src0_q, (gid_s + k * BLOCK_STRIDE_A + LINE_STRIDE_A * 2)).x;
-        regA_hi.s3 = read_imageui(src0_q, (gid_s + k * BLOCK_STRIDE_A + LINE_STRIDE_A * 3)).x;
-        regA_lo.s0 = read_imageui(src0_q, (gid_s + k * BLOCK_STRIDE_A + LINE_STRIDE_A * 4)).x;
-        regA_lo.s1 = read_imageui(src0_q, (gid_s + k * BLOCK_STRIDE_A + LINE_STRIDE_A * 5)).x;
-        regA_lo.s2 = read_imageui(src0_q, (gid_s + k * BLOCK_STRIDE_A + LINE_STRIDE_A * 6)).x;
-        regA_lo.s3 = read_imageui(src0_q, (gid_s + k * BLOCK_STRIDE_A + LINE_STRIDE_A * 7)).x;
+#if MC_N_COLS < MC_STAGE_MIN_COLS
+        Q4K_MC_LOAD_WEIGHTS(k, regA_hi, regA_lo);
+#endif
 
 #if MC_N_COLS >= MC_STAGE_MIN_COLS
         // Stage this block's activations for every column in the subgroup's own slice. The first barrier keeps the
