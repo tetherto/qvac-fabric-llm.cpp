@@ -2858,11 +2858,14 @@ ggml_tensor * llm_graph_context::build_attn_mha_runs(
 
         ggml_tensor * cur = build_attn_mha(q_r, k, v, nullptr, kq_mask_r, sinks, v_mla, 0, kq_scale, il);
 
-        // copy out of the attention node and add it to the graph now, so its temp buffers are freed before the next run
-        cur = ggml_cont(ctx0, cur);
+        // the first run waits for the next concat: copy it out of the FA node, so the FA temp buffers are freed before the next run
+        if (res == nullptr && cparams.flash_attn) {
+            cur = ggml_cont(ctx0, cur);
+        }
 
         res = res ? ggml_concat(ctx0, res, cur, 1) : cur;
 
+        // add the run to the graph now, so its nodes are freed before the next run
         ggml_build_forward_expand(gf, res);
     }
 
