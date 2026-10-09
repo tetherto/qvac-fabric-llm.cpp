@@ -123,6 +123,28 @@ struct vk_flash_attn_push_constants {
 };
 
 static_assert(sizeof(vk_flash_attn_push_constants) <= 128, "sizeof(vk_flash_attn_push_constants) must be <= 128");
+struct vk_flash_attn_back_push_constants {
+    uint32_t N;
+    uint32_t KV;
+    uint32_t neq2;
+    uint32_t nek2;
+    uint32_t nek3;
+    uint32_t nem2;
+    uint32_t nem3;
+
+    // strides in elements of the respective tensor
+    uint32_t nbq1, nbq2, nbq3;
+    uint32_t nbk1, nbk2, nbk3;
+    uint32_t nbv1, nbv2, nbv3;
+    uint32_t nbm1, nbm2, nbm3;
+    uint32_t nbo1, nbo2, nbo3;
+    uint32_t nbd1, nbd2, nbd3;
+
+    float scale;
+    uint32_t mask_enable;
+};
+static_assert(sizeof(vk_flash_attn_back_push_constants) <= 128, "sizeof(vk_flash_attn_back_push_constants) must be <= 128");
+
 
 struct vk_fa_xe_opt_push_constants {
     uint32_t kv_seq_len;

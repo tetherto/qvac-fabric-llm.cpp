@@ -455,6 +455,18 @@ struct vk_fa_pipeline_state {
     }
 };
 
+struct vk_fa_back_pipeline_state {
+    uint32_t target;
+    ggml_type kv_type;
+    uint32_t HS, Br, Bc, D_split;
+    uint32_t workgroup_size, subgroup_size;
+
+    bool operator<(const vk_fa_back_pipeline_state &b) const {
+        return std::tie(target, kv_type, HS, Br, Bc, D_split, workgroup_size, subgroup_size) <
+               std::tie(b.target, b.kv_type, b.HS, b.Br, b.Bc, b.D_split, b.workgroup_size, b.subgroup_size);
+    }
+};
+
 struct vk_conv2d_pipeline_state {
     vk_conv2d_pipeline_state(uint32_t s0, uint32_t s1, uint32_t p0, uint32_t p1, uint32_t d0, uint32_t d1, uint32_t KW, uint32_t KH, uint32_t aligned)
         : s0(s0), s1(s1), p0(p0), p1(p1), d0(d0), d1(d1), KW(KW), KH(KH), aligned(aligned) {}
@@ -1072,6 +1084,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_conv2d_dw_cwhn_f32, pipeline_conv2d_dw_cwhn_f16_f32;
 
     std::map<vk_fa_pipeline_state, vk_pipeline> pipeline_flash_attn_f32_f16;
+    std::map<vk_fa_back_pipeline_state, vk_pipeline> pipeline_flash_attn_back;
 
     std::map<std::pair<uint32_t, uint32_t>, vk_pipeline> pipeline_fa_mask_opt;
 

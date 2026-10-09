@@ -1765,6 +1765,10 @@ extern "C" {
         bool load_optimizer_state;          // whether to load optimizer state from checkpoint_path
 
         bool assistant_loss_only;
+
+        // keep flash attention enabled during training; every backend in use needs
+        // FLASH_ATTN_EXT_BACK, otherwise the scheduler runs those nodes on the CPU
+        bool flash_attn;
     };
 
     LLAMA_API struct llama_opt_params llama_opt_default_params(void);

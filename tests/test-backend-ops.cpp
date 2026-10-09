@@ -14872,6 +14872,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         for (ggml_flash_attn_ext_back_target target : {GGML_FLASH_ATTN_EXT_BACK_STATS, GGML_FLASH_ATTN_EXT_BACK_DQ, GGML_FLASH_ATTN_EXT_BACK_DKV}) {
             test_cases.emplace_back(new test_flash_attn_ext_back(64, 4, {2, 1}, 512, 75, true, GGML_TYPE_F16, {0, 2, 1, 3}, target));
         }
+        // shapes of the grad-mode cases, small head sizes, partial tiles, odd head sizes and larger GQA groups
+        for (ggml_flash_attn_ext_back_target target : {GGML_FLASH_ATTN_EXT_BACK_STATS, GGML_FLASH_ATTN_EXT_BACK_DQ, GGML_FLASH_ATTN_EXT_BACK_DKV}) {
+            for (bool mask : {false, true}) {
+                test_cases.emplace_back(new test_flash_attn_ext_back( 32, 2, {2, 1},  16,  8, mask, GGML_TYPE_F32, {0, 1, 2, 3}, target));
+                test_cases.emplace_back(new test_flash_attn_ext_back( 32, 2, {2, 1},  16,  8, mask, GGML_TYPE_F32, {0, 2, 1, 3}, target));
+                test_cases.emplace_back(new test_flash_attn_ext_back( 32, 2, {1, 2},  16,  8, mask, GGML_TYPE_F32, {0, 1, 2, 3}, target));
+            }
+            test_cases.emplace_back(new test_flash_attn_ext_back( 80, 2, {1, 1}, 113,  3, true, GGML_TYPE_F16, {0, 1, 2, 3}, target));
+            test_cases.emplace_back(new test_flash_attn_ext_back( 96, 2, {1, 1},  40,  1, true, GGML_TYPE_F32, {0, 1, 2, 3}, target));
+            test_cases.emplace_back(new test_flash_attn_ext_back(256, 2, {8, 1}, 113, 75, true, GGML_TYPE_F16, {0, 1, 2, 3}, target));
+            test_cases.emplace_back(new test_flash_attn_ext_back(128, 1, {8, 2},  64, 64, true, GGML_TYPE_F32, {0, 1, 2, 3}, target));
+        }
     } // !GGML_SKIP_FLASH_ATTN
 
     // asymmetric head_dim (hsk != hsv) with one or both sides not 64-aligned
@@ -15819,6 +15831,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
 
     // Qwen3-VL-8B https://github.com/ggml-org/llama.cpp/issues/17012
     test_cases.emplace_back(new test_flash_attn_ext(72, 72, 16, {1, 1}, 5776, 5776, false, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+    test_cases.emplace_back(new test_flash_attn_ext(72, 72, 16, {1, 1}, 5776, 5776, false, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F32, GGML_TYPE_F32, {0, 1, 2, 3}, false));
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {4, 1}, 1024, 1024, true, false, 0.0f, 0.0f, GGML_PREC_F32, GGML_TYPE_F32, GGML_TYPE_F32, {0, 1, 2, 3}, false));
+    for (ggml_flash_attn_ext_back_target target : {GGML_FLASH_ATTN_EXT_BACK_STATS, GGML_FLASH_ATTN_EXT_BACK_DQ, GGML_FLASH_ATTN_EXT_BACK_DKV}) {
+        test_cases.emplace_back(new test_flash_attn_ext_back(128, 8, {4, 1}, 1024, 1024, true, GGML_TYPE_F32, {0, 1, 2, 3}, target));
+    }
 
     // Sparse flash attention (n_kv_max hint) decode across KV depths.
     // Shapes: 576/512 DeepSeek MLA, 512/512 DeepSeek-V4/GLM-5.2, 256/256 gqa12 Qwen QSA.
