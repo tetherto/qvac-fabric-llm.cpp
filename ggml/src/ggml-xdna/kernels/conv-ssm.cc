@@ -50,13 +50,13 @@ typedef float conv_elem;
 #endif
 
 #ifndef DIM_C
-#error "DIM_C must be defined"
+#    error "DIM_C must be defined"
 #endif
 #ifndef DIM_T
-#error "DIM_T must be defined"
+#    error "DIM_T must be defined"
 #endif
 #ifndef DIM_KW
-#error "DIM_KW must be defined"
+#    error "DIM_KW must be defined"
 #endif
 
 // 512-bit vectors: 16 f32 lanes.
@@ -66,15 +66,17 @@ typedef float conv_elem;
 
 // Rows are whole vectors of channels, so nothing pads: a row is DIM_C floats
 // and every row start is DIM_C-aligned.
-#define XROWT (DIM_T + DIM_KW - 1)
+#    define XROWT (DIM_T + DIM_KW - 1)
 
 static_assert(DIM_C % VLEN == 0, "DIM_C must be a multiple of the vector length");
 
 // x is [XROWT][C] and w is [KW][C], so tap i of channel lane c sits at
 // (t+i)*C + c: every load is contiguous and aligned, and the KW taps are KW
 // whole vectors rather than a window slid across two.
-extern "C" void ggml_xdna_conv_apply(const conv_elem * __restrict xw,
-                                     conv_elem * __restrict       out) {
+extern "C" void ggml_xdna_conv_apply(const conv_elem * __restrict xw, conv_elem * __restrict out) {
+    // The rounding mode is the core's, left by whatever ran on it before:
+    // set it, or the first dispatch after another design rounds differently.
+    aie::set_rounding(aie::rounding_mode::conv_even);
     const conv_elem * const w = xw + (size_t) XROWT * DIM_C;
 
     for (unsigned t = 0; t < DIM_T; t++) {
@@ -84,8 +86,7 @@ extern "C" void ggml_xdna_conv_apply(const conv_elem * __restrict xw,
         for (unsigned c = 0; c < DIM_C; c += VLEN) {
             aie::accum<accfloat, VLEN> acc = aie::zeros<accfloat, VLEN>();
             for (unsigned i = 0; i < DIM_KW; i++) {
-                acc = aie::mac(acc,
-                               aie::load_v<VLEN>(xt + (size_t) i * DIM_C + c),
+                acc = aie::mac(acc, aie::load_v<VLEN>(xt + (size_t) i * DIM_C + c),
                                aie::load_v<VLEN>(w + (size_t) i * DIM_C + c));
             }
             aie::store_v(ot + c, acc.template to_vector<conv_elem>());
@@ -99,13 +100,15 @@ extern "C" void ggml_xdna_conv_apply(const conv_elem * __restrict xw,
 // default tile and a misaligned load_v slides.
 static_assert(DIM_T % VLEN == 0, "DIM_T must be a multiple of the vector length");
 
-#define XROW (((DIM_T + DIM_KW - 1 + VLEN - 1) / VLEN) * VLEN)
+#    define XROW (((DIM_T + DIM_KW - 1 + VLEN - 1) / VLEN) * VLEN)
 static_assert(XROW % VLEN == 0, "XROW must be a multiple of the vector length");
 static_assert(XROW >= DIM_T + VLEN, "XROW must cover the aligned pair of loads");
 static_assert(DIM_KW <= VLEN, "shuffle tap must fit in one vector");
 
-extern "C" void ggml_xdna_conv_apply(const conv_elem * __restrict xw,
-                                     conv_elem * __restrict       out) {
+extern "C" void ggml_xdna_conv_apply(const conv_elem * __restrict xw, conv_elem * __restrict out) {
+    // The rounding mode is the core's, left by whatever ran on it before:
+    // set it, or the first dispatch after another design rounds differently.
+    aie::set_rounding(aie::rounding_mode::conv_even);
     const conv_elem * const w = xw + (size_t) DIM_C * XROW;
 
     for (unsigned c = 0; c < DIM_C; c++) {
@@ -116,12 +119,11 @@ extern "C" void ggml_xdna_conv_apply(const conv_elem * __restrict xw,
         for (unsigned t = 0; t < DIM_T; t += VLEN) {
             const aie::vector<conv_elem, VLEN> x_lo = aie::load_v<VLEN>(xc + t);
             const aie::vector<conv_elem, VLEN> x_hi = aie::load_v<VLEN>(xc + t + VLEN);
-            aie::accum<accfloat, VLEN> acc = aie::zeros<accfloat, VLEN>();
+            aie::accum<accfloat, VLEN>         acc  = aie::zeros<accfloat, VLEN>();
             // Tap i needs x[t+i : t+i+VLEN]. load_v at t+i is misaligned for
             // i>0; two aligned loads plus shuffle_down_fill is the sliding window.
             for (unsigned i = 0; i < DIM_KW; i++) {
-                acc = aie::mac(acc, aie::shuffle_down_fill(x_lo, x_hi, i),
-                               aie::broadcast<conv_elem, VLEN>(wc[i]));
+                acc = aie::mac(acc, aie::shuffle_down_fill(x_lo, x_hi, i), aie::broadcast<conv_elem, VLEN>(wc[i]));
             }
             aie::store_v(oc + t, acc.template to_vector<conv_elem>());
         }

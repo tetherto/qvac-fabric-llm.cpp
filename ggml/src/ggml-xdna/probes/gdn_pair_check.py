@@ -1,6 +1,6 @@
-# One head of the prefill gated delta rule on the mmul (FLM_PREFILL_PLAN.md,
-# step 3, build order 1) against ggml's token recurrence: two cores, each
-# holding the state for half of the value columns (kernels/gdn-mm.cc).
+# One head of the prefill gated delta rule on the mmul against ggml's token
+# recurrence: two cores, each holding the state for half of the value columns
+# (kernels/gdn-mm.cc).
 # On the bench, in the IRON env:
 #   NPU_CACHE_HOME=$(mktemp -d) python probes/gdn_pair_check.py [chunks] [gate scale]
 import hashlib

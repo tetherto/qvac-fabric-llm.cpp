@@ -1,7 +1,8 @@
 #define NOCPP
 
-#include <aie_api/aie.hpp>
 #include <stdint.h>
+
+#include <aie_api/aie.hpp>
 
 // Flash attention for the six full-attention prefill layers of Qwen3.5.
 // Semantics match GGML_OP_FLASH_ATTN_EXT with a plain causal mask, no sinks
@@ -28,30 +29,34 @@
 // FA_JT (keys per tile), FA_ROWS (cores per column), FA_SCALE.
 
 #ifndef FA_D
-#define FA_D 256
+#    define FA_D 256
 #endif
 #ifndef FA_MT
-#define FA_MT 16
+#    define FA_MT 16
 #endif
 #ifndef FA_JT
-#define FA_JT 8
+#    define FA_JT 8
 #endif
 #ifndef FA_ROWS
-#define FA_ROWS 4
+#    define FA_ROWS 4
 #endif
 #ifndef FA_SCALE
-#define FA_SCALE 0.0625f
+#    define FA_SCALE 0.0625f
 #endif
 #ifndef FA_QHDR
-#define FA_QHDR 16
+#    define FA_QHDR 16
 #endif
 
 // m starts here rather than at -inf so that a tile a row cannot see at all
 // leaves it alone: the masked bias below is far more negative still, so the
 // running max does not move and the tile contributes exp(-huge) = 0. With
 // m = -inf the two would be equal and every masked key would weigh 1.
-#define FA_M0   (-1.0e30f)
-#define FA_MASK (-1.0e34f)
+#define FA_M0        (-1.0e30f)
+#define FA_MASK      (-1.0e34f)
+// exp()'s repeated-squaring form: x / FA_EXP_SHIFT, a degree-5 series in
+// the reduced range, then eight squarings back.
+#define FA_EXP_MIN   (-40.0f)
+#define FA_EXP_SHIFT 256.0f
 
 using vf   = ::aie::vector<float, FA_MT>;
 using vbf  = ::aie::vector<bfloat16, FA_MT>;
@@ -70,16 +75,12 @@ using accf = ::aie::accum<accfloat, FA_MT>;
 // arithmetic, no int/float round trip.
 static inline vf fa_exp(const vf & x) {
     const vf one = ::aie::broadcast<float, FA_MT>(1.0f);
-    const vf xc  = ::aie::max(x, ::aie::broadcast<float, FA_MT>(-40.0f));
-    const vf t   = ::aie::mul(xc, ::aie::broadcast<float, FA_MT>(1.0f / 256.0f))
-                       .template to_vector<float>(0);
-    vf e = ::aie::broadcast<float, FA_MT>(1.0f / 5.0f);
-    e = ::aie::add(::aie::mul(e, t).template to_vector<float>(0),
-                   ::aie::broadcast<float, FA_MT>(1.0f / 4.0f));
-    e = ::aie::add(::aie::mul(e, t).template to_vector<float>(0),
-                   ::aie::broadcast<float, FA_MT>(1.0f / 3.0f));
-    e = ::aie::add(::aie::mul(e, t).template to_vector<float>(0),
-                   ::aie::broadcast<float, FA_MT>(1.0f / 2.0f));
+    const vf xc  = ::aie::max(x, ::aie::broadcast<float, FA_MT>(FA_EXP_MIN));
+    const vf t   = ::aie::mul(xc, ::aie::broadcast<float, FA_MT>(1.0f / FA_EXP_SHIFT)).template to_vector<float>(0);
+    vf       e   = ::aie::broadcast<float, FA_MT>(1.0f / 5.0f);
+    e = ::aie::add(::aie::mul(e, t).template to_vector<float>(0), ::aie::broadcast<float, FA_MT>(1.0f / 4.0f));
+    e = ::aie::add(::aie::mul(e, t).template to_vector<float>(0), ::aie::broadcast<float, FA_MT>(1.0f / 3.0f));
+    e = ::aie::add(::aie::mul(e, t).template to_vector<float>(0), ::aie::broadcast<float, FA_MT>(1.0f / 2.0f));
     e = ::aie::add(::aie::mul(e, t).template to_vector<float>(0), one);
     e = ::aie::add(::aie::mul(e, t).template to_vector<float>(0), one);
     e = ::aie::mul(e, e).template to_vector<float>(0);
@@ -97,27 +98,26 @@ static inline vf fa_exp(const vf & x) {
 // reciprocal table is bf16 and AIE2-only.
 static inline vf fa_rcp(const vf & a) {
     const vf two = ::aie::broadcast<float, FA_MT>(2.0f);
-    vf r = ::aie::sub(::aie::broadcast<int32, FA_MT>(0x7EF311C3),
-                      a.template cast_to<int32>()).template cast_to<float>();
-    r = ::aie::mul(r, ::aie::sub(two, ::aie::mul(a, r).template to_vector<float>(0)))
-            .template to_vector<float>(0);
-    r = ::aie::mul(r, ::aie::sub(two, ::aie::mul(a, r).template to_vector<float>(0)))
-            .template to_vector<float>(0);
-    r = ::aie::mul(r, ::aie::sub(two, ::aie::mul(a, r).template to_vector<float>(0)))
-            .template to_vector<float>(0);
+    vf       r =
+        ::aie::sub(::aie::broadcast<int32, FA_MT>(0x7EF311C3), a.template cast_to<int32>()).template cast_to<float>();
+    r = ::aie::mul(r, ::aie::sub(two, ::aie::mul(a, r).template to_vector<float>(0))).template to_vector<float>(0);
+    r = ::aie::mul(r, ::aie::sub(two, ::aie::mul(a, r).template to_vector<float>(0))).template to_vector<float>(0);
+    r = ::aie::mul(r, ::aie::sub(two, ::aie::mul(a, r).template to_vector<float>(0))).template to_vector<float>(0);
     return r;
 }
 
 // Lane index as a float, for the causal compare. Built once per call from a
 // constant table: a vector iota is not in the API for every element type.
 static const float fa_lane_tbl[64] = {
-    0,  1,  2,  3,  4,  5,  6,  7,  8,  9,  10, 11, 12, 13, 14, 15,
-    16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31,
-    32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47,
-    48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63,
+    0,  1,  2,  3,  4,  5,  6,  7,  8,  9,  10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21,
+    22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43,
+    44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63,
 };
 
 extern "C" void ggml_xdna_fa_zero(float * acc) {
+    // The rounding mode is the core's, left by whatever ran on it before:
+    // set it, or the first dispatch after another design rounds differently.
+    aie::set_rounding(aie::rounding_mode::conv_even);
     const vf z = ::aie::zeros<float, FA_MT>();
     for (int i = 0; i < FA_D; i++) {
         ::aie::store_v(FA_O(acc) + i * FA_MT, z);
@@ -138,17 +138,19 @@ extern "C" void ggml_xdna_fa_zero(float * acc) {
 //
 //   [0] zero the accumulator (first chunk)   [2] first tile of this chunk
 //   [1] normalise it (last chunk)            [3] keys cached before the batch
-extern "C" void ggml_xdna_fa_step(float * acc, int32_t * qpar, bfloat16 * kv,
-                                  int32_t jt, int32_t mb, int32_t row) {
-    const bfloat16 * qt = (const bfloat16 *) (qpar + FA_QHDR);
-    const int32_t jtb   = qpar[2];
-    const int32_t npast = qpar[3];
-    const bfloat16 * K = kv;
-    const bfloat16 * V = kv + FA_JT * FA_D;
-    float *          O = FA_O(acc);
+extern "C" void ggml_xdna_fa_step(float * acc, int32_t * qpar, bfloat16 * kv, int32_t jt, int32_t mb, int32_t row) {
+    // The rounding mode is the core's, left by whatever ran on it before:
+    // set it, or the first dispatch after another design rounds differently.
+    aie::set_rounding(aie::rounding_mode::conv_even);
+    const bfloat16 * qt    = (const bfloat16 *) (qpar + FA_QHDR);
+    const int32_t    jtb   = qpar[2];
+    const int32_t    npast = qpar[3];
+    const bfloat16 * K     = kv;
+    const bfloat16 * V     = kv + FA_JT * FA_D;
+    float *          O     = FA_O(acc);
 
-    const vf lane  = ::aie::load_v<FA_MT>(fa_lane_tbl);
-    const int j0 = ((int) jtb + (int) jt) * FA_JT;
+    const vf  lane  = ::aie::load_v<FA_MT>(fa_lane_tbl);
+    const int j0    = ((int) jtb + (int) jt) * FA_JT;
     // Query i of this block sits at cache position qpos0 + i, so it may see
     // keys 0 .. qpos0 + i.
     const int qpos0 = (int) npast + ((int) mb * FA_ROWS + (int) row) * FA_MT;
@@ -164,34 +166,32 @@ extern "C" void ggml_xdna_fa_step(float * acc, int32_t * qpar, bfloat16 * kv,
     vf m_new = m_old;
     for (int j = 0; j < FA_JT; j++) {
         const bfloat16 * kr = K + j * FA_D;
-        accf a = ::aie::zeros<accfloat, FA_MT>();
+        accf             a  = ::aie::zeros<accfloat, FA_MT>();
 #pragma clang loop unroll_count(8)
         for (int d = 0; d < FA_D; d++) {
-            a = ::aie::mac(a, ::aie::load_v<FA_MT>(qt + d * FA_MT),
-                           ::aie::broadcast<bfloat16, FA_MT>(kr[d]));
+            a = ::aie::mac(a, ::aie::load_v<FA_MT>(qt + d * FA_MT), ::aie::broadcast<bfloat16, FA_MT>(kr[d]));
         }
-        vf s = ::aie::mul(a.template to_vector<float>(),
-                          ::aie::broadcast<float, FA_MT>(FA_SCALE))
+        vf s = ::aie::mul(a.template to_vector<float>(), ::aie::broadcast<float, FA_MT>(FA_SCALE))
                    .template to_vector<float>(0);
         // Causal mask without a select: lane i keeps key j0+j when
         // i >= j0 + j - qpos0, so min(lane - threshold, 0) is zero where the
         // key is visible and negative where it is not.
         const vf d0 = ::aie::sub(lane, ::aie::broadcast<float, FA_MT>(thr));
-        const vf bias = ::aie::mul(::aie::min(d0, ::aie::zeros<float, FA_MT>()),
-                                   ::aie::broadcast<float, FA_MT>(-FA_MASK))
-                            .template to_vector<float>(0);
+        const vf bias =
+            ::aie::mul(::aie::min(d0, ::aie::zeros<float, FA_MT>()), ::aie::broadcast<float, FA_MT>(-FA_MASK))
+                .template to_vector<float>(0);
         s     = ::aie::add(s, bias);
         S[j]  = s;
         m_new = ::aie::max(m_new, s);
-        thr  += 1.0f;
+        thr += 1.0f;
     }
 
-    const vf corr = fa_exp(::aie::sub(m_old, m_new));
-    vf l_new = ::aie::mul(l_old, corr).template to_vector<float>(0);
-    vbf P[FA_JT];
+    const vf corr  = fa_exp(::aie::sub(m_old, m_new));
+    vf       l_new = ::aie::mul(l_old, corr).template to_vector<float>(0);
+    vbf      P[FA_JT];
     for (int j = 0; j < FA_JT; j++) {
         const vf p = fa_exp(::aie::sub(S[j], m_new));
-        l_new = ::aie::add(l_new, p);
+        l_new      = ::aie::add(l_new, p);
         accf pa;
         pa.from_vector(p);
         P[j] = pa.template to_vector<bfloat16>();
@@ -202,12 +202,10 @@ extern "C" void ggml_xdna_fa_step(float * acc, int32_t * qpar, bfloat16 * kv,
     // bf16 MAC the QK loop above uses.
     for (int d = 0; d < FA_D; d++) {
         accf a;
-        a.from_vector(::aie::mul(::aie::load_v<FA_MT>(O + d * FA_MT), corr)
-                          .template to_vector<float>(0));
+        a.from_vector(::aie::mul(::aie::load_v<FA_MT>(O + d * FA_MT), corr).template to_vector<float>(0));
 #pragma clang loop unroll_count(8)
         for (int j = 0; j < FA_JT; j++) {
-            a = ::aie::mac(a, P[j],
-                           ::aie::broadcast<bfloat16, FA_MT>(V[j * FA_D + d]));
+            a = ::aie::mac(a, P[j], ::aie::broadcast<bfloat16, FA_MT>(V[j * FA_D + d]));
         }
         ::aie::store_v(O + d * FA_MT, a.template to_vector<float>());
     }
@@ -219,11 +217,13 @@ extern "C" void ggml_xdna_fa_step(float * acc, int32_t * qpar, bfloat16 * kv,
 // Divide the accumulated O by l, in place. A row with no visible key cannot
 // happen in a causal batch - every query sees at least itself - so l > 0.
 extern "C" void ggml_xdna_fa_norm(float * acc) {
+    // The rounding mode is the core's, left by whatever ran on it before:
+    // set it, or the first dispatch after another design rounds differently.
+    aie::set_rounding(aie::rounding_mode::conv_even);
     const vf inv = fa_rcp(::aie::load_v<FA_MT>(FA_LV(acc)));
-    float * O = FA_O(acc);
+    float *  O   = FA_O(acc);
     for (int d = 0; d < FA_D; d++) {
         ::aie::store_v(O + d * FA_MT,
-                       ::aie::mul(::aie::load_v<FA_MT>(O + d * FA_MT), inv)
-                           .template to_vector<float>(0));
+                       ::aie::mul(::aie::load_v<FA_MT>(O + d * FA_MT), inv).template to_vector<float>(0));
     }
 }

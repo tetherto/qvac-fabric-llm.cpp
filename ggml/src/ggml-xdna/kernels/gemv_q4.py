@@ -5,9 +5,9 @@ applied to the accumulator (gemv_q4.cc).
   rm -rf ~/.npu/cache && python3 gemv_q4.py -d npu2 --fmt q4g32
   rm -rf ~/.npu/cache && python3 gemv_q4.py -d npu2 --fmt q8g16 -K 2048 -N 4096 --n-core 64
 
-The q8 example needs --n-core 64: the shape alone derives 128, and two
-int8 code planes plus the parameter planes then ask for more L1 than a
-core has.
+The q8g16 line pins --n-core 64: the shape-derived 128 doubles the weight tile,
+and its double buffering plus the activation tiles then overruns the 56 KB L1
+budget.
 
 The core program depends only on (format, N_CORE, K_TILE), so one artifact per
 format serves every shape and the backend builds its own instruction stream
@@ -40,6 +40,8 @@ from pathlib import Path
 
 import ml_dtypes
 import numpy as np
+
+import kernelsrc
 
 import aie.iron as iron
 from aie.iron import Buffer, CompileTime, In, ObjectFifo, Out, Program, Runtime, Worker
@@ -149,7 +151,9 @@ PRO_EMIT_COL = 5
 
 
 def _kernels(fmt: str, k_tile: int, n_core: int):
-    src = (Path(__file__).resolve().parent / "gemv-q4.cc").read_text()
+    here = Path(__file__).resolve().parent
+    raw = (here / "gemv-q4.cc").read_text()
+    src = kernelsrc.inline(raw)
     flags = _kernel_flags(fmt, k_tile, n_core)
 
     # The prologue is a build of its own: its quantizer is about a kilobyte of
@@ -160,8 +164,9 @@ def _kernels(fmt: str, k_tile: int, n_core: int):
     pro_flags = [f for f in flags if not f.startswith("-DACT_RAW")] + \
                 ["-DACT_RAW=0", "-DACT_PRO=1"]
     digest = hashlib.sha256((src + "\0".join(flags)).encode()).hexdigest()[:8]
-    # The attention layer's prologue work (act-att.cc) shares the object.
-    psrc = src + "\n" + (Path(__file__).resolve().parent / "act-att.cc").read_text()
+    # The attention layer's prologue work (act-att.cc) shares the object. The
+    # two are inlined together, so a header they both include lands once.
+    psrc = kernelsrc.inline(raw + "\n" + (here / "act-att.cc").read_text())
     pdigest = hashlib.sha256((psrc + "\0".join(pro_flags)).encode()).hexdigest()[:8]
     w_ty = np.ndarray[(tile_bytes(fmt, k_tile, n_core),), np.dtype[np.uint8]]
     a_ty = np.ndarray[(ACT_TILE // 4,), np.dtype[np.int32]]
@@ -204,7 +209,7 @@ def _kernels_lead(fmt: str, k_tile: int, n_core: int):
     and one symbol cannot be declared with two types - so the same source is
     built again under another name."""
     kdir = Path(__file__).resolve().parent
-    src = (kdir / "gemv-q4.cc").read_text()
+    src = kernelsrc.load(kdir / "gemv-q4.cc")
     zsrc = (kdir / "gemv-zero.cc").read_text()
     msrc = (kdir / "gemv-merge.cc").read_text()
     flags = _kernel_flags(fmt, k_tile, n_core)
@@ -246,7 +251,7 @@ AD_SCR = 2 * 32 * 64
 
 def _kernels_att(fmt: str, k_tile: int, n_core: int, lead: bool):
     kdir = Path(__file__).resolve().parent
-    src = (kdir / "attn-dec.cc").read_text()
+    src = kernelsrc.load(kdir / "attn-dec.cc")
     sfx = "_lead" if lead else ""
     flags = [f"-DACT_TILE={ACT_TILE}", f"-DN_CORE={n_core}"]
     if lead:

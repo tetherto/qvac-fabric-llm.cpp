@@ -1,8 +1,7 @@
-# One pair of the prefill attention on the mmul (FLM_PREFILL_PLAN.md, step 4,
-# build order 1) against numpy: 32 rows (4 query heads x 8 positions q0 ..
-# q0 + 7 of one KV head), causal over keys 0 .. q0 + 7, each core holding one
-# half of D = 256 and the two exchanging their halves of the scores through
-# shared memory (kernels/attn-mm.cc), everything transposed.
+# One pair of the prefill attention on the mmul against numpy: 32 rows (4 query
+# heads x 8 positions q0 .. q0 + 7 of one KV head), causal over keys 0 .. q0 + 7,
+# each core holding one half of D = 256 and the two exchanging their halves of
+# the scores through shared memory (kernels/attn-mm.cc), everything transposed.
 # On the bench, in the IRON env:
 #   NPU_CACHE_HOME=$(mktemp -d) python probes/fa_pair_check.py [q0]
 import hashlib

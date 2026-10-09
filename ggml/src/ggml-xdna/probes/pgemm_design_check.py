@@ -86,10 +86,10 @@ a_t = iron.tensor((A_ELEMS,), dtype=bf16, device="npu")
 c_t = iron.zeros((C_ELEMS,), dtype=np.float32, device="npu")
 hdr = pg.header(M, K, N, Q8, GLU)
 np.copyto(w_t.numpy(), wbuf)
-
-
 # the header through the MemTile's tiling: bf16 j of it sent where the
 # tiling reads output j from
+
+
 def untiled(h):
     o = np.zeros_like(h)
     for j in range(64):

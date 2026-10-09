@@ -543,13 +543,17 @@ llama_build_and_test(test-autorelease.cpp       LABEL "model")
 llama_build_and_test(test-backend-sampler.cpp   LABEL "model")
 llama_build_and_test(test-laya.cpp)
 
-# XDNA NPU: load, run and free a model several times in one process (#293).
-# Self-skipping when no XDNA device is registered.
+# XDNA NPU. Self-skipping when no XDNA device is registered.
 if (GGML_XDNA)
+    # Load, run and free a model several times in one process (#293).
     llama_build_and_test(test-xdna-reload.cpp       LABEL "model")
     # Graphs the backend rewrites, against the CPU backend. Needs the device,
-    # no model; self-skipping like the above.
+    # no model.
     llama_build_and_test(test-xdna-graph.cpp)
+    # Two llama contexts computing at once (-m model.gguf).
+    llama_build_and_test(test-xdna-contexts.cpp     LABEL "model")
+    # A sequence's state saved and restored around other tokens (-m model.gguf).
+    llama_build_and_test(test-xdna-state.cpp        LABEL "model")
     # The host-only backend tests are built with the backend
     # (ggml/src/ggml-xdna/CMakeLists.txt); they need no model and no device.
     foreach(t test-xdna-repack)

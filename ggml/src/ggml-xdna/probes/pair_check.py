@@ -1,7 +1,7 @@
-# One expander/multiplier pair of the prefill GEMM (FLM_PREFILL_PLAN.md, step
-# 1, build order 2) against numpy: C (M x 64) = A (M x K) @ W (K x 64), W the
-# decode GEMV tiles of one core, expanded on tile (0, 2) (gemm-expand.cc) and
-# handed over in shared memory to the mmul on its neighbour (0, 3).
+# One expander/multiplier pair of the prefill GEMM against numpy: C (M x 64) =
+# A (M x K) @ W (K x 64), W the decode GEMV tiles of one core, expanded on tile
+# (0, 2) (gemm-expand.cc) and handed over in shared memory to the mmul on its
+# neighbour (0, 3).
 # On the bench, in the IRON env:
 #   NPU_CACHE_HOME=$(mktemp -d) python probes/pair_check.py q4g32|q8g16 [K] [bfp16]
 import hashlib
