@@ -770,6 +770,10 @@ struct ggml_cl_adreno_xmem_attn_state {
 // Multi-column K-quant GEMVs: one kernel per src1 column count in [MIN, MAX], stored at its column count.
 static constexpr int KQUANT_MC_GEMV_MIN_COLS = 2;
 static constexpr int KQUANT_MC_GEMV_MAX_COLS = 8;
+
+// Padded src1 columns per work item of the q6_K noshuffle GEMM (Q6K_GEMM_COLS in the kernel) and of its narrow build.
+static constexpr int Q6K_GEMM_COLS        = 8;
+static constexpr int Q6K_GEMM_NARROW_COLS = 4;
 #endif
 
 // backend context
@@ -1443,6 +1447,7 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_gemv_noshuffle_q6_K_f32_mc[KQUANT_MC_GEMV_MAX_COLS + 1] = {};  // multi-column GEMVs, by ne1
     cl_kernel kernel_gemm_noshuffle_q6_K_f32;
     cl_kernel kernel_gemm_noshuffle_q6_K_f32_cok;
+    cl_kernel kernel_gemm_noshuffle_q6_K_f32_n4 = nullptr;  // N padded to Q6K_GEMM_NARROW_COLS, A7X only
     cl_kernel kernel_gemv_noshuffle_q5_k_f32;
     cl_kernel kernel_gemv_noshuffle_q5_k_f32_mc[KQUANT_MC_GEMV_MAX_COLS + 1] = {};  // multi-column GEMVs, by ne1
     cl_kernel kernel_gemm_noshuffle_q5_k_f32;
@@ -5613,6 +5618,14 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 
         CL_CHECK((backend_ctx->kernel_gemm_noshuffle_q6_K_f32 = clCreateKernel(prog, "kernel_gemm_noshuffle_q6_K_f32", &err), err));
         CL_CHECK((backend_ctx->kernel_gemm_noshuffle_q6_K_f32_cok = clCreateKernel(prog, "kernel_gemm_noshuffle_q6_K_f32_cok", &err), err));
+
+        // The narrow GEMM serves verify batches of up to Q6K_GEMM_NARROW_COLS tokens; only A7X is measured.
+        if (backend_ctx->adreno_gen == ADRENO_GPU_GEN::A7X) {
+            const std::string narrow_opts = CL_moe_compile_opts + " -DQ6K_GEMM_COLS=" + std::to_string(Q6K_GEMM_NARROW_COLS);
+            cl_program prog_narrow = build_program_from_source(backend_ctx, kernel_src.c_str(), narrow_opts);
+            CL_CHECK((backend_ctx->kernel_gemm_noshuffle_q6_K_f32_n4 = clCreateKernel(prog_narrow, "kernel_gemm_noshuffle_q6_K_f32_n4", &err), err));
+            CL_CHECK(clReleaseProgram(prog_narrow));
+        }
         GGML_LOG_CONT(".");
     }
 
@@ -22361,11 +22374,21 @@ static void ggml_cl_mul_mat_q6_K_f32_adreno(ggml_backend_t backend, const ggml_t
         img_desc.buffer = b_sub_buf;
         CL_CHECK((b_img = clCreateImage(context, CL_MEM_READ_ONLY, &img_fmt, &img_desc, NULL, &err), err));
 
-        // pad N to multiple of 8
-        int extra_elements = ne1 % 8;
+        // Opt-in cooperative-K GEMM (GGML_OPENCL_Q6K_GEMM_COK=1): it reassociates the K sum, so logits are not
+        // byte-identical to the default path.
+        static const char * q6k_cok_env = getenv("GGML_OPENCL_Q6K_GEMM_COK");
+        static const bool q6k_gemm_cok  = (q6k_cok_env != nullptr) && (atoi(q6k_cok_env) != 0);
+        const bool use_q6k_cok = q6k_gemm_cok && (ne1 <= 8);
+        // Up to Q6K_GEMM_NARROW_COLS columns, the narrow GEMM skips the padded half of the 8-column tile.
+        const bool use_q6k_narrow = !use_q6k_cok && backend_ctx->kernel_gemm_noshuffle_q6_K_f32_n4 != nullptr &&
+                                    ne1 <= Q6K_GEMM_NARROW_COLS;
+        const int  pad_cols       = use_q6k_narrow ? Q6K_GEMM_NARROW_COLS : Q6K_GEMM_COLS;
+
+        // pad N to a multiple of pad_cols
+        int extra_elements = ne1 % pad_cols;
         int padding = 0;
         if (extra_elements > 0){
-            padding = 8 - extra_elements;
+            padding = pad_cols - extra_elements;
         }
 
         // subbuffer for transposed activation
@@ -22403,19 +22426,9 @@ static void ggml_cl_mul_mat_q6_K_f32_adreno(ggml_backend_t backend, const ggml_t
         backend_ctx->enqueue_ndrange_kernel(kernel, 2, global_size_t, local_size_t, dst);
 
         // gemm
-        // Cooperative-K small-batch (n_q in [2..8]) path: intra-WG K-split,
-        // mirrors the q4_K _cok path (batched serving). OPT-IN
-        // (GGML_OPENCL_Q6K_GEMM_COK=1), DEFAULT OFF: q6_K is the tied lm_head/
-        // output projection, so the K-reassociation perturbs final logits and
-        // greedy is NOT byte-identical (op-tests pass, output coherent, but not
-        // bit-exact). It is also NEUTRAL on end-to-end MTP (q4_K cok already
-        // captured that; the MTP bottleneck moved off the GEMMs). Keep opt-in
-        // for batched serving until PPL-validated on a non-GDN q6_K model.
-        static const char * q6k_cok_env = getenv("GGML_OPENCL_Q6K_GEMM_COK");
-        static const bool q6k_gemm_cok  = (q6k_cok_env != nullptr) && (atoi(q6k_cok_env) != 0);
-        const bool use_q6k_cok = q6k_gemm_cok && (ne1 <= 8);
-        kernel = use_q6k_cok ? backend_ctx->kernel_gemm_noshuffle_q6_K_f32_cok
-                             : backend_ctx->kernel_gemm_noshuffle_q6_K_f32;
+        kernel = use_q6k_cok    ? backend_ctx->kernel_gemm_noshuffle_q6_K_f32_cok
+               : use_q6k_narrow ? backend_ctx->kernel_gemm_noshuffle_q6_K_f32_n4
+                                : backend_ctx->kernel_gemm_noshuffle_q6_K_f32;
         int padded_N = ne1 + padding;
 
         cl_ushort mask_f000 = 0xF000;
@@ -22445,7 +22458,7 @@ static void ggml_cl_mul_mat_q6_K_f32_adreno(ggml_backend_t backend, const ggml_t
             local_work_size[1] = 8;               // COK_NSG
             local_work_size[2] = 1;
         } else {
-            global_work_size[0] = (size_t)CEIL_DIV(ne1, 8);
+            global_work_size[0] = (size_t)CEIL_DIV(ne1, pad_cols);
             global_work_size[1] = (size_t)CEIL_DIV(ne01, 4);
             global_work_size[2] = 1;
             local_work_size[0] = 2;
