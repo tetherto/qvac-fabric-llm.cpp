@@ -100,6 +100,12 @@ LLAMA_API void llama_set_embeddings_nextn(struct llama_context * ctx, bool value
 // chain multiple trained NextN heads. Default 0 (first head).
 LLAMA_API void llama_set_nextn_layer_offset(struct llama_context * ctx, int32_t offset);
 
+// Restrict the tokens a DFlash2 drafter proposes to n_ranges ascending, disjoint [ranges[2*i], ranges[2*i + 1]) token id ranges.
+// n_ranges == 0 restores the full vocabulary and succeeds for any model. Otherwise returns false and leaves the context unchanged
+// for a model other than DFlash2, a DFlash2 drafter with a reduced (d2t) vocabulary, or invalid ranges, including ranges that
+// cover fewer ids than the drafter's selector top-k.
+LLAMA_API bool llama_set_draft_vocab(struct llama_context * ctx, const int32_t * ranges, int32_t n_ranges);
+
 // mirrors:
 // LLAMA_API float * llama_get_embeddings(struct llama_context * ctx);
 LLAMA_API float * llama_get_embeddings_nextn(struct llama_context * ctx);
@@ -109,6 +115,10 @@ LLAMA_API float * llama_get_embeddings_nextn_ith(struct llama_context * ctx, int
 
 // Set whether the context outputs the input embeddings of a specific layer
 LLAMA_API void llama_set_embeddings_layer_inp(struct llama_context * ctx, uint32_t lid, bool value);
+
+// Output the layer input rows of each ubatch only from its first row at a position >= pos_min of the row's sequence (-1 = all rows)
+// The skipped rows keep stale data and must not be read
+LLAMA_API void llama_set_embeddings_layer_inp_pos_min(struct llama_context * ctx, llama_seq_id seq_id, llama_pos pos_min);
 
 // mirrors:
 // LLAMA_API float * llama_get_embeddings(struct llama_context * ctx);

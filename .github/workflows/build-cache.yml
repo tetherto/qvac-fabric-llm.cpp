@@ -5,8 +5,13 @@ on:
   schedule:
     - cron: '0 * * * *'
 
+# QVAC divergence from upstream: dedupe per PR and per branch, so a re-push or
+# re-dispatch supersedes the in-flight run. The default branch deliberately
+# keeps upstream's run_id behaviour — this workflow is cron-only, and an hourly
+# run that outlives its hour must not be killed by the next one, or the cache it
+# exists to populate is never saved. See QVAC-24627.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.head_ref && github.ref || github.run_id }}
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || (github.ref == 'refs/heads/master' && github.run_id) || github.ref }}
   cancel-in-progress: true
 
 jobs:

@@ -25,13 +25,20 @@ on:
       'ci/run.sh',
       '**/CMakeLists.txt',
       '**/.cmake',
+      'ggml/include/**',
+      'src/**',
+      'tests/**',
       'ggml/src/*',
       'ggml/src/ggml-cpu/**',
       'ggml/src/ggml-vulkan/**'
     ]
 
+# QVAC divergence from upstream: dedupe per PR and per branch, so a re-push or
+# re-dispatch supersedes the in-flight run. The default branch deliberately
+# keeps upstream's run_id behaviour - master pushes must not cancel each other,
+# or a merged commit can end with no CI verdict. See QVAC-24627.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.head_ref && github.ref || github.run_id }}
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || (github.ref == 'refs/heads/master' && github.run_id) || github.ref }}
   cancel-in-progress: true
 
 env:
@@ -44,9 +51,15 @@ env:
   LLAMA_ARG_LOG_TIMESTAMPS: 1
 
 jobs:
+  authorize:
+    permissions: {}
+    uses: ./.github/workflows/reusable-authorize-self-hosted.yml
+
   gpu-vulkan-nvidia-cm:
+    needs: authorize
+    if: needs.authorize.outputs.allowed == 'true'
     # runs-on: "hf-jobs-t4-small:ubuntu26_04"
-    runs-on: [self-hosted, Linux, NVIDIA]
+    runs-on: qvac-ubuntu2204-x64-gpu
 
     steps:
       - name: Clone
@@ -74,6 +87,7 @@ jobs:
       - name: Test
         id: ggml-ci
         run: |
+          git lfs install
           vulkaninfo --summary
           GG_BUILD_VULKAN=1 GGML_VK_DISABLE_COOPMAT2=1 bash ./ci/run.sh ~/results/llama.cpp ~/mnt/llama.cpp
 
@@ -90,8 +104,10 @@ jobs:
       #     save: true
 
   gpu-vulkan-nvidia-cm2:
+    needs: authorize
+    if: needs.authorize.outputs.allowed == 'true'
     # runs-on: "hf-jobs-t4-small:ubuntu26_04"
-    runs-on: [self-hosted, Linux, NVIDIA, COOPMAT2]
+    runs-on: qvac-ubuntu2204-x64-gpu
 
     steps:
       - name: Clone
@@ -119,6 +135,7 @@ jobs:
       - name: Test
         id: ggml-ci
         run: |
+          git lfs install
           vulkaninfo --summary
           GG_BUILD_VULKAN=1 bash ./ci/run.sh ~/results/llama.cpp ~/mnt/llama.cpp
 
@@ -135,7 +152,9 @@ jobs:
       #     save: true
 
   gpu-vulkan-apple:
-    runs-on: [self-hosted, macOS, ARM64]
+    needs: authorize
+    if: needs.authorize.outputs.allowed == 'true'
+    runs-on: qvac-macos26-arm64-gpu
 
     steps:
       - name: Clone
@@ -145,10 +164,12 @@ jobs:
       - name: Test
         id: ggml-ci
         run: |
+          git lfs install
           vulkaninfo --summary
           GG_BUILD_VULKAN=1 bash ./ci/run.sh ~/results/llama.cpp ~/mnt/llama.cpp
 
   gpu-vulkan-intel-linux:
+    if: false  # QVAC-23796: no matching hardware
     runs-on: [self-hosted, Linux, Intel]
 
     steps:
@@ -161,10 +182,12 @@ jobs:
       - name: Test
         id: ggml-ci
         run: |
+          git lfs install
           vulkaninfo --summary
           GG_BUILD_VULKAN=1 bash ./ci/run.sh ~/results/llama.cpp ~/mnt/llama.cpp
 
   gpu-vulkan-intel-windows:
+    if: false  # QVAC-23796: no matching hardware
     runs-on: [self-hosted, Windows, X64, Intel]
 
     steps:
@@ -180,6 +203,7 @@ jobs:
           CHERE_INVOKING: 1
           PATH: C:\msys64\ucrt64\bin;C:\msys64\usr\bin;C:\Windows\System32;${{ env.PATH }}
         run: |
+          git lfs install
           vulkaninfo --summary
           # Skip python related tests with GG_BUILD_LOW_PERF=1 since Windows MSYS2 UCRT64 currently fails to create
           # a valid python environment for testing
@@ -187,6 +211,8 @@ jobs:
 
   # TODO: provision AMD GPU machine
   # amd-vulkan:
+  #   needs: authorize
+  #   if: needs.authorize.outputs.allowed == 'true'
   #   runs-on: [self-hosted, Linux, AMD]
 
   #   steps:

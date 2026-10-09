@@ -1250,6 +1250,7 @@ static webgpu_encoded_op ggml_webgpu_ssm_scan(webgpu_context & ctx,
                                                    ggml_webgpu_tensor_binding_overlap(ctx->global_ctx, src4, src5);
     bool                             a_overlap   = false;
     bool                             ids_overlap = false;
+    bool                             dst_overlap = false;
     ggml_webgpu_merged_binding_range xbc_merged_range = {};
     if (xbc_overlap) {
         xbc_merged_range = ggml_webgpu_tensor_merged_binding_range(ctx, { src1, src2, src4, src5 });
@@ -1265,14 +1266,23 @@ static webgpu_encoded_op ggml_webgpu_ssm_scan(webgpu_context & ctx,
                 a_overlap ? ggml_webgpu_tensor_merged_binding_range(ctx, { src1, src2, src3, src4, src5, src6 }) :
                             ggml_webgpu_tensor_merged_binding_range(ctx, { src1, src2, src4, src5, src6 });
         }
+        dst_overlap = ggml_webgpu_tensor_binding_overlap_range(ctx->global_ctx, dst, src1->buffer,
+                                                               xbc_merged_range.offset, xbc_merged_range.size);
+        if (dst_overlap) {
+            // The merged inputs can span a gap occupied by the output.
+            const auto dst_range = ggml_webgpu_tensor_merged_binding_range(ctx, { dst });
+            GGML_ASSERT(dst_range.offset >= xbc_merged_range.offset &&
+                        dst_range.offset + dst_range.size <= xbc_merged_range.offset + xbc_merged_range.size);
+        }
     }
 
     webgpu_pipeline pipeline =
-        ctx->shader_lib->get_ssm_scan_pipeline(shader_lib_ctx, xbc_overlap, a_overlap, ids_overlap);
+        ctx->shader_lib->get_ssm_scan_pipeline(shader_lib_ctx, xbc_overlap, a_overlap, ids_overlap, dst_overlap);
     auto * decisions = static_cast<ggml_webgpu_ssm_scan_shader_decisions *>(pipeline.context.get());
     xbc_overlap      = decisions->xbc_overlap;
     a_overlap        = decisions->a_overlap;
     ids_overlap      = decisions->ids_overlap;
+    dst_overlap      = decisions->dst_overlap;
 
     uint32_t offset_x        = (uint32_t) (ggml_webgpu_tensor_misalignment(ctx, src1) / ggml_type_size(src1->type));
     uint32_t offset_dt       = (uint32_t) (ggml_webgpu_tensor_misalignment(ctx, src2) / ggml_type_size(src2->type));
@@ -1305,7 +1315,8 @@ static webgpu_encoded_op ggml_webgpu_ssm_scan(webgpu_context & ctx,
         offset_B,
         offset_C,
         offset_ids,
-        (uint32_t) (ggml_webgpu_tensor_misalignment(ctx, dst) / ggml_type_size(dst->type)),
+        dst_overlap ? ggml_webgpu_tensor_merged_element_offset(dst, xbc_merged_range) :
+                      (uint32_t) (ggml_webgpu_tensor_misalignment(ctx, dst) / ggml_type_size(dst->type)),
 
         (uint32_t) (src0->nb[1] / ggml_type_size(src0->type)),
         (uint32_t) (src0->nb[2] / ggml_type_size(src0->type)),
@@ -1344,18 +1355,14 @@ static webgpu_encoded_op ggml_webgpu_ssm_scan(webgpu_context & ctx,
     if (xbc_overlap) {
         entries.push_back(
             ggml_webgpu_make_bind_group_entry(1, ggml_webgpu_tensor_buf(src1), xbc_bind_offset, xbc_bind_size));
-        if (ids_overlap) {
-            if (!a_overlap) {
-                entries.push_back(ggml_webgpu_make_tensor_bind_group_entry(ctx, 2, src3));
-            }
-            entries.push_back(ggml_webgpu_make_tensor_bind_group_entry(ctx, a_overlap ? 2 : 3, dst));
-        } else if (a_overlap) {
-            entries.push_back(ggml_webgpu_make_tensor_bind_group_entry(ctx, 2, src6));
-            entries.push_back(ggml_webgpu_make_tensor_bind_group_entry(ctx, 3, dst));
-        } else {
-            entries.push_back(ggml_webgpu_make_tensor_bind_group_entry(ctx, 2, src3));
-            entries.push_back(ggml_webgpu_make_tensor_bind_group_entry(ctx, 3, src6));
-            entries.push_back(ggml_webgpu_make_tensor_bind_group_entry(ctx, 4, dst));
+        if (!a_overlap) {
+            entries.push_back(ggml_webgpu_make_tensor_bind_group_entry(ctx, entries.size(), src3));
+        }
+        if (!ids_overlap) {
+            entries.push_back(ggml_webgpu_make_tensor_bind_group_entry(ctx, entries.size(), src6));
+        }
+        if (!dst_overlap) {
+            entries.push_back(ggml_webgpu_make_tensor_bind_group_entry(ctx, entries.size(), dst));
         }
     } else {
         entries.push_back(ggml_webgpu_make_tensor_bind_group_entry(ctx, 1, src1));
@@ -4084,6 +4091,7 @@ static void ggml_backend_webgpu_device_get_props(ggml_backend_dev_t dev, struct 
         /* .buffer_from_host_ptr  = */ false,
         /* .events                = */ false,
         /* .mmap_support          = */ true,
+        /* .copy_stream           = */ false,
     };
 }
 

@@ -25,13 +25,20 @@ on:
       'ci/run.sh',
       '**/CMakeLists.txt',
       '**/.cmake',
+      'ggml/include/**',
+      'src/**',
+      'tests/**',
       'ggml/src/*',
       'ggml/src/ggml-cpu/**',
       'ggml/src/ggml-cuda/**'
     ]
 
+# QVAC divergence from upstream: dedupe per PR and per branch, so a re-push or
+# re-dispatch supersedes the in-flight run. The default branch deliberately
+# keeps upstream's run_id behaviour - master pushes must not cancel each other,
+# or a merged commit can end with no CI verdict. See QVAC-24627.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.head_ref && github.ref || github.run_id }}
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || (github.ref == 'refs/heads/master' && github.run_id) || github.ref }}
   cancel-in-progress: true
 
 env:
@@ -44,19 +51,23 @@ env:
   LLAMA_ARG_LOG_TIMESTAMPS: 1
 
 jobs:
+  authorize:
+    permissions: {}
+    uses: ./.github/workflows/reusable-authorize-self-hosted.yml
+
   gpu-cuda:
-    runs-on: "hf-jobs-t4-small:cuda13"
+    needs: authorize
+    if: needs.authorize.outputs.allowed == 'true'
+    # runs-on: "hf-jobs-t4-small:cuda13"
+    runs-on: qvac-ubuntu2204-x64-gpu
 
     steps:
       - name: Clone
         id: checkout
         uses: actions/checkout@v6
 
-      - name: Install dependencies
-        run: |
-          sudo apt update
-          sudo apt install -y cmake libssl-dev time unzip wget python3 python3-venv python3-pip
-
+      # No `sudo apt install` step: the self-hosted runners are de-sudoed, and these
+      # packages are already provisioned fleet-wide on the runners.
       - name: ccache
         uses: ggml-org/ccache-action@v1.2.24
         with:
@@ -73,6 +84,7 @@ jobs:
       - name: Test
         id: ggml-ci
         run: |
+          git lfs install
           nvidia-smi
           GG_BUILD_CUDA=1 CUDACXX=/usr/local/cuda/bin/nvcc bash ./ci/run.sh ~/results/llama.cpp ~/mnt/llama.cpp
 
@@ -89,6 +101,7 @@ jobs:
           save: true
 
   gpu-rocm:
+    if: false  # QVAC-23796: no matching hardware
     runs-on: [self-hosted, Linux, AMD]
 
     steps:
@@ -105,11 +118,14 @@ jobs:
         env:
           HIP_LAUNCH_BLOCKING: "1"
         run: |
+          git lfs install
           rocminfo
           GG_BUILD_ROCM=1 GG_BUILD_AMDGPU_TARGETS=gfx1151 bash ./ci/run.sh ~/results/llama.cpp ~/mnt/llama.cpp
 
   # TODO: provision AMD GPU machine
   # amd-rocm:
+  #   needs: authorize
+  #   if: needs.authorize.outputs.allowed == 'true'
   #   runs-on: [self-hosted, Linux, AMD]
 
   #   steps:

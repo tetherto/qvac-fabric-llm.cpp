@@ -143,6 +143,7 @@ public:
 
     llama_pos seq_pos_min(llama_seq_id seq_id) const override;
     llama_pos seq_pos_max(llama_seq_id seq_id) const override;
+    uint32_t  seq_token_count(llama_seq_id seq_id) const override;
 
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const override;
 
@@ -157,6 +158,7 @@ public:
 
     uint32_t get_size()     const;
     uint32_t get_n_stream() const;
+    uint32_t get_n_seq_ids() const;
 
     bool get_has_shift() const;
 
@@ -167,6 +169,9 @@ public:
     ggml_tensor * get_k_storage(int32_t il) const;
 
     const llama_kv_cells & get_cells(llama_seq_id seq_id) const;
+
+    // The stream holding seq_id's cells.
+    uint32_t get_stream(llama_seq_id seq_id) const;
 
     // state_read, plus the cells the restored tokens were placed in
     // a cache that mirrors another one (the qwen4exp indexer) must not search for its own cells: two searches agree only by luck
@@ -192,9 +197,16 @@ public:
     ggml_tensor * get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
     ggml_tensor * get_v(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
 
+    // width of the K-cache view used by the K-shift graph for this model layer
+    int64_t get_k_shift_width(uint32_t il) const;
+
     // store k_cur and v_cur in the cache based on the provided head location
     ggml_tensor * cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il, const slot_info & sinfo) const;
     ggml_tensor * cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, int32_t il, const slot_info & sinfo) const;
+
+    // gradient-aware retrieval for LoRA training
+    ggml_tensor * get_k_lora(ggml_context * ctx, ggml_tensor * k_cur, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
+    ggml_tensor * get_v_lora(ggml_context * ctx, ggml_tensor * v_cur, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
 
     //
     // preparation API
@@ -228,6 +240,7 @@ public:
     void set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ubatch, const slot_info & sinfo) const;
 
     void set_input_k_shift(ggml_tensor * dst) const;
+    void set_input_k_shift_data(int32_t * data) const;
 
     void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
@@ -403,6 +416,9 @@ public:
     ggml_tensor * get_k(ggml_context * ctx, int32_t il) const;
     ggml_tensor * get_v(ggml_context * ctx, int32_t il) const;
 
+    // The full K storage tensor of the layer, spanning all streams.
+    ggml_tensor * get_k_storage(int32_t il) const;
+
     // store k_cur and v_cur in the cache based on the provided head location
     // note: the heads in k_cur and v_cur should be laid out contiguously in memory
     //   - k_cur  [n_embd_head_k, n_head_k, n_tokens]
@@ -411,6 +427,10 @@ public:
     //   - v_idxs [n_tokens] or [n_tokens*n_embd_v_gqa] depending if V cache is transposed
     ggml_tensor * cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il) const;
     ggml_tensor * cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, int32_t il) const;
+
+    // gradient-aware retrieval for LoRA training
+    ggml_tensor * get_k_lora(ggml_context * ctx, ggml_tensor * k_cur, int32_t il) const;
+    ggml_tensor * get_v_lora(ggml_context * ctx, ggml_tensor * v_cur, int32_t il) const;
 
     // create destination indices for each head of the current batch for where it would be written in the KV cache
     // the indices address the global KV cache (not per stream) - this is not relevant for the user of this API, but

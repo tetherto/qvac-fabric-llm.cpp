@@ -229,6 +229,12 @@ static void test(void) {
     argv = {"binary_name", "-lm", "hello"};
     assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
 
+    // draft vocabulary ranges are B:E pairs of integers (llama_set_draft_vocab checks their order and bounds)
+    for (const char * ranges : {"0:10:20", "7", "a:5", "5:9x", "0:10,"}) {
+        argv = {"binary_name", "--spec-draft-vocab", ranges};
+        assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
+    }
+
     printf("test-arg-parser: test valid usage\n\n");
 
     argv = {"binary_name", "-m", "model_file.gguf"};
@@ -274,6 +280,10 @@ static void test(void) {
         assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), synth_params, LLAMA_EXAMPLE_SERVER));
     }
 
+    argv = {"binary_name", "--spec-draft-vocab", "0:98304,248032:248320"};
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
+    assert((params.speculative.draft.vocab_ranges == std::vector<int32_t>{0, 98304, 248032, 248320}));
+
     argv = {"binary_name", "-lm", "none"};
     assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
     assert(params.load_mode == LLAMA_LOAD_MODE_NONE);
@@ -294,6 +304,20 @@ static void test(void) {
     assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
     assert(params.load_mode == LLAMA_LOAD_MODE_DIRECT_IO);
 
+    {
+        common_params cache_params;
+        cache_params.model.path = "model_file.gguf";
+        assert(cache_params.moe_cache_auto && !cache_params.moe_cache_auto_explicit);
+        for (const char * value : {"auto", "0", "128", "auto"}) {
+            argv = {"binary_name", "--moe-cache-mib", value};
+            assert(common_params_parse(argv.size(), list_str_to_char(argv).data(), cache_params, LLAMA_EXAMPLE_COMMON));
+            const bool automatic = std::string(value) == "auto";
+            assert(cache_params.moe_cache_auto == automatic);
+            assert(cache_params.moe_cache_auto_explicit == automatic);
+            assert(cache_params.moe_cache_size == (std::string(value) == "128" ? 128 * 1024 * 1024 : 0));
+        }
+    }
+
     // multi-value args (CSV)
     argv = {"binary_name", "--lora", "file1.gguf,\"file2,2.gguf\",\"file3\"\"3\"\".gguf\",file4\".gguf"};
     assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
@@ -308,6 +332,20 @@ static void test(void) {
     printf("test-arg-parser: skip on windows build\n");
 #else
     printf("test-arg-parser: test environment variables (valid + invalid usages)\n\n");
+
+    {
+        common_params cache_params;
+        cache_params.model.path = "model_file.gguf";
+        setenv("LLAMA_ARG_MOE_CACHE_MIB", "auto", true);
+        argv = {"binary_name"};
+        assert(common_params_parse(argv.size(), list_str_to_char(argv).data(), cache_params, LLAMA_EXAMPLE_COMMON));
+        assert(cache_params.moe_cache_auto && cache_params.moe_cache_auto_explicit);
+        argv = {"binary_name", "--moe-cache-mib", "0"};
+        assert(common_params_parse(argv.size(), list_str_to_char(argv).data(), cache_params, LLAMA_EXAMPLE_COMMON));
+        assert(!cache_params.moe_cache_auto && !cache_params.moe_cache_auto_explicit);
+        assert(cache_params.moe_cache_size == 0);
+        unsetenv("LLAMA_ARG_MOE_CACHE_MIB");
+    }
 
     setenv("LLAMA_ARG_THREADS", "blah", true);
     argv = {"binary_name"};

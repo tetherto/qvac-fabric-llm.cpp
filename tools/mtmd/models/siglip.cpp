@@ -4,7 +4,14 @@ ggml_cgraph * clip_graph_siglip::build() {
     ggml_tensor * inp = build_inp();
 
     ggml_tensor * learned_pos_embd = model.position_embeddings;
-    if (proj_type == PROJECTOR_TYPE_LFM2 || proj_type == PROJECTOR_TYPE_PHI4) {
+    // Insurance for VisionPsy, not a live path: both idefics3 preprocessing variants
+    // return a refined size that is a whole multiple of image_size, so every crop the
+    // encoder sees is image_size x image_size and the patch grid already matches the
+    // learned one. resize_position_embeddings() is a no-op in that case, so ggml_interpolate
+    // is never reached for this model. It only starts doing work if a future checkpoint
+    // feeds non-square or sub-image_size crops.
+    if (proj_type == PROJECTOR_TYPE_LFM2 || proj_type == PROJECTOR_TYPE_PHI4
+            || proj_type == PROJECTOR_TYPE_VISIONPSY) {
         learned_pos_embd = resize_position_embeddings();
     }
 
@@ -38,7 +45,7 @@ ggml_cgraph * clip_graph_siglip::build() {
             ggml_cont(ctx0, ggml_transpose(ctx0, model.mm_input_proj_w)),
             cur);
 
-    } else if (proj_type == PROJECTOR_TYPE_IDEFICS3) {
+    } else if (proj_type == PROJECTOR_TYPE_IDEFICS3 || proj_type == PROJECTOR_TYPE_VISIONPSY) {
         // pixel_shuffle
         // https://github.com/huggingface/transformers/blob/0a950e0bbe1ed58d5401a6b547af19f15f0c195e/src/transformers/models/idefics3/modeling_idefics3.py#L578
         const int scale_factor = model.hparams.n_merge;

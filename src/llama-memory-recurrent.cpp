@@ -403,6 +403,18 @@ llama_pos llama_memory_recurrent::seq_pos_max(llama_seq_id seq_id) const {
     return result;
 }
 
+uint32_t llama_memory_recurrent::seq_token_count(llama_seq_id seq_id) const {
+    uint32_t result = 0;
+
+    for (uint32_t i = 0; i < size; ++i) {
+        if (seq_id < 0 ? !cells[i].is_empty() : cells[i].has_seq_id(seq_id)) {
+            ++result;
+        }
+    }
+
+    return result;
+}
+
 void llama_memory_recurrent::set_rs_idx(llama_seq_id seq_id, uint32_t idx) {
     if (seq_id < 0) {
         std::fill(rs_idx.begin(), rs_idx.end(), 0);

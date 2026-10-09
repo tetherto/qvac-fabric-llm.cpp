@@ -23,13 +23,20 @@ on:
       'ci/run.sh',
       '**/CMakeLists.txt',
       '**/.cmake',
+      'ggml/include/**',
+      'src/**',
+      'tests/**',
       'ggml/src/*',
       'ggml/src/ggml-cpu/**',
       'ggml/src/ggml-openvino/**'
     ]
 
+# QVAC divergence from upstream: dedupe per PR and per branch, so a re-push or
+# re-dispatch supersedes the in-flight run. The default branch deliberately
+# keeps upstream's run_id behaviour - master pushes must not cancel each other,
+# or a merged commit can end with no CI verdict. See QVAC-24627.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.head_ref && github.ref || github.run_id }}
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || (github.ref == 'refs/heads/master' && github.run_id) || github.ref }}
   cancel-in-progress: true
 
 env:
@@ -43,6 +50,7 @@ env:
 
 jobs:
   gpu-openvino-low-perf:
+    if: false  # QVAC-23796: no matching hardware
     runs-on: [self-hosted, Linux, Intel, OpenVINO]
 
     env:
@@ -71,5 +79,6 @@ jobs:
       - name: Test
         id: ggml-ci
         run: |
+          git lfs install
           source ./openvino_toolkit/setupvars.sh
           GG_BUILD_OPENVINO=1 GGML_OPENVINO_DEVICE=GPU GG_BUILD_LOW_PERF=1 bash ./ci/run.sh ~/results/llama.cpp ~/mnt/llama.cpp

@@ -221,3 +221,104 @@ template [[host_name("kernel_soft_max_f16")]]   kernel kernel_soft_max_t   kerne
 template [[host_name("kernel_soft_max_f32")]]   kernel kernel_soft_max_t   kernel_soft_max<float>;
 template [[host_name("kernel_soft_max_f16_4")]] kernel kernel_soft_max_4_t kernel_soft_max_4<half4>;
 template [[host_name("kernel_soft_max_f32_4")]] kernel kernel_soft_max_4_t kernel_soft_max_4<float4>;
+
+[[host_name("kernel_soft_max_back")]]
+kernel void kernel_soft_max_back(
+        constant ggml_metal_kargs_soft_max_back & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        threadgroup float * shmem_f32 [[threadgroup(0)]],
+        uint3   tgpig[[threadgroup_position_in_grid]],
+        ushort3 tpitg[[thread_position_in_threadgroup]],
+        ushort  sgitg[[simdgroup_index_in_threadgroup]],
+        ushort  tiisg[[thread_index_in_simdgroup]],
+        ushort3   ntg[[threads_per_threadgroup]]) {
+    if (sgitg == 0) {
+        shmem_f32[tiisg] = 0.0f;
+    }
+
+    const int i01 = tgpig.x;
+    const int i02 = tgpig.y;
+    const int i03 = tgpig.z;
+
+    device const float * dy = (device const float *) (src0 + i03*args.nb03 + i02*args.nb02 + i01*args.nb01);
+    device const float * y  = (device const float *) (src1 + i03*args.nb13 + i02*args.nb12 + i01*args.nb11);
+    device       float * dx = (device       float *) (dst  + i03*args.nb3  + i02*args.nb2  + i01*args.nb1);
+
+    float sum = 0.0f;
+    for (int i00 = tpitg.x; i00 < args.ne00; i00 += ntg.x) {
+        sum += dy[i00] * y[i00];
+    }
+
+    sum = simd_sum(sum);
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (tiisg == 0) {
+        shmem_f32[sgitg] = sum;
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    sum = shmem_f32[tiisg];
+    sum = simd_sum(sum);
+
+    const float scale = args.scale;
+
+    for (int i00 = tpitg.x; i00 < args.ne00; i00 += ntg.x) {
+        dx[i00] = (dy[i00] - sum) * y[i00] * scale;
+    }
+}
+
+[[host_name("kernel_soft_max_back_4")]]
+kernel void kernel_soft_max_back_4(
+        constant ggml_metal_kargs_soft_max_back & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        threadgroup float * shmem_f32 [[threadgroup(0)]],
+        uint3   tgpig[[threadgroup_position_in_grid]],
+        ushort3 tpitg[[thread_position_in_threadgroup]],
+        ushort  sgitg[[simdgroup_index_in_threadgroup]],
+        ushort  tiisg[[thread_index_in_simdgroup]],
+        ushort3   ntg[[threads_per_threadgroup]]) {
+    if (sgitg == 0) {
+        shmem_f32[tiisg] = 0.0f;
+    }
+
+    const int i01 = tgpig.x;
+    const int i02 = tgpig.y;
+    const int i03 = tgpig.z;
+
+    device const float4 * dy = (device const float4 *) (src0 + i03*args.nb03 + i02*args.nb02 + i01*args.nb01);
+    device const float4 * y  = (device const float4 *) (src1 + i03*args.nb13 + i02*args.nb12 + i01*args.nb11);
+    device       float4 * dx = (device       float4 *) (dst  + i03*args.nb3  + i02*args.nb2  + i01*args.nb1);
+
+    float sum = 0.0f;
+    for (int i00 = tpitg.x; i00 < args.ne00_4; i00 += ntg.x) {
+        sum += dot(dy[i00], y[i00]);
+    }
+
+    sum = simd_sum(sum);
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (tiisg == 0) {
+        shmem_f32[sgitg] = sum;
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    sum = shmem_f32[tiisg];
+    sum = simd_sum(sum);
+
+    const float scale = args.scale;
+    const float4 sum4 = float4(sum);
+
+    for (int i00 = tpitg.x; i00 < args.ne00_4; i00 += ntg.x) {
+        const float4 dy4 = dy[i00];
+        const float4 y4  = y[i00];
+        dx[i00] = (dy4 - sum4) * y4 * scale;
+    }
+}

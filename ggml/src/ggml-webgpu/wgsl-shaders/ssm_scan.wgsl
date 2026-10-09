@@ -49,24 +49,20 @@ struct Params {
 #ifdef IDS_OVERLAP
 @group(0) @binding(1) var<storage, read_write> x_dt_B_C_ids_merged: array<u32>;
 #ifdef A_OVERLAP
-@group(0) @binding(2) var<storage, read_write> dst: array<f32>;
-@group(0) @binding(3) var<uniform> params: Params;
+#define DST_BINDING 2
 #else
 @group(0) @binding(2) var<storage, read_write> A: array<f32>;
-@group(0) @binding(3) var<storage, read_write> dst: array<f32>;
-@group(0) @binding(4) var<uniform> params: Params;
+#define DST_BINDING 3
 #endif
 #else
 @group(0) @binding(1) var<storage, read_write> x_dt_B_C_merged: array<f32>;
 #ifdef A_OVERLAP
 @group(0) @binding(2) var<storage, read_write> ids: array<i32>;
-@group(0) @binding(3) var<storage, read_write> dst: array<f32>;
-@group(0) @binding(4) var<uniform> params: Params;
+#define DST_BINDING 3
 #else
 @group(0) @binding(2) var<storage, read_write> A: array<f32>;
 @group(0) @binding(3) var<storage, read_write> ids: array<i32>;
-@group(0) @binding(4) var<storage, read_write> dst: array<f32>;
-@group(0) @binding(5) var<uniform> params: Params;
+#define DST_BINDING 4
 #endif
 #endif
 #else
@@ -76,9 +72,16 @@ struct Params {
 @group(0) @binding(4) var<storage, read_write> B: array<f32>;
 @group(0) @binding(5) var<storage, read_write> C: array<f32>;
 @group(0) @binding(6) var<storage, read_write> ids: array<i32>;
-@group(0) @binding(7) var<storage, read_write> dst: array<f32>;
-@group(0) @binding(8) var<uniform> params: Params;
+#define DST_BINDING 7
 #endif
+
+#ifdef DST_OVERLAP
+#define PARAMS_BINDING DST_BINDING
+#else
+@group(0) @binding(DST_BINDING) var<storage, read_write> dst: array<f32>;
+#define PARAMS_BINDING (DST_BINDING + 1)
+#endif
+@group(0) @binding(PARAMS_BINDING) var<uniform> params: Params;
 
 var<workgroup> shared_x_dt: array<f32, TOKENS_PER_TILE>;
 var<workgroup> shared_dtsp: array<f32, TOKENS_PER_TILE>;
@@ -103,6 +106,18 @@ fn read_state_slot(i3: u32) -> u32 {
     return x_dt_B_C_ids_merged[params.offset_ids + i3];
 #else
     return u32(ids[params.offset_ids + i3]);
+#endif
+}
+
+fn write_dst(idx: u32, value: f32) {
+#ifdef DST_OVERLAP
+#ifdef IDS_OVERLAP
+    x_dt_B_C_ids_merged[idx] = bitcast<u32>(value);
+#else
+    x_dt_B_C_merged[idx] = value;
+#endif
+#else
+    dst[idx] = value;
 #endif
 }
 
@@ -187,7 +202,7 @@ fn main(
                     params.offset_dst + params.y_elems + tid + i1 * params.d_state +
                     ir * (params.d_state * params.d_inner) +
                     (slot * n_seqs + i3) * (params.d_state * params.d_inner * params.n_head);
-                dst[snapshot_idx] = s;
+                write_dst(snapshot_idx, s);
             }
 
 #ifdef USE_SUBGROUP_REDUCTION
@@ -218,7 +233,7 @@ fn main(
                 let y_idx =
                     params.offset_dst + i1 + ir * params.d_inner + token * (params.n_head * params.d_inner) +
                     i3 * (params.n_seq_tokens * params.n_head * params.d_inner);
-                dst[y_idx] = sum;
+                write_dst(y_idx, sum);
             }
 #else
             for (var stride = WG_SIZE / 2u; stride > 0u; stride >>= 1u) {
@@ -232,7 +247,7 @@ fn main(
                 let y_idx =
                     params.offset_dst + i1 + ir * params.d_inner + token * (params.n_head * params.d_inner) +
                     i3 * (params.n_seq_tokens * params.n_head * params.d_inner);
-                dst[y_idx] = shared_reduce[reduce_base(token_in_tile)];
+                write_dst(y_idx, shared_reduce[reduce_base(token_in_tile)]);
             }
 #endif
 
@@ -243,5 +258,5 @@ fn main(
     let state_idx =
         params.offset_dst + params.y_elems + tid + i1 * params.d_state + ir * (params.d_state * params.d_inner) +
         i3 * (params.d_state * params.d_inner * params.n_head);
-    dst[state_idx] = s_prev;
+    write_dst(state_idx, s_prev);
 }

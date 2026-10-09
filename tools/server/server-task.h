@@ -585,6 +585,21 @@ struct server_prompt {
     }
 };
 
+// discarded context checkpoints, kept so that new checkpoints reuse their memory instead of page-faulting fresh allocations
+struct server_checkpoint_pool {
+    std::list<common_prompt_checkpoint> spare;
+
+    // move the checkpoint at `it` into the pool, returns the iterator that follows it
+    std::list<common_prompt_checkpoint>::iterator discard(
+            std::list<common_prompt_checkpoint> & checkpoints,
+            std::list<common_prompt_checkpoint>::iterator it);
+
+    // append a checkpoint to `checkpoints`; a reused one keeps its target and draft data for update_tgt() and update_dft() to overwrite
+    common_prompt_checkpoint & add(std::list<common_prompt_checkpoint> & checkpoints);
+
+    void clear();
+};
+
 struct server_prompt_data {
     std::vector<uint8_t> main;
     std::vector<uint8_t> drft;

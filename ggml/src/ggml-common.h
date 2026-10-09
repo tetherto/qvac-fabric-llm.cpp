@@ -99,6 +99,11 @@ typedef sycl::half2 ggml_half2;
 #define QI2_0 (QK2_0 / 32)
 #define QR2_0 1
 
+#define QI_PQ2_0 (QK_PQ2_0 / 32)
+#define QR_PQ2_0 1
+#define QI_PTQ1_0 (QK_PTQ1_0 / 32)
+#define QR_PTQ1_0 1
+
 
 #define QI4_0 (QK4_0 / (4 * QR4_0))
 #define QR4_0 2
@@ -126,6 +131,9 @@ typedef sycl::half2 ggml_half2;
 
 #define QI2_K (QK_K / (4*QR2_K))
 #define QR2_K 4
+
+#define QI_TQ2_0 (QK_K / (4*QR_TQ2_0))
+#define QR_TQ2_0 4
 
 #define QI3_K (QK_K / (4*QR3_K))
 #define QR3_K 4
@@ -190,6 +198,23 @@ typedef struct {
     uint8_t qs[QK2_0 / 4];   // 2 bits per element
 } block_q2_0;
 static_assert(sizeof(block_q2_0) == sizeof(ggml_half) + QK2_0 / 4, "wrong q2_0 block size/padding");
+
+// Prism Q2_0 with one fp16 scale per 128 weights.
+#define QK_PQ2_0 128
+typedef struct {
+    ggml_half d;                   // delta (scale)
+    uint8_t qs[QK_PQ2_0 / 4];    // 2 bits per element
+} block_pq2_0;
+static_assert(sizeof(block_pq2_0) == sizeof(ggml_half) + QK_PQ2_0 / 4, "wrong pq2_0 block size/padding");
+
+// Prism ternary packing with one fp16 scale per 128 weights.
+#define QK_PTQ1_0 128
+typedef struct {
+    uint8_t qs[(QK_PTQ1_0 - 4*QK_PTQ1_0/64)/5]; // 24 B, 5 trits per byte -> 120 values
+    uint8_t qh[QK_PTQ1_0/64];                   //  2 B, 4 trits per byte ->   8 values
+    ggml_half d;                                // scale
+} block_ptq1_0;
+static_assert(sizeof(block_ptq1_0) == sizeof(ggml_half) + QK_PTQ1_0/64 + (QK_PTQ1_0 - 4*QK_PTQ1_0/64)/5, "wrong ptq1_0 block size/padding");
 
 #define QK4_0 32
 typedef struct {
@@ -458,6 +483,16 @@ typedef struct {
     uint8_t  qs[QK_K/2];
 } block_iq4_xs;
 static_assert(sizeof(block_iq4_xs) == sizeof(ggml_half) + sizeof(uint16_t) + QK_K/64 + QK_K/2, "wrong iq4_xs block size/padding");
+
+// TurboQuant/PolarQuant block layouts are only consumed by host C/C++ code (CPU
+// quant + type traits). The GPU-shader DECL contexts (Metal/CUDA/HIP/SYCL/MUSA)
+// define their own quant layouts and must not pull in this standalone host header
+// — e.g. the Metal shader compile of ggml-metal.metal would fail to find it.
+#if !defined(GGML_COMMON_DECL_METAL) && !defined(GGML_COMMON_DECL_CUDA) && \
+    !defined(GGML_COMMON_DECL_HIP)   && !defined(GGML_COMMON_DECL_SYCL) && \
+    !defined(GGML_COMMON_DECL_MUSA)
+#include "ggml-tbq-types.h"
+#endif
 
 #endif // GGML_COMMON_DECL
 #endif // GGML_COMMON_DECL

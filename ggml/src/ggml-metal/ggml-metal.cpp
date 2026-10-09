@@ -605,6 +605,16 @@ static ggml_guid_t ggml_backend_metal_guid(void) {
     return &guid;
 }
 
+static int ggml_backend_metal_default_n_cb(void) {
+    const char * env_n_cb = getenv("GGML_METAL_N_CB");
+    if (env_n_cb != nullptr) {
+        const int n_cb = atoi(env_n_cb);
+        return n_cb > 0 ? n_cb : 1;
+    }
+
+    return 1;
+}
+
 ggml_backend_t ggml_backend_metal_init(void) {
     ggml_backend_dev_t dev = ggml_backend_reg_dev_get(ggml_backend_metal_reg(), 0);
     ggml_metal_device_t ctx_dev = (ggml_metal_device_t)dev->context;
@@ -624,7 +634,7 @@ ggml_backend_t ggml_backend_metal_init(void) {
         /* .context   = */ ctx,
     };
 
-    ggml_backend_metal_set_n_cb(backend, 1);
+    ggml_backend_metal_set_n_cb(backend, ggml_backend_metal_default_n_cb());
 
     return backend;
 }
@@ -686,9 +696,13 @@ static enum ggml_backend_dev_type ggml_backend_metal_device_get_type(ggml_backen
 }
 
 static void ggml_backend_metal_device_get_props(ggml_backend_dev_t dev, ggml_backend_dev_props * props) {
+    ggml_metal_device_t ctx_dev = (ggml_metal_device_t)dev->context;
+
     props->name        = ggml_backend_metal_device_get_name(dev);
     props->description = ggml_backend_metal_device_get_description(dev);
     props->type        = ggml_backend_metal_device_get_type(dev);
+
+    props->memory_unified = ggml_metal_device_get_props(ctx_dev)->has_unified_memory;
 
     ggml_backend_metal_device_get_memory(dev, &props->memory_free, &props->memory_total);
 
@@ -698,6 +712,7 @@ static void ggml_backend_metal_device_get_props(ggml_backend_dev_t dev, ggml_bac
         /* .buffer_from_host_ptr = */ true,
         /* .events               = */ true,
         /* .mmap_support         = */ true,
+        /* .copy_stream          = */ false,
     };
 }
 
@@ -719,7 +734,7 @@ static ggml_backend_t ggml_backend_metal_device_init_backend(ggml_backend_dev_t 
         /* .context   = */ ctx,
     };
 
-    ggml_backend_metal_set_n_cb(backend, 1);
+    ggml_backend_metal_set_n_cb(backend, ggml_backend_metal_default_n_cb());
 
     return backend;
 
@@ -738,6 +753,9 @@ static ggml_backend_buffer_t ggml_backend_metal_device_buffer_mapped(ggml_backen
     ggml_metal_device_t ctx_dev = (ggml_metal_device_t)dev->context;
 
     ggml_metal_buffer_t res = ggml_metal_buffer_map(ctx_dev, ptr, size, max_tensor_size);
+    if (res == NULL) {
+        return NULL;
+    }
 
     const ggml_metal_device_props * props_dev = ggml_metal_device_get_props(ctx_dev);
 
@@ -936,6 +954,26 @@ static void ggml_backend_metal_fusion_set_enabled(ggml_backend_fusion_t finfo, b
     ggml_metal_fusion_info_set_enabled((struct ggml_metal_fusion_info *) finfo, enabled);
 }
 
+// signed FWHT fusion counter for test-backend-ops; the first call turns the device stats on
+static uint64_t ggml_backend_metal_fwht_fusion_count(ggml_backend_t backend) {
+    GGML_ASSERT(ggml_backend_is_metal(backend));
+
+    struct ggml_metal_fusion_info * finfo = ggml_metal_device_get_fusion_info((ggml_metal_device_t) backend->device->context);
+    ggml_metal_fusion_info_stats_init(finfo);
+
+    // the counters are indexed like the fusion table
+    const int n = ggml_metal_fusion_info_n_fusions(finfo);
+
+    uint64_t res = 0;
+    for (int i = 0; i < n; i++) {
+        if (ggml_metal_fusion_id_at(i) == GGML_METAL_FUSION_FWHT_SIGNED) {
+            res += ggml_metal_fusion_info_count(finfo, i);
+        }
+    }
+
+    return res;
+}
+
 static void * ggml_backend_metal_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     if (strcmp(name, "ggml_backend_get_features") == 0) {
         return (void *)ggml_backend_metal_get_features;
@@ -974,6 +1012,9 @@ static void * ggml_backend_metal_get_proc_address(ggml_backend_reg_t reg, const 
     }
     if (strcmp(name, "ggml_backend_fusion_set_enabled") == 0) {
         return (void *)ggml_backend_metal_fusion_set_enabled;
+    }
+    if (strcmp(name, "ggml_backend_metal_fwht_fusion_count") == 0) {
+        return (void *)ggml_backend_metal_fwht_fusion_count;
     }
 
     return NULL;
@@ -1032,6 +1073,15 @@ ggml_backend_reg_t ggml_backend_metal_reg(void) {
 
             for (int i = 0; i < g_devices; ++i) {
                 auto * dev = ggml_backend_metal_device_init(&reg, i);
+
+                // Skip unusable devices (e.g. paravirtualized GPUs with no working simdgroup
+                // intrinsics).
+                if (!ggml_metal_device_get_props((ggml_metal_device_t)dev->context)->has_simdgroup_reduction) {
+                    GGML_LOG_WARN("%s: skipping Metal device %d (no simdgroup reduction support)\n", __func__, i);
+                    ggml_backend_metal_device_free(dev);
+                    continue;
+                }
+
                 devs.emplace_back(dev);
 
                 reg_ctx->devices.push_back(dev);

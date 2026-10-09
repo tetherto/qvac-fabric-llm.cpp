@@ -7,7 +7,13 @@ dl_handle * dl_load_library(const fs::path & path) {
     DWORD old_mode = SetErrorMode(SEM_FAILCRITICALERRORS);
     SetErrorMode(old_mode | SEM_FAILCRITICALERRORS);
 
-    HMODULE handle = LoadLibraryW(path.wstring().c_str());
+    std::error_code ec;
+    fs::path        absolute_path = path.is_absolute() ? path : fs::absolute(path, ec);
+    HMODULE         handle        = nullptr;
+    if (!ec) {
+        handle = LoadLibraryExW(absolute_path.wstring().c_str(), nullptr,
+                                LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
+    }
 
     SetErrorMode(old_mode);
 

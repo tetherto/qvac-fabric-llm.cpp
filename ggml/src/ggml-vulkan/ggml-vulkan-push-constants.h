@@ -153,8 +153,10 @@ struct vk_op_push_constants {
 
 struct vk_op_fwht_push_constants {
     uint32_t n_rows;
+    uint32_t n_blk;
     uint32_t src_offset;
     uint32_t dst_offset;
+    uint32_t sign_offset;
     float scale;
 };
 
@@ -450,6 +452,32 @@ struct vk_op_add_id_push_constants {
     uint32_t s21;
 };
 
+struct vk_op_mul_mat_id_back_a_push_constants {
+    uint32_t K;
+    uint32_t N;
+    uint32_t n_expert;
+    uint32_t n_used;
+    uint32_t n_tok;
+    uint32_t b_ne1;
+    uint32_t g_nb1; uint32_t g_nb2;
+    uint32_t b_nb1; uint32_t b_nb2;
+    uint32_t ids_nb1;
+    uint32_t d_nb1; uint32_t d_nb2;
+};
+
+struct vk_op_mul_mat_id_back_b_push_constants {
+    uint32_t K;
+    uint32_t N;
+    uint32_t n_used;
+    uint32_t n_tok;
+    uint32_t n_expert;
+    uint32_t dst_ne1;
+    uint32_t as_nb1; uint32_t as_nb2;
+    uint32_t g_nb1;  uint32_t g_nb2;
+    uint32_t ids_nb1;
+    uint32_t d_nb1;  uint32_t d_nb2;
+};
+
 struct vk_op_diag_mask_push_constants {
     uint32_t ncols;
     uint32_t rows_per_channel;
@@ -705,6 +733,22 @@ struct vk_op_gated_delta_net_push_constants {
     uint32_t K;
 };
 
+struct vk_op_gated_delta_net_back_push_constants {
+    uint32_t H;
+    uint32_t n_tokens;
+    uint32_t n_seqs;
+    uint32_t K;
+    uint32_t s_off;
+    uint32_t sq1, sq2, sq3;
+    uint32_t sv1, sv2, sv3;
+    uint32_t sb1, sb2, sb3;
+    uint32_t neq1, rq3;
+    float scale;
+    uint32_t off_dk, off_dv, off_dg, off_db, off_ds;
+    uint32_t off_scratch;
+    uint32_t wg_stride;
+};
+
 struct vk_op_ssm_scan_push_constants {
     uint32_t nb02, nb03, nb12, nb13;
     uint32_t nb21, nb22, nb31;
@@ -718,6 +762,20 @@ struct vk_op_ssm_conv_push_constants {
     uint32_t nb01, nb02;
     uint32_t nb11;
     uint32_t dst_nb0, dst_nb1, dst_nb2;
+    uint32_t nc, ncs, nr, n_t, n_s;
+};
+
+struct vk_op_ssm_conv_back_sx_push_constants {
+    uint32_t grad_nb0, grad_nb1, grad_nb2;
+    uint32_t c_nb1;
+    uint32_t dst_nb0, dst_nb1, dst_nb2;
+    uint32_t nc, ncs, nr, n_t, n_s;
+};
+
+struct vk_op_ssm_conv_back_c_push_constants {
+    uint32_t grad_nb0, grad_nb1, grad_nb2;
+    uint32_t sx_nb0, sx_nb1, sx_nb2;
+    uint32_t dst_nb1;
     uint32_t nc, ncs, nr, n_t, n_s;
 };
 
@@ -834,6 +892,7 @@ struct vk_op_sum_rows_push_constants
     uint32_t misalign_offsets;
     uint32_t ne0_12mp, ne0_12L;
     uint32_t ne0_1mp, ne0_1L;
+    uint32_t nrows;
 };
 
 static vk_op_sum_rows_push_constants vk_op_sum_rows_push_constants_init(const ggml_tensor * src, const ggml_tensor * dst, int64_t n_cols) {
@@ -842,6 +901,7 @@ static vk_op_sum_rows_push_constants vk_op_sum_rows_push_constants_init(const gg
     p.n_cols = (uint32_t)n_cols;
     p.ne01 = (uint32_t)src->ne[1];
     p.ne02 = (uint32_t)src->ne[2];
+    p.nrows = (uint32_t)ggml_nrows(src);
     p.nb01 = (uint32_t)src->nb[1] / type_size;
     p.nb02 = (uint32_t)src->nb[2] / type_size;
     p.nb03 = (uint32_t)src->nb[3] / type_size;
@@ -935,8 +995,8 @@ template <> inline void init_pushconst_tensor_offsets(ggml_backend_vk_context * 
 template <> inline void init_pushconst_tensor_offsets(ggml_backend_vk_context * ctx, vk_op_fwht_push_constants &p, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * src2, const ggml_tensor * src3, ggml_tensor * dst) {
     p.src_offset = get_misalign_bytes(ctx, src0) / ggml_type_size(src0->type);
     p.dst_offset = get_misalign_bytes(ctx, dst)  / ggml_type_size(dst->type);
+    p.sign_offset = src1 ? get_misalign_bytes(ctx, src1) / ggml_type_size(src1->type) : 0;
 
-    GGML_UNUSED(src1);
     GGML_UNUSED(src2);
     GGML_UNUSED(src3);
 }

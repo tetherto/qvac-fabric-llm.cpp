@@ -5,7 +5,8 @@ on:
 
 jobs:
   build:
-    runs-on: [self-hosted, fast]
+    runs-on: qvac-ubuntu2404-x64
+    timeout-minutes: 20
     env:
       BRANCH_NAME: ${{ github.head_ref || github.ref_name }}
 

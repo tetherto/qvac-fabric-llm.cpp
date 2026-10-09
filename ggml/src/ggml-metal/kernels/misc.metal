@@ -410,6 +410,7 @@ kernel void kernel_fwht(
         constant ggml_metal_kargs_fwht & args,
         device const src_t * src,
         device float * dst,
+        device const float * signs,
         uint3  tgpig[[threadgroup_position_in_grid]],
         ushort sgitg[[simdgroup_index_in_threadgroup]],
         ushort tiisg[[thread_index_in_simdgroup]],
@@ -425,6 +426,8 @@ kernel void kernel_fwht(
     if (r >= args.nrows) {
         return;
     }
+    signs += args.n_blk > 0 ? (r % args.n_blk) * N : 0;
+
 
     src += r * N;
     dst += r * N;
@@ -433,7 +436,8 @@ kernel void kernel_fwht(
 
     float reg[NE];
     for (int i = 0; i < NE; i++) {
-        reg[i] = float(src[i*NW + lane])*scale;
+        const float s = args.n_blk > 0 ? signs[i*NW + lane] : 1.0f;
+        reg[i] = float(src[i*NW + lane])*s*scale;
     }
     for (int i = 1; i < NW; i *= 2) {
         for (int j = 0; j < NE; j++) {
@@ -470,6 +474,7 @@ kernel void kernel_fwht_tg(
         constant ggml_metal_kargs_fwht & args,
         device const src_t * src,
         device float * dst,
+        device const float * signs,
         uint3  tgpig[[threadgroup_position_in_grid]],
         ushort sgitg[[simdgroup_index_in_threadgroup]],
         ushort tiisg[[thread_index_in_simdgroup]],
@@ -486,6 +491,8 @@ kernel void kernel_fwht_tg(
     if (r >= args.nrows) {
         return;
     }
+    signs += args.n_blk > 0 ? (r % args.n_blk) * N : 0;
+
 
     src += r * N;
     dst += r * N;
@@ -494,7 +501,8 @@ kernel void kernel_fwht_tg(
 
     float reg[NE];
     for (int i = 0; i < NE; i++) {
-        reg[i] = float(src[i*NT + tid])*scale;
+        const float s = args.n_blk > 0 ? signs[i*NT + tid] : 1.0f;
+        reg[i] = float(src[i*NT + tid])*s*scale;
     }
 
     for (int i = 1; i < NW; i *= 2) {
@@ -538,25 +546,33 @@ kernel void kernel_fwht_tg(
 typedef decltype(kernel_fwht<64, float>) kernel_fwht_f32_t;
 typedef decltype(kernel_fwht<64, half>)  kernel_fwht_f16_t;
 
-template [[host_name("kernel_fwht_f32_64")]]  kernel kernel_fwht_f32_t kernel_fwht<64,  float>;
-template [[host_name("kernel_fwht_f32_128")]] kernel kernel_fwht_f32_t kernel_fwht<128, float>;
-template [[host_name("kernel_fwht_f32_256")]] kernel kernel_fwht_f32_t kernel_fwht<256, float>;
+template [[host_name("kernel_fwht_f32_64")]]         kernel kernel_fwht_f32_t kernel_fwht<64,   float>;
+template [[host_name("kernel_fwht_f32_128")]]        kernel kernel_fwht_f32_t kernel_fwht<128,  float>;
+template [[host_name("kernel_fwht_f32_256")]]        kernel kernel_fwht_f32_t kernel_fwht<256,  float>;
+template [[host_name("kernel_fwht_f32_512")]]        kernel kernel_fwht_f32_t kernel_fwht_tg<512,  GGML_METAL_FWHT_TG_NT, float>;
+template [[host_name("kernel_fwht_f32_1024")]]       kernel kernel_fwht_f32_t kernel_fwht_tg<1024, GGML_METAL_FWHT_TG_NT, float>;
+template [[host_name("kernel_fwht_f32_2048")]]       kernel kernel_fwht_f32_t kernel_fwht_tg<2048, GGML_METAL_FWHT_TG_NT, float>;
+template [[host_name("kernel_fwht_f32_4096")]]       kernel kernel_fwht_f32_t kernel_fwht_tg<4096, GGML_METAL_FWHT_TG_NT, float>;
+template [[host_name("kernel_fwht_f32_8192")]]       kernel kernel_fwht_f32_t kernel_fwht_tg<8192, GGML_METAL_FWHT_TG_NT, float>;
+template [[host_name("kernel_fwht_f32_512_nt128")]]  kernel kernel_fwht_f32_t kernel_fwht_tg<512,  GGML_METAL_FWHT_TG_NT_FALLBACK, float>;
+template [[host_name("kernel_fwht_f32_1024_nt128")]] kernel kernel_fwht_f32_t kernel_fwht_tg<1024, GGML_METAL_FWHT_TG_NT_FALLBACK, float>;
+template [[host_name("kernel_fwht_f32_2048_nt128")]] kernel kernel_fwht_f32_t kernel_fwht_tg<2048, GGML_METAL_FWHT_TG_NT_FALLBACK, float>;
+template [[host_name("kernel_fwht_f32_4096_nt128")]] kernel kernel_fwht_f32_t kernel_fwht_tg<4096, GGML_METAL_FWHT_TG_NT_FALLBACK, float>;
+template [[host_name("kernel_fwht_f32_8192_nt128")]] kernel kernel_fwht_f32_t kernel_fwht_tg<8192, GGML_METAL_FWHT_TG_NT_FALLBACK, float>;
 
-template [[host_name("kernel_fwht_f16_64")]]  kernel kernel_fwht_f16_t kernel_fwht<64,  half>;
-template [[host_name("kernel_fwht_f16_128")]] kernel kernel_fwht_f16_t kernel_fwht<128, half>;
-template [[host_name("kernel_fwht_f16_256")]] kernel kernel_fwht_f16_t kernel_fwht<256, half>;
-
-template [[host_name("kernel_fwht_f32_512")]]  kernel kernel_fwht_f32_t kernel_fwht_tg<512,  GGML_METAL_FWHT_TG_NT, float>;
-template [[host_name("kernel_fwht_f32_1024")]] kernel kernel_fwht_f32_t kernel_fwht_tg<1024, GGML_METAL_FWHT_TG_NT, float>;
-template [[host_name("kernel_fwht_f32_2048")]] kernel kernel_fwht_f32_t kernel_fwht_tg<2048, GGML_METAL_FWHT_TG_NT, float>;
-template [[host_name("kernel_fwht_f32_4096")]] kernel kernel_fwht_f32_t kernel_fwht_tg<4096, GGML_METAL_FWHT_TG_NT, float>;
-template [[host_name("kernel_fwht_f32_8192")]] kernel kernel_fwht_f32_t kernel_fwht_tg<8192, GGML_METAL_FWHT_TG_NT, float>;
-
-template [[host_name("kernel_fwht_f16_512")]]  kernel kernel_fwht_f16_t kernel_fwht_tg<512,  GGML_METAL_FWHT_TG_NT, half>;
-template [[host_name("kernel_fwht_f16_1024")]] kernel kernel_fwht_f16_t kernel_fwht_tg<1024, GGML_METAL_FWHT_TG_NT, half>;
-template [[host_name("kernel_fwht_f16_2048")]] kernel kernel_fwht_f16_t kernel_fwht_tg<2048, GGML_METAL_FWHT_TG_NT, half>;
-template [[host_name("kernel_fwht_f16_4096")]] kernel kernel_fwht_f16_t kernel_fwht_tg<4096, GGML_METAL_FWHT_TG_NT, half>;
-template [[host_name("kernel_fwht_f16_8192")]] kernel kernel_fwht_f16_t kernel_fwht_tg<8192, GGML_METAL_FWHT_TG_NT, half>;
+template [[host_name("kernel_fwht_f16_64")]]         kernel kernel_fwht_f16_t kernel_fwht<64,   half>;
+template [[host_name("kernel_fwht_f16_128")]]        kernel kernel_fwht_f16_t kernel_fwht<128,  half>;
+template [[host_name("kernel_fwht_f16_256")]]        kernel kernel_fwht_f16_t kernel_fwht<256,  half>;
+template [[host_name("kernel_fwht_f16_512")]]        kernel kernel_fwht_f16_t kernel_fwht_tg<512,  GGML_METAL_FWHT_TG_NT, half>;
+template [[host_name("kernel_fwht_f16_1024")]]       kernel kernel_fwht_f16_t kernel_fwht_tg<1024, GGML_METAL_FWHT_TG_NT, half>;
+template [[host_name("kernel_fwht_f16_2048")]]       kernel kernel_fwht_f16_t kernel_fwht_tg<2048, GGML_METAL_FWHT_TG_NT, half>;
+template [[host_name("kernel_fwht_f16_4096")]]       kernel kernel_fwht_f16_t kernel_fwht_tg<4096, GGML_METAL_FWHT_TG_NT, half>;
+template [[host_name("kernel_fwht_f16_8192")]]       kernel kernel_fwht_f16_t kernel_fwht_tg<8192, GGML_METAL_FWHT_TG_NT, half>;
+template [[host_name("kernel_fwht_f16_512_nt128")]]  kernel kernel_fwht_f16_t kernel_fwht_tg<512,  GGML_METAL_FWHT_TG_NT_FALLBACK, half>;
+template [[host_name("kernel_fwht_f16_1024_nt128")]] kernel kernel_fwht_f16_t kernel_fwht_tg<1024, GGML_METAL_FWHT_TG_NT_FALLBACK, half>;
+template [[host_name("kernel_fwht_f16_2048_nt128")]] kernel kernel_fwht_f16_t kernel_fwht_tg<2048, GGML_METAL_FWHT_TG_NT_FALLBACK, half>;
+template [[host_name("kernel_fwht_f16_4096_nt128")]] kernel kernel_fwht_f16_t kernel_fwht_tg<4096, GGML_METAL_FWHT_TG_NT_FALLBACK, half>;
+template [[host_name("kernel_fwht_f16_8192_nt128")]] kernel kernel_fwht_f16_t kernel_fwht_tg<8192, GGML_METAL_FWHT_TG_NT_FALLBACK, half>;
 
 constant int FC_dsv4_hc_n_hc [[function_constant(FC_DSV4_HC + 0)]];
 

@@ -1,0 +1,40 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : require
+
+#include "types.glsl"
+
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly buffer Grad { float grad[]; }; // {d_inner, n_t, n_s}
+layout(binding = 1) readonly buffer Sx   { float sx[]; };   // {d_conv - 1 + n_t, d_inner, n_s}
+layout(binding = 2) buffer Dst { float dst[]; };            // {d_conv, d_inner}
+
+layout(push_constant) uniform PushConstants {
+    uint grad_nb0, grad_nb1, grad_nb2;
+    uint sx_nb0, sx_nb1, sx_nb2;
+    uint dst_nb1;
+    uint nc; uint ncs; uint nr; uint n_t; uint n_s;
+};
+
+void main() {
+    const uint i0 = gl_GlobalInvocationID.x; // conv tap [0, nc)
+    const uint i1 = gl_GlobalInvocationID.y; // channel [0, nr)
+
+    if (i0 >= nc || i1 >= nr) {
+        return;
+    }
+
+    float sumf = 0.0;
+
+    // grad_c[j,k] = sum_{t,s} grad[k,t,s] * sx[t+j,k,s]
+    for (uint i3 = 0; i3 < n_s; ++i3) {
+        const uint grad_base = i1 * (grad_nb0 / 4) + i3 * (grad_nb2 / 4);
+        const uint sx_base   = i0 * (sx_nb0 / 4) + i1 * (sx_nb1 / 4) + i3 * (sx_nb2 / 4);
+        for (uint i2 = 0; i2 < n_t; ++i2) {
+            sumf += grad[grad_base + i2 * (grad_nb1 / 4)] * sx[sx_base + i2 * (sx_nb0 / 4)];
+        }
+    }
+
+    dst[i0 + i1 * (dst_nb1 / 4)] = sumf;
+}

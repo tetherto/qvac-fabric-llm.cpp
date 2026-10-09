@@ -12,11 +12,14 @@
 #include "ggml-opt.h"
 
 #include <array>
+#include <atomic>
 #include <map>
+#include <memory>
 #include <vector>
 
 struct llama_model;
 class llama_batch_allocr;
+class llama_moe_cache;
 
 class llama_io_read_i;
 class llama_io_write_i;
@@ -39,6 +42,11 @@ struct llama_memory_buffer {
 };
 
 using llama_memory_buffers = std::map<ggml_backend_buffer_type_t, llama_memory_buffer>;
+
+struct llama_compute_state {
+    ggml_backend_sched_t sched = nullptr;
+    uint64_t generation = 0;
+};
 
 struct llama_context {
     // init scheduler and compute buffers, reserve worst-case graphs
@@ -118,7 +126,9 @@ struct llama_context {
     void set_embeddings (bool value);
     void set_embeddings_nextn(bool value, bool masked);
     void set_embeddings_layer_inp(uint32_t lid, bool enable);
+    void set_embeddings_layer_inp_pos_min(llama_seq_id seq_id, llama_pos pos_min);
     void set_nextn_layer_offset(int32_t offset);
+    bool set_draft_vocab(const int32_t * ranges, int32_t n_ranges);
     void set_causal_attn(bool value);
     void set_warmup(bool value);
 
@@ -209,13 +219,31 @@ struct llama_context {
             ggml_opt_result_t       result_eval,
             int64_t                 idata_split,
             ggml_opt_epoch_callback callback_train,
-            ggml_opt_epoch_callback callback_eval);
+            ggml_opt_epoch_callback callback_eval,
+            int64_t                 resume_from_batch = -1);
+
+    // Optimizer state access for checkpointing (delegated to ggml_opt API)
+    int64_t opt_get_iter();
+
+    // Optimizer state persistence
+    bool opt_save_state(const char* filename);
+    bool opt_load_state(const char* filename);
+
+    // Clean up optimizer context to free memory and allow reinitialization
+    void opt_cleanup();
+
+    // Request early exit from training epoch (thread-safe)
+    void opt_request_stop();
+
+    // Reset the stop flag to allow training to continue
+    void opt_reset_stop();
 
     void opt_epoch_iter(
             ggml_opt_dataset_t               dataset,
             ggml_opt_result_t                result,
             const std::vector<llama_token> & tokens,
             const std::vector<llama_token> & labels_sparse,
+            const std::vector<int32_t>     & masks_sparse,
             llama_batch                    & batch,
             ggml_opt_epoch_callback          callback,
             bool                             train,
@@ -239,7 +267,11 @@ private:
 
     // async-copy enabled layer-input tensors (per cparams.output_layer_inp)
     // from backend into host-side embd_layer_inp buffers
-    void extract_layer_inputs(const llm_graph_result * res, size_t token_offset, size_t n_tokens);
+    void extract_layer_inputs(const llm_graph_result * res, const llama_ubatch & ubatch, size_t token_offset);
+
+    // first ubatch row whose layer inputs are read, rows before it are not copied
+    uint32_t layer_inp_first_row(const llama_ubatch & ubatch) const;
+    bool     layer_inp_row_read (const llama_ubatch & ubatch, uint32_t i) const;
 
     //
     // graph
@@ -296,6 +328,7 @@ private:
     llama_cross cross; // TODO: tmp for handling cross-attention - need something better probably
 
     llama_memory_ptr memory;
+    std::unique_ptr<llama_moe_cache> moe_cache;
 
     // decode output (2-dimensional array: [n_outputs][n_vocab])
     buffer_view<float> logits = {nullptr, 0};
@@ -312,6 +345,9 @@ private:
     // host buffers for output layer input embeddings, per layer
     // populated when cparams.output_layer_inp[il] is true
     std::vector<buffer_view<float>> embd_layer_inp;
+
+    // per sequence: layer input rows at lower positions are not read (-1 = all rows are read)
+    std::vector<llama_pos> embd_layer_inp_pos_min;
 
     struct sampling_info {
         // !samplers.empty() to check if any samplers are active
@@ -352,6 +388,10 @@ private:
     std::vector<swap_info> output_swaps;
 
     ggml_backend_sched_ptr sched;
+    std::shared_ptr<llama_compute_state> compute_state = std::make_shared<llama_compute_state>();
+    std::weak_ptr<llama_compute_state> ctx_compute;
+    uint64_t compute_generation = 0;
+    bool compute_share_source = false;
 
     bool sched_need_reserve = true;
 
@@ -360,6 +400,16 @@ private:
 
     // training
     ggml_opt_context_t opt_ctx = nullptr;
+    uint32_t original_n_ctx_train = 0;
+
+    // optimizer state loading (deferred until after ggml_opt_build)
+    std::string pending_optimizer_checkpoint_path;
+    bool should_load_optimizer_tensors = false;
+    bool optimizer_tensors_loaded = false;
+    ggml_opt_loss_type opt_loss_type = GGML_OPT_LOSS_TYPE_CROSS_ENTROPY;
+
+    // early exit flag for training epochs (thread-safe)
+    std::atomic<bool> training_should_stop{ false };
 
     ggml_threadpool_t threadpool       = nullptr;
     ggml_threadpool_t threadpool_batch = nullptr;
@@ -379,6 +429,13 @@ private:
     llm_graph_result_ptr gf_res_reserve;
 
     llm_graph_result * gf_res_prev_active = nullptr;
+
+    // the model's Hadamard transforms plus the target's when tensors are borrowed through ctx_other
+    llama_hadamard_rotations hadamard_rotations;
+    llama_hadamard_rotations hadamard_inverses;
+
+    // one-time Hadamard transform-coverage check on the first built graph
+    bool hadamard_verified = false;
 
     // host buffer for the model output (logits and embeddings)
     ggml_backend_buffer_ptr buf_output;
@@ -405,3 +462,7 @@ private:
 
     mutable int32_t n_reused = 0; // number of times the previous graph was reused
 };
+
+// qvac: defined in llama-context.cpp but was missing a declaration after the rebase
+// onto upstream b9341 — llama.cpp calls it for debug-log memory accounting.
+void llama_memory_breakdown_print(const struct llama_context * ctx);

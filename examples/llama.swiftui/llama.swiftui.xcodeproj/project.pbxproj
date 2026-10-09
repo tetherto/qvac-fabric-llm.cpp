@@ -20,6 +20,7 @@
 		DD84C9FD2D747FED007778EC /* llama.xcframework in Frameworks */ = {isa = PBXBuildFile; fileRef = DD84C9FC2D747FED007778EC /* llama.xcframework */; };
 		DD84C9FE2D747FED007778EC /* llama.xcframework in Embed Frameworks */ = {isa = PBXBuildFile; fileRef = DD84C9FC2D747FED007778EC /* llama.xcframework */; settings = {ATTRIBUTES = (CodeSignOnCopy, RemoveHeadersOnCopy, ); }; };
 		F1FE20E22B465ECA00B45541 /* LoadCustomButton.swift in Sources */ = {isa = PBXBuildFile; fileRef = F1FE20E12B465EC900B45541 /* LoadCustomButton.swift */; };
+		D1A2F0012E0C8E8B00A1B1C0 /* FinetuneBridge.mm in Sources */ = {isa = PBXBuildFile; fileRef = D1A2F0002E0C8E8B00A1B1C0 /* FinetuneBridge.mm */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXCopyFilesBuildPhase section */
@@ -51,6 +52,9 @@
 		DD84C9FC2D747FED007778EC /* llama.xcframework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.xcframework; name = llama.xcframework; path = "../../build-apple/llama.xcframework"; sourceTree = "<group>"; };
 		DF2D2FE72B4A59BE00FCB72D /* llama.cpp */ = {isa = PBXFileReference; lastKnownFileType = wrapper; name = llama.cpp; path = ../..; sourceTree = "<group>"; };
 		F1FE20E12B465EC900B45541 /* LoadCustomButton.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LoadCustomButton.swift; sourceTree = "<group>"; };
+		D1A2F0002E0C8E8B00A1B1C0 /* FinetuneBridge.mm */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.objcpp; path = FinetuneBridge.mm; sourceTree = "<group>"; };
+		D1A2F0022E0C8E8B00A1B1C0 /* FinetuneBridge.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = FinetuneBridge.h; sourceTree = "<group>"; };
+		D1A2F0032E0C8E8B00A1B1C0 /* llama_swiftui-Bridging-Header.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = "llama_swiftui-Bridging-Header.h"; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -93,6 +97,7 @@
 				8A3F84102AC4BD85005E2EE8 /* Resources */,
 				8A9F7C4B2AC332DC008AE1EA /* Models */,
 				8A9F7C4A2AC332BF008AE1EA /* UI */,
+				D1A2F0062E0C8E8B00A1B1C0 /* Bridging */,
 				8A1C83762AC328BD0096AF73 /* llama_swiftuiApp.swift */,
 				8A1C837A2AC328BE0096AF73 /* Assets.xcassets */,
 			);
@@ -109,6 +114,13 @@
 			name = Frameworks;
 			sourceTree = "<group>";
 		};
+		8A3F84112AC4BD8C005E2EE8 /* models */ = {
+			isa = PBXGroup;
+			children = (
+			);
+			path = models;
+			sourceTree = "<group>";
+		};
 		8A3F84102AC4BD85005E2EE8 /* Resources */ = {
 			isa = PBXGroup;
 			children = (
@@ -117,19 +129,22 @@
 			path = Resources;
 			sourceTree = "<group>";
 		};
-		8A3F84112AC4BD8C005E2EE8 /* models */ = {
-			isa = PBXGroup;
-			children = (
-			);
-			path = models;
-			sourceTree = "<group>";
-		};
 		8A907F312AC7134E006146EA /* llama.cpp.swift */ = {
 			isa = PBXGroup;
 			children = (
 				8A907F322AC7134E006146EA /* LibLlama.swift */,
 			);
 			path = llama.cpp.swift;
+			sourceTree = "<group>";
+		};
+		D1A2F0062E0C8E8B00A1B1C0 /* Bridging */ = {
+			isa = PBXGroup;
+			children = (
+				D1A2F0022E0C8E8B00A1B1C0 /* FinetuneBridge.h */,
+				D1A2F0032E0C8E8B00A1B1C0 /* llama_swiftui-Bridging-Header.h */,
+				D1A2F0002E0C8E8B00A1B1C0 /* FinetuneBridge.mm */,
+			);
+			path = Bridging;
 			sourceTree = "<group>";
 		};
 		8A9F7C4A2AC332BF008AE1EA /* UI */ = {
@@ -230,6 +245,7 @@
 				F1FE20E22B465ECA00B45541 /* LoadCustomButton.swift in Sources */,
 				8A907F332AC7138A006146EA /* LibLlama.swift in Sources */,
 				8A9F7C4D2AC332EE008AE1EA /* LlamaState.swift in Sources */,
+				D1A2F0012E0C8E8B00A1B1C0 /* FinetuneBridge.mm in Sources */,
 				8A1C83792AC328BD0096AF73 /* ContentView.swift in Sources */,
 				8A1C83772AC328BD0096AF73 /* llama_swiftuiApp.swift in Sources */,
 				7FA3D2B32B2EA2F600543F92 /* DownloadButton.swift in Sources */,
@@ -364,9 +380,10 @@
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				CLANG_ENABLE_MODULES = YES;
+				CODE_SIGN_IDENTITY = "Apple Development";
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
-				DEVELOPMENT_TEAM = K5UQJPP73A;
+				DEVELOPMENT_TEAM = 3LT8Z8ZRCG;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
@@ -380,14 +397,16 @@
 					"@executable_path/Frameworks",
 				);
 				MARKETING_VERSION = 1.0;
-				PRODUCT_BUNDLE_IDENTIFIER = "com.bachittle.llama-swift";
+				PRODUCT_BUNDLE_IDENTIFIER = "llama-collabora";
 				PRODUCT_NAME = "$(TARGET_NAME)";
+				PROVISIONING_PROFILE_SPECIFIER = "";
 				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator xros xrsimulator";
 				SUPPORTS_XR_DESIGNED_FOR_IPHONE_IPAD = NO;
 				SWIFT_EMIT_LOC_STRINGS = YES;
 				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
 				SWIFT_VERSION = 5.0;
 				TARGETED_DEVICE_FAMILY = "1,2,7";
+				SWIFT_OBJC_BRIDGING_HEADER = "llama.swiftui/Bridging/llama_swiftui-Bridging-Header.h";
 			};
 			name = Debug;
 		};
@@ -396,9 +415,10 @@
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				CLANG_ENABLE_MODULES = YES;
+				CODE_SIGN_IDENTITY = "Apple Development";
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
-				DEVELOPMENT_TEAM = K5UQJPP73A;
+				DEVELOPMENT_TEAM = 3LT8Z8ZRCG;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
@@ -412,13 +432,15 @@
 					"@executable_path/Frameworks",
 				);
 				MARKETING_VERSION = 1.0;
-				PRODUCT_BUNDLE_IDENTIFIER = "com.bachittle.llama-swift";
+				PRODUCT_BUNDLE_IDENTIFIER = "llama-collabora";
 				PRODUCT_NAME = "$(TARGET_NAME)";
+				PROVISIONING_PROFILE_SPECIFIER = "";
 				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator xros xrsimulator";
 				SUPPORTS_XR_DESIGNED_FOR_IPHONE_IPAD = NO;
 				SWIFT_EMIT_LOC_STRINGS = YES;
 				SWIFT_VERSION = 5.0;
 				TARGETED_DEVICE_FAMILY = "1,2,7";
+				SWIFT_OBJC_BRIDGING_HEADER = "llama.swiftui/Bridging/llama_swiftui-Bridging-Header.h";
 			};
 			name = Release;
 		};

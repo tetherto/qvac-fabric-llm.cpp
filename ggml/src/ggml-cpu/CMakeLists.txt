@@ -35,6 +35,7 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
         ggml-cpu/hbm.h
         ggml-cpu/quants.c
         ggml-cpu/quants.h
+        ggml-cpu/tbq-quants.c
         ggml-cpu/traits.cpp
         ggml-cpu/traits.h
         ggml-cpu/amx/amx.cpp
@@ -57,6 +58,25 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
         ggml-cpu/ops.h
         ggml-cpu/ops.cpp
         )
+
+    # clang-22's -O3 optimizer blows up (>6h on a single TU; reproduced locally
+    # as one clang++ pegged at 100% CPU, ~0.8 GB RSS) compiling the AMX
+    # quantized-matmul kernel (ggml-cpu/amx/mmq.cpp) for the sapphirerapids
+    # variant under GGML_CPU_ALL_VARIANTS. AMX throughput comes from the tile
+    # intrinsics, not the high-level optimizer, so building that one TU at -O1
+    # avoids the compile-time explosion at negligible runtime cost (-O1: ~5s vs
+    # -O3: >40m). Skip MSVC: it maps -O1 to /O1, incompatible with the debug
+    # /RTC1 flag (D8016), and doesn't hit the clang blow-up anyway.
+    #
+    # NOTE: source-file COMPILE_OPTIONS are *directory*-scoped — they apply to
+    # mmq.cpp in every variant library built here, not just the one whose
+    # function call sets them. So gate on the consuming target via a generator
+    # expression: only the ggml-cpu-sapphirerapids target gets -O1; every other
+    # variant keeps -O3.
+    if(NOT MSVC AND GGML_BACKEND_DL AND GGML_CPU_ALL_VARIANTS)
+      set_source_files_properties(ggml-cpu/amx/mmq.cpp PROPERTIES COMPILE_OPTIONS
+        "$<$<STREQUAL:$<TARGET_PROPERTY:NAME>,ggml-cpu-sapphirerapids>:-O1>")
+    endif()
 
     target_compile_features(${GGML_CPU_NAME} PRIVATE c_std_11 cxx_std_17)
     target_include_directories(${GGML_CPU_NAME} PRIVATE . ggml-cpu)
@@ -318,12 +338,21 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
                 endif()
                 if (GGML_AMX_TILE)
                     list(APPEND ARCH_DEFINITIONS __AMX_TILE__ GGML_AMX_TILE)
+                    if (CMAKE_C_COMPILER_ID STREQUAL "Clang")
+                        list(APPEND ARCH_FLAGS -mamx-tile)
+                    endif()
                 endif()
                 if (GGML_AMX_INT8)
                     list(APPEND ARCH_DEFINITIONS __AMX_INT8__ GGML_AMX_INT8)
+                    if (CMAKE_C_COMPILER_ID STREQUAL "Clang")
+                        list(APPEND ARCH_FLAGS -mamx-int8)
+                    endif()
                 endif()
                 if (GGML_AMX_BF16)
                     list(APPEND ARCH_DEFINITIONS __AMX_BF16__ GGML_AMX_BF16)
+                    if (CMAKE_C_COMPILER_ID STREQUAL "Clang")
+                        list(APPEND ARCH_FLAGS -mamx-bf16)
+                    endif()
                 endif()
             elseif (GGML_AVX2)
                 list(APPEND ARCH_FLAGS /arch:AVX2)
@@ -337,6 +366,9 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
             endif()
             if (GGML_AVX_VNNI)
                 list(APPEND ARCH_DEFINITIONS __AVXVNNI__ GGML_AVX_VNNI)
+                if (CMAKE_C_COMPILER_ID STREQUAL "Clang")
+                    list(APPEND ARCH_FLAGS -mavxvnni)
+                endif()
             endif()
             if (GGML_BMI2)
                 # MSVC does not define macro __BMI2__
