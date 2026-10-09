@@ -239,7 +239,12 @@ bool socket_t::impl::rdma_probe() {
     const uint8_t ib_port = 1;
     int num_devs = 0;
     ibv_device ** devs = ibv_get_device_list(&num_devs);
-    if (!devs || num_devs == 0) return false;
+    if (!devs) return false;
+    if (num_devs == 0) {
+        // the list is allocated even when it is empty
+        ibv_free_device_list(devs);
+        return false;
+    }
 
     ibv_context * ibctx = nullptr;
     const char * matched_dev = nullptr;
