@@ -547,6 +547,9 @@ llama_build_and_test(test-laya.cpp)
 # Self-skipping when no XDNA device is registered.
 if (GGML_XDNA)
     llama_build_and_test(test-xdna-reload.cpp       LABEL "model")
+    # Graphs the backend rewrites, against the CPU backend. Needs the device,
+    # no model; self-skipping like the above.
+    llama_build_and_test(test-xdna-graph.cpp)
     # The host-only backend tests are built with the backend
     # (ggml/src/ggml-xdna/CMakeLists.txt); they need no model and no device.
     foreach(t test-xdna-repack)

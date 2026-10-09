@@ -10,6 +10,9 @@ ggml_add_backend_library(ggml-xdna
                          xdna-gemv.cpp
                          xdna-seq-attn.cpp
                          xdna-ops.cpp
+                         xdna-pgemm.cpp
+                         xdna-attn-mm.cpp
+                         xdna-gdn-mm.cpp
                          xdna-fa-prefill.cpp
                          xdna-gdn-prefill.cpp
                          xdna-conv-prefill.cpp
@@ -260,6 +263,89 @@ if (GGML_XDNA_BUILD_KERNELS)
         VERBATIM
     )
     list(APPEND XDNA_ARTIFACTS ${FA_XCLBIN} ${FA_INSTS})
+
+    # Prefill GEMM (pgemm.py + gemm-expand.cc, FLM_PREFILL_PLAN.md step 1):
+    # every core expands the decode GEMV's own weight tiles into bf16 and runs
+    # the bfp16 mmul. The cores read their loop counts from the first A object,
+    # so one artifact covers every M, K, N and both tile formats; the runner
+    # (xdna-pgemm.cpp) builds each call's TXN stream, and the .insts.bin here
+    # is only the sample shape's.
+    set(PG_STEM "pgemm_c8")
+    set(PG_XCLBIN "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/${PG_STEM}.xclbin")
+    set(PG_INSTS  "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/${PG_STEM}.insts.bin")
+    add_custom_command(
+        OUTPUT ${PG_XCLBIN} ${PG_INSTS}
+        COMMAND ${GEMM_PYTHON} "${GEMM_DIR}/pgemm.py"
+                -d npu2
+                --xclbin-path ${PG_XCLBIN}
+                --insts-path ${PG_INSTS}
+        DEPENDS "${GEMM_DIR}/pgemm.py" "${GEMM_DIR}/gemm-expand.cc"
+                "${GEMM_DIR}/gemv_q4.py" "${GEMM_DIR}/wfmt.py"
+        WORKING_DIRECTORY "${GEMM_DIR}"
+        COMMENT "ggml-xdna: compiling the prefill GEMM"
+        VERBATIM
+    )
+    list(APPEND XDNA_ARTIFACTS ${PG_XCLBIN} ${PG_INSTS})
+
+    # Prefill attention (attn_mm.py + attn-mm.cc, FLM_PREFILL_PLAN.md step 4):
+    # the six full-attention layers on the mmul, the cores driven by a header
+    # (passes, the ubatch's first position), so one artifact covers every
+    # length; the runner (xdna-attn-mm.cpp) builds each call's TXN stream.
+    set(AM_STEM "attn_mm_c8")
+    set(AM_XCLBIN "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/${AM_STEM}.xclbin")
+    set(AM_INSTS  "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/${AM_STEM}.insts.bin")
+    add_custom_command(
+        OUTPUT ${AM_XCLBIN} ${AM_INSTS}
+        COMMAND ${GEMM_PYTHON} "${GEMM_DIR}/attn_mm.py"
+                -d npu2
+                --xclbin-path ${AM_XCLBIN}
+                --insts-path ${AM_INSTS}
+        DEPENDS "${GEMM_DIR}/attn_mm.py" "${GEMM_DIR}/attn-mm.cc"
+        WORKING_DIRECTORY "${GEMM_DIR}"
+        COMMENT "ggml-xdna: compiling the prefill attention"
+        VERBATIM
+    )
+    list(APPEND XDNA_ARTIFACTS ${AM_XCLBIN} ${AM_INSTS})
+
+    # Prefill gated delta rule (gdn_mm.py + gdn-mm.cc, FLM_PREFILL_PLAN.md
+    # step 3): the recurrent layers' state on the array for the whole ubatch,
+    # the cores driven by a header, one artifact for every length; the runner
+    # (xdna-gdn-mm.cpp) builds each call's TXN stream.
+    set(GM_STEM "gdn_mm_c8")
+    set(GM_XCLBIN "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/${GM_STEM}.xclbin")
+    set(GM_INSTS  "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/${GM_STEM}.insts.bin")
+    add_custom_command(
+        OUTPUT ${GM_XCLBIN} ${GM_INSTS}
+        COMMAND ${GEMM_PYTHON} "${GEMM_DIR}/gdn_mm.py"
+                -d npu2
+                --xclbin-path ${GM_XCLBIN}
+                --insts-path ${GM_INSTS}
+        DEPENDS "${GEMM_DIR}/gdn_mm.py" "${GEMM_DIR}/gdn-mm.cc"
+        WORKING_DIRECTORY "${GEMM_DIR}"
+        COMMENT "ggml-xdna: compiling the prefill gated delta rule"
+        VERBATIM
+    )
+    list(APPEND XDNA_ARTIFACTS ${GM_XCLBIN} ${GM_INSTS})
+
+    # The recurrent layers' conv input on the array (gdn_conv.py +
+    # gdn-conv.cc): the in-projection's rows convolved, SiLU'd and K, Q
+    # normalized straight into the prefill GDN's input; the runner
+    # (xdna-gdn-mm.cpp) builds each call's TXN stream.
+    set(GC_STEM "gdn_conv_c8")
+    set(GC_XCLBIN "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/${GC_STEM}.xclbin")
+    set(GC_INSTS  "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/${GC_STEM}.insts.bin")
+    add_custom_command(
+        OUTPUT ${GC_XCLBIN} ${GC_INSTS}
+        COMMAND ${GEMM_PYTHON} "${GEMM_DIR}/gdn_conv.py"
+                -d npu2
+                --xclbin-path ${GC_XCLBIN}
+                --insts-path ${GC_INSTS}
+        DEPENDS "${GEMM_DIR}/gdn_conv.py" "${GEMM_DIR}/gdn-conv.cc"
+        WORKING_DIRECTORY "${GEMM_DIR}"
+        COMMENT "ggml-xdna: compiling the GDN conv input"
+        VERBATIM
+    )
+    list(APPEND XDNA_ARTIFACTS ${GC_XCLBIN} ${GC_INSTS})
 
     # Fused decode (fused_layer.py): the whole recurrent layer in one xclbin -
     # the conv+norm+gdn+gated core, the decode GEMV its projections run on, and
