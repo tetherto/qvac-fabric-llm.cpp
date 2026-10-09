@@ -80,6 +80,20 @@ jobs:
             exit 1
           fi
 
+      # -O0 keeps branches of the verbs.h inline wrappers that optimized builds drop,
+      # and those can call libibverbs functions the Release check never sees.
+      - name: Check the Debug RPC backend for libibverbs symbols
+        run: |
+          cmake -B build-debug \
+            -G "Ninja" \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DGGML_RPC=ON
+          cmake --build build-debug --target ggml-rpc test-rpc-transport -j $(nproc)
+          if nm -D build-debug/bin/libggml-rpc.so | grep -E '[[:space:]]_?ibv_'; then
+            printf '%s\n' "Debug libggml-rpc.so imports or exports ibv symbols"
+            exit 1
+          fi
+
       - name: Download model
         run: |
           cmake \

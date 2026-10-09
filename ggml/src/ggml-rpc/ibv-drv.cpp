@@ -24,6 +24,7 @@
 
 // Every non-inline libibverbs function the RPC transport calls, including those
 // that verbs.h inline wrappers call (ibv_query_port, _ibv_query_gid_ex, ibv_reg_mr).
+// ibv_reg_mr_iova2 is the __ibv_reg_mr branch that only -O0 builds keep.
 #define IBV_SYMBOLS(X)            \
     X(_ibv_query_gid_ex)          \
     X(ibv_ack_cq_events)          \
@@ -46,6 +47,7 @@
     X(ibv_query_gid)              \
     X(ibv_query_port)             \
     X(ibv_reg_mr)                 \
+    X(ibv_reg_mr_iova2)           \
     X(ibv_wc_status_str)
 
 #define IBV_PFN(name) static decltype(&name) name##_pfn = nullptr;
@@ -140,6 +142,10 @@ int (ibv_query_port)(struct ibv_context * context, uint8_t port_num, struct _com
 
 struct ibv_mr * (ibv_reg_mr)(struct ibv_pd * pd, void * addr, size_t length, int access) {
     return ibv_reg_mr_pfn(pd, addr, length, access);
+}
+
+struct ibv_mr * ibv_reg_mr_iova2(struct ibv_pd * pd, void * addr, size_t length, uint64_t iova, unsigned int access) {
+    return ibv_reg_mr_iova2_pfn(pd, addr, length, iova, access);
 }
 
 const char * ibv_wc_status_str(enum ibv_wc_status status) {
