@@ -179,6 +179,11 @@ if(NOT TARGET ggml::ggml)
             INTERFACE_INCLUDE_DIRECTORIES "${GGML_INCLUDE_DIR}"
             INTERFACE_LINK_LIBRARIES "${GGML_BASE_INTERFACE_LINK_LIBRARIES}")
 
+    if(GGML_MAX_NAME)
+        set_property(TARGET ggml::ggml-base APPEND PROPERTY
+            INTERFACE_COMPILE_DEFINITIONS "GGML_MAX_NAME=${GGML_MAX_NAME}")
+    endif()
+
     set(_ggml_all_targets "")
     if (NOT GGML_BACKEND_DL)
         foreach(_ggml_backend ${GGML_AVAILABLE_BACKENDS})

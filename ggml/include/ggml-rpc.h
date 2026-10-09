@@ -21,10 +21,12 @@ extern "C" {
 //     (b12032 fork: 109, b11259 fork: 108); 111.1 adds RPC_CMD_SET_TENSOR_2D_HASH.
 // 112 adds cache flags to SET_TENSOR and SET_TENSOR_2D (b12032 fork: 110,
 //     b11259 fork: 109).
+// 113 widens rpc_tensor::name with GGML_MAX_NAME 128 (b12032 fork: 111,
+//     temp-11018: 110).
 // A minor bump is additive: the client still accepts a server with an older
 // minor and must gate every command introduced by a later minor on the minor
 // the server announces at HELLO.
-#define RPC_PROTO_MAJOR_VERSION    112
+#define RPC_PROTO_MAJOR_VERSION    113
 #define RPC_PROTO_MINOR_VERSION    0
 #define RPC_PROTO_PATCH_VERSION    0
 
