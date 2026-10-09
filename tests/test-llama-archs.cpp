@@ -1791,8 +1791,12 @@ static llama_model_ptr kv_stream_gaps_model(llm_arch arch) {
     auto gguf = get_gguf_ctx(arch, arch == LLM_ARCH_DEEPSEEK2);
     gguf_set_val_u32(gguf.get(), (std::string(llm_arch_name(arch)) + ".block_count").c_str(), 8);
 
+    // CPU only: GPU backends pick kernels by stream count, so their rounding differs between layouts (~3e-4 nmse for MLA on CUDA)
+    ggml_backend_dev_t devs[] = { nullptr };
+
     llama_model_params mp = llama_model_default_params();
     mp.progress_callback = silent_model_load_progress;
+    mp.devices = devs;
     size_t seed = 1;
     llama_model_ptr model(llama_model_init_from_user(gguf.get(), kv_stream_gaps_tensor_data, &seed, mp));
     GGML_ASSERT(model);
