@@ -310,10 +310,32 @@ kernel void kernel_gemv_noshuffle_q6_K_f32(
 
 #ifdef MC_N_COLS
 // Multi-column kernel_gemv_noshuffle_q6_K_f32, built once per MC_N_COLS (2..8): weights load once per K-block and
-// each column runs the 1-column dequant-accumulate with the same K-split, so it is bit-identical to it.
+// each column runs the 1-column dequant-accumulate (bit-identical to it at the same work-group height).
+#define MC_MAX_NSG 16
 // From MC_STAGE_MIN_COLS columns on, the activations come from a local-memory slice instead of per-column broadcasts.
 #define MC_STAGE_MIN_COLS 4
 #define MC_BLOCK_PIXELS   8 // float4 activation pixels per 32-element block
+#define MC_BLOCK_Q_WORDS  4 // ql uints (and qh ushorts) per row in one 32-element block
+// The weights prefetch costs registers; below 7 columns they would cut the waves of a smaller K-split.
+#define MC_PREFETCH_MIN_COLS 7
+#define Q6K_MC_LOAD_WEIGHTS(kb, l_hi, h_hi, l_lo, h_lo) { \
+    const int kq = (kb); \
+    l_hi.s0 = read_imageui(src0_ql, gid_s + kq*block_stride_a + line_stride_a*0).x; \
+    l_hi.s1 = read_imageui(src0_ql, gid_s + kq*block_stride_a + line_stride_a*1).x; \
+    l_hi.s2 = read_imageui(src0_ql, gid_s + kq*block_stride_a + line_stride_a*2).x; \
+    l_hi.s3 = read_imageui(src0_ql, gid_s + kq*block_stride_a + line_stride_a*3).x; \
+    h_hi.s0 = as_ushort(read_imageh(src0_qh, gid_s + kq*block_stride_a + line_stride_a*0).x); \
+    h_hi.s1 = as_ushort(read_imageh(src0_qh, gid_s + kq*block_stride_a + line_stride_a*1).x); \
+    h_hi.s2 = as_ushort(read_imageh(src0_qh, gid_s + kq*block_stride_a + line_stride_a*2).x); \
+    h_hi.s3 = as_ushort(read_imageh(src0_qh, gid_s + kq*block_stride_a + line_stride_a*3).x); \
+    l_lo.s0 = read_imageui(src0_ql, gid_s + kq*block_stride_a + line_stride_a*4).x; \
+    l_lo.s1 = read_imageui(src0_ql, gid_s + kq*block_stride_a + line_stride_a*5).x; \
+    l_lo.s2 = read_imageui(src0_ql, gid_s + kq*block_stride_a + line_stride_a*6).x; \
+    l_lo.s3 = read_imageui(src0_ql, gid_s + kq*block_stride_a + line_stride_a*7).x; \
+    h_lo.s0 = as_ushort(read_imageh(src0_qh, gid_s + kq*block_stride_a + line_stride_a*4).x); \
+    h_lo.s1 = as_ushort(read_imageh(src0_qh, gid_s + kq*block_stride_a + line_stride_a*5).x); \
+    h_lo.s2 = as_ushort(read_imageh(src0_qh, gid_s + kq*block_stride_a + line_stride_a*6).x); \
+    h_lo.s3 = as_ushort(read_imageh(src0_qh, gid_s + kq*block_stride_a + line_stride_a*7).x); }
 
 #if MC_N_COLS < MC_STAGE_MIN_COLS
 #ifdef VECTOR_SUB_GROUP_BROADCAT
@@ -344,15 +366,15 @@ kernel void kernel_gemv_noshuffle_q6_K_f32(
     dequantize_block_acc_fetch_lo(ts, as_ushort8(ql_lo), as_uchar8(qh_lo), reg_d, reg_s, ACT_LOCAL, y2, y3); }
 #endif
 
-// Sums the subgroup partials of one column in subgroup order and stores its two rows.
-inline void reduce_store_col_q6k(float2 ts, int col, local float2 * lm, int sg, ushort slid,
+// Sums the nsg subgroup partials of one column in subgroup order and stores its two rows.
+inline void reduce_store_col_q6k(float2 ts, int col, local float2 * lm, int sg, ushort slid, int nsg,
                                  int gid, int ne01, global float * dst) {
     if (sg > 0) {
         lm[SUBGROUP_SIZE * (sg - 1) + slid] = ts;
     }
     barrier(CLK_LOCAL_MEM_FENCE);
     if (sg == 0) {
-        for (int i = 0; i < NSUBGROUPS - 1; ++i) {
+        for (int i = 0; i < nsg - 1; ++i) {
             ts += lm[SUBGROUP_SIZE * i + slid];
         }
         if (gid * 2 + 0 < ne01) dst[col * ne01 + gid * 2 + 0] = ts.s0;
@@ -373,15 +395,17 @@ kernel void kernel_gemv_noshuffle_q6_K_f32_mc(
     global float * dst,
     ulong offsetd,
     int ne00,
-    int ne01
+    int ne01,
+    local float4 * mc_stage  // nsg * MC_N_COLS staged blocks, sized by the host
 ) {
     int grp  = get_local_id(1);
     int gid  = get_global_id(0);
     ushort slid = get_sub_group_local_id();
+    int nsg  = get_local_size(1);
 
     int nb = ne00 / 32;
     int line_stride_a  = ne01 / 2;
-    int block_stride_a = NSUBGROUPS * ne01;
+    int block_stride_a = MC_BLOCK_Q_WORDS * ne01; // set by the weight layout, not the K-split
     int col_stride     = ne00 / 4;
     // Tail lanes (ne01 % 128 != 0) fetch a clamped row; the store guard drops their results.
     int gid_s = min(gid, line_stride_a - 1);
@@ -395,31 +419,27 @@ kernel void kernel_gemv_noshuffle_q6_K_f32_mc(
     float2 ts0 = 0.0f, ts1 = 0.0f, ts2 = 0.0f, ts3 = 0.0f;
     float2 ts4 = 0.0f, ts5 = 0.0f, ts6 = 0.0f, ts7 = 0.0f;
 
-#if MC_N_COLS >= MC_STAGE_MIN_COLS
-    local float4 mc_stage[NSUBGROUPS * MC_N_COLS * MC_BLOCK_PIXELS];
+#if MC_N_COLS >= MC_PREFETCH_MIN_COLS
+    // Load the next block's weight words while this block's columns run, hiding their latency.
+    uint4   next_ql_hi, next_ql_lo;
+    ushort4 next_qh_hi, next_qh_lo;
+    Q6K_MC_LOAD_WEIGHTS(min(grp, nb - 1), next_ql_hi, next_qh_hi, next_ql_lo, next_qh_lo);
 #endif
 
-    for (int k = grp; k < nb; k += NSUBGROUPS) {
+    for (int k = grp; k < nb; k += nsg) {
+#if MC_N_COLS >= MC_PREFETCH_MIN_COLS
+        ql_hi = next_ql_hi;
+        qh_hi = next_qh_hi;
+        ql_lo = next_ql_lo;
+        qh_lo = next_qh_lo;
+        Q6K_MC_LOAD_WEIGHTS(min(k + nsg, nb - 1), next_ql_hi, next_qh_hi, next_ql_lo, next_qh_lo);
+#endif
         reg_d = src0_d[gid_s + k/8 * line_stride_a];
         reg_s = as_char4(src0_s[gid_s + k * line_stride_a]);
 
-        ql_hi.s0 = read_imageui(src0_ql, gid_s + k*block_stride_a + line_stride_a*0).x;
-        ql_hi.s1 = read_imageui(src0_ql, gid_s + k*block_stride_a + line_stride_a*1).x;
-        ql_hi.s2 = read_imageui(src0_ql, gid_s + k*block_stride_a + line_stride_a*2).x;
-        ql_hi.s3 = read_imageui(src0_ql, gid_s + k*block_stride_a + line_stride_a*3).x;
-        qh_hi.s0 = as_ushort(read_imageh(src0_qh, gid_s + k*block_stride_a + line_stride_a*0).x);
-        qh_hi.s1 = as_ushort(read_imageh(src0_qh, gid_s + k*block_stride_a + line_stride_a*1).x);
-        qh_hi.s2 = as_ushort(read_imageh(src0_qh, gid_s + k*block_stride_a + line_stride_a*2).x);
-        qh_hi.s3 = as_ushort(read_imageh(src0_qh, gid_s + k*block_stride_a + line_stride_a*3).x);
-
-        ql_lo.s0 = read_imageui(src0_ql, gid_s + k*block_stride_a + line_stride_a*4).x;
-        ql_lo.s1 = read_imageui(src0_ql, gid_s + k*block_stride_a + line_stride_a*5).x;
-        ql_lo.s2 = read_imageui(src0_ql, gid_s + k*block_stride_a + line_stride_a*6).x;
-        ql_lo.s3 = read_imageui(src0_ql, gid_s + k*block_stride_a + line_stride_a*7).x;
-        qh_lo.s0 = as_ushort(read_imageh(src0_qh, gid_s + k*block_stride_a + line_stride_a*4).x);
-        qh_lo.s1 = as_ushort(read_imageh(src0_qh, gid_s + k*block_stride_a + line_stride_a*5).x);
-        qh_lo.s2 = as_ushort(read_imageh(src0_qh, gid_s + k*block_stride_a + line_stride_a*6).x);
-        qh_lo.s3 = as_ushort(read_imageh(src0_qh, gid_s + k*block_stride_a + line_stride_a*7).x);
+#if MC_N_COLS < MC_PREFETCH_MIN_COLS
+        Q6K_MC_LOAD_WEIGHTS(k, ql_hi, qh_hi, ql_lo, qh_lo);
+#endif
 
 #if MC_N_COLS >= MC_STAGE_MIN_COLS
         // Stage this block's activations for every column in the subgroup's own slice. The first barrier keeps the
@@ -441,15 +461,15 @@ kernel void kernel_gemv_noshuffle_q6_K_f32_mc(
         if (MC_N_COLS > 7) Q6K_MC_COL(ts7, 7);
     }
 
-    local float2 reduce_lm[SUBGROUP_SIZE * (NSUBGROUPS - 1)];
+    local float2 reduce_lm[SUBGROUP_SIZE * (MC_MAX_NSG - 1)];
     dst = (global float*)((global char*)dst + offsetd);
-    reduce_store_col_q6k(ts0, 0, reduce_lm, grp, slid, gid, ne01, dst);
-    reduce_store_col_q6k(ts1, 1, reduce_lm, grp, slid, gid, ne01, dst);
-    if (MC_N_COLS > 2) reduce_store_col_q6k(ts2, 2, reduce_lm, grp, slid, gid, ne01, dst);
-    if (MC_N_COLS > 3) reduce_store_col_q6k(ts3, 3, reduce_lm, grp, slid, gid, ne01, dst);
-    if (MC_N_COLS > 4) reduce_store_col_q6k(ts4, 4, reduce_lm, grp, slid, gid, ne01, dst);
-    if (MC_N_COLS > 5) reduce_store_col_q6k(ts5, 5, reduce_lm, grp, slid, gid, ne01, dst);
-    if (MC_N_COLS > 6) reduce_store_col_q6k(ts6, 6, reduce_lm, grp, slid, gid, ne01, dst);
-    if (MC_N_COLS > 7) reduce_store_col_q6k(ts7, 7, reduce_lm, grp, slid, gid, ne01, dst);
+    reduce_store_col_q6k(ts0, 0, reduce_lm, grp, slid, nsg, gid, ne01, dst);
+    reduce_store_col_q6k(ts1, 1, reduce_lm, grp, slid, nsg, gid, ne01, dst);
+    if (MC_N_COLS > 2) reduce_store_col_q6k(ts2, 2, reduce_lm, grp, slid, nsg, gid, ne01, dst);
+    if (MC_N_COLS > 3) reduce_store_col_q6k(ts3, 3, reduce_lm, grp, slid, nsg, gid, ne01, dst);
+    if (MC_N_COLS > 4) reduce_store_col_q6k(ts4, 4, reduce_lm, grp, slid, nsg, gid, ne01, dst);
+    if (MC_N_COLS > 5) reduce_store_col_q6k(ts5, 5, reduce_lm, grp, slid, nsg, gid, ne01, dst);
+    if (MC_N_COLS > 6) reduce_store_col_q6k(ts6, 6, reduce_lm, grp, slid, nsg, gid, ne01, dst);
+    if (MC_N_COLS > 7) reduce_store_col_q6k(ts7, 7, reduce_lm, grp, slid, nsg, gid, ne01, dst);
 }
 #endif // MC_N_COLS

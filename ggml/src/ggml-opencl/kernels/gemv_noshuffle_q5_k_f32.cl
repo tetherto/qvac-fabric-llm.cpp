@@ -343,10 +343,27 @@ kernel void kernel_gemv_noshuffle_q5_k_f32(
 
 #ifdef MC_N_COLS
 // Multi-column kernel_gemv_noshuffle_q5_k_f32, built once per MC_N_COLS (2..8): weights load once per K-block and
-// each column runs the 1-column dequant-accumulate with the same K-split, so it is bit-identical to it.
+// each column runs the 1-column dequant-accumulate (bit-identical to it at the same work-group height).
+#define MC_MAX_NSG 16
 // From MC_STAGE_MIN_COLS columns on, the activations come from a local-memory slice instead of per-column broadcasts.
 #define MC_STAGE_MIN_COLS 4
 #define MC_BLOCK_PIXELS   8 // float4 activation pixels per 32-element block
+#define MC_BLOCK_Q_WORDS  4 // uint words of 4-bit quants per row in one 32-element block
+#define MC_BLOCK_QH_WORDS 2 // ushort words of high bits per row in one 32-element block
+#define Q5K_MC_LOAD_WEIGHTS(kb, h, a_hi, a_lo) { \
+    const uint kq = (kb); \
+    h.s0 = as_ushort(read_imageh(src0_qh, (gid_s + kq * BLOCK_STRIDE_A_QH + LINE_STRIDE_A_QH * 0)).x); \
+    h.s1 = as_ushort(read_imageh(src0_qh, (gid_s + kq * BLOCK_STRIDE_A_QH + LINE_STRIDE_A_QH * 1)).x); \
+    h.s2 = as_ushort(read_imageh(src0_qh, (gid_s + kq * BLOCK_STRIDE_A_QH + LINE_STRIDE_A_QH * 2)).x); \
+    h.s3 = as_ushort(read_imageh(src0_qh, (gid_s + kq * BLOCK_STRIDE_A_QH + LINE_STRIDE_A_QH * 3)).x); \
+    a_hi.s0 = read_imageui(src0_q, (gid_s + kq * BLOCK_STRIDE_A + LINE_STRIDE_A * 0)).x; \
+    a_hi.s1 = read_imageui(src0_q, (gid_s + kq * BLOCK_STRIDE_A + LINE_STRIDE_A * 1)).x; \
+    a_hi.s2 = read_imageui(src0_q, (gid_s + kq * BLOCK_STRIDE_A + LINE_STRIDE_A * 2)).x; \
+    a_hi.s3 = read_imageui(src0_q, (gid_s + kq * BLOCK_STRIDE_A + LINE_STRIDE_A * 3)).x; \
+    a_lo.s0 = read_imageui(src0_q, (gid_s + kq * BLOCK_STRIDE_A + LINE_STRIDE_A * 4)).x; \
+    a_lo.s1 = read_imageui(src0_q, (gid_s + kq * BLOCK_STRIDE_A + LINE_STRIDE_A * 5)).x; \
+    a_lo.s2 = read_imageui(src0_q, (gid_s + kq * BLOCK_STRIDE_A + LINE_STRIDE_A * 6)).x; \
+    a_lo.s3 = read_imageui(src0_q, (gid_s + kq * BLOCK_STRIDE_A + LINE_STRIDE_A * 7)).x; }
 
 #if MC_N_COLS < MC_STAGE_MIN_COLS
 #ifdef VECTOR_SUB_GROUP_BROADCAST
@@ -377,15 +394,15 @@ kernel void kernel_gemv_noshuffle_q5_k_f32(
     dequantizeBlockAccum_ns_fetch_lo(ts, as_ushort8(regA_lo), as_uchar8(regH), regS, regM, ACT_LOCAL, y2, y3); }
 #endif
 
-// Sums the subgroup partials of one column in subgroup order and stores its two rows.
-inline void reduce_store_col_q5k(float2 ts, uint col, local float2 * lm, uint sg, ushort slid,
+// Sums the nsg subgroup partials of one column in subgroup order and stores its two rows.
+inline void reduce_store_col_q5k(float2 ts, uint col, local float2 * lm, uint sg, ushort slid, uint nsg,
                                  uint gid, uint M, global float * dst) {
     if (sg > 0) {
         lm[SUBGROUP_SIZE * (sg - 1) + slid] = ts;
     }
     barrier(CLK_LOCAL_MEM_FENCE);
     if (sg == 0) {
-        for (uint i = 0; i < NSUBGROUPS - 1; ++i) {
+        for (uint i = 0; i < nsg - 1; ++i) {
             ts += lm[SUBGROUP_SIZE * i + slid];
         }
         if (gid * 2 + 0 < M) dst[col * M + gid * 2 + 0] = ts.s0;
@@ -410,19 +427,22 @@ kernel void kernel_gemv_noshuffle_q5_k_f32_mc(
         int ne01,
         uchar mask_d6,
         uchar mask_d4,
-        uchar mask_hi2)
+        uchar mask_hi2,
+        local float4 * mc_stage)  // nsg * MC_N_COLS staged blocks, sized by the host
 {
     uint groupId = get_local_id(1);
     uint gid     = get_global_id(0);
     ushort slid  = get_sub_group_local_id();
+    uint nsg     = get_local_size(1);
 
     uint K = ne00;
     uint M = ne01;
 
+    // Block strides follow the weight layout, not the K-split.
     uint LINE_STRIDE_A     = M / 2;
-    uint BLOCK_STRIDE_A    = NSUBGROUPS * M;
+    uint BLOCK_STRIDE_A    = MC_BLOCK_Q_WORDS * M;
     uint LINE_STRIDE_A_QH  = M / 2;
-    uint BLOCK_STRIDE_A_QH = NSUBGROUPS * M / 2;
+    uint BLOCK_STRIDE_A_QH = MC_BLOCK_QH_WORDS * M;
     uint scales_per_row    = (K / QK_K) * 12;
     uint COL_STRIDE        = K / 4;
     // Tail lanes (ne01 % 128 != 0) fetch a clamped row; the store guard drops their results.
@@ -437,10 +457,19 @@ kernel void kernel_gemv_noshuffle_q5_k_f32_mc(
     float2 ts4 = 0.0f, ts5 = 0.0f, ts6 = 0.0f, ts7 = 0.0f;
 
 #if MC_N_COLS >= MC_STAGE_MIN_COLS
-    local float4 mc_stage[NSUBGROUPS * MC_N_COLS * MC_BLOCK_PIXELS];
+    // The staged path loads the next block's weight words while this block's columns run, hiding their latency.
+    ushort4 next_h;
+    uint4   next_hi, next_lo;
+    Q5K_MC_LOAD_WEIGHTS(min(groupId, K / 32 - 1), next_h, next_hi, next_lo);
 #endif
 
-    for (uint k = groupId; k < (K / 32); k += NSUBGROUPS) {
+    for (uint k = groupId; k < (K / 32); k += nsg) {
+#if MC_N_COLS >= MC_STAGE_MIN_COLS
+        regH    = next_h;
+        regA_hi = next_hi;
+        regA_lo = next_lo;
+        Q5K_MC_LOAD_WEIGHTS(min(k + nsg, K / 32 - 1), next_h, next_hi, next_lo);
+#endif
         uint sb = k / 8;
         uint j  = k % 8;
 
@@ -457,19 +486,9 @@ kernel void kernel_gemv_noshuffle_q5_k_f32_mc(
         regS = convert_half2(convert_float2(d)  * convert_float2((uchar2)(sv0, sv1)));
         regM = convert_half2(convert_float2(dm) * convert_float2((uchar2)(mn0, mn1)));
 
-        regH.s0 = as_ushort(read_imageh(src0_qh, (gid_s + k * BLOCK_STRIDE_A_QH + LINE_STRIDE_A_QH * 0)).x);
-        regH.s1 = as_ushort(read_imageh(src0_qh, (gid_s + k * BLOCK_STRIDE_A_QH + LINE_STRIDE_A_QH * 1)).x);
-        regH.s2 = as_ushort(read_imageh(src0_qh, (gid_s + k * BLOCK_STRIDE_A_QH + LINE_STRIDE_A_QH * 2)).x);
-        regH.s3 = as_ushort(read_imageh(src0_qh, (gid_s + k * BLOCK_STRIDE_A_QH + LINE_STRIDE_A_QH * 3)).x);
-
-        regA_hi.s0 = read_imageui(src0_q, (gid_s + k * BLOCK_STRIDE_A + LINE_STRIDE_A * 0)).x;
-        regA_hi.s1 = read_imageui(src0_q, (gid_s + k * BLOCK_STRIDE_A + LINE_STRIDE_A * 1)).x;
-        regA_hi.s2 = read_imageui(src0_q, (gid_s + k * BLOCK_STRIDE_A + LINE_STRIDE_A * 2)).x;
-        regA_hi.s3 = read_imageui(src0_q, (gid_s + k * BLOCK_STRIDE_A + LINE_STRIDE_A * 3)).x;
-        regA_lo.s0 = read_imageui(src0_q, (gid_s + k * BLOCK_STRIDE_A + LINE_STRIDE_A * 4)).x;
-        regA_lo.s1 = read_imageui(src0_q, (gid_s + k * BLOCK_STRIDE_A + LINE_STRIDE_A * 5)).x;
-        regA_lo.s2 = read_imageui(src0_q, (gid_s + k * BLOCK_STRIDE_A + LINE_STRIDE_A * 6)).x;
-        regA_lo.s3 = read_imageui(src0_q, (gid_s + k * BLOCK_STRIDE_A + LINE_STRIDE_A * 7)).x;
+#if MC_N_COLS < MC_STAGE_MIN_COLS
+        Q5K_MC_LOAD_WEIGHTS(k, regH, regA_hi, regA_lo);
+#endif
 
 #if MC_N_COLS >= MC_STAGE_MIN_COLS
         // Stage this block's activations for every column in the subgroup's own slice. The first barrier keeps the
@@ -491,15 +510,15 @@ kernel void kernel_gemv_noshuffle_q5_k_f32_mc(
         if (MC_N_COLS > 7) Q5K_MC_COL(ts7, 7);
     }
 
-    local float2 reduceLM[SUBGROUP_SIZE * (NSUBGROUPS - 1)];
+    local float2 reduceLM[SUBGROUP_SIZE * (MC_MAX_NSG - 1)];
     dst = (global float*)((global char*)dst + offsetd);
-    reduce_store_col_q5k(ts0, 0, reduceLM, groupId, slid, gid, M, dst);
-    reduce_store_col_q5k(ts1, 1, reduceLM, groupId, slid, gid, M, dst);
-    if (MC_N_COLS > 2) reduce_store_col_q5k(ts2, 2, reduceLM, groupId, slid, gid, M, dst);
-    if (MC_N_COLS > 3) reduce_store_col_q5k(ts3, 3, reduceLM, groupId, slid, gid, M, dst);
-    if (MC_N_COLS > 4) reduce_store_col_q5k(ts4, 4, reduceLM, groupId, slid, gid, M, dst);
-    if (MC_N_COLS > 5) reduce_store_col_q5k(ts5, 5, reduceLM, groupId, slid, gid, M, dst);
-    if (MC_N_COLS > 6) reduce_store_col_q5k(ts6, 6, reduceLM, groupId, slid, gid, M, dst);
-    if (MC_N_COLS > 7) reduce_store_col_q5k(ts7, 7, reduceLM, groupId, slid, gid, M, dst);
+    reduce_store_col_q5k(ts0, 0, reduceLM, groupId, slid, nsg, gid, M, dst);
+    reduce_store_col_q5k(ts1, 1, reduceLM, groupId, slid, nsg, gid, M, dst);
+    if (MC_N_COLS > 2) reduce_store_col_q5k(ts2, 2, reduceLM, groupId, slid, nsg, gid, M, dst);
+    if (MC_N_COLS > 3) reduce_store_col_q5k(ts3, 3, reduceLM, groupId, slid, nsg, gid, M, dst);
+    if (MC_N_COLS > 4) reduce_store_col_q5k(ts4, 4, reduceLM, groupId, slid, nsg, gid, M, dst);
+    if (MC_N_COLS > 5) reduce_store_col_q5k(ts5, 5, reduceLM, groupId, slid, nsg, gid, M, dst);
+    if (MC_N_COLS > 6) reduce_store_col_q5k(ts6, 6, reduceLM, groupId, slid, nsg, gid, M, dst);
+    if (MC_N_COLS > 7) reduce_store_col_q5k(ts7, 7, reduceLM, groupId, slid, nsg, gid, M, dst);
 }
 #endif // MC_N_COLS

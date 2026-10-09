@@ -1883,34 +1883,35 @@ static void create_kquant_mc_gemv_kernels(ggml_backend_opencl_context * backend_
     }
 }
 
-static constexpr size_t Q4K_MC_SUBGROUP_SIZE      = 64;
-static constexpr size_t Q4K_MC_MAX_SUBGROUPS      = 16;                     // MC_MAX_NSG in the kernel
-static constexpr size_t Q4K_MC_STAGE_COL_BYTES    = 8 * sizeof(cl_float4);  // one 32-element block of one column
-static constexpr size_t Q4K_MC_CORESIDENT_WGS     = 2;
-static constexpr int    Q4K_MC_WAVE_RULE_MIN_COLS = 3;                      // n2 keeps the power-of-two K-split
-static constexpr int    Q4K_MC_STAGE_MIN_COLS     = 4;                      // MC_STAGE_MIN_COLS in the kernel
+static constexpr size_t KQUANT_MC_SUBGROUP_SIZE   = 64;
+static constexpr size_t KQUANT_MC_MAX_SUBGROUPS   = 16;                     // MC_MAX_NSG in the kernels
+static constexpr size_t KQUANT_MC_STAGE_COL_BYTES = 8 * sizeof(cl_float4);  // one 32-element block of one column
+static constexpr size_t KQUANT_MC_CORESIDENT_WGS  = 2;
+static constexpr int    KQUANT_MC_STAGE_MIN_COLS  = 4;                      // MC_STAGE_MIN_COLS in the kernels
+static constexpr int    Q4K_MC_WAVE_RULE_MIN_COLS = 3;                      // q4_K n2 keeps the power-of-two K-split
+static constexpr size_t Q5K_Q6K_GEMV_SUBGROUPS    = 4;                      // NSUBGROUPS of the 1-column q5_K/q6_K GEMVs
 
-// Below Q4K_MC_STAGE_MIN_COLS the kernel never touches its stage, which gets the smallest valid (non-zero) size.
-static size_t q4k_mc_stage_bytes(size_t nsg, int ne1) {
-    return ne1 >= Q4K_MC_STAGE_MIN_COLS ? nsg * (size_t) ne1 * Q4K_MC_STAGE_COL_BYTES : sizeof(cl_float4);
+// Below KQUANT_MC_STAGE_MIN_COLS the kernel never touches its stage, which gets the smallest valid (non-zero) size.
+static size_t kquant_mc_stage_bytes(size_t nsg, int ne1) {
+    return ne1 >= KQUANT_MC_STAGE_MIN_COLS ? nsg * (size_t) ne1 * KQUANT_MC_STAGE_COL_BYTES : sizeof(cl_float4);
 }
 
-// Waves of one q4_K mc launch resident on a compute unit: as many work-groups of nsg subgroups as the kernel's
+// Waves of one K-quant mc launch resident on a compute unit: as many work-groups of nsg subgroups as the kernel's
 // register-bound WG cap holds. Local memory never binds first: two work-groups at the largest stage fit 32 KB.
-static size_t q4k_mc_resident_waves(size_t nsg, size_t cap_waves) {
+static size_t kquant_mc_resident_waves(size_t nsg, size_t cap_waves) {
     return nsg * (cap_waves / nsg);
 }
 
-// q4_K mc K-split: two co-resident work-groups of half the waves when the grid gives every compute unit two, one
-// work-group of all waves for smaller grids; the power-of-two pick stays unless it holds fewer waves.
-static size_t q4k_mc_subgroups(const ggml_backend_opencl_context * backend_ctx, cl_kernel kernel, int ne01,
-                               size_t pow2_nsg) {
-    const size_t cap_waves = std::min(backend_ctx->get_kernel_workgroup_size(kernel) / Q4K_MC_SUBGROUP_SIZE,
-                                      Q4K_MC_MAX_SUBGROUPS);
-    const size_t wgs       = CEIL_DIV((size_t) ne01 / 2, Q4K_MC_SUBGROUP_SIZE);
-    const bool   fills_two = backend_ctx->compute_units > 0 && wgs >= Q4K_MC_CORESIDENT_WGS * backend_ctx->compute_units;
-    const size_t nsg       = fills_two ? std::max<size_t>(cap_waves / Q4K_MC_CORESIDENT_WGS, 1) : cap_waves;
-    return q4k_mc_resident_waves(nsg, cap_waves) > q4k_mc_resident_waves(pow2_nsg, cap_waves) ? nsg : pow2_nsg;
+// K-quant mc K-split: two co-resident work-groups of half the waves when the grid gives every compute unit two, one
+// work-group of all waves for smaller grids; the base split stays unless it holds fewer waves.
+static size_t kquant_mc_subgroups(const ggml_backend_opencl_context * backend_ctx, cl_kernel kernel, int ne01,
+                                  size_t base_nsg) {
+    const size_t cap_waves = std::min(backend_ctx->get_kernel_workgroup_size(kernel) / KQUANT_MC_SUBGROUP_SIZE,
+                                      KQUANT_MC_MAX_SUBGROUPS);
+    const size_t wgs       = CEIL_DIV((size_t) ne01 / 2, KQUANT_MC_SUBGROUP_SIZE);
+    const bool   fills_two = backend_ctx->compute_units > 0 && wgs >= KQUANT_MC_CORESIDENT_WGS * backend_ctx->compute_units;
+    const size_t nsg       = fills_two ? std::max<size_t>(cap_waves / KQUANT_MC_CORESIDENT_WGS, 1) : cap_waves;
+    return kquant_mc_resident_waves(nsg, cap_waves) > kquant_mc_resident_waves(base_nsg, cap_waves) ? nsg : base_nsg;
 }
 #endif
 
@@ -21834,9 +21835,9 @@ static void ggml_cl_mul_mat_q4_k_f32_adreno(ggml_backend_t backend, const ggml_t
         }
         if (use_mc) {
             if (splitk_wide && ne1 >= Q4K_MC_WAVE_RULE_MIN_COLS) {
-                nsg_y = q4k_mc_subgroups(backend_ctx, kernel, ne01, nsg_y);
+                nsg_y = kquant_mc_subgroups(backend_ctx, kernel, ne01, nsg_y);
             }
-            CL_CHECK(clSetKernelArg(kernel, 12, q4k_mc_stage_bytes(nsg_y, ne1), NULL));
+            CL_CHECK(clSetKernelArg(kernel, 12, kquant_mc_stage_bytes(nsg_y, ne1), NULL));
         }
         size_t local_work_size[3] = {64, nsg_y, 1};
         size_t global_work_size[3] = {(size_t)CEIL_DIV(use_tiled ? ne01 : (use_q4k_o4 ? ne01/4 : ne01/2), 64)*64, nsg_y, 1};
@@ -22230,8 +22231,13 @@ static void ggml_cl_mul_mat_q6_K_f32_adreno(ggml_backend_t backend, const ggml_t
                                  : use_o4
                                  ? (size_t) CEIL_DIV(ne01/4, 64) * 64
                                  : (size_t) CEIL_DIV(ne01/2, 64) * 64;
-        size_t local_work_size[3]  = {64, 4, 1};
-        size_t global_work_size[3] = {gws_x, 4, 1};
+        size_t nsg = Q5K_Q6K_GEMV_SUBGROUPS;
+        if (use_mc) {  // unlike q4_K, every mc width takes the wave rule
+            nsg = kquant_mc_subgroups(backend_ctx, kernel, ne01, nsg);
+            CL_CHECK(clSetKernelArg(kernel, 9, kquant_mc_stage_bytes(nsg, ne1), NULL));
+        }
+        size_t local_work_size[3]  = {64, nsg, 1};
+        size_t global_work_size[3] = {gws_x, nsg, 1};
 
         backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
 
@@ -22555,8 +22561,13 @@ static void ggml_cl_mul_mat_q5_K_f32_adreno(ggml_backend_t backend, const ggml_t
         CL_CHECK(clSetKernelArg(kernel, 11, sizeof(cl_uchar), &mask_d4));
         CL_CHECK(clSetKernelArg(kernel, 12, sizeof(cl_uchar), &mask_hi2));
 
-        size_t local_work_size[3]  = {64, 4, 1};
-        size_t global_work_size[3] = {(size_t)CEIL_DIV(ne01/2, 64)*64, 4, 1};
+        size_t nsg = Q5K_Q6K_GEMV_SUBGROUPS;
+        if (use_mc) {  // unlike q4_K, every mc width takes the wave rule
+            nsg = kquant_mc_subgroups(backend_ctx, kernel, ne01, nsg);
+            CL_CHECK(clSetKernelArg(kernel, 13, kquant_mc_stage_bytes(nsg, ne1), NULL));
+        }
+        size_t local_work_size[3]  = {64, nsg, 1};
+        size_t global_work_size[3] = {(size_t)CEIL_DIV(ne01/2, 64)*64, nsg, 1};
 
         backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
 
