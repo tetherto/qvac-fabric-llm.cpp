@@ -1,0 +1,433 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_KHR_memory_scope_semantics : enable
+#extension GL_KHR_cooperative_matrix : enable
+#extension GL_NV_cooperative_matrix2 : enable
+#extension GL_EXT_buffer_reference : enable
+#extension GL_EXT_null_initializer : enable
+
+// Backward of ggml_flash_attn_ext on NV_cooperative_matrix2.
+// Same tiling and push constants as flash_attn_back.comp: a workgroup owns Br outer
+// rows (q for DQ, kv for DKV) and walks the inner dimension in Bc-column tiles.
+// Per tile: S = Q.K^T and dP = dO.V^T on tensor cores (f16 operands, f32 accumulators),
+// P = exp(scale*S + mask - L) and dS = scale*P*(dP - delta) per element in f32,
+// then dQ += dS.K, or dV += P^T.dO and dK += dS^T.Q. STATS runs the online
+// softmax over S for the logsumexp and reduces grad_o*o per row in f32.
+
+#define FA_BACK_STATS 0
+#define FA_BACK_DQ    1
+#define FA_BACK_DKV   2
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+layout (constant_id = 0) const uint32_t WorkGroupSize = 128;
+layout (constant_id = 1) const uint32_t Br = 32;
+layout (constant_id = 2) const uint32_t Bc = 32;
+layout (constant_id = 3) const uint32_t HS = 64;
+layout (constant_id = 4) const uint32_t D_split = 8;       // unused, shared spec constant layout with the scalar shader
+layout (constant_id = 5) const uint32_t SubGroupSize = 32; // unused
+layout (constant_id = 6) const uint32_t SHMEM_STAGING = 0; // unused
+
+const uint32_t HS_pad = (HS + 15) & ~15;
+
+layout (push_constant) uniform parameter {
+    uint32_t N;
+    uint32_t KV;
+    uint32_t neq2;
+    uint32_t nek2;
+    uint32_t nek3;
+    uint32_t nem2;
+    uint32_t nem3;
+
+    // strides in elements of the respective tensor
+    uint32_t nbq1, nbq2, nbq3;
+    uint32_t nbk1, nbk2, nbk3;
+    uint32_t nbv1, nbv2, nbv3;
+    uint32_t nbm1, nbm2, nbm3;
+    uint32_t nbo1, nbo2, nbo3;
+    uint32_t nbd1, nbd2, nbd3;
+
+    float scale;
+    uint32_t mask_enable;
+
+    uint32_t mask_opt;
+    uint32_t mo_stride;
+    uint32_t mo_batch;
+} p;
+
+layout (binding = 0) readonly buffer Q  {uint8_t  data_q[];};
+layout (binding = 1) readonly buffer K  {uint8_t  data_k[];};
+layout (binding = 2) readonly buffer V  {uint8_t  data_v[];};
+layout (binding = 3) readonly buffer M  {uint8_t  data_m[];};
+layout (binding = 4) readonly buffer O  {uint8_t  data_o[];};
+layout (binding = 5) readonly buffer G  {uint8_t  data_g[];};
+layout (binding = 6) readonly buffer ST {float    data_stats[];};
+layout (binding = 7) writeonly buffer D {float    data_d[];};
+layout (binding = 8) readonly buffer MO {uint32_t data_mask_opt[];};
+
+#define MASK_OPT_ALL_NEG_INF 1
+#define MASK_OPT_ALL_ZERO 2
+#define CEIL_DIV(a, b) (((a) + (b) - 1) / (b))
+#define NEG_INF uintBitsToFloat(0xFF800000)
+#define NEG_FLT_MAX_OVER_2 uintBitsToFloat(0xFEFFFFFF)
+
+// F32 tensors are read through a vec4 "block" and converted to f16 on load
+layout(buffer_reference, std430, buffer_reference_align = 16) buffer decodeBufF32 {
+    vec4 block;
+};
+
+float16_t decodeF32(const in decodeBufF32 bl, const in uint blockCoords[2], const in uint coordInBlock[2]) {
+    return float16_t(bl.block[coordInBlock[1]]);
+}
+
+#ifdef KV_F32
+#define KV_TYPE_SIZE 4
+#define KV_LAYOUT_BLOCK(l) l = setTensorLayoutBlockSizeNV(l, 1, 4)
+#define KV_STRIDE(nb) ((nb) / 4)
+#define KV_DECODE , decodeF32
+#else
+#define KV_TYPE_SIZE 2
+#define KV_LAYOUT_BLOCK(l)
+#define KV_STRIDE(nb) (nb)
+#define KV_DECODE
+#endif
+
+#define COOPMAT_ACC(R, C) coopmat<float,     gl_ScopeWorkgroup, R, C, gl_MatrixUseAccumulator>
+#define COOPMAT_A(R, C)   coopmat<float16_t, gl_ScopeWorkgroup, R, C, gl_MatrixUseA>
+#define COOPMAT_B(R, C)   coopmat<float16_t, gl_ScopeWorkgroup, R, C, gl_MatrixUseB>
+
+// stats of the current (iq2, iq3): 2 floats per q row, (logsumexp, dot(grad_o, o))
+uint32_t g_stats_base;
+
+float maxReduce(const in float x, const in float y) {
+    return max(x, y);
+}
+
+float sumReduce(const in float x, const in float y) {
+    return x + y;
+}
+
+float Max(const in uint32_t row, const in uint32_t col, const in float a, const in float b) {
+    return max(a, b);
+}
+
+float Exp(const in uint32_t row, const in uint32_t col, const in float x) {
+    return exp(x);
+}
+
+// STATS: kv columns past KV read as -inf so they drop out of the row max and sum
+float padCols(const in uint32_t row, const in uint32_t col, const in float s, const in uint32_t kcol0) {
+    return kcol0 + col >= p.KV ? NEG_INF : s;
+}
+
+// STATS: column 0 holds the row value after a row reduction; write it to the stats tensor
+float storeStat(const in uint32_t row, const in uint32_t col, const in float v, const in uint32_t qrow0, const in uint32_t idx) {
+    if (col == 0 && qrow0 + row < p.N) {
+        data_d[g_stats_base + 2 * (qrow0 + row) + idx] = v;
+    }
+    return v;
+}
+
+float logsumexp(const in uint32_t row, const in uint32_t col, const in float m, const in float l) {
+    return l == 0.0 ? NEG_INF : m + log(l);
+}
+
+// DQ: rows are q rows qrow0 + row, columns are kv columns kcol0 + col
+float pFuncDQ(const in uint32_t row, const in uint32_t col, const in float s, const in uint32_t qrow0, const in uint32_t kcol0) {
+    const uint32_t qrow = qrow0 + row;
+    if (qrow >= p.N || kcol0 + col >= p.KV || s == NEG_INF) {
+        return 0.0;
+    }
+    return exp(s - data_stats[g_stats_base + 2 * qrow]);
+}
+
+float dsFuncDQ(const in uint32_t row, const in uint32_t col, const in float pv, const in float dp, const in uint32_t qrow0) {
+    const uint32_t qrow = min(qrow0 + row, p.N - 1);
+    return p.scale * pv * (dp - data_stats[g_stats_base + 2 * qrow + 1]);
+}
+
+// DKV: rows are kv rows krow0 + row, columns are q rows qrow0 + col
+float pFuncDKV(const in uint32_t row, const in uint32_t col, const in float s, const in uint32_t krow0, const in uint32_t qrow0) {
+    const uint32_t qrow = qrow0 + col;
+    if (qrow >= p.N || krow0 + row >= p.KV || s == NEG_INF) {
+        return 0.0;
+    }
+    return exp(s - data_stats[g_stats_base + 2 * qrow]);
+}
+
+float dsFuncDKV(const in uint32_t row, const in uint32_t col, const in float pv, const in float dp, const in uint32_t qrow0) {
+    const uint32_t qrow = min(qrow0 + col, p.N - 1);
+    return p.scale * pv * (dp - data_stats[g_stats_base + 2 * qrow + 1]);
+}
+
+void main() {
+    const tensorViewNV<2, false, 1, 0> tensorViewTranspose = createTensorViewNV(2, false, 1, 0);
+
+    // q and grad_o rows of one head: [N, HS] f32, row strides nbq1 / nbo2
+    tensorLayoutNV<2, gl_CooperativeMatrixClampModeConstantNV> layoutQ = createTensorLayoutNV(2, gl_CooperativeMatrixClampModeConstantNV);
+    layoutQ = setTensorLayoutBlockSizeNV(layoutQ, 1, 4);
+    layoutQ = setTensorLayoutDimensionNV(layoutQ, p.N, HS);
+    layoutQ = setTensorLayoutStrideNV(layoutQ, p.nbq1 / 4, 1);
+
+    tensorLayoutNV<2, gl_CooperativeMatrixClampModeConstantNV> layoutG = createTensorLayoutNV(2, gl_CooperativeMatrixClampModeConstantNV);
+    layoutG = setTensorLayoutBlockSizeNV(layoutG, 1, 4);
+    layoutG = setTensorLayoutDimensionNV(layoutG, p.N, HS);
+    layoutG = setTensorLayoutStrideNV(layoutG, p.nbo2 / 4, 1);
+
+    // k and v rows of one kv head: [KV, HS]
+    tensorLayoutNV<2, gl_CooperativeMatrixClampModeConstantNV> layoutK = createTensorLayoutNV(2, gl_CooperativeMatrixClampModeConstantNV);
+    KV_LAYOUT_BLOCK(layoutK);
+    layoutK = setTensorLayoutDimensionNV(layoutK, p.KV, HS);
+    layoutK = setTensorLayoutStrideNV(layoutK, KV_STRIDE(p.nbk1), 1);
+
+    tensorLayoutNV<2, gl_CooperativeMatrixClampModeConstantNV> layoutV = createTensorLayoutNV(2, gl_CooperativeMatrixClampModeConstantNV);
+    KV_LAYOUT_BLOCK(layoutV);
+    layoutV = setTensorLayoutDimensionNV(layoutV, p.KV, HS);
+    layoutV = setTensorLayoutStrideNV(layoutV, KV_STRIDE(p.nbv1), 1);
+
+    // mask [nem1 >= N q rows, KV], out of range entries read as -inf
+    tensorLayoutNV<2, gl_CooperativeMatrixClampModeConstantNV> layoutM = createTensorLayoutNV(2, gl_CooperativeMatrixClampModeConstantNV);
+    layoutM = setTensorLayoutDimensionNV(layoutM, p.N, p.KV);
+    layoutM = setTensorLayoutStrideNV(layoutM, p.nbm1, 1);
+    layoutM = setTensorLayoutClampValueNV(layoutM, 0xfc00);
+
+    // result rows [N or KV, HS] f32, contiguous rows of stride nbd1
+    tensorLayoutNV<2, gl_CooperativeMatrixClampModeConstantNV> layoutD = createTensorLayoutNV(2, gl_CooperativeMatrixClampModeConstantNV);
+    layoutD = setTensorLayoutStrideNV(layoutD, p.nbd1, 1);
+
+    const uint32_t i = gl_WorkGroupID.x;
+
+#if FA_BACK_TARGET == FA_BACK_STATS
+    const uint32_t iq2 = gl_WorkGroupID.y;
+    const uint32_t iq3 = gl_WorkGroupID.z;
+    const uint32_t rk2 = p.neq2 / p.nek2;
+    const uint32_t ik2 = iq2 / rk2;
+    const uint32_t ik3 = iq3;
+
+    const uint32_t q_offset = (iq2 * p.nbq2 + iq3 * p.nbq3) * 4;
+    const uint32_t g_offset = (iq2 * p.nbo1 + iq3 * p.nbo3) * 4;
+    const uint32_t k_offset = (ik2 * p.nbk2 + ik3 * p.nbk3) * KV_TYPE_SIZE;
+    const uint32_t m_offset = ((iq2 % p.nem2) * p.nbm2 + (iq3 % p.nem3) * p.nbm3) * 2;
+    const uint32_t mo_offset = ((iq3 % p.nem3) * p.nem2 + (iq2 % p.nem2)) * p.mo_batch + i * p.mo_stride;
+    g_stats_base = 2 * ((iq3 * p.neq2 + iq2) * p.N);
+
+    COOPMAT_A(Br, HS_pad) Qa;
+    coopMatLoadTensorNV(Qa, data_q, q_offset, sliceTensorLayoutNV(layoutQ, i * Br, Br, 0, HS_pad), decodeF32);
+
+    COOPMAT_ACC(Br, Bc) M = COOPMAT_ACC(Br, Bc)(NEG_FLT_MAX_OVER_2);
+    COOPMAT_ACC(Br, Bc) L = COOPMAT_ACC(Br, Bc)(0.0);
+
+    const uint32_t Tc = CEIL_DIV(p.KV, Bc);
+
+    [[dont_unroll]]
+    for (uint32_t j = 0; j < Tc; ++j) {
+        uint32_t mask_code = 0;
+        if (p.mask_opt != 0) {
+            mask_code = (data_mask_opt[mo_offset + j / 16] >> ((j % 16) * 2)) & 3;
+            if (mask_code == MASK_OPT_ALL_NEG_INF) {
+                continue;
+            }
+        }
+        const bool tile_mask = p.mask_enable != 0 && mask_code != MASK_OPT_ALL_ZERO;
+
+        COOPMAT_B(HS_pad, Bc) K_T;
+        coopMatLoadTensorNV(K_T, data_k, k_offset, sliceTensorLayoutNV(layoutK, j * Bc, Bc, 0, HS_pad), tensorViewTranspose KV_DECODE);
+        COOPMAT_ACC(Br, Bc) S = COOPMAT_ACC(Br, Bc)(0.0);
+        S = coopMatMulAdd(Qa, K_T, S);
+
+        S *= p.scale;
+        if (tile_mask) {
+            coopmat<float16_t, gl_ScopeWorkgroup, Br, Bc, gl_MatrixUseAccumulator> mv;
+            coopMatLoadTensorNV(mv, data_m, m_offset, sliceTensorLayoutNV(layoutM, i * Br, Br, j * Bc, Bc));
+            S += COOPMAT_ACC(Br, Bc)(mv);
+        }
+        coopMatPerElementNV(S, S, padCols, j * Bc);
+
+        COOPMAT_ACC(Br, Bc) rowmax, P, rowsum, eM;
+        coopMatReduceNV(rowmax, S, gl_CooperativeMatrixReduceRowNV, maxReduce);
+
+        const COOPMAT_ACC(Br, Bc) Mold = M;
+        coopMatPerElementNV(M, rowmax, Max, Mold);
+        coopMatPerElementNV(P, S - M, Exp);
+        coopMatPerElementNV(eM, Mold - M, Exp);
+        coopMatReduceNV(rowsum, P, gl_CooperativeMatrixReduceRowNV, sumReduce);
+
+        L = eM * L + rowsum;
+    }
+
+    COOPMAT_ACC(Br, Bc) lse;
+    coopMatPerElementNV(lse, M, logsumexp, L);
+    coopMatPerElementNV(lse, lse, storeStat, i * Br, 0u);
+
+    // delta = dot(grad_o, o) per row, in f32
+    tensorLayoutNV<2, gl_CooperativeMatrixClampModeConstantNV> layoutO32 = createTensorLayoutNV(2, gl_CooperativeMatrixClampModeConstantNV);
+    layoutO32 = setTensorLayoutDimensionNV(layoutO32, p.N, HS);
+    layoutO32 = setTensorLayoutStrideNV(layoutO32, p.nbo2, 1);
+
+    COOPMAT_ACC(Br, HS_pad) Om, Gm;
+    coopMatLoadTensorNV(Om, data_o, g_offset, sliceTensorLayoutNV(layoutO32, i * Br, Br, 0, HS_pad));
+    coopMatLoadTensorNV(Gm, data_g, g_offset, sliceTensorLayoutNV(layoutO32, i * Br, Br, 0, HS_pad));
+    Om = Om * Gm;
+
+    COOPMAT_ACC(Br, HS_pad) delta;
+    coopMatReduceNV(delta, Om, gl_CooperativeMatrixReduceRowNV, sumReduce);
+    coopMatPerElementNV(delta, delta, storeStat, i * Br, 1u);
+
+#elif FA_BACK_TARGET == FA_BACK_DQ
+    const uint32_t iq2 = gl_WorkGroupID.y;
+    const uint32_t iq3 = gl_WorkGroupID.z;
+    const uint32_t rk2 = p.neq2 / p.nek2;
+    const uint32_t ik2 = iq2 / rk2;
+    const uint32_t ik3 = iq3;
+
+    layoutD = setTensorLayoutDimensionNV(layoutD, p.N, HS);
+
+    const uint32_t q_offset = (iq2 * p.nbq2 + iq3 * p.nbq3) * 4;
+    const uint32_t g_offset = (iq2 * p.nbo1 + iq3 * p.nbo3) * 4;
+    const uint32_t k_offset = (ik2 * p.nbk2 + ik3 * p.nbk3) * KV_TYPE_SIZE;
+    const uint32_t v_offset = (ik2 * p.nbv2 + ik3 * p.nbv3) * KV_TYPE_SIZE;
+    const uint32_t m_offset = ((iq2 % p.nem2) * p.nbm2 + (iq3 % p.nem3) * p.nbm3) * 2;
+    const uint32_t mo_offset = ((iq3 % p.nem3) * p.nem2 + (iq2 % p.nem2)) * p.mo_batch + i * p.mo_stride;
+    g_stats_base = 2 * ((iq3 * p.neq2 + iq2) * p.N);
+
+    COOPMAT_A(Br, HS_pad) Qa;
+    COOPMAT_A(Br, HS_pad) Ga;
+    coopMatLoadTensorNV(Qa, data_q, q_offset, sliceTensorLayoutNV(layoutQ, i * Br, Br, 0, HS_pad), decodeF32);
+    coopMatLoadTensorNV(Ga, data_g, g_offset, sliceTensorLayoutNV(layoutG, i * Br, Br, 0, HS_pad), decodeF32);
+
+    COOPMAT_ACC(Br, HS_pad) dQ = COOPMAT_ACC(Br, HS_pad)(0.0);
+
+    const uint32_t Tc = CEIL_DIV(p.KV, Bc);
+
+    [[dont_unroll]]
+    for (uint32_t j = 0; j < Tc; ++j) {
+        uint32_t mask_code = 0;
+        if (p.mask_opt != 0) {
+            mask_code = (data_mask_opt[mo_offset + j / 16] >> ((j % 16) * 2)) & 3;
+            if (mask_code == MASK_OPT_ALL_NEG_INF) {
+                continue;
+            }
+        }
+        const bool tile_mask = p.mask_enable != 0 && mask_code != MASK_OPT_ALL_ZERO;
+
+        COOPMAT_B(HS_pad, Bc) K_T;
+        coopMatLoadTensorNV(K_T, data_k, k_offset, sliceTensorLayoutNV(layoutK, j * Bc, Bc, 0, HS_pad), tensorViewTranspose KV_DECODE);
+        COOPMAT_ACC(Br, Bc) S = COOPMAT_ACC(Br, Bc)(0.0);
+        S = coopMatMulAdd(Qa, K_T, S);
+
+        COOPMAT_B(HS_pad, Bc) V_T;
+        coopMatLoadTensorNV(V_T, data_v, v_offset, sliceTensorLayoutNV(layoutV, j * Bc, Bc, 0, HS_pad), tensorViewTranspose KV_DECODE);
+        COOPMAT_ACC(Br, Bc) dP = COOPMAT_ACC(Br, Bc)(0.0);
+        dP = coopMatMulAdd(Ga, V_T, dP);
+
+        S *= p.scale;
+        if (tile_mask) {
+            coopmat<float16_t, gl_ScopeWorkgroup, Br, Bc, gl_MatrixUseAccumulator> mv;
+            coopMatLoadTensorNV(mv, data_m, m_offset, sliceTensorLayoutNV(layoutM, i * Br, Br, j * Bc, Bc));
+            S += COOPMAT_ACC(Br, Bc)(mv);
+        }
+
+        COOPMAT_ACC(Br, Bc) P;
+        coopMatPerElementNV(P, S, pFuncDQ, i * Br, j * Bc);
+        COOPMAT_ACC(Br, Bc) dS;
+        coopMatPerElementNV(dS, P, dsFuncDQ, dP, i * Br);
+
+        COOPMAT_A(Br, Bc) dS_A = COOPMAT_A(Br, Bc)(dS);
+        COOPMAT_B(Bc, HS_pad) Kb;
+        coopMatLoadTensorNV(Kb, data_k, k_offset, sliceTensorLayoutNV(layoutK, j * Bc, Bc, 0, HS_pad) KV_DECODE);
+        dQ = coopMatMulAdd(dS_A, Kb, dQ);
+    }
+
+    const uint32_t d_offset = iq2 * p.nbd2 + iq3 * p.nbd3;
+    coopMatStoreTensorNV(dQ, data_d, d_offset, sliceTensorLayoutNV(layoutD, i * Br, Br, 0, HS_pad));
+
+#else // FA_BACK_DKV
+    const uint32_t ik2 = gl_WorkGroupID.y;
+    const uint32_t ik3 = gl_WorkGroupID.z;
+    const uint32_t iq3 = ik3;
+    const uint32_t rk2 = p.neq2 / p.nek2;
+
+    layoutD = setTensorLayoutDimensionNV(layoutD, p.KV, HS);
+
+    const uint32_t k_offset = (ik2 * p.nbk2 + ik3 * p.nbk3) * KV_TYPE_SIZE;
+    const uint32_t v_offset = (ik2 * p.nbv2 + ik3 * p.nbv3) * KV_TYPE_SIZE;
+
+    COOPMAT_A(Br, HS_pad) Ka;
+    COOPMAT_A(Br, HS_pad) Va;
+    coopMatLoadTensorNV(Ka, data_k, k_offset, sliceTensorLayoutNV(layoutK, i * Br, Br, 0, HS_pad) KV_DECODE);
+    coopMatLoadTensorNV(Va, data_v, v_offset, sliceTensorLayoutNV(layoutV, i * Br, Br, 0, HS_pad) KV_DECODE);
+
+    COOPMAT_ACC(Br, HS_pad) dK = COOPMAT_ACC(Br, HS_pad)(0.0);
+    COOPMAT_ACC(Br, HS_pad) dV = COOPMAT_ACC(Br, HS_pad)(0.0);
+
+    const uint32_t Tc = CEIL_DIV(p.N, Bc);
+
+    for (uint32_t h = 0; h < rk2; ++h) {
+        const uint32_t iq2 = ik2 * rk2 + h;
+
+        const uint32_t q_offset = (iq2 * p.nbq2 + iq3 * p.nbq3) * 4;
+        const uint32_t g_offset = (iq2 * p.nbo1 + iq3 * p.nbo3) * 4;
+        const uint32_t m_offset = ((iq2 % p.nem2) * p.nbm2 + (iq3 % p.nem3) * p.nbm3) * 2;
+        // codes are tiled as [Bc q rows] x [Br kv rows]: row tile j, column tile i
+        const uint32_t mo_offset = ((iq3 % p.nem3) * p.nem2 + (iq2 % p.nem2)) * p.mo_batch + i / 16;
+        g_stats_base = 2 * ((iq3 * p.neq2 + iq2) * p.N);
+
+        [[dont_unroll]]
+        for (uint32_t j = 0; j < Tc; ++j) {
+            uint32_t mask_code = 0;
+            if (p.mask_opt != 0) {
+                mask_code = (data_mask_opt[mo_offset + j * p.mo_stride] >> ((i % 16) * 2)) & 3;
+                if (mask_code == MASK_OPT_ALL_NEG_INF) {
+                    continue;
+                }
+            }
+            const bool tile_mask = p.mask_enable != 0 && mask_code != MASK_OPT_ALL_ZERO;
+
+            COOPMAT_B(HS_pad, Bc) Q_T;
+            coopMatLoadTensorNV(Q_T, data_q, q_offset, sliceTensorLayoutNV(layoutQ, j * Bc, Bc, 0, HS_pad), tensorViewTranspose, decodeF32);
+            COOPMAT_ACC(Br, Bc) S = COOPMAT_ACC(Br, Bc)(0.0);
+            S = coopMatMulAdd(Ka, Q_T, S);
+
+            COOPMAT_B(HS_pad, Bc) G_T;
+            coopMatLoadTensorNV(G_T, data_g, g_offset, sliceTensorLayoutNV(layoutG, j * Bc, Bc, 0, HS_pad), tensorViewTranspose, decodeF32);
+            COOPMAT_ACC(Br, Bc) dP = COOPMAT_ACC(Br, Bc)(0.0);
+            dP = coopMatMulAdd(Va, G_T, dP);
+
+            S *= p.scale;
+            if (tile_mask) {
+                // transposed mask tile: rows are kv, columns are q
+                coopmat<float16_t, gl_ScopeWorkgroup, Br, Bc, gl_MatrixUseAccumulator> mv;
+                coopMatLoadTensorNV(mv, data_m, m_offset, sliceTensorLayoutNV(layoutM, j * Bc, Bc, i * Br, Br), tensorViewTranspose);
+                S += COOPMAT_ACC(Br, Bc)(mv);
+            }
+
+            COOPMAT_ACC(Br, Bc) P;
+            coopMatPerElementNV(P, S, pFuncDKV, i * Br, j * Bc);
+            COOPMAT_ACC(Br, Bc) dS;
+            coopMatPerElementNV(dS, P, dsFuncDKV, dP, j * Bc);
+
+            COOPMAT_A(Br, Bc) P_A  = COOPMAT_A(Br, Bc)(P);
+            COOPMAT_A(Br, Bc) dS_A = COOPMAT_A(Br, Bc)(dS);
+
+            COOPMAT_B(Bc, HS_pad) Gb;
+            coopMatLoadTensorNV(Gb, data_g, g_offset, sliceTensorLayoutNV(layoutG, j * Bc, Bc, 0, HS_pad), decodeF32);
+            dV = coopMatMulAdd(P_A, Gb, dV);
+
+            COOPMAT_B(Bc, HS_pad) Qb;
+            coopMatLoadTensorNV(Qb, data_q, q_offset, sliceTensorLayoutNV(layoutQ, j * Bc, Bc, 0, HS_pad), decodeF32);
+            dK = coopMatMulAdd(dS_A, Qb, dK);
+        }
+    }
+
+    const uint32_t dk_offset = ik2 * p.nbd2 + ik3 * p.nbd3;
+    const uint32_t dv_offset = dk_offset + p.nek3 * p.nbd3;
+    coopMatStoreTensorNV(dK, data_d, dk_offset, sliceTensorLayoutNV(layoutD, i * Br, Br, 0, HS_pad));
+    coopMatStoreTensorNV(dV, data_d, dv_offset, sliceTensorLayoutNV(layoutD, i * Br, Br, 0, HS_pad));
+#endif
+}

@@ -4373,10 +4373,18 @@ void llama_context::opt_init(struct llama_model * model, struct llama_opt_params
     GGML_ASSERT(model->hparams.n_ctx_train % n_batch  == 0);
     GGML_ASSERT(n_batch                    % n_ubatch == 0);
 
-    if (cparams.flash_attn) {
-        LLAMA_LOG_INFO("%s: disabling flash attention, FLASH_ATTN_EXT has no backward pass\n", __func__);
+    if (cparams.flash_attn && !lopt_params.flash_attn) {
+        LLAMA_LOG_INFO("%s: disabling flash attention for training (enable with llama_opt_params.flash_attn)\n", __func__);
         cparams.flash_attn = false;
     }
+
+    // kv_rows needs flash attention and FLASH_ATTN_EXT_BACK has no kv_rows support: the unified cache
+    // falls back to the dense mask; auto_fkvr = false keeps the reserve below from turning it back on
+    if (cparams.fused_kv_rows) {
+        LLAMA_LOG_INFO("%s: disabling kv_rows for training\n", __func__);
+    }
+    cparams.fused_kv_rows = false;
+    cparams.auto_fkvr     = false;
 
     if (model->split_mode() == LLAMA_SPLIT_MODE_TENSOR && !model->training()) {
         GGML_ABORT("%s: training under SPLIT_MODE_TENSOR needs llama_model_params::training set when the model is loaded", __func__);
@@ -5565,6 +5573,7 @@ struct llama_opt_params llama_opt_default_params(void) {
         /*checkpoint_path      =*/ nullptr,
         /*load_optimizer_state =*/ false,
         /*assistant_loss_only  =*/ false,
+        /*flash_attn           =*/ false,
     };
 }
 
