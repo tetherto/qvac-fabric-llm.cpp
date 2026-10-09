@@ -100,6 +100,9 @@ struct llama_memory_i {
     // getters
     virtual bool get_can_shift() const = 0;
 
+    // ubatches can hold non-consecutive KV streams, see llama_kv_cache::set_allow_stream_gaps
+    virtual bool get_allow_stream_gaps() const { return false; }
+
     //
     // ops
     //

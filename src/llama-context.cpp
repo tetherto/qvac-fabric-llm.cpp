@@ -2609,7 +2609,7 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
 
     // with one KV stream per sequence, attention runs once per run of consecutive streams (build_attn_mha_runs)
     // worst case is every other sequence active; each extra run adds up to ~24 nodes per layer
-    if (!cparams.kv_unified && cparams.n_seq_max > 1) {
+    if (!cparams.kv_unified && cparams.n_seq_max > 1 && memory && memory->get_allow_stream_gaps()) {
         const uint32_t n_runs_max = std::min((cparams.n_seq_max + 1)/2, n_tokens);
         if (n_runs_max > 1) {
             res += (n_runs_max - 1) * 24u * model.hparams.n_layer();

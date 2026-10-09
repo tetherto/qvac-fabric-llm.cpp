@@ -175,7 +175,7 @@ public:
     bool get_has_shift() const;
 
     // allow ubatches with non-consecutive streams - the graph must read the cache per run of streams
-    bool get_allow_stream_gaps() const;
+    bool get_allow_stream_gaps() const override;
     void set_allow_stream_gaps(bool value);
 
     ggml_type type_k() const;
