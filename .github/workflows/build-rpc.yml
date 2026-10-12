@@ -23,6 +23,8 @@ on:
       'ggml/src/ggml-rpc/**',
       'tests/CMakeLists.txt',
       'tests/test-rpc.cpp',
+      'tests/test-rpc-server-port.cpp',
+      'tests/test-rpc-transport.cpp',
       'tools/rpc/**'
     ]
 
@@ -96,7 +98,7 @@ jobs:
             printf '%s\n' "RPC servers did not become ready"
             exit 1
           fi
-          ctest -R '^test-rpc$' --verbose
+          ctest -R '^test-rpc(-transport|-server-port)?$' --verbose
           if [ "$(grep -c '\[set_tensor_2d\] saved to' rpc-server-0.log)" -ne 1 ]; then
             printf '%s\n' "2D tensor cache test did not record exactly one upload"
             exit 1
