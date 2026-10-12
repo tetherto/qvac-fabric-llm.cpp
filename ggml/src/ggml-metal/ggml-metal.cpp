@@ -17,9 +17,6 @@
 // note: can be overridden with GGML_METAL_DEVICES env to simulate virtual devices
 static int g_devices = 1;
 
-// forward declaration
-static bool ggml_backend_buffer_is_metal(ggml_backend_buffer_t buffer);
-
 ////////////////////////////////////////////////////////////////////////////////
 // backend interface
 ////////////////////////////////////////////////////////////////////////////////
@@ -176,9 +173,9 @@ static ggml_backend_buffer_i ggml_backend_metal_buffer_private_i = {
     /* .reset         = */ NULL,
 };
 
-static bool ggml_backend_buffer_is_metal(ggml_backend_buffer_t buffer) {
-    return buffer->iface.free_buffer == ggml_backend_metal_buffer_shared_free_buffer ||
-           buffer->iface.free_buffer == ggml_backend_metal_buffer_private_free_buffer;
+bool ggml_backend_buffer_is_metal(ggml_backend_buffer_t buffer) {
+    return buffer && (buffer->iface.free_buffer == ggml_backend_metal_buffer_shared_free_buffer ||
+                      buffer->iface.free_buffer == ggml_backend_metal_buffer_private_free_buffer);
 }
 
 //

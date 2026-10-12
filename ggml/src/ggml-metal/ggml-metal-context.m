@@ -7,6 +7,10 @@
 #import "ggml-metal-common.h"
 #import "ggml-metal-ops.h"
 
+#ifdef GGML_METAL_COREML
+#import "ggml-metal-coreml.h"
+#endif
+
 #import <Foundation/Foundation.h>
 #import <TargetConditionals.h>
 
@@ -81,6 +85,9 @@ struct ggml_metal {
     // error state - set when a command buffer fails during synchronize
     // once set, graph_compute will return GGML_STATUS_FAILED until the backend is recreated
     bool has_error;
+#ifdef GGML_METAL_COREML
+    ggml_metal_coreml_t coreml;
+#endif
 };
 
 ggml_metal_t ggml_metal_init(ggml_metal_device_t dev) {
@@ -191,11 +198,19 @@ ggml_metal_t ggml_metal_init(ggml_metal_device_t dev) {
 
     res->pipelines_ext = ggml_metal_pipelines_init();
 
+#ifdef GGML_METAL_COREML
+    res->coreml = ggml_metal_coreml_init(dev);
+#endif
+
     return res;
 }
 
 void ggml_metal_free(ggml_metal_t ctx) {
     GGML_LOG_INFO("%s: deallocating\n", __func__);
+
+#ifdef GGML_METAL_COREML
+    ggml_metal_coreml_free(ctx->coreml);
+#endif
 
     for (int i = 0; i < GGML_METAL_MAX_COMMAND_BUFFERS; ++i) {
         if (ctx->cmd_bufs[i].obj) {
@@ -460,7 +475,66 @@ bool ggml_metal_cpy_tensor_async(ggml_metal_t ctx_src, ggml_metal_t ctx_dst, con
     }
 }
 
+#ifdef GGML_METAL_COREML
+static enum ggml_status ggml_metal_graph_compute_range(ggml_metal_t ctx, struct ggml_cgraph * gf, int start, int end) {
+    if (start == end) { return GGML_STATUS_SUCCESS; }
+    @autoreleasepool {
+        ggml_metal_device_rsets_keep_alive(ctx->dev);
+        id<MTLCommandQueue> queue = ggml_metal_device_get_queue(ctx->dev);
+        id<MTLCommandBuffer> cb = [queue commandBuffer];
+        if (!cb) { return GGML_STATUS_FAILED; }
+        struct ggml_cgraph range = ggml_graph_view(gf, start, end);
+        ggml_metal_op_t op = ggml_metal_op_init(ctx->dev, cb, &range, 0, range.n_nodes,
+                ctx->use_fusion, ctx->use_concurrency, false, ctx->debug_graph, ctx->debug_fusion);
+        for (int i = 0; i < ggml_metal_op_n_nodes(op);) {
+            const int encoded = ggml_metal_op_encode(op, i);
+            if (encoded == 0) { break; }
+            i += encoded;
+        }
+        ggml_metal_op_free(op);
+        [cb commit];
+        [cb waitUntilCompleted];
+        if (cb.status != MTLCommandBufferStatusCompleted) {
+            GGML_LOG_ERROR("%s: command buffer failed: %s\n", __func__, cb.error.localizedDescription.UTF8String);
+            ctx->has_error = true;
+            return GGML_STATUS_FAILED;
+        }
+    }
+    return GGML_STATUS_SUCCESS;
+}
+
+static enum ggml_status ggml_metal_graph_compute_coreml(ggml_metal_t ctx, struct ggml_cgraph * gf) {
+    ggml_metal_synchronize(ctx);
+    if (ctx->has_error) { return GGML_STATUS_FAILED; }
+    ctx->gf = gf;
+    int start = 0;
+    for (int i = 0; i < gf->n_nodes; ++i) {
+        struct ggml_tensor * node = gf->nodes[i];
+        if (!ggml_metal_coreml_candidate(node)) {
+            ggml_metal_coreml_log(ctx->coreml, node, "unsupported-policy");
+            continue;
+        }
+        enum ggml_status status = ggml_metal_graph_compute_range(ctx, gf, start, i);
+        if (status != GGML_STATUS_SUCCESS) { return status; }
+        // On failure keep the node in the next Metal range.
+        start = ggml_metal_coreml_compute(ctx->coreml, node) ? i + 1 : i;
+    }
+    return ggml_metal_graph_compute_range(ctx, gf, start, gf->n_nodes);
+}
+#endif
+
 enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph * gf) {
+#ifdef GGML_METAL_COREML
+    if (ggml_metal_coreml_enabled(ctx->coreml) && !ctx->abort_callback &&
+        ctx->capture_compute < 1 && !ctx->capture_started && ![[MTLCaptureManager sharedCaptureManager] isCapturing]) {
+        for (int i = 0; i < gf->n_nodes; ++i) {
+            if (ggml_metal_coreml_candidate(gf->nodes[i])) {
+                return ggml_metal_graph_compute_coreml(ctx, gf);
+            }
+        }
+    }
+#endif
+
     if (ctx->has_error) {
         GGML_LOG_ERROR("%s: backend is in error state from a previous command buffer failure - recreate the backend to recover\n", __func__);
         return GGML_STATUS_FAILED;

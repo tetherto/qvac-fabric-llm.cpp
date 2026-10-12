@@ -4,6 +4,21 @@ find_library(METALKIT_FRAMEWORK MetalKit   REQUIRED)
 
 message(STATUS "Metal framework found")
 
+if (GGML_METAL_COREML)
+    if (CMAKE_VERSION VERSION_LESS 3.16)
+        message(FATAL_ERROR "GGML_METAL_COREML requires CMake 3.16 or newer for Objective-C++")
+    endif()
+    if (NOT CMAKE_SYSTEM_NAME STREQUAL "Darwin")
+        message(FATAL_ERROR "GGML_METAL_COREML requires macOS")
+    endif()
+    # Keep existing .m sources in Objective-C when enabling the CoreML .mm source.
+    enable_language(OBJC)
+    enable_language(OBJCXX)
+    find_library(COREML_FRAMEWORK CoreML REQUIRED)
+    find_library(COREVIDEO_FRAMEWORK CoreVideo REQUIRED)
+    find_library(IOSURFACE_FRAMEWORK IOSurface REQUIRED)
+endif()
+
 ggml_add_backend_library(ggml-metal
                          ggml-metal.cpp
                          ggml-metal-device.m
@@ -18,6 +33,14 @@ target_link_libraries(ggml-metal PRIVATE
                       ${METAL_FRAMEWORK}
                       ${METALKIT_FRAMEWORK}
                       )
+
+if (GGML_METAL_COREML)
+    target_sources(ggml-metal PRIVATE ggml-metal-coreml.mm)
+    target_compile_definitions(ggml-metal PRIVATE GGML_METAL_COREML)
+    target_link_libraries(ggml-metal PRIVATE ${COREML_FRAMEWORK} ${COREVIDEO_FRAMEWORK} ${IOSURFACE_FRAMEWORK})
+    set_source_files_properties(ggml-metal-coreml.mm PROPERTIES COMPILE_FLAGS "-fno-objc-arc -fexceptions -fobjc-exceptions -fblocks")
+    set_target_properties(ggml-metal PROPERTIES OBJCXX_STANDARD 17 OBJCXX_STANDARD_REQUIRED YES)
+endif()
 
 if (GGML_METAL_NDEBUG)
     add_compile_definitions(GGML_METAL_NDEBUG)

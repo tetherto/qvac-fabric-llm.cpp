@@ -240,6 +240,10 @@ option(GGML_VIRTGPU                         "ggml: use the VirtGPU/Virglrenderer
 option(GGML_VIRTGPU_BACKEND                 "ggml: build the VirtGPU/Virglrenderer API Remoting backend"    OFF)
 option(GGML_METAL                           "ggml: use Metal"                                 ${GGML_METAL_DEFAULT})
 option(GGML_METAL_NDEBUG                    "ggml: disable Metal debugging"                   OFF)
+option(GGML_METAL_COREML                    "ggml: experimental macOS CoreML matmul in Metal" OFF)
+if (GGML_METAL_COREML AND (NOT GGML_METAL OR NOT CMAKE_SYSTEM_NAME STREQUAL "Darwin"))
+    message(FATAL_ERROR "GGML_METAL_COREML requires GGML_METAL=ON and a macOS target")
+endif()
 option(GGML_METAL_SHADER_DEBUG              "ggml: compile Metal with -fno-fast-math"         OFF)
 option(GGML_METAL_EMBED_LIBRARY             "ggml: embed Metal library"                       ${GGML_METAL})
 set   (GGML_METAL_MACOSX_VERSION_MIN "" CACHE STRING

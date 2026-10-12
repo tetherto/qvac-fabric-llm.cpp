@@ -343,6 +343,18 @@ if (NOT LLAMA_SANITIZE_ADDRESS AND NOT GGML_SCHED_NO_REALLOC)
   llama_build_and_test(test-opt.cpp)
 endif()
 llama_build_and_test(test-backend-ops.cpp)
+
+add_executable(test-metal-coreml test-metal-coreml.cpp)
+target_link_libraries(test-metal-coreml PRIVATE ggml)
+add_test(NAME test-metal-coreml-policy COMMAND test-metal-coreml --policy)
+if (GGML_METAL)
+    add_test(NAME test-metal-coreml-no-device COMMAND ${CMAKE_COMMAND}
+        -DTEST_BINARY=$<TARGET_FILE:test-metal-coreml>
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/test-metal-coreml-no-device.cmake)
+endif()
+if (GGML_CPU)
+    add_test(NAME test-metal-coreml-cpu COMMAND test-metal-coreml CPU 512 64 512 f32 1)
+endif()
 llama_build_and_test(test-unified-memory-props.cpp)
 if (GGML_METAL)
     # only a Metal build can enumerate a Metal device

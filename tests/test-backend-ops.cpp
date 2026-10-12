@@ -10976,6 +10976,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gla(GGML_TYPE_F32, 32, 64, 32, 4));
     test_cases.emplace_back(new test_gla(GGML_TYPE_F32, 32, 64, 128, 4));
 
+    // CoreML opt-in shapes, plus small, batched and strided Metal fallback cases.
+    for (ggml_type activation : {GGML_TYPE_F16, GGML_TYPE_F32}) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, activation, 512, 64, 512, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, activation, 512, 128, 512, {1, 1}, {1, 1}));
+        if (activation == GGML_TYPE_F32) {
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, activation, 512, 1, 512, {1, 1}, {1, 1}));
+        }
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, activation, 512, 64, 512, {2, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, activation, 512, 64, 512, {1, 1}, {1, 1}, {0, 1, 2, 3}, 544));
+    }
+
     // FWHT tests
     test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F32, 128, 1, 128));
     test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F32, 64, 1, 64));

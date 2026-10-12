@@ -350,6 +350,9 @@ void   ggml_metal_buffer_get_tensor   (ggml_metal_buffer_t buf, const struct ggm
 bool   ggml_metal_buffer_cpy_tensor   (ggml_metal_buffer_t buf, const struct ggml_tensor * src, struct ggml_tensor * dst);
 void   ggml_metal_buffer_clear        (ggml_metal_buffer_t buf, uint8_t value);
 
+struct ggml_backend_buffer;
+bool ggml_backend_buffer_is_metal(struct ggml_backend_buffer * buffer);
+
 // finds the Metal buffer that contains the tensor data on the GPU device
 // the assumption is that there is 1-to-1 mapping between the host and device memory buffers, so we can find the
 // Metal buffer based on the host memory pointer
