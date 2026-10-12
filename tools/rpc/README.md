@@ -132,7 +132,7 @@ The RPC backend can use RDMA instead of TCP for lower latency and higher through
 
 Two providers are supported, each enabled by default when its library is found at build time:
 
-- **Linux**: RoCEv2-capable NICs (e.g. Mellanox ConnectX), via `libibverbs`.
+- **Linux**: RoCEv2-capable NICs (e.g. Mellanox ConnectX), via `libibverbs`. Shared builds load `libibverbs.so.1` at runtime, so a host without it still runs RPC over TCP. Static builds link it.
 - **macOS**: RDMA over Thunderbolt on Apple silicon Macs with Thunderbolt 5, via `librdma`. Requires macOS 26.2 or later, with RDMA enabled once from macOS Recovery via `rdma_ctl enable`. See [TN3205](https://developer.apple.com/documentation/technotes/tn3205-low-latency-communication-with-rdma-over-thunderbolt).
 
 RDMA is point-to-point, so each side uses the local device whose GID matches the address the connection was made on. Connect over the RDMA-capable link -- with Thunderbolt, use the peer's Thunderbolt address in `--rpc`; a connection made over another interface stays on TCP.
@@ -141,6 +141,12 @@ To force plain TCP without rebuilding, set `GGML_RPC_NO_RDMA` on either peer:
 ```bash
 $ GGML_RPC_NO_RDMA=1 bin/ggml-rpc-server
 ```
+
+The `transport` line the server prints at startup shows which applies:
+
+- `TCP (RDMA auto-negotiate enabled)`: the RDMA library loaded and lists at least one RDMA device, so each connection tries RDMA.
+- `TCP (RDMA unavailable)`: the RDMA library is missing or incomplete, or the host has no RDMA device.
+- `TCP (RDMA disabled by GGML_RPC_NO_RDMA)`: RDMA was turned off on purpose.
 
 On Linux, after 100 ms without a completion, the transport waits for a completion event so an idle connection does not keep a CPU core busy.
 

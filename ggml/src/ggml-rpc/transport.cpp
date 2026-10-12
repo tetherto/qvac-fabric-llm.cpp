@@ -22,6 +22,7 @@
 #  include <unistd.h>
 #endif
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
@@ -37,6 +38,8 @@
 #  include <time.h>
 #  ifdef GGML_RPC_RDMA_APPLE
 #    include "transport-apple.h"
+#  else
+#    include "ibv-drv.h"
 #  endif
 #endif // GGML_RPC_RDMA
 
@@ -219,6 +222,11 @@ bool socket_t::impl::tcp_peer_closed() {
 }
 
 bool socket_t::impl::rdma_probe() {
+    // without libibverbs the caps stay zero and the connection uses TCP
+    if (!ibvdrv_init()) {
+        return false;
+    }
+
     const char * dev_env = std::getenv("GGML_RDMA_DEV");
     const char * gid_env = std::getenv("GGML_RDMA_GID");
 
@@ -230,7 +238,12 @@ bool socket_t::impl::rdma_probe() {
     const uint8_t ib_port = 1;
     int num_devs = 0;
     ibv_device ** devs = ibv_get_device_list(&num_devs);
-    if (!devs || num_devs == 0) return false;
+    if (!devs) return false;
+    if (num_devs == 0) {
+        // the list is allocated even when it is empty
+        ibv_free_device_list(devs);
+        return false;
+    }
 
     ibv_context * ibctx = nullptr;
     const char * matched_dev = nullptr;
@@ -661,7 +674,8 @@ bool socket_t::impl::set_timeout(int timeout) {
 void socket_t::impl::get_caps(uint8_t * local_caps) {
     memset(local_caps, 0, RPC_CONN_CAPS_SIZE);
 #ifdef GGML_RPC_RDMA
-    if (std::getenv("GGML_RPC_NO_RDMA")) {
+    // the same test ggml_backend_rpc_rdma_supported() reports
+    if (!rpc_transport_rdma_available()) {
         return;
     }
 #  ifdef GGML_RPC_RDMA_APPLE
@@ -1073,4 +1087,41 @@ void rpc_transport_shutdown() {
     }
     WSACleanup();
 #endif
+}
+
+bool rpc_transport_rdma_available() {
+#ifdef GGML_RPC_RDMA
+    if (std::getenv("GGML_RPC_NO_RDMA")) {
+        return false;
+    }
+#  ifdef GGML_RPC_RDMA_APPLE
+    if (!apple_rdma::available()) {
+        return false;
+    }
+#  else
+    if (!ibvdrv_init()) {
+        return false;
+    }
+#  endif
+    // the library alone is not enough: hosts often have libibverbs for MPI or UCX
+    // but no RDMA device, and every connection then stays on TCP. Remember only a
+    // found device, so one whose driver loads after this process starts is seen.
+    static std::atomic<bool> has_device{false};
+    if (has_device.load(std::memory_order_relaxed)) {
+        return true;
+    }
+    int num_devs = 0;
+    ibv_device ** devs = ibv_get_device_list(&num_devs);
+    if (devs == nullptr) {
+        return false;
+    }
+    ibv_free_device_list(devs);
+    if (num_devs <= 0) {
+        return false;
+    }
+    has_device.store(true, std::memory_order_relaxed);
+    return true;
+#else
+    return false;
+#endif // GGML_RPC_RDMA
 }

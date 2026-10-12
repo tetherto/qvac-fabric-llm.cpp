@@ -3838,7 +3838,14 @@ ggml_backend_rpc_server_t ggml_backend_rpc_server_create(
     }
 
 #ifdef GGML_RPC_RDMA
-    LOG_INFO("  transport      : TCP (RDMA auto-negotiate enabled)\n");
+    // tell a deliberate opt-out apart from a host that cannot use RDMA
+    if (std::getenv("GGML_RPC_NO_RDMA")) {
+        LOG_INFO("  transport      : TCP (RDMA disabled by GGML_RPC_NO_RDMA)\n");
+    } else if (rpc_transport_rdma_available()) {
+        LOG_INFO("  transport      : TCP (RDMA auto-negotiate enabled)\n");
+    } else {
+        LOG_INFO("  transport      : TCP (RDMA unavailable)\n");
+    }
 #else
     LOG_INFO("  transport      : TCP\n");
 #endif // GGML_RPC_RDMA
@@ -3864,6 +3871,10 @@ ggml_backend_rpc_server_t ggml_backend_rpc_server_create(
 
 int ggml_backend_rpc_server_get_port(ggml_backend_rpc_server_t server) {
     return server != nullptr ? server->port : -1;
+}
+
+bool ggml_backend_rpc_rdma_supported(void) {
+    return rpc_transport_rdma_available();
 }
 
 void ggml_backend_rpc_server_run(ggml_backend_rpc_server_t server) {
@@ -4329,6 +4340,9 @@ static void * ggml_backend_rpc_get_proc_address(ggml_backend_reg_t reg, const ch
     }
     if (std::strcmp(name, "ggml_backend_rpc_server_get_port") == 0) {
         return (void *)ggml_backend_rpc_server_get_port;
+    }
+    if (std::strcmp(name, "ggml_backend_rpc_rdma_supported") == 0) {
+        return (void *)ggml_backend_rpc_rdma_supported;
     }
     if (std::strcmp(name, "ggml_backend_comm_init") == 0) {
         return (void *)ggml_backend_rpc_comm_init;

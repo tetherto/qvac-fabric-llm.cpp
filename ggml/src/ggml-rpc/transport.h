@@ -42,3 +42,7 @@ private:
 
 bool rpc_transport_init();
 void rpc_transport_shutdown();
+
+// True when new connections will try RDMA: the RDMA library loaded, it lists an
+// RDMA device, and GGML_RPC_NO_RDMA is unset. They fall back to TCP when RDMA fails.
+bool rpc_transport_rdma_available();
