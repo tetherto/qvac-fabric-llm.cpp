@@ -7,7 +7,7 @@ Finetuning of Stories 260K and LLaMA 3.2 1b seems to work with 24 GB of memory.
 **For CPU training, compile llama.cpp without any additional backends such as CUDA.**
 **For CUDA training, use the maximum number of GPU layers.**
 
-Flash attention is disabled during training because `FLASH_ATTN_EXT` has no backward pass.
+Flash attention stays off in training unless you pass `--train-flash-attn`. It needs the `FLASH_ATTN_EXT_BACK` kernel on every backend in use: CPU, CUDA and Vulkan have it, also under `-sm tensor` and over RPC; on other backends keep `-fa off`.
 
 Proof of concept:
 
