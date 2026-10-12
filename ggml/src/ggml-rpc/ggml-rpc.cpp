@@ -527,12 +527,13 @@ static bool parse_endpoint(const std::string & endpoint, std::string & host, int
         return false;
     }
     host = endpoint.substr(0, pos);
-    try {
-        port = std::stoi(endpoint.substr(pos + 1));
-    } catch (...) {
+    // check every character: stoi stops at the first non-digit and htons truncates big ports
+    const std::string port_str = endpoint.substr(pos + 1);
+    if (port_str.empty() || port_str.size() > 5 || port_str.find_first_not_of("0123456789") != std::string::npos) {
         return false;
     }
-    return true;
+    port = std::stoi(port_str);
+    return port <= 65535;
 }
 
 // RPC request : | rpc_cmd (1 byte) | request_size (8 bytes) | request_data (request_size bytes) |
@@ -3771,6 +3772,7 @@ struct ggml_backend_rpc_server {
     std::string cache_dir;
     bool has_cache_dir = false;
     std::string host;
+    int port = -1;
     socket_ptr server_socket;
     socket_ptr client_socket;
     std::mutex client_mutex;
@@ -3798,6 +3800,12 @@ ggml_backend_rpc_server_t ggml_backend_rpc_server_create(
         return nullptr;
     }
     auto server = std::make_unique<ggml_backend_rpc_server>();
+    // validate the endpoint before initializing any device
+    int port;
+    if (!parse_endpoint(endpoint, server->host, port)) {
+        LOG_ERROR("Invalid endpoint: %s\n", endpoint);
+        return nullptr;
+    }
     server->has_cache_dir = cache_dir != nullptr;
     if (server->has_cache_dir) {
         server->cache_dir = cache_dir;
@@ -3806,7 +3814,6 @@ ggml_backend_rpc_server_t ggml_backend_rpc_server_create(
         RPC_PROTO_MAJOR_VERSION,
         RPC_PROTO_MINOR_VERSION,
         RPC_PROTO_PATCH_VERSION);
-    LOG_INFO("  endpoint       : %s\n", endpoint);
     LOG_INFO("  local cache    : %s\n", cache_dir ? cache_dir : "n/a");
     LOG_INFO("Devices:\n");
     for (size_t i = 0; i < n_devices; i++) {
@@ -3830,11 +3837,6 @@ ggml_backend_rpc_server_t ggml_backend_rpc_server_create(
         }
     }
 
-    int port;
-    if (!parse_endpoint(endpoint, server->host, port)) {
-        return nullptr;
-    }
-
 #ifdef GGML_RPC_RDMA
     LOG_INFO("  transport      : TCP (RDMA auto-negotiate enabled)\n");
 #else
@@ -3847,10 +3849,21 @@ ggml_backend_rpc_server_t ggml_backend_rpc_server_create(
     server->transport_initialized = true;
     server->server_socket         = socket_t::create_server(server->host.c_str(), port);
     if (server->server_socket == nullptr) {
-        LOG_ERROR("Failed to create server socket\n");
+        LOG_ERROR("Failed to create server socket on %s\n", endpoint);
         return nullptr;
     }
+    // port 0 binds an ephemeral port, so report the one the socket got
+    server->port = server->server_socket->local_port();
+    if (server->port <= 0) {
+        LOG_ERROR("Failed to get the server port for %s\n", endpoint);
+        return nullptr;
+    }
+    LOG_INFO("  endpoint       : %s:%d\n", server->host.c_str(), server->port);
     return server.release();
+}
+
+int ggml_backend_rpc_server_get_port(ggml_backend_rpc_server_t server) {
+    return server != nullptr ? server->port : -1;
 }
 
 void ggml_backend_rpc_server_run(ggml_backend_rpc_server_t server) {
@@ -4313,6 +4326,9 @@ static void * ggml_backend_rpc_get_proc_address(ggml_backend_reg_t reg, const ch
     }
     if (std::strcmp(name, "ggml_backend_rpc_server_free") == 0) {
         return (void *)ggml_backend_rpc_server_free;
+    }
+    if (std::strcmp(name, "ggml_backend_rpc_server_get_port") == 0) {
+        return (void *)ggml_backend_rpc_server_get_port;
     }
     if (std::strcmp(name, "ggml_backend_comm_init") == 0) {
         return (void *)ggml_backend_rpc_comm_init;

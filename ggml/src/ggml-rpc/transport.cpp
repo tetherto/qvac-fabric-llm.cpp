@@ -768,6 +768,15 @@ void socket_t::shutdown() {
 #endif
 }
 
+int socket_t::local_port() const {
+    struct sockaddr_in addr = {};
+    socklen_t addr_len = sizeof(addr);
+    if (getsockname(pimpl->fd, (struct sockaddr *) &addr, &addr_len) != 0 || addr.sin_family != AF_INET) {
+        return -1;
+    }
+    return ntohs(addr.sin_port);
+}
+
 void socket_t::get_caps(uint8_t * local_caps) {
     return pimpl->get_caps(local_caps);
 }
@@ -918,13 +927,17 @@ socket_ptr socket_t::create_server(const char * host, int port) {
     if (!is_valid_fd(sockfd)) {
         return nullptr;
     }
+    auto fail = [&]() -> socket_ptr {
+        close_socket(sockfd);
+        return nullptr;
+    };
     if (!set_reuse_addr(sockfd)) {
         LOG_ERROR("Failed to set SO_REUSEADDR\n");
-        return nullptr;
+        return fail();
     }
     if (inet_addr(host) == INADDR_NONE) {
         LOG_ERROR("Invalid host address: %s\n", host);
-        return nullptr;
+        return fail();
     }
     struct sockaddr_in serv_addr;
     serv_addr.sin_family = AF_INET;
@@ -932,10 +945,10 @@ socket_ptr socket_t::create_server(const char * host, int port) {
     serv_addr.sin_port = htons(port);
 
     if (bind(sockfd, (struct sockaddr *) &serv_addr, sizeof(serv_addr)) < 0) {
-        return nullptr;
+        return fail();
     }
     if (listen(sockfd, 1) < 0) {
-        return nullptr;
+        return fail();
     }
     LOG_DBG("[%s] listening on %s:%d\n", __func__, host, port);
     return socket_ptr(new socket_t(std::make_unique<impl>(sockfd)));
