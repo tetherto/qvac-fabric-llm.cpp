@@ -956,6 +956,36 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
         return {GGML_BACKEND_SPLIT_AXIS_1, {0}, {1}, 1};
     };
 
+
+    auto handle_flash_attn_ext_back = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
+        GGML_ASSERT(tensor->src[3] == nullptr || src_ss[3].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+
+        if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
+            GGML_ASSERT(src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+            GGML_ASSERT(src_ss[2].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+            GGML_ASSERT(src_ss[4].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+            GGML_ASSERT(src_ss[5].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+            GGML_ASSERT(tensor->src[6] == nullptr || src_ss[6].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+            return {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1};
+        }
+
+        GGML_ASSERT(src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_2);
+        GGML_ASSERT(src_ss[4].axis == GGML_BACKEND_SPLIT_AXIS_1);
+        GGML_ASSERT(src_ss[5].axis == GGML_BACKEND_SPLIT_AXIS_1);
+        GGML_ASSERT(tensor->src[6] == nullptr || src_ss[6].axis == GGML_BACKEND_SPLIT_AXIS_2);
+        const bool kv_split = src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_2 &&
+                src_ss[2].axis == GGML_BACKEND_SPLIT_AXIS_2;
+        const bool kv_mirrored = src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED &&
+                src_ss[2].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED;
+        GGML_ASSERT(kv_split || kv_mirrored);
+        GGML_ASSERT(!kv_mirrored || (tensor->src[1]->ne[2] == 1 && tensor->src[2]->ne[2] == 1));
+
+        if (ggml_get_op_params_i32(tensor, 5) != GGML_FLASH_ATTN_EXT_BACK_DKV || kv_split) {
+            return {GGML_BACKEND_SPLIT_AXIS_2, {0}, {1}, 1};
+        }
+        return {assume_sync ? GGML_BACKEND_SPLIT_AXIS_MIRRORED : GGML_BACKEND_SPLIT_AXIS_PARTIAL, {0}, {1}, 1};
+    };
+
     auto handle_lightning_indexer = [&](
             const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
         for (size_t i = 0; i < 4; i++) {
@@ -1238,7 +1268,7 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
                 split_state = handle_flash_attn_ext(src_ss);
             } break;
             case GGML_OP_FLASH_ATTN_EXT_BACK: {
-                split_state = handle_generic(src_ss, /*scalar_only =*/ true);
+                split_state = handle_flash_attn_ext_back(src_ss);
             } break;
             case GGML_OP_SSM_CONV: {
                 split_state = handle_ssm_conv(src_ss);
