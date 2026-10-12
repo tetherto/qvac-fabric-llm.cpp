@@ -2349,17 +2349,31 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         size_t spv_size = 0;
         const void * spv_data = nullptr;
 #define FA_BACK_SPV(NAME) { name = #NAME; spv_size = NAME ## _len; spv_data = NAME ## _data; }
-        switch (s.target) {
-            case GGML_FLASH_ATTN_EXT_BACK_STATS: if (f16) FA_BACK_SPV(flash_attn_back_stats_f16) else FA_BACK_SPV(flash_attn_back_stats_f32) break;
-            case GGML_FLASH_ATTN_EXT_BACK_DQ:    if (f16) FA_BACK_SPV(flash_attn_back_dq_f16)    else FA_BACK_SPV(flash_attn_back_dq_f32)    break;
-            case GGML_FLASH_ATTN_EXT_BACK_DKV:   if (f16) FA_BACK_SPV(flash_attn_back_dkv_f16)   else FA_BACK_SPV(flash_attn_back_dkv_f32)   break;
-            default: GGML_ABORT("invalid flash_attn_ext_back target");
+        if (s.path == FA_COOPMAT2) {
+#if defined(VK_NV_cooperative_matrix2) && defined(GGML_VULKAN_COOPMAT2_GLSLC_SUPPORT)
+            switch (s.target) {
+                case GGML_FLASH_ATTN_EXT_BACK_STATS: if (f16) FA_BACK_SPV(flash_attn_back_stats_f16_cm2) else FA_BACK_SPV(flash_attn_back_stats_f32_cm2) break;
+                case GGML_FLASH_ATTN_EXT_BACK_DQ:  if (f16) FA_BACK_SPV(flash_attn_back_dq_f16_cm2)  else FA_BACK_SPV(flash_attn_back_dq_f32_cm2)  break;
+                case GGML_FLASH_ATTN_EXT_BACK_DKV: if (f16) FA_BACK_SPV(flash_attn_back_dkv_f16_cm2) else FA_BACK_SPV(flash_attn_back_dkv_f32_cm2) break;
+                default: GGML_ABORT("invalid flash_attn_ext_back coopmat2 target");
+            }
+#else
+            GGML_ABORT("flash_attn_ext_back coopmat2 pipeline without coopmat2 shader support");
+#endif
+        } else {
+            switch (s.target) {
+                case GGML_FLASH_ATTN_EXT_BACK_STATS: if (f16) FA_BACK_SPV(flash_attn_back_stats_f16) else FA_BACK_SPV(flash_attn_back_stats_f32) break;
+                case GGML_FLASH_ATTN_EXT_BACK_DQ:    if (f16) FA_BACK_SPV(flash_attn_back_dq_f16)    else FA_BACK_SPV(flash_attn_back_dq_f32)    break;
+                case GGML_FLASH_ATTN_EXT_BACK_DKV:   if (f16) FA_BACK_SPV(flash_attn_back_dkv_f16)   else FA_BACK_SPV(flash_attn_back_dkv_f32)   break;
+                default: GGML_ABORT("invalid flash_attn_ext_back target");
+            }
         }
 #undef FA_BACK_SPV
+        const bool full_subgroups = s.path == FA_SCALAR && !ds;
         ggml_vk_create_pipeline(device, fab.second, name, spv_size, spv_data, "main", 9,
                                 sizeof(vk_flash_attn_back_push_constants), {1, 1, 1},
                                 {s.workgroup_size, s.Br, s.Bc, s.HS, s.D_split, s.subgroup_size},
-                                1, true, !ds, !ds ? s.subgroup_size : 0);
+                                1, true, full_subgroups, full_subgroups ? s.subgroup_size : 0);
     }
 
     for (auto &fa : device->pipeline_flash_attn_f32_f16) {
@@ -12235,8 +12249,8 @@ static void ggml_vk_flash_attn_ext_back(ggml_backend_vk_context * ctx, vk_contex
     }
 
     const uint32_t D_lsb   = HS ^ (HS & (HS - 1));
-    const uint32_t D_split = std::min(std::min(subgroup_size, 8u), D_lsb / 4);
-    const uint32_t Bc      = (HS & 8) ? 64 : 32;
+    uint32_t D_split = std::min(std::min(subgroup_size, 8u), D_lsb / 4);
+    uint32_t Bc      = (HS & 8) ? 64 : 32;
 
     uint32_t workgroup_size = subgroup_size * ((subgroup_size > 32 && HS < 128) ? 2 : 4);
     workgroup_size = std::min(workgroup_size, Bc * D_split);
@@ -12247,7 +12261,19 @@ static void ggml_vk_flash_attn_ext_back(ggml_backend_vk_context * ctx, vk_contex
         Br = std::max(Br / 2, 1u);
     }
 
-    const vk_fa_back_pipeline_state state{target, k->type, HS, Br, Bc, D_split, workgroup_size, disable_subgroups ? 0 : subgroup_size};
+    // tensor cores where available, GGML_VK_FA_BACK_SCALAR forces the scalar path
+    static const bool force_scalar = getenv("GGML_VK_FA_BACK_SCALAR") != nullptr;
+    FaCodePath path = FA_SCALAR;
+    if (device->coopmat2 && !force_scalar) {
+        path = FA_COOPMAT2;
+        Br = 32;
+        Bc = 32;
+        workgroup_size = 128;
+        D_split = 1;
+        disable_subgroups = false;
+    }
+
+    const vk_fa_back_pipeline_state state{target, k->type, HS, Br, Bc, D_split, workgroup_size, disable_subgroups ? 0 : subgroup_size, path};
 
     vk_pipeline pipeline = nullptr;
     {

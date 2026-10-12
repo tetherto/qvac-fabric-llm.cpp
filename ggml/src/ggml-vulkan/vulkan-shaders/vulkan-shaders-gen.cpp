@@ -1494,6 +1494,12 @@ void process_shaders() {
         string_to_spv("flash_attn_back_" + target.first + "_f32", "flash_attn_back.comp", merge_maps(base_dict, {{"FA_BACK_TARGET", target.second}, {"KV_TYPEV4", "vec4"}}));
         string_to_spv("flash_attn_back_" + target.first + "_f16", "flash_attn_back.comp", merge_maps(base_dict, {{"FA_BACK_TARGET", target.second}, {"KV_TYPEV4", "f16vec4"}}));
     }
+#if defined(GGML_VULKAN_COOPMAT2_GLSLC_SUPPORT)
+    for (const auto & target : {std::pair<std::string, std::string>{"stats", "0"}, {"dq", "1"}, {"dkv", "2"}}) {
+        string_to_spv("flash_attn_back_" + target.first + "_f32", "flash_attn_back_cm2.comp", merge_maps(base_dict, {{"FA_BACK_TARGET", target.second}, {"KV_F32", "1"}}), true, false, true);
+        string_to_spv("flash_attn_back_" + target.first + "_f16", "flash_attn_back_cm2.comp", merge_maps(base_dict, {{"FA_BACK_TARGET", target.second}}), true, false, true);
+    }
+#endif
 
     string_to_spv("opt_step_adamw_f32", "opt_step_adamw.comp", merge_maps(base_dict, {{"A_TYPE", "float"}}));
     string_to_spv("opt_step_sgd_f32", "opt_step_sgd.comp", merge_maps(base_dict, {{"A_TYPE", "float"}}));

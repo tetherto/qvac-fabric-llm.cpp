@@ -460,10 +460,11 @@ struct vk_fa_back_pipeline_state {
     ggml_type kv_type;
     uint32_t HS, Br, Bc, D_split;
     uint32_t workgroup_size, subgroup_size;
+    FaCodePath path;
 
     bool operator<(const vk_fa_back_pipeline_state &b) const {
-        return std::tie(target, kv_type, HS, Br, Bc, D_split, workgroup_size, subgroup_size) <
-               std::tie(b.target, b.kv_type, b.HS, b.Br, b.Bc, b.D_split, b.workgroup_size, b.subgroup_size);
+        return std::tie(target, kv_type, HS, Br, Bc, D_split, workgroup_size, subgroup_size, path) <
+               std::tie(b.target, b.kv_type, b.HS, b.Br, b.Bc, b.D_split, b.workgroup_size, b.subgroup_size, b.path);
     }
 };
 
