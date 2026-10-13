@@ -638,6 +638,7 @@ extern "C" {
         GGML_OP_NORM_CHANNEL,
         GGML_OP_SCALE_RESIDUAL,
         GGML_OP_BIAS_GELU,
+        GGML_OP_PAD_REPLICATE_1D,
         GGML_OP_COUNT,
     };
 
@@ -2647,6 +2648,30 @@ extern "C" {
             struct ggml_context * ctx,
             struct ggml_tensor  * x,
             struct ggml_tensor  * bias);
+
+    // Edge-replicate padding for 1D conv inputs, in one dispatch instead of
+    // a view + repeat_4d + concat sequence. pad_left alone gives causal
+    // padding, pad_left + pad_right the symmetric edge-clamp form.
+    // Input `x` is `[L_in, C, 1, 1]` f32 contiguous; the
+    // output has `ne = [L_in + pad_left + pad_right, C, 1, 1]` where:
+    //
+    //   y[t, c] = x[clamp(t - pad_left, 0, L_in - 1), c]
+    //
+    // (Replicate / edge-clamp semantics — the leftmost row of `x` fills
+    // the left pad, the rightmost row fills the right pad.)
+    GGML_API struct ggml_tensor * ggml_pad_replicate_1d(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,
+            int                   pad_left,
+            int                   pad_right);
+
+    // [C, T]-layout variant.  Input x is [C, L_in, 1, 1]; output is
+    // [C, L_in + pad_left + pad_right, 1, 1].
+    GGML_API struct ggml_tensor * ggml_pad_replicate_1d_ct(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,
+            int                   pad_left,
+            int                   pad_right);
     // Move tensor elements by an offset given for each dimension. Elements that
     // are shifted beyond the last position are wrapped around to the beginning.
     GGML_API struct ggml_tensor * ggml_roll(

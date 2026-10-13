@@ -5484,6 +5484,32 @@ struct test_mm_epilogue : public test_case {
     }
 };
 
+// GGML_OP_PAD_REPLICATE_1D
+struct test_pad_replicate_1d : public test_case {
+    const int64_t L;
+    const int64_t C;
+    const int     pad_left;
+    const int     pad_right;
+    const bool    ct;
+
+    std::string vars() override {
+        return VARS_TO_STR5(L, C, pad_left, pad_right, ct);
+    }
+
+    test_pad_replicate_1d(int64_t L = 37, int64_t C = 8, int pad_left = 3, int pad_right = 2, bool ct = false)
+        : L(L), C(C), pad_left(pad_left), pad_right(pad_right), ct(ct) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x = ct ? ggml_new_tensor_4d(ctx, GGML_TYPE_F32, C, L, 1, 1)
+                             : ggml_new_tensor_4d(ctx, GGML_TYPE_F32, L, C, 1, 1);
+        ggml_set_name(x, "x");
+        ggml_tensor * out = ct ? ggml_pad_replicate_1d_ct(ctx, x, pad_left, pad_right)
+                               : ggml_pad_replicate_1d(ctx, x, pad_left, pad_right);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 // GGML_OP_CONV_1D_DW_DIRECT
 struct test_conv_1d_dw_direct : public test_case {
     const int64_t L;
@@ -14113,6 +14139,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_conv_1d_dw_direct(278, 512, 7, 27, true, false, 139));
     test_cases.emplace_back(new test_conv_1d_dw_direct(90, 512, 5, 8, true, false, 45));
     test_cases.emplace_back(new test_conv_1d_dw_direct(37, 96, 5, 2, true, false, 0, 2));
+    for (bool ct : { false, true }) {
+        test_cases.emplace_back(new test_pad_replicate_1d(37, 8, 3, 2, ct));
+        test_cases.emplace_back(new test_pad_replicate_1d(139, 512, 6, 0, ct));
+        test_cases.emplace_back(new test_pad_replicate_1d(1, 5, 2, 2, ct));
+    }
     // Metal fuses the depthwise taps into the following channel layer norm; the last shape exceeds
     // its per-thread register budget and must fall back to two dispatches.
     test_cases.emplace_back(new test_conv_1d_dw_direct_norm_channel(90, 512, 7, 1, true, false, 45));

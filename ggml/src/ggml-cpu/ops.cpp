@@ -9580,6 +9580,52 @@ void ggml_compute_forward_bias_gelu(
         }
     }
 }
+
+// ggml_compute_forward_pad_replicate_1d
+
+void ggml_compute_forward_pad_replicate_1d(
+        const ggml_compute_params * params,
+              ggml_tensor * dst) {
+
+    const ggml_tensor * x = dst->src[0]; // [L_in, C, 1, 1] or [C, L_in, 1, 1]
+
+    GGML_ASSERT(x->type == GGML_TYPE_F32);
+    GGML_ASSERT(dst->type == GGML_TYPE_F32);
+
+    const int pad_left = ggml_get_op_params_i32(dst, 0);
+    const int32_t layout = ggml_get_op_params_i32(dst, 2);
+
+    int L_in, L_out, C, sxt, sxc, syt, syc;
+    if (layout == 0) {
+        L_in  = (int) x->ne[0];
+        C     = (int) x->ne[1];
+        L_out = (int) dst->ne[0];
+        sxt = 1;     sxc = L_in;   syt = 1;     syc = L_out;
+    } else {
+        C     = (int) x->ne[0];
+        L_in  = (int) x->ne[1];
+        L_out = (int) dst->ne[1];
+        sxt = C;     sxc = 1;      syt = C;     syc = 1;
+    }
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    const float * x_data = (const float *) x->data;
+          float * y_data = (float *)       dst->data;
+
+    // Stripe over channels.  For each output time t, read from
+    // clamp(t - pad_left, 0, L_in - 1); layout flag picks strides.
+    for (int c = ith; c < C; c += nth) {
+        for (int t = 0; t < L_out; ++t) {
+            int src_t = t - pad_left;
+            if (src_t < 0)       src_t = 0;
+            if (src_t >= L_in)   src_t = L_in - 1;
+            y_data[(size_t) t * syt + (size_t) c * syc] =
+                x_data[(size_t) src_t * sxt + (size_t) c * sxc];
+        }
+    }
+}
 // ggml_compute_forward_roll
 
 static int64_t ggml_wrap_index(int64_t i, int64_t ne) {

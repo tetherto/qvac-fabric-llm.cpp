@@ -1214,9 +1214,10 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "NORM_CHANNEL",
     "SCALE_RESIDUAL",
     "BIAS_GELU",
+    "PAD_REPLICATE_1D",
 };
 
-static_assert(GGML_OP_COUNT == 118, "GGML_OP_COUNT != 118");
+static_assert(GGML_OP_COUNT == 119, "GGML_OP_COUNT != 119");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1347,9 +1348,10 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "norm_channel(x,g,b)",
     "scale_residual(x,b,gamma,res)",
     "bias_gelu(x,b)",
+    "pad_replicate_1d(x,pad_l,pad_r)",
 };
 
-static_assert(GGML_OP_COUNT == 118, "GGML_OP_COUNT != 118");
+static_assert(GGML_OP_COUNT == 119, "GGML_OP_COUNT != 119");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -5922,6 +5924,59 @@ struct ggml_tensor * ggml_bias_gelu_tc_to_ct(
         struct ggml_tensor  * x,
         struct ggml_tensor  * bias) {
     return ggml_bias_gelu_impl(ctx, x, bias, /*layout=*/2);
+}
+
+// ggml_pad_replicate_1d
+
+static struct ggml_tensor * ggml_pad_replicate_1d_impl(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * x,
+        int                   pad_left,
+        int                   pad_right,
+        int                   layout) {
+    GGML_ASSERT(x->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(x));
+    GGML_ASSERT(x->ne[2] == 1 && x->ne[3] == 1);
+    GGML_ASSERT(pad_left >= 0 && pad_right >= 0);
+
+    int64_t out_ne0, out_ne1;
+    if (layout == 0) {
+        const int64_t L_in = x->ne[0];
+        const int64_t C    = x->ne[1];
+        out_ne0 = L_in + pad_left + pad_right;
+        out_ne1 = C;
+    } else {
+        const int64_t C    = x->ne[0];
+        const int64_t L_in = x->ne[1];
+        out_ne0 = C;
+        out_ne1 = L_in + pad_left + pad_right;
+    }
+    struct ggml_tensor * result = ggml_new_tensor_4d(ctx, x->type,
+            out_ne0, out_ne1, x->ne[2], x->ne[3]);
+
+    int32_t params[3] = { pad_left, pad_right, layout };
+    ggml_set_op_params(result, params, sizeof(params));
+
+    result->op     = GGML_OP_PAD_REPLICATE_1D;
+    result->src[0] = x;
+
+    return result;
+}
+
+struct ggml_tensor * ggml_pad_replicate_1d(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * x,
+        int                   pad_left,
+        int                   pad_right) {
+    return ggml_pad_replicate_1d_impl(ctx, x, pad_left, pad_right, /*layout=*/0);
+}
+
+struct ggml_tensor * ggml_pad_replicate_1d_ct(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * x,
+        int                   pad_left,
+        int                   pad_right) {
+    return ggml_pad_replicate_1d_impl(ctx, x, pad_left, pad_right, /*layout=*/1);
 }
 // ggml_roll
 
