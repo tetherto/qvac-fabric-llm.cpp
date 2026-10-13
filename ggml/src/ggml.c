@@ -1219,9 +1219,10 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GRU",
     "ZERO_UPSAMPLE",
     "CHANNEL_SHUFFLE",
+    "AFFINE_PRELU",
 };
 
-static_assert(GGML_OP_COUNT == 122, "GGML_OP_COUNT != 122");
+static_assert(GGML_OP_COUNT == 123, "GGML_OP_COUNT != 123");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1357,9 +1358,10 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "gru(whh,gi,bhh)",
     "zero_upsample(x)",
     "channel_shuffle(x)",
+    "affine_prelu(x,aw,ab,slope)",
 };
 
-static_assert(GGML_OP_COUNT == 122, "GGML_OP_COUNT != 122");
+static_assert(GGML_OP_COUNT == 123, "GGML_OP_COUNT != 123");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -6054,6 +6056,33 @@ struct ggml_tensor * ggml_channel_shuffle(
 
     result->op     = GGML_OP_CHANNEL_SHUFFLE;
     result->src[0] = a;
+
+    return result;
+}
+
+// ggml_affine_prelu
+
+struct ggml_tensor * ggml_affine_prelu(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * aw,
+        struct ggml_tensor  * ab,
+        struct ggml_tensor  * slope) {
+    GGML_ASSERT(x->type == GGML_TYPE_F32 && aw->type == GGML_TYPE_F32 &&
+                ab->type == GGML_TYPE_F32 && slope->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(x) && ggml_is_contiguous(aw) && ggml_is_contiguous(ab) && ggml_is_contiguous(slope));
+    // aw and ab hold one [F] row per channel, slope one value per channel
+    GGML_ASSERT(aw->ne[0] == x->ne[0] && ggml_nelements(aw) == x->ne[0]*x->ne[2]);
+    GGML_ASSERT(ggml_are_same_shape(aw, ab));
+    GGML_ASSERT(ggml_nelements(slope) == x->ne[2]);
+
+    struct ggml_tensor * result = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, x->ne[0], x->ne[1], x->ne[2], x->ne[3]);
+
+    result->op     = GGML_OP_AFFINE_PRELU;
+    result->src[0] = x;
+    result->src[1] = aw;
+    result->src[2] = ab;
+    result->src[3] = slope;
 
     return result;
 }

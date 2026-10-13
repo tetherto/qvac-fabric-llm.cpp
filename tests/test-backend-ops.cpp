@@ -5717,6 +5717,29 @@ struct test_channel_shuffle : public test_case {
         return ggml_channel_shuffle(ctx, a, groups);
     }
 };
+
+// GGML_OP_AFFINE_PRELU
+struct test_affine_prelu : public test_case {
+    const int64_t f;   // features (ne0)
+    const int64_t t;   // time (ne1)
+    const int64_t c;   // channels (ne2)
+    const int64_t bc;  // batch (ne3)
+
+    std::string vars() override {
+        return VARS_TO_STR4(f, t, c, bc);
+    }
+
+    test_affine_prelu(int64_t f = 16, int64_t t = 10, int64_t c = 6, int64_t bc = 2)
+        : f(f), t(t), c(c), bc(bc) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x     = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, f, t, c, bc);
+        ggml_tensor * aw    = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, f, c);
+        ggml_tensor * ab    = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, f, c);
+        ggml_tensor * slope = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, c);
+        return ggml_affine_prelu(ctx, x, aw, ab, slope);
+    }
+};
 // GGML_OP_SSM_SCAN
 struct test_ssm_scan : public test_case {
     const ggml_type type;
@@ -14424,6 +14447,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (int groups : {1, 2, 3, 4}) {
         test_cases.emplace_back(new test_channel_shuffle({8, 4, 12, 2}, groups));
     }
+
+    test_cases.emplace_back(new test_affine_prelu(16, 10, 6, 2));
+    test_cases.emplace_back(new test_affine_prelu(129, 63, 16, 3));
     // fused ssm_conv + (optional) bias_add + silu. The bias-only graph (no silu) is intentionally
     // not tested since there's no fusion for that pattern in ggml_cuda_can_fuse.
     for (int64_t d_conv : {3, 4, 7, 9}) {

@@ -651,6 +651,10 @@ extern "C" {
         // Channel shuffle over ne2 (LavaSR denoiser): one plane copy per
         // output channel instead of a permute/reshape/transpose/cont chain.
         GGML_OP_CHANNEL_SHUFFLE,
+
+        // Fused affine + per-channel PReLU (LavaSR denoiser):
+        // out = x*aw + ab + max(x,0) + slope*min(x,0).
+        GGML_OP_AFFINE_PRELU,
         GGML_OP_COUNT,
     };
 
@@ -2707,6 +2711,15 @@ extern "C" {
             struct ggml_context * ctx,
             struct ggml_tensor  * a,
             int                   groups);
+
+    // Fused affine + per-channel PReLU: out = x*aw + ab + max(x,0) + slope*min(x,0).
+    // x [F,T,C,Bc] contiguous; aw,ab [F,C] (per freq,channel); slope [C].
+    GGML_API struct ggml_tensor * ggml_affine_prelu(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * aw,
+            struct ggml_tensor  * ab,
+            struct ggml_tensor  * slope);
     // Move tensor elements by an offset given for each dimension. Elements that
     // are shifted beyond the last position are wrapped around to the beginning.
     GGML_API struct ggml_tensor * ggml_roll(

@@ -20459,6 +20459,8 @@
 "CPU","CHANNEL_SHUFFLE","ne=[8,4,12,2],groups=2","support","1","yes","CPU"
 "CPU","CHANNEL_SHUFFLE","ne=[8,4,12,2],groups=3","support","1","yes","CPU"
 "CPU","CHANNEL_SHUFFLE","ne=[8,4,12,2],groups=4","support","1","yes","CPU"
+"CPU","AFFINE_PRELU","f=16,t=10,c=6,bc=2","support","1","yes","CPU"
+"CPU","AFFINE_PRELU","f=129,t=63,c=16,bc=3","support","1","yes","CPU"
 "CPU","SCALE_RESIDUAL","L=139,C=512,B=1,ct=0","support","1","yes","CPU"
 "CPU","SCALE_RESIDUAL","L=37,C=96,B=2,ct=0","support","1","yes","CPU"
 "CPU","BIAS_GELU","L=139,C=512,B=1,ct=0","support","1","yes","CPU"

@@ -93,6 +93,7 @@ void ggml_compute_forward_pad_replicate_1d(const struct ggml_compute_params * pa
 void ggml_compute_forward_gru(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_zero_upsample(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_channel_shuffle(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+void ggml_compute_forward_affine_prelu(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_roll(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_arange(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_timestep_embedding(const struct ggml_compute_params * params, struct ggml_tensor * dst);

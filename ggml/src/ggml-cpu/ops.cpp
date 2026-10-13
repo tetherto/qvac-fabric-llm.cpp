@@ -9752,6 +9752,53 @@ void ggml_compute_forward_channel_shuffle(
         for (int64_t i = 0; i < FT; ++i) dp[i] = sp[i];
     }
 }
+
+void ggml_compute_forward_affine_prelu(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+
+    const ggml_tensor * x     = dst->src[0];
+    const ggml_tensor * aw    = dst->src[1];
+    const ggml_tensor * ab    = dst->src[2];
+    const ggml_tensor * slope = dst->src[3];
+    GGML_ASSERT(dst->type == GGML_TYPE_F32 && x->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(x) && ggml_is_contiguous(dst));
+
+    const int64_t F  = x->ne[0];
+    const int64_t T  = x->ne[1];
+    const int64_t C  = x->ne[2];
+    const int64_t Bc = x->ne[3];
+
+    const float * xd  = (const float *) x->data;
+    const float * awd = (const float *) aw->data;
+    const float * abd = (const float *) ab->data;
+    const float * sld = (const float *) slope->data;
+    float       * dd  = (float *) dst->data;
+
+    // parallel over planes (c + C*b); per element: affine + per-channel prelu in scalar op order.
+    const int64_t nplanes = C * Bc;
+    const int64_t per_thread = (nplanes + params->nth - 1) / params->nth;
+    const int64_t start = params->ith * per_thread;
+    const int64_t end   = MIN(start + per_thread, nplanes);
+
+    for (int64_t p = start; p < end; ++p) {
+        const int64_t c   = p % C;
+        const float * awc = awd + c * F;
+        const float * abc = abd + c * F;
+        const float   sl  = sld[c];
+        const float * xp  = xd + p * F * T;
+        float       * dp  = dd + p * F * T;
+        for (int64_t i = 0; i < F * T; ++i) {
+            const float xv = xp[i];
+            const float r  = xv > 0.0f ? xv : 0.0f;
+            const float n  = xv - r;
+            const float pr = r + sl * n;
+            const float a  = xv * awc[i % F] + abc[i % F];
+            dp[i] = a + pr;
+        }
+    }
+}
+
 static void ggml_compute_forward_roll_f32(
         const ggml_compute_params * params,
         ggml_tensor * dst) {
