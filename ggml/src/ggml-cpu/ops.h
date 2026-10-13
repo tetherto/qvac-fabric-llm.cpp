@@ -90,6 +90,7 @@ void ggml_compute_forward_norm_channel(const struct ggml_compute_params * params
 void ggml_compute_forward_scale_residual(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_bias_gelu(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_pad_replicate_1d(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+void ggml_compute_forward_gru(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_roll(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_arange(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_timestep_embedding(const struct ggml_compute_params * params, struct ggml_tensor * dst);

@@ -9637,6 +9637,59 @@ static int64_t ggml_wrap_index(int64_t i, int64_t ne) {
     return i;
 }
 
+// Fused batched GRU reference (CPU).  Parallel over batch b; serial over the L time-steps.
+//   whh [H,3H], gi_all [3H,B,L] (precomputed Wih*x+bih), bhh [3H] -> dst [H,B,L].
+void ggml_compute_forward_gru(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+
+    const ggml_tensor * whh    = dst->src[0];  // [H, 3H]
+    const ggml_tensor * gi_all = dst->src[1];  // [3H, B, L]
+    const ggml_tensor * bhh    = dst->src[2];  // [3H]
+
+    GGML_ASSERT(dst->type == GGML_TYPE_F32 && whh->type == GGML_TYPE_F32 &&
+                gi_all->type == GGML_TYPE_F32 && bhh->type == GGML_TYPE_F32);
+
+    const int64_t H  = whh->ne[0];
+    const int64_t H3 = gi_all->ne[0];   // 3H
+    const int64_t B  = gi_all->ne[1];
+    const int64_t L  = gi_all->ne[2];
+    const bool reverse = ggml_get_op_params_i32(dst, 0) != 0;
+
+    const float * whh_d = (const float *) whh->data;    // whh[k + H*g]  (column g = whh_d + H*g)
+    const float * gi_d  = (const float *) gi_all->data; // gi[g + H3*b + H3*B*t]
+    const float * bhh_d = (const float *) bhh->data;    // bhh[g]
+    float *       dst_d = (float *)       dst->data;    // dst[j + H*b + H*B*t]
+
+    std::vector<float> h((size_t) H), gh((size_t) H3);
+
+    const int64_t per = (B + params->nth - 1) / params->nth;
+    const int64_t b0  = (int64_t) params->ith * per;
+    const int64_t b1  = std::min(b0 + per, B);
+
+    for (int64_t b = b0; b < b1; ++b) {
+        for (int64_t j = 0; j < H; ++j) h[j] = 0.0f;   // zero initial state
+        for (int64_t s = 0; s < L; ++s) {
+            const int64_t t  = reverse ? (L - 1 - s) : s;
+            const float * gi = gi_d + (H3 * b + H3 * B * t);
+            for (int64_t g = 0; g < H3; ++g) {          // gh = whh*h + bhh
+                const float * wcol = whh_d + H * g;
+                float acc = 0.0f;
+                for (int64_t k = 0; k < H; ++k) acc += wcol[k] * h[k];
+                gh[g] = acc + bhh_d[g];
+            }
+            float * out = dst_d + (H * b + H * B * t);
+            for (int64_t j = 0; j < H; ++j) {
+                const float r  = 1.0f / (1.0f + expf(-(gi[j]          + gh[j])));
+                const float z  = 1.0f / (1.0f + expf(-(gi[H + j]      + gh[H + j])));
+                const float nc = tanhf(gi[2 * H + j] + r * gh[2 * H + j]);
+                const float hn = nc + z * (h[j] - nc);   // h_new = nc + z*(h - nc)
+                h[j]   = hn;
+                out[j] = hn;
+            }
+        }
+    }
+}
 static void ggml_compute_forward_roll_f32(
         const ggml_compute_params * params,
         ggml_tensor * dst) {

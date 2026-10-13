@@ -639,6 +639,10 @@ extern "C" {
         GGML_OP_SCALE_RESIDUAL,
         GGML_OP_BIAS_GELU,
         GGML_OP_PAD_REPLICATE_1D,
+
+        // Fused batched GRU (LavaSR denoiser): the whole recurrent sweep over
+        // the L time-steps as one op, parallel over the batch.
+        GGML_OP_GRU,
         GGML_OP_COUNT,
     };
 
@@ -2672,6 +2676,15 @@ extern "C" {
             struct ggml_tensor  * x,
             int                   pad_left,
             int                   pad_right);
+
+    // Fused batched GRU, PyTorch semantics (gate order r,z,n; reset on hh new-gate; h0=0).
+    // whh [H,3H]; gi_all [3H,B,L] = precomputed Wih*x+bih; bhh [3H] -> [H,B,L]; reverse flips t.
+    GGML_API struct ggml_tensor * ggml_gru(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * whh,
+            struct ggml_tensor  * gi_all,
+            struct ggml_tensor  * bhh,
+            bool                  reverse);
     // Move tensor elements by an offset given for each dimension. Elements that
     // are shifted beyond the last position are wrapped around to the beginning.
     GGML_API struct ggml_tensor * ggml_roll(

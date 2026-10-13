@@ -1215,9 +1215,11 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "SCALE_RESIDUAL",
     "BIAS_GELU",
     "PAD_REPLICATE_1D",
+
+    "GRU",
 };
 
-static_assert(GGML_OP_COUNT == 119, "GGML_OP_COUNT != 119");
+static_assert(GGML_OP_COUNT == 120, "GGML_OP_COUNT != 120");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1349,9 +1351,11 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "scale_residual(x,b,gamma,res)",
     "bias_gelu(x,b)",
     "pad_replicate_1d(x,pad_l,pad_r)",
+
+    "gru(whh,gi,bhh)",
 };
 
-static_assert(GGML_OP_COUNT == 119, "GGML_OP_COUNT != 119");
+static_assert(GGML_OP_COUNT == 120, "GGML_OP_COUNT != 120");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -5977,6 +5981,36 @@ struct ggml_tensor * ggml_pad_replicate_1d_ct(
         int                   pad_left,
         int                   pad_right) {
     return ggml_pad_replicate_1d_impl(ctx, x, pad_left, pad_right, /*layout=*/1);
+}
+
+// ggml_gru
+
+struct ggml_tensor * ggml_gru(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * whh,     // [H, 3H]
+        struct ggml_tensor  * gi_all,  // [3H, B, L]
+        struct ggml_tensor  * bhh,     // [3H]
+        bool                  reverse) {
+    GGML_ASSERT(whh->type == GGML_TYPE_F32 && gi_all->type == GGML_TYPE_F32 && bhh->type == GGML_TYPE_F32);
+    GGML_ASSERT(whh->ne[0] * 3 == gi_all->ne[0]);   // whh ne0 = H, gi_all ne0 = 3H
+    GGML_ASSERT(whh->ne[1] == gi_all->ne[0]);        // whh ne1 = 3H
+    GGML_ASSERT(bhh->ne[0] == gi_all->ne[0]);        // bhh = 3H
+    GGML_ASSERT(ggml_is_contiguous(whh) && ggml_is_contiguous(gi_all) && ggml_is_contiguous(bhh));
+
+    const int64_t H = whh->ne[0];
+    const int64_t B = gi_all->ne[1];
+    const int64_t L = gi_all->ne[2];
+
+    struct ggml_tensor * result = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, H, B, L);
+
+    ggml_set_op_params_i32(result, 0, reverse ? 1 : 0);
+
+    result->op     = GGML_OP_GRU;
+    result->src[0] = whh;
+    result->src[1] = gi_all;
+    result->src[2] = bhh;
+
+    return result;
 }
 // ggml_roll
 

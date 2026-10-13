@@ -5630,6 +5630,45 @@ struct test_conv_1d_dw_direct_norm_channel : public test_case {
         return out;
     }
 };
+
+// GGML_OP_GRU
+struct test_gru : public test_case {
+    const int64_t h;   // hidden size (GPU backends cap at 128)
+    const int64_t b;   // batch
+    const int64_t l;   // sequence length
+    const bool reverse;
+    const float gi_range;  // input-transform magnitude (large values exercise gate saturation)
+
+    std::string vars() override {
+        return VARS_TO_STR5(h, b, l, reverse, gi_range);
+    }
+
+    test_gru(int64_t h = 64, int64_t b = 2, int64_t l = 9, bool reverse = false, float gi_range = 1.0f)
+        : h(h), b(b), l(l), reverse(reverse), gi_range(gi_range) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * whh = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, h, 3 * h);
+        ggml_tensor * gi  = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 3 * h, b, l);
+        ggml_tensor * bhh = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 3 * h);
+        ggml_tensor * out = ggml_gru(ctx, whh, gi, bhh, reverse);
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        // Scale recurrent weights like trained weights (spectral radius < 1): plain U(-1,1) whh
+        // makes the recurrence chaotic, so per-backend fp ULP diffs amplify over l and fail any bound.
+        const float ws = 1.0f / sqrtf((float) h);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->ne[0] == h && t->ne[1] == 3 * h) {
+                init_tensor_uniform(t, -ws, ws);   // whh
+            } else if (t->ne[2] == l && t->ne[0] == 3 * h) {
+                init_tensor_uniform(t, -gi_range, gi_range);   // gi
+            } else {
+                init_tensor_uniform(t, -1.0f, 1.0f);
+            }
+        }
+    }
+};
 // GGML_OP_SSM_SCAN
 struct test_ssm_scan : public test_case {
     const ggml_type type;
@@ -14311,6 +14350,23 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    test_cases.emplace_back(new test_gru(64, 1, 17, false));
+    test_cases.emplace_back(new test_gru(64, 1, 17, true));
+    test_cases.emplace_back(new test_gru(128, 2, 33, false));    // H at the GPU shared-mem cap
+    test_cases.emplace_back(new test_gru(96, 2, 9, true));       // H not a multiple of the warp size
+    test_cases.emplace_back(new test_gru(96, 2, 33, true));      // long L with H > typical warp size
+    test_cases.emplace_back(new test_gru(4, 1953, 33, true));    // LavaSR denoiser DPGRNN shape (tiny H, huge B)
+    test_cases.emplace_back(new test_gru(2, 31, 63, false));     // LavaSR cTFA shape
+    test_cases.emplace_back(new test_gru(64, 1, 17, false, 60.0f));  // saturated gates (large gi: tanh/exp range)
+    test_cases.emplace_back(new test_gru(4, 33, 9, false));          // batch tail: B % PB(32) = 1
+    test_cases.emplace_back(new test_gru(8, 17, 5, true));           // PB=16, tail 1, reverse
+    test_cases.emplace_back(new test_gru(3, 100, 7, false));         // ragged lanes (128 % 3 = 2 idle) + tail
+    test_cases.emplace_back(new test_gru(48, 5, 9, true));           // PB=2, slot spans the wave64 boundary
+    test_cases.emplace_back(new test_gru(2, 300, 11, true));         // small-H variant, multi-WG + tail
+
+    test_cases.emplace_back(new test_gru(64, 1, 17, false, 90.0f));  // past fp32 exp-overflow threshold (~88.7)
+    test_cases.emplace_back(new test_gru(64, 1, 17, false, 150.0f)); // LavaSR-observed activation range
+    test_cases.emplace_back(new test_gru(64, 1, 17, false, 300.0f)); // extreme saturation
     // fused ssm_conv + (optional) bias_add + silu. The bias-only graph (no silu) is intentionally
     // not tested since there's no fusion for that pattern in ggml_cuda_can_fuse.
     for (int64_t d_conv : {3, 4, 7, 9}) {
