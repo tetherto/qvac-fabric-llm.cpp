@@ -82,8 +82,12 @@ The glue runs on its own CPU backend with its own pool: `GGML_XDNA_GLUE_THREADS`
 The AIE designs are Python (IRON / mlir-aie) under `kernels/`; the device C++
 they compile in is `kernels/*.cc`, one file per kernel. They are compiled out of
 line at build time into `<stem>.xclbin` next to their `.insts.bin`, in the build
-output directory. The backend looks for artifacts in the backend install dir,
-the executable dir and the working directory.
+output directory. The backend looks for artifacts, in order, in
+`GGML_XDNA_KERNEL_DIR` when it is set, the directory of the module the backend
+is in (the backend library in a `GGML_BACKEND_DL` build, the binary it is
+linked into otherwise), the backend install dir, the executable dir and the
+working directory. A package that loads the backend with
+`ggml_backend_load_all_from_path()` ships the artifacts next to the library.
 
 `fused_layer` and `gemv_n32_r4_c8` are loaded under a **design-tagged** name.
 `kernels/design_tag.py` hashes the design sources and the build knobs. Configure
@@ -235,8 +239,9 @@ OMP_WAIT_POLICY=PASSIVE ./build/bin/llama-server -m model.gguf \
 
 ### Environment
 
-The knobs below are for bisecting a regression rather than tuning: each one
-disables the NPU path it names, and the default is the fast one.
+Most of the knobs below are for bisecting a regression rather than tuning: each
+one disables the NPU path it names, and the default is the fast one.
+`GGML_XDNA_KERNEL_DIR` is for packagers: it points the backend at its artifacts.
 
 | variable | default | effect |
 | :-- | :-- | :-- |
@@ -255,6 +260,7 @@ disables the NPU path it names, and the default is the fast one.
 | `GGML_XDNA_GDN` | 0 | `1` runs the older GDN prefill body on the array |
 | `GGML_XDNA_FA` | 0 | `1` runs the older flash-attention prefill on the array |
 | `GGML_XDNA_SPIN_US` | 0 | poll this many microseconds for completion before blocking; `-1` polls until it completes |
+| `GGML_XDNA_KERNEL_DIR` | unset | a directory to look for the kernel artifacts in before the others |
 
 The remaining `GGML_XDNA_*` variables (`HEAD`, `QUEUE`, `INPROJ`, `ATTN`,
 `ATTN_LAYER`, `ATTN_TAIL`, `HOST_BO`, `PGEMM_*`, `ARENA_MB`, `BATCH`, `TOKEN`,

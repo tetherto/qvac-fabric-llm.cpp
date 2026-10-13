@@ -8,6 +8,13 @@
 #include <xrt/experimental/xrt_xclbin.h>
 #include <xrt/xrt_kernel.h>
 
+#ifdef _WIN32
+#    define WIN32_LEAN_AND_MEAN
+#    include <windows.h>
+#else
+#    include <dlfcn.h>
+#endif
+
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -81,8 +88,42 @@ xdna_device * xdna_device_open(void) {
 
 // --- kernel ----------------------------------------------------------------
 
+// The directory of the module this code is linked into: the backend library in
+// a GGML_BACKEND_DL build, the binary it is part of otherwise. A packaged build
+// ships the artifacts there, and loads the backend with
+// ggml_backend_load_all_from_path() from a host binary somewhere else.
+static fs::path xdna_module_dir(void) {
+#ifdef _WIN32
+    HMODULE mod = nullptr;
+    if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           (LPCWSTR) (void *) &xdna_module_dir, &mod)) {
+        wchar_t     buf[MAX_PATH];
+        const DWORD n = GetModuleFileNameW(mod, buf, MAX_PATH);
+        if (n > 0 && n < MAX_PATH) {
+            return fs::path(buf).parent_path();
+        }
+    }
+#else
+    Dl_info info;
+    if (dladdr((void *) &xdna_module_dir, &info) && info.dli_fname && *info.dli_fname) {
+        std::error_code ec;
+        const fs::path  p = fs::canonical(info.dli_fname, ec);
+        return (ec ? fs::path(info.dli_fname) : p).parent_path();
+    }
+#endif
+    return {};
+}
+
 std::vector<fs::path> xdna_kernel_search_dirs(void) {
     std::vector<fs::path> dirs;
+    // a packager's own layout
+    if (const char * e = getenv("GGML_XDNA_KERNEL_DIR"); e && *e) {
+        dirs.emplace_back(e);
+    }
+    const fs::path mod = xdna_module_dir();
+    if (!mod.empty()) {
+        dirs.push_back(mod);
+    }
 #ifdef GGML_BACKEND_DIR
     dirs.emplace_back(GGML_BACKEND_DIR);
 #endif
