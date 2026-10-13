@@ -655,6 +655,10 @@ extern "C" {
         // Fused affine + per-channel PReLU (LavaSR denoiser):
         // out = x*aw + ab + max(x,0) + slope*min(x,0).
         GGML_OP_AFFINE_PRELU,
+
+        // Snake activation y = x + sin^2(a*x) * inv_b, per-channel a / inv_b
+        // (ACE-Step Oobleck VAE).
+        GGML_OP_SNAKE,
         GGML_OP_COUNT,
     };
 
@@ -2720,6 +2724,14 @@ extern "C" {
             struct ggml_tensor  * aw,
             struct ggml_tensor  * ab,
             struct ggml_tensor  * slope);
+
+    // snake activation: y = x + sin^2(a*x) * inv_b, per-channel a / inv_b
+    // (ACE-Step Oobleck VAE).  x: [T, C]; a, inv_b: one per channel.
+    GGML_API struct ggml_tensor * ggml_snake(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,      // [T, C]
+            struct ggml_tensor  * a,      // per-channel scale inside sin(), F32
+            struct ggml_tensor  * inv_b); // per-channel output scale, F32
     // Move tensor elements by an offset given for each dimension. Elements that
     // are shifted beyond the last position are wrapped around to the beginning.
     GGML_API struct ggml_tensor * ggml_roll(

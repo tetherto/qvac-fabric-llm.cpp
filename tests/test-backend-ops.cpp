@@ -5740,6 +5740,26 @@ struct test_affine_prelu : public test_case {
         return ggml_affine_prelu(ctx, x, aw, ab, slope);
     }
 };
+
+// GGML_OP_SNAKE
+struct test_snake : public test_case {
+    const int64_t t;  // time (ne0)
+    const int64_t c;  // channels (ne1)
+
+    std::string vars() override {
+        return VARS_TO_STR2(t, c);
+    }
+
+    test_snake(int64_t t = 32, int64_t c = 8) : t(t), c(c) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x     = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, t, c);
+        ggml_tensor * a     = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1, c);
+        ggml_tensor * inv_b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1, c);
+        ggml_set_name(x, "x");
+        return ggml_snake(ctx, x, a, inv_b);
+    }
+};
 // GGML_OP_SSM_SCAN
 struct test_ssm_scan : public test_case {
     const ggml_type type;
@@ -14450,6 +14470,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     test_cases.emplace_back(new test_affine_prelu(16, 10, 6, 2));
     test_cases.emplace_back(new test_affine_prelu(129, 63, 16, 3));
+
+    test_cases.emplace_back(new test_snake(32, 8));
+    test_cases.emplace_back(new test_snake(127, 3));
     // fused ssm_conv + (optional) bias_add + silu. The bias-only graph (no silu) is intentionally
     // not tested since there's no fusion for that pattern in ggml_cuda_can_fuse.
     for (int64_t d_conv : {3, 4, 7, 9}) {

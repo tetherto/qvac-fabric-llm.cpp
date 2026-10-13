@@ -9626,6 +9626,51 @@ void ggml_compute_forward_pad_replicate_1d(
         }
     }
 }
+
+// ggml_compute_forward_snake
+//
+// Snake activation y = x + sin^2(a*x) * inv_b, with per-channel a and inv_b.
+// x / dst are [T, C] (T = ne0, contiguous); a and inv_b hold one F32 value per
+// channel.  Parallelized over channels (threads own disjoint [c*T, (c+1)*T)
+// bands).  ACE-Step Oobleck VAE.  CPU bring-up: F32 only.
+void ggml_compute_forward_snake(
+        const ggml_compute_params * params,
+              ggml_tensor * dst) {
+
+    const ggml_tensor * x     = dst->src[0];
+    const ggml_tensor * a     = dst->src[1];
+    const ggml_tensor * inv_b = dst->src[2];
+
+    GGML_ASSERT(x->type == GGML_TYPE_F32);
+    GGML_ASSERT(dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(a->type == GGML_TYPE_F32 && inv_b->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(x));
+    GGML_ASSERT(ggml_is_contiguous(dst));
+
+    const int64_t T = x->ne[0];
+    const int64_t C = x->ne[1];
+
+    const float * xd = (const float *) x->data;
+    const float * ad = (const float *) a->data;
+    const float * bd = (const float *) inv_b->data;
+          float * yd = (float *)       dst->data;
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    // Split over channels: each thread owns disjoint time bands.
+    for (int64_t c = ith; c < C; c += nth) {
+        const float ac = ad[c];
+        const float bc = bd[c];
+        const float * xc = xd + c * T;
+              float * yc = yd + c * T;
+        for (int64_t t = 0; t < T; t++) {
+            const float xi = xc[t];
+            const float si = sinf(ac * xi);
+            yc[t] = xi + si * si * bc;
+        }
+    }
+}
 // ggml_compute_forward_roll
 
 static int64_t ggml_wrap_index(int64_t i, int64_t ne) {
