@@ -11,7 +11,6 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
-#include <climits>
 #include <cstddef>
 #include <cstdlib>
 #include <cstring>
@@ -1029,11 +1028,7 @@ void xdna_batch_begin(int k) {
     }
     // The token's first run starts on its own: the array has work while the
     // host prepares the first list, instead of waiting for all of it.
-    static const int lead = [] {
-        const char * e = getenv("GGML_XDNA_BATCH_LEAD");
-        return e ? (int) std::clamp(strtol(e, nullptr, 10), (long) INT_MIN, (long) INT_MAX) : 1;
-    }();
-    g_batch.lead = lead;
+    g_batch.lead = 1;
 }
 
 bool xdna_batch_active(void) {
