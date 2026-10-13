@@ -1406,9 +1406,10 @@ static const char * GGML_GLU_OP_NAME[GGML_GLU_OP_COUNT] = {
     "GEGLU_ERF",
     "GEGLU_QUICK",
     "SWIGLU_CLAMP",
+    "SIGLU",
 };
 
-static_assert(GGML_GLU_OP_COUNT == 7, "GGML_GLU_OP_COUNT != 7");
+static_assert(GGML_GLU_OP_COUNT == 8, "GGML_GLU_OP_COUNT != 8");
 
 static_assert(sizeof(struct ggml_object)%GGML_MEM_ALIGN == 0, "ggml_object size must be a multiple of GGML_MEM_ALIGN");
 static_assert(sizeof(struct ggml_tensor)%GGML_MEM_ALIGN == 0, "ggml_tensor size must be a multiple of GGML_MEM_ALIGN");
@@ -3333,6 +3334,27 @@ struct ggml_tensor * ggml_geglu_quick_split(
         struct ggml_tensor  * a,
         struct ggml_tensor  * b) {
     return ggml_glu_impl(ctx, a, b, GGML_GLU_OP_GEGLU_QUICK, false);
+}
+
+// ggml_siglu
+
+struct ggml_tensor * ggml_siglu(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a) {
+    return ggml_glu_impl(ctx, a, NULL, GGML_GLU_OP_SIGLU, false);
+}
+
+struct ggml_tensor * ggml_siglu_swapped(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a) {
+    return ggml_glu_impl(ctx, a, NULL, GGML_GLU_OP_SIGLU, true);
+}
+
+struct ggml_tensor * ggml_siglu_split(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * b) {
+    return ggml_glu_impl(ctx, a, b, GGML_GLU_OP_SIGLU, false);
 }
 
 struct ggml_tensor * ggml_swiglu_oai(

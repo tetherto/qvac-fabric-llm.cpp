@@ -730,6 +730,7 @@ extern "C" {
         GGML_GLU_OP_GEGLU_ERF,
         GGML_GLU_OP_GEGLU_QUICK,
         GGML_GLU_OP_SWIGLU_CLAMP,
+        GGML_GLU_OP_SIGLU,
 
         GGML_GLU_OP_COUNT,
     };
@@ -1462,6 +1463,15 @@ extern "C" {
             struct ggml_context * ctx,
             struct ggml_tensor  * a);
 
+    // unlike the other gated ops, the sigmoid is applied to the gate: out = a*sigmoid(b)
+    GGML_API struct ggml_tensor * ggml_siglu(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a);
+
+    GGML_API struct ggml_tensor * ggml_siglu_swapped(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a);
+
     // A: n columns, r rows,
     // B: n columns, r rows,
     GGML_API struct ggml_tensor * ggml_glu_split(
@@ -1491,6 +1501,11 @@ extern "C" {
             struct ggml_tensor  * b);
 
     GGML_API struct ggml_tensor * ggml_geglu_quick_split(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * b);
+
+    GGML_API struct ggml_tensor * ggml_siglu_split(
             struct ggml_context * ctx,
             struct ggml_tensor  * a,
             struct ggml_tensor  * b);

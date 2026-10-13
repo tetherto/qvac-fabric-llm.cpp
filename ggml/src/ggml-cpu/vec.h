@@ -1776,6 +1776,28 @@ inline static void ggml_vec_geglu_quick_bf16(const int n, ggml_bf16_t * y, const
     }
 }
 
+inline static void ggml_vec_siglu_f32(const int n, float * y, const float * x, const float * g) {
+    for (int i = 0; i < n; ++i) {
+        y[i] = x[i] * (1.0f / (1.0f + expf(-g[i])));
+    }
+}
+
+inline static void ggml_vec_siglu_f16(const int n, ggml_fp16_t * y, const ggml_fp16_t * x, const ggml_fp16_t * g) {
+    for (int i = 0; i < n; ++i) {
+        float xi = GGML_CPU_FP16_TO_FP32(x[i]);
+        float gi = GGML_CPU_FP16_TO_FP32(g[i]);
+        y[i] = GGML_CPU_FP32_TO_FP16(xi * (1.0f / (1.0f + expf(-gi))));
+    }
+}
+
+inline static void ggml_vec_siglu_bf16(const int n, ggml_bf16_t * y, const ggml_bf16_t * x, const ggml_bf16_t * g) {
+    for (int i = 0; i < n; ++i) {
+        float xi = GGML_BF16_TO_FP32(x[i]);
+        float gi = GGML_BF16_TO_FP32(g[i]);
+        y[i] = GGML_FP32_TO_BF16(xi * (1.0f / (1.0f + expf(-gi))));
+    }
+}
+
 inline static void ggml_vec_sum_f32(const int n, float * s, const float * x) {
 #ifndef GGML_USE_ACCELERATE
     ggml_float sum = 0.0;
