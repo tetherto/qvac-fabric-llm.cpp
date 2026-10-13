@@ -1209,9 +1209,11 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "OPT_STEP_SGD",
 
     "GLU",
+
+    "CONV_1D_DW_DIRECT",
 };
 
-static_assert(GGML_OP_COUNT == 114, "GGML_OP_COUNT != 114");
+static_assert(GGML_OP_COUNT == 115, "GGML_OP_COUNT != 115");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1337,9 +1339,11 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "sgd(x)",
 
     "glu(x)",
+
+    "conv_1d_dw_direct(x,w,b)",
 };
 
-static_assert(GGML_OP_COUNT == 114, "GGML_OP_COUNT != 114");
+static_assert(GGML_OP_COUNT == 115, "GGML_OP_COUNT != 115");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -5637,6 +5641,97 @@ struct ggml_tensor * ggml_pad_reflect_1d(
     return result;
 }
 
+// ggml_conv_1d_dw_direct
+
+// Internal helper: depthwise_1d with explicit layout + causal flags.
+// layout = 0 → [T, C] (T inner) ; layout = 1 → [C, T] (C inner).
+// causal = 0 → symmetric edge-clamp (vector_estimator);
+// causal = 1 → causal-left padding (vocoder).
+static struct ggml_tensor * ggml_conv_1d_dw_direct_impl(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * w,
+        struct ggml_tensor  * bias,
+        int                   dilation,
+        int                   layout,
+        int                   causal,
+        int                   seg_len) {
+    GGML_ASSERT(a->type == GGML_TYPE_F32);
+    GGML_ASSERT(w->type == GGML_TYPE_F32);
+    GGML_ASSERT(bias == NULL || bias->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(a));
+    GGML_ASSERT(ggml_is_contiguous(w));
+    GGML_ASSERT(bias == NULL || ggml_is_contiguous(bias));
+    GGML_ASSERT(dilation >= 1);
+    GGML_ASSERT(a->ne[2] >= 1 && a->ne[3] == 1);
+
+    // a: [L, C, B, 1] (layout=0) or [C, L, B, 1] (layout=1).
+    // w in conv kernel layout [K, 1, C, 1] (ggml_im2col-consumable),
+    // K in {3, 5, 7} (3/5 for vector_estimator symmetric, 7 for vocoder causal).
+    // bias: [C].
+    const int K = (int) w->ne[0];
+    GGML_ASSERT(K == 3 || K == 5 || K == 7);
+    GGML_ASSERT(w->ne[1] == 1);
+    const int64_t C_dim = (layout == 0) ? a->ne[1] : a->ne[0];
+    const int64_t L_dim = (layout == 0) ? a->ne[0] : a->ne[1];
+    GGML_ASSERT(w->ne[2] == C_dim);
+    GGML_ASSERT(bias == NULL || bias->ne[0] == C_dim);
+    GGML_ASSERT(seg_len >= 0 && (seg_len == 0 || L_dim % seg_len == 0));
+
+    struct ggml_tensor * result = ggml_new_tensor_4d(ctx, a->type,
+            a->ne[0], a->ne[1], a->ne[2], a->ne[3]);
+
+    int32_t params[5] = { K, dilation, layout, causal, seg_len };
+    ggml_set_op_params(result, params, sizeof(params));
+
+    result->op     = GGML_OP_CONV_1D_DW_DIRECT;
+    result->src[0] = a;
+    result->src[1] = w;
+    result->src[2] = bias;
+
+    return result;
+}
+
+struct ggml_tensor * ggml_conv_1d_dw_direct(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * w,
+        struct ggml_tensor  * bias,
+        int                   dilation) {
+    return ggml_conv_1d_dw_direct_impl(ctx, a, w, bias, dilation,
+                                             /*layout=*/0, /*causal=*/0, /*seg_len=*/0);
+}
+
+struct ggml_tensor * ggml_conv_1d_dw_direct_ct(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * w,
+        struct ggml_tensor  * bias,
+        int                   dilation) {
+    return ggml_conv_1d_dw_direct_impl(ctx, a, w, bias, dilation,
+                                             /*layout=*/1, /*causal=*/0, /*seg_len=*/0);
+}
+
+struct ggml_tensor * ggml_conv_1d_dw_direct_causal_ct(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * w,
+        struct ggml_tensor  * bias,
+        int                   dilation) {
+    return ggml_conv_1d_dw_direct_impl(ctx, a, w, bias, dilation,
+                                             /*layout=*/1, /*causal=*/1, /*seg_len=*/0);
+}
+
+struct ggml_tensor * ggml_conv_1d_dw_direct_ct_segmented(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * w,
+        struct ggml_tensor  * bias,
+        int                   dilation,
+        int                   seg_len) {
+    return ggml_conv_1d_dw_direct_impl(ctx, a, w, bias, dilation,
+                                             /*layout=*/1, /*causal=*/0, seg_len);
+}
 // ggml_roll
 
 struct ggml_tensor * ggml_roll(

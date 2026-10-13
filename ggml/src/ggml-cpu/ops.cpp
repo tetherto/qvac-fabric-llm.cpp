@@ -9199,6 +9199,125 @@ void ggml_compute_forward_pad_reflect_1d(
     }
 }
 
+// ggml_compute_forward_conv_1d_dw_direct
+
+struct conv_1d_dw_direct_params {
+    int K;
+    int dilation;
+    int k_off;
+    int seg_len;
+    int ith;
+    int nth;
+};
+
+// Clamp a tap to its segment so padding repeats the edge sample.
+static inline int conv_1d_dw_direct_tap(int t, int k, const conv_1d_dw_direct_params * p,
+                                    int lo, int hi) {
+    const int s = t + (k + p->k_off) * p->dilation;
+    if (s < lo) return lo;
+    if (s >= hi) return hi - 1;
+    return s;
+}
+
+static inline void conv_1d_dw_direct_segment(int t, int seg_len, int L,
+                                         int * lo, int * hi) {
+    *lo = seg_len > 0 ? (t / seg_len) * seg_len : 0;
+    *hi = seg_len > 0 ? *lo + seg_len : L;
+}
+
+static void conv_1d_dw_direct_fill_bias(float * y, const float * b, int C) {
+    if (b) {
+        for (int c = 0; c < C; ++c) y[c] = b[c];
+    } else {
+        for (int c = 0; c < C; ++c) y[c] = 0.0f;
+    }
+}
+
+// [T, C]: each channel owns a contiguous run of timesteps, so stripe over
+// channels and keep the tap loop innermost.
+static void conv_1d_dw_direct_tc(
+        const float * x, const float * w, const float * b, float * y,
+        int L, int C, const conv_1d_dw_direct_params * p) {
+    for (int c = p->ith; c < C; c += p->nth) {
+        const float bias_v = b ? b[c] : 0.0f;
+        const float * w_c = w + (size_t) c * p->K;
+        const float * xc = x + (size_t) c * L;
+        float       * yc = y + (size_t) c * L;
+        for (int t = 0; t < L; ++t) {
+            int lo, hi;
+            conv_1d_dw_direct_segment(t, p->seg_len, L, &lo, &hi);
+            float sum = bias_v;
+            for (int k = 0; k < p->K; ++k) {
+                sum += xc[conv_1d_dw_direct_tap(t, k, p, lo, hi)] * w_c[k];
+            }
+            yc[t] = sum;
+        }
+    }
+}
+
+// [C, T]: each timestep is a contiguous row of channels. Stripe over timesteps
+// and hoist the tap loop outside the channel loop, so every tap reads one
+// contiguous row instead of C-strided singles. Taps still accumulate in
+// ascending k, which keeps the result bit-identical to the [T, C] order.
+static void conv_1d_dw_direct_ct(
+        const float * x, const float * w, const float * b, float * y,
+        int L, int C, const conv_1d_dw_direct_params * p) {
+    for (int t = p->ith; t < L; t += p->nth) {
+        int lo, hi;
+        conv_1d_dw_direct_segment(t, p->seg_len, L, &lo, &hi);
+        float * yt = y + (size_t) t * C;
+        conv_1d_dw_direct_fill_bias(yt, b, C);
+        for (int k = 0; k < p->K; ++k) {
+            const float * xs = x + (size_t) conv_1d_dw_direct_tap(t, k, p, lo, hi) * C;
+            for (int c = 0; c < C; ++c) {
+                yt[c] += xs[c] * w[(size_t) c * p->K + k];
+            }
+        }
+    }
+}
+
+void ggml_compute_forward_conv_1d_dw_direct(
+        const ggml_compute_params * params,
+              ggml_tensor * dst) {
+
+    const ggml_tensor * x    = dst->src[0]; // [L, C, B, 1] or [C, L, B, 1]
+    const ggml_tensor * w    = dst->src[1]; // [K, 1, C, 1]
+    const ggml_tensor * bias = dst->src[2]; // [C] or NULL
+
+    GGML_ASSERT(x->type == GGML_TYPE_F32);
+    GGML_ASSERT(w->type == GGML_TYPE_F32);
+    GGML_ASSERT(bias == NULL || bias->type == GGML_TYPE_F32);
+    GGML_ASSERT(dst->type == GGML_TYPE_F32);
+
+    const int32_t * opts = (const int32_t *) dst->op_params;
+    const int K        = opts[0];
+    const int dilation = opts[1];
+    const int32_t layout = opts[2];
+    const int32_t causal = opts[3];
+    const int32_t seg_len = opts[4];
+    const int k_off = (causal != 0) ? -(K - 1) : -(K / 2);
+
+    const float * x_data = (const float *) x->data;
+    const float * w_data = (const float *) w->data;
+    const float * b_data = bias ? (const float *) bias->data : NULL;
+          float * y_data = (float *) dst->data;
+
+    const conv_1d_dw_direct_params dw = {
+        K, dilation, k_off, seg_len, params->ith, params->nth
+    };
+
+    const size_t batch_stride = (size_t) x->ne[0] * x->ne[1];
+    for (int64_t ib = 0; ib < x->ne[2]; ++ib) {
+        const size_t batch_offset = (size_t) ib * batch_stride;
+        if (layout == 0) {
+            conv_1d_dw_direct_tc(x_data + batch_offset, w_data, b_data, y_data + batch_offset,
+                (int) x->ne[0], (int) x->ne[1], &dw);
+        } else {
+            conv_1d_dw_direct_ct(x_data + batch_offset, w_data, b_data, y_data + batch_offset,
+                (int) x->ne[1], (int) x->ne[0], &dw);
+        }
+    }
+}
 // ggml_compute_forward_roll
 
 static int64_t ggml_wrap_index(int64_t i, int64_t ne) {

@@ -632,6 +632,9 @@ extern "C" {
 
         GGML_OP_GLU,
 
+        // Fused ops for ConvNeXt-style convolutional blocks: each collapses a
+        // multi-op sub-graph into one dispatch.
+        GGML_OP_CONV_1D_DW_DIRECT,
         GGML_OP_COUNT,
     };
 
@@ -2509,6 +2512,53 @@ extern "C" {
             int                   p0,
             int                   p1);
 
+    // Fused depthwise 1D convolution with edge-clamp (replicate)
+    // padding and bias add. Per-channel filter of width K applied independently
+    // to every batch in a (ne0 = L, ne1 = C, ne2 = B, ne3 = 1) tensor.
+    //   y[t, c, batch] = bias[c]
+    //                  + sum_{k=0..K-1} a[clamp(t + (k - K/2)*dilation, 0, L-1), c, batch]
+    //                                 * w[k, c]
+    //
+    // a:    [L, C, B, 1]  f32 contiguous
+    // w:    [K, 1, C, 1]  f32 contiguous (a depthwise conv weight)
+    // bias: [C]           f32 contiguous, or NULL to skip the bias add
+    // dilation: positive integer
+    //
+    // Output matches a's shape. Currently supports K in {3, 5, 7}.
+    GGML_API struct ggml_tensor * ggml_conv_1d_dw_direct(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * w,
+            struct ggml_tensor  * bias,
+            int                   dilation);
+
+    // [C, T]-layout variant: a is [C, L, B, 1] with C inner-most. Same kernel,
+    // strides flipped via a layout flag in op_params.
+    GGML_API struct ggml_tensor * ggml_conv_1d_dw_direct_ct(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * w,
+            struct ggml_tensor  * bias,
+            int                   dilation);
+
+    // [C, T]-layout + causal-left padding variant.  Used by the vocoder
+    // ConvNeXt chain.  K may be 3, 5, or 7.
+    GGML_API struct ggml_tensor * ggml_conv_1d_dw_direct_causal_ct(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * w,
+            struct ggml_tensor  * bias,
+            int                   dilation);
+
+    // [C, T] variant over independent batches and T / seg_len segments: the
+    // edge clamp never crosses a batch or segment boundary.
+    GGML_API struct ggml_tensor * ggml_conv_1d_dw_direct_ct_segmented(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * w,
+            struct ggml_tensor  * bias,
+            int                   dilation,
+            int                   seg_len);
     // Move tensor elements by an offset given for each dimension. Elements that
     // are shifted beyond the last position are wrapped around to the beginning.
     GGML_API struct ggml_tensor * ggml_roll(

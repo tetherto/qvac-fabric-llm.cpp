@@ -5304,6 +5304,75 @@ struct test_ssm_conv_bias_silu : public test_case {
     }
 };
 
+
+// GGML_OP_CONV_1D_DW_DIRECT
+struct test_conv_1d_dw_direct : public test_case {
+    const int64_t L;
+    const int64_t C;
+    const int64_t B;
+    const int64_t K;
+    const int dilation;
+    const bool ct;      // [C, T] layout instead of [T, C]
+    const bool causal;  // causal-left taps ([C, T] only)
+    const int seg_len;  // clamp inside seg_len windows ([C, T] only)
+
+    std::string vars() override {
+        return VARS_TO_STR8(L, C, B, K, dilation, ct, causal, seg_len);
+    }
+
+    test_conv_1d_dw_direct(int64_t L = 139, int64_t C = 512, int64_t K = 7, int dilation = 3,
+                                 bool ct = true, bool causal = false, int seg_len = 0, int64_t B = 1)
+        : L(L), C(C), B(B), K(K), dilation(dilation), ct(ct), causal(causal), seg_len(seg_len) {}
+
+    enum variant { TIME_INNER, CHANNEL_INNER, CHANNEL_INNER_CAUSAL, CHANNEL_INNER_SEGMENTED };
+
+    variant layout_variant() const {
+        if (seg_len > 0) {
+            return CHANNEL_INNER_SEGMENTED;
+        }
+        if (causal) {
+            return CHANNEL_INNER_CAUSAL;
+        }
+        return ct ? CHANNEL_INNER : TIME_INNER;
+    }
+
+    ggml_tensor * new_input(ggml_context * ctx) {
+        // the [T, C] layout keeps time inner-most (ne0 = L); the ct variants keep the
+        // channel inner-most (ne0 = C), so the two dimensions swap places
+        if (ct) {
+            return ggml_new_tensor_3d(ctx, GGML_TYPE_F32, C, L, B);
+        }
+        return ggml_new_tensor_3d(ctx, GGML_TYPE_F32, L, C, B);
+    }
+
+    ggml_tensor * build_conv(ggml_context * ctx, ggml_tensor * a, ggml_tensor * w, ggml_tensor * b) {
+        switch (layout_variant()) {
+            case CHANNEL_INNER_SEGMENTED:
+                return ggml_conv_1d_dw_direct_ct_segmented(ctx, a, w, b, dilation, seg_len);
+            case CHANNEL_INNER_CAUSAL:
+                return ggml_conv_1d_dw_direct_causal_ct(ctx, a, w, b, dilation);
+            case CHANNEL_INNER:
+                return ggml_conv_1d_dw_direct_ct(ctx, a, w, b, dilation);
+            case TIME_INNER:
+                return ggml_conv_1d_dw_direct(ctx, a, w, b, dilation);
+        }
+        GGML_ABORT("unknown layout variant");
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = new_input(ctx);
+        ggml_set_name(a, "a");
+        ggml_tensor * w = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, K, 1, C);
+        ggml_set_name(w, "w");
+        ggml_tensor * b = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, C);
+        ggml_set_name(b, "b");
+
+        ggml_tensor * out = build_conv(ctx, a, w, b);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+};
 // GGML_OP_SSM_SCAN
 struct test_ssm_scan : public test_case {
     const ggml_type type;
@@ -13798,6 +13867,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    for (int64_t K : { 3, 5, 7 }) {
+        test_cases.emplace_back(new test_conv_1d_dw_direct(139, 512, K, 3, true));
+        test_cases.emplace_back(new test_conv_1d_dw_direct(139, 512, K, 2, false));
+    }
+    test_cases.emplace_back(new test_conv_1d_dw_direct(4096, 512, 7, 1, true, true));
+    test_cases.emplace_back(new test_conv_1d_dw_direct(278, 512, 7, 27, true, false, 139));
+    test_cases.emplace_back(new test_conv_1d_dw_direct(90, 512, 5, 8, true, false, 45));
+    test_cases.emplace_back(new test_conv_1d_dw_direct(37, 96, 5, 2, true, false, 0, 2));
     test_cases.emplace_back(new test_l2_norm_back());
     test_cases.emplace_back(new test_l2_norm_back(GGML_TYPE_F32, { 1025, 5, 4, 3 }));
     test_cases.emplace_back(new test_l2_norm_back(GGML_TYPE_F32, {   64, 5, 4, 3 }, 1e-6f, true));
