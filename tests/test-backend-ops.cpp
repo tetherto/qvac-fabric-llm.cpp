@@ -15388,6 +15388,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         for (ggml_flash_attn_ext_back_target target : {GGML_FLASH_ATTN_EXT_BACK_STATS, GGML_FLASH_ATTN_EXT_BACK_DQ, GGML_FLASH_ATTN_EXT_BACK_DKV}) {
             test_cases.emplace_back(new test_flash_attn_ext_back(64, 4, {2, 1}, 512, 75, true, GGML_TYPE_F16, {0, 2, 1, 3}, target));
             test_cases.emplace_back(new test_flash_attn_ext_back(256, 1, {4, 1}, 256, 32, true, GGML_TYPE_F16, {0, 1, 2, 3}, target));
+            // single kv head at head sizes the CUDA tensor-core path takes
+            test_cases.emplace_back(new test_flash_attn_ext_back(128, 1, {8, 1}, 256, 64, true, GGML_TYPE_F16, {0, 1, 2, 3}, target));
+            test_cases.emplace_back(new test_flash_attn_ext_back( 64, 1, {4, 1}, 113, 75, true, GGML_TYPE_F32, {0, 1, 2, 3}, target));
         }
         // shapes of the grad-mode cases, small head sizes, partial tiles, odd head sizes and larger GQA groups
         for (ggml_flash_attn_ext_back_target target : {GGML_FLASH_ATTN_EXT_BACK_STATS, GGML_FLASH_ATTN_EXT_BACK_DQ, GGML_FLASH_ATTN_EXT_BACK_DKV}) {
@@ -16387,6 +16390,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {4, 1}, 1024, 1024, true, false, 0.0f, 0.0f, GGML_PREC_F32, GGML_TYPE_F32, GGML_TYPE_F32, {0, 1, 2, 3}, false));
     for (ggml_flash_attn_ext_back_target target : {GGML_FLASH_ATTN_EXT_BACK_STATS, GGML_FLASH_ATTN_EXT_BACK_DQ, GGML_FLASH_ATTN_EXT_BACK_DKV}) {
         test_cases.emplace_back(new test_flash_attn_ext_back(128, 8, {4, 1}, 1024, 1024, true, GGML_TYPE_F32, {0, 1, 2, 3}, target));
+        // single kv head, the shape the -sm tensor PARTIAL path uses
+        test_cases.emplace_back(new test_flash_attn_ext_back(128, 1, {32, 1}, 1024, 1024, true, GGML_TYPE_F16, {0, 1, 2, 3}, target, true));
     }
 
     // Sparse flash attention (n_kv_max hint) decode across KV depths.
