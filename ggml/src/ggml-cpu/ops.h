@@ -96,6 +96,7 @@ void ggml_compute_forward_channel_shuffle(const struct ggml_compute_params * par
 void ggml_compute_forward_affine_prelu(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_snake(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_lstm_cell(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+void ggml_compute_forward_tdt_step(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_roll(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_arange(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_timestep_embedding(const struct ggml_compute_params * params, struct ggml_tensor * dst);

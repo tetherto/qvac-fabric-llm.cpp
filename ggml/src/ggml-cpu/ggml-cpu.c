@@ -2155,6 +2155,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_lstm_cell(params, tensor);
             } break;
+        case GGML_OP_TDT_STEP:
+            {
+                ggml_compute_forward_tdt_step(params, tensor);
+            } break;
         case GGML_OP_ZERO_UPSAMPLE:
             {
                 ggml_compute_forward_zero_upsample(params, tensor);
@@ -2665,6 +2669,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_WIN_PART:
         case GGML_OP_WIN_UNPART:
         case GGML_OP_GET_REL_POS:
+        case GGML_OP_TDT_STEP:
             {
                 n_tasks = 1;
             } break;

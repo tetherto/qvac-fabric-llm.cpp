@@ -1222,9 +1222,10 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "AFFINE_PRELU",
     "SNAKE",
     "LSTM_CELL",
+    "TDT_STEP",
 };
 
-static_assert(GGML_OP_COUNT == 125, "GGML_OP_COUNT != 125");
+static_assert(GGML_OP_COUNT == 126, "GGML_OP_COUNT != 126");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1363,9 +1364,10 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "affine_prelu(x,aw,ab,slope)",
     "snake(x,a,inv_b)",
     "lstm_cell(gates,c)",
+    "tdt_step(tok,dur,state,dst)",
 };
 
-static_assert(GGML_OP_COUNT == 125, "GGML_OP_COUNT != 125");
+static_assert(GGML_OP_COUNT == 126, "GGML_OP_COUNT != 126");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -6164,6 +6166,52 @@ struct ggml_tensor * ggml_lstm_cell_masked(
 
     return ggml_lstm_cell_impl(ctx, gates, hc_prev, mask, hc_prev->ne[0]/GGML_LSTM_N_OUTS);
 }
+
+// ggml_tdt_step
+
+struct ggml_tensor * ggml_tdt_step(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * token,
+        struct ggml_tensor  * dur_idx,
+        struct ggml_tensor  * state,
+        struct ggml_tensor  * dur_table,
+        struct ggml_tensor  * dst,
+        int                   blank_id,
+        int                   max_symbols_per_step,
+        int                   rnnt) {
+    GGML_ASSERT(token->type     == GGML_TYPE_I32);
+    GGML_ASSERT(dur_idx->type   == GGML_TYPE_I32);
+    GGML_ASSERT(state->type     == GGML_TYPE_I32);
+    GGML_ASSERT(dur_table->type == GGML_TYPE_I32);
+    GGML_ASSERT(dst->type       == GGML_TYPE_I32);
+    GGML_ASSERT(ggml_is_contiguous(token));
+    GGML_ASSERT(ggml_is_contiguous(dur_idx));
+    GGML_ASSERT(ggml_is_contiguous(state));
+    GGML_ASSERT(ggml_is_contiguous(dur_table));
+    GGML_ASSERT(ggml_is_contiguous(dst));
+    GGML_ASSERT(ggml_nelements(token)   == 1);
+    GGML_ASSERT(ggml_nelements(dur_idx) == 1);
+    GGML_ASSERT(ggml_nelements(state)   == GGML_TDT_STEP_N_INS);
+    GGML_ASSERT(ggml_nelements(dur_table) >= 1);
+    GGML_ASSERT(ggml_nelements(dst)     == GGML_TDT_STEP_N_OUTS);
+    GGML_ASSERT(max_symbols_per_step > 0);
+
+    // the result is a view of dst, so chained steps fill rows of one tensor
+    struct ggml_tensor * result = ggml_view_tensor(ctx, dst);
+
+    const int32_t params[] = { blank_id, max_symbols_per_step, rnnt };
+    ggml_set_op_params(result, params, sizeof(params));
+
+    result->op     = GGML_OP_TDT_STEP;
+    result->src[0] = token;
+    result->src[1] = dur_idx;
+    result->src[2] = state;
+    result->src[3] = dur_table;
+    result->src[4] = dst;
+
+    return result;
+}
+
 // ggml_roll
 
 struct ggml_tensor * ggml_roll(
