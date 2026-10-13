@@ -232,18 +232,7 @@ common_memory_reports common_measure_memory(common_params & params) {
     return res;
 }
 
-common_device_memory_data_vec common_get_device_memory_data(
-        const char * path_model,
-        const llama_model_params * mparams,
-        const llama_context_params * cparams,
-        std::vector<ggml_backend_dev_t> & devs,
-        uint32_t & hp_ngl,
-        uint32_t & hp_n_ctx_train,
-        uint32_t & hp_n_expert,
-        ggml_log_level log_level) {
-    std::vector<llama_device_memory_data> impl = common_get_device_memory_data_impl(
-            path_model, mparams, cparams, devs, hp_ngl, hp_n_ctx_train, hp_n_expert, log_level);
-
+static common_device_memory_data_vec common_device_memory_data_from(const std::vector<llama_device_memory_data> & impl) {
     common_device_memory_data_vec ret(impl.size());
     for (size_t i = 0; i < impl.size(); i++) {
         ret[i].total   = impl[i].total;
@@ -253,6 +242,19 @@ common_device_memory_data_vec common_get_device_memory_data(
         ret[i].compute = impl[i].mb.compute;
     }
     return ret;
+}
+
+common_device_memory_data_vec common_get_device_memory_data(
+        const char * path_model,
+        const llama_model_params * mparams,
+        const llama_context_params * cparams,
+        std::vector<ggml_backend_dev_t> & devs,
+        uint32_t & hp_ngl,
+        uint32_t & hp_n_ctx_train,
+        uint32_t & hp_n_expert,
+        ggml_log_level log_level) {
+    return common_device_memory_data_from(common_get_device_memory_data_impl(
+        path_model, mparams, cparams, devs, hp_ngl, hp_n_ctx_train, hp_n_expert, log_level));
 }
 
 int64_t common_fit_shared_pool_deficit(
@@ -358,7 +360,8 @@ bool common_fit_auto_prefetch_weights(
 static void common_params_fit_impl(
         const char * path_model, struct llama_model_params * mparams, struct llama_context_params * cparams,
         float * tensor_split, struct llama_model_tensor_buft_override * tensor_buft_overrides,
-        size_t * margins_s, uint32_t n_ctx_min, const common_fit_extra_model * extra, bool prefetch_weights_auto, enum ggml_log_level log_level, bool moe_cache_auto_explicit) {
+        size_t * margins_s, uint32_t n_ctx_min, const common_fit_extra_model * extra, bool prefetch_weights_auto, enum ggml_log_level log_level, bool moe_cache_auto_explicit,
+        common_fit_measurement * measurement) {
     if (mparams->split_mode == LLAMA_SPLIT_MODE_TENSOR) {
         throw common_params_fit_exception("llama_params_fit is not implemented for SPLIT_MODE_TENSOR, abort");
     }
@@ -449,13 +452,28 @@ static void common_params_fit_impl(
     // llama_context would use only hp_nct in total for n_ctx == 0, resolve the context before measuring anything else:
     if (n_ctx_auto) {
         cparams->n_ctx = n_ctx_max;
-        if (n_streams > 1) {
+        // with a frequency scale the first probe's context rescales hp_nct, so that probe measured a smaller context
+        if (n_streams > 1 || cparams->rope_freq_scale != 0.0f) {
             LOG_TRC("%s: context size unset and KV cache not unified -> using %" PRIu32 " for %" PRIu32 " sequences:\n",
                 __func__, n_ctx_max, n_streams);
             dmds_full = common_get_device_memory_data_impl(path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level);
         }
     }
+    const dmds_t dmds_main = dmds_full;
     add_extra_memory(dmds_full);
+
+    // valid only while the parameters are still those of the first probe
+    auto record_first_probe = [&]() {
+        if (measurement == nullptr) {
+            return;
+        }
+        measurement->measured    = true;
+        measurement->memory      = common_device_memory_data_from(dmds_main);
+        measurement->devs        = devs;
+        measurement->n_layer     = hp_ngl;
+        measurement->n_ctx_train = hp_nct;
+        measurement->n_expert    = hp_nex;
+    };
 
     const size_t nd = devs.size(); // number of devices
 
@@ -536,6 +554,7 @@ static void common_params_fit_impl(
         if (sum_projected_free >= margins[0]) {
             LOG_TRC("%s: will leave %" PRId64 " >= %" PRId64 " MiB of system memory, no changes needed\n",
                 __func__, sum_projected_free/MiB, margins[0]/MiB);
+            record_first_probe();
             return;
         }
     } else {
@@ -610,6 +629,7 @@ static void common_params_fit_impl(
         if (projected_free_per_device[0] >= margins[0] && host_shared_deficit == 0) {
             LOG_TRC("%s: will leave %" PRId64 " >= %" PRId64 " MiB of free device memory, no changes needed\n",
                 __func__, projected_free_per_device[0]/MiB, margins[0]/MiB);
+            record_first_probe();
             return;
         }
     } else if (nd > 1) {
@@ -622,6 +642,7 @@ static void common_params_fit_impl(
         }
         if (!changes_needed) {
             LOG_TRC("%s: targets for free memory can be met on all devices, no changes needed\n", __func__);
+            record_first_probe();
             return;
         }
     }
@@ -629,9 +650,14 @@ static void common_params_fit_impl(
     if (auto_prefetch) {
         cparams->prefetch_weights = true;
         common_params_fit_impl(
-            path_model, mparams, cparams, tensor_split, tensor_buft_overrides, margins_s, n_ctx_min, extra, false, log_level, moe_cache_auto_explicit);
+            path_model, mparams, cparams, tensor_split, tensor_buft_overrides, margins_s, n_ctx_min, extra, false, log_level, moe_cache_auto_explicit,
+            measurement);
         if (mparams->n_gpu_layers == default_mparams.n_gpu_layers) {
             cparams->prefetch_weights = false;
+            // the inner fit measured with prefetch on
+            if (measurement != nullptr) {
+                *measurement = {};
+            }
         } else {
             LOG_INF("%s: automatic weight prefetch enabled for fitted host weights\n", __func__);
         }
@@ -948,7 +974,8 @@ static void common_params_fit_impl(
     if (auto_moe_cache_size > 0) {
         cparams->moe_cache_size = auto_moe_cache_size;
         common_params_fit_impl(
-            path_model, mparams, cparams, tensor_split, tensor_buft_overrides, margins_s, n_ctx_min, extra, prefetch_weights_auto, log_level, moe_cache_auto_explicit);
+            path_model, mparams, cparams, tensor_split, tensor_buft_overrides, margins_s, n_ctx_min, extra, prefetch_weights_auto, log_level, moe_cache_auto_explicit,
+            measurement);
         return;
     }
 
@@ -1205,7 +1232,7 @@ static void common_params_fit_impl(
     set_ngl_tensor_split_tbo(ngl_per_device, overflow_bufts, *mparams);
 }
 
-enum common_params_fit_status common_fit_params(
+static enum common_params_fit_status common_fit_params_with_measurement(
         const char * path_model,
         llama_model_params * mparams,
         llama_context_params * cparams,
@@ -1216,7 +1243,8 @@ enum common_params_fit_status common_fit_params(
         const common_fit_extra_model * extra,
         bool prefetch_weights_auto,
         ggml_log_level log_level,
-        bool moe_cache_auto_explicit) {
+        bool moe_cache_auto_explicit,
+        common_fit_measurement * measurement) {
     const int64_t t0_us = llama_time_us();
     common_params_fit_status status = COMMON_PARAMS_FIT_STATUS_SUCCESS;
     // The impl mutates the params while it works (e.g. n_ctx during the
@@ -1243,7 +1271,8 @@ enum common_params_fit_status common_fit_params(
     }
     try {
         common_params_fit_impl(
-            path_model, mparams, cparams, tensor_split, tensor_buft_overrides, margins, n_ctx_min, extra, prefetch_weights_auto, log_level, moe_cache_auto_explicit);
+            path_model, mparams, cparams, tensor_split, tensor_buft_overrides, margins, n_ctx_min, extra, prefetch_weights_auto, log_level, moe_cache_auto_explicit,
+            measurement);
         LOG_TRC("%s: successfully fit params to free device memory\n", __func__);
     } catch (const common_params_fit_exception & e) {
         LOG_WRN("%s: failed to fit params to free device memory: %s\n", __func__, e.what());
@@ -1264,6 +1293,59 @@ enum common_params_fit_status common_fit_params(
     }
     const int64_t t1_us = llama_time_us();
     LOG_TRC("%s: fitting params to free memory took %.2f seconds\n", __func__, (t1_us - t0_us) * 1e-6);
+    return status;
+}
+
+enum common_params_fit_status common_fit_params(
+        const char * path_model,
+        llama_model_params * mparams,
+        llama_context_params * cparams,
+        float * tensor_split,
+        llama_model_tensor_buft_override * tensor_buft_overrides,
+        size_t * margins,
+        uint32_t n_ctx_min,
+        const common_fit_extra_model * extra,
+        bool prefetch_weights_auto,
+        ggml_log_level log_level,
+        bool moe_cache_auto_explicit) {
+    return common_fit_params_with_measurement(
+        path_model, mparams, cparams, tensor_split, tensor_buft_overrides, margins, n_ctx_min, extra, prefetch_weights_auto, log_level, moe_cache_auto_explicit,
+        nullptr);
+}
+
+enum common_params_fit_status common_fit_params_measured(
+        const char * path_model,
+        llama_model_params * mparams,
+        llama_context_params * cparams,
+        float * tensor_split,
+        llama_model_tensor_buft_override * tensor_buft_overrides,
+        size_t * margins,
+        uint32_t n_ctx_min,
+        const common_fit_extra_model * extra,
+        bool prefetch_weights_auto,
+        ggml_log_level log_level,
+        common_fit_measurement * measurement,
+        bool moe_cache_auto_explicit) {
+    GGML_ASSERT(measurement != nullptr);
+    *measurement = {};
+    const common_params_fit_status status = common_fit_params_with_measurement(
+        path_model, mparams, cparams, tensor_split, tensor_buft_overrides, margins, n_ctx_min, extra, prefetch_weights_auto, log_level, moe_cache_auto_explicit,
+        measurement);
+    // a failed fit restores the caller's parameters, so the fit's own probes do not describe them
+    if (status != COMMON_PARAMS_FIT_STATUS_SUCCESS) {
+        *measurement = {};
+    }
+    if (status == COMMON_PARAMS_FIT_STATUS_ERROR || measurement->measured) {
+        return status;
+    }
+    try {
+        measurement->memory = common_device_memory_data_from(common_get_device_memory_data_impl(
+            path_model, mparams, cparams, measurement->devs, measurement->n_layer, measurement->n_ctx_train, measurement->n_expert, log_level));
+        measurement->measured = true;
+    } catch (const std::exception & e) {
+        LOG_WRN("%s: failed to measure the fitted params: %s\n", __func__, e.what());
+        *measurement = {};
+    }
     return status;
 }
 

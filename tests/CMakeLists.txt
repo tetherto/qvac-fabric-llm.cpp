@@ -347,6 +347,14 @@ set_tests_properties(test-llama-context PROPERTIES
     TIMEOUT 3600
 )
 
+llama_build(test-fit-measured.cpp)
+llama_test(
+    test-fit-measured
+    LABEL main
+    ARGS "${MODEL_DIR}/llama-dense.gguf"
+)
+set_tests_properties(test-fit-measured PROPERTIES FIXTURES_REQUIRED generate-models)
+
 llama_build(test-fusion.cpp)
 
 llama_build_and_test(test-chat-peg-parser.cpp peg-parser/simple-tokenize.cpp  LABEL behavior)

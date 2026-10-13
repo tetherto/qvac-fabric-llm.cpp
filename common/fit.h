@@ -154,3 +154,30 @@ common_device_memory_data_vec common_get_device_memory_data(
                            uint32_t & hp_n_ctx_train,
                            uint32_t & hp_n_expert,
                      ggml_log_level   log_level);
+
+// what common_get_device_memory_data reports for the main model at the parameters a fit leaves in place
+struct common_fit_measurement {
+    bool                            measured    = false;
+    common_device_memory_data_vec   memory;              // one row per device, then a trailing host row
+    std::vector<ggml_backend_dev_t> devs;
+    uint32_t                        n_layer     = 0;
+    uint32_t                        n_ctx_train = 0;
+    uint32_t                        n_expert    = 0;
+};
+
+// common_fit_params, then the memory of the parameters it leaves in mparams and cparams
+//   - a fit that needs no changes reuses its first probe; any other outcome is measured by one more probe
+//   - nothing is measured on ERROR
+common_params_fit_status common_fit_params_measured(
+                         const char * path_model,
+                 llama_model_params * mparams,
+               llama_context_params * cparams,
+                              float * tensor_split,
+   llama_model_tensor_buft_override * tensor_buft_overrides,
+                             size_t * margins,
+                           uint32_t   n_ctx_min,
+      const common_fit_extra_model * extra,
+                               bool   prefetch_weights_auto,
+                     ggml_log_level   log_level,
+             common_fit_measurement * measurement,
+                               bool   moe_cache_auto_explicit = false);
