@@ -23,15 +23,17 @@ extern "C" {
 //     b11259 fork: 109).
 // 113 widens rpc_tensor::name with GGML_MAX_NAME 128 (b12032 fork: 111,
 //     temp-11018: 110).
+// 114 adds the speech ops to the ggml_op enum (b12032 fork: 112,
+//     temp-11018: 111).
 // A minor bump is additive: the client still accepts a server with an older
 // minor and must gate every command introduced by a later minor on the minor
 // the server announces at HELLO.
-#define RPC_PROTO_MAJOR_VERSION    113
+#define RPC_PROTO_MAJOR_VERSION    114
 #define RPC_PROTO_MINOR_VERSION    0
 #define RPC_PROTO_PATCH_VERSION    0
 
 #ifdef  __cplusplus
-static_assert(GGML_OP_COUNT == 111, "GGML_OP_COUNT has changed - update RPC_PROTO_PATCH_VERSION");
+static_assert(GGML_OP_COUNT == 123, "GGML_OP_COUNT has changed - update RPC_PROTO_PATCH_VERSION");
 #endif
 
 #define GGML_RPC_MAX_SERVERS       16

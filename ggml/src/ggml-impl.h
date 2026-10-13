@@ -87,6 +87,22 @@ static bool ggml_are_same_layout(const struct ggml_tensor * a, const struct ggml
     return true;
 }
 
+// GGML_OP_LSTM_CELL gate chunks along ne0 of the pre-activation tensor (PyTorch/NeMo order).
+enum ggml_lstm_gate {
+    GGML_LSTM_GATE_INPUT  = 0,
+    GGML_LSTM_GATE_FORGET = 1,
+    GGML_LSTM_GATE_CELL   = 2,
+    GGML_LSTM_GATE_OUTPUT = 3,
+    GGML_LSTM_N_GATES     = 4,
+};
+
+// GGML_OP_LSTM_CELL result chunks along ne0.
+enum ggml_lstm_out {
+    GGML_LSTM_OUT_H  = 0,
+    GGML_LSTM_OUT_C  = 1,
+    GGML_LSTM_N_OUTS = 2,
+};
+
 static bool ggml_op_is_empty(enum ggml_op op) {
     switch (op) {
         case GGML_OP_NONE:
