@@ -1211,9 +1211,10 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 
     "CONV_1D_DW_DIRECT",
+    "NORM_CHANNEL",
 };
 
-static_assert(GGML_OP_COUNT == 115, "GGML_OP_COUNT != 115");
+static_assert(GGML_OP_COUNT == 116, "GGML_OP_COUNT != 116");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1341,9 +1342,10 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 
     "conv_1d_dw_direct(x,w,b)",
+    "norm_channel(x,g,b)",
 };
 
-static_assert(GGML_OP_COUNT == 115, "GGML_OP_COUNT != 115");
+static_assert(GGML_OP_COUNT == 116, "GGML_OP_COUNT != 116");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -5731,6 +5733,66 @@ struct ggml_tensor * ggml_conv_1d_dw_direct_ct_segmented(
         int                   seg_len) {
     return ggml_conv_1d_dw_direct_impl(ctx, a, w, bias, dilation,
                                              /*layout=*/1, /*causal=*/0, seg_len);
+}
+
+// ggml_norm_channel
+
+// Internal helper: layer_norm_channel with explicit layout flag.
+// layout = 0 → [T, C] (T inner) ; layout = 1 → [C, T] (C inner).
+static struct ggml_tensor * ggml_norm_channel_impl(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * g,
+        struct ggml_tensor  * b,
+        float                 eps,
+        int                   layout) {
+    GGML_ASSERT(a->type == GGML_TYPE_F32);
+    GGML_ASSERT(g->type == GGML_TYPE_F32);
+    GGML_ASSERT(b->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(a));
+    GGML_ASSERT(ggml_is_contiguous(g));
+    GGML_ASSERT(ggml_is_contiguous(b));
+
+    GGML_ASSERT(a->ne[2] >= 1 && a->ne[3] == 1);
+    // The "channel" dimension is the OUTER one for [T, C] (ne[1]) and the
+    // INNER one for [C, T] (ne[0]).  gamma/beta have length == C.
+    const int64_t C_dim = (layout == 0) ? a->ne[1] : a->ne[0];
+    GGML_ASSERT(g->ne[0] == C_dim);
+    GGML_ASSERT(b->ne[0] == C_dim);
+
+    struct ggml_tensor * result = ggml_new_tensor_4d(ctx, a->type,
+            a->ne[0], a->ne[1], a->ne[2], a->ne[3]);
+
+    // op_params: [eps (f32), layout (i32)].
+    int32_t params[2];
+    memcpy(&params[0], &eps, sizeof(float));
+    params[1] = layout;
+    ggml_set_op_params(result, params, sizeof(params));
+
+    result->op     = GGML_OP_NORM_CHANNEL;
+    result->src[0] = a;
+    result->src[1] = g;
+    result->src[2] = b;
+
+    return result;
+}
+
+struct ggml_tensor * ggml_norm_channel(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * g,
+        struct ggml_tensor  * b,
+        float                 eps) {
+    return ggml_norm_channel_impl(ctx, a, g, b, eps, /*layout=*/0);
+}
+
+struct ggml_tensor * ggml_norm_channel_ct(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * g,
+        struct ggml_tensor  * b,
+        float                 eps) {
+    return ggml_norm_channel_impl(ctx, a, g, b, eps, /*layout=*/1);
 }
 // ggml_roll
 

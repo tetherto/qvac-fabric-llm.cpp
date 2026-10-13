@@ -635,6 +635,7 @@ extern "C" {
         // Fused ops for ConvNeXt-style convolutional blocks: each collapses a
         // multi-op sub-graph into one dispatch.
         GGML_OP_CONV_1D_DW_DIRECT,
+        GGML_OP_NORM_CHANNEL,
         GGML_OP_COUNT,
     };
 
@@ -2559,6 +2560,37 @@ extern "C" {
             struct ggml_tensor  * bias,
             int                   dilation,
             int                   seg_len);
+
+    // Fused channel-axis layer norm. Normalises across the
+    // channel dim (ne[1]) of each batch in a [L, C, B, 1] tensor and applies
+    // an affine scale + shift. Replaces the permute + cont + ggml_norm + mul
+    // + add + permute + cont chain that stock ggml_norm requires (since it
+    // normalises along ne[0]).
+    //
+    //   y[t, c, batch] = ((a[t, c, batch] - mean[t, batch]) /
+    //                     sqrt(var[t, batch] + eps)) * g[c] + b[c]
+    //
+    // a: [L, C, B, 1]  f32 contiguous
+    // g: [C]            f32 contiguous (scale)
+    // b: [C]            f32 contiguous (shift)
+    // eps: numerical epsilon (passed as float op param)
+    GGML_API struct ggml_tensor * ggml_norm_channel(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * g,
+            struct ggml_tensor  * b,
+            float                 eps);
+
+    // [C, T]-layout variant: a is [C, T, B, 1] with C inner-most. g and b
+    // still have length C (== a->ne[0] here, vs == a->ne[1] in the [T, C]
+    // variant). Same op as ggml_norm_channel; this variant only sets the
+    // layout flag.
+    GGML_API struct ggml_tensor * ggml_norm_channel_ct(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * g,
+            struct ggml_tensor  * b,
+            float                 eps);
     // Move tensor elements by an offset given for each dimension. Elements that
     // are shifted beyond the last position are wrapped around to the beginning.
     GGML_API struct ggml_tensor * ggml_roll(

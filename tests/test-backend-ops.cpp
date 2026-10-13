@@ -5304,6 +5304,37 @@ struct test_ssm_conv_bias_silu : public test_case {
     }
 };
 
+// GGML_OP_NORM_CHANNEL
+struct test_norm_channel : public test_case {
+    const int64_t L;
+    const int64_t C;
+    const int64_t B;
+    const bool ct; // [C, T] layout instead of [T, C]
+    const float eps;
+
+    std::string vars() override {
+        return VARS_TO_STR5(L, C, B, ct, eps);
+    }
+
+    test_norm_channel(int64_t L = 139, int64_t C = 512, bool ct = false, float eps = 1e-6f,
+                                       int64_t B = 1)
+        : L(L), C(C), B(B), ct(ct), eps(eps) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ct ? ggml_new_tensor_3d(ctx, GGML_TYPE_F32, C, L, B) : ggml_new_tensor_3d(ctx, GGML_TYPE_F32, L, C, B);
+        ggml_set_name(a, "a");
+        ggml_tensor * g = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, C);
+        ggml_set_name(g, "g");
+        ggml_tensor * b = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, C);
+        ggml_set_name(b, "b");
+
+        ggml_tensor * out = ct ? ggml_norm_channel_ct(ctx, a, g, b, eps)
+                               : ggml_norm_channel(ctx, a, g, b, eps);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+};
 
 // GGML_OP_CONV_1D_DW_DIRECT
 struct test_conv_1d_dw_direct : public test_case {
@@ -5368,6 +5399,58 @@ struct test_conv_1d_dw_direct : public test_case {
         ggml_set_name(b, "b");
 
         ggml_tensor * out = build_conv(ctx, a, w, b);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+};
+
+// CONV_1D_DW_DIRECT followed by NORM_CHANNEL, which Metal runs as one dispatch
+struct test_conv_1d_dw_direct_norm_channel : public test_case {
+    const int64_t L;
+    const int64_t C;
+    const int64_t B;
+    const int64_t K;
+    const int dilation;
+    const bool ct;
+    const bool causal;
+    const int seg_len;
+
+    std::string vars() override {
+        return VARS_TO_STR8(L, C, B, K, dilation, ct, causal, seg_len);
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    test_conv_1d_dw_direct_norm_channel(int64_t L, int64_t C, int64_t K, int dilation,
+                                         bool ct = true, bool causal = false, int seg_len = 0, int64_t B = 1)
+        : L(L), C(C), B(B), K(K), dilation(dilation), ct(ct), causal(causal), seg_len(seg_len) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ct ? ggml_new_tensor_3d(ctx, GGML_TYPE_F32, C, L, B) : ggml_new_tensor_3d(ctx, GGML_TYPE_F32, L, C, B);
+        ggml_set_name(a, "a");
+        ggml_tensor * w = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, K, 1, C);
+        ggml_set_name(w, "w");
+        ggml_tensor * b = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, C);
+        ggml_set_name(b, "b");
+        ggml_tensor * g = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, C);
+        ggml_set_name(g, "g");
+        ggml_tensor * beta = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, C);
+        ggml_set_name(beta, "beta");
+
+        ggml_tensor * dw;
+        if (seg_len > 0) {
+            dw = ggml_conv_1d_dw_direct_ct_segmented(ctx, a, w, b, dilation, seg_len);
+        } else if (causal) {
+            dw = ggml_conv_1d_dw_direct_causal_ct(ctx, a, w, b, dilation);
+        } else if (ct) {
+            dw = ggml_conv_1d_dw_direct_ct(ctx, a, w, b, dilation);
+        } else {
+            dw = ggml_conv_1d_dw_direct(ctx, a, w, b, dilation);
+        }
+        const float eps = 1e-6f;
+        ggml_tensor * out = ct ? ggml_norm_channel_ct(ctx, dw, g, beta, eps)
+                               : ggml_norm_channel(ctx, dw, g, beta, eps);
         ggml_set_name(out, "out");
 
         return out;
@@ -13867,6 +13950,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // ConvNeXt shapes: the [T, C] kernel raced on its shared reduction slot for T >= 139.
+    for (bool ct : { false, true }) {
+        for (int64_t L : { 45, 139, 234, 1024 }) {
+            test_cases.emplace_back(new test_norm_channel(L, 512, ct));
+        }
+    }
+    test_cases.emplace_back(new test_norm_channel(37, 96, true, 1e-6f, 2));
     for (int64_t K : { 3, 5, 7 }) {
         test_cases.emplace_back(new test_conv_1d_dw_direct(139, 512, K, 3, true));
         test_cases.emplace_back(new test_conv_1d_dw_direct(139, 512, K, 2, false));
@@ -13875,6 +13965,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_conv_1d_dw_direct(278, 512, 7, 27, true, false, 139));
     test_cases.emplace_back(new test_conv_1d_dw_direct(90, 512, 5, 8, true, false, 45));
     test_cases.emplace_back(new test_conv_1d_dw_direct(37, 96, 5, 2, true, false, 0, 2));
+    // Metal fuses the depthwise taps into the following channel layer norm; the last shape exceeds
+    // its per-thread register budget and must fall back to two dispatches.
+    test_cases.emplace_back(new test_conv_1d_dw_direct_norm_channel(90, 512, 7, 1, true, false, 45));
+    test_cases.emplace_back(new test_conv_1d_dw_direct_norm_channel(278, 512, 7, 3, true, false, 139));
+    test_cases.emplace_back(new test_conv_1d_dw_direct_norm_channel(468, 512, 7, 9, true, false, 234));
+    test_cases.emplace_back(new test_conv_1d_dw_direct_norm_channel(2808, 512, 7, 1, true, true));
+    test_cases.emplace_back(new test_conv_1d_dw_direct_norm_channel(53, 256, 5, 2, false));
+    test_cases.emplace_back(new test_conv_1d_dw_direct_norm_channel(54, 64, 5, 1, false));
+    test_cases.emplace_back(new test_conv_1d_dw_direct_norm_channel(139, 2048, 3, 1, true));
+    test_cases.emplace_back(new test_conv_1d_dw_direct_norm_channel(139, 2304, 3, 1, true));
+    test_cases.emplace_back(new test_conv_1d_dw_direct_norm_channel(37, 96, 5, 2, true, false, 0, 2));
     test_cases.emplace_back(new test_l2_norm_back());
     test_cases.emplace_back(new test_l2_norm_back(GGML_TYPE_F32, { 1025, 5, 4, 3 }));
     test_cases.emplace_back(new test_l2_norm_back(GGML_TYPE_F32, {   64, 5, 4, 3 }, 1e-6f, true));

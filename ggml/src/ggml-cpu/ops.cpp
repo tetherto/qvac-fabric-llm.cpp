@@ -9318,6 +9318,70 @@ void ggml_compute_forward_conv_1d_dw_direct(
         }
     }
 }
+
+// ggml_compute_forward_norm_channel
+
+void ggml_compute_forward_norm_channel(
+        const ggml_compute_params * params,
+              ggml_tensor * dst) {
+
+    const ggml_tensor * x = dst->src[0]; // [L, C, B, 1] or [C, L, B, 1]
+    const ggml_tensor * g = dst->src[1]; // [C]
+    const ggml_tensor * b = dst->src[2]; // [C]
+
+    GGML_ASSERT(x->type == GGML_TYPE_F32);
+    GGML_ASSERT(g->type == GGML_TYPE_F32);
+    GGML_ASSERT(b->type == GGML_TYPE_F32);
+    GGML_ASSERT(dst->type == GGML_TYPE_F32);
+
+    float eps;
+    memcpy(&eps, dst->op_params, sizeof(eps));
+    const int32_t layout = ((const int32_t *) dst->op_params)[1];
+
+    int L, C, sxt, sxc;
+    if (layout == 0) {
+        // [T, C]: T inner.
+        L = (int) x->ne[0];
+        C = (int) x->ne[1];
+        sxt = 1;  sxc = L;
+    } else {
+        // [C, T]: C inner.
+        C = (int) x->ne[0];
+        L = (int) x->ne[1];
+        sxt = C;  sxc = 1;
+    }
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    const float * x_data = (const float *) x->data;
+    const float * g_data = (const float *) g->data;
+    const float * b_data = (const float *) b->data;
+          float * y_data = (float *) dst->data;
+
+    // Layout-agnostic indexing via element strides. Each batch occupies one
+    // contiguous L*C plane and reuses the same affine channel parameters.
+    const size_t batch_stride = (size_t) L * C;
+    for (int64_t ib = 0; ib < x->ne[2]; ++ib) {
+        const size_t batch_offset = (size_t) ib * batch_stride;
+        for (int t = ith; t < L; t += nth) {
+            double mean = 0.0;
+            for (int c = 0; c < C; ++c) mean += x_data[batch_offset + (size_t) t * sxt + (size_t) c * sxc];
+            mean /= (double) C;
+            double var = 0.0;
+            for (int c = 0; c < C; ++c) {
+                const double d = (double) x_data[batch_offset + (size_t) t * sxt + (size_t) c * sxc] - mean;
+                var += d * d;
+            }
+            const float inv = 1.0f / sqrtf((float) (var / (double) C) + eps);
+            for (int c = 0; c < C; ++c) {
+                const size_t offset = batch_offset + (size_t) t * sxt + (size_t) c * sxc;
+                const float xv = x_data[offset];
+                y_data[offset] = (xv - (float) mean) * inv * g_data[c] + b_data[c];
+            }
+        }
+    }
+}
 // ggml_compute_forward_roll
 
 static int64_t ggml_wrap_index(int64_t i, int64_t ne) {
