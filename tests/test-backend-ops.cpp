@@ -5366,6 +5366,124 @@ struct test_scale_residual : public test_case {
     }
 };
 
+// GGML_OP_BIAS_GELU
+struct test_bias_gelu : public test_case {
+    const int64_t L;
+    const int64_t C;
+    const int64_t B;
+    const bool    ct;
+
+    std::string vars() override {
+        return VARS_TO_STR4(L, C, B, ct);
+    }
+
+    test_bias_gelu(int64_t L = 139, int64_t C = 512, int64_t B = 1, bool ct = false)
+        : L(L), C(C), B(B), ct(ct) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x = ct ? ggml_new_tensor_3d(ctx, GGML_TYPE_F32, C, L, B) : ggml_new_tensor_3d(ctx, GGML_TYPE_F32, L, C, B);
+        ggml_set_name(x, "x");
+        ggml_tensor * bias = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, C);
+        ggml_set_name(bias, "bias");
+        ggml_tensor * out = ct ? ggml_bias_gelu_ct(ctx, x, bias) : ggml_bias_gelu(ctx, x, bias);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
+// MUL_MAT followed by an epilogue the Metal backend fuses into its mat-mat kernels
+struct test_mm_epilogue : public test_case {
+    // BIAS_RESIDUAL_INPLACE stores the result over the matmul input, which the fusion must refuse.
+    enum epilogue {
+        BIAS = 1,
+        BIAS_RESIDUAL,
+        BIAS_GELU,
+        PW2_RESIDUAL,
+        BIAS_RESIDUAL_INPLACE,
+        BIAS_GELU_TRANSPOSE,
+        PW2_RESIDUAL_TRANSPOSE,
+    };
+
+    const ggml_type type_a;
+    const int64_t m;
+    const int64_t n;
+    const int64_t k;
+    const int64_t B;
+    const int mode;
+    const bool prec_f32;
+
+    std::string vars() override {
+        return VARS_TO_STR7(type_a, m, n, k, B, mode, prec_f32);
+    }
+
+    double max_nmse_err() override {
+        return prec_f32 ? 1e-9 : 5e-4;
+    }
+
+    // WebGPU has no f32-precision matmul path, so GGML_PREC_F32 cannot tighten its tolerance.
+    double max_nmse_err(ggml_backend_t backend) override {
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
+        return strcmp(ggml_backend_reg_name(reg), "WebGPU") == 0 ? 5e-4 : max_nmse_err();
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    test_mm_epilogue(ggml_type type_a, int64_t m, int64_t n, int64_t k, int mode, bool prec_f32 = false,
+                                 int64_t B = 1)
+        : type_a(type_a), m(m), n(n), k(k), B(B), mode(mode), prec_f32(prec_f32) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor_2d(ctx, type_a, k, m);
+        ggml_set_name(a, "a");
+        ggml_tensor * b = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k, n, B);
+        ggml_set_name(b, "b");
+        ggml_tensor * mm = ggml_mul_mat(ctx, a, b);
+        if (prec_f32) {
+            ggml_prec_set_acc(mm, GGML_PREC_F32);
+        }
+        ggml_tensor * bias = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, m);
+        ggml_set_name(bias, "bias");
+        ggml_tensor * out = build_epilogue(ctx, mm, b, bias);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+
+    ggml_tensor * new_residual(ggml_context * ctx) {
+        ggml_tensor * residual = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, m, n, B);
+        ggml_set_name(residual, "residual");
+        return residual;
+    }
+
+    ggml_tensor * new_gamma(ggml_context * ctx) {
+        ggml_tensor * gamma = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, m);
+        ggml_set_name(gamma, "gamma");
+        return gamma;
+    }
+
+    ggml_tensor * build_epilogue(ggml_context * ctx, ggml_tensor * mm, ggml_tensor * b, ggml_tensor * bias) {
+        ggml_tensor * bias_col = ggml_reshape_2d(ctx, bias, m, 1);
+        switch (mode) {
+            case BIAS:
+                return ggml_add(ctx, mm, bias_col);
+            case BIAS_RESIDUAL:
+                return ggml_add(ctx, ggml_add(ctx, mm, bias_col), new_residual(ctx));
+            case BIAS_RESIDUAL_INPLACE:
+                GGML_ASSERT(m == k);
+                return ggml_add_inplace(ctx, b, ggml_add(ctx, mm, bias_col));
+            case BIAS_GELU:
+                return ggml_bias_gelu_ct(ctx, mm, bias);
+            case BIAS_GELU_TRANSPOSE:
+                return ggml_bias_gelu_tc_to_ct(ctx, ggml_cont(ctx, ggml_transpose(ctx, mm)), bias);
+            case PW2_RESIDUAL:
+                return ggml_scale_residual_ct(ctx, mm, bias, new_gamma(ctx), new_residual(ctx));
+            case PW2_RESIDUAL_TRANSPOSE:
+                return ggml_scale_residual_tc_to_ct(ctx, ggml_cont(ctx, ggml_transpose(ctx, mm)), bias, new_gamma(ctx), new_residual(ctx));
+        }
+        GGML_ABORT("unknown epilogue mode");
+    }
+};
+
 // GGML_OP_CONV_1D_DW_DIRECT
 struct test_conv_1d_dw_direct : public test_case {
     const int64_t L;
@@ -14010,6 +14128,30 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_scale_residual(139, 512, 1, ct));
         test_cases.emplace_back(new test_scale_residual(37, 96, 2, ct));
     }
+    for (bool ct : { false, true }) {
+        test_cases.emplace_back(new test_bias_gelu(139, 512, 1, ct));
+        test_cases.emplace_back(new test_bias_gelu(37, 96, 2, ct));
+    }
+    // Metal fuses these epilogues into its mat-mat kernels; the ragged shapes cover the tile bounds.
+    for (int mode : { 1, 2, 3, 4, 6, 7 }) {
+        for (auto shape : { std::array<int64_t, 3>{512, 139, 512}, std::array<int64_t, 3>{2048, 90, 512}, std::array<int64_t, 3>{512, 468, 2048}, std::array<int64_t, 3>{144, 278, 512}, std::array<int64_t, 3>{100, 37, 96} }) {
+            test_cases.emplace_back(new test_mm_epilogue(GGML_TYPE_F32,  shape[0], shape[1], shape[2], mode));
+            test_cases.emplace_back(new test_mm_epilogue(GGML_TYPE_F16,  shape[0], shape[1], shape[2], mode));
+            test_cases.emplace_back(new test_mm_epilogue(GGML_TYPE_Q8_0, shape[0], shape[1], shape[2], mode));
+        }
+        test_cases.emplace_back(new test_mm_epilogue(GGML_TYPE_F16, 100, 37, 100, mode));
+    }
+    for (int mode : { test_mm_epilogue::BIAS_GELU,
+                      test_mm_epilogue::PW2_RESIDUAL,
+                      test_mm_epilogue::BIAS_GELU_TRANSPOSE,
+                      test_mm_epilogue::PW2_RESIDUAL_TRANSPOSE }) {
+        test_cases.emplace_back(new test_mm_epilogue(GGML_TYPE_F32, 100, 37, 96, mode, false, 2));
+    }
+    for (ggml_type type_a : { GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_Q8_0 }) {
+        test_cases.emplace_back(new test_mm_epilogue(type_a, 512, 139, 512, test_mm_epilogue::BIAS_RESIDUAL_INPLACE));
+    }
+
+
     test_cases.emplace_back(new test_l2_norm_back());
     test_cases.emplace_back(new test_l2_norm_back(GGML_TYPE_F32, { 1025, 5, 4, 3 }));
     test_cases.emplace_back(new test_l2_norm_back(GGML_TYPE_F32, {   64, 5, 4, 3 }, 1e-6f, true));

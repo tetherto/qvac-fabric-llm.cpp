@@ -2139,6 +2139,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_scale_residual(params, tensor);
             } break;
+        case GGML_OP_BIAS_GELU:
+            {
+                ggml_compute_forward_bias_gelu(params, tensor);
+            } break;
         case GGML_OP_ROLL:
             {
                 ggml_compute_forward_roll(params, tensor);
@@ -2600,6 +2604,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_CONV_1D_DW_DIRECT:
         case GGML_OP_NORM_CHANNEL:
         case GGML_OP_SCALE_RESIDUAL:
+        case GGML_OP_BIAS_GELU:
         case GGML_OP_ROLL:
         case GGML_OP_ARANGE:
         case GGML_OP_TIMESTEP_EMBEDDING:

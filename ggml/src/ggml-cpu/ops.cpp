@@ -9470,6 +9470,116 @@ void ggml_compute_forward_scale_residual(
         }
     }
 }
+
+// ggml_compute_forward_bias_gelu
+
+static const float kInvSqrt2 = 0.7071067811865475f;
+
+static inline float bias_gelu_one(float x, float b) {
+    const float v = x + b;
+    return 0.5f * v * (1.0f + erff(v * kInvSqrt2));
+}
+
+// [T, C]: timesteps are contiguous, so stripe over channels.
+static void bias_gelu_tc(
+        const float * x, const float * b, float * y,
+        int L, int C, int ith, int nth) {
+    for (int c = ith; c < C; c += nth) {
+        const float bv = b[c];
+        const float * xc = x + (size_t) c * L;
+        float       * yc = y + (size_t) c * L;
+        for (int t = 0; t < L; ++t) {
+            yc[t] = bias_gelu_one(xc[t], bv);
+        }
+    }
+}
+
+// One contiguous row: y[i] = gelu_erf(x[i] + b[i]). The ISA order here mirrors
+// vec.h exactly, since those blocks are #elif and only one defines
+// ggml_v_gelu_erf. SVE has no vector form and falls through to the scalar tail.
+static void bias_gelu_row(float * y, const float * x, const float * b, int n) {
+    int i = 0;
+#if defined(__ARM_FEATURE_SVE) && defined(__aarch64__)
+#elif defined(__ARM_NEON) && defined(__aarch64__)
+    for (; i + 3 < n; i += 4) {
+        vst1q_f32(y + i, ggml_v_gelu_erf(vaddq_f32(vld1q_f32(x + i), vld1q_f32(b + i))));
+    }
+#elif defined(__AVX512F__) && defined(__AVX512DQ__)
+    for (; i + 15 < n; i += 16) {
+        _mm512_storeu_ps(y + i, ggml_v_gelu_erf(
+            _mm512_add_ps(_mm512_loadu_ps(x + i), _mm512_loadu_ps(b + i))));
+    }
+#elif defined(__AVX2__) && defined(__FMA__)
+    for (; i + 7 < n; i += 8) {
+        _mm256_storeu_ps(y + i, ggml_v_gelu_erf(
+            _mm256_add_ps(_mm256_loadu_ps(x + i), _mm256_loadu_ps(b + i))));
+    }
+#elif defined(__SSE2__)
+    for (; i + 3 < n; i += 4) {
+        _mm_storeu_ps(y + i, ggml_v_gelu_erf(
+            _mm_add_ps(_mm_loadu_ps(x + i), _mm_loadu_ps(b + i))));
+    }
+#endif
+    for (; i < n; ++i) {
+        y[i] = bias_gelu_one(x[i], b[i]);
+    }
+}
+
+// [C, T]: channels are contiguous, so stripe over timesteps and let each row be
+// a unit-stride pass over x, bias and y. Striping over channels here would make
+// the inner loop walk one float per cache line.
+static void bias_gelu_ct(
+        const float * x, const float * b, float * y,
+        int L, int C, int ith, int nth) {
+    for (int t = ith; t < L; t += nth) {
+        bias_gelu_row(y + (size_t) t * C, x + (size_t) t * C, b, C);
+    }
+}
+
+static void bias_gelu_tc_to_ct(
+        const float * x, const float * b, float * y,
+        int L, int C, int ith, int nth) {
+    for (int t = ith; t < L; t += nth) {
+        float * yt = y + (size_t) t * C;
+        for (int c = 0; c < C; ++c) {
+            yt[c] = bias_gelu_one(x[(size_t) c * L + t], b[c]);
+        }
+    }
+}
+
+void ggml_compute_forward_bias_gelu(
+        const ggml_compute_params * params,
+              ggml_tensor * dst) {
+
+    const ggml_tensor * x    = dst->src[0]; // [L, C, B, 1] or [C, L, B, 1]
+    const ggml_tensor * bias = dst->src[1]; // [C]
+
+    GGML_ASSERT(x->type    == GGML_TYPE_F32);
+    GGML_ASSERT(bias->type == GGML_TYPE_F32);
+    GGML_ASSERT(dst->type  == GGML_TYPE_F32);
+
+    const int32_t layout = ((const int32_t *) dst->op_params)[0];
+
+    const float * x_data = (const float *) x->data;
+    const float * b_data = (const float *) bias->data;
+          float * y_data = (float *)       dst->data;
+
+    const size_t batch_stride = (size_t) x->ne[0] * x->ne[1];
+    for (int64_t ib = 0; ib < x->ne[2]; ++ib) {
+        const size_t batch_offset = (size_t) ib * batch_stride;
+        if (layout == 0) {
+            bias_gelu_tc(x_data + batch_offset, b_data, y_data + batch_offset,
+                (int) x->ne[0], (int) x->ne[1], params->ith, params->nth);
+        } else if (layout == 1) {
+            bias_gelu_ct(x_data + batch_offset, b_data, y_data + batch_offset,
+                (int) x->ne[1], (int) x->ne[0], params->ith, params->nth);
+        } else {
+            GGML_ASSERT(layout == 2);
+            bias_gelu_tc_to_ct(x_data + batch_offset, b_data, y_data + batch_offset,
+                (int) x->ne[0], (int) x->ne[1], params->ith, params->nth);
+        }
+    }
+}
 // ggml_compute_forward_roll
 
 static int64_t ggml_wrap_index(int64_t i, int64_t ne) {

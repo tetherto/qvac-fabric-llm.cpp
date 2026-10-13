@@ -1213,9 +1213,10 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "CONV_1D_DW_DIRECT",
     "NORM_CHANNEL",
     "SCALE_RESIDUAL",
+    "BIAS_GELU",
 };
 
-static_assert(GGML_OP_COUNT == 117, "GGML_OP_COUNT != 117");
+static_assert(GGML_OP_COUNT == 118, "GGML_OP_COUNT != 118");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1345,9 +1346,10 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "conv_1d_dw_direct(x,w,b)",
     "norm_channel(x,g,b)",
     "scale_residual(x,b,gamma,res)",
+    "bias_gelu(x,b)",
 };
 
-static_assert(GGML_OP_COUNT == 117, "GGML_OP_COUNT != 117");
+static_assert(GGML_OP_COUNT == 118, "GGML_OP_COUNT != 118");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -5869,6 +5871,57 @@ struct ggml_tensor * ggml_scale_residual_tc_to_ct(
         struct ggml_tensor  * gamma,
         struct ggml_tensor  * residual) {
     return ggml_scale_residual_impl(ctx, x, bias, gamma, residual, /*layout=*/2);
+}
+
+// ggml_bias_gelu
+
+static struct ggml_tensor * ggml_bias_gelu_impl(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * bias,
+        int                   layout) {
+    GGML_ASSERT(layout >= 0 && layout <= 2);
+    GGML_ASSERT(x->type == GGML_TYPE_F32);
+    GGML_ASSERT(bias->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(x));
+    GGML_ASSERT(ggml_is_contiguous(bias));
+    GGML_ASSERT(x->ne[2] >= 1 && x->ne[3] == 1);
+    const int64_t C_dim = layout == 0 ? x->ne[1] : layout == 1 ? x->ne[0] : x->ne[1];
+    GGML_ASSERT(bias->ne[0] == C_dim);
+
+    struct ggml_tensor * result = layout == 2
+        ? ggml_new_tensor_4d(ctx, x->type, x->ne[1], x->ne[0], x->ne[2], x->ne[3])
+        : ggml_new_tensor_4d(ctx, x->type, x->ne[0], x->ne[1], x->ne[2], x->ne[3]);
+
+    int32_t params[1] = { layout };
+    ggml_set_op_params(result, params, sizeof(params));
+
+    result->op     = GGML_OP_BIAS_GELU;
+    result->src[0] = x;
+    result->src[1] = bias;
+
+    return result;
+}
+
+struct ggml_tensor * ggml_bias_gelu(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * bias) {
+    return ggml_bias_gelu_impl(ctx, x, bias, /*layout=*/0);
+}
+
+struct ggml_tensor * ggml_bias_gelu_ct(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * bias) {
+    return ggml_bias_gelu_impl(ctx, x, bias, /*layout=*/1);
+}
+
+struct ggml_tensor * ggml_bias_gelu_tc_to_ct(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * bias) {
+    return ggml_bias_gelu_impl(ctx, x, bias, /*layout=*/2);
 }
 // ggml_roll
 

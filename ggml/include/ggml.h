@@ -637,6 +637,7 @@ extern "C" {
         GGML_OP_CONV_1D_DW_DIRECT,
         GGML_OP_NORM_CHANNEL,
         GGML_OP_SCALE_RESIDUAL,
+        GGML_OP_BIAS_GELU,
         GGML_OP_COUNT,
     };
 
@@ -2622,6 +2623,30 @@ extern "C" {
             struct ggml_tensor  * bias,
             struct ggml_tensor  * gamma,
             struct ggml_tensor  * residual);
+
+    // Fused bias-add + GELU (erf form, the gelu_erf in ggml).
+    // Channel-axis broadcasts for `bias` ([C]); `x` is [L, C, B, 1] f32
+    // contiguous. Output matches `x`.
+    //
+    //   y[t, c, batch] = gelu_erf(x[t, c, batch] + bias[c])
+    //                  = 0.5 * v * (1 + erf(v * 1/sqrt(2)))  where v = x + bias
+    GGML_API struct ggml_tensor * ggml_bias_gelu(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * bias);
+
+    // [C, T]-layout variant.  Bias still has length C (== x->ne[0] here).
+    GGML_API struct ggml_tensor * ggml_bias_gelu_ct(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * bias);
+
+    // Fused transpose variant. `x` is contiguous [T, C, B, 1]; the returned
+    // tensor is contiguous [C, T, B, 1].
+    GGML_API struct ggml_tensor * ggml_bias_gelu_tc_to_ct(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * bias);
     // Move tensor elements by an offset given for each dimension. Elements that
     // are shifted beyond the last position are wrapped around to the beginning.
     GGML_API struct ggml_tensor * ggml_roll(
