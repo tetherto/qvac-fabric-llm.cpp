@@ -18,7 +18,7 @@ for the GEMV). The route depends on the number of activation rows `M`:
 
 | M | route |
 | :-- | :-- |
-| 1 | decode GEMV (`kernels/gemv_q4.py` + `kernels/gemv-q4.cc`): the weights stay quantized in DDR and the group parameters are applied to the accumulator |
+| 1 | decode GEMV (`kernels/gemv_q4.py` + `kernels/gemv-q4.cc`): the weights stay quantized in DDR and the group parameters are applied to the accumulator; `Q5_K`/`Q6_K` `attn_qkv` and `attn_v` are taken at 4 bits by default (see [4-bit decode weights](#4-bit-decode-weights-on-by-default)) |
 | 2..63 | decode GEMM, the M32 block (`kernels/gemm.py`, native bf16 r=4) |
 | >= 64 | prefill GEMM, the cheapest baked M block; bf16 for `F16`/`BF16`/`Q4_K`, and the native int8 route (1 B/value) for `Q4_K`/`Q5_K`/`Q6_K` |
 
@@ -117,6 +117,32 @@ Both decode as `w = q*d + m` and both are exact with respect to the ggml block
 they come from, so a single kernel streams either and the GEMV never switches
 hardware context. The packed weights live in a device buffer for the process
 lifetime, keyed by the tensor's data pointer and shape.
+
+#### 4-bit decode weights (on by default)
+
+One step is lossy, and it is on by default by design. For the single-token
+decode, every `Q5_K` or `Q6_K` weight named `attn_qkv` or `attn_v` is
+re-quantized to `Q4_K` from its dequantized values when it is packed, and the
+decode GEMV streams it at 4 bits (q4g32) instead of the exact 8-bit form. That
+applies wherever the decode runs those weights: the fused recurrent and
+attention layers and the per-op GEMV. These two tensors buy the most decode
+speed per unit of accuracy lost. On Qwen3.5-0.8B Q4_K_M, decode goes from 47.5
+to 52.4 t/s at a 1k context, and the decode KLD against the CPU from 0.0051 to
+0.0122. Greedy text can differ from the exact form where two tokens are close.
+
+It does not touch:
+- the prefill GEMM, which takes every weight in its own format (4 bits there
+  would cost prefill KLD 0.0041 -> 0.0105);
+- `Q4_K` tensors, which are 4-bit already;
+- `ssm_out`;
+- the weights in the model file.
+
+`GGML_XDNA_W4` controls it:
+- unset: `attn_qkv,attn_v`, the default above;
+- set and empty (`GGML_XDNA_W4=`): every weight keeps its exact 8-bit form, at
+  the slower decode;
+- a comma-separated list (`GGML_XDNA_W4=attn_v`): the `Q5_K`/`Q6_K` weights it
+  applies to, by the last part of their name (`blk.N.<name>.weight`).
 
 ### One decode token
 
@@ -241,6 +267,7 @@ OMP_WAIT_POLICY=PASSIVE ./build/bin/llama-server -m model.gguf \
 
 Most of the knobs below are for bisecting a regression rather than tuning: each
 one disables the NPU path it names, and the default is the fast one.
+`GGML_XDNA_W4` is for users: it trades decode accuracy for speed.
 `GGML_XDNA_KERNEL_DIR` is for packagers: it points the backend at its artifacts.
 
 | variable | default | effect |
@@ -260,6 +287,7 @@ one disables the NPU path it names, and the default is the fast one.
 | `GGML_XDNA_GDN` | 0 | `1` runs the older GDN prefill body on the array |
 | `GGML_XDNA_FA` | 0 | `1` runs the older flash-attention prefill on the array |
 | `GGML_XDNA_SPIN_US` | 0 | poll this many microseconds for completion before blocking; `-1` polls until it completes |
+| `GGML_XDNA_W4` | `attn_qkv,attn_v` | the `Q5_K`/`Q6_K` weights the decode GEMV takes at 4 bits, a lossy default (see [4-bit decode weights](#4-bit-decode-weights-on-by-default)); empty keeps them at 8 bits |
 | `GGML_XDNA_KERNEL_DIR` | unset | a directory to look for the kernel artifacts in before the others |
 
 The remaining `GGML_XDNA_*` variables (`HEAD`, `QUEUE`, `INPROJ`, `ATTN`,
