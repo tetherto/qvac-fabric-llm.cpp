@@ -643,6 +643,10 @@ extern "C" {
         // Fused batched GRU (LavaSR denoiser): the whole recurrent sweep over
         // the L time-steps as one op, parallel over the batch.
         GGML_OP_GRU,
+
+        // Zero-insertion upsample along ne0 (LavaSR denoiser transpose-conv):
+        // out[i0*s] = in[i0], zeros between, in one pass.
+        GGML_OP_ZERO_UPSAMPLE,
         GGML_OP_COUNT,
     };
 
@@ -2685,6 +2689,13 @@ extern "C" {
             struct ggml_tensor  * gi_all,
             struct ggml_tensor  * bhh,
             bool                  reverse);
+
+    // Zero-insertion upsample of ne0 by factor s: result ne0 = (a->ne0 - 1)*s + 1,
+    // result[i0*s, ...] = a[i0, ...], zeros elsewhere.  a must be contiguous.
+    GGML_API struct ggml_tensor * ggml_zero_upsample(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            int                   s);
     // Move tensor elements by an offset given for each dimension. Elements that
     // are shifted beyond the last position are wrapped around to the beginning.
     GGML_API struct ggml_tensor * ggml_roll(

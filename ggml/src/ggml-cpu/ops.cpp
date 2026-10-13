@@ -9690,6 +9690,35 @@ void ggml_compute_forward_gru(
         }
     }
 }
+
+void ggml_compute_forward_zero_upsample(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+
+    const ggml_tensor * src = dst->src[0];
+    GGML_ASSERT(dst->type == GGML_TYPE_F32 && src->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(src) && ggml_is_contiguous(dst));
+
+    const int64_t s  = ggml_get_op_params_i32(dst, 0);
+    const int64_t F  = src->ne[0];
+    const int64_t Fu = dst->ne[0];
+    const int64_t R  = src->ne[1] * src->ne[2] * src->ne[3];   // rows (ne1*ne2*ne3)
+
+    const float * src_data = (const float *) src->data;
+    float       * dst_data = (float *) dst->data;
+
+    // parallel over rows: zero each output row, then scatter the input at stride s.
+    const int64_t per_thread = (R + params->nth - 1) / params->nth;
+    const int64_t start = params->ith * per_thread;
+    const int64_t end   = MIN(start + per_thread, R);
+
+    for (int64_t r = start; r < end; ++r) {
+        const float * sp = src_data + r * F;
+        float       * dp = dst_data + r * Fu;
+        for (int64_t i = 0; i < Fu; ++i) dp[i] = 0.0f;
+        for (int64_t f = 0; f < F; ++f) dp[f * s] = sp[f];
+    }
+}
 static void ggml_compute_forward_roll_f32(
         const ggml_compute_params * params,
         ggml_tensor * dst) {

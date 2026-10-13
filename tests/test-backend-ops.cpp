@@ -5669,6 +5669,36 @@ struct test_gru : public test_case {
         }
     }
 };
+
+// GGML_OP_ZERO_UPSAMPLE
+struct test_zero_upsample : public test_case {
+    const std::array<int64_t, 4> ne;
+    const int s;
+    const bool offset;
+
+    std::string vars() override {
+        return VARS_TO_STR3(ne, s, offset);
+    }
+
+    test_zero_upsample(std::array<int64_t, 4> ne = {10, 7, 3, 2}, int s = 2, bool offset = false)
+        : ne(ne), s(s), offset(offset) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = offset ? offset_view(ctx) : ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
+        return ggml_zero_upsample(ctx, a, s);
+    }
+
+    // A contiguous view that starts one element into its storage, so it is
+    // misaligned for backends that bind buffers at an aligned offset.
+    ggml_tensor * offset_view(ggml_context * ctx) {
+        const int64_t elements = ne[0] * ne[1] * ne[2] * ne[3];
+        ggml_tensor * storage = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, elements + 1);
+        ggml_set_name(storage, "zero-upsample-offset-storage");
+        return ggml_view_4d(ctx, storage, ne[0], ne[1], ne[2], ne[3],
+            ne[0] * sizeof(float), ne[0] * ne[1] * sizeof(float),
+            ne[0] * ne[1] * ne[2] * sizeof(float), sizeof(float));
+    }
+};
 // GGML_OP_SSM_SCAN
 struct test_ssm_scan : public test_case {
     const ggml_type type;
@@ -14367,6 +14397,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gru(64, 1, 17, false, 90.0f));  // past fp32 exp-overflow threshold (~88.7)
     test_cases.emplace_back(new test_gru(64, 1, 17, false, 150.0f)); // LavaSR-observed activation range
     test_cases.emplace_back(new test_gru(64, 1, 17, false, 300.0f)); // extreme saturation
+
+    test_cases.emplace_back(new test_zero_upsample({10, 7, 3, 2}, 1));
+    test_cases.emplace_back(new test_zero_upsample({10, 7, 3, 2}, 2));
+    test_cases.emplace_back(new test_zero_upsample({33, 5, 2, 2}, 5));
+    test_cases.emplace_back(new test_zero_upsample({10, 7, 3, 2}, 2, true));
     // fused ssm_conv + (optional) bias_add + silu. The bias-only graph (no silu) is intentionally
     // not tested since there's no fusion for that pattern in ggml_cuda_can_fuse.
     for (int64_t d_conv : {3, 4, 7, 9}) {

@@ -1217,9 +1217,10 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "PAD_REPLICATE_1D",
 
     "GRU",
+    "ZERO_UPSAMPLE",
 };
 
-static_assert(GGML_OP_COUNT == 120, "GGML_OP_COUNT != 120");
+static_assert(GGML_OP_COUNT == 121, "GGML_OP_COUNT != 121");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1353,9 +1354,10 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "pad_replicate_1d(x,pad_l,pad_r)",
 
     "gru(whh,gi,bhh)",
+    "zero_upsample(x)",
 };
 
-static_assert(GGML_OP_COUNT == 120, "GGML_OP_COUNT != 120");
+static_assert(GGML_OP_COUNT == 121, "GGML_OP_COUNT != 121");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -6009,6 +6011,27 @@ struct ggml_tensor * ggml_gru(
     result->src[0] = whh;
     result->src[1] = gi_all;
     result->src[2] = bhh;
+
+    return result;
+}
+
+// ggml_zero_upsample
+
+struct ggml_tensor * ggml_zero_upsample(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        int                   s) {
+    GGML_ASSERT(a->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(a));
+    GGML_ASSERT(s >= 1);
+
+    const int64_t ne0 = (a->ne[0] - 1) * s + 1;
+    struct ggml_tensor * result = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, ne0, a->ne[1], a->ne[2], a->ne[3]);
+
+    ggml_set_op_params_i32(result, 0, s);
+
+    result->op     = GGML_OP_ZERO_UPSAMPLE;
+    result->src[0] = a;
 
     return result;
 }
