@@ -219,9 +219,7 @@ bool xdna_att_run(xdna_att *    a,
         int32_t * w      = (int32_t *) qb;
         w[4 * D / 2]     = n_valid;
         w[4 * D / 2 + 1] = t;
-        // GGML_XDNA_ATTN_SKIP: move the data, skip the arithmetic - what the
-        // DMA alone costs (diagnostic; the output is garbage)
-        w[4 * D / 2 + 2] = getenv("GGML_XDNA_ATTN_SKIP") ? 1 : 0;
+        w[4 * D / 2 + 2] = 0;  // the kernel's skip-the-arithmetic flag: never set
     }
     if (!xdna_buffer_sync_to_device(a->act)) {
         return false;
