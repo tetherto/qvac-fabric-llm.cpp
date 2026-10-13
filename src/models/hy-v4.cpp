@@ -379,43 +379,11 @@ ggml_tensor * llama_model_hy_v4::graph::build_indexer_top_k(
 
     const auto * mctx_lid   = inp_attn_dsa->mctx->get_lid();
     const auto & k_idxs_lid = inp_attn_dsa->get_k_idxs_lid();
-    ggml_build_forward_expand(gf, mctx_lid->cpy_k(ctx0, ik, k_idxs_lid, il));
-
     ggml_tensor * iw = ggml_mul_mat(ctx0, layer.indexer_proj, cur);
 
-    ik = mctx_lid->get_k(ctx0, il);
-
-    const auto n_stream = ik->ne[3];
-    iq = ggml_view_4d(ctx0, iq, iq->ne[0], iq->ne[1], iq->ne[2]/n_stream, n_stream,
-            iq->nb[1], iq->nb[2], iq->nb[3]/n_stream, 0);
-    iw = ggml_view_4d(ctx0, iw, iw->ne[0], iw->ne[1]/n_stream, iw->ne[2], n_stream,
-            iw->nb[1], iw->nb[2]/n_stream, iw->nb[3]/n_stream, 0);
-
-    // fold both reference scale factors into the weights before the big score tensor
-    iw = ggml_scale(ctx0, iw, 1.0f / sqrtf(float(n_embd_indexer * n_indexer_head)));
-
-    ggml_tensor * score = nullptr;
-    if (cparams.fused_lid) {
-        score = ggml_lightning_indexer(ctx0, iq, ik, iw, inp_attn_dsa->get_kq_mask_lid());
-        cb(score, "indexer_score", il);
-        res->add_fused_node({LLM_FUSED_OP_LIGHTNING_INDEXER, score, il});
-    } else {
-        iq = ggml_permute(ctx0, iq, 0, 2, 1, 3);
-        ik = ggml_permute(ctx0, ik, 0, 2, 1, 3);
-
-        score = ggml_mul_mat(ctx0, ik, iq);
-        score = ggml_cont(ctx0, ggml_permute(ctx0, score, 2, 1, 0, 3));
-        score = ggml_relu(ctx0, score);
-        score = ggml_mul(ctx0, score, iw);
-        score = ggml_sum_rows(ctx0, score);
-        score = ggml_cont(ctx0, ggml_permute(ctx0, score, 2, 1, 0, 3));
-        score = ggml_add(ctx0, score, inp_attn_dsa->get_kq_mask_lid());
-        cb(score, "indexer_score", il);
-    }
-
-    const uint32_t n_top_k = score->ne[0] < (int64_t) hparams.indexer_top_k ? score->ne[0] : hparams.indexer_top_k;
-
-    return ggml_cont(ctx0, ggml_top_k(ctx0, score, n_top_k));
+    return build_lid_top_k(
+            mctx_lid, iq, ik, iw, k_idxs_lid, inp_attn_dsa->get_kq_mask_lid(),
+            1.0f / sqrtf(float(n_embd_indexer * n_indexer_head)), hparams.indexer_top_k, il);
 }
 
 ggml_tensor * llama_model_hy_v4::graph::build_attention_dsa(
