@@ -24,6 +24,8 @@ ggml_add_backend_library(ggml-xdna
                         )
 
 target_link_libraries(ggml-xdna PRIVATE XRT::xrt_coreutil)
+# dladdr: the kernel artifacts are looked for next to the backend module
+target_link_libraries(ggml-xdna PRIVATE ${CMAKE_DL_LIBS})
 
 # The one place the backend wants threads: re-quantising a weight tensor to
 # int8 the first time a GEMM asks for it. It is once per tensor and still
