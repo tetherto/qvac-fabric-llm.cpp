@@ -636,6 +636,7 @@ extern "C" {
         // multi-op sub-graph into one dispatch.
         GGML_OP_CONV_1D_DW_DIRECT,
         GGML_OP_NORM_CHANNEL,
+        GGML_OP_SCALE_RESIDUAL,
         GGML_OP_COUNT,
     };
 
@@ -2591,6 +2592,36 @@ extern "C" {
             struct ggml_tensor  * g,
             struct ggml_tensor  * b,
             float                 eps);
+
+    // Fused (x + bias) * gamma + residual. Channel-axis
+    // broadcasts for `bias` and `gamma` (both [C]); `x` and `residual`
+    // are [L, C, B, 1] f32 contiguous. Output matches `x`.
+    //
+    //   y[t, c, batch] = residual[t, c, batch] + (x[t, c, batch] + bias[c]) * gamma[c]
+    GGML_API struct ggml_tensor * ggml_scale_residual(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * bias,
+            struct ggml_tensor  * gamma,
+            struct ggml_tensor  * residual);
+
+    // [C, T]-layout variant. Bias/gamma still have length C (== x->ne[0]
+    // here, vs == x->ne[1] in the [T, C] variant).
+    GGML_API struct ggml_tensor * ggml_scale_residual_ct(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * bias,
+            struct ggml_tensor  * gamma,
+            struct ggml_tensor  * residual);
+
+    // Fused transpose variant. `x` is contiguous [T, C, B, 1], while
+    // `residual` and the returned tensor are contiguous [C, T, B, 1].
+    GGML_API struct ggml_tensor * ggml_scale_residual_tc_to_ct(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * bias,
+            struct ggml_tensor  * gamma,
+            struct ggml_tensor  * residual);
     // Move tensor elements by an offset given for each dimension. Elements that
     // are shifted beyond the last position are wrapped around to the beginning.
     GGML_API struct ggml_tensor * ggml_roll(

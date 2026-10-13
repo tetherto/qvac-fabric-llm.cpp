@@ -1212,9 +1212,10 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
 
     "CONV_1D_DW_DIRECT",
     "NORM_CHANNEL",
+    "SCALE_RESIDUAL",
 };
 
-static_assert(GGML_OP_COUNT == 116, "GGML_OP_COUNT != 116");
+static_assert(GGML_OP_COUNT == 117, "GGML_OP_COUNT != 117");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1343,9 +1344,10 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
 
     "conv_1d_dw_direct(x,w,b)",
     "norm_channel(x,g,b)",
+    "scale_residual(x,b,gamma,res)",
 };
 
-static_assert(GGML_OP_COUNT == 116, "GGML_OP_COUNT != 116");
+static_assert(GGML_OP_COUNT == 117, "GGML_OP_COUNT != 117");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -5793,6 +5795,80 @@ struct ggml_tensor * ggml_norm_channel_ct(
         struct ggml_tensor  * b,
         float                 eps) {
     return ggml_norm_channel_impl(ctx, a, g, b, eps, /*layout=*/1);
+}
+
+// ggml_scale_residual
+
+static struct ggml_tensor * ggml_scale_residual_impl(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * bias,
+        struct ggml_tensor  * gamma,
+        struct ggml_tensor  * residual,
+        int                   layout) {
+    GGML_ASSERT(layout >= 0 && layout <= 2);
+    GGML_ASSERT(x->type == GGML_TYPE_F32);
+    GGML_ASSERT(bias->type == GGML_TYPE_F32);
+    GGML_ASSERT(gamma->type == GGML_TYPE_F32);
+    GGML_ASSERT(residual->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(x));
+    GGML_ASSERT(ggml_is_contiguous(bias));
+    GGML_ASSERT(ggml_is_contiguous(gamma));
+    GGML_ASSERT(ggml_is_contiguous(residual));
+    GGML_ASSERT(x->ne[2] >= 1 && x->ne[3] == 1);
+    const int64_t C_dim = layout == 0 ? x->ne[1] : layout == 1 ? x->ne[0] : x->ne[1];
+    GGML_ASSERT(bias->ne[0] == C_dim);
+    GGML_ASSERT(gamma->ne[0] == C_dim);
+    if (layout == 2) {
+        GGML_ASSERT(residual->ne[0] == x->ne[1]);
+        GGML_ASSERT(residual->ne[1] == x->ne[0]);
+    } else {
+        GGML_ASSERT(residual->ne[0] == x->ne[0]);
+        GGML_ASSERT(residual->ne[1] == x->ne[1]);
+    }
+    GGML_ASSERT(residual->ne[2] == x->ne[2] && residual->ne[3] == 1);
+
+    struct ggml_tensor * result = layout == 2
+        ? ggml_new_tensor_4d(ctx, x->type, x->ne[1], x->ne[0], x->ne[2], x->ne[3])
+        : ggml_new_tensor_4d(ctx, x->type, x->ne[0], x->ne[1], x->ne[2], x->ne[3]);
+
+    int32_t params[1] = { layout };
+    ggml_set_op_params(result, params, sizeof(params));
+
+    result->op     = GGML_OP_SCALE_RESIDUAL;
+    result->src[0] = x;
+    result->src[1] = bias;
+    result->src[2] = gamma;
+    result->src[3] = residual;
+
+    return result;
+}
+
+struct ggml_tensor * ggml_scale_residual(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * bias,
+        struct ggml_tensor  * gamma,
+        struct ggml_tensor  * residual) {
+    return ggml_scale_residual_impl(ctx, x, bias, gamma, residual, /*layout=*/0);
+}
+
+struct ggml_tensor * ggml_scale_residual_ct(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * bias,
+        struct ggml_tensor  * gamma,
+        struct ggml_tensor  * residual) {
+    return ggml_scale_residual_impl(ctx, x, bias, gamma, residual, /*layout=*/1);
+}
+
+struct ggml_tensor * ggml_scale_residual_tc_to_ct(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * bias,
+        struct ggml_tensor  * gamma,
+        struct ggml_tensor  * residual) {
+    return ggml_scale_residual_impl(ctx, x, bias, gamma, residual, /*layout=*/2);
 }
 // ggml_roll
 

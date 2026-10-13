@@ -5336,6 +5336,36 @@ struct test_norm_channel : public test_case {
     }
 };
 
+// GGML_OP_SCALE_RESIDUAL
+struct test_scale_residual : public test_case {
+    const int64_t L;
+    const int64_t C;
+    const int64_t B;
+    const bool    ct;
+
+    std::string vars() override {
+        return VARS_TO_STR4(L, C, B, ct);
+    }
+
+    test_scale_residual(int64_t L = 139, int64_t C = 512, int64_t B = 1, bool ct = false)
+        : L(L), C(C), B(B), ct(ct) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x = ct ? ggml_new_tensor_3d(ctx, GGML_TYPE_F32, C, L, B) : ggml_new_tensor_3d(ctx, GGML_TYPE_F32, L, C, B);
+        ggml_set_name(x, "x");
+        ggml_tensor * bias = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, C);
+        ggml_set_name(bias, "bias");
+        ggml_tensor * gamma = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, C);
+        ggml_set_name(gamma, "gamma");
+        ggml_tensor * residual = ggml_dup_tensor(ctx, x);
+        ggml_set_name(residual, "residual");
+        ggml_tensor * out = ct ? ggml_scale_residual_ct(ctx, x, bias, gamma, residual)
+                               : ggml_scale_residual(ctx, x, bias, gamma, residual);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 // GGML_OP_CONV_1D_DW_DIRECT
 struct test_conv_1d_dw_direct : public test_case {
     const int64_t L;
@@ -13976,6 +14006,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_conv_1d_dw_direct_norm_channel(139, 2048, 3, 1, true));
     test_cases.emplace_back(new test_conv_1d_dw_direct_norm_channel(139, 2304, 3, 1, true));
     test_cases.emplace_back(new test_conv_1d_dw_direct_norm_channel(37, 96, 5, 2, true, false, 0, 2));
+    for (bool ct : { false, true }) {
+        test_cases.emplace_back(new test_scale_residual(139, 512, 1, ct));
+        test_cases.emplace_back(new test_scale_residual(37, 96, 2, ct));
+    }
     test_cases.emplace_back(new test_l2_norm_back());
     test_cases.emplace_back(new test_l2_norm_back(GGML_TYPE_F32, { 1025, 5, 4, 3 }));
     test_cases.emplace_back(new test_l2_norm_back(GGML_TYPE_F32, {   64, 5, 4, 3 }, 1e-6f, true));

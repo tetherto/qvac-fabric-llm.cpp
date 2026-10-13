@@ -9382,6 +9382,94 @@ void ggml_compute_forward_norm_channel(
         }
     }
 }
+
+// ggml_compute_forward_scale_residual
+
+// [T, C]: timesteps are contiguous, so stripe over channels and hoist the
+// per-channel bias and gamma out of the inner loop.
+static void scale_residual_tc(
+        const float * x, const float * b, const float * g, const float * r,
+        float * y, int L, int C, int ith, int nth) {
+    for (int c = ith; c < C; c += nth) {
+        const float bv = b[c];
+        const float gv = g[c];
+        const float * xc = x + (size_t) c * L;
+        const float * rc = r + (size_t) c * L;
+        float       * yc = y + (size_t) c * L;
+        for (int t = 0; t < L; ++t) {
+            yc[t] = rc[t] + (xc[t] + bv) * gv;
+        }
+    }
+}
+
+// [C, T]: channels are contiguous, so stripe over timesteps. All four streams
+// are then unit-stride; striping over channels would walk one float per line.
+static void scale_residual_ct(
+        const float * x, const float * b, const float * g, const float * r,
+        float * y, int L, int C, int ith, int nth) {
+    for (int t = ith; t < L; t += nth) {
+        const float * xt = x + (size_t) t * C;
+        const float * rt = r + (size_t) t * C;
+        float       * yt = y + (size_t) t * C;
+        for (int c = 0; c < C; ++c) {
+            yt[c] = rt[c] + (xt[c] + b[c]) * g[c];
+        }
+    }
+}
+
+// Transpose while fusing the pointwise epilogue: x is [T, C], residual/y are
+// [C, T]. Stripe over output timesteps for contiguous residual/output writes.
+static void scale_residual_tc_to_ct(
+        const float * x, const float * b, const float * g, const float * r,
+        float * y, int L, int C, int ith, int nth) {
+    for (int t = ith; t < L; t += nth) {
+        const float * rt = r + (size_t) t * C;
+        float       * yt = y + (size_t) t * C;
+        for (int c = 0; c < C; ++c) {
+            yt[c] = rt[c] + (x[(size_t) c * L + t] + b[c]) * g[c];
+        }
+    }
+}
+
+void ggml_compute_forward_scale_residual(
+        const ggml_compute_params * params,
+              ggml_tensor * dst) {
+
+    const ggml_tensor * x        = dst->src[0]; // [L, C, B, 1] or [C, L, B, 1]
+    const ggml_tensor * bias     = dst->src[1]; // [C]
+    const ggml_tensor * gamma    = dst->src[2]; // [C]
+    const ggml_tensor * residual = dst->src[3]; // same shape as dst
+
+    GGML_ASSERT(x->type == GGML_TYPE_F32);
+    GGML_ASSERT(bias->type == GGML_TYPE_F32);
+    GGML_ASSERT(gamma->type == GGML_TYPE_F32);
+    GGML_ASSERT(residual->type == GGML_TYPE_F32);
+    GGML_ASSERT(dst->type == GGML_TYPE_F32);
+
+    const int32_t layout = ((const int32_t *) dst->op_params)[0];
+
+    const float * x_data   = (const float *) x->data;
+    const float * b_data   = (const float *) bias->data;
+    const float * g_data   = (const float *) gamma->data;
+    const float * r_data   = (const float *) residual->data;
+          float * y_data   = (float *) dst->data;
+
+    const size_t batch_stride = (size_t) x->ne[0] * x->ne[1];
+    for (int64_t ib = 0; ib < x->ne[2]; ++ib) {
+        const size_t batch_offset = (size_t) ib * batch_stride;
+        if (layout == 0) {
+            scale_residual_tc(x_data + batch_offset, b_data, g_data, r_data + batch_offset, y_data + batch_offset,
+                (int) x->ne[0], (int) x->ne[1], params->ith, params->nth);
+        } else if (layout == 1) {
+            scale_residual_ct(x_data + batch_offset, b_data, g_data, r_data + batch_offset, y_data + batch_offset,
+                (int) x->ne[1], (int) x->ne[0], params->ith, params->nth);
+        } else {
+            GGML_ASSERT(layout == 2);
+            scale_residual_tc_to_ct(x_data + batch_offset, b_data, g_data, r_data + batch_offset, y_data + batch_offset,
+                (int) x->ne[0], (int) x->ne[1], params->ith, params->nth);
+        }
+    }
+}
 // ggml_compute_forward_roll
 
 static int64_t ggml_wrap_index(int64_t i, int64_t ne) {
