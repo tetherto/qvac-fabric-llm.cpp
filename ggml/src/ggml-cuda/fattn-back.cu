@@ -1,31 +1,9 @@
 #include "fattn-back.cuh"
+#include "fattn-back-mma.cuh"
 
 #define FAB_D_MAX    256
 #define FAB_PER_LANE (FAB_D_MAX/WARP_SIZE)
 #define FAB_WARPS    8
-
-
-struct ggml_cuda_flash_attn_ext_back_kargs {
-    int32_t target; // ggml_flash_attn_ext_back_target
-    float   scale;
-
-    int64_t D;         // head size, hsk == hsv
-    int64_t n_q;       // q rows per head
-    int64_t n_kv;      // kv rows per head
-    int64_t n_head;
-    int64_t n_head_kv; // q head h reads kv head h / (n_head/n_head_kv)
-    int64_t ne3;
-
-    // q [D, n_q, n_head, ne3], k and v [D, n_kv, n_head_kv, ne3]
-    uint64_t nbq1, nbq2, nbq3;
-    uint64_t nbk1, nbk2, nbk3;
-    uint64_t nbv1, nbv2, nbv3;
-
-    // mask [n_kv, >= n_q, nem2, nem3] F16, broadcast over heads and ne3, zero when absent
-    int64_t  nem2, nem3;
-    uint64_t nbm1, nbm2, nbm3;
-};
-static_assert(std::is_trivially_copyable_v<ggml_cuda_flash_attn_ext_back_kargs>);
 
 
 // o and grad_o are [D, n_head, n_q, ne3], stats [2, n_q, n_head, ne3], contiguous like dst:
@@ -314,11 +292,15 @@ void ggml_cuda_flash_attn_ext_back(ggml_backend_cuda_context & ctx, ggml_tensor 
     args.nbk1 = k->nb[1]; args.nbk2 = k->nb[2]; args.nbk3 = k->nb[3];
     args.nbv1 = v->nb[1]; args.nbv2 = v->nb[2]; args.nbv3 = v->nb[3];
 
+    args.nem2 = 1; args.nem3 = 1;
     if (mask) {
         args.nem2 = mask->ne[2]; args.nem3 = mask->ne[3];
         args.nbm1 = mask->nb[1]; args.nbm2 = mask->nb[2]; args.nbm3 = mask->nb[3];
     }
 
+    if (ggml_cuda_flash_attn_ext_back_mma(ctx, dst, args)) {
+        return;
+    }
     if (k->type == GGML_TYPE_F16) {
         launch_flash_attn_ext_back<half>(dst, args, ctx.stream());
     } else {
