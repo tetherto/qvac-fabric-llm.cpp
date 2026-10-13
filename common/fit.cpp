@@ -6,6 +6,7 @@
 #include "log.h"
 
 #include "../src/llama-ext.h"
+#include "../ggml/src/ggml-impl.h"
 
 #include <array>
 #include <algorithm>
@@ -36,33 +37,22 @@ static std::mutex & common_fit_logger_mutex() {
     return mutex;
 }
 
-// RAII: send llama logs below min_level to the debug log
-// the scope also serializes the temporary logger override across all fit/memory probes
+// RAII: on this thread, send llama logs below min_level to the debug log
+// the scope also serializes fit/memory probes
 struct common_fit_log_scope {
-    common_fit_log_scope(ggml_log_level min_level) : lock(common_fit_logger_mutex()), min_level(min_level) {
-        llama_log_get(&original_logger.callback, &original_logger.user_data);
-        llama_log_set([](ggml_log_level level, const char * text, void * user_data) {
-            const common_fit_log_scope * self = (const common_fit_log_scope *) user_data;
-            const ggml_log_level level_eff = level >= self->min_level ? level : GGML_LOG_LEVEL_DEBUG;
-            self->original_logger.callback(level_eff, text, self->original_logger.user_data);
-        }, this);
-    }
+    explicit common_fit_log_scope(ggml_log_level min_level)
+        : lock(common_fit_logger_mutex()), previous(ggml_log_set_thread_min_level(min_level)) {}
 
     ~common_fit_log_scope() {
-        llama_log_set(original_logger.callback, original_logger.user_data);
+        ggml_log_set_thread_min_level(previous);
     }
 
     common_fit_log_scope(const common_fit_log_scope &) = delete;
     common_fit_log_scope & operator=(const common_fit_log_scope &) = delete;
 
 private:
-    // declared first: taken before the logger is swapped and released after the destructor restores it
-    std::lock_guard<std::mutex> lock;
-    struct {
-        ggml_log_callback callback;
-        void * user_data;
-    } original_logger;
-    ggml_log_level min_level;
+    std::lock_guard<std::mutex> lock; // declared first: held until the level is restored
+    ggml_log_level previous;
 };
 
 static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
