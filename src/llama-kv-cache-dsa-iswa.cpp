@@ -73,6 +73,8 @@ llama_kv_cache_dsa_iswa::llama_kv_cache_dsa_iswa(
             model, hparams, type_k, type_v,
             v_trans, offload, unified, size_swa, n_seq_max, n_pad,
             hparams.n_swa, hparams.swa_type, nullptr, filter_swa, reuse, nullptr);
+
+    kv_swa->set_allow_stream_gaps(true);
 }
 
 void llama_kv_cache_dsa_iswa::clear(bool data) {
@@ -187,7 +189,7 @@ llama_memory_context_ptr llama_kv_cache_dsa_iswa::init_batch(llama_batch_allocr 
 
         std::vector<llama_ubatch> ubatches;
         while (true) {
-            auto ubatch = balloc.split_equal(n_ubatch, !unified, 0);
+            auto ubatch = balloc.split_equal(n_ubatch, !unified, 0, true);
 
             if (ubatch.n_tokens == 0) {
                 break;
@@ -237,6 +239,10 @@ bool llama_kv_cache_dsa_iswa::get_can_shift() const {
     return kv_dsa->get_can_shift() &&
            kv_swa->get_can_shift() &&
            kv_dsa->get_mla()->get_size() == kv_swa->get_size();
+}
+
+bool llama_kv_cache_dsa_iswa::get_allow_stream_gaps() const {
+    return kv_dsa->get_allow_stream_gaps() && kv_swa->get_allow_stream_gaps();
 }
 
 void llama_kv_cache_dsa_iswa::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
@@ -293,8 +299,8 @@ llama_kv_cache_dsa_iswa_context::llama_kv_cache_dsa_iswa_context(
         std::vector<llama_ubatch> ubatches) :
     ubatches(std::move(ubatches)),
     // note: here we copy the ubatches. not sure if this is ideal
-    ctx_dsa(new llama_kv_cache_dsa_context(kv->get_dsa(), std::move(sinfos_mla), std::move(sinfos_lid), this->ubatches)),
-    ctx_swa(new llama_kv_cache_context(kv->get_swa(), std::move(sinfos_swa), this->ubatches)),
+    ctx_dsa(new llama_kv_cache_dsa_context(kv->get_dsa(), std::move(sinfos_mla), std::move(sinfos_lid), this->ubatches, true)),
+    ctx_swa(new llama_kv_cache_context(kv->get_swa(), std::move(sinfos_swa), this->ubatches, true)),
     status(llama_memory_status_combine(ctx_dsa->get_status(), ctx_swa->get_status())) {
 }
 

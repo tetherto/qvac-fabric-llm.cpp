@@ -45,6 +45,8 @@ public:
 
     bool get_can_shift() const override;
 
+    bool get_allow_stream_gaps() const override;
+
     void clear(bool data) override;
 
     bool seq_rm  (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1) override;
