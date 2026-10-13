@@ -1221,9 +1221,10 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "CHANNEL_SHUFFLE",
     "AFFINE_PRELU",
     "SNAKE",
+    "LSTM_CELL",
 };
 
-static_assert(GGML_OP_COUNT == 124, "GGML_OP_COUNT != 124");
+static_assert(GGML_OP_COUNT == 125, "GGML_OP_COUNT != 125");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1361,9 +1362,10 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "channel_shuffle(x)",
     "affine_prelu(x,aw,ab,slope)",
     "snake(x,a,inv_b)",
+    "lstm_cell(gates,c)",
 };
 
-static_assert(GGML_OP_COUNT == 124, "GGML_OP_COUNT != 124");
+static_assert(GGML_OP_COUNT == 125, "GGML_OP_COUNT != 125");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -6113,6 +6115,54 @@ struct ggml_tensor * ggml_snake(
     result->src[2] = inv_b;
 
     return result;
+}
+
+// ggml_lstm_cell
+
+static struct ggml_tensor * ggml_lstm_cell_impl(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * gates,
+        struct ggml_tensor  * prev,
+        struct ggml_tensor  * mask,
+        int64_t               H) {
+    GGML_ASSERT(gates->type == GGML_TYPE_F32);
+    GGML_ASSERT(prev->type  == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(gates));
+    GGML_ASSERT(ggml_is_contiguous(prev));
+    GGML_ASSERT(gates->ne[0] == GGML_LSTM_N_GATES*H);
+    GGML_ASSERT(gates->ne[1] == prev->ne[1]);
+    GGML_ASSERT(gates->ne[2] == 1 && gates->ne[3] == 1);
+    GGML_ASSERT(prev->ne[2]  == 1 && prev->ne[3]  == 1);
+
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32,
+                                                     GGML_LSTM_N_OUTS*H, prev->ne[1]);
+
+    result->op     = GGML_OP_LSTM_CELL;
+    result->src[0] = gates;
+    result->src[1] = prev;
+    result->src[2] = mask;
+
+    return result;
+}
+
+struct ggml_tensor * ggml_lstm_cell(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * gates,
+        struct ggml_tensor  * c_prev) {
+    return ggml_lstm_cell_impl(ctx, gates, c_prev, NULL, c_prev->ne[0]);
+}
+
+struct ggml_tensor * ggml_lstm_cell_masked(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * gates,
+        struct ggml_tensor  * hc_prev,
+        struct ggml_tensor  * mask) {
+    GGML_ASSERT(mask->type == GGML_TYPE_I32);
+    GGML_ASSERT(ggml_is_contiguous(mask));
+    GGML_ASSERT(hc_prev->ne[0] % GGML_LSTM_N_OUTS == 0);
+    GGML_ASSERT(ggml_nelements(mask) == hc_prev->ne[1] || ggml_nelements(mask) == 1);
+
+    return ggml_lstm_cell_impl(ctx, gates, hc_prev, mask, hc_prev->ne[0]/GGML_LSTM_N_OUTS);
 }
 // ggml_roll
 

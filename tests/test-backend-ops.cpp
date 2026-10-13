@@ -5760,6 +5760,71 @@ struct test_snake : public test_case {
         return ggml_snake(ctx, x, a, inv_b);
     }
 };
+
+// GGML_OP_LSTM_CELL
+struct test_lstm_cell : public test_case {
+    const int64_t h;  // hidden size
+    const int64_t n;  // batch (columns)
+
+    std::string vars() override {
+        return VARS_TO_STR2(h, n);
+    }
+
+    test_lstm_cell(int64_t h = 32, int64_t n = 1) : h(h), n(n) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * gates  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 4*h, n);
+        ggml_tensor * c_prev = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, h, n);
+        ggml_set_name(gates,  "gates");
+        ggml_set_name(c_prev, "c_prev");
+        return ggml_lstm_cell(ctx, gates, c_prev);
+    }
+};
+
+// GGML_OP_LSTM_CELL, masked form over a packed [h | c] previous state
+struct test_lstm_cell_masked : public test_case {
+    const int64_t h;        // hidden size
+    const int64_t n;        // batch (columns)
+    const int32_t mask_val; // 0 holds the previous pair, non-zero takes the fresh one
+    const bool broadcast;   // one mask entry for every column instead of one each
+    const int64_t mask_off; // > 0: the mask is a view this many elements into a longer buffer
+
+    std::string vars() override {
+        return VARS_TO_STR5(h, n, mask_val, broadcast, mask_off);
+    }
+
+    test_lstm_cell_masked(int64_t h = 32, int64_t n = 1, int32_t mask_val = 1, bool broadcast = false,
+                          int64_t mask_off = 0)
+        : h(h), n(n), mask_val(mask_val), broadcast(broadcast), mask_off(mask_off) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t n_mask = broadcast ? 1 : n;
+        ggml_tensor * gates   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 4*h, n);
+        ggml_tensor * hc_prev = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 2*h, n);
+        ggml_tensor * mask    = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, mask_off + n_mask);
+        ggml_set_name(gates,   "gates");
+        ggml_set_name(hc_prev, "hc_prev");
+        ggml_set_name(mask,    "mask");
+        if (mask_off > 0) {
+            mask = ggml_view_1d(ctx, mask, n_mask, mask_off*sizeof(int32_t));
+        }
+        return ggml_lstm_cell_masked(ctx, gates, hc_prev, mask);
+    }
+
+    // The elements before the view hold the opposite value, so a kernel that
+    // ignores the view offset reads the wrong mask.
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (std::string(t->name) == "mask") {
+                std::vector<int32_t> m((size_t) ggml_nelements(t), mask_val);
+                std::fill(m.begin(), m.begin() + mask_off, mask_val == 0 ? 1 : 0);
+                ggml_backend_tensor_set(t, m.data(), 0, m.size()*sizeof(int32_t));
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
 // GGML_OP_SSM_SCAN
 struct test_ssm_scan : public test_case {
     const ggml_type type;
@@ -14473,6 +14538,28 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     test_cases.emplace_back(new test_snake(32, 8));
     test_cases.emplace_back(new test_snake(127, 3));
+
+    for (int64_t h : {32, 640}) {
+        for (int64_t n : {1, 5}) {
+            test_cases.emplace_back(new test_lstm_cell(h, n));
+        }
+    }
+
+    for (int64_t h : {32, 640}) {
+        for (int64_t n : {1, 4}) {
+            for (float mask_val : {0.0f, 1.0f}) {
+                for (bool broadcast : {false, true}) {
+                    test_cases.emplace_back(new test_lstm_cell_masked(h, n, mask_val, broadcast));
+                }
+            }
+        }
+    }
+
+    // The TDT decoder passes the update flag as a view into its control tensor.
+    for (int32_t mask_val : {0, 1}) {
+        test_cases.emplace_back(new test_lstm_cell_masked(640, 1, mask_val, true, 3));
+        test_cases.emplace_back(new test_lstm_cell_masked(32, 4, mask_val, false, 3));
+    }
     // fused ssm_conv + (optional) bias_add + silu. The bias-only graph (no silu) is intentionally
     // not tested since there's no fusion for that pattern in ggml_cuda_can_fuse.
     for (int64_t d_conv : {3, 4, 7, 9}) {

@@ -659,6 +659,10 @@ extern "C" {
         // Snake activation y = x + sin^2(a*x) * inv_b, per-channel a / inv_b
         // (ACE-Step Oobleck VAE).
         GGML_OP_SNAKE,
+
+        // Fused LSTM cell (Parakeet TDT decoder): the four gate activations plus
+        // the new cell and hidden state as one op.
+        GGML_OP_LSTM_CELL,
         GGML_OP_COUNT,
     };
 
@@ -2732,6 +2736,22 @@ extern "C" {
             struct ggml_tensor  * x,      // [T, C]
             struct ggml_tensor  * a,      // per-channel scale inside sin(), F32
             struct ggml_tensor  * inv_b); // per-channel output scale, F32
+
+    // fused LSTM cell: c_new = sigmoid(f)*c_prev + sigmoid(i)*tanh(g),
+    // h_new = sigmoid(o)*tanh(c_new).  Result rows [0, H) are h_new, [H, 2H) are c_new.
+    GGML_API struct ggml_tensor * ggml_lstm_cell(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * gates,   // [4H, N] pre-activations, i | f | g | o along ne0, F32
+            struct ggml_tensor  * c_prev); // [H, N] previous cell state, F32
+
+    // Same cell over a packed [h | c] previous state, selected per column: a column
+    // whose mask entry is non-zero takes the fresh pair, the rest copy hc_prev bit
+    // for bit (a select, so a held column is exact even for non-finite values).
+    GGML_API struct ggml_tensor * ggml_lstm_cell_masked(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * gates,   // [4H, N] pre-activations, i | f | g | o along ne0, F32
+            struct ggml_tensor  * hc_prev, // [2H, N] previous h | c, F32
+            struct ggml_tensor  * mask);   // [N] or [1] I32, non-zero takes the fresh pair
     // Move tensor elements by an offset given for each dimension. Elements that
     // are shifted beyond the last position are wrapped around to the beginning.
     GGML_API struct ggml_tensor * ggml_roll(
