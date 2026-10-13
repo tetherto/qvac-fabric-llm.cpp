@@ -2446,11 +2446,72 @@ static std::vector<float> kv_stream_gaps_logits(llama_model * model, const std::
             decode(n_tokens);
         }
     }
+    uint32_t prev_step = 0;
+    bool has_prev_step = false;
     for (const uint32_t n_step : steps) {
+        const int32_t n_reused = llama_perf_context(ctx.get()).n_reused;
         decode(std::vector<uint32_t>(n_seqs, n_step));
+        if (has_prev_step && n_step == prev_step) {
+            GGML_ASSERT(llama_perf_context(ctx.get()).n_reused > n_reused);
+        }
+        prev_step = n_step;
+        has_prev_step = true;
     }
 
     return res;
+}
+
+static bool kv_stream_gaps_rebuild(llama_model * model, llama_flash_attn_type fa) {
+    const uint32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
+
+    auto cp = llama_context_default_params();
+    cp.n_ctx           = 21*512;
+    cp.n_batch         = cp.n_ubatch = 21;
+    cp.n_seq_max       = 21;
+    cp.kv_unified      = false;
+    cp.flash_attn_type = fa;
+    cp.n_threads       = cp.n_threads_batch = 4;
+    llama_context_ptr ctx(llama_init_from_model(model, cp));
+    GGML_ASSERT(ctx);
+
+    std::vector<float> ref;
+    for (const std::vector<llama_seq_id> & seqs : {
+            std::vector<llama_seq_id>{0, 1, 2, 3},
+            std::vector<llama_seq_id>{4, 5, 6, 8},
+            std::vector<llama_seq_id>{9, 10, 12, 13},
+            std::vector<llama_seq_id>{14, 16, 18, 20}}) {
+        std::vector<float> cur;
+        for (llama_pos pos = 0; pos < 2; ++pos) {
+            llama_batch batch = llama_batch_init(4, 0, 1);
+            for (uint32_t s = 0; s < seqs.size(); ++s) {
+                common_batch_add(batch, (llama_token) (1 + s + pos*seqs.size()), pos, { seqs[s] }, true);
+            }
+
+            const int32_t n_reused = llama_perf_context(ctx.get()).n_reused;
+            GGML_ASSERT(llama_decode(ctx.get(), batch) == 0);
+            if (pos == 1 && llama_perf_context(ctx.get()).n_reused <= n_reused) {
+                llama_batch_free(batch);
+                return false;
+            }
+
+            if (pos == 1) {
+                for (int32_t j = 0; j < batch.n_tokens; ++j) {
+                    const float * row = llama_get_logits_ith(ctx.get(), j);
+                    GGML_ASSERT(row != nullptr);
+                    cur.insert(cur.end(), row, row + n_vocab);
+                }
+            }
+            llama_batch_free(batch);
+        }
+
+        if (ref.empty()) {
+            ref = std::move(cur);
+        } else if (!(nmse(cur, ref) < 1e-6)) {
+            return false;
+        }
+    }
+
+    return true;
 }
 
 // sequences on non-consecutive KV streams must give the same logits as on consecutive streams
@@ -2480,6 +2541,13 @@ static int test_kv_stream_gaps() {
             seqs_gaps[i] = 2*i;
         }
         check(model.get(), seqs_cont, seqs_gaps, {1}, 256, 8);
+
+        for (const auto fa : {LLAMA_FLASH_ATTN_TYPE_DISABLED, LLAMA_FLASH_ATTN_TYPE_ENABLED}) {
+            if (!kv_stream_gaps_rebuild(model.get(), fa)) {
+                printf("FAIL: %s fa=%d stream layout rebuild\n", llm_arch_name(model->arch), fa);
+                ok = false;
+            }
+        }
     }
 
     // runs of several streams with several tokens per stream, then decode over the cached tokens, for each attention path:
@@ -2488,7 +2556,7 @@ static int test_kv_stream_gaps() {
         auto model = kv_stream_gaps_model(arch);
 
         for (const std::vector<llama_seq_id> & seqs : {std::vector<llama_seq_id>{0, 2, 4, 6, 8, 10, 12, 14}, std::vector<llama_seq_id>{1, 2, 3, 6, 7, 11, 12, 13}}) {
-            check(model.get(), {0, 1, 2, 3, 4, 5, 6, 7}, seqs, {40, 1, 3}, 16, 64);
+            check(model.get(), {0, 1, 2, 3, 4, 5, 6, 7}, seqs, {40, 1, 1, 3}, 16, 64);
         }
     }
 

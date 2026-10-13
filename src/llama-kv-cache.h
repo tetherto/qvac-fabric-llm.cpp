@@ -13,6 +13,11 @@ struct llama_hparams;
 struct llama_model;
 struct llama_context;
 
+struct llama_kv_cache_packed_view {
+    ggml_tensor * tensor;
+    bool transposed;
+};
+
 //
 // llama_kv_cache
 //
@@ -75,6 +80,23 @@ public:
                 res.back().second++;
             }
             return res;
+        }
+
+        uint32_t stream_stride() const {
+            if (strm.size() < 2) {
+                return 1;
+            }
+            if (strm[1] <= strm[0]) {
+                return 0;
+            }
+
+            const uint32_t stride = strm[1] - strm[0];
+            for (uint32_t i = 2; i < strm.size(); ++i) {
+                if (strm[i] != strm[0] + static_cast<llama_seq_id>(i*stride)) {
+                    return 0;
+                }
+            }
+            return stride;
         }
 
         bool empty() const {
@@ -185,6 +207,7 @@ public:
 
     std::vector<uint32_t> get_layer_ids() const;
     ggml_tensor * get_k_storage(int32_t il) const;
+    ggml_tensor * get_v_storage(int32_t il) const;
 
     const llama_kv_cells & get_cells(llama_seq_id seq_id) const;
 
@@ -215,9 +238,16 @@ public:
     ggml_tensor * get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
     ggml_tensor * get_v(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
 
-    // views of the streams [i0, i0 + n) of sinfo, which must have consecutive ids
-    ggml_tensor * get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo, uint32_t i0, uint32_t n) const;
-    ggml_tensor * get_v(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo, uint32_t i0, uint32_t n) const;
+    ggml_tensor * get_k_packed(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
+    llama_kv_cache_packed_view get_v_packed(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
+
+    // views of streams [i0, i0 + n) with a constant positive physical stride
+    ggml_tensor * get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo,
+            uint32_t i0, uint32_t n, uint32_t stream_stride = 1) const;
+    ggml_tensor * get_v(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo,
+            uint32_t i0, uint32_t n, uint32_t stream_stride = 1) const;
+    llama_kv_cache_packed_view get_v_view(ggml_context * ctx, int32_t il, uint32_t n_kv,
+            const slot_info & sinfo, uint32_t i0, uint32_t n) const;
 
     // width of the K-cache view used by the K-shift graph for this model layer
     int64_t get_k_shift_width(uint32_t il) const;
@@ -443,12 +473,18 @@ public:
     // the ubatch streams split in runs of consecutive stream ids: [i0, i0 + n) for run r
     uint32_t get_n_runs() const;
     void     get_run(uint32_t r, uint32_t & i0, uint32_t & n) const;
+    bool     get_can_view_packed() const;
 
     ggml_tensor * get_k(ggml_context * ctx, int32_t il, uint32_t r) const;
     ggml_tensor * get_v(ggml_context * ctx, int32_t il, uint32_t r) const;
+    llama_kv_cache_packed_view get_v_view(ggml_context * ctx, int32_t il, uint32_t r) const;
 
-    // The full K storage tensor of the layer, spanning all streams.
+    ggml_tensor * get_k_packed(ggml_context * ctx, int32_t il) const;
+    llama_kv_cache_packed_view get_v_packed(ggml_context * ctx, int32_t il) const;
+
+    // The full storage tensors of the layer, spanning all streams.
     ggml_tensor * get_k_storage(int32_t il) const;
+    ggml_tensor * get_v_storage(int32_t il) const;
 
     // store k_cur and v_cur in the cache based on the provided head location
     // note: the heads in k_cur and v_cur should be laid out contiguously in memory
