@@ -633,11 +633,9 @@ bool xdna_rec_core_fuse_so(xdna_rec_core * core, xdna_kernel_pool * pool, xdna_g
     // stream has everything the prologue reads. Its weights follow the
     // in-projection's in argument 6, and its output lands in the tail of its
     // own activation buffer (argument 8), since it has no argument left.
-    // GGML_XDNA_FUSE_FFN=0 keeps it a dispatch of its own.
     core->ffn_fused      = false;
     size_t     ffn_w_off = 0;
-    const bool fuse_ffn  = core->inproj && core->so_to_act && ffn &&
-                          !(getenv("GGML_XDNA_FUSE_FFN") && getenv("GGML_XDNA_FUSE_FFN")[0] == '0');
+    const bool fuse_ffn  = core->inproj && core->so_to_act && ffn;
     if (fuse_ffn) {
         ffn_w_off = xdna_align_up(core->in_w_off + core->in_geom.weight_bytes(), 4096);
         if (core->gates) {
