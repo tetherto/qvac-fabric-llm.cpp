@@ -5699,6 +5699,24 @@ struct test_zero_upsample : public test_case {
             ne[0] * ne[1] * ne[2] * sizeof(float), sizeof(float));
     }
 };
+
+// GGML_OP_CHANNEL_SHUFFLE
+struct test_channel_shuffle : public test_case {
+    const std::array<int64_t, 4> ne;
+    const int groups;
+
+    std::string vars() override {
+        return VARS_TO_STR2(ne, groups);
+    }
+
+    test_channel_shuffle(std::array<int64_t, 4> ne = {8, 4, 12, 2}, int groups = 2)
+        : ne(ne), groups(groups) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
+        return ggml_channel_shuffle(ctx, a, groups);
+    }
+};
 // GGML_OP_SSM_SCAN
 struct test_ssm_scan : public test_case {
     const ggml_type type;
@@ -14402,6 +14420,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_zero_upsample({10, 7, 3, 2}, 2));
     test_cases.emplace_back(new test_zero_upsample({33, 5, 2, 2}, 5));
     test_cases.emplace_back(new test_zero_upsample({10, 7, 3, 2}, 2, true));
+
+    for (int groups : {1, 2, 3, 4}) {
+        test_cases.emplace_back(new test_channel_shuffle({8, 4, 12, 2}, groups));
+    }
     // fused ssm_conv + (optional) bias_add + silu. The bias-only graph (no silu) is intentionally
     // not tested since there's no fusion for that pattern in ggml_cuda_can_fuse.
     for (int64_t d_conv : {3, 4, 7, 9}) {

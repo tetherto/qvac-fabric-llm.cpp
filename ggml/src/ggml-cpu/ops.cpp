@@ -9719,6 +9719,39 @@ void ggml_compute_forward_zero_upsample(
         for (int64_t f = 0; f < F; ++f) dp[f * s] = sp[f];
     }
 }
+
+void ggml_compute_forward_channel_shuffle(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+
+    const ggml_tensor * src = dst->src[0];
+    GGML_ASSERT(dst->type == GGML_TYPE_F32 && src->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(src) && ggml_is_contiguous(dst));
+
+    const int64_t G  = ggml_get_op_params_i32(dst, 0);
+    const int64_t FT = src->ne[0] * src->ne[1];
+    const int64_t C  = src->ne[2];
+    const int64_t Bc = src->ne[3];
+    const int64_t cg = C / G;
+
+    const float * src_data = (const float *) src->data;
+    float       * dst_data = (float *) dst->data;
+
+    // parallel over output planes (c' + C*b): copy the FT plane from the shuffled input channel.
+    const int64_t nplanes = C * Bc;
+    const int64_t per_thread = (nplanes + params->nth - 1) / params->nth;
+    const int64_t start = params->ith * per_thread;
+    const int64_t end   = MIN(start + per_thread, nplanes);
+
+    for (int64_t p = start; p < end; ++p) {
+        const int64_t cprime = p % C;
+        const int64_t b      = p / C;
+        const int64_t in_c   = (cprime % G) * cg + cprime / G;
+        const float * sp = src_data + (in_c + C * b) * FT;
+        float       * dp = dst_data + p * FT;
+        for (int64_t i = 0; i < FT; ++i) dp[i] = sp[i];
+    }
+}
 static void ggml_compute_forward_roll_f32(
         const ggml_compute_params * params,
         ggml_tensor * dst) {
