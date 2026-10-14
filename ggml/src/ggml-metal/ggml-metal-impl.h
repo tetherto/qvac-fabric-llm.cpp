@@ -855,6 +855,7 @@ typedef struct {
 typedef struct {
     int32_t T;
     int32_t C;
+    int64_t ne; // T * C, kept 64-bit so a 2^31-element activation does not wrap
 } ggml_metal_kargs_snake;
 
 typedef struct {

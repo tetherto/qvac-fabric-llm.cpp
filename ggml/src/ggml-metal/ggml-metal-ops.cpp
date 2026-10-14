@@ -5945,9 +5945,9 @@ int ggml_metal_op_snake_fused(ggml_metal_op_t ctx, int idx) {
     const ggml_tensor * a = (x == mul0->src[0]) ? mul0->src[1] : mul0->src[0];
     const ggml_tensor * inv_b = (mul1->src[0] == sqr) ? mul1->src[1] : mul1->src[0];
 
-    const int T     = (int) x->ne[0];
-    const int C     = (int) x->ne[1];
-    const int total = T * C;
+    const int     T     = (int) x->ne[0];
+    const int     C     = (int) x->ne[1];
+    const int64_t total = (int64_t) T * C;
 
     // the encode loop pre-checked the leading mul only, check the rest of the chain
     for (int i = 1; i < 5; ++i) {
@@ -5961,8 +5961,9 @@ int ggml_metal_op_snake_fused(ggml_metal_op_t ctx, int idx) {
     auto pipeline = ggml_metal_library_get_pipeline_snake(lib, x->type);
 
     ggml_metal_kargs_snake args = {
-        /*.T =*/ T,
-        /*.C =*/ C,
+        /*.T  =*/ T,
+        /*.C  =*/ C,
+        /*.ne =*/ total,
     };
 
     ggml_metal_encoder_set_pipeline(enc, pipeline);
@@ -5972,9 +5973,10 @@ int ggml_metal_op_snake_fused(ggml_metal_op_t ctx, int idx) {
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(inv_b), 3);
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(add),   4);
 
-    const int nth = 256;
-    const int ntg = (total + nth - 1) / nth;
-    ggml_metal_encoder_dispatch_threadgroups(enc, ntg, 1, 1, nth, 1, 1);
+    const int     nth = 256;
+    const int64_t ntg = (total + nth - 1) / nth;
+    GGML_ASSERT(ntg <= INT32_MAX);
+    ggml_metal_encoder_dispatch_threadgroups(enc, (int) ntg, 1, 1, nth, 1, 1);
 
     return 5;
 }
@@ -7661,15 +7663,16 @@ int ggml_metal_op_snake(ggml_metal_op_t ctx, int idx) {
     ggml_metal_library_t lib = ctx->lib;
     ggml_metal_encoder_t enc = ctx->enc;
 
-    const int T     = (int) op->ne[0];
-    const int C     = (int) op->ne[1];
-    const int total = T * C;
+    const int     T     = (int) op->ne[0];
+    const int     C     = (int) op->ne[1];
+    const int64_t total = (int64_t) T * C;
 
     auto pipeline = ggml_metal_library_get_pipeline_snake(lib, op->src[0]->type);
 
     ggml_metal_kargs_snake args = {
-        /*.T =*/ T,
-        /*.C =*/ C,
+        /*.T  =*/ T,
+        /*.C  =*/ C,
+        /*.ne =*/ total,
     };
 
     ggml_metal_encoder_set_pipeline(enc, pipeline);
@@ -7679,9 +7682,10 @@ int ggml_metal_op_snake(ggml_metal_op_t ctx, int idx) {
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[2]), 3);
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         4);
 
-    const int nth = 256;
-    const int ntg = (total + nth - 1) / nth;
-    ggml_metal_encoder_dispatch_threadgroups(enc, ntg, 1, 1, nth, 1, 1);
+    const int     nth = 256;
+    const int64_t ntg = (total + nth - 1) / nth;
+    GGML_ASSERT(ntg <= INT32_MAX);
+    ggml_metal_encoder_dispatch_threadgroups(enc, (int) ntg, 1, 1, nth, 1, 1);
 
     return 1;
 }
