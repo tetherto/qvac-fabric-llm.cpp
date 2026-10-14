@@ -15976,3 +15976,7 @@
 "MTL0","CONV_1D_DW_DIRECT","L=278,C=512,B=1,K=7,dilation=27,ct=1,causal=0,seg_len=139","support","1","yes","MTL"
 "MTL0","CONV_1D_DW_DIRECT","L=90,C=512,B=1,K=5,dilation=8,ct=1,causal=0,seg_len=45","support","1","yes","MTL"
 "MTL0","CONV_1D_DW_DIRECT","L=37,C=96,B=2,K=5,dilation=2,ct=1,causal=0,seg_len=0","support","1","yes","MTL"
+"MTL0","SCALE_RESIDUAL","L=139,C=512,B=1,ct=0","support","1","yes","MTL"
+"MTL0","SCALE_RESIDUAL","L=37,C=96,B=2,ct=0","support","1","yes","MTL"
+"MTL0","SCALE_RESIDUAL","L=139,C=512,B=1,ct=1","support","1","yes","MTL"
+"MTL0","SCALE_RESIDUAL","L=37,C=96,B=2,ct=1","support","1","yes","MTL"
