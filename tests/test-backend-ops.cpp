@@ -10396,15 +10396,17 @@ struct test_mul_mat_vec_fusion : public test_case {
 };
 
 // A scheduler weight copy has OP_NONE but may be reused after its matmul.
-// The fused gate/up/GLU kernel must not write its output into that input.
+// The fused gate/up/GLU kernel must not write its output into that input,
+// whether the output lands in the middle of the copy or at its first byte.
 struct test_mul_mat_vec_fusion_alias : public test_case {
     const ggml_type type;
+    const bool at_start;
     ggml_tensor * gate = nullptr;
     ggml_tensor * out = nullptr;
 
-    explicit test_mul_mat_vec_fusion_alias(ggml_type type) : type(type) {}
+    test_mul_mat_vec_fusion_alias(ggml_type type, bool at_start) : type(type), at_start(at_start) {}
 
-    std::string vars() override { return VARS_TO_STR1(type); }
+    std::string vars() override { return VARS_TO_STR2(type, at_start); }
     std::string op_desc(ggml_tensor *) override { return "MUL_MAT_VEC_FUSION_ALIAS"; }
     bool run_whole_graph() override { return true; }
     double max_nmse_err() override { return 5e-3; }
@@ -10427,7 +10429,9 @@ struct test_mul_mat_vec_fusion_alias : public test_case {
         init_mul_mat_id_tensors(ctx, 8);
         // Simulate allocator reuse of a dead gate copy. The ordinary sequence
         // is valid; fusion would overwrite later experts while reading them.
-        const size_t offset = ggml_nbytes(gate) / 2;
+        // at_start puts the output at the copy's first byte: an equal data
+        // pointer is an overlap too, not a write-through.
+        const size_t offset = at_start ? 0 : ggml_nbytes(gate) / 2;
         GGML_ASSERT(offset + ggml_nbytes(out) <= ggml_nbytes(gate));
         out->data = static_cast<char *>(gate->data) + offset;
         out->buffer = gate->buffer;
@@ -15793,7 +15797,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_Q4_K,   GGML_GLU_OP_SWIGLU,        17,  5120, 256, true, 16, 8, true));
     test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_Q8_0,   GGML_GLU_OP_SWIGLU,      2048,   128, 256, true, 40, 8, false));
     for (ggml_type type : { GGML_TYPE_IQ2_XS, GGML_TYPE_Q4_0, GGML_TYPE_PQ2_0 }) {
-        test_cases.emplace_back(new test_mul_mat_vec_fusion_alias(type));
+        for (bool at_start : { false, true }) {
+            test_cases.emplace_back(new test_mul_mat_vec_fusion_alias(type, at_start));
+        }
     }
 
     // stacked gate/up weights split into two views
