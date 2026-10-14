@@ -1716,10 +1716,13 @@ static bool ggml_metal_fusion_check_memory_ranges(
         const ggml_tensor * const    * nodes,
         int                            node_count) {
     // some fused kernels write through a tensor that also appears as a source (e.g. the gdn
-    // cache cpy), so a source that is the same memory as the output is not an external read
-    // source
+    // cache cpy): the output and the source are views of one tensor at the same offset, or one
+    // is a view of the other. Only that structural identity makes the source a non-external
+    // read. An equal data pointer alone does not: the allocator reuses dead storage, so an
+    // unrelated source (e.g. a scheduler weight copy) can start where the fused output starts
+    // and the fused kernel would overwrite it while still reading it
     auto same_memory = [](const ggml_tensor * a, const ggml_tensor * b) {
-        if (a->data && b->data && a->data == b->data) {
+        if (a->view_src && a->view_src == b->view_src && a->view_offs == b->view_offs) {
             return true;
         }
         for (const ggml_tensor * v = a; v; v = v->view_src) {
@@ -1771,11 +1774,21 @@ static bool ggml_metal_fusion_check_memory_ranges(
         for (int j = 0; j < node_count; ++j) {
             for (int s = 0; s < GGML_MAX_SRC; ++s) {
                 const ggml_tensor * src = nodes[j]->src[s];
-                if (!src || src->op == GGML_OP_NONE || same_memory(src, dst)) {
+                // Scheduler copies are OP_NONE tensors too. Their storage can be
+                // reused after the original operation, but fusion keeps it live.
+                if (!src || same_memory(src, dst)) {
                     continue;
                 }
 
                 if (nodes_overlap(dst, src) && !is_intermediate(src, nodes, j)) {
+                    // An exact alias is safe when each thread writes only the elements it read: the
+                    // ADD chain, and the signed FWHT, whose RESHAPE keeps the element order.
+                    const bool inplace_ok =
+                        (fusion->id == GGML_METAL_FUSION_ADD_CHAIN   && ggml_are_same_layout(src, dst)) ||
+                        (fusion->id == GGML_METAL_FUSION_FWHT_SIGNED && ggml_metal_fusion_same_linear_layout(src, dst));
+                    if (src->data == dst->data && inplace_ok) {
+                        continue;
+                    }
                     return false;
                 }
             }

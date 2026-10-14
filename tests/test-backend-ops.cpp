@@ -4713,6 +4713,41 @@ struct test_add_add : public test_case {
     }
 };
 
+struct test_add_add_alias : public test_add_add {
+    const int alias_input;
+    ggml_tensor * src = nullptr;
+    ggml_tensor * out = nullptr;
+    bool metal_label = false;
+
+    test_add_add_alias(std::array<int64_t, 4> ne, int alias_input)
+        : test_add_add(GGML_TYPE_F32, GGML_TYPE_F32, ne), alias_input(alias_input) {}
+
+    std::string vars() override { return test_add_add::vars() + "," + VAR_TO_STR(alias_input); }
+    std::string op_desc(ggml_tensor *) override { return "ADD_ADD_ALIAS"; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        out = test_add_add::build_graph(ctx);
+        src = alias_input == 2 ? out->src[1] : out->src[0]->src[alias_input];
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        test_add_add::initialize_tensors(ctx);
+        // Simulate allocator reuse of an input after its last ADD.
+        out->data = src->data;
+        out->buffer = src->buffer;
+    }
+
+    uint64_t fusion_count(ggml_backend_t backend) override {
+        const bool metal = strcmp(ggml_backend_reg_name(ggml_backend_dev_backend_reg(ggml_backend_get_device(backend))), "MTL") == 0;
+        const int64_t count = metal ? backend_fusion_label_count(backend, "ADD+ADD") : -1;
+        metal_label = count >= 0;
+        return metal_label ? (uint64_t) count : 0;
+    }
+
+    bool expect_fusion() override { return metal_label; }
+};
+
 // GGML_OP_ADD + GGML_OP_RMS_NORM (fused operation)
 struct test_add_rms_norm : public test_case {
     const ggml_type type;
@@ -10737,15 +10772,17 @@ struct test_mul_mat_fusion_w4a8 : public test_mul_mat_fusion {
 };
 
 // A scheduler weight copy has OP_NONE but may be reused after its matmul.
-// The fused gate/up/GLU kernel must not write its output into that input.
+// The fused gate/up/GLU kernel must not write its output into that input,
+// whether the output lands in the middle of the copy or at its first byte.
 struct test_mul_mat_vec_fusion_alias : public test_case {
     const ggml_type type;
+    const bool at_start;
     ggml_tensor * gate = nullptr;
     ggml_tensor * out = nullptr;
 
-    explicit test_mul_mat_vec_fusion_alias(ggml_type type) : type(type) {}
+    test_mul_mat_vec_fusion_alias(ggml_type type, bool at_start) : type(type), at_start(at_start) {}
 
-    std::string vars() override { return VARS_TO_STR1(type); }
+    std::string vars() override { return VARS_TO_STR2(type, at_start); }
     std::string op_desc(ggml_tensor *) override { return "MUL_MAT_VEC_FUSION_ALIAS"; }
     bool run_whole_graph() override { return true; }
     double max_nmse_err() override { return 5e-3; }
@@ -10768,7 +10805,9 @@ struct test_mul_mat_vec_fusion_alias : public test_case {
         init_mul_mat_id_tensors(ctx, 8);
         // Simulate allocator reuse of a dead gate copy. The ordinary sequence
         // is valid; fusion would overwrite later experts while reading them.
-        const size_t offset = ggml_nbytes(gate) / 2;
+        // at_start puts the output at the copy's first byte: an equal data
+        // pointer is an overlap too, not a write-through.
+        const size_t offset = at_start ? 0 : ggml_nbytes(gate) / 2;
         GGML_ASSERT(offset + ggml_nbytes(out) <= ggml_nbytes(gate));
         out->data = static_cast<char *>(gate->data) + offset;
         out->buffer = gate->buffer;
@@ -14453,6 +14492,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_add_add(GGML_TYPE_F16, GGML_TYPE_F16, { n, 5, 4, 3 }, false, false));
         test_cases.emplace_back(new test_add_add(GGML_TYPE_F16, GGML_TYPE_F32, { n, 5, 4, 3 }, false, false));
         test_cases.emplace_back(new test_add_add(GGML_TYPE_F16, GGML_TYPE_F32, { n, 5, 4, 3 }, true, false));
+        for (int alias_input : {0, 1, 2}) {
+            test_cases.emplace_back(new test_add_add_alias({ n, 5, 4, 3 }, alias_input));
+        }
     }
 
     for (std::array<int64_t, 4> ne : std::vector<std::array<int64_t, 4>>{ { 128, 16, 1, 1 }, { 128, 16, 7, 1 }, { 1025, 5, 4, 3 } }) {
@@ -16654,7 +16696,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // K = 2048: few-row MMQ, where enabled, takes the gate and up matmuls instead of the fused MMQ path
     test_cases.emplace_back(new test_mul_mat_fusion(GGML_TYPE_Q4_K,   GGML_GLU_OP_SWIGLU,         9,   128, 2048, false, 1, 1, false, false, true, false, { 1, 1 }));
     for (ggml_type type : { GGML_TYPE_IQ2_XS, GGML_TYPE_Q4_0, GGML_TYPE_PQ2_0 }) {
-        test_cases.emplace_back(new test_mul_mat_vec_fusion_alias(type));
+        for (bool at_start : { false, true }) {
+            test_cases.emplace_back(new test_mul_mat_vec_fusion_alias(type, at_start));
+        }
     }
 
     // stacked gate/up weights split into two views
