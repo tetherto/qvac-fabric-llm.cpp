@@ -1229,3 +1229,31 @@ kernel void kernel_bias_gelu_f32(
         y_c[(size_t) t * syt] = 0.5f * v * (1.0f + erf_approx<float>(v * SQRT_2_INV));
     }
 }
+
+kernel void kernel_pad_replicate_1d_f32(
+    constant   ggml_metal_kargs_pad_replicate_1d & args,
+    device  const float * x,
+    device        float * y,
+    uint3 tgpig[[threadgroup_position_in_grid]],
+    uint3 tpitg[[thread_position_in_threadgroup]],
+    uint3   ntg[[threads_per_threadgroup]]) {
+
+    const int c = (int) tgpig.x;
+    if (c >= args.C) return;
+
+    const int L_in  = args.L_in;
+    const int L_out = args.L_out;
+    const int pad   = args.pad_left;
+    const int sxt = args.sxt, sxc = args.sxc;
+    const int syt = args.syt, syc = args.syc;
+
+    device const float * x_c = x + (size_t) c * sxc;
+    device       float * y_c = y + (size_t) c * syc;
+
+    for (int t = (int) tpitg.x; t < L_out; t += (int) ntg.x) {
+        int src_t = t - pad;
+        if (src_t < 0)      src_t = 0;
+        if (src_t >= L_in)  src_t = L_in - 1;
+        y_c[(size_t) t * syt] = x_c[(size_t) src_t * sxt];
+    }
+}

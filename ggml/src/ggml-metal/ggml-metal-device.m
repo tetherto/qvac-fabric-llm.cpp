@@ -1990,6 +1990,8 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
             return op->src[0]->ne[3] == 1 &&
                    op->src[0]->type == GGML_TYPE_F32 &&
                    op->src[1]->type == GGML_TYPE_F32;
+        case GGML_OP_PAD_REPLICATE_1D:
+            return op->src[0]->type == GGML_TYPE_F32;
         case GGML_OP_LEAKY_RELU:
             return op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_F16;
         case GGML_OP_ARGSORT:
