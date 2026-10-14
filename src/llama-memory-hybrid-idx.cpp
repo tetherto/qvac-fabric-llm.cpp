@@ -71,7 +71,12 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
             model, hparams_idx, type_k, type_v, v_trans, offload, unified,
             kv_size, n_seq_max, n_pad, n_swa, swa_type,
             nullptr, filter_idx, nullptr, nullptr, "idx_");
-    }()) {}
+    }()) {
+    get_mem_attn()->set_allow_stream_gaps(true);
+    if (mem_idx) {
+        mem_idx->set_allow_stream_gaps(true);
+    }
+}
 
 llama_memory_context_ptr llama_memory_hybrid_idx::init_batch(llama_batch_allocr & balloc, uint32_t n_ubatch, bool embd_all) {
     // note: repeats llama_memory_hybrid::init_batch, as the indexer needs the attention slot infos that the base context hides
@@ -96,7 +101,8 @@ llama_memory_context_ptr llama_memory_hybrid_idx::init_batch(llama_batch_allocr 
                 //   so that the rollback snapshots remain valid
                 const uint32_t n_rs_seq = get_mem_recr()->n_rs_seq;
 
-                ubatch = balloc.split_equal(n_ubatch, !unified, n_rs_seq > 0 ? n_rs_seq + 1 : 0);
+                ubatch = balloc.split_equal(
+                        n_ubatch, !unified, n_rs_seq > 0 ? n_rs_seq + 1 : 0, get_allow_stream_gaps());
             }
 
             if (ubatch.n_tokens == 0) {
@@ -608,13 +614,13 @@ void llama_memory_hybrid_idx::set_input_qsa(
 // llama_memory_hybrid_idx_context
 //
 
-// streams in each ubatch's slot info, matching get_k/get_v's `ns`
+// logical streams in each ubatch, including when their physical cache streams have gaps
 static std::vector<uint32_t> llama_memory_hybrid_idx_ns(const llama_kv_cache::slot_info_vec_t & sinfos) {
     std::vector<uint32_t> res;
     res.reserve(sinfos.size());
 
     for (const auto & sinfo : sinfos) {
-        res.push_back(sinfo.s1 - sinfo.s0 + 1);
+        res.push_back(sinfo.n_stream());
     }
 
     return res;

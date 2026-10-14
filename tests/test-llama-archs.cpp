@@ -1790,12 +1790,15 @@ static void kv_stream_gaps_tensor_data(struct ggml_tensor * tensor, void * userd
 static llama_model_ptr kv_stream_gaps_model(llm_arch arch) {
     auto gguf = get_gguf_ctx(arch,
             arch == LLM_ARCH_DEEPSEEK2 || arch == LLM_ARCH_DEEPSEEK32 ||
-            arch == LLM_ARCH_DOTS3NOTE || arch == LLM_ARCH_MINIMAX_M3);
+            arch == LLM_ARCH_DOTS3NOTE || arch == LLM_ARCH_MINIMAX_M3 || arch == LLM_ARCH_QWEN4EXP);
     gguf_set_val_u32(gguf.get(), (std::string(llm_arch_name(arch)) + ".block_count").c_str(), 8);
     if (arch == LLM_ARCH_DOTS3NOTE) {
         llama_model_saver ms(arch, gguf.get());
         ms.add_kv(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN, std::vector<uint32_t>({0, 1, 0, 1, 0, 1, 0, 1}));
         ms.add_kv(LLM_KV_ATTENTION_INDEXER_TYPES,          std::vector<uint32_t>({1, 0, 1, 0, 1, 0, 1, 0}));
+    } else if (arch == LLM_ARCH_QWEN4EXP) {
+        llama_model_saver ms(arch, gguf.get());
+        ms.add_kv(LLM_KV_ATTENTION_COMPRESS_RATIOS, std::vector<uint32_t>(8, 4));
     }
 
     // CPU only: GPU backends pick kernels by stream count, so their rounding differs between layouts (~3e-4 nmse for MLA on CUDA)
@@ -1967,7 +1970,7 @@ static int test_kv_stream_gaps() {
     // kv, iswa (40 tokens > n_swa), hybrid, MLA (K-only cache) and DSA; runs of 3, 2 and 3 streams so that run index != first stream
     for (const llm_arch arch : {
             LLM_ARCH_QWEN3, LLM_ARCH_GEMMA3, LLM_ARCH_QWEN35, LLM_ARCH_DEEPSEEK2,
-            LLM_ARCH_DEEPSEEK32, LLM_ARCH_DOTS3NOTE, LLM_ARCH_MINIMAX_M3}) {
+            LLM_ARCH_DEEPSEEK32, LLM_ARCH_DOTS3NOTE, LLM_ARCH_MINIMAX_M3, LLM_ARCH_QWEN4EXP}) {
         auto model = kv_stream_gaps_model(arch);
 
         for (const std::vector<llama_seq_id> & seqs : {std::vector<llama_seq_id>{0, 2, 4, 6, 8, 10, 12, 14}, std::vector<llama_seq_id>{1, 2, 3, 6, 7, 11, 12, 13}}) {
