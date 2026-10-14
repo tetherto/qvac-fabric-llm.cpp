@@ -24,7 +24,8 @@ struct common_fit_extra_model {
 // fits mparams and cparams to free device memory (assumes system memory is unlimited)
 //   - returns SUCCESS if parameters fit, FAILURE if they cannot fit, or ERROR on a hard error
 //   - restores parameters, tensor split, and null-terminated overrides on FAILURE or ERROR
-//   - fit/memory probes are serialized; log-level filtering affects only the probe thread
+//   - temporary global logger overrides are serialized between fit/memory probes;
+//     callers must still exclude unrelated logging and logger changes during probes
 //   - only parameters that have the same value as in llama_default_model_params are modified
 //     with the exception of the context size which is modified if and only if equal to 0
 common_params_fit_status common_fit_params(
@@ -37,7 +38,7 @@ common_params_fit_status common_fit_params(
                            uint32_t   n_ctx_min,             // minimum context size to set when trying to reduce memory use
       const common_fit_extra_model * extra,                  // model to fit alongside the main one, nullptr if there is none
                                bool   prefetch_weights_auto, // enable prefetch when fitting a dense model
-                     ggml_log_level   log_level,              // minimum log level on the probe thread; lower levels go to debug log
+                     ggml_log_level   log_level,              // minimum log level to print during fitting, lower levels go to debug log
                                bool   moe_cache_auto_explicit = false); // opt in to automatic caching on non-CUDA backends
 
 // Automatic acceleration policies, exposed for hardware-independent tests.

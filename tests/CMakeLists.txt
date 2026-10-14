@@ -414,7 +414,6 @@ if (GGML_METAL)
     target_compile_definitions(test-unified-memory-props PRIVATE LLAMA_TEST_EXPECT_METAL)
 endif()
 llama_build_and_test(test-fit-params.cpp)
-llama_build_and_test(test-fit-logger.cpp)
 if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     # This test uses internal symbols that are not exported from llama.dll.
     llama_build(test-moe-cache.cpp)

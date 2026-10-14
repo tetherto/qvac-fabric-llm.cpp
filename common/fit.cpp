@@ -5,7 +5,6 @@
 #include "llama-cpp.h"
 
 #include "../src/llama-ext.h"
-#include "../ggml/src/ggml-impl.h"
 
 #include <array>
 #include <algorithm>
@@ -40,16 +39,29 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
         uint32_t & hp_n_ctx_train,
         uint32_t & hp_n_expert,
         ggml_log_level log_level) {
-    static std::mutex probe_mutex;
-    const std::lock_guard<std::mutex> lock(probe_mutex);
-    struct log_level_scope {
-        ggml_log_level previous;
-        explicit log_level_scope(ggml_log_level level)
-            : previous(ggml_log_set_thread_min_level(level)) {}
-        ~log_level_scope() {
-            ggml_log_set_thread_min_level(previous);
+    // Serialize temporary logger overrides across all fit/memory probes.
+    static std::mutex logger_mutex;
+    const std::lock_guard<std::mutex> lock(logger_mutex);
+    struct user_data_t {
+        struct {
+            ggml_log_callback callback;
+            void * user_data;
+        } original_logger;
+        ggml_log_level min_level; // prints below this log level go to debug log
+
+        ~user_data_t() {
+            llama_log_set(original_logger.callback, original_logger.user_data);
         }
-    } log_scope(log_level);
+    };
+    user_data_t ud;
+    llama_log_get(&ud.original_logger.callback, &ud.original_logger.user_data);
+    ud.min_level = log_level;
+
+    llama_log_set([](ggml_log_level level, const char * text, void * user_data) {
+        const user_data_t * ud = (const user_data_t *) user_data;
+        const ggml_log_level level_eff = level >= ud->min_level ? level : GGML_LOG_LEVEL_DEBUG;
+        ud->original_logger.callback(level_eff, text, ud->original_logger.user_data);
+    }, &ud);
 
     llama_model_params mparams_copy = *mparams;
     mparams_copy.no_alloc  = true;

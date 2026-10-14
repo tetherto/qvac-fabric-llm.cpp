@@ -288,7 +288,6 @@ static void ggml_log_internal_v(enum ggml_log_level level, const char * format, 
     if (format == NULL) {
         return;
     }
-    level = level >= ggml_log_get_thread_min_level() ? level : GGML_LOG_LEVEL_DEBUG;
     va_list args_copy;
     va_copy(args_copy, args);
     char buffer[128];
