@@ -402,6 +402,63 @@ static void test_split(testing & t) {
         t.assert_equal(6u, ba.get_n_used());
     });
 
+    t.test("split_equal_seq_gaps", [&](testing & t) {
+        auto make = [](batch_builder & bb, const std::vector<llama_seq_id> & seqs) {
+            for (llama_seq_id s : seqs) {
+                for (int i = 0; i < 2; ++i) {
+                    bb.add(i, {s}, i == 1);
+                }
+            }
+        };
+
+        {
+            batch_builder bb;
+            make(bb, {0, 2, 5});
+
+            llama_batch_allocr ba(1);
+            t.assert_true(ba.init(bb.make(), vocab, nullptr, bb.n_embd, 8, false));
+
+            for (llama_seq_id s : {0, 2, 5}) {
+                llama_ubatch ub = ba.split_equal(8, true, 0);
+                t.assert_equal("one seq per ubatch without gaps", 1u, ub.n_seqs_unq);
+                t.assert_equal(s, ub.seq_id_unq[0]);
+            }
+            t.assert_equal(0u, ba.split_equal(8, true, 0).n_tokens);
+        }
+
+        {
+            batch_builder bb;
+            make(bb, {0, 2, 5});
+
+            llama_batch_allocr ba(1);
+            t.assert_true(ba.init(bb.make(), vocab, nullptr, bb.n_embd, 8, false));
+
+            llama_ubatch ub = ba.split_equal(8, true, 0, true);
+            t.assert_equal("all seqs in one ubatch with gaps", 6u, ub.n_tokens);
+            t.assert_equal(3u, ub.n_seqs_unq);
+            const llama_seq_id expected[] = {0, 0, 2, 2, 5, 5};
+            for (int i = 0; i < (int) std::min<uint32_t>(ub.n_tokens, 6); ++i) {
+                t.assert_equal(expected[i], ub.seq_id[i][0]);
+            }
+            t.assert_equal(0u, ba.split_equal(8, true, 0, true).n_tokens);
+        }
+
+        {
+            batch_builder bb;
+            make(bb, {5, 2});
+
+            llama_batch_allocr ba(1);
+            t.assert_true(ba.init(bb.make(), vocab, nullptr, bb.n_embd, 8, false));
+
+            llama_ubatch ub = ba.split_equal(8, true, 0, true);
+            t.assert_equal("decreasing ids go to the next ubatch", 1u, ub.n_seqs_unq);
+            t.assert_equal(5, ub.seq_id_unq[0]);
+            ub = ba.split_equal(8, true, 0, true);
+            t.assert_equal(1u, ub.n_seqs_unq);
+            t.assert_equal(2, ub.seq_id_unq[0]);
+        }
+    });
+
     t.test("split_equal_coupled", [&](testing & t) {
         batch_builder bb;
         bb.add(0, {0, 1}, false);

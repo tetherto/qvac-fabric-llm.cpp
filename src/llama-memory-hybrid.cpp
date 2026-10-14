@@ -86,7 +86,7 @@ llama_memory_context_ptr llama_memory_hybrid::init_batch(llama_batch_allocr & ba
                 //   so that the rollback snapshots remain valid
                 const uint32_t n_rs_seq = mem_recr->n_rs_seq;
 
-                ubatch = balloc.split_equal(n_ubatch, !unified, n_rs_seq > 0 ? n_rs_seq + 1 : 0);
+                ubatch = balloc.split_equal(n_ubatch, !unified, n_rs_seq > 0 ? n_rs_seq + 1 : 0, mem_attn->get_allow_stream_gaps());
             }
 
             if (ubatch.n_tokens == 0) {
@@ -133,6 +133,10 @@ llama_memory_context_ptr llama_memory_hybrid::init_update(llama_context * lctx, 
 bool llama_memory_hybrid::get_can_shift() const {
     // Shifting is trivially supported for recurrent
     return mem_attn->get_can_shift();
+}
+
+bool llama_memory_hybrid::get_allow_stream_gaps() const {
+    return mem_attn->get_allow_stream_gaps();
 }
 
 void llama_memory_hybrid::clear(bool data) {

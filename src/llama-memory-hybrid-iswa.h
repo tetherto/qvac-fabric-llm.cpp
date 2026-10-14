@@ -57,6 +57,7 @@ public:
     llama_memory_context_ptr init_update(llama_context * lctx, bool optimize) override;
 
     bool get_can_shift() const override;
+    bool get_allow_stream_gaps() const override;
 
     void clear(bool data) override;
 
