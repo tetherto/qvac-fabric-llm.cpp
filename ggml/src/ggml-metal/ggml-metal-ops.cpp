@@ -529,6 +529,10 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
             {
                 n_fuse = ggml_metal_op_snake(ctx, idx);
             } break;
+        case GGML_OP_LSTM_CELL:
+            {
+                n_fuse = ggml_metal_op_lstm_cell(ctx, idx);
+            } break;
         case GGML_OP_CONV_1D_DW_DIRECT:
             {
                 n_fuse = ggml_metal_op_conv_1d_dw_direct(ctx, idx);
@@ -7674,6 +7678,51 @@ int ggml_metal_op_snake(ggml_metal_op_t ctx, int idx) {
     const int nth = 256;
     const int ntg = (total + nth - 1) / nth;
     ggml_metal_encoder_dispatch_threadgroups(enc, ntg, 1, 1, nth, 1, 1);
+
+    return 1;
+}
+
+int ggml_metal_op_lstm_cell(ggml_metal_op_t ctx, int idx) {
+    ggml_tensor * op = ctx->node(idx);
+
+    ggml_metal_library_t lib = ctx->lib;
+    ggml_metal_encoder_t enc = ctx->enc;
+
+    const ggml_tensor * mask = op->src[2];
+
+    // Unmasked: src1 is c_prev [H, N]. Masked: src1 is hc_prev [2H, N] and c
+    // starts half a row in.
+    const int32_t H = (int32_t) (op->ne[0]/GGML_LSTM_N_OUTS);
+    const int32_t N = (int32_t) op->src[1]->ne[1];
+
+    ggml_metal_kargs_lstm_cell args = {
+        /*.H           =*/ H,
+        /*.N           =*/ N,
+        /*.prev_row    =*/ (int32_t) op->src[1]->ne[0],
+        /*.c_base      =*/ mask ? H : 0,
+        /*.mask_stride =*/ (mask && ggml_nelements(mask) > 1) ? 1 : 0,
+    };
+
+    auto pipeline = ggml_metal_library_get_pipeline_lstm_cell(lib, op);
+
+    ggml_metal_encoder_set_pipeline(enc, pipeline);
+    ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[0]), 1); // gates
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[1]), 2); // c_prev / hc_prev
+    if (mask) {
+        ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(mask), 3);     // select mask
+        ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(op),   4);     // h_new | c_new
+    } else {
+        ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(op),   3);     // h_new | c_new
+    }
+
+    // Flat 1D grid over H*N elements with a grid-stride loop for high occupancy.
+    const int64_t total = (int64_t) H * (int64_t) N;
+    const int     nth   = 256;
+    int64_t ntg = (total + nth - 1) / nth;
+    if (ntg < 1)      ntg = 1;
+    if (ntg > 65535)  ntg = 65535;  // grid-stride covers the remainder
+    ggml_metal_encoder_dispatch_threadgroups(enc, (int) ntg, 1, 1, nth, 1, 1);
 
     return 1;
 }

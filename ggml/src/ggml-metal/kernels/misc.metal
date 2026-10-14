@@ -1167,6 +1167,105 @@ template [[host_name("kernel_top_k_mask_f16")]] kernel kernel_top_k_mask_h_t ker
 template [[host_name("kernel_top_k_mask_f32")]] kernel kernel_top_k_mask_f_t kernel_top_k_mask<float, float4>;
 
 
+// gate and output slots of the LSTM cell and the transducer step control, in ggml's order
+constant uint LSTM_GATE_INPUT  = 0;
+constant uint LSTM_GATE_FORGET = 1;
+constant uint LSTM_GATE_CELL   = 2;
+constant uint LSTM_GATE_OUTPUT = 3;
+constant uint LSTM_N_GATES     = 4;
+constant uint LSTM_OUT_H       = 0;
+constant uint LSTM_OUT_C       = 1;
+constant uint LSTM_N_OUTS      = 2;
+
+static inline void lstm_cell_pair_f32(
+        device const float * g, float c_prev, uint H, uint j,
+        thread float & h_new, thread float & c_new) {
+    const float gi = 1 / (1 + exp(-g[LSTM_GATE_INPUT  * H + j]));
+    const float gf = 1 / (1 + exp(-g[LSTM_GATE_FORGET * H + j]));
+    const float gg = precise::tanh(g[LSTM_GATE_CELL   * H + j]);
+    const float go = 1 / (1 + exp(-g[LSTM_GATE_OUTPUT * H + j]));
+
+    // Metal compiles with fast math; the barrier stops the two products from
+    // contracting into an FMA, which the decomposed mul/mul/add graph cannot do.
+    {
+        #pragma clang fp contract(off)
+        c_new = gf * c_prev + gi * gg;
+    }
+
+    h_new = go * precise::tanh(c_new);
+}
+
+kernel void kernel_lstm_cell_f32(
+        constant ggml_metal_kargs_lstm_cell & args,
+        device const float * gates,  // [4H, N]
+        device const float * c_prev, // [H, N]
+        device       float * dst,    // [2H, N]
+        uint3 tgpig[[threadgroup_position_in_grid]],
+        uint3  tgpg[[threadgroups_per_grid]],
+        uint3 tpitg[[thread_position_in_threadgroup]],
+        uint3   ntg[[threads_per_threadgroup]]) {
+
+    const uint H        = (uint) args.H;
+    const uint prev_row = (uint) args.prev_row;
+    const uint total    = H * (uint) args.N;
+
+    const uint stride = ntg.x * tgpg.x;
+    for (uint k = tgpig.x * ntg.x + tpitg.x; k < total; k += stride) {
+        const uint n = k / H;
+        const uint j = k - n * H;
+
+        float h_new;
+        float c_new;
+        lstm_cell_pair_f32(gates + n * LSTM_N_GATES * H, c_prev[n * prev_row + j], H, j,
+                           h_new, c_new);
+
+        device float * out = dst + n * LSTM_N_OUTS * H;
+
+        out[LSTM_OUT_H * H + j] = h_new;
+        out[LSTM_OUT_C * H + j] = c_new;
+    }
+}
+
+kernel void kernel_lstm_cell_masked_f32(
+        constant ggml_metal_kargs_lstm_cell & args,
+        device const float * gates,   // [4H, N]
+        device const float * hc_prev, // [2H, N]
+        device const int   * mask,    // [N] or [1]
+        device       float * dst,     // [2H, N]
+        uint3 tgpig[[threadgroup_position_in_grid]],
+        uint3  tgpg[[threadgroups_per_grid]],
+        uint3 tpitg[[thread_position_in_threadgroup]],
+        uint3   ntg[[threads_per_threadgroup]]) {
+
+    const uint H        = (uint) args.H;
+    const uint prev_row = (uint) args.prev_row;
+    const uint c_base   = (uint) args.c_base;
+    const uint m_stride = (uint) args.mask_stride;
+    const uint total    = H * (uint) args.N;
+
+    const uint stride = ntg.x * tgpg.x;
+    for (uint k = tgpig.x * ntg.x + tpitg.x; k < total; k += stride) {
+        const uint n = k / H;
+        const uint j = k - n * H;
+
+        device const float * p   = hc_prev + n * prev_row;
+        device       float * out = dst     + n * LSTM_N_OUTS * H;
+
+        if (mask[n * m_stride] == 0) {
+            out[LSTM_OUT_H * H + j] = p[j];
+            out[LSTM_OUT_C * H + j] = p[c_base + j];
+            continue;
+        }
+
+        float h_new;
+        float c_new;
+        lstm_cell_pair_f32(gates + n * LSTM_N_GATES * H, p[c_base + j], H, j, h_new, c_new);
+
+        out[LSTM_OUT_H * H + j] = h_new;
+        out[LSTM_OUT_C * H + j] = c_new;
+    }
+}
+
 kernel void kernel_scale_residual_f32(
     constant   ggml_metal_kargs_scale_residual & args,
     device  const float * x,

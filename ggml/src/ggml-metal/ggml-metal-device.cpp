@@ -3513,6 +3513,37 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_count_equal(ggml
 }
 
 
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_lstm_cell(ggml_metal_library_t lib, const ggml_tensor * op) {
+    assert(op->op == GGML_OP_LSTM_CELL);
+
+    GGML_ASSERT(ggml_is_contiguous(op->src[0]));
+    GGML_ASSERT(ggml_is_contiguous(op->src[1]));
+    GGML_ASSERT(op->src[0]->type == GGML_TYPE_F32);
+    GGML_ASSERT(op->src[1]->type == GGML_TYPE_F32);
+    GGML_ASSERT(op->type         == GGML_TYPE_F32);
+    if (op->src[2]) {
+        GGML_ASSERT(ggml_is_contiguous(op->src[2]));
+        GGML_ASSERT(op->src[2]->type == GGML_TYPE_I32);
+    }
+
+    char base[256];
+    char name[256];
+
+    if (op->src[2]) {
+        snprintf(base, 256, "kernel_lstm_cell_masked_%s", ggml_type_name(op->type));
+    } else {
+        snprintf(base, 256, "kernel_lstm_cell_%s", ggml_type_name(op->type));
+    }
+    snprintf(name, 256, "%s", base);
+
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        res = ggml_metal_library_compile_pipeline(lib, base, name, nullptr);
+    }
+
+    return res;
+}
+
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_conv_1d_dw_direct(ggml_metal_library_t lib, const ggml_tensor * op) {
     assert(op->op == GGML_OP_CONV_1D_DW_DIRECT);
 

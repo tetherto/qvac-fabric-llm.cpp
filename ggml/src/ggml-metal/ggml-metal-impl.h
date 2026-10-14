@@ -1636,6 +1636,15 @@ typedef struct {
 } ggml_metal_kargs_silu_back;
 
 typedef struct {
+    int32_t H;           // hidden size
+    int32_t N;           // batch (columns)
+    int32_t prev_row;    // elements per column of the previous state: H, or 2H when masked
+    int32_t c_base;      // where c starts inside a previous-state column
+    int32_t mask_stride; // 0 broadcasts a single mask entry over every column
+} ggml_metal_kargs_lstm_cell;
+
+
+typedef struct {
     int32_t L;
     int32_t C;
     int32_t B;
