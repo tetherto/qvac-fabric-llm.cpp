@@ -396,6 +396,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_glu(ggml_metal_l
                 case GGML_GLU_OP_GEGLU_ERF:    op_str = "geglu_erf";    break;
                 case GGML_GLU_OP_GEGLU_QUICK:  op_str = "geglu_quick";  break;
                 case GGML_GLU_OP_SWIGLU_CLAMP: op_str = "swiglu_clamp"; break;
+                case GGML_GLU_OP_SIGLU:        op_str = "siglu";        break;
                 default: GGML_ABORT("fatal error");
             } break;
         default: GGML_ABORT("fatal error");
