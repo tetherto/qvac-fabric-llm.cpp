@@ -1645,6 +1645,14 @@ typedef struct {
 
 
 typedef struct {
+    int32_t n_dur;       // entries in the duration table
+    int32_t blank_id;
+    int32_t max_symbols; // symbols allowed at one encoder frame
+    int32_t rnnt;        // 1 = no duration head, advance one frame
+} ggml_metal_kargs_tdt_step;
+
+
+typedef struct {
     int32_t L;
     int32_t C;
     int32_t B;

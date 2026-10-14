@@ -533,6 +533,10 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
             {
                 n_fuse = ggml_metal_op_lstm_cell(ctx, idx);
             } break;
+        case GGML_OP_TDT_STEP:
+            {
+                n_fuse = ggml_metal_op_tdt_step(ctx, idx);
+            } break;
         case GGML_OP_CONV_1D_DW_DIRECT:
             {
                 n_fuse = ggml_metal_op_conv_1d_dw_direct(ctx, idx);
@@ -7723,6 +7727,34 @@ int ggml_metal_op_lstm_cell(ggml_metal_op_t ctx, int idx) {
     if (ntg < 1)      ntg = 1;
     if (ntg > 65535)  ntg = 65535;  // grid-stride covers the remainder
     ggml_metal_encoder_dispatch_threadgroups(enc, (int) ntg, 1, 1, nth, 1, 1);
+
+    return 1;
+}
+
+int ggml_metal_op_tdt_step(ggml_metal_op_t ctx, int idx) {
+    ggml_tensor * op = ctx->node(idx);
+
+    ggml_metal_library_t lib = ctx->lib;
+    ggml_metal_encoder_t enc = ctx->enc;
+
+    ggml_metal_kargs_tdt_step args = {
+        /*.n_dur       =*/ (int32_t) ggml_nelements(op->src[3]),
+        /*.blank_id    =*/ ggml_get_op_params_i32(op, 0),
+        /*.max_symbols =*/ ggml_get_op_params_i32(op, 1),
+        /*.rnnt        =*/ ggml_get_op_params_i32(op, 2),
+    };
+
+    auto pipeline = ggml_metal_library_get_pipeline_tdt_step(lib, op);
+
+    ggml_metal_encoder_set_pipeline(enc, pipeline);
+    ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[0]), 1); // token
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[1]), 2); // duration index
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[2]), 3); // loop counters
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[3]), 4); // duration table
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         5);
+
+    ggml_metal_encoder_dispatch_threadgroups(enc, 1, 1, 1, 1, 1, 1);
 
     return 1;
 }
