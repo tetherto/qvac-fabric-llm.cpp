@@ -1548,6 +1548,10 @@ void process_shaders() {
     string_to_spv("ssm_conv_back_sx_f32", "ssm_conv_back_sx.comp", {{"A_TYPE", "float"}});
     string_to_spv("ssm_conv_back_c_f32", "ssm_conv_back_c.comp", {{"A_TYPE", "float"}});
 
+    string_to_spv("gru_f32",             "gru.comp",             {{"A_TYPE", "float"}});
+    string_to_spv("gru_small_h2_f32",    "gru_small.comp",       {{"A_TYPE", "float"}, {"H_C", "2"}});
+    string_to_spv("gru_small_h4_f32",    "gru_small.comp",       {{"A_TYPE", "float"}, {"H_C", "4"}});
+    string_to_spv("gru_small_h8_f32",    "gru_small.comp",       {{"A_TYPE", "float"}, {"H_C", "8"}});
     string_to_spv("conv_1d_dw_direct_f32",              "conv_1d_dw_direct.comp",              {});
     string_to_spv("conv_1d_dw_direct_norm_channel_f32", "conv_1d_dw_direct_norm_channel.comp", {});
     string_to_spv("norm_channel_f32",     "norm_channel.comp",     {});

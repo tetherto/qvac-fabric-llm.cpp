@@ -1248,6 +1248,8 @@ struct vk_device_struct {
     vk_pipeline pipeline_ssm_conv_f32;
     vk_pipeline pipeline_ssm_conv_silu_f32;
     vk_pipeline pipeline_ssm_conv_bias_silu_f32;
+    vk_pipeline pipeline_gru_f32;
+    vk_pipeline pipeline_gru_small_f32[3];  // H == 2, 4, 8 register-resident variants
     vk_pipeline pipeline_conv_1d_dw_direct_f32;
     vk_pipeline pipeline_conv_1d_dw_direct_norm_channel_f32;
     vk_pipeline pipeline_norm_channel_f32;
@@ -2208,6 +2210,9 @@ struct vk_op_ssm_conv_push_constants {
     uint32_t nc, ncs, nr, n_t, n_s;
 };
 
+struct vk_op_gru_push_constants {
+    uint32_t H, B, L, reverse;
+};
 
 struct vk_op_conv_1d_dw_direct_push_constants {
     uint32_t ne, L, C, B, K, dilation, layout, causal, seg_len, has_bias;
@@ -7294,6 +7299,10 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_back_sx_f32, "ssm_conv_back_sx_f32", ssm_conv_back_sx_f32_len, ssm_conv_back_sx_f32_data, "main", 3, sizeof(vk_op_ssm_conv_back_sx_push_constants), {32, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_back_c_f32, "ssm_conv_back_c_f32", ssm_conv_back_c_f32_len, ssm_conv_back_c_f32_data, "main", 3, sizeof(vk_op_ssm_conv_back_c_push_constants), {32, 1, 1}, {}, 1);
 
+    ggml_vk_create_pipeline(device, device->pipeline_gru_f32, "gru_f32", gru_f32_len, gru_f32_data, "main", 4, sizeof(vk_op_gru_push_constants), {1, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_gru_small_f32[0], "gru_small_h2_f32", gru_small_h2_f32_len, gru_small_h2_f32_data, "main", 4, sizeof(vk_op_gru_push_constants), {1, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_gru_small_f32[1], "gru_small_h4_f32", gru_small_h4_f32_len, gru_small_h4_f32_data, "main", 4, sizeof(vk_op_gru_push_constants), {1, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_gru_small_f32[2], "gru_small_h8_f32", gru_small_h8_f32_len, gru_small_h8_f32_data, "main", 4, sizeof(vk_op_gru_push_constants), {1, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_conv_1d_dw_direct_f32, "conv_1d_dw_direct_f32", conv_1d_dw_direct_f32_len, conv_1d_dw_direct_f32_data, "main", 4, sizeof(vk_op_conv_1d_dw_direct_push_constants), {256, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_conv_1d_dw_direct_norm_channel_f32, "conv_1d_dw_direct_norm_channel_f32", conv_1d_dw_direct_norm_channel_f32_len, conv_1d_dw_direct_norm_channel_f32_data, "main", 6, sizeof(vk_op_conv_1d_dw_direct_norm_channel_push_constants), {512, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_norm_channel_f32, "norm_channel_f32", norm_channel_f32_len, norm_channel_f32_data, "main", 4, sizeof(vk_op_norm_channel_push_constants), {512, 1, 1}, {}, 1);
@@ -14117,6 +14126,19 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
             }
         }
         return nullptr;
+    case GGML_OP_GRU:
+        if (src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
+            // tiny hidden sizes: one-lane-per-batch register-resident variant
+            // (no barriers in the L loop); the packed kernel covers the rest.
+            switch (src0->ne[0]) {
+                case 2: return ctx->device->pipeline_gru_small_f32[0];
+                case 4: return ctx->device->pipeline_gru_small_f32[1];
+                case 8: return ctx->device->pipeline_gru_small_f32[2];
+                default: break;
+            }
+            return ctx->device->pipeline_gru_f32;
+        }
+        return nullptr;
     case GGML_OP_CONV_1D_DW_DIRECT:
         return src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32
             ? ctx->device->pipeline_conv_1d_dw_direct_f32 : nullptr;
@@ -14851,6 +14873,16 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
             const uint32_t n_t = dst->ne[1];
             const uint32_t n_s = dst->ne[2];
             elements = { nr, n_t, n_s };
+        }
+        break;
+    case GGML_OP_GRU:
+        {
+            // small-H: one lane per batch element; packed kernel: 128-lane WGs each covering
+            // PB = floor(128/H) batch elements (supports_op guarantees 1 <= H <= 128; must match the shaders).
+            const uint32_t H  = (uint32_t)src0->ne[0];
+            const uint32_t B  = (uint32_t)src1->ne[1];
+            const uint32_t PB = (H == 2 || H == 4 || H == 8) ? 128 : 128 / H;
+            elements = { 1, CEIL_DIV(B, PB), 1 };
         }
         break;
     case GGML_OP_SSM_CONV_BACK_SX:
@@ -15676,6 +15708,18 @@ static void ggml_vk_ssm_conv_back_c(ggml_backend_vk_context * ctx, vk_context& s
     });
 }
 
+static void ggml_vk_gru(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
+    const ggml_tensor * src0 = dst->src[0];  // whh [H, 3H]
+    const ggml_tensor * src1 = dst->src[1];  // gi_all [3H, B, L]
+    const ggml_tensor * src2 = dst->src[2];  // bhh [3H]
+
+    ggml_vk_op_f32<vk_op_gru_push_constants>(ctx, subctx, src0, src1, src2, nullptr, dst, GGML_OP_GRU, {
+        (uint32_t)src0->ne[0],
+        (uint32_t)src1->ne[1],
+        (uint32_t)src1->ne[2],
+        (uint32_t)ggml_get_op_params_i32(dst, 0),
+    });
+}
 
 static void ggml_vk_conv_1d_dw_direct(ggml_backend_vk_context * ctx, vk_context & subctx, ggml_tensor * dst) {
     const ggml_tensor * x = dst->src[0];
@@ -19064,6 +19108,10 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
 
         break;
 
+    case GGML_OP_GRU:
+        ggml_vk_gru(ctx, compute_ctx, node);
+
+        break;
 
     case GGML_OP_CONV_1D_DW_DIRECT:
         if (ctx->num_additional_fused_ops > 0) {
@@ -22729,6 +22777,11 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
             }
         case GGML_OP_SSM_CONV:
             return op->src[0]->type == GGML_TYPE_F32;
+        case GGML_OP_GRU:
+            return ggml_vk_op_views_aligned(device, op) &&
+                   op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
+                   op->src[2]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
+                   op->src[0]->ne[0] <= 128;   // hidden size H <= GRU_MAX_H (shared-mem cap)
         case GGML_OP_CONV_1D_DW_DIRECT:
             return ggml_vk_op_views_aligned(device, op) && op->src[0]->ne[3] == 1 &&
                    op->src[0]->type == GGML_TYPE_F32 &&
@@ -23803,6 +23856,9 @@ static void ggml_vk_check_results_0(ggml_backend_vk_context * ctx, ggml_cgraph *
                                          src_clone[3], src_clone[4], src_clone[5], src_clone[6], K);
         } else if (tensor->op == GGML_OP_SSM_CONV) {
             tensor_clone = ggml_ssm_conv(ggml_ctx, src_clone[0], src_clone[1]);
+        } else if (tensor->op == GGML_OP_GRU) {
+            tensor_clone = ggml_gru(ggml_ctx, src_clone[0], src_clone[1], src_clone[2],
+                                    ggml_get_op_params_i32(tensor, 0) != 0);
         } else if (tensor->op == GGML_OP_SSM_CONV_BACK_SX) {
             tensor_clone = ggml_ssm_conv_back_sx(ggml_ctx, src_clone[0], src_clone[1], tensor);
         } else if (tensor->op == GGML_OP_SSM_CONV_BACK_C) {
