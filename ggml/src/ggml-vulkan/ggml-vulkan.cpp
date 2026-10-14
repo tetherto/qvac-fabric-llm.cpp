@@ -1249,6 +1249,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_ssm_conv_silu_f32;
     vk_pipeline pipeline_ssm_conv_bias_silu_f32;
     vk_pipeline pipeline_conv_1d_dw_direct_f32;
+    vk_pipeline pipeline_conv_1d_dw_direct_norm_channel_f32;
     vk_pipeline pipeline_norm_channel_f32;
     vk_pipeline pipeline_ssm_conv_back_sx_f32;
     vk_pipeline pipeline_ssm_conv_back_c_f32;
@@ -2207,6 +2208,11 @@ struct vk_op_ssm_conv_push_constants {
 
 struct vk_op_conv_1d_dw_direct_push_constants {
     uint32_t ne, L, C, B, K, dilation, layout, causal, seg_len, has_bias;
+};
+
+struct vk_op_conv_1d_dw_direct_norm_channel_push_constants {
+    uint32_t L, C, B, K, dilation, layout, causal, seg_len, has_bias;
+    float eps;
 };
 
 struct vk_op_norm_channel_push_constants {
@@ -7278,6 +7284,7 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_back_c_f32, "ssm_conv_back_c_f32", ssm_conv_back_c_f32_len, ssm_conv_back_c_f32_data, "main", 3, sizeof(vk_op_ssm_conv_back_c_push_constants), {32, 1, 1}, {}, 1);
 
     ggml_vk_create_pipeline(device, device->pipeline_conv_1d_dw_direct_f32, "conv_1d_dw_direct_f32", conv_1d_dw_direct_f32_len, conv_1d_dw_direct_f32_data, "main", 4, sizeof(vk_op_conv_1d_dw_direct_push_constants), {256, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_conv_1d_dw_direct_norm_channel_f32, "conv_1d_dw_direct_norm_channel_f32", conv_1d_dw_direct_norm_channel_f32_len, conv_1d_dw_direct_norm_channel_f32_data, "main", 6, sizeof(vk_op_conv_1d_dw_direct_norm_channel_push_constants), {512, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_norm_channel_f32, "norm_channel_f32", norm_channel_f32_len, norm_channel_f32_data, "main", 4, sizeof(vk_op_norm_channel_push_constants), {512, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_opt_step_adamw_f32, "opt_step_adamw_f32", opt_step_adamw_f32_len, opt_step_adamw_f32_data, "main", 5, sizeof(vk_op_push_constants), {512, 1, 1}, {}, 1);
 
@@ -15663,6 +15670,50 @@ static void ggml_vk_conv_1d_dw_direct(ggml_backend_vk_context * ctx, vk_context 
         });
 }
 
+static void ggml_vk_conv_1d_dw_direct_norm_channel(
+        ggml_backend_vk_context * ctx, vk_context & subctx, const ggml_cgraph * cgraph, int node_idx) {
+    GGML_ASSERT(ctx->num_additional_fused_ops == 1);
+
+    const ggml_tensor * conv = cgraph->nodes[node_idx];
+    const ggml_tensor * norm = cgraph->nodes[node_idx + 1];
+    const ggml_tensor * x = conv->src[0];
+    const ggml_tensor * w = conv->src[1];
+    const ggml_tensor * bias = conv->src[2];
+    const ggml_tensor * gamma = norm->src[1];
+    const ggml_tensor * beta = norm->src[2];
+    ggml_tensor * dst = cgraph->nodes[node_idx + ctx->num_additional_fused_ops];
+
+    const uint32_t layout = (uint32_t)ggml_get_op_params_i32(conv, 2);
+    const uint32_t L = (uint32_t)(layout == 0 ? x->ne[0] : x->ne[1]);
+    const uint32_t C = (uint32_t)(layout == 0 ? x->ne[1] : x->ne[0]);
+    float eps;
+    memcpy(&eps, norm->op_params, sizeof(eps));
+
+    const vk_op_conv_1d_dw_direct_norm_channel_push_constants pc = {
+        L,
+        C,
+        (uint32_t)x->ne[2],
+        (uint32_t)ggml_get_op_params_i32(conv, 0),
+        (uint32_t)ggml_get_op_params_i32(conv, 1),
+        layout,
+        (uint32_t)ggml_get_op_params_i32(conv, 3),
+        (uint32_t)ggml_get_op_params_i32(conv, 4),
+        bias != nullptr ? 1u : 0u,
+        eps,
+    };
+
+    vk_pipeline pipeline = ctx->device->pipeline_conv_1d_dw_direct_norm_channel_f32;
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, {
+        ggml_vk_tensor_subbuffer(ctx, x),
+        ggml_vk_tensor_subbuffer(ctx, w),
+        ggml_vk_tensor_subbuffer(ctx, bias ? bias : x),
+        ggml_vk_tensor_subbuffer(ctx, gamma),
+        ggml_vk_tensor_subbuffer(ctx, beta),
+        ggml_vk_tensor_subbuffer(ctx, dst),
+    }, pc, { 512, L, (uint32_t)x->ne[2] });
+}
+
 static void ggml_vk_norm_channel(ggml_backend_vk_context * ctx, vk_context & subctx, ggml_tensor * dst) {
     const ggml_tensor * x = dst->src[0];
     const uint32_t layout = (uint32_t)ggml_get_op_params_i32(dst, 1);
@@ -18951,7 +19002,11 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
 
 
     case GGML_OP_CONV_1D_DW_DIRECT:
-        ggml_vk_conv_1d_dw_direct(ctx, compute_ctx, node);
+        if (ctx->num_additional_fused_ops > 0) {
+            ggml_vk_conv_1d_dw_direct_norm_channel(ctx, compute_ctx, cgraph, node_idx);
+        } else {
+            ggml_vk_conv_1d_dw_direct(ctx, compute_ctx, node);
+        }
 
         break;
 
@@ -20477,6 +20532,67 @@ static bool ggml_vk_can_fuse_fwht_signed(ggml_backend_vk_context * ctx, const st
         signs->ne[0] == x->ne[0] && signs->ne[0] % n == 0;
 }
 
+static bool ggml_vk_can_fuse_conv_1d_dw_direct_norm_channel(const struct ggml_cgraph * cgraph, int node_idx) {
+    if (!ggml_can_fuse(cgraph, node_idx, { GGML_OP_CONV_1D_DW_DIRECT, GGML_OP_NORM_CHANNEL })) {
+        return false;
+    }
+
+    const ggml_tensor * conv = cgraph->nodes[node_idx];
+    const ggml_tensor * norm = cgraph->nodes[node_idx + 1];
+    if (norm->src[0] != conv ||
+        ggml_get_op_params_i32(conv, 2) != ggml_get_op_params_i32(norm, 1)) {
+        return false;
+    }
+
+    const ggml_tensor * x = conv->src[0];
+    const ggml_tensor * w = conv->src[1];
+    const ggml_tensor * bias = conv->src[2];
+    const ggml_tensor * gamma = norm->src[1];
+    const ggml_tensor * beta = norm->src[2];
+    if (!x || !w || !gamma || !beta) {
+        return false;
+    }
+
+    const int32_t layout = ggml_get_op_params_i32(conv, 2);
+    const int64_t C = layout == 0 ? x->ne[1] : x->ne[0];
+    const int32_t K = ggml_get_op_params_i32(conv, 0);
+
+    // The shader keeps every depthwise result in registers until both
+    // normalization reductions finish. Wider tensors retain the two standalone dispatches.
+    static constexpr int64_t values_per_lane = 8;
+    static constexpr int64_t local_size = 512;
+    if (C > values_per_lane * local_size ||
+        !ggml_are_same_shape(conv, x) ||
+        w->ne[0] != K || w->ne[1] != 1 || w->ne[2] != C || w->ne[3] != 1 ||
+        (bias && ggml_nelements(bias) != C) ||
+        ggml_nelements(gamma) != C || ggml_nelements(beta) != C) {
+        return false;
+    }
+
+    if (x->ne[3] != 1 ||
+        x->type != GGML_TYPE_F32 || w->type != GGML_TYPE_F32 ||
+        (bias && bias->type != GGML_TYPE_F32) ||
+        gamma->type != GGML_TYPE_F32 || beta->type != GGML_TYPE_F32 ||
+        conv->type != GGML_TYPE_F32 || norm->type != GGML_TYPE_F32 ||
+        !ggml_is_contiguous(x) || !ggml_is_contiguous(w) ||
+        (bias && !ggml_is_contiguous(bias)) ||
+        !ggml_is_contiguous(gamma) || !ggml_is_contiguous(beta) ||
+        !ggml_is_contiguous(conv) || !ggml_is_contiguous(norm) ||
+        (K != 3 && K != 5 && K != 7)) {
+        return false;
+    }
+
+    // Unlike the standalone pair, the fused workgroups can still be reading
+    // neighboring timesteps or affine parameters when another workgroup writes.
+    for (const ggml_tensor * input : { x, w, bias, gamma, beta }) {
+        if (input && ggml_vk_tensors_overlap(input, norm, false)) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
 static bool ggml_vk_can_fuse_rms_norm_mul_rope(ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph,
                                                int node_idx) {
     const ggml_tensor *rms = cgraph->nodes[node_idx + 0];
@@ -20860,6 +20976,12 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 ctx->fused_fwht_signed = true;
                 fusion_string = "FWHT_SIGNED";
                 std::fill_n(op_srcs_fused_elementwise, 3, false);
+            } else if (ggml_vk_can_fuse_conv_1d_dw_direct_norm_channel(cgraph, i)) {
+                ctx->num_additional_fused_ops = 1;
+                fusion_string = "CONV_1D_DW_DIRECT_NORM_CHANNEL";
+                // The conv reads neighboring timesteps and the norm reduces all channels.
+                op_srcs_fused_elementwise[0] = false;
+                op_srcs_fused_elementwise[1] = false;
             } else if (ggml_vk_can_fuse_snake(ctx, cgraph, i)) {
                 ctx->num_additional_fused_ops = 4;
                 fusion_string = "SNAKE";

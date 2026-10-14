@@ -1549,6 +1549,7 @@ void process_shaders() {
     string_to_spv("ssm_conv_back_c_f32", "ssm_conv_back_c.comp", {{"A_TYPE", "float"}});
 
     string_to_spv("conv_1d_dw_direct_f32",              "conv_1d_dw_direct.comp",              {});
+    string_to_spv("conv_1d_dw_direct_norm_channel_f32", "conv_1d_dw_direct_norm_channel.comp", {});
     string_to_spv("norm_channel_f32",     "norm_channel.comp",     {});
     string_to_spv("topk_moe_f32", "topk_moe.comp", {});
 
