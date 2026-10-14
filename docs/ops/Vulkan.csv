@@ -19499,3 +19499,5 @@
 "Vulkan0","CHANNEL_SHUFFLE","ne=[8,4,12,2],groups=2","support","1","yes","Vulkan"
 "Vulkan0","CHANNEL_SHUFFLE","ne=[8,4,12,2],groups=3","support","1","yes","Vulkan"
 "Vulkan0","CHANNEL_SHUFFLE","ne=[8,4,12,2],groups=4","support","1","yes","Vulkan"
+"Vulkan0","AFFINE_PRELU","f=16,t=10,c=6,bc=2","support","1","yes","Vulkan"
+"Vulkan0","AFFINE_PRELU","f=129,t=63,c=16,bc=3","support","1","yes","Vulkan"

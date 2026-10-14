@@ -1554,6 +1554,7 @@ void process_shaders() {
     string_to_spv("gru_small_h8_f32",    "gru_small.comp",       {{"A_TYPE", "float"}, {"H_C", "8"}});
     string_to_spv("zero_upsample_f32",   "zero_upsample.comp",   {{"A_TYPE", "float"}, {"D_TYPE", "float"}});
     string_to_spv("channel_shuffle_f32", "channel_shuffle.comp", {{"A_TYPE", "float"}, {"D_TYPE", "float"}});
+    string_to_spv("affine_prelu_f32",    "affine_prelu.comp",    {{"A_TYPE", "float"}});
     string_to_spv("conv_1d_dw_direct_f32",              "conv_1d_dw_direct.comp",              {});
     string_to_spv("conv_1d_dw_direct_norm_channel_f32", "conv_1d_dw_direct_norm_channel.comp", {});
     string_to_spv("norm_channel_f32",     "norm_channel.comp",     {});
