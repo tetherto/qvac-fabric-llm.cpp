@@ -1165,3 +1165,254 @@ typedef decltype(kernel_top_k_mask<float, float4>) kernel_top_k_mask_f_t;
 
 template [[host_name("kernel_top_k_mask_f16")]] kernel kernel_top_k_mask_h_t kernel_top_k_mask<half,  half4>;
 template [[host_name("kernel_top_k_mask_f32")]] kernel kernel_top_k_mask_f_t kernel_top_k_mask<float, float4>;
+
+
+// gate and output slots of the LSTM cell and the transducer step control, in ggml's order
+constant uint LSTM_GATE_INPUT  = 0;
+constant uint LSTM_GATE_FORGET = 1;
+constant uint LSTM_GATE_CELL   = 2;
+constant uint LSTM_GATE_OUTPUT = 3;
+constant uint LSTM_N_GATES     = 4;
+constant uint LSTM_OUT_H       = 0;
+constant uint LSTM_OUT_C       = 1;
+constant uint LSTM_N_OUTS      = 2;
+constant uint TDT_STEP_IN_T      = 0;
+constant uint TDT_STEP_IN_S      = 1;
+constant uint TDT_STEP_IN_N      = 2;
+constant uint TDT_STEP_OUT_T     = 0;
+constant uint TDT_STEP_OUT_S     = 1;
+constant uint TDT_STEP_OUT_N     = 2;
+constant uint TDT_STEP_OUT_UPD   = 3;
+constant uint TDT_STEP_OUT_HOLD  = 4;
+constant uint TDT_STEP_OUT_FRAME = 5;
+constant uint TDT_STEP_OUT_TOKEN = 6;
+constant uint TDT_STEP_OUT_DUR   = 7;
+
+static inline void lstm_cell_pair_f32(
+        device const float * g, float c_prev, uint H, uint j,
+        thread float & h_new, thread float & c_new) {
+    const float gi = 1 / (1 + exp(-g[LSTM_GATE_INPUT  * H + j]));
+    const float gf = 1 / (1 + exp(-g[LSTM_GATE_FORGET * H + j]));
+    const float gg = precise::tanh(g[LSTM_GATE_CELL   * H + j]);
+    const float go = 1 / (1 + exp(-g[LSTM_GATE_OUTPUT * H + j]));
+
+    // Metal compiles with fast math; the barrier stops the two products from
+    // contracting into an FMA, which the decomposed mul/mul/add graph cannot do.
+    {
+        #pragma clang fp contract(off)
+        c_new = gf * c_prev + gi * gg;
+    }
+
+    h_new = go * precise::tanh(c_new);
+}
+
+kernel void kernel_lstm_cell_f32(
+        constant ggml_metal_kargs_lstm_cell & args,
+        device const float * gates,  // [4H, N]
+        device const float * c_prev, // [H, N]
+        device       float * dst,    // [2H, N]
+        uint3 tgpig[[threadgroup_position_in_grid]],
+        uint3  tgpg[[threadgroups_per_grid]],
+        uint3 tpitg[[thread_position_in_threadgroup]],
+        uint3   ntg[[threads_per_threadgroup]]) {
+
+    const uint H        = (uint) args.H;
+    const uint prev_row = (uint) args.prev_row;
+    const uint total    = H * (uint) args.N;
+
+    const uint stride = ntg.x * tgpg.x;
+    for (uint k = tgpig.x * ntg.x + tpitg.x; k < total; k += stride) {
+        const uint n = k / H;
+        const uint j = k - n * H;
+
+        float h_new;
+        float c_new;
+        lstm_cell_pair_f32(gates + n * LSTM_N_GATES * H, c_prev[n * prev_row + j], H, j,
+                           h_new, c_new);
+
+        device float * out = dst + n * LSTM_N_OUTS * H;
+
+        out[LSTM_OUT_H * H + j] = h_new;
+        out[LSTM_OUT_C * H + j] = c_new;
+    }
+}
+
+kernel void kernel_lstm_cell_masked_f32(
+        constant ggml_metal_kargs_lstm_cell & args,
+        device const float * gates,   // [4H, N]
+        device const float * hc_prev, // [2H, N]
+        device const int   * mask,    // [N] or [1]
+        device       float * dst,     // [2H, N]
+        uint3 tgpig[[threadgroup_position_in_grid]],
+        uint3  tgpg[[threadgroups_per_grid]],
+        uint3 tpitg[[thread_position_in_threadgroup]],
+        uint3   ntg[[threads_per_threadgroup]]) {
+
+    const uint H        = (uint) args.H;
+    const uint prev_row = (uint) args.prev_row;
+    const uint c_base   = (uint) args.c_base;
+    const uint m_stride = (uint) args.mask_stride;
+    const uint total    = H * (uint) args.N;
+
+    const uint stride = ntg.x * tgpg.x;
+    for (uint k = tgpig.x * ntg.x + tpitg.x; k < total; k += stride) {
+        const uint n = k / H;
+        const uint j = k - n * H;
+
+        device const float * p   = hc_prev + n * prev_row;
+        device       float * out = dst     + n * LSTM_N_OUTS * H;
+
+        if (mask[n * m_stride] == 0) {
+            out[LSTM_OUT_H * H + j] = p[j];
+            out[LSTM_OUT_C * H + j] = p[c_base + j];
+            continue;
+        }
+
+        float h_new;
+        float c_new;
+        lstm_cell_pair_f32(gates + n * LSTM_N_GATES * H, p[c_base + j], H, j, h_new, c_new);
+
+        out[LSTM_OUT_H * H + j] = h_new;
+        out[LSTM_OUT_C * H + j] = c_new;
+    }
+}
+
+kernel void kernel_tdt_step_i32(
+        constant ggml_metal_kargs_tdt_step & args,
+        device const int * token,
+        device const int * dur_idx,
+        device const int * state,
+        device const int * dur_table,
+        device       int * dst) {
+    const int t = state[TDT_STEP_IN_T];
+    const int s = state[TDT_STEP_IN_S];
+    const int n = state[TDT_STEP_IN_N];
+
+    int t_next = t;
+    int s_next = s;
+    int update = 0;
+
+    if (t < n) {
+        const int raw = dur_idx[0];
+        const int di  = raw < 0 ? 0 : (raw < args.n_dur ? raw : args.n_dur - 1);
+        const int dur = args.rnnt ? 0 : dur_table[di];
+        const int adv = args.rnnt ? 1 : (dur > 1 ? dur : 1);
+
+        if (token[0] == args.blank_id) {
+            t_next = t + adv;
+            s_next = 0;
+        } else {
+            update = 1;
+            s_next = s + 1;
+            if ((args.rnnt == 0 && dur > 0) || s_next >= args.max_symbols) {
+                t_next = t + adv;
+                s_next = 0;
+            }
+        }
+    }
+
+    int frame = t_next > n - 1 ? n - 1 : t_next;
+    if (frame < 0) {
+        frame = 0;
+    }
+
+    dst[TDT_STEP_OUT_T]     = t_next;
+    dst[TDT_STEP_OUT_S]     = s_next;
+    dst[TDT_STEP_OUT_N]     = n;
+    dst[TDT_STEP_OUT_UPD]   = update;
+    dst[TDT_STEP_OUT_HOLD]  = 1 - update;
+    dst[TDT_STEP_OUT_FRAME] = frame;
+    dst[TDT_STEP_OUT_TOKEN] = token[0];
+    dst[TDT_STEP_OUT_DUR]   = dur_idx[0];
+}
+
+kernel void kernel_scale_residual_f32(
+    constant   ggml_metal_kargs_scale_residual & args,
+    device  const float * x,
+    device  const float * bias,
+    device  const float * gamma,
+    device  const float * residual,
+    device        float * y,
+    uint3 tgpig[[threadgroup_position_in_grid]],
+    uint3 tpitg[[thread_position_in_threadgroup]],
+    uint3   ntg[[threads_per_threadgroup]]) {
+
+    const int c = (int) tgpig.x;
+    const int batch = (int) tgpig.y;
+    if (c >= args.C || batch >= args.B) return;
+
+    const int L = args.L;
+    const int sxt = args.sxt, sxc = args.sxc;
+    const int syt = args.syt, syc = args.syc;
+    const int srt = args.srt, src = args.src;
+    const float bv = bias[c];
+    const float gv = gamma[c];
+    const size_t batch_offset = (size_t) batch * L * args.C;
+
+    device const float * x_c = x        + batch_offset + (size_t) c * sxc;
+    device const float * r_c = residual + batch_offset + (size_t) c * src;
+    device       float * y_c = y        + batch_offset + (size_t) c * syc;
+
+    for (int t = (int) tpitg.x; t < L; t += (int) ntg.x) {
+        y_c[(size_t) t * syt] = r_c[(size_t) t * srt] + (x_c[(size_t) t * sxt] + bv) * gv;
+    }
+}
+
+kernel void kernel_bias_gelu_f32(
+    constant   ggml_metal_kargs_bias_gelu & args,
+    device  const float * x,
+    device  const float * bias,
+    device        float * y,
+    uint3 tgpig[[threadgroup_position_in_grid]],
+    uint3 tpitg[[thread_position_in_threadgroup]],
+    uint3   ntg[[threads_per_threadgroup]]) {
+
+    const int c = (int) tgpig.x;
+    const int batch = (int) tgpig.y;
+    if (c >= args.C || batch >= args.B) return;
+
+    const int L = args.L;
+    const int sxt = args.sxt, sxc = args.sxc;
+    const int syt = args.syt, syc = args.syc;
+    const float bv = bias[c];
+    const size_t batch_offset = (size_t) batch * L * args.C;
+
+    device const float * x_c = x + batch_offset + (size_t) c * sxc;
+    device       float * y_c = y + batch_offset + (size_t) c * syc;
+
+    // Use the same erf_approx template as kernel_gelu_erf_f32 above
+    // (Abramowitz & Stegun 7.1.26 / Hastings approximation) so the fused
+    // bias_gelu output is bit-identical to the unfused add + gelu_erf path.
+    for (int t = (int) tpitg.x; t < L; t += (int) ntg.x) {
+        const float v = x_c[(size_t) t * sxt] + bv;
+        y_c[(size_t) t * syt] = 0.5f * v * (1.0f + erf_approx<float>(v * SQRT_2_INV));
+    }
+}
+
+kernel void kernel_pad_replicate_1d_f32(
+    constant   ggml_metal_kargs_pad_replicate_1d & args,
+    device  const float * x,
+    device        float * y,
+    uint3 tgpig[[threadgroup_position_in_grid]],
+    uint3 tpitg[[thread_position_in_threadgroup]],
+    uint3   ntg[[threads_per_threadgroup]]) {
+
+    const int c = (int) tgpig.x;
+    if (c >= args.C) return;
+
+    const int L_in  = args.L_in;
+    const int L_out = args.L_out;
+    const int pad   = args.pad_left;
+    const int sxt = args.sxt, sxc = args.sxc;
+    const int syt = args.syt, syc = args.syc;
+
+    device const float * x_c = x + (size_t) c * sxc;
+    device       float * y_c = y + (size_t) c * syc;
+
+    for (int t = (int) tpitg.x; t < L_out; t += (int) ntg.x) {
+        int src_t = t - pad;
+        if (src_t < 0)      src_t = 0;
+        if (src_t >= L_in)  src_t = L_in - 1;
+        y_c[(size_t) t * syt] = x_c[(size_t) src_t * sxt];
+    }
+}

@@ -722,3 +722,175 @@ kernel void kernel_conv_3d<half>(
     device       char  * dst,
     uint3 tgpig[[threadgroup_position_in_grid]],
     uint3 tpitg[[thread_position_in_threadgroup]]);
+
+static inline float conv_1d_dw_direct_tap(device const float * x_c, device const float * w_c,
+                                             int t, int lo, int hi, int k, int dilation, int k_off,
+                                             int sxt, float sum) {
+    int s = t + (k + k_off) * dilation;
+    if (s < lo) s = lo; else if (s >= hi) s = hi - 1;
+    return fma(x_c[(size_t) s * sxt], w_c[k], sum);
+}
+
+static inline float conv_1d_dw_direct_tap_sum(device const float * x_c, device const float * w_c,
+                                                 int t, int lo, int hi, int K, int dilation, int k_off,
+                                                 int sxt, float bias_v) {
+    float sum = bias_v;
+    if (K == 7) {
+        sum = conv_1d_dw_direct_tap(x_c, w_c, t, lo, hi, 0, dilation, k_off, sxt, sum);
+        sum = conv_1d_dw_direct_tap(x_c, w_c, t, lo, hi, 1, dilation, k_off, sxt, sum);
+        sum = conv_1d_dw_direct_tap(x_c, w_c, t, lo, hi, 2, dilation, k_off, sxt, sum);
+        sum = conv_1d_dw_direct_tap(x_c, w_c, t, lo, hi, 3, dilation, k_off, sxt, sum);
+        sum = conv_1d_dw_direct_tap(x_c, w_c, t, lo, hi, 4, dilation, k_off, sxt, sum);
+        sum = conv_1d_dw_direct_tap(x_c, w_c, t, lo, hi, 5, dilation, k_off, sxt, sum);
+        sum = conv_1d_dw_direct_tap(x_c, w_c, t, lo, hi, 6, dilation, k_off, sxt, sum);
+    } else if (K == 5) {
+        sum = conv_1d_dw_direct_tap(x_c, w_c, t, lo, hi, 0, dilation, k_off, sxt, sum);
+        sum = conv_1d_dw_direct_tap(x_c, w_c, t, lo, hi, 1, dilation, k_off, sxt, sum);
+        sum = conv_1d_dw_direct_tap(x_c, w_c, t, lo, hi, 2, dilation, k_off, sxt, sum);
+        sum = conv_1d_dw_direct_tap(x_c, w_c, t, lo, hi, 3, dilation, k_off, sxt, sum);
+        sum = conv_1d_dw_direct_tap(x_c, w_c, t, lo, hi, 4, dilation, k_off, sxt, sum);
+    } else { // K == 3
+        sum = conv_1d_dw_direct_tap(x_c, w_c, t, lo, hi, 0, dilation, k_off, sxt, sum);
+        sum = conv_1d_dw_direct_tap(x_c, w_c, t, lo, hi, 1, dilation, k_off, sxt, sum);
+        sum = conv_1d_dw_direct_tap(x_c, w_c, t, lo, hi, 2, dilation, k_off, sxt, sum);
+    }
+    return sum;
+}
+
+kernel void kernel_conv_1d_dw_direct_f32(
+    constant   ggml_metal_kargs_conv_1d_dw_direct & args,
+    device  const float * x,
+    device  const float * w,
+    device  const float * bias,
+    device        float * y,
+    uint3 tgpig[[threadgroup_position_in_grid]],
+    uint3 tpitg[[thread_position_in_threadgroup]],
+    uint3   ntg[[threads_per_threadgroup]]) {
+
+    const int c = (int) tgpig.x;
+    const int batch = (int) tgpig.y;
+    if (c >= args.C || batch >= args.B) return;
+
+    const int L        = args.L;
+    const int K        = args.K;
+    const int dilation = args.dilation;
+    const int causal   = args.causal;
+    const int sxt = args.sxt, sxc = args.sxc;
+    const int syt = args.syt, syc = args.syc;
+    const size_t batch_offset = (size_t) batch * L * args.C;
+
+    // Layout-agnostic per-channel base pointers: x[t, c] = x[t*sxt + c*sxc].
+    // w is stored as [K, 1, C] f32 contiguous, so w_c = w + c*K stays.
+    device const float * x_c = x + batch_offset + (size_t) c * sxc;
+    device const float * w_c = w + (size_t) c * K;
+    device       float * y_c = y + batch_offset + (size_t) c * syc;
+
+    const float bias_v = (args.has_bias != 0) ? bias[c] : 0.0f;
+
+    // The k-offset selects the kernel-centre vs causal-left convolution
+    // semantic: symmetric edge-clamp (causal=0) uses offset = -K/2 so the
+    // tap at k = K/2 lands at t; causal (causal=1) uses offset = -(K-1) so
+    // the last tap at k = K-1 lands at t and earlier taps look strictly
+    // left.
+    const int k_off = (causal != 0) ? -(K - 1) : -(K / 2);
+    const int seg_len = args.seg_len;
+
+    for (int t = (int) tpitg.x; t < L; t += (int) ntg.x) {
+        const int lo = seg_len > 0 ? (t / seg_len) * seg_len : 0;
+        const int hi = seg_len > 0 ? lo + seg_len : L;
+        y_c[(size_t) t * syt] = conv_1d_dw_direct_tap_sum(x_c, w_c, t, lo, hi, K, dilation, k_off, sxt, bias_v);
+    }
+}
+
+kernel void kernel_conv_1d_dw_direct_norm_channel_f32(
+    constant   ggml_metal_kargs_conv_1d_dw_direct_norm_channel & args,
+    device  const float * x,
+    device  const float * w,
+    device  const float * bias,
+    device  const float * g,
+    device  const float * b,
+    device        float * y,
+    threadgroup    float * shared [[threadgroup(0)]],
+    uint3 tgpig[[threadgroup_position_in_grid]],
+    uint3 tpitg[[thread_position_in_threadgroup]],
+    uint3   ntg[[threads_per_threadgroup]],
+    uint  sgitg [[simdgroup_index_in_threadgroup]],
+    uint  tiisg [[thread_index_in_simdgroup]]) {
+
+    const int t = (int) tgpig.x;
+    const int batch = (int) tgpig.y;
+    if (t >= args.L || batch >= args.B) return;
+
+    const int L = args.L;
+    const int C = args.C;
+    const int K = args.K;
+    const int dilation = args.dilation;
+    const int sxt = args.sxt, sxc = args.sxc;
+    const int syt = args.syt, syc = args.syc;
+    const int k_off = (args.causal != 0) ? -(K - 1) : -(K / 2);
+    const int seg_len = args.seg_len;
+    const int lo = seg_len > 0 ? (t / seg_len) * seg_len : 0;
+    const int hi = seg_len > 0 ? lo + seg_len : L;
+    const size_t batch_offset = (size_t) batch * L * C;
+
+    float vals[GGML_METAL_DW_LN_MAX_PER_THREAD];
+    for (int i = 0; i < GGML_METAL_DW_LN_MAX_PER_THREAD; ++i) {
+        const int c = (int) tpitg.x + i * (int) ntg.x;
+        if (c < C) {
+            const float bias_v = (args.has_bias != 0) ? bias[c] : 0.0f;
+            vals[i] = conv_1d_dw_direct_tap_sum(x + batch_offset + (size_t) c * sxc, w + (size_t) c * K,
+                                                   t, lo, hi, K, dilation, k_off, sxt, bias_v);
+        }
+    }
+
+    float my_sum = 0.0f;
+    for (int i = 0; i < GGML_METAL_DW_LN_MAX_PER_THREAD; ++i) {
+        const int c = (int) tpitg.x + i * (int) ntg.x;
+        if (c < C) my_sum += vals[i];
+    }
+    my_sum = simd_sum(my_sum);
+    if (tiisg == 0) {
+        shared[sgitg] = my_sum;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sgitg == 0) {
+        const uint n_sg = (ntg.x + 31) / 32;
+        float total = (tiisg < n_sg) ? shared[tiisg] : 0.0f;
+        total = simd_sum(total);
+        if (tiisg == 0) shared[0] = total;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float mean = shared[0] / (float) C;
+
+    float my_sq = 0.0f;
+    for (int i = 0; i < GGML_METAL_DW_LN_MAX_PER_THREAD; ++i) {
+        const int c = (int) tpitg.x + i * (int) ntg.x;
+        if (c < C) {
+            const float d = vals[i] - mean;
+            my_sq = fma(d, d, my_sq);
+        }
+    }
+    my_sq = simd_sum(my_sq);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tiisg == 0) {
+        shared[sgitg] = my_sq;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sgitg == 0) {
+        const uint n_sg = (ntg.x + 31) / 32;
+        float total = (tiisg < n_sg) ? shared[tiisg] : 0.0f;
+        total = simd_sum(total);
+        if (tiisg == 0) shared[0] = total;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float inv_std = rsqrt(shared[0] / (float) C + args.eps);
+
+    device float * y_t = y + batch_offset + (size_t) t * syt;
+    for (int i = 0; i < GGML_METAL_DW_LN_MAX_PER_THREAD; ++i) {
+        const int c = (int) tpitg.x + i * (int) ntg.x;
+        if (c < C) {
+            const float xv = vals[i];
+            y_t[(size_t) c * syc] = (xv - mean) * inv_std * g[c] + b[c];
+        }
+    }
+}
