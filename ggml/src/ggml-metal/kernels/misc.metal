@@ -522,12 +522,12 @@ kernel void kernel_snake(
         uint         tpitg [[thread_position_in_threadgroup]],
         uint         ntg   [[threads_per_threadgroup]]) {
 
-    const int idx = tgpig * ntg + tpitg;
-    if (idx >= args.T * args.C) {
+    const uint64_t idx = (uint64_t) tgpig * ntg + tpitg;
+    if (idx >= (uint64_t) args.ne) {
         return;
     }
 
-    const int   c  = idx / args.T;  // x is [T, C], a / inv_b collapse to [1, C]
+    const uint64_t c  = idx / (uint64_t) args.T;  // x is [T, C], a / inv_b collapse to [1, C]
     const float xi = float(x[idx]);
     const float si = sin(a[c] * xi);
     dst[idx] = T(xi + si * si * inv_b[c]);
