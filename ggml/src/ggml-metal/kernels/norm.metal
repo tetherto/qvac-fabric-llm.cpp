@@ -464,3 +464,80 @@ kernel void kernel_group_norm_f32(
         dst[j] *= scale;
     }
 }
+
+kernel void kernel_norm_channel_f32(
+    constant   ggml_metal_kargs_norm_channel & args,
+    device  const float * x,
+    device  const float * g,
+    device  const float * b,
+    device        float * y,
+    threadgroup    float * shared [[threadgroup(0)]],
+    uint3 tgpig[[threadgroup_position_in_grid]],
+    uint3 tpitg[[thread_position_in_threadgroup]],
+    uint3   ntg[[threads_per_threadgroup]],
+    uint  sgitg [[simdgroup_index_in_threadgroup]],
+    uint  tiisg [[thread_index_in_simdgroup]]) {
+
+    const int t = (int) tgpig.x;
+    const int batch = (int) tgpig.y;
+    if (t >= args.L || batch >= args.B) return;
+
+    const int C = args.C;
+    // Element strides — let the same kernel handle both
+    // [T, C] (sxt=1, sxc=L) and [C, T] (sxt=C, sxc=1) layouts.
+    const int sxt = args.sxt, sxc = args.sxc;
+    const int syt = args.syt, syc = args.syc;
+    const size_t batch_offset = (size_t) batch * args.L * C;
+
+    device const float * x_t = x + batch_offset + (size_t) t * sxt;
+    device       float * y_t = y + batch_offset + (size_t) t * syt;
+
+    // ---- Mean ----
+    float my_sum = 0.0f;
+    for (int c = (int) tpitg.x; c < C; c += (int) ntg.x) {
+        my_sum += x_t[(size_t) c * sxc];
+    }
+    // Simdgroup reduce within the simdgroup.
+    my_sum = simd_sum(my_sum);
+    if (tiisg == 0) {
+        shared[sgitg] = my_sum;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    // First simdgroup reduces partial sums.
+    if (sgitg == 0) {
+        const uint n_sg = (ntg.x + 31) / 32;
+        float total = (tiisg < n_sg) ? shared[tiisg] : 0.0f;
+        total = simd_sum(total);
+        if (tiisg == 0) shared[0] = total;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float mean = shared[0] / (float) C;
+
+    // ---- Variance ----
+    float my_sq = 0.0f;
+    for (int c = (int) tpitg.x; c < C; c += (int) ntg.x) {
+        const float d = x_t[(size_t) c * sxc] - mean;
+        my_sq = fma(d, d, my_sq);
+    }
+    my_sq = simd_sum(my_sq);
+    // Every simdgroup must have read the mean from shared[0] before it is reused below.
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tiisg == 0) {
+        shared[sgitg] = my_sq;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sgitg == 0) {
+        const uint n_sg = (ntg.x + 31) / 32;
+        float total = (tiisg < n_sg) ? shared[tiisg] : 0.0f;
+        total = simd_sum(total);
+        if (tiisg == 0) shared[0] = total;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float inv_std = rsqrt(shared[0] / (float) C + args.eps);
+
+    // ---- Apply affine ----
+    for (int c = (int) tpitg.x; c < C; c += (int) ntg.x) {
+        const float xv = x_t[(size_t) c * sxc];
+        y_t[(size_t) c * syc] = (xv - mean) * inv_std * g[c] + b[c];
+    }
+}

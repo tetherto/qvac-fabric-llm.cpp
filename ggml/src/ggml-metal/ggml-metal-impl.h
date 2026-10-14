@@ -1635,4 +1635,55 @@ typedef struct {
     int64_t ne;
 } ggml_metal_kargs_silu_back;
 
+typedef struct {
+    int32_t L;
+    int32_t C;
+    int32_t B;
+    int32_t K;
+    int32_t dilation;
+    int32_t has_bias;
+    int32_t causal;   // 0 = symmetric edge-clamp (vector_estimator), 1 = causal-left (vocoder)
+    int32_t seg_len;  // 0 = one segment of L, else clamp inside each seg_len window
+    int32_t sxt;
+    int32_t sxc;
+    int32_t syt;
+    int32_t syc;
+} ggml_metal_kargs_conv_1d_dw_direct;
+
+
+typedef struct {
+    int32_t L;
+    int32_t C;
+    int32_t B;
+    int32_t K;
+    int32_t dilation;
+    int32_t has_bias;
+    int32_t causal;
+    int32_t seg_len;
+    int32_t sxt;
+    int32_t sxc;
+    int32_t syt;
+    int32_t syc;
+    float   eps;
+} ggml_metal_kargs_conv_1d_dw_direct_norm_channel;
+
+
+typedef struct {
+    int32_t L;
+    int32_t C;
+    int32_t B;
+    float   eps;
+    // Per-axis element strides for x and y.  Lets the same kernel handle
+    // both [T, C] (sxt=1, sxc=L) and [C, T] (sxt=C, sxc=1) layouts.
+    int32_t sxt;  // x stride per time step (in elements)
+    int32_t sxc;  // x stride per channel  (in elements)
+    int32_t syt;  // y stride per time step (in elements)
+    int32_t syc;  // y stride per channel  (in elements)
+} ggml_metal_kargs_norm_channel;
+
+
+// Channels one thread holds in registers between the depthwise taps and the layer-norm reduction.
+#define GGML_METAL_DW_LN_MAX_PER_THREAD 8
+#define GGML_METAL_NORM_CHANNEL_MAX_SIMDGROUPS 8
+
 #endif // GGML_METAL_IMPL
