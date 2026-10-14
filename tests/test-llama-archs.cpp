@@ -1788,7 +1788,9 @@ static void kv_stream_gaps_tensor_data(struct ggml_tensor * tensor, void * userd
 
 // 8 layers: with the default 2, a wrong K/V view changes the logits by less than 1e-5 nmse
 static llama_model_ptr kv_stream_gaps_model(llm_arch arch) {
-    auto gguf = get_gguf_ctx(arch, arch == LLM_ARCH_DEEPSEEK2 || arch == LLM_ARCH_DEEPSEEK32 || arch == LLM_ARCH_DOTS3NOTE);
+    auto gguf = get_gguf_ctx(arch,
+            arch == LLM_ARCH_DEEPSEEK2 || arch == LLM_ARCH_DEEPSEEK32 ||
+            arch == LLM_ARCH_DOTS3NOTE || arch == LLM_ARCH_MINIMAX_M3);
     gguf_set_val_u32(gguf.get(), (std::string(llm_arch_name(arch)) + ".block_count").c_str(), 8);
     if (arch == LLM_ARCH_DOTS3NOTE) {
         llama_model_saver ms(arch, gguf.get());
@@ -1963,7 +1965,9 @@ static int test_kv_stream_gaps() {
 
     // runs of several streams with several tokens per stream, then decode over the cached tokens, for each attention path:
     // kv, iswa (40 tokens > n_swa), hybrid, MLA (K-only cache) and DSA; runs of 3, 2 and 3 streams so that run index != first stream
-    for (const llm_arch arch : {LLM_ARCH_QWEN3, LLM_ARCH_GEMMA3, LLM_ARCH_QWEN35, LLM_ARCH_DEEPSEEK2, LLM_ARCH_DEEPSEEK32, LLM_ARCH_DOTS3NOTE}) {
+    for (const llm_arch arch : {
+            LLM_ARCH_QWEN3, LLM_ARCH_GEMMA3, LLM_ARCH_QWEN35, LLM_ARCH_DEEPSEEK2,
+            LLM_ARCH_DEEPSEEK32, LLM_ARCH_DOTS3NOTE, LLM_ARCH_MINIMAX_M3}) {
         auto model = kv_stream_gaps_model(arch);
 
         for (const std::vector<llama_seq_id> & seqs : {std::vector<llama_seq_id>{0, 2, 4, 6, 8, 10, 12, 14}, std::vector<llama_seq_id>{1, 2, 3, 6, 7, 11, 12, 13}}) {

@@ -47,6 +47,9 @@ llama_kv_cache_msa::llama_kv_cache_msa(
             model, hparams_idx, type_k, type_v,
             v_trans, offload, unified, kv_size, n_seq_max, n_pad,
             n_swa, swa_type, nullptr, filter_idx, reuse, nullptr);
+
+    kv_base->set_allow_stream_gaps(true);
+    kv_idx ->set_allow_stream_gaps(true);
 }
 
 void llama_kv_cache_msa::clear(bool data) {
@@ -114,7 +117,7 @@ llama_memory_context_ptr llama_kv_cache_msa::init_batch(
 
         std::vector<llama_ubatch> ubatches;
         while (true) {
-            auto ubatch = n_stream == 1 ? balloc.split_simple(n_ubatch) : balloc.split_equal(n_ubatch, true, 0);
+            auto ubatch = n_stream == 1 ? balloc.split_simple(n_ubatch) : balloc.split_equal(n_ubatch, true, 0, true);
 
             if (ubatch.n_tokens == 0) {
                 break;
@@ -159,6 +162,10 @@ bool llama_kv_cache_msa::get_can_shift() const {
     return kv_base->get_can_shift() &&
            kv_idx ->get_can_shift() &&
            kv_base->get_size() == kv_idx->get_size();
+}
+
+bool llama_kv_cache_msa::get_allow_stream_gaps() const {
+    return kv_base->get_allow_stream_gaps() && kv_idx->get_allow_stream_gaps();
 }
 
 void llama_kv_cache_msa::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
@@ -315,11 +322,16 @@ void llama_kv_cache_msa_context::set_input_pos_slot(ggml_tensor * dst, const lla
 
     GGML_ASSERT(n_tokens % n_stream_ub == 0);
     const int64_t n_tps = n_tokens/n_stream_ub;
+    const auto * kv_base = kv->get_base();
+    const auto * kv_idx  = kv->get_idx();
+    GGML_ASSERT(kv_base->get_size() == kv_idx->get_size());
 
     for (int64_t s = 0; s < n_stream_ub; ++s) {
         const llama_seq_id seq_id = ubatch->seq_id[s*n_tps][0];
 
-        const auto & cells = kv->get_base()->get_cells(seq_id);
+        const auto & cells = kv_base->get_cells(seq_id);
+        const uint32_t stream = kv_base->get_stream(seq_id);
+        GGML_ASSERT(stream == kv_idx->get_stream(seq_id));
 
         std::vector<int32_t> map(n_pos, 0);
 
@@ -334,7 +346,7 @@ void llama_kv_cache_msa_context::set_input_pos_slot(ggml_tensor * dst, const lla
                 continue;
             }
 
-            map[p0] = (int32_t) j;
+            map[p0] = (int32_t) (stream*kv_base->get_size() + j);
         }
 
         if (dst->type == GGML_TYPE_I32) {

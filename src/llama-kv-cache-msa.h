@@ -44,6 +44,8 @@ public:
 
     bool get_can_shift() const override;
 
+    bool get_allow_stream_gaps() const override;
+
     void clear(bool data) override;
 
     bool seq_rm  (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1) override;
@@ -133,10 +135,10 @@ public:
     uint32_t get_n_pos() const;
 
     // position <-> cell translation maps, populated from the base cache cells
-    // the model graph relates cache contents to token positions only through these per ubatch inputs
+    // position-to-cell values address the full cache storage across all streams
     // value for empty or other-sequence cells is 0 so consumers must mask them
     void set_input_cell_pos(ggml_tensor * dst, const llama_ubatch * ubatch, int32_t div) const;
-    // positions without a cell map to cell 0, consumers must mask them assumes one sequence per stream
+    // positions without a cell map to storage cell 0, consumers must mask them
     void set_input_pos_slot(ggml_tensor * dst, const llama_ubatch * ubatch) const;
     void set_input_pos_mask(ggml_tensor * dst, const llama_ubatch * ubatch) const;
 
