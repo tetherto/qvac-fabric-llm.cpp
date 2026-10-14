@@ -791,10 +791,6 @@ static llama_kv_cache::slot_info_vec_t dsv4_build_comp_sinfos(
             sinfo.idxs[s].resize(1, 0);
         }
 
-        if (n_stream > 1 && sinfo.s1 - sinfo.s0 + 1 != ns) {
-            throw std::runtime_error("DSV4 compressed streams are not contiguous in ubatch");
-        }
-
         sinfos.push_back(std::move(sinfo));
     }
 
@@ -1310,6 +1306,12 @@ llama_kv_cache_dsv4::llama_kv_cache_dsv4(
             v_trans, offload, unified_compressed, GGML_PAD(dsv4_comp_size(kv_size, DSV4_CSA_RATIO), 256u), n_seq_max, n_pad,
             0, LLAMA_SWA_TYPE_NONE, nullptr, filter_csa, nullptr, nullptr);
 
+    kv_raw->get_base()->set_allow_stream_gaps(true);
+    kv_raw->get_swa ()->set_allow_stream_gaps(true);
+    kv_csa->set_allow_stream_gaps(true);
+    kv_hca->set_allow_stream_gaps(true);
+    kv_lid->set_allow_stream_gaps(true);
+
     LLAMA_LOG_INFO("%s: creating DSV4 CSA compressor state\n", __func__);
 
     csa_state = std::make_unique<llama_dsv4_comp_state>(
@@ -1410,7 +1412,8 @@ llama_memory_context_ptr llama_kv_cache_dsv4::init_batch(
             } else {
                 // [TAG_RECURRENT_ROLLBACK_SPLITS]
                 // the trailing (1 + n_rs_seq) tokens of each seq must stay in the same ubatch
-                ubatch = balloc.split_equal(n_ubatch, raw_per_seq || comp_per_seq, n_rs_seq > 0 ? n_rs_seq + 1 : 0);
+                ubatch = balloc.split_equal(
+                        n_ubatch, raw_per_seq || comp_per_seq, n_rs_seq > 0 ? n_rs_seq + 1 : 0, true);
             }
 
             if (ubatch.n_tokens == 0) {
@@ -1449,6 +1452,10 @@ bool llama_kv_cache_dsv4::get_can_shift() const {
     // Compressed row metadata uses block-derived positions. Keep shifting
     // disabled until DSV4 compressed-cache shift semantics are wired.
     return false;
+}
+
+bool llama_kv_cache_dsv4::get_allow_stream_gaps() const {
+    return true;
 }
 
 void llama_kv_cache_dsv4::clear(bool data) {
@@ -1883,7 +1890,7 @@ uint32_t llama_kv_cache_dsv4_raw_context::get_n_write() const {
 }
 
 ggml_tensor * llama_kv_cache_dsv4_raw_context::get_k(ggml_context * ctx, int32_t il) const {
-    return kv_swa->get_k(ctx, il, n_kv, sinfos_read[i_next]);
+    return kv_swa->get_k_packed(ctx, il, n_kv, sinfos_read[i_next]);
 }
 
 ggml_tensor * llama_kv_cache_dsv4_raw_context::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il) const {
@@ -1984,7 +1991,7 @@ uint32_t llama_kv_cache_dsv4_comp_context::get_n_kv() const {
 }
 
 ggml_tensor * llama_kv_cache_dsv4_comp_context::get_k(ggml_context * ctx, int32_t il) const {
-    return kv->get_k(ctx, il, n_kv, sinfos[i_cur]);
+    return kv->get_k_packed(ctx, il, n_kv, sinfos[i_cur]);
 }
 
 ggml_tensor * llama_kv_cache_dsv4_comp_context::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il) const {
