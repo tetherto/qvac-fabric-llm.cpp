@@ -143,7 +143,7 @@ static __global__ __launch_bounds__(256, BLOCKS) void gdn_single(ggml_cuda_gdn_m
     const int64_t                                  qoff  = (seq / a.rq3) * a.sq3 + (h % a.H_k) * a.sq1;
     const int64_t                                  voff  = seq * a.sv3 + h * a.sv1 + v0;
     const int64_t                                  goff  = seq * a.sb3 + h * a.sb1;
-    float *                                        out   = a.dst + ((int64_t) seq * a.n_tokens * a.H + h) * D + v0;
+    float *                                        out   = a.dst + ((int64_t) seq * a.out_tokens * a.H + h) * D + v0;
     constexpr int                                  STATE_TILES = (D / 16) * (V / N);
     constexpr int                                  PER_WARP    = STATE_TILES / WARPS;
     static_assert(STATE_TILES % WARPS == 0, "state must divide across warps");

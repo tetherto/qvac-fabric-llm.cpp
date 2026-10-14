@@ -17,6 +17,7 @@ struct ggml_cuda_gdn_mma_args {
     int64_t H;
     int64_t H_k;
     int64_t n_tokens;
+    int64_t out_tokens; // tokens per sequence in dst; exceeds n_tokens when a serial tail follows
     int64_t n_seqs;
     int64_t rq3;
     int64_t sq1;

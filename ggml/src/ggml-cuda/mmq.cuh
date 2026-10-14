@@ -983,6 +983,31 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
 }
 
 
+// Output tile coordinates of a stream-k tile index. Column tiles are innermost unless rows_innermost is set, in which
+// case the blocks running at the same time work on the same src0 rows.
+struct mmq_tile_idx {
+    int it;
+    int jt;
+    int zt;
+    int wt;
+};
+
+static __device__ __forceinline__ mmq_tile_idx mmq_get_tile_idx(
+        int tile, const bool rows_innermost, const int nty, const uint3 ntx, const uint3 nchannels_y, const uint3 nsamples_y) {
+    int it = 0;
+    if (rows_innermost) {
+        it    = tile % nty;
+        tile /= nty;
+    }
+    uint2 tmp = fast_div_modulo(tile, ntx);
+    const int jt = tmp.y;
+    tmp = fast_div_modulo(tmp.x, nchannels_y);
+    const int zt = tmp.y;
+    tmp = fast_div_modulo(tmp.x, nsamples_y);
+    const int wt = tmp.y;
+    return {rows_innermost ? it : int(tmp.x), jt, zt, wt};
+}
+
 // The mul_mat_q kernel implements "stream-k" work partitioning as described in https://arxiv.org/abs/2301.03598
 
 template <ggml_type type, int J, bool fallback>
@@ -994,7 +1019,7 @@ static __global__ void mul_mat_q(
         const uint3 blocks_per_ne00, const int nrows_x, const int ncols_dst, const int stride_row_x, const int ncols_y, const int stride_col_dst,
         const uint3 channel_ratio, const uint3 nchannels_y, const int stride_channel_x, const int stride_channel_y, const int stride_channel_dst,
         const uint3 sample_ratio, const uint3 nsamples_y, const int stride_sample_x, const int stride_sample_y, const int stride_sample_dst,
-        const uint3 ntx) {
+        const uint3 ntx, const bool rows_innermost) {
 
     // Skip unused template specializations for faster compilation:
     if (ggml_cuda_mmq_get_config(type, J, fallback).type == GGML_TYPE_COUNT) {
@@ -1109,16 +1134,8 @@ static __global__ void mul_mat_q(
     int kb0_start = fastmodulo(kbc, blocks_per_ne00);
     int kb0_stop  = min(blocks_per_ne00.z, uint32_t(kb0_start + kbc_stop - kbc));
     while (kbc < kbc_stop && kb0_stop == int(blocks_per_ne00.z)) {
-        int tmp = fastdiv(kbc, blocks_per_ne00);
-        uint2 tmp2 = fast_div_modulo(tmp, ntx);
-        const int jt = tmp2.y;
-        tmp = tmp2.x;
-        tmp2 = fast_div_modulo(tmp, nchannels_y);
-        const int zt = tmp2.y;
-        tmp = tmp2.x;
-        tmp2 = fast_div_modulo(tmp, nsamples_y);
-        const int wt = tmp2.y;
-        const int it = tmp2.x;
+        const mmq_tile_idx t = mmq_get_tile_idx(fastdiv(kbc, blocks_per_ne00), rows_innermost, nty, ntx, nchannels_y, nsamples_y);
+        const int it = t.it, jt = t.jt, zt = t.zt, wt = t.wt;
 
         // Defaults for regular matrix multiplication:
         int col_low    = 0;
@@ -1198,16 +1215,8 @@ static __global__ void mul_mat_q(
         return;
     }
 
-    int tmp = fastdiv(kbc, blocks_per_ne00);
-    uint2 tmp2 = fast_div_modulo(tmp, ntx);
-    const int jt = tmp2.y;
-    tmp = tmp2.x;
-    tmp2 = fast_div_modulo(tmp, nchannels_y);
-    const int zt = tmp2.y;
-    tmp = tmp2.x;
-    tmp2 = fast_div_modulo(tmp, nsamples_y);
-    const int wt = tmp2.y;
-    const int it = tmp2.x;
+    const mmq_tile_idx t = mmq_get_tile_idx(fastdiv(kbc, blocks_per_ne00), rows_innermost, nty, ntx, nchannels_y, nsamples_y);
+    const int it = t.it, jt = t.jt, zt = t.zt, wt = t.wt;
 
     // Defaults for regular matrix multiplication:
     int col_low    = 0;
@@ -1278,7 +1287,7 @@ static __global__ void mul_mat_q_stream_k_fixup(
         const int32_t * __restrict__ ids_dst, const int32_t * __restrict__ expert_bounds, float * __restrict__ dst,
         float * __restrict__ tmp_last_tile, const uint3 blocks_per_ne00, const int nrows_x, const int ncols_dst,
         const int stride_col_dst, const uint3 nchannels_y, const int stride_channel_dst, const uint3 nsamples_y,
-        const int stride_sample_dst, const uint3 ntx) {
+        const int stride_sample_dst, const uint3 ntx, const bool rows_innermost) {
     constexpr int warp_size       = ggml_cuda_get_physical_warp_size();
     constexpr int nwarps          = (ggml_cuda_mmq_get_nthreads(type, J, fallback) / 2) / warp_size;
     constexpr int I               = ggml_cuda_mmq_get_I(type, J, fallback);
@@ -1345,16 +1354,8 @@ static __global__ void mul_mat_q_stream_k_fixup(
         return;
     }
 
-    int tmp = fastdiv(kbc0, blocks_per_ne00);
-    uint2 tmp2 = fast_div_modulo(tmp, ntx);
-    const int jt = tmp2.y;
-    tmp = tmp2.x;
-    tmp2 = fast_div_modulo(tmp, nchannels_y);
-    const int zt = tmp2.y;
-    tmp = tmp2.x;
-    tmp2 = fast_div_modulo(tmp, nsamples_y);
-    const int wt = tmp2.y;
-    const int it = tmp2.x;
+    const mmq_tile_idx t = mmq_get_tile_idx(fastdiv(kbc0, blocks_per_ne00), rows_innermost, nty, ntx, nchannels_y, nsamples_y);
+    const int it = t.it, jt = t.jt, zt = t.zt, wt = t.wt;
 
     if (!ids_dst) {
         const int offset_dst = wt*stride_sample_dst + zt*stride_channel_dst + jt*J*stride_col_dst + it*I;
@@ -1427,6 +1428,13 @@ static size_t mmq_get_nbytes_shared(const ggml_cuda_mmq_config & config, const i
     return nbs_ids + nbs_x + GGML_PAD(nbs_y, config.nthreads*sizeof(int));
 }
 
+// With fewer stream-k blocks than tiles, row tiles go innermost when src0 does not fit in L2 so that the blocks running
+// at the same time read the same src0 rows. Measured on Blackwell only.
+static bool mmq_stream_k_rows_innermost(
+        const int cc, const size_t l2_size, const size_t src0_bytes, const int nblocks, const int ntiles) {
+    return blackwell_mma_available(cc) && nblocks < ntiles && src0_bytes > l2_size;
+}
+
 template <ggml_type type, int J, bool fallback>
 static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) {
     const int id = ggml_cuda_get_device();
@@ -1467,7 +1475,7 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
              blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
              channel_ratio_fd, nchannels_y_fd, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
              sample_ratio_fd, nsamples_y_fd, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
-             ntx_fd);
+             ntx_fd, false);
         return;
     }
 
@@ -1481,6 +1489,9 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
     GGML_ASSERT(ntiles_dst * blocks_per_ne00_fd.z < (1 << 30)); // Assert that variable kbc will not overflow.
 
     const bool fixup_needed = ntiles_dst % block_nums_stream_k.x != 0;
+    const size_t src0_bytes = args.nrows_x*ggml_row_size(type, args.ncols_x);
+    const bool rows_innermost = mmq_stream_k_rows_innermost(cc, ggml_cuda_info().devices[id].l2_size, src0_bytes,
+        block_nums_stream_k.x, ntiles_dst);
 
     ggml_cuda_pool & pool = ctx.pool(id);
     ggml_cuda_pool_alloc<float> tmp_fixup(pool);
@@ -1496,7 +1507,7 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
          blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
          channel_ratio_fd, nchannels_y_fd, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
          sample_ratio_fd, nsamples_y_fd, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
-         ntx_fd);
+         ntx_fd, rows_innermost);
 
     if (!fixup_needed) {
         return;
@@ -1506,7 +1517,7 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
     mul_mat_q_stream_k_fixup<type, J, fallback><<<block_nums_fixup, block_dims_fixup, 0, stream>>>
         (args.ids_dst, args.expert_bounds, args.dst, tmp_fixup.ptr, blocks_per_ne00_fd, args.nrows_x, args.ncols_dst,
          args.nrows_dst, nchannels_y_fd, args.stride_channel_dst, nsamples_y_fd, args.stride_sample_dst,
-         ntx_fd);
+         ntx_fd, rows_innermost);
 }
 
 template <ggml_type type, bool fallback>

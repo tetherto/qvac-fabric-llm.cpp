@@ -40,6 +40,7 @@
 #include "ggml-cuda/mmq-cutlass.cuh"
 #include "ggml-cuda/mmq.cuh"
 #include "ggml-cuda/mmvf.cuh"
+#include "ggml-cuda/mmvf-act.cuh"
 #include "ggml-cuda/mmvq.cuh"
 #include "ggml-cuda/mmid-back.cuh"
 #include "ggml-cuda/moe-weighted-reduction.cuh"
@@ -540,6 +541,7 @@ static ggml_cuda_device_info ggml_cuda_init() {
         info.devices[id].integrated = false; // Temporarily disabled due to issues with corrupted output (e.g. #15034)
         info.devices[id].nsm        = prop.multiProcessorCount;
         info.devices[id].smpb       = prop.sharedMemPerBlock;
+        info.devices[id].l2_size    = prop.l2CacheSize;
         info.devices[id].warp_size  = prop.warpSize;
 
 #ifndef GGML_USE_MUSA
@@ -3694,6 +3696,64 @@ static int ggml_cuda_try_gdn_cache_fusion(
     return skip;
 }
 
+// true if a CPY between f32 views of two different tensors can start a copy batch
+static bool ggml_cuda_cpy_batch_can_start(const ggml_tensor * a) {
+    return a->op == GGML_OP_CPY && (a->flags & GGML_TENSOR_FLAG_COMPUTE) && a->src[0]->type == GGML_TYPE_F32 &&
+        a->type == GGML_TYPE_F32 && a->src[0]->view_src && a->view_src && a->src[0]->view_src != a->view_src;
+}
+
+// true if CPY b moves the same view layout between the same two tensors as CPY a
+static bool ggml_cuda_cpy_same_layout(const ggml_tensor * a, const ggml_tensor * b) {
+    return b->op == GGML_OP_CPY && (b->flags & GGML_TENSOR_FLAG_COMPUTE) &&
+        b->src[0]->type == a->src[0]->type && b->type == a->type &&
+        b->src[0]->view_src == a->src[0]->view_src && b->view_src == a->view_src &&
+        ggml_are_same_shape(a->src[0], b->src[0]) && ggml_are_same_stride(a->src[0], b->src[0]) &&
+        ggml_are_same_shape(a, b) && ggml_are_same_stride(a, b);
+}
+
+static bool ggml_cuda_tensor_ranges_overlap(const ggml_tensor * a, const ggml_tensor * b);
+
+// whether copy next writes where a batched copy reads or writes, or reads where one of them writes
+static bool ggml_cuda_cpy_batch_conflicts(const ggml_tensor * const * batched, int n, const ggml_tensor * next) {
+    for (int k = 0; k < n; ++k) {
+        const ggml_tensor * prev = batched[k];
+        if (ggml_cuda_tensor_ranges_overlap(next, prev) || ggml_cuda_tensor_ranges_overlap(next->src[0], prev) ||
+            ggml_cuda_tensor_ranges_overlap(next, prev->src[0])) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// the same-layout f32 view copies from node_idx on, with only views in between; returns the nodes to skip
+static int ggml_cuda_try_cpy_batch(const ggml_cgraph * cgraph, int node_idx, ggml_cuda_cpy_batch & batch) {
+    const ggml_tensor * first = cgraph->nodes[node_idx];
+    if (!ggml_cuda_cpy_batch_can_start(first)) {
+        return 0;
+    }
+
+    const ggml_tensor * batched[GGML_CUDA_CPY_BATCH_MAX] = { first };
+    batch.n           = 1;
+    batch.src_offs[0] = 0;
+    batch.dst_offs[0] = 0;
+
+    int skip = 0;
+    for (int j = node_idx + 1; j < cgraph->n_nodes && batch.n < GGML_CUDA_CPY_BATCH_MAX; ++j) {
+        const ggml_tensor * next = cgraph->nodes[j];
+        if (ggml_cuda_is_view_or_noop(next)) {
+            continue;
+        }
+        if (!ggml_cuda_cpy_same_layout(first, next) || ggml_cuda_cpy_batch_conflicts(batched, batch.n, next)) {
+            break;
+        }
+        batch.src_offs[batch.n] = (const char *) next->src[0]->data - (const char *) first->src[0]->data;
+        batch.dst_offs[batch.n] = (const char *) next->src[1]->data - (const char *) first->src[1]->data;
+        batched[batch.n++]      = next;
+        skip                    = j - node_idx;
+    }
+    return skip;
+}
+
 static bool ggml_cuda_topk_moe_fusion(const struct ggml_cgraph * cgraph, int node_idx, ggml_cuda_topk_moe_args & args) {
     args.sigmoid         = false;
     args.sqrt_softplus   = false;
@@ -4409,13 +4469,176 @@ static int ggml_cuda_try_fuse_mlp_bf16(ggml_backend_cuda_context *         cuda_
                                        int                                 i,
                                        ggml_cuda_cutlass_activation_plan & activation_plan);
 
+#define GGML_CUDA_GDN_STATE_GATHER_WINDOW 64
+
+// index of the gated_delta_net's state input (the get_rows or its reshape), or -1 when a node between the two
+// writes the get_rows source states or its row ids
+static int ggml_cuda_gdn_state_input_idx(const ggml_cgraph * cgraph, int get_rows_idx, int gdn_idx) {
+    const ggml_tensor * get_rows = cgraph->nodes[get_rows_idx];
+    const ggml_tensor * state    = cgraph->nodes[gdn_idx]->src[5];
+
+    int state_idx = state == get_rows ? get_rows_idx : -1;
+    for (int j = get_rows_idx + 1; j < gdn_idx; ++j) {
+        const ggml_tensor * n = cgraph->nodes[j];
+        if (n == state) {
+            state_idx = j;
+        } else if (!ggml_cuda_is_view_or_noop(n) && (ggml_cuda_tensor_ranges_overlap(n, get_rows->src[0]) ||
+                                                      ggml_cuda_tensor_ranges_overlap(n, get_rows->src[1]))) {
+            return -1;
+        }
+    }
+    return state_idx;
+}
+
+// the gated_delta_net may read its state rows from the get_rows source: one sequence, no chunked prefix, gather used
+// only by the gdn and not an output, row-aligned snapshot cache fusion, no writer of the source states or ids between
+static bool ggml_cuda_gdn_reads_state_rows(const ggml_cgraph * cgraph, int get_rows_idx, int gdn_idx) {
+    const ggml_tensor * get_rows = cgraph->nodes[get_rows_idx];
+    const ggml_tensor * gdn      = cgraph->nodes[gdn_idx];
+    const ggml_tensor * state    = gdn->src[5];
+    if (get_rows->op != GGML_OP_GET_ROWS || gdn->op != GGML_OP_GATED_DELTA_NET ||
+        ((get_rows->flags | state->flags) & GGML_TENSOR_FLAG_OUTPUT) ||
+        (state != get_rows && (state->op != GGML_OP_RESHAPE || state->src[0] != get_rows))) {
+        return false;
+    }
+
+    const ggml_tensor * states = get_rows->src[0];
+    const ggml_tensor * ids    = get_rows->src[1];
+    const ggml_tensor * v      = gdn->src[2];
+    const int64_t       D      = v->ne[0] * v->ne[0] * v->ne[1];
+    const int64_t       K      = ggml_get_op_params_i32(gdn, 0);
+    if (v->ne[3] != 1 || v->ne[2] > K || states->type != GGML_TYPE_F32 || get_rows->type != GGML_TYPE_F32 ||
+        ids->type != GGML_TYPE_I32 || ggml_nelements(ids) != 1 || states->ne[0] != D || !ggml_is_contiguous(states)) {
+        return false;
+    }
+
+    const int state_idx = ggml_cuda_gdn_state_input_idx(cgraph, get_rows_idx, gdn_idx);
+    if (state_idx < 0 || ggml_node_get_use_count(cgraph, get_rows_idx) != 1 ||
+        ggml_node_get_use_count(cgraph, state_idx) != 1) {
+        return false;
+    }
+
+    ggml_cuda_gated_delta_net_fused_cache cache;
+    if (ggml_cuda_try_gdn_cache_fusion(cgraph, gdn_idx, cache) <= 0) {
+        return false;
+    }
+    // with every snapshot slot aligned to the state rows, an element is only read and written by the warp owning it
+    const ptrdiff_t snapshot_offset = (const char *) cache.data - (const char *) states->data;
+    const int64_t   slot_bytes      = cache.slot_stride * (int64_t) sizeof(float);
+    return snapshot_offset % (ptrdiff_t) states->nb[1] == 0 && slot_bytes % (int64_t) states->nb[1] == 0;
+}
+
+// index of the gated_delta_net that reads the rows of this get_rows itself, or -1
+static int ggml_cuda_gdn_state_gather_consumer(const ggml_cgraph * cgraph, int get_rows_idx) {
+    const int end = std::min(cgraph->n_nodes, get_rows_idx + 1 + GGML_CUDA_GDN_STATE_GATHER_WINDOW);
+    for (int j = get_rows_idx + 1; j < end; ++j) {
+        if (cgraph->nodes[j]->op == GGML_OP_GATED_DELTA_NET) {
+            return ggml_cuda_gdn_reads_state_rows(cgraph, get_rows_idx, j) ? j : -1;
+        }
+    }
+    return -1;
+}
+
+// index of the get_rows whose rows this gated_delta_net reads itself, or -1
+static int ggml_cuda_gdn_state_gather_source(const ggml_cgraph * cgraph, int gdn_idx) {
+    const ggml_tensor * state    = cgraph->nodes[gdn_idx]->src[5];
+    const ggml_tensor * get_rows = state->op == GGML_OP_RESHAPE ? state->src[0] : state;
+    const int           begin    = std::max(0, gdn_idx - GGML_CUDA_GDN_STATE_GATHER_WINDOW);
+    for (int j = gdn_idx - 1; j >= begin; --j) {
+        if (cgraph->nodes[j] == get_rows) {
+            return ggml_cuda_gdn_state_gather_consumer(cgraph, j) == gdn_idx ? j : -1;
+        }
+    }
+    return -1;
+}
+
+static bool ggml_cuda_fusion_disabled() {
+    static const bool disabled = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
+    return disabled;
+}
+
+// the per-row operand of a binary op whose other operand is prev: f32, one value per mul_mat row
+static const ggml_tensor * ggml_cuda_mmvf_act_row_operand(const ggml_tensor * op, const ggml_tensor * prev, int64_t nrows) {
+    const ggml_tensor * other = op->src[0] == prev ? op->src[1] : (op->src[1] == prev ? op->src[0] : nullptr);
+    if (other == nullptr || other->type != GGML_TYPE_F32 || !ggml_is_contiguous(other) || other->ne[0] != nrows ||
+        ggml_nelements(other) != nrows) {
+        return nullptr;
+    }
+    return other;
+}
+
+// an f32 mul_mat that mul_mat_vec_f32_act can run (only where the unfused mul_mat would go to cuBLAS)
+static bool ggml_cuda_can_use_mmvf_act(const ggml_tensor * mm) {
+    return mm->op == GGML_OP_MUL_MAT && mm->src[0]->type == GGML_TYPE_F32 && mm->src[1]->type == GGML_TYPE_F32 &&
+        ggml_get_op_params_i32(mm, 1) == GGML_HINT_NONE &&
+        !ggml_backend_buft_is_cuda_repacked(ggml_backend_buffer_get_type(mm->src[0]->buffer)) &&
+        ggml_cuda_should_use_mmvf_act(mm);
+}
+
+// mul_mat -> reshape -> add bias -> softplus -> mul scale, bias and scale one value per row
+static int ggml_cuda_try_mmvf_act_softplus_gate(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i) {
+    const ggml_op ops[]       = { GGML_OP_MUL_MAT, GGML_OP_RESHAPE, GGML_OP_ADD, GGML_OP_UNARY, GGML_OP_MUL };
+    const int     out_nodes[] = { i + 4 };
+    if (!ggml_can_fuse_subgraph(cgraph, i, 5, ops, out_nodes, 1) ||
+        !ggml_cuda_check_fusion_memory_ranges(cgraph, i, 5, out_nodes, 1)) {
+        return 0;
+    }
+
+    const ggml_tensor * mm      = cgraph->nodes[i];
+    const ggml_tensor * reshape = cgraph->nodes[i + 1];
+    const ggml_tensor * add     = cgraph->nodes[i + 2];
+    const ggml_tensor * unary   = cgraph->nodes[i + 3];
+    ggml_tensor *       mul     = cgraph->nodes[i + 4];
+    const int64_t       nrows   = mm->ne[0];
+    const ggml_tensor * bias    = ggml_cuda_mmvf_act_row_operand(add, reshape, nrows);
+    const ggml_tensor * scale   = ggml_cuda_mmvf_act_row_operand(mul, unary, nrows);
+
+    if (reshape->src[0] != mm || reshape->ne[0] != nrows || unary->src[0] != add ||
+        ggml_get_unary_op(unary) != GGML_UNARY_OP_SOFTPLUS || bias == nullptr || scale == nullptr ||
+        add->type != GGML_TYPE_F32 || unary->type != GGML_TYPE_F32 || mul->type != GGML_TYPE_F32 ||
+        !ggml_are_same_shape(add, reshape) || !ggml_are_same_shape(mul, add) || !ggml_is_contiguous(mul)) {
+        return 0;
+    }
+    ggml_cuda_mul_mat_vec_f32_act(ctx, mm->src[0], mm->src[1], bias, scale, GGML_CUDA_MMVF_ACT_SOFTPLUS_GATE, mul);
+    return 4;
+}
+
+// mul_mat -> reshape -> sigmoid, unless the sigmoid starts a top-k MoE gate (left to that fusion)
+static int ggml_cuda_try_mmvf_act_sigmoid(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i) {
+    const ggml_op ops[]       = { GGML_OP_MUL_MAT, GGML_OP_RESHAPE, GGML_OP_UNARY };
+    const int     out_nodes[] = { i + 2 };
+    if (!ggml_can_fuse_subgraph(cgraph, i, 3, ops, out_nodes, 1) ||
+        !ggml_cuda_check_fusion_memory_ranges(cgraph, i, 3, out_nodes, 1)) {
+        return 0;
+    }
+
+    const ggml_tensor * mm      = cgraph->nodes[i];
+    const ggml_tensor * reshape = cgraph->nodes[i + 1];
+    ggml_tensor *       unary   = cgraph->nodes[i + 2];
+
+    ggml_cuda_topk_moe_args topk_args;
+    if (reshape->src[0] != mm || unary->src[0] != reshape || ggml_get_unary_op(unary) != GGML_UNARY_OP_SIGMOID ||
+        unary->type != GGML_TYPE_F32 || !ggml_is_contiguous(unary) || ggml_cuda_topk_moe_fusion(cgraph, i + 2, topk_args)) {
+        return 0;
+    }
+    ggml_cuda_mul_mat_vec_f32_act(ctx, mm->src[0], mm->src[1], nullptr, nullptr, GGML_CUDA_MMVF_ACT_SIGMOID, unary);
+    return 2;
+}
+
+static int ggml_cuda_try_mmvf_act_fusion(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i) {
+    if (!ggml_cuda_can_use_mmvf_act(cgraph->nodes[i])) {
+        return 0;
+    }
+    const int nodes_to_skip = ggml_cuda_try_mmvf_act_softplus_gate(ctx, cgraph, i);
+    return nodes_to_skip > 0 ? nodes_to_skip : ggml_cuda_try_mmvf_act_sigmoid(ctx, cgraph, i);
+}
+
 // try and fuse nodes and return the number of nodes to skip
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context *         cuda_ctx,
                               ggml_cgraph *                       cgraph,
                               int                                 i,
                               ggml_cuda_cutlass_activation_plan * activation_plan) {
-    static bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
-    if (disable_fusion) {
+    if (ggml_cuda_fusion_disabled()) {
         return 0;
     }
 
@@ -4445,11 +4668,34 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context *         cuda_ctx,
         ggml_cuda_gated_delta_net_fused_cache fused_state_cpy;
         const int nodes_to_skip = ggml_cuda_try_gdn_cache_fusion(cgraph, i, fused_state_cpy);
         if (nodes_to_skip > 0) {
+            const int gather_idx = ggml_cuda_gdn_state_gather_source(cgraph, i);
+            if (gather_idx >= 0) {
+                const ggml_tensor * get_rows = cgraph->nodes[gather_idx];
+                fused_state_cpy.state_src  = (const float *) get_rows->src[0]->data;
+                fused_state_cpy.state_rows = (const int32_t *) get_rows->src[1]->data;
+            }
 #ifdef GGML_CUDA_DEBUG
             GGML_LOG_INFO("%s: fused gated_delta_net snapshot copies for %s (skipped %d nodes)\n",
                           __func__, node->name, nodes_to_skip);
 #endif
             ggml_cuda_op_gated_delta_net_fused_cache(*cuda_ctx, node, fused_state_cpy);
+            return nodes_to_skip;
+        }
+    }
+
+    // consecutive same-layout copies between two tensors run as one launch
+    if (node->op == GGML_OP_CPY) {
+        ggml_cuda_cpy_batch batch;
+        const int nodes_to_skip = ggml_cuda_try_cpy_batch(cgraph, i, batch);
+        if (nodes_to_skip > 0) {
+            ggml_cuda_cpy_f32_batch(*cuda_ctx, node->src[0], node->src[1], batch);
+            return nodes_to_skip;
+        }
+    }
+
+    if (node->op == GGML_OP_MUL_MAT) {
+        const int nodes_to_skip = ggml_cuda_try_mmvf_act_fusion(*cuda_ctx, cgraph, i);
+        if (nodes_to_skip > 0) {
             return nodes_to_skip;
         }
     }
@@ -5787,6 +6033,12 @@ static bool ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context *    
                 }
 
                 if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+                    continue;
+                }
+
+                // a later gated_delta_net reads these state rows from the cache itself
+                if (node->op == GGML_OP_GET_ROWS && !ggml_cuda_fusion_disabled() &&
+                    ggml_cuda_gdn_state_gather_consumer(cgraph, i) >= 0) {
                     continue;
                 }
 
