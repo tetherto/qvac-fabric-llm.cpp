@@ -1561,6 +1561,8 @@ void process_shaders() {
     string_to_spv("scale_residual_f32",   "scale_residual.comp",   {});
     string_to_spv("bias_gelu_f32",        "bias_gelu.comp",        {});
     string_to_spv("pad_replicate_1d_f32", "pad_replicate_1d.comp", {});
+    string_to_spv("lstm_cell_f32",        "lstm_cell.comp",        {{"A_TYPE", "float"}});
+    string_to_spv("lstm_cell_masked_f32", "lstm_cell.comp",        {{"A_TYPE", "float"}, {"MASKED", "1"}});
     string_to_spv("topk_moe_f32", "topk_moe.comp", {});
 
 #ifdef GGML_VULKAN_BUILD_ADRENO_SHADERS
