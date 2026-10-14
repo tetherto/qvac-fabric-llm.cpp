@@ -537,6 +537,10 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
             {
                 n_fuse = ggml_metal_op_scale_residual(ctx, idx);
             } break;
+        case GGML_OP_BIAS_GELU:
+            {
+                n_fuse = ggml_metal_op_bias_gelu(ctx, idx);
+            } break;
         case GGML_OP_PAD_REFLECT_1D:
             {
                 n_fuse = ggml_metal_op_pad_reflect_1d(ctx, idx);
@@ -7815,6 +7819,55 @@ int ggml_metal_op_scale_residual(ggml_metal_op_t ctx, int idx) {
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[2]), 3); // gamma
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[3]), 4); // residual
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         5); // y
+
+    ggml_metal_encoder_dispatch_threadgroups(enc, C, ne2, 1, nth, 1, 1);
+
+    return 1;
+}
+
+int ggml_metal_op_bias_gelu(ggml_metal_op_t ctx, int idx) {
+    ggml_tensor * op = ctx->node(idx);
+
+    ggml_metal_library_t lib = ctx->lib;
+    ggml_metal_encoder_t enc = ctx->enc;
+
+    GGML_TENSOR_LOCALS(int32_t, ne, op, ne);
+
+    // op_params[0]: 0 = [T, C], 1 = [C, T], 2 = [T, C] input to [C, T] output.
+    const int32_t layout = ((const int32_t *) op->op_params)[0];
+
+    int L, C, sxt, sxc, syt, syc;
+    if (layout == 0) {
+        L = ne0; C = ne1;
+        sxt = 1; sxc = L; syt = 1; syc = L;
+    } else {
+        C = ne0; L = ne1;
+        sxt = layout == 1 ? C : 1;
+        sxc = layout == 1 ? 1 : L;
+        syt = C; syc = 1;
+    }
+
+    ggml_metal_kargs_bias_gelu args = {
+        /*.L   =*/ L,
+        /*.C   =*/ C,
+        /*.B   =*/ ne2,
+        /*.sxt =*/ sxt,
+        /*.sxc =*/ sxc,
+        /*.syt =*/ syt,
+        /*.syc =*/ syc,
+    };
+
+    auto pipeline = ggml_metal_library_get_pipeline_bias_gelu(lib, op);
+
+    int nth = L;
+    if (nth > 256) nth = 256;
+    if (nth < 1)   nth = 1;
+
+    ggml_metal_encoder_set_pipeline(enc, pipeline);
+    ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[0]), 1); // x
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[1]), 2); // bias
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         3); // y
 
     ggml_metal_encoder_dispatch_threadgroups(enc, C, ne2, 1, nth, 1, 1);
 

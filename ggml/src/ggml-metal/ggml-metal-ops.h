@@ -121,6 +121,7 @@ int ggml_metal_op_gated_delta_net_back(ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_conv_1d_dw_direct     (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_norm_channel          (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_scale_residual        (ggml_metal_op_t ctx, int idx);
+int ggml_metal_op_bias_gelu             (ggml_metal_op_t ctx, int idx);
 #ifdef __cplusplus
 }
 #endif

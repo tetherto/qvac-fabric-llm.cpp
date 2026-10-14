@@ -1695,6 +1695,17 @@ typedef struct {
 } ggml_metal_kargs_scale_residual;
 
 
+typedef struct {
+    int32_t L;
+    int32_t C;
+    int32_t B;
+    int32_t sxt;
+    int32_t sxc;
+    int32_t syt;
+    int32_t syc;
+} ggml_metal_kargs_bias_gelu;
+
+
 // Channels one thread holds in registers between the depthwise taps and the layer-norm reduction.
 #define GGML_METAL_DW_LN_MAX_PER_THREAD 8
 #define GGML_METAL_NORM_CHANNEL_MAX_SIMDGROUPS 8

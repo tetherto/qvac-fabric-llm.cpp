@@ -1198,3 +1198,34 @@ kernel void kernel_scale_residual_f32(
         y_c[(size_t) t * syt] = r_c[(size_t) t * srt] + (x_c[(size_t) t * sxt] + bv) * gv;
     }
 }
+
+kernel void kernel_bias_gelu_f32(
+    constant   ggml_metal_kargs_bias_gelu & args,
+    device  const float * x,
+    device  const float * bias,
+    device        float * y,
+    uint3 tgpig[[threadgroup_position_in_grid]],
+    uint3 tpitg[[thread_position_in_threadgroup]],
+    uint3   ntg[[threads_per_threadgroup]]) {
+
+    const int c = (int) tgpig.x;
+    const int batch = (int) tgpig.y;
+    if (c >= args.C || batch >= args.B) return;
+
+    const int L = args.L;
+    const int sxt = args.sxt, sxc = args.sxc;
+    const int syt = args.syt, syc = args.syc;
+    const float bv = bias[c];
+    const size_t batch_offset = (size_t) batch * L * args.C;
+
+    device const float * x_c = x + batch_offset + (size_t) c * sxc;
+    device       float * y_c = y + batch_offset + (size_t) c * syc;
+
+    // Use the same erf_approx template as kernel_gelu_erf_f32 above
+    // (Abramowitz & Stegun 7.1.26 / Hastings approximation) so the fused
+    // bias_gelu output is bit-identical to the unfused add + gelu_erf path.
+    for (int t = (int) tpitg.x; t < L; t += (int) ntg.x) {
+        const float v = x_c[(size_t) t * sxt] + bv;
+        y_c[(size_t) t * syt] = 0.5f * v * (1.0f + erf_approx<float>(v * SQRT_2_INV));
+    }
+}

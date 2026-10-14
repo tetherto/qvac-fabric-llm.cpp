@@ -15980,3 +15980,7 @@
 "MTL0","SCALE_RESIDUAL","L=37,C=96,B=2,ct=0","support","1","yes","MTL"
 "MTL0","SCALE_RESIDUAL","L=139,C=512,B=1,ct=1","support","1","yes","MTL"
 "MTL0","SCALE_RESIDUAL","L=37,C=96,B=2,ct=1","support","1","yes","MTL"
+"MTL0","BIAS_GELU","L=139,C=512,B=1,ct=0","support","1","yes","MTL"
+"MTL0","BIAS_GELU","L=37,C=96,B=2,ct=0","support","1","yes","MTL"
+"MTL0","BIAS_GELU","L=139,C=512,B=1,ct=1","support","1","yes","MTL"
+"MTL0","BIAS_GELU","L=37,C=96,B=2,ct=1","support","1","yes","MTL"
