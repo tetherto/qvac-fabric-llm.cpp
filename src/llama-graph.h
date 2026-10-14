@@ -36,6 +36,7 @@ struct llama_layer;
 struct llama_memory_context_i;
 
 class llama_kv_cache_context;
+struct llama_kv_cache_packed_view;
 class llama_kv_cache_dsa_context;
 class llama_kv_cache_dsa_iswa_context;
 class llama_kv_cache_msa_context;
@@ -1227,7 +1228,19 @@ struct llm_graph_context {
                   float   kq_scale,
                     int   il) const;
 
-    // build_attn_mha once per run of consecutive streams in the ubatch, the cache views cannot skip streams
+    ggml_tensor * build_attn_mha_packed(
+            ggml_tensor * q,
+            ggml_tensor * k,
+            const llama_kv_cache_packed_view & v,
+            ggml_tensor * kq_b,
+            ggml_tensor * kq_mask,
+            ggml_tensor * sinks,
+            ggml_tensor * v_mla,
+                int64_t   n_kv_max,
+                  float   kq_scale,
+                    int   il) const;
+
+    // gather physical cache streams and attend over them as one logical batch
     // n_embd_v_k > 0: V is a view of the first n_embd_v_k values of K
     ggml_tensor * build_attn_mha_runs(
             const llama_kv_cache_context * mctx_cur,
@@ -1236,7 +1249,19 @@ struct llm_graph_context {
             ggml_tensor * sinks,
             ggml_tensor * v_mla,
                 int64_t   n_embd_v_k,
+                int64_t   n_kv_max,
                   float   kq_scale,
+                    int   il) const;
+
+    ggml_tensor * build_lid_top_k(
+            const llama_kv_cache_context * mctx_cur,
+            ggml_tensor * q,
+            ggml_tensor * k_cur,
+            ggml_tensor * weights,
+            ggml_tensor * k_idxs,
+            ggml_tensor * kq_mask,
+                  float   scale,
+               uint32_t   n_top_k,
                     int   il) const;
 
     llm_graph_input_attn_no_cache * build_attn_inp_no_cache() const;

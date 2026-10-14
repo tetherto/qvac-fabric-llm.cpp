@@ -436,7 +436,8 @@ public:
     llama_kv_cache_context(
             llama_kv_cache * kv,
             slot_info_vec_t sinfos,
-            std::vector<llama_ubatch> ubatches);
+            std::vector<llama_ubatch> ubatches,
+            bool pack_streams = false);
 
     virtual ~llama_kv_cache_context();
 
@@ -467,6 +468,7 @@ public:
     uint32_t get_n_runs() const;
     void     get_run(uint32_t r, uint32_t & i0, uint32_t & n) const;
     bool     get_can_view_packed() const;
+    bool     get_use_packed() const;
 
     ggml_tensor * get_k(ggml_context * ctx, int32_t il, uint32_t r) const;
     ggml_tensor * get_v(ggml_context * ctx, int32_t il, uint32_t r) const;
@@ -538,6 +540,8 @@ private:
     slot_info_vec_t sinfos;
 
     std::vector<llama_ubatch> ubatches;
+
+    bool pack_streams = false;
 
     //
     // data needed for building the compute graph for the current ubatch:

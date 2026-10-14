@@ -2985,7 +2985,8 @@ llama_kv_cache_context::llama_kv_cache_context(
 llama_kv_cache_context::llama_kv_cache_context(
         llama_kv_cache * kv,
         llama_kv_cache::slot_info_vec_t sinfos,
-        std::vector<llama_ubatch> ubatches) : status(LLAMA_MEMORY_STATUS_SUCCESS), kv(kv), sinfos(std::move(sinfos)), ubatches(std::move(ubatches)) {
+        std::vector<llama_ubatch> ubatches,
+        bool pack_streams) : status(LLAMA_MEMORY_STATUS_SUCCESS), kv(kv), sinfos(std::move(sinfos)), ubatches(std::move(ubatches)), pack_streams(pack_streams) {
 }
 
 llama_kv_cache_context::~llama_kv_cache_context() = default;
@@ -3068,6 +3069,10 @@ void llama_kv_cache_context::get_run(uint32_t r, uint32_t & i0, uint32_t & n) co
 bool llama_kv_cache_context::get_can_view_packed() const {
     const auto & sinfo = sinfos[i_cur];
     return sinfo.runs().size() == 1 || sinfo.stream_stride() > 0;
+}
+
+bool llama_kv_cache_context::get_use_packed() const {
+    return pack_streams || get_can_view_packed();
 }
 
 ggml_tensor * llama_kv_cache_context::get_k(ggml_context * ctx, int32_t il, uint32_t r) const {

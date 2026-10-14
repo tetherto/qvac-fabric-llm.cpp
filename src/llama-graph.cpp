@@ -2693,7 +2693,22 @@ ggml_tensor * llm_graph_context::build_attn_mha(
              int64_t   n_kv_max,
                float   kq_scale,
                  int   il) const {
-    const bool v_trans = v->nb[1] > v->nb[2];
+    return build_attn_mha_packed(q, k, { v, v->nb[1] > v->nb[2] }, kq_b, kq_mask, sinks, v_mla, n_kv_max, kq_scale, il);
+}
+
+ggml_tensor * llm_graph_context::build_attn_mha_packed(
+         ggml_tensor * q,
+         ggml_tensor * k,
+         const llama_kv_cache_packed_view & v_view,
+         ggml_tensor * kq_b,
+         ggml_tensor * kq_mask,
+         ggml_tensor * sinks,
+         ggml_tensor * v_mla,
+             int64_t   n_kv_max,
+               float   kq_scale,
+                 int   il) const {
+    ggml_tensor * v = v_view.tensor;
+    const bool v_trans = v_view.transposed;
 
     // split the batch into streams if needed
     const auto n_stream = k->ne[3];
@@ -2827,27 +2842,108 @@ ggml_tensor * llm_graph_context::build_attn_mha_runs(
          ggml_tensor * sinks,
          ggml_tensor * v_mla,
              int64_t   n_embd_v_k,
+             int64_t   n_kv_max,
                float   kq_scale,
                  int   il) const {
-    const int64_t n_stream = kq_mask->ne[3];
-    const int64_t n_tps    = q->ne[2]/n_stream;
+    if (!cparams.flash_attn || !mctx_cur->get_use_packed()) {
+        const int64_t n_stream = kq_mask->ne[3];
+        const int64_t n_tps    = q->ne[2]/n_stream;
 
-    ggml_tensor * res = nullptr;
+        ggml_tensor * out = nullptr;
+        for (uint32_t r = 0; r < mctx_cur->get_n_runs(); ++r) {
+            uint32_t i0;
+            uint32_t n;
+            mctx_cur->get_run(r, i0, n);
+
+            ggml_tensor * k = mctx_cur->get_k(ctx0, il, r);
+            llama_kv_cache_packed_view v_view { nullptr, false };
+            if (n_embd_v_k > 0) {
+                v_view.tensor = ggml_view_4d(ctx0, k, n_embd_v_k, k->ne[1], k->ne[2], k->ne[3],
+                        k->nb[1], k->nb[2], k->nb[3], 0);
+            } else {
+                v_view = mctx_cur->get_v_view(ctx0, il, r);
+            }
+            ggml_tensor * q_r = ggml_view_3d(ctx0, q, q->ne[0], q->ne[1], n*n_tps,
+                    q->nb[1], q->nb[2], i0*n_tps*q->nb[2]);
+
+            ggml_tensor *& kq_mask_r = kq_mask_runs[{kq_mask, r}];
+            if (kq_mask_r == nullptr) {
+                kq_mask_r = ggml_view_4d(ctx0, kq_mask,
+                        kq_mask->ne[0], kq_mask->ne[1], kq_mask->ne[2], n,
+                        kq_mask->nb[1], kq_mask->nb[2], kq_mask->nb[3], i0*kq_mask->nb[3]);
+            }
+
+            ggml_tensor * cur = build_attn_mha_packed(
+                    q_r, k, v_view, nullptr, kq_mask_r, sinks, v_mla, n_kv_max, kq_scale, il);
+            out = out ? ggml_concat(ctx0, out, cur, 1) : cur;
+            ggml_build_forward_expand(gf, out);
+        }
+        return out;
+    }
+
+    ggml_tensor * k = mctx_cur->get_k_packed(ctx0, il);
+    llama_kv_cache_packed_view v_view = n_embd_v_k == 0
+        ? mctx_cur->get_v_packed(ctx0, il)
+        : llama_kv_cache_packed_view { nullptr, false };
+
+    if (n_embd_v_k > 0) {
+        v_view.tensor = ggml_view_4d(ctx0, k, n_embd_v_k, k->ne[1], k->ne[2], k->ne[3],
+                k->nb[1], k->nb[2], k->nb[3], 0);
+    }
+
+    ggml_build_forward_expand(gf, k);
+    ggml_build_forward_expand(gf, v_view.tensor);
+
+    return build_attn_mha_packed(q, k, v_view, nullptr, kq_mask, sinks, v_mla, n_kv_max, kq_scale, il);
+}
+
+ggml_tensor * llm_graph_context::build_lid_top_k(
+        const llama_kv_cache_context * mctx_cur,
+         ggml_tensor * q,
+         ggml_tensor * k_cur,
+         ggml_tensor * weights,
+         ggml_tensor * k_idxs,
+         ggml_tensor * kq_mask,
+               float   scale,
+            uint32_t   n_top_k,
+                 int   il) const {
+    ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, k_cur, k_idxs, il));
+
+    const int64_t n_stream = kq_mask->ne[3];
+
+    q = ggml_view_4d(ctx0, q, q->ne[0], q->ne[1], q->ne[2]/n_stream, n_stream,
+            q->nb[1], q->nb[2], q->nb[3]/n_stream, 0);
+    weights = ggml_view_4d(ctx0, weights, weights->ne[0], weights->ne[1]/n_stream, weights->ne[2], n_stream,
+            weights->nb[1], weights->nb[2]/n_stream, weights->nb[3]/n_stream, 0);
+    weights = ggml_scale(ctx0, weights, scale);
+
+    if (cparams.fused_lid && mctx_cur->get_n_runs() > 1 && mctx_cur->get_use_packed()) {
+        ggml_tensor * k = mctx_cur->get_k_packed(ctx0, il);
+
+        ggml_tensor * score = ggml_lightning_indexer(ctx0, q, k, weights, kq_mask);
+        cb(score, "indexer_score", il);
+        res->add_fused_node({LLM_FUSED_OP_LIGHTNING_INDEXER, score, il});
+
+        ggml_tensor * top_k = ggml_cont(ctx0,
+                ggml_top_k(ctx0, score, std::min<int64_t>(score->ne[0], n_top_k)));
+        ggml_build_forward_expand(gf, top_k);
+        return top_k;
+    }
+
+    ggml_tensor * top_k = nullptr;
 
     for (uint32_t r = 0; r < mctx_cur->get_n_runs(); ++r) {
         uint32_t i0;
         uint32_t n;
         mctx_cur->get_run(r, i0, n);
 
-        ggml_tensor * k = mctx_cur->get_k(ctx0, il, r);
-        ggml_tensor * v = n_embd_v_k > 0
-            ? ggml_view_4d(ctx0, k, n_embd_v_k, k->ne[1], k->ne[2], k->ne[3], k->nb[1], k->nb[2], k->nb[3], 0)
-            : mctx_cur->get_v(ctx0, il, r);
-
-        ggml_tensor * q_r = ggml_view_3d(ctx0, q, q->ne[0], q->ne[1], n*n_tps, q->nb[1], q->nb[2], i0*n_tps*q->nb[2]);
-
-        // flash attention does not check the mask width
-        GGML_ASSERT(kq_mask->ne[0] == k->ne[2]);
+        ggml_tensor * k_r = mctx_cur->get_k(ctx0, il, r);
+        ggml_tensor * q_r = ggml_view_4d(ctx0, q,
+                q->ne[0], q->ne[1], q->ne[2], n,
+                q->nb[1], q->nb[2], q->nb[3], i0*q->nb[3]);
+        ggml_tensor * weights_r = ggml_view_4d(ctx0, weights,
+                weights->ne[0], weights->ne[1], weights->ne[2], n,
+                weights->nb[1], weights->nb[2], weights->nb[3], i0*weights->nb[3]);
 
         ggml_tensor *& kq_mask_r = kq_mask_runs[{kq_mask, r}];
         if (kq_mask_r == nullptr) {
@@ -2856,20 +2952,30 @@ ggml_tensor * llm_graph_context::build_attn_mha_runs(
                     kq_mask->nb[1], kq_mask->nb[2], kq_mask->nb[3], i0*kq_mask->nb[3]);
         }
 
-        ggml_tensor * cur = build_attn_mha(q_r, k, v, nullptr, kq_mask_r, sinks, v_mla, 0, kq_scale, il);
+        ggml_tensor * score;
+        if (cparams.fused_lid) {
+            score = ggml_lightning_indexer(ctx0, q_r, k_r, weights_r, kq_mask_r);
+            res->add_fused_node({LLM_FUSED_OP_LIGHTNING_INDEXER, score, il});
+        } else {
+            q_r = ggml_permute(ctx0, q_r, 0, 2, 1, 3);
+            k_r = ggml_permute(ctx0, k_r, 0, 2, 1, 3);
 
-        // the first run waits for the next concat: copy it out of the FA node, so the FA temp buffers are freed before the next run
-        if (res == nullptr && cparams.flash_attn) {
-            cur = ggml_cont(ctx0, cur);
+            score = ggml_mul_mat(ctx0, k_r, q_r);
+            score = ggml_cont(ctx0, ggml_permute(ctx0, score, 2, 1, 0, 3));
+            score = ggml_relu(ctx0, score);
+            score = ggml_mul(ctx0, score, weights_r);
+            score = ggml_sum_rows(ctx0, score);
+            score = ggml_cont(ctx0, ggml_permute(ctx0, score, 2, 1, 0, 3));
+            score = ggml_add(ctx0, score, kq_mask_r);
         }
+        cb(score, "indexer_score", il);
 
-        res = res ? ggml_concat(ctx0, res, cur, 1) : cur;
-
-        // add the run to the graph now, so its nodes are freed before the next run
-        ggml_build_forward_expand(gf, res);
+        ggml_tensor * top_k_r = ggml_cont(ctx0, ggml_top_k(ctx0, score, std::min<int64_t>(score->ne[0], n_top_k)));
+        top_k = top_k ? ggml_concat(ctx0, top_k, top_k_r, 3) : top_k_r;
+        ggml_build_forward_expand(gf, top_k);
     }
 
-    return res;
+    return top_k;
 }
 
 llm_graph_input_attn_no_cache * llm_graph_context::build_attn_inp_no_cache() const {
@@ -3038,7 +3144,7 @@ ggml_tensor * llm_graph_context::build_attn(
 
     if (!use_lora && mctx_cur->get_n_runs() > 1) {
         GGML_ASSERT(kq_b == nullptr);
-        cur = build_attn_mha_runs(mctx_cur, q, kq_mask, sinks, v_mla, 0, kq_scale, il);
+        cur = build_attn_mha_runs(mctx_cur, q, kq_mask, sinks, v_mla, 0, 0, kq_scale, il);
     } else {
         if (use_lora) {
             k = mctx_cur->get_k_lora(ctx0, k_cur, il);
@@ -3149,7 +3255,7 @@ ggml_tensor * llm_graph_context::build_attn(
 
     if (mctx_cur->get_n_runs() > 1) {
         GGML_ASSERT(kq_b == nullptr);
-        cur = build_attn_mha_runs(mctx_cur, q, kq_mask, sinks, v_mla, v_cur->ne[0], kq_scale, il);
+        cur = build_attn_mha_runs(mctx_cur, q, kq_mask, sinks, v_mla, v_cur->ne[0], 0, kq_scale, il);
     } else {
         ggml_tensor * k = mctx_cur->get_k(ctx0, il);
         ggml_tensor * v = ggml_view_4d(ctx0, k, v_cur->ne[0], k->ne[1], k->ne[2], k->ne[3], k->nb[1], k->nb[2], k->nb[3], 0);
@@ -3237,10 +3343,16 @@ ggml_tensor * llm_graph_context::build_attn(
     kq_mask_top_k = ggml_add(ctx0, kq_mask_top_k, kq_mask);
 
     ggml_tensor * q = q_cur;
-    ggml_tensor * k = mctx_cur->get_k(ctx0, il);
-    ggml_tensor * v = ggml_view_4d(ctx0, k, v_cur->ne[0], k->ne[1], k->ne[2], k->ne[3], k->nb[1], k->nb[2], k->nb[3], 0);
+    ggml_tensor * cur;
 
-    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask_top_k, sinks, v_mla, top_k->ne[0], kq_scale, il);
+    if (mctx_cur->get_n_runs() > 1) {
+        GGML_ASSERT(kq_b == nullptr);
+        cur = build_attn_mha_runs(mctx_cur, q, kq_mask_top_k, sinks, v_mla, v_cur->ne[0], top_k->ne[0], kq_scale, il);
+    } else {
+        ggml_tensor * k = mctx_cur->get_k(ctx0, il);
+        ggml_tensor * v = ggml_view_4d(ctx0, k, v_cur->ne[0], k->ne[1], k->ne[2], k->ne[3], k->nb[1], k->nb[2], k->nb[3], 0);
+        cur = build_attn_mha(q, k, v, kq_b, kq_mask_top_k, sinks, v_mla, top_k->ne[0], kq_scale, il);
+    }
     cb(cur, "kqv_out", il);
 
     if (wo) {
@@ -3324,7 +3436,7 @@ ggml_tensor * llm_graph_context::build_attn(
 
     if (!use_lora && mctx_cur->get_n_runs() > 1) {
         GGML_ASSERT(kq_b == nullptr);
-        cur = build_attn_mha_runs(mctx_cur, q, kq_mask, sinks, v_mla, 0, kq_scale, il);
+        cur = build_attn_mha_runs(mctx_cur, q, kq_mask, sinks, v_mla, 0, 0, kq_scale, il);
     } else {
         if (use_lora) {
             k = mctx_cur->get_k_lora(ctx0, k_cur, il);
@@ -3416,7 +3528,7 @@ ggml_tensor * llm_graph_context::build_attn(
 
     if (mctx_cur->get_n_runs() > 1) {
         GGML_ASSERT(kq_b == nullptr);
-        cur = build_attn_mha_runs(mctx_cur, q, kq_mask, sinks, v_mla, v_cur->ne[0], kq_scale, il);
+        cur = build_attn_mha_runs(mctx_cur, q, kq_mask, sinks, v_mla, v_cur->ne[0], 0, kq_scale, il);
     } else {
         ggml_tensor * k = mctx_cur->get_k(ctx0, il);
         ggml_tensor * v = ggml_view_4d(ctx0, k, v_cur->ne[0], k->ne[1], k->ne[2], k->ne[3], k->nb[1], k->nb[2], k->nb[3], 0);

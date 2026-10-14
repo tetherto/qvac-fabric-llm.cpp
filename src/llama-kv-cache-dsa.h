@@ -47,6 +47,8 @@ public:
 
     bool get_can_shift() const override;
 
+    bool get_allow_stream_gaps() const override;
+
     void clear(bool data) override;
 
     bool seq_rm  (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1) override;
@@ -105,7 +107,8 @@ public:
             llama_kv_cache_dsa * kv,
             slot_info_vec_t sinfos_base,
             slot_info_vec_t sinfos_ik,
-            std::vector<llama_ubatch> ubatches);
+            std::vector<llama_ubatch> ubatches,
+            bool pack_streams = false);
 
     virtual ~llama_kv_cache_dsa_context();
 

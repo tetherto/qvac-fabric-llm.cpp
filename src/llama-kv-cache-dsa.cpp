@@ -51,6 +51,9 @@ llama_kv_cache_dsa::llama_kv_cache_dsa(
             model, hparams_lid, type_k, type_v,
             v_trans, offload, unified, kv_size, n_seq_max, n_pad,
             n_swa, swa_type, nullptr, filter_lid, reuse, nullptr);
+
+    kv_mla->set_allow_stream_gaps(true);
+    kv_lid->set_allow_stream_gaps(true);
 }
 
 void llama_kv_cache_dsa::clear(bool data) {
@@ -118,7 +121,7 @@ llama_memory_context_ptr llama_kv_cache_dsa::init_batch(
 
         std::vector<llama_ubatch> ubatches;
         while (true) {
-            auto ubatch = n_stream == 1 ? balloc.split_simple(n_ubatch) : balloc.split_equal(n_ubatch, true, 0);
+            auto ubatch = n_stream == 1 ? balloc.split_simple(n_ubatch) : balloc.split_equal(n_ubatch, true, 0, true);
 
             if (ubatch.n_tokens == 0) {
                 break;
@@ -165,6 +168,10 @@ bool llama_kv_cache_dsa::get_can_shift() const {
            kv_mla->get_size() == kv_lid->get_size();
 }
 
+bool llama_kv_cache_dsa::get_allow_stream_gaps() const {
+    return kv_mla->get_allow_stream_gaps() && kv_lid->get_allow_stream_gaps();
+}
+
 void llama_kv_cache_dsa::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
     kv_mla->state_write(io, seq_id, flags);
     kv_lid->state_write(io, seq_id, flags);
@@ -209,11 +216,12 @@ llama_kv_cache_dsa_context::llama_kv_cache_dsa_context(
         llama_kv_cache_dsa * kv,
         slot_info_vec_t sinfos_mla,
         slot_info_vec_t sinfos_lid,
-        std::vector<llama_ubatch> ubatches) :
+        std::vector<llama_ubatch> ubatches,
+        bool pack_streams) :
     ubatches(std::move(ubatches)),
     // note: here we copy the ubatches. not sure if this is ideal
-    ctx_mla(new llama_kv_cache_context(kv->get_mla(), std::move(sinfos_mla), this->ubatches)),
-    ctx_lid(new llama_kv_cache_context(kv->get_lid(), std::move(sinfos_lid), this->ubatches)),
+    ctx_mla(new llama_kv_cache_context(kv->get_mla(), std::move(sinfos_mla), this->ubatches, pack_streams)),
+    ctx_lid(new llama_kv_cache_context(kv->get_lid(), std::move(sinfos_lid), this->ubatches, pack_streams)),
     status(llama_memory_status_combine(ctx_mla->get_status(), ctx_lid->get_status())) {
 }
 
