@@ -5,6 +5,15 @@
 // 4-word header followed by fixed-size instructions. The stream is bound to a
 // loaded xclbin as its insts BO. Only GEMM sequences exist so far; other ops
 // extend this module with their own builders.
+//
+// Provenance: the builders in this module are this backend's own
+// implementation of the NPU2 instruction-stream format. They were written from
+// the BD field semantics documented in mlir-aie (AIEDmaToNpu.cpp and
+// include/aie/Runtime/TxnEncoding.h) and from streams read back out of
+// artifacts this design built; no mlir-aie or IRON source was copied or
+// translated into them, and the one sentence quoted from mlir-aie
+// (xdna-seq.cpp, on the DDR aperture) is attributed where it appears. MIT,
+// like the rest of the backend - see ../THIRD_PARTY_NOTICES.md for what is not.
 
 #include <cstdint>
 #include <vector>
@@ -111,7 +120,7 @@ enum class xdna_dma_dir : uint32_t {
 // apart, is buf_len = run*reps, d0_size = run, d0_stride = 1, d1_size = reps,
 // d1_stride = stride. Anything unsure here is worth checking the same way:
 // build the pattern in IRON, disassemble the .insts.bin it ships beside the
-// xclbin (the .insts.bin it ships beside the xclbin and read the words.
+// xclbin and read the words.
 struct xdna_bd {
     // Lengths, sizes and strides are in 32-bit words, the units the address
     // generator takes; only buf_off is in bytes.
