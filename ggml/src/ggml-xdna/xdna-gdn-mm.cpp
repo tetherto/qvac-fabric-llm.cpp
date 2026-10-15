@@ -691,9 +691,14 @@ bool cv_ensure(xdna_kernel_pool * pool, xdna_buffer ** bo, size_t * cap, size_t 
 
 }  // namespace
 
+// Opt-in (GGML_XDNA_GDN_CONV=1): the host's conv input is faster - on the
+// 0.8B pp512 1900 against 1680 t/s with it on the array, at the same output.
 bool xdna_gdn_conv_supported(void) {
+    if (xdna_env_int("GGML_XDNA_GDN_CONV", 0) == 0) {
+        return false;
+    }
     static const bool present = !xdna_artifact_find(CV_STEM, false).xclbin.empty();
-    return present && xdna_env_int("GGML_XDNA_GDN_CONV", 1) != 0;
+    return present;
 }
 
 xdna_buffer * xdna_gdn_conv_input(xdna_kernel_pool * pool, int n_tok, int channels, size_t * off) {
