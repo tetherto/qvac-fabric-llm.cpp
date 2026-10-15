@@ -272,6 +272,8 @@ llama_test(test-llama-archs NAME test-glm5-invalid-metadata ARGS --glm5-invalid-
 llama_test(test-llama-archs NAME test-mtp-shared-cpu ARGS --mtp-shared-cpu)
 llama_test(test-llama-archs NAME test-hadamard-contracts ARGS --hadamard-contracts)
 llama_test(test-llama-archs NAME test-layer-inp-pos-min ARGS --layer-inp-pos-min)
+llama_test(test-llama-archs NAME test-moe-no-output-ubatches ARGS --moe-no-output-ubatches)
+set_tests_properties(test-moe-no-output-ubatches PROPERTIES ENVIRONMENT GGML_SCHED_DEBUG_REALLOC=1)
 if (GGML_CUDA)
     llama_test(test-llama-archs NAME test-mtp-shared ARGS --mtp-shared)
 endif()

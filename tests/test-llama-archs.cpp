@@ -183,7 +183,8 @@ static void usage(char ** argv) {
     LOG("  --glm5-kpool-sequences   Run only the GLM5 k-pool sequence edit and shared-token test\n");
     LOG("  --glm5-invalid-metadata  Run only the GLM5 invalid-metadata rejection test\n");
     LOG("  --qsa-unified-multiseq   Run only the QSA unified multi-sequence fallback test\n");
-    LOG("  --layer-inp-pos-min      Run only the layer-input pos_min copy test\n\n");
+    LOG("  --layer-inp-pos-min      Run only the layer-input pos_min copy test\n");
+    LOG("  --moe-no-output-ubatches Run only the MoE no-output ubatch realloc test (must be the sole argument)\n\n");
     LOG("Examples:\n");
     LOG("  %s\n", argv[0]);
     LOG("  %s -a qwen35moe\n", argv[0]);
@@ -2549,6 +2550,56 @@ static int test_layer_inp_pos_min() {
     return ok ? 0 : 1;
 }
 
+static constexpr uint32_t NO_OUTPUT_N_UBATCH      = 256; // n_kv is padded to 256, so every ubatch grows the KQ mask
+static constexpr uint32_t NO_OUTPUT_N_UBATCHES    = 3;
+static constexpr uint32_t NO_OUTPUT_N_EXPERT_USED = 2;   // the CUDA MoE weighted-reduction fusion needs at least 2
+static constexpr size_t   NO_OUTPUT_SEED          = 1234;
+
+static void add_tokens_last_output(llama_batch_ext * batch, const std::vector<llama_token> & tokens) {
+    for (size_t i = 0; i < tokens.size(); ++i) {
+        const int32_t idx = llama_batch_ext_add_token(batch, 0, tokens[i]);
+        GGML_ASSERT(idx >= 0);
+        const llama_pos pos = (llama_pos) i;
+        llama_batch_ext_set_pos(batch, idx, &pos);
+        llama_batch_ext_set_output_logits(batch, idx, i + 1 == tokens.size());
+    }
+}
+
+// only the last ubatch has an output, so the last MoE layer runs on 0 tokens in the others;
+// ctest sets GGML_SCHED_DEBUG_REALLOC=1, which aborts on a re-plan at an unchanged graph size
+static int test_moe_no_output_ubatches() {
+    init_normal_pool(NO_OUTPUT_SEED, 0.1f); // fill_normal draws from the shared pool (upstream 8542e94350f)
+    auto metadata = get_gguf_ctx(LLM_ARCH_QWEN3MOE, true);
+    const std::string prefix = llm_arch_name(LLM_ARCH_QWEN3MOE);
+    gguf_set_val_u32(metadata.get(), (prefix + ".expert_used_count").c_str(), NO_OUTPUT_N_EXPERT_USED);
+
+    auto mp = llama_model_default_params();
+    mp.progress_callback = silent_model_load_progress;
+    tensor_data_params tensor_params = { NO_OUTPUT_SEED, 0.1f };
+    llama_model_ptr model(llama_model_init_from_user(metadata.get(), set_tensor_data, &tensor_params, mp));
+    GGML_ASSERT(model);
+
+    const uint32_t n_tokens = NO_OUTPUT_N_UBATCH * NO_OUTPUT_N_UBATCHES;
+    auto cp = llama_context_default_params();
+    cp.n_ctx     = n_tokens;
+    cp.n_batch   = n_tokens;
+    cp.n_ubatch  = NO_OUTPUT_N_UBATCH;
+    cp.n_threads = cp.n_threads_batch = 4;
+    llama_context_ptr ctx(llama_init_from_model(model.get(), cp));
+    GGML_ASSERT(ctx);
+
+    const auto tokens = get_tokens(n_tokens, llama_vocab_n_tokens(llama_model_get_vocab(model.get())), NO_OUTPUT_SEED);
+    llama_batch_ext_ptr batch(llama_batch_ext_init(ctx.get()));
+    add_tokens_last_output(batch.get(), tokens);
+    const int rc = llama_process(ctx.get(), LLAMA_PROCESS_TYPE_DECODE, batch.get());
+    if (rc != 0) {
+        printf("FAIL: decode of %u MoE ubatches without outputs returned %d\n", NO_OUTPUT_N_UBATCHES, rc);
+        return 1;
+    }
+    printf("MoE ubatches without outputs passed\n");
+    return 0;
+}
+
 int main(int argc, char ** argv) {
     // init the logger at max verbosity. filter with a custom callback respecting the user-configure verbosity
     common_log_set_verbosity_thold(LOG_LEVEL_DEBUG);
@@ -2569,6 +2620,9 @@ int main(int argc, char ** argv) {
     }
     if (argc == 2 && strcmp(argv[1], "--layer-inp-pos-min") == 0) {
         return test_layer_inp_pos_min();
+    }
+    if (argc == 2 && strcmp(argv[1], "--moe-no-output-ubatches") == 0) {
+        return test_moe_no_output_ubatches();
     }
     std::random_device rd;
 
