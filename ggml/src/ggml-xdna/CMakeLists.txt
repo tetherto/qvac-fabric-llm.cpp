@@ -13,8 +13,6 @@ ggml_add_backend_library(ggml-xdna
                          xdna-pgemm.cpp
                          xdna-attn-mm.cpp
                          xdna-gdn-mm.cpp
-                         xdna-fa-prefill.cpp
-                         xdna-gdn-prefill.cpp
                          xdna-conv-prefill.cpp
                          xdna-rec.cpp
                          xdna-rec-gemv.cpp
@@ -216,28 +214,6 @@ if (GGML_XDNA_BUILD_KERNELS)
         list(APPEND XDNA_ARTIFACTS ${INT8_XCLBIN} ${INT8_INSTS})
     endforeach()
 
-    # GDN prefill kernel (gdn_prefill.py + gdn-prefill.cc): the bf16 CS=64-token
-    # GGML_OP_GATED_DELTA_NET recurrence, run by xdna-gdn-prefill.cpp. The DMA
-    # schedule is a host-built TXN stream at runtime; the .insts.bin here is
-    # only a build-time reference and is never read by the runner. Stem follows
-    # the gemm_<dtype>_<geom>_c<cols> convention.
-    set(GDN_PREFILL_STEM "gdn_prefill_bf16_S128_H16_CS64_c8")
-    set(GDN_PREFILL_XCLBIN "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/${GDN_PREFILL_STEM}.xclbin")
-    set(GDN_PREFILL_INSTS  "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/${GDN_PREFILL_STEM}.insts.bin")
-
-    add_custom_command(
-        OUTPUT ${GDN_PREFILL_XCLBIN} ${GDN_PREFILL_INSTS}
-        COMMAND ${GEMM_PYTHON} "${GEMM_DIR}/gdn_prefill.py"
-                -d npu2
-                --xclbin-path ${GDN_PREFILL_XCLBIN}
-                --insts-path ${GDN_PREFILL_INSTS}
-        DEPENDS "${GEMM_DIR}/gdn_prefill.py" "${GEMM_DIR}/gdn-prefill.cc" ${XDNA_KERNEL_HEADERS}
-        WORKING_DIRECTORY "${GEMM_DIR}"
-        COMMENT "ggml-xdna: compiling GDN prefill kernel S128 H16 CS64"
-        VERBATIM
-    )
-    list(APPEND XDNA_ARTIFACTS ${GDN_PREFILL_XCLBIN} ${GDN_PREFILL_INSTS})
-
     # SSM_CONV kernel (conv.py + conv-ssm.cc, ported from the qvac-fabric max2
     # branch): causal depthwise conv1d, token-major layout (no host transpose),
     # C=16 channels x 8 cols x 4 rows = 512 channels per tile, T=256 token
@@ -262,28 +238,6 @@ if (GGML_XDNA_BUILD_KERNELS)
         VERBATIM
     )
     list(APPEND XDNA_ARTIFACTS ${CONV_XCLBIN} ${CONV_INSTS})
-
-    # Flash attention kernel (fa.py + attn-fa.cc) for the six full-attention prefill
-    # layers: 8 columns = 8 query heads, 4 cores a column each owning 32
-    # queries, 64 key tiles of 8 keys a dispatch. The host chains chunks of the
-    # key range and rounds of the batch, so this one artifact covers every n_kv.
-    set(FA_STEM "fa_prefill_bf16_D256_MT32_JT8_NJ64_c8")
-    set(FA_XCLBIN "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/${FA_STEM}.xclbin")
-    set(FA_INSTS  "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/${FA_STEM}.insts.bin")
-
-    add_custom_command(
-        OUTPUT ${FA_XCLBIN} ${FA_INSTS}
-        COMMAND ${GEMM_PYTHON} "${GEMM_DIR}/fa.py"
-                -d npu2
-                --cols 8 --KVH 2 --MT 32 --JT 8 --NMB 1 --NJ 64
-                --xclbin-path ${FA_XCLBIN}
-                --insts-path ${FA_INSTS}
-        DEPENDS "${GEMM_DIR}/fa.py" "${GEMM_DIR}/attn-fa.cc" ${XDNA_KERNEL_HEADERS}
-        WORKING_DIRECTORY "${GEMM_DIR}"
-        COMMENT "ggml-xdna: compiling flash attention kernel D256 MT32 JT8 NJ64"
-        VERBATIM
-    )
-    list(APPEND XDNA_ARTIFACTS ${FA_XCLBIN} ${FA_INSTS})
 
     # Prefill GEMM (pgemm.py + gemm-expand.cc):
     # every core expands the decode GEMV's own weight tiles into bf16 and runs

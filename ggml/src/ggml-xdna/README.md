@@ -60,8 +60,8 @@ per-op path for a model the fused design does cover.
 | :-- | :-- | :-- |
 | `SSM_CONV`, from 64 tokens | `kernels/conv.py` | opt-in, `GGML_XDNA_CONV=1`; the host is cheaper and is what runs otherwise |
 | the prefill GDN's conv input | `kernels/gdn_conv.py` | on with the GDN, `GGML_XDNA_GDN_CONV=0` for the host |
-| `GATED_DELTA_NET` | `kernels/gdn_prefill.py` | opt-in, `GGML_XDNA_GDN=1` |
-| `FLASH_ATTN_EXT`, plain causal mask only | `kernels/fa.py` | opt-in, `GGML_XDNA_FA=1` |
+| `GATED_DELTA_NET` | `kernels/gdn_mm.py` | on, `GGML_XDNA_GDN_MM=0` for the host |
+| `FLASH_ATTN_EXT` | `kernels/attn_mm.py` | on, `GGML_XDNA_FA_MM=0` for the host |
 
 ### Everything else
 
@@ -250,9 +250,11 @@ Artifacts, all in the build output directory (`build/bin` by default):
 | :-- | :-- |
 | `gemm_bf16_f32_M{32,256,512,2048}_K1024_N2048_c8` | bf16 GEMM, one per M block; M32 is the decode one |
 | `gemm_int8_int32_M{256,512,2048}_K1024_N2048_c8` | native int8 GEMM, prefill |
-| `gdn_prefill_bf16_S128_H16_CS64_c8` | GATED_DELTA_NET prefill |
-| `conv_prefill_bf16_c16_t256_kw4_mb8` | SSM_CONV prefill |
-| `fa_prefill_bf16_D256_MT32_JT8_NJ64_c8` | flash attention prefill |
+| `pgemm_c8` | prefill GEMM in the decode GEMV's weight tiles |
+| `gdn_mm_c8` | GATED_DELTA_NET prefill |
+| `gdn_conv_c8` | the prefill GDN's conv input |
+| `attn_mm_c8` | FLASH_ATTN_EXT prefill |
+| `conv_prefill_bf16_c16_t256_kw4_mb8` | SSM_CONV prefill, opt-in |
 | `fused_layer_<tag>` | the fused recurrent layer, decode |
 | `gemv_n32_r4_c8_<tag>` | the standalone decode GEMV |
 
@@ -309,8 +311,6 @@ one disables the NPU path it names, and the default is the fast one.
 | `GGML_XDNA_GDN_CONV` | 1 | `0` runs the prefill GDN's conv input on the host |
 | `GGML_XDNA_FA_MM` | 1 | `0` takes prefill attention off the array |
 | `GGML_XDNA_CONV` | 0 | `1` runs the standalone prefill conv on the array; the host is what runs otherwise |
-| `GGML_XDNA_GDN` | 0 | `1` runs the older GDN prefill body on the array |
-| `GGML_XDNA_FA` | 0 | `1` runs the older flash-attention prefill on the array |
 | `GGML_XDNA_SPIN_US` | 0 | poll this many microseconds for completion before blocking; `-1` polls until it completes |
 | `GGML_XDNA_W4` | `attn_qkv,attn_v` | the `Q5_K`/`Q6_K` weights the decode GEMV takes at 4 bits, a lossy default (see [4-bit decode weights](#4-bit-decode-weights-on-by-default)); empty keeps them at 8 bits |
 | `GGML_XDNA_KERNEL_DIR` | unset | a directory to look for the kernel artifacts in before the others |
@@ -362,9 +362,7 @@ default to the fast path and are read where they are used.
 | `xdna-quant.h/.cpp` | NPU weight formats (q4g32 / q8g16) and the ggml repack |
 | `xdna-rec.h/.cpp` | the fused recurrent layer: session state, packing, core stream |
 | `xdna-rec-gemv.h/.cpp` | the fused layer's projections (ssm_out, FFN) on the decode GEMV |
-| `xdna-gdn-prefill.h/.cpp` | GDN prefill runner |
 | `xdna-conv-prefill.h/.cpp` | SSM_CONV prefill runner |
-| `xdna-fa-prefill.h/.cpp` | flash-attention prefill runner |
 | `kernels/*.py` | IRON/MLIR-AIE designs: the array configuration, the fifos and the runtime sequence |
 | `kernels/*.cc` | the device C++ those designs compile in |
 
