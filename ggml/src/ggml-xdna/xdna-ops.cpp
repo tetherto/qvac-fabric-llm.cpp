@@ -4,9 +4,7 @@
 #include "ggml-quants.h"
 #include "xdna-attn-mm.h"
 #include "xdna-conv-prefill.h"
-#include "xdna-fa-prefill.h"
 #include "xdna-gdn-mm.h"
-#include "xdna-gdn-prefill.h"
 #include "xdna-gemv.h"
 #include "xdna-pgemm.h"
 #include "xdna-prof.h"
@@ -1297,17 +1295,15 @@ bool xdna_ops_supported(const xdna_ops * ops, const struct ggml_tensor * op) {
         case GGML_OP_MUL_MAT:
             return gemm_supported(ops, op);
         case GGML_OP_GATED_DELTA_NET:
-            // Prefill recurrent body offloaded to the GDN prefill kernel
-            // (kernels/gdn_prefill.py) when the artifact is present.
-            return xdna_gdn_mm_supported(op) || xdna_gdn_prefill_supported(op);
+            // The prefill gated delta rule on the whole array (kernels/gdn_mm.py).
+            return xdna_gdn_mm_supported(op);
         case GGML_OP_SSM_CONV:
             // Depthwise conv1d offloaded to the conv kernel when present.
             return xdna_conv_prefill_supported(op);
         case GGML_OP_FLASH_ATTN_EXT:
-            // The six full-attention prefill layers: on the mmul
-            // (kernels/attn_mm.py), or the older vector kernel (kernels/fa.py)
-            // when that is asked for.
-            return xdna_attn_mm_supported(op) || xdna_fa_prefill_supported(op);
+            // The six full-attention prefill layers, on the mmul
+            // (kernels/attn_mm.py).
+            return xdna_attn_mm_supported(op);
         default:
             return false;
     }
@@ -1345,10 +1341,7 @@ bool xdna_ops_compute(xdna_ops * ops, struct ggml_tensor * node) {
             }
             {
                 xdna_prof::section_timer st("prefill: gated delta net");
-                if (xdna_gdn_mm_supported(node)) {
-                    return xdna_gdn_mm_run(ops->pool, node);
-                }
-                return xdna_gdn_prefill_run(ops->pool->device, node);
+                return xdna_gdn_mm_run(ops->pool, node);
             }
         case GGML_OP_SSM_CONV:
             if (!xdna_ops_finalize(ops)) {
@@ -1364,10 +1357,7 @@ bool xdna_ops_compute(xdna_ops * ops, struct ggml_tensor * node) {
             }
             {
                 xdna_prof::section_timer st("prefill: flash attention");
-                if (xdna_attn_mm_supported(node)) {
-                    return xdna_attn_mm_run(ops->pool, node);
-                }
-                return xdna_fa_prefill_run(ops->pool->device, node);
+                return xdna_attn_mm_run(ops->pool, node);
             }
         default:
             GGML_LOG_ERROR("%s: unsupported op %d in XDNA graph\n", "xdna-ops", (int) node->op);
