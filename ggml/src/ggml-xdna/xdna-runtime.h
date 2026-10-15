@@ -169,7 +169,7 @@ bool xdna_run_wait(xrt::run & run);
 // one. Outside a batch xdna_run_submit is xdna_run_restart.
 // k < 0 is token mode: the runs' streams are joined into one command, sent
 // at the wait or before any run started otherwise (the token's first run
-// starts on its own, GGML_XDNA_BATCH_LEAD). A run joins only with its buffers
+// starts on its own). A run joins only with its buffers
 // given, and the join renames each buffer to the root BO it is a view of -
 // the decode's arena (xdna_arena_scope) is what keeps those few.
 void xdna_batch_begin(int k);
