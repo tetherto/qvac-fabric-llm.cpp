@@ -145,7 +145,7 @@ lifetime, keyed by the tensor's data pointer and shape.
 
 #### 4-bit decode weights (on by default)
 
-One step is lossy, and it is on by default by design. For the single-token
+Two steps are lossy, and both are on by default by design. The first: for the single-token
 decode, every `Q5_K` or `Q6_K` weight named `attn_qkv` or `attn_v` is
 re-quantized to `Q4_K` from its dequantized values when it is packed, and the
 decode GEMV streams it at 4 bits (q4g32) instead of the exact 8-bit form. That
@@ -395,7 +395,15 @@ Diagnostics - nothing is measured unless they are set:
 | `xdna-quant.h/.cpp` | NPU weight formats (q4g32 / q8g16) and the ggml repack |
 | `xdna-rec.h/.cpp` | the fused recurrent layer: session state, packing, core stream |
 | `xdna-rec-gemv.h/.cpp` | the fused layer's projections (ssm_out, FFN) on the decode GEMV |
-| `xdna-conv-prefill.h/.cpp` | SSM_CONV prefill runner |
+| `xdna-att-layer.h/.cpp` | a full-attention decode layer as one dispatch of the fused design |
+| `xdna-att.h/.cpp` | the decode attention on the fused design's GEMV pool |
+| `xdna-head.h/.cpp` | the decode's vocabulary projection on the pool, with its exact and 4-bit rows |
+| `xdna-pgemm.h/.cpp` | the prefill GEMM in the decode GEMV's weight tiles, and what it folds in (norm, SwiGLU, gate into A) |
+| `xdna-attn-mm.h/.cpp` | the prefill attention on the array |
+| `xdna-gdn-mm.h/.cpp` | the prefill gated delta rule on the array, and the GDN input it is fed |
+| `xdna-conv-prefill.h/.cpp` | SSM_CONV prefill runner (opt-in) |
+| `xdna-norm.h` | the host RMS_NORM, rounded as ggml's CPU op rounds it |
+| `xdna-prof.h` | the profiler behind `GGML_XDNA_PROF` |
 | `kernels/*.py` | IRON/MLIR-AIE designs: the array configuration, the fifos and the runtime sequence |
 | `kernels/*.cc` | the device C++ those designs compile in |
 
