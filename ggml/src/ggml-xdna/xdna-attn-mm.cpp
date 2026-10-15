@@ -316,11 +316,7 @@ bool xdna_attn_mm_supported(const ggml_tensor * node) {
     // Everything else runs here: the prefill belongs on the array. Below ~1M
     // (token, key) pairs the host would be quicker (it takes ~11 ns a pair,
     // the array ~3 plus a few ms a call - the layouts and the stream), which
-    // is the call's own cost to bring down; GGML_XDNA_FA_MM_MIN measures it.
-    static const int64_t min_pairs = xdna_env_int("GGML_XDNA_FA_MM_MIN", 0);
-    if (n_tokens * (n_kv - n_tokens / 2) < min_pairs) {
-        return false;
-    }
+    // is the call's own cost to bring down.
     float params[3] = { 0.0f, 0.0f, 0.0f };
     std::memcpy(params, node->op_params, sizeof(params));
     if (params[0] != SCALE || params[1] != 0.0f || params[2] != 0.0f) {

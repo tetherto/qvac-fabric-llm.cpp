@@ -688,15 +688,10 @@ static xdna_buffer * xdna_res_alloc(xdna_device * dev) {
     return xdna_buffer_alloc(dev, XDNA_RES_BYTES);
 }
 
-// GGML_XDNA_BATCH=k sends queued runs to the device k to a runlist rather
-// than one command each (xdna_batch_begin). The SoC's power follows the
-// command rate, not the bytes: synthetic loads on the array measured 16 W
-// package at 89 commands/s streaming 48 GB/s and 20 W at 1000 commands/s
-// moving 1 GB/s, and the decode's 25 a token (1275/s) holds 23.5 W. At 1k,
-// whole-token lists (k=32) are 18.3 W at 46.9 tok/s against 23.5 W at 50.8 -
-// 0.390 J a token against 0.463, 16% less - but a command inside a list
-// costs ~65 us more than one queued alone, so it is off by default until
-// the token is one command of its own. 0 or 1: a command each.
+// How queued runs go to the device (xdna_batch_begin). The SoC's power
+// follows the command rate, not the bytes: synthetic loads on the array
+// measured 16 W package at 89 commands/s streaming 48 GB/s and 20 W at 1000
+// commands/s moving 1 GB/s, and the decode's 25 a token (1275/s) holds 23.5 W.
 static int xdna_batch_k(void) {
     // GGML_XDNA_TOKEN (1, the default): the token's queued runs as one joined
     // command, the first on its own (xdna_run_submit's token mode); t > 1: at
@@ -705,11 +700,8 @@ static int xdna_batch_k(void) {
     // size from 3 runs a command up loses the same ~6%: with more than one
     // layer in a command a layer boundary costs ~65 us that separate commands
     // do not pay (one layer a command through the same join is full speed).
-    if (const int t = xdna_env_int("GGML_XDNA_TOKEN", 1)) {
-        return t == 1 ? -1 : -t;
-    }
-    static const int v = xdna_env_int("GGML_XDNA_BATCH", 0);
-    return v > 1 ? v : 0;
+    static const int t = xdna_env_int("GGML_XDNA_TOKEN", 1);
+    return t == 0 ? 0 : t == 1 ? -1 : -t;
 }
 
 static void xdna_batch_open(void) {
@@ -938,24 +930,13 @@ struct xdna_rec_plan {
     int           i_cap_ss   = -1;  // GET_ROWS cache_s seed node
     int           i_cap_hres = -1;  // residual producer node
     // The in-projection's input (attn_norm-N): with the projection in the
-    // fused stream (xdna_rec_inproj_on), this is what the fire reads in place
-    // of qkv and z, and the two MUL_MATs never run.
+    // fused stream, this is what the fire reads in place of qkv and z, and the
+    // two MUL_MATs never run.
     ggml_tensor * n_act      = nullptr;
     int           i_cap_act  = -1;
 };
 
 }  // namespace
-
-// The recurrent layer's in-projection (attn_qkv + attn_gate) runs at the head
-// of the fused dispatch and drains qkv and z straight into the core's inputs.
-// GGML_XDNA_INPROJ=0 keeps it a GEMV dispatch of its own, whose outputs the
-// host then copies into the core's buffers.
-static bool xdna_rec_inproj_on(void) {
-    static const bool v = [] {
-        return xdna_env_int("GGML_XDNA_INPROJ", 1) != 0;
-    }();
-    return v;
-}
 
 // Fused recurrent-layer path is the DEFAULT NPU decode mode. GGML_XDNA_FUSED_LAYER=0
 // restores the per-op decode path. Requires the fused xclbin to exist
@@ -1857,7 +1838,7 @@ static bool xdna_rec_scan(ggml_backend_xdna_context *  ctx,
         // Both projections read the same normed row; it is the fire's input
         // when they are in its stream.
         p.n_act           = p.n_qkv->src[1];
-        const bool inproj = xdna_rec_inproj_on() && p.n_act && p.n_z->src[1] == p.n_act &&
+        const bool inproj = p.n_act && p.n_z->src[1] == p.n_act &&
                             p.n_act->type == GGML_TYPE_F32 && p.n_act->ne[0] == p.n_qkv->src[0]->ne[0] &&
                             ggml_nelements(p.n_act) == p.n_act->ne[0];
         if (!inproj) {
@@ -2358,7 +2339,7 @@ static bool xdna_rec_run(ggml_backend_xdna_context *               ctx,
                     GGML_LOG_ERROR(
                         "%s: fused layer %d: the in-projection (%s, %s) "
                         "does not split into the core's inputs; "
-                        "GGML_XDNA_INPROJ=0 runs it on its own\n",
+                        "GGML_XDNA_FUSED_LAYER=0 runs the layer per op\n",
                         "ggml-xdna", p.il, ggml_type_name(p.n_qkv->src[0]->type), ggml_type_name(p.n_z->src[0]->type));
                     return false;
                 }
@@ -4177,29 +4158,6 @@ static enum ggml_status xdna_graph_compute_impl(ggml_backend_xdna_context * ctx,
             }
             xdna_pending_wait(ctx);
             if (xdna_att_try(ctx, node)) {
-                if (getenv("GGML_XDNA_ATTN_CHECK")) {
-                    // Diagnostic: the host's flash attention on the same node,
-                    // against the pool's; the host's result is kept unless
-                    // GGML_XDNA_ATTN_CHECK=npu.
-                    std::vector<float> npu((const float *) node->data, (const float *) node->data + 2048);
-                    xdna_glue_host_run(&ctx->ops, node);
-                    double e2 = 0, r2 = 0, mx = 0;
-                    for (int q = 0; q < 2048; q++) {
-                        const double d = npu[q] - ((const float *) node->data)[q];
-                        e2 += d * d;
-                        r2 += (double) ((const float *) node->data)[q] * (double) ((const float *) node->data)[q];
-                        mx = std::max(mx, fabs(d));
-                    }
-                    static int shown      = 0;
-                    const int  shown_prev = shown++;
-                    if (shown_prev < 40 || (shown % 200) == 0) {
-                        fprintf(stderr, "[attcheck] %s nkv=%lld rel=%.3e max=%.3e\n", node->name,
-                                (long long) node->src[1]->ne[1], sqrt(e2 / std::max(r2, 1e-30)), mx);
-                    }
-                    if (strcmp(getenv("GGML_XDNA_ATTN_CHECK"), "npu") == 0) {
-                        memcpy(node->data, npu.data(), 2048 * sizeof(float));
-                    }
-                }
                 continue;
             }
         }
