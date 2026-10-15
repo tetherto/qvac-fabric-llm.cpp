@@ -523,6 +523,13 @@ bool xdna_buffer_sync_from_device_range(xdna_buffer * buf, size_t bytes, size_t 
 // that is what the pattern is for: mark the range before the dispatch, read
 // until the mark is gone.
 
+// Reading back what the device wrote: up to XDNA_SETTLE_PASSES checks for the
+// mark, XDNA_SETTLE_PAUSE pause instructions apart, and XDNA_SETTLE_US of spin
+// before the first plain read.
+constexpr int XDNA_SETTLE_PASSES = 2000;
+constexpr int XDNA_SETTLE_PAUSE  = 400;
+constexpr int XDNA_SETTLE_US     = 20;
+
 // Only whole words can carry the pattern.
 static size_t xdna_markable(size_t bytes) {
     return bytes & ~(size_t) (sizeof(uint32_t) - 1);
@@ -591,8 +598,8 @@ uint8_t * xdna_buffer_wait_written(xdna_buffer * buf, size_t bytes, size_t offse
         return nullptr;
     }
     uint8_t * base = (uint8_t *) buf->data + offset;
-    static const int passes      = xdna_env_int("GGML_XDNA_SETTLE_PASSES", 2000);
-    static const int pause_loops = xdna_env_int("GGML_XDNA_SETTLE_PAUSE", 400);
+    constexpr int passes      = XDNA_SETTLE_PASSES;
+    constexpr int pause_loops = XDNA_SETTLE_PAUSE;
     for (int pass = 0;; pass++) {
         if (xdna_poison_left(base, bytes) == 0) {
             return base;
@@ -627,8 +634,8 @@ bool xdna_buffer_download(xdna_buffer * buf, void * dst, size_t bytes, size_t of
     // Bounded by the drain, not by a guess: the pattern is the evidence, and it
     // disappears exactly when the device's write lands. A pass is a pause, not
     // a timer sleep - sleep_for(2us) costs a tick and measures about 80us.
-    static const int passes      = xdna_env_int("GGML_XDNA_SETTLE_PASSES", 2000);
-    static const int pause_loops = xdna_env_int("GGML_XDNA_SETTLE_PAUSE", 400);
+    constexpr int passes      = XDNA_SETTLE_PASSES;
+    constexpr int pause_loops = XDNA_SETTLE_PAUSE;
     for (int pass = 0;; pass++) {
         std::memcpy(dst, base, bytes);
         if (xdna_poison_left(dst, bytes) == 0) {
@@ -670,7 +677,7 @@ bool xdna_buffer_read_settled(xdna_buffer * buf, void * dst, size_t bytes, size_
         while (std::chrono::steady_clock::now() < until) {
         }
     };
-    static const int settle_us = xdna_env_int("GGML_XDNA_SETTLE_US", 20);
+    constexpr int settle_us = XDNA_SETTLE_US;
     if (!xdna_buffer_sync_from_device(buf)) {
         return false;
     }
