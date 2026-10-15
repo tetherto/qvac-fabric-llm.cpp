@@ -26,6 +26,7 @@
 
 #include <algorithm>
 #include <climits>
+#include <cmath>
 #include <sys/resource.h>
 #include <cstdio>
 #include <cstdlib>
@@ -3347,7 +3348,7 @@ static enum ggml_status xdna_graph_compute_impl(ggml_backend_xdna_context * ctx,
     struct gdn_in_plan {
         struct ggml_tensor * gdn = nullptr;
         xdna_gdn_conv_in     in;
-        struct ggml_tensor * skip[5] = {};
+        struct ggml_tensor * skip[7] = {};
         // on the array: the in-projection, run into the conv's buffer at its
         // own place in the graph (qkv_ok once it did)
         struct ggml_tensor * qkv     = nullptr;
@@ -3384,18 +3385,61 @@ static enum ggml_status xdna_graph_compute_impl(ggml_backend_xdna_context * ctx,
         auto f32 = [](const struct ggml_tensor * t) {
             return t && t->type == GGML_TYPE_F32;
         };
+        // The L2 norm of Q or K as llama builds it: one L2_NORM, or the
+        // RMS_NORM(x, eps / n) * 1 / sqrt(n) that is x / sqrt(sum x^2 + eps)
+        // (models.h, build_gdn_l2_norm). The array takes x / max(|x|, eps'),
+        // so the second form goes as eps' = sqrt(eps): the same value but
+        // where |x| is within a few eps of zero. `norm` is the node whose
+        // source is x, `out` the one the GDN reads.
+        struct l2_of {
+            struct ggml_tensor * out  = nullptr;
+            struct ggml_tensor * norm = nullptr;
+            float                eps  = 0.0f;
+        };
+        auto l2_norm_of = [&](struct ggml_tensor * t, l2_of & r) {
+            if (!t) {
+                return false;
+            }
+            if (t->op == GGML_OP_L2_NORM && t->src[0]) {
+                r.out = r.norm = t;
+                std::memcpy(&r.eps, t->op_params, sizeof(float));
+                return true;
+            }
+            struct ggml_tensor * rn = t->src[0];
+            if (t->op != GGML_OP_SCALE || !rn || rn->op != GGML_OP_RMS_NORM || !rn->src[0] || !f32(rn)) {
+                return false;
+            }
+            float sc = 0.0f, bias = 0.0f, eps = 0.0f;
+            std::memcpy(&sc, (const float *) t->op_params + 0, sizeof(float));
+            std::memcpy(&bias, (const float *) t->op_params + 1, sizeof(float));
+            std::memcpy(&eps, rn->op_params, sizeof(float));
+            const float n = (float) rn->ne[0];
+            if (bias != 0.0f || std::fabs(sc * std::sqrt(n) - 1.0f) > 1e-5f) {
+                return false;
+            }
+            for (struct ggml_tensor * u : real_readers(rn)) {
+                if (u != t) {
+                    return false;
+                }
+            }
+            r.out  = t;
+            r.norm = rn;
+            r.eps  = std::sqrt(eps * n);
+            return true;
+        };
         for (int i = 0; i < cgraph->n_nodes; i++) {
             struct ggml_tensor * gd = cgraph->nodes[i];
             if (gd->op != GGML_OP_GATED_DELTA_NET || !xdna_gdn_mm_supported(gd)) {
                 continue;
             }
-            struct ggml_tensor *l2q = gd->src[0], *l2k = gd->src[1], *vv = gd->src[2];
-            if (l2q->op != GGML_OP_L2_NORM || l2k->op != GGML_OP_L2_NORM || !vv->view_src || !l2q->src[0] ||
-                !l2k->src[0]) {
+            l2_of                q2, k2;
+            struct ggml_tensor * vv = gd->src[2];
+            if (!l2_norm_of(gd->src[0], q2) || !l2_norm_of(gd->src[1], k2) || !vv->view_src) {
                 continue;
             }
+            struct ggml_tensor *l2q = q2.out, *l2k = k2.out;
             struct ggml_tensor * silu = vv->view_src;
-            if (l2q->src[0]->view_src != silu || l2k->src[0]->view_src != silu || silu->op != GGML_OP_UNARY ||
+            if (q2.norm->src[0]->view_src != silu || k2.norm->src[0]->view_src != silu || silu->op != GGML_OP_UNARY ||
                 ggml_get_unary_op(silu) != GGML_UNARY_OP_SILU || !f32(silu) || !ggml_is_contiguous(silu)) {
                 continue;
             }
@@ -3428,7 +3472,7 @@ static enum ggml_status xdna_graph_compute_impl(ggml_backend_xdna_context * ctx,
                 ok = ok && r == silu;
             }
             for (struct ggml_tensor * r : real_readers(silu)) {
-                ok = ok && (r == l2q || r == l2k || r == gd);
+                ok = ok && (r == q2.norm || r == k2.norm || r == gd);
             }
             for (struct ggml_tensor * r : real_readers(l2q)) {
                 ok = ok && r == gd;
@@ -3445,18 +3489,22 @@ static enum ggml_status xdna_graph_compute_impl(ggml_backend_xdna_context * ctx,
             p.in.state     = cat->src[0];
             p.in.w         = w;
             p.in.state_out = cpy;
-            std::memcpy(&p.in.eps_q, l2q->op_params, sizeof(float));
-            std::memcpy(&p.in.eps_k, l2k->op_params, sizeof(float));
-            p.in.q_off = (long long) (l2q->src[0]->view_offs / sizeof(float));
-            p.in.k_off = (long long) (l2k->src[0]->view_offs / sizeof(float));
+            p.in.eps_q     = q2.eps;
+            p.in.eps_k     = k2.eps;
+            p.in.q_off = (long long) (q2.norm->src[0]->view_offs / sizeof(float));
+            p.in.k_off = (long long) (k2.norm->src[0]->view_offs / sizeof(float));
             p.in.v_off = (long long) (vv->view_offs / sizeof(float));
             p.skip[0]  = conv;
             p.skip[1]  = silu;
             p.skip[2]  = l2q;
             p.skip[3]  = l2k;
             p.skip[4]  = cpy;
+            p.skip[5]  = q2.norm != l2q ? q2.norm : nullptr;
+            p.skip[6]  = k2.norm != l2k ? k2.norm : nullptr;
             for (struct ggml_tensor * t : p.skip) {
-                consumed.insert(t);
+                if (t) {
+                    consumed.insert(t);
+                }
             }
             // the projection read only through the concat can go straight
             // to the array's conv
