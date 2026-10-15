@@ -465,7 +465,28 @@ if (GGML_XDNA_BUILD_KERNELS)
     # backend silently falls back.
     add_dependencies(ggml-xdna ggml-xdna-kernels)
 
-    install(FILES ${XDNA_ARTIFACTS} DESTINATION ${CMAKE_INSTALL_BINDIR})
+    # Only what the backend opens is installed. The untagged builds of the
+    # tagged designs are the stamping step's input - the backend loads the
+    # tagged copies - and of the instruction streams only the opt-in conv
+    # prefill's is read: every other stream is built at runtime, and those
+    # .insts.bin stay in the build tree as references.
+    set(XDNA_INSTALL_ARTIFACTS)
+    foreach(A IN LISTS XDNA_ARTIFACTS)
+        get_filename_component(AN "${A}" NAME)
+        set(AKEEP TRUE)
+        if (AN MATCHES "\\.insts\\.bin$" AND NOT AN STREQUAL "${CONV_STEM}.insts.bin")
+            set(AKEEP FALSE)
+        endif()
+        foreach(TS IN LISTS XDNA_TAGGED_STEMS)
+            if (AN STREQUAL "${TS}.xclbin")
+                set(AKEEP FALSE)
+            endif()
+        endforeach()
+        if (AKEEP)
+            list(APPEND XDNA_INSTALL_ARTIFACTS "${A}")
+        endif()
+    endforeach()
+    install(FILES ${XDNA_INSTALL_ARTIFACTS} DESTINATION ${CMAKE_INSTALL_BINDIR})
 endif()
 
 # Host-only tests of what a device cannot check for itself: which weight
