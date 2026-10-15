@@ -15818,6 +15818,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // delta-net conv input: [conv_kernel - 1, channels] state concatenated with transposed [tokens, channels] x
+    for (int64_t channels : { 77, 10240 }) {
+        for (int64_t tokens : { 1, 7, 64, 2048 }) {
+            test_cases.emplace_back(new test_concat(GGML_TYPE_F32, {3, channels, 1, 1}, tokens, 0, 32));
+            test_cases.emplace_back(new test_concat(GGML_TYPE_I32, {3, channels, 1, 1}, tokens, 0, 32));
+        }
+    }
+
     for (ggml_type type_a : { GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1, GGML_TYPE_Q8_0 }) {
         for (int v : { 0, 4, 8, 12 }) {
             for (int dim : { 0, 1, 2, 3, }) {
