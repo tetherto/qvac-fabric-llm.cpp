@@ -103,6 +103,31 @@ The `.insts.bin` files are reference copies. The runtime builds its own TXN
 instruction streams in C++ (`xdna-seq.cpp`, `xdna-seq-attn.cpp`,
 `xdna-gemv.cpp`), which is what lets one artifact serve every shape.
 
+### Provenance and licences
+
+Most of this backend is original work under the repository's MIT licence. Two
+parts are worth stating plainly.
+
+The host-side instruction-stream builders (`xdna-seq.cpp`, `xdna-seq-attn.cpp`,
+`xdna-gemv.cpp` and the stream code in `xdna-pgemm.cpp`) are this backend's own
+implementation of the NPU2 TXN format. They were written from the BD field
+semantics documented in mlir-aie (`AIEDmaToNpu.cpp`,
+`include/aie/Runtime/TxnEncoding.h`) and from instruction streams read back out
+of artifacts this design built (`.insts.bin`); no mlir-aie or IRON source was
+copied or translated into them. The one sentence quoted from mlir-aie, in
+`xdna-seq.cpp`, is attributed where it appears.
+
+`kernels/gemm.py` is the exception: its array and ObjectFifo plumbing is
+adapted from mlir-aie's `programming_examples` matrix-multiplication designs,
+which are `Copyright (C) 2024-2026 Advanced Micro Devices, Inc.` under
+`Apache-2.0 WITH LLVM-exception`. The file carries that notice and the licence
+texts ship beside it in `LICENSES/`. The other designs under `kernels/` use the
+published IRON API only.
+
+[`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md) lists what is derived from
+what, and says why the compiled `.xclbin` / `.insts.bin` need nothing added
+(the LLVM exception covers compiled output).
+
 ### The array
 
 Eight AIE columns, four compute rows each. The GEMV designs stream every

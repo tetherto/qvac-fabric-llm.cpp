@@ -1,6 +1,19 @@
 #!/usr/bin/env python3
 # gemm.py -*- Python -*-
 #
+# Copyright (C) 2024-2026 Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+#
+# Adapted from mlir-aie's whole-array/cascade matrix-multiplication designs
+# (programming_examples/basic and .../ml/block_datatypes): the array and
+# ObjectFifo plumbing is theirs. Modified for the ggml-xdna backend of
+# qvac-fabric-llm.cpp (2026): the kernel, the tile layouts, the RTP counts and
+# the runtime sequence are this project's, and the design is trimmed to bf16
+# inputs on the npu2 device. The file is distributed under the same
+# Apache-2.0 WITH LLVM-exception as the examples - the stricter of the two
+# licences, which covers both parts. The sources, the licence texts
+# (../LICENSES/) and the notice are listed in ../THIRD_PARTY_NOTICES.md.
+#
 # Minimal IRON design for the ggml-xdna GEMM kernel (C = A @ B, bf16 -> f32).
 #
 # Compile-only mode (builds .xclbin + .insts.bin artifacts):
