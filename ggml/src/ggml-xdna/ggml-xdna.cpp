@@ -3504,6 +3504,14 @@ static enum ggml_status xdna_graph_compute_impl(ggml_backend_xdna_context * ctx,
             }
             gdn_in[cat] = p;
         }
+        // A concat this plan feeds the array from is not the concat-tail
+        // plan's as well: that one would run the conv at the concat and never
+        // reach the GDN input, while the conv, the norms and the state copy
+        // stay skipped here (GGML_XDNA_CONV=1, which offers the conv to the
+        // array, made the prefill garbage).
+        for (const auto & kv : gdn_in) {
+            concat_tail.erase(kv.first);
+        }
     }
 
     // Two small projections of one activation (a recurrent layer's alpha and
