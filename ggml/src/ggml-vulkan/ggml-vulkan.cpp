@@ -4543,6 +4543,9 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_f32,           "ssm_conv_f32",           ssm_conv_f32_len, ssm_conv_f32_data, "main", 4, sizeof(vk_op_ssm_conv_push_constants), {32, 16, 1}, {32, 16, 0, 0}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_silu_f32,      "ssm_conv_silu_f32",      ssm_conv_f32_len, ssm_conv_f32_data, "main", 4, sizeof(vk_op_ssm_conv_push_constants), {32, 16, 1}, {32, 16, 0, 1}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_bias_silu_f32, "ssm_conv_bias_silu_f32", ssm_conv_f32_len, ssm_conv_f32_data, "main", 4, sizeof(vk_op_ssm_conv_push_constants), {32, 16, 1}, {32, 16, 1, 1}, 1);
+    // direct conv: 64 channels x 4 token groups of 8 tokens per workgroup; tail: 256 (channel, column) pairs
+    ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_direct_silu_f32, "ssm_conv_direct_silu_f32", ssm_conv_f32_len, ssm_conv_f32_data, "main", 4, sizeof(vk_op_ssm_conv_push_constants), {64, 32, 1}, {64, 4, 0, 1, 1, 8}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_tail_f32,        "ssm_conv_tail_f32",        ssm_conv_f32_len, ssm_conv_f32_data, "main", 4, sizeof(vk_op_ssm_conv_push_constants), {256, 1, 1}, {256, 1, 0, 0, 2, 1}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_back_sx_f32, "ssm_conv_back_sx_f32", ssm_conv_back_sx_f32_len, ssm_conv_back_sx_f32_data, "main", 3, sizeof(vk_op_ssm_conv_back_sx_push_constants), {32, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_back_c_f32, "ssm_conv_back_c_f32", ssm_conv_back_c_f32_len, ssm_conv_back_c_f32_data, "main", 3, sizeof(vk_op_ssm_conv_back_c_push_constants), {32, 1, 1}, {}, 1);
 
@@ -12592,7 +12595,65 @@ void ggml_vk_ssm_scan(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_te
         pc, elements);
 }
 
+// direct conv + SiLU (see ggml_vk_ssm_conv_direct_check): x [C, T, S] and the state [3, C, S] in place of the concat
+static void ggml_vk_ssm_conv_direct(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_backend_vk_context::ssm_conv_direct_match & m) {
+    const uint32_t C = (uint32_t) m.kern->ne[1];
+    const uint32_t T = (uint32_t) m.out->ne[1];
+    const uint32_t S = (uint32_t) m.out->ne[2];
+
+    vk_pipeline pipeline = ctx->device->pipeline_ssm_conv_direct_silu_f32;
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+
+    const vk_op_ssm_conv_push_constants pc = {
+        (uint32_t) (C * sizeof(float)), (uint32_t) ((size_t) C * T * sizeof(float)),
+        (uint32_t) m.kern->nb[1],
+        (uint32_t) m.out->nb[0], (uint32_t) m.out->nb[1], (uint32_t) m.out->nb[2],
+        (uint32_t) m.kern->ne[0],
+        (uint32_t) m.state->ne[0],
+        C, T, S,
+    };
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+        { ggml_vk_tensor_subbuffer(ctx, m.x), ggml_vk_tensor_subbuffer(ctx, m.kern),
+          ggml_vk_tensor_subbuffer(ctx, m.state), ggml_vk_tensor_subbuffer(ctx, m.out) },
+        pc, { C, T, S });
+}
+
+// the concat columns [tail_from, T + 3) that the conv-state copies read; the conv itself runs direct
+static void ggml_vk_concat_tail(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_backend_vk_context::ssm_conv_direct_match & m) {
+    const ggml_tensor * cc = m.concat;
+    const uint32_t C = (uint32_t) cc->ne[1];
+    const uint32_t T = (uint32_t) cc->ne[0] - 3;
+    const uint32_t S = (uint32_t) cc->ne[2];
+    const uint32_t ncols = (uint32_t) (cc->ne[0] - m.tail_from);
+    if (ncols == 0) {
+        return;
+    }
+
+    vk_pipeline pipeline = ctx->device->pipeline_ssm_conv_tail_f32;
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+
+    const vk_op_ssm_conv_push_constants pc = {
+        (uint32_t) (C * sizeof(float)), (uint32_t) ((size_t) C * T * sizeof(float)),
+        0,
+        (uint32_t) cc->nb[0], (uint32_t) cc->nb[1], (uint32_t) cc->nb[2],
+        (uint32_t) m.tail_from,
+        3,
+        C, T, S,
+    };
+    // binding 1 is unused in this mode
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+        { ggml_vk_tensor_subbuffer(ctx, m.x), ggml_vk_tensor_subbuffer(ctx, m.state),
+          ggml_vk_tensor_subbuffer(ctx, m.state), ggml_vk_tensor_subbuffer(ctx, cc) },
+        pc, { ncols * C, S, 1 });
+}
+
+
 void ggml_vk_ssm_conv(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx) {
+    if (ctx->fused_ssm_conv_direct >= 0) {
+        GGML_ASSERT(ctx->num_additional_fused_ops == 1);
+        ggml_vk_ssm_conv_direct(ctx, subctx, ctx->ssm_conv_direct_matches[ctx->fused_ssm_conv_direct]);
+        return;
+    }
     ggml_tensor * conv = cgraph->nodes[node_idx];
     const ggml_tensor * src0 = conv->src[0];
     const ggml_tensor * src1 = conv->src[1];
@@ -14792,6 +14853,12 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
                 }
             }
         }
+        // tensors a fused kernel reads that are not srcs of its nodes (the direct conv reads x and the state)
+        for (const ggml_tensor * extra : ctx->fused_extra_srcs) {
+            if (extra && !need_sync && overlaps_unsynced(extra, ctx->unsynced_nodes_written)) {
+                need_sync = true;
+            }
+        }
 
         if (need_sync) {
             if (vk_enable_sync_logger) {
@@ -14819,6 +14886,11 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
                     continue;
                 }
                 ctx->unsynced_nodes_read.push_back(get_buffer_range(cur_node->src[j]));
+            }
+        }
+        for (const ggml_tensor * extra : ctx->fused_extra_srcs) {
+            if (extra) {
+                ctx->unsynced_nodes_read.push_back(get_buffer_range(extra));
             }
         }
     }
@@ -14907,6 +14979,10 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
 
         break;
     case GGML_OP_CONCAT:
+        if (ctx->fused_concat_tail >= 0) {
+            ggml_vk_concat_tail(ctx, compute_ctx, ctx->ssm_conv_direct_matches[ctx->fused_concat_tail]);
+            break;
+        }
         ggml_vk_concat(ctx, compute_ctx, src0, src1, node);
 
         break;
@@ -16776,6 +16852,221 @@ static bool ggml_vk_can_fuse_fwht_signed(ggml_backend_vk_context * ctx, const st
         signs->ne[0] == x->ne[0] && signs->ne[0] % n == 0;
 }
 
+// Direct GDN conv: CONCAT(state [3, C, S], transpose(x [C, T, S]), dim 0) -> SSM_CONV(width 4) -> SILU.
+// The concat transposes x into an [T+3, C, S] tensor (84 MB at T = 2048 for Flash-Next) that the conv reads once.
+// Instead the conv reads x in its channel-contiguous layout and the state directly, and the concat node writes
+// only the tail columns that its other readers (the recurrent conv-state copies, which read the last 3 columns
+// once per rollback slot) need. The graph is unchanged: other backends and the GGML_VK_SSMCONV_DIRECT=0 arm run
+// the same nodes. The decision is made at the concat and consumed at its SSM_CONV, so both see one answer.
+static bool ggml_vk_ssm_conv_direct_enabled() {
+    static const bool enabled = [] {
+        const char * e = getenv("GGML_VK_SSMCONV_DIRECT");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    return enabled;
+}
+
+// decode and short verify ubatches keep the concat: nothing to save there, and the reader scan stays off that path
+static constexpr int64_t ssm_conv_direct_min_tokens = 8;
+
+static bool ggml_vk_ssm_conv_direct_reject(const char * why, int node) {
+    static const bool dbg = getenv("GGML_VK_FUSION_DEBUG") != nullptr;
+    if (dbg) {
+        fprintf(stderr, "ggml_vulkan: direct ssm conv not matched at node %d: %s\n", node, why);
+    }
+    return false;
+}
+
+static bool ggml_vk_node_reads(const ggml_tensor * t, const ggml_tensor * root) {
+    for (int s = 0; s < GGML_MAX_SRC; ++s) {
+        if (t->src[s] && (t->src[s] == root || t->src[s]->view_src == root)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// a view of the concat covering H whole columns of every row: returns the first column, or -1
+static int64_t ggml_vk_conv_tail_view_col(const ggml_tensor * t, const ggml_tensor * cc, int64_t H) {
+    if (t->op != GGML_OP_VIEW || t->view_src != cc || t->type != GGML_TYPE_F32 ||
+        t->ne[0] != H || t->ne[1] != cc->ne[1] || t->ne[2] != cc->ne[2] || t->ne[3] != 1 ||
+        t->nb[1] != cc->nb[1] || t->nb[2] != cc->nb[2] || t->view_offs % sizeof(float) != 0) {
+        return -1;
+    }
+    const int64_t col = (int64_t) (t->view_offs / sizeof(float));
+    return (col >= 0 && col + H <= cc->ne[0]) ? col : -1;
+}
+
+// the conv-state copies: a tail view, a CONT of one, or a CPY of either
+static bool ggml_vk_conv_tail_reader(const ggml_tensor * t, const ggml_tensor * cc, int64_t H, int64_t & tail_from) {
+    const ggml_tensor * v = nullptr;
+    if (t->op == GGML_OP_VIEW) {
+        v = t;
+    } else if (t->op == GGML_OP_CONT || t->op == GGML_OP_CPY) {
+        v = t->src[0];
+        if (v && t->op == GGML_OP_CPY && v->op == GGML_OP_CONT) {
+            v = v->src[0];
+        }
+    }
+    const int64_t col = v ? ggml_vk_conv_tail_view_col(v, cc, H) : -1;
+    if (col < 0) {
+        return false;
+    }
+    tail_from = std::min(tail_from, col);
+    return true;
+}
+
+// the whole concat, directly or through a view/reshape covering all of it
+static bool ggml_vk_conv_whole(const ggml_tensor * s, const ggml_tensor * cc) {
+    return s == cc || (s && s->view_src == cc && s->view_offs == 0 && ggml_nelements(s) == ggml_nelements(cc) && ggml_is_contiguous(s));
+}
+
+// Structural match at a CONCAT node. With runtime = true it also checks the allocated addresses: the SiLU output
+// must not overlap anything the direct conv reads, and nothing between the concat and the SiLU may write x or
+// the state (graph_optimize asks the allocator to keep both alive, this is the check that it did).
+static bool ggml_vk_ssm_conv_direct_check(const ggml_backend_vk_context * ctx, const ggml_cgraph * cgraph, int i,
+                                          ggml_backend_vk_context::ssm_conv_direct_match & m, bool runtime) {
+    const ggml_tensor * cc = cgraph->nodes[i];
+    if (cc->op != GGML_OP_CONCAT || cc->type != GGML_TYPE_F32 || ggml_get_op_params_i32(cc, 0) != 0 ||
+        (cc->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+        return false;
+    }
+    const ggml_tensor * st = cc->src[0];
+    const ggml_tensor * tr = cc->src[1];
+    if (!st || !tr || st->type != GGML_TYPE_F32 || tr->type != GGML_TYPE_F32 || tr->op != GGML_OP_TRANSPOSE ||
+        !tr->view_src || tr->view_offs != 0) {
+        return ggml_vk_ssm_conv_direct_reject("concat srcs are not (state, transpose(x))", i);
+    }
+    const int64_t T = tr->ne[0];
+    const int64_t C = tr->ne[1];
+    const int64_t S = tr->ne[2];
+    const ggml_tensor * x = tr->view_src;
+    // x^T must be a plain transpose of the whole contiguous x: token stride C, channel stride 1, sequence stride C*T
+    if (x->type != GGML_TYPE_F32 || !ggml_is_contiguous(x) || ggml_nelements(x) != C * T * S || tr->ne[3] != 1 ||
+        tr->nb[0] != (size_t) C * sizeof(float) || tr->nb[1] != sizeof(float) || tr->nb[2] != (size_t) C * T * sizeof(float)) {
+        return ggml_vk_ssm_conv_direct_reject("x layout", i);
+    }
+    // Short ubatches keep the plain concat + conv, but only the runtime match skips them: graph_optimize
+    // registers the allocation dependencies for every token count, so the graph (node count included) and the
+    // allocation the scheduler reserved for the largest ubatch do not change with the ubatch size.
+    if (runtime && T < ssm_conv_direct_min_tokens) {
+        return false;
+    }
+    if (st->ne[0] != 3 || st->ne[1] != C || st->ne[2] != S || st->ne[3] != 1 || !ggml_is_contiguous(st)) {
+        return ggml_vk_ssm_conv_direct_reject("state layout", i);
+    }
+    if (cc->ne[0] != T + 3 || cc->ne[1] != C || cc->ne[2] != S || cc->ne[3] != 1 || !ggml_is_contiguous(cc)) {
+        return ggml_vk_ssm_conv_direct_reject("concat layout", i);
+    }
+
+    // one SSM_CONV reads the whole concat; everything else must read only tail columns
+    int64_t tail_from = T + 3;
+    int conv = -1;
+    for (int n = i + 1; n < cgraph->n_nodes; ++n) {
+        const ggml_tensor * t = cgraph->nodes[n];
+        if (!ggml_vk_node_reads(t, cc)) {
+            continue;
+        }
+        if (t->op == GGML_OP_SSM_CONV && ggml_vk_conv_whole(t->src[0], cc)) {
+            if (conv >= 0) {
+                return ggml_vk_ssm_conv_direct_reject("two convs read the concat", n);
+            }
+            conv = n;
+            continue;
+        }
+        if ((t->op == GGML_OP_RESHAPE || t->op == GGML_OP_VIEW) && ggml_vk_conv_whole(t, cc)) {
+            continue; // shape plumbing into the conv
+        }
+        if (!ggml_vk_conv_tail_reader(t, cc, 3, tail_from)) {
+            return ggml_vk_ssm_conv_direct_reject("the concat has a reader that is neither the conv nor a tail copy", n);
+        }
+    }
+    if (conv < 0 || conv + 1 >= cgraph->n_nodes) {
+        return ggml_vk_ssm_conv_direct_reject("no conv in this graph", i);
+    }
+    const ggml_tensor * cv = cgraph->nodes[conv];
+    const ggml_tensor * w  = cv->src[1];
+    if (cv->type != GGML_TYPE_F32 || !w || w->type != GGML_TYPE_F32 || w->ne[0] != 4 || w->ne[1] != C || !ggml_is_contiguous(w) ||
+        cv->ne[0] != C || cv->ne[1] != T || cv->ne[2] != S || cv->ne[3] != 1 || (cv->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+        return ggml_vk_ssm_conv_direct_reject("conv shape", conv);
+    }
+    // the conv output is never written, so the SiLU right after it must be its only reader
+    ggml_tensor * su = cgraph->nodes[conv + 1];
+    if (su->op != GGML_OP_UNARY || ggml_get_unary_op(su) != GGML_UNARY_OP_SILU || su->src[0] != cv || su->type != GGML_TYPE_F32 ||
+        !ggml_is_contiguous(su) || !ggml_are_same_shape(su, cv) || (cv->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 ||
+        (su->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+        return ggml_vk_ssm_conv_direct_reject("no SILU right after the conv", conv);
+    }
+    for (int n = conv + 2; n < cgraph->n_nodes; ++n) {
+        if (ggml_vk_node_reads(cgraph->nodes[n], cv)) {
+            return ggml_vk_ssm_conv_direct_reject("the conv output has another reader", n);
+        }
+    }
+
+    if (runtime) {
+        for (const ggml_tensor * t : { (const ggml_tensor *) x, st, w, (const ggml_tensor *) cc, (const ggml_tensor *) su }) {
+            if (!t->buffer || get_misalign_bytes(ctx, t) != 0) {
+                return ggml_vk_ssm_conv_direct_reject("unallocated or misaligned tensor", i);
+            }
+        }
+        for (const ggml_tensor * t : { (const ggml_tensor *) x, st, w, (const ggml_tensor *) cc }) {
+            if (ggml_vk_tensors_overlap(t, su, false)) {
+                return ggml_vk_ssm_conv_direct_reject("the SiLU output overlaps an input", conv + 1);
+            }
+        }
+        // x and the state are read at the conv, later than the concat that names them: nothing in between may
+        // overwrite them
+        for (int n = i + 1; n <= conv; ++n) {
+            const ggml_tensor * t = cgraph->nodes[n];
+            if (t->buffer == nullptr || t->op == GGML_OP_NONE || ggml_op_is_empty(t->op) || ggml_is_empty(t)) {
+                continue;
+            }
+            if (ggml_vk_tensors_overlap(t, x, false) || ggml_vk_tensors_overlap(t, st, false)) {
+                return ggml_vk_ssm_conv_direct_reject("x or the state is overwritten before the conv", n);
+            }
+        }
+    }
+
+    m.concat    = cc;
+    m.state     = st;
+    m.x         = x;
+    m.kern      = w;
+    m.out       = su;
+    m.conv_idx  = conv;
+    m.tail_from = std::max<int64_t>(0, tail_from);
+    return true;
+}
+
+static bool ggml_vk_ssm_conv_direct_at_concat(ggml_backend_vk_context * ctx, const ggml_cgraph * cgraph, int i) {
+    if (!ggml_vk_ssm_conv_direct_enabled() || cgraph->nodes[i]->op != GGML_OP_CONCAT) {
+        return false;
+    }
+    ggml_backend_vk_context::ssm_conv_direct_match m;
+    if (!ggml_vk_ssm_conv_direct_check(ctx, cgraph, i, m, true)) {
+        return false;
+    }
+    ctx->ssm_conv_direct_matches.push_back(m);
+    ctx->fused_concat_tail = (int) ctx->ssm_conv_direct_matches.size() - 1;
+    return true;
+}
+
+static bool ggml_vk_ssm_conv_direct_at_conv(ggml_backend_vk_context * ctx, const ggml_cgraph * cgraph, int i) {
+    if (cgraph->nodes[i]->op != GGML_OP_SSM_CONV) {
+        return false;
+    }
+    for (size_t k = 0; k < ctx->ssm_conv_direct_matches.size(); ++k) {
+        const auto & m = ctx->ssm_conv_direct_matches[k];
+        if (m.conv_idx == i && ggml_vk_conv_whole(cgraph->nodes[i]->src[0], m.concat)) {
+            ctx->fused_ssm_conv_direct = (int) k;
+            ctx->fused_extra_srcs[0] = m.x;
+            ctx->fused_extra_srcs[1] = m.state;
+            return true;
+        }
+    }
+    return false;
+}
+
+
 bool ggml_vk_can_fuse_rms_norm_mul_rope(ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph,
                                                int node_idx) {
     const ggml_tensor *rms = cgraph->nodes[node_idx + 0];
@@ -16892,6 +17183,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
     ctx->prealloc_size_add_rms_partials_offset = 0;
     ctx->do_add_rms_partials = false;
     ctx->do_add_rms_partials_offset_calculation = false;
+    ctx->ssm_conv_direct_matches.clear();
 
     int last_node = cgraph->n_nodes - 1;
 
@@ -17036,6 +17328,9 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         ctx->fused_hc_post_gate = false;
         ctx->fused_rms_norm_mode = RMS_NORM_COUNT;
         ctx->fused_fwht_signed = false;
+        ctx->fused_concat_tail = -1;
+        ctx->fused_ssm_conv_direct = -1;
+        ctx->fused_extra_srcs[0] = ctx->fused_extra_srcs[1] = nullptr;
         const char *fusion_string {};
         if (!ctx->device->disable_fusion) {
             uint32_t num_adds = ggml_vk_fuse_multi_add(ctx, cgraph, i);
@@ -17133,6 +17428,14 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 }
                 op_srcs_fused_elementwise[0] = true;
                 op_srcs_fused_elementwise[1] = true;
+            } else if (ggml_vk_ssm_conv_direct_at_conv(ctx, cgraph, i)) {
+                // decided at the concat, which then wrote only its tail: this must not fall back
+                ctx->num_additional_fused_ops = 1;
+                fusion_string = "CONCAT_SSM_CONV_SILU";
+                op_srcs_fused_elementwise[0] = false;
+                op_srcs_fused_elementwise[1] = true;
+            } else if (ggml_vk_ssm_conv_direct_at_concat(ctx, cgraph, i)) {
+                fusion_string = "CONCAT_TAIL";
             } else if (ggml_vk_can_fuse_ssm_conv(ctx, cgraph, i, 2)) {
                 ctx->num_additional_fused_ops = 2;
                 fusion_string = "SSM_CONV_BIAS_SILU";
@@ -17284,6 +17587,8 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 }
             }
             if (need_disable) {
+                // the direct conv's concat already skipped writing the full tensor; its match checks every overlap
+                GGML_ASSERT(ctx->fused_ssm_conv_direct < 0);
                 ctx->num_additional_fused_ops = 0;
                 ctx->fused_ops_write_mask = 1;
                 ctx->fused_topk_moe_mode = TOPK_MOE_COUNT;
@@ -17780,6 +18085,20 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
     // Replace the graph with the new order.
     for (int i = 0; i < graph->n_nodes; ++i) {
         graph->nodes[i] = new_order[i];
+    }
+
+    // direct GDN conv: x and the state are read at the conv, after the concat that names them, and while the
+    // SiLU output is written; keep them allocated through the SiLU (the runtime match re-checks the addresses)
+    if (ggml_vk_ssm_conv_direct_enabled() && !ctx->device->disable_fusion && params && params->add_alloc_dep) {
+        for (int i = 0; i < graph->n_nodes; ++i) {
+            ggml_backend_vk_context::ssm_conv_direct_match m;
+            if (graph->nodes[i]->op == GGML_OP_CONCAT && ggml_vk_ssm_conv_direct_check(ctx, graph, i, m, false)) {
+                for (const ggml_tensor * input : { m.x, m.state }) {
+                    auto * root = const_cast<ggml_tensor *>(input->view_src ? input->view_src : input);
+                    params->add_alloc_dep(params->user_data, root, m.out);
+                }
+            }
+        }
     }
 }
 

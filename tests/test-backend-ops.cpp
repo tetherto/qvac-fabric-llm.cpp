@@ -6247,6 +6247,77 @@ struct test_rwkv_wkv6 : public test_case {
 };
 
 // GGML_OP_GATED_DELTA_NET
+// CONCAT(state, transpose(x)) -> SSM_CONV -> SILU, plus the recurrent conv-state copies of the last 3 columns
+// (one per rollback slot, slot s ending s tokens earlier), as the GDN layers build it. Vulkan runs the conv
+// straight from x and the state and writes only the concat columns the copies read. Allocated through the
+// scheduler so graph_optimize's allocation dependencies apply; x is an intermediate the allocator could reuse.
+// Verified nodes: the SiLU output and every state copy (the state the next ubatch starts from).
+struct test_ssm_conv_direct : public test_case {
+    const int64_t channels, n_t, n_s, n_slots;
+    const bool extra_reader; // a whole-concat reader besides the conv: must fall back to the full concat
+
+    std::vector<ggml_tensor *> verify;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "CONCAT_SSM_CONV_SILU";
+    }
+
+    bool run_whole_graph() override { return true; }
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return verify; }
+
+    std::string vars() override {
+        return VARS_TO_STR5(channels, n_t, n_s, n_slots, extra_reader);
+    }
+
+    test_ssm_conv_direct(int64_t channels = 64, int64_t n_t = 7, int64_t n_s = 1, int64_t n_slots = 1, bool extra_reader = false)
+        : channels(channels), n_t(n_t), n_s(n_s), n_slots(n_slots), extra_reader(extra_reader) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        verify.clear();
+        const int64_t C = channels;
+        ggml_tensor * state = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 3, C, n_s);
+        ggml_set_name(state, "state");
+        ggml_tensor * x_src = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, C, n_t, n_s);
+        ggml_set_name(x_src, "x_src");
+        ggml_tensor * x = ggml_scale(ctx, x_src, 0.5f); // an allocatable intermediate, like the qkv projection
+        ggml_tensor * kern = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 4, C);
+        ggml_set_name(kern, "kernel");
+        ggml_tensor * cache = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 3 * C, n_s * n_slots);
+        ggml_set_name(cache, "cache");
+
+        ggml_tensor * cc = ggml_concat(ctx, state, ggml_transpose(ctx, x), 0);
+        const size_t row_size = ggml_row_size(GGML_TYPE_F32, 3 * C);
+        for (int64_t slot = 0; slot < n_slots; ++slot) {
+            const int64_t s_idx = std::max<int64_t>(0, cc->ne[0] - 3 - slot);
+            ggml_tensor * tail = ggml_view_3d(ctx, cc, 3, C, n_s, cc->nb[1], cc->nb[2], ggml_row_size(cc->type, s_idx));
+            ggml_tensor * dst  = ggml_view_2d(ctx, cache, 3 * C, n_s, cache->nb[1], slot * n_s * row_size);
+            ggml_tensor * cpy  = ggml_cpy(ctx, tail, dst);
+            if (gf) {
+                ggml_build_forward_expand(gf, cpy);
+            }
+            verify.push_back(cpy);
+        }
+        if (extra_reader) {
+            ggml_tensor * whole = ggml_scale(ctx, cc, 2.0f);
+            if (gf) {
+                ggml_build_forward_expand(gf, whole);
+            }
+            verify.push_back(whole);
+        }
+        // an independent full-size allocation between the concat and the conv
+        ggml_tensor * scratch = ggml_scale(ctx, x_src, 0.25f);
+        if (gf) {
+            ggml_build_forward_expand(gf, scratch);
+        }
+
+        ggml_tensor * out = ggml_silu(ctx, ggml_ssm_conv(ctx, cc, kern));
+        ggml_set_name(out, "out");
+        verify.push_back(out);
+        return out;
+    }
+};
+
 struct test_gated_delta_net : public test_case {
     const ggml_type type;
 
@@ -16688,6 +16759,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_moe_reduce(63,   12, 33, true,  true, true));
     test_cases.emplace_back(new test_moe_reduce(2048, 15, 40, false, true));
     test_cases.emplace_back(new test_moe_reduce(2048, 16, 32, false, true));
+
+    // CONCAT + SSM_CONV + SILU with the conv-state copies (Vulkan direct conv). n_t below 8 stays on the concat
+    // path; ragged channels (130) and token tiles (32 per workgroup); two sequences; 1 and 4 rollback slots.
+    for (int64_t nt : {1, 3, 8, 9, 31, 33, 300}) {
+        test_cases.emplace_back(new test_ssm_conv_direct(130, nt, 2, 1));
+    }
+    test_cases.emplace_back(new test_ssm_conv_direct(130, 9, 1, 4));
+    test_cases.emplace_back(new test_ssm_conv_direct(256, 300, 2, 4));
+    test_cases.emplace_back(new test_ssm_conv_direct(130, 8, 2, 8));         // tail reaches into the state columns
+    test_cases.emplace_back(new test_ssm_conv_direct(10240, 257, 1, 1));     // Flash-Next channels
+    test_cases.emplace_back(new test_ssm_conv_direct(256, 64, 1, 1, true));  // another whole-concat reader: no fusion
 
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 1, 1));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 16, 1, 1));

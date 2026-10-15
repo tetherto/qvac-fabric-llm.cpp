@@ -1072,6 +1072,10 @@ struct vk_device_struct {
     vk_pipeline pipeline_ssm_conv_f32;
     vk_pipeline pipeline_ssm_conv_silu_f32;
     vk_pipeline pipeline_ssm_conv_bias_silu_f32;
+    // CONCAT(state, x^T) + SSM_CONV + SILU without the transposed concat: the conv reads x and the state
+    // directly, and the concat node only writes the tail columns its other readers (state copies) use
+    vk_pipeline pipeline_ssm_conv_direct_silu_f32;
+    vk_pipeline pipeline_ssm_conv_tail_f32;
     vk_pipeline pipeline_ssm_conv_back_sx_f32;
     vk_pipeline pipeline_ssm_conv_back_c_f32;
     vk_pipeline pipeline_opt_step_adamw_f32;
@@ -1588,6 +1592,21 @@ struct ggml_backend_vk_context {
     bool fused_topk_qsa {};
     bool fused_hc_post_gate {};
     rms_norm_mode fused_rms_norm_mode {RMS_NORM_COUNT};
+    // direct GDN conv: concats matched in this graph (decided at the concat, consumed at its SSM_CONV)
+    struct ssm_conv_direct_match {
+        const ggml_tensor * concat;
+        const ggml_tensor * state;   // [ncs, C, S], contiguous
+        const ggml_tensor * x;       // x^T's storage: [C, T, S], contiguous
+        const ggml_tensor * kern;    // [ncs + 1, C]
+        ggml_tensor * out;           // the SILU node
+        int conv_idx;
+        int64_t tail_from;           // first concat column read by anything but the conv
+    };
+    std::vector<ssm_conv_direct_match> ssm_conv_direct_matches;
+    int fused_concat_tail {-1};      // current CONCAT writes only its tail (index into ssm_conv_direct_matches)
+    int fused_ssm_conv_direct {-1};  // current SSM_CONV (+SILU) runs direct (index into ssm_conv_direct_matches)
+    // set while the current node is a direct conv: srcs read outside node->src (x, state) for the sync tracking
+    const ggml_tensor * fused_extra_srcs[2] {};
     bool fused_fwht_signed {};
     std::atomic<uint64_t> fwht_fusion_count {};
 
