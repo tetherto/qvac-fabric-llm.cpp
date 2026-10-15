@@ -2605,14 +2605,11 @@ static void xdna_kernels_warm(xdna_kernel_pool * pool, const xdna_ops * ops, std
     if (xdna_rec_active()) {
         // Fused decode: one design carries both the core and the decode GEMV
         // its projections run on, so warming it covers the split the mode
-        // uses. The opt-in prefill kernels are warmed alongside it when they
-        // are on: each holds a hardware context, so not when nothing runs them.
+        // uses. The opt-in prefill conv is warmed alongside it when it is on:
+        // it holds a hardware context, so not when nothing runs it.
         warm_stem(std::filesystem::path(xdna_fused_xclbin()).stem().string());
         if (xdna_env_int("GGML_XDNA_CONV", 0) != 0) {
             warm_names("conv_prefill");
-        }
-        if (xdna_env_int("GGML_XDNA_FA", 0) != 0) {
-            warm_names("fa_prefill");
         }
         return;
     }
