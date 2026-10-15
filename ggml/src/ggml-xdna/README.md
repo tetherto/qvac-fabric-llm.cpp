@@ -59,7 +59,7 @@ per-op path for a model the fused design does cover.
 | op | kernel | default |
 | :-- | :-- | :-- |
 | `SSM_CONV`, from 64 tokens | `kernels/conv.py` | opt-in, `GGML_XDNA_CONV=1`; the host is cheaper and is what runs otherwise |
-| the prefill GDN's conv input | `kernels/gdn_conv.py` | on with the GDN, `GGML_XDNA_GDN_CONV=0` for the host |
+| the prefill GDN's conv input | `kernels/gdn_conv.py` | opt-in, `GGML_XDNA_GDN_CONV=1`; the host is faster (pp512 1900 against 1680 t/s on the 0.8B) and is what runs otherwise |
 | `GATED_DELTA_NET` | `kernels/gdn_mm.py` | on, `GGML_XDNA_GDN_MM=0` for the host |
 | `FLASH_ATTN_EXT` | `kernels/attn_mm.py` | on, `GGML_XDNA_FA_MM=0` for the host |
 
@@ -260,7 +260,7 @@ Artifacts, all in the build output directory (`build/bin` by default):
 | `gemm_int8_int32_M{256,512,2048}_K1024_N2048_c8` | native int8 GEMM, prefill |
 | `pgemm_c8` | prefill GEMM in the decode GEMV's weight tiles |
 | `gdn_mm_c8` | GATED_DELTA_NET prefill |
-| `gdn_conv_c8` | the prefill GDN's conv input |
+| `gdn_conv_c8` | the prefill GDN's conv input, opt-in |
 | `attn_mm_c8` | FLASH_ATTN_EXT prefill |
 | `conv_prefill_bf16_c16_t256_kw4_mb8` | SSM_CONV prefill, opt-in |
 | `fused_layer_<tag>` | the fused recurrent layer, decode |
@@ -315,6 +315,7 @@ For users - a trade-off, a size or a location:
 | `GGML_XDNA_GLUE_THREADS_BIG` | 16 | the same, for a chunk of 32 tokens or more |
 | `GGML_XDNA_ARENA_MB` | 256 | size of each chunk of the device-buffer arena, in MiB |
 | `GGML_XDNA_CONV` | 0 | `1` runs the standalone prefill `SSM_CONV` on the array; the host is cheaper, which is why it is off |
+| `GGML_XDNA_GDN_CONV` | 0 | `1` computes the prefill GDN's conv input on the array; the host is faster, which is why it is off |
 | `GGML_XDNA_KERNEL_DIR` | unset | a directory to look for the kernel artifacts in before the others (see Artifacts) |
 
 For bisecting a regression - each `0` turns off the NPU route it names, and the
@@ -343,7 +344,6 @@ report, not for tuning: every one is slower than the default.
 | `GGML_XDNA_PGEMM_GLU_A` | the SwiGLU written into the down projection's A |
 | `GGML_XDNA_GDN_MM` | the prefill gated delta rule on the array |
 | `GGML_XDNA_GDN_IN` | the prefill GDN's conv input, norms and state copy fed straight into the array |
-| `GGML_XDNA_GDN_CONV` | the prefill GDN's conv input on the array (it runs on the host) |
 | `GGML_XDNA_FA_MM` | the prefill attention on the array |
 
 Diagnostics - nothing is measured unless they are set:
