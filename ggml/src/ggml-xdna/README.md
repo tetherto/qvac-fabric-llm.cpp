@@ -169,6 +169,14 @@ It does not touch:
 - a comma-separated list (`GGML_XDNA_W4=attn_v`): the `Q5_K`/`Q6_K` weights it
   applies to, by the last part of their name (`blk.N.<name>.weight`).
 
+The decode head (the vocabulary projection on the array) is the other lossy
+default, on the same terms: its first 65536 vocabulary rows - a byte-pair
+vocabulary's most frequent tokens - stay at 8 bits and the rest are 4-bit.
+Against the CPU's `Q6_K` head on the 0.8B that is a head KLD of 0.0052, where
+every row at 4 bits would be 0.0165. `GGML_XDNA_HEAD_EXACT_ROWS` sets the
+number of exact rows (`0`: all 4-bit); `GGML_XDNA_HEAD=0` takes the head off
+the array altogether.
+
 ### One decode token
 
 1. The scheduler has placed the ops here because `supports_op` claimed them.
@@ -292,33 +300,58 @@ OMP_WAIT_POLICY=PASSIVE ./build/bin/llama-server -m model.gguf \
 
 ### Environment
 
-Most of the knobs below are for bisecting a regression rather than tuning: each
-one disables the NPU path it names, and the default is the fast one.
-`GGML_XDNA_W4` is for users: it trades decode accuracy for speed.
-`GGML_XDNA_KERNEL_DIR` is for packagers: it points the backend at its artifacts.
+Every `GGML_XDNA_*` variable the backend reads is listed here. Unset is the
+default, and the default is what a release runs.
+
+For users - a trade-off, a size or a location:
 
 | variable | default | effect |
 | :-- | :-- | :-- |
-| `GGML_XDNA_FUSED_LAYER` | 1 | bisection switch: `0` leaves the fused layer off. It does not run a model the layer refuses |
-| `GGML_XDNA_GEMV_GROUP` | 1 | `0` keeps the decode projections outside the fused layer on the host |
-| `GGML_XDNA_GEMV_PROMOTE` | 1 | `0` keeps one GEMV dispatch to a single weight format |
-| `GGML_XDNA_GLUE` | 1 | `0` stops the backend claiming the host ops of a decode chunk |
-| `GGML_XDNA_GLUE_THREADS` | 4 | host-fallback threads for a decode-sized chunk |
-| `GGML_XDNA_GLUE_THREADS_BIG` | 16 | host-fallback threads for a chunk of 32 tokens or more |
-| `GGML_XDNA_INT8` | 1 | `0` drops the native int8 prefill GEMM |
-| `GGML_XDNA_PGEMM` | 1 | `0` takes the prefill GEMM off the array |
-| `GGML_XDNA_GDN_MM` | 1 | `0` takes the prefill gated delta rule off the array |
-| `GGML_XDNA_GDN_CONV` | 1 | `0` runs the prefill GDN's conv input on the host |
-| `GGML_XDNA_FA_MM` | 1 | `0` takes prefill attention off the array |
-| `GGML_XDNA_CONV` | 0 | `1` runs the standalone prefill conv on the array; the host is what runs otherwise |
-| `GGML_XDNA_SPIN_US` | 0 | poll this many microseconds for completion before blocking; `-1` polls until it completes |
 | `GGML_XDNA_W4` | `attn_qkv,attn_v` | the `Q5_K`/`Q6_K` weights the decode GEMV takes at 4 bits, a lossy default (see [4-bit decode weights](#4-bit-decode-weights-on-by-default)); empty keeps them at 8 bits |
-| `GGML_XDNA_KERNEL_DIR` | unset | a directory to look for the kernel artifacts in before the others |
+| `GGML_XDNA_HEAD_EXACT_ROWS` | 65536 | the vocabulary rows the decode head keeps at 8 bits, from row 0 (a byte-pair vocabulary's most frequent tokens); the rest are 4-bit. Head KLD against the CPU's Q6_K head on the 0.8B: 0.0052 at 65536, 0.0165 with `0` (all 4-bit) |
+| `GGML_XDNA_TOKEN` | 1 | how a token's queued runs go to the device: `1` as one joined command, `t > 1` at most `t` runs a command, `0` a command each - slightly faster decode at a higher package power (24.0 W at 50.9 t/s against 18.0 W at ~48 t/s with the default, 1k context) |
+| `GGML_XDNA_SPIN_US` | 0 | poll this many microseconds for completion before blocking; `-1` polls until it completes |
+| `GGML_XDNA_GLUE_THREADS` | 4 | host threads for the ops the backend runs on the host in a decode-sized chunk |
+| `GGML_XDNA_GLUE_THREADS_BIG` | 16 | the same, for a chunk of 32 tokens or more |
+| `GGML_XDNA_ARENA_MB` | 256 | size of each chunk of the device-buffer arena, in MiB |
+| `GGML_XDNA_CONV` | 0 | `1` runs the standalone prefill `SSM_CONV` on the array; the host is cheaper, which is why it is off |
+| `GGML_XDNA_KERNEL_DIR` | unset | a directory to look for the kernel artifacts in before the others (see Artifacts) |
 
-The remaining `GGML_XDNA_*` variables (`HEAD`, `QUEUE`, `INPROJ`, `ATTN`,
-`ATTN_LAYER`, `ATTN_TAIL`, `HOST_BO`, `PGEMM_*`, `ARENA_MB`, `BATCH`, `TOKEN`,
-`SETTLE_US`, `FA_MM_MIN`, `GDN_IN`) select or size one dispatch each; they
-default to the fast path and are read where they are used.
+For bisecting a regression - each `0` turns off the NPU route it names, and the
+host (or a less fused path) runs it instead. They are for narrowing down a bug
+report, not for tuning: every one is slower than the default.
+
+| variable | `0` turns off |
+| :-- | :-- |
+| `GGML_XDNA_FUSED_LAYER` | the fused decode layers (the per-op path runs). It does not run a model the fused layer refuses |
+| `GGML_XDNA_GEMV_GROUP` | the decode projections outside the fused layer, on the array |
+| `GGML_XDNA_GEMV_PROMOTE` | merging a decode GEMV group of mixed weight formats into one dispatch |
+| `GGML_XDNA_HEAD` | the decode's vocabulary projection on the array |
+| `GGML_XDNA_QUEUE` | queuing the fused layers: each one is waited for |
+| `GGML_XDNA_ATTN` | the decode attention on the array |
+| `GGML_XDNA_ATTN_LAYER` | a whole attention layer, the q/k/v projections to `l_out`, in one dispatch (the tail and the decode attention still run) |
+| `GGML_XDNA_ATTN_TAIL` | an attention layer's tail - output projection, residual, post-attention norm and FFN - in one dispatch |
+| `GGML_XDNA_GLUE` | the host ops the backend runs inside an NPU chunk (the scheduler splits the graph at each instead) |
+| `GGML_XDNA_HOST_BO` | the backend's host buffer type: plain CPU buffers |
+| `GGML_XDNA_PGEMM` | the prefill GEMM on the array |
+| `GGML_XDNA_INT8` | the native int8 prefill GEMM |
+| `GGML_XDNA_PGEMM_ADD` | the residual ADD folded into the norm's pass |
+| `GGML_XDNA_PGEMM_NORM_A` | the RMS norm written into the next GEMM's A |
+| `GGML_XDNA_PGEMM_GATED_A` | a recurrent layer's gated output written into the output projection's A |
+| `GGML_XDNA_PGEMM_GATE_A` | the attention gate written into the output projection's A |
+| `GGML_XDNA_PGEMM_GLU` | the SwiGLU computed from the gate and up GEMMs on the array |
+| `GGML_XDNA_PGEMM_GLU_A` | the SwiGLU written into the down projection's A |
+| `GGML_XDNA_GDN_MM` | the prefill gated delta rule on the array |
+| `GGML_XDNA_GDN_IN` | the prefill GDN's conv input, norms and state copy fed straight into the array |
+| `GGML_XDNA_GDN_CONV` | the prefill GDN's conv input on the array (it runs on the host) |
+| `GGML_XDNA_FA_MM` | the prefill attention on the array |
+
+Diagnostics - nothing is measured unless they are set:
+
+| variable | effect |
+| :-- | :-- |
+| `GGML_XDNA_PROF` | `1`: a table of where the time went, per section, at exit; `2`: also lists, once, the ops a single-token chunk still runs on the host |
+| `GGML_XDNA_PROF_TRACE` | with `GGML_XDNA_PROF=1`, every section as `<name>\t<start ns>\t<end ns>` on the monotonic clock into this file, to line up with a power trace |
 
 ## Troubleshooting
 
