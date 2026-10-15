@@ -276,26 +276,6 @@ bool xdna_gemm_seq_supported(const xdna_gemm_tiles * tiles, int M, int K, int N)
 // persistent full-weight buffer.
 bool xdna_gemm_seq_build(xdna_seq * seq, const xdna_gemm_tiles * tiles, int M, int K, int N, uint32_t b_offset = 0);
 
-// Fixed geometry of one CS=64-token GDN prefill chunk (S=128, H=16, see
-// kernels/gdn_prefill.py). Byte/word counts per shim column of the three
-// host BOs: arg 0 = tok [H][CS][3*S+2] bf16, arg 1 = packed state|attn
-// [H][NS][ROWS*S + CS*ROWS] bf16, arg 2 = same packed buffer (in place).
-struct xdna_gdn_prefill_geom {
-    int n_cols          = 8;      // shim columns (H/2)
-    int state_col_bytes = 98304;  // packed column, bytes (= 4 workers x PACKED_N x 2)
-    int state_col_words = 24576;  // packed column in 4-byte words
-    int tok_col_bytes   = 98816;  // tok column, bytes (= 2 heads x CS x (3*S+2) x 2)
-    int tok_col_words   = 24704;
-};
-
-// Build the TXN stream for one CS=64-token chunk of the GDN prefill kernel:
-// state seed (8 columns, arg 1), then per column the tok fill (arg 0) and the
-// packed drain (arg 2); the last column's drain stamps the completion token the
-// host waits. The stream is bound once and reused for every chained chunk - the
-// state seed re-copies the in-place packed BO, so the updated device state
-// flows into the next chunk.
-bool xdna_gdn_prefill_seq_build(xdna_seq * seq, const xdna_gdn_prefill_geom * g);
-
 // Geometry of the merged conv+norm+gdn decode kernel (fused_layer.xclbin,
 // kernels/fused_layer.py). The worker layout is the rec_full design: conv on
 // cols 0..conv_cols-1, norm on the next norm_cols, bf16-vector gdn on the last
