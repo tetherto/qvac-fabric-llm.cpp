@@ -100,10 +100,11 @@ LLAMA_API void llama_set_embeddings_nextn(struct llama_context * ctx, bool value
 // chain multiple trained NextN heads. Default 0 (first head).
 LLAMA_API void llama_set_nextn_layer_offset(struct llama_context * ctx, int32_t offset);
 
-// Restrict the tokens a DFlash2 drafter proposes to n_ranges ascending, disjoint [ranges[2*i], ranges[2*i + 1]) token id ranges.
-// n_ranges == 0 restores the full vocabulary and succeeds for any model. Otherwise returns false and leaves the context unchanged
-// for a model other than DFlash2, a DFlash2 drafter with a reduced (d2t) vocabulary, or invalid ranges, including ranges that
-// cover fewer ids than the drafter's selector top-k.
+// Restrict the tokens a DFlash2 or MTP drafter proposes to n_ranges ascending, disjoint [ranges[2*i], ranges[2*i + 1]) token id
+// ranges. n_ranges == 0 restores the full vocabulary and succeeds for any context. Otherwise returns false and leaves the context
+// unchanged for a context that is neither a DFlash2 drafter nor the MTP context of a model whose MTP head supports it, a DFlash2
+// drafter with a reduced (d2t) vocabulary, or invalid ranges, including ranges that cover fewer ids than a DFlash2 selector top-k.
+// A head whose row ranges its backend cannot run as views keeps computing the full vocabulary.
 LLAMA_API bool llama_set_draft_vocab(struct llama_context * ctx, const int32_t * ranges, int32_t n_ranges);
 
 // mirrors:

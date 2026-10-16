@@ -22,7 +22,7 @@ struct llama_cparams {
 
     int32_t  nextn_layer_offset = 0;
 
-    std::vector<int32_t> draft_vocab; // [begin, end) token id pairs a DFlash2 drafter may propose, empty = all
+    std::vector<int32_t> draft_vocab; // [begin, end) token id pairs a DFlash2 or MTP drafter may propose, empty = all
 
     float rope_freq_base;
     float rope_freq_scale;

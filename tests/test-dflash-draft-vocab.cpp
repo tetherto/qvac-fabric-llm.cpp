@@ -64,8 +64,8 @@ static bool spec_init_rejects(common_params_speculative & params) {
     return false;
 }
 
-// a speculative type other than draft-dflash rejects the ranges and works without them
-static bool test_needs_dflash() {
+// a speculative type other than draft-dflash or draft-mtp rejects the ranges and works without them
+static bool test_needs_drafter() {
     common_params_speculative params;
     params.types = { COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE };
     params.draft.vocab_ranges = { 0, 10 };
@@ -100,6 +100,6 @@ int main() {
         { { 0, 1, 10, 12 },                 false },
     };
 
-    const int failures = run_cases(cases) + (test_needs_dflash() ? 0 : 1);
+    const int failures = run_cases(cases) + (test_needs_drafter() ? 0 : 1);
     return failures == 0 ? 0 : 1;
 }

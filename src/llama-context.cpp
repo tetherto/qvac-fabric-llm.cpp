@@ -1386,15 +1386,17 @@ void llama_context::set_nextn_layer_offset(int32_t offset) {
 }
 
 bool llama_context::set_draft_vocab(const int32_t * ranges, int32_t n_ranges) {
-    // the ranges select rows of a full-vocabulary DFlash2 head, which a reduced (d2t) head does not have
+    // the ranges select rows of a full-vocabulary head: a DFlash2 one (a reduced d2t head has none) or an MTP one
     const bool has_full_dflash2_head = model.arch == LLM_ARCH_DFLASH && model.dflash_selector_hidden && !model.d2t;
-    if (n_ranges < 0 || (n_ranges > 0 && !has_full_dflash2_head)) {
+    const bool has_mtp_head          = cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP && llm_arch_mtp_supports_draft_vocab(model.arch);
+    if (n_ranges < 0 || (n_ranges > 0 && !has_full_dflash2_head && !has_mtp_head)) {
         return false;
     }
 
-    // the selector picks its top-k candidates from the draft vocabulary
+    // a DFlash2 selector picks its top-k candidates from the draft vocabulary; an MTP drafter needs no minimum
+    const int32_t n_min_ids = has_mtp_head ? 0 : (int32_t) model.hparams.dflash_selector_top_k;
     std::vector<int32_t> draft_vocab(ranges, ranges + 2*n_ranges);
-    if (!llama_draft_vocab_is_valid(draft_vocab, model.vocab.n_tokens(), (int32_t) model.hparams.dflash_selector_top_k)) {
+    if (!llama_draft_vocab_is_valid(draft_vocab, model.vocab.n_tokens(), n_min_ids)) {
         return false;
     }
 

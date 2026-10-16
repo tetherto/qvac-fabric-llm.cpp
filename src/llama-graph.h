@@ -32,6 +32,7 @@ using llama_hadamard_rotations = std::unordered_map<const ggml_tensor *, llama_h
 
 struct llama_cparams;
 struct llama_layer;
+struct llama_model;
 
 struct llama_memory_context_i;
 
@@ -137,6 +138,9 @@ protected:
 };
 
 using llm_graph_input_ptr = std::unique_ptr<llm_graph_input_i>;
+
+// whether the device that holds head runs the mat-mul of every row view of head given by ranges with an activation shaped like cur
+bool llm_graph_draft_vocab_views_supported(ggml_tensor * head, const ggml_tensor * cur, const std::vector<int32_t> & ranges);
 
 class llm_graph_input_embd : public llm_graph_input_i {
 public:
@@ -246,6 +250,24 @@ public:
     const llama_cparams cparams;
 
     const uint32_t n_outputs;
+};
+
+// the target token ids of the draft vocabulary, in draft-logit column order
+class llm_graph_input_draft_vocab : public llm_graph_input_i {
+public:
+    llm_graph_input_draft_vocab(const std::vector<int32_t> & ranges, bool reusable);
+    virtual ~llm_graph_input_draft_vocab() = default;
+
+    void set_input(const llama_ubatch * ubatch) override;
+
+    // the ids follow cparams.draft_vocab, which llm_graph_params::allow_reuse compares;
+    // MTP graphs reuse the input, DFlash2 graphs rebuild it every decode
+    bool can_reuse(const llm_graph_params & params) override;
+
+    ggml_tensor * ids = nullptr; // I32 [n_draft_vocab]
+
+    const std::vector<int32_t> ids_host;
+    const bool                 reusable;
 };
 
 class llm_graph_input_mean : public llm_graph_input_i {
@@ -1207,6 +1229,22 @@ struct llm_graph_context {
     ggml_tensor * build_inp_pos_bucket_enc() const;
     ggml_tensor * build_inp_pos_bucket_dec() const;
     ggml_tensor * build_pos_bias(ggml_tensor * pos_bucket, ggml_tensor * attn_rel_b) const;
+
+    //
+    // draft vocabulary (cparams.draft_vocab)
+    //
+
+    ggml_tensor * build_inp_draft_vocab(bool reusable) const;
+
+    // build_draft_vocab_logits views row ranges of head: its owner must keep the row layout, the views skip the input
+    // rotation and LoRA delta of build_lora_mm, and the device holding head must run the mat-mul of each view with cur
+    bool draft_vocab_rows_viewable(const llama_model & owner, ggml_tensor * head, ggml_tensor * cur) const;
+
+    // logits over the draft vocabulary: one mat-mul per row range of head
+    ggml_tensor * build_draft_vocab_logits(ggml_tensor * head, ggml_tensor * head_s, ggml_tensor * cur) const;
+
+    // logits over a reduced vocabulary placed at their target token ids of an n_vocab-wide -inf row
+    ggml_tensor * build_vocab_scatter(ggml_tensor * logits, ggml_tensor * ids, int64_t n_vocab) const;
 
     //
     // attention

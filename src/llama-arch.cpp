@@ -1167,6 +1167,16 @@ bool llm_arch_supports_rs_rollback(const llm_arch & arch) {
     }
 }
 
+// archs whose MTP head honors cparams.draft_vocab
+bool llm_arch_mtp_supports_draft_vocab(const llm_arch & arch) {
+    switch (arch) {
+        case LLM_ARCH_QWEN35:
+            return true;
+        default:
+            return false;
+    }
+}
+
 bool llm_arch_supports_sm_tensor(const llm_arch & arch) {
     switch (arch) {
         case LLM_ARCH_GROK:

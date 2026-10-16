@@ -634,7 +634,15 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
     ggml_tensor * head_w = layer.nextn.shared_head_head ? layer.nextn.shared_head_head : model.output;
     ggml_tensor * head_s = layer.nextn.shared_head_head ? layer.nextn.shared_head_head_s : model.output_s;
     GGML_ASSERT(head_w && "QWEN35 MTP: missing LM head (nextn.shared_head_head or model.output)");
-    cur = build_lora_mm(head_w, cur, head_s);
+    if (!cparams.draft_vocab.empty() && draft_vocab_rows_viewable(model, head_w, cur)) {
+        cur = build_draft_vocab_logits(head_w, head_s, cur);
+        // requested logits keep the target vocabulary width, with -inf outside the draft vocabulary
+        if (n_outputs > 0) {
+            cur = build_vocab_scatter(cur, build_inp_draft_vocab(/*reusable =*/ true), model.vocab.n_tokens());
+        }
+    } else {
+        cur = build_lora_mm(head_w, cur, head_s);
+    }
     cb(cur, "result_output", -1);
 
     res->t_logits = cur;
