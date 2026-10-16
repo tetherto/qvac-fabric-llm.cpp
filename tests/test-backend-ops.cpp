@@ -11346,9 +11346,10 @@ struct test_flash_attn_ext_back : public test_case {
     std::array<int32_t, 4> permute;
     const ggml_flash_attn_ext_back_target target;
     const bool mask_zero; // visible mask entries are 0 instead of random, as in training
+    const float grad_scale; // grad_o in [-grad_scale, grad_scale], training gradients are far below 1
 
     std::string vars() override {
-        return VARS_TO_STR10(hs, nh, nr23, kv, nb, mask, type_KV, permute, target, mask_zero);
+        return VARS_TO_STR11(hs, nh, nr23, kv, nb, mask, type_KV, permute, target, mask_zero, grad_scale);
     }
 
     double max_nmse_err() override {
@@ -11357,8 +11358,9 @@ struct test_flash_attn_ext_back : public test_case {
 
     test_flash_attn_ext_back(int64_t hs = 64, int64_t nh = 4, std::array<int64_t, 2> nr23 = {1, 1}, int64_t kv = 96, int64_t nb = 8,
                              bool mask = true, ggml_type type_KV = GGML_TYPE_F16, std::array<int32_t, 4> permute = {0, 1, 2, 3},
-                             ggml_flash_attn_ext_back_target target = GGML_FLASH_ATTN_EXT_BACK_DQ, bool mask_zero = false)
-        : hs(hs), nh(nh), nr23(nr23), kv(kv), nb(nb), mask(mask), type_KV(type_KV), permute(permute), target(target), mask_zero(mask_zero) {}
+                             ggml_flash_attn_ext_back_target target = GGML_FLASH_ATTN_EXT_BACK_DQ, bool mask_zero = false, float grad_scale = 1.0f)
+        : hs(hs), nh(nh), nr23(nr23), kv(kv), nb(nb), mask(mask), type_KV(type_KV), permute(permute), target(target), mask_zero(mask_zero),
+          grad_scale(grad_scale) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         auto const &create_permuted = [&](ggml_type type, int64_t ne0, int64_t ne1, int64_t ne2, int64_t ne3) -> ggml_tensor * {
@@ -11413,6 +11415,8 @@ struct test_flash_attn_ext_back : public test_case {
                 } else {
                     init_tensor_kq_mask_causal(t);
                 }
+            } else if (strcmp(t->name, "grad_o") == 0) {
+                init_tensor_uniform(t, -grad_scale, grad_scale);
             } else {
                 init_tensor_uniform(t);
             }
@@ -15391,6 +15395,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             // single kv head at head sizes the CUDA tensor-core path takes
             test_cases.emplace_back(new test_flash_attn_ext_back(128, 1, {8, 1}, 256, 64, true, GGML_TYPE_F16, {0, 1, 2, 3}, target));
             test_cases.emplace_back(new test_flash_attn_ext_back( 64, 1, {4, 1}, 113, 75, true, GGML_TYPE_F32, {0, 1, 2, 3}, target));
+            // training-sized gradients: an unscaled F16 grad_o or dS underflows here
+            test_cases.emplace_back(new test_flash_attn_ext_back(128, 2, {4, 1}, 512, 75, true, GGML_TYPE_F16, {0, 1, 2, 3}, target, true, 1e-6f));
+            test_cases.emplace_back(new test_flash_attn_ext_back( 64, 2, {2, 1}, 256, 64, true, GGML_TYPE_F16, {0, 1, 2, 3}, target, true, 1e-12f));
         }
         // shapes of the grad-mode cases, small head sizes, partial tiles, odd head sizes and larger GQA groups
         for (ggml_flash_attn_ext_back_target target : {GGML_FLASH_ATTN_EXT_BACK_STATS, GGML_FLASH_ATTN_EXT_BACK_DQ, GGML_FLASH_ATTN_EXT_BACK_DKV}) {
