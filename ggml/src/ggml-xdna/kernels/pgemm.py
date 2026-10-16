@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # pgemm.py -*- Python -*-
 #
-# The prefill GEMM (FLM_PREFILL_PLAN.md, step 1): C (M x N) = A (M x K) @ W
+# The prefill GEMM: C (M x N) = A (M x K) @ W
 # with W the decode GEMV's packed weight tiles, in the decode's own order,
 # expanded on the cores (gemm-expand.cc) and multiplied by the bfp16 mmul -
 # every one of the 32 cores doing both (one expander feeding one multiplier
@@ -57,6 +57,8 @@ from pathlib import Path
 import ml_dtypes
 import numpy as np
 
+import kernelsrc
+
 import aie.iron as iron
 import aie.iron.kernels as akernels
 from aie.iron import Buffer, CompileTime, In, Lock, ObjectFifo, Out, Program, Runtime, Worker
@@ -89,7 +91,7 @@ HDR = MB * KS                          # the header object is one A object
 bf16 = ml_dtypes.bfloat16
 
 _here = Path(__file__).resolve().parent
-_src = (_here / "gemm-expand.cc").read_text()
+_src = kernelsrc.load(_here / "gemm-expand.cc")
 # the bfp16 mmul is (8, 8, 8): akernels.mm().mac_dims misreports bf16's
 _flags = ["-DMAC_T=8", f"-DEXP_STEP={KS}", "-DEXP_UNROLL=8"]
 _obj = "pgexp_" + hashlib.md5((_src + str(_flags)).encode()).hexdigest()[:8] + ".o"

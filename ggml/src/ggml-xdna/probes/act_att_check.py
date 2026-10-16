@@ -16,6 +16,11 @@ from aie.iron.controlflow import range_
 from aie.iron.kernel import ExternalFunction
 from aie.iron.kernels._common import _include_dirs
 
+# The kernels include the shared headers (xdna-math.h, xdna-vec.h), which do not
+# compile beside the source string: kernelsrc pastes them in, as the designs do.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "kernels"))
+import kernelsrc  # noqa: E402
+
 MODE = sys.argv[1] if len(sys.argv) > 1 else "prep"
 failed = []
 
@@ -29,7 +34,7 @@ ACT = 2112
 AW = ACT // 4
 D, H, NROT = 256, 8, 64
 here = Path(__file__).resolve().parent.parent / "kernels"
-src = (here / "gemv-q4.cc").read_text() + "\n" + (here / "act-att.cc").read_text()
+src = kernelsrc.inline((here / "gemv-q4.cc").read_text() + "\n" + (here / "act-att.cc").read_text())
 flags = ["-DK_TILE_Q4=256", "-DK_TILE_Q8=128", f"-DACT_TILE={ACT}", "-DN_CORE=64",
          "-DQ4_GROUP=32", "-DQ8_GROUP=16", "-DGEMV_VEC=64", "-DACT_RAW=0", "-DACT_PRO=1"]
 obj = "tpro_" + hashlib.md5((src + str(flags)).encode()).hexdigest()[:8] + ".o"

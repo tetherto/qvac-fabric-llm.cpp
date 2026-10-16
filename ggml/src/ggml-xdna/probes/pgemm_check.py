@@ -1,4 +1,4 @@
-# The prefill GEMM on the whole array (FLM_PREFILL_PLAN.md, step 1) against
+# The prefill GEMM on the whole array against
 # numpy: C (M x N) = A (M x K) @ W (K x N), W the decode GEMV's packed tiles in
 # the decode's own order, every one of the 32 cores expanding its tiles and
 # running the bfp16 mmul.

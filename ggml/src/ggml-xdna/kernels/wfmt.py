@@ -20,6 +20,8 @@ from pathlib import Path
 import ml_dtypes
 import numpy as np
 
+import kernelsrc
+
 from aie.iron.kernel import ExternalFunction
 from aie.iron.kernels._common import _include_dirs
 
@@ -41,8 +43,8 @@ def tile_bytes(fmt: str, k: int, n: int) -> int:
     if fmt == "q4g32":
         return k * n // 2 + 2 * (k // Q4_GROUP) * n * 4
     if fmt == "q8g16":
-        # one scale pair per group, no min plane: dequant_q8g16_bf16 reads
-        # the codes then a single [2 * ng, n] bf16 block
+        # One scale-pair plane: the device reads codes then 2*NG bf16 rows and
+        # never a min plane (dequant_q8g16_bf16 in gemm-dequant.cc).
         return k * n + (k // Q8_GROUP) * n * 4
     raise ValueError(f"unknown weight format {fmt!r}")
 
@@ -53,7 +55,7 @@ def group_size(fmt: str) -> int:
 
 def dequant_fn(fmt: str, k: int, n: int, s: int = MAC_S, t: int = MAC_T) -> ExternalFunction:
     """The core function that expands one packed tile into a bf16 (k, n) tile."""
-    src = (Path(__file__).resolve().parent / "gemm-dequant.cc").read_text()
+    src = kernelsrc.load(Path(__file__).resolve().parent / "gemm-dequant.cc")
     flags = [
         f"-DK_TILE={k}", f"-DN_TILE={n}",
         f"-DMAC_S={s}", f"-DMAC_T={t}", f"-DQ4_GROUP={Q4_GROUP}",
@@ -118,10 +120,10 @@ def pack_tile(fmt: str, codes: np.ndarray, d: np.ndarray, m: np.ndarray | None,
                 | ((flat[1::2].astype(np.uint8) & 0xF) << 4))
     else:
         body = flat.astype(np.int8).view(np.uint8)
-    planes = [split_pairs(d).reshape(-1)]
+    # q8g16 carries no min, so its callers pass m=None and no plane is written.
+    params = split_pairs(d).reshape(-1)
     if m is not None:
-        planes.append(split_pairs(m).reshape(-1))
-    params = np.concatenate(planes)
+        params = np.concatenate([params, split_pairs(m).reshape(-1)])
     return np.concatenate([body, params.view(np.uint8)])
 
 
