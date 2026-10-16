@@ -54,7 +54,7 @@ extern "C" void ggml_xdna_post_norm(const float * in, uint8_t * out) {
     // match what the projection's kernel reads - the same two forms the
     // gated stage writes (rec-gated.cc), chosen by the model's ssm_out
     // weight type: GATED_FMT=1 is the 8-bit form (tiles of 128 codes,
-    // groups of 16, gsum at tile+128, fmt word 1), the default the 4-bit
+    // groups of 32, gsum at tile+128, fmt word 1), the default the 4-bit
     // form (tiles of 256, groups of 32). A mismatch reads as garbage.
     int32_t * hdr = (int32_t *)act;
     hdr[0] = @PNT@;
@@ -79,23 +79,32 @@ extern "C" void ggml_xdna_post_norm(const float * in, uint8_t * out) {
         int8 * code = (int8 *)tile;
 #if defined(GATED_FMT) && GATED_FMT == 1
         float * gsum = (float *)(tile + 128);
-        float * gd = gsum + 8;
-        for (int g = 0; g < 8; g++) {
-            const int base = t * 128 + g * 16;
+        float * gd = gsum + 4;
+        for (int g = 0; g < 4; g++) {
+            const int base = t * 128 + g * 32;
             auto y0 = aie::mul(aie::mul(aie::load_v<16>(hattn + base), vscale)
                                    .to_vector<float>(),
                                aie::load_v<16>(gam + base)).to_vector<float>();
-            const auto a0 = aie::bit_and(y0.cast_to<int32>(), absmask)
-                                .cast_to<float>();
+            auto y1 = aie::mul(aie::mul(aie::load_v<16>(hattn + base + 16), vscale)
+                                   .to_vector<float>(),
+                               aie::load_v<16>(gam + base + 16)).to_vector<float>();
+            const auto a0 = aie::max(
+                aie::bit_and(y0.cast_to<int32>(), absmask).cast_to<float>(),
+                aie::bit_and(y1.cast_to<int32>(), absmask).cast_to<float>());
             const float ga = aie::reduce_max(a0);
             const float gdv = ga > 0.0f ? ga / 127.0f : 1.0f;
             const auto ginv = aie::broadcast<float, 16>(1.0f / gdv);
             auto q0 = aie::min(aie::max(aie::mul(y0, ginv).to_vector<float>(),
                                         vlo), vhi);
+            auto q1 = aie::min(aie::max(aie::mul(y1, ginv).to_vector<float>(),
+                                        vlo), vhi);
             const auto i0 = aie::sub(aie::add(q0, magic).cast_to<int32>(),
                                       magici);
-            aie::store_v(code + g * 16, aie::pack(aie::pack(i0)));
-            gsum[g] = (float) aie::reduce_add(i0);
+            const auto i1 = aie::sub(aie::add(q1, magic).cast_to<int32>(),
+                                      magici);
+            aie::store_v(code + g * 32, aie::pack(aie::pack(i0)));
+            aie::store_v(code + g * 32 + 16, aie::pack(aie::pack(i1)));
+            gsum[g] = (float) (aie::reduce_add(i0) + aie::reduce_add(i1));
             gd[g] = gdv;
         }
 #else

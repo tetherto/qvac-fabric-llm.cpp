@@ -27,17 +27,25 @@ struct xdna_device {
 // a shared hw_context. All variants of the same xclbin share the context via
 // the shared_ptr; the runtime keeps contexts alive for the process lifetime.
 struct xdna_kernel {
+    xrt::device                      device;
     std::shared_ptr<xrt::hw_context> context;
     xrt::kernel                      kernel;
     xrt::bo                          insts_bo;
     int64_t                          insts_bytes = 0;
     std::string                      xclbin_name;
+    // The stream as bound, for a token's streams to be joined into one
+    // command (xdna_run_submit).
+    std::vector<uint32_t>            insts_host;
 };
 
 // A host-visible device buffer object (BO).
 struct xdna_buffer {
     xrt::bo bo;
     size_t  bytes = 0;
+    // The BO this one is a view of (null: its own) and where in it: what a
+    // joined stream names instead of this buffer.
+    xdna_buffer * root = nullptr;
+    size_t        root_off = 0;
 };
 
 // Pool of kernels: holds the artifact stems found in the search dirs and the

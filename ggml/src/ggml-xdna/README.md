@@ -249,6 +249,11 @@ OMP_WAIT_POLICY=PASSIVE ./build/bin/llama-server -m model.gguf \
 - `--poll 0` stops the threadpool busy-polling while the NPU works;
   `OMP_WAIT_POLICY=PASSIVE` does the same for the host fallback pool.
 - Offload as usual: `-ngl 99` puts every layer on the device.
+- Leave flash attention on (`-fa on`, or `auto`, the default). The NPU's
+  attention routes take llama's `FLASH_ATTN_EXT`; with `-fa off` llama builds
+  attention from `MUL_MAT` and `SOFT_MAX`, which run on the host: about half
+  the decode speed on the 0.8B, with ten times the host work. The backend
+  logs a warning once when it sees that.
 
 ### Environment
 
@@ -344,8 +349,8 @@ architecture.
 - The host-built instruction streams and the RTP/shim constants follow the
   mlir-aie placement. The design tag does not cover the toolchain version, so a
   toolchain bump has to be paired with re-reading those constants.
-- One backend context per process holds the dispatch state, so two decodes at
-  once from separate llama contexts share it (single-context use is what is
-  tested).
+- All llama contexts in a process share one backend context. Their graph
+  computes take turns on it (the array runs one command stream at a time
+  anyway).
 - The device reports itself to the scheduler as a GPU while its buffers are host
   memory, so the reported free memory and any `--fit` accounting are nominal.

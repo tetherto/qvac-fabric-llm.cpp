@@ -6,6 +6,7 @@
 #include "xdna-gdn-prefill.h"
 #include "xdna-conv-prefill.h"
 #include "xdna-fa-prefill.h"
+#include "xdna-prof.h"
 
 #include "ggml-impl.h"
 #include "ggml-quants.h"
@@ -940,8 +941,23 @@ static bool gemv_compute_group(xdna_ops * ops, xdna_ops::gemv_group & grp,
         }
 
         grp.buf.resize((size_t) grp.geom.n_real);
-        if (!xdna_gemv_run(g, (const float *) grp.nodes[0]->src[1]->data,
-                           grp.buf.data())) {
+        bool ok;
+        {
+            // Label: every weight this dispatch carries, joined - a group can
+            // merge several projections that read the same activation (see
+            // xdna_ops_plan_gemv) into one dispatch.
+            std::string label;
+            for (size_t k = 0; k < grp.nodes.size(); k++) {
+                if (k) {
+                    label += "+";
+                }
+                label += ggml_get_name(grp.nodes[k]->src[0]);
+            }
+            xdna_prof::gemv_timer __xdna_prof_gv(std::move(label));
+            ok = xdna_gemv_run(g, (const float *) grp.nodes[0]->src[1]->data,
+                               grp.buf.data());
+        }
+        if (!ok) {
             return false;
         }
         grp.ran = true;

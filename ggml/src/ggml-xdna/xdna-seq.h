@@ -119,7 +119,8 @@ struct xdna_bd {
     uint32_t ax_cache  = 0;   // AXI cache bits (usually 2)
     uint32_t iter_size   = 1; // iteration count (outermost repeat)
     uint32_t iter_stride = 1; // iteration stride
-    uint32_t next_bd   = 0;   // next BD id in the chain (0 = none)
+    uint32_t next_bd   = 0;   // next BD id in the chain
+    bool     use_next  = false; // continue into next_bd when this one ends
     bool     valid     = true;
 
     // packet header (only when used with packet routing)
