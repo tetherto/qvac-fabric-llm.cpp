@@ -615,6 +615,14 @@ enum FaCodePath {
     FA_COOPMAT2,
 };
 
+// vk_fa_pipeline_state::flags bits above the ones get_fa_pipeline_state derives from its arguments;
+// the shader side is flash_attn_base.glsl / flash_attn_cm1_mr.comp
+static constexpr uint32_t FA_FLAG_V_TRANSPOSED = 64;    // V is read from the per-head V^T scratch
+static constexpr uint32_t FA_FLAG_MULTI_ROW    = 128;   // host only: build the pipeline from flash_attn_cm1_mr
+static constexpr uint32_t FA_FLAG_MR_LAZY      = 256;   // multi-row: skip identity O rescales
+static constexpr uint32_t FA_FLAG_MR_NOEB      = 512;   // multi-row: no loop-end barrier
+static constexpr uint32_t FA_FLAG_MR_VPOST     = 1024;  // multi-row: V^T loads before the softmax barrier
+
 struct vk_fa_pipeline_state {
     uint32_t HSK, HSV;
     uint32_t Br, Bc;
@@ -1058,6 +1066,7 @@ struct vk_device_struct {
 
     vk_pipeline pipeline_dequant[GGML_TYPE_COUNT];
     vk_pipeline pipeline_dequant_transpose[GGML_TYPE_COUNT]; // fused dequant+transpose for FA quant-KV
+    vk_pipeline pipeline_dequant_f16_transpose_vt; // f16 V -> per-head V^T for the coopmat1 FA (V_TRANSPOSED)
     vk_pipeline pipeline_dequant_mul_mat_vec_f32_f32[DMMV_WG_SIZE_COUNT][GGML_TYPE_COUNT][mul_mat_vec_max_cols];
     vk_pipeline pipeline_dequant_mul_mat_vec_f16_f32[DMMV_WG_SIZE_COUNT][GGML_TYPE_COUNT][mul_mat_vec_max_cols];
     vk_pipeline pipeline_dequant_mul_mat_vec_id_f32[DMMV_WG_SIZE_COUNT][GGML_TYPE_COUNT];
@@ -2682,6 +2691,13 @@ class vk_perf_logger {
         timings[name].push_back(time);
     }
 
+    // Log a sub-node interval under a caller-supplied name. Used for work a node's handler
+    // dispatches before the op itself (e.g. the FA K/V contiguize/dequant pass), which would
+    // otherwise be billed to the op and invisible. No flops: these move bytes, not math.
+    void log_timing_named(const char *name, uint64_t time) {
+        timings[std::string(name)].push_back(time);
+    }
+
     void log_timing(const std::vector<ggml_tensor *> &nodes, const std::vector<const char *> &names, uint64_t time) {
         uint64_t total_flops = 0;
         std::string name;
@@ -2874,6 +2890,13 @@ class vk_perf_logger {
     }
 };
 
+// One memoized device-local capacity decision for a flash attention scratch, see ggml_vk_fa_scratch_fits
+struct vk_fa_scratch_gate {
+    uint64_t sz;
+    bool fits;
+    bool logged;
+};
+
 struct ggml_backend_vk_context {
     std::string name;
 
@@ -2883,6 +2906,9 @@ struct ggml_backend_vk_context {
     ggml_vk_garbage_collector gc;
     size_t prealloc_size_x, prealloc_size_y, prealloc_size_split_k, prealloc_size_add_rms_partials, prealloc_size_add_rms_partials_offset, prealloc_size_tile;
     vk_buffer prealloc_x, prealloc_y, prealloc_split_k, prealloc_add_rms_partials, prealloc_tile, sync_staging;
+    // memoized capacity decisions for the FA scratch in prealloc_x, see ggml_vk_fa_scratch_fits
+    vk_fa_scratch_gate fa_dequant_gate; // the K/V scratch alone
+    vk_fa_scratch_gate fa_vt_gate;      // K/V scratch + V^T
     vk::Fence fence, almost_ready_fence;
     bool submit_pending {};
     bool almost_ready_fence_pending {};
@@ -2967,6 +2993,9 @@ struct ggml_backend_vk_context {
     std::vector<int> query_fusion_node_count;
     std::vector<ggml_tensor *> query_nodes;
     std::vector<int> query_node_idx;
+    // non-null => this query slot closes a sub-node interval logged under this literal name,
+    // not a graph node. See ggml_vk_perf_mark_subop.
+    std::vector<const char *> query_sub_names;
     int32_t num_queries {};
     int32_t query_idx {};
 };
@@ -4510,7 +4539,45 @@ static vk_fa_tuning_params get_fa_tuning_params_coopmat1(const vk_device& device
     result.block_cols = coopmat_block_cols * num_subgroups;
     result.row_split = num_subgroups;
     result.subgroup_size = device->subgroup_size;
+
+    // Pin a 32-wide subgroup only where narrowing is free. The shader derives cols_per_iter,
+    // threads_per_rowgroup and every strided load loop from gl_WorkGroupSize.x, and
+    // workgroup_size is num_subgroups * subgroup_size, so threads_per_rowgroup always equals the
+    // real subgroup size. Halving the subgroup halves the workgroup, and the per-lane O state
+    // grows as d_per_thread = ceil((HSV/4) / threads_per_rowgroup). Pin only when that count is
+    // unchanged. Above that point the narrow subgroup issues roughly 1.5x to 1.8x the
+    // instructions for the same number of SIMD passes, which loses on an issue-bound kernel:
+    // hd256 measures 6 to 18 percent slower. The test depends on HSV only; HSK does not enter
+    // d_per_thread. On a 64-wide device it reduces exactly to hsv <= 128.
+    // On by default (=1, applies the rule); =0 disables. =2 forces the pin regardless of
+    // head size, for measuring the configurations the rule rejects. Diagnostic only.
+    static const int fa_wave32 = [] {
+        const char * e = getenv("GGML_VK_FA_WAVE32");
+        return e ? atoi(e) : 1;
+    }();
+    // Multi-row dispatches only. Decode dispatches carry N = gqa_ratio rows (8 on
+    // Qwen3-Coder-30B) and there the narrow subgroup loses: tg64 at d8192/d32768 measured
+    // 3.5 to 4 percent slower with the pin (q8_0 KV), while prefill gains up to 10 percent
+    // at d8192. Keep the pin to the prefill shapes it was measured on.
+    if (fa_wave32 != 0 &&
+        n_rows >= 32 &&
+        device->subgroup_size_control &&
+        32 < device->subgroup_size &&                              // narrow only, never widen
+        device->subgroup_min_size <= 32 && 32 <= device->subgroup_max_size &&
+        (result.block_cols % 32) == 0 &&                           // cols_per_thread stays >= 1
+        (result.block_cols * result.block_rows / 4) >= num_subgroups * 32 &&  // mask_cache != 0
+        (fa_wave32 == 2 ||
+         CEIL_DIV(hsv / 4, 32u) == CEIL_DIV(hsv / 4, device->subgroup_size))) {
+        result.subgroup_size = 32;
+    }
+
     result.workgroup_size = num_subgroups * result.subgroup_size;
+
+    // threads_per_rowgroup == the real subgroup size is load-bearing in three places:
+    // the subgroupMax row reduction, the subgroupAdd of Lf, and tmpsh[gl_SubgroupID], which is
+    // sized by row_split and would be written out of bounds if gl_NumSubgroups exceeded it.
+    GGML_ASSERT(result.workgroup_size == result.row_split * result.subgroup_size);
+    GGML_ASSERT(result.block_cols % result.subgroup_size == 0);
 
     const uint32_t D_lsb = D ^ (D & (D-1));  // extract lowest set bit
     result.d_split = std::min(std::min(result.subgroup_size, 8u), D_lsb / 4);
@@ -5536,6 +5603,13 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                 if (f32acc) { spv_data = flash_attn_f32_f16_cm1_data;        spv_size = flash_attn_f32_f16_cm1_len; }
                 else        { spv_data = flash_attn_f32_f16_f16acc_cm1_data; spv_size = flash_attn_f32_f16_f16acc_cm1_len; }
                 name = aligned ? "flash_attn_f32_f16_aligned_cm1" : "flash_attn_f32_f16_cm1";
+                if (fa.first.flags & FA_FLAG_MULTI_ROW) {
+                    // multi-row prefill flash attention (GGML_VK_FA_MR): f32 accumulation, aligned only
+                    GGML_ASSERT(f32acc && aligned);
+                    spv_data = flash_attn_f32_f16_mr_cm1_data;
+                    spv_size = flash_attn_f32_f16_mr_cm1_len;
+                    name = "flash_attn_f32_f16_mr_cm1";
+                }
             }
             ggml_vk_create_pipeline(device, fa.second, name, spv_size, spv_data, "main", 8,
                                     sizeof(vk_flash_attn_push_constants), {Br, 1, 1},
@@ -6739,6 +6813,9 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     ggml_vk_create_pipeline(device, device->pipeline_dequant[GGML_TYPE_Q5_1], "dequant_q5_1", dequant_q5_1_len, dequant_q5_1_data, "main", 2, 5 * sizeof(uint32_t), {256 * 16, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_dequant[GGML_TYPE_Q8_0], "dequant_q8_0", dequant_q8_0_len, dequant_q8_0_data, "main", 2, 5 * sizeof(uint32_t), {256 * 16, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_dequant_transpose[GGML_TYPE_Q8_0], "dequant_q8_0_transpose", dequant_q8_0_transpose_len, dequant_q8_0_transpose_data, "main", 2, 5 * sizeof(uint32_t), {256 * 16, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_dequant_transpose[GGML_TYPE_F16], "dequant_f16_transpose", dequant_f16_transpose_len, dequant_f16_transpose_data, "main", 2, 5 * sizeof(uint32_t), {256 * 8, 1, 1}, {}, 1);
+    // one 64 kv x 64 hs tile per workgroup, dispatched as (HS / 64, KV / 64, heads)
+    ggml_vk_create_pipeline(device, device->pipeline_dequant_f16_transpose_vt, "dequant_f16_transpose_vt", dequant_f16_transpose_vt_len, dequant_f16_transpose_vt_data, "main", 2, 5 * sizeof(uint32_t), {64, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_dequant[GGML_TYPE_Q2_K], "dequant_q2_k", dequant_q2_k_len, dequant_q2_k_data, "main", 2, 5 * sizeof(uint32_t), {256 * 64, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_dequant[GGML_TYPE_Q3_K], "dequant_q3_k", dequant_q3_k_len, dequant_q3_k_data, "main", 2, 5 * sizeof(uint32_t), {256 * 64, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_dequant[GGML_TYPE_Q4_K], "dequant_q4_k", dequant_q4_k_len, dequant_q4_k_data, "main", 2, 5 * sizeof(uint32_t), {256 * 32, 1, 1}, {}, 1);
@@ -9423,6 +9500,8 @@ static void ggml_vk_init(ggml_backend_vk_context * ctx, size_t idx) {
     ctx->prealloc_size_x = 0;
     ctx->prealloc_size_y = 0;
     ctx->prealloc_size_split_k = 0;
+    ctx->fa_dequant_gate = {};
+    ctx->fa_vt_gate = {};
     // Fixed size of 1KB, for deterministic behavior
     ctx->prealloc_size_add_rms_partials = 1024;
     ctx->prealloc_size_tile = 0;
@@ -13298,8 +13377,8 @@ static bool ggml_vk_flash_attn_coopmat_shmem_support(const vk_device& device, co
     const uint32_t qstride = hsk_pad / 4 + 2;
     const uint32_t Qf = Br * qstride * f16vec4;
 
-    const uint32_t psh_stride = Br / 4 + 2;
-    const uint32_t Psh = Bc * psh_stride * f16vec4;
+    const uint32_t psh_stride = Bc / 4 + 2;
+    const uint32_t Psh = Br * psh_stride * f16vec4;
 
     const uint32_t sfshstride = (hsk <= 128) ? (Br + 8) : Br;
     const uint32_t sfsh = Bc * sfshstride * acctype;
@@ -13325,6 +13404,89 @@ static bool ggml_vk_flash_attn_coopmat_shmem_support(const vk_device& device, co
     VK_LOG_DEBUG("ggml_vk_flash_attn_coopmat_shmem_support(HSK=" << hsk << ", HSV=" << hsv << ", f32acc=" << f32acc << ", qjl_quant_k=" << qjl_quant_k << ", qjl_full_proj=" << qjl_full_proj << ", total_size=" << total_size << ", supported=" << supported);
 
     return supported;
+}
+
+// Capacity gate for the dequant-once f16 K/V scratch. On discrete devices the scratch can push the
+// working set past free VRAM, and the driver then silently pages device-local memory (~15x prefill
+// regression measured on an 8 GB card at long context). UMA has no separate pool to overflow.
+//
+// Gates our own device-local usage against the physical heap size, less a reserve for memory not
+// visible in-process. heapBudget is deliberately not the signal: ggml_backend_vk_get_device_memory
+// computes heapBudget - heapUsage unsigned, which wraps when the device is oversubscribed. Nor can
+// the allocation gate itself: on WDDM vkAllocateMemory only fails near physical heap size, above
+// the free-VRAM level where paging starts. The reserve is necessarily conservative because other
+// processes' VRAM use is invisible to us. GGML_VK_FA_DEQUANT=0/1 forces the path off/on;
+// GGML_VK_FA_DEQUANT_RESERVE_MB overrides the reserve.
+//
+// `gate` memoizes the decision for one scratch (the K/V scratch, or K/V + V^T); `what` and `force`
+// name it and its override in the log line.
+static bool ggml_vk_fa_scratch_fits(ggml_backend_vk_context * ctx, vk_fa_scratch_gate & gate, uint64_t scratch_sz,
+                                    const char * what, const char * force) {
+    const vk_device& device = ctx->device;
+
+    if (device->uma) {
+        return true;
+    }
+
+    // Decided once per scratch size, so the decision cannot flip between layers as usage grows.
+    if (gate.sz == scratch_sz) {
+        return gate.fits;
+    }
+
+    static const uint64_t reserve = [] {
+        const char * env = getenv("GGML_VK_FA_DEQUANT_RESERVE_MB");
+        return (uint64_t)(env ? atoi(env) : 1024) * 1024 * 1024;
+    }();
+
+    bool fits = false;
+
+    // Without VK_EXT_memory_budget our usage is unknowable, so leave the path disabled.
+    if (vk_instance.device_supports_membudget[device->idx]) {
+        vk::PhysicalDeviceMemoryBudgetPropertiesEXT budgetprops;
+        vk::PhysicalDeviceMemoryProperties2 memprops = {};
+        memprops.pNext = &budgetprops;
+        device->physical_device.getMemoryProperties2(&memprops);
+
+        uint64_t heap_size = 0;
+        uint64_t heap_used = 0;
+        for (uint32_t i = 0; i < memprops.memoryProperties.memoryHeapCount; ++i) {
+            const vk::MemoryHeap & heap = memprops.memoryProperties.memoryHeaps[i];
+            if (heap.flags & vk::MemoryHeapFlagBits::eDeviceLocal) {
+                heap_size += heap.size;
+                heap_used += budgetprops.heapUsage[i];
+            }
+        }
+        // heap_used already covers scratch allocated on a previous ubatch, so counting scratch_sz
+        // in full is conservative by up to the current scratch size.
+        fits = heap_size > reserve && heap_used + scratch_sz + reserve <= heap_size;
+    }
+
+    if (!fits && !gate.logged) {
+        gate.logged = true;
+        GGML_LOG_INFO("ggml_vulkan: flash attention %s disabled: %llu MiB scratch does not fit "
+                      "device-local memory with a %llu MiB reserve. Set %s to force it on.\n",
+                      what, (unsigned long long)(scratch_sz >> 20), (unsigned long long)(reserve >> 20), force);
+    }
+
+    gate.sz = scratch_sz;
+    gate.fits = fits;
+    return fits;
+}
+
+// Close a timestamp interval mid-node so work a handler dispatches before its op is billed
+// separately instead of being folded into the op's own time. `name` must be a string literal
+// (stored by pointer). No-op unless the perf logger is on in per-op mode.
+static void ggml_vk_perf_mark_subop(ggml_backend_vk_context * ctx, vk_context& subctx, const char * name) {
+    if (!vk_perf_logger_enabled || vk_perf_logger_concurrent || ctx->query_pool == VK_NULL_HANDLE) {
+        return;
+    }
+    if (ctx->query_idx >= (int)ctx->num_queries) {
+        return;                       // pool headroom exhausted; drop the mark rather than overflow
+    }
+    ctx->query_nodes[ctx->query_idx] = nullptr;
+    ctx->query_fusion_names[ctx->query_idx] = nullptr;
+    ctx->query_sub_names[ctx->query_idx] = name;
+    subctx->s->buffer->buf.writeTimestamp(vk::PipelineStageFlagBits::eAllCommands, ctx->query_pool, ctx->query_idx++);
 }
 
 static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * q, const ggml_tensor * k, const ggml_tensor * v, const ggml_tensor * mask, const ggml_tensor * sinks, ggml_tensor * dst) {
@@ -13406,7 +13568,14 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
         }
     }
 
-    // dequant K/V once into an f16 scratch, reordered KV layout so FA can read without a stride
+    // For prefill with quantized K/V, dequantize+transpose K/V once into a per-head-contiguous
+    // f16 scratch and run the f16 FA path, instead of the coopmat1 shader re-dequantizing the
+    // whole KV inside every Q-workgroup. The KV-cache view reaching FA is [0,2,1,3]-permuted but
+    // dense, so we require dense allocation (not ggml_is_contiguous) and block-contiguous dim0,
+    // and only engage where a fused dequant-transpose shader exists. Prefill only
+    // (n_rows >= 64); measured neutral at shallow depth and up to ~2x at long context.
+    // The scratch is bound as a single storage buffer holding K and V back to back, so the SUM of
+    // the two must fit maxStorageBufferRange, not each half independently.
     auto is_dense_kv_cache = [](const ggml_tensor * t) {
         return t->nb[0] == ggml_type_size(t->type) &&
                t->nb[2] == ggml_row_size(t->type, t->ne[0]) &&
@@ -13415,17 +13584,34 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
     };
     const bool k_quant = k->type != GGML_TYPE_F16 && k->type != GGML_TYPE_BF16 && k->type != GGML_TYPE_F32;
     const bool v_quant = v->type != GGML_TYPE_F16 && v->type != GGML_TYPE_BF16 && v->type != GGML_TYPE_F32;
-    const bool use_dequant_kv = k_quant && v_quant && neq1 >= 64 &&
+    const uint64_t kv_f16_sz = ((uint64_t)ggml_nelements(k) + (uint64_t)ggml_nelements(v)) * sizeof(ggml_fp16_t);
+    static const char * fa_dequant_env = getenv("GGML_VK_FA_DEQUANT");
+    const bool fa_dequant_off = fa_dequant_env && fa_dequant_env[0] == '0';
+    const bool fa_dequant_on  = fa_dequant_env && fa_dequant_env[0] == '1';
+    // Contiguize pass for f16 K/V (GGML_VK_FA_KV_CONTIG=0 opts out). The KV-cache view
+    // reaching FA is head-interleaved ([HS, NH, KV] physically), and the cm1
+    // direct-from-global coopMatLoads run ~2-5x slower on those strided rows than on
+    // per-head-contiguous K/V. Copy K/V once into the scratch instead (dequant_f16_transpose
+    // is a pure strided copy). Only engages when the rows are actually strided, and shares
+    // the quant path's prefill/allocation/scratch-capacity gates below.
+    static const char * fa_kv_contig_env = getenv("GGML_VK_FA_KV_CONTIG");
+    const bool fa_kv_contig = !(fa_kv_contig_env && fa_kv_contig_env[0] == '0');
+    const bool kv_f16_strided = k->type == GGML_TYPE_F16 && v->type == GGML_TYPE_F16 &&
+                                (k->nb[1] != (uint64_t)HSK * sizeof(ggml_fp16_t) ||
+                                 v->nb[1] != (uint64_t)HSV * sizeof(ggml_fp16_t)) &&
+                                (HSK % 8) == 0 && (HSV % 8) == 0;
+    const bool use_dequant_kv = !fa_dequant_off && ((k_quant && v_quant) || (fa_kv_contig && kv_f16_strided)) && neq1 >= 64 &&
                                 is_dense_kv_cache(k) && is_dense_kv_cache(v) &&
-                                (uint64_t)ggml_nelements(k) * sizeof(ggml_fp16_t) <= ctx->device->properties.limits.maxStorageBufferRange &&
-                                (uint64_t)ggml_nelements(v) * sizeof(ggml_fp16_t) <= ctx->device->properties.limits.maxStorageBufferRange &&
+                                kv_f16_sz <= ctx->device->properties.limits.maxStorageBufferRange &&
                                 ctx->device->pipeline_dequant_transpose[k->type] != nullptr &&
                                 ctx->device->pipeline_dequant_transpose[v->type] != nullptr &&
                                 // coopmat2 path does not benefit from the f16 scratch
                                 !ctx->device->coopmat2 &&
                                 // Intel Xe1 regresses, see PR 25494
                                 (ctx->device->vendor_id != VK_VENDOR_ID_INTEL ||
-                                 (ctx->device->coopmat_support && ctx->device->architecture != vk_device_architecture::INTEL_XE1));
+                                 (ctx->device->coopmat_support && ctx->device->architecture != vk_device_architecture::INTEL_XE1)) &&
+                                (fa_dequant_on || ggml_vk_fa_scratch_fits(ctx, ctx->fa_dequant_gate, kv_f16_sz, "dequant-once (K/V)",
+                                                                   "GGML_VK_FA_DEQUANT=1"));
     const ggml_type k_type_eff = use_dequant_kv ? GGML_TYPE_F16 : k->type;
     const ggml_type v_type_eff = use_dequant_kv ? GGML_TYPE_F16 : v->type;
 
@@ -13505,8 +13691,110 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
     // Only use mask opt when the mask is fairly large. This hasn't been tuned extensively.
     bool use_mask_opt = mask && !use_sparse && nem1 >= 32 && nem0 * nem1 > 32768 && nem0 >= tuning_params.block_cols * 16
                         && (ctx->device->architecture != vk_device_architecture::AMD_GCN || HSK > 256 || HSV > 256);
+    const bool radv_rdna3 = ctx->device->driver_id == vk::DriverId::eMesaRadv &&
+                            ctx->device->architecture == vk_device_architecture::AMD_RDNA3;
+
+    // V^T for the coopmat1 prefill FA: transpose f16 V per head into a [HSV][KV + 128] scratch so a P x V
+    // B-operand fragment is one contiguous 32-byte run per lane instead of 16 kv-strided 16-bit loads.
+    // GGML_VK_FA_VT: unset = on for the cm1 kernel on RADV RDNA3, 1 = on everywhere, 0 = off (this also turns
+    // off the multi-row kernel, which reads V only from the V^T scratch). The cm1 kernel cannot use it with
+    // shmem staging, which stages V rows from the row-major layout. =1 also skips the capacity check below.
+    static const int fa_vt_env = [] {
+        const char * e = getenv("GGML_VK_FA_VT");
+        return e ? atoi(e) : -1;
+    }();
+    // dest row stride KV + 128: 2 * KV bytes is a multiple of 4 KB for every KV admitted here, which would put
+    // the 16 hd rows of a fragment on one memory channel; +256 B moves consecutive rows to the next channel
+    const uint32_t vt_kv_pad = KV + 128;
+    const uint64_t vt_size = (uint64_t)HSV * vt_kv_pad * nev2 * sizeof(ggml_fp16_t);
+    const uint64_t vt_offset = use_dequant_kv ? kv_f16_sz : 0;
+    const bool vt_eligible = fa_vt_env != 0 && tuning_params.path == FA_COOPMAT1 && aligned && !tuning_params.shmem_staging &&
+                             v_type_eff == GGML_TYPE_F16 && !use_sparse && gqa_ratio == 1 && neq1 >= 64 && nev3 == 1 &&
+                             (KV % 64) == 0 && (HSV % 64) == 0 && KV < 65536 * 64 &&
+                             ctx->device->pipeline_dequant_f16_transpose_vt != nullptr &&
+                             (use_dequant_kv || ((nbv1 % 8) == 0 && (nbv2 % 8) == 0)) &&
+                             vt_size <= ctx->device->properties.limits.maxStorageBufferRange &&
+                             vt_offset + vt_size <= ctx->device->max_buffer_size;
+
+    // Multi-row prefill FA (flash_attn_cm1_mr.comp): one workgroup of eight wave32 subgroups covers 64 rows =
+    // H heads x 64/H tokens that share a KV head. Q stays in registers and each 16-key K/V tile serves all 64
+    // rows (cm1 pins Br at 16). K is read as per-head f16 rows (the contiguized scratch for a KV cache view),
+    // V from the V^T scratch. GGML_VK_FA_MR_H sets H (default 2 when it divides the GQA ratio, else 1).
+    // GGML_VK_FA_MR: unset = on for head size 256 on RADV RDNA3 (where it was measured: Qwen3.8-27B, FA per
+    // pp2048 ubatch 2067 -> 954 ms at d32768 on gfx1151), 1 = on for every eligible shape, 0 = off.
+    static const int fa_mr_env = [] {
+        const char * e = getenv("GGML_VK_FA_MR");
+        return e ? atoi(e) : -1;
+    }();
+    static const int fa_mr_h_env = [] {
+        const char * e = getenv("GGML_VK_FA_MR_H");
+        return e ? atoi(e) : 0;
+    }();
+    const bool fa_mr_on = fa_mr_env > 0 || (fa_mr_env < 0 && HSK == 256 && radv_rdna3);
+
+    // The V^T region extends prealloc_x past the K/V scratch. When it would grow the allocation, gate the whole
+    // scratch (K/V + V^T) on device-local capacity, as the K/V scratch alone is gated above; an allocation that
+    // is already large enough adds nothing. Only asked when V^T would be used, so other devices never query it.
+    const uint64_t vt_scratch_sz = vt_offset + vt_size;
+    const bool vt_ok = vt_eligible && (fa_mr_on || fa_vt_env > 0 || radv_rdna3) &&
+                       (fa_vt_env > 0 || vt_scratch_sz <= ctx->prealloc_size_x ||
+                        ggml_vk_fa_scratch_fits(ctx, ctx->fa_vt_gate, vt_scratch_sz, "V^T", "GGML_VK_FA_VT=1"));
+    const uint32_t qk_ratio_mr = nek2 > 0 ? (uint32_t)(neq2 / nek2) : 0;
+    const uint32_t mr_h = fa_mr_h_env > 0 ? (uint32_t)fa_mr_h_env : ((qk_ratio_mr % 2) == 0 ? 2u : 1u);
+    const bool use_mr = fa_mr_on && vt_ok && f32acc &&
+                        k_type_eff == GGML_TYPE_F16 && HSK == HSV && (HSK == 128 || HSK == 256) &&
+                        (mr_h == 1 || mr_h == 2 || mr_h == 4) && qk_ratio_mr > 0 && (qk_ratio_mr % mr_h) == 0 &&
+                        neq2 == (int64_t)qk_ratio_mr * nek2 && nek2 == nev2 &&
+                        (mask == nullptr || (mask->type == GGML_TYPE_F16 && nem2 <= 1 && nem3 <= 1 &&
+                                             mask->nb[1] == (size_t)KV * sizeof(ggml_fp16_t))) &&
+                        (q_stride % 4) == 0 && (nbq2 % 16) == 0 && (nbq3 % 16) == 0 &&
+                        (k_stride % 8) == 0 && (nbk2_eff % 16) == 0 && (nbk3_eff % 16) == 0 &&
+                        ctx->device->subgroup_size_control && ctx->device->subgroup_min_size <= 32 && 32 <= ctx->device->subgroup_max_size &&
+                        ctx->device->subgroup_clustered && ctx->device->subgroup_vote;
+    const bool use_vt = vt_ok && (use_mr || fa_vt_env > 0 || radv_rdna3);
+    if (use_mr) {
+        tuning_params.block_rows = 64 / mr_h;
+        tuning_params.block_cols = 64;
+        tuning_params.row_split = mr_h;
+        tuning_params.subgroup_size = 32;
+        tuning_params.workgroup_size = 256;
+        tuning_params.shmem_staging = 0;
+        tuning_params.disable_subgroups = false;
+        tuning_params.limit_occupancy_shmem = 0;
+        workgroups_y = (uint32_t)neq2 / mr_h;
+        static const bool fa_mr_log = [] {
+            const char * e = getenv("GGML_VK_FA_MR_LOG");
+            return e != nullptr && atoi(e) != 0;
+        }();
+        if (fa_mr_log) {
+            GGML_LOG_INFO("ggml_vulkan: multi-row FA N=%u KV=%u hs=%u heads=%u H=%u gqa=%u mask=%d mask_opt=%d contig=%d\n",
+                          N, KV, HSK, (uint32_t)neq2, mr_h, qk_ratio_mr, mask != nullptr, (int)use_mask_opt, (int)use_dequant_kv);
+        }
+    }
+
     vk_fa_pipeline_state fa_pipeline_state = get_fa_pipeline_state(ctx->device, tuning_params, HSK, HSV, aligned, f32acc,
                                                                    mask != nullptr, use_mask_opt, logit_softcap != 0, use_sparse, k_type_eff, v_type_eff);
+    if (use_vt) {
+        fa_pipeline_state.flags |= FA_FLAG_V_TRANSPOSED;
+    }
+    if (use_mr) {
+        // schedule knobs, each default on (=0 disables); Qwen3.8-27B pp2048 at d32768, FA op time on gfx1151:
+        //   GGML_VK_FA_MR_LAZY:  skip the O rescale of row blocks whose running max did not move  1171 -> 1095 ms
+        //   GGML_VK_FA_MR_NOEB:  drop the loop-end barrier (no LDS hazard needs it)                1099 -> 1008 ms
+        //   GGML_VK_FA_MR_VPOST: issue the V^T loads between the S store and the softmax barrier   1099 ->  969 ms
+        //   all three: 954 ms
+        const auto fa_mr_knob = [](const char * name) {
+            const char * e = getenv(name);
+            return e == nullptr || atoi(e) != 0;
+        };
+        static const bool fa_mr_lazy  = fa_mr_knob("GGML_VK_FA_MR_LAZY");
+        static const bool fa_mr_noeb  = fa_mr_knob("GGML_VK_FA_MR_NOEB");
+        static const bool fa_mr_vpost = fa_mr_knob("GGML_VK_FA_MR_VPOST");
+        fa_pipeline_state.flags |= FA_FLAG_MULTI_ROW |
+                                   (fa_mr_lazy  ? FA_FLAG_MR_LAZY  : 0) |
+                                   (fa_mr_noeb  ? FA_FLAG_MR_NOEB  : 0) |
+                                   (fa_mr_vpost ? FA_FLAG_MR_VPOST : 0);
+    }
 
     vk_pipeline pipeline = nullptr;
 
@@ -13553,6 +13841,8 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
         // Match the shader's per-split block count so no split is empty.
         const uint32_t per_blocks = CEIL_DIV(total_blocks, split_k);
         split_k = CEIL_DIV(total_blocks, per_blocks);
+    } else if (use_mr) {
+        // multi-row FA: prefill only, enough workgroups without a split (and the kernel writes dst directly)
     } else if (gqa_ratio > 1 && workgroups_x <= Br) {
         split_k = shader_core_count * 2 / (workgroups_x * workgroups_y * workgroups_z);
     } else if (gqa_ratio <= 1) {
@@ -13640,13 +13930,21 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
     vk_subbuffer sinks_buf = sinks ? ggml_vk_tensor_subbuffer(ctx, sinks) : q_buf;
     vk_subbuffer mask_opt_buf = use_mask_opt ? ggml_vk_subbuffer(ctx, ctx->prealloc_y, 0) : q_buf;
     vk_subbuffer sparse_buf = use_sparse ? ggml_vk_subbuffer(ctx, ctx->prealloc_y, 0) : q_buf;
+    if (use_mask_opt || use_sparse) {
+        // the mask opt bits and the sparse index list overwrite a matmul input converted into prealloc_y
+        ctx->prealloc_y_last_pipeline_used = nullptr;
+        ctx->prealloc_y_last_tensor_used = nullptr;
+    }
 
     if (use_dequant_kv) {
         const uint64_t fp = sizeof(ggml_fp16_t);
         const uint64_t k_f16_sz = (uint64_t)ggml_nelements(k) * fp;
         const uint64_t v_f16_sz = (uint64_t)ggml_nelements(v) * fp;
-        if (ctx->prealloc_size_x < k_f16_sz + v_f16_sz) {
-            ctx->prealloc_size_x = k_f16_sz + v_f16_sz;
+        // the V^T region after K and V is reserved here: growing prealloc_x after the dispatches below would
+        // replace the buffer they wrote
+        const uint64_t need = k_f16_sz + v_f16_sz + (use_vt ? vt_size : 0);
+        if (ctx->prealloc_size_x < need) {
+            ctx->prealloc_size_x = need;
             ggml_vk_preallocate_buffers(ctx, subctx);
         }
         vk_pipeline tr_k = ctx->device->pipeline_dequant_transpose[k->type];
@@ -13667,6 +13965,39 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
         ggml_vk_sync_buffers(ctx, subctx);
         k_buf = k_dst;
         v_buf = v_dst;
+        // Bill the K/V contiguize/dequant pass on its own line. Without this it is charged to
+        // FLASH_ATTN_EXT, which makes the copy invisible and the kernel look slower than it is.
+        ggml_vk_perf_mark_subop(ctx, subctx, (k_quant && v_quant)
+                                             ? "FA_KV_DEQUANT (sub-op)"
+                                             : "FA_KV_CONTIGUIZE (sub-op)");
+    }
+
+    if (use_vt) {
+        // V -> V^T [nev2][HSV][KV + 128] in prealloc_x, after the K/V contiguize scratch when that ran
+        if (ctx->prealloc_size_x < vt_offset + vt_size) {
+            // only reachable without the contiguize pass, which reserves the V^T region itself
+            GGML_ASSERT(!use_dequant_kv);
+            ctx->prealloc_size_x = vt_offset + vt_size;
+            ggml_vk_preallocate_buffers(ctx, subctx);
+        }
+        vk_pipeline tr_vt = ctx->device->pipeline_dequant_f16_transpose_vt;
+        ggml_pipeline_request_descriptor_sets(ctx, tr_vt, 1);
+        if (ctx->prealloc_x_need_sync && !use_dequant_kv) {
+            ggml_vk_sync_buffers(ctx, subctx);
+        }
+        vk_subbuffer vt_dst = vk_subbuffer{ ctx->prealloc_x, vt_offset, vt_size };
+        // source element strides: the contiguized scratch is [HSV][KV][nev2], the tensor has nbv1 / nbv2
+        const uint32_t src_kv_stride   = use_dequant_kv ? HSV      : (uint32_t)(nbv1 / sizeof(ggml_fp16_t));
+        const uint32_t src_head_stride = use_dequant_kv ? HSV * KV : (uint32_t)(nbv2 / sizeof(ggml_fp16_t));
+        const std::vector<uint32_t> tr_pc = { HSV, vt_kv_pad, src_kv_stride, src_head_stride, 0 };
+        ggml_vk_dispatch_pipeline(ctx, subctx, tr_vt, { v_buf, vt_dst }, tr_pc, { HSV, KV / 64, (uint32_t)nev2 });
+        ggml_vk_sync_buffers(ctx, subctx);
+        ctx->prealloc_x_need_sync = true;
+        v_buf = vt_dst;
+        v_stride = vt_kv_pad;
+        nbv2_eff = (uint32_t)((uint64_t)HSV * vt_kv_pad * sizeof(ggml_fp16_t));
+        nbv3_eff = (uint32_t)vt_size;
+        ggml_vk_perf_mark_subop(ctx, subctx, "FA_V_TRANSPOSE (sub-op)");
     }
 
     uint32_t mask_n_head_log2 = ((sinks != nullptr) << 24) | n_head_log2;
@@ -16993,6 +17324,10 @@ static void ggml_vk_soft_max(ggml_backend_vk_context * ctx, vk_context& subctx, 
 
         vk_subbuffer buf_x = { ctx->prealloc_x, 0, tmp_size };
         vk_subbuffer buf_y = { ctx->prealloc_y, 0, tmp_size };
+
+        // the partial results overwrite a matmul input converted into prealloc_y
+        ctx->prealloc_y_last_pipeline_used = nullptr;
+        ctx->prealloc_y_last_tensor_used = nullptr;
 
         std::array<uint32_t, 3> elements = { num_wgs, nrows_x, 1 };
 
@@ -21402,9 +21737,11 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
             ctx->query_fusion_node_count.resize(ctx->num_queries);
             ctx->query_nodes.resize(ctx->num_queries);
             ctx->query_node_idx.resize(ctx->num_queries);
+            ctx->query_sub_names.resize(ctx->num_queries);
         }
 
-        ctx->device->device.resetQueryPool(ctx->query_pool, 0, cgraph->n_nodes+1);
+        // Reset the whole pool, not just n_nodes+1: sub-op marks consume slots past that.
+        ctx->device->device.resetQueryPool(ctx->query_pool, 0, ctx->num_queries);
         std::fill(ctx->query_fusion_names.begin(), ctx->query_fusion_names.end(), nullptr);
         std::fill(ctx->query_fusion_node_count.begin(), ctx->query_fusion_node_count.end(), 0);
         std::fill(ctx->query_nodes.begin(), ctx->query_nodes.end(), nullptr);
@@ -21813,6 +22150,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 // track a single node/fusion for the current query
                 ctx->query_nodes[ctx->query_idx] = cgraph->nodes[i];
                 ctx->query_fusion_names[ctx->query_idx] = fusion_string;
+                ctx->query_sub_names[ctx->query_idx] = nullptr;
                 compute_ctx->s->buffer->buf.writeTimestamp(vk::PipelineStageFlagBits::eAllCommands, ctx->query_pool, ctx->query_idx++);
                 ggml_vk_sync_buffers(ctx, compute_ctx);
             } else {
@@ -21854,14 +22192,22 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         ctx->compute_ctx.reset();
 
         // Get the results and pass them to the logger
-        std::vector<uint64_t> timestamps(cgraph->n_nodes + 1);
-        VK_CHECK(ctx->device->device.getQueryPoolResults(ctx->query_pool, 0, ctx->query_idx, (cgraph->n_nodes + 1)*sizeof(uint64_t), timestamps.data(), sizeof(uint64_t), vk::QueryResultFlagBits::e64 | vk::QueryResultFlagBits::eWait), "get timestamp results", ctx->device);
+        // Sized to the pool, not n_nodes+1: sub-op marks push query_idx past the node count.
+        std::vector<uint64_t> timestamps(ctx->num_queries);
+        VK_CHECK(ctx->device->device.getQueryPoolResults(ctx->query_pool, 0, ctx->query_idx, ctx->num_queries*sizeof(uint64_t), timestamps.data(), sizeof(uint64_t), vk::QueryResultFlagBits::e64 | vk::QueryResultFlagBits::eWait), "get timestamp results", ctx->device);
         if (!vk_perf_logger_concurrent) {
             // Log each op separately
             for (int i = 1; i < ctx->query_idx; i++) {
+                const uint64_t dt = uint64_t((timestamps[i] - timestamps[i-1]) * ctx->device->properties.limits.timestampPeriod);
+                if (ctx->query_sub_names[i] != nullptr) {
+                    // sub-node interval (e.g. the FA K/V contiguize pass) - billed separately so
+                    // it is not silently folded into the op that dispatched it
+                    ctx->perf_logger->log_timing_named(ctx->query_sub_names[i], dt);
+                    continue;
+                }
                 auto node = ctx->query_nodes[i];
                 auto name = ctx->query_fusion_names[i];
-                ctx->perf_logger->log_timing(node, name, uint64_t((timestamps[i] - timestamps[i-1]) * ctx->device->properties.limits.timestampPeriod));
+                ctx->perf_logger->log_timing(node, name, dt);
             }
         } else {
             // Log each group of nodes

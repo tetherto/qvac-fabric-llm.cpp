@@ -853,6 +853,11 @@ void process_shaders() {
 #if defined(GGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
                 string_to_spv("flash_attn_f32_f16", "flash_attn_cm1.comp",
                     merge_maps(fa_base_dict, {{"Q_TYPE", "float"}, {"D_TYPE", "float"}, {"D_TYPEV4", "vec4"}, {"COOPMAT", "1"}}), fp16, true, false, f16acc);
+                // multi-row prefill flash attention (GGML_VK_FA_MR): f32 accumulation only
+                if (!f16acc) {
+                    string_to_spv("flash_attn_f32_f16_mr", "flash_attn_cm1_mr.comp",
+                        merge_maps(fa_base_dict, {{"Q_TYPE", "float"}, {"D_TYPE", "float"}, {"D_TYPEV4", "vec4"}, {"COOPMAT", "1"}}), fp16, true, false, f16acc);
+                }
 #endif
             }
 
@@ -1073,6 +1078,12 @@ void process_shaders() {
         // Fused dequant+transpose variant for FA quant-KV (per-head-contiguous f16 scratch).
         if (tname == "q8_0") {
             string_to_spv("dequant_" + tname + "_transpose", "dequant_" + tname + ".comp", merge_maps(base_dict, {{data_a_key, "1"}, {"D_TYPE", "float16_t"}, {"DEQUANT_TRANSPOSE", "1"}}));
+        }
+        // Strided-copy counterpart for f16 KV (contiguize the head-interleaved cache layout).
+        if (tname == "f16") {
+            string_to_spv("dequant_f16_transpose", "dequant_f16_transpose.comp", {});
+            // f16 V -> V^T per head for the coopmat1 flash attention
+            string_to_spv("dequant_f16_transpose_vt", "dequant_f16_transpose_vt.comp", {});
         }
 
         // get_rows uses element-wise dequant which doesn't work for TQ3/TQ4 (need FHT)
