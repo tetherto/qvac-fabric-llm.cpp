@@ -573,7 +573,7 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
                 return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "attn_output.weight");
             }
             if (std::regex_match(tensor_name, pattern_attn_kv_b_weight)) {
-                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_2);
+                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_2, "attn_output.weight");
             }
         }
 
@@ -784,29 +784,34 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
 
     auto get_split_granularity = [&](int64_t blck_size, uint32_t il, const std::vector<std::pair<int64_t, uint32_t>> & segments) -> std::vector<int64_t> {
         if (ud->model->arch == LLM_ARCH_GLM5_NEXT) {
+            // blck_size is that of attn_output, whose input dim is split, so every tensor of the layer splits in granules of
+            // heads_per_granule heads: tensors that differ in granule size would put the heads of a device on different boundaries
             const int64_t head_dim = hparams.is_recr(il) ? hparams.n_embd_head_kda : hparams.n_embd_head_v_mla();
             const int64_t head_granularity = std::lcm(blck_size, head_dim);
+            const int64_t heads_per_granule = head_granularity / head_dim;
             if (std::regex_match(tensor_name, pattern_r_cache)) {
                 return {head_granularity * (hparams.ssm_d_conv - 1)};
             }
             if (std::regex_match(tensor_name, pattern_s_cache)) {
                 return {head_granularity * head_dim};
             }
-            if (std::regex_match(tensor_name, pattern_kda_conv) ||
-                    std::regex_match(tensor_name, pattern_attn_kv_b_weight) ||
+            if (std::regex_match(tensor_name, pattern_attn_kv_b_weight) ||
                     std::regex_match(tensor_name, pattern_ssm_a) ||
                     std::regex_match(tensor_name, pattern_ssm_beta)) {
-                return {1}; // one whole head on axis 2, or one scalar per head
+                return {heads_per_granule}; // one whole head on axis 2, or one scalar per head
             }
-            if (std::regex_match(tensor_name, pattern_kda_head_weight) ||
+            if (std::regex_match(tensor_name, pattern_kda_conv) ||
+                    std::regex_match(tensor_name, pattern_kda_head_weight) ||
                     std::regex_match(tensor_name, pattern_ssm_dt) ||
                     std::regex_match(tensor_name, pattern_q_weight) ||
                     std::regex_match(tensor_name, pattern_kv_weight) ||
+                    std::regex_match(tensor_name, pattern_q_bias) ||
+                    std::regex_match(tensor_name, pattern_kv_bias) ||
                     std::regex_match(tensor_name, pattern_attn_out_weight)) {
                 return {head_granularity};
             }
             if (std::regex_match(tensor_name, pattern_attn_q_b_weight)) {
-                return {std::lcm(blck_size, int64_t(hparams.n_embd_head_k_mla()))};
+                return {heads_per_granule * int64_t(hparams.n_embd_head_k_mla())};
             }
         }
         // for better performance it may make sense to round up blck_size to a higher power of 2 so that more efficient kernels can be used
@@ -945,6 +950,14 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
                 tensor_split_scan[j] += tensor_split_scan[j - 1];
             }
         }
+        // count in whole granules where possible: tensors with as many granules then round a fractional split the same way
+        auto get_split_high = [&](int64_t ne_s, int64_t g_s, size_t j) -> int64_t {
+            const int64_t unit    = ne_s % g_s == 0 ? g_s : 1;
+            const int64_t n_units = ne_s / unit;
+            const int64_t high = unit * int64_t(tensor_split_scan.back() == 0.0f ?
+                n_units * (j+1)/ud->n_devices : n_units * tensor_split_scan[j]/tensor_split_scan.back());
+            return high - high % g_s;
+        };
         const std::vector<std::pair<int64_t, uint32_t>> segments = get_split_segments(split_state.axis, tc.il);
         const std::vector<int64_t> granularity = get_split_granularity(blck_size, tc.il, segments);
         for (size_t is = 0; is < segments.size(); is++) {
@@ -954,11 +967,7 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             int64_t low = 0;
             size_t j = 0;
             for (; j < ud->n_devices - 1; j++) {
-                int64_t high = tensor_split_scan.back() == 0.0f ?
-                    ne_s * (j+1)/ud->n_devices : ne_s * tensor_split_scan[j]/tensor_split_scan.back();
-                if (high % g_s != 0) {
-                    high -= high % g_s;
-                }
+                const int64_t high = get_split_high(ne_s, g_s, j);
                 split_state.ne[is*ud->n_devices + (j + tc.rotation) % ud->n_devices] = high - low;
                 low = high;
             }

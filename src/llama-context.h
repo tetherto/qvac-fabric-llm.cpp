@@ -63,6 +63,7 @@ struct llama_context {
     //   - changing attention type
     //   - etc.
     void sched_reserve();
+    void reserve_gather_ubatch(uint32_t n_tokens, uint32_t n_seqs, const llama_memory_context_i * mctx);
 
     void synchronize();
 
@@ -280,9 +281,10 @@ public:
     // returns the result of ggml_backend_sched_graph_compute_async execution
     ggml_status graph_compute(ggml_cgraph * gf, bool batched);
 
-    // reserve a graph with a dummy ubatch of the specified size
+    // reserve a graph with a dummy ubatch of the specified size; gather_path forces the indexer gather path
     ggml_cgraph * graph_reserve(
-        uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, bool split_only = false, size_t * sizes = nullptr);
+        uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, bool split_only = false, size_t * sizes = nullptr,
+        bool gather_path = false);
 
     bool set_sampler(llama_seq_id seq_id, llama_sampler * sampler);
 
