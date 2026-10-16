@@ -1,0 +1,49 @@
+#version 450
+
+#include "dequant_head.glsl"
+
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout (binding = 0) readonly buffer A {f16vec4 data_a[];};
+layout (binding = 1) writeonly buffer D {f16vec4 data_b[];};
+
+// f16 V -> V^T per head for the coopmat1 flash attention (V_TRANSPOSED): source V[nh][kv][hs] with element
+// strides p.stride_a (kv) and p.stride_b (head), hs contiguous; dest [nh][hs][kv_pad] with p.K = kv_pad, the
+// dest row stride, and p.M = HS. The pad keeps the row stride off a multiple of 4 KB, which would put every
+// hs row of a coopmat fragment on the same memory channel.
+// One workgroup moves one 64 kv x 64 hs tile through LDS, so reads and writes are both coalesced:
+// gl_WorkGroupID = (hs tile, kv tile, head). Host gate: KV % 64 == 0, HS % 64 == 0.
+shared uint16_t tile[64][65];   // [kv][hs], padded to spread the transposed reads over the banks
+
+void main() {
+    const uint HS = p.M, KVs = p.K;
+    const uint ths = gl_WorkGroupID.x;
+    const uint tkv = gl_WorkGroupID.y;
+    const uint nh  = gl_WorkGroupID.z;
+    const uint tid = gl_LocalInvocationID.x;
+    // read: 64 kv rows x 16 f16vec4 of hs, 16 threads per row, 4 passes
+    [[unroll]] for (uint i = 0; i < 4; ++i) {
+        const uint idx = i * 256 + tid;
+        const uint r = idx / 16;
+        const uint c = idx % 16;
+        const uint src = (nh * p.stride_b + (tkv * 64 + r) * p.stride_a + ths * 64) / 4 + c;
+        const f16vec4 v = data_a[src];
+        tile[r][4 * c + 0] = float16BitsToUint16(v.x);
+        tile[r][4 * c + 1] = float16BitsToUint16(v.y);
+        tile[r][4 * c + 2] = float16BitsToUint16(v.z);
+        tile[r][4 * c + 3] = float16BitsToUint16(v.w);
+    }
+    barrier();
+    // write: 64 hs rows x 16 f16vec4 of kv
+    [[unroll]] for (uint i = 0; i < 4; ++i) {
+        const uint idx = i * 256 + tid;
+        const uint h = idx / 16;
+        const uint c = idx % 16;
+        const f16vec4 v = f16vec4(uint16BitsToFloat16(tile[4 * c + 0][h]), uint16BitsToFloat16(tile[4 * c + 1][h]),
+                                  uint16BitsToFloat16(tile[4 * c + 2][h]), uint16BitsToFloat16(tile[4 * c + 3][h]));
+        const uint dst = (nh * HS * KVs + (ths * 64 + h) * KVs + tkv * 64) / 4 + c;
+        data_b[dst] = v;
+    }
+}

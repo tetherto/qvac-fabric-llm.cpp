@@ -662,8 +662,14 @@ void main() {
                     if (!USE_DECODE_V && !KV_bounds_check && !USE_SPARSE) {
                         // F16/BF16 values can be loaded directly from global memory
                         const uint v_tile_row = j * Bc + bc_chunk * MatBc;
-                        const uint v_tile_offset = v_offset / 4 + v_tile_row * v_stride / 4 + hsv_offset / 4;
-                        coopMatLoad(QMat, data_vv4, v_tile_offset, v_stride / 4, gl_CooperativeMatrixLayoutRowMajor);
+                        if (V_TRANSPOSED) {
+                            // B[k = kv][n = hd] is column-major in the V^T scratch: each lane reads 16 contiguous kv
+                            const uint vt_tile_offset = v_offset / 4 + hsv_offset * (v_stride / 4) + v_tile_row / 4;
+                            coopMatLoad(QMat, data_vv4, vt_tile_offset, v_stride / 4, gl_CooperativeMatrixLayoutColumnMajor);
+                        } else {
+                            const uint v_tile_offset = v_offset / 4 + v_tile_row * v_stride / 4 + hsv_offset / 4;
+                            coopMatLoad(QMat, data_vv4, v_tile_offset, v_stride / 4, gl_CooperativeMatrixLayoutRowMajor);
+                        }
                     } else {
                         const uint v_tile_offset = bc_chunk * MatBr * v_cols + gl_SubgroupID * (MatBc / 4);
                         coopMatLoad(QMat, kvsh, v_tile_offset, vsh_stride, gl_CooperativeMatrixLayoutRowMajor);
