@@ -1343,6 +1343,8 @@ void process_shaders() {
     string_to_spv("geglu_erf_f32",  "geglu_erf.comp",   {{"A_TYPE", "float"},       {"D_TYPE", "float"}});
     string_to_spv("geglu_quick_f16","geglu_quick.comp", {{"A_TYPE", "float16_t"},   {"D_TYPE", "float16_t"}});
     string_to_spv("geglu_quick_f32","geglu_quick.comp", {{"A_TYPE", "float"},       {"D_TYPE", "float"}});
+    string_to_spv("siglu_f16",      "siglu.comp",       {{"A_TYPE", "float16_t"},   {"D_TYPE", "float16_t"}});
+    string_to_spv("siglu_f32",      "siglu.comp",       {{"A_TYPE", "float"},       {"D_TYPE", "float"}});
 
     string_to_spv("silu_back_f32",  "silu_back.comp",   {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}});
     string_to_spv("gelu_back_f32",  "gelu_back.comp",   {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}});
@@ -1547,6 +1549,23 @@ void process_shaders() {
     string_to_spv("ssm_conv_f32", "ssm_conv.comp", {{"A_TYPE", "float"}});
     string_to_spv("ssm_conv_back_sx_f32", "ssm_conv_back_sx.comp", {{"A_TYPE", "float"}});
     string_to_spv("ssm_conv_back_c_f32", "ssm_conv_back_c.comp", {{"A_TYPE", "float"}});
+
+    string_to_spv("gru_f32",             "gru.comp",             {{"A_TYPE", "float"}});
+    string_to_spv("gru_small_h2_f32",    "gru_small.comp",       {{"A_TYPE", "float"}, {"H_C", "2"}});
+    string_to_spv("gru_small_h4_f32",    "gru_small.comp",       {{"A_TYPE", "float"}, {"H_C", "4"}});
+    string_to_spv("gru_small_h8_f32",    "gru_small.comp",       {{"A_TYPE", "float"}, {"H_C", "8"}});
+    string_to_spv("zero_upsample_f32",   "zero_upsample.comp",   {{"A_TYPE", "float"}, {"D_TYPE", "float"}});
+    string_to_spv("channel_shuffle_f32", "channel_shuffle.comp", {{"A_TYPE", "float"}, {"D_TYPE", "float"}});
+    string_to_spv("affine_prelu_f32",    "affine_prelu.comp",    {{"A_TYPE", "float"}});
+    string_to_spv("conv_1d_dw_direct_f32",              "conv_1d_dw_direct.comp",              {});
+    string_to_spv("conv_1d_dw_direct_norm_channel_f32", "conv_1d_dw_direct_norm_channel.comp", {});
+    string_to_spv("norm_channel_f32",     "norm_channel.comp",     {});
+    string_to_spv("scale_residual_f32",   "scale_residual.comp",   {});
+    string_to_spv("bias_gelu_f32",        "bias_gelu.comp",        {});
+    string_to_spv("pad_replicate_1d_f32", "pad_replicate_1d.comp", {});
+    string_to_spv("lstm_cell_f32",        "lstm_cell.comp",        {{"A_TYPE", "float"}});
+    string_to_spv("lstm_cell_masked_f32", "lstm_cell.comp",        {{"A_TYPE", "float"}, {"MASKED", "1"}});
+    string_to_spv("tdt_step_i32",         "tdt_step.comp",         {{"A_TYPE", "int"}});
 
     string_to_spv("topk_moe_f32", "topk_moe.comp", {});
 

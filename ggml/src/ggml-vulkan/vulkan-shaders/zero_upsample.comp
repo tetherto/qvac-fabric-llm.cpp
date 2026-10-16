@@ -1,0 +1,30 @@
+#version 450
+
+#include "types.glsl"
+
+// Zero-insertion upsample of ne0 by s: dst[f] = (f%s==0) ? src[f/s] : 0.
+// One thread per dst element (gather form).
+layout (push_constant) uniform parameter
+{
+    uint ne;   // total dst elements
+    uint F;    // src ne0
+    uint Fu;   // dst ne0 = (F-1)*s+1
+    uint s;    // upsample stride
+} p;
+
+layout (binding = 0) readonly buffer A {A_TYPE data_a[];};
+layout (binding = 1) writeonly buffer D {D_TYPE data_d[];};
+
+layout(local_size_x = 512, local_size_y = 1, local_size_z = 1) in;
+
+void main() {
+    const uint idx = gl_GlobalInvocationID.z * 262144 + gl_GlobalInvocationID.y * 512 + gl_GlobalInvocationID.x;
+    if (idx >= p.ne) {
+        return;
+    }
+
+    const uint r = idx / p.Fu;
+    const uint f = idx - r * p.Fu;
+
+    data_d[idx] = (f % p.s == 0u) ? D_TYPE(data_a[r * p.F + f / p.s]) : D_TYPE(0.0f);
+}

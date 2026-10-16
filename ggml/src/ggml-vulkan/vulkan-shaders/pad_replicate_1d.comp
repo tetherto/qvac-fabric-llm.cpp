@@ -1,0 +1,29 @@
+#version 450
+
+#include "types.glsl"
+
+layout (push_constant) uniform parameter {
+    uint ne;
+    uint L_in;
+    uint L_out;
+    uint C;
+    uint layout_id;
+    uint pad_left;
+} p;
+
+layout (binding = 0) readonly buffer X { float data_x[]; };
+layout (binding = 1) writeonly buffer D { float data_d[]; };
+
+layout(local_size_x = 512, local_size_y = 1, local_size_z = 1) in;
+
+void main() {
+    const uint idx = gl_GlobalInvocationID.z * 262144u + gl_GlobalInvocationID.y * 512u + gl_GlobalInvocationID.x;
+    if (idx >= p.ne) {
+        return;
+    }
+    const uint t = p.layout_id == 0u ? idx % p.L_out : idx / p.C;
+    const uint c = p.layout_id == 0u ? idx / p.L_out : idx % p.C;
+    const int src_t_i = clamp(int(t) - int(p.pad_left), 0, int(p.L_in) - 1);
+    const uint src_idx = p.layout_id == 0u ? uint(src_t_i) + c * p.L_in : c + uint(src_t_i) * p.C;
+    data_d[idx] = data_x[src_idx];
+}

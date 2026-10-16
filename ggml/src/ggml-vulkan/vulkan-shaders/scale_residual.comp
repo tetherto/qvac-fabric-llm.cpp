@@ -1,0 +1,40 @@
+#version 450
+
+#include "types.glsl"
+
+layout (push_constant) uniform parameter {
+    uint ne;
+    uint L;
+    uint C;
+    uint B;
+    uint layout_id;
+} p;
+
+layout (binding = 0) readonly buffer X { float data_x[]; };
+layout (binding = 1) readonly buffer B { float data_b[]; };
+layout (binding = 2) readonly buffer G { float data_g[]; };
+layout (binding = 3) readonly buffer R { float data_r[]; };
+layout (binding = 4) writeonly buffer D { float data_d[]; };
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+void main() {
+    const uint idx = gl_GlobalInvocationID.z * 262144u + gl_GlobalInvocationID.y * 512u + gl_GlobalInvocationID.x;
+    if (idx >= p.ne) {
+        return;
+    }
+    const uint batch_stride = p.L * p.C;
+    const uint batch = idx / batch_stride;
+    if (batch >= p.B) {
+        return;
+    }
+    const uint local_idx = idx - batch * batch_stride;
+    const uint c = p.layout_id == 0u ? local_idx / p.L : local_idx % p.C;
+    const uint x_idx = p.layout_id == 2u
+        ? batch * batch_stride + (local_idx % p.C) * p.L + local_idx / p.C
+        : idx;
+    precise float biased = data_x[x_idx] + data_b[c];
+    precise float scaled = biased * data_g[c];
+    precise float result = data_r[idx] + scaled;
+    data_d[idx] = result;
+}

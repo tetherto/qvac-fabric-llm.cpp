@@ -1,0 +1,62 @@
+#version 450
+
+#include "types.glsl"
+
+#extension GL_EXT_control_flow_attributes : enable
+
+layout (push_constant) uniform parameter {
+    uint L;
+    uint C;
+    uint B;
+    uint layout_id;
+    float eps;
+} p;
+
+layout (binding = 0) readonly buffer X { float data_x[]; };
+layout (binding = 1) readonly buffer G { float data_g[]; };
+layout (binding = 2) readonly buffer B { float data_b[]; };
+layout (binding = 3) writeonly buffer D { float data_d[]; };
+
+layout(local_size_x = 512, local_size_y = 1, local_size_z = 1) in;
+shared vec2 partial[512];
+
+uint offset_tc(uint t, uint c, uint batch) {
+    return batch * p.L * p.C + (p.layout_id == 0u ? t + c * p.L : c + t * p.C);
+}
+
+void main() {
+    const uint lane = gl_LocalInvocationID.x;
+    const uint t = gl_WorkGroupID.y;
+    const uint batch = gl_WorkGroupID.z;
+    if (t >= p.L || batch >= p.B) {
+        return;
+    }
+
+    partial[lane] = vec2(0.0f, 0.0f);
+    [[unroll]] for (uint c = lane; c < p.C; c += 512u) {
+        const float value = data_x[offset_tc(t, c, batch)];
+        partial[lane].x += value;
+        partial[lane].y += value * value;
+    }
+    barrier();
+    [[unroll]] for (uint stride = 256u; stride != 0u; stride >>= 1u) {
+        if (lane < stride) {
+            partial[lane] += partial[lane + stride];
+        }
+        barrier();
+    }
+
+    const float mean = partial[0].x / float(p.C);
+    const float variance = partial[0].y / float(p.C) - mean * mean;
+    const float inv_std = inversesqrt(variance + p.eps);
+
+    [[unroll]] for (uint c = lane; c < p.C; c += 512u) {
+        const uint idx = offset_tc(t, c, batch);
+        // Match the three stock dispatches' F32 rounding boundaries:
+        // NORM stores first, then MUL, then ADD.
+        precise float normalized = (data_x[idx] - mean) * inv_std;
+        precise float scaled = normalized * data_g[c];
+        precise float shifted = scaled + data_b[c];
+        data_d[idx] = shifted;
+    }
+}
