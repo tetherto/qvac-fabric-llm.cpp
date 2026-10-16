@@ -4418,7 +4418,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             // shaders (seen on Adreno 840); use the full-subgroup / shmem reduce path
             // instead, which Adreno 830 (no clustered support) already takes and passes.
             const bool clustered_ok = device->subgroup_clustered &&
-                                      device->architecture != vk_device_architecture::QUALCOMM_ADRENO;
+                                      device->vendor_id != VK_VENDOR_ID_QUALCOMM;
 
             uint32_t lanes_per_column;
             if (device->vendor_id == VK_VENDOR_ID_INTEL) {
@@ -10761,7 +10761,7 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
         // Use a tiled shader for AMD RADV on embedded GPUs to avoid VK_ERROR_DEVICE_LOST due to slow threads.
         if (ctx->device->uma &&
             (ctx->device->driver_id == vk::DriverId::eMesaRadv ||
-             ctx->device->architecture == vk_device_architecture::QUALCOMM_ADRENO) &&
+             ctx->device->vendor_id == VK_VENDOR_ID_QUALCOMM) &&
             src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
             CEIL_DIV(dst->ne[0], 32) <= ctx->device->properties.limits.maxComputeWorkGroupCount[0] &&
             CEIL_DIV(dst->ne[1], 32) <= ctx->device->properties.limits.maxComputeWorkGroupCount[1] &&
@@ -11214,7 +11214,7 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
          pipeline == ctx->device->pipeline_out_prod_tiled_q4_0 ||
          pipeline == ctx->device->pipeline_out_prod_tiled_q8_0 ||
          pipeline == ctx->device->pipeline_out_prod_tiled_tq2_0) &&
-        ctx->device->architecture == vk_device_architecture::QUALCOMM_ADRENO &&
+        ctx->device->vendor_id == VK_VENDOR_ID_QUALCOMM &&
         ne01 >= 65536 && dst->ne[1] > 32 && dst->ne[2] == 1 && dst->ne[3] == 1;
     const uint32_t out_prod_chunks = split_out_prod ? CEIL_DIV(dst->ne[1], 32) : 1;
     ggml_pipeline_request_descriptor_sets(ctx, pipeline, out_prod_chunks);
