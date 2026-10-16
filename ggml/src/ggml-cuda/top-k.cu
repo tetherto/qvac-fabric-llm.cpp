@@ -36,19 +36,12 @@ static void top_k_cub(ggml_cuda_pool & pool,
                          ncols, k, env));
 }
 
-#elif defined(GGML_CUDA_USE_CUB)  // CUB_TOP_K_AVAILABLE
+#else  // CUB_TOP_K_AVAILABLE
 
-static int next_power_of_2(int x) {
-    int n = 1;
-    while (n < x) {
-        n *= 2;
-    }
-    return n;
-}
+// rows up to this length are sorted in shared memory by the bitonic sort
+static constexpr int TOP_K_BITONIC_MAX_NCOLS = 1024;
 
-#endif                            // CUB_TOP_K_AVAILABLE
-
-#if !defined(GGML_CUDA_USE_CUB) && defined(GGML_USE_HIP)
+#ifdef GGML_CUDA_TOP_K_LONG_ROWS
 
 static __device__ __forceinline__ uint32_t top_k_float_to_ordered(float value) {
     const uint32_t bits = __float_as_uint(value);
@@ -60,14 +53,12 @@ struct top_k_radix_state {
     uint32_t prefix;
     uint32_t prefix_mask;
     int rank;
-    int greater_count;
-    int equal_count;
 };
 
 static __global__ void top_k_radix_init(top_k_radix_state * states, int nrows, int k) {
     const int row = blockIdx.x * blockDim.x + threadIdx.x;
     if (row < nrows) {
-        states[row] = {0, 0, k, 0, 0};
+        states[row] = {0, 0, k};
     }
 }
 
@@ -114,66 +105,153 @@ static __global__ void top_k_radix_select(
         int shift) {
     constexpr int NBINS = 1 << RADIX_BITS;
 
+    static_assert(BLOCK_SIZE == NBINS, "one thread per bin");
+
     const int row = blockIdx.x;
     const int tid = threadIdx.x;
-    __shared__ int histogram[NBINS];
+    __shared__ int suffix[NBINS];
+
+    // read before the scan barriers so no thread sees the state written below
+    const top_k_radix_state state = states[row];
 
     int count = 0;
     for (int row_block = 0; row_block < blocks_per_row; ++row_block) {
         const size_t offset = ((size_t) row * blocks_per_row + row_block) * NBINS;
         count += block_histograms[offset + tid];
     }
-    histogram[tid] = count;
+    suffix[tid] = count;
     __syncthreads();
 
-    if (tid == 0) {
-        top_k_radix_state state = states[row];
-        int bin = NBINS - 1;
-        while (bin > 0 && histogram[bin] < state.rank) {
-            state.rank -= histogram[bin--];
+    // suffix[b] = number of keys in bins >= b
+    for (int stride = 1; stride < NBINS; stride *= 2) {
+        const int add = tid + stride < NBINS ? suffix[tid + stride] : 0;
+        __syncthreads();
+        suffix[tid] += add;
+        __syncthreads();
+    }
+
+    // the selected bin is the highest one whose suffix reaches rank; bin 0 is the fallback
+    const int above = tid + 1 < NBINS ? suffix[tid + 1] : 0;
+    if (above < state.rank && (tid == 0 || suffix[tid] >= state.rank)) {
+        top_k_radix_state next = state;
+        next.rank -= above;
+        next.prefix |= (uint32_t) tid << shift;
+        next.prefix_mask |= (uint32_t) (NBINS - 1) << shift;
+        states[row] = next;
+    }
+}
+
+static __device__ __forceinline__ int top_k_sum_warp_totals(const int * warp_totals, int n_warps, int warp, int & total) {
+    int before = 0;
+    total = 0;
+    for (int w = 0; w < n_warps; ++w) {
+        before += w < warp ? warp_totals[w] : 0;
+        total  += warp_totals[w];
+    }
+    return before;
+}
+
+// Exclusive prefix sum of one flag per thread across the block, with the block total in total.
+template<int BLOCK_SIZE>
+static __device__ __forceinline__ int top_k_block_exclusive_scan(int flag, int * warp_totals, int & total) {
+    constexpr int n_warps = BLOCK_SIZE / WARP_SIZE;
+    const int warp = threadIdx.x / WARP_SIZE;
+    const int inclusive = warp_prefix_inclusive_sum<int, WARP_SIZE>(flag);
+    if (threadIdx.x % WARP_SIZE == WARP_SIZE - 1) {
+        warp_totals[warp] = inclusive;
+    }
+    __syncthreads();
+    const int before = top_k_sum_warp_totals(warp_totals, n_warps, warp, total);
+    __syncthreads();
+    return before + inclusive - flag;
+}
+
+// Keys above and equal to the threshold in each block's contiguous column range.
+template<int BLOCK_SIZE>
+static __global__ void top_k_radix_count(
+        const float * __restrict__ src,
+        const top_k_radix_state * __restrict__ states,
+        int2 * __restrict__ block_counts,
+        int ncols,
+        int blocks_per_row,
+        int cols_per_block) {
+    const int row = blockIdx.x / blocks_per_row;
+    const int begin = (blockIdx.x % blocks_per_row) * cols_per_block;
+    const int end = min(begin + cols_per_block, ncols);
+    const float * row_src = src + (size_t) row * ncols;
+    const uint32_t prefix = states[row].prefix;
+    __shared__ int counts[2];
+
+    if (threadIdx.x == 0) {
+        counts[0] = 0;
+        counts[1] = 0;
+    }
+    __syncthreads();
+
+    for (int col = begin + threadIdx.x; col < end; col += BLOCK_SIZE) {
+        const uint32_t key = top_k_float_to_ordered(row_src[col]);
+        if (key > prefix) {
+            atomicAdd(&counts[0], 1);
+        } else if (key == prefix) {
+            atomicAdd(&counts[1], 1);
         }
-        state.prefix |= (uint32_t) bin << shift;
-        state.prefix_mask |= (uint32_t) (NBINS - 1) << shift;
-        states[row] = state;
+    }
+    __syncthreads();
+
+    if (threadIdx.x == 0) {
+        block_counts[blockIdx.x] = make_int2(counts[0], counts[1]);
     }
 }
 
-static __global__ void top_k_radix_reset_counters(top_k_radix_state * states, int nrows) {
-    const int row = blockIdx.x * blockDim.x + threadIdx.x;
-    if (row < nrows) {
-        states[row].greater_count = 0;
-        states[row].equal_count = 0;
+static __device__ __forceinline__ int2 top_k_radix_counts_before(const int2 * row_counts, int row_block) {
+    int2 before = make_int2(0, 0);
+    for (int b = 0; b < row_block; ++b) {
+        before.x += row_counts[b].x;
+        before.y += row_counts[b].y;
     }
+    return before;
 }
 
+// Writes the selected columns in ascending order, so ties keep the lowest indices and the result is deterministic.
 template<int BLOCK_SIZE>
 static __global__ void top_k_radix_gather(
         const float * __restrict__ src,
         int * __restrict__ dst,
-        top_k_radix_state * __restrict__ states,
+        const top_k_radix_state * __restrict__ states,
+        const int2 * __restrict__ block_counts,
         int ncols,
         int k,
-        int blocks_per_row) {
+        int blocks_per_row,
+        int cols_per_block) {
     const int row = blockIdx.x / blocks_per_row;
     const int row_block = blockIdx.x % blocks_per_row;
-    const int tid = threadIdx.x;
+    const int begin = row_block * cols_per_block;
+    const int end = min(begin + cols_per_block, ncols);
     const float * row_src = src + (size_t) row * ncols;
     int * row_dst = dst + (size_t) row * k;
-    top_k_radix_state * state = &states[row];
+    const top_k_radix_state state = states[row];
+    __shared__ int scratch[BLOCK_SIZE / WARP_SIZE];
 
-    for (int col = row_block * BLOCK_SIZE + tid;
-         col < ncols;
-         col += blocks_per_row * BLOCK_SIZE) {
-        const uint32_t key = top_k_float_to_ordered(row_src[col]);
-        if (key > state->prefix) {
-            const int pos = atomicAdd(&state->greater_count, 1);
+    const int2 before = top_k_radix_counts_before(block_counts + (size_t) row * blocks_per_row, row_block);
+    int n_equal_before = before.y;
+    int out = before.x + min(n_equal_before, state.rank);
+
+    for (int col0 = begin; col0 < end; col0 += BLOCK_SIZE) {
+        const int col = col0 + threadIdx.x;
+        const uint32_t key = col < end ? top_k_float_to_ordered(row_src[col]) : 0;
+        const bool is_equal = col < end && key == state.prefix;
+
+        int n_equal;
+        const int equal_rank = n_equal_before + top_k_block_exclusive_scan<BLOCK_SIZE>(is_equal, scratch, n_equal);
+        const bool selected = col < end && (key > state.prefix || (is_equal && equal_rank < state.rank));
+
+        int n_selected;
+        const int pos = out + top_k_block_exclusive_scan<BLOCK_SIZE>(selected, scratch, n_selected);
+        if (selected) {
             row_dst[pos] = col;
-        } else if (key == state->prefix) {
-            const int pos = atomicAdd(&state->equal_count, 1);
-            if (pos < state->rank) {
-                row_dst[k - state->rank + pos] = col;
-            }
         }
+        out += n_selected;
+        n_equal_before += n_equal;
     }
 }
 
@@ -184,11 +262,14 @@ static void top_k_radix_cuda(
     constexpr int RADIX_BITS = 8;
     constexpr int NBINS = 1 << RADIX_BITS;
     const int blocks_per_row = std::min((ncols + 1023) / 1024, 64);
+    const int cols_per_block = GGML_PAD((ncols + blocks_per_row - 1) / blocks_per_row, BLOCK_SIZE);
 
     ggml_cuda_pool_alloc<top_k_radix_state> states_alloc(pool, nrows);
     ggml_cuda_pool_alloc<int> histograms_alloc(pool, (size_t) nrows * blocks_per_row * NBINS);
+    ggml_cuda_pool_alloc<int2> counts_alloc(pool, (size_t) nrows * blocks_per_row);
     top_k_radix_state * states = states_alloc.get();
     int * histograms = histograms_alloc.get();
+    int2 * counts = counts_alloc.get();
 
     top_k_radix_init<<<(nrows + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE, 0, stream>>>(states, nrows, k);
 
@@ -201,14 +282,80 @@ static void top_k_radix_cuda(
             <<<nrows, BLOCK_SIZE, 0, stream>>>(histograms, states, blocks_per_row, shift);
     }
 
-    top_k_radix_reset_counters
-        <<<(nrows + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE, 0, stream>>>(states, nrows);
+    top_k_radix_count<BLOCK_SIZE>
+        <<<row_grid, BLOCK_SIZE, 0, stream>>>(src, states, counts, ncols, blocks_per_row, cols_per_block);
     top_k_radix_gather<BLOCK_SIZE>
         <<<row_grid, BLOCK_SIZE, 0, stream>>>(
-            src, dst, states, ncols, k, blocks_per_row);
+            src, dst, states, counts, ncols, k, blocks_per_row, cols_per_block);
 }
 
-#endif // !defined(GGML_CUDA_USE_CUB) && defined(GGML_USE_HIP)
+#ifdef GGML_CUDA_USE_CUB
+// cub sorts rows of up to this many columns faster than radix selection
+static constexpr int64_t TOP_K_SORT_MAX_NCOLS = 4096;
+// below cub's 300-segment partition threshold, whose host sync stalls pipelined GPUs
+static constexpr int64_t TOP_K_SORT_MAX_NROWS = 256;
+
+static bool top_k_stream_is_capturing(cudaStream_t stream) {
+#ifdef USE_CUDA_GRAPH
+    cudaStreamCaptureStatus status;
+    CUDA_CHECK(cudaStreamIsCapturing(stream, &status));
+    return status != cudaStreamCaptureStatusNone;
+#else
+    GGML_UNUSED(stream);
+    return false;
+#endif  // USE_CUDA_GRAPH
+}
+#endif  // GGML_CUDA_USE_CUB
+
+static bool top_k_use_radix(int64_t ncols, int64_t nrows, cudaStream_t stream) {
+    if (ncols <= TOP_K_BITONIC_MAX_NCOLS) {
+        return false;
+    }
+#ifdef GGML_CUDA_USE_CUB
+    if (ncols > TOP_K_SORT_MAX_NCOLS || nrows > TOP_K_SORT_MAX_NROWS) {
+        return true;
+    }
+    // under stream capture cub sorts several rows by segmented radix sort, which is slower than radix selection
+    return nrows > 1 && top_k_stream_is_capturing(stream);
+#else
+    GGML_UNUSED(nrows);
+    GGML_UNUSED(stream);
+    return true;
+#endif  // GGML_CUDA_USE_CUB
+}
+
+#endif  // GGML_CUDA_TOP_K_LONG_ROWS
+
+// Sorts each row, by bitonic sort or by cub for long rows, and keeps its first k columns.
+static void top_k_argsort_chunk(
+        ggml_cuda_pool & pool, const float * src, int * tmp, int * dst, int ncols, int nrows, int k, cudaStream_t stream) {
+#ifdef GGML_CUDA_USE_CUB
+    if (ncols > TOP_K_BITONIC_MAX_NCOLS) {
+        argsort_f32_i32_cuda_cub(pool, src, tmp, ncols, nrows, GGML_SORT_ORDER_DESC, stream);
+    } else {
+        argsort_f32_i32_cuda_bitonic(src, tmp, ncols, nrows, GGML_SORT_ORDER_DESC, stream);
+    }
+#else
+    GGML_ASSERT(ncols <= TOP_K_BITONIC_MAX_NCOLS);
+    argsort_f32_i32_cuda_bitonic(src, tmp, ncols, nrows, GGML_SORT_ORDER_DESC, stream);
+#endif  // GGML_CUDA_USE_CUB
+    CUDA_CHECK(cudaMemcpy2DAsync(dst, k * sizeof(int), tmp, ncols * sizeof(int), k * sizeof(int), nrows,
+                                 cudaMemcpyDeviceToDevice, stream));
+}
+
+// Sorts the rows in chunks, which bounds the temporary indices and keeps the row offsets of the sorts in int range.
+static void top_k_argsort_cuda(
+        ggml_cuda_pool & pool, const float * src, int * dst, int64_t ncols, int64_t nrows, int64_t k, size_t nb01,
+        cudaStream_t stream) {
+    const int64_t chunk_nrows = argsort_f32_i32_cuda_cub_chunk_nrows(nb01, nrows);
+    ggml_cuda_pool_alloc<int> tmp_alloc(pool, ncols * chunk_nrows);
+    for (int64_t i = 0; i < nrows; i += chunk_nrows) {
+        const int iter_nrows = (int) std::min(chunk_nrows, nrows - i);
+        top_k_argsort_chunk(pool, src + i * ncols, tmp_alloc.get(), dst + i * k, ncols, iter_nrows, k, stream);
+    }
+}
+
+#endif // CUB_TOP_K_AVAILABLE
 
 void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src0   = dst->src[0];
@@ -232,44 +379,13 @@ void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     for (int i = 0; i < nrows; i++) {
         top_k_cub(pool, src0_d + i * ncols, dst_d + i * k, ncols, k, stream);
     }
-#elif defined(GGML_CUDA_USE_CUB)  // CUB_TOP_K_AVAILABLE
-    // Fall back to argsort + copy
-    const int    ncols_pad      = next_power_of_2(ncols);
-    const size_t shared_mem     = ncols_pad * sizeof(int);
-    const size_t max_shared_mem = ggml_cuda_info().devices[ggml_cuda_get_device()].smpb;
-    const bool   use_bitonic    = shared_mem <= max_shared_mem && ncols <= 1024;
-    const int    chunk_nrows    = argsort_f32_i32_cuda_cub_chunk_nrows(src0->nb[1], nrows);
-
-    ggml_cuda_pool_alloc<int> temp_dst_alloc(pool, ncols * chunk_nrows);
-    int *                     tmp_dst = temp_dst_alloc.get();
-
-    for (int64_t i = 0; i < nrows; i += chunk_nrows) {
-        int iter_nrows = std::min((int64_t) chunk_nrows, nrows - i);
-
-        if (use_bitonic) {
-            argsort_f32_i32_cuda_bitonic(src0_d, tmp_dst, ncols, iter_nrows, GGML_SORT_ORDER_DESC, stream);
-        } else {
-            argsort_f32_i32_cuda_cub(pool, src0_d, tmp_dst, ncols, iter_nrows, GGML_SORT_ORDER_DESC, stream);
-        }
-        CUDA_CHECK(cudaMemcpy2DAsync(dst_d, k * sizeof(int), tmp_dst, ncols * sizeof(int), k * sizeof(int), iter_nrows,
-                                     cudaMemcpyDeviceToDevice, stream));
-
-        src0_d += ncols * iter_nrows;
-        dst_d  += k     * iter_nrows;
-    }
-#else                             // GGML_CUDA_USE_CUB
-#if defined(GGML_USE_HIP)
-    if (ncols > 1024) {
+#else  // CUB_TOP_K_AVAILABLE
+#ifdef GGML_CUDA_TOP_K_LONG_ROWS
+    if (top_k_use_radix(ncols, nrows, stream)) {
         top_k_radix_cuda(pool, src0_d, dst_d, ncols, nrows, k, stream);
-    } else {
-#endif // defined(GGML_USE_HIP)
-        ggml_cuda_pool_alloc<int> temp_dst_alloc(pool, ncols * nrows);
-        int *                     tmp_dst = temp_dst_alloc.get();
-        argsort_f32_i32_cuda_bitonic(src0_d, tmp_dst, ncols, nrows, GGML_SORT_ORDER_DESC, stream);
-        CUDA_CHECK(cudaMemcpy2DAsync(dst_d, k * sizeof(int), tmp_dst, ncols * sizeof(int), k * sizeof(int), nrows,
-                                     cudaMemcpyDeviceToDevice, stream));
-#if defined(GGML_USE_HIP)
+        return;
     }
-#endif // defined(GGML_USE_HIP)
-#endif
+#endif  // GGML_CUDA_TOP_K_LONG_ROWS
+    top_k_argsort_cuda(pool, src0_d, dst_d, ncols, nrows, k, src0->nb[1], stream);
+#endif  // CUB_TOP_K_AVAILABLE
 }
