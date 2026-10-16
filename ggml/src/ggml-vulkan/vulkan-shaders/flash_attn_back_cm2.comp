@@ -70,6 +70,7 @@ layout (binding = 5) readonly buffer G  {uint8_t  data_g[];};
 layout (binding = 6) readonly buffer ST {float    data_stats[];};
 layout (binding = 7) writeonly buffer D {float    data_d[];};
 layout (binding = 8) readonly buffer MO {uint32_t data_mask_opt[];};
+layout (binding = 9) readonly buffer GM {uint32_t data_gmax;};
 
 #define MASK_OPT_ALL_NEG_INF 1
 #define MASK_OPT_ALL_ZERO 2
@@ -84,6 +85,13 @@ layout(buffer_reference, std430, buffer_reference_align = 16) buffer decodeBufF3
 
 float16_t decodeF32(const in decodeBufF32 bl, const in uint blockCoords[2], const in uint coordInBlock[2]) {
     return float16_t(bl.block[coordInBlock[1]]);
+}
+
+// 2^e from the max |grad_o|, grad_o is scaled by it on load so it stays in f16 range
+float g_scale = 1.0f;
+
+float16_t decodeF32G(const in decodeBufF32 bl, const in uint blockCoords[2], const in uint coordInBlock[2]) {
+    return float16_t(bl.block[coordInBlock[1]] * g_scale);
 }
 
 #ifdef KV_F32
@@ -138,6 +146,16 @@ float logsumexp(const in uint32_t row, const in uint32_t col, const in float m, 
     return l == 0.0 ? NEG_INF : m + log(l);
 }
 
+int gexp(uint gmax) {
+    const float m = uintBitsToFloat(gmax);
+    if (m > 0.0 && !isinf(m)) {
+        int out_ex;
+        frexp(m, out_ex);
+        return clamp(1 - out_ex, -64, 64);
+    }
+    return 0;
+}
+
 // DQ: rows are q rows qrow0 + row, columns are kv columns kcol0 + col
 float pFuncDQ(const in uint32_t row, const in uint32_t col, const in float s, const in uint32_t qrow0, const in uint32_t kcol0) {
     const uint32_t qrow = qrow0 + row;
@@ -149,7 +167,7 @@ float pFuncDQ(const in uint32_t row, const in uint32_t col, const in float s, co
 
 float dsFuncDQ(const in uint32_t row, const in uint32_t col, const in float pv, const in float dp, const in uint32_t qrow0) {
     const uint32_t qrow = min(qrow0 + row, p.N - 1);
-    return p.scale * pv * (dp - data_stats[g_stats_base + 2 * qrow + 1]);
+    return p.scale * pv * (dp - g_scale * data_stats[g_stats_base + 2 * qrow + 1]);
 }
 
 // DKV: rows are kv rows krow0 + row, columns are q rows qrow0 + col
@@ -163,7 +181,7 @@ float pFuncDKV(const in uint32_t row, const in uint32_t col, const in float s, c
 
 float dsFuncDKV(const in uint32_t row, const in uint32_t col, const in float pv, const in float dp, const in uint32_t qrow0) {
     const uint32_t qrow = min(qrow0 + col, p.N - 1);
-    return p.scale * pv * (dp - data_stats[g_stats_base + 2 * qrow + 1]);
+    return p.scale * pv * (dp - g_scale * data_stats[g_stats_base + 2 * qrow + 1]);
 }
 
 void main() {
@@ -295,11 +313,12 @@ void main() {
     const uint32_t m_offset = ((iq2 % p.nem2) * p.nbm2 + (iq3 % p.nem3) * p.nbm3) * 2;
     const uint32_t mo_offset = ((iq3 % p.nem3) * p.nem2 + (iq2 % p.nem2)) * p.mo_batch + i * p.mo_stride;
     g_stats_base = 2 * ((iq3 * p.neq2 + iq2) * p.N);
+    g_scale = exp2(float(gexp(data_gmax)));
 
     COOPMAT_A(Br, HS_pad) Qa;
     COOPMAT_A(Br, HS_pad) Ga;
     coopMatLoadTensorNV(Qa, data_q, q_offset, sliceTensorLayoutNV(layoutQ, i * Br, Br, 0, HS_pad), decodeF32);
-    coopMatLoadTensorNV(Ga, data_g, g_offset, sliceTensorLayoutNV(layoutG, i * Br, Br, 0, HS_pad), decodeF32);
+    coopMatLoadTensorNV(Ga, data_g, g_offset, sliceTensorLayoutNV(layoutG, i * Br, Br, 0, HS_pad), decodeF32G);
 
     COOPMAT_ACC(Br, HS_pad) dQ = COOPMAT_ACC(Br, HS_pad)(0.0);
 
@@ -344,6 +363,9 @@ void main() {
         dQ = coopMatMulAdd(dS_A, Kb, dQ);
     }
 
+    // undo the grad_o scale, 1 / 2^e is exact
+    dQ *= 1.0f / g_scale;
+
     const uint32_t d_offset = iq2 * p.nbd2 + iq3 * p.nbd3;
     coopMatStoreTensorNV(dQ, data_d, d_offset, sliceTensorLayoutNV(layoutD, i * Br, Br, 0, HS_pad));
 
@@ -357,6 +379,8 @@ void main() {
 
     const uint32_t k_offset = (ik2 * p.nbk2 + ik3 * p.nbk3) * KV_TYPE_SIZE;
     const uint32_t v_offset = (ik2 * p.nbv2 + ik3 * p.nbv3) * KV_TYPE_SIZE;
+
+    g_scale = exp2(float(gexp(data_gmax)));
 
     COOPMAT_A(Br, HS_pad) Ka;
     COOPMAT_A(Br, HS_pad) Va;
@@ -395,7 +419,7 @@ void main() {
             S = coopMatMulAdd(Ka, Q_T, S);
 
             COOPMAT_B(HS_pad, Bc) G_T;
-            coopMatLoadTensorNV(G_T, data_g, g_offset, sliceTensorLayoutNV(layoutG, j * Bc, Bc, 0, HS_pad), tensorViewTranspose, decodeF32);
+            coopMatLoadTensorNV(G_T, data_g, g_offset, sliceTensorLayoutNV(layoutG, j * Bc, Bc, 0, HS_pad), tensorViewTranspose, decodeF32G);
             COOPMAT_ACC(Br, Bc) dP = COOPMAT_ACC(Br, Bc)(0.0);
             dP = coopMatMulAdd(Va, G_T, dP);
 
@@ -416,7 +440,7 @@ void main() {
             COOPMAT_A(Br, Bc) dS_A = COOPMAT_A(Br, Bc)(dS);
 
             COOPMAT_B(Bc, HS_pad) Gb;
-            coopMatLoadTensorNV(Gb, data_g, g_offset, sliceTensorLayoutNV(layoutG, j * Bc, Bc, 0, HS_pad), decodeF32);
+            coopMatLoadTensorNV(Gb, data_g, g_offset, sliceTensorLayoutNV(layoutG, j * Bc, Bc, 0, HS_pad), decodeF32G);
             dV = coopMatMulAdd(P_A, Gb, dV);
 
             COOPMAT_B(Bc, HS_pad) Qb;
@@ -424,6 +448,11 @@ void main() {
             dK = coopMatMulAdd(dS_A, Qb, dK);
         }
     }
+
+    // undo the grad_o scale, 1 / 2^e is exact
+    const float inv_g_scale = 1.0f / g_scale;
+    dK *= inv_g_scale;
+    dV *= inv_g_scale;
 
     const uint32_t dk_offset = ik2 * p.nbd2 + ik3 * p.nbd3;
     const uint32_t dv_offset = dk_offset + p.nek3 * p.nbd3;

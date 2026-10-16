@@ -1,0 +1,39 @@
+#version 450
+
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform parameter {
+    uint ne0, ne1, ne2, ne3;
+    uint nb1, nb2, nb3;
+} p;
+
+layout(binding = 0) readonly buffer A { float data_a[]; };
+
+layout(binding = 1) buffer M { uint data_max; };
+
+void main() {
+    const uint n      = p.ne0 * p.ne1 * p.ne2 * p.ne3;
+    const uint stride = gl_NumWorkGroups.x * gl_WorkGroupSize.x;
+
+    float m = 0.0;
+    for (uint i = gl_GlobalInvocationID.x; i < n; i += stride) {
+
+        const uint i0 = i % p.ne0;
+        uint       r  = i / p.ne0;
+        const uint i1 = r % p.ne1;
+
+        r /= p.ne1;
+
+        const uint i2 = r % p.ne2;
+        const uint i3 = r / p.ne2;
+
+        m = max(m, abs(data_a[i3 * p.nb3 + i2 * p.nb2 + i1 * p.nb1 + i0]));
+    }
+
+    m = subgroupMax(m);
+    if (subgroupElect()) {
+        atomicMax(data_max, floatBitsToUint(m));
+    }
+}
