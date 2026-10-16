@@ -6708,22 +6708,21 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                         int out_nodes[2];  // nodes which can't be elided
 
                         if (args.sigmoid) {
-                            ops.insert(ops.end(), { GGML_OP_UNARY });
+                            ops.push_back(GGML_OP_UNARY);
                         } else if (args.sqrt_softplus) {
                             ops.insert(ops.end(), { GGML_OP_UNARY, GGML_OP_SQRT });
                         } else {
-                            ops.insert(ops.end(), { GGML_OP_SOFT_MAX });
+                            ops.push_back(GGML_OP_SOFT_MAX);
                         }
                         const int i_probs = i + (int) ops.size() - 1;  // last node of the gating activation
 
+                        // reshape, optional selection bias, then the top-k: argsort, view (the ids), get_rows
+                        ops.push_back(GGML_OP_RESHAPE);
                         if (args.prob_bias) {
-                            ops.insert(ops.end(), { GGML_OP_RESHAPE, GGML_OP_ADD, GGML_OP_ARGSORT, GGML_OP_VIEW,
-                                                    GGML_OP_GET_ROWS });
-                            out_nodes[0] = i_probs + 4;
-                        } else {
-                            ops.insert(ops.end(), { GGML_OP_RESHAPE, GGML_OP_ARGSORT, GGML_OP_VIEW, GGML_OP_GET_ROWS });
-                            out_nodes[0] = i_probs + 3;
+                            ops.push_back(GGML_OP_ADD);
                         }
+                        ops.insert(ops.end(), { GGML_OP_ARGSORT, GGML_OP_VIEW, GGML_OP_GET_ROWS });
+                        out_nodes[0] = i_probs + (args.prob_bias ? 4 : 3);
                         ids = cgraph->nodes[out_nodes[0]];
 
                         if (args.norm) {
