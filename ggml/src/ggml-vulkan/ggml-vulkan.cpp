@@ -2890,6 +2890,13 @@ class vk_perf_logger {
     }
 };
 
+// One memoized device-local capacity decision for a flash attention scratch, see ggml_vk_fa_scratch_fits
+struct vk_fa_scratch_gate {
+    uint64_t sz;
+    bool fits;
+    bool logged;
+};
+
 struct ggml_backend_vk_context {
     std::string name;
 
@@ -2899,10 +2906,9 @@ struct ggml_backend_vk_context {
     ggml_vk_garbage_collector gc;
     size_t prealloc_size_x, prealloc_size_y, prealloc_size_split_k, prealloc_size_add_rms_partials, prealloc_size_add_rms_partials_offset, prealloc_size_tile;
     vk_buffer prealloc_x, prealloc_y, prealloc_split_k, prealloc_add_rms_partials, prealloc_tile, sync_staging;
-    // memoized capacity decision for the FA dequant-once scratch, see ggml_vk_fa_dequant_scratch_fits
-    uint64_t fa_dequant_gate_sz;
-    bool fa_dequant_gate_fits;
-    bool fa_dequant_gate_logged;
+    // memoized capacity decisions for the FA scratch in prealloc_x, see ggml_vk_fa_scratch_fits
+    vk_fa_scratch_gate fa_dequant_gate; // the K/V scratch alone
+    vk_fa_scratch_gate fa_vt_gate;      // K/V scratch + V^T
     vk::Fence fence, almost_ready_fence;
     bool submit_pending {};
     bool almost_ready_fence_pending {};
@@ -9494,9 +9500,8 @@ static void ggml_vk_init(ggml_backend_vk_context * ctx, size_t idx) {
     ctx->prealloc_size_x = 0;
     ctx->prealloc_size_y = 0;
     ctx->prealloc_size_split_k = 0;
-    ctx->fa_dequant_gate_sz = 0;
-    ctx->fa_dequant_gate_fits = false;
-    ctx->fa_dequant_gate_logged = false;
+    ctx->fa_dequant_gate = {};
+    ctx->fa_vt_gate = {};
     // Fixed size of 1KB, for deterministic behavior
     ctx->prealloc_size_add_rms_partials = 1024;
     ctx->prealloc_size_tile = 0;
@@ -13412,7 +13417,11 @@ static bool ggml_vk_flash_attn_coopmat_shmem_support(const vk_device& device, co
 // the free-VRAM level where paging starts. The reserve is necessarily conservative because other
 // processes' VRAM use is invisible to us. GGML_VK_FA_DEQUANT=0/1 forces the path off/on;
 // GGML_VK_FA_DEQUANT_RESERVE_MB overrides the reserve.
-static bool ggml_vk_fa_dequant_scratch_fits(ggml_backend_vk_context * ctx, uint64_t scratch_sz) {
+//
+// `gate` memoizes the decision for one scratch (the K/V scratch, or K/V + V^T); `what` and `force`
+// name it and its override in the log line.
+static bool ggml_vk_fa_scratch_fits(ggml_backend_vk_context * ctx, vk_fa_scratch_gate & gate, uint64_t scratch_sz,
+                                    const char * what, const char * force) {
     const vk_device& device = ctx->device;
 
     if (device->uma) {
@@ -13420,8 +13429,8 @@ static bool ggml_vk_fa_dequant_scratch_fits(ggml_backend_vk_context * ctx, uint6
     }
 
     // Decided once per scratch size, so the decision cannot flip between layers as usage grows.
-    if (ctx->fa_dequant_gate_sz == scratch_sz) {
-        return ctx->fa_dequant_gate_fits;
+    if (gate.sz == scratch_sz) {
+        return gate.fits;
     }
 
     static const uint64_t reserve = [] {
@@ -13452,15 +13461,15 @@ static bool ggml_vk_fa_dequant_scratch_fits(ggml_backend_vk_context * ctx, uint6
         fits = heap_size > reserve && heap_used + scratch_sz + reserve <= heap_size;
     }
 
-    if (!fits && !ctx->fa_dequant_gate_logged) {
-        ctx->fa_dequant_gate_logged = true;
-        GGML_LOG_INFO("ggml_vulkan: flash attention dequant-once disabled: %llu MiB K/V scratch does not fit "
-                      "device-local memory with a %llu MiB reserve. Set GGML_VK_FA_DEQUANT=1 to force it on.\n",
-                      (unsigned long long)(scratch_sz >> 20), (unsigned long long)(reserve >> 20));
+    if (!fits && !gate.logged) {
+        gate.logged = true;
+        GGML_LOG_INFO("ggml_vulkan: flash attention %s disabled: %llu MiB scratch does not fit "
+                      "device-local memory with a %llu MiB reserve. Set %s to force it on.\n",
+                      what, (unsigned long long)(scratch_sz >> 20), (unsigned long long)(reserve >> 20), force);
     }
 
-    ctx->fa_dequant_gate_sz = scratch_sz;
-    ctx->fa_dequant_gate_fits = fits;
+    gate.sz = scratch_sz;
+    gate.fits = fits;
     return fits;
 }
 
@@ -13601,7 +13610,8 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
                                 // Intel Xe1 regresses, see PR 25494
                                 (ctx->device->vendor_id != VK_VENDOR_ID_INTEL ||
                                  (ctx->device->coopmat_support && ctx->device->architecture != vk_device_architecture::INTEL_XE1)) &&
-                                (fa_dequant_on || ggml_vk_fa_dequant_scratch_fits(ctx, kv_f16_sz));
+                                (fa_dequant_on || ggml_vk_fa_scratch_fits(ctx, ctx->fa_dequant_gate, kv_f16_sz, "dequant-once (K/V)",
+                                                                   "GGML_VK_FA_DEQUANT=1"));
     const ggml_type k_type_eff = use_dequant_kv ? GGML_TYPE_F16 : k->type;
     const ggml_type v_type_eff = use_dequant_kv ? GGML_TYPE_F16 : v->type;
 
@@ -13688,7 +13698,7 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
     // B-operand fragment is one contiguous 32-byte run per lane instead of 16 kv-strided 16-bit loads.
     // GGML_VK_FA_VT: unset = on for the cm1 kernel on RADV RDNA3, 1 = on everywhere, 0 = off (this also turns
     // off the multi-row kernel, which reads V only from the V^T scratch). The cm1 kernel cannot use it with
-    // shmem staging, which stages V rows from the row-major layout.
+    // shmem staging, which stages V rows from the row-major layout. =1 also skips the capacity check below.
     static const int fa_vt_env = [] {
         const char * e = getenv("GGML_VK_FA_VT");
         return e ? atoi(e) : -1;
@@ -13698,13 +13708,13 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
     const uint32_t vt_kv_pad = KV + 128;
     const uint64_t vt_size = (uint64_t)HSV * vt_kv_pad * nev2 * sizeof(ggml_fp16_t);
     const uint64_t vt_offset = use_dequant_kv ? kv_f16_sz : 0;
-    const bool vt_ok = fa_vt_env != 0 && tuning_params.path == FA_COOPMAT1 && aligned && !tuning_params.shmem_staging &&
-                       v_type_eff == GGML_TYPE_F16 && !use_sparse && gqa_ratio == 1 && neq1 >= 64 && nev3 == 1 &&
-                       (KV % 64) == 0 && (HSV % 64) == 0 && KV < 65536 * 64 &&
-                       ctx->device->pipeline_dequant_f16_transpose_vt != nullptr &&
-                       (use_dequant_kv || ((nbv1 % 8) == 0 && (nbv2 % 8) == 0)) &&
-                       vt_size <= ctx->device->properties.limits.maxStorageBufferRange &&
-                       vt_offset + vt_size <= ctx->device->max_buffer_size;
+    const bool vt_eligible = fa_vt_env != 0 && tuning_params.path == FA_COOPMAT1 && aligned && !tuning_params.shmem_staging &&
+                             v_type_eff == GGML_TYPE_F16 && !use_sparse && gqa_ratio == 1 && neq1 >= 64 && nev3 == 1 &&
+                             (KV % 64) == 0 && (HSV % 64) == 0 && KV < 65536 * 64 &&
+                             ctx->device->pipeline_dequant_f16_transpose_vt != nullptr &&
+                             (use_dequant_kv || ((nbv1 % 8) == 0 && (nbv2 % 8) == 0)) &&
+                             vt_size <= ctx->device->properties.limits.maxStorageBufferRange &&
+                             vt_offset + vt_size <= ctx->device->max_buffer_size;
 
     // Multi-row prefill FA (flash_attn_cm1_mr.comp): one workgroup of eight wave32 subgroups covers 64 rows =
     // H heads x 64/H tokens that share a KV head. Q stays in registers and each 16-key K/V tile serves all 64
@@ -13721,6 +13731,14 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
         return e ? atoi(e) : 0;
     }();
     const bool fa_mr_on = fa_mr_env > 0 || (fa_mr_env < 0 && HSK == 256 && radv_rdna3);
+
+    // The V^T region extends prealloc_x past the K/V scratch. When it would grow the allocation, gate the whole
+    // scratch (K/V + V^T) on device-local capacity, as the K/V scratch alone is gated above; an allocation that
+    // is already large enough adds nothing. Only asked when V^T would be used, so other devices never query it.
+    const uint64_t vt_scratch_sz = vt_offset + vt_size;
+    const bool vt_ok = vt_eligible && (fa_mr_on || fa_vt_env > 0 || radv_rdna3) &&
+                       (fa_vt_env > 0 || vt_scratch_sz <= ctx->prealloc_size_x ||
+                        ggml_vk_fa_scratch_fits(ctx, ctx->fa_vt_gate, vt_scratch_sz, "V^T", "GGML_VK_FA_VT=1"));
     const uint32_t qk_ratio_mr = nek2 > 0 ? (uint32_t)(neq2 / nek2) : 0;
     const uint32_t mr_h = fa_mr_h_env > 0 ? (uint32_t)fa_mr_h_env : ((qk_ratio_mr % 2) == 0 ? 2u : 1u);
     const bool use_mr = fa_mr_on && vt_ok && f32acc &&
