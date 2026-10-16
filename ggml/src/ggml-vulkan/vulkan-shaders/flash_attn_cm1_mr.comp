@@ -252,10 +252,11 @@ void main() {
                 }
                 if (read_mask) {
                     // rows past N never reach the output; rows past nem1 read no mask, so every key is visible there
+                    // same threshold as the score path above, so a key it scores -inf also has its V zeroed
                     uint32_t bits = 0u;
                     if (sm_tok < N) {
                         [[unroll]] for (uint32_t k = 0; k < 4; ++k) {
-                            const bool vis = !m_row_ok || float(data_m[m_row_off + key0 + sm_seg * 4 + k]) > NEG_FLT_MAX_OVER_2;
+                            const bool vis = !m_row_ok || float(data_m[m_row_off + key0 + sm_seg * 4 + k]) > FA_MASK_DEAD;
                             bits |= vis ? 1u << (sm_seg * 4 + k) : 0u;
                         }
                     }
