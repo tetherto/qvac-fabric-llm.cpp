@@ -11616,13 +11616,19 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
         // im2col uses only src1 and dst buffers
         ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { src1_buf, dst_buf }, pc, elements);
     } else if (op == GGML_OP_COUNT_EQUAL) {
-        // count_equal assumes that destination buffer is initialized with zeroes
-        ggml_vk_buffer_memset_async(subctx, dst_buf.buffer, dst_buf.offset, 0, dst_buf.size);
+        // count_equal assumes that destination buffer is initialized with zeroes.
+        // Clear it on the GPU timeline: a deferred host memset on host-visible memory
+        // runs at submit time and can be overwritten by earlier, still-pending graph
+        // ops that alias the same allocation.
+        subctx->s->buffer->buf.fillBuffer(dst_buf.buffer->buffer, dst_buf.offset, dst_buf.size, 0);
         ggml_vk_sync_buffers(ctx, subctx);
         ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { src0_buf, src1_buf, dst_buf }, pc, elements);
     } else if (op == GGML_OP_COUNT_EQUAL_MASKED) {
-        // count_equal_masked assumes that destination buffer is initialized with zeroes
-        ggml_vk_buffer_memset_async(subctx, dst_buf.buffer, dst_buf.offset, 0, dst_buf.size);
+        // count_equal_masked assumes that destination buffer is initialized with zeroes.
+        // Clear it on the GPU timeline: a deferred host memset on host-visible memory
+        // runs at submit time and can be overwritten by earlier, still-pending graph
+        // ops that alias the same allocation.
+        subctx->s->buffer->buf.fillBuffer(dst_buf.buffer->buffer, dst_buf.offset, dst_buf.size, 0);
         ggml_vk_sync_buffers(ctx, subctx);
         ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { src0_buf, src1_buf, src2_buf, dst_buf }, pc, elements);
     } else if (op == GGML_OP_OPT_STEP_SGD) {
