@@ -2370,7 +2370,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         }
 #undef FA_BACK_SPV
         const bool full_subgroups = s.path == FA_SCALAR && !ds;
-        ggml_vk_create_pipeline(device, fab.second, name, spv_size, spv_data, "main", 9,
+        ggml_vk_create_pipeline(device, fab.second, name, spv_size, spv_data, "main", 10,
                                 sizeof(vk_flash_attn_back_push_constants), {1, 1, 1},
                                 {s.workgroup_size, s.Br, s.Bc, s.HS, s.D_split, s.subgroup_size},
                                 1, true, full_subgroups, full_subgroups ? s.subgroup_size : 0);
@@ -3751,6 +3751,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 
     ggml_vk_create_pipeline(device, device->pipeline_matmul_split_k_reduce, "split_k_reduce", split_k_reduce_len, split_k_reduce_data, "main", 2, 2 * sizeof(uint32_t), {256 * 4, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_flash_attn_split_k_reduce, "fa_split_k_reduce", fa_split_k_reduce_len, fa_split_k_reduce_data, "main", 3, sizeof(vk_op_flash_attn_split_k_reduce_push_constants), {1, device->subgroup_size, 1}, {device->subgroup_size}, 1, true);
+    ggml_vk_create_pipeline(device, device->pipeline_flash_attn_back_absmax, "fa_back_absmax", fa_back_absmax_len, fa_back_absmax_data, "main", 2, sizeof(vk_op_flash_attn_back_absmax_push_constants), { 256, 1, 1 }, {}, 1);
 
 #if defined(VK_KHR_cooperative_matrix) && defined(GGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
     if (device->vendor_id == VK_VENDOR_ID_INTEL && (device->architecture == INTEL_XE2 || (device->architecture == INTEL_XE1 && device->coopmat_support && device->uma))) {
@@ -12320,6 +12321,44 @@ static void ggml_vk_flash_attn_ext_back(ggml_backend_vk_context * ctx, vk_contex
     const uint32_t mo_stride = use_mask_opt ? CEIL_DIV(nem0, 16 * mo_cols) : 0;
     const uint32_t mo_batch  = use_mask_opt ? mo_stride * CEIL_DIV(nem1, mo_rows) : 0;
 
+    const bool use_gscale = path == FA_COOPMAT2 && target != GGML_FLASH_ATTN_EXT_BACK_STATS;
+
+    vk_subbuffer gmax_buf = q_buf;
+    if (use_gscale) {
+        constexpr size_t gmax_buf_size = sizeof(uint32_t);
+        constexpr size_t float_size = sizeof(float);
+
+        ggml_pipeline_request_descriptor_sets(ctx, device->pipeline_flash_attn_back_absmax, 1);
+
+        if (ctx->prealloc_size_split_k < gmax_buf_size) {
+            ctx->prealloc_size_split_k = gmax_buf_size;
+            ggml_vk_preallocate_buffers(ctx, subctx);
+        }
+
+        if (ctx->prealloc_split_k_need_sync) {
+            ggml_vk_sync_buffers(ctx, subctx);
+        }
+
+        gmax_buf = ggml_vk_subbuffer(ctx, ctx->prealloc_split_k, 0);
+
+        subctx->s->buffer->buf.fillBuffer(gmax_buf.buffer->buffer, gmax_buf.offset, gmax_buf_size, 0);
+        ggml_vk_sync_buffers(ctx, subctx);
+
+        const uint32_t ne = (uint32_t) ggml_nelements(grad_o);
+        const vk_op_flash_attn_back_absmax_push_constants absmax_pc = {
+            (uint32_t) grad_o->ne[0],
+            (uint32_t) grad_o->ne[1],
+            (uint32_t) grad_o->ne[2],
+            (uint32_t) grad_o->ne[3],
+            (uint32_t) (grad_o->nb[1] / float_size),
+            (uint32_t) (grad_o->nb[2] / float_size),
+            (uint32_t) (grad_o->nb[3] / float_size),
+        };
+        ggml_vk_dispatch_pipeline(ctx, subctx, device->pipeline_flash_attn_back_absmax, { g_buf, gmax_buf }, absmax_pc, { std::min(ne, 256u * 1024u), 1, 1 });
+
+        ggml_vk_sync_buffers(ctx, subctx);
+    }
+
     vk_subbuffer mask_opt_buf = q_buf;
     if (use_mask_opt) {
         vk_pipeline pipeline_mask_opt = nullptr;
@@ -12379,11 +12418,15 @@ static void ggml_vk_flash_attn_ext_back(ggml_backend_vk_context * ctx, vk_contex
     }
 
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
-        {q_buf, k_buf, v_buf, mask_buf, o_buf, g_buf, stats_buf, dst_buf, mask_opt_buf},
+        {q_buf, k_buf, v_buf, mask_buf, o_buf, g_buf, stats_buf, dst_buf, mask_opt_buf, gmax_buf},
         pc, elements);
 
     if (use_mask_opt) {
         ctx->prealloc_y_need_sync = true;
+    }
+
+    if (use_gscale) {
+        ctx->prealloc_split_k_need_sync = true;
     }
 }
 

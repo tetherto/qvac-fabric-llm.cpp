@@ -1086,6 +1086,7 @@ struct vk_device_struct {
 
     std::map<vk_fa_pipeline_state, vk_pipeline> pipeline_flash_attn_f32_f16;
     std::map<vk_fa_back_pipeline_state, vk_pipeline> pipeline_flash_attn_back;
+    vk_pipeline pipeline_flash_attn_back_absmax;
 
     std::map<std::pair<uint32_t, uint32_t>, vk_pipeline> pipeline_fa_mask_opt;
 

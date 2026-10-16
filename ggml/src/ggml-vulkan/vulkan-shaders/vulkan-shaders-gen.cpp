@@ -1501,6 +1501,8 @@ void process_shaders() {
     }
 #endif
 
+    string_to_spv("fa_back_absmax", "flash_attn_back_absmax.comp", {});
+
     string_to_spv("opt_step_adamw_f32", "opt_step_adamw.comp", merge_maps(base_dict, {{"A_TYPE", "float"}}));
     string_to_spv("opt_step_sgd_f32", "opt_step_sgd.comp", merge_maps(base_dict, {{"A_TYPE", "float"}}));
 

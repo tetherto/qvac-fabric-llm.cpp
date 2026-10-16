@@ -981,6 +981,16 @@ struct vk_op_flash_attn_sparse_compact_push_constants {
     uint32_t n_kv_max;
 };
 
+struct vk_op_flash_attn_back_absmax_push_constants {
+    uint32_t ne0;
+    uint32_t ne1;
+    uint32_t ne2;
+    uint32_t ne3;
+    uint32_t nb1;
+    uint32_t nb2;
+    uint32_t nb3;
+};
+
 template <typename T> void init_pushconst_tensor_offsets(ggml_backend_vk_context * ctx, T &p, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * src2, const ggml_tensor * src3, ggml_tensor * dst) {
     GGML_UNUSED(p);
     GGML_UNUSED(src0);
