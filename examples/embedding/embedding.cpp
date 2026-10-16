@@ -1,5 +1,15 @@
+#include <algorithm>
+#include <chrono>
+#include <cstdint>
+#include <cstdlib>
+#include <ctime>
+#include <fstream>
+#include <thread>
+#include <vector>
+
 #include "arg.h"
 #include "common.h"
+#include "llama-cpp.h"
 #include "log.h"
 #include "llama.h"
 
@@ -9,6 +19,10 @@
 
 #if defined(_MSC_VER)
 #pragma warning(disable: 4244 4267) // possible loss of data
+#endif
+
+#ifdef LLAMA_COMMON_TEST_HEADERS
+#include "load_into_memory.h"
 #endif
 
 static std::vector<std::string> split_lines(const std::string & s, const std::string & separator = "\n") {
@@ -134,7 +148,22 @@ int main(int argc, char ** argv) {
     llama_numa_init(params.numa);
 
     // load the model
+#ifdef LLAMA_COMMON_TEST_HEADERS
+    common_init_result_ptr llama_init;
+    if (memory_configuration_env_is_set()) {
+        llama_model_params mparams = common_model_params_to_llama(params);
+        llama_model * model = load_model_from_memory_configuration(params.model.path.c_str(), mparams);
+        // Adopt the externally-loaded model via the 2-arg overload, which builds
+        // the result (context + samplers) before delegating to the internal
+        // 3-arg helper. Calling the 3-arg helper directly with the default-
+        // constructed (null) llama_init would deref a null result immediately.
+        llama_init = common_init_from_model_and_params(model, params);
+    } else {
+        llama_init = common_init_from_params(params);
+    }
+#else
     auto llama_init = common_init_from_params(params);
+#endif
 
     auto * model = llama_init->model();
     auto * ctx = llama_init->context();

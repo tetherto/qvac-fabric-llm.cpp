@@ -1,0 +1,3 @@
+-r jinja/requirements.txt
+-r snapdragon/qdc/requirements.txt
+-r tune/tune_requirements.txt

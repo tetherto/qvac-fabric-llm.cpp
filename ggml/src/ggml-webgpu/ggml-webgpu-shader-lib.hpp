@@ -141,10 +141,11 @@ struct ggml_webgpu_ssm_scan_pipeline_key {
     bool xbc_overlap;
     bool a_overlap;
     bool ids_overlap;
+    bool dst_overlap;
 
     bool operator==(const ggml_webgpu_ssm_scan_pipeline_key & other) const {
         return type == other.type && d_state == other.d_state && xbc_overlap == other.xbc_overlap &&
-               a_overlap == other.a_overlap && ids_overlap == other.ids_overlap;
+               a_overlap == other.a_overlap && ids_overlap == other.ids_overlap && dst_overlap == other.dst_overlap;
     }
 };
 
@@ -156,6 +157,7 @@ struct ggml_webgpu_ssm_scan_pipeline_key_hash {
         ggml_webgpu_hash_combine(seed, key.xbc_overlap);
         ggml_webgpu_hash_combine(seed, key.a_overlap);
         ggml_webgpu_hash_combine(seed, key.ids_overlap);
+        ggml_webgpu_hash_combine(seed, key.dst_overlap);
         return seed;
     }
 };
@@ -166,6 +168,7 @@ struct ggml_webgpu_ssm_scan_shader_decisions {
     bool     xbc_overlap = false;
     bool     a_overlap   = false;
     bool     ids_overlap = false;
+    bool     dst_overlap = false;
 };
 
 /** Argsort **/
@@ -1800,13 +1803,15 @@ class ggml_webgpu_shader_lib {
     webgpu_pipeline get_ssm_scan_pipeline(const ggml_webgpu_shader_lib_context & context,
                                           bool                                   xbc_overlap,
                                           bool                                   a_overlap,
-                                          bool                                   ids_overlap) {
+                                          bool                                   ids_overlap,
+                                          bool                                   dst_overlap) {
         ggml_webgpu_ssm_scan_pipeline_key key = {};
         key.type                              = context.dst->type;
         key.d_state                           = (int) context.src0->ne[0];
         key.xbc_overlap                       = xbc_overlap;
         key.a_overlap                         = a_overlap;
         key.ids_overlap                       = ids_overlap;
+        key.dst_overlap                       = dst_overlap;
 
         auto it = ssm_scan_pipelines.find(key);
         if (it != ssm_scan_pipelines.end()) {
@@ -1847,6 +1852,10 @@ class ggml_webgpu_shader_lib {
         if (key.ids_overlap) {
             defines.push_back("IDS_OVERLAP");
         }
+        if (key.dst_overlap) {
+            defines.push_back("DST_OVERLAP");
+            variant += "_dst_overlap";
+        }
         variant += "_d" + std::to_string(key.d_state);
 
         auto processed             = preprocessor.preprocess(wgsl_ssm_scan, defines);
@@ -1856,6 +1865,7 @@ class ggml_webgpu_shader_lib {
         decisions->xbc_overlap     = key.xbc_overlap;
         decisions->a_overlap       = key.a_overlap;
         decisions->ids_overlap     = key.ids_overlap;
+        decisions->dst_overlap     = key.dst_overlap;
         webgpu_pipeline pipeline   = ggml_webgpu_create_pipeline(device, processed, variant);
         pipeline.context           = decisions;
         ssm_scan_pipelines[key]    = pipeline;

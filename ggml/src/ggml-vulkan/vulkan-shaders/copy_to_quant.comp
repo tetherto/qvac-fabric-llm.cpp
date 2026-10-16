@@ -300,6 +300,8 @@ void quantize(uint dst_idx, uint src_idx)
 }
 #endif
 
+#include "turbo-quant/copy_to_quant.glsl"
+
 #if defined(SET_ROWS)
 
 void main() {
@@ -307,7 +309,14 @@ void main() {
     init_iq_shmem(gl_WorkGroupSize);
 #endif
 
+#if defined(TBQ_COOP)
+    // One workgroup == one block. gl_WorkGroupID is packed (z, y, x) where each
+    // workgroup corresponds to a single QUANT_K-sized block.
+    const uint block_idx = gl_WorkGroupID.z * 262144 + gl_WorkGroupID.y * 512 + gl_WorkGroupID.x;
+    const uint idx = block_idx * QUANT_K;
+#else
     const uint idx = ((gl_WorkGroupID.z * 262144 + gl_WorkGroupID.y * 512 + gl_WorkGroupID.x) * BLOCK_SIZE + gl_LocalInvocationID.x) * QUANT_K;
+#endif
 
     if (idx >= p.ne) {
         return;
@@ -335,7 +344,14 @@ void main() {
     init_iq_shmem(gl_WorkGroupSize);
 #endif
 
+#if defined(TBQ_COOP)
+    // One workgroup == one block. Thread 0..31 of the workgroup cooperate on
+    // QUANT_K values, so we drop the *32 multiplier and the lane offset.
+    const uint block_idx = gl_WorkGroupID.z * 262144 + gl_WorkGroupID.y * 512 + gl_WorkGroupID.x;
+    const uint idx = block_idx * QUANT_K;
+#else
     const uint idx = (gl_WorkGroupID.z * 262144 + gl_WorkGroupID.y * 512 + gl_WorkGroupID.x * 32 + gl_LocalInvocationID.x) * QUANT_K;
+#endif
 
     if (idx >= p.ne) {
         return;

@@ -150,10 +150,18 @@ __kernel void flash_attn_f32(
         }
         barrier(CLK_LOCAL_MEM_FENCE);
 
-        if (my_query_row >= n_q) {
-            continue;
-        }
-
+        // NOTE: do NOT `continue` for out-of-range query rows here. Every
+        // work-item must reach the trailing barrier at the end of this loop,
+        // otherwise the extra lanes (my_query_row >= n_q in the last partial
+        // BLOCK_M block) race ahead to the next tile's load and overwrite
+        // l_k/l_v while active lanes are still reading them. That shared-memory
+        // race silently corrupts the K/V tiles for any sequence spanning more
+        // than one BLOCK_N tile (e.g. the bidirectional Qwen3-VL vision tower,
+        // n_kv=247), degrading the encode. Empirically this fires even on a
+        // single 64-wide Adreno subgroup (Adreno 830), so it is guarded
+        // unconditionally, not only for FA_SG < 64. Guard the score loop
+        // instead of continuing.
+        if (my_query_row < n_q) {
         for (int j = 0; j < BLOCK_N; j += 4) {
             const int k_row0 = k_start + j;
             const int k_row1 = k_start + j + 1;
@@ -222,6 +230,11 @@ __kernel void flash_attn_f32(
             l_i = l_i * scale_prev + p0 + p1 + p2 + p3;
             m_i = m_new;
         }
+        } // end if (my_query_row < n_q)
+
+        // Ensure every work-item has finished reading l_k/l_v before the next
+        // iteration overwrites the shared K/V tiles.
+        barrier(CLK_LOCAL_MEM_FENCE);
     }
 
     if (my_query_row < n_q) {

@@ -1,0 +1,55 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+
+layout (push_constant) uniform parameter
+{
+    uint K;         // dst->ne[0]  (cols of each expert)
+    uint N;         // dst->ne[1]  (rows of each expert)
+    uint n_expert;  // dst->ne[2]
+    uint n_used;    // ids->ne[0]
+    uint n_tok;     // ids->ne[1]
+    uint b_ne1;     // b->ne[1] (n_used or 1 for broadcast)
+    uint g_nb1;     // grad_out strides (in elements)
+    uint g_nb2;
+    uint b_nb1;     // b strides
+    uint b_nb2;
+    uint ids_nb1;   // ids stride
+    uint d_nb1;     // dst strides
+    uint d_nb2;
+} p;
+
+#define BLOCK_SIZE 256
+
+layout(local_size_x = BLOCK_SIZE, local_size_y = 1, local_size_z = 1) in;
+
+layout (binding = 0) readonly  buffer G {float   data_g[];};  // grad_out [N, n_used, n_tok]
+layout (binding = 1) readonly  buffer B {float   data_b[];};  // b        [K, b_ne1, n_tok]
+layout (binding = 2) readonly  buffer I {int32_t data_i[];};  // ids      [n_used, n_tok]
+layout (binding = 3) writeonly buffer D {float   data_d[];};  // grad_as  [K, N, n_expert]
+
+// One workgroup per (n, e), local invocations stride over k.
+// grad_as[e, n, k] = sum over tokens t and used slots u with ids[t][u] == e of grad_out[t, u, n] * b[t, bu, k]
+void main() {
+    const uint n = gl_WorkGroupID.x;
+    const uint e = gl_WorkGroupID.y;
+
+    for (uint k = gl_LocalInvocationID.x; k < p.K; k += BLOCK_SIZE) {
+        float acc = 0.0;
+
+        for (uint t = 0; t < p.n_tok; ++t) {
+            for (uint u = 0; u < p.n_used; ++u) {
+                if (uint(data_i[u + t*p.ids_nb1]) != e) {
+                    continue;
+                }
+                const float g  = data_g[n + u*p.g_nb1 + t*p.g_nb2];
+                const uint  bu = (p.b_ne1 == 1u) ? 0u : u;
+                const float bv = data_b[k + bu*p.b_nb1 + t*p.b_nb2];
+                acc += g * bv;
+            }
+        }
+
+        data_d[k + n*p.d_nb1 + e*p.d_nb2] = acc;
+    }
+}

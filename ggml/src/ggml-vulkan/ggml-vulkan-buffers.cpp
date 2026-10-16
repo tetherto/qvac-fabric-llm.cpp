@@ -1,3 +1,5 @@
+// the VMA implementation is compiled in this file only
+#define VMA_IMPLEMENTATION
 #include "ggml-vulkan-common.h"
 
 ggml_backend_buffer_type_i ggml_backend_vk_buffer_type_interface = {
@@ -9,180 +11,60 @@ ggml_backend_buffer_type_i ggml_backend_vk_buffer_type_interface = {
     /* .is_host          = */ NULL,
 };
 
-static std::vector<uint32_t> ggml_vk_find_memory_properties(const vk::PhysicalDeviceMemoryProperties* mem_props, vk::MemoryRequirements* mem_req, vk::MemoryPropertyFlags flags) {
-    std::vector<uint32_t> indices;
-
-    for (uint32_t i = 0; i < mem_props->memoryTypeCount; ++i) {
-        vk::MemoryType memory_type = mem_props->memoryTypes[i];
-        if ((mem_req->memoryTypeBits & ((uint64_t)1 << i)) &&
-            (flags & memory_type.propertyFlags) == flags &&
-            mem_props->memoryHeaps[memory_type.heapIndex].size >= mem_req->size) {
-            indices.push_back(i);
-        }
-    }
-    return indices;
-}
-
-static vk_buffer ggml_vk_create_buffer(vk_device& device, size_t size, const std::initializer_list<vk::MemoryPropertyFlags> & req_flags_list,
-                                       void *import_ptr = nullptr) {
-    VK_LOG_DEBUG("ggml_vk_create_buffer(" << device->name << ", " << size << ", " << to_string(req_flags_list.begin()[0]) << ", " << to_string(req_flags_list.begin()[req_flags_list.size()-1]) << ")");
-    if (size > device->max_buffer_size) {
+static vk_buffer ggml_vk_create_buffer(vk_device& device, const vk::BufferCreateInfo& buffer_info, const VmaAllocationCreateInfo& alloc_info) {
+    VK_LOG_DEBUG("ggml_vk_create_buffer(" << device->name << ", " << buffer_info.size << ")");
+    if (buffer_info.size > device->max_buffer_size) {
         throw vk::OutOfDeviceMemoryError("Requested buffer size exceeds device buffer size limit");
     }
 
     vk_buffer buf = std::make_shared<vk_buffer_struct>();
 
-    if (size == 0) {
+    if (buffer_info.size == 0) {
         buf->size = 0;
         return buf;
     }
 
-    vk::BufferUsageFlags usage_flags = vk::BufferUsageFlagBits::eStorageBuffer | vk::BufferUsageFlagBits::eTransferSrc | vk::BufferUsageFlagBits::eTransferDst;
-    vk::MemoryAllocateFlags mem_flags {};
-    if (device->buffer_device_address) {
-        usage_flags |= vk::BufferUsageFlagBits::eShaderDeviceAddress;
-        mem_flags |= vk::MemoryAllocateFlagBits::eDeviceAddress;
+    VkResult res = vmaCreateBuffer(device->allocator, reinterpret_cast<const VkBufferCreateInfo *>(&buffer_info), &alloc_info, reinterpret_cast<VkBuffer *>(&buf->buffer), &buf->allocation, &buf->info);
+    if (res != VK_SUCCESS) {
+        throw vk::SystemError(static_cast<vk::Result>(res), "vmaCreateBuffer failed");
     }
 
-    vk::BufferCreateInfo buffer_create_info{
-        vk::BufferCreateFlags(),
-        size,
-        usage_flags,
-        vk::SharingMode::eExclusive,
-        0,
-        nullptr,
-    };
-
-    vk::ExternalMemoryBufferCreateInfo external_memory_bci;
-    if (import_ptr) {
-        external_memory_bci.handleTypes = vk::ExternalMemoryHandleTypeFlagBits::eHostAllocationEXT;
-        buffer_create_info.setPNext(&external_memory_bci);
-    }
-
-    buf->buffer = device->device.createBuffer(buffer_create_info);
-
-    vk::MemoryRequirements mem_req = device->device.getBufferMemoryRequirements(buf->buffer);
-
-    vk::PhysicalDeviceMemoryProperties mem_props = device->physical_device.getMemoryProperties();
-
-    const vk::MemoryPriorityAllocateInfoEXT mem_priority_info { 1.0f };
-
-    vk::MemoryAllocateFlagsInfo mem_flags_info { mem_flags };
-
-    if (device->memory_priority) {
-        mem_flags_info.setPNext(&mem_priority_info);
-    }
-
-    if (import_ptr) {
-        vk::MemoryHostPointerPropertiesEXT host_pointer_props;
-        try {
-            host_pointer_props = device->device.getMemoryHostPointerPropertiesEXT(vk::ExternalMemoryHandleTypeFlagBits::eHostAllocationEXT, import_ptr);
-        } catch (vk::SystemError& e) {
-            GGML_LOG_WARN("ggml_vulkan: Failed getMemoryHostPointerPropertiesEXT (%s)\n", e.what());
-            device->device.destroyBuffer(buf->buffer);
-            return {};
-        }
-        vk::PhysicalDeviceMemoryProperties mem_props = device->physical_device.getMemoryProperties();
-
-        uint32_t memory_type_idx;
-        vk::MemoryPropertyFlags property_flags = *req_flags_list.begin();
-        for (memory_type_idx = 0; memory_type_idx < 32; ++memory_type_idx) {
-            if (!(host_pointer_props.memoryTypeBits & (1u << memory_type_idx))) {
-                continue;
-            }
-            if (!(mem_req.memoryTypeBits & (1u << memory_type_idx))) {
-                continue;
-            }
-
-            vk::MemoryType memory_type = mem_props.memoryTypes[memory_type_idx];
-            // check for visible+coherent+cached. Other flags (e.g. devicelocal) are allowed
-            if ((memory_type.propertyFlags & property_flags) == property_flags) {
-                property_flags = memory_type.propertyFlags;
-                break;
-            }
-        }
-        if (memory_type_idx == 32) {
-            GGML_LOG_WARN("ggml_vulkan: Memory type for host allocation not found\n");
-            device->device.destroyBuffer(buf->buffer);
-            return {};
-        }
-
-        buf->memory_property_flags = mem_props.memoryTypes[memory_type_idx].propertyFlags;
-        try {
-            vk::ImportMemoryHostPointerInfoEXT import_info;
-            import_info.handleType = vk::ExternalMemoryHandleTypeFlagBits::eHostAllocationEXT;
-            import_info.pHostPointer = import_ptr;
-            import_info.setPNext(&mem_flags_info);
-            buf->device_memory = device->device.allocateMemory({ size, memory_type_idx, &import_info });
-        } catch (const vk::SystemError& e) {
-        }
-    } else {
-        for (auto it = req_flags_list.begin(); it != req_flags_list.end(); it++) {
-            const auto & req_flags = *it;
-
-            const std::vector<uint32_t> memory_type_indices = ggml_vk_find_memory_properties(&mem_props, &mem_req, req_flags);
-
-            if (memory_type_indices.empty()) {
-                continue;
-            }
-
-            bool done = false;
-
-            for (auto mtype_it = memory_type_indices.begin(); mtype_it != memory_type_indices.end(); mtype_it++) {
-                try {
-                    buf->device_memory = device->device.allocateMemory({ mem_req.size, *mtype_it, &mem_flags_info });
-                    buf->memory_property_flags = mem_props.memoryTypes[*mtype_it].propertyFlags;
-                    done = true;
-                    break;
-                } catch (const vk::SystemError& e) {
-                    // loop and retry
-                    // during last attempt throw the exception
-                    if (it + 1 == req_flags_list.end() && mtype_it + 1 == memory_type_indices.end()) {
-                        device->device.destroyBuffer(buf->buffer);
-                        throw e;
-                    }
-                }
-            }
-
-            if (done) {
-                break;
-            }
-        }
-    }
-
-    if (!buf->device_memory) {
-        device->device.destroyBuffer(buf->buffer);
-        throw vk::OutOfDeviceMemoryError("No suitable memory type found");
-    }
-
-    buf->ptr = nullptr;
-
-    if (import_ptr) {
-        buf->ptr = import_ptr;
-    } else {
-        if (buf->memory_property_flags & vk::MemoryPropertyFlagBits::eHostVisible) {
-            buf->ptr = device->device.mapMemory(buf->device_memory, 0, VK_WHOLE_SIZE);
-        }
-    }
-
-    device->device.bindBufferMemory(buf->buffer, buf->device_memory, 0);
+    vmaGetAllocationMemoryProperties(device->allocator, buf->allocation, reinterpret_cast<VkMemoryPropertyFlags *>(&buf->memory_property_flags));
 
     buf->device = device;
-    buf->size = size;
+    buf->size = buffer_info.size;
 
-    if (device->buffer_device_address) {
+    if (device->buffer_device_address && (buffer_info.usage & vk::BufferUsageFlagBits::eShaderDeviceAddress)) {
         const vk::BufferDeviceAddressInfo addressInfo(buf->buffer);
         buf->bda_addr = device->device.getBufferAddress(addressInfo);
     }
 
-    device->memory_logger->log_allocation(buf, size);
+#ifdef GGML_VULKAN_MEMORY_DEBUG
+    device->memory_logger->log_allocation(buf, buf->size);
+#endif
+    VK_LOG_DEBUG("ggml_vk_create_buffer(buffer " << buf->buffer << ", usage " << to_string(buffer_info.usage) << ", memory property " << to_string(buf->memory_property_flags) << ")");
 
     return buf;
 }
 
-vk_buffer ggml_vk_create_buffer_check(vk_device& device, size_t size, vk::MemoryPropertyFlags req_flags, vk::MemoryPropertyFlags fallback_flags) {
+vk_buffer ggml_vk_create_buffer_check(vk_device& device, size_t size) {
     try {
-        return ggml_vk_create_buffer(device, size, {req_flags, fallback_flags});
+        const vk::BufferCreateInfo buffer_info{
+            vk::BufferCreateFlags(),
+            size,
+            vk::BufferUsageFlagBits::eTransferSrc | vk::BufferUsageFlagBits::eTransferDst,
+            vk::SharingMode::eExclusive,
+            0,
+            nullptr,
+        };
+
+        VmaAllocationCreateInfo alloc_info = {};
+        alloc_info.usage = (device->prefer_host_memory ? VMA_MEMORY_USAGE_AUTO_PREFER_HOST : VMA_MEMORY_USAGE_AUTO);
+        alloc_info.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT |
+            VMA_ALLOCATION_CREATE_MAPPED_BIT;
+        alloc_info.requiredFlags = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+
+        return ggml_vk_create_buffer(device, buffer_info, alloc_info);
     } catch (const vk::SystemError& e) {
         std::cerr << "ggml_vulkan: Memory allocation of size " << size << " failed." << std::endl;
         std::cerr << "ggml_vulkan: " << e.what() << std::endl;
@@ -190,36 +72,69 @@ vk_buffer ggml_vk_create_buffer_check(vk_device& device, size_t size, vk::Memory
     }
 }
 
+static vk_buffer ggml_vk_create_buffer_aligned(vk_device& device, const vk::BufferCreateInfo& buffer_info, const VmaAllocationCreateInfo& alloc_info, VkDeviceSize alignment) {
+    VK_LOG_DEBUG("ggml_vk_create_buffer_aligned(" << device->name << ", " << buffer_info.size << ", " << alignment << " )");
+    if (buffer_info.size > device->max_buffer_size) {
+        throw vk::OutOfDeviceMemoryError("Requested buffer size exceeds device buffer size limit");
+    }
+
+    vk_buffer buf = std::make_shared<vk_buffer_struct>();
+
+    if (buffer_info.size == 0) {
+        buf->size = 0;
+        return buf;
+    }
+
+    VkResult res = vmaCreateBufferWithAlignment(device->allocator, reinterpret_cast<const VkBufferCreateInfo *>(&buffer_info), &alloc_info, alignment, reinterpret_cast<VkBuffer *>(&buf->buffer), &buf->allocation, &buf->info);
+    if (res != VK_SUCCESS) {
+        throw vk::SystemError(static_cast<vk::Result>(res), "vmaCreateBufferWithAlignment failed");
+    }
+
+    vmaGetAllocationMemoryProperties(device->allocator, buf->allocation, reinterpret_cast<VkMemoryPropertyFlags *>(&buf->memory_property_flags));
+
+    buf->device = device;
+    buf->size = buffer_info.size;
+
+    if (device->buffer_device_address && (buffer_info.usage & vk::BufferUsageFlagBits::eShaderDeviceAddress)) {
+        const vk::BufferDeviceAddressInfo addressInfo(buf->buffer);
+        buf->bda_addr = device->device.getBufferAddress(addressInfo);
+    }
+
+#ifdef GGML_VULKAN_MEMORY_DEBUG
+    device->memory_logger->log_allocation(buf, buf->size);
+#endif
+    VK_LOG_DEBUG("ggml_vk_create_buffer_aligned(buffer " << buf->buffer << ", usage " << to_string(buffer_info.usage) << ", memory property " << to_string(buf->memory_property_flags) << ")");
+
+    return buf;
+}
+
 vk_buffer ggml_vk_create_buffer_device(vk_device& device, size_t size) {
+    VK_LOG_MEMORY("ggml_vk_create_buffer_device(" << size << ")");
+
     vk_buffer buf;
+
+    vk::BufferUsageFlags usage = vk::BufferUsageFlagBits::eStorageBuffer | vk::BufferUsageFlagBits::eTransferSrc | vk::BufferUsageFlagBits::eTransferDst;
+    if (device->buffer_device_address) {
+        usage |= vk::BufferUsageFlagBits::eShaderDeviceAddress;
+    }
+
+    const vk::BufferCreateInfo buffer_create_info{
+        vk::BufferCreateFlags(),
+        size,
+        usage,
+        vk::SharingMode::eExclusive,
+        0,
+        nullptr,
+    };
+
+    VmaAllocationCreateInfo alloc_info{};
+    alloc_info.usage = (device->prefer_host_memory ? VMA_MEMORY_USAGE_AUTO_PREFER_HOST : VMA_MEMORY_USAGE_AUTO);
+    alloc_info.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT |
+        VMA_ALLOCATION_CREATE_HOST_ACCESS_ALLOW_TRANSFER_INSTEAD_BIT |
+        VMA_ALLOCATION_CREATE_MAPPED_BIT;
+
     try {
-        if (device->prefer_host_memory) {
-            buf = ggml_vk_create_buffer(device, size, {vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent,
-                                                       vk::MemoryPropertyFlagBits::eDeviceLocal});
-        } else if (device->uma) {
-            // On UMA, prefer host-visible memory so direct tensor borrowing works.
-            // If unavailable, fall back to device-local memory.
-            buf = ggml_vk_create_buffer(device, size, {vk::MemoryPropertyFlagBits::eDeviceLocal | vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent,
-                                                       vk::MemoryPropertyFlagBits::eDeviceLocal,
-                                                       vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent});
-        } else if (device->disable_host_visible_vidmem) {
-            if (device->allow_sysmem_fallback) {
-                buf = ggml_vk_create_buffer(device, size, {vk::MemoryPropertyFlagBits::eDeviceLocal,
-                                                           vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent});
-            } else {
-                buf = ggml_vk_create_buffer(device, size, {vk::MemoryPropertyFlagBits::eDeviceLocal});
-            }
-        } else {
-            // use rebar if available, otherwise fallback to device only visible memory
-            if (device->allow_sysmem_fallback) {
-                buf = ggml_vk_create_buffer(device, size, {vk::MemoryPropertyFlagBits::eDeviceLocal | vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent,
-                                                           vk::MemoryPropertyFlagBits::eDeviceLocal,
-                                                           vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent});
-            } else {
-                buf = ggml_vk_create_buffer(device, size, {vk::MemoryPropertyFlagBits::eDeviceLocal | vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent,
-                                                           vk::MemoryPropertyFlagBits::eDeviceLocal});
-            }
-        }
+        buf = ggml_vk_create_buffer(device, buffer_create_info, alloc_info);
     } catch (const vk::SystemError& e) {
         std::cerr << "ggml_vulkan: Device memory allocation of size " << size << " failed." << std::endl;
         std::cerr << "ggml_vulkan: " << e.what() << std::endl;
@@ -243,22 +158,40 @@ void ggml_vk_destroy_buffer(vk_buffer& buf) {
 
 void * ggml_vk_host_malloc(vk_device& device, size_t size) {
     VK_LOG_MEMORY("ggml_vk_host_malloc(" << size << ")");
-    vk_buffer buf = ggml_vk_create_buffer(device, size,
-        {vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent | vk::MemoryPropertyFlagBits::eHostCached,
-         vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent});
+
+    const vk::BufferCreateInfo buffer_info{
+        vk::BufferCreateFlags(),
+        size,
+        vk::BufferUsageFlagBits::eTransferDst | vk::BufferUsageFlagBits::eTransferSrc,
+        vk::SharingMode::eExclusive,
+        0,
+        nullptr,
+    };
+
+    VmaAllocationCreateInfo alloc_info = {};
+    alloc_info.usage = (device->prefer_host_memory ? VMA_MEMORY_USAGE_AUTO_PREFER_HOST : VMA_MEMORY_USAGE_AUTO);
+    alloc_info.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT |
+        VMA_ALLOCATION_CREATE_MAPPED_BIT;
+    alloc_info.requiredFlags = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+
+    // host buffer type advertises minMemoryMapAlignment; make the mapped ptr honour it
+    // so the tallocr base-align (ggml-alloc.c:71) consumes no unreserved slack
+    // This issue is upstream, at least until b9518. And it is triggered by VMA
+    // and possibility of buffer misalignment.
+    const size_t host_align = std::max<size_t>(TENSOR_ALIGNMENT, device->properties.limits.minMemoryMapAlignment);
+    vk_buffer buf = ggml_vk_create_buffer_aligned(device, buffer_info, alloc_info, host_align);
 
     if(!(buf->memory_property_flags & vk::MemoryPropertyFlagBits::eHostVisible)) {
         fprintf(stderr, "WARNING: failed to allocate %.2f MB of pinned memory\n",
             size/1024.0/1024.0);
-        device->device.freeMemory(buf->device_memory);
-        device->device.destroyBuffer(buf->buffer);
+        buf.reset();
         return nullptr;
     }
 
     std::lock_guard<std::shared_mutex> guard(device->pinned_memory_mutex);
-    device->pinned_memory.push_back(std::make_tuple(buf->ptr, size, buf));
+    device->pinned_memory.push_back(std::make_tuple(buf->info.pMappedData, size, buf));
 
-    return buf->ptr;
+    return buf->info.pMappedData;
 }
 
 void ggml_vk_host_free(vk_device& device, void* ptr) {
@@ -308,9 +241,7 @@ void ggml_vk_ensure_sync_staging_buffer(vk_device& device, size_t size) {
     if (device->sync_staging == nullptr || device->sync_staging->size < size) {
         VK_LOG_MEMORY("ggml_vk_ensure_sync_staging_buffer(" << size << ")");
         ggml_vk_destroy_buffer(device->sync_staging);
-        device->sync_staging = ggml_vk_create_buffer_check(device, size,
-            vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent | vk::MemoryPropertyFlagBits::eHostCached,
-            vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent);
+        device->sync_staging = ggml_vk_create_buffer_check(device, size);
     }
 }
 
@@ -318,9 +249,7 @@ void ggml_vk_ensure_sync_staging_buffer(ggml_backend_vk_context * ctx, size_t si
     if (ctx->sync_staging == nullptr || ctx->sync_staging->size < size) {
         VK_LOG_MEMORY("ggml_vk_ensure_sync_staging_buffer(" << size << ")");
         ggml_vk_destroy_buffer(ctx->sync_staging);
-        ctx->sync_staging = ggml_vk_create_buffer_check(ctx->device, size,
-            vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent | vk::MemoryPropertyFlagBits::eHostCached,
-            vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent);
+        ctx->sync_staging = ggml_vk_create_buffer_check(ctx->device, size);
     }
 }
 
@@ -403,16 +332,16 @@ static void ggml_vk_buffer_write_nc_async(ggml_backend_vk_context * ctx, vk_cont
         for (uint64_t i2 = 0; i2 < ne2; i2++) {
             // Find longest contiguous slice
             if (ne1*nb1 == dstnb2) {
-                deferred_memcpy((uint8_t *)staging->ptr + i3*dstnb3 + i2*dstnb2, (const uint8_t *) tensor->data + buf_offset + i3*nb3 + i2*nb2, dstnb2, &subctx->in_memcpys);
+                deferred_memcpy((uint8_t *)staging->info.pMappedData + i3*dstnb3 + i2*dstnb2, (const uint8_t *) tensor->data + buf_offset + i3*nb3 + i2*nb2, dstnb2, &subctx->in_memcpys);
             } else {
                 for (uint64_t i1 = 0; i1 < ne1; i1++) {
                     if (ne0*nb0/bs == dstnb1) {
-                        deferred_memcpy((uint8_t *)staging->ptr + i3*dstnb3 + i2*dstnb2 + i1*dstnb1, (const uint8_t *) tensor->data + buf_offset + i3*nb3 + i2*nb2 + i1*nb1, dstnb1, &subctx->in_memcpys);
+                        deferred_memcpy((uint8_t *)staging->info.pMappedData + i3*dstnb3 + i2*dstnb2 + i1*dstnb1, (const uint8_t *) tensor->data + buf_offset + i3*nb3 + i2*nb2 + i1*nb1, dstnb1, &subctx->in_memcpys);
                     } else {
                         const uint64_t s_off = buf_offset + i3*nb3 + i2*nb2 + i1*nb1;
                         const uint64_t d_off = i3*dstnb3 + i2*dstnb2 + i1*dstnb1;
                         for (uint64_t i0 = 0; i0 < ne0; i0++) {
-                            deferred_memcpy((uint8_t *)staging->ptr + d_off + i0*dstnb0, (const uint8_t *) tensor->data + s_off + i0*nb0, dstnb0, &subctx->in_memcpys);
+                            deferred_memcpy((uint8_t *)staging->info.pMappedData + d_off + i0*dstnb0, (const uint8_t *) tensor->data + s_off + i0*nb0, dstnb0, &subctx->in_memcpys);
                         }
                     }
                 }
@@ -480,10 +409,10 @@ bool ggml_vk_buffer_write_2d_async(vk_context subctx, vk_buffer& dst, size_t off
     subctx->s->buffer->buf.copyBuffer(staging_buffer->buffer, dst->buffer, slices);
 
     if (width == spitch) {
-        deferred_memcpy((uint8_t *)staging_buffer->ptr, src, staging_size, &subctx->in_memcpys);
+        deferred_memcpy((uint8_t *)staging_buffer->info.pMappedData, src, staging_size, &subctx->in_memcpys);
     } else {
         for (size_t i = 0; i < height; i++) {
-            deferred_memcpy((uint8_t *)staging_buffer->ptr + i * width, (const uint8_t *) src + i * spitch, width, &subctx->in_memcpys);
+            deferred_memcpy((uint8_t *)staging_buffer->info.pMappedData + i * width, (const uint8_t *) src + i * spitch, width, &subctx->in_memcpys);
         }
     }
     return true;
@@ -501,10 +430,10 @@ void ggml_vk_buffer_write_2d(vk_buffer& dst, size_t offset, const void * src, si
         GGML_ASSERT(dst->memory_property_flags & vk::MemoryPropertyFlagBits::eHostCoherent);
 
         if (width == spitch && width == dpitch) {
-            memcpy((uint8_t *)dst->ptr + offset, src, width * height);
+            memcpy((uint8_t *)dst->info.pMappedData + offset, src, width * height);
         } else {
             for (size_t i = 0; i < height; i++) {
-                memcpy((uint8_t *)dst->ptr + offset + i * dpitch, (const uint8_t *) src + i * spitch, width);
+                memcpy((uint8_t *)dst->info.pMappedData + offset + i * dpitch, (const uint8_t *) src + i * spitch, width);
             }
         }
     } else {
@@ -602,10 +531,10 @@ bool ggml_vk_buffer_read_2d_async(vk_context subctx, vk_buffer& src, size_t offs
     subctx->s->buffer->buf.copyBuffer(src->buffer, staging_buffer->buffer, staging_slices);
 
     if (width == dpitch) {
-        deferred_memcpy(dst, staging_buffer->ptr, staging_size, &subctx->out_memcpys);
+        deferred_memcpy(dst, staging_buffer->info.pMappedData, staging_size, &subctx->out_memcpys);
     } else {
         for (size_t i = 0; i < height; i++) {
-            deferred_memcpy((uint8_t *) dst + i * dpitch, (const uint8_t *) staging_buffer->ptr + i * width, width, &subctx->out_memcpys);
+            deferred_memcpy((uint8_t *) dst + i * dpitch, (const uint8_t *) staging_buffer->info.pMappedData + i * width, width, &subctx->out_memcpys);
         }
     }
     return true;
@@ -642,10 +571,10 @@ void ggml_vk_buffer_read_2d(vk_buffer& src, size_t offset, void * dst, size_t sp
         ggml_vk_queue_command_pools_cleanup(src->device);
 
         if (width == spitch && width == dpitch) {
-            memcpy(dst, (const uint8_t *) src->ptr + offset, width * height);
+            memcpy(dst, (const uint8_t *) src->info.pMappedData + offset, width * height);
         } else {
             for (size_t i = 0; i < height; i++) {
-                memcpy((uint8_t *) dst + i * dpitch, (const uint8_t *) src->ptr + offset + i * spitch, width);
+                memcpy((uint8_t *) dst + i * dpitch, (const uint8_t *) src->info.pMappedData + offset + i * spitch, width);
             }
         }
     } else {
@@ -703,17 +632,17 @@ void ggml_vk_buffer_copy(vk_buffer& dst, size_t dst_offset, vk_buffer& src, size
 
         // Copy to src staging buffer
         ggml_vk_buffer_copy(src->device->sync_staging, 0, src, src_offset, size);
+
         // Copy to dst buffer
-        ggml_vk_buffer_write(dst, dst_offset, src->device->sync_staging->ptr, size);
+        ggml_vk_buffer_write(dst, dst_offset, src->device->sync_staging->info.pMappedData, size);
     }
 }
 
 void ggml_vk_buffer_memset_async(vk_context& ctx, vk_buffer& dst, size_t offset, uint32_t c, size_t size) {
     VK_LOG_DEBUG("ggml_vk_buffer_memset_async(" << offset << ", " << c << ", " << size << ")");
 
-    if (dst->memory_property_flags & vk::MemoryPropertyFlagBits::eHostVisible &&
-        dst->device->uma) {
-        deferred_memset((uint8_t*)dst->ptr + offset, c, size, &ctx->memsets);
+    if (dst->memory_property_flags & vk::MemoryPropertyFlagBits::eHostVisible) {
+        deferred_memset((uint8_t*)dst->info.pMappedData + offset, c, size, &ctx->memsets);
         return;
     }
 
@@ -724,9 +653,8 @@ void ggml_vk_buffer_memset_async(vk_context& ctx, vk_buffer& dst, size_t offset,
 void ggml_vk_buffer_memset(vk_buffer& dst, size_t offset, uint32_t c, size_t size) {
     VK_LOG_DEBUG("ggml_vk_buffer_memset(" << offset << ", " << c << ", " << size << ")");
 
-    if (dst->memory_property_flags & vk::MemoryPropertyFlagBits::eHostVisible &&
-        dst->device->uma) {
-        memset((uint8_t*)dst->ptr + offset, c, size);
+    if (dst->memory_property_flags & vk::MemoryPropertyFlagBits::eHostVisible) {
+        memset((uint8_t*)dst->info.pMappedData + offset, c, size);
         return;
     }
 
@@ -769,15 +697,9 @@ vk_buffer ggml_vk_buffer_from_host_ptr(vk_device & device, void * ptr, size_t si
         return {};
     }
 
-    const vk::MemoryPropertyFlags property_flags = vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent | vk::MemoryPropertyFlagBits::eHostCached;
-
-    vk_buffer buf {};
-    try {
-        buf = ggml_vk_create_buffer(device, size, { property_flags }, ptr);
-    } catch (vk::SystemError& e) {
-        GGML_LOG_WARN("ggml_vulkan: Failed ggml_vk_create_buffer (%s)\n", e.what());
-    }
-
-    return buf;
+    // buffer_from_host_ptr capability is disabled; external memory import not supported with VMA
+    GGML_UNUSED(ptr);
+    GGML_UNUSED(size);
+    return {};
 }
 

@@ -10,6 +10,8 @@
 #include <stdexcept>
 #include <cerrno>
 #include <algorithm>
+#include <map>
+#include <streambuf>
 
 #ifdef __has_include
     #if __has_include(<unistd.h>)
@@ -64,9 +66,7 @@ static std::string llama_format_win_err(DWORD err) {
 }
 #endif
 
-// llama_file
-
-struct llama_file::impl {
+struct llama_file_disk::impl {
 #if defined(_WIN32)
     HANDLE fp_win32;
     std::string GetErrorMessageWin32(DWORD error_code) const {
@@ -297,7 +297,7 @@ struct llama_file::impl {
                         alignment = 1;
                         init_fp("rb");
                         seek(curr_off, SEEK_SET);
-                        read_raw_unsafe(ptr, len);
+                        read_raw_unsafe(static_cast<char *>(ptr) + bytes_read, len - bytes_read);
                         return;
                     }
                     throw std::runtime_error(format("read error: %s", strerror(errno)));
@@ -317,28 +317,82 @@ struct llama_file::impl {
         }
     }
 
-    void read_aligned_chunk(void * dest, size_t size) {
-        size_t offset = tell();
-        off_t aligned_offset = offset & ~(alignment - 1);
-        off_t offset_from_alignment = offset - aligned_offset;
-        size_t bytes_to_read = (offset_from_alignment + size + alignment - 1) & ~(alignment - 1);
+    size_t read_raw_unsafe_at(void * ptr, size_t len, size_t offset) const {
+        int read_fd = fd != -1 ? fd : fileno(fp);
+        std::unique_ptr<FILE, int (*)(FILE *)> buffered(nullptr, &std::fclose);
+        size_t done = 0;
+        while (done < len) {
+            ssize_t ret = pread(read_fd, static_cast<char *>(ptr) + done, len - done, offset + done);
+            if (ret < 0) {
+                if (errno == EINTR) {
+                    continue;
+                }
+                if (fd != -1 && !buffered && (errno == EINVAL || errno == EFAULT)) {
+                    LLAMA_LOG_WARN("%s: Falling back to buffered IO due to %s\n", __func__, strerror(errno));
+                    // Keep the direct-IO descriptor valid for the other readers.
+                    buffered.reset(ggml_fopen(fname.c_str(), "rb"));
+                    if (!buffered) {
+                        throw std::runtime_error(format("failed to open %s: %s", fname.c_str(), strerror(errno)));
+                    }
+                    read_fd = fileno(buffered.get());
+                    continue;
+                }
+                throw std::runtime_error(format("pread failed: %s", strerror(errno)));
+            }
+            if (ret == 0) {
+                break;
+            }
+            done += static_cast<size_t>(ret);
+        }
+        return done;
+    }
 
-        void * raw_buffer = nullptr;
-        int ret = posix_memalign(&raw_buffer, alignment, bytes_to_read);
-        if (ret != 0) {
-            throw std::runtime_error(format("posix_memalign failed with error %d", ret));
+    void read_aligned_chunk(void * dest, size_t size) {
+        struct read_buffer {
+            void * data = nullptr;
+            size_t capacity = 0;
+            size_t alignment = 0;
+            ~read_buffer() { free(data); }
+        };
+        // Share a bounded buffer across all shards read by this thread.
+        thread_local read_buffer bounce;
+        size_t offset = tell();
+        if (offset > this->size || size > this->size - offset) {
+            throw std::runtime_error("unexpectedly reached end of file");
         }
 
-        struct aligned_buffer_deleter {
-            void operator()(void * p) const { free(p); }
-        };
-        std::unique_ptr<void, aligned_buffer_deleter> buffer(raw_buffer);
+        while (size > 0) {
+            if (!has_direct_io()) {
+                seek(offset, SEEK_SET);
+                read_raw_unsafe(dest, size);
+                return;
+            }
+            const size_t aligned_offset = offset & ~(alignment - 1);
+            const size_t skip = offset - aligned_offset;
+            const size_t limit = std::max<size_t>(8 * 1024 * 1024, alignment);
+            const size_t bytes_to_read = std::min(limit, (skip + size + alignment - 1) & ~(alignment - 1));
+            const size_t to_copy = std::min(size, bytes_to_read - skip);
 
-        seek(aligned_offset, SEEK_SET);
-        read_raw_unsafe(buffer.get(), bytes_to_read);
+            if (bytes_to_read > bounce.capacity || alignment > bounce.alignment) {
+                void * data = nullptr;
+                int ret = posix_memalign(&data, alignment, bytes_to_read);
+                if (ret != 0) {
+                    throw std::runtime_error(format("posix_memalign failed with error %d", ret));
+                }
+                free(bounce.data);
+                bounce.data = data;
+                bounce.capacity = bytes_to_read;
+                bounce.alignment = alignment;
+            }
 
-        uintptr_t actual_data = reinterpret_cast<uintptr_t>(buffer.get()) + offset_from_alignment;
-        memcpy(dest, reinterpret_cast<void *>(actual_data), size);
+            seek(aligned_offset, SEEK_SET);
+            read_raw_unsafe(bounce.data, bytes_to_read);
+            memcpy(dest, static_cast<char *>(bounce.data) + skip, to_copy);
+            dest = static_cast<char *>(dest) + to_copy;
+            offset += to_copy;
+            size -= to_copy;
+        }
+        seek(offset, SEEK_SET);
     }
 
     void read_raw(void * ptr, size_t len) {
@@ -396,20 +450,18 @@ struct llama_file::impl {
     bool owns_fp = true;
 };
 
-llama_file::llama_file(const char * fname, const char * mode, const bool use_direct_io) :
+llama_file_disk::llama_file_disk(const char * fname, const char * mode, const bool use_direct_io) :
     pimpl(std::make_unique<impl>(fname, mode, use_direct_io)) {}
+llama_file_disk::llama_file_disk(FILE * file) : pimpl(std::make_unique<impl>(file)) {}
+llama_file_disk::~llama_file_disk() = default;
 
-llama_file::llama_file(FILE * file) : pimpl(std::make_unique<impl>(file)) {}
+size_t llama_file_disk::tell() const { return pimpl->tell(); }
+size_t llama_file_disk::size() const { return pimpl->size; }
 
-llama_file::~llama_file() = default;
+size_t llama_file_disk::read_alignment() const { return pimpl->read_alignment(); }
+bool llama_file_disk::has_direct_io() const { return pimpl->has_direct_io(); }
 
-size_t llama_file::tell() const { return pimpl->tell(); }
-size_t llama_file::size() const { return pimpl->size; }
-
-size_t llama_file::read_alignment() const { return pimpl->read_alignment(); }
-bool llama_file::has_direct_io() const { return pimpl->has_direct_io(); }
-
-int llama_file::file_id() const {
+int llama_file_disk::file_id() const {
 #ifdef _WIN32
     return _fileno(pimpl->fp);
 #else
@@ -424,18 +476,208 @@ int llama_file::file_id() const {
 #endif
 }
 
-void llama_file::seek(size_t offset, int whence) const { pimpl->seek(offset, whence); }
-void llama_file::read_raw(void * ptr, size_t len) { pimpl->read_raw(ptr, len); }
+void llama_file_disk::seek(size_t offset, int whence) const { pimpl->seek(offset, whence); }
+void llama_file_disk::read_raw(void * ptr, size_t len) { pimpl->read_raw(ptr, len); }
 #ifdef _WIN32
-void llama_file::read_raw_unsafe(void * ptr, size_t len) { pimpl->read_raw(ptr, len); }
+void llama_file_disk::read_raw_unsafe(void * ptr, size_t len) { pimpl->read_raw(ptr, len); }
 #else
-void llama_file::read_raw_unsafe(void * ptr, size_t len) { pimpl->read_raw_unsafe(ptr, len); }
+void llama_file_disk::read_raw_unsafe(void * ptr, size_t len) { pimpl->read_raw_unsafe(ptr, len); }
+size_t llama_file_disk::read_raw_unsafe_at(void * ptr, size_t len, size_t offset) const {
+    return pimpl->read_raw_unsafe_at(ptr, len, offset);
+}
 #endif
 
-uint32_t llama_file::read_u32() { return pimpl->read_u32(); }
+#ifdef _WIN32
+void llama_file_disk::read_aligned_chunk(void * dest, size_t size) { pimpl->read_raw(dest, size); }
+#else
+void llama_file_disk::read_aligned_chunk(void * dest, size_t size) { pimpl->read_aligned_chunk(dest, size); }
+#endif
 
-void llama_file::write_raw(const void * ptr, size_t len) const { pimpl->write_raw(ptr, len); }
-void llama_file::write_u32(uint32_t val) const { pimpl->write_u32(val); }
+uint32_t llama_file_disk::read_u32() { return pimpl->read_u32(); }
+
+void llama_file_disk::write_raw(const void * ptr, size_t len) const { pimpl->write_raw(ptr, len); }
+void llama_file_disk::write_u32(uint32_t val) const { pimpl->write_u32(val); }
+
+template <bool Writable>
+llama_file_buffer<Writable>::llama_file_buffer(std::unique_ptr<std::basic_streambuf<char>> && streambuf) :
+    streambuf(std::move(streambuf)) {}
+
+template <bool Writable> llama_file_buffer<Writable>::~llama_file_buffer() = default;
+
+template <bool Writable> size_t llama_file_buffer<Writable>::tell() const {
+    return streambuf->pubseekoff(0, std::ios_base::cur);
+}
+
+template <bool Writable> size_t llama_file_buffer<Writable>::size() const {
+    auto current_pos = streambuf->pubseekoff(0, std::ios_base::cur);
+    auto end_pos     = streambuf->pubseekoff(0, std::ios_base::end);
+    streambuf->pubseekpos(current_pos);
+    return end_pos;
+}
+
+template <bool Writable> int llama_file_buffer<Writable>::file_id() const {
+    return -1;
+}
+
+template <bool Writable> void llama_file_buffer<Writable>::seek(size_t offset, int whence) const {
+    std::ios_base::seekdir dir;
+    switch (whence) {
+        case SEEK_SET: dir = std::ios_base::beg; break;
+        case SEEK_CUR: dir = std::ios_base::cur; break;
+        case SEEK_END: dir = std::ios_base::end; break;
+        default:       throw std::out_of_range("invalid whence");
+    }
+    auto result = streambuf->pubseekoff(offset, dir);
+    if (result == std::streampos(-1)) {
+        throw std::runtime_error("seek failed");
+    }
+}
+
+template <bool Writable> void llama_file_buffer<Writable>::read_raw(void * ptr, size_t len) {
+    auto bytes_read = streambuf->sgetn(static_cast<char *>(ptr), len);
+    if (bytes_read != static_cast<std::streamsize>(len)) {
+        throw std::runtime_error("read beyond end of buffer");
+    }
+}
+
+template <bool Writable> uint32_t llama_file_buffer<Writable>::read_u32() {
+    uint32_t val;
+    read_raw(&val, sizeof(val));
+    return val;
+}
+
+template <> void llama_file_buffer<false>::write_raw([[maybe_unused]] const void * ptr, size_t len) const {
+    if (len > 0) {
+        throw std::runtime_error("buffer is not writable");
+    }
+}
+
+template <> void llama_file_buffer<false>::write_u32(uint32_t val) const {
+    write_raw(&val, sizeof(val));
+}
+
+template <> void llama_file_buffer<true>::write_raw(const void * ptr, size_t len) const {
+    auto bytes_written = streambuf->sputn(static_cast<const char *>(ptr), len);
+    if (bytes_written != static_cast<std::streamsize>(len)) {
+        throw std::runtime_error("write beyond end of buffer");
+    }
+}
+
+template <bool Writable> const void * llama_file_buffer<Writable>::data_ptr() const {
+    const auto * buf = dynamic_cast<const Uint8BufferStreamBuf *>(streambuf.get());
+    return buf != nullptr ? buf->data_ptr() : nullptr;
+}
+
+template <> void llama_file_buffer<true>::write_u32(uint32_t val) const {
+    write_raw(&val, sizeof(val));
+}
+
+// Explicit instantiations
+template struct llama_file_buffer<false>;
+template struct llama_file_buffer<true>;
+
+// llama_future_file_buffer implementation
+
+namespace {
+std::string final_key(const std::string & promise_key, const std::string & context) {
+    return promise_key + ":" + context;
+}
+
+std::mutex promise_registry_mutex;
+
+std::map<std::string, std::promise<std::unique_ptr<llama_file_buffer<false>>>> promise_registry_ro;
+std::map<std::string, std::promise<std::unique_ptr<llama_file_buffer<true>>>>  promise_registry_rw;
+
+template <bool Writable>
+std::map<std::string, std::promise<std::unique_ptr<llama_file_buffer<Writable>>>> & promise_registry() {
+    if constexpr (Writable) {
+        return promise_registry_rw;
+    } else {
+        return promise_registry_ro;
+    }
+}
+
+/// @brief Ensures a promise exists in the registry for the given key.
+/// If it doesn't exist, creates it. Returns an iterator to the promise.
+/// Thread-safe.
+template <bool Writable>
+typename std::map<std::string, std::promise<std::unique_ptr<llama_file_buffer<Writable>>>>::iterator
+ensure_promise_registry(const std::string & key) {
+    std::lock_guard<std::mutex> lock(promise_registry_mutex);
+    auto                        it = promise_registry<Writable>().find(key);
+    if (it != promise_registry<Writable>().end()) {
+        return it;
+    }
+    auto result =
+        promise_registry<Writable>().emplace(key, std::promise<std::unique_ptr<llama_file_buffer<Writable>>>());
+    LLAMA_LOG_CMAKE_DEBUG("%s: created future file buffer %p for %s\n", __func__, (void *) &(*result.first), key.c_str());
+    return result.first;
+}
+}  // namespace
+
+template <bool Writable>
+llama_future_file_buffer<Writable>::llama_future_file_buffer(const std::string & promise_key,
+                                                             const std::string & context) :
+    file_buffer_future(),
+    file_buffer() {
+    std::string key              = final_key(promise_key, context);
+    file_buffer_promise_iterator = ensure_promise_registry<Writable>(key);
+    file_buffer_future           = file_buffer_promise_iterator->second.get_future();
+}
+
+template <bool Writable>
+llama_future_file_buffer<Writable>::llama_future_file_buffer(llama_future_file_buffer && other) noexcept :
+    file_buffer_promise_iterator(std::move(other.file_buffer_promise_iterator)),
+    file_buffer_future(std::move(other.file_buffer_future)),
+    file_buffer(std::move(other.file_buffer)) {
+    // Set the other object's iterator to end() to mark it as moved from
+    // to avoid early erasure at destruction of the moved other object
+    other.file_buffer_promise_iterator = promise_registry<Writable>().end();
+}
+
+template <bool Writable>
+llama_future_file_buffer<Writable> & llama_future_file_buffer<Writable>::operator=(
+    llama_future_file_buffer && other) noexcept {
+    if (this != &other) {
+        file_buffer_promise_iterator       = std::move(other.file_buffer_promise_iterator);
+        file_buffer_future                 = std::move(other.file_buffer_future);
+        file_buffer                        = std::move(other.file_buffer);
+        other.file_buffer_promise_iterator = promise_registry<Writable>().end();
+    }
+    return *this;
+}
+
+template <bool Writable> llama_future_file_buffer<Writable>::~llama_future_file_buffer() {
+    std::lock_guard<std::mutex> lock(promise_registry_mutex);
+    if (file_buffer_promise_iterator != promise_registry<Writable>().end()) {
+        promise_registry<Writable>().erase(file_buffer_promise_iterator);
+    }
+}
+
+template <bool Writable>
+bool llama_future_file_buffer<Writable>::fulfill_promise(const std::string & promise_key, const std::string & context,
+                                                         std::unique_ptr<llama_file_buffer<Writable>> && value) {
+    std::string key = final_key(promise_key, context);
+    auto        it  = ensure_promise_registry<Writable>(key);
+    LLAMA_LOG_CMAKE_DEBUG("fulfilling future file buffer %p for %s\n", (void *) &(*it), key.c_str());
+    it->second.set_value(std::move(value));
+    return true;
+}
+
+template <bool Writable>
+std::unique_ptr<llama_file_buffer<Writable>> llama_future_file_buffer<Writable>::extract() const {
+    if (file_buffer) {
+        return std::move(file_buffer);
+    }
+
+    auto future_result = file_buffer_future.get();
+    file_buffer        = std::move(future_result);
+    return std::move(file_buffer);
+}
+
+// Explicit instantiations for llama_future_file_buffer
+template struct llama_future_file_buffer<false>;
+template struct llama_future_file_buffer<true>;
 
 // llama_mmap
 

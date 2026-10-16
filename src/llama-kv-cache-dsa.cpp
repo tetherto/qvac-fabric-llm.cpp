@@ -95,6 +95,10 @@ llama_pos llama_kv_cache_dsa::seq_pos_max(llama_seq_id seq_id) const {
     return kv_mla->seq_pos_max(seq_id);
 }
 
+uint32_t llama_kv_cache_dsa::seq_token_count(llama_seq_id seq_id) const {
+    return kv_mla->seq_token_count(seq_id);
+}
+
 std::map<ggml_backend_buffer_type_t, size_t> llama_kv_cache_dsa::memory_breakdown() const {
     std::map<ggml_backend_buffer_type_t, size_t> mb = kv_mla->memory_breakdown();
     for (const auto & buft_size : kv_lid->memory_breakdown()) {

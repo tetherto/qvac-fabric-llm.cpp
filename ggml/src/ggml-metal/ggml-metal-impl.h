@@ -29,8 +29,18 @@
 #define N_R0_Q2_0 8
 #define N_SG_Q2_0 2
 
+#define N_R0_PQ2_0 8
+#define N_SG_PQ2_0 2
+#define N_R0_PTQ1_0 5
+#define N_R0_PTQ1_0_R4 4
+#define N_R0_PTQ1_0_ID 4
+#define N_SG_PTQ1_0 1
+
 #define N_R0_Q4_0 4
 #define N_SG_Q4_0 2
+#define N_NC_Q4_0 2 // src1 rows of kernel_mul_mv_q4_0_f32_nc
+// glu holds 2 accs per row, so use fewer rows per simdgroup
+#define N_R0_Q4_0_GLU 1
 
 #define N_R0_Q4_1 4
 #define N_SG_Q4_1 2
@@ -53,7 +63,7 @@
 #define N_R0_Q3_K 2
 #define N_SG_Q3_K 2
 
-#define N_R0_Q4_K 2
+#define N_R0_Q4_K 1
 #define N_SG_Q4_K 2
 
 #define N_R0_Q5_K 1
@@ -121,6 +131,7 @@
 #define FC_MOE_REDUCE                  1900
 #define FC_DSV4_HC                     2000
 #define FC_PAD                         2100
+#define FC_MUL_MV_MMA                  2200
 
 // op-specific constants
 #define OP_FLASH_ATTN_EXT_NQPSG 8
@@ -209,6 +220,7 @@ typedef struct {
     uint64_t nb2;
     uint64_t nb3;
     int32_t  dim;
+    int32_t  nc0;
 } ggml_metal_kargs_concat;
 
 typedef struct {
@@ -313,6 +325,42 @@ typedef struct {
     uint64_t nb3;
 } ggml_metal_kargs_cpy;
 
+#define GGML_METAL_CPY_BATCH_MAX 16
+
+// consecutive copies with one layout, each shifted by a byte offset in the source and in the destination
+typedef struct {
+    ggml_metal_kargs_cpy cpy;
+    int64_t dsrc[GGML_METAL_CPY_BATCH_MAX];
+    int64_t ddst[GGML_METAL_CPY_BATCH_MAX];
+} ggml_metal_kargs_cpy_batch;
+
+typedef struct {
+    int32_t  ne00;
+    int32_t  ne01;
+    int32_t  ne02;
+    int32_t  ne03;
+    uint64_t nb00;
+    uint64_t nb01;
+    uint64_t nb02;
+    uint64_t nb03;
+    int32_t  ne10;
+    int32_t  ne11;
+    int32_t  ne12;
+    int32_t  ne13;
+    uint64_t nb10;
+    uint64_t nb11;
+    uint64_t nb12;
+    uint64_t nb13;
+    int32_t  ne0;
+    int32_t  ne1;
+    int32_t  ne2;
+    int32_t  ne3;
+    uint64_t nb0;
+    uint64_t nb1;
+    uint64_t nb2;
+    uint64_t nb3;
+} ggml_metal_kargs_out_prod;
+
 typedef struct {
     int64_t  ne10;
     int64_t  ne11;
@@ -361,6 +409,7 @@ typedef struct {
     int32_t  sect_3;
     bool     src2;
     bool     inplace;
+    float    sin_sign;
 } ggml_metal_kargs_rope;
 
 typedef struct {
@@ -610,6 +659,13 @@ typedef struct {
     int32_t  ne1;
     uint64_t nb1;
     int32_t  nr0;
+    int32_t  scale_grouped;
+    int32_t  nes0;
+    int32_t  nes1;
+    int32_t  nes2;
+    uint64_t nbs0;
+    uint64_t nbs1;
+    uint64_t nbs2;
 } ggml_metal_kargs_mul_mv_id;
 
 // NORM
@@ -629,6 +685,119 @@ typedef struct {
     uint64_t nbf3[3];
     float    scale;
 } ggml_metal_kargs_norm;
+
+typedef struct {
+    int32_t  ne00;
+    int32_t  ne00_4;
+    uint64_t nb01;
+    uint64_t nb02;
+    uint64_t nb03;
+    uint64_t nb11;
+    uint64_t nb12;
+    uint64_t nb13;
+    uint64_t nb1;
+    uint64_t nb2;
+    uint64_t nb3;
+    float    eps;
+} ggml_metal_kargs_rms_norm_back;
+
+typedef struct {
+    int32_t  ne00;
+    int32_t  ne00_4;
+    uint64_t nb01;
+    uint64_t nb02;
+    uint64_t nb03;
+    uint64_t nb11;
+    uint64_t nb12;
+    uint64_t nb13;
+    uint64_t nb1;
+    uint64_t nb2;
+    uint64_t nb3;
+    float    eps;
+} ggml_metal_kargs_l2_norm_back;
+
+typedef struct {
+    int32_t  K;
+    int32_t  N;
+    int32_t  n_expert;
+    int32_t  n_used;
+    int32_t  n_tok;
+    int32_t  b_ne1;
+    uint64_t g_nb1;
+    uint64_t g_nb2;
+    uint64_t b_nb1;
+    uint64_t b_nb2;
+    uint64_t ids_nb1;
+    uint64_t d_nb1;
+    uint64_t d_nb2;
+} ggml_metal_kargs_mul_mat_id_back_a;
+
+typedef struct {
+    int32_t  K;
+    int32_t  N;
+    int32_t  n_used;
+    int32_t  n_tok;
+    int32_t  n_expert;
+    int32_t  dst_ne1;
+    uint64_t as_nb1;
+    uint64_t as_nb2;
+    uint64_t g_nb1;
+    uint64_t g_nb2;
+    uint64_t ids_nb1;
+    uint64_t d_nb1;
+    uint64_t d_nb2;
+} ggml_metal_kargs_mul_mat_id_back_b;
+
+typedef struct {
+    int32_t  nc;
+    int32_t  ncs;
+    int32_t  nr;
+    int32_t  n_t;
+    int32_t  n_s;
+    uint64_t grad_nb0;
+    uint64_t grad_nb1;
+    uint64_t grad_nb2;
+    uint64_t c_nb1;
+    uint64_t dst_nb0;
+    uint64_t dst_nb1;
+    uint64_t dst_nb2;
+} ggml_metal_kargs_ssm_conv_back_sx;
+
+typedef struct {
+    int32_t  nc;
+    int32_t  ncs;
+    int32_t  nr;
+    int32_t  n_t;
+    int32_t  n_s;
+    uint64_t grad_nb0;
+    uint64_t grad_nb1;
+    uint64_t grad_nb2;
+    uint64_t sx_nb0;
+    uint64_t sx_nb1;
+    uint64_t sx_nb2;
+    uint64_t dst_nb1;
+} ggml_metal_kargs_ssm_conv_back_c;
+
+typedef struct {
+    int32_t  H;
+    int32_t  n_tokens;
+    int32_t  n_seqs;
+    int32_t  K;
+    int32_t  neq1;
+    int32_t  rq3;
+    uint64_t s_off;
+    uint64_t sq1, sq2, sq3;
+    uint64_t sv1, sv2, sv3;
+    uint64_t sb1, sb2, sb3;
+    uint64_t off_dk;
+    uint64_t off_dv;
+    uint64_t off_dg;
+    uint64_t off_db;
+    uint64_t off_ds;
+    uint64_t off_scratch;
+    uint64_t wg_stride;
+    float    scale;
+} ggml_metal_kargs_gated_delta_net_back;
 
 typedef struct {
     int32_t  ne00;
@@ -908,6 +1077,21 @@ typedef struct {
     float    m1;
     int32_t  n_head_log2;
 } ggml_metal_kargs_soft_max;
+
+typedef struct {
+    int32_t  ne00;
+    int32_t  ne00_4;
+    uint64_t nb01;
+    uint64_t nb02;
+    uint64_t nb03;
+    uint64_t nb11;
+    uint64_t nb12;
+    uint64_t nb13;
+    uint64_t nb1;
+    uint64_t nb2;
+    uint64_t nb3;
+    float    scale;
+} ggml_metal_kargs_soft_max_back;
 
 typedef struct {
     int64_t  ne00;
@@ -1229,6 +1413,11 @@ typedef struct {
     int32_t  len;
 } ggml_metal_kargs_argsort_merge;
 
+// Use one threadgroup per FWHT row for folded model widths.
+#define GGML_METAL_FWHT_TG_MIN_N 512
+#define GGML_METAL_FWHT_TG_NT    256
+#define GGML_METAL_FWHT_TG_NT_FALLBACK 128
+
 typedef struct {
     int32_t  ne00;   // number of columns (elements per row)
     int32_t  ne01;   // rows
@@ -1260,6 +1449,7 @@ typedef struct {
 
 typedef struct {
     int32_t nrows;
+    int32_t n_blk;
 } ggml_metal_kargs_fwht;
 
 typedef struct {

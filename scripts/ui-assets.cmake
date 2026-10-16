@@ -146,6 +146,14 @@ endfunction()
 function(emit_files dist_dir)
     set(UI_TEMPLATE_DIR "${LLAMA_SOURCE_DIR}/tools/ui")
 
+    # A downloaded/prebuilt dist can lag the source and omit static files that a
+    # from-source `vite build` copies verbatim (notably loading.html). Overlay the
+    # source static/ tree so every path (npm build, prebuilt dir, HF download) gets
+    # the complete set, however stale the prebuilt dist.tar.gz is.
+    if(IS_DIRECTORY "${UI_SOURCE_DIR}/static")
+        file(COPY "${UI_SOURCE_DIR}/static/" DESTINATION "${dist_dir}")
+    endif()
+
     # Collect the asset list once and reuse it for the fingerprint,
     # validation, compression and embedding.
     set(assets "")

@@ -8,6 +8,7 @@
 #include <openvino/op/convert.hpp>
 #include <openvino/op/reduce_sum.hpp>
 #include <openvino/op/unsqueeze.hpp>
+#include <openvino/op/util/precision_sensitive_attribute.hpp>
 
 namespace ov {
 namespace frontend {
@@ -38,7 +39,8 @@ OutputVector translate_add(const NodeContext & context) {
     auto input_1 = process_view_input_new(context, 1);
     // opset1::Add needs matching types (e.g. fused ADD_ADD mixes f16/f32); add in f32, cast once.
     auto output_type = context.get_output_type();
-    if (input_0.get_element_type() != input_1.get_element_type()) {
+    const bool mixed_types = input_0.get_element_type() != input_1.get_element_type();
+    if (mixed_types) {
         if (input_0.get_element_type() != ov::element::f32) {
             input_0 = std::make_shared<ov::op::v0::Convert>(input_0, ov::element::f32);
         }
@@ -47,8 +49,16 @@ OutputVector translate_add(const NodeContext & context) {
         }
     }
     ov::Output<ov::Node> res = std::make_shared<ov::op::v1::Add>(input_0, input_1);
+    if (mixed_types) {
+        ov::mark_as_precision_sensitive(res.get_node_shared_ptr()->input(0));
+        ov::mark_as_precision_sensitive(res.get_node_shared_ptr()->input(1));
+    }
     if (res.get_element_type() != output_type) {
-        res = std::make_shared<ov::op::v0::Convert>(res, output_type);
+        auto output_convert = std::make_shared<ov::op::v0::Convert>(res, output_type);
+        if (mixed_types) {
+            ov::mark_as_precision_sensitive(output_convert->input(0));
+        }
+        res = output_convert;
     }
     return rename_outputs_with_suffix({res}, context.get_name());
 }

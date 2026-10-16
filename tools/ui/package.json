@@ -30,10 +30,10 @@
 		"@chromatic-com/storybook": "5.2.1",
 		"@eslint/compat": "1.4.1",
 		"@eslint/js": "9.39.2",
-		"@internationalized/date": "3.12.2",
+		"@internationalized/date": "3.12.3",
 		"@lucide/svelte": "1.25.0",
 		"@modelcontextprotocol/sdk": "1.30.0",
-		"@playwright/test": "1.56.1",
+		"@playwright/test": "1.60.0",
 		"@storybook/addon-a11y": "10.5.6",
 		"@storybook/addon-docs": "10.5.6",
 		"@storybook/addon-mcp": "0.7.0",
@@ -68,10 +68,10 @@
 		"http-server": "14.1.1",
 		"mdast": "3.0.0",
 		"mdsvex": "0.12.7",
-		"mermaid": "11.15.0",
+		"mermaid": "11.17.2",
 		"mode-watcher": "1.1.0",
 		"pdfjs-dist": "5.4.54",
-		"playwright": "1.56.1",
+		"playwright": "1.60.0",
 		"prettier": "3.8.3",
 		"prettier-plugin-svelte": "4.1.0",
 		"prettier-plugin-tailwindcss": "0.8.0",
@@ -106,6 +106,7 @@
 	},
 	"overrides": {
 		"cookie": "1.1.1",
+		"nanoid": "3.3.18",
 		"sharp": "0.35.3",
 		"valibot": "1.4.2"
 	}

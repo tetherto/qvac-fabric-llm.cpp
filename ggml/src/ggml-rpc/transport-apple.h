@@ -5,6 +5,9 @@
 #include <memory>
 
 struct apple_rdma {
+    // True when librdma is installed, so probe() can use it.
+    static bool available();
+
     // target_gid is 16 bytes in, caps is RPC_CONN_CAPS_SIZE bytes out.
     static std::unique_ptr<apple_rdma> probe(int fd, const uint8_t * target_gid, uint8_t * caps);
     ~apple_rdma();
