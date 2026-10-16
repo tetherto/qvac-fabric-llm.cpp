@@ -1074,6 +1074,10 @@ void process_shaders() {
         if (tname == "q8_0") {
             string_to_spv("dequant_" + tname + "_transpose", "dequant_" + tname + ".comp", merge_maps(base_dict, {{data_a_key, "1"}, {"D_TYPE", "float16_t"}, {"DEQUANT_TRANSPOSE", "1"}}));
         }
+        // Strided-copy counterpart for f16 KV (contiguize the head-interleaved cache layout).
+        if (tname == "f16") {
+            string_to_spv("dequant_f16_transpose", "dequant_f16_transpose.comp", {});
+        }
 
         // get_rows uses element-wise dequant which doesn't work for TQ3/TQ4 (need FHT)
         if (!is_tq_fht(tname)) {
