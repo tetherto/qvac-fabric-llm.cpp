@@ -6740,7 +6740,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                         if (ggml_can_fuse_subgraph(cgraph, i, ops.size(), ops.data(), out_nodes, 2) &&
                                 ggml_cuda_should_use_topk_moe(node, logits, weights, ids)) {
 
-                            add_alloc_deps(i, i + ops.size());
+                            add_alloc_deps(i, out_nodes[1]);
                             i += ops.size() - 1;
                         }
                     }
