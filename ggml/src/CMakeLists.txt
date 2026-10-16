@@ -196,6 +196,7 @@ add_library(ggml-base
             ../include/uint8-buff-stream.h
             ggml.c
             ggml.cpp
+            ggml-log.cpp
             ggml-alloc.c
             ggml-backend.cpp
             ggml-backend-meta.cpp

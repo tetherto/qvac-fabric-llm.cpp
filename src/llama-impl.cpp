@@ -2,6 +2,7 @@
 
 #include "gguf.h"
 #include "llama.h"
+#include "../ggml/src/ggml-impl.h"
 
 #include <cinttypes>
 #include <climits>
@@ -36,6 +37,7 @@ void llama_log_set(ggml_log_callback log_callback, void * user_data) {
 }
 
 static void llama_log_internal_v(ggml_log_level level, const char * format, va_list args) {
+    level = level >= ggml_log_get_thread_min_level() ? level : GGML_LOG_LEVEL_DEBUG;
     va_list args_copy;
     va_copy(args_copy, args);
     char buffer[128];
