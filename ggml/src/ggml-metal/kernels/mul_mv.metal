@@ -271,12 +271,14 @@ constant bool  FC_mul_mv_norm  [[function_constant(FC_MUL_MV + 8)]];
 // NORM: fused RMS_NORM + MUL + mat-vec. src1 is the un-normalized row x and srcw the norm weight w, and the kernel
 // computes dst = rsqrt(mean(x^2) + eps) * (src0 . (x*w)). each simdgroup reads all of x, so the sum of squares
 // accumulates next to the dot products and the scale is applied once per output row
-template<typename block_q_type, short NR0, typename args_t, bool NORM>
+// RES:  fused mat-vec + ADD. srcr is the residual, of the same shape as dst, and the kernel writes dst = src0 . src1 + res
+template<typename block_q_type, short NR0, typename args_t, bool NORM, bool RES>
 void mul_vec_q_n_f32_impl_t(
         args_t args,
         device const char * src0,
         device const char * src1,
         device const char * srcw,
+        device const char * srcr,
         device       char * dst,
         threadgroup  char * shmem,
         uint3  tgpig,
@@ -372,7 +374,8 @@ void mul_vec_q_n_f32_impl_t(
         scale = rsqrt(simd_sum(sumsq)/args.ne00 + args.eps);
     }
 
-    device float * dst_f32 = (device float *) dst + im*args.ne0*args.ne1 + r1*args.ne0;
+    device       float * dst_f32 = (device       float *) dst  + im*args.ne0*args.ne1 + r1*args.ne0;
+    device const float * res_f32 = (device const float *) srcr + im*args.ne0*args.ne1 + r1*args.ne0;
 
     //helper_mv_reduce_and_write<NR0>(dst_f32, sumf, r0, args.ne01, tiisg, sgitg, shmem);
 
@@ -380,7 +383,7 @@ void mul_vec_q_n_f32_impl_t(
         const float tot = simd_sum(sumf[row])*scale;
 
         if (tiisg == 0 && r0 + row < args.ne01) {
-            dst_f32[r0 + row] = tot;
+            dst_f32[r0 + row] = RES ? tot + res_f32[r0 + row] : tot;
         }
     }
 }
@@ -395,7 +398,7 @@ void mul_vec_q_n_f32_impl(
         uint3  tgpig,
         ushort tiisg,
         ushort sgitg) {
-    mul_vec_q_n_f32_impl_t<block_q_type, NR0, args_t, false>(args, src0, src1, src1, dst, shmem, tgpig, tiisg, sgitg);
+    mul_vec_q_n_f32_impl_t<block_q_type, NR0, args_t, false, false>(args, src0, src1, src1, src1, dst, shmem, tgpig, tiisg, sgitg);
 }
 
 template<typename block_q_type, short NR0, typename args_t>
@@ -1043,11 +1046,16 @@ kernel void kernel_mul_mv_q4_0_f32(
         uint3  tgpig[[threadgroup_position_in_grid]],
         ushort tiisg[[thread_index_in_simdgroup]],
         ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+#define MV_ARGS args, src0, src1, srcw, src2, dst, shmem, tgpig, tiisg, sgitg
+    typedef constant ggml_metal_kargs_mul_mv & args_t;
     if (FC_mul_mv_norm) {
-        mul_vec_q_n_f32_impl_t<block_q4_0, N_R0_Q4_0, constant ggml_metal_kargs_mul_mv &, true >(args, src0, src1, srcw, dst, shmem, tgpig, tiisg, sgitg);
+        if (FC_mul_mv_add) { mul_vec_q_n_f32_impl_t<block_q4_0, N_R0_Q4_0, args_t, true,  true >(MV_ARGS); }
+        else               { mul_vec_q_n_f32_impl_t<block_q4_0, N_R0_Q4_0, args_t, true,  false>(MV_ARGS); }
     } else {
-        mul_vec_q_n_f32_impl_t<block_q4_0, N_R0_Q4_0, constant ggml_metal_kargs_mul_mv &, false>(args, src0, src1, srcw, dst, shmem, tgpig, tiisg, sgitg);
+        if (FC_mul_mv_add) { mul_vec_q_n_f32_impl_t<block_q4_0, N_R0_Q4_0, args_t, false, true >(MV_ARGS); }
+        else               { mul_vec_q_n_f32_impl_t<block_q4_0, N_R0_Q4_0, args_t, false, false>(MV_ARGS); }
     }
+#undef MV_ARGS
 }
 
 [[host_name("kernel_mul_mv_glu_q4_0_f32")]]
@@ -4247,13 +4255,14 @@ static inline float4 mxfp4_hi4(uint32_t w) {
     return float4(mxfp4_dq1(w >> 4), mxfp4_dq1(w >> 12), mxfp4_dq1(w >> 20), mxfp4_dq1(w >> 28));
 }
 
-// NORM: fused RMS_NORM + MUL + mat-vec, see mul_vec_q_n_f32_impl_t
-template<int NR0, typename args_t, bool NORM>
+// NORM: fused RMS_NORM + MUL + mat-vec, RES: fused mat-vec + ADD, see mul_vec_q_n_f32_impl_t
+template<int NR0, typename args_t, bool NORM, bool RES>
 void kernel_mul_mv_mxfp4_f32_impl_t(
         args_t args,
         device const char * src0,
         device const char * src1,
         device const char * srcw,
+        device const char * srcr,
         device       char * dst,
         threadgroup  char * shmem,
         uint3  tgpig,
@@ -4346,12 +4355,13 @@ void kernel_mul_mv_mxfp4_f32_impl_t(
         scale = rsqrt(simd_sum(sumsq)/args.ne00 + args.eps);
     }
 
-    device float * dst_f32 = (device float *) dst + (uint64_t)im*args.ne0*args.ne1 + (uint64_t)r1*args.ne0;
+    device       float * dst_f32 = (device       float *) dst  + (uint64_t)im*args.ne0*args.ne1 + (uint64_t)r1*args.ne0;
+    device const float * res_f32 = (device const float *) srcr + (uint64_t)im*args.ne0*args.ne1 + (uint64_t)r1*args.ne0;
 
     for (int row = 0; row < NR0 && first_row + row < args.ne0; ++row) {
         float sum_all = simd_sum(sumf[row])*scale;
         if (tiisg == 0) {
-            dst_f32[first_row + row] = sum_all;
+            dst_f32[first_row + row] = RES ? sum_all + res_f32[first_row + row] : sum_all;
         }
     }
 }
@@ -4366,7 +4376,7 @@ void kernel_mul_mv_mxfp4_f32_impl(
         uint3  tgpig,
         ushort tiisg,
         ushort sgitg) {
-    kernel_mul_mv_mxfp4_f32_impl_t<NR0, args_t, false>(args, src0, src1, src1, dst, shmem, tgpig, tiisg, sgitg);
+    kernel_mul_mv_mxfp4_f32_impl_t<NR0, args_t, false, false>(args, src0, src1, src1, src1, dst, shmem, tgpig, tiisg, sgitg);
 }
 
 [[host_name("kernel_mul_mv_mxfp4_f32")]]
@@ -4381,11 +4391,16 @@ kernel void kernel_mul_mv_mxfp4_f32(
         uint3  tgpig[[threadgroup_position_in_grid]],
         ushort tiisg[[thread_index_in_simdgroup]],
         ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+#define MV_ARGS args, src0, src1, srcw, src2, dst, shmem, tgpig, tiisg, sgitg
+    typedef constant ggml_metal_kargs_mul_mv & args_t;
     if (FC_mul_mv_norm) {
-        kernel_mul_mv_mxfp4_f32_impl_t<N_R0_MXFP4, constant ggml_metal_kargs_mul_mv &, true >(args, src0, src1, srcw, dst, shmem, tgpig, tiisg, sgitg);
+        if (FC_mul_mv_add) { kernel_mul_mv_mxfp4_f32_impl_t<N_R0_MXFP4, args_t, true,  true >(MV_ARGS); }
+        else               { kernel_mul_mv_mxfp4_f32_impl_t<N_R0_MXFP4, args_t, true,  false>(MV_ARGS); }
     } else {
-        kernel_mul_mv_mxfp4_f32_impl_t<N_R0_MXFP4, constant ggml_metal_kargs_mul_mv &, false>(args, src0, src1, srcw, dst, shmem, tgpig, tiisg, sgitg);
+        if (FC_mul_mv_add) { kernel_mul_mv_mxfp4_f32_impl_t<N_R0_MXFP4, args_t, false, true >(MV_ARGS); }
+        else               { kernel_mul_mv_mxfp4_f32_impl_t<N_R0_MXFP4, args_t, false, false>(MV_ARGS); }
     }
+#undef MV_ARGS
 }
 
 template<int nr0, typename args_t>
