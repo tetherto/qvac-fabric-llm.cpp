@@ -1144,6 +1144,93 @@ static bool ggml_metal_fusion_check_mul_mv_glu_stacked(
     return ggml_can_fuse_subgraph_ext(gf, raw_idxs, raw_count, ops_all.data(), outputs, 1);
 }
 
+// true if the MUL_MAT + MUL_MAT + GLU fusion takes the mat-vecs at raw graph indices i0 and i1 together with the GLU
+// right after them
+static bool ggml_metal_fusion_glu_takes_pair(
+        const ggml_cgraph * gf, int i0, int i1, ggml_metal_fusion_mode mode) {
+    static const ggml_metal_fusion glu_fusion(GGML_METAL_FUSION_MUL_MV_GLU, { GGML_OP_MUL_MAT, GGML_OP_MUL_MAT, GGML_OP_GLU }, {},
+            true, ggml_metal_fusion_check_mul_mv_glu);
+
+    int ig = i1 + 1;
+    while (ig < gf->n_nodes && ggml_op_is_empty(gf->nodes[ig]->op)) {
+        ig++;
+    }
+    if (ig >= gf->n_nodes || gf->nodes[ig]->op != GGML_OP_GLU) {
+        return false;
+    }
+
+    const int           idxs[3]  = { i0, i1, ig };
+    const ggml_tensor * nodes[3] = { gf->nodes[i0], gf->nodes[i1], gf->nodes[ig] };
+
+    return ggml_metal_fusion_check_mul_mv_glu(&glu_fusion, nodes, gf, idxs, 0, mode);
+}
+
+// RMS_NORM + MUL + MUL_MAT x N: the normed and weighted row feeds only N single-row Q4_0/MXFP4 mat-vecs, which read the
+// norm input and the norm weight and apply the norm themselves (unsafe = true). the norm and the MUL are elided, so the N
+// mat-vecs must be their only consumers; a gate/up pair that the GLU fusion takes right after is left to that fusion
+static bool ggml_metal_fusion_check_rms_norm_mul_mv(
+        const ggml_metal_fusion      * fusion,
+        const ggml_tensor * const    * nodes,
+        const ggml_cgraph            * gf,
+        const int                    * node_idxs,
+              int                      idx,
+              ggml_metal_fusion_mode   mode) {
+    const int n_ops = (int) fusion->ops.size();
+
+    const ggml_tensor * norm = nodes[0];
+    const ggml_tensor * mul  = nodes[1];
+    const ggml_tensor * x    = norm->src[0];
+    const ggml_tensor * w    = mul->src[1];
+
+    if (mul->src[0] != norm || x->type != GGML_TYPE_F32 || norm->type != GGML_TYPE_F32 || mul->type != GGML_TYPE_F32 ||
+        !ggml_are_same_shape(mul, norm) || !ggml_is_contiguous(x) || !ggml_is_contiguous(norm) || !ggml_is_contiguous(mul)) {
+        return false;
+    }
+
+    // a single weight row of the norm width
+    if (w->type != GGML_TYPE_F32 || w->ne[0] != norm->ne[0] || ggml_nrows(w) != 1 || !ggml_is_contiguous(w)) {
+        return false;
+    }
+
+    for (int j = 2; j < n_ops; ++j) {
+        const ggml_tensor * mm = nodes[j];
+        const ggml_tensor * a  = mm->src[0];
+
+        if (mm->src[1] != mul || mm->type != GGML_TYPE_F32 ||
+            (a->type != GGML_TYPE_Q4_0 && a->type != GGML_TYPE_MXFP4) || a->ne[0] != norm->ne[0] ||
+            a->ne[2] != 1 || a->ne[3] != 1 || ggml_is_transposed(a) ||
+            ggml_get_op_params_i32(mm, 1) == GGML_HINT_SRC0_IS_HADAMARD) {
+            return false;
+        }
+    }
+
+    if (!ggml_can_fuse_subgraph_ext(gf, node_idxs + idx, n_ops, fusion->ops.data(), node_idxs + idx + 2, n_ops - 2)) {
+        return false;
+    }
+
+    if (n_ops == 4 && ggml_metal_fusion_glu_takes_pair(gf, node_idxs[idx + 2], node_idxs[idx + 3], mode)) {
+        return false;
+    }
+
+    if (mode == GGML_METAL_FUSION_STRUCTURAL) {
+        return true;
+    }
+
+    // a single row takes the plain mat-vec path (MMA and the multi-row kernels start at 2 rows); the mat-vecs read the
+    // norm input while they write their outputs, so these must not overlap it
+    if (ggml_nrows(x) != 1) {
+        return false;
+    }
+
+    for (int j = 2; j < n_ops; ++j) {
+        if (ggml_metal_fusion_overlap(x, nodes[j]) || ggml_metal_fusion_overlap(w, nodes[j])) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
 // ---- patterns ------------------------------------------------------------
 
 static const std::vector<ggml_op> ops_norm_mul         = { GGML_OP_NORM, GGML_OP_MUL };
@@ -1172,6 +1259,12 @@ static const std::vector<ggml_op> ops_rms_norm_fwht = { GGML_OP_RMS_NORM, GGML_O
 // the MUL reads the CONT directly or through a RESHAPE
 static const std::vector<ggml_op> ops_cont_fwht    = { GGML_OP_CONT, GGML_OP_MUL, GGML_OP_RESHAPE, GGML_OP_MUL_MAT };
 static const std::vector<ggml_op> ops_cont_rs_fwht = { GGML_OP_CONT, GGML_OP_RESHAPE, GGML_OP_MUL, GGML_OP_RESHAPE, GGML_OP_MUL_MAT };
+
+// the norm folded into 1-4 mat-vecs
+static const std::vector<ggml_op> ops_rms_norm_mul_mv_1 = { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_MUL_MAT };
+static const std::vector<ggml_op> ops_rms_norm_mul_mv_2 = { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_MUL_MAT, GGML_OP_MUL_MAT };
+static const std::vector<ggml_op> ops_rms_norm_mul_mv_3 = { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_MUL_MAT, GGML_OP_MUL_MAT, GGML_OP_MUL_MAT };
+static const std::vector<ggml_op> ops_rms_norm_mul_mv_4 = { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_MUL_MAT, GGML_OP_MUL_MAT, GGML_OP_MUL_MAT, GGML_OP_MUL_MAT };
 
 static const std::vector<ggml_op> ops_ssm_conv_silu = { GGML_OP_SSM_CONV, GGML_OP_UNARY };
 
@@ -1380,6 +1473,11 @@ static const std::vector<ggml_metal_fusion> ggml_metal_fusions = {
     { GGML_METAL_FUSION_RMS_NORM_FWHT,  ops_rms_norm_fwht,          {},     true,  ggml_metal_fusion_check_rms_norm_fwht },
     { GGML_METAL_FUSION_CONT_FWHT,      ops_cont_fwht,              {},     true,  ggml_metal_fusion_check_cont_fwht },
     { GGML_METAL_FUSION_CONT_FWHT,      ops_cont_rs_fwht,           {},     true,  ggml_metal_fusion_check_cont_fwht },
+    // the norm folded into 1-4 mat-vecs; every mat-vec of the group is an output
+    { GGML_METAL_FUSION_RMS_NORM_MUL_MV, ops_rms_norm_mul_mv_4,     {2, 3, 4}, true, ggml_metal_fusion_check_rms_norm_mul_mv },
+    { GGML_METAL_FUSION_RMS_NORM_MUL_MV, ops_rms_norm_mul_mv_3,     {2, 3}, true,  ggml_metal_fusion_check_rms_norm_mul_mv },
+    { GGML_METAL_FUSION_RMS_NORM_MUL_MV, ops_rms_norm_mul_mv_2,     {2},    true,  ggml_metal_fusion_check_rms_norm_mul_mv },
+    { GGML_METAL_FUSION_RMS_NORM_MUL_MV, ops_rms_norm_mul_mv_1,     {},     true,  ggml_metal_fusion_check_rms_norm_mul_mv },
 };
 
 ggml_metal_fusion_id ggml_metal_fusion_id_at(int idx) {
@@ -1446,6 +1544,12 @@ void ggml_metal_fusion_add_alloc_deps(
 
         if (best) {
             ggml_metal_fusion_add_pattern_alloc_deps(user_data, add_alloc_dep, gf, best, i);
+            // the mat-vecs of RMS_NORM + MUL + MUL_MAT x N can head their own patterns (MUL_MAT + MUL_MAT + GLU),
+            // which also fire when this one does not: rescan from the first mat-vec so they get their deps
+            if (best->id == GGML_METAL_FUSION_RMS_NORM_MUL_MV) {
+                i += 1;
+                continue;
+            }
             i += best_raw - 1;
             // the MUL that ends MUL_MAT_ID + MUL or UNARY + MUL can also head MOE_REDUCE or SNAKE:
             // rescan it so both get their deps
