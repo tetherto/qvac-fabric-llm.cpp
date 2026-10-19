@@ -323,6 +323,105 @@ kernel void kernel_rope_vision(
     }
 }
 
+// fused RMS_NORM + MUL + ROPE (+ SET_ROWS), e.g. the per-head Q/K norms of Qwen3 and the K-cache write.
+// one simdgroup per row (head) of a token: each thread holds up to NP rotation pairs, the sum of squares is a single
+// simd_sum, and the normalized, weighted values are rotated in registers. the rows are rotated over their full width
+// (n_dims == ne00). with set_rows, token i2 is written as one f16/f32 row at index srci[i2] of dst (the cache)
+template<typename T, bool NEOX>
+kernel void kernel_rms_norm_rope(
+        constant ggml_metal_kargs_norm_rope & args,
+        device const char * src0,
+        device const char * srcw,
+        device const char * src1,
+        device const char * src2,
+        device const char * srci,
+        device       char * dst,
+        ushort  tiisg[[thread_index_in_simdgroup]],
+        ushort  sgitg[[simdgroup_index_in_threadgroup]],
+        ushort3 ntg  [[threads_per_threadgroup]],
+        uint3   tgpig[[threadgroup_position_in_grid]]) {
+    constexpr short NP = 4; // rotation pairs per thread: rows up to 2*32*NP = 256 wide
+
+    const int i1 = tgpig.x*ntg.y + sgitg;
+    const int i2 = tgpig.y;
+
+    if (i1 >= args.ne01) {
+        return;
+    }
+
+    const int nh = args.ne00/2;
+
+    device const float * x = (device const float *) (src0 + i2*args.nb02 + i1*args.nb01);
+    device const float * w = (device const float *) srcw;
+
+    float a[NP];
+    float b[NP];
+
+    float sumsq = 0.0f;
+
+    FOR_UNROLL (short p = 0; p < NP; ++p) {
+        const int j = tiisg + N_SIMDWIDTH*p;
+
+        a[p] = 0.0f;
+        b[p] = 0.0f;
+
+        if (j < nh) {
+            a[p] = NEOX ? x[j]      : x[2*j];
+            b[p] = NEOX ? x[j + nh] : x[2*j + 1];
+
+            sumsq += a[p]*a[p] + b[p]*b[p];
+        }
+    }
+
+    const float scale = 1.0f/sqrt(simd_sum(sumsq)/args.ne00 + args.eps);
+
+    float corr_dims[2];
+    rope_yarn_corr_dims(args.ne00, args.n_ctx_orig, args.freq_base, args.beta_fast, args.beta_slow, corr_dims);
+
+    const float theta_base = (float) ((device const int32_t *) src1)[i2];
+    const float inv_ndims  = -1.f/args.ne00;
+
+    device T * y;
+    if (args.set_rows) {
+        const int64_t r = args.idx_i32 ? (int64_t) ((device const int32_t *) srci)[i2] : ((device const int64_t *) srci)[i2];
+        y = (device T *) (dst + r*args.nb_set) + i1*args.ne00;
+    } else {
+        y = (device T *) (dst + i2*args.nb2 + i1*args.nb1);
+    }
+
+    FOR_UNROLL (short p = 0; p < NP; ++p) {
+        const int j = tiisg + N_SIMDWIDTH*p;
+
+        if (j < nh) {
+            const int ia = NEOX ? j      : 2*j;
+            const int ib = NEOX ? j + nh : 2*j + 1;
+
+            // same order of operations as the unfused norm, mul and rope
+            const float x0 = (a[p]*scale)*w[ia];
+            const float x1 = (b[p]*scale)*w[ib];
+
+            const int iw = 2*j;
+
+            const float theta       = theta_base * pow(args.freq_base, inv_ndims*iw);
+            const float freq_factor = args.src2 ? ((device const float *) src2)[j] : 1.0f;
+
+            float cos_theta;
+            float sin_theta;
+            rope_yarn(theta/freq_factor, args.freq_scale, corr_dims, iw, args.ext_factor, args.attn_factor, &cos_theta, &sin_theta);
+
+            y[ia] = (T) (x0*cos_theta - x1*sin_theta);
+            y[ib] = (T) (x0*sin_theta + x1*cos_theta);
+        }
+    }
+}
+
+typedef decltype(kernel_rms_norm_rope<float, true>) kernel_rms_norm_rope_t;
+
+template [[host_name("kernel_rms_norm_rope_neox_f32")]] kernel kernel_rms_norm_rope_t kernel_rms_norm_rope<float, true>;
+template [[host_name("kernel_rms_norm_rope_neox_f16")]] kernel kernel_rms_norm_rope_t kernel_rms_norm_rope<half,  true>;
+template [[host_name("kernel_rms_norm_rope_norm_f32")]] kernel kernel_rms_norm_rope_t kernel_rms_norm_rope<float, false>;
+template [[host_name("kernel_rms_norm_rope_norm_f16")]] kernel kernel_rms_norm_rope_t kernel_rms_norm_rope<half,  false>;
+
 typedef decltype(kernel_rope_norm<float>) kernel_rope_norm_t;
 typedef decltype(kernel_rope_neox<float>) kernel_rope_neox_t;
 typedef decltype(kernel_rope_multi<float>) kernel_rope_multi_t;
