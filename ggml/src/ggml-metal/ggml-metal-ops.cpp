@@ -5235,6 +5235,86 @@ static int ggml_metal_op_cont_fwht(ggml_metal_op_t ctx, int idx) {
     return GGML_METAL_CONT_FWHT_N_OPS;
 }
 
+// RMS_NORM + MUL + ROPE (+ SET_ROWS): one dispatch normalizes, weights and rotates the rows, and writes them to the ROPE
+// output or, with SET_ROWS, straight into the indexed dst rows
+static int ggml_metal_op_rms_norm_rope(ggml_metal_op_t ctx, int idx, int n_fuse) {
+    ggml_metal_library_t lib = ctx->lib;
+    ggml_metal_encoder_t enc = ctx->enc;
+
+    const ggml_tensor * norm = ctx->node(idx);
+    const ggml_tensor * mul  = ctx->node(idx + 1);
+    const ggml_tensor * rope = ctx->node(idx + 2);
+    const ggml_tensor * sr   = n_fuse == 4 ? ctx->node(idx + 3) : nullptr;
+
+    const ggml_tensor * x   = norm->src[0];
+    const ggml_tensor * dst = sr ? sr : rope;
+
+    float eps;
+    memcpy(&eps, norm->op_params, sizeof(float));
+
+    const int32_t * rp = (const int32_t *) rope->op_params;
+
+    float freq_base;
+    float freq_scale;
+    float ext_factor;
+    float attn_factor;
+    float beta_fast;
+    float beta_slow;
+
+    memcpy(&freq_base,   rp +  5, sizeof(float));
+    memcpy(&freq_scale,  rp +  6, sizeof(float));
+    memcpy(&ext_factor,  rp +  7, sizeof(float));
+    memcpy(&attn_factor, rp +  8, sizeof(float));
+    memcpy(&beta_fast,   rp +  9, sizeof(float));
+    memcpy(&beta_slow,   rp + 10, sizeof(float));
+
+    ggml_metal_op_fusion_concurrency(ctx, idx, n_fuse);
+
+    ggml_metal_kargs_norm_rope args = {
+        /*.ne00        =*/ (int32_t) x->ne[0],
+        /*.ne01        =*/ (int32_t) x->ne[1],
+        /*.ne02        =*/ (int32_t) x->ne[2],
+        /*.nb01        =*/ x->nb[1],
+        /*.nb02        =*/ x->nb[2],
+        /*.nb1         =*/ rope->nb[1],
+        /*.nb2         =*/ rope->nb[2],
+        /*.nb_set      =*/ sr ? sr->nb[1] : 0,
+        /*.eps         =*/ eps,
+        /*.n_ctx_orig  =*/ rp[4],
+        /*.freq_base   =*/ freq_base,
+        /*.freq_scale  =*/ freq_scale,
+        /*.ext_factor  =*/ ext_factor,
+        /*.attn_factor =*/ attn_factor,
+        /*.beta_fast   =*/ beta_fast,
+        /*.beta_slow   =*/ beta_slow,
+        /*.src2        =*/ rope->src[2] != nullptr,
+        /*.set_rows    =*/ sr != nullptr,
+        /*.idx_i32     =*/ sr && sr->src[1]->type == GGML_TYPE_I32,
+    };
+
+    auto pipeline = ggml_metal_library_get_pipeline_norm_rope(lib, rp[2] == GGML_ROPE_TYPE_NEOX, dst->type);
+
+    ggml_metal_encoder_set_pipeline(enc, pipeline);
+    ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(x),            1);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(mul->src[1]),  2);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(rope->src[1]), 3);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(rope->src[2] ? rope->src[2] : x), 4);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(sr ? sr->src[1] : x), 5);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(dst),          6);
+
+    // one simdgroup per row, nsg rows per threadgroup
+    const int nsg = 4;
+
+    ggml_metal_encoder_dispatch_threadgroups(enc, (args.ne01 + nsg - 1)/nsg, args.ne02, 1, 32, nsg, 1);
+
+    if (ggml_metal_fusion_info_debug(ctx->finfo) > 1) {
+        GGML_LOG_DEBUG("%s: fuse: RMS_NORM + MUL + ROPE%s\n", __func__, sr ? " + SET_ROWS" : "");
+    }
+
+    return n_fuse;
+}
+
 // RMS_NORM + MUL + MUL_MAT x N: encode only the N mat-vecs; each one normalizes the norm input with the norm weight
 static int ggml_metal_op_rms_norm_mul_mv(ggml_metal_op_t ctx, int idx, int n_fuse) {
     const ggml_tensor * norm = ctx->node(idx);
@@ -5310,6 +5390,11 @@ int ggml_metal_op_norm(ggml_metal_op_t ctx, int idx) {
         if (fusion && ggml_metal_fusion_get_id(fusion) == GGML_METAL_FUSION_RMS_NORM_MUL_MV) {
             ctx->count_fusions(fusion);
             return ggml_metal_op_rms_norm_mul_mv(ctx, idx, n);
+        }
+
+        if (fusion && ggml_metal_fusion_get_id(fusion) == GGML_METAL_FUSION_RMS_NORM_ROPE) {
+            ctx->count_fusions(fusion);
+            return ggml_metal_op_rms_norm_rope(ctx, idx, n);
         }
 
         if (fusion && ggml_metal_fusion_get_id(fusion) == GGML_METAL_FUSION_RMS_NORM_FWHT) {

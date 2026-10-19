@@ -1231,6 +1231,120 @@ static bool ggml_metal_fusion_check_rms_norm_mul_mv(
     return true;
 }
 
+// RMS_NORM + MUL + ROPE (+ SET_ROWS): rows normalized over their width, weighted and rotated over the full width, as the
+// per-head Q/K norms of Qwen3; with SET_ROWS, the rotated rows are written straight into the cache rows given by the
+// indices, through a contiguous view of the ROPE output (unsafe = true). the norm, the MUL and, with SET_ROWS, the ROPE
+// and any view between ROPE and SET_ROWS are elided, so none of them may have consumers outside the group
+static bool ggml_metal_fusion_check_rms_norm_rope(
+        const ggml_metal_fusion      * fusion,
+        const ggml_tensor * const    * nodes,
+        const ggml_cgraph            * gf,
+        const int                    * node_idxs,
+              int                      idx,
+              ggml_metal_fusion_mode   mode) {
+
+    const int n_ops = (int) fusion->ops.size();
+    GGML_ASSERT(n_ops == 3 || n_ops == 4);
+
+    const int * idxs = node_idxs + idx;
+
+    const ggml_tensor * norm = nodes[0];
+    const ggml_tensor * mul  = nodes[1];
+    const ggml_tensor * rope = nodes[2];
+    const ggml_tensor * x    = norm->src[0];
+    const ggml_tensor * w    = mul->src[1];
+
+    if (mul->src[0] != norm || rope->src[0] != mul ||
+        x->type != GGML_TYPE_F32 || norm->type != GGML_TYPE_F32 || mul->type != GGML_TYPE_F32 || rope->type != GGML_TYPE_F32 ||
+        !ggml_are_same_shape(norm, mul) || !ggml_are_same_shape(mul, rope)) {
+        return false;
+    }
+
+    // rows up to 256 wide, see kernel_rms_norm_rope
+    const int64_t ne0 = norm->ne[0];
+    if (ne0 % 2 != 0 || ne0 > 256 || x->nb[0] != sizeof(float) || x->ne[3] != 1 || rope->nb[0] != sizeof(float)) {
+        return false;
+    }
+
+    if (w->type != GGML_TYPE_F32 || w->ne[0] != ne0 || ggml_nrows(w) != 1 || !ggml_is_contiguous(w)) {
+        return false;
+    }
+
+    // NEOX or normal rotation over the full row
+    const int32_t * rp = (const int32_t *) rope->op_params;
+    const int rmode  = rp[2];
+    const int n_dims = rp[1];
+    if ((rmode != GGML_ROPE_TYPE_NEOX && rmode != GGML_ROPE_TYPE_NORMAL) || n_dims != ne0) {
+        return false;
+    }
+
+    const ggml_tensor * pos = rope->src[1];
+    const ggml_tensor * ff  = rope->src[2];
+    if (pos->type != GGML_TYPE_I32 || pos->ne[0] != rope->ne[2] || !ggml_is_contiguous(pos)) {
+        return false;
+    }
+    if (ff && (ff->type != GGML_TYPE_F32 || ff->ne[0] < ne0/2 || !ggml_is_contiguous(ff))) {
+        return false;
+    }
+
+    if (n_ops == 3) {
+        if (!ggml_can_fuse_subgraph_ext(gf, idxs, 3, fusion->ops.data(), idxs + 2, 1)) {
+            return false;
+        }
+
+        // each row is read whole before it is written, so only an exact alias of the input is safe
+        return mode != GGML_METAL_FUSION_FULL || (!ggml_metal_fusion_partial_overlap(x, rope) && !ggml_metal_fusion_overlap(w, rope));
+    }
+
+    // SET_ROWS of the rotated rows, one dst row per token
+    const ggml_tensor * sr  = nodes[3];
+    const ggml_tensor * src = sr->src[0];
+    const ggml_tensor * ids = sr->src[1];
+
+    if (src != rope && (src->view_src != rope || src->view_offs != 0)) {
+        return false;
+    }
+    if (!ggml_is_contiguous(rope) || !ggml_is_contiguous(src) || ggml_nelements(src) != ggml_nelements(rope) ||
+        src->ne[0] != ne0*rope->ne[1] || src->ne[1] != rope->ne[2] || src->ne[2] != 1 || src->ne[3] != 1) {
+        return false;
+    }
+    if ((ids->type != GGML_TYPE_I64 && ids->type != GGML_TYPE_I32) || ids->ne[0] != src->ne[1] ||
+        ggml_nrows(ids) != 1 || !ggml_is_contiguous(ids)) {
+        return false;
+    }
+    if ((sr->type != GGML_TYPE_F16 && sr->type != GGML_TYPE_F32) || sr->ne[0] != src->ne[0] ||
+        sr->nb[0] != ggml_type_size(sr->type) || sr->ne[2] != 1 || sr->ne[3] != 1) {
+        return false;
+    }
+
+    if (src == rope) {
+        if (!ggml_can_fuse_subgraph_ext(gf, idxs, 4, fusion->ops.data(), idxs + 3, 1)) {
+            return false;
+        }
+    } else {
+        // the SET_ROWS reads the ROPE through a view, which is not one of the matched nodes
+        int gi_view = -1;
+        for (int i = idxs[2] + 1; i < idxs[3]; ++i) {
+            if (gf->nodes[i] == src) {
+                gi_view = i;
+                break;
+            }
+        }
+        if (gi_view < 0) {
+            return false;
+        }
+
+        const ggml_op ops[5] = { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ROPE, src->op, GGML_OP_SET_ROWS };
+        const int     gis[5] = { idxs[0], idxs[1], idxs[2], gi_view, idxs[3] };
+
+        if (!ggml_can_fuse_subgraph_ext(gf, gis, 5, ops, &gis[4], 1)) {
+            return false;
+        }
+    }
+
+    return mode != GGML_METAL_FUSION_FULL || !ggml_metal_fusion_overlap(x, sr);
+}
+
 // ---- patterns ------------------------------------------------------------
 
 static const std::vector<ggml_op> ops_norm_mul         = { GGML_OP_NORM, GGML_OP_MUL };
@@ -1265,6 +1379,13 @@ static const std::vector<ggml_op> ops_rms_norm_mul_mv_1 = { GGML_OP_RMS_NORM, GG
 static const std::vector<ggml_op> ops_rms_norm_mul_mv_2 = { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_MUL_MAT, GGML_OP_MUL_MAT };
 static const std::vector<ggml_op> ops_rms_norm_mul_mv_3 = { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_MUL_MAT, GGML_OP_MUL_MAT, GGML_OP_MUL_MAT };
 static const std::vector<ggml_op> ops_rms_norm_mul_mv_4 = { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_MUL_MAT, GGML_OP_MUL_MAT, GGML_OP_MUL_MAT, GGML_OP_MUL_MAT };
+
+// per-head Q/K norm + rotation; the SET_ROWS variant writes the K rows straight into the cache, usually through a
+// reshape or view of the ROPE output
+static const std::vector<ggml_op> ops_rms_norm_rope        = { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ROPE };
+static const std::vector<ggml_op> ops_rms_norm_rope_set    = { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ROPE, GGML_OP_SET_ROWS };
+static const std::vector<ggml_op> ops_rms_norm_rope_rs_set = { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ROPE, GGML_OP_RESHAPE, GGML_OP_SET_ROWS };
+static const std::vector<ggml_op> ops_rms_norm_rope_vw_set = { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ROPE, GGML_OP_VIEW, GGML_OP_SET_ROWS };
 
 static const std::vector<ggml_op> ops_ssm_conv_silu = { GGML_OP_SSM_CONV, GGML_OP_UNARY };
 
@@ -1478,6 +1599,10 @@ static const std::vector<ggml_metal_fusion> ggml_metal_fusions = {
     { GGML_METAL_FUSION_RMS_NORM_MUL_MV, ops_rms_norm_mul_mv_3,     {2, 3}, true,  ggml_metal_fusion_check_rms_norm_mul_mv },
     { GGML_METAL_FUSION_RMS_NORM_MUL_MV, ops_rms_norm_mul_mv_2,     {2},    true,  ggml_metal_fusion_check_rms_norm_mul_mv },
     { GGML_METAL_FUSION_RMS_NORM_MUL_MV, ops_rms_norm_mul_mv_1,     {},     true,  ggml_metal_fusion_check_rms_norm_mul_mv },
+    { GGML_METAL_FUSION_RMS_NORM_ROPE,   ops_rms_norm_rope_rs_set,  {},     true,  ggml_metal_fusion_check_rms_norm_rope },
+    { GGML_METAL_FUSION_RMS_NORM_ROPE,   ops_rms_norm_rope_vw_set,  {},     true,  ggml_metal_fusion_check_rms_norm_rope },
+    { GGML_METAL_FUSION_RMS_NORM_ROPE,   ops_rms_norm_rope_set,     {},     true,  ggml_metal_fusion_check_rms_norm_rope },
+    { GGML_METAL_FUSION_RMS_NORM_ROPE,   ops_rms_norm_rope,         {},     true,  ggml_metal_fusion_check_rms_norm_rope },
 };
 
 ggml_metal_fusion_id ggml_metal_fusion_id_at(int idx) {

@@ -2777,6 +2777,31 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_rope(ggml_metal_
     return res;
 }
 
+// fused RMS_NORM + MUL + ROPE (+ SET_ROWS into a tdst cache)
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_norm_rope(ggml_metal_library_t lib, bool neox, ggml_type tdst) {
+    GGML_ASSERT(tdst == GGML_TYPE_F32 || tdst == GGML_TYPE_F16);
+
+    char base[256];
+    char name[256];
+
+    snprintf(base, 256, "kernel_rms_norm_rope_%s_%s", neox ? "neox" : "norm", ggml_type_name(tdst));
+    snprintf(name, 256, "%s", base);
+
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        ggml_metal_cv_t cv = ggml_metal_cv_init();
+
+        ggml_metal_cv_set_bool(cv, false, FC_ROPE + 0);
+        ggml_metal_cv_set_bool(cv, false, FC_ROPE + 1);
+
+        res = ggml_metal_library_compile_pipeline(lib, base, name, cv);
+
+        ggml_metal_cv_free(cv);
+    }
+
+    return res;
+}
+
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_im2col(ggml_metal_library_t lib, const ggml_tensor * op) {
     assert(op->op == GGML_OP_IM2COL);
 
