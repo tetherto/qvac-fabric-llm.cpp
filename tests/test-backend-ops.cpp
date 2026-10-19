@@ -11025,6 +11025,67 @@ struct test_mul_mat_add : public test_case {
     }
 };
 
+// RMS_NORM + MUL (weight) consumed by n_mm mat-vecs, as for attn_norm -> Q/K/V and ffn_norm -> gate/up.
+// a backend may fold the norm into the mat-vecs; extra_use gives the normalized row another consumer and n > 1 rows
+// make it a mat-mat, both of which must keep the norm
+struct test_rms_norm_mul_mv : public test_case {
+    const ggml_type type_a;
+    const int64_t k;
+    const int64_t m;
+    const int n_mm;
+    const int64_t n;
+    const bool extra_use;
+
+    std::string vars() override {
+        return VARS_TO_STR6(type_a, k, m, n_mm, n, extra_use);
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "RMS_NORM_MUL_MV";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    test_rms_norm_mul_mv(ggml_type type_a = GGML_TYPE_Q4_0, int64_t k = 2560, int64_t m = 1024, int n_mm = 3,
+            int64_t n = 1, bool extra_use = false)
+        : type_a(type_a), k(k), m(m), n_mm(n_mm), n(n), extra_use(extra_use) {}
+
+    // only the sum is compared: the mat-vec outputs themselves may be elided by other fusions (e.g. MUL_MAT + ADD)
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
+        ggml_set_name(x, "x");
+        ggml_tensor * w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, k);
+        ggml_set_name(w, "w");
+
+        ggml_tensor * cur = ggml_mul(ctx, ggml_rms_norm(ctx, x, 1e-6f), w);
+
+        std::vector<ggml_tensor *> mms;
+        for (int i = 0; i < n_mm; i++) {
+            ggml_tensor * a = ggml_new_tensor_2d(ctx, type_a, k, m);
+            mms.push_back(ggml_mul_mat(ctx, a, cur));
+        }
+
+        // nest the sum so that the mat-vecs are consecutive in the graph: mm0 + (mm1 + (mm2 + ...))
+        ggml_tensor * out = mms[n_mm - 1];
+        for (int i = n_mm - 2; i >= 0; i--) {
+            out = ggml_add(ctx, mms[i], out);
+        }
+
+        if (extra_use) {
+            out = ggml_add(ctx, out, ggml_sum_rows(ctx, cur));
+        }
+
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+};
+
 struct test_mul_mat_vec_fusion : public test_case {
     const ggml_type type;
     const ggml_glu_op glu_op;
@@ -15011,6 +15072,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
     test_cases.emplace_back(new test_mul_mat_add(GGML_TYPE_PQ2_0, 2048, 1, 2048, MUL_MAT_ADD_B_INPLACE));
     test_cases.emplace_back(new test_mul_mat_add(GGML_TYPE_PQ2_0, 5120, 1, 6144));
+
+    // RMS_NORM + MUL folded into the consuming mat-vecs
+    for (ggml_type type : {GGML_TYPE_Q4_0, GGML_TYPE_MXFP4}) {
+        for (int n_mm : {1, 2, 3, 4}) {
+            test_cases.emplace_back(new test_rms_norm_mul_mv(type, 2560, 1024, n_mm));
+        }
+        test_cases.emplace_back(new test_rms_norm_mul_mv(type,   96,   33, 3));
+        test_cases.emplace_back(new test_rms_norm_mul_mv(type,  256,   32, 2));
+        test_cases.emplace_back(new test_rms_norm_mul_mv(type, 4096,   64, 2));
+        test_cases.emplace_back(new test_rms_norm_mul_mv(type, 2560, 1024, 3, 1, true)); // other use: keep the norm
+        test_cases.emplace_back(new test_rms_norm_mul_mv(type, 2560,  256, 3, 4));       // 4 rows: keep the norm
+    }
+    test_cases.emplace_back(new test_rms_norm_mul_mv(GGML_TYPE_Q8_0, 2560, 256, 2));   // no fused kernel: keep the norm
 
     // few src1 rows (speculative verify): odd m, a single K block, long K, every tile width, broadcast batches
     for (int64_t n : {2, 3, 5, 8, 9, 13, 16}) {

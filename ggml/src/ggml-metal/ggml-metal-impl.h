@@ -55,7 +55,7 @@
 #define N_R0_Q8_0 2
 #define N_SG_Q8_0 4
 
-#define N_R0_MXFP4 2
+#define N_R0_MXFP4 4
 #define N_SG_MXFP4 2
 
 #define N_R0_Q2_K 4
@@ -576,6 +576,7 @@ typedef struct {
     int32_t  nr0;
     int16_t  r2;
     int16_t  r3;
+    float    eps; // fused RMS_NORM (FC_mul_mv_norm)
 } ggml_metal_kargs_mul_mv;
 
 typedef struct {
