@@ -31,6 +31,10 @@ const bool Q_IN_REGS       = (Flags & 32) != 0;
 // coopmat1: subgroups own Q rows, O in coopmat accumulators. K/V staged in LDS, or loaded from global memory with FLIP_DIRECT.
 const bool FLIP            = (Flags & 64) != 0;
 const bool FLIP_DIRECT     = (Flags & 128) != 0;
+// V is supplied transposed per head ([HSV][v_stride] with KV contiguous, from dequant_f16_transpose_vt), so a
+// coopmat1 P x V B-operand fragment is one contiguous 32-byte run per lane instead of 16 kv-strided halves.
+// coopmat1 only, f16 V, aligned, no shmem staging (which stages V rows from the row-major layout).
+const bool V_TRANSPOSED     = (Flags & 512) != 0;
 
 // Round up head sizes to a multiple of 16, for coopmat1/coopmat2 paths
 const uint32_t HSK_pad = (HSK + 15) & ~15;
@@ -97,6 +101,8 @@ layout (binding = 7) readonly buffer SP {int32_t data_sparse[];};
 #define NEG_FLT16_MAX -65504.0
 
 #define MASK_OPT_ALL_NEG_INF 1
+// a mask value at or below this (f16 -inf, or the lowest finite f16 some mask writers use for it) hides the key
+#define FA_MASK_DEAD (-65504.0)
 #define MASK_OPT_ALL_ZERO 2
 
 #define BINDING_IDX_K 0
