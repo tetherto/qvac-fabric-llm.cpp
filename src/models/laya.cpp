@@ -131,7 +131,9 @@ public:
         std::vector<int32_t> seq_qtype(n_seqs, -1);
         std::vector<std::vector<std::pair<llama_pos, int32_t>>> markers(n_seqs);
         for (int64_t i = 0; i < n_tokens; ++i) {
-            const llama_token tok = ubatch->token ? ubatch->token[i] : LLAMA_TOKEN_NULL;
+            // mixed ubatch: embd rows have token id 0, do not read them as tokens
+            const bool is_embd = !ubatch->token || (ubatch->is_mixed() && ubatch->type[i]);
+            const llama_token tok = is_embd ? LLAMA_TOKEN_NULL : ubatch->token[i];
 
             for (int32_t j = 0; j < ubatch->n_seq_id[i]; ++j) {
                 const int32_t s = ubatch->seq_idx[ubatch->seq_id[i][j]];
