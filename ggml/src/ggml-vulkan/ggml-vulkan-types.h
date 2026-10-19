@@ -435,6 +435,14 @@ enum FaCodePath {
     FA_COOPMAT2,
 };
 
+// vk_fa_pipeline_state::flags bits above the ones get_fa_pipeline_state derives from its arguments;
+// the shader side is flash_attn_base.glsl / flash_attn_cm1_mr.comp
+static constexpr uint32_t FA_FLAG_V_TRANSPOSED = 64;    // V is read from the per-head V^T scratch
+static constexpr uint32_t FA_FLAG_MULTI_ROW    = 128;   // host only: build the pipeline from flash_attn_cm1_mr
+static constexpr uint32_t FA_FLAG_MR_LAZY      = 256;   // multi-row: skip identity O rescales
+static constexpr uint32_t FA_FLAG_MR_NOEB      = 512;   // multi-row: no loop-end barrier
+static constexpr uint32_t FA_FLAG_MR_VPOST     = 1024;  // multi-row: V^T loads before the softmax barrier
+
 struct vk_fa_pipeline_state {
     uint32_t HSK, HSV;
     uint32_t Br, Bc;
@@ -863,6 +871,7 @@ struct vk_device_struct {
 
     vk_pipeline pipeline_dequant[GGML_TYPE_COUNT];
     vk_pipeline pipeline_dequant_transpose[GGML_TYPE_COUNT]; // fused dequant+transpose for FA quant-KV
+    vk_pipeline pipeline_dequant_f16_transpose_vt; // f16 V -> per-head V^T for the coopmat1 FA (V_TRANSPOSED)
     vk_pipeline pipeline_dequant_mul_mat_vec_f32_f32[DMMV_WG_SIZE_COUNT][GGML_TYPE_COUNT][mul_mat_vec_max_cols];
     vk_pipeline pipeline_dequant_mul_mat_vec_f16_f32[DMMV_WG_SIZE_COUNT][GGML_TYPE_COUNT][mul_mat_vec_max_cols];
     vk_pipeline pipeline_dequant_mul_mat_vec_id_f32[DMMV_WG_SIZE_COUNT][GGML_TYPE_COUNT];
@@ -1335,6 +1344,13 @@ class vk_perf_logger {
         timings[name].push_back(time);
     }
 
+    // Log a sub-node interval under a caller-supplied name. Used for work a node's handler
+    // dispatches before the op itself (e.g. the FA K/V contiguize/dequant pass), which would
+    // otherwise be billed to the op and invisible. No flops: these move bytes, not math.
+    void log_timing_named(const char *name, uint64_t time) {
+        timings[std::string(name)].push_back(time);
+    }
+
     void log_timing(const std::vector<ggml_tensor *> &nodes, const std::vector<const char *> &names, uint64_t time) {
         uint64_t total_flops = 0;
         std::string name;
@@ -1527,6 +1543,13 @@ class vk_perf_logger {
     }
 };
 
+// One memoized device-local capacity decision for a flash attention scratch, see ggml_vk_fa_scratch_fits
+struct vk_fa_scratch_gate {
+    uint64_t sz;
+    bool fits;
+    bool logged;
+};
+
 struct ggml_backend_vk_context {
     std::string name;
 
@@ -1536,6 +1559,9 @@ struct ggml_backend_vk_context {
     ggml_vk_garbage_collector gc;
     size_t prealloc_size_x, prealloc_size_y, prealloc_size_split_k, prealloc_size_add_rms_partials, prealloc_size_add_rms_partials_offset, prealloc_size_tile;
     vk_buffer prealloc_x, prealloc_y, prealloc_split_k, prealloc_add_rms_partials, prealloc_tile, sync_staging;
+    // memoized capacity decisions for the FA scratch in prealloc_x, see ggml_vk_fa_scratch_fits
+    vk_fa_scratch_gate fa_dequant_gate; // the K/V scratch alone
+    vk_fa_scratch_gate fa_vt_gate;      // K/V scratch + V^T
     vk::Fence fence, almost_ready_fence;
     bool submit_pending {};
     bool almost_ready_fence_pending {};
@@ -1623,6 +1649,9 @@ struct ggml_backend_vk_context {
     std::vector<int> query_fusion_node_count;
     std::vector<ggml_tensor *> query_nodes;
     std::vector<int> query_node_idx;
+    // non-null => this query slot closes a sub-node interval logged under this literal name,
+    // not a graph node. See ggml_vk_perf_mark_subop.
+    std::vector<const char *> query_sub_names;
     int32_t num_queries {};
     int32_t query_idx {};
 };

@@ -46,8 +46,11 @@ shared float tmpsh[row_split];
 const uint32_t qstride = HSK_pad / 4 + 2;
 shared FLOAT_TYPEV4 Qf[Br * qstride];
 
-const uint psh_stride = Br / 4 + 2;
-shared FLOAT_TYPEV4 Psh[Bc * psh_stride];
+// P is stored query-major with KV contiguous so the GEMM2 UseA load can be RowMajor:
+// RADV flips the requested layout for UseA, and only the resulting internal column-major
+// case gets an alignment hint, which is what lets the 16 element loads vectorize.
+const uint psh_stride = Bc / 4 + 2;
+shared FLOAT_TYPEV4 Psh[Br * psh_stride];
 
 // Avoid padding for hsk==256 to make it fit in 48KB shmem.
 const uint32_t sfshstride = (HSK <= 128) ? (Br / 4 + 2) : Br / 4;
@@ -500,22 +503,26 @@ void main() {
 
         // Pf staging: same packing for both f16 V (consumed by coopmat P·V below)
         // and TurboQuant V (consumed by the fused-dequant scalar P·V loop below).
-        // Each thread writes Pf for its owned (col, row_tid) group: 4 rows packed
-        // into one f16vec4 slot in Psh[col * psh_stride + tile_row(r) / 4].
+        // Each thread writes Pf for its owned (col, row_tid) group: P for (row, col) is
+        // component col % 4 of Psh[row * psh_stride + col / 4] (query-major).
         [[unroll]] for (uint32_t c = 0; c < cols_per_thread; ++c) {
             const uint col = c * cols_per_iter + col_tid;
 
             [[unroll]] for (uint32_t r = 0; r < rows_per_thread; r += 4) {
                 const uint row = tile_row(r);
+                const uint pcol_vec  = col / 4;
+                const uint pcol_comp = col % 4;
                 if (KV_bounds_check && j * Bc + col >= KV) {
-                    Psh[col * psh_stride + row / 4] = FLOAT_TYPEV4(0.0f);
+                    [[unroll]] for (uint32_t vec_idx = 0; vec_idx < 4; ++vec_idx) {
+                        Psh[(row + vec_idx) * psh_stride + pcol_vec][pcol_comp] = FLOAT_TYPE(0.0f);
+                    }
                 } else {
                     const vec4 mfvec = vec4(Mf[r], Mf[r + 1], Mf[r + 2], Mf[r + 3]);
                     const FLOAT_TYPEV4 Pf = FLOAT_TYPEV4(exp(vec4(sfsh[row / 4 + col * sfshstride]) - mfvec));
                     [[unroll]] for (uint32_t vec_idx = 0; vec_idx < 4; ++vec_idx) {
                         Lf[r + vec_idx] += Pf[vec_idx];
+                        Psh[(row + vec_idx) * psh_stride + pcol_vec][pcol_comp] = Pf[vec_idx];
                     }
-                    Psh[col * psh_stride + row / 4] = Pf;
                 }
             }
         }
@@ -543,13 +550,12 @@ void main() {
                 uint iqs   = coord % V_BLOCK_SIZE;
                 f16vec4 Vf = f16vec4(dequantize4_v(ib, iqs, v_offset));
 
-                // Psh[col * psh_stride + tile_row(r) / 4] packs Pf for 4 consecutive
-                // rows owned by this thread's row_tid into one f16vec4 lane.
+                // Psh is query-major: P for (row, c) is component c % 4 of
+                // Psh[row * psh_stride + c / 4], for the 4 consecutive rows of this row_tid.
                 [[unroll]] for (uint32_t r = 0; r < rows_per_thread; r += 4) {
                     const uint row = tile_row(r);
-                    f16vec4 Pf = Psh[c * psh_stride + row / 4];
                     [[unroll]] for (uint32_t vec_idx = 0; vec_idx < 4; ++vec_idx) {
-                        Of[r + vec_idx][d_local] += Pf[vec_idx] * Vf;
+                        Of[r + vec_idx][d_local] += Psh[(row + vec_idx) * psh_stride + c / 4][c % 4] * Vf;
                     }
                 }
             }
@@ -590,6 +596,13 @@ void main() {
         barrier();
 
         const uint num_hsv_tiles = (HSV + MatBc * row_split - 1) / (MatBc * row_split); // round up
+
+        // Psh is not written again until the next KV block, so the P fragments are the same
+        // for every hsv_tile. Load them once instead of re-reading LDS per tile.
+        coopmat<FLOAT_TYPE, gl_ScopeSubgroup, MatBc, 16, gl_MatrixUseA> PMat[Bc / MatBc];
+        [[unroll]] for (uint32_t bc_chunk = 0; bc_chunk < Bc / MatBc; ++bc_chunk) {
+            coopMatLoad(PMat[bc_chunk], Psh, bc_chunk * (MatBc / 4), psh_stride, gl_CooperativeMatrixLayoutRowMajor);
+        }
 
         // Each subgroup handles HSV/4 columns
         [[unroll]] for (uint32_t hsv_tile = 0; hsv_tile < num_hsv_tiles; ++hsv_tile) {
@@ -645,14 +658,18 @@ void main() {
 
             if (hsv_offset < HSV_pad) {
                 [[unroll]] for (uint32_t bc_chunk = 0; bc_chunk < Bc / MatBc; ++bc_chunk) {
-                    coopMatLoad(KMat, Psh, bc_chunk * MatBc * psh_stride, psh_stride, gl_CooperativeMatrixLayoutColumnMajor);
-
                     if (SHMEM_STAGING == 0) {
                     if (!USE_DECODE_V && !KV_bounds_check && !USE_SPARSE) {
                         // F16/BF16 values can be loaded directly from global memory
                         const uint v_tile_row = j * Bc + bc_chunk * MatBc;
-                        const uint v_tile_offset = v_offset / 4 + v_tile_row * v_stride / 4 + hsv_offset / 4;
-                        coopMatLoad(QMat, data_vv4, v_tile_offset, v_stride / 4, gl_CooperativeMatrixLayoutRowMajor);
+                        if (V_TRANSPOSED) {
+                            // B[k = kv][n = hd] is column-major in the V^T scratch: each lane reads 16 contiguous kv
+                            const uint vt_tile_offset = v_offset / 4 + hsv_offset * (v_stride / 4) + v_tile_row / 4;
+                            coopMatLoad(QMat, data_vv4, vt_tile_offset, v_stride / 4, gl_CooperativeMatrixLayoutColumnMajor);
+                        } else {
+                            const uint v_tile_offset = v_offset / 4 + v_tile_row * v_stride / 4 + hsv_offset / 4;
+                            coopMatLoad(QMat, data_vv4, v_tile_offset, v_stride / 4, gl_CooperativeMatrixLayoutRowMajor);
+                        }
                     } else {
                         const uint v_tile_offset = bc_chunk * MatBr * v_cols + gl_SubgroupID * (MatBc / 4);
                         coopMatLoad(QMat, kvsh, v_tile_offset, vsh_stride, gl_CooperativeMatrixLayoutRowMajor);
@@ -662,7 +679,7 @@ void main() {
                         coopMatLoad(QMat, kvsh, v_tile_offset, kvsh_stride, gl_CooperativeMatrixLayoutRowMajor);
                     }
 
-                    PVMat = coopMatMulAdd(KMat, QMat, PVMat);
+                    PVMat = coopMatMulAdd(PMat[bc_chunk], QMat, PVMat);
                 }
 
                 // Store PVMat to pvsh and load into Of
