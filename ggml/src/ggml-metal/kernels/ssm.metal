@@ -548,3 +548,79 @@ kernel void kernel_ssm_scan_ssd_mma_f32(
         threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
     }
 }
+
+// causal depthwise conv (d_conv = 4) + SiLU with a deferred conv-state commit, see ggml_gdn_conv_deferred.
+// one threadgroup per (head of head_dim channels, token, seq), one thread per channel: the conv has no
+// sequential dependency, so every token runs in parallel. the leading n_norm heads are L2-normalized with
+// a threadgroup reduction. each token stores its own conv input into the history (token 0 also the window).
+kernel void kernel_gdn_conv_deferred_f32(
+        constant ggml_metal_kargs_gdn_conv_deferred & args,
+        device const char * x,
+        device const char * w,
+        device       char * hist,
+        device const char * rec_idx,
+        device       char * dst,
+        threadgroup  float * shmem [[threadgroup(0)]],
+        uint3   tgpig[[threadgroup_position_in_grid]],
+        ushort  tiitg[[thread_index_in_threadgroup]],
+        ushort  sgitg[[simdgroup_index_in_threadgroup]],
+        ushort  tiisg[[thread_index_in_simdgroup]],
+        ushort3 ntg3[[threads_per_threadgroup]]) {
+    const int ih  = tgpig.x; // head
+    const int t   = tgpig.y; // token
+    const int is  = tgpig.z; // seq
+    const int ntg = ntg3.x;
+    const int C   = args.C;
+    const int c   = ih*ntg + tiitg;
+
+    device const int * idx = (device const int *) rec_idx + 3*is;
+    const int pending = clamp(idx[0], 0, args.K);
+
+    device const float * h_in  = (device const float *) (hist + (uint64_t) idx[1]*args.nb_h1);
+    device       float * h_out = (device       float *) (hist + (uint64_t) idx[2]*args.nb_h1);
+
+    device const char * xs = x + is*args.nb_x2 + c*sizeof(float);
+
+    // conv input column i: the window for i < 3, then the new inputs
+    float ci[4];
+    for (int j = 0; j < 4; ++j) {
+        const int i = t + j;
+        ci[j] = i < 3 ? h_in[(pending + i)*C + c] : *(device const float *) (xs + (i - 3)*args.nb_x1);
+    }
+
+    device const float * wc = (device const float *) w + 4*c;
+
+    float sumf = 0.0f;
+    sumf += ci[0]*wc[0];
+    sumf += ci[1]*wc[1];
+    sumf += ci[2]*wc[2];
+    sumf += ci[3]*wc[3];
+
+    float y = sumf/(1.0f + exp(-sumf));
+
+    if (ih < args.n_norm) {
+        const float sq = simd_sum(y*y);
+        if (tiisg == 0) {
+            shmem[sgitg] = sq;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        float tot = 0.0f;
+        for (short i = 0; i < ntg/32; ++i) {
+            tot += shmem[i];
+        }
+        y *= 1.0f/sqrt(tot + args.eps);
+    }
+
+    *(device float *) (dst + t*args.nb1 + is*args.nb2 + c*sizeof(float)) = y;
+
+    // keep the last R + 3 conv input columns, i.e. column i - (n_tokens - R) for i >= n_tokens - R
+    const int i0 = args.n_tokens - min(args.n_tokens, args.K);
+    if (t + 3 >= i0) {
+        h_out[(t + 3 - i0)*C + c] = ci[3];
+    }
+    if (t == 0) {
+        for (int i = i0; i < 3; ++i) {
+            h_out[(i - i0)*C + c] = ci[i];
+        }
+    }
+}

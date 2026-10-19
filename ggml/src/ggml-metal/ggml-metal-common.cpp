@@ -166,7 +166,9 @@ bool ggml_metal_op_mul_mat_may_use_mma(const struct ggml_tensor * op) {
 }
 
 bool ggml_metal_mul_mat_mv_may_add(const struct ggml_tensor * op) {
-    return op->src[0]->type == GGML_TYPE_PQ2_0 && op->src[1]->type == GGML_TYPE_F32 &&
+    const ggml_type type = op->src[0]->type;
+
+    return (type == GGML_TYPE_PQ2_0 || type == GGML_TYPE_Q4_0 || type == GGML_TYPE_MXFP4) && op->src[1]->type == GGML_TYPE_F32 &&
         ggml_get_op_params_i32(op, 1) != GGML_HINT_SRC0_IS_HADAMARD;
 }
 

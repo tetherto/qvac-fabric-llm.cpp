@@ -229,7 +229,11 @@ kernel void kernel_unary_mul_impl(
 #define FC_CNT FC_unary_cnt
 
     if (FC_CNT) {
-        const int i0 = tgpig.x;
+        const int i0 = tgpig.x*ntg.x + tpitg.x;
+        if (i0 >= args.ne0*args.ne1*args.ne2*args.ne3) {
+            return;
+        }
+
         const TC x = (TC) ((device const T0 *) src0)[i0];
         const TC y = (TC) ((device const T0 *) src1)[i0];
 

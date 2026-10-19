@@ -56,7 +56,7 @@
 #define N_R0_Q8_0 2
 #define N_SG_Q8_0 4
 
-#define N_R0_MXFP4 2
+#define N_R0_MXFP4 4
 #define N_SG_MXFP4 2
 
 #define N_R0_Q2_K 4
@@ -138,6 +138,7 @@
 #define FC_MUL_MV_MMA                  2300
 #define FC_TOP_K_MASK                  2400
 #define FC_GROUP_NORM                  2500
+#define FC_GATED_DELTA_NET_DEFERRED    2600
 
 // op-specific constants
 #define OP_FLASH_ATTN_EXT_NQPSG 8
@@ -414,6 +415,29 @@ typedef struct {
     float    sin_sign;
 } ggml_metal_kargs_rope;
 
+// fused RMS_NORM + MUL + ROPE (+ SET_ROWS): the rows are normalized, weighted and rotated over their full width
+typedef struct {
+    int32_t  ne00;     // row width: the norm width and the RoPE dims
+    int32_t  ne01;     // rows per token (heads)
+    int32_t  ne02;     // tokens
+    uint64_t nb01;     // src row stride
+    uint64_t nb02;     // src token stride
+    uint64_t nb1;      // dst row stride
+    uint64_t nb2;      // dst token stride
+    uint64_t nb_set;   // set_rows: dst stride per row index
+    float    eps;
+    int32_t  n_ctx_orig;
+    float    freq_base;
+    float    freq_scale;
+    float    ext_factor;
+    float    attn_factor;
+    float    beta_fast;
+    float    beta_slow;
+    bool     src2;     // RoPE frequency factors
+    bool     set_rows; // write each token to the dst row given by the indices instead of its own row
+    bool     idx_i32;  // the indices are i32, else i64
+} ggml_metal_kargs_norm_rope;
+
 typedef struct {
     int32_t  ne0;
     int32_t  ne1;
@@ -592,6 +616,7 @@ typedef struct {
     int32_t  nr0;
     int16_t  r2;
     int16_t  r3;
+    float    eps; // fused RMS_NORM (FC_mul_mv_norm)
 } ggml_metal_kargs_mul_mv;
 
 typedef struct {
@@ -1208,6 +1233,51 @@ typedef struct {
     uint64_t nb3;
     uint64_t nb_out; // 0 => snapshots are appended after the attn scores (unfused)
 } ggml_metal_kargs_gated_delta_net;
+
+typedef struct {
+    int32_t  ne01; // q heads
+    int32_t  ne11; // k heads
+    int32_t  ne21; // v heads
+    int32_t  ne22; // n_tokens
+    int32_t  ne23; // n_seqs
+    uint64_t nb01;
+    uint64_t nb02;
+    uint64_t nb03;
+    uint64_t nb11;
+    uint64_t nb12;
+    uint64_t nb13;
+    uint64_t nb21;
+    uint64_t nb22;
+    uint64_t nb23;
+    uint64_t nb31; // gate strides
+    uint64_t nb32;
+    uint64_t nb33;
+    uint64_t nb41; // beta strides
+    uint64_t nb42;
+    uint64_t nb43;
+    uint64_t nb51; // state strides
+    uint64_t nb52;
+    uint64_t nb53;
+    uint64_t nb61; // record row stride
+    int32_t  rec_v; // record offsets (floats)
+    int32_t  rec_g;
+    int32_t  rec_b;
+    int32_t  fused; // 1 => the new base is written to dst_fuse (the recurrent cache)
+    int32_t  gates; // 1 => g and beta are raw: g = softplus(g + dt) * a, beta = sigmoid(beta)
+} ggml_metal_kargs_gated_delta_net_deferred;
+
+typedef struct {
+    int32_t  C;        // channels
+    int32_t  n_tokens;
+    int32_t  K;        // history keeps K + 3 columns
+    int32_t  n_norm;   // leading heads that get L2-normalized
+    float    eps;
+    uint64_t nb_x1;
+    uint64_t nb_x2;
+    uint64_t nb1;      // dst
+    uint64_t nb2;
+    uint64_t nb_h1;    // history row stride
+} ggml_metal_kargs_gdn_conv_deferred;
 
 typedef struct {
     int32_t  ne00;

@@ -493,20 +493,43 @@ void llm_graph_input_cls::set_input(const llama_ubatch * ubatch) {
     }
 }
 
-void llm_graph_input_rs::set_input(const llama_ubatch * ubatch) {
-    GGML_UNUSED(ubatch);
-
+// fills the recurrent state copy indices of a ubatch
+static void llm_graph_set_input_rs(llm_graph_input_rs * inp, const llama_memory_recurrent_context * mctx, const llama_ubatch * ubatch) {
     const int64_t n_rs = mctx->get_n_rs();
 
-    if (s_copy) {
-        GGML_ASSERT(ggml_backend_buffer_is_host(s_copy->buffer));
-        int32_t * data = (int32_t *) s_copy->data;
+    // the deferred gdn inputs read the pending rollback, which s_copy() below consumes
+    if (inp->rec_idx) {
+        // the base-state copy indices are not part of the graph when the base states are updated in place
+        int32_t * s_copy_base = nullptr;
+        if (inp->s_copy_base->buffer) {
+            GGML_ASSERT(ggml_backend_buffer_is_host(inp->s_copy_base->buffer));
+            s_copy_base = (int32_t *) inp->s_copy_base->data;
+        }
+        GGML_ASSERT(ggml_backend_buffer_is_host(inp->rec_idx->buffer));
+        mctx->set_input_gdn_deferred(s_copy_base, (int32_t *) inp->rec_idx->data, *ubatch);
+    }
+
+    if (inp->s_copy) {
+        // with the deferred gdn commit no graph node may read s_copy, but s_copy() still has to
+        // consume the pending rollback
+        int32_t * data = nullptr;
+        if (inp->s_copy->buffer) {
+            GGML_ASSERT(ggml_backend_buffer_is_host(inp->s_copy->buffer));
+            data = (int32_t *) inp->s_copy->data;
+        }
 
         // assuming copy destinations ALWAYS happen ONLY on the cells between head and head+n
         for (uint32_t i = 0; i < n_rs; ++i) {
-            data[i] = mctx->s_copy(i);
+            const int32_t src = mctx->s_copy(i);
+            if (data) {
+                data[i] = src;
+            }
         }
     }
+}
+
+void llm_graph_input_rs::set_input(const llama_ubatch * ubatch) {
+    llm_graph_set_input_rs(this, mctx, ubatch);
 }
 
 bool llm_graph_input_rs::can_reuse(const llm_graph_params & params) {
@@ -522,6 +545,7 @@ bool llm_graph_input_rs::can_reuse(const llm_graph_params & params) {
 
     res &= head == mctx->get_head();
     res &= rs_z == mctx->get_rs_z();
+    res &= s_base_inplace == mctx->get_s_base_inplace(params.ubatch.n_seqs);
 
     return res;
 }
@@ -1214,17 +1238,7 @@ void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
     // kv_rows and the mask stay unallocated if all attention layers have their own (e.g. qwen4exp QSA)
     mctx->get_attn()->set_input_attn_mask(inp_attn->self_attn_mask, ubatch, cparams.causal_attn);
 
-    const int64_t n_rs = mctx->get_recr()->get_n_rs();
-
-    if (inp_rs->s_copy) {
-        GGML_ASSERT(ggml_backend_buffer_is_host(inp_rs->s_copy->buffer));
-        int32_t * data = (int32_t *) inp_rs->s_copy->data;
-
-        // assuming copy destinations ALWAYS happen ONLY on the cells between head and head+n
-        for (uint32_t i = 0; i < n_rs; ++i) {
-            data[i] = mctx->get_recr()->s_copy(i);
-        }
-    }
+    llm_graph_set_input_rs(inp_rs.get(), mctx->get_recr(), ubatch);
 }
 
 bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
@@ -1245,6 +1259,7 @@ bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
 
     res &= inp_rs->head == mctx->get_recr()->get_head();
     res &= inp_rs->rs_z == mctx->get_recr()->get_rs_z();
+    res &= inp_rs->s_base_inplace == mctx->get_recr()->get_s_base_inplace(params.ubatch.n_seqs);
 
     return res;
 }
@@ -1260,17 +1275,7 @@ void llm_graph_input_mem_hybrid_k::set_input(const llama_ubatch * ubatch) {
         mctx->get_attn()->set_input_attn_mask(inp_attn->self_attn_mask, ubatch, cparams.causal_attn);
     }
 
-    const int64_t n_rs = mctx->get_recr()->get_n_rs();
-
-    if (inp_rs->s_copy) {
-        GGML_ASSERT(ggml_backend_buffer_is_host(inp_rs->s_copy->buffer));
-        int32_t * data = (int32_t *) inp_rs->s_copy->data;
-
-        // assuming copy destinations ALWAYS happen ONLY on the cells between head and head+n
-        for (uint32_t i = 0; i < n_rs; ++i) {
-            data[i] = mctx->get_recr()->s_copy(i);
-        }
-    }
+    llm_graph_set_input_rs(inp_rs.get(), mctx->get_recr(), ubatch);
 }
 
 bool llm_graph_input_mem_hybrid_k::can_reuse(const llm_graph_params & params) {
@@ -1290,6 +1295,7 @@ bool llm_graph_input_mem_hybrid_k::can_reuse(const llm_graph_params & params) {
 
     res &= inp_rs->head == mctx->get_recr()->get_head();
     res &= inp_rs->rs_z == mctx->get_recr()->get_rs_z();
+    res &= inp_rs->s_base_inplace == mctx->get_recr()->get_s_base_inplace(params.ubatch.n_seqs);
 
     return res;
 }
@@ -1317,17 +1323,7 @@ void llm_graph_input_mem_hybrid_iswa::set_input(const llama_ubatch * ubatch) {
         attn_ctx->get_swa()->set_input_attn_mask(inp_attn->self_attn_mask_swa, ubatch, cparams.causal_attn);
     }
 
-    const int64_t n_rs = mctx->get_recr()->get_n_rs();
-
-    if (inp_rs->s_copy) {
-        GGML_ASSERT(ggml_backend_buffer_is_host(inp_rs->s_copy->buffer));
-        int32_t * data = (int32_t *) inp_rs->s_copy->data;
-
-        // assuming copy destinations ALWAYS happen ONLY on the cells between head and head+n
-        for (uint32_t i = 0; i < n_rs; ++i) {
-            data[i] = mctx->get_recr()->s_copy(i);
-        }
-    }
+    llm_graph_set_input_rs(inp_rs.get(), mctx->get_recr(), ubatch);
 }
 
 bool llm_graph_input_mem_hybrid_iswa::can_reuse(const llm_graph_params & params) {
@@ -1361,6 +1357,7 @@ bool llm_graph_input_mem_hybrid_iswa::can_reuse(const llm_graph_params & params)
 
     res &= inp_rs->head == mctx->get_recr()->get_head();
     res &= inp_rs->rs_z == mctx->get_recr()->get_rs_z();
+    res &= inp_rs->s_base_inplace == mctx->get_recr()->get_s_base_inplace(params.ubatch.n_seqs);
 
     return res;
 }
@@ -4101,6 +4098,19 @@ static std::unique_ptr<llm_graph_input_rs> build_rs_inp_impl(
 
     inp->s_copy_main = ggml_view_1d(ctx0, inp->s_copy, n_seqs, 0);
     inp->s_copy_tail = ggml_view_1d(ctx0, inp->s_copy, n_rs - 1, inp->s_copy->nb[0]);
+
+    if (mctx_cur->get_gdn_deferred()) {
+        inp->s_copy_base = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_rs);
+        ggml_set_input(inp->s_copy_base);
+
+        inp->s_copy_base_main  = ggml_view_1d(ctx0, inp->s_copy_base, n_seqs, 0);
+        inp->s_copy_base_extra = ggml_view_1d(ctx0, inp->s_copy_base, n_rs - n_seqs, n_seqs * inp->s_copy_base->nb[0]);
+
+        inp->rec_idx = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, 3, n_seqs);
+        ggml_set_input(inp->rec_idx);
+
+        inp->s_base_inplace = mctx_cur->get_s_base_inplace(n_seqs);
+    }
 
     inp->head = mctx_cur->get_head();
     inp->rs_z = mctx_cur->get_rs_z();
