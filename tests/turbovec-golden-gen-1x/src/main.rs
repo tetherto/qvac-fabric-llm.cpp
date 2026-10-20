@@ -198,6 +198,96 @@ fn main() {
     println!("}};");
     println!();
 
+    // Incremental sync: the file after each step, hashed with the per-file
+    // random nonce and the superblock CRC (which covers it) zeroed.
+    println!("struct Tv1xSyncCase {{ int bits; int dim; uint64_t step_hashes[6]; size_t step_lens[6]; uint64_t final_ids[{N_QUERY} * {K}]; }};");
+    println!("static const Tv1xSyncCase kTv1xSyncCases[] = {{");
+    let dir = std::env::temp_dir().join(format!("tv1x-sync-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    for bits in 2..=4usize {
+        let dim = 128usize;
+        let path = dir.join(format!("sync-q{bits}.tvim"));
+        let _ = std::fs::remove_file(&path);
+        let all = rows(SEED_DB, 160, dim);
+        let all_ids = ids(160);
+        let row_range = |a: usize, b: usize| all[a * dim..b * dim].to_vec();
+        let n_levels = 1usize << bits;
+        let masked = |path: &std::path::Path, n_calib: usize| -> (u64, usize) {
+            let mut bytes = std::fs::read(path).unwrap();
+            let sb_len = 24 + (n_levels - 1) * 4 + n_levels * 4 + 4 + n_calib * 8 + 4;
+            for b in &mut bytes[12..20] {
+                *b = 0;
+            }
+            for b in &mut bytes[sb_len - 4..sb_len] {
+                *b = 0;
+            }
+            (hash_bytes(&bytes), bytes.len())
+        };
+        let mut idx = IdMapIndex::new(dim, bits).unwrap();
+        let mut hashes = Vec::new();
+        // Step 0: first sync, a full write.
+        idx.add_with_ids(&row_range(0, 70), &all_ids[0..70]).unwrap();
+        idx.sync(&path).unwrap();
+        hashes.push(masked(&path, 0));
+        // Step 1: appends complete the tail block and add whole blocks.
+        idx.add_with_ids(&row_range(70, 120), &all_ids[70..120]).unwrap();
+        idx.sync(&path).unwrap();
+        hashes.push(masked(&path, 0));
+        // Step 2: removals inside committed blocks become redo ops.
+        for i in [5usize, 40, 100, 119] {
+            assert!(idx.remove(all_ids[i]));
+        }
+        idx.sync(&path).unwrap();
+        hashes.push(masked(&path, 0));
+        // Step 3: more removals and appends; earlier ops materialize.
+        for i in [6usize, 64, 33] {
+            assert!(idx.remove(all_ids[i]));
+        }
+        idx.add_with_ids(&row_range(120, 130), &all_ids[120..130]).unwrap();
+        idx.sync(&path).unwrap();
+        hashes.push(masked(&path, 0));
+        // Step 4: a sync with nothing changed commits a new generation.
+        idx.sync(&path).unwrap();
+        hashes.push(masked(&path, 0));
+        // Step 5: a calibrate re-encodes every row, so the next sync
+        // rewrites the file.
+        idx.calibrate(&rows(SEED_CALIB, N_CALIB, dim)).unwrap();
+        idx.sync(&path).unwrap();
+        hashes.push(masked(&path, dim));
+        let loaded = IdMapIndex::load(&path).unwrap();
+        let (_, final_ids) = loaded.search(&rows(SEED_QUERY, N_QUERY, dim), K);
+        print!("    {{ {bits}, {dim}, {{ ");
+        print!("{}", hashes.iter().map(|(h, _)| format!("UINT64_C(0x{h:016x})")).collect::<Vec<_>>().join(", "));
+        print!(" }}, {{ ");
+        print!("{}", hashes.iter().map(|(_, l)| format!("{l}")).collect::<Vec<_>>().join(", "));
+        print!(" }}, {{ ");
+        print!("{}", final_ids.iter().map(|x| format!("{x}u")).collect::<Vec<_>>().join(", "));
+        println!(" }} }},");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+    println!("}};");
+    println!();
+
+    // A snapshot after removals: rows sit in swap-remove order.
+    println!("struct Tv1xHistoryCase {{ int bits; uint64_t snapshot_hash; size_t snapshot_len; }};");
+    println!("static const Tv1xHistoryCase kTv1xHistoryCases[] = {{");
+    for bits in 2..=4usize {
+        let dim = 128usize;
+        let all = rows(SEED_DB, 80, dim);
+        let all_ids = ids(80);
+        let mut idx = IdMapIndex::new(dim, bits).unwrap();
+        idx.add_with_ids(&all[..70 * dim], &all_ids[..70]).unwrap();
+        for i in [5usize, 40, 69, 0] {
+            assert!(idx.remove(all_ids[i]));
+        }
+        idx.add_with_ids(&all[70 * dim..75 * dim], &all_ids[70..75]).unwrap();
+        assert!(idx.remove(all_ids[71]));
+        let bytes = idx.to_bytes();
+        println!("    {{ {bits}, UINT64_C(0x{:016x}), {} }},", hash_bytes(&bytes), bytes.len());
+    }
+    println!("}};");
+    println!();
+
     // One small snapshot spelled out for byte-level diagnostics. The image
     // is the superblock, two fixed-size header slots (slot 0 used prefix,
     // then zero padding; slot 1 all zero) and the block units, so only the
