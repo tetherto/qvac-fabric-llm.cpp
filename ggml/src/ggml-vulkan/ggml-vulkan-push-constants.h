@@ -836,6 +836,13 @@ struct vk_op_lstm_cell_push_constants {
     uint32_t H, N, prev_row, c_base, mask_stride;
     uint32_t gates_offset, prev_offset, mask_offset, dst_offset;
 };
+
+struct vk_op_tdt_step_push_constants {
+    uint32_t n_dur;
+    int32_t  blank_id, max_symbols, rnnt;
+    uint32_t token_offset, dur_idx_offset, state_offset, dur_table_offset, dst_offset;
+};
+
 struct vk_op_ssm_conv_back_sx_push_constants {
     uint32_t grad_nb0, grad_nb1, grad_nb2;
     uint32_t c_nb1;

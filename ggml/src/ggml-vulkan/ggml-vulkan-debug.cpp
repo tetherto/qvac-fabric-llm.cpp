@@ -1411,6 +1411,12 @@ void ggml_vk_check_results_0(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph
             tensor_clone = tensor->src[2]
                              ? ggml_lstm_cell_masked(ggml_ctx, src_clone[0], src_clone[1], src_clone[2])
                              : ggml_lstm_cell(ggml_ctx, src_clone[0], src_clone[1]);
+        } else if (tensor->op == GGML_OP_TDT_STEP) {
+            tensor_clone = ggml_tdt_step(ggml_ctx, src_clone[0], src_clone[1], src_clone[2], src_clone[3],
+                                         src_clone[4],
+                                         ggml_get_op_params_i32(tensor, 0),
+                                         ggml_get_op_params_i32(tensor, 1),
+                                         ggml_get_op_params_i32(tensor, 2));
         } else if (tensor->op == GGML_OP_SSM_CONV_BACK_SX) {
             tensor_clone = ggml_ssm_conv_back_sx(ggml_ctx, src_clone[0], src_clone[1], tensor);
         } else if (tensor->op == GGML_OP_SSM_CONV_BACK_C) {

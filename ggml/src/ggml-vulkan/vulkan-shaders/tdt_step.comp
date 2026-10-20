@@ -1,0 +1,83 @@
+#version 450
+
+#include "types.glsl"
+
+// Greedy transducer step control, mirroring ggml_tdt_step_i32 in ggml-cpu/ops.cpp.
+
+#define TDT_STEP_IN_T      0
+#define TDT_STEP_IN_S      1
+#define TDT_STEP_IN_N      2
+#define TDT_STEP_OUT_T     0
+#define TDT_STEP_OUT_S     1
+#define TDT_STEP_OUT_N     2
+#define TDT_STEP_OUT_UPD   3
+#define TDT_STEP_OUT_HOLD  4
+#define TDT_STEP_OUT_FRAME 5
+#define TDT_STEP_OUT_TOKEN 6
+#define TDT_STEP_OUT_DUR   7
+
+layout (push_constant) uniform parameter
+{
+    uint n_dur;
+    int  blank_id;
+    int  max_symbols;
+    int  rnnt;
+    uint token_offset;      // buffer misalignment, in elements
+    uint dur_idx_offset;
+    uint state_offset;
+    uint dur_table_offset;
+    uint dst_offset;
+} p;
+
+layout (binding = 0) readonly  buffer TK {int data_token[];};
+layout (binding = 1) readonly  buffer DI {int data_dur_idx[];};
+layout (binding = 2) readonly  buffer ST {int data_state[];};
+layout (binding = 3) readonly  buffer DT {int data_dur_table[];};
+layout (binding = 4) writeonly buffer D  {int data_d[];};
+
+layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+
+void main() {
+    const int t = data_state[p.state_offset + TDT_STEP_IN_T];
+    const int s = data_state[p.state_offset + TDT_STEP_IN_S];
+    const int n = data_state[p.state_offset + TDT_STEP_IN_N];
+
+    const int tok = data_token[p.token_offset];
+    const int raw = data_dur_idx[p.dur_idx_offset];
+
+    int t_next = t;
+    int s_next = s;
+    int update = 0;
+
+    if (t < n) {
+        const int di  = raw < 0 ? 0 : (raw < int(p.n_dur) ? raw : int(p.n_dur) - 1);
+        const int dur = p.rnnt != 0 ? 0 : data_dur_table[p.dur_table_offset + uint(di)];
+        const int adv = p.rnnt != 0 ? 1 : (dur > 1 ? dur : 1);
+
+        if (tok == p.blank_id) {
+            t_next = t + adv;
+            s_next = 0;
+        } else {
+            update = 1;
+            s_next = s + 1;
+            if ((p.rnnt == 0 && dur > 0) || s_next >= p.max_symbols) {
+                t_next = t + adv;
+                s_next = 0;
+            }
+        }
+    }
+
+    int frame = t_next > n - 1 ? n - 1 : t_next;
+    if (frame < 0) {
+        frame = 0;
+    }
+
+    data_d[p.dst_offset + TDT_STEP_OUT_T]     = t_next;
+    data_d[p.dst_offset + TDT_STEP_OUT_S]     = s_next;
+    data_d[p.dst_offset + TDT_STEP_OUT_N]     = n;
+    data_d[p.dst_offset + TDT_STEP_OUT_UPD]   = update;
+    data_d[p.dst_offset + TDT_STEP_OUT_HOLD]  = 1 - update;
+    data_d[p.dst_offset + TDT_STEP_OUT_FRAME] = frame;
+    data_d[p.dst_offset + TDT_STEP_OUT_TOKEN] = tok;
+    data_d[p.dst_offset + TDT_STEP_OUT_DUR]   = raw;
+}
