@@ -843,10 +843,19 @@ kernel void kernel_conv_1d_dw_direct_norm_channel_f32(
         }
     }
 
+    // Shifted two-pass over the register-resident values: sums run over
+    // value - pivot so a large shared offset does not swallow the channel variation.
+    if (tpitg.x == 0) {
+        shared[0] = vals[0];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float pivot = shared[0];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
     float my_sum = 0.0f;
     for (int i = 0; i < GGML_METAL_DW_LN_MAX_PER_THREAD; ++i) {
         const int c = (int) tpitg.x + i * (int) ntg.x;
-        if (c < C) my_sum += vals[i];
+        if (c < C) my_sum += vals[i] - pivot;
     }
     my_sum = simd_sum(my_sum);
     if (tiisg == 0) {
@@ -860,13 +869,14 @@ kernel void kernel_conv_1d_dw_direct_norm_channel_f32(
         if (tiisg == 0) shared[0] = total;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    const float mean = shared[0] / (float) C;
+    const float delta = shared[0] / (float) C;
+    const float mean = pivot + delta;
 
     float my_sq = 0.0f;
     for (int i = 0; i < GGML_METAL_DW_LN_MAX_PER_THREAD; ++i) {
         const int c = (int) tpitg.x + i * (int) ntg.x;
         if (c < C) {
-            const float d = vals[i] - mean;
+            const float d = (vals[i] - pivot) - delta;
             my_sq = fma(d, d, my_sq);
         }
     }
