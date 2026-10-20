@@ -436,63 +436,146 @@ int snapshot_write_v1_preflight(size_t n, size_t dim) {
     return GGML_VEC_INDEX_OK;
 }
 
-// Removes temp siblings of `path` that a killed writer left behind: names
-// of the form `<base>.tmp.<suffix>` with this file's suffix shapes, older
-// than an hour (upstream turbovec sweep_stale_tmps). Runs once per
-// destination per process; failures are ignored.
-static void sweep_stale_temp_files(const char * path) {
+// The part after `<base>.tmp.` of a temp name this file or upstream
+// turbovec writes: six alphanumerics (POSIX mkstemp), `pid.tid.sequence`
+// (Windows), or upstream's `pid.seq` and `pid.seq.hex8`.
+static bool is_temp_suffix(const std::string & suffix) {
+    if (suffix.size() == 6 &&
+        std::all_of(suffix.begin(), suffix.end(), [](char c) { return std::isalnum(static_cast<unsigned char>(c)) != 0; })) {
+        return true;
+    }
+    auto digits = [](const std::string & part) {
+        return !part.empty() && std::all_of(part.begin(), part.end(), [](char c) { return c >= '0' && c <= '9'; });
+    };
+    std::vector<std::string> parts;
+    size_t from = 0;
+    for (size_t dot = suffix.find('.'); ; dot = suffix.find('.', from)) {
+        parts.push_back(suffix.substr(from, dot == std::string::npos ? std::string::npos : dot - from));
+        if (dot == std::string::npos || parts.size() > 3) {
+            break;
+        }
+        from = dot + 1;
+    }
+    if (parts.size() < 2 || parts.size() > 3 || !digits(parts[0]) || !digits(parts[1])) {
+        return false;
+    }
+    if (parts.size() == 2) {
+        return true;
+    }
+    const std::string & last = parts[2];
+    return digits(last) ||
+        (last.size() == 8 &&
+         std::all_of(last.begin(), last.end(), [](char c) { return std::isxdigit(static_cast<unsigned char>(c)) != 0; }));
+}
+
+// The basename a writer uses for `base`'s temp with this suffix: the whole
+// name, or for a long one the cut that keeps the temp within 255 bytes
+// (at a UTF-8 character boundary, as upstream and the POSIX writer cut).
+static std::string temp_stem_for(const std::string & base, size_t suffix_len) {
+    constexpr size_t kNameMax = 255;
+    const size_t tail = std::strlen(".tmp.") + suffix_len;
+    if (base.size() + tail <= kNameMax || tail >= kNameMax) {
+        return base;
+    }
+    size_t cut = kNameMax - tail;
+    while (cut > 0 && (static_cast<unsigned char>(base[cut]) & 0xc0) == 0x80) {
+        --cut;
+    }
+    return base.substr(0, cut);
+}
+
+#ifdef _WIN32
+// The Windows writer cuts in UTF-16 code units instead.
+static std::wstring temp_stem_for_wide(const std::wstring & base, size_t suffix_len) {
+    constexpr size_t kNameMax = 255;
+    const size_t tail = std::wcslen(L".tmp.") + suffix_len;
+    if (base.size() + tail <= kNameMax || tail >= kNameMax) {
+        return base;
+    }
+    std::wstring stem = base.substr(0, kNameMax - tail);
+    if (!stem.empty() && stem.back() >= 0xd800 && stem.back() <= 0xdbff) {
+        stem.pop_back();
+    }
+    return stem;
+}
+#endif
+
+// Removes temp siblings of `path` that a killed writer left behind, older
+// than an hour (upstream turbovec sweep_stale_tmps): `<stem>.tmp.<suffix>`
+// with a temp suffix, where the stem is the destination's basename or the
+// exact cut a writer makes of it. A cut stem is skipped when a file of that
+// name exists, since the temp may then be that file's in-flight write. Runs
+// once per destination per process (every time past 4096 destinations);
+// failures are ignored and never fail the write.
+static void sweep_stale_temp_files(const char * path) try {
     static std::mutex mutex;
     static std::unordered_set<std::string> swept;
-    {
-        std::lock_guard<std::mutex> lock(mutex);
-        if (!swept.insert(path).second) {
-            return;
-        }
-    }
     std::filesystem::path destination;
     if (!filesystem_path_from_utf8(path, destination)) {
         return;
     }
-    const std::string base = destination.filename().string();
+    const std::filesystem::path base_path = destination.filename();
+    const std::string base = base_path.u8string();
+    // A destination that is itself a temp name has no leaked siblings.
+    const size_t own_at = base.rfind(".tmp.");
+    if (own_at != std::string::npos && is_temp_suffix(base.substr(own_at + 5))) {
+        return;
+    }
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        if (swept.size() < 4096 && !swept.insert(path).second) {
+            return;
+        }
+    }
     std::filesystem::path parent = destination.parent_path();
     if (parent.empty()) {
         parent = ".";
     }
-    auto our_suffix = [](const std::string & suffix) {
-        // POSIX mkstemp: six alphanumerics. Windows: pid.tid.sequence.
-        if (suffix.size() == 6 &&
-            std::all_of(suffix.begin(), suffix.end(), [](char c) { return std::isalnum(static_cast<unsigned char>(c)) != 0; })) {
-            return true;
-        }
-        int dots = 0;
-        for (char c : suffix) {
-            if (c == '.') {
-                ++dots;
-            } else if (c < '0' || c > '9') {
-                return false;
-            }
-        }
-        return dots == 2;
-    };
     std::error_code ec;
     const auto now = std::filesystem::file_time_type::clock::now();
-    for (const auto & entry : std::filesystem::directory_iterator(parent, ec)) {
-        const std::string name = entry.path().filename().string();
-        const size_t at = name.rfind(".tmp.");
-        if (at == std::string::npos || !our_suffix(name.substr(at + 5))) {
+    for (std::filesystem::directory_iterator it(parent, ec), end; !ec && it != end; it.increment(ec)) {
+        const std::filesystem::path entry = it->path();
+        std::string name;
+        try {
+            name = entry.filename().u8string();
+        } catch (...) {
             continue;
         }
-        // A long destination's temp carries a cut base: a prefix of it.
+        const size_t at = name.rfind(".tmp.");
+        if (at == std::string::npos) {
+            continue;
+        }
+        const std::string suffix = name.substr(at + 5);
+        if (!is_temp_suffix(suffix)) {
+            continue;
+        }
         const std::string stem = name.substr(0, at);
-        if (stem.empty() || base.compare(0, stem.size(), stem) != 0) {
+        bool ours = stem == base;
+        if (!ours && !stem.empty()) {
+            bool cut = stem == temp_stem_for(base, suffix.size());
+#ifdef _WIN32
+            const std::wstring wide_name = entry.filename().wstring();
+            const size_t wide_at = wide_name.rfind(L".tmp.");
+            cut = cut ||
+                (wide_at != std::wstring::npos &&
+                 wide_name.substr(0, wide_at) == temp_stem_for_wide(base_path.wstring(), wide_name.size() - wide_at - 5));
+#endif
+            std::error_code exists_ec;
+            ours = cut && !std::filesystem::exists(entry.parent_path() / std::filesystem::u8path(stem), exists_ec) && !exists_ec;
+        }
+        if (!ours) {
             continue;
         }
         std::error_code entry_ec;
-        const auto modified = std::filesystem::last_write_time(entry.path(), entry_ec);
+        if (!std::filesystem::is_regular_file(entry, entry_ec) || entry_ec) {
+            continue;
+        }
+        const auto modified = std::filesystem::last_write_time(entry, entry_ec);
         if (!entry_ec && now - modified > std::chrono::hours(1)) {
-            std::filesystem::remove(entry.path(), entry_ec);
+            std::filesystem::remove(entry, entry_ec);
         }
     }
+} catch (...) {
 }
 
 struct TempFile {
@@ -780,15 +863,15 @@ static bool rename_overwrite(const TempFile & temp, const char * dst) {
     if (!utf8_to_wide(dst, destination)) {
         return false;
     }
-    // A reader or scanner holding the destination open makes the replace
-    // fail transiently with access-denied or sharing-violation; retry with
-    // backoff, as upstream turbovec's rename_atomic does (#415).
+    // One replacing rename, as upstream turbovec's rename_atomic does:
+    // ReplaceFileW has failure modes that leave the destination missing.
+    // A reader or scanner holding the destination open makes it fail
+    // transiently with access-denied or sharing-violation; retry with
+    // backoff (#415).
     DWORD delay_ms = 1;
     for (int attempt = 0;; ++attempt) {
-        const bool ok = GetFileAttributesW(destination.c_str()) != INVALID_FILE_ATTRIBUTES ?
-            ReplaceFileW(destination.c_str(), temp.path.c_str(), nullptr, REPLACEFILE_WRITE_THROUGH, nullptr,
-                         nullptr) != 0 :
-            MoveFileExW(temp.path.c_str(), destination.c_str(), MOVEFILE_WRITE_THROUGH) != 0;
+        const bool ok = MoveFileExW(temp.path.c_str(), destination.c_str(),
+                                    MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0;
         if (ok) {
             return true;
         }
@@ -1127,10 +1210,18 @@ void rebuild_state_hash(ggml_vec_index & idx) {
     idx.state_hash_xor = 0;
     idx.state_hash_sum = 0;
     idx.state_hash_sum_rot = 0;
+    std::vector<uint8_t> rows;
     if (turbovec_rows_in_blocked(idx)) {
+        try {
+            rows.resize(32 * turbovec_row_bytes(idx.turbovec_bits, static_cast<size_t>(idx.dim)));
+        } catch (const std::bad_alloc &) {
+            // Callers rebuild after committing a change, so this must not
+            // fail: fall back to reading row by row.
+        }
+    }
+    if (!rows.empty()) {
         // Rows come out of the blocked cache a block at a time.
         const size_t row_bytes = turbovec_row_bytes(idx.turbovec_bits, static_cast<size_t>(idx.dim));
-        std::vector<uint8_t> rows(32 * row_bytes);
         for (size_t first = 0; first < idx.slot_to_id.size(); first += 32) {
             turbovec_block_rows_packed(idx, first / 32, rows.data());
             for (size_t slot = first; slot < std::min(first + 32, idx.slot_to_id.size()); ++slot) {

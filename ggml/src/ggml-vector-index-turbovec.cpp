@@ -2070,6 +2070,12 @@ void turbovec_blocked_truncate(ggml_vec_index & idx, size_t n) {
     const size_t n_blocks = (n + lane_size - 1) / lane_size;
     std::vector<uint8_t> & blocked = idx.turbovec_blocked_data;
     if (blocked.size() < n_blocks * block_bytes) {
+        // The cache does not cover these rows; with packed rows it is
+        // rebuilt on the next add.
+        if (idx.turbovec_packed_rows) {
+            blocked.clear();
+            idx.turbovec_blocked_n_blocks = 0;
+        }
         return;
     }
     blocked.resize(n_blocks * block_bytes);
@@ -2175,10 +2181,13 @@ void repack_turbovec_codes(
     const size_t dim_sz = static_cast<size_t>(dim);
     const size_t codes_per_byte = static_cast<size_t>(8 / bits);
     const size_t n_byte_groups = dim_sz / codes_per_byte;
-    n_blocks = (n_vectors + kTurboVecScoreBlock - 1) / kTurboVecScoreBlock;
+    // n_blocks changes only once the cache is resized, so a failed
+    // allocation leaves the old cache and its block count in step.
+    const size_t new_blocks = (n_vectors + kTurboVecScoreBlock - 1) / kTurboVecScoreBlock;
     blocked_codes.assign(
-        n_blocks * n_byte_groups * static_cast<size_t>(kTurboVecScoreBlock),
+        new_blocks * n_byte_groups * static_cast<size_t>(kTurboVecScoreBlock),
         0);
+    n_blocks = new_blocks;
 
     for (size_t block = 0; block < n_blocks; ++block) {
         repack_turbovec_code_block(packed_codes, n_vectors, bits, dim, block, blocked_codes, vector_major);
@@ -2197,9 +2206,13 @@ void repack_turbovec_codes_from_slot(
     const size_t dim_sz = static_cast<size_t>(dim);
     const size_t codes_per_byte = static_cast<size_t>(8 / bits);
     const size_t n_byte_groups = dim_sz / codes_per_byte;
+    // Patching from first_slot needs a cache that covers exactly the rows
+    // before it; anything else (an invalidated, empty cache included) is
+    // rebuilt in full.
+    const size_t old_blocks = (first_slot + kTurboVecScoreBlock - 1) / kTurboVecScoreBlock;
     const size_t old_expected_size =
-        n_blocks * n_byte_groups * static_cast<size_t>(kTurboVecScoreBlock);
-    if (first_slot == 0 || first_slot > n_vectors ||
+        old_blocks * n_byte_groups * static_cast<size_t>(kTurboVecScoreBlock);
+    if (first_slot == 0 || first_slot > n_vectors || n_blocks != old_blocks ||
         blocked_codes.size() != old_expected_size) {
         repack_turbovec_codes(packed_codes, n_vectors, bits, dim, blocked_codes, n_blocks, vector_major);
         return;

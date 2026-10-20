@@ -229,19 +229,36 @@ void turbovec_planes_refresh(ggml_vec_index & idx, size_t first_slot) {
     const size_t n = idx.slot_to_id.size();
     std::lock_guard<std::mutex> lock(idx.turbovec_planes_mutex);
     if (!idx.turbovec_planes) {
-        if (!turbovec_planes_wanted(idx.turbovec_bits, idx.dim, n)) {
+        // An index with staged search switched off never needs the planes.
+        if (!idx.turbovec_staged_enabled || !turbovec_planes_wanted(idx.turbovec_bits, idx.dim, n)) {
             return;
         }
         // Promotion: the statistics are fitted afresh from the new cache,
         // and the staged search reads the bit planes from packed rows.
-        turbovec_materialize_packed_rows(idx);
+        try {
+            turbovec_materialize_packed_rows(idx);
+        } catch (const std::bad_alloc &) {
+            // Not promoted yet; the next add tries again.
+            return;
+        }
         idx.turbovec_planes = true;
         idx.turbovec_stats_ready = false;
         idx.turbovec_sign_blocked.clear();
         first_slot = 0;
     }
-    repack_turbovec_sign_codes(
-        idx.turbovec_data.data(), n, idx.turbovec_bits, idx.dim, first_slot, idx.turbovec_sign_blocked);
+    try {
+        repack_turbovec_sign_codes(
+            idx.turbovec_data.data(), n, idx.turbovec_bits, idx.dim, first_slot, idx.turbovec_sign_blocked);
+    } catch (const std::bad_alloc &) {
+        // Without memory for the sign planes the index drops back to full
+        // scans, so a mutation never fails after its rows are committed;
+        // the next add promotes it again.
+        idx.turbovec_planes = false;
+        idx.turbovec_stats_ready = false;
+        std::vector<uint8_t>().swap(idx.turbovec_sign_blocked);
+        std::vector<float>().swap(idx.turbovec_centre);
+        turbovec_settle_rows(idx);
+    }
     idx.turbovec_centre_ready = false;
 }
 
@@ -480,8 +497,13 @@ bool turbovec_staged_search(
     const std::vector<float> * centre = nullptr;
     {
         std::lock_guard<std::mutex> lock(idx.turbovec_planes_mutex);
-        if (!idx.turbovec_planes ||
-            idx.turbovec_sign_blocked.size() != ((n + kBlock - 1) / kBlock) * nsg * kBlock) {
+        // The exact rescore reads the blocked cache; without a valid one
+        // the caller's full scan (and its per-row fallback) answers.
+        const size_t n_blocks = (n + kBlock - 1) / kBlock;
+        const size_t n_byte_groups = static_cast<size_t>(dim) / static_cast<size_t>(8 / bits);
+        if (!idx.turbovec_planes || idx.turbovec_sign_blocked.size() != n_blocks * nsg * kBlock ||
+            idx.turbovec_blocked_n_blocks != n_blocks ||
+            idx.turbovec_blocked_data.size() != n_blocks * n_byte_groups * kBlock) {
             return false;
         }
         if (!idx.turbovec_stats_ready) {
@@ -665,7 +687,7 @@ bool turbovec_staged_search(
                 idx, exact_lut.data(), exact_scale, exact_bias, permute_dot ? &pd : nullptr, block, block_scores);
             scored_block = block;
         }
-        update_topk_heap(heap, k, { block_scores[c.slot % kBlock], idx.slot_to_id[c.slot] });
+        update_topk_heap(heap, k, { block_scores[c.slot % kBlock], topk_key(idx, c.slot) });
     }
     return true;
 }
