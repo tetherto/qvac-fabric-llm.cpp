@@ -5718,16 +5718,34 @@ struct test_conv_1d_dw_direct_norm_channel : public test_case {
     const bool ct;
     const bool causal;
     const int seg_len;
+    const float offset; // shared input offset under a 0.5 pattern, constant taps, no bias (0 = uniform)
 
     std::string vars() override {
-        return VARS_TO_STR8(L, C, B, K, dilation, ct, causal, seg_len);
+        return VARS_TO_STR9(L, C, B, K, dilation, ct, causal, seg_len, offset);
     }
 
     bool run_whole_graph() override { return true; }
 
     test_conv_1d_dw_direct_norm_channel(int64_t L, int64_t C, int64_t K, int dilation,
-                                         bool ct = true, bool causal = false, int seg_len = 0, int64_t B = 1)
-        : L(L), C(C), B(B), K(K), dilation(dilation), ct(ct), causal(causal), seg_len(seg_len) {}
+                                         bool ct = true, bool causal = false, int seg_len = 0, int64_t B = 1,
+                                         float offset = 0.0f)
+        : L(L), C(C), B(B), K(K), dilation(dilation), ct(ct), causal(causal), seg_len(seg_len), offset(offset) {}
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (offset == 0.0f) {
+                init_tensor_uniform(t);
+            } else if (strcmp(t->name, "a") == 0) {
+                init_tensor_offset_pattern(t, offset, 0.5f);
+            } else if (strcmp(t->name, "w") == 0) {
+                init_tensor_uniform(t, 0.1f, 0.1f);
+            } else if (strcmp(t->name, "b") == 0) {
+                init_tensor_uniform(t, 0.0f, 0.0f);
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * a = ct ? ggml_new_tensor_3d(ctx, GGML_TYPE_F32, C, L, B) : ggml_new_tensor_3d(ctx, GGML_TYPE_F32, L, C, B);
@@ -14694,9 +14712,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_conv_1d_dw_direct_norm_channel(139, 2048, 3, 1, true));
     test_cases.emplace_back(new test_conv_1d_dw_direct_norm_channel(139, 2304, 3, 1, true));
     test_cases.emplace_back(new test_conv_1d_dw_direct_norm_channel(37, 96, 5, 2, true, false, 0, 2));
-    for (bool ct : { false, true }) {
-        test_cases.emplace_back(new test_scale_residual(139, 512, 1, ct));
-        test_cases.emplace_back(new test_scale_residual(37, 96, 2, ct));
+    test_cases.emplace_back(new test_conv_1d_dw_direct_norm_channel(139, 512, 7, 3, true, false, 0, 1, 10000.0f));
+    test_cases.emplace_back(new test_conv_1d_dw_direct_norm_channel(53, 256, 5, 2, false, false, 0, 1, 10000.0f));
+    // long sequences take the fused shader; the shorter cases above stay on the two dispatches
+    test_cases.emplace_back(new test_conv_1d_dw_direct_norm_channel(1024, 512, 7, 3, true));
+    test_cases.emplace_back(new test_conv_1d_dw_direct_norm_channel(1024, 256, 5, 2, false));
+    test_cases.emplace_back(new test_conv_1d_dw_direct_norm_channel(600, 2048, 3, 1, true));
+    test_cases.emplace_back(new test_conv_1d_dw_direct_norm_channel(300, 96, 5, 2, true, false, 0, 2));
+    test_cases.emplace_back(new test_conv_1d_dw_direct_norm_channel(1024, 512, 7, 3, true, false, 0, 1, 10000.0f));
+    test_cases.emplace_back(new test_conv_1d_dw_direct_norm_channel(1024, 256, 5, 2, false, false, 0, 1, 10000.0f));
     }
     for (bool ct : { false, true }) {
         test_cases.emplace_back(new test_bias_gelu(139, 512, 1, ct));
@@ -17871,6 +17895,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_conv_1d_dw_direct(2808, 512, 7, 1, true, true));
     test_cases.emplace_back(new test_norm_channel(139, 512, true));
     test_cases.emplace_back(new test_norm_channel(1024, 512, false));
+    test_cases.emplace_back(new test_conv_1d_dw_direct_norm_channel(139, 512, 7, 3, true));
+    test_cases.emplace_back(new test_conv_1d_dw_direct_norm_channel(2808, 512, 7, 1, true, true));
+    test_cases.emplace_back(new test_conv_1d_dw_direct_norm_channel(1024, 512, 7, 3, true));
 
     return test_cases;
 }

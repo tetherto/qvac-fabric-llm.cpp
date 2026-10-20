@@ -799,6 +799,11 @@ struct vk_op_conv_1d_dw_direct_push_constants {
     uint32_t ne, L, C, B, K, dilation, layout, causal, seg_len, has_bias;
 };
 
+struct vk_op_conv_1d_dw_direct_norm_channel_push_constants {
+    uint32_t L, C, B, K, dilation, layout, causal, seg_len, has_bias;
+    float eps;
+};
+
 struct vk_op_norm_channel_push_constants {
     uint32_t L, C, B, layout;
     float eps;
