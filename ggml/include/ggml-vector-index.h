@@ -92,34 +92,23 @@ GGML_VEC_INDEX_API const char * ggml_vec_index_error_to_string(int error);
 // per vector. `bit_width=32` stores full f32 vectors. Returns NULL on bad args.
 GGML_VEC_INDEX_API ggml_vec_index_t * ggml_vec_index_create(int dim, int bit_width);
 
-// Creates a TurboQuant q2 vector index. This is distinct from the generic
-// q4/q8 modes created by `ggml_vec_index_create`: vectors are normalized,
-// rotated, quantized with Lloyd-Max q2 codebooks, and searched against rotated
-// queries. This implementation requires a 64-bit target,
-// `0 < dim <= 1024 && dim % 8 == 0`, and supports add/search/filter/IVF plus
-// regular snapshot write/load. TurboVec materializes a dense `dim x dim`
-// rotation matrix on first use. Snapshots from earlier releases with larger
-// dimensions can be loaded and rewritten, but add/search/IVF are unsupported.
-// `ggml_vec_index_prepare` is best-effort and does not report allocation status.
-// mmap loading and logged mutations are reserved for later format work.
-GGML_VEC_INDEX_API ggml_vec_index_t * ggml_vec_index_create_turbovec_q2(int dim);
-
-// Creates a TurboQuant q4 vector index. This is distinct from the generic
-// `bit_width=4` mode created by `ggml_vec_index_create`: vectors are normalized,
-// rotated, quantized with Lloyd-Max q4 codebooks, and searched against rotated
-// queries. This implementation requires a 64-bit target,
-// `0 < dim <= 1024 && dim % 8 == 0`, and supports add/search/filter/IVF plus
-// regular snapshot write/load. TurboVec materializes a dense `dim x dim`
-// rotation matrix on first use. Snapshots from earlier releases with larger
-// dimensions can be loaded and rewritten, but add/search/IVF are unsupported.
-// `ggml_vec_index_prepare` is best-effort and does not report allocation status.
-// mmap loading and logged mutations are reserved for later format work.
-GGML_VEC_INDEX_API ggml_vec_index_t * ggml_vec_index_create_turbovec_q4(int dim);
-
-// Creates a TurboQuant index with `bit_width` 2, 3 or 4 (the encoding of
-// upstream turbovec 1.1.2). Requires a 64-bit target and
-// `0 < dim <= 16384 && dim % 8 == 0`. Returns NULL on bad args.
+// Creates a TurboQuant index with `bit_width` 2, 3 or 4: a port of upstream
+// turbovec 1.1.2 that encodes, snapshots and syncs byte for byte as turbovec
+// does. Vectors and queries are rotated with turbovec's deterministic
+// block-Hadamard transform, quantized with Lloyd-Max codebooks (optionally
+// under a TQ+ calibration, see `ggml_vec_index_turbovec_calibrate`), and
+// searched against the rotated query without decoding. Requires a 64-bit
+// target and `0 < dim <= 16384 && dim % 8 == 0`. Supports add, search,
+// filtered search, IVF, snapshots, in-memory snapshots and incremental sync;
+// mmap loading and delta logs are not supported. `ggml_vec_index_prepare` is
+// best-effort and does not report allocation status. Returns NULL on bad args.
 GGML_VEC_INDEX_API ggml_vec_index_t * ggml_vec_index_create_turbovec(int dim, int bit_width);
+
+// Shorthands for `ggml_vec_index_create_turbovec(dim, 2)` and `(dim, 4)`. The
+// TurboVec q4 mode is distinct from the generic `bit_width=4` mode created by
+// `ggml_vec_index_create`.
+GGML_VEC_INDEX_API ggml_vec_index_t * ggml_vec_index_create_turbovec_q2(int dim);
+GGML_VEC_INDEX_API ggml_vec_index_t * ggml_vec_index_create_turbovec_q4(int dim);
 
 // Fits the TurboVec TQ+ per-coordinate calibration from `n` sample vectors
 // (row-major, `dim` floats each) and commits it. Every later add is encoded
