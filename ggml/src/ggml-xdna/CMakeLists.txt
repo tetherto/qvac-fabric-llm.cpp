@@ -22,6 +22,12 @@ ggml_add_backend_library(ggml-xdna
                         )
 
 target_link_libraries(ggml-xdna PRIVATE XRT::xrt_coreutil)
+# the CPU backend the host ops inside an NPU chunk run on (ggml-xdna.cpp)
+if (GGML_BACKEND_DL)
+    target_link_libraries(ggml-xdna PRIVATE ggml-cpu-xdna)
+else()
+    target_link_libraries(ggml-xdna PRIVATE ggml-cpu)
+endif()
 # dladdr: the kernel artifacts are looked for next to the backend module
 target_link_libraries(ggml-xdna PRIVATE ${CMAKE_DL_LIBS})
 

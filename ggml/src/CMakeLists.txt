@@ -399,6 +399,16 @@ if (GGML_VECTOR_INDEX)
 endif()
 
 function(ggml_add_backend_library backend)
+    if (GGML_BACKEND_EMBEDDED)
+        # static copy linked into another backend module: not loadable, not installed, not exported
+        add_library(${backend} STATIC ${ARGN})
+        set_target_properties(${backend} PROPERTIES POSITION_INDEPENDENT_CODE ON)
+        target_compile_definitions(${backend} PRIVATE GGML_BACKEND_EMBEDDED)
+        target_link_libraries(${backend} PRIVATE ggml-base)
+        target_include_directories(${backend} PRIVATE ..)
+        return()
+    endif()
+
     if (GGML_BACKEND_DL)
         add_library(${backend} MODULE ${ARGN})
         # write the shared library to the output directory
@@ -627,6 +637,16 @@ if (GGML_CPU_ALL_VARIANTS)
     endif()
 elseif (GGML_CPU)
     ggml_add_cpu_backend_variant_impl("")
+endif()
+
+# ggml-xdna runs host ops on a CPU backend; a DL module cannot link the CPU modules, so it gets its own copy (every XDNA host has zen4 features)
+if (GGML_XDNA AND GGML_BACKEND_DL)
+    if (NOT GGML_SYSTEM_ARCH STREQUAL "x86")
+        message(FATAL_ERROR "ggml-xdna is x86-only")
+    endif()
+    set(GGML_BACKEND_EMBEDDED ON)
+    ggml_add_cpu_backend_variant(xdna SSE42 AVX F16C FMA AVX2 BMI2 AVX512 AVX512_VBMI AVX512_VNNI AVX512_BF16)
+    unset(GGML_BACKEND_EMBEDDED)
 endif()
 
 ggml_add_backend(BLAS)

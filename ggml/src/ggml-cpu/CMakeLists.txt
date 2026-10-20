@@ -402,7 +402,7 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
             endif()
         endif()
 
-        if (GGML_BACKEND_DL)
+        if (GGML_BACKEND_DL AND NOT GGML_BACKEND_EMBEDDED)
             if (GGML_NATIVE)
                 # the feature check relies on ARCH_DEFINITIONS, but it is not set with GGML_NATIVE
                 message(FATAL_ERROR "GGML_NATIVE is not compatible with GGML_BACKEND_DL, consider using GGML_CPU_ALL_VARIANTS")
