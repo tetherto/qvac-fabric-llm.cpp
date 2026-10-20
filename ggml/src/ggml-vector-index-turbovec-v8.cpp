@@ -348,13 +348,8 @@ void build_image(const Source & src, uint64_t nonce, TurboVecV8Image & image) {
 // The rows in upstream order: the order an upstream index with the same
 // add/remove history holds them in. Falls back to slot order if the
 // tracked order was lost.
-static std::vector<size_t> upstream_rows(const ggml_vec_index & idx) {
-    const TurboVecSyncBinding & b = idx.turbovec_sync;
-    return b.file_rows.size() == active_count(idx) ? b.file_rows : live_slots(idx);
-}
-
 void turbovec_v8_build_image(const ggml_vec_index & idx, TurboVecV8Image & image) {
-    const std::vector<size_t> rows = upstream_rows(idx);
+    const std::vector<size_t> rows = live_slots(idx);
     build_image(Source(idx, rows), 0, image);
 }
 
@@ -852,23 +847,6 @@ void turbovec_sync_unbind(ggml_vec_index & idx) noexcept {
     b.fresh.clear();
 }
 
-// Rebuilds the row order as slot order when tracking failed; files stay
-// valid, they just stop matching upstream's row order.
-static void reset_rows(ggml_vec_index & idx) noexcept {
-    TurboVecSyncBinding & b = idx.turbovec_sync;
-    turbovec_sync_unbind(idx);
-    try {
-        b.file_rows = live_slots(idx);
-        b.slot_rows.assign(idx.slot_to_id.size(), SIZE_MAX);
-        for (size_t r = 0; r < b.file_rows.size(); ++r) {
-            b.slot_rows[b.file_rows[r]] = r;
-        }
-    } catch (...) {
-        b.file_rows.clear();
-        b.slot_rows.clear();
-    }
-}
-
 namespace {
 
 void bind_rows(
@@ -876,19 +854,13 @@ void bind_rows(
         const char * path,
         uint64_t gen,
         uint64_t nonce,
-        std::vector<size_t> rows,
         const std::vector<size_t> & pending) {
     TurboVecSyncBinding & b = idx.turbovec_sync;
-    b.slot_rows.assign(idx.slot_to_id.size(), SIZE_MAX);
-    for (size_t r = 0; r < rows.size(); ++r) {
-        b.slot_rows[rows[r]] = r;
-    }
-    b.file_rows = std::move(rows);
     b.pending = std::unordered_set<size_t>(pending.begin(), pending.end());
     b.fresh.clear();
     b.path = path;
     b.gen = gen;
-    b.n_synced = b.file_rows.size();
+    b.n_synced = idx.slot_to_id.size();
     b.nonce = nonce;
     b.calib_gen = idx.turbovec_calib_gen;
     b.bound = true;
@@ -1161,97 +1133,33 @@ bool plan_incremental(
 }  // namespace
 
 void turbovec_sync_bind_loaded(ggml_vec_index & idx, const char * path, const TurboVecV8LoadInfo & info) {
-    std::vector<size_t> rows(idx.slot_to_id.size());
-    for (size_t r = 0; r < rows.size(); ++r) {
-        rows[r] = r;
-    }
     // An unclaimed snapshot loads unbound, so the first sync claims it.
     if (info.nonce == 0 || path == nullptr) {
-        reset_rows(idx);
+        turbovec_sync_unbind(idx);
         return;
     }
-    bind_rows(idx, path, info.gen, info.nonce, std::move(rows), info.pending);
-}
-
-void turbovec_sync_note_add(ggml_vec_index & idx, size_t base_slot, size_t n) noexcept {
-    TurboVecSyncBinding & b = idx.turbovec_sync;
-    try {
-        b.slot_rows.resize(base_slot + n, SIZE_MAX);
-        for (size_t slot = base_slot; slot < base_slot + n; ++slot) {
-            b.slot_rows[slot] = b.file_rows.size();
-            b.file_rows.push_back(slot);
-        }
-    } catch (...) {
-        reset_rows(idx);
-    }
+    bind_rows(idx, path, info.gen, info.nonce, info.pending);
 }
 
 void turbovec_sync_note_remove(ggml_vec_index & idx, size_t slot) noexcept {
     TurboVecSyncBinding & b = idx.turbovec_sync;
-    try {
-        if (slot >= b.slot_rows.size() || b.slot_rows[slot] == SIZE_MAX || b.file_rows.empty()) {
-            // Called before the slot goes inactive; rebuild without it.
-            reset_rows(idx);
-            if (slot < b.slot_rows.size() && b.slot_rows[slot] != SIZE_MAX) {
-                turbovec_sync_note_remove(idx, slot);
-            }
-            return;
-        }
-        // Upstream swap-remove: the file's last row moves into the hole.
-        // Both rows diverge from the commit (the hole takes new bytes, the
-        // last row dies but may be refilled), and only rows inside the
-        // commit's whole blocks need redo ops.
-        const size_t r = b.slot_rows[slot];
-        const size_t last = b.file_rows.size() - 1;
-        const size_t watermark = static_cast<size_t>(b.n_synced) / kBlock * kBlock;
-        if (b.bound) {
-            for (size_t row : { r, last }) {
-                if (row < watermark) {
-                    b.fresh.insert(row);
-                }
-            }
-        }
-        if (r != last) {
-            const size_t moved = b.file_rows[last];
-            b.file_rows[r] = moved;
-            b.slot_rows[moved] = r;
-        }
-        b.file_rows.pop_back();
-        b.slot_rows[slot] = SIZE_MAX;
-    } catch (...) {
-        reset_rows(idx);
+    if (!b.bound) {
+        return;
     }
-}
-
-void turbovec_sync_note_compact(ggml_vec_index & idx) noexcept {
-    TurboVecSyncBinding & b = idx.turbovec_sync;
     try {
-        // Compaction keeps live slots in order: a slot's new index is its
-        // rank among the live ones.
-        std::vector<size_t> remap(idx.slot_to_id.size(), SIZE_MAX);
-        size_t next = 0;
-        for (size_t slot = 0; slot < remap.size(); ++slot) {
-            if (slot_is_active(idx, slot)) {
-                remap[slot] = next++;
+        // Both rows diverge from the commit (the hole takes the last row's
+        // bytes, the last row dies but may be refilled), and only rows
+        // inside the commit's whole blocks need redo ops (upstream
+        // swap_remove + mark_dirty).
+        const size_t last = idx.slot_to_id.size() - 1;
+        const size_t watermark = static_cast<size_t>(b.n_synced) / kBlock * kBlock;
+        for (size_t row : { slot, last }) {
+            if (row < watermark) {
+                b.fresh.insert(row);
             }
         }
-        std::vector<size_t> slot_rows(next, SIZE_MAX);
-        for (size_t r = 0; r < b.file_rows.size(); ++r) {
-            const size_t slot = remap[b.file_rows[r]];
-            if (slot == SIZE_MAX) {
-                b.file_rows.clear();
-                return;
-            }
-            b.file_rows[r] = slot;
-            slot_rows[slot] = r;
-        }
-        b.slot_rows.swap(slot_rows);
     } catch (...) {
-        // The slots are about to be renumbered: drop the order; the next
-        // image falls back to slot order.
         turbovec_sync_unbind(idx);
-        b.file_rows.clear();
-        b.slot_rows.clear();
     }
 }
 
@@ -1273,7 +1181,8 @@ int turbovec_v8_sync(ggml_vec_index & idx, const char * path) {
     }
 
     if (state == CursorState::intact && b.calib_gen == idx.turbovec_calib_gen) {
-        const Source src(idx, b.file_rows);
+        const std::vector<size_t> rows = live_slots(idx);
+        const Source src(idx, rows);
         std::vector<TurboVecWriteBatch> batches;
         uint64_t new_gen = 0;
         std::vector<size_t> carried;
@@ -1285,7 +1194,7 @@ int turbovec_v8_sync(ggml_vec_index & idx, const char * path) {
                 return rc;
             }
             b.gen = new_gen;
-            b.n_synced = b.file_rows.size();
+            b.n_synced = rows.size();
             b.pending = std::unordered_set<size_t>(carried.begin(), carried.end());
             b.fresh.clear();
             return GGML_VEC_INDEX_OK;
@@ -1293,7 +1202,7 @@ int turbovec_v8_sync(ggml_vec_index & idx, const char * path) {
     }
 
     // A full write claims the file with a fresh nonce.
-    std::vector<size_t> rows = upstream_rows(idx);
+    const std::vector<size_t> rows = live_slots(idx);
     const uint64_t nonce = new_file_nonce();
     TurboVecV8Image image;
     build_image(Source(idx, rows), nonce, image);
@@ -1302,7 +1211,7 @@ int turbovec_v8_sync(ggml_vec_index & idx, const char * path) {
         turbovec_sync_unbind(idx);
         return rc;
     }
-    bind_rows(idx, path, 0, nonce, std::move(rows), {});
+    bind_rows(idx, path, 0, nonce, {});
     return rc;
 }
 
@@ -1324,7 +1233,8 @@ int turbovec_sync_plan_for_test(
     }
     uint64_t new_gen = 0;
     std::vector<size_t> carried;
-    return plan_incremental(Source(*idx, b.file_rows), b, stale_used, batches, new_gen, carried) ?
+    const std::vector<size_t> rows = live_slots(*idx);
+    return plan_incremental(Source(*idx, rows), b, stale_used, batches, new_gen, carried) ?
         GGML_VEC_INDEX_OK : GGML_VEC_INDEX_E_INVALID_ARG;
 }
 #endif
