@@ -157,6 +157,18 @@ static void init_tensor_uniform(ggml_tensor * tensor, float min = -1.0f, float m
     }
 }
 
+// a large shared offset with a small hashed pattern on top: the input that makes a
+// single-pass E[x^2] - E[x]^2 variance cancel catastrophically
+static void init_tensor_offset_pattern(ggml_tensor * tensor, float offset, float step) {
+    static constexpr size_t hash_mul    = 7919;
+    static constexpr size_t hash_levels = 101;
+    std::vector<float> data(ggml_nelements(tensor));
+    for (size_t i = 0; i < data.size(); i++) {
+        data[i] = offset + ((i * hash_mul) % hash_levels) * step;
+    }
+    ggml_backend_tensor_set(tensor, data.data(), 0, ggml_nbytes(tensor));
+}
+
 // generate an F16 mask where certain blocks are randomly masked with -INF value
 static void init_tensor_kq_mask(ggml_tensor * tensor, float min = -1.0f, float max = 1.0f) {
     GGML_ASSERT(tensor->type == GGML_TYPE_F16);
@@ -5417,14 +5429,25 @@ struct test_norm_channel : public test_case {
     const int64_t B;
     const bool ct; // [C, T] layout instead of [T, C]
     const float eps;
+    const float offset; // shared input offset under a 0.001 pattern (0 = uniform input)
 
     std::string vars() override {
-        return VARS_TO_STR5(L, C, B, ct, eps);
+        return VARS_TO_STR6(L, C, B, ct, eps, offset);
     }
 
     test_norm_channel(int64_t L = 139, int64_t C = 512, bool ct = false, float eps = 1e-6f,
-                                       int64_t B = 1)
-        : L(L), C(C), B(B), ct(ct), eps(eps) {}
+                                       int64_t B = 1, float offset = 0.0f)
+        : L(L), C(C), B(B), ct(ct), eps(eps), offset(offset) {}
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (offset != 0.0f && strcmp(t->name, "a") == 0) {
+                init_tensor_offset_pattern(t, offset, 0.001f);
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * a = ct ? ggml_new_tensor_3d(ctx, GGML_TYPE_F32, C, L, B) : ggml_new_tensor_3d(ctx, GGML_TYPE_F32, L, C, B);
@@ -14643,6 +14666,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
     test_cases.emplace_back(new test_norm_channel(37, 96, true, 1e-6f, 2));
+    // large shared offset under a tiny channel variation: a single-pass variance cancels here
+    for (bool ct : { false, true }) {
+        test_cases.emplace_back(new test_norm_channel(139, 512, ct, 1e-6f, 1, 10000.0f));
+    }
     for (int64_t K : { 3, 5, 7 }) {
         test_cases.emplace_back(new test_conv_1d_dw_direct(139, 512, K, 3, true));
         test_cases.emplace_back(new test_conv_1d_dw_direct(139, 512, K, 2, false));
@@ -17842,6 +17869,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     // activations, the recurrent cells and the transducer step)
     test_cases.emplace_back(new test_conv_1d_dw_direct(139, 512, 7, 3, true));
     test_cases.emplace_back(new test_conv_1d_dw_direct(2808, 512, 7, 1, true, true));
+    test_cases.emplace_back(new test_norm_channel(139, 512, true));
+    test_cases.emplace_back(new test_norm_channel(1024, 512, false));
 
     return test_cases;
 }
