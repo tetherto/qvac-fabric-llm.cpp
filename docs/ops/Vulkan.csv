@@ -19484,6 +19484,8 @@
 "Vulkan0","CHANNEL_SHUFFLE","ne=[8,4,12,2],groups=4","support","1","yes","Vulkan"
 "Vulkan0","AFFINE_PRELU","f=16,t=10,c=6,bc=2","support","1","yes","Vulkan"
 "Vulkan0","AFFINE_PRELU","f=129,t=63,c=16,bc=3","support","1","yes","Vulkan"
+"Vulkan0","SNAKE","t=32,c=8","support","1","yes","Vulkan"
+"Vulkan0","SNAKE","t=127,c=3","support","1","yes","Vulkan"
 "Vulkan0","NORM_CHANNEL","L=45,C=512,B=1,ct=0,eps=0.000001,offset=0.000000","support","1","yes","Vulkan"
 "Vulkan0","NORM_CHANNEL","L=139,C=512,B=1,ct=0,eps=0.000001,offset=0.000000","support","1","yes","Vulkan"
 "Vulkan0","NORM_CHANNEL","L=234,C=512,B=1,ct=0,eps=0.000001,offset=0.000000","support","1","yes","Vulkan"
