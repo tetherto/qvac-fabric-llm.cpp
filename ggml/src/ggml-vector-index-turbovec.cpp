@@ -1581,13 +1581,21 @@ size_t turbovec_row_bytes(int bits, size_t dim) {
     return static_cast<size_t>(bits) * (dim / 8);
 }
 
+// Byte offset of (group g, lane) inside a block in upstream's vector-major
+// layout (pack.rs `vm_byte_index`): four groups of one vector are adjacent,
+// so a dot-product kernel loads them as one 32-bit lane.
+static size_t vector_major_offset(size_t g, size_t lane) {
+    return (g / 4) * 128 + (lane / 16) * 64 + (lane % 16) * 4 + g % 4;
+}
+
 static void repack_turbovec_code_block(
         const uint8_t * packed_codes,
         size_t n_vectors,
         int bits,
         int dim,
         size_t block,
-        std::vector<uint8_t> & blocked_codes) {
+        std::vector<uint8_t> & blocked_codes,
+        bool vector_major) {
     const size_t dim_sz = static_cast<size_t>(dim);
     const size_t codes_per_byte = static_cast<size_t>(8 / bits);
     const size_t n_byte_groups = dim_sz / codes_per_byte;
@@ -1604,6 +1612,15 @@ static void repack_turbovec_code_block(
         if (vector < n_vectors) {
             packed_row_to_seq_fast(packed_codes + vector * row_bytes, bits, dim, seq.data() + lane * n_byte_groups);
         }
+    }
+    if (vector_major) {
+        uint8_t * out = blocked_codes.data() + block_offset;
+        for (size_t group = 0; group < n_byte_groups; ++group) {
+            for (size_t lane = 0; lane < static_cast<size_t>(kTurboVecScoreBlock); ++lane) {
+                out[vector_major_offset(group, lane)] = seq[lane * n_byte_groups + group];
+            }
+        }
+        return;
     }
     for (size_t group = 0; group < n_byte_groups; ++group) {
         uint8_t * out = blocked_codes.data() + block_offset + group * kTurboVecScoreBlock;
@@ -1628,6 +1645,24 @@ static void repack_turbovec_code_block(
 // One lane's code byte for a byte group of a blocked block, in either
 // in-memory layout: sequential lanes, or x86's perm0 nibble interleave
 // (see repack_turbovec_code_block).
+static uint8_t blocked_lane_byte(const uint8_t * group_bytes, size_t lane);
+static void set_blocked_lane_byte(uint8_t * group_bytes, size_t lane, uint8_t value);
+
+// (group, lane) of a whole block, in the block's layout.
+static uint8_t block_lane_byte(const uint8_t * block, size_t g, size_t lane, bool vector_major) {
+    return vector_major ?
+        block[vector_major_offset(g, lane)] :
+        blocked_lane_byte(block + g * static_cast<size_t>(kTurboVecScoreBlock), lane);
+}
+
+static void set_block_lane_byte(uint8_t * block, size_t g, size_t lane, bool vector_major, uint8_t value) {
+    if (vector_major) {
+        block[vector_major_offset(g, lane)] = value;
+    } else {
+        set_blocked_lane_byte(block + g * static_cast<size_t>(kTurboVecScoreBlock), lane, value);
+    }
+}
+
 static uint8_t blocked_lane_byte(const uint8_t * group_bytes, size_t lane) {
 #if defined(__x86_64__) || defined(_M_X64)
     const size_t p = lane % 16;
@@ -1653,6 +1688,237 @@ static void set_blocked_lane_byte(uint8_t * group_bytes, size_t lane, uint8_t va
 #endif
 }
 
+void build_turbovec_permute_dot(const float * query, int dim, TurboVecPermuteDot & out) {
+    // Upstream search.rs `build_permute_dot`: the codebook and the query
+    // each rounded to int8 under one scale (round is half away from zero).
+    const TurboVecCodebook & codebook = turbovec_codebook(4, dim, false);
+    float cmax = 0.0f;
+    for (float c : codebook.centroids) {
+        cmax = std::max(cmax, std::fabs(c));
+    }
+    const float cs = cmax > 0.0f ? cmax / 127.0f : 1.0f;
+    for (int i = 0; i < 16; ++i) {
+        out.levels[i] = static_cast<int8_t>(std::max(-127.0f, std::min(127.0f, std::round(codebook.centroids[i] / cs))));
+    }
+    float qmax = 0.0f;
+    for (int d = 0; d < dim; ++d) {
+        qmax = std::max(qmax, std::fabs(query[d]));
+    }
+    float qs = qmax / 127.0f;
+    float inv_qs = 1.0f;
+    if (qs >= FLT_MIN) {
+        inv_qs = 1.0f / qs;
+    } else {
+        qs = 1.0f;
+    }
+    out.weights.resize(static_cast<size_t>(dim));
+    for (int d = 0; d < dim; ++d) {
+        out.weights[static_cast<size_t>(d)] =
+            static_cast<int8_t>(std::max(-127.0f, std::min(127.0f, std::round(query[d] * inv_qs))));
+    }
+    out.scale = cs * qs;
+    out.bias = 0.0f;
+}
+
+#if GGML_VEC_INDEX_USE_NEON && (defined(__clang__) || defined(__GNUC__))
+// Clang spells the AArch64 extension "dotprod"; GCC needs "+dotprod".
+#if defined(__clang__)
+#define GGML_VEC_INDEX_TARGET_DOTPROD __attribute__((target("dotprod")))
+#else
+#define GGML_VEC_INDEX_TARGET_DOTPROD __attribute__((target("+dotprod")))
+#endif
+
+// SDOT over the sequential blocked layout: four byte groups of sixteen
+// lanes are transposed in registers so each 32-bit lane holds one vector's
+// four codes, and one SDOT adds four weight * level products per vector.
+// Integer sums, so bit-identical to the scalar kernel below.
+GGML_VEC_INDEX_TARGET_DOTPROD
+static void permute_dot_block_sums_sdot(
+        const TurboVecPermuteDot & pd,
+        const uint8_t * block,
+        size_t n_byte_groups,
+        bool vector_major,
+        int32_t * sums) {
+    const int8x16_t levels = vld1q_s8(pd.levels);
+    const uint8x16_t nibble = vdupq_n_u8(0x0f);
+    int32x4_t acc[8];
+    for (int32x4_t & a : acc) {
+        a = vdupq_n_s32(0);
+    }
+    const int8_t * w = pd.weights.data();
+    for (size_t g = 0; g < n_byte_groups; g += 4) {
+        const int8_t even[4] = { w[2 * g], w[2 * g + 2], w[2 * g + 4], w[2 * g + 6] };
+        const int8_t odd[4] = { w[2 * g + 1], w[2 * g + 3], w[2 * g + 5], w[2 * g + 7] };
+        int32_t even_word = 0;
+        int32_t odd_word = 0;
+        std::memcpy(&even_word, even, 4);
+        std::memcpy(&odd_word, odd, 4);
+        const int8x16_t w_even = vreinterpretq_s8_s32(vdupq_n_s32(even_word));
+        const int8x16_t w_odd = vreinterpretq_s8_s32(vdupq_n_s32(odd_word));
+        if (vector_major) {
+            // The block already holds each vector's four codes together.
+            const uint8_t * unit = block + (g / 4) * 128;
+            for (int i = 0; i < 8; ++i) {
+                const uint8x16_t quad = vld1q_u8(unit + 16 * i);
+                acc[i] = vdotq_s32(acc[i], vqtbl1q_s8(levels, vshrq_n_u8(quad, 4)), w_even);
+                acc[i] = vdotq_s32(acc[i], vqtbl1q_s8(levels, vandq_u8(quad, nibble)), w_odd);
+            }
+            continue;
+        }
+        for (size_t half = 0; half < 2; ++half) {
+            const uint8_t * base = block + g * 32 + half * 16;
+            const uint8x16_t x0 = vld1q_u8(base);
+            const uint8x16_t x1 = vld1q_u8(base + 32);
+            const uint8x16_t x2 = vld1q_u8(base + 64);
+            const uint8x16_t x3 = vld1q_u8(base + 96);
+            const uint8x16x2_t z01 = vzipq_u8(x0, x1);
+            const uint8x16x2_t z23 = vzipq_u8(x2, x3);
+            const uint16x8x2_t q0 = vzipq_u16(vreinterpretq_u16_u8(z01.val[0]), vreinterpretq_u16_u8(z23.val[0]));
+            const uint16x8x2_t q1 = vzipq_u16(vreinterpretq_u16_u8(z01.val[1]), vreinterpretq_u16_u8(z23.val[1]));
+            const uint8x16_t quads[4] = {
+                vreinterpretq_u8_u16(q0.val[0]), vreinterpretq_u8_u16(q0.val[1]),
+                vreinterpretq_u8_u16(q1.val[0]), vreinterpretq_u8_u16(q1.val[1]),
+            };
+            for (int i = 0; i < 4; ++i) {
+                int32x4_t & a = acc[half * 4 + static_cast<size_t>(i)];
+                a = vdotq_s32(a, vqtbl1q_s8(levels, vshrq_n_u8(quads[i], 4)), w_even);
+                a = vdotq_s32(a, vqtbl1q_s8(levels, vandq_u8(quads[i], nibble)), w_odd);
+            }
+        }
+    }
+    for (int i = 0; i < 8; ++i) {
+        vst1q_s32(sums + 4 * i, acc[i]);
+    }
+}
+
+GGML_VEC_INDEX_TARGET_DOTPROD
+static void permute_dot_block_sums_sdot_4(
+        const TurboVecPermuteDot * const * pds,
+        const uint8_t * block,
+        size_t n_byte_groups,
+        int32_t (*sums)[kTurboVecScoreBlock]) {
+    const int8x16_t levels = vld1q_s8(pds[0]->levels);
+    const uint8x16_t nibble = vdupq_n_u8(0x0f);
+    int32x4_t acc[4][8];
+    for (auto & query_acc : acc) {
+        for (int32x4_t & a : query_acc) {
+            a = vdupq_n_s32(0);
+        }
+    }
+    for (size_t g = 0; g < n_byte_groups; g += 4) {
+        int8x16_t w_even[4];
+        int8x16_t w_odd[4];
+        for (int q = 0; q < 4; ++q) {
+            const int8_t * w = pds[q]->weights.data();
+            const int8_t even[4] = { w[2 * g], w[2 * g + 2], w[2 * g + 4], w[2 * g + 6] };
+            const int8_t odd[4] = { w[2 * g + 1], w[2 * g + 3], w[2 * g + 5], w[2 * g + 7] };
+            int32_t even_word = 0;
+            int32_t odd_word = 0;
+            std::memcpy(&even_word, even, 4);
+            std::memcpy(&odd_word, odd, 4);
+            w_even[q] = vreinterpretq_s8_s32(vdupq_n_s32(even_word));
+            w_odd[q] = vreinterpretq_s8_s32(vdupq_n_s32(odd_word));
+        }
+        const uint8_t * unit = block + (g / 4) * 128;
+        for (int i = 0; i < 8; ++i) {
+            const uint8x16_t quad = vld1q_u8(unit + 16 * i);
+            const int8x16_t hi = vqtbl1q_s8(levels, vshrq_n_u8(quad, 4));
+            const int8x16_t lo = vqtbl1q_s8(levels, vandq_u8(quad, nibble));
+            for (int q = 0; q < 4; ++q) {
+                acc[q][i] = vdotq_s32(acc[q][i], hi, w_even[q]);
+                acc[q][i] = vdotq_s32(acc[q][i], lo, w_odd[q]);
+            }
+        }
+    }
+    for (int q = 0; q < 4; ++q) {
+        for (int i = 0; i < 8; ++i) {
+            vst1q_s32(sums[q] + 4 * i, acc[q][i]);
+        }
+    }
+}
+#endif
+
+void score_turbovec_permute_dot_block(
+        const TurboVecPermuteDot & pd,
+        const uint8_t * blocked_codes,
+        const float * vector_scales,
+        size_t block_index,
+        size_t n_vectors,
+        int dim,
+        bool vector_major,
+        float * out_scores) {
+    // A 4-bit byte group holds dim 2g in its high nibble and 2g + 1 in its
+    // low one. The sums are exact integers, so they match upstream's SDOT,
+    // SMMLA and VNNI kernels whatever the order of accumulation.
+    const size_t n_byte_groups = static_cast<size_t>(dim) / 2;
+    const size_t lane_size = static_cast<size_t>(kTurboVecScoreBlock);
+    const size_t base = block_index * lane_size;
+    const size_t valid = std::min(lane_size, n_vectors - base);
+    const uint8_t * block = blocked_codes + block_index * n_byte_groups * lane_size;
+    int32_t sums[kTurboVecScoreBlock] = {};
+#if GGML_VEC_INDEX_USE_NEON && (defined(__clang__) || defined(__GNUC__))
+    // dim % 8 == 0 makes the group count a multiple of four.
+    const bool has_dot_product = turbovec_cpu_dot_product();
+    if (has_dot_product) {
+        permute_dot_block_sums_sdot(pd, block, n_byte_groups, vector_major, sums);
+    } else
+#endif
+    {
+        const int8_t * w = pd.weights.data();
+        for (size_t g = 0; g < n_byte_groups; ++g) {
+            const int32_t w_even = w[2 * g];
+            const int32_t w_odd = w[2 * g + 1];
+            for (size_t lane = 0; lane < valid; ++lane) {
+                const uint8_t byte = block_lane_byte(block, g, lane, vector_major);
+                sums[lane] += w_even * pd.levels[byte >> 4] + w_odd * pd.levels[byte & 0x0f];
+            }
+        }
+    }
+    for (size_t lane = 0; lane < lane_size; ++lane) {
+        out_scores[lane] = lane < valid ?
+            std::fma(static_cast<float>(sums[lane]), pd.scale, pd.bias) * vector_scales[base + lane] :
+            -std::numeric_limits<float>::infinity();
+    }
+}
+
+void score_turbovec_permute_dot_block_4(
+        const TurboVecPermuteDot * const * pds,
+        const uint8_t * blocked_codes,
+        const float * vector_scales,
+        size_t block_index,
+        size_t n_vectors,
+        int dim,
+        bool vector_major,
+        float * const * out_scores) {
+#if GGML_VEC_INDEX_USE_NEON && (defined(__clang__) || defined(__GNUC__))
+    const bool has_dot_product = turbovec_cpu_dot_product();
+    if (vector_major && has_dot_product) {
+        const size_t n_byte_groups = static_cast<size_t>(dim) / 2;
+        const size_t lane_size = static_cast<size_t>(kTurboVecScoreBlock);
+        // The code loads and level lookups are shared by the four queries;
+        // only the weights and the SDOTs are per query.
+        const size_t base = block_index * lane_size;
+        const size_t valid = std::min(lane_size, n_vectors - base);
+        int32_t sums[4][kTurboVecScoreBlock];
+        permute_dot_block_sums_sdot_4(
+            pds, blocked_codes + block_index * n_byte_groups * lane_size, n_byte_groups, sums);
+        for (int q = 0; q < 4; ++q) {
+            for (size_t lane = 0; lane < lane_size; ++lane) {
+                out_scores[q][lane] = lane < valid ?
+                    std::fma(static_cast<float>(sums[q][lane]), pds[q]->scale, pds[q]->bias) *
+                        vector_scales[base + lane] :
+                    -std::numeric_limits<float>::infinity();
+            }
+        }
+        return;
+    }
+#endif
+    for (int q = 0; q < 4; ++q) {
+        score_turbovec_permute_dot_block(
+            *pds[q], blocked_codes, vector_scales, block_index, n_vectors, dim, vector_major, out_scores[q]);
+    }
+}
+
 void turbovec_blocked_swap_remove(ggml_vec_index & idx, size_t slot, size_t last) {
     const size_t n_byte_groups = static_cast<size_t>(idx.dim) / static_cast<size_t>(8 / idx.turbovec_bits);
     const size_t block_bytes = n_byte_groups * static_cast<size_t>(kTurboVecScoreBlock);
@@ -1667,13 +1933,14 @@ void turbovec_blocked_swap_remove(ggml_vec_index & idx, size_t slot, size_t last
     // Move the last lane into the hole, zero the vacated lane (a stale lane
     // would break byte determinism), then drop a now-empty block.
     const size_t lane_size = static_cast<size_t>(kTurboVecScoreBlock);
+    const bool vm = idx.turbovec_blocked_vm;
+    uint8_t * src = blocked.data() + (last / lane_size) * block_bytes;
+    uint8_t * dst = blocked.data() + (slot / lane_size) * block_bytes;
     for (size_t g = 0; g < n_byte_groups; ++g) {
-        uint8_t * src = blocked.data() + (last / lane_size) * block_bytes + g * lane_size;
         if (slot != last) {
-            uint8_t * dst = blocked.data() + (slot / lane_size) * block_bytes + g * lane_size;
-            set_blocked_lane_byte(dst, slot % lane_size, blocked_lane_byte(src, last % lane_size));
+            set_block_lane_byte(dst, g, slot % lane_size, vm, block_lane_byte(src, g, last % lane_size, vm));
         }
-        set_blocked_lane_byte(src, last % lane_size, 0);
+        set_block_lane_byte(src, g, last % lane_size, vm, 0);
     }
     idx.turbovec_blocked_n_blocks = (last + lane_size - 1) / lane_size;
     blocked.resize(idx.turbovec_blocked_n_blocks * block_bytes);
@@ -1685,7 +1952,8 @@ void repack_turbovec_codes(
         int bits,
         int dim,
         std::vector<uint8_t> & blocked_codes,
-        size_t & n_blocks) {
+        size_t & n_blocks,
+        bool vector_major) {
     const size_t dim_sz = static_cast<size_t>(dim);
     const size_t codes_per_byte = static_cast<size_t>(8 / bits);
     const size_t n_byte_groups = dim_sz / codes_per_byte;
@@ -1695,7 +1963,7 @@ void repack_turbovec_codes(
         0);
 
     for (size_t block = 0; block < n_blocks; ++block) {
-        repack_turbovec_code_block(packed_codes, n_vectors, bits, dim, block, blocked_codes);
+        repack_turbovec_code_block(packed_codes, n_vectors, bits, dim, block, blocked_codes, vector_major);
     }
 }
 
@@ -1706,7 +1974,8 @@ void repack_turbovec_codes_from_slot(
         int dim,
         size_t first_slot,
         std::vector<uint8_t> & blocked_codes,
-        size_t & n_blocks) {
+        size_t & n_blocks,
+        bool vector_major) {
     const size_t dim_sz = static_cast<size_t>(dim);
     const size_t codes_per_byte = static_cast<size_t>(8 / bits);
     const size_t n_byte_groups = dim_sz / codes_per_byte;
@@ -1714,7 +1983,7 @@ void repack_turbovec_codes_from_slot(
         n_blocks * n_byte_groups * static_cast<size_t>(kTurboVecScoreBlock);
     if (first_slot == 0 || first_slot > n_vectors ||
         blocked_codes.size() != old_expected_size) {
-        repack_turbovec_codes(packed_codes, n_vectors, bits, dim, blocked_codes, n_blocks);
+        repack_turbovec_codes(packed_codes, n_vectors, bits, dim, blocked_codes, n_blocks, vector_major);
         return;
     }
 
@@ -1727,7 +1996,7 @@ void repack_turbovec_codes_from_slot(
         n_blocks * n_byte_groups * static_cast<size_t>(kTurboVecScoreBlock),
         0);
     for (size_t block = first_block; block < n_blocks; ++block) {
-        repack_turbovec_code_block(packed_codes, n_vectors, bits, dim, block, blocked_codes);
+        repack_turbovec_code_block(packed_codes, n_vectors, bits, dim, block, blocked_codes, vector_major);
     }
 }
 
