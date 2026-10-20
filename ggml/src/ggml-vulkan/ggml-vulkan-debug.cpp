@@ -1401,6 +1401,8 @@ void ggml_vk_check_results_0(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph
                                     ggml_get_op_params_i32(tensor, 0) != 0);
         } else if (tensor->op == GGML_OP_ZERO_UPSAMPLE) {
             tensor_clone = ggml_zero_upsample(ggml_ctx, src_clone[0], ggml_get_op_params_i32(tensor, 0));
+        } else if (tensor->op == GGML_OP_CHANNEL_SHUFFLE) {
+            tensor_clone = ggml_channel_shuffle(ggml_ctx, src_clone[0], ggml_get_op_params_i32(tensor, 0));
         } else if (tensor->op == GGML_OP_SSM_CONV_BACK_SX) {
             tensor_clone = ggml_ssm_conv_back_sx(ggml_ctx, src_clone[0], src_clone[1], tensor);
         } else if (tensor->op == GGML_OP_SSM_CONV_BACK_C) {
