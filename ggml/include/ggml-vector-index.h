@@ -115,6 +115,28 @@ GGML_VEC_INDEX_API ggml_vec_index_t * ggml_vec_index_create_turbovec_q2(int dim)
 // mmap loading and logged mutations are reserved for later format work.
 GGML_VEC_INDEX_API ggml_vec_index_t * ggml_vec_index_create_turbovec_q4(int dim);
 
+// Creates a TurboQuant index with `bit_width` 2, 3 or 4 (the encoding of
+// upstream turbovec 1.1.2). Requires a 64-bit target and
+// `0 < dim <= 16384 && dim % 8 == 0`. Returns NULL on bad args.
+GGML_VEC_INDEX_API ggml_vec_index_t * ggml_vec_index_create_turbovec(int dim, int bit_width);
+
+// Fits the TurboVec TQ+ per-coordinate calibration from `n` sample vectors
+// (row-major, `dim` floats each) and commits it. Every later add is encoded
+// under it, and rows already stored are re-encoded from their codes. Pass a
+// random, representative sample (around 1000 rows); a sorted or clustered
+// sample fits quantiles that hurt recall. Calibrate before adding when you
+// can: re-encoding stored rows is a second quantization. May be called again
+// to refit. Requires `n >= 2`. Returns GGML_VEC_INDEX_E_INVALID_ARG for a
+// non-TurboVec or legacy (v3-loaded) index, invalid values, or a sample whose
+// fit is the identity. Invalidates prepared filters and IVF state.
+GGML_VEC_INDEX_API int ggml_vec_index_turbovec_calibrate(
+    ggml_vec_index_t * idx,
+    const float * sample,
+    int n);
+
+// Returns 1 when a TurboVec index holds a committed TQ+ calibration.
+GGML_VEC_INDEX_API int ggml_vec_index_turbovec_is_calibrated(const ggml_vec_index_t * idx);
+
 GGML_VEC_INDEX_API void ggml_vec_index_free(ggml_vec_index_t * idx);
 
 // Mutation.

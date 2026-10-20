@@ -22,6 +22,22 @@ constexpr int kTurboVecScoreBlock = 32;
 constexpr int kTurboVecFlushEvery = 256;
 #endif
 constexpr uint64_t kTurboVecRotationSeed = 42;
+constexpr int kTurboVecHadamardRounds = 2;
+// rand_core 0.6 `seed_from_u64(42)`, frozen by upstream turbovec 1.x
+// (rotation.rs ROTATION_SEED) so the rotation depends only on ChaCha8.
+constexpr uint8_t kTurboVecHadamardSeed[32] = {
+    164, 143, 161, 123, 88, 50, 61, 10, 234, 184, 161, 204, 105, 1, 20, 184,
+    43, 140, 200, 117, 24, 180, 247, 84, 141, 68, 110, 161, 228, 223, 32, 242,
+};
+constexpr int kTurboVecNormChains = 8;
+// Fewest rows a TQ+ fit can use: two distinct order statistics per coordinate.
+constexpr int kTurboVecMinCalibrationRows = 2;
+// Reconstructions whose unit-space inner product is at or below this are
+// degenerate and store scale 0 (upstream #116).
+constexpr double kTurboVecDegenerateInner = 0.1;
+// Norms at or below this have no direction and store scale 0 (upstream
+// MIN_INPUT_NORM).
+constexpr float kTurboVecMinInputNorm = 1e-10f;
 constexpr int kTurboVecZigguratLayers = 256;
 constexpr int kTurboVecZigguratTableSize = kTurboVecZigguratLayers + 1;
 constexpr uint64_t kTurboVecZigguratLayerMask = 0xff;
@@ -462,6 +478,179 @@ static void apply_turbovec_query_rotation_batch(
     apply_turbovec_rotation_batch(src, dst, n, dim);
 }
 
+// TurboVec 1.x rotation: a globally permuted block-Hadamard transform, ported
+// from upstream turbovec 1.1.2 `rotation.rs`. Every multiply and add happens in
+// the upstream order with no fused multiply-add, so the rotated coordinates,
+// and therefore the encoded bytes, are identical on every target.
+struct TurboVecHadamardRotation {
+    int dim = 0;
+    int block = 0;
+    float inv_sqrt_block = 1.0f;
+    std::array<std::vector<float>, kTurboVecHadamardRounds> signs;
+    std::array<std::vector<uint32_t>, kTurboVecHadamardRounds> perms;
+};
+
+struct TurboVecHadamardCacheEntry {
+    size_t ref_count = 0;
+    std::weak_ptr<const TurboVecHadamardRotation> weak;
+    std::shared_ptr<const TurboVecHadamardRotation> strong;
+};
+
+static void chacha8_seed_bytes(ChaCha8 & rng, const uint8_t (&seed)[32]) {
+    for (int i = 0; i < 8; ++i) {
+        rng.key[i] = load_u32_le_local(seed + i * 4);
+    }
+    rng.counter = 0;
+    rng.next_word = 16;
+}
+
+static TurboVecHadamardRotation make_turbovec_hadamard_rotation(int dim) {
+    TurboVecHadamardRotation rotation;
+    rotation.dim = dim;
+    // Largest power-of-two divisor of dim; at least 8 because dim % 8 == 0.
+    rotation.block = dim & -dim;
+    rotation.inv_sqrt_block = 1.0f / std::sqrt(static_cast<float>(rotation.block));
+
+    // One ChaCha8 stream drives the construction. Per round: dim sign draws,
+    // then a Fisher-Yates permutation. The draw order is part of the format.
+    ChaCha8 rng;
+    chacha8_seed_bytes(rng, kTurboVecHadamardSeed);
+    const size_t dim_sz = static_cast<size_t>(dim);
+    for (int round = 0; round < kTurboVecHadamardRounds; ++round) {
+        std::vector<float> & signs = rotation.signs[static_cast<size_t>(round)];
+        signs.resize(dim_sz);
+        for (size_t i = 0; i < dim_sz; ++i) {
+            signs[i] = (chacha8_next_u32(rng) & 1u) != 0 ? -1.0f : 1.0f;
+        }
+        std::vector<uint32_t> & perm = rotation.perms[static_cast<size_t>(round)];
+        perm.resize(dim_sz);
+        for (size_t i = 0; i < dim_sz; ++i) {
+            perm[i] = static_cast<uint32_t>(i);
+        }
+        for (size_t i = dim_sz - 1; i >= 1; --i) {
+            const size_t j = static_cast<size_t>(
+                chacha8_next_u64(rng) % (static_cast<uint64_t>(i) + 1));
+            std::swap(perm[i], perm[j]);
+        }
+    }
+    return rotation;
+}
+
+static std::mutex & turbovec_hadamard_cache_mutex() {
+    static std::mutex mutex;
+    return mutex;
+}
+
+static std::unordered_map<int, TurboVecHadamardCacheEntry> & turbovec_hadamard_cache() {
+    static std::unordered_map<int, TurboVecHadamardCacheEntry> cache;
+    return cache;
+}
+
+static std::shared_ptr<const TurboVecHadamardRotation> turbovec_hadamard_rotation(int dim) {
+    std::lock_guard<std::mutex> lock(turbovec_hadamard_cache_mutex());
+    auto & cache = turbovec_hadamard_cache();
+    auto it = cache.find(dim);
+    if (it == cache.end()) {
+        it = cache.emplace(dim, TurboVecHadamardCacheEntry{}).first;
+    }
+    std::shared_ptr<const TurboVecHadamardRotation> rotation =
+        it->second.strong != nullptr ? it->second.strong : it->second.weak.lock();
+    if (rotation == nullptr) {
+        rotation = std::make_shared<const TurboVecHadamardRotation>(
+            make_turbovec_hadamard_rotation(dim));
+        it->second.weak = rotation;
+        if (it->second.ref_count != 0) {
+            it->second.strong = rotation;
+        }
+    }
+    return rotation;
+}
+
+// Unnormalized in-place Walsh-Hadamard butterfly on one block, then the
+// orthonormal 1/sqrt(block) scale (upstream `wht_block_scalar`).
+static void turbovec_wht_block(float * blk, int block, float inv_sqrt_block) {
+    for (int len = 1; len < block; len <<= 1) {
+        for (int i = 0; i < block; i += 2 * len) {
+            for (int j = i; j < i + len; ++j) {
+                const float a = blk[j];
+                const float b = blk[j + len];
+                blk[j] = a + b;
+                blk[j + len] = a - b;
+            }
+        }
+    }
+    for (int i = 0; i < block; ++i) {
+        blk[i] *= inv_sqrt_block;
+    }
+}
+
+// Rotate src scaled by inv into dst (upstream `apply_scaled_into`; with
+// inv == 1 it is `apply`, since x * 1.0f is exact). scratch holds dim floats.
+static void apply_turbovec_hadamard(
+        const TurboVecHadamardRotation & rotation,
+        const float * src,
+        float inv,
+        float * dst,
+        float * scratch) {
+    static_assert(kTurboVecHadamardRounds == 2, "the buffer schedule is written for two rounds");
+    const int dim = rotation.dim;
+    const int block = rotation.block;
+    const uint32_t * perm0 = rotation.perms[0].data();
+    const float * signs0 = rotation.signs[0].data();
+    for (int i = 0; i < dim; ++i) {
+        scratch[i] = (src[perm0[i]] * inv) * signs0[i];
+    }
+    for (int offset = 0; offset < dim; offset += block) {
+        turbovec_wht_block(scratch + offset, block, rotation.inv_sqrt_block);
+    }
+    const uint32_t * perm1 = rotation.perms[1].data();
+    const float * signs1 = rotation.signs[1].data();
+    for (int i = 0; i < dim; ++i) {
+        dst[i] = scratch[perm1[i]] * signs1[i];
+    }
+    for (int offset = 0; offset < dim; offset += block) {
+        turbovec_wht_block(dst + offset, block, rotation.inv_sqrt_block);
+    }
+}
+
+// Inverse of apply_turbovec_hadamard with inv == 1. The normalized
+// Walsh-Hadamard block is its own inverse, so each round is undone in reverse.
+static void apply_turbovec_hadamard_inverse(
+        const TurboVecHadamardRotation & rotation,
+        const float * src,
+        float * dst,
+        float * scratch) {
+    const int dim = rotation.dim;
+    const int block = rotation.block;
+    std::memcpy(scratch, src, static_cast<size_t>(dim) * sizeof(float));
+    for (int round = kTurboVecHadamardRounds - 1; round >= 0; --round) {
+        for (int offset = 0; offset < dim; offset += block) {
+            turbovec_wht_block(scratch + offset, block, rotation.inv_sqrt_block);
+        }
+        const uint32_t * perm = rotation.perms[static_cast<size_t>(round)].data();
+        const float * signs = rotation.signs[static_cast<size_t>(round)].data();
+        for (int i = 0; i < dim; ++i) {
+            dst[perm[i]] = scratch[i] * signs[i];
+        }
+        if (round != 0) {
+            std::memcpy(scratch, dst, static_cast<size_t>(dim) * sizeof(float));
+        }
+    }
+}
+
+// L2 norm with upstream's eight fixed accumulation chains (encode.rs
+// `simd_norm`): chain j % 8, combined pairwise, then one f32 sqrt.
+static float turbovec_hadamard_norm(const float * row, int dim) {
+    float chains[kTurboVecNormChains] = {};
+    for (int j = 0; j < dim; ++j) {
+        chains[j % kTurboVecNormChains] += row[j] * row[j];
+    }
+    const float sum =
+        ((chains[0] + chains[1]) + (chains[2] + chains[3])) +
+        ((chains[4] + chains[5]) + (chains[6] + chains[7]));
+    return std::sqrt(sum);
+}
+
 static double vector_norm(const float * values, int dim) {
     double sum = 0.0;
     for (int i = 0; i < dim; ++i) {
@@ -704,7 +893,9 @@ static double adaptive_simpson(const Fn & f, double a, double b, double tol, int
     return adaptive_simpson_rec(f, a, b, fa, fb, fm, whole, tol, max_depth);
 }
 
-static TurboVecCodebook make_turbovec_codebook(int bits, int dim) {
+// legacy selects turbovec 0.9 boundaries (f64 midpoints cast to f32); 1.x
+// uses f32 midpoints of the f32 centroids.
+static TurboVecCodebook make_turbovec_codebook(int bits, int dim, bool legacy) {
     const ScopedNearestRounding rounding_guard;
     const double a = (static_cast<double>(dim) - 1.0) * 0.5;
     const int n_levels = 1 << bits;
@@ -763,24 +954,26 @@ static TurboVecCodebook make_turbovec_codebook(int bits, int dim) {
     TurboVecCodebook out;
     out.boundaries.resize(static_cast<size_t>(n_levels - 1));
     out.centroids.resize(static_cast<size_t>(n_levels));
-    for (int i = 0; i < n_levels - 1; ++i) {
-        out.boundaries[static_cast<size_t>(i)] =
-            static_cast<float>((centroids[static_cast<size_t>(i)] + centroids[static_cast<size_t>(i) + 1]) * 0.5);
-    }
     for (int i = 0; i < n_levels; ++i) {
         out.centroids[static_cast<size_t>(i)] = static_cast<float>(centroids[static_cast<size_t>(i)]);
+    }
+    for (int i = 0; i < n_levels - 1; ++i) {
+        const size_t level = static_cast<size_t>(i);
+        out.boundaries[level] = legacy ?
+            static_cast<float>((centroids[level] + centroids[level + 1]) * 0.5) :
+            (out.centroids[level] + out.centroids[level + 1]) * 0.5f;
     }
     return out;
 }
 
-static const TurboVecCodebook & turbovec_codebook(int bits, int dim) {
+static const TurboVecCodebook & turbovec_codebook(int bits, int dim, bool legacy) {
     static std::mutex mutex;
     static std::unordered_map<int, TurboVecCodebook> cache;
-    const int key = bits * 1000000 + dim;
+    const int key = (legacy ? 10000000 : 0) + bits * 1000000 + dim;
     std::lock_guard<std::mutex> lock(mutex);
     auto it = cache.find(key);
     if (it == cache.end()) {
-        it = cache.emplace(key, make_turbovec_codebook(bits, dim)).first;
+        it = cache.emplace(key, make_turbovec_codebook(bits, dim, legacy)).first;
     }
     return it->second;
 }
@@ -822,11 +1015,13 @@ static void turbovec_set_bitplane_code(uint8_t * row, int coord, int bits, int d
 
 static uint8_t turbovec_group_code_byte(const uint8_t * row, int group, int bits, int dim) {
     const int codes_per_byte = 8 / bits;
+    // 3-bit codes take a whole nibble each, two per byte (upstream pack.rs).
+    const int field = bits == 3 ? 4 : bits;
     const int dim_start = group * codes_per_byte;
     uint8_t byte = 0;
     for (int c = 0; c < codes_per_byte; ++c) {
         const uint8_t code = turbovec_get_bitplane_code(row, dim_start + c, bits, dim);
-        const int shift = (codes_per_byte - 1 - c) * bits;
+        const int shift = (codes_per_byte - 1 - c) * field;
         byte |= static_cast<uint8_t>(code << shift);
     }
     return byte;
@@ -903,7 +1098,13 @@ static void build_turbovec_query_lut(
         max_span = std::max(max_span, hi_max - hi_min);
     }
 
-    out_scale = max_span > 1e-10f ? max_span / max_lut : 1.0f;
+    // The u8 table is query-magnitude free and the scale carries the
+    // magnitude, so any positive span is usable; an absolute floor broke
+    // ranking for small queries (upstream #335).
+    out_scale = max_span > 0.0f ? max_span / max_lut : 1.0f;
+    if (!(out_scale >= FLT_MIN)) {
+        out_scale = 1.0f;
+    }
     const float inv_scale = 1.0f / out_scale;
     for (int g = 0; g < n_byte_groups; ++g) {
         const float lo_min = mins[static_cast<size_t>(g) * 2];
@@ -956,14 +1157,10 @@ static float horizontal_sum_local(float32x4_t v) {
 
 } // namespace
 
-bool turbovec_q2_supported_dim(int dim) {
+bool turbovec_supported_dim(int dim, bool legacy) {
     return sizeof(size_t) >= 8 &&
-        dim > 0 && dim <= kTurboVecMaxDim && dim % kTurboVecDimMultiple == 0;
-}
-
-bool turbovec_q4_supported_dim(int dim) {
-    return sizeof(size_t) >= 8 &&
-        dim > 0 && dim <= kTurboVecMaxDim && dim % kTurboVecDimMultiple == 0;
+        dim > 0 && dim <= (legacy ? kTurboVecLegacyMaxDim : kTurboVecMaxDim) &&
+        dim % kTurboVecDimMultiple == 0;
 }
 
 bool turbovec_serialized_dim_supported(int dim) {
@@ -971,29 +1168,47 @@ bool turbovec_serialized_dim_supported(int dim) {
         dim > 0 && dim <= kTurboVecMaxSerializedDim && dim % kTurboVecDimMultiple == 0;
 }
 
-void turbovec_retain_rotation(int dim) {
-    std::lock_guard<std::mutex> lock(turbovec_rotation_cache_mutex());
-    TurboVecRotationCacheEntry & entry = turbovec_rotation_cache()[dim];
+void turbovec_retain_rotation(int dim, bool legacy) {
+    if (legacy) {
+        std::lock_guard<std::mutex> lock(turbovec_rotation_cache_mutex());
+        TurboVecRotationCacheEntry & entry = turbovec_rotation_cache()[dim];
+        ++entry.ref_count;
+        if (entry.strong == nullptr) {
+            entry.strong = entry.weak.lock();
+        }
+        return;
+    }
+    std::lock_guard<std::mutex> lock(turbovec_hadamard_cache_mutex());
+    TurboVecHadamardCacheEntry & entry = turbovec_hadamard_cache()[dim];
     ++entry.ref_count;
     if (entry.strong == nullptr) {
         entry.strong = entry.weak.lock();
     }
 }
 
-void turbovec_release_rotation(int dim) noexcept {
-    try {
-        std::lock_guard<std::mutex> lock(turbovec_rotation_cache_mutex());
-        auto & cache = turbovec_rotation_cache();
-        const auto it = cache.find(dim);
-        if (it == cache.end() || it->second.ref_count == 0) {
-            return;
+template <typename Entry>
+static void turbovec_release_cache_entry(std::unordered_map<int, Entry> & cache, int dim) {
+    const auto it = cache.find(dim);
+    if (it == cache.end() || it->second.ref_count == 0) {
+        return;
+    }
+    --it->second.ref_count;
+    if (it->second.ref_count == 0) {
+        it->second.strong.reset();
+        if (it->second.weak.expired()) {
+            cache.erase(it);
         }
-        --it->second.ref_count;
-        if (it->second.ref_count == 0) {
-            it->second.strong.reset();
-            if (it->second.weak.expired()) {
-                cache.erase(it);
-            }
+    }
+}
+
+void turbovec_release_rotation(int dim, bool legacy) noexcept {
+    try {
+        if (legacy) {
+            std::lock_guard<std::mutex> lock(turbovec_rotation_cache_mutex());
+            turbovec_release_cache_entry(turbovec_rotation_cache(), dim);
+        } else {
+            std::lock_guard<std::mutex> lock(turbovec_hadamard_cache_mutex());
+            turbovec_release_cache_entry(turbovec_hadamard_cache(), dim);
         }
     } catch (...) {
     }
@@ -1061,7 +1276,7 @@ size_t turbovec_rotation_cache_bytes_for_test(void) {
 }
 
 uint64_t turbovec_rotation_hash_for_test(int dim) {
-    if (!turbovec_q4_supported_dim(dim)) {
+    if (!turbovec_supported_dim(dim, true)) {
         return 0;
     }
     uint64_t hash = UINT64_C(0xcbf29ce484222325);
@@ -1081,7 +1296,7 @@ uint64_t turbovec_query_rotation_hash_for_test(
         const float * queries,
         int n_queries,
         int dim) {
-    if (queries == nullptr || n_queries < 0 || !turbovec_q4_supported_dim(dim)) {
+    if (queries == nullptr || n_queries < 0 || !turbovec_supported_dim(dim, true)) {
         return 0;
     }
     std::vector<float> rotated(static_cast<size_t>(n_queries) * static_cast<size_t>(dim));
@@ -1102,7 +1317,7 @@ double turbovec_query_rotation_max_abs_diff_for_test(
         const float * queries,
         int n_queries,
         int dim) {
-    if (queries == nullptr || n_queries < 0 || !turbovec_q4_supported_dim(dim)) {
+    if (queries == nullptr || n_queries < 0 || !turbovec_supported_dim(dim, true)) {
         return std::numeric_limits<double>::infinity();
     }
     const size_t value_count =
@@ -1133,7 +1348,7 @@ uint64_t turbovec_lut_hash_for_test(
         uint32_t * lut_bias_bits) {
     if (query == nullptr || tqplus_shift == nullptr || tqplus_scale == nullptr ||
         lut_scale_bits == nullptr || lut_bias_bits == nullptr ||
-        (bits != 2 && bits != 4) || n_queries <= 0 || !turbovec_q4_supported_dim(dim)) {
+        (bits != 2 && bits != 4) || n_queries <= 0 || !turbovec_supported_dim(dim, true)) {
         return 0;
     }
     std::vector<float> rotated(static_cast<size_t>(n_queries) * static_cast<size_t>(dim));
@@ -1153,7 +1368,7 @@ uint64_t turbovec_lut_hash_for_test(
     float lut_bias = 0.0f;
     build_turbovec_query_lut(
         calibrated.data(),
-        turbovec_codebook(bits, dim).centroids.data(),
+        turbovec_codebook(bits, dim, true).centroids.data(),
         bits,
         dim,
         lut,
@@ -1172,11 +1387,11 @@ uint64_t turbovec_lut_hash_for_test(
 }
 
 uint64_t turbovec_codebook_hash_for_test(int bits, int dim) {
-    if ((bits != 2 && bits != 4) || !turbovec_q4_supported_dim(dim)) {
+    if ((bits != 2 && bits != 4) || !turbovec_supported_dim(dim, true)) {
         return 0;
     }
     uint64_t hash = UINT64_C(0xcbf29ce484222325);
-    for (float value : turbovec_codebook(bits, dim).centroids) {
+    for (float value : turbovec_codebook(bits, dim, true).centroids) {
         uint32_t bits_value = 0;
         std::memcpy(&bits_value, &value, sizeof(bits_value));
         for (int byte = 0; byte < 4; ++byte) {
@@ -1188,12 +1403,54 @@ uint64_t turbovec_codebook_hash_for_test(int bits, int dim) {
 }
 #endif
 
-void prepare_turbovec(int bits, int dim) {
-    if ((bits != 2 && bits != 4) || !turbovec_q4_supported_dim(dim)) {
+#ifdef GGML_VEC_INDEX_TEST_HOOKS
+void turbovec_hadamard_rotate_for_test(const float * src, float * dst, int dim) {
+    const std::shared_ptr<const TurboVecHadamardRotation> rotation = turbovec_hadamard_rotation(dim);
+    std::vector<float> scratch(static_cast<size_t>(dim));
+    apply_turbovec_hadamard(*rotation, src, 1.0f, dst, scratch.data());
+}
+
+static uint64_t turbovec_fnv1a_for_test(uint64_t hash, const void * data, size_t size) {
+    const auto * bytes = static_cast<const uint8_t *>(data);
+    for (size_t i = 0; i < size; ++i) {
+        hash ^= bytes[i];
+        hash *= UINT64_C(0x100000001b3);
+    }
+    return hash;
+}
+
+int turbovec_index_hashes_for_test(
+        const ggml_vec_index_t * idx,
+        uint64_t * codes_hash,
+        uint64_t * scales_hash,
+        uint64_t * shift_hash,
+        uint64_t * scale_hash) {
+    if (idx == nullptr || !is_turbovec(*idx)) {
+        return 0;
+    }
+    std::shared_lock<std::shared_mutex> lock(idx->mutex);
+    constexpr uint64_t basis = UINT64_C(0xcbf29ce484222325);
+    *codes_hash = turbovec_fnv1a_for_test(basis, idx->turbovec_data.data(), idx->turbovec_data.size());
+    *scales_hash = turbovec_fnv1a_for_test(
+        basis, idx->turbovec_scale.data(), idx->turbovec_scale.size() * sizeof(float));
+    *shift_hash = turbovec_fnv1a_for_test(
+        basis, idx->turbovec_tqplus_shift.data(), idx->turbovec_tqplus_shift.size() * sizeof(float));
+    *scale_hash = turbovec_fnv1a_for_test(
+        basis, idx->turbovec_tqplus_scale.data(), idx->turbovec_tqplus_scale.size() * sizeof(float));
+    return 1;
+}
+#endif
+
+void prepare_turbovec(int bits, int dim, bool legacy) {
+    if (bits < 2 || bits > 4 || !turbovec_supported_dim(dim, legacy)) {
         return;
     }
-    (void) turbovec_rotation(dim);
-    (void) turbovec_codebook(bits, dim);
+    if (legacy) {
+        (void) turbovec_rotation(dim);
+    } else {
+        (void) turbovec_hadamard_rotation(dim);
+    }
+    (void) turbovec_codebook(bits, dim, legacy);
 }
 
 #ifdef GGML_VEC_INDEX_TEST_HOOKS
@@ -1230,22 +1487,8 @@ void turbovec_clear_blocked_for_test(ggml_vec_index_t * idx) {
 }
 #endif
 
-size_t turbovec_q2_row_bytes(size_t dim) {
-    return dim / 4;
-}
-
-size_t turbovec_q2_scale_count(size_t dim) {
-    (void) dim;
-    return 1;
-}
-
-size_t turbovec_q4_row_bytes(size_t dim) {
-    return dim / 2;
-}
-
-size_t turbovec_q4_scale_count(size_t dim) {
-    (void) dim;
-    return 1;
+size_t turbovec_row_bytes(int bits, size_t dim) {
+    return static_cast<size_t>(bits) * (dim / 8);
 }
 
 static void repack_turbovec_code_block(
@@ -1606,16 +1849,27 @@ void score_turbovec_lut_block_4(
 #endif
 }
 
-void rotate_turbovec_query(const float * src, float * dst, int dim) {
-    rotate_turbovec_queries(src, dst, 1, dim);
+void rotate_turbovec_query(bool legacy, const float * src, float * dst, int dim) {
+    rotate_turbovec_queries(legacy, src, dst, 1, dim);
 }
 
 void rotate_turbovec_queries(
+        bool legacy,
         const float * src,
         float * dst,
         int n_queries,
         int dim) {
-    apply_turbovec_query_rotation_batch(src, dst, n_queries, dim);
+    if (legacy) {
+        apply_turbovec_query_rotation_batch(src, dst, n_queries, dim);
+        return;
+    }
+    const ScopedNearestRounding rounding_guard;
+    const std::shared_ptr<const TurboVecHadamardRotation> rotation = turbovec_hadamard_rotation(dim);
+    std::vector<float> scratch(static_cast<size_t>(dim));
+    for (int query = 0; query < n_queries; ++query) {
+        const size_t offset = static_cast<size_t>(query) * static_cast<size_t>(dim);
+        apply_turbovec_hadamard(*rotation, src + offset, 1.0f, dst + offset, scratch.data());
+    }
 }
 
 void quantize_turbovec_batch(
@@ -1631,7 +1885,7 @@ void quantize_turbovec_batch(
     const size_t dim_sz = static_cast<size_t>(dim);
     const size_t n_sz = static_cast<size_t>(n);
     const size_t row_bytes = static_cast<size_t>(bits) * (dim_sz / 8);
-    const TurboVecCodebook & codebook = turbovec_codebook(bits, dim);
+    const TurboVecCodebook & codebook = turbovec_codebook(bits, dim, true);
 
     std::vector<double> norms(n_sz);
     std::vector<float> unit(n_sz * dim_sz);
@@ -1721,7 +1975,9 @@ void quantize_turbovec_batch(
                 static_cast<double>(shift[coordinate]);
             inner += static_cast<double>(rotated_row[coordinate]) * centroid_original;
         }
-        if (!(inner > 1e-10)) {
+        // Degenerate reconstructions store scale 0 so one out-of-distribution
+        // vector cannot win every query (upstream #116).
+        if (!(inner > kTurboVecDegenerateInner)) {
             scales[static_cast<size_t>(row)] = 0.0f;
             continue;
         }
@@ -1738,6 +1994,340 @@ void quantize_turbovec_batch(
             scales[static_cast<size_t>(row)] = static_cast<float>(scale_f64);
         }
     }
+}
+
+void turbovec_codebook_values(
+        int bits,
+        int dim,
+        bool legacy,
+        std::vector<float> & boundaries,
+        std::vector<float> & centroids) {
+    const TurboVecCodebook & codebook = turbovec_codebook(bits, dim, legacy);
+    boundaries = codebook.boundaries;
+    centroids = codebook.centroids;
+}
+
+void turbovec_packed_row_to_seq(const uint8_t * packed, int bits, int dim, uint8_t * seq) {
+    const int n_byte_groups = dim / (8 / bits);
+    for (int group = 0; group < n_byte_groups; ++group) {
+        seq[group] = turbovec_group_code_byte(packed, group, bits, dim);
+    }
+}
+
+void turbovec_seq_row_to_packed(const uint8_t * seq, int bits, int dim, uint8_t * packed) {
+    const int codes_per_byte = 8 / bits;
+    const int field = bits == 3 ? 4 : bits;
+    const uint8_t mask = static_cast<uint8_t>((1u << bits) - 1u);
+    std::memset(packed, 0, turbovec_row_bytes(bits, static_cast<size_t>(dim)));
+    for (int coord = 0; coord < dim; ++coord) {
+        const int shift = (codes_per_byte - 1 - coord % codes_per_byte) * field;
+        const uint8_t code = static_cast<uint8_t>((seq[coord / codes_per_byte] >> shift) & mask);
+        turbovec_set_bitplane_code(packed, coord, bits, dim, code);
+    }
+}
+
+void decode_turbovec_row_calibrated(
+        int bits,
+        bool legacy,
+        const uint8_t * codes,
+        const float * scales,
+        const float * tqplus_shift,
+        const float * tqplus_scale,
+        float * dst,
+        int dim) {
+    const TurboVecCodebook & codebook = turbovec_codebook(bits, dim, legacy);
+    const float * centroids = codebook.centroids.data();
+    std::vector<float> rotated(static_cast<size_t>(dim));
+    for (int i = 0; i < dim; ++i) {
+        const uint8_t code = turbovec_get_bitplane_code(codes, i, bits, dim);
+        const size_t coordinate = static_cast<size_t>(i);
+        const float shift = tqplus_shift != nullptr ? tqplus_shift[coordinate] : 0.0f;
+        const float calibration_scale = tqplus_scale != nullptr ? tqplus_scale[coordinate] : 1.0f;
+        rotated[coordinate] =
+            (centroids[code] / calibration_scale - shift) * scales[0];
+    }
+    if (legacy) {
+        apply_turbovec_rotation(rotated.data(), dst, dim, true);
+        return;
+    }
+    const std::shared_ptr<const TurboVecHadamardRotation> rotation = turbovec_hadamard_rotation(dim);
+    std::vector<float> scratch(static_cast<size_t>(dim));
+    apply_turbovec_hadamard_inverse(*rotation, rotated.data(), dst, scratch.data());
+}
+
+void build_turbovec_lut(
+        int bits,
+        bool legacy,
+        const float * rotated_query,
+        int dim,
+        std::vector<uint8_t> & lut,
+        float & scale,
+        float & bias) {
+    const TurboVecCodebook & codebook = turbovec_codebook(bits, dim, legacy);
+    build_turbovec_query_lut(rotated_query, codebook.centroids.data(), bits, dim, lut, scale, bias);
+}
+
+float dot_turbovec_bits_lut_row(
+        const uint8_t * lut,
+        float lut_scale,
+        float lut_bias,
+        const uint8_t * codes,
+        const float * scales,
+        int bits,
+        int dim) {
+    return dot_turbovec_lut_row(lut, lut_scale, lut_bias, codes, scales, bits, dim);
+}
+
+// Quantize already-rotated unit rows under (shift, scale_tq) and pack one
+// bit-plane row each, returning the per-vector correction scale (upstream
+// encode.rs `fused_quantize_scale_pack_scalar` + `scale_from_inner`).
+static float quantize_turbovec_hadamard_row(
+        const float * rotated,
+        float norm,
+        const float * shift,
+        const float * scale_tq,
+        const float * inv_scale_tq,
+        const TurboVecCodebook & codebook,
+        int bits,
+        int dim,
+        uint8_t * packed_row) {
+    const size_t bytes_per_plane = static_cast<size_t>(dim) / 8;
+    const int n_boundaries = (1 << bits) - 1;
+    const float * boundaries = codebook.boundaries.data();
+    const float * centroids = codebook.centroids.data();
+    double chains[4] = {};
+    for (int chunk = 0; chunk < dim / 8; ++chunk) {
+        uint8_t codes[8];
+        for (int k = 0; k < 8; ++k) {
+            const int j = chunk * 8 + k;
+            const float calibrated = (rotated[j] + shift[j]) * scale_tq[j];
+            uint8_t code = 0;
+            for (int b = 0; b < n_boundaries; ++b) {
+                if (calibrated > boundaries[b]) {
+                    ++code;
+                }
+            }
+            codes[k] = code;
+            const double reconstructed =
+                static_cast<double>(centroids[code]) * static_cast<double>(inv_scale_tq[j]) -
+                static_cast<double>(shift[j]);
+            chains[j % 4] += static_cast<double>(rotated[j]) * reconstructed;
+        }
+        for (int plane = 0; plane < bits; ++plane) {
+            uint8_t byte = 0;
+            for (int k = 0; k < 8; ++k) {
+                byte |= static_cast<uint8_t>(((codes[k] >> plane) & 1u) << (7 - k));
+            }
+            packed_row[static_cast<size_t>(plane) * bytes_per_plane + static_cast<size_t>(chunk)] = byte;
+        }
+    }
+    const double inner = (chains[0] + chains[1]) + (chains[2] + chains[3]);
+    // Written positively so a NaN inner lands in the degenerate branch.
+    return inner > kTurboVecDegenerateInner ? norm / static_cast<float>(inner) : 0.0f;
+}
+
+struct TurboVecCalibrationView {
+    std::vector<float> identity_shift;
+    std::vector<float> identity_scale;
+    const float * shift = nullptr;
+    const float * scale = nullptr;
+    std::vector<float> inverse_scale;
+
+    TurboVecCalibrationView(const std::vector<float> & tq_shift, const std::vector<float> & tq_scale, int dim) {
+        const size_t dim_sz = static_cast<size_t>(dim);
+        if (tq_shift.empty()) {
+            identity_shift.assign(dim_sz, 0.0f);
+            identity_scale.assign(dim_sz, 1.0f);
+            shift = identity_shift.data();
+            scale = identity_scale.data();
+        } else {
+            if (tq_shift.size() != dim_sz || tq_scale.size() != dim_sz) {
+                throw std::invalid_argument("invalid TurboVec TQ+ calibration");
+            }
+            shift = tq_shift.data();
+            scale = tq_scale.data();
+        }
+        inverse_scale.resize(dim_sz);
+        for (size_t i = 0; i < dim_sz; ++i) {
+            inverse_scale[i] = 1.0f / scale[i];
+        }
+    }
+};
+
+void quantize_turbovec_hadamard_batch(
+        const float * src,
+        int n,
+        int bits,
+        uint8_t * dst,
+        float * scales,
+        int dim,
+        const std::vector<float> & tqplus_shift,
+        const std::vector<float> & tqplus_scale) {
+    const ScopedNearestRounding rounding_guard;
+    const size_t dim_sz = static_cast<size_t>(dim);
+    const size_t row_bytes = turbovec_row_bytes(bits, dim_sz);
+    const TurboVecCodebook & codebook = turbovec_codebook(bits, dim, false);
+    const std::shared_ptr<const TurboVecHadamardRotation> rotation = turbovec_hadamard_rotation(dim);
+    const TurboVecCalibrationView calibration(tqplus_shift, tqplus_scale, dim);
+    std::vector<float> rotated(dim_sz);
+    std::vector<float> scratch(dim_sz);
+    for (int row = 0; row < n; ++row) {
+        const float * input = src + static_cast<size_t>(row) * dim_sz;
+        const float norm = turbovec_hadamard_norm(input, dim);
+        const float inv = norm > kTurboVecMinInputNorm ? 1.0f / norm : 0.0f;
+        apply_turbovec_hadamard(*rotation, input, inv, rotated.data(), scratch.data());
+        scales[row] = quantize_turbovec_hadamard_row(
+            rotated.data(),
+            norm,
+            calibration.shift,
+            calibration.scale,
+            calibration.inverse_scale.data(),
+            codebook,
+            bits,
+            dim,
+            dst + static_cast<size_t>(row) * row_bytes);
+    }
+}
+
+// Total-order sort key for f32 (upstream encode.rs `f32_sort_key`): ranking
+// keys and mapping back gives the same order statistic as ranking values.
+static uint32_t turbovec_f32_sort_key(float value) {
+    uint32_t bits = 0;
+    std::memcpy(&bits, &value, sizeof(bits));
+    return bits ^ (static_cast<uint32_t>(static_cast<int32_t>(bits) >> 31) | 0x80000000u);
+}
+
+static float turbovec_f32_from_sort_key(uint32_t key) {
+    const uint32_t mask = (key & 0x80000000u) != 0 ? 0x80000000u : 0xffffffffu;
+    const uint32_t bits = key ^ mask;
+    float value = 0.0f;
+    std::memcpy(&value, &bits, sizeof(value));
+    return value;
+}
+
+int fit_turbovec_calibration(
+        const float * sample,
+        int n,
+        int bits,
+        int dim,
+        std::vector<float> & out_shift,
+        std::vector<float> & out_scale) {
+    const ScopedNearestRounding rounding_guard;
+    if (n < kTurboVecMinCalibrationRows) {
+        return GGML_VEC_INDEX_E_INVALID_ARG;
+    }
+    const size_t dim_sz = static_cast<size_t>(dim);
+    const size_t n_sz = static_cast<size_t>(n);
+    const std::shared_ptr<const TurboVecHadamardRotation> rotation = turbovec_hadamard_rotation(dim);
+    std::vector<float> rotated(n_sz * dim_sz);
+    std::vector<float> scratch(dim_sz);
+    for (size_t row = 0; row < n_sz; ++row) {
+        const float * input = sample + row * dim_sz;
+        const float norm = turbovec_hadamard_norm(input, dim);
+        const float inv = norm > kTurboVecMinInputNorm ? 1.0f / norm : 0.0f;
+        apply_turbovec_hadamard(*rotation, input, inv, rotated.data() + row * dim_sz, scratch.data());
+    }
+
+    // Anchor on the codebook's outermost centroid (upstream #454): the
+    // probability level P(|x| <= c_outer) moves with bit width.
+    const TurboVecCodebook & codebook = turbovec_codebook(bits, dim, false);
+    float c_outer = 0.0f;
+    for (float centroid : codebook.centroids) {
+        c_outer = std::max(c_outer, std::fabs(centroid));
+    }
+    const double beta_a = (static_cast<double>(dim) - 1.0) * 0.5;
+    const double p_hi = regularized_beta((static_cast<double>(c_outer) + 1.0) / 2.0, beta_a, beta_a);
+    const double p_lo = 1.0 - p_hi;
+    const float qc_lo = -c_outer;
+    const float qc_hi = c_outer;
+    const float qc_span = qc_hi - qc_lo;
+    const size_t lo_index = static_cast<size_t>(static_cast<double>(n_sz) * p_lo);
+    const size_t hi_index = std::max(
+        std::min(static_cast<size_t>(static_cast<double>(n_sz) * p_hi), n_sz - 1),
+        lo_index + 1);
+
+    std::vector<float> shift(dim_sz, 0.0f);
+    std::vector<float> scale(dim_sz, 1.0f);
+    std::vector<uint32_t> keys(n_sz);
+    for (size_t column = 0; column < dim_sz; ++column) {
+        for (size_t row = 0; row < n_sz; ++row) {
+            keys[row] = turbovec_f32_sort_key(rotated[row * dim_sz + column]);
+        }
+        std::nth_element(keys.begin(), keys.begin() + static_cast<std::ptrdiff_t>(lo_index), keys.end());
+        const float qe_lo = turbovec_f32_from_sort_key(keys[lo_index]);
+        std::nth_element(
+            keys.begin() + static_cast<std::ptrdiff_t>(lo_index) + 1,
+            keys.begin() + static_cast<std::ptrdiff_t>(hi_index),
+            keys.end());
+        const float qe_hi = turbovec_f32_from_sort_key(keys[hi_index]);
+        const float qe_span = qe_hi - qe_lo;
+        if (qe_span > 1e-6f) {
+            scale[column] = qc_span / qe_span;
+            shift[column] = qc_lo / scale[column] - qe_lo;
+        }
+    }
+
+    bool identity = true;
+    for (size_t i = 0; i < dim_sz && identity; ++i) {
+        identity = shift[i] == 0.0f && scale[i] == 1.0f;
+    }
+    if (identity) {
+        return GGML_VEC_INDEX_E_INVALID_ARG;
+    }
+    out_shift.swap(shift);
+    out_scale.swap(scale);
+    return GGML_VEC_INDEX_OK;
+}
+
+void reencode_turbovec_rows(
+        int bits,
+        int dim,
+        size_t n,
+        const uint8_t * codes,
+        const float * scales,
+        const std::vector<float> & old_shift,
+        const std::vector<float> & old_scale,
+        const std::vector<float> & new_shift,
+        const std::vector<float> & new_scale,
+        std::vector<uint8_t> & out_codes,
+        std::vector<float> & out_scales) {
+    const ScopedNearestRounding rounding_guard;
+    const size_t dim_sz = static_cast<size_t>(dim);
+    const size_t row_bytes = turbovec_row_bytes(bits, dim_sz);
+    const TurboVecCodebook & codebook = turbovec_codebook(bits, dim, false);
+    const float * centroids = codebook.centroids.data();
+    const TurboVecCalibrationView old_calibration(old_shift, old_scale, dim);
+    const TurboVecCalibrationView new_calibration(new_shift, new_scale, dim);
+    std::vector<uint8_t> next_codes(n * row_bytes);
+    std::vector<float> next_scales(n);
+    std::vector<float> reconstructed(dim_sz);
+    for (size_t row = 0; row < n; ++row) {
+        // Rebuild the rotated row from its codes under the old pair, then
+        // encode it under the new one (upstream lib.rs `reencode_stored_rows`).
+        const uint8_t * packed = codes + row * row_bytes;
+        double sum_squares = 0.0;
+        for (int d = 0; d < dim; ++d) {
+            const uint8_t code = turbovec_get_bitplane_code(packed, d, bits, dim);
+            const float x =
+                centroids[code] * old_calibration.inverse_scale[static_cast<size_t>(d)] -
+                old_calibration.shift[d];
+            reconstructed[static_cast<size_t>(d)] = x;
+            sum_squares += static_cast<double>(x) * static_cast<double>(x);
+        }
+        const float norm = static_cast<float>(static_cast<double>(scales[row]) * sum_squares);
+        next_scales[row] = quantize_turbovec_hadamard_row(
+            reconstructed.data(),
+            norm,
+            new_calibration.shift,
+            new_calibration.scale,
+            new_calibration.inverse_scale.data(),
+            codebook,
+            bits,
+            dim,
+            next_codes.data() + row * row_bytes);
+    }
+    out_codes.swap(next_codes);
+    out_scales.swap(next_scales);
 }
 
 void quantize_turbovec_q2_row(const float * src, uint8_t * dst, float * scales, int dim) {
@@ -1757,18 +2347,7 @@ void decode_turbovec_q2_row_calibrated(
         const float * tqplus_scale,
         float * dst,
         int dim) {
-    const TurboVecCodebook & codebook = turbovec_codebook(2, dim);
-    const float * centroids = codebook.centroids.data();
-    std::vector<float> rotated(static_cast<size_t>(dim));
-    for (int i = 0; i < dim; ++i) {
-        const uint8_t code = turbovec_get_bitplane_code(codes, i, 2, dim);
-        const size_t coordinate = static_cast<size_t>(i);
-        const float shift = tqplus_shift != nullptr ? tqplus_shift[coordinate] : 0.0f;
-        const float calibration_scale = tqplus_scale != nullptr ? tqplus_scale[coordinate] : 1.0f;
-        rotated[coordinate] =
-            (centroids[code] / calibration_scale - shift) * scales[0];
-    }
-    apply_turbovec_rotation(rotated.data(), dst, dim, true);
+    decode_turbovec_row_calibrated(2, true, codes, scales, tqplus_shift, tqplus_scale, dst, dim);
 }
 
 float dot_turbovec_q2_rotated_row(const float * rotated_query, const uint8_t * codes, const float * scales, int dim) {
@@ -1781,7 +2360,7 @@ float dot_turbovec_q2_rotated_row(const float * rotated_query, const uint8_t * c
 
 float dot_turbovec_q2_row(const float * query, const uint8_t * codes, const float * scales, int dim) {
     std::vector<float> rotated(static_cast<size_t>(dim));
-    rotate_turbovec_query(query, rotated.data(), dim);
+    rotate_turbovec_query(true, query, rotated.data(), dim);
     return dot_turbovec_q2_rotated_row(rotated.data(), codes, scales, dim);
 }
 
@@ -1792,8 +2371,7 @@ void quantize_turbovec_q4_row(const float * src, uint8_t * dst, float * scales, 
 }
 
 void build_turbovec_q2_lut(const float * rotated_query, int dim, std::vector<uint8_t> & lut, float & scale, float & bias) {
-    const TurboVecCodebook & codebook = turbovec_codebook(2, dim);
-    build_turbovec_query_lut(rotated_query, codebook.centroids.data(), 2, dim, lut, scale, bias);
+    build_turbovec_lut(2, true, rotated_query, dim, lut, scale, bias);
 }
 
 float dot_turbovec_q2_lut_row(
@@ -1817,23 +2395,11 @@ void decode_turbovec_q4_row_calibrated(
         const float * tqplus_scale,
         float * dst,
         int dim) {
-    const TurboVecCodebook & codebook = turbovec_codebook(4, dim);
-    const float * centroids = codebook.centroids.data();
-    std::vector<float> rotated(static_cast<size_t>(dim));
-    for (int i = 0; i < dim; ++i) {
-        const uint8_t code = turbovec_get_bitplane_code(codes, i, 4, dim);
-        const size_t coordinate = static_cast<size_t>(i);
-        const float shift = tqplus_shift != nullptr ? tqplus_shift[coordinate] : 0.0f;
-        const float calibration_scale = tqplus_scale != nullptr ? tqplus_scale[coordinate] : 1.0f;
-        rotated[coordinate] =
-            (centroids[code] / calibration_scale - shift) * scales[0];
-    }
-    apply_turbovec_rotation(rotated.data(), dst, dim, true);
+    decode_turbovec_row_calibrated(4, true, codes, scales, tqplus_shift, tqplus_scale, dst, dim);
 }
 
 void build_turbovec_q4_lut(const float * rotated_query, int dim, std::vector<uint8_t> & lut, float & scale, float & bias) {
-    const TurboVecCodebook & codebook = turbovec_codebook(4, dim);
-    build_turbovec_query_lut(rotated_query, codebook.centroids.data(), 4, dim, lut, scale, bias);
+    build_turbovec_lut(4, true, rotated_query, dim, lut, scale, bias);
 }
 
 float dot_turbovec_q4_lut_row(
@@ -1856,6 +2422,6 @@ float dot_turbovec_q4_rotated_row(const float * rotated_query, const uint8_t * c
 
 float dot_turbovec_q4_row(const float * query, const uint8_t * codes, const float * scales, int dim) {
     std::vector<float> rotated(static_cast<size_t>(dim));
-    rotate_turbovec_query(query, rotated.data(), dim);
+    rotate_turbovec_query(true, query, rotated.data(), dim);
     return dot_turbovec_q4_rotated_row(rotated.data(), codes, scales, dim);
 }
