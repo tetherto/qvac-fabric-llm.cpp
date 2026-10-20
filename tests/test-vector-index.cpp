@@ -5855,6 +5855,44 @@ void check_turbovec_1x_staged() {
             ggml_vec_index_free(tv);
         }
     }
+#if defined(__aarch64__) || defined(_M_ARM64)
+    // A batch in which only query 0's sampled seed runs short: upstream
+    // rescans it with the single-query sign tables, and so does the port.
+    {
+        const int short_k = kTv1xStagedShortK;
+        std::vector<float> short_db = db;
+        const std::vector<float> noise = tv1x_rows(kTv1xStagedShortNoiseSeed, 48 * 32, dim);
+        const size_t stride = (static_cast<size_t>(n) / 32) / 48;
+        for (size_t i = 0; i < 48; ++i) {
+            const size_t block = i * stride + stride / 2;
+            for (size_t lane = 0; lane < 32; ++lane) {
+                const size_t row = block * 32 + lane;
+                for (size_t c = 0; c < dim; ++c) {
+                    short_db[row * dim + c] = queries[c] + 0.05f * noise[(i * 32 + lane) * dim + c];
+                }
+            }
+        }
+        for (const Tv1xStagedShortCase & c : kTv1xStagedShortCases) {
+            auto * tv = ggml_vec_index_create_turbovec(static_cast<int>(dim), c.bits);
+            if (c.calibrated != 0) {
+                CHECK(ggml_vec_index_turbovec_calibrate(tv, calib.data(), kTv1xNCalib) == GGML_VEC_INDEX_OK);
+            }
+            CHECK(ggml_vec_index_add(tv, short_db.data(), n, ids.data()) == GGML_VEC_INDEX_OK);
+            std::vector<float> scores(static_cast<size_t>(3 * short_k));
+            std::vector<uint64_t> out(scores.size());
+            for (const int threads : { 1, 4 }) {
+                ggml_vec_index_set_threads(tv, threads);
+                CHECK(ggml_vec_index_search(tv, queries.data(), 3, short_k, scores.data(), out.data()) ==
+                      GGML_VEC_INDEX_OK);
+                for (size_t i = 0; i < out.size(); ++i) {
+                    CHECK(out[i] == c.ids[i]);
+                    CHECK(scores[i] == c.scores[i]);
+                }
+            }
+            ggml_vec_index_free(tv);
+        }
+    }
+#endif
     turbovec_force_vector_major_for_test(-1);
     turbovec_force_planes_for_test(-1, 0);
 }

@@ -674,13 +674,24 @@ void turbovec_planes_reset(ggml_vec_index & idx);
 void turbovec_planes_swap_remove(ggml_vec_index & idx, size_t slot, size_t last);
 // Searches one query (rotated, TQ+-calibrated) in stages into `heap`;
 // returns false when the index is not set up for it.
+// How a staged search is run, following upstream's batch bookkeeping.
+struct TurboVecStagedOpts {
+    // The call searches one query: on aarch64 its sign tables cap at 31.
+    bool single_query = false;
+    // The shortlist scan alone uses a lone query's tables (upstream's
+    // rescan of the one query in a batch whose sampled seed ran short).
+    bool sign_single = false;
+    // Set to whether upstream's sampled seed would have left this query's
+    // shortlist short; false when upstream does not seed.
+    bool * seed_short = nullptr;
+};
 bool turbovec_staged_search(
     const ggml_vec_index & idx,
     const float * query,
     float bias_corr,
     int k,
     const uint8_t * allowed_mask,
-    bool single_query,
+    const TurboVecStagedOpts & opts,
     std::vector<ScoreId> & heap);
 void prepare_turbovec(int bits, int dim, bool legacy);
 void rotate_turbovec_query(bool legacy, const float * src, float * dst, int dim);
