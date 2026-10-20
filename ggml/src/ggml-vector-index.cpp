@@ -398,6 +398,17 @@ void rollback_appended_slots_unlocked(
     if (is_turbovec(*idx)) {
         idx->turbovec_data.resize(base_slot * turbovec_row_bytes(idx->turbovec_bits, dim_sz));
         idx->turbovec_scale.resize(base_slot);
+        // The blocked cache may already cover the appended rows.
+        const size_t n_byte_groups = dim_sz / static_cast<size_t>(8 / idx->turbovec_bits);
+        idx->turbovec_blocked_n_blocks = (base_slot + 31) / 32;
+        idx->turbovec_blocked_data.resize(idx->turbovec_blocked_n_blocks * n_byte_groups * 32);
+        TurboVecSyncBinding & rows = idx->turbovec_sync;
+        while (!rows.file_rows.empty() && rows.file_rows.back() >= base_slot) {
+            rows.file_rows.pop_back();
+        }
+        if (rows.slot_rows.size() > base_slot) {
+            rows.slot_rows.resize(base_slot);
+        }
         // Only a legacy index fits its calibration on the first add; a 1.x
         // calibration comes from an explicit calibrate call and survives.
         if (base_slot == 0 && idx->turbovec_legacy) {
@@ -520,7 +531,9 @@ int ggml_vec_index_add_unlocked(
             max_slots = std::min(max_slots, std::numeric_limits<size_t>::max() / scale_count / sizeof(float));
         }
         size_t current_slots = std::min(idx->slot_to_id.capacity(), idx->slot_active.capacity());
-        if (is_q4(*idx)) {
+        if (is_turbovec(*idx)) {
+            // Codes and scales grow near-exactly; nothing in the f32 store.
+        } else if (is_q4(*idx)) {
             const size_t row_bytes = q4_row_bytes(dim_sz);
             current_slots = std::min(current_slots, idx->q4_data.capacity() / row_bytes);
             current_slots = std::min(current_slots, idx->q4_scale.capacity());
@@ -532,7 +545,10 @@ int ggml_vec_index_add_unlocked(
         }
         const size_t target_slots  = grow_capacity(current_slots, new_slots, max_slots);
 
-        if (is_q4(*idx)) {
+        if (is_turbovec(*idx)) {
+            reserve_mostly_exact(idx->turbovec_data, n_sz * row_elements);
+            reserve_mostly_exact(idx->turbovec_scale, n_sz);
+        } else if (is_q4(*idx)) {
             const size_t row_bytes     = q4_row_bytes(dim_sz);
             const size_t target_values = target_slots * row_bytes;
             if (idx->q4_data.capacity() < target_values) {
@@ -640,7 +656,6 @@ int ggml_vec_index_add_unlocked(
         }
         idx->n_active += n_sz;
         if (is_turbovec(*idx)) {
-            turbovec_sync_note_add(*idx, base_slot, n_sz);
             repack_turbovec_codes_from_slot(
                 idx->turbovec_data.data(),
                 new_slots,
@@ -649,6 +664,9 @@ int ggml_vec_index_add_unlocked(
                 base_slot,
                 idx->turbovec_blocked_data,
                 idx->turbovec_blocked_n_blocks);
+            // Last: nothing after it can fail, so a rolled-back add never
+            // leaves the row order naming slots that no longer exist.
+            turbovec_sync_note_add(*idx, base_slot, n_sz);
         }
         for (size_t slot = base_slot; slot < new_slots; ++slot) {
             add_state_hash(*idx, slot_state_hash(*idx, slot));

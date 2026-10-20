@@ -662,7 +662,13 @@ void search_one(
             };
             const uint8_t * block_filter = allowed_blocks.empty() ? nullptr : allowed_blocks.data();
             const size_t n_blocks = idx.turbovec_blocked_n_blocks;
-            if (n_threads > 1 && n_blocks >= kTurboVecParallelMinBlocks) {
+            // Split on the blocks a filter actually leaves to score, so a
+            // narrow filter over a large index stays on one thread
+            // (upstream #554).
+            const size_t n_scored = allowed_blocks.empty() ?
+                n_blocks :
+                static_cast<size_t>(std::count(allowed_blocks.begin(), allowed_blocks.end(), uint8_t{ 1 }));
+            if (n_threads > 1 && n_scored >= kTurboVecParallelMinBlocks) {
                 // One query over many blocks: score block ranges on each
                 // worker into its own heap, then merge. Top-k uses a strict
                 // (score, id) order, so the split cannot change the result.

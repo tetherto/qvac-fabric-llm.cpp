@@ -197,6 +197,24 @@ struct MinHeapCmp {
     bool operator()(const ScoreId & a, const ScoreId & b) const { return score_id_better(a, b); }
 };
 
+// Reserves room for `additional` more elements without doubling a tight
+// buffer for a small append (upstream lib.rs `reserve_mostly_exact`, #501):
+// appends of at most an eighth of the length reserve exactly, plus an
+// eighth of headroom so a run of small appends stays amortized.
+template <typename T>
+void reserve_mostly_exact(std::vector<T> & v, size_t additional) {
+    const size_t len = v.size();
+    if (v.capacity() - len >= additional) {
+        return;
+    }
+    const size_t headroom = len / 8;
+    if (additional <= headroom) {
+        v.reserve(len + additional + headroom);
+    } else {
+        v.reserve(std::max(len + additional, v.capacity() + v.capacity() / 2));
+    }
+}
+
 inline constexpr int kMaxThreads = 256;
 
 // Runs fn(task, worker) for every task in [0, n_tasks) on up to n_threads
