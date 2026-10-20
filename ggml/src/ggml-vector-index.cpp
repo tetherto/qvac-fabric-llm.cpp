@@ -402,13 +402,6 @@ void rollback_appended_slots_unlocked(
         const size_t n_byte_groups = dim_sz / static_cast<size_t>(8 / idx->turbovec_bits);
         idx->turbovec_blocked_n_blocks = (base_slot + 31) / 32;
         idx->turbovec_blocked_data.resize(idx->turbovec_blocked_n_blocks * n_byte_groups * 32);
-        TurboVecSyncBinding & rows = idx->turbovec_sync;
-        while (!rows.file_rows.empty() && rows.file_rows.back() >= base_slot) {
-            rows.file_rows.pop_back();
-        }
-        if (rows.slot_rows.size() > base_slot) {
-            rows.slot_rows.resize(base_slot);
-        }
         // Only a legacy index fits its calibration on the first add; a 1.x
         // calibration comes from an explicit calibrate call and survives.
         if (base_slot == 0 && idx->turbovec_legacy) {
@@ -664,9 +657,6 @@ int ggml_vec_index_add_unlocked(
                 base_slot,
                 idx->turbovec_blocked_data,
                 idx->turbovec_blocked_n_blocks);
-            // Last: nothing after it can fail, so a rolled-back add never
-            // leaves the row order naming slots that no longer exist.
-            turbovec_sync_note_add(*idx, base_slot, n_sz);
         }
         for (size_t slot = base_slot; slot < new_slots; ++slot) {
             add_state_hash(*idx, slot_state_hash(*idx, slot));
@@ -705,6 +695,30 @@ int ggml_vec_index_add(
     }
 }
 
+// Upstream turbovec's swap_remove: the last slot's row moves into `slot`
+// and the index shrinks by one, so a TurboVec 1.x index never holds
+// tombstones and its slot order is upstream's row order. Allocation-free.
+static void turbovec_swap_remove(ggml_vec_index & idx, size_t slot) {
+    turbovec_sync_note_remove(idx, slot);
+    const size_t last = idx.slot_to_id.size() - 1;
+    const size_t row_bytes = turbovec_row_bytes(idx.turbovec_bits, static_cast<size_t>(idx.dim));
+    if (slot != last) {
+        std::memcpy(
+            idx.turbovec_data.data() + slot * row_bytes,
+            idx.turbovec_data.data() + last * row_bytes,
+            row_bytes);
+        idx.turbovec_scale[slot] = idx.turbovec_scale[last];
+        idx.slot_to_id[slot] = idx.slot_to_id[last];
+        idx.id_to_slot[idx.slot_to_id[slot]] = slot;
+    }
+    idx.turbovec_data.resize(last * row_bytes);
+    idx.turbovec_scale.resize(last);
+    idx.slot_to_id.resize(last);
+    idx.slot_active.resize(last);
+    --idx.n_active;
+    turbovec_blocked_swap_remove(idx, slot, last);
+}
+
 int ggml_vec_index_remove_unlocked(
         ggml_vec_index_t * idx,
         uint64_t id,
@@ -732,8 +746,15 @@ int ggml_vec_index_remove_unlocked(
             return GGML_VEC_INDEX_E_INVALID_ARG;
         }
         remove_state_hash(*idx, slot_state_hash(*idx, slot));
-        if (is_turbovec(*idx)) {
-            turbovec_sync_note_remove(*idx, slot);
+        if (is_turbovec(*idx) && !idx->turbovec_legacy) {
+            turbovec_swap_remove(*idx, slot);
+            idx->id_to_slot.erase(id);
+            ++idx->generation;
+            invalidate_ivf(*idx);
+            if (!allow_delta_bound) {
+                idx->delta_log_start_allowed = false;
+            }
+            return GGML_VEC_INDEX_OK;
         }
         idx->slot_active[slot] = 0;
         --idx->n_active;
@@ -894,9 +915,6 @@ static int ggml_vec_index_compact_unlocked(ggml_vec_index_t * idx) {
             idx->data.swap(new_data);
         }
 
-        if (is_turbovec(*idx)) {
-            turbovec_sync_note_compact(*idx);
-        }
         idx->slot_to_id.swap(new_slot_to_id);
         idx->slot_active.swap(new_slot_active);
         idx->id_to_slot.swap(new_id_to_slot);

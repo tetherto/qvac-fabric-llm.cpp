@@ -265,9 +265,8 @@ void parallel_for(size_t n_tasks, int n_threads, Fn && fn) {
 }
 
 // A TurboVec index's binding to the v8 file it syncs to (upstream
-// `SyncCursor` plus its dirty sets). The file's row r holds slot
-// file_rows[r]: removals move the last row into the hole as upstream's
-// swap-remove does, so the file's row order can differ from slot order.
+// `SyncCursor` plus its dirty sets). A 1.x index removes by swap-remove,
+// as upstream does, so its slot order is the file's row order.
 struct TurboVecSyncBinding {
     bool bound = false;
     std::string path;
@@ -277,9 +276,6 @@ struct TurboVecSyncBinding {
     uint64_t n_synced = 0;
     uint64_t nonce = 0;
     uint64_t calib_gen = 0;
-    std::vector<size_t> file_rows;
-    // slot -> file row, SIZE_MAX for a slot the file does not hold.
-    std::vector<size_t> slot_rows;
     // File rows whose redo ops ride the last commit, and rows changed since.
     std::unordered_set<size_t> pending;
     std::unordered_set<size_t> fresh;
@@ -683,10 +679,9 @@ int turbovec_read_file_range(
     uint64_t & file_size);
 void turbovec_sync_bind_loaded(ggml_vec_index & idx, const char * path, const TurboVecV8LoadInfo & info);
 void turbovec_sync_unbind(ggml_vec_index & idx) noexcept;
-void turbovec_sync_note_add(ggml_vec_index & idx, size_t base_slot, size_t n) noexcept;
+// Records a swap-remove of `slot` (the last slot moves into it) for the
+// next sync's redo ops.
 void turbovec_sync_note_remove(ggml_vec_index & idx, size_t slot) noexcept;
-// Call during compaction, while slot_active still describes the old slots.
-void turbovec_sync_note_compact(ggml_vec_index & idx) noexcept;
 int turbovec_v8_sync(ggml_vec_index & idx, const char * path);
 void decode_turbovec_q2_row(const uint8_t * codes, const float * scales, float * dst, int dim);
 void decode_turbovec_q2_row_calibrated(
@@ -713,6 +708,9 @@ void build_turbovec_q4_lut(const float * rotated_query, int dim, std::vector<uin
 float dot_turbovec_q4_lut_row(const uint8_t * lut, float lut_scale, float lut_bias, const uint8_t * codes, const float * scales, int dim);
 float dot_turbovec_q4_rotated_row(const float * rotated_query, const uint8_t * codes, const float * scales, int dim);
 float dot_turbovec_q4_row(const float * query, const uint8_t * codes, const float * scales, int dim);
+// Patches the blocked cache for a swap-remove of `slot` whose last slot
+// (`last`, already removed from the rows) moved into it.
+void turbovec_blocked_swap_remove(ggml_vec_index & idx, size_t slot, size_t last);
 void repack_turbovec_codes(
     const uint8_t * packed_codes,
     size_t n_vectors,
