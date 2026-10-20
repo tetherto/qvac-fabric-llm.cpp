@@ -723,9 +723,12 @@ TempFile::~TempFile() {
     remove_temp_file(*this);
 }
 
-static bool flush_and_sync(std::FILE * stream) {
+static bool flush_and_sync(std::FILE * stream, bool durable = true) {
     if (std::fflush(stream) != 0) {
         return false;
+    }
+    if (!durable) {
+        return true;
     }
 #ifdef GGML_VEC_INDEX_TEST_HOOKS
     if (g_test_data_fsync_fail.load()) {
@@ -3172,7 +3175,7 @@ static bool seek_to(std::FILE * stream, uint64_t offset) {
 // the two fixed-size header slots is skipped with a seek, so filesystems
 // with sparse-file support store it as a hole; the bytes read back are the
 // same as upstream's.
-int turbovec_v8_write_file(const char * path, const TurboVecV8Image & image) {
+int turbovec_v8_write_file(const char * path, const TurboVecV8Image & image, bool durable) {
     const uint64_t image_size = turbovec_v8_image_size(image);
 
     test_maybe_throw_bad_alloc();
@@ -3211,7 +3214,7 @@ int turbovec_v8_write_file(const char * path, const TurboVecV8Image & image) {
             }
         }
     }
-    if (!set_file_size(f, image_size) || !flush_and_sync(f)) {
+    if (!set_file_size(f, image_size) || !flush_and_sync(f, durable)) {
         return fail_io();
     }
     const int close_result = std::fclose(temp.stream);
@@ -3224,16 +3227,16 @@ int turbovec_v8_write_file(const char * path, const TurboVecV8Image & image) {
         return fail_io();
     }
     temp.path.clear();
-    if (!fsync_parent_dir(path)) {
+    if (durable && !fsync_parent_dir(path)) {
         return GGML_VEC_INDEX_E_NOT_DURABLE;
     }
     return GGML_VEC_INDEX_OK;
 }
 
-static int write_turbovec_v8_unlocked(ggml_vec_index_t * idx, const char * path) {
+static int write_turbovec_v8_unlocked(ggml_vec_index_t * idx, const char * path, bool durable) {
     TurboVecV8Image image;
     turbovec_v8_build_image(*idx, image);
-    return turbovec_v8_write_file(path, image);
+    return turbovec_v8_write_file(path, image, durable);
 }
 
 static std::FILE * open_existing_rw(const char * path) {
@@ -3324,7 +3327,7 @@ int ggml_vec_index_sync(ggml_vec_index_t * idx, const char * path) {
     }
 }
 
-static int ggml_vec_index_write_unlocked(ggml_vec_index_t * idx, const char * path) {
+static int ggml_vec_index_write_unlocked(ggml_vec_index_t * idx, const char * path, bool durable = true) {
     try {
         if (idx == nullptr || path == nullptr) {
             return GGML_VEC_INDEX_E_INVALID_ARG;
@@ -3337,7 +3340,7 @@ static int ggml_vec_index_write_unlocked(ggml_vec_index_t * idx, const char * pa
             if (!has_vector_storage(*idx) || idx->turbovec_scale.size() != idx->slot_to_id.size()) {
                 return GGML_VEC_INDEX_E_INTERNAL;
             }
-            return write_turbovec_v8_unlocked(idx, path);
+            return write_turbovec_v8_unlocked(idx, path, durable);
         }
         if (active_count(*idx) > std::numeric_limits<uint32_t>::max()) {
             return GGML_VEC_INDEX_E_INVALID_ARG;
@@ -3535,7 +3538,7 @@ static int ggml_vec_index_write_unlocked(ggml_vec_index_t * idx, const char * pa
             !write_u32_le(f, vectors_crc ^ 0xffffffffu) || !write_u32_le(f, ids_crc ^ 0xffffffffu)) {
             return fail_io();
         }
-        if (!flush_and_sync(f)) {
+        if (!flush_and_sync(f, durable)) {
             return fail_io();
         }
         const int close_result = std::fclose(temp.stream);
@@ -3548,7 +3551,7 @@ static int ggml_vec_index_write_unlocked(ggml_vec_index_t * idx, const char * pa
             return fail_io();
         }
         temp.path.clear();
-        if (!fsync_parent_dir(path)) {
+        if (durable && !fsync_parent_dir(path)) {
             return GGML_VEC_INDEX_E_NOT_DURABLE;
         }
         return GGML_VEC_INDEX_OK;
@@ -3559,8 +3562,12 @@ static int ggml_vec_index_write_unlocked(ggml_vec_index_t * idx, const char * pa
     }
 }
 
-int ggml_vec_index_write(ggml_vec_index_t * idx, const char * path) {
-    if (idx == nullptr) {
+int ggml_vec_index_write_with_durability(
+        ggml_vec_index_t * idx,
+        const char * path,
+        enum ggml_vec_index_durability durability) {
+    if (idx == nullptr ||
+        (durability != GGML_VEC_INDEX_DURABILITY_DURABLE && durability != GGML_VEC_INDEX_DURABILITY_FAST)) {
         return GGML_VEC_INDEX_E_INVALID_ARG;
     }
     try {
@@ -3568,14 +3575,20 @@ int ggml_vec_index_write(ggml_vec_index_t * idx, const char * path) {
         if (idx->delta_log_bound) {
             return GGML_VEC_INDEX_E_INVALID_ARG;
         }
-        const int status = ggml_vec_index_write_unlocked(idx, path);
-        if (status == GGML_VEC_INDEX_OK || status == GGML_VEC_INDEX_E_NOT_DURABLE) {
+        const bool durable = durability == GGML_VEC_INDEX_DURABILITY_DURABLE;
+        const int status = ggml_vec_index_write_unlocked(idx, path, durable);
+        // A delta log starts from a snapshot that is on stable storage.
+        if (durable && (status == GGML_VEC_INDEX_OK || status == GGML_VEC_INDEX_E_NOT_DURABLE)) {
             idx->delta_log_start_allowed = true;
         }
         return status;
     } catch (...) {
         return GGML_VEC_INDEX_E_INTERNAL;
     }
+}
+
+int ggml_vec_index_write(ggml_vec_index_t * idx, const char * path) {
+    return ggml_vec_index_write_with_durability(idx, path, GGML_VEC_INDEX_DURABILITY_DURABLE);
 }
 
 static bool supports_bytes(const ggml_vec_index & idx) {

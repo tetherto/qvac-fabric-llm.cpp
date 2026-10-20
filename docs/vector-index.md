@@ -225,7 +225,7 @@ log. Plain `add`, `remove`, `compact`, and snapshot `write` operations return
 
 `ggml_vec_index_add_logged` and `ggml_vec_index_remove_logged` append durable
 mutations. Before starting a new log, establish the snapshot lineage with a
-successful `ggml_vec_index_write` or `ggml_vec_index_load`. The first logged
+successful durable `ggml_vec_index_write` or a `ggml_vec_index_load`. The first logged
 mutation binds the handle to the delta log; later logged mutations and
 `ggml_vec_index_compact_delta` must use that same file. Equivalent hardlink
 aliases identify the same log.
@@ -238,6 +238,13 @@ the snapshot and delta log to revalidate the durable state before continuing.
 durability could not be confirmed. `GGML_VEC_INDEX_E_PARTIAL_COMPACT` means the
 snapshot was replaced but its durability could not be confirmed, or resetting
 the delta log failed.
+
+`ggml_vec_index_write_with_durability` with `GGML_VEC_INDEX_DURABILITY_FAST`
+writes the same snapshot through the same temp file and atomic rename but
+skips the data and directory fsyncs, as upstream turbovec's `Durability::Fast`
+does. The destination never holds a torn snapshot and survives a process
+crash, but a power loss shortly afterwards may lose the new file, so a fast
+write does not let a delta log start. Syncs are always durable.
 
 TurboVec snapshots use upstream turbovec's v8 container, the `.tvim` files
 turbovec's own `IdMapIndex` writes: a superblock with the codebook and

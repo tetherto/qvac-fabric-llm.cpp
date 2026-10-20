@@ -86,6 +86,7 @@ int     ggml_vec_index_test_can_address_array(size_t count, size_t element_size)
 void    ggml_vec_index_test_set_write_fail_after(int64_t bytes);
 void    ggml_vec_index_test_set_oom_countdown(int64_t countdown);
 void    ggml_vec_index_test_set_parent_fsync_fail(int fail);
+void    ggml_vec_index_test_set_data_fsync_fail(int fail);
 void    ggml_vec_index_test_set_parent_fsync_fail_after(int64_t count);
 void    ggml_vec_index_test_set_load_with_delta_block(int block);
 int     ggml_vec_index_test_get_load_with_delta_waiters(void);
@@ -6062,6 +6063,61 @@ void check_turbovec_1x_single_code_copy() {
 #endif
 
 #ifdef GGML_VEC_INDEX_TEST_HOOKS
+// A fast write keeps the temp file and atomic rename but skips both fsyncs
+// (upstream Durability::Fast), for every index kind, and writes the same
+// bytes as a durable one. It does not let a delta log start.
+void check_write_with_durability() {
+    constexpr int dim = 64;
+    const std::vector<float> rows = tv1x_rows(kTv1xSeedDb, 100, dim);
+    const std::vector<uint64_t> ids = tv1x_ids(101);
+    const std::string durable_path = (std::filesystem::temp_directory_path() / "ggml-vector-index-durable.tvim").string();
+    const std::string fast_path = (std::filesystem::temp_directory_path() / "ggml-vector-index-fast.tvim").string();
+    const std::string delta_path = (std::filesystem::temp_directory_path() / "ggml-vector-index-fast.tvid").string();
+    for (const int kind : { 0, 1 }) {
+        auto * idx = kind == 0 ? ggml_vec_index_create(dim, 32) : ggml_vec_index_create_turbovec(dim, 4);
+        CHECK(ggml_vec_index_add(idx, rows.data(), 100, ids.data()) == GGML_VEC_INDEX_OK);
+        std::filesystem::remove(durable_path);
+        std::filesystem::remove(fast_path);
+        std::filesystem::remove(delta_path);
+        CHECK(ggml_vec_index_write_with_durability(idx, fast_path.c_str(), static_cast<ggml_vec_index_durability>(2)) ==
+              GGML_VEC_INDEX_E_INVALID_ARG);
+
+        ggml_vec_index_test_set_data_fsync_fail(1);
+        CHECK(ggml_vec_index_write(idx, durable_path.c_str()) == GGML_VEC_INDEX_E_IO);
+        CHECK(!std::filesystem::exists(durable_path));
+        CHECK(ggml_vec_index_write_with_durability(idx, fast_path.c_str(), GGML_VEC_INDEX_DURABILITY_FAST) ==
+              GGML_VEC_INDEX_OK);
+        ggml_vec_index_test_set_data_fsync_fail(0);
+        ggml_vec_index_test_set_parent_fsync_fail(1);
+        CHECK(ggml_vec_index_write_with_durability(idx, fast_path.c_str(), GGML_VEC_INDEX_DURABILITY_FAST) ==
+              GGML_VEC_INDEX_OK);
+        CHECK(ggml_vec_index_write(idx, durable_path.c_str()) == GGML_VEC_INDEX_E_NOT_DURABLE);
+        ggml_vec_index_test_set_parent_fsync_fail(0);
+        CHECK(read_file_bytes(fast_path) == read_file_bytes(durable_path));
+        auto * loaded = ggml_vec_index_load(fast_path.c_str());
+        CHECK(loaded != nullptr && ggml_vec_index_len(loaded) == 100);
+        ggml_vec_index_free(loaded);
+        ggml_vec_index_free(idx);
+
+        if (kind == 0) {
+            // Only a durable write lets a delta log start from this state.
+            auto * fresh = ggml_vec_index_create(dim, 32);
+            CHECK(ggml_vec_index_add(fresh, rows.data(), 100, ids.data()) == GGML_VEC_INDEX_OK);
+            CHECK(ggml_vec_index_write_with_durability(fresh, fast_path.c_str(), GGML_VEC_INDEX_DURABILITY_FAST) ==
+                  GGML_VEC_INDEX_OK);
+            CHECK(ggml_vec_index_add_logged(fresh, rows.data(), 1, &ids[100], delta_path.c_str()) ==
+                  GGML_VEC_INDEX_E_INVALID_ARG);
+            CHECK(ggml_vec_index_write_with_durability(fresh, fast_path.c_str(), GGML_VEC_INDEX_DURABILITY_DURABLE) ==
+                  GGML_VEC_INDEX_OK);
+            CHECK(ggml_vec_index_add_logged(fresh, rows.data(), 1, &ids[100], delta_path.c_str()) == GGML_VEC_INDEX_OK);
+            ggml_vec_index_free(fresh);
+        }
+    }
+    std::filesystem::remove(durable_path);
+    std::filesystem::remove(fast_path);
+    std::filesystem::remove(delta_path);
+}
+
 // to_bytes, write and a full sync build block units as they go instead of
 // materializing all of them, so none holds a second copy of the payload.
 void check_turbovec_1x_streamed_snapshots() {
@@ -6197,6 +6253,7 @@ int main(int argc, char ** argv) {
             check_turbovec_1x_staged_maintenance();
             check_turbovec_1x_single_code_copy();
             check_turbovec_1x_streamed_snapshots();
+            check_write_with_durability();
             check_tqplus_deterministic_layout(
                 2,
                 UINT64_C(0xc4140782241d45eb),

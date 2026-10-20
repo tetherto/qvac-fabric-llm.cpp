@@ -790,7 +790,7 @@ ggml_vec_index_t * turbovec_v8_load_image(std::vector<uint8_t> raw, int & error,
 
 // Positioned writes made durable together (one fsync per batch).
 using TurboVecWriteBatch = std::vector<std::pair<uint64_t, std::vector<uint8_t>>>;
-int turbovec_v8_write_file(const char * path, const TurboVecV8Image & image);
+int turbovec_v8_write_file(const char * path, const TurboVecV8Image & image, bool durable = true);
 int turbovec_v8_apply_batches(const char * path, const std::vector<TurboVecWriteBatch> & batches);
 // Reads up to `size` bytes at `offset`; GGML_VEC_INDEX_E_NOT_FOUND when the
 // file does not exist.
