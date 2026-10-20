@@ -17917,6 +17917,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_lstm_cell(640, 1));
     test_cases.emplace_back(new test_lstm_cell(640, 5));
     test_cases.emplace_back(new test_tdt_step(1024, 2, 3, 0, 8));
+    test_cases.emplace_back(new test_glu(GGML_GLU_OP_SIGLU, GGML_TYPE_F32, { 2048, 139, 1, 1 }, 0, false));
 
     return test_cases;
 }
