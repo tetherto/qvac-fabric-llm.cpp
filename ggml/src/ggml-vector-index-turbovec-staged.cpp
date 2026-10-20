@@ -5,9 +5,11 @@
 // with estimates that add the lower planes, and rescores the best few with
 // the full scan's own arithmetic, so returned scores are exact while the
 // candidate set is approximate. This follows upstream's single-threaded
-// path (search.rs `search` with a `PlanesRef`, `rerank_legacy`, `Refine`);
-// upstream's seeded collectors only speed the shortlist up, and its
-// in-scan refinement on a thread pool is not reproduced.
+// path (search.rs `search` with a `PlanesRef`, `rerank_legacy`, `Refine`).
+// Upstream's seeded collectors only speed the shortlist up, except that the
+// one query of a batch whose seed runs short is rescanned with single-query
+// tables; the port computes the seed to reproduce that. Upstream's in-scan
+// refinement on a thread pool is not reproduced.
 
 #include "ggml-vector-index-impl.h"
 
@@ -282,6 +284,41 @@ void turbovec_planes_swap_remove(ggml_vec_index & idx, size_t slot, size_t last)
 
 namespace {
 
+// Upstream seeds its buffered collectors on aarch64 only, and only for an
+// index of at least 1024 full blocks (pack.rs planes_sample).
+#if GGML_VEC_INDEX_USE_NEON
+constexpr bool kSeedSupported = true;
+#else
+constexpr bool kSeedSupported = false;
+#endif
+constexpr size_t kSeedMinBlocks = 1024;
+
+// Upstream's collector seed (search.rs sample_seeds over pack.rs
+// planes_sample): the r-th best sign score among 48 blocks taken at a
+// stride, with r set so a little more than a shortlist's worth of the
+// whole index should score above it.
+float sample_seed(const ggml_vec_index & idx, const SignLut & lut, size_t s_len, int bits) {
+    constexpr size_t kSampleBlocks = 48;
+    const size_t n = idx.slot_to_id.size();
+    const size_t stride = (n / kBlock) / kSampleBlocks;
+    const size_t n_s = kSampleBlocks * kBlock;
+    const float r_s = static_cast<float>(s_len * n_s) / static_cast<float>(n);
+    const float width = bits == 4 ? 4.0f : 6.0f;
+    const float over = std::min(1.0f + width / std::sqrt(std::max(r_s, 1.0f)), 4.0f);
+    const size_t r = std::min(std::max(static_cast<size_t>(std::ceil(over * r_s)), size_t{ 6 }), n_s);
+    std::vector<float> scores(n_s);
+    for (size_t i = 0; i < kSampleBlocks; ++i) {
+        // Offset by half a stride so the sample is not the index's head.
+        const size_t block = i * stride + stride / 2;
+        score_turbovec_lut_block(
+            lut.values.data(), lut.scale, lut.bias, idx.turbovec_sign_blocked.data(), idx.turbovec_scale.data(),
+            block, n, 2, idx.dim / 2, scores.data() + i * kBlock);
+    }
+    std::nth_element(scores.begin(), scores.begin() + static_cast<std::ptrdiff_t>(r - 1), scores.end(),
+        [](float a, float b) { return a > b; });
+    return scores[r - 1];
+}
+
 // Upstream pack.rs `planes_stats`, from the first 64 blocks of the cache.
 TurboVecPlanesStats compute_stats(const ggml_vec_index & idx) {
     const int bits = idx.turbovec_bits;
@@ -479,8 +516,12 @@ bool turbovec_staged_search(
         float bias_corr,
         int k,
         const uint8_t * allowed_mask,
-        bool single_query,
+        const TurboVecStagedOpts & opts,
         std::vector<ScoreId> & heap) {
+    if (opts.seed_short != nullptr) {
+        *opts.seed_short = false;
+    }
+    const bool single_query = opts.single_query;
     if (!is_turbovec(idx) || idx.turbovec_legacy || !idx.turbovec_staged_enabled) {
         return false;
     }
@@ -547,11 +588,16 @@ bool turbovec_staged_search(
                 kSignCentre * idx.turbovec_tqplus_shift[static_cast<size_t>(d)] / idx.turbovec_tqplus_scale[static_cast<size_t>(d)];
         }
     }
-    SignLut sign_lut = build_sign_lut(q_sign.data(), m, dim, single_query);
+    SignLut sign_lut = build_sign_lut(q_sign.data(), m, dim, single_query || opts.sign_single);
     sign_lut.bias += bias_corr;
     SignLut plain_lut;
     if (refines && table_rank && calibrated) {
         plain_lut = build_sign_lut(query, m, dim, single_query);
+        plain_lut.bias += bias_corr;
+    } else if (refines && table_rank && opts.sign_single && !single_query) {
+        // The ranking keeps the batch's sign tables (upstream ranks on
+        // sign_luts, not the rescan's).
+        plain_lut = build_sign_lut(q_sign.data(), m, dim, false);
         plain_lut.bias += bias_corr;
     }
     const SignLut & rank_lut = plain_lut.values.empty() ? sign_lut : plain_lut;
@@ -576,11 +622,27 @@ bool turbovec_staged_search(
         top.reserve(s_len);
         float block_scores[kBlock];
         const size_t n_blocks = (n + kBlock - 1) / kBlock;
+        // Upstream seeds an unmasked scan's collector with the r-th best
+        // score of a 48-block sample and rescans a query that comes back
+        // with fewer than s_len rows above it. The rows kept are the same
+        // either way; only which query is short matters, to the caller.
+        const bool seeded = kSeedSupported && opts.seed_short != nullptr && allowed_mask == nullptr &&
+            2 * s_len < n_allowed && n / kBlock >= kSeedMinBlocks;
+        float seed = -std::numeric_limits<float>::infinity();
+        if (seeded) {
+            seed = sample_seed(idx, sign_lut, s_len, bits);
+        }
+        size_t above_seed = 0;
         for (size_t block = 0; block < n_blocks; ++block) {
             score_turbovec_lut_block(
                 sign_lut.values.data(), sign_lut.scale, sign_lut.bias, idx.turbovec_sign_blocked.data(), vscales,
                 block, n, 2, dim / 2, block_scores);
             const size_t count = std::min(kBlock, n - block * kBlock);
+            if (seeded) {
+                for (size_t lane = 0; lane < count; ++lane) {
+                    above_seed += block_scores[lane] > seed ? 1 : 0;
+                }
+            }
             // Rows arrive in slot order, so once the shortlist is full a row
             // scoring no better than its worst cannot displace it.
             const bool full = top.size() == s_len;
@@ -599,6 +661,9 @@ bool turbovec_staged_search(
         for (const ScoreId & c : top) {
             const size_t v = static_cast<size_t>(c.id);
             list.push_back({ v, plain_score(v, static_cast<float>(c.score)) });
+        }
+        if (seeded) {
+            *opts.seed_short = above_seed < s_len;
         }
     }
 

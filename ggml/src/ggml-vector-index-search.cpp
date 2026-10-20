@@ -592,9 +592,14 @@ void search_one(
     const std::vector<size_t> * allowed_slots = nullptr,
     const float * pre_rotated_turbovec_query = nullptr,
     int n_threads = 1,
-    bool single_query = false) {
+    bool single_query = false,
+    bool * staged_seed_short = nullptr,
+    bool staged_sign_single = false) {
 
     const size_t n_slots = idx.slot_to_id.size();
+    if (staged_seed_short != nullptr) {
+        *staged_seed_short = false;
+    }
 
     test_maybe_throw_bad_alloc();
     heap.clear();
@@ -647,9 +652,13 @@ void search_one(
                     }
                 }
             }
+            TurboVecStagedOpts opts;
+            opts.single_query = single_query;
+            opts.sign_single = staged_sign_single;
+            opts.seed_short = staged_seed_short;
             if (turbovec_staged_search(
-                    idx, score_query, tqplus_bias, k, staged_mask.empty() ? nullptr : staged_mask.data(),
-                    single_query, heap)) {
+                    idx, score_query, tqplus_bias, k, staged_mask.empty() ? nullptr : staged_mask.data(), opts,
+                    heap)) {
                 write_topk_heap(idx, k, out_scores, out_ids, heap);
                 return;
             }
@@ -1268,6 +1277,8 @@ static int ggml_vec_index_search_impl(
         const int query_threads = n_tasks >= 2 ? idx->n_threads : 1;
         const int block_threads = query_threads > 1 ? 1 : idx->n_threads;
         std::vector<Scratch> scratch(std::max<size_t>(1, std::min(n_tasks, static_cast<size_t>(query_threads))));
+        // Per query: did upstream's sampled seed leave its shortlist short?
+        std::vector<uint8_t> seed_short(n_q > 1 ? static_cast<size_t>(n_q) : 0, 0);
         parallel_for(n_tasks, query_threads, [&](size_t task, size_t worker) {
             Scratch & sc = scratch[worker];
 #if GGML_VEC_INDEX_USE_NEON
@@ -1285,6 +1296,7 @@ static int ggml_vec_index_search_impl(
 #endif
             const size_t q = static_cast<size_t>(n_batched) + (task - n_batches);
             const double max_query = query_max_abs_values.empty() ? 0.0 : query_max_abs_values[q];
+            bool query_short = false;
             search_one(
                 *idx,
                 queries + q * dim_sz,
@@ -1300,8 +1312,38 @@ static int ggml_vec_index_search_impl(
                 allowed_ptr,
                 rotated_turbovec_queries.empty() ? nullptr : rotated_turbovec_queries.data() + q * dim_sz,
                 block_threads,
-                n_q == 1);
+                n_q == 1,
+                seed_short.empty() ? nullptr : &query_short);
+            if (!seed_short.empty()) {
+                seed_short[q] = query_short ? 1 : 0;
+            }
         });
+        // Upstream rescans a batch's short queries unseeded; a lone short
+        // query goes through the single-query scan and its narrower sign
+        // tables, which can change its shortlist. Several short queries
+        // keep the batch tables, as their first pass here already did.
+        if (std::count(seed_short.begin(), seed_short.end(), uint8_t{ 1 }) == 1) {
+            const size_t q = static_cast<size_t>(std::find(seed_short.begin(), seed_short.end(), uint8_t{ 1 }) - seed_short.begin());
+            Scratch & sc = scratch[0];
+            search_one(
+                *idx,
+                queries + q * dim_sz,
+                k,
+                out_scores + q * k_sz,
+                out_ids + q * k_sz,
+                query_max_abs_values.empty() ? 0.0 : query_max_abs_values[q],
+                sc.heap,
+                sc.rotated_query,
+                sc.calibrated_query,
+                sc.lut,
+                sc.allowed_blocks,
+                allowed_ptr,
+                rotated_turbovec_queries.empty() ? nullptr : rotated_turbovec_queries.data() + q * dim_sz,
+                block_threads,
+                false,
+                nullptr,
+                true);
+        }
     } catch (const std::bad_alloc &) {
         return GGML_VEC_INDEX_E_OOM;
     } catch (...) {
