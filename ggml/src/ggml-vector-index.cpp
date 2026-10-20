@@ -605,7 +605,8 @@ int ggml_vec_index_add_unlocked(
                     scales,
                     idx->dim,
                     idx->turbovec_tqplus_shift,
-                    idx->turbovec_tqplus_scale);
+                    idx->turbovec_tqplus_scale,
+                    idx->n_threads);
             }
         }
 
@@ -1255,6 +1256,31 @@ int ggml_vec_index_contains(const ggml_vec_index_t * idx, uint64_t id) {
     }
 }
 
+int ggml_vec_index_set_threads(ggml_vec_index_t * idx, int n_threads) {
+    if (idx == nullptr || n_threads < 1 || n_threads > kMaxThreads) {
+        return GGML_VEC_INDEX_E_INVALID_ARG;
+    }
+    try {
+        std::unique_lock<std::shared_mutex> lock(idx->mutex);
+        idx->n_threads = n_threads;
+        return GGML_VEC_INDEX_OK;
+    } catch (...) {
+        return GGML_VEC_INDEX_E_INTERNAL;
+    }
+}
+
+int ggml_vec_index_threads(const ggml_vec_index_t * idx) {
+    if (idx == nullptr) {
+        return 0;
+    }
+    try {
+        std::shared_lock<std::shared_mutex> lock(idx->mutex);
+        return idx->n_threads;
+    } catch (...) {
+        return 0;
+    }
+}
+
 int ggml_vec_index_turbovec_calibrate(ggml_vec_index_t * idx, const float * sample, int n) {
     if (idx == nullptr) {
         return GGML_VEC_INDEX_E_INVALID_ARG;
@@ -1279,7 +1305,7 @@ int ggml_vec_index_turbovec_calibrate(ggml_vec_index_t * idx, const float * samp
         std::vector<float> shift;
         std::vector<float> scale;
         const int status =
-            fit_turbovec_calibration(sample, n, idx->turbovec_bits, idx->dim, shift, scale);
+            fit_turbovec_calibration(sample, n, idx->turbovec_bits, idx->dim, shift, scale, idx->n_threads);
         if (status != GGML_VEC_INDEX_OK) {
             return status;
         }
@@ -1303,7 +1329,8 @@ int ggml_vec_index_turbovec_calibrate(ggml_vec_index_t * idx, const float * samp
                 shift,
                 scale,
                 codes,
-                scales);
+                scales,
+                idx->n_threads);
             repack_turbovec_codes(codes.data(), n_slots, idx->turbovec_bits, idx->dim, blocked, n_blocks);
         }
 

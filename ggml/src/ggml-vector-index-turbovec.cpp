@@ -2154,6 +2154,9 @@ struct TurboVecCalibrationView {
     }
 };
 
+// Rows per parallel task: large enough to amortize the hand-off.
+constexpr size_t kTurboVecRowsPerTask = 256;
+
 void quantize_turbovec_hadamard_batch(
         const float * src,
         int n,
@@ -2162,31 +2165,39 @@ void quantize_turbovec_hadamard_batch(
         float * scales,
         int dim,
         const std::vector<float> & tqplus_shift,
-        const std::vector<float> & tqplus_scale) {
-    const ScopedNearestRounding rounding_guard;
+        const std::vector<float> & tqplus_scale,
+        int n_threads) {
     const size_t dim_sz = static_cast<size_t>(dim);
     const size_t row_bytes = turbovec_row_bytes(bits, dim_sz);
     const TurboVecCodebook & codebook = turbovec_codebook(bits, dim, false);
     const std::shared_ptr<const TurboVecHadamardRotation> rotation = turbovec_hadamard_rotation(dim);
     const TurboVecCalibrationView calibration(tqplus_shift, tqplus_scale, dim);
-    std::vector<float> rotated(dim_sz);
-    std::vector<float> scratch(dim_sz);
-    for (int row = 0; row < n; ++row) {
-        const float * input = src + static_cast<size_t>(row) * dim_sz;
-        const float norm = turbovec_hadamard_norm(input, dim);
-        const float inv = norm > kTurboVecMinInputNorm ? 1.0f / norm : 0.0f;
-        apply_turbovec_hadamard(*rotation, input, inv, rotated.data(), scratch.data());
-        scales[row] = quantize_turbovec_hadamard_row(
-            rotated.data(),
-            norm,
-            calibration.shift,
-            calibration.scale,
-            calibration.inverse_scale.data(),
-            codebook,
-            bits,
-            dim,
-            dst + static_cast<size_t>(row) * row_bytes);
-    }
+    // Rows are independent and every row's arithmetic is fixed, so the
+    // bytes do not depend on how rows are spread over threads.
+    const size_t n_sz = static_cast<size_t>(n);
+    const size_t n_tasks = (n_sz + kTurboVecRowsPerTask - 1) / kTurboVecRowsPerTask;
+    parallel_for(n_tasks, n_threads, [&](size_t task, size_t) {
+        const ScopedNearestRounding rounding_guard;
+        std::vector<float> rotated(dim_sz);
+        std::vector<float> scratch(dim_sz);
+        const size_t end = std::min(n_sz, (task + 1) * kTurboVecRowsPerTask);
+        for (size_t row = task * kTurboVecRowsPerTask; row < end; ++row) {
+            const float * input = src + row * dim_sz;
+            const float norm = turbovec_hadamard_norm(input, dim);
+            const float inv = norm > kTurboVecMinInputNorm ? 1.0f / norm : 0.0f;
+            apply_turbovec_hadamard(*rotation, input, inv, rotated.data(), scratch.data());
+            scales[row] = quantize_turbovec_hadamard_row(
+                rotated.data(),
+                norm,
+                calibration.shift,
+                calibration.scale,
+                calibration.inverse_scale.data(),
+                codebook,
+                bits,
+                dim,
+                dst + row * row_bytes);
+        }
+    });
 }
 
 // Total-order sort key for f32 (upstream encode.rs `f32_sort_key`): ranking
@@ -2211,7 +2222,8 @@ int fit_turbovec_calibration(
         int bits,
         int dim,
         std::vector<float> & out_shift,
-        std::vector<float> & out_scale) {
+        std::vector<float> & out_scale,
+        int n_threads) {
     const ScopedNearestRounding rounding_guard;
     if (n < kTurboVecMinCalibrationRows) {
         return GGML_VEC_INDEX_E_INVALID_ARG;
@@ -2220,13 +2232,17 @@ int fit_turbovec_calibration(
     const size_t n_sz = static_cast<size_t>(n);
     const std::shared_ptr<const TurboVecHadamardRotation> rotation = turbovec_hadamard_rotation(dim);
     std::vector<float> rotated(n_sz * dim_sz);
-    std::vector<float> scratch(dim_sz);
-    for (size_t row = 0; row < n_sz; ++row) {
-        const float * input = sample + row * dim_sz;
-        const float norm = turbovec_hadamard_norm(input, dim);
-        const float inv = norm > kTurboVecMinInputNorm ? 1.0f / norm : 0.0f;
-        apply_turbovec_hadamard(*rotation, input, inv, rotated.data() + row * dim_sz, scratch.data());
-    }
+    parallel_for((n_sz + kTurboVecRowsPerTask - 1) / kTurboVecRowsPerTask, n_threads, [&](size_t task, size_t) {
+        const ScopedNearestRounding task_rounding;
+        std::vector<float> scratch(dim_sz);
+        const size_t end = std::min(n_sz, (task + 1) * kTurboVecRowsPerTask);
+        for (size_t row = task * kTurboVecRowsPerTask; row < end; ++row) {
+            const float * input = sample + row * dim_sz;
+            const float norm = turbovec_hadamard_norm(input, dim);
+            const float inv = norm > kTurboVecMinInputNorm ? 1.0f / norm : 0.0f;
+            apply_turbovec_hadamard(*rotation, input, inv, rotated.data() + row * dim_sz, scratch.data());
+        }
+    });
 
     // Anchor on the codebook's outermost centroid (upstream #454): the
     // probability level P(|x| <= c_outer) moves with bit width.
@@ -2248,24 +2264,30 @@ int fit_turbovec_calibration(
 
     std::vector<float> shift(dim_sz, 0.0f);
     std::vector<float> scale(dim_sz, 1.0f);
-    std::vector<uint32_t> keys(n_sz);
-    for (size_t column = 0; column < dim_sz; ++column) {
-        for (size_t row = 0; row < n_sz; ++row) {
-            keys[row] = turbovec_f32_sort_key(rotated[row * dim_sz + column]);
+    // Each coordinate's fit is independent: an order statistic of its column.
+    constexpr size_t kColumnsPerTask = 16;
+    parallel_for((dim_sz + kColumnsPerTask - 1) / kColumnsPerTask, n_threads, [&](size_t task, size_t) {
+        const ScopedNearestRounding task_rounding;
+        std::vector<uint32_t> keys(n_sz);
+        const size_t column_end = std::min(dim_sz, (task + 1) * kColumnsPerTask);
+        for (size_t column = task * kColumnsPerTask; column < column_end; ++column) {
+            for (size_t row = 0; row < n_sz; ++row) {
+                keys[row] = turbovec_f32_sort_key(rotated[row * dim_sz + column]);
+            }
+            std::nth_element(keys.begin(), keys.begin() + static_cast<std::ptrdiff_t>(lo_index), keys.end());
+            const float qe_lo = turbovec_f32_from_sort_key(keys[lo_index]);
+            std::nth_element(
+                keys.begin() + static_cast<std::ptrdiff_t>(lo_index) + 1,
+                keys.begin() + static_cast<std::ptrdiff_t>(hi_index),
+                keys.end());
+            const float qe_hi = turbovec_f32_from_sort_key(keys[hi_index]);
+            const float qe_span = qe_hi - qe_lo;
+            if (qe_span > 1e-6f) {
+                scale[column] = qc_span / qe_span;
+                shift[column] = qc_lo / scale[column] - qe_lo;
+            }
         }
-        std::nth_element(keys.begin(), keys.begin() + static_cast<std::ptrdiff_t>(lo_index), keys.end());
-        const float qe_lo = turbovec_f32_from_sort_key(keys[lo_index]);
-        std::nth_element(
-            keys.begin() + static_cast<std::ptrdiff_t>(lo_index) + 1,
-            keys.begin() + static_cast<std::ptrdiff_t>(hi_index),
-            keys.end());
-        const float qe_hi = turbovec_f32_from_sort_key(keys[hi_index]);
-        const float qe_span = qe_hi - qe_lo;
-        if (qe_span > 1e-6f) {
-            scale[column] = qc_span / qe_span;
-            shift[column] = qc_lo / scale[column] - qe_lo;
-        }
-    }
+    });
 
     bool identity = true;
     for (size_t i = 0; i < dim_sz && identity; ++i) {
@@ -2290,8 +2312,8 @@ void reencode_turbovec_rows(
         const std::vector<float> & new_shift,
         const std::vector<float> & new_scale,
         std::vector<uint8_t> & out_codes,
-        std::vector<float> & out_scales) {
-    const ScopedNearestRounding rounding_guard;
+        std::vector<float> & out_scales,
+        int n_threads) {
     const size_t dim_sz = static_cast<size_t>(dim);
     const size_t row_bytes = turbovec_row_bytes(bits, dim_sz);
     const TurboVecCodebook & codebook = turbovec_codebook(bits, dim, false);
@@ -2300,32 +2322,36 @@ void reencode_turbovec_rows(
     const TurboVecCalibrationView new_calibration(new_shift, new_scale, dim);
     std::vector<uint8_t> next_codes(n * row_bytes);
     std::vector<float> next_scales(n);
-    std::vector<float> reconstructed(dim_sz);
-    for (size_t row = 0; row < n; ++row) {
-        // Rebuild the rotated row from its codes under the old pair, then
-        // encode it under the new one (upstream lib.rs `reencode_stored_rows`).
-        const uint8_t * packed = codes + row * row_bytes;
-        double sum_squares = 0.0;
-        for (int d = 0; d < dim; ++d) {
-            const uint8_t code = turbovec_get_bitplane_code(packed, d, bits, dim);
-            const float x =
-                centroids[code] * old_calibration.inverse_scale[static_cast<size_t>(d)] -
-                old_calibration.shift[d];
-            reconstructed[static_cast<size_t>(d)] = x;
-            sum_squares += static_cast<double>(x) * static_cast<double>(x);
+    parallel_for((n + kTurboVecRowsPerTask - 1) / kTurboVecRowsPerTask, n_threads, [&](size_t task, size_t) {
+        const ScopedNearestRounding rounding_guard;
+        std::vector<float> reconstructed(dim_sz);
+        const size_t row_end = std::min(n, (task + 1) * kTurboVecRowsPerTask);
+        for (size_t row = task * kTurboVecRowsPerTask; row < row_end; ++row) {
+            // Rebuild the rotated row from its codes under the old pair, then
+            // encode it under the new one (upstream lib.rs `reencode_stored_rows`).
+            const uint8_t * packed = codes + row * row_bytes;
+            double sum_squares = 0.0;
+            for (int d = 0; d < dim; ++d) {
+                const uint8_t code = turbovec_get_bitplane_code(packed, d, bits, dim);
+                const float x =
+                    centroids[code] * old_calibration.inverse_scale[static_cast<size_t>(d)] -
+                    old_calibration.shift[d];
+                reconstructed[static_cast<size_t>(d)] = x;
+                sum_squares += static_cast<double>(x) * static_cast<double>(x);
+            }
+            const float norm = static_cast<float>(static_cast<double>(scales[row]) * sum_squares);
+            next_scales[row] = quantize_turbovec_hadamard_row(
+                reconstructed.data(),
+                norm,
+                new_calibration.shift,
+                new_calibration.scale,
+                new_calibration.inverse_scale.data(),
+                codebook,
+                bits,
+                dim,
+                next_codes.data() + row * row_bytes);
         }
-        const float norm = static_cast<float>(static_cast<double>(scales[row]) * sum_squares);
-        next_scales[row] = quantize_turbovec_hadamard_row(
-            reconstructed.data(),
-            norm,
-            new_calibration.shift,
-            new_calibration.scale,
-            new_calibration.inverse_scale.data(),
-            codebook,
-            bits,
-            dim,
-            next_codes.data() + row * row_bytes);
-    }
+    });
     out_codes.swap(next_codes);
     out_scales.swap(next_scales);
 }

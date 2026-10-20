@@ -129,6 +129,14 @@ GGML_VEC_INDEX_API int ggml_vec_index_turbovec_is_calibrated(const ggml_vec_inde
 
 GGML_VEC_INDEX_API void ggml_vec_index_free(ggml_vec_index_t * idx);
 
+// Worker threads search, add and TurboVec calibration may use, including
+// the calling thread; 1 (the default) runs every call on the calling thread.
+// Query batches are split across threads, and a single TurboVec query over
+// 32,768 or more vectors splits its blocks. Results do not depend on the
+// thread count. `n_threads` must be in 1..256.
+GGML_VEC_INDEX_API int ggml_vec_index_set_threads(ggml_vec_index_t * idx, int n_threads);
+GGML_VEC_INDEX_API int ggml_vec_index_threads(const ggml_vec_index_t * idx);
+
 // Mutation.
 //
 // Adds `n` vectors of length `dim` each (row-major, contiguous in `vectors`),
