@@ -129,8 +129,11 @@ GGML_VEC_INDEX_API int ggml_vec_index_turbovec_calibrate(
 // where upstream turbovec runs it (aarch64; 4 bits needs the dot-product
 // extension), a search scans the sign planes for a shortlist, ranks it with
 // the lower planes and rescores the best few exactly: returned scores are
-// the full scan's, but the ids can differ slightly from a full scan's.
-// Pass 0 to always scan the whole index.
+// the full scan's, but the ids can differ from a full scan's (on random data
+// 77-94% of a top 10 overlaps it, as with upstream).
+// A staged search runs on the calling thread. Pass 0 to always scan the
+// whole index; that also drops the planes caches. Legacy and 3-bit indexes
+// accept the call but never search in stages.
 GGML_VEC_INDEX_API int ggml_vec_index_turbovec_set_staged(ggml_vec_index_t * idx, int enabled);
 
 // Returns 1 when a TurboVec index holds a committed TQ+ calibration.
@@ -140,9 +143,9 @@ GGML_VEC_INDEX_API void ggml_vec_index_free(ggml_vec_index_t * idx);
 
 // Worker threads search, add and TurboVec calibration may use, including
 // the calling thread; 1 (the default) runs every call on the calling thread.
-// Query batches are split across threads, and a single TurboVec query over
-// 32,768 or more vectors splits its blocks. Results do not depend on the
-// thread count. `n_threads` must be in 1..256.
+// Query batches are split across threads, and a single full-scan TurboVec
+// query over 32,768 or more vectors splits its blocks (a staged search stays
+// on one thread). Results do not depend on the thread count. `n_threads` must be in 1..256.
 GGML_VEC_INDEX_API int ggml_vec_index_set_threads(ggml_vec_index_t * idx, int n_threads);
 GGML_VEC_INDEX_API int ggml_vec_index_threads(const ggml_vec_index_t * idx);
 
@@ -164,8 +167,11 @@ GGML_VEC_INDEX_API int ggml_vec_index_add(
     const uint64_t   * ids);
 
 // Removes the entry for `id` by marking its internal slot deleted. Physical
-// storage is compacted only when writing a snapshot. Returns GGML_VEC_INDEX_OK
-// if removed, GGML_VEC_INDEX_E_NOT_FOUND if not present, negative on error.
+// storage is compacted only when writing a snapshot. A TurboVec 1.x index
+// instead removes at once, as upstream turbovec does: the last row moves into
+// the freed slot, which changes the order `ggml_vec_index_ids` reports.
+// Returns GGML_VEC_INDEX_OK if removed, GGML_VEC_INDEX_E_NOT_FOUND if not
+// present, negative on error.
 GGML_VEC_INDEX_API int ggml_vec_index_remove(ggml_vec_index_t * idx, uint64_t id);
 
 // Physically removes deleted slots from in-memory storage. This does not write
@@ -241,7 +247,9 @@ GGML_VEC_INDEX_API int ggml_vec_index_build_ivf(
 // Top-k search. `queries` is `n_q * dim` row-major. `out_scores` and
 // `out_ids` are caller-allocated buffers of size `n_q * k`. Each row is
 // sorted descending by score (higher = closer / more similar), with equal
-// scores ordered by ascending id. If the index holds fewer than k entries, the
+// scores ordered by ascending id; a TurboVec 1.x index orders them by row, as
+// upstream turbovec does (insertion order, as reshuffled by removals). `k`
+// must be at least 1. If the index holds fewer than k entries, the
 // remaining slots in each row are filled with UINT64_MAX ids; callers must use
 // out_ids[i] == UINT64_MAX to identify padding. Padded score slots are filled
 // with -FLT_MAX for compatibility, but that value can also be a legitimate

@@ -420,6 +420,7 @@ size_t best_centroid(const float * query, const std::vector<float> & centroids, 
 }
 
 void write_topk_heap(
+        const ggml_vec_index_t & idx,
         int k,
         float * out_scores,
         uint64_t * out_ids,
@@ -431,7 +432,7 @@ void write_topk_heap(
     for (int i = 0; i < k; ++i) {
         if (static_cast<size_t>(i) < heap.size()) {
             out_scores[i] = float_score_from_double(heap[static_cast<size_t>(i)].score);
-            out_ids[i] = heap[static_cast<size_t>(i)].id;
+            out_ids[i] = topk_key_id(idx, heap[static_cast<size_t>(i)].id);
         } else {
             out_scores[i] = -FLT_MAX;
             out_ids[i] = UINT64_MAX;
@@ -454,7 +455,7 @@ void write_topk_results(
             update_topk_heap(
                 heap,
                 k,
-                { score_for_slot(slot), idx.slot_to_id[slot] });
+                { score_for_slot(slot), topk_key(idx, slot) });
         }
     };
 
@@ -474,7 +475,7 @@ void write_topk_results(
         }
     }
 
-    write_topk_heap(k, out_scores, out_ids, heap);
+    write_topk_heap(idx, k, out_scores, out_ids, heap);
 }
 
 // A single TurboVec query over at least this many 32-vector blocks splits
@@ -569,7 +570,7 @@ void score_turbovec_block_range(
             if (!std::isfinite(score) && query.permute_dot == nullptr) {
                 score = score_slot(idx, query.score_query, slot, 0.0, query.lut, query.scale, query.bias);
             }
-            update_topk_heap(heap, k, { score, idx.slot_to_id[slot] });
+            update_topk_heap(heap, k, { score, topk_key(idx, slot) });
         }
     }
 }
@@ -649,7 +650,7 @@ void search_one(
             if (turbovec_staged_search(
                     idx, score_query, tqplus_bias, k, staged_mask.empty() ? nullptr : staged_mask.data(),
                     single_query, heap)) {
-                write_topk_heap(k, out_scores, out_ids, heap);
+                write_topk_heap(idx, k, out_scores, out_ids, heap);
                 return;
             }
         }
@@ -713,7 +714,7 @@ void search_one(
             if (n_threads > 1 && n_scored >= kTurboVecParallelMinBlocks) {
                 // One query over many blocks: score block ranges on each
                 // worker into its own heap, then merge. Top-k uses a strict
-                // (score, id) order, so the split cannot change the result.
+                // (score, key) order, so the split cannot change the result.
                 const size_t n_ranges = static_cast<size_t>(n_threads) * 4;
                 const size_t per_range = (n_blocks + n_ranges - 1) / n_ranges;
                 std::vector<std::vector<ScoreId>> range_heaps(n_ranges);
@@ -733,7 +734,7 @@ void search_one(
             } else {
                 score_turbovec_block_range(idx, query_lut, 0, n_blocks, block_filter, allowed_mask, k, heap);
             }
-            write_topk_heap(k, out_scores, out_ids, heap);
+            write_topk_heap(idx, k, out_scores, out_ids, heap);
             return;
         }
     }
@@ -880,13 +881,14 @@ void search_turbovec_four_queries(
                 update_topk_heap(
                     scratch.heaps[query],
                     k,
-                    { score, idx.slot_to_id[base_slot + lane] });
+                    { score, topk_key(idx, base_slot + lane) });
             }
         }
     }
 
     for (int query = 0; query < 4; ++query) {
         write_topk_heap(
+            idx,
             k,
             out_scores + static_cast<size_t>(query) * static_cast<size_t>(k),
             out_ids + static_cast<size_t>(query) * static_cast<size_t>(k),

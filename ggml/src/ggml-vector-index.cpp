@@ -23,6 +23,18 @@ bool is_q4(const ggml_vec_index & idx) {
     return idx.bit_width == 4 && idx.turbovec_bits == 0;
 }
 
+bool topk_keys_are_slots(const ggml_vec_index & idx) {
+    return is_turbovec(idx) && !idx.turbovec_legacy;
+}
+
+uint64_t topk_key(const ggml_vec_index & idx, size_t slot) {
+    return topk_keys_are_slots(idx) ? static_cast<uint64_t>(slot) : idx.slot_to_id[slot];
+}
+
+uint64_t topk_key_id(const ggml_vec_index & idx, uint64_t key) {
+    return topk_keys_are_slots(idx) ? idx.slot_to_id[static_cast<size_t>(key)] : key;
+}
+
 bool is_turbovec(const ggml_vec_index & idx) {
     return idx.turbovec_bits != 0;
 }
@@ -681,6 +693,7 @@ int ggml_vec_index_add_unlocked(
                 turbovec_blocked_append(*idx, turbovec_batch.data(), base_slot, n_sz);
             }
             turbovec_planes_refresh(*idx, base_slot);
+            turbovec_settle_rows(*idx);
         }
         for (size_t slot = base_slot; slot < new_slots; ++slot) {
             add_state_hash(
@@ -754,6 +767,7 @@ static void turbovec_swap_remove(ggml_vec_index & idx, size_t slot) {
     --idx.n_active;
     turbovec_blocked_swap_remove(idx, slot, last);
     turbovec_planes_swap_remove(idx, slot, last);
+    turbovec_settle_rows(idx);
 }
 
 int ggml_vec_index_remove_unlocked(
@@ -1505,6 +1519,15 @@ int ggml_vec_index_turbovec_set_staged(ggml_vec_index_t * idx, int enabled) {
             return GGML_VEC_INDEX_E_INVALID_ARG;
         }
         idx->turbovec_staged_enabled = enabled != 0;
+        // Switching staged search off drops the planes caches and the packed
+        // rows they need; switching it on promotes again if the index is
+        // large enough. Snapshot layout depends only on the index size.
+        if (enabled == 0) {
+            turbovec_planes_reset(*idx);
+            turbovec_settle_rows(*idx);
+        } else {
+            turbovec_planes_refresh(*idx, 0);
+        }
         return GGML_VEC_INDEX_OK;
     } catch (...) {
         return GGML_VEC_INDEX_E_INTERNAL;
