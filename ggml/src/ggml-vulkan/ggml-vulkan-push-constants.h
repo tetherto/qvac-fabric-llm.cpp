@@ -806,6 +806,10 @@ struct vk_op_channel_shuffle_push_constants {
     uint32_t ne, FT, C, G;
 };
 
+struct vk_op_affine_prelu_push_constants {
+    uint32_t ne, F, FT, C;
+};
+
 struct vk_op_conv_1d_dw_direct_push_constants {
     uint32_t ne, L, C, B, K, dilation, layout, causal, seg_len, has_bias;
 };

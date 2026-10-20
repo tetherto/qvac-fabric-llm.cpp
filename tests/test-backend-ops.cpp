@@ -17912,6 +17912,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_gru(4, 1953, 33, true));
     test_cases.emplace_back(new test_zero_upsample({1024, 80, 4, 1}, 2));
     test_cases.emplace_back(new test_channel_shuffle({64, 64, 64, 2}, 4));
+    test_cases.emplace_back(new test_affine_prelu(129, 63, 16, 3));
 
     return test_cases;
 }
