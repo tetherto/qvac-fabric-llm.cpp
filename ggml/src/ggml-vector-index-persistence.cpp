@@ -944,15 +944,16 @@ uint32_t index_state_crc32c(const ggml_vec_index & idx) {
     crc = crc32c_update_u64(crc, static_cast<uint64_t>(active_count(idx)));
     if (is_turbovec(idx)) {
         const size_t row_bytes = turbovec_row_bytes(idx.turbovec_bits, static_cast<size_t>(idx.dim));
-        const uint8_t * data = idx.turbovec_data.data();
         for (size_t slot = 0; slot < idx.slot_to_id.size(); ++slot) {
             if (slot_is_active(idx, slot)) {
                 crc = crc32c_update_u32(crc, float_to_u32(idx.turbovec_scale[slot]));
             }
         }
+        std::vector<uint8_t> row(row_bytes);
         for (size_t slot = 0; slot < idx.slot_to_id.size(); ++slot) {
             if (slot_is_active(idx, slot)) {
-                crc = crc32c_update(crc, data + slot * row_bytes, row_bytes);
+                turbovec_row_packed(idx, slot, row.data());
+                crc = crc32c_update(crc, row.data(), row_bytes);
             }
         }
     } else if (is_q4(idx)) {
@@ -1005,7 +1006,7 @@ static uint64_t rotl64(uint64_t v, int shift) {
     return (v << shift) | (v >> (64 - shift));
 }
 
-uint64_t slot_state_hash(const ggml_vec_index & idx, size_t slot) {
+uint64_t slot_state_hash(const ggml_vec_index & idx, size_t slot, const uint8_t * turbovec_row) {
     uint32_t crc0 = 0xffffffffu;
     uint32_t crc1 = 0x82f63b78u;
     auto update_u32 = [&](uint32_t v) {
@@ -1026,7 +1027,12 @@ uint64_t slot_state_hash(const ggml_vec_index & idx, size_t slot) {
     if (is_turbovec(idx)) {
         const size_t row_bytes = turbovec_row_bytes(idx.turbovec_bits, dim_sz);
         update_u32(float_to_u32(idx.turbovec_scale[slot]));
-        update_bytes(idx.turbovec_data.data() + slot * row_bytes, row_bytes);
+        uint8_t row[kTurboVecMaxDim / 2];
+        if (turbovec_row == nullptr) {
+            turbovec_row_packed(idx, slot, row);
+            turbovec_row = row;
+        }
+        update_bytes(turbovec_row, row_bytes);
     } else if (is_q4(idx)) {
         update_u32(float_to_u32(idx.q4_scale[slot]));
         const size_t row_bytes = q4_row_bytes(dim_sz);

@@ -331,12 +331,18 @@ inline double score_slot(
         float turbovec_lut_scale = 1.0f,
         float turbovec_lut_bias = 0.0f) {
     const int dim = idx.dim;
+    uint8_t turbovec_row[kTurboVecMaxDim / 2];
+    if (turbovec_rows_in_blocked(idx)) {
+        turbovec_row_packed(idx, slot, turbovec_row);
+    }
     return is_turbovec(idx) ?
         dot_turbovec_bits_lut_row(
             turbovec_lut,
             turbovec_lut_scale,
             turbovec_lut_bias,
-            idx.turbovec_data.data() + slot * turbovec_row_bytes(idx.turbovec_bits, static_cast<size_t>(dim)),
+            turbovec_rows_in_blocked(idx) ?
+                turbovec_row :
+                idx.turbovec_data.data() + slot * turbovec_row_bytes(idx.turbovec_bits, static_cast<size_t>(dim)),
             idx.turbovec_scale.data() + slot,
             idx.turbovec_bits,
             dim) :
@@ -363,10 +369,12 @@ inline double score_slot(
 void decode_slot_to_f32(const ggml_vec_index_t & idx, size_t slot, float * dst) {
     const int dim = idx.dim;
     if (is_turbovec(idx)) {
+        uint8_t row[kTurboVecMaxDim / 2];
+        turbovec_row_packed(idx, slot, row);
         decode_turbovec_row_calibrated(
             idx.turbovec_bits,
             idx.turbovec_legacy,
-            idx.turbovec_data.data() + slot * turbovec_row_bytes(idx.turbovec_bits, static_cast<size_t>(dim)),
+            row,
             idx.turbovec_scale.data() + slot,
             idx.turbovec_tqplus_shift.empty() ? nullptr : idx.turbovec_tqplus_shift.data(),
             idx.turbovec_tqplus_scale.empty() ? nullptr : idx.turbovec_tqplus_scale.data(),

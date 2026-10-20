@@ -351,6 +351,11 @@ struct ggml_vec_index {
     // Bumped by every calibrate; a sync across one rewrites the whole file.
     uint64_t turbovec_calib_gen = 0;
     TurboVecSyncBinding turbovec_sync;
+    // Whether turbovec_data holds the packed rows. A 1.x index keeps its
+    // codes only in the blocked cache (upstream #475) unless it is in the
+    // planes layout, whose staged search reads the bit planes row by row;
+    // a legacy index always keeps packed rows.
+    bool turbovec_packed_rows = true;
     std::vector<uint8_t> turbovec_data;
     std::vector<float>   turbovec_scale;
     std::vector<float>   turbovec_tqplus_shift;
@@ -582,6 +587,8 @@ uint64_t turbovec_lut_hash_for_test(
 uint64_t turbovec_codebook_hash_for_test(int bits, int dim);
 uint64_t turbovec_blocked_hash_for_test(const ggml_vec_index_t * idx);
 void turbovec_clear_blocked_for_test(ggml_vec_index_t * idx);
+void turbovec_code_bytes_for_test(
+    const ggml_vec_index_t * idx, size_t * packed, size_t * blocked, size_t * sign);
 int turbovec_avx2_available_for_test();
 int turbovec_avx2_lut_block_matches_scalar_for_test(int bits, int dim);
 void turbovec_reset_block_score_call_count_for_test(void);
@@ -821,6 +828,20 @@ float dot_turbovec_q4_row(const float * query, const uint8_t * codes, const floa
 // Patches the blocked cache for a swap-remove of `slot` whose last slot
 // (`last`, already removed from the rows) moved into it.
 void turbovec_blocked_swap_remove(ggml_vec_index & idx, size_t slot, size_t last);
+// Drops the blocked cache's rows from n on, zeroing the tail block's lanes.
+void turbovec_blocked_truncate(ggml_vec_index & idx, size_t n);
+// Code access that works whether the codes live in packed rows (legacy) or
+// only in the blocked cache (1.x).
+bool turbovec_rows_in_blocked(const ggml_vec_index & idx);
+// Materializes the packed rows from the blocked cache (planes promotion),
+// and drops them again once only the blocked cache is needed.
+void turbovec_materialize_packed_rows(ggml_vec_index & idx);
+void turbovec_settle_rows(ggml_vec_index & idx);
+void turbovec_row_seq(const ggml_vec_index & idx, size_t slot, uint8_t * seq);
+void turbovec_row_packed(const ggml_vec_index & idx, size_t slot, uint8_t * packed);
+void turbovec_rows_packed(const ggml_vec_index & idx, std::vector<uint8_t> & packed);
+// Writes n_new packed rows into the blocked cache from first_slot on.
+void turbovec_blocked_append(ggml_vec_index & idx, const uint8_t * packed, size_t first_slot, size_t n_new);
 // The sign planes of rows [first_slot, n_vectors) into the sign blocked
 // cache (upstream's planes sign region), growing or shrinking it to cover
 // n_vectors rows.
@@ -889,7 +910,9 @@ int ggml_vec_index_remove_unlocked(
 
 uint32_t index_state_crc32c(const ggml_vec_index & idx);
 uint32_t index_state_crc32c_after_remove(const ggml_vec_index & idx, uint64_t id);
-uint64_t slot_state_hash(const ggml_vec_index & idx, size_t slot);
+// turbovec_row, when given, is the slot's packed TurboVec row (saves
+// reading it back from the blocked cache).
+uint64_t slot_state_hash(const ggml_vec_index & idx, size_t slot, const uint8_t * turbovec_row = nullptr);
 void add_state_hash(ggml_vec_index & idx, uint64_t hash);
 void remove_state_hash(ggml_vec_index & idx, uint64_t hash);
 void rebuild_state_hash(ggml_vec_index & idx);

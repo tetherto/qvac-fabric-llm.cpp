@@ -313,7 +313,7 @@ public:
             if (geo.layout == kLayoutPlanes) {
                 // Canonical planes unit: the sign bytes group-major across
                 // the lanes, then each lane's low planes.
-                const uint8_t * packed = idx.turbovec_data.data() + slot * packed_bytes;
+                const uint8_t * packed = packed_row(slot);
                 for (size_t g = 0; g < nsg; ++g) {
                     out[g * kBlock + lane] = packed[low_row + g];
                 }
@@ -333,8 +333,17 @@ public:
 
 private:
     const uint8_t * seq_row(size_t slot) const {
-        turbovec_packed_row_to_seq(idx.turbovec_data.data() + slot * packed_bytes, geo.bits, idx.dim, seq.data());
+        turbovec_row_seq(idx, slot, seq.data());
         return seq.data();
+    }
+
+    const uint8_t * packed_row(size_t slot) const {
+        if (!turbovec_rows_in_blocked(idx)) {
+            return idx.turbovec_data.data() + slot * packed_bytes;
+        }
+        packed.resize(packed_bytes);
+        turbovec_row_packed(idx, slot, packed.data());
+        return packed.data();
     }
 
     const ggml_vec_index & idx;
@@ -342,6 +351,7 @@ private:
     Geo geo;
     size_t packed_bytes;
     mutable std::vector<uint8_t> seq;
+    mutable std::vector<uint8_t> packed;
 };
 
 void build_image(const Source & src, uint64_t nonce, TurboVecV8Image & image) {
@@ -745,6 +755,9 @@ ggml_vec_index_t * turbovec_v8_load_image(std::vector<uint8_t> raw, int & error,
     const size_t packed_bytes = turbovec_row_bytes(geo.bits, geo.dim);
     const size_t nsg = planes_nsg(geo);
     const size_t low_row = static_cast<size_t>(geo.bits - 1) * nsg;
+    // The rows are decoded into packed form first; once the blocked cache
+    // is built they are dropped unless the planes layout needs them.
+    idx->turbovec_packed_rows = true;
     idx->turbovec_data.assign(n * packed_bytes, 0);
     idx->turbovec_scale.assign(n, 0.0f);
     idx->slot_to_id.assign(n, 0);
@@ -841,6 +854,7 @@ ggml_vec_index_t * turbovec_v8_load_image(std::vector<uint8_t> raw, int & error,
         idx->turbovec_blocked_vm);
     turbovec_planes_refresh(*idx, 0);
     rebuild_state_hash(*idx);
+    turbovec_settle_rows(*idx);
     if (info != nullptr) {
         info->gen = chosen->gen;
         info->nonce = get_u64_le(raw.data() + geo.sb_fixed() - 12);
