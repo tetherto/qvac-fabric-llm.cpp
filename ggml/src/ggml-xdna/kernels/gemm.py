@@ -4,15 +4,13 @@
 # Copyright (C) 2024-2026 Advanced Micro Devices, Inc.
 # SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 #
-# Adapted from mlir-aie's whole-array/cascade matrix-multiplication designs
-# (programming_examples/basic and .../ml/block_datatypes): the array and
-# ObjectFifo plumbing is theirs. Modified for the ggml-xdna backend of
-# qvac-fabric-llm.cpp (2026): the kernel, the tile layouts, the RTP counts and
-# the runtime sequence are this project's, and the design is trimmed to bf16
-# inputs on the npu2 device. The file is distributed under the same
-# Apache-2.0 WITH LLVM-exception as the examples - the stricter of the two
-# licences, which covers both parts. The sources, the licence texts
-# (../LICENSES/) and the notice are listed in ../THIRD_PARTY_NOTICES.md.
+# Modifications Copyright (c) 2026 Tether Operations, S.A. de C.V.
+# This file has been modified from mlir-aie
+# programming_examples/basic/matrix_multiplication/whole_array/whole_array.py
+# programming_examples/basic/matrix_multiplication/cascade/cascade.py
+# programming_examples/ml/block_datatypes/matrix_multiplication/whole_array_shuffle/whole_array.py
+# programming_examples/ml/block_datatypes/matrix_multiplication/whole_array_mixed/whole_array.py
+# (mlir-aie 1.4.3).
 #
 # Minimal IRON design for the ggml-xdna GEMM kernel (C = A @ B, bf16 -> f32).
 #
