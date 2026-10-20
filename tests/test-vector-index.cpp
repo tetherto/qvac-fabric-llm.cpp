@@ -5068,6 +5068,63 @@ void check_turbovec_1x_torn_sync() {
 }
 #endif
 
+// Threads change how work is split, never the result: encodes, calibration,
+// snapshots and every search path must match the single-threaded run.
+void check_turbovec_1x_threads() {
+    constexpr int dim = 64;
+    constexpr int n = 40000;
+    const std::vector<float> rows = tv1x_rows(kTv1xSeedDb, n, dim);
+    const std::vector<float> calib = tv1x_rows(kTv1xSeedCalib, 1500, dim);
+    const std::vector<float> queries = tv1x_rows(kTv1xSeedQuery, 9, dim);
+    std::vector<uint64_t> ids(n);
+    for (int i = 0; i < n; ++i) {
+        ids[static_cast<size_t>(i)] = 5000000 + static_cast<uint64_t>(i);
+    }
+    CHECK(ggml_vec_index_set_threads(nullptr, 2) == GGML_VEC_INDEX_E_INVALID_ARG);
+    for (const int bits : { 2, 3, 4 }) {
+        ggml_vec_index_t * built[2] = {};
+        std::vector<uint8_t> bytes[2];
+        std::vector<float> scores[2];
+        std::vector<uint64_t> out[2];
+        const std::vector<uint64_t> allowed = { ids[7], ids[31000], ids[39999], ids[12345] };
+        for (int run = 0; run < 2; ++run) {
+            auto * tv = ggml_vec_index_create_turbovec(dim, bits);
+            CHECK(ggml_vec_index_threads(tv) == 1);
+            CHECK(ggml_vec_index_set_threads(tv, 0) == GGML_VEC_INDEX_E_INVALID_ARG);
+            CHECK(ggml_vec_index_set_threads(tv, run == 0 ? 1 : 8) == GGML_VEC_INDEX_OK);
+            CHECK(ggml_vec_index_add(tv, rows.data(), n / 2, ids.data()) == GGML_VEC_INDEX_OK);
+            CHECK(ggml_vec_index_turbovec_calibrate(tv, calib.data(), 1500) == GGML_VEC_INDEX_OK);
+            CHECK(ggml_vec_index_add(tv, rows.data() + static_cast<size_t>(n / 2) * dim, n / 2, ids.data() + n / 2) ==
+                  GGML_VEC_INDEX_OK);
+            for (const size_t i : { 3, 900, 20001, 33333 }) {
+                CHECK(ggml_vec_index_remove(tv, ids[i]) == GGML_VEC_INDEX_OK);
+            }
+            uint8_t * data = nullptr;
+            size_t size = 0;
+            CHECK(ggml_vec_index_to_bytes(tv, &data, &size) == GGML_VEC_INDEX_OK);
+            bytes[run].assign(data, data + size);
+            ggml_vec_index_bytes_free(data);
+            // A batch, a lone query (block split at 8 threads) and a filter.
+            scores[run].resize(9 * 10 + 10 + 4);
+            out[run].resize(scores[run].size());
+            CHECK(ggml_vec_index_search(tv, queries.data(), 9, 10, scores[run].data(), out[run].data()) ==
+                  GGML_VEC_INDEX_OK);
+            CHECK(ggml_vec_index_search(tv, queries.data(), 1, 10, scores[run].data() + 90, out[run].data() + 90) ==
+                  GGML_VEC_INDEX_OK);
+            CHECK(ggml_vec_index_search_filtered(
+                      tv, queries.data() + dim, 1, 4, allowed.data(), 4, scores[run].data() + 100, out[run].data() + 100) ==
+                  GGML_VEC_INDEX_OK);
+            built[run] = tv;
+        }
+        CHECK(bytes[0] == bytes[1]);
+        CHECK(out[0] == out[1]);
+        CHECK(scores[0] == scores[1]);
+        CHECK(std::equal(out[0].begin(), out[0].begin() + 10, out[0].begin() + 90));
+        ggml_vec_index_free(built[0]);
+        ggml_vec_index_free(built[1]);
+    }
+}
+
 void check_turbovec_1x() {
     for (const Tv1xIndexCase & c : kTv1xIndexCases) {
         check_turbovec_1x_golden_case(c);
@@ -5080,6 +5137,7 @@ void check_turbovec_1x() {
     }
     check_turbovec_1x_sync_api();
     check_turbovec_1x_history_snapshots();
+    check_turbovec_1x_threads();
 }
 
 }  // namespace
