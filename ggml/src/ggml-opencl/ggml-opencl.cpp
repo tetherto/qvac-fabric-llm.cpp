@@ -9324,6 +9324,11 @@ static void ggml_opencl_print_backend_info(ggml_backend_opencl_device_context * 
     }
 }
 
+static bool ggml_opencl_generic_device_allowed() {
+    const char * allow = getenv("GGML_OPENCL_ALLOW_GENERIC_DEVICE");
+    return allow != nullptr && atoi(allow) != 0;
+}
+
 // check if device should be accepted
 static bool ggml_opencl_is_device_supported(ggml_backend_dev_t dev) {
     GGML_ASSERT(dev);
@@ -9344,6 +9349,11 @@ static bool ggml_opencl_is_device_supported(ggml_backend_dev_t dev) {
             dev_ctx->adreno_gen = get_adreno_gpu_gen(dev_ctx->device_name.c_str());
         }
     } else if (strstr(dev_ctx->device_name.c_str(), "Intel")) {
+        dev_ctx->gpu_family = GPU_FAMILY::INTEL;
+    } else if (ggml_opencl_generic_device_allowed()) {
+        // test hosts without a supported GPU (CI runners on a CPU OpenCL device)
+        // run the portable kernel set with the Intel kernel selection
+        GGML_LOG_WARN("ggml_opencl: GGML_OPENCL_ALLOW_GENERIC_DEVICE is set, admitting '%s' as a generic device.\n", dev_ctx->device_name.c_str());
         dev_ctx->gpu_family = GPU_FAMILY::INTEL;
     } else {
         GGML_LOG_WARN("ggml_opencl: unsupported GPU '%s'.\n", dev_ctx->device_name.c_str());
