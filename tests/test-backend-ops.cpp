@@ -17910,6 +17910,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_gru(64, 1, 17, false));
     test_cases.emplace_back(new test_gru(128, 2, 33, false));
     test_cases.emplace_back(new test_gru(4, 1953, 33, true));
+    test_cases.emplace_back(new test_zero_upsample({1024, 80, 4, 1}, 2));
 
     return test_cases;
 }
