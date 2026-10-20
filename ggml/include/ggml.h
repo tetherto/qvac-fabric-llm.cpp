@@ -664,6 +664,12 @@ extern "C" {
         // 0/1 mask that says whether the step's predictor update is kept.
         GGML_OP_TDT_STEP,
 
+        // Gated delta net with a deferred state commit (speculative decoding): the base state is
+        // replayed forward by rows recorded in the previous call instead of keeping a state
+        // snapshot per draft token. See ggml_gated_delta_net_deferred.
+        GGML_OP_GATED_DELTA_NET_DEFERRED,
+        GGML_OP_GDN_CONV_DEFERRED,
+
         GGML_OP_COUNT,
     };
 
@@ -3093,6 +3099,60 @@ extern "C" {
             struct ggml_tensor  * beta,
             struct ggml_tensor  * state,
             struct ggml_tensor  * d);
+
+    // gated delta net with a deferred state commit, for speculative decoding without a state
+    // snapshot per draft token. q, k, v, g and beta are as in ggml_gated_delta_net.
+    //
+    // gated delta net with a deferred state commit, for speculative decoding.
+    // Instead of a state snapshot per draft token, the last rows of each call are recorded and the
+    // base state is brought up to date by replaying the kept rows at the start of the next call.
+    //   state   : [S_v, S_v, H_v, n_seqs] committed base state
+    //   rec     : [n_rec, n_rows] record storage, n_rec = ggml_gated_delta_net_rec_size(); updated in place
+    //   rec_idx : I32 [3, n_seqs] per seq: {pending, read_row, write_row}
+    // for each seq the base is first replayed by the first `pending` rows of rec row `read_row`, then
+    // the block runs; the last R = min(n_tokens, K) rows are recorded into rec row `write_row` and the
+    // new base is the state after the first n_tokens - R tokens. Rows read and rows written must not overlap.
+    // record layout (floats): k [S_k, H_k, K] | v [S_v, H_v, K] | g [G, H_v, K] | beta [H_v, K], G = g->ne[0];
+    // recorded row r belongs to token n_tokens - R + r.
+    // dt, a (optional, [H_v], G == 1 only): g and beta are then the raw gate inputs, activated as
+    // g = softplus(g + dt) * a and beta = sigmoid(beta) (the records keep the activated values)
+    // result 1D: attn [S_v, H_v, n_tokens, n_seqs] | new base [S_v, S_v, H_v, n_seqs]
+    GGML_API struct ggml_tensor * ggml_gated_delta_net_deferred(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * v,
+            struct ggml_tensor  * g,
+            struct ggml_tensor  * beta,
+            struct ggml_tensor  * state,
+            struct ggml_tensor  * rec,
+            struct ggml_tensor  * rec_idx,
+            struct ggml_tensor  * dt,
+            struct ggml_tensor  * a,
+            int64_t               K);
+
+    GGML_API int64_t ggml_gated_delta_net_rec_size(int64_t S_k, int64_t H_k, int64_t S_v, int64_t H_v, int64_t G, int64_t K);
+
+    // causal depthwise conv + SiLU of a gated delta net layer with a deferred conv-state commit, the
+    // conv-state counterpart of ggml_gated_delta_net_deferred. the leading n_norm heads of head_dim
+    // channels (the q and k heads) are then L2-normalized: y / sqrt(sum(y^2) + eps).
+    //   x       : [C, n_tokens, n_seqs] new conv inputs
+    //   w       : [d_conv, C] conv weights
+    //   hist    : [(K + d_conv - 1) * C, n_rows] conv input history (time-major), updated in place
+    //   rec_idx : I32 [3, n_seqs] per seq {pending, read_row, write_row}, as for ggml_gated_delta_net_deferred
+    // the conv window of a seq is history columns [pending, pending + d_conv - 1) of row read_row. the last
+    // min(n_tokens, K) + d_conv - 1 conv input columns are stored in row write_row.
+    // result: [C, n_tokens, n_seqs]
+    GGML_API struct ggml_tensor * ggml_gdn_conv_deferred(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * w,
+            struct ggml_tensor  * hist,
+            struct ggml_tensor  * rec_idx,
+            int64_t               K,
+            int64_t               n_norm,
+            int64_t               head_dim,
+            float                 eps);
 
     // DSA lightning indexer
     //

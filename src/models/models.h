@@ -86,8 +86,26 @@ struct llm_build_delta_net_base : public llm_graph_context {
             int64_t              conv_channels,
             int                  il);
 
+    // causal conv + silu + q/k l2 norms with the deferred conv-state commit (see ggml_gdn_conv_deferred)
+    // qkv_mixed: (conv_channels, n_seq_tokens, n_seqs); returns the same shape
+    ggml_tensor * build_conv_deferred(
+            llm_graph_input_rs * inp,
+            ggml_tensor *        qkv_mixed,
+            ggml_tensor *        conv_kernel,
+            int64_t              n_norm,
+            int64_t              head_dim,
+            float                eps,
+            int                  il);
+
+    // gather the ubatch's ssm states from the cache (the base states with the deferred gdn commit)
+    ggml_tensor * build_rs_ssm(
+            llm_graph_input_rs * inp,
+            ggml_tensor *        ssm_states_all,
+            int64_t              n_seqs);
+
     // run delta-net attention and write the new recurrent state(s) back to ssm_states_all
     // s: (head_v_dim, head_v_dim, num_v_heads, n_seqs); returns output: (head_v_dim, num_v_heads, n_seq_tokens, n_seqs)
+    // dt, a: deferred commit only, g and b are then the raw gate inputs (see ggml_gated_delta_net_deferred)
     ggml_tensor * build_recurrent_attn(
             llm_graph_input_rs * inp,
             ggml_tensor *        ssm_states_all,
@@ -97,7 +115,9 @@ struct llm_build_delta_net_base : public llm_graph_context {
             ggml_tensor *        g,
             ggml_tensor *        b,
             ggml_tensor *        s,
-            int                  il);
+            int                  il,
+            ggml_tensor *        dt = nullptr,
+            ggml_tensor *        a  = nullptr);
 };
 
 struct llm_build_rwkv6_base : public llm_graph_context {

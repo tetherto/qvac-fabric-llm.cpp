@@ -168,6 +168,61 @@ static bool ggml_metal_fusion_check_gdn_cache(
     return true;
 }
 
+// GATED_DELTA_NET_DEFERRED + CPY: the trailing cpy stores the new base state into the recurrent
+// cache, so the kernel writes it there directly. as with GDN_CACHE the gdn output has other
+// consumers (the attn view), so the structural checks live entirely in this callback.
+static bool ggml_metal_fusion_check_gdn_deferred_cache(
+        const ggml_metal_fusion      * fusion,
+        const ggml_tensor * const    * nodes,
+        const ggml_metal_device_props * props,
+              ggml_metal_fusion_mode    mode) {
+    GGML_UNUSED(fusion);
+    GGML_UNUSED(props);
+
+    const ggml_tensor * gdn = nodes[0];
+    const ggml_tensor * cpy = nodes[1];
+
+    if (gdn->type != GGML_TYPE_F32 || (gdn->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+        return false;
+    }
+
+    if (cpy->op != GGML_OP_CPY || (cpy->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+        return false;
+    }
+
+    const int64_t S_v      = gdn->src[2]->ne[0];
+    const int64_t H        = gdn->src[2]->ne[1];
+    const int64_t n_tokens = gdn->src[2]->ne[2];
+    const int64_t n_seqs   = gdn->src[2]->ne[3];
+    const size_t  tail_off = ggml_row_size(GGML_TYPE_F32, S_v * H * n_tokens * n_seqs);
+
+    const int64_t D = S_v * S_v * H;
+
+    const ggml_tensor * src = cpy->src[0]; // base view
+    const ggml_tensor * dst = cpy->src[1]; // cache view
+
+    if (src->op != GGML_OP_VIEW || src->view_src != gdn ||
+        src->view_offs != tail_off || !ggml_is_contiguous(src)) {
+        return false;
+    }
+
+    const int64_t expected_ne[GGML_MAX_DIMS] = { D, n_seqs, 1, 1 };
+    if (dst->type != GGML_TYPE_F32 ||
+        !std::equal(expected_ne, expected_ne + GGML_MAX_DIMS, dst->ne) ||
+        dst->nb[0] != ggml_type_size(GGML_TYPE_F32) ||
+        dst->nb[1] != ggml_row_size(GGML_TYPE_F32, D)) {
+        return false;
+    }
+
+    if (mode == GGML_METAL_FUSION_FULL) {
+        if (dst->data == nullptr) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
 // MUL + SIN + SQR + MUL + ADD (snake activation)
 static bool ggml_metal_fusion_check_snake(
         const ggml_metal_fusion      * fusion,
@@ -725,6 +780,7 @@ static const ggml_op ops_add_7[] = { GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD, GGML
 static const ggml_op ops_snake[] = { GGML_OP_MUL, GGML_OP_SIN, GGML_OP_SQR, GGML_OP_MUL, GGML_OP_ADD };
 
 static const ggml_op ops_gdn_cache[] = { GGML_OP_GATED_DELTA_NET, GGML_OP_CPY };
+static const ggml_op ops_gdn_deferred_cache[] = { GGML_OP_GATED_DELTA_NET_DEFERRED, GGML_OP_CPY };
 
 static const ggml_op ops_fwht_signed[] = { GGML_OP_MUL, GGML_OP_MUL_MAT };
 static const ggml_op ops_cont_fwht[] = { GGML_OP_CONT, GGML_OP_MUL, GGML_OP_MUL_MAT };
@@ -758,6 +814,7 @@ static const ggml_metal_fusion ggml_metal_fusions[] = {
     { GGML_METAL_FUSION_ADD_CHAIN,    ops_add_7,            7, false, ggml_metal_fusion_check_add_chain },
     { GGML_METAL_FUSION_SNAKE,        ops_snake,            5, false, ggml_metal_fusion_check_snake },
     { GGML_METAL_FUSION_GDN_CACHE,    ops_gdn_cache,        2, true,  ggml_metal_fusion_check_gdn_cache },
+    { GGML_METAL_FUSION_GDN_DEFERRED_CACHE, ops_gdn_deferred_cache, 2, true, ggml_metal_fusion_check_gdn_deferred_cache },
     { GGML_METAL_FUSION_FWHT_SIGNED,  ops_fwht_signed,      2, true,  ggml_metal_fusion_check_fwht_signed },
     { GGML_METAL_FUSION_RMS_NORM_FWHT, ops_rms_norm_fwht,   4, true,  ggml_metal_fusion_check_rms_norm_fwht },
     { GGML_METAL_FUSION_CONT_FWHT,     ops_cont_fwht,       3, true,  ggml_metal_fusion_check_cont_fwht },
