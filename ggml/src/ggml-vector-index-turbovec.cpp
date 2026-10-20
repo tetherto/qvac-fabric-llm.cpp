@@ -1994,12 +1994,47 @@ void turbovec_row_packed(const ggml_vec_index & idx, size_t slot, uint8_t * pack
     seq_row_to_packed_fast(seq, bits, idx.dim, packed);
 }
 
+void turbovec_block_rows_packed(const ggml_vec_index & idx, size_t block, uint8_t * packed) {
+    const int bits = idx.turbovec_bits;
+    const size_t lane_size = static_cast<size_t>(kTurboVecScoreBlock);
+    const size_t n = idx.slot_to_id.size();
+    const size_t first = block * lane_size;
+    const size_t count = std::min(lane_size, n - first);
+    const size_t row_bytes = turbovec_row_bytes(bits, static_cast<size_t>(idx.dim));
+    if (!turbovec_rows_in_blocked(idx)) {
+        std::memcpy(packed, idx.turbovec_data.data() + first * row_bytes, count * row_bytes);
+        return;
+    }
+    // One pass over the block, group by group, then each row repacked.
+    const size_t n_byte_groups = static_cast<size_t>(idx.dim) / static_cast<size_t>(8 / bits);
+    const uint8_t * src = idx.turbovec_blocked_data.data() + block * n_byte_groups * lane_size;
+    std::vector<uint8_t> seq(lane_size * n_byte_groups);
+    for (size_t g = 0; g < n_byte_groups; ++g) {
+        for (size_t lane = 0; lane < count; ++lane) {
+            seq[lane * n_byte_groups + g] = block_lane_byte(src, g, lane, idx.turbovec_blocked_vm);
+        }
+    }
+    for (size_t lane = 0; lane < count; ++lane) {
+        seq_row_to_packed_fast(seq.data() + lane * n_byte_groups, bits, idx.dim, packed + lane * row_bytes);
+    }
+}
+
 void turbovec_rows_packed(const ggml_vec_index & idx, std::vector<uint8_t> & packed) {
     const size_t row_bytes = turbovec_row_bytes(idx.turbovec_bits, static_cast<size_t>(idx.dim));
     const size_t n = idx.slot_to_id.size();
+    const size_t lane_size = static_cast<size_t>(kTurboVecScoreBlock);
     packed.resize(n * row_bytes);
-    for (size_t slot = 0; slot < n; ++slot) {
-        turbovec_row_packed(idx, slot, packed.data() + slot * row_bytes);
+    for (size_t block = 0; block * lane_size < n; ++block) {
+        turbovec_block_rows_packed(idx, block, packed.data() + block * lane_size * row_bytes);
+    }
+}
+
+void turbovec_blocked_set_row_seq(ggml_vec_index & idx, size_t slot, const uint8_t * seq) {
+    const size_t n_byte_groups = static_cast<size_t>(idx.dim) / static_cast<size_t>(8 / idx.turbovec_bits);
+    const size_t lane_size = static_cast<size_t>(kTurboVecScoreBlock);
+    uint8_t * block = idx.turbovec_blocked_data.data() + (slot / lane_size) * n_byte_groups * lane_size;
+    for (size_t g = 0; g < n_byte_groups; ++g) {
+        set_block_lane_byte(block, g, slot % lane_size, idx.turbovec_blocked_vm, seq[g]);
     }
 }
 

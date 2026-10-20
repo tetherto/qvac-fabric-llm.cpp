@@ -949,11 +949,13 @@ uint32_t index_state_crc32c(const ggml_vec_index & idx) {
                 crc = crc32c_update_u32(crc, float_to_u32(idx.turbovec_scale[slot]));
             }
         }
-        std::vector<uint8_t> row(row_bytes);
-        for (size_t slot = 0; slot < idx.slot_to_id.size(); ++slot) {
-            if (slot_is_active(idx, slot)) {
-                turbovec_row_packed(idx, slot, row.data());
-                crc = crc32c_update(crc, row.data(), row_bytes);
+        std::vector<uint8_t> rows(32 * row_bytes);
+        for (size_t first = 0; first < idx.slot_to_id.size(); first += 32) {
+            turbovec_block_rows_packed(idx, first / 32, rows.data());
+            for (size_t slot = first; slot < std::min(first + 32, idx.slot_to_id.size()); ++slot) {
+                if (slot_is_active(idx, slot)) {
+                    crc = crc32c_update(crc, rows.data() + (slot - first) * row_bytes, row_bytes);
+                }
             }
         }
     } else if (is_q4(idx)) {
@@ -1122,6 +1124,21 @@ void rebuild_state_hash(ggml_vec_index & idx) {
     idx.state_hash_xor = 0;
     idx.state_hash_sum = 0;
     idx.state_hash_sum_rot = 0;
+    if (turbovec_rows_in_blocked(idx)) {
+        // Rows come out of the blocked cache a block at a time.
+        const size_t row_bytes = turbovec_row_bytes(idx.turbovec_bits, static_cast<size_t>(idx.dim));
+        std::vector<uint8_t> rows(32 * row_bytes);
+        for (size_t first = 0; first < idx.slot_to_id.size(); first += 32) {
+            turbovec_block_rows_packed(idx, first / 32, rows.data());
+            for (size_t slot = first; slot < std::min(first + 32, idx.slot_to_id.size()); ++slot) {
+                if (slot_is_active(idx, slot)) {
+                    add_state_hash(idx, slot_state_hash(idx, slot, rows.data() + (slot - first) * row_bytes));
+                }
+            }
+        }
+        idx.state_hash_valid = true;
+        return;
+    }
     for (size_t slot = 0; slot < idx.slot_to_id.size(); ++slot) {
         if (slot_is_active(idx, slot)) {
             add_state_hash(idx, slot_state_hash(idx, slot));
@@ -3177,9 +3194,21 @@ int turbovec_v8_write_file(const char * path, const TurboVecV8Image & image) {
         !write_bytes(f, image.header0.data(), image.header0.size())) {
         return fail_io();
     }
-    if (!image.units.empty()) {
-        if (!seek_to(f, units_at) || !write_bytes(f, image.units.data(), image.units.size())) {
+    if (image.n_units != 0) {
+        // Units go out in chunks of about 1 MiB, built as they are written.
+        const size_t per_chunk = std::max<size_t>(1, (size_t{ 1 } << 20) / image.unit_len);
+        std::vector<uint8_t> chunk(std::min(per_chunk, image.n_units) * image.unit_len);
+        if (!seek_to(f, units_at)) {
             return fail_io();
+        }
+        for (size_t first = 0; first < image.n_units; first += per_chunk) {
+            const size_t count = std::min(per_chunk, image.n_units - first);
+            for (size_t i = 0; i < count; ++i) {
+                image.unit(first + i, chunk.data() + i * image.unit_len);
+            }
+            if (!write_bytes(f, chunk.data(), count * image.unit_len)) {
+                return fail_io();
+            }
         }
     }
     if (!set_file_size(f, image_size) || !flush_and_sync(f)) {
@@ -3574,10 +3603,11 @@ int ggml_vec_index_to_bytes(const ggml_vec_index_t * idx, uint8_t ** out_bytes, 
         if (bytes == nullptr) {
             return GGML_VEC_INDEX_E_OOM;
         }
-        std::memcpy(bytes, image.superblock.data(), image.superblock.size());
-        std::memcpy(bytes + image.superblock.size(), image.header0.data(), image.header0.size());
-        if (!image.units.empty()) {
-            std::memcpy(bytes + image.superblock.size() + 2 * image.header_len, image.units.data(), image.units.size());
+        try {
+            turbovec_v8_fill_image(image, bytes);
+        } catch (...) {
+            std::free(bytes);
+            throw;
         }
         *out_bytes = bytes;
         *out_size = size;

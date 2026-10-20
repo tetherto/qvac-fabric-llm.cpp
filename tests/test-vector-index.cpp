@@ -21,6 +21,7 @@
 #include <filesystem>
 #include <fstream>
 #include <limits>
+#include <new>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -38,6 +39,48 @@
 #endif
 
 #ifdef GGML_VEC_INDEX_TEST_HOOKS
+// The largest single operator new request while tracking is on, to bound
+// what a snapshot writer holds at once.
+static std::atomic<bool> g_track_largest_alloc{ false };
+static std::atomic<size_t> g_largest_alloc{ 0 };
+
+// GCC can inline a replacement operator delete into its callers and then
+// flags its free() of operator new's memory (-Wmismatched-new-delete),
+// although these replacements pair malloc with free.
+#if defined(__GNUC__) && !defined(__clang__)
+#define GGML_VI_TEST_NOINLINE __attribute__((noinline))
+#if __GNUC__ >= 11
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wmismatched-new-delete"
+#endif
+#else
+#define GGML_VI_TEST_NOINLINE
+#endif
+
+void * operator new(size_t size) {
+    if (g_track_largest_alloc.load(std::memory_order_relaxed)) {
+        size_t seen = g_largest_alloc.load(std::memory_order_relaxed);
+        while (size > seen && !g_largest_alloc.compare_exchange_weak(seen, size)) {
+        }
+    }
+    if (void * p = std::malloc(size == 0 ? 1 : size)) {
+        return p;
+    }
+    throw std::bad_alloc();
+}
+
+GGML_VI_TEST_NOINLINE void operator delete(void * p) noexcept {
+    std::free(p);
+}
+
+GGML_VI_TEST_NOINLINE void operator delete(void * p, size_t) noexcept {
+    std::free(p);
+}
+
+#if defined(__GNUC__) && !defined(__clang__) && __GNUC__ >= 11
+#pragma GCC diagnostic pop
+#endif
+
 extern "C" {
 int     ggml_vec_index_test_can_address_array(size_t count, size_t element_size);
 void    ggml_vec_index_test_set_write_fail_after(int64_t bytes);
@@ -6018,6 +6061,54 @@ void check_turbovec_1x_single_code_copy() {
 }
 #endif
 
+#ifdef GGML_VEC_INDEX_TEST_HOOKS
+// to_bytes, write and a full sync build block units as they go instead of
+// materializing all of them, so none holds a second copy of the payload.
+void check_turbovec_1x_streamed_snapshots() {
+    constexpr int dim = 256;
+    constexpr int n = 40000;
+    const std::vector<float> rows = tv1x_rows(kTv1xSeedDb, n, dim);
+    const std::vector<uint64_t> ids = tv1x_ids(n);
+    const std::string path = (std::filesystem::temp_directory_path() / "ggml-vector-index-tv1x-stream.tvim").string();
+    const std::string sync_path =
+        (std::filesystem::temp_directory_path() / "ggml-vector-index-tv1x-stream-sync.tvim").string();
+    auto * tv = ggml_vec_index_create_turbovec(dim, 4);
+    CHECK(ggml_vec_index_add(tv, rows.data(), n, ids.data()) == GGML_VEC_INDEX_OK);
+    const size_t payload = ggml_vec_index_serialized_size(tv);
+    CHECK(payload > static_cast<size_t>(n) * (dim / 2));
+    auto largest_during = [&](auto && fn) {
+        g_largest_alloc.store(0);
+        g_track_largest_alloc.store(true);
+        fn();
+        g_track_largest_alloc.store(false);
+        return g_largest_alloc.load();
+    };
+    uint8_t * data = nullptr;
+    size_t size = 0;
+    const size_t to_bytes_peak = largest_during([&] {
+        CHECK(ggml_vec_index_to_bytes(tv, &data, &size) == GGML_VEC_INDEX_OK);
+    });
+    CHECK(size == payload);
+    std::filesystem::remove(path);
+    std::filesystem::remove(sync_path);
+    const size_t write_peak = largest_during([&] { CHECK(ggml_vec_index_write(tv, path.c_str()) == GGML_VEC_INDEX_OK); });
+    const size_t sync_peak = largest_during([&] { CHECK(ggml_vec_index_sync(tv, sync_path.c_str()) == GGML_VEC_INDEX_OK); });
+    CHECK(to_bytes_peak <= (size_t{ 1 } << 20));
+    CHECK(write_peak <= (size_t{ 1 } << 20) + payload / 64);
+    CHECK(sync_peak <= (size_t{ 1 } << 20) + payload / 64);
+    const std::vector<uint8_t> written = read_file_bytes(path);
+    CHECK(written.size() == size && std::memcmp(written.data(), data, size) == 0);
+    CHECK(read_file_bytes(sync_path).size() == size);
+    ggml_vec_index_bytes_free(data);
+    auto * loaded = ggml_vec_index_load(sync_path.c_str());
+    CHECK(loaded != nullptr && ggml_vec_index_len(loaded) == n);
+    ggml_vec_index_free(loaded);
+    ggml_vec_index_free(tv);
+    std::filesystem::remove(path);
+    std::filesystem::remove(sync_path);
+}
+#endif
+
 void check_turbovec_1x() {
     for (const Tv1xIndexCase & c : kTv1xIndexCases) {
 #ifdef GGML_VEC_INDEX_TEST_HOOKS
@@ -6105,6 +6196,7 @@ int main(int argc, char ** argv) {
             check_turbovec_1x_staged();
             check_turbovec_1x_staged_maintenance();
             check_turbovec_1x_single_code_copy();
+            check_turbovec_1x_streamed_snapshots();
             check_tqplus_deterministic_layout(
                 2,
                 UINT64_C(0xc4140782241d45eb),

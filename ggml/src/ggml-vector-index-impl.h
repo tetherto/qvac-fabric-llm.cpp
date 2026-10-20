@@ -18,6 +18,7 @@
 #include <exception>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -762,18 +763,23 @@ void turbovec_seq_row_to_packed(const uint8_t * seq, int bits, int dim, uint8_t 
 // Upstream turbovec v8 snapshot pieces: the superblock, the used prefix of
 // header slot 0, and the block units. The full image is superblock, two
 // header_len slots (slot 0 starts with header0, the rest is zero), units.
+// Units are produced on demand, so a writer never holds them all at once;
+// `unit` reads the index and is only valid while its lock is held.
 struct TurboVecV8Image {
     std::vector<uint8_t> superblock;
     std::vector<uint8_t> header0;
     size_t header_len = 0;
-    std::vector<uint8_t> units;
+    size_t n_units = 0;
+    size_t unit_len = 0;
+    std::function<void(size_t block, uint8_t * out)> unit;
 };
 bool turbovec_v8_magic(const uint8_t * bytes, size_t size);
 uint64_t turbovec_v8_declared_size(std::istream & f, uint64_t file_size);
 void turbovec_v8_build_image(const ggml_vec_index & idx, TurboVecV8Image & image);
 size_t turbovec_v8_image_size(const TurboVecV8Image & image);
 size_t turbovec_v8_serialized_size(const ggml_vec_index & idx);
-void turbovec_v8_flatten_image(const TurboVecV8Image & image, std::vector<uint8_t> & out);
+// Writes the whole image into out (turbovec_v8_image_size bytes, zeroed).
+void turbovec_v8_fill_image(const TurboVecV8Image & image, uint8_t * out);
 struct TurboVecV8LoadInfo {
     uint64_t gen = 0;
     uint64_t nonce = 0;
@@ -840,6 +846,10 @@ void turbovec_settle_rows(ggml_vec_index & idx);
 void turbovec_row_seq(const ggml_vec_index & idx, size_t slot, uint8_t * seq);
 void turbovec_row_packed(const ggml_vec_index & idx, size_t slot, uint8_t * packed);
 void turbovec_rows_packed(const ggml_vec_index & idx, std::vector<uint8_t> & packed);
+// The packed rows of one 32-row block (fewer for the tail block).
+void turbovec_block_rows_packed(const ggml_vec_index & idx, size_t block, uint8_t * packed);
+// Writes one row's sequential codes into its blocked-cache lane.
+void turbovec_blocked_set_row_seq(ggml_vec_index & idx, size_t slot, const uint8_t * seq);
 // Writes n_new packed rows into the blocked cache from first_slot on.
 void turbovec_blocked_append(ggml_vec_index & idx, const uint8_t * packed, size_t first_slot, size_t n_new);
 // The sign planes of rows [first_slot, n_vectors) into the sign blocked

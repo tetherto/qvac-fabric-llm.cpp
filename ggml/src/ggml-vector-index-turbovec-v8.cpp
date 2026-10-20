@@ -354,7 +354,16 @@ private:
     mutable std::vector<uint8_t> packed;
 };
 
-void build_image(const Source & src, uint64_t nonce, TurboVecV8Image & image) {
+// A Source over rows it owns, for an image that outlives its builder.
+struct OwnedSource {
+    OwnedSource(const ggml_vec_index & idx, std::vector<size_t> owned) : rows(std::move(owned)), src(idx, rows) {}
+    std::vector<size_t> rows;
+    Source src;
+};
+
+void build_image(const ggml_vec_index & idx, std::vector<size_t> rows, uint64_t nonce, TurboVecV8Image & image) {
+    auto owned = std::make_shared<OwnedSource>(idx, std::move(rows));
+    const Source & src = owned->src;
     const Geo & geo = src.geometry();
     image.superblock = src.superblock(nonce);
     // Generation 0 with no ops and an empty delta, whose digest covers just
@@ -362,11 +371,9 @@ void build_image(const Source & src, uint64_t nonce, TurboVecV8Image & image) {
     const uint8_t gen_bytes[8] = {};
     image.header0 = src.header(0, {}, {}, 0, 0, crc32_upstream(gen_bytes, sizeof(gen_bytes)));
     image.header_len = geo.hdr_len();
-    const size_t n_blocks = src.n() / kBlock;
-    image.units.assign(n_blocks * geo.unit_len(), 0);
-    for (size_t block = 0; block < n_blocks; ++block) {
-        src.unit(block, image.units.data() + block * geo.unit_len());
-    }
+    image.n_units = src.n() / kBlock;
+    image.unit_len = geo.unit_len();
+    image.unit = [owned](size_t block, uint8_t * out) { owned->src.unit(block, out); };
 }
 
 }  // namespace
@@ -375,27 +382,23 @@ void build_image(const Source & src, uint64_t nonce, TurboVecV8Image & image) {
 // add/remove history holds them in. Falls back to slot order if the
 // tracked order was lost.
 void turbovec_v8_build_image(const ggml_vec_index & idx, TurboVecV8Image & image) {
-    const std::vector<size_t> rows = live_slots(idx);
-    build_image(Source(idx, rows), 0, image);
+    build_image(idx, live_slots(idx), 0, image);
 }
 
 size_t turbovec_v8_image_size(const TurboVecV8Image & image) {
-    return image.superblock.size() + 2 * image.header_len + image.units.size();
+    return image.superblock.size() + 2 * image.header_len + image.n_units * image.unit_len;
 }
 
 size_t turbovec_v8_serialized_size(const ggml_vec_index & idx) {
     return index_geo(idx).unit_at(active_count(idx) / kBlock);
 }
 
-void turbovec_v8_flatten_image(const TurboVecV8Image & image, std::vector<uint8_t> & out) {
-    out.assign(turbovec_v8_image_size(image), 0);
-    std::memcpy(out.data(), image.superblock.data(), image.superblock.size());
-    std::memcpy(out.data() + image.superblock.size(), image.header0.data(), image.header0.size());
-    if (!image.units.empty()) {
-        std::memcpy(
-            out.data() + image.superblock.size() + 2 * image.header_len,
-            image.units.data(),
-            image.units.size());
+void turbovec_v8_fill_image(const TurboVecV8Image & image, uint8_t * out) {
+    std::memcpy(out, image.superblock.data(), image.superblock.size());
+    std::memcpy(out + image.superblock.size(), image.header0.data(), image.header0.size());
+    uint8_t * units = out + image.superblock.size() + 2 * image.header_len;
+    for (size_t block = 0; block < image.n_units; ++block) {
+        image.unit(block, units + block * image.unit_len);
     }
 }
 
@@ -755,18 +758,31 @@ ggml_vec_index_t * turbovec_v8_load_image(std::vector<uint8_t> raw, int & error,
     const size_t packed_bytes = turbovec_row_bytes(geo.bits, geo.dim);
     const size_t nsg = planes_nsg(geo);
     const size_t low_row = static_cast<size_t>(geo.bits - 1) * nsg;
-    // The rows are decoded into packed form first; once the blocked cache
-    // is built they are dropped unless the planes layout needs them.
-    idx->turbovec_packed_rows = true;
-    idx->turbovec_data.assign(n * packed_bytes, 0);
+    // Rows decode straight into the blocked cache. An index the planes
+    // layout will promote decodes into packed rows instead, which its staged
+    // search reads, and builds the blocked cache from them.
+    const bool keep_packed = turbovec_planes_wanted(geo.bits, dim, n);
+    idx->turbovec_packed_rows = keep_packed;
+    if (keep_packed) {
+        idx->turbovec_data.assign(n * packed_bytes, 0);
+    } else {
+        idx->turbovec_blocked_n_blocks = (n + kBlock - 1) / kBlock;
+        idx->turbovec_blocked_data.assign(idx->turbovec_blocked_n_blocks * row_bytes * kBlock, 0);
+    }
     idx->turbovec_scale.assign(n, 0.0f);
     idx->slot_to_id.assign(n, 0);
 
     // A sequential row (one byte per code group) or a planes row (low
-    // planes, then the sign plane) into the packed bit-plane row.
+    // planes, then the sign plane) into the index's code storage.
     auto put_seq_row = [&](size_t slot, const uint8_t * codes) {
-        turbovec_seq_row_to_packed(codes, geo.bits, dim, idx->turbovec_data.data() + slot * packed_bytes);
+        if (keep_packed) {
+            turbovec_seq_row_to_packed(codes, geo.bits, dim, idx->turbovec_data.data() + slot * packed_bytes);
+        } else {
+            turbovec_blocked_set_row_seq(*idx, slot, codes);
+        }
     };
+    std::vector<uint8_t> packed_row(packed_bytes);
+    std::vector<uint8_t> seq_row(row_bytes);
     auto put_row_codes = [&](size_t slot, const uint8_t * codes) {
         // Tail rows and redo ops always carry sequential row codes.
         put_seq_row(slot, codes);
@@ -778,13 +794,17 @@ ggml_vec_index_t * turbovec_v8_load_image(std::vector<uint8_t> raw, int & error,
         const uint8_t * unit = raw.data() + geo.unit_at(block);
         for (size_t lane = 0; lane < kBlock; ++lane) {
             const size_t slot = block * kBlock + lane;
-            uint8_t * packed = idx->turbovec_data.data() + slot * packed_bytes;
             if (geo.layout == kLayoutPlanes) {
                 // Canonical planes unit: sign bytes group-major across the
                 // block's lanes, then each lane's low planes.
+                uint8_t * packed = keep_packed ? idx->turbovec_data.data() + slot * packed_bytes : packed_row.data();
                 std::memcpy(packed, unit + nsg * kBlock + lane * low_row, low_row);
                 for (size_t g = 0; g < nsg; ++g) {
                     packed[low_row + g] = unit[g * kBlock + lane];
+                }
+                if (!keep_packed) {
+                    turbovec_packed_row_to_seq(packed, geo.bits, dim, seq_row.data());
+                    turbovec_blocked_set_row_seq(*idx, slot, seq_row.data());
                 }
             } else {
                 for (size_t g = 0; g < row_bytes; ++g) {
@@ -844,14 +864,16 @@ ggml_vec_index_t * turbovec_v8_load_image(std::vector<uint8_t> raw, int & error,
         idx->turbovec_tqplus_shift.swap(shift);
         idx->turbovec_tqplus_scale.swap(scale);
     }
-    repack_turbovec_codes(
-        idx->turbovec_data.data(),
-        n,
-        geo.bits,
-        dim,
-        idx->turbovec_blocked_data,
-        idx->turbovec_blocked_n_blocks,
-        idx->turbovec_blocked_vm);
+    if (keep_packed) {
+        repack_turbovec_codes(
+            idx->turbovec_data.data(),
+            n,
+            geo.bits,
+            dim,
+            idx->turbovec_blocked_data,
+            idx->turbovec_blocked_n_blocks,
+            idx->turbovec_blocked_vm);
+    }
     turbovec_planes_refresh(*idx, 0);
     rebuild_state_hash(*idx);
     turbovec_settle_rows(*idx);
@@ -1250,10 +1272,9 @@ int turbovec_v8_sync(ggml_vec_index & idx, const char * path) {
     }
 
     // A full write claims the file with a fresh nonce.
-    const std::vector<size_t> rows = live_slots(idx);
     const uint64_t nonce = new_file_nonce();
     TurboVecV8Image image;
-    build_image(Source(idx, rows), nonce, image);
+    build_image(idx, live_slots(idx), nonce, image);
     const int rc = turbovec_v8_write_file(path, image);
     if (rc != GGML_VEC_INDEX_OK && rc != GGML_VEC_INDEX_E_NOT_DURABLE) {
         turbovec_sync_unbind(idx);
