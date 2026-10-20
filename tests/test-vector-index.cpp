@@ -5125,6 +5125,43 @@ void check_turbovec_1x_threads() {
     }
 }
 
+void check_vector_index_introspection() {
+    CHECK(ggml_vec_index_storage(nullptr) == GGML_VEC_INDEX_STORAGE_NONE);
+    CHECK(ggml_vec_index_turbovec_is_legacy(nullptr) == 0);
+    const std::pair<ggml_vec_index_t *, int> cases[] = {
+        { ggml_vec_index_create(64, 32), GGML_VEC_INDEX_STORAGE_F32 },
+        { ggml_vec_index_create(64, 8), GGML_VEC_INDEX_STORAGE_Q8 },
+        { ggml_vec_index_create(64, 4), GGML_VEC_INDEX_STORAGE_Q4 },
+        { ggml_vec_index_create_turbovec(64, 2), GGML_VEC_INDEX_STORAGE_TURBOVEC_Q2 },
+        { ggml_vec_index_create_turbovec(64, 3), GGML_VEC_INDEX_STORAGE_TURBOVEC_Q3 },
+        { ggml_vec_index_create_turbovec(64, 4), GGML_VEC_INDEX_STORAGE_TURBOVEC_Q4 },
+        { create_legacy_turbovec(64, 4), GGML_VEC_INDEX_STORAGE_TURBOVEC_Q4 },
+    };
+    const std::vector<float> rows = tv1x_rows(kTv1xSeedDb, 5, 64);
+    const std::vector<uint64_t> ids = tv1x_ids(5);
+    for (const auto & c : cases) {
+        CHECK(ggml_vec_index_storage(c.first) == c.second);
+        CHECK(ggml_vec_index_add(c.first, rows.data(), 5, ids.data()) == GGML_VEC_INDEX_OK);
+        CHECK(ggml_vec_index_remove(c.first, ids[1]) == GGML_VEC_INDEX_OK);
+        size_t count = 0;
+        CHECK(ggml_vec_index_ids(c.first, nullptr, 0, &count) == GGML_VEC_INDEX_OK);
+        CHECK(count == 4);
+        std::vector<uint64_t> listed(2);
+        CHECK(ggml_vec_index_ids(c.first, listed.data(), listed.size(), &count) == GGML_VEC_INDEX_OK);
+        CHECK(count == 4 && listed[0] == ids[0] && listed[1] == ids[2]);
+        listed.assign(8, 0);
+        CHECK(ggml_vec_index_ids(c.first, listed.data(), listed.size(), &count) == GGML_VEC_INDEX_OK);
+        CHECK(listed[3] == ids[4] && listed[4] == 0);
+        CHECK(ggml_vec_index_ids(c.first, nullptr, 1, &count) == GGML_VEC_INDEX_E_INVALID_ARG);
+        CHECK(ggml_vec_index_ids(c.first, listed.data(), 1, nullptr) == GGML_VEC_INDEX_E_INVALID_ARG);
+    }
+    CHECK(ggml_vec_index_turbovec_is_legacy(cases[5].first) == 0);
+    CHECK(ggml_vec_index_turbovec_is_legacy(cases[6].first) == 1);
+    for (const auto & c : cases) {
+        ggml_vec_index_free(c.first);
+    }
+}
+
 void check_turbovec_1x() {
     for (const Tv1xIndexCase & c : kTv1xIndexCases) {
         check_turbovec_1x_golden_case(c);
@@ -5138,6 +5175,7 @@ void check_turbovec_1x() {
     check_turbovec_1x_sync_api();
     check_turbovec_1x_history_snapshots();
     check_turbovec_1x_threads();
+    check_vector_index_introspection();
 }
 
 }  // namespace
