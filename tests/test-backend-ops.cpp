@@ -17906,6 +17906,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_conv_1d_dw_direct_norm_channel(1024, 512, 7, 3, true));
     test_cases.emplace_back(new test_scale_residual(139, 512, 1, 1));
     test_cases.emplace_back(new test_bias_gelu(139, 512, 1, 1));
+    test_cases.emplace_back(new test_pad_replicate_1d(139, 512, 6, 0, true));
 
     return test_cases;
 }

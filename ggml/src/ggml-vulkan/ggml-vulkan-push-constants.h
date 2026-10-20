@@ -812,6 +812,10 @@ struct vk_op_norm_channel_push_constants {
 struct vk_op_channel_pointwise_push_constants {
     uint32_t ne, L, C, B, layout;
 };
+
+struct vk_op_pad_replicate_1d_push_constants {
+    uint32_t ne, L_in, L_out, C, layout, pad_left;
+};
 struct vk_op_ssm_conv_back_sx_push_constants {
     uint32_t grad_nb0, grad_nb1, grad_nb2;
     uint32_t c_nb1;
