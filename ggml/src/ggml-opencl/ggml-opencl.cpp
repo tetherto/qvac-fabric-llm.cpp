@@ -1309,6 +1309,7 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_gru_f32;
     cl_kernel kernel_zero_upsample_f32;
     cl_kernel kernel_channel_shuffle_f32;
+    cl_kernel kernel_affine_prelu_f32;
     cl_kernel kernel_timestep_embedding;
     cl_kernel kernel_gemv_moe_q4_0_f32_ns, kernel_gemm_moe_q4_0_f32_ns, kernel_gemm_moe_q4_0_f32_ns_bin;
     cl_kernel kernel_gemm_moe_q8_0_f32_ns;
@@ -5023,6 +5024,22 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         cl_program prog =
             build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
         CL_CHECK((backend_ctx->kernel_channel_shuffle_f32 = clCreateKernel(prog, "kernel_channel_shuffle_f32", &err), err));
+        CL_CHECK(clReleaseProgram(prog));
+        GGML_LOG_CONT(".");
+    }
+
+    // affine_prelu
+    {
+#ifdef GGML_OPENCL_EMBED_KERNELS
+        const std::string kernel_src {
+            #include "affine_prelu.cl.h"
+        };
+#else
+        const std::string kernel_src = read_file("affine_prelu.cl");
+#endif
+        cl_program prog =
+            build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
+        CL_CHECK((backend_ctx->kernel_affine_prelu_f32 = clCreateKernel(prog, "kernel_affine_prelu_f32", &err), err));
         CL_CHECK(clReleaseProgram(prog));
         GGML_LOG_CONT(".");
     }
@@ -12440,6 +12457,10 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
         case GGML_OP_CHANNEL_SHUFFLE:
             return op->src[0]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
                    ggml_is_contiguous(op->src[0]);
+        case GGML_OP_AFFINE_PRELU:
+            return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
+                   op->src[2]->type == GGML_TYPE_F32 && op->src[3]->type == GGML_TYPE_F32 &&
+                   op->type == GGML_TYPE_F32 && ggml_is_contiguous(op->src[0]);
         case GGML_OP_TIMESTEP_EMBEDDING:
             return op->src[0]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32;
         case GGML_OP_GROUP_NORM:
@@ -21714,6 +21735,56 @@ static void ggml_cl_channel_shuffle(ggml_backend_t backend, const ggml_tensor * 
     size_t local_work_size[]  = { 64, 1, 1 };
     backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
 }
+
+static void ggml_cl_affine_prelu(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    const ggml_tensor * x     = dst->src[0];
+    const ggml_tensor * aw    = dst->src[1];
+    const ggml_tensor * ab    = dst->src[2];
+    const ggml_tensor * slope = dst->src[3];
+    GGML_ASSERT(x && x->extra && aw && aw->extra && ab && ab->extra && slope && slope->extra);
+    GGML_ASSERT(dst && dst->extra);
+    GGML_UNUSED(src0);
+    GGML_UNUSED(src1);
+
+    ggml_backend_opencl_context * backend_ctx = (ggml_backend_opencl_context *)backend->context;
+
+    ggml_tensor_extra_cl * ex = (ggml_tensor_extra_cl *)x->extra;
+    ggml_tensor_extra_cl * ew = (ggml_tensor_extra_cl *)aw->extra;
+    ggml_tensor_extra_cl * eb = (ggml_tensor_extra_cl *)ab->extra;
+    ggml_tensor_extra_cl * es = (ggml_tensor_extra_cl *)slope->extra;
+    ggml_tensor_extra_cl * ed = (ggml_tensor_extra_cl *)dst->extra;
+
+    cl_ulong ofx = ex->offset + x->view_offs;
+    cl_ulong ofw = ew->offset + aw->view_offs;
+    cl_ulong ofb = eb->offset + ab->view_offs;
+    cl_ulong ofs = es->offset + slope->view_offs;
+    cl_ulong ofd = ed->offset + dst->view_offs;
+
+    const int F = x->ne[0];
+    const int T = x->ne[1];
+    const int C = x->ne[2];
+
+    cl_kernel kernel = backend_ctx->kernel_affine_prelu_f32;
+    CL_CHECK(clSetKernelArg(kernel,  0, sizeof(cl_mem),   &ex->data_device));
+    CL_CHECK(clSetKernelArg(kernel,  1, sizeof(cl_ulong), &ofx));
+    CL_CHECK(clSetKernelArg(kernel,  2, sizeof(cl_mem),   &ew->data_device));
+    CL_CHECK(clSetKernelArg(kernel,  3, sizeof(cl_ulong), &ofw));
+    CL_CHECK(clSetKernelArg(kernel,  4, sizeof(cl_mem),   &eb->data_device));
+    CL_CHECK(clSetKernelArg(kernel,  5, sizeof(cl_ulong), &ofb));
+    CL_CHECK(clSetKernelArg(kernel,  6, sizeof(cl_mem),   &es->data_device));
+    CL_CHECK(clSetKernelArg(kernel,  7, sizeof(cl_ulong), &ofs));
+    CL_CHECK(clSetKernelArg(kernel,  8, sizeof(cl_mem),   &ed->data_device));
+    CL_CHECK(clSetKernelArg(kernel,  9, sizeof(cl_ulong), &ofd));
+    CL_CHECK(clSetKernelArg(kernel, 10, sizeof(int),      &F));
+    CL_CHECK(clSetKernelArg(kernel, 11, sizeof(int),      &T));
+    CL_CHECK(clSetKernelArg(kernel, 12, sizeof(int),      &C));
+
+    const size_t gws0 = ((size_t) (F + 63) / 64) * 64;
+    size_t global_work_size[] = { gws0, (size_t) T, (size_t) (C * dst->ne[3]) };
+    size_t local_work_size[]  = { 64, 1, 1 };
+    backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
+}
+
 static void ggml_cl_timestep_embedding(ggml_backend_t backend, const ggml_tensor * src0, ggml_tensor * dst) {
     GGML_ASSERT(src0);
     GGML_ASSERT(src0->extra);
@@ -39128,6 +39199,12 @@ bool ggml_cl_compute_forward(ggml_backend_t backend, struct ggml_tensor * tensor
                 return false;
             }
             func = ggml_cl_channel_shuffle;
+            break;
+        case GGML_OP_AFFINE_PRELU:
+            if (!any_on_device) {
+                return false;
+            }
+            func = ggml_cl_affine_prelu;
             break;
         case GGML_OP_TIMESTEP_EMBEDDING:
             if (!any_on_device) {
