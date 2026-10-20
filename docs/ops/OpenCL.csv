@@ -22541,3 +22541,5 @@
 "OpenCL","CHANNEL_SHUFFLE","ne=[8,4,12,2],groups=4","support","1","yes","OpenCL"
 "OpenCL","AFFINE_PRELU","f=16,t=10,c=6,bc=2","support","1","yes","OpenCL"
 "OpenCL","AFFINE_PRELU","f=129,t=63,c=16,bc=3","support","1","yes","OpenCL"
+"OpenCL","SNAKE","t=32,c=8","support","1","yes","OpenCL"
+"OpenCL","SNAKE","t=127,c=3","support","1","yes","OpenCL"
