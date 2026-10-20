@@ -1091,6 +1091,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_conv_1d_dw_direct_norm_channel_f32;
     vk_pipeline pipeline_norm_channel_f32;
     vk_pipeline pipeline_scale_residual_f32;
+    vk_pipeline pipeline_bias_gelu_f32;
     // CONCAT(state, x^T) + SSM_CONV + SILU without the transposed concat: the conv reads x and the state
     // directly, and the concat node only writes the tail columns its other readers (state copies) use
     vk_pipeline pipeline_ssm_conv_direct_silu_f32;

@@ -1384,6 +1384,12 @@ void ggml_vk_check_results_0(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph
                 case 2:  tensor_clone = ggml_scale_residual_tc_to_ct(ggml_ctx, src_clone[0], src_clone[1], src_clone[2], src_clone[3]); break;
                 default: tensor_clone = ggml_scale_residual(ggml_ctx, src_clone[0], src_clone[1], src_clone[2], src_clone[3]); break;
             }
+        } else if (tensor->op == GGML_OP_BIAS_GELU) {
+            switch (ggml_get_op_params_i32(tensor, 0)) {
+                case 1:  tensor_clone = ggml_bias_gelu_ct(ggml_ctx, src_clone[0], src_clone[1]); break;
+                case 2:  tensor_clone = ggml_bias_gelu_tc_to_ct(ggml_ctx, src_clone[0], src_clone[1]); break;
+                default: tensor_clone = ggml_bias_gelu(ggml_ctx, src_clone[0], src_clone[1]); break;
+            }
         } else if (tensor->op == GGML_OP_SSM_CONV_BACK_SX) {
             tensor_clone = ggml_ssm_conv_back_sx(ggml_ctx, src_clone[0], src_clone[1], tensor);
         } else if (tensor->op == GGML_OP_SSM_CONV_BACK_C) {
