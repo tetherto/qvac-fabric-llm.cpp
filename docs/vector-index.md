@@ -142,10 +142,10 @@ scores are exactly the full scan's, but which ids are returned can differ
 from it: on unstructured random test data 77 to 94% of a top 10 overlaps the
 full scan's, the same as upstream, and real embeddings fare better (see
 upstream's measurements). The results match upstream's single-threaded
-staged search bit for bit, ties included. Upstream's thread-pool variant
-refines inside its scan, and a batch whose sampled seed comes up short is
-rescanned there; both can return different ids. A staged search runs on the
-calling thread. An index stays staged if it later shrinks below the
+staged search bit for bit, ties included, down to the batch query whose
+sampled seed comes up short and is rescanned with single-query tables.
+Upstream's thread-pool variant refines inside its scan and can return
+different ids. A staged search runs on the calling thread. An index stays staged if it later shrinks below the
 threshold. `ggml_vec_index_turbovec_set_staged(idx, 0)` makes an index scan in
 full instead. Upstream also searches in stages on x86 with AVX-512 VBMI and
 VNNI; this port scans in full there for now.

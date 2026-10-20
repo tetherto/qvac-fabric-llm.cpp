@@ -63,6 +63,7 @@ const SEED_DB: u64 = 1;
 const SEED_QUERY: u64 = 2;
 const SEED_CALIB: u64 = 3;
 const SEED_ROTATION: u64 = 4;
+const SEED_SHORT_NOISE: u64 = 5;
 
 fn ids(n: usize) -> Vec<u64> {
     (0..n as u64).map(|i| 1000 + 7 * i).collect()
@@ -478,6 +479,52 @@ fn print_staged() {
     println!("static const Tv1xStagedSnapshot kTv1xStagedSnapshots[] = {{");
     for (bits, calibrated, hash, len) in snapshots {
         println!("    {{ {bits}, {calibrated}, UINT64_C(0x{hash:016x}), {len} }},");
+    }
+    println!("}};");
+    print_staged_short();
+}
+
+// A batch of three in which only query 0's sampled seed runs short: near
+// copies of it fill exactly the 48 blocks upstream samples, so the seed
+// lands above all but a handful of rows. Upstream then rescans that one
+// query with the single-query sign tables.
+fn print_staged_short() {
+    const N: usize = 40_000;
+    const DIM: usize = 128;
+    const KS: usize = 100;
+    println!("static constexpr int kTv1xStagedShortK = {KS};");
+    println!("static constexpr uint64_t kTv1xStagedShortNoiseSeed = {SEED_SHORT_NOISE};");
+    println!("struct Tv1xStagedShortCase {{ int bits; int calibrated; uint64_t ids[3 * {KS}]; float scores[3 * {KS}]; }};");
+    println!("static const Tv1xStagedShortCase kTv1xStagedShortCases[] = {{");
+    let mut db = rows(SEED_DB, N, DIM);
+    let id_list = ids(N);
+    let queries = rows(SEED_QUERY, 3, DIM);
+    let calib = rows(SEED_CALIB, N_CALIB, DIM);
+    let noise = rows(SEED_SHORT_NOISE, 48 * 32, DIM);
+    let stride = (N / 32) / 48;
+    for i in 0..48 {
+        let block = i * stride + stride / 2;
+        for lane in 0..32 {
+            let row = block * 32 + lane;
+            for c in 0..DIM {
+                db[row * DIM + c] = queries[c] + 0.05 * noise[(i * 32 + lane) * DIM + c];
+            }
+        }
+    }
+    for bits in [2usize, 4] {
+        for calibrated in [0, 1] {
+            let mut idx = IdMapIndex::new(DIM, bits).unwrap();
+            if calibrated == 1 {
+                idx.calibrate(&calib).unwrap();
+            }
+            idx.add_with_ids(&db, &id_list).unwrap();
+            let (s, i) = idx.search(&queries, KS);
+            let fmt_ids = i.iter().map(|x| format!("{x}u")).collect::<Vec<_>>().join(", ");
+            let fmt_f32 = s.iter().map(|x| format!("{:.9e}f", x)).collect::<Vec<_>>().join(", ");
+            println!("    {{ {bits}, {calibrated},");
+            println!("      {{ {fmt_ids} }},");
+            println!("      {{ {fmt_f32} }} }},");
+        }
     }
     println!("}};");
 }
