@@ -556,6 +556,7 @@ struct TurboVecV8Image {
 bool turbovec_v8_magic(const uint8_t * bytes, size_t size);
 void turbovec_v8_build_image(const ggml_vec_index & idx, TurboVecV8Image & image);
 size_t turbovec_v8_image_size(const TurboVecV8Image & image);
+size_t turbovec_v8_serialized_size(const ggml_vec_index & idx);
 void turbovec_v8_flatten_image(const TurboVecV8Image & image, std::vector<uint8_t> & out);
 ggml_vec_index_t * turbovec_v8_load_image(std::vector<uint8_t> raw, int & error);
 void decode_turbovec_q2_row(const uint8_t * codes, const float * scales, float * dst, int dim);
