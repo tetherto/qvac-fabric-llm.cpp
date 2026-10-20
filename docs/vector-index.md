@@ -257,6 +257,11 @@ codes, only over the superblock and headers. Loading validates the codebook,
 calibration and per-vector scales and rejects duplicate ids. TurboVec
 snapshots do not support mmap loading or delta logs.
 
+Writers build block units as they go: a write or full sync holds about 1 MiB
+beyond the index, and `ggml_vec_index_to_bytes` holds only its output. A load
+reads the file's declared content and decodes it straight into the blocked
+codes.
+
 `ggml_vec_index_to_bytes` and `ggml_vec_index_from_bytes` move the same image
 through memory, and `ggml_vec_index_serialized_size` reports its size.
 
