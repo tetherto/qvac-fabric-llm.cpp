@@ -1307,6 +1307,7 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_ssm_scan_f32_mamba2_d256 = nullptr;
 
     cl_kernel kernel_gru_f32;
+    cl_kernel kernel_zero_upsample_f32;
     cl_kernel kernel_timestep_embedding;
     cl_kernel kernel_gemv_moe_q4_0_f32_ns, kernel_gemm_moe_q4_0_f32_ns, kernel_gemm_moe_q4_0_f32_ns_bin;
     cl_kernel kernel_gemm_moe_q8_0_f32_ns;
@@ -4989,6 +4990,22 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         cl_program prog =
             build_program_from_source(backend_ctx, kernel_src.c_str(), gru_opts.c_str());
         CL_CHECK((backend_ctx->kernel_gru_f32 = clCreateKernel(prog, "kernel_gru_f32", &err), err));
+        CL_CHECK(clReleaseProgram(prog));
+        GGML_LOG_CONT(".");
+    }
+
+    // zero_upsample
+    {
+#ifdef GGML_OPENCL_EMBED_KERNELS
+        const std::string kernel_src {
+            #include "zero_upsample.cl.h"
+        };
+#else
+        const std::string kernel_src = read_file("zero_upsample.cl");
+#endif
+        cl_program prog =
+            build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
+        CL_CHECK((backend_ctx->kernel_zero_upsample_f32 = clCreateKernel(prog, "kernel_zero_upsample_f32", &err), err));
         CL_CHECK(clReleaseProgram(prog));
         GGML_LOG_CONT(".");
     }
@@ -12400,6 +12417,9 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
             return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
                    op->src[2]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
                    op->src[0]->ne[0] <= GGML_OPENCL_GRU_MAX_H;
+        case GGML_OP_ZERO_UPSAMPLE:
+            return op->src[0]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
+                   ggml_is_contiguous(op->src[0]);
         case GGML_OP_TIMESTEP_EMBEDDING:
             return op->src[0]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32;
         case GGML_OP_GROUP_NORM:
@@ -21605,6 +21625,40 @@ static void ggml_cl_gru(ggml_backend_t backend, const ggml_tensor * src0, const 
 
     size_t global_work_size[] = { (size_t) H, (size_t) B, 1 };
     size_t local_work_size[]  = { (size_t) H, 1, 1 };
+    backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
+}
+
+static void ggml_cl_zero_upsample(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    GGML_ASSERT(src0 && src0->extra);
+    GGML_ASSERT(dst && dst->extra);
+    GGML_UNUSED(src1);
+
+    ggml_backend_opencl_context * backend_ctx = (ggml_backend_opencl_context *)backend->context;
+
+    ggml_tensor_extra_cl * e0 = (ggml_tensor_extra_cl *)src0->extra;
+    ggml_tensor_extra_cl * ed = (ggml_tensor_extra_cl *)dst->extra;
+
+    cl_ulong off0 = e0->offset + src0->view_offs;
+    cl_ulong offd = ed->offset + dst->view_offs;
+
+    const int F  = src0->ne[0];
+    const int R  = src0->ne[1] * src0->ne[2] * src0->ne[3];
+    const int Fu = dst->ne[0];
+    const int s  = ggml_get_op_params_i32(dst, 0);
+
+    cl_kernel kernel = backend_ctx->kernel_zero_upsample_f32;
+    CL_CHECK(clSetKernelArg(kernel, 0, sizeof(cl_mem),   &e0->data_device));
+    CL_CHECK(clSetKernelArg(kernel, 1, sizeof(cl_ulong), &off0));
+    CL_CHECK(clSetKernelArg(kernel, 2, sizeof(cl_mem),   &ed->data_device));
+    CL_CHECK(clSetKernelArg(kernel, 3, sizeof(cl_ulong), &offd));
+    CL_CHECK(clSetKernelArg(kernel, 4, sizeof(int),      &F));
+    CL_CHECK(clSetKernelArg(kernel, 5, sizeof(int),      &R));
+    CL_CHECK(clSetKernelArg(kernel, 6, sizeof(int),      &Fu));
+    CL_CHECK(clSetKernelArg(kernel, 7, sizeof(int),      &s));
+
+    const size_t gws0 = ((size_t) (F + 63) / 64) * 64;
+    size_t global_work_size[] = { gws0, (size_t) R, 1 };
+    size_t local_work_size[]  = { 64, 1, 1 };
     backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
 }
 static void ggml_cl_timestep_embedding(ggml_backend_t backend, const ggml_tensor * src0, ggml_tensor * dst) {
@@ -39009,6 +39063,12 @@ bool ggml_cl_compute_forward(ggml_backend_t backend, struct ggml_tensor * tensor
                 return false;
             }
             func = ggml_cl_gru;
+            break;
+        case GGML_OP_ZERO_UPSAMPLE:
+            if (!any_on_device) {
+                return false;
+            }
+            func = ggml_cl_zero_upsample;
             break;
         case GGML_OP_TIMESTEP_EMBEDDING:
             if (!any_on_device) {
