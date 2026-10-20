@@ -503,10 +503,11 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
             //     pp512 MMQ is still as fast or faster. With HIP 7.2 (ROCm 7.2.2) hipBLAS is slower instead (pp2048
             //     317 -> 288 t/s), so older HIP keeps MMQ. GGML_CUDA_RDNA3_5_Q8_0_MMQ_MAX overrides the row limit.
             if (GGML_CUDA_CC_IS_RDNA3_5(cc) && type == GGML_TYPE_Q8_0 && n_experts == 0) {
+                // static storage: MSVC rejects reading a block-scope constexpr in a capture-less lambda (C3493)
 #if defined(GGML_USE_HIP) && HIP_VERSION >= 71500000
-                constexpr int64_t q8_0_mmq_max_default = 512;
+                static constexpr int64_t q8_0_mmq_max_default = 512;
 #else
-                constexpr int64_t q8_0_mmq_max_default = INT64_MAX;
+                static constexpr int64_t q8_0_mmq_max_default = INT64_MAX;
 #endif // defined(GGML_USE_HIP) && HIP_VERSION >= 71500000
                 static const int64_t q8_0_mmq_max = [] {
                     const char * env = getenv("GGML_CUDA_RDNA3_5_Q8_0_MMQ_MAX");
