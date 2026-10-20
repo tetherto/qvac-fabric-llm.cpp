@@ -794,6 +794,10 @@ struct vk_op_ssm_conv_push_constants {
     uint32_t nc, ncs, nr, n_t, n_s;
 };
 
+
+struct vk_op_conv_1d_dw_direct_push_constants {
+    uint32_t ne, L, C, B, K, dilation, layout, causal, seg_len, has_bias;
+};
 struct vk_op_ssm_conv_back_sx_push_constants {
     uint32_t grad_nb0, grad_nb1, grad_nb2;
     uint32_t c_nb1;

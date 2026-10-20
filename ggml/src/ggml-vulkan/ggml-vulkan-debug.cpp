@@ -1361,6 +1361,18 @@ void ggml_vk_check_results_0(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph
                                          src_clone[3], src_clone[4], src_clone[5], src_clone[6], K);
         } else if (tensor->op == GGML_OP_SSM_CONV) {
             tensor_clone = ggml_ssm_conv(ggml_ctx, src_clone[0], src_clone[1]);
+        } else if (tensor->op == GGML_OP_CONV_1D_DW_DIRECT) {
+            const int dilation = ggml_get_op_params_i32(tensor, 1);
+            const int seg_len  = ggml_get_op_params_i32(tensor, 4);
+            if (seg_len > 0) {
+                tensor_clone = ggml_conv_1d_dw_direct_ct_segmented(ggml_ctx, src_clone[0], src_clone[1], src_clone[2], dilation, seg_len);
+            } else if (ggml_get_op_params_i32(tensor, 3) != 0) {
+                tensor_clone = ggml_conv_1d_dw_direct_causal_ct(ggml_ctx, src_clone[0], src_clone[1], src_clone[2], dilation);
+            } else if (ggml_get_op_params_i32(tensor, 2) != 0) {
+                tensor_clone = ggml_conv_1d_dw_direct_ct(ggml_ctx, src_clone[0], src_clone[1], src_clone[2], dilation);
+            } else {
+                tensor_clone = ggml_conv_1d_dw_direct(ggml_ctx, src_clone[0], src_clone[1], src_clone[2], dilation);
+            }
         } else if (tensor->op == GGML_OP_SSM_CONV_BACK_SX) {
             tensor_clone = ggml_ssm_conv_back_sx(ggml_ctx, src_clone[0], src_clone[1], tensor);
         } else if (tensor->op == GGML_OP_SSM_CONV_BACK_C) {

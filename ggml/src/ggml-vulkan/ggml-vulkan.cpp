@@ -4619,6 +4619,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_back_sx_f32, "ssm_conv_back_sx_f32", ssm_conv_back_sx_f32_len, ssm_conv_back_sx_f32_data, "main", 3, sizeof(vk_op_ssm_conv_back_sx_push_constants), {32, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_back_c_f32, "ssm_conv_back_c_f32", ssm_conv_back_c_f32_len, ssm_conv_back_c_f32_data, "main", 3, sizeof(vk_op_ssm_conv_back_c_push_constants), {32, 1, 1}, {}, 1);
 
+    ggml_vk_create_pipeline(device, device->pipeline_conv_1d_dw_direct_f32, "conv_1d_dw_direct_f32", conv_1d_dw_direct_f32_len, conv_1d_dw_direct_f32_data, "main", 4, sizeof(vk_op_conv_1d_dw_direct_push_constants), {256, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_opt_step_adamw_f32, "opt_step_adamw_f32", opt_step_adamw_f32_len, opt_step_adamw_f32_data, "main", 5, sizeof(vk_op_push_constants), {512, 1, 1}, {}, 1);
 
     ggml_vk_create_pipeline(device, device->pipeline_opt_step_sgd_f32, "opt_step_sgd_f32", opt_step_sgd_f32_len, opt_step_sgd_f32_data, "main", 3, sizeof(vk_op_push_constants), {512, 1, 1}, {}, 1);
@@ -11386,6 +11387,9 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
             }
         }
         return nullptr;
+    case GGML_OP_CONV_1D_DW_DIRECT:
+        return src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32
+            ? ctx->device->pipeline_conv_1d_dw_direct_f32 : nullptr;
     case GGML_OP_SSM_CONV_BACK_SX:
         if (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
             return ctx->device->pipeline_ssm_conv_back_sx_f32;
@@ -11843,6 +11847,18 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
             }
         } else {
             GGML_ABORT("invalid push constant type for CONV_3D");
+        }
+        break;
+    case GGML_OP_CONV_1D_DW_DIRECT:
+        {
+            const uint32_t ne = ggml_nelements(dst);
+            if (ne > 262144) {
+                elements = { 512, 512, CEIL_DIV(ne, 262144) };
+            } else if (ne > 512) {
+                elements = { 512, CEIL_DIV(ne, 512), 1 };
+            } else {
+                elements = { ne, 1, 1 };
+            }
         }
         break;
     case GGML_OP_ADD:
@@ -13090,6 +13106,25 @@ static void ggml_vk_ssm_conv_back_c(ggml_backend_vk_context * ctx, vk_context& s
     });
 }
 
+
+static void ggml_vk_conv_1d_dw_direct(ggml_backend_vk_context * ctx, vk_context & subctx, ggml_tensor * dst) {
+    const ggml_tensor * x = dst->src[0];
+    const ggml_tensor * w = dst->src[1];
+    const ggml_tensor * bias = dst->src[2];
+    const uint32_t layout = (uint32_t)ggml_get_op_params_i32(dst, 2);
+    const uint32_t L = (uint32_t)(layout == 0 ? x->ne[0] : x->ne[1]);
+    const uint32_t C = (uint32_t)(layout == 0 ? x->ne[1] : x->ne[0]);
+    ggml_vk_op_f32<vk_op_conv_1d_dw_direct_push_constants>(
+        ctx, subctx, x, w, bias ? bias : x, nullptr, dst, dst->op, {
+            (uint32_t)ggml_nelements(dst), L, C, (uint32_t)x->ne[2],
+            (uint32_t)ggml_get_op_params_i32(dst, 0),
+            (uint32_t)ggml_get_op_params_i32(dst, 1),
+            layout,
+            (uint32_t)ggml_get_op_params_i32(dst, 3),
+            (uint32_t)ggml_get_op_params_i32(dst, 4),
+            bias != nullptr ? 1u : 0u,
+        });
+}
 static void ggml_vk_op_f32_opt_step_adamw(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst, const vk_op_push_constants&& pc) {
     const ggml_tensor * x = dst->src[0];
     const ggml_tensor * g = dst->src[1];
@@ -15819,6 +15854,11 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
 
     case GGML_OP_SSM_CONV:
         ggml_vk_ssm_conv(ctx, compute_ctx, cgraph, node_idx);
+
+        break;
+
+    case GGML_OP_CONV_1D_DW_DIRECT:
+        ggml_vk_conv_1d_dw_direct(ctx, compute_ctx, node);
 
         break;
 
@@ -19024,6 +19064,21 @@ static ggml_backend_t ggml_backend_vk_device_init(ggml_backend_dev_t dev, const 
     return ggml_backend_vk_init(ctx->device);
 }
 
+// Shaders without misalignment offsets address their buffers from the bound
+// offset, so a view that starts inside a storage-buffer alignment unit cannot be bound.
+static bool ggml_vk_view_offset_aligned(const vk_device & device, const ggml_tensor * t) {
+    return (t->view_offs & (device->properties.limits.minStorageBufferOffsetAlignment - 1)) == 0;
+}
+
+static bool ggml_vk_op_views_aligned(const vk_device & device, const ggml_tensor * op) {
+    for (int i = 0; i < GGML_MAX_SRC; ++i) {
+        if (op->src[i] && !ggml_vk_view_offset_aligned(device, op->src[i])) {
+            return false;
+        }
+    }
+    return ggml_vk_view_offset_aligned(device, op);
+}
+
 static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
     ggml_backend_vk_device_context * ctx = (ggml_backend_vk_device_context *)dev->context;
     const vk_device& device = ggml_vk_get_device(ctx->device);
@@ -19877,6 +19932,17 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
             }
         case GGML_OP_SSM_CONV:
             return op->src[0]->type == GGML_TYPE_F32;
+        case GGML_OP_CONV_1D_DW_DIRECT:
+            return ggml_vk_op_views_aligned(device, op) && op->src[0]->ne[3] == 1 &&
+                   op->src[0]->type == GGML_TYPE_F32 &&
+                   op->src[1]->type == GGML_TYPE_F32 &&
+                   (!op->src[2] || op->src[2]->type == GGML_TYPE_F32) &&
+                   op->type == GGML_TYPE_F32 &&
+                   ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]) &&
+                   (!op->src[2] || ggml_is_contiguous(op->src[2])) && ggml_is_contiguous(op) &&
+                   (ggml_get_op_params_i32(op, 0) == 3 ||
+                    ggml_get_op_params_i32(op, 0) == 5 ||
+                    ggml_get_op_params_i32(op, 0) == 7);
         case GGML_OP_SSM_CONV_BACK_SX:
         case GGML_OP_SSM_CONV_BACK_C:
             return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32;

@@ -17838,6 +17838,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         test_cases.emplace_back(new test_l2_norm_batch(GGML_TYPE_F32, { n, 16, 16, 1 }, 4, 1e-12f, true));
     }
 
+    // speech ops at their model shapes (ConvNeXt blocks at C = 512, the vocoder
+    // activations, the recurrent cells and the transducer step)
+    test_cases.emplace_back(new test_conv_1d_dw_direct(139, 512, 7, 3, true));
+    test_cases.emplace_back(new test_conv_1d_dw_direct(2808, 512, 7, 1, true, true));
 
     return test_cases;
 }
