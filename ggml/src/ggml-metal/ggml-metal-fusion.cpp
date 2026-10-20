@@ -1144,18 +1144,26 @@ static bool ggml_metal_fusion_check_mul_mv_glu_stacked(
     return ggml_can_fuse_subgraph_ext(gf, raw_idxs, raw_count, ops_all.data(), outputs, 1);
 }
 
-// true if the MUL_MAT + MUL_MAT + GLU fusion takes the mat-vecs at raw graph indices i0 and i1 together with the GLU
-// right after them
+// true if the MUL_MAT + MUL_MAT + GLU fusion takes the mat-vecs at raw graph indices i0 and i1 together with the GLU that
+// reads them. the GLU need not follow the pair yet: packing the pair with the norm would let the graph optimizer place
+// other nodes between the pair and the GLU, which that fusion needs adjacent
 static bool ggml_metal_fusion_glu_takes_pair(
         const ggml_cgraph * gf, int i0, int i1, ggml_metal_fusion_mode mode) {
     static const ggml_metal_fusion glu_fusion(GGML_METAL_FUSION_MUL_MV_GLU, { GGML_OP_MUL_MAT, GGML_OP_MUL_MAT, GGML_OP_GLU }, {},
             true, ggml_metal_fusion_check_mul_mv_glu);
 
-    int ig = i1 + 1;
-    while (ig < gf->n_nodes && ggml_op_is_empty(gf->nodes[ig]->op)) {
-        ig++;
+    const ggml_tensor * a = gf->nodes[i0];
+    const ggml_tensor * b = gf->nodes[i1];
+
+    int ig = -1;
+    for (int i = i1 + 1; i < gf->n_nodes && i <= i1 + 32; ++i) {
+        const ggml_tensor * glu = gf->nodes[i];
+        if (glu->op == GGML_OP_GLU && ((glu->src[0] == a && glu->src[1] == b) || (glu->src[0] == b && glu->src[1] == a))) {
+            ig = i;
+            break;
+        }
     }
-    if (ig >= gf->n_nodes || gf->nodes[ig]->op != GGML_OP_GLU) {
+    if (ig < 0) {
         return false;
     }
 
