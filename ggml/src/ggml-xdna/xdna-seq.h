@@ -13,7 +13,7 @@
 // artifacts this design built; no mlir-aie or IRON source was copied or
 // translated into them, and the one sentence quoted from mlir-aie
 // (xdna-seq.cpp, on the DDR aperture) is attributed where it appears. MIT,
-// like the rest of the backend - see ../THIRD_PARTY_NOTICES.md for what is not.
+// like the rest of the backend - see THIRD_PARTY_NOTICES for what is not.
 
 #include <cstdint>
 #include <vector>
