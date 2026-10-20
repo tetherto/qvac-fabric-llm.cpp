@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Tether Operations, S.A. de C.V.
+// SPDX-License-Identifier: MIT
+
 #pragma once
 
 #include "ggml.h"
