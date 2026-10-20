@@ -4149,6 +4149,7 @@ static void ggml_webgpu_init_memset_pipeline(webgpu_global_context & ctx) {
 
 static void ggml_backend_webgpu_request_adapter(wgpu::Instance & instance, wgpu::Adapter & adapter) {
     wgpu::RequestAdapterOptions options = {};
+    options.powerPreference = wgpu::PowerPreference::HighPerformance;
 
 #if !defined(__EMSCRIPTEN__) && !defined(__wasi__)
     // TODO: track need for these toggles: https://issues.chromium.org/issues/42251215
@@ -4900,7 +4901,6 @@ ggml_backend_reg_t ggml_backend_webgpu_reg() {
     };
 
     ctx->name         = GGML_WEBGPU_NAME;
-    ctx->device_count = 0;
 
     // Keep one Dawn/WebGPU instance alive for the lifetime of the static backend
     // registry. Recreating it on repeated registry lookups can invalidate
@@ -4908,6 +4908,8 @@ ggml_backend_reg_t ggml_backend_webgpu_reg() {
     if (ctx->webgpu_global_ctx != nullptr && ctx->webgpu_global_ctx->instance != nullptr) {
         return &reg;
     }
+
+    ctx->device_count = 0;
 
     wgpu::InstanceDescriptor               instance_descriptor{};
     std::vector<wgpu::InstanceFeatureName> instance_features = { wgpu::InstanceFeatureName::TimedWaitAny };
@@ -4933,11 +4935,18 @@ ggml_backend_reg_t ggml_backend_webgpu_reg() {
     }
 
     // WebGPU backend requires f16 support and, on native, implicit device synchronization.
-    if (adapter != nullptr && adapter.HasFeature(wgpu::FeatureName::ShaderF16)
-#if !defined(__EMSCRIPTEN__) && !defined(__wasi__)
-        && adapter.HasFeature(wgpu::FeatureName::ImplicitDeviceSynchronization)
+    if (adapter == nullptr) {
+        GGML_LOG_WARN("ggml_webgpu: no adapter available, backend disabled\n");
+    } else if (!adapter.HasFeature(wgpu::FeatureName::ShaderF16)) {
+        GGML_LOG_WARN("ggml_webgpu: adapter lacks shader-f16, backend disabled\n");
+#ifdef __EMSCRIPTEN__
+        GGML_LOG_WARN("ggml_webgpu: on affected Chromium NVIDIA/Vulkan configurations, try --enable-dawn-features=vulkan_enable_f16_on_nvidia\n");
 #endif
-    ) {
+#if !defined(__EMSCRIPTEN__) && !defined(__wasi__)
+    } else if (!adapter.HasFeature(wgpu::FeatureName::ImplicitDeviceSynchronization)) {
+        GGML_LOG_WARN("ggml_webgpu: adapter lacks implicit device synchronization, backend disabled\n");
+#endif
+    } else {
         ctx->device_count = 1;
     }
 

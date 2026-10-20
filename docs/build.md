@@ -850,11 +850,55 @@ cmake -B build -DGGML_WEBGPU=ON
 cmake --build build --config Release
 ```
 
+Native builds must use a Dawn package compatible with the target platform and C++ runtime. For clang/libc++ builds, build Dawn with the same toolchain instead of combining it with a GCC/libstdc++ prebuilt package. Set `Dawn_DIR` or `CMAKE_PREFIX_PATH` to locate that package.
+
+WebGPU does not require disabling CUDA, Vulkan, or Metal. Disable other GPU backends when isolating WebGPU measurements, or select the WebGPU device explicitly with `--device WebGPU`. Dynamic backend builds must package the WebGPU module alongside their other backend modules.
+
 ### Browser Support
 
-WebGPU allows cross-platform access to the GPU from supported browsers. We utilize [Emscripten](https://emscripten.org/) to compile ggml's WebGPU backend to WebAssembly. Emscripten does not officially support WebGPU bindings yet, but Dawn currently maintains its own WebGPU bindings called emdawnwebgpu.
+Browser builds compile the engine to WebAssembly with [Emscripten](https://emscripten.org/) and use emdawnwebgpu to access the browser's WebGPU API. A native Bare addon cannot be loaded by a browser; the WASM build is a separate artifact.
 
 Follow the instructions [here](https://dawn.googlesource.com/dawn/+/refs/heads/main/src/emdawnwebgpu/) to download or build the emdawnwebgpu package (Note that it might be safer to build the emdawnwebgpu package locally, so that it stays in sync with the version of Dawn you have installed above). When building using CMake, the path to the emdawnwebgpu port file needs to be set with the flag `EMDAWNWEBGPU_DIR`.
+
+The backend requires the adapter to expose `shader-f16`. If it is missing, WebGPU registers no device and logs the reason. On affected Chromium NVIDIA/Vulkan configurations, launching Chromium with `--enable-dawn-features=vulkan_enable_f16_on_nvidia` can expose this feature. Check the actual adapter features and GPU offload logs before interpreting benchmark results.
+
+To build the browser benchmark, activate Emscripten and run from the repository root:
+
+```sh
+emcmake cmake -S . -B build-webgpu-wasm -G Ninja \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DGGML_WEBGPU=ON \
+    -DGGML_OPENMP=OFF \
+    -DLLAMA_OPENSSL=OFF \
+    -DLLAMA_BUILD_HTML=OFF \
+    -DLLAMA_BUILD_APP=OFF \
+    -DEMDAWNWEBGPU_DIR=/absolute/path/to/emdawnwebgpu_pkg
+cmake --build build-webgpu-wasm --target llama-bench
+python3 -m http.server 8000 --bind 127.0.0.1
+```
+
+Open `http://localhost:8000/tests/test-webgpu-browser.html`, select a GGUF model, and run the benchmark. The page stages the model in WASM memory and explicitly selects WebGPU. It uses one CPU thread because this build does not enable Emscripten pthreads. The benchmark target reserves an 8 MiB stack for model graph construction. Reload the page for each run because the benchmark exits its runtime. Require positive GPU layer-offload counts, benchmark results, and `EXIT: 0`; a feature probe alone does not establish that inference used the GPU. The page holds the model in browser memory, so allow enough memory for the model, staging copies, and inference buffers.
+
+### Native registration test
+
+With `GGML_WEBGPU=ON` and `LLAMA_BUILD_TESTS=ON`, build and run the registry regression test:
+
+```sh
+cmake --build build --target test-webgpu-registry
+TEST_WEBGPU_REQUIRE_DEVICE=1 ctest --test-dir build -R '^test-webgpu-registry$' --output-on-failure
+```
+
+Run this in separate native builds with `GGML_BACKEND_DL=ON` and `GGML_BACKEND_DL=OFF`. The test checks automatic discovery and repeated registration. Without `TEST_WEBGPU_REQUIRE_DEVICE=1`, an unavailable device or Dawn's Null test backend skips the test with exit code 77. With `TEST_WEBGPU_REQUIRE_DEVICE=1`, either condition fails the test. For a deliberately disabled adapter fixture, set `TEST_WEBGPU_EXPECT_DISABLED=1` instead; this requires zero devices and an explanatory warning. These environment variables control test expectations, not adapter capabilities.
+
+For inference validation, use the same model and workload on native and browser builds:
+
+```sh
+cmake --build build --target llama-bench test-backend-ops
+build/bin/test-backend-ops test -b WebGPU
+build/bin/llama-bench -v -m /absolute/path/to/model.gguf --load-mode none --device WebGPU -ngl 999 -fa on -t 1 -p 128 -n 16 -r 3
+```
+
+Check that the operator test actually exercises WebGPU and that the benchmark offloads layers to it. On hybrid GPU systems, also record the adapter identity without external ICD pinning to verify the high-performance preference. Compare throughput only with matching model, quantization, flash-attention settings, and prompt and generation lengths.
 
 ## IBM Z & LinuxONE
 
