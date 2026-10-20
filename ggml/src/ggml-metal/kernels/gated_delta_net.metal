@@ -127,6 +127,222 @@ template [[host_name("kernel_gated_delta_net_f32_1")]] kernel kernel_gated_delta
 template [[host_name("kernel_gated_delta_net_f32_2")]] kernel kernel_gated_delta_net_t kernel_gated_delta_net_impl<float2, 2>;
 template [[host_name("kernel_gated_delta_net_f32_4")]] kernel kernel_gated_delta_net_t kernel_gated_delta_net_impl<float4, 4>;
 
+constant short FC_gdn_deferred_S_v [[function_constant(FC_GATED_DELTA_NET_DEFERRED + 0)]];
+constant short FC_gdn_deferred_G   [[function_constant(FC_GATED_DELTA_NET_DEFERRED + 1)]];
+constant short FC_gdn_deferred_K   [[function_constant(FC_GATED_DELTA_NET_DEFERRED + 2)]];
+constant short FC_gdn_deferred_RPS [[function_constant(FC_GATED_DELTA_NET_DEFERRED + 3)]];
+
+#define GDN_DEFERRED_RPS_MAX 8
+
+// one recurrence step on a state row, the same arithmetic as kernel_gated_delta_net_impl
+template<typename T>
+static inline void gdn_deferred_step_1(thread T & ls, T kt, float v, float g_exp, float beta) {
+    const float s_k = simd_sum(gdn_dot(ls, kt));
+    const float d = (v - g_exp * s_k) * beta;
+    ls = ls * g_exp + kt * d;
+}
+
+template<typename T>
+static inline void gdn_deferred_step_g(thread T & ls, T kt, float v, T ge, float beta) {
+    const float s_k = simd_sum(gdn_dot(ls * ge, kt));
+    const float d = (v - s_k) * beta;
+    ls = ls * ge + kt * d;
+}
+
+// gated delta net with a deferred state commit, see ggml_gated_delta_net_deferred.
+// each simdgroup owns RPS consecutive state rows, so one load of the k and q vectors serves RPS rows:
+// replay the pending recorded rows into the base, then run the block, writing the new base when the
+// block reaches it and recording the last R rows.
+// the base may be written in place (fused into the cache cpy): each simdgroup reads its rows before
+// writing them and no other simdgroup touches those rows.
+template<typename T, short NSG>
+kernel void kernel_gated_delta_net_deferred_impl(
+        constant ggml_metal_kargs_gated_delta_net_deferred & args,
+        device const char * q,
+        device const char * k,
+        device const char * v,
+        device const char * g,
+        device const char * b,
+        device const char * s,
+        device       char * rec,
+        device const char * rec_idx,
+        device       char * dst,
+        device       char * dst_fuse,
+        device const char * dt,
+        device const char * a,
+        uint3 tgpig[[threadgroup_position_in_grid]],
+        uint3 tpitg[[thread_position_in_threadgroup]],
+        uint3   ntg[[threads_per_threadgroup]])  {
+#define S_v FC_gdn_deferred_S_v
+#define G   FC_gdn_deferred_G
+#define K   FC_gdn_deferred_K
+#define RPS FC_gdn_deferred_RPS
+
+    static_assert(sizeof(T) == NSG * sizeof(float), "");
+
+    const uint tx = tpitg.x;
+    const uint ty = tpitg.y;
+
+    const uint i23  = tgpig.z; // seq
+    const uint i21  = tgpig.y; // v head
+    const uint row0 = (tgpig.x * ntg.y + ty) * RPS; // first state row of this simdgroup
+
+    if (row0 >= (uint) S_v) {
+        return;
+    }
+
+    const uint i01 = i21 % args.ne01;
+    const uint i11 = i21 % args.ne11;
+    const uint H   = args.ne21;
+
+    const float scale = 1.0f / sqrt((float) S_v);
+
+    device const char * s_rows = s + i23*args.nb53 + i21*args.nb52 + row0*args.nb51;
+
+    T ls[GDN_DEFERRED_RPS_MAX];
+    for (short r = 0; r < RPS; ++r) {
+        ls[r] = ((device const T *) (s_rows + r*args.nb51))[tx];
+    }
+
+    device const int * idx = (device const int *) rec_idx + 3*i23;
+    const int pending = clamp(idx[0], 0, (int) K);
+
+    device const float * rec_in  = (device const float *) (rec + (uint64_t) idx[1]*args.nb61);
+    device       float * rec_out = (device       float *) (rec + (uint64_t) idx[2]*args.nb61);
+
+    float vv[GDN_DEFERRED_RPS_MAX];
+
+    for (int p = 0; p < pending; ++p) {
+        const T kt = ((device const T *) (rec_in + (p*args.ne11 + i11)*S_v))[tx];
+        const float bb = rec_in[args.rec_b + p*H + i21];
+        device const float * vp = rec_in + args.rec_v + (p*H + i21)*S_v + row0;
+        for (short r = 0; r < RPS; ++r) {
+            vv[r] = vp[r];
+        }
+        device const float * gp = rec_in + args.rec_g + (p*H + i21)*G;
+        if (G == 1) {
+            const float g_exp = exp(gp[0]);
+            for (short r = 0; r < RPS; ++r) {
+                gdn_deferred_step_1(ls[r], kt, vv[r], g_exp, bb);
+            }
+        } else {
+            const T ge = exp(((device const T *) gp)[tx]);
+            for (short r = 0; r < RPS; ++r) {
+                gdn_deferred_step_g(ls[r], kt, vv[r], ge, bb);
+            }
+        }
+    }
+
+    const int ntok   = args.ne22;
+    const int R      = min(ntok, (int) K);
+    const int t_base = ntok - R;
+
+    const uint attn_size  = args.ne22 * H * S_v * args.ne23;
+    const uint state_offs = (i23*H + i21)*S_v*S_v + row0*S_v;
+
+    device float * base_out = (args.fused ? (device float *) dst_fuse : (device float *) dst + attn_size) + state_offs;
+
+    device float * dst_attn = (device float *) dst + (i23*args.ne22*H + i21)*S_v + row0;
+
+    device const float * q_ptr = (device const float *) (q + i23*args.nb03 + i01*args.nb01);
+    device const float * k_ptr = (device const float *) (k + i23*args.nb13 + i11*args.nb11);
+    device const float * v_ptr = (device const float *) (v + i23*args.nb23 + i21*args.nb21) + row0;
+
+    device const float * b_ptr = (device const float *) (b + i23*args.nb43 + i21*args.nb41);
+    device const float * g_ptr = (device const float *) (g + i23*args.nb33 + i21*args.nb31);
+
+    const float dt_h = args.gates ? ((device const float *) dt)[i21] : 0.0f;
+    const float a_h  = args.gates ? ((device const float *) a)[i21]  : 0.0f;
+
+    for (int t = 0; t < ntok; t++) {
+        if (t == t_base) {
+            for (short r = 0; r < RPS; ++r) {
+                ((device T *) (base_out + r*S_v))[tx] = ls[r];
+            }
+        }
+
+        const T kt = ((device const T *) k_ptr)[tx];
+        const T qt = ((device const T *) q_ptr)[tx];
+        for (short r = 0; r < RPS; ++r) {
+            vv[r] = v_ptr[r];
+        }
+
+        // the scalar gate (G == 1) and beta, activated here for raw gates
+        float gv = G == 1 ? g_ptr[0] : 0.0f;
+        float bv = b_ptr[0];
+        if (args.gates) {
+            const float x = gv + dt_h;
+            gv = ((x > 20.0f) ? x : log(1.0f + exp(x))) * a_h;
+            bv = 1.0f/(1.0f + exp(-bv));
+        }
+
+        if (t >= t_base) {
+            const int rr = t - t_base;
+            if (i21 < (uint) args.ne11 && row0 == 0) {
+                ((device T *) (rec_out + (rr*args.ne11 + i21)*S_v))[tx] = kt;
+            }
+            if (tx == 0) {
+                for (short r = 0; r < RPS; ++r) {
+                    rec_out[args.rec_v + (rr*H + i21)*S_v + row0 + r] = vv[r];
+                }
+            }
+            if (row0 == 0) {
+                if (G == 1) {
+                    if (tx == 0) {
+                        rec_out[args.rec_g + rr*H + i21] = gv;
+                    }
+                } else {
+                    ((device T *) (rec_out + args.rec_g + (rr*H + i21)*G))[tx] = ((device const T *) g_ptr)[tx];
+                }
+                if (tx == 0) {
+                    rec_out[args.rec_b + rr*H + i21] = bv;
+                }
+            }
+        }
+
+        if (G == 1) {
+            const float g_exp = exp(gv);
+            for (short r = 0; r < RPS; ++r) {
+                gdn_deferred_step_1(ls[r], kt, vv[r], g_exp, bv);
+            }
+        } else {
+            const T ge = exp(((device const T *) g_ptr)[tx]);
+            for (short r = 0; r < RPS; ++r) {
+                gdn_deferred_step_g(ls[r], kt, vv[r], ge, bv);
+            }
+        }
+
+        float y[GDN_DEFERRED_RPS_MAX];
+        for (short r = 0; r < RPS; ++r) {
+            y[r] = simd_sum(gdn_dot(ls[r], qt));
+        }
+
+        if (tx == 0) {
+            for (short r = 0; r < RPS; ++r) {
+                dst_attn[t*H*S_v + r] = y[r]*scale;
+            }
+        }
+
+        q_ptr = (device const float *) ((device const char *) q_ptr + args.nb02);
+        k_ptr = (device const float *) ((device const char *) k_ptr + args.nb12);
+        v_ptr = (device const float *) ((device const char *) v_ptr + args.nb22);
+
+        b_ptr = (device const float *) ((device const char *) b_ptr + args.nb42);
+        g_ptr = (device const float *) ((device const char *) g_ptr + args.nb32);
+    }
+
+#undef S_v
+#undef G
+#undef K
+#undef RPS
+}
+
+typedef decltype(kernel_gated_delta_net_deferred_impl<float4, 4>) kernel_gated_delta_net_deferred_t;
+
+template [[host_name("kernel_gated_delta_net_deferred_f32_1")]] kernel kernel_gated_delta_net_deferred_t kernel_gated_delta_net_deferred_impl<float,  1>;
+template [[host_name("kernel_gated_delta_net_deferred_f32_2")]] kernel kernel_gated_delta_net_deferred_t kernel_gated_delta_net_deferred_impl<float2, 2>;
+template [[host_name("kernel_gated_delta_net_deferred_f32_4")]] kernel kernel_gated_delta_net_deferred_t kernel_gated_delta_net_deferred_impl<float4, 4>;
+
 // Derived from MLX gated_delta_update.h (MIT License, Apple Inc.).
 /*
 MIT License

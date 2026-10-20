@@ -1217,9 +1217,12 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "SNAKE",
     "LSTM_CELL",
     "TDT_STEP",
+
+    "GATED_DELTA_NET_DEFERRED",
+    "GDN_CONV_DEFERRED",
 };
 
-static_assert(GGML_OP_COUNT == 125, "GGML_OP_COUNT != 125");
+static_assert(GGML_OP_COUNT == 127, "GGML_OP_COUNT != 127");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1358,9 +1361,12 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "snake(x,a,inv_b)",
     "lstm_cell(gates,c)",
     "tdt_step(tok,dur,state,dst)",
+
+    "gated_delta_net_deferred(q,k,v,g,beta,s,rec,idx)",
+    "gdn_conv_deferred(x,w,hist,idx)",
 };
 
-static_assert(GGML_OP_COUNT == 125, "GGML_OP_COUNT != 125");
+static_assert(GGML_OP_COUNT == 127, "GGML_OP_COUNT != 127");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -7406,6 +7412,136 @@ struct ggml_tensor * ggml_gated_delta_net(
     result->src[3] = g;
     result->src[4] = beta;
     result->src[5] = state;
+
+    return result;
+}
+
+// ggml_gated_delta_net_deferred
+
+int64_t ggml_gated_delta_net_rec_size(int64_t S_k, int64_t H_k, int64_t S_v, int64_t H_v, int64_t G, int64_t K) {
+    // rows are padded to 16 bytes so that vector loads of the recorded k rows stay aligned
+    return GGML_PAD(K * (S_k * H_k + S_v * H_v + G * H_v + H_v), 4);
+}
+
+struct ggml_tensor * ggml_gated_delta_net_deferred(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * v,
+        struct ggml_tensor  * g,
+        struct ggml_tensor  * beta,
+        struct ggml_tensor  * state,
+        struct ggml_tensor  * rec,
+        struct ggml_tensor  * rec_idx,
+        struct ggml_tensor  * dt,
+        struct ggml_tensor  * a,
+        int64_t               K) {
+    GGML_ASSERT(ggml_is_contiguous_rows(q));
+    GGML_ASSERT(ggml_is_contiguous_rows(k));
+    GGML_ASSERT(ggml_is_contiguous_rows(v));
+    GGML_ASSERT(ggml_is_contiguous_rows(g));
+    GGML_ASSERT(ggml_is_contiguous_rows(beta));
+    GGML_ASSERT(ggml_is_contiguous_rows(state));
+    GGML_ASSERT(ggml_is_contiguous_rows(rec));
+
+    GGML_ASSERT(q->type == GGML_TYPE_F32 && k->type == GGML_TYPE_F32 && v->type == GGML_TYPE_F32);
+    GGML_ASSERT(g->type == GGML_TYPE_F32 && beta->type == GGML_TYPE_F32);
+    GGML_ASSERT(state->type == GGML_TYPE_F32 && rec->type == GGML_TYPE_F32);
+    GGML_ASSERT(rec_idx->type == GGML_TYPE_I32);
+
+    const int64_t S_k      = k->ne[0];
+    const int64_t H_k      = k->ne[1];
+    const int64_t S_v      = v->ne[0];
+    const int64_t H        = v->ne[1];
+    const int64_t n_tokens = v->ne[2];
+    const int64_t n_seqs   = v->ne[3];
+    const int64_t G        = g->ne[0];
+
+    GGML_ASSERT(S_k == S_v);
+    GGML_ASSERT(H % H_k == 0 && H % q->ne[1] == 0);
+    GGML_ASSERT(q->ne[2] == n_tokens && k->ne[2] == n_tokens);
+    GGML_ASSERT(q->ne[3] == n_seqs && k->ne[3] == n_seqs);
+    GGML_ASSERT(G == 1 || G == S_v);
+    GGML_ASSERT(beta->ne[0] == 1);
+    GGML_ASSERT(K >= 1);
+
+    GGML_ASSERT(state->ne[0] == S_v && state->ne[1] == S_v && state->ne[2] == H && state->ne[3] == n_seqs);
+    // the state rows of one sequence must be contiguous (the base is read and written in place)
+    GGML_ASSERT(state->nb[2] == (size_t) S_v * state->nb[1]);
+
+    const int64_t n_rec = ggml_gated_delta_net_rec_size(S_k, H_k, S_v, H, G, K);
+    GGML_ASSERT(rec->ne[0] == n_rec && rec->ne[2] == 1 && rec->ne[3] == 1);
+    GGML_ASSERT(ggml_is_contiguous(rec_idx) && rec_idx->ne[0] == 3 && ggml_nrows(rec_idx) == n_seqs);
+
+    const int64_t n_attn = S_v * H * n_tokens * n_seqs;
+    const int64_t n_base = S_v * S_v * H * n_seqs;
+
+    struct ggml_tensor * result = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_attn + n_base);
+
+    // raw gates: activated inside the op
+    GGML_ASSERT((dt == NULL) == (a == NULL));
+    if (dt) {
+        GGML_ASSERT(G == 1);
+        GGML_ASSERT(dt->type == GGML_TYPE_F32 && a->type == GGML_TYPE_F32);
+        GGML_ASSERT(ggml_is_contiguous(dt) && ggml_is_contiguous(a));
+        GGML_ASSERT(ggml_nelements(dt) == H && ggml_nelements(a) == H);
+    }
+
+    ggml_set_op_params_i32(result, 0, (int32_t) K);
+    ggml_set_op_params_i32(result, 1, dt ? 1 : 0);
+
+    result->op     = GGML_OP_GATED_DELTA_NET_DEFERRED;
+    result->src[0] = q;
+    result->src[1] = k;
+    result->src[2] = v;
+    result->src[3] = g;
+    result->src[4] = beta;
+    result->src[5] = state;
+    result->src[6] = rec;
+    result->src[7] = rec_idx;
+    result->src[8] = dt;
+    result->src[9] = a;
+
+    return result;
+}
+
+// ggml_gdn_conv_deferred
+
+struct ggml_tensor * ggml_gdn_conv_deferred(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * w,
+        struct ggml_tensor  * hist,
+        struct ggml_tensor  * rec_idx,
+        int64_t               K,
+        int64_t               n_norm,
+        int64_t               head_dim,
+        float                 eps) {
+    GGML_ASSERT(x->type == GGML_TYPE_F32 && w->type == GGML_TYPE_F32 && hist->type == GGML_TYPE_F32);
+    GGML_ASSERT(rec_idx->type == GGML_TYPE_I32);
+    GGML_ASSERT(x->nb[0] == sizeof(float) && ggml_is_contiguous(w) && ggml_is_contiguous_rows(hist));
+
+    const int64_t C      = x->ne[0];
+    const int64_t n_seqs = x->ne[2];
+    const int64_t d_conv = w->ne[0];
+
+    GGML_ASSERT(x->ne[3] == 1 && w->ne[1] == C && d_conv >= 2);
+    GGML_ASSERT(K >= 1 && head_dim >= 1 && n_norm >= 0 && n_norm * head_dim <= C);
+    GGML_ASSERT(hist->ne[0] == (K + d_conv - 1) * C && hist->ne[2] == 1 && hist->ne[3] == 1);
+    GGML_ASSERT(ggml_is_contiguous(rec_idx) && rec_idx->ne[0] == 3 && ggml_nrows(rec_idx) == n_seqs);
+
+    struct ggml_tensor * result = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, C, x->ne[1], n_seqs);
+
+    ggml_set_op_params_i32(result, 0, (int32_t) K);
+    ggml_set_op_params_i32(result, 1, (int32_t) n_norm);
+    ggml_set_op_params_i32(result, 2, (int32_t) head_dim);
+    ggml_set_op_params_f32(result, 3, eps);
+
+    result->op     = GGML_OP_GDN_CONV_DEFERRED;
+    result->src[0] = x;
+    result->src[1] = w;
+    result->src[2] = hist;
+    result->src[3] = rec_idx;
 
     return result;
 }
