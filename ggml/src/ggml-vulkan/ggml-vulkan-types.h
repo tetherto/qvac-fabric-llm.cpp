@@ -1027,6 +1027,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_swiglu_clamp[2];
     vk_pipeline pipeline_geglu_erf[2];
     vk_pipeline pipeline_geglu_quick[2];
+    vk_pipeline pipeline_siglu[2];
 
     vk_pipeline pipeline_leaky_relu[2];
     vk_pipeline pipeline_silu_back_f32;
@@ -1113,6 +1114,20 @@ struct vk_device_struct {
     vk_pipeline pipeline_ssm_conv_f32;
     vk_pipeline pipeline_ssm_conv_silu_f32;
     vk_pipeline pipeline_ssm_conv_bias_silu_f32;
+    vk_pipeline pipeline_gru_f32;
+    vk_pipeline pipeline_gru_small_f32[3];  // H == 2, 4, 8 register-resident variants
+    vk_pipeline pipeline_zero_upsample_f32;
+    vk_pipeline pipeline_channel_shuffle_f32;
+    vk_pipeline pipeline_affine_prelu_f32;
+    vk_pipeline pipeline_conv_1d_dw_direct_f32;
+    vk_pipeline pipeline_conv_1d_dw_direct_norm_channel_f32;
+    vk_pipeline pipeline_norm_channel_f32;
+    vk_pipeline pipeline_scale_residual_f32;
+    vk_pipeline pipeline_bias_gelu_f32;
+    vk_pipeline pipeline_pad_replicate_1d_f32;
+    vk_pipeline pipeline_lstm_cell_f32;
+    vk_pipeline pipeline_lstm_cell_masked_f32;
+    vk_pipeline pipeline_tdt_step_i32;
     // CONCAT(state, x^T) + SSM_CONV + SILU without the transposed concat: the conv reads x and the state
     // directly, and the concat node only writes the tail columns its other readers (state copies) use
     vk_pipeline pipeline_ssm_conv_direct_silu_f32;

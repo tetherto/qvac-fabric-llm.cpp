@@ -819,6 +819,55 @@ struct vk_op_ssm_conv_push_constants {
     uint32_t nc, ncs, nr, n_t, n_s;
 };
 
+struct vk_op_gru_push_constants {
+    uint32_t H, B, L, reverse;
+};
+
+struct vk_op_zero_upsample_push_constants {
+    uint32_t ne, F, Fu, s;
+};
+
+struct vk_op_channel_shuffle_push_constants {
+    uint32_t ne, FT, C, G;
+};
+
+struct vk_op_affine_prelu_push_constants {
+    uint32_t ne, F, FT, C;
+};
+
+struct vk_op_conv_1d_dw_direct_push_constants {
+    uint32_t ne, L, C, B, K, dilation, layout, causal, seg_len, has_bias;
+};
+
+struct vk_op_conv_1d_dw_direct_norm_channel_push_constants {
+    uint32_t L, C, B, K, dilation, layout, causal, seg_len, has_bias;
+    float eps;
+};
+
+struct vk_op_norm_channel_push_constants {
+    uint32_t L, C, B, layout;
+    float eps;
+};
+
+struct vk_op_channel_pointwise_push_constants {
+    uint32_t ne, L, C, B, layout;
+};
+
+struct vk_op_pad_replicate_1d_push_constants {
+    uint32_t ne, L_in, L_out, C, layout, pad_left;
+};
+
+struct vk_op_lstm_cell_push_constants {
+    uint32_t H, N, prev_row, c_base, mask_stride;
+    uint32_t gates_offset, prev_offset, mask_offset, dst_offset;
+};
+
+struct vk_op_tdt_step_push_constants {
+    uint32_t n_dur;
+    int32_t  blank_id, max_symbols, rnnt;
+    uint32_t token_offset, dur_idx_offset, state_offset, dur_table_offset, dst_offset;
+};
+
 struct vk_op_ssm_conv_back_sx_push_constants {
     uint32_t grad_nb0, grad_nb1, grad_nb2;
     uint32_t c_nb1;

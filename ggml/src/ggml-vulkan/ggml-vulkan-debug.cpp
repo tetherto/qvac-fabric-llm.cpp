@@ -1409,6 +1409,62 @@ void ggml_vk_check_results_0(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph
                                          src_clone[3], src_clone[4], src_clone[5], src_clone[6], K);
         } else if (tensor->op == GGML_OP_SSM_CONV) {
             tensor_clone = ggml_ssm_conv(ggml_ctx, src_clone[0], src_clone[1]);
+        } else if (tensor->op == GGML_OP_CONV_1D_DW_DIRECT) {
+            const int dilation = ggml_get_op_params_i32(tensor, 1);
+            const int seg_len  = ggml_get_op_params_i32(tensor, 4);
+            if (seg_len > 0) {
+                tensor_clone = ggml_conv_1d_dw_direct_ct_segmented(ggml_ctx, src_clone[0], src_clone[1], src_clone[2], dilation, seg_len);
+            } else if (ggml_get_op_params_i32(tensor, 3) != 0) {
+                tensor_clone = ggml_conv_1d_dw_direct_causal_ct(ggml_ctx, src_clone[0], src_clone[1], src_clone[2], dilation);
+            } else if (ggml_get_op_params_i32(tensor, 2) != 0) {
+                tensor_clone = ggml_conv_1d_dw_direct_ct(ggml_ctx, src_clone[0], src_clone[1], src_clone[2], dilation);
+            } else {
+                tensor_clone = ggml_conv_1d_dw_direct(ggml_ctx, src_clone[0], src_clone[1], src_clone[2], dilation);
+            }
+        } else if (tensor->op == GGML_OP_NORM_CHANNEL) {
+            const float eps = ggml_get_op_params_f32(tensor, 0);
+            tensor_clone = ggml_get_op_params_i32(tensor, 1) != 0
+                             ? ggml_norm_channel_ct(ggml_ctx, src_clone[0], src_clone[1], src_clone[2], eps)
+                             : ggml_norm_channel(ggml_ctx, src_clone[0], src_clone[1], src_clone[2], eps);
+        } else if (tensor->op == GGML_OP_SCALE_RESIDUAL) {
+            switch (ggml_get_op_params_i32(tensor, 0)) {
+                case 1:  tensor_clone = ggml_scale_residual_ct(ggml_ctx, src_clone[0], src_clone[1], src_clone[2], src_clone[3]); break;
+                case 2:  tensor_clone = ggml_scale_residual_tc_to_ct(ggml_ctx, src_clone[0], src_clone[1], src_clone[2], src_clone[3]); break;
+                default: tensor_clone = ggml_scale_residual(ggml_ctx, src_clone[0], src_clone[1], src_clone[2], src_clone[3]); break;
+            }
+        } else if (tensor->op == GGML_OP_BIAS_GELU) {
+            switch (ggml_get_op_params_i32(tensor, 0)) {
+                case 1:  tensor_clone = ggml_bias_gelu_ct(ggml_ctx, src_clone[0], src_clone[1]); break;
+                case 2:  tensor_clone = ggml_bias_gelu_tc_to_ct(ggml_ctx, src_clone[0], src_clone[1]); break;
+                default: tensor_clone = ggml_bias_gelu(ggml_ctx, src_clone[0], src_clone[1]); break;
+            }
+        } else if (tensor->op == GGML_OP_PAD_REPLICATE_1D) {
+            const int pad_left  = ggml_get_op_params_i32(tensor, 0);
+            const int pad_right = ggml_get_op_params_i32(tensor, 1);
+            tensor_clone = ggml_get_op_params_i32(tensor, 2) != 0
+                             ? ggml_pad_replicate_1d_ct(ggml_ctx, src_clone[0], pad_left, pad_right)
+                             : ggml_pad_replicate_1d(ggml_ctx, src_clone[0], pad_left, pad_right);
+        } else if (tensor->op == GGML_OP_GRU) {
+            tensor_clone = ggml_gru(ggml_ctx, src_clone[0], src_clone[1], src_clone[2],
+                                    ggml_get_op_params_i32(tensor, 0) != 0);
+        } else if (tensor->op == GGML_OP_ZERO_UPSAMPLE) {
+            tensor_clone = ggml_zero_upsample(ggml_ctx, src_clone[0], ggml_get_op_params_i32(tensor, 0));
+        } else if (tensor->op == GGML_OP_CHANNEL_SHUFFLE) {
+            tensor_clone = ggml_channel_shuffle(ggml_ctx, src_clone[0], ggml_get_op_params_i32(tensor, 0));
+        } else if (tensor->op == GGML_OP_AFFINE_PRELU) {
+            tensor_clone = ggml_affine_prelu(ggml_ctx, src_clone[0], src_clone[1], src_clone[2], src_clone[3]);
+        } else if (tensor->op == GGML_OP_SNAKE) {
+            tensor_clone = ggml_snake(ggml_ctx, src_clone[0], src_clone[1], src_clone[2]);
+        } else if (tensor->op == GGML_OP_LSTM_CELL) {
+            tensor_clone = tensor->src[2]
+                             ? ggml_lstm_cell_masked(ggml_ctx, src_clone[0], src_clone[1], src_clone[2])
+                             : ggml_lstm_cell(ggml_ctx, src_clone[0], src_clone[1]);
+        } else if (tensor->op == GGML_OP_TDT_STEP) {
+            tensor_clone = ggml_tdt_step(ggml_ctx, src_clone[0], src_clone[1], src_clone[2], src_clone[3],
+                                         src_clone[4],
+                                         ggml_get_op_params_i32(tensor, 0),
+                                         ggml_get_op_params_i32(tensor, 1),
+                                         ggml_get_op_params_i32(tensor, 2));
         } else if (tensor->op == GGML_OP_SSM_CONV_BACK_SX) {
             tensor_clone = ggml_ssm_conv_back_sx(ggml_ctx, src_clone[0], src_clone[1], tensor);
         } else if (tensor->op == GGML_OP_SSM_CONV_BACK_C) {

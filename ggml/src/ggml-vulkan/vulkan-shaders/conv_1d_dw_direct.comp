@@ -1,0 +1,78 @@
+#version 450
+
+#include "types.glsl"
+
+#extension GL_EXT_control_flow_attributes : enable
+
+layout (push_constant) uniform parameter {
+    uint ne;
+    uint L;
+    uint C;
+    uint B;
+    uint K;
+    uint dilation;
+    uint layout_id;
+    uint causal;
+    uint seg_len;
+    uint has_bias;
+} p;
+
+layout (binding = 0) readonly buffer X { float data_x[]; };
+layout (binding = 1) readonly buffer W { float data_w[]; };
+layout (binding = 2) readonly buffer B { float data_b[]; };
+layout (binding = 3) writeonly buffer D { float data_d[]; };
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+void main() {
+    const uint idx =
+        gl_GlobalInvocationID.z * 262144u +
+        gl_GlobalInvocationID.y * 512u +
+        gl_GlobalInvocationID.x;
+    if (idx >= p.ne) {
+        return;
+    }
+    const uint batch_stride = p.L * p.C;
+    const uint batch = idx / batch_stride;
+    if (batch >= p.B) {
+        return;
+    }
+    const uint local_idx = idx - batch * batch_stride;
+    const uint t = p.layout_id == 0u ? local_idx % p.L : local_idx / p.C;
+    const uint c = p.layout_id == 0u ? local_idx / p.L : local_idx % p.C;
+    const int lo = p.seg_len != 0u ? int((t / p.seg_len) * p.seg_len) : 0;
+    const int hi = p.seg_len != 0u ? lo + int(p.seg_len) : int(p.L);
+    const int k_off = p.causal != 0u ? -(int(p.K) - 1) : -(int(p.K) / 2);
+
+    // Match the stock F32 MUL_MAT_VEC subgroup reduction exactly, but compute
+    // one output per invocation. Stock assigns two taps to each lane, then
+    // subgroupAdd uses a pairwise tree. K is restricted to 3, 5, or 7.
+    precise float pair0 = 0.0f;
+    precise float pair1 = 0.0f;
+    precise float pair2 = 0.0f;
+    precise float pair3 = 0.0f;
+    [[unroll]] for (uint k = 0u; k < 8u; ++k) {
+        if (k < p.K) {
+            int src_t = int(t) + (int(k) + k_off) * int(p.dilation);
+            src_t = clamp(src_t, lo, hi - 1);
+            const uint src_idx = batch * batch_stride + (
+                p.layout_id == 0u ? uint(src_t) + c * p.L : c + uint(src_t) * p.C);
+            const float xv = data_x[src_idx];
+            const float wv = data_w[c * p.K + k];
+            if (k < 2u) {
+                pair0 = fma(xv, wv, pair0);
+            } else if (k < 4u) {
+                pair1 = fma(xv, wv, pair1);
+            } else if (k < 6u) {
+                pair2 = fma(xv, wv, pair2);
+            } else {
+                pair3 = fma(xv, wv, pair3);
+            }
+        }
+    }
+    precise float left = pair0 + pair1;
+    precise float right = pair2 + pair3;
+    precise float sum = left + right;
+    precise float result = p.has_bias != 0u ? sum + data_b[c] : sum;
+    data_d[idx] = result;
+}

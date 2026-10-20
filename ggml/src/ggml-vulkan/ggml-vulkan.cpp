@@ -4560,6 +4560,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     CREATE_GLU(swiglu_clamp)
     CREATE_GLU(geglu_erf)
     CREATE_GLU(geglu_quick)
+    CREATE_GLU(siglu)
 #undef CREATE_GLU
 
     ggml_vk_create_pipeline(device, device->pipeline_silu_back_f32, "silu_back_f32", silu_back_f32_len, silu_back_f32_data, "main", 3, sizeof(vk_op_push_constants), {512, 1, 1}, {}, 1);
@@ -4913,6 +4914,23 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_tail_f32,        "ssm_conv_tail_f32",        ssm_conv_f32_len, ssm_conv_f32_data, "main", 4, sizeof(vk_op_ssm_conv_push_constants), {256, 1, 1}, {256, 1, 0, 0, 2, 1}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_back_sx_f32, "ssm_conv_back_sx_f32", ssm_conv_back_sx_f32_len, ssm_conv_back_sx_f32_data, "main", 3, sizeof(vk_op_ssm_conv_back_sx_push_constants), {32, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_back_c_f32, "ssm_conv_back_c_f32", ssm_conv_back_c_f32_len, ssm_conv_back_c_f32_data, "main", 3, sizeof(vk_op_ssm_conv_back_c_push_constants), {32, 1, 1}, {}, 1);
+
+    ggml_vk_create_pipeline(device, device->pipeline_gru_f32, "gru_f32", gru_f32_len, gru_f32_data, "main", 4, sizeof(vk_op_gru_push_constants), {1, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_gru_small_f32[0], "gru_small_h2_f32", gru_small_h2_f32_len, gru_small_h2_f32_data, "main", 4, sizeof(vk_op_gru_push_constants), {1, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_gru_small_f32[1], "gru_small_h4_f32", gru_small_h4_f32_len, gru_small_h4_f32_data, "main", 4, sizeof(vk_op_gru_push_constants), {1, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_gru_small_f32[2], "gru_small_h8_f32", gru_small_h8_f32_len, gru_small_h8_f32_data, "main", 4, sizeof(vk_op_gru_push_constants), {1, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_zero_upsample_f32, "zero_upsample_f32", zero_upsample_f32_len, zero_upsample_f32_data, "main", 2, sizeof(vk_op_zero_upsample_push_constants), {512, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_channel_shuffle_f32, "channel_shuffle_f32", channel_shuffle_f32_len, channel_shuffle_f32_data, "main", 2, sizeof(vk_op_channel_shuffle_push_constants), {512, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_affine_prelu_f32, "affine_prelu_f32", affine_prelu_f32_len, affine_prelu_f32_data, "main", 5, sizeof(vk_op_affine_prelu_push_constants), {512, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_conv_1d_dw_direct_f32, "conv_1d_dw_direct_f32", conv_1d_dw_direct_f32_len, conv_1d_dw_direct_f32_data, "main", 4, sizeof(vk_op_conv_1d_dw_direct_push_constants), {256, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_conv_1d_dw_direct_norm_channel_f32, "conv_1d_dw_direct_norm_channel_f32", conv_1d_dw_direct_norm_channel_f32_len, conv_1d_dw_direct_norm_channel_f32_data, "main", 6, sizeof(vk_op_conv_1d_dw_direct_norm_channel_push_constants), {512, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_norm_channel_f32, "norm_channel_f32", norm_channel_f32_len, norm_channel_f32_data, "main", 4, sizeof(vk_op_norm_channel_push_constants), {512, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_scale_residual_f32, "scale_residual_f32", scale_residual_f32_len, scale_residual_f32_data, "main", 5, sizeof(vk_op_channel_pointwise_push_constants), {256, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_bias_gelu_f32, "bias_gelu_f32", bias_gelu_f32_len, bias_gelu_f32_data, "main", 3, sizeof(vk_op_channel_pointwise_push_constants), {256, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_pad_replicate_1d_f32, "pad_replicate_1d_f32", pad_replicate_1d_f32_len, pad_replicate_1d_f32_data, "main", 2, sizeof(vk_op_pad_replicate_1d_push_constants), {512, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_lstm_cell_f32, "lstm_cell_f32", lstm_cell_f32_len, lstm_cell_f32_data, "main", 3, sizeof(vk_op_lstm_cell_push_constants), {512, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_lstm_cell_masked_f32, "lstm_cell_masked_f32", lstm_cell_masked_f32_len, lstm_cell_masked_f32_data, "main", 4, sizeof(vk_op_lstm_cell_push_constants), {512, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_tdt_step_i32, "tdt_step_i32", tdt_step_i32_len, tdt_step_i32_data, "main", 5, sizeof(vk_op_tdt_step_push_constants), {1, 1, 1}, {}, 1);
 
     ggml_vk_create_pipeline(device, device->pipeline_opt_step_adamw_f32, "opt_step_adamw_f32", opt_step_adamw_f32_len, opt_step_adamw_f32_data, "main", 5, sizeof(vk_op_push_constants), {512, 1, 1}, {}, 1);
 
@@ -11607,6 +11625,8 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
                 return ctx->device->pipeline_geglu_erf[dst->type == GGML_TYPE_F16];
             case GGML_GLU_OP_GEGLU_QUICK:
                 return ctx->device->pipeline_geglu_quick[dst->type == GGML_TYPE_F16];
+            case GGML_GLU_OP_SIGLU:
+                return ctx->device->pipeline_siglu[dst->type == GGML_TYPE_F16];
             default:
                 break;
         }
@@ -11911,6 +11931,65 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
             }
         }
         return nullptr;
+    case GGML_OP_GRU:
+        if (src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
+            // tiny hidden sizes: one-lane-per-batch register-resident variant
+            // (no barriers in the L loop); the packed kernel covers the rest.
+            switch (src0->ne[0]) {
+                case 2: return ctx->device->pipeline_gru_small_f32[0];
+                case 4: return ctx->device->pipeline_gru_small_f32[1];
+                case 8: return ctx->device->pipeline_gru_small_f32[2];
+                default: break;
+            }
+            return ctx->device->pipeline_gru_f32;
+        }
+        return nullptr;
+    case GGML_OP_ZERO_UPSAMPLE:
+        if (src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
+            return ctx->device->pipeline_zero_upsample_f32;
+        }
+        return nullptr;
+    case GGML_OP_CHANNEL_SHUFFLE:
+        if (src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
+            return ctx->device->pipeline_channel_shuffle_f32;
+        }
+        return nullptr;
+    case GGML_OP_AFFINE_PRELU:
+        if (src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
+            return ctx->device->pipeline_affine_prelu_f32;
+        }
+        return nullptr;
+    case GGML_OP_CONV_1D_DW_DIRECT:
+        return src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32
+            ? ctx->device->pipeline_conv_1d_dw_direct_f32 : nullptr;
+    case GGML_OP_NORM_CHANNEL:
+        return src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32
+            ? ctx->device->pipeline_norm_channel_f32 : nullptr;
+    case GGML_OP_SCALE_RESIDUAL:
+        return src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32
+            ? ctx->device->pipeline_scale_residual_f32 : nullptr;
+    case GGML_OP_BIAS_GELU:
+        return src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32
+            ? ctx->device->pipeline_bias_gelu_f32 : nullptr;
+    case GGML_OP_PAD_REPLICATE_1D:
+        return src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32
+            ? ctx->device->pipeline_pad_replicate_1d_f32 : nullptr;
+    case GGML_OP_SNAKE:
+        if (src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
+            return ctx->device->pipeline_snake_f32;
+        }
+        return nullptr;
+    case GGML_OP_LSTM_CELL:
+        if (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
+            return src2 != nullptr ? ctx->device->pipeline_lstm_cell_masked_f32
+                                   : ctx->device->pipeline_lstm_cell_f32;
+        }
+        return nullptr;
+    case GGML_OP_TDT_STEP:
+        if (src0->type == GGML_TYPE_I32 && src1->type == GGML_TYPE_I32 && dst->type == GGML_TYPE_I32) {
+            return ctx->device->pipeline_tdt_step_i32;
+        }
+        return nullptr;
     case GGML_OP_SSM_CONV_BACK_SX:
         if (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
             return ctx->device->pipeline_ssm_conv_back_sx_f32;
@@ -12084,6 +12163,46 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
     }
 
     GGML_UNUSED(src2);
+}
+
+// one workgroup per timestep on y and per batch on z: both axes must fit the device grid
+static bool ggml_vk_norm_channel_grid_fits(const vk_device & device, const ggml_tensor * x, int32_t layout) {
+    const int64_t L = layout == 0 ? x->ne[0] : x->ne[1];
+    return (uint64_t) L <= device->properties.limits.maxComputeWorkGroupCount[1] &&
+           (uint64_t) x->ne[2] <= device->properties.limits.maxComputeWorkGroupCount[2];
+}
+
+// the register-resident variants run one lane per batch element; the packed kernel
+// covers floor(128 / H) batch elements per 128-lane workgroup (supports_op keeps H <= 128)
+static uint32_t ggml_vk_gru_batch_per_workgroup(uint32_t H) {
+    return (H == 2 || H == 4 || H == 8) ? 128 : 128 / H;
+}
+
+static bool ggml_vk_gru_grid_fits(const vk_device & device, const ggml_tensor * op) {
+    const uint32_t H = (uint32_t) op->src[0]->ne[0];
+    const uint32_t B = (uint32_t) op->src[1]->ne[1];
+    return CEIL_DIV(B, ggml_vk_gru_batch_per_workgroup(H)) <= device->properties.limits.maxComputeWorkGroupCount[1];
+}
+
+static uint32_t get_misalign_elements(const ggml_backend_vk_context * ctx, const ggml_tensor * t) {
+    return t ? get_misalign_bytes(ctx, t) / ggml_type_size(t->type) : 0;
+}
+
+template <> void init_pushconst_tensor_offsets(ggml_backend_vk_context * ctx, vk_op_lstm_cell_push_constants &p, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * src2, const ggml_tensor * src3, ggml_tensor * dst) {
+    p.gates_offset = get_misalign_elements(ctx, src0);
+    p.prev_offset  = get_misalign_elements(ctx, src1);
+    p.mask_offset  = get_misalign_elements(ctx, src2);
+    p.dst_offset   = get_misalign_elements(ctx, dst);
+
+    GGML_UNUSED(src3);
+}
+
+template <> void init_pushconst_tensor_offsets(ggml_backend_vk_context * ctx, vk_op_tdt_step_push_constants &p, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * src2, const ggml_tensor * src3, ggml_tensor * dst) {
+    p.token_offset     = get_misalign_elements(ctx, src0);
+    p.dur_idx_offset   = get_misalign_elements(ctx, src1);
+    p.state_offset     = get_misalign_elements(ctx, src2);
+    p.dur_table_offset = get_misalign_elements(ctx, src3);
+    p.dst_offset       = get_misalign_elements(ctx, dst);
 }
 
 template<typename PC>
@@ -12361,6 +12480,25 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
             GGML_ABORT("invalid push constant type for CONV_3D");
         }
         break;
+    case GGML_OP_CONV_1D_DW_DIRECT:
+        {
+            const uint32_t ne = ggml_nelements(dst);
+            if (ne > 262144) {
+                elements = { 512, 512, CEIL_DIV(ne, 262144) };
+            } else if (ne > 512) {
+                elements = { 512, CEIL_DIV(ne, 512), 1 };
+            } else {
+                elements = { ne, 1, 1 };
+            }
+        }
+        break;
+    case GGML_OP_NORM_CHANNEL:
+        elements = { 512, (uint32_t)(ggml_get_op_params_i32(dst, 1) == 0 ? src0->ne[0] : src0->ne[1]),
+                     (uint32_t)src0->ne[2] };
+        break;
+    case GGML_OP_SNAKE:
+        elements = { (uint32_t)src0->ne[0], (uint32_t)src0->ne[1], 1 };
+        break;
     case GGML_OP_ADD:
     case GGML_OP_SUB:
     case GGML_OP_DIV:
@@ -12388,6 +12526,12 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
     case GGML_OP_UPSCALE:
     case GGML_OP_UNARY:
     case GGML_OP_GLU:
+    case GGML_OP_ZERO_UPSAMPLE:
+    case GGML_OP_CHANNEL_SHUFFLE:
+    case GGML_OP_AFFINE_PRELU:
+    case GGML_OP_SCALE_RESIDUAL:
+    case GGML_OP_BIAS_GELU:
+    case GGML_OP_PAD_REPLICATE_1D:
     case GGML_OP_CONV_2D_DW:
         {
             // dispatched per 32x32 tile, not per element
@@ -12507,6 +12651,30 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
             const uint32_t n_t = dst->ne[1];
             const uint32_t n_s = dst->ne[2];
             elements = { nr, n_t, n_s };
+        }
+        break;
+    case GGML_OP_LSTM_CELL:
+        {
+            // one thread per [h_new, c_new] pair over the flat H*N grid
+            const uint32_t ne = (uint32_t)(dst->ne[0]/GGML_LSTM_N_OUTS * dst->ne[1]);
+            if (ne > 262144) {
+                elements = { 512, 512, CEIL_DIV(ne, 262144) };
+            } else if (ne > 512) {
+                elements = { 512, CEIL_DIV(ne, 512), 1 };
+            } else {
+                elements = { ne, 1, 1 };
+            }
+        }
+        break;
+    case GGML_OP_TDT_STEP:
+        elements = { 1, 1, 1 };
+        break;
+    case GGML_OP_GRU:
+        {
+            const uint32_t H  = (uint32_t)src0->ne[0];
+            const uint32_t B  = (uint32_t)src1->ne[1];
+            const uint32_t PB = ggml_vk_gru_batch_per_workgroup(H);
+            elements = { 1, CEIL_DIV(B, PB), 1 };
         }
         break;
     case GGML_OP_SSM_CONV_BACK_SX:
@@ -13607,6 +13775,215 @@ static void ggml_vk_ssm_conv_back_c(ggml_backend_vk_context * ctx, vk_context& s
         (uint32_t)dst->ne[1],
         (uint32_t)src0->ne[1],
         (uint32_t)src0->ne[2],
+    });
+}
+
+static void ggml_vk_gru(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
+    const ggml_tensor * src0 = dst->src[0];  // whh [H, 3H]
+    const ggml_tensor * src1 = dst->src[1];  // gi_all [3H, B, L]
+    const ggml_tensor * src2 = dst->src[2];  // bhh [3H]
+
+    ggml_vk_op_f32<vk_op_gru_push_constants>(ctx, subctx, src0, src1, src2, nullptr, dst, GGML_OP_GRU, {
+        (uint32_t)src0->ne[0],
+        (uint32_t)src1->ne[1],
+        (uint32_t)src1->ne[2],
+        (uint32_t)ggml_get_op_params_i32(dst, 0),
+    });
+}
+
+static void ggml_vk_zero_upsample(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
+    const ggml_tensor * src0 = dst->src[0];
+
+    ggml_vk_op_f32<vk_op_zero_upsample_push_constants>(ctx, subctx, src0, nullptr, nullptr, nullptr, dst, GGML_OP_ZERO_UPSAMPLE, {
+        (uint32_t)ggml_nelements(dst),
+        (uint32_t)src0->ne[0],
+        (uint32_t)dst->ne[0],
+        (uint32_t)ggml_get_op_params_i32(dst, 0),
+    });
+}
+
+static void ggml_vk_channel_shuffle(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
+    const ggml_tensor * src0 = dst->src[0];
+
+    ggml_vk_op_f32<vk_op_channel_shuffle_push_constants>(ctx, subctx, src0, nullptr, nullptr, nullptr, dst, GGML_OP_CHANNEL_SHUFFLE, {
+        (uint32_t)ggml_nelements(dst),
+        (uint32_t)(src0->ne[0] * src0->ne[1]),
+        (uint32_t)src0->ne[2],
+        (uint32_t)ggml_get_op_params_i32(dst, 0),
+    });
+}
+
+static void ggml_vk_affine_prelu(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
+    const ggml_tensor * src0 = dst->src[0];  // x [F, T, C, Bc]
+    const ggml_tensor * src1 = dst->src[1];  // aw [F, C]
+    const ggml_tensor * src2 = dst->src[2];  // ab [F, C]
+    const ggml_tensor * src3 = dst->src[3];  // slope [C]
+
+    ggml_vk_op_f32<vk_op_affine_prelu_push_constants>(ctx, subctx, src0, src1, src2, src3, dst, GGML_OP_AFFINE_PRELU, {
+        (uint32_t)ggml_nelements(dst),
+        (uint32_t)src0->ne[0],
+        (uint32_t)(src0->ne[0] * src0->ne[1]),
+        (uint32_t)src0->ne[2],
+    });
+}
+
+static void ggml_vk_conv_1d_dw_direct(ggml_backend_vk_context * ctx, vk_context & subctx, ggml_tensor * dst) {
+    const ggml_tensor * x = dst->src[0];
+    const ggml_tensor * w = dst->src[1];
+    const ggml_tensor * bias = dst->src[2];
+    const uint32_t layout = (uint32_t)ggml_get_op_params_i32(dst, 2);
+    const uint32_t L = (uint32_t)(layout == 0 ? x->ne[0] : x->ne[1]);
+    const uint32_t C = (uint32_t)(layout == 0 ? x->ne[1] : x->ne[0]);
+    ggml_vk_op_f32<vk_op_conv_1d_dw_direct_push_constants>(
+        ctx, subctx, x, w, bias ? bias : x, nullptr, dst, dst->op, {
+            (uint32_t)ggml_nelements(dst), L, C, (uint32_t)x->ne[2],
+            (uint32_t)ggml_get_op_params_i32(dst, 0),
+            (uint32_t)ggml_get_op_params_i32(dst, 1),
+            layout,
+            (uint32_t)ggml_get_op_params_i32(dst, 3),
+            (uint32_t)ggml_get_op_params_i32(dst, 4),
+            bias != nullptr ? 1u : 0u,
+        });
+}
+
+static void ggml_vk_conv_1d_dw_direct_norm_channel(
+        ggml_backend_vk_context * ctx, vk_context & subctx, const ggml_cgraph * cgraph, int node_idx) {
+    GGML_ASSERT(ctx->num_additional_fused_ops == 1);
+
+    const ggml_tensor * conv = cgraph->nodes[node_idx];
+    const ggml_tensor * norm = cgraph->nodes[node_idx + 1];
+    const ggml_tensor * x = conv->src[0];
+    const ggml_tensor * w = conv->src[1];
+    const ggml_tensor * bias = conv->src[2];
+    const ggml_tensor * gamma = norm->src[1];
+    const ggml_tensor * beta = norm->src[2];
+    ggml_tensor * dst = cgraph->nodes[node_idx + ctx->num_additional_fused_ops];
+
+    const uint32_t layout = (uint32_t)ggml_get_op_params_i32(conv, 2);
+    const uint32_t L = (uint32_t)(layout == 0 ? x->ne[0] : x->ne[1]);
+    const uint32_t C = (uint32_t)(layout == 0 ? x->ne[1] : x->ne[0]);
+    float eps;
+    memcpy(&eps, norm->op_params, sizeof(eps));
+
+    const vk_op_conv_1d_dw_direct_norm_channel_push_constants pc = {
+        L,
+        C,
+        (uint32_t)x->ne[2],
+        (uint32_t)ggml_get_op_params_i32(conv, 0),
+        (uint32_t)ggml_get_op_params_i32(conv, 1),
+        layout,
+        (uint32_t)ggml_get_op_params_i32(conv, 3),
+        (uint32_t)ggml_get_op_params_i32(conv, 4),
+        bias != nullptr ? 1u : 0u,
+        eps,
+    };
+
+    vk_pipeline pipeline = ctx->device->pipeline_conv_1d_dw_direct_norm_channel_f32;
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, {
+        ggml_vk_tensor_subbuffer(ctx, x),
+        ggml_vk_tensor_subbuffer(ctx, w),
+        ggml_vk_tensor_subbuffer(ctx, bias ? bias : x),
+        ggml_vk_tensor_subbuffer(ctx, gamma),
+        ggml_vk_tensor_subbuffer(ctx, beta),
+        ggml_vk_tensor_subbuffer(ctx, dst),
+    }, pc, { 512, L, (uint32_t)x->ne[2] });
+}
+
+static void ggml_vk_norm_channel(ggml_backend_vk_context * ctx, vk_context & subctx, ggml_tensor * dst) {
+    const ggml_tensor * x = dst->src[0];
+    const uint32_t layout = (uint32_t)ggml_get_op_params_i32(dst, 1);
+    float eps;
+    memcpy(&eps, dst->op_params, sizeof(eps));
+    ggml_vk_op_f32<vk_op_norm_channel_push_constants>(
+        ctx, subctx, x, dst->src[1], dst->src[2], nullptr, dst, dst->op, {
+            (uint32_t)(layout == 0 ? x->ne[0] : x->ne[1]),
+            (uint32_t)(layout == 0 ? x->ne[1] : x->ne[0]),
+            (uint32_t)x->ne[2], layout, eps,
+        });
+}
+
+static void ggml_vk_scale_residual(ggml_backend_vk_context * ctx, vk_context & subctx, ggml_tensor * dst) {
+    const ggml_tensor * x = dst->src[0];
+    const uint32_t layout = (uint32_t)ggml_get_op_params_i32(dst, 0);
+    ggml_vk_op_f32<vk_op_channel_pointwise_push_constants>(
+        ctx, subctx, x, dst->src[1], dst->src[2], dst->src[3], dst, dst->op, {
+            (uint32_t)ggml_nelements(dst),
+            (uint32_t)(layout == 0 ? x->ne[0] : layout == 1 ? x->ne[1] : x->ne[0]),
+            (uint32_t)(layout == 0 ? x->ne[1] : layout == 1 ? x->ne[0] : x->ne[1]),
+            (uint32_t)x->ne[2], layout,
+        });
+}
+
+static void ggml_vk_bias_gelu(ggml_backend_vk_context * ctx, vk_context & subctx, ggml_tensor * dst) {
+    const ggml_tensor * x = dst->src[0];
+    const uint32_t layout = (uint32_t)ggml_get_op_params_i32(dst, 0);
+    ggml_vk_op_f32<vk_op_channel_pointwise_push_constants>(
+        ctx, subctx, x, dst->src[1], nullptr, nullptr, dst, dst->op, {
+            (uint32_t)ggml_nelements(dst),
+            (uint32_t)(layout == 0 ? x->ne[0] : layout == 1 ? x->ne[1] : x->ne[0]),
+            (uint32_t)(layout == 0 ? x->ne[1] : layout == 1 ? x->ne[0] : x->ne[1]),
+            (uint32_t)x->ne[2], layout,
+        });
+}
+
+static void ggml_vk_pad_replicate_1d(ggml_backend_vk_context * ctx, vk_context & subctx, ggml_tensor * dst) {
+    const ggml_tensor * x = dst->src[0];
+    const uint32_t layout = (uint32_t)ggml_get_op_params_i32(dst, 2);
+    ggml_vk_op_f32<vk_op_pad_replicate_1d_push_constants>(
+        ctx, subctx, x, nullptr, nullptr, nullptr, dst, dst->op, {
+            (uint32_t)ggml_nelements(dst),
+            (uint32_t)(layout == 0 ? x->ne[0] : x->ne[1]),
+            (uint32_t)(layout == 0 ? dst->ne[0] : dst->ne[1]),
+            (uint32_t)(layout == 0 ? x->ne[1] : x->ne[0]),
+            layout,
+            (uint32_t)ggml_get_op_params_i32(dst, 0),
+        });
+}
+
+static void ggml_vk_snake(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
+    const ggml_tensor * src0 = dst->src[0];  // x     [T, C]
+    const ggml_tensor * src1 = dst->src[1];  // a     [C]
+    const ggml_tensor * src2 = dst->src[2];  // inv_b [C]
+
+    vk_op_snake_push_constants pc{};
+    pc.ne0 = static_cast<uint32_t>(src0->ne[0]);
+    pc.ne1 = static_cast<uint32_t>(src0->ne[1]);
+
+    ggml_vk_op_f32(ctx, subctx, src0, src1, src2, nullptr, dst, GGML_OP_SNAKE, std::move(pc));
+}
+
+static void ggml_vk_lstm_cell(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
+    const ggml_tensor * gates = dst->src[0];  // [4H, N]
+    const ggml_tensor * prev  = dst->src[1];  // c_prev [H, N], or hc_prev [2H, N] when masked
+    const ggml_tensor * mask  = dst->src[2];  // [N] or [1], null when unmasked
+
+    // Unmasked: prev is c_prev [H, N]. Masked: prev is hc_prev [2H, N] and c
+    // starts half a row in.
+    const uint32_t H = (uint32_t)(dst->ne[0]/GGML_LSTM_N_OUTS);
+
+    ggml_vk_op_f32<vk_op_lstm_cell_push_constants>(ctx, subctx, gates, prev, mask, nullptr, dst, GGML_OP_LSTM_CELL, {
+        H,
+        (uint32_t)prev->ne[1],
+        (uint32_t)prev->ne[0],
+        mask ? H : 0,
+        (mask && ggml_nelements(mask) > 1) ? 1u : 0u,
+        0, 0, 0, 0,  // buffer offsets, filled in by init_pushconst_tensor_offsets
+    });
+}
+
+static void ggml_vk_tdt_step(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
+    const ggml_tensor * token     = dst->src[0];
+    const ggml_tensor * dur_idx   = dst->src[1];
+    const ggml_tensor * state     = dst->src[2];
+    const ggml_tensor * dur_table = dst->src[3];
+
+    ggml_vk_op_f32<vk_op_tdt_step_push_constants>(ctx, subctx, token, dur_idx, state, dur_table, dst, GGML_OP_TDT_STEP, {
+        (uint32_t)ggml_nelements(dur_table),
+        ggml_get_op_params_i32(dst, 0),
+        ggml_get_op_params_i32(dst, 1),
+        ggml_get_op_params_i32(dst, 2),
+        0, 0, 0, 0, 0,  // buffer offsets, filled in by init_pushconst_tensor_offsets
     });
 }
 
@@ -16101,6 +16478,7 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
         case GGML_GLU_OP_SWIGLU_OAI:
         case GGML_GLU_OP_GEGLU_ERF:
         case GGML_GLU_OP_GEGLU_QUICK:
+        case GGML_GLU_OP_SIGLU:
         case GGML_GLU_OP_SWIGLU_CLAMP:
             ggml_vk_glu(ctx, compute_ctx, src0, src1, node);
             break;
@@ -16304,6 +16682,70 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
 
     case GGML_OP_SSM_CONV:
         ggml_vk_ssm_conv(ctx, compute_ctx, cgraph, node_idx);
+
+        break;
+
+    case GGML_OP_GRU:
+        ggml_vk_gru(ctx, compute_ctx, node);
+
+        break;
+
+    case GGML_OP_ZERO_UPSAMPLE:
+        ggml_vk_zero_upsample(ctx, compute_ctx, node);
+
+        break;
+
+    case GGML_OP_CHANNEL_SHUFFLE:
+        ggml_vk_channel_shuffle(ctx, compute_ctx, node);
+
+        break;
+
+    case GGML_OP_AFFINE_PRELU:
+        ggml_vk_affine_prelu(ctx, compute_ctx, node);
+
+        break;
+
+    case GGML_OP_CONV_1D_DW_DIRECT:
+        if (ctx->num_additional_fused_ops > 0) {
+            ggml_vk_conv_1d_dw_direct_norm_channel(ctx, compute_ctx, cgraph, node_idx);
+        } else {
+            ggml_vk_conv_1d_dw_direct(ctx, compute_ctx, node);
+        }
+
+        break;
+
+    case GGML_OP_NORM_CHANNEL:
+        ggml_vk_norm_channel(ctx, compute_ctx, node);
+
+        break;
+
+    case GGML_OP_SCALE_RESIDUAL:
+        ggml_vk_scale_residual(ctx, compute_ctx, node);
+
+        break;
+
+    case GGML_OP_BIAS_GELU:
+        ggml_vk_bias_gelu(ctx, compute_ctx, node);
+
+        break;
+
+    case GGML_OP_PAD_REPLICATE_1D:
+        ggml_vk_pad_replicate_1d(ctx, compute_ctx, node);
+
+        break;
+
+    case GGML_OP_SNAKE:
+        ggml_vk_snake(ctx, compute_ctx, node);
+
+        break;
+
+    case GGML_OP_LSTM_CELL:
+        ggml_vk_lstm_cell(ctx, compute_ctx, node);
+
+        break;
+
+    case GGML_OP_TDT_STEP:
+        ggml_vk_tdt_step(ctx, compute_ctx, node);
 
         break;
 
@@ -18156,6 +18598,75 @@ static bool ggml_vk_ssm_conv_direct_at_conv(ggml_backend_vk_context * ctx, const
 }
 
 
+static bool ggml_vk_can_fuse_conv_1d_dw_direct_norm_channel(const ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx) {
+    if (!ggml_can_fuse(cgraph, node_idx, { GGML_OP_CONV_1D_DW_DIRECT, GGML_OP_NORM_CHANNEL })) {
+        return false;
+    }
+
+    const ggml_tensor * conv = cgraph->nodes[node_idx];
+    const ggml_tensor * norm = cgraph->nodes[node_idx + 1];
+    if (norm->src[0] != conv ||
+        ggml_get_op_params_i32(conv, 2) != ggml_get_op_params_i32(norm, 1)) {
+        return false;
+    }
+
+    const ggml_tensor * x = conv->src[0];
+    const ggml_tensor * w = conv->src[1];
+    const ggml_tensor * bias = conv->src[2];
+    const ggml_tensor * gamma = norm->src[1];
+    const ggml_tensor * beta = norm->src[2];
+    if (!x || !w || !gamma || !beta) {
+        return false;
+    }
+
+    const int32_t layout = ggml_get_op_params_i32(conv, 2);
+    const int64_t L = layout == 0 ? x->ne[0] : x->ne[1];
+    const int64_t C = layout == 0 ? x->ne[1] : x->ne[0];
+    const int32_t K = ggml_get_op_params_i32(conv, 0);
+
+    // One 512-lane workgroup per timestep: a short sequence underfills the GPU and
+    // runs faster as the two standalone dispatches.
+    static constexpr int64_t min_fused_workgroups = 512;
+    if (L * x->ne[2] < min_fused_workgroups || !ggml_vk_norm_channel_grid_fits(ctx->device, x, layout)) {
+        return false;
+    }
+
+    // The shader keeps every depthwise result in registers until both
+    // normalization reductions finish. Wider tensors retain the two standalone dispatches.
+    static constexpr int64_t values_per_lane = 8;
+    static constexpr int64_t local_size = 512;
+    if (C > values_per_lane * local_size ||
+        !ggml_are_same_shape(conv, x) ||
+        w->ne[0] != K || w->ne[1] != 1 || w->ne[2] != C || w->ne[3] != 1 ||
+        (bias && ggml_nelements(bias) != C) ||
+        ggml_nelements(gamma) != C || ggml_nelements(beta) != C) {
+        return false;
+    }
+
+    if (x->ne[3] != 1 ||
+        x->type != GGML_TYPE_F32 || w->type != GGML_TYPE_F32 ||
+        (bias && bias->type != GGML_TYPE_F32) ||
+        gamma->type != GGML_TYPE_F32 || beta->type != GGML_TYPE_F32 ||
+        conv->type != GGML_TYPE_F32 || norm->type != GGML_TYPE_F32 ||
+        !ggml_is_contiguous(x) || !ggml_is_contiguous(w) ||
+        (bias && !ggml_is_contiguous(bias)) ||
+        !ggml_is_contiguous(gamma) || !ggml_is_contiguous(beta) ||
+        !ggml_is_contiguous(conv) || !ggml_is_contiguous(norm) ||
+        (K != 3 && K != 5 && K != 7)) {
+        return false;
+    }
+
+    // Unlike the standalone pair, the fused workgroups can still be reading
+    // neighboring timesteps or affine parameters when another workgroup writes.
+    for (const ggml_tensor * input : { x, w, bias, gamma, beta }) {
+        if (input && ggml_vk_tensors_overlap(input, norm, false)) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
 bool ggml_vk_can_fuse_rms_norm_mul_rope(ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph,
                                                int node_idx) {
     const ggml_tensor *rms = cgraph->nodes[node_idx + 0];
@@ -18580,6 +19091,12 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 ctx->fused_fwht_signed = true;
                 fusion_string = "FWHT_SIGNED";
                 std::fill_n(op_srcs_fused_elementwise, 3, false);
+            } else if (ggml_vk_can_fuse_conv_1d_dw_direct_norm_channel(ctx, cgraph, i)) {
+                ctx->num_additional_fused_ops = 1;
+                fusion_string = "CONV_1D_DW_DIRECT_NORM_CHANNEL";
+                // The conv reads neighboring timesteps and the norm reduces all channels.
+                op_srcs_fused_elementwise[0] = false;
+                op_srcs_fused_elementwise[1] = false;
             } else if (ggml_vk_can_fuse_snake(ctx, cgraph, i)) {
                 ctx->num_additional_fused_ops = 4;
                 fusion_string = "SNAKE";
@@ -19598,6 +20115,21 @@ static ggml_backend_t ggml_backend_vk_device_init(ggml_backend_dev_t dev, const 
     return ggml_backend_vk_init(ctx->device);
 }
 
+// Shaders without misalignment offsets address their buffers from the bound
+// offset, so a view that starts inside a storage-buffer alignment unit cannot be bound.
+static bool ggml_vk_view_offset_aligned(const vk_device & device, const ggml_tensor * t) {
+    return (t->view_offs & (device->properties.limits.minStorageBufferOffsetAlignment - 1)) == 0;
+}
+
+static bool ggml_vk_op_views_aligned(const vk_device & device, const ggml_tensor * op) {
+    for (int i = 0; i < GGML_MAX_SRC; ++i) {
+        if (op->src[i] && !ggml_vk_view_offset_aligned(device, op->src[i])) {
+            return false;
+        }
+    }
+    return ggml_vk_view_offset_aligned(device, op);
+}
+
 static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
     ggml_backend_vk_device_context * ctx = (ggml_backend_vk_device_context *)dev->context;
     const vk_device& device = ggml_vk_get_device(ctx->device);
@@ -19668,6 +20200,7 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                 case GGML_GLU_OP_SWIGLU_OAI:
                 case GGML_GLU_OP_GEGLU_ERF:
                 case GGML_GLU_OP_GEGLU_QUICK:
+                case GGML_GLU_OP_SIGLU:
                 case GGML_GLU_OP_SWIGLU_CLAMP:
                     return (op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_F16) &&
                            (op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16) &&
@@ -20474,6 +21007,78 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
             }
         case GGML_OP_SSM_CONV:
             return op->src[0]->type == GGML_TYPE_F32;
+        case GGML_OP_GRU:
+            return ggml_vk_op_views_aligned(device, op) &&
+                   op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
+                   op->src[2]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
+                   op->src[0]->ne[0] <= 128 &&   // hidden size H <= GRU_MAX_H (shared-mem cap)
+                   ggml_vk_gru_grid_fits(device, op);
+        case GGML_OP_ZERO_UPSAMPLE:
+            return ggml_vk_op_views_aligned(device, op) &&
+                   op->src[0]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
+                   ggml_is_contiguous(op->src[0]);
+        case GGML_OP_CHANNEL_SHUFFLE:
+            return ggml_vk_op_views_aligned(device, op) &&
+                   op->src[0]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
+                   ggml_is_contiguous(op->src[0]);
+        case GGML_OP_AFFINE_PRELU:
+            return ggml_vk_op_views_aligned(device, op) &&
+                   op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
+                   op->src[2]->type == GGML_TYPE_F32 && op->src[3]->type == GGML_TYPE_F32 &&
+                   op->type == GGML_TYPE_F32 && ggml_is_contiguous(op->src[0]);
+        case GGML_OP_CONV_1D_DW_DIRECT:
+            return ggml_vk_op_views_aligned(device, op) && op->src[0]->ne[3] == 1 &&
+                   op->src[0]->type == GGML_TYPE_F32 &&
+                   op->src[1]->type == GGML_TYPE_F32 &&
+                   (!op->src[2] || op->src[2]->type == GGML_TYPE_F32) &&
+                   op->type == GGML_TYPE_F32 &&
+                   ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]) &&
+                   (!op->src[2] || ggml_is_contiguous(op->src[2])) && ggml_is_contiguous(op) &&
+                   (ggml_get_op_params_i32(op, 0) == 3 ||
+                    ggml_get_op_params_i32(op, 0) == 5 ||
+                    ggml_get_op_params_i32(op, 0) == 7);
+        case GGML_OP_NORM_CHANNEL:
+            return ggml_vk_op_views_aligned(device, op) && op->src[0]->ne[3] == 1 &&
+                   op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
+                   op->src[2]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
+                   ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]) &&
+                   ggml_is_contiguous(op->src[2]) && ggml_is_contiguous(op) &&
+                   ggml_vk_norm_channel_grid_fits(device, op->src[0], ggml_get_op_params_i32(op, 1));
+        case GGML_OP_SCALE_RESIDUAL:
+            return ggml_vk_op_views_aligned(device, op) && op->src[0]->ne[3] == 1 &&
+                   op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
+                   op->src[2]->type == GGML_TYPE_F32 && op->src[3]->type == GGML_TYPE_F32 &&
+                   op->type == GGML_TYPE_F32 && ggml_is_contiguous(op->src[0]) &&
+                   ggml_is_contiguous(op->src[1]) && ggml_is_contiguous(op->src[2]) &&
+                   ggml_is_contiguous(op->src[3]) && ggml_is_contiguous(op);
+        case GGML_OP_BIAS_GELU:
+            return ggml_vk_op_views_aligned(device, op) && op->src[0]->ne[3] == 1 &&
+                   op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
+                   op->type == GGML_TYPE_F32 && ggml_is_contiguous(op->src[0]) &&
+                   ggml_is_contiguous(op->src[1]) && ggml_is_contiguous(op);
+        case GGML_OP_PAD_REPLICATE_1D:
+            return ggml_vk_op_views_aligned(device, op) &&
+                   op->src[0]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
+                   ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op);
+        case GGML_OP_SNAKE:
+            return ggml_vk_op_views_aligned(device, op) &&
+                   op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
+                   op->src[2]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
+                   ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op);
+        case GGML_OP_LSTM_CELL:
+            return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
+                   op->type == GGML_TYPE_F32 &&
+                   ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]) &&
+                   ggml_is_contiguous(op) &&
+                   (!op->src[2] || (op->src[2]->type == GGML_TYPE_I32 &&
+                                    ggml_is_contiguous(op->src[2])));
+        case GGML_OP_TDT_STEP:
+            return op->src[0]->type == GGML_TYPE_I32 && op->src[1]->type == GGML_TYPE_I32 &&
+                   op->src[2]->type == GGML_TYPE_I32 && op->src[3]->type == GGML_TYPE_I32 &&
+                   op->type == GGML_TYPE_I32 &&
+                   ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]) &&
+                   ggml_is_contiguous(op->src[2]) && ggml_is_contiguous(op->src[3]) &&
+                   ggml_is_contiguous(op);
         case GGML_OP_SSM_CONV_BACK_SX:
         case GGML_OP_SSM_CONV_BACK_C:
             return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32;

@@ -181,6 +181,18 @@ static void init_tensor_uniform(ggml_tensor * tensor, float min = -1.0f, float m
     }
 }
 
+// a large shared offset with a small hashed pattern on top: the input that makes a
+// single-pass E[x^2] - E[x]^2 variance cancel catastrophically
+static void init_tensor_offset_pattern(ggml_tensor * tensor, float offset, float step) {
+    static constexpr size_t hash_mul    = 7919;
+    static constexpr size_t hash_levels = 101;
+    std::vector<float> data(ggml_nelements(tensor));
+    for (size_t i = 0; i < data.size(); i++) {
+        data[i] = offset + ((i * hash_mul) % hash_levels) * step;
+    }
+    ggml_backend_tensor_set(tensor, data.data(), 0, ggml_nbytes(tensor));
+}
+
 // generate an F16 mask where certain blocks are randomly masked with -INF value
 static void init_tensor_kq_mask(ggml_tensor * tensor, float min = -1.0f, float max = 1.0f) {
     GGML_ASSERT(tensor->type == GGML_TYPE_F16);
@@ -5562,14 +5574,25 @@ struct test_norm_channel : public test_case {
     const int64_t B;
     const bool ct; // [C, T] layout instead of [T, C]
     const float eps;
+    const float offset; // shared input offset under a 0.001 pattern (0 = uniform input)
 
     std::string vars() override {
-        return VARS_TO_STR5(L, C, B, ct, eps);
+        return VARS_TO_STR6(L, C, B, ct, eps, offset);
     }
 
     test_norm_channel(int64_t L = 139, int64_t C = 512, bool ct = false, float eps = 1e-6f,
-                                       int64_t B = 1)
-        : L(L), C(C), B(B), ct(ct), eps(eps) {}
+                                       int64_t B = 1, float offset = 0.0f)
+        : L(L), C(C), B(B), ct(ct), eps(eps), offset(offset) {}
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (offset != 0.0f && strcmp(t->name, "a") == 0) {
+                init_tensor_offset_pattern(t, offset, 0.001f);
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * a = ct ? ggml_new_tensor_3d(ctx, GGML_TYPE_F32, C, L, B) : ggml_new_tensor_3d(ctx, GGML_TYPE_F32, L, C, B);
@@ -5592,26 +5615,27 @@ struct test_scale_residual : public test_case {
     const int64_t L;
     const int64_t C;
     const int64_t B;
-    const bool    ct;
+    const int     layout; // 0 = [T, C], 1 = [C, T], 2 = [T, C] in and [C, T] out
 
     std::string vars() override {
-        return VARS_TO_STR4(L, C, B, ct);
+        return VARS_TO_STR4(L, C, B, layout);
     }
 
-    test_scale_residual(int64_t L = 139, int64_t C = 512, int64_t B = 1, bool ct = false)
-        : L(L), C(C), B(B), ct(ct) {}
+    test_scale_residual(int64_t L = 139, int64_t C = 512, int64_t B = 1, int layout = 0)
+        : L(L), C(C), B(B), layout(layout) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
-        ggml_tensor * x = ct ? ggml_new_tensor_3d(ctx, GGML_TYPE_F32, C, L, B) : ggml_new_tensor_3d(ctx, GGML_TYPE_F32, L, C, B);
+        ggml_tensor * x = layout == 1 ? ggml_new_tensor_3d(ctx, GGML_TYPE_F32, C, L, B) : ggml_new_tensor_3d(ctx, GGML_TYPE_F32, L, C, B);
         ggml_set_name(x, "x");
         ggml_tensor * bias = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, C);
         ggml_set_name(bias, "bias");
         ggml_tensor * gamma = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, C);
         ggml_set_name(gamma, "gamma");
-        ggml_tensor * residual = ggml_dup_tensor(ctx, x);
+        ggml_tensor * residual = layout == 2 ? ggml_new_tensor_3d(ctx, GGML_TYPE_F32, C, L, B) : ggml_dup_tensor(ctx, x);
         ggml_set_name(residual, "residual");
-        ggml_tensor * out = ct ? ggml_scale_residual_ct(ctx, x, bias, gamma, residual)
-                               : ggml_scale_residual(ctx, x, bias, gamma, residual);
+        ggml_tensor * out = layout == 2 ? ggml_scale_residual_tc_to_ct(ctx, x, bias, gamma, residual)
+                          : layout == 1 ? ggml_scale_residual_ct(ctx, x, bias, gamma, residual)
+                                        : ggml_scale_residual(ctx, x, bias, gamma, residual);
         ggml_set_name(out, "out");
         return out;
     }
@@ -5622,21 +5646,23 @@ struct test_bias_gelu : public test_case {
     const int64_t L;
     const int64_t C;
     const int64_t B;
-    const bool    ct;
+    const int     layout; // 0 = [T, C], 1 = [C, T], 2 = [T, C] in and [C, T] out
 
     std::string vars() override {
-        return VARS_TO_STR4(L, C, B, ct);
+        return VARS_TO_STR4(L, C, B, layout);
     }
 
-    test_bias_gelu(int64_t L = 139, int64_t C = 512, int64_t B = 1, bool ct = false)
-        : L(L), C(C), B(B), ct(ct) {}
+    test_bias_gelu(int64_t L = 139, int64_t C = 512, int64_t B = 1, int layout = 0)
+        : L(L), C(C), B(B), layout(layout) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
-        ggml_tensor * x = ct ? ggml_new_tensor_3d(ctx, GGML_TYPE_F32, C, L, B) : ggml_new_tensor_3d(ctx, GGML_TYPE_F32, L, C, B);
+        ggml_tensor * x = layout == 1 ? ggml_new_tensor_3d(ctx, GGML_TYPE_F32, C, L, B) : ggml_new_tensor_3d(ctx, GGML_TYPE_F32, L, C, B);
         ggml_set_name(x, "x");
         ggml_tensor * bias = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, C);
         ggml_set_name(bias, "bias");
-        ggml_tensor * out = ct ? ggml_bias_gelu_ct(ctx, x, bias) : ggml_bias_gelu(ctx, x, bias);
+        ggml_tensor * out = layout == 2 ? ggml_bias_gelu_tc_to_ct(ctx, x, bias)
+                          : layout == 1 ? ggml_bias_gelu_ct(ctx, x, bias)
+                                        : ggml_bias_gelu(ctx, x, bias);
         ggml_set_name(out, "out");
         return out;
     }
@@ -5840,16 +5866,34 @@ struct test_conv_1d_dw_direct_norm_channel : public test_case {
     const bool ct;
     const bool causal;
     const int seg_len;
+    const float offset; // shared input offset under a 0.5 pattern, constant taps, no bias (0 = uniform)
 
     std::string vars() override {
-        return VARS_TO_STR8(L, C, B, K, dilation, ct, causal, seg_len);
+        return VARS_TO_STR9(L, C, B, K, dilation, ct, causal, seg_len, offset);
     }
 
     bool run_whole_graph() override { return true; }
 
     test_conv_1d_dw_direct_norm_channel(int64_t L, int64_t C, int64_t K, int dilation,
-                                         bool ct = true, bool causal = false, int seg_len = 0, int64_t B = 1)
-        : L(L), C(C), B(B), K(K), dilation(dilation), ct(ct), causal(causal), seg_len(seg_len) {}
+                                         bool ct = true, bool causal = false, int seg_len = 0, int64_t B = 1,
+                                         float offset = 0.0f)
+        : L(L), C(C), B(B), K(K), dilation(dilation), ct(ct), causal(causal), seg_len(seg_len), offset(offset) {}
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (offset == 0.0f) {
+                init_tensor_uniform(t);
+            } else if (strcmp(t->name, "a") == 0) {
+                init_tensor_offset_pattern(t, offset, 0.5f);
+            } else if (strcmp(t->name, "w") == 0) {
+                init_tensor_uniform(t, 0.1f, 0.1f);
+            } else if (strcmp(t->name, "b") == 0) {
+                init_tensor_uniform(t, 0.0f, 0.0f);
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * a = ct ? ggml_new_tensor_3d(ctx, GGML_TYPE_F32, C, L, B) : ggml_new_tensor_3d(ctx, GGML_TYPE_F32, L, C, B);
@@ -15271,6 +15315,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
     test_cases.emplace_back(new test_norm_channel(37, 96, true, 1e-6f, 2));
+    // large shared offset under a tiny channel variation: a single-pass variance cancels here
+    for (bool ct : { false, true }) {
+        test_cases.emplace_back(new test_norm_channel(139, 512, ct, 1e-6f, 1, 10000.0f));
+    }
     for (int64_t K : { 3, 5, 7 }) {
         test_cases.emplace_back(new test_conv_1d_dw_direct(139, 512, K, 3, true));
         test_cases.emplace_back(new test_conv_1d_dw_direct(139, 512, K, 2, false));
@@ -15295,13 +15343,22 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_conv_1d_dw_direct_norm_channel(139, 2048, 3, 1, true));
     test_cases.emplace_back(new test_conv_1d_dw_direct_norm_channel(139, 2304, 3, 1, true));
     test_cases.emplace_back(new test_conv_1d_dw_direct_norm_channel(37, 96, 5, 2, true, false, 0, 2));
-    for (bool ct : { false, true }) {
-        test_cases.emplace_back(new test_scale_residual(139, 512, 1, ct));
-        test_cases.emplace_back(new test_scale_residual(37, 96, 2, ct));
+    test_cases.emplace_back(new test_conv_1d_dw_direct_norm_channel(139, 512, 7, 3, true, false, 0, 1, 10000.0f));
+    test_cases.emplace_back(new test_conv_1d_dw_direct_norm_channel(53, 256, 5, 2, false, false, 0, 1, 10000.0f));
+    // long sequences take the fused shader; the shorter cases above stay on the two dispatches
+    test_cases.emplace_back(new test_conv_1d_dw_direct_norm_channel(1024, 512, 7, 3, true));
+    test_cases.emplace_back(new test_conv_1d_dw_direct_norm_channel(1024, 256, 5, 2, false));
+    test_cases.emplace_back(new test_conv_1d_dw_direct_norm_channel(600, 2048, 3, 1, true));
+    test_cases.emplace_back(new test_conv_1d_dw_direct_norm_channel(300, 96, 5, 2, true, false, 0, 2));
+    test_cases.emplace_back(new test_conv_1d_dw_direct_norm_channel(1024, 512, 7, 3, true, false, 0, 1, 10000.0f));
+    test_cases.emplace_back(new test_conv_1d_dw_direct_norm_channel(1024, 256, 5, 2, false, false, 0, 1, 10000.0f));
+    for (int layout : { 0, 1, 2 }) {
+        test_cases.emplace_back(new test_scale_residual(139, 512, 1, layout));
+        test_cases.emplace_back(new test_scale_residual(37, 96, 2, layout));
     }
-    for (bool ct : { false, true }) {
-        test_cases.emplace_back(new test_bias_gelu(139, 512, 1, ct));
-        test_cases.emplace_back(new test_bias_gelu(37, 96, 2, ct));
+    for (int layout : { 0, 1, 2 }) {
+        test_cases.emplace_back(new test_bias_gelu(139, 512, 1, layout));
+        test_cases.emplace_back(new test_bias_gelu(37, 96, 2, layout));
     }
     // Metal fuses these epilogues into its mat-mat kernels; the ragged shapes cover the tile bounds.
     for (int mode : { 1, 2, 3, 4, 6, 7 }) {
@@ -18816,6 +18873,29 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         test_cases.emplace_back(new test_l2_norm_batch(GGML_TYPE_F32, { n, 16, 16, 1 }, 4, 1e-12f, true));
     }
 
+    // speech ops at their model shapes (ConvNeXt blocks at C = 512, the vocoder
+    // activations, the recurrent cells and the transducer step)
+    test_cases.emplace_back(new test_conv_1d_dw_direct(139, 512, 7, 3, true));
+    test_cases.emplace_back(new test_conv_1d_dw_direct(2808, 512, 7, 1, true, true));
+    test_cases.emplace_back(new test_norm_channel(139, 512, true));
+    test_cases.emplace_back(new test_norm_channel(1024, 512, false));
+    test_cases.emplace_back(new test_conv_1d_dw_direct_norm_channel(139, 512, 7, 3, true));
+    test_cases.emplace_back(new test_conv_1d_dw_direct_norm_channel(2808, 512, 7, 1, true, true));
+    test_cases.emplace_back(new test_conv_1d_dw_direct_norm_channel(1024, 512, 7, 3, true));
+    test_cases.emplace_back(new test_scale_residual(139, 512, 1, 1));
+    test_cases.emplace_back(new test_bias_gelu(139, 512, 1, 1));
+    test_cases.emplace_back(new test_pad_replicate_1d(139, 512, 6, 0, true));
+    test_cases.emplace_back(new test_gru(64, 1, 17, false));
+    test_cases.emplace_back(new test_gru(128, 2, 33, false));
+    test_cases.emplace_back(new test_gru(4, 1953, 33, true));
+    test_cases.emplace_back(new test_zero_upsample({1024, 80, 4, 1}, 2));
+    test_cases.emplace_back(new test_channel_shuffle({64, 64, 64, 2}, 4));
+    test_cases.emplace_back(new test_affine_prelu(129, 63, 16, 3));
+    test_cases.emplace_back(new test_snake(4096, 512));
+    test_cases.emplace_back(new test_lstm_cell(640, 1));
+    test_cases.emplace_back(new test_lstm_cell(640, 5));
+    test_cases.emplace_back(new test_tdt_step(1024, 2, 3, 0, 8));
+    test_cases.emplace_back(new test_glu(GGML_GLU_OP_SIGLU, GGML_TYPE_F32, { 2048, 139, 1, 1 }, 0, false));
 
     return test_cases;
 }
