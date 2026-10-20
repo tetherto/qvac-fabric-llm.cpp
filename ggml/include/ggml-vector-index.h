@@ -413,6 +413,35 @@ GGML_VEC_INDEX_API int ggml_vec_index_len(const ggml_vec_index_t * idx);
 GGML_VEC_INDEX_API int ggml_vec_index_dim(const ggml_vec_index_t * idx);
 GGML_VEC_INDEX_API int ggml_vec_index_bit_width(const ggml_vec_index_t * idx);
 
+// Storage mode of an index. `bit_width` alone cannot tell generic q4 from
+// TurboVec q4.
+enum ggml_vec_index_storage {
+    GGML_VEC_INDEX_STORAGE_NONE        = 0,
+    GGML_VEC_INDEX_STORAGE_F32         = 1,
+    GGML_VEC_INDEX_STORAGE_Q8          = 2,
+    GGML_VEC_INDEX_STORAGE_Q4          = 3,
+    GGML_VEC_INDEX_STORAGE_TURBOVEC_Q2 = 4,
+    GGML_VEC_INDEX_STORAGE_TURBOVEC_Q3 = 5,
+    GGML_VEC_INDEX_STORAGE_TURBOVEC_Q4 = 6,
+};
+
+// Returns a `ggml_vec_index_storage` value; GGML_VEC_INDEX_STORAGE_NONE for
+// a NULL handle.
+GGML_VEC_INDEX_API int ggml_vec_index_storage(const ggml_vec_index_t * idx);
+
+// Returns 1 for a TurboVec index loaded from a v3 snapshot, which keeps the
+// turbovec 0.9 encoding (see `ggml_vec_index_create_turbovec`).
+GGML_VEC_INDEX_API int ggml_vec_index_turbovec_is_legacy(const ggml_vec_index_t * idx);
+
+// Copies the live ids into `out_ids`, up to `capacity` of them, and stores
+// the live count in `out_count`. Pass `capacity` 0 to query the count. Ids
+// come in a stable order that changes only with mutations.
+GGML_VEC_INDEX_API int ggml_vec_index_ids(
+    const ggml_vec_index_t * idx,
+    uint64_t               * out_ids,
+    size_t                   capacity,
+    size_t                 * out_count);
+
 // File format (.tvim versions 2 and 3, all little-endian):
 // "TQ+" here is the TurboVec per-coordinate calibration scheme, unrelated to
 // ggml tensor types GGML_TYPE_TQ1_0 and GGML_TYPE_TQ2_0.

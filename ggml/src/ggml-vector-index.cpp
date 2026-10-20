@@ -1256,6 +1256,60 @@ int ggml_vec_index_contains(const ggml_vec_index_t * idx, uint64_t id) {
     }
 }
 
+int ggml_vec_index_storage(const ggml_vec_index_t * idx) {
+    if (idx == nullptr) {
+        return GGML_VEC_INDEX_STORAGE_NONE;
+    }
+    try {
+        std::shared_lock<std::shared_mutex> lock(idx->mutex);
+        switch (idx->turbovec_bits) {
+            case 2: return GGML_VEC_INDEX_STORAGE_TURBOVEC_Q2;
+            case 3: return GGML_VEC_INDEX_STORAGE_TURBOVEC_Q3;
+            case 4: return GGML_VEC_INDEX_STORAGE_TURBOVEC_Q4;
+            default: break;
+        }
+        return is_q4(*idx) ? GGML_VEC_INDEX_STORAGE_Q4 :
+            is_q8(*idx) ? GGML_VEC_INDEX_STORAGE_Q8 : GGML_VEC_INDEX_STORAGE_F32;
+    } catch (...) {
+        return GGML_VEC_INDEX_STORAGE_NONE;
+    }
+}
+
+int ggml_vec_index_turbovec_is_legacy(const ggml_vec_index_t * idx) {
+    if (idx == nullptr) {
+        return 0;
+    }
+    try {
+        std::shared_lock<std::shared_mutex> lock(idx->mutex);
+        return is_turbovec(*idx) && idx->turbovec_legacy ? 1 : 0;
+    } catch (...) {
+        return 0;
+    }
+}
+
+int ggml_vec_index_ids(
+        const ggml_vec_index_t * idx,
+        uint64_t * out_ids,
+        size_t capacity,
+        size_t * out_count) {
+    if (idx == nullptr || out_count == nullptr || (capacity != 0 && out_ids == nullptr)) {
+        return GGML_VEC_INDEX_E_INVALID_ARG;
+    }
+    try {
+        std::shared_lock<std::shared_mutex> lock(idx->mutex);
+        *out_count = active_count(*idx);
+        size_t written = 0;
+        for (size_t slot = 0; slot < idx->slot_to_id.size() && written < capacity; ++slot) {
+            if (slot_is_active(*idx, slot)) {
+                out_ids[written++] = idx->slot_to_id[slot];
+            }
+        }
+        return GGML_VEC_INDEX_OK;
+    } catch (...) {
+        return GGML_VEC_INDEX_E_INTERNAL;
+    }
+}
+
 int ggml_vec_index_set_threads(ggml_vec_index_t * idx, int n_threads) {
     if (idx == nullptr || n_threads < 1 || n_threads > kMaxThreads) {
         return GGML_VEC_INDEX_E_INVALID_ARG;
