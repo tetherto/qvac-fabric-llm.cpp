@@ -113,8 +113,10 @@ inline constexpr size_t   kTvidRecordOffState     = 20;
 inline constexpr size_t   kTvidRecordOffWide      = 24;
 inline constexpr size_t   kMaxIndexLen    = static_cast<size_t>(std::numeric_limits<int>::max());
 inline constexpr uint64_t kMaxSnapshotBytes = UINT64_C(1) << 32;
-// Current TurboVec rotation builds a dense dim x dim QR matrix.
-inline constexpr int      kTurboVecMaxDim = 1024;
+// TurboVec 1.x (block-Hadamard rotation) accepts dims up to upstream MAX_DIM.
+inline constexpr int      kTurboVecMaxDim = 16384;
+// Legacy 0.9 TurboVec (v3 snapshots) builds a dense dim x dim QR rotation.
+inline constexpr int      kTurboVecLegacyMaxDim = 1024;
 inline constexpr int      kTurboVecMaxSerializedDim = 65536;
 inline constexpr float    kTurboVecMaxInputMagnitude = 1e16f;
 
@@ -228,12 +230,13 @@ struct ggml_vec_index {
     std::vector<float>  q8_scale;
     std::vector<uint8_t> q4_data;
     std::vector<float>   q4_scale;
-    bool turbovec_q2 = false;
-    std::vector<uint8_t> turbovec_q2_data;
-    std::vector<float>   turbovec_q2_scale;
-    bool turbovec_q4 = false;
-    std::vector<uint8_t> turbovec_q4_data;
-    std::vector<float>   turbovec_q4_scale;
+    // TurboVec code width (2, 3 or 4); 0 for every other storage mode.
+    int turbovec_bits = 0;
+    // True for an index loaded from a v3 snapshot: it keeps the turbovec 0.9
+    // QR rotation, codebook and first-add calibration it was written with.
+    bool turbovec_legacy = false;
+    std::vector<uint8_t> turbovec_data;
+    std::vector<float>   turbovec_scale;
     std::vector<float>   turbovec_tqplus_shift;
     std::vector<float>   turbovec_tqplus_scale;
     std::vector<uint8_t> turbovec_blocked_data;
@@ -394,23 +397,19 @@ bool delta_log_path_key(const char * path, std::string & out);
 void invalidate_ivf(ggml_vec_index & idx);
 bool is_q8(const ggml_vec_index & idx);
 bool is_q4(const ggml_vec_index & idx);
+bool is_turbovec(const ggml_vec_index & idx);
 bool is_turbovec_q2(const ggml_vec_index & idx);
 bool is_turbovec_q4(const ggml_vec_index & idx);
 bool is_quantized(const ggml_vec_index & idx);
 uint8_t storage_kind(const ggml_vec_index & idx);
 size_t q4_row_bytes(size_t dim);
-size_t turbovec_q2_row_bytes(size_t dim);
-size_t turbovec_q2_scale_count(size_t dim);
-size_t turbovec_q4_row_bytes(size_t dim);
-size_t turbovec_q4_scale_count(size_t dim);
+size_t turbovec_row_bytes(int bits, size_t dim);
 size_t vector_bytes(const ggml_vec_index & idx);
 bool slot_is_active(const ggml_vec_index & idx, size_t slot);
 size_t active_count(const ggml_vec_index & idx);
 const float * f32_data_ptr(const ggml_vec_index & idx);
 const int8_t * q8_data_ptr(const ggml_vec_index & idx);
 const uint8_t * q4_data_ptr(const ggml_vec_index & idx);
-const uint8_t * turbovec_q2_data_ptr(const ggml_vec_index & idx);
-const uint8_t * turbovec_q4_data_ptr(const ggml_vec_index & idx);
 bool has_vector_storage(const ggml_vec_index & idx);
 int q4_decode(uint8_t nibble);
 void quantize_q8_row(const float * src, int8_t * dst, int dim, float & scale);
@@ -418,12 +417,11 @@ void quantize_q4_row(const float * src, uint8_t * dst, int dim, float & scale);
 float quantization_scale(float max_abs, float divisor);
 void quantize_q8_values(const float * src, int8_t * dst, size_t n, float scale);
 void quantize_q4_values(const float * src, uint8_t * dst, size_t offset, size_t n, float scale);
-bool turbovec_q2_supported_dim(int dim);
-bool turbovec_q4_supported_dim(int dim);
+bool turbovec_supported_dim(int dim, bool legacy);
 bool turbovec_serialized_dim_supported(int dim);
-ggml_vec_index_t * ggml_vec_index_create_turbovec_for_load(int dim, int bit_width);
-void turbovec_retain_rotation(int dim);
-void turbovec_release_rotation(int dim) noexcept;
+ggml_vec_index_t * ggml_vec_index_create_turbovec_for_load(int dim, int bit_width, bool legacy);
+void turbovec_retain_rotation(int dim, bool legacy);
+void turbovec_release_rotation(int dim, bool legacy) noexcept;
 #ifdef GGML_VEC_INDEX_TEST_HOOKS
 uint64_t turbovec_ziggurat_table_hash_for_test(void);
 double turbovec_ziggurat_x_for_test(int index);
@@ -456,13 +454,46 @@ int turbovec_avx2_available_for_test();
 int turbovec_avx2_lut_block_matches_scalar_for_test(int bits, int dim);
 void turbovec_reset_block_score_call_count_for_test(void);
 int64_t turbovec_block_score_call_count_for_test(void);
+void turbovec_hadamard_rotate_for_test(const float * src, float * dst, int dim);
+int turbovec_index_hashes_for_test(
+    const ggml_vec_index_t * idx,
+    uint64_t * codes_hash,
+    uint64_t * scales_hash,
+    uint64_t * shift_hash,
+    uint64_t * scale_hash);
 #endif
-void prepare_turbovec(int bits, int dim);
-void rotate_turbovec_query(const float * src, float * dst, int dim);
+void prepare_turbovec(int bits, int dim, bool legacy);
+void rotate_turbovec_query(bool legacy, const float * src, float * dst, int dim);
 void rotate_turbovec_queries(
+    bool legacy,
     const float * src,
     float * dst,
     int n_queries,
+    int dim);
+void decode_turbovec_row_calibrated(
+    int bits,
+    bool legacy,
+    const uint8_t * codes,
+    const float * scales,
+    const float * tqplus_shift,
+    const float * tqplus_scale,
+    float * dst,
+    int dim);
+void build_turbovec_lut(
+    int bits,
+    bool legacy,
+    const float * rotated_query,
+    int dim,
+    std::vector<uint8_t> & lut,
+    float & scale,
+    float & bias);
+float dot_turbovec_bits_lut_row(
+    const uint8_t * lut,
+    float lut_scale,
+    float lut_bias,
+    const uint8_t * codes,
+    const float * scales,
+    int bits,
     int dim);
 void quantize_turbovec_q2_row(const float * src, uint8_t * dst, float * scales, int dim);
 void quantize_turbovec_batch(
@@ -474,6 +505,59 @@ void quantize_turbovec_batch(
     int dim,
     std::vector<float> & tqplus_shift,
     std::vector<float> & tqplus_scale);
+void quantize_turbovec_hadamard_batch(
+    const float * src,
+    int n,
+    int bits,
+    uint8_t * dst,
+    float * scales,
+    int dim,
+    const std::vector<float> & tqplus_shift,
+    const std::vector<float> & tqplus_scale);
+int fit_turbovec_calibration(
+    const float * sample,
+    int n,
+    int bits,
+    int dim,
+    std::vector<float> & out_shift,
+    std::vector<float> & out_scale);
+void reencode_turbovec_rows(
+    int bits,
+    int dim,
+    size_t n,
+    const uint8_t * codes,
+    const float * scales,
+    const std::vector<float> & old_shift,
+    const std::vector<float> & old_scale,
+    const std::vector<float> & new_shift,
+    const std::vector<float> & new_scale,
+    std::vector<uint8_t> & out_codes,
+    std::vector<float> & out_scales);
+void turbovec_codebook_values(
+    int bits,
+    int dim,
+    bool legacy,
+    std::vector<float> & boundaries,
+    std::vector<float> & centroids);
+// Packed bit-plane row <-> sequential row (one byte per group of 8 / bits
+// codes, 3-bit codes in 4-bit fields), the code layout upstream files store.
+void turbovec_packed_row_to_seq(const uint8_t * packed, int bits, int dim, uint8_t * seq);
+void turbovec_seq_row_to_packed(const uint8_t * seq, int bits, int dim, uint8_t * packed);
+
+// Upstream turbovec v8 snapshot pieces: the superblock, the used prefix of
+// header slot 0, and the block units. The full image is superblock, two
+// header_len slots (slot 0 starts with header0, the rest is zero), units.
+struct TurboVecV8Image {
+    std::vector<uint8_t> superblock;
+    std::vector<uint8_t> header0;
+    size_t header_len = 0;
+    std::vector<uint8_t> units;
+};
+bool turbovec_v8_magic(const uint8_t * bytes, size_t size);
+void turbovec_v8_build_image(const ggml_vec_index & idx, TurboVecV8Image & image);
+size_t turbovec_v8_image_size(const TurboVecV8Image & image);
+void turbovec_v8_flatten_image(const TurboVecV8Image & image, std::vector<uint8_t> & out);
+ggml_vec_index_t * turbovec_v8_load_image(std::vector<uint8_t> raw, int & error);
 void decode_turbovec_q2_row(const uint8_t * codes, const float * scales, float * dst, int dim);
 void decode_turbovec_q2_row_calibrated(
     const uint8_t * codes,
