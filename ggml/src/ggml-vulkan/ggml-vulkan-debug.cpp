@@ -1407,6 +1407,10 @@ void ggml_vk_check_results_0(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph
             tensor_clone = ggml_affine_prelu(ggml_ctx, src_clone[0], src_clone[1], src_clone[2], src_clone[3]);
         } else if (tensor->op == GGML_OP_SNAKE) {
             tensor_clone = ggml_snake(ggml_ctx, src_clone[0], src_clone[1], src_clone[2]);
+        } else if (tensor->op == GGML_OP_LSTM_CELL) {
+            tensor_clone = tensor->src[2]
+                             ? ggml_lstm_cell_masked(ggml_ctx, src_clone[0], src_clone[1], src_clone[2])
+                             : ggml_lstm_cell(ggml_ctx, src_clone[0], src_clone[1]);
         } else if (tensor->op == GGML_OP_SSM_CONV_BACK_SX) {
             tensor_clone = ggml_ssm_conv_back_sx(ggml_ctx, src_clone[0], src_clone[1], tensor);
         } else if (tensor->op == GGML_OP_SSM_CONV_BACK_C) {

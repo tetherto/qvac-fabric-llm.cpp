@@ -831,6 +831,11 @@ struct vk_op_channel_pointwise_push_constants {
 struct vk_op_pad_replicate_1d_push_constants {
     uint32_t ne, L_in, L_out, C, layout, pad_left;
 };
+
+struct vk_op_lstm_cell_push_constants {
+    uint32_t H, N, prev_row, c_base, mask_stride;
+    uint32_t gates_offset, prev_offset, mask_offset, dst_offset;
+};
 struct vk_op_ssm_conv_back_sx_push_constants {
     uint32_t grad_nb0, grad_nb1, grad_nb2;
     uint32_t c_nb1;
