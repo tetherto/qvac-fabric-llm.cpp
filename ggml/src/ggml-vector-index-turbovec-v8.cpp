@@ -821,7 +821,8 @@ ggml_vec_index_t * turbovec_v8_load_image(std::vector<uint8_t> raw, int & error,
         geo.bits,
         dim,
         idx->turbovec_blocked_data,
-        idx->turbovec_blocked_n_blocks);
+        idx->turbovec_blocked_n_blocks,
+        idx->turbovec_blocked_vm);
     rebuild_state_hash(*idx);
     if (info != nullptr) {
         info->gen = chosen->gen;

@@ -484,7 +484,17 @@ struct TurboVecQueryLut {
     float scale;
     float bias;
     const float * score_query;
+    // Set when 4-bit codes score with permute-dot arithmetic instead.
+    const TurboVecPermuteDot * permute_dot = nullptr;
 };
+
+// Upstream turbovec scores 4-bit codes with its permute-dot kernels on
+// hosts that run them (turbovec_cpu_vector_major) and with the nibble LUT
+// elsewhere; the two round differently, so this follows the same split.
+bool turbovec_uses_permute_dot(const ggml_vec_index_t & idx) {
+    // Decided with the blocked layout when the index was created.
+    return idx.turbovec_blocked_vm;
+}
 
 // Scores blocks [block_begin, block_end) straight into the top-k heap,
 // skipping tombstones, blocks with no allowed slot and disallowed slots.
@@ -514,6 +524,17 @@ void score_turbovec_block_range(
 #ifdef GGML_VEC_INDEX_TEST_HOOKS
         g_turbovec_block_score_calls.fetch_add(1, std::memory_order_relaxed);
 #endif
+        if (query.permute_dot != nullptr) {
+            score_turbovec_permute_dot_block(
+                *query.permute_dot,
+                idx.turbovec_blocked_data.data(),
+                vector_scales,
+                block,
+                n_slots,
+                idx.dim,
+                idx.turbovec_blocked_vm,
+                block_scores.data());
+        } else
 #if defined(GGML_VEC_INDEX_HAVE_AVX2_KERNEL) && !GGML_VEC_INDEX_USE_NEON && GGML_VEC_INDEX_TURBOVEC_AVX2_LAYOUT
         if (has_turbovec_avx2) {
             ggml_vec_index_detail::score_turbovec_lut_block_avx2(
@@ -549,7 +570,7 @@ void score_turbovec_block_range(
                 continue;
             }
             float score = block_scores[lane];
-            if (!std::isfinite(score)) {
+            if (!std::isfinite(score) && query.permute_dot == nullptr) {
                 score = score_slot(idx, query.score_query, slot, 0.0, query.lut, query.scale, query.bias);
             }
             update_topk_heap(heap, k, { score, idx.slot_to_id[slot] });
@@ -621,6 +642,12 @@ void search_one(
         build_turbovec_lut(
             idx.turbovec_bits, idx.turbovec_legacy, score_query, idx.dim, turbovec_lut, turbovec_lut_scale, turbovec_lut_bias);
         turbovec_lut_bias += tqplus_bias;
+        TurboVecPermuteDot permute_dot;
+        const bool use_permute_dot = turbovec_uses_permute_dot(idx);
+        if (use_permute_dot) {
+            build_turbovec_permute_dot(score_query, idx.dim, permute_dot);
+            permute_dot.bias = tqplus_bias;
+        }
 
         const int bits = idx.turbovec_bits;
         const size_t n_byte_groups =
@@ -659,6 +686,7 @@ void search_one(
             }
             const TurboVecQueryLut query_lut = {
                 turbovec_lut.data(), turbovec_lut_scale, turbovec_lut_bias, score_query,
+                use_permute_dot ? &permute_dot : nullptr,
             };
             const uint8_t * block_filter = allowed_blocks.empty() ? nullptr : allowed_blocks.data();
             const size_t n_blocks = idx.turbovec_blocked_n_blocks;
@@ -720,6 +748,7 @@ struct TurboVecBatch4Scratch {
     std::array<std::vector<ScoreId>, 4> heaps;
     std::array<std::vector<float>, 4> calibrated_queries;
     std::array<std::vector<uint8_t>, 4> luts;
+    std::array<TurboVecPermuteDot, 4> permute_dots;
 };
 
 void search_turbovec_four_queries(
@@ -764,6 +793,11 @@ void search_turbovec_four_queries(
             tqplus_bias = static_cast<float>(bias_correction);
         }
 
+        if (turbovec_uses_permute_dot(idx)) {
+            build_turbovec_permute_dot(score_queries[query], idx.dim, scratch.permute_dots[query]);
+            scratch.permute_dots[query].bias = tqplus_bias;
+            continue;
+        }
         build_turbovec_lut(
             bits,
             idx.turbovec_legacy,
@@ -775,6 +809,9 @@ void search_turbovec_four_queries(
         lut_biases[query] += tqplus_bias;
         lut_ptrs[query] = scratch.luts[query].data();
     }
+    const TurboVecPermuteDot * pds[4] = {
+        &scratch.permute_dots[0], &scratch.permute_dots[1], &scratch.permute_dots[2], &scratch.permute_dots[3],
+    };
 
     const float * vector_scales = idx.turbovec_scale.data();
     std::array<std::array<float, 32>, 4> block_scores{};
@@ -788,23 +825,35 @@ void search_turbovec_four_queries(
 #ifdef GGML_VEC_INDEX_TEST_HOOKS
         g_turbovec_block_score_calls.fetch_add(1, std::memory_order_relaxed);
 #endif
-        score_turbovec_lut_block_4(
-            lut_ptrs,
-            lut_scales,
-            lut_biases,
-            idx.turbovec_blocked_data.data(),
-            vector_scales,
-            block,
-            n_slots,
-            bits,
-            idx.dim,
-            block_score_ptrs);
+        if (turbovec_uses_permute_dot(idx)) {
+            score_turbovec_permute_dot_block_4(
+                pds,
+                idx.turbovec_blocked_data.data(),
+                vector_scales,
+                block,
+                n_slots,
+                idx.dim,
+                idx.turbovec_blocked_vm,
+                block_score_ptrs);
+        } else {
+            score_turbovec_lut_block_4(
+                lut_ptrs,
+                lut_scales,
+                lut_biases,
+                idx.turbovec_blocked_data.data(),
+                vector_scales,
+                block,
+                n_slots,
+                bits,
+                idx.dim,
+                block_score_ptrs);
+        }
         const size_t base_slot = block * 32;
         const size_t count = std::min(static_cast<size_t>(32), n_slots - base_slot);
         for (int query = 0; query < 4; ++query) {
             for (size_t lane = 0; lane < count; ++lane) {
                 float score = block_scores[query][lane];
-                if (!std::isfinite(score)) {
+                if (!std::isfinite(score) && !turbovec_uses_permute_dot(idx)) {
                     score = score_slot(
                         idx,
                         score_queries[query],

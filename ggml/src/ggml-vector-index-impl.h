@@ -323,6 +323,9 @@ struct ggml_vec_index {
     // True for an index loaded from a v3 snapshot: it keeps the turbovec 0.9
     // QR rotation, codebook and first-add calibration it was written with.
     bool turbovec_legacy = false;
+    // The blocked cache uses upstream's vector-major layout (1.x 4-bit
+    // indexes on hosts that score with permute-dot); fixed at creation.
+    bool turbovec_blocked_vm = false;
     // Bumped by every calibrate; a sync across one rewrites the whole file.
     uint64_t turbovec_calib_gen = 0;
     TurboVecSyncBinding turbovec_sync;
@@ -550,6 +553,8 @@ int turbovec_sync_plan_for_test(
     ggml_vec_index_t * idx,
     const char * path,
     std::vector<std::vector<std::pair<uint64_t, std::vector<uint8_t>>>> & batches);
+void turbovec_force_vector_major_for_test(int mode);
+void turbovec_disable_dot_product_for_test(int disabled);
 int turbovec_index_hashes_for_test(
     const ggml_vec_index_t * idx,
     uint64_t * codes_hash,
@@ -557,6 +562,43 @@ int turbovec_index_hashes_for_test(
     uint64_t * shift_hash,
     uint64_t * scale_hash);
 #endif
+// Whether this CPU runs upstream turbovec's dot-product ("vector-major")
+// kernels: aarch64 with dot product, x86 with AVX-512 F/BW/VBMI/VNNI. Those
+// hosts score 4-bit codes with int8 permute-dot arithmetic.
+bool turbovec_cpu_vector_major();
+// The CPU's own dot-product support, which a test override cannot change:
+// gates the SDOT instructions themselves.
+bool turbovec_cpu_dot_product();
+
+// One query quantized for the 4-bit permute-dot score (upstream
+// `QueryPermuteDot`): sum_d weight[d] * level[code[d]] in int32, then
+// fma(sum, scale, bias) times the vector's scale.
+struct TurboVecPermuteDot {
+    int8_t levels[16] = {};
+    std::vector<int8_t> weights;
+    float scale = 1.0f;
+    float bias = 0.0f;
+};
+void build_turbovec_permute_dot(const float * query, int dim, TurboVecPermuteDot & out);
+void score_turbovec_permute_dot_block(
+    const TurboVecPermuteDot & pd,
+    const uint8_t * blocked_codes,
+    const float * vector_scales,
+    size_t block_index,
+    size_t n_vectors,
+    int dim,
+    bool vector_major,
+    float * out_scores);
+// Four queries over one block, sharing the code loads (NEON vector-major).
+void score_turbovec_permute_dot_block_4(
+    const TurboVecPermuteDot * const * pds,
+    const uint8_t * blocked_codes,
+    const float * vector_scales,
+    size_t block_index,
+    size_t n_vectors,
+    int dim,
+    bool vector_major,
+    float * const * out_scores);
 void prepare_turbovec(int bits, int dim, bool legacy);
 void rotate_turbovec_query(bool legacy, const float * src, float * dst, int dim);
 void rotate_turbovec_queries(
@@ -717,7 +759,8 @@ void repack_turbovec_codes(
     int bits,
     int dim,
     std::vector<uint8_t> & blocked_codes,
-    size_t & n_blocks);
+    size_t & n_blocks,
+    bool vector_major = false);
 void repack_turbovec_codes_from_slot(
     const uint8_t * packed_codes,
     size_t n_vectors,
@@ -725,7 +768,8 @@ void repack_turbovec_codes_from_slot(
     int dim,
     size_t first_slot,
     std::vector<uint8_t> & blocked_codes,
-    size_t & n_blocks);
+    size_t & n_blocks,
+    bool vector_major = false);
 void score_turbovec_lut_block(
     const uint8_t * lut,
     float lut_scale,

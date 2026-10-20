@@ -123,6 +123,16 @@ their codes. Pass a random, representative sample of about 1000 vectors, and
 calibrate before adding when possible: re-encoding stored rows is a second
 quantization. An index that is never calibrated is plain TurboQuant.
 `ggml_vec_index_prepare` is best-effort and does not report allocation status.
+
+Like upstream, 4-bit search picks its arithmetic by host. On aarch64 with the
+dot-product extension, 4-bit codes are scored with upstream's int8
+permute-dot arithmetic (an SDOT kernel over upstream's vector-major block
+layout); elsewhere they are scored through the nibble lookup tables, as 2-
+and 3-bit codes always are. The two round differently, so 4-bit scores, and
+occasionally which ids sit at the edge of a top-k, depend on the host exactly
+as upstream's do. Upstream also uses permute-dot on x86 with AVX-512 VBMI
+and VNNI; this port keeps the lookup tables there for now.
+
 Search keeps a 32-vector blocked copy of the packed codes in memory for
 NEON/AVX2 LUT scoring; this cache is updated after adds and rebuilt after
 compaction, calibration and snapshot loading.

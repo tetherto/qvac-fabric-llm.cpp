@@ -340,6 +340,7 @@ static ggml_vec_index_t * ggml_vec_index_create_turbovec_impl(
         idx->bit_width = bit_width;
         idx->turbovec_bits = bit_width;
         idx->turbovec_legacy = legacy;
+        idx->turbovec_blocked_vm = !legacy && bit_width == 4 && turbovec_cpu_vector_major();
         idx->filter_cookie = g_next_filter_cookie.fetch_add(1, std::memory_order_relaxed);
         if (idx->filter_cookie == 0) {
             idx->filter_cookie = g_next_filter_cookie.fetch_add(1, std::memory_order_relaxed);
@@ -656,7 +657,8 @@ int ggml_vec_index_add_unlocked(
                 idx->dim,
                 base_slot,
                 idx->turbovec_blocked_data,
-                idx->turbovec_blocked_n_blocks);
+                idx->turbovec_blocked_n_blocks,
+                idx->turbovec_blocked_vm);
         }
         for (size_t slot = base_slot; slot < new_slots; ++slot) {
             add_state_hash(*idx, slot_state_hash(*idx, slot));
@@ -850,7 +852,8 @@ static int ggml_vec_index_compact_unlocked(ggml_vec_index_t * idx) {
                     idx->turbovec_bits,
                     idx->dim,
                     new_turbovec_blocked_data,
-                    new_turbovec_blocked_n_blocks);
+                    new_turbovec_blocked_n_blocks,
+                    idx->turbovec_blocked_vm);
             }
             idx->turbovec_data.swap(new_data);
             idx->turbovec_scale.swap(new_scales);
@@ -1421,7 +1424,8 @@ int ggml_vec_index_turbovec_calibrate(ggml_vec_index_t * idx, const float * samp
                 codes,
                 scales,
                 idx->n_threads);
-            repack_turbovec_codes(codes.data(), n_slots, idx->turbovec_bits, idx->dim, blocked, n_blocks);
+            repack_turbovec_codes(
+                codes.data(), n_slots, idx->turbovec_bits, idx->dim, blocked, n_blocks, idx->turbovec_blocked_vm);
         }
 
         idx->turbovec_tqplus_shift.swap(shift);

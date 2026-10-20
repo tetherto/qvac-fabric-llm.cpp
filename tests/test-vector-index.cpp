@@ -83,6 +83,8 @@ void turbovec_reset_block_score_call_count_for_test(void);
 int64_t turbovec_block_score_call_count_for_test(void);
 uint64_t turbovec_ziggurat_table_hash_for_test(void);
 void turbovec_hadamard_rotate_for_test(const float * src, float * dst, int dim);
+void turbovec_force_vector_major_for_test(int mode);
+void turbovec_disable_dot_product_for_test(int disabled);
 int turbovec_sync_plan_for_test(
     ggml_vec_index_t * idx,
     const char * path,
@@ -130,6 +132,7 @@ constexpr int kTurboVecMaxTestDim = 16384;
 #include "turbovec-golden-dim256-q2.inc"
 #include "turbovec-golden-dim256-q4.inc"
 #include "turbovec-1x-golden.inc"
+#include "turbovec-1x-golden-vm.inc"
 
 #define CHECK(cond)                                                            \
     do {                                                                       \
@@ -4493,7 +4496,7 @@ std::vector<uint8_t> tv1x_snapshot_bytes(ggml_vec_index_t * idx, const char * na
     return bytes;
 }
 
-void tv1x_check_search(
+bool tv1x_search_matches(
         ggml_vec_index_t * idx,
         const std::vector<float> & queries,
         const uint64_t * expected_ids,
@@ -4503,13 +4506,46 @@ void tv1x_check_search(
     CHECK(ggml_vec_index_search(idx, queries.data(), kTv1xNQuery, kTv1xK, scores.data(), ids.data()) ==
           GGML_VEC_INDEX_OK);
     for (size_t i = 0; i < ids.size(); ++i) {
-        CHECK(ids[i] == expected_ids[i]);
-        const float tolerance = 1e-5f * std::max(1.0f, std::fabs(expected_scores[i]));
-        CHECK(std::fabs(scores[i] - expected_scores[i]) <= tolerance);
+        if (ids[i] != expected_ids[i] || scores[i] != expected_scores[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+const Tv1xVmCase * tv1x_vm_case(int dim) {
+    for (const Tv1xVmCase & c : kTv1xVmCases) {
+        if (c.dim == dim) {
+            return &c;
+        }
+    }
+    return nullptr;
+}
+
+// Upstream scores 4-bit codes with its permute-dot kernel on hosts that run
+// it and with the nibble LUT elsewhere; this port makes the same choice when
+// an index is created. `kernel` names the expected one: 0 LUT, 1 permute-dot,
+// -1 whichever this host picked.
+void tv1x_check_search(
+        ggml_vec_index_t * idx,
+        int bits,
+        int kernel,
+        const std::vector<float> & queries,
+        const uint64_t * lut_ids,
+        const float * lut_scores,
+        const uint64_t * vm_ids,
+        const float * vm_scores) {
+    if (bits != 4 || kernel == 0) {
+        CHECK(tv1x_search_matches(idx, queries, lut_ids, lut_scores));
+    } else if (kernel == 1) {
+        CHECK(tv1x_search_matches(idx, queries, vm_ids, vm_scores));
+    } else {
+        CHECK(tv1x_search_matches(idx, queries, lut_ids, lut_scores) ||
+              tv1x_search_matches(idx, queries, vm_ids, vm_scores));
     }
 }
 
-void check_turbovec_1x_golden_case(const Tv1xIndexCase & c) {
+void check_turbovec_1x_golden_case(const Tv1xIndexCase & c, int kernel) {
     const size_t dim = static_cast<size_t>(c.dim);
     std::vector<float> db = tv1x_rows(kTv1xSeedDb, kTv1xNDb, dim);
     std::fill(db.begin(), db.begin() + static_cast<std::ptrdiff_t>(dim), 0.0f);
@@ -4522,7 +4558,11 @@ void check_turbovec_1x_golden_case(const Tv1xIndexCase & c) {
     CHECK(ggml_vec_index_bit_width(plain) == c.bits);
     CHECK(ggml_vec_index_add(plain, db.data(), kTv1xNDb, ids.data()) == GGML_VEC_INDEX_OK);
     CHECK(ggml_vec_index_turbovec_is_calibrated(plain) == 0);
-    tv1x_check_search(plain, queries, c.search_ids, c.search_scores);
+    const Tv1xVmCase * vm = c.bits == 4 ? tv1x_vm_case(c.dim) : nullptr;
+    CHECK(c.bits != 4 || vm != nullptr);
+    tv1x_check_search(
+        plain, c.bits, kernel, queries, c.search_ids, c.search_scores,
+        vm != nullptr ? vm->search_ids : nullptr, vm != nullptr ? vm->search_scores : nullptr);
     const std::vector<uint8_t> plain_bytes = tv1x_snapshot_bytes(plain, "ggml-vector-index-tv1x-plain.tvim");
     CHECK(plain_bytes.size() == c.snapshot_len);
     CHECK(tv1x_fnv(plain_bytes.data(), plain_bytes.size()) == c.snapshot_hash);
@@ -4532,7 +4572,9 @@ void check_turbovec_1x_golden_case(const Tv1xIndexCase & c) {
     CHECK(ggml_vec_index_turbovec_calibrate(calibrated, calib.data(), kTv1xNCalib) == GGML_VEC_INDEX_OK);
     CHECK(ggml_vec_index_turbovec_is_calibrated(calibrated) == 1);
     CHECK(ggml_vec_index_add(calibrated, db.data(), kTv1xNDb, ids.data()) == GGML_VEC_INDEX_OK);
-    tv1x_check_search(calibrated, queries, c.calibrated_search_ids, c.calibrated_search_scores);
+    tv1x_check_search(
+        calibrated, c.bits, kernel, queries, c.calibrated_search_ids, c.calibrated_search_scores,
+        vm != nullptr ? vm->calibrated_search_ids : nullptr, vm != nullptr ? vm->calibrated_search_scores : nullptr);
     const std::vector<uint8_t> calibrated_bytes =
         tv1x_snapshot_bytes(calibrated, "ggml-vector-index-tv1x-calibrated.tvim");
     CHECK(calibrated_bytes.size() == c.calibrated_snapshot_len);
@@ -4932,9 +4974,9 @@ void check_turbovec_1x_sync_case(const Tv1xSyncCase & c) {
     CHECK(ggml_vec_index_len(loaded) == 120 - 7 + 10);
     CHECK(ggml_vec_index_search(loaded, queries.data(), kTv1xNQuery, kTv1xK, scores.data(), out.data()) ==
           GGML_VEC_INDEX_OK);
-    for (size_t i = 0; i < out.size(); ++i) {
-        CHECK(out[i] == c.final_ids[i]);
-    }
+    const bool lut_ids = std::equal(out.begin(), out.end(), c.final_ids);
+    const bool vm_ids = c.bits == 4 && std::equal(out.begin(), out.end(), kTv1xVmSyncFinalIds4);
+    CHECK(lut_ids || vm_ids);
 
     // The loaded index is bound to the file and syncs on incrementally.
     CHECK(ggml_vec_index_remove(loaded, ids[3]) == GGML_VEC_INDEX_OK);
@@ -5632,9 +5674,53 @@ void check_turbovec_1x_reordered_and_stale_commits() {
 }
 #endif
 
+#ifdef GGML_VEC_INDEX_TEST_HOOKS
+// The portable permute-dot kernel and the SDOT one accumulate the same
+// integers, in both blocked layouts, including after swap-removes.
+void check_turbovec_1x_permute_dot_kernels() {
+    constexpr int dim = 200;
+    const std::vector<float> rows = tv1x_rows(kTv1xSeedDb, 150, dim);
+    const std::vector<uint64_t> ids = tv1x_ids(150);
+    const std::vector<float> queries = tv1x_rows(kTv1xSeedQuery, 6, dim);
+    turbovec_force_vector_major_for_test(1);
+    auto * tv = ggml_vec_index_create_turbovec(dim, 4);
+    turbovec_force_vector_major_for_test(-1);
+    CHECK(ggml_vec_index_add(tv, rows.data(), 150, ids.data()) == GGML_VEC_INDEX_OK);
+    for (const size_t i : { 4, 77, 149, 30 }) {
+        CHECK(ggml_vec_index_remove(tv, ids[i]) == GGML_VEC_INDEX_OK);
+    }
+    std::vector<float> scores[2];
+    std::vector<uint64_t> out[2];
+    for (int scalar = 0; scalar < 2; ++scalar) {
+        turbovec_disable_dot_product_for_test(scalar);
+        scores[scalar].resize(6 * 12 + 12);
+        out[scalar].resize(scores[scalar].size());
+        CHECK(ggml_vec_index_search(tv, queries.data(), 6, 12, scores[scalar].data(), out[scalar].data()) ==
+              GGML_VEC_INDEX_OK);
+        CHECK(ggml_vec_index_search(tv, queries.data(), 1, 12, scores[scalar].data() + 72, out[scalar].data() + 72) ==
+              GGML_VEC_INDEX_OK);
+    }
+    turbovec_disable_dot_product_for_test(0);
+    CHECK(scores[0] == scores[1]);
+    CHECK(out[0] == out[1]);
+    ggml_vec_index_free(tv);
+}
+#endif
+
 void check_turbovec_1x() {
     for (const Tv1xIndexCase & c : kTv1xIndexCases) {
-        check_turbovec_1x_golden_case(c);
+#ifdef GGML_VEC_INDEX_TEST_HOOKS
+        // Each 4-bit kernel against its own fixture, on indexes built under it.
+        if (c.bits == 4) {
+            for (const int kernel : { 0, 1 }) {
+                turbovec_force_vector_major_for_test(kernel);
+                check_turbovec_1x_golden_case(c, kernel);
+            }
+            turbovec_force_vector_major_for_test(-1);
+            continue;
+        }
+#endif
+        check_turbovec_1x_golden_case(c, -1);
     }
     check_turbovec_1x_snapshot_interop();
     check_turbovec_1x_calibrate_api();
@@ -5659,6 +5745,8 @@ int main(int argc, char ** argv) {
 
 #ifdef GGML_VEC_INDEX_TEST_HOOKS
     if (argc == 2 && std::string(argv[1]) == "--internal-hooks") {
+        // Kernel-consistency checks below compare against the scalar LUT.
+        turbovec_force_vector_major_for_test(0);
         if (kTurboVecSupported) {
             {
                 constexpr int tv_cache_dim = 64;
@@ -5702,6 +5790,7 @@ int main(int argc, char ** argv) {
             check_turbovec_1x_torn_sync();
             check_turbovec_1x_failed_add_then_sync();
             check_turbovec_1x_reordered_and_stale_commits();
+            check_turbovec_1x_permute_dot_kernels();
             check_tqplus_deterministic_layout(
                 2,
                 UINT64_C(0xc4140782241d45eb),
