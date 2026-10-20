@@ -541,6 +541,60 @@ bool delta_verified_in(const std::vector<uint8_t> & raw, const Geo & geo, const 
 
 }  // namespace
 
+uint64_t turbovec_v8_declared_size(std::istream & f, uint64_t file_size) {
+    // The image size follows from the geometry and the row count, so a
+    // padded or sparse file never costs more memory than its image
+    // (upstream io_v7 `declared_len`, #487). Returns 0 when undecidable.
+    auto read_at = [&](uint64_t offset, uint8_t * out, size_t size) {
+        if (offset > file_size || file_size - offset < size) {
+            return false;
+        }
+        f.clear();
+        f.seekg(static_cast<std::streamoff>(offset), std::ios::beg);
+        f.read(reinterpret_cast<char *>(out), static_cast<std::streamsize>(size));
+        return static_cast<bool>(f) && f.gcount() == static_cast<std::streamsize>(size);
+    };
+    uint8_t head[24];
+    if (!read_at(0, head, sizeof(head)) || !turbovec_v8_magic(head, sizeof(head))) {
+        return 0;
+    }
+    Geo geo;
+    const bool v8 = std::memcmp(head, kV8Magic, 4) == 0;
+    geo.version = v8 ? 8 : 7;
+    geo.bits = head[5];
+    geo.kind = head[6];
+    geo.layout = v8 ? head[7] : kLayoutSeq;
+    if (geo.bits < 2 || geo.bits > 4 || geo.kind > 1 || geo.layout > kLayoutPlanes) {
+        return 0;
+    }
+    geo.dim = get_u32_le(head + geo.sb_fixed() - 16);
+    if (geo.dim == 0 || geo.dim % 8 != 0 || geo.dim > static_cast<size_t>(kTurboVecMaxDim)) {
+        return 0;
+    }
+    uint8_t n_calib_bytes[4];
+    if (!read_at(geo.sb_fixed() + (2 * geo.n_levels() - 1) * 4, n_calib_bytes, 4)) {
+        return 0;
+    }
+    geo.n_calib = get_u32_le(n_calib_bytes);
+    if (geo.n_calib != 0 && geo.n_calib != geo.dim) {
+        return 0;
+    }
+    uint64_t n = 0;
+    for (size_t slot = 0; slot < 2; ++slot) {
+        uint8_t count[8];
+        if (!read_at(geo.hdr_at(slot) + 8, count, sizeof(count))) {
+            return 0;
+        }
+        n = std::max(n, get_u64_le(count));
+    }
+    const uint64_t blocks = n / kBlock;
+    const uint64_t unit_len = geo.unit_len();
+    if (blocks > (UINT64_MAX - geo.unit_at(0)) / unit_len) {
+        return 0;
+    }
+    return std::min<uint64_t>(file_size, geo.unit_at(0) + blocks * unit_len);
+}
+
 ggml_vec_index_t * turbovec_v8_load_image(std::vector<uint8_t> raw, int & error, TurboVecV8LoadInfo * info) {
     error = GGML_VEC_INDEX_E_IO;
     if (raw.size() < 12 || !turbovec_v8_magic(raw.data(), raw.size())) {
@@ -757,8 +811,15 @@ ggml_vec_index_t * turbovec_v8_load_image(std::vector<uint8_t> raw, int & error,
     }
     idx->slot_active.assign(n, 1);
     idx->n_active = n;
-    idx->turbovec_tqplus_shift.swap(shift);
-    idx->turbovec_tqplus_scale.swap(scale);
+    // A stored identity pair declares no calibration (upstream
+    // `normalize_calibration`): the index is uncalibrated and writes none.
+    const bool identity =
+        std::all_of(shift.begin(), shift.end(), [](float v) { return v == 0.0f; }) &&
+        std::all_of(scale.begin(), scale.end(), [](float v) { return v == 1.0f; });
+    if (!identity) {
+        idx->turbovec_tqplus_shift.swap(shift);
+        idx->turbovec_tqplus_scale.swap(scale);
+    }
     repack_turbovec_codes(
         idx->turbovec_data.data(),
         n,
@@ -859,7 +920,6 @@ enum class CursorState { intact, foreign, replaced };
 int cursor_state(
         const char * path,
         const TurboVecSyncBinding & b,
-        const Geo & geo,
         CursorState & state,
         size_t & stale_used) {
     stale_used = 0;
@@ -899,6 +959,34 @@ int cursor_state(
         return GGML_VEC_INDEX_E_IO;
     }
     const size_t file_len = static_cast<size_t>(file_size);
+    // Parse the commits with the file's own geometry, not the index's: a
+    // calibrate since the last sync changes the index's superblock length,
+    // and reading the file through it would miss another writer's newer
+    // commits and treat the file as ours to rewrite.
+    Geo geo;
+    geo.kind = head[6];
+    geo.bits = head[5];
+    geo.dim = get_u32_le(head.data() + sb_fixed - 16);
+    if (geo.kind != kKindIdMap || geo.bits < 2 || geo.bits > 4 || geo.dim == 0 || geo.dim % 8 != 0 ||
+        geo.dim > static_cast<size_t>(kTurboVecMaxDim)) {
+        state = CursorState::replaced;
+        return GGML_VEC_INDEX_OK;
+    }
+    {
+        std::vector<uint8_t> n_calib_bytes;
+        uint64_t ignored = 0;
+        if (turbovec_read_file_range(path, sb_fixed + (2 * geo.n_levels() - 1) * 4, 4, n_calib_bytes, ignored) !=
+                GGML_VEC_INDEX_OK ||
+            n_calib_bytes.size() != 4) {
+            state = CursorState::replaced;
+            return GGML_VEC_INDEX_OK;
+        }
+        geo.n_calib = get_u32_le(n_calib_bytes.data());
+        if (geo.n_calib != 0 && geo.n_calib != geo.dim) {
+            state = CursorState::replaced;
+            return GGML_VEC_INDEX_OK;
+        }
+    }
 
     // Read each slot's used prefix: a commit without redo ops fits in the
     // probe length; one carrying ops widens to the whole slot once.
@@ -1169,12 +1257,11 @@ void turbovec_sync_note_compact(ggml_vec_index & idx) noexcept {
 
 int turbovec_v8_sync(ggml_vec_index & idx, const char * path) {
     TurboVecSyncBinding & b = idx.turbovec_sync;
-    const Geo geo = index_geo(idx);
     const bool bound = b.bound && filesystem_paths_equal(b.path.c_str(), path);
     CursorState state = CursorState::replaced;
     size_t stale_used = 0;
     if (bound) {
-        const int rc = cursor_state(path, b, geo, state, stale_used);
+        const int rc = cursor_state(path, b, state, stale_used);
         if (rc != GGML_VEC_INDEX_OK) {
             return rc;
         }
@@ -1231,7 +1318,7 @@ int turbovec_sync_plan_for_test(
     }
     CursorState state = CursorState::replaced;
     size_t stale_used = 0;
-    const int rc = cursor_state(path, b, index_geo(*idx), state, stale_used);
+    const int rc = cursor_state(path, b, state, stale_used);
     if (rc != GGML_VEC_INDEX_OK || state != CursorState::intact) {
         return GGML_VEC_INDEX_E_INVALID_ARG;
     }

@@ -57,7 +57,8 @@ the delta log, it returns `GGML_VEC_INDEX_E_PARTIAL_COMPACT`.
 
 TurboVec is a separate compressed search mode built on the same index API: a
 port of upstream [turbovec](https://github.com/ryancodrai/turbovec) 1.1.2 that
-encodes, snapshots and syncs byte for byte as turbovec does. Vectors and
+encodes, snapshots and syncs byte for byte as turbovec does (see Persistence
+for the one layout difference on large indexes). Vectors and
 queries are rotated into a quantization-friendly space, optional TQ+
 calibration and Lloyd-Max codebooks produce q2, q3 or q4 codes stored in
 bit-plane rows, and search builds lookup tables from the rotated query to score
@@ -216,7 +217,11 @@ calibration, two commit header slots, and one unit per 32-row block. Files are
 interchangeable with turbovec 1.1 and later in both directions; v7 files and
 v8 files in the bit-planes unit layout load too, and positional `.tv` files
 (no ids) are rejected. Row order follows upstream's swap-remove order, so a
-snapshot is byte-identical to the one turbovec writes for the same history.
+snapshot is byte-identical to the one turbovec writes for the same history,
+with one exception: from 32,768 vectors, at 2 or 4 bits and dimensions that
+are multiples of 32, turbovec on aarch64 and on x86 with AVX-512 VBMI and VNNI
+stores block units in its bit-planes layout, while this writer always uses
+the sequential layout. Both forms load in either implementation.
 Each header slot reserves room for 1024 pending removals, so even a small file
 carries a few hundred KiB of zero padding; the writer leaves it as a file hole
 where the filesystem supports one. v8 carries no checksum over the block

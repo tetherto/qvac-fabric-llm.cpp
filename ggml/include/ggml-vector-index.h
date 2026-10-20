@@ -94,7 +94,8 @@ GGML_VEC_INDEX_API ggml_vec_index_t * ggml_vec_index_create(int dim, int bit_wid
 
 // Creates a TurboQuant index with `bit_width` 2, 3 or 4: a port of upstream
 // turbovec 1.1.2 that encodes, snapshots and syncs byte for byte as turbovec
-// does. Vectors and queries are rotated with turbovec's deterministic
+// does (except that large indexes always store the sequential unit layout,
+// see docs/vector-index.md). Vectors and queries are rotated with turbovec's deterministic
 // block-Hadamard transform, quantized with Lloyd-Max codebooks (optionally
 // under a TQ+ calibration, see `ggml_vec_index_turbovec_calibrate`), and
 // searched against the rotated query without decoding. Requires a 64-bit

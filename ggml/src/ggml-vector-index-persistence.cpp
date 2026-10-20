@@ -436,6 +436,65 @@ int snapshot_write_v1_preflight(size_t n, size_t dim) {
     return GGML_VEC_INDEX_OK;
 }
 
+// Removes temp siblings of `path` that a killed writer left behind: names
+// of the form `<base>.tmp.<suffix>` with this file's suffix shapes, older
+// than an hour (upstream turbovec sweep_stale_tmps). Runs once per
+// destination per process; failures are ignored.
+static void sweep_stale_temp_files(const char * path) {
+    static std::mutex mutex;
+    static std::unordered_set<std::string> swept;
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        if (!swept.insert(path).second) {
+            return;
+        }
+    }
+    std::filesystem::path destination;
+    if (!filesystem_path_from_utf8(path, destination)) {
+        return;
+    }
+    const std::string base = destination.filename().string();
+    std::filesystem::path parent = destination.parent_path();
+    if (parent.empty()) {
+        parent = ".";
+    }
+    auto our_suffix = [](const std::string & suffix) {
+        // POSIX mkstemp: six alphanumerics. Windows: pid.tid.sequence.
+        if (suffix.size() == 6 &&
+            std::all_of(suffix.begin(), suffix.end(), [](char c) { return std::isalnum(static_cast<unsigned char>(c)) != 0; })) {
+            return true;
+        }
+        int dots = 0;
+        for (char c : suffix) {
+            if (c == '.') {
+                ++dots;
+            } else if (c < '0' || c > '9') {
+                return false;
+            }
+        }
+        return dots == 2;
+    };
+    std::error_code ec;
+    const auto now = std::filesystem::file_time_type::clock::now();
+    for (const auto & entry : std::filesystem::directory_iterator(parent, ec)) {
+        const std::string name = entry.path().filename().string();
+        const size_t at = name.rfind(".tmp.");
+        if (at == std::string::npos || !our_suffix(name.substr(at + 5))) {
+            continue;
+        }
+        // A long destination's temp carries a cut base: a prefix of it.
+        const std::string stem = name.substr(0, at);
+        if (stem.empty() || base.compare(0, stem.size(), stem) != 0) {
+            continue;
+        }
+        std::error_code entry_ec;
+        const auto modified = std::filesystem::last_write_time(entry.path(), entry_ec);
+        if (!entry_ec && now - modified > std::chrono::hours(1)) {
+            std::filesystem::remove(entry.path(), entry_ec);
+        }
+    }
+}
+
 struct TempFile {
     std::FILE * stream = nullptr;
 #ifdef _WIN32
@@ -452,6 +511,30 @@ struct TempFile {
 
 #ifdef _WIN32
 
+// A path past the legacy MAX_PATH limit takes the \\?\ form, which Windows
+// file APIs accept at any length, as Rust's std (and so upstream turbovec)
+// does. Directory APIs keep 12 characters of MAX_PATH for themselves.
+static std::wstring windows_long_path(const std::wstring & path) {
+    constexpr size_t kLegacyLimit = MAX_PATH - 12;
+    if (path.size() < kLegacyLimit || path.rfind(L"\\\\?\\", 0) == 0 || path.rfind(L"\\\\.\\", 0) == 0) {
+        return path;
+    }
+    const DWORD needed = GetFullPathNameW(path.c_str(), 0, nullptr, nullptr);
+    if (needed == 0) {
+        return path;
+    }
+    std::wstring full(needed, L'\0');
+    const DWORD written = GetFullPathNameW(path.c_str(), needed, full.data(), nullptr);
+    if (written == 0 || written >= needed) {
+        return path;
+    }
+    full.resize(written);
+    if (full.rfind(L"\\\\", 0) == 0) {
+        return L"\\\\?\\UNC\\" + full.substr(2);
+    }
+    return L"\\\\?\\" + full;
+}
+
 bool utf8_to_wide(const char * src, std::wstring & dst) {
     const int size = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, src, -1, nullptr, 0);
     if (size <= 0) {
@@ -461,11 +544,12 @@ bool utf8_to_wide(const char * src, std::wstring & dst) {
     if (MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, src, -1, buffer.data(), size) != size) {
         return false;
     }
-    dst.assign(buffer.data());
+    dst = windows_long_path(buffer.data());
     return true;
 }
 
 static bool open_temp_file(const char * path, TempFile & temp) {
+    sweep_stale_temp_files(path);
     std::wstring destination;
     if (!utf8_to_wide(path, destination)) {
         return false;
@@ -477,7 +561,17 @@ static bool open_temp_file(const char * path, TempFile & temp) {
                       static_cast<unsigned long>(GetCurrentProcessId()),
                       static_cast<unsigned long>(GetCurrentThreadId()),
                       static_cast<unsigned long long>(sequence.fetch_add(1)));
-        temp.path = destination + suffix;
+        // Keep the temp's file name within NAME_MAX for long destinations.
+        std::wstring base = destination;
+        const size_t name_at = base.find_last_of(L"\\/") == std::wstring::npos ? 0 : base.find_last_of(L"\\/") + 1;
+        const size_t suffix_len = std::wcslen(suffix);
+        if (base.size() - name_at + suffix_len > 255 && suffix_len < 255) {
+            base.resize(name_at + 255 - suffix_len);
+            if (!base.empty() && base.back() >= 0xd800 && base.back() <= 0xdbff) {
+                base.pop_back();
+            }
+        }
+        temp.path = base + suffix;
 
         int fd = -1;
         const errno_t error = _wsopen_s(&fd, temp.path.c_str(), _O_CREAT | _O_EXCL | _O_RDWR | _O_BINARY | _O_NOINHERIT,
@@ -536,8 +630,29 @@ constexpr int kOpenNoFollow = O_NOFOLLOW;
 constexpr int kOpenNoFollow = 0;
 #    endif
 
+// Longest file name a temp sibling may take (NAME_MAX on common
+// filesystems); a long destination name is cut, on a UTF-8 boundary, to
+// fit the suffix instead of failing the write.
+constexpr size_t kTempNameMax = 255;
+
+static std::string temp_sibling_base(const char * path, size_t suffix_len) {
+    const std::string full(path);
+    const size_t slash = full.find_last_of('/');
+    const size_t name_at = slash == std::string::npos ? 0 : slash + 1;
+    const size_t name_len = full.size() - name_at;
+    if (name_len + suffix_len <= kTempNameMax || suffix_len >= kTempNameMax) {
+        return full;
+    }
+    size_t cut = kTempNameMax - suffix_len;
+    while (cut > 0 && (static_cast<unsigned char>(full[name_at + cut]) & 0xc0) == 0x80) {
+        --cut;
+    }
+    return full.substr(0, name_at + cut);
+}
+
 static bool open_temp_file(const char * path, TempFile & temp) {
-    std::string pattern = std::string(path) + ".tmp.XXXXXX";
+    sweep_stale_temp_files(path);
+    std::string pattern = temp_sibling_base(path, std::strlen(".tmp.XXXXXX")) + ".tmp.XXXXXX";
     std::vector<char> mutable_path(pattern.begin(), pattern.end());
     mutable_path.push_back('\0');
     const int fd = ::mkstemp(mutable_path.data());
@@ -662,11 +777,25 @@ static bool rename_overwrite(const TempFile & temp, const char * dst) {
     if (!utf8_to_wide(dst, destination)) {
         return false;
     }
-    if (GetFileAttributesW(destination.c_str()) != INVALID_FILE_ATTRIBUTES) {
-        return ReplaceFileW(destination.c_str(), temp.path.c_str(), nullptr, REPLACEFILE_WRITE_THROUGH, nullptr,
-                            nullptr) != 0;
+    // A reader or scanner holding the destination open makes the replace
+    // fail transiently with access-denied or sharing-violation; retry with
+    // backoff, as upstream turbovec's rename_atomic does (#415).
+    DWORD delay_ms = 1;
+    for (int attempt = 0;; ++attempt) {
+        const bool ok = GetFileAttributesW(destination.c_str()) != INVALID_FILE_ATTRIBUTES ?
+            ReplaceFileW(destination.c_str(), temp.path.c_str(), nullptr, REPLACEFILE_WRITE_THROUGH, nullptr,
+                         nullptr) != 0 :
+            MoveFileExW(temp.path.c_str(), destination.c_str(), MOVEFILE_WRITE_THROUGH) != 0;
+        if (ok) {
+            return true;
+        }
+        const DWORD error = GetLastError();
+        if (attempt >= 10 || (error != ERROR_ACCESS_DENIED && error != ERROR_SHARING_VIOLATION)) {
+            return false;
+        }
+        Sleep(delay_ms);
+        delay_ms = std::min<DWORD>(delay_ms * 2, 64);
     }
-    return MoveFileExW(temp.path.c_str(), destination.c_str(), MOVEFILE_WRITE_THROUGH) != 0;
 #else
     return std::rename(temp.path.c_str(), dst) == 0;
 #endif
@@ -3539,15 +3668,22 @@ ggml_vec_index_t * ggml_vec_index_load(const char * path) {
         if (turbovec_v8_magic(header, kTvimV1HeaderSize)) {
             f.seekg(0, std::ios::end);
             const std::streamoff file_size = f.tellg();
-            if (file_size <= 0 ||
-                static_cast<uint64_t>(file_size) > std::numeric_limits<size_t>::max()) {
+            if (file_size <= 0) {
+                return load_fail(GGML_VEC_INDEX_E_IO);
+            }
+            uint64_t want = turbovec_v8_declared_size(f, static_cast<uint64_t>(file_size));
+            if (want == 0) {
+                want = static_cast<uint64_t>(file_size);
+            }
+            if (want > std::numeric_limits<size_t>::max()) {
                 return load_fail(GGML_VEC_INDEX_E_IO);
             }
             test_maybe_throw_bad_alloc();
-            std::vector<uint8_t> raw(static_cast<size_t>(file_size));
+            std::vector<uint8_t> raw(static_cast<size_t>(want));
+            f.clear();
             f.seekg(0, std::ios::beg);
-            f.read(reinterpret_cast<char *>(raw.data()), file_size);
-            if (!f || f.gcount() != file_size) {
+            f.read(reinterpret_cast<char *>(raw.data()), static_cast<std::streamsize>(want));
+            if (!f || f.gcount() != static_cast<std::streamsize>(want)) {
                 return load_fail(GGML_VEC_INDEX_E_IO);
             }
             int error = GGML_VEC_INDEX_E_IO;

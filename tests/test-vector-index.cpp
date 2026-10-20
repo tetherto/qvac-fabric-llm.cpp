@@ -503,6 +503,18 @@ bool has_snapshot_tmp(const std::filesystem::path & path) {
     return false;
 }
 
+// Windows file APIs reject paths past MAX_PATH unless given in verbatim
+// form (a \\?\ prefix); tests that use file names near NAME_MAX build
+// their paths that way.
+std::filesystem::path verbatim_path(const std::filesystem::path & path) {
+#ifdef _WIN32
+    const std::wstring full = std::filesystem::absolute(path).wstring();
+    return full.rfind(L"\\\\?\\", 0) == 0 ? path : std::filesystem::path(L"\\\\?\\" + full);
+#else
+    return path;
+#endif
+}
+
 void append_u32_le(std::vector<uint8_t> & bytes, uint32_t value) {
     for (int i = 0; i < 4; ++i) {
         bytes.push_back(static_cast<uint8_t>(value >> (8 * i)));
@@ -5162,6 +5174,403 @@ void check_vector_index_introspection() {
     }
 }
 
+// The upstream image with an extra block of bytes rebuilt around a new
+// superblock (its header slots and units move with it).
+std::vector<uint8_t> tv1x_with_superblock(const std::vector<uint8_t> & superblock) {
+    std::vector<uint8_t> image(superblock.size() + 2 * kTv1xImageHeaderLen + sizeof(kTv1xImageUnits), 0);
+    std::memcpy(image.data(), superblock.data(), superblock.size());
+    std::memcpy(image.data() + superblock.size(), kTv1xImageHeader0, sizeof(kTv1xImageHeader0));
+    std::memcpy(image.data() + superblock.size() + 2 * kTv1xImageHeaderLen, kTv1xImageUnits, sizeof(kTv1xImageUnits));
+    return image;
+}
+
+std::vector<uint64_t> tv1x_top_ids(ggml_vec_index_t * idx, const float * query, int k) {
+    std::vector<float> scores(static_cast<size_t>(k));
+    std::vector<uint64_t> ids(static_cast<size_t>(k));
+    CHECK(ggml_vec_index_search(idx, query, 1, k, scores.data(), ids.data()) == GGML_VEC_INDEX_OK);
+    return ids;
+}
+
+uint64_t tv1x_nonce(const std::string & path) {
+    const std::vector<uint8_t> bytes = read_file_bytes(path);
+    return read_u64_le_at(bytes, 12);
+}
+
+// Upstream turbovec behaviours the golden fixtures do not reach.
+void check_turbovec_1x_upstream_contracts() {
+    const std::vector<uint8_t> upstream = tv1x_upstream_image();
+    const size_t sb_len = sizeof(kTv1xImageSuperblock);
+    const size_t dim = static_cast<size_t>(kTv1xImageDim);
+    const std::vector<float> queries = tv1x_rows(kTv1xSeedQuery, kTv1xNQuery, dim);
+    auto * reference = tv1x_load_bytes(upstream);
+    CHECK(reference != nullptr);
+    const std::vector<uint64_t> reference_ids = tv1x_top_ids(reference, queries.data(), 10);
+
+    // A stored identity calibration declares none (upstream
+    // normalize_calibration): the index is uncalibrated and writes none.
+    {
+        std::vector<uint8_t> sb(kTv1xImageSuperblock, kTv1xImageSuperblock + sb_len - 8);
+        append_u32_le(sb, static_cast<uint32_t>(dim));
+        for (size_t i = 0; i < dim; ++i) {
+            append_f32_le(sb, 0.0f);
+        }
+        for (size_t i = 0; i < dim; ++i) {
+            append_f32_le(sb, 1.0f);
+        }
+        append_u32_le(sb, tv1x_crc32(sb, sb.size()));
+        auto * loaded = tv1x_load_bytes(tv1x_with_superblock(sb));
+        CHECK(loaded != nullptr);
+        CHECK(ggml_vec_index_turbovec_is_calibrated(loaded) == 0);
+        CHECK(tv1x_snapshot_bytes(loaded, "ggml-vector-index-tv1x-identity.tvim") == upstream);
+        ggml_vec_index_free(loaded);
+    }
+    // A v7 container (one superblock byte shorter, no layout byte) loads.
+    {
+        std::vector<uint8_t> sb(kTv1xImageSuperblock, kTv1xImageSuperblock + sb_len - 4);
+        sb[2] = '7';
+        sb[4] = 2;
+        sb.erase(sb.begin() + 7);
+        append_u32_le(sb, tv1x_crc32(sb, sb.size()));
+        auto * loaded = tv1x_load_bytes(tv1x_with_superblock(sb));
+        CHECK(loaded != nullptr);
+        CHECK(tv1x_top_ids(loaded, queries.data(), 10) == reference_ids);
+        // A v7 file this index loaded is rewritten as v8 by a write.
+        CHECK(tv1x_snapshot_bytes(loaded, "ggml-vector-index-tv1x-v7.tvim") == upstream);
+        ggml_vec_index_free(loaded);
+    }
+    // Trailing bytes past the declared image are ignored.
+    {
+        std::vector<uint8_t> padded = upstream;
+        padded.resize(padded.size() + 65536, 0);
+        auto * loaded = tv1x_load_bytes(padded);
+        CHECK(loaded != nullptr);
+        CHECK(ggml_vec_index_len(loaded) == kTv1xNDb);
+        ggml_vec_index_free(loaded);
+    }
+    // Duplicate ids, an absurd row count, an oversized dim.
+    {
+        const size_t units_at = sb_len + 2 * kTv1xImageHeaderLen;
+        const size_t ids_at = units_at + 32 * (dim / 2) + 32 * 4;
+        std::vector<uint8_t> bad = upstream;
+        std::memcpy(bad.data() + ids_at + 8, bad.data() + ids_at, 8);
+        CHECK(tv1x_load_bytes(bad) == nullptr);
+        bad = upstream;
+        write_u64_le_at(bad, sb_len + 8, UINT64_C(1) << 40);
+        CHECK(tv1x_load_bytes(bad) == nullptr);
+        bad = upstream;
+        write_u32_le_at(bad, 8, 16392);
+        tv1x_reseal_superblock(bad, sb_len);
+        CHECK(tv1x_load_bytes(bad) == nullptr);
+    }
+    // A calibration scale small enough to turn scores into Inf is refused.
+    {
+        auto * tv = ggml_vec_index_create_turbovec(kTv1xImageDim, 4);
+        const std::vector<float> calib = tv1x_rows(kTv1xSeedCalib, 256, dim);
+        CHECK(ggml_vec_index_turbovec_calibrate(tv, calib.data(), 256) == GGML_VEC_INDEX_OK);
+        std::vector<uint8_t> bytes = tv1x_snapshot_bytes(tv, "ggml-vector-index-tv1x-tiny-scale.tvim");
+        const size_t n_levels = 16;
+        const size_t calibrated_sb = 24 + (n_levels - 1) * 4 + n_levels * 4 + 4 + dim * 8 + 4;
+        const size_t scale_at = 24 + (n_levels - 1) * 4 + n_levels * 4 + 4 + dim * 4;
+        std::vector<uint8_t> bad = bytes;
+        uint32_t tiny = 0;
+        const float tiny_value = 1e-40f;
+        std::memcpy(&tiny, &tiny_value, sizeof(tiny));
+        write_u32_le_at(bad, scale_at + 4 * 3, tiny);
+        write_u32_le_at(bad, calibrated_sb - 4, tv1x_crc32(bad, calibrated_sb - 4));
+        CHECK(tv1x_load_bytes(bad) == nullptr);
+        ggml_vec_index_free(tv);
+    }
+
+    // Ranking does not depend on the query's magnitude (upstream #335).
+    {
+        std::vector<float> tiny_query(queries.begin(), queries.begin() + static_cast<std::ptrdiff_t>(dim));
+        for (float & v : tiny_query) {
+            v *= 1e-20f;
+        }
+        CHECK(tv1x_top_ids(reference, tiny_query.data(), 10) == reference_ids);
+    }
+
+    // Calibration contracts (upstream tests/explicit_calibration.rs).
+    {
+        constexpr int cdim = 64;
+        const std::vector<float> sample = tv1x_rows(kTv1xSeedCalib, 1024, cdim);
+        const std::vector<float> rows = tv1x_rows(kTv1xSeedDb, 300, cdim);
+        const std::vector<uint64_t> ids = tv1x_ids(300);
+        for (const int bits : { 2, 3, 4 }) {
+            // Refitting under the committed pair reproduces the codes.
+            auto * tv = ggml_vec_index_create_turbovec(cdim, bits);
+            CHECK(ggml_vec_index_turbovec_calibrate(tv, sample.data(), 1024) == GGML_VEC_INDEX_OK);
+            CHECK(ggml_vec_index_add(tv, rows.data(), 300, ids.data()) == GGML_VEC_INDEX_OK);
+            const std::vector<uint8_t> before = tv1x_snapshot_bytes(tv, "ggml-vector-index-tv1x-refit.tvim");
+            CHECK(ggml_vec_index_turbovec_calibrate(tv, sample.data(), 1024) == GGML_VEC_INDEX_OK);
+            const std::vector<uint8_t> after = tv1x_snapshot_bytes(tv, "ggml-vector-index-tv1x-refit.tvim");
+            CHECK(after.size() == before.size());
+            // Codes are byte-identical; scales may move by rounding only.
+            auto * a = tv1x_load_bytes(before);
+            auto * b = tv1x_load_bytes(after);
+            CHECK(tv1x_top_ids(a, rows.data() + 7 * cdim, 5) == tv1x_top_ids(b, rows.data() + 7 * cdim, 5));
+            ggml_vec_index_free(a);
+            ggml_vec_index_free(b);
+            // A calibrated empty index round-trips calibrated, and adds after
+            // the reload reuse its calibration.
+            auto * empty = ggml_vec_index_create_turbovec(cdim, bits);
+            CHECK(ggml_vec_index_turbovec_calibrate(empty, sample.data(), 1024) == GGML_VEC_INDEX_OK);
+            auto * restored = tv1x_load_bytes(tv1x_snapshot_bytes(empty, "ggml-vector-index-tv1x-empty-cal.tvim"));
+            CHECK(ggml_vec_index_turbovec_is_calibrated(restored) == 1);
+            CHECK(ggml_vec_index_add(restored, rows.data(), 300, ids.data()) == GGML_VEC_INDEX_OK);
+            auto * fresh = ggml_vec_index_create_turbovec(cdim, bits);
+            CHECK(ggml_vec_index_turbovec_calibrate(fresh, sample.data(), 1024) == GGML_VEC_INDEX_OK);
+            CHECK(ggml_vec_index_add(fresh, rows.data(), 300, ids.data()) == GGML_VEC_INDEX_OK);
+            CHECK(tv1x_snapshot_bytes(restored, "ggml-vector-index-tv1x-a.tvim") ==
+                  tv1x_snapshot_bytes(fresh, "ggml-vector-index-tv1x-b.tvim"));
+            // A drained index can be calibrated, and a loaded one refit.
+            for (size_t i = 0; i < 300; ++i) {
+                CHECK(ggml_vec_index_remove(fresh, ids[i]) == GGML_VEC_INDEX_OK);
+            }
+            CHECK(ggml_vec_index_turbovec_calibrate(fresh, sample.data() + 10 * cdim, 500) == GGML_VEC_INDEX_OK);
+            CHECK(ggml_vec_index_turbovec_calibrate(restored, sample.data() + 10 * cdim, 500) == GGML_VEC_INDEX_OK);
+            CHECK(tv1x_top_ids(restored, rows.data() + 9 * cdim, 1)[0] == ids[9]);
+            // Exactly the two-row floor is accepted.
+            CHECK(ggml_vec_index_turbovec_calibrate(fresh, sample.data(), 2) == GGML_VEC_INDEX_OK);
+            for (auto * idx : { tv, empty, restored, fresh }) {
+                ggml_vec_index_free(idx);
+            }
+        }
+    }
+    ggml_vec_index_free(reference);
+}
+
+// Sync contracts beyond the golden scenario (upstream lib.rs v7 crash and
+// delta tests).
+void check_turbovec_1x_sync_contracts() {
+    constexpr int dim = 64;
+    const std::vector<float> rows = tv1x_rows(kTv1xSeedDb, 2400, dim);
+    const std::vector<uint64_t> ids = tv1x_ids(2400);
+    const std::string path = (std::filesystem::temp_directory_path() / "ggml-vector-index-tv1x-sync-contracts.tvim").string();
+    std::filesystem::remove(path);
+
+    // Up to 1024 redo ops ride one commit header; more force a rewrite.
+    // Removing rows from the low end leaves each hole inside committed
+    // blocks, so every removal carries one op.
+    for (const size_t n_removed : { size_t{ 1000 }, size_t{ 1100 } }) {
+        std::filesystem::remove(path);
+        auto * tv = ggml_vec_index_create_turbovec(dim, 2);
+        CHECK(ggml_vec_index_add(tv, rows.data(), 2400, ids.data()) == GGML_VEC_INDEX_OK);
+        CHECK(ggml_vec_index_sync(tv, path.c_str()) == GGML_VEC_INDEX_OK);
+        const uint64_t nonce = tv1x_nonce(path);
+        for (size_t i = 0; i < n_removed; ++i) {
+            CHECK(ggml_vec_index_remove(tv, ids[i]) == GGML_VEC_INDEX_OK);
+        }
+        CHECK(ggml_vec_index_sync(tv, path.c_str()) == GGML_VEC_INDEX_OK);
+        CHECK((tv1x_nonce(path) == nonce) == (n_removed <= 1024));
+        auto * loaded = ggml_vec_index_load(path.c_str());
+        CHECK(ggml_vec_index_len(loaded) == static_cast<int>(2400 - n_removed));
+        CHECK(ggml_vec_index_contains(loaded, ids[n_removed - 1]) == 0);
+        CHECK(ggml_vec_index_contains(loaded, ids[n_removed]) == 1);
+        ggml_vec_index_free(loaded);
+        ggml_vec_index_free(tv);
+    }
+    // Draining to empty and regrowing below the synced watermark.
+    {
+        std::filesystem::remove(path);
+        auto * tv = ggml_vec_index_create_turbovec(dim, 4);
+        CHECK(ggml_vec_index_add(tv, rows.data(), 100, ids.data()) == GGML_VEC_INDEX_OK);
+        CHECK(ggml_vec_index_sync(tv, path.c_str()) == GGML_VEC_INDEX_OK);
+        for (size_t i = 0; i < 100; ++i) {
+            CHECK(ggml_vec_index_remove(tv, ids[i]) == GGML_VEC_INDEX_OK);
+        }
+        CHECK(ggml_vec_index_sync(tv, path.c_str()) == GGML_VEC_INDEX_OK);
+        auto * empty = ggml_vec_index_load(path.c_str());
+        CHECK(empty != nullptr && ggml_vec_index_len(empty) == 0);
+        ggml_vec_index_free(empty);
+        CHECK(ggml_vec_index_add(tv, rows.data() + 200 * dim, 40, ids.data() + 200) == GGML_VEC_INDEX_OK);
+        CHECK(ggml_vec_index_sync(tv, path.c_str()) == GGML_VEC_INDEX_OK);
+        auto * regrown = ggml_vec_index_load(path.c_str());
+        CHECK(ggml_vec_index_len(regrown) == 40);
+        CHECK(tv1x_top_ids(regrown, rows.data() + 233 * dim, 1)[0] == ids[233]);
+        CHECK(tv1x_snapshot_bytes(regrown, "ggml-vector-index-tv1x-regrown-a.tvim") ==
+              tv1x_snapshot_bytes(tv, "ggml-vector-index-tv1x-regrown-b.tvim"));
+        ggml_vec_index_free(regrown);
+        ggml_vec_index_free(tv);
+    }
+    // A calibrate never licenses overwriting another writer's commits.
+    {
+        std::filesystem::remove(path);
+        auto * a = ggml_vec_index_create_turbovec(dim, 2);
+        CHECK(ggml_vec_index_add(a, rows.data(), 100, ids.data()) == GGML_VEC_INDEX_OK);
+        CHECK(ggml_vec_index_sync(a, path.c_str()) == GGML_VEC_INDEX_OK);
+        auto * b = ggml_vec_index_load(path.c_str());
+        CHECK(ggml_vec_index_add(b, rows.data() + 100 * dim, 10, ids.data() + 100) == GGML_VEC_INDEX_OK);
+        CHECK(ggml_vec_index_sync(b, path.c_str()) == GGML_VEC_INDEX_OK);
+        CHECK(ggml_vec_index_turbovec_calibrate(a, rows.data(), 100) == GGML_VEC_INDEX_OK);
+        CHECK(ggml_vec_index_sync(a, path.c_str()) == GGML_VEC_INDEX_E_IO);
+        auto * check = ggml_vec_index_load(path.c_str());
+        CHECK(ggml_vec_index_len(check) == 110);
+        ggml_vec_index_free(check);
+        ggml_vec_index_free(b);
+        ggml_vec_index_free(a);
+    }
+    // Upstream a_queued_compaction_still_respects_the_foreign_file_guard:
+    // another writer claimed the path with its own full write.
+    {
+        std::filesystem::remove(path);
+        auto * a = ggml_vec_index_create_turbovec(dim, 4);
+        CHECK(ggml_vec_index_turbovec_calibrate(a, rows.data(), 1024) == GGML_VEC_INDEX_OK);
+        CHECK(ggml_vec_index_add(a, rows.data(), 40, ids.data()) == GGML_VEC_INDEX_OK);
+        CHECK(ggml_vec_index_sync(a, path.c_str()) == GGML_VEC_INDEX_OK);
+        auto * b = ggml_vec_index_create_turbovec(dim, 4);
+        CHECK(ggml_vec_index_turbovec_calibrate(b, rows.data() + 1024 * dim, 1024) == GGML_VEC_INDEX_OK);
+        CHECK(ggml_vec_index_add(b, rows.data() + 40 * dim, 20, ids.data() + 40) == GGML_VEC_INDEX_OK);
+        CHECK(ggml_vec_index_sync(b, path.c_str()) == GGML_VEC_INDEX_OK);
+        CHECK(ggml_vec_index_turbovec_calibrate(a, rows.data() + 512 * dim, 1024) == GGML_VEC_INDEX_OK);
+        CHECK(ggml_vec_index_sync(a, path.c_str()) == GGML_VEC_INDEX_E_IO);
+        auto * loaded = ggml_vec_index_load(path.c_str());
+        CHECK(tv1x_snapshot_bytes(loaded, "ggml-vector-index-tv1x-guard-a.tvim") ==
+              tv1x_snapshot_bytes(b, "ggml-vector-index-tv1x-guard-b.tvim"));
+        ggml_vec_index_free(loaded);
+        ggml_vec_index_free(b);
+        ggml_vec_index_free(a);
+    }
+#ifndef _WIN32
+    // A sync that fails partway drops the binding; the next one rewrites.
+    if (::geteuid() != 0) {
+        std::filesystem::remove(path);
+        auto * tv = ggml_vec_index_create_turbovec(dim, 2);
+        CHECK(ggml_vec_index_add(tv, rows.data(), 64, ids.data()) == GGML_VEC_INDEX_OK);
+        CHECK(ggml_vec_index_sync(tv, path.c_str()) == GGML_VEC_INDEX_OK);
+        CHECK(ggml_vec_index_add(tv, rows.data() + 64 * dim, 64, ids.data() + 64) == GGML_VEC_INDEX_OK);
+        ::chmod(path.c_str(), 0444);
+        CHECK(ggml_vec_index_sync(tv, path.c_str()) == GGML_VEC_INDEX_E_IO);
+        ::chmod(path.c_str(), 0644);
+        CHECK(ggml_vec_index_sync(tv, path.c_str()) == GGML_VEC_INDEX_OK);
+        auto * loaded = ggml_vec_index_load(path.c_str());
+        CHECK(ggml_vec_index_len(loaded) == 128);
+        ggml_vec_index_free(loaded);
+        ggml_vec_index_free(tv);
+    }
+#endif
+    // Destination names near NAME_MAX still get a temp sibling.
+    {
+        const std::string long_path =
+            (verbatim_path(std::filesystem::temp_directory_path()) / (std::string(240, 'n') + ".tvim")).string();
+        auto * tv = ggml_vec_index_create_turbovec(dim, 2);
+        CHECK(ggml_vec_index_add(tv, rows.data(), 10, ids.data()) == GGML_VEC_INDEX_OK);
+        CHECK(ggml_vec_index_write(tv, long_path.c_str()) == GGML_VEC_INDEX_OK);
+        CHECK(ggml_vec_index_sync(tv, long_path.c_str()) == GGML_VEC_INDEX_OK);
+        CHECK(!has_snapshot_tmp(long_path));
+        std::filesystem::remove(long_path);
+        ggml_vec_index_free(tv);
+    }
+    std::filesystem::remove(path);
+}
+
+#ifdef GGML_VEC_INDEX_TEST_HOOKS
+// An add that fails partway on a sync-bound index leaves nothing behind:
+// the next sync commits exactly the rows that were added (upstream #388).
+void check_turbovec_1x_failed_add_then_sync() {
+    constexpr int dim = 64;
+    const std::vector<float> rows = tv1x_rows(kTv1xSeedDb, 200, dim);
+    const std::vector<uint64_t> ids = tv1x_ids(200);
+    const std::string path = (std::filesystem::temp_directory_path() / "ggml-vector-index-tv1x-oom.tvim").string();
+    std::filesystem::remove(path);
+    auto * tv = ggml_vec_index_create_turbovec(dim, 2);
+    CHECK(ggml_vec_index_add(tv, rows.data(), 70, ids.data()) == GGML_VEC_INDEX_OK);
+    CHECK(ggml_vec_index_sync(tv, path.c_str()) == GGML_VEC_INDEX_OK);
+    int failures = 0;
+    for (int64_t countdown = 1; countdown < 64; ++countdown) {
+        ggml_vec_index_test_set_oom_countdown(countdown);
+        const int rc = ggml_vec_index_add(tv, rows.data() + 70 * dim, 50, ids.data() + 70);
+        ggml_vec_index_test_set_oom_countdown(-1);
+        if (rc == GGML_VEC_INDEX_OK) {
+            break;
+        }
+        CHECK(rc == GGML_VEC_INDEX_E_OOM);
+        ++failures;
+        CHECK(ggml_vec_index_len(tv) == 70);
+        CHECK(ggml_vec_index_sync(tv, path.c_str()) == GGML_VEC_INDEX_OK);
+        auto * loaded = ggml_vec_index_load(path.c_str());
+        CHECK(ggml_vec_index_len(loaded) == 70);
+        ggml_vec_index_free(loaded);
+    }
+    CHECK(failures > 0);
+    CHECK(ggml_vec_index_len(tv) == 120);
+    CHECK(ggml_vec_index_sync(tv, path.c_str()) == GGML_VEC_INDEX_OK);
+    auto * loaded = ggml_vec_index_load(path.c_str());
+    CHECK(ggml_vec_index_len(loaded) == 120);
+    CHECK(tv1x_snapshot_bytes(loaded, "ggml-vector-index-tv1x-oom-a.tvim") ==
+          tv1x_snapshot_bytes(tv, "ggml-vector-index-tv1x-oom-b.tvim"));
+    ggml_vec_index_free(loaded);
+    ggml_vec_index_free(tv);
+    std::filesystem::remove(path);
+}
+
+// A commit header that reaches disk before its data is detected and the
+// load falls back; the recovered index's next commit wipes the abandoned
+// header before reusing its slot.
+void check_turbovec_1x_reordered_and_stale_commits() {
+    constexpr int dim = 64;
+    const std::vector<float> rows = tv1x_rows(kTv1xSeedDb, 300, dim);
+    const std::vector<uint64_t> ids = tv1x_ids(300);
+    const std::string path = (std::filesystem::temp_directory_path() / "ggml-vector-index-tv1x-reorder.tvim").string();
+    std::filesystem::remove(path);
+    auto * tv = ggml_vec_index_create_turbovec(dim, 4);
+    CHECK(ggml_vec_index_add(tv, rows.data(), 100, ids.data()) == GGML_VEC_INDEX_OK);
+    CHECK(ggml_vec_index_sync(tv, path.c_str()) == GGML_VEC_INDEX_OK);
+    CHECK(ggml_vec_index_remove(tv, ids[7]) == GGML_VEC_INDEX_OK);
+    CHECK(ggml_vec_index_add(tv, rows.data() + 100 * dim, 100, ids.data() + 100) == GGML_VEC_INDEX_OK);
+    std::vector<std::vector<std::pair<uint64_t, std::vector<uint8_t>>>> batches;
+    CHECK(turbovec_sync_plan_for_test(tv, path.c_str(), batches) == GGML_VEC_INDEX_OK);
+    CHECK(batches.size() == 1);
+    auto apply = [&](const std::vector<uint8_t> & base, bool with_units, bool damage_unit) {
+        std::vector<uint8_t> bytes = base;
+        const auto & batch = batches.back();
+        for (size_t op = 0; op < batch.size(); ++op) {
+            const bool is_header = op + 1 == batch.size();
+            if (!is_header && !with_units) {
+                continue;
+            }
+            const auto & write = batch[op];
+            if (bytes.size() < write.first + write.second.size()) {
+                bytes.resize(static_cast<size_t>(write.first + write.second.size()), 0);
+            }
+            std::memcpy(bytes.data() + write.first, write.second.data(), write.second.size());
+            if (!is_header && damage_unit && op == 0) {
+                bytes[static_cast<size_t>(write.first) + 5] ^= 0x40;
+            }
+        }
+        return bytes;
+    };
+    const std::vector<uint8_t> committed = read_file_bytes(path);
+    // Only the header lands: it names units past the end of the file and
+    // is not a commit.
+    write_file_bytes(path, apply(committed, false, false));
+    auto * header_only = ggml_vec_index_load(path.c_str());
+    CHECK(header_only != nullptr && ggml_vec_index_len(header_only) == 100);
+    ggml_vec_index_free(header_only);
+    // Everything lands but a unit is damaged: the header parses, its delta
+    // fails, and the load falls back to the previous commit.
+    write_file_bytes(path, apply(committed, true, true));
+    auto * recovered = ggml_vec_index_load(path.c_str());
+    CHECK(recovered != nullptr);
+    CHECK(ggml_vec_index_len(recovered) == 100);
+    CHECK(ggml_vec_index_contains(recovered, ids[7]) == 1);
+    // Generation 1 again, into the slot that still holds the abandoned one.
+    CHECK(ggml_vec_index_remove(recovered, ids[9]) == GGML_VEC_INDEX_OK);
+    batches.clear();
+    CHECK(turbovec_sync_plan_for_test(recovered, path.c_str(), batches) == GGML_VEC_INDEX_OK);
+    CHECK(batches.size() == 2);
+    CHECK(ggml_vec_index_sync(recovered, path.c_str()) == GGML_VEC_INDEX_OK);
+    auto * reloaded = ggml_vec_index_load(path.c_str());
+    CHECK(ggml_vec_index_len(reloaded) == 99);
+    CHECK(ggml_vec_index_contains(reloaded, ids[9]) == 0);
+    CHECK(ggml_vec_index_contains(reloaded, ids[7]) == 1);
+    ggml_vec_index_free(reloaded);
+    ggml_vec_index_free(recovered);
+    ggml_vec_index_free(tv);
+    std::filesystem::remove(path);
+}
+#endif
+
 void check_turbovec_1x() {
     for (const Tv1xIndexCase & c : kTv1xIndexCases) {
         check_turbovec_1x_golden_case(c);
@@ -5176,6 +5585,8 @@ void check_turbovec_1x() {
     check_turbovec_1x_history_snapshots();
     check_turbovec_1x_threads();
     check_vector_index_introspection();
+    check_turbovec_1x_upstream_contracts();
+    check_turbovec_1x_sync_contracts();
 }
 
 }  // namespace
@@ -5228,6 +5639,8 @@ int main(int argc, char ** argv) {
             check_turbovec_numeric_helper_parity();
             check_turbovec_1x_rotation_and_codebooks();
             check_turbovec_1x_torn_sync();
+            check_turbovec_1x_failed_add_then_sync();
+            check_turbovec_1x_reordered_and_stale_commits();
             check_tqplus_deterministic_layout(
                 2,
                 UINT64_C(0xc4140782241d45eb),

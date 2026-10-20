@@ -1666,6 +1666,9 @@ void repack_turbovec_codes_from_slot(
 
     const size_t first_block = first_slot / kTurboVecScoreBlock;
     n_blocks = (n_vectors + kTurboVecScoreBlock - 1) / kTurboVecScoreBlock;
+    reserve_mostly_exact(
+        blocked_codes,
+        n_blocks * n_byte_groups * static_cast<size_t>(kTurboVecScoreBlock) - blocked_codes.size());
     blocked_codes.resize(
         n_blocks * n_byte_groups * static_cast<size_t>(kTurboVecScoreBlock),
         0);
