@@ -296,6 +296,14 @@ public:
     ggml_tensor * s_copy_main;   // I32 [n_seqs]
     ggml_tensor * s_copy_extra;  // I32 [n_rs - n_seqs]
 
+    // deferred gated delta net commit (see llama_memory_recurrent::gdn_deferred), else null:
+    // the ssm base states always live in plane 0, so they get their own copy indices
+    ggml_tensor * s_copy_base       = nullptr; // I32 [n_rs]
+    ggml_tensor * s_copy_base_main  = nullptr; // I32 [n_seqs]
+    ggml_tensor * s_copy_base_extra = nullptr; // I32 [n_rs - n_seqs]
+    ggml_tensor * rec_idx           = nullptr; // I32 [3, n_seqs] {pending, read_row, write_row}
+    bool          s_base_inplace    = false;   // the base states are read and written in place
+
     const llama_memory_recurrent_context * mctx;
 
     // used in view offsets, need to match for valid graph reuse

@@ -134,6 +134,7 @@
 #define FC_DSV4_HC                     2000
 #define FC_PAD                         2100
 #define FC_MUL_MV_MMA                  2200
+#define FC_GATED_DELTA_NET_DEFERRED    2300
 
 // op-specific constants
 #define OP_FLASH_ATTN_EXT_NQPSG 8
@@ -1219,6 +1220,51 @@ typedef struct {
     uint64_t nb3;
     uint64_t nb_out; // 0 => snapshots are appended after the attn scores (unfused)
 } ggml_metal_kargs_gated_delta_net;
+
+typedef struct {
+    int32_t  ne01; // q heads
+    int32_t  ne11; // k heads
+    int32_t  ne21; // v heads
+    int32_t  ne22; // n_tokens
+    int32_t  ne23; // n_seqs
+    uint64_t nb01;
+    uint64_t nb02;
+    uint64_t nb03;
+    uint64_t nb11;
+    uint64_t nb12;
+    uint64_t nb13;
+    uint64_t nb21;
+    uint64_t nb22;
+    uint64_t nb23;
+    uint64_t nb31; // gate strides
+    uint64_t nb32;
+    uint64_t nb33;
+    uint64_t nb41; // beta strides
+    uint64_t nb42;
+    uint64_t nb43;
+    uint64_t nb51; // state strides
+    uint64_t nb52;
+    uint64_t nb53;
+    uint64_t nb61; // record row stride
+    int32_t  rec_v; // record offsets (floats)
+    int32_t  rec_g;
+    int32_t  rec_b;
+    int32_t  fused; // 1 => the new base is written to dst_fuse (the recurrent cache)
+    int32_t  gates; // 1 => g and beta are raw: g = softplus(g + dt) * a, beta = sigmoid(beta)
+} ggml_metal_kargs_gated_delta_net_deferred;
+
+typedef struct {
+    int32_t  C;        // channels
+    int32_t  n_tokens;
+    int32_t  K;        // history keeps K + 3 columns
+    int32_t  n_norm;   // leading heads that get L2-normalized
+    float    eps;
+    uint64_t nb_x1;
+    uint64_t nb_x2;
+    uint64_t nb1;      // dst
+    uint64_t nb2;
+    uint64_t nb_h1;    // history row stride
+} ggml_metal_kargs_gdn_conv_deferred;
 
 typedef struct {
     int32_t  ne00;

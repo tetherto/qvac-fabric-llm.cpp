@@ -783,6 +783,60 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_rwkv(ggml_metal_
     return res;
 }
 
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_gdn_conv_deferred(ggml_metal_library_t lib, const ggml_tensor * op) {
+    GGML_UNUSED(op);
+
+    const char * name = "kernel_gdn_conv_deferred_f32";
+
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        res = ggml_metal_library_compile_pipeline(lib, name, name, nullptr);
+    }
+
+    return res;
+}
+
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_gated_delta_net_deferred(ggml_metal_library_t lib, const ggml_tensor * op) {
+    char base[256];
+    char name[256];
+
+    const int S_v = op->src[2]->ne[0];
+    const int G   = op->src[3]->ne[0];
+    const int K   = ggml_get_op_params_i32(op, 0);
+    const int nsg = S_v/32;
+
+    GGML_ASSERT(S_v % 32 == 0);
+
+    // state rows per simdgroup: one load of k and q serves this many rows
+    static const int rps_env = [] {
+        const char * e = getenv("GGML_METAL_GDN_RPS");
+        return e ? atoi(e) : 8;
+    }();
+    const int rps = std::max(1, std::min(8, rps_env));
+
+    snprintf(base, 256, "kernel_gated_delta_net_deferred_f32_%d", nsg);
+    snprintf(name, 256, "%s_S_v=%d_G=%d_K=%d_rps=%d", base, S_v, G, K, rps);
+
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        ggml_metal_cv_t cv = ggml_metal_cv_init();
+
+        ggml_metal_cv_set_int16(cv, S_v, FC_GATED_DELTA_NET_DEFERRED + 0);
+        ggml_metal_cv_set_int16(cv, G,   FC_GATED_DELTA_NET_DEFERRED + 1);
+        ggml_metal_cv_set_int16(cv, K,   FC_GATED_DELTA_NET_DEFERRED + 2);
+        ggml_metal_cv_set_int16(cv, rps, FC_GATED_DELTA_NET_DEFERRED + 3);
+
+        res = ggml_metal_library_compile_pipeline(lib, base, name, cv);
+
+        ggml_metal_cv_free(cv);
+    }
+
+    res.nsg = nsg;
+    res.nr0 = rps;
+
+    return res;
+}
+
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_gated_delta_net(ggml_metal_library_t lib, const ggml_tensor * op) {
     // The MLX-style SIMD-group path currently handles scalar-gate prefill
     // with one final-state snapshot. Other layouts and modes use the sequential kernel.
