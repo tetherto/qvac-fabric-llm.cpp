@@ -232,7 +232,9 @@ void turbovec_planes_refresh(ggml_vec_index & idx, size_t first_slot) {
         if (!turbovec_planes_wanted(idx.turbovec_bits, idx.dim, n)) {
             return;
         }
-        // Promotion: the statistics are fitted afresh from the new cache.
+        // Promotion: the statistics are fitted afresh from the new cache,
+        // and the staged search reads the bit planes from packed rows.
+        turbovec_materialize_packed_rows(idx);
         idx.turbovec_planes = true;
         idx.turbovec_stats_ready = false;
         idx.turbovec_sign_blocked.clear();

@@ -328,6 +328,26 @@ GGML_VEC_INDEX_API int ggml_vec_index_write(
     ggml_vec_index_t * idx,
     const char       * path);
 
+// How durable `ggml_vec_index_write_with_durability` makes a snapshot before
+// it returns (upstream turbovec's `Durability`).
+enum ggml_vec_index_durability {
+    // Temp file, fsync, atomic rename, parent-directory fsync: what
+    // `ggml_vec_index_write` does.
+    GGML_VEC_INDEX_DURABILITY_DURABLE = 0,
+    // The same temp file and atomic rename without either fsync. The
+    // destination never holds a torn snapshot and the previous file survives
+    // a process crash, but a power loss shortly after the call returns may
+    // lose the new file. A fast write does not allow starting a delta log.
+    GGML_VEC_INDEX_DURABILITY_FAST = 1,
+};
+
+// `ggml_vec_index_write` with an explicit durability level, for every index
+// kind. Syncs are always durable.
+GGML_VEC_INDEX_API int ggml_vec_index_write_with_durability(
+    ggml_vec_index_t              * idx,
+    const char                    * path,
+    enum ggml_vec_index_durability  durability);
+
 // In-memory snapshots of a TurboVec index (not a v3-loaded one): exactly the
 // bytes `ggml_vec_index_write` puts in the file, padding included. The
 // buffer is allocated by the library; free it with `ggml_vec_index_bytes_free`.
