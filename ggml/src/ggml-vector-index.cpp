@@ -659,6 +659,7 @@ int ggml_vec_index_add_unlocked(
                 idx->turbovec_blocked_data,
                 idx->turbovec_blocked_n_blocks,
                 idx->turbovec_blocked_vm);
+            turbovec_planes_refresh(*idx, base_slot);
         }
         for (size_t slot = base_slot; slot < new_slots; ++slot) {
             add_state_hash(*idx, slot_state_hash(*idx, slot));
@@ -719,6 +720,7 @@ static void turbovec_swap_remove(ggml_vec_index & idx, size_t slot) {
     idx.slot_active.resize(last);
     --idx.n_active;
     turbovec_blocked_swap_remove(idx, slot, last);
+    turbovec_planes_swap_remove(idx, slot, last);
 }
 
 int ggml_vec_index_remove_unlocked(
@@ -1438,6 +1440,10 @@ int ggml_vec_index_turbovec_calibrate(ggml_vec_index_t * idx, const float * samp
             idx->turbovec_blocked_n_blocks = n_blocks;
             rebuild_state_hash(*idx);
         }
+        // Every row changed: the staged-search cache starts over (and is
+        // only kept if the index is still large enough).
+        turbovec_planes_reset(*idx);
+        turbovec_planes_refresh(*idx, 0);
         ++idx->generation;
         invalidate_ivf(*idx);
         idx->delta_log_start_allowed = false;
@@ -1446,6 +1452,22 @@ int ggml_vec_index_turbovec_calibrate(ggml_vec_index_t * idx, const float * samp
         return GGML_VEC_INDEX_E_OOM;
     } catch (const std::invalid_argument &) {
         return GGML_VEC_INDEX_E_INVALID_ARG;
+    } catch (...) {
+        return GGML_VEC_INDEX_E_INTERNAL;
+    }
+}
+
+int ggml_vec_index_turbovec_set_staged(ggml_vec_index_t * idx, int enabled) {
+    if (idx == nullptr) {
+        return GGML_VEC_INDEX_E_INVALID_ARG;
+    }
+    try {
+        std::unique_lock<std::shared_mutex> lock(idx->mutex);
+        if (!is_turbovec(*idx)) {
+            return GGML_VEC_INDEX_E_INVALID_ARG;
+        }
+        idx->turbovec_staged_enabled = enabled != 0;
+        return GGML_VEC_INDEX_OK;
     } catch (...) {
         return GGML_VEC_INDEX_E_INTERNAL;
     }
