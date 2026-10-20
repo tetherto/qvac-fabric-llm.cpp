@@ -61,10 +61,10 @@ encodes, snapshots and syncs byte for byte as turbovec does. Vectors and
 queries are rotated into a quantization-friendly space, optional TQ+
 calibration and Lloyd-Max codebooks produce q2, q3 or q4 codes stored in
 bit-plane rows, and search builds lookup tables from the rotated query to score
-packed codes without reconstructing full vectors. A blocked copy of the packed
-codes supports scalar, NEON, and AVX2 scoring. Derived rotation, blocked-code,
-and IVF state is invalidated or rebuilt after mutations, compaction, and
-snapshot loading.
+packed codes without reconstructing full vectors. Codes are kept in a 32-vector
+blocked layout that scalar, NEON, and AVX2 scoring read directly. Derived
+rotation and IVF state is invalidated or rebuilt after mutations, compaction,
+and snapshot loading.
 
 Each layer carries its own regression coverage: result ordering, architecture
 parity, snapshot corruption, mmap restrictions, delta replay, compaction, stale
@@ -147,9 +147,13 @@ threshold. `ggml_vec_index_turbovec_set_staged(idx, 0)` makes an index scan in
 full instead. Upstream also searches in stages on x86 with AVX-512 VBMI and
 VNNI; this port scans in full there for now.
 
-Search keeps a 32-vector blocked copy of the packed codes in memory for
-NEON/AVX2 LUT scoring; this cache is updated after adds and rebuilt after
-compaction, calibration and snapshot loading.
+A TurboVec 1.x index holds its codes once, in the 32-vector blocked layout that
+search scores, so it uses about half the code memory of upstream turbovec,
+which keeps bit-plane rows next to its search cache. A staged index also keeps
+the bit-plane rows and a blocked copy of its sign planes, because its
+shortlist ranking reads the planes row by row. Adds and removals patch the
+blocked codes in place; calibration and snapshot loading rebuild them. Legacy
+v3 indexes keep bit-plane rows next to the blocked copy.
 
 Indexes loaded from a v3 snapshot (written by earlier releases) keep the
 turbovec 0.9 encoding they were written with: a dense Gaussian QR rotation,
