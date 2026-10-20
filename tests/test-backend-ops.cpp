@@ -17907,6 +17907,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_scale_residual(139, 512, 1, 1));
     test_cases.emplace_back(new test_bias_gelu(139, 512, 1, 1));
     test_cases.emplace_back(new test_pad_replicate_1d(139, 512, 6, 0, true));
+    test_cases.emplace_back(new test_gru(64, 1, 17, false));
+    test_cases.emplace_back(new test_gru(128, 2, 33, false));
+    test_cases.emplace_back(new test_gru(4, 1953, 33, true));
 
     return test_cases;
 }

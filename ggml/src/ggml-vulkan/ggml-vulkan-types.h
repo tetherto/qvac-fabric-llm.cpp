@@ -1087,6 +1087,8 @@ struct vk_device_struct {
     vk_pipeline pipeline_ssm_conv_f32;
     vk_pipeline pipeline_ssm_conv_silu_f32;
     vk_pipeline pipeline_ssm_conv_bias_silu_f32;
+    vk_pipeline pipeline_gru_f32;
+    vk_pipeline pipeline_gru_small_f32[3];  // H == 2, 4, 8 register-resident variants
     vk_pipeline pipeline_conv_1d_dw_direct_f32;
     vk_pipeline pipeline_conv_1d_dw_direct_norm_channel_f32;
     vk_pipeline pipeline_norm_channel_f32;

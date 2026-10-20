@@ -1396,6 +1396,9 @@ void ggml_vk_check_results_0(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph
             tensor_clone = ggml_get_op_params_i32(tensor, 2) != 0
                              ? ggml_pad_replicate_1d_ct(ggml_ctx, src_clone[0], pad_left, pad_right)
                              : ggml_pad_replicate_1d(ggml_ctx, src_clone[0], pad_left, pad_right);
+        } else if (tensor->op == GGML_OP_GRU) {
+            tensor_clone = ggml_gru(ggml_ctx, src_clone[0], src_clone[1], src_clone[2],
+                                    ggml_get_op_params_i32(tensor, 0) != 0);
         } else if (tensor->op == GGML_OP_SSM_CONV_BACK_SX) {
             tensor_clone = ggml_ssm_conv_back_sx(ggml_ctx, src_clone[0], src_clone[1], tensor);
         } else if (tensor->op == GGML_OP_SSM_CONV_BACK_C) {
