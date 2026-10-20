@@ -1027,6 +1027,96 @@ static uint8_t turbovec_group_code_byte(const uint8_t * row, int group, int bits
     return byte;
 }
 
+// Byte-level conversion tables between packed bit-plane rows and
+// sequential rows (one byte per group of 8 / bits codes; 3-bit codes in
+// 4-bit fields), from upstream pack.rs `build_extract_lut` and
+// `build_unpack_lut`.
+struct TurboVecPackTables {
+    // extract[p][b]: plane p's byte b spread into the sequential bytes of
+    // its eight coordinates, little-endian in a u32.
+    uint32_t extract[4][256];
+    // unpack[b]: for each plane p, a (8 / bits)-bit field at offset
+    // p * (8 / bits) holding plane p of the byte's codes, in dim order.
+    uint16_t unpack[256];
+};
+
+static TurboVecPackTables make_turbovec_pack_tables(int bits) {
+    TurboVecPackTables t{};
+    const int codes_per_byte = 8 / bits;
+    const int field = bits == 3 ? 4 : bits;
+    for (int p = 0; p < bits; ++p) {
+        for (int b = 0; b < 256; ++b) {
+            uint32_t acc = 0;
+            for (int j = 0; j < 8; ++j) {
+                if ((b & (1 << (7 - j))) != 0) {
+                    const int out_byte = j / codes_per_byte;
+                    const int shift = (codes_per_byte - 1 - j % codes_per_byte) * field;
+                    acc |= UINT32_C(1) << (out_byte * 8 + shift + p);
+                }
+            }
+            t.extract[p][b] = acc;
+        }
+    }
+    for (int b = 0; b < 256; ++b) {
+        uint16_t entry = 0;
+        for (int c = 0; c < codes_per_byte; ++c) {
+            const int code = (b >> ((codes_per_byte - 1 - c) * field)) & ((1 << bits) - 1);
+            for (int p = 0; p < bits; ++p) {
+                if ((code & (1 << p)) != 0) {
+                    entry |= static_cast<uint16_t>(1u << (p * codes_per_byte + (codes_per_byte - 1 - c)));
+                }
+            }
+        }
+        t.unpack[b] = entry;
+    }
+    return t;
+}
+
+static const TurboVecPackTables & turbovec_pack_tables(int bits) {
+    static const std::array<TurboVecPackTables, 3> tables = {
+        make_turbovec_pack_tables(2),
+        make_turbovec_pack_tables(3),
+        make_turbovec_pack_tables(4),
+    };
+    return tables[static_cast<size_t>(bits - 2)];
+}
+
+static void packed_row_to_seq_fast(const uint8_t * packed, int bits, int dim, uint8_t * seq) {
+    const TurboVecPackTables & t = turbovec_pack_tables(bits);
+    const size_t bytes_per_plane = static_cast<size_t>(dim) / 8;
+    const size_t n_out = static_cast<size_t>(8 / (8 / bits));
+    for (size_t c = 0; c < bytes_per_plane; ++c) {
+        uint32_t acc = 0;
+        for (int p = 0; p < bits; ++p) {
+            acc |= t.extract[p][packed[static_cast<size_t>(p) * bytes_per_plane + c]];
+        }
+        for (size_t o = 0; o < n_out; ++o) {
+            seq[c * n_out + o] = static_cast<uint8_t>(acc >> (8 * o));
+        }
+    }
+}
+
+static void seq_row_to_packed_fast(const uint8_t * seq, int bits, int dim, uint8_t * packed) {
+    const TurboVecPackTables & t = turbovec_pack_tables(bits);
+    const int codes_per_byte = 8 / bits;
+    const int groups_per_out = 8 / codes_per_byte;
+    const uint16_t field_mask = static_cast<uint16_t>((1u << codes_per_byte) - 1u);
+    const size_t bytes_per_plane = static_cast<size_t>(dim) / 8;
+    for (size_t ob = 0; ob < bytes_per_plane; ++ob) {
+        uint8_t acc[4] = {};
+        for (int q = 0; q < groups_per_out; ++q) {
+            const uint16_t e = t.unpack[seq[ob * static_cast<size_t>(groups_per_out) + static_cast<size_t>(q)]];
+            const int shift = 8 - codes_per_byte * (q + 1);
+            for (int p = 0; p < bits; ++p) {
+                acc[p] |= static_cast<uint8_t>(((e >> (p * codes_per_byte)) & field_mask) << shift);
+            }
+        }
+        for (int p = 0; p < bits; ++p) {
+            packed[static_cast<size_t>(p) * bytes_per_plane + ob] = acc[p];
+        }
+    }
+}
+
 #if defined(_MSC_VER)
 __declspec(noinline)
 #elif defined(__GNUC__) || defined(__clang__)
@@ -1505,50 +1595,31 @@ static void repack_turbovec_code_block(
     const size_t base_vector = block * kTurboVecScoreBlock;
     const size_t block_offset =
         block * n_byte_groups * static_cast<size_t>(kTurboVecScoreBlock);
-    std::fill_n(
-        blocked_codes.data() + block_offset,
-        n_byte_groups * static_cast<size_t>(kTurboVecScoreBlock),
-        0);
+    // Each lane's sequential row, converted once: rows past the last
+    // vector stay zero.
+    thread_local std::vector<uint8_t> seq;
+    seq.assign(static_cast<size_t>(kTurboVecScoreBlock) * n_byte_groups, 0);
+    for (size_t lane = 0; lane < static_cast<size_t>(kTurboVecScoreBlock); ++lane) {
+        const size_t vector = base_vector + lane;
+        if (vector < n_vectors) {
+            packed_row_to_seq_fast(packed_codes + vector * row_bytes, bits, dim, seq.data() + lane * n_byte_groups);
+        }
+    }
     for (size_t group = 0; group < n_byte_groups; ++group) {
-        const size_t output_offset =
-            (block * n_byte_groups + group) * kTurboVecScoreBlock;
+        uint8_t * out = blocked_codes.data() + block_offset + group * kTurboVecScoreBlock;
 #if defined(__x86_64__) || defined(_M_X64)
         static constexpr size_t perm[16] = {
             0, 8, 1, 9, 2, 10, 3, 11, 4, 12, 5, 13, 6, 14, 7, 15,
         };
         for (size_t j = 0; j < 16; ++j) {
-            const size_t vector_a = base_vector + perm[j];
-            const size_t vector_b = vector_a + 16;
-            const uint8_t byte_a = vector_a < n_vectors ?
-                turbovec_group_code_byte(
-                    packed_codes + vector_a * row_bytes,
-                    static_cast<int>(group),
-                    bits,
-                    dim) :
-                0;
-            const uint8_t byte_b = vector_b < n_vectors ?
-                turbovec_group_code_byte(
-                    packed_codes + vector_b * row_bytes,
-                    static_cast<int>(group),
-                    bits,
-                    dim) :
-                0;
-            blocked_codes[output_offset + j] =
-                static_cast<uint8_t>((byte_a >> 4) | ((byte_b >> 4) << 4));
-            blocked_codes[output_offset + 16 + j] =
-                static_cast<uint8_t>((byte_a & 0x0f) | ((byte_b & 0x0f) << 4));
+            const uint8_t byte_a = seq[perm[j] * n_byte_groups + group];
+            const uint8_t byte_b = seq[(perm[j] + 16) * n_byte_groups + group];
+            out[j] = static_cast<uint8_t>((byte_a >> 4) | ((byte_b >> 4) << 4));
+            out[16 + j] = static_cast<uint8_t>((byte_a & 0x0f) | ((byte_b & 0x0f) << 4));
         }
 #else
-        for (size_t lane = 0; lane < kTurboVecScoreBlock; ++lane) {
-            const size_t vector = base_vector + lane;
-            if (vector < n_vectors) {
-                blocked_codes[output_offset + lane] =
-                    turbovec_group_code_byte(
-                        packed_codes + vector * row_bytes,
-                        static_cast<int>(group),
-                        bits,
-                        dim);
-            }
+        for (size_t lane = 0; lane < static_cast<size_t>(kTurboVecScoreBlock); ++lane) {
+            out[lane] = seq[lane * n_byte_groups + group];
         }
 #endif
     }
@@ -2008,22 +2079,11 @@ void turbovec_codebook_values(
 }
 
 void turbovec_packed_row_to_seq(const uint8_t * packed, int bits, int dim, uint8_t * seq) {
-    const int n_byte_groups = dim / (8 / bits);
-    for (int group = 0; group < n_byte_groups; ++group) {
-        seq[group] = turbovec_group_code_byte(packed, group, bits, dim);
-    }
+    packed_row_to_seq_fast(packed, bits, dim, seq);
 }
 
 void turbovec_seq_row_to_packed(const uint8_t * seq, int bits, int dim, uint8_t * packed) {
-    const int codes_per_byte = 8 / bits;
-    const int field = bits == 3 ? 4 : bits;
-    const uint8_t mask = static_cast<uint8_t>((1u << bits) - 1u);
-    std::memset(packed, 0, turbovec_row_bytes(bits, static_cast<size_t>(dim)));
-    for (int coord = 0; coord < dim; ++coord) {
-        const int shift = (codes_per_byte - 1 - coord % codes_per_byte) * field;
-        const uint8_t code = static_cast<uint8_t>((seq[coord / codes_per_byte] >> shift) & mask);
-        turbovec_set_bitplane_code(packed, coord, bits, dim, code);
-    }
+    seq_row_to_packed_fast(seq, bits, dim, packed);
 }
 
 void decode_turbovec_row_calibrated(
