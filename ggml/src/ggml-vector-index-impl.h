@@ -15,6 +15,7 @@
 #include <cstdio>
 #include <cwchar>
 #include <cstring>
+#include <exception>
 #include <filesystem>
 #include <fstream>
 #include <limits>
@@ -196,6 +197,55 @@ struct MinHeapCmp {
     bool operator()(const ScoreId & a, const ScoreId & b) const { return score_id_better(a, b); }
 };
 
+inline constexpr int kMaxThreads = 256;
+
+// Runs fn(task, worker) for every task in [0, n_tasks) on up to n_threads
+// threads, the calling thread included; worker is in [0, workers). Tasks
+// are handed out dynamically, so fn must not depend on which worker runs a
+// task. Rethrows the first exception a task threw.
+template <typename Fn>
+void parallel_for(size_t n_tasks, int n_threads, Fn && fn) {
+    const size_t workers = std::min(n_tasks, static_cast<size_t>(std::max(1, n_threads)));
+    if (workers <= 1) {
+        for (size_t task = 0; task < n_tasks; ++task) {
+            fn(task, size_t{ 0 });
+        }
+        return;
+    }
+    std::atomic<size_t> next{ 0 };
+    std::mutex error_mutex;
+    std::exception_ptr error;
+    auto run = [&](size_t worker) {
+        try {
+            for (size_t task = next.fetch_add(1); task < n_tasks; task = next.fetch_add(1)) {
+                fn(task, worker);
+            }
+        } catch (...) {
+            std::lock_guard<std::mutex> lock(error_mutex);
+            if (!error) {
+                error = std::current_exception();
+            }
+            next.store(n_tasks);
+        }
+    };
+    std::vector<std::thread> threads;
+    threads.reserve(workers - 1);
+    try {
+        for (size_t worker = 1; worker < workers; ++worker) {
+            threads.emplace_back(run, worker);
+        }
+    } catch (...) {
+        // Fewer threads than asked: the ones started and this one finish.
+    }
+    run(0);
+    for (std::thread & thread : threads) {
+        thread.join();
+    }
+    if (error) {
+        std::rethrow_exception(error);
+    }
+}
+
 // A TurboVec index's binding to the v8 file it syncs to (upstream
 // `SyncCursor` plus its dirty sets). The file's row r holds slot
 // file_rows[r]: removals move the last row into the hole as upstream's
@@ -223,6 +273,9 @@ struct ggml_vec_index {
     int            dim                     = 0;
     int            bit_width               = 32;
     uint64_t       generation              = 0;
+    // Worker threads a call may use (ggml_vec_index_set_threads); 1 keeps
+    // every call on the calling thread.
+    int            n_threads               = 1;
     uint64_t       filter_cookie           = 0;
     bool           read_only_mmap          = false;
     bool           delta_log_start_allowed = false;
@@ -541,14 +594,16 @@ void quantize_turbovec_hadamard_batch(
     float * scales,
     int dim,
     const std::vector<float> & tqplus_shift,
-    const std::vector<float> & tqplus_scale);
+    const std::vector<float> & tqplus_scale,
+    int n_threads);
 int fit_turbovec_calibration(
     const float * sample,
     int n,
     int bits,
     int dim,
     std::vector<float> & out_shift,
-    std::vector<float> & out_scale);
+    std::vector<float> & out_scale,
+    int n_threads);
 void reencode_turbovec_rows(
     int bits,
     int dim,
@@ -560,7 +615,8 @@ void reencode_turbovec_rows(
     const std::vector<float> & new_shift,
     const std::vector<float> & new_scale,
     std::vector<uint8_t> & out_codes,
-    std::vector<float> & out_scales);
+    std::vector<float> & out_scales,
+    int n_threads);
 void turbovec_codebook_values(
     int bits,
     int dim,
