@@ -1625,6 +1625,60 @@ static void repack_turbovec_code_block(
     }
 }
 
+// One lane's code byte for a byte group of a blocked block, in either
+// in-memory layout: sequential lanes, or x86's perm0 nibble interleave
+// (see repack_turbovec_code_block).
+static uint8_t blocked_lane_byte(const uint8_t * group_bytes, size_t lane) {
+#if defined(__x86_64__) || defined(_M_X64)
+    const size_t p = lane % 16;
+    const size_t j = p < 8 ? 2 * p : 2 * (p - 8) + 1;
+    const int shift = lane < 16 ? 0 : 4;
+    return static_cast<uint8_t>(
+        (((group_bytes[j] >> shift) & 0x0f) << 4) | ((group_bytes[16 + j] >> shift) & 0x0f));
+#else
+    return group_bytes[lane];
+#endif
+}
+
+static void set_blocked_lane_byte(uint8_t * group_bytes, size_t lane, uint8_t value) {
+#if defined(__x86_64__) || defined(_M_X64)
+    const size_t p = lane % 16;
+    const size_t j = p < 8 ? 2 * p : 2 * (p - 8) + 1;
+    const int shift = lane < 16 ? 0 : 4;
+    const uint8_t keep = static_cast<uint8_t>(0xf0u >> shift);
+    group_bytes[j] = static_cast<uint8_t>((group_bytes[j] & keep) | ((value >> 4) << shift));
+    group_bytes[16 + j] = static_cast<uint8_t>((group_bytes[16 + j] & keep) | ((value & 0x0f) << shift));
+#else
+    group_bytes[lane] = value;
+#endif
+}
+
+void turbovec_blocked_swap_remove(ggml_vec_index & idx, size_t slot, size_t last) {
+    const size_t n_byte_groups = static_cast<size_t>(idx.dim) / static_cast<size_t>(8 / idx.turbovec_bits);
+    const size_t block_bytes = n_byte_groups * static_cast<size_t>(kTurboVecScoreBlock);
+    std::vector<uint8_t> & blocked = idx.turbovec_blocked_data;
+    if (blocked.size() != idx.turbovec_blocked_n_blocks * block_bytes ||
+        idx.turbovec_blocked_n_blocks != (last + kTurboVecScoreBlock) / kTurboVecScoreBlock) {
+        // No valid cache to patch; the next add or prepare rebuilds it.
+        blocked.clear();
+        idx.turbovec_blocked_n_blocks = 0;
+        return;
+    }
+    // Move the last lane into the hole, zero the vacated lane (a stale lane
+    // would break byte determinism), then drop a now-empty block.
+    const size_t lane_size = static_cast<size_t>(kTurboVecScoreBlock);
+    for (size_t g = 0; g < n_byte_groups; ++g) {
+        uint8_t * src = blocked.data() + (last / lane_size) * block_bytes + g * lane_size;
+        if (slot != last) {
+            uint8_t * dst = blocked.data() + (slot / lane_size) * block_bytes + g * lane_size;
+            set_blocked_lane_byte(dst, slot % lane_size, blocked_lane_byte(src, last % lane_size));
+        }
+        set_blocked_lane_byte(src, last % lane_size, 0);
+    }
+    idx.turbovec_blocked_n_blocks = (last + lane_size - 1) / lane_size;
+    blocked.resize(idx.turbovec_blocked_n_blocks * block_bytes);
+}
+
 void repack_turbovec_codes(
         const uint8_t * packed_codes,
         size_t n_vectors,

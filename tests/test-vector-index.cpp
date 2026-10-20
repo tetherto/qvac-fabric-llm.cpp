@@ -5158,12 +5158,16 @@ void check_vector_index_introspection() {
         size_t count = 0;
         CHECK(ggml_vec_index_ids(c.first, nullptr, 0, &count) == GGML_VEC_INDEX_OK);
         CHECK(count == 4);
-        std::vector<uint64_t> listed(2);
+        std::vector<uint64_t> listed(8, 0);
         CHECK(ggml_vec_index_ids(c.first, listed.data(), listed.size(), &count) == GGML_VEC_INDEX_OK);
-        CHECK(count == 4 && listed[0] == ids[0] && listed[1] == ids[2]);
-        listed.assign(8, 0);
-        CHECK(ggml_vec_index_ids(c.first, listed.data(), listed.size(), &count) == GGML_VEC_INDEX_OK);
-        CHECK(listed[3] == ids[4] && listed[4] == 0);
+        CHECK(count == 4 && listed[4] == 0);
+        std::vector<uint64_t> live(listed.begin(), listed.begin() + 4);
+        std::sort(live.begin(), live.end());
+        CHECK((live == std::vector<uint64_t>{ ids[0], ids[2], ids[3], ids[4] }));
+        // A short buffer gets a prefix of the same order.
+        std::vector<uint64_t> prefix(2);
+        CHECK(ggml_vec_index_ids(c.first, prefix.data(), prefix.size(), &count) == GGML_VEC_INDEX_OK);
+        CHECK(count == 4 && prefix[0] == listed[0] && prefix[1] == listed[1]);
         CHECK(ggml_vec_index_ids(c.first, nullptr, 1, &count) == GGML_VEC_INDEX_E_INVALID_ARG);
         CHECK(ggml_vec_index_ids(c.first, listed.data(), 1, nullptr) == GGML_VEC_INDEX_E_INVALID_ARG);
     }
@@ -5278,6 +5282,35 @@ void check_turbovec_1x_upstream_contracts() {
         write_u32_le_at(bad, scale_at + 4 * 3, tiny);
         write_u32_le_at(bad, calibrated_sb - 4, tv1x_crc32(bad, calibrated_sb - 4));
         CHECK(tv1x_load_bytes(bad) == nullptr);
+        ggml_vec_index_free(tv);
+    }
+
+    // Swap-removes patch the blocked search cache in place; it scores
+    // exactly like one rebuilt from the remaining rows.
+    for (const int bits : { 2, 3, 4 }) {
+        constexpr int rdim = 64;
+        const std::vector<float> rrows = tv1x_rows(kTv1xSeedDb, 300, rdim);
+        const std::vector<uint64_t> rids = tv1x_ids(300);
+        const std::vector<float> rqueries = tv1x_rows(kTv1xSeedQuery, 5, rdim);
+        auto * tv = ggml_vec_index_create_turbovec(rdim, bits);
+        CHECK(ggml_vec_index_add(tv, rrows.data(), 300, rids.data()) == GGML_VEC_INDEX_OK);
+        for (size_t i = 0; i < 300; i += 7) {
+            CHECK(ggml_vec_index_remove(tv, rids[(i * 13) % 300]) == GGML_VEC_INDEX_OK);
+        }
+        // The last slot itself (no move), whether or not already gone.
+        (void) ggml_vec_index_remove(tv, rids[299]);
+        uint8_t * data = nullptr;
+        size_t size = 0;
+        CHECK(ggml_vec_index_to_bytes(tv, &data, &size) == GGML_VEC_INDEX_OK);
+        ggml_vec_index_t * rebuilt = nullptr;
+        CHECK(ggml_vec_index_from_bytes(data, size, &rebuilt) == GGML_VEC_INDEX_OK);
+        ggml_vec_index_bytes_free(data);
+        std::vector<float> s1(5 * 20), s2(5 * 20);
+        std::vector<uint64_t> o1(5 * 20), o2(5 * 20);
+        CHECK(ggml_vec_index_search(tv, rqueries.data(), 5, 20, s1.data(), o1.data()) == GGML_VEC_INDEX_OK);
+        CHECK(ggml_vec_index_search(rebuilt, rqueries.data(), 5, 20, s2.data(), o2.data()) == GGML_VEC_INDEX_OK);
+        CHECK(o1 == o2 && s1 == s2);
+        ggml_vec_index_free(rebuilt);
         ggml_vec_index_free(tv);
     }
 
