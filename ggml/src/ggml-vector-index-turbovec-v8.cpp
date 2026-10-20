@@ -283,6 +283,15 @@ size_t turbovec_v8_image_size(const TurboVecV8Image & image) {
     return image.superblock.size() + 2 * image.header_len + image.units.size();
 }
 
+size_t turbovec_v8_serialized_size(const ggml_vec_index & idx) {
+    Geo geo;
+    geo.kind = kKindIdMap;
+    geo.dim = static_cast<size_t>(idx.dim);
+    geo.bits = idx.turbovec_bits;
+    geo.n_calib = idx.turbovec_tqplus_shift.size();
+    return geo.unit_at(active_count(idx) / kBlock);
+}
+
 void turbovec_v8_flatten_image(const TurboVecV8Image & image, std::vector<uint8_t> & out) {
     out.assign(turbovec_v8_image_size(image), 0);
     std::memcpy(out.data(), image.superblock.data(), image.superblock.size());

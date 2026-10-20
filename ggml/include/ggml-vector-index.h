@@ -20,6 +20,7 @@
 // Endianness: persistence format is fixed little-endian. Stream loaders decode
 // fields into host values; mmap loading requires a little-endian host.
 
+#include <stddef.h>
 #include <stdint.h>
 
 #ifndef GGML_API
@@ -307,7 +308,11 @@ GGML_VEC_INDEX_API int ggml_vec_index_search_ivf(
     float                  * out_scores,
     uint64_t               * out_ids);
 
-// Persistence. Writers use .tvim v2 for f32/q4/q8 and v3 for TurboVec.
+// Persistence. Writers use .tvim v2 for f32/q4/q8. TurboVec indexes write
+// upstream turbovec's v8 container, readable by turbovec 1.1 and later;
+// indexes loaded from a v3 snapshot keep writing v3. A v8 snapshot reserves
+// two fixed-size commit headers, mostly zero, which the writer leaves as a
+// file hole where the filesystem supports one.
 // Delta-bound handles must use `ggml_vec_index_compact_delta`; ordinary
 // snapshot writes return GGML_VEC_INDEX_E_INVALID_ARG.
 // Returns GGML_VEC_INDEX_E_NOT_DURABLE when the file was atomically replaced
@@ -317,7 +322,29 @@ GGML_VEC_INDEX_API int ggml_vec_index_write(
     ggml_vec_index_t * idx,
     const char       * path);
 
-// Loads v2/v3 files and migrates v1 f32 snapshots. Legacy bit_width=8 snapshots
+// In-memory snapshots of a TurboVec index (not a v3-loaded one): exactly the
+// bytes `ggml_vec_index_write` puts in the file, padding included. The
+// buffer is allocated by the library; free it with `ggml_vec_index_bytes_free`.
+// Other storage modes return GGML_VEC_INDEX_E_INVALID_ARG.
+GGML_VEC_INDEX_API int ggml_vec_index_to_bytes(
+    const ggml_vec_index_t * idx,
+    uint8_t               ** out_bytes,
+    size_t                 * out_size);
+
+GGML_VEC_INDEX_API void ggml_vec_index_bytes_free(uint8_t * bytes);
+
+// Exact byte size `ggml_vec_index_to_bytes` returns, without serializing.
+// Returns 0 for indexes it does not support.
+GGML_VEC_INDEX_API size_t ggml_vec_index_serialized_size(const ggml_vec_index_t * idx);
+
+// Loads a TurboVec v8 snapshot from memory with the same validation as
+// `ggml_vec_index_load_ex`.
+GGML_VEC_INDEX_API int ggml_vec_index_from_bytes(
+    const uint8_t      * bytes,
+    size_t               size,
+    ggml_vec_index_t  ** out);
+
+// Loads v2/v3 and v7/v8 files and migrates v1 f32 snapshots. Legacy bit_width=8 snapshots
 // are quantized to q8; all other legacy bit widths migrate to f32/32-bit.
 // Returns 0 on success and stores the loaded handle in `out`.
 GGML_VEC_INDEX_API int ggml_vec_index_load_ex(

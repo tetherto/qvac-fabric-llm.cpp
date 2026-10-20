@@ -4673,6 +4673,35 @@ void check_turbovec_1x_snapshot_interop() {
         CHECK(scores == expected_scores);
     };
 
+    // In-memory snapshots are the same image.
+    CHECK(ggml_vec_index_serialized_size(idx) == upstream.size());
+    uint8_t * bytes = nullptr;
+    size_t size = 0;
+    CHECK(ggml_vec_index_to_bytes(idx, &bytes, &size) == GGML_VEC_INDEX_OK);
+    CHECK(size == upstream.size());
+    CHECK(std::equal(bytes, bytes + size, upstream.begin()));
+    ggml_vec_index_t * from_bytes = nullptr;
+    CHECK(ggml_vec_index_from_bytes(bytes, size, &from_bytes) == GGML_VEC_INDEX_OK);
+    check_loaded(from_bytes);
+    ggml_vec_index_free(from_bytes);
+    CHECK(ggml_vec_index_from_bytes(bytes, size / 2, &from_bytes) != GGML_VEC_INDEX_OK);
+    CHECK(from_bytes == nullptr);
+    ggml_vec_index_bytes_free(bytes);
+    const uint8_t garbage[8] = { 'n', 'o', 't', 'a', 't', 'v', '8', 0 };
+    CHECK(ggml_vec_index_from_bytes(garbage, sizeof(garbage), &from_bytes) == GGML_VEC_INDEX_E_BAD_MAGIC);
+    CHECK(ggml_vec_index_from_bytes(nullptr, 4, &from_bytes) == GGML_VEC_INDEX_E_INVALID_ARG);
+    CHECK(ggml_vec_index_to_bytes(idx, nullptr, &size) == GGML_VEC_INDEX_E_INVALID_ARG);
+    {
+        auto * generic = ggml_vec_index_create(kTv1xImageDim, 8);
+        CHECK(ggml_vec_index_to_bytes(generic, &bytes, &size) == GGML_VEC_INDEX_E_INVALID_ARG);
+        CHECK(bytes == nullptr && size == 0);
+        CHECK(ggml_vec_index_serialized_size(generic) == 0);
+        ggml_vec_index_free(generic);
+        auto * legacy = create_legacy_turbovec(kTv1xImageDim, 4);
+        CHECK(ggml_vec_index_to_bytes(legacy, &bytes, &size) == GGML_VEC_INDEX_E_INVALID_ARG);
+        ggml_vec_index_free(legacy);
+    }
+
     // Upstream's image loads, and saving it again reproduces it.
     auto * loaded = tv1x_load_bytes(upstream);
     check_loaded(loaded);

@@ -3322,6 +3322,89 @@ int ggml_vec_index_write(ggml_vec_index_t * idx, const char * path) {
     }
 }
 
+static bool supports_bytes(const ggml_vec_index & idx) {
+    return is_turbovec(idx) && !idx.turbovec_legacy && !idx.delta_log_bound;
+}
+
+int ggml_vec_index_to_bytes(const ggml_vec_index_t * idx, uint8_t ** out_bytes, size_t * out_size) {
+    if (out_bytes == nullptr || out_size == nullptr) {
+        return GGML_VEC_INDEX_E_INVALID_ARG;
+    }
+    *out_bytes = nullptr;
+    *out_size = 0;
+    if (idx == nullptr) {
+        return GGML_VEC_INDEX_E_INVALID_ARG;
+    }
+    try {
+        std::shared_lock<std::shared_mutex> lock(idx->mutex);
+        if (!supports_bytes(*idx)) {
+            return GGML_VEC_INDEX_E_INVALID_ARG;
+        }
+        TurboVecV8Image image;
+        turbovec_v8_build_image(*idx, image);
+        const size_t size = turbovec_v8_image_size(image);
+        auto * bytes = static_cast<uint8_t *>(std::calloc(size, 1));
+        if (bytes == nullptr) {
+            return GGML_VEC_INDEX_E_OOM;
+        }
+        std::memcpy(bytes, image.superblock.data(), image.superblock.size());
+        std::memcpy(bytes + image.superblock.size(), image.header0.data(), image.header0.size());
+        if (!image.units.empty()) {
+            std::memcpy(bytes + image.superblock.size() + 2 * image.header_len, image.units.data(), image.units.size());
+        }
+        *out_bytes = bytes;
+        *out_size = size;
+        return GGML_VEC_INDEX_OK;
+    } catch (const std::bad_alloc &) {
+        return GGML_VEC_INDEX_E_OOM;
+    } catch (...) {
+        return GGML_VEC_INDEX_E_INTERNAL;
+    }
+}
+
+void ggml_vec_index_bytes_free(uint8_t * bytes) {
+    std::free(bytes);
+}
+
+size_t ggml_vec_index_serialized_size(const ggml_vec_index_t * idx) {
+    if (idx == nullptr) {
+        return 0;
+    }
+    try {
+        std::shared_lock<std::shared_mutex> lock(idx->mutex);
+        return supports_bytes(*idx) ? turbovec_v8_serialized_size(*idx) : 0;
+    } catch (...) {
+        return 0;
+    }
+}
+
+int ggml_vec_index_from_bytes(const uint8_t * bytes, size_t size, ggml_vec_index_t ** out) {
+    if (out == nullptr) {
+        return GGML_VEC_INDEX_E_INVALID_ARG;
+    }
+    *out = nullptr;
+    if (bytes == nullptr || size == 0) {
+        return GGML_VEC_INDEX_E_INVALID_ARG;
+    }
+    try {
+        if (!turbovec_v8_magic(bytes, size)) {
+            return GGML_VEC_INDEX_E_BAD_MAGIC;
+        }
+        test_maybe_throw_bad_alloc();
+        int error = GGML_VEC_INDEX_E_IO;
+        ggml_vec_index_t * idx = turbovec_v8_load_image(std::vector<uint8_t>(bytes, bytes + size), error);
+        if (idx == nullptr) {
+            return error;
+        }
+        *out = idx;
+        return GGML_VEC_INDEX_OK;
+    } catch (const std::bad_alloc &) {
+        return GGML_VEC_INDEX_E_OOM;
+    } catch (...) {
+        return GGML_VEC_INDEX_E_INTERNAL;
+    }
+}
+
 int ggml_vec_index_load_ex(const char * path, ggml_vec_index_t ** out) {
     if (out == nullptr) {
         return GGML_VEC_INDEX_E_INVALID_ARG;
