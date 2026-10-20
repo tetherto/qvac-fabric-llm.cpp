@@ -493,9 +493,12 @@ kernel void kernel_norm_channel_f32(
     device       float * y_t = y + batch_offset + (size_t) t * syt;
 
     // ---- Mean ----
+    // Shifted two-pass: sums run over x - pivot so a large shared offset does
+    // not swallow the channel variation.
+    const float pivot = x_t[0];
     float my_sum = 0.0f;
     for (int c = (int) tpitg.x; c < C; c += (int) ntg.x) {
-        my_sum += x_t[(size_t) c * sxc];
+        my_sum += x_t[(size_t) c * sxc] - pivot;
     }
     // Simdgroup reduce within the simdgroup.
     my_sum = simd_sum(my_sum);
@@ -511,12 +514,13 @@ kernel void kernel_norm_channel_f32(
         if (tiisg == 0) shared[0] = total;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    const float mean = shared[0] / (float) C;
+    const float delta = shared[0] / (float) C;
+    const float mean = pivot + delta;
 
     // ---- Variance ----
     float my_sq = 0.0f;
     for (int c = (int) tpitg.x; c < C; c += (int) ntg.x) {
-        const float d = x_t[(size_t) c * sxc] - mean;
+        const float d = (x_t[(size_t) c * sxc] - pivot) - delta;
         my_sq = fma(d, d, my_sq);
     }
     my_sq = simd_sum(my_sq);
