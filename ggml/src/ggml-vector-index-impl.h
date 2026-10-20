@@ -196,6 +196,27 @@ struct MinHeapCmp {
     bool operator()(const ScoreId & a, const ScoreId & b) const { return score_id_better(a, b); }
 };
 
+// A TurboVec index's binding to the v8 file it syncs to (upstream
+// `SyncCursor` plus its dirty sets). The file's row r holds slot
+// file_rows[r]: removals move the last row into the hole as upstream's
+// swap-remove does, so the file's row order can differ from slot order.
+struct TurboVecSyncBinding {
+    bool bound = false;
+    std::string path;
+    // Generation and row count of the last commit, the file's identity,
+    // and the calibration generation that commit was written under.
+    uint64_t gen = 0;
+    uint64_t n_synced = 0;
+    uint64_t nonce = 0;
+    uint64_t calib_gen = 0;
+    std::vector<size_t> file_rows;
+    // slot -> file row, SIZE_MAX for a slot the file does not hold.
+    std::vector<size_t> slot_rows;
+    // File rows whose redo ops ride the last commit, and rows changed since.
+    std::unordered_set<size_t> pending;
+    std::unordered_set<size_t> fresh;
+};
+
 struct ggml_vec_index {
     mutable std::shared_mutex mutex;
 
@@ -235,6 +256,9 @@ struct ggml_vec_index {
     // True for an index loaded from a v3 snapshot: it keeps the turbovec 0.9
     // QR rotation, codebook and first-add calibration it was written with.
     bool turbovec_legacy = false;
+    // Bumped by every calibrate; a sync across one rewrites the whole file.
+    uint64_t turbovec_calib_gen = 0;
+    TurboVecSyncBinding turbovec_sync;
     std::vector<uint8_t> turbovec_data;
     std::vector<float>   turbovec_scale;
     std::vector<float>   turbovec_tqplus_shift;
@@ -455,6 +479,10 @@ int turbovec_avx2_lut_block_matches_scalar_for_test(int bits, int dim);
 void turbovec_reset_block_score_call_count_for_test(void);
 int64_t turbovec_block_score_call_count_for_test(void);
 void turbovec_hadamard_rotate_for_test(const float * src, float * dst, int dim);
+int turbovec_sync_plan_for_test(
+    ggml_vec_index_t * idx,
+    const char * path,
+    std::vector<std::vector<std::pair<uint64_t, std::vector<uint8_t>>>> & batches);
 int turbovec_index_hashes_for_test(
     const ggml_vec_index_t * idx,
     uint64_t * codes_hash,
@@ -558,7 +586,33 @@ void turbovec_v8_build_image(const ggml_vec_index & idx, TurboVecV8Image & image
 size_t turbovec_v8_image_size(const TurboVecV8Image & image);
 size_t turbovec_v8_serialized_size(const ggml_vec_index & idx);
 void turbovec_v8_flatten_image(const TurboVecV8Image & image, std::vector<uint8_t> & out);
-ggml_vec_index_t * turbovec_v8_load_image(std::vector<uint8_t> raw, int & error);
+struct TurboVecV8LoadInfo {
+    uint64_t gen = 0;
+    uint64_t nonce = 0;
+    // File rows with redo ops in the adopted commit.
+    std::vector<size_t> pending;
+};
+ggml_vec_index_t * turbovec_v8_load_image(std::vector<uint8_t> raw, int & error, TurboVecV8LoadInfo * info);
+
+// Positioned writes made durable together (one fsync per batch).
+using TurboVecWriteBatch = std::vector<std::pair<uint64_t, std::vector<uint8_t>>>;
+int turbovec_v8_write_file(const char * path, const TurboVecV8Image & image);
+int turbovec_v8_apply_batches(const char * path, const std::vector<TurboVecWriteBatch> & batches);
+// Reads up to `size` bytes at `offset`; GGML_VEC_INDEX_E_NOT_FOUND when the
+// file does not exist.
+int turbovec_read_file_range(
+    const char * path,
+    uint64_t offset,
+    size_t size,
+    std::vector<uint8_t> & out,
+    uint64_t & file_size);
+void turbovec_sync_bind_loaded(ggml_vec_index & idx, const char * path, const TurboVecV8LoadInfo & info);
+void turbovec_sync_unbind(ggml_vec_index & idx) noexcept;
+void turbovec_sync_note_add(ggml_vec_index & idx, size_t base_slot, size_t n) noexcept;
+void turbovec_sync_note_remove(ggml_vec_index & idx, size_t slot) noexcept;
+// Call during compaction, while slot_active still describes the old slots.
+void turbovec_sync_note_compact(ggml_vec_index & idx) noexcept;
+int turbovec_v8_sync(ggml_vec_index & idx, const char * path);
 void decode_turbovec_q2_row(const uint8_t * codes, const float * scales, float * dst, int dim);
 void decode_turbovec_q2_row_calibrated(
     const uint8_t * codes,

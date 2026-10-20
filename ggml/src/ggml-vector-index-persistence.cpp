@@ -3020,9 +3020,7 @@ static bool seek_to(std::FILE * stream, uint64_t offset) {
 // the two fixed-size header slots is skipped with a seek, so filesystems
 // with sparse-file support store it as a hole; the bytes read back are the
 // same as upstream's.
-static int write_turbovec_v8_unlocked(ggml_vec_index_t * idx, const char * path) {
-    TurboVecV8Image image;
-    turbovec_v8_build_image(*idx, image);
+int turbovec_v8_write_file(const char * path, const TurboVecV8Image & image) {
     const uint64_t image_size = turbovec_v8_image_size(image);
 
     test_maybe_throw_bad_alloc();
@@ -3066,6 +3064,100 @@ static int write_turbovec_v8_unlocked(ggml_vec_index_t * idx, const char * path)
         return GGML_VEC_INDEX_E_NOT_DURABLE;
     }
     return GGML_VEC_INDEX_OK;
+}
+
+static int write_turbovec_v8_unlocked(ggml_vec_index_t * idx, const char * path) {
+    TurboVecV8Image image;
+    turbovec_v8_build_image(*idx, image);
+    return turbovec_v8_write_file(path, image);
+}
+
+static std::FILE * open_existing_rw(const char * path) {
+#ifdef _WIN32
+    std::wstring wide;
+    if (!utf8_to_wide(path, wide)) {
+        return nullptr;
+    }
+    return _wfopen(wide.c_str(), L"r+b");
+#else
+    return std::fopen(path, "r+b");
+#endif
+}
+
+int turbovec_v8_apply_batches(const char * path, const std::vector<TurboVecWriteBatch> & batches) {
+    std::FILE * f = open_existing_rw(path);
+    if (f == nullptr) {
+        return GGML_VEC_INDEX_E_IO;
+    }
+    for (const TurboVecWriteBatch & batch : batches) {
+        for (const auto & op : batch) {
+            if (!seek_to(f, op.first) || !write_bytes(f, op.second.data(), op.second.size())) {
+                std::fclose(f);
+                return GGML_VEC_INDEX_E_IO;
+            }
+        }
+        if (!flush_and_sync(f)) {
+            std::fclose(f);
+            return GGML_VEC_INDEX_E_IO;
+        }
+    }
+    return std::fclose(f) == 0 ? GGML_VEC_INDEX_OK : GGML_VEC_INDEX_E_IO;
+}
+
+int turbovec_read_file_range(
+        const char * path,
+        uint64_t offset,
+        size_t size,
+        std::vector<uint8_t> & out,
+        uint64_t & file_size) {
+    out.clear();
+    std::filesystem::path fs_path;
+    if (!filesystem_path_from_utf8(path, fs_path)) {
+        return GGML_VEC_INDEX_E_INVALID_ARG;
+    }
+    std::error_code ec;
+    const uintmax_t length = std::filesystem::file_size(fs_path, ec);
+    if (ec) {
+        return std::filesystem::exists(fs_path, ec) ? GGML_VEC_INDEX_E_IO : GGML_VEC_INDEX_E_NOT_FOUND;
+    }
+    file_size = static_cast<uint64_t>(length);
+    if (offset >= file_size) {
+        return GGML_VEC_INDEX_OK;
+    }
+    const uint64_t available = file_size - offset;
+    const size_t want = static_cast<size_t>(std::min<uint64_t>(available, size));
+    std::ifstream f(fs_path, std::ios::binary);
+    if (!f.is_open()) {
+        return GGML_VEC_INDEX_E_IO;
+    }
+    out.resize(want);
+    f.seekg(static_cast<std::streamoff>(offset), std::ios::beg);
+    f.read(reinterpret_cast<char *>(out.data()), static_cast<std::streamsize>(want));
+    if (!f || f.gcount() != static_cast<std::streamsize>(want)) {
+        out.clear();
+        return GGML_VEC_INDEX_E_IO;
+    }
+    return GGML_VEC_INDEX_OK;
+}
+
+int ggml_vec_index_sync(ggml_vec_index_t * idx, const char * path) {
+    if (idx == nullptr || path == nullptr) {
+        return GGML_VEC_INDEX_E_INVALID_ARG;
+    }
+    try {
+        std::unique_lock<std::shared_mutex> lock(idx->mutex);
+        if (!is_turbovec(*idx) || idx->turbovec_legacy || idx->delta_log_bound) {
+            return GGML_VEC_INDEX_E_INVALID_ARG;
+        }
+        test_maybe_throw_bad_alloc();
+        return turbovec_v8_sync(*idx, path);
+    } catch (const std::bad_alloc &) {
+        turbovec_sync_unbind(*idx);
+        return GGML_VEC_INDEX_E_OOM;
+    } catch (...) {
+        turbovec_sync_unbind(*idx);
+        return GGML_VEC_INDEX_E_INTERNAL;
+    }
 }
 
 static int ggml_vec_index_write_unlocked(ggml_vec_index_t * idx, const char * path) {
@@ -3392,10 +3484,11 @@ int ggml_vec_index_from_bytes(const uint8_t * bytes, size_t size, ggml_vec_index
         }
         test_maybe_throw_bad_alloc();
         int error = GGML_VEC_INDEX_E_IO;
-        ggml_vec_index_t * idx = turbovec_v8_load_image(std::vector<uint8_t>(bytes, bytes + size), error);
+        ggml_vec_index_t * idx = turbovec_v8_load_image(std::vector<uint8_t>(bytes, bytes + size), error, nullptr);
         if (idx == nullptr) {
             return error;
         }
+        turbovec_sync_bind_loaded(*idx, nullptr, TurboVecV8LoadInfo{});
         *out = idx;
         return GGML_VEC_INDEX_OK;
     } catch (const std::bad_alloc &) {
@@ -3458,10 +3551,13 @@ ggml_vec_index_t * ggml_vec_index_load(const char * path) {
                 return load_fail(GGML_VEC_INDEX_E_IO);
             }
             int error = GGML_VEC_INDEX_E_IO;
-            ggml_vec_index_t * loaded = turbovec_v8_load_image(std::move(raw), error);
+            TurboVecV8LoadInfo info;
+            ggml_vec_index_t * loaded = turbovec_v8_load_image(std::move(raw), error, &info);
             if (loaded == nullptr) {
                 return load_fail(error);
             }
+            // A file a sync claimed binds the loaded index to it.
+            turbovec_sync_bind_loaded(*loaded, path, info);
             loaded->delta_log_start_allowed = false;
             g_last_load_error = GGML_VEC_INDEX_OK;
             return loaded;

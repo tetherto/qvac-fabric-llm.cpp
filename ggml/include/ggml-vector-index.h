@@ -344,6 +344,19 @@ GGML_VEC_INDEX_API int ggml_vec_index_from_bytes(
     size_t               size,
     ggml_vec_index_t  ** out);
 
+// Incremental save of a TurboVec index (not a v3-loaded one) to `path`
+// (upstream turbovec `sync`). The first sync to a path, and any sync after a
+// calibrate, writes the whole file and claims it; later syncs write only the
+// blocks and commit header that changed, durable after one fsync. A crash
+// at any byte leaves the previous commit loadable. Loading a synced file
+// binds the loaded index to it, so syncs continue incrementally. Returns
+// GGML_VEC_INDEX_E_IO when another writer has advanced or replaced the file
+// (load it to adopt its state), and GGML_VEC_INDEX_E_NOT_DURABLE as
+// `ggml_vec_index_write` does. One writer per path.
+GGML_VEC_INDEX_API int ggml_vec_index_sync(
+    ggml_vec_index_t * idx,
+    const char       * path);
+
 // Loads v2/v3 and v7/v8 files and migrates v1 f32 snapshots. Legacy bit_width=8 snapshots
 // are quantized to q8; all other legacy bit widths migrate to f32/32-bit.
 // Returns 0 on success and stores the loaded handle in `out`.

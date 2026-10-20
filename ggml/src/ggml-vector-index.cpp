@@ -639,6 +639,7 @@ int ggml_vec_index_add_unlocked(
         }
         idx->n_active += n_sz;
         if (is_turbovec(*idx)) {
+            turbovec_sync_note_add(*idx, base_slot, n_sz);
             repack_turbovec_codes_from_slot(
                 idx->turbovec_data.data(),
                 new_slots,
@@ -712,6 +713,9 @@ int ggml_vec_index_remove_unlocked(
             return GGML_VEC_INDEX_E_INVALID_ARG;
         }
         remove_state_hash(*idx, slot_state_hash(*idx, slot));
+        if (is_turbovec(*idx)) {
+            turbovec_sync_note_remove(*idx, slot);
+        }
         idx->slot_active[slot] = 0;
         --idx->n_active;
         idx->id_to_slot.erase(it);
@@ -871,6 +875,9 @@ static int ggml_vec_index_compact_unlocked(ggml_vec_index_t * idx) {
             idx->data.swap(new_data);
         }
 
+        if (is_turbovec(*idx)) {
+            turbovec_sync_note_compact(*idx);
+        }
         idx->slot_to_id.swap(new_slot_to_id);
         idx->slot_active.swap(new_slot_active);
         idx->id_to_slot.swap(new_id_to_slot);
@@ -1302,6 +1309,7 @@ int ggml_vec_index_turbovec_calibrate(ggml_vec_index_t * idx, const float * samp
 
         idx->turbovec_tqplus_shift.swap(shift);
         idx->turbovec_tqplus_scale.swap(scale);
+        ++idx->turbovec_calib_gen;
         if (n_slots != 0) {
             idx->turbovec_data.swap(codes);
             idx->turbovec_scale.swap(scales);
