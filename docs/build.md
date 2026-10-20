@@ -836,7 +836,7 @@ cmake --build build --config Release
 
 Native builds must use a Dawn package compatible with the target platform and C++ runtime. For clang/libc++ builds, build Dawn with the same toolchain instead of combining it with a GCC/libstdc++ prebuilt package. Set `Dawn_DIR` or `CMAKE_PREFIX_PATH` to locate that package.
 
-WebGPU does not require disabling CUDA, Vulkan, or Metal. Disable other GPU backends when isolating WebGPU measurements, or select the WebGPU device explicitly with `--device WebGPU`. Dynamic backend builds must package the WebGPU module alongside their other backend modules.
+WebGPU does not require disabling CUDA, Vulkan, or Metal. Disable other GPU backends when isolating WebGPU measurements, or select the WebGPU device explicitly with `--device WebGPU`. Dynamic backend builds must package the WebGPU module alongside their other backend modules. WebGPU discovery through `ggml_backend_load_all()` is opt-in: set `GGML_WEBGPU_AUTOLOAD=1` before starting the process. Otherwise a packaged WebGPU module is not loaded, preserving the existing CUDA, Vulkan, and Metal selection. `--device WebGPU` selects an already registered device; it does not enable loading. The automatic loader keeps WebGPU disabled on Adreno 6xx when the Vulkan probe identifies that device family. Explicit module loading through `ggml_backend_load()` or `GGML_BACKEND_PATH` remains available and bypasses the automatic loading policy.
 
 ### Browser Support
 
@@ -869,17 +869,17 @@ With `GGML_WEBGPU=ON` and `LLAMA_BUILD_TESTS=ON`, build and run the registry reg
 
 ```sh
 cmake --build build --target test-webgpu-registry
-TEST_WEBGPU_REQUIRE_DEVICE=1 ctest --test-dir build -R '^test-webgpu-registry$' --output-on-failure
+TEST_WEBGPU_REQUIRE_DEVICE=1 ctest --test-dir build -R '^test-webgpu-registry' --output-on-failure
 ```
 
-Run this in separate native builds with `GGML_BACKEND_DL=ON` and `GGML_BACKEND_DL=OFF`. The test checks automatic discovery and repeated registration. Without `TEST_WEBGPU_REQUIRE_DEVICE=1`, an unavailable device or Dawn's Null test backend skips the test with exit code 77. With `TEST_WEBGPU_REQUIRE_DEVICE=1`, either condition fails the test. For a deliberately disabled adapter fixture, set `TEST_WEBGPU_EXPECT_DISABLED=1` instead; this requires zero devices and an explanatory warning. These environment variables control test expectations, not adapter capabilities.
+Run this in separate native builds with `GGML_BACKEND_DL=ON` and `GGML_BACKEND_DL=OFF`. The test enables dynamic discovery with `GGML_WEBGPU_AUTOLOAD=1` and checks repeated registration and device reuse. A separate dynamic-build test verifies that `GGML_WEBGPU_AUTOLOAD=0` does not load WebGPU. Without `TEST_WEBGPU_REQUIRE_DEVICE=1`, an unavailable device or Dawn's Null test backend skips the test with exit code 77. With `TEST_WEBGPU_REQUIRE_DEVICE=1`, either condition fails the test. For a deliberately disabled adapter fixture, set `TEST_WEBGPU_EXPECT_DISABLED=1` instead; this requires zero devices and an explanatory warning. These environment variables control test expectations, not adapter capabilities.
 
 For inference validation, use the same model and workload on native and browser builds:
 
 ```sh
 cmake --build build --target llama-bench test-backend-ops
-build/bin/test-backend-ops test -b WebGPU
-build/bin/llama-bench -v -m /absolute/path/to/model.gguf --load-mode none --device WebGPU -ngl 999 -fa on -t 1 -p 128 -n 16 -r 3
+GGML_WEBGPU_AUTOLOAD=1 build/bin/test-backend-ops test -b WebGPU
+GGML_WEBGPU_AUTOLOAD=1 build/bin/llama-bench -v -m /absolute/path/to/model.gguf --load-mode none --device WebGPU -ngl 999 -fa on -t 1 -p 128 -n 16 -r 3
 ```
 
 Check that the operator test actually exercises WebGPU and that the benchmark offloads layers to it. On hybrid GPU systems, also record the adapter identity without external ICD pinning to verify the high-performance preference. Compare throughput only with matching model, quantization, flash-attention settings, and prompt and generation lengths.

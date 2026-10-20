@@ -825,10 +825,11 @@ void ggml_backend_load_all_from_path(const char * dir_path) {
     ggml_backend_load_best("rpc", silent, dir_path);
     ggml_backend_load_best("sycl", silent, dir_path);
     ggml_backend_load_best("vulkan", silent, dir_path);
-    ggml_backend_load_best("webgpu", silent, dir_path);
     ggml_backend_load_best("virtgpu", silent, dir_path);
 
     bool useOpencl = true;
+    const char * webgpu_autoload = std::getenv("GGML_WEBGPU_AUTOLOAD");
+    bool useWebgpu = webgpu_autoload != nullptr && std::strcmp(webgpu_autoload, "1") == 0;
 
 #ifdef __ANDROID__
     // Logic for buggy backends on Adreno GPUs
@@ -849,6 +850,7 @@ void ggml_backend_load_all_from_path(const char * dir_path) {
             GGML_LOG_INFO("%s: Vulkan backend removed\n", __func__);
         }
         useOpencl = false;
+        useWebgpu = false;
     }
 #endif
 
@@ -858,6 +860,9 @@ void ggml_backend_load_all_from_path(const char * dir_path) {
     ggml_backend_load_best("hexagon", silent, dir_path);
     ggml_backend_load_best("musa", silent, dir_path);
     ggml_backend_load_best("openvino", silent, dir_path);
+    if (useWebgpu) {
+        ggml_backend_load_best("webgpu", silent, dir_path);
+    }
     ggml_backend_load_best("cpu", silent, dir_path);
     // check the environment variable GGML_BACKEND_PATH to load an out-of-tree backend
     const char * backend_path = std::getenv("GGML_BACKEND_PATH");

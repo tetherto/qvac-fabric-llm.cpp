@@ -389,6 +389,10 @@ if (GGML_WEBGPU AND NOT EMSCRIPTEN)
         add_dependencies(test-webgpu-registry ggml-webgpu)
         llama_test(test-webgpu-registry
             ARGS "$<TARGET_FILE_DIR:ggml-webgpu>" "$<TARGET_FILE:ggml-webgpu>")
+        set_tests_properties(test-webgpu-registry PROPERTIES ENVIRONMENT "GGML_WEBGPU_AUTOLOAD=1")
+        llama_test(test-webgpu-registry NAME test-webgpu-registry-no-autoload
+            ARGS "$<TARGET_FILE_DIR:ggml-webgpu>" "$<TARGET_FILE:ggml-webgpu>" --no-autoload)
+        set_tests_properties(test-webgpu-registry-no-autoload PROPERTIES ENVIRONMENT "GGML_WEBGPU_AUTOLOAD=0")
     else()
         target_link_libraries(test-webgpu-registry PRIVATE ggml-webgpu)
         llama_test(test-webgpu-registry)

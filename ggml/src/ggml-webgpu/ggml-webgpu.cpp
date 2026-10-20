@@ -4118,7 +4118,7 @@ static void ggml_webgpu_init_memset_pipeline(webgpu_global_context & ctx) {
 
 static void ggml_backend_webgpu_request_adapter(wgpu::Instance & instance, wgpu::Adapter & adapter) {
     wgpu::RequestAdapterOptions options = {};
-    options.powerPreference = wgpu::PowerPreference::HighPerformance;
+    options.powerPreference             = wgpu::PowerPreference::HighPerformance;
 
 #ifndef __EMSCRIPTEN__
     // TODO: track need for these toggles: https://issues.chromium.org/issues/42251215
@@ -4821,7 +4821,9 @@ static ggml_backend_dev_t ggml_backend_webgpu_reg_get_device(ggml_backend_reg_t 
 
     ggml_backend_webgpu_reg_context * reg_ctx = static_cast<ggml_backend_webgpu_reg_context *>(reg->context);
 
-    create_webgpu_device(reg_ctx);
+    if (reg_ctx->webgpu_global_ctx->device == nullptr) {
+        create_webgpu_device(reg_ctx);
+    }
 
     static ggml_backend_webgpu_device_context device_ctx;
     device_ctx.device_name            = GGML_WEBGPU_NAME;
@@ -4860,12 +4862,10 @@ ggml_backend_reg_t ggml_backend_webgpu_reg() {
         /* .context     = */ ctx,
     };
 
-    ctx->name         = GGML_WEBGPU_NAME;
+    ctx->name = GGML_WEBGPU_NAME;
 
-    // Keep one Dawn/WebGPU instance alive for the lifetime of the static backend
-    // registry. Recreating it on repeated registry lookups can invalidate
-    // adapter/device references that are still held by the backend/device layer.
-    if (ctx->webgpu_global_ctx != nullptr && ctx->webgpu_global_ctx->instance != nullptr) {
+    // Cache setup failures too, so repeated lookups do not retry or repeat diagnostics.
+    if (ctx->webgpu_global_ctx != nullptr) {
         return &reg;
     }
 
@@ -4900,7 +4900,9 @@ ggml_backend_reg_t ggml_backend_webgpu_reg() {
     } else if (!adapter.HasFeature(wgpu::FeatureName::ShaderF16)) {
         GGML_LOG_WARN("ggml_webgpu: adapter lacks shader-f16, backend disabled\n");
 #ifdef __EMSCRIPTEN__
-        GGML_LOG_WARN("ggml_webgpu: on affected Chromium NVIDIA/Vulkan configurations, try --enable-dawn-features=vulkan_enable_f16_on_nvidia\n");
+        GGML_LOG_WARN(
+            "ggml_webgpu: on affected Chromium NVIDIA/Vulkan configurations, try "
+            "--enable-dawn-features=vulkan_enable_f16_on_nvidia\n");
 #endif
 #ifndef __EMSCRIPTEN__
     } else if (!adapter.HasFeature(wgpu::FeatureName::ImplicitDeviceSynchronization)) {
