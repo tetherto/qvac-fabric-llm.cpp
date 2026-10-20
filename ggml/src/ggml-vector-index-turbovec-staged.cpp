@@ -547,7 +547,14 @@ bool turbovec_staged_search(
                 sign_lut.values.data(), sign_lut.scale, sign_lut.bias, idx.turbovec_sign_blocked.data(), vscales,
                 block, n, 2, dim / 2, block_scores);
             const size_t count = std::min(kBlock, n - block * kBlock);
+            // Rows arrive in slot order, so once the shortlist is full a row
+            // scoring no better than its worst cannot displace it.
+            const bool full = top.size() == s_len;
+            const double threshold = full ? top.front().score : 0.0;
             for (size_t lane = 0; lane < count; ++lane) {
+                if (full && static_cast<double>(block_scores[lane]) <= threshold) {
+                    continue;
+                }
                 const size_t v = block * kBlock + lane;
                 if (allowed_mask != nullptr && allowed_mask[v] == 0) {
                     continue;

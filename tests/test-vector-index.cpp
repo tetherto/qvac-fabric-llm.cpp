@@ -5806,6 +5806,89 @@ void check_turbovec_1x_staged() {
 }
 #endif
 
+#ifdef GGML_VEC_INDEX_TEST_HOOKS
+// The staged-search cache follows every mutation: an index searched after
+// adds, removals, a calibrate or a reload agrees with one rebuilt from its
+// bytes, and the file layout follows the index's size across syncs.
+void check_turbovec_1x_staged_maintenance() {
+    constexpr int dim = 64;
+    constexpr int threshold = 1000;
+    const std::vector<float> rows = tv1x_rows(kTv1xSeedDb, 3000, dim);
+    const std::vector<uint64_t> ids = tv1x_ids(3000);
+    const std::vector<float> queries = tv1x_rows(kTv1xSeedQuery, 4, dim);
+    const std::vector<float> calib = tv1x_rows(kTv1xSeedCalib, 1024, dim);
+    const std::string path = (std::filesystem::temp_directory_path() / "ggml-vector-index-tv1x-staged-sync.tvim").string();
+    turbovec_force_planes_for_test(1, threshold);
+    turbovec_force_vector_major_for_test(1);
+    auto agrees_with_rebuilt = [&](ggml_vec_index_t * tv) {
+        uint8_t * data = nullptr;
+        size_t size = 0;
+        CHECK(ggml_vec_index_to_bytes(tv, &data, &size) == GGML_VEC_INDEX_OK);
+        ggml_vec_index_t * rebuilt = nullptr;
+        CHECK(ggml_vec_index_from_bytes(data, size, &rebuilt) == GGML_VEC_INDEX_OK);
+        ggml_vec_index_bytes_free(data);
+        std::vector<float> s1(4 * 8), s2(4 * 8);
+        std::vector<uint64_t> o1(4 * 8), o2(4 * 8);
+        CHECK(ggml_vec_index_search(tv, queries.data(), 4, 8, s1.data(), o1.data()) == GGML_VEC_INDEX_OK);
+        CHECK(ggml_vec_index_search(rebuilt, queries.data(), 4, 8, s2.data(), o2.data()) == GGML_VEC_INDEX_OK);
+        CHECK(o1 == o2 && s1 == s2);
+        ggml_vec_index_free(rebuilt);
+        return size;
+    };
+    auto layout_of = [&](ggml_vec_index_t * tv) {
+        return tv1x_snapshot_bytes(tv, "ggml-vector-index-tv1x-staged-layout.tvim")[7];
+    };
+    for (const int bits : { 2, 4 }) {
+        std::filesystem::remove(path);
+        auto * tv = ggml_vec_index_create_turbovec(dim, bits);
+        CHECK(ggml_vec_index_add(tv, rows.data(), 900, ids.data()) == GGML_VEC_INDEX_OK);
+        CHECK(layout_of(tv) == 0);
+        CHECK(ggml_vec_index_sync(tv, path.c_str()) == GGML_VEC_INDEX_OK);
+        // Crossing the threshold promotes the index; the next sync rewrites
+        // the file in the planes layout.
+        CHECK(ggml_vec_index_add(tv, rows.data() + 900 * dim, 600, ids.data() + 900) == GGML_VEC_INDEX_OK);
+        CHECK(layout_of(tv) == 1);
+        agrees_with_rebuilt(tv);
+        const uint64_t nonce = tv1x_nonce(path);
+        CHECK(ggml_vec_index_sync(tv, path.c_str()) == GGML_VEC_INDEX_OK);
+        CHECK(tv1x_nonce(path) != nonce);
+        CHECK(read_file_bytes(path)[7] == 1);
+        // Adds and removals patch the sign planes in place.
+        CHECK(ggml_vec_index_add(tv, rows.data() + 1500 * dim, 77, ids.data() + 1500) == GGML_VEC_INDEX_OK);
+        for (size_t i = 0; i < 1577; i += 41) {
+            CHECK(ggml_vec_index_remove(tv, ids[i]) == GGML_VEC_INDEX_OK);
+        }
+        agrees_with_rebuilt(tv);
+        // A later sync stays incremental in the planes layout and reloads.
+        const uint64_t planes_nonce = tv1x_nonce(path);
+        CHECK(ggml_vec_index_sync(tv, path.c_str()) == GGML_VEC_INDEX_OK);
+        CHECK(tv1x_nonce(path) == planes_nonce);
+        auto * loaded = ggml_vec_index_load(path.c_str());
+        CHECK(loaded != nullptr);
+        CHECK(tv1x_snapshot_bytes(loaded, "ggml-vector-index-tv1x-staged-l.tvim") ==
+              tv1x_snapshot_bytes(tv, "ggml-vector-index-tv1x-staged-t.tvim"));
+        ggml_vec_index_free(loaded);
+        // A calibrate re-encodes every row and rebuilds the cache.
+        CHECK(ggml_vec_index_turbovec_calibrate(tv, calib.data(), 1024) == GGML_VEC_INDEX_OK);
+        agrees_with_rebuilt(tv);
+        // Shrinking below the threshold keeps the staged search but stores
+        // sequential units, as upstream does.
+        for (size_t i = 1; i < 1577 && ggml_vec_index_len(tv) > 800; i += 2) {
+            ggml_vec_index_remove(tv, ids[i]);
+        }
+        CHECK(ggml_vec_index_len(tv) <= 800);
+        CHECK(layout_of(tv) == 0);
+        std::vector<float> scores(8);
+        std::vector<uint64_t> out(8);
+        CHECK(ggml_vec_index_search(tv, queries.data(), 1, 8, scores.data(), out.data()) == GGML_VEC_INDEX_OK);
+        ggml_vec_index_free(tv);
+    }
+    std::filesystem::remove(path);
+    turbovec_force_vector_major_for_test(-1);
+    turbovec_force_planes_for_test(-1, 0);
+}
+#endif
+
 void check_turbovec_1x() {
     for (const Tv1xIndexCase & c : kTv1xIndexCases) {
 #ifdef GGML_VEC_INDEX_TEST_HOOKS
@@ -5891,6 +5974,7 @@ int main(int argc, char ** argv) {
             check_turbovec_1x_reordered_and_stale_commits();
             check_turbovec_1x_permute_dot_kernels();
             check_turbovec_1x_staged();
+            check_turbovec_1x_staged_maintenance();
             check_tqplus_deterministic_layout(
                 2,
                 UINT64_C(0xc4140782241d45eb),
