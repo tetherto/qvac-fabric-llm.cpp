@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <string>
 #include <vector>
 
@@ -358,7 +359,10 @@ struct case_rollback_bound : ctx_test {
 
         // the DSV4 cache rebuilds snapshot d from the state before the ubatch, so d <= n is exact;
         // the recurrent memory gets snapshots 0..n-1 from ggml_gated_delta_net, only for n <= n_rs_seq + 1
-        const bool from_ubatch_start = arch == LLM_ARCH_DEEPSEEK4 || arch == LLM_ARCH_DEEPSEEK41;
+        // the deferred gated delta net commit (LLAMA_GDN_DEFERRED) keeps the state before the ubatch too
+        const char * gdn_env = getenv("LLAMA_GDN_DEFERRED");
+        const bool gdn_deferred = (arch == LLM_ARCH_QWEN35 || arch == LLM_ARCH_QWEN35MOE) && gdn_env && atoi(gdn_env) != 0;
+        const bool from_ubatch_start = arch == LLM_ARCH_DEEPSEEK4 || arch == LLM_ARCH_DEEPSEEK41 || gdn_deferred;
 
         const auto make_ctx = [&]() {
             ctx_opts opts;
