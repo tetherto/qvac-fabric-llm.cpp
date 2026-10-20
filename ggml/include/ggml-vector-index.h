@@ -94,8 +94,7 @@ GGML_VEC_INDEX_API ggml_vec_index_t * ggml_vec_index_create(int dim, int bit_wid
 
 // Creates a TurboQuant index with `bit_width` 2, 3 or 4: a port of upstream
 // turbovec 1.1.2 that encodes, snapshots and syncs byte for byte as turbovec
-// does (except that large indexes always store the sequential unit layout,
-// see docs/vector-index.md). Vectors and queries are rotated with turbovec's deterministic
+// does. Vectors and queries are rotated with turbovec's deterministic
 // block-Hadamard transform, quantized with Lloyd-Max codebooks (optionally
 // under a TQ+ calibration, see `ggml_vec_index_turbovec_calibrate`), and
 // searched against the rotated query without decoding. Requires a 64-bit
@@ -124,6 +123,15 @@ GGML_VEC_INDEX_API int ggml_vec_index_turbovec_calibrate(
     ggml_vec_index_t * idx,
     const float * sample,
     int n);
+
+// Staged search for a TurboVec 1.x index, on by default. From 32,768
+// vectors at 2 or 4 bits and dimensions that are multiples of 32, on hosts
+// where upstream turbovec runs it (aarch64; 4 bits needs the dot-product
+// extension), a search scans the sign planes for a shortlist, ranks it with
+// the lower planes and rescores the best few exactly: returned scores are
+// the full scan's, but the ids can differ slightly from a full scan's.
+// Pass 0 to always scan the whole index.
+GGML_VEC_INDEX_API int ggml_vec_index_turbovec_set_staged(ggml_vec_index_t * idx, int enabled);
 
 // Returns 1 when a TurboVec index holds a committed TQ+ calibration.
 GGML_VEC_INDEX_API int ggml_vec_index_turbovec_is_calibrated(const ggml_vec_index_t * idx);

@@ -85,6 +85,7 @@ uint64_t turbovec_ziggurat_table_hash_for_test(void);
 void turbovec_hadamard_rotate_for_test(const float * src, float * dst, int dim);
 void turbovec_force_vector_major_for_test(int mode);
 void turbovec_disable_dot_product_for_test(int disabled);
+void turbovec_force_planes_for_test(int mode, size_t min_vectors);
 int turbovec_sync_plan_for_test(
     ggml_vec_index_t * idx,
     const char * path,
@@ -133,6 +134,7 @@ constexpr int kTurboVecMaxTestDim = 16384;
 #include "turbovec-golden-dim256-q4.inc"
 #include "turbovec-1x-golden.inc"
 #include "turbovec-1x-golden-vm.inc"
+#include "turbovec-1x-golden-staged.inc"
 
 #define CHECK(cond)                                                            \
     do {                                                                       \
@@ -5707,6 +5709,103 @@ void check_turbovec_1x_permute_dot_kernels() {
 }
 #endif
 
+#ifdef GGML_VEC_INDEX_TEST_HOOKS
+// Staged search (upstream planes search): returned scores are the full
+// scan's for the same ids, and on aarch64 the results are upstream's.
+void check_turbovec_1x_staged() {
+    const int n = kTv1xStagedN;
+    const size_t dim = static_cast<size_t>(kTv1xStagedDim);
+    const int k = kTv1xStagedK;
+    const std::vector<float> db = tv1x_rows(kTv1xSeedDb, static_cast<size_t>(n), dim);
+    const std::vector<uint64_t> ids = tv1x_ids(static_cast<size_t>(n));
+    const std::vector<float> queries = tv1x_rows(kTv1xSeedQuery, 3, dim);
+    const std::vector<float> calib = tv1x_rows(kTv1xSeedCalib, kTv1xNCalib, dim);
+    std::vector<uint64_t> allow;
+    for (size_t i = 0; i < ids.size(); i += 3) {
+        allow.push_back(ids[i]);
+    }
+    turbovec_force_planes_for_test(1, 0);
+    turbovec_force_vector_major_for_test(1);
+    for (const int bits : { 2, 4 }) {
+        for (const int calibrated : { 0, 1 }) {
+            auto * tv = ggml_vec_index_create_turbovec(static_cast<int>(dim), bits);
+            if (calibrated != 0) {
+                CHECK(ggml_vec_index_turbovec_calibrate(tv, calib.data(), kTv1xNCalib) == GGML_VEC_INDEX_OK);
+            }
+            CHECK(ggml_vec_index_add(tv, db.data(), n, ids.data()) == GGML_VEC_INDEX_OK);
+            // At this size upstream stores units as bit planes.
+            const std::vector<uint8_t> image = tv1x_snapshot_bytes(tv, "ggml-vector-index-tv1x-staged.tvim");
+            CHECK(image[7] == 1);
+            bool snapshot_found = false;
+            for (const Tv1xStagedSnapshot & snap : kTv1xStagedSnapshots) {
+                if (snap.bits == bits && snap.calibrated == calibrated) {
+                    snapshot_found = true;
+                    CHECK(image.size() == snap.len);
+                    CHECK(tv1x_fnv(image.data(), image.size()) == snap.hash);
+                }
+            }
+            CHECK(snapshot_found);
+            auto * reloaded = tv1x_load_bytes(image);
+            CHECK(reloaded != nullptr);
+            CHECK(tv1x_snapshot_bytes(reloaded, "ggml-vector-index-tv1x-staged-2.tvim") == image);
+            ggml_vec_index_free(reloaded);
+            for (const int nq : { 1, 3 }) {
+                for (const int filtered : { 0, 1 }) {
+                    auto search = [&](std::vector<float> & scores, std::vector<uint64_t> & out) {
+                        scores.assign(static_cast<size_t>(3 * k), 0.0f);
+                        out.assign(scores.size(), 0);
+                        for (int q = 0; q < 3; q += nq) {
+                            const float * query = queries.data() + static_cast<size_t>(q) * dim;
+                            float * s = scores.data() + static_cast<size_t>(q * k);
+                            uint64_t * o = out.data() + static_cast<size_t>(q * k);
+                            CHECK((filtered != 0 ?
+                                ggml_vec_index_search_filtered(tv, query, nq, k, allow.data(), static_cast<int>(allow.size()), s, o) :
+                                ggml_vec_index_search(tv, query, nq, k, s, o)) == GGML_VEC_INDEX_OK);
+                        }
+                    };
+                    std::vector<float> staged_scores;
+                    std::vector<uint64_t> staged_ids;
+                    search(staged_scores, staged_ids);
+                    // Every returned score is the full scan's for that id.
+                    CHECK(ggml_vec_index_turbovec_set_staged(tv, 0) == GGML_VEC_INDEX_OK);
+                    std::vector<float> full_scores;
+                    std::vector<uint64_t> full_ids;
+                    search(full_scores, full_ids);
+                    CHECK(ggml_vec_index_turbovec_set_staged(tv, 1) == GGML_VEC_INDEX_OK);
+                    size_t shared = 0;
+                    for (size_t i = 0; i < staged_ids.size(); ++i) {
+                        const size_t q = i / static_cast<size_t>(k);
+                        for (size_t j = q * static_cast<size_t>(k); j < (q + 1) * static_cast<size_t>(k); ++j) {
+                            if (full_ids[j] == staged_ids[i]) {
+                                CHECK(full_scores[j] == staged_scores[i]);
+                                ++shared;
+                            }
+                        }
+                    }
+                    CHECK(shared * 10 >= staged_ids.size() * 8);
+#if defined(__aarch64__) || defined(_M_ARM64)
+                    bool found = false;
+                    for (const Tv1xStagedCase & c : kTv1xStagedCases) {
+                        if (c.bits == bits && c.calibrated == calibrated && c.nq == nq && c.filtered == filtered) {
+                            found = true;
+                            for (size_t i = 0; i < staged_ids.size(); ++i) {
+                                CHECK(staged_ids[i] == c.ids[i]);
+                                CHECK(staged_scores[i] == c.scores[i]);
+                            }
+                        }
+                    }
+                    CHECK(found);
+#endif
+                }
+            }
+            ggml_vec_index_free(tv);
+        }
+    }
+    turbovec_force_vector_major_for_test(-1);
+    turbovec_force_planes_for_test(-1, 0);
+}
+#endif
+
 void check_turbovec_1x() {
     for (const Tv1xIndexCase & c : kTv1xIndexCases) {
 #ifdef GGML_VEC_INDEX_TEST_HOOKS
@@ -5791,6 +5890,7 @@ int main(int argc, char ** argv) {
             check_turbovec_1x_failed_add_then_sync();
             check_turbovec_1x_reordered_and_stale_commits();
             check_turbovec_1x_permute_dot_kernels();
+            check_turbovec_1x_staged();
             check_tqplus_deterministic_layout(
                 2,
                 UINT64_C(0xc4140782241d45eb),

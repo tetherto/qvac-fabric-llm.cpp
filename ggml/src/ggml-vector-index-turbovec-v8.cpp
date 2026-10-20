@@ -190,6 +190,10 @@ Geo index_geo(const ggml_vec_index & idx) {
     geo.dim = static_cast<size_t>(idx.dim);
     geo.bits = idx.turbovec_bits;
     geo.n_calib = idx.turbovec_tqplus_shift.size();
+    // Upstream stores units as bit planes when the index would search in
+    // stages at its current size (lib.rs `unit_layout`), sequential rows
+    // otherwise, whatever its cache holds.
+    geo.layout = turbovec_planes_wanted(idx.turbovec_bits, idx.dim, active_count(idx)) ? kLayoutPlanes : kLayoutSeq;
     return geo;
 }
 
@@ -236,7 +240,7 @@ public:
         sb.push_back(kV8Revision);
         sb.push_back(static_cast<uint8_t>(geo.bits));
         sb.push_back(geo.kind);
-        sb.push_back(kLayoutSeq);
+        sb.push_back(geo.layout);
         push_u32(sb, static_cast<uint32_t>(geo.dim));
         push_u64(sb, nonce);
         push_u32(sb, static_cast<uint32_t>(kMaxOps));
@@ -297,6 +301,8 @@ public:
     // the lanes), 32 scales, 32 ids. Lanes past the last row are zero.
     void unit(size_t block, uint8_t * out) const {
         const size_t row_bytes = geo.row_bytes();
+        const size_t nsg = geo.dim / 8;
+        const size_t low_row = static_cast<size_t>(geo.bits - 1) * nsg;
         std::memset(out, 0, geo.unit_len());
         for (size_t lane = 0; lane < kBlock; ++lane) {
             const size_t r = block * kBlock + lane;
@@ -304,9 +310,19 @@ public:
                 break;
             }
             const size_t slot = rows[r];
-            const uint8_t * codes = seq_row(slot);
-            for (size_t g = 0; g < row_bytes; ++g) {
-                out[g * kBlock + lane] = codes[g];
+            if (geo.layout == kLayoutPlanes) {
+                // Canonical planes unit: the sign bytes group-major across
+                // the lanes, then each lane's low planes.
+                const uint8_t * packed = idx.turbovec_data.data() + slot * packed_bytes;
+                for (size_t g = 0; g < nsg; ++g) {
+                    out[g * kBlock + lane] = packed[low_row + g];
+                }
+                std::memcpy(out + nsg * kBlock + lane * low_row, packed, low_row);
+            } else {
+                const uint8_t * codes = seq_row(slot);
+                for (size_t g = 0; g < row_bytes; ++g) {
+                    out[g * kBlock + lane] = codes[g];
+                }
             }
             uint32_t scale_bits = 0;
             std::memcpy(&scale_bits, &idx.turbovec_scale[slot], sizeof(scale_bits));
@@ -823,6 +839,7 @@ ggml_vec_index_t * turbovec_v8_load_image(std::vector<uint8_t> raw, int & error,
         idx->turbovec_blocked_data,
         idx->turbovec_blocked_n_blocks,
         idx->turbovec_blocked_vm);
+    turbovec_planes_refresh(*idx, 0);
     rebuild_state_hash(*idx);
     if (info != nullptr) {
         info->gen = chosen->gen;
@@ -894,6 +911,7 @@ enum class CursorState { intact, foreign, replaced };
 int cursor_state(
         const char * path,
         const TurboVecSyncBinding & b,
+        uint8_t b_layout,
         CursorState & state,
         size_t & stale_used,
         size_t & file_n_calib) {
@@ -927,7 +945,9 @@ int cursor_state(
         state = nonce == 0 ? CursorState::replaced : CursorState::foreign;
         return GGML_VEC_INDEX_OK;
     }
-    if (!v8 || head[7] != kLayoutSeq) {
+    // Our own file in a form this index no longer writes (a v7 file, or a
+    // layout it has since grown into): rewrite it whole.
+    if (!v8 || head[7] != b_layout) {
         state = CursorState::replaced;
         return GGML_VEC_INDEX_OK;
     }
@@ -942,6 +962,7 @@ int cursor_state(
     Geo geo;
     geo.kind = head[6];
     geo.bits = head[5];
+    geo.layout = head[7];
     geo.dim = get_u32_le(head.data() + sb_fixed - 16);
     if (geo.kind != kKindIdMap || geo.bits < 2 || geo.bits > 4 || geo.dim == 0 || geo.dim % 8 != 0 ||
         geo.dim > static_cast<size_t>(kTurboVecMaxDim)) {
@@ -1175,7 +1196,7 @@ int turbovec_v8_sync(ggml_vec_index & idx, const char * path) {
     size_t stale_used = 0;
     if (bound) {
         size_t file_n_calib = 0;
-        const int rc = cursor_state(path, b, state, stale_used, file_n_calib);
+        const int rc = cursor_state(path, b, index_geo(idx).layout, state, stale_used, file_n_calib);
         if (rc != GGML_VEC_INDEX_OK) {
             return rc;
         }
@@ -1241,7 +1262,7 @@ int turbovec_sync_plan_for_test(
     CursorState state = CursorState::replaced;
     size_t stale_used = 0;
     size_t file_n_calib = 0;
-    const int rc = cursor_state(path, b, state, stale_used, file_n_calib);
+    const int rc = cursor_state(path, b, index_geo(*idx).layout, state, stale_used, file_n_calib);
     if (rc != GGML_VEC_INDEX_OK || state != CursorState::intact ||
         file_n_calib != idx->turbovec_tqplus_shift.size()) {
         return GGML_VEC_INDEX_E_INVALID_ARG;

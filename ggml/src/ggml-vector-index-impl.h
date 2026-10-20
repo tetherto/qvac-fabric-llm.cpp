@@ -215,6 +215,18 @@ void reserve_mostly_exact(std::vector<T> & v, size_t additional) {
     }
 }
 
+// Keeps the best k candidates in a min-heap under score_id_better.
+inline void update_topk_heap(std::vector<ScoreId> & heap, int k, const ScoreId & candidate) {
+    if (heap.size() < static_cast<size_t>(k)) {
+        heap.push_back(candidate);
+        std::push_heap(heap.begin(), heap.end(), MinHeapCmp());
+    } else if (score_id_better(candidate, heap.front())) {
+        std::pop_heap(heap.begin(), heap.end(), MinHeapCmp());
+        heap.back() = candidate;
+        std::push_heap(heap.begin(), heap.end(), MinHeapCmp());
+    }
+}
+
 inline constexpr int kMaxThreads = 256;
 
 // Runs fn(task, worker) for every task in [0, n_tasks) on up to n_threads
@@ -263,6 +275,16 @@ void parallel_for(size_t n_tasks, int n_threads, Fn && fn) {
         std::rethrow_exception(error);
     }
 }
+
+// How a staged search weighs the sign plane and estimates a level from its
+// bits (upstream pack.rs `PlanesStats`).
+struct TurboVecPlanesStats {
+    float m = 0.0f;
+    float alpha = 0.0f;
+    float beta[3] = {};
+    float alpha1 = 0.0f;
+    float beta1 = 0.0f;
+};
 
 // A TurboVec index's binding to the v8 file it syncs to (upstream
 // `SyncCursor` plus its dirty sets). A 1.x index removes by swap-remove,
@@ -335,6 +357,22 @@ struct ggml_vec_index {
     std::vector<float>   turbovec_tqplus_scale;
     std::vector<uint8_t> turbovec_blocked_data;
     size_t turbovec_blocked_n_blocks = 0;
+
+    // Staged search (upstream turbovec's planes search). Once a 2- or
+    // 4-bit index reaches kTurboVecPlanesMinVectors on a host that runs it
+    // the index is promoted and keeps a blocked copy of its sign planes;
+    // it stays promoted if it later shrinks.
+    bool turbovec_staged_enabled = true;
+    bool turbovec_planes = false;
+    std::vector<uint8_t> turbovec_sign_blocked;
+    // Derived lazily by the first staged search, as upstream does: the
+    // planes statistics (from the cache head, reset only on promotion) and
+    // the per-vector centre term (reset by every mutation).
+    mutable std::mutex turbovec_planes_mutex;
+    mutable bool turbovec_stats_ready = false;
+    mutable TurboVecPlanesStats turbovec_stats;
+    mutable bool turbovec_centre_ready = false;
+    mutable std::vector<float> turbovec_centre;
 
     std::vector<uint64_t> slot_to_id;
     std::vector<uint8_t>  slot_active;
@@ -555,6 +593,7 @@ int turbovec_sync_plan_for_test(
     std::vector<std::vector<std::pair<uint64_t, std::vector<uint8_t>>>> & batches);
 void turbovec_force_vector_major_for_test(int mode);
 void turbovec_disable_dot_product_for_test(int disabled);
+void turbovec_force_planes_for_test(int mode, size_t min_vectors);
 int turbovec_index_hashes_for_test(
     const ggml_vec_index_t * idx,
     uint64_t * codes_hash,
@@ -599,6 +638,35 @@ void score_turbovec_permute_dot_block_4(
     int dim,
     bool vector_major,
     float * const * out_scores);
+bool turbovec_uses_permute_dot(const ggml_vec_index_t & idx);
+void score_turbovec_block(
+    const ggml_vec_index_t & idx,
+    const uint8_t * lut,
+    float lut_scale,
+    float lut_bias,
+    const TurboVecPermuteDot * permute_dot,
+    size_t block,
+    float * out_scores);
+
+// Staged search (ggml-vector-index-turbovec-staged.cpp).
+inline constexpr size_t kTurboVecPlanesMinVectors = 32768;
+bool turbovec_planes_for(int bits, int dim);
+bool turbovec_planes_wanted(int bits, int dim, size_t n_vectors);
+// After an add (first new slot), a load or calibrate (0): promotes the
+// index or patches its sign planes.
+void turbovec_planes_refresh(ggml_vec_index & idx, size_t first_slot);
+void turbovec_planes_reset(ggml_vec_index & idx);
+void turbovec_planes_swap_remove(ggml_vec_index & idx, size_t slot, size_t last);
+// Searches one query (rotated, TQ+-calibrated) in stages into `heap`;
+// returns false when the index is not set up for it.
+bool turbovec_staged_search(
+    const ggml_vec_index & idx,
+    const float * query,
+    float bias_corr,
+    int k,
+    const uint8_t * allowed_mask,
+    bool single_query,
+    std::vector<ScoreId> & heap);
 void prepare_turbovec(int bits, int dim, bool legacy);
 void rotate_turbovec_query(bool legacy, const float * src, float * dst, int dim);
 void rotate_turbovec_queries(
@@ -753,6 +821,17 @@ float dot_turbovec_q4_row(const float * query, const uint8_t * codes, const floa
 // Patches the blocked cache for a swap-remove of `slot` whose last slot
 // (`last`, already removed from the rows) moved into it.
 void turbovec_blocked_swap_remove(ggml_vec_index & idx, size_t slot, size_t last);
+// The sign planes of rows [first_slot, n_vectors) into the sign blocked
+// cache (upstream's planes sign region), growing or shrinking it to cover
+// n_vectors rows.
+void repack_turbovec_sign_codes(
+    const uint8_t * packed_codes,
+    size_t n_vectors,
+    int bits,
+    int dim,
+    size_t first_slot,
+    std::vector<uint8_t> & sign_blocked);
+void turbovec_sign_blocked_swap_remove(ggml_vec_index & idx, size_t slot, size_t last);
 void repack_turbovec_codes(
     const uint8_t * packed_codes,
     size_t n_vectors,
