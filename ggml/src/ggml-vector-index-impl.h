@@ -536,6 +536,13 @@ void invalidate_ivf(ggml_vec_index & idx);
 bool is_q8(const ggml_vec_index & idx);
 bool is_q4(const ggml_vec_index & idx);
 bool is_turbovec(const ggml_vec_index & idx);
+// Top-k heaps order equal scores by their key. A TurboVec 1.x index keys
+// on the slot, which is upstream turbovec's row order, so ties come out as
+// upstream returns them; other indexes key on the external id. Keys are
+// mapped back to ids when results are written.
+bool topk_keys_are_slots(const ggml_vec_index & idx);
+uint64_t topk_key(const ggml_vec_index & idx, size_t slot);
+uint64_t topk_key_id(const ggml_vec_index & idx, uint64_t key);
 bool is_turbovec_q2(const ggml_vec_index & idx);
 bool is_turbovec_q4(const ggml_vec_index & idx);
 bool is_quantized(const ggml_vec_index & idx);

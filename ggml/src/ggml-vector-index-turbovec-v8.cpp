@@ -20,6 +20,12 @@
 
 #include <random>
 
+#ifdef _WIN32
+#include <process.h>
+#else
+#include <unistd.h>
+#endif
+
 namespace {
 
 constexpr uint8_t kV7Magic[4] = { 'T', 'V', '7', '\0' };
@@ -929,11 +935,26 @@ uint64_t new_file_nonce() {
             static_cast<uint64_t>(std::chrono::steady_clock::now().time_since_epoch().count());
         return std::mt19937_64(seed);
     }();
+    // The clock and process id are mixed into every nonce (upstream
+    // io::file_nonce), so processes forked from one parent still differ.
+    auto mix = [](uint64_t x) {
+        x += UINT64_C(0x9e3779b97f4a7c15);
+        x = (x ^ (x >> 30)) * UINT64_C(0xbf58476d1ce4e5b9);
+        x = (x ^ (x >> 27)) * UINT64_C(0x94d049bb133111eb);
+        return x ^ (x >> 31);
+    };
+#ifdef _WIN32
+    const uint64_t pid = static_cast<uint64_t>(_getpid());
+#else
+    const uint64_t pid = static_cast<uint64_t>(::getpid());
+#endif
+    const uint64_t clock = static_cast<uint64_t>(std::chrono::system_clock::now().time_since_epoch().count()) ^
+        static_cast<uint64_t>(std::chrono::steady_clock::now().time_since_epoch().count());
     std::lock_guard<std::mutex> lock(mutex);
     uint64_t nonce = 0;
     // Zero marks an unclaimed snapshot.
     while (nonce == 0) {
-        nonce = rng();
+        nonce = rng() ^ mix(clock ^ mix(pid));
     }
     return nonce;
 }
