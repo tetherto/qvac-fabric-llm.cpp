@@ -231,6 +231,10 @@ inline void update_topk_heap(std::vector<ScoreId> & heap, int k, const ScoreId &
 
 inline constexpr int kMaxThreads = 256;
 
+// A single TurboVec query over at least this many 32-vector blocks splits
+// them across threads (upstream turbovec's block-parallel threshold).
+inline constexpr size_t kTurboVecParallelMinBlocks = 1024;
+
 // One parallel_for task: ctx is the caller's functor.
 using ParallelTaskFn = void (*)(void * ctx, size_t task, size_t worker);
 
@@ -689,6 +693,9 @@ struct TurboVecStagedOpts {
     // Set to whether upstream's sampled seed would have left this query's
     // shortlist short; false when upstream does not seed.
     bool * seed_short = nullptr;
+    // Threads the one query may split its blocks over (a batch already
+    // splits across queries and passes 1). The results do not depend on it.
+    int n_threads = 1;
 };
 bool turbovec_staged_search(
     const ggml_vec_index & idx,

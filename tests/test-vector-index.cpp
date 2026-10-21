@@ -5969,7 +5969,8 @@ void check_turbovec_1x_staged() {
             CHECK(ggml_vec_index_add(tv, short_db.data(), n, ids.data()) == GGML_VEC_INDEX_OK);
             std::vector<float> scores(static_cast<size_t>(3 * short_k));
             std::vector<uint64_t> out(scores.size());
-            for (const int threads : { 1, 4 }) {
+            // The rescan of the short query splits its blocks above one thread.
+            for (const int threads : { 1, 2, 4, 8 }) {
                 ggml_vec_index_set_threads(tv, threads);
                 CHECK(ggml_vec_index_search(tv, queries.data(), 3, short_k, scores.data(), out.data()) ==
                       GGML_VEC_INDEX_OK);
@@ -5988,6 +5989,80 @@ void check_turbovec_1x_staged() {
 #endif
 
 #ifdef GGML_VEC_INDEX_TEST_HOOKS
+// Every search returns the same ids and score bits at any thread count:
+// lone queries (which split their blocks), batches (split across queries),
+// wide and narrow filters, staged and full scans, and k large enough for
+// the ranking to split too.
+void check_turbovec_1x_thread_invariance() {
+    constexpr int dim = 64;
+    constexpr int n = 40000;
+    constexpr int nq = 5;
+    const std::vector<float> rows = tv1x_rows(kTv1xSeedDb, n, dim);
+    const std::vector<uint64_t> ids = tv1x_ids(n);
+    const std::vector<float> queries = tv1x_rows(kTv1xSeedQuery, nq, dim);
+    const std::vector<float> calib = tv1x_rows(kTv1xSeedCalib, 1024, dim);
+    std::vector<uint64_t> wide;
+    for (size_t i = 0; i < ids.size(); i += 3) {
+        wide.push_back(ids[i]);
+    }
+    std::vector<uint64_t> narrow;
+    for (size_t i = 5; i < ids.size(); i += 811) {
+        narrow.push_back(ids[i]);
+    }
+    turbovec_force_planes_for_test(1, 0);
+    turbovec_force_vector_major_for_test(1);
+    for (const int bits : { 2, 4 }) {
+        for (const int calibrated : { 0, 1 }) {
+            auto * tv = ggml_vec_index_create_turbovec(dim, bits);
+            if (calibrated != 0) {
+                CHECK(ggml_vec_index_turbovec_calibrate(tv, calib.data(), 1024) == GGML_VEC_INDEX_OK);
+            }
+            CHECK(ggml_vec_index_add(tv, rows.data(), n, ids.data()) == GGML_VEC_INDEX_OK);
+            auto run = [&](int threads, std::vector<float> & scores, std::vector<uint64_t> & out) {
+                CHECK(ggml_vec_index_set_threads(tv, threads) == GGML_VEC_INDEX_OK);
+                scores.clear();
+                out.clear();
+                auto search = [&](const float * q, int n_q, int k, const std::vector<uint64_t> * allow) {
+                    const size_t at = scores.size();
+                    scores.resize(at + static_cast<size_t>(n_q * k));
+                    out.resize(scores.size());
+                    CHECK((allow != nullptr ?
+                        ggml_vec_index_search_filtered(
+                            tv, q, n_q, k, allow->data(), static_cast<int>(allow->size()), scores.data() + at, out.data() + at) :
+                        ggml_vec_index_search(tv, q, n_q, k, scores.data() + at, out.data() + at)) == GGML_VEC_INDEX_OK);
+                };
+                for (const int staged : { 1, 0 }) {
+                    CHECK(ggml_vec_index_turbovec_set_staged(tv, staged) == GGML_VEC_INDEX_OK);
+                    for (const int k : { 10, 150 }) {
+                        for (int q = 0; q < nq; ++q) {
+                            search(queries.data() + static_cast<size_t>(q) * dim, 1, k, nullptr);
+                        }
+                        search(queries.data(), nq, k, nullptr);
+                        search(queries.data(), 1, k, &wide);
+                        search(queries.data() + dim, 1, k, &narrow);
+                        search(queries.data(), 3, k, &wide);
+                    }
+                }
+                CHECK(ggml_vec_index_turbovec_set_staged(tv, 1) == GGML_VEC_INDEX_OK);
+            };
+            std::vector<float> ref_scores;
+            std::vector<uint64_t> ref_ids;
+            run(1, ref_scores, ref_ids);
+            for (const int threads : { 2, 8, 3 }) {
+                std::vector<float> scores;
+                std::vector<uint64_t> out;
+                run(threads, scores, out);
+                CHECK(out == ref_ids);
+                CHECK(scores.size() == ref_scores.size());
+                CHECK(std::memcmp(scores.data(), ref_scores.data(), scores.size() * sizeof(float)) == 0);
+            }
+            ggml_vec_index_free(tv);
+        }
+    }
+    turbovec_force_vector_major_for_test(-1);
+    turbovec_force_planes_for_test(-1, 0);
+}
+
 // The pool behind every multi-threaded call: tasks run once each, nested
 // calls run inline, exceptions reach the caller, concurrent callers share
 // the helpers instead of each starting their own, and a forked child that
@@ -6050,6 +6125,111 @@ void check_vector_index_pool() {
     CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
     ggml_vec_index_free(tv);
 #endif
+}
+
+// Searches from several threads on one index while another thread adds
+// and removes a row under the exclusive lock: every search sees the index
+// either with the row or without it, and matches that state's results.
+void check_turbovec_1x_concurrent_search() {
+    constexpr int dim = 64;
+    constexpr int n = 40000;
+    constexpr int nq = 4;
+    constexpr int k = 10;
+    const std::vector<float> rows = tv1x_rows(kTv1xSeedDb, n, dim);
+    const std::vector<uint64_t> ids = tv1x_ids(n);
+    const std::vector<float> queries = tv1x_rows(kTv1xSeedQuery, nq, dim);
+    const std::vector<float> calib = tv1x_rows(kTv1xSeedCalib, 1024, dim);
+    // A row on top of query 0, so it is in that query's results while added.
+    const std::vector<float> extra(queries.begin(), queries.begin() + dim);
+    const uint64_t extra_id = 99999999;
+    turbovec_force_planes_for_test(1, 0);
+    for (const int staged : { 1, 0 }) {
+        auto * tv = ggml_vec_index_create_turbovec(dim, 2);
+        CHECK(ggml_vec_index_turbovec_calibrate(tv, calib.data(), 1024) == GGML_VEC_INDEX_OK);
+        CHECK(ggml_vec_index_add(tv, rows.data(), n, ids.data()) == GGML_VEC_INDEX_OK);
+        CHECK(ggml_vec_index_turbovec_set_staged(tv, staged) == GGML_VEC_INDEX_OK);
+        CHECK(ggml_vec_index_set_threads(tv, 4) == GGML_VEC_INDEX_OK);
+        // Per state: nq lone queries, then the batch of all of them.
+        auto search_all = [&](std::vector<float> & scores, std::vector<uint64_t> & out) {
+            scores.assign(static_cast<size_t>(2 * nq * k), 0.0f);
+            out.assign(scores.size(), 0);
+            for (int q = 0; q < nq; ++q) {
+                if (ggml_vec_index_search(tv, queries.data() + static_cast<size_t>(q) * dim, 1, k,
+                        scores.data() + q * k, out.data() + q * k) != GGML_VEC_INDEX_OK) {
+                    return false;
+                }
+            }
+            return ggml_vec_index_search(tv, queries.data(), nq, k, scores.data() + nq * k, out.data() + nq * k) ==
+                GGML_VEC_INDEX_OK;
+        };
+        std::vector<float> without_scores;
+        std::vector<float> with_scores;
+        std::vector<uint64_t> without_ids;
+        std::vector<uint64_t> with_ids;
+        CHECK(search_all(without_scores, without_ids));
+        CHECK(ggml_vec_index_add(tv, extra.data(), 1, &extra_id) == GGML_VEC_INDEX_OK);
+        CHECK(search_all(with_scores, with_ids));
+        CHECK(with_ids[0] == extra_id);
+        CHECK(ggml_vec_index_remove(tv, extra_id) == GGML_VEC_INDEX_OK);
+        {
+            std::vector<float> again_scores;
+            std::vector<uint64_t> again_ids;
+            CHECK(search_all(again_scores, again_ids));
+            CHECK(again_ids == without_ids && again_scores == without_scores);
+        }
+        auto matches = [&](const std::vector<float> & scores, const std::vector<uint64_t> & out) {
+            // Each query's slice must be one state's; the state may change
+            // between the calls.
+            for (int part = 0; part < nq + 1; ++part) {
+                const size_t begin = static_cast<size_t>(part * k);
+                const size_t len = static_cast<size_t>(part == nq ? nq * k : k);
+                auto same = [&](const std::vector<float> & s, const std::vector<uint64_t> & o) {
+                    return std::equal(out.begin() + begin, out.begin() + begin + len, o.begin() + begin) &&
+                        std::memcmp(scores.data() + begin, s.data() + begin, len * sizeof(float)) == 0;
+                };
+                if (!same(without_scores, without_ids) && !same(with_scores, with_ids)) {
+                    return false;
+                }
+            }
+            return true;
+        };
+        std::atomic<bool> stop{ false };
+        std::atomic<int> mismatches{ 0 };
+        std::atomic<int> readers_done{ 0 };
+        std::vector<std::thread> readers;
+        for (int r = 0; r < 4; ++r) {
+            readers.emplace_back([&] {
+                std::vector<float> scores;
+                std::vector<uint64_t> out;
+                // A bounded run with a pause after each search: glibc's
+                // reader-preferring rwlock would let four back-to-back
+                // readers keep the writer out for good.
+                for (int it = 0; it < 60 && !stop.load(); ++it) {
+                    if (!search_all(scores, out) || !matches(scores, out)) {
+                        mismatches.fetch_add(1);
+                    }
+                    std::this_thread::sleep_for(std::chrono::microseconds(200));
+                }
+                readers_done.fetch_add(1);
+            });
+        }
+        int toggles = 0;
+        while (toggles < 40 && readers_done.load() < 4) {
+            if (ggml_vec_index_add(tv, extra.data(), 1, &extra_id) != GGML_VEC_INDEX_OK ||
+                ggml_vec_index_remove(tv, extra_id) != GGML_VEC_INDEX_OK ||
+                ggml_vec_index_set_threads(tv, toggles % 3 == 0 ? 1 : 4) != GGML_VEC_INDEX_OK) {
+                mismatches.fetch_add(1);
+            }
+            ++toggles;
+        }
+        stop.store(true);
+        for (std::thread & reader : readers) {
+            reader.join();
+        }
+        CHECK(mismatches.load() == 0);
+        ggml_vec_index_free(tv);
+    }
+    turbovec_force_planes_for_test(-1, 0);
 }
 #endif
 
@@ -6726,7 +6906,9 @@ int main(int argc, char ** argv) {
             check_turbovec_1x_reordered_and_stale_commits();
             check_turbovec_1x_permute_dot_kernels();
             check_turbovec_1x_staged();
+            check_turbovec_1x_thread_invariance();
             check_vector_index_pool();
+            check_turbovec_1x_concurrent_search();
             check_turbovec_1x_staged_maintenance();
             check_turbovec_1x_single_code_copy();
             check_turbovec_1x_streamed_snapshots();
