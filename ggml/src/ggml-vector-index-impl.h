@@ -604,6 +604,7 @@ int64_t turbovec_block_score_call_count_for_test(void);
 void turbovec_hadamard_rotate_for_test(const float * src, float * dst, int dim);
 int turbovec_rotation_kernel_parity_for_test(int kernel);
 int turbovec_encode_kernel_parity_for_test(int kernel);
+int turbovec_layout_kernel_parity_for_test(int kernel);
 int vector_validation_kernel_parity_for_test(int kernel);
 int crc32c_kernel_parity_for_test(int kernel);
 int turbovec_sync_plan_for_test(
@@ -890,6 +891,12 @@ size_t turbovec_block_scratch_bytes(const ggml_vec_index & idx);
 void turbovec_block_rows_packed(const ggml_vec_index & idx, size_t block, uint8_t * packed, uint8_t * scratch);
 // Writes one row's sequential codes into its blocked-cache lane.
 void turbovec_blocked_set_row_seq(ggml_vec_index & idx, size_t slot, const uint8_t * seq);
+// Whole 32-row blocks in the sequential-blocked layout (byte g of lane l at
+// g * 32 + l: the v7/v8 unit codes), read from or written to the blocked
+// cache in its in-memory layout (upstream pack.rs `native_to_seq` /
+// `seq_into_native`). The block must lie inside the cache.
+void turbovec_block_seq(const ggml_vec_index & idx, size_t block, uint8_t * seq_blocked);
+void turbovec_blocked_set_block_seq(ggml_vec_index & idx, size_t block, const uint8_t * seq_blocked);
 // Writes n_new packed rows into the blocked cache from first_slot on.
 void turbovec_blocked_append(ggml_vec_index & idx, const uint8_t * packed, size_t first_slot, size_t n_new);
 // The sign planes of rows [first_slot, n_vectors) into the sign blocked

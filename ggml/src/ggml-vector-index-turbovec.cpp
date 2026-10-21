@@ -14,7 +14,8 @@
 #include <arm_neon.h>
 #endif
 
-#if defined(GGML_VEC_INDEX_HAVE_AVX2_KERNEL) || defined(GGML_VEC_INDEX_HAVE_AVX512_KERNEL)
+#if defined(GGML_VEC_INDEX_HAVE_AVX2_KERNEL) || defined(GGML_VEC_INDEX_HAVE_AVX512_KERNEL) || \
+    defined(GGML_VEC_INDEX_HAVE_SSE42_KERNEL)
 #include "ggml-vector-index-x86.h"
 #endif
 
@@ -2440,6 +2441,204 @@ void turbovec_blocked_set_row_seq(ggml_vec_index & idx, size_t slot, const uint8
         set_block_lane_byte(block, g, slot % lane_size, idx.turbovec_blocked_vm, seq[g]);
     }
 }
+
+// Upstream pack.rs x86 perm0 nibble interleave of 32-byte groups of
+// sequential lane bytes, in place (the scalar arm of `interleave_chunk_x86`),
+// and its inverse (`deinterleave_x86_code_byte` per lane).
+[[maybe_unused]] static void turbovec_interleave_scalar(uint8_t * buf, size_t len) {
+    static constexpr size_t perm0[16] = { 0, 8, 1, 9, 2, 10, 3, 11, 4, 12, 5, 13, 6, 14, 7, 15 };
+    const size_t lane_size = static_cast<size_t>(kTurboVecScoreBlock);
+    uint8_t tmp[kTurboVecScoreBlock];
+    for (size_t at = 0; at + lane_size <= len; at += lane_size) {
+        uint8_t * group = buf + at;
+        std::memcpy(tmp, group, lane_size);
+        for (size_t j = 0; j < 16; ++j) {
+            const uint8_t ba = tmp[perm0[j]];
+            const uint8_t bb = tmp[perm0[j] + 16];
+            group[j] = static_cast<uint8_t>((ba >> 4) | (bb & 0xf0));
+            group[16 + j] = static_cast<uint8_t>((ba & 0x0f) | ((bb & 0x0f) << 4));
+        }
+    }
+}
+
+[[maybe_unused]] static void turbovec_deinterleave_scalar(const uint8_t * blocked, uint8_t * out, size_t len) {
+    static constexpr size_t inv_perm0[16] = { 0, 2, 4, 6, 8, 10, 12, 14, 1, 3, 5, 7, 9, 11, 13, 15 };
+    const size_t lane_size = static_cast<size_t>(kTurboVecScoreBlock);
+    for (size_t at = 0; at + lane_size <= len; at += lane_size) {
+        for (size_t lane = 0; lane < lane_size; ++lane) {
+            const size_t j = inv_perm0[lane & 15];
+            const uint8_t hi_plane = blocked[at + j];
+            const uint8_t lo_plane = blocked[at + 16 + j];
+            const int shift = lane < 16 ? 0 : 4;
+            out[at + lane] = static_cast<uint8_t>(
+                (((hi_plane >> shift) & 0x0f) << 4) | ((lo_plane >> shift) & 0x0f));
+        }
+    }
+}
+
+#if defined(__x86_64__) || defined(_M_X64)
+// Upstream `interleave_chunk_x86` / `deinterleave_chunk_x86` dispatch: AVX2,
+// then SSSE3, then the scalar loop.
+static void turbovec_interleave_native(uint8_t * buf, size_t len) {
+#if defined(GGML_VEC_INDEX_HAVE_AVX2_KERNEL)
+    if (vec_index_cpu_features().avx2) {
+        ggml_vec_index_detail::turbovec_interleave_avx2(buf, len);
+        return;
+    }
+#endif
+#if defined(GGML_VEC_INDEX_HAVE_SSE42_KERNEL)
+    if (vec_index_cpu_features().ssse3) {
+        ggml_vec_index_detail::turbovec_interleave_ssse3(buf, len);
+        return;
+    }
+#endif
+    turbovec_interleave_scalar(buf, len);
+}
+
+static void turbovec_deinterleave_native(const uint8_t * blocked, uint8_t * out, size_t len) {
+#if defined(GGML_VEC_INDEX_HAVE_SSE42_KERNEL)
+    if (vec_index_cpu_features().ssse3) {
+        ggml_vec_index_detail::turbovec_deinterleave_ssse3(blocked, out, len);
+        return;
+    }
+#endif
+    turbovec_deinterleave_scalar(blocked, out, len);
+}
+#endif
+
+void turbovec_block_seq(const ggml_vec_index & idx, size_t block, uint8_t * seq_blocked) {
+    const size_t n_byte_groups = static_cast<size_t>(idx.dim) / static_cast<size_t>(8 / idx.turbovec_bits);
+    const size_t lane_size = static_cast<size_t>(kTurboVecScoreBlock);
+    const size_t block_bytes = n_byte_groups * lane_size;
+    const uint8_t * src = idx.turbovec_blocked_data.data() + block * block_bytes;
+    if (idx.turbovec_blocked_vm) {
+        for (size_t g = 0; g < n_byte_groups; ++g) {
+            for (size_t lane = 0; lane < lane_size; ++lane) {
+                seq_blocked[g * lane_size + lane] = src[vector_major_offset(g, lane)];
+            }
+        }
+        return;
+    }
+#if defined(__x86_64__) || defined(_M_X64)
+    turbovec_deinterleave_native(src, seq_blocked, block_bytes);
+#else
+    std::memcpy(seq_blocked, src, block_bytes);
+#endif
+}
+
+void turbovec_blocked_set_block_seq(ggml_vec_index & idx, size_t block, const uint8_t * seq_blocked) {
+    const size_t n_byte_groups = static_cast<size_t>(idx.dim) / static_cast<size_t>(8 / idx.turbovec_bits);
+    const size_t lane_size = static_cast<size_t>(kTurboVecScoreBlock);
+    const size_t block_bytes = n_byte_groups * lane_size;
+    uint8_t * dst = idx.turbovec_blocked_data.data() + block * block_bytes;
+    if (idx.turbovec_blocked_vm) {
+        for (size_t g = 0; g < n_byte_groups; ++g) {
+            for (size_t lane = 0; lane < lane_size; ++lane) {
+                dst[vector_major_offset(g, lane)] = seq_blocked[g * lane_size + lane];
+            }
+        }
+        return;
+    }
+    std::memcpy(dst, seq_blocked, block_bytes);
+#if defined(__x86_64__) || defined(_M_X64)
+    turbovec_interleave_native(dst, block_bytes);
+#endif
+}
+
+#ifdef GGML_VEC_INDEX_TEST_HOOKS
+// Kernel 0: SSSE3 interleave and deinterleave; 1: AVX2 interleave, each
+// against the scalar loops; 2: the whole-block helpers in both blocked
+// layouts against the per-lane accessors (every host). 1 on a match, 0 on a
+// mismatch, -1 when this build or CPU lacks the kernel.
+int turbovec_layout_kernel_parity_for_test(int kernel) {
+    const size_t lane_size = static_cast<size_t>(kTurboVecScoreBlock);
+    // An odd group count covers the AVX2 kernel's single-group tail.
+    constexpr size_t n_groups = 101;
+    std::vector<uint8_t> src(n_groups * lane_size);
+    uint32_t state = 0x9e3779b9u;
+    for (uint8_t & b : src) {
+        state = state * 1664525u + 1013904223u;
+        b = static_cast<uint8_t>(state >> 24);
+    }
+    if (kernel == 0 || kernel == 1) {
+        void (*interleave)(uint8_t *, size_t) = nullptr;
+        void (*deinterleave)(const uint8_t *, uint8_t *, size_t) = nullptr;
+#if (defined(__x86_64__) || defined(_M_X64)) && defined(GGML_VEC_INDEX_HAVE_SSE42_KERNEL)
+        if (kernel == 0 && vec_index_cpu_features().ssse3) {
+            interleave = ggml_vec_index_detail::turbovec_interleave_ssse3;
+            deinterleave = ggml_vec_index_detail::turbovec_deinterleave_ssse3;
+        }
+#endif
+#if (defined(__x86_64__) || defined(_M_X64)) && defined(GGML_VEC_INDEX_HAVE_AVX2_KERNEL)
+        if (kernel == 1 && vec_index_cpu_features().avx2) {
+            interleave = ggml_vec_index_detail::turbovec_interleave_avx2;
+        }
+#endif
+        if (interleave == nullptr) {
+            return -1;
+        }
+        std::vector<uint8_t> expect = src;
+        turbovec_interleave_scalar(expect.data(), expect.size());
+        for (size_t groups : { n_groups, size_t{ 1 }, size_t{ 2 }, size_t{ 0 } }) {
+            std::vector<uint8_t> got(src.begin(), src.begin() + static_cast<std::ptrdiff_t>(groups * lane_size));
+            interleave(got.data(), got.size());
+            if (!std::equal(got.begin(), got.end(), expect.begin())) {
+                return 0;
+            }
+        }
+        if (expect == src) {
+            return 0;
+        }
+        std::vector<uint8_t> back(src.size());
+        turbovec_deinterleave_scalar(expect.data(), back.data(), back.size());
+        if (back != src) {
+            return 0;
+        }
+        if (deinterleave != nullptr) {
+            std::fill(back.begin(), back.end(), 0);
+            deinterleave(expect.data(), back.data(), back.size());
+            if (back != src) {
+                return 0;
+            }
+        }
+        return 1;
+    }
+    if (kernel != 2) {
+        return -1;
+    }
+    // dim 192 at 2 bits: 48 byte groups, a multiple of the vector-major unit.
+    constexpr int dim = 192;
+    ggml_vec_index_t * idx = ggml_vec_index_create_turbovec_q2(dim);
+    if (idx == nullptr) {
+        return 0;
+    }
+    const size_t n_byte_groups = static_cast<size_t>(dim) / 4;
+    const size_t block_bytes = n_byte_groups * lane_size;
+    bool ok = true;
+    for (bool vm : { false, true }) {
+        idx->turbovec_blocked_vm = vm;
+        idx->turbovec_blocked_data.assign(2 * block_bytes, 0);
+        const uint8_t * seq = src.data();
+        turbovec_blocked_set_block_seq(*idx, 1, seq);
+        const uint8_t * block = idx->turbovec_blocked_data.data() + block_bytes;
+        for (size_t g = 0; g < n_byte_groups && ok; ++g) {
+            for (size_t lane = 0; lane < lane_size; ++lane) {
+                ok = ok && block_lane_byte(block, g, lane, vm) == seq[g * lane_size + lane];
+            }
+        }
+        ok = ok && std::all_of(
+            idx->turbovec_blocked_data.begin(),
+            idx->turbovec_blocked_data.begin() + static_cast<std::ptrdiff_t>(block_bytes),
+            [](uint8_t b) { return b == 0; });
+        std::vector<uint8_t> back(block_bytes);
+        turbovec_block_seq(*idx, 1, back.data());
+        ok = ok && std::equal(back.begin(), back.end(), seq);
+    }
+    idx->turbovec_blocked_data.clear();
+    ggml_vec_index_free(idx);
+    return ok ? 1 : 0;
+}
+#endif
 
 void turbovec_blocked_append(ggml_vec_index & idx, const uint8_t * packed, size_t first_slot, size_t n_new) {
     // New rows land lane by lane: lanes already in the partial tail block

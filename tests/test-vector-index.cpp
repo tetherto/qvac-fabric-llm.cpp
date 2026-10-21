@@ -178,6 +178,7 @@ uint64_t turbovec_ziggurat_table_hash_for_test(void);
 void turbovec_hadamard_rotate_for_test(const float * src, float * dst, int dim);
 int turbovec_rotation_kernel_parity_for_test(int kernel);
 int turbovec_encode_kernel_parity_for_test(int kernel);
+int turbovec_layout_kernel_parity_for_test(int kernel);
 int vector_validation_kernel_parity_for_test(int kernel);
 int crc32c_kernel_parity_for_test(int kernel);
 void turbovec_force_vector_major_for_test(int mode);
@@ -4735,6 +4736,10 @@ void check_simd_kernel_parity() {
                 "vector validation", simd_names[kernel], vector_validation_kernel_parity_for_test(kernel), required);
         }
     }
+    // x86 search-layout interleave; the whole-block helpers run everywhere.
+    check_simd_parity_status("TurboVec layout", "SSSE3", turbovec_layout_kernel_parity_for_test(0), false);
+    check_simd_parity_status("TurboVec layout", "AVX2", turbovec_layout_kernel_parity_for_test(1), false);
+    check_simd_parity_status("TurboVec layout", "block helpers", turbovec_layout_kernel_parity_for_test(2), true);
     // Hardware CRC-32C against the table loop.
     check_simd_parity_status("CRC-32C", "ARMv8 CRC32", crc32c_kernel_parity_for_test(0), false);
     check_simd_parity_status("CRC-32C", "SSE4.2", crc32c_kernel_parity_for_test(1), false);

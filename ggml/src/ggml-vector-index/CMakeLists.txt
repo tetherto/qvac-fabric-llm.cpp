@@ -64,9 +64,9 @@ if (GGML_VECTOR_INDEX_AVX2_FLAG)
         PROPERTIES COMPILE_OPTIONS "${GGML_VECTOR_INDEX_AVX2_FLAG}")
 endif()
 
-# The CRC-32C kernel needs SSE4.2, and the TurboVec rotation kernels AVX-512
-# F (with AVX2). Each gets its own object, like the AVX2 one, and runs only
-# after a runtime CPU check.
+# The TurboVec layout and checksum kernels need SSSE3 and SSE4.2, and the
+# rotation kernels AVX-512 F (with AVX2). Each gets its own object, like the
+# AVX2 one, and runs only after a runtime CPU check.
 set(GGML_VECTOR_INDEX_SSE42_FLAG "")
 set(GGML_VECTOR_INDEX_SSE42_ENABLED OFF)
 set(GGML_VECTOR_INDEX_AVX512_FLAG "")
@@ -74,7 +74,8 @@ set(GGML_VECTOR_INDEX_SSE42_CHECK_SOURCE [=[
     #include <immintrin.h>
     #include <cstdint>
     int main() {
-        const unsigned crc = _mm_crc32_u8(0u, static_cast<unsigned char>(_mm_cvtsi128_si32(_mm_set1_epi8(3))));
+        const __m128i v = _mm_shuffle_epi8(_mm_set1_epi8(3), _mm_set1_epi8(1));
+        const unsigned crc = _mm_crc32_u8(0u, static_cast<unsigned char>(_mm_cvtsi128_si32(v)));
         return crc == 0u ? 0 : 1;
     }
 ]=])
@@ -94,13 +95,14 @@ set(GGML_VECTOR_INDEX_AVX512_CHECK_SOURCE [=[
 if (GGML_SYSTEM_ARCH STREQUAL "x86")
     set(GGML_VECTOR_INDEX_SSE42_CANDIDATE OFF)
     if (CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        check_cxx_compiler_flag("-mssse3" GGML_VECTOR_INDEX_SUPPORTS_MSSSE3)
         check_cxx_compiler_flag("-msse4.2" GGML_VECTOR_INDEX_SUPPORTS_MSSE42)
-        if (GGML_VECTOR_INDEX_SUPPORTS_MSSE42)
-            set(GGML_VECTOR_INDEX_SSE42_FLAG "-msse4.2")
+        if (GGML_VECTOR_INDEX_SUPPORTS_MSSSE3 AND GGML_VECTOR_INDEX_SUPPORTS_MSSE42)
+            set(GGML_VECTOR_INDEX_SSE42_FLAG "-mssse3;-msse4.2")
             set(GGML_VECTOR_INDEX_SSE42_CANDIDATE ON)
         endif()
     elseif (MSVC)
-        # MSVC compiles SSE4.2 intrinsics without an /arch flag.
+        # MSVC compiles SSSE3 and SSE4.2 intrinsics without an /arch flag.
         set(GGML_VECTOR_INDEX_SSE42_CANDIDATE ON)
     endif()
     if (GGML_VECTOR_INDEX_SSE42_CANDIDATE)
