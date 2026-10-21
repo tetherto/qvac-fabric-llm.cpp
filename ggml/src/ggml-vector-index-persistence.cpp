@@ -248,13 +248,23 @@ static bool read_u64_le(std::ifstream & f, uint64_t & v) {
     return true;
 }
 
+// CRC-32C (Castagnoli), one table lookup per byte; callers apply the
+// initial value and the final inversion.
 uint32_t crc32c_update(uint32_t crc, const void * data, size_t size) {
+    static const std::array<uint32_t, 256> table = [] {
+        std::array<uint32_t, 256> t{};
+        for (uint32_t i = 0; i < 256; ++i) {
+            uint32_t c = i;
+            for (int bit = 0; bit < 8; ++bit) {
+                c = (c >> 1) ^ (0x82f63b78u & (0u - (c & 1u)));
+            }
+            t[i] = c;
+        }
+        return t;
+    }();
     const auto * bytes = static_cast<const uint8_t *>(data);
     for (size_t i = 0; i < size; ++i) {
-        crc ^= bytes[i];
-        for (int bit = 0; bit < 8; ++bit) {
-            crc = (crc >> 1) ^ (0x82f63b78u & (0u - (crc & 1u)));
-        }
+        crc = (crc >> 8) ^ table[(crc ^ bytes[i]) & 0xffu];
     }
     return crc;
 }

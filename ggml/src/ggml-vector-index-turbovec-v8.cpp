@@ -36,27 +36,8 @@ constexpr size_t kMaxOps = 1024;
 // (upstream io.rs MAX_VECTOR_SCALE).
 constexpr float kMaxVectorScale = 1e22f;
 
-const uint32_t * crc32c_table() {
-    static const std::array<uint32_t, 256> table = [] {
-        std::array<uint32_t, 256> t{};
-        for (uint32_t i = 0; i < 256; ++i) {
-            uint32_t c = i;
-            for (int bit = 0; bit < 8; ++bit) {
-                c = (c >> 1) ^ (0x82f63b78u & (0u - (c & 1u)));
-            }
-            t[i] = c;
-        }
-        return t;
-    }();
-    return table.data();
-}
-
 uint32_t crc32c_raw(uint32_t crc, const uint8_t * data, size_t size) {
-    const uint32_t * table = crc32c_table();
-    for (size_t i = 0; i < size; ++i) {
-        crc = (crc >> 8) ^ table[(crc ^ data[i]) & 0xffu];
-    }
-    return crc;
+    return crc32c_update(crc, data, size);
 }
 
 uint32_t crc32_one(const uint8_t * data, size_t size) {
