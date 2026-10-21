@@ -550,8 +550,21 @@ static size_t first_invalid_abs(const float * values, size_t n, float max_abs) {
 #endif
 }
 
-bool all_finite_abs_less_than(const float * values, size_t n, float max_abs) {
-    return first_invalid_abs(values, n, max_abs) == n;
+bool all_finite_abs_less_than(const float * values, size_t n, float max_abs, int n_threads) {
+    // Large inputs split into chunks scanned on the worker threads.
+    constexpr size_t kValuesPerTask = size_t{ 1 } << 18;
+    std::atomic<bool> ok{ true };
+    parallel_for((n + kValuesPerTask - 1) / kValuesPerTask, n_threads, [&](size_t task, size_t) {
+        if (!ok.load(std::memory_order_relaxed)) {
+            return;
+        }
+        const size_t begin = task * kValuesPerTask;
+        const size_t len = std::min(n, begin + kValuesPerTask) - begin;
+        if (first_invalid_abs(values + begin, len, max_abs) != len) {
+            ok.store(false, std::memory_order_relaxed);
+        }
+    });
+    return ok.load(std::memory_order_relaxed);
 }
 
 #ifdef GGML_VEC_INDEX_TEST_HOOKS
@@ -1164,6 +1177,13 @@ static bool rename_overwrite(const TempFile & temp, const char * dst) {
 }
 
 #ifdef GGML_VEC_INDEX_TEST_HOOKS
+void state_hash_for_test(const ggml_vec_index_t * idx, uint64_t * sums) {
+    std::shared_lock<std::shared_mutex> lock(idx->mutex);
+    sums[0] = idx->state_hash_xor;
+    sums[1] = idx->state_hash_sum;
+    sums[2] = idx->state_hash_sum_rot;
+}
+
 extern "C" {
 int ggml_vec_index_test_can_address_array(size_t count, size_t element_size) {
     return can_address_array(count, element_size) ? 1 : 0;
@@ -1419,6 +1439,96 @@ void add_state_hash(ggml_vec_index & idx, uint64_t hash) {
     idx.state_hash_sum_rot += rotl64(hash, 17);
 }
 
+namespace {
+
+// The three state-hash sums over a set of slots, in any order.
+struct StateHashSums {
+    uint64_t hash_xor = 0;
+    uint64_t sum = 0;
+    uint64_t sum_rot = 0;
+
+    void add(uint64_t hash) {
+        hash_xor ^= hash;
+        sum += hash;
+        sum_rot += rotl64(hash, 17);
+    }
+
+    void add(const StateHashSums & other) {
+        hash_xor ^= other.hash_xor;
+        sum += other.sum;
+        sum_rot += other.sum_rot;
+    }
+};
+
+// Slots per parallel task of a state-hash pass (a multiple of 32, so a task
+// reads whole blocks of the blocked cache).
+constexpr size_t kStateHashSlotsPerTask = 2048;
+
+// Sums the hashes of the active slots [first, last) over n_threads; rows,
+// when given, are the packed rows of those slots, and otherwise rows come
+// out of the blocked cache a block at a time when the index keeps them only
+// there.
+StateHashSums state_hash_sums(const ggml_vec_index & idx, size_t first, size_t last, const uint8_t * rows, int n_threads) {
+    const size_t n_tasks = last > first ? (last - first + kStateHashSlotsPerTask - 1) / kStateHashSlotsPerTask : 0;
+    const bool blocked = rows == nullptr && turbovec_rows_in_blocked(idx) && first % 32 == 0;
+    const size_t row_bytes = is_turbovec(idx) ? turbovec_row_bytes(idx.turbovec_bits, static_cast<size_t>(idx.dim)) : 0;
+    std::vector<StateHashSums> partial(n_tasks);
+    parallel_for(n_tasks, n_threads, [&](size_t task, size_t) {
+        const size_t begin = first + task * kStateHashSlotsPerTask;
+        const size_t end = std::min(last, begin + kStateHashSlotsPerTask);
+        StateHashSums & sums = partial[task];
+        if (blocked) {
+            std::vector<uint8_t> scratch(turbovec_block_scratch_bytes(idx));
+            std::vector<uint8_t> block_rows(32 * row_bytes);
+            for (size_t block_first = begin; block_first < end; block_first += 32) {
+                turbovec_block_rows_packed(idx, block_first / 32, block_rows.data(), scratch.data());
+                for (size_t slot = block_first; slot < std::min(block_first + 32, end); ++slot) {
+                    if (slot_is_active(idx, slot)) {
+                        sums.add(slot_state_hash(idx, slot, block_rows.data() + (slot - block_first) * row_bytes));
+                    }
+                }
+            }
+            return;
+        }
+        for (size_t slot = begin; slot < end; ++slot) {
+            if (slot_is_active(idx, slot)) {
+                sums.add(slot_state_hash(idx, slot, rows == nullptr ? nullptr : rows + (slot - first) * row_bytes));
+            }
+        }
+    });
+    StateHashSums total;
+    for (const StateHashSums & sums : partial) {
+        total.add(sums);
+    }
+    return total;
+}
+
+void apply_state_hash_sums(ggml_vec_index & idx, const StateHashSums & sums) {
+    idx.state_hash_xor ^= sums.hash_xor;
+    idx.state_hash_sum += sums.sum;
+    idx.state_hash_sum_rot += sums.sum_rot;
+}
+
+}  // namespace
+
+void add_state_hash_range(ggml_vec_index & idx, size_t first, size_t last, const uint8_t * rows) {
+    if (idx.n_threads > 1) {
+        // An add hashes its rows after committing them, so this must not
+        // fail: without memory for the threaded pass, hash row by row.
+        try {
+            apply_state_hash_sums(idx, state_hash_sums(idx, first, last, rows, idx.n_threads));
+            return;
+        } catch (...) {
+        }
+    }
+    const size_t row_bytes = is_turbovec(idx) ? turbovec_row_bytes(idx.turbovec_bits, static_cast<size_t>(idx.dim)) : 0;
+    for (size_t slot = first; slot < last; ++slot) {
+        if (slot_is_active(idx, slot)) {
+            add_state_hash(idx, slot_state_hash(idx, slot, rows == nullptr ? nullptr : rows + (slot - first) * row_bytes));
+        }
+    }
+}
+
 void remove_state_hash(ggml_vec_index & idx, uint64_t hash) {
     idx.state_hash_xor ^= hash;
     idx.state_hash_sum -= hash;
@@ -1486,6 +1596,16 @@ void rebuild_state_hash(ggml_vec_index & idx) {
     idx.state_hash_xor = 0;
     idx.state_hash_sum = 0;
     idx.state_hash_sum_rot = 0;
+    if (idx.n_threads > 1) {
+        // Callers rebuild after committing a change, so this must not fail:
+        // without memory for the threaded pass, fall back to the one below.
+        try {
+            apply_state_hash_sums(idx, state_hash_sums(idx, 0, idx.slot_to_id.size(), nullptr, idx.n_threads));
+            idx.state_hash_valid = true;
+            return;
+        } catch (...) {
+        }
+    }
     std::vector<uint8_t> rows;
     std::vector<uint8_t> scratch;
     if (turbovec_rows_in_blocked(idx)) {

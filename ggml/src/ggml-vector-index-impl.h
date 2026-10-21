@@ -503,7 +503,8 @@ inline void test_record_delta_read_size(size_t) {}
 bool is_supported_bit_width(int bit_width);
 bool is_valid_id(uint64_t id);
 bool all_finite(const float * values, size_t n);
-bool all_finite_abs_less_than(const float * values, size_t n, float max_abs);
+// n_threads splits the check; the answer does not depend on it.
+bool all_finite_abs_less_than(const float * values, size_t n, float max_abs, int n_threads = 1);
 uint32_t float_to_u32(float value);
 float u32_to_float(uint32_t value);
 void put_u32_le(uint8_t * dst, uint32_t v);
@@ -605,6 +606,7 @@ void turbovec_force_vector_major_for_test(int mode);
 void turbovec_disable_dot_product_for_test(int disabled);
 void turbovec_force_planes_for_test(int mode, size_t min_vectors);
 size_t parallel_pool_threads_for_test(void);
+void state_hash_for_test(const ggml_vec_index_t * idx, uint64_t * sums);
 int parallel_pool_selftest_for_test(int n_threads);
 int turbovec_index_hashes_for_test(
     const ggml_vec_index_t * idx,
@@ -903,8 +905,10 @@ void repack_turbovec_sign_codes(
     int bits,
     int dim,
     size_t first_slot,
-    std::vector<uint8_t> & sign_blocked);
+    std::vector<uint8_t> & sign_blocked,
+    int n_threads = 1);
 void turbovec_sign_blocked_swap_remove(ggml_vec_index & idx, size_t slot, size_t last);
+// Blocks are independent, so n_threads does not change the bytes.
 void repack_turbovec_codes(
     const uint8_t * packed_codes,
     size_t n_vectors,
@@ -912,7 +916,8 @@ void repack_turbovec_codes(
     int dim,
     std::vector<uint8_t> & blocked_codes,
     size_t & n_blocks,
-    bool vector_major = false);
+    bool vector_major = false,
+    int n_threads = 1);
 void repack_turbovec_codes_from_slot(
     const uint8_t * packed_codes,
     size_t n_vectors,
@@ -921,7 +926,8 @@ void repack_turbovec_codes_from_slot(
     size_t first_slot,
     std::vector<uint8_t> & blocked_codes,
     size_t & n_blocks,
-    bool vector_major = false);
+    bool vector_major = false,
+    int n_threads = 1);
 void score_turbovec_lut_block(
     const uint8_t * lut,
     float lut_scale,
@@ -966,6 +972,10 @@ uint32_t index_state_crc32c_after_remove(const ggml_vec_index & idx, uint64_t id
 // reading it back from the blocked cache).
 uint64_t slot_state_hash(const ggml_vec_index & idx, size_t slot, const uint8_t * turbovec_row = nullptr);
 void add_state_hash(ggml_vec_index & idx, uint64_t hash);
+// Adds the hashes of the active slots [first, last) over idx.n_threads;
+// `rows`, when given, holds their packed TurboVec rows. The hash sums are
+// commutative, so the result does not depend on the split.
+void add_state_hash_range(ggml_vec_index & idx, size_t first, size_t last, const uint8_t * rows);
 void remove_state_hash(ggml_vec_index & idx, uint64_t hash);
 void rebuild_state_hash(ggml_vec_index & idx);
 uint32_t index_state_token(const ggml_vec_index & idx);

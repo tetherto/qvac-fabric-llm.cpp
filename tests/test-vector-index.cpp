@@ -187,6 +187,7 @@ void turbovec_force_vector_major_for_test(int mode);
 void turbovec_disable_dot_product_for_test(int disabled);
 void turbovec_force_planes_for_test(int mode, size_t min_vectors);
 size_t parallel_pool_threads_for_test(void);
+void state_hash_for_test(const ggml_vec_index_t * idx, uint64_t * sums);
 int parallel_pool_selftest_for_test(int n_threads);
 int turbovec_sync_plan_for_test(
     ggml_vec_index_t * idx,
@@ -5319,6 +5320,22 @@ void check_turbovec_1x_threads() {
         CHECK(out[0] == out[1]);
         CHECK(scores[0] == scores[1]);
         CHECK(std::equal(out[0].begin(), out[0].begin() + 10, out[0].begin() + 90));
+#ifdef GGML_VEC_INDEX_TEST_HOOKS
+        // The state hash an add and a calibrate keep over 8 threads is the
+        // one a single-threaded load rebuilds.
+        {
+            uint64_t sums[3][3] = {};
+            state_hash_for_test(built[0], sums[0]);
+            state_hash_for_test(built[1], sums[1]);
+            ggml_vec_index_t * loaded = nullptr;
+            CHECK(ggml_vec_index_from_bytes(bytes[1].data(), bytes[1].size(), &loaded) == GGML_VEC_INDEX_OK);
+            state_hash_for_test(loaded, sums[2]);
+            ggml_vec_index_free(loaded);
+            for (int i = 0; i < 3; ++i) {
+                CHECK(sums[0][i] == sums[1][i] && sums[0][i] == sums[2][i]);
+            }
+        }
+#endif
         ggml_vec_index_free(built[0]);
         ggml_vec_index_free(built[1]);
     }

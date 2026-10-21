@@ -532,7 +532,7 @@ int ggml_vec_index_add_unlocked(
             return GGML_VEC_INDEX_E_INVALID_ARG;
         }
         const bool valid_values = is_turbovec(*idx) ?
-            all_finite_abs_less_than(vectors, value_count, kTurboVecMaxInputMagnitude) :
+            all_finite_abs_less_than(vectors, value_count, kTurboVecMaxInputMagnitude, idx->n_threads) :
             all_finite(vectors, value_count);
         if (!valid_values) {
             return GGML_VEC_INDEX_E_INVALID_ARG;
@@ -688,24 +688,15 @@ int ggml_vec_index_add_unlocked(
                     base_slot,
                     idx->turbovec_blocked_data,
                     idx->turbovec_blocked_n_blocks,
-                    idx->turbovec_blocked_vm);
+                    idx->turbovec_blocked_vm,
+                    idx->n_threads);
             } else {
                 turbovec_blocked_append(*idx, turbovec_batch.data(), base_slot, n_sz);
             }
             turbovec_planes_refresh(*idx, base_slot);
             turbovec_settle_rows(*idx);
         }
-        for (size_t slot = base_slot; slot < new_slots; ++slot) {
-            add_state_hash(
-                *idx,
-                slot_state_hash(
-                    *idx,
-                    slot,
-                    turbovec_batch.empty() ?
-                        nullptr :
-                        turbovec_batch.data() +
-                            (slot - base_slot) * turbovec_row_bytes(idx->turbovec_bits, dim_sz)));
-        }
+        add_state_hash_range(*idx, base_slot, new_slots, turbovec_batch.empty() ? nullptr : turbovec_batch.data());
         if (finalize) {
             ++idx->generation;
             invalidate_ivf(*idx);
@@ -899,7 +890,8 @@ static int ggml_vec_index_compact_unlocked(ggml_vec_index_t * idx) {
                     idx->dim,
                     new_turbovec_blocked_data,
                     new_turbovec_blocked_n_blocks,
-                    idx->turbovec_blocked_vm);
+                    idx->turbovec_blocked_vm,
+                    idx->n_threads);
             }
             idx->turbovec_data.swap(new_data);
             idx->turbovec_packed_rows = true;
@@ -1439,7 +1431,7 @@ int ggml_vec_index_turbovec_calibrate(ggml_vec_index_t * idx, const float * samp
         const size_t n_sz = static_cast<size_t>(n);
         if (n_sz > std::numeric_limits<size_t>::max() / dim_sz ||
             !can_address_array(n_sz * dim_sz, sizeof(float)) ||
-            !all_finite_abs_less_than(sample, n_sz * dim_sz, kTurboVecMaxInputMagnitude)) {
+            !all_finite_abs_less_than(sample, n_sz * dim_sz, kTurboVecMaxInputMagnitude, idx->n_threads)) {
             return GGML_VEC_INDEX_E_INVALID_ARG;
         }
 
@@ -1477,7 +1469,8 @@ int ggml_vec_index_turbovec_calibrate(ggml_vec_index_t * idx, const float * samp
                 scales,
                 idx->n_threads);
             repack_turbovec_codes(
-                codes.data(), n_slots, idx->turbovec_bits, idx->dim, blocked, n_blocks, idx->turbovec_blocked_vm);
+                codes.data(), n_slots, idx->turbovec_bits, idx->dim, blocked, n_blocks, idx->turbovec_blocked_vm,
+                idx->n_threads);
         }
 
         idx->turbovec_tqplus_shift.swap(shift);

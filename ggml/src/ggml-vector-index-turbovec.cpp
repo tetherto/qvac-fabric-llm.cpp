@@ -23,6 +23,8 @@ namespace {
 
 constexpr int kTurboVecDimMultiple = 8;
 constexpr int kTurboVecScoreBlock = 32;
+// 32-row blocks per parallel task of the cache repacks.
+constexpr size_t kTurboVecBlocksPerTask = 64;
 #if GGML_VEC_INDEX_USE_NEON
 constexpr int kTurboVecFlushEvery = 256;
 #endif
@@ -2022,6 +2024,27 @@ static void repack_turbovec_code_block(
     write_blocked_block(seq.data(), n_byte_groups, blocked_codes.data() + block_offset, vector_major);
 }
 
+// Blocks [first_block, end_block); each writes only its own bytes.
+static void repack_turbovec_code_blocks(
+        const uint8_t * packed_codes,
+        size_t n_vectors,
+        int bits,
+        int dim,
+        size_t first_block,
+        size_t end_block,
+        std::vector<uint8_t> & blocked_codes,
+        bool vector_major,
+        int n_threads) {
+    const size_t n_repack = end_block > first_block ? end_block - first_block : 0;
+    parallel_for((n_repack + kTurboVecBlocksPerTask - 1) / kTurboVecBlocksPerTask, n_threads, [&](size_t task, size_t) {
+        const size_t begin = first_block + task * kTurboVecBlocksPerTask;
+        const size_t end = std::min(end_block, begin + kTurboVecBlocksPerTask);
+        for (size_t block = begin; block < end; ++block) {
+            repack_turbovec_code_block(packed_codes, n_vectors, bits, dim, block, blocked_codes, vector_major);
+        }
+    });
+}
+
 // Writes one block of 32 sequential rows (lane-major, n_byte_groups bytes
 // each) in the blocked layout the scan kernels read.
 static void write_blocked_block(const uint8_t * seq, size_t n_byte_groups, uint8_t * block, bool vector_major) {
@@ -2427,10 +2450,15 @@ void turbovec_rows_packed(const ggml_vec_index & idx, std::vector<uint8_t> & pac
     const size_t n = idx.slot_to_id.size();
     const size_t lane_size = static_cast<size_t>(kTurboVecScoreBlock);
     packed.resize(n * row_bytes);
-    std::vector<uint8_t> scratch(turbovec_rows_in_blocked(idx) ? turbovec_block_scratch_bytes(idx) : 0);
-    for (size_t block = 0; block * lane_size < n; ++block) {
-        turbovec_block_rows_packed(idx, block, packed.data() + block * lane_size * row_bytes, scratch.data());
-    }
+    const size_t n_blocks = (n + lane_size - 1) / lane_size;
+    // Each block writes its own rows.
+    parallel_for((n_blocks + kTurboVecBlocksPerTask - 1) / kTurboVecBlocksPerTask, idx.n_threads, [&](size_t task, size_t) {
+        std::vector<uint8_t> scratch(turbovec_rows_in_blocked(idx) ? turbovec_block_scratch_bytes(idx) : 0);
+        const size_t end = std::min(n_blocks, (task + 1) * kTurboVecBlocksPerTask);
+        for (size_t block = task * kTurboVecBlocksPerTask; block < end; ++block) {
+            turbovec_block_rows_packed(idx, block, packed.data() + block * lane_size * row_bytes, scratch.data());
+        }
+    });
 }
 
 void turbovec_blocked_set_row_seq(ggml_vec_index & idx, size_t slot, const uint8_t * seq) {
@@ -2654,15 +2682,21 @@ void turbovec_blocked_append(ggml_vec_index & idx, const uint8_t * packed, size_
     reserve_mostly_exact(blocked, n_blocks * block_bytes > blocked.size() ? n_blocks * block_bytes - blocked.size() : 0);
     blocked.resize(n_blocks * block_bytes, 0);
     idx.turbovec_blocked_n_blocks = n_blocks;
-    uint8_t seq[kTurboVecMaxDim / 2];
-    for (size_t i = 0; i < n_new; ++i) {
-        const size_t slot = first_slot + i;
-        packed_row_to_seq_fast(packed + i * row_bytes, bits, idx.dim, seq);
-        uint8_t * block = blocked.data() + (slot / lane_size) * block_bytes;
-        for (size_t g = 0; g < n_byte_groups; ++g) {
-            set_block_lane_byte(block, g, slot % lane_size, idx.turbovec_blocked_vm, seq[g]);
+    // A task covers whole blocks, as lanes of one block can share bytes.
+    const size_t first_block = first_slot / lane_size;
+    const size_t n_tasks = (n_blocks - first_block + kTurboVecBlocksPerTask - 1) / kTurboVecBlocksPerTask;
+    parallel_for(n_new == 0 ? 0 : n_tasks, idx.n_threads, [&](size_t task, size_t) {
+        uint8_t seq[kTurboVecMaxDim / 2];
+        const size_t begin = std::max(first_slot, (first_block + task * kTurboVecBlocksPerTask) * lane_size);
+        const size_t end = std::min(n_total, (first_block + (task + 1) * kTurboVecBlocksPerTask) * lane_size);
+        for (size_t slot = begin; slot < end; ++slot) {
+            packed_row_to_seq_fast(packed + (slot - first_slot) * row_bytes, bits, idx.dim, seq);
+            uint8_t * block = blocked.data() + (slot / lane_size) * block_bytes;
+            for (size_t g = 0; g < n_byte_groups; ++g) {
+                set_block_lane_byte(block, g, slot % lane_size, idx.turbovec_blocked_vm, seq[g]);
+            }
         }
-    }
+    });
 }
 
 void turbovec_blocked_truncate(ggml_vec_index & idx, size_t n) {
@@ -2726,7 +2760,8 @@ void repack_turbovec_sign_codes(
         int bits,
         int dim,
         size_t first_slot,
-        std::vector<uint8_t> & sign_blocked) {
+        std::vector<uint8_t> & sign_blocked,
+        int n_threads) {
     // The sign plane of a bit-plane row is its top plane: one byte per
     // eight coordinates, scanned as an index with dim / 8 byte groups.
     const size_t n_sign_groups = static_cast<size_t>(dim) / 8;
@@ -2739,17 +2774,22 @@ void repack_turbovec_sign_codes(
     reserve_mostly_exact(sign_blocked, n_blocks * block_bytes > sign_blocked.size() ?
         n_blocks * block_bytes - sign_blocked.size() : 0);
     sign_blocked.resize(n_blocks * block_bytes, 0);
-    std::vector<uint8_t> seq(lane_size * n_sign_groups);
-    for (size_t block = first_block; block < n_blocks; ++block) {
-        std::fill(seq.begin(), seq.end(), 0);
-        for (size_t lane = 0; lane < lane_size; ++lane) {
-            const size_t vector = block * lane_size + lane;
-            if (vector < n_vectors) {
-                std::memcpy(seq.data() + lane * n_sign_groups, packed_codes + vector * row_bytes + sign_at, n_sign_groups);
+    const size_t n_repack = n_blocks > first_block ? n_blocks - first_block : 0;
+    parallel_for((n_repack + kTurboVecBlocksPerTask - 1) / kTurboVecBlocksPerTask, n_threads, [&](size_t task, size_t) {
+        std::vector<uint8_t> seq(lane_size * n_sign_groups);
+        const size_t begin = first_block + task * kTurboVecBlocksPerTask;
+        const size_t end = std::min(n_blocks, begin + kTurboVecBlocksPerTask);
+        for (size_t block = begin; block < end; ++block) {
+            std::fill(seq.begin(), seq.end(), 0);
+            for (size_t lane = 0; lane < lane_size; ++lane) {
+                const size_t vector = block * lane_size + lane;
+                if (vector < n_vectors) {
+                    std::memcpy(seq.data() + lane * n_sign_groups, packed_codes + vector * row_bytes + sign_at, n_sign_groups);
+                }
             }
+            write_blocked_block(seq.data(), n_sign_groups, sign_blocked.data() + block * block_bytes, false);
         }
-        write_blocked_block(seq.data(), n_sign_groups, sign_blocked.data() + block * block_bytes, false);
-    }
+    });
 }
 
 void turbovec_sign_blocked_swap_remove(ggml_vec_index & idx, size_t slot, size_t last) {
@@ -2779,7 +2819,8 @@ void repack_turbovec_codes(
         int dim,
         std::vector<uint8_t> & blocked_codes,
         size_t & n_blocks,
-        bool vector_major) {
+        bool vector_major,
+        int n_threads) {
     const size_t dim_sz = static_cast<size_t>(dim);
     const size_t codes_per_byte = static_cast<size_t>(8 / bits);
     const size_t n_byte_groups = dim_sz / codes_per_byte;
@@ -2790,10 +2831,7 @@ void repack_turbovec_codes(
         new_blocks * n_byte_groups * static_cast<size_t>(kTurboVecScoreBlock),
         0);
     n_blocks = new_blocks;
-
-    for (size_t block = 0; block < n_blocks; ++block) {
-        repack_turbovec_code_block(packed_codes, n_vectors, bits, dim, block, blocked_codes, vector_major);
-    }
+    repack_turbovec_code_blocks(packed_codes, n_vectors, bits, dim, 0, n_blocks, blocked_codes, vector_major, n_threads);
 }
 
 void repack_turbovec_codes_from_slot(
@@ -2804,7 +2842,8 @@ void repack_turbovec_codes_from_slot(
         size_t first_slot,
         std::vector<uint8_t> & blocked_codes,
         size_t & n_blocks,
-        bool vector_major) {
+        bool vector_major,
+        int n_threads) {
     const size_t dim_sz = static_cast<size_t>(dim);
     const size_t codes_per_byte = static_cast<size_t>(8 / bits);
     const size_t n_byte_groups = dim_sz / codes_per_byte;
@@ -2816,7 +2855,7 @@ void repack_turbovec_codes_from_slot(
         old_blocks * n_byte_groups * static_cast<size_t>(kTurboVecScoreBlock);
     if (first_slot == 0 || first_slot > n_vectors || n_blocks != old_blocks ||
         blocked_codes.size() != old_expected_size) {
-        repack_turbovec_codes(packed_codes, n_vectors, bits, dim, blocked_codes, n_blocks, vector_major);
+        repack_turbovec_codes(packed_codes, n_vectors, bits, dim, blocked_codes, n_blocks, vector_major, n_threads);
         return;
     }
 
@@ -2828,9 +2867,8 @@ void repack_turbovec_codes_from_slot(
     blocked_codes.resize(
         n_blocks * n_byte_groups * static_cast<size_t>(kTurboVecScoreBlock),
         0);
-    for (size_t block = first_block; block < n_blocks; ++block) {
-        repack_turbovec_code_block(packed_codes, n_vectors, bits, dim, block, blocked_codes, vector_major);
-    }
+    repack_turbovec_code_blocks(
+        packed_codes, n_vectors, bits, dim, first_block, n_blocks, blocked_codes, vector_major, n_threads);
 }
 
 void score_turbovec_lut_block(

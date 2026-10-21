@@ -253,7 +253,8 @@ void turbovec_planes_refresh(ggml_vec_index & idx, size_t first_slot) {
     }
     try {
         repack_turbovec_sign_codes(
-            idx.turbovec_data.data(), n, idx.turbovec_bits, idx.dim, first_slot, idx.turbovec_sign_blocked);
+            idx.turbovec_data.data(), n, idx.turbovec_bits, idx.dim, first_slot, idx.turbovec_sign_blocked,
+            idx.n_threads);
     } catch (const std::bad_alloc &) {
         // Without memory for the sign planes the index drops back to full
         // scans, so a mutation never fails after its rows are committed;
