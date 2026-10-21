@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <array>
 #include <cassert>
+#include <cerrno>
 #include <atomic>
 #include <cfloat>
 #include <chrono>
@@ -32,6 +33,7 @@
 #ifdef _WIN32
 #include <process.h>
 #else
+#include <sys/wait.h>
 #include <unistd.h>
 #endif
 
@@ -184,6 +186,8 @@ int crc32c_kernel_parity_for_test(int kernel);
 void turbovec_force_vector_major_for_test(int mode);
 void turbovec_disable_dot_product_for_test(int disabled);
 void turbovec_force_planes_for_test(int mode, size_t min_vectors);
+size_t parallel_pool_threads_for_test(void);
+int parallel_pool_selftest_for_test(int n_threads);
 int turbovec_sync_plan_for_test(
     ggml_vec_index_t * idx,
     const char * path,
@@ -5984,6 +5988,72 @@ void check_turbovec_1x_staged() {
 #endif
 
 #ifdef GGML_VEC_INDEX_TEST_HOOKS
+// The pool behind every multi-threaded call: tasks run once each, nested
+// calls run inline, exceptions reach the caller, concurrent callers share
+// the helpers instead of each starting their own, and a forked child that
+// searches does not wait on its parent's helpers.
+void check_vector_index_pool() {
+    for (const int threads : { 1, 2, 3, 8, 64 }) {
+        CHECK(parallel_pool_selftest_for_test(threads) == 0);
+    }
+    const size_t pool_threads = parallel_pool_threads_for_test();
+    CHECK(pool_threads >= 7 && pool_threads <= 255);
+    std::atomic<int> failures{ 0 };
+    std::vector<std::thread> callers;
+    for (int c = 0; c < 8; ++c) {
+        callers.emplace_back([&] {
+            for (int i = 0; i < 25; ++i) {
+                if (parallel_pool_selftest_for_test(8) != 0) {
+                    failures.fetch_add(1);
+                }
+            }
+        });
+    }
+    for (std::thread & caller : callers) {
+        caller.join();
+    }
+    CHECK(failures.load() == 0);
+    CHECK(parallel_pool_threads_for_test() == pool_threads);
+
+#ifndef _WIN32
+    constexpr int dim = 64;
+    constexpr int n = 40000;
+    const std::vector<float> rows = tv1x_rows(kTv1xSeedDb, n, dim);
+    const std::vector<uint64_t> ids = tv1x_ids(n);
+    const std::vector<float> queries = tv1x_rows(kTv1xSeedQuery, 2, dim);
+    auto * tv = ggml_vec_index_create_turbovec(dim, 2);
+    CHECK(ggml_vec_index_set_threads(tv, 4) == GGML_VEC_INDEX_OK);
+    CHECK(ggml_vec_index_add(tv, rows.data(), n, ids.data()) == GGML_VEC_INDEX_OK);
+    std::vector<float> scores(20);
+    std::vector<uint64_t> out(20);
+    CHECK(ggml_vec_index_search(tv, queries.data(), 2, 10, scores.data(), out.data()) == GGML_VEC_INDEX_OK);
+    std::fflush(nullptr);
+    const pid_t child = fork();
+    CHECK(child >= 0);
+    if (child == 0) {
+        alarm(60);
+        std::vector<float> child_scores(20);
+        std::vector<uint64_t> child_out(20);
+        const bool ok = ggml_vec_index_search(tv, queries.data(), 2, 10, child_scores.data(), child_out.data()) ==
+                GGML_VEC_INDEX_OK &&
+            ggml_vec_index_search(tv, queries.data(), 1, 10, child_scores.data(), child_out.data()) ==
+                GGML_VEC_INDEX_OK &&
+            parallel_pool_selftest_for_test(4) == 0 &&
+            std::equal(child_out.begin(), child_out.begin() + 10, out.begin()) &&
+            std::memcmp(child_scores.data(), scores.data(), 10 * sizeof(float)) == 0;
+        _exit(ok ? 0 : 1);
+    }
+    int status = 0;
+    while (waitpid(child, &status, 0) < 0) {
+        CHECK(errno == EINTR);
+    }
+    CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    ggml_vec_index_free(tv);
+#endif
+}
+#endif
+
+#ifdef GGML_VEC_INDEX_TEST_HOOKS
 // The staged-search cache follows every mutation: an index searched after
 // adds, removals, a calibrate or a reload agrees with one rebuilt from its
 // bytes, and the file layout follows the index's size across syncs.
@@ -6656,6 +6726,7 @@ int main(int argc, char ** argv) {
             check_turbovec_1x_reordered_and_stale_commits();
             check_turbovec_1x_permute_dot_kernels();
             check_turbovec_1x_staged();
+            check_vector_index_pool();
             check_turbovec_1x_staged_maintenance();
             check_turbovec_1x_single_code_copy();
             check_turbovec_1x_streamed_snapshots();

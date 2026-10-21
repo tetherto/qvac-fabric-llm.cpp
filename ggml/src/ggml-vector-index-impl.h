@@ -29,6 +29,7 @@
 #include <string>
 #include <system_error>
 #include <thread>
+#include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -230,10 +231,21 @@ inline void update_topk_heap(std::vector<ScoreId> & heap, int k, const ScoreId &
 
 inline constexpr int kMaxThreads = 256;
 
+// One parallel_for task: ctx is the caller's functor.
+using ParallelTaskFn = void (*)(void * ctx, size_t task, size_t worker);
+
+// Runs fn(ctx, task, worker) for every task in [0, n_tasks) on the calling
+// thread (worker 0) and up to workers - 1 helpers from the process-wide
+// pool (ggml-vector-index-pool.cpp), each with its own worker id in
+// [1, workers). Helpers run under the caller's floating-point environment.
+// A call from inside a task, or after the pool shut down, runs inline.
+void parallel_run(size_t n_tasks, size_t workers, ParallelTaskFn fn, void * ctx);
+
 // Runs fn(task, worker) for every task in [0, n_tasks) on up to n_threads
 // threads, the calling thread included; worker is in [0, workers). Tasks
 // are handed out dynamically, so fn must not depend on which worker runs a
-// task. Rethrows the first exception a task threw.
+// task. Rethrows the first exception a task threw. One thread keeps every
+// task on the calling thread without touching the pool.
 template <typename Fn>
 void parallel_for(size_t n_tasks, int n_threads, Fn && fn) {
     const size_t workers = std::min(n_tasks, static_cast<size_t>(std::max(1, n_threads)));
@@ -243,38 +255,12 @@ void parallel_for(size_t n_tasks, int n_threads, Fn && fn) {
         }
         return;
     }
-    std::atomic<size_t> next{ 0 };
-    std::mutex error_mutex;
-    std::exception_ptr error;
-    auto run = [&](size_t worker) {
-        try {
-            for (size_t task = next.fetch_add(1); task < n_tasks; task = next.fetch_add(1)) {
-                fn(task, worker);
-            }
-        } catch (...) {
-            std::lock_guard<std::mutex> lock(error_mutex);
-            if (!error) {
-                error = std::current_exception();
-            }
-            next.store(n_tasks);
-        }
-    };
-    std::vector<std::thread> threads;
-    threads.reserve(workers - 1);
-    try {
-        for (size_t worker = 1; worker < workers; ++worker) {
-            threads.emplace_back(run, worker);
-        }
-    } catch (...) {
-        // Fewer threads than asked: the ones started and this one finish.
-    }
-    run(0);
-    for (std::thread & thread : threads) {
-        thread.join();
-    }
-    if (error) {
-        std::rethrow_exception(error);
-    }
+    using Functor = std::remove_reference_t<Fn>;
+    parallel_run(
+        n_tasks,
+        workers,
+        [](void * ctx, size_t task, size_t worker) { (*static_cast<Functor *>(ctx))(task, worker); },
+        const_cast<void *>(static_cast<const void *>(std::addressof(fn))));
 }
 
 // How a staged search weighs the sign plane and estimates a level from its
@@ -614,6 +600,8 @@ int turbovec_sync_plan_for_test(
 void turbovec_force_vector_major_for_test(int mode);
 void turbovec_disable_dot_product_for_test(int disabled);
 void turbovec_force_planes_for_test(int mode, size_t min_vectors);
+size_t parallel_pool_threads_for_test(void);
+int parallel_pool_selftest_for_test(int n_threads);
 int turbovec_index_hashes_for_test(
     const ggml_vec_index_t * idx,
     uint64_t * codes_hash,
