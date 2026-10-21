@@ -278,7 +278,7 @@ public:
     llm_graph_result * get_gf_res_reserve() const;
 
     // returns the result of ggml_backend_sched_graph_compute_async execution
-    ggml_status graph_compute(ggml_cgraph * gf, bool batched);
+    ggml_status graph_compute(ggml_cgraph * gf, bool batched, ggml_backend_sched_t sched_gf = nullptr);
 
     // reserve a graph with a dummy ubatch of the specified size
     ggml_cgraph * graph_reserve(
@@ -289,13 +289,34 @@ public:
 private:
     llm_graph_result * get_gf_res_prev();
 
+    // DFlash drafts alternate the target-feature injection (embd batch) with the noise block (token batch).
+    // The embd graphs get their own scheduler, compute buffers and GPU backend, so both graphs stay allocated
+    // for reuse and a noise block does not wait for the injection queued before it to copy its inputs.
+    struct graph_stream {
+        std::vector<ggml_backend_ptr> backends;     // the GPU backends of the stream, owned
+        std::vector<ggml_backend_t>   backend_ptrs; // the stream's GPU backends + the context's ACCEL and CPU backends
+        ggml_backend_sched_ptr        sched;
+        llm_graph_result_ptr          res;
+        bool                          active = false; // res holds the graph allocated in sched
+    };
+
+    // nullptr if the context does not use an embd stream
+    graph_stream * get_embd_stream();
+
+    // the scheduler that computed the last ubatch, its outputs are read through it
+    ggml_backend_sched_t get_sched_ubatch() const;
+
+    // the previous graphs are not reused after this
+    void graph_res_prev_reset();
+
     llm_graph_params graph_params(
                         llm_graph_result * res,
                       const llama_ubatch & ubatch,
             const llama_memory_context_i * mctx,
-                          llm_graph_type   gtype) const;
+                          llm_graph_type   gtype,
+                    ggml_backend_sched_t   sched_gf = nullptr) const;
 
-    llm_graph_cb graph_get_cb() const;
+    llm_graph_cb graph_get_cb(ggml_backend_sched_t sched_gf) const;
 
     // disable auto fused ops (Flash Attention, Gated Delta Net) whose op lands on a device
     // that differs from the layer it belongs to (usually due to missing backend support)
@@ -422,6 +443,10 @@ private:
     llm_graph_result_ptr gf_res_reserve;
 
     llm_graph_result * gf_res_prev_active = nullptr;
+
+    std::unique_ptr<graph_stream> embd_stream;
+    bool embd_stream_enabled   = false;
+    bool ubatch_on_embd_stream = false;
 
     // the model's Hadamard transforms plus the target's when tensors are borrowed through ctx_other
     llama_hadamard_rotations hadamard_rotations;
