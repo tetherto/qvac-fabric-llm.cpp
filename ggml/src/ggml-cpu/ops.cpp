@@ -2707,9 +2707,16 @@ static void ggml_compute_forward_gelu_quick_f32(
         const int i2 = (ir - i3*ne02*ne01)/ne01;
         const int i1 = (ir - i3*ne02*ne01 - i2*ne01);
 
-        ggml_vec_gelu_quick_f32(nc,
-                (float *) ((char *) dst->data  + i3*nb3  + i2*nb2  + i1*nb1),
-                (float *) ((char *) src0->data + i3*nb03 + i2*nb02 + i1*nb01));
+        float * dst_row = (float *) ((char *) dst->data + i3*nb3 + i2*nb2 + i1*nb1);
+        const float * src_row = (const float *) ((char *) src0->data + i3*nb03 + i2*nb02 + i1*nb01);
+        if (params->use_ref) {
+            // Avoid the FP16 lookup table in the F32 reference path.
+            for (int k = 0; k < nc; ++k) {
+                dst_row[k] = ggml_gelu_quick_f32(src_row[k]);
+            }
+        } else {
+            ggml_vec_gelu_quick_f32(nc, dst_row, src_row);
+        }
 
 #ifndef NDEBUG
         for (int k = 0; k < nc; k++) {

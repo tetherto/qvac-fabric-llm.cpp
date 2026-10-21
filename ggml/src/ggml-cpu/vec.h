@@ -64,6 +64,9 @@ extern ggml_fp16_t ggml_table_gelu_f16[1 << 16];
 // precomputed quick gelu table for f16 (128 KB)
 extern ggml_fp16_t ggml_table_gelu_quick_f16[1 << 16];
 
+// precomputed quick gelu table for f32 output (256 KB)
+extern float ggml_table_gelu_quick_f32[1 << 16];
+
 //
 // fundamental operations
 //
@@ -1050,7 +1053,7 @@ inline static void ggml_vec_gelu_quick_f32(const int n, float * y, const float *
     for (int i = 0; i < n; ++i) {
         ggml_fp16_t fp16 = GGML_CPU_FP32_TO_FP16(x[i]);
         memcpy(&t, &fp16, sizeof(uint16_t));
-        y[i] = GGML_CPU_FP16_TO_FP32(ggml_table_gelu_quick_f16[t]);
+        y[i] = ggml_table_gelu_quick_f32[t];
     }
 }
 #else
