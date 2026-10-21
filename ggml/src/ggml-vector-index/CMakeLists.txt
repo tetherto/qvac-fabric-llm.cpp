@@ -68,6 +68,7 @@ endif()
 # rotation kernels AVX-512 F (with AVX2). Each gets its own object, like the
 # AVX2 one, and runs only after a runtime CPU check.
 set(GGML_VECTOR_INDEX_SSE42_FLAG "")
+set(GGML_VECTOR_INDEX_SSSE3_FLAG "")
 set(GGML_VECTOR_INDEX_SSE42_ENABLED OFF)
 set(GGML_VECTOR_INDEX_AVX512_FLAG "")
 set(GGML_VECTOR_INDEX_SSE42_CHECK_SOURCE [=[
@@ -99,6 +100,9 @@ if (GGML_SYSTEM_ARCH STREQUAL "x86")
         check_cxx_compiler_flag("-msse4.2" GGML_VECTOR_INDEX_SUPPORTS_MSSE42)
         if (GGML_VECTOR_INDEX_SUPPORTS_MSSSE3 AND GGML_VECTOR_INDEX_SUPPORTS_MSSE42)
             set(GGML_VECTOR_INDEX_SSE42_FLAG "-mssse3;-msse4.2")
+            # The layout kernels run on SSSE3-only CPUs, so their object
+            # must not let the compiler use anything newer.
+            set(GGML_VECTOR_INDEX_SSSE3_FLAG "-mssse3")
             set(GGML_VECTOR_INDEX_SSE42_CANDIDATE ON)
         endif()
     elseif (MSVC)
@@ -228,11 +232,16 @@ if (GGML_VECTOR_INDEX_AVX2_FLAG OR GGML_VECTOR_INDEX_SSE42_ENABLED)
     list(APPEND GGML_VECTOR_INDEX_SOURCES ${GGML_VECTOR_INDEX_SOURCE_DIR}/ggml-vector-index-x86.h)
 endif()
 if (GGML_VECTOR_INDEX_SSE42_ENABLED)
-    list(APPEND GGML_VECTOR_INDEX_SOURCES ${GGML_VECTOR_INDEX_SOURCE_DIR}/ggml-vector-index-sse42.cpp)
+    list(APPEND GGML_VECTOR_INDEX_SOURCES
+        ${GGML_VECTOR_INDEX_SOURCE_DIR}/ggml-vector-index-sse42.cpp
+        ${GGML_VECTOR_INDEX_SOURCE_DIR}/ggml-vector-index-ssse3.cpp)
     if (GGML_VECTOR_INDEX_SSE42_FLAG)
         set_source_files_properties(
             ${GGML_VECTOR_INDEX_SOURCE_DIR}/ggml-vector-index-sse42.cpp
             PROPERTIES COMPILE_OPTIONS "${GGML_VECTOR_INDEX_SSE42_FLAG}")
+        set_source_files_properties(
+            ${GGML_VECTOR_INDEX_SOURCE_DIR}/ggml-vector-index-ssse3.cpp
+            PROPERTIES COMPILE_OPTIONS "${GGML_VECTOR_INDEX_SSSE3_FLAG}")
     endif()
 endif()
 if (GGML_VECTOR_INDEX_AVX512_FLAG)
