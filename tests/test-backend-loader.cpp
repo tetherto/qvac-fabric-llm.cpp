@@ -5,6 +5,7 @@
 //   - the best scoring module wins over a zero-score one
 //   - a module reachable through two directory entries is scored once
 //   - GGML_DISABLE_CUDA stops the cuda search entirely
+//   - a module logs through the logger set with ggml_log_set, also while it is scored
 //   - on Windows, a cuda module's runtime DLL resolves from CUDA_PATH or CUDA_PATH_V*
 
 #include "ggml-backend.h"
@@ -16,6 +17,7 @@
 #include <filesystem>
 #include <fstream>
 #include <string>
+#include <vector>
 
 namespace fs = std::filesystem;
 
@@ -55,6 +57,27 @@ static void check(bool ok, const char * what) {
     if (!ok) {
         failures++;
     }
+}
+
+struct log_line {
+    ggml_log_level level;
+    std::string    text;
+};
+
+static std::vector<log_line> log_lines;
+
+static void capture_log(ggml_log_level level, const char * text, void *) {
+    log_lines.push_back({ level, text });
+    fputs(text, stderr);
+}
+
+static bool logged(ggml_log_level level, const std::string & text) {
+    for (const auto & line : log_lines) {
+        if (line.level == level && line.text == text) {
+            return true;
+        }
+    }
+    return false;
 }
 
 static ggml_backend_reg_t find_reg(const char * name) {
@@ -104,6 +127,7 @@ int main() {
     }
     set_env("GGML_LOADER_TEST_LOG", log.string().c_str());
     set_env("GGML_DISABLE_CUDA", nullptr);
+    ggml_log_set(capture_log, nullptr);
 
     const fs::path zero = dir / (std::string(k_prefix) + "zero" + k_ext);
     const fs::path ok   = dir / (std::string(k_prefix) + "ok" + k_ext);
@@ -115,6 +139,7 @@ int main() {
     ggml_backend_load_all_from_path(dir.string().c_str());
     check(count_scores(log, "STUB_ZERO") == 1, "zero-score module is scored");
     check(find_reg("STUB_ZERO") == nullptr, "zero-score module is not registered");
+    check(logged(GGML_LOG_LEVEL_INFO, "STUB_ZERO: score\n"), "module log while scored reaches the logger");
 
     fs::remove(log, ec);
     fs::copy_file(STUB_OK_PATH, ok, ec);
@@ -127,6 +152,7 @@ int main() {
 
     ggml_backend_load_all_from_path(dir.string().c_str());
     check(count_regs("STUB_OK") == 1, "best module is registered once");
+    check(logged(GGML_LOG_LEVEL_DEBUG, "STUB_OK: init\n"), "module debug log reaches the logger");
     check(find_reg("STUB_ZERO") == nullptr, "zero-score module still not registered");
     if (have_link) {
         check(count_scores(log, "STUB_OK") == 1, "module behind two entries is scored once");
@@ -177,6 +203,7 @@ int main() {
     unload_all("STUB_DEP");
 #endif
 
+    ggml_log_set(nullptr, nullptr);
     fs::remove_all(dir, ec);
     printf("%s\n", failures == 0 ? "PASS" : "FAILED");
     return failures == 0 ? 0 : 1;
