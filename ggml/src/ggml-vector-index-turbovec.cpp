@@ -2039,7 +2039,8 @@ static void repack_turbovec_code_block(
         int dim,
         size_t block,
         std::vector<uint8_t> & blocked_codes,
-        TurboVecLayout layout) {
+        TurboVecLayout layout,
+        std::vector<uint8_t> & seq) {
     const size_t dim_sz = static_cast<size_t>(dim);
     const size_t codes_per_byte = static_cast<size_t>(8 / bits);
     const size_t n_byte_groups = dim_sz / codes_per_byte;
@@ -2048,8 +2049,8 @@ static void repack_turbovec_code_block(
     const size_t block_offset =
         block * n_byte_groups * static_cast<size_t>(kTurboVecScoreBlock);
     // Each lane's sequential row, converted once: rows past the last
-    // vector stay zero.
-    thread_local std::vector<uint8_t> seq;
+    // vector stay zero. `seq` is the caller's scratch, so pool threads
+    // keep no buffer between calls.
     seq.assign(static_cast<size_t>(kTurboVecScoreBlock) * n_byte_groups, 0);
     for (size_t lane = 0; lane < static_cast<size_t>(kTurboVecScoreBlock); ++lane) {
         const size_t vector = base_vector + lane;
@@ -2075,8 +2076,9 @@ static void repack_turbovec_code_blocks(
     parallel_for((n_repack + kTurboVecBlocksPerTask - 1) / kTurboVecBlocksPerTask, n_threads, [&](size_t task, size_t) {
         const size_t begin = first_block + task * kTurboVecBlocksPerTask;
         const size_t end = std::min(end_block, begin + kTurboVecBlocksPerTask);
+        std::vector<uint8_t> seq;
         for (size_t block = begin; block < end; ++block) {
-            repack_turbovec_code_block(packed_codes, n_vectors, bits, dim, block, blocked_codes, layout);
+            repack_turbovec_code_block(packed_codes, n_vectors, bits, dim, block, blocked_codes, layout, seq);
         }
     });
 }

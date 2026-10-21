@@ -249,7 +249,9 @@ int64_t low_dot(const LowPlanes & planes, const uint8_t * row) {
             for (int b = 0; b < kLowBits; ++b) {
                 const uint64_t p = group[static_cast<size_t>(b) * words_per_chunk + j];
                 const uint64_t n = group[static_cast<size_t>(kLowBits + b) * words_per_chunk + j];
-                acc += (static_cast<int64_t>(popcount64(l & p)) - static_cast<int64_t>(popcount64(l & n))) << b;
+                // A multiply, not a shift: the difference can be negative.
+                acc += (static_cast<int64_t>(popcount64(l & p)) - static_cast<int64_t>(popcount64(l & n))) *
+                    (int64_t{ 1 } << b);
             }
         }
     }
@@ -792,7 +794,8 @@ bool turbovec_staged_search(
         // Collects a range's rows in a buffer cut back to its best s_len
         // whenever it doubles; the s_len-th best kept is the cut-off.
         auto scan = [&](size_t block_begin, size_t block_end, std::vector<ScoreId> & top, size_t & above_seed) {
-            top.reserve(2 * s_len);
+            // A short range never needs the full 2 * s_len.
+            top.reserve(std::min(2 * s_len, (block_end - block_begin) * kBlock + 1));
             bool cut = false;
             double threshold = 0.0;
             auto cut_back = [&]() {
