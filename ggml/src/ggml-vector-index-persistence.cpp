@@ -1117,8 +1117,7 @@ uint64_t slot_state_hash(const ggml_vec_index & idx, size_t slot, const uint8_t 
         update_u32(float_to_u32(idx.turbovec_scale[slot]));
         uint8_t row[kTurboVecMaxDim / 2];
         if (turbovec_row == nullptr) {
-            turbovec_row_packed(idx, slot, row);
-            turbovec_row = row;
+            turbovec_row = turbovec_row_packed_ptr(idx, slot, row);
         }
         update_bytes(turbovec_row, row_bytes);
     } else if (is_q4(idx)) {

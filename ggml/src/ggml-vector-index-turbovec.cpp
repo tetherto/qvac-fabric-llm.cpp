@@ -1982,6 +1982,14 @@ void turbovec_row_seq(const ggml_vec_index & idx, size_t slot, uint8_t * seq) {
     }
 }
 
+const uint8_t * turbovec_row_packed_ptr(const ggml_vec_index & idx, size_t slot, uint8_t * scratch) {
+    if (!turbovec_rows_in_blocked(idx)) {
+        return idx.turbovec_data.data() + slot * turbovec_row_bytes(idx.turbovec_bits, static_cast<size_t>(idx.dim));
+    }
+    turbovec_row_packed(idx, slot, scratch);
+    return scratch;
+}
+
 void turbovec_row_packed(const ggml_vec_index & idx, size_t slot, uint8_t * packed) {
     const int bits = idx.turbovec_bits;
     if (!turbovec_rows_in_blocked(idx)) {
