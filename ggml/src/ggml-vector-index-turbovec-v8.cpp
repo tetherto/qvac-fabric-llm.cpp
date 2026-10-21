@@ -888,13 +888,16 @@ enum class CursorState { intact, foreign, replaced };
 
 // Is the file at `path` still the one this binding last committed (upstream
 // `cursor_state`)? `stale_used` reports a newer header left in the slot the
-// next commit targets, which must be wiped before data moves.
+// next commit targets, which must be wiped before data moves; `file_n_calib`
+// the calibration length the file's superblock declares.
 int cursor_state(
         const char * path,
         const TurboVecSyncBinding & b,
         CursorState & state,
-        size_t & stale_used) {
+        size_t & stale_used,
+        size_t & file_n_calib) {
     stale_used = 0;
+    file_n_calib = 0;
     std::vector<uint8_t> head;
     uint64_t file_size = 0;
     int rc = turbovec_read_file_range(path, 0, 24, head, file_size);
@@ -958,6 +961,7 @@ int cursor_state(
             state = CursorState::replaced;
             return GGML_VEC_INDEX_OK;
         }
+        file_n_calib = geo.n_calib;
     }
 
     // Read each slot's used prefix: a commit without redo ops fits in the
@@ -1169,9 +1173,17 @@ int turbovec_v8_sync(ggml_vec_index & idx, const char * path) {
     CursorState state = CursorState::replaced;
     size_t stale_used = 0;
     if (bound) {
-        const int rc = cursor_state(path, b, state, stale_used);
+        size_t file_n_calib = 0;
+        const int rc = cursor_state(path, b, state, stale_used, file_n_calib);
         if (rc != GGML_VEC_INDEX_OK) {
             return rc;
+        }
+        // Incremental writes use the index's superblock geometry. A file
+        // that declares another calibration length (a stored identity pair,
+        // which loading drops) would take them at the wrong offsets:
+        // rewrite it instead.
+        if (state == CursorState::intact && file_n_calib != idx.turbovec_tqplus_shift.size()) {
+            state = CursorState::replaced;
         }
     }
     // Another writer advanced or replaced the file: refuse rather than
@@ -1227,8 +1239,10 @@ int turbovec_sync_plan_for_test(
     }
     CursorState state = CursorState::replaced;
     size_t stale_used = 0;
-    const int rc = cursor_state(path, b, state, stale_used);
-    if (rc != GGML_VEC_INDEX_OK || state != CursorState::intact) {
+    size_t file_n_calib = 0;
+    const int rc = cursor_state(path, b, state, stale_used, file_n_calib);
+    if (rc != GGML_VEC_INDEX_OK || state != CursorState::intact ||
+        file_n_calib != idx->turbovec_tqplus_shift.size()) {
         return GGML_VEC_INDEX_E_INVALID_ARG;
     }
     uint64_t new_gen = 0;
