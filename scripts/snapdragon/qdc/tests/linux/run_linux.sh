@@ -233,6 +233,35 @@ run_backend_ops_snake_case() {
   fi
 }
 
+run_backend_ops_speech_case() {
+  local log="$LOG_DIR/backend_ops_speech.log"
+  local clean_log="$LOG_DIR/backend_ops_speech_plain.log"
+  local timeout_seconds=600
+  timeout "$timeout_seconds" env GGML_HEXAGON_NDEV=1 GGML_HEXAGON_HOSTBUF=0 ./bin/test-backend-ops \
+      -b HTP0 -p 'suite=speech_htp,' > "$log" 2>&1
+  local rc=$?
+  note_timeout_if_triggered "$rc" "$timeout_seconds" "$log"
+  sed $'s/\033\[[0-9;]*m//g' "$log" > "$clean_log"
+  if [ "$rc" -eq 0 ]; then
+    if ! grep -q 'Backend HTP0: OK' "$clean_log" ||
+       grep -Eq 'suite=speech_htp,.*: not supported' "$clean_log"; then
+      rc=1
+    fi
+    local op
+    for op in DEPTHWISE_CONV_1D COL2IM_1D CONV_2D_DW IM2COL MUL_MAT TIMESTEP_EMBEDDING GELU_ERF GET_ROWS CPY FLASH_ATTN_EXT; do
+      if ! grep -Eq "^[[:space:]]*$op\\(suite=speech_htp,.*\\): OK$" "$clean_log"; then
+        rc=1
+        echo "No $op speech case passed on HTP0" >> "$log"
+      fi
+    done
+  fi
+  if [ "$rc" -eq 0 ]; then
+    xml_case_pass "tests.test_backend_ops_posix" "test_backend_ops_speech_htp0"
+  else
+    xml_case_fail "tests.test_backend_ops_posix" "test_backend_ops_speech_htp0" "$rc" "$log"
+  fi
+}
+
 xml_open
 
 case "{TEST_MODE}" in
@@ -243,12 +272,14 @@ case "{TEST_MODE}" in
   backend-ops)
     for d in mxfp4 fp16 q4_0; do run_backend_ops_case "$d"; done
     run_backend_ops_snake_case
+    run_backend_ops_speech_case
     ;;
   all)
     for b in cpu gpu npu; do run_completion_case "$b"; done
     for b in cpu gpu npu; do run_bench_case "$b"; done
     for d in mxfp4 fp16 q4_0; do run_backend_ops_case "$d"; done
     run_backend_ops_snake_case
+    run_backend_ops_speech_case
     ;;
   *)
     echo "FATAL: unsupported TEST_MODE={TEST_MODE}"
