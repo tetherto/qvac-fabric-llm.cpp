@@ -863,6 +863,10 @@ void turbovec_materialize_packed_rows(ggml_vec_index & idx);
 void turbovec_settle_rows(ggml_vec_index & idx);
 void turbovec_row_seq(const ggml_vec_index & idx, size_t slot, uint8_t * seq);
 void turbovec_row_packed(const ggml_vec_index & idx, size_t slot, uint8_t * packed);
+// The slot's packed row without copying when the index keeps packed rows (a
+// legacy row can be wider than any 1.x row); a 1.x row is read back from the
+// blocked cache into `scratch`, which must hold kTurboVecMaxDim / 2 bytes.
+const uint8_t * turbovec_row_packed_ptr(const ggml_vec_index & idx, size_t slot, uint8_t * scratch);
 void turbovec_rows_packed(const ggml_vec_index & idx, std::vector<uint8_t> & packed);
 // The packed rows of one 32-row block (fewer for the tail block).
 void turbovec_block_rows_packed(const ggml_vec_index & idx, size_t block, uint8_t * packed);

@@ -3187,13 +3187,14 @@ void refresh_turbovec_tvim_checksums(std::vector<uint8_t> & bytes, const TurboVe
             0xffffffffu);
 }
 
-void check_turbovec_oversized_snapshot_compatibility(int bits) {
+// v3 snapshots load at dimensions past what legacy indexes add or search;
+// at 40000 a packed row is wider than any TurboVec 1.x row.
+void check_turbovec_oversized_snapshot_compatibility(int bits, int old_dim = 1032) {
     constexpr int current_dim = 16;
-    constexpr int old_dim = 1032;
     constexpr int count = 2;
     CHECK(bits == 2 || bits == 4);
 
-    const std::string suffix = std::to_string(bits);
+    const std::string suffix = std::to_string(bits) + "-" + std::to_string(old_dim);
     const std::string path =
         (std::filesystem::temp_directory_path() /
          ("ggml-vector-index-turbovec-old-dim-q" + suffix + ".tvim")).string();
@@ -7001,6 +7002,7 @@ int main(int argc, char ** argv) {
 
     for (const int bit_width : { 2, 4 }) {
         check_turbovec_oversized_snapshot_compatibility(bit_width);
+        check_turbovec_oversized_snapshot_compatibility(bit_width, 40000);
         check_turbovec_v3_corruption_rejected(bit_width);
         check_turbovec_tiny_tqplus_scale_rejected(bit_width);
         check_turbovec_zero_scale_and_legacy_calibration(bit_width);
