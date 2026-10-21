@@ -370,11 +370,10 @@ void decode_slot_to_f32(const ggml_vec_index_t & idx, size_t slot, float * dst) 
     const int dim = idx.dim;
     if (is_turbovec(idx)) {
         uint8_t row[kTurboVecMaxDim / 2];
-        turbovec_row_packed(idx, slot, row);
         decode_turbovec_row_calibrated(
             idx.turbovec_bits,
             idx.turbovec_legacy,
-            row,
+            turbovec_row_packed_ptr(idx, slot, row),
             idx.turbovec_scale.data() + slot,
             idx.turbovec_tqplus_shift.empty() ? nullptr : idx.turbovec_tqplus_shift.data(),
             idx.turbovec_tqplus_scale.empty() ? nullptr : idx.turbovec_tqplus_scale.data(),
