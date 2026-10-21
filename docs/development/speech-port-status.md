@@ -121,6 +121,6 @@ layouts, strides over 64 KiB, fused depthwise convolution with weight buffers,
 F16/BF16 conversion, mixed F32/F16 attention, and partial matmul output tiles.
 New direct-access kernels stage extended-address inputs through DMA on v81.
 The Android and Linux QDC runners require every selected case to execute and
-pass. A missing QDC API key fails the device lane instead of producing a green
-job with skipped execution. Completion requires actual runs on QCS9075M,
+pass when credentials are available. Without a QDC API key, the workflow skips
+device execution. Completion requires actual runs on QCS9075M,
 SM8750, and SM8850; builds and CPU references do not establish HTP correctness.
