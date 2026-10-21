@@ -5,6 +5,14 @@
 #include <array>
 #include <cfenv>
 
+#if GGML_VEC_INDEX_USE_NEON
+#include <arm_neon.h>
+#endif
+
+#if defined(GGML_VEC_INDEX_HAVE_AVX2_KERNEL)
+#include "ggml-vector-index-x86.h"
+#endif
+
 class DeltaReplayNearestRounding {
 public:
     DeltaReplayNearestRounding() : saved_rounding(std::fegetround()) {
@@ -357,14 +365,123 @@ static bool turbovec_tqplus_shift_is_valid(float shift, size_t dim) {
     return std::fabs(static_cast<double>(shift)) <= max_abs_shift;
 }
 
-bool all_finite_abs_less_than(const float * values, size_t n, float max_abs) {
+static size_t first_invalid_abs_scalar(const float * values, size_t n, float max_abs) {
     for (size_t i = 0; i < n; ++i) {
         if (!std::isfinite(values[i]) || std::fabs(values[i]) >= max_abs) {
-            return false;
+            return i;
         }
     }
-    return true;
+    return n;
 }
+
+#if GGML_VEC_INDEX_USE_NEON
+// Upstream encode.rs aarch64 `first_invalid_in_chunk`: an all-clean fast
+// path testing |x| < |max_abs| four lanes per vcalt (NaN, Inf and
+// over-magnitude values fail), with the exact scalar predicate pinpointing
+// the first invalid element of a flagged quad.
+static size_t first_invalid_abs_neon(const float * values, size_t n, float max_abs) {
+    const float32x4_t bound = vdupq_n_f32(max_abs);
+    size_t i = 0;
+    for (; i + 4 <= n; i += 4) {
+        const uint32x4_t ok = vcaltq_f32(vld1q_f32(values + i), bound);
+        if (vminvq_u32(ok) == 0) {
+            const size_t at = first_invalid_abs_scalar(values + i, 4, max_abs);
+            if (at != 4) {
+                return i + at;
+            }
+        }
+    }
+    return i + first_invalid_abs_scalar(values + i, n - i, max_abs);
+}
+#endif
+
+static size_t first_invalid_abs(const float * values, size_t n, float max_abs) {
+#if GGML_VEC_INDEX_USE_NEON
+    return first_invalid_abs_neon(values, n, max_abs);
+#else
+#if defined(GGML_VEC_INDEX_HAVE_AVX2_KERNEL)
+    if (vec_index_cpu_features().avx2) {
+        return ggml_vec_index_detail::first_invalid_abs_avx2(values, n, max_abs);
+    }
+#endif
+    return first_invalid_abs_scalar(values, n, max_abs);
+#endif
+}
+
+bool all_finite_abs_less_than(const float * values, size_t n, float max_abs) {
+    return first_invalid_abs(values, n, max_abs) == n;
+}
+
+#ifdef GGML_VEC_INDEX_TEST_HOOKS
+// 1 when the input validation scan (0: NEON, 1: AVX2) reports the scalar
+// scan's first invalid index on clean and poisoned inputs, 0 on a mismatch,
+// -1 when this build or CPU lacks the kernel.
+int vector_validation_kernel_parity_for_test(int kernel) {
+    std::function<size_t(const float *, size_t, float)> simd;
+#if GGML_VEC_INDEX_USE_NEON
+    if (kernel == 0) {
+        simd = first_invalid_abs_neon;
+    }
+#endif
+#if defined(GGML_VEC_INDEX_HAVE_AVX2_KERNEL)
+    if (kernel == 1 && vec_index_cpu_features().avx2) {
+        simd = ggml_vec_index_detail::first_invalid_abs_avx2;
+    }
+#endif
+    if (!simd) {
+        return -1;
+    }
+    const float bound = kTurboVecMaxInputMagnitude;
+    const float poisons[] = {
+        std::numeric_limits<float>::quiet_NaN(),
+        -std::numeric_limits<float>::quiet_NaN(),
+        std::numeric_limits<float>::infinity(),
+        -std::numeric_limits<float>::infinity(),
+        bound,
+        -bound,
+        std::nextafter(bound, 0.0f),
+        std::numeric_limits<float>::max(),
+        std::numeric_limits<float>::denorm_min(),
+        -0.0f,
+    };
+    std::vector<float> values(67);
+    for (size_t n = 0; n <= values.size(); ++n) {
+        for (size_t i = 0; i < n; ++i) {
+            values[i] = static_cast<float>((static_cast<int>(i * 37 % 101) - 50)) * 0.125f;
+        }
+        if (simd(values.data(), n, bound) != first_invalid_abs_scalar(values.data(), n, bound)) {
+            return 0;
+        }
+        for (float poison : poisons) {
+            for (size_t at = 0; at < n; ++at) {
+                const float saved = values[at];
+                values[at] = poison;
+                if (simd(values.data(), n, bound) != first_invalid_abs_scalar(values.data(), n, bound)) {
+                    return 0;
+                }
+                // A second, later poison must not move the reported index.
+                if (at + 5 < n) {
+                    values[at + 5] = std::numeric_limits<float>::infinity();
+                    const bool same =
+                        simd(values.data(), n, bound) == first_invalid_abs_scalar(values.data(), n, bound);
+                    values[at + 5] = static_cast<float>((static_cast<int>((at + 5) * 37 % 101) - 50)) * 0.125f;
+                    if (!same) {
+                        return 0;
+                    }
+                }
+                values[at] = saved;
+            }
+        }
+        // A NaN or infinite bound must give the scalar predicate's answers.
+        for (float odd_bound : { std::numeric_limits<float>::quiet_NaN(), std::numeric_limits<float>::infinity() }) {
+            if (simd(values.data(), n, odd_bound) != first_invalid_abs_scalar(values.data(), n, odd_bound)) {
+                return 0;
+            }
+        }
+    }
+    return 1;
+}
+#endif
 
 bool checked_mul_u64(uint64_t a, uint64_t b, uint64_t & out) {
     if (a != 0 && b > std::numeric_limits<uint64_t>::max() / a) {
