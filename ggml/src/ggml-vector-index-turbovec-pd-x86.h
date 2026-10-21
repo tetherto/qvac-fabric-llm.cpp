@@ -44,7 +44,8 @@ void permute_dot_sums_x86(
         _mm512_broadcast_i32x4(_mm_loadu_si128(reinterpret_cast<const __m128i *>(levels16))),
         _mm512_set1_epi8(static_cast<char>(0x80)));
 
-    __m512i acc[BLK][NQ][2];
+    // Zeroed in full, as upstream does: only the first nb are seeded.
+    __m512i acc[BLK][NQ][2] = {};
     for (size_t sub = 0; sub < nb; ++sub) {
         for (int q = 0; q < NQ; ++q) {
             const __m512i z = _mm512_set1_epi32(zeros[q]);
