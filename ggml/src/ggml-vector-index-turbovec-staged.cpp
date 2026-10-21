@@ -11,6 +11,8 @@
 
 #include "ggml-vector-index-impl.h"
 
+#include <bitset>
+
 #if GGML_VEC_INDEX_USE_NEON
 #include <arm_neon.h>
 #endif
@@ -32,6 +34,15 @@ constexpr float kSignLutCapSingle = 31.0f;
 
 std::atomic<int> g_planes_override{ -1 };
 std::atomic<size_t> g_planes_min_vectors{ kTurboVecPlanesMinVectors };
+
+// Set bits of a word; MSVC has no __builtin_popcount.
+inline int popcount64(uint64_t x) {
+#if defined(__GNUC__) || defined(__clang__)
+    return __builtin_popcountll(x);
+#else
+    return static_cast<int>(std::bitset<64>(x).count());
+#endif
+}
 
 // Shortlist, middle and rescore lengths for a top-k request (upstream
 // planes_shortlist_len, planes_mid_len, planes_rescore_len).
@@ -177,8 +188,7 @@ int64_t low_dot(const LowPlanes & planes, const uint8_t * row) {
             for (int b = 0; b < kLowBits; ++b) {
                 const uint64_t p = group[static_cast<size_t>(b) * words_per_chunk + j];
                 const uint64_t n = group[static_cast<size_t>(kLowBits + b) * words_per_chunk + j];
-                acc += (static_cast<int64_t>(__builtin_popcountll(l & p)) -
-                        static_cast<int64_t>(__builtin_popcountll(l & n))) << b;
+                acc += (static_cast<int64_t>(popcount64(l & p)) - static_cast<int64_t>(popcount64(l & n))) << b;
             }
         }
     }
@@ -271,7 +281,7 @@ TurboVecPlanesStats compute_stats(const ggml_vec_index & idx) {
         for (size_t v = 0; v < n; ++v) {
             const uint8_t * row = idx.turbovec_data.data() + v * row_bytes;
             for (size_t g = 0; g < nsg; ++g) {
-                outer += static_cast<uint64_t>(__builtin_popcount(static_cast<uint8_t>(~(row[nsg + g] ^ row[g]))));
+                outer += static_cast<uint64_t>(popcount64(static_cast<uint8_t>(~(row[nsg + g] ^ row[g]))));
                 total += 8;
             }
         }
