@@ -7,6 +7,7 @@ On Linux: runs test-backend-ops directly via run_linux.sh (BASH framework).
 """
 
 import os
+import re
 import sys
 
 import pytest
@@ -38,6 +39,16 @@ def test_backend_ops_htp0(type_a):
     assert result.returncode == 0, (
         f"test-backend-ops type_a={type_a} failed (exit {result.returncode})"
     )
+
+
+def test_backend_ops_snake_htp0():
+    result = run_snapdragon(["test-backend-ops", "-b", "HTP0", "-o", "SNAKE"])
+    output = re.sub(r"\x1b\[[0-9;]*m", "", result.stdout or "")
+    write_qdc_log("backend_ops_snake.log", result.stdout or "")
+    assert result.returncode == 0, f"SNAKE failed (exit {result.returncode})"
+    assert re.search(r"Backend HTP0: OK", output), "HTP0 did not complete successfully"
+    assert re.search(r"^\s*SNAKE\(.*\): OK$", output, re.MULTILINE), "No SNAKE case passed on HTP0"
+    assert not re.search(r"^\s*SNAKE\(.*\): not supported", output, re.MULTILINE), "SNAKE cases were skipped"
 
 
 if __name__ == "__main__":

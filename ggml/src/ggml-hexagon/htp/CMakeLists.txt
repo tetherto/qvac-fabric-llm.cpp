@@ -48,6 +48,7 @@ add_library(${HTP_LIB} SHARED
     roll-ops.c
     pool-ops.c
     upscale-ops.c
+    snake-ops.c
     allreduce-ops.c
 )
 

@@ -61,6 +61,7 @@ htp_op_code htp_op_remap(const struct ggml_tensor * t) {
         case GGML_OP_CONV_2D_DW:      return HTP_OP_CONV_2D_DW;
         case GGML_OP_ROLL:            return HTP_OP_ROLL;
         case GGML_OP_UPSCALE:         return HTP_OP_UPSCALE;
+        case GGML_OP_SNAKE:           return HTP_OP_SNAKE;
 
         case GGML_OP_UNARY:
             switch (ggml_get_unary_op(t)) {
@@ -3366,6 +3367,48 @@ static bool htp_kparams_solve_roll(
     return true;
 }
 
+static bool htp_snake_tensor_fits(const struct ggml_tensor * t) {
+    uint64_t span = ggml_type_size(t->type);
+    for (int i = 0; i < GGML_MAX_DIMS; ++i) {
+        if (t->ne[i] <= 0 || t->ne[i] > INT32_MAX || t->nb[i] > INT32_MAX) {
+            return false;
+        }
+        const uint64_t extent = i == 0 ? t->ne[i] / ggml_blck_size(t->type) : t->ne[i];
+        if (extent == 0) {
+            return false;
+        }
+        span += (extent - 1) * t->nb[i];
+        if (span > INT32_MAX) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool htp_kparams_solve_snake(
+    const struct ggml_hexagon_session * sess,
+    const struct ggml_tensor * op,
+    struct htp_snake_kernel_params * kparams
+) {
+    memset(kparams, 0, sizeof(*kparams));
+
+    const struct ggml_tensor * x        = op->src[0];
+    const struct ggml_tensor * alpha    = op->src[1];
+    const struct ggml_tensor * inv_beta = op->src[2];
+    if (htp_session_mdev_count(sess) > 1 || x->type != GGML_TYPE_F32 || op->type != GGML_TYPE_F32 ||
+        alpha->type != GGML_TYPE_F32 || inv_beta->type != GGML_TYPE_F32) {
+        return false;
+    }
+    if (!(ggml_is_contiguous(x) && ggml_is_contiguous(op) && x->ne[2] == 1 && x->ne[3] == 1 &&
+          ggml_is_contiguous(alpha) && ggml_is_contiguous(inv_beta) && ggml_nelements(alpha) == x->ne[1] &&
+          ggml_nelements(inv_beta) == x->ne[1] && htp_snake_tensor_fits(x) && htp_snake_tensor_fits(op))) {
+        return false;
+    }
+
+    kparams->n_threads = (std::min)(htp_session_n_threads(sess), (uint32_t) x->ne[1]);
+    return true;
+}
+
 static bool htp_kparams_solve_diag(
     const struct ggml_hexagon_session * sess,
     const struct ggml_tensor * op,
@@ -4258,6 +4301,9 @@ bool htp_kparams_solve(
 
         case HTP_OP_SOLVE_TRI:
             return htp_kparams_invoke<htp_kparams_solve_solve_tri>(sess, op, kparams);
+
+        case HTP_OP_SNAKE:
+            return htp_kparams_invoke<htp_kparams_solve_snake>(sess, op, kparams);
 
         default:
             if (htp_op_is_unary(opcode)) {
