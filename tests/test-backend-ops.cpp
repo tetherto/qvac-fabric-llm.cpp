@@ -13408,8 +13408,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
-    // Exercise the QUICK GELU transition range and vector tails.
-    for (ggml_unary_op op : {GGML_UNARY_OP_GELU_QUICK}) {
+    // The transition range distinguishes GELU from GELU_QUICK; large inputs hide the difference.
+    for (ggml_unary_op op : {GGML_UNARY_OP_GELU, GGML_UNARY_OP_GELU_QUICK}) {
         test_cases.emplace_back(new test_unary(op, GGML_TYPE_F32, {512, 3, 1, 1}, 0, 5.0f));
         test_cases.emplace_back(new test_unary(op, GGML_TYPE_F32, {513, 3, 1, 1}, 0, 5.0f));
         test_cases.emplace_back(new test_unary(op, GGML_TYPE_F32, {513, 3, 2, 1}, 1, 5.0f));
