@@ -611,6 +611,9 @@ int turbovec_sync_plan_for_test(
     std::vector<std::vector<std::pair<uint64_t, std::vector<uint8_t>>>> & batches);
 void turbovec_force_vector_major_for_test(int mode);
 void turbovec_disable_dot_product_for_test(int disabled);
+// -1 follows the build, 0 or 1 forces upstream's aarch64 or x86 rules for
+// indexes created afterwards (turbovec_x86_rules).
+void turbovec_force_x86_rules_for_test(int mode);
 // -1 follows the host, 0 or 1 forces the `vm8` choice for indexes created
 // afterwards (still only on top of the vector-major layout).
 void turbovec_force_vm8_for_test(int mode);
@@ -648,9 +651,26 @@ struct VecIndexCpuFeatures {
     bool avx2 = false;
     // AVX-512 F, only together with AVX2.
     bool avx512f = false;
+    // AVX-512 extensions, each only together with AVX-512 F. GFNI counts
+    // only there too: the search kernels use its 512-bit form.
+    bool avx512bw = false;
+    bool avx512vbmi = false;
+    bool avx512vnni = false;
+    bool avx512vpopcntdq = false;
+    bool gfni = false;
     bool arm_crc32 = false;
 };
 const VecIndexCpuFeatures & vec_index_cpu_features();
+// Upstream `have_gfni`: the GFNI form of the x86 permute-dot kernel, unless
+// TURBOVEC_NO_GFNI is set. Both forms sum the same integers.
+bool turbovec_cpu_gfni();
+// Whether new indexes follow upstream's x86 rules rather than its aarch64
+// ones: on a vector-major host the 2- and 3-bit layouts are vector-major
+// too (scored by the `vpermb` scan), the staged search's sign region is
+// vector-major and scanned the same way, and its ranking counts bit masks.
+// True on x86 builds; a test may force it anywhere, so the scalar models
+// of those kernels run on any host.
+bool turbovec_x86_rules();
 
 // The CPU's int8 matrix multiply (aarch64 i8mm): gates the SMMLA
 // instructions themselves.
