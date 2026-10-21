@@ -115,6 +115,25 @@ static std::string path_str(const fs::path & path) {
     }
 }
 
+// Send a log line of a backend module to the logger set in this ggml-base.
+static void ggml_backend_dl_log_forward(enum ggml_log_level level, const char * text, void * user_data) {
+    GGML_UNUSED(user_data);
+    ggml_log_callback callback;
+    void *            callback_user_data;
+    ggml_log_get(&callback, &callback_user_data);
+    callback(level, text, callback_user_data);
+}
+
+// A backend module that links ggml-base statically has its own logger, which prints all levels to stderr.
+// Connect it to this logger before the module runs code. Skip a module that shares this ggml-base, else the logger calls itself.
+static void ggml_backend_dl_forward_log(dl_handle * handle) {
+    using log_set_t = void (*)(ggml_log_callback, void *);
+    auto log_set    = (log_set_t) dl_get_sym(handle, "ggml_log_set");
+    if (log_set != nullptr && log_set != &ggml_log_set) {
+        log_set(ggml_backend_dl_log_forward, nullptr);
+    }
+}
+
 struct ggml_backend_reg_entry {
     ggml_backend_reg_t reg;
     dl_handle_ptr handle;
@@ -246,6 +265,7 @@ struct ggml_backend_registry {
             }
             return nullptr;
         }
+        ggml_backend_dl_forward_log(handle.get());
 
         auto score_fn = (ggml_backend_score_t) dl_get_sym(handle.get(), "ggml_backend_score");
         if (score_fn && score_fn() == 0) {
@@ -648,6 +668,7 @@ static ggml_backend_reg_t ggml_backend_load_best(const char * name, bool silent,
             load_failures.emplace_back(entryPath, error);
         }
         if (handle) {
+            ggml_backend_dl_forward_log(handle.get());
             // a module that failed to load must not hide a working one the platform loader finds
             found_candidate = found_candidate || !name_only;
             auto score_fn = (ggml_backend_score_t) dl_get_sym(handle.get(), "ggml_backend_score");
