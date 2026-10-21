@@ -1096,6 +1096,9 @@ struct vk_device_struct {
     vk_pipeline pipeline_lightning_indexer_f32[GGML_TYPE_COUNT];
     // [size_idx][kda] where size_idx: 0=d16, 1=d32, 2=d64, 3=d128
     vk_pipeline pipeline_gated_delta_net[4][2];
+    // [size_idx][kda], as pipeline_gated_delta_net
+    vk_pipeline pipeline_gated_delta_net_deferred[4][2];
+    vk_pipeline pipeline_gdn_conv_deferred_f32;
     // [size_idx][kda] where size_idx: 0=d32, 1=d64, 2=d128 (no d16 backward; falls back to CPU)
     vk_pipeline pipeline_gated_delta_net_back[3][2];
     vk_pipeline pipeline_ssm_scan_f32_d128;

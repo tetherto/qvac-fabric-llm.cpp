@@ -73,6 +73,7 @@
 #include "ggml-cuda/gla.cuh"
 #include "ggml-cuda/gated_delta_net.cuh"
 #include "ggml-cuda/gated_delta_net_back.cuh"
+#include "ggml-cuda/gated_delta_net_deferred.cuh"
 #include "ggml-cuda/dsv4-hc.cuh"
 #include "ggml-cuda/set.cuh"
 #include "ggml-cuda/set-rows.cuh"
@@ -3145,6 +3146,12 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context &          ctx,
         case GGML_OP_GATED_DELTA_NET_BACK:
             ggml_cuda_op_gated_delta_net_back(ctx, dst);
             break;
+        case GGML_OP_GATED_DELTA_NET_DEFERRED:
+            ggml_cuda_op_gated_delta_net_deferred(ctx, dst, nullptr);
+            break;
+        case GGML_OP_GDN_CONV_DEFERRED:
+            ggml_cuda_op_gdn_conv_deferred(ctx, dst);
+            break;
         case GGML_OP_DSV4_HC_COMB:
             ggml_cuda_op_dsv4_hc_comb(ctx, dst);
             break;
@@ -3693,6 +3700,58 @@ static int ggml_cuda_try_gdn_cache_fusion(
 
     fused_state_cpy.data        = (float *) dst->data; // rollback group 0 (newest)
     fused_state_cpy.slot_stride = K > 1 ? (int64_t) (dst->nb[2] / sizeof(float)) : 0;
+    return skip;
+}
+
+// match gated_delta_net_deferred + the cpy that stores its new base state into the cache, so the kernel writes it there
+// and the cpy is skipped
+static int ggml_cuda_try_gdn_deferred_cache_fusion(const ggml_cgraph * cgraph, int node_idx, float ** base_out) {
+    const ggml_tensor * gdn = cgraph->nodes[node_idx];
+    if (gdn->op != GGML_OP_GATED_DELTA_NET_DEFERRED || gdn->type != GGML_TYPE_F32 || (gdn->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+        return 0;
+    }
+
+    const ggml_tensor * src_v    = gdn->src[2];
+    const int64_t       S_v      = src_v->ne[0];
+    const int64_t       H        = src_v->ne[1];
+    const int64_t       n_tokens = src_v->ne[2];
+    const int64_t       n_seqs   = src_v->ne[3];
+    const int64_t       D        = S_v * S_v * H;
+
+    const size_t tail_off = ggml_row_size(GGML_TYPE_F32, S_v * H * n_tokens * n_seqs);
+
+    const ggml_tensor * cpy  = nullptr;
+    int                 skip = 0;
+    for (int j = node_idx + 1; j < cgraph->n_nodes && cpy == nullptr; ++j) {
+        const ggml_tensor * n = cgraph->nodes[j];
+        if (ggml_cuda_is_view_or_noop(n)) {
+            continue;
+        }
+        if (n->op != GGML_OP_CPY || (n->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+            return 0;
+        }
+        cpy  = n;
+        skip = j - node_idx;
+    }
+    if (cpy == nullptr) {
+        return 0;
+    }
+
+    const ggml_tensor * src = cpy->src[0]; // view of the new base
+    const ggml_tensor * dst = cpy->src[1]; // cache view
+
+    if (src->op != GGML_OP_VIEW || src->view_src != gdn || src->view_offs != tail_off || !ggml_is_contiguous(src)) {
+        return 0;
+    }
+
+    const std::array<int64_t, GGML_MAX_DIMS> expected_ne = { D, n_seqs, 1, 1 };
+    if (dst->op != GGML_OP_VIEW || dst->type != GGML_TYPE_F32 || dst->data == nullptr ||
+        !std::equal(expected_ne.begin(), expected_ne.end(), dst->ne) ||
+        dst->nb[0] != ggml_type_size(GGML_TYPE_F32) || dst->nb[1] != (size_t) ggml_row_size(GGML_TYPE_F32, D)) {
+        return 0;
+    }
+
+    *base_out = (float *) dst->data;
     return skip;
 }
 
@@ -4452,6 +4511,16 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context *         cuda_ctx,
                     *cuda_ctx, match.experts, match.expert_scale, match.weights, match.dst);
                 return match.node_count - 1;
             }
+        }
+    }
+
+    // gated_delta_net_deferred -> cpy: store the new base state into the cache
+    if (node->op == GGML_OP_GATED_DELTA_NET_DEFERRED) {
+        float * base_out = nullptr;
+        const int nodes_to_skip = ggml_cuda_try_gdn_deferred_cache_fusion(cgraph, i, &base_out);
+        if (nodes_to_skip > 0) {
+            ggml_cuda_op_gated_delta_net_deferred(*cuda_ctx, node, base_out);
+            return nodes_to_skip;
         }
     }
 
@@ -7187,6 +7256,16 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             return true;
         case GGML_OP_GATED_DELTA_NET:
             return true;
+        case GGML_OP_GATED_DELTA_NET_DEFERRED: {
+                const int64_t S_v = op->src[2]->ne[0];
+                return (S_v == 16 || S_v == 32 || S_v == 64 || S_v == 128) && op->src[0]->nb[0] == sizeof(float) &&
+                    op->src[1]->nb[0] == sizeof(float) && op->src[5]->nb[0] == sizeof(float);
+            }
+        case GGML_OP_GDN_CONV_DEFERRED: {
+                const int64_t head_dim = ggml_get_op_params_i32(op, 2);
+                return op->src[1]->ne[0] == 4 && op->src[0]->nb[0] == sizeof(float) &&
+                    head_dim % WARP_SIZE == 0 && head_dim <= 1024 && op->src[0]->ne[0] % head_dim == 0;
+            }
         case GGML_OP_GATED_DELTA_NET_BACK: {
                 //TODO: shares the forward op's MUSA compiler issue, see GGML_OP_GATED_DELTA_NET above
 #ifdef GGML_USE_MUSA
