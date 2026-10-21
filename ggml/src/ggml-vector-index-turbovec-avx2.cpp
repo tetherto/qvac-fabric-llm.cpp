@@ -1,5 +1,6 @@
-// ggml-vector-index-turbovec-avx2.cpp - AVX2 TurboVec rotation and encode
-// kernels, ported from upstream turbovec 1.1.2 (rotation.rs, encode.rs). Built with AVX2 + FMA enabled and called only after a
+// ggml-vector-index-turbovec-avx2.cpp - AVX2 TurboVec rotation, encode and
+// layout kernels, ported from upstream turbovec 1.1.2 (rotation.rs,
+// encode.rs, pack.rs). Built with AVX2 + FMA enabled and called only after a
 // runtime check; every kernel performs the scalar reference's IEEE
 // operations in the same order (no fused multiply-add), so its output is
 // bit-identical.
@@ -300,6 +301,46 @@ size_t first_invalid_abs_avx2(const float * values, size_t n, float max_abs) {
         }
     }
     return n;
+}
+
+// Upstream pack.rs `interleave_chunk_avx2`: the SSSE3 perm0 nibble
+// interleave on two 32-byte groups per iteration. `len` is a multiple of 32;
+// both groups are loaded before either is stored, so it runs in place.
+void turbovec_interleave_avx2(uint8_t * buf, size_t len) {
+    static const uint8_t kPerm0[16] = { 0, 8, 1, 9, 2, 10, 3, 11, 4, 12, 5, 13, 6, 14, 7, 15 };
+    const __m256i permv = _mm256_broadcastsi128_si256(_mm_loadu_si128(reinterpret_cast<const __m128i *>(kPerm0)));
+    const __m256i lo_mask = _mm256_set1_epi8(0x0f);
+    const __m256i hi_mask = _mm256_set1_epi8(static_cast<char>(0xf0));
+    constexpr size_t block = 32;
+    const size_t n = len / block;
+    const size_t pairs = n / 2;
+    for (size_t i = 0; i < pairs; ++i) {
+        uint8_t * p = buf + i * 2 * block;
+        const __m256i v0 = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(p));
+        const __m256i v1 = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(p + block));
+        // [b0.lo | b1.lo] and [b0.hi | b1.hi].
+        const __m256i a = _mm256_shuffle_epi8(_mm256_permute2x128_si256(v0, v1, 0x20), permv);
+        const __m256i b = _mm256_shuffle_epi8(_mm256_permute2x128_si256(v0, v1, 0x31), permv);
+        const __m256i a_hi = _mm256_and_si256(_mm256_srli_epi16(a, 4), lo_mask);
+        const __m256i out_hi = _mm256_or_si256(a_hi, _mm256_and_si256(b, hi_mask));
+        const __m256i b_lo4 = _mm256_and_si256(b, lo_mask);
+        const __m256i out_lo = _mm256_or_si256(_mm256_and_si256(a, lo_mask), _mm256_slli_epi16(b_lo4, 4));
+        _mm256_storeu_si256(reinterpret_cast<__m256i *>(p), _mm256_permute2x128_si256(out_hi, out_lo, 0x20));
+        _mm256_storeu_si256(reinterpret_cast<__m256i *>(p + block), _mm256_permute2x128_si256(out_hi, out_lo, 0x31));
+    }
+    if (n % 2 == 1) {
+        // AVX2 implies SSSE3; the final odd group takes the 16-byte kernel.
+        uint8_t * p = buf + pairs * 2 * block;
+        const __m128i perm128 = _mm_loadu_si128(reinterpret_cast<const __m128i *>(kPerm0));
+        const __m128i lo128 = _mm_set1_epi8(0x0f);
+        const __m128i hi128 = _mm_set1_epi8(static_cast<char>(0xf0));
+        const __m128i a = _mm_shuffle_epi8(_mm_loadu_si128(reinterpret_cast<const __m128i *>(p)), perm128);
+        const __m128i b = _mm_shuffle_epi8(_mm_loadu_si128(reinterpret_cast<const __m128i *>(p + 16)), perm128);
+        const __m128i out_hi = _mm_or_si128(_mm_and_si128(_mm_srli_epi16(a, 4), lo128), _mm_and_si128(b, hi128));
+        const __m128i out_lo = _mm_or_si128(_mm_and_si128(a, lo128), _mm_slli_epi16(_mm_and_si128(b, lo128), 4));
+        _mm_storeu_si128(reinterpret_cast<__m128i *>(p), out_hi);
+        _mm_storeu_si128(reinterpret_cast<__m128i *>(p + 16), out_lo);
+    }
 }
 
 } // namespace ggml_vec_index_detail

@@ -299,6 +299,13 @@ public:
         const size_t nsg = geo.dim / 8;
         const size_t low_row = static_cast<size_t>(geo.bits - 1) * nsg;
         std::memset(out, 0, geo.unit_len());
+        // A full sequential unit is the blocked cache's block converted as a
+        // whole: its rows are the block's own slots, in order.
+        const bool whole_block = geo.layout != kLayoutPlanes && turbovec_rows_in_blocked(idx) &&
+            (block + 1) * kBlock <= n();
+        if (whole_block) {
+            turbovec_block_seq(idx, block, out);
+        }
         for (size_t lane = 0; lane < kBlock; ++lane) {
             const size_t r = block * kBlock + lane;
             if (r >= n()) {
@@ -313,7 +320,7 @@ public:
                     out[g * kBlock + lane] = packed[low_row + g];
                 }
                 std::memcpy(out + nsg * kBlock + lane * low_row, packed, low_row);
-            } else {
+            } else if (!whole_block) {
                 const uint8_t * codes = seq_row(slot);
                 for (size_t g = 0; g < row_bytes; ++g) {
                     out[g * kBlock + lane] = codes[g];
@@ -793,8 +800,14 @@ ggml_vec_index_t * turbovec_v8_load_image(std::vector<uint8_t> raw, int & error,
 
     const size_t n_blocks = n / kBlock;
     std::vector<uint8_t> codes(row_bytes);
+    // Sequential units already hold whole blocks in the sequential-blocked
+    // layout: they go into the blocked cache a block at a time.
+    const bool whole_blocks = geo.layout != kLayoutPlanes && !keep_packed;
     for (size_t block = 0; block < n_blocks; ++block) {
         const uint8_t * unit = raw.data() + geo.unit_at(block);
+        if (whole_blocks) {
+            turbovec_blocked_set_block_seq(*idx, block, unit);
+        }
         for (size_t lane = 0; lane < kBlock; ++lane) {
             const size_t slot = block * kBlock + lane;
             if (geo.layout == kLayoutPlanes) {
@@ -809,7 +822,7 @@ ggml_vec_index_t * turbovec_v8_load_image(std::vector<uint8_t> raw, int & error,
                     turbovec_packed_row_to_seq(packed, geo.bits, dim, seq_row.data());
                     turbovec_blocked_set_row_seq(*idx, slot, seq_row.data());
                 }
-            } else {
+            } else if (!whole_blocks) {
                 for (size_t g = 0; g < row_bytes; ++g) {
                     codes[g] = unit[g * kBlock + lane];
                 }
