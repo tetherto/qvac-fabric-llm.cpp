@@ -361,6 +361,7 @@ static ggml_vec_index_t * ggml_vec_index_create_turbovec_impl(
         idx->turbovec_packed_rows = legacy;
         idx->turbovec_blocked_vm = !legacy && turbovec_wants_vector_major(bit_width, dim);
         idx->turbovec_blocked_vm8 = !legacy && turbovec_wants_vm8(bit_width, dim);
+        idx->turbovec_x86 = !legacy && turbovec_x86_rules();
         idx->filter_cookie = g_next_filter_cookie.fetch_add(1, std::memory_order_relaxed);
         if (idx->filter_cookie == 0) {
             idx->filter_cookie = g_next_filter_cookie.fetch_add(1, std::memory_order_relaxed);
