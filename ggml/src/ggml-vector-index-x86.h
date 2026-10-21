@@ -27,6 +27,11 @@ double turbovec_quantize_row_avx2(
     int dim,
     uint8_t * packed_row);
 size_t first_invalid_abs_avx2(const float * values, size_t n, float max_abs);
+// A permute-dot block's scores: fma(sum, scale, bias) * vector_scales[lane]
+// for the first `valid` of 32 lanes, -inf after. The hardware fused
+// multiply-add rounds once, as std::fma does, without a libm call.
+void permute_dot_finish_avx2(
+    const int32_t * sums, float scale, float bias, const float * vector_scales, size_t valid, float * out_scores);
 void turbovec_interleave_avx2(uint8_t * buf, size_t len);
 
 // ggml-vector-index-turbovec-avx512.cpp (AVX-512 F + AVX2 object).

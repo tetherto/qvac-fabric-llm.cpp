@@ -9,6 +9,7 @@
 #include "ggml-vector-index-x86.h"
 #include "ggml-vector-index-turbovec-pd-x86.h"
 
+#include <cassert>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -150,7 +151,12 @@ void turbovec_vnni_lut_sums(
             case 5: vnni_lut_sums_nq<5, false>(split_luts, block, n_byte_groups, 0, out); break;
             case 6: vnni_lut_sums_nq<6, false>(split_luts, block, n_byte_groups, 0, out); break;
             case 7: vnni_lut_sums_nq<7, false>(split_luts, block, n_byte_groups, 0, out); break;
-            default: vnni_lut_sums_nq<8, false>(split_luts, block, n_byte_groups, 0, out); break;
+            default:
+                // Callers batch at most 8 (the scan's width is 6); more would
+                // leave the extra queries' sums unwritten, as upstream would.
+                assert(nq <= 8);
+                vnni_lut_sums_nq<8, false>(split_luts, block, n_byte_groups, 0, out);
+                break;
         }
     }
 }
