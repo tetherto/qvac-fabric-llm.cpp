@@ -179,6 +179,7 @@ void turbovec_hadamard_rotate_for_test(const float * src, float * dst, int dim);
 int turbovec_rotation_kernel_parity_for_test(int kernel);
 int turbovec_encode_kernel_parity_for_test(int kernel);
 int vector_validation_kernel_parity_for_test(int kernel);
+int crc32c_kernel_parity_for_test(int kernel);
 void turbovec_force_vector_major_for_test(int mode);
 void turbovec_disable_dot_product_for_test(int disabled);
 void turbovec_force_planes_for_test(int mode, size_t min_vectors);
@@ -4734,6 +4735,9 @@ void check_simd_kernel_parity() {
                 "vector validation", simd_names[kernel], vector_validation_kernel_parity_for_test(kernel), required);
         }
     }
+    // Hardware CRC-32C against the table loop.
+    check_simd_parity_status("CRC-32C", "ARMv8 CRC32", crc32c_kernel_parity_for_test(0), false);
+    check_simd_parity_status("CRC-32C", "SSE4.2", crc32c_kernel_parity_for_test(1), false);
 }
 
 void check_turbovec_1x_rotation_and_codebooks() {

@@ -33,4 +33,7 @@ void turbovec_wht_block_avx512(float * blk, int block, float inv_sqrt_block);
 void turbovec_permute_gather_avx512(
     int mode, const float * src, const uint32_t * perm, const float * signs, float inv, float * dst, size_t n);
 
+// ggml-vector-index-sse42.cpp (SSE4.2 object).
+uint32_t crc32c_update_sse42(uint32_t crc, const uint8_t * data, size_t size);
+
 } // namespace ggml_vec_index_detail

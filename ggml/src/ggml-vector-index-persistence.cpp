@@ -9,8 +9,35 @@
 #include <arm_neon.h>
 #endif
 
-#if defined(GGML_VEC_INDEX_HAVE_AVX2_KERNEL)
+#if defined(GGML_VEC_INDEX_HAVE_AVX2_KERNEL) || defined(GGML_VEC_INDEX_HAVE_SSE42_KERNEL)
 #include "ggml-vector-index-x86.h"
+#endif
+
+// Hardware CRC-32C on little-endian aarch64, behind a runtime check
+// (upstream's crc32c crate uses the same instructions).
+#if (defined(__aarch64__) || defined(_M_ARM64)) && !defined(__AARCH64EB__)
+#if defined(_MSC_VER) && !defined(__clang__)
+#include <intrin.h>
+#define GGML_VEC_INDEX_ARM_CRC32 1
+#define GGML_VEC_INDEX_CRC_TARGET
+#elif defined(__ARM_FEATURE_CRC32)
+#include <arm_acle.h>
+#define GGML_VEC_INDEX_ARM_CRC32 1
+#define GGML_VEC_INDEX_CRC_TARGET
+#elif defined(__clang__)
+#include <arm_acle.h>
+#define GGML_VEC_INDEX_ARM_CRC32 1
+#define GGML_VEC_INDEX_CRC_TARGET __attribute__((target("crc")))
+#elif defined(__GNUC__) && __GNUC__ >= 10
+// GCC 10+ declares the CRC intrinsics for functions targeting +crc.
+#include <arm_acle.h>
+#define GGML_VEC_INDEX_ARM_CRC32 1
+#define GGML_VEC_INDEX_CRC_TARGET __attribute__((target("+crc")))
+#else
+#define GGML_VEC_INDEX_ARM_CRC32 0
+#endif
+#else
+#define GGML_VEC_INDEX_ARM_CRC32 0
 #endif
 
 class DeltaReplayNearestRounding {
@@ -256,9 +283,9 @@ static bool read_u64_le(std::ifstream & f, uint64_t & v) {
     return true;
 }
 
-// CRC-32C (Castagnoli), one table lookup per byte; callers apply the
-// initial value and the final inversion.
-uint32_t crc32c_update(uint32_t crc, const void * data, size_t size) {
+// CRC-32C (Castagnoli), one table lookup per byte: the reference every
+// hardware path below must match.
+static uint32_t crc32c_update_table(uint32_t crc, const uint8_t * bytes, size_t size) {
     static const std::array<uint32_t, 256> table = [] {
         std::array<uint32_t, 256> t{};
         for (uint32_t i = 0; i < 256; ++i) {
@@ -270,12 +297,127 @@ uint32_t crc32c_update(uint32_t crc, const void * data, size_t size) {
         }
         return t;
     }();
-    const auto * bytes = static_cast<const uint8_t *>(data);
     for (size_t i = 0; i < size; ++i) {
         crc = (crc >> 8) ^ table[(crc ^ bytes[i]) & 0xffu];
     }
     return crc;
 }
+
+#if GGML_VEC_INDEX_ARM_CRC32
+// The ARMv8 CRC32C instructions apply the reflected table step to each byte
+// (crc32cb) or to eight little-endian bytes at once (crc32cd), so the
+// result equals the table loop for any input.
+GGML_VEC_INDEX_CRC_TARGET
+static uint32_t crc32c_update_arm(uint32_t crc, const uint8_t * bytes, size_t size) {
+    while (size != 0 && (reinterpret_cast<uintptr_t>(bytes) & 7u) != 0) {
+        crc = __crc32cb(crc, *bytes++);
+        --size;
+    }
+    for (; size >= 8; size -= 8, bytes += 8) {
+        uint64_t word = 0;
+        std::memcpy(&word, bytes, sizeof(word));
+        crc = __crc32cd(crc, word);
+    }
+    while (size != 0) {
+        crc = __crc32cb(crc, *bytes++);
+        --size;
+    }
+    return crc;
+}
+#endif
+
+enum class Crc32cKernel { table, arm, sse42 };
+
+static uint32_t crc32c_update_with(Crc32cKernel kernel, uint32_t crc, const uint8_t * bytes, size_t size) {
+    switch (kernel) {
+#if GGML_VEC_INDEX_ARM_CRC32
+        case Crc32cKernel::arm:
+            return crc32c_update_arm(crc, bytes, size);
+#endif
+#if defined(GGML_VEC_INDEX_HAVE_SSE42_KERNEL)
+        case Crc32cKernel::sse42:
+            return ggml_vec_index_detail::crc32c_update_sse42(crc, bytes, size);
+#endif
+        default:
+            break;
+    }
+    return crc32c_update_table(crc, bytes, size);
+}
+
+// CRC-32C update; callers apply the initial value and the final inversion.
+uint32_t crc32c_update(uint32_t crc, const void * data, size_t size) {
+    static const Crc32cKernel kernel = [] {
+        const VecIndexCpuFeatures & features = vec_index_cpu_features();
+#if GGML_VEC_INDEX_ARM_CRC32
+        if (features.arm_crc32) {
+            return Crc32cKernel::arm;
+        }
+#endif
+#if defined(GGML_VEC_INDEX_HAVE_SSE42_KERNEL)
+        if (features.sse42) {
+            return Crc32cKernel::sse42;
+        }
+#endif
+        (void) features;
+        return Crc32cKernel::table;
+    }();
+    return crc32c_update_with(kernel, crc, static_cast<const uint8_t *>(data), size);
+}
+
+#ifdef GGML_VEC_INDEX_TEST_HOOKS
+// 1 when the hardware CRC-32C path (0: ARMv8 CRC32, 1: SSE4.2) matches the
+// table loop over random buffers of every length 0..5000 at every alignment
+// and seed, 0 on a mismatch, -1 when this build or CPU lacks the path.
+int crc32c_kernel_parity_for_test(int kernel) {
+    Crc32cKernel selected = Crc32cKernel::table;
+    bool available = false;
+    if (kernel == 0) {
+        selected = Crc32cKernel::arm;
+        available = GGML_VEC_INDEX_ARM_CRC32 && vec_index_cpu_features().arm_crc32;
+    } else if (kernel == 1) {
+        selected = Crc32cKernel::sse42;
+#if defined(GGML_VEC_INDEX_HAVE_SSE42_KERNEL)
+        available = vec_index_cpu_features().sse42;
+#endif
+    }
+    if (!available) {
+        return -1;
+    }
+    constexpr size_t max_len = 5000;
+    std::vector<uint8_t> buf(max_len + 16);
+    uint64_t state = UINT64_C(0x9e3779b97f4a7c15);
+    auto next = [&state]() {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        return state;
+    };
+    for (uint8_t & b : buf) {
+        b = static_cast<uint8_t>(next() >> 56);
+    }
+    for (size_t len = 0; len <= max_len; ++len) {
+        const size_t start = static_cast<size_t>(next() % 16);
+        const uint32_t seed = len % 3 == 0 ? 0xffffffffu : static_cast<uint32_t>(next());
+        const uint8_t * p = buf.data() + start;
+        if (crc32c_update_with(selected, seed, p, len) != crc32c_update_table(seed, p, len)) {
+            return 0;
+        }
+    }
+    // Every start offset against one fixed length, and split updates.
+    for (size_t start = 0; start < 16; ++start) {
+        const uint8_t * p = buf.data() + start;
+        const uint32_t whole = crc32c_update_with(selected, 0xffffffffu, p, 4093);
+        const uint32_t split = crc32c_update_with(
+            selected, crc32c_update_with(selected, 0xffffffffu, p, 13 + start), p + 13 + start, 4080 - start);
+        if (whole != crc32c_update_table(0xffffffffu, p, 4093) || split != whole) {
+            return 0;
+        }
+    }
+    // The CRC-32C check value: crc32c("123456789") == 0xe3069283.
+    const uint8_t check[9] = { '1', '2', '3', '4', '5', '6', '7', '8', '9' };
+    return ~crc32c_update_with(selected, 0xffffffffu, check, sizeof(check)) == 0xe3069283u ? 1 : 0;
+}
+#endif
 
 static bool read_u32_le_crc(std::ifstream & f, uint32_t & v, uint32_t & crc) {
     uint8_t bytes[4];

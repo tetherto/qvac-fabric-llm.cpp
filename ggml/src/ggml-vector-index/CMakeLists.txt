@@ -64,10 +64,20 @@ if (GGML_VECTOR_INDEX_AVX2_FLAG)
         PROPERTIES COMPILE_OPTIONS "${GGML_VECTOR_INDEX_AVX2_FLAG}")
 endif()
 
-# The TurboVec rotation kernels also have an AVX-512 F (with AVX2) form. It
-# gets its own object, like the AVX2 one, and runs only after a runtime CPU
-# check.
+# The CRC-32C kernel needs SSE4.2, and the TurboVec rotation kernels AVX-512
+# F (with AVX2). Each gets its own object, like the AVX2 one, and runs only
+# after a runtime CPU check.
+set(GGML_VECTOR_INDEX_SSE42_FLAG "")
+set(GGML_VECTOR_INDEX_SSE42_ENABLED OFF)
 set(GGML_VECTOR_INDEX_AVX512_FLAG "")
+set(GGML_VECTOR_INDEX_SSE42_CHECK_SOURCE [=[
+    #include <immintrin.h>
+    #include <cstdint>
+    int main() {
+        const unsigned crc = _mm_crc32_u8(0u, static_cast<unsigned char>(_mm_cvtsi128_si32(_mm_set1_epi8(3))));
+        return crc == 0u ? 0 : 1;
+    }
+]=])
 set(GGML_VECTOR_INDEX_AVX512_CHECK_SOURCE [=[
     #include <immintrin.h>
     int main() {
@@ -82,6 +92,30 @@ set(GGML_VECTOR_INDEX_AVX512_CHECK_SOURCE [=[
     }
 ]=])
 if (GGML_SYSTEM_ARCH STREQUAL "x86")
+    set(GGML_VECTOR_INDEX_SSE42_CANDIDATE OFF)
+    if (CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        check_cxx_compiler_flag("-msse4.2" GGML_VECTOR_INDEX_SUPPORTS_MSSE42)
+        if (GGML_VECTOR_INDEX_SUPPORTS_MSSE42)
+            set(GGML_VECTOR_INDEX_SSE42_FLAG "-msse4.2")
+            set(GGML_VECTOR_INDEX_SSE42_CANDIDATE ON)
+        endif()
+    elseif (MSVC)
+        # MSVC compiles SSE4.2 intrinsics without an /arch flag.
+        set(GGML_VECTOR_INDEX_SSE42_CANDIDATE ON)
+    endif()
+    if (GGML_VECTOR_INDEX_SSE42_CANDIDATE)
+        set(CMAKE_REQUIRED_FLAGS_SAVE ${CMAKE_REQUIRED_FLAGS})
+        string(REPLACE ";" " " GGML_VECTOR_INDEX_SSE42_REQUIRED_FLAGS "${GGML_VECTOR_INDEX_SSE42_FLAG}")
+        set(CMAKE_REQUIRED_FLAGS "${CMAKE_REQUIRED_FLAGS} ${GGML_VECTOR_INDEX_SSE42_REQUIRED_FLAGS}")
+        check_cxx_source_compiles(
+            "${GGML_VECTOR_INDEX_SSE42_CHECK_SOURCE}"
+            GGML_VECTOR_INDEX_SUPPORTS_SSE42_KERNEL)
+        set(CMAKE_REQUIRED_FLAGS ${CMAKE_REQUIRED_FLAGS_SAVE})
+        if (GGML_VECTOR_INDEX_SUPPORTS_SSE42_KERNEL)
+            set(GGML_VECTOR_INDEX_SSE42_ENABLED ON)
+        endif()
+    endif()
+
     # The AVX-512 kernels fall back to the AVX2 ones for short tails.
     if (GGML_VECTOR_INDEX_AVX2_FLAG)
         if (MSVC)
@@ -110,8 +144,16 @@ if (GGML_SYSTEM_ARCH STREQUAL "x86")
     endif()
 endif()
 
-if (GGML_VECTOR_INDEX_AVX2_FLAG)
+if (GGML_VECTOR_INDEX_AVX2_FLAG OR GGML_VECTOR_INDEX_SSE42_ENABLED)
     list(APPEND GGML_VECTOR_INDEX_SOURCES ${GGML_VECTOR_INDEX_SOURCE_DIR}/ggml-vector-index-x86.h)
+endif()
+if (GGML_VECTOR_INDEX_SSE42_ENABLED)
+    list(APPEND GGML_VECTOR_INDEX_SOURCES ${GGML_VECTOR_INDEX_SOURCE_DIR}/ggml-vector-index-sse42.cpp)
+    if (GGML_VECTOR_INDEX_SSE42_FLAG)
+        set_source_files_properties(
+            ${GGML_VECTOR_INDEX_SOURCE_DIR}/ggml-vector-index-sse42.cpp
+            PROPERTIES COMPILE_OPTIONS "${GGML_VECTOR_INDEX_SSE42_FLAG}")
+    endif()
 endif()
 if (GGML_VECTOR_INDEX_AVX512_FLAG)
     list(APPEND GGML_VECTOR_INDEX_SOURCES ${GGML_VECTOR_INDEX_SOURCE_DIR}/ggml-vector-index-turbovec-avx512.cpp)
@@ -120,6 +162,9 @@ if (GGML_VECTOR_INDEX_AVX512_FLAG)
         PROPERTIES COMPILE_OPTIONS "${GGML_VECTOR_INDEX_AVX512_FLAG}")
 endif()
 set(GGML_VECTOR_INDEX_X86_DEFINITIONS "")
+if (GGML_VECTOR_INDEX_SSE42_ENABLED)
+    list(APPEND GGML_VECTOR_INDEX_X86_DEFINITIONS GGML_VEC_INDEX_HAVE_SSE42_KERNEL)
+endif()
 if (GGML_VECTOR_INDEX_AVX512_FLAG)
     list(APPEND GGML_VECTOR_INDEX_X86_DEFINITIONS GGML_VEC_INDEX_HAVE_AVX512_KERNEL)
 endif()

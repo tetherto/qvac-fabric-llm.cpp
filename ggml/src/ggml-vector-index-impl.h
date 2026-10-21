@@ -605,6 +605,7 @@ void turbovec_hadamard_rotate_for_test(const float * src, float * dst, int dim);
 int turbovec_rotation_kernel_parity_for_test(int kernel);
 int turbovec_encode_kernel_parity_for_test(int kernel);
 int vector_validation_kernel_parity_for_test(int kernel);
+int crc32c_kernel_parity_for_test(int kernel);
 int turbovec_sync_plan_for_test(
     ggml_vec_index_t * idx,
     const char * path,
