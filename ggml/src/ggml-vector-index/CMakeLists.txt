@@ -62,11 +62,18 @@ if (GGML_VECTOR_INDEX_AVX2_FLAG)
         PROPERTIES COMPILE_OPTIONS "${GGML_VECTOR_INDEX_AVX2_FLAG}")
 endif()
 
-# TurboVec encodes must match upstream turbovec bit for bit, and upstream
-# never fuses a multiply with an add; keep the compiler from contracting them.
+# TurboVec encodes must match upstream turbovec bit for bit: upstream neither
+# fuses a multiply with an add nor reassociates, so keep the compiler from
+# contracting and undo any fast-math a toolchain turns on (the arm64 clang
+# toolchains pass -ffp-model=fast).
 set(GGML_VECTOR_INDEX_FP_OPTIONS "")
-if (CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
-    set(GGML_VECTOR_INDEX_FP_OPTIONS "-ffp-contract=off")
+if (CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC")
+    set(GGML_VECTOR_INDEX_FP_OPTIONS "/fp:precise")
+    if (CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+        list(APPEND GGML_VECTOR_INDEX_FP_OPTIONS "/clang:-ffp-contract=off")
+    endif()
+elseif (CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    set(GGML_VECTOR_INDEX_FP_OPTIONS -fno-fast-math -ffp-contract=off)
 elseif (MSVC)
     set(GGML_VECTOR_INDEX_FP_OPTIONS "/fp:precise")
 endif()
