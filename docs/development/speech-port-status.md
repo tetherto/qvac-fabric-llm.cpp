@@ -26,9 +26,11 @@ already covered by the Metal/Vulkan parts; they are not a separate merged patch.
 - CUDA implementations of the new speech operations are not part of the merged
   stack. Existing CUDA operations must not be confused with coverage of these
   new operation IDs.
-- Hexagon still needs col2im-1d, conv-2d-dw, depthwise-conv-1d,
-  timestep-embedding, transpose, `hvx-erf.h`, DMA stride handling, and the speech
-  changes to flash-attention, im2col, unary, matmul, get-rows, and copy.
+- The remaining Hexagon implementation is included in this change: col2im-1d,
+  conv-2d-dw, fused depthwise-conv-1d, timestep-embedding, transpose, GELU-erf,
+  F32 attention inputs, F16 HMX activations, partial output tiles, K=9 matmul,
+  BF16 row gathers, and strided copies/im2col. Existing upstream DMA splitting
+  and batched F32 VTCM matmul are retained. Device validation remains required.
 - The SNAKE reviewer reported a successful Galaxy S25 (SM8750, v79) run. The
   three QDC jobs skipped device execution because the API key was unavailable.
   QCS9075M and SM8850 remain unvalidated; green skipped jobs are not device passes.
@@ -104,3 +106,21 @@ diff -u docs/ops.md /tmp/ops-check.md
 ```
 
 The `update-ops-docs` workflow performs the same generation and comparison.
+
+## Hexagon speech validation
+
+Run the focused speech cases and the previously merged SNAKE cases on HTP:
+
+```sh
+test-backend-ops test -b HTP0 -p 'suite=speech_htp,'
+test-backend-ops test -b HTP0 -o SNAKE
+```
+
+The speech group covers vector/tile tails, padding/dilation, planar and channel
+layouts, strides over 64 KiB, fused depthwise convolution with weight buffers,
+F16/BF16 conversion, mixed F32/F16 attention, and partial matmul output tiles.
+New direct-access kernels stage extended-address inputs through DMA on v81.
+The Android and Linux QDC runners require every selected case to execute and
+pass. A missing QDC API key fails the device lane instead of producing a green
+job with skipped execution. Completion requires actual runs on QCS9075M,
+SM8750, and SM8850; builds and CPU references do not establish HTP correctness.
