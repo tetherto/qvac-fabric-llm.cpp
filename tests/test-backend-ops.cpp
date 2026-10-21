@@ -14089,7 +14089,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_affine_prelu(16, 10, 6, 2));
     test_cases.emplace_back(new test_affine_prelu(129, 63, 16, 3));
 
+    test_cases.emplace_back(new test_snake(1, 1));
+    test_cases.emplace_back(new test_snake(31, 11));
     test_cases.emplace_back(new test_snake(32, 8));
+    test_cases.emplace_back(new test_snake(33, 11));
     test_cases.emplace_back(new test_snake(127, 3));
 
     for (int64_t h : {32, 640}) {

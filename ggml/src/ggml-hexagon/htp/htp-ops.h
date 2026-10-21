@@ -111,6 +111,7 @@ enum htp_op_code {
     HTP_OP_MDEV_GROUP,
     HTP_OP_ROLL,
     HTP_OP_ARGMAX,
+    HTP_OP_SNAKE,
 
     HTP_OP_INVALID
 };

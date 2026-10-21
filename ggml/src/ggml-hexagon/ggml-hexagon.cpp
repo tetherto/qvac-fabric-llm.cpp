@@ -6562,6 +6562,38 @@ static bool ggml_hexagon_supported_tri(const struct ggml_hexagon_session * sess,
     GGML_UNUSED(sess);
 }
 
+static bool ggml_hexagon_tensor_fits(const struct ggml_tensor * t) {
+    uint64_t span = ggml_type_size(t->type);
+    for (int i = 0; i < GGML_MAX_DIMS; ++i) {
+        if (t->ne[i] <= 0 || t->ne[i] > INT32_MAX || t->nb[i] > INT32_MAX) {
+            return false;
+        }
+        const uint64_t extent = i == 0 ? t->ne[i] / ggml_blck_size(t->type) : t->ne[i];
+        if (extent == 0) {
+            return false;
+        }
+        span += (extent - 1) * t->nb[i];
+        if (span > INT32_MAX) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool ggml_hexagon_supported_snake(const struct ggml_hexagon_session * sess, const struct ggml_tensor * op) {
+    const struct ggml_tensor * x        = op->src[0];
+    const struct ggml_tensor * alpha    = op->src[1];
+    const struct ggml_tensor * inv_beta = op->src[2];
+    if (sess->mdev.count > 1 || x->type != GGML_TYPE_F32 || op->type != GGML_TYPE_F32 || alpha->type != GGML_TYPE_F32 ||
+        inv_beta->type != GGML_TYPE_F32) {
+        return false;
+    }
+    return ggml_is_contiguous(x) && ggml_is_contiguous(op) && x->ne[2] == 1 && x->ne[3] == 1 &&
+           ggml_is_contiguous(alpha) && ggml_is_contiguous(inv_beta) && ggml_nelements(alpha) == x->ne[1] &&
+           ggml_nelements(inv_beta) == x->ne[1] && ggml_hexagon_tensor_fits(x) &&
+           ggml_hexagon_tensor_fits(op);
+}
+
 static const char * ggml_backend_hexagon_name(ggml_backend_t backend) {
     auto sess = static_cast<ggml_hexagon_session *>(backend->context);
     return sess->c_name();
@@ -6615,6 +6647,7 @@ static htp_op_code op_remap_to_htp(const ggml_tensor * t) {
         case GGML_OP_PAD:             return HTP_OP_PAD;
         case GGML_OP_IM2COL:          return HTP_OP_IM2COL;
         case GGML_OP_ROLL:            return HTP_OP_ROLL;
+        case GGML_OP_SNAKE:           return HTP_OP_SNAKE;
 
         case GGML_OP_UNARY:
             switch (ggml_get_unary_op(t)) {
@@ -7757,6 +7790,10 @@ static bool ggml_backend_hexagon_device_supports_op(ggml_backend_dev_t dev, cons
 
         case GGML_OP_TOP_K:
             supp = ggml_hexagon_supported_top_k(sess, op);
+            break;
+
+        case GGML_OP_SNAKE:
+            supp = ggml_hexagon_supported_snake(sess, op);
             break;
 
         case GGML_OP_SSM_CONV:
