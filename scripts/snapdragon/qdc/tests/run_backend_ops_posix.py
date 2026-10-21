@@ -51,6 +51,20 @@ def test_backend_ops_snake_htp0():
     assert not re.search(r"^\s*SNAKE\(.*\): not supported", output, re.MULTILINE), "SNAKE cases were skipped"
 
 
+SPEECH_OPS = ("DEPTHWISE_CONV_1D", "COL2IM_1D", "CONV_2D_DW", "IM2COL", "MUL_MAT", "TIMESTEP_EMBEDDING", "GELU_ERF", "GET_ROWS", "CPY", "FLASH_ATTN_EXT")
+
+
+def test_backend_ops_speech_htp0():
+    result = run_snapdragon(["test-backend-ops", "-b", "HTP0", "-p", "suite=speech_htp,"])
+    output = re.sub(r"\x1b\[[0-9;]*m", "", result.stdout or "")
+    write_qdc_log("backend_ops_speech.log", result.stdout or "")
+    assert result.returncode == 0, f"Speech ops failed (exit {result.returncode})"
+    assert re.search(r"Backend HTP0: OK", output), "HTP0 did not complete successfully"
+    assert not re.search(r"suite=speech_htp,.*: not supported", output), "Speech cases were skipped"
+    for op in SPEECH_OPS:
+        assert re.search(rf"^\s*{op}\(suite=speech_htp,.*\): OK$", output, re.MULTILINE), f"No {op} speech case passed on HTP0"
+
+
 if __name__ == "__main__":
     ret = pytest.main(["-s", "--junitxml=results.xml", os.path.realpath(__file__)])
     if os.path.exists("results.xml"):
