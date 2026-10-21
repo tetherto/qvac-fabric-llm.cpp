@@ -19568,3 +19568,6 @@
 "Vulkan0","BIAS_GELU","L=37,C=96,B=2,layout=1","support","1","yes","Vulkan"
 "Vulkan0","BIAS_GELU","L=139,C=512,B=1,layout=2","support","1","yes","Vulkan"
 "Vulkan0","BIAS_GELU","L=37,C=96,B=2,layout=2","support","1","yes","Vulkan"
+"Vulkan0","SNAKE","t=1,c=1","support","1","yes","Vulkan"
+"Vulkan0","SNAKE","t=31,c=11","support","1","yes","Vulkan"
+"Vulkan0","SNAKE","t=33,c=11","support","1","yes","Vulkan"
