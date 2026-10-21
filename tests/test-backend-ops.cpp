@@ -2226,9 +2226,10 @@ struct test_unary : public test_case {
     const ggml_type type;
     const std::array<int64_t, 4> ne_a;
     int v; // view (1 : non-contiguous a)
+    const float input_max;
 
     std::string vars() override {
-        return VARS_TO_STR3(type, ne_a, v);
+        return VARS_TO_STR3(type, ne_a, v) + (input_max == 150.0f ? "" : "," + VAR_TO_STR(input_max));
     }
 
     double max_nmse_err(ggml_backend_t backend) override {
@@ -2243,8 +2244,9 @@ struct test_unary : public test_case {
     test_unary(ggml_unary_op op,
             ggml_type type = GGML_TYPE_F32,
             std::array<int64_t, 4> ne_a = {128, 2, 2, 2},
-            int v = 0)
-        : op(op), type(type), ne_a(ne_a), v(v) {}
+            int v = 0,
+            float input_max = 150.0f)
+        : op(op), type(type), ne_a(ne_a), v(v), input_max(input_max) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         const bool grad_supported = op == GGML_UNARY_OP_ABS || op == GGML_UNARY_OP_SGN || op == GGML_UNARY_OP_NEG ||
@@ -2281,8 +2283,8 @@ struct test_unary : public test_case {
     }
 
     void initialize_tensors(ggml_context * ctx) override {
-        float min = -150.f;
-        float max =  150.f;
+        float min = -input_max;
+        float max =  input_max;
 
         // Keep FP16 exp/expm1 inputs in-range so all backends stay finite instead of
         // disagreeing on whether overflow saturates to max-F16 or produces +inf.
@@ -13759,6 +13761,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                 test_cases.emplace_back(new test_unary((ggml_unary_op) op, type, { 5, 7, 11, 13 }, v));
             }
         }
+    }
+
+    // Exercise the QUICK GELU transition range and vector tails.
+    for (ggml_unary_op op : {GGML_UNARY_OP_GELU_QUICK}) {
+        test_cases.emplace_back(new test_unary(op, GGML_TYPE_F32, {512, 3, 1, 1}, 0, 5.0f));
+        test_cases.emplace_back(new test_unary(op, GGML_TYPE_F32, {513, 3, 1, 1}, 0, 5.0f));
+        test_cases.emplace_back(new test_unary(op, GGML_TYPE_F32, {513, 3, 2, 1}, 1, 5.0f));
+        test_cases.emplace_back(new test_unary(op, GGML_TYPE_F32, {262145, 3, 1, 1}, 0, 5.0f));
     }
 
     // fused relu + sqr (squared ReLU)
