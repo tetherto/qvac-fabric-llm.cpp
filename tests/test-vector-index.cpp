@@ -5227,6 +5227,34 @@ void check_turbovec_1x_upstream_contracts() {
         CHECK(ggml_vec_index_turbovec_is_calibrated(loaded) == 0);
         CHECK(tv1x_snapshot_bytes(loaded, "ggml-vector-index-tv1x-identity.tvim") == upstream);
         ggml_vec_index_free(loaded);
+
+        // The same file as a sync destination (a nonzero nonce): the loaded
+        // index's superblock is shorter than the file's, so its next sync
+        // rewrites the file rather than patching it at shifted offsets.
+        std::vector<uint8_t> synced = sb;
+        synced.resize(synced.size() - 4);
+        write_u64_le_at(synced, 12, UINT64_C(0x5eed5eed5eed5eed));
+        append_u32_le(synced, tv1x_crc32(synced, synced.size()));
+        const std::string path =
+            (std::filesystem::temp_directory_path() / "ggml-vector-index-tv1x-identity-sync.tvim").string();
+        write_file_bytes(path, tv1x_with_superblock(synced));
+        auto * bound = ggml_vec_index_load(path.c_str());
+        CHECK(bound != nullptr);
+        const std::vector<float> extra = tv1x_rows(kTv1xSeedDb + 7, 40, dim);
+        std::vector<uint64_t> extra_ids(40);
+        for (size_t i = 0; i < extra_ids.size(); ++i) {
+            extra_ids[i] = UINT64_C(900000) + i;
+        }
+        CHECK(ggml_vec_index_add(bound, extra.data(), 40, extra_ids.data()) == GGML_VEC_INDEX_OK);
+        CHECK(ggml_vec_index_sync(bound, path.c_str()) == GGML_VEC_INDEX_OK);
+        auto * reloaded = ggml_vec_index_load(path.c_str());
+        CHECK(reloaded != nullptr);
+        CHECK(ggml_vec_index_len(reloaded) == ggml_vec_index_len(bound));
+        CHECK(tv1x_snapshot_bytes(reloaded, "ggml-vector-index-tv1x-identity-r.tvim") ==
+              tv1x_snapshot_bytes(bound, "ggml-vector-index-tv1x-identity-b.tvim"));
+        ggml_vec_index_free(reloaded);
+        ggml_vec_index_free(bound);
+        std::filesystem::remove(path);
     }
     // A v7 container (one superblock byte shorter, no layout byte) loads.
     {
