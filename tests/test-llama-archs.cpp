@@ -1,4 +1,5 @@
 #include "common.h"
+#include "fit.h"
 #include "speculative.h"
 #include "../src/llama-context.h"
 #include "../ggml/src/ggml-backend-impl.h"
@@ -25,6 +26,7 @@
 #include <cstdio>
 #include <cstring>
 #include <cstdint>
+#include <filesystem>
 #include <random>
 #include <regex>
 #include <stdexcept>
@@ -1676,13 +1678,18 @@ static FILE * save_folded_target(llm_arch arch, const llama_model * model, const
     return file;
 }
 
-// a DFlash drafter as loaded from a file without token_embd and output, so it reads the target's through ctx_other
-static llama_model_ptr get_borrowing_dflash(size_t seed) {
+static gguf_context_ptr get_borrowing_dflash_metadata() {
     auto metadata = get_gguf_ctx(LLM_ARCH_DFLASH, false);
     // DFlash reads the window pattern as a per-layer array; keep the drafter full-attention
     gguf_remove_key(metadata.get(), "dflash.attention.sliding_window");
     const int32_t target_layers[] = { 1 };
     gguf_set_arr_data(metadata.get(), "dflash.target_layers", GGUF_TYPE_INT32, target_layers, 1);
+    return metadata;
+}
+
+// a DFlash drafter as loaded from a file without token_embd and output, so it reads the target's through ctx_other
+static llama_model_ptr get_borrowing_dflash(size_t seed) {
+    auto metadata = get_borrowing_dflash_metadata();
     tensor_data_params tensor_params = { seed, 0.1f };
     llama_model_ptr draft(llama_model_init_from_user(metadata.get(), set_tensor_data, &tensor_params, llama_model_default_params()));
     GGML_ASSERT(draft);
@@ -2096,6 +2103,101 @@ static int test_layer_inp_pos_min() {
     return ok ? 0 : 1;
 }
 
+static bool same_memory(const common_device_memory_data_vec & a, const common_device_memory_data_vec & b) {
+    if (a.size() != b.size()) {
+        return false;
+    }
+    for (size_t i = 0; i < a.size(); ++i) {
+        if (a[i].model != b[i].model || a[i].context != b[i].context || a[i].compute != b[i].compute) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// a fit measures a draft model that borrows the target's token_embd and output next to a probe of the target,
+// as the load creates it; a draft that borrows nothing measures as it does alone
+static int test_fit_borrowing_draft() {
+    const size_t seed = 1234;
+    const std::string dir         = std::filesystem::temp_directory_path().string();
+    const std::string path_target = dir + "/test-fit-borrowing-target.gguf";
+    const std::string path_draft  = dir + "/test-fit-borrowing-dflash.gguf";
+    {
+        auto metadata = get_gguf_ctx(LLM_ARCH_QWEN35, false);
+        auto target = get_model_and_ctx(metadata.get(), nullptr, seed, 0.1f, {});
+        llama_model_save_to_file(target.first.get(), path_target.c_str());
+        // written from its metadata and tensors: the model saver knows neither the DFlash keys nor its tensors
+        llama_model_ptr draft = get_borrowing_dflash(seed);
+        gguf_context_ptr draft_ctx(gguf_init_empty());
+        gguf_set_kv(draft_ctx.get(), get_borrowing_dflash_metadata().get());
+        llama_model_saver saver(LLM_ARCH_DFLASH, draft_ctx.get());
+        for (const auto & [name, tensor] : draft->tensors_by_name) {
+            if (name != "token_embd.weight" && name != "output.weight") {
+                saver.add_tensor(tensor);
+            }
+        }
+        saver.save(path_draft);
+    }
+
+    auto mparams = llama_model_default_params();
+    auto cparams = llama_context_default_params();
+    cparams.n_ctx     = 128;
+    cparams.n_batch   = cparams.n_ubatch = 8;
+    cparams.n_seq_max = 1;
+    auto mparams_dft = mparams;
+    auto cparams_dft = cparams;
+
+    std::vector<ggml_backend_dev_t> devs;
+    uint32_t n_layer     = 0;
+    uint32_t n_ctx_train = 0;
+    uint32_t n_expert    = 0;
+
+    bool alone_fails = false;
+    try {
+        common_get_device_memory_data(path_draft.c_str(), &mparams_dft, &cparams_dft, devs, n_layer, n_ctx_train,
+                                      n_expert, GGML_LOG_LEVEL_ERROR);
+    } catch (const std::exception &) {
+        alone_fails = true;
+    }
+
+    const common_fit_extra_model borrowing = { path_draft.c_str(), &mparams_dft, &cparams_dft, false };
+    const auto measured = common_get_extra_device_memory_data(&borrowing, path_target.c_str(), &mparams, &cparams,
+                                                              devs, n_layer, n_ctx_train, n_expert, GGML_LOG_LEVEL_ERROR);
+    size_t model   = 0;
+    size_t compute = 0;
+    for (const auto & row : measured) {
+        model   += row.model;
+        compute += row.compute;
+    }
+
+    const common_fit_extra_model plain = { path_target.c_str(), &mparams_dft, &cparams_dft, false };
+    const auto as_extra = common_get_extra_device_memory_data(&plain, path_target.c_str(), &mparams, &cparams,
+                                                              devs, n_layer, n_ctx_train, n_expert, GGML_LOG_LEVEL_ERROR);
+    const auto alone = common_get_device_memory_data(path_target.c_str(), &mparams_dft, &cparams_dft, devs, n_layer,
+                                                     n_ctx_train, n_expert, GGML_LOG_LEVEL_ERROR);
+
+    std::remove(path_target.c_str());
+    std::remove(path_draft.c_str());
+
+    bool ok = true;
+    if (!alone_fails) {
+        LOG_ERR("%s: the borrowing draft was measured without the target\n", __func__);
+        ok = false;
+    }
+    if (model == 0 || compute == 0) {
+        LOG_ERR("%s: the borrowing draft measured %zu model and %zu compute bytes\n", __func__, model, compute);
+        ok = false;
+    }
+    if (!same_memory(as_extra, alone)) {
+        LOG_ERR("%s: a draft that borrows nothing measured differently as an extra model\n", __func__);
+        ok = false;
+    }
+    if (ok) {
+        printf("fit borrowing draft tests passed\n");
+    }
+    return ok ? 0 : 1;
+}
+
 static constexpr uint32_t NO_OUTPUT_N_UBATCH      = 256; // n_kv is padded to 256, so every ubatch grows the KQ mask
 static constexpr uint32_t NO_OUTPUT_N_UBATCHES    = 3;
 static constexpr uint32_t NO_OUTPUT_N_EXPERT_USED = 2;   // the CUDA MoE weighted-reduction fusion needs at least 2
@@ -2161,6 +2263,9 @@ int main(int argc, char ** argv) {
     }
     if (argc == 2 && strcmp(argv[1], "--layer-inp-pos-min") == 0) {
         return test_layer_inp_pos_min();
+    }
+    if (argc == 2 && strcmp(argv[1], "--fit-borrowing-draft") == 0) {
+        return test_fit_borrowing_draft();
     }
     if (argc == 2 && strcmp(argv[1], "--moe-no-output-ubatches") == 0) {
         return test_moe_no_output_ubatches();

@@ -30,6 +30,13 @@ class common_params_fit_exception : public std::runtime_error {
     using std::runtime_error::runtime_error;
 };
 
+// a model probed next to the measured one, its context passed as the measured context's ctx_other
+struct common_fit_probe_other {
+    const char * path_model;
+    const llama_model_params * mparams;
+    const llama_context_params * cparams;
+};
+
 static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
         const char * path_model,
         const llama_model_params * mparams,
@@ -38,7 +45,8 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
         uint32_t & hp_ngl,
         uint32_t & hp_n_ctx_train,
         uint32_t & hp_n_expert,
-        ggml_log_level log_level) {
+        ggml_log_level log_level,
+        const common_fit_probe_other * other = nullptr) {
     // Serialize temporary logger overrides across all fit/memory probes.
     static std::mutex logger_mutex;
     const std::lock_guard<std::mutex> lock(logger_mutex);
@@ -63,6 +71,26 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
         ud->original_logger.callback(level_eff, text, ud->original_logger.user_data);
     }, &ud);
 
+    // declared first so that it outlives the measured context that borrows from it
+    llama_model_ptr      model_other_owner;
+    llama_context_ptr    ctx_other_owner;
+    llama_context_params cparams_copy = *cparams;
+    if (other != nullptr) {
+        llama_model_params mparams_other = *other->mparams;
+        mparams_other.no_alloc  = true;
+        mparams_other.load_mode = LLAMA_LOAD_MODE_NONE;
+
+        model_other_owner.reset(llama_model_load_from_file(other->path_model, mparams_other));
+        if (!model_other_owner) {
+            throw std::runtime_error("failed to load the model to borrow from");
+        }
+        ctx_other_owner.reset(llama_init_from_model(model_other_owner.get(), *other->cparams));
+        if (!ctx_other_owner) {
+            throw common_params_fit_exception("failed to create llama_context from the model to borrow from");
+        }
+        cparams_copy.ctx_other = ctx_other_owner.get();
+    }
+
     llama_model_params mparams_copy = *mparams;
     mparams_copy.no_alloc  = true;
     mparams_copy.load_mode = LLAMA_LOAD_MODE_NONE;
@@ -73,7 +101,7 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
         throw std::runtime_error("failed to load model");
     }
 
-    llama_context_ptr ctx_owner(llama_init_from_model(model, *cparams));
+    llama_context_ptr ctx_owner(llama_init_from_model(model, cparams_copy));
     llama_context * ctx = ctx_owner.get();
     if (ctx == nullptr) {
         throw common_params_fit_exception("failed to create llama_context from model");
@@ -181,6 +209,47 @@ common_device_memory_data_vec common_get_device_memory_data(
         ggml_log_level log_level) {
     return common_device_memory_data_from(common_get_device_memory_data_impl(
         path_model, mparams, cparams, devs, hp_ngl, hp_n_ctx_train, hp_n_expert, log_level));
+}
+
+// a draft model that borrows from the main model (a DFlash or EAGLE3 draft without its own embeddings, a Gemma 4
+// assistant) cannot create its context alone, so it is measured next to a probe of the main model passed as its
+// ctx_other, as the load creates it; any other extra model is measured alone
+static std::vector<llama_device_memory_data> common_get_extra_device_memory_data_impl(
+        const common_fit_extra_model & extra,
+        const char * path_main,
+        const llama_model_params * mparams_main,
+        const llama_context_params * cparams_main,
+        std::vector<ggml_backend_dev_t> & devs,
+        uint32_t & hp_ngl,
+        uint32_t & hp_n_ctx_train,
+        uint32_t & hp_n_expert,
+        ggml_log_level log_level) {
+    try {
+        return common_get_device_memory_data_impl(
+            extra.path_model, extra.mparams, extra.cparams, devs, hp_ngl, hp_n_ctx_train, hp_n_expert, log_level);
+    } catch (const common_params_fit_exception &) {
+        // an MTP context on the main model's weights never borrows through ctx_other
+        if (extra.shares_model) {
+            throw;
+        }
+        const common_fit_probe_other main = { path_main, mparams_main, cparams_main };
+        return common_get_device_memory_data_impl(
+            extra.path_model, extra.mparams, extra.cparams, devs, hp_ngl, hp_n_ctx_train, hp_n_expert, log_level, &main);
+    }
+}
+
+common_device_memory_data_vec common_get_extra_device_memory_data(
+        const common_fit_extra_model * extra,
+        const char * path_main,
+        const llama_model_params * mparams_main,
+        const llama_context_params * cparams_main,
+        std::vector<ggml_backend_dev_t> & devs,
+        uint32_t & hp_ngl,
+        uint32_t & hp_n_ctx_train,
+        uint32_t & hp_n_expert,
+        ggml_log_level log_level) {
+    return common_device_memory_data_from(common_get_extra_device_memory_data_impl(
+        *extra, path_main, mparams_main, cparams_main, devs, hp_ngl, hp_n_ctx_train, hp_n_expert, log_level));
 }
 
 int64_t common_fit_shared_pool_deficit(
@@ -328,8 +397,8 @@ static void common_params_fit_impl(
 
             dmds_t measured;
             try {
-                measured = common_get_device_memory_data_impl(
-                    extra->path_model, extra->mparams, extra->cparams, devs_extra, ngl_extra, nct_extra, nex_extra, log_level);
+                measured = common_get_extra_device_memory_data_impl(
+                    *extra, path_model, mparams, cparams, devs_extra, ngl_extra, nct_extra, nex_extra, log_level);
             } catch (const std::runtime_error & e) {
                 // the extra model is optional, fit the main model alone rather than giving up
                 LOG_WRN("%s: failed to measure the memory of the extra model, fitting without it: %s\n", __func__, e.what());
