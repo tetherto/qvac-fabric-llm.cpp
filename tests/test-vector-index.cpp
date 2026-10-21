@@ -6144,9 +6144,10 @@ void check_turbovec_1x_tie_order() {
     ggml_vec_index_free(f32);
 }
 
-// The stale-temp sweep reclaims only temps written for this destination,
-// in this port's or upstream turbovec's name shapes, and leaves every other
-// `.tmp.` file alone.
+// The stale-temp sweep reclaims only temps written for this destination in
+// the `.tmp.pid.seq.hex8` shape this port and upstream turbovec write (or
+// upstream's older `.tmp.pid.seq`), and leaves every other `.tmp.` file
+// alone, a user's `<name>.tmp.backup` included.
 void check_turbovec_stale_temp_sweep() {
     const std::filesystem::path dir = verbatim_path(std::filesystem::temp_directory_path()) / "ggml-vector-index-sweep";
     std::filesystem::remove_all(dir);
@@ -6162,24 +6163,27 @@ void check_turbovec_stale_temp_sweep() {
     };
     const std::string long_base = std::string(240, 'a') + ".tvim";
     const std::string kept_long_base = std::string(240, 'b') + ".tvim";
+    const std::string suffix = ".tmp.123.4.deadbeef";
+    const size_t cut = 255 - suffix.size();
     const std::filesystem::path reclaimed[] = {
-        make("idx.tv.tmp.Ab3dE9", true),
         make("idx.tv.tmp.123.4", true),
-        make("idx.tv.tmp.123.4.deadbeef", true),
-        make("idx.tv.tmp.12.34.56", true),
+        make("idx.tv" + suffix, true),
         // A long destination's temp carries the writer's exact cut.
-        make(long_base.substr(0, 255 - 11) + ".tmp.Qw3Er5", true),
+        make(long_base.substr(0, cut) + suffix, true),
     };
     const std::filesystem::path kept[] = {
+        make("idx.tv.tmp.backup", true),
+        make("idx.tv.tmp.Ab3dE9", true),
         make("idx.tmp.backup", true),
-        make("i.tmp.abc123", true),
         make("idx.tv.tmp.notours", true),
         make("idx.tv.tmp.12.x", true),
-        make("idx.tv.tmp.Zz9yX8", false),
-        make("other.tv.tmp.Ab3dE9", true),
+        make("idx.tv.tmp.12.34.56", true),
+        make("idx.tv.tmp.123.4.deadbee", true),
+        make("idx.tv.tmp.99.7.0badf00d", false),
+        make("other.tv" + suffix, true),
         // A cut stem that names an existing file may be that file's temp.
-        make(kept_long_base.substr(0, 255 - 11) + ".tmp.Qw3Er5", true),
-        make(kept_long_base.substr(0, 255 - 11), false),
+        make(kept_long_base.substr(0, cut) + suffix, true),
+        make(kept_long_base.substr(0, cut), false),
     };
     constexpr int dim = 64;
     const std::vector<float> rows = tv1x_rows(kTv1xSeedDb, 4, dim);
