@@ -75,6 +75,11 @@ fn main() {
     // the two round scores differently. `--vector-major` prints the 4-bit
     // searches under the permute-dot kernel (run it on such a host); the
     // default output pins the LUT scan so it does not depend on the machine.
+    if std::env::args().any(|a| a == "--vm8-2bit-section") {
+        // Child of `--vector-major`, run with TURBOVEC_2BIT_VM8=1.
+        print_vm8_2bit_section();
+        return;
+    }
     if std::env::args().any(|a| a == "--vector-major") {
         print_vector_major();
         print_batch_section();
@@ -582,6 +587,35 @@ fn print_batch_section() {
         for row in batch_case_rows(bits) {
             println!("{row}");
         }
+    }
+    println!("}};");
+    // The same 2-bit searches under TURBOVEC_2BIT_VM8=1, which upstream
+    // reads once per process: a child process prints them.
+    let exe = std::env::current_exe().unwrap();
+    let child = std::process::Command::new(exe)
+        .arg("--vm8-2bit-section")
+        .env("TURBOVEC_2BIT_VM8", "1")
+        .output()
+        .unwrap();
+    assert!(child.status.success(), "{}", String::from_utf8_lossy(&child.stderr));
+    print!("{}", String::from_utf8(child.stdout).unwrap());
+}
+
+fn print_vm8_2bit_section() {
+    // The opt-in only changes anything on aarch64 with i8mm; elsewhere these
+    // rows would silently repeat the LUT ones.
+    #[cfg(target_arch = "aarch64")]
+    assert!(std::arch::is_aarch64_feature_detected!("i8mm"), "the 2-bit vm8 rows need aarch64 with i8mm");
+    #[cfg(not(target_arch = "aarch64"))]
+    panic!("the 2-bit vm8 rows need aarch64 with i8mm");
+    assert_eq!(std::env::var("TURBOVEC_2BIT_VM8").as_deref(), Ok("1"));
+    println!();
+    println!("// The 2-bit batched searches under TURBOVEC_2BIT_VM8=1 (aarch64 with i8mm):");
+    println!("// dims whose byte-group count is a multiple of 8 take the vm8 layout, where");
+    println!("// batches of 12, 8 and 4 score with SMMLA and other queries with the LUT.");
+    println!("static const Tv1xBatchCase kTv1xVm8TwoBitCases[] = {{");
+    for row in batch_case_rows(2) {
+        println!("{row}");
     }
     println!("}};");
 }

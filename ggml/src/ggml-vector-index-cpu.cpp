@@ -3,6 +3,9 @@
 
 #include "ggml-vector-index-impl.h"
 
+#include <cstdlib>
+#include <cstring>
+
 #if defined(__APPLE__) && (defined(__aarch64__) || defined(_M_ARM64))
 #include <sys/sysctl.h>
 #elif (defined(__linux__) || defined(__ANDROID__)) && defined(__aarch64__)
@@ -19,6 +22,7 @@ std::atomic<int> g_vector_major_override{ -1 };
 std::atomic<bool> g_dot_product_disabled{ false };
 std::atomic<int> g_vm8_override{ -1 };
 std::atomic<bool> g_i8mm_disabled{ false };
+std::atomic<int> g_vm8_2bit_override{ -1 };
 
 bool detect_vector_major() {
 #if defined(__aarch64__) || defined(_M_ARM64)
@@ -167,6 +171,20 @@ bool turbovec_cpu_vm8() {
 #endif
 }
 
+bool turbovec_vm8_2bit_enabled() {
+    const int forced = g_vm8_2bit_override.load(std::memory_order_relaxed);
+    if (forced >= 0) {
+        return forced != 0;
+    }
+    // Upstream pack.rs `use_vm8_2bit`: read once per process, on only for
+    // exactly "1".
+    static const bool enabled = [] {
+        const char * value = std::getenv("TURBOVEC_2BIT_VM8");
+        return value != nullptr && std::strcmp(value, "1") == 0;
+    }();
+    return enabled;
+}
+
 #ifdef GGML_VEC_INDEX_TEST_HOOKS
 void turbovec_force_vm8_for_test(int mode) {
     g_vm8_override.store(mode, std::memory_order_relaxed);
@@ -174,6 +192,10 @@ void turbovec_force_vm8_for_test(int mode) {
 
 void turbovec_disable_i8mm_for_test(int disabled) {
     g_i8mm_disabled.store(disabled != 0, std::memory_order_relaxed);
+}
+
+void turbovec_force_vm8_2bit_for_test(int mode) {
+    g_vm8_2bit_override.store(mode, std::memory_order_relaxed);
 }
 
 void turbovec_force_vector_major_for_test(int mode) {

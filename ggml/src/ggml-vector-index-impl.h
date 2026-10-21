@@ -341,8 +341,8 @@ struct ggml_vec_index {
     bool turbovec_blocked_vm = false;
     // The blocked cache uses upstream's wider `vm8` unit instead (aarch64
     // with i8mm: 4-bit indexes whose byte-group count is a multiple of
-    // eight); fixed at creation and never persisted, since snapshots are
-    // written from sequential rows.
+    // eight, and 2-bit ones under TURBOVEC_2BIT_VM8=1); fixed at creation
+    // and never persisted, since snapshots are written from sequential rows.
     bool turbovec_blocked_vm8 = false;
     // Bumped by every calibrate; a sync across one rewrites the whole file.
     uint64_t turbovec_calib_gen = 0;
@@ -616,6 +616,8 @@ void turbovec_disable_dot_product_for_test(int disabled);
 void turbovec_force_vm8_for_test(int mode);
 // Keeps SMMLA off even on an i8mm host; kernels fall back to SDOT or scalar.
 void turbovec_disable_i8mm_for_test(int disabled);
+// -1 follows TURBOVEC_2BIT_VM8, 0 or 1 overrides it.
+void turbovec_force_vm8_2bit_for_test(int mode);
 // Fused batches for every query count upstream batches, filters and
 // small indexes included, so a test reaches the batch kernels.
 void turbovec_force_batches_for_test(int enabled);
@@ -655,6 +657,11 @@ const VecIndexCpuFeatures & vec_index_cpu_features();
 bool turbovec_cpu_i8mm();
 // Whether new indexes take upstream's `vm8` layout (pack.rs `use_vm8`).
 bool turbovec_cpu_vm8();
+// Upstream's TURBOVEC_2BIT_VM8=1 opt-in (pack.rs `use_vm8_2bit`), read
+// once per process: 2-bit indexes take the `vm8` layout where `vm8` is
+// available, batches score them with SMMLA, and on aarch64 the staged
+// (planes) search is off.
+bool turbovec_vm8_2bit_enabled();
 
 // In-memory layout of a TurboVec blocked cache.
 enum TurboVecLayout : uint8_t {
@@ -679,6 +686,9 @@ bool turbovec_wants_vm8(int bits, int dim);
 // fma(sum, scale, bias) times the vector's scale.
 struct TurboVecPermuteDot {
     int8_t levels[16] = {};
+    // 2-bit operand set only (upstream H72): levels[i] = level[i & 3] and
+    // levels2[i] = level[(i >> 2) & 3].
+    int8_t levels2[16] = {};
     // One int8 weight per dimension, in dimension order.
     std::vector<int8_t> weights;
     // The lone-query weights over the vm8 layout (4-bit, when the
@@ -688,6 +698,9 @@ struct TurboVecPermuteDot {
     float bias = 0.0f;
 };
 void build_turbovec_permute_dot(const float * query, int dim, TurboVecPermuteDot & out);
+// The 2-bit SMMLA operand set of a 2-bit vm8 index (upstream
+// `build_permute_dot_2bit`).
+void build_turbovec_permute_dot_2bit(const float * query, int dim, TurboVecPermuteDot & out);
 void score_turbovec_permute_dot_block(
     const TurboVecPermuteDot & pd,
     const uint8_t * blocked_codes,
@@ -699,10 +712,11 @@ void score_turbovec_permute_dot_block(
     float * out_scores);
 // Upstream's fused permute-dot batches: 4, 8 or 12 queries over one block,
 // sharing the code loads (pd_scan widths). 4-bit codes in the vm or vm8
-// layout.
+// layout, or 2-bit codes in vm8 (TURBOVEC_2BIT_VM8).
 inline constexpr int kTurboVecMaxBatch = 12;
 struct TurboVecPermuteDotBatch {
     int n = 0;
+    int bits = 4;
     TurboVecLayout layout = kTurboVecLayoutSeq;
     const TurboVecPermuteDot * pds[kTurboVecMaxBatch] = {};
     // SMMLA A operands for the batch, built once by prepare.
@@ -982,6 +996,19 @@ void repack_turbovec_codes_from_slot(
     TurboVecLayout layout = kTurboVecLayoutSeq,
     int n_threads = 1);
 void score_turbovec_lut_block(
+    const uint8_t * lut,
+    float lut_scale,
+    float lut_bias,
+    const uint8_t * blocked_codes,
+    const float * vector_scales,
+    size_t block_index,
+    size_t n_vectors,
+    int bits,
+    int dim,
+    float * out_scores);
+// score_turbovec_lut_block over a vm8 block (2-bit indexes under
+// TURBOVEC_2BIT_VM8), bit-identical to it on the same codes.
+void score_turbovec_lut_block_vm8(
     const uint8_t * lut,
     float lut_scale,
     float lut_bias,

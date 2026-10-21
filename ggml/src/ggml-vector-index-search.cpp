@@ -488,6 +488,12 @@ void score_turbovec_lut_block_for(
         size_t block,
         float * out_scores) {
     const size_t n_slots = idx.slot_to_id.size();
+    if (idx.turbovec_blocked_vm8) {
+        score_turbovec_lut_block_vm8(
+            lut, lut_scale, lut_bias, idx.turbovec_blocked_data.data(), idx.turbovec_scale.data(), block, n_slots,
+            idx.turbovec_bits, idx.dim, out_scores);
+        return;
+    }
 #if defined(GGML_VEC_INDEX_HAVE_AVX2_KERNEL) && !GGML_VEC_INDEX_USE_NEON && GGML_VEC_INDEX_TURBOVEC_AVX2_LAYOUT
     static const bool has_turbovec_avx2 = cpu_has_avx2();
     if (has_turbovec_avx2) {
@@ -503,9 +509,10 @@ void score_turbovec_lut_block_for(
         idx.turbovec_bits, idx.dim, out_scores);
 }
 
-// Whether batches score with permute-dot operands (upstream `pd_batched`).
+// Whether batches score with permute-dot operands (upstream `pd_batched`):
+// 4-bit permute-dot indexes, and 2-bit indexes in the vm8 layout.
 bool turbovec_pd_batched(const ggml_vec_index_t & idx) {
-    return turbovec_uses_permute_dot(idx);
+    return turbovec_uses_permute_dot(idx) || (idx.turbovec_bits == 2 && idx.turbovec_blocked_vm8);
 }
 
 struct TurboVecQueryLut {
@@ -821,7 +828,11 @@ void search_turbovec_query_batch(
 
         if (pd_batched) {
             // The permute-dot kernels carry the TQ+ correction in their bias.
-            build_turbovec_permute_dot(score_queries[query], idx.dim, scratch.permute_dots[query]);
+            if (bits == 4) {
+                build_turbovec_permute_dot(score_queries[query], idx.dim, scratch.permute_dots[query]);
+            } else {
+                build_turbovec_permute_dot_2bit(score_queries[query], idx.dim, scratch.permute_dots[query]);
+            }
             scratch.permute_dots[query].bias = tqplus_bias;
             continue;
         }
@@ -840,6 +851,7 @@ void search_turbovec_query_batch(
     TurboVecPermuteDotBatch & pd_batch = scratch.pd_batch;
     if (pd_batched) {
         pd_batch.n = n;
+        pd_batch.bits = bits;
         pd_batch.layout = turbovec_layout(idx);
         for (int query = 0; query < n; ++query) {
             pd_batch.pds[query] = &scratch.permute_dots[query];
@@ -1261,9 +1273,11 @@ static int ggml_vec_index_search_impl(
                  per_query_scratch);
         const bool batch_scratch_is_bounded =
             batch_query_scratch <= 2 * single_query_scratch;
-        bool batch_required = false;
+        // A 2-bit vm8 batch scores differently from the single-query LUT
+        // scan, so it batches whenever upstream does (filters included).
+        bool batch_required = pd_batched && batch_bits == 2;
 #ifdef GGML_VEC_INDEX_TEST_HOOKS
-        batch_required = g_turbovec_force_batches.load(std::memory_order_relaxed);
+        batch_required = batch_required || g_turbovec_force_batches.load(std::memory_order_relaxed);
 #endif
         if (is_turbovec(*idx) &&
             !(idx->turbovec_planes && idx->turbovec_staged_enabled) &&
