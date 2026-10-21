@@ -633,6 +633,7 @@ int turbovec_sync_plan_for_test(
     std::vector<std::vector<std::pair<uint64_t, std::vector<uint8_t>>>> & batches);
 void turbovec_force_vector_major_for_test(int mode);
 void turbovec_disable_dot_product_for_test(int disabled);
+int vec_index_simd_kernel_built_for_test(int id);
 // -1 follows the build, 0 or 1 forces upstream's aarch64 or x86 rules for
 // indexes created afterwards (turbovec_x86_rules).
 void turbovec_force_x86_rules_for_test(int mode);

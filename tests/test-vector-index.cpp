@@ -189,6 +189,7 @@ int turbovec_encode_kernel_parity_for_test(int kernel);
 int turbovec_layout_kernel_parity_for_test(int kernel);
 int vector_validation_kernel_parity_for_test(int kernel);
 int crc32c_kernel_parity_for_test(int kernel);
+int vec_index_simd_kernel_built_for_test(int id);
 int turbovec_search_kernel_parity_for_test(int kernel);
 int turbovec_vpermb_reference_search_for_test(
     const ggml_vec_index_t * idx,
@@ -4798,7 +4799,30 @@ void check_turbovec_1x_golden_case(const Tv1xIndexCase & c, int kernel) {
 // A SIMD kernel's parity status: 1 matched its scalar reference bit for bit,
 // 0 did not, -1 this build or CPU cannot run it (x86 kernels on an arm64
 // host; CI's x86 runners execute them).
-void check_simd_parity_status(const char * what, const char * kernel, int status, bool required) {
+// Kernels this compiler always builds (see vec_index_simd_kernel_built_for_test
+// for the ids): every x86 object under GCC and Clang, and NEON and the ARMv8
+// CRC32 path on aarch64. A missing one means the build dropped it quietly.
+bool simd_kernel_always_built(int id) {
+#if (defined(__x86_64__) || defined(_M_X64)) && (defined(__GNUC__) || defined(__clang__)) && !defined(_MSC_VER)
+    return id == 1 || id == 2 || id == 3 || id == 5 || id == 6 || id == 7 || id == 8 || id == 9;
+#elif defined(__aarch64__)
+    return id == 0 || id == 4;
+#else
+    (void) id;
+    return false;
+#endif
+}
+
+// A parity hook returns 1 on a match, 0 on a mismatch and -1 when the build
+// or CPU lacks the kernel; `built_id` tells those two apart, and `required`
+// says the CPU certainly has the kernel. A negative id: always built.
+void check_simd_parity_status(const char * what, const char * kernel, int status, bool required, int built_id) {
+    if (built_id >= 0 && vec_index_simd_kernel_built_for_test(built_id) == 0) {
+        CHECK(!simd_kernel_always_built(built_id));
+        CHECK(status < 0);
+        std::printf("SKIP %s %s parity (not built)\n", what, kernel);
+        return;
+    }
     if (status < 0) {
         CHECK(!required);
         std::printf("SKIP %s %s parity\n", what, kernel);
@@ -4815,32 +4839,44 @@ void check_simd_kernel_parity() {
 #endif
     // Rotation (Walsh-Hadamard, gather, norm), encode and input validation.
     static const char * const simd_names[] = { "NEON", "AVX2", "AVX-512" };
+    static const int simd_built_ids[] = { 0, 1, 2 };
     for (int kernel = 0; kernel < 3; ++kernel) {
         const bool required = kernel == 0 && arm64;
+        const int built_id = simd_built_ids[kernel];
         check_simd_parity_status(
-            "TurboVec rotation", simd_names[kernel], turbovec_rotation_kernel_parity_for_test(kernel), required);
+            "TurboVec rotation", simd_names[kernel], turbovec_rotation_kernel_parity_for_test(kernel), required,
+            built_id);
         if (kernel < 2) {
             check_simd_parity_status(
-                "TurboVec encode", simd_names[kernel], turbovec_encode_kernel_parity_for_test(kernel), required);
+                "TurboVec encode", simd_names[kernel], turbovec_encode_kernel_parity_for_test(kernel), required,
+                built_id);
             check_simd_parity_status(
-                "vector validation", simd_names[kernel], vector_validation_kernel_parity_for_test(kernel), required);
+                "vector validation", simd_names[kernel], vector_validation_kernel_parity_for_test(kernel), required,
+                built_id);
         }
     }
     // x86 search-layout interleave; the whole-block helpers run everywhere.
-    check_simd_parity_status("TurboVec layout", "SSSE3", turbovec_layout_kernel_parity_for_test(0), false);
-    check_simd_parity_status("TurboVec layout", "AVX2", turbovec_layout_kernel_parity_for_test(1), false);
-    check_simd_parity_status("TurboVec layout", "block helpers", turbovec_layout_kernel_parity_for_test(2), true);
+    check_simd_parity_status("TurboVec layout", "SSSE3", turbovec_layout_kernel_parity_for_test(0), false, 3);
+    check_simd_parity_status("TurboVec layout", "AVX2", turbovec_layout_kernel_parity_for_test(1), false, 1);
+    check_simd_parity_status("TurboVec layout", "block helpers", turbovec_layout_kernel_parity_for_test(2), true, -1);
     // Hardware CRC-32C against the table loop.
-    check_simd_parity_status("CRC-32C", "ARMv8 CRC32", crc32c_kernel_parity_for_test(0), false);
-    check_simd_parity_status("CRC-32C", "SSE4.2", crc32c_kernel_parity_for_test(1), false);
+#if defined(__APPLE__) && defined(__aarch64__)
+    constexpr bool always_crc32 = true;  // every Apple arm64 CPU has it
+#else
+    constexpr bool always_crc32 = false;
+#endif
+    check_simd_parity_status("CRC-32C", "ARMv8 CRC32", crc32c_kernel_parity_for_test(0), always_crc32, 4);
+    check_simd_parity_status("CRC-32C", "SSE4.2", crc32c_kernel_parity_for_test(1), false, 5);
     // The x86 search kernels against their scalar models.
     static const char * const search_names[] = {
         "AVX-512 VNNI vpermb scan", "AVX-512 VNNI permute-dot", "AVX-512 GFNI permute-dot", "AVX-512 VNNI exact4",
         "AVX-512 BW LUT pair", "AVX2 4-query LUT", "AVX-512 BW low masks", "AVX-512 VPOPCNTDQ low dot",
     };
+    static const int search_built_ids[] = { 6, 6, 7, 6, 8, 1, 8, 9 };
     for (int kernel = 0; kernel < 8; ++kernel) {
         check_simd_parity_status(
-            "TurboVec search", search_names[kernel], turbovec_search_kernel_parity_for_test(kernel), false);
+            "TurboVec search", search_names[kernel], turbovec_search_kernel_parity_for_test(kernel), false,
+            search_built_ids[kernel]);
     }
 }
 
@@ -5413,7 +5449,12 @@ void check_turbovec_1x_threads() {
         CHECK(bytes[0] == bytes[1]);
         CHECK(out[0] == out[1]);
         CHECK(scores[0] == scores[1]);
-        CHECK(std::equal(out[0].begin(), out[0].begin() + 10, out[0].begin() + 90));
+        // A batch's first query equals the lone query, except under
+        // upstream's 2-bit vm8 opt-in, whose batches score differently.
+        const char * vm8_2bit = std::getenv("TURBOVEC_2BIT_VM8");
+        if (bits != 2 || vm8_2bit == nullptr || std::strcmp(vm8_2bit, "1") != 0) {
+            CHECK(std::equal(out[0].begin(), out[0].begin() + 10, out[0].begin() + 90));
+        }
 #ifdef GGML_VEC_INDEX_TEST_HOOKS
         // The state hash an add and a calibrate keep over 8 threads is the
         // one a single-threaded load rebuilds.
@@ -6502,6 +6543,9 @@ void check_turbovec_1x_staged(int x86_rules) {
 // bit. Scores no fixture records, since upstream generates its fixtures on
 // aarch64; the reference is the formula upstream's kernel computes.
 void check_turbovec_1x_vpermb() {
+    // The aarch64-rule indexes below are sequential, whatever the 2-bit
+    // vm8 opt-in in the environment says.
+    turbovec_force_vm8_2bit_for_test(0);
     turbovec_force_x86_rules_for_test(1);
     turbovec_force_vector_major_for_test(1);
     turbovec_force_batches_for_test(1);
@@ -6580,7 +6624,7 @@ void check_turbovec_1x_vpermb() {
     }
     turbovec_force_batches_for_test(0);
     turbovec_force_vector_major_for_test(-1);
-    turbovec_force_x86_rules_for_test(0);
+    turbovec_force_x86_rules_for_test(0);    turbovec_force_vm8_2bit_for_test(-1);
 }
 #endif
 
@@ -7416,6 +7460,72 @@ void check_turbovec_1x_streamed_snapshots() {
 }
 #endif
 
+#ifdef GGML_VEC_INDEX_TEST_HOOKS
+// Batches with threads to spare split their blocks across them; the result
+// equals one thread's for every batch kernel (4-bit permute-dot on the
+// default and forced-vm8 layouts, the 2-bit vm8 opt-in, the LUT scan).
+void check_turbovec_1x_batch_block_split() {
+    constexpr int dim = 64;
+    constexpr int n = 33000;
+    const std::vector<float> rows = tv1x_rows(kTv1xSeedDb, n, dim);
+    const std::vector<float> queries = tv1x_rows(kTv1xSeedQuery, 13, dim);
+    const std::vector<uint64_t> ids = tv1x_ids(n);
+    std::vector<uint64_t> allowed;
+    for (int i = 0; i < n; i += 3) {
+        allowed.push_back(ids[static_cast<size_t>(i)]);
+    }
+    struct Mode {
+        int bits;
+        int vm8;
+        int vm8_2bit;
+    };
+    for (const Mode mode : { Mode{ 4, -1, 0 }, Mode{ 4, 1, 0 }, Mode{ 2, -1, 1 }, Mode{ 3, -1, 0 } }) {
+        turbovec_force_vm8_for_test(mode.vm8);
+        turbovec_force_vm8_2bit_for_test(mode.vm8_2bit);
+        auto * tv = ggml_vec_index_create_turbovec(dim, mode.bits);
+        CHECK(ggml_vec_index_add(tv, rows.data(), n, ids.data()) == GGML_VEC_INDEX_OK);
+        CHECK(ggml_vec_index_turbovec_set_staged(tv, 0) == GGML_VEC_INDEX_OK);
+        for (const int nq : { 4, 8, 12, 13 }) {
+            std::vector<float> scores[2];
+            std::vector<uint64_t> out[2];
+            for (int run = 0; run < 2; ++run) {
+                CHECK(ggml_vec_index_set_threads(tv, run == 0 ? 1 : 8) == GGML_VEC_INDEX_OK);
+                scores[run].assign(static_cast<size_t>(nq) * 20, 0.0f);
+                out[run].assign(scores[run].size(), 0);
+                CHECK(ggml_vec_index_search(tv, queries.data(), nq, 10, scores[run].data(), out[run].data()) ==
+                      GGML_VEC_INDEX_OK);
+                CHECK(ggml_vec_index_search_filtered(
+                          tv, queries.data(), nq, 10, allowed.data(), static_cast<int>(allowed.size()),
+                          scores[run].data() + nq * 10, out[run].data() + nq * 10) == GGML_VEC_INDEX_OK);
+            }
+            CHECK(out[0] == out[1]);
+            CHECK(scores[0] == scores[1]);
+        }
+        // Syncs from this layout reload byte for byte, threads on.
+        const std::string path =
+            (std::filesystem::temp_directory_path() / "ggml-vector-index-tv1x-split-sync.tvim").string();
+        std::filesystem::remove(path);
+        CHECK(ggml_vec_index_sync(tv, path.c_str()) == GGML_VEC_INDEX_OK);
+        for (int i = 0; i < n; i += 997) {
+            CHECK(ggml_vec_index_remove(tv, ids[static_cast<size_t>(i)]) == GGML_VEC_INDEX_OK);
+        }
+        // Re-add the first removed rows (row 0 and row 997).
+        CHECK(ggml_vec_index_add(tv, rows.data(), 1, ids.data()) == GGML_VEC_INDEX_OK);
+        CHECK(ggml_vec_index_add(tv, rows.data() + 997 * dim, 1, ids.data() + 997) == GGML_VEC_INDEX_OK);
+        CHECK(ggml_vec_index_sync(tv, path.c_str()) == GGML_VEC_INDEX_OK);
+        auto * loaded = ggml_vec_index_load(path.c_str());
+        CHECK(loaded != nullptr);
+        CHECK(tv1x_snapshot_bytes(loaded, "ggml-vector-index-tv1x-split-l.tvim") ==
+              tv1x_snapshot_bytes(tv, "ggml-vector-index-tv1x-split-t.tvim"));
+        ggml_vec_index_free(loaded);
+        std::filesystem::remove(path);
+        ggml_vec_index_free(tv);
+    }
+    turbovec_force_vm8_for_test(-1);
+    turbovec_force_vm8_2bit_for_test(-1);
+}
+#endif
+
 void check_turbovec_1x() {
     for (const Tv1xIndexCase & c : kTv1xIndexCases) {
 #ifdef GGML_VEC_INDEX_TEST_HOOKS
@@ -7516,6 +7626,7 @@ int main(int argc, char ** argv) {
             check_vector_index_pool();
             check_turbovec_1x_concurrent_search();
             check_turbovec_1x_staged_maintenance();
+            check_turbovec_1x_batch_block_split();
             check_turbovec_1x_single_code_copy();
             check_turbovec_1x_streamed_snapshots();
             check_write_with_durability();

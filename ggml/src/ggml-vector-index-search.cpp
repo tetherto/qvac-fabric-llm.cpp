@@ -857,7 +857,8 @@ void search_turbovec_query_batch(
         uint64_t * out_ids,
         const uint8_t * block_filter,
         const uint8_t * allowed_mask,
-        TurboVecBatchScratch & scratch) {
+        TurboVecBatchScratch & scratch,
+        int block_threads) {
     const size_t n_slots = idx.slot_to_id.size();
     const size_t dim_sz = static_cast<size_t>(idx.dim);
     const int bits = idx.turbovec_bits;
@@ -942,13 +943,6 @@ void search_turbovec_query_batch(
     }
 
     const float * vector_scales = idx.turbovec_scale.data();
-    std::array<std::array<float, 64>, kTurboVecMaxBatch> block_scores{};
-    float * block_score_ptrs[kTurboVecMaxBatch];
-    float * second_block_ptrs[kTurboVecMaxBatch];
-    for (int query = 0; query < kTurboVecMaxBatch; ++query) {
-        block_score_ptrs[query] = block_scores[query].data();
-        second_block_ptrs[query] = block_scores[query].data() + 32;
-    }
     // The 4-query LUT scan takes blocks in pairs on x86 (upstream's
     // AVX-512 BW kernel); everything else one block at a time.
 #if defined(__x86_64__) || defined(_M_X64)
@@ -957,8 +951,17 @@ void search_turbovec_query_batch(
     const size_t group = 1;
 #endif
     const size_t n_blocks = idx.turbovec_blocked_n_blocks;
-    for (size_t first = 0; first < n_blocks; first += group) {
-        const size_t n_group = std::min(group, n_blocks - first);
+    // Scores blocks [block_begin, block_end) into one top-k heap per query.
+    auto scan = [&](size_t block_begin, size_t block_end, std::vector<ScoreId> * heaps) {
+    std::array<std::array<float, 64>, kTurboVecMaxBatch> block_scores{};
+    float * block_score_ptrs[kTurboVecMaxBatch];
+    float * second_block_ptrs[kTurboVecMaxBatch];
+    for (int query = 0; query < kTurboVecMaxBatch; ++query) {
+        block_score_ptrs[query] = block_scores[query].data();
+        second_block_ptrs[query] = block_scores[query].data() + 32;
+    }
+    for (size_t first = block_begin; first < block_end; first += group) {
+        const size_t n_group = std::min(group, block_end - first);
         bool any_allowed = block_filter == nullptr;
         for (size_t b = 0; b < n_group && !any_allowed; ++b) {
             any_allowed = block_filter[first + b] != 0;
@@ -1024,9 +1027,40 @@ void search_turbovec_query_batch(
                             lut_biases[query]);
                     }
                     update_topk_heap(
-                        scratch.heaps[query],
+                        heaps[query],
                         k,
                         { score, topk_key(idx, slot) });
+                }
+            }
+        }
+    }
+    };
+
+    // A batch with threads to spare splits its blocks into ranges, each with
+    // its own heaps, merged under the strict (score, key) order, so the split
+    // cannot change the result (as a lone query's block split).
+    size_t n_scored = n_blocks;
+    if (block_filter != nullptr) {
+        n_scored = static_cast<size_t>(std::count(block_filter, block_filter + n_blocks, uint8_t{ 1 }));
+    }
+    if (block_threads <= 1 || n_scored < kTurboVecParallelMinBlocks) {
+        scan(0, n_blocks, scratch.heaps.data());
+    } else {
+        const size_t n_ranges = static_cast<size_t>(block_threads) * 4;
+        size_t per_range = (n_blocks + n_ranges - 1) / n_ranges;
+        per_range = (per_range + group - 1) / group * group;
+        std::vector<std::array<std::vector<ScoreId>, kTurboVecMaxBatch>> range_heaps(n_ranges);
+        parallel_for(n_ranges, block_threads, [&](size_t range, size_t) {
+            const size_t begin = range * per_range;
+            const size_t end = std::min(n_blocks, begin + per_range);
+            if (begin < end) {
+                scan(begin, end, range_heaps[range].data());
+            }
+        });
+        for (int query = 0; query < n; ++query) {
+            for (const auto & heaps : range_heaps) {
+                for (const ScoreId & candidate : heaps[query]) {
+                    update_topk_heap(scratch.heaps[query], k, candidate);
                 }
             }
         }
@@ -1532,7 +1566,12 @@ static int ggml_vec_index_search_impl(
         // split its blocks.
         const size_t n_batches = batches.size();
         const size_t n_tasks = n_batches + static_cast<size_t>(n_q - n_batched);
-        const int query_threads = n_tasks >= 2 ? idx->n_threads : 1;
+        // Fewer tasks than threads on a large index: run the tasks in turn,
+        // each splitting its blocks, so every thread has work (upstream tiles
+        // a batch over block ranges the same way).
+        const bool split_blocks = n_tasks < static_cast<size_t>(idx->n_threads) && is_turbovec(*idx) &&
+            idx->turbovec_blocked_n_blocks >= kTurboVecParallelMinBlocks;
+        const int query_threads = n_tasks >= 2 && !split_blocks ? idx->n_threads : 1;
         const int block_threads = query_threads > 1 ? 1 : idx->n_threads;
         std::vector<Scratch> scratch(std::max<size_t>(1, std::min(n_tasks, static_cast<size_t>(query_threads))));
         // Per query: did upstream's sampled seed leave its shortlist short?
@@ -1552,7 +1591,8 @@ static int ggml_vec_index_search_impl(
                     out_ids + q * k_sz,
                     batch_blocks.empty() ? nullptr : batch_blocks.data(),
                     batch_mask.empty() ? nullptr : batch_mask.data(),
-                    sc.batch);
+                    sc.batch,
+                    block_threads);
                 return;
             }
 #endif

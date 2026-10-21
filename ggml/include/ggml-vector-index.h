@@ -126,14 +126,15 @@ GGML_VEC_INDEX_API int ggml_vec_index_turbovec_calibrate(
 
 // Staged search for a TurboVec 1.x index, on by default. From 32,768
 // vectors at 2 or 4 bits and dimensions that are multiples of 32, on hosts
-// where upstream turbovec runs it (aarch64; 4 bits needs the dot-product
-// extension), a search scans the sign planes for a shortlist, ranks it with
-// the lower planes and rescores the best few exactly: returned scores are
-// the full scan's, but the ids can differ from a full scan's (on random data
-// 77-94% of a top 10 overlaps it, as with upstream).
-// A staged search runs on the calling thread. Pass 0 to always scan the
-// whole index; that also drops the planes caches. Legacy and 3-bit indexes
-// accept the call but never search in stages.
+// where upstream turbovec runs it (aarch64, where 4 bits needs the
+// dot-product extension, and x86 with AVX-512 F, BW, VBMI and VNNI; not
+// under TURBOVEC_2BIT_VM8=1), a search scans the sign planes for a
+// shortlist, ranks it with the lower planes and rescores the best few
+// exactly: returned scores are the full scan's, but the ids can differ from
+// a full scan's (on random data 77-94% of a top 10 overlaps it, as with
+// upstream). Pass 0 to always scan the whole index; that also drops the
+// planes caches. Legacy and 3-bit indexes accept the call but never search
+// in stages.
 GGML_VEC_INDEX_API int ggml_vec_index_turbovec_set_staged(ggml_vec_index_t * idx, int enabled);
 
 // Returns 1 when a TurboVec index holds a committed TQ+ calibration.
@@ -143,9 +144,10 @@ GGML_VEC_INDEX_API void ggml_vec_index_free(ggml_vec_index_t * idx);
 
 // Worker threads search, add and TurboVec calibration may use, including
 // the calling thread; 1 (the default) runs every call on the calling thread.
-// Query batches are split across threads, and a single full-scan TurboVec
-// query over 32,768 or more vectors splits its blocks (a staged search stays
-// on one thread). Results do not depend on the thread count. `n_threads` must be in 1..256.
+// Queries are split across threads; when a search has fewer queries or
+// batches than threads, each splits the blocks of a TurboVec index of
+// 32,768 or more vectors instead, staged searches included. Results do not
+// depend on the thread count. `n_threads` must be in 1..256.
 GGML_VEC_INDEX_API int ggml_vec_index_set_threads(ggml_vec_index_t * idx, int n_threads);
 GGML_VEC_INDEX_API int ggml_vec_index_threads(const ggml_vec_index_t * idx);
 
