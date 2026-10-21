@@ -7,7 +7,6 @@
 
 #include "ggml-vector-index-x86.h"
 
-#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -280,6 +279,21 @@ double turbovec_quantize_row_avx2(
 // testing |x| < max_abs eight lanes at a time (NaN, Inf and over-magnitude
 // values all fail), with the exact scalar predicate pinpointing the first
 // invalid element of a flagged group. Returns n when every element is valid.
+// The scalar predicate !isfinite(x) || fabs(x) >= max_abs on the bits, so
+// this object instantiates no <cmath> inline function: an AVX2-built copy
+// of one could be the copy baseline code links against.
+static bool invalid_abs(float x, float max_abs) {
+    uint32_t bits = 0;
+    std::memcpy(&bits, &x, sizeof(bits));
+    bits &= 0x7fffffffu;
+    if (bits >= 0x7f800000u) {
+        return true;
+    }
+    float magnitude = 0.0f;
+    std::memcpy(&magnitude, &bits, sizeof(magnitude));
+    return magnitude >= max_abs;
+}
+
 size_t first_invalid_abs_avx2(const float * values, size_t n, float max_abs) {
     const __m256 bound = _mm256_set1_ps(max_abs);
     const __m256 abs_mask = _mm256_castsi256_ps(_mm256_set1_epi32(0x7fffffff));
@@ -289,14 +303,14 @@ size_t first_invalid_abs_avx2(const float * values, size_t n, float max_abs) {
         const __m256 ok = _mm256_cmp_ps(_mm256_and_ps(x, abs_mask), bound, _CMP_LT_OQ);
         if (_mm256_movemask_ps(ok) != 0xff) {
             for (size_t j = i; j < i + 8; ++j) {
-                if (!std::isfinite(values[j]) || std::fabs(values[j]) >= max_abs) {
+                if (invalid_abs(values[j], max_abs)) {
                     return j;
                 }
             }
         }
     }
     for (; i < n; ++i) {
-        if (!std::isfinite(values[i]) || std::fabs(values[i]) >= max_abs) {
+        if (invalid_abs(values[i], max_abs)) {
             return i;
         }
     }
