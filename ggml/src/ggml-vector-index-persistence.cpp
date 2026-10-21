@@ -436,36 +436,51 @@ int snapshot_write_v1_preflight(size_t n, size_t dim) {
     return GGML_VEC_INDEX_OK;
 }
 
-// The part after `<base>.tmp.` of a temp name this file or upstream
-// turbovec writes: six alphanumerics (POSIX mkstemp), `pid.tid.sequence`
-// (Windows), or upstream's `pid.seq` and `pid.seq.hex8`.
+// The part after `<base>.tmp.` of a temp name: `pid.seq.hex8`, as both this
+// file and upstream turbovec name their temps (`pid.seq` from upstream's
+// older writers). The sweep reclaims only these shapes, so a user's own
+// `<name>.tmp.backup` never matches.
 static bool is_temp_suffix(const std::string & suffix) {
-    if (suffix.size() == 6 &&
-        std::all_of(suffix.begin(), suffix.end(), [](char c) { return std::isalnum(static_cast<unsigned char>(c)) != 0; })) {
-        return true;
-    }
     auto digits = [](const std::string & part) {
         return !part.empty() && std::all_of(part.begin(), part.end(), [](char c) { return c >= '0' && c <= '9'; });
     };
-    std::vector<std::string> parts;
-    size_t from = 0;
-    for (size_t dot = suffix.find('.'); ; dot = suffix.find('.', from)) {
-        parts.push_back(suffix.substr(from, dot == std::string::npos ? std::string::npos : dot - from));
-        if (dot == std::string::npos || parts.size() > 3) {
-            break;
-        }
-        from = dot + 1;
-    }
-    if (parts.size() < 2 || parts.size() > 3 || !digits(parts[0]) || !digits(parts[1])) {
+    const size_t first = suffix.find('.');
+    if (first == std::string::npos) {
         return false;
     }
-    if (parts.size() == 2) {
+    const size_t second = suffix.find('.', first + 1);
+    if (!digits(suffix.substr(0, first)) ||
+        !digits(suffix.substr(first + 1, second == std::string::npos ? std::string::npos : second - first - 1))) {
+        return false;
+    }
+    if (second == std::string::npos) {
         return true;
     }
-    const std::string & last = parts[2];
-    return digits(last) ||
-        (last.size() == 8 &&
-         std::all_of(last.begin(), last.end(), [](char c) { return std::isxdigit(static_cast<unsigned char>(c)) != 0; }));
+    const std::string rand = suffix.substr(second + 1);
+    return rand.size() == 8 &&
+        std::all_of(rand.begin(), rand.end(), [](char c) { return std::isxdigit(static_cast<unsigned char>(c)) != 0; });
+}
+
+// A fresh `.tmp.pid.seq.hex8` suffix (upstream io.rs tmp_sibling): the
+// process id, a per-process sequence and 32 bits that keep two processes
+// with the same id (in different containers) apart.
+static std::string next_temp_suffix() {
+    static std::atomic<uint64_t> sequence{ 0 };
+#ifdef _WIN32
+    const uint64_t pid = static_cast<uint64_t>(GetCurrentProcessId());
+#else
+    const uint64_t pid = static_cast<uint64_t>(::getpid());
+#endif
+    const uint64_t seq = sequence.fetch_add(1);
+    uint64_t x = static_cast<uint64_t>(std::chrono::steady_clock::now().time_since_epoch().count()) ^
+        (pid << 32) ^ (seq * UINT64_C(0x9e3779b97f4a7c15));
+    x = (x ^ (x >> 30)) * UINT64_C(0xbf58476d1ce4e5b9);
+    x = (x ^ (x >> 27)) * UINT64_C(0x94d049bb133111eb);
+    x ^= x >> 31;
+    char suffix[64];
+    std::snprintf(suffix, sizeof(suffix), ".tmp.%llu.%llu.%08x", static_cast<unsigned long long>(pid),
+                  static_cast<unsigned long long>(seq), static_cast<unsigned>(x & 0xffffffffu));
+    return suffix;
 }
 
 // The basename a writer uses for `base`'s temp with this suffix: the whole
@@ -637,17 +652,13 @@ static bool open_temp_file(const char * path, TempFile & temp) {
     if (!utf8_to_wide(path, destination)) {
         return false;
     }
-    static std::atomic<uint64_t> sequence{ 0 };
     for (int attempt = 0; attempt < 128; ++attempt) {
-        wchar_t suffix[96];
-        std::swprintf(suffix, sizeof(suffix) / sizeof(suffix[0]), L".tmp.%lu.%lu.%llu",
-                      static_cast<unsigned long>(GetCurrentProcessId()),
-                      static_cast<unsigned long>(GetCurrentThreadId()),
-                      static_cast<unsigned long long>(sequence.fetch_add(1)));
+        const std::string ascii_suffix = next_temp_suffix();
+        const std::wstring suffix(ascii_suffix.begin(), ascii_suffix.end());
         // Keep the temp's file name within NAME_MAX for long destinations.
         std::wstring base = destination;
         const size_t name_at = base.find_last_of(L"\\/") == std::wstring::npos ? 0 : base.find_last_of(L"\\/") + 1;
-        const size_t suffix_len = std::wcslen(suffix);
+        const size_t suffix_len = suffix.size();
         if (base.size() - name_at + suffix_len > 255 && suffix_len < 255) {
             base.resize(name_at + 255 - suffix_len);
             if (!base.empty() && base.back() >= 0xd800 && base.back() <= 0xdbff) {
@@ -735,14 +746,20 @@ static std::string temp_sibling_base(const char * path, size_t suffix_len) {
 
 static bool open_temp_file(const char * path, TempFile & temp) {
     sweep_stale_temp_files(path);
-    std::string pattern = temp_sibling_base(path, std::strlen(".tmp.XXXXXX")) + ".tmp.XXXXXX";
-    std::vector<char> mutable_path(pattern.begin(), pattern.end());
-    mutable_path.push_back('\0');
-    const int fd = ::mkstemp(mutable_path.data());
+    int fd = -1;
+    for (int attempt = 0; attempt < 128 && fd < 0; ++attempt) {
+        const std::string suffix = next_temp_suffix();
+        const std::string candidate = temp_sibling_base(path, suffix.size()) + suffix;
+        fd = ::open(candidate.c_str(), O_CREAT | O_EXCL | O_RDWR | O_CLOEXEC, 0600);
+        if (fd >= 0) {
+            temp.path = candidate;
+        } else if (errno != EEXIST) {
+            return false;
+        }
+    }
     if (fd < 0) {
         return false;
     }
-    temp.path.assign(mutable_path.data());
 
     struct stat destination_stat;
     if (::stat(path, &destination_stat) == 0 && ::fchmod(fd, destination_stat.st_mode & 0777) != 0) {
