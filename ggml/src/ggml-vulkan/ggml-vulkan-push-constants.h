@@ -759,6 +759,31 @@ struct vk_op_gated_delta_net_push_constants {
     uint32_t K;
 };
 
+struct vk_op_gated_delta_net_deferred_push_constants {
+    uint32_t H, H_k, n_tokens, K;
+    uint32_t sq1, sq2, sq3; // q and k
+    uint32_t sv1, sv2, sv3;
+    uint32_t sg1, sg2, sg3;
+    uint32_t sb1, sb2, sb3;
+    uint32_t ss1, ss2, ss3;
+    uint32_t s_rec, rec_v, rec_g, rec_b;
+    uint32_t base_off;
+    uint32_t gates;
+    float    scale;
+    uint32_t q_off, k_off, v_off, g_off, b_off, s_off;
+};
+
+static_assert(sizeof(vk_op_gated_delta_net_deferred_push_constants) <= 128);
+
+struct vk_op_gdn_conv_deferred_push_constants {
+    uint32_t C, n_tokens, K, n_norm;
+    float    eps;
+    uint32_t sx1, sx2;
+    uint32_t s1, s2;
+    uint32_t s_hist;
+    uint32_t x_off;
+};
+
 struct vk_op_gated_delta_net_back_push_constants {
     uint32_t H;
     uint32_t n_tokens;
