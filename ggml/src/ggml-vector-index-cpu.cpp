@@ -208,7 +208,9 @@ bool turbovec_x86_rules() {
 }
 
 bool turbovec_cpu_i8mm() {
-    static const bool detected = detect_i8mm();
+    // Upstream `have_i8mm`: TURBOVEC_NO_I8MM (set at all) keeps the SDOT
+    // kernels and the vector-major layout.
+    static const bool detected = std::getenv("TURBOVEC_NO_I8MM") == nullptr && detect_i8mm();
     return detected && !g_i8mm_disabled.load(std::memory_order_relaxed);
 }
 
@@ -266,5 +268,69 @@ void turbovec_force_x86_rules_for_test(int mode) {
 
 void turbovec_disable_dot_product_for_test(int disabled) {
     g_dot_product_disabled.store(disabled != 0, std::memory_order_relaxed);
+}
+
+// Whether this build compiled the kernels a SIMD parity check exercises, so
+// a test can tell a kernel left out of the build from one this CPU lacks.
+// Ids: 0 NEON, 1 AVX2, 2 AVX-512 F, 3 SSSE3, 4 ARMv8 CRC32, 5 SSE4.2,
+// 6 AVX-512 VNNI, 7 AVX-512 GFNI, 8 AVX-512 BW, 9 AVX-512 VPOPCNTDQ.
+int vec_index_simd_kernel_built_for_test(int id) {
+    switch (id) {
+        case 0:
+            return GGML_VEC_INDEX_USE_NEON ? 1 : 0;
+        case 1:
+#if defined(GGML_VEC_INDEX_HAVE_AVX2_KERNEL)
+            return 1;
+#else
+            return 0;
+#endif
+        case 2:
+#if defined(GGML_VEC_INDEX_HAVE_AVX512_KERNEL)
+            return 1;
+#else
+            return 0;
+#endif
+        case 3:
+        case 5:
+#if defined(GGML_VEC_INDEX_HAVE_SSE42_KERNEL)
+            return 1;
+#else
+            return 0;
+#endif
+        case 4:
+            // persistence.cpp builds the ARMv8 CRC32 path under these.
+#if (defined(__aarch64__) || defined(_M_ARM64)) && !defined(__AARCH64EB__) && \
+    (defined(_MSC_VER) || defined(__ARM_FEATURE_CRC32) || defined(__clang__) || (defined(__GNUC__) && __GNUC__ >= 10))
+            return 1;
+#else
+            return 0;
+#endif
+        case 6:
+#if defined(GGML_VEC_INDEX_HAVE_VNNI_KERNEL)
+            return 1;
+#else
+            return 0;
+#endif
+        case 7:
+#if defined(GGML_VEC_INDEX_HAVE_VNNI_KERNEL) && defined(GGML_VEC_INDEX_HAVE_GFNI_KERNEL)
+            return 1;
+#else
+            return 0;
+#endif
+        case 8:
+#if defined(GGML_VEC_INDEX_HAVE_AVX512BW_KERNEL)
+            return 1;
+#else
+            return 0;
+#endif
+        case 9:
+#if defined(GGML_VEC_INDEX_HAVE_VPOPCNT_KERNEL)
+            return 1;
+#else
+            return 0;
+#endif
+        default:
+            return 0;
+    }
 }
 #endif
