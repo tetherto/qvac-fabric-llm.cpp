@@ -149,12 +149,7 @@ jobs:
         id: check_secret
         env:
           QDC_API_KEY: ${{ secrets.QDC_API_KEY }}
-        run: |
-          if [ -z "$QDC_API_KEY" ]; then
-            echo "::error::QDC_API_KEY is required for device validation"
-            exit 1
-          fi
-          echo "has-qdc-key=true" >> "$GITHUB_OUTPUT"
+        run: echo "has-qdc-key=${{ env.QDC_API_KEY != '' }}" >> "$GITHUB_OUTPUT"
 
       - name: Run QDC tests (${{ matrix.device }})
         if: steps.check_secret.outputs.has-qdc-key == 'true'
