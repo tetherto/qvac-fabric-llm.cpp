@@ -11990,9 +11990,12 @@ struct test_flash_attn_ext : public test_case {
     const bool v_is_view_of_k;
     const int64_t n_kv_max;
     const int64_t n_sparse_mask;
+    const float scale;
+    const int64_t packed_window; // -1: random mask, 0: full sequence, positive: symmetric window
 
     std::string vars() override {
-        return VARS_TO_STR17(hsk, hsv, nh, nr23, kv, nb, mask, sinks, max_bias, logit_softcap, prec, type_K, type_V, permute, kv_view, v_is_view_of_k, n_kv_max);
+        return VARS_TO_STR17(hsk, hsv, nh, nr23, kv, nb, mask, sinks, max_bias, logit_softcap, prec, type_K, type_V, permute, kv_view, v_is_view_of_k, n_kv_max) +
+            (packed_window < 0 ? "" : "," + VARS_TO_STR2(scale, packed_window));
     }
 
     double max_nmse_err() override {
@@ -12009,9 +12012,10 @@ struct test_flash_attn_ext : public test_case {
     test_flash_attn_ext(int64_t hsk = 128, int64_t hsv = 128, int64_t nh = 32, std::array<int64_t, 2> nr23 = {1, 1}, int64_t kv = 96, int64_t nb = 8,
                         bool mask = true, bool sinks = false, float max_bias = 0.0f, float logit_softcap = 0.0f, ggml_prec prec = GGML_PREC_F32,
                         ggml_type type_K = GGML_TYPE_F16, ggml_type type_V = GGML_TYPE_F16, std::array<int32_t, 4> permute = {0, 1, 2, 3},
-                        bool kv_view = true, bool v_is_view_of_k = false, int64_t n_kv_max = 0, int64_t n_sparse_mask = -1)
+                        bool kv_view = true, bool v_is_view_of_k = false, int64_t n_kv_max = 0, int64_t n_sparse_mask = -1, float scale = 0.0f, int64_t packed_window = -1)
         : hsk(hsk), hsv(hsv), nh(nh), nr23(nr23), kv(kv), nb(nb), mask(mask), sinks(sinks), max_bias(max_bias), logit_softcap(logit_softcap), prec(prec),
-          type_K(type_K), type_V(type_V), permute(permute), kv_view(kv_view), v_is_view_of_k(v_is_view_of_k), n_kv_max(n_kv_max), n_sparse_mask(n_sparse_mask < 0 ? n_kv_max : n_sparse_mask) {}
+          type_K(type_K), type_V(type_V), permute(permute), kv_view(kv_view), v_is_view_of_k(v_is_view_of_k), n_kv_max(n_kv_max), n_sparse_mask(n_sparse_mask < 0 ? n_kv_max : n_sparse_mask),
+          scale(scale == 0.0f ? 1.0f/sqrtf(hsk) : scale), packed_window(packed_window) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         const int64_t hsk_padded = GGML_PAD(hsk, ggml_blck_size(type_K));
@@ -12076,7 +12080,7 @@ struct test_flash_attn_ext : public test_case {
             ggml_set_name(s, "s");
         }
 
-        ggml_tensor * out = ggml_flash_attn_ext(ctx, q, k, v, m, 1.0f/sqrtf(hsk), max_bias, logit_softcap);
+        ggml_tensor * out = ggml_flash_attn_ext(ctx, q, k, v, m, scale, max_bias, logit_softcap);
         ggml_flash_attn_ext_add_sinks(out, s);
         ggml_flash_attn_ext_set_n_kv_max(out, n_kv_max);
         ggml_prec_set_acc(out, prec);
@@ -12091,7 +12095,18 @@ struct test_flash_attn_ext : public test_case {
                 // make the sink values more noticeable in order to trigger a test failure when the implementation is wrong
                 init_tensor_uniform(t, -10.0f, 10.0f);
             } else if (strcmp(t->name, "m") == 0) {
-                if (mode == MODE_GRAD) {
+                if (packed_window >= 0) {
+                    GGML_ASSERT(kv == nb && kv > 1);
+                    std::vector<ggml_fp16_t> data(ggml_nelements(t));
+                    for (size_t i = 0; i < data.size(); ++i) {
+                        const int64_t key = i % kv;
+                        const int64_t query = (i / kv) % nb;
+                        const bool same_sequence = (key < kv/2) == (query < kv/2);
+                        const bool in_window = packed_window == 0 || std::abs(key - query) <= packed_window;
+                        data[i] = ggml_fp32_to_fp16(same_sequence && in_window ? 0.0f : -INFINITY);
+                    }
+                    ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(ggml_fp16_t));
+                } else if (mode == MODE_GRAD) {
                     init_tensor_kq_mask_causal(t);
                 } else if (n_sparse_mask > 0) {
                     init_tensor_kq_mask_sparse(t, n_sparse_mask);
@@ -16047,6 +16062,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     // FLASH_ATTN_EXT causes GPU shader hangs on NVIDIA T4 (Turing) scalar FA path
     if (!getenv("GGML_SKIP_FLASH_ATTN")) {
+        // EmbeddingGemma 2 head sizes and scale, with two packed sequences and symmetric attention.
+        for (int64_t n : {65, 128}) {
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {2, 1}, n, n, true, false, 0.0f, 0.0f, GGML_PREC_F32,
+                GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, false, false, 0, -1, 1.0f, 16));
+            test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {4, 1}, n, n, true, false, 0.0f, 0.0f, GGML_PREC_F32,
+                GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, false, false, 0, -1, 1.0f, 0));
+        }
+
         // prefill-shaped cases with long KV (nb >= 32, kv >= 1024): covers the
         // XMX/GEMM-accelerated SYCL FA path which only activates for these shapes.
         for (int kv : { 1024, 2048, }) {
