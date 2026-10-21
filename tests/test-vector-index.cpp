@@ -84,6 +84,45 @@ GGML_VI_TEST_NOINLINE void operator delete(void * p, size_t) noexcept {
     std::free(p);
 }
 
+// The other forms, so every allocation the program makes pairs malloc with
+// free: a sanitizer's own nothrow or array operator new would otherwise
+// hand our free memory it allocated differently.
+void * operator new[](size_t size) {
+    return ::operator new(size);
+}
+
+void * operator new(size_t size, const std::nothrow_t &) noexcept {
+    try {
+        return ::operator new(size);
+    } catch (...) {
+        return nullptr;
+    }
+}
+
+void * operator new[](size_t size, const std::nothrow_t &) noexcept {
+    try {
+        return ::operator new(size);
+    } catch (...) {
+        return nullptr;
+    }
+}
+
+GGML_VI_TEST_NOINLINE void operator delete[](void * p) noexcept {
+    std::free(p);
+}
+
+GGML_VI_TEST_NOINLINE void operator delete[](void * p, size_t) noexcept {
+    std::free(p);
+}
+
+GGML_VI_TEST_NOINLINE void operator delete(void * p, const std::nothrow_t &) noexcept {
+    std::free(p);
+}
+
+GGML_VI_TEST_NOINLINE void operator delete[](void * p, const std::nothrow_t &) noexcept {
+    std::free(p);
+}
+
 #if defined(__GNUC__) && !defined(__clang__) && __GNUC__ >= 11
 #pragma GCC diagnostic pop
 #endif
