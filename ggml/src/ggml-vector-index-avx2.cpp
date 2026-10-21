@@ -1,12 +1,24 @@
 #include "ggml-vector-index-avx2.h"
 
-#include <algorithm>
 #include <cstddef>
 #include <immintrin.h>
-#include <limits>
+#include <cstring>
 
 namespace ggml_vec_index_detail {
 namespace {
+
+// Local stand-ins for the standard min and infinity: an AVX2-built copy of
+// a header inline function could be the copy baseline code links against.
+inline size_t min_size(size_t a, size_t b) {
+    return a < b ? a : b;
+}
+
+inline float negative_infinity() {
+    const uint32_t bits = 0xff800000u;
+    float value = 0.0f;
+    std::memcpy(&value, &bits, sizeof(value));
+    return value;
+}
 
 inline double horizontal_sum(__m256d v) {
     const __m128d lo  = _mm256_castpd256_pd128(v);
@@ -104,7 +116,7 @@ void score_turbovec_lut_block_avx2(
     constexpr size_t flush_every = 256;
     const size_t base_vector = block_index * block_size;
     const size_t block_offset = block_index * n_byte_groups * block_size;
-    const size_t valid_lanes = std::min(block_size, n_vectors - base_vector);
+    const size_t valid_lanes = min_size(block_size, n_vectors - base_vector);
     const __m256i nibble_mask = _mm256_set1_epi8(0x0f);
     const __m256 scale = _mm256_set1_ps(lut_scale);
     __m256 float_accum[4] = {
@@ -117,7 +129,7 @@ void score_turbovec_lut_block_avx2(
     const size_t n_batches = (n_byte_groups + flush_every - 1) / flush_every;
     for (size_t batch = 0; batch < n_batches; ++batch) {
         const size_t group_begin = batch * flush_every;
-        const size_t group_end = std::min(group_begin + flush_every, n_byte_groups);
+        const size_t group_end = min_size(group_begin + flush_every, n_byte_groups);
         __m256i accum[4] = {
             _mm256_setzero_si256(),
             _mm256_setzero_si256(),
@@ -181,7 +193,7 @@ void score_turbovec_lut_block_avx2(
         for (size_t lane = 0; lane < block_size; ++lane) {
             out_scores[lane] = lane < valid_lanes ?
                 decoded[lane] * vector_scales[base_vector + lane] :
-                -std::numeric_limits<float>::infinity();
+                negative_infinity();
         }
     }
 }
@@ -212,7 +224,7 @@ void score_turbovec_lut_block4_avx2(
     const size_t n_batches = (n_byte_groups + flush_every - 1) / flush_every;
     for (size_t batch = 0; batch < n_batches; ++batch) {
         const size_t g_start = batch * flush_every;
-        const size_t g_end = std::min(g_start + flush_every, n_byte_groups);
+        const size_t g_end = min_size(g_start + flush_every, n_byte_groups);
         __m256i accus[4][4];
         for (auto & qa : accus) {
             for (__m256i & a : qa) {

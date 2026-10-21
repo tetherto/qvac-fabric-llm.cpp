@@ -100,9 +100,10 @@ void turbovec_permute_dot_sums_gfni(
 // object): the staged search's bit-mask dot product.
 int64_t turbovec_low_dot_avx512(const uint8_t * masks, const uint8_t * row, size_t row_len);
 
-// ggml-vector-index-sse42.cpp (SSSE3 + SSE4.2 object).
+// ggml-vector-index-ssse3.cpp (SSSE3 object).
 void turbovec_interleave_ssse3(uint8_t * buf, size_t len);
 void turbovec_deinterleave_ssse3(const uint8_t * blocked, uint8_t * out, size_t len);
+// ggml-vector-index-sse42.cpp (SSE4.2 object).
 uint32_t crc32c_update_sse42(uint32_t crc, const uint8_t * data, size_t size);
 
 } // namespace ggml_vec_index_detail
