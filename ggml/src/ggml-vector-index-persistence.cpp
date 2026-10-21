@@ -1036,8 +1036,9 @@ uint32_t index_state_crc32c(const ggml_vec_index & idx) {
             }
         }
         std::vector<uint8_t> rows(32 * row_bytes);
+        std::vector<uint8_t> scratch(turbovec_rows_in_blocked(idx) ? turbovec_block_scratch_bytes(idx) : 0);
         for (size_t first = 0; first < idx.slot_to_id.size(); first += 32) {
-            turbovec_block_rows_packed(idx, first / 32, rows.data());
+            turbovec_block_rows_packed(idx, first / 32, rows.data(), scratch.data());
             for (size_t slot = first; slot < std::min(first + 32, idx.slot_to_id.size()); ++slot) {
                 if (slot_is_active(idx, slot)) {
                     crc = crc32c_update(crc, rows.data() + (slot - first) * row_bytes, row_bytes);
@@ -1210,19 +1211,22 @@ void rebuild_state_hash(ggml_vec_index & idx) {
     idx.state_hash_sum = 0;
     idx.state_hash_sum_rot = 0;
     std::vector<uint8_t> rows;
+    std::vector<uint8_t> scratch;
     if (turbovec_rows_in_blocked(idx)) {
         try {
+            scratch.resize(turbovec_block_scratch_bytes(idx));
             rows.resize(32 * turbovec_row_bytes(idx.turbovec_bits, static_cast<size_t>(idx.dim)));
         } catch (const std::bad_alloc &) {
             // Callers rebuild after committing a change, so this must not
             // fail: fall back to reading row by row.
+            rows.clear();
         }
     }
     if (!rows.empty()) {
         // Rows come out of the blocked cache a block at a time.
         const size_t row_bytes = turbovec_row_bytes(idx.turbovec_bits, static_cast<size_t>(idx.dim));
         for (size_t first = 0; first < idx.slot_to_id.size(); first += 32) {
-            turbovec_block_rows_packed(idx, first / 32, rows.data());
+            turbovec_block_rows_packed(idx, first / 32, rows.data(), scratch.data());
             for (size_t slot = first; slot < std::min(first + 32, idx.slot_to_id.size()); ++slot) {
                 if (slot_is_active(idx, slot)) {
                     add_state_hash(idx, slot_state_hash(idx, slot, rows.data() + (slot - first) * row_bytes));

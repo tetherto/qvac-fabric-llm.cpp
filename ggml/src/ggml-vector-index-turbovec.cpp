@@ -2002,7 +2002,11 @@ void turbovec_row_packed(const ggml_vec_index & idx, size_t slot, uint8_t * pack
     seq_row_to_packed_fast(seq, bits, idx.dim, packed);
 }
 
-void turbovec_block_rows_packed(const ggml_vec_index & idx, size_t block, uint8_t * packed) {
+size_t turbovec_block_scratch_bytes(const ggml_vec_index & idx) {
+    return static_cast<size_t>(kTurboVecScoreBlock) * (static_cast<size_t>(idx.dim) / static_cast<size_t>(8 / idx.turbovec_bits));
+}
+
+void turbovec_block_rows_packed(const ggml_vec_index & idx, size_t block, uint8_t * packed, uint8_t * scratch) {
     const int bits = idx.turbovec_bits;
     const size_t lane_size = static_cast<size_t>(kTurboVecScoreBlock);
     const size_t n = idx.slot_to_id.size();
@@ -2016,14 +2020,13 @@ void turbovec_block_rows_packed(const ggml_vec_index & idx, size_t block, uint8_
     // One pass over the block, group by group, then each row repacked.
     const size_t n_byte_groups = static_cast<size_t>(idx.dim) / static_cast<size_t>(8 / bits);
     const uint8_t * src = idx.turbovec_blocked_data.data() + block * n_byte_groups * lane_size;
-    std::vector<uint8_t> seq(lane_size * n_byte_groups);
     for (size_t g = 0; g < n_byte_groups; ++g) {
         for (size_t lane = 0; lane < count; ++lane) {
-            seq[lane * n_byte_groups + g] = block_lane_byte(src, g, lane, idx.turbovec_blocked_vm);
+            scratch[lane * n_byte_groups + g] = block_lane_byte(src, g, lane, idx.turbovec_blocked_vm);
         }
     }
     for (size_t lane = 0; lane < count; ++lane) {
-        seq_row_to_packed_fast(seq.data() + lane * n_byte_groups, bits, idx.dim, packed + lane * row_bytes);
+        seq_row_to_packed_fast(scratch + lane * n_byte_groups, bits, idx.dim, packed + lane * row_bytes);
     }
 }
 
@@ -2032,8 +2035,9 @@ void turbovec_rows_packed(const ggml_vec_index & idx, std::vector<uint8_t> & pac
     const size_t n = idx.slot_to_id.size();
     const size_t lane_size = static_cast<size_t>(kTurboVecScoreBlock);
     packed.resize(n * row_bytes);
+    std::vector<uint8_t> scratch(turbovec_rows_in_blocked(idx) ? turbovec_block_scratch_bytes(idx) : 0);
     for (size_t block = 0; block * lane_size < n; ++block) {
-        turbovec_block_rows_packed(idx, block, packed.data() + block * lane_size * row_bytes);
+        turbovec_block_rows_packed(idx, block, packed.data() + block * lane_size * row_bytes, scratch.data());
     }
 }
 
