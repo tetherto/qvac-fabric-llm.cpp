@@ -422,16 +422,17 @@ function(ggml_add_backend_library backend)
         # with cmake-bare
         # add_dependencies(ggml ${backend})
 
+        # the component lets a build that makes one module install just that module
         if (GGML_BACKEND_DIR)
             install(TARGETS ${backend}
                     EXPORT ggml-targets
-                    LIBRARY DESTINATION ${GGML_BACKEND_DIR}
-                    RUNTIME DESTINATION ${GGML_BACKEND_DIR})
+                    LIBRARY DESTINATION ${GGML_BACKEND_DIR} COMPONENT ${backend}
+                    RUNTIME DESTINATION ${GGML_BACKEND_DIR} COMPONENT ${backend})
         else()
             install(TARGETS ${backend}
                     EXPORT ggml-targets
-                    LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
-                    RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+                    LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR} COMPONENT ${backend}
+                    RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR} COMPONENT ${backend})
         endif()
     else()
         add_library(${backend} ${ARGN})
