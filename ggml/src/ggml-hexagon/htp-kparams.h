@@ -26,6 +26,7 @@
 #include "htp/roll-ops.h"
 #include "htp/rope-ops.h"
 #include "htp/set-rows-ops.h"
+#include "htp/snake-ops.h"
 #include "htp/softmax-ops.h"
 #include "htp/solve-tri-ops.h"
 #include "htp/timestep-ops.h"
