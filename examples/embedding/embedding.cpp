@@ -1,5 +1,7 @@
 #include <algorithm>
+#include <cerrno>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <ctime>
@@ -48,16 +50,19 @@ static void batch_add_seq(common_batch & batch, const std::vector<int32_t> & tok
     }
 }
 
-static void batch_decode(llama_context * ctx, common_batch & batch, float * output, int n_seq, int n_embd_out, int embd_norm) {
+static bool batch_decode(llama_context * ctx, common_batch & batch, float * output, int n_seq, int n_embd_out, int embd_norm, bool quiet) {
     const enum llama_pooling_type pooling_type = llama_pooling_type(ctx);
 
     // clear previous kv_cache values (irrelevant for embeddings)
     llama_memory_clear(llama_get_memory(ctx), true);
 
     // run model
-    LOG_INF("%s: n_tokens = %d, n_seq = %d\n", __func__, batch.size(), n_seq);
-    if (llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get()) < 0) {
+    if (!quiet) {
+        LOG_INF("%s: n_tokens = %d, n_seq = %d\n", __func__, batch.size(), n_seq);
+    }
+    if (llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get()) != 0) {
         LOG_ERR("%s : failed to process\n", __func__);
+        return false;
     }
 
     for (int i = 0; i < batch.size(); i++) {
@@ -83,6 +88,7 @@ static void batch_decode(llama_context * ctx, common_batch & batch, float * outp
         float * out = output + embd_pos * n_embd_out;
         common_embd_normalize(embd, out, n_embd_out, embd_norm);
     }
+    return true;
 }
 
 // plain, pipe-friendly output: one embedding per line
@@ -108,18 +114,54 @@ static void print_raw_embeddings(const float * emb,
     }
 }
 
+static void print_benchmark_usage(int, char **) {
+    printf("Embedding benchmark environment variables:\n"
+           "  LLAMA_EMBED_BENCH_REPETITIONS  timed corpus passes on one loaded context (1..1000)\n"
+           "  LLAMA_EMBED_BENCH_WARMUPS      untimed corpus passes (1..1000, default: 1)\n\n");
+}
+
 int main(int argc, char ** argv) {
     std::setlocale(LC_NUMERIC, "C");
+
+    int bench_repetitions = 0;
+    int bench_warmups = 1;
+    const auto read_count = [](const char * name, int & count) {
+        const char * value = std::getenv(name);
+        if (!value) {
+            return true;
+        }
+        char * end = nullptr;
+        errno = 0;
+        const long parsed = std::strtol(value, &end, 10);
+        if (errno || end == value || *end != '\0' || parsed < 1 || parsed > 1000 ||
+                !std::all_of(value, (const char *) end, [](char c) { return c >= '0' && c <= '9'; })) {
+            fprintf(stderr, "%s requires a count in [1, 1000]\n", name);
+            return false;
+        }
+        count = (int) parsed;
+        return true;
+    };
+    if (!read_count("LLAMA_EMBED_BENCH_REPETITIONS", bench_repetitions) ||
+        !read_count("LLAMA_EMBED_BENCH_WARMUPS", bench_warmups)) {
+        return 1;
+    }
+    if (std::getenv("LLAMA_EMBED_BENCH_WARMUPS") && bench_repetitions == 0) {
+        fprintf(stderr, "LLAMA_EMBED_BENCH_WARMUPS requires LLAMA_EMBED_BENCH_REPETITIONS\n");
+        return 1;
+    }
 
     common_params params;
 
     common_init();
 
-    if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_EMBEDDING)) {
+    if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_EMBEDDING, print_benchmark_usage)) {
         return 1;
     }
 
     params.embedding = true;
+    if (bench_repetitions) {
+        params.warmup = false;
+    }
 
     // get max number of sequences per batch
     const int n_seq_max = llama_max_parallel_sequences();
@@ -148,6 +190,7 @@ int main(int argc, char ** argv) {
     llama_numa_init(params.numa);
 
     // load the model
+    const auto init_start = std::chrono::steady_clock::now();
 #ifdef LLAMA_COMMON_TEST_HEADERS
     common_init_result_ptr llama_init;
     if (memory_configuration_env_is_set()) {
@@ -164,6 +207,7 @@ int main(int argc, char ** argv) {
 #else
     auto llama_init = common_init_from_params(params);
 #endif
+    const double init_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - init_start).count();
 
     auto * model = llama_init->model();
     auto * ctx = llama_init->context();
@@ -288,32 +332,68 @@ int main(int argc, char ** argv) {
     std::vector<float> embeddings(n_embd_count * n_embd_out, 0);
     float * emb = embeddings.data();
 
-    // break into batches
-    int e = 0; // number of embeddings already stored
-    int s = 0; // number of prompts in current batch
-    for (int k = 0; k < n_prompts; k++) {
-        // clamp to n_batch tokens
-        auto & inp = inputs[k];
-
-        const uint64_t n_toks = inp.size();
-
-        // encode if at capacity
-        if (batch.size() + n_toks > n_batch || s >= n_seq_max) {
-            float * out = emb + e * n_embd_out;
-            batch_decode(ctx, batch, out, s, n_embd_out, params.embd_normalize);
-            e += pooling_type == LLAMA_POOLING_TYPE_NONE ? batch.size() : s;
-            s = 0;
-            batch.clear();
-        }
-
-        // add to batch
-        batch_add_seq(batch, inp, s);
-        s += 1;
+    size_t n_tokens_total = 0;
+    for (const auto & inp : inputs) {
+        n_tokens_total += inp.size();
     }
+    int n_batches = 0;
+    std::vector<int> batch_tokens;
+    const auto encode = [&]() {
+        batch.clear();
+        int e = 0;
+        int s = 0;
+        n_batches = 0;
+        batch_tokens.clear();
+        for (const auto & inp : inputs) {
+            if (batch.size() + inp.size() > n_batch || s >= n_seq_max) {
+                if (!batch_decode(ctx, batch, emb + e * n_embd_out, s, n_embd_out, params.embd_normalize, bench_repetitions != 0)) {
+                    return false;
+                }
+                ++n_batches;
+                batch_tokens.push_back(batch.size());
+                e += pooling_type == LLAMA_POOLING_TYPE_NONE ? batch.size() : s;
+                s = 0;
+                batch.clear();
+            }
+            batch_add_seq(batch, inp, s++);
+        }
+        ++n_batches;
+        batch_tokens.push_back(batch.size());
+        return batch_decode(ctx, batch, emb + e * n_embd_out, s, n_embd_out, params.embd_normalize, bench_repetitions != 0);
+    };
 
-    // final batch
-    float * out = emb + e * n_embd_out;
-    batch_decode(ctx, batch, out, s, n_embd_out, params.embd_normalize);
+    std::vector<double> pass_ms;
+    std::vector<float> first_embeddings;
+    bool outputs_finite = true;
+    double repeated_min_cosine = 1.0;
+    double first_pass_ms = 0;
+    const int n_passes = bench_repetitions ? bench_warmups + bench_repetitions : 1;
+    for (int pass = 0; pass < n_passes; ++pass) {
+        const auto start = std::chrono::steady_clock::now();
+        if (!encode()) {
+            return 1;
+        }
+        const double elapsed_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+        if (pass == 0) {
+            first_pass_ms = elapsed_ms;
+        }
+        if (bench_repetitions && pass >= bench_warmups) {
+            pass_ms.push_back(elapsed_ms);
+        }
+        if (bench_repetitions) {
+            outputs_finite = outputs_finite && std::all_of(embeddings.begin(), embeddings.end(), [](float value) {
+                return std::isfinite(value);
+            });
+            if (pass == 0) {
+                first_embeddings = embeddings;
+            } else if (outputs_finite) {
+                for (int i = 0; i < n_embd_count; ++i) {
+                    repeated_min_cosine = std::min(repeated_min_cosine, (double) common_embd_similarity_cos(
+                            first_embeddings.data() + i * n_embd_out, emb + i * n_embd_out, n_embd_out));
+                }
+            }
+        }
+    }
 
     if (params.embd_out.empty()) {
         LOG("\n");
@@ -434,6 +514,26 @@ int main(int argc, char ** argv) {
 
     LOG("\n");
     llama_perf_context_print(ctx);
+    if (bench_repetitions) {
+        common_log_flush(common_log_main());
+        fprintf(stderr, "EMBEDDING_BENCH {\"model_context_init_ms\":%.6f,\"first_pass_ms\":%.6f,"
+                        "\"texts\":%d,\"tokens\":%zu,\"batches\":%d,\"batch_size\":%u,\"ubatch_size\":%u,"
+                        "\"warmups\":%d,\"outputs_finite\":%s,\"repeated_min_cosine\":%.9f,\"pass_ms\":[",
+                init_ms, first_pass_ms, n_prompts, n_tokens_total, n_batches, llama_n_batch(ctx), llama_n_ubatch(ctx), bench_warmups,
+                outputs_finite ? "true" : "false", repeated_min_cosine);
+        for (size_t i = 0; i < pass_ms.size(); ++i) {
+            fprintf(stderr, "%s%.6f", i ? "," : "", pass_ms[i]);
+        }
+        fprintf(stderr, "],\"tokens_per_text\":[");
+        for (size_t i = 0; i < inputs.size(); ++i) {
+            fprintf(stderr, "%s%zu", i ? "," : "", inputs[i].size());
+        }
+        fprintf(stderr, "],\"batch_tokens\":[");
+        for (size_t i = 0; i < batch_tokens.size(); ++i) {
+            fprintf(stderr, "%s%d", i ? "," : "", batch_tokens[i]);
+        }
+        fprintf(stderr, "]}\n");
+    }
 
     // clean up
     llama_backend_free();
