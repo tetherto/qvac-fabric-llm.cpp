@@ -6962,6 +6962,94 @@ struct test_repacked_mul_mat : public test_case {
     }
 };
 
+struct test_bf16_mul_mat_upload : public test_repacked_mul_mat {
+    ggml_backend_t backend = nullptr;
+    const bool strided_upload;
+    bool transfer_ok = true;
+
+    test_bf16_mul_mat_upload(int64_t n, bool strided_upload) :
+        test_repacked_mul_mat(GGML_TYPE_BF16, 64, n, 128), strided_upload(strided_upload) {}
+
+    std::string vars() override {
+        return test_repacked_mul_mat::vars() + "," + VAR_TO_STR(strided_upload);
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MUL_MAT_BF16_UPLOAD";
+    }
+
+    bool skip_backend(ggml_backend_t b) override {
+        return strncmp(ggml_backend_name(b), "HTP", 3) != 0;
+    }
+
+    ggml_backend_buffer_type_t weight_buffer_type(ggml_backend_t b) override {
+        backend = b;
+        return ggml_backend_get_default_buffer_type(b);
+    }
+
+    int graph_replays() override { return 2; }
+
+    double err(const float * a, const float * b, size_t n) override {
+        return transfer_ok ? nmse(a, b, n) : INFINITY;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        test_case::initialize_tensors(ctx);
+        ggml_tensor * weight = ggml_get_tensor(ctx, "weight");
+        if (!weight) {
+            return;
+        }
+
+        // Populate the backend's weight cache before changing the uploaded bytes.
+        transfer_ok = ggml_backend_graph_compute(backend, gf) == GGML_STATUS_SUCCESS;
+        std::vector<uint8_t> original(ggml_nbytes(weight));
+        ggml_backend_tensor_get(weight, original.data(), 0, original.size());
+        std::vector<uint8_t> changed = original;
+        for (size_t i = 1; i < changed.size(); i += 2) {
+            changed[i] ^= 0x80;
+        }
+
+        std::vector<uint8_t> expected = changed;
+        if (strided_upload) {
+            const size_t row_size = ggml_row_size(GGML_TYPE_BF16, k);
+            const size_t host_stride = row_size + 5;
+            std::vector<uint8_t> rows(m * host_stride);
+            expected = original;
+            for (int64_t i = 0; i < m; ++i) {
+                memcpy(rows.data() + i * host_stride, changed.data() + i * row_size + 1, row_size - 2);
+                memcpy(expected.data() + i * row_size + 1, changed.data() + i * row_size + 1, row_size - 2);
+            }
+            ggml_backend_tensor_set_2d(weight, rows.data(), 1, row_size - 2, m, row_size, host_stride);
+            std::vector<uint8_t> readback(rows.size());
+            ggml_backend_tensor_get_2d(weight, readback.data(), 1, row_size - 2, m, row_size, host_stride);
+            transfer_ok = transfer_ok && readback == rows;
+        } else {
+            const size_t offsets[] = {0, 7, changed.size() / 2 + 1, changed.size()};
+            for (size_t i = 0; i < 3; ++i) {
+                ggml_backend_tensor_set_async(backend, weight, changed.data() + offsets[i],
+                                              offsets[i], offsets[i + 1] - offsets[i]);
+            }
+        }
+        std::vector<uint8_t> readback(expected.size());
+        ggml_backend_tensor_get_async(backend, weight, readback.data(), 0, readback.size());
+        ggml_backend_synchronize(backend);
+        transfer_ok = transfer_ok && readback == expected;
+
+        ggml_tensor view = *weight;
+        view.view_src = weight;
+        ggml_tensor probe = *ggml_graph_node(gf, 0);
+        probe.op = GGML_OP_MUL_MAT;
+        probe.src[0] = &view;
+        transfer_ok = transfer_ok && !ggml_backend_supports_op(backend, &probe);
+        probe.src[0] = weight;
+        ggml_tensor half_input = *probe.src[1];
+        half_input.type = GGML_TYPE_F16;
+        probe.src[1] = &half_input;
+        transfer_ok = transfer_ok && !ggml_backend_supports_op(backend, &probe);
+    }
+};
+
 struct test_cutlass_mul_mat : public test_repacked_mul_mat {
     const bool unaligned_input;
     ggml_tensor * pair_output = nullptr;
@@ -16738,6 +16826,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         for (ggml_type type_K : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16, GGML_TYPE_Q8_0, GGML_TYPE_Q5_1, GGML_TYPE_Q5_0, GGML_TYPE_Q4_1, GGML_TYPE_Q4_0}) {
             test_cases.emplace_back(new test_lightning_indexer(128, 64, kv, 32, 4, 1, type_K));
         }
+    }
+
+    for (int64_t n : {1, 32}) {
+        test_cases.emplace_back(new test_bf16_mul_mat_upload(n, false));
+        test_cases.emplace_back(new test_bf16_mul_mat_upload(n, true));
     }
 
     for (ggml_type type : {GGML_TYPE_MXFP4, GGML_TYPE_NVFP4}) {
