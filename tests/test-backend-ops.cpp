@@ -2279,6 +2279,20 @@ struct test_unary : public test_case {
 
 };
 
+struct test_gelu_transition : public test_unary {
+    test_gelu_transition(ggml_unary_op op, std::array<int64_t, 4> ne_a, int v) :
+        test_unary(op, GGML_TYPE_F32, ne_a, v, 5.0f) {}
+
+    double max_nmse_err(ggml_backend_t backend) override {
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
+        if (op == GGML_UNARY_OP_GELU_QUICK && strcmp(ggml_backend_reg_name(reg), "CPU") == 0) {
+            // The CPU QUICK lookup rounds both its input and output to F16.
+            return 2e-7;
+        }
+        return test_unary::max_nmse_err(backend);
+    }
+};
+
 // GGML_OP_GLU
 struct test_glu : public test_case {
     const ggml_glu_op op;
@@ -6965,13 +6979,25 @@ struct test_repacked_mul_mat : public test_case {
 struct test_bf16_mul_mat_upload : public test_repacked_mul_mat {
     ggml_backend_t backend = nullptr;
     const bool strided_upload;
+    const bool view_upload;
     bool transfer_ok = true;
 
-    test_bf16_mul_mat_upload(int64_t n, bool strided_upload) :
-        test_repacked_mul_mat(GGML_TYPE_BF16, 64, n, 128), strided_upload(strided_upload) {}
+    test_bf16_mul_mat_upload(int64_t n, bool strided_upload, bool view_upload = false) :
+        test_repacked_mul_mat(GGML_TYPE_BF16, 64, n, 128), strided_upload(strided_upload), view_upload(view_upload) {}
 
     std::string vars() override {
-        return test_repacked_mul_mat::vars() + "," + VAR_TO_STR(strided_upload);
+        return test_repacked_mul_mat::vars() + "," + VAR_TO_STR(strided_upload) +
+            (view_upload ? "," + VAR_TO_STR(view_upload) : "");
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx, ggml_context * ctx_weights) override {
+        ggml_tensor * out = test_repacked_mul_mat::build_graph(ctx, ctx_weights);
+        if (view_upload) {
+            ggml_tensor * weight = ggml_get_tensor(ctx_weights, "weight");
+            ggml_tensor * view = ggml_view_2d(ctx_weights, weight, k, m, weight->nb[1], 0);
+            ggml_set_name(view, "weight_upload_view");
+        }
+        return out;
     }
 
     std::string op_desc(ggml_tensor * t) override {
@@ -7000,6 +7026,8 @@ struct test_bf16_mul_mat_upload : public test_repacked_mul_mat {
         if (!weight) {
             return;
         }
+        ggml_tensor * upload = view_upload ? ggml_get_tensor(ctx, "weight_upload_view") : weight;
+        GGML_ASSERT(upload != nullptr);
 
         // Populate the backend's weight cache before changing the uploaded bytes.
         transfer_ok = ggml_backend_graph_compute(backend, gf) == GGML_STATUS_SUCCESS;
@@ -7020,14 +7048,14 @@ struct test_bf16_mul_mat_upload : public test_repacked_mul_mat {
                 memcpy(rows.data() + i * host_stride, changed.data() + i * row_size + 1, row_size - 2);
                 memcpy(expected.data() + i * row_size + 1, changed.data() + i * row_size + 1, row_size - 2);
             }
-            ggml_backend_tensor_set_2d(weight, rows.data(), 1, row_size - 2, m, row_size, host_stride);
+            ggml_backend_tensor_set_2d(upload, rows.data(), 1, row_size - 2, m, row_size, host_stride);
             std::vector<uint8_t> readback(rows.size());
-            ggml_backend_tensor_get_2d(weight, readback.data(), 1, row_size - 2, m, row_size, host_stride);
+            ggml_backend_tensor_get_2d(upload, readback.data(), 1, row_size - 2, m, row_size, host_stride);
             transfer_ok = transfer_ok && readback == rows;
         } else {
             const size_t offsets[] = {0, 7, changed.size() / 2 + 1, changed.size()};
             for (size_t i = 0; i < 3; ++i) {
-                ggml_backend_tensor_set_async(backend, weight, changed.data() + offsets[i],
+                ggml_backend_tensor_set_async(backend, upload, changed.data() + offsets[i],
                                               offsets[i], offsets[i + 1] - offsets[i]);
             }
         }
@@ -13513,10 +13541,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     // The transition range distinguishes GELU from GELU_QUICK; large inputs hide the difference.
     for (ggml_unary_op op : {GGML_UNARY_OP_GELU, GGML_UNARY_OP_GELU_QUICK}) {
-        test_cases.emplace_back(new test_unary(op, GGML_TYPE_F32, {512, 3, 1, 1}, 0, 5.0f));
-        test_cases.emplace_back(new test_unary(op, GGML_TYPE_F32, {513, 3, 1, 1}, 0, 5.0f));
-        test_cases.emplace_back(new test_unary(op, GGML_TYPE_F32, {513, 3, 2, 1}, 1, 5.0f));
-        test_cases.emplace_back(new test_unary(op, GGML_TYPE_F32, {262145, 3, 1, 1}, 0, 5.0f));
+        test_cases.emplace_back(new test_gelu_transition(op, {512, 3, 1, 1}, 0));
+        test_cases.emplace_back(new test_gelu_transition(op, {513, 3, 1, 1}, 0));
+        test_cases.emplace_back(new test_gelu_transition(op, {513, 3, 2, 1}, 1));
+        test_cases.emplace_back(new test_gelu_transition(op, {262145, 3, 1, 1}, 0));
     }
 
     // fused relu + sqr (squared ReLU)
@@ -16855,6 +16883,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_bf16_mul_mat_upload(n, false));
         test_cases.emplace_back(new test_bf16_mul_mat_upload(n, true));
     }
+    test_cases.emplace_back(new test_bf16_mul_mat_upload(32, false, true));
+    test_cases.emplace_back(new test_bf16_mul_mat_upload(32, true, true));
 
     for (ggml_type type : {GGML_TYPE_MXFP4, GGML_TYPE_NVFP4}) {
         test_cases.emplace_back(new test_repacked_mul_mat(type, 256, 1, 512));
