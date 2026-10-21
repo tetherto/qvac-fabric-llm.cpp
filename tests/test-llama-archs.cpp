@@ -2103,37 +2103,54 @@ static int test_layer_inp_pos_min() {
     return ok ? 0 : 1;
 }
 
-static bool same_memory(const common_device_memory_data_vec & a, const common_device_memory_data_vec & b) {
-    if (a.size() != b.size()) {
-        return false;
-    }
-    for (size_t i = 0; i < a.size(); ++i) {
-        if (a[i].model != b[i].model || a[i].context != b[i].context || a[i].compute != b[i].compute) {
-            return false;
+// removes the files on every return from the test
+struct temp_files {
+    std::vector<std::string> paths;
+    ~temp_files() {
+        for (const std::string & path : paths) {
+            std::remove(path.c_str());
         }
     }
-    return true;
-}
+};
 
 // a fit measures a draft model that borrows the target's token_embd and output next to a probe of the target,
-// as the load creates it; a draft that borrows nothing measures as it does alone
+// as the load creates it: its own weights, KV cache and compute, none of the target's; a target of another width
+// is refused instead of failing a ggml assert; a draft that borrows nothing measures as it does alone
 static int test_fit_borrowing_draft() {
     const size_t seed = 1234;
-    const std::string dir         = std::filesystem::temp_directory_path().string();
-    const std::string path_target = dir + "/test-fit-borrowing-target.gguf";
-    const std::string path_draft  = dir + "/test-fit-borrowing-dflash.gguf";
+    // unique per run, so that concurrent runs do not share the files
+    const std::string prefix = (std::filesystem::temp_directory_path() /
+        ("test-fit-borrowing-" + std::to_string(std::random_device{}()) + "-")).string();
+    temp_files files = { { prefix + "target.gguf", prefix + "dflash.gguf", prefix + "narrow.gguf" } };
+    const std::string & path_target = files.paths[0];
+    const std::string & path_draft  = files.paths[1];
+    const std::string & path_narrow = files.paths[2];
+
+    size_t   draft_bytes    = 0; // the drafter's own weights
+    size_t   borrowed_bytes = 0; // the target's token_embd, which the drafter borrows
+    uint32_t draft_n_layer  = 0;
     {
         auto metadata = get_gguf_ctx(LLM_ARCH_QWEN35, false);
+        // more layers than the drafter, so that the reported layer count tells the two apart
+        gguf_set_val_u32(metadata.get(), "qwen35.block_count", 4);
         auto target = get_model_and_ctx(metadata.get(), nullptr, seed, 0.1f, {});
         llama_model_save_to_file(target.first.get(), path_target.c_str());
+        borrowed_bytes = ggml_nbytes(target.first->tok_embd);
+        // a target narrower than the drafter; LLaMA derives its head size from the width
+        auto metadata_narrow = get_gguf_ctx(LLM_ARCH_LLAMA, false);
+        gguf_set_val_u32(metadata_narrow.get(), "llama.embedding_length", 128);
+        auto narrow = get_model_and_ctx(metadata_narrow.get(), nullptr, seed, 0.1f, {});
+        llama_model_save_to_file(narrow.first.get(), path_narrow.c_str());
         // written from its metadata and tensors: the model saver knows neither the DFlash keys nor its tensors
         llama_model_ptr draft = get_borrowing_dflash(seed);
+        draft_n_layer = llama_model_n_layer(draft.get());
         gguf_context_ptr draft_ctx(gguf_init_empty());
         gguf_set_kv(draft_ctx.get(), get_borrowing_dflash_metadata().get());
         llama_model_saver saver(LLM_ARCH_DFLASH, draft_ctx.get());
         for (const auto & [name, tensor] : draft->tensors_by_name) {
             if (name != "token_embd.weight" && name != "output.weight") {
                 saver.add_tensor(tensor);
+                draft_bytes += ggml_nbytes(tensor);
             }
         }
         saver.save(path_draft);
@@ -2164,31 +2181,59 @@ static int test_fit_borrowing_draft() {
     const auto measured = common_get_extra_device_memory_data(&borrowing, path_target.c_str(), &mparams, &cparams,
                                                               devs, n_layer, n_ctx_train, n_expert, GGML_LOG_LEVEL_ERROR);
     size_t model   = 0;
+    size_t context = 0;
     size_t compute = 0;
     for (const auto & row : measured) {
         model   += row.model;
+        context += row.context;
         compute += row.compute;
     }
+    const uint32_t measured_n_layer = n_layer;
 
+    bool narrow_refused = false;
+    try {
+        common_get_extra_device_memory_data(&borrowing, path_narrow.c_str(), &mparams, &cparams,
+                                            devs, n_layer, n_ctx_train, n_expert, GGML_LOG_LEVEL_ERROR);
+    } catch (const std::exception & e) {
+        narrow_refused = strstr(e.what(), "width") != nullptr;
+    }
+
+    // a draft that borrows nothing measures as it does alone
     const common_fit_extra_model plain = { path_target.c_str(), &mparams_dft, &cparams_dft, false };
     const auto as_extra = common_get_extra_device_memory_data(&plain, path_target.c_str(), &mparams, &cparams,
                                                               devs, n_layer, n_ctx_train, n_expert, GGML_LOG_LEVEL_ERROR);
     const auto alone = common_get_device_memory_data(path_target.c_str(), &mparams_dft, &cparams_dft, devs, n_layer,
                                                      n_ctx_train, n_expert, GGML_LOG_LEVEL_ERROR);
-
-    std::remove(path_target.c_str());
-    std::remove(path_draft.c_str());
+    bool same = as_extra.size() == alone.size();
+    for (size_t i = 0; same && i < alone.size(); ++i) {
+        same = as_extra[i].model == alone[i].model && as_extra[i].context == alone[i].context &&
+               as_extra[i].compute == alone[i].compute;
+    }
 
     bool ok = true;
     if (!alone_fails) {
         LOG_ERR("%s: the borrowing draft was measured without the target\n", __func__);
         ok = false;
     }
-    if (model == 0 || compute == 0) {
-        LOG_ERR("%s: the borrowing draft measured %zu model and %zu compute bytes\n", __func__, model, compute);
+    // buffer alignment pads the weights a little, never by a whole borrowed tensor
+    if (model < draft_bytes || model >= draft_bytes + borrowed_bytes) {
+        LOG_ERR("%s: the borrowing draft measured %zu model bytes, its own weights are %zu\n",
+                __func__, model, draft_bytes);
         ok = false;
     }
-    if (!same_memory(as_extra, alone)) {
+    if (context == 0 || compute == 0) {
+        LOG_ERR("%s: the borrowing draft measured %zu context and %zu compute bytes\n", __func__, context, compute);
+        ok = false;
+    }
+    if (measured_n_layer != draft_n_layer) {
+        LOG_ERR("%s: the measurement reported %u layers, the draft has %u\n", __func__, measured_n_layer, draft_n_layer);
+        ok = false;
+    }
+    if (!narrow_refused) {
+        LOG_ERR("%s: a draft against a target of another width was not refused for its width\n", __func__);
+        ok = false;
+    }
+    if (!same) {
         LOG_ERR("%s: a draft that borrows nothing measured differently as an extra model\n", __func__);
         ok = false;
     }
