@@ -176,6 +176,9 @@ void turbovec_reset_block_score_call_count_for_test(void);
 int64_t turbovec_block_score_call_count_for_test(void);
 uint64_t turbovec_ziggurat_table_hash_for_test(void);
 void turbovec_hadamard_rotate_for_test(const float * src, float * dst, int dim);
+int turbovec_rotation_kernel_parity_for_test(int kernel);
+int turbovec_encode_kernel_parity_for_test(int kernel);
+int vector_validation_kernel_parity_for_test(int kernel);
 void turbovec_force_vector_major_for_test(int mode);
 void turbovec_disable_dot_product_for_test(int disabled);
 void turbovec_force_planes_for_test(int mode, size_t min_vectors);
@@ -4700,6 +4703,39 @@ void check_turbovec_1x_golden_case(const Tv1xIndexCase & c, int kernel) {
 }
 
 #ifdef GGML_VEC_INDEX_TEST_HOOKS
+// A SIMD kernel's parity status: 1 matched its scalar reference bit for bit,
+// 0 did not, -1 this build or CPU cannot run it (x86 kernels on an arm64
+// host; CI's x86 runners execute them).
+void check_simd_parity_status(const char * what, const char * kernel, int status, bool required) {
+    if (status < 0) {
+        CHECK(!required);
+        std::printf("SKIP %s %s parity\n", what, kernel);
+        return;
+    }
+    CHECK(status == 1);
+}
+
+void check_simd_kernel_parity() {
+#if defined(__aarch64__) || defined(_M_ARM64)
+    constexpr bool arm64 = true;
+#else
+    constexpr bool arm64 = false;
+#endif
+    // Rotation (Walsh-Hadamard, gather, norm), encode and input validation.
+    static const char * const simd_names[] = { "NEON", "AVX2", "AVX-512" };
+    for (int kernel = 0; kernel < 3; ++kernel) {
+        const bool required = kernel == 0 && arm64;
+        check_simd_parity_status(
+            "TurboVec rotation", simd_names[kernel], turbovec_rotation_kernel_parity_for_test(kernel), required);
+        if (kernel < 2) {
+            check_simd_parity_status(
+                "TurboVec encode", simd_names[kernel], turbovec_encode_kernel_parity_for_test(kernel), required);
+            check_simd_parity_status(
+                "vector validation", simd_names[kernel], vector_validation_kernel_parity_for_test(kernel), required);
+        }
+    }
+}
+
 void check_turbovec_1x_rotation_and_codebooks() {
     for (const Tv1xRotationCase & c : kTv1xRotationCases) {
         const std::vector<float> row = tv1x_rows(kTv1xSeedRotation, 1, static_cast<size_t>(c.dim));
@@ -6604,6 +6640,7 @@ int main(int argc, char ** argv) {
             check_turbovec_sparse_filter_block_selection();
 
             check_turbovec_numeric_helper_parity();
+            check_simd_kernel_parity();
             check_turbovec_1x_rotation_and_codebooks();
             check_turbovec_1x_torn_sync();
             check_turbovec_1x_failed_add_then_sync();

@@ -602,6 +602,9 @@ int turbovec_avx2_lut_block_matches_scalar_for_test(int bits, int dim);
 void turbovec_reset_block_score_call_count_for_test(void);
 int64_t turbovec_block_score_call_count_for_test(void);
 void turbovec_hadamard_rotate_for_test(const float * src, float * dst, int dim);
+int turbovec_rotation_kernel_parity_for_test(int kernel);
+int turbovec_encode_kernel_parity_for_test(int kernel);
+int vector_validation_kernel_parity_for_test(int kernel);
 int turbovec_sync_plan_for_test(
     ggml_vec_index_t * idx,
     const char * path,
@@ -623,6 +626,18 @@ bool turbovec_cpu_vector_major();
 // The CPU's own dot-product support, which a test override cannot change:
 // gates the SDOT instructions themselves.
 bool turbovec_cpu_dot_product();
+// Runtime CPU features gating the rotation, encode, layout and checksum
+// kernels, as upstream turbovec gates them with is_x86_feature_detected!.
+struct VecIndexCpuFeatures {
+    bool ssse3 = false;
+    bool sse42 = false;
+    // AVX2 with FMA: the AVX2 object is compiled with both.
+    bool avx2 = false;
+    // AVX-512 F, only together with AVX2.
+    bool avx512f = false;
+    bool arm_crc32 = false;
+};
+const VecIndexCpuFeatures & vec_index_cpu_features();
 
 // One query quantized for the 4-bit permute-dot score (upstream
 // `QueryPermuteDot`): sum_d weight[d] * level[code[d]] in int32, then
