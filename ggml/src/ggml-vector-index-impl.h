@@ -869,7 +869,9 @@ void turbovec_row_packed(const ggml_vec_index & idx, size_t slot, uint8_t * pack
 const uint8_t * turbovec_row_packed_ptr(const ggml_vec_index & idx, size_t slot, uint8_t * scratch);
 void turbovec_rows_packed(const ggml_vec_index & idx, std::vector<uint8_t> & packed);
 // The packed rows of one 32-row block (fewer for the tail block).
-void turbovec_block_rows_packed(const ggml_vec_index & idx, size_t block, uint8_t * packed);
+// `scratch` holds turbovec_block_scratch_bytes(idx) bytes.
+size_t turbovec_block_scratch_bytes(const ggml_vec_index & idx);
+void turbovec_block_rows_packed(const ggml_vec_index & idx, size_t block, uint8_t * packed, uint8_t * scratch);
 // Writes one row's sequential codes into its blocked-cache lane.
 void turbovec_blocked_set_row_seq(ggml_vec_index & idx, size_t slot, const uint8_t * seq);
 // Writes n_new packed rows into the blocked cache from first_slot on.
