@@ -146,8 +146,10 @@ index whose dimension is a multiple of 16 takes upstream's wider `vm8`
 block layout, and the queries of a multi-query search are scored in fused
 batches of 12, 8 or 4 with SMMLA kernels, as upstream does (other dimensions
 batch with SMMLA over the vector-major layout). Permute-dot sums are exact
-integers, so every kernel returns the same scores. The block layout is chosen when an index is created
-and never reaches a file: snapshots are written from sequential rows.
+integers, so every kernel returns the same scores. The block layout is
+chosen when an index is created and never reaches a file: snapshots are
+written from sequential rows. `TURBOVEC_NO_I8MM` set to anything keeps the
+SDOT kernels and the vector-major layout, as upstream's does.
 
 `TURBOVEC_2BIT_VM8=1` in the environment, read once per process, opts in to
 upstream's experimental 2-bit `vm8` path, with upstream's semantics: on an
@@ -173,9 +175,11 @@ upstream's measurements). The results match upstream's single-threaded
 staged search bit for bit, ties included, down to the batch query whose
 sampled seed comes up short and is rescanned with single-query tables.
 Upstream's thread-pool variant refines inside its scan and can return
-different ids. A staged search runs on the calling thread. An index stays staged if it later shrinks below the
-threshold. `ggml_vec_index_turbovec_set_staged(idx, 0)` makes an index scan in
-full instead. On x86, as upstream does, the sign planes are scanned with the
+different ids; here a lone query over 32,768 or more vectors splits its scan
+across the index's threads without changing any result. An index stays
+staged if it later shrinks below the threshold.
+`ggml_vec_index_turbovec_set_staged(idx, 0)` makes an index scan in full
+instead. On x86, as upstream does, the sign planes are scanned with the
 `vpermb` arithmetic, the shortlist is ranked by counting bit masks against the
 query rather than through lookup tables, and a 4-bit shortlist is rescored
 straight from the bit planes. No fixture from upstream x86 covers those
