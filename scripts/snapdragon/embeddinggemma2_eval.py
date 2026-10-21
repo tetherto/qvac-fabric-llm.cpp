@@ -8,6 +8,7 @@ import json
 import logging
 import math
 import os
+import platform
 from pathlib import Path
 import re
 import shlex
@@ -26,6 +27,11 @@ REPO = Path(__file__).resolve().parents[2]
 BENCH_ENV = ("LLAMA_EMBED_BENCH_REPETITIONS", "LLAMA_EMBED_BENCH_WARMUPS")
 COMPUTE_OPS = {"MUL_MAT", "MUL_MAT_ID", "MUL_MAT_NX", "MUL_MAT_ID_NX", "FLASH_ATTN_EXT",
                "GELU", "GELU_QUICK", "GEGLU", "GEGLU_ERF", "GEGLU_QUICK", "RMS_NORM", "SOFT_MAX", "ROPE"}
+
+
+def host_device_info():
+    info = platform.uname()
+    return {"host": info.system + " " + info.release, "machine": info.machine}
 
 
 def htp_compute_records(log):
@@ -247,7 +253,7 @@ def main():
     parser.add_argument("--flash-attn", choices=("on", "off"), default="off")
     parser.add_argument("--timeout", type=positive, default=600, help="seconds per process")
     parser.add_argument("--adb", metavar="SERIAL", help="use an already connected and provisioned Android device")
-    parser.add_argument("--adb-port", type=positive, default=15045)
+    parser.add_argument("--adb-port", type=positive, default=5037)
     parser.add_argument("--remote-dir", default="/data/local/tmp/embeddinggemma2")
     parser.add_argument("--remote-binary")
     parser.add_argument("--remote-model")
@@ -317,8 +323,7 @@ def main():
             report["device_info"] = {prop: runner.remote("getprop " + prop) for prop in
                                      ("ro.product.model", "ro.soc.model", "ro.build.version.release", "ro.build.fingerprint")}
         else:
-            report["device_info"] = {"host": os.uname().sysname + " " + os.uname().release,
-                                     "machine": os.uname().machine}
+            report["device_info"] = host_device_info()
         report["build_version"] = runner.version()
         packed, timing, _ = runner.run("packed", texts, repetitions=args.repetitions)
         singles = [runner.run(f"single-{index:02}", [text])[0][0] for index, text in enumerate(texts)]
