@@ -30,6 +30,12 @@
 #include <utility>
 #include <vector>
 
+#if (defined(__x86_64__) || defined(__i386__)) && (defined(__GNUC__) || defined(__clang__))
+#include <cpuid.h>
+#elif defined(_MSC_VER) && defined(_M_X64)
+#include <intrin.h>
+#endif
+
 #ifdef _WIN32
 #include <process.h>
 #else
@@ -183,7 +189,18 @@ int turbovec_encode_kernel_parity_for_test(int kernel);
 int turbovec_layout_kernel_parity_for_test(int kernel);
 int vector_validation_kernel_parity_for_test(int kernel);
 int crc32c_kernel_parity_for_test(int kernel);
+int turbovec_search_kernel_parity_for_test(int kernel);
+int turbovec_vpermb_reference_search_for_test(
+    const ggml_vec_index_t * idx,
+    const float * queries,
+    int n_q,
+    int k,
+    const uint64_t * allowed,
+    int n_allowed,
+    float * out_scores,
+    uint64_t * out_ids);
 void turbovec_force_vector_major_for_test(int mode);
+void turbovec_force_x86_rules_for_test(int mode);
 void turbovec_disable_dot_product_for_test(int disabled);
 void turbovec_force_vm8_for_test(int mode);
 void turbovec_disable_i8mm_for_test(int disabled);
@@ -4634,6 +4651,65 @@ const Tv1xVmCase * tv1x_vm_case(int dim) {
     return nullptr;
 }
 
+#ifndef GGML_VEC_INDEX_TEST_HOOKS
+// This host runs upstream's x86 vector-major kernels (AVX-512 F, BW, VBMI
+// and VNNI, the layout not opted out).
+bool tv1x_vpermb_host();
+#endif
+
+// Whether a 2- or 3-bit index scores with upstream's x86 `vpermb` scan
+// (x86 with AVX-512 F, BW, VBMI and VNNI, vector-major not opted out),
+// whose scores the fixtures, generated on aarch64, do not record.
+bool tv1x_vpermb_index(const ggml_vec_index_t * idx, int bits) {
+    if (bits == 4) {
+        return false;
+    }
+#ifdef GGML_VEC_INDEX_TEST_HOOKS
+    return turbovec_layout_for_test(idx) == 1;
+#else
+    // Whole four-group units only.
+    if ((ggml_vec_index_dim(idx) / (8 / bits)) % 4 != 0) {
+        return false;
+    }
+    return tv1x_vpermb_host();
+#endif
+}
+
+#ifndef GGML_VEC_INDEX_TEST_HOOKS
+bool tv1x_vpermb_host() {
+#if (defined(__x86_64__) || defined(_M_X64)) && (defined(__GNUC__) || defined(__clang__))
+    for (const char * name : { "TURBOVEC_NO_VECTOR_MAJOR", "TURBOVEC_NO_VNNI" }) {
+        const char * value = std::getenv(name);
+        if (value != nullptr && std::strcmp(value, "0") != 0) {
+            return false;
+        }
+    }
+    __builtin_cpu_init();
+    unsigned eax = 0, ebx = 0, ecx = 0, edx = 0;
+    if (!__builtin_cpu_supports("avx512f") || __get_cpuid_count(7, 0, &eax, &ebx, &ecx, &edx) == 0) {
+        return false;
+    }
+    return (ebx & (1u << 30)) != 0 && (ecx & (1u << 1)) != 0 && (ecx & (1u << 11)) != 0;
+#elif defined(_M_X64)
+    int regs[4] = {};
+    __cpuidex(regs, 7, 0);
+    const unsigned ebx = static_cast<unsigned>(regs[1]);
+    const unsigned ecx = static_cast<unsigned>(regs[2]);
+    for (const char * name : { "TURBOVEC_NO_VECTOR_MAJOR", "TURBOVEC_NO_VNNI" }) {
+        const char * value = std::getenv(name);
+        if (value != nullptr && std::strcmp(value, "0") != 0) {
+            return false;
+        }
+    }
+    // As the library: AVX-512 needs the OS to save the opmask and ZMM state.
+    return (ebx & (1u << 16)) != 0 && (ebx & (1u << 30)) != 0 && (ecx & (1u << 1)) != 0 &&
+           (ecx & (1u << 11)) != 0 && (_xgetbv(0) & 0xe6) == 0xe6;
+#else
+    return false;
+#endif
+}
+#endif
+
 // Upstream scores 4-bit codes with its permute-dot kernel on hosts that run
 // it and with the nibble LUT elsewhere; this port makes the same choice when
 // an index is created. `kernel` names the expected one: 0 LUT, 1 permute-dot,
@@ -4647,7 +4723,10 @@ void tv1x_check_search(
         const float * lut_scores,
         const uint64_t * vm_ids,
         const float * vm_scores) {
-    if (bits != 4 || kernel == 0) {
+    if (tv1x_vpermb_index(idx, bits)) {
+        // Checked against its own reference by check_turbovec_1x_vpermb.
+        std::printf("SKIP TurboVec %d-bit fixture search (x86 vpermb scan)\n", bits);
+    } else if (bits != 4 || kernel == 0) {
         CHECK(tv1x_search_matches(idx, queries, lut_ids, lut_scores));
     } else if (kernel == 1) {
         CHECK(tv1x_search_matches(idx, queries, vm_ids, vm_scores));
@@ -4754,6 +4833,15 @@ void check_simd_kernel_parity() {
     // Hardware CRC-32C against the table loop.
     check_simd_parity_status("CRC-32C", "ARMv8 CRC32", crc32c_kernel_parity_for_test(0), false);
     check_simd_parity_status("CRC-32C", "SSE4.2", crc32c_kernel_parity_for_test(1), false);
+    // The x86 search kernels against their scalar models.
+    static const char * const search_names[] = {
+        "AVX-512 VNNI vpermb scan", "AVX-512 VNNI permute-dot", "AVX-512 GFNI permute-dot", "AVX-512 VNNI exact4",
+        "AVX-512 BW LUT pair", "AVX2 4-query LUT", "AVX-512 BW low masks", "AVX-512 VPOPCNTDQ low dot",
+    };
+    for (int kernel = 0; kernel < 8; ++kernel) {
+        check_simd_parity_status(
+            "TurboVec search", search_names[kernel], turbovec_search_kernel_parity_for_test(kernel), false);
+    }
 }
 
 void check_turbovec_1x_rotation_and_codebooks() {
@@ -5128,7 +5216,7 @@ void check_turbovec_1x_sync_case(const Tv1xSyncCase & c) {
           GGML_VEC_INDEX_OK);
     const bool lut_ids = std::equal(out.begin(), out.end(), c.final_ids);
     const bool vm_ids = c.bits == 4 && std::equal(out.begin(), out.end(), kTv1xVmSyncFinalIds4);
-    CHECK(lut_ids || vm_ids);
+    CHECK(lut_ids || vm_ids || tv1x_vpermb_index(loaded, c.bits));
 
     // The loaded index is bound to the file and syncs on incrementally.
     CHECK(ggml_vec_index_remove(loaded, ids[3]) == GGML_VEC_INDEX_OK);
@@ -5935,6 +6023,8 @@ void check_turbovec_1x_vm8_layout_choice() {
         { 2, 200, 1, 1, 1, 0 }, { 2, 144, 1, 1, 1, 0 }, { 2, 128, 1, 0, 1, 0 }, { 2, 128, 0, 1, 1, 0 },
         { 3, 128, 1, 1, 1, 0 },
     };
+    // The table above is upstream's aarch64 rules.
+    turbovec_force_x86_rules_for_test(0);
     for (const Case & c : cases) {
         turbovec_force_vector_major_for_test(c.vm);
         turbovec_force_vm8_for_test(c.vm8);
@@ -5961,6 +6051,37 @@ void check_turbovec_1x_vm8_layout_choice() {
 #else
     CHECK(!turbovec_planes_for(2, 128));
 #endif
+    // Upstream's x86 rules: vector-major at every width with whole
+    // four-group units (2-bit dim 200 has 50 groups), never vm8 unless a
+    // test forces it, and the planes layout at both widths exactly when
+    // the vector-major kernels run, TURBOVEC_2BIT_VM8 or not.
+    turbovec_force_x86_rules_for_test(1);
+    static constexpr Case x86_cases[] = {
+        { 4, 128, 1, -1, 0, 1 }, { 4, 200, 1, -1, 0, 1 }, { 2, 128, 1, -1, 1, 1 }, { 2, 144, 1, -1, 0, 1 },
+        { 2, 200, 1, -1, 0, 0 }, { 3, 128, 1, -1, 0, 1 }, { 3, 200, 1, -1, 0, 1 }, { 2, 128, 0, -1, 0, 0 },
+        { 3, 128, 0, -1, 0, 0 }, { 4, 128, 0, -1, 0, 0 },
+    };
+    for (const Case & c : x86_cases) {
+        turbovec_force_vector_major_for_test(c.vm);
+        turbovec_force_vm8_for_test(c.vm8);
+        turbovec_force_vm8_2bit_for_test(c.vm8_2bit);
+        auto * idx = ggml_vec_index_create_turbovec(c.dim, c.bits);
+        CHECK(idx != nullptr);
+        CHECK(turbovec_layout_for_test(idx) == c.layout);
+        ggml_vec_index_free(idx);
+    }
+    turbovec_force_planes_for_test(-1, 0);
+    for (const int vm : { 1, 0 }) {
+        turbovec_force_vector_major_for_test(vm);
+        for (const int vm8_2bit : { 0, 1 }) {
+            turbovec_force_vm8_2bit_for_test(vm8_2bit);
+            CHECK(turbovec_planes_for(2, 128) == (vm != 0));
+            CHECK(turbovec_planes_for(4, 128) == (vm != 0));
+            CHECK(!turbovec_planes_for(2, 200));
+            CHECK(!turbovec_planes_for(3, 128));
+        }
+    }
+    turbovec_force_x86_rules_for_test(0);
     tv1x_reset_kernel_overrides();
 }
 
@@ -6202,8 +6323,19 @@ void check_turbovec_1x_batch_goldens() {
             run(c, 1, 1, 0);
         }
     }
-    // The fused batches are NEON-only in this port; elsewhere every query
-    // runs alone, and upstream never takes the vm8 layout there.
+    // Upstream's x86 permute-dot kernels sum the same integers as its
+    // aarch64 ones, so the 4-bit fixtures hold under its x86 rules too
+    // (vector-major, no vm8, this build's batch widths and kernels).
+    turbovec_force_x86_rules_for_test(1);
+    for (const Tv1xBatchCase & c : kTv1xBatchCases) {
+        if (c.bits == 4) {
+            for (const int kernel : { 0, 2 }) {
+                run(c, 0, 0, kernel);
+            }
+        }
+    }
+    turbovec_force_x86_rules_for_test(0);
+    // Upstream takes the vm8 layout on aarch64 alone.
 #if defined(__aarch64__) && (defined(__ARM_NEON) || defined(__ARM_NEON__))
     for (const Tv1xBatchCase & c : kTv1xVm8TwoBitCases) {
         for (const int kernel : { 0, 1 }) {
@@ -6222,8 +6354,12 @@ void check_turbovec_1x_batch_goldens() {
 
 #ifdef GGML_VEC_INDEX_TEST_HOOKS
 // Staged search (upstream planes search): returned scores are the full
-// scan's for the same ids, and on aarch64 the results are upstream's.
-void check_turbovec_1x_staged() {
+// scan's for the same ids, and on aarch64 the results are upstream's. Under
+// upstream's x86 rules the sign region is vector-major and scanned with the
+// `vpermb` arithmetic, the ranking counts bit masks and a 4-bit shortlist
+// is rescored from the planes (exact4); no fixture records that.
+void check_turbovec_1x_staged(int x86_rules) {
+    turbovec_force_x86_rules_for_test(x86_rules);
     const int n = kTv1xStagedN;
     const size_t dim = static_cast<size_t>(kTv1xStagedDim);
     const int k = kTv1xStagedK;
@@ -6295,6 +6431,9 @@ void check_turbovec_1x_staged() {
                     }
                     CHECK(shared * 10 >= staged_ids.size() * 8);
 #if defined(__aarch64__) || defined(_M_ARM64)
+                    if (x86_rules != 0) {
+                        continue;
+                    }
                     bool found = false;
                     for (const Tv1xStagedCase & c : kTv1xStagedCases) {
                         if (c.bits == bits && c.calibrated == calibrated && c.nq == nq && c.filtered == filtered) {
@@ -6315,7 +6454,7 @@ void check_turbovec_1x_staged() {
 #if defined(__aarch64__) || defined(_M_ARM64)
     // A batch in which only query 0's sampled seed runs short: upstream
     // rescans it with the single-query sign tables, and so does the port.
-    {
+    if (x86_rules == 0) {
         const int short_k = kTv1xStagedShortK;
         std::vector<float> short_db = db;
         const std::vector<float> noise = tv1x_rows(kTv1xStagedShortNoiseSeed, 48 * 32, dim);
@@ -6353,6 +6492,95 @@ void check_turbovec_1x_staged() {
 #endif
     turbovec_force_vector_major_for_test(-1);
     turbovec_force_planes_for_test(-1, 0);
+    turbovec_force_x86_rules_for_test(0);
+}
+
+// Upstream's x86 2- and 3-bit search (the `vpermb` scan over vector-major
+// codes, exact u32 table sums, then sum * scale + bias unfused): lone
+// queries, every batch width and tail, filters, block groups split across
+// threads and after swap-removes, all equal to the slow reference bit for
+// bit. Scores no fixture records, since upstream generates its fixtures on
+// aarch64; the reference is the formula upstream's kernel computes.
+void check_turbovec_1x_vpermb() {
+    turbovec_force_x86_rules_for_test(1);
+    turbovec_force_vector_major_for_test(1);
+    turbovec_force_batches_for_test(1);
+    for (const int bits : { 2, 3 }) {
+        for (const int dim : { 96, 200, 768 }) {
+            const size_t d = static_cast<size_t>(dim);
+            const int n = 333;
+            const std::vector<float> rows = tv1x_rows(kTv1xSeedDb, static_cast<size_t>(n), d);
+            const std::vector<uint64_t> ids = tv1x_ids(static_cast<size_t>(n));
+            const std::vector<float> queries = tv1x_rows(kTv1xSeedQuery, 20, d);
+            const std::vector<float> calib = tv1x_rows(kTv1xSeedCalib, kTv1xNCalib, d);
+            std::vector<uint64_t> allow;
+            for (size_t i = 0; i < ids.size(); i += 3) {
+                allow.push_back(ids[i]);
+            }
+            for (const int calibrated : { 0, 1 }) {
+                auto * tv = ggml_vec_index_create_turbovec(dim, bits);
+                const size_t n_byte_groups = d / static_cast<size_t>(8 / bits);
+                CHECK(turbovec_layout_for_test(tv) == (n_byte_groups % 4 == 0 ? 1 : 0));
+                if (calibrated != 0) {
+                    CHECK(ggml_vec_index_turbovec_calibrate(tv, calib.data(), kTv1xNCalib) == GGML_VEC_INDEX_OK);
+                }
+                CHECK(ggml_vec_index_add(tv, rows.data(), n, ids.data()) == GGML_VEC_INDEX_OK);
+                if (turbovec_layout_for_test(tv) != 1) {
+                    std::vector<float> s(10);
+                    std::vector<uint64_t> o(10);
+                    CHECK(turbovec_vpermb_reference_search_for_test(tv, queries.data(), 1, 10, nullptr, 0, s.data(), o.data()) == 0);
+                    ggml_vec_index_free(tv);
+                    continue;
+                }
+                for (const size_t i : { size_t{ 5 }, size_t{ 140 }, size_t{ 332 } }) {
+                    CHECK(ggml_vec_index_remove(tv, ids[i]) == GGML_VEC_INDEX_OK);
+                }
+                constexpr int k = 11;
+                for (const int threads : { 1, 4 }) {
+                    ggml_vec_index_set_threads(tv, threads);
+                    for (const int n_q : { 1, 2, 5, 6, 7, 13, 20 }) {
+                        for (const int filtered : { 0, 1 }) {
+                            std::vector<float> scores(static_cast<size_t>(n_q * k)), want(scores.size());
+                            std::vector<uint64_t> out(scores.size()), want_ids(scores.size());
+                            CHECK((filtered != 0 ?
+                                ggml_vec_index_search_filtered(tv, queries.data(), n_q, k, allow.data(),
+                                    static_cast<int>(allow.size()), scores.data(), out.data()) :
+                                ggml_vec_index_search(tv, queries.data(), n_q, k, scores.data(), out.data())) ==
+                                GGML_VEC_INDEX_OK);
+                            CHECK(turbovec_vpermb_reference_search_for_test(tv, queries.data(), n_q, k,
+                                filtered != 0 ? allow.data() : nullptr, static_cast<int>(allow.size()), want.data(),
+                                want_ids.data()) == 1);
+                            CHECK(out == want_ids);
+                            CHECK(std::memcmp(scores.data(), want.data(), scores.size() * sizeof(float)) == 0);
+                        }
+                    }
+                }
+                // The aarch64 rules' LUT scan rounds differently, so the
+                // two cannot be confused.
+                turbovec_force_x86_rules_for_test(0);
+                auto * lut = ggml_vec_index_create_turbovec(dim, bits);
+                turbovec_force_x86_rules_for_test(1);
+                CHECK(turbovec_layout_for_test(lut) == 0);
+                if (calibrated != 0) {
+                    CHECK(ggml_vec_index_turbovec_calibrate(lut, calib.data(), kTv1xNCalib) == GGML_VEC_INDEX_OK);
+                }
+                CHECK(ggml_vec_index_add(lut, rows.data(), n, ids.data()) == GGML_VEC_INDEX_OK);
+                for (const size_t i : { size_t{ 5 }, size_t{ 140 }, size_t{ 332 } }) {
+                    CHECK(ggml_vec_index_remove(lut, ids[i]) == GGML_VEC_INDEX_OK);
+                }
+                std::vector<float> a(static_cast<size_t>(20 * k)), b(a.size());
+                std::vector<uint64_t> ai(a.size()), bi(a.size());
+                CHECK(ggml_vec_index_search(tv, queries.data(), 20, k, a.data(), ai.data()) == GGML_VEC_INDEX_OK);
+                CHECK(ggml_vec_index_search(lut, queries.data(), 20, k, b.data(), bi.data()) == GGML_VEC_INDEX_OK);
+                CHECK(a != b);
+                ggml_vec_index_free(lut);
+                ggml_vec_index_free(tv);
+            }
+        }
+    }
+    turbovec_force_batches_for_test(0);
+    turbovec_force_vector_major_for_test(-1);
+    turbovec_force_x86_rules_for_test(0);
 }
 #endif
 
@@ -7226,8 +7454,11 @@ int main(int argc, char ** argv) {
 
 #ifdef GGML_VEC_INDEX_TEST_HOOKS
     if (argc == 2 && std::string(argv[1]) == "--internal-hooks") {
-        // Kernel-consistency checks below compare against the scalar LUT.
+        // Kernel-consistency checks below compare against the scalar LUT,
+        // and the fixtures are upstream's aarch64 results: tests that want
+        // upstream's x86 rules ask for them.
         turbovec_force_vector_major_for_test(0);
+        turbovec_force_x86_rules_for_test(0);
         if (kTurboVecSupported) {
             {
                 constexpr int tv_cache_dim = 64;
@@ -7278,7 +7509,9 @@ int main(int argc, char ** argv) {
             check_turbovec_1x_vm8_mutations();
             check_turbovec_1x_vm8_2bit();
             check_turbovec_1x_batch_goldens();
-            check_turbovec_1x_staged();
+            check_turbovec_1x_staged(0);
+            check_turbovec_1x_staged(1);
+            check_turbovec_1x_vpermb();
             check_turbovec_1x_thread_invariance();
             check_vector_index_pool();
             check_turbovec_1x_concurrent_search();
