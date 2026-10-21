@@ -477,10 +477,6 @@ void write_topk_results(
     write_topk_heap(idx, k, out_scores, out_ids, heap);
 }
 
-// A single TurboVec query over at least this many 32-vector blocks splits
-// them across threads (upstream turbovec's block-parallel threshold).
-constexpr size_t kTurboVecParallelMinBlocks = 1024;
-
 struct TurboVecQueryLut {
     const uint8_t * lut;
     float scale;
@@ -655,6 +651,7 @@ void search_one(
             opts.single_query = single_query;
             opts.sign_single = staged_sign_single;
             opts.seed_short = staged_seed_short;
+            opts.n_threads = n_threads;
             if (turbovec_staged_search(
                     idx, score_query, tqplus_bias, k, staged_mask.empty() ? nullptr : staged_mask.data(), opts,
                     heap)) {
@@ -1321,6 +1318,7 @@ static int ggml_vec_index_search_impl(
         // query goes through the single-query scan and its narrower sign
         // tables, which can change its shortlist. Several short queries
         // keep the batch tables, as their first pass here already did.
+        // The rescan runs alone, so it may split its blocks.
         if (std::count(seed_short.begin(), seed_short.end(), uint8_t{ 1 }) == 1) {
             const size_t q = static_cast<size_t>(std::find(seed_short.begin(), seed_short.end(), uint8_t{ 1 }) - seed_short.begin());
             Scratch & sc = scratch[0];
@@ -1338,7 +1336,7 @@ static int ggml_vec_index_search_impl(
                 sc.allowed_blocks,
                 allowed_ptr,
                 rotated_turbovec_queries.empty() ? nullptr : rotated_turbovec_queries.data() + q * dim_sz,
-                block_threads,
+                idx->n_threads,
                 false,
                 nullptr,
                 true);
