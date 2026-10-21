@@ -190,6 +190,7 @@ int turbovec_layout_kernel_parity_for_test(int kernel);
 int vector_validation_kernel_parity_for_test(int kernel);
 int crc32c_kernel_parity_for_test(int kernel);
 int vec_index_simd_kernel_built_for_test(int id);
+int turbovec_pd_finish_parity_for_test();
 int turbovec_search_kernel_parity_for_test(int kernel);
 int turbovec_vpermb_reference_search_for_test(
     const ggml_vec_index_t * idx,
@@ -4867,6 +4868,7 @@ void check_simd_kernel_parity() {
 #endif
     check_simd_parity_status("CRC-32C", "ARMv8 CRC32", crc32c_kernel_parity_for_test(0), always_crc32, 4);
     check_simd_parity_status("CRC-32C", "SSE4.2", crc32c_kernel_parity_for_test(1), false, 5);
+    check_simd_parity_status("TurboVec permute-dot epilogue", "AVX2", turbovec_pd_finish_parity_for_test(), false, 1);
     // The x86 search kernels against their scalar models.
     static const char * const search_names[] = {
         "AVX-512 VNNI vpermb scan", "AVX-512 VNNI permute-dot", "AVX-512 GFNI permute-dot", "AVX-512 VNNI exact4",
@@ -6624,7 +6626,8 @@ void check_turbovec_1x_vpermb() {
     }
     turbovec_force_batches_for_test(0);
     turbovec_force_vector_major_for_test(-1);
-    turbovec_force_x86_rules_for_test(0);    turbovec_force_vm8_2bit_for_test(-1);
+    turbovec_force_x86_rules_for_test(0);
+    turbovec_force_vm8_2bit_for_test(-1);
 }
 #endif
 
@@ -6877,7 +6880,8 @@ void check_turbovec_1x_concurrent_search() {
 // The staged-search cache follows every mutation: an index searched after
 // adds, removals, a calibrate or a reload agrees with one rebuilt from its
 // bytes, and the file layout follows the index's size across syncs.
-void check_turbovec_1x_staged_maintenance() {
+void check_turbovec_1x_staged_maintenance(int x86_rules) {
+    turbovec_force_x86_rules_for_test(x86_rules);
     constexpr int dim = 64;
     constexpr int threshold = 1000;
     const std::vector<float> rows = tv1x_rows(kTv1xSeedDb, 3000, dim);
@@ -6953,6 +6957,7 @@ void check_turbovec_1x_staged_maintenance() {
     std::filesystem::remove(path);
     turbovec_force_vector_major_for_test(-1);
     turbovec_force_planes_for_test(-1, 0);
+    turbovec_force_x86_rules_for_test(0);
 }
 #endif
 
@@ -7625,7 +7630,8 @@ int main(int argc, char ** argv) {
             check_turbovec_1x_thread_invariance();
             check_vector_index_pool();
             check_turbovec_1x_concurrent_search();
-            check_turbovec_1x_staged_maintenance();
+            check_turbovec_1x_staged_maintenance(0);
+            check_turbovec_1x_staged_maintenance(1);
             check_turbovec_1x_batch_block_split();
             check_turbovec_1x_single_code_copy();
             check_turbovec_1x_streamed_snapshots();

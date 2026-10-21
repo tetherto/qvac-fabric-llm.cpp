@@ -2756,6 +2756,15 @@ static void permute_dot_finish(
         size_t base,
         size_t valid,
         float * out_scores) {
+#if defined(GGML_VEC_INDEX_HAVE_AVX2_KERNEL) && (defined(__x86_64__) || defined(_M_X64))
+    // Without -mfma here std::fma is a libm call per lane (a software
+    // routine on MSVC); every host that runs these kernels has AVX2 + FMA.
+    if (vec_index_cpu_features().avx2) {
+        ggml_vec_index_detail::permute_dot_finish_avx2(
+            sums, pd.scale, pd.bias, vector_scales + base, valid, out_scores);
+        return;
+    }
+#endif
     for (size_t lane = 0; lane < static_cast<size_t>(kTurboVecScoreBlock); ++lane) {
         out_scores[lane] = lane < valid ?
             std::fma(static_cast<float>(sums[lane]), pd.scale, pd.bias) * vector_scales[base + lane] :
@@ -4999,6 +5008,45 @@ static bool turbovec_x86_kernel_available(int kernel) {
 
 static bool same_float_bits(const float * a, const float * b, size_t n) {
     return std::memcmp(a, b, n * sizeof(float)) == 0;
+}
+
+// 1 when the AVX2 permute-dot epilogue matches the scalar fma(sum, scale,
+// bias) * scale bit for bit, 0 on a mismatch, -1 when this build or CPU
+// lacks it.
+int turbovec_pd_finish_parity_for_test() {
+#if defined(GGML_VEC_INDEX_HAVE_AVX2_KERNEL) && (defined(__x86_64__) || defined(_M_X64))
+    if (!vec_index_cpu_features().avx2) {
+        return -1;
+    }
+    uint32_t state = 0x6a09e667u;
+    auto next = [&]() {
+        state = state * 1664525u + 1013904223u;
+        return state;
+    };
+    for (int it = 0; it < 20000; ++it) {
+        int32_t sums[32];
+        float scales[32];
+        for (int lane = 0; lane < 32; ++lane) {
+            sums[lane] = static_cast<int32_t>(next() % 80000001u) - 40000000;
+            scales[lane] = (static_cast<float>(next() % 2001u) - 1000.0f) * 1e-6f;
+        }
+        const float scale = (static_cast<float>(next() % 2001u) - 1000.0f) * 1e-7f;
+        const float bias = (static_cast<float>(next() % 2001u) - 1000.0f) * 1e-3f;
+        const size_t valid = next() % 33u;
+        float got[32];
+        ggml_vec_index_detail::permute_dot_finish_avx2(sums, scale, bias, scales, valid, got);
+        for (size_t lane = 0; lane < 32; ++lane) {
+            const float want = lane < valid ? std::fma(static_cast<float>(sums[lane]), scale, bias) * scales[lane] :
+                -std::numeric_limits<float>::infinity();
+            if (std::memcmp(&got[lane], &want, sizeof(float)) != 0) {
+                return 0;
+            }
+        }
+    }
+    return 1;
+#else
+    return -1;
+#endif
 }
 
 // Kernel 0: the AVX-512 VNNI `vpermb` scan; 1: the VNNI permute-dot scan;

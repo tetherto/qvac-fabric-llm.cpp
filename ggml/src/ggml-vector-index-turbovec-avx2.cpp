@@ -279,6 +279,35 @@ double turbovec_quantize_row_avx2(
 // testing |x| < max_abs eight lanes at a time (NaN, Inf and over-magnitude
 // values all fail), with the exact scalar predicate pinpointing the first
 // invalid element of a flagged group. Returns n when every element is valid.
+void permute_dot_finish_avx2(
+        const int32_t * sums, float scale, float bias, const float * vector_scales, size_t valid, float * out_scores) {
+    const __m256 scale_v = _mm256_set1_ps(scale);
+    const __m256 bias_v = _mm256_set1_ps(bias);
+    uint32_t neg_inf_bits = 0xff800000u;
+    float neg_inf = 0.0f;
+    std::memcpy(&neg_inf, &neg_inf_bits, sizeof(neg_inf));
+    // Eight lanes at a time over all 32 (sums always holds 32); scales are
+    // read only for valid lanes, through a padded copy in a partial group.
+    for (size_t lane = 0; lane < 32; lane += 8) {
+        if (lane >= valid) {
+            for (size_t i = lane; i < lane + 8; ++i) {
+                out_scores[i] = neg_inf;
+            }
+            continue;
+        }
+        const size_t live = valid - lane < 8 ? valid - lane : 8;
+        float scales[8] = {};
+        std::memcpy(scales, vector_scales + lane, live * sizeof(float));
+        const __m256 sum = _mm256_cvtepi32_ps(_mm256_loadu_si256(reinterpret_cast<const __m256i *>(sums + lane)));
+        const __m256 fused = _mm256_fmadd_ps(sum, scale_v, bias_v);
+        float result[8];
+        _mm256_storeu_ps(result, _mm256_mul_ps(fused, _mm256_loadu_ps(scales)));
+        for (size_t i = 0; i < 8; ++i) {
+            out_scores[lane + i] = i < live ? result[i] : neg_inf;
+        }
+    }
+}
+
 // The scalar predicate !isfinite(x) || fabs(x) >= max_abs on the bits, so
 // this object instantiates no <cmath> inline function: an AVX2-built copy
 // of one could be the copy baseline code links against.

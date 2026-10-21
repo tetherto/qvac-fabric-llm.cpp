@@ -634,6 +634,7 @@ int turbovec_sync_plan_for_test(
 void turbovec_force_vector_major_for_test(int mode);
 void turbovec_disable_dot_product_for_test(int disabled);
 int vec_index_simd_kernel_built_for_test(int id);
+int turbovec_pd_finish_parity_for_test();
 // -1 follows the build, 0 or 1 forces upstream's aarch64 or x86 rules for
 // indexes created afterwards (turbovec_x86_rules).
 void turbovec_force_x86_rules_for_test(int mode);
@@ -809,7 +810,7 @@ void score_turbovec_permute_dot_blocks(
 // `vpermb` scan (n_byte_groups a multiple of four, n_byte_groups * 32
 // bytes).
 void turbovec_split_lut_for_vnni(const uint8_t * lut, size_t n_byte_groups, uint8_t * out);
-// The `vpermb` scan (turbovec_scores_vnni_lut) of nq queries (up to 12)
+// The `vpermb` scan (turbovec_scores_vnni_lut) of nq queries (up to 8)
 // over n_group consecutive vector-major blocks, out_scores[q][b * 32 +
 // lane]. `splits` (each query's split tables) may be null: the AVX-512
 // kernel needs them, the scalar model reads `luts`.

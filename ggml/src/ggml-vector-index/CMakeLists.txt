@@ -261,6 +261,13 @@ endforeach()
 if (GGML_VECTOR_INDEX_VNNI_FLAG OR GGML_VECTOR_INDEX_GFNI_FLAG)
     list(APPEND GGML_VECTOR_INDEX_SOURCES ${GGML_VECTOR_INDEX_SOURCE_DIR}/ggml-vector-index-turbovec-pd-x86.h)
 endif()
+if (GGML_SYSTEM_ARCH STREQUAL "x86" AND NOT GGML_VECTOR_INDEX_VNNI_FLAG)
+    # Layout and staged search follow the CPU, as upstream's do, so on an
+    # AVX-512 VBMI/VNNI CPU a build without these kernels scores through
+    # their scalar models: the same results, far slower.
+    message(WARNING "ggml-vector-index: the AVX-512 VNNI search kernels could not be built with this compiler; "
+        "TurboVec searches on AVX-512 VBMI/VNNI CPUs will use a much slower scalar path")
+endif()
 set(GGML_VECTOR_INDEX_X86_DEFINITIONS "")
 foreach (kernel IN ITEMS AVX512BW VNNI GFNI VPOPCNT)
     if (GGML_VECTOR_INDEX_${kernel}_FLAG)
