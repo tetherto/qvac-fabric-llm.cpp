@@ -125,12 +125,20 @@ quantization. An index that is never calibrated is plain TurboQuant.
 
 Like upstream, 4-bit search picks its arithmetic by host. On aarch64 with the
 dot-product extension, 4-bit codes are scored with upstream's int8
-permute-dot arithmetic (an SDOT kernel over upstream's vector-major block
-layout); elsewhere they are scored through the nibble lookup tables, as 2-
-and 3-bit codes always are. The two round differently, so 4-bit scores, and
-occasionally which ids sit at the edge of a top-k, depend on the host exactly
-as upstream's do. Upstream also uses permute-dot on x86 with AVX-512 VBMI
-and VNNI; this port keeps the lookup tables there for now.
+permute-dot arithmetic over upstream's vector-major block layout; elsewhere
+they are scored through the nibble lookup tables, as 2- and 3-bit codes
+always are. The two round differently, so 4-bit scores, and occasionally
+which ids sit at the edge of a top-k, depend on the host exactly as
+upstream's do. Upstream also uses permute-dot on x86 with AVX-512 VBMI and
+VNNI; this port keeps the lookup tables there for now.
+
+On aarch64 with the int8 matrix-multiply extension (i8mm) as well, a 4-bit
+index whose dimension is a multiple of 16 takes upstream's wider `vm8`
+block layout, and the queries of a multi-query search are scored in fused
+batches of 12, 8 or 4 with SMMLA kernels, as upstream does (other dimensions
+batch with SMMLA over the vector-major layout). Permute-dot sums are exact
+integers, so every kernel returns the same scores. The block layout is chosen when an index is created
+and never reaches a file: snapshots are written from sequential rows.
 
 Large 2- and 4-bit indexes search in stages, as upstream does. From 32,768
 vectors, at dimensions that are multiples of 32, on aarch64 (4 bits also needs
