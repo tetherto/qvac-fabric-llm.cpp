@@ -45,9 +45,15 @@ llama_memory_recurrent::llama_memory_recurrent(
     {
         const char * env = getenv("LLAMA_GDN_DEFERRED");
         const bool arch_ok = model.arch == LLM_ARCH_QWEN35 || model.arch == LLM_ARCH_QWEN35MOE;
-        gdn_deferred = n_rs_seq > 0 && arch_ok && env && atoi(env) != 0;
-        // LLAMA_GDN_DEFERRED=2 keeps gathering the base states (for A/B runs)
-        gdn_inplace  = gdn_deferred && atoi(env) != 2;
+        // without offload the records live in host memory, so the deferred ops would run on the CPU
+        if (!offload && env && atoi(env) != 0) {
+            LLAMA_LOG_WARN("%s: LLAMA_GDN_DEFERRED is ignored when the recurrent states are not offloaded\n", __func__);
+        }
+        gdn_deferred = offload && n_rs_seq > 0 && arch_ok && env && atoi(env) != 0;
+        // LLAMA_GDN_DEFERRED=2 keeps gathering the base states (for A/B runs).
+        // only a single cell always keeps its own base state: with more cells, whether a ubatch could
+        // skip the gather depends on the cell layout, and the graph would not match the reserved one
+        gdn_inplace  = gdn_deferred && atoi(env) != 2 && mem_size == 1;
         if (gdn_deferred) {
             const int64_t H_v = hparams.ssm_dt_rank;
             const int64_t S_v = hparams.ssm_d_inner / H_v;
@@ -862,23 +868,22 @@ void llama_memory_recurrent::set_input_gdn_deferred(int32_t * s_copy_base, int32
         const auto &   cell    = cells[cell_id];
         const int32_t  src0    = cell.src0;
 
-        if (s_copy_base) {
-            s_copy_base[i] = src0;
+        s_copy_base[i] = src0;
+
+        // the pending rollback applies to extra cells too: s_copy() consumes it for every cell
+        uint32_t rollback = 0;
+        if (!cell.seq_id.empty()) {
+            const llama_seq_id seq = *cell.seq_id.begin();
+            if (seq >= 0 && (size_t) seq < rs_idx.size()) {
+                rollback = rs_idx[seq];
+            }
         }
 
+        // a cell copied from the zeroed state starts with nothing to replay
+        const uint32_t rows = src0 == rs_z ? 0 : rec_rows[src0];
+        GGML_ASSERT(rollback <= rows);
+
         if (i < n_seqs) {
-            uint32_t rollback = 0;
-            if (!cell.seq_id.empty()) {
-                const llama_seq_id seq = *cell.seq_id.begin();
-                if (seq >= 0 && (size_t) seq < rs_idx.size()) {
-                    rollback = rs_idx[seq];
-                }
-            }
-
-            // a cell copied from the zeroed state starts with nothing to replay
-            const uint32_t rows = src0 == rs_z ? 0 : rec_rows[src0];
-            GGML_ASSERT(rollback <= rows);
-
             rec_idx[3*i + 0] = (int32_t) (rows - rollback);
             rec_idx[3*i + 1] = 2*src0 + rec_slot[src0];
             rec_idx[3*i + 2] = 2*cell_id + 1 - rec_slot[cell_id];
@@ -886,9 +891,9 @@ void llama_memory_recurrent::set_input_gdn_deferred(int32_t * s_copy_base, int32
             slot_new[i] = 1 - rec_slot[cell_id];
             rows_new[i] = std::min(n_seq_tokens, K);
         } else {
-            // extra cells get a copy of both record slots of their source (see build_rs_gdn_deferred_extra)
+            // extra cells get a copy of both record slots of their source (see build_conv_deferred and build_recurrent_attn)
             slot_new[i] = rec_slot[src0];
-            rows_new[i] = src0 == rs_z ? 0 : rec_rows[src0];
+            rows_new[i] = rows - rollback;
         }
     }
 
@@ -1675,17 +1680,10 @@ bool llama_memory_recurrent_context::get_gdn_deferred() const {
 }
 
 bool llama_memory_recurrent_context::get_s_base_inplace(uint32_t n_seqs) const {
-    if (is_full || !mem->gdn_inplace || get_n_rs() != n_seqs) {
-        return false;
-    }
+    GGML_UNUSED(n_seqs);
 
-    for (uint32_t i = 0; i < n_seqs; ++i) {
-        if (mem->cells[mem->head + i].src0 != (int32_t) (mem->head + i)) {
-            return false;
-        }
-    }
-
-    return true;
+    // gdn_inplace implies a single cell, which always keeps its own base state (also in the reserved graph)
+    return mem->gdn_inplace;
 }
 
 int64_t llama_memory_recurrent_context::get_gdn_k() const {
