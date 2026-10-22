@@ -1,0 +1,5 @@
+coremltools==9.0
+numpy==2.2.6
+safetensors==0.8.0
+torch==2.7.0
+transformers @ git+https://github.com/huggingface/transformers.git@ab7e5ac33f234b41665fee663fefd441d35ad3d4
