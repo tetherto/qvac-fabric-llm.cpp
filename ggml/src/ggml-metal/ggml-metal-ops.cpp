@@ -90,6 +90,15 @@ struct ggml_metal_op {
         return ggml_graph_node(gf, idxs[i]);
     }
 
+    ggml_cgraph * graph() const {
+        return gf;
+    }
+
+    int graph_idx(int i) const {
+        assert(i >= 0 && i < (int) idxs.size());
+        return idxs[i];
+    }
+
     // consult the fusion table for the longest pattern starting at i0
     // returns the matching pattern (nullptr if no fusion) and sets *n_out to the number of nodes
     const ggml_metal_fusion * can_fuse(int i0, enum ggml_metal_fusion_mode mode, int * n_out) const {
