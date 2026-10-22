@@ -58,6 +58,19 @@ static double nmse(const std::vector<float> & a, const std::vector<float> & b) {
     return mse_a_b / mse_a_0;
 }
 
+static std::vector<float> get_tensor_f32(const ggml_tensor * tensor) {
+    std::vector<float> data(ggml_nelements(tensor));
+    if (tensor->type == GGML_TYPE_F32) {
+        ggml_backend_tensor_get(tensor, data.data(), 0, ggml_nbytes(tensor));
+    } else {
+        GGML_ASSERT(tensor->type == GGML_TYPE_F16);
+        std::vector<ggml_fp16_t> data_f16(data.size());
+        ggml_backend_tensor_get(tensor, data_f16.data(), 0, ggml_nbytes(tensor));
+        ggml_fp16_to_fp32_row(data_f16.data(), data.data(), data.size());
+    }
+    return data;
+}
+
 struct tensor_data_params {
     size_t seed;
     float  stdev;
@@ -1263,16 +1276,30 @@ static std::string get_device_label(ggml_backend_dev_t dev) {
 // A unified cache has one cell-to-block map for every sequence. Image patches can share a
 // temporal position, so until QSA has sequence-local ranks this configuration must stay dense.
 static int test_qsa_unified_multiseq(size_t seed, float stdev) {
+    // visible (finite) cells of the selection masks, and the layers that have one (once per ubatch)
     struct observed_nodes {
-        bool top_k = false;
+        bool                  top_k    = false;
+        size_t                n_sparse = 0;
+        std::set<std::string> layers;
     } observed;
 
     auto observe = [](ggml_tensor * tensor, bool ask, void * data) {
+        auto & nodes = *static_cast<observed_nodes *>(data);
+        auto count_finite = [](const std::vector<float> & mask) {
+            return (size_t) std::count_if(mask.begin(), mask.end(), [](float v) { return std::isfinite(v); });
+        };
         if (ask) {
-            auto & nodes = *static_cast<observed_nodes *>(data);
             nodes.top_k |= std::strncmp(tensor->name, "indexer_top_k-", 14) == 0;
+            if (std::strncmp(tensor->name, "kq_mask_qsa-", 12) != 0) {
+                return false;
+            }
+            return true;
         }
-        return false;
+        // upstream builds the selection from set_rows(-inf, 0) alone, without adding the kq_mask,
+        // so the causal cell count is derived from the batches below instead of read from the graph
+        nodes.layers.insert(tensor->name);
+        nodes.n_sparse += count_finite(get_tensor_f32(tensor));
+        return true;
     };
 
     // top_k below the per-sequence context so the indexer drops cells
@@ -1369,14 +1396,35 @@ static int test_qsa_unified_multiseq(size_t seed, float stdev) {
     steps.push_back(make_batch({ { 0, 64, 0 }, { 1, 40, 3 } }));
     steps.push_back(make_batch({ { 1, 16, 8 }, { 0, 32, 8 } }));
 
+    // (seq, pos) of the cells already in the cache, the batch tokens are appended per step
+    std::vector<std::pair<llama_seq_id, llama_pos>> cells;
+
     for (const auto & step : steps) {
+        observed.n_sparse = 0;
+        observed.layers.clear();
         const auto actual   = decode(unified.second.get(), step->batch);
         const auto expected = decode(streams.second.get(), step->batch);
         const auto baseline = decode(dense.second.get(),   step->batch);
 
-        // unified matches per-stream to ~1e-14, sparse differs from dense by ~1e-9
+        // cells the causal mask allows: same sequence, position not after the token
+        for (int32_t i = 0; i < step->batch.n_tokens; ++i) {
+            cells.emplace_back(step->batch.seq_id[i][0], step->batch.pos[i]);
+        }
+        size_t n_causal = 0;
+        for (int32_t i = 0; i < step->batch.n_tokens; ++i) {
+            for (const auto & [seq, pos] : cells) {
+                n_causal += seq == step->batch.seq_id[i][0] && pos <= step->batch.pos[i];
+            }
+        }
+        const size_t n_dense = n_causal*observed.layers.size();
+
+        // unified matches per-stream to ~1e-14
         GGML_ASSERT(nmse(actual, expected) < 1e-11);
-        GGML_ASSERT(nmse(expected, baseline) > 1e-11);
+        // the selection drops cells the causal mask allows and that reaches the logits;
+        // how much it moves them depends on the weight draw, which differs per C++ stdlib
+        GGML_ASSERT(!observed.layers.empty());
+        GGML_ASSERT(observed.n_sparse > 0 && observed.n_sparse < n_dense);
+        GGML_ASSERT(nmse(expected, baseline) > 0.0);
     }
 
     GGML_ASSERT(observed.top_k);
@@ -2473,19 +2521,6 @@ static void fold_rows(std::vector<float> & rows, int64_t n) {
     for (size_t r = 0; r < rows.size(); r += n) {
         fold_row(rows.data() + r, n);
     }
-}
-
-static std::vector<float> get_tensor_f32(const ggml_tensor * tensor) {
-    std::vector<float> data(ggml_nelements(tensor));
-    if (tensor->type == GGML_TYPE_F32) {
-        ggml_backend_tensor_get(tensor, data.data(), 0, ggml_nbytes(tensor));
-    } else {
-        GGML_ASSERT(tensor->type == GGML_TYPE_F16);
-        std::vector<ggml_fp16_t> data_f16(data.size());
-        ggml_backend_tensor_get(tensor, data_f16.data(), 0, ggml_nbytes(tensor));
-        ggml_fp16_to_fp32_row(data_f16.data(), data.data(), data.size());
-    }
-    return data;
 }
 
 // a copy of the target with prism.hadamard metadata and its token_embd, output and extra_folded rows folded, which leaves
