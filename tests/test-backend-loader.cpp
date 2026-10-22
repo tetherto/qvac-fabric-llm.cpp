@@ -6,6 +6,8 @@
 //   - a module reachable through two directory entries is scored once
 //   - GGML_DISABLE_CUDA stops the cuda search entirely
 //   - a module logs through the logger set with ggml_log_set, also while it is scored
+//   - outside Windows, with a static ggml-base: a module error line also goes to stderr,
+//     and loading again keeps a logger set on the module
 //   - on Windows, a cuda module's runtime DLL resolves from CUDA_PATH or CUDA_PATH_V*
 
 #include "ggml-backend.h"
@@ -16,6 +18,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <string>
 #include <vector>
 
@@ -38,6 +41,10 @@ static void set_env(const char * name, const char * value) {
     SetEnvironmentVariableA(name, value);
 }
 #else
+#    include <dlfcn.h>
+#    include <fcntl.h>
+#    include <unistd.h>
+
 static const char * const k_prefix = "libqvac-ggml-cuda-";
 static const char * const k_ext    = ".so";
 
@@ -68,7 +75,6 @@ static std::vector<log_line> log_lines;
 
 static void capture_log(ggml_log_level level, const char * text, void *) {
     log_lines.push_back({ level, text });
-    fputs(text, stderr);
 }
 
 static bool logged(ggml_log_level level, const std::string & text) {
@@ -79,6 +85,32 @@ static bool logged(ggml_log_level level, const std::string & text) {
     }
     return false;
 }
+
+#ifndef _WIN32
+static std::vector<std::string> module_lines;
+
+static void module_log(ggml_log_level, const char * text, void *) {
+    module_lines.emplace_back(text);
+}
+
+// Run fn with stderr sent to a file, and return what was written.
+template <typename F> static std::string capture_stderr(const fs::path & file, F fn) {
+    fflush(stderr);
+    const int saved = dup(STDERR_FILENO);
+    const int fd    = open(file.string().c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (saved < 0 || fd < 0) {
+        return "<cannot capture stderr>";
+    }
+    dup2(fd, STDERR_FILENO);
+    close(fd);
+    fn();
+    fflush(stderr);
+    dup2(saved, STDERR_FILENO);
+    close(saved);
+    std::ifstream in(file);
+    return std::string(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+}
+#endif
 
 static ggml_backend_reg_t find_reg(const char * name) {
     for (size_t i = 0; i < ggml_backend_reg_count(); i++) {
@@ -157,6 +189,41 @@ int main() {
     if (have_link) {
         check(count_scores(log, "STUB_OK") == 1, "module behind two entries is scored once");
     }
+
+#ifndef _WIN32
+    {
+        // The module's own logger, when it links its own ggml-base.
+        using log_set_t      = void (*)(ggml_log_callback, void *);
+        using log_internal_t = void (*)(ggml_log_level, const char *, ...);
+        Dl_info            info{};
+        ggml_backend_reg_t reg    = find_reg("STUB_OK");
+        void *             handle = nullptr;
+        if (reg != nullptr && dladdr(reg, &info) != 0 && info.dli_fname != nullptr) {
+            handle = dlopen(info.dli_fname, RTLD_NOW | RTLD_NOLOAD);
+        }
+        auto mod_log_set      = handle ? (log_set_t) dlsym(handle, "ggml_log_set") : nullptr;
+        auto mod_log_internal = handle ? (log_internal_t) dlsym(handle, "ggml_log_internal") : nullptr;
+        if (mod_log_set == nullptr || mod_log_internal == nullptr || mod_log_set == &ggml_log_set) {
+            printf("module shares ggml-base, own-logger cases skipped\n");
+        } else {
+            const std::string err = capture_stderr(dir / "stderr.log", [&] {
+                mod_log_internal(GGML_LOG_LEVEL_ERROR, "STUB_OK: error\n");
+            });
+            check(logged(GGML_LOG_LEVEL_ERROR, "STUB_OK: error\n"), "module error reaches the logger");
+            check(err == "STUB_OK: error\n", "module error also goes to stderr");
+
+            mod_log_set(module_log, nullptr);
+            ggml_backend_load_all_from_path(dir.string().c_str());
+            mod_log_internal(GGML_LOG_LEVEL_INFO, "STUB_OK: probe\n");
+            check(!module_lines.empty() && module_lines.back() == "STUB_OK: probe\n",
+                  "loading again keeps a logger set on the module");
+            mod_log_set(nullptr, nullptr);
+        }
+        if (handle != nullptr) {
+            dlclose(handle);
+        }
+    }
+#endif
     unload_all("STUB_OK");
 
     fs::remove(log, ec);
