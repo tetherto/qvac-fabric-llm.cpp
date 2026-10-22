@@ -76,7 +76,8 @@ void quantize_cutlass_nvfp4_cuda(
         const float * x, void * vy, uint8_t * block_scales, float * row_scales, bool use_aligned_float8,
         int64_t n_cols, int64_t n_cols_padded, int64_t stride_row, int64_t n_rows, cudaStream_t stream);
 
-void quantize_cutlass_nvfp4_swiglu_bf16_cuda(const nv_bfloat16 * gate,
+// returns whether glu was written, which happens only when a row does not fit in shared memory
+bool quantize_cutlass_nvfp4_swiglu_bf16_cuda(const nv_bfloat16 * gate,
                                              const nv_bfloat16 * up,
                                              const float *       gate_scale,
                                              const float *       up_scale,
