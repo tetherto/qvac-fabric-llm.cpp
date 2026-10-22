@@ -13960,7 +13960,7 @@ struct test_speech_matmul_precision : test_mul_mat {
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * out = test_mul_mat::build_graph(ctx);
-        ggml_mul_mat_set_prec(out, GGML_PREC_F32);
+        GGML_ASSERT(ggml_prec_set_acc(out, GGML_PREC_F32));
         return out;
     }
 };
