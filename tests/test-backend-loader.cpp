@@ -6,7 +6,7 @@
 //   - a module reachable through two directory entries is scored once
 //   - GGML_DISABLE_CUDA stops the cuda search entirely
 //   - a module logs through the logger set with ggml_log_set, also while it is scored
-//   - outside Windows, with a static ggml-base: a module error line also goes to stderr,
+//   - outside Windows, with a static ggml-base: a module error line and its CONT lines also go to stderr,
 //     and loading again keeps a logger set on the module
 //   - on Windows, a cuda module's runtime DLL resolves from CUDA_PATH or CUDA_PATH_V*
 
@@ -208,9 +208,13 @@ int main() {
         } else {
             const std::string err = capture_stderr(dir / "stderr.log", [&] {
                 mod_log_internal(GGML_LOG_LEVEL_ERROR, "STUB_OK: error\n");
+                mod_log_internal(GGML_LOG_LEVEL_CONT, "  error detail\n");
+                mod_log_internal(GGML_LOG_LEVEL_INFO, "STUB_OK: info\n");
+                mod_log_internal(GGML_LOG_LEVEL_CONT, ".");
             });
             check(logged(GGML_LOG_LEVEL_ERROR, "STUB_OK: error\n"), "module error reaches the logger");
-            check(err == "STUB_OK: error\n", "module error also goes to stderr");
+            check(err == "STUB_OK: error\n  error detail\n",
+                  "module error and its CONT lines also go to stderr, other lines do not");
 
             mod_log_set(module_log, nullptr);
             ggml_backend_load_all_from_path(dir.string().c_str());
