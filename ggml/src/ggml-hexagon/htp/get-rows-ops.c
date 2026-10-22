@@ -203,7 +203,7 @@ static void get_rows_thread_##TYPE_NAME##_##IDX_TYPE(unsigned int nth, unsigned 
 #define Q8_0_BYTES(n) (((n) / 32) * sizeof(block_q8_0))
 
 static __attribute__((noinline)) void compute_get_rows_f16(float * dst_spad, const void * src_spad, uint32_t cur_elems) {
-    hvx_dequantize_row_f16_f32(dst_spad, src_spad, cur_elems);
+    hvx_copy_f32_f16_aa((uint8_t *) dst_spad, (const uint8_t *) src_spad, cur_elems);
 }
 
 static __attribute__((noinline)) void compute_get_rows_q8_0(float * dst_spad, const void * src_spad, uint32_t cur_elems) {
@@ -212,6 +212,31 @@ static __attribute__((noinline)) void compute_get_rows_q8_0(float * dst_spad, co
 
 GET_ROWS_THREAD_DT_FN(f16,  F16_BYTES,  int32_t, { compute_get_rows_f16((float *)dst_spad, src_spad, cur_elems); })
 GET_ROWS_THREAD_DT_FN(f16,  F16_BYTES,  int64_t, { compute_get_rows_f16((float *)dst_spad, src_spad, cur_elems); })
+
+static void store_get_rows_bf16(float * dst, HVX_Vector values, uint32_t n) {
+    const HVX_VectorPair widened = Q6_W_vshuff_VVR(values, Q6_V_vzero(), -2);
+    const uint32_t first = MIN(n, VLEN_FP32);
+    hvx_vec_store_a(dst, first * sizeof(float), Q6_V_lo_W(widened));
+    if (n > first) {
+        hvx_vec_store_a(dst + first, (n - first) * sizeof(float), Q6_V_hi_W(widened));
+    }
+}
+
+static void compute_get_rows_bf16(float * dst, const void * src, uint32_t n) {
+    const uint16_t * values = src;
+    uint32_t i = 0;
+    for (; i + VLEN_FP16 <= n; i += VLEN_FP16) {
+        store_get_rows_bf16(dst + i, *(const HVX_Vector *) (values + i), VLEN_FP16);
+    }
+    if (i < n) {
+        uint16_t tail[VLEN_FP16] __attribute__((aligned(128))) = {0};
+        memcpy(tail, values + i, (n - i) * sizeof(uint16_t));
+        store_get_rows_bf16(dst + i, *(const HVX_Vector *) tail, n - i);
+    }
+}
+
+GET_ROWS_THREAD_DT_FN(bf16, F16_BYTES, int32_t, { compute_get_rows_bf16((float *)dst_spad, src_spad, cur_elems); })
+GET_ROWS_THREAD_DT_FN(bf16, F16_BYTES, int64_t, { compute_get_rows_bf16((float *)dst_spad, src_spad, cur_elems); })
 
 GET_ROWS_THREAD_DT_FN(q8_0, Q8_0_BYTES, int32_t, { compute_get_rows_q8_0((float *)dst_spad, src_spad, cur_elems); })
 GET_ROWS_THREAD_DT_FN(q8_0, Q8_0_BYTES, int64_t, { compute_get_rows_q8_0((float *)dst_spad, src_spad, cur_elems); })
@@ -369,7 +394,7 @@ int op_get_rows(struct htp_ops_context * octx) {
     const struct htp_get_rows_kernel_params * kparams = (const struct htp_get_rows_kernel_params *) octx->kernel_params;
 
     if (octx->src[0]->type != HTP_TYPE_F32 &&
-         octx->src[0]->type != HTP_TYPE_F16 &&
+         octx->src[0]->type != HTP_TYPE_F16 && octx->src[0]->type != HTP_TYPE_BF16 &&
          octx->src[0]->type != HTP_TYPE_Q4_0 &&
          octx->src[0]->type != HTP_TYPE_Q8_0 &&
          octx->src[0]->type != HTP_TYPE_I32) {
@@ -451,6 +476,7 @@ int op_get_rows(struct htp_ops_context * octx) {
             break;
         case HTP_GET_ROWS_KERNEL_FLAT:
             switch (octx->src[0]->type) {
+                case HTP_TYPE_BF16: q_func = (work_queue_func_t)(is_i32 ? get_rows_thread_bf16_int32_t : get_rows_thread_bf16_int64_t); break;
                 case HTP_TYPE_F16:  q_func = (work_queue_func_t)(is_i32 ? get_rows_thread_f16_int32_t  : get_rows_thread_f16_int64_t);  break;
                 case HTP_TYPE_Q8_0: q_func = (work_queue_func_t)(is_i32 ? get_rows_thread_q8_0_int32_t : get_rows_thread_q8_0_int64_t); break;
                 default:            return HTP_STATUS_NO_SUPPORT;

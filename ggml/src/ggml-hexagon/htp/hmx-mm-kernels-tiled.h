@@ -1119,6 +1119,39 @@ static void transfer_activation_row_pair_fp32_to_fp16_col_chunk(
     }
 }
 
+static inline HVX_Vector hmx_activation_pair_f16(const __fp16 *row0, const __fp16 *row1, uint32_t n_valid) {
+    __fp16 lanes0[VLEN_FP16] __attribute__((aligned(VLEN))) = {0};
+    __fp16 lanes1[VLEN_FP16] __attribute__((aligned(VLEN))) = {0};
+    const uint32_t count = MIN(n_valid, HTP_MM_HMX_TILE_N_COLS);
+    if (row0) { memcpy(lanes0, row0, count * sizeof(__fp16)); }
+    if (row1) { memcpy(lanes1, row1, count * sizeof(__fp16)); }
+    const HVX_Vector v0 = *(const HVX_Vector *) lanes0;
+    const HVX_Vector v1 = *(const HVX_Vector *) lanes1;
+    return Q6_V_lo_W(Q6_W_vshuff_VVR(v1, v0, -2));
+}
+
+static void transfer_activation_row_pair_fp16(__fp16 *restrict vtcm_dst, const __fp16 *row0, const __fp16 *row1,
+                                              uint32_t r, uint32_t k_block, uint32_t k_valid) {
+    const uint32_t r0 = r / HTP_MM_HMX_TILE_N_ROWS;
+    const uint32_t r1 = r % HTP_MM_HMX_TILE_N_ROWS;
+    for (uint32_t c = 0; c < k_block; c += HTP_MM_HMX_TILE_N_COLS) {
+        const uint32_t n_valid  = k_valid > c ? k_valid - c : 0;
+        const uint32_t tile_idx = r0 * (k_block / HTP_MM_HMX_TILE_N_COLS) + c / HTP_MM_HMX_TILE_N_COLS;
+        HVX_Vector *   tile     = (HVX_Vector *) (vtcm_dst + tile_idx * HTP_MM_HMX_TILE_N_ELMS);
+        tile[r1 / 2] = hmx_activation_pair_f16(row0 ? row0 + c : NULL, row1 ? row1 + c : NULL, n_valid);
+    }
+}
+
+static void transfer_activation_chunk_fp16(__fp16 *restrict vtcm_dst, const __fp16 *restrict src, uint32_t n_rows,
+                                           uint32_t k_block, uint32_t k_stride, uint32_t k_valid) {
+    const uint32_t n_rows_padded = hex_align_up(n_rows, HTP_MM_HMX_TILE_N_ROWS);
+    for (uint32_t r = 0; r < n_rows_padded; r += 2) {
+        const __fp16 *row0 = r < n_rows ? src + (size_t) r * k_stride : NULL;
+        const __fp16 *row1 = r + 1 < n_rows ? src + (size_t) (r + 1) * k_stride : NULL;
+        transfer_activation_row_pair_fp16(vtcm_dst, row0, row1, r, k_block, k_valid);
+    }
+}
+
 static void transfer_activation_chunk_fp32_to_fp16_gathered(
             __fp16 *restrict vtcm_dst,
             const float *restrict src,

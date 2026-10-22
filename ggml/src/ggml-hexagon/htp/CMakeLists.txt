@@ -45,6 +45,12 @@ add_library(${HTP_LIB} SHARED
     im2col-ops.c
     roll-ops.c
     snake-ops.c
+    col2im-1d-ops.c
+    conv-2d-dw-ops.c
+    depthwise-conv-1d-ops.c
+    timestep-embedding-ops.c
+    transpose-ops.c
+
     allreduce-ops.c
 )
 

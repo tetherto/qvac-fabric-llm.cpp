@@ -7,6 +7,7 @@
 #include "ggml-common.h"
 #include "htp-ctx.h"
 #include "htp-ops.h"
+#include "htp-dma-reader.h"
 #include "hvx-utils.h"
 #include "hvx-sin-cos.h"
 
@@ -37,8 +38,19 @@ static void snake_row(float * restrict y, const float * restrict x, uint32_t n, 
     }
 }
 
-static inline float snake_channel_param(const struct htp_tensor * p, uint32_t c) {
-    return ((const float *) p->data)[c];
+static float snake_channel_param(struct htp_dma_reader * reader, uint32_t c) {
+    return *(const float *) htp_dma_reader_view(reader, c * sizeof(float), sizeof(float));
+}
+
+static void snake_dma_row(float * y, struct htp_dma_reader * reader, uint32_t offset, uint32_t n,
+                          float alpha, float inv_beta) {
+    float tile[VLEN_FP32] __attribute__((aligned(VLEN)));
+    for (uint32_t i = 0; i < n; i += VLEN_FP32) {
+        const uint32_t count = MIN(VLEN_FP32, n - i);
+        memset(tile, 0, sizeof(tile));
+        memcpy(tile, htp_dma_reader_view(reader, offset + i * sizeof(float), count * sizeof(float)), count * sizeof(float));
+        snake_row(y + i, tile, count, alpha, inv_beta);
+    }
 }
 
 static inline bool snake_channel_params_valid(const struct htp_tensor * p, uint32_t channels) {
@@ -58,10 +70,19 @@ static void snake_thread(unsigned int nth, unsigned int ith, void * data) {
     const uint32_t start    = sctx->channels_per_thread * ith;
     const uint32_t end      = MIN(start + sctx->channels_per_thread, channels);
 
+    uint8_t * scratch = octx->ctx->vtcm_base + ith * 3 * HTP_DMA_READER_BYTES;
+    struct htp_dma_reader xr = htp_dma_reader_init(x, octx->ctx->dma[ith], scratch);
+    struct htp_dma_reader ar = htp_dma_reader_init(alpha, octx->ctx->dma[ith], scratch + HTP_DMA_READER_BYTES);
+    struct htp_dma_reader br = htp_dma_reader_init(inv_beta, octx->ctx->dma[ith], scratch + 2 * HTP_DMA_READER_BYTES);
     for (uint32_t c = start; c < end; c++) {
-        snake_row((float *) ((uint8_t *) y->data + c * y->nb[1]),
-                  (const float *) ((const uint8_t *) x->data + c * x->nb[1]), x->ne[0],
-                  snake_channel_param(alpha, c), snake_channel_param(inv_beta, c));
+        float * out = (float *) ((uint8_t *) y->data + c * y->nb[1]);
+        const float a = snake_channel_param(&ar, c);
+        const float b = snake_channel_param(&br, c);
+        if (htp_tensor_is_extended(x)) {
+            snake_dma_row(out, &xr, c * x->nb[1], x->ne[0], a, b);
+        } else {
+            snake_row(out, (const float *) ((const uint8_t *) x->data + c * x->nb[1]), x->ne[0], a, b);
+        }
     }
 }
 
@@ -87,6 +108,9 @@ int op_snake(struct htp_ops_context * octx) {
         return HTP_STATUS_OK;
     }
 
+    if ((size_t) threads * 3 * HTP_DMA_READER_BYTES > octx->ctx->vtcm_size) {
+        return HTP_STATUS_VTCM_TOO_SMALL;
+    }
     struct htp_snake_context sctx = {
         .octx                = octx,
         .channels_per_thread = (channels + threads - 1) / threads,

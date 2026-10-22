@@ -176,5 +176,27 @@ int op_im2col(struct htp_ops_context * octx);
 int op_allreduce(struct htp_ops_context * octx);
 int op_roll(struct htp_ops_context * octx);
 int op_snake(struct htp_ops_context * octx);
+int op_col2im_1d(struct htp_ops_context * octx);
+int op_conv_2d_dw(struct htp_ops_context * octx);
+int op_depthwise_conv_1d(struct htp_ops_context * octx);
+int op_timestep_embedding(struct htp_ops_context * octx);
+struct htp_transpose_f32 {
+    struct htp_ops_context * octx;
+    const uint8_t *          src;
+    uint8_t *                dst;
+    uint32_t                 rows;
+    uint32_t                 cols;
+    uint32_t                 src_row_stride;
+    uint32_t                 dst_row_stride;
+    uint32_t                 batch2;
+    uint32_t                 batch3;
+    uint32_t                 src_stride2;
+    uint32_t                 src_stride3;
+    uint32_t                 dst_stride2;
+    uint32_t                 dst_stride3;
+};
+
+bool htp_transpose_f32(const struct htp_transpose_f32 * job);
+
 
 #endif /* HTP_CTX_H */

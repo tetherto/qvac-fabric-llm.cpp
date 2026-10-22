@@ -852,6 +852,7 @@ static int execute_op(struct htp_ops_context * octx) {
         case HTP_OP_UNARY_SILU:
         case HTP_OP_UNARY_GELU:
         case HTP_OP_UNARY_GELU_QUICK:
+        case HTP_OP_UNARY_GELU_ERF:
         case HTP_OP_UNARY_NEG:
         case HTP_OP_UNARY_EXP:
         case HTP_OP_UNARY_TANH:
@@ -930,6 +931,14 @@ static int execute_op(struct htp_ops_context * octx) {
         case HTP_OP_ROLL:
             return op_roll(octx);
 
+        case HTP_OP_COL2IM_1D:
+            return op_col2im_1d(octx);
+        case HTP_OP_CONV_2D_DW:
+            return op_conv_2d_dw(octx);
+        case HTP_OP_DEPTHWISE_CONV_1D:
+            return op_depthwise_conv_1d(octx);
+        case HTP_OP_TIMESTEP_EMBEDDING:
+            return op_timestep_embedding(octx);
         case HTP_OP_SNAKE:
             return op_snake(octx);
 

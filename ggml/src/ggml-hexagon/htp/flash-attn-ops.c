@@ -39,6 +39,14 @@
 // Must be multiple of 32
 #define FLASH_ATTN_BLOCK_SIZE (32 * 2)
 
+static void fa_convert_row_f16(uint8_t * row, uint32_t type, uint32_t n) {
+    if (type == HTP_TYPE_F32) {
+        hvx_copy_f16_f32_aa(row, row, n);
+    } else {
+        hvx_dequantize_row_q8_0_f16((__fp16 *) row, row, n);
+    }
+}
+
 struct htp_fa_context {
     const struct htp_ops_context * octx;
 
@@ -357,19 +365,19 @@ static void flash_attn_ext_f16_thread(unsigned int nth, unsigned int ith, void *
             uint8_t * v_base = (void *) dma_queue_pop(dma_q).dst; // V
             __fp16  * m_base = mask ? (__fp16 *) dma_queue_pop(dma_q).dst : NULL; // M
 
-            if (factx->k->type == HTP_TYPE_Q8_0) {
+            if ((factx->k->type == HTP_TYPE_Q8_0 || factx->k->type == HTP_TYPE_F32)) {
                 htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_FA_K_PREP, ir);
                 for (uint32_t r = 0; r < current_block_size; ++r) {
                     __fp16 * row_k = (__fp16 *)(k_base + r * factx->size_k_row_padded);
-                    hvx_dequantize_row_q8_0_f16(row_k, row_k, DK);
+                    fa_convert_row_f16((uint8_t *) row_k, factx->k->type, DK);
                 }
                 htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_FA_K_PREP, ir);
             }
-            if (factx->v->type == HTP_TYPE_Q8_0) {
+            if ((factx->v->type == HTP_TYPE_Q8_0 || factx->v->type == HTP_TYPE_F32)) {
                 htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_FA_V_PREP, ir);
                 for (uint32_t r = 0; r < current_block_size; ++r) {
                     __fp16 * row_v = (__fp16 *)(v_base + r * factx->size_v_row_padded);
-                    hvx_dequantize_row_q8_0_f16(row_v, row_v, DV);
+                    fa_convert_row_f16((uint8_t *) row_v, factx->v->type, DV);
                 }
                 htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_FA_V_PREP, ir);
             }
@@ -622,10 +630,11 @@ static void fa_k_interleave_thread(unsigned int n, unsigned int i, void * data) 
 
     struct htp_thread_trace * tr = &factx->octx->ctx->trace[i];
     htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_FA_K_PREP, (uint16_t) (args->kv_start + start));
-    if (factx->k->type == HTP_TYPE_Q8_0) {
+    if ((factx->k->type == HTP_TYPE_Q8_0 || factx->k->type == HTP_TYPE_F32)) {
         for (uint32_t r = start; r < end; ++r) {
             __fp16 * row_k = (__fp16 *)((char *)args->curr_k + r * args->src_stride * sizeof(__fp16));
-            hvx_dequantize_row_q8_0_f16(row_k, row_k, factx->DK);
+            fa_convert_row_f16((uint8_t *) row_k, factx->k->type, factx->DK);
+            memset(row_k + factx->DK, 0, (factx->DK_pad - factx->DK) * sizeof(__fp16));
         }
     }
     hmx_interleave_rows_to_tiles(factx->vtcm_k_tiles[args->buf_idx], (const __fp16 *) args->curr_k, total_rows, factx->DK_pad,
@@ -676,10 +685,11 @@ static void fa_v_interleave_thread(unsigned int n, unsigned int i, void * data) 
 
     struct htp_thread_trace * tr = &factx->octx->ctx->trace[i];
     htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_FA_V_PREP, (uint16_t) (args->kv_start + start));
-    if (factx->v->type == HTP_TYPE_Q8_0) {
+    if ((factx->v->type == HTP_TYPE_Q8_0 || factx->v->type == HTP_TYPE_F32)) {
         for (uint32_t r = start; r < end; ++r) {
             __fp16 * row_v = (__fp16 *)((char *)args->v_src + r * args->src_stride * sizeof(__fp16));
-            hvx_dequantize_row_q8_0_f16(row_v, row_v, factx->DV);
+            fa_convert_row_f16((uint8_t *) row_v, factx->v->type, factx->DV);
+            memset(row_v + factx->DV, 0, (factx->DV_pad - factx->DV) * sizeof(__fp16));
         }
     }
     hmx_interleave_cols_to_tiles(v_tiles_dst, (const __fp16 *) args->v_src, total_rows, factx->DV_pad,
@@ -1923,13 +1933,13 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
     // so the HMX interleave/tile logic can operate on 64-aligned head dims.
     const size_t size_k_row        = htp_tensor_get_row_size(k->type, DK);
     const size_t size_v_row        = htp_tensor_get_row_size(v->type, DV);
-    const size_t size_k_row_padded = hex_round_up(DK_pad * sizeof(__fp16), 128);
-    const size_t size_v_row_padded = hex_round_up(DV_pad * sizeof(__fp16), 128);
+    const size_t size_k_row_padded = hex_round_up(DK_pad * (k->type == HTP_TYPE_F32 ? sizeof(float) : sizeof(__fp16)), 128);
+    const size_t size_v_row_padded = hex_round_up(DV_pad * (v->type == HTP_TYPE_F32 ? sizeof(float) : sizeof(__fp16)), 128);
 
     // Build the VTCM layout once (shared with the host estimator) and place every
     // scratch buffer at its computed offset. Padded head dims size the HMX tiles.
     struct hmx_fa_vtcm_layout L;
-    hmx_fa_vtcm_layout_build(&L, G, DK_pad, DV_pad, Br, Bc, n_threads, pipeline, factx.is_q_fp32, factx.sinks != NULL, factx.n_heads);
+    hmx_fa_vtcm_layout_build(&L, G, DK_pad, DV_pad, Br, Bc, n_threads, pipeline, factx.is_q_fp32, kparams->is_k_fp32 != 0, kparams->is_v_fp32 != 0, factx.sinks != NULL, factx.n_heads);
 
     if (L.total_bytes > ctx->vtcm_size) {
         return HTP_STATUS_VTCM_TOO_SMALL;
@@ -2437,8 +2447,8 @@ int op_flash_attn_ext(struct htp_ops_context * octx) {
 
     // Check support
     if ((q->type != HTP_TYPE_F16 && q->type != HTP_TYPE_F32) ||
-        (k->type != HTP_TYPE_F16 && k->type != HTP_TYPE_Q8_0) ||
-        (v->type != HTP_TYPE_F16 && v->type != HTP_TYPE_Q8_0)) {
+        (k->type != HTP_TYPE_F16 && k->type != HTP_TYPE_Q8_0 && k->type != HTP_TYPE_F32) ||
+        (v->type != HTP_TYPE_F16 && v->type != HTP_TYPE_Q8_0 && v->type != HTP_TYPE_F32)) {
         return HTP_STATUS_NO_SUPPORT;
     }
 
@@ -2531,7 +2541,7 @@ int op_flash_attn_ext(struct htp_ops_context * octx) {
     const bool has_mask  = (mask != NULL);
     const bool has_sinks = (octx->src[4] != NULL);
     struct hvx_fa_vtcm_layout L;
-    hvx_fa_vtcm_layout_build(&L, k->ne[0], v->ne[0], factx.is_q_fp32, has_mask, has_sinks, n_head, n_threads);
+    hvx_fa_vtcm_layout_build(&L, k->ne[0], v->ne[0], factx.is_q_fp32, kparams->is_k_fp32 != 0, kparams->is_v_fp32 != 0, has_mask, has_sinks, n_head, n_threads);
 
     if (L.total_bytes > octx->ctx->vtcm_size) {
         return HTP_STATUS_VTCM_TOO_SMALL;

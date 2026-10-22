@@ -2,6 +2,8 @@
 #define HTP_OPS_H
 
 #include <assert.h>
+#include <stddef.h>
+#include <stdint.h>
 
 // ggml-common.h must be included prio to this header
 
@@ -28,6 +30,7 @@ enum htp_data_type {
     HTP_TYPE_IQ4_NL = 20,
     HTP_TYPE_I32    = 26,
     HTP_TYPE_I64    = 27,
+    HTP_TYPE_BF16   = 30,
     HTP_TYPE_MXFP4  = 39,
 
     // types used internally for repack, dyn.quant, etc
@@ -113,6 +116,12 @@ enum htp_op_code {
     HTP_OP_ARGMAX,
     HTP_OP_SNAKE,
     HTP_OP_UNARY_GELU_QUICK,
+    HTP_OP_COL2IM_1D,
+    HTP_OP_CONV_2D_DW,
+    HTP_OP_DEPTHWISE_CONV_1D,
+    HTP_OP_TIMESTEP_EMBEDDING,
+    HTP_OP_UNARY_GELU_ERF,
+
 
     HTP_OP_INVALID
 };
@@ -261,5 +270,33 @@ struct htp_opbatch_rsp {
     uint32_t n_traces[HTP_MAX_NTHREADS + 1];
     // struct htp_prof_desc profs[];  -- dspqueue buf 0
 };
+
+#define HTP_DW1D_LANES 32
+
+static inline uint64_t htp_dw1d_round_up(uint64_t n) {
+    return (n + HTP_DW1D_LANES - 1) / HTP_DW1D_LANES * HTP_DW1D_LANES;
+}
+
+static inline uint64_t htp_dw1d_in_pitch(uint32_t out_len, uint32_t taps, uint32_t dilation, uint32_t pad,
+                                         uint32_t in_len) {
+    const uint64_t reach  = htp_dw1d_round_up(out_len) + (uint64_t) (taps - 1) * dilation;
+    const uint64_t staged = (uint64_t) pad + in_len;
+    return htp_dw1d_round_up(reach > staged ? reach : staged);
+}
+
+static inline size_t htp_dw1d_vtcm_bytes(uint32_t channels, uint64_t in_pitch, uint64_t out_pitch, uint32_t taps) {
+    if (in_pitch > SIZE_MAX || out_pitch > SIZE_MAX - in_pitch) {
+        return SIZE_MAX;
+    }
+    const uint64_t weight_pitch = htp_dw1d_round_up(taps);
+    if (weight_pitch > SIZE_MAX - (in_pitch + out_pitch)) {
+        return SIZE_MAX;
+    }
+    const size_t pitch = in_pitch + out_pitch + weight_pitch;
+    if (pitch > SIZE_MAX / sizeof(float) || (pitch && channels > SIZE_MAX / sizeof(float) / pitch)) {
+        return SIZE_MAX;
+    }
+    return (size_t) channels * pitch * sizeof(float);
+}
 
 #endif /* HTP_OPS_H */

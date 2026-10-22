@@ -477,6 +477,9 @@ if (GGML_RPC)
 endif()
 
 # TODO: make this test (and others) not link `libllama` as it is not needed [TAG_TESTS_LLAMA_LINK]
+add_executable(test-hexagon-dma-reader test-hexagon-dma-reader.cpp)
+llama_test(test-hexagon-dma-reader)
+
 llama_build(test-backend-ops.cpp)
 
 llama_build_and_test(test-tiled-mulmat.cpp)

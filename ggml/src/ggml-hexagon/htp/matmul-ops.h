@@ -12,6 +12,10 @@
 extern "C" {
 #endif
 
+static inline bool htp_mm_weight_pads_partial_tile(int weight_type) {
+    return weight_type == HTP_TYPE_F16 || weight_type == HTP_TYPE_F32;
+}
+
 // --- HMX Tile Constraints ---
 #define HTP_MM_HMX_TILE_N_COLS 32
 #define HTP_MM_HMX_TILE_N_ROWS 32
@@ -59,6 +63,7 @@ extern "C" {
 
 enum htp_mm_kernel_type {
     HTP_MM_KERNEL_UNSUPPORTED = 0,
+    HTP_MM_KERNEL_HVX_F16_F16_K9,
 
     // HMX paths
     HTP_MM_KERNEL_HMX_2D,
