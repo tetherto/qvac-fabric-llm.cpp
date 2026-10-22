@@ -14755,6 +14755,57 @@ struct test_speech_htp : T {
     }
 };
 
+template <typename T>
+struct test_speech_htp_weights : test_speech_htp<T> {
+    using test_speech_htp<T>::test_speech_htp;
+    using T::build_graph;
+
+    std::string vars() override { return test_speech_htp<T>::vars() + ",weight_inputs=1"; }
+    bool use_weight_context() override { return true; }
+
+    static ggml_tensor * relocate_leaf(ggml_context * weights, ggml_tensor * tensor,
+                                       std::unordered_map<ggml_tensor *, ggml_tensor *> & relocated) {
+        if (!tensor || tensor->op != GGML_OP_NONE || tensor->view_src) {
+            return tensor;
+        }
+        auto found = relocated.find(tensor);
+        if (found != relocated.end()) {
+            return found->second;
+        }
+        ggml_tensor * copy = ggml_dup_tensor(weights, tensor);
+        ggml_set_name(copy, tensor->name);
+        copy->flags = tensor->flags;
+        relocated[tensor] = copy;
+        return copy;
+    }
+
+    // T's graph built in one context, without virtual dispatch: test_mul_mat builds through its
+    // 2-context overload, and its 1-context one forwards virtually to the override below
+    ggml_tensor * build_graph_single_ctx(ggml_context * ctx) {
+        if constexpr (std::is_base_of_v<test_mul_mat, T>) {
+            return T::build_graph(ctx, ctx);
+        } else {
+            return T::build_graph(ctx);
+        }
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx, ggml_context * weights) override {
+        ggml_tensor * out = build_graph_single_ctx(ctx);
+        std::unordered_map<ggml_tensor *, ggml_tensor *> relocated;
+        for (ggml_tensor * node = ggml_get_first_tensor(ctx); node; node = ggml_get_next_tensor(ctx, node)) {
+            for (ggml_tensor * & src : node->src) {
+                if (src != out->view_src) {
+                    src = relocate_leaf(weights, src, relocated);
+                }
+            }
+            if (node->view_src != out->view_src) {
+                node->view_src = relocate_leaf(weights, node->view_src, relocated);
+            }
+        }
+        return out;
+    }
+};
+
 struct test_depthwise_conv_1d_fused : test_case {
     const int64_t length;
     const int64_t channels;
@@ -14790,23 +14841,104 @@ struct test_depthwise_conv_1d_fused : test_case {
     }
 };
 
+struct test_speech_conv_zero : test_speech_htp<test_conv_2d_dw> {
+    using test_speech_htp<test_conv_2d_dw>::test_speech_htp;
+
+    std::string vars() override { return test_speech_htp<test_conv_2d_dw>::vars() + ",zero=1"; }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            init_tensor_uniform(t, 0.0f, 0.0f);
+        }
+    }
+};
+
+struct test_speech_matmul_precision : test_mul_mat {
+    using test_mul_mat::test_mul_mat;
+
+    std::string vars() override { return "suite=speech_htp,prec=f32," + test_mul_mat::vars(); }
+
+    ggml_tensor * build_graph(ggml_context * ctx, ggml_context * ctx_weights) override {
+        ggml_tensor * out = test_mul_mat::build_graph(ctx, ctx_weights);
+        GGML_ASSERT(ggml_prec_set_acc(out, GGML_PREC_F32));
+        return out;
+    }
+};
+
+struct test_speech_conv_weights : test_case {
+    const ggml_type type;
+
+    explicit test_speech_conv_weights(ggml_type type) : type(type) {}
+
+    std::string vars() override { return "suite=speech_htp,repeated_weights=1," + VARS_TO_STR1(type); }
+    std::string op_desc(ggml_tensor *) override { return "CONV_2D_DW"; }
+    bool run_whole_graph() override { return true; }
+    bool use_weight_context() override { return true; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override { return build_graph(ctx, ctx); }
+
+    ggml_tensor * build_graph(ggml_context * ctx, ggml_context * weights) override {
+        constexpr int64_t channels = 33;
+        ggml_tensor * x = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 65, 5, channels, 1);
+        ggml_tensor * w1 = ggml_new_tensor_4d(weights, type, 3, 3, 1, channels);
+        ggml_tensor * w2 = ggml_new_tensor_4d(weights, type, 3, 3, 1, channels);
+        ggml_tensor * y1 = ggml_conv_2d_dw_direct(ctx, w1, x, 1, 1, 1, 1, 1, 1);
+        ggml_tensor * y2 = ggml_conv_2d_dw_direct(ctx, w2, x, 1, 1, 1, 1, 1, 1);
+        return ggml_add(ctx, y1, y2);
+    }
+};
+
 static void add_speech_htp_type_cases(std::vector<std::unique_ptr<test_case>> & cases, ggml_type type) {
     cases.emplace_back(new test_speech_htp<test_col2im_1d>(type, 5, 3, 33, 2, 1));
     cases.emplace_back(new test_speech_htp<test_col2im_1d>(type, 2, 3, 31, 3, 0));
     cases.emplace_back(new test_speech_htp<test_col2im_1d>(type, 16, 2, 65, 8, 4));
     cases.emplace_back(new test_speech_htp<test_conv_2d_dw>({65, 9, 33, 1}, {3, 3, 1, 33}, type, 2, 1, 1, false));
+    cases.emplace_back(new test_speech_htp<test_conv_2d_dw>({65, 9, 33, 1}, {3, 3, 1, 33}, type, 1, 1, 1, false));
+    cases.emplace_back(new test_speech_conv_zero({65, 9, 33, 1}, {3, 3, 1, 33}, type, 1, 1, 1, false));
+    cases.emplace_back(new test_speech_conv_zero({17, 5, 65, 2}, {3, 3, 1, 65}, type, 1, 2, 2, true));
     cases.emplace_back(new test_speech_htp<test_conv_2d_dw>({17, 5, 65, 2}, {3, 3, 1, 65}, type, 1, 2, 2, true));
     cases.emplace_back(new test_speech_htp<test_im2col>(GGML_TYPE_F32, type, type, {67, 5, 1, 1}, {3, 5, 1, 1}, 2, 1, 2, 0, 2, 1, false));
     cases.emplace_back(new test_speech_htp<test_get_rows>(type, 7, 11, 5, 2, 1, true, true, 1));
     cases.emplace_back(new test_speech_htp<test_cpy>(type, type == GGML_TYPE_F32 ? GGML_TYPE_F16 : GGML_TYPE_F32,
         {33, 17, 2, 1}, {-1, -1, -1, -1}, {1, 0, 2, 3}));
+    cases.emplace_back(new test_speech_htp<test_cpy>(type, type == GGML_TYPE_F32 ? GGML_TYPE_F16 : GGML_TYPE_F32,
+        {4, 1, 33, 1}, {-1, -1, -1, -1}, {2, 1, 0, 3}));
     cases.emplace_back(new test_speech_htp<test_mul_mat>(type, type, 65, 17, 128, {1, 1}, {1, 1}));
 }
 
+static void add_speech_htp_dma_cases(std::vector<std::unique_ptr<test_case>> & cases) {
+    for (ggml_type type : {GGML_TYPE_F32, GGML_TYPE_F16}) {
+        cases.emplace_back(new test_speech_htp_weights<test_col2im_1d>(type, 5, 3, 1031, 2, 1));
+        cases.emplace_back(new test_speech_htp_weights<test_col2im_1d>(type, 16, 2, 1031, 8, 4));
+        cases.emplace_back(new test_speech_htp_weights<test_conv_2d_dw>({65, 9, 33, 1}, {3, 3, 1, 33}, type, 2, 1, 1, false));
+        cases.emplace_back(new test_speech_htp_weights<test_conv_2d_dw>({17, 5, 65, 2}, {3, 3, 1, 65}, type, 1, 2, 2, true));
+        cases.emplace_back(new test_speech_htp_weights<test_im2col>(GGML_TYPE_F32, type, type,
+            {1031, 5, 1, 1}, {3, 5, 1, 1}, 2, 1, 2, 0, 2, 1, false));
+        cases.emplace_back(new test_speech_htp_weights<test_cpy>(type, type == GGML_TYPE_F32 ? GGML_TYPE_F16 : GGML_TYPE_F32,
+            std::array<int64_t, 4>{1031, 3, 2, 1}, std::array<int64_t, 4>{-1, -1, -1, -1}, std::array<int64_t, 4>{1, 0, 2, 3}));
+    }
+    cases.emplace_back(new test_speech_htp_weights<test_cpy>(GGML_TYPE_F16, GGML_TYPE_F32,
+        std::array<int64_t, 4>{1048583, 1, 1, 1}));
+    cases.emplace_back(new test_speech_htp_weights<test_snake>(1031, 7));
+    cases.emplace_back(new test_speech_htp_weights<test_timestep_embedding>(GGML_TYPE_F32, std::array<int64_t, 4>{1031, 1, 1, 1}, 33, 1000));
+    cases.emplace_back(new test_speech_htp_weights<test_mul_mat>(GGML_TYPE_F16, GGML_TYPE_F16, 1031, 7, 9, std::array<int64_t, 2>{1, 1}, std::array<int64_t, 2>{1, 1}));
+    cases.emplace_back(new test_speech_htp_weights<test_mul_mat>(GGML_TYPE_F16, GGML_TYPE_F16, 65, 33, 128, std::array<int64_t, 2>{1, 1}, std::array<int64_t, 2>{1, 1}));
+}
+
 static void add_speech_htp_cases(std::vector<std::unique_ptr<test_case>> & cases) {
+    add_speech_htp_dma_cases(cases);
+    cases.emplace_back(new test_speech_conv_weights(GGML_TYPE_F32));
+    cases.emplace_back(new test_speech_conv_weights(GGML_TYPE_F16));
+    cases.emplace_back(new test_speech_htp<test_mul_mat>(GGML_TYPE_F16, GGML_TYPE_F16, 32, 33, 32, {1, 1}, {1, 1}));
+    cases.emplace_back(new test_speech_matmul_precision(GGML_TYPE_F16, GGML_TYPE_F16, 32, 33, 32, {1, 1}, {1, 1}));
+    cases.emplace_back(new test_speech_matmul_precision(GGML_TYPE_F16, GGML_TYPE_F32, 64, 32, 128, {2, 1}, {1, 1}));
+    cases.emplace_back(new test_speech_matmul_precision(GGML_TYPE_Q8_0, GGML_TYPE_F32, 64, 32, 128, {1, 1}, {1, 1}));
     add_speech_htp_type_cases(cases, GGML_TYPE_F32);
     add_speech_htp_type_cases(cases, GGML_TYPE_F16);
     cases.emplace_back(new test_speech_htp<test_get_rows>(GGML_TYPE_BF16, 33, 11, 5, 2, 1, true, true, 1));
+    cases.emplace_back(new test_speech_htp<test_get_rows>(GGML_TYPE_BF16, 7, 11, 5, 2, 1, true, true, 1));
+    cases.emplace_back(new test_speech_htp<test_get_rows>(GGML_TYPE_BF16, 64, 11, 5, 2, 1, true, true, 1));
+    cases.emplace_back(new test_speech_htp<test_get_rows>(GGML_TYPE_BF16, 65, 11, 5, 2, 1, true, true, 1));
     cases.emplace_back(new test_speech_htp<test_timestep_embedding>(GGML_TYPE_F32, {3, 1, 1, 1}, 1, 10000));
     cases.emplace_back(new test_speech_htp<test_timestep_embedding>(GGML_TYPE_F32, {3, 1, 1, 1}, 33, 1000));
     cases.emplace_back(new test_speech_htp<test_unary>(GGML_UNARY_OP_GELU_ERF, GGML_TYPE_F32, {33, 3, 1, 1}));
@@ -14814,13 +14946,14 @@ static void add_speech_htp_cases(std::vector<std::unique_ptr<test_case>> & cases
     cases.emplace_back(new test_speech_htp<test_cpy>(GGML_TYPE_F32, GGML_TYPE_F32,
         {129, 33, 2, 1}, {-1, -1, -1, -1}, {1, 0, 2, 3}));
     cases.emplace_back(new test_speech_htp<test_cpy>(GGML_TYPE_F32, GGML_TYPE_F32,
-        {16385, 3, 1, 1}, {-1, -1, -1, -1}, {1, 0, 2, 3}));
+        {16385, 3, 2, 1}, {-1, -1, -1, -1}, {1, 0, 2, 3}));
     cases.emplace_back(new test_speech_htp<test_im2col>(GGML_TYPE_F32, GGML_TYPE_F32, GGML_TYPE_F32,
         {129, 33, 2, 1}, {1, 33, 1, 1}, 1, 1, 0, 0, 1, 1, false));
     cases.emplace_back(new test_speech_htp<test_im2col>(GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_F16,
         {16385, 3, 1, 1}, {3, 3, 1, 1}, 1, 1, 1, 0, 1, 1, false));
     cases.emplace_back(new test_depthwise_conv_1d_fused(33, 5, 1, false));
     cases.emplace_back(new test_depthwise_conv_1d_fused(65, 3, 2, true));
+    cases.emplace_back(new test_depthwise_conv_1d_fused(127, 7, 3, true));
     cases.emplace_back(new test_speech_htp<test_mul_mat>(GGML_TYPE_F16, GGML_TYPE_F16, 65, 7, 9, {1, 1}, {1, 1}));
     cases.emplace_back(new test_speech_htp<test_mul_mat>(GGML_TYPE_F32, GGML_TYPE_F32, 33, 17, 64, {2, 1}, {2, 1}));
     cases.emplace_back(new test_speech_htp<test_flash_attn_ext>(96, 96, 2, {1, 1}, 128, 32, false, false,
