@@ -1657,6 +1657,10 @@ static bool ggml_metal_fusion_check_memory_ranges(
                 }
 
                 if (nodes_overlap(dst, src) && !is_intermediate(src, nodes, j)) {
+                    // Each ADD-chain thread reads its input elements before writing their sum.
+                    if (fusion->id == GGML_METAL_FUSION_ADD_CHAIN && src->data == dst->data && ggml_are_same_layout(src, dst)) {
+                        continue;
+                    }
                     return false;
                 }
             }

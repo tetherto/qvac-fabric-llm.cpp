@@ -4721,6 +4721,41 @@ struct test_add_add : public test_case {
     }
 };
 
+struct test_add_add_alias : public test_add_add {
+    const int alias_input;
+    ggml_tensor * src = nullptr;
+    ggml_tensor * out = nullptr;
+    bool metal_label = false;
+
+    test_add_add_alias(std::array<int64_t, 4> ne, int alias_input)
+        : test_add_add(GGML_TYPE_F32, GGML_TYPE_F32, ne), alias_input(alias_input) {}
+
+    std::string vars() override { return test_add_add::vars() + "," + VAR_TO_STR(alias_input); }
+    std::string op_desc(ggml_tensor *) override { return "ADD_ADD_ALIAS"; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        out = test_add_add::build_graph(ctx);
+        src = alias_input == 2 ? out->src[1] : out->src[0]->src[alias_input];
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        test_add_add::initialize_tensors(ctx);
+        // Simulate allocator reuse of an input after its last ADD.
+        out->data = src->data;
+        out->buffer = src->buffer;
+    }
+
+    uint64_t fusion_count(ggml_backend_t backend) override {
+        const bool metal = strcmp(ggml_backend_reg_name(ggml_backend_dev_backend_reg(ggml_backend_get_device(backend))), "MTL") == 0;
+        const int64_t count = metal ? backend_fusion_label_count(backend, "ADD+ADD") : -1;
+        metal_label = count >= 0;
+        return metal_label ? (uint64_t) count : 0;
+    }
+
+    bool expect_fusion() override { return metal_label; }
+};
+
 // GGML_OP_ADD + GGML_OP_RMS_NORM (fused operation)
 struct test_add_rms_norm : public test_case {
     const ggml_type type;
@@ -14829,6 +14864,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_add_add(GGML_TYPE_F16, GGML_TYPE_F16, { n, 5, 4, 3 }, false, false));
         test_cases.emplace_back(new test_add_add(GGML_TYPE_F16, GGML_TYPE_F32, { n, 5, 4, 3 }, false, false));
         test_cases.emplace_back(new test_add_add(GGML_TYPE_F16, GGML_TYPE_F32, { n, 5, 4, 3 }, true, false));
+        for (int alias_input : {0, 1, 2}) {
+            test_cases.emplace_back(new test_add_add_alias({ n, 5, 4, 3 }, alias_input));
+        }
     }
 
     for (std::array<int64_t, 4> ne : std::vector<std::array<int64_t, 4>>{ { 128, 16, 1, 1 }, { 128, 16, 7, 1 }, { 1025, 5, 4, 3 } }) {

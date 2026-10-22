@@ -33,6 +33,8 @@ bailingmoe3         ,1   ,any     ,RMS_NORM+MUL                ,      8
 bailingmoe3         ,1   ,any     ,RMS_NORM+SCALE              ,      2
 bailingmoe3         ,1   ,any     ,UNARY+MUL                   ,      1
 beam                ,0   ,any     ,MUL+ADD                     ,      6
+beam                ,0   ,decode  ,MUL_MAT+MUL_MAT+GLU         ,      1
+beam                ,0   ,decode  ,MUL_MAT_ID+MUL_MAT_ID+GLU   ,      3
 beam                ,0   ,any     ,RMS_NORM+MUL                ,     25
 bloom               ,0   ,any     ,NORM+MUL+ADD                ,      6
 chatglm             ,0   ,any     ,RMS_NORM+MUL                ,      5

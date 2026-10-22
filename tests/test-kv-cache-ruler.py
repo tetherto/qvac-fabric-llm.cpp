@@ -20,7 +20,6 @@ Config presets:
 
 import argparse
 import csv
-import dataclasses
 import logging
 import os
 import sys
@@ -28,7 +27,6 @@ from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime
-from itertools import chain, repeat
 from pathlib import Path
 from typing import Optional
 
@@ -349,14 +347,13 @@ def main():
                         help="Config preset (default: small)")
     parser.add_argument("--gpus", default="0", help="Comma-separated GPU IDs (default: 0)")
     parser.add_argument("--models", nargs="*", help="Model paths to use (overrides defaults)")
-    parser.add_argument("--tokenizers", nargs="*", help="Tokenizer repos to use for each specified model (overrides defaults)")
     parser.add_argument("--output-dir", default="results", help="Directory for output files")
     parser.add_argument("--skip-v2", action="store_true", help="Skip v2 (hard) tasks")
     parser.add_argument("--skip-main", action="store_true", help="Skip main tasks")
     parser.add_argument("--dry-run", action="store_true", help="Print jobs without running")
     parser.add_argument("--rerun-missing", action="store_true",
                         help="Reuse latest output dir, skip jobs with existing CSV, run the rest")
-    parser.add_argument("--extra", nargs=argparse.REMAINDER, default=[], help="Extra args for ruler-bench")
+    parser.add_argument("--extra", nargs="*", default=[], help="Extra args for ruler-bench")
     args = parser.parse_args()
 
     preset = PRESETS[args.config]
@@ -379,16 +376,15 @@ def main():
     models = MODELS_DEFAULT
     if args.models:
         models = []
-        tokenizers = args.tokenizers if args.tokenizers else []
-        for p, t in zip(args.models, chain(tokenizers, repeat(None))):
+        for p in args.models:
             for m in MODELS_DEFAULT:
                 if m.path == p:
-                    models.append(dataclasses.replace(m, tokenizer=t if t else m.tokenizer))
+                    models.append(m)
                     break
             else:
                 models.append(ModelDef(
                     path=p,
-                    tokenizer=t if t else "",
+                    tokenizer="",  # will auto-detect
                     label=Path(p).stem,
                     family="custom",
                 ))
