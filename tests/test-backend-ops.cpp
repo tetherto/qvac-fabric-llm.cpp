@@ -7892,6 +7892,44 @@ struct test_cutlass_shared_activation : public test_case {
     }
 };
 
+// An F8_E4M3 matmul and a narrow BF16 matmul (like the GDN alpha/beta) on the same src1: on CUDA the BF16 one
+// reuses the e4m3 activation quantized for the F8 one.
+struct test_mul_mat_fp8_bf16_shared : public test_case {
+    const int64_t m;
+    const int64_t n;
+    const int64_t k;
+
+    std::string vars() override {
+        return VARS_TO_STR3(m, n, k);
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MUL_MAT_FP8_BF16_SHARED";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    double max_nmse_err() override {
+        return 5e-3;
+    }
+
+    test_mul_mat_fp8_bf16_shared(int64_t m = 48, int64_t n = 512, int64_t k = 5120) : m(m), n(n), k(k) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * w8 = ggml_new_tensor_2d(ctx, GGML_TYPE_F8_E4M3, k, m);
+        ggml_set_name(w8, "w8");
+        ggml_tensor * wb = ggml_new_tensor_2d(ctx, GGML_TYPE_BF16, k, m);
+        ggml_set_name(wb, "wb");
+        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
+        ggml_set_name(x, "x");
+
+        ggml_tensor * out = ggml_add(ctx, ggml_mul_mat(ctx, w8, x), ggml_mul_mat(ctx, wb, x));
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 struct test_cutlass_mlp_bf16 : public test_case {
     static constexpr int n_weights = 3;
 
@@ -7934,7 +7972,8 @@ struct test_cutlass_mlp_bf16 : public test_case {
 
     bool run_whole_graph() override { return true; }
 
-    std::vector<ggml_tensor *> fusion_test_nodes() override { return { pair_output, materialized_glu }; }
+    // the fused path does not write the GLU (NaN-initialized above), down must read only its NVFP4 copy
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return { pair_output }; }
 
     bool expect_fusion() override { return !reuse_glu; }
 
@@ -18145,6 +18184,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {1, 1}, 128, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F8_E4M3, GGML_TYPE_F8_E4M3));
     test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {1, 1}, 128, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F8_E4M3, GGML_TYPE_F8_E4M3));
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {1, 1}, 128, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F8_E4M3, GGML_TYPE_F8_E4M3));
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 512, 75, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F8_E4M3, GGML_TYPE_F8_E4M3));
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {6, 1}, 512, 75, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F8_E4M3, GGML_TYPE_F8_E4M3));
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {1, 1}, 128, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F8_E4M3, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {1, 1}, 128, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F8_E4M3));
 
@@ -18939,6 +18980,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_cutlass_mul_mat(type, 260, 129, 576));
             test_cases.emplace_back(new test_cutlass_mul_mat(type, 5120, 512, 5120));
             test_cases.emplace_back(new test_cutlass_shared_activation());
+            test_cases.emplace_back(new test_mul_mat_fp8_bf16_shared());
+            test_cases.emplace_back(new test_mul_mat_fp8_bf16_shared(48, 9, 512));
             test_cases.emplace_back(new test_cutlass_mlp_bf16(false));
             test_cases.emplace_back(new test_cutlass_mlp_bf16(true));
             test_cases.emplace_back(new test_cutlass_mlp_bf16(false, 129));
@@ -19350,6 +19393,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, kv, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, false, 0));
     }
 
+    // Qwen3.5/3.6 full attention prompt processing: 4 KV heads, GQA 6, 1024-token ubatch
+    for (int kv : {1024, 4096, 16384, 32768}) {
+        for (ggml_type type_KV : {GGML_TYPE_F16, GGML_TYPE_F8_E4M3}) {
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, 1024, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV));
+        }
+    }
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 8, {8, 1}, 7680, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 8, {8, 1}, 7680, 4, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 8, {8, 1}, 7680,   1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0));

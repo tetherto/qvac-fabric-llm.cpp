@@ -3224,6 +3224,10 @@ static bool ggml_cuda_mul_mat(ggml_backend_cuda_context &          ctx,
                 ggml_cuda_mul_mat_fp8(ctx, src0, src1, dst, nullptr, activation->values, (const float *) activation->scales)) {
             return true;
         }
+        if (activation != nullptr && activation->type == GGML_TYPE_F8_E4M3 && src0->type == GGML_TYPE_BF16 &&
+                ggml_cuda_mul_mat_fp8_bf16(ctx, src0, src1, dst, activation->values, (const float *) activation->scales)) {
+            return true;
+        }
         ggml_cuda_mul_mat_canonical(ctx, src0, src1, dst);
         return true;
     }
@@ -3241,7 +3245,7 @@ static bool ggml_cuda_mul_mat(ggml_backend_cuda_context &          ctx,
     if (cutlass_result == ggml_cuda_cutlass_result::success) {
         return true;
     }
-    if (!ggml_cuda_cutlass_result_can_fallback(cutlass_result)) {
+    if (!ggml_cuda_cutlass_result_can_fallback(cutlass_result) || (activation != nullptr && !activation->src1_written)) {
         return false;
     }
     const auto canonical_buft = ggml_backend_cuda_buffer_type(ctx.device);
@@ -6453,10 +6457,11 @@ struct ggml_cuda_cutlass_activation_plan {
             return up_result;
         }
 
-        char *    output     = group_workspace + mlp_plan.output_offset;
-        uint8_t * scales     = (uint8_t *) output + mlp_plan.output_layout.offset_scales;
-        float *   row_scales = (float *) (output + mlp_plan.output_layout.offset_rows);
-        quantize_cutlass_nvfp4_swiglu_bf16_cuda(
+        // the match guarantees that down is the only consumer of the GLU, and down reads the NVFP4 copy
+        char *     output      = group_workspace + mlp_plan.output_offset;
+        uint8_t *  scales      = (uint8_t *) output + mlp_plan.output_layout.offset_scales;
+        float *    row_scales  = (float *) (output + mlp_plan.output_layout.offset_rows);
+        const bool glu_written = quantize_cutlass_nvfp4_swiglu_bf16_cuda(
             (const nv_bfloat16 *) gate, (const nv_bfloat16 *) up, (const float *) mlp_plan.match.gate_scale->data,
             (const float *) mlp_plan.match.up_scale->data, (float *) mlp_plan.match.glu->data, output, scales,
             row_scales, mlp_plan.output_layout.k, mlp_plan.output_layout.k_padded, mlp_plan.output_layout.m,
@@ -6471,6 +6476,7 @@ struct ggml_cuda_cutlass_activation_plan {
             mlp_plan.output_layout.k,
             mlp_plan.output_layout.k_padded,
             mlp_plan.output_layout.type,
+            glu_written,
         };
         mlp_plan.ready = true;
         ++ctx.mlp_fusion_count;
@@ -6536,7 +6542,7 @@ static bool ggml_cuda_preflight_mlp_bf16(ggml_backend_cuda_context &           c
         !ggml_cuda_cutlass_get_activation_layout(ctx, match.down_mm->src[0], match.glu, match.down_mm, output_layout) ||
         match.glu->buffer == nullptr ||
         ggml_backend_buffer_get_type(match.glu->buffer) != ggml_backend_cuda_buffer_type(ctx.device) ||
-        match.glu->type != GGML_TYPE_F32 || !ggml_is_contiguous(match.glu) ||
+        match.glu->type != GGML_TYPE_F32 || !ggml_is_contiguous(match.glu) || (uintptr_t) match.glu->data % 16 != 0 ||
         match.gate_mm->src[0]->ne[1] != match.up_mm->src[0]->ne[1] ||
         !ggml_are_same_shape(match.gate_mm, match.up_mm) || !ggml_are_same_shape(match.gate_mm, match.glu) ||
         gate_layout.type != up_layout.type || gate_layout.m != up_layout.m || gate_layout.k != up_layout.k ||
@@ -6606,6 +6612,19 @@ static ggml_cuda_cutlass_activation_plan ggml_cuda_build_cutlass_activation_plan
 
     for (int i = 0; i < cgraph->n_nodes; ++i) {
         ggml_tensor * node = cgraph->nodes[i];
+        // a narrow BF16 matmul joins an FP8 group that already quantizes its src1
+        if (node->op == GGML_OP_MUL_MAT && (node->flags & GGML_TENSOR_FLAG_COMPUTE) != 0 && node->src[0] != nullptr &&
+            node->src[1] != nullptr && node->src[0]->type == GGML_TYPE_BF16 &&
+            ggml_cuda_fp8_bf16_weight_supported(node->src[0], node->src[1], node)) {
+            for (ggml_cuda_cutlass_activation_plan::group & candidate : plan.groups) {
+                if (candidate.src1 == node->src[1] && candidate.layout.type == GGML_TYPE_F8_E4M3) {
+                    candidate.nodes.push_back(node);
+                    candidate.last = i;
+                    break;
+                }
+            }
+            continue;
+        }
         if (node->op != GGML_OP_MUL_MAT || (node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 || node->src[0] == nullptr ||
             node->src[1] == nullptr || (node->src[0]->type != GGML_TYPE_NVFP4 && node->src[0]->type != GGML_TYPE_F8_E4M3) ||
             ggml_nrows(node->src[1]) <= MMVQ_MAX_BATCH_SIZE) {

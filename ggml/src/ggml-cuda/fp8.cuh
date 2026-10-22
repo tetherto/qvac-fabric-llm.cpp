@@ -16,6 +16,14 @@ bool ggml_cuda_fp8_activation_supported(const ggml_tensor * src0, const ggml_ten
 void ggml_cuda_fp8_quantize(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src1, float input_scale, uint8_t * values, float * scale);
 
+// narrow BF16 weights (e.g. the 48-row GDN alpha/beta) whose src1 is already quantized for FP8 matmuls: the weight is
+// quantized per call with a per-tensor scale and the matmul runs on the shared e4m3 activation
+bool ggml_cuda_fp8_bf16_weight_supported(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst);
+
+bool ggml_cuda_mul_mat_fp8_bf16(
+        ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst,
+        const uint8_t * act_values, const float * act_scale);
+
 // act_values/act_scale: src1 already quantized by ggml_cuda_fp8_quantize with this weight's input scale
 bool ggml_cuda_mul_mat_fp8(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst,
