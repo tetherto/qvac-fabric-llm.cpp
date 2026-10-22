@@ -166,6 +166,7 @@ jobs:
           cmake -B build-backend-loader-static \
             -DLLAMA_FATAL_WARNINGS=ON \
             -DLLAMA_BUILD_TESTS=ON \
+            -DGGML_NATIVE=OFF \
             -DGGML_BACKEND_DL=ON \
             -DBUILD_SHARED_LIBS=OFF
           cmake --build build-backend-loader-static --target test-backend-loader test-backend-loader-stub-zero test-backend-loader-stub-ok -j $(nproc)
