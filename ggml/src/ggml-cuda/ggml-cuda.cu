@@ -2725,6 +2725,10 @@ static bool ggml_cuda_mul_mat(ggml_backend_cuda_context &          ctx,
                 ggml_cuda_mul_mat_fp8(ctx, src0, src1, dst, nullptr, activation->values, (const float *) activation->scales)) {
             return true;
         }
+        if (activation != nullptr && activation->type == GGML_TYPE_F8_E4M3 && src0->type == GGML_TYPE_BF16 &&
+                ggml_cuda_mul_mat_fp8_bf16(ctx, src0, src1, dst, activation->values, (const float *) activation->scales)) {
+            return true;
+        }
         ggml_cuda_mul_mat_canonical(ctx, src0, src1, dst);
         return true;
     }
@@ -6019,6 +6023,19 @@ static ggml_cuda_cutlass_activation_plan ggml_cuda_build_cutlass_activation_plan
 
     for (int i = 0; i < cgraph->n_nodes; ++i) {
         ggml_tensor * node = cgraph->nodes[i];
+        // a narrow BF16 matmul joins an FP8 group that already quantizes its src1
+        if (node->op == GGML_OP_MUL_MAT && (node->flags & GGML_TENSOR_FLAG_COMPUTE) != 0 && node->src[0] != nullptr &&
+            node->src[1] != nullptr && node->src[0]->type == GGML_TYPE_BF16 &&
+            ggml_cuda_fp8_bf16_weight_supported(node->src[0], node->src[1], node)) {
+            for (ggml_cuda_cutlass_activation_plan::group & candidate : plan.groups) {
+                if (candidate.src1 == node->src[1] && candidate.layout.type == GGML_TYPE_F8_E4M3) {
+                    candidate.nodes.push_back(node);
+                    candidate.last = i;
+                    break;
+                }
+            }
+            continue;
+        }
         if (node->op != GGML_OP_MUL_MAT || (node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 || node->src[0] == nullptr ||
             node->src[1] == nullptr || (node->src[0]->type != GGML_TYPE_NVFP4 && node->src[0]->type != GGML_TYPE_F8_E4M3) ||
             ggml_nrows(node->src[1]) <= MMVQ_MAX_BATCH_SIZE) {
