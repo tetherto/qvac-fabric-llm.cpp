@@ -2721,6 +2721,10 @@ static bool ggml_cuda_mul_mat(ggml_backend_cuda_context &          ctx,
     }
 
     if (!ggml_backend_buft_is_cuda_repacked(ggml_backend_buffer_get_type(src0->buffer))) {
+        if (activation != nullptr && activation->type == GGML_TYPE_F8_E4M3 &&
+                ggml_cuda_mul_mat_fp8(ctx, src0, src1, dst, nullptr, activation->values, (const float *) activation->scales)) {
+            return true;
+        }
         ggml_cuda_mul_mat_canonical(ctx, src0, src1, dst);
         return true;
     }
@@ -4820,6 +4824,8 @@ static bool ggml_cuda_match_mlp_bf16(const ggml_cgraph * cgraph, int i, ggml_cud
 }
 
 struct ggml_cuda_cutlass_activation_plan;
+static const ggml_cuda_cutlass_activation * ggml_cuda_activation_plan_prepare(
+        ggml_cuda_cutlass_activation_plan & plan, ggml_backend_cuda_context & ctx, const ggml_tensor * node);
 static int ggml_cuda_try_fuse_mlp_bf16(ggml_backend_cuda_context *         cuda_ctx,
                                        ggml_cgraph *                       cgraph,
                                        int                                 i,
@@ -5536,9 +5542,14 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context *         cuda_ctx,
                 break;
             }
 
-            if (op == GGML_OP_MUL_MAT && !with_bias && src0->type == GGML_TYPE_F8_E4M3 &&
-                    ggml_cuda_mul_mat_fp8(*cuda_ctx, src0, src1, scale_node, scale)) {
-                return 1;
+            if (op == GGML_OP_MUL_MAT && !with_bias && src0->type == GGML_TYPE_F8_E4M3) {
+                const ggml_cuda_cutlass_activation * activation =
+                    activation_plan != nullptr ? ggml_cuda_activation_plan_prepare(*activation_plan, *cuda_ctx, mm_node) : nullptr;
+                const bool prequantized = activation != nullptr && activation->type == GGML_TYPE_F8_E4M3;
+                if (ggml_cuda_mul_mat_fp8(*cuda_ctx, src0, src1, scale_node, scale,
+                        prequantized ? activation->values : nullptr, prequantized ? (const float *) activation->scales : nullptr)) {
+                    return 1;
+                }
             }
 
             if (ggml_cuda_should_fuse_mul_mat_vec_q(mm_node)) {
@@ -5963,6 +5974,11 @@ static bool ggml_cuda_preflight_mlp_bf16(ggml_backend_cuda_context &           c
     return true;
 }
 
+static const ggml_cuda_cutlass_activation * ggml_cuda_activation_plan_prepare(
+        ggml_cuda_cutlass_activation_plan & plan, ggml_backend_cuda_context & ctx, const ggml_tensor * node) {
+    return plan.prepare(ctx, node);
+}
+
 static ggml_cuda_cutlass_activation_plan ggml_cuda_build_cutlass_activation_plan(ggml_backend_cuda_context * cuda_ctx,
                                                                                  ggml_cgraph *               cgraph,
                                                                                  bool concurrent_events_active) {
@@ -6002,7 +6018,7 @@ static ggml_cuda_cutlass_activation_plan ggml_cuda_build_cutlass_activation_plan
     for (int i = 0; i < cgraph->n_nodes; ++i) {
         ggml_tensor * node = cgraph->nodes[i];
         if (node->op != GGML_OP_MUL_MAT || (node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 || node->src[0] == nullptr ||
-            node->src[1] == nullptr || node->src[0]->type != GGML_TYPE_NVFP4 ||
+            node->src[1] == nullptr || (node->src[0]->type != GGML_TYPE_NVFP4 && node->src[0]->type != GGML_TYPE_F8_E4M3) ||
             ggml_nrows(node->src[1]) <= MMVQ_MAX_BATCH_SIZE) {
             continue;
         }
@@ -6021,7 +6037,8 @@ static ggml_cuda_cutlass_activation_plan ggml_cuda_build_cutlass_activation_plan
                 candidate_layout.offset_scales == layout.offset_scales &&
                 candidate_layout.size_scales == layout.size_scales &&
                 candidate_layout.offset_rows == layout.offset_rows && candidate_layout.size_rows == layout.size_rows &&
-                candidate_layout.size_allocation == layout.size_allocation) {
+                candidate_layout.size_allocation == layout.size_allocation &&
+                candidate_layout.fp8_input_scale == layout.fp8_input_scale) {
                 activation_group = &candidate;
                 break;
             }

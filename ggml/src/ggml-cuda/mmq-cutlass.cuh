@@ -19,6 +19,8 @@ struct ggml_cuda_cutlass_activation_layout {
     int       k        = 0;
     int       k_padded = 0;
     ggml_type type     = GGML_TYPE_COUNT;
+
+    float fp8_input_scale = 0.0f; // GGML_TYPE_F8_E4M3: static activation scale, 0 for a dynamic one
 };
 
 struct ggml_cuda_cutlass_activation {
