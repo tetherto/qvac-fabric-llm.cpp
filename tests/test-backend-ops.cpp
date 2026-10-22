@@ -13989,6 +13989,7 @@ static void add_speech_htp_cases(std::vector<std::unique_ptr<test_case>> & cases
         {16385, 3, 1, 1}, {3, 3, 1, 1}, 1, 1, 1, 0, 1, 1, false));
     cases.emplace_back(new test_depthwise_conv_1d_fused(33, 5, 1, false));
     cases.emplace_back(new test_depthwise_conv_1d_fused(65, 3, 2, true));
+    cases.emplace_back(new test_depthwise_conv_1d_fused(127, 7, 3, true));
     cases.emplace_back(new test_speech_htp<test_mul_mat>(GGML_TYPE_F16, GGML_TYPE_F16, 65, 7, 9, {1, 1}, {1, 1}));
     cases.emplace_back(new test_speech_htp<test_mul_mat>(GGML_TYPE_F32, GGML_TYPE_F32, 33, 17, 64, {2, 1}, {2, 1}));
     cases.emplace_back(new test_speech_htp<test_flash_attn_ext>(96, 96, 2, {1, 1}, 128, 32, false, false,
