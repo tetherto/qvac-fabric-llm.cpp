@@ -1657,8 +1657,12 @@ static bool ggml_metal_fusion_check_memory_ranges(
                 }
 
                 if (nodes_overlap(dst, src) && !is_intermediate(src, nodes, j)) {
-                    // Each ADD-chain thread reads its input elements before writing their sum.
-                    if (fusion->id == GGML_METAL_FUSION_ADD_CHAIN && src->data == dst->data && ggml_are_same_layout(src, dst)) {
+                    // An exact alias is safe when each thread writes only the elements it read: the
+                    // ADD chain, and the signed FWHT, whose RESHAPE keeps the element order.
+                    const bool inplace_ok =
+                        (fusion->id == GGML_METAL_FUSION_ADD_CHAIN   && ggml_are_same_layout(src, dst)) ||
+                        (fusion->id == GGML_METAL_FUSION_FWHT_SIGNED && ggml_metal_fusion_same_linear_layout(src, dst));
+                    if (src->data == dst->data && inplace_ok) {
                         continue;
                     }
                     return false;
