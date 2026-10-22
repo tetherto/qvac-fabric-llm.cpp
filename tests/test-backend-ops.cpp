@@ -13975,6 +13975,9 @@ static void add_speech_htp_cases(std::vector<std::unique_ptr<test_case>> & cases
     add_speech_htp_type_cases(cases, GGML_TYPE_F32);
     add_speech_htp_type_cases(cases, GGML_TYPE_F16);
     cases.emplace_back(new test_speech_htp<test_get_rows>(GGML_TYPE_BF16, 33, 11, 5, 2, 1, true, true, 1));
+    cases.emplace_back(new test_speech_htp<test_get_rows>(GGML_TYPE_BF16, 7, 11, 5, 2, 1, true, true, 1));
+    cases.emplace_back(new test_speech_htp<test_get_rows>(GGML_TYPE_BF16, 64, 11, 5, 2, 1, true, true, 1));
+    cases.emplace_back(new test_speech_htp<test_get_rows>(GGML_TYPE_BF16, 65, 11, 5, 2, 1, true, true, 1));
     cases.emplace_back(new test_speech_htp<test_timestep_embedding>(GGML_TYPE_F32, {3, 1, 1, 1}, 1, 10000));
     cases.emplace_back(new test_speech_htp<test_timestep_embedding>(GGML_TYPE_F32, {3, 1, 1, 1}, 33, 1000));
     cases.emplace_back(new test_speech_htp<test_unary>(GGML_UNARY_OP_GELU_ERF, GGML_TYPE_F32, {33, 3, 1, 1}));
