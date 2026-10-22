@@ -13900,6 +13900,29 @@ struct test_depthwise_conv_1d_fused : test_case {
     }
 };
 
+struct test_speech_conv_weights : test_case {
+    const ggml_type type;
+
+    explicit test_speech_conv_weights(ggml_type type) : type(type) {}
+
+    std::string vars() override { return "suite=speech_htp,repeated_weights=1," + VARS_TO_STR1(type); }
+    std::string op_desc(ggml_tensor *) override { return "CONV_2D_DW"; }
+    bool run_whole_graph() override { return true; }
+    bool use_weight_context() override { return true; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override { return build_graph(ctx, ctx); }
+
+    ggml_tensor * build_graph(ggml_context * ctx, ggml_context * weights) override {
+        constexpr int64_t channels = 33;
+        ggml_tensor * x = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 65, 5, channels, 1);
+        ggml_tensor * w1 = ggml_new_tensor_4d(weights, type, 3, 3, 1, channels);
+        ggml_tensor * w2 = ggml_new_tensor_4d(weights, type, 3, 3, 1, channels);
+        ggml_tensor * y1 = ggml_conv_2d_dw_direct(ctx, w1, x, 1, 1, 1, 1, 1, 1);
+        ggml_tensor * y2 = ggml_conv_2d_dw_direct(ctx, w2, x, 1, 1, 1, 1, 1, 1);
+        return ggml_add(ctx, y1, y2);
+    }
+};
+
 static void add_speech_htp_type_cases(std::vector<std::unique_ptr<test_case>> & cases, ggml_type type) {
     cases.emplace_back(new test_speech_htp<test_col2im_1d>(type, 5, 3, 33, 2, 1));
     cases.emplace_back(new test_speech_htp<test_col2im_1d>(type, 2, 3, 31, 3, 0));
@@ -13914,6 +13937,8 @@ static void add_speech_htp_type_cases(std::vector<std::unique_ptr<test_case>> & 
 }
 
 static void add_speech_htp_cases(std::vector<std::unique_ptr<test_case>> & cases) {
+    cases.emplace_back(new test_speech_conv_weights(GGML_TYPE_F32));
+    cases.emplace_back(new test_speech_conv_weights(GGML_TYPE_F16));
     add_speech_htp_type_cases(cases, GGML_TYPE_F32);
     add_speech_htp_type_cases(cases, GGML_TYPE_F16);
     cases.emplace_back(new test_speech_htp<test_get_rows>(GGML_TYPE_BF16, 33, 11, 5, 2, 1, true, true, 1));
