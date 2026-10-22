@@ -2,6 +2,18 @@
 
 #include <cstdint>
 
+#ifdef GGML_USE_MUSA
+// the MUSA compiler crashes on these kernels, so the ops are not supported there (see ggml_backend_cuda_device_supports_op)
+void ggml_cuda_op_gated_delta_net_deferred(ggml_backend_cuda_context & ctx, ggml_tensor * dst, float * base_out) {
+    GGML_UNUSED_VARS(ctx, dst, base_out);
+    GGML_ABORT("GGML_OP_GATED_DELTA_NET_DEFERRED is not supported on MUSA");
+}
+
+void ggml_cuda_op_gdn_conv_deferred(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    GGML_UNUSED_VARS(ctx, dst);
+    GGML_ABORT("GGML_OP_GDN_CONV_DEFERRED is not supported on MUSA");
+}
+#else
 // gated delta net with a deferred state commit, see ggml_gated_delta_net_deferred. one warp per state column, as in
 // gated_delta_net_cuda and with the same arithmetic: replay the pending recorded rows into the base, then run the
 // block, writing the new base when the block reaches it and recording the last R rows.
@@ -341,3 +353,4 @@ void ggml_cuda_op_gdn_conv_deferred(ggml_backend_cuda_context & ctx, ggml_tensor
         (float *) dst->data, C, n_tokens, K, n_norm, eps,
         x->nb[1] / fs, x->nb[2] / fs, dst->nb[1] / fs, dst->nb[2] / fs, hist->nb[1] / fs);
 }
+#endif // GGML_USE_MUSA
