@@ -20,6 +20,7 @@ Config presets:
 
 import argparse
 import csv
+import dataclasses
 import logging
 import os
 import sys
@@ -382,9 +383,7 @@ def main():
         for p, t in zip(args.models, chain(tokenizers, repeat(None))):
             for m in MODELS_DEFAULT:
                 if m.path == p:
-                    m_updated = m.copy()
-                    m_updated.tokenizer = t if t else m.tokenizer
-                    models.append(m_updated)
+                    models.append(dataclasses.replace(m, tokenizer=t if t else m.tokenizer))
                     break
             else:
                 models.append(ModelDef(

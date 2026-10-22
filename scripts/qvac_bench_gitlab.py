@@ -196,6 +196,7 @@ def main() -> None:
             sys.exit("db: no database URL (pass --db-url or set $DATABASE_URL, or use --dry-run)")
         try:
             pusher = make_pusher(args.db_url)
+            assert pusher is not None  # args.db_url is non-empty here
             pusher.ping()
         except DbPreflightError as e:
             sys.exit(f"db: {e}")

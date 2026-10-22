@@ -3,7 +3,7 @@ from itertools import product
 from functools import cache
 from pathlib import Path
 from socket import gethostname
-from typing import Any, Sequence
+from typing import Any, Sequence, cast
 import argparse
 import csv
 import datetime
@@ -30,6 +30,7 @@ IMAGES_DIR: Path = WORKDIR / "images"
 logging.basicConfig(stream=sys.stderr, level=logging.INFO, format="%(message)s")
 
 OptionsType = dict[str, Any]
+
 
 class Worktree:
     backend_defines: dict[str, list[str]] = {
@@ -68,7 +69,7 @@ class Worktree:
 
         if rebuild or not self.build_path.is_dir():
             shutil.rmtree(self.build_path, ignore_errors=True)
-            log(self.name, f"cmake configure")
+            log(self.name, "cmake configure")
             with (RESULTS_DIR / f"{self.sha}-{self.backend}-cmake.log").open("w") as logfile:
                 subprocess.run(
                     [
@@ -85,7 +86,7 @@ class Worktree:
         else:
             log(self.name, f"partially reusing existing build: {self.build_path}, building only missing binaries: {' '.join(missing_binaries)} (pass --rebuild to force)")
 
-        log(self.name, f"cmake build")
+        log(self.name, "cmake build")
         with (RESULTS_DIR / f"{self.sha}-{self.backend}-build.log").open("w") as logfile:
             subprocess.run(
                 ["cmake", "--build", self.build_path, "-j", str(num_jobs), "--target"] + missing_binaries,
@@ -154,6 +155,7 @@ class Model:
         if self.mmproj:
             self._download_file(self.mmproj)
 
+
 class RunContext:
     def __init__(self, worktree: Worktree, model: Model, options: OptionsType) -> None:
         self.worktree = worktree
@@ -164,6 +166,7 @@ class RunContext:
         # Ignore options that don't affect the resuls of a run
         for ignore in ("restart", "retry_failed", "rebuild", "num_jobs", "clean_unused"):
             self.options.pop(ignore, None)
+
 
 class Benchmark(ABC):
     def __init__(self, name: str, binaries: Sequence[str], default_options: OptionsType) -> None:
@@ -209,7 +212,6 @@ class Benchmark(ABC):
     @abstractmethod
     def create_report(self, worktrees: Sequence[Worktree], models: Sequence[Model], options: OptionsType, report_options: OptionsType, df: pd.DataFrame) -> None:
         pass
-
 
 
 class NoModel(Model):
@@ -351,18 +353,18 @@ def build_parser():
 
 
 def apply_overrides(config, args):
-    override = {}
+    override: OptionsType = {}
 
     if args.benchmark:
         override["benchmark"] = args.benchmark
 
     if args.model:
         for model_str in args.model:
-            override.setdefault("models", {}).append(json.loads(model_str))
+            override.setdefault("models", []).append(json.loads(model_str))
 
     if args.build:
         for build_str in args.build:
-            override.setdefault("builds", {}).append(json.loads(build_str))
+            override.setdefault("builds", []).append(json.loads(build_str))
 
     if args.option:
         override["options"] = parse_options(args.option)
@@ -381,12 +383,14 @@ def apply_overrides(config, args):
 
     return deep_merge(config, override)
 
+
 def visible_devices(run_ctx: RunContext) -> str:
     if run_ctx.worktree.backend == "vulkan":
         return str(run_ctx.options.get("ggml_vk_visible_devices", "0"))
     elif run_ctx.worktree.backend == "cuda":
         return str(run_ctx.options.get("cuda_visible_devices", "0"))
     return "0"
+
 
 @cache
 def allvulkaninfo() -> list[str]:
@@ -462,8 +466,8 @@ def gpuinfo(worktrees, models, options) -> list[tuple[int, str, str]]:
     visible_devices = set()
 
     for model in models:
-        run_ctx = RunContext(None, model, options)
-        for d in split_devices(run_ctx.options.get("ggml_vk_visible_devices", "")):
+        model_options = options | (model.options or {})
+        for d in split_devices(model_options.get("ggml_vk_visible_devices", "")):
             visible_devices.add(d)
 
     backends = {worktree.backend for worktree in worktrees}
@@ -485,6 +489,7 @@ def get_status(statuspath) -> str | None:
             return j.get("status", None)
     except FileNotFoundError:
         return None
+
 
 class LlamaBench(Benchmark):
     def __init__(self) -> None:
@@ -524,8 +529,8 @@ class LlamaBench(Benchmark):
     def verify_output(self, run_ctx: RunContext) -> bool:
         outpath = self.result_path(run_ctx, ".stdout")
         with outpath.open("r") as f:
-            for l in f.readlines():
-                data = json.loads(l)
+            for line in f.readlines():
+                data = json.loads(line)
                 if "avg_ts" not in data:
                     return False
         return True
@@ -577,11 +582,12 @@ class LlamaBench(Benchmark):
 
         df = df.reindex(columns=["model", "metric", "worktree", "tps", "sd"])
         rows = []
-        for (model, metric), group in df.groupby(["model", "metric"], sort=False):
+        for key, group in df.groupby(["model", "metric"], sort=False):
+            model, metric = cast(tuple[str, str], key)
             # The reference may have no row here, e.g. if its run failed for this model.
             ref_values = group.loc[group.worktree == reference, "tps"]
             ref = ref_values.iloc[0] if not ref_values.empty else None
-            row = { "Model": model, "Metric": metric, }
+            row = {"Model": model, "Metric": metric}
             for _, r in group.iterrows():
                 value = f"{r.tps:.2f} ±{r.sd:.2f}"
                 if r.worktree != reference and ref is not None and ref != 0.0:
@@ -594,10 +600,11 @@ class LlamaBench(Benchmark):
         with report_path.open("w") as f:
             f.write("\n".join(lines))
             f.write("\n")
-            f.write(pd.DataFrame(rows).to_markdown(index=False, tablefmt="github"))
+            pd.DataFrame(rows).to_markdown(f, index=False, tablefmt="github")
             f.write("\n")
 
-        print(f"wrote {report_path}", file=sys.stderr)
+        print(f"wrote {report_path}", file=sys.stderr)  # noqa: NP100
+
 
 class LlamaFinetuneLora(Benchmark):
     loss_re = re.compile(r"loss\s*=?\s*(([0-9.eE+-]+)|inf|nan|-inf)")
@@ -749,12 +756,11 @@ class LlamaFinetuneLora(Benchmark):
 
             lines.append(row)
 
-
         report_path = RESULTS_DIR / f"{self.name}-report.md"
         with report_path.open("w") as f:
             f.write("\n".join(lines))
 
-        print(f"wrote {report_path}", file=sys.stderr)
+        print(f"wrote {report_path}", file=sys.stderr)  # noqa: NP100
 
 
 class LlamaMtmdCli(Benchmark):
@@ -837,7 +843,7 @@ class LlamaMtmdCli(Benchmark):
                     "n_predict": run_ctx.options["n_predict"],
                     "t0_wall_t": elapsed_t0,
                     "tN_wall_t": elapsed_tN
-                    })
+                })
 
         with outpath.open("w") as out:
             json.dump(results, out, indent=2)
@@ -933,7 +939,8 @@ class LlamaMtmdCli(Benchmark):
         with report_path.open("w") as f:
             f.write("\n".join(lines))
 
-        print(f"wrote {report_path}", file=sys.stderr)
+        print(f"wrote {report_path}", file=sys.stderr)  # noqa: NP100
+
 
 class Turboquant(Benchmark):
     def __init__(self) -> None:
@@ -1011,11 +1018,11 @@ class Turboquant(Benchmark):
                 )
 
         # NIAH needs data from RULER
-        if "niah" in benchmarks and not "ruler" in benchmarks:
+        if "niah" in benchmarks and "ruler" not in benchmarks:
             benchmarks = ["ruler"] + benchmarks
 
         for bench in [b for b in ["ruler", "longbench", "zeroscrolls", "leval", "niah"] if b in benchmarks]:
-            print("running:", bench)
+            print("running:", bench)  # noqa: NP100
             bench_path = self.result_path(run_ctx, f".{bench}")
             if bench == "ruler":
                 extra_args = ["--extra", "--cli-bin", f"{run_ctx.worktree.binary_path('llama-completion')}"]
@@ -1027,8 +1034,8 @@ class Turboquant(Benchmark):
             with outpath.open("a") as out:
                 subprocess.run(
                     ["python3", REPO_ROOT / "tests" / f"test-kv-cache-{bench}.py", "--output-dir", bench_path,
-                     "--models", model_path, "--gpus", visible_devices(run_ctx)] +
-                     run_ctx.options[f"{bench}_args"] + extra_args,
+                     "--models", model_path, "--gpus", visible_devices(run_ctx)]
+                    + run_ctx.options[f"{bench}_args"] + extra_args,
                     stdout=out,
                     stderr=subprocess.STDOUT,
                     env=env,
@@ -1045,7 +1052,7 @@ class Turboquant(Benchmark):
                         if "model" not in row or "pp_vs_f16_x" not in row or "tg_vs_f16_x" not in row:
                             return False
                 return True
-            except:
+            except Exception:
                 return False
 
         if "perp" in run_ctx.options["benchmarks"]:
@@ -1057,7 +1064,7 @@ class Turboquant(Benchmark):
                         if "model" not in row or "bpw_avg" not in row or "ppl_mean" not in row:
                             return False
                 return True
-            except:
+            except Exception:
                 return False
 
         return True
@@ -1141,14 +1148,13 @@ class Turboquant(Benchmark):
                                 return (v - values[reference]) / values[reference] * 100.0
                             cells.append(f"{delta_pct(val):+.2f}%" + (f" (α: {delta_pct(val_nc):+.2f}%)" if not math.isnan(val_nc) else ""))
                         else:
-                            cells.append(f"-")
+                            cells.append("-")
 
                 lines.append("| " + " | ".join(cells) + " |")
 
             lines.append("")
 
         return lines
-
 
     def create_report_turboquant_evals(self, worktrees: Sequence[Worktree], models: Sequence[Model], options: OptionsType, df: pd.DataFrame) -> list[str]:
         active_benches = [b for b in ["ruler", "longbench", "zeroscrolls", "leval", "niah"]
@@ -1266,7 +1272,7 @@ class Turboquant(Benchmark):
         with report_path.open("w") as f:
             f.write("\n".join(lines))
 
-        print(f"wrote {report_path}", file=sys.stderr)
+        print(f"wrote {report_path}", file=sys.stderr)  # noqa: NP100
 
 
 benchmarks = [
@@ -1299,11 +1305,11 @@ def bench_driver(
     except DbPreflightError as e:
         sys.exit(f"db: {e}")
 
-    log("driver", f"downloading models for benchmark")
+    log("driver", "downloading models for benchmark")
     for model in models:
         model.download()
 
-    log("driver", f"preparing builds for benchmark")
+    log("driver", "preparing builds for benchmark")
     builds_with_worktrees = []
     for build in builds:
         worktree = build.create_worktree()
@@ -1320,7 +1326,6 @@ def bench_driver(
                 if not any([b.is_dir() for b in wt.glob("build-*")]):
                     log("driver", f"removing unused worktree directory: {wt}")
                     subprocess.run(["git", "-C", str(REPO_ROOT), "worktree", "remove", "--force", str(wt)], check=True)
-
 
     for (build, worktree) in builds_with_worktrees:
         for model in models:
@@ -1425,7 +1430,7 @@ def main() -> None:
     if "builds" not in config:
         raise ValueError("missing required config value: builds")
 
-    print(json.dumps(config, indent=2))
+    print(json.dumps(config, indent=2))  # noqa: NP100
 
     benchmark = next((x for x in benchmarks if x.name == config["benchmark"]), None)
     if benchmark is None:

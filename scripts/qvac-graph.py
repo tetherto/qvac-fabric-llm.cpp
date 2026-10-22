@@ -46,7 +46,7 @@ class LlamaBenchReport(Report):
 
     @classmethod
     def detect(cls, text: str) -> bool:
-        if not '- **llama-bench**' in text or not '| Model ' in text:
+        if '- **llama-bench**' not in text or '| Model ' not in text:
             return False
 
         return True
@@ -59,7 +59,7 @@ class LlamaBenchReport(Report):
 
         for model in df["model"].unique():
             outfile = outpath / (model + ".pdf")
-            print(f"Plotting graphs for model '{model}' -> {outfile}")
+            print(f"Plotting graphs for model '{model}' -> {outfile}")  # noqa: NP100
             model_df = df[df["model"] == model]
 
             metrics = model_df["metric"].unique()
@@ -123,7 +123,7 @@ class LlamaFinetuneLoraReport(Report):
 
     @classmethod
     def detect(cls, text: str) -> bool:
-        if not '- **Loss tolerance' in text or not '| Model | ' in text or not 'epoch_s' in text:
+        if '- **Loss tolerance' not in text or '| Model | ' not in text or 'epoch_s' not in text:
             return False
 
         return True
@@ -136,7 +136,7 @@ class LlamaFinetuneLoraReport(Report):
 
         for model in df["model"].unique():
             outfile = outpath / (model + ".pdf")
-            print(f"Plotting graphs for model '{model}' -> {outfile}")
+            print(f"Plotting graphs for model '{model}' -> {outfile}")  # noqa: NP100
             model_df = df[df["model"] == model]
 
             fig, axes = plt.subplots(len(groups), 1, figsize=(8.27, 11.69), squeeze=False)
@@ -149,7 +149,7 @@ class LlamaFinetuneLoraReport(Report):
                 for device in metric_df["device"].unique():
                     device_df = metric_df[metric_df["device"] == device]
                     vals = device_df[branch_cols].fillna(0.0).values.flatten()
-                    line = ax.plot(branch_cols, vals, marker="o", label=device)
+                    ax.plot(branch_cols, vals, marker="o", label=device)
 
                 if len(ax.get_lines()) > 0:
                     ax.set_title("Epoch time")
@@ -222,7 +222,7 @@ def main() -> None:
 
     flat_devices = [item for sublist in args.devices for item in sublist] if args.devices else []
     if not args.reports or len(args.reports) != len(flat_devices):
-        print(
+        print(  # noqa: NP100
             "Reports and devices must be provided and must have the same length."
         )
         return
@@ -257,4 +257,4 @@ if __name__ == "__main__":
     try:
         main()
     except Exception as e:
-        print(f"Error: {e}")
+        print(f"Error: {e}")  # noqa: NP100
