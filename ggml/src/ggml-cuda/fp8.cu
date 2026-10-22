@@ -278,6 +278,86 @@ bool ggml_cuda_mul_mat_fp8(
     return true;
 }
 
+static __global__ void fp8_bf16_amax(const nv_bfloat16 * __restrict__ x, const int64_t n, float * __restrict__ amax) {
+    float value = 0.0f;
+    for (int64_t i = (int64_t) blockIdx.x*blockDim.x + threadIdx.x; i < n; i += (int64_t) blockDim.x*gridDim.x) {
+        value = fmaxf(value, fabsf(__bfloat162float(x[i])));
+    }
+    __shared__ float shared[WARP_SIZE];
+    value = block_reduce<block_reduce_method::MAX, 256>(value, shared);
+    if (threadIdx.x == 0) {
+        // non-negative floats order like their bit patterns
+        atomicMax((unsigned int *) amax, __float_as_uint(value));
+    }
+}
+
+static __global__ void fp8_bf16_convert(
+        const nv_bfloat16 * __restrict__ x, const int64_t n, const float * __restrict__ amax, float * __restrict__ scale,
+        uint8_t * __restrict__ y) {
+    const float d = *amax > 0.0f ? *amax / 448.0f : 1.0f;
+    const int64_t i0 = (int64_t) blockIdx.x*blockDim.x + threadIdx.x;
+    if (i0 == 0) {
+        *scale = d;
+    }
+    for (int64_t i = i0; i < n; i += (int64_t) blockDim.x*gridDim.x) {
+        y[i] = ggml_cuda_fp32_to_f8_e4m3(__bfloat162float(x[i]) / d);
+    }
+}
+
+bool ggml_cuda_fp8_bf16_weight_supported(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst) {
+    static const bool disabled = getenv("GGML_CUDA_DISABLE_FP8_BF16") != nullptr;
+    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    return !disabled && fp8_mma_hardware_available(cc) && src0->type == GGML_TYPE_BF16 && ggml_is_contiguous(src0) &&
+        src0->ne[2] == 1 && src0->ne[3] == 1 && src0->ne[0] % 16 == 0 && src0->ne[1] % 16 == 0 && src0->ne[1] <= 256 &&
+        src1->type == GGML_TYPE_F32 && src1->ne[0] == src0->ne[0] && src1->ne[1] > MMVF_MAX_BATCH_SIZE &&
+        src1->ne[2] == 1 && src1->ne[3] == 1 && dst->type == GGML_TYPE_F32 && ggml_is_contiguous(dst) &&
+        ggml_cuda_is_aligned(src0, 16) && ggml_cuda_is_aligned(dst, 16);
+}
+
+bool ggml_cuda_mul_mat_fp8_bf16(
+        ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst,
+        const uint8_t * act_values, const float * act_scale) {
+    if (act_values == nullptr || !ggml_cuda_fp8_bf16_weight_supported(src0, src1, dst)) {
+        return false;
+    }
+    const int64_t k = src0->ne[0];
+    const int64_t n = src0->ne[1];
+    const int64_t m = src1->ne[1];
+
+    std::lock_guard<std::mutex> lock(fp8_plan_mutex);
+    fp8_matmul_plan & plan = fp8_get_plan(ctx, k, n, m);
+    if (!plan.ok) {
+        return false;
+    }
+
+    cudaStream_t stream = ctx.stream();
+    const int64_t ne_w = k*n;
+    ggml_cuda_pool_alloc<uint8_t> w_fp8(ctx.pool(), ne_w);
+    ggml_cuda_pool_alloc<float> w_amax(ctx.pool(), 1);
+    ggml_cuda_pool_alloc<float> w_scale(ctx.pool(), 1);
+    const int blocks = (int) std::min<int64_t>((ne_w + 255)/256, 256);
+    CUDA_CHECK(cudaMemsetAsync(w_amax.ptr, 0, sizeof(float), stream));
+    fp8_bf16_amax<<<blocks, 256, 0, stream>>>((const nv_bfloat16 *) src0->data, ne_w, w_amax.ptr);
+    fp8_bf16_convert<<<blocks, 256, 0, stream>>>((const nv_bfloat16 *) src0->data, ne_w, w_amax.ptr, w_scale.ptr, w_fp8.ptr);
+    CUDA_CHECK(cudaGetLastError());
+
+    const float * a_scale = w_scale.ptr;
+    CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(plan.op, CUBLASLT_MATMUL_DESC_A_SCALE_POINTER, &a_scale, sizeof(a_scale)));
+    CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(plan.op, CUBLASLT_MATMUL_DESC_B_SCALE_POINTER, &act_scale, sizeof(act_scale)));
+
+    ggml_cuda_pool_alloc<char> workspace(ctx.pool());
+    void * workspace_ptr = nullptr;
+    if (plan.workspace != 0) {
+        workspace.alloc(plan.workspace + 256);
+        workspace_ptr = (void *) GGML_PAD((uintptr_t) workspace.get(), (uintptr_t) 256);
+    }
+    const float alpha = 1.0f;
+    const float beta  = 0.0f;
+    CUBLAS_CHECK(cublasLtMatmul(ctx.cublaslt_handle(), plan.op, &alpha, w_fp8.ptr, plan.a, act_values, plan.b,
+        &beta, dst->data, plan.d, dst->data, plan.d, &plan.algo, workspace_ptr, plan.workspace, stream));
+    return true;
+}
+
 #else
 
 float ggml_cuda_fp8_input_scale(const ggml_tensor * src0) {
@@ -300,6 +380,18 @@ bool ggml_cuda_mul_mat_fp8(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst,
         const ggml_tensor * weight_scale, const uint8_t * act_values, const float * act_scale) {
     GGML_UNUSED_VARS(ctx, src0, src1, dst, weight_scale, act_values, act_scale);
+    return false;
+}
+
+bool ggml_cuda_fp8_bf16_weight_supported(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst) {
+    GGML_UNUSED_VARS(src0, src1, dst);
+    return false;
+}
+
+bool ggml_cuda_mul_mat_fp8_bf16(
+        ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst,
+        const uint8_t * act_values, const float * act_scale) {
+    GGML_UNUSED_VARS(ctx, src0, src1, dst, act_values, act_scale);
     return false;
 }
 
