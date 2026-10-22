@@ -3,6 +3,7 @@
 // and context interpolation without loading model weights or a GPU backend.
 
 #include "../common/fit.h"
+#include "../ggml/src/ggml-impl.h"
 
 #include <cstdio>
 #include <cstdint>
@@ -127,8 +128,7 @@ static void test_auto_cache_preserves_context_fitting() {
 }
 
 #ifndef _WIN32
-// Inject an exception from the probe's logger to exercise unwinding before
-// any of the explicit model/context failure checks can restore the callback.
+// Inject an exception from the probe's logger to check thread-local log-level restoration during unwinding.
 static void test_probe_logger_restoration() {
     ggml_log_callback original_callback;
     void * original_data;
@@ -157,17 +157,19 @@ static void test_probe_logger_restoration() {
     void * restored_data;
     llama_log_get(&restored_callback, &restored_data);
     expect_i64("probe exception injected", caught, true);
-    expect_i64("probe restores callback", restored_callback == callback, true);
-    expect_i64("probe restores callback data", restored_data == &inject, true);
-    // A second probe verifies that unwinding released the serialization mutex.
+    expect_i64("probe does not replace callback", restored_callback == callback, true);
+    expect_i64("probe does not replace callback data", restored_data == &inject, true);
+    expect_i64("probe restores thread level", ggml_log_get_thread_min_level(), GGML_LOG_LEVEL_NONE);
+    // A second probe checks that the calling thread remains usable after unwinding.
     try {
         common_get_device_memory_data("/nonexistent-fit-test/model.gguf", &mparams, &cparams, devices,
                                       layers, context, experts, GGML_LOG_LEVEL_ERROR);
     } catch (const std::runtime_error &) {
     }
     llama_log_get(&restored_callback, &restored_data);
-    expect_i64("failed load restores callback", restored_callback == callback, true);
-    expect_i64("failed load restores callback data", restored_data == &inject, true);
+    expect_i64("failed load does not replace callback", restored_callback == callback, true);
+    expect_i64("failed load does not replace callback data", restored_data == &inject, true);
+    expect_i64("failed load restores thread level", ggml_log_get_thread_min_level(), GGML_LOG_LEVEL_NONE);
     llama_log_set(original_callback, original_data);
 }
 #endif
