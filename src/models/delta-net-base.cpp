@@ -541,11 +541,10 @@ ggml_tensor * llm_build_delta_net_base::build_conv_deferred(
     // both history slots of a cell are adjacent rows
     ggml_tensor * hist2 = ggml_reshape_2d(ctx0, hist, 2 * hist->ne[0], hist->ne[1] / 2);
 
-    // a fresh cell starts from a zero conv window
-    if (rs_z >= 0) {
-        ggml_build_forward_expand(gf, ggml_scale_inplace(ctx0,
-            ggml_view_1d(ctx0, hist2, hist2->ne[0], rs_z * hist2->nb[1]), 0));
-    }
+    // a fresh cell starts from a zero conv window.
+    // like the extra copies below, the nodes are zero-sized when unused so the graph matches the reserved one
+    ggml_build_forward_expand(gf, ggml_scale_inplace(ctx0,
+        ggml_view_1d(ctx0, hist2, hist2->ne[0] * (rs_z >= 0), rs_z * hist2->nb[1] * (rs_z >= 0)), 0));
 
     ggml_tensor * out = ggml_gdn_conv_deferred(ctx0, qkv_mixed, conv_kernel, hist, inp->rec_idx,
             mctx_cur->get_gdn_k(), n_norm, head_dim, eps);
@@ -553,13 +552,11 @@ ggml_tensor * llm_build_delta_net_base::build_conv_deferred(
 
     // cells that only receive a copy of another cell's state also need its history.
     // copied after the conv, which may read a source row that is one of these cells
-    if (n_rs > n_seqs) {
-        ggml_build_forward_expand(gf, out);
-        ggml_tensor * extra = ggml_get_rows(ctx0, hist2, inp->s_copy_base_extra);
-        ggml_build_forward_expand(gf,
-                ggml_cpy(ctx0, extra,
-                    ggml_view_2d(ctx0, hist2, hist2->ne[0], n_rs - n_seqs, hist2->nb[1], (head + n_seqs) * hist2->nb[1])));
-    }
+    ggml_build_forward_expand(gf, out);
+    ggml_tensor * extra = ggml_get_rows(ctx0, hist2, inp->s_copy_base_extra);
+    ggml_build_forward_expand(gf,
+            ggml_cpy(ctx0, extra,
+                ggml_view_2d(ctx0, hist2, hist2->ne[0], n_rs - n_seqs, hist2->nb[1], (head + n_seqs) * hist2->nb[1])));
 
     return out;
 }
@@ -577,10 +574,8 @@ ggml_tensor * llm_build_delta_net_base::build_rs_ssm(
     if (inp->s_base_inplace) {
         // every cell keeps its own base state: no gather, the op reads and writes the cache rows
         const int32_t rs_z = mctx_cur->get_rs_z();
-        if (rs_z >= 0) {
-            ggml_build_forward_expand(gf, ggml_scale_inplace(ctx0,
-                ggml_view_1d(ctx0, ssm_states_all, hparams.n_embd_s(), rs_z*ssm_states_all->nb[1]), 0));
-        }
+        ggml_build_forward_expand(gf, ggml_scale_inplace(ctx0,
+            ggml_view_1d(ctx0, ssm_states_all, hparams.n_embd_s()*(rs_z >= 0), rs_z*ssm_states_all->nb[1]*(rs_z >= 0)), 0));
 
         return ggml_view_2d(ctx0, ssm_states_all, hparams.n_embd_s(), n_seqs, ssm_states_all->nb[1],
                             mctx_cur->get_head()*ssm_states_all->nb[1]);
@@ -647,13 +642,11 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
 
         // cells that only receive a copy of another cell's state also need its records
         const int64_t n_rs = mctx_cur->get_n_rs();
-        if (n_rs > n_seqs) {
-            ggml_tensor * rec2 = ggml_reshape_2d(ctx0, rec, 2 * rec->ne[0], rec->ne[1] / 2);
-            ggml_tensor * rec_extra = ggml_get_rows(ctx0, rec2, inp->s_copy_base_extra);
-            ggml_build_forward_expand(gf,
-                    ggml_cpy(ctx0, rec_extra,
-                        ggml_view_2d(ctx0, rec2, rec2->ne[0], n_rs - n_seqs, rec2->nb[1], (kv_head + n_seqs) * rec2->nb[1])));
-        }
+        ggml_tensor * rec2 = ggml_reshape_2d(ctx0, rec, 2 * rec->ne[0], rec->ne[1] / 2);
+        ggml_tensor * rec_extra = ggml_get_rows(ctx0, rec2, inp->s_copy_base_extra);
+        ggml_build_forward_expand(gf,
+                ggml_cpy(ctx0, rec_extra,
+                    ggml_view_2d(ctx0, rec2, rec2->ne[0], n_rs - n_seqs, rec2->nb[1], (kv_head + n_seqs) * rec2->nb[1])));
 
         return output;
     }
