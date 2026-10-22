@@ -3105,10 +3105,8 @@ extern "C" {
             struct ggml_tensor  * state,
             struct ggml_tensor  * d);
 
-    // gated delta net with a deferred state commit, for speculative decoding without a state
-    // snapshot per draft token. q, k, v, g and beta are as in ggml_gated_delta_net.
-    //
-    // gated delta net with a deferred state commit, for speculative decoding.
+    // gated delta net with a deferred state commit, for speculative decoding. q, k, v, g and beta
+    // are as in ggml_gated_delta_net.
     // Instead of a state snapshot per draft token, the last rows of each call are recorded and the
     // base state is brought up to date by replaying the kept rows at the start of the next call.
     //   state   : [S_v, S_v, H_v, n_seqs] committed base state

@@ -232,6 +232,13 @@ extern "C" {
         void * context;
     };
 
+    // for ops that update a src in place: on a device that cannot use the buffer of that src, the scheduler gives the op a copy and the update is lost
+    static inline bool ggml_backend_dev_supports_inplace_src(ggml_backend_dev_t dev, const struct ggml_tensor * src) {
+        const struct ggml_tensor * t = src->view_src ? src->view_src : src;
+        // no buffer yet, e.g. in test-backend-ops
+        return t->buffer == NULL || dev->iface.supports_buft(dev, t->buffer->buft);
+    }
+
     //
     // Backend (reg)
     //

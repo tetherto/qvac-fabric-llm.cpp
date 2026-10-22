@@ -33,6 +33,9 @@ gated_delta_net_deferred_cuda(
 
     const uint32_t hk = fastmodulo(h, hk_magic);
 
+    // before the first read: the previous kernels may write the base state
+    ggml_cuda_pdl_sync();
+
     // state is stored transposed: M[col][i] = S[i][col], row col is contiguous
     float s_shard[rows_per_lane];
     const float * s_in = state + seq * ss3 + h * ss2 + col * ss1;
@@ -79,8 +82,6 @@ gated_delta_net_deferred_cuda(
 
     float k_reg[rows_per_lane];
     float q_reg[rows_per_lane];
-
-    ggml_cuda_pdl_sync();
 
     for (int p = 0; p < pending; p++) {
         const float * k_p = rec_in + (p * H_k + hk) * S_v;

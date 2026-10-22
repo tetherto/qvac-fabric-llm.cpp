@@ -771,6 +771,13 @@ static ggml_backend_buffer_t ggml_backend_metal_device_buffer_mapped(ggml_backen
 static bool ggml_backend_metal_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
     ggml_metal_device_t ctx_dev = (ggml_metal_device_t)dev->context;
 
+    if (op->op == GGML_OP_GATED_DELTA_NET_DEFERRED && !ggml_backend_dev_supports_inplace_src(dev, op->src[6])) {
+        return false;
+    }
+    if (op->op == GGML_OP_GDN_CONV_DEFERRED && !ggml_backend_dev_supports_inplace_src(dev, op->src[2])) {
+        return false;
+    }
+
     return ggml_metal_device_supports_op(ctx_dev, op);
 }
 

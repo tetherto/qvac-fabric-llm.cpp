@@ -803,11 +803,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_gated_delta_net_
     GGML_ASSERT(S_v % 32 == 0);
 
     // state rows per simdgroup: one load of k and q serves this many rows
-    static const int rps_env = [] {
-        const char * e = getenv("GGML_METAL_GDN_RPS");
-        return e ? atoi(e) : 8;
-    }();
-    const int rps = std::max(1, std::min(8, rps_env));
+    const int rps = 8;
 
     snprintf(base, 256, "kernel_gated_delta_net_deferred_f32_%d", nsg);
     snprintf(name, 256, "%s_S_v=%d_G=%d_K=%d_rps=%d", base, S_v, G, K, rps);

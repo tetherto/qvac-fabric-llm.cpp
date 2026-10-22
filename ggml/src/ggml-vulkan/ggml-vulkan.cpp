@@ -20383,11 +20383,12 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                 }
                 // q and k share strides in the shader; offsets must be whole floats
                 return ggml_are_same_stride(op->src[0], op->src[1]) && op->src[0]->nb[0] == sizeof(float) &&
-                    op->src[5]->nb[0] == sizeof(float) && op->type == GGML_TYPE_F32;
+                    op->src[5]->nb[0] == sizeof(float) && op->type == GGML_TYPE_F32 &&
+                    ggml_backend_dev_supports_inplace_src(dev, op->src[6]);
             }
         case GGML_OP_GDN_CONV_DEFERRED:
             return ggml_get_op_params_i32(op, 2) == 128 && op->src[1]->ne[0] == 4 && op->src[0]->nb[0] == sizeof(float) &&
-                op->src[0]->ne[0] % 128 == 0;
+                op->src[0]->ne[0] % 128 == 0 && ggml_backend_dev_supports_inplace_src(dev, op->src[2]);
         case GGML_OP_GATED_DELTA_NET:
             {
                 const uint32_t S_v = op->src[2]->ne[0];
