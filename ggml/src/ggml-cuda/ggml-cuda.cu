@@ -7259,12 +7259,14 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_GATED_DELTA_NET_DEFERRED: {
                 const int64_t S_v = op->src[2]->ne[0];
                 return (S_v == 16 || S_v == 32 || S_v == 64 || S_v == 128) && op->src[0]->nb[0] == sizeof(float) &&
-                    op->src[1]->nb[0] == sizeof(float) && op->src[5]->nb[0] == sizeof(float);
+                    op->src[1]->nb[0] == sizeof(float) && op->src[5]->nb[0] == sizeof(float) &&
+                    ggml_backend_dev_supports_inplace_src(dev, op->src[6]);
             }
         case GGML_OP_GDN_CONV_DEFERRED: {
                 const int64_t head_dim = ggml_get_op_params_i32(op, 2);
                 return op->src[1]->ne[0] == 4 && op->src[0]->nb[0] == sizeof(float) &&
-                    head_dim % WARP_SIZE == 0 && head_dim <= 1024 && op->src[0]->ne[0] % head_dim == 0;
+                    head_dim % WARP_SIZE == 0 && head_dim <= 1024 && op->src[0]->ne[0] % head_dim == 0 &&
+                    ggml_backend_dev_supports_inplace_src(dev, op->src[2]);
             }
         case GGML_OP_GATED_DELTA_NET_BACK: {
                 //TODO: shares the forward op's MUSA compiler issue, see GGML_OP_GATED_DELTA_NET above

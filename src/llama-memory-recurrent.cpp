@@ -44,7 +44,11 @@ llama_memory_recurrent::llama_memory_recurrent(
     {
         const char * env = getenv("LLAMA_GDN_DEFERRED");
         const bool arch_ok = model.arch == LLM_ARCH_QWEN35 || model.arch == LLM_ARCH_QWEN35MOE;
-        gdn_deferred = n_rs_seq > 0 && arch_ok && env && atoi(env) != 0;
+        // without offload the records live in host memory, so the deferred ops would run on the CPU
+        if (!offload && env && atoi(env) != 0) {
+            LLAMA_LOG_WARN("%s: LLAMA_GDN_DEFERRED is ignored when the recurrent states are not offloaded\n", __func__);
+        }
+        gdn_deferred = offload && n_rs_seq > 0 && arch_ok && env && atoi(env) != 0;
         // LLAMA_GDN_DEFERRED=2 keeps gathering the base states (for A/B runs)
         gdn_inplace  = gdn_deferred && atoi(env) != 2;
         if (gdn_deferred) {
@@ -846,19 +850,20 @@ void llama_memory_recurrent::set_input_gdn_deferred(int32_t * s_copy_base, int32
             s_copy_base[i] = src0;
         }
 
-        if (i < n_seqs) {
-            uint32_t rollback = 0;
-            if (!cell.seq_id.empty()) {
-                const llama_seq_id seq = *cell.seq_id.begin();
-                if (seq >= 0 && (size_t) seq < rs_idx.size()) {
-                    rollback = rs_idx[seq];
-                }
+        // the pending rollback applies to extra cells too: s_copy() consumes it for every cell
+        uint32_t rollback = 0;
+        if (!cell.seq_id.empty()) {
+            const llama_seq_id seq = *cell.seq_id.begin();
+            if (seq >= 0 && (size_t) seq < rs_idx.size()) {
+                rollback = rs_idx[seq];
             }
+        }
 
-            // a cell copied from the zeroed state starts with nothing to replay
-            const uint32_t rows = src0 == rs_z ? 0 : rec_rows[src0];
-            GGML_ASSERT(rollback <= rows);
+        // a cell copied from the zeroed state starts with nothing to replay
+        const uint32_t rows = src0 == rs_z ? 0 : rec_rows[src0];
+        GGML_ASSERT(rollback <= rows);
 
+        if (i < n_seqs) {
             rec_idx[3*i + 0] = (int32_t) (rows - rollback);
             rec_idx[3*i + 1] = 2*src0 + rec_slot[src0];
             rec_idx[3*i + 2] = 2*cell_id + 1 - rec_slot[cell_id];
@@ -866,9 +871,9 @@ void llama_memory_recurrent::set_input_gdn_deferred(int32_t * s_copy_base, int32
             slot_new[i] = 1 - rec_slot[cell_id];
             rows_new[i] = std::min(n_seq_tokens, K);
         } else {
-            // extra cells get a copy of both record slots of their source (see build_rs_gdn_deferred_extra)
+            // extra cells get a copy of both record slots of their source (see build_conv_deferred and build_recurrent_attn)
             slot_new[i] = rec_slot[src0];
-            rows_new[i] = src0 == rs_z ? 0 : rec_rows[src0];
+            rows_new[i] = rows - rollback;
         }
     }
 

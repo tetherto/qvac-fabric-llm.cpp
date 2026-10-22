@@ -550,17 +550,19 @@ ggml_tensor * llm_build_delta_net_base::build_conv_deferred(
             ggml_view_1d(ctx0, hist2, hist2->ne[0], rs_z * hist2->nb[1]), 0));
     }
 
-    // cells that only receive a copy of another cell's state also need its history
+    ggml_tensor * out = ggml_gdn_conv_deferred(ctx0, qkv_mixed, conv_kernel, hist, inp->rec_idx,
+            mctx_cur->get_gdn_k(), n_norm, head_dim, eps);
+    cb(out, "conv_deferred", il);
+
+    // cells that only receive a copy of another cell's state also need its history.
+    // copied after the conv, which may read a source row that is one of these cells
     if (n_rs > n_seqs) {
+        ggml_build_forward_expand(gf, out);
         ggml_tensor * extra = ggml_get_rows(ctx0, hist2, inp->s_copy_base_extra);
         ggml_build_forward_expand(gf,
                 ggml_cpy(ctx0, extra,
                     ggml_view_2d(ctx0, hist2, hist2->ne[0], n_rs - n_seqs, hist2->nb[1], (head + n_seqs) * hist2->nb[1])));
     }
-
-    ggml_tensor * out = ggml_gdn_conv_deferred(ctx0, qkv_mixed, conv_kernel, hist, inp->rec_idx,
-            mctx_cur->get_gdn_k(), n_norm, head_dim, eps);
-    cb(out, "conv_deferred", il);
 
     return out;
 }
