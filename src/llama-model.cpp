@@ -2041,6 +2041,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     }
     if (!ml.no_alloc) {
         load_tensors_hadamard();
+        load_fp8_input_scales();
     }
     return true;
 }
@@ -2262,6 +2263,36 @@ void llama_model::print_backend_buffers_info(const int32_t n_gpu_layers) {
             LLAMA_LOG_INFO("%s: %12s model buffer size = %8.2f MiB\n",
                 __func__, ggml_backend_buffer_name(buf.get()), ggml_backend_buffer_get_size(buf.get()) / 1024.0 / 1024.0);
         }
+    }
+}
+
+// The CUDA backend quantizes the activations of FP8 matmuls with the checkpoint's static input_scale when the
+// weight carries it in op_params (see GGML_CUDA_FP8_INPUT_SCALE_TAG in ggml-cuda/fp8.cuh).
+void llama_model_base::load_fp8_input_scales() {
+    static constexpr int32_t fp8_input_scale_tag = 0x46503853;
+    static const std::string suffix = ".weight";
+    int n_set = 0;
+    for (auto & [name, w] : tensors_by_name) {
+        if (w->type != GGML_TYPE_F8_E4M3 || name.size() <= suffix.size() ||
+                name.compare(name.size() - suffix.size(), suffix.size(), suffix) != 0) {
+            continue;
+        }
+        const std::string in_name = name.substr(0, name.size() - suffix.size()) + ".input_scale";
+        const ggml_tensor * in_s = get_tensor(in_name.c_str());
+        if (in_s == nullptr || in_s->type != GGML_TYPE_F32 || ggml_nelements(in_s) != 1 || in_s->buffer == nullptr) {
+            continue;
+        }
+        float value = 0.0f;
+        ggml_backend_tensor_get(in_s, &value, 0, sizeof(value));
+        if (!std::isfinite(value) || value <= 0.0f) {
+            continue;
+        }
+        std::memcpy((char *) w->op_params + 0, &fp8_input_scale_tag, sizeof(int32_t));
+        std::memcpy((char *) w->op_params + 4, &value, sizeof(float));
+        n_set++;
+    }
+    if (n_set > 0) {
+        LLAMA_LOG_INFO("%s: %d FP8 weights use their static input scale\n", __func__, n_set);
     }
 }
 
