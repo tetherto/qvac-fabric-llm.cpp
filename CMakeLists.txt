@@ -2,6 +2,14 @@ cmake_minimum_required(VERSION 3.14...3.28) # for add_link_options and implicit 
 project("llama.cpp" C CXX)
 include(CheckIncludeFileCXX)
 
+option(LLAMA_COREML_EMBEDDING "llama: build optional Core ML embedding adapter" OFF)
+if (LLAMA_COREML_EMBEDDING)
+    if (NOT APPLE)
+        message(FATAL_ERROR "Core ML embedding requires macOS 15 or iOS 18")
+    endif()
+    enable_language(OBJC OBJCXX)
+endif()
+
 ### llama.cpp version
 set(LLAMA_VERSION_MAJOR 0)
 set(LLAMA_VERSION_MINOR 7)
@@ -238,6 +246,10 @@ if (NOT BUILD_LLAMA)
     message(STATUS "BUILD_LLAMA is OFF: skipping LLAMA targets.")
 else()
 add_subdirectory(src)
+
+if (LLAMA_COREML_EMBEDDING)
+    add_subdirectory(examples/embedding-coreml)
+endif()
 
 #
 # utils, programs, examples and tests
