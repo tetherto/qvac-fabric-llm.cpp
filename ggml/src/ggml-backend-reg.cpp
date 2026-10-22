@@ -138,7 +138,7 @@ static void ggml_backend_dl_log_forward(enum ggml_log_level level, const char * 
 // A backend module that links ggml-base statically has its own logger, which prints all levels to stderr.
 // Connect it to this logger before the module runs code. Skip a module that shares this ggml-base, else the logger calls itself.
 // Keep a logger that a consumer set on the module after an earlier load.
-// Windows: a module with a static ggml-base does not export ggml_log_set, so this does nothing there.
+// Windows: a module with a static ggml-base exports these functions only through ggml_backend_export_log_functions (ggml/src/CMakeLists.txt).
 static void ggml_backend_dl_forward_log(dl_handle * handle) {
     using log_set_t = void (*)(ggml_log_callback, void *);
     using log_get_t = void (*)(ggml_log_callback *, void **);
