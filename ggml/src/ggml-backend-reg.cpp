@@ -117,12 +117,18 @@ static std::string path_str(const fs::path & path) {
 
 // Send a log line of a backend module to the logger set in this ggml-base.
 // An error line also goes to stderr at once: a CUDA error logs its details just before GGML_ABORT, and a logger can print later (common_log does).
+// A CONT line after an error line on the same thread goes too, e.g. the node list of a Vulkan device-lost report.
 static void ggml_backend_dl_log_forward(enum ggml_log_level level, const char * text, void * user_data) {
     GGML_UNUSED(user_data);
+    static thread_local enum ggml_log_level last_level = GGML_LOG_LEVEL_NONE;
+    const bool is_error = level == GGML_LOG_LEVEL_ERROR || (level == GGML_LOG_LEVEL_CONT && last_level == GGML_LOG_LEVEL_ERROR);
+    if (level != GGML_LOG_LEVEL_CONT) {
+        last_level = level;
+    }
     ggml_log_callback callback;
     void *            callback_user_data;
     ggml_log_get(&callback, &callback_user_data);
-    if (level == GGML_LOG_LEVEL_ERROR && callback != ggml_log_callback_default) {
+    if (is_error && callback != ggml_log_callback_default) {
         fputs(text, stderr);
         fflush(stderr);
     }
