@@ -1,6 +1,6 @@
 # Core ML text embedding adapter
 
-Optional C API for the published FluidInference EmbeddingGemma 2 text model. Intended for Fabric integration after its llama.cpp rebase. It is a separate full-model execution path, not a ggml backend or a change to `llama_decode` or the server. Requires macOS 15 / iOS 18 and Apple silicon for ANE acceleration.
+Optional C API for EmbeddingGemma 2 text models exported below or published by FluidInference. Intended for Fabric integration after its llama.cpp rebase. It is a separate full-model execution path, not a ggml backend or a change to `llama_decode` or the server. Requires macOS 15 / iOS 18 and Apple silicon for ANE acceleration.
 
 The package already contains the fixed-shape graph and overflow-safe FP16 RMSNorm. The adapter reuses model objects and input buffers, memory maps the original BF16 token table, chooses the smallest fixed function that fits, and packs adjacent short texts into 256 tokens, using the package's eight or sixteen output slots. Attention blocks and positions are independent for each packed text. A single-text bin uses its smaller fixed function. Output order matches input order. Calls on one context are serialized. Set `llama_coreml_embedding_set_max_inflight(ctx, 8)` to pipeline predictions asynchronously on shared models within an encode call; the default is one synchronous prediction at a time. Each pending request owns reusable input buffers. Encode waits for all callbacks before returning, including on error. Separate contexts remain available for independent callers. Core ML selects CPU/ANE placement; selecting CPU + ANE does not prove that every operation runs on ANE.
 
@@ -23,6 +23,47 @@ Download from [FluidInference/embeddinggemma-2-coreml](https://huggingface.co/Fl
 Pass their containing directory to `llama_coreml_embedding_load`. The first load compiles the package and copies the result to `EmbeddingGemma2Text.mlmodelc` in that directory. The directory must be writable for this initial step. Precompiled assets can instead be supplied in a read-only directory. Functions load lazily; the first inference using a function may spend minutes compiling for the device. Warm all functions required by the workload before timing.
 
 The token table must have exactly 262144 rows of 512 little-endian BF16 values. It is converted to FP16 and scaled by sqrt(512) during input preparation. This is the original token table, not a GGUF quantized table. Model weights and tokenizer must come from matching checkpoints. The adapter checks file size and model input/output contracts; it does not authenticate downloaded files. Pin revisions and verify checksums when distributing assets.
+
+## Export from a local checkpoint
+
+`export_coreml.py` converts the text encoder from the original Hugging Face safetensors checkpoint. It writes `EmbeddingGemma2Text.mlpackage`, the unscaled original `embeddings.bf16`, `tokenizer.json`, `source-config.json`, and an `export.json` manifest with source hashes, tool versions, and function shapes. Audio and vision weights are not loaded. The destination must not exist; conversion failures remove temporary output.
+
+Use a separate Python 3.11 environment on an Apple silicon Mac. The requirements pin Core ML Tools 9, its supported PyTorch 2.7 release, and a Transformers revision with EmbeddingGemma 2 support. Do not combine these requirements with the repository's GGUF conversion environment.
+
+```sh
+python3.11 -m venv .venv-coreml
+.venv-coreml/bin/python -m pip install -r examples/embedding-coreml/requirements.txt
+
+# Accept the source model's access terms and authenticate with Hugging Face first.
+.venv-coreml/bin/hf download google/embeddinggemma-2 \
+    --revision 914f7f89142e33e77833254d9c9b90c3cef7303b \
+    --include config.json tokenizer.json '*.safetensors' '*.safetensors.index.json' \
+    --local-dir ../embeddinggemma-2-hf
+
+.venv-coreml/bin/python examples/embedding-coreml/export_coreml.py \
+    ../embeddinggemma-2-hf ../embeddinggemma-2-coreml --pack-slots 8
+```
+
+The exporter also accepts a compatible local fine-tuned checkpoint with the same text architecture. It uses no remote Python code and supports single-file or sharded safetensors. The six single-text functions use lengths 32/48/64/128/256/512; `pack_256` has eight output slots by default. Pass `--pack-slots 16` to export sixteen slots directly. RMSNorm and final L2 normalization rescale before squaring to avoid FP16 overflow. Rotary tables are computed in FP32 before conversion; the packed function looks up positions that restart for each text.
+
+Export traces the text encoder on CPU and converts the graphs; it does not execute Core ML predictions or prove Neural Engine placement. Allow substantial memory, time, and temporary disk space for seven intermediate packages. Core ML Tools merges them with shared weights into the final package. This is an independent export, not a byte-identical reproduction of FluidInference's package. The historical benchmarks below apply to the downloaded package, not to freshly exported graphs.
+
+Validate a new export on the target Mac before using it: build the benchmark above, convert the same source checkpoint to a BF16 GGUF in the normal GGUF conversion environment, then compare the two paths. Include short texts, lengths crossing every bucket, and enough short texts to fill all packing slots. The benchmark checks cosine agreement and normalization. Run the compute-plan tool to inspect anticipated device placement; ANE placement is not guaranteed by export alone.
+
+```sh
+# Use the existing GGUF conversion environment, not .venv-coreml.
+python convert_hf_to_gguf.py ../embeddinggemma-2-hf \
+    --outtype bf16 --outfile ../embeddinggemma-2-BF16.gguf
+build-ane/bin/llama-coreml-embedding-bench \
+    ../embeddinggemma-2-BF16.gguf ../embeddinggemma-2-coreml \
+    examples/embedding-coreml/benchmark-texts.txt 5 metal 1 8 512 8
+
+# These checks use metadata, temporary files, and synthetic normalization tensors.
+# They do not load model weights or run the encoder.
+python3 -m unittest discover -s examples/embedding-coreml -p 'test_export_coreml.py'
+```
+
+The adapter compiles `.mlpackage` to `.mlmodelc` on first load. `expand_pack16.py` is only for the pinned downloaded FluidInference graph and rejects independently exported graphs; use `--pack-slots 16` for a local export. `palettize_pack.py` can produce a separate compressed variant, which requires its own accuracy validation.
 
 ## Tokenization and integration
 

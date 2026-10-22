@@ -22,3 +22,14 @@ unresolved-reference = "ignore"
 import-not-found = "ignore"
 missing-attribute = "ignore"
 missing-union-attribute = "ignore"
+
+# These tools use the separate, pinned Core ML export environment.
+[[overrides]]
+include = [
+    "./examples/embedding-coreml/expand_pack16.py",
+    "./examples/embedding-coreml/export_coreml.py",
+    "./examples/embedding-coreml/palettize_pack.py",
+]
+
+[overrides.rules]
+import-not-found = "ignore"
