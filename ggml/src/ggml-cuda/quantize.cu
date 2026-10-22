@@ -783,6 +783,7 @@ void quantize_mmq_fp4_cuda(
 }
 
 #ifdef GGML_CUDA_CUTLASS
+// gate, up and glu rows must be 16-byte aligned and n_cols a multiple of 16
 static __global__ void quantize_cutlass_nvfp4_swiglu_bf16(const nv_bfloat16 * __restrict__ gate,
                                                           const nv_bfloat16 * __restrict__ up,
                                                           const float * __restrict__ gate_scale,
@@ -795,8 +796,10 @@ static __global__ void quantize_cutlass_nvfp4_swiglu_bf16(const nv_bfloat16 * __
                                                           int64_t n_cols_padded,
                                                           bool use_smem) {
 #    if defined(BLACKWELL_MMA_AVAILABLE)
-    // row_buf avoids reading the materialized GLU back from global memory.
-    extern __shared__ float row_buf[];
+    // The GLU is rounded to BF16, so a BF16 row buffer is exact. glu is written only when the row does not fit in
+    // shared memory.
+    extern __shared__ uint4 row_buf_vec[];
+    nv_bfloat16 * row_buf = (nv_bfloat16 *) row_buf_vec;
 
     const int64_t row        = blockIdx.x;
     const int64_t row_offset = row * n_cols;
@@ -804,15 +807,32 @@ static __global__ void quantize_cutlass_nvfp4_swiglu_bf16(const nv_bfloat16 * __
     const float   us         = *up_scale;
 
     float amax = 0.0f;
-    for (int64_t col = threadIdx.x; col < n_cols; col += blockDim.x) {
-        const float gate_value = (float) gate[row_offset + col] * gs;
-        const float up_value   = (float) up[row_offset + col] * us;
-        const float value      = (float) (nv_bfloat16) (ggml_cuda_op_silu_single(gate_value) * up_value);
-        if (use_smem) {
-            row_buf[col] = value;
+    for (int64_t col = 8 * threadIdx.x; col < n_cols; col += 8 * blockDim.x) {
+        const uint4          g4 = *(const uint4 *) (gate + row_offset + col);
+        const uint4          u4 = *(const uint4 *) (up + row_offset + col);
+        const nv_bfloat162 * g2 = (const nv_bfloat162 *) &g4;
+        const nv_bfloat162 * u2 = (const nv_bfloat162 *) &u4;
+        uint4                packed;
+        nv_bfloat162 *       p2 = (nv_bfloat162 *) &packed;
+        float                vals[8];
+#        pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const float2 g = __bfloat1622float2(g2[j]);
+            const float2 u = __bfloat1622float2(u2[j]);
+            p2[j]          = __floats2bfloat162_rn(ggml_cuda_op_silu_single(g.x * gs) * (u.x * us),
+                                                   ggml_cuda_op_silu_single(g.y * gs) * (u.y * us));
+            const float2 v = __bfloat1622float2(p2[j]);
+            vals[2 * j + 0] = v.x;
+            vals[2 * j + 1] = v.y;
+            amax            = fmaxf(amax, fmaxf(fabsf(v.x), fabsf(v.y)));
         }
-        glu[row_offset + col] = value;
-        amax = fmaxf(amax, fabsf(value));
+        if (use_smem) {
+            *(uint4 *) (row_buf + col) = packed;
+        } else {
+            float4 * out = (float4 *) (glu + row_offset + col);
+            out[0]       = make_float4(vals[0], vals[1], vals[2], vals[3]);
+            out[1]       = make_float4(vals[4], vals[5], vals[6], vals[7]);
+        }
     }
 
     amax = warp_reduce_max<WARP_SIZE>(amax);
@@ -841,10 +861,29 @@ static __global__ void quantize_cutlass_nvfp4_swiglu_bf16(const nv_bfloat16 * __
     for (int64_t subblock = threadIdx.x; subblock < n_subblocks; subblock += blockDim.x) {
         const int64_t col_base = subblock * QK_NVFP4_SUB;
         float         vals[QK_NVFP4_SUB];
+        if (col_base >= n_cols) {
 #        pragma unroll
-        for (int k = 0; k < QK_NVFP4_SUB; ++k) {
-            const int64_t col = col_base + k;
-            vals[k]           = col < n_cols ? (use_smem ? row_buf[col] : glu[row_offset + col]) : 0.0f;
+            for (int k = 0; k < QK_NVFP4_SUB; ++k) {
+                vals[k] = 0.0f;
+            }
+        } else if (use_smem) {
+            const uint4 v4[2] = { *(const uint4 *) (row_buf + col_base), *(const uint4 *) (row_buf + col_base + 8) };
+            const nv_bfloat162 * v2 = (const nv_bfloat162 *) v4;
+#        pragma unroll
+            for (int k = 0; k < QK_NVFP4_SUB / 2; ++k) {
+                const float2 v  = __bfloat1622float2(v2[k]);
+                vals[2 * k + 0] = v.x;
+                vals[2 * k + 1] = v.y;
+            }
+        } else {
+#        pragma unroll
+            for (int k = 0; k < QK_NVFP4_SUB / 4; ++k) {
+                const float4 v  = *(const float4 *) (glu + row_offset + col_base + 4 * k);
+                vals[4 * k + 0] = v.x;
+                vals[4 * k + 1] = v.y;
+                vals[4 * k + 2] = v.z;
+                vals[4 * k + 3] = v.w;
+            }
         }
 
         uint8_t fp8_code;
@@ -902,7 +941,7 @@ void quantize_cutlass_nvfp4_cuda(
     }
 }
 
-void quantize_cutlass_nvfp4_swiglu_bf16_cuda(const nv_bfloat16 * gate,
+bool quantize_cutlass_nvfp4_swiglu_bf16_cuda(const nv_bfloat16 * gate,
                                              const nv_bfloat16 * up,
                                              const float *       gate_scale,
                                              const float *       up_scale,
@@ -916,7 +955,8 @@ void quantize_cutlass_nvfp4_swiglu_bf16_cuda(const nv_bfloat16 * gate,
                                              cudaStream_t        stream) {
     GGML_ASSERT(n_cols % QK_NVFP4 == 0 && n_cols_padded >= n_cols && n_cols_padded % 128 == 0);
     GGML_ASSERT(n_cols > 0 && (uint64_t) n_cols <= SIZE_MAX / sizeof(float));
-    const size_t row_bytes = (size_t) n_cols * sizeof(float);
+    GGML_ASSERT((uintptr_t) gate % 16 == 0 && (uintptr_t) up % 16 == 0 && (uintptr_t) glu % 16 == 0);
+    const size_t row_bytes = (size_t) n_cols * sizeof(nv_bfloat16);
     const int id = ggml_cuda_get_device();
     static std::once_flag smem_once[GGML_CUDA_MAX_DEVICES];
     static size_t         smem_limit[GGML_CUDA_MAX_DEVICES] = {};
@@ -946,5 +986,6 @@ void quantize_cutlass_nvfp4_swiglu_bf16_cuda(const nv_bfloat16 * gate,
     quantize_cutlass_nvfp4_swiglu_bf16<<<(unsigned) n_rows, CUDA_QUANTIZE_BLOCK_SIZE_MMQ, use_smem ? row_bytes : 0,
                                          stream>>>(
         gate, up, gate_scale, up_scale, glu, vy, block_scales, row_scales, n_cols, n_cols_padded, use_smem);
+    return !use_smem;
 }
 #endif

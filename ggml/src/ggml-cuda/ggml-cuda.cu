@@ -2907,7 +2907,7 @@ static bool ggml_cuda_mul_mat(ggml_backend_cuda_context &          ctx,
     if (cutlass_result == ggml_cuda_cutlass_result::success) {
         return true;
     }
-    if (!ggml_cuda_cutlass_result_can_fallback(cutlass_result)) {
+    if (!ggml_cuda_cutlass_result_can_fallback(cutlass_result) || (activation != nullptr && !activation->src1_written)) {
         return false;
     }
     const auto canonical_buft = ggml_backend_cuda_buffer_type(ctx.device);
@@ -6077,10 +6077,11 @@ struct ggml_cuda_cutlass_activation_plan {
             return up_result;
         }
 
-        char *    output     = group_workspace + mlp_plan.output_offset;
-        uint8_t * scales     = (uint8_t *) output + mlp_plan.output_layout.offset_scales;
-        float *   row_scales = (float *) (output + mlp_plan.output_layout.offset_rows);
-        quantize_cutlass_nvfp4_swiglu_bf16_cuda(
+        // the match guarantees that down is the only consumer of the GLU, and down reads the NVFP4 copy
+        char *     output      = group_workspace + mlp_plan.output_offset;
+        uint8_t *  scales      = (uint8_t *) output + mlp_plan.output_layout.offset_scales;
+        float *    row_scales  = (float *) (output + mlp_plan.output_layout.offset_rows);
+        const bool glu_written = quantize_cutlass_nvfp4_swiglu_bf16_cuda(
             (const nv_bfloat16 *) gate, (const nv_bfloat16 *) up, (const float *) mlp_plan.match.gate_scale->data,
             (const float *) mlp_plan.match.up_scale->data, (float *) mlp_plan.match.glu->data, output, scales,
             row_scales, mlp_plan.output_layout.k, mlp_plan.output_layout.k_padded, mlp_plan.output_layout.m,
@@ -6095,6 +6096,7 @@ struct ggml_cuda_cutlass_activation_plan {
             mlp_plan.output_layout.k,
             mlp_plan.output_layout.k_padded,
             mlp_plan.output_layout.type,
+            glu_written,
         };
         mlp_plan.ready = true;
         ++ctx.mlp_fusion_count;
@@ -6160,7 +6162,7 @@ static bool ggml_cuda_preflight_mlp_bf16(ggml_backend_cuda_context &           c
         !ggml_cuda_cutlass_get_activation_layout(ctx, match.down_mm->src[0], match.glu, match.down_mm, output_layout) ||
         match.glu->buffer == nullptr ||
         ggml_backend_buffer_get_type(match.glu->buffer) != ggml_backend_cuda_buffer_type(ctx.device) ||
-        match.glu->type != GGML_TYPE_F32 || !ggml_is_contiguous(match.glu) ||
+        match.glu->type != GGML_TYPE_F32 || !ggml_is_contiguous(match.glu) || (uintptr_t) match.glu->data % 16 != 0 ||
         match.gate_mm->src[0]->ne[1] != match.up_mm->src[0]->ne[1] ||
         !ggml_are_same_shape(match.gate_mm, match.up_mm) || !ggml_are_same_shape(match.gate_mm, match.glu) ||
         gate_layout.type != up_layout.type || gate_layout.m != up_layout.m || gate_layout.k != up_layout.k ||
