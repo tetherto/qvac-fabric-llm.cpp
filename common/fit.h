@@ -113,11 +113,8 @@ common_device_memory_data_vec common_get_device_memory_data(
                            uint32_t & hp_n_expert,
                      ggml_log_level   log_level);
 
-// common_get_device_memory_data for the extra model of a fit, measured as the fit measures it:
-//   - alone where it can be
-//   - a draft model that borrows from the main model (a DFlash or EAGLE3 draft without its own embeddings,
-//     a Gemma 4 assistant) next to a no_alloc probe of the main model passed as its ctx_other, as the load creates it
-//   - the rows are the extra model's own, on its devices; the main model's are not included
+// memory of the extra model of a fit, measured as the fit measures it; a borrowing draft is measured next to the main model
+// the rows are the extra model's own, on its devices
 common_device_memory_data_vec common_get_extra_device_memory_data(
        const common_fit_extra_model * extra,
                          const char * path_main,

@@ -12,7 +12,6 @@
 #include <cassert>
 #include <stdexcept>
 #include <cinttypes>
-#include <cstring>
 #include <set>
 #include <mutex>
 #include <string>
@@ -39,21 +38,11 @@ struct common_fit_probe_other {
     const llama_context_params * cparams;
 };
 
-// the width at which a draft model would read the main model's token_embd or output, 0 for an architecture that
-// cannot borrow them (those that llama_context passes ctx_other to)
-static int32_t common_fit_borrowed_n_embd(const llama_model * model) {
-    char arch[64] = {};
-    if (llama_model_meta_val_str(model, "general.architecture", arch, sizeof(arch)) < 0) {
-        return 0;
-    }
-    if (strcmp(arch, "gemma4-assistant") == 0) {
-        return llama_model_n_embd_inp(model);
-    }
-    if (strcmp(arch, "dflash") == 0 || strcmp(arch, "eagle3") == 0) {
-        return llama_model_n_embd(model);
-    }
-    return 0;
-}
+// what earlier measurements of the extra model found, kept for the whole fit
+struct common_fit_extra_state {
+    bool borrows      = false; // measured next to the main model, skip the probe alone
+    bool borrow_fails = false; // failed next to the main model too, do not retry that
+};
 
 static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
         const char * path_model,
@@ -94,6 +83,8 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
             throw common_params_fit_exception("failed to create llama_context from the model to borrow from");
         }
         cparams_copy.ctx_other = ctx_other_owner.get();
+        // as the load: the draft holds as many tokens as the context it borrows from
+        cparams_copy.n_ctx = llama_n_ctx(ctx_other_owner.get());
     }
 
     llama_model_params mparams_copy = *mparams;
@@ -104,17 +95,6 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
     llama_model * model = model_owner.get();
     if (model == nullptr) {
         throw std::runtime_error("failed to load model");
-    }
-
-    // a width mismatch fails a ggml assert while the context reserves its graph, so refuse it here
-    if (other != nullptr) {
-        const int32_t n_embd_borrowed = common_fit_borrowed_n_embd(model);
-        const int32_t n_embd_other    = llama_model_n_embd(model_other_owner.get());
-        if (n_embd_borrowed != 0 && n_embd_borrowed != n_embd_other) {
-            throw common_params_fit_exception(
-                "the draft model reads borrowed tensors at width " + std::to_string(n_embd_borrowed) +
-                ", the model to borrow from has width " + std::to_string(n_embd_other));
-        }
     }
 
     llama_context_ptr ctx_owner(llama_init_from_model(model, cparams_copy));
@@ -227,10 +207,7 @@ common_device_memory_data_vec common_get_device_memory_data(
         path_model, mparams, cparams, devs, hp_ngl, hp_n_ctx_train, hp_n_expert, log_level));
 }
 
-// a draft model that borrows from the main model (a DFlash or EAGLE3 draft without its own embeddings, a Gemma 4
-// assistant) cannot create its context alone, so it is measured next to a probe of the main model passed as its
-// ctx_other, as the load creates it; any other extra model is measured alone
-// `borrows` is set once the extra model has measured that way, so later measurements skip the attempt alone
+// a draft that cannot create its context alone is measured again next to a probe of the main model, as the load creates it
 static std::vector<llama_device_memory_data> common_get_extra_device_memory_data_impl(
         const common_fit_extra_model & extra,
         const char * path_main,
@@ -241,23 +218,33 @@ static std::vector<llama_device_memory_data> common_get_extra_device_memory_data
         uint32_t & hp_n_ctx_train,
         uint32_t & hp_n_expert,
         ggml_log_level log_level,
-        bool & borrows) {
-    if (!borrows) {
+        common_fit_extra_state & state) {
+    std::string error_alone;
+    if (!state.borrows) {
         try {
             return common_get_device_memory_data_impl(
                 extra.path_model, extra.mparams, extra.cparams, devs, hp_ngl, hp_n_ctx_train, hp_n_expert, log_level);
-        } catch (const common_params_fit_exception &) {
+        } catch (const common_params_fit_exception & e) {
             // an MTP context on the main model's weights never borrows through ctx_other
-            if (extra.shares_model) {
+            if (extra.shares_model || state.borrow_fails) {
                 throw;
             }
+            error_alone = e.what();
         }
     }
     const common_fit_probe_other main = { path_main, mparams_main, cparams_main };
-    auto ret = common_get_device_memory_data_impl(
-        extra.path_model, extra.mparams, extra.cparams, devs, hp_ngl, hp_n_ctx_train, hp_n_expert, log_level, &main);
-    borrows = true;
-    return ret;
+    try {
+        auto ret = common_get_device_memory_data_impl(
+            extra.path_model, extra.mparams, extra.cparams, devs, hp_ngl, hp_n_ctx_train, hp_n_expert, log_level, &main);
+        state.borrows = true;
+        return ret;
+    } catch (const std::runtime_error & e) {
+        if (error_alone.empty()) {
+            throw;
+        }
+        state.borrow_fails = true;
+        throw std::runtime_error(error_alone + " (next to the main model: " + e.what() + ")");
+    }
 }
 
 common_device_memory_data_vec common_get_extra_device_memory_data(
@@ -271,9 +258,20 @@ common_device_memory_data_vec common_get_extra_device_memory_data(
         uint32_t & hp_n_expert,
         ggml_log_level log_level) {
     GGML_ASSERT(extra != nullptr);
-    bool borrows = false;
-    return common_device_memory_data_from(common_get_extra_device_memory_data_impl(
-        *extra, path_main, mparams_main, cparams_main, devs, hp_ngl, hp_n_ctx_train, hp_n_expert, log_level, borrows));
+    // as the fit: the extra model follows the context of the main model
+    llama_context_params cparams_extra = *extra->cparams;
+    cparams_extra.n_ctx = cparams_main->n_ctx;
+    const common_fit_extra_model extra_copy = { extra->path_model, extra->mparams, &cparams_extra, extra->shares_model };
+
+    common_fit_extra_state state;
+    common_device_memory_data_vec ret = common_device_memory_data_from(common_get_extra_device_memory_data_impl(
+        extra_copy, path_main, mparams_main, cparams_main, devs, hp_ngl, hp_n_ctx_train, hp_n_expert, log_level, state));
+    if (extra->shares_model) {
+        for (common_device_memory_data & row : ret) {
+            row.model = 0;
+        }
+    }
+    return ret;
 }
 
 int64_t common_fit_shared_pool_deficit(
@@ -380,7 +378,7 @@ static void common_params_fit_impl(
         const char * path_model, struct llama_model_params * mparams, struct llama_context_params * cparams,
         float * tensor_split, struct llama_model_tensor_buft_override * tensor_buft_overrides,
         size_t * margins_s, uint32_t n_ctx_min, const common_fit_extra_model * extra, bool prefetch_weights_auto, enum ggml_log_level log_level, bool moe_cache_auto_explicit,
-        common_fit_measurement * measurement) {
+        common_fit_measurement * measurement, common_fit_extra_state & extra_state) {
     if (mparams->split_mode == LLAMA_SPLIT_MODE_TENSOR) {
         throw common_params_fit_exception("llama_params_fit is not implemented for SPLIT_MODE_TENSOR, abort");
     }
@@ -398,13 +396,12 @@ static void common_params_fit_impl(
     const uint32_t n_streams  = cparams->kv_unified ? 1 : std::max<uint32_t>(1, cparams->n_seq_max);
     const bool     n_ctx_auto = cparams->n_ctx == 0;
 
-    dmds_t   dmds_extra;            // memory of the extra model, laid out on the devices of the main model
-    uint32_t n_ctx_extra   = 0;     // context that memory was measured at
-    bool     extra_borrows = false; // the extra model measures next to a probe of the main model
+    dmds_t   dmds_extra;       // memory of the extra model, laid out on the devices of the main model
+    uint32_t n_ctx_extra = 0;  // context that memory was measured at
 
     // the extra model competes for the same memory as the main model, add it to every measurement
     // its memory is measured again whenever the context it follows changes
-    // a draft that borrows from the main model is measured next to it at that context, with the placement of mparams
+    // a borrowing draft keeps the main model placement of its measurement, later placement changes do not move it
     auto add_extra_memory = [&](dmds_t & dmds) {
         if (extra == nullptr) {
             return;
@@ -425,7 +422,7 @@ static void common_params_fit_impl(
             try {
                 measured = common_get_extra_device_memory_data_impl(
                     *extra, path_model, mparams, cparams, devs_extra, ngl_extra, nct_extra, nex_extra, log_level,
-                    extra_borrows);
+                    extra_state);
             } catch (const std::runtime_error & e) {
                 // the extra model is optional, fit the main model alone rather than giving up
                 LOG_WRN("%s: failed to measure the memory of the extra model, fitting without it: %s\n", __func__, e.what());
@@ -673,7 +670,7 @@ static void common_params_fit_impl(
         cparams->prefetch_weights = true;
         common_params_fit_impl(
             path_model, mparams, cparams, tensor_split, tensor_buft_overrides, margins_s, n_ctx_min, extra, false, log_level, moe_cache_auto_explicit,
-            measurement);
+            measurement, extra_state);
         if (mparams->n_gpu_layers == default_mparams.n_gpu_layers) {
             cparams->prefetch_weights = false;
             // the inner fit measured with prefetch on
@@ -997,7 +994,7 @@ static void common_params_fit_impl(
         cparams->moe_cache_size = auto_moe_cache_size;
         common_params_fit_impl(
             path_model, mparams, cparams, tensor_split, tensor_buft_overrides, margins_s, n_ctx_min, extra, prefetch_weights_auto, log_level, moe_cache_auto_explicit,
-            measurement);
+            measurement, extra_state);
         return;
     }
 
@@ -1292,9 +1289,10 @@ static enum common_params_fit_status common_fit_params_with_measurement(
         }
     }
     try {
+        common_fit_extra_state extra_state;
         common_params_fit_impl(
             path_model, mparams, cparams, tensor_split, tensor_buft_overrides, margins, n_ctx_min, extra, prefetch_weights_auto, log_level, moe_cache_auto_explicit,
-            measurement);
+            measurement, extra_state);
         LOG_TRC("%s: successfully fit params to free device memory\n", __func__);
     } catch (const common_params_fit_exception & e) {
         LOG_WRN("%s: failed to fit params to free device memory: %s\n", __func__, e.what());

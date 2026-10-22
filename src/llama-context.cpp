@@ -258,6 +258,13 @@ llama_context::llama_context(
         const llama_model & model_other = cparams.ctx_other->get_model();
         hdmd->rot.insert(model_other.hdmd.rot.begin(), model_other.hdmd.rot.end());
         hdmd->inv.insert(model_other.hdmd.inv.begin(), model_other.hdmd.inv.end());
+
+        // a borrowed tensor of another width fails a ggml assert when the graph is reserved
+        const uint32_t n_embd_borrowed = model.arch == LLM_ARCH_GEMMA4_ASSISTANT ? hparams.n_embd_inp() : hparams.n_embd;
+        if (n_embd_borrowed != model_other.hparams.n_embd) {
+            throw std::runtime_error(format("%s reads borrowed tensors at width %u, the model to borrow from has width %u",
+                model.arch_name().c_str(), n_embd_borrowed, model_other.hparams.n_embd));
+        }
     }
 
     if (params.ctx_other_share_compute && params.ctx_type == LLAMA_CONTEXT_TYPE_MTP && params.ctx_other != nullptr &&

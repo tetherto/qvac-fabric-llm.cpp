@@ -2409,9 +2409,7 @@ struct temp_files {
     }
 };
 
-// a fit measures a draft model that borrows the target's token_embd and output next to a probe of the target,
-// as the load creates it: its own weights, KV cache and compute, none of the target's; a target of another width
-// is refused instead of failing a ggml assert; a draft that borrows nothing measures as it does alone
+// a borrowing draft is measured next to its target with only its own memory, a target of another width is refused
 static int test_fit_borrowing_draft() {
     const size_t seed = 1234;
     // unique per run, so that concurrent runs do not share the files
@@ -2486,24 +2484,47 @@ static int test_fit_borrowing_draft() {
     }
     const uint32_t measured_n_layer = n_layer;
 
+    // llama_init_from_model logs the reason and returns nullptr
+    ggml_log_callback log_callback  = nullptr;
+    void *            log_user_data = nullptr;
+    llama_log_get(&log_callback, &log_user_data);
+    bool width_logged = false;
+    llama_log_set([](ggml_log_level level, const char * text, void * user_data) {
+        if (level == GGML_LOG_LEVEL_ERROR && strstr(text, "borrowed tensors at width") != nullptr) {
+            *(bool *) user_data = true;
+        }
+    }, &width_logged);
     bool narrow_refused = false;
     try {
         common_get_extra_device_memory_data(&borrowing, path_narrow.c_str(), &mparams, &cparams,
                                             devs, n_layer, n_ctx_train, n_expert, GGML_LOG_LEVEL_ERROR);
-    } catch (const std::exception & e) {
-        narrow_refused = strstr(e.what(), "width") != nullptr;
+    } catch (const std::exception &) {
+        narrow_refused = true;
+    }
+    llama_log_set(log_callback, log_user_data);
+
+    // the draft follows the context of the target, above its own training context here
+    auto cparams_long     = cparams;
+    auto cparams_dft_auto = cparams_dft;
+    cparams_long.n_ctx     = 512;
+    cparams_dft_auto.n_ctx = 0;
+    const common_fit_extra_model following = { path_draft.c_str(), &mparams_dft, &cparams_dft_auto, false };
+    const auto followed = common_get_extra_device_memory_data(&following, path_target.c_str(), &mparams, &cparams_long,
+                                                              devs, n_layer, n_ctx_train, n_expert, GGML_LOG_LEVEL_ERROR);
+    size_t context_long = 0;
+    for (const auto & row : followed) {
+        context_long += row.context;
     }
 
-    // a draft that borrows nothing measures as it does alone
-    const common_fit_extra_model plain = { path_target.c_str(), &mparams_dft, &cparams_dft, false };
-    const auto as_extra = common_get_extra_device_memory_data(&plain, path_target.c_str(), &mparams, &cparams,
-                                                              devs, n_layer, n_ctx_train, n_expert, GGML_LOG_LEVEL_ERROR);
+    // an extra model on the weights of the main model counts none of them, and otherwise measures as it does alone
+    const common_fit_extra_model sharing = { path_target.c_str(), &mparams_dft, &cparams_dft, true };
+    const auto shared = common_get_extra_device_memory_data(&sharing, path_target.c_str(), &mparams, &cparams,
+                                                            devs, n_layer, n_ctx_train, n_expert, GGML_LOG_LEVEL_ERROR);
     const auto alone = common_get_device_memory_data(path_target.c_str(), &mparams_dft, &cparams_dft, devs, n_layer,
                                                      n_ctx_train, n_expert, GGML_LOG_LEVEL_ERROR);
-    bool same = as_extra.size() == alone.size();
+    bool same = shared.size() == alone.size();
     for (size_t i = 0; same && i < alone.size(); ++i) {
-        same = as_extra[i].model == alone[i].model && as_extra[i].context == alone[i].context &&
-               as_extra[i].compute == alone[i].compute;
+        same = shared[i].model == 0 && shared[i].context == alone[i].context && shared[i].compute == alone[i].compute;
     }
 
     bool ok = true;
@@ -2525,12 +2546,17 @@ static int test_fit_borrowing_draft() {
         LOG_ERR("%s: the measurement reported %u layers, the draft has %u\n", __func__, measured_n_layer, draft_n_layer);
         ok = false;
     }
-    if (!narrow_refused) {
+    if (!narrow_refused || !width_logged) {
         LOG_ERR("%s: a draft against a target of another width was not refused for its width\n", __func__);
         ok = false;
     }
+    if (context_long <= context) {
+        LOG_ERR("%s: the draft measured %zu context bytes at a longer target context, %zu at the shorter\n",
+                __func__, context_long, context);
+        ok = false;
+    }
     if (!same) {
-        LOG_ERR("%s: a draft that borrows nothing measured differently as an extra model\n", __func__);
+        LOG_ERR("%s: an extra model on the weights of the main model counted them, or measured differently\n", __func__);
         ok = false;
     }
     if (ok) {
