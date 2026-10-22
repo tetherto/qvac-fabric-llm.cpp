@@ -1057,6 +1057,9 @@ struct llama_model_base : public llama_model {
     // helper: make the prism.hadamard rotation and sign tensors for the folded weights
     void load_tensors_hadamard();
 
+    // helper: give FP8 weights their checkpoint's static input scale (op_params, read by the CUDA backend)
+    void load_fp8_input_scales();
+
     // helper: read the SWA pattern as one flag per layer, or as a period expanded by set_swa_pattern
     void load_swa_pattern(llama_model_loader & ml, uint32_t n_pattern, bool dense_first = false);
 
