@@ -435,14 +435,15 @@ extern "C" {
         GGML_TYPE_Q1_0    = 41,
         GGML_TYPE_Q2_0    = 42,
         GGML_TYPE_F8_E4M3 = 43,
-        GGML_TYPE_TBQ3_0    = 44, // TurboQuant 3-bit + QJL Stage 2, block=128 (4.25 bpw)
-        GGML_TYPE_TBQ4_0    = 45, // TurboQuant 4-bit + QJL Stage 2, block=128 (5.25 bpw)
-        GGML_TYPE_TBQ3_0_64 = 46, // TurboQuant 3-bit + QJL Stage 2, block=64  (4.5 bpw)
-        GGML_TYPE_TBQ4_0_64 = 47, // TurboQuant 4-bit + QJL Stage 2, block=64  (5.5 bpw)
-        GGML_TYPE_PQ3_0     = 48, // PolarQuant 3-bit (Stage 1 only), block=128 (3.125 bpw)
-        GGML_TYPE_PQ3_0_64  = 49, // PolarQuant 3-bit (Stage 1 only), block=64  (3.25 bpw)
-        GGML_TYPE_PQ4_0     = 50, // PolarQuant 4-bit (Stage 1 only), block=128 (4.125 bpw)
-        GGML_TYPE_PQ4_0_64  = 51, // PolarQuant 4-bit (Stage 1 only), block=64  (4.25 bpw)
+        // fabric KV-cache-only types, moved out of the upstream range (not stored in GGUF files)
+        GGML_TYPE_TBQ3_0    = 52, // TurboQuant 3-bit + QJL Stage 2, block=128 (4.25 bpw)
+        GGML_TYPE_TBQ4_0    = 53, // TurboQuant 4-bit + QJL Stage 2, block=128 (5.25 bpw)
+        GGML_TYPE_TBQ3_0_64 = 54, // TurboQuant 3-bit + QJL Stage 2, block=64  (4.5 bpw)
+        GGML_TYPE_TBQ4_0_64 = 55, // TurboQuant 4-bit + QJL Stage 2, block=64  (5.5 bpw)
+        GGML_TYPE_PQ3_0     = 56, // PolarQuant 3-bit (Stage 1 only), block=128 (3.125 bpw)
+        GGML_TYPE_PQ3_0_64  = 57, // PolarQuant 3-bit (Stage 1 only), block=64  (3.25 bpw)
+        GGML_TYPE_PQ4_0     = 58, // PolarQuant 4-bit (Stage 1 only), block=128 (4.125 bpw)
+        GGML_TYPE_PQ4_0_64  = 59, // PolarQuant 4-bit (Stage 1 only), block=64  (4.25 bpw)
         GGML_TYPE_PQ2_0     = 142,
         GGML_TYPE_PTQ1_0    = 143,
         GGML_TYPE_COUNT     = 144,
