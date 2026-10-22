@@ -52,7 +52,8 @@ jobs:
       - name: Setup Node.js (build the embedded web UI from source)
         uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version: lts/*
+          check-latest: true
 
       - name: Install dependencies
         env:
@@ -93,7 +94,8 @@ jobs:
       - name: Setup Node.js (build the embedded web UI from source)
         uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version: lts/*
+          check-latest: true
 
       - name: Dependencies
         id: depends
@@ -129,7 +131,8 @@ jobs:
       - name: Setup Node.js (build the embedded web UI from source)
         uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version: lts/*
+          check-latest: true
 
       - name: Dependencies
         id: depends
