@@ -325,7 +325,7 @@ class DbPusher:
 
     def ping(self) -> None:
         """Raise DbPreflightError if the database is unreachable."""
-        import psycopg
+        import psycopg  # ty: ignore[unresolved-import]
 
         try:
             with psycopg.connect(self.db_url, connect_timeout=10) as conn:
@@ -339,7 +339,7 @@ class DbPusher:
             rows = collect_run_rows(stem, run_url)
             if not rows:
                 return True
-            import psycopg
+            import psycopg  # ty: ignore[unresolved-import]
 
             with psycopg.connect(self.db_url, connect_timeout=10) as conn:
                 with conn.cursor() as cursor:
@@ -365,7 +365,7 @@ def make_pusher(db_url: "str | None") -> "DbPusher | None":
     if not db_url:
         return None
     try:
-        import psycopg  # noqa: F401
+        import psycopg  # noqa: F401  # ty: ignore[unresolved-import]
     except ImportError as e:
         raise DbPreflightError(
             "--db-url given but psycopg is not installed "
@@ -405,6 +405,7 @@ def main() -> None:
         sys.exit(f"db: not a directory: {args.results_dir}")
     try:
         pusher = make_pusher(args.db_url)
+        assert pusher is not None  # args.db_url is non-empty here
         pusher.ping()
     except DbPreflightError as e:
         sys.exit(f"db: {e}")
