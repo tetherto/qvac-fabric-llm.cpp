@@ -7059,6 +7059,10 @@ static bool ggml_backend_cuda_repacked_supports_op(
     if (op->src[0]->extra != nullptr && !ggml_cuda_repack_is_cutlass_blockscaled(op->src[0])) {
         return false;
     }
+    // empty nodes are skipped at compute time; rejecting them would copy the whole weight to another backend
+    if (ggml_is_empty(op)) {
+        return true;
+    }
 
     const int cc = ggml_cuda_info().devices[dev_ctx->device].cc;
     return ggml_cuda_repacked_mul_mat_supported(op->src[0], op->src[1], op) ||
