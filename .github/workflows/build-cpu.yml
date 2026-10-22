@@ -338,6 +338,22 @@ jobs:
           cd build
           ctest -L main -C Release --verbose --timeout 900
 
+      # The layout qvac ships: each backend module links its own static ggml-base, so the log forwarding checks run for real.
+      - name: Static backend-loader test
+        id: backend_loader_static
+        if: ${{ matrix.build == 'x64-cpu-static' }}
+        run: |
+          cmake -S . -B build-backend-loader-static -G "Ninja Multi-Config" `
+            -D CMAKE_TOOLCHAIN_FILE=cmake/x64-windows-llvm.cmake `
+            -DGGML_NATIVE=OFF `
+            -DGGML_OPENMP=OFF `
+            -DLLAMA_BUILD_TESTS=ON `
+            -DLLAMA_BUILD_BORINGSSL=ON `
+            -DGGML_BACKEND_DL=ON `
+            -DBUILD_SHARED_LIBS=OFF
+          cmake --build build-backend-loader-static --config Release --target test-backend-loader -j ${env:NUMBER_OF_PROCESSORS}
+          ctest --test-dir build-backend-loader-static -C Release -R '^test-backend-loader$' --output-on-failure
+
       # TODO: disabled for now, consider adding tests for all CPU variants instead
       # - name: Test (Intel SDE)
       #   id: cmake_test_sde
