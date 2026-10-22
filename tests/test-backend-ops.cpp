@@ -7616,7 +7616,8 @@ struct test_cutlass_mlp_bf16 : public test_case {
 
     bool run_whole_graph() override { return true; }
 
-    std::vector<ggml_tensor *> fusion_test_nodes() override { return { pair_output, materialized_glu }; }
+    // the fused path does not write the GLU (NaN-initialized above), down must read only its NVFP4 copy
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return { pair_output }; }
 
     bool expect_fusion() override { return !reuse_glu; }
 
