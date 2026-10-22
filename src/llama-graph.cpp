@@ -402,14 +402,9 @@ static void llm_graph_set_input_rs(llm_graph_input_rs * inp, const llama_memory_
 
     // the deferred gdn inputs read the pending rollback, which s_copy() below consumes
     if (inp->rec_idx) {
-        // the base-state copy indices are not part of the graph when the base states are updated in place
-        int32_t * s_copy_base = nullptr;
-        if (inp->s_copy_base->buffer) {
-            GGML_ASSERT(ggml_backend_buffer_is_host(inp->s_copy_base->buffer));
-            s_copy_base = (int32_t *) inp->s_copy_base->data;
-        }
+        GGML_ASSERT(ggml_backend_buffer_is_host(inp->s_copy_base->buffer));
         GGML_ASSERT(ggml_backend_buffer_is_host(inp->rec_idx->buffer));
-        mctx->set_input_gdn_deferred(s_copy_base, (int32_t *) inp->rec_idx->data, *ubatch);
+        mctx->set_input_gdn_deferred((int32_t *) inp->s_copy_base->data, (int32_t *) inp->rec_idx->data, *ubatch);
     }
 
     if (inp->s_copy) {

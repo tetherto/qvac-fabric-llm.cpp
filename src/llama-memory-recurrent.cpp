@@ -49,8 +49,10 @@ llama_memory_recurrent::llama_memory_recurrent(
             LLAMA_LOG_WARN("%s: LLAMA_GDN_DEFERRED is ignored when the recurrent states are not offloaded\n", __func__);
         }
         gdn_deferred = offload && n_rs_seq > 0 && arch_ok && env && atoi(env) != 0;
-        // LLAMA_GDN_DEFERRED=2 keeps gathering the base states (for A/B runs)
-        gdn_inplace  = gdn_deferred && atoi(env) != 2;
+        // LLAMA_GDN_DEFERRED=2 keeps gathering the base states (for A/B runs).
+        // only a single cell always keeps its own base state: with more cells, whether a ubatch could
+        // skip the gather depends on the cell layout, and the graph would not match the reserved one
+        gdn_inplace  = gdn_deferred && atoi(env) != 2 && mem_size == 1;
         if (gdn_deferred) {
             const int64_t H_v = hparams.ssm_dt_rank;
             const int64_t S_v = hparams.ssm_d_inner / H_v;
@@ -868,9 +870,7 @@ void llama_memory_recurrent::set_input_gdn_deferred(int32_t * s_copy_base, int32
         const auto &   cell    = cells[cell_id];
         const int32_t  src0    = cell.src0;
 
-        if (s_copy_base) {
-            s_copy_base[i] = src0;
-        }
+        s_copy_base[i] = src0;
 
         // the pending rollback applies to extra cells too: s_copy() consumes it for every cell
         uint32_t rollback = 0;
@@ -1682,17 +1682,10 @@ bool llama_memory_recurrent_context::get_gdn_deferred() const {
 }
 
 bool llama_memory_recurrent_context::get_s_base_inplace(uint32_t n_seqs) const {
-    if (is_full || !mem->gdn_inplace || get_n_rs() != n_seqs) {
-        return false;
-    }
+    GGML_UNUSED(n_seqs);
 
-    for (uint32_t i = 0; i < n_seqs; ++i) {
-        if (mem->cells[mem->head + i].src0 != (int32_t) (mem->head + i)) {
-            return false;
-        }
-    }
-
-    return true;
+    // gdn_inplace implies a single cell, which always keeps its own base state (also in the reserved graph)
+    return mem->gdn_inplace;
 }
 
 int64_t llama_memory_recurrent_context::get_gdn_k() const {

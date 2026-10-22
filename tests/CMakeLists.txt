@@ -314,6 +314,22 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
         TIMEOUT 3600
     )
 
+    # the recurrent-state cases with the deferred gated delta net commit (qwen35, qwen35moe)
+    # its own working directory: the per-model logs would collide with test-llama-context under ctest -j
+    file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/test-llama-context-gdn-deferred")
+    llama_test(
+        test-llama-context
+        NAME test-llama-context-gdn-deferred
+        LABEL main
+        WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/test-llama-context-gdn-deferred"
+        ARGS --models "${MODEL_DIR}" -t 4 --test "rollback|replay|shared|swap"
+    )
+    set_tests_properties(test-llama-context-gdn-deferred PROPERTIES
+        FIXTURES_REQUIRED generate-models
+        ENVIRONMENT "LLAMA_GDN_DEFERRED=1;GGML_SCHED_DEBUG_REALLOC=1"
+        TIMEOUT 3600
+    )
+
     llama_build(test-fit-measured.cpp)
     llama_test(
         test-fit-measured

@@ -84,7 +84,7 @@ public:
     // the rows recorded by the last ubatch. each cell has two record slots so that a ubatch never
     // overwrites the slot it replays from. rollback then only changes how many rows get replayed.
     bool    gdn_deferred = false;
-    bool    gdn_inplace  = false; // update the base states in place when the cells allow it
+    bool    gdn_inplace  = false; // update the base states in place (single cell only)
     int64_t gdn_rec_size = 0; // floats per record slot
 
     int64_t gdn_conv_channels() const { return hparams.ssm_d_inner + 2*hparams.ssm_n_group*hparams.ssm_d_state; }
@@ -94,7 +94,6 @@ public:
 
     // fills the base-state copy indices and the {pending, read_row, write_row} triples of a ubatch,
     // then advances the record metadata. must run before s_copy() consumes the rollback indices.
-    // s_copy_base may be null (base states updated in place)
     void set_input_gdn_deferred(int32_t * s_copy_base, int32_t * rec_idx, uint32_t n_rs, uint32_t n_seqs, uint32_t n_seq_tokens);
 
     // computed before each graph build
@@ -223,8 +222,8 @@ public:
 
     void set_input_gdn_deferred(int32_t * s_copy_base, int32_t * rec_idx, const llama_ubatch & ubatch) const;
 
-    // true when every cell of the ubatch keeps its own base state (no copies, no extra cells), so the
-    // deferred gdn op can update the base states in place instead of gathering them
+    // true when the deferred gdn op updates the base states in place instead of gathering them,
+    // which needs every cell to keep its own base state (no copies, no extra cells)
     bool get_s_base_inplace(uint32_t n_seqs) const;
 
 private:
