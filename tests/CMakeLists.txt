@@ -278,6 +278,18 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
         ENVIRONMENT "GGML_SCHED_DEBUG_REALLOC=1"
     )
 
+    # the same with the deferred gated delta net commit (qwen35, qwen35moe)
+    llama_test(
+        test-recurrent-state-rollback
+        NAME test-recurrent-state-rollback-gdn-deferred
+        LABEL main
+        ARGS --models "${MODEL_DIR}" -t 4
+    )
+    set_tests_properties(test-recurrent-state-rollback-gdn-deferred PROPERTIES
+        FIXTURES_REQUIRED generate-models
+        ENVIRONMENT "LLAMA_GDN_DEFERRED=1;GGML_SCHED_DEBUG_REALLOC=1"
+    )
+
     # Test state save/load functionality across all architectures, using the generated dummy models
     llama_test(
         test-save-load-state

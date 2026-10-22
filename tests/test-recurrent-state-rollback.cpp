@@ -15,6 +15,7 @@
 #include <clocale>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <limits>
@@ -105,6 +106,18 @@ static llama_context_ptr make_ctx(const common_params & params, llama_model * mo
     cparams.n_batch   = std::max(cparams.n_batch,  (uint32_t) (cparams.n_rs_seq + 1));
     cparams.n_ubatch  = std::max(cparams.n_ubatch, (uint32_t) (cparams.n_rs_seq + 1));
     return init_ctx(model, cparams, fill);
+}
+
+static void set_env(const char * name, const char * value) {
+#ifdef _WIN32
+    _putenv_s(name, value ? value : "");
+#else
+    if (value) {
+        setenv(name, value, 1);
+    } else {
+        unsetenv(name);
+    }
+#endif
 }
 
 static float logit_diff(float a, float b) {
@@ -567,6 +580,173 @@ static test_status test_shared_seq_reserve(const common_params & params, llama_m
     return test_status::PASS;
 }
 
+// Start three seqs, then decode a ubatch with only two of them: the cells get swapped so that the
+// ubatch's cells are contiguous, and the seq left out moves to an extra cell that receives a copy of
+// its state. The seq that moved, then the seq in the extra cell (optionally with a pending rollback),
+// are compared with a fresh context that decodes only the history of that seq.
+static test_status test_multi_seq_cell_swap(const common_params & params, llama_model * model, uint8_t fill) {
+    const char * func = __func__;
+
+    // see test_shared_seq_reserve
+    char arch_str[64] = {};
+    llama_model_meta_val_str(model, "general.architecture", arch_str, sizeof(arch_str));
+    if (strcmp(arch_str, "kimi-linear") == 0 || strcmp(arch_str, "minimax-01") == 0) {
+        LOG_INF("%s: skipping %s, its reserve uses n_seqs = 1\n", __func__, arch_str);
+        return test_status::SKIP;
+    }
+
+    const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
+
+    constexpr llama_pos n_prompt = 16;
+    constexpr llama_pos n_draft  = 3;
+    constexpr llama_pos n_keep   = 1;
+    constexpr float     nmse_eps = 1e-4f; // see test_multi_seq_split_replay
+
+    // the reserved graph has no extra cells (n_rs == n_seqs), so the first ubatch with one grows the extra state
+    // copies and re-reserves, with or without the deferred gdn commit. how much it grows depends on the backend, so
+    // the contexts of this test skip the realloc check
+    const char *      debug_realloc      = getenv("GGML_SCHED_DEBUG_REALLOC");
+    const bool        debug_realloc_set  = debug_realloc != nullptr;
+    const std::string debug_realloc_prev = debug_realloc_set ? debug_realloc : "";
+
+    const auto make_ctx_seqs = [&](uint32_t n_seq_max, bool unified) {
+        auto cparams = common_context_params_to_llama(params);
+        cparams.n_seq_max  = n_seq_max;
+        cparams.n_rs_seq   = 8;
+        cparams.n_ctx      = 256;
+        cparams.n_batch    = 64;
+        cparams.n_ubatch   = 64;
+        cparams.kv_unified = unified;
+        set_env("GGML_SCHED_DEBUG_REALLOC", "0");
+        llama_context_ptr ctx = init_ctx(model, cparams, fill);
+        set_env("GGML_SCHED_DEBUG_REALLOC", debug_realloc_set ? debug_realloc_prev.c_str() : nullptr);
+        return ctx;
+    };
+
+    const auto tok = [&](llama_seq_id seq, llama_pos pos) {
+        return (llama_token) ((7*(uint32_t) pos + 31*seq + 1) % (uint32_t) n_vocab);
+    };
+
+    // decodes [p0, p1) of each seq in one batch, returns the logits of the last token of the last seq
+    const auto decode_seqs = [&](llama_context * ctx, const std::vector<llama_seq_id> & seqs, llama_pos p0, llama_pos p1) -> const float * {
+        llama_batch batch = llama_batch_init((int32_t) seqs.size()*(p1 - p0), 0, 1);
+        for (llama_seq_id s : seqs) {
+            for (llama_pos pos = p0; pos < p1; ++pos) {
+                common_batch_add(batch, tok(s, pos), pos, { s }, pos + 1 == p1);
+            }
+        }
+        const bool ok = llama_decode(ctx, batch) == 0;
+        const int32_t n_tokens = batch.n_tokens;
+        llama_batch_free(batch);
+        return ok ? llama_get_logits_ith(ctx, n_tokens - 1) : nullptr;
+    };
+
+    // the logits of the last decode and the recurrent state of a seq. the logits of the generated test
+    // models barely depend on the recurrent state, so the state is compared too
+    struct seq_out {
+        std::vector<float>   logits;
+        std::vector<uint8_t> state;
+    };
+
+    const auto capture = [&](llama_context * ctx, llama_seq_id seq, const float * logits) {
+        seq_out res;
+        if (logits) {
+            res.logits.assign(logits, logits + n_vocab);
+            res.state.resize(llama_state_seq_get_size_ext(ctx, seq, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY));
+            res.state.resize(llama_state_seq_get_data_ext(ctx, res.state.data(), res.state.size(), seq, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY));
+        }
+        return res;
+    };
+
+    // a fresh context that decodes only the given chunks of the history of seq
+    const auto reference = [&](bool unified, llama_seq_id seq, const std::vector<std::pair<llama_pos, llama_pos>> & chunks) {
+        llama_context_ptr ctx = make_ctx_seqs(3, unified);
+        const float * logits = nullptr;
+        for (const auto & [p0, p1] : chunks) {
+            logits = ctx ? decode_seqs(ctx.get(), { seq }, p0, p1) : nullptr;
+        }
+        return ctx ? capture(ctx.get(), seq, logits) : seq_out();
+    };
+
+    const auto check = [&](const char * name, llama_seq_id seq, const seq_out & got, const seq_out & ref) {
+        if (got.logits.empty() || ref.logits.empty()) {
+            LOG_ERR("%s: %s: decode of seq %d failed\n", func, name, seq);
+            return false;
+        }
+        const double nmse_logits = nmse(ref.logits.data(), got.logits.data(), n_vocab);
+        // compared as floats: the headers of the two states are the same
+        const double nmse_state = got.state.size() != ref.state.size() ? std::numeric_limits<double>::infinity() :
+            nmse((const float *) ref.state.data(), (const float *) got.state.data(), (int) (ref.state.size()/sizeof(float)));
+        if (nmse_logits > nmse_eps || nmse_state > nmse_eps) {
+            LOG_ERR("%s: %s: seq %d mismatch (logits nmse %g, state nmse %g)\n", func, name, seq, nmse_logits, nmse_state);
+            return false;
+        }
+        LOG_INF("%s: %s: seq %d matched (logits nmse %g, state nmse %g)\n", func, name, seq, nmse_logits, nmse_state);
+        return true;
+    };
+
+    struct swap_case {
+        const char * name;
+        bool         unified;
+        llama_seq_id order[3]; // the seqs take their cells in this order
+        llama_seq_id a;        // the seqs of the ubatch that swaps the cells,
+        llama_seq_id b;        // b moves to the cell of the seq left out
+        bool         rollback; // the seq left out has a pending rollback when its cell moves
+    };
+
+    const swap_case cases[] = {
+        { "unified swap",     true,  { 0, 1, 2 }, 0, 2, false },
+        { "split swap",       false, { 0, 2, 1 }, 0, 1, false },
+        { "unified rollback", true,  { 0, 1, 2 }, 0, 2, true  },
+        { "split rollback",   false, { 0, 2, 1 }, 0, 1, true  },
+    };
+
+    bool ran = false;
+    for (const auto & c : cases) {
+        llama_context_ptr ctx = make_ctx_seqs(3, c.unified);
+        if (!ctx) {
+            LOG_ERR("%s: %s: failed to init context\n", __func__, c.name);
+            return test_status::FAIL;
+        }
+        if (c.rollback && llama_n_rs_seq(ctx.get()) < (uint32_t) (n_draft - n_keep)) {
+            continue;
+        }
+        ran = true;
+
+        const llama_seq_id left = 3 - c.a - c.b;
+
+        bool ok = true;
+        for (llama_seq_id s : c.order) {
+            ok = ok && decode_seqs(ctx.get(), { s }, 0, n_prompt) != nullptr;
+        }
+
+        std::vector<std::pair<llama_pos, llama_pos>> chunks_left = { { 0, n_prompt } };
+        if (c.rollback) {
+            ok = ok && decode_seqs(ctx.get(), { left }, n_prompt, n_prompt + n_draft) != nullptr;
+            ok = ok && llama_memory_seq_rm(llama_get_memory(ctx.get()), left, n_prompt + n_keep, -1);
+            chunks_left.push_back({ n_prompt, n_prompt + n_keep });
+        }
+        if (!ok) {
+            LOG_ERR("%s: %s: prompt decode or rollback failed\n", __func__, c.name);
+            return test_status::FAIL;
+        }
+
+        const float * logits = decode_seqs(ctx.get(), { c.a, c.b }, n_prompt, n_prompt + 1);
+        if (!check(c.name, c.b, capture(ctx.get(), c.b, logits), reference(c.unified, c.b, { { 0, n_prompt }, { n_prompt, n_prompt + 1 } }))) {
+            return test_status::FAIL;
+        }
+
+        const llama_pos pos = chunks_left.back().second;
+        chunks_left.push_back({ pos, pos + 1 });
+        logits = decode_seqs(ctx.get(), { left }, pos, pos + 1);
+        if (!check(c.name, left, capture(ctx.get(), left, logits), reference(c.unified, left, chunks_left))) {
+            return test_status::FAIL;
+        }
+    }
+
+    return ran ? test_status::PASS : test_status::SKIP;
+}
+
 static test_status merge_status(test_status a, test_status b) {
     if (a == test_status::FAIL || b == test_status::FAIL) {
         return test_status::FAIL;
@@ -581,6 +761,7 @@ struct test_results {
     test_status rollback = test_status::SKIP;
     test_status replay   = test_status::SKIP;
     test_status shared   = test_status::SKIP;
+    test_status swap     = test_status::SKIP;
 };
 
 // Run every test for an initialized model over both cache fills.
@@ -591,10 +772,12 @@ static test_results run_tests(const common_params & params, llama_model * model)
         const test_status rb = test_rollback(params, model, fill);
         const test_status rp = test_multi_seq_split_replay(params, model, fill);
         const test_status ss = test_shared_seq_reserve(params, model, fill);
+        const test_status sw = test_multi_seq_cell_swap(params, model, fill);
         res.rollback = merge_status(res.rollback, rb);
         res.replay   = merge_status(res.replay,   rp);
         res.shared   = merge_status(res.shared,   ss);
-        if (rb == test_status::FAIL || rp == test_status::FAIL || ss == test_status::FAIL) {
+        res.swap     = merge_status(res.swap,     sw);
+        if (rb == test_status::FAIL || rp == test_status::FAIL || ss == test_status::FAIL || sw == test_status::FAIL) {
             break;
         }
     }
@@ -613,7 +796,7 @@ static test_results run_tests_for_model(const std::string & model_path, const st
     if (model == nullptr) {
         LOG_ERR("%s: failed to init model '%s'\n", __func__, model_path.c_str());
         // a model that cannot be loaded is a failure, not a skip
-        return { test_status::FAIL, test_status::FAIL, test_status::FAIL };
+        return { test_status::FAIL, test_status::FAIL, test_status::FAIL, test_status::FAIL };
     }
 
     if (!llama_model_is_recurrent(model) && !llama_model_is_hybrid(model)) {
@@ -699,12 +882,12 @@ int main(int argc, char ** argv) {
         // silence everything but the table itself (LOG has verbosity LOG_LEVEL_OUTPUT = 0)
         common_log_set_verbosity_thold(0);
 
-        LOG("%-*s  %-8s  %-11s  %s\n", (int) name_width, "Model", "rollback", "split replay", "shared seq");
+        LOG("%-*s  %-8s  %-11s  %-10s  %s\n", (int) name_width, "Model", "rollback", "split replay", "shared seq", "cell swap");
         common_log_flush(common_log_main());
 
-        size_t n_pass[3] = { 0, 0, 0 };
-        size_t n_skip[3] = { 0, 0, 0 };
-        size_t n_fail[3] = { 0, 0, 0 };
+        size_t n_pass[4] = { 0, 0, 0, 0 };
+        size_t n_skip[4] = { 0, 0, 0, 0 };
+        size_t n_fail[4] = { 0, 0, 0, 0 };
         for (const auto & model_path : models) {
             const auto name = std::filesystem::path(model_path).filename().string();
 
@@ -714,12 +897,12 @@ int main(int argc, char ** argv) {
 
             // all status strings have the same raw length, so the columns line up;
             // pad the first status to the width of the "rollback" header + separator
-            LOG("  %s      %s         %s", test_status_str(res.rollback), test_status_str(res.replay), test_status_str(res.shared));
+            LOG("  %s      %s         %s        %s", test_status_str(res.rollback), test_status_str(res.replay), test_status_str(res.shared), test_status_str(res.swap));
             LOG("\n");
             common_log_flush(common_log_main());
 
-            const test_status all[3] = { res.rollback, res.replay, res.shared };
-            for (int t = 0; t < 3; ++t) {
+            const test_status all[4] = { res.rollback, res.replay, res.shared, res.swap };
+            for (int t = 0; t < 4; ++t) {
                 switch (all[t]) {
                     case test_status::PASS: n_pass[t]++; break;
                     case test_status::FAIL: n_fail[t]++; break;
@@ -737,12 +920,15 @@ int main(int argc, char ** argv) {
                 __func__, n_pass[1], n_skip[1], n_fail[1], models.size());
         LOG_INF("%s: shared seq:   %zu passed, %zu skipped, %zu failed (of %zu)\n",
                 __func__, n_pass[2], n_skip[2], n_fail[2], models.size());
+        LOG_INF("%s: cell swap:    %zu passed, %zu skipped, %zu failed (of %zu)\n",
+                __func__, n_pass[3], n_skip[3], n_fail[3], models.size());
 
-        return (n_fail[0] + n_fail[1] + n_fail[2]) == 0 ? 0 : 1;
+        return (n_fail[0] + n_fail[1] + n_fail[2] + n_fail[3]) == 0 ? 0 : 1;
     }
 
     // single-model mode
     const test_results res = run_tests_for_model(params.model.path, params);
 
-    return (res.rollback == test_status::FAIL || res.replay == test_status::FAIL || res.shared == test_status::FAIL) ? 1 : 0;
+    return (res.rollback == test_status::FAIL || res.replay == test_status::FAIL || res.shared == test_status::FAIL ||
+            res.swap == test_status::FAIL) ? 1 : 0;
 }
