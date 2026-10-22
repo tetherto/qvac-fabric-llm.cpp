@@ -13960,6 +13960,8 @@ static void add_speech_htp_type_cases(std::vector<std::unique_ptr<test_case>> & 
     cases.emplace_back(new test_speech_htp<test_get_rows>(type, 7, 11, 5, 2, 1, true, true, 1));
     cases.emplace_back(new test_speech_htp<test_cpy>(type, type == GGML_TYPE_F32 ? GGML_TYPE_F16 : GGML_TYPE_F32,
         {33, 17, 2, 1}, {-1, -1, -1, -1}, {1, 0, 2, 3}));
+    cases.emplace_back(new test_speech_htp<test_cpy>(type, type == GGML_TYPE_F32 ? GGML_TYPE_F16 : GGML_TYPE_F32,
+        {4, 1, 33, 1}, {-1, -1, -1, -1}, {2, 1, 0, 3}));
     cases.emplace_back(new test_speech_htp<test_mul_mat>(type, type, 65, 17, 128, {1, 1}, {1, 1}));
 }
 
@@ -13980,7 +13982,7 @@ static void add_speech_htp_cases(std::vector<std::unique_ptr<test_case>> & cases
     cases.emplace_back(new test_speech_htp<test_cpy>(GGML_TYPE_F32, GGML_TYPE_F32,
         {129, 33, 2, 1}, {-1, -1, -1, -1}, {1, 0, 2, 3}));
     cases.emplace_back(new test_speech_htp<test_cpy>(GGML_TYPE_F32, GGML_TYPE_F32,
-        {16385, 3, 1, 1}, {-1, -1, -1, -1}, {1, 0, 2, 3}));
+        {16385, 3, 2, 1}, {-1, -1, -1, -1}, {1, 0, 2, 3}));
     cases.emplace_back(new test_speech_htp<test_im2col>(GGML_TYPE_F32, GGML_TYPE_F32, GGML_TYPE_F32,
         {129, 33, 2, 1}, {1, 33, 1, 1}, 1, 1, 0, 0, 1, 1, false));
     cases.emplace_back(new test_speech_htp<test_im2col>(GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_F16,
