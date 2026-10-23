@@ -21,6 +21,49 @@
 // llama_memory_recurrent
 //
 
+// whether dev can run the deferred gated delta net ops of a layer, as built by build_conv_deferred and build_recurrent_attn
+static bool llama_gdn_deferred_supported(ggml_backend_dev_t dev, const llama_hparams & hparams, uint32_t n_rs_seq) {
+    const int64_t H_v    = hparams.ssm_dt_rank;
+    const int64_t S_v    = hparams.ssm_d_inner / H_v;
+    const int64_t H_k    = hparams.ssm_n_group;
+    const int64_t S_k    = hparams.ssm_d_state;
+    const int64_t C      = hparams.ssm_d_inner + 2*H_k*S_k;
+    const int64_t d_conv = hparams.ssm_d_conv;
+    const int64_t K      = n_rs_seq + 1;
+
+    if (S_k != S_v || H_v % H_k != 0) {
+        return false;
+    }
+
+    ggml_init_params params = {
+        /*.mem_size   =*/ 16*ggml_tensor_overhead(),
+        /*.mem_buffer =*/ NULL,
+        /*.no_alloc   =*/ true,
+    };
+    ggml_context_ptr ctx_ptr { ggml_init(params) };
+    ggml_context * ctx = ctx_ptr.get();
+
+    ggml_tensor * rec_idx = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 3, 1);
+
+    ggml_tensor * x    = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, C, 1, 1);
+    ggml_tensor * w    = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d_conv, C);
+    ggml_tensor * hist = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, (K + d_conv - 1)*C, 2);
+    ggml_tensor * conv = ggml_gdn_conv_deferred(ctx, x, w, hist, rec_idx, K, 2*H_k, S_k, hparams.f_norm_rms_eps);
+
+    ggml_tensor * q   = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, S_k, H_k, 1, 1);
+    ggml_tensor * k   = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, S_k, H_k, 1, 1);
+    ggml_tensor * v   = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, S_v, H_v, 1, 1);
+    ggml_tensor * g   = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, H_v, 1, 1);
+    ggml_tensor * b   = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, H_v, 1, 1);
+    ggml_tensor * s   = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, S_v, S_v, H_v, 1);
+    ggml_tensor * rec = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ggml_gated_delta_net_rec_size(S_k, H_k, S_v, H_v, 1, K), 2);
+    ggml_tensor * dt  = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, H_v);
+    ggml_tensor * a   = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, H_v);
+    ggml_tensor * gdn = ggml_gated_delta_net_deferred(ctx, q, k, v, g, b, s, rec, rec_idx, dt, a, K);
+
+    return ggml_backend_dev_supports_op(dev, conv) && ggml_backend_dev_supports_op(dev, gdn);
+}
+
 llama_memory_recurrent::llama_memory_recurrent(
         const llama_model & model,
                 ggml_type   type_r,
@@ -49,6 +92,18 @@ llama_memory_recurrent::llama_memory_recurrent(
             LLAMA_LOG_WARN("%s: LLAMA_GDN_DEFERRED is ignored when the recurrent states are not offloaded\n", __func__);
         }
         gdn_deferred = offload && n_rs_seq > 0 && arch_ok && env && atoi(env) != 0;
+        // the device of each layer has to run the deferred ops: the cpu cannot update records in device memory
+        for (int32_t il = 0; gdn_deferred && il < n_layer; ++il) {
+            if (filter && !filter(il)) {
+                continue;
+            }
+            ggml_backend_dev_t dev = model.dev_layer(il);
+            if (!llama_gdn_deferred_supported(dev, hparams, n_rs_seq)) {
+                LLAMA_LOG_WARN("%s: LLAMA_GDN_DEFERRED is ignored, %s does not support the deferred gated delta net ops\n",
+                        __func__, ggml_backend_dev_name(dev));
+                gdn_deferred = false;
+            }
+        }
         // LLAMA_GDN_DEFERRED=2 keeps gathering the base states (for A/B runs).
         // only a single cell always keeps its own base state: with more cells, whether a ubatch could
         // skip the gather depends on the cell layout, and the graph would not match the reserved one
