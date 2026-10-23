@@ -176,7 +176,7 @@ def export_wrapper(model, packed: bool):
             self.eps = original.eps
             self.weight = original.weight if original.with_scale else None
 
-        def forward(self, values):  # ty: ignore[invalid-mutable-override]
+        def forward(self, values):
             result = rms_normalize(values, self.eps)
             return result if self.weight is None else result * self.weight
 
@@ -203,7 +203,7 @@ def export_wrapper(model, packed: bool):
                 self.register_buffer(kind + "_cos", cos.squeeze(0))
                 self.register_buffer(kind + "_sin", sin.squeeze(0))
 
-        def forward(self, inputs_embeds, attention_mask, positions=None, pool=None):  # ty: ignore[invalid-mutable-override]
+        def forward(self, inputs_embeds, attention_mask, positions=None, pool=None):
             length = inputs_embeds.shape[1]
             if self.packed:
                 assert positions is not None and pool is not None
