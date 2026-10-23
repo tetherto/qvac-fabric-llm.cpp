@@ -235,6 +235,7 @@ class Keys:
             LOCAL_BLOCKS = "{arch}.attention.indexer.local_blocks"  # MSA
             TYPES      = "{arch}.attention.indexer.types"
             KPOOL             = "{arch}.attention.indexer.kpool"              # GLM5-Next
+            INDEX_SHARE_MTP   = "{arch}.attention.indexer.index_share_mtp"    # GLM5-Next
             KPOOL_SELECT_TAIL = "{arch}.attention.indexer.kpool_select_tail"  # GLM5-Next
 
     class HyperConnection:
@@ -346,6 +347,11 @@ class Keys:
         MAX_HEAD_TOKENS    = "{arch}.decision.max_head_tokens"
         TEMPERATURE        = "{arch}.decision.temperature.{name}"  # name: "<type>" or "<type>.<n_opt bucket>"
         SCORE_BIAS         = "{arch}.decision.score_bias.{n}.{i}"  # added to the logit of level i of a score question with n levels
+        # laya arch (fork)
+        ACT_COUNT          = "{arch}.decision.act_count"
+        MAX_OPTIONS        = "{arch}.decision.max_options"
+        QTYPE_TOKENS       = "{arch}.decision.qtype_tokens"
+        CONFIG             = "{arch}.decision.config"
 
     class Tokenizer:
         MODEL                = "tokenizer.ggml.model"
@@ -418,6 +424,7 @@ class Keys:
         PREPROC_MIN_TILES     = "clip.vision.preproc_min_tiles"
         PREPROC_MAX_TILES     = "clip.vision.preproc_max_tiles"
         PREPROC_IMAGE_SIZE    = "clip.vision.preproc_image_size"
+        PREPROC_NO_UPSCALE    = "clip.vision.preproc_no_upscale"
         PATCH_SIZE            = "clip.vision.patch_size"
         EMBEDDING_LENGTH      = "clip.vision.embedding_length"
         FEED_FORWARD_LENGTH   = "clip.vision.feed_forward_length"
@@ -557,6 +564,7 @@ class MODEL_ARCH(IntEnum):
     REFACT           = auto()
     BERT             = auto()
     MODERN_BERT      = auto()
+    LAYA             = auto()
     NOMIC_BERT       = auto()
     NOMIC_BERT_MOE   = auto()
     NEO_BERT         = auto()
@@ -960,6 +968,16 @@ class MODEL_TENSOR(IntEnum):
     DECISION_QUERY                = auto()
     DECISION_OPTION_MLP           = auto()
     DECISION_QUERY_MLP            = auto()
+    DECISION_TYPE_EMBD   = auto() # decision head (laya)
+    DECISION_ATTN_NORM   = auto()
+    DECISION_ATTN_QKV    = auto()
+    DECISION_ATTN_OUT    = auto()
+    DECISION_FFN_NORM    = auto()
+    DECISION_FFN_UP      = auto()
+    DECISION_FFN_DOWN    = auto()
+    DECISION_SCORER_NORM = auto()
+    DECISION_ACT         = auto()
+    DECISION_ACT_OUT     = auto()
     CONV1D               = auto()
     CONVNEXT_DW          = auto()
     CONVNEXT_NORM        = auto()
@@ -1374,6 +1392,7 @@ MODEL_ARCH_NAMES: dict[MODEL_ARCH, str] = {
     MODEL_ARCH.REFACT:           "refact",
     MODEL_ARCH.BERT:             "bert",
     MODEL_ARCH.MODERN_BERT:      "modern-bert",
+    MODEL_ARCH.LAYA:             "laya",
     MODEL_ARCH.NOMIC_BERT:       "nomic-bert",
     MODEL_ARCH.NOMIC_BERT_MOE:   "nomic-bert-moe",
     MODEL_ARCH.NEO_BERT:         "neo-bert",
@@ -1776,6 +1795,16 @@ TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
     MODEL_TENSOR.DECISION_QUERY:                "decision.query",
     MODEL_TENSOR.DECISION_OPTION_MLP:           "decision.option_mlp",
     MODEL_TENSOR.DECISION_QUERY_MLP:            "decision.query_mlp",
+    MODEL_TENSOR.DECISION_TYPE_EMBD:        "decision.type_embd",
+    MODEL_TENSOR.DECISION_ATTN_NORM:        "decision.blk.{bid}.attn_norm",
+    MODEL_TENSOR.DECISION_ATTN_QKV:         "decision.blk.{bid}.attn_qkv",
+    MODEL_TENSOR.DECISION_ATTN_OUT:         "decision.blk.{bid}.attn_output",
+    MODEL_TENSOR.DECISION_FFN_NORM:         "decision.blk.{bid}.ffn_norm",
+    MODEL_TENSOR.DECISION_FFN_UP:           "decision.blk.{bid}.ffn_up",
+    MODEL_TENSOR.DECISION_FFN_DOWN:         "decision.blk.{bid}.ffn_down",
+    MODEL_TENSOR.DECISION_SCORER_NORM:      "decision.scorer_norm",
+    MODEL_TENSOR.DECISION_ACT:              "decision.act",
+    MODEL_TENSOR.DECISION_ACT_OUT:          "decision.act_out",
     MODEL_TENSOR.CONV1D:                    "conv1d",
     MODEL_TENSOR.CONVNEXT_DW:               "convnext.{bid}.dw",
     MODEL_TENSOR.CONVNEXT_NORM:             "convnext.{bid}.norm",
@@ -2654,6 +2683,29 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.CLS,
         MODEL_TENSOR.CLS_OUT,
         MODEL_TENSOR.CLS_NORM,
+    ],
+    MODEL_ARCH.LAYA: [
+        MODEL_TENSOR.TOKEN_EMBD,
+        MODEL_TENSOR.TOKEN_EMBD_NORM,
+        MODEL_TENSOR.OUTPUT_NORM,
+        MODEL_TENSOR.ATTN_NORM,
+        MODEL_TENSOR.ATTN_OUT,
+        MODEL_TENSOR.ATTN_QKV,
+        MODEL_TENSOR.FFN_UP,
+        MODEL_TENSOR.FFN_DOWN,
+        MODEL_TENSOR.FFN_NORM,
+        MODEL_TENSOR.DECISION_TYPE_EMBD,
+        MODEL_TENSOR.DECISION_ATTN_NORM,
+        MODEL_TENSOR.DECISION_ATTN_QKV,
+        MODEL_TENSOR.DECISION_ATTN_OUT,
+        MODEL_TENSOR.DECISION_FFN_NORM,
+        MODEL_TENSOR.DECISION_FFN_UP,
+        MODEL_TENSOR.DECISION_FFN_DOWN,
+        MODEL_TENSOR.DECISION_SCORER_NORM,
+        MODEL_TENSOR.DECISION_SCORER,
+        MODEL_TENSOR.DECISION_SCORER_OUT,
+        MODEL_TENSOR.DECISION_ACT,
+        MODEL_TENSOR.DECISION_ACT_OUT,
     ],
     MODEL_ARCH.NOMIC_BERT: [
         MODEL_TENSOR.TOKEN_EMBD,
@@ -6226,6 +6278,8 @@ class GGMLQuantizationType(IntEnum):
     NVFP4   = 40
     Q1_0    = 41
     Q2_0    = 42
+    PQ2_0   = 142
+    PTQ1_0  = 143
 
 
 class ExpertGatingFuncType(IntEnum):
@@ -6282,6 +6336,8 @@ class LlamaFileType(IntEnum):
     MOSTLY_NVFP4         = 39  # except 1d tensors
     MOSTLY_Q1_0          = 40  # except 1d tensors
     MOSTLY_Q2_0          = 41  # except 1d tensors
+    MOSTLY_PQ2_0         = 141  # except 1d tensors
+    MOSTLY_PTQ1_0        = 143  # except 1d tensors
 
     GUESSED              = 1024  # not specified in the model file
 
@@ -6348,6 +6404,7 @@ class VisionProjectorType:
     GEMMA4UA = "gemma4ua" # "unified" variant
     PHI4 = "phi4"
     IDEFICS3 = "idefics3"
+    VISIONPSY = "visionpsy"
     PIXTRAL = "pixtral"
     LLAMA4 = "llama4"
     QWEN2VL = "qwen2vl_merger"
@@ -6443,6 +6500,8 @@ GGML_QUANT_SIZES: dict[GGMLQuantizationType, tuple[int, int]] = {
     GGMLQuantizationType.NVFP4:   (64, 4 + 32),
     GGMLQuantizationType.Q1_0:    (128, 2 + 16),
     GGMLQuantizationType.Q2_0:    (64, 2 + 16),
+    GGMLQuantizationType.PQ2_0:   (128, 2 + 32),
+    GGMLQuantizationType.PTQ1_0:  (128, 2 + 24 + 2),
 }
 
 

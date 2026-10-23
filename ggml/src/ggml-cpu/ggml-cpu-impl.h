@@ -62,6 +62,25 @@ struct ggml_compute_params {
 #endif
 #endif
 
+// Portable prefetch hint for CPU kernels.
+//   rw:        0 = read, 1 = write
+//   locality:  0..3, higher = keep closer in the cache hierarchy
+// Maps to __builtin_prefetch on GCC/Clang, _mm_prefetch on MSVC (x86/x64),
+// and is a no-op on compilers / architectures that expose neither.
+#if defined(__GNUC__) || defined(__clang__)
+#    define GGML_CPU_PREFETCH(addr, rw, locality) __builtin_prefetch((addr), (rw), (locality))
+#elif defined(_MSC_VER) && (defined(_M_IX86) || defined(_M_X64))
+     // _mm_prefetch takes _MM_HINT_{NTA,T0,T1,T2}; map locality 0..3 onto them.
+     // Write hints are not directly supported; fall back to a read hint.
+#    define GGML_CPU_PREFETCH(addr, rw, locality) \
+         _mm_prefetch((const char *)(addr), \
+             (locality) == 0 ? _MM_HINT_NTA : \
+             (locality) == 1 ? _MM_HINT_T2  : \
+             (locality) == 2 ? _MM_HINT_T1  : _MM_HINT_T0)
+#else
+#    define GGML_CPU_PREFETCH(addr, rw, locality) ((void)0)
+#endif
+
 #if defined(__s390x__) && defined(__VEC__)
 #ifndef __VXE__
 #define __VXE__

@@ -300,6 +300,7 @@ struct common_chat_params {
     common_chat_prompt                  prompt;
     std::string                         grammar;
     bool                                grammar_lazy         = false;
+    bool                                thinking_forced_open = false;
     std::string                         generation_prompt;
     bool                                supports_thinking    = false;
     std::string                         thinking_start_tag;  // e.g., "<think>"

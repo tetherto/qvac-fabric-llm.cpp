@@ -86,8 +86,10 @@ kernel void kernel_rope_norm(
             const float x0 = src[0];
             const float x1 = src[1];
 
-            dst_data[0] = x0*cos_theta - x1*sin_theta;
-            dst_data[1] = x0*sin_theta + x1*cos_theta;
+            const float sin_theta_mod = sin_theta * args.sin_sign;
+
+            dst_data[0] = x0*cos_theta - x1*sin_theta_mod;
+            dst_data[1] = x0*sin_theta_mod + x1*cos_theta;
         } else {
             if (args.inplace) {
                 continue;
@@ -144,8 +146,10 @@ kernel void kernel_rope_neox(
             const float x0 = src[0];
             const float x1 = src[args.n_dims/2];
 
-            dst_data[0]             = x0*cos_theta - x1*sin_theta;
-            dst_data[args.n_dims/2] = x0*sin_theta + x1*cos_theta;
+            const float sin_theta_mod = sin_theta * args.sin_sign;
+
+            dst_data[0]             = x0*cos_theta - x1*sin_theta_mod;
+            dst_data[args.n_dims/2] = x0*sin_theta_mod + x1*cos_theta;
         } else {
             if (args.inplace) {
                 continue;
@@ -232,8 +236,10 @@ kernel void kernel_rope_multi(
             const float x0 = src[0];
             const float x1 = src[args.n_dims/2];
 
-            dst_data[0]             = x0*cos_theta - x1*sin_theta;
-            dst_data[args.n_dims/2] = x0*sin_theta + x1*cos_theta;
+            const float sin_theta_mod = sin_theta * args.sin_sign;
+
+            dst_data[0]             = x0*cos_theta - x1*sin_theta_mod;
+            dst_data[args.n_dims/2] = x0*sin_theta_mod + x1*cos_theta;
         } else {
             if (args.inplace) {
                 continue;
@@ -303,8 +309,10 @@ kernel void kernel_rope_vision(
             const float x0 = src[0];
             const float x1 = src[args.n_dims]; // different from kernel_rope_multi
 
-            dst_data[0]           = x0*cos_theta - x1*sin_theta;
-            dst_data[args.n_dims] = x0*sin_theta + x1*cos_theta; // different from kernel_rope_multi
+            const float sin_theta_mod = sin_theta * args.sin_sign;
+
+            dst_data[0]           = x0*cos_theta - x1*sin_theta_mod;
+            dst_data[args.n_dims] = x0*sin_theta_mod + x1*cos_theta; // different from kernel_rope_multi
         } else {
             device const T * const src = (device T *)(src0 + i3*args.nb03 + i2*args.nb02 + i1*args.nb01 + i0*args.nb00);
             device       T * dst_data  = (device T *)( dst + i3*args.nb3  + i2*args.nb2  + i1*args.nb1  + i0*args.nb0);

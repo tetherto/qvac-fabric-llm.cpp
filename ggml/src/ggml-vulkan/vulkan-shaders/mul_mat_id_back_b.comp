@@ -1,0 +1,94 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : enable
+
+#include "types.glsl"
+
+layout (push_constant) uniform parameter
+{
+    uint K;         // dst->ne[0]  (cols)
+    uint N;         // as->ne[1]   (reduction dim / rows of each expert)
+    uint n_used;    // ids->ne[0]
+    uint n_tok;     // ids->ne[1]
+    uint n_expert;  // as->ne[2]
+    uint dst_ne1;   // dst->ne[1] (n_used or 1 for accumulation)
+    uint as_nb1;    // as strides (in elements, f32 only)
+    uint as_nb2;
+    uint g_nb1;     // grad_out strides
+    uint g_nb2;
+    uint ids_nb1;   // ids stride
+    uint d_nb1;     // dst strides
+    uint d_nb2;
+} p;
+
+#define BLOCK_SIZE 256
+
+layout(local_size_x = BLOCK_SIZE, local_size_y = 1, local_size_z = 1) in;
+
+layout (binding = 0) readonly  buffer A {A_TYPE  data_a[];};  // as       [K, N, n_expert]
+#if defined(A_TYPE_PACKED16)
+layout (binding = 0) readonly  buffer A_PACKED16 {A_TYPE_PACKED16 data_a_packed16[];};
+#endif
+#if defined(A_TYPE_PACKED32)
+layout (binding = 0) readonly  buffer A_PACKED32 {A_TYPE_PACKED32 data_a_packed32[];};
+#endif
+layout (binding = 1) readonly  buffer G {float   data_g[];};  // grad_out [N, n_used, n_tok]
+layout (binding = 2) readonly  buffer I {int32_t data_i[];};  // ids      [n_used, n_tok]
+layout (binding = 3) writeonly buffer D {float   data_d[];};  // grad_b   [K, dst_ne1, n_tok]
+
+#if !defined(DATA_A_F32) && !defined(DATA_A_Q8_0)
+#define MMID_BACK_B_DEQUANT 1
+#include "dequant_funcs.glsl"
+#endif
+
+float read_as(uint k, uint n, uint e) {
+#if defined(DATA_A_Q8_0)
+    const uint blocks_per_row = p.K / QUANT_K;
+    const uint ib  = (e * p.N + n) * blocks_per_row + (k / QUANT_K);
+    const uint iqs = k % QUANT_K;
+    return float(data_a[ib].qs[iqs]) * float(data_a[ib].d);
+#elif defined(MMID_BACK_B_DEQUANT)
+    const uint blocks_per_row = p.K / QUANT_K;
+    const uint ib = (e * p.N + n) * blocks_per_row + (k / QUANT_K);
+    const uint kk = k % QUANT_K;
+#if QUANT_R == 1
+    const uint iqs = kk & ~1u;
+    const bool hi  = (kk & 1u) != 0u;
+#else
+    const uint iqs = (kk < QUANT_K/2) ? kk : kk - QUANT_K/2;
+    const bool hi  = kk >= QUANT_K/2;
+#endif
+    vec2 v = dequantize(ib, iqs, 0);
+    const vec2 dm = get_dm(ib, 0);
+    v = v * dm.x + dm.y;
+    return hi ? v.y : v.x;
+#else
+    return data_a[k + n*p.as_nb1 + e*p.as_nb2];
+#endif
+}
+
+// One workgroup per (slot, t), local invocations stride over k.
+// grad_b[t, slot, k] = sum over routed slots u (slot, or all of them when the
+// output is broadcast to a single slot) of sum_n as[e, n, k] * grad_out[t, u, n],
+// with e = ids[t][u].
+void main() {
+    const uint slot = gl_WorkGroupID.x;
+    const uint t    = gl_WorkGroupID.y;
+
+    const uint u0 = (p.dst_ne1 == 1u) ? 0u       : slot;
+    const uint u1 = (p.dst_ne1 == 1u) ? p.n_used : (slot + 1u);
+
+    for (uint k = gl_LocalInvocationID.x; k < p.K; k += BLOCK_SIZE) {
+        float acc = 0.0;
+
+        for (uint u = u0; u < u1; ++u) {
+            const uint e = uint(data_i[u + t*p.ids_nb1]);
+            for (uint n = 0; n < p.N; ++n) {
+                const float g = data_g[n + u*p.g_nb1 + t*p.g_nb2];
+                acc += read_as(k, n, e) * g;
+            }
+        }
+
+        data_d[k + slot*p.d_nb1 + t*p.d_nb2] = acc;
+    }
+}

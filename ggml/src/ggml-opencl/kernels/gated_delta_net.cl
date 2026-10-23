@@ -87,10 +87,13 @@ kernel void kernel_gated_delta_net(
         global const char * beta_buf,  ulong off_beta,
         global const char * state_buf, ulong off_state,
         global       char * dst_buf,   ulong off_dst,
+        global       char * cache_buf, ulong off_cache, // recurrent cache view of a fused CPY, used when write_cache
         uint  H_v,
         uint  n_tokens,
         uint  n_seqs,
         uint  s_off,
+        uint  cache_slot_stride,                        // floats between snapshot slots in the cache view
+        uint  write_cache,
         uint  sq1, uint sq2, uint sq3,
         uint  sv1, uint sv2, uint sv3,
         uint  sb1, uint sb2, uint sb3,
@@ -106,6 +109,7 @@ kernel void kernel_gated_delta_net(
     global const float * data_beta  = (global const float *)(beta_buf  + off_beta);
     global const float * data_state = (global const float *)(state_buf + off_state);
     global       float * data_dst   = (global       float *)(dst_buf   + off_dst);
+    global       float * data_cache = (global       float *)(cache_buf + off_cache);
 
     const uint head_id     = get_group_id(0);
     const uint seq_id      = get_group_id(1);
@@ -226,10 +230,15 @@ kernel void kernel_gated_delta_net(
                 #pragma unroll
                 for (uint cg = 0; cg < COLS_PER_LANE_GROUP; cg++) {
                     const uint col = sg_col_base + cg * LANE_GROUPS_PER_SG + lane_group;
-                    const uint slot_base = s_off + (uint)target_slot * state_size_per_snap + state_out_base;
+                    const uint slot_base  = s_off + (uint)target_slot * state_size_per_snap + state_out_base;
+                    const uint cache_base = (uint)target_slot * cache_slot_stride + state_out_base;
                     #pragma unroll
                     for (uint r = 0; r < ROWS_PER_LANE; r++) {
-                        data_dst[slot_base + col * S_V + r * LANES_PER_COLUMN + lane] = s_shard[cg][r];
+                        const uint idx = col * S_V + r * LANES_PER_COLUMN + lane;
+                        data_dst[slot_base + idx] = s_shard[cg][r];
+                        if (write_cache) {
+                            data_cache[cache_base + idx] = s_shard[cg][r];
+                        }
                     }
                 }
             }
@@ -242,7 +251,11 @@ kernel void kernel_gated_delta_net(
             const uint col = sg_col_base + cg * LANE_GROUPS_PER_SG + lane_group;
             #pragma unroll
             for (uint r = 0; r < ROWS_PER_LANE; r++) {
-                data_dst[s_off + state_base + col * S_V + r * LANES_PER_COLUMN + lane] = s_shard[cg][r];
+                const uint idx = state_base + col * S_V + r * LANES_PER_COLUMN + lane;
+                data_dst[s_off + idx] = s_shard[cg][r];
+                if (write_cache) {
+                    data_cache[idx] = s_shard[cg][r];
+                }
             }
         }
     }

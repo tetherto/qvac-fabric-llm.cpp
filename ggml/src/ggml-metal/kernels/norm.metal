@@ -83,7 +83,7 @@ kernel void kernel_norm_fuse_impl(
         }
         if (F == 2) {
             if (FC_norm_use_scale) {
-                y[i00] = (y[i00]*scale) * args.scale;
+                y[i00] = (y[i00]*scale) * args.scale + args.bias;
             } else {
                 y[i00] = (y[i00]*scale)*f0[i00];
             }
@@ -107,7 +107,8 @@ template [[host_name("kernel_norm_mul_add_f32_4")]] kernel kernel_norm_fuse_t ke
 // F == 1 : rms_norm (no fuse)
 // F == 2 : rms_norm + mul
 // F == 3 : rms_norm + mul + add
-template <typename T, short F>
+// E      : epilogue (GGML_METAL_NORM_EPI_*): SILU_GATE (gate in src1_1) with F == 2
+template <typename T, short F, short E = GGML_METAL_NORM_EPI_NONE>
 kernel void kernel_rms_norm_fuse_impl(
         constant ggml_metal_kargs_norm & args,
         device const char * src0,
@@ -160,9 +161,12 @@ kernel void kernel_rms_norm_fuse_impl(
         if (F == 1) {
             y[i00] = (x[i00]*scale);
         }
-        if (F == 2) {
+        if (F == 2 && E == GGML_METAL_NORM_EPI_SILU_GATE) {
+            const T g = f1[i00];
+            y[i00] = (g/(1 + exp(-g)))*((x[i00]*scale)*f0[i00]);
+        } else if (F == 2) {
             if (FC_norm_use_scale) {
-                y[i00] = (x[i00]*scale) * args.scale;
+                y[i00] = (x[i00]*scale) * args.scale + args.bias;
             } else {
                 y[i00] = (x[i00]*scale)*f0[i00];
             }
@@ -182,6 +186,150 @@ template [[host_name("kernel_rms_norm_mul_add_f32")]] kernel kernel_rms_norm_fus
 template [[host_name("kernel_rms_norm_f32_4")]]         kernel kernel_rms_norm_fuse_t kernel_rms_norm_fuse_impl<float4, 1>;
 template [[host_name("kernel_rms_norm_mul_f32_4")]]     kernel kernel_rms_norm_fuse_t kernel_rms_norm_fuse_impl<float4, 2>;
 template [[host_name("kernel_rms_norm_mul_add_f32_4")]] kernel kernel_rms_norm_fuse_t kernel_rms_norm_fuse_impl<float4, 3>;
+
+template [[host_name("kernel_rms_norm_mul_silu_f32")]]   kernel kernel_rms_norm_fuse_t kernel_rms_norm_fuse_impl<float,  2, GGML_METAL_NORM_EPI_SILU_GATE>;
+template [[host_name("kernel_rms_norm_mul_silu_f32_4")]] kernel kernel_rms_norm_fuse_t kernel_rms_norm_fuse_impl<float4, 2, GGML_METAL_NORM_EPI_SILU_GATE>;
+
+kernel void kernel_rms_norm_back(
+        constant ggml_metal_kargs_rms_norm_back & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        threadgroup float * shmem_f32 [[threadgroup(0)]],
+        uint3   tgpig[[threadgroup_position_in_grid]],
+        ushort3 tpitg[[thread_position_in_threadgroup]],
+        ushort  sgitg[[simdgroup_index_in_threadgroup]],
+        ushort  tiisg[[thread_index_in_simdgroup]],
+        ushort3   ntg[[threads_per_threadgroup]]) {
+    threadgroup float * shmem_xx  = shmem_f32;
+    threadgroup float * shmem_xdz = shmem_f32 + 32;
+
+    if (sgitg == 0) {
+        shmem_xx[tiisg]  = 0.0f;
+        shmem_xdz[tiisg] = 0.0f;
+    }
+
+    const int i01 = tgpig.x;
+    const int i02 = tgpig.y;
+    const int i03 = tgpig.z;
+
+    device const float4 * dz = (device const float4 *) (src0 + i03*args.nb03 + i02*args.nb02 + i01*args.nb01);
+    device const float4 * x  = (device const float4 *) (src1 + i03*args.nb13 + i02*args.nb12 + i01*args.nb11);
+
+    float sum_xx  = 0.0f;
+    float sum_xdz = 0.0f;
+
+    for (int i00 = tpitg.x; i00 < args.ne00_4; i00 += ntg.x) {
+        const float4 x4  = x[i00];
+        const float4 dz4 = dz[i00];
+        sum_xx  += dot(x4, x4);
+        sum_xdz += dot(x4, dz4);
+    }
+
+    sum_xx  = simd_sum(sum_xx);
+    sum_xdz = simd_sum(sum_xdz);
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (tiisg == 0) {
+        shmem_xx[sgitg]  = sum_xx;
+        shmem_xdz[sgitg] = sum_xdz;
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    sum_xx  = shmem_xx[tiisg];
+    sum_xdz = shmem_xdz[tiisg];
+
+    sum_xx  = simd_sum(sum_xx);
+    sum_xdz = simd_sum(sum_xdz);
+
+    const float mean_eps = sum_xx/args.ne00 + args.eps;
+    const float rrms     = rsqrt(mean_eps);
+    const float sum_eps  = sum_xx + args.eps*args.ne00;
+    const float scale    = -sum_xdz/sum_eps;
+
+    device float4 * y = (device float4 *) (dst + i03*args.nb3 + i02*args.nb2 + i01*args.nb1);
+
+    for (int i00 = tpitg.x; i00 < args.ne00_4; i00 += ntg.x) {
+        float4 dx = dz[i00] + x[i00]*scale;
+        y[i00] = dx*rrms;
+    }
+}
+
+kernel void kernel_l2_norm_back(
+        constant ggml_metal_kargs_l2_norm_back & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        threadgroup float * shmem_f32 [[threadgroup(0)]],
+        uint3   tgpig[[threadgroup_position_in_grid]],
+        ushort3 tpitg[[thread_position_in_threadgroup]],
+        ushort  sgitg[[simdgroup_index_in_threadgroup]],
+        ushort  tiisg[[thread_index_in_simdgroup]],
+        ushort3   ntg[[threads_per_threadgroup]]) {
+    threadgroup float * shmem_xx = shmem_f32;
+    threadgroup float * shmem_xg = shmem_f32 + 32;
+
+    if (sgitg == 0) {
+        shmem_xx[tiisg] = 0.0f;
+        shmem_xg[tiisg] = 0.0f;
+    }
+
+    const int i01 = tgpig.x;
+    const int i02 = tgpig.y;
+    const int i03 = tgpig.z;
+
+    device const float4 * dy = (device const float4 *) (src0 + i03*args.nb03 + i02*args.nb02 + i01*args.nb01);
+    device const float4 * x  = (device const float4 *) (src1 + i03*args.nb13 + i02*args.nb12 + i01*args.nb11);
+
+    float sum_xx = 0.0f;
+    float sum_xg = 0.0f;
+
+    for (int i00 = tpitg.x; i00 < args.ne00_4; i00 += ntg.x) {
+        const float4 x4  = x[i00];
+        const float4 dy4 = dy[i00];
+        sum_xx += dot(x4, x4);
+        sum_xg += dot(x4, dy4);
+    }
+
+    sum_xx = simd_sum(sum_xx);
+    sum_xg = simd_sum(sum_xg);
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (tiisg == 0) {
+        shmem_xx[sgitg] = sum_xx;
+        shmem_xg[sgitg] = sum_xg;
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    sum_xx = shmem_xx[tiisg];
+    sum_xg = shmem_xg[tiisg];
+
+    sum_xx = simd_sum(sum_xx);
+    sum_xg = simd_sum(sum_xg);
+
+    const float eps  = args.eps;
+    const float norm = sqrt(sum_xx);
+
+    float scale_g;
+    float scale_x;
+    if (norm > eps) {
+        scale_g = 1.0f/norm;
+        scale_x = -scale_g*scale_g*scale_g*sum_xg;
+    } else {
+        scale_g = 1.0f/eps;
+        scale_x = 0.0f;
+    }
+
+    device float4 * y = (device float4 *) (dst + i03*args.nb3 + i02*args.nb2 + i01*args.nb1);
+
+    for (int i00 = tpitg.x; i00 < args.ne00_4; i00 += ntg.x) {
+        y[i00] = scale_g*dy[i00] + scale_x*x[i00];
+    }
+}
 
 template <typename T0, typename T>
 kernel void kernel_l2_norm_impl(
@@ -314,5 +462,86 @@ kernel void kernel_group_norm_f32(
     const float scale = 1.0f/sqrt(variance + args.eps);
     for (int j = start; j < end; j += ntg) {
         dst[j] *= scale;
+    }
+}
+
+kernel void kernel_norm_channel_f32(
+    constant   ggml_metal_kargs_norm_channel & args,
+    device  const float * x,
+    device  const float * g,
+    device  const float * b,
+    device        float * y,
+    threadgroup    float * shared [[threadgroup(0)]],
+    uint3 tgpig[[threadgroup_position_in_grid]],
+    uint3 tpitg[[thread_position_in_threadgroup]],
+    uint3   ntg[[threads_per_threadgroup]],
+    uint  sgitg [[simdgroup_index_in_threadgroup]],
+    uint  tiisg [[thread_index_in_simdgroup]]) {
+
+    const int t = (int) tgpig.x;
+    const int batch = (int) tgpig.y;
+    if (t >= args.L || batch >= args.B) return;
+
+    const int C = args.C;
+    // Element strides — let the same kernel handle both
+    // [T, C] (sxt=1, sxc=L) and [C, T] (sxt=C, sxc=1) layouts.
+    const int sxt = args.sxt, sxc = args.sxc;
+    const int syt = args.syt, syc = args.syc;
+    const size_t batch_offset = (size_t) batch * args.L * C;
+
+    device const float * x_t = x + batch_offset + (size_t) t * sxt;
+    device       float * y_t = y + batch_offset + (size_t) t * syt;
+
+    // ---- Mean ----
+    // Shifted two-pass: sums run over x - pivot so a large shared offset does
+    // not swallow the channel variation.
+    const float pivot = x_t[0];
+    float my_sum = 0.0f;
+    for (int c = (int) tpitg.x; c < C; c += (int) ntg.x) {
+        my_sum += x_t[(size_t) c * sxc] - pivot;
+    }
+    // Simdgroup reduce within the simdgroup.
+    my_sum = simd_sum(my_sum);
+    if (tiisg == 0) {
+        shared[sgitg] = my_sum;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    // First simdgroup reduces partial sums.
+    if (sgitg == 0) {
+        const uint n_sg = (ntg.x + 31) / 32;
+        float total = (tiisg < n_sg) ? shared[tiisg] : 0.0f;
+        total = simd_sum(total);
+        if (tiisg == 0) shared[0] = total;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float delta = shared[0] / (float) C;
+    const float mean = pivot + delta;
+
+    // ---- Variance ----
+    float my_sq = 0.0f;
+    for (int c = (int) tpitg.x; c < C; c += (int) ntg.x) {
+        const float d = (x_t[(size_t) c * sxc] - pivot) - delta;
+        my_sq = fma(d, d, my_sq);
+    }
+    my_sq = simd_sum(my_sq);
+    // Every simdgroup must have read the mean from shared[0] before it is reused below.
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tiisg == 0) {
+        shared[sgitg] = my_sq;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sgitg == 0) {
+        const uint n_sg = (ntg.x + 31) / 32;
+        float total = (tiisg < n_sg) ? shared[tiisg] : 0.0f;
+        total = simd_sum(total);
+        if (tiisg == 0) shared[0] = total;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float inv_std = rsqrt(shared[0] / (float) C + args.eps);
+
+    // ---- Apply affine ----
+    for (int c = (int) tpitg.x; c < C; c += (int) ntg.x) {
+        const float xv = x_t[(size_t) c * sxc];
+        y_t[(size_t) c * syc] = (xv - mean) * inv_std * g[c] + b[c];
     }
 }

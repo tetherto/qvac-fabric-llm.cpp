@@ -8,6 +8,14 @@ layout(constant_id = 0) const uint BLOCK_SIZE = 32;
 layout(constant_id = 1) const uint TOKENS_PER_WG = 16;
 layout(constant_id = 2) const bool APPLY_BIAS = false;
 layout(constant_id = 3) const bool APPLY_SILU = false;
+// 0: SSM_CONV over the materialised concat (src0 = [nc - 1 + n_t, nr, n_s]).
+// 1: direct conv + SiLU: src0 is x [nr, n_t, n_s] (nb01 = token stride, nb02 = sequence stride, bytes), binding 2
+//    is the ncs-column state [ncs, nr, n_s]; the concat is never read. Kernel width must be 4 (ncs = 3).
+// 2: concat tail: write concat columns [nc, ncs + n_t) of every channel row from the state and x (src0 = x,
+//    binding 2 = state, dst = concat with row stride dst_nb1 and sequence stride dst_nb2; nc = first column).
+layout(constant_id = 4) const uint MODE = 0;
+// MODE 1: tokens per thread. The 4-tap window slides in registers, so a token costs one x load and one store.
+layout(constant_id = 5) const uint TOKENS_PER_THREAD = 1;
 
 layout(local_size_x_id = 0, local_size_y_id = 1, local_size_z = 1) in;
 
@@ -24,6 +32,62 @@ layout(push_constant) uniform PushConstants {
 };
 
 void main() {
+    if (MODE == 1) {
+        // one thread per (channel, TOKENS_PER_THREAD tokens); lanes run along channels, so every x load and
+        // dst store is a contiguous row segment
+        const uint c  = gl_GlobalInvocationID.x;
+        const uint t0 = (gl_WorkGroupID.y * TOKENS_PER_WG + gl_LocalInvocationID.y) * TOKENS_PER_THREAD;
+        const uint s  = gl_WorkGroupID.z;
+        if (c >= nr || t0 >= n_t || s >= n_s) {
+            return;
+        }
+        const uint xs      = nb01 / 4;
+        const uint x_base  = s * (nb02 / 4) + c;
+        const uint st_base = s * ncs * nr + c * ncs;
+        const uint k_base  = c * (nb11 / 4);
+        const vec4 w = vec4(src1[k_base], src1[k_base + 1], src1[k_base + 2], src1[k_base + 3]);
+
+        // window: times t0-3, t0-2, t0-1; a negative time reads state column t + ncs
+        float win[3];
+        [[unroll]] for (uint i = 0; i < 3; i++) {
+            const int t = int(t0) + int(i) - 3;
+            if (t < 0) {
+                win[i] = bias[st_base + uint(t + int(ncs))];
+            } else {
+                win[i] = src0[x_base + uint(t) * xs];
+            }
+        }
+        const uint d_base = s * (dst_nb2 / 4) + c;
+        [[unroll]] for (uint i = 0; i < TOKENS_PER_THREAD; i++) {
+            const uint t = t0 + i;
+            if (t >= n_t) {
+                break;
+            }
+            const float v = src0[x_base + t * xs];
+            // the same dot() as the nc == 4 path over the concat, so the result is bit-identical
+            float sum = dot(vec4(win[0], win[1], win[2], v), w);
+            sum = sum / (1.0f + exp(-sum));
+            dst[d_base + t * (dst_nb1 / 4)] = sum;
+            win[0] = win[1];
+            win[1] = win[2];
+            win[2] = v;
+        }
+        return;
+    } else if (MODE == 2) {
+        const uint ncols = ncs + n_t - nc;
+        const uint idx = gl_GlobalInvocationID.x;
+        const uint s   = gl_WorkGroupID.y;
+        if (idx >= ncols * nr || s >= n_s) {
+            return;
+        }
+        // lanes along channels: x reads coalesce, the (few) columns per channel are the outer index
+        const uint c = idx % nr;
+        const uint j = nc + idx / nr;
+        const float v = j < ncs ? bias[s * ncs * nr + c * ncs + j] : src0[s * (nb02 / 4) + (j - ncs) * (nb01 / 4) + c];
+        dst[s * (dst_nb2 / 4) + c * (dst_nb1 / 4) + j] = v;
+        return;
+    }
+
     const uint i1 = gl_GlobalInvocationID.x;
     const uint i2 = gl_WorkGroupID.y * TOKENS_PER_WG + gl_LocalInvocationID.y;
     const uint i3 = gl_WorkGroupID.z;

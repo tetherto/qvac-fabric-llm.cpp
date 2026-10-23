@@ -30,7 +30,7 @@ extern "C" {
 
 void ggml_print_backtrace(void);
 
-uint64_t ggml_graph_next_uid(void);
+GGML_API uint64_t ggml_graph_next_uid(void);
 
 #ifndef MIN
 #    define MIN(a, b) ((a) < (b) ? (a) : (b))
@@ -87,6 +87,22 @@ static bool ggml_are_same_layout(const struct ggml_tensor * a, const struct ggml
     return true;
 }
 
+// GGML_OP_LSTM_CELL gate chunks along ne0 of the pre-activation tensor (PyTorch/NeMo order).
+enum ggml_lstm_gate {
+    GGML_LSTM_GATE_INPUT  = 0,
+    GGML_LSTM_GATE_FORGET = 1,
+    GGML_LSTM_GATE_CELL   = 2,
+    GGML_LSTM_GATE_OUTPUT = 3,
+    GGML_LSTM_N_GATES     = 4,
+};
+
+// GGML_OP_LSTM_CELL result chunks along ne0.
+enum ggml_lstm_out {
+    GGML_LSTM_OUT_H  = 0,
+    GGML_LSTM_OUT_C  = 1,
+    GGML_LSTM_N_OUTS = 2,
+};
+
 static bool ggml_op_is_empty(enum ggml_op op) {
     switch (op) {
         case GGML_OP_NONE:
@@ -114,6 +130,9 @@ static inline float ggml_compute_softplus_f32(float input) {
 GGML_ATTRIBUTE_FORMAT(2, 3)
 GGML_API void ggml_log_internal        (enum ggml_log_level level, const char * format, ...);
 GGML_API void ggml_log_callback_default(enum ggml_log_level level, const char * text, void * user_data);
+
+GGML_API enum ggml_log_level ggml_log_get_thread_min_level(void);
+GGML_API enum ggml_log_level ggml_log_set_thread_min_level(enum ggml_log_level level);
 
 #define GGML_LOG(...)       ggml_log_internal(GGML_LOG_LEVEL_NONE , __VA_ARGS__)
 #define GGML_LOG_INFO(...)  ggml_log_internal(GGML_LOG_LEVEL_INFO , __VA_ARGS__)

@@ -314,6 +314,7 @@ struct llama_hparams {
     uint32_t indexer_kpool_row = 3;
     // pools are consecutive cells in sequence order, not runs of consecutive positions
     bool     indexer_kpool_by_order = false;
+    bool     indexer_index_share_mtp   = false; // MTP iterations reuse one indexer selection
     // MSA
     uint32_t indexer_block_size  = 0;
     uint32_t indexer_local_blocks = 0;
@@ -423,6 +424,9 @@ struct llama_hparams {
 
     // return true if one of the layers is SWA
     bool is_swa_any() const;
+
+    // return true if every layer is SWA
+    bool is_swa_all() const;
 
     bool is_swa(uint32_t il) const;
 
