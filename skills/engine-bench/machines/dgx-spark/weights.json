@@ -1,0 +1,51 @@
+{
+    "machine": "dgx-spark",
+    "engines": {
+        "up": {
+            "name": "llama.cpp master",
+            "weights": "NVFP4 GGUF via convert_hf_to_gguf from the ModelOpt checkpoint (attention Q8_0)",
+            "draft": {
+                "mtp": "model MTP head (Q8_0 in the GGUF)",
+                "dflash2": "DFlash2 Q8_0 GGUF"
+            }
+        },
+        "fab": {
+            "name": "qvac-fabric PR stack",
+            "weights": "NVFP4 GGUF via convert_hf_to_gguf from the ModelOpt checkpoint (attention Q8_0)",
+            "draft": {
+                "mtp": "model MTP head (Q8_0 in the GGUF)",
+                "dflash2": "DFlash2 Q8_0 GGUF"
+            }
+        },
+        "fab0": {
+            "name": "qvac-fabric PR stack, deferred off",
+            "weights": "NVFP4 GGUF via convert_hf_to_gguf from the ModelOpt checkpoint (attention Q8_0)",
+            "draft": {
+                "mtp": "model MTP head (Q8_0 in the GGUF)",
+                "dflash2": "DFlash2 Q8_0 GGUF"
+            }
+        },
+        "vllm": {
+            "name": "vLLM",
+            "weights": "NVFP4 ModelOpt",
+            "draft": {
+                "mtp": "model MTP head (bf16)",
+                "dflash2": "DFlash2 bf16"
+            }
+        },
+        "sglang": {
+            "name": "SGLang",
+            "weights": "NVFP4 ModelOpt",
+            "draft": {
+                "mtp": "model MTP head (bf16)",
+                "dflash2": "DFlash2 bf16"
+            }
+        }
+    },
+    "provenance": {
+        "hf": "nvidia/Qwen3.8-27B-NVFP4 @ 482ca0f (ModelOpt mixed: NVFP4 W4A4 MLP and lm_head, FP8 attention, bf16 MTP head; 21.9 GB)",
+        "gguf": "Qwen3.8-27B-NVFP4-modelopt.gguf: llama.cpp 479a52779 convert_hf_to_gguf --outtype q8_0 from that checkpoint (same NVFP4 MLP and lm_head bits, FP8 attention dequantized to Q8_0, MTP head Q8_0; 19.8 GB)",
+        "draft_hf": "z-lab/Qwen3.8-27B-DFlash2 @ 50307d4, bf16",
+        "draft_gguf": "z-lab/Qwen3.8-27B-DFlash2-GGUF @ 2d9571f, Q8_0"
+    }
+}
