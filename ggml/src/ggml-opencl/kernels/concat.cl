@@ -126,3 +126,37 @@ kernel void kernel_concat_b4_pack(
         *y = *x;
     }
 }
+
+// dim==0 concat of 4-byte elements with one work-item per element, for rows too long for one work-group each.
+kernel void kernel_concat_b4_wide(
+    global  const char * src0,
+    ulong                offset0,
+    global  const char * src1,
+    ulong                offset1,
+    global        char * dst,
+    ulong                offsetd,
+    int             ne00,
+    int             ne0,
+    ulong           nb00,
+    ulong           nb01,
+    ulong           nb02,
+    ulong           nb10,
+    ulong           nb11,
+    ulong           nb12,
+    ulong           nb0,
+    ulong           nb1,
+    ulong           nb2
+) {
+    const int i0 = get_global_id(0);
+    if (i0 >= ne0) {
+        return;
+    }
+    const int i1 = get_global_id(1);
+    const int i2 = get_global_id(2);
+
+    global const int * x = i0 < ne00
+        ? (global const int *)(src0 + offset0 + i2*nb02 + i1*nb01 + i0*nb00)
+        : (global const int *)(src1 + offset1 + i2*nb12 + i1*nb11 + (i0 - ne00)*nb10);
+
+    *(global int *)(dst + offsetd + i2*nb2 + i1*nb1 + i0*nb0) = *x;
+}

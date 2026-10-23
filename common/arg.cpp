@@ -4343,7 +4343,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_P_MIN"));
     add_opt(common_arg(
         {"--spec-draft-vocab"}, "B:E[,B:E...]",
-        "token id ranges [B, E) a DFlash2 drafter may propose; the target still verifies over the full vocabulary\n"
+        "token id ranges [B, E) a DFlash2 or MTP drafter may propose; the target still verifies over the full vocabulary\n"
         "(default: full vocabulary)",
         [](common_params & params, const std::string & value) {
             params.speculative.draft.vocab_ranges = parse_token_ranges(value);

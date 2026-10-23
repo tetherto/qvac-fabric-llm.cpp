@@ -2719,7 +2719,7 @@ common_speculative_output_limits common_speculative_get_output_limits(
     };
 }
 
-// --spec-draft-vocab restricts a DFlash2 drafter only; it is applied before any speculative state changes, so a rejected value leaves the contexts as they were
+// --spec-draft-vocab restricts a DFlash2 or MTP drafter; it is applied before any speculative state changes, so a rejected value leaves the contexts as they were
 static void common_speculative_apply_draft_vocab(const common_params_speculative & params) {
     const auto & ranges = params.draft.vocab_ranges;
     if (ranges.empty()) {
@@ -2727,15 +2727,19 @@ static void common_speculative_apply_draft_vocab(const common_params_speculative
     }
 
     const bool has_dflash = std::find(params.types.begin(), params.types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH) != params.types.end();
-    if (!has_dflash || params.draft.ctx_dft == nullptr) {
-        throw std::runtime_error("--spec-draft-vocab needs --spec-type draft-dflash and a draft model");
+    const bool has_mtp    = std::find(params.types.begin(), params.types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP)    != params.types.end();
+    if (!(has_dflash || has_mtp) || params.draft.ctx_dft == nullptr) {
+        throw std::runtime_error("--spec-draft-vocab needs --spec-type draft-dflash with a draft model, or --spec-type draft-mtp");
     }
 
     if (ranges.size() % 2 != 0 || !llama_set_draft_vocab(params.draft.ctx_dft, ranges.data(), (int32_t) ranges.size()/2)) {
-        const llama_model * model = llama_get_model(params.draft.ctx_dft);
-        throw std::runtime_error("--spec-draft-vocab needs a DFlash2 drafter with a full-vocabulary head and non-empty, ascending, disjoint ranges within its " +
-                std::to_string(llama_vocab_n_tokens(llama_model_get_vocab(model))) + "-token vocabulary that cover at least its " +
-                std::to_string(llama_model_dflash_selector_top_k(model)) + " selector candidates");
+        const llama_model * model   = llama_get_model(params.draft.ctx_dft);
+        const std::string   n_vocab = std::to_string(llama_vocab_n_tokens(llama_model_get_vocab(model)));
+        throw std::runtime_error(has_dflash
+                ? "--spec-draft-vocab needs a DFlash2 drafter with a full-vocabulary head and non-empty, ascending, disjoint ranges within its " +
+                  n_vocab + "-token vocabulary that cover at least its " + std::to_string(llama_model_dflash_selector_top_k(model)) + " selector candidates"
+                : "--spec-draft-vocab needs a model whose MTP head supports a draft vocabulary and non-empty, ascending, disjoint ranges within its " +
+                  n_vocab + "-token vocabulary");
     }
 
     LOG_INF("%s: draft vocabulary: %zu token id ranges\n", __func__, ranges.size()/2);

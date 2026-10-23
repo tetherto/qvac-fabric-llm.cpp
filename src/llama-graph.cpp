@@ -231,6 +231,21 @@ bool llm_graph_input_out_ids::can_reuse(const llm_graph_params & params) {
     return res;
 }
 
+llm_graph_input_draft_vocab::llm_graph_input_draft_vocab(const std::vector<int32_t> & ranges, bool reusable) :
+    ids_host(llama_draft_vocab_ids(ranges)), reusable(reusable) {}
+
+void llm_graph_input_draft_vocab::set_input(const llama_ubatch * ubatch) {
+    GGML_UNUSED(ubatch);
+
+    ggml_backend_tensor_set(ids, ids_host.data(), 0, ggml_nbytes(ids));
+}
+
+bool llm_graph_input_draft_vocab::can_reuse(const llm_graph_params & params) {
+    GGML_UNUSED(params);
+
+    return reusable;
+}
+
 void llm_graph_input_mean::set_input(const llama_ubatch * ubatch) {
     if (cparams.embeddings   &&
        (cparams.pooling_type == LLAMA_POOLING_TYPE_MEAN ||
@@ -2680,6 +2695,86 @@ ggml_tensor * llm_graph_context::build_pos_bias(ggml_tensor * pos_bucket, ggml_t
     cb(pos_bias, "pos_bias", -1);
 
     return pos_bias;
+}
+
+ggml_tensor * llm_graph_context::build_inp_draft_vocab(bool reusable) const {
+    auto inp = std::make_unique<llm_graph_input_draft_vocab>(cparams.draft_vocab, reusable);
+
+    inp->ids = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, (int64_t) inp->ids_host.size());
+    ggml_set_input(inp->ids);
+
+    ggml_tensor * ids = inp->ids;
+    res->add_input(std::move(inp));
+
+    return ids;
+}
+
+// the device that holds a weight; the CPU buffer type reports none
+static ggml_backend_dev_t weight_device(const ggml_tensor * w) {
+    ggml_backend_dev_t dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(w->buffer));
+    return dev != nullptr ? dev : ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+}
+
+static constexpr size_t DRAFT_VOCAB_PROBE_TENSORS_PER_RANGE = 2; // a row view and its mat-mul
+
+bool llm_graph_draft_vocab_views_supported(ggml_tensor * head, const ggml_tensor * cur, const std::vector<int32_t> & ranges) {
+    const ggml_init_params params = {
+        /*.mem_size   =*/ ggml_tensor_overhead()*(1 + DRAFT_VOCAB_PROBE_TENSORS_PER_RANGE*ranges.size()/2),
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+    ggml_context_ptr ctx { ggml_init(params) };
+    ggml_tensor * b = ggml_new_tensor(ctx.get(), cur->type, GGML_MAX_DIMS, cur->ne);
+
+    const ggml_backend_dev_t dev = weight_device(head);
+    for (size_t r = 0; r < ranges.size(); r += 2) {
+        ggml_tensor * rows = ggml_view_2d(ctx.get(), head, head->ne[0], ranges[r + 1] - ranges[r], head->nb[1], ranges[r]*head->nb[1]);
+        if (!ggml_backend_dev_supports_op(dev, ggml_mul_mat(ctx.get(), rows, b))) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool llm_graph_context::draft_vocab_rows_viewable(const llama_model & owner, ggml_tensor * head, ggml_tensor * cur) const {
+    if (owner.has_backend_layout(head)) {
+        return false;
+    }
+    if (hadamard_rotations && hadamard_rotations->count(head) > 0) {
+        return false;
+    }
+    for (const auto & lora : *loras) {
+        if (lora.first->get_weight(head) != nullptr) {
+            return false;
+        }
+    }
+    return llm_graph_draft_vocab_views_supported(head, cur, cparams.draft_vocab);
+}
+
+ggml_tensor * llm_graph_context::build_draft_vocab_logits(ggml_tensor * head, ggml_tensor * head_s, ggml_tensor * cur) const {
+    const auto & ranges = cparams.draft_vocab;
+
+    ggml_tensor * logits = nullptr;
+    for (size_t r = 0; r < ranges.size(); r += 2) {
+        ggml_tensor * w = ggml_view_2d(ctx0, head, head->ne[0], ranges[r + 1] - ranges[r], head->nb[1], ranges[r]*head->nb[1]);
+        ggml_tensor * l = ggml_mul_mat(ctx0, w, cur);
+        logits = logits ? ggml_concat(ctx0, logits, l, 0) : l;
+    }
+    return head_s ? ggml_mul(ctx0, logits, head_s) : logits;
+}
+
+ggml_tensor * llm_graph_context::build_vocab_scatter(ggml_tensor * logits, ggml_tensor * ids, int64_t n_vocab) const {
+    const int64_t n_draft_vocab = logits->ne[0];
+    const int64_t n_rows        = logits->ne[1];
+
+    GGML_ASSERT(ids->ne[0] == n_draft_vocab);
+
+    ggml_tensor * full = ggml_fill(ctx0, ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, 1, n_vocab, n_rows), -INFINITY);
+    full = ggml_set_rows(ctx0, full,
+            ggml_reshape_3d(ctx0, logits, 1,             n_draft_vocab, n_rows),
+            ggml_reshape_3d(ctx0, ids,    n_draft_vocab, 1,             1));
+
+    return ggml_reshape_2d(ctx0, full, n_vocab, n_rows);
 }
 
 ggml_tensor * llm_graph_context::build_attn_mha(

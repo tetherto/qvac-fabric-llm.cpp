@@ -610,8 +610,7 @@ kernel void kernel_gemv_splitk_reduce_f32(
 // Multi-column kernel_gemv_noshuffle_q4_k_f32, built once per MC_N_COLS (2..8): weights load once per K-block and
 // each column runs the 1-column dequant-accumulate (bit-identical to it at the same work-group height).
 #define MC_MAX_NSG 16
-// From MC_STAGE_MIN_COLS columns on, the activations come from a local-memory slice instead of per-column broadcasts.
-#define MC_STAGE_MIN_COLS 4
+// The activations come from a per-subgroup local-memory slice instead of per-column broadcasts.
 #define MC_BLOCK_PIXELS   8 // float4 activation pixels per 32-element block
 #define Q4K_MC_LOAD_WEIGHTS(kb, a_hi, a_lo) { \
     const uint kq = (kb); \
@@ -624,21 +623,6 @@ kernel void kernel_gemv_splitk_reduce_f32(
     a_lo.s2 = read_imageui(src0_q, (gid_s + kq * BLOCK_STRIDE_A + LINE_STRIDE_A * 6)).x; \
     a_lo.s3 = read_imageui(src0_q, (gid_s + kq * BLOCK_STRIDE_A + LINE_STRIDE_A * 7)).x; }
 
-#if MC_N_COLS < MC_STAGE_MIN_COLS
-#ifdef VECTOR_SUB_GROUP_BROADCAST
-#define Q4K_MC_DEQ_HI dequantizeBlockAccum_ns_sgbroadcast_8_hi
-#define Q4K_MC_DEQ_LO dequantizeBlockAccum_ns_sgbroadcast_8_lo
-#else
-#define Q4K_MC_DEQ_HI dequantizeBlockAccum_ns_sgbroadcast_1_hi
-#define Q4K_MC_DEQ_LO dequantizeBlockAccum_ns_sgbroadcast_1_lo
-#endif
-
-#define Q4K_MC_COL(ts, c) { \
-    if (slid < 4) { regB.s0123 = read_imagef(src1, (c) * COL_STRIDE +     slid * 2 + k * 8); \
-                    regB.s4567 = read_imagef(src1, (c) * COL_STRIDE + 1 + slid * 2 + k * 8); } \
-    Q4K_MC_DEQ_HI(ts, as_ushort8(regA_hi), regS, regM, regB); \
-    Q4K_MC_DEQ_LO(ts, as_ushort8(regA_lo), regS, regM, regB); }
-#else
 // Every lane reads the staged block itself, so the lane argument is not needed.
 #define ACT_LOCAL(v, e, lane) v.e
 // The fence keeps the compiler from hoisting every column's local loads, which spilled registers at n8 on A740.
@@ -651,7 +635,6 @@ kernel void kernel_gemv_splitk_reduce_f32(
     const float8 y3 = (float8)(sp[6], sp[7]); \
     dequantizeBlockAccum_ns_fetch_hi(ts, as_ushort8(regA_hi), regS, regM, ACT_LOCAL, y0, y1); \
     dequantizeBlockAccum_ns_fetch_lo(ts, as_ushort8(regA_lo), regS, regM, ACT_LOCAL, y2, y3); }
-#endif
 
 // Sums the nsg subgroup partials of one column in subgroup order and stores its two rows.
 inline void reduce_store_col_q4k(float2 ts, uint col, local float2 * lm, uint sg, ushort slid, uint nsg,
@@ -704,23 +687,18 @@ kernel void kernel_gemv_noshuffle_q4_k_f32_mc(
 
     private uint4  regA_hi, regA_lo;
     private half2  regS, regM;
-    private float8 regB;
 
     float2 ts0 = 0.0f, ts1 = 0.0f, ts2 = 0.0f, ts3 = 0.0f;
     float2 ts4 = 0.0f, ts5 = 0.0f, ts6 = 0.0f, ts7 = 0.0f;
 
-#if MC_N_COLS >= MC_STAGE_MIN_COLS
-    // The staged path loads the next block's weight words while this block's columns run, hiding their latency.
+    // The next block's weight words load while this block's columns run, hiding their latency.
     uint4 next_hi, next_lo;
     Q4K_MC_LOAD_WEIGHTS(min(groupId, K / 32 - 1), next_hi, next_lo);
-#endif
 
     for (uint k = groupId; k < (K / 32); k += nsg) {
-#if MC_N_COLS >= MC_STAGE_MIN_COLS
         regA_hi = next_hi;
         regA_lo = next_lo;
         Q4K_MC_LOAD_WEIGHTS(min(k + nsg, K / 32 - 1), next_hi, next_lo);
-#endif
         uint sb = k / 8;
         uint j  = k % 8;
 
@@ -737,11 +715,6 @@ kernel void kernel_gemv_noshuffle_q4_k_f32_mc(
         regS = convert_half2(convert_float2(d)  * convert_float2((uchar2)(sv0, sv1)));
         regM = convert_half2(convert_float2(dm) * convert_float2((uchar2)(mn0, mn1)));
 
-#if MC_N_COLS < MC_STAGE_MIN_COLS
-        Q4K_MC_LOAD_WEIGHTS(k, regA_hi, regA_lo);
-#endif
-
-#if MC_N_COLS >= MC_STAGE_MIN_COLS
         // Stage this block's activations for every column in the subgroup's own slice. The first barrier keeps the
         // previous block's reads ahead of the overwrite, the second makes the writes visible to every lane.
         sub_group_barrier(CLK_LOCAL_MEM_FENCE);
@@ -750,7 +723,6 @@ kernel void kernel_gemv_noshuffle_q4_k_f32_mc(
                 (slid / MC_BLOCK_PIXELS) * COL_STRIDE + k * MC_BLOCK_PIXELS + slid % MC_BLOCK_PIXELS);
         }
         sub_group_barrier(CLK_LOCAL_MEM_FENCE);
-#endif
         Q4K_MC_COL(ts0, 0);
         Q4K_MC_COL(ts1, 1);
         if (MC_N_COLS > 2) Q4K_MC_COL(ts2, 2);

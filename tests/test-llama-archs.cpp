@@ -25,6 +25,7 @@
 #include <cstdio>
 #include <cstring>
 #include <cstdint>
+#include <numeric>
 #include <random>
 #include <stdexcept>
 #include <string>
@@ -78,7 +79,7 @@ static void set_tensor_data(struct ggml_tensor * tensor, void * userdata) {
 }
 
 static void usage(char ** argv) {
-    printf("Usage: %s [-a/--arch arch] [-s/--seed seed] [-o/--out dir] [-v N] [-h/--help] [--mtp-shared|--mtp-shared-cpu|--hadamard-contracts|--qsa-unified-multiseq|--glm5-kpool-sequences|--glm5-invalid-metadata|--layer-inp-pos-min|--moe-no-output-ubatches]\n", argv[0]);
+    printf("Usage: %s [-a/--arch arch] [-s/--seed seed] [-o/--out dir] [-v N] [-h/--help] [--mtp-shared|--mtp-shared-cpu|--hadamard-contracts|--qsa-unified-multiseq|--glm5-kpool-sequences|--glm5-invalid-metadata|--layer-inp-pos-min|--moe-no-output-ubatches|--mtp-draft-vocab]\n", argv[0]);
 }
 
 static std::vector<llama_token> get_tokens(const uint32_t n_tokens, const uint32_t n_vocab, const size_t seed){
@@ -1808,6 +1809,188 @@ static int test_moe_no_output_ubatches() {
     return 0;
 }
 
+// two token id ranges of the synthetic vocabulary, and the prompt the MTP draft steps follow
+static const std::vector<int32_t> MTP_DRAFT_VOCAB = { 4, 40, 96, 128 };
+static constexpr int32_t          MTP_DRAFT_VOCAB_PROMPT   = 8;
+static constexpr double           MTP_DRAFT_VOCAB_MAX_NMSE = 1e-8;
+static constexpr int64_t          DRAFT_VOCAB_PROBE_N_EMBD = 32;
+
+static bool in_token_ranges(int32_t id, const std::vector<int32_t> & ranges) {
+    for (size_t r = 0; r < ranges.size(); r += 2) {
+        if (id >= ranges[r] && id < ranges[r + 1]) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool is_weight_row_view_mat_mul(const ggml_tensor * op) {
+    const ggml_tensor * w = op->src[0] != nullptr ? op->src[0]->view_src : nullptr;
+    return op->op == GGML_OP_MUL_MAT && w != nullptr && w->buffer != nullptr &&
+           ggml_backend_buffer_get_usage(w->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS;
+}
+
+// a CPU clone with its own buffer type that declines mat-muls over row views of a weight, as a backend whose repacked
+// weight layout addresses only whole weights does
+static ggml_backend_dev_t row_view_declining_device() {
+    static ggml_backend_device      dev  = *ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+    static ggml_backend_buffer_type buft = *ggml_backend_cpu_buffer_type();
+    buft.device = &dev;
+    dev.iface.get_buffer_type = [](ggml_backend_dev_t) { return &buft; };
+    dev.iface.supports_op     = [](ggml_backend_dev_t, const ggml_tensor * op) {
+        auto * cpu = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+        return !is_weight_row_view_mat_mul(op) && cpu->iface.supports_op(cpu, op);
+    };
+    return &dev;
+}
+
+// the row-view probe of a head stored in a weight buffer of buft
+static bool draft_vocab_views_supported_in(ggml_backend_buffer_type_t buft) {
+    const ggml_init_params params = {
+        /*.mem_size   =*/ 2*ggml_tensor_overhead(),
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+    ggml_context_ptr ctx { ggml_init(params) };
+    ggml_tensor * head = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, DRAFT_VOCAB_PROBE_N_EMBD, MTP_DRAFT_VOCAB.back());
+    ggml_tensor * cur  = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, DRAFT_VOCAB_PROBE_N_EMBD, 1);
+
+    ggml_backend_buffer_ptr buf { ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft) };
+    GGML_ASSERT(buf);
+    ggml_backend_buffer_set_usage(buf.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+    return llm_graph_draft_vocab_views_supported(head, cur, MTP_DRAFT_VOCAB);
+}
+
+static llama_model_ptr mtp_draft_vocab_model() {
+    auto metadata = get_gguf_ctx(LLM_ARCH_QWEN35, false);
+    gguf_set_val_u32(metadata.get(), "qwen35.block_count", 3);
+    gguf_set_val_u32(metadata.get(), "qwen35.nextn_predict_layers", 1);
+
+    auto mp = llama_model_default_params();
+    mp.load_mtp = true;
+    size_t seed = 1234;
+    llama_model_ptr model(llama_model_init_from_user(metadata.get(), set_tensor_data, &seed, mp));
+    GGML_ASSERT(model);
+    return model;
+}
+
+// the logits of one draft step after the prompt; the step's position is removed again, so a repeat sees the same state
+static std::vector<float> mtp_draft_step_logits(common_speculative * spec, llama_context * draft, const llama_tokens & prompt) {
+    const llama_pos pos0 = (llama_pos) prompt.size();
+    llama_tokens result;
+    common_speculative_get_draft_params(spec, 0) = {
+        /* .drafting = */ true,
+        /* .n_max    = */ 1,
+        /* .pos0     = */ pos0,
+        /* .id_last  = */ MTP_DRAFT_VOCAB_PROMPT,
+        /* .prompt   = */ &prompt,
+        /* .result   = */ &result,
+    };
+    common_speculative_draft(spec);
+
+    const float * logits = llama_get_logits_ith(draft, -1);
+    GGML_ASSERT(logits != nullptr);
+    std::vector<float> step(logits, logits + llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(draft))));
+    GGML_ASSERT(llama_memory_seq_rm(llama_get_memory(draft), 0, pos0, -1));
+    return step;
+}
+
+struct mtp_draft_steps {
+    std::vector<float> first;
+    std::vector<float> second;
+    int32_t            n_reused;            // graph reuses of the draft context during the second step
+    bool               target_takes_ranges;
+};
+
+// two identical MTP draft steps after the prompt, with the draft vocabulary restricted to ranges when they are given
+static mtp_draft_steps run_mtp_draft_steps(llama_model * model, const std::vector<int32_t> & ranges) {
+    auto cp = llama_context_default_params();
+    cp.n_ctx = 128;
+    cp.n_batch = cp.n_ubatch = MTP_DRAFT_VOCAB_PROMPT;
+    cp.n_outputs_max = cp.n_outputs_max_per_seq = MTP_DRAFT_VOCAB_PROMPT;
+    cp.n_seq_max = 1;
+    cp.n_threads = cp.n_threads_batch = 2;
+    cp.no_perf = false;
+    llama_context_ptr target(llama_init_from_model(model, cp));
+    cp.ctx_type  = LLAMA_CONTEXT_TYPE_MTP;
+    cp.ctx_other = target.get();
+    llama_context_ptr draft(llama_init_from_model(model, cp));
+    GGML_ASSERT(target && draft);
+
+    common_params_speculative params;
+    params.types = { COMMON_SPECULATIVE_TYPE_DRAFT_MTP };
+    params.draft.ctx_tgt = target.get();
+    params.draft.ctx_dft = draft.get();
+    params.draft.backend_sampling = false;
+    params.draft.n_max = 1;
+    params.draft.vocab_ranges = ranges;
+    common_speculative_ptr spec(common_speculative_init(params, 1));
+    GGML_ASSERT(spec);
+
+    llama_tokens prompt(MTP_DRAFT_VOCAB_PROMPT);
+    std::iota(prompt.begin(), prompt.end(), 0);
+    llama_batch batch = llama_batch_init(MTP_DRAFT_VOCAB_PROMPT, 0, 1);
+    for (int32_t i = 0; i < MTP_DRAFT_VOCAB_PROMPT; ++i) {
+        common_batch_add(batch, prompt[i], i, { 0 }, true);
+    }
+    GGML_ASSERT(llama_decode(target.get(), batch) == 0);
+    GGML_ASSERT(common_speculative_process(spec.get(), batch));
+    common_speculative_begin(spec.get(), 0, prompt);
+    llama_batch_free(batch);
+
+    mtp_draft_steps steps;
+    steps.first = mtp_draft_step_logits(spec.get(), draft.get(), prompt);
+    const int32_t n_reused_before = llama_perf_context(draft.get()).n_reused;
+    steps.second   = mtp_draft_step_logits(spec.get(), draft.get(), prompt);
+    steps.n_reused = llama_perf_context(draft.get()).n_reused - n_reused_before;
+    steps.target_takes_ranges = llama_set_draft_vocab(target.get(), MTP_DRAFT_VOCAB.data(), (int32_t) MTP_DRAFT_VOCAB.size()/2);
+    return steps;
+}
+
+static bool all_finite(const std::vector<float> & logits) {
+    return std::all_of(logits.begin(), logits.end(), [](float x) { return std::isfinite(x); });
+}
+
+// logits inside the ranges equal the full head's, every other logit is -inf
+static bool restricted_to_draft_vocab(const std::vector<float> & restricted, const std::vector<float> & full) {
+    std::vector<float> inside_restricted;
+    std::vector<float> inside_full;
+    for (size_t id = 0; id < restricted.size(); ++id) {
+        if (!in_token_ranges((int32_t) id, MTP_DRAFT_VOCAB)) {
+            if (restricted[id] != -INFINITY) {
+                return false;
+            }
+            continue;
+        }
+        inside_restricted.push_back(restricted[id]);
+        inside_full.push_back(full[id]);
+    }
+    return all_finite(inside_restricted) && nmse(inside_full, inside_restricted) < MTP_DRAFT_VOCAB_MAX_NMSE;
+}
+
+// the MTP head computes logits over the draft vocabulary only and its graph is reused; the target context rejects the
+// ranges; the row-view probe asks the device that holds the head
+static int test_mtp_draft_vocab() {
+    // the draft's debug log prints candidate token text, which the synthetic vocabulary does not have
+    common_log_set_verbosity_thold(LOG_LEVEL_INFO);
+
+    llama_model_ptr model = mtp_draft_vocab_model();
+    const mtp_draft_steps full       = run_mtp_draft_steps(model.get(), {});
+    const mtp_draft_steps restricted = run_mtp_draft_steps(model.get(), MTP_DRAFT_VOCAB);
+
+    const bool masked = all_finite(full.first) && restricted_to_draft_vocab(restricted.first, full.first) &&
+                        restricted.second == restricted.first;
+    const bool reused = restricted.n_reused > 0;
+    const bool target = !restricted.target_takes_ranges;
+    const bool probe  = draft_vocab_views_supported_in(ggml_backend_cpu_buffer_type()) &&
+                        !draft_vocab_views_supported_in(ggml_backend_dev_buffer_type(row_view_declining_device()));
+
+    const bool ok = masked && reused && target && probe;
+    printf("MTP draft vocabulary: restricted %d, graph reused %d, target rejects %d, views follow the head's device %d: %s\n",
+            masked, reused, target, probe, ok ? "passed" : "FAIL");
+    return ok ? 0 : 1;
+}
+
 int main(int argc, char ** argv) {
     // init the logger at max verbosity. filter with a custom callback respecting the user-configure verbosity
     common_log_set_verbosity_thold(LOG_LEVEL_DEBUG);
@@ -1830,6 +2013,9 @@ int main(int argc, char ** argv) {
     }
     if (argc == 2 && strcmp(argv[1], "--moe-no-output-ubatches") == 0) {
         return test_moe_no_output_ubatches();
+    }
+    if (argc == 2 && strcmp(argv[1], "--mtp-draft-vocab") == 0) {
+        return test_mtp_draft_vocab();
     }
     std::random_device rd;
 

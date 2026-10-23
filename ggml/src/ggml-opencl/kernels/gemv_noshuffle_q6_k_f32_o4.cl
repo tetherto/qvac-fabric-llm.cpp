@@ -237,7 +237,9 @@ kernel void Q6K_O4_NAME(
     global float * dst,
     ulong offsetd,
     int ne00,
-    int ne01
+    int ne01,
+    int row0,   // first weight row of a row-range view, 0 for a whole weight
+    int ne01_w  // rows of the whole weight, which set the layout strides
 ) {
     int grp = get_local_id(1);
     int gid = get_global_id(0);              // 4-output-quad index
@@ -249,8 +251,8 @@ kernel void Q6K_O4_NAME(
     // ne01/4 apart) is slower because two distant cache-line streams have worse
     // locality than the adjacent pair whose reads interleave into the same lines
     // each iteration.
-    int gid_a = gid * 2;
-    int gid_b = gid * 2 + 1;
+    int gid_a = gid * 2 + row0 / 2;
+    int gid_b = gid_a + 1;
 
     int nb = ne00 / 32;
 
@@ -263,8 +265,8 @@ kernel void Q6K_O4_NAME(
     float2 total_sum_a = 0.0f;
     float2 total_sum_b = 0.0f;
 
-    int line_stride_a = ne01 / 2;
-    int block_stride_a = NSUBGROUPS * ne01;
+    int line_stride_a = ne01_w / 2;
+    int block_stride_a = NSUBGROUPS * ne01_w;
 
     for (int k = grp; k < nb; k += NSUBGROUPS) {
         reg_d_a = src0_d[gid_a + k/8 * line_stride_a];
@@ -283,7 +285,7 @@ kernel void Q6K_O4_NAME(
             reg_b.s4567 = read_imagef(src1, 1 + slid*2 + k*8);
         }
 
-        // Pair a (output rows gid_a*2, gid_a*2+1): read hi+lo then dequant
+        // Pair a (weight rows gid_a*2, gid_a*2+1): read hi+lo then dequant
         // both in one block so the `_lo` macro can see the `shared_y` that
         // `_hi` declared. Pair b follows in its own block — fresh shared_y.
         {

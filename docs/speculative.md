@@ -92,8 +92,8 @@ A DFlash2 drafter can propose tokens from part of the vocabulary only.
 `--spec-draft-vocab` takes ascending, disjoint `[begin, end)` token id ranges. The drafter computes its output head over those rows only, and the target still verifies over the full vocabulary, so the output is unchanged.
 Tokens outside the ranges are never drafted, which can lower acceptance for text that uses them.
 Each range adds a mat-mul and a concat to the draft graph, so a few wide ranges cost less than many narrow ones.
-The ranges have no effect when the draft output head has a LoRA adapter or a Hadamard rotation, or when the loader stores it in a repacked or split buffer type, such as `CPU_REPACK` for a quantized head on the CPU. The drafter then uses the full vocabulary.
-Invalid ranges, ranges that cover fewer tokens than the drafter's selector top-k, a speculative type other than `draft-dflash`, or a drafter that is not DFlash2 or has a reduced (d2t) vocabulary stop the speculative setup with an error.
+The ranges have no effect when the draft output head has a LoRA adapter or a Hadamard rotation, when the loader stores it in a repacked or split buffer type, such as `CPU_REPACK` for a quantized head on the CPU, or when the backend that holds the head cannot run a mat-mul over its row ranges for the tokens of a draft step. The drafter then uses the full vocabulary.
+Invalid ranges, ranges that cover fewer tokens than the drafter's selector top-k, a speculative type other than `draft-dflash` or `draft-mtp`, or a drafter that is not DFlash2 or has a reduced (d2t) vocabulary stop the speculative setup with an error.
 For the Qwen3.8 DFlash2 drafter, `0:98304,248032:248320` keeps the first 98304 tokens and the special tokens at the end of the vocabulary:
 
 ```bash
@@ -140,6 +140,21 @@ convert the same way.
 See:
 
 - #25173
+
+### MTP (`draft-mtp`)
+
+MTP drafts with the Multi Token Prediction layers of the target model, so it needs no draft model.
+
+`--spec-draft-vocab` also restricts the MTP head of Qwen3.5 models, with the range rules of DFlash2 (see above) and no minimum token count.
+The head then computes logits over the ranges only, which shortens every draft step of a model whose head is a large part of it.
+Tokens outside the ranges are never drafted, so text that uses them, such as Cyrillic with the ranges below, drafts fewer accepted tokens.
+On the OpenCL backend with an Adreno GPU, a q6_K head runs the ranges for one draft token at a time when each range starts and ends at a multiple of 128 rows; otherwise it uses the full vocabulary.
+For the 248320-token Qwen3.5 vocabulary, `0:98304,247808:248320` keeps the first 98304 tokens and the last 512, which include the special tokens:
+
+```bash
+llama-server -m Qwen3.5-2B-Q4_K_M.gguf \
+    --spec-type draft-mtp --spec-draft-n-max 3 --spec-draft-vocab 0:98304,247808:248320 --jinja
+```
 
 ### n-gram Cache (`ngram-cache`)
 
@@ -281,7 +296,7 @@ Use exactly one of these options:
                                         minimum speculative decoding probability (greedy) (default: 0.00)
                                         (env: LLAMA_ARG_SPEC_DRAFT_P_MIN)
 --spec-draft-vocab                      B:E[,B:E...]
-                                        token id ranges [B, E) a DFlash2 drafter may propose; the target still verifies over the full vocabulary
+                                        token id ranges [B, E) a DFlash2 or MTP drafter may propose; the target still verifies over the full vocabulary
                                         (default: full vocabulary)
                                         (env: LLAMA_ARG_SPEC_DRAFT_VOCAB)
 --spec-draft-ngl, -ngld, --gpu-layers-draft, --n-gpu-layers-draft  N
