@@ -12827,6 +12827,290 @@ static void ggml_compute_forward_dsv4_hc_comb_f32(
     }
 }
 
+// ggml_compute_forward_gated_delta_net_deferred
+static void ggml_compute_forward_gated_delta_net_deferred_one_chunk(
+    const ggml_compute_params * params,
+    ggml_tensor * dst,
+    int64_t ir0,
+    int64_t ir1) {
+
+    const ggml_tensor * src_q       = dst->src[0];
+    const ggml_tensor * src_k       = dst->src[1];
+    const ggml_tensor * src_v       = dst->src[2];
+    const ggml_tensor * src_g       = dst->src[3];
+    const ggml_tensor * src_beta    = dst->src[4];
+    const ggml_tensor * src_state   = dst->src[5];
+    const ggml_tensor * src_rec     = dst->src[6];
+    const ggml_tensor * src_idx     = dst->src[7];
+
+    GGML_TENSOR_LOCALS(int64_t, neq, src_q, ne);
+    GGML_TENSOR_LOCALS(size_t,  nbq, src_q, nb);
+    GGML_TENSOR_LOCALS(int64_t, nek, src_k, ne);
+    GGML_TENSOR_LOCALS(size_t,  nbk, src_k, nb);
+    GGML_TENSOR_LOCALS(int64_t, nev, src_v, ne);
+    GGML_TENSOR_LOCALS(size_t,  nbv, src_v, nb);
+    GGML_TENSOR_LOCALS(int64_t, neg, src_g, ne);
+    GGML_TENSOR_LOCALS(size_t,  nbg, src_g, nb);
+    GGML_TENSOR_LOCALS(size_t,  nbb, src_beta, nb);
+
+    const int64_t S_v      = nev0;
+    const int64_t H        = nev1;
+    const int64_t n_tokens = nev2;
+    const int64_t n_seqs   = nev3;
+    const int64_t S_k      = nek0;
+    const int64_t H_k      = nek1;
+    const int64_t G        = neg0;
+
+    const bool kda = (G == S_v);
+
+    const int64_t K = ggml_get_op_params_i32(dst, 0);
+    const int64_t R = MIN(n_tokens, K);    // rows recorded by this call
+
+    // raw gates: g = softplus(g + dt) * a, beta = sigmoid(beta)
+    const bool    gates = ggml_get_op_params_i32(dst, 1) != 0;
+    const float * dt_d  = gates ? (const float *) dst->src[8]->data : nullptr;
+    const float * a_d   = gates ? (const float *) dst->src[9]->data : nullptr;
+    const int64_t t_base = n_tokens - R;   // the new base is the state after t_base tokens
+
+    // record offsets (floats) within one record row
+    const int64_t rec_v = K * S_k * H_k;
+    const int64_t rec_g = rec_v + K * S_v * H;
+    const int64_t rec_b = rec_g + K * G * H;
+
+    float * attn_out_base = (float *) dst->data;
+    float * base_out_base = attn_out_base + S_v * H * n_tokens * n_seqs;
+
+    const int64_t per_thread = S_v + S_v * S_v;
+    float * delta = (float *) params->wdata + params->ith * per_thread + CACHE_LINE_SIZE_F32;
+    float * s     = delta + S_v;
+
+    const float scale = 1.0f / sqrtf((float) S_v);
+
+    // state is stored transposed: s[j*S_v + i] = S[i][j], so row j of s is column j of S
+    auto update = [&](const float * k_d, const float * v_d, const float * g_d, float beta_val) {
+        if (kda) {
+            for (int64_t i = 0; i < S_v; ++i) {
+                delta[i] = expf(g_d[i]);
+            }
+            for (int64_t j = 0; j < S_v; ++j) {
+                ggml_vec_mul_f32(S_v, &s[j * S_v], &s[j * S_v], delta);
+            }
+        } else {
+            ggml_vec_scale_f32(S_v * S_v, s, expf(g_d[0]));
+        }
+        for (int64_t j = 0; j < S_v; ++j) {
+            float sum = 0.0f;
+            ggml_vec_dot_f32(S_v, &sum, 0, &s[j * S_v], 0, k_d, 0, 1);
+            delta[j] = (v_d[j] - sum) * beta_val;
+        }
+        for (int64_t j = 0; j < S_v; ++j) {
+            ggml_vec_mad_f32(S_v, &s[j * S_v], k_d, delta[j]);
+        }
+    };
+
+    for (int64_t ir = ir0; ir < ir1; ++ir) {
+        const int64_t iv1 = ir % H; // head
+        const int64_t iv3 = ir / H; // sequence
+
+        const int64_t iq1 = iv1 % neq1;
+        const int64_t ik1 = iv1 % nek1;
+
+        const float * s_in = (const float *) ((const char *) src_state->data + iv3 * src_state->nb[3] + iv1 * src_state->nb[2]);
+        memcpy(s, s_in, S_v * S_v * sizeof(float));
+
+        const int32_t * idx = (const int32_t *) src_idx->data + 3 * iv3;
+
+        // bring the base up to date with the rows of the previous call that were kept
+        const float * rec_in  = (const float *) ((const char *) src_rec->data + idx[1] * src_rec->nb[1]);
+              float * rec_out = (float *)       ((char *)       src_rec->data + idx[2] * src_rec->nb[1]);
+        const int64_t pending = MAX(0, MIN((int64_t) idx[0], K));
+        for (int64_t r = 0; r < pending; ++r) {
+            update(rec_in + (r * H_k + ik1) * S_k,
+                   rec_in + rec_v + (r * H + iv1) * S_v,
+                   rec_in + rec_g + (r * H + iv1) * G,
+                   rec_in[rec_b + r * H + iv1]);
+        }
+
+        float * base_out = base_out_base + (iv3 * H + iv1) * S_v * S_v;
+        float * attn_data = attn_out_base + (iv3 * n_tokens * H + iv1) * S_v;
+
+        for (int64_t t = 0; t < n_tokens; t++) {
+            if (t == t_base) {
+                memcpy(base_out, s, S_v * S_v * sizeof(float));
+            }
+
+            const float * q_d = (const float *)((const char *)src_q->data + iv3 * nbq3 + t * nbq2 + iq1 * nbq1);
+            const float * k_d = (const float *)((const char *)src_k->data + iv3 * nbk3 + t * nbk2 + ik1 * nbk1);
+            const float * v_d = (const float *)((const char *)src_v->data + iv3 * nbv3 + t * nbv2 + iv1 * nbv1);
+
+            float         beta_val = *(const float *)((const char *)src_beta->data + iv3 * nbb3 + t * nbb2 + iv1 * nbb1);
+            const float * g_d      =  (const float *)((const char *)src_g->data    + iv3 * nbg3 + t * nbg2 + iv1 * nbg1);
+
+            float g_act;
+            if (gates) {
+                const float x = g_d[0] + dt_d[iv1];
+                g_act    = ((x > 20.0f) ? x : logf(1.0f + expf(x))) * a_d[iv1];
+                g_d      = &g_act;
+                beta_val = 1.0f / (1.0f + expf(-beta_val));
+            }
+
+            if (t >= t_base) {
+                const int64_t r = t - t_base;
+                if (iv1 < H_k) {
+                    memcpy(rec_out + (r * H_k + iv1) * S_k, k_d, S_k * sizeof(float));
+                }
+                memcpy(rec_out + rec_v + (r * H + iv1) * S_v, v_d, S_v * sizeof(float));
+                memcpy(rec_out + rec_g + (r * H + iv1) * G, g_d, G * sizeof(float));
+                rec_out[rec_b + r * H + iv1] = beta_val;
+            }
+
+            update(k_d, v_d, g_d, beta_val);
+
+            for (int64_t j = 0; j < S_v; ++j) {
+                float sum = 0.0f;
+                ggml_vec_dot_f32(S_v, &sum, 0, &s[j * S_v], 0, q_d, 0, 1);
+                attn_data[j] = sum * scale;
+            }
+
+            attn_data += S_v * H;
+        }
+    }
+}
+
+static void ggml_compute_forward_gated_delta_net_deferred_f32(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+
+    const ggml_tensor * V = dst->src[2];
+    const int64_t nr = V->ne[1] * V->ne[3];
+
+    const int nth = params->nth;
+    const int ith = params->ith;
+
+    const int64_t dr  = (nr + nth - 1) / nth;
+    const int64_t ir0 = dr * ith;
+    const int64_t ir1 = MIN(ir0 + dr, nr);
+
+    if (ir0 < ir1) {
+        ggml_compute_forward_gated_delta_net_deferred_one_chunk(params, dst, ir0, ir1);
+    }
+}
+
+void ggml_compute_forward_gated_delta_net_deferred(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    switch (dst->src[0]->type) {
+        case GGML_TYPE_F32:
+            {
+                ggml_compute_forward_gated_delta_net_deferred_f32(params, dst);
+            } break;
+        default:
+            {
+                GGML_ABORT("fatal error");
+            }
+    }
+}
+
+// ggml_compute_forward_gdn_conv_deferred
+static void ggml_compute_forward_gdn_conv_deferred_f32(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+
+    const ggml_tensor * src_x    = dst->src[0];
+    const ggml_tensor * src_w    = dst->src[1];
+    const ggml_tensor * src_hist = dst->src[2];
+    const ggml_tensor * src_idx  = dst->src[3];
+
+    const int64_t C        = src_x->ne[0];
+    const int64_t n_tokens = src_x->ne[1];
+    const int64_t n_seqs   = src_x->ne[2];
+    const int64_t d_conv   = src_w->ne[0];
+    const int64_t n_win    = d_conv - 1;
+
+    const int64_t K        = ggml_get_op_params_i32(dst, 0);
+    const int64_t n_norm   = ggml_get_op_params_i32(dst, 1);
+    const int64_t head_dim = ggml_get_op_params_i32(dst, 2);
+    const float   eps      = ggml_get_op_params_f32(dst, 3);
+
+    GGML_ASSERT(C % head_dim == 0);
+
+    const int64_t R = MIN(n_tokens, K);
+    const int64_t n_heads = C / head_dim;
+
+    // one task per (seq, head of head_dim channels): the conv is per channel and the norm per head
+    const int64_t nr  = n_seqs * n_heads;
+    const int64_t dr  = (nr + params->nth - 1) / params->nth;
+    const int64_t ir0 = dr * params->ith;
+    const int64_t ir1 = MIN(ir0 + dr, nr);
+
+    const float * w = (const float *) src_w->data;
+
+    for (int64_t ir = ir0; ir < ir1; ++ir) {
+        const int64_t is = ir / n_heads;
+        const int64_t ih = ir % n_heads;
+        const int64_t c0 = ih * head_dim;
+
+        const int32_t * idx = (const int32_t *) src_idx->data + 3 * is;
+        const int64_t pending = MAX(0, MIN((int64_t) idx[0], K));
+
+        const float * h_in  = (const float *) ((const char *) src_hist->data + idx[1] * src_hist->nb[1]);
+              float * h_out = (float *)       ((char *)       src_hist->data + idx[2] * src_hist->nb[1]);
+
+        // conv input column i of channel c: the window for i < n_win, then the new inputs
+        auto ci = [&](int64_t i, int64_t c) -> float {
+            if (i < n_win) {
+                return h_in[(pending + i) * C + c];
+            }
+            return *(const float *) ((const char *) src_x->data + (i - n_win) * src_x->nb[1] + is * src_x->nb[2] + c * sizeof(float));
+        };
+
+        for (int64_t t = 0; t < n_tokens; ++t) {
+            float * y = (float *) ((char *) dst->data + t * dst->nb[1] + is * dst->nb[2]) + c0;
+
+            for (int64_t c = 0; c < head_dim; ++c) {
+                float sum = 0.0f;
+                for (int64_t j = 0; j < d_conv; ++j) {
+                    sum += ci(t + j, c0 + c) * w[(c0 + c) * d_conv + j];
+                }
+                y[c] = sum / (1.0f + expf(-sum));
+            }
+
+            if (ih < n_norm) {
+                ggml_float sumsq = 0.0;
+                for (int64_t c = 0; c < head_dim; ++c) {
+                    sumsq += (ggml_float) (y[c] * y[c]);
+                }
+                const float scale = 1.0f / sqrtf((float) sumsq + eps);
+                for (int64_t c = 0; c < head_dim; ++c) {
+                    y[c] *= scale;
+                }
+            }
+        }
+
+        // keep the last R + n_win conv input columns
+        for (int64_t j = 0; j < R + n_win; ++j) {
+            for (int64_t c = 0; c < head_dim; ++c) {
+                h_out[j * C + c0 + c] = ci(n_tokens - R + j, c0 + c);
+            }
+        }
+    }
+}
+
+void ggml_compute_forward_gdn_conv_deferred(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    switch (dst->src[0]->type) {
+        case GGML_TYPE_F32:
+            {
+                ggml_compute_forward_gdn_conv_deferred_f32(params, dst);
+            } break;
+        default:
+            {
+                GGML_ABORT("fatal error");
+            }
+    }
+}
+
 // ggml_compute_forward_gated_delta_net_back
 
 static void ggml_compute_forward_gated_delta_net_back_f32(

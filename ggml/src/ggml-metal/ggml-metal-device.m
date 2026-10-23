@@ -2139,6 +2139,16 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
         case GGML_OP_RWKV_WKV6:
         case GGML_OP_RWKV_WKV7:
             return true;
+        case GGML_OP_GDN_CONV_DEFERRED:
+            {
+                const int64_t head_dim = ggml_get_op_params_i32(op, 2);
+                return has_simdgroup_reduction && op->src[1]->ne[0] == 4 && op->src[0]->nb[0] == sizeof(float) &&
+                    head_dim % 32 == 0 && head_dim <= 1024 && op->src[0]->ne[0] % head_dim == 0;
+            }
+        case GGML_OP_GATED_DELTA_NET_DEFERRED:
+            return has_simdgroup_reduction && op->src[2]->ne[0] % 32 == 0 && op->src[2]->ne[0] <= 128 &&
+                op->src[1]->nb[0] == sizeof(float) && op->src[0]->nb[0] == sizeof(float) &&
+                op->src[5]->nb[0] == sizeof(float) && op->src[6]->nb[1] % 16 == 0;
         case GGML_OP_GATED_DELTA_NET:
             return has_simdgroup_reduction && op->src[2]->ne[0] % 32 == 0 &&
                 op->src[0]->ne[2] == op->src[2]->ne[2] && op->src[1]->ne[2] == op->src[2]->ne[2] &&

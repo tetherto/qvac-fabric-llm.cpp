@@ -47,6 +47,7 @@ typedef enum ggml_metal_fusion_id {
     GGML_METAL_FUSION_MUL_MV_GLU,   // MUL_MAT(_ID) up + gate + GLU (swiglu), single-token decode
     GGML_METAL_FUSION_MUL_MV_ID_MUL, // MUL_MAT_ID + MUL (routing weights), mat-vec path; yields to MOE_REDUCE
     GGML_METAL_FUSION_UNARY_MUL,    // UNARY (silu/sigmoid/softplus) + MUL
+    GGML_METAL_FUSION_GDN_DEFERRED_CACHE, // GATED_DELTA_NET_DEFERRED + CPY (write the new base into the recurrent cache)
     GGML_METAL_FUSION_FWHT_SIGNED,  // MUL + MUL_MAT(hadamard) (sign vector folded into the FWHT)
     GGML_METAL_FUSION_RMS_NORM_FWHT, // RMS_NORM + MUL + MUL + MUL_MAT(hadamard) (normalized row into the signed FWHT)
     GGML_METAL_FUSION_CONT_FWHT,     // CONT + MUL + MUL_MAT(hadamard) (the signed FWHT gathers the CONT source)

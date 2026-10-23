@@ -4457,6 +4457,12 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             {"gated_delta_net_f32_d64",     "gated_delta_net_f32_d64_kda"},
             {"gated_delta_net_f32_d128",    "gated_delta_net_f32_d128_kda"},
         };
+        const char * gdn_deferred_names[][2] = {
+            {"gated_delta_net_deferred_f32_d16",  "gated_delta_net_deferred_f32_d16_kda"},
+            {"gated_delta_net_deferred_f32_d32",  "gated_delta_net_deferred_f32_d32_kda"},
+            {"gated_delta_net_deferred_f32_d64",  "gated_delta_net_deferred_f32_d64_kda"},
+            {"gated_delta_net_deferred_f32_d128", "gated_delta_net_deferred_f32_d128_kda"},
+        };
         const char * gdn_back_names[][2] = {
             {"gated_delta_net_back_f32_d32",  "gated_delta_net_back_f32_d32_kda"},
             {"gated_delta_net_back_f32_d64",  "gated_delta_net_back_f32_d64_kda"},
@@ -4525,6 +4531,19 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             const uint32_t cols_per_wg = device->subgroup_size / lanes_per_column;
             const std::array<uint32_t, 3> wg_denoms = {1u, 1u, cols_per_wg};
 
+            size_t gdn_deferred_len;
+            const void * gdn_deferred_data;
+            if (use_clustered_reduce) {
+                gdn_deferred_len  = gated_delta_net_deferred_f32_len;
+                gdn_deferred_data = (const void *)gated_delta_net_deferred_f32_data;
+            } else if (use_subgroup_reduce) {
+                gdn_deferred_len  = gated_delta_net_deferred_f32_nocluster_len;
+                gdn_deferred_data = (const void *)gated_delta_net_deferred_f32_nocluster_data;
+            } else {
+                gdn_deferred_len  = gated_delta_net_deferred_f32_shmem_len;
+                gdn_deferred_data = (const void *)gated_delta_net_deferred_f32_shmem_data;
+            }
+
             // Backward op: several subgroups per workgroup hide the serial token loop's
             // latency. Target 32, clamped so COLS_PER_STEP <= S_V and the workgroup fits the
             // device limit (all powers of two, so the result divides S_V). The shmem variant
@@ -4542,6 +4561,10 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                     gdn_names[si][kda], gdn_len, gdn_data, "main", 7, sizeof(vk_op_gated_delta_net_push_constants),
                     wg_denoms, {S_V, kda, device->subgroup_size, lanes_per_column}, 1, true, use_subgroup_ops, device->subgroup_size);
 
+                ggml_vk_create_pipeline(device, device->pipeline_gated_delta_net_deferred[si][kda],
+                    gdn_deferred_names[si][kda], gdn_deferred_len, gdn_deferred_data, "main", 11, sizeof(vk_op_gated_delta_net_deferred_push_constants),
+                    wg_denoms, {S_V, kda, device->subgroup_size, lanes_per_column}, 1, true, use_subgroup_ops, device->subgroup_size);
+
                 if (si != 0) {
                     ggml_vk_create_pipeline(device, device->pipeline_gated_delta_net_back[si-1][kda],
                         gdn_back_names[si-1][kda], gdn_back_len, gdn_back_data,
@@ -4551,6 +4574,10 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             }
         }
     }
+
+    // the conv of the deferred gated delta net commit: one workgroup per head of 128 channels
+    ggml_vk_create_pipeline(device, device->pipeline_gdn_conv_deferred_f32, "gdn_conv_deferred_f32", gdn_conv_deferred_f32_len, gdn_conv_deferred_f32_data,
+        "main", 5, sizeof(vk_op_gdn_conv_deferred_push_constants), {128, 1, 1}, {128}, 1);
 
     if (device->subgroup_arithmetic && device->subgroup_require_full_support) {
         ggml_vk_create_pipeline(device, device->pipeline_ssm_scan_f32_d128, "ssm_scan_128_f32", ssm_scan_subgroup_f32_len, ssm_scan_subgroup_f32_data, "main", 8, sizeof(vk_op_ssm_scan_push_constants), {1, 1, 1}, {128, device->subgroup_size}, 1, true, true);
@@ -11212,6 +11239,26 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
             return ctx->device->pipeline_gated_delta_net[si][kda];
         }
         return nullptr;
+    case GGML_OP_GATED_DELTA_NET_DEFERRED:
+        if (src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
+            const uint32_t S_v = dst->src[2]->ne[0];
+            const uint32_t kda = (dst->src[3]->ne[0] == (int64_t)S_v) ? 1 : 0;
+            uint32_t si;
+            switch (S_v) {
+                case 16:  si = 0; break;
+                case 32:  si = 1; break;
+                case 64:  si = 2; break;
+                case 128: si = 3; break;
+                default: return nullptr;
+            }
+            return ctx->device->pipeline_gated_delta_net_deferred[si][kda];
+        }
+        return nullptr;
+    case GGML_OP_GDN_CONV_DEFERRED:
+        if (src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 && ggml_get_op_params_i32(dst, 2) == 128) {
+            return ctx->device->pipeline_gdn_conv_deferred_f32;
+        }
+        return nullptr;
     case GGML_OP_GATED_DELTA_NET_BACK:
         if (src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
             const uint32_t S_v = dst->src[2]->ne[0];
@@ -12634,6 +12681,101 @@ void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& subctx, 
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
         {src_buf[0], src_buf[1], src_buf[2], src_buf[3], src_buf[4], src_buf[5], dst_buf},
         pc, { H, n_seqs, S_v });
+}
+
+static void ggml_vk_gated_delta_net_deferred(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
+    const ggml_tensor * q     = dst->src[0];
+    const ggml_tensor * k     = dst->src[1];
+    const ggml_tensor * v     = dst->src[2];
+    const ggml_tensor * g     = dst->src[3];
+    const ggml_tensor * beta  = dst->src[4];
+    const ggml_tensor * state = dst->src[5];
+    const ggml_tensor * rec   = dst->src[6];
+    const ggml_tensor * dt    = dst->src[8];
+
+    GGML_ASSERT(dst->buffer != nullptr);
+
+    const uint32_t S_v      = (uint32_t) v->ne[0];
+    const uint32_t H        = (uint32_t) v->ne[1];
+    const uint32_t n_tokens = (uint32_t) v->ne[2];
+    const uint32_t n_seqs   = (uint32_t) v->ne[3];
+    const uint32_t H_k      = (uint32_t) k->ne[1];
+    const uint32_t G        = (uint32_t) g->ne[0];
+    const uint32_t K        = (uint32_t) ggml_get_op_params_i32(dst, 0);
+
+    vk_pipeline pipeline = ggml_vk_op_get_pipeline(ctx, q, k, v, dst, dst->op);
+    GGML_ASSERT(pipeline != nullptr);
+
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+
+    // q, k, v, g, beta and state may be views at any offset; the rest are whole, aligned tensors
+    vk_subbuffer buf[10];
+    for (int i = 0; i < 6; i++) {
+        buf[i] = ggml_vk_tensor_subbuffer(ctx, dst->src[i], true);
+    }
+    buf[6] = ggml_vk_tensor_subbuffer(ctx, rec);
+    buf[7] = ggml_vk_tensor_subbuffer(ctx, dst->src[7]);
+    // the gate parameters are bound to the record when unused
+    buf[8] = dt ? ggml_vk_tensor_subbuffer(ctx, dt)          : buf[6];
+    buf[9] = dt ? ggml_vk_tensor_subbuffer(ctx, dst->src[9]) : buf[6];
+    vk_subbuffer dst_buf = ggml_vk_tensor_subbuffer(ctx, dst);
+
+    const auto fs  = [](size_t nb) { return (uint32_t) (nb / sizeof(float)); };
+    const auto off = [&](const ggml_tensor * t) { return get_misalign_bytes(ctx, t) / (uint32_t) sizeof(float); };
+
+    const uint32_t rec_v = K * S_v * H_k;
+    const uint32_t rec_g = rec_v + K * S_v * H;
+    const uint32_t rec_b = rec_g + K * G * H;
+
+    const vk_op_gated_delta_net_deferred_push_constants pc = {
+        H, H_k, n_tokens, K,
+        fs(q->nb[1]), fs(q->nb[2]), fs(q->nb[3]),
+        fs(v->nb[1]), fs(v->nb[2]), fs(v->nb[3]),
+        fs(g->nb[1]), fs(g->nb[2]), fs(g->nb[3]),
+        fs(beta->nb[1]), fs(beta->nb[2]), fs(beta->nb[3]),
+        fs(state->nb[1]), fs(state->nb[2]), fs(state->nb[3]),
+        fs(rec->nb[1]), rec_v, rec_g, rec_b,
+        S_v * H * n_tokens * n_seqs,
+        dt ? 1u : 0u,
+        1.0f / sqrtf((float) S_v),
+        off(q), off(k), off(v), off(g), off(beta), off(state),
+    };
+
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+        {buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7], buf[8], buf[9], dst_buf},
+        pc, { H, n_seqs, S_v });
+}
+
+static void ggml_vk_gdn_conv_deferred(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
+    const ggml_tensor * x    = dst->src[0];
+    const ggml_tensor * hist = dst->src[2];
+
+    GGML_ASSERT(dst->buffer != nullptr);
+
+    const uint32_t C        = (uint32_t) x->ne[0];
+    const uint32_t n_tokens = (uint32_t) x->ne[1];
+    const uint32_t n_seqs   = (uint32_t) x->ne[2];
+
+    vk_pipeline pipeline = ggml_vk_op_get_pipeline(ctx, x, dst->src[1], hist, dst, dst->op);
+    GGML_ASSERT(pipeline != nullptr);
+
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+
+    const auto fs = [](size_t nb) { return (uint32_t) (nb / sizeof(float)); };
+
+    const vk_op_gdn_conv_deferred_push_constants pc = {
+        C, n_tokens, (uint32_t) ggml_get_op_params_i32(dst, 0), (uint32_t) ggml_get_op_params_i32(dst, 1),
+        ggml_get_op_params_f32(dst, 3),
+        fs(x->nb[1]), fs(x->nb[2]),
+        fs(dst->nb[1]), fs(dst->nb[2]),
+        fs(hist->nb[1]),
+        get_misalign_bytes(ctx, x) / (uint32_t) sizeof(float),
+    };
+
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+        {ggml_vk_tensor_subbuffer(ctx, x, true), ggml_vk_tensor_subbuffer(ctx, dst->src[1]), ggml_vk_tensor_subbuffer(ctx, hist),
+         ggml_vk_tensor_subbuffer(ctx, dst->src[3]), ggml_vk_tensor_subbuffer(ctx, dst)},
+        pc, { C, n_tokens, n_seqs });
 }
 
 static void ggml_vk_flash_attn_ext_back(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
@@ -16008,6 +16150,14 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
 
     case GGML_OP_GATED_DELTA_NET_BACK:
         ggml_vk_gated_delta_net_back(ctx, compute_ctx, node);
+
+        break;
+    case GGML_OP_GATED_DELTA_NET_DEFERRED:
+        ggml_vk_gated_delta_net_deferred(ctx, compute_ctx, node);
+
+        break;
+    case GGML_OP_GDN_CONV_DEFERRED:
+        ggml_vk_gdn_conv_deferred(ctx, compute_ctx, node);
 
         break;
     case GGML_OP_FLASH_ATTN_EXT_BACK:
@@ -20103,6 +20253,20 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                 }
                 return true;
             }
+        case GGML_OP_GATED_DELTA_NET_DEFERRED:
+            {
+                const uint32_t S_v = op->src[2]->ne[0];
+                if (S_v != 16 && S_v != 32 && S_v != 64 && S_v != 128) {
+                    return false;
+                }
+                // q and k share strides in the shader; offsets must be whole floats
+                return ggml_are_same_stride(op->src[0], op->src[1]) && op->src[0]->nb[0] == sizeof(float) &&
+                    op->src[5]->nb[0] == sizeof(float) && op->type == GGML_TYPE_F32 &&
+                    ggml_backend_dev_supports_inplace_src(dev, op->src[6]);
+            }
+        case GGML_OP_GDN_CONV_DEFERRED:
+            return ggml_get_op_params_i32(op, 2) == 128 && op->src[1]->ne[0] == 4 && op->src[0]->nb[0] == sizeof(float) &&
+                op->src[0]->ne[0] % 128 == 0 && ggml_backend_dev_supports_inplace_src(dev, op->src[2]);
         case GGML_OP_GATED_DELTA_NET:
             {
                 const uint32_t S_v = op->src[2]->ne[0];
