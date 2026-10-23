@@ -153,8 +153,11 @@ public:
     uint32_t get_n_stream() const;
 
     // glm5-next, complete pools of kpool consecutive positions per sequence, scored as whole pools.
-    uint32_t get_n_kpool    (const llama_ubatch & ubatch) const; // Padded pool count, where the last pool is always unused.
-    uint32_t get_n_kpool_new(const llama_ubatch & ubatch) const; // Pool slots reserved for this ubatch; at least one for a stable decode graph.
+    // Each ubatch sequence group scores only its own layout, padded to the largest one, while the padded groups fit
+    // the reserved pools. Otherwise, and when shared cells make pooling uncached, the ubatch is one group.
+    uint32_t get_n_kpool       () const;                            // Padded pools per group, where the last pool is always unused.
+    uint32_t get_n_kpool_groups(const llama_ubatch & ubatch) const; // Scored groups of this ubatch.
+    uint32_t get_n_kpool_new   (const llama_ubatch & ubatch) const; // Pool slots reserved for this ubatch; at least one for a stable decode graph.
     bool get_kpool_cache_safe() const;
     void set_input_kpool(ggml_tensor * pool_cells, ggml_tensor * pool_idxs, ggml_tensor * pool_mask, ggml_tensor * tail_idxs,
                          ggml_tensor * gather_mask, bool gather, ggml_tensor * new_pool_idxs, ggml_tensor * new_pool_rep,
@@ -178,8 +181,12 @@ private:
 
     // K-pool layouts
     struct kpool_state;
-    kpool_state kpool_build_layout() const;
+    kpool_state kpool_build_layout(const llama_ubatch * ubatch) const;
+    void kpool_collect_unified_cells(kpool_state & st, const std::vector<llama_seq_id> & wanted) const;
     kpool_state kpool_build_state(const llama_ubatch & ubatch) const;
+    void kpool_set_groups(kpool_state & st, const llama_ubatch & ubatch) const;
+    bool kpool_seq_groups_fit(const kpool_state & st, const llama_ubatch & ubatch) const;
+    uint64_t kpool_reserved_pools() const;
     const kpool_state & kpool_cur() const;
 
     // unique_ptr because kpool_state is incomplete here.
