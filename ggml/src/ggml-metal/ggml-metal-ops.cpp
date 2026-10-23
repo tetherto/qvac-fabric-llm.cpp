@@ -3867,27 +3867,28 @@ static bool ggml_metal_op_flash_attn_ext_use_tensor(const ggml_tensor * op, bool
     return op->src[1]->ne[1] % OP_FLASH_ATTN_EXT_TENSOR_NCPSG == 0;
 }
 
-// returns the n_kv_max hint if the sparse path is available for this op, or 0 otherwise
-// the mask (src[3]) remains the single source of truth: finite entries are the valid KV positions,
-// n_kv_max is only an upper bound on their number per mask row, used to size the index lists
-static int ggml_metal_op_flash_attn_ext_n_kv_max_sparse(const ggml_tensor * op) {
-    assert(op->op == GGML_OP_FLASH_ATTN_EXT);
+// upper bound on the n_kv_max hint for the sparse path, larger hints use the dense kernels
+static constexpr int32_t OP_FLASH_ATTN_EXT_SPARSE_NKV_MAX = 4096;
 
+static int32_t ggml_metal_op_flash_attn_ext_n_kv_max_hint(const ggml_tensor * op) {
     int32_t n_kv_max = 0;
     memcpy(&n_kv_max, ((const int32_t *) op->op_params) + 4, sizeof(n_kv_max));
 
-    if (n_kv_max <= 0) {
-        return 0;
+    return n_kv_max;
+}
+
+// structural conditions for the sparse path: a positive hint, a mask and vec kernels for (type, dk, dv)
+// independent of the hint magnitude, so the index scratch reserved for a graph stays valid when the hint changes
+static bool ggml_metal_op_flash_attn_ext_sparse_eligible(const ggml_tensor * op) {
+    assert(op->op == GGML_OP_FLASH_ATTN_EXT);
+
+    if (ggml_metal_op_flash_attn_ext_n_kv_max_hint(op) <= 0) {
+        return false;
     }
 
     // the sparse indices are gathered from the mask
     if (!op->src[3]) {
-        return 0;
-    }
-
-    // bound the size of the index lists
-    if (n_kv_max > 4096) {
-        return 0;
+        return false;
     }
 
     // vec kernel instantiations exist for these (type, dk, dv) combinations only
@@ -3908,7 +3909,7 @@ static int ggml_metal_op_flash_attn_ext_n_kv_max_sparse(const ggml_tensor * op) 
                           (dk == 576 && dv == 512);
 
     if (!dk_dv_ok) {
-        return 0;
+        return false;
     }
 
     switch (op->src[1]->type) {
@@ -3922,10 +3923,27 @@ static int ggml_metal_op_flash_attn_ext_n_kv_max_sparse(const ggml_tensor * op) 
         case GGML_TYPE_Q8_0:
             break;
         default:
-            return 0;
+            return false;
     }
 
-    return n_kv_max;
+    return true;
+}
+
+// returns the n_kv_max used by the sparse kernels for this op, or 0 for the dense path
+// the mask (src[3]) remains the single source of truth, n_kv_max only bounds the finite entries per row;
+// the cutoff applies to the raw hint, the result is clamped to the mask width (the hint may exceed it, e.g. qwen4exp)
+static int ggml_metal_op_flash_attn_ext_n_kv_max_sparse(const ggml_tensor * op) {
+    if (!ggml_metal_op_flash_attn_ext_sparse_eligible(op)) {
+        return 0;
+    }
+
+    const int32_t n_kv_max = ggml_metal_op_flash_attn_ext_n_kv_max_hint(op);
+
+    if (n_kv_max > OP_FLASH_ATTN_EXT_SPARSE_NKV_MAX) {
+        return 0;
+    }
+
+    return std::min<int32_t>(n_kv_max, op->src[3]->ne[0]);
 }
 
 // in some models (e.g. MLA-based), V is a view of K (the first ne20 elements of each K row);
@@ -4102,18 +4120,18 @@ size_t ggml_metal_op_flash_attn_ext_extra_kv_f16(const ggml_tensor * op) {
 
 // size of the sparse index lists: one list of KV indices per mask row,
 // padded with -1 up to a multiple of OP_FLASH_ATTN_EXT_VEC_NCPSG
+// sized from the mask width and not from the hint: the hint can change between graphs of the same
+// context (e.g. llama_set_causal_attn) and the buffer reserved for the first graph has to fit the others
 size_t ggml_metal_op_flash_attn_ext_extra_idx(const ggml_tensor * op) {
     assert(op->op == GGML_OP_FLASH_ATTN_EXT);
 
-    GGML_TENSOR_LOCALS( int32_t, ne3, op->src[3], ne);
-
-    const int n_kv_max = ggml_metal_op_flash_attn_ext_n_kv_max_sparse(op);
-
-    if (n_kv_max <= 0) {
+    if (!ggml_metal_op_flash_attn_ext_sparse_eligible(op)) {
         return 0;
     }
 
-    const int n_kv_max_padded = GGML_PAD(n_kv_max, OP_FLASH_ATTN_EXT_VEC_NCPSG);
+    GGML_TENSOR_LOCALS( int32_t, ne3, op->src[3], ne);
+
+    const int n_kv_max_padded = GGML_PAD(std::min(ne30, OP_FLASH_ATTN_EXT_SPARSE_NKV_MAX), OP_FLASH_ATTN_EXT_VEC_NCPSG);
 
     return GGML_PAD(sizeof(int32_t)*(size_t) n_kv_max_padded*ne31*ne32*ne33, 16);
 }

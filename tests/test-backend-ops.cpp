@@ -16678,6 +16678,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // KV not a multiple of the compaction workgroup size.
     test_cases.emplace_back(new test_flash_attn_ext(128, 128, 1, { 8, 1}, 5003, 4, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false,  512));
 
+    // n_kv_max above the mask width (qwen4exp/glm5-next: 259 for a 256-wide selection mask) and on both
+    // sides of the Metal sparse cutoff (4096): the hint is clamped to the mask, the index scratch is not sized from it
+    test_cases.emplace_back(new test_flash_attn_ext(64, 64, 8, {8, 1},  256, 64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false,  259,  256));
+    test_cases.emplace_back(new test_flash_attn_ext(64, 64, 8, {8, 1},  256, 64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false,  515,  128));
+    test_cases.emplace_back(new test_flash_attn_ext(64, 64, 8, {8, 1}, 8192, 64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 4096, 4096));
+    test_cases.emplace_back(new test_flash_attn_ext(64, 64, 8, {8, 1}, 8192, 64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 4097, 4096));
+
     // Sparse gather: native block sizes, padded slots, and head/batch strides.
     for (ggml_type type : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16, GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1, GGML_TYPE_Q8_0, GGML_TYPE_IQ4_NL}) {
         test_cases.emplace_back(new test_flash_attn_ext(128, 96, 2, {8, 2}, 5003, 3, true, false, 0, 0, GGML_PREC_F32, type, type, {0, 1, 2, 3}, true, false, 257));
