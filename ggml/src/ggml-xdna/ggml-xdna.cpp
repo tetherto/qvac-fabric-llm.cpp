@@ -422,7 +422,7 @@ static void xdna_glue_set_n_tokens(const struct ggml_cgraph * cgraph) {
 // Lazily created CPU backend + a scratch cgraph for the host-fallback compute.
 static ggml_backend_t xdna_glue_cpu(void) {
     static ggml_backend_t cpu = []() {
-        ggml_backend_t b = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
+        ggml_backend_t b = ggml_backend_cpu_init();
         if (b == nullptr) {
             GGML_LOG_WARN("%s: glue: no CPU backend for host fallback\n", "ggml-xdna");
             return b;
