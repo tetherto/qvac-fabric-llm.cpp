@@ -29,6 +29,7 @@
 #include <string>
 #include <system_error>
 #include <thread>
+#include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -230,10 +231,25 @@ inline void update_topk_heap(std::vector<ScoreId> & heap, int k, const ScoreId &
 
 inline constexpr int kMaxThreads = 256;
 
+// A single TurboVec query over at least this many 32-vector blocks splits
+// them across threads (upstream turbovec's block-parallel threshold).
+inline constexpr size_t kTurboVecParallelMinBlocks = 1024;
+
+// One parallel_for task: ctx is the caller's functor.
+using ParallelTaskFn = void (*)(void * ctx, size_t task, size_t worker);
+
+// Runs fn(ctx, task, worker) for every task in [0, n_tasks) on the calling
+// thread (worker 0) and up to workers - 1 helpers from the process-wide
+// pool (ggml-vector-index-pool.cpp), each with its own worker id in
+// [1, workers). Helpers run under the caller's floating-point environment.
+// A call from inside a task, or after the pool shut down, runs inline.
+void parallel_run(size_t n_tasks, size_t workers, ParallelTaskFn fn, void * ctx);
+
 // Runs fn(task, worker) for every task in [0, n_tasks) on up to n_threads
 // threads, the calling thread included; worker is in [0, workers). Tasks
 // are handed out dynamically, so fn must not depend on which worker runs a
-// task. Rethrows the first exception a task threw.
+// task. Rethrows the first exception a task threw. One thread keeps every
+// task on the calling thread without touching the pool.
 template <typename Fn>
 void parallel_for(size_t n_tasks, int n_threads, Fn && fn) {
     const size_t workers = std::min(n_tasks, static_cast<size_t>(std::max(1, n_threads)));
@@ -243,38 +259,12 @@ void parallel_for(size_t n_tasks, int n_threads, Fn && fn) {
         }
         return;
     }
-    std::atomic<size_t> next{ 0 };
-    std::mutex error_mutex;
-    std::exception_ptr error;
-    auto run = [&](size_t worker) {
-        try {
-            for (size_t task = next.fetch_add(1); task < n_tasks; task = next.fetch_add(1)) {
-                fn(task, worker);
-            }
-        } catch (...) {
-            std::lock_guard<std::mutex> lock(error_mutex);
-            if (!error) {
-                error = std::current_exception();
-            }
-            next.store(n_tasks);
-        }
-    };
-    std::vector<std::thread> threads;
-    threads.reserve(workers - 1);
-    try {
-        for (size_t worker = 1; worker < workers; ++worker) {
-            threads.emplace_back(run, worker);
-        }
-    } catch (...) {
-        // Fewer threads than asked: the ones started and this one finish.
-    }
-    run(0);
-    for (std::thread & thread : threads) {
-        thread.join();
-    }
-    if (error) {
-        std::rethrow_exception(error);
-    }
+    using Functor = std::remove_reference_t<Fn>;
+    parallel_run(
+        n_tasks,
+        workers,
+        [](void * ctx, size_t task, size_t worker) { (*static_cast<Functor *>(ctx))(task, worker); },
+        const_cast<void *>(static_cast<const void *>(std::addressof(fn))));
 }
 
 // How a staged search weighs the sign plane and estimates a level from its
@@ -513,7 +503,8 @@ inline void test_record_delta_read_size(size_t) {}
 bool is_supported_bit_width(int bit_width);
 bool is_valid_id(uint64_t id);
 bool all_finite(const float * values, size_t n);
-bool all_finite_abs_less_than(const float * values, size_t n, float max_abs);
+// n_threads splits the check; the answer does not depend on it.
+bool all_finite_abs_less_than(const float * values, size_t n, float max_abs, int n_threads = 1);
 uint32_t float_to_u32(float value);
 float u32_to_float(uint32_t value);
 void put_u32_le(uint8_t * dst, uint32_t v);
@@ -602,6 +593,11 @@ int turbovec_avx2_lut_block_matches_scalar_for_test(int bits, int dim);
 void turbovec_reset_block_score_call_count_for_test(void);
 int64_t turbovec_block_score_call_count_for_test(void);
 void turbovec_hadamard_rotate_for_test(const float * src, float * dst, int dim);
+int turbovec_rotation_kernel_parity_for_test(int kernel);
+int turbovec_encode_kernel_parity_for_test(int kernel);
+int turbovec_layout_kernel_parity_for_test(int kernel);
+int vector_validation_kernel_parity_for_test(int kernel);
+int crc32c_kernel_parity_for_test(int kernel);
 int turbovec_sync_plan_for_test(
     ggml_vec_index_t * idx,
     const char * path,
@@ -609,6 +605,9 @@ int turbovec_sync_plan_for_test(
 void turbovec_force_vector_major_for_test(int mode);
 void turbovec_disable_dot_product_for_test(int disabled);
 void turbovec_force_planes_for_test(int mode, size_t min_vectors);
+size_t parallel_pool_threads_for_test(void);
+void state_hash_for_test(const ggml_vec_index_t * idx, uint64_t * sums);
+int parallel_pool_selftest_for_test(int n_threads);
 int turbovec_index_hashes_for_test(
     const ggml_vec_index_t * idx,
     uint64_t * codes_hash,
@@ -623,6 +622,18 @@ bool turbovec_cpu_vector_major();
 // The CPU's own dot-product support, which a test override cannot change:
 // gates the SDOT instructions themselves.
 bool turbovec_cpu_dot_product();
+// Runtime CPU features gating the rotation, encode, layout and checksum
+// kernels, as upstream turbovec gates them with is_x86_feature_detected!.
+struct VecIndexCpuFeatures {
+    bool ssse3 = false;
+    bool sse42 = false;
+    // AVX2 with FMA: the AVX2 object is compiled with both.
+    bool avx2 = false;
+    // AVX-512 F, only together with AVX2.
+    bool avx512f = false;
+    bool arm_crc32 = false;
+};
+const VecIndexCpuFeatures & vec_index_cpu_features();
 
 // One query quantized for the 4-bit permute-dot score (upstream
 // `QueryPermuteDot`): sum_d weight[d] * level[code[d]] in int32, then
@@ -684,6 +695,9 @@ struct TurboVecStagedOpts {
     // Set to whether upstream's sampled seed would have left this query's
     // shortlist short; false when upstream does not seed.
     bool * seed_short = nullptr;
+    // Threads the one query may split its blocks over (a batch already
+    // splits across queries and passes 1). The results do not depend on it.
+    int n_threads = 1;
 };
 bool turbovec_staged_search(
     const ggml_vec_index & idx,
@@ -874,6 +888,12 @@ size_t turbovec_block_scratch_bytes(const ggml_vec_index & idx);
 void turbovec_block_rows_packed(const ggml_vec_index & idx, size_t block, uint8_t * packed, uint8_t * scratch);
 // Writes one row's sequential codes into its blocked-cache lane.
 void turbovec_blocked_set_row_seq(ggml_vec_index & idx, size_t slot, const uint8_t * seq);
+// Whole 32-row blocks in the sequential-blocked layout (byte g of lane l at
+// g * 32 + l: the v7/v8 unit codes), read from or written to the blocked
+// cache in its in-memory layout (upstream pack.rs `native_to_seq` /
+// `seq_into_native`). The block must lie inside the cache.
+void turbovec_block_seq(const ggml_vec_index & idx, size_t block, uint8_t * seq_blocked);
+void turbovec_blocked_set_block_seq(ggml_vec_index & idx, size_t block, const uint8_t * seq_blocked);
 // Writes n_new packed rows into the blocked cache from first_slot on.
 void turbovec_blocked_append(ggml_vec_index & idx, const uint8_t * packed, size_t first_slot, size_t n_new);
 // The sign planes of rows [first_slot, n_vectors) into the sign blocked
@@ -885,8 +905,10 @@ void repack_turbovec_sign_codes(
     int bits,
     int dim,
     size_t first_slot,
-    std::vector<uint8_t> & sign_blocked);
+    std::vector<uint8_t> & sign_blocked,
+    int n_threads = 1);
 void turbovec_sign_blocked_swap_remove(ggml_vec_index & idx, size_t slot, size_t last);
+// Blocks are independent, so n_threads does not change the bytes.
 void repack_turbovec_codes(
     const uint8_t * packed_codes,
     size_t n_vectors,
@@ -894,7 +916,8 @@ void repack_turbovec_codes(
     int dim,
     std::vector<uint8_t> & blocked_codes,
     size_t & n_blocks,
-    bool vector_major = false);
+    bool vector_major = false,
+    int n_threads = 1);
 void repack_turbovec_codes_from_slot(
     const uint8_t * packed_codes,
     size_t n_vectors,
@@ -903,7 +926,8 @@ void repack_turbovec_codes_from_slot(
     size_t first_slot,
     std::vector<uint8_t> & blocked_codes,
     size_t & n_blocks,
-    bool vector_major = false);
+    bool vector_major = false,
+    int n_threads = 1);
 void score_turbovec_lut_block(
     const uint8_t * lut,
     float lut_scale,
@@ -948,6 +972,10 @@ uint32_t index_state_crc32c_after_remove(const ggml_vec_index & idx, uint64_t id
 // reading it back from the blocked cache).
 uint64_t slot_state_hash(const ggml_vec_index & idx, size_t slot, const uint8_t * turbovec_row = nullptr);
 void add_state_hash(ggml_vec_index & idx, uint64_t hash);
+// Adds the hashes of the active slots [first, last) over idx.n_threads;
+// `rows`, when given, holds their packed TurboVec rows. The hash sums are
+// commutative, so the result does not depend on the split.
+void add_state_hash_range(ggml_vec_index & idx, size_t first, size_t last, const uint8_t * rows);
 void remove_state_hash(ggml_vec_index & idx, uint64_t hash);
 void rebuild_state_hash(ggml_vec_index & idx);
 uint32_t index_state_token(const ggml_vec_index & idx);

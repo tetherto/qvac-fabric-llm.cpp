@@ -14,10 +14,17 @@
 #include <arm_neon.h>
 #endif
 
+#if defined(GGML_VEC_INDEX_HAVE_AVX2_KERNEL) || defined(GGML_VEC_INDEX_HAVE_AVX512_KERNEL) || \
+    defined(GGML_VEC_INDEX_HAVE_SSE42_KERNEL)
+#include "ggml-vector-index-x86.h"
+#endif
+
 namespace {
 
 constexpr int kTurboVecDimMultiple = 8;
 constexpr int kTurboVecScoreBlock = 32;
+// 32-row blocks per parallel task of the cache repacks.
+constexpr size_t kTurboVecBlocksPerTask = 64;
 #if GGML_VEC_INDEX_USE_NEON
 constexpr int kTurboVecFlushEvery = 256;
 #endif
@@ -566,9 +573,41 @@ static std::shared_ptr<const TurboVecHadamardRotation> turbovec_hadamard_rotatio
     return rotation;
 }
 
+// SIMD kernel family a rotation or encode helper runs with. Upstream
+// turbovec 1.1.2 has NEON, AVX2 and AVX-512 forms of these kernels and
+// documents each as bit-identical to its scalar reference; the parity test
+// hooks below hold every form this host can run to that.
+enum class TurboVecSimd { scalar, neon, avx2, avx512 };
+
+// The widest kernel family this host runs, picked once (upstream's
+// is_x86_feature_detected! dispatch: AVX-512 F, then AVX2; NEON is baseline
+// on aarch64). Kernels without an AVX-512 form use their AVX2 one.
+static TurboVecSimd turbovec_host_simd() {
+#if GGML_VEC_INDEX_USE_NEON
+    return TurboVecSimd::neon;
+#else
+    static const TurboVecSimd simd = [] {
+        const VecIndexCpuFeatures & features = vec_index_cpu_features();
+#if defined(GGML_VEC_INDEX_HAVE_AVX512_KERNEL)
+        if (features.avx512f) {
+            return TurboVecSimd::avx512;
+        }
+#endif
+#if defined(GGML_VEC_INDEX_HAVE_AVX2_KERNEL)
+        if (features.avx2) {
+            return TurboVecSimd::avx2;
+        }
+#endif
+        (void) features;
+        return TurboVecSimd::scalar;
+    }();
+    return simd;
+#endif
+}
+
 // Unnormalized in-place Walsh-Hadamard butterfly on one block, then the
 // orthonormal 1/sqrt(block) scale (upstream `wht_block_scalar`).
-static void turbovec_wht_block(float * blk, int block, float inv_sqrt_block) {
+static void turbovec_wht_block_scalar(float * blk, int block, float inv_sqrt_block) {
     for (int len = 1; len < block; len <<= 1) {
         for (int i = 0; i < block; i += 2 * len) {
             for (int j = i; j < i + len; ++j) {
@@ -584,9 +623,170 @@ static void turbovec_wht_block(float * blk, int block, float inv_sqrt_block) {
     }
 }
 
+#if GGML_VEC_INDEX_USE_NEON
+// Upstream rotation.rs aarch64 `wht_block`: stages len = 1 and 2 fused in
+// registers, then radix-8 passes (three stages each), a radix-4 pass if two
+// stages remain and a radix-2 pass if one does. Butterflies within a stage
+// touch disjoint elements, and every output is the same (a +- b) expression
+// tree with the same f32 roundings as the scalar ladder, so the result is
+// bit-identical to turbovec_wht_block_scalar.
+static void turbovec_wht_block_neon(float * p, int block, float inv_sqrt_block) {
+    for (int j = 0; j < block; j += 8) {
+        // len = 1: adjacent pairs.
+        const float32x4x2_t ab = vld2q_f32(p + j);
+        const float32x4_t s1 = vaddq_f32(ab.val[0], ab.val[1]);  // [s0 s1 s2 s3]
+        const float32x4_t d1 = vsubq_f32(ab.val[0], ab.val[1]);  // [d0 d1 d2 d3]
+        // len = 2 pairs (s0, d0) with (s1, d1) and (s2, d2) with (s3, d3).
+        const float32x4_t s_even = vtrn1q_f32(s1, d1);  // [s0 d0 s2 d2]
+        const float32x4_t s_odd = vtrn2q_f32(s1, d1);   // [s1 d1 s3 d3]
+        const float32x4_t sum2 = vaddq_f32(s_even, s_odd);
+        const float32x4_t dif2 = vsubq_f32(s_even, s_odd);
+        vst1q_f32(p + j, vcombine_f32(vget_low_f32(sum2), vget_low_f32(dif2)));
+        vst1q_f32(p + j + 4, vcombine_f32(vget_high_f32(sum2), vget_high_f32(dif2)));
+    }
+
+    int len = 4;
+    for (; 4 * len < block; len <<= 3) {
+        for (int i = 0; i < block; i += 8 * len) {
+            for (int j = i; j < i + len; j += 4) {
+                const float32x4_t a = vld1q_f32(p + j);
+                const float32x4_t b = vld1q_f32(p + j + len);
+                const float32x4_t c = vld1q_f32(p + j + 2 * len);
+                const float32x4_t d = vld1q_f32(p + j + 3 * len);
+                const float32x4_t e = vld1q_f32(p + j + 4 * len);
+                const float32x4_t f = vld1q_f32(p + j + 5 * len);
+                const float32x4_t g = vld1q_f32(p + j + 6 * len);
+                const float32x4_t h = vld1q_f32(p + j + 7 * len);
+                const float32x4_t apb = vaddq_f32(a, b);
+                const float32x4_t amb = vsubq_f32(a, b);
+                const float32x4_t cpd = vaddq_f32(c, d);
+                const float32x4_t cmd = vsubq_f32(c, d);
+                const float32x4_t epf = vaddq_f32(e, f);
+                const float32x4_t emf = vsubq_f32(e, f);
+                const float32x4_t gph = vaddq_f32(g, h);
+                const float32x4_t gmh = vsubq_f32(g, h);
+                const float32x4_t s0 = vaddq_f32(apb, cpd);
+                const float32x4_t s1 = vaddq_f32(amb, cmd);
+                const float32x4_t s2 = vsubq_f32(apb, cpd);
+                const float32x4_t s3 = vsubq_f32(amb, cmd);
+                const float32x4_t s4 = vaddq_f32(epf, gph);
+                const float32x4_t s5 = vaddq_f32(emf, gmh);
+                const float32x4_t s6 = vsubq_f32(epf, gph);
+                const float32x4_t s7 = vsubq_f32(emf, gmh);
+                vst1q_f32(p + j, vaddq_f32(s0, s4));
+                vst1q_f32(p + j + len, vaddq_f32(s1, s5));
+                vst1q_f32(p + j + 2 * len, vaddq_f32(s2, s6));
+                vst1q_f32(p + j + 3 * len, vaddq_f32(s3, s7));
+                vst1q_f32(p + j + 4 * len, vsubq_f32(s0, s4));
+                vst1q_f32(p + j + 5 * len, vsubq_f32(s1, s5));
+                vst1q_f32(p + j + 6 * len, vsubq_f32(s2, s6));
+                vst1q_f32(p + j + 7 * len, vsubq_f32(s3, s7));
+            }
+        }
+    }
+    if (2 * len < block) {
+        for (int i = 0; i < block; i += 4 * len) {
+            for (int j = i; j < i + len; j += 4) {
+                const float32x4_t a = vld1q_f32(p + j);
+                const float32x4_t b = vld1q_f32(p + j + len);
+                const float32x4_t c = vld1q_f32(p + j + 2 * len);
+                const float32x4_t d = vld1q_f32(p + j + 3 * len);
+                const float32x4_t apb = vaddq_f32(a, b);
+                const float32x4_t amb = vsubq_f32(a, b);
+                const float32x4_t cpd = vaddq_f32(c, d);
+                const float32x4_t cmd = vsubq_f32(c, d);
+                vst1q_f32(p + j, vaddq_f32(apb, cpd));
+                vst1q_f32(p + j + len, vaddq_f32(amb, cmd));
+                vst1q_f32(p + j + 2 * len, vsubq_f32(apb, cpd));
+                vst1q_f32(p + j + 3 * len, vsubq_f32(amb, cmd));
+            }
+        }
+        len <<= 2;
+    }
+    if (len < block) {
+        for (int i = 0; i < block; i += 2 * len) {
+            for (int j = i; j < i + len; j += 4) {
+                const float32x4_t a = vld1q_f32(p + j);
+                const float32x4_t b = vld1q_f32(p + j + len);
+                vst1q_f32(p + j, vaddq_f32(a, b));
+                vst1q_f32(p + j + len, vsubq_f32(a, b));
+            }
+        }
+    }
+
+    const float32x4_t sv = vdupq_n_f32(inv_sqrt_block);
+    for (int j = 0; j < block; j += 4) {
+        vst1q_f32(p + j, vmulq_f32(vld1q_f32(p + j), sv));
+    }
+}
+#endif
+
+static void turbovec_wht_block_with(TurboVecSimd simd, float * blk, int block, float inv_sqrt_block) {
+    switch (simd) {
+#if GGML_VEC_INDEX_USE_NEON
+        case TurboVecSimd::neon:
+            turbovec_wht_block_neon(blk, block, inv_sqrt_block);
+            return;
+#endif
+#if defined(GGML_VEC_INDEX_HAVE_AVX512_KERNEL)
+        case TurboVecSimd::avx512:
+            ggml_vec_index_detail::turbovec_wht_block_avx512(blk, block, inv_sqrt_block);
+            return;
+#endif
+#if defined(GGML_VEC_INDEX_HAVE_AVX2_KERNEL)
+        case TurboVecSimd::avx2:
+            ggml_vec_index_detail::turbovec_wht_block_avx2(blk, block, inv_sqrt_block);
+            return;
+#endif
+        default:
+            break;
+    }
+    turbovec_wht_block_scalar(blk, block, inv_sqrt_block);
+}
+
+// One permutation round (upstream rotation.rs `permute_gather`):
+// dst[i] = src[perm[i]], times signs[i] when mode is 1, and times inv and
+// then signs[i] when mode is 2. The x86 forms replace the per-element index
+// and value loads with a hardware gather; the multiplies are the same IEEE
+// operations in the same order, so the output is bit-identical.
+static void turbovec_permute_gather_scalar(
+        int mode, const float * src, const uint32_t * perm, const float * signs, float inv, float * dst, size_t n) {
+    for (size_t i = 0; i < n; ++i) {
+        const float v = src[perm[i]];
+        dst[i] = mode == 0 ? v : (mode == 1 ? v * signs[i] : (v * inv) * signs[i]);
+    }
+}
+
+static void turbovec_permute_gather_with(
+        TurboVecSimd simd,
+        int mode,
+        const float * src,
+        const uint32_t * perm,
+        const float * signs,
+        float inv,
+        float * dst,
+        size_t n) {
+    switch (simd) {
+#if defined(GGML_VEC_INDEX_HAVE_AVX512_KERNEL)
+        case TurboVecSimd::avx512:
+            ggml_vec_index_detail::turbovec_permute_gather_avx512(mode, src, perm, signs, inv, dst, n);
+            return;
+#endif
+#if defined(GGML_VEC_INDEX_HAVE_AVX2_KERNEL)
+        case TurboVecSimd::avx2:
+            ggml_vec_index_detail::turbovec_permute_gather_avx2(mode, src, perm, signs, inv, dst, n);
+            return;
+#endif
+        default:
+            break;
+    }
+    turbovec_permute_gather_scalar(mode, src, perm, signs, inv, dst, n);
+}
+
 // Rotate src scaled by inv into dst (upstream `apply_scaled_into`; with
 // inv == 1 it is `apply`, since x * 1.0f is exact). scratch holds dim floats.
-static void apply_turbovec_hadamard(
+static void apply_turbovec_hadamard_with(
+        TurboVecSimd simd,
         const TurboVecHadamardRotation & rotation,
         const float * src,
         float inv,
@@ -595,27 +795,32 @@ static void apply_turbovec_hadamard(
     static_assert(kTurboVecHadamardRounds == 2, "the buffer schedule is written for two rounds");
     const int dim = rotation.dim;
     const int block = rotation.block;
-    const uint32_t * perm0 = rotation.perms[0].data();
-    const float * signs0 = rotation.signs[0].data();
-    for (int i = 0; i < dim; ++i) {
-        scratch[i] = (src[perm0[i]] * inv) * signs0[i];
-    }
+    const size_t dim_sz = static_cast<size_t>(dim);
+    turbovec_permute_gather_with(
+        simd, 2, src, rotation.perms[0].data(), rotation.signs[0].data(), inv, scratch, dim_sz);
     for (int offset = 0; offset < dim; offset += block) {
-        turbovec_wht_block(scratch + offset, block, rotation.inv_sqrt_block);
+        turbovec_wht_block_with(simd, scratch + offset, block, rotation.inv_sqrt_block);
     }
-    const uint32_t * perm1 = rotation.perms[1].data();
-    const float * signs1 = rotation.signs[1].data();
-    for (int i = 0; i < dim; ++i) {
-        dst[i] = scratch[perm1[i]] * signs1[i];
-    }
+    turbovec_permute_gather_with(
+        simd, 1, scratch, rotation.perms[1].data(), rotation.signs[1].data(), 1.0f, dst, dim_sz);
     for (int offset = 0; offset < dim; offset += block) {
-        turbovec_wht_block(dst + offset, block, rotation.inv_sqrt_block);
+        turbovec_wht_block_with(simd, dst + offset, block, rotation.inv_sqrt_block);
     }
+}
+
+static void apply_turbovec_hadamard(
+        const TurboVecHadamardRotation & rotation,
+        const float * src,
+        float inv,
+        float * dst,
+        float * scratch) {
+    apply_turbovec_hadamard_with(turbovec_host_simd(), rotation, src, inv, dst, scratch);
 }
 
 // Inverse of apply_turbovec_hadamard with inv == 1. The normalized
 // Walsh-Hadamard block is its own inverse, so each round is undone in reverse.
-static void apply_turbovec_hadamard_inverse(
+static void apply_turbovec_hadamard_inverse_with(
+        TurboVecSimd simd,
         const TurboVecHadamardRotation & rotation,
         const float * src,
         float * dst,
@@ -625,7 +830,7 @@ static void apply_turbovec_hadamard_inverse(
     std::memcpy(scratch, src, static_cast<size_t>(dim) * sizeof(float));
     for (int round = kTurboVecHadamardRounds - 1; round >= 0; --round) {
         for (int offset = 0; offset < dim; offset += block) {
-            turbovec_wht_block(scratch + offset, block, rotation.inv_sqrt_block);
+            turbovec_wht_block_with(simd, scratch + offset, block, rotation.inv_sqrt_block);
         }
         const uint32_t * perm = rotation.perms[static_cast<size_t>(round)].data();
         const float * signs = rotation.signs[static_cast<size_t>(round)].data();
@@ -638,17 +843,71 @@ static void apply_turbovec_hadamard_inverse(
     }
 }
 
-// L2 norm with upstream's eight fixed accumulation chains (encode.rs
-// `simd_norm`): chain j % 8, combined pairwise, then one f32 sqrt.
-static float turbovec_hadamard_norm(const float * row, int dim) {
+static void apply_turbovec_hadamard_inverse(
+        const TurboVecHadamardRotation & rotation,
+        const float * src,
+        float * dst,
+        float * scratch) {
+    apply_turbovec_hadamard_inverse_with(turbovec_host_simd(), rotation, src, dst, scratch);
+}
+
+// Squared L2 norm with upstream's eight fixed accumulation chains (encode.rs
+// `norm_sq_scalar`): chain j % 8, combined pairwise.
+static float turbovec_norm_sq_scalar(const float * row, int dim) {
     float chains[kTurboVecNormChains] = {};
     for (int j = 0; j < dim; ++j) {
         chains[j % kTurboVecNormChains] += row[j] * row[j];
     }
-    const float sum =
-        ((chains[0] + chains[1]) + (chains[2] + chains[3])) +
+    return ((chains[0] + chains[1]) + (chains[2] + chains[3])) +
         ((chains[4] + chains[5]) + (chains[6] + chains[7]));
-    return std::sqrt(sum);
+}
+
+#if GGML_VEC_INDEX_USE_NEON
+// Upstream encode.rs `norm_sq_neon`: the eight chains are two float32x4
+// accumulators, multiplied and added as separate instructions (never a
+// fused multiply-add), so each term rounds twice as in the scalar chains.
+static float turbovec_norm_sq_neon(const float * row, int dim) {
+    float32x4_t acc_lo = vdupq_n_f32(0.0f);
+    float32x4_t acc_hi = vdupq_n_f32(0.0f);
+    int i = 0;
+    for (; i + kTurboVecNormChains <= dim; i += kTurboVecNormChains) {
+        const float32x4_t lo = vld1q_f32(row + i);
+        const float32x4_t hi = vld1q_f32(row + i + 4);
+        acc_lo = vaddq_f32(acc_lo, vmulq_f32(lo, lo));
+        acc_hi = vaddq_f32(acc_hi, vmulq_f32(hi, hi));
+    }
+    float chains[kTurboVecNormChains];
+    vst1q_f32(chains, acc_lo);
+    vst1q_f32(chains + 4, acc_hi);
+    for (; i < dim; ++i) {
+        chains[i % kTurboVecNormChains] += row[i] * row[i];
+    }
+    return ((chains[0] + chains[1]) + (chains[2] + chains[3])) +
+        ((chains[4] + chains[5]) + (chains[6] + chains[7]));
+}
+#endif
+
+static float turbovec_norm_sq_with(TurboVecSimd simd, const float * row, int dim) {
+    switch (simd) {
+#if GGML_VEC_INDEX_USE_NEON
+        case TurboVecSimd::neon:
+            return turbovec_norm_sq_neon(row, dim);
+#endif
+#if defined(GGML_VEC_INDEX_HAVE_AVX2_KERNEL)
+        case TurboVecSimd::avx2:
+        case TurboVecSimd::avx512:
+            return ggml_vec_index_detail::turbovec_norm_sq_avx(row, dim);
+#endif
+        default:
+            break;
+    }
+    return turbovec_norm_sq_scalar(row, dim);
+}
+
+// L2 norm (upstream encode.rs `simd_norm`): the fixed-chain squared norm,
+// then one correctly rounded f32 sqrt.
+static float turbovec_hadamard_norm(const float * row, int dim) {
+    return std::sqrt(turbovec_norm_sq_with(turbovec_host_simd(), row, dim));
 }
 
 static double vector_norm(const float * values, int dim) {
@@ -1500,6 +1759,141 @@ void turbovec_hadamard_rotate_for_test(const float * src, float * dst, int dim) 
     apply_turbovec_hadamard(*rotation, src, 1.0f, dst, scratch.data());
 }
 
+// The SIMD family a parity hook checks (0: NEON, 1: AVX2, 2: AVX-512), or
+// false when this build or CPU cannot run it.
+static bool turbovec_simd_for_test(int kernel, TurboVecSimd & simd) {
+    const VecIndexCpuFeatures & features = vec_index_cpu_features();
+    (void) features;
+    switch (kernel) {
+#if GGML_VEC_INDEX_USE_NEON
+        case 0:
+            simd = TurboVecSimd::neon;
+            return true;
+#endif
+#if defined(GGML_VEC_INDEX_HAVE_AVX2_KERNEL)
+        case 1:
+            simd = TurboVecSimd::avx2;
+            return features.avx2;
+#endif
+#if defined(GGML_VEC_INDEX_HAVE_AVX512_KERNEL)
+        case 2:
+            simd = TurboVecSimd::avx512;
+            return features.avx512f;
+#endif
+        default:
+            return false;
+    }
+}
+
+static bool turbovec_same_bits_for_test(const float * a, const float * b, size_t n) {
+    return std::memcmp(a, b, n * sizeof(float)) == 0;
+}
+
+// Deterministic pseudo-random values in [-0.5, 0.5) (upstream's xorshift).
+struct TurboVecTestRng {
+    uint64_t state;
+    uint64_t next() {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        return state;
+    }
+    float uniform() {
+        return static_cast<float>(static_cast<double>(next() >> 11) / 9007199254740992.0) - 0.5f;
+    }
+};
+
+// 1 when the rotation kernels of `kernel` (Walsh-Hadamard butterfly at every
+// block size up to 16384, permutation gather in every multiply mode, the
+// fixed-chain norm, and whole forward and inverse rotations) reproduce the
+// scalar ones bit for bit; 0 on a mismatch; -1 when unavailable.
+int turbovec_rotation_kernel_parity_for_test(int kernel) {
+    TurboVecSimd simd = TurboVecSimd::scalar;
+    if (!turbovec_simd_for_test(kernel, simd)) {
+        return -1;
+    }
+    const ScopedNearestRounding rounding_guard;
+    TurboVecTestRng rng{ UINT64_C(0x9e3779b97f4a7c15) };
+    for (int block = 8; block <= 16384; block *= 2) {
+        const float inv = 1.0f / std::sqrt(static_cast<float>(block));
+        std::vector<float> expect(static_cast<size_t>(block));
+        for (float & v : expect) {
+            v = rng.uniform();
+        }
+        std::vector<float> got = expect;
+        turbovec_wht_block_scalar(expect.data(), block, inv);
+        turbovec_wht_block_with(simd, got.data(), block, inv);
+        if (!turbovec_same_bits_for_test(got.data(), expect.data(), got.size())) {
+            return 0;
+        }
+    }
+    // Lengths below and between the 8 and 16 lane widths reach every tail.
+    for (size_t n : { size_t{ 8 }, size_t{ 12 }, size_t{ 13 }, size_t{ 16 }, size_t{ 24 }, size_t{ 29 },
+                      size_t{ 64 }, size_t{ 200 }, size_t{ 1536 } }) {
+        std::vector<float> src(n);
+        std::vector<float> signs(n);
+        std::vector<uint32_t> perm(n);
+        for (size_t i = 0; i < n; ++i) {
+            src[i] = rng.uniform();
+            signs[i] = (rng.next() & 1) != 0 ? -1.0f : 1.0f;
+            perm[i] = static_cast<uint32_t>(i);
+        }
+        for (size_t i = n - 1; i >= 1; --i) {
+            std::swap(perm[i], perm[static_cast<size_t>(rng.next() % (i + 1))]);
+        }
+        for (int mode = 0; mode <= 2; ++mode) {
+            std::vector<float> expect(n);
+            std::vector<float> got(n, std::numeric_limits<float>::quiet_NaN());
+            turbovec_permute_gather_scalar(mode, src.data(), perm.data(), signs.data(), 0.8125f, expect.data(), n);
+            turbovec_permute_gather_with(simd, mode, src.data(), perm.data(), signs.data(), 0.8125f, got.data(), n);
+            if (!turbovec_same_bits_for_test(got.data(), expect.data(), n)) {
+                return 0;
+            }
+        }
+    }
+    for (int n = 0; n <= 3072; n = n < 40 ? n + 1 : n * 2) {
+        std::vector<float> row(static_cast<size_t>(n));
+        for (float & v : row) {
+            v = rng.uniform() * 3.0f;
+        }
+        const float expect = turbovec_norm_sq_scalar(row.data(), n);
+        const float got = turbovec_norm_sq_with(simd, row.data(), n);
+        if (std::memcmp(&expect, &got, sizeof(float)) != 0) {
+            return 0;
+        }
+    }
+    for (int dim : { 8, 24, 64, 128, 200, 768, 1000, 1024, 1536, 3072 }) {
+        const std::shared_ptr<const TurboVecHadamardRotation> rotation = turbovec_hadamard_rotation(dim);
+        const size_t dim_sz = static_cast<size_t>(dim);
+        std::vector<float> src(dim_sz);
+        for (float & v : src) {
+            v = rng.uniform();
+        }
+        const float norm = std::sqrt(turbovec_norm_sq_scalar(src.data(), dim));
+        std::vector<float> expect(dim_sz);
+        std::vector<float> got(dim_sz);
+        std::vector<float> scratch(dim_sz);
+        // 0 is the scale encode uses for a zero-norm row: it is the input
+        // that would expose a signed-zero difference.
+        for (float inv : { 1.0f, 1.0f / norm, 0.0f, 0.8125f, -1.0f }) {
+            std::fill(scratch.begin(), scratch.end(), std::numeric_limits<float>::quiet_NaN());
+            apply_turbovec_hadamard_with(TurboVecSimd::scalar, *rotation, src.data(), inv, expect.data(), scratch.data());
+            std::fill(scratch.begin(), scratch.end(), std::numeric_limits<float>::quiet_NaN());
+            std::fill(got.begin(), got.end(), std::numeric_limits<float>::quiet_NaN());
+            apply_turbovec_hadamard_with(simd, *rotation, src.data(), inv, got.data(), scratch.data());
+            if (!turbovec_same_bits_for_test(got.data(), expect.data(), dim_sz)) {
+                return 0;
+            }
+        }
+        apply_turbovec_hadamard_inverse_with(TurboVecSimd::scalar, *rotation, src.data(), expect.data(), scratch.data());
+        apply_turbovec_hadamard_inverse_with(simd, *rotation, src.data(), got.data(), scratch.data());
+        if (!turbovec_same_bits_for_test(got.data(), expect.data(), dim_sz)) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
 static uint64_t turbovec_fnv1a_for_test(uint64_t hash, const void * data, size_t size) {
     const auto * bytes = static_cast<const uint8_t *>(data);
     for (size_t i = 0; i < size; ++i) {
@@ -1628,6 +2022,27 @@ static void repack_turbovec_code_block(
         }
     }
     write_blocked_block(seq.data(), n_byte_groups, blocked_codes.data() + block_offset, vector_major);
+}
+
+// Blocks [first_block, end_block); each writes only its own bytes.
+static void repack_turbovec_code_blocks(
+        const uint8_t * packed_codes,
+        size_t n_vectors,
+        int bits,
+        int dim,
+        size_t first_block,
+        size_t end_block,
+        std::vector<uint8_t> & blocked_codes,
+        bool vector_major,
+        int n_threads) {
+    const size_t n_repack = end_block > first_block ? end_block - first_block : 0;
+    parallel_for((n_repack + kTurboVecBlocksPerTask - 1) / kTurboVecBlocksPerTask, n_threads, [&](size_t task, size_t) {
+        const size_t begin = first_block + task * kTurboVecBlocksPerTask;
+        const size_t end = std::min(end_block, begin + kTurboVecBlocksPerTask);
+        for (size_t block = begin; block < end; ++block) {
+            repack_turbovec_code_block(packed_codes, n_vectors, bits, dim, block, blocked_codes, vector_major);
+        }
+    });
 }
 
 // Writes one block of 32 sequential rows (lane-major, n_byte_groups bytes
@@ -2035,10 +2450,15 @@ void turbovec_rows_packed(const ggml_vec_index & idx, std::vector<uint8_t> & pac
     const size_t n = idx.slot_to_id.size();
     const size_t lane_size = static_cast<size_t>(kTurboVecScoreBlock);
     packed.resize(n * row_bytes);
-    std::vector<uint8_t> scratch(turbovec_rows_in_blocked(idx) ? turbovec_block_scratch_bytes(idx) : 0);
-    for (size_t block = 0; block * lane_size < n; ++block) {
-        turbovec_block_rows_packed(idx, block, packed.data() + block * lane_size * row_bytes, scratch.data());
-    }
+    const size_t n_blocks = (n + lane_size - 1) / lane_size;
+    // Each block writes its own rows.
+    parallel_for((n_blocks + kTurboVecBlocksPerTask - 1) / kTurboVecBlocksPerTask, idx.n_threads, [&](size_t task, size_t) {
+        std::vector<uint8_t> scratch(turbovec_rows_in_blocked(idx) ? turbovec_block_scratch_bytes(idx) : 0);
+        const size_t end = std::min(n_blocks, (task + 1) * kTurboVecBlocksPerTask);
+        for (size_t block = task * kTurboVecBlocksPerTask; block < end; ++block) {
+            turbovec_block_rows_packed(idx, block, packed.data() + block * lane_size * row_bytes, scratch.data());
+        }
+    });
 }
 
 void turbovec_blocked_set_row_seq(ggml_vec_index & idx, size_t slot, const uint8_t * seq) {
@@ -2049,6 +2469,204 @@ void turbovec_blocked_set_row_seq(ggml_vec_index & idx, size_t slot, const uint8
         set_block_lane_byte(block, g, slot % lane_size, idx.turbovec_blocked_vm, seq[g]);
     }
 }
+
+// Upstream pack.rs x86 perm0 nibble interleave of 32-byte groups of
+// sequential lane bytes, in place (the scalar arm of `interleave_chunk_x86`),
+// and its inverse (`deinterleave_x86_code_byte` per lane).
+[[maybe_unused]] static void turbovec_interleave_scalar(uint8_t * buf, size_t len) {
+    static constexpr size_t perm0[16] = { 0, 8, 1, 9, 2, 10, 3, 11, 4, 12, 5, 13, 6, 14, 7, 15 };
+    const size_t lane_size = static_cast<size_t>(kTurboVecScoreBlock);
+    uint8_t tmp[kTurboVecScoreBlock];
+    for (size_t at = 0; at + lane_size <= len; at += lane_size) {
+        uint8_t * group = buf + at;
+        std::memcpy(tmp, group, lane_size);
+        for (size_t j = 0; j < 16; ++j) {
+            const uint8_t ba = tmp[perm0[j]];
+            const uint8_t bb = tmp[perm0[j] + 16];
+            group[j] = static_cast<uint8_t>((ba >> 4) | (bb & 0xf0));
+            group[16 + j] = static_cast<uint8_t>((ba & 0x0f) | ((bb & 0x0f) << 4));
+        }
+    }
+}
+
+[[maybe_unused]] static void turbovec_deinterleave_scalar(const uint8_t * blocked, uint8_t * out, size_t len) {
+    static constexpr size_t inv_perm0[16] = { 0, 2, 4, 6, 8, 10, 12, 14, 1, 3, 5, 7, 9, 11, 13, 15 };
+    const size_t lane_size = static_cast<size_t>(kTurboVecScoreBlock);
+    for (size_t at = 0; at + lane_size <= len; at += lane_size) {
+        for (size_t lane = 0; lane < lane_size; ++lane) {
+            const size_t j = inv_perm0[lane & 15];
+            const uint8_t hi_plane = blocked[at + j];
+            const uint8_t lo_plane = blocked[at + 16 + j];
+            const int shift = lane < 16 ? 0 : 4;
+            out[at + lane] = static_cast<uint8_t>(
+                (((hi_plane >> shift) & 0x0f) << 4) | ((lo_plane >> shift) & 0x0f));
+        }
+    }
+}
+
+#if defined(__x86_64__) || defined(_M_X64)
+// Upstream `interleave_chunk_x86` / `deinterleave_chunk_x86` dispatch: AVX2,
+// then SSSE3, then the scalar loop.
+static void turbovec_interleave_native(uint8_t * buf, size_t len) {
+#if defined(GGML_VEC_INDEX_HAVE_AVX2_KERNEL)
+    if (vec_index_cpu_features().avx2) {
+        ggml_vec_index_detail::turbovec_interleave_avx2(buf, len);
+        return;
+    }
+#endif
+#if defined(GGML_VEC_INDEX_HAVE_SSE42_KERNEL)
+    if (vec_index_cpu_features().ssse3) {
+        ggml_vec_index_detail::turbovec_interleave_ssse3(buf, len);
+        return;
+    }
+#endif
+    turbovec_interleave_scalar(buf, len);
+}
+
+static void turbovec_deinterleave_native(const uint8_t * blocked, uint8_t * out, size_t len) {
+#if defined(GGML_VEC_INDEX_HAVE_SSE42_KERNEL)
+    if (vec_index_cpu_features().ssse3) {
+        ggml_vec_index_detail::turbovec_deinterleave_ssse3(blocked, out, len);
+        return;
+    }
+#endif
+    turbovec_deinterleave_scalar(blocked, out, len);
+}
+#endif
+
+void turbovec_block_seq(const ggml_vec_index & idx, size_t block, uint8_t * seq_blocked) {
+    const size_t n_byte_groups = static_cast<size_t>(idx.dim) / static_cast<size_t>(8 / idx.turbovec_bits);
+    const size_t lane_size = static_cast<size_t>(kTurboVecScoreBlock);
+    const size_t block_bytes = n_byte_groups * lane_size;
+    const uint8_t * src = idx.turbovec_blocked_data.data() + block * block_bytes;
+    if (idx.turbovec_blocked_vm) {
+        for (size_t g = 0; g < n_byte_groups; ++g) {
+            for (size_t lane = 0; lane < lane_size; ++lane) {
+                seq_blocked[g * lane_size + lane] = src[vector_major_offset(g, lane)];
+            }
+        }
+        return;
+    }
+#if defined(__x86_64__) || defined(_M_X64)
+    turbovec_deinterleave_native(src, seq_blocked, block_bytes);
+#else
+    std::memcpy(seq_blocked, src, block_bytes);
+#endif
+}
+
+void turbovec_blocked_set_block_seq(ggml_vec_index & idx, size_t block, const uint8_t * seq_blocked) {
+    const size_t n_byte_groups = static_cast<size_t>(idx.dim) / static_cast<size_t>(8 / idx.turbovec_bits);
+    const size_t lane_size = static_cast<size_t>(kTurboVecScoreBlock);
+    const size_t block_bytes = n_byte_groups * lane_size;
+    uint8_t * dst = idx.turbovec_blocked_data.data() + block * block_bytes;
+    if (idx.turbovec_blocked_vm) {
+        for (size_t g = 0; g < n_byte_groups; ++g) {
+            for (size_t lane = 0; lane < lane_size; ++lane) {
+                dst[vector_major_offset(g, lane)] = seq_blocked[g * lane_size + lane];
+            }
+        }
+        return;
+    }
+    std::memcpy(dst, seq_blocked, block_bytes);
+#if defined(__x86_64__) || defined(_M_X64)
+    turbovec_interleave_native(dst, block_bytes);
+#endif
+}
+
+#ifdef GGML_VEC_INDEX_TEST_HOOKS
+// Kernel 0: SSSE3 interleave and deinterleave; 1: AVX2 interleave, each
+// against the scalar loops; 2: the whole-block helpers in both blocked
+// layouts against the per-lane accessors (every host). 1 on a match, 0 on a
+// mismatch, -1 when this build or CPU lacks the kernel.
+int turbovec_layout_kernel_parity_for_test(int kernel) {
+    const size_t lane_size = static_cast<size_t>(kTurboVecScoreBlock);
+    // An odd group count covers the AVX2 kernel's single-group tail.
+    constexpr size_t n_groups = 101;
+    std::vector<uint8_t> src(n_groups * lane_size);
+    uint32_t state = 0x9e3779b9u;
+    for (uint8_t & b : src) {
+        state = state * 1664525u + 1013904223u;
+        b = static_cast<uint8_t>(state >> 24);
+    }
+    if (kernel == 0 || kernel == 1) {
+        void (*interleave)(uint8_t *, size_t) = nullptr;
+        void (*deinterleave)(const uint8_t *, uint8_t *, size_t) = nullptr;
+#if (defined(__x86_64__) || defined(_M_X64)) && defined(GGML_VEC_INDEX_HAVE_SSE42_KERNEL)
+        if (kernel == 0 && vec_index_cpu_features().ssse3) {
+            interleave = ggml_vec_index_detail::turbovec_interleave_ssse3;
+            deinterleave = ggml_vec_index_detail::turbovec_deinterleave_ssse3;
+        }
+#endif
+#if (defined(__x86_64__) || defined(_M_X64)) && defined(GGML_VEC_INDEX_HAVE_AVX2_KERNEL)
+        if (kernel == 1 && vec_index_cpu_features().avx2) {
+            interleave = ggml_vec_index_detail::turbovec_interleave_avx2;
+        }
+#endif
+        if (interleave == nullptr) {
+            return -1;
+        }
+        std::vector<uint8_t> expect = src;
+        turbovec_interleave_scalar(expect.data(), expect.size());
+        for (size_t groups : { n_groups, size_t{ 1 }, size_t{ 2 }, size_t{ 0 } }) {
+            std::vector<uint8_t> got(src.begin(), src.begin() + static_cast<std::ptrdiff_t>(groups * lane_size));
+            interleave(got.data(), got.size());
+            if (!std::equal(got.begin(), got.end(), expect.begin())) {
+                return 0;
+            }
+        }
+        if (expect == src) {
+            return 0;
+        }
+        std::vector<uint8_t> back(src.size());
+        turbovec_deinterleave_scalar(expect.data(), back.data(), back.size());
+        if (back != src) {
+            return 0;
+        }
+        if (deinterleave != nullptr) {
+            std::fill(back.begin(), back.end(), 0);
+            deinterleave(expect.data(), back.data(), back.size());
+            if (back != src) {
+                return 0;
+            }
+        }
+        return 1;
+    }
+    if (kernel != 2) {
+        return -1;
+    }
+    // dim 192 at 2 bits: 48 byte groups, a multiple of the vector-major unit.
+    constexpr int dim = 192;
+    ggml_vec_index_t * idx = ggml_vec_index_create_turbovec_q2(dim);
+    if (idx == nullptr) {
+        return 0;
+    }
+    const size_t n_byte_groups = static_cast<size_t>(dim) / 4;
+    const size_t block_bytes = n_byte_groups * lane_size;
+    bool ok = true;
+    for (bool vm : { false, true }) {
+        idx->turbovec_blocked_vm = vm;
+        idx->turbovec_blocked_data.assign(2 * block_bytes, 0);
+        const uint8_t * seq = src.data();
+        turbovec_blocked_set_block_seq(*idx, 1, seq);
+        const uint8_t * block = idx->turbovec_blocked_data.data() + block_bytes;
+        for (size_t g = 0; g < n_byte_groups && ok; ++g) {
+            for (size_t lane = 0; lane < lane_size; ++lane) {
+                ok = ok && block_lane_byte(block, g, lane, vm) == seq[g * lane_size + lane];
+            }
+        }
+        ok = ok && std::all_of(
+            idx->turbovec_blocked_data.begin(),
+            idx->turbovec_blocked_data.begin() + static_cast<std::ptrdiff_t>(block_bytes),
+            [](uint8_t b) { return b == 0; });
+        std::vector<uint8_t> back(block_bytes);
+        turbovec_block_seq(*idx, 1, back.data());
+        ok = ok && std::equal(back.begin(), back.end(), seq);
+    }
+    idx->turbovec_blocked_data.clear();
+    ggml_vec_index_free(idx);
+    return ok ? 1 : 0;
+}
+#endif
 
 void turbovec_blocked_append(ggml_vec_index & idx, const uint8_t * packed, size_t first_slot, size_t n_new) {
     // New rows land lane by lane: lanes already in the partial tail block
@@ -2064,15 +2682,21 @@ void turbovec_blocked_append(ggml_vec_index & idx, const uint8_t * packed, size_
     reserve_mostly_exact(blocked, n_blocks * block_bytes > blocked.size() ? n_blocks * block_bytes - blocked.size() : 0);
     blocked.resize(n_blocks * block_bytes, 0);
     idx.turbovec_blocked_n_blocks = n_blocks;
-    uint8_t seq[kTurboVecMaxDim / 2];
-    for (size_t i = 0; i < n_new; ++i) {
-        const size_t slot = first_slot + i;
-        packed_row_to_seq_fast(packed + i * row_bytes, bits, idx.dim, seq);
-        uint8_t * block = blocked.data() + (slot / lane_size) * block_bytes;
-        for (size_t g = 0; g < n_byte_groups; ++g) {
-            set_block_lane_byte(block, g, slot % lane_size, idx.turbovec_blocked_vm, seq[g]);
+    // A task covers whole blocks, as lanes of one block can share bytes.
+    const size_t first_block = first_slot / lane_size;
+    const size_t n_tasks = (n_blocks - first_block + kTurboVecBlocksPerTask - 1) / kTurboVecBlocksPerTask;
+    parallel_for(n_new == 0 ? 0 : n_tasks, idx.n_threads, [&](size_t task, size_t) {
+        uint8_t seq[kTurboVecMaxDim / 2];
+        const size_t begin = std::max(first_slot, (first_block + task * kTurboVecBlocksPerTask) * lane_size);
+        const size_t end = std::min(n_total, (first_block + (task + 1) * kTurboVecBlocksPerTask) * lane_size);
+        for (size_t slot = begin; slot < end; ++slot) {
+            packed_row_to_seq_fast(packed + (slot - first_slot) * row_bytes, bits, idx.dim, seq);
+            uint8_t * block = blocked.data() + (slot / lane_size) * block_bytes;
+            for (size_t g = 0; g < n_byte_groups; ++g) {
+                set_block_lane_byte(block, g, slot % lane_size, idx.turbovec_blocked_vm, seq[g]);
+            }
         }
-    }
+    });
 }
 
 void turbovec_blocked_truncate(ggml_vec_index & idx, size_t n) {
@@ -2136,7 +2760,8 @@ void repack_turbovec_sign_codes(
         int bits,
         int dim,
         size_t first_slot,
-        std::vector<uint8_t> & sign_blocked) {
+        std::vector<uint8_t> & sign_blocked,
+        int n_threads) {
     // The sign plane of a bit-plane row is its top plane: one byte per
     // eight coordinates, scanned as an index with dim / 8 byte groups.
     const size_t n_sign_groups = static_cast<size_t>(dim) / 8;
@@ -2149,17 +2774,22 @@ void repack_turbovec_sign_codes(
     reserve_mostly_exact(sign_blocked, n_blocks * block_bytes > sign_blocked.size() ?
         n_blocks * block_bytes - sign_blocked.size() : 0);
     sign_blocked.resize(n_blocks * block_bytes, 0);
-    std::vector<uint8_t> seq(lane_size * n_sign_groups);
-    for (size_t block = first_block; block < n_blocks; ++block) {
-        std::fill(seq.begin(), seq.end(), 0);
-        for (size_t lane = 0; lane < lane_size; ++lane) {
-            const size_t vector = block * lane_size + lane;
-            if (vector < n_vectors) {
-                std::memcpy(seq.data() + lane * n_sign_groups, packed_codes + vector * row_bytes + sign_at, n_sign_groups);
+    const size_t n_repack = n_blocks > first_block ? n_blocks - first_block : 0;
+    parallel_for((n_repack + kTurboVecBlocksPerTask - 1) / kTurboVecBlocksPerTask, n_threads, [&](size_t task, size_t) {
+        std::vector<uint8_t> seq(lane_size * n_sign_groups);
+        const size_t begin = first_block + task * kTurboVecBlocksPerTask;
+        const size_t end = std::min(n_blocks, begin + kTurboVecBlocksPerTask);
+        for (size_t block = begin; block < end; ++block) {
+            std::fill(seq.begin(), seq.end(), 0);
+            for (size_t lane = 0; lane < lane_size; ++lane) {
+                const size_t vector = block * lane_size + lane;
+                if (vector < n_vectors) {
+                    std::memcpy(seq.data() + lane * n_sign_groups, packed_codes + vector * row_bytes + sign_at, n_sign_groups);
+                }
             }
+            write_blocked_block(seq.data(), n_sign_groups, sign_blocked.data() + block * block_bytes, false);
         }
-        write_blocked_block(seq.data(), n_sign_groups, sign_blocked.data() + block * block_bytes, false);
-    }
+    });
 }
 
 void turbovec_sign_blocked_swap_remove(ggml_vec_index & idx, size_t slot, size_t last) {
@@ -2189,7 +2819,8 @@ void repack_turbovec_codes(
         int dim,
         std::vector<uint8_t> & blocked_codes,
         size_t & n_blocks,
-        bool vector_major) {
+        bool vector_major,
+        int n_threads) {
     const size_t dim_sz = static_cast<size_t>(dim);
     const size_t codes_per_byte = static_cast<size_t>(8 / bits);
     const size_t n_byte_groups = dim_sz / codes_per_byte;
@@ -2200,10 +2831,7 @@ void repack_turbovec_codes(
         new_blocks * n_byte_groups * static_cast<size_t>(kTurboVecScoreBlock),
         0);
     n_blocks = new_blocks;
-
-    for (size_t block = 0; block < n_blocks; ++block) {
-        repack_turbovec_code_block(packed_codes, n_vectors, bits, dim, block, blocked_codes, vector_major);
-    }
+    repack_turbovec_code_blocks(packed_codes, n_vectors, bits, dim, 0, n_blocks, blocked_codes, vector_major, n_threads);
 }
 
 void repack_turbovec_codes_from_slot(
@@ -2214,7 +2842,8 @@ void repack_turbovec_codes_from_slot(
         size_t first_slot,
         std::vector<uint8_t> & blocked_codes,
         size_t & n_blocks,
-        bool vector_major) {
+        bool vector_major,
+        int n_threads) {
     const size_t dim_sz = static_cast<size_t>(dim);
     const size_t codes_per_byte = static_cast<size_t>(8 / bits);
     const size_t n_byte_groups = dim_sz / codes_per_byte;
@@ -2226,7 +2855,7 @@ void repack_turbovec_codes_from_slot(
         old_blocks * n_byte_groups * static_cast<size_t>(kTurboVecScoreBlock);
     if (first_slot == 0 || first_slot > n_vectors || n_blocks != old_blocks ||
         blocked_codes.size() != old_expected_size) {
-        repack_turbovec_codes(packed_codes, n_vectors, bits, dim, blocked_codes, n_blocks, vector_major);
+        repack_turbovec_codes(packed_codes, n_vectors, bits, dim, blocked_codes, n_blocks, vector_major, n_threads);
         return;
     }
 
@@ -2238,9 +2867,8 @@ void repack_turbovec_codes_from_slot(
     blocked_codes.resize(
         n_blocks * n_byte_groups * static_cast<size_t>(kTurboVecScoreBlock),
         0);
-    for (size_t block = first_block; block < n_blocks; ++block) {
-        repack_turbovec_code_block(packed_codes, n_vectors, bits, dim, block, blocked_codes, vector_major);
-    }
+    repack_turbovec_code_blocks(
+        packed_codes, n_vectors, bits, dim, first_block, n_blocks, blocked_codes, vector_major, n_threads);
 }
 
 void score_turbovec_lut_block(
@@ -2707,23 +3335,21 @@ float dot_turbovec_bits_lut_row(
     return dot_turbovec_lut_row(lut, lut_scale, lut_bias, codes, scales, bits, dim);
 }
 
-// Quantize already-rotated unit rows under (shift, scale_tq) and pack one
-// bit-plane row each, returning the per-vector correction scale (upstream
-// encode.rs `fused_quantize_scale_pack_scalar` + `scale_from_inner`).
-static float quantize_turbovec_hadamard_row(
+// Quantize one already-rotated unit row under (shift, scale_tq) and pack one
+// bit-plane row, returning the reconstruction inner product <u_rot, x_hat>
+// in original space (upstream encode.rs `fused_quantize_scale_pack_scalar`).
+static double quantize_turbovec_hadamard_row_scalar(
         const float * rotated,
-        float norm,
         const float * shift,
         const float * scale_tq,
         const float * inv_scale_tq,
-        const TurboVecCodebook & codebook,
+        const float * boundaries,
+        const float * centroids,
         int bits,
         int dim,
         uint8_t * packed_row) {
     const size_t bytes_per_plane = static_cast<size_t>(dim) / 8;
     const int n_boundaries = (1 << bits) - 1;
-    const float * boundaries = codebook.boundaries.data();
-    const float * centroids = codebook.centroids.data();
     double chains[4] = {};
     for (int chunk = 0; chunk < dim / 8; ++chunk) {
         uint8_t codes[8];
@@ -2750,10 +3376,230 @@ static float quantize_turbovec_hadamard_row(
             packed_row[static_cast<size_t>(plane) * bytes_per_plane + static_cast<size_t>(chunk)] = byte;
         }
     }
-    const double inner = (chains[0] + chains[1]) + (chains[2] + chains[3]);
+    return (chains[0] + chains[1]) + (chains[2] + chains[3]);
+}
+
+#if GGML_VEC_INDEX_USE_NEON
+// Upstream encode.rs aarch64 `fused_quantize_scale_pack` with the
+// reconstruction computed inline (its `None` arm): calibration and boundary
+// counts eight lanes at a time, the reconstruction terms in the scalar
+// chains' order (term j joins chain j % 4 through two float64x2
+// accumulators) and the bit planes gathered with a weighted horizontal add.
+// Packed bytes and the inner product are bit-identical to the scalar kernel.
+template <int BITS>
+static double quantize_turbovec_hadamard_row_neon(
+        const float * rotated,
+        const float * shift,
+        const float * scale_tq,
+        const float * inv_scale_tq,
+        const float * boundaries,
+        const float * centroids,
+        int dim,
+        uint8_t * packed_row) {
+    const size_t bytes_per_plane = static_cast<size_t>(dim) / 8;
+    float64x2_t acc_a = vdupq_n_f64(0.0);
+    float64x2_t acc_b = vdupq_n_f64(0.0);
+    static const uint8_t kWeights[8] = { 128, 64, 32, 16, 8, 4, 2, 1 };
+    const uint8x8_t weights = vld1_u8(kWeights);
+    for (int chunk = 0; chunk < dim / 8; ++chunk) {
+        const int offset = chunk * 8;
+        const float32x4_t vals_lo = vmulq_f32(
+            vaddq_f32(vld1q_f32(rotated + offset), vld1q_f32(shift + offset)), vld1q_f32(scale_tq + offset));
+        const float32x4_t vals_hi = vmulq_f32(
+            vaddq_f32(vld1q_f32(rotated + offset + 4), vld1q_f32(shift + offset + 4)),
+            vld1q_f32(scale_tq + offset + 4));
+        uint32x4_t acc_lo = vdupq_n_u32(0);
+        uint32x4_t acc_hi = vdupq_n_u32(0);
+        if (BITS == 4) {
+            // Two-level scan: one compare against the median boundary picks
+            // the 7-boundary half to count; x > b[7] implies x exceeds all of
+            // b[0..7], so the count equals the flat scan's.
+            const float32x4_t mid = vdupq_n_f32(boundaries[7]);
+            const uint32x4_t m_lo = vcgtq_f32(vals_lo, mid);
+            const uint32x4_t m_hi = vcgtq_f32(vals_hi, mid);
+            acc_lo = vshlq_n_u32(vshrq_n_u32(m_lo, 31), 3);
+            acc_hi = vshlq_n_u32(vshrq_n_u32(m_hi, 31), 3);
+            for (int k = 0; k < 7; ++k) {
+                const float32x4_t b_low = vdupq_n_f32(boundaries[k]);
+                const float32x4_t b_high = vdupq_n_f32(boundaries[8 + k]);
+                const float32x4_t bv_lo = vbslq_f32(m_lo, b_high, b_low);
+                const float32x4_t bv_hi = vbslq_f32(m_hi, b_high, b_low);
+                acc_lo = vaddq_u32(acc_lo, vshrq_n_u32(vcgtq_f32(vals_lo, bv_lo), 31));
+                acc_hi = vaddq_u32(acc_hi, vshrq_n_u32(vcgtq_f32(vals_hi, bv_hi), 31));
+            }
+        } else {
+            for (int b = 0; b < (1 << BITS) - 1; ++b) {
+                const float32x4_t bv = vdupq_n_f32(boundaries[b]);
+                acc_lo = vaddq_u32(acc_lo, vshrq_n_u32(vcgtq_f32(vals_lo, bv), 31));
+                acc_hi = vaddq_u32(acc_hi, vshrq_n_u32(vcgtq_f32(vals_hi, bv), 31));
+            }
+        }
+        uint8_t counts[8];
+        counts[0] = static_cast<uint8_t>(vgetq_lane_u32(acc_lo, 0));
+        counts[1] = static_cast<uint8_t>(vgetq_lane_u32(acc_lo, 1));
+        counts[2] = static_cast<uint8_t>(vgetq_lane_u32(acc_lo, 2));
+        counts[3] = static_cast<uint8_t>(vgetq_lane_u32(acc_lo, 3));
+        counts[4] = static_cast<uint8_t>(vgetq_lane_u32(acc_hi, 0));
+        counts[5] = static_cast<uint8_t>(vgetq_lane_u32(acc_hi, 1));
+        counts[6] = static_cast<uint8_t>(vgetq_lane_u32(acc_hi, 2));
+        counts[7] = static_cast<uint8_t>(vgetq_lane_u32(acc_hi, 3));
+
+        double terms[8];
+        for (int k = 0; k < 8; ++k) {
+            const int d = offset + k;
+            const double reconstructed =
+                static_cast<double>(centroids[counts[k]]) * static_cast<double>(inv_scale_tq[d]) -
+                static_cast<double>(shift[d]);
+            terms[k] = static_cast<double>(rotated[d]) * reconstructed;
+        }
+        acc_a = vaddq_f64(acc_a, vld1q_f64(terms));
+        acc_b = vaddq_f64(acc_b, vld1q_f64(terms + 2));
+        acc_a = vaddq_f64(acc_a, vld1q_f64(terms + 4));
+        acc_b = vaddq_f64(acc_b, vld1q_f64(terms + 6));
+
+        const uint8x8_t codes = vld1_u8(counts);
+        for (int plane = 0; plane < BITS; ++plane) {
+            const uint8x8_t hit = vtst_u8(codes, vdup_n_u8(static_cast<uint8_t>(1u << plane)));
+            packed_row[static_cast<size_t>(plane) * bytes_per_plane + static_cast<size_t>(chunk)] =
+                vaddv_u8(vand_u8(hit, weights));
+        }
+    }
+    return (vgetq_lane_f64(acc_a, 0) + vgetq_lane_f64(acc_a, 1)) +
+        (vgetq_lane_f64(acc_b, 0) + vgetq_lane_f64(acc_b, 1));
+}
+#endif
+
+static double quantize_turbovec_hadamard_row_with(
+        TurboVecSimd simd,
+        const float * rotated,
+        const float * shift,
+        const float * scale_tq,
+        const float * inv_scale_tq,
+        const float * boundaries,
+        const float * centroids,
+        int bits,
+        int dim,
+        uint8_t * packed_row) {
+    switch (simd) {
+#if GGML_VEC_INDEX_USE_NEON
+        case TurboVecSimd::neon:
+            if (bits == 2) {
+                return quantize_turbovec_hadamard_row_neon<2>(
+                    rotated, shift, scale_tq, inv_scale_tq, boundaries, centroids, dim, packed_row);
+            }
+            if (bits == 3) {
+                return quantize_turbovec_hadamard_row_neon<3>(
+                    rotated, shift, scale_tq, inv_scale_tq, boundaries, centroids, dim, packed_row);
+            }
+            if (bits == 4) {
+                return quantize_turbovec_hadamard_row_neon<4>(
+                    rotated, shift, scale_tq, inv_scale_tq, boundaries, centroids, dim, packed_row);
+            }
+            break;
+#endif
+#if defined(GGML_VEC_INDEX_HAVE_AVX2_KERNEL)
+        case TurboVecSimd::avx2:
+        case TurboVecSimd::avx512:
+            if (bits >= 2 && bits <= 4) {
+                return ggml_vec_index_detail::turbovec_quantize_row_avx2(
+                    rotated, shift, scale_tq, inv_scale_tq, boundaries, centroids, bits, dim, packed_row);
+            }
+            break;
+#endif
+        default:
+            break;
+    }
+    return quantize_turbovec_hadamard_row_scalar(
+        rotated, shift, scale_tq, inv_scale_tq, boundaries, centroids, bits, dim, packed_row);
+}
+
+// Quantize already-rotated unit rows under (shift, scale_tq) and pack one
+// bit-plane row each, returning the per-vector correction scale (upstream
+// encode.rs `fused_quantize_scale_pack` + `scale_from_inner`).
+static float quantize_turbovec_hadamard_row(
+        const float * rotated,
+        float norm,
+        const float * shift,
+        const float * scale_tq,
+        const float * inv_scale_tq,
+        const TurboVecCodebook & codebook,
+        int bits,
+        int dim,
+        uint8_t * packed_row) {
+    const double inner = quantize_turbovec_hadamard_row_with(
+        turbovec_host_simd(),
+        rotated,
+        shift,
+        scale_tq,
+        inv_scale_tq,
+        codebook.boundaries.data(),
+        codebook.centroids.data(),
+        bits,
+        dim,
+        packed_row);
     // Written positively so a NaN inner lands in the degenerate branch.
     return inner > kTurboVecDegenerateInner ? norm / static_cast<float>(inner) : 0.0f;
 }
+
+#ifdef GGML_VEC_INDEX_TEST_HOOKS
+// 1 when the fused quantize-and-pack kernel of `kernel` (0: NEON, 1: AVX2)
+// writes the scalar kernel's packed bytes and inner product bit for bit at
+// 2, 3 and 4 bits, with and without a calibration, including values that
+// land exactly on boundaries and zero rows; 0 on a mismatch; -1 when
+// unavailable.
+int turbovec_encode_kernel_parity_for_test(int kernel) {
+    TurboVecSimd simd = TurboVecSimd::scalar;
+    if (kernel == 2 || !turbovec_simd_for_test(kernel, simd)) {
+        return -1;
+    }
+    const ScopedNearestRounding rounding_guard;
+    TurboVecTestRng rng{ UINT64_C(0x243f6a8885a308d3) };
+    for (int bits = 2; bits <= 4; ++bits) {
+        for (int dim : { 8, 64, 200, 768, 1024 }) {
+            const TurboVecCodebook & codebook = turbovec_codebook(bits, dim, false);
+            const size_t dim_sz = static_cast<size_t>(dim);
+            const size_t row_bytes = turbovec_row_bytes(bits, dim_sz);
+            const float spread = 3.0f / std::sqrt(static_cast<float>(dim));
+            for (int calibrated = 0; calibrated <= 1; ++calibrated) {
+                std::vector<float> shift(dim_sz, 0.0f);
+                std::vector<float> scale(dim_sz, 1.0f);
+                std::vector<float> inv_scale(dim_sz, 1.0f);
+                if (calibrated != 0) {
+                    for (size_t d = 0; d < dim_sz; ++d) {
+                        shift[d] = rng.uniform() * spread * 0.2f;
+                        scale[d] = 0.75f + rng.uniform();
+                        inv_scale[d] = 1.0f / scale[d];
+                    }
+                }
+                for (int trial = 0; trial < 6; ++trial) {
+                    std::vector<float> row(dim_sz);
+                    for (size_t d = 0; d < dim_sz; ++d) {
+                        row[d] = trial == 0 ? 0.0f : rng.uniform() * spread;
+                    }
+                    if (trial == 1 && calibrated == 0) {
+                        // Exact boundary hits: a strict compare keeps them low.
+                        for (size_t d = 0; d < dim_sz; ++d) {
+                            row[d] = codebook.boundaries[d % codebook.boundaries.size()];
+                        }
+                    }
+                    std::vector<uint8_t> expect(row_bytes, 0xa5);
+                    std::vector<uint8_t> got(row_bytes, 0x5a);
+                    const double expect_inner = quantize_turbovec_hadamard_row_scalar(
+                        row.data(), shift.data(), scale.data(), inv_scale.data(), codebook.boundaries.data(),
+                        codebook.centroids.data(), bits, dim, expect.data());
+                    const double got_inner = quantize_turbovec_hadamard_row_with(
+                        simd, row.data(), shift.data(), scale.data(), inv_scale.data(), codebook.boundaries.data(),
+                        codebook.centroids.data(), bits, dim, got.data());
+                    if (got != expect || std::memcmp(&got_inner, &expect_inner, sizeof(double)) != 0) {
+                        return 0;
+                    }
+                }
+            }
+        }
+    }
+    return 1;
+}
+#endif
 
 struct TurboVecCalibrationView {
     std::vector<float> identity_shift;

@@ -9,7 +9,10 @@
 // Upstream's seeded collectors only speed the shortlist up, except that the
 // one query of a batch whose seed runs short is rescanned with single-query
 // tables; the port computes the seed to reproduce that. Upstream's in-scan
-// refinement on a thread pool is not reproduced.
+// refinement on a thread pool, which can return other rows than its
+// single-threaded path, is not reproduced: a lone query here splits the
+// shortlist scan, the ranking and the rescore across threads and still
+// returns the single-threaded results.
 
 #include "ggml-vector-index-impl.h"
 
@@ -250,7 +253,8 @@ void turbovec_planes_refresh(ggml_vec_index & idx, size_t first_slot) {
     }
     try {
         repack_turbovec_sign_codes(
-            idx.turbovec_data.data(), n, idx.turbovec_bits, idx.dim, first_slot, idx.turbovec_sign_blocked);
+            idx.turbovec_data.data(), n, idx.turbovec_bits, idx.dim, first_slot, idx.turbovec_sign_blocked,
+            idx.n_threads);
     } catch (const std::bad_alloc &) {
         // Without memory for the sign planes the index drops back to full
         // scans, so a mutation never fails after its rows are committed;
@@ -443,6 +447,14 @@ TurboVecPlanesStats compute_stats(const ggml_vec_index & idx) {
     return stats;
 }
 
+// Rows per task of the centre term and candidates per task of the rank
+// and rescore stages: enough to amortize the hand-off.
+constexpr size_t kCentreRowsPerTask = 4096;
+constexpr size_t kRankPerTask = 64;
+// Shortlist ranges per thread of a split scan: each range fills a shortlist
+// of its own before it can prune, so fewer ranges than the full scan's.
+constexpr size_t kRangesPerThread = 2;
+
 // Upstream pack.rs `planes_centre`: C(v) = sum_d w_d * sign_d(v).
 std::vector<float> compute_centre(const ggml_vec_index & idx, float m) {
     const int dim = idx.dim;
@@ -456,17 +468,21 @@ std::vector<float> compute_centre(const ggml_vec_index & idx, float m) {
     }
     const size_t n = idx.slot_to_id.size();
     std::vector<float> centre(n);
-    for (size_t v = 0; v < n; ++v) {
-        const uint8_t * sign = idx.turbovec_data.data() + v * row_bytes + sign_at;
-        float acc = 0.0f;
-        for (size_t g = 0; g < nsg; ++g) {
-            for (int j = 0; j < 8; ++j) {
-                const float wj = w[g * 8 + static_cast<size_t>(j)];
-                acc += ((sign[g] >> (7 - j)) & 1u) != 0 ? wj : -wj;
+    // Each row's sum is its own, so rows may spread over threads.
+    parallel_for((n + kCentreRowsPerTask - 1) / kCentreRowsPerTask, idx.n_threads, [&](size_t task, size_t) {
+        const size_t end = std::min(n, (task + 1) * kCentreRowsPerTask);
+        for (size_t v = task * kCentreRowsPerTask; v < end; ++v) {
+            const uint8_t * sign = idx.turbovec_data.data() + v * row_bytes + sign_at;
+            float acc = 0.0f;
+            for (size_t g = 0; g < nsg; ++g) {
+                for (int j = 0; j < 8; ++j) {
+                    const float wj = w[g * 8 + static_cast<size_t>(j)];
+                    acc += ((sign[g] >> (7 - j)) & 1u) != 0 ? wj : -wj;
+                }
             }
+            centre[v] = acc;
         }
-        centre[v] = acc;
-    }
+    });
     return centre;
 }
 
@@ -601,16 +617,58 @@ bool turbovec_staged_search(
         plain_lut.bias += bias_corr;
     }
     const SignLut & rank_lut = plain_lut.values.empty() ? sign_lut : plain_lut;
+    // The query's tables for the ranking and the exact rescore. A split
+    // query builds them while its blocks are scanned.
     LowPlanes low_planes;
-    if (refines && !table_rank) {
-        low_planes = build_low_planes(query, m, dim);
-    }
+    auto build_low = [&]() {
+        if (refines && !table_rank) {
+            low_planes = build_low_planes(query, m, dim);
+        }
+    };
+    std::vector<uint8_t> exact_lut;
+    float exact_scale = 1.0f;
+    float exact_bias = 0.0f;
+    TurboVecPermuteDot pd;
+    const bool permute_dot = turbovec_uses_permute_dot(idx);
+    bool exact_built = false;
+    auto build_exact = [&]() {
+        if (permute_dot) {
+            build_turbovec_permute_dot(query, dim, pd);
+            pd.bias = bias_corr;
+        } else {
+            build_turbovec_lut(bits, false, query, dim, exact_lut, exact_scale, exact_bias);
+            exact_bias += bias_corr;
+        }
+        exact_built = true;
+    };
     auto plain_score = [&](size_t v, float s) {
         return centre != nullptr ? s - kSignCentre * vscales[v] * (*centre)[v] : s;
     };
 
-    // Stage one: the shortlist, the top s_len allowed rows by sign score.
+    // Stage one: the shortlist, the top s_len allowed rows by sign score
+    // under the strict (score, slot) order, so which rows it holds does not
+    // depend on the order they are collected in. A lone query over enough
+    // blocks splits them into ranges, as the full scan does: each range
+    // collects its own top s_len, and the global top s_len rows are each in
+    // their range's, so the best s_len of all ranges together is the
+    // single-threaded shortlist.
+    const size_t n_blocks = (n + kBlock - 1) / kBlock;
+    std::vector<uint8_t> scan_blocks;
+    size_t n_scan_blocks = n_blocks;
+    if (allowed_mask != nullptr) {
+        // A block without an allowed row adds nothing to the shortlist.
+        scan_blocks.assign(n_blocks, 0);
+        for (size_t v = 0; v < n; ++v) {
+            scan_blocks[v / kBlock] |= allowed_mask[v] != 0 ? 1 : 0;
+        }
+        n_scan_blocks = static_cast<size_t>(std::count(scan_blocks.begin(), scan_blocks.end(), uint8_t{ 1 }));
+    }
+    const int n_threads = std::max(1, opts.n_threads);
+    const bool split = n_threads > 1 && n_scan_blocks >= kTurboVecParallelMinBlocks;
     std::vector<Candidate> list;
+    if (s_len >= n_allowed || !split) {
+        build_low();
+    }
     if (s_len >= n_allowed) {
         for (size_t v = 0; v < n; ++v) {
             if (allowed_mask == nullptr || allowed_mask[v] != 0) {
@@ -618,10 +676,6 @@ bool turbovec_staged_search(
             }
         }
     } else {
-        std::vector<ScoreId> top;
-        top.reserve(s_len);
-        float block_scores[kBlock];
-        const size_t n_blocks = (n + kBlock - 1) / kBlock;
         // Upstream seeds an unmasked scan's collector with the r-th best
         // score of a 48-block sample and rescans a query that comes back
         // with fewer than s_len rows above it. The rows kept are the same
@@ -632,32 +686,111 @@ bool turbovec_staged_search(
         if (seeded) {
             seed = sample_seed(idx, sign_lut, s_len, bits);
         }
-        size_t above_seed = 0;
-        for (size_t block = 0; block < n_blocks; ++block) {
-            score_turbovec_lut_block(
-                sign_lut.values.data(), sign_lut.scale, sign_lut.bias, idx.turbovec_sign_blocked.data(), vscales,
-                block, n, 2, dim / 2, block_scores);
-            const size_t count = std::min(kBlock, n - block * kBlock);
-            if (seeded) {
+        // The best s_len-th score any range has kept so far: every row of
+        // the shortlist scores at least that, so a range may drop a row that
+        // scores strictly less (a tie may still win on its slot).
+        std::atomic<double> floor_score{ -std::numeric_limits<double>::infinity() };
+        // Collects a range's rows in a buffer cut back to its best s_len
+        // whenever it doubles; the s_len-th best kept is the cut-off.
+        auto scan = [&](size_t block_begin, size_t block_end, std::vector<ScoreId> & top, size_t & above_seed) {
+            top.reserve(2 * s_len);
+            bool cut = false;
+            double threshold = 0.0;
+            auto cut_back = [&]() {
+                std::nth_element(top.begin(), top.begin() + static_cast<std::ptrdiff_t>(s_len - 1), top.end(), score_id_better);
+                top.resize(s_len);
+                cut = true;
+                threshold = top.back().score;
+                if (split) {
+                    double seen = floor_score.load(std::memory_order_relaxed);
+                    while (threshold > seen &&
+                           !floor_score.compare_exchange_weak(seen, threshold, std::memory_order_relaxed)) {
+                    }
+                }
+            };
+            float block_scores[kBlock];
+            for (size_t block = block_begin; block < block_end; ++block) {
+                if (!scan_blocks.empty() && scan_blocks[block] == 0) {
+                    continue;
+                }
+                score_turbovec_lut_block(
+                    sign_lut.values.data(), sign_lut.scale, sign_lut.bias, idx.turbovec_sign_blocked.data(), vscales,
+                    block, n, 2, dim / 2, block_scores);
+                const size_t count = std::min(kBlock, n - block * kBlock);
+                if (seeded) {
+                    for (size_t lane = 0; lane < count; ++lane) {
+                        above_seed += block_scores[lane] > seed ? 1 : 0;
+                    }
+                }
+                // Rows arrive in slot order, so once s_len rows are kept a
+                // row scoring no better than the worst of them cannot enter.
+                const double floor = split ? floor_score.load(std::memory_order_relaxed) :
+                                             -std::numeric_limits<double>::infinity();
                 for (size_t lane = 0; lane < count; ++lane) {
-                    above_seed += block_scores[lane] > seed ? 1 : 0;
+                    const double score = static_cast<double>(block_scores[lane]);
+                    if ((cut && score <= threshold) || score < floor) {
+                        continue;
+                    }
+                    const size_t v = block * kBlock + lane;
+                    if (allowed_mask != nullptr && allowed_mask[v] == 0) {
+                        continue;
+                    }
+                    top.push_back({ score, static_cast<uint64_t>(v) });
+                }
+                if (top.size() >= 2 * s_len) {
+                    cut_back();
                 }
             }
-            // Rows arrive in slot order, so once the shortlist is full a row
-            // scoring no better than its worst cannot displace it.
-            const bool full = top.size() == s_len;
-            const double threshold = full ? top.front().score : 0.0;
-            for (size_t lane = 0; lane < count; ++lane) {
-                if (full && static_cast<double>(block_scores[lane]) <= threshold) {
-                    continue;
-                }
-                const size_t v = block * kBlock + lane;
-                if (allowed_mask != nullptr && allowed_mask[v] == 0) {
-                    continue;
-                }
-                update_topk_heap(top, static_cast<int>(s_len), { block_scores[lane], static_cast<uint64_t>(v) });
+            if (split && top.size() > s_len) {
+                cut_back();
             }
+        };
+        std::vector<ScoreId> top;
+        size_t above_seed = 0;
+        if (split) {
+            const size_t n_ranges = static_cast<size_t>(n_threads) * kRangesPerThread;
+            const size_t per_range = (n_blocks + n_ranges - 1) / n_ranges;
+            std::vector<std::vector<ScoreId>> range_tops(n_ranges);
+            std::vector<size_t> range_above(n_ranges, 0);
+            // Two more tasks build the query's later tables meanwhile.
+            parallel_for(n_ranges + 2, n_threads, [&](size_t range, size_t) {
+                if (range == n_ranges) {
+                    build_low();
+                    return;
+                }
+                if (range == n_ranges + 1) {
+                    build_exact();
+                    return;
+                }
+                const size_t begin = range * per_range;
+                const size_t end = std::min(n_blocks, begin + per_range);
+                if (begin < end) {
+                    scan(begin, end, range_tops[range], range_above[range]);
+                }
+            });
+            // A row below the final floor is below some range's s_len rows.
+            const double floor = floor_score.load(std::memory_order_relaxed);
+            size_t total = 0;
+            for (size_t range = 0; range < n_ranges; ++range) {
+                above_seed += range_above[range];
+                total += range_tops[range].size();
+            }
+            top.reserve(total);
+            for (const std::vector<ScoreId> & range_top : range_tops) {
+                for (const ScoreId & c : range_top) {
+                    if (c.score >= floor) {
+                        top.push_back(c);
+                    }
+                }
+            }
+        } else {
+            scan(0, n_blocks, top, above_seed);
         }
+        if (top.size() > s_len) {
+            std::nth_element(top.begin(), top.begin() + static_cast<std::ptrdiff_t>(s_len - 1), top.end(), score_id_better);
+            top.resize(s_len);
+        }
+        list.reserve(top.size());
         for (const ScoreId & c : top) {
             const size_t v = static_cast<size_t>(c.id);
             list.push_back({ v, plain_score(v, static_cast<float>(c.score)) });
@@ -666,6 +799,22 @@ bool turbovec_staged_search(
             *opts.seed_short = above_seed < s_len;
         }
     }
+    // Runs fn(i) for every candidate i in [0, count): each candidate's
+    // arithmetic is its own, so a split query spreads them over threads.
+    auto for_each_candidate = [&](size_t count, auto && fn) {
+        if (!split) {
+            for (size_t i = 0; i < count; ++i) {
+                fn(i);
+            }
+            return;
+        }
+        parallel_for((count + kRankPerTask - 1) / kRankPerTask, n_threads, [&](size_t task, size_t) {
+            const size_t end = std::min(count, (task + 1) * kRankPerTask);
+            for (size_t i = task * kRankPerTask; i < end; ++i) {
+                fn(i);
+            }
+        });
+    };
 
     // Stages two and three: rank by estimates from the lower planes and
     // keep the best t_len (upstream rank_first_keep / rank_full_known).
@@ -691,7 +840,7 @@ bool turbovec_staged_search(
         };
         const size_t top_plane = n_low - 1;
         std::vector<float> tops(list.size());
-        for (size_t i = 0; i < list.size(); ++i) {
+        for_each_candidate(list.size(), [&](size_t i) {
             Candidate & c = list[i];
             const float l = plane_term(c.slot, top_plane);
             tops[i] = l;
@@ -702,15 +851,17 @@ bool turbovec_staged_search(
                 const float m_s = c.score / vscale - bias_corr;
                 c.score = vscale * (a1_over_m * m_s + b1_over_m * l + bias_corr);
             }
-        }
+        });
         if (n_low > 1) {
+            // keep_best's choice follows the strict (score, slot) order, so
+            // it does not depend on the order the shortlist arrived in.
             keep_best(list, mid_len(k_sz), &tops);
-            for (size_t i = 0; i < list.size(); ++i) {
+            for_each_candidate(list.size(), [&](size_t i) {
                 Candidate & c = list[i];
                 const float vscale = vscales[c.slot];
                 if (vscale == 0.0f) {
                     c.score = 0.0f;
-                    continue;
+                    return;
                 }
                 float l[3] = {};
                 for (size_t j = 0; j + 1 < n_low; ++j) {
@@ -723,36 +874,57 @@ bool turbovec_staged_search(
                     est += b_over_m[j] * l[j];
                 }
                 c.score = vscale * (est + bias_corr);
-            }
+            });
         }
         keep_best(list, t_len);
     }
 
     // Stage four: the exact score for what is left, from the full scan's own
     // block kernel, so a returned score equals the full scan's.
-    std::vector<uint8_t> exact_lut;
-    float exact_scale = 1.0f;
-    float exact_bias = 0.0f;
-    TurboVecPermuteDot pd;
-    const bool permute_dot = turbovec_uses_permute_dot(idx);
-    if (permute_dot) {
-        build_turbovec_permute_dot(query, dim, pd);
-        pd.bias = bias_corr;
-    } else {
-        build_turbovec_lut(bits, false, query, dim, exact_lut, exact_scale, exact_bias);
-        exact_bias += bias_corr;
+    if (!exact_built) {
+        build_exact();
     }
     std::sort(list.begin(), list.end(), [](const Candidate & a, const Candidate & b) { return a.slot < b.slot; });
-    float block_scores[kBlock];
-    size_t scored_block = SIZE_MAX;
-    for (const Candidate & c : list) {
-        const size_t block = c.slot / kBlock;
-        if (block != scored_block) {
-            score_turbovec_block(
-                idx, exact_lut.data(), exact_scale, exact_bias, permute_dot ? &pd : nullptr, block, block_scores);
-            scored_block = block;
+    if (!split) {
+        float block_scores[kBlock];
+        size_t scored_block = SIZE_MAX;
+        for (const Candidate & c : list) {
+            const size_t block = c.slot / kBlock;
+            if (block != scored_block) {
+                score_turbovec_block(
+                    idx, exact_lut.data(), exact_scale, exact_bias, permute_dot ? &pd : nullptr, block, block_scores);
+                scored_block = block;
+            }
+            update_topk_heap(heap, k, { block_scores[c.slot % kBlock], topk_key(idx, c.slot) });
         }
-        update_topk_heap(heap, k, { block_scores[c.slot % kBlock], topk_key(idx, c.slot) });
+        return true;
+    }
+    // A split query scores the candidates' blocks across threads, each block
+    // once, then fills the heap in slot order as the loop above does.
+    std::vector<size_t> block_starts;
+    for (size_t i = 0; i < list.size(); ++i) {
+        if (i == 0 || list[i].slot / kBlock != list[i - 1].slot / kBlock) {
+            block_starts.push_back(i);
+        }
+    }
+    block_starts.push_back(list.size());
+    const size_t n_cand_blocks = block_starts.size() - 1;
+    std::vector<float> exact(list.size());
+    constexpr size_t kBlocksPerTask = 4;
+    parallel_for((n_cand_blocks + kBlocksPerTask - 1) / kBlocksPerTask, n_threads, [&](size_t task, size_t) {
+        float block_scores[kBlock];
+        const size_t end = std::min(n_cand_blocks, (task + 1) * kBlocksPerTask);
+        for (size_t b = task * kBlocksPerTask; b < end; ++b) {
+            score_turbovec_block(
+                idx, exact_lut.data(), exact_scale, exact_bias, permute_dot ? &pd : nullptr,
+                list[block_starts[b]].slot / kBlock, block_scores);
+            for (size_t i = block_starts[b]; i < block_starts[b + 1]; ++i) {
+                exact[i] = block_scores[list[i].slot % kBlock];
+            }
+        }
+    });
+    for (size_t i = 0; i < list.size(); ++i) {
+        update_topk_heap(heap, k, { exact[i], topk_key(idx, list[i].slot) });
     }
     return true;
 }
