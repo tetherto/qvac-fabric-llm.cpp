@@ -27,6 +27,7 @@ struct mtmd_helper_video_init_params {
     float fps_target;            // desired output fps; <= 0 means use the video's native fps, defaulted to 4.0f
     const char * ffmpeg_bin_dir; // directory containing ffmpeg/ffprobe binaries; NULL means search PATH
     int64_t timestamp_interval_ms; // interval for adding timestamp as text chunk (example: "[10m50.5s]"); <= 0 means no timestamp, defaulted to 5000ms
+    uint64_t max_frame_pixels;     // width * height limit of a frame, checked before decoding; 0 means no limit, defaulted to 0
     // TODO @ngxson : allow "placeholder" bitmap output for counting tokens
 };
 
@@ -35,6 +36,10 @@ MTMD_API struct mtmd_helper_video_init_params mtmd_helper_video_init_params_defa
 // opt for mtmd_helper_bitmap_init_from_*()
 struct mtmd_helper_init_opt {
     struct mtmd_helper_video_init_params video_params;
+    // decode limits, checked before anything is allocated or decoded; 0 means no limit
+    // an input over a limit fails with MTMD_HELPER_BITMAP_AUDIO_TOO_LONG or MTMD_HELPER_BITMAP_IMAGE_TOO_LARGE
+    uint64_t max_audio_frames; // mono samples at the model's audio sample rate (mtmd_get_audio_sample_rate)
+    uint64_t max_image_pixels; // width * height of an image, a webp, or each video frame (with video_params.max_frame_pixels, the lower one applies)
 };
 typedef struct mtmd_helper_init_opt mtmd_helper_init_opt;
 
@@ -48,14 +53,22 @@ MTMD_API void mtmd_helper_log_set(ggml_log_callback log_callback, void * user_da
 // Returns true if this build includes video support (MTMD_VIDEO was ON at compile time).
 MTMD_API bool mtmd_helper_support_video(const mtmd_context * ctx);
 
+enum mtmd_helper_bitmap_status {
+    MTMD_HELPER_BITMAP_OK = 0,
+    MTMD_HELPER_BITMAP_FAILED,          // unreadable or unsupported input
+    MTMD_HELPER_BITMAP_AUDIO_TOO_LONG,  // over mtmd_helper_init_opt.max_audio_frames
+    MTMD_HELPER_BITMAP_IMAGE_TOO_LARGE, // over mtmd_helper_init_opt.max_image_pixels
+};
+
 struct mtmd_helper_bitmap_wrapper {
     mtmd_bitmap * bitmap;
     mtmd_helper_video * video_ctx;
+    enum mtmd_helper_bitmap_status status; // why bitmap is NULL
 };
 
 // helper function to construct a mtmd_bitmap from a file
 // it calls mtmd_helper_bitmap_init_from_buf() internally
-// returns nullptr on failure
+// returns nullptr on failure, with the reason in status
 // this function is thread-safe
 MTMD_API struct mtmd_helper_bitmap_wrapper mtmd_helper_bitmap_init_from_file(
                     const mtmd_context * ctx,
@@ -72,7 +85,8 @@ MTMD_API struct mtmd_helper_bitmap_wrapper mtmd_helper_bitmap_init_from_file(
 //   - for now, video input is only supported via C++ helper functions
 //   - audio files will be auto-detected based on magic bytes
 //   - output bitmap will have SHA-256 hash (hex string) as the ID
-// returns nullptr on failure
+//   - opt.max_audio_frames and opt.max_image_pixels are compared with the length or size the decoder itself reads from the input, before it allocates or decodes
+// returns nullptr on failure, with the reason in status
 // this function is thread-safe
 MTMD_API struct mtmd_helper_bitmap_wrapper mtmd_helper_bitmap_init_from_buf(
                     const mtmd_context * ctx,
