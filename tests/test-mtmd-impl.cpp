@@ -472,17 +472,17 @@ MAKE_TEST(test_helper_audio_limit_counts_at_model_rate) {
 }
 
 MAKE_TEST(test_helper_image_limit) {
-    const auto small = make_bmp(4, 2, true);
+    const auto small_bmp = make_bmp(4, 2, true);
 
-    auto res = decode_media(small, -1, 0, 0);
+    auto res = decode_media(small_bmp, -1, 0, 0);
     t.assert_equal("status without a limit", std::string("ok"), std::string(status_name(res.status)));
 
-    res = decode_media(small, -1, 0, 8);
+    res = decode_media(small_bmp, -1, 0, 8);
     t.assert_equal("status at the limit", std::string("ok"), std::string(status_name(res.status)));
     t.assert_equal("width", (uint32_t) 4, res.nx);
     t.assert_equal("height", (uint32_t) 2, res.ny);
 
-    res = decode_media(small, -1, 0, 7);
+    res = decode_media(small_bmp, -1, 0, 7);
     t.assert_equal("status over the limit", std::string("image too large"), std::string(status_name(res.status)));
 
     // a top-down BMP stores a negative height
