@@ -123,4 +123,4 @@ jobs:
         if: ${{ matrix.sanitizer == 'UNDEFINED' }}
         run: |
           cd build
-          ctest -R '^test-vector-index(-hooks|-faults)?$' --verbose --timeout 900
+          ctest -R '^test-vector-index(-hooks|-hooks-full|-faults)?$' --verbose --timeout 900

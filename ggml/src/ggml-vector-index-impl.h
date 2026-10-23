@@ -18,6 +18,7 @@
 #include <exception>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -215,6 +216,18 @@ void reserve_mostly_exact(std::vector<T> & v, size_t additional) {
     }
 }
 
+// Keeps the best k candidates in a min-heap under score_id_better.
+inline void update_topk_heap(std::vector<ScoreId> & heap, int k, const ScoreId & candidate) {
+    if (heap.size() < static_cast<size_t>(k)) {
+        heap.push_back(candidate);
+        std::push_heap(heap.begin(), heap.end(), MinHeapCmp());
+    } else if (score_id_better(candidate, heap.front())) {
+        std::pop_heap(heap.begin(), heap.end(), MinHeapCmp());
+        heap.back() = candidate;
+        std::push_heap(heap.begin(), heap.end(), MinHeapCmp());
+    }
+}
+
 inline constexpr int kMaxThreads = 256;
 
 // Runs fn(task, worker) for every task in [0, n_tasks) on up to n_threads
@@ -263,6 +276,16 @@ void parallel_for(size_t n_tasks, int n_threads, Fn && fn) {
         std::rethrow_exception(error);
     }
 }
+
+// How a staged search weighs the sign plane and estimates a level from its
+// bits (upstream pack.rs `PlanesStats`).
+struct TurboVecPlanesStats {
+    float m = 0.0f;
+    float alpha = 0.0f;
+    float beta[3] = {};
+    float alpha1 = 0.0f;
+    float beta1 = 0.0f;
+};
 
 // A TurboVec index's binding to the v8 file it syncs to (upstream
 // `SyncCursor` plus its dirty sets). A 1.x index removes by swap-remove,
@@ -323,15 +346,39 @@ struct ggml_vec_index {
     // True for an index loaded from a v3 snapshot: it keeps the turbovec 0.9
     // QR rotation, codebook and first-add calibration it was written with.
     bool turbovec_legacy = false;
+    // The blocked cache uses upstream's vector-major layout (1.x 4-bit
+    // indexes on hosts that score with permute-dot); fixed at creation.
+    bool turbovec_blocked_vm = false;
     // Bumped by every calibrate; a sync across one rewrites the whole file.
     uint64_t turbovec_calib_gen = 0;
     TurboVecSyncBinding turbovec_sync;
+    // Whether turbovec_data holds the packed rows. A 1.x index keeps its
+    // codes only in the blocked cache (upstream #475) unless it is in the
+    // planes layout, whose staged search reads the bit planes row by row;
+    // a legacy index always keeps packed rows.
+    bool turbovec_packed_rows = true;
     std::vector<uint8_t> turbovec_data;
     std::vector<float>   turbovec_scale;
     std::vector<float>   turbovec_tqplus_shift;
     std::vector<float>   turbovec_tqplus_scale;
     std::vector<uint8_t> turbovec_blocked_data;
     size_t turbovec_blocked_n_blocks = 0;
+
+    // Staged search (upstream turbovec's planes search). Once a 2- or
+    // 4-bit index reaches kTurboVecPlanesMinVectors on a host that runs it
+    // the index is promoted and keeps a blocked copy of its sign planes;
+    // it stays promoted if it later shrinks.
+    bool turbovec_staged_enabled = true;
+    bool turbovec_planes = false;
+    std::vector<uint8_t> turbovec_sign_blocked;
+    // Derived lazily by the first staged search, as upstream does: the
+    // planes statistics (from the cache head, reset only on promotion) and
+    // the per-vector centre term (reset by every mutation).
+    mutable std::mutex turbovec_planes_mutex;
+    mutable bool turbovec_stats_ready = false;
+    mutable TurboVecPlanesStats turbovec_stats;
+    mutable bool turbovec_centre_ready = false;
+    mutable std::vector<float> turbovec_centre;
 
     std::vector<uint64_t> slot_to_id;
     std::vector<uint8_t>  slot_active;
@@ -489,6 +536,13 @@ void invalidate_ivf(ggml_vec_index & idx);
 bool is_q8(const ggml_vec_index & idx);
 bool is_q4(const ggml_vec_index & idx);
 bool is_turbovec(const ggml_vec_index & idx);
+// Top-k heaps order equal scores by their key. A TurboVec 1.x index keys
+// on the slot, which is upstream turbovec's row order, so ties come out as
+// upstream returns them; other indexes key on the external id. Keys are
+// mapped back to ids when results are written.
+bool topk_keys_are_slots(const ggml_vec_index & idx);
+uint64_t topk_key(const ggml_vec_index & idx, size_t slot);
+uint64_t topk_key_id(const ggml_vec_index & idx, uint64_t key);
 bool is_turbovec_q2(const ggml_vec_index & idx);
 bool is_turbovec_q4(const ggml_vec_index & idx);
 bool is_quantized(const ggml_vec_index & idx);
@@ -541,6 +595,8 @@ uint64_t turbovec_lut_hash_for_test(
 uint64_t turbovec_codebook_hash_for_test(int bits, int dim);
 uint64_t turbovec_blocked_hash_for_test(const ggml_vec_index_t * idx);
 void turbovec_clear_blocked_for_test(ggml_vec_index_t * idx);
+void turbovec_code_bytes_for_test(
+    const ggml_vec_index_t * idx, size_t * packed, size_t * blocked, size_t * sign);
 int turbovec_avx2_available_for_test();
 int turbovec_avx2_lut_block_matches_scalar_for_test(int bits, int dim);
 void turbovec_reset_block_score_call_count_for_test(void);
@@ -550,6 +606,9 @@ int turbovec_sync_plan_for_test(
     ggml_vec_index_t * idx,
     const char * path,
     std::vector<std::vector<std::pair<uint64_t, std::vector<uint8_t>>>> & batches);
+void turbovec_force_vector_major_for_test(int mode);
+void turbovec_disable_dot_product_for_test(int disabled);
+void turbovec_force_planes_for_test(int mode, size_t min_vectors);
 int turbovec_index_hashes_for_test(
     const ggml_vec_index_t * idx,
     uint64_t * codes_hash,
@@ -557,6 +616,83 @@ int turbovec_index_hashes_for_test(
     uint64_t * shift_hash,
     uint64_t * scale_hash);
 #endif
+// Whether this CPU runs upstream turbovec's dot-product ("vector-major")
+// kernels: aarch64 with dot product, x86 with AVX-512 F/BW/VBMI/VNNI. Those
+// hosts score 4-bit codes with int8 permute-dot arithmetic.
+bool turbovec_cpu_vector_major();
+// The CPU's own dot-product support, which a test override cannot change:
+// gates the SDOT instructions themselves.
+bool turbovec_cpu_dot_product();
+
+// One query quantized for the 4-bit permute-dot score (upstream
+// `QueryPermuteDot`): sum_d weight[d] * level[code[d]] in int32, then
+// fma(sum, scale, bias) times the vector's scale.
+struct TurboVecPermuteDot {
+    int8_t levels[16] = {};
+    std::vector<int8_t> weights;
+    float scale = 1.0f;
+    float bias = 0.0f;
+};
+void build_turbovec_permute_dot(const float * query, int dim, TurboVecPermuteDot & out);
+void score_turbovec_permute_dot_block(
+    const TurboVecPermuteDot & pd,
+    const uint8_t * blocked_codes,
+    const float * vector_scales,
+    size_t block_index,
+    size_t n_vectors,
+    int dim,
+    bool vector_major,
+    float * out_scores);
+// Four queries over one block, sharing the code loads (NEON vector-major).
+void score_turbovec_permute_dot_block_4(
+    const TurboVecPermuteDot * const * pds,
+    const uint8_t * blocked_codes,
+    const float * vector_scales,
+    size_t block_index,
+    size_t n_vectors,
+    int dim,
+    bool vector_major,
+    float * const * out_scores);
+bool turbovec_uses_permute_dot(const ggml_vec_index_t & idx);
+void score_turbovec_block(
+    const ggml_vec_index_t & idx,
+    const uint8_t * lut,
+    float lut_scale,
+    float lut_bias,
+    const TurboVecPermuteDot * permute_dot,
+    size_t block,
+    float * out_scores);
+
+// Staged search (ggml-vector-index-turbovec-staged.cpp).
+inline constexpr size_t kTurboVecPlanesMinVectors = 32768;
+bool turbovec_planes_for(int bits, int dim);
+bool turbovec_planes_wanted(int bits, int dim, size_t n_vectors);
+// After an add (first new slot), a load or calibrate (0): promotes the
+// index or patches its sign planes.
+void turbovec_planes_refresh(ggml_vec_index & idx, size_t first_slot);
+void turbovec_planes_reset(ggml_vec_index & idx);
+void turbovec_planes_swap_remove(ggml_vec_index & idx, size_t slot, size_t last);
+// Searches one query (rotated, TQ+-calibrated) in stages into `heap`;
+// returns false when the index is not set up for it.
+// How a staged search is run, following upstream's batch bookkeeping.
+struct TurboVecStagedOpts {
+    // The call searches one query: on aarch64 its sign tables cap at 31.
+    bool single_query = false;
+    // The shortlist scan alone uses a lone query's tables (upstream's
+    // rescan of the one query in a batch whose sampled seed ran short).
+    bool sign_single = false;
+    // Set to whether upstream's sampled seed would have left this query's
+    // shortlist short; false when upstream does not seed.
+    bool * seed_short = nullptr;
+};
+bool turbovec_staged_search(
+    const ggml_vec_index & idx,
+    const float * query,
+    float bias_corr,
+    int k,
+    const uint8_t * allowed_mask,
+    const TurboVecStagedOpts & opts,
+    std::vector<ScoreId> & heap);
 void prepare_turbovec(int bits, int dim, bool legacy);
 void rotate_turbovec_query(bool legacy, const float * src, float * dst, int dim);
 void rotate_turbovec_queries(
@@ -645,18 +781,23 @@ void turbovec_seq_row_to_packed(const uint8_t * seq, int bits, int dim, uint8_t 
 // Upstream turbovec v8 snapshot pieces: the superblock, the used prefix of
 // header slot 0, and the block units. The full image is superblock, two
 // header_len slots (slot 0 starts with header0, the rest is zero), units.
+// Units are produced on demand, so a writer never holds them all at once;
+// `unit` reads the index and is only valid while its lock is held.
 struct TurboVecV8Image {
     std::vector<uint8_t> superblock;
     std::vector<uint8_t> header0;
     size_t header_len = 0;
-    std::vector<uint8_t> units;
+    size_t n_units = 0;
+    size_t unit_len = 0;
+    std::function<void(size_t block, uint8_t * out)> unit;
 };
 bool turbovec_v8_magic(const uint8_t * bytes, size_t size);
 uint64_t turbovec_v8_declared_size(std::istream & f, uint64_t file_size);
 void turbovec_v8_build_image(const ggml_vec_index & idx, TurboVecV8Image & image);
 size_t turbovec_v8_image_size(const TurboVecV8Image & image);
 size_t turbovec_v8_serialized_size(const ggml_vec_index & idx);
-void turbovec_v8_flatten_image(const TurboVecV8Image & image, std::vector<uint8_t> & out);
+// Writes the whole image into out (turbovec_v8_image_size bytes, zeroed).
+void turbovec_v8_fill_image(const TurboVecV8Image & image, uint8_t * out);
 struct TurboVecV8LoadInfo {
     uint64_t gen = 0;
     uint64_t nonce = 0;
@@ -667,7 +808,7 @@ ggml_vec_index_t * turbovec_v8_load_image(std::vector<uint8_t> raw, int & error,
 
 // Positioned writes made durable together (one fsync per batch).
 using TurboVecWriteBatch = std::vector<std::pair<uint64_t, std::vector<uint8_t>>>;
-int turbovec_v8_write_file(const char * path, const TurboVecV8Image & image);
+int turbovec_v8_write_file(const char * path, const TurboVecV8Image & image, bool durable = true);
 int turbovec_v8_apply_batches(const char * path, const std::vector<TurboVecWriteBatch> & batches);
 // Reads up to `size` bytes at `offset`; GGML_VEC_INDEX_E_NOT_FOUND when the
 // file does not exist.
@@ -711,13 +852,49 @@ float dot_turbovec_q4_row(const float * query, const uint8_t * codes, const floa
 // Patches the blocked cache for a swap-remove of `slot` whose last slot
 // (`last`, already removed from the rows) moved into it.
 void turbovec_blocked_swap_remove(ggml_vec_index & idx, size_t slot, size_t last);
+// Drops the blocked cache's rows from n on, zeroing the tail block's lanes.
+void turbovec_blocked_truncate(ggml_vec_index & idx, size_t n);
+// Code access that works whether the codes live in packed rows (legacy) or
+// only in the blocked cache (1.x).
+bool turbovec_rows_in_blocked(const ggml_vec_index & idx);
+// Materializes the packed rows from the blocked cache (planes promotion),
+// and drops them again once only the blocked cache is needed.
+void turbovec_materialize_packed_rows(ggml_vec_index & idx);
+void turbovec_settle_rows(ggml_vec_index & idx);
+void turbovec_row_seq(const ggml_vec_index & idx, size_t slot, uint8_t * seq);
+void turbovec_row_packed(const ggml_vec_index & idx, size_t slot, uint8_t * packed);
+// The slot's packed row without copying when the index keeps packed rows (a
+// legacy row can be wider than any 1.x row); a 1.x row is read back from the
+// blocked cache into `scratch`, which must hold kTurboVecMaxDim / 2 bytes.
+const uint8_t * turbovec_row_packed_ptr(const ggml_vec_index & idx, size_t slot, uint8_t * scratch);
+void turbovec_rows_packed(const ggml_vec_index & idx, std::vector<uint8_t> & packed);
+// The packed rows of one 32-row block (fewer for the tail block).
+// `scratch` holds turbovec_block_scratch_bytes(idx) bytes.
+size_t turbovec_block_scratch_bytes(const ggml_vec_index & idx);
+void turbovec_block_rows_packed(const ggml_vec_index & idx, size_t block, uint8_t * packed, uint8_t * scratch);
+// Writes one row's sequential codes into its blocked-cache lane.
+void turbovec_blocked_set_row_seq(ggml_vec_index & idx, size_t slot, const uint8_t * seq);
+// Writes n_new packed rows into the blocked cache from first_slot on.
+void turbovec_blocked_append(ggml_vec_index & idx, const uint8_t * packed, size_t first_slot, size_t n_new);
+// The sign planes of rows [first_slot, n_vectors) into the sign blocked
+// cache (upstream's planes sign region), growing or shrinking it to cover
+// n_vectors rows.
+void repack_turbovec_sign_codes(
+    const uint8_t * packed_codes,
+    size_t n_vectors,
+    int bits,
+    int dim,
+    size_t first_slot,
+    std::vector<uint8_t> & sign_blocked);
+void turbovec_sign_blocked_swap_remove(ggml_vec_index & idx, size_t slot, size_t last);
 void repack_turbovec_codes(
     const uint8_t * packed_codes,
     size_t n_vectors,
     int bits,
     int dim,
     std::vector<uint8_t> & blocked_codes,
-    size_t & n_blocks);
+    size_t & n_blocks,
+    bool vector_major = false);
 void repack_turbovec_codes_from_slot(
     const uint8_t * packed_codes,
     size_t n_vectors,
@@ -725,7 +902,8 @@ void repack_turbovec_codes_from_slot(
     int dim,
     size_t first_slot,
     std::vector<uint8_t> & blocked_codes,
-    size_t & n_blocks);
+    size_t & n_blocks,
+    bool vector_major = false);
 void score_turbovec_lut_block(
     const uint8_t * lut,
     float lut_scale,
@@ -766,7 +944,9 @@ int ggml_vec_index_remove_unlocked(
 
 uint32_t index_state_crc32c(const ggml_vec_index & idx);
 uint32_t index_state_crc32c_after_remove(const ggml_vec_index & idx, uint64_t id);
-uint64_t slot_state_hash(const ggml_vec_index & idx, size_t slot);
+// turbovec_row, when given, is the slot's packed TurboVec row (saves
+// reading it back from the blocked cache).
+uint64_t slot_state_hash(const ggml_vec_index & idx, size_t slot, const uint8_t * turbovec_row = nullptr);
 void add_state_hash(ggml_vec_index & idx, uint64_t hash);
 void remove_state_hash(ggml_vec_index & idx, uint64_t hash);
 void rebuild_state_hash(ggml_vec_index & idx);

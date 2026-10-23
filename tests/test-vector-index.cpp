@@ -11,6 +11,7 @@
 #include <cassert>
 #include <atomic>
 #include <cfloat>
+#include <chrono>
 #include <cfenv>
 #include <cmath>
 #include <cstddef>
@@ -21,8 +22,10 @@
 #include <filesystem>
 #include <fstream>
 #include <limits>
+#include <new>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -37,11 +40,99 @@
 #endif
 
 #ifdef GGML_VEC_INDEX_TEST_HOOKS
+// The largest single operator new request while tracking is on, to bound
+// what a snapshot writer holds at once.
+static std::atomic<bool> g_track_largest_alloc{ false };
+static std::atomic<size_t> g_largest_alloc{ 0 };
+// When positive, the operator new call that brings it to zero throws, so a
+// test can fail every allocation an API call makes, one at a time.
+static std::atomic<long> g_alloc_fail_countdown{ 0 };
+
+// GCC can inline a replacement operator delete into its callers and then
+// flags its free() of operator new's memory (-Wmismatched-new-delete),
+// although these replacements pair malloc with free.
+#if defined(__GNUC__) && !defined(__clang__)
+#define GGML_VI_TEST_NOINLINE __attribute__((noinline))
+#if __GNUC__ >= 11
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wmismatched-new-delete"
+#endif
+#else
+#define GGML_VI_TEST_NOINLINE
+#endif
+
+void * operator new(size_t size) {
+    if (g_alloc_fail_countdown.load(std::memory_order_relaxed) > 0 && g_alloc_fail_countdown.fetch_sub(1) == 1) {
+        throw std::bad_alloc();
+    }
+    if (g_track_largest_alloc.load(std::memory_order_relaxed)) {
+        size_t seen = g_largest_alloc.load(std::memory_order_relaxed);
+        while (size > seen && !g_largest_alloc.compare_exchange_weak(seen, size)) {
+        }
+    }
+    if (void * p = std::malloc(size == 0 ? 1 : size)) {
+        return p;
+    }
+    throw std::bad_alloc();
+}
+
+GGML_VI_TEST_NOINLINE void operator delete(void * p) noexcept {
+    std::free(p);
+}
+
+GGML_VI_TEST_NOINLINE void operator delete(void * p, size_t) noexcept {
+    std::free(p);
+}
+
+// The other forms, so every allocation the program makes pairs malloc with
+// free: a sanitizer's own nothrow or array operator new would otherwise
+// hand our free memory it allocated differently.
+void * operator new[](size_t size) {
+    return ::operator new(size);
+}
+
+void * operator new(size_t size, const std::nothrow_t &) noexcept {
+    try {
+        return ::operator new(size);
+    } catch (...) {
+        return nullptr;
+    }
+}
+
+void * operator new[](size_t size, const std::nothrow_t &) noexcept {
+    try {
+        return ::operator new(size);
+    } catch (...) {
+        return nullptr;
+    }
+}
+
+GGML_VI_TEST_NOINLINE void operator delete[](void * p) noexcept {
+    std::free(p);
+}
+
+GGML_VI_TEST_NOINLINE void operator delete[](void * p, size_t) noexcept {
+    std::free(p);
+}
+
+GGML_VI_TEST_NOINLINE void operator delete(void * p, const std::nothrow_t &) noexcept {
+    std::free(p);
+}
+
+GGML_VI_TEST_NOINLINE void operator delete[](void * p, const std::nothrow_t &) noexcept {
+    std::free(p);
+}
+
+#if defined(__GNUC__) && !defined(__clang__) && __GNUC__ >= 11
+#pragma GCC diagnostic pop
+#endif
+
 extern "C" {
 int     ggml_vec_index_test_can_address_array(size_t count, size_t element_size);
 void    ggml_vec_index_test_set_write_fail_after(int64_t bytes);
 void    ggml_vec_index_test_set_oom_countdown(int64_t countdown);
 void    ggml_vec_index_test_set_parent_fsync_fail(int fail);
+void    ggml_vec_index_test_set_data_fsync_fail(int fail);
 void    ggml_vec_index_test_set_parent_fsync_fail_after(int64_t count);
 void    ggml_vec_index_test_set_load_with_delta_block(int block);
 int     ggml_vec_index_test_get_load_with_delta_waiters(void);
@@ -77,12 +168,17 @@ uint64_t turbovec_lut_hash_for_test(
 uint64_t turbovec_codebook_hash_for_test(int bits, int dim);
 uint64_t turbovec_blocked_hash_for_test(const ggml_vec_index_t * idx);
 void turbovec_clear_blocked_for_test(ggml_vec_index_t * idx);
+void turbovec_code_bytes_for_test(
+    const ggml_vec_index_t * idx, size_t * packed, size_t * blocked, size_t * sign);
 int turbovec_avx2_available_for_test();
 int turbovec_avx2_lut_block_matches_scalar_for_test(int bits, int dim);
 void turbovec_reset_block_score_call_count_for_test(void);
 int64_t turbovec_block_score_call_count_for_test(void);
 uint64_t turbovec_ziggurat_table_hash_for_test(void);
 void turbovec_hadamard_rotate_for_test(const float * src, float * dst, int dim);
+void turbovec_force_vector_major_for_test(int mode);
+void turbovec_disable_dot_product_for_test(int disabled);
+void turbovec_force_planes_for_test(int mode, size_t min_vectors);
 int turbovec_sync_plan_for_test(
     ggml_vec_index_t * idx,
     const char * path,
@@ -130,6 +226,8 @@ constexpr int kTurboVecMaxTestDim = 16384;
 #include "turbovec-golden-dim256-q2.inc"
 #include "turbovec-golden-dim256-q4.inc"
 #include "turbovec-1x-golden.inc"
+#include "turbovec-1x-golden-vm.inc"
+#include "turbovec-1x-golden-staged.inc"
 
 #define CHECK(cond)                                                            \
     do {                                                                       \
@@ -3128,13 +3226,14 @@ void refresh_turbovec_tvim_checksums(std::vector<uint8_t> & bytes, const TurboVe
             0xffffffffu);
 }
 
-void check_turbovec_oversized_snapshot_compatibility(int bits) {
+// v3 snapshots load at dimensions past what legacy indexes add or search;
+// at 40000 a packed row is wider than any TurboVec 1.x row.
+void check_turbovec_oversized_snapshot_compatibility(int bits, int old_dim = 1032) {
     constexpr int current_dim = 16;
-    constexpr int old_dim = 1032;
     constexpr int count = 2;
     CHECK(bits == 2 || bits == 4);
 
-    const std::string suffix = std::to_string(bits);
+    const std::string suffix = std::to_string(bits) + "-" + std::to_string(old_dim);
     const std::string path =
         (std::filesystem::temp_directory_path() /
          ("ggml-vector-index-turbovec-old-dim-q" + suffix + ".tvim")).string();
@@ -4493,7 +4592,7 @@ std::vector<uint8_t> tv1x_snapshot_bytes(ggml_vec_index_t * idx, const char * na
     return bytes;
 }
 
-void tv1x_check_search(
+bool tv1x_search_matches(
         ggml_vec_index_t * idx,
         const std::vector<float> & queries,
         const uint64_t * expected_ids,
@@ -4503,13 +4602,46 @@ void tv1x_check_search(
     CHECK(ggml_vec_index_search(idx, queries.data(), kTv1xNQuery, kTv1xK, scores.data(), ids.data()) ==
           GGML_VEC_INDEX_OK);
     for (size_t i = 0; i < ids.size(); ++i) {
-        CHECK(ids[i] == expected_ids[i]);
-        const float tolerance = 1e-5f * std::max(1.0f, std::fabs(expected_scores[i]));
-        CHECK(std::fabs(scores[i] - expected_scores[i]) <= tolerance);
+        if (ids[i] != expected_ids[i] || scores[i] != expected_scores[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+const Tv1xVmCase * tv1x_vm_case(int dim) {
+    for (const Tv1xVmCase & c : kTv1xVmCases) {
+        if (c.dim == dim) {
+            return &c;
+        }
+    }
+    return nullptr;
+}
+
+// Upstream scores 4-bit codes with its permute-dot kernel on hosts that run
+// it and with the nibble LUT elsewhere; this port makes the same choice when
+// an index is created. `kernel` names the expected one: 0 LUT, 1 permute-dot,
+// -1 whichever this host picked.
+void tv1x_check_search(
+        ggml_vec_index_t * idx,
+        int bits,
+        int kernel,
+        const std::vector<float> & queries,
+        const uint64_t * lut_ids,
+        const float * lut_scores,
+        const uint64_t * vm_ids,
+        const float * vm_scores) {
+    if (bits != 4 || kernel == 0) {
+        CHECK(tv1x_search_matches(idx, queries, lut_ids, lut_scores));
+    } else if (kernel == 1) {
+        CHECK(tv1x_search_matches(idx, queries, vm_ids, vm_scores));
+    } else {
+        CHECK(tv1x_search_matches(idx, queries, lut_ids, lut_scores) ||
+              tv1x_search_matches(idx, queries, vm_ids, vm_scores));
     }
 }
 
-void check_turbovec_1x_golden_case(const Tv1xIndexCase & c) {
+void check_turbovec_1x_golden_case(const Tv1xIndexCase & c, int kernel) {
     const size_t dim = static_cast<size_t>(c.dim);
     std::vector<float> db = tv1x_rows(kTv1xSeedDb, kTv1xNDb, dim);
     std::fill(db.begin(), db.begin() + static_cast<std::ptrdiff_t>(dim), 0.0f);
@@ -4522,7 +4654,11 @@ void check_turbovec_1x_golden_case(const Tv1xIndexCase & c) {
     CHECK(ggml_vec_index_bit_width(plain) == c.bits);
     CHECK(ggml_vec_index_add(plain, db.data(), kTv1xNDb, ids.data()) == GGML_VEC_INDEX_OK);
     CHECK(ggml_vec_index_turbovec_is_calibrated(plain) == 0);
-    tv1x_check_search(plain, queries, c.search_ids, c.search_scores);
+    const Tv1xVmCase * vm = c.bits == 4 ? tv1x_vm_case(c.dim) : nullptr;
+    CHECK(c.bits != 4 || vm != nullptr);
+    tv1x_check_search(
+        plain, c.bits, kernel, queries, c.search_ids, c.search_scores,
+        vm != nullptr ? vm->search_ids : nullptr, vm != nullptr ? vm->search_scores : nullptr);
     const std::vector<uint8_t> plain_bytes = tv1x_snapshot_bytes(plain, "ggml-vector-index-tv1x-plain.tvim");
     CHECK(plain_bytes.size() == c.snapshot_len);
     CHECK(tv1x_fnv(plain_bytes.data(), plain_bytes.size()) == c.snapshot_hash);
@@ -4532,7 +4668,9 @@ void check_turbovec_1x_golden_case(const Tv1xIndexCase & c) {
     CHECK(ggml_vec_index_turbovec_calibrate(calibrated, calib.data(), kTv1xNCalib) == GGML_VEC_INDEX_OK);
     CHECK(ggml_vec_index_turbovec_is_calibrated(calibrated) == 1);
     CHECK(ggml_vec_index_add(calibrated, db.data(), kTv1xNDb, ids.data()) == GGML_VEC_INDEX_OK);
-    tv1x_check_search(calibrated, queries, c.calibrated_search_ids, c.calibrated_search_scores);
+    tv1x_check_search(
+        calibrated, c.bits, kernel, queries, c.calibrated_search_ids, c.calibrated_search_scores,
+        vm != nullptr ? vm->calibrated_search_ids : nullptr, vm != nullptr ? vm->calibrated_search_scores : nullptr);
     const std::vector<uint8_t> calibrated_bytes =
         tv1x_snapshot_bytes(calibrated, "ggml-vector-index-tv1x-calibrated.tvim");
     CHECK(calibrated_bytes.size() == c.calibrated_snapshot_len);
@@ -4932,9 +5070,9 @@ void check_turbovec_1x_sync_case(const Tv1xSyncCase & c) {
     CHECK(ggml_vec_index_len(loaded) == 120 - 7 + 10);
     CHECK(ggml_vec_index_search(loaded, queries.data(), kTv1xNQuery, kTv1xK, scores.data(), out.data()) ==
           GGML_VEC_INDEX_OK);
-    for (size_t i = 0; i < out.size(); ++i) {
-        CHECK(out[i] == c.final_ids[i]);
-    }
+    const bool lut_ids = std::equal(out.begin(), out.end(), c.final_ids);
+    const bool vm_ids = c.bits == 4 && std::equal(out.begin(), out.end(), kTv1xVmSyncFinalIds4);
+    CHECK(lut_ids || vm_ids);
 
     // The loaded index is bound to the file and syncs on incrementally.
     CHECK(ggml_vec_index_remove(loaded, ids[3]) == GGML_VEC_INDEX_OK);
@@ -5632,9 +5770,775 @@ void check_turbovec_1x_reordered_and_stale_commits() {
 }
 #endif
 
+#ifdef GGML_VEC_INDEX_TEST_HOOKS
+// The portable permute-dot kernel and the SDOT one accumulate the same
+// integers, in both blocked layouts, including after swap-removes.
+void check_turbovec_1x_permute_dot_kernels() {
+    constexpr int dim = 200;
+    const std::vector<float> rows = tv1x_rows(kTv1xSeedDb, 150, dim);
+    const std::vector<uint64_t> ids = tv1x_ids(150);
+    const std::vector<float> queries = tv1x_rows(kTv1xSeedQuery, 6, dim);
+    turbovec_force_vector_major_for_test(1);
+    auto * tv = ggml_vec_index_create_turbovec(dim, 4);
+    turbovec_force_vector_major_for_test(-1);
+    CHECK(ggml_vec_index_add(tv, rows.data(), 150, ids.data()) == GGML_VEC_INDEX_OK);
+    for (const size_t i : { 4, 77, 149, 30 }) {
+        CHECK(ggml_vec_index_remove(tv, ids[i]) == GGML_VEC_INDEX_OK);
+    }
+    std::vector<float> scores[2];
+    std::vector<uint64_t> out[2];
+    for (int scalar = 0; scalar < 2; ++scalar) {
+        turbovec_disable_dot_product_for_test(scalar);
+        scores[scalar].resize(6 * 12 + 12);
+        out[scalar].resize(scores[scalar].size());
+        CHECK(ggml_vec_index_search(tv, queries.data(), 6, 12, scores[scalar].data(), out[scalar].data()) ==
+              GGML_VEC_INDEX_OK);
+        CHECK(ggml_vec_index_search(tv, queries.data(), 1, 12, scores[scalar].data() + 72, out[scalar].data() + 72) ==
+              GGML_VEC_INDEX_OK);
+    }
+    turbovec_disable_dot_product_for_test(0);
+    CHECK(scores[0] == scores[1]);
+    CHECK(out[0] == out[1]);
+    ggml_vec_index_free(tv);
+}
+#endif
+
+#ifdef GGML_VEC_INDEX_TEST_HOOKS
+// Staged search (upstream planes search): returned scores are the full
+// scan's for the same ids, and on aarch64 the results are upstream's.
+void check_turbovec_1x_staged() {
+    const int n = kTv1xStagedN;
+    const size_t dim = static_cast<size_t>(kTv1xStagedDim);
+    const int k = kTv1xStagedK;
+    const std::vector<float> db = tv1x_rows(kTv1xSeedDb, static_cast<size_t>(n), dim);
+    const std::vector<uint64_t> ids = tv1x_ids(static_cast<size_t>(n));
+    const std::vector<float> queries = tv1x_rows(kTv1xSeedQuery, 3, dim);
+    const std::vector<float> calib = tv1x_rows(kTv1xSeedCalib, kTv1xNCalib, dim);
+    std::vector<uint64_t> allow;
+    for (size_t i = 0; i < ids.size(); i += 3) {
+        allow.push_back(ids[i]);
+    }
+    turbovec_force_planes_for_test(1, 0);
+    turbovec_force_vector_major_for_test(1);
+    for (const int bits : { 2, 4 }) {
+        for (const int calibrated : { 0, 1 }) {
+            auto * tv = ggml_vec_index_create_turbovec(static_cast<int>(dim), bits);
+            if (calibrated != 0) {
+                CHECK(ggml_vec_index_turbovec_calibrate(tv, calib.data(), kTv1xNCalib) == GGML_VEC_INDEX_OK);
+            }
+            CHECK(ggml_vec_index_add(tv, db.data(), n, ids.data()) == GGML_VEC_INDEX_OK);
+            // At this size upstream stores units as bit planes.
+            const std::vector<uint8_t> image = tv1x_snapshot_bytes(tv, "ggml-vector-index-tv1x-staged.tvim");
+            CHECK(image[7] == 1);
+            bool snapshot_found = false;
+            for (const Tv1xStagedSnapshot & snap : kTv1xStagedSnapshots) {
+                if (snap.bits == bits && snap.calibrated == calibrated) {
+                    snapshot_found = true;
+                    CHECK(image.size() == snap.len);
+                    CHECK(tv1x_fnv(image.data(), image.size()) == snap.hash);
+                }
+            }
+            CHECK(snapshot_found);
+            auto * reloaded = tv1x_load_bytes(image);
+            CHECK(reloaded != nullptr);
+            CHECK(tv1x_snapshot_bytes(reloaded, "ggml-vector-index-tv1x-staged-2.tvim") == image);
+            ggml_vec_index_free(reloaded);
+            for (const int nq : { 1, 3 }) {
+                for (const int filtered : { 0, 1 }) {
+                    auto search = [&](std::vector<float> & scores, std::vector<uint64_t> & out) {
+                        scores.assign(static_cast<size_t>(3 * k), 0.0f);
+                        out.assign(scores.size(), 0);
+                        for (int q = 0; q < 3; q += nq) {
+                            const float * query = queries.data() + static_cast<size_t>(q) * dim;
+                            float * s = scores.data() + static_cast<size_t>(q * k);
+                            uint64_t * o = out.data() + static_cast<size_t>(q * k);
+                            CHECK((filtered != 0 ?
+                                ggml_vec_index_search_filtered(tv, query, nq, k, allow.data(), static_cast<int>(allow.size()), s, o) :
+                                ggml_vec_index_search(tv, query, nq, k, s, o)) == GGML_VEC_INDEX_OK);
+                        }
+                    };
+                    std::vector<float> staged_scores;
+                    std::vector<uint64_t> staged_ids;
+                    search(staged_scores, staged_ids);
+                    // Every returned score is the full scan's for that id.
+                    CHECK(ggml_vec_index_turbovec_set_staged(tv, 0) == GGML_VEC_INDEX_OK);
+                    std::vector<float> full_scores;
+                    std::vector<uint64_t> full_ids;
+                    search(full_scores, full_ids);
+                    CHECK(ggml_vec_index_turbovec_set_staged(tv, 1) == GGML_VEC_INDEX_OK);
+                    size_t shared = 0;
+                    for (size_t i = 0; i < staged_ids.size(); ++i) {
+                        const size_t q = i / static_cast<size_t>(k);
+                        for (size_t j = q * static_cast<size_t>(k); j < (q + 1) * static_cast<size_t>(k); ++j) {
+                            if (full_ids[j] == staged_ids[i]) {
+                                CHECK(full_scores[j] == staged_scores[i]);
+                                ++shared;
+                            }
+                        }
+                    }
+                    CHECK(shared * 10 >= staged_ids.size() * 8);
+#if defined(__aarch64__) || defined(_M_ARM64)
+                    bool found = false;
+                    for (const Tv1xStagedCase & c : kTv1xStagedCases) {
+                        if (c.bits == bits && c.calibrated == calibrated && c.nq == nq && c.filtered == filtered) {
+                            found = true;
+                            for (size_t i = 0; i < staged_ids.size(); ++i) {
+                                CHECK(staged_ids[i] == c.ids[i]);
+                                CHECK(staged_scores[i] == c.scores[i]);
+                            }
+                        }
+                    }
+                    CHECK(found);
+#endif
+                }
+            }
+            ggml_vec_index_free(tv);
+        }
+    }
+#if defined(__aarch64__) || defined(_M_ARM64)
+    // A batch in which only query 0's sampled seed runs short: upstream
+    // rescans it with the single-query sign tables, and so does the port.
+    {
+        const int short_k = kTv1xStagedShortK;
+        std::vector<float> short_db = db;
+        const std::vector<float> noise = tv1x_rows(kTv1xStagedShortNoiseSeed, 48 * 32, dim);
+        const size_t stride = (static_cast<size_t>(n) / 32) / 48;
+        for (size_t i = 0; i < 48; ++i) {
+            const size_t block = i * stride + stride / 2;
+            for (size_t lane = 0; lane < 32; ++lane) {
+                const size_t row = block * 32 + lane;
+                for (size_t c = 0; c < dim; ++c) {
+                    short_db[row * dim + c] = queries[c] + 0.05f * noise[(i * 32 + lane) * dim + c];
+                }
+            }
+        }
+        for (const Tv1xStagedShortCase & c : kTv1xStagedShortCases) {
+            auto * tv = ggml_vec_index_create_turbovec(static_cast<int>(dim), c.bits);
+            if (c.calibrated != 0) {
+                CHECK(ggml_vec_index_turbovec_calibrate(tv, calib.data(), kTv1xNCalib) == GGML_VEC_INDEX_OK);
+            }
+            CHECK(ggml_vec_index_add(tv, short_db.data(), n, ids.data()) == GGML_VEC_INDEX_OK);
+            std::vector<float> scores(static_cast<size_t>(3 * short_k));
+            std::vector<uint64_t> out(scores.size());
+            for (const int threads : { 1, 4 }) {
+                ggml_vec_index_set_threads(tv, threads);
+                CHECK(ggml_vec_index_search(tv, queries.data(), 3, short_k, scores.data(), out.data()) ==
+                      GGML_VEC_INDEX_OK);
+                for (size_t i = 0; i < out.size(); ++i) {
+                    CHECK(out[i] == c.ids[i]);
+                    CHECK(scores[i] == c.scores[i]);
+                }
+            }
+            ggml_vec_index_free(tv);
+        }
+    }
+#endif
+    turbovec_force_vector_major_for_test(-1);
+    turbovec_force_planes_for_test(-1, 0);
+}
+#endif
+
+#ifdef GGML_VEC_INDEX_TEST_HOOKS
+// The staged-search cache follows every mutation: an index searched after
+// adds, removals, a calibrate or a reload agrees with one rebuilt from its
+// bytes, and the file layout follows the index's size across syncs.
+void check_turbovec_1x_staged_maintenance() {
+    constexpr int dim = 64;
+    constexpr int threshold = 1000;
+    const std::vector<float> rows = tv1x_rows(kTv1xSeedDb, 3000, dim);
+    const std::vector<uint64_t> ids = tv1x_ids(3000);
+    const std::vector<float> queries = tv1x_rows(kTv1xSeedQuery, 4, dim);
+    const std::vector<float> calib = tv1x_rows(kTv1xSeedCalib, 1024, dim);
+    const std::string path = (std::filesystem::temp_directory_path() / "ggml-vector-index-tv1x-staged-sync.tvim").string();
+    turbovec_force_planes_for_test(1, threshold);
+    turbovec_force_vector_major_for_test(1);
+    auto agrees_with_rebuilt = [&](ggml_vec_index_t * tv) {
+        uint8_t * data = nullptr;
+        size_t size = 0;
+        CHECK(ggml_vec_index_to_bytes(tv, &data, &size) == GGML_VEC_INDEX_OK);
+        ggml_vec_index_t * rebuilt = nullptr;
+        CHECK(ggml_vec_index_from_bytes(data, size, &rebuilt) == GGML_VEC_INDEX_OK);
+        ggml_vec_index_bytes_free(data);
+        std::vector<float> s1(4 * 8), s2(4 * 8);
+        std::vector<uint64_t> o1(4 * 8), o2(4 * 8);
+        CHECK(ggml_vec_index_search(tv, queries.data(), 4, 8, s1.data(), o1.data()) == GGML_VEC_INDEX_OK);
+        CHECK(ggml_vec_index_search(rebuilt, queries.data(), 4, 8, s2.data(), o2.data()) == GGML_VEC_INDEX_OK);
+        CHECK(o1 == o2 && s1 == s2);
+        ggml_vec_index_free(rebuilt);
+        return size;
+    };
+    auto layout_of = [&](ggml_vec_index_t * tv) {
+        return tv1x_snapshot_bytes(tv, "ggml-vector-index-tv1x-staged-layout.tvim")[7];
+    };
+    for (const int bits : { 2, 4 }) {
+        std::filesystem::remove(path);
+        auto * tv = ggml_vec_index_create_turbovec(dim, bits);
+        CHECK(ggml_vec_index_add(tv, rows.data(), 900, ids.data()) == GGML_VEC_INDEX_OK);
+        CHECK(layout_of(tv) == 0);
+        CHECK(ggml_vec_index_sync(tv, path.c_str()) == GGML_VEC_INDEX_OK);
+        // Crossing the threshold promotes the index; the next sync rewrites
+        // the file in the planes layout.
+        CHECK(ggml_vec_index_add(tv, rows.data() + 900 * dim, 600, ids.data() + 900) == GGML_VEC_INDEX_OK);
+        CHECK(layout_of(tv) == 1);
+        agrees_with_rebuilt(tv);
+        const uint64_t nonce = tv1x_nonce(path);
+        CHECK(ggml_vec_index_sync(tv, path.c_str()) == GGML_VEC_INDEX_OK);
+        CHECK(tv1x_nonce(path) != nonce);
+        CHECK(read_file_bytes(path)[7] == 1);
+        // Adds and removals patch the sign planes in place.
+        CHECK(ggml_vec_index_add(tv, rows.data() + 1500 * dim, 77, ids.data() + 1500) == GGML_VEC_INDEX_OK);
+        for (size_t i = 0; i < 1577; i += 41) {
+            CHECK(ggml_vec_index_remove(tv, ids[i]) == GGML_VEC_INDEX_OK);
+        }
+        agrees_with_rebuilt(tv);
+        // A later sync stays incremental in the planes layout and reloads.
+        const uint64_t planes_nonce = tv1x_nonce(path);
+        CHECK(ggml_vec_index_sync(tv, path.c_str()) == GGML_VEC_INDEX_OK);
+        CHECK(tv1x_nonce(path) == planes_nonce);
+        auto * loaded = ggml_vec_index_load(path.c_str());
+        CHECK(loaded != nullptr);
+        CHECK(tv1x_snapshot_bytes(loaded, "ggml-vector-index-tv1x-staged-l.tvim") ==
+              tv1x_snapshot_bytes(tv, "ggml-vector-index-tv1x-staged-t.tvim"));
+        ggml_vec_index_free(loaded);
+        // A calibrate re-encodes every row and rebuilds the cache.
+        CHECK(ggml_vec_index_turbovec_calibrate(tv, calib.data(), 1024) == GGML_VEC_INDEX_OK);
+        agrees_with_rebuilt(tv);
+        // Shrinking below the threshold keeps the staged search but stores
+        // sequential units, as upstream does.
+        for (size_t i = 1; i < 1577 && ggml_vec_index_len(tv) > 800; i += 2) {
+            ggml_vec_index_remove(tv, ids[i]);
+        }
+        CHECK(ggml_vec_index_len(tv) <= 800);
+        CHECK(layout_of(tv) == 0);
+        std::vector<float> scores(8);
+        std::vector<uint64_t> out(8);
+        CHECK(ggml_vec_index_search(tv, queries.data(), 1, 8, scores.data(), out.data()) == GGML_VEC_INDEX_OK);
+        ggml_vec_index_free(tv);
+    }
+    std::filesystem::remove(path);
+    turbovec_force_vector_major_for_test(-1);
+    turbovec_force_planes_for_test(-1, 0);
+}
+#endif
+
+#ifdef GGML_VEC_INDEX_TEST_HOOKS
+// A 1.x index keeps its codes once, in the blocked search cache, through
+// every mutation, snapshot and reload (upstream #475). Only the planes
+// layout, whose staged search reads bit planes row by row, adds packed rows.
+void check_turbovec_1x_single_code_copy() {
+    constexpr int dim = 64;
+    constexpr int n = 1000;
+    const std::vector<float> rows = tv1x_rows(kTv1xSeedDb, n, dim);
+    const std::vector<uint64_t> ids = tv1x_ids(n);
+    const std::vector<float> queries = tv1x_rows(kTv1xSeedQuery, 4, dim);
+    const std::vector<float> calib = tv1x_rows(kTv1xSeedCalib, 256, dim);
+    const std::string path = (std::filesystem::temp_directory_path() / "ggml-vector-index-tv1x-one-copy.tvim").string();
+    auto codes_once = [&](const ggml_vec_index_t * tv) {
+        size_t packed = 0;
+        size_t blocked = 0;
+        size_t sign = 0;
+        turbovec_code_bytes_for_test(tv, &packed, &blocked, &sign);
+        const int bits = ggml_vec_index_bit_width(tv);
+        const size_t n_byte_groups = static_cast<size_t>(dim) / static_cast<size_t>(8 / bits);
+        const size_t n_blocks = (static_cast<size_t>(ggml_vec_index_len(tv)) + 31) / 32;
+        return packed == 0 && sign == 0 && blocked == n_blocks * n_byte_groups * 32;
+    };
+    auto same_results = [&](ggml_vec_index_t * a, ggml_vec_index_t * b) {
+        std::vector<float> s1(4 * 10), s2(4 * 10);
+        std::vector<uint64_t> o1(4 * 10), o2(4 * 10);
+        CHECK(ggml_vec_index_search(a, queries.data(), 4, 10, s1.data(), o1.data()) == GGML_VEC_INDEX_OK);
+        CHECK(ggml_vec_index_search(b, queries.data(), 4, 10, s2.data(), o2.data()) == GGML_VEC_INDEX_OK);
+        return o1 == o2 && s1 == s2;
+    };
+    // The per-row scorer below is the LUT kernel; pin the blocked one to it.
+    turbovec_force_vector_major_for_test(0);
+    turbovec_force_planes_for_test(0, 0);
+    for (const int bits : { 2, 3, 4 }) {
+        std::filesystem::remove(path);
+        auto * tv = ggml_vec_index_create_turbovec(dim, bits);
+        CHECK(ggml_vec_index_add(tv, rows.data(), 700, ids.data()) == GGML_VEC_INDEX_OK);
+        CHECK(codes_once(tv));
+        CHECK(ggml_vec_index_sync(tv, path.c_str()) == GGML_VEC_INDEX_OK);
+        CHECK(ggml_vec_index_add(tv, rows.data() + 700 * dim, n - 700, ids.data() + 700) == GGML_VEC_INDEX_OK);
+        for (int i = 0; i < n; i += 37) {
+            CHECK(ggml_vec_index_remove(tv, ids[static_cast<size_t>(i)]) == GGML_VEC_INDEX_OK);
+        }
+        CHECK(codes_once(tv));
+        CHECK(ggml_vec_index_sync(tv, path.c_str()) == GGML_VEC_INDEX_OK);
+        CHECK(ggml_vec_index_compact(tv) == GGML_VEC_INDEX_OK);
+        CHECK(codes_once(tv));
+
+        // A reload, a bytes round trip and a calibrate all end with one copy,
+        // and the rows they hold match the index's own.
+        auto * loaded = ggml_vec_index_load(path.c_str());
+        CHECK(loaded != nullptr);
+        CHECK(codes_once(loaded));
+        CHECK(same_results(tv, loaded));
+        CHECK(tv1x_snapshot_bytes(loaded, "ggml-vector-index-tv1x-one-copy-l.tvim") ==
+              tv1x_snapshot_bytes(tv, "ggml-vector-index-tv1x-one-copy-t.tvim"));
+        uint8_t * data = nullptr;
+        size_t size = 0;
+        CHECK(ggml_vec_index_to_bytes(tv, &data, &size) == GGML_VEC_INDEX_OK);
+        ggml_vec_index_t * rebuilt = nullptr;
+        CHECK(ggml_vec_index_from_bytes(data, size, &rebuilt) == GGML_VEC_INDEX_OK);
+        ggml_vec_index_bytes_free(data);
+        CHECK(codes_once(rebuilt));
+        CHECK(ggml_vec_index_turbovec_calibrate(tv, calib.data(), 256) == GGML_VEC_INDEX_OK);
+        CHECK(ggml_vec_index_turbovec_calibrate(rebuilt, calib.data(), 256) == GGML_VEC_INDEX_OK);
+        CHECK(codes_once(tv));
+        CHECK(same_results(tv, rebuilt));
+        uint64_t h1[4] = {};
+        uint64_t h2[4] = {};
+        CHECK(turbovec_index_hashes_for_test(tv, &h1[0], &h1[1], &h1[2], &h1[3]) == 1);
+        CHECK(turbovec_index_hashes_for_test(rebuilt, &h2[0], &h2[1], &h2[2], &h2[3]) == 1);
+        CHECK(std::equal(h1, h1 + 4, h2));
+        ggml_vec_index_free(rebuilt);
+
+        // Per-row scoring reads the rows back from the blocked cache.
+        turbovec_clear_blocked_for_test(loaded);
+        size_t packed = 0;
+        size_t blocked = 0;
+        size_t sign = 0;
+        turbovec_code_bytes_for_test(loaded, &packed, &blocked, &sign);
+        CHECK(packed > 0 && blocked == 0);
+        auto * reloaded = ggml_vec_index_load(path.c_str());
+        const int live = ggml_vec_index_len(reloaded);
+        std::vector<float> s1(static_cast<size_t>(live)), s2(static_cast<size_t>(live));
+        std::vector<uint64_t> o1(static_cast<size_t>(live)), o2(static_cast<size_t>(live));
+        CHECK(ggml_vec_index_search(loaded, queries.data(), 1, live, s1.data(), o1.data()) == GGML_VEC_INDEX_OK);
+        CHECK(ggml_vec_index_search(reloaded, queries.data(), 1, live, s2.data(), o2.data()) == GGML_VEC_INDEX_OK);
+        std::unordered_map<uint64_t, float> by_id;
+        for (int i = 0; i < live; ++i) {
+            by_id[o2[static_cast<size_t>(i)]] = s2[static_cast<size_t>(i)];
+        }
+        for (int i = 0; i < live; ++i) {
+            const auto it = by_id.find(o1[static_cast<size_t>(i)]);
+            CHECK(it != by_id.end());
+            CHECK(std::fabs(it->second - s1[static_cast<size_t>(i)]) <= std::max(1e-4f * std::fabs(it->second), 1e-4f));
+        }
+        ggml_vec_index_free(reloaded);
+        ggml_vec_index_free(loaded);
+        ggml_vec_index_free(tv);
+    }
+
+    // Promotion to the planes layout materializes the packed rows next to
+    // the sign planes; a calibrate below the threshold drops them again.
+    turbovec_force_planes_for_test(1, 500);
+    for (const int bits : { 2, 4 }) {
+        auto * tv = ggml_vec_index_create_turbovec(dim, bits);
+        CHECK(ggml_vec_index_add(tv, rows.data(), 400, ids.data()) == GGML_VEC_INDEX_OK);
+        CHECK(codes_once(tv));
+        CHECK(ggml_vec_index_add(tv, rows.data() + 400 * dim, 200, ids.data() + 400) == GGML_VEC_INDEX_OK);
+        size_t packed = 0;
+        size_t blocked = 0;
+        size_t sign = 0;
+        turbovec_code_bytes_for_test(tv, &packed, &blocked, &sign);
+        CHECK(sign > 0 && packed >= static_cast<size_t>(600) * static_cast<size_t>(dim * bits / 8));
+        for (int i = 0; i < 200; ++i) {
+            CHECK(ggml_vec_index_remove(tv, ids[static_cast<size_t>(i)]) == GGML_VEC_INDEX_OK);
+        }
+        CHECK(ggml_vec_index_turbovec_calibrate(tv, calib.data(), 256) == GGML_VEC_INDEX_OK);
+        CHECK(codes_once(tv));
+        ggml_vec_index_free(tv);
+    }
+    turbovec_force_planes_for_test(-1, 0);
+    turbovec_force_vector_major_for_test(-1);
+    std::filesystem::remove(path);
+}
+#endif
+
+#ifdef GGML_VEC_INDEX_TEST_HOOKS
+// Equal scores come back in row order, as upstream turbovec returns them:
+// insertion order, as reshuffled by swap-remove. Other indexes order ties
+// by ascending id.
+void check_turbovec_1x_tie_order() {
+    constexpr int dim = 64;
+    const std::vector<float> row = tv1x_rows(kTv1xSeedDb, 1, dim);
+    std::vector<float> rows;
+    for (int i = 0; i < 4; ++i) {
+        rows.insert(rows.end(), row.begin(), row.end());
+    }
+    const uint64_t ids[4] = { 100, 99, 7, 50 };
+    auto top = [&](ggml_vec_index_t * idx, int k) {
+        std::vector<float> scores(static_cast<size_t>(k));
+        std::vector<uint64_t> out(static_cast<size_t>(k));
+        CHECK(ggml_vec_index_search(idx, row.data(), 1, k, scores.data(), out.data()) == GGML_VEC_INDEX_OK);
+        return out;
+    };
+    for (const int bits : { 2, 3, 4 }) {
+        auto * tv = ggml_vec_index_create_turbovec(dim, bits);
+        CHECK(ggml_vec_index_add(tv, rows.data(), 4, ids) == GGML_VEC_INDEX_OK);
+        CHECK((top(tv, 4) == std::vector<uint64_t>{ 100, 99, 7, 50 }));
+        CHECK((top(tv, 2) == std::vector<uint64_t>{ 100, 99 }));
+        // Removing row 0 moves the last row (id 50) into it.
+        CHECK(ggml_vec_index_remove(tv, 100) == GGML_VEC_INDEX_OK);
+        CHECK((top(tv, 3) == std::vector<uint64_t>{ 50, 99, 7 }));
+        ggml_vec_index_set_threads(tv, 4);
+        CHECK((top(tv, 3) == std::vector<uint64_t>{ 50, 99, 7 }));
+        ggml_vec_index_free(tv);
+    }
+    auto * f32 = ggml_vec_index_create(dim, 32);
+    CHECK(ggml_vec_index_add(f32, rows.data(), 4, ids) == GGML_VEC_INDEX_OK);
+    CHECK((top(f32, 4) == std::vector<uint64_t>{ 7, 50, 99, 100 }));
+    ggml_vec_index_free(f32);
+}
+
+// The stale-temp sweep reclaims only temps written for this destination in
+// the `.tmp.pid.seq.hex8` shape this port and upstream turbovec write (or
+// upstream's older `.tmp.pid.seq`), and leaves every other `.tmp.` file
+// alone, a user's `<name>.tmp.backup` included.
+void check_turbovec_stale_temp_sweep() {
+    const std::filesystem::path dir = verbatim_path(std::filesystem::temp_directory_path()) / "ggml-vector-index-sweep";
+    std::filesystem::remove_all(dir);
+    std::filesystem::create_directories(dir);
+    const auto old = std::filesystem::file_time_type::clock::now() - std::chrono::hours(2);
+    auto make = [&](const std::string & name, bool stale) {
+        const std::filesystem::path path = dir / name;
+        std::ofstream(path) << "x";
+        if (stale) {
+            std::filesystem::last_write_time(path, old);
+        }
+        return path;
+    };
+    const std::string long_base = std::string(240, 'a') + ".tvim";
+    const std::string kept_long_base = std::string(240, 'b') + ".tvim";
+    const std::string suffix = ".tmp.123.4.deadbeef";
+    const size_t cut = 255 - suffix.size();
+    const std::filesystem::path reclaimed[] = {
+        make("idx.tv.tmp.123.4", true),
+        make("idx.tv" + suffix, true),
+        // A long destination's temp carries the writer's exact cut.
+        make(long_base.substr(0, cut) + suffix, true),
+    };
+    const std::filesystem::path kept[] = {
+        make("idx.tv.tmp.backup", true),
+        make("idx.tv.tmp.Ab3dE9", true),
+        make("idx.tmp.backup", true),
+        make("idx.tv.tmp.notours", true),
+        make("idx.tv.tmp.12.x", true),
+        make("idx.tv.tmp.12.34.56", true),
+        make("idx.tv.tmp.123.4.deadbee", true),
+        make("idx.tv.tmp.99.7.0badf00d", false),
+        make("other.tv" + suffix, true),
+        // A cut stem that names an existing file may be that file's temp.
+        make(kept_long_base.substr(0, cut) + suffix, true),
+        make(kept_long_base.substr(0, cut), false),
+    };
+    constexpr int dim = 64;
+    const std::vector<float> rows = tv1x_rows(kTv1xSeedDb, 4, dim);
+    const std::vector<uint64_t> ids = tv1x_ids(4);
+    auto * tv = ggml_vec_index_create_turbovec(dim, 2);
+    CHECK(ggml_vec_index_add(tv, rows.data(), 4, ids.data()) == GGML_VEC_INDEX_OK);
+    CHECK(ggml_vec_index_write(tv, (dir / "idx.tv").string().c_str()) == GGML_VEC_INDEX_OK);
+    CHECK(ggml_vec_index_write(tv, (dir / long_base).string().c_str()) == GGML_VEC_INDEX_OK);
+    CHECK(ggml_vec_index_write(tv, (dir / kept_long_base).string().c_str()) == GGML_VEC_INDEX_OK);
+    ggml_vec_index_free(tv);
+    for (const auto & path : reclaimed) {
+        CHECK(!std::filesystem::exists(path));
+    }
+    for (const auto & path : kept) {
+        CHECK(std::filesystem::exists(path));
+    }
+    std::filesystem::remove_all(dir);
+}
+
+// Every allocation an add or a calibrate makes can fail without leaving
+// the index half changed: a failed call leaves the snapshot bytes as they
+// were, a successful one matches the same call made with memory to spare,
+// and the staged-search caches stay consistent with the rows either way.
+void check_turbovec_1x_alloc_failures() {
+    constexpr int dim = 64;
+    const std::vector<float> rows = tv1x_rows(kTv1xSeedDb, 140, dim);
+    const std::vector<uint64_t> ids = tv1x_ids(140);
+    const std::vector<float> queries = tv1x_rows(kTv1xSeedQuery, 3, dim);
+    const std::vector<float> calib = tv1x_rows(kTv1xSeedCalib, 64, dim);
+    turbovec_force_vector_major_for_test(0);
+    turbovec_force_planes_for_test(1, 96);
+    auto bytes_of = [](ggml_vec_index_t * idx) {
+        uint8_t * data = nullptr;
+        size_t size = 0;
+        CHECK(ggml_vec_index_to_bytes(idx, &data, &size) == GGML_VEC_INDEX_OK);
+        std::vector<uint8_t> out(data, data + size);
+        ggml_vec_index_bytes_free(data);
+        return out;
+    };
+    auto from = [](const std::vector<uint8_t> & bytes) {
+        ggml_vec_index_t * idx = nullptr;
+        CHECK(ggml_vec_index_from_bytes(bytes.data(), bytes.size(), &idx) == GGML_VEC_INDEX_OK);
+        return idx;
+    };
+    auto results = [&](ggml_vec_index_t * idx) {
+        std::vector<float> scores(3 * 10);
+        std::vector<uint64_t> out(3 * 10);
+        CHECK(ggml_vec_index_search(idx, queries.data(), 3, 10, scores.data(), out.data()) == GGML_VEC_INDEX_OK);
+        return std::make_pair(out, scores);
+    };
+    // Promoted exactly when it holds the sign planes, with packed rows next
+    // to them; otherwise one blocked copy of the codes.
+    auto consistent = [&](ggml_vec_index_t * idx, int bits) {
+        size_t packed = 0;
+        size_t blocked = 0;
+        size_t sign = 0;
+        turbovec_code_bytes_for_test(idx, &packed, &blocked, &sign);
+        const size_t n = static_cast<size_t>(ggml_vec_index_len(idx));
+        const size_t n_blocks = (n + 31) / 32;
+        const bool blocked_ok = blocked == n_blocks * 32 * static_cast<size_t>(dim / (8 / bits));
+        if (sign == 0) {
+            return blocked_ok && packed == 0;
+        }
+        return blocked_ok && sign == n_blocks * 32 * static_cast<size_t>(dim / 8) &&
+            packed >= n * static_cast<size_t>(dim * bits / 8);
+    };
+    // The reference searches the same rows promoted the same way.
+    auto same_search = [&](ggml_vec_index_t * idx, const std::vector<uint8_t> & bytes) {
+        size_t packed = 0;
+        size_t blocked = 0;
+        size_t sign = 0;
+        turbovec_code_bytes_for_test(idx, &packed, &blocked, &sign);
+        auto * ref = from(bytes);
+        if (sign == 0) {
+            ggml_vec_index_turbovec_set_staged(ref, 0);
+        }
+        const bool same = results(idx) == results(ref);
+        ggml_vec_index_free(ref);
+        return same;
+    };
+    for (const int bits : { 2, 4 }) {
+        for (const int op : { 0, 1 }) {
+            // op 0: an add that promotes the index; op 1: a calibrate of a
+            // promoted index.
+            auto * seed = ggml_vec_index_create_turbovec(dim, bits);
+            CHECK(ggml_vec_index_add(seed, rows.data(), op == 0 ? 95 : 130, ids.data()) == GGML_VEC_INDEX_OK);
+            const std::vector<uint8_t> before = bytes_of(seed);
+            auto run = [&](ggml_vec_index_t * idx) {
+                return op == 0 ? ggml_vec_index_add(idx, rows.data() + 95 * dim, 10, ids.data() + 95) :
+                                 ggml_vec_index_turbovec_calibrate(idx, calib.data(), 64);
+            };
+            CHECK(run(seed) == GGML_VEC_INDEX_OK);
+            const std::vector<uint8_t> after = bytes_of(seed);
+            ggml_vec_index_free(seed);
+            int failures = 0;
+            for (long countdown = 1; countdown < 20000; ++countdown) {
+                auto * idx = from(before);
+                g_alloc_fail_countdown.store(countdown);
+                const int rc = run(idx);
+                const bool injected = g_alloc_fail_countdown.exchange(0) <= 0;
+                if (rc == GGML_VEC_INDEX_OK) {
+                    CHECK(bytes_of(idx) == after);
+                    CHECK(consistent(idx, bits));
+                    CHECK(same_search(idx, after));
+                } else {
+                    CHECK(rc == GGML_VEC_INDEX_E_OOM);
+                    ++failures;
+                    CHECK(bytes_of(idx) == before);
+                    CHECK(consistent(idx, bits));
+                    CHECK(same_search(idx, before));
+                    CHECK(run(idx) == GGML_VEC_INDEX_OK);
+                    CHECK(bytes_of(idx) == after);
+                    CHECK(consistent(idx, bits));
+                }
+                ggml_vec_index_free(idx);
+                if (!injected) {
+                    break;
+                }
+            }
+            CHECK(failures > 0);
+        }
+    }
+    turbovec_force_planes_for_test(-1, 0);
+    turbovec_force_vector_major_for_test(-1);
+}
+
+// A search cache that was dropped is rebuilt in full by the next add, and
+// a staged search never reads it; set_staged(0) drops the planes caches.
+void check_turbovec_1x_cache_recovery() {
+    constexpr int dim = 64;
+    const std::vector<float> rows = tv1x_rows(kTv1xSeedDb, 200, dim);
+    const std::vector<uint64_t> ids = tv1x_ids(200);
+    const std::vector<float> queries = tv1x_rows(kTv1xSeedQuery, 3, dim);
+    turbovec_force_vector_major_for_test(0);
+    auto results = [&](ggml_vec_index_t * idx) {
+        std::vector<float> scores(3 * 10);
+        std::vector<uint64_t> out(3 * 10);
+        CHECK(ggml_vec_index_search(idx, queries.data(), 3, 10, scores.data(), out.data()) == GGML_VEC_INDEX_OK);
+        return std::make_pair(out, scores);
+    };
+    for (const int bits : { 2, 3, 4 }) {
+        auto * hooked = ggml_vec_index_create_turbovec(dim, bits);
+        auto * plain = ggml_vec_index_create_turbovec(dim, bits);
+        for (auto * idx : { hooked, plain }) {
+            CHECK(ggml_vec_index_add(idx, rows.data(), 100, ids.data()) == GGML_VEC_INDEX_OK);
+        }
+        turbovec_clear_blocked_for_test(hooked);
+        for (auto * idx : { hooked, plain }) {
+            CHECK(ggml_vec_index_remove(idx, ids[0]) == GGML_VEC_INDEX_OK);
+            CHECK(ggml_vec_index_add(idx, rows.data() + 100 * dim, 3, ids.data() + 100) == GGML_VEC_INDEX_OK);
+        }
+        CHECK(turbovec_blocked_hash_for_test(hooked) == turbovec_blocked_hash_for_test(plain));
+        CHECK(results(hooked) == results(plain));
+        size_t packed = 0;
+        size_t blocked = 0;
+        size_t sign = 0;
+        turbovec_code_bytes_for_test(hooked, &packed, &blocked, &sign);
+        CHECK(packed == 0);
+        ggml_vec_index_free(hooked);
+        ggml_vec_index_free(plain);
+    }
+
+    turbovec_force_planes_for_test(1, 96);
+    for (const int bits : { 2, 4 }) {
+        auto * tv = ggml_vec_index_create_turbovec(dim, bits);
+        auto * full = ggml_vec_index_create_turbovec(dim, bits);
+        CHECK(ggml_vec_index_turbovec_set_staged(full, 0) == GGML_VEC_INDEX_OK);
+        for (auto * idx : { tv, full }) {
+            CHECK(ggml_vec_index_add(idx, rows.data(), 150, ids.data()) == GGML_VEC_INDEX_OK);
+        }
+        size_t packed = 0;
+        size_t blocked = 0;
+        size_t sign = 0;
+        turbovec_code_bytes_for_test(full, &packed, &blocked, &sign);
+        CHECK(packed == 0 && sign == 0);
+        turbovec_code_bytes_for_test(tv, &packed, &blocked, &sign);
+        CHECK(packed > 0 && sign > 0);
+        const std::vector<uint8_t> snapshot = tv1x_snapshot_bytes(tv, "ggml-vector-index-tv1x-staged-off.tvim");
+        CHECK(snapshot == tv1x_snapshot_bytes(full, "ggml-vector-index-tv1x-staged-full.tvim"));
+        CHECK(ggml_vec_index_turbovec_set_staged(tv, 0) == GGML_VEC_INDEX_OK);
+        turbovec_code_bytes_for_test(tv, &packed, &blocked, &sign);
+        CHECK(packed == 0 && sign == 0);
+        CHECK(results(tv) == results(full));
+        CHECK(ggml_vec_index_turbovec_set_staged(tv, 1) == GGML_VEC_INDEX_OK);
+        turbovec_code_bytes_for_test(tv, &packed, &blocked, &sign);
+        CHECK(packed > 0 && sign > 0);
+        CHECK(tv1x_snapshot_bytes(tv, "ggml-vector-index-tv1x-staged-on.tvim") == snapshot);
+        // Without its blocked cache a promoted index answers from the full
+        // scan's per-row path instead of staged rescoring.
+        turbovec_clear_blocked_for_test(tv);
+        const auto staged_off = results(full);
+        const auto recovered = results(tv);
+        CHECK(recovered.first == staged_off.first);
+        ggml_vec_index_free(tv);
+        ggml_vec_index_free(full);
+    }
+    turbovec_force_planes_for_test(-1, 0);
+    turbovec_force_vector_major_for_test(-1);
+}
+
+// A fast write keeps the temp file and atomic rename but skips both fsyncs
+// (upstream Durability::Fast), for every index kind, and writes the same
+// bytes as a durable one. It does not let a delta log start.
+void check_write_with_durability() {
+    constexpr int dim = 64;
+    const std::vector<float> rows = tv1x_rows(kTv1xSeedDb, 100, dim);
+    const std::vector<uint64_t> ids = tv1x_ids(101);
+    const std::string durable_path = (std::filesystem::temp_directory_path() / "ggml-vector-index-durable.tvim").string();
+    const std::string fast_path = (std::filesystem::temp_directory_path() / "ggml-vector-index-fast.tvim").string();
+    const std::string delta_path = (std::filesystem::temp_directory_path() / "ggml-vector-index-fast.tvid").string();
+    for (const int kind : { 0, 1 }) {
+        auto * idx = kind == 0 ? ggml_vec_index_create(dim, 32) : ggml_vec_index_create_turbovec(dim, 4);
+        CHECK(ggml_vec_index_add(idx, rows.data(), 100, ids.data()) == GGML_VEC_INDEX_OK);
+        std::filesystem::remove(durable_path);
+        std::filesystem::remove(fast_path);
+        std::filesystem::remove(delta_path);
+        CHECK(ggml_vec_index_write_with_durability(idx, fast_path.c_str(), static_cast<ggml_vec_index_durability>(2)) ==
+              GGML_VEC_INDEX_E_INVALID_ARG);
+
+        ggml_vec_index_test_set_data_fsync_fail(1);
+        CHECK(ggml_vec_index_write(idx, durable_path.c_str()) == GGML_VEC_INDEX_E_IO);
+        CHECK(!std::filesystem::exists(durable_path));
+        CHECK(ggml_vec_index_write_with_durability(idx, fast_path.c_str(), GGML_VEC_INDEX_DURABILITY_FAST) ==
+              GGML_VEC_INDEX_OK);
+        ggml_vec_index_test_set_data_fsync_fail(0);
+        ggml_vec_index_test_set_parent_fsync_fail(1);
+        CHECK(ggml_vec_index_write_with_durability(idx, fast_path.c_str(), GGML_VEC_INDEX_DURABILITY_FAST) ==
+              GGML_VEC_INDEX_OK);
+        CHECK(ggml_vec_index_write(idx, durable_path.c_str()) == GGML_VEC_INDEX_E_NOT_DURABLE);
+        ggml_vec_index_test_set_parent_fsync_fail(0);
+        CHECK(read_file_bytes(fast_path) == read_file_bytes(durable_path));
+        auto * loaded = ggml_vec_index_load(fast_path.c_str());
+        CHECK(loaded != nullptr && ggml_vec_index_len(loaded) == 100);
+        ggml_vec_index_free(loaded);
+        ggml_vec_index_free(idx);
+
+        if (kind == 0) {
+            // Only a durable write lets a delta log start from this state.
+            auto * fresh = ggml_vec_index_create(dim, 32);
+            CHECK(ggml_vec_index_add(fresh, rows.data(), 100, ids.data()) == GGML_VEC_INDEX_OK);
+            CHECK(ggml_vec_index_write_with_durability(fresh, fast_path.c_str(), GGML_VEC_INDEX_DURABILITY_FAST) ==
+                  GGML_VEC_INDEX_OK);
+            CHECK(ggml_vec_index_add_logged(fresh, rows.data(), 1, &ids[100], delta_path.c_str()) ==
+                  GGML_VEC_INDEX_E_INVALID_ARG);
+            CHECK(ggml_vec_index_write_with_durability(fresh, fast_path.c_str(), GGML_VEC_INDEX_DURABILITY_DURABLE) ==
+                  GGML_VEC_INDEX_OK);
+            CHECK(ggml_vec_index_add_logged(fresh, rows.data(), 1, &ids[100], delta_path.c_str()) == GGML_VEC_INDEX_OK);
+            ggml_vec_index_free(fresh);
+        }
+    }
+    std::filesystem::remove(durable_path);
+    std::filesystem::remove(fast_path);
+    std::filesystem::remove(delta_path);
+}
+
+// to_bytes, write and a full sync build block units as they go instead of
+// materializing all of them, so none holds a second copy of the payload.
+void check_turbovec_1x_streamed_snapshots() {
+    constexpr int dim = 256;
+    constexpr int n = 40000;
+    const std::vector<float> rows = tv1x_rows(kTv1xSeedDb, n, dim);
+    const std::vector<uint64_t> ids = tv1x_ids(n);
+    const std::string path = (std::filesystem::temp_directory_path() / "ggml-vector-index-tv1x-stream.tvim").string();
+    const std::string sync_path =
+        (std::filesystem::temp_directory_path() / "ggml-vector-index-tv1x-stream-sync.tvim").string();
+    auto * tv = ggml_vec_index_create_turbovec(dim, 4);
+    CHECK(ggml_vec_index_add(tv, rows.data(), n, ids.data()) == GGML_VEC_INDEX_OK);
+    const size_t payload = ggml_vec_index_serialized_size(tv);
+    CHECK(payload > static_cast<size_t>(n) * (dim / 2));
+    auto largest_during = [&](auto && fn) {
+        g_largest_alloc.store(0);
+        g_track_largest_alloc.store(true);
+        fn();
+        g_track_largest_alloc.store(false);
+        return g_largest_alloc.load();
+    };
+    uint8_t * data = nullptr;
+    size_t size = 0;
+    const size_t to_bytes_peak = largest_during([&] {
+        CHECK(ggml_vec_index_to_bytes(tv, &data, &size) == GGML_VEC_INDEX_OK);
+    });
+    CHECK(size == payload);
+    std::filesystem::remove(path);
+    std::filesystem::remove(sync_path);
+    const size_t write_peak = largest_during([&] { CHECK(ggml_vec_index_write(tv, path.c_str()) == GGML_VEC_INDEX_OK); });
+    const size_t sync_peak = largest_during([&] { CHECK(ggml_vec_index_sync(tv, sync_path.c_str()) == GGML_VEC_INDEX_OK); });
+    CHECK(to_bytes_peak <= (size_t{ 1 } << 20));
+    CHECK(write_peak <= (size_t{ 1 } << 20) + payload / 64);
+    CHECK(sync_peak <= (size_t{ 1 } << 20) + payload / 64);
+    const std::vector<uint8_t> written = read_file_bytes(path);
+    CHECK(written.size() == size && std::memcmp(written.data(), data, size) == 0);
+    CHECK(read_file_bytes(sync_path).size() == size);
+    ggml_vec_index_bytes_free(data);
+    auto * loaded = ggml_vec_index_load(sync_path.c_str());
+    CHECK(loaded != nullptr && ggml_vec_index_len(loaded) == n);
+    ggml_vec_index_free(loaded);
+    ggml_vec_index_free(tv);
+    std::filesystem::remove(path);
+    std::filesystem::remove(sync_path);
+}
+#endif
+
 void check_turbovec_1x() {
     for (const Tv1xIndexCase & c : kTv1xIndexCases) {
-        check_turbovec_1x_golden_case(c);
+#ifdef GGML_VEC_INDEX_TEST_HOOKS
+        // Each 4-bit kernel against its own fixture, on indexes built under it.
+        if (c.bits == 4) {
+            for (const int kernel : { 0, 1 }) {
+                turbovec_force_vector_major_for_test(kernel);
+                check_turbovec_1x_golden_case(c, kernel);
+            }
+            turbovec_force_vector_major_for_test(-1);
+            continue;
+        }
+#endif
+        check_turbovec_1x_golden_case(c, -1);
     }
     check_turbovec_1x_snapshot_interop();
     check_turbovec_1x_calibrate_api();
@@ -5659,6 +6563,8 @@ int main(int argc, char ** argv) {
 
 #ifdef GGML_VEC_INDEX_TEST_HOOKS
     if (argc == 2 && std::string(argv[1]) == "--internal-hooks") {
+        // Kernel-consistency checks below compare against the scalar LUT.
+        turbovec_force_vector_major_for_test(0);
         if (kTurboVecSupported) {
             {
                 constexpr int tv_cache_dim = 64;
@@ -5702,6 +6608,16 @@ int main(int argc, char ** argv) {
             check_turbovec_1x_torn_sync();
             check_turbovec_1x_failed_add_then_sync();
             check_turbovec_1x_reordered_and_stale_commits();
+            check_turbovec_1x_permute_dot_kernels();
+            check_turbovec_1x_staged();
+            check_turbovec_1x_staged_maintenance();
+            check_turbovec_1x_single_code_copy();
+            check_turbovec_1x_streamed_snapshots();
+            check_write_with_durability();
+            check_turbovec_1x_tie_order();
+            check_turbovec_stale_temp_sweep();
+            check_turbovec_1x_alloc_failures();
+            check_turbovec_1x_cache_recovery();
             check_tqplus_deterministic_layout(
                 2,
                 UINT64_C(0xc4140782241d45eb),
@@ -6129,6 +7045,7 @@ int main(int argc, char ** argv) {
 
     for (const int bit_width : { 2, 4 }) {
         check_turbovec_oversized_snapshot_compatibility(bit_width);
+        check_turbovec_oversized_snapshot_compatibility(bit_width, 40000);
         check_turbovec_v3_corruption_rejected(bit_width);
         check_turbovec_tiny_tqplus_scale_rejected(bit_width);
         check_turbovec_zero_scale_and_legacy_calibration(bit_width);
