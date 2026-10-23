@@ -1686,6 +1686,90 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     return res;
 }
 
+bool llama_context::set_coreml_model(const char * directory, int32_t max_inflight) {
+#ifdef LLAMA_USE_COREML
+    if (!directory || !directory[0]) {
+        synchronize();
+        coreml.reset();
+        return true;
+    }
+    if (model.arch != LLM_ARCH_GEMMA_EMBEDDING2 || memory || model.hparams.n_layer() != 24 || model.hparams.n_embd != 512 ||
+            model.hparams.n_embd_out() != 768 || model.vocab.n_tokens() != 262144 ||
+            max_inflight < 1 || max_inflight > 8) {
+        return false;
+    }
+    char error[1024] = {};
+    decltype(coreml) next(llama_coreml_embedding_load_raw(directory, error, sizeof(error)), llama_coreml_embedding_free);
+    if (!next || llama_coreml_embedding_set_max_inflight(next.get(), max_inflight) != 0) {
+        LLAMA_LOG_WARN("%s: could not configure Core ML sidecar: %s\n", __func__, error);
+        return false;
+    }
+    synchronize();
+    coreml = std::move(next);
+    LLAMA_LOG_INFO("%s: Core ML enabled for compatible mean-pooled token batches\n", __func__);
+    return true;
+#else
+    (void) max_inflight;
+    return !directory || !directory[0];
+#endif
+}
+
+#ifdef LLAMA_USE_COREML
+bool llama_context::encode_coreml(const llama_ubatch & ubatch) {
+    if (!coreml || !cparams.embeddings || cparams.pooling_type != LLAMA_POOLING_TYPE_MEAN ||
+            cparams.ctx_type != LLAMA_CONTEXT_TYPE_DEFAULT || cparams.training ||
+            cparams.embeddings_nextn || cparams.cb_eval || abort_callback || !loras->empty() ||
+            !sampling.samplers.empty() || !ubatch.token || ubatch.embd || ubatch.is_mixed() || ubatch.n_pos != 1) {
+        return false;
+    }
+    for (uint32_t i = 0; i < model.hparams.n_layer(); ++i) {
+        if (cvec->tensor_for(i) || cparams.embeddings_layer_inp[i]) {
+            return false;
+        }
+    }
+    if (cparams.embeddings_layer_inp.back()) {
+        return false;
+    }
+    try {
+        std::map<llama_seq_id, std::vector<int32_t>> tokens;
+        for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+            if (ubatch.n_seq_id[i] != 1) {
+                return false;
+            }
+            auto & sequence = tokens[ubatch.seq_id[i][0]];
+            if (ubatch.pos[i] != (llama_pos) sequence.size() || sequence.size() >= 512) {
+                return false;
+            }
+            sequence.push_back(ubatch.token[i]);
+        }
+        std::vector<llama_coreml_embedding_sequence> sequences;
+        for (const auto & entry : tokens) {
+            sequences.push_back({entry.second.data(), (int32_t) entry.second.size()});
+        }
+        std::vector<float> output(sequences.size() * 768);
+        char error[1024] = {};
+        if (llama_coreml_embedding_encode(coreml.get(), sequences.data(), (int32_t) sequences.size(), true,
+                output.data(), output.size(), error, sizeof(error)) != 0) {
+            LLAMA_LOG_WARN("%s: Core ML failed: %s; disabling sidecar and using ggml\n", __func__, error);
+            coreml.reset();
+            return false;
+        }
+        std::map<llama_seq_id, std::vector<float>> result;
+        size_t row = 0;
+        for (const auto & entry : tokens) {
+            result[entry.first].assign(output.begin() + row * 768, output.begin() + (row + 1) * 768);
+            ++row;
+        }
+        embd_seq.swap(result);
+        LLAMA_LOG_DEBUG("%s: Core ML encoded %u tokens in %zu sequences\n", __func__, ubatch.n_tokens, sequences.size());
+        return true;
+    } catch (const std::exception & error) {
+        LLAMA_LOG_WARN("%s: Core ML failed: %s; using ggml\n", __func__, error.what());
+        return false;
+    }
+}
+#endif
+
 int llama_context::encode(const llama_batch_ext & batch_inp) {
     if (batch_inp.tokens.empty()) {
         LLAMA_LOG_ERROR("%s: n_tokens == 0\n", __func__);
@@ -1744,6 +1828,12 @@ int llama_context::encode(const llama_batch_ext & batch_inp) {
     }
 
     n_outputs = n_tokens;
+
+#ifdef LLAMA_USE_COREML
+    if (encode_coreml(ubatch)) {
+        return 0;
+    }
+#endif
 
     const auto causal_attn_org = cparams.causal_attn;
 
@@ -4866,6 +4956,18 @@ int32_t llama_encode(
     }
 
     return ret;
+}
+
+bool llama_supports_coreml(void) {
+#ifdef LLAMA_USE_COREML
+    return true;
+#else
+    return false;
+#endif
+}
+
+bool llama_set_coreml_model(llama_context * ctx, const char * directory, int32_t max_inflight) {
+    return ctx && ctx->set_coreml_model(directory, max_inflight);
 }
 
 int32_t llama_decode(

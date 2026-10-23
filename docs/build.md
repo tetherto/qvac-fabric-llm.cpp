@@ -144,6 +144,10 @@ To disable the Metal build at compile time use the `-DGGML_METAL=OFF` cmake opti
 
 When built with Metal support, you can explicitly disable GPU inference with the `--n-gpu-layers 0` command-line argument.
 
+## Core ML embeddings
+
+On macOS 15 / iOS 18, enable EmbeddingGemma 2 Core ML support with `-DLLAMA_COREML_EMBEDDING=ON`. The runtime is part of the `llama` library and can use CPU + Neural Engine; it requires a matching exported sidecar with raw pooled output. The embedding CLI and server select it with `--coreml-model DIR` and retain ggml fallback. See the [Core ML guide](../examples/embedding-coreml/README.md) for export, public API configuration, and validation.
+
 ## SYCL
 
 SYCL is a higher-level programming model to improve programming productivity on various hardware accelerators.

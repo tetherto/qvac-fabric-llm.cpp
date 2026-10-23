@@ -191,6 +191,7 @@ For the full list of features, please refer to [server's changelog](https://gith
 | `--image-no-upscale on\|off` | in idefics3-style preprocessing, round an image's long side up to a whole number of<br/>slices and cap it, instead of always stretching it to the cap; overrides the value<br/>from the GGUF. Small images then stay small and become far fewer slices. This is<br/>what separates the VisionPsy Flash checkpoint from the base one, whose mmprojs are<br/>otherwise indistinguishable, so a Flash checkpoint run without it is silently<br/>running base preprocessing<br/>(env: LLAMA_ARG_IMAGE_NO_UPSCALE) |
 | `-a, --alias STRING` | set model name aliases, comma-separated (to be used by API)<br/>(env: LLAMA_ARG_ALIAS) |
 | `--tags STRING` | set model tags, comma-separated (informational, not used for routing)<br/>(env: LLAMA_ARG_TAGS) |
+| `--coreml-model DIR` | optional EmbeddingGemma 2 Core ML sidecar with raw pooled output; unsupported batches use ggml (env: `LLAMA_ARG_COREML_MODEL`) |
 | `--embd-normalize N` | normalisation for embeddings (default: 2) (-1=none, 0=max absolute int16, 1=taxicab, 2=euclidean, >2=p-norm) |
 | `--host HOST` | IP addresses to listen on, comma-separated, or UNIX socket paths ending in .sock; with multiple TCP addresses, :: binds IPv6 only; overlapping addresses result in undefined behavior (default: 127.0.0.1)<br/>(env: LLAMA_ARG_HOST) |
 | `--port PORT` | port to listen (default: 8080)<br/>(env: LLAMA_ARG_PORT) |
