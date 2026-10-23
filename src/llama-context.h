@@ -12,6 +12,10 @@
 #include "ggml-cpp.h"
 #include "ggml-opt.h"
 
+#ifdef LLAMA_USE_COREML
+#include "llama-coreml.h"
+#endif
+
 #include <array>
 #include <atomic>
 #include <map>
@@ -125,6 +129,7 @@ struct llama_context {
     void set_abort_callback(bool (*abort_callback)(void * data), void * abort_callback_data);
 
     void set_embeddings (bool value);
+    bool set_coreml_model(const char * directory, int32_t max_inflight);
     void set_embeddings_nextn(bool value, bool masked);
     void set_embeddings_layer_inp(uint32_t lid, bool enable);
     void set_embeddings_layer_inp_pos_min(llama_seq_id seq_id, llama_pos pos_min);
@@ -338,6 +343,10 @@ private:
     llama_cross cross; // TODO: tmp for handling cross-attention - need something better probably
 
     llama_memory_ptr memory;
+#ifdef LLAMA_USE_COREML
+    std::unique_ptr<llama_coreml_embedding, decltype(&llama_coreml_embedding_free)> coreml{nullptr, llama_coreml_embedding_free};
+    bool encode_coreml(const llama_ubatch & ubatch);
+#endif
     llama_moe_cache_ptr moe_cache;
 
     // decode output (2-dimensional array: [n_outputs][n_vocab])

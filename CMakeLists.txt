@@ -336,6 +336,10 @@ set(LLAMA_PUBLIC_HEADERS
     ${CMAKE_CURRENT_SOURCE_DIR}/include/llama.h
     ${CMAKE_CURRENT_SOURCE_DIR}/include/llama-cpp.h)
 
+if (LLAMA_COREML_EMBEDDING)
+    list(APPEND LLAMA_PUBLIC_HEADERS ${CMAKE_CURRENT_SOURCE_DIR}/include/llama-coreml.h)
+endif()
+
 set_target_properties(llama
     PROPERTIES
         PUBLIC_HEADER "${LLAMA_PUBLIC_HEADERS}")
@@ -440,6 +444,11 @@ if (IS_ABSOLUTE "${CMAKE_INSTALL_INCLUDEDIR}")
     set(LLAMA_PC_INCLUDEDIR "${CMAKE_INSTALL_INCLUDEDIR}")
 else()
     set(LLAMA_PC_INCLUDEDIR "\${prefix}/${CMAKE_INSTALL_INCLUDEDIR}")
+endif()
+
+set(LLAMA_PC_LIBS_PRIVATE "")
+if (LLAMA_COREML_EMBEDDING)
+    set(LLAMA_PC_LIBS_PRIVATE "-framework CoreML -framework Foundation")
 endif()
 
 configure_file(cmake/llama.pc.in

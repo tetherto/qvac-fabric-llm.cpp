@@ -3455,6 +3455,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_EMBEDDING, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_DEBUG}));
     add_opt(common_arg(
+        {"--coreml-model"}, "DIR",
+        "optional Core ML embedding sidecar directory; incompatible models or batches use ggml",
+        [](common_params & params, const std::string & value) {
+            params.coreml_model = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_EMBEDDING, LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_COREML_MODEL"));
+    add_opt(common_arg(
         {"--embd-output-format"}, "FORMAT",
         "empty = default, \"array\" = [[],[]...], \"json\" = openai style, \"json+\" = same \"json\" + cosine similarity matrix, \"raw\" = plain whitespace-delimited output (one embedding per line)",
         [](common_params & params, const std::string & value) {
