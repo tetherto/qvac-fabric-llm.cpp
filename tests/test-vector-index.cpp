@@ -185,6 +185,12 @@ int vector_validation_kernel_parity_for_test(int kernel);
 int crc32c_kernel_parity_for_test(int kernel);
 void turbovec_force_vector_major_for_test(int mode);
 void turbovec_disable_dot_product_for_test(int disabled);
+void turbovec_force_vm8_for_test(int mode);
+void turbovec_disable_i8mm_for_test(int disabled);
+void turbovec_force_vm8_2bit_for_test(int mode);
+void turbovec_force_batches_for_test(int enabled);
+int turbovec_layout_for_test(const ggml_vec_index_t * idx);
+bool turbovec_planes_for(int bits, int dim);
 void turbovec_force_planes_for_test(int mode, size_t min_vectors);
 size_t parallel_pool_threads_for_test(void);
 void state_hash_for_test(const ggml_vec_index_t * idx, uint64_t * sums);
@@ -5870,6 +5876,351 @@ void check_turbovec_1x_permute_dot_kernels() {
 #endif
 
 #ifdef GGML_VEC_INDEX_TEST_HOOKS
+// Puts every kernel and layout override back to following the host.
+void tv1x_reset_kernel_overrides() {
+    turbovec_force_vector_major_for_test(-1);
+    turbovec_force_vm8_for_test(-1);
+    turbovec_force_vm8_2bit_for_test(-1);
+    turbovec_disable_i8mm_for_test(0);
+    turbovec_disable_dot_product_for_test(0);
+    turbovec_force_batches_for_test(0);
+}
+
+// An index created under the given layout overrides (vector-major forced on).
+ggml_vec_index_t * tv1x_create_with_layout(int dim, int bits, int vm8, int vm8_2bit) {
+    turbovec_force_vector_major_for_test(1);
+    turbovec_force_vm8_for_test(vm8);
+    turbovec_force_vm8_2bit_for_test(vm8_2bit);
+    auto * idx = ggml_vec_index_create_turbovec(dim, bits);
+    CHECK(idx != nullptr);
+    return idx;
+}
+
+// Every query count upstream batches differently (12 + 12 + 1, 12 + 8,
+// 12 + 4, 8 + 2, 4 + 1 + 1, 4, a lone query), then a filtered batch; all results
+// concatenated.
+std::pair<std::vector<float>, std::vector<uint64_t>> tv1x_search_batches(
+        ggml_vec_index_t * idx,
+        const std::vector<float> & queries,
+        int dim,
+        const std::vector<uint64_t> & allow) {
+    constexpr int k = 7;
+    std::pair<std::vector<float>, std::vector<uint64_t>> all;
+    for (const int n_q : { 25, 20, 16, 10, 6, 4, 1, -20 }) {
+        const int n = std::abs(n_q);
+        CHECK(static_cast<size_t>(n) * static_cast<size_t>(dim) <= queries.size());
+        std::vector<float> scores(static_cast<size_t>(n * k));
+        std::vector<uint64_t> ids(scores.size());
+        if (n_q < 0) {
+            CHECK(ggml_vec_index_search_filtered(
+                      idx, queries.data(), n, k, allow.data(), static_cast<int>(allow.size()), scores.data(),
+                      ids.data()) == GGML_VEC_INDEX_OK);
+        } else {
+            CHECK(ggml_vec_index_search(idx, queries.data(), n, k, scores.data(), ids.data()) == GGML_VEC_INDEX_OK);
+        }
+        all.first.insert(all.first.end(), scores.begin(), scores.end());
+        all.second.insert(all.second.end(), ids.begin(), ids.end());
+    }
+    return all;
+}
+
+// Upstream picks the vm8 layout on aarch64 with i8mm, for 4-bit indexes
+// whose byte-group count is a multiple of 8 and, under TURBOVEC_2BIT_VM8,
+// for such 2-bit ones; it needs the vector-major layout underneath.
+void check_turbovec_1x_vm8_layout_choice() {
+    struct Case { int bits; int dim; int vm; int vm8; int vm8_2bit; int layout; };
+    static constexpr Case cases[] = {
+        { 4, 128, 1, 1, 0, 2 }, { 4, 200, 1, 1, 0, 1 }, { 4, 136, 1, 1, 1, 1 }, { 4, 128, 1, 0, 0, 1 },
+        { 4, 128, 0, 1, 1, 0 }, { 2, 128, 1, 1, 0, 0 }, { 2, 128, 1, 1, 1, 2 }, { 2, 96, 1, 1, 1, 2 },
+        { 2, 200, 1, 1, 1, 0 }, { 2, 144, 1, 1, 1, 0 }, { 2, 128, 1, 0, 1, 0 }, { 2, 128, 0, 1, 1, 0 },
+        { 3, 128, 1, 1, 1, 0 },
+    };
+    for (const Case & c : cases) {
+        turbovec_force_vector_major_for_test(c.vm);
+        turbovec_force_vm8_for_test(c.vm8);
+        turbovec_force_vm8_2bit_for_test(c.vm8_2bit);
+        auto * idx = ggml_vec_index_create_turbovec(c.dim, c.bits);
+        CHECK(idx != nullptr);
+        CHECK(turbovec_layout_for_test(idx) == c.layout);
+        // The layout is fixed at creation: a later override does not move it.
+        turbovec_force_vm8_for_test(1 - c.vm8);
+        const std::vector<float> rows = tv1x_rows(kTv1xSeedDb, 40, static_cast<size_t>(c.dim));
+        const std::vector<uint64_t> ids = tv1x_ids(40);
+        CHECK(ggml_vec_index_add(idx, rows.data(), 40, ids.data()) == GGML_VEC_INDEX_OK);
+        CHECK(turbovec_layout_for_test(idx) == c.layout);
+        ggml_vec_index_free(idx);
+    }
+    // The opt-in replaces the scan the planes layout needs (aarch64 only).
+    turbovec_force_vm8_2bit_for_test(1);
+    turbovec_force_planes_for_test(-1, 0);
+    CHECK(!turbovec_planes_for(2, 128));
+    CHECK(!turbovec_planes_for(4, 128));
+    turbovec_force_vm8_2bit_for_test(0);
+#if defined(__aarch64__) && (defined(__ARM_NEON) || defined(__ARM_NEON__))
+    CHECK(turbovec_planes_for(2, 128));
+#else
+    CHECK(!turbovec_planes_for(2, 128));
+#endif
+    tv1x_reset_kernel_overrides();
+}
+
+// The SMMLA kernels (vm8 single query, vm8 and vector-major batches) and the
+// SDOT and scalar ones accumulate the same integers, so every layout and
+// kernel returns the same scores, at group counts with and without whole
+// vm8 units, after swap-removes.
+void check_turbovec_1x_vm8_kernel_parity() {
+    turbovec_force_batches_for_test(1);
+    for (const int dim : { 64, 136, 200, 256, 768 }) {
+        const size_t d = static_cast<size_t>(dim);
+        const std::vector<float> rows = tv1x_rows(kTv1xSeedDb, 150, d);
+        const std::vector<uint64_t> ids = tv1x_ids(150);
+        const std::vector<float> queries = tv1x_rows(kTv1xSeedQuery, 25, d);
+        std::vector<uint64_t> allow;
+        for (size_t i = 0; i < ids.size(); i += 3) {
+            allow.push_back(ids[i]);
+        }
+        std::vector<std::pair<std::vector<float>, std::vector<uint64_t>>> results;
+        for (const int vm8 : { 1, 0 }) {
+            auto * tv = tv1x_create_with_layout(dim, 4, vm8, 0);
+            CHECK(turbovec_layout_for_test(tv) == (vm8 != 0 && dim % 16 == 0 ? 2 : 1));
+            CHECK(ggml_vec_index_add(tv, rows.data(), 150, ids.data()) == GGML_VEC_INDEX_OK);
+            for (const size_t i : { 4, 77, 149, 30 }) {
+                CHECK(ggml_vec_index_remove(tv, ids[i]) == GGML_VEC_INDEX_OK);
+            }
+            // SMMLA, SDOT, then scalar.
+            for (const int kernel : { 0, 1, 2 }) {
+                turbovec_disable_i8mm_for_test(kernel >= 1);
+                turbovec_disable_dot_product_for_test(kernel >= 2);
+                results.push_back(tv1x_search_batches(tv, queries, dim, allow));
+            }
+            turbovec_disable_i8mm_for_test(0);
+            turbovec_disable_dot_product_for_test(0);
+            ggml_vec_index_free(tv);
+        }
+        for (const auto & r : results) {
+            CHECK(r.first == results[0].first);
+            CHECK(r.second == results[0].second);
+        }
+    }
+    tv1x_reset_kernel_overrides();
+}
+
+// Every mutation of a vm8 cache (append into a partial tail block,
+// swap-remove including the last row, rolled-back appends, calibrate)
+// leaves the bytes a fresh build of the same rows has, and snapshots stay
+// independent of the layout.
+void check_turbovec_1x_vm8_mutations() {
+    turbovec_force_batches_for_test(1);
+    constexpr int dim = 128;
+    const size_t d = static_cast<size_t>(dim);
+    const std::vector<float> rows = tv1x_rows(kTv1xSeedDb, 260, d);
+    const std::vector<uint64_t> ids = tv1x_ids(260);
+    const std::vector<float> queries = tv1x_rows(kTv1xSeedQuery, 25, d);
+    const std::vector<float> calib = tv1x_rows(kTv1xSeedCalib, kTv1xNCalib, d);
+    std::vector<uint64_t> allow;
+    for (size_t i = 0; i < ids.size(); i += 3) {
+        allow.push_back(ids[i]);
+    }
+    for (const int bits : { 4, 2 }) {
+        auto * vm8 = tv1x_create_with_layout(dim, bits, 1, 1);
+        CHECK(turbovec_layout_for_test(vm8) == 2);
+        // The same mutations on the sequential layout, for the snapshots.
+        turbovec_force_vector_major_for_test(0);
+        auto * seq = ggml_vec_index_create_turbovec(dim, bits);
+        CHECK(turbovec_layout_for_test(seq) == 0);
+        turbovec_force_vector_major_for_test(1);
+        // A fresh vm8 index built from vm8's snapshot holds the same cache.
+        auto check_against_rebuilt = [&](const char * name) {
+            const std::vector<uint8_t> bytes = tv1x_snapshot_bytes(vm8, name);
+            CHECK(bytes == tv1x_snapshot_bytes(seq, name));
+            const std::string path = (std::filesystem::temp_directory_path() / name).string();
+            write_file_bytes(path, bytes);
+            auto * rebuilt = ggml_vec_index_load(path.c_str());
+            std::filesystem::remove(path);
+            CHECK(rebuilt != nullptr);
+            CHECK(turbovec_layout_for_test(rebuilt) == 2);
+            CHECK(turbovec_blocked_hash_for_test(rebuilt) == turbovec_blocked_hash_for_test(vm8));
+            CHECK(tv1x_search_batches(rebuilt, queries, dim, allow) == tv1x_search_batches(vm8, queries, dim, allow));
+            ggml_vec_index_free(rebuilt);
+        };
+        for (auto * idx : { vm8, seq }) {
+            CHECK(ggml_vec_index_add(idx, rows.data(), 70, ids.data()) == GGML_VEC_INDEX_OK);
+        }
+        check_against_rebuilt("ggml-vector-index-tv1x-vm8-a.tvim");
+        // Appends that fail part way roll back into the partial tail block.
+        const uint64_t before = turbovec_blocked_hash_for_test(vm8);
+        int failures = 0;
+        for (int64_t countdown = 1; countdown < 64; ++countdown) {
+            ggml_vec_index_test_set_oom_countdown(countdown);
+            const int rc = ggml_vec_index_add(vm8, rows.data() + 70 * d, 50, ids.data() + 70);
+            ggml_vec_index_test_set_oom_countdown(-1);
+            if (rc == GGML_VEC_INDEX_OK) {
+                break;
+            }
+            CHECK(rc == GGML_VEC_INDEX_E_OOM);
+            CHECK(ggml_vec_index_len(vm8) == 70);
+            CHECK(turbovec_blocked_hash_for_test(vm8) == before);
+            ++failures;
+        }
+        CHECK(failures > 0);
+        CHECK(ggml_vec_index_add(seq, rows.data() + 70 * d, 50, ids.data() + 70) == GGML_VEC_INDEX_OK);
+        check_against_rebuilt("ggml-vector-index-tv1x-vm8-b.tvim");
+        // Swap-removes: the last row, rows in other blocks, the new tail.
+        for (const size_t i : { 119, 4, 77, 31, 0, 100, 64 }) {
+            for (auto * idx : { vm8, seq }) {
+                CHECK(ggml_vec_index_remove(idx, ids[i]) == GGML_VEC_INDEX_OK);
+            }
+        }
+        check_against_rebuilt("ggml-vector-index-tv1x-vm8-c.tvim");
+        // Remove down to an empty block and grow again.
+        for (size_t i = 120; i < 260; ++i) {
+            for (auto * idx : { vm8, seq }) {
+                CHECK(ggml_vec_index_add(idx, rows.data() + i * d, 1, ids.data() + i) == GGML_VEC_INDEX_OK);
+            }
+        }
+        for (size_t i = 200; i < 260; ++i) {
+            for (auto * idx : { vm8, seq }) {
+                CHECK(ggml_vec_index_remove(idx, ids[i]) == GGML_VEC_INDEX_OK);
+            }
+        }
+        check_against_rebuilt("ggml-vector-index-tv1x-vm8-d.tvim");
+        // Calibrating re-encodes every row into the cache.
+        for (auto * idx : { vm8, seq }) {
+            CHECK(ggml_vec_index_turbovec_calibrate(idx, calib.data(), kTv1xNCalib) == GGML_VEC_INDEX_OK);
+        }
+        check_against_rebuilt("ggml-vector-index-tv1x-vm8-e.tvim");
+        ggml_vec_index_free(seq);
+        ggml_vec_index_free(vm8);
+    }
+    tv1x_reset_kernel_overrides();
+}
+
+// The 2-bit vm8 opt-in: a lone query (and any query outside a batch of 12,
+// 8 or 4) scans the vm8 codes with the LUT kernel, bit-identical to the
+// sequential layout; batches score with SMMLA, matched by the scalar
+// fallback.
+void check_turbovec_1x_vm8_2bit() {
+    turbovec_force_batches_for_test(1);
+    for (const int dim : { 96, 128, 768 }) {
+        const size_t d = static_cast<size_t>(dim);
+        const std::vector<float> rows = tv1x_rows(kTv1xSeedDb, 150, d);
+        const std::vector<uint64_t> ids = tv1x_ids(150);
+        const std::vector<float> queries = tv1x_rows(kTv1xSeedQuery, 25, d);
+        std::vector<uint64_t> allow;
+        for (size_t i = 0; i < ids.size(); i += 3) {
+            allow.push_back(ids[i]);
+        }
+        auto * vm8 = tv1x_create_with_layout(dim, 2, 1, 1);
+        auto * seq = tv1x_create_with_layout(dim, 2, 1, 0);
+        CHECK(turbovec_layout_for_test(vm8) == 2);
+        CHECK(turbovec_layout_for_test(seq) == 0);
+        for (auto * idx : { vm8, seq }) {
+            CHECK(ggml_vec_index_add(idx, rows.data(), 150, ids.data()) == GGML_VEC_INDEX_OK);
+            CHECK(ggml_vec_index_remove(idx, ids[17]) == GGML_VEC_INDEX_OK);
+        }
+        constexpr int k = 9;
+        // Two and three queries run one by one under upstream's aarch64
+        // batching, the only place a vm8 index exists; an x86 build pads
+        // such a tail into a batch, so only the lone query is compared.
+#if GGML_VEC_INDEX_USE_NEON
+        const std::vector<int> query_counts = { 1, 2, 3 };
+#else
+        const std::vector<int> query_counts = { 1 };
+#endif
+        for (const int n_q : query_counts) {
+            std::vector<float> scores[2];
+            std::vector<uint64_t> out[2];
+            for (int i = 0; i < 2; ++i) {
+                scores[i].resize(static_cast<size_t>(n_q * k));
+                out[i].resize(scores[i].size());
+                CHECK(ggml_vec_index_search(i == 0 ? vm8 : seq, queries.data(), n_q, k, scores[i].data(), out[i].data()) ==
+                      GGML_VEC_INDEX_OK);
+            }
+            CHECK(scores[0] == scores[1]);
+            CHECK(out[0] == out[1]);
+        }
+        const auto smmla = tv1x_search_batches(vm8, queries, dim, allow);
+        turbovec_disable_i8mm_for_test(1);
+        CHECK(tv1x_search_batches(vm8, queries, dim, allow) == smmla);
+        turbovec_disable_i8mm_for_test(0);
+        ggml_vec_index_free(seq);
+        ggml_vec_index_free(vm8);
+    }
+    tv1x_reset_kernel_overrides();
+}
+
+// Upstream's batched searches (tests/turbovec-1x-golden-vm.inc) under every
+// kernel this port has for the layout: 4-bit permute-dot, 2-bit LUT, and
+// 2-bit under TURBOVEC_2BIT_VM8.
+void check_turbovec_1x_batch_goldens() {
+    auto run = [](const Tv1xBatchCase & c, int vm8, int vm8_2bit, int kernel, int force_batches = 1) {
+        turbovec_force_batches_for_test(force_batches);
+        const size_t d = static_cast<size_t>(c.dim);
+        std::vector<float> db = tv1x_rows(kTv1xSeedDb, kTv1xNDb, d);
+        std::fill(db.begin(), db.begin() + static_cast<std::ptrdiff_t>(d), 0.0f);
+        const std::vector<float> queries = tv1x_rows(kTv1xSeedQuery, static_cast<size_t>(c.n_q), d);
+        const std::vector<uint64_t> ids = tv1x_ids(kTv1xNDb);
+        std::vector<uint64_t> allow;
+        for (size_t i = 0; i < ids.size(); i += 3) {
+            allow.push_back(ids[i]);
+        }
+        auto * idx = tv1x_create_with_layout(c.dim, c.bits, vm8, vm8_2bit);
+        if (c.calibrated != 0) {
+            const std::vector<float> calib = tv1x_rows(kTv1xSeedCalib, kTv1xNCalib, d);
+            CHECK(ggml_vec_index_turbovec_calibrate(idx, calib.data(), kTv1xNCalib) == GGML_VEC_INDEX_OK);
+        }
+        CHECK(ggml_vec_index_add(idx, db.data(), kTv1xNDb, ids.data()) == GGML_VEC_INDEX_OK);
+        turbovec_disable_i8mm_for_test(kernel >= 1);
+        turbovec_disable_dot_product_for_test(kernel >= 2);
+        std::vector<float> scores(static_cast<size_t>(c.n_q * kTv1xK));
+        std::vector<uint64_t> out(scores.size());
+        if (c.filtered != 0) {
+            CHECK(ggml_vec_index_search_filtered(
+                      idx, queries.data(), c.n_q, kTv1xK, allow.data(), static_cast<int>(allow.size()), scores.data(),
+                      out.data()) == GGML_VEC_INDEX_OK);
+        } else {
+            CHECK(ggml_vec_index_search(idx, queries.data(), c.n_q, kTv1xK, scores.data(), out.data()) ==
+                  GGML_VEC_INDEX_OK);
+        }
+        turbovec_disable_i8mm_for_test(0);
+        turbovec_disable_dot_product_for_test(0);
+        for (size_t i = 0; i < out.size(); ++i) {
+            CHECK(out[i] == c.ids[i]);
+            CHECK(scores[i] == c.scores[i]);
+        }
+        ggml_vec_index_free(idx);
+    };
+    for (const Tv1xBatchCase & c : kTv1xBatchCases) {
+        for (const int vm8 : { 1, 0 }) {
+            // SMMLA, SDOT, scalar; the 2-bit LUT ignores the 4-bit kernels,
+            // and the opt-in leaves a geometry without whole vm8 units alone.
+            for (const int kernel : { 0, 1, 2 }) {
+                run(c, vm8, 0, kernel);
+            }
+        }
+        if (c.bits == 2 && (c.dim / 4) % 8 != 0) {
+            run(c, 1, 1, 0);
+        }
+    }
+    // The fused batches are NEON-only in this port; elsewhere every query
+    // runs alone, and upstream never takes the vm8 layout there.
+#if defined(__aarch64__) && (defined(__ARM_NEON) || defined(__ARM_NEON__))
+    for (const Tv1xBatchCase & c : kTv1xVm8TwoBitCases) {
+        for (const int kernel : { 0, 1 }) {
+            run(c, 1, 1, kernel);
+        }
+        // Batching follows upstream on its own: a 2-bit vm8 batch scores
+        // differently from the single-query scan.
+        run(c, 1, 1, 0, 0);
+    }
+#else
+    (void) kTv1xVm8TwoBitCases;
+#endif
+    tv1x_reset_kernel_overrides();
+}
+#endif
+
+#ifdef GGML_VEC_INDEX_TEST_HOOKS
 // Staged search (upstream planes search): returned scores are the full
 // scan's for the same ids, and on aarch64 the results are upstream's.
 void check_turbovec_1x_staged() {
@@ -6922,6 +7273,11 @@ int main(int argc, char ** argv) {
             check_turbovec_1x_failed_add_then_sync();
             check_turbovec_1x_reordered_and_stale_commits();
             check_turbovec_1x_permute_dot_kernels();
+            check_turbovec_1x_vm8_layout_choice();
+            check_turbovec_1x_vm8_kernel_parity();
+            check_turbovec_1x_vm8_mutations();
+            check_turbovec_1x_vm8_2bit();
+            check_turbovec_1x_batch_goldens();
             check_turbovec_1x_staged();
             check_turbovec_1x_thread_invariance();
             check_vector_index_pool();

@@ -3,6 +3,9 @@
 
 #include "ggml-vector-index-impl.h"
 
+#include <cstdlib>
+#include <cstring>
+
 #if defined(__APPLE__) && (defined(__aarch64__) || defined(_M_ARM64))
 #include <sys/sysctl.h>
 #elif (defined(__linux__) || defined(__ANDROID__)) && defined(__aarch64__)
@@ -17,6 +20,9 @@ namespace {
 
 std::atomic<int> g_vector_major_override{ -1 };
 std::atomic<bool> g_dot_product_disabled{ false };
+std::atomic<int> g_vm8_override{ -1 };
+std::atomic<bool> g_i8mm_disabled{ false };
+std::atomic<int> g_vm8_2bit_override{ -1 };
 
 bool detect_vector_major() {
 #if defined(__aarch64__) || defined(_M_ARM64)
@@ -100,6 +106,29 @@ VecIndexCpuFeatures detect_cpu_features() {
     return f;
 }
 
+bool detect_i8mm() {
+#if defined(__aarch64__) || defined(_M_ARM64)
+    // ARMv8.6 int8 matrix multiply (SMMLA), upstream `have_i8mm`; optional
+    // before v8.6, so detected like dot product.
+#if defined(__APPLE__)
+    int value = 0;
+    size_t size = sizeof(value);
+    return sysctlbyname("hw.optional.arm.FEAT_I8MM", &value, &size, nullptr, 0) == 0 && value != 0;
+#elif defined(__linux__) || defined(__ANDROID__)
+#ifndef HWCAP2_I8MM
+#define HWCAP2_I8MM (1 << 13)
+#endif
+    return (getauxval(AT_HWCAP2) & HWCAP2_I8MM) != 0;
+#elif defined(_WIN32) && defined(PF_ARM_V82_I8MM_INSTRUCTIONS_AVAILABLE)
+    return IsProcessorFeaturePresent(PF_ARM_V82_I8MM_INSTRUCTIONS_AVAILABLE) != 0;
+#else
+    return false;
+#endif
+#else
+    return false;
+#endif
+}
+
 }  // namespace
 
 const VecIndexCpuFeatures & vec_index_cpu_features() {
@@ -120,7 +149,55 @@ bool turbovec_cpu_vector_major() {
     return turbovec_cpu_dot_product();
 }
 
+bool turbovec_cpu_i8mm() {
+    static const bool detected = detect_i8mm();
+    return detected && !g_i8mm_disabled.load(std::memory_order_relaxed);
+}
+
+bool turbovec_cpu_vm8() {
+    // Upstream pack.rs `use_vm8`: aarch64 with i8mm, on top of the
+    // vector-major layout. No other kernel reads the layout.
+    if (!turbovec_cpu_vector_major()) {
+        return false;
+    }
+    const int forced = g_vm8_override.load(std::memory_order_relaxed);
+    if (forced >= 0) {
+        return forced != 0;
+    }
+#if defined(__aarch64__) || defined(_M_ARM64)
+    return turbovec_cpu_i8mm();
+#else
+    return false;
+#endif
+}
+
+bool turbovec_vm8_2bit_enabled() {
+    const int forced = g_vm8_2bit_override.load(std::memory_order_relaxed);
+    if (forced >= 0) {
+        return forced != 0;
+    }
+    // Upstream pack.rs `use_vm8_2bit`: read once per process, on only for
+    // exactly "1".
+    static const bool enabled = [] {
+        const char * value = std::getenv("TURBOVEC_2BIT_VM8");
+        return value != nullptr && std::strcmp(value, "1") == 0;
+    }();
+    return enabled;
+}
+
 #ifdef GGML_VEC_INDEX_TEST_HOOKS
+void turbovec_force_vm8_for_test(int mode) {
+    g_vm8_override.store(mode, std::memory_order_relaxed);
+}
+
+void turbovec_disable_i8mm_for_test(int disabled) {
+    g_i8mm_disabled.store(disabled != 0, std::memory_order_relaxed);
+}
+
+void turbovec_force_vm8_2bit_for_test(int mode) {
+    g_vm8_2bit_override.store(mode, std::memory_order_relaxed);
+}
+
 void turbovec_force_vector_major_for_test(int mode) {
     g_vector_major_override.store(mode, std::memory_order_relaxed);
 }
