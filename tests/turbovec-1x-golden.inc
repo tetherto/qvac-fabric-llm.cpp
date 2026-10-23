@@ -156,6 +156,20 @@ static const Tv1xIndexCase kTv1xIndexCases[] = {
       UINT64_C(0xf608bc3fff7c1b90), 1716436, UINT64_C(0x30abf7eaa764a209), 1728724 },
 };
 
+struct Tv1xSyncCase { int bits; int dim; uint64_t step_hashes[6]; size_t step_lens[6]; uint64_t final_ids[3 * 5]; };
+static const Tv1xSyncCase kTv1xSyncCases[] = {
+    { 2, 128, { UINT64_C(0x549df96c6c9c64c2), UINT64_C(0x60c7289785ec91d5), UINT64_C(0x25dc119dc54482ed), UINT64_C(0x00e9ac3f4ec5ed33), UINT64_C(0x8a4c529cc544a94d), UINT64_C(0xf8588863d039a860) }, { 116276, 117684, 117684, 117684, 117684, 118708 }, { 1434u, 1581u, 1357u, 1287u, 1840u, 1413u, 1749u, 1679u, 1049u, 1210u, 1175u, 1021u, 1581u, 1182u, 1007u } },
+    { 3, 128, { UINT64_C(0x7ad11c9f31806e6f), UINT64_C(0x1ad997c042a3a3ab), UINT64_C(0x9ed7e4512a7136c5), UINT64_C(0x02c0b5af4b16c7e0), UINT64_C(0x1400551522176a9b), UINT64_C(0x8757463ae4037e1f) }, { 185876, 188308, 188308, 188308, 188308, 189332 }, { 1084u, 1434u, 1357u, 1287u, 1735u, 1679u, 1749u, 1546u, 1413u, 1525u, 1175u, 1021u, 1182u, 1644u, 1581u } },
+    { 4, 128, { UINT64_C(0x1950400f291004c7), UINT64_C(0xd294861b7b3ce469), UINT64_C(0x659266a05f6e9dc2), UINT64_C(0x49f73deeb3c0dc8f), UINT64_C(0xfb588b6aa17a8e3d), UINT64_C(0x0ad866883f1e318f) }, { 185940, 188372, 188372, 188372, 188372, 189396 }, { 1084u, 1287u, 1434u, 1357u, 1581u, 1679u, 1210u, 1742u, 1749u, 1546u, 1175u, 1021u, 1182u, 1644u, 1581u } },
+};
+
+struct Tv1xHistoryCase { int bits; uint64_t snapshot_hash; size_t snapshot_len; };
+static const Tv1xHistoryCase kTv1xHistoryCases[] = {
+    { 2, UINT64_C(0xcb1d60a0c6abfa25), 116276 },
+    { 3, UINT64_C(0x96fbac8776697bec), 185876 },
+    { 4, UINT64_C(0x99838af7a1b92274), 185940 },
+};
+
 static constexpr int kTv1xImageDim = 128;
 static constexpr int kTv1xImageBits = 4;
 static constexpr size_t kTv1xImageLen = 185940;

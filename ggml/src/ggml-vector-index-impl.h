@@ -15,6 +15,7 @@
 #include <cstdio>
 #include <cwchar>
 #include <cstring>
+#include <exception>
 #include <filesystem>
 #include <fstream>
 #include <limits>
@@ -196,12 +197,99 @@ struct MinHeapCmp {
     bool operator()(const ScoreId & a, const ScoreId & b) const { return score_id_better(a, b); }
 };
 
+// Reserves room for `additional` more elements without doubling a tight
+// buffer for a small append (upstream lib.rs `reserve_mostly_exact`, #501):
+// appends of at most an eighth of the length reserve exactly, plus an
+// eighth of headroom so a run of small appends stays amortized.
+template <typename T>
+void reserve_mostly_exact(std::vector<T> & v, size_t additional) {
+    const size_t len = v.size();
+    if (v.capacity() - len >= additional) {
+        return;
+    }
+    const size_t headroom = len / 8;
+    if (additional <= headroom) {
+        v.reserve(len + additional + headroom);
+    } else {
+        v.reserve(std::max(len + additional, v.capacity() + v.capacity() / 2));
+    }
+}
+
+inline constexpr int kMaxThreads = 256;
+
+// Runs fn(task, worker) for every task in [0, n_tasks) on up to n_threads
+// threads, the calling thread included; worker is in [0, workers). Tasks
+// are handed out dynamically, so fn must not depend on which worker runs a
+// task. Rethrows the first exception a task threw.
+template <typename Fn>
+void parallel_for(size_t n_tasks, int n_threads, Fn && fn) {
+    const size_t workers = std::min(n_tasks, static_cast<size_t>(std::max(1, n_threads)));
+    if (workers <= 1) {
+        for (size_t task = 0; task < n_tasks; ++task) {
+            fn(task, size_t{ 0 });
+        }
+        return;
+    }
+    std::atomic<size_t> next{ 0 };
+    std::mutex error_mutex;
+    std::exception_ptr error;
+    auto run = [&](size_t worker) {
+        try {
+            for (size_t task = next.fetch_add(1); task < n_tasks; task = next.fetch_add(1)) {
+                fn(task, worker);
+            }
+        } catch (...) {
+            std::lock_guard<std::mutex> lock(error_mutex);
+            if (!error) {
+                error = std::current_exception();
+            }
+            next.store(n_tasks);
+        }
+    };
+    std::vector<std::thread> threads;
+    threads.reserve(workers - 1);
+    try {
+        for (size_t worker = 1; worker < workers; ++worker) {
+            threads.emplace_back(run, worker);
+        }
+    } catch (...) {
+        // Fewer threads than asked: the ones started and this one finish.
+    }
+    run(0);
+    for (std::thread & thread : threads) {
+        thread.join();
+    }
+    if (error) {
+        std::rethrow_exception(error);
+    }
+}
+
+// A TurboVec index's binding to the v8 file it syncs to (upstream
+// `SyncCursor` plus its dirty sets). A 1.x index removes by swap-remove,
+// as upstream does, so its slot order is the file's row order.
+struct TurboVecSyncBinding {
+    bool bound = false;
+    std::string path;
+    // Generation and row count of the last commit, the file's identity,
+    // and the calibration generation that commit was written under.
+    uint64_t gen = 0;
+    uint64_t n_synced = 0;
+    uint64_t nonce = 0;
+    uint64_t calib_gen = 0;
+    // File rows whose redo ops ride the last commit, and rows changed since.
+    std::unordered_set<size_t> pending;
+    std::unordered_set<size_t> fresh;
+};
+
 struct ggml_vec_index {
     mutable std::shared_mutex mutex;
 
     int            dim                     = 0;
     int            bit_width               = 32;
     uint64_t       generation              = 0;
+    // Worker threads a call may use (ggml_vec_index_set_threads); 1 keeps
+    // every call on the calling thread.
+    int            n_threads               = 1;
     uint64_t       filter_cookie           = 0;
     bool           read_only_mmap          = false;
     bool           delta_log_start_allowed = false;
@@ -235,6 +323,9 @@ struct ggml_vec_index {
     // True for an index loaded from a v3 snapshot: it keeps the turbovec 0.9
     // QR rotation, codebook and first-add calibration it was written with.
     bool turbovec_legacy = false;
+    // Bumped by every calibrate; a sync across one rewrites the whole file.
+    uint64_t turbovec_calib_gen = 0;
+    TurboVecSyncBinding turbovec_sync;
     std::vector<uint8_t> turbovec_data;
     std::vector<float>   turbovec_scale;
     std::vector<float>   turbovec_tqplus_shift;
@@ -455,6 +546,10 @@ int turbovec_avx2_lut_block_matches_scalar_for_test(int bits, int dim);
 void turbovec_reset_block_score_call_count_for_test(void);
 int64_t turbovec_block_score_call_count_for_test(void);
 void turbovec_hadamard_rotate_for_test(const float * src, float * dst, int dim);
+int turbovec_sync_plan_for_test(
+    ggml_vec_index_t * idx,
+    const char * path,
+    std::vector<std::vector<std::pair<uint64_t, std::vector<uint8_t>>>> & batches);
 int turbovec_index_hashes_for_test(
     const ggml_vec_index_t * idx,
     uint64_t * codes_hash,
@@ -513,14 +608,16 @@ void quantize_turbovec_hadamard_batch(
     float * scales,
     int dim,
     const std::vector<float> & tqplus_shift,
-    const std::vector<float> & tqplus_scale);
+    const std::vector<float> & tqplus_scale,
+    int n_threads);
 int fit_turbovec_calibration(
     const float * sample,
     int n,
     int bits,
     int dim,
     std::vector<float> & out_shift,
-    std::vector<float> & out_scale);
+    std::vector<float> & out_scale,
+    int n_threads);
 void reencode_turbovec_rows(
     int bits,
     int dim,
@@ -532,7 +629,8 @@ void reencode_turbovec_rows(
     const std::vector<float> & new_shift,
     const std::vector<float> & new_scale,
     std::vector<uint8_t> & out_codes,
-    std::vector<float> & out_scales);
+    std::vector<float> & out_scales,
+    int n_threads);
 void turbovec_codebook_values(
     int bits,
     int dim,
@@ -554,10 +652,37 @@ struct TurboVecV8Image {
     std::vector<uint8_t> units;
 };
 bool turbovec_v8_magic(const uint8_t * bytes, size_t size);
+uint64_t turbovec_v8_declared_size(std::istream & f, uint64_t file_size);
 void turbovec_v8_build_image(const ggml_vec_index & idx, TurboVecV8Image & image);
 size_t turbovec_v8_image_size(const TurboVecV8Image & image);
+size_t turbovec_v8_serialized_size(const ggml_vec_index & idx);
 void turbovec_v8_flatten_image(const TurboVecV8Image & image, std::vector<uint8_t> & out);
-ggml_vec_index_t * turbovec_v8_load_image(std::vector<uint8_t> raw, int & error);
+struct TurboVecV8LoadInfo {
+    uint64_t gen = 0;
+    uint64_t nonce = 0;
+    // File rows with redo ops in the adopted commit.
+    std::vector<size_t> pending;
+};
+ggml_vec_index_t * turbovec_v8_load_image(std::vector<uint8_t> raw, int & error, TurboVecV8LoadInfo * info);
+
+// Positioned writes made durable together (one fsync per batch).
+using TurboVecWriteBatch = std::vector<std::pair<uint64_t, std::vector<uint8_t>>>;
+int turbovec_v8_write_file(const char * path, const TurboVecV8Image & image);
+int turbovec_v8_apply_batches(const char * path, const std::vector<TurboVecWriteBatch> & batches);
+// Reads up to `size` bytes at `offset`; GGML_VEC_INDEX_E_NOT_FOUND when the
+// file does not exist.
+int turbovec_read_file_range(
+    const char * path,
+    uint64_t offset,
+    size_t size,
+    std::vector<uint8_t> & out,
+    uint64_t & file_size);
+void turbovec_sync_bind_loaded(ggml_vec_index & idx, const char * path, const TurboVecV8LoadInfo & info);
+void turbovec_sync_unbind(ggml_vec_index & idx) noexcept;
+// Records a swap-remove of `slot` (the last slot moves into it) for the
+// next sync's redo ops.
+void turbovec_sync_note_remove(ggml_vec_index & idx, size_t slot) noexcept;
+int turbovec_v8_sync(ggml_vec_index & idx, const char * path);
 void decode_turbovec_q2_row(const uint8_t * codes, const float * scales, float * dst, int dim);
 void decode_turbovec_q2_row_calibrated(
     const uint8_t * codes,
@@ -583,6 +708,9 @@ void build_turbovec_q4_lut(const float * rotated_query, int dim, std::vector<uin
 float dot_turbovec_q4_lut_row(const uint8_t * lut, float lut_scale, float lut_bias, const uint8_t * codes, const float * scales, int dim);
 float dot_turbovec_q4_rotated_row(const float * rotated_query, const uint8_t * codes, const float * scales, int dim);
 float dot_turbovec_q4_row(const float * query, const uint8_t * codes, const float * scales, int dim);
+// Patches the blocked cache for a swap-remove of `slot` whose last slot
+// (`last`, already removed from the rows) moved into it.
+void turbovec_blocked_swap_remove(ggml_vec_index & idx, size_t slot, size_t last);
 void repack_turbovec_codes(
     const uint8_t * packed_codes,
     size_t n_vectors,

@@ -71,9 +71,9 @@ Choose a cache budget that leaves VRAM for other model weights, the KV cache, an
 
 `ggml-vector-index` provides a standalone C API for local vector search, including compressed CPU indexes for applications that need on-device retrieval.
 
-- **Storage**: full-precision f32, generic q8 and packed q4, plus TurboVec 2-bit and 4-bit modes with scalar, NEON, and AVX2 scoring paths.
+- **Storage**: full-precision f32, generic q8 and packed q4, plus TurboVec 2-, 3- and 4-bit modes (a byte-exact port of [turbovec](https://github.com/ryancodrai/turbovec) 1.1.2, dimensions up to 16384) with scalar, NEON, and AVX2 scoring paths.
 - **Search**: exact top-k scans, filtering by caller-provided IDs, reusable prepared filters, and optional IVF search for approximate candidate selection.
-- **Persistence**: index snapshots, with read-only mmap loading and incremental mutation logs for the generic storage modes. TurboVec supports snapshot save/load; mmap and logged mutations are not yet supported for TurboVec.
+- **Persistence**: index snapshots, with read-only mmap loading and incremental mutation logs for the generic storage modes. TurboVec writes turbovec's own v8 files, in memory or on disk, and saves incrementally with crash-safe `sync`.
 
 The library is disabled by default. Enable it with `-DGGML_VECTOR_INDEX=ON` and link `ggml::vector-index` explicitly; it is not integrated into the llama runtime or server. See the [Vector Index Guide](docs/vector-index.md) for supported dimensions, API usage, persistence contracts, and benchmarks.
 
