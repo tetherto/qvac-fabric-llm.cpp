@@ -148,6 +148,12 @@ endif()
 if (TARGET ggml-vector-index)
     add_executable(test-vector-index test-vector-index.cpp)
     target_compile_features(test-vector-index PRIVATE cxx_std_17)
+    # Golden inputs are rebuilt bit for bit: no fused multiply-adds and no
+    # fast-math from the toolchain.
+    if (CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang" AND NOT CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC")
+        set(TEST_VECTOR_INDEX_FP_OPTIONS -fno-fast-math -ffp-contract=off)
+    endif()
+    target_compile_options(test-vector-index PRIVATE ${TEST_VECTOR_INDEX_FP_OPTIONS})
     target_include_directories(test-vector-index PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
     target_link_libraries(test-vector-index PRIVATE ggml-vector-index)
     if (LLAMA_TESTS_INSTALL)
@@ -157,6 +163,7 @@ if (TARGET ggml-vector-index)
 
     add_executable(test-vector-index-hooks test-vector-index.cpp)
     target_compile_features(test-vector-index-hooks PRIVATE cxx_std_17)
+    target_compile_options(test-vector-index-hooks PRIVATE ${TEST_VECTOR_INDEX_FP_OPTIONS})
     target_include_directories(test-vector-index-hooks PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
     target_compile_definitions(test-vector-index-hooks PRIVATE GGML_VEC_INDEX_TEST_HOOKS)
     target_link_libraries(test-vector-index-hooks PRIVATE ggml-vector-index-test)
@@ -164,6 +171,9 @@ if (TARGET ggml-vector-index)
         install(TARGETS test-vector-index-hooks RUNTIME)
     endif()
     llama_test(test-vector-index-hooks ARGS --internal-hooks)
+    # The full suite again, against the hooks build, so checks that need
+    # internal access (rotation and golden hashes) run alongside it.
+    llama_test(test-vector-index-hooks NAME test-vector-index-hooks-full)
 
     add_executable(test-vector-index-faults test-vector-index-faults.cpp)
     target_compile_features(test-vector-index-faults PRIVATE cxx_std_17)

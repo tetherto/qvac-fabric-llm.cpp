@@ -1,0 +1,10 @@
+[package]
+name = "turbovec-golden-gen-1x"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Regenerates tests/turbovec-1x-golden.inc from upstream turbovec. The exact
+# pin matters: the fixtures are byte-for-byte outputs of this release.
+[dependencies]
+turbovec = "=1.1.2"
