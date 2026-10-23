@@ -709,6 +709,238 @@ static void test_reallocation() {
     }
 }
 
+struct add_graph {
+    test_context_with_graph g;
+    ggml_tensor *           a;
+    ggml_tensor *           b;
+};
+
+static add_graph make_add_graph(size_t size_bytes) {
+    test_context_with_graph g   = make_context();
+    ggml_tensor *           a   = make_input_with_size(g.ctx, size_bytes);
+    ggml_tensor *           b   = make_input_with_size(g.ctx, size_bytes);
+    ggml_tensor *           out = ggml_add(g.ctx, a, b);
+    ggml_set_output(out);
+    ggml_build_forward_expand(g.graph, out);
+    return { std::move(g), a, b };
+}
+
+static size_t buffer_offset(const ggml_tensor * t) {
+    return (const char *) t->data - (const char *) ggml_backend_buffer_get_base(t->buffer);
+}
+
+static void test_reserved_plan_survives_other_graph() {
+    dummy_backend    backend = dummy_backend_init(SIZE_MAX, /*align*/ 4);
+    ggml_gallocr_ptr galloc  = ggml_gallocr_ptr(ggml_gallocr_new(&backend.buffer_type));
+
+    add_graph big = make_add_graph(64);
+    GGML_ASSERT(ggml_gallocr_alloc_graph(galloc.get(), big.g.graph));
+    const size_t reserved_total = backend.context->allocated_total();
+
+    auto [ctx, graph, ctx_ptr] = make_context();
+    make_scale_graph(ctx, graph, 16);
+    GGML_ASSERT(ggml_gallocr_alloc_graph(galloc.get(), graph));
+
+    // the smaller graph of the reserved shape keeps the reserved layout instead of a tight one
+    add_graph small = make_add_graph(32);
+    GGML_ASSERT(ggml_gallocr_alloc_graph(galloc.get(), small.g.graph));
+    check_all_allocated(small.g.graph);
+    GGML_ASSERT(buffer_offset(small.a) == buffer_offset(big.a));
+    GGML_ASSERT(buffer_offset(small.b) == buffer_offset(big.b));
+    GGML_ASSERT(backend.context->allocated_total() == reserved_total);
+
+    // a graph that outgrows the stored plan is planned again
+    add_graph bigger = make_add_graph(128);
+    GGML_ASSERT(ggml_gallocr_alloc_graph(galloc.get(), bigger.g.graph));
+    check_all_allocated(bigger.g.graph);
+    check_no_overlap(bigger.g.graph);
+    GGML_ASSERT(backend.context->allocated_total() > reserved_total);
+}
+
+// Two independent scales of inputs of size_a and size_b bytes.
+static test_context_with_graph make_two_scale_graph(size_t size_a, size_t size_b) {
+    test_context_with_graph g   = make_context();
+    ggml_tensor *           out_a = ggml_scale(g.ctx, make_input_with_size(g.ctx, size_a), 2.0f);
+    ggml_tensor *           out_b = ggml_scale(g.ctx, make_input_with_size(g.ctx, size_b), 2.0f);
+    ggml_set_output(out_a);
+    ggml_set_output(out_b);
+    ggml_build_forward_expand(g.graph, out_a);
+    ggml_build_forward_expand(g.graph, out_b);
+    return g;
+}
+
+static void test_stored_plan_grows_to_cover_graphs() {
+    dummy_backend              backend_a = dummy_backend_init(SIZE_MAX, /*align*/ 4);
+    dummy_backend              backend_b = dummy_backend_init(SIZE_MAX, /*align*/ 4);
+    ggml_backend_buffer_type_t bufts[2]  = { &backend_a.buffer_type, &backend_b.buffer_type };
+    ggml_gallocr_ptr           galloc    = ggml_gallocr_ptr(ggml_gallocr_new_n(bufts, 2));
+
+    test_context_with_graph wide = make_two_scale_graph(64, 16);
+    GGML_ASSERT(ggml_gallocr_reserve_n(galloc.get(), wide.graph, nullptr, nullptr));
+
+    // with several buffers a graph that does not fit the plan is not planned again automatically
+    test_context_with_graph tall = make_two_scale_graph(16, 64);
+    GGML_ASSERT(!ggml_gallocr_alloc_graph(galloc.get(), tall.graph));
+    GGML_ASSERT(ggml_gallocr_reserve_n(galloc.get(), tall.graph, nullptr, nullptr));
+    GGML_ASSERT(ggml_gallocr_alloc_graph(galloc.get(), tall.graph));
+
+    // the new plan also covers the first graph, so it fits without a new plan
+    test_context_with_graph wide_again = make_two_scale_graph(64, 16);
+    GGML_ASSERT(ggml_gallocr_alloc_graph(galloc.get(), wide_again.graph));
+    check_all_allocated(wide_again.graph);
+    check_no_overlap(wide_again.graph);
+}
+
+// Reserves the two-scale graph with every tensor in buffer buffer_id.
+static void reserve_two_scale_graph(ggml_gallocr_t galloc, size_t size_a, size_t size_b, int buffer_id) {
+    test_context_with_graph g = make_two_scale_graph(size_a, size_b);
+    const int node_buffer_ids[2] = { buffer_id, buffer_id };
+    const int leaf_buffer_ids[2] = { buffer_id, buffer_id };
+    GGML_ASSERT(g.graph->n_nodes == 2 && g.graph->n_leafs == 2);
+    GGML_ASSERT(ggml_gallocr_reserve_n(galloc, g.graph, node_buffer_ids, leaf_buffer_ids));
+}
+
+// Two buffer ids of one buffer type share a buffer, so a stored plan of one id restores and floors graphs of the other.
+static void test_stored_plan_restores_across_shared_buffer_type(bool cross_id) {
+    dummy_backend              backend  = dummy_backend_init(SIZE_MAX, /*align*/ 4);
+    ggml_backend_buffer_type_t bufts[2] = { &backend.buffer_type, &backend.buffer_type };
+    ggml_gallocr_ptr           galloc   = ggml_gallocr_ptr(ggml_gallocr_new_n(bufts, 2));
+    const int                  other_id = cross_id ? 1 : 0;
+
+    reserve_two_scale_graph(galloc.get(), 64, 16, 0);
+    reserve_two_scale_graph(galloc.get(), 16, 64, other_id);
+    const size_t n_planned = ggml_gallocr_get_n_planned(galloc.get());
+
+    reserve_two_scale_graph(galloc.get(), 64, 16, 0);
+    reserve_two_scale_graph(galloc.get(), 16, 64, other_id);
+    GGML_ASSERT(ggml_gallocr_get_n_planned(galloc.get()) == n_planned);
+}
+
+// n chained scales of one input, a graph of n nodes.
+static test_context_with_graph make_scale_chain_graph(int n) {
+    test_context_with_graph g   = make_context();
+    ggml_tensor *           out = make_input_with_size(g.ctx, 16);
+    for (int i = 0; i < n; i++) {
+        out = ggml_scale(g.ctx, out, 2.0f);
+    }
+    ggml_set_output(out);
+    ggml_build_forward_expand(g.graph, out);
+    return g;
+}
+
+// Reserves n graphs of distinct node counts, so each stores a plan of its own.
+static void reserve_scale_chains(ggml_gallocr_t galloc, int n) {
+    for (int i = 1; i <= n; i++) {
+        test_context_with_graph g = make_scale_chain_graph(i);
+        GGML_ASSERT(ggml_gallocr_reserve(galloc, g.graph));
+    }
+}
+
+// Twice the plans that ggml-alloc stores.
+static constexpr int N_OTHER_SHAPES = 16;
+
+static void test_reserved_plan_survives_many_other_shapes() {
+    dummy_backend    backend = dummy_backend_init(SIZE_MAX, /*align*/ 4);
+    ggml_gallocr_ptr galloc  = ggml_gallocr_ptr(ggml_gallocr_new(&backend.buffer_type));
+
+    add_graph reserved = make_add_graph(64);
+    GGML_ASSERT(ggml_gallocr_reserve(galloc.get(), reserved.g.graph));
+    ggml_gallocr_pin_plan(galloc.get());
+
+    reserve_scale_chains(galloc.get(), N_OTHER_SHAPES);
+    const size_t n_planned = ggml_gallocr_get_n_planned(galloc.get());
+
+    add_graph smaller = make_add_graph(32);
+    GGML_ASSERT(ggml_gallocr_reserve(galloc.get(), smaller.g.graph));
+    GGML_ASSERT(ggml_gallocr_get_n_planned(galloc.get()) == n_planned);
+}
+
+// ((i0 + i1) + i1) + i0: every sum can reuse the memory of the previous one.
+static test_context_with_graph make_add_chain_graph() {
+    test_context_with_graph g   = make_context();
+    ggml_tensor *           i0  = make_input_with_size(g.ctx, 16);
+    ggml_tensor *           i1  = make_input_with_size(g.ctx, 16);
+    ggml_tensor *           s0  = ggml_add(g.ctx, i0, i1);
+    ggml_tensor *           out = ggml_add(g.ctx, ggml_add(g.ctx, s0, i1), i0);
+    ggml_set_output(out);
+    ggml_build_forward_expand(g.graph, out);
+    return g;
+}
+
+// (i0 + i1) + (i0 + i1): the same counts and source slots, but the first sum stays alive while the second runs.
+static test_context_with_graph make_add_pair_graph() {
+    test_context_with_graph g   = make_context();
+    ggml_tensor *           i0  = make_input_with_size(g.ctx, 16);
+    ggml_tensor *           i1  = make_input_with_size(g.ctx, 16);
+    ggml_tensor *           out = ggml_add(g.ctx, ggml_add(g.ctx, i0, i1), ggml_add(g.ctx, i0, i1));
+    ggml_set_output(out);
+    ggml_build_forward_expand(g.graph, out);
+    return g;
+}
+
+static void test_stored_plan_needs_same_wiring() {
+    dummy_backend    backend = dummy_backend_init(SIZE_MAX, /*align*/ 4);
+    ggml_gallocr_ptr galloc  = ggml_gallocr_ptr(ggml_gallocr_new(&backend.buffer_type));
+
+    test_context_with_graph chain = make_add_chain_graph();
+    GGML_ASSERT(ggml_gallocr_reserve(galloc.get(), chain.graph));
+
+    auto [ctx, graph, ctx_ptr] = make_context();
+    make_scale_graph(ctx, graph, 16);
+    GGML_ASSERT(ggml_gallocr_reserve(galloc.get(), graph));
+
+    test_context_with_graph pair = make_add_pair_graph();
+    GGML_ASSERT(ggml_graph_n_nodes(pair.graph) == ggml_graph_n_nodes(chain.graph));
+    GGML_ASSERT(pair.graph->n_leafs == chain.graph->n_leafs);
+    GGML_ASSERT(ggml_gallocr_reserve(galloc.get(), pair.graph));
+    GGML_ASSERT(ggml_gallocr_alloc_graph(galloc.get(), pair.graph));
+    check_all_allocated(pair.graph);
+    check_no_overlap(pair.graph);
+}
+
+struct copy_graph {
+    test_context_with_graph g;
+    ggml_tensor *           sum;
+};
+
+// (x + copy[i_copy]) + 2x with two copies that are never freed, as the scheduler keeps its input copies for pipeline parallelism.
+static copy_graph make_copy_graph(size_t size_bytes, int i_copy) {
+    test_context_with_graph g = make_context();
+    ggml_tensor * copies[2];
+    for (ggml_tensor *& copy : copies) {
+        copy = make_input_with_size(g.ctx, size_bytes);
+        ggml_set_output(copy);
+        ggml_build_forward_expand(g.graph, copy);
+    }
+    ggml_tensor * x   = make_input_with_size(g.ctx, size_bytes);
+    ggml_tensor * sum = ggml_add(g.ctx, x, copies[i_copy]);
+    ggml_tensor * out = ggml_add(g.ctx, sum, ggml_scale(g.ctx, x, 2.0f));
+    ggml_set_output(out);
+    ggml_build_forward_expand(g.graph, out);
+    return { std::move(g), sum };
+}
+
+static void test_stored_plan_ignores_persistent_source() {
+    dummy_backend    backend = dummy_backend_init(SIZE_MAX, /*align*/ 4);
+    ggml_gallocr_ptr galloc  = ggml_gallocr_ptr(ggml_gallocr_new(&backend.buffer_type));
+
+    copy_graph big = make_copy_graph(64, 0);
+    GGML_ASSERT(ggml_gallocr_alloc_graph(galloc.get(), big.g.graph));
+    const size_t reserved_total = backend.context->allocated_total();
+
+    auto [ctx, graph, ctx_ptr] = make_context();
+    make_scale_graph(ctx, graph, 16);
+    GGML_ASSERT(ggml_gallocr_alloc_graph(galloc.get(), graph));
+
+    // reading the other copy changes no lifetime, so the stored plan of the first graph is restored
+    copy_graph small = make_copy_graph(32, 1);
+    GGML_ASSERT(ggml_gallocr_alloc_graph(galloc.get(), small.g.graph));
+    check_all_allocated(small.g.graph);
+    check_no_overlap(small.g.graph);
+    GGML_ASSERT(buffer_offset(small.sum) == buffer_offset(big.sum));
+    GGML_ASSERT(backend.context->allocated_total() == reserved_total);
+}
+
 static void test_backend_graph_optimize(ggml_backend_t, ggml_cgraph * graph, ggml_backend_graph_optimize_params * params) {
     GGML_ASSERT(graph->n_nodes == 3);
     params->add_alloc_dep(params->user_data, graph->nodes[0], graph->nodes[2]);
@@ -864,6 +1096,13 @@ int main() {
     run("test_multiple_buffer_types", test_multiple_buffer_types);
     run("test_buffer_size_zero", test_buffer_size_zero);
     run("test_reallocation", test_reallocation);
+    run("test_reserved_plan_survives_other_graph", test_reserved_plan_survives_other_graph);
+    run("test_stored_plan_grows_to_cover_graphs", test_stored_plan_grows_to_cover_graphs);
+    run("test_stored_plan_needs_same_wiring", test_stored_plan_needs_same_wiring);
+    run("test_stored_plan_ignores_persistent_source", test_stored_plan_ignores_persistent_source);
+    run("test_stored_plan_restores_across_shared_buffer_type(false)", []() { test_stored_plan_restores_across_shared_buffer_type(false); });
+    run("test_stored_plan_restores_across_shared_buffer_type(true)", []() { test_stored_plan_restores_across_shared_buffer_type(true); });
+    run("test_reserved_plan_survives_many_other_shapes", test_reserved_plan_survives_many_other_shapes);
     run("test_graph_optimize_alloc_dep", test_graph_optimize_alloc_dep);
     run("test_shared_buffers", test_shared_buffers);
     run("test_shared_buffers_tensor_extras(SIZE_MAX)", []() { test_shared_buffers_tensor_extras(SIZE_MAX); });

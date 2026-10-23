@@ -73,6 +73,12 @@ GGML_API bool ggml_gallocr_alloc_graph(ggml_gallocr_t galloc, struct ggml_cgraph
 
 GGML_API size_t ggml_gallocr_get_buffer_size(ggml_gallocr_t galloc, int buffer_id);
 
+// number of graphs planned so far; a graph that restores a stored plan does not count
+GGML_API size_t ggml_gallocr_get_n_planned(ggml_gallocr_t galloc);
+
+// keep the plan of the last reserved graph when stored plans are evicted
+GGML_API void ggml_gallocr_pin_plan(ggml_gallocr_t galloc);
+
 // Utils
 // Create a buffer and allocate all the tensors in a ggml_context
 // ggml_backend_alloc_ctx_tensors_from_buft_size returns the size of the buffer that would be allocated by ggml_backend_alloc_ctx_tensors_from_buft
