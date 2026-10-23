@@ -68,6 +68,7 @@ endif()
 # rotation kernels AVX-512 F (with AVX2). Each gets its own object, like the
 # AVX2 one, and runs only after a runtime CPU check.
 set(GGML_VECTOR_INDEX_SSE42_FLAG "")
+set(GGML_VECTOR_INDEX_SSSE3_FLAG "")
 set(GGML_VECTOR_INDEX_SSE42_ENABLED OFF)
 set(GGML_VECTOR_INDEX_AVX512_FLAG "")
 set(GGML_VECTOR_INDEX_SSE42_CHECK_SOURCE [=[
@@ -99,6 +100,9 @@ if (GGML_SYSTEM_ARCH STREQUAL "x86")
         check_cxx_compiler_flag("-msse4.2" GGML_VECTOR_INDEX_SUPPORTS_MSSE42)
         if (GGML_VECTOR_INDEX_SUPPORTS_MSSSE3 AND GGML_VECTOR_INDEX_SUPPORTS_MSSE42)
             set(GGML_VECTOR_INDEX_SSE42_FLAG "-mssse3;-msse4.2")
+            # The layout kernels run on SSSE3-only CPUs, so their object
+            # must not let the compiler use anything newer.
+            set(GGML_VECTOR_INDEX_SSSE3_FLAG "-mssse3")
             set(GGML_VECTOR_INDEX_SSE42_CANDIDATE ON)
         endif()
     elseif (MSVC)
@@ -146,15 +150,98 @@ if (GGML_SYSTEM_ARCH STREQUAL "x86")
     endif()
 endif()
 
+# The x86 search kernels: one object per instruction-set combination, each
+# run only after its runtime check, so a missing combination leaves that
+# kernel's scalar model in charge. GCC and Clang enable each feature with
+# its -m flag. MSVC does not gate intrinsics by feature, so /arch:AVX512
+# compiles them all; clang-cl does gate them and also takes the features
+# through /clang:. The first candidate that compiles the kernel's
+# instructions wins.
+function(ggml_vector_index_x86_flags out_var name check_source)
+    set(${out_var} "" PARENT_SCOPE)
+    if (NOT GGML_VECTOR_INDEX_AVX2_FLAG)
+        return()
+    endif()
+    set(candidates ${ARGN})
+    foreach (candidate IN LISTS candidates)
+        if (MSVC AND NOT candidate MATCHES "^/")
+            continue()
+        elseif (NOT MSVC AND NOT CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+            continue()
+        elseif (NOT MSVC AND candidate MATCHES "^/")
+            continue()
+        endif()
+        string(REPLACE "," ";" flags "${candidate}")
+        string(REPLACE "," " " required "${candidate}")
+        string(MAKE_C_IDENTIFIER "GGML_VECTOR_INDEX_${name}_${candidate}" check_var)
+        set(CMAKE_REQUIRED_FLAGS_SAVE ${CMAKE_REQUIRED_FLAGS})
+        set(CMAKE_REQUIRED_FLAGS "${CMAKE_REQUIRED_FLAGS} ${required}")
+        check_cxx_source_compiles("${check_source}" ${check_var})
+        set(CMAKE_REQUIRED_FLAGS ${CMAKE_REQUIRED_FLAGS_SAVE})
+        if (${check_var})
+            set(${out_var} "${flags}" PARENT_SCOPE)
+            return()
+        endif()
+    endforeach()
+endfunction()
+
+ggml_vector_index_x86_flags(GGML_VECTOR_INDEX_AVX512BW_FLAG AVX512BW [=[
+    #include <immintrin.h>
+    int main() {
+        alignas(64) unsigned char b[64] = {};
+        const __m512i v = _mm512_shuffle_epi8(_mm512_loadu_si512(b), _mm512_set1_epi8(1));
+        const __m512i w = _mm512_add_epi16(_mm512_srli_epi16(v, 8), _mm512_inserti64x4(v, _mm256_set1_epi8(2), 1));
+        const __m256 f = _mm256_fmadd_ps(_mm256_set1_ps(1.0f), _mm256_cvtepi32_ps(_mm256_cvtepu16_epi32(
+            _mm512_castsi512_si128(w))), _mm256_setzero_ps());
+        const __mmask16 m = _mm512_test_epi32_mask(_mm512_cvttps_epi32(_mm512_set1_ps(_mm256_cvtss_f32(f))), w);
+        return _mm512_reduce_add_epi32(_mm512_mask_sub_epi32(w, m, w, w)) == 0 ? 0 : 1;
+    }
+]=] "-mavx2,-mfma,-mavx512f,-mavx512bw" "/arch:AVX512")
+ggml_vector_index_x86_flags(GGML_VECTOR_INDEX_VNNI_FLAG VNNI [=[
+    #include <immintrin.h>
+    int main() {
+        alignas(64) unsigned char b[64] = {};
+        const __m512i v = _mm512_loadu_si512(b);
+        const __m512i p = _mm512_permutexvar_epi8(v, _mm512_shuffle_epi8(v, v));
+        const __m512i d = _mm512_dpbusd_epi32(_mm512_setzero_si512(), p, _mm512_maskz_mov_epi8(~0ull, v));
+        return _mm512_reduce_add_epi32(d) == 0 ? 0 : 1;
+    }
+]=] "-mavx512f,-mavx512bw,-mavx512vbmi,-mavx512vnni" "/arch:AVX512"
+    "/arch:AVX512,/clang:-mavx512vbmi,/clang:-mavx512vnni")
+ggml_vector_index_x86_flags(GGML_VECTOR_INDEX_GFNI_FLAG GFNI [=[
+    #include <immintrin.h>
+    int main() {
+        alignas(64) unsigned char b[64] = {};
+        const __m512i v = _mm512_loadu_si512(b);
+        const __m512i s = _mm512_gf2p8affine_epi64_epi8(v, _mm512_set1_epi64(0x1020408000000000ll), 0);
+        const __m512i d = _mm512_dpbusd_epi32(_mm512_setzero_si512(), _mm512_shuffle_epi8(v, s), v);
+        return _mm512_reduce_add_epi32(d) == 0 ? 0 : 1;
+    }
+]=] "-mavx512f,-mavx512bw,-mavx512vnni,-mgfni" "/arch:AVX512" "/arch:AVX512,/clang:-mavx512vnni,/clang:-mgfni")
+ggml_vector_index_x86_flags(GGML_VECTOR_INDEX_VPOPCNT_FLAG VPOPCNT [=[
+    #include <immintrin.h>
+    int main() {
+        alignas(64) unsigned char b[64] = {};
+        const __m512i v = _mm512_maskz_loadu_epi8(~0ull, b);
+        const __m512i c = _mm512_sll_epi64(_mm512_popcnt_epi64(v), _mm_cvtsi32_si128(1));
+        return _mm512_reduce_add_epi64(c) == 0 ? 0 : 1;
+    }
+]=] "-mavx512f,-mavx512bw,-mavx512vpopcntdq" "/arch:AVX512" "/arch:AVX512,/clang:-mavx512vpopcntdq")
+
 if (GGML_VECTOR_INDEX_AVX2_FLAG OR GGML_VECTOR_INDEX_SSE42_ENABLED)
     list(APPEND GGML_VECTOR_INDEX_SOURCES ${GGML_VECTOR_INDEX_SOURCE_DIR}/ggml-vector-index-x86.h)
 endif()
 if (GGML_VECTOR_INDEX_SSE42_ENABLED)
-    list(APPEND GGML_VECTOR_INDEX_SOURCES ${GGML_VECTOR_INDEX_SOURCE_DIR}/ggml-vector-index-sse42.cpp)
+    list(APPEND GGML_VECTOR_INDEX_SOURCES
+        ${GGML_VECTOR_INDEX_SOURCE_DIR}/ggml-vector-index-sse42.cpp
+        ${GGML_VECTOR_INDEX_SOURCE_DIR}/ggml-vector-index-ssse3.cpp)
     if (GGML_VECTOR_INDEX_SSE42_FLAG)
         set_source_files_properties(
             ${GGML_VECTOR_INDEX_SOURCE_DIR}/ggml-vector-index-sse42.cpp
             PROPERTIES COMPILE_OPTIONS "${GGML_VECTOR_INDEX_SSE42_FLAG}")
+        set_source_files_properties(
+            ${GGML_VECTOR_INDEX_SOURCE_DIR}/ggml-vector-index-ssse3.cpp
+            PROPERTIES COMPILE_OPTIONS "${GGML_VECTOR_INDEX_SSSE3_FLAG}")
     endif()
 endif()
 if (GGML_VECTOR_INDEX_AVX512_FLAG)
@@ -163,7 +250,30 @@ if (GGML_VECTOR_INDEX_AVX512_FLAG)
         ${GGML_VECTOR_INDEX_SOURCE_DIR}/ggml-vector-index-turbovec-avx512.cpp
         PROPERTIES COMPILE_OPTIONS "${GGML_VECTOR_INDEX_AVX512_FLAG}")
 endif()
+foreach (kernel IN ITEMS AVX512BW VNNI GFNI VPOPCNT)
+    if (GGML_VECTOR_INDEX_${kernel}_FLAG)
+        string(TOLOWER "${kernel}" kernel_file)
+        set(kernel_source ${GGML_VECTOR_INDEX_SOURCE_DIR}/ggml-vector-index-turbovec-${kernel_file}.cpp)
+        list(APPEND GGML_VECTOR_INDEX_SOURCES ${kernel_source})
+        set_source_files_properties(${kernel_source} PROPERTIES COMPILE_OPTIONS "${GGML_VECTOR_INDEX_${kernel}_FLAG}")
+    endif()
+endforeach()
+if (GGML_VECTOR_INDEX_VNNI_FLAG OR GGML_VECTOR_INDEX_GFNI_FLAG)
+    list(APPEND GGML_VECTOR_INDEX_SOURCES ${GGML_VECTOR_INDEX_SOURCE_DIR}/ggml-vector-index-turbovec-pd-x86.h)
+endif()
+if (GGML_SYSTEM_ARCH STREQUAL "x86" AND NOT GGML_VECTOR_INDEX_VNNI_FLAG)
+    # Layout and staged search follow the CPU, as upstream's do, so on an
+    # AVX-512 VBMI/VNNI CPU a build without these kernels scores through
+    # their scalar models: the same results, far slower.
+    message(WARNING "ggml-vector-index: the AVX-512 VNNI search kernels could not be built with this compiler; "
+        "TurboVec searches on AVX-512 VBMI/VNNI CPUs will use a much slower scalar path")
+endif()
 set(GGML_VECTOR_INDEX_X86_DEFINITIONS "")
+foreach (kernel IN ITEMS AVX512BW VNNI GFNI VPOPCNT)
+    if (GGML_VECTOR_INDEX_${kernel}_FLAG)
+        list(APPEND GGML_VECTOR_INDEX_X86_DEFINITIONS GGML_VEC_INDEX_HAVE_${kernel}_KERNEL)
+    endif()
+endforeach()
 if (GGML_VECTOR_INDEX_SSE42_ENABLED)
     list(APPEND GGML_VECTOR_INDEX_X86_DEFINITIONS GGML_VEC_INDEX_HAVE_SSE42_KERNEL)
 endif()

@@ -344,6 +344,12 @@ struct ggml_vec_index {
     // eight, and 2-bit ones under TURBOVEC_2BIT_VM8=1); fixed at creation
     // and never persisted, since snapshots are written from sequential rows.
     bool turbovec_blocked_vm8 = false;
+    // Created under upstream's x86 rules (turbovec_x86_rules); fixed at
+    // creation. With the vector-major layout, 2- and 3-bit codes score
+    // with the `vpermb` scan's arithmetic, and the staged search keeps its
+    // sign region vector-major, scans it the same way and ranks with bit
+    // masks, as upstream does on x86.
+    bool turbovec_x86 = false;
     // Bumped by every calibrate; a sync across one rewrites the whole file.
     uint64_t turbovec_calib_gen = 0;
     TurboVecSyncBinding turbovec_sync;
@@ -605,12 +611,33 @@ int turbovec_encode_kernel_parity_for_test(int kernel);
 int turbovec_layout_kernel_parity_for_test(int kernel);
 int vector_validation_kernel_parity_for_test(int kernel);
 int crc32c_kernel_parity_for_test(int kernel);
+// The x86 search kernels against their scalar models (kernels 0-7, see
+// ggml-vector-index-turbovec.cpp); 1 match, 0 mismatch, -1 unavailable.
+int turbovec_search_kernel_parity_for_test(int kernel);
+// The staged search's AVX-512 bit-mask build (0) and VPOPCNTDQ count (1).
+int turbovec_low_kernel_parity_for_test(int kernel);
+// Upstream's x86 `vpermb`-scan search computed slot by slot from the code
+// bytes (ggml-vector-index-search.cpp); 0 when the index does not score so.
+int turbovec_vpermb_reference_search_for_test(
+    const ggml_vec_index_t * idx,
+    const float * queries,
+    int n_q,
+    int k,
+    const uint64_t * allowed,
+    int n_allowed,
+    float * out_scores,
+    uint64_t * out_ids);
 int turbovec_sync_plan_for_test(
     ggml_vec_index_t * idx,
     const char * path,
     std::vector<std::vector<std::pair<uint64_t, std::vector<uint8_t>>>> & batches);
 void turbovec_force_vector_major_for_test(int mode);
 void turbovec_disable_dot_product_for_test(int disabled);
+int vec_index_simd_kernel_built_for_test(int id);
+int turbovec_pd_finish_parity_for_test();
+// -1 follows the build, 0 or 1 forces upstream's aarch64 or x86 rules for
+// indexes created afterwards (turbovec_x86_rules).
+void turbovec_force_x86_rules_for_test(int mode);
 // -1 follows the host, 0 or 1 forces the `vm8` choice for indexes created
 // afterwards (still only on top of the vector-major layout).
 void turbovec_force_vm8_for_test(int mode);
@@ -648,9 +675,26 @@ struct VecIndexCpuFeatures {
     bool avx2 = false;
     // AVX-512 F, only together with AVX2.
     bool avx512f = false;
+    // AVX-512 extensions, each only together with AVX-512 F. GFNI counts
+    // only there too: the search kernels use its 512-bit form.
+    bool avx512bw = false;
+    bool avx512vbmi = false;
+    bool avx512vnni = false;
+    bool avx512vpopcntdq = false;
+    bool gfni = false;
     bool arm_crc32 = false;
 };
 const VecIndexCpuFeatures & vec_index_cpu_features();
+// Upstream `have_gfni`: the GFNI form of the x86 permute-dot kernel, unless
+// TURBOVEC_NO_GFNI is set. Both forms sum the same integers.
+bool turbovec_cpu_gfni();
+// Whether new indexes follow upstream's x86 rules rather than its aarch64
+// ones: on a vector-major host the 2- and 3-bit layouts are vector-major
+// too (scored by the `vpermb` scan), the staged search's sign region is
+// vector-major and scanned the same way, and its ranking counts bit masks.
+// True on x86 builds; a test may force it anywhere, so the scalar models
+// of those kernels run on any host.
+bool turbovec_x86_rules();
 
 // The CPU's int8 matrix multiply (aarch64 i8mm): gates the SMMLA
 // instructions themselves.
@@ -677,6 +721,19 @@ inline TurboVecLayout turbovec_layout(const ggml_vec_index & idx) {
     return idx.turbovec_blocked_vm8 ? kTurboVecLayoutVm8 :
         idx.turbovec_blocked_vm ? kTurboVecLayoutVm : kTurboVecLayoutSeq;
 }
+// The staged search's sign region (dim / 8 byte groups): vector-major
+// under upstream's x86 rules (pack.rs `planes_sign_permuted`), sequential
+// otherwise.
+inline TurboVecLayout turbovec_sign_layout(const ggml_vec_index & idx) {
+    return idx.turbovec_x86 && idx.turbovec_blocked_vm && (idx.dim / 8) % 4 == 0 ? kTurboVecLayoutVm :
+                                                                                  kTurboVecLayoutSeq;
+}
+// Whether this index's codes score with the `vpermb` scan's arithmetic
+// (upstream x86, 2 and 3 bits in the vector-major layout): exact u32 sums
+// of the nibble tables, then sum * scale + bias, unfused.
+inline bool turbovec_scores_vnni_lut(const ggml_vec_index & idx) {
+    return idx.turbovec_blocked_vm && !idx.turbovec_blocked_vm8 && idx.turbovec_bits != 4;
+}
 // The layouts upstream picks for a new 1.x index of this geometry.
 bool turbovec_wants_vector_major(int bits, int dim);
 bool turbovec_wants_vm8(int bits, int dim);
@@ -694,6 +751,11 @@ struct TurboVecPermuteDot {
     // The lone-query weights over the vm8 layout (4-bit, when the
     // byte-group count is a multiple of eight).
     std::vector<int8_t> vm8_weights;
+    // Builds with the AVX-512 VNNI kernels, 4-bit: the weights in
+    // upstream's own order (per four byte groups, the four odd dims then
+    // the four even ones) and -128 times their sum, for those kernels.
+    std::vector<int8_t> x86_weights;
+    int32_t zero = 0;
     float scale = 1.0f;
     float bias = 0.0f;
 };
@@ -731,6 +793,71 @@ void score_turbovec_permute_dot_batch_block(
     size_t n_vectors,
     int dim,
     float * const * out_scores);
+// score_turbovec_permute_dot_block over n_group (up to eight) consecutive
+// blocks, out_scores[b * 32 + lane]: on x86 one pass interleaves them, as
+// upstream's lone query does.
+void score_turbovec_permute_dot_blocks(
+    const TurboVecPermuteDot & pd,
+    const uint8_t * blocked_codes,
+    const float * vector_scales,
+    size_t first_block,
+    size_t n_group,
+    size_t n_vectors,
+    int dim,
+    TurboVecLayout layout,
+    float * out_scores);
+// Upstream `split_lut_for_vnni`: a query's nibble tables reordered for the
+// `vpermb` scan (n_byte_groups a multiple of four, n_byte_groups * 32
+// bytes).
+void turbovec_split_lut_for_vnni(const uint8_t * lut, size_t n_byte_groups, uint8_t * out);
+// The `vpermb` scan (turbovec_scores_vnni_lut) of nq queries (up to 8)
+// over n_group consecutive vector-major blocks, out_scores[q][b * 32 +
+// lane]. `splits` (each query's split tables) may be null: the AVX-512
+// kernel needs them, the scalar model reads `luts`.
+void score_turbovec_lut_blocks_vnni(
+    const uint8_t * const * luts,
+    const uint8_t * const * splits,
+    const float * scales,
+    const float * biases,
+    int nq,
+    const uint8_t * blocked_codes,
+    const float * vector_scales,
+    size_t first_block,
+    size_t n_group,
+    size_t n_vectors,
+    int bits,
+    int dim,
+    float * const * out_scores);
+void score_turbovec_lut_block_vnni(
+    const uint8_t * lut,
+    const uint8_t * split,
+    float lut_scale,
+    float lut_bias,
+    const uint8_t * blocked_codes,
+    const float * vector_scales,
+    size_t block_index,
+    size_t n_vectors,
+    int bits,
+    int dim,
+    float * out_scores);
+// One vector's 4-bit permute-dot sum from a planes cache (upstream
+// `exact4_sum`): its sign plane from the vector-major sign block, its low
+// planes from its packed row; `w` is upstream's `Exact4` weight layout.
+int32_t turbovec_exact4_sum(
+    const int8_t * w,
+    const int8_t * levels,
+    int32_t zero,
+    const uint8_t * sign_block,
+    const uint8_t * low_row,
+    size_t nsg,
+    size_t lane);
+int32_t turbovec_exact4_sum_scalar(
+    const int8_t * w,
+    const int8_t * levels,
+    const uint8_t * sign_block,
+    const uint8_t * low_row,
+    size_t nsg,
+    size_t lane);
 bool turbovec_uses_permute_dot(const ggml_vec_index_t & idx);
 void score_turbovec_block(
     const ggml_vec_index_t & idx,
@@ -739,7 +866,8 @@ void score_turbovec_block(
     float lut_bias,
     const TurboVecPermuteDot * permute_dot,
     size_t block,
-    float * out_scores);
+    float * out_scores,
+    const uint8_t * split = nullptr);
 
 // Staged search (ggml-vector-index-turbovec-staged.cpp).
 inline constexpr size_t kTurboVecPlanesMinVectors = 32768;
@@ -973,7 +1101,8 @@ void repack_turbovec_sign_codes(
     int dim,
     size_t first_slot,
     std::vector<uint8_t> & sign_blocked,
-    int n_threads = 1);
+    int n_threads = 1,
+    TurboVecLayout layout = kTurboVecLayoutSeq);
 void turbovec_sign_blocked_swap_remove(ggml_vec_index & idx, size_t slot, size_t last);
 // Blocks are independent, so n_threads does not change the bytes.
 void repack_turbovec_codes(
@@ -1030,6 +1159,20 @@ void score_turbovec_lut_block_4(
     int bits,
     int dim,
     float * const out_scores[4]);
+// score_turbovec_lut_block_4 over blocks block_index and block_index + 1
+// (upstream's AVX-512 BW kernel takes them in one pass).
+void score_turbovec_lut_block_pair_4(
+    const uint8_t * const luts[4],
+    const float lut_scales[4],
+    const float lut_biases[4],
+    const uint8_t * blocked_codes,
+    const float * vector_scales,
+    size_t block_index,
+    size_t n_vectors,
+    int bits,
+    int dim,
+    float * const out_scores0[4],
+    float * const out_scores1[4]);
 void rollback_appended_slots_unlocked(
     ggml_vec_index_t * idx,
     size_t base_slot,

@@ -88,9 +88,11 @@ target_link_libraries(my_target PRIVATE ggml::vector-index)
 ```
 
 NEON kernels are selected automatically on supported ARM builds. On x86,
-AVX2 kernels are built separately when `GGML_NATIVE=ON` or `GGML_AVX2=ON` and
-are selected at runtime. Scalar and SIMD reduction order can produce small
-score differences across CPU architectures.
+the AVX2 and AVX-512 kernels (BW, VBMI, VNNI, GFNI and VPOPCNTDQ forms, each
+in its own object) are built whenever the compiler supports them and are
+selected after a runtime CPU check; a CPU without one uses that kernel's
+scalar model, which computes the same result. Scalar and SIMD reduction
+order can produce small score differences across CPU architectures.
 
 ## Storage Modes
 
@@ -123,22 +125,31 @@ calibrate before adding when possible: re-encoding stored rows is a second
 quantization. An index that is never calibrated is plain TurboQuant.
 `ggml_vec_index_prepare` is best-effort and does not report allocation status.
 
-Like upstream, 4-bit search picks its arithmetic by host. On aarch64 with the
-dot-product extension, 4-bit codes are scored with upstream's int8
-permute-dot arithmetic over upstream's vector-major block layout; elsewhere
-they are scored through the nibble lookup tables, as 2- and 3-bit codes are
-by default. The two round differently, so 4-bit scores, and occasionally
-which ids sit at the edge of a top-k, depend on the host exactly as
-upstream's do. Upstream also uses permute-dot on x86 with AVX-512 VBMI and
-VNNI; this port keeps the lookup tables there for now.
+Like upstream, search picks its arithmetic by host. On aarch64 with the
+dot-product extension, and on x86 with AVX-512 F, BW, VBMI and VNNI, 4-bit
+codes are scored with upstream's int8 permute-dot arithmetic over upstream's
+vector-major block layout; the two architectures sum the same integers, so
+their scores agree. On such an x86 host 2- and 3-bit codes take the
+vector-major layout too and are scored as upstream's `vpermb` scan scores
+them: an exact sum of the lookup-table entries, then one multiply and one
+add. Everywhere else codes are scored through the nibble lookup tables,
+whose partial sums are folded in every 256 byte groups. These round
+differently, so scores, and occasionally which ids sit at the edge of a
+top-k, depend on the host exactly as upstream's do.
+`TURBOVEC_NO_VECTOR_MAJOR` (or the older `TURBOVEC_NO_VNNI`) set to anything
+but `0`, read once per process, keeps the lookup tables for new indexes, and
+`TURBOVEC_NO_GFNI` keeps the x86 permute-dot kernel off its GFNI form (the
+same sums), as upstream's do.
 
 On aarch64 with the int8 matrix-multiply extension (i8mm) as well, a 4-bit
 index whose dimension is a multiple of 16 takes upstream's wider `vm8`
 block layout, and the queries of a multi-query search are scored in fused
 batches of 12, 8 or 4 with SMMLA kernels, as upstream does (other dimensions
 batch with SMMLA over the vector-major layout). Permute-dot sums are exact
-integers, so every kernel returns the same scores. The block layout is chosen when an index is created
-and never reaches a file: snapshots are written from sequential rows.
+integers, so every kernel returns the same scores. The block layout is
+chosen when an index is created and never reaches a file: snapshots are
+written from sequential rows. `TURBOVEC_NO_I8MM` set to anything keeps the
+SDOT kernels and the vector-major layout, as upstream's does.
 
 `TURBOVEC_2BIT_VM8=1` in the environment, read once per process, opts in to
 upstream's experimental 2-bit `vm8` path, with upstream's semantics: on an
@@ -152,7 +163,8 @@ unchanged.
 
 Large 2- and 4-bit indexes search in stages, as upstream does. From 32,768
 vectors, at dimensions that are multiples of 32, on aarch64 (4 bits also needs
-the dot-product extension; neither runs under `TURBOVEC_2BIT_VM8=1`), a search scans the sign planes alone for a
+the dot-product extension; neither runs under `TURBOVEC_2BIT_VM8=1`) and on
+x86 hosts with the vector-major layout, a search scans the sign planes alone for a
 shortlist (`max(384, 16k)` at 2 bits; `max(256, 20k)`, or `16k` from `k = 64`,
 at 4 bits), ranks the shortlist with estimates that add the lower planes,
 and rescores the best few with the full scan's own arithmetic. Returned
@@ -163,10 +175,16 @@ upstream's measurements). The results match upstream's single-threaded
 staged search bit for bit, ties included, down to the batch query whose
 sampled seed comes up short and is rescanned with single-query tables.
 Upstream's thread-pool variant refines inside its scan and can return
-different ids. A staged search runs on the calling thread. An index stays staged if it later shrinks below the
-threshold. `ggml_vec_index_turbovec_set_staged(idx, 0)` makes an index scan in
-full instead. Upstream also searches in stages on x86 with AVX-512 VBMI and
-VNNI; this port scans in full there for now.
+different ids; here a lone query over 32,768 or more vectors splits its scan
+across the index's threads without changing any result. An index stays
+staged if it later shrinks below the threshold.
+`ggml_vec_index_turbovec_set_staged(idx, 0)` makes an index scan in full
+instead. On x86, as upstream does, the sign planes are scanned with the
+`vpermb` arithmetic, the shortlist is ranked by counting bit masks against the
+query rather than through lookup tables, and a 4-bit shortlist is rescored
+straight from the bit planes. No fixture from upstream x86 covers those
+results; they are checked against reference implementations of upstream's
+arithmetic.
 
 A TurboVec 1.x index holds its codes once, in the 32-vector blocked layout that
 search scores, so it uses about half the code memory of upstream turbovec,
