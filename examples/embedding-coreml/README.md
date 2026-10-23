@@ -1,17 +1,45 @@
-# Core ML text embedding adapter
+# Core ML EmbeddingGemma 2 support
 
-Optional C API for EmbeddingGemma 2 text models exported below or published by FluidInference. Intended for Fabric integration after its llama.cpp rebase. It is a separate full-model execution path, not a ggml backend or a change to `llama_decode` or the server. Requires macOS 15 / iOS 18 and Apple silicon for ANE acceleration.
+Optional Core ML acceleration for the existing EmbeddingGemma 2 embedding API, CLI, and server. The runtime is built into `llama`; the exporter, benchmark, and compute-plan tools live in this directory. Requires macOS 15 / iOS 18 and Apple silicon for ANE acceleration.
 
 The package already contains the fixed-shape graph and overflow-safe FP16 RMSNorm. The adapter reuses model objects and input buffers, memory maps the original BF16 token table, chooses the smallest fixed function that fits, and packs adjacent short texts into 256 tokens, using the package's eight or sixteen output slots. Attention blocks and positions are independent for each packed text. A single-text bin uses its smaller fixed function. Output order matches input order. Calls on one context are serialized. Set `llama_coreml_embedding_set_max_inflight(ctx, 8)` to pipeline predictions asynchronously on shared models within an encode call; the default is one synchronous prediction at a time. Each pending request owns reusable input buffers. Encode waits for all callbacks before returning, including on error. Separate contexts remain available for independent callers. Core ML selects CPU/ANE placement; selecting CPU + ANE does not prove that every operation runs on ANE.
 
-## Build on Mac Studio
+## Build on Apple silicon
 
 ```sh
 cmake -S . -B build-ane -DCMAKE_BUILD_TYPE=Release -DLLAMA_COREML_EMBEDDING=ON
-cmake --build build-ane --target llama-coreml-embedding-bench -j 12
+cmake --build build-ane --target llama llama-embedding llama-server llama-coreml-embedding-bench -j 8
 ```
 
-The option is off by default. `llama-embedding-coreml` is a static target that also builds when `LLAMA_BUILD_EXAMPLES=OFF` and `LLAMA_BUILD_COMMON=OFF`. Link it into Fabric and include `embedding-coreml.h`; no changes to llama's public ABI are needed.
+The option is off by default. Core ML support remains in the installed `llama` library when examples, common utilities, and tools are disabled. Use `llama.h` for the existing API integration or the installed `llama-coreml.h` for the lower-level adapter. Feature-off builds retain the configuration API and report Core ML unavailable.
+
+## Existing embedding API, CLI, and server
+
+Load a matching GGUF normally, create an embedding context with mean pooling, then configure the sidecar before calling `llama_encode()` or `llama_decode()`:
+
+```cpp
+if (!llama_set_coreml_model(ctx, "../embeddinggemma-2-coreml", 8)) {
+    // The existing ggml path remains available.
+}
+llama_encode(ctx, batch);
+const float * embedding = llama_get_embeddings_seq(ctx, seq_id);
+```
+
+The sidecar must come from the same checkpoint as the GGUF. Returned vectors are raw, mean-pooled embeddings, preserving the existing API's normalization contract. Callers can apply their usual normalization or Matryoshka truncation. Pass a null directory to disable the sidecar; a failed configuration leaves the previous configuration unchanged. `llama_supports_coreml()` reports build-time availability. Context calls retain the usual caller-side synchronization requirements.
+
+The CLI and server accept `--coreml-model DIR` (or `LLAMA_ARG_COREML_MODEL`). They retain their existing output formats, tokenization, and `--embd-normalize` behavior:
+
+```sh
+build-ane/bin/llama-embedding -m ../embeddinggemma-2-BF16.gguf \
+    --coreml-model ../embeddinggemma-2-coreml --pooling mean \
+    -p 'title: none | text: Example document' --embd-normalize 2
+build-ane/bin/llama-server -m ../embeddinggemma-2-BF16.gguf \
+    --embedding --pooling mean --coreml-model ../embeddinggemma-2-coreml
+```
+
+Compatible batches contain independent token sequences starting at position zero, at most 512 tokens each, with mean pooling. Longer sequences, shared token rows, supplied embeddings, position offsets, other pooling modes, adapters, callbacks, and feature extraction use ggml. A prediction failure disables that context's sidecar and retries the batch with ggml. Keep the GGUF weights available for fallback; this optimization does not eliminate their memory use.
+
+This integration requires an `embedding_raw` output. Re-export older normalized-only packages with the exporter below. The pinned FluidInference package remains usable through the lower-level normalized adapter; the existing embedding API rejects it and the CLI/server continue with ggml.
 
 ## Model assets
 
@@ -26,7 +54,7 @@ The token table must have exactly 262144 rows of 512 little-endian BF16 values. 
 
 ## Export from a local checkpoint
 
-`export_coreml.py` converts the text encoder from the original Hugging Face safetensors checkpoint. It writes `EmbeddingGemma2Text.mlpackage`, the unscaled original `embeddings.bf16`, `tokenizer.json`, `source-config.json`, and an `export.json` manifest with source hashes, tool versions, and function shapes. Audio and vision weights are not loaded. The destination must not exist; conversion failures remove temporary output.
+`export_coreml.py` converts the text encoder from the original Hugging Face safetensors checkpoint. Each function provides `embedding` (L2-normalized FP16) and `embedding_raw` (unnormalized FP32 mean pooling). It writes `EmbeddingGemma2Text.mlpackage`, the unscaled original `embeddings.bf16`, `tokenizer.json`, `source-config.json`, and an `export.json` manifest with source hashes, tool versions, and function shapes. Audio and vision weights are not loaded. The destination must not exist; conversion failures remove temporary output.
 
 Use a separate Python 3.11 environment on an Apple silicon Mac. The requirements pin Core ML Tools 9, its supported PyTorch 2.7 release, and a Transformers revision with EmbeddingGemma 2 support. Do not combine these requirements with the repository's GGUF conversion environment.
 
@@ -48,7 +76,7 @@ The exporter also accepts a compatible local fine-tuned checkpoint with the same
 
 Export traces the text encoder on CPU and converts the graphs; it does not execute Core ML predictions or prove Neural Engine placement. Allow substantial memory, time, and temporary disk space for seven intermediate packages. Core ML Tools merges them with shared weights into the final package. This is an independent export, not a byte-identical reproduction of FluidInference's package. The historical benchmarks below apply to the downloaded package, not to freshly exported graphs.
 
-Validate a new export on the target Mac before using it: build the benchmark above, convert the same source checkpoint to a BF16 GGUF in the normal GGUF conversion environment, then compare the two paths. Include short texts, lengths crossing every bucket, and enough short texts to fill all packing slots. The benchmark checks cosine agreement and normalization. Run the compute-plan tool to inspect anticipated device placement; ANE placement is not guaranteed by export alone.
+Validate a new export on the target Mac before using it: build the benchmark above, convert the same source checkpoint to a BF16 GGUF in the normal GGUF conversion environment, then compare the two paths. Include short texts, lengths crossing every bucket, and enough short texts to fill all packing slots. The benchmark checks cosine agreement and normalization. For raw-output exports, it also verifies the existing encode/decode API, raw vector magnitudes, sequence ID mapping, disabling the sidecar, and ggml fallback. Run the compute-plan tool to inspect anticipated device placement; ANE placement is not guaranteed by export alone.
 
 ```sh
 # Use the existing GGUF conversion environment, not .venv-coreml.
@@ -63,13 +91,15 @@ build-ane/bin/llama-coreml-embedding-bench \
 python3 -m unittest discover -s examples/embedding-coreml -p 'test_export_coreml.py'
 ```
 
+BF16 GGUF provides a reference close to the original checkpoint. Also validate the official Q8_0 GGUF with the same corpus and batching arguments when deploying that quantization. Core ML uses the original checkpoint through its FP16 sidecar, independently of GGUF quantization; the raw output is exposed as FP32. The selected GGUF controls ggml execution and fallback.
+
 The adapter compiles `.mlpackage` to `.mlmodelc` on first load. `expand_pack16.py` is only for the pinned downloaded FluidInference graph and rejects independently exported graphs; use `--pack-slots 16` for a local export. `palettize_pack.py` can produce a separate compressed variant, which requires its own accuracy validation.
 
-## Tokenization and integration
+## Lower-level adapter and tokenization
 
 Reuse llama.cpp's GGUF vocabulary with `llama_model_params.vocab_only = true`. Apply the task prefix before tokenization, for example `title: none | text: ` for documents or `task: search result | query: ` for queries. Tokenize with `add_special=false` and `parse_special=false`, then explicitly prepend BOS (2) and append EOS (1). Do not rely on the GGUF's generation defaults to insert EOS.
 
-Pass an array of `llama_coreml_embedding_sequence` to `llama_coreml_embedding_encode` with packing enabled. Each sequence includes its BOS/EOS and must contain 1..512 tokens. The adapter rejects overlength inputs; the caller owns any truncation policy and must preserve EOS. It produces 768 floats per text, already mean-pooled and L2-normalized by the model. For Matryoshka output, keep the first 512/256/128 components and renormalize. Errors return through a caller-owned buffer; no C++ exceptions cross the C API. A failure may leave partial output, which the caller must discard.
+Pass an array of `llama_coreml_embedding_sequence` to `llama_coreml_embedding_encode` with packing enabled. Each sequence includes its BOS/EOS and must contain 1..512 tokens. The adapter rejects overlength inputs; the caller owns any truncation policy and must preserve EOS. The default `llama_coreml_embedding_load` produces 768 floats per text, already mean-pooled and L2-normalized by the model. `llama_coreml_embedding_load_raw` instead selects unnormalized mean-pooled output from a compatible local export. For Matryoshka output, keep the first 512/256/128 components and renormalize. Errors return through a caller-owned buffer; no C++ exceptions cross the C API. A failure may leave partial output, which the caller must discard.
 
 ## Accuracy and throughput
 
@@ -82,7 +112,7 @@ build-ane/bin/llama-coreml-embedding-bench \
 # Repeat with cpu as the last argument for the CPU comparison.
 ```
 
-The optional arguments after the execution path are Core ML workers (1..8, default 1), reference parallel sequences (1..64, default 8), reference token batch capacity (32..2048, default 512), and Core ML calls in flight (1..8, default 1). Values above one worker add a concurrent Core ML throughput measurement. Each context owns its input buffers; the model package and mapped token table remain the same. The benchmark exits with an error when any cosine similarity is below 0.998 or outputs are non-finite or not L2 normalized. `benchmark-texts.txt` supplies a small multilingual/code smoke corpus. Include lengths crossing 32/48/64/128/256/512 token boundaries when validating a deployment. This is a smoke/accuracy check, not an embedding quality evaluation. Measure your real corpus and target hardware before claiming an application speedup.
+The optional arguments after the execution path are Core ML workers (1..8, default 1), reference parallel sequences (1..64, default 8), reference token batch capacity (32..2048, default 512), and Core ML calls in flight (1..8, default 1). Values above one worker add a concurrent Core ML throughput measurement. Each context owns its input buffers; the model package and mapped token table remain the same. The benchmark exits with an error when any cosine similarity is below 0.998 or normalized outputs are non-finite or not L2 normalized. With a raw-output package it additionally checks raw relative L2 error below 3% and reports `coreml_integrated` throughput through the normal API. A normalized-only package reports `integrated_api=unavailable` and tests only the lower-level adapter. `benchmark-texts.txt` supplies a small multilingual/code smoke corpus. Include lengths crossing 32/48/64/128/256/512 token boundaries when validating a deployment. This is a smoke/accuracy check, not an embedding quality evaluation. Measure your real corpus and target hardware before claiming an application speedup.
 
 Build `llama-coreml-embedding-plan` and run it with the compiled `.mlmodelc` directory to report Core ML's preferred device for every non-constant operation of each function. Constants are excluded because they do not execute and have no device usage entry. A compute plan describes anticipated placement; actual execution can be inspected with Core ML profiling in Instruments.
 

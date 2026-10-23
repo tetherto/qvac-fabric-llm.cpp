@@ -2,7 +2,7 @@
 #import <Foundation/Foundation.h>
 #import <dispatch/dispatch.h>
 
-#include "embedding-coreml.h"
+#include "llama-coreml.h"
 #include "ggml.h"
 
 #include <algorithm>
@@ -50,6 +50,7 @@ struct coreml_function {
     int length = 0;
     int slots = 1;
     bool packed = false;
+    bool raw = false;
 
     MLMultiArray * array(NSArray<NSNumber *> * shape, std::vector<ggml_fp16_t> & data) {
         NSMutableArray<NSNumber *> * strides = [NSMutableArray arrayWithCapacity:shape.count];
@@ -66,10 +67,11 @@ struct coreml_function {
         return result;
     }
 
-    void load(NSURL * url, int size, bool packing, MLModel * shared_model = nil) {
+    void load(NSURL * url, int size, bool packing, MLModel * shared_model = nil, bool raw_output = false) {
         input = nil;
         length = size;
         packed = packing;
+        raw = raw_output;
         MLModelConfiguration * config = [[MLModelConfiguration alloc] init];
         config.computeUnits = MLComputeUnitsCPUAndNeuralEngine;
         if (@available(macOS 15.0, iOS 18.0, *)) {
@@ -84,6 +86,12 @@ struct coreml_function {
                     "unexpected packed pooling shape");
             slots = constraint.shape[0].intValue;
             check(slots == 8 || slots == 16, "packed model must have 8 or 16 slots");
+        }
+        if (raw) {
+            auto constraint = model.modelDescription.outputDescriptionsByName[@"embedding_raw"].multiArrayConstraint;
+            check(constraint && [constraint.shape isEqualToArray:@[@(slots), @(dimension)]],
+                    "sidecar must provide embedding_raw outputs; re-export the model");
+            check(constraint.dataType == MLMultiArrayDataTypeFloat32, "embedding_raw must use float32 output");
         }
         embeds.resize(length * hidden);
         mask.resize(packed ? length * length : length);
@@ -161,7 +169,7 @@ struct coreml_function {
     }
 
     void extract(id<MLFeatureProvider> result, int count, float * output) {
-        MLMultiArray * embedding = [result featureValueForName:@"embedding"].multiArrayValue;
+        MLMultiArray * embedding = [result featureValueForName:raw ? @"embedding_raw" : @"embedding"].multiArrayValue;
         check(embedding && ([embedding.shape isEqualToArray:@[@(slots), @(dimension)]] ||
                 (packed && [embedding.shape isEqualToArray:@[@1, @(slots), @(dimension)]])),
                 "unexpected Core ML output shape");
@@ -234,11 +242,12 @@ struct llama_coreml_embedding {
     coreml_function packed;
     std::mutex mutex;
     int max_inflight = 1;
+    bool raw = false;
     std::array<coreml_async_slot, 8> async_slots;
     llama_coreml_embedding_stats stats = {};
 };
 
-llama_coreml_embedding * llama_coreml_embedding_load(const char * directory, char * error, size_t error_size) {
+static llama_coreml_embedding * load_embedding(const char * directory, char * error, size_t error_size, bool raw) {
     set_error(error, error_size, "");
     @autoreleasepool {
         try {
@@ -249,6 +258,7 @@ llama_coreml_embedding * llama_coreml_embedding_load(const char * directory, cha
             NSString * path = [NSString stringWithUTF8String:directory];
             check(path != nil, "invalid UTF-8 directory");
             auto ctx = std::make_unique<llama_coreml_embedding>();
+            ctx->raw = raw;
             NSError * failure = nil;
             ctx->table = [NSData dataWithContentsOfFile:[path stringByAppendingPathComponent:@"embeddings.bf16"]
                     options:NSDataReadingMappedAlways error:&failure];
@@ -263,12 +273,21 @@ llama_coreml_embedding * llama_coreml_embedding_load(const char * directory, cha
                 }
             }
             ctx->url = compiled;
+            if (raw) { ctx->single[0].load(ctx->url, lengths[0], false, nil, true); }
             return ctx.release();
         } catch (const std::exception & failure) {
             set_error(error, error_size, failure.what());
             return nullptr;
         }
     }
+}
+
+llama_coreml_embedding * llama_coreml_embedding_load(const char * directory, char * error, size_t error_size) {
+    return load_embedding(directory, error, error_size, false);
+}
+
+llama_coreml_embedding * llama_coreml_embedding_load_raw(const char * directory, char * error, size_t error_size) {
+    return load_embedding(directory, error, error_size, true);
 }
 
 void llama_coreml_embedding_free(llama_coreml_embedding * ctx) {
@@ -322,7 +341,7 @@ int32_t llama_coreml_embedding_encode(llama_coreml_embedding * ctx,
                 int count = 1;
                 int used = sequences[i].n_tokens;
                 if (pack && i + 1 < n_sequences && used + sequences[i + 1].n_tokens <= 256) {
-                    if (!ctx->packed.input) { ctx->packed.load(ctx->url, 256, true); }
+                    if (!ctx->packed.input) { ctx->packed.load(ctx->url, 256, true, nil, ctx->raw); }
                     while (i + count < n_sequences && count < ctx->packed.slots && used + sequences[i + count].n_tokens <= 256) {
                         used += sequences[i + count++].n_tokens;
                     }
@@ -331,13 +350,13 @@ int32_t llama_coreml_embedding_encode(llama_coreml_embedding * ctx,
                 int function_index = 6;
                 if (count > 1) {
                     function = &ctx->packed;
-                    if (!function->input) { function->load(ctx->url, 256, true); }
+                    if (!function->input) { function->load(ctx->url, 256, true, nil, ctx->raw); }
                 } else {
                     int bucket = 0;
                     while (lengths[bucket] < used) { ++bucket; }
                     function_index = bucket;
                     function = &ctx->single[bucket];
-                    if (!function->input) { function->load(ctx->url, lengths[bucket], false); }
+                    if (!function->input) { function->load(ctx->url, lengths[bucket], false, nil, ctx->raw); }
                 }
                 if (ctx->max_inflight == 1) {
                     function->run(table, sequences + i, count, output + size_t(i) * dimension, ctx->stats);
@@ -346,7 +365,7 @@ int32_t llama_coreml_embedding_encode(llama_coreml_embedding * ctx,
                     slot->wait();
                     check(slot->failure.empty(), slot->failure.c_str());
                     coreml_function * buffer = &slot->functions[function_index];
-                    if (!buffer->input) { buffer->load(ctx->url, function->length, function->packed, function->model); }
+                    if (!buffer->input) { buffer->load(ctx->url, function->length, function->packed, function->model, ctx->raw); }
                     const auto preparation_begin = std::chrono::steady_clock::now();
                     buffer->prepare(table, sequences + i, count);
                     const auto prediction_begin = std::chrono::steady_clock::now();

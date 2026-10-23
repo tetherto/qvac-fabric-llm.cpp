@@ -95,7 +95,7 @@ def sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def validate_functions(description, contracts: dict, slots: int, dtype: int) -> None:
+def validate_functions(description, contracts: dict, slots: int, dtype: int, raw_dtype: int) -> None:
     functions = {function.name: function for function in description.functions}
     if set(functions) != set(contracts):
         raise ValueError("Exported functions do not match the adapter contract")
@@ -107,11 +107,13 @@ def validate_functions(description, contracts: dict, slots: int, dtype: int) -> 
             array = feature.type.multiArrayType
             if tuple(array.shape) != inputs[feature.name] or array.dataType != dtype:
                 raise ValueError(f"Unexpected exported shape or type for {name}.{feature.name}")
-        if len(function.output) != 1 or function.output[0].name != "embedding":
+        if len(function.output) != 2 or {feature.name for feature in function.output} != {"embedding", "embedding_raw"}:
             raise ValueError(f"Unexpected exported outputs for {name}")
-        array = function.output[0].type.multiArrayType
-        if tuple(array.shape) != (slots if name == "pack_256" else 1, 768) or array.dataType != dtype:
-            raise ValueError(f"Unexpected exported embedding shape or type for {name}")
+        for feature in function.output:
+            array = feature.type.multiArrayType
+            expected_dtype = raw_dtype if feature.name == "embedding_raw" else dtype
+            if tuple(array.shape) != (slots if name == "pack_256" else 1, 768) or array.dataType != expected_dtype:
+                raise ValueError(f"Unexpected exported embedding shape or type for {name}.{feature.name}")
 
 
 def load_encoder(source: Path, destination: Path, text: dict):
@@ -228,7 +230,7 @@ def export_wrapper(model, packed: bool):
                                position_embeddings=rotations[self.layer_types[i]])
             hidden = self.projection(self.norm(hidden)).squeeze(0)
             pooled = torch.matmul(pool, hidden)
-            return l2_normalize(pooled)
+            return l2_normalize(pooled), pooled
 
     return Encoder().eval()
 
@@ -272,7 +274,7 @@ def export(source: Path, destination: Path, slots: int) -> None:
                     traced, convert_to="mlprogram", minimum_deployment_target=ct.target.iOS18,
                     compute_precision=ct.precision.FLOAT16, skip_model_load=True,
                     inputs=[ct.TensorType(name=key, shape=shape, dtype=np.float16) for key, shape in shapes.items()],
-                    outputs=[ct.TensorType(name="embedding", dtype=np.float16)],
+                    outputs=[ct.TensorType(name="embedding", dtype=np.float16), ct.TensorType(name="embedding_raw", dtype=np.float32)],
                 )
                 path = work / (name + ".mlpackage")
                 converted.save(str(path))
@@ -280,7 +282,8 @@ def export(source: Path, destination: Path, slots: int) -> None:
         functions.default_function_name = "embed_32"
         package = assets / "EmbeddingGemma2Text.mlpackage"
         ct.utils.save_multifunction(functions, str(package))
-        validate_functions(ct.utils.load_spec(str(package)).description, contracts, slots, getattr(ArrayFeatureType, "FLOAT16"))
+        validate_functions(ct.utils.load_spec(str(package)).description, contracts, slots,
+                           getattr(ArrayFeatureType, "FLOAT16"), getattr(ArrayFeatureType, "FLOAT32"))
         shutil.copy2(source / "tokenizer.json", assets / "tokenizer.json")
         shutil.copy2(source / "config.json", assets / "source-config.json")
         manifest = {
@@ -290,6 +293,7 @@ def export(source: Path, destination: Path, slots: int) -> None:
             "token_table_sha256": sha256(assets / "embeddings.bf16"),
             "model_sha256": sha256(package / "Data/com.apple.CoreML/model.mlmodel"),
             "pack_slots": slots, "functions": contracts,
+            "outputs": {"embedding": "float16_l2_normalized", "embedding_raw": "float32_mean_pooled"},
             "torch": torch.__version__, "transformers": transformers.__version__, "coremltools": ct.__version__,
         }
         (assets / "export.json").write_text(json.dumps(manifest, indent=2) + "\n")
