@@ -1,10 +1,12 @@
-#include "embedding-coreml.h"
+#include "llama-coreml.h"
 #include "llama.h"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <fstream>
 #include <limits>
 #include <memory>
@@ -12,6 +14,13 @@
 #include <string>
 #include <thread>
 #include <vector>
+
+static std::atomic<uint64_t> coreml_batches{0};
+
+static void capture_log(ggml_log_level, const char * text, void *) {
+    if (strstr(text, "Core ML encoded")) { ++coreml_batches; }
+    fputs(text, stderr);
+}
 
 static void require(bool value, const char * message) {
     if (!value) { throw std::runtime_error(message); }
@@ -46,6 +55,7 @@ int main(int argc, char ** argv) {
         fprintf(stderr, "usage: %s model.gguf coreml-directory prefixed-texts.txt [repetitions=5] [cpu|metal=metal] [workers=1] [parallel=8] [batch=512] [max-inflight=1]\n", argv[0]);
         return 1;
     }
+    llama_log_set(capture_log, nullptr);
     llama_backend_init();
     int status = 1;
     try {
@@ -139,7 +149,7 @@ int main(int argc, char ** argv) {
         cp.kv_unified = true;
         auto ctx = std::unique_ptr<llama_context, decltype(&llama_free)>(llama_init_from_model(model.get(), cp), llama_free);
         require(ctx != nullptr, "reference context failed");
-        auto baseline = [&]() {
+        auto run_api = [&](llama_context * target, bool decode = false, int32_t position_offset = 0, bool rotate_ids = false) {
             llama_batch batch = llama_batch_init(batch_size, 0, 1);
             for (size_t start = 0; start < tokens.size();) {
                 batch.n_tokens = 0;
@@ -148,19 +158,20 @@ int main(int argc, char ** argv) {
                     for (size_t pos = 0; pos < tokens[end].size(); ++pos) {
                         int i = batch.n_tokens++;
                         batch.token[i] = tokens[end][pos];
-                        batch.pos[i] = int32_t(pos);
+                        batch.pos[i] = int32_t(pos) + position_offset;
                         batch.n_seq_id[i] = 1;
-                        batch.seq_id[i][0] = int32_t(end - start);
+                        batch.seq_id[i][0] = (int32_t(end - start) + (rotate_ids ? parallel / 2 : 0)) % parallel;
                         batch.logits[i] = true;
                     }
                     ++end;
                 }
-                if (llama_encode(ctx.get(), batch) != 0) {
+                if ((decode ? llama_decode(target, batch) : llama_encode(target, batch)) != 0) {
                     llama_batch_free(batch);
                     throw std::runtime_error("reference inference failed");
                 }
                 for (size_t i = start; i < end; ++i) {
-                    const float * out = llama_get_embeddings_seq(ctx.get(), int32_t(i - start));
+                    const int32_t id = (int32_t(i - start) + (rotate_ids ? parallel / 2 : 0)) % parallel;
+                    const float * out = llama_get_embeddings_seq(target, id);
                     if (!out) {
                         llama_batch_free(batch);
                         throw std::runtime_error("reference embedding missing");
@@ -171,7 +182,9 @@ int main(int argc, char ** argv) {
             }
             llama_batch_free(batch);
         };
+        auto baseline = [&]() { run_api(ctx.get()); };
         baseline();
+        const auto ggml_reference = reference;
         double minimum_reference = 1, mean_reference = 0, minimum_packed_reference = 1;
         for (size_t i = 0; i < tokens.size(); ++i) {
             double value = cosine(reference.data() + i * 768, single.data() + i * 768);
@@ -201,6 +214,101 @@ int main(int argc, char ** argv) {
         measure("coreml_single", [&]() { encode(false, single); });
         measure("coreml_packed", [&]() { encode(true, packed); });
         measure(backend.c_str(), baseline);
+        if (llama_set_coreml_model(ctx.get(), argv[2], max_inflight)) {
+            auto check_raw = [&](const std::vector<float> & expected) {
+                double maximum_relative_error = 0;
+                for (size_t row = 0; row < tokens.size(); ++row) {
+                    double squared_error = 0, squared_reference = 0;
+                    for (size_t col = 0; col < 768; ++col) {
+                        const size_t index = row * 768 + col;
+                        const double delta = reference[index] - expected[index];
+                        squared_error += delta * delta;
+                        squared_reference += double(expected[index]) * expected[index];
+                    }
+                    require(cosine(reference.data() + row * 768, expected.data() + row * 768) >= 0.998,
+                            "integrated embedding direction differs from ggml");
+                    maximum_relative_error = std::max(maximum_relative_error, sqrt(squared_error / squared_reference));
+                }
+                require(maximum_relative_error < 0.03, "integrated embeddings lost their raw magnitude");
+                return maximum_relative_error;
+            };
+            uint64_t before = coreml_batches.load();
+            baseline();
+            require(coreml_batches.load() > before, "llama_encode did not use Core ML");
+            const double raw_error = check_raw(ggml_reference);
+            before = coreml_batches.load();
+            run_api(ctx.get(), true, 0, true);
+            require(coreml_batches.load() > before, "llama_decode did not use Core ML");
+            check_raw(ggml_reference);
+            measure("coreml_integrated", baseline);
+            check_raw(ggml_reference);
+            before = coreml_batches.load();
+            run_api(ctx.get(), false, 7);
+            require(coreml_batches.load() == before, "position-offset batch did not fall back to ggml");
+            const auto shifted = reference;
+            require(llama_set_coreml_model(ctx.get(), nullptr, 1), "could not disable Core ML");
+            run_api(ctx.get(), false, 7);
+            check_raw(shifted);
+            baseline();
+            require(coreml_batches.load() == before, "disabled sidecar still executed");
+            check_raw(ggml_reference);
+
+            llama_context_params fallback_params = cp;
+            fallback_params.n_ctx = fallback_params.n_batch = fallback_params.n_ubatch = 1024;
+            fallback_params.n_seq_max = 2;
+            auto fallback = std::unique_ptr<llama_context, decltype(&llama_free)>(
+                    llama_init_from_model(model.get(), fallback_params), llama_free);
+            require(fallback != nullptr, "fallback context failed");
+            auto check_fallback = [&](llama_batch & batch, int n_sequences) {
+                require(llama_set_coreml_model(fallback.get(), nullptr, 1), "could not disable fallback context sidecar");
+                require(llama_encode(fallback.get(), batch) == 0, "ggml fallback reference failed");
+                std::vector<float> expected;
+                for (int id = 0; id < n_sequences; ++id) {
+                    const float * out = llama_get_embeddings_seq(fallback.get(), id);
+                    require(out != nullptr, "fallback reference missing");
+                    expected.insert(expected.end(), out, out + 768);
+                }
+                require(llama_set_coreml_model(fallback.get(), argv[2], max_inflight), "fallback context sidecar failed");
+                const uint64_t calls = coreml_batches.load();
+                require(llama_decode(fallback.get(), batch) == 0, "unsupported batch fallback failed");
+                require(coreml_batches.load() == calls, "unsupported batch used Core ML");
+                for (int id = 0; id < n_sequences; ++id) {
+                    const float * out = llama_get_embeddings_seq(fallback.get(), id);
+                    require(out && cosine(out, expected.data() + id * 768) > 0.99999, "fallback output mismatch");
+                }
+            };
+            llama_batch long_batch = llama_batch_init(513, 0, 2);
+            long_batch.n_tokens = 513;
+            for (int i = 0; i < 513; ++i) {
+                long_batch.token[i] = tokens[0][i % tokens[0].size()];
+                long_batch.pos[i] = i;
+                long_batch.n_seq_id[i] = 1;
+                long_batch.seq_id[i][0] = 0;
+                long_batch.logits[i] = true;
+            }
+            check_fallback(long_batch, 1);
+            long_batch.n_tokens = 16;
+            for (int i = 0; i < 16; ++i) {
+                long_batch.n_seq_id[i] = 2;
+                long_batch.seq_id[i][1] = 1;
+            }
+            check_fallback(long_batch, 2);
+            llama_batch_free(long_batch);
+            llama_batch media = llama_batch_init(2, 512, 1);
+            media.n_tokens = 2;
+            for (int i = 0; i < 2; ++i) {
+                for (int col = 0; col < 512; ++col) { media.embd[i * 512 + col] = float(col % 7 - 3) * 0.1f; }
+                media.pos[i] = i;
+                media.n_seq_id[i] = 1;
+                media.seq_id[i][0] = 0;
+                media.logits[i] = true;
+            }
+            check_fallback(media, 1);
+            llama_batch_free(media);
+            printf("integrated_api=passed raw_relative_error_max=%.8f encode_decode=passed sequence_ids=passed fallback=passed\n", raw_error);
+        } else {
+            printf("integrated_api=unavailable model_requires_embedding_raw=1\n");
+        }
         if (workers > 1) {
             using coreml_ptr = std::unique_ptr<llama_coreml_embedding, decltype(&llama_coreml_embedding_free)>;
             std::vector<coreml_ptr> contexts;

@@ -1458,6 +1458,14 @@ common_init_result_ptr common_init_from_model_and_params(llama_model* model, com
         params.ctx_shift = false;
     }
 
+    if (!params.coreml_model.empty()) {
+        if (!llama_supports_coreml()) {
+            COM_WRN("%s", "Core ML is unavailable in this build; enable -DLLAMA_COREML=ON; using ggml\n");
+        } else if (!llama_set_coreml_model(lctx, params.coreml_model.c_str(), 8)) {
+            COM_WRN("%s", "Core ML embedding sidecar could not be configured; using ggml\n");
+        }
+    }
+
     if (!params.control_vectors.empty()) {
         if (params.control_vector_layer_start <= 0) params.control_vector_layer_start = 1;
         if (params.control_vector_layer_end   <= 0) params.control_vector_layer_end   = llama_model_n_layer(model);

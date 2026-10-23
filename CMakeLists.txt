@@ -2,10 +2,10 @@ cmake_minimum_required(VERSION 3.14...3.28) # for add_link_options and implicit 
 project("llama.cpp" C CXX)
 include(CheckIncludeFileCXX)
 
-option(LLAMA_COREML_EMBEDDING "llama: build optional Core ML embedding adapter" OFF)
-if (LLAMA_COREML_EMBEDDING)
+option(LLAMA_COREML "llama: build optional Core ML support" OFF)
+if (LLAMA_COREML)
     if (NOT APPLE)
-        message(FATAL_ERROR "Core ML embedding requires macOS 15 or iOS 18")
+        message(FATAL_ERROR "LLAMA_COREML requires macOS 15 or iOS 18")
     endif()
     enable_language(OBJC OBJCXX)
 endif()
@@ -249,7 +249,7 @@ if (NOT BUILD_LLAMA)
 else()
 add_subdirectory(src)
 
-if (LLAMA_COREML_EMBEDDING)
+if (LLAMA_COREML)
     add_subdirectory(examples/embedding-coreml)
 endif()
 
@@ -339,6 +339,10 @@ set(LLAMA_BIN_INSTALL_DIR     ${CMAKE_INSTALL_BINDIR}     CACHE PATH "Location o
 set(LLAMA_PUBLIC_HEADERS
     ${CMAKE_CURRENT_SOURCE_DIR}/include/llama.h
     ${CMAKE_CURRENT_SOURCE_DIR}/include/llama-cpp.h)
+
+if (LLAMA_COREML)
+    list(APPEND LLAMA_PUBLIC_HEADERS ${CMAKE_CURRENT_SOURCE_DIR}/include/llama-coreml.h)
+endif()
 
 set_target_properties(llama
     PROPERTIES
@@ -444,6 +448,11 @@ if (IS_ABSOLUTE "${CMAKE_INSTALL_INCLUDEDIR}")
     set(LLAMA_PC_INCLUDEDIR "${CMAKE_INSTALL_INCLUDEDIR}")
 else()
     set(LLAMA_PC_INCLUDEDIR "\${prefix}/${CMAKE_INSTALL_INCLUDEDIR}")
+endif()
+
+set(LLAMA_PC_LIBS_PRIVATE "")
+if (LLAMA_COREML)
+    set(LLAMA_PC_LIBS_PRIVATE "-framework CoreML -framework Foundation")
 endif()
 
 configure_file(cmake/llama.pc.in

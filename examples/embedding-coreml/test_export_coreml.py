@@ -35,18 +35,23 @@ class TestExportContract(unittest.TestCase):
     def test_reject_invalid_converted_output(self):
         contracts = export_coreml.function_contracts(16)
 
-        def feature(name, shape):
-            return SimpleNamespace(name=name, type=SimpleNamespace(multiArrayType=SimpleNamespace(shape=shape, dataType=1)))
+        def feature(name, shape, dtype=1):
+            return SimpleNamespace(name=name, type=SimpleNamespace(multiArrayType=SimpleNamespace(shape=shape, dataType=dtype)))
 
         functions = [SimpleNamespace(
             name=name, input=[feature(key, shape) for key, shape in shapes.items()],
-            output=[feature("embedding", (16 if name == "pack_256" else 1, 768))],
+            output=[feature("embedding", (16 if name == "pack_256" else 1, 768)),
+                    feature("embedding_raw", (16 if name == "pack_256" else 1, 768), 2)],
         ) for name, shapes in contracts.items()]
         description = SimpleNamespace(functions=functions)
-        export_coreml.validate_functions(description, contracts, 16, 1)
+        export_coreml.validate_functions(description, contracts, 16, 1, 2)
         functions[-1].output[0].type.multiArrayType.shape = (8, 768)
         with self.assertRaisesRegex(ValueError, "embedding shape or type"):
-            export_coreml.validate_functions(description, contracts, 16, 1)
+            export_coreml.validate_functions(description, contracts, 16, 1, 2)
+        functions[-1].output[0].type.multiArrayType.shape = (16, 768)
+        functions[-1].output[1].type.multiArrayType.dataType = 1
+        with self.assertRaisesRegex(ValueError, "embedding shape or type"):
+            export_coreml.validate_functions(description, contracts, 16, 1, 2)
 
     def test_adapter_shapes(self):
         for slots in (8, 16):

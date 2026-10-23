@@ -23,13 +23,13 @@ import-not-found = "ignore"
 missing-attribute = "ignore"
 missing-union-attribute = "ignore"
 
-# These tools use the separate, pinned Core ML export environment.
+# The exporter uses its separate, pinned Core ML environment. torch declares
+# Module.forward as a Callable attribute, so ty >= 0.0.88 rejects method overrides.
 [[overrides]]
 include = [
-    "./examples/embedding-coreml/expand_pack16.py",
     "./examples/embedding-coreml/export_coreml.py",
-    "./examples/embedding-coreml/palettize_pack.py",
 ]
 
 [overrides.rules]
 import-not-found = "ignore"
+incompatible-mutable-override = "ignore"
