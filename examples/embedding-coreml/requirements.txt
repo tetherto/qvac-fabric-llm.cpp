@@ -1,5 +1,6 @@
-coremltools==9.0
-numpy==2.2.6
-safetensors==0.8.0
-torch==2.7.0
+# Keep the validated Core ML export toolchain in its separate environment.
+coremltools==9.0  # check_requirements: ignore "=="
+numpy==2.2.6  # check_requirements: ignore "=="
+safetensors==0.8.0  # check_requirements: ignore "=="
+torch==2.7.0  # check_requirements: ignore "=="
 transformers @ git+https://github.com/huggingface/transformers.git@ab7e5ac33f234b41665fee663fefd441d35ad3d4
