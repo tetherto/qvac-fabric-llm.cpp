@@ -218,6 +218,16 @@ static __host__ mmvq_parameter_table_id get_device_table_id(int cc) {
     return MMVQ_PARAMETERS_GENERIC;
 }
 
+static constexpr __host__ __device__ bool mmvq_wide_type(ggml_type type) {
+    return type == GGML_TYPE_Q8_0 || type == GGML_TYPE_NVFP4;
+}
+
+// GB10 DRAM is slow enough that the mat-vec of these types stays memory bound up to 16 columns,
+// where MMQ and the CUTLASS NVFP4 GEMM reach only ~80% of the bandwidth
+bool ggml_cuda_mmvq_wide(enum ggml_type type, int cc) {
+    return mmvq_wide_type(type) && get_device_table_id(cc) == MMVQ_PARAMETERS_GB10;
+}
+
 // Per-architecture maximum batch size for which MMVQ should be used for MUL_MAT_ID.
 // Returns a value <= MMVQ_MAX_BATCH_SIZE. Default is MMVQ_MAX_BATCH_SIZE.
 // Check https://github.com/ggml-org/llama.cpp/pull/20905#issuecomment-4145835627 for details
@@ -429,6 +439,9 @@ bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11) {
         }
     }
     if (GGML_CUDA_CC_IS_NVIDIA(cc) && cc == GGML_CUDA_CC_DGX_SPARK) {
+        if (ggml_cuda_mmvq_wide(type, cc)) {
+            return ne11 <= MMVQ_MAX_BATCH_SIZE_WIDE;
+        }
         switch (type) { // tuned on DGX Spark GB10
             case GGML_TYPE_Q2_K:
                 return ne11 <= 6;
@@ -646,6 +659,9 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
         }
     }
     if (table_id == MMVQ_PARAMETERS_GB10) {
+        if (ncols_dst > MMVQ_MAX_BATCH_SIZE) {
+            return 1;
+        }
         const int generic = calc_nwarps(type, ncols_dst, MMVQ_PARAMETERS_GENERIC);
         // Only worth the wider block when it actually retires the K loop in half the trips (Observation)
         if (ncols_dst == 1 && !small_k && halve_iters) {
@@ -684,6 +700,10 @@ static constexpr __host__ __device__ bool mmvq_two_rows_ncols1(ggml_type type) {
 }
 
 static constexpr __host__ __device__ int calc_rows_per_block(ggml_type type, int ncols_dst, int table_id, bool small_k = false, int nwarps = 1) {
+    if (table_id == MMVQ_PARAMETERS_GB10 && ncols_dst > MMVQ_MAX_BATCH_SIZE) {
+        // more rows per block reuse each activation load, the FP4 decode needs it most
+        return type == GGML_TYPE_NVFP4 ? 4 : 2;
+    }
     if (ptq1_0_pt_enabled() && type == GGML_TYPE_PTQ1_0 && ncols_dst > 1 &&
         (table_id == MMVQ_PARAMETERS_GENERIC || table_id == MMVQ_PARAMETERS_TURING)) {
         return ptq1_0_pt_rows_per_block(ncols_dst);
@@ -1364,7 +1384,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
         const int ids_stride, cudaStream_t stream) {
 
     GGML_ASSERT(ncols_x % ggml_blck_size(type) == 0);
-    GGML_ASSERT(ncols_dst <= MMVQ_MAX_BATCH_SIZE);
+    GGML_ASSERT(ncols_dst <= MMVQ_MAX_BATCH_SIZE_WIDE);
 
     // Must match the layout ggml_cuda_mul_mat_vec_q asked quantize_row_q8_1_cuda to write.
     const bool y_soa = ggml_cuda_q8_1_layout_host(type, ncols_dst, ids != nullptr) == GGML_CUDA_Q8_1_SOA_ISUM;
@@ -1561,6 +1581,27 @@ static void mul_mat_vec_q_switch_ncols_dst(
                  dims.first, dims.second, 0, ids_stride, y_soa, stream);
         } break;
         default:
+            if constexpr (mmvq_wide_type(type)) {
+                const auto launch = [&](auto ncols_tag) {
+                    constexpr int c_ncols_dst = decltype(ncols_tag)::value;
+                    std::pair<dim3, dim3> dims = calc_launch_params<type>(c_ncols_dst, nrows_x, nchannels_dst, nsamples_dst, warp_size, table_id);
+                    mul_mat_vec_q_switch_fusion<type, c_ncols_dst, false, false, cutlass_layout>(vx, vx_scales, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
+                         channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst,
+                         sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst,
+                         dims.first, dims.second, 0, ids_stride, y_soa, stream);
+                };
+                switch (ncols_dst) {
+                    case  9: launch(std::integral_constant<int,  9>{}); return;
+                    case 10: launch(std::integral_constant<int, 10>{}); return;
+                    case 11: launch(std::integral_constant<int, 11>{}); return;
+                    case 12: launch(std::integral_constant<int, 12>{}); return;
+                    case 13: launch(std::integral_constant<int, 13>{}); return;
+                    case 14: launch(std::integral_constant<int, 14>{}); return;
+                    case 15: launch(std::integral_constant<int, 15>{}); return;
+                    case 16: launch(std::integral_constant<int, 16>{}); return;
+                    default: break;
+                }
+            }
             GGML_ABORT("fatal error");
     }
 }
