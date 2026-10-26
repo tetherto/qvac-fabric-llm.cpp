@@ -17999,6 +17999,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_repacked_mul_mat(type, 256, 256, 512));
         test_cases.emplace_back(new test_repacked_mul_mat(type, 257, 1, 576));
         test_cases.emplace_back(new test_repacked_mul_mat(type, 257, 8, 576));
+        test_cases.emplace_back(new test_repacked_mul_mat(type, 257, 13, 576));
+        test_cases.emplace_back(new test_repacked_mul_mat(type, 260, 16, 576));
         test_cases.emplace_back(new test_repacked_mul_mat(type, 260, 256, 576));
         test_cases.emplace_back(new test_cutlass_mul_mat(type, 260, 256, 576));
         test_cases.emplace_back(new test_cutlass_mul_mat(type, 257, 256, 576));

@@ -2642,12 +2642,18 @@ static bool ggml_cuda_match_shared_expert(const ggml_cgraph * graph, int routed_
     return true;
 }
 
+// the most src1 rows that repacked weights of this type still multiply with MMVQ instead of CUTLASS
+static int64_t ggml_cuda_repacked_mmvq_max_batch(const ggml_type type, const int cc) {
+    return ggml_cuda_mmvq_wide(type, cc) ? MMVQ_MAX_BATCH_SIZE_WIDE : MMVQ_MAX_BATCH_SIZE;
+}
+
 static bool ggml_cuda_repacked_mmvq_supported(
-        const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst) {
+        const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst, const int cc) {
+    const int64_t max_batch = ggml_cuda_repacked_mmvq_max_batch(src0->type, cc);
     if (!ggml_cuda_cutlass_weight_supported(src0) || src1 == nullptr || dst == nullptr ||
         src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 ||
         src0->ne[2] != 1 || src0->ne[3] != 1 ||
-        src1->ne[0] != src0->ne[0] || src1->ne[1] <= 0 || src1->ne[1] > MMVQ_MAX_BATCH_SIZE ||
+        src1->ne[0] != src0->ne[0] || src1->ne[1] <= 0 || src1->ne[1] > max_batch ||
         src1->ne[2] != 1 || src1->ne[3] != 1 ||
         dst->ne[0] != src0->ne[1] || dst->ne[1] != src1->ne[1] || dst->ne[2] != 1 || dst->ne[3] != 1 ||
         !ggml_is_contiguous(src0) || !ggml_is_contiguous(src1) || !ggml_is_contiguous(dst)) {
@@ -2738,7 +2744,7 @@ static bool ggml_cuda_mul_mat(ggml_backend_cuda_context &          ctx,
     }
 
     const int cc = ggml_cuda_info().devices[ctx.device].cc;
-    if (ggml_cuda_repacked_mmvq_supported(src0, src1, dst) &&
+    if (ggml_cuda_repacked_mmvq_supported(src0, src1, dst, cc) &&
         ggml_cuda_should_use_mmvq(src0->type, cc, src1->ne[1])) {
         ggml_cuda_mul_mat_vec_q(ctx, src0, src1, nullptr, dst);
         return true;
@@ -4776,7 +4782,8 @@ static bool ggml_cuda_match_mlp_bf16(const ggml_cgraph * cgraph, int i, ggml_cud
         return false;
     }
     if (cgraph->nodes[i]->op != GGML_OP_MUL_MAT || cgraph->nodes[i]->src[1] == nullptr ||
-        ggml_nrows(cgraph->nodes[i]->src[1]) <= MMVQ_MAX_BATCH_SIZE) {
+        ggml_nrows(cgraph->nodes[i]->src[1]) <= ggml_cuda_repacked_mmvq_max_batch(cgraph->nodes[i]->src[0]->type,
+                                                                                  ggml_cuda_info().devices[ggml_cuda_get_device()].cc)) {
         return false;
     }
 
@@ -6091,7 +6098,7 @@ static ggml_cuda_cutlass_activation_plan ggml_cuda_build_cutlass_activation_plan
         }
         if (node->op != GGML_OP_MUL_MAT || (node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 || node->src[0] == nullptr ||
             node->src[1] == nullptr || (node->src[0]->type != GGML_TYPE_NVFP4 && node->src[0]->type != GGML_TYPE_F8_E4M3) ||
-            ggml_nrows(node->src[1]) <= MMVQ_MAX_BATCH_SIZE) {
+            ggml_nrows(node->src[1]) <= ggml_cuda_repacked_mmvq_max_batch(node->src[0]->type, ggml_cuda_info().devices[cuda_ctx->device].cc)) {
             continue;
         }
 
@@ -7332,7 +7339,7 @@ static bool ggml_backend_cuda_repacked_supports_op(
 
     const int cc = ggml_cuda_info().devices[dev_ctx->device].cc;
     return ggml_cuda_repacked_mul_mat_supported(op->src[0], op->src[1], op) ||
-        (ggml_cuda_repacked_mmvq_supported(op->src[0], op->src[1], op) &&
+        (ggml_cuda_repacked_mmvq_supported(op->src[0], op->src[1], op, cc) &&
          ggml_cuda_should_use_mmvq(op->src[0]->type, cc, op->src[1]->ne[1]));
 }
 
