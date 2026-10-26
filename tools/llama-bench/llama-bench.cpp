@@ -217,11 +217,14 @@ static void register_rpc_server_list(const std::string & servers) {
         thread.join();
     }
 
+    // benchmarking without a requested server would silently measure the wrong setup
     for (size_t i = 0; i < rpc_servers.size(); i++) {
         if (!prefetch_ok[i]) {
-            LOG_WRN("failed to connect to RPC server %s\n", rpc_servers[i].c_str());
-            continue;
+            throw std::invalid_argument("failed to connect to RPC server " + rpc_servers[i]);
         }
+    }
+
+    for (size_t i = 0; i < rpc_servers.size(); i++) {
         const auto & server = rpc_servers[i];
         auto reg = ggml_backend_rpc_add_server_fn(server.c_str());
         ggml_backend_register(reg);
