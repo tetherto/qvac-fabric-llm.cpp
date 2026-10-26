@@ -5759,7 +5759,10 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context *         cuda_ctx,
                 break;
             }
 
-            if (op == GGML_OP_MUL_MAT && !with_bias && src0->type == GGML_TYPE_F8_E4M3) {
+            // cuBLASLt only above the mat-vec range: an unfused MMVF + scale is faster there
+            if (op == GGML_OP_MUL_MAT && !with_bias && src0->type == GGML_TYPE_F8_E4M3 &&
+                    !ggml_cuda_should_use_mmvf(src0, ggml_cuda_info().devices[cuda_ctx->device].cc,
+                        ggml_cuda_info().devices[cuda_ctx->device].warp_size, src1->ne[1])) {
                 const ggml_cuda_cutlass_activation * activation =
                     activation_plan != nullptr ? ggml_cuda_activation_plan_prepare(*activation_plan, *cuda_ctx, mm_node) : nullptr;
                 const bool prequantized = activation != nullptr && activation->type == GGML_TYPE_F8_E4M3;
