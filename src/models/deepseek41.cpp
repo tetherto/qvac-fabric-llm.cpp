@@ -547,11 +547,11 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention41(
             ggml_tensor * iw = ggml_scale(ctx0, build_lora_mm(layer.indexer_proj, cur), 1.0f/sqrtf(float(n_idx_embd*n_idx_head)));
             iw = ggml_view_4d(ctx0, iw, iw->ne[0], nt/n_stream, 1, n_stream, iw->nb[1], iw->nb[1]*(nt/n_stream), iw->nb[1]*(nt/n_stream), 0);
 
-            // chunk queries so the [n_ih, tokens, n_comp] scores stay near 2^26 elements (at most 64 chunks); the fused indexer runs as one chunk
+            // chunk queries so the scores stay near 2^26 elements (at most 64 chunks): [tokens, n_comp] from the fused indexer, [n_ih, tokens, n_comp] without it
             const int64_t n_tok = nt/n_stream;
             GGML_ASSERT(ci.kq_mask->ne[1] == n_tok);
-            const int64_t chunk = fused_idx ? n_tok :
-                std::max({ (n_tok + 63)/64, (INT64_C(1) << 26)/(n_idx_head*n_comp*n_stream), INT64_C(1) });
+            const int64_t n_score = (fused_idx ? 1 : n_idx_head)*n_comp*n_stream;
+            const int64_t chunk   = std::max({ (n_tok + 63)/64, (INT64_C(1) << 26)/n_score, INT64_C(1) });
 
             const int32_t cand_src = hparams.dsv41_cand_src;
             const bool    pick_blk = cand_src == il && cand_pin;              // level one: pick the candidate blocks
@@ -569,13 +569,15 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention41(
                 const auto rows = [&](ggml_tensor * t) {
                     return ggml_view_4d(ctx0, t, t->ne[0], nc, 1, n_stream, t->nb[1], t->nb[2], t->nb[3], t0*t->nb[1]);
                 };
+                ggml_tensor * iqc = ggml_view_4d(ctx0, iq, iq->ne[0], iq->ne[1], nc, n_stream, iq->nb[1], iq->nb[2], iq->nb[3], t0*iq->nb[2]);
                 ggml_tensor * score = nullptr;
                 if (fused_idx) {
-                    score = ggml_lightning_indexer(ctx0, iq, ik, iw, ci.kq_mask);
+                    // the fused indexer broadcasts the mask over the streams, so keep its own ne[3]
+                    ggml_tensor * m = ci.kq_mask;
+                    ggml_tensor * mask = ggml_view_4d(ctx0, m, m->ne[0], nc, 1, m->ne[3], m->nb[1], m->nb[2], m->nb[3], t0*m->nb[1]);
+                    score = ggml_lightning_indexer(ctx0, iqc, ik, rows(iw), mask);
                     res->add_fused_node({LLM_FUSED_OP_LIGHTNING_INDEXER, score, il});
                 } else {
-                    ggml_tensor * iqc = ggml_view_4d(ctx0, iq, iq->ne[0], iq->ne[1], nc, n_stream, iq->nb[1], iq->nb[2], iq->nb[3], t0*iq->nb[2]);
-
                     ggml_tensor * kq = ggml_mul_mat(ctx0, ik_p, ggml_permute(ctx0, iqc, 0, 2, 1, 3));
                     kq = ggml_cont(ctx0, ggml_permute(ctx0, kq, 2, 1, 0, 3));
                     score = ggml_sum_rows(ctx0, ggml_mul(ctx0, ggml_relu(ctx0, kq), rows(iw)));
