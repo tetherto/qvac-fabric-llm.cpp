@@ -31,6 +31,7 @@
 #include <memory>
 #include <filesystem>
 #include <random>
+#include <thread>
 #include <utility>
 #include <fstream>
 
@@ -4804,6 +4805,40 @@ private:
         return true;
     }
 
+    // sample one token for each slot, on up to 8 threads with at least 4 slots each: every slot has its own sampler and
+    // only reads the logits. a slot that fails keeps LLAMA_TOKEN_NULL and is sampled again by the caller
+    void sample_parallel(const std::vector<server_slot *> & to_sample, int32_t off, std::vector<llama_token> & out) {
+        const int n = (int) to_sample.size();
+        const int n_threads = std::min(n / 4, 8);
+        if (n_threads < 2) {
+            return;
+        }
+
+        // the first synchronization and logits access update the context, later calls only read it
+        llama_synchronize(ctx_tgt);
+        llama_get_logits(ctx_tgt);
+
+        auto work = [&](int t) {
+            for (int i = t; i < n; i += n_threads) {
+                server_slot & slot = *to_sample[i];
+                try {
+                    out[slot.id] = common_sampler_sample(slot.smpl.get(), slot.ctx_tgt, slot.i_batch - off);
+                } catch (const std::exception &) {
+                    out[slot.id] = LLAMA_TOKEN_NULL;
+                }
+            }
+        };
+
+        std::vector<std::thread> workers;
+        for (int t = 1; t < n_threads; ++t) {
+            workers.emplace_back(work, t);
+        }
+        work(0);
+        for (auto & w : workers) {
+            w.join();
+        }
+    }
+
     void post_decode(int32_t n_batch_tokens, int32_t off) {
         // for checking if a given batch index is inside the current sub-batch
         auto is_inside_view = [&](int32_t idx) {
@@ -4824,6 +4859,22 @@ private:
             return params_base.special ||
                 slot.task->params.sampling.preserved_tokens.find(token) != slot.task->params.sampling.preserved_tokens.end();
         };
+
+        // the slots that sample one token from this sub-batch below, sampled first and in parallel
+        std::vector<llama_token> pre_sampled(slots.size(), LLAMA_TOKEN_NULL);
+        {
+            std::vector<server_slot *> to_sample;
+            for (auto & slot : slots) {
+                if (!is_inside_view(slot.i_batch) || (slot.can_speculate() && !slot.spec_draft.empty())) {
+                    continue;
+                }
+                const bool done_prompt = slot.state == SLOT_STATE_DONE_PROMPT && slot.task->need_sampling();
+                if (done_prompt || slot.state == SLOT_STATE_GENERATING) {
+                    to_sample.push_back(&slot);
+                }
+            }
+            sample_parallel(to_sample, off, pre_sampled);
+        }
 
         iterate(slots, [&](server_slot & slot) {
             // optionally send prompt processing progress
@@ -4880,8 +4931,8 @@ private:
             // shifted according to the current sub-batch
             const int tok_idx = slot.i_batch - off;
 
-            llama_token id;
-            {
+            llama_token id = pre_sampled[slot.id];
+            if (id == LLAMA_TOKEN_NULL) {
                 scoped_timer timer(t_sampl, n_sampl);
                 id = common_sampler_sample(slot.smpl.get(), slot.ctx_tgt, tok_idx);
             }
