@@ -62,6 +62,7 @@ def engram_compressed_token_map(tokenizer_dir: Path) -> tuple[list[int], int]:
     from transformers import AutoTokenizer
 
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_dir)
+    assert tokenizer is not None
     sentinel = "\ue000"
     normalizer = normalizers.Sequence([
         normalizers.NFKC(),
