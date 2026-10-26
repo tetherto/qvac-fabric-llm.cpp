@@ -4513,11 +4513,9 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                 gdn_subgroup_size = 16u;
             }
 
-            // Adreno's subgroupClusteredAdd returns wrong results in the gated_delta_net
-            // shaders (seen on Adreno 840); use the full-subgroup / shmem reduce path
-            // instead, which Adreno 830 (no clustered support) already takes and passes.
-            const bool clustered_ok = device->subgroup_clustered &&
-                                      device->vendor_id != VK_VENDOR_ID_QUALCOMM;
+            // subgroup_clustered is off on Adreno, whose clustered reductions are wrong (see
+            // ggml_vk_get_device); there the full-subgroup / shmem reduce path is used instead.
+            const bool clustered_ok = device->subgroup_clustered;
 
             uint32_t lanes_per_column;
             if (device->vendor_id == VK_VENDOR_ID_INTEL) {
@@ -5167,6 +5165,12 @@ vk_device ggml_vk_get_device(size_t idx) {
 #endif
         device->subgroup_clustered = (vk11_props.subgroupSupportedStages & vk::ShaderStageFlagBits::eCompute) &&
                                      (vk11_props.subgroupSupportedOperations & vk::SubgroupFeatureFlagBits::eClustered);
+        // Workaround for Adreno's clustered subgroup reductions (subgroupClusteredAdd/Max) returning
+        // wrong results (seen on Adreno 840; the 830 does not report clustered support). Every kernel
+        // with a clustered variant falls back to a full-subgroup or shared-memory reduction.
+        if (device->vendor_id == VK_VENDOR_ID_QUALCOMM) {
+            device->subgroup_clustered = false;
+        }
 
         device->subgroup_ballot = (vk11_props.subgroupSupportedStages & vk::ShaderStageFlagBits::eCompute) &&
                                   (vk11_props.subgroupSupportedOperations & vk::SubgroupFeatureFlagBits::eBallot);
