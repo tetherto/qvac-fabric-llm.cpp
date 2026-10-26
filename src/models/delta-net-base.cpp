@@ -573,19 +573,12 @@ ggml_tensor * llm_build_delta_net_base::build_rs_ssm(
 
     const auto * mctx_cur = inp->mctx;
 
-    if (inp->s_base_inplace) {
-        // every cell keeps its own base state: no gather, the op reads and writes the cache rows
-        const int32_t rs_z = mctx_cur->get_rs_z();
-        ggml_build_forward_expand(gf, ggml_scale_inplace(ctx0,
-            ggml_view_1d(ctx0, ssm_states_all, hparams.n_embd_s()*(rs_z >= 0), rs_z*ssm_states_all->nb[1]*(rs_z >= 0)), 0));
-
-        return ggml_view_2d(ctx0, ssm_states_all, hparams.n_embd_s(), n_seqs, ssm_states_all->nb[1],
-                            mctx_cur->get_head()*ssm_states_all->nb[1]);
-    }
-
-    // one gather of all n_rs base states: the ubatch states, then the extra cells (see build_rs)
-    return build_rs(ssm_states_all, inp->s_copy_base, inp->s_copy_base_main, hparams.n_embd_s(), n_seqs,
-                    mctx_cur->get_n_rs(), mctx_cur->get_head(), mctx_cur->get_size(), mctx_cur->get_rs_z());
+    // in place: the op reads the base state of each cell before it writes the new one there. otherwise one gather of
+    // all n_rs base states: the ubatch states, then the extra cells (see build_rs)
+    return build_rs(ssm_states_all, inp->s_base_inplace ? inp->s_copy_moved : inp->s_copy_base, inp->s_copy_base_main,
+                    hparams.n_embd_s(), n_seqs,
+                    mctx_cur->get_n_rs(), mctx_cur->get_head(), mctx_cur->get_size(), mctx_cur->get_rs_z(),
+                    nullptr, inp->s_base_inplace);
 }
 
 ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
