@@ -22,7 +22,6 @@
 #include "ggml.h"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
-#include "ggml-cpu.h"
 
 #include <cmath>
 #include <cstdio>
@@ -174,7 +173,7 @@ int main(void) {
         return 0;
     }
     ggml_backend_t npu = ggml_backend_dev_init(dev, nullptr);
-    ggml_backend_t cpu = ggml_backend_cpu_init();
+    ggml_backend_t cpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
     if (!npu || !cpu) {
         std::printf("test-xdna-graph: backend init failed\n");
         return 1;
