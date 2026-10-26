@@ -4808,11 +4808,9 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                 gdn_subgroup_size = 16u;
             }
 
-            // Adreno's subgroupClusteredAdd returns wrong results in the gated_delta_net
-            // shaders (seen on Adreno 840); use the full-subgroup / shmem reduce path
-            // instead, which Adreno 830 (no clustered support) already takes and passes.
-            const bool clustered_ok = device->subgroup_clustered &&
-                                      device->vendor_id != VK_VENDOR_ID_QUALCOMM;
+            // subgroup_clustered is off on Adreno, whose clustered reductions are wrong (see
+            // ggml_vk_get_device); there the full-subgroup / shmem reduce path is used instead.
+            const bool clustered_ok = device->subgroup_clustered;
 
             uint32_t lanes_per_column;
             if (device->vendor_id == VK_VENDOR_ID_INTEL) {
@@ -5491,6 +5489,12 @@ vk_device ggml_vk_get_device(size_t idx) {
 #endif
         device->subgroup_clustered = (vk11_props.subgroupSupportedStages & vk::ShaderStageFlagBits::eCompute) &&
                                      (vk11_props.subgroupSupportedOperations & vk::SubgroupFeatureFlagBits::eClustered);
+        // Workaround for Adreno's clustered subgroup reductions (subgroupClusteredAdd/Max) returning
+        // wrong results (seen on Adreno 840; the 830 does not report clustered support). Every kernel
+        // with a clustered variant falls back to a full-subgroup or shared-memory reduction.
+        if (device->vendor_id == VK_VENDOR_ID_QUALCOMM) {
+            device->subgroup_clustered = false;
+        }
 
         device->subgroup_ballot = (vk11_props.subgroupSupportedStages & vk::ShaderStageFlagBits::eCompute) &&
                                   (vk11_props.subgroupSupportedOperations & vk::SubgroupFeatureFlagBits::eBallot);
@@ -14431,6 +14435,13 @@ static bool ggml_vk_fuse_norm_extra_enabled() {
 }
 
 static bool ggml_vk_rms_norm_small_ok(const ggml_backend_vk_context * ctx, const ggml_tensor * src0, const ggml_tensor * dst) {
+    // Workaround for rms_norm_small.comp computing wrong results on Adreno 840: use rms_norm.comp
+    // on Adreno, unless its one-workgroup-per-row grid would not fit in maxComputeWorkGroupCount[0]
+    // (the short-row kernel strides over rows; still wrong on the 840, but rms_norm.comp would abort).
+    if (ctx->device->vendor_id == VK_VENDOR_ID_QUALCOMM &&
+        src0->ne[1] <= ctx->device->properties.limits.maxComputeWorkGroupCount[0]) {
+        return false;
+    }
     return ggml_vk_norm_small_enabled() && ctx->device->pipeline_rms_norm_small_f32 != nullptr &&
            src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 && src0->ne[0] <= 256 &&
            ggml_is_contiguous_rows(src0) && ggml_is_contiguous(dst) &&
