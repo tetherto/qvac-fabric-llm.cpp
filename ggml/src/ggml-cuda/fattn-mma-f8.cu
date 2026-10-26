@@ -440,6 +440,8 @@ static int fattn_f8_mode() {
     return mode;
 }
 
+// at least one full query tile: with fewer queries (decode or verify of many sequences) the K/V pre-pass over the
+// whole cache costs more than the kernel saves
 bool ggml_cuda_flash_attn_ext_f8_supported(int device, const ggml_tensor * dst) {
     if (fattn_f8_mode() == 0) {
         return false;
@@ -466,7 +468,7 @@ bool ggml_cuda_flash_attn_ext_f8_supported(int device, const ggml_tensor * dst) 
     return (D == 128 || D == 256) && K->ne[0] == D && V->ne[0] == D && kv_type_ok &&
         Q->type == GGML_TYPE_F32 && Q->nb[0] == sizeof(float) && ggml_cuda_is_aligned(Q, 16) &&
         ggml_cuda_is_aligned(K, 16) && ggml_cuda_is_aligned(V, 16) &&
-        Q->ne[1] >= 64 && Q->ne[2] % K->ne[2] == 0 && V->ne[2] == K->ne[2] &&
+        Q->ne[1] >= FATTN_F8_BQ && Q->ne[2] % K->ne[2] == 0 && V->ne[2] == K->ne[2] &&
         (K->ne[3] == Q->ne[3] || K->ne[3] == 1) && V->ne[3] == K->ne[3] &&
         K->ne[1] % FATTN_F8_BK == 0 && V->ne[1] == K->ne[1] &&
         K->nb[0] == ggml_type_size(K->type) && V->nb[0] == ggml_type_size(V->type) &&
