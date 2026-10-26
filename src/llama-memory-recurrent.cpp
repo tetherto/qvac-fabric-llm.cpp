@@ -105,10 +105,8 @@ llama_memory_recurrent::llama_memory_recurrent(
                 gdn_deferred = false;
             }
         }
-        // LLAMA_GDN_DEFERRED=2 keeps gathering the base states (for A/B runs).
-        // only a single cell always keeps its own base state: with more cells, whether a ubatch could
-        // skip the gather depends on the cell layout, and the graph would not match the reserved one
-        gdn_inplace  = gdn_deferred && atoi(env) != 2 && mem_size == 1;
+        // LLAMA_GDN_DEFERRED=2 keeps gathering the base states (for A/B runs)
+        gdn_inplace  = gdn_deferred && atoi(env) != 2;
         if (gdn_deferred) {
             const int64_t H_v = hparams.ssm_dt_rank;
             const int64_t S_v = hparams.ssm_d_inner / H_v;
@@ -1737,7 +1735,6 @@ bool llama_memory_recurrent_context::get_gdn_deferred() const {
 bool llama_memory_recurrent_context::get_s_base_inplace(uint32_t n_seqs) const {
     GGML_UNUSED(n_seqs);
 
-    // gdn_inplace implies a single cell, which always keeps its own base state (also in the reserved graph)
     return mem->gdn_inplace;
 }
 
@@ -1749,7 +1746,7 @@ void llama_memory_recurrent_context::set_input_gdn_deferred(int32_t * s_copy_bas
     mem->set_input_gdn_deferred(s_copy_base, rec_idx, get_n_rs(), ubatch.n_seqs, ubatch.n_seq_tokens);
 }
 
-int32_t llama_memory_recurrent_context::s_copy(int i) const {
+int32_t llama_memory_recurrent_context::s_copy_src(int i) const {
     const uint32_t cell_idx = i + mem->head;
     const int32_t  src0     = mem->cells[cell_idx].src0;
 
@@ -1762,9 +1759,42 @@ int32_t llama_memory_recurrent_context::s_copy(int i) const {
         const llama_seq_id seq = *mem->cells[cell_idx].seq_id.begin();
         if (seq >= 0 && (size_t) seq < mem->rs_idx.size()) {
             idx = mem->rs_idx[seq];
+        }
+    }
+    return (int32_t)(idx * mem->size) + src0;
+}
+
+int32_t llama_memory_recurrent_context::s_copy(int i) const {
+    const int32_t src = s_copy_src(i);
+
+    const uint32_t cell_idx = i + mem->head;
+    if (mem->n_rs_seq != 0 && !mem->cells[cell_idx].seq_id.empty()) {
+        const llama_seq_id seq = *mem->cells[cell_idx].seq_id.begin();
+        if (seq >= 0 && (size_t) seq < mem->rs_idx.size()) {
             // reset rollback idx
             mem->rs_idx[seq] = 0;
         }
     }
-    return (int32_t)(idx * mem->size) + src0;
+    return src;
+}
+
+void llama_memory_recurrent_context::get_moved_range(uint32_t n_seqs, uint32_t & i0, uint32_t & i1) const {
+    i0 = 0;
+    i1 = 0;
+
+    if (is_full) {
+        i1 = n_seqs;
+        return;
+    }
+
+    for (uint32_t i = 0; i < n_seqs; ++i) {
+        // the deferred base states always live in plane 0 (see set_input_gdn_deferred)
+        const int32_t src = mem->gdn_deferred ? mem->cells[mem->head + i].src0 : s_copy_src(i);
+        if (src != (int32_t) (mem->head + i)) {
+            if (i1 == 0) {
+                i0 = i;
+            }
+            i1 = i + 1;
+        }
+    }
 }
