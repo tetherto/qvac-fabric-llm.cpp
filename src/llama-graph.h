@@ -295,7 +295,7 @@ public:
     // and shared across layers which use build_rs
     ggml_tensor * s_copy_main;  // I32 [n_seqs]
     ggml_tensor * s_copy_tail;  // I32 [n_rs - 1]
-    ggml_tensor * s_copy_moved; // I32 [n_rs - i0], see build_rs with in_place
+    ggml_tensor * s_copy_moved; // I32 [n_rs - i0], see build_rs with in_place (a view of s_copy_base when deferred)
 
     // deferred gated delta net commit (see llama_memory_recurrent::gdn_deferred), else null:
     // the ssm base states always live in plane 0, so they get their own copy indices
@@ -303,7 +303,7 @@ public:
     ggml_tensor * s_copy_base_main  = nullptr; // I32 [n_seqs]
     ggml_tensor * s_copy_base_extra = nullptr; // I32 [n_rs - n_seqs]
     ggml_tensor * rec_idx           = nullptr; // I32 [3, n_seqs] {pending, read_row, write_row}
-    bool          s_base_inplace    = false;   // the base states are read and written in place
+    bool          s_base_inplace    = false;   // the base states are read and written in place (s_copy_moved)
 
     const llama_memory_recurrent_context * mctx;
 
@@ -1432,8 +1432,8 @@ struct llm_graph_context {
     llm_graph_input_rs * build_rs_inp() const;
 
     // in_place: return a view of the cache rows of the ubatch instead of a gathered copy. the states from the first one
-    // that is not in its own cell yet through the extra states are copied to their cells first. the caller must read
-    // the states before it writes the new ones
+    // that is not in its own cell yet through the extra states (s_copy_moved) are copied to their cells first. the
+    // caller must read the states before it writes the new ones
     ggml_tensor * build_rs(
             llm_graph_input_rs * inp,
             ggml_tensor * s,

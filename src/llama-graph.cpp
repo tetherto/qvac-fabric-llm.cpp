@@ -4079,6 +4079,8 @@ static std::unique_ptr<llm_graph_input_rs> build_rs_inp_impl(
         inp->s_copy_base = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_rs);
         ggml_set_input(inp->s_copy_base);
 
+        inp->s_copy_moved = ggml_view_1d(ctx0, inp->s_copy_base, n_rs - i0, i0 * inp->s_copy_base->nb[0]);
+
         inp->s_copy_base_main  = ggml_view_1d(ctx0, inp->s_copy_base, n_seqs, 0);
         inp->s_copy_base_extra = ggml_view_1d(ctx0, inp->s_copy_base, n_rs - n_seqs, n_seqs * inp->s_copy_base->nb[0]);
 

@@ -105,10 +105,8 @@ llama_memory_recurrent::llama_memory_recurrent(
                 gdn_deferred = false;
             }
         }
-        // LLAMA_GDN_DEFERRED=2 keeps gathering the base states (for A/B runs).
-        // only a single cell always keeps its own base state: with more cells, whether a ubatch could
-        // skip the gather depends on the cell layout, and the graph would not match the reserved one
-        gdn_inplace  = gdn_deferred && atoi(env) != 2 && mem_size == 1;
+        // LLAMA_GDN_DEFERRED=2 keeps gathering the base states (for A/B runs)
+        gdn_inplace  = gdn_deferred && atoi(env) != 2;
         if (gdn_deferred) {
             const int64_t H_v = hparams.ssm_dt_rank;
             const int64_t S_v = hparams.ssm_d_inner / H_v;
@@ -1737,7 +1735,6 @@ bool llama_memory_recurrent_context::get_gdn_deferred() const {
 bool llama_memory_recurrent_context::get_s_base_inplace(uint32_t n_seqs) const {
     GGML_UNUSED(n_seqs);
 
-    // gdn_inplace implies a single cell, which always keeps its own base state (also in the reserved graph)
     return mem->gdn_inplace;
 }
 
@@ -1791,7 +1788,9 @@ void llama_memory_recurrent_context::get_moved_range(uint32_t n_seqs, uint32_t &
     }
 
     for (uint32_t i = 0; i < n_seqs; ++i) {
-        if (s_copy_src(i) != (int32_t) (mem->head + i)) {
+        // the deferred base states always live in plane 0 (see set_input_gdn_deferred)
+        const int32_t src = mem->gdn_deferred ? mem->cells[mem->head + i].src0 : s_copy_src(i);
+        if (src != (int32_t) (mem->head + i)) {
             if (i1 == 0) {
                 i0 = i;
             }
