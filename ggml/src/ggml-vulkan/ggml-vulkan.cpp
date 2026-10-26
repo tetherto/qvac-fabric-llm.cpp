@@ -13930,6 +13930,13 @@ static bool ggml_vk_fuse_norm_extra_enabled() {
 }
 
 static bool ggml_vk_rms_norm_small_ok(const ggml_backend_vk_context * ctx, const ggml_tensor * src0, const ggml_tensor * dst) {
+    // Workaround for rms_norm_small.comp computing wrong results on Adreno 840: use rms_norm.comp
+    // on Adreno, unless its one-workgroup-per-row grid would not fit in maxComputeWorkGroupCount[0]
+    // (the short-row kernel strides over rows; still wrong on the 840, but rms_norm.comp would abort).
+    if (ctx->device->vendor_id == VK_VENDOR_ID_QUALCOMM &&
+        src0->ne[1] <= ctx->device->properties.limits.maxComputeWorkGroupCount[0]) {
+        return false;
+    }
     return ggml_vk_norm_small_enabled() && ctx->device->pipeline_rms_norm_small_f32 != nullptr &&
            src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 && src0->ne[0] <= 256 &&
            ggml_is_contiguous_rows(src0) && ggml_is_contiguous(dst) &&
