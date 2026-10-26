@@ -225,6 +225,11 @@ public:
 
     int32_t s_copy(int i) const;
 
+    // rows [i0, i1) of the ubatch whose state is not in its own cell yet (s_copy(i) != head + i), empty when every
+    // state is in place. unlike s_copy, it leaves a pending rollback index in place. the full (reserve) context
+    // reports every row, so the reserved graph sizes the buffers for moving all of them
+    void get_moved_range(uint32_t n_seqs, uint32_t & i0, uint32_t & i1) const;
+
     void set_input_gdn_deferred(int32_t * s_copy_base, int32_t * rec_idx, const llama_ubatch & ubatch) const;
 
     // true when the deferred gdn op updates the base states in place instead of gathering them,
@@ -232,6 +237,9 @@ public:
     bool get_s_base_inplace(uint32_t n_seqs) const;
 
 private:
+    // the source of s_copy(i), without consuming the pending rollback index
+    int32_t s_copy_src(int i) const;
+
     const llama_memory_status status;
 
     llama_memory_recurrent * mem;

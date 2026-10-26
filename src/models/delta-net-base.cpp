@@ -457,7 +457,8 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
 
     const int64_t n_seqs = ubatch.n_seqs;
 
-    ggml_tensor * conv_states = build_rs(inp, conv_states_all, hparams.n_embd_r(), n_seqs);
+    // in place: only the concat below reads the conv states, and the write-back of the new states depends on it
+    ggml_tensor * conv_states = build_rs(inp, conv_states_all, hparams.n_embd_r(), n_seqs, nullptr, true);
     cb(conv_states, "conv_states", il);
 
     conv_states = ggml_reshape_3d(ctx0, conv_states, conv_kernel_size - 1, conv_channels, n_seqs);
@@ -566,7 +567,8 @@ ggml_tensor * llm_build_delta_net_base::build_rs_ssm(
         ggml_tensor *        ssm_states_all,
         int64_t              n_seqs) {
     if (!inp->rec_idx) {
-        return build_rs(inp, ssm_states_all, hparams.n_embd_s(), n_seqs);
+        // in place: the delta net reads the state before its new state is written back (build_recurrent_attn)
+        return build_rs(inp, ssm_states_all, hparams.n_embd_s(), n_seqs, nullptr, true);
     }
 
     const auto * mctx_cur = inp->mctx;
