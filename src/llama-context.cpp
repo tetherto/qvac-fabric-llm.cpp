@@ -1002,6 +1002,11 @@ void llama_context::synchronize() {
 
     ggml_backend_sched_synchronize(sched.get());
 
+    // nothing evaluated since the last synchronization: no stats to add, and repeated calls stay read-only
+    if (n_queued_tokens == 0) {
+        return;
+    }
+
     // FIXME: if multiple single tokens are evaluated without a synchronization,
     // the stats will be added to the prompt evaluation stats
     // this should only happen when using batch size 1 to evaluate a batch
@@ -2769,6 +2774,10 @@ bool llama_context::extract_layer_inputs(const llm_graph_result * res, const lla
 }
 
 void llama_context::output_reorder() {
+    if (output_swaps.empty()) {
+        return;
+    }
+
     const uint64_t n_vocab     = model.vocab.n_tokens();
     const uint64_t n_embd      = model.hparams.n_embd;
     const uint64_t n_embd_out  = model.hparams.n_embd_out();
