@@ -22,6 +22,12 @@ ggml_add_backend_library(ggml-xdna
                         )
 
 target_link_libraries(ggml-xdna PRIVATE XRT::xrt_coreutil)
+# the CPU backend the host ops inside an NPU chunk run on (ggml-xdna.cpp)
+if (GGML_BACKEND_DL)
+    target_link_libraries(ggml-xdna PRIVATE ggml-cpu-xdna)
+else()
+    target_link_libraries(ggml-xdna PRIVATE ggml-cpu)
+endif()
 # dladdr: the kernel artifacts are looked for next to the backend module
 target_link_libraries(ggml-xdna PRIVATE ${CMAKE_DL_LIBS})
 
@@ -486,7 +492,16 @@ if (GGML_XDNA_BUILD_KERNELS)
             list(APPEND XDNA_INSTALL_ARTIFACTS "${A}")
         endif()
     endforeach()
-    install(FILES ${XDNA_INSTALL_ARTIFACTS} DESTINATION ${CMAKE_INSTALL_BINDIR})
+    # The backend looks for them next to its module, so a DL build installs them
+    # where ggml_add_backend_library installs the module, in the same component.
+    if (GGML_BACKEND_DL AND GGML_BACKEND_DIR)
+        set(XDNA_ARTIFACT_DIR ${GGML_BACKEND_DIR})
+    elseif (GGML_BACKEND_DL)
+        set(XDNA_ARTIFACT_DIR ${CMAKE_INSTALL_LIBDIR})
+    else()
+        set(XDNA_ARTIFACT_DIR ${CMAKE_INSTALL_BINDIR})
+    endif()
+    install(FILES ${XDNA_INSTALL_ARTIFACTS} DESTINATION ${XDNA_ARTIFACT_DIR} COMPONENT ggml-xdna)
 endif()
 
 # Host-only tests of what a device cannot check for itself: which weight
