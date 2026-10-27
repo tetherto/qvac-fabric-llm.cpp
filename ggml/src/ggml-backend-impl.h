@@ -268,7 +268,8 @@ extern "C" {
     // Higher scores are preferred, 0 means the backend is not supported in the current system
     typedef int                (*ggml_backend_score_t)(void);
 
-#ifdef GGML_BACKEND_DL
+// an embedded copy is linked into another backend module and must not define its entry points
+#if defined(GGML_BACKEND_DL) && !defined(GGML_BACKEND_EMBEDDED)
 #    ifdef __cplusplus
 #        define GGML_BACKEND_DL_IMPL(reg_fn)                             \
             extern "C" {                                                 \

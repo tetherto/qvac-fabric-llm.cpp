@@ -411,6 +411,16 @@ function(ggml_backend_export_log_functions target)
 endfunction()
 
 function(ggml_add_backend_library backend)
+    if (GGML_BACKEND_EMBEDDED)
+        # static copy linked into another backend module: not loadable, not installed, not exported
+        add_library(${backend} STATIC ${ARGN})
+        set_target_properties(${backend} PROPERTIES POSITION_INDEPENDENT_CODE ON)
+        target_compile_definitions(${backend} PRIVATE GGML_BACKEND_EMBEDDED)
+        target_link_libraries(${backend} PRIVATE ggml-base)
+        target_include_directories(${backend} PRIVATE ..)
+        return()
+    endif()
+
     if (GGML_BACKEND_DL)
         add_library(${backend} MODULE ${ARGN})
         ggml_backend_export_log_functions(${backend})
@@ -425,16 +435,17 @@ function(ggml_add_backend_library backend)
         # with cmake-bare
         # add_dependencies(ggml ${backend})
 
+        # the component lets a build that makes one module install just that module
         if (GGML_BACKEND_DIR)
             install(TARGETS ${backend}
                     EXPORT ggml-targets
-                    LIBRARY DESTINATION ${GGML_BACKEND_DIR}
-                    RUNTIME DESTINATION ${GGML_BACKEND_DIR})
+                    LIBRARY DESTINATION ${GGML_BACKEND_DIR} COMPONENT ${backend}
+                    RUNTIME DESTINATION ${GGML_BACKEND_DIR} COMPONENT ${backend})
         else()
             install(TARGETS ${backend}
                     EXPORT ggml-targets
-                    LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
-                    RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+                    LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR} COMPONENT ${backend}
+                    RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR} COMPONENT ${backend})
         endif()
     else()
         add_library(${backend} ${ARGN})
@@ -642,6 +653,19 @@ elseif (GGML_CPU)
     ggml_add_cpu_backend_variant_impl("")
 endif()
 
+# ggml-xdna runs host ops on a CPU backend; a DL module cannot link the CPU modules, so it gets its own copy (every XDNA host has zen4 features)
+if (GGML_XDNA AND GGML_BACKEND_DL)
+    if (NOT GGML_SYSTEM_ARCH STREQUAL "x86")
+        message(FATAL_ERROR "ggml-xdna is x86-only")
+    endif()
+    if (NOT GGML_CPU)
+        include(ggml-cpu/CMakeLists.txt)
+    endif()
+    set(GGML_BACKEND_EMBEDDED ON)
+    ggml_add_cpu_backend_variant(xdna SSE42 AVX F16C FMA AVX2 BMI2 AVX512 AVX512_VBMI AVX512_VNNI AVX512_BF16)
+    unset(GGML_BACKEND_EMBEDDED)
+endif()
+
 ggml_add_backend(BLAS)
 ggml_add_backend(CANN)
 ggml_add_backend(CUDA)
@@ -657,6 +681,7 @@ ggml_add_backend(WebGPU)
 ggml_add_backend(zDNN)
 ggml_add_backend(OpenCL)
 ggml_add_backend(Hexagon)
+ggml_add_backend(XDNA)
 ggml_add_backend(ZenDNN)
 ggml_add_backend(OPENVINO)
 

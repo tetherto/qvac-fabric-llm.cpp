@@ -582,6 +582,26 @@ llama_build_and_test(test-autorelease.cpp       LABEL "model")
 llama_build_and_test(test-backend-sampler.cpp   LABEL "model")
 llama_build_and_test(test-laya.cpp)
 
+# XDNA NPU. Self-skipping when no XDNA device is registered.
+if (GGML_XDNA)
+    # Load, run and free a model several times in one process (#293).
+    llama_build_and_test(test-xdna-reload.cpp       LABEL "model")
+    # Graphs the backend rewrites, against the CPU backend. Needs the device,
+    # no model.
+    llama_build_and_test(test-xdna-graph.cpp)
+    # Two llama contexts computing at once (-m model.gguf).
+    llama_build_and_test(test-xdna-contexts.cpp     LABEL "model")
+    # A sequence's state saved and restored around other tokens (-m model.gguf).
+    llama_build_and_test(test-xdna-state.cpp        LABEL "model")
+    # The host-only backend tests are built with the backend
+    # (ggml/src/ggml-xdna/CMakeLists.txt); they need no model and no device.
+    foreach(t test-xdna-repack test-xdna-head-rows)
+        if (TARGET ${t})
+            add_test(NAME ${t} COMMAND ${t} ${CMAKE_RUNTIME_OUTPUT_DIRECTORY})
+        endif()
+    endforeach()
+endif()
+
 # Test for state restore with fragmented KV cache
 # Requires a model, uses same args pattern as test-thread-safety
 # TODO: run on all dummy models

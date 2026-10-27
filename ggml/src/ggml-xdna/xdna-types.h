@@ -1,0 +1,77 @@
+#pragma once
+
+// Transparent XDNA types. The backend always links XRT, so the structs hold
+// XRT handles directly instead of hiding them behind opaque pointers.
+
+#include <xrt/xrt_bo.h>
+#include <xrt/xrt_device.h>
+#include <xrt/xrt_hw_context.h>
+#include <xrt/xrt_kernel.h>
+
+#include <cstddef>
+#include <cstdint>
+#include <memory>
+#include <mutex>
+#include <string>
+#include <unordered_map>
+#include <vector>
+
+// The NPU device. One per process.
+struct xdna_device {
+    xrt::device device;
+    std::string name;
+    std::string description;
+};
+
+// A loaded kernel: one xclbin plus one instruction stream (insts BO) bound to
+// a shared hw_context. All variants of the same xclbin share the context via
+// the shared_ptr; the runtime keeps contexts alive for the process lifetime.
+struct xdna_kernel {
+    xrt::device                      device;
+    std::shared_ptr<xrt::hw_context> context;
+    xrt::kernel                      kernel;
+    xrt::bo                          insts_bo;
+    int64_t                          insts_bytes = 0;
+    std::string                      xclbin_name;
+    // The stream as bound, for a token's streams to be joined into one
+    // command (xdna_run_submit).
+    std::vector<uint32_t>            insts_host;
+};
+
+// A host-visible device buffer object (BO).
+struct xdna_buffer {
+    xrt::bo       bo;
+    // The host mapping, taken once when the buffer is created. xrt::bo::map()
+    // can fail, and it is the only way to reach the BO's memory, so the pointer
+    // is cached here where the failure can still be reported and the buffer
+    // freed: a buffer that exists always has a valid mapping.
+    void *        data     = nullptr;
+    size_t        bytes    = 0;
+    // The BO this one is a view of (null: its own) and where in it: what a
+    // joined stream names instead of this buffer.
+    xdna_buffer * root     = nullptr;
+    size_t        root_off = 0;
+};
+
+// Pool of kernels: holds the artifact stems found in the search dirs and the
+// kernels loaded from them. The runtime caches one hw_context per xclbin uuid,
+// so variants of one xclbin share it with no reload penalty. Also pools
+// host-visible buffers.
+struct xdna_kernel_pool {
+    struct pool_entry {
+        xdna_buffer * buf;
+        uint64_t      seq;  // idle stamp, lower = older
+    };
+
+    static constexpr size_t MAX_POOL_SIZE = 16;
+
+    xdna_device * device = nullptr;
+
+    std::vector<std::string>                       names;    // artifact stems
+    std::unordered_map<std::string, xdna_kernel *> kernels;  // name -> kernel
+    std::mutex                                     kernel_mutex;
+
+    std::vector<pool_entry> pool;
+    uint64_t                pool_tick = 0;
+    std::mutex              pool_mutex;
+};
