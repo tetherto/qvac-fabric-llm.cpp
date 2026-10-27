@@ -5775,6 +5775,84 @@ void check_turbovec_1x_failed_add_then_sync() {
     std::filesystem::remove(path);
 }
 
+// A sync that fails keeps its binding, so the retry still refuses a file
+// another writer committed to in the meantime instead of rewriting it with
+// that writer's commits lost.
+void check_turbovec_1x_failed_sync_keeps_binding() {
+    constexpr int dim = 32;
+    const std::vector<float> rows = tv1x_rows(kTv1xSeedDb, 128, dim);
+    const std::vector<uint64_t> ids = tv1x_ids(128);
+    const std::string path = (std::filesystem::temp_directory_path() / "ggml-vector-index-tv1x-failed-sync.tvim").string();
+    auto add = [&](ggml_vec_index_t * idx, size_t from, size_t to) {
+        CHECK(ggml_vec_index_add(idx, rows.data() + from * dim, static_cast<int>(to - from), ids.data() + from) ==
+              GGML_VEC_INDEX_OK);
+    };
+    // Another handle loads the file, removes ids[0] and commits.
+    auto commit_remove_elsewhere = [&]() {
+        auto * other = ggml_vec_index_load(path.c_str());
+        CHECK(other != nullptr);
+        CHECK(ggml_vec_index_remove(other, ids[0]) == GGML_VEC_INDEX_OK);
+        CHECK(ggml_vec_index_sync(other, path.c_str()) == GGML_VEC_INDEX_OK);
+        ggml_vec_index_free(other);
+    };
+    auto check_removal_kept = [&](int64_t len) {
+        auto * reloaded = ggml_vec_index_load(path.c_str());
+        CHECK(reloaded != nullptr);
+        CHECK(ggml_vec_index_len(reloaded) == len);
+        CHECK(ggml_vec_index_contains(reloaded, ids[0]) == 0);
+        ggml_vec_index_free(reloaded);
+    };
+
+    // Out of memory before anything is written, after another commit.
+    {
+        std::filesystem::remove(path);
+        auto * tv = ggml_vec_index_create_turbovec(dim, 2);
+        add(tv, 0, 64);
+        CHECK(ggml_vec_index_sync(tv, path.c_str()) == GGML_VEC_INDEX_OK);
+        commit_remove_elsewhere();
+        ggml_vec_index_test_set_oom_countdown(0);
+        CHECK(ggml_vec_index_sync(tv, path.c_str()) == GGML_VEC_INDEX_E_OOM);
+        ggml_vec_index_test_set_oom_countdown(-1);
+        CHECK(ggml_vec_index_sync(tv, path.c_str()) == GGML_VEC_INDEX_E_IO);
+        check_removal_kept(63);
+        ggml_vec_index_free(tv);
+    }
+    // A write that fails partway, then another commit at the same
+    // generation the failed sync was writing.
+    {
+        std::filesystem::remove(path);
+        auto * tv = ggml_vec_index_create_turbovec(dim, 2);
+        add(tv, 0, 64);
+        CHECK(ggml_vec_index_sync(tv, path.c_str()) == GGML_VEC_INDEX_OK);
+        add(tv, 64, 96);
+        ggml_vec_index_test_set_write_fail_after(8);
+        CHECK(ggml_vec_index_sync(tv, path.c_str()) == GGML_VEC_INDEX_E_IO);
+        ggml_vec_index_test_set_write_fail_after(-1);
+        commit_remove_elsewhere();
+        CHECK(ggml_vec_index_sync(tv, path.c_str()) == GGML_VEC_INDEX_E_IO);
+        check_removal_kept(63);
+        ggml_vec_index_free(tv);
+    }
+    // With no other writer, the retry commits everything.
+    {
+        std::filesystem::remove(path);
+        auto * tv = ggml_vec_index_create_turbovec(dim, 2);
+        add(tv, 0, 64);
+        CHECK(ggml_vec_index_sync(tv, path.c_str()) == GGML_VEC_INDEX_OK);
+        add(tv, 64, 96);
+        ggml_vec_index_test_set_write_fail_after(8);
+        CHECK(ggml_vec_index_sync(tv, path.c_str()) == GGML_VEC_INDEX_E_IO);
+        ggml_vec_index_test_set_write_fail_after(-1);
+        CHECK(ggml_vec_index_sync(tv, path.c_str()) == GGML_VEC_INDEX_OK);
+        auto * reloaded = ggml_vec_index_load(path.c_str());
+        CHECK(reloaded != nullptr);
+        CHECK(ggml_vec_index_len(reloaded) == 96);
+        ggml_vec_index_free(reloaded);
+        ggml_vec_index_free(tv);
+    }
+    std::filesystem::remove(path);
+}
+
 // A commit header that reaches disk before its data is detected and the
 // load falls back; the recovered index's next commit wipes the abandoned
 // header before reusing its slot.
@@ -7188,6 +7266,83 @@ void check_turbovec_1x_streamed_snapshots() {
 }
 #endif
 
+// A v8 file is read only as far as its geometry and a CRC-checked header
+// declare, so a sparse file with a huge apparent size costs no memory,
+// whether its metadata is valid or not.
+void check_turbovec_1x_sparse_load() {
+    constexpr int dim = 32;
+    const std::vector<float> rows = tv1x_rows(kTv1xSeedDb, 64, dim);
+    const std::vector<uint64_t> ids = tv1x_ids(64);
+    const std::string path = (std::filesystem::temp_directory_path() / "ggml-vector-index-tv1x-sparse.tvim").string();
+    std::filesystem::remove(path);
+    auto * tv = ggml_vec_index_create_turbovec(dim, 2);
+    CHECK(ggml_vec_index_add(tv, rows.data(), 64, ids.data()) == GGML_VEC_INDEX_OK);
+    CHECK(ggml_vec_index_write(tv, path.c_str()) == GGML_VEC_INDEX_OK);
+    ggml_vec_index_free(tv);
+    const std::vector<uint8_t> image = read_file_bytes(path);
+    auto write_sparse = [&](const std::vector<uint8_t> & bytes) {
+        write_file_bytes(path, bytes);
+        std::error_code ec;
+        std::filesystem::resize_file(path, uintmax_t{ 1 } << 40, ec);
+        return !ec;
+    };
+    if (!write_sparse(image)) {
+        std::printf("SKIP TurboVec sparse load: no sparse files here\n");
+        std::filesystem::remove(path);
+        return;
+    }
+    auto * loaded = ggml_vec_index_load(path.c_str());
+    CHECK(loaded != nullptr);
+    CHECK(ggml_vec_index_len(loaded) == 64);
+    ggml_vec_index_free(loaded);
+
+    // An invalid dimension.
+    std::vector<uint8_t> bad = image;
+    put_u32_le(bad, 8, 7);
+    CHECK(write_sparse(bad));
+    ggml_vec_index_t * out = nullptr;
+    CHECK(ggml_vec_index_load_ex(path.c_str(), &out) == GGML_VEC_INDEX_E_IO);
+    CHECK(out == nullptr);
+    // A huge row count in the only header, whose CRC then fails.
+    bad = image;
+    const size_t sb_len = 24 + 3 * 4 + 4 * 4 + 4 + 4;
+    write_u64_le_at(bad, sb_len + 8, uint64_t{ 1 } << 34);
+    CHECK(write_sparse(bad));
+    CHECK(ggml_vec_index_load_ex(path.c_str(), &out) == GGML_VEC_INDEX_E_IO);
+    CHECK(out == nullptr);
+    std::filesystem::remove(path);
+}
+
+// A stale handle whose next sync would switch the file to the planes
+// layout still checks the file's commits first, so it cannot rewrite over
+// another writer's commit.
+void check_turbovec_1x_stale_layout_change() {
+    constexpr int dim = 32;
+    // Upstream switches to the planes layout at 32768 rows.
+    constexpr size_t n = 32768;
+    const std::vector<float> rows = tv1x_rows(kTv1xSeedDb, n, dim);
+    const std::vector<uint64_t> ids = tv1x_ids(n);
+    const std::string path = (std::filesystem::temp_directory_path() / "ggml-vector-index-tv1x-layout.tvim").string();
+    std::filesystem::remove(path);
+    auto * tv = ggml_vec_index_create_turbovec(dim, 2);
+    CHECK(ggml_vec_index_add(tv, rows.data(), static_cast<int>(n - 1), ids.data()) == GGML_VEC_INDEX_OK);
+    CHECK(ggml_vec_index_sync(tv, path.c_str()) == GGML_VEC_INDEX_OK);
+    auto * other = ggml_vec_index_load(path.c_str());
+    CHECK(other != nullptr);
+    CHECK(ggml_vec_index_remove(other, ids[0]) == GGML_VEC_INDEX_OK);
+    CHECK(ggml_vec_index_sync(other, path.c_str()) == GGML_VEC_INDEX_OK);
+    ggml_vec_index_free(other);
+    CHECK(ggml_vec_index_add(tv, rows.data() + (n - 1) * dim, 1, ids.data() + n - 1) == GGML_VEC_INDEX_OK);
+    CHECK(ggml_vec_index_sync(tv, path.c_str()) == GGML_VEC_INDEX_E_IO);
+    auto * reloaded = ggml_vec_index_load(path.c_str());
+    CHECK(reloaded != nullptr);
+    CHECK(ggml_vec_index_len(reloaded) == static_cast<int>(n - 2));
+    CHECK(ggml_vec_index_contains(reloaded, ids[0]) == 0);
+    ggml_vec_index_free(reloaded);
+    ggml_vec_index_free(tv);
+    std::filesystem::remove(path);
+}
+
 void check_turbovec_1x() {
     for (const Tv1xIndexCase & c : kTv1xIndexCases) {
 #ifdef GGML_VEC_INDEX_TEST_HOOKS
@@ -7210,6 +7365,8 @@ void check_turbovec_1x() {
         check_turbovec_1x_sync_case(c);
     }
     check_turbovec_1x_sync_api();
+    check_turbovec_1x_sparse_load();
+    check_turbovec_1x_stale_layout_change();
     check_turbovec_1x_history_snapshots();
     check_turbovec_1x_threads();
     check_vector_index_introspection();
@@ -7271,6 +7428,7 @@ int main(int argc, char ** argv) {
             check_turbovec_1x_rotation_and_codebooks();
             check_turbovec_1x_torn_sync();
             check_turbovec_1x_failed_add_then_sync();
+            check_turbovec_1x_failed_sync_keeps_binding();
             check_turbovec_1x_reordered_and_stale_commits();
             check_turbovec_1x_permute_dot_kernels();
             check_turbovec_1x_vm8_layout_choice();

@@ -2281,13 +2281,15 @@ void build_turbovec_permute_dot_2bit(const float * query, int dim, TurboVecPermu
 }
 
 #if GGML_VEC_INDEX_USE_NEON && (defined(__clang__) || defined(__GNUC__))
-// Clang spells the AArch64 extensions "dotprod" and "i8mm"; GCC needs the
-// leading "+".
+// Clang spells the AArch64 extensions "dotprod" and "i8mm". GCC must match
+// the target its arm_neon.h declares the intrinsic under,
+// "arch=armv8.2-a+dotprod": GCC 12 rejects a bare "+dotprod" on an armv8-a
+// baseline as a target mismatch when it inlines vdotq_s32.
 #if defined(__clang__)
 #define GGML_VEC_INDEX_TARGET_DOTPROD __attribute__((target("dotprod")))
 #define GGML_VEC_INDEX_TARGET_I8MM __attribute__((target("i8mm")))
 #else
-#define GGML_VEC_INDEX_TARGET_DOTPROD __attribute__((target("+dotprod")))
+#define GGML_VEC_INDEX_TARGET_DOTPROD __attribute__((target("arch=armv8.2-a+dotprod")))
 #define GGML_VEC_INDEX_TARGET_I8MM __attribute__((target("+i8mm")))
 #endif
 

@@ -292,6 +292,15 @@ struct TurboVecSyncBinding {
     // File rows whose redo ops ride the last commit, and rows changed since.
     std::unordered_set<size_t> pending;
     std::unordered_set<size_t> fresh;
+    // `fresh` lost a row, so the next sync must rewrite the file, after the
+    // same generation check as an incremental one.
+    bool rewrite = false;
+    // A failed sync may still have landed its commit. These name it, so the
+    // next sync can tell its own commit from another writer's: the nonce of
+    // a full write, or the generation and header CRC of an incremental one.
+    uint64_t attempt_nonce = 0;
+    uint64_t attempt_gen = 0;
+    uint32_t attempt_crc = 0;
 };
 
 struct ggml_vec_index {
