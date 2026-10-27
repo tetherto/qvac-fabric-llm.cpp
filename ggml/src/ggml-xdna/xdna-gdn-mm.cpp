@@ -43,7 +43,7 @@ constexpr int          IN_N       = 2 * C * DK + C * DV + FX_N * 2;  // bf16 an 
 constexpr int          O_N        = C * DV;                          // f32 an output object
 constexpr int          N_STATE_IN = 4, N_STATE_OUT = 8;
 constexpr float        LS_MIN         = -32.0f;
-constexpr int64_t      GDN_MIN_TOKENS = 64;  // a sequence's tokens in the ubatch (see xdna_gdn_mm_supported)
+constexpr int64_t      GDN_MIN_TOKENS = 144;  // a sequence's tokens in the ubatch (see xdna_gdn_mm_supported)
 
 // element (r, c) of a (rows x cols) matrix in 8 x 8 tiles
 inline size_t t8(int r, int c, int cols) {
@@ -128,14 +128,14 @@ bool xdna_gdn_mm_supported(const ggml_tensor * node) {
     if (!q || !k || !v || !g || !b || !s) {
         return false;
     }
-    // A single token is the decode's, whose layers run fused. Below a pass
-    // of 64 tokens the host's recurrence is what runs: 2-3x quicker there
-    // (the array's run is two design changes a layer, conv and GDN, ~2.4 ms
-    // each), and it gives a token the same bits however the server cut its
-    // sequence into ubatches or batched it with others. The chunked form
-    // here depends on where the ubatch boundaries fall, so a request served
-    // alongside others (its prompt in other pieces) would not reproduce a
-    // lone one. Energy breaks even with the host near 128 tokens.
+    // A single token is the decode's, whose layers run fused. Below
+    // GDN_MIN_TOKENS the host's recurrence runs: quicker and less energy a token
+    // (pp128 on the 0.8B: 1137 against 656 t/s, 30 against 35 mJ; from 160
+    // tokens the array takes less energy). It also gives a token the same bits
+    // however the server cut its sequence into ubatches or batched it with
+    // others. The chunked form here depends on where the ubatch boundaries
+    // fall, so a request served alongside others (its prompt in other pieces)
+    // would not reproduce a lone one.
     if (v->ne[2] < GDN_MIN_TOKENS) {
         return false;
     }
