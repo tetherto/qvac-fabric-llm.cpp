@@ -80,8 +80,6 @@ find_package(Threads REQUIRED)
 target_link_libraries(llama PUBLIC ggml PRIVATE Threads::Threads)
 
 if (LLAMA_COREML)
-    find_library(COREML_FRAMEWORK CoreML REQUIRED)
-    find_library(FOUNDATION_FRAMEWORK Foundation REQUIRED)
     target_sources(llama PRIVATE llama-coreml.mm)
     target_compile_definitions(llama PRIVATE LLAMA_USE_COREML)
     target_link_libraries(llama PRIVATE "-framework CoreML" "-framework Foundation")

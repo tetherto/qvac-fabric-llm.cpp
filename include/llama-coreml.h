@@ -11,6 +11,21 @@
 extern "C" {
 #endif
 
+enum {
+    LLAMA_COREML_N_LAYER = 24,
+    LLAMA_COREML_HIDDEN = 512,
+    LLAMA_COREML_EMBD_OUT = 768,
+    LLAMA_COREML_VOCAB = 262144,
+    LLAMA_COREML_BOS = 2,
+    LLAMA_COREML_EOS = 1,
+    LLAMA_COREML_MAX_TOKENS = 512,
+    LLAMA_COREML_PACK_TOKENS = 256,
+    LLAMA_COREML_MIN_SLOTS = 8,
+    LLAMA_COREML_MAX_SLOTS = 16,
+    LLAMA_COREML_MAX_INFLIGHT = 8,
+    LLAMA_COREML_DEFAULT_INFLIGHT = 1,
+};
+
 struct llama_coreml_embedding;
 
 // Tokens must use the original EmbeddingGemma 2 vocabulary, including BOS and EOS.

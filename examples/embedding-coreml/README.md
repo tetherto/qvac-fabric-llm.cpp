@@ -27,20 +27,20 @@ const float * embedding = llama_get_embeddings_seq(ctx, seq_id);
 
 The sidecar must come from the same checkpoint as the GGUF. Returned vectors are raw, mean-pooled embeddings, preserving the existing API's normalization contract. Callers can apply their usual normalization or Matryoshka truncation. Pass a null directory to disable the sidecar; a failed configuration leaves the previous configuration unchanged. `llama_supports_coreml()` reports build-time availability. Context calls retain the usual caller-side synchronization requirements.
 
-The CLI and server accept `--coreml-model DIR` (or `LLAMA_ARG_COREML_MODEL`). They retain their existing output formats, tokenization, and `--embd-normalize` behavior:
+The CLI and server accept `--coreml-model DIR` (or `LLAMA_ARG_COREML_MODEL`). Set `--coreml-max-inflight N` (or `LLAMA_ARG_COREML_MAX_INFLIGHT`) to 1..8 predictions; the default is one. They retain their existing output formats, tokenization, and `--embd-normalize` behavior:
 
 ```sh
 build-ane/bin/llama-embedding -m ../embeddinggemma-2-BF16.gguf \
     --coreml-model ../embeddinggemma-2-coreml --pooling mean \
     -p 'title: none | text: Example document' --embd-normalize 2
 build-ane/bin/llama-server -m ../embeddinggemma-2-BF16.gguf \
-    --embedding --pooling mean --coreml-model ../embeddinggemma-2-coreml \
+    --embedding --pooling mean --coreml-model ../embeddinggemma-2-coreml --coreml-max-inflight 8 \
     -np 32 -c 16384 -b 1024 -ub 1024
 ```
 
 For short-text throughput, tune `-np` together with `-b` and `-ub`. The server default of four parallel sequences often produces only one packed prediction per encode, leaving asynchronous slots idle. Larger parallelism allows multiple predictions to overlap when enough requests are queued; benchmark the memory and latency tradeoff on the target device.
 
-Compatible batches contain independent token sequences starting at position zero, at most 512 tokens each, with mean pooling. Longer sequences, shared token rows, supplied embeddings, position offsets, other pooling modes, adapters, callbacks, and feature extraction use ggml. A prediction failure disables that context's sidecar and retries the batch with ggml. Keep the GGUF weights available for fallback; this optimization does not eliminate their memory use.
+Setup rejects non-mean pooling and RoPE/YaRN or attention settings that differ from the sidecar. Compatible batches contain independent token sequences starting at position zero, at most 512 tokens each, with mean pooling. Longer sequences, shared token rows, supplied embeddings, position offsets, adapters, callbacks, and feature extraction use ggml. A prediction failure disables that context's sidecar and retries the batch with ggml. Keep the GGUF weights available for fallback; this optimization does not eliminate their memory use.
 
 This integration requires an `embedding_raw` output. Re-export older normalized-only packages with the exporter below. The pinned FluidInference package remains usable through the lower-level normalized adapter; the existing embedding API rejects it and the CLI/server continue with ggml.
 
@@ -51,7 +51,7 @@ Download from [FluidInference/embeddinggemma-2-coreml](https://huggingface.co/Fl
 - `EmbeddingGemma2Text.mlpackage/` (all files)
 - `embeddings.bf16`
 
-Pass their containing directory to `llama_coreml_embedding_load`. The first load compiles the package and copies the result to `EmbeddingGemma2Text.mlmodelc` in that directory. The directory must be writable for this initial step. Precompiled assets can instead be supplied in a read-only directory. The integrated API loads and validates all seven functions at setup and compares a short fixed text against ggml with a minimum cosine of 0.998. Setup can take minutes on first use. This numerical probe detects incompatible output but does not prove weight identity; matching checkpoints remain the caller's responsibility. The lower-level normalized adapter still loads functions lazily. Warm the workload before measuring throughput.
+Pass their containing directory to `llama_coreml_embedding_load`. The first load compiles the package and copies the result to `EmbeddingGemma2Text.mlmodelc` in that directory. The directory must be writable for this initial step. When replacing the `.mlpackage` or switching checkpoint revisions, stop callers and delete the adjacent `EmbeddingGemma2Text.mlmodelc` before loading again. An existing compiled cache is reused without checking the package; the compatibility probe is not a cache invalidation mechanism. Precompiled assets can instead be supplied in a read-only directory. The integrated API loads and validates all seven functions at setup and compares a short fixed text against ggml with a minimum cosine of 0.998. Setup can take minutes on first use. This numerical probe detects incompatible output but does not prove weight identity; matching checkpoints remain the caller's responsibility. The lower-level normalized adapter still loads functions lazily. Warm the workload before measuring throughput.
 
 The token table must have exactly 262144 rows of 512 little-endian BF16 values. It is converted to FP16 and scaled by sqrt(512) during input preparation. This is the original token table, not a GGUF quantized table. Model weights and tokenizer must come from matching checkpoints. The adapter checks file size and model input/output contracts; it does not authenticate downloaded files. Pin revisions and verify checksums when distributing assets.
 
@@ -92,6 +92,9 @@ build-ane/bin/llama-coreml-embedding-bench \
 # These checks use metadata, temporary files, and synthetic normalization tensors.
 # They do not load model weights or run the encoder.
 python3 -m unittest discover -s examples/embedding-coreml -p 'test_export_coreml.py'
+
+# C++ packing, grouping, and context contract checks need no model assets.
+ctest --test-dir build-ane -R '^coreml-contract$' --output-on-failure
 ```
 
 BF16 GGUF provides a reference close to the original checkpoint. Also validate the official Q8_0 GGUF with the same corpus and batching arguments when deploying that quantization. Core ML uses the original checkpoint through its FP16 sidecar, independently of GGUF quantization; the raw output is exposed as FP32. The selected GGUF controls ggml execution and fallback.
