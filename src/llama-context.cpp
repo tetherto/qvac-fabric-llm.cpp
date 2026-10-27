@@ -1709,9 +1709,17 @@ bool llama_context::set_coreml_model(const char * directory, int32_t max_infligh
         coreml.reset();
         return true;
     }
-    if (model.arch != LLM_ARCH_GEMMA_EMBEDDING2 || memory || model.hparams.n_layer() != 24 || model.hparams.n_embd != 512 ||
-            model.hparams.n_embd_out() != 768 || model.vocab.n_tokens() != 262144 ||
-            max_inflight < 1 || max_inflight > 8) {
+    if (model.arch != LLM_ARCH_GEMMA_EMBEDDING2 || memory) {
+        LLAMA_LOG_WARN("%s: Core ML sidecars support EmbeddingGemma 2 text encoder contexts only\n", __func__);
+        return false;
+    }
+    if (model.hparams.n_layer() != 24 || model.hparams.n_embd != 512 || model.hparams.n_embd_out() != 768 ||
+            model.vocab.n_tokens() != 262144 || llama_vocab_bos(&model.vocab) != 2 || llama_vocab_eos(&model.vocab) != 1) {
+        LLAMA_LOG_WARN("%s: model dimensions or vocabulary do not match the EmbeddingGemma 2 sidecar contract\n", __func__);
+        return false;
+    }
+    if (max_inflight < 1 || max_inflight > 8) {
+        LLAMA_LOG_WARN("%s: max_inflight must be between 1 and 8\n", __func__);
         return false;
     }
     char error[1024] = {};
@@ -1721,6 +1729,54 @@ bool llama_context::set_coreml_model(const char * directory, int32_t max_infligh
         return false;
     }
     synchronize();
+    try {
+        const char * text = "title: none | text: The quick brown fox jumps over the lazy dog.";
+        llama_token tokens[32];
+        const int32_t count = llama_tokenize(&model.vocab, text, strlen(text), tokens + 1, 30, false, false);
+        if (count < 0) {
+            throw std::runtime_error("could not tokenize the sidecar compatibility probe");
+        }
+        tokens[0] = llama_vocab_bos(&model.vocab);
+        tokens[count + 1] = llama_vocab_eos(&model.vocab);
+        const llama_coreml_embedding_sequence sequence = {tokens, count + 2};
+        const size_t dimension = model.hparams.n_embd_out();
+        std::vector<float> actual(dimension);
+        if (llama_coreml_embedding_encode(next.get(), &sequence, 1, false, actual.data(), actual.size(), error, sizeof(error)) != 0) {
+            throw std::runtime_error(error);
+        }
+        auto params = llama_context_default_params();
+        params.n_ctx = params.n_batch = params.n_ubatch = 32;
+        params.n_seq_max = 1;
+        params.n_threads = cparams.n_threads;
+        params.n_threads_batch = cparams.n_threads_batch;
+        params.embeddings = true;
+        params.pooling_type = LLAMA_POOLING_TYPE_MEAN;
+        params.no_perf = true;
+        // Use a separate context so setup cannot replace the caller's outputs or adapters.
+        auto probe = std::make_unique<llama_context>(model, params);
+        if (probe->encode(llama_batch_get_one(tokens, sequence.n_tokens)) != 0) {
+            throw std::runtime_error("ggml sidecar compatibility probe failed");
+        }
+        const float * expected = llama_get_embeddings_seq(probe.get(), 0);
+        if (!expected) {
+            throw std::runtime_error("ggml sidecar compatibility probe returned no embedding");
+        }
+        double dot = 0, aa = 0, bb = 0;
+        for (size_t i = 0; i < dimension; ++i) {
+            dot += double(actual[i]) * expected[i];
+            aa += double(actual[i]) * actual[i];
+            bb += double(expected[i]) * expected[i];
+        }
+        const double cosine = aa > 0 && bb > 0 ? dot / sqrt(aa * bb) : 0;
+        if (!std::isfinite(cosine) || cosine < 0.998) {
+            LLAMA_LOG_WARN("%s: sidecar compatibility probe cosine %.8f is below 0.998; check that the GGUF and sidecar use matching weights\n", __func__, cosine);
+            return false;
+        }
+        LLAMA_LOG_INFO("%s: sidecar compatibility probe cosine %.8f\n", __func__, cosine);
+    } catch (const std::exception & failure) {
+        LLAMA_LOG_WARN("%s: could not validate Core ML sidecar: %s\n", __func__, failure.what());
+        return false;
+    }
     coreml = std::move(next);
     LLAMA_LOG_INFO("%s: Core ML enabled for compatible mean-pooled token batches\n", __func__);
     return true;
@@ -1762,7 +1818,8 @@ bool llama_context::encode_coreml(const llama_ubatch & ubatch) {
         for (const auto & entry : tokens) {
             sequences.push_back({entry.second.data(), (int32_t) entry.second.size()});
         }
-        std::vector<float> output(sequences.size() * 768);
+        const size_t dimension = model.hparams.n_embd_out();
+        std::vector<float> output(sequences.size() * dimension);
         char error[1024] = {};
         if (llama_coreml_embedding_encode(coreml.get(), sequences.data(), (int32_t) sequences.size(), true,
                 output.data(), output.size(), error, sizeof(error)) != 0) {
@@ -1773,7 +1830,7 @@ bool llama_context::encode_coreml(const llama_ubatch & ubatch) {
         std::map<llama_seq_id, std::vector<float>> result;
         size_t row = 0;
         for (const auto & entry : tokens) {
-            result[entry.first].assign(output.begin() + row * 768, output.begin() + (row + 1) * 768);
+            result[entry.first].assign(output.begin() + row * dimension, output.begin() + (row + 1) * dimension);
             ++row;
         }
         embd_seq.swap(result);

@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cerrno>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -268,12 +269,31 @@ static llama_coreml_embedding * load_embedding(const char * directory, char * er
                 NSURL * package = [NSURL fileURLWithPath:[path stringByAppendingPathComponent:@"EmbeddingGemma2Text.mlpackage"]];
                 NSURL * temporary = [MLModel compileModelAtURL:package error:&failure];
                 if (!temporary) { throw ml_error(failure); }
-                if (![[NSFileManager defaultManager] copyItemAtURL:temporary toURL:compiled error:&failure]) {
-                    throw ml_error(failure);
+                NSFileManager * files = [NSFileManager defaultManager];
+                NSURL * staging = [NSURL fileURLWithPath:[compiled.path stringByAppendingFormat:@".%@.tmp", NSUUID.UUID.UUIDString]];
+                try {
+                    if (![files copyItemAtURL:temporary toURL:staging error:&failure]) {
+                        throw ml_error(failure);
+                    }
+                    if (rename(staging.path.fileSystemRepresentation, compiled.path.fileSystemRepresentation) != 0) {
+                        const int code = errno;
+                        check((code == EEXIST || code == ENOTEMPTY) && [files fileExistsAtPath:compiled.path], strerror(code));
+                    }
+                } catch (...) {
+                    [files removeItemAtURL:staging error:nullptr];
+                    [files removeItemAtURL:temporary error:nullptr];
+                    throw;
                 }
+                [files removeItemAtURL:staging error:nullptr];
+                [files removeItemAtURL:temporary error:nullptr];
             }
             ctx->url = compiled;
-            if (raw) { ctx->single[0].load(ctx->url, lengths[0], false, nil, true); }
+            if (raw) {
+                for (int i = 0; i < 6; ++i) {
+                    ctx->single[i].load(ctx->url, lengths[i], false, nil, true);
+                }
+                ctx->packed.load(ctx->url, 256, true, nil, true);
+            }
             return ctx.release();
         } catch (const std::exception & failure) {
             set_error(error, error_size, failure.what());
@@ -373,25 +393,30 @@ int32_t llama_coreml_embedding_encode(llama_coreml_embedding * ctx,
                     slot->pending = true;
                     dispatch_semaphore_t completion = slot->semaphore;
                     // Each pending request owns its buffers until completion.
-                    [function->model predictionFromFeatures:buffer->input completionHandler:^(id<MLFeatureProvider> result, NSError * failure) {
-                        @autoreleasepool {
-                            const auto output_begin = std::chrono::steady_clock::now();
-                            try {
-                                if (!result) { throw ml_error(failure); }
-                                buffer->extract(result, count, destination);
-                                const auto output_end = std::chrono::steady_clock::now();
-                                ++slot->stats.calls;
-                                slot->stats.preparation_ms += std::chrono::duration<double, std::milli>(prediction_begin - preparation_begin).count();
-                                slot->stats.prediction_ms += std::chrono::duration<double, std::milli>(output_begin - prediction_begin).count();
-                                slot->stats.output_ms += std::chrono::duration<double, std::milli>(output_end - output_begin).count();
-                            } catch (const std::exception & error) {
-                                slot->failure = error.what();
-                            } catch (...) {
-                                slot->failure = "Core ML callback failed";
+                    if (@available(macOS 15.0, iOS 18.0, *)) {
+                        [function->model predictionFromFeatures:buffer->input completionHandler:^(id<MLFeatureProvider> result, NSError * failure) {
+                            @autoreleasepool {
+                                const auto output_begin = std::chrono::steady_clock::now();
+                                try {
+                                    if (!result) { throw ml_error(failure); }
+                                    buffer->extract(result, count, destination);
+                                    const auto output_end = std::chrono::steady_clock::now();
+                                    ++slot->stats.calls;
+                                    slot->stats.preparation_ms += std::chrono::duration<double, std::milli>(prediction_begin - preparation_begin).count();
+                                    slot->stats.prediction_ms += std::chrono::duration<double, std::milli>(output_begin - prediction_begin).count();
+                                    slot->stats.output_ms += std::chrono::duration<double, std::milli>(output_end - output_begin).count();
+                                } catch (const std::exception & error) {
+                                    slot->failure = error.what();
+                                } catch (...) {
+                                    slot->failure = "Core ML callback failed";
+                                }
                             }
-                        }
-                        dispatch_semaphore_signal(completion);
-                    }];
+                            dispatch_semaphore_signal(completion);
+                        }];
+                    } else {
+                        slot->pending = false;
+                        throw std::runtime_error("asynchronous prediction requires macOS 15 or iOS 18");
+                    }
                 }
                 i += count;
             }

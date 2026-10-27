@@ -32,12 +32,10 @@ include = [
 unsupported-operator = "ignore"
 not-subscriptable = "ignore"
 
-# These tools use the separate, pinned Core ML export environment.
+# The exporter uses its separate, pinned Core ML environment.
 [[overrides]]
 include = [
-    "./examples/embedding-coreml/expand_pack16.py",
     "./examples/embedding-coreml/export_coreml.py",
-    "./examples/embedding-coreml/palettize_pack.py",
 ]
 
 [overrides.rules]
