@@ -232,6 +232,9 @@ cmake --build build -j$(nproc)
 - `GGML_XDNA_GEMM_PYTHON` overrides the interpreter used for the kernel build.
 - `GGML_OPENMP=ON` is recommended: the weight packing and the host fallback are
   OpenMP loops.
+- `GGML_CPU` has to stay on (the default) unless `GGML_BACKEND_DL=ON`: the host
+  ops inside an NPU chunk run on the CPU backend, and only a DL build compiles
+  the backend its own copy. The configure stops otherwise.
 - `GGML_XDNA_GATED_FMT` (default 1) selects the activation layout the gated
   stage writes: `0` is the 4-bit form for a `Q4_K` `ssm_out`, `1` the 8-bit form
   for `Q5_K`/`Q6_K`. It is compiled into the artifact and into the backend, and
