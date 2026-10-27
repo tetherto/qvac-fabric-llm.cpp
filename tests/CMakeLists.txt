@@ -631,7 +631,7 @@ if (GGML_XDNA)
     llama_build_and_test(test-xdna-state.cpp        LABEL "model")
     # The host-only backend tests are built with the backend
     # (ggml/src/ggml-xdna/CMakeLists.txt); they need no model and no device.
-    foreach(t test-xdna-repack)
+    foreach(t test-xdna-repack test-xdna-head-rows)
         if (TARGET ${t})
             add_test(NAME ${t} COMMAND ${t} ${CMAKE_RUNTIME_OUTPUT_DIRECTORY})
         endif()
