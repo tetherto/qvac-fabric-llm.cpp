@@ -5565,6 +5565,84 @@ void check_turbovec_1x_failed_add_then_sync() {
     std::filesystem::remove(path);
 }
 
+// A sync that fails keeps its binding, so the retry still refuses a file
+// another writer committed to in the meantime instead of rewriting it with
+// that writer's commits lost.
+void check_turbovec_1x_failed_sync_keeps_binding() {
+    constexpr int dim = 32;
+    const std::vector<float> rows = tv1x_rows(kTv1xSeedDb, 128, dim);
+    const std::vector<uint64_t> ids = tv1x_ids(128);
+    const std::string path = (std::filesystem::temp_directory_path() / "ggml-vector-index-tv1x-failed-sync.tvim").string();
+    auto add = [&](ggml_vec_index_t * idx, size_t from, size_t to) {
+        CHECK(ggml_vec_index_add(idx, rows.data() + from * dim, static_cast<int>(to - from), ids.data() + from) ==
+              GGML_VEC_INDEX_OK);
+    };
+    // Another handle loads the file, removes ids[0] and commits.
+    auto commit_remove_elsewhere = [&]() {
+        auto * other = ggml_vec_index_load(path.c_str());
+        CHECK(other != nullptr);
+        CHECK(ggml_vec_index_remove(other, ids[0]) == GGML_VEC_INDEX_OK);
+        CHECK(ggml_vec_index_sync(other, path.c_str()) == GGML_VEC_INDEX_OK);
+        ggml_vec_index_free(other);
+    };
+    auto check_removal_kept = [&](int64_t len) {
+        auto * reloaded = ggml_vec_index_load(path.c_str());
+        CHECK(reloaded != nullptr);
+        CHECK(ggml_vec_index_len(reloaded) == len);
+        CHECK(ggml_vec_index_contains(reloaded, ids[0]) == 0);
+        ggml_vec_index_free(reloaded);
+    };
+
+    // Out of memory before anything is written, after another commit.
+    {
+        std::filesystem::remove(path);
+        auto * tv = ggml_vec_index_create_turbovec(dim, 2);
+        add(tv, 0, 64);
+        CHECK(ggml_vec_index_sync(tv, path.c_str()) == GGML_VEC_INDEX_OK);
+        commit_remove_elsewhere();
+        ggml_vec_index_test_set_oom_countdown(0);
+        CHECK(ggml_vec_index_sync(tv, path.c_str()) == GGML_VEC_INDEX_E_OOM);
+        ggml_vec_index_test_set_oom_countdown(-1);
+        CHECK(ggml_vec_index_sync(tv, path.c_str()) == GGML_VEC_INDEX_E_IO);
+        check_removal_kept(63);
+        ggml_vec_index_free(tv);
+    }
+    // A write that fails partway, then another commit at the same
+    // generation the failed sync was writing.
+    {
+        std::filesystem::remove(path);
+        auto * tv = ggml_vec_index_create_turbovec(dim, 2);
+        add(tv, 0, 64);
+        CHECK(ggml_vec_index_sync(tv, path.c_str()) == GGML_VEC_INDEX_OK);
+        add(tv, 64, 96);
+        ggml_vec_index_test_set_write_fail_after(8);
+        CHECK(ggml_vec_index_sync(tv, path.c_str()) == GGML_VEC_INDEX_E_IO);
+        ggml_vec_index_test_set_write_fail_after(-1);
+        commit_remove_elsewhere();
+        CHECK(ggml_vec_index_sync(tv, path.c_str()) == GGML_VEC_INDEX_E_IO);
+        check_removal_kept(63);
+        ggml_vec_index_free(tv);
+    }
+    // With no other writer, the retry commits everything.
+    {
+        std::filesystem::remove(path);
+        auto * tv = ggml_vec_index_create_turbovec(dim, 2);
+        add(tv, 0, 64);
+        CHECK(ggml_vec_index_sync(tv, path.c_str()) == GGML_VEC_INDEX_OK);
+        add(tv, 64, 96);
+        ggml_vec_index_test_set_write_fail_after(8);
+        CHECK(ggml_vec_index_sync(tv, path.c_str()) == GGML_VEC_INDEX_E_IO);
+        ggml_vec_index_test_set_write_fail_after(-1);
+        CHECK(ggml_vec_index_sync(tv, path.c_str()) == GGML_VEC_INDEX_OK);
+        auto * reloaded = ggml_vec_index_load(path.c_str());
+        CHECK(reloaded != nullptr);
+        CHECK(ggml_vec_index_len(reloaded) == 96);
+        ggml_vec_index_free(reloaded);
+        ggml_vec_index_free(tv);
+    }
+    std::filesystem::remove(path);
+}
+
 // A commit header that reaches disk before its data is detected and the
 // load falls back; the recovered index's next commit wipes the abandoned
 // header before reusing its slot.
@@ -5749,6 +5827,7 @@ int main(int argc, char ** argv) {
             check_turbovec_1x_rotation_and_codebooks();
             check_turbovec_1x_torn_sync();
             check_turbovec_1x_failed_add_then_sync();
+            check_turbovec_1x_failed_sync_keeps_binding();
             check_turbovec_1x_reordered_and_stale_commits();
             check_tqplus_deterministic_layout(
                 2,
