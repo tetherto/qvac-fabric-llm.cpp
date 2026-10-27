@@ -11,6 +11,10 @@
 #include <string>
 #include <thread>
 
+#ifdef GGML_USE_OPENMP
+#    include <omp.h>
+#endif
+
 // f32 -> bf16, round to nearest even. The device side is bf16 throughout.
 //
 // The integer form, not ggml_fp32_to_bf16_row: that is scalar unless the
@@ -41,6 +45,15 @@ static inline float xdna_exp2_poly(float f) {
 static inline int xdna_host_threads() {
     static const int n = std::max(1, std::min(16, (int) std::thread::hardware_concurrency() / 2));
     return n;
+}
+
+// This thread's number in its OpenMP team; 0 outside one or without OpenMP.
+static inline int xdna_omp_thread() {
+#ifdef GGML_USE_OPENMP
+    return omp_get_thread_num();
+#else
+    return 0;
+#endif
 }
 
 // Round a size up to a multiple of `a`, the 4 KB device buffer granularity by

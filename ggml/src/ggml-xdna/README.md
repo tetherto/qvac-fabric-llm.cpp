@@ -46,14 +46,24 @@ to requantize `ssm_out` (see Build). `GGML_XDNA_FUSED_LAYER=0` is a bisection
 switch, not a way to run a model this layer refuses.
 
 The designs are also built for one residual width (1024, `XDNA_RES_D`). A model
-whose residual stream is wider - Qwen3.5-2B is 2048 - cannot be handed a
-recurrent layer at all: its decode falls back by itself and stays on the array
-as far as the width allows. The recurrent bodies (conv, GDN, norms, GLU) run on
-the host, while the projections keep the decode GEMV on the same array, the
-decode attention stays on the pool and the head goes where `GGML_XDNA_HEAD`
-puts it. One warning names the width when it happens.
-`GGML_XDNA_FUSED_LAYER=0` still forces the per-op path for a model the fused
-design does cover.
+whose residual stream is wider - Qwen3.5-2B is 2048, the 4B 2560, the 9B 4096 -
+cannot be handed a recurrent layer at all, and one warning names the width when
+it happens. Its prefill keeps the array as far as the kernels take its shapes.
+Its decode (one token a sequence) runs whole on the host instead, because the
+decode GEMV streams weights at ~31 GB/s, less than the host's cores draw.
+`GGML_XDNA_HOST_DECODE_THREADS` (8) threads compute it, pinned one a core and
+filling one L3 domain before the next, so the other domain idles. Spreading
+them over both domains decodes faster but costs more energy a token. Against
+the array's per-op decode on a Ryzen AI MAX+ 395, the 4B Q4_K_M goes from 8.9
+to 17.6 t/s at 2.5 instead of 3.0 J a token, the 9B Q4_K_M from 6.0 to 10.4
+t/s at 4.0 instead of 4.7 J, and the 9B Q8_0 from 6.3 to 6.6 t/s at 6.1
+instead of 10.2 J.
+
+`GGML_XDNA_HOST_DECODE_THREADS=0` keeps that decode on the array per op: the
+recurrent bodies (conv, GDN, norms, GLU) run on the host, the projections on
+the decode GEMV, the decode attention on the pool, and the head goes where
+`GGML_XDNA_HEAD` puts it. `GGML_XDNA_FUSED_LAYER=0` still forces the per-op
+path for a model the fused design does cover.
 
 ### Prefill ops
 
@@ -323,6 +333,8 @@ For users - a trade-off, a size or a location:
 | `GGML_XDNA_SPIN_US` | 0 | poll this many microseconds for completion before blocking; `-1` polls until it completes |
 | `GGML_XDNA_GLUE_THREADS` | 4 | host threads for the ops the backend runs on the host in a decode-sized chunk, except the vocabulary projection, which takes 12 (at most `GGML_XDNA_GLUE_THREADS_BIG`) |
 | `GGML_XDNA_GLUE_THREADS_BIG` | 16 | the same, for a chunk of 32 tokens or more |
+| `GGML_XDNA_HOST_DECODE_THREADS` | 8 | host threads for the decode of a model wider than the fused layers (see [The fused decode recurrent layer](#the-fused-decode-recurrent-layer)); `0` runs that decode per op on the array, slower at more energy a token |
+| `GGML_XDNA_HOST_DECODE_PIN` | 1 | in an OpenMP build, pins those threads one a core, filling one L3 domain before the next, and hands every borrowed thread its CPU mask back after each decode; `0` leaves their placement to the OS, at more energy a token (2.75 against 2.45 J on the 4B) |
 | `GGML_XDNA_ARENA_MB` | 256 | size of each chunk of the device-buffer arena, in MiB |
 | `GGML_XDNA_CONV` | 0 | `1` runs the standalone prefill `SSM_CONV` on the array; the host is cheaper, which is why it is off |
 | `GGML_XDNA_GDN_CONV` | 0 | `1` computes the prefill GDN's conv input on the array; the host is faster, which is why it is off |
