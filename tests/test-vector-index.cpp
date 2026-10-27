@@ -30,10 +30,12 @@
 #include <utility>
 #include <vector>
 
-#if (defined(__x86_64__) || defined(__i386__)) && (defined(__GNUC__) || defined(__clang__))
-#include <cpuid.h>
-#elif defined(_MSC_VER) && defined(_M_X64)
+// Same order as the library's CPU detection: Clang targeting the MSVC ABI
+// defines both _MSC_VER and __clang__, and has no libgcc CPU-model runtime.
+#if (defined(__x86_64__) || defined(_M_X64)) && defined(_MSC_VER)
 #include <intrin.h>
+#elif (defined(__x86_64__) || defined(__i386__)) && (defined(__GNUC__) || defined(__clang__))
+#include <cpuid.h>
 #endif
 
 #ifdef _WIN32
@@ -4679,21 +4681,13 @@ bool tv1x_vpermb_index(const ggml_vec_index_t * idx, int bits) {
 
 #ifndef GGML_VEC_INDEX_TEST_HOOKS
 bool tv1x_vpermb_host() {
-#if (defined(__x86_64__) || defined(_M_X64)) && (defined(__GNUC__) || defined(__clang__))
-    for (const char * name : { "TURBOVEC_NO_VECTOR_MAJOR", "TURBOVEC_NO_VNNI" }) {
-        const char * value = std::getenv(name);
-        if (value != nullptr && std::strcmp(value, "0") != 0) {
-            return false;
-        }
-    }
-    __builtin_cpu_init();
-    unsigned eax = 0, ebx = 0, ecx = 0, edx = 0;
-    if (!__builtin_cpu_supports("avx512f") || __get_cpuid_count(7, 0, &eax, &ebx, &ecx, &edx) == 0) {
+#if defined(_M_X64) && defined(_MSC_VER)
+    int regs[4] = {};
+    __cpuidex(regs, 1, 0);
+    // _xgetbv faults unless the OS enabled XSAVE.
+    if ((static_cast<unsigned>(regs[2]) & (1u << 27)) == 0) {
         return false;
     }
-    return (ebx & (1u << 30)) != 0 && (ecx & (1u << 1)) != 0 && (ecx & (1u << 11)) != 0;
-#elif defined(_M_X64)
-    int regs[4] = {};
     __cpuidex(regs, 7, 0);
     const unsigned ebx = static_cast<unsigned>(regs[1]);
     const unsigned ecx = static_cast<unsigned>(regs[2]);
@@ -4706,6 +4700,19 @@ bool tv1x_vpermb_host() {
     // As the library: AVX-512 needs the OS to save the opmask and ZMM state.
     return (ebx & (1u << 16)) != 0 && (ebx & (1u << 30)) != 0 && (ecx & (1u << 1)) != 0 &&
            (ecx & (1u << 11)) != 0 && (_xgetbv(0) & 0xe6) == 0xe6;
+#elif defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
+    for (const char * name : { "TURBOVEC_NO_VECTOR_MAJOR", "TURBOVEC_NO_VNNI" }) {
+        const char * value = std::getenv(name);
+        if (value != nullptr && std::strcmp(value, "0") != 0) {
+            return false;
+        }
+    }
+    __builtin_cpu_init();
+    unsigned eax = 0, ebx = 0, ecx = 0, edx = 0;
+    if (!__builtin_cpu_supports("avx512f") || __get_cpuid_count(7, 0, &eax, &ebx, &ecx, &edx) == 0) {
+        return false;
+    }
+    return (ebx & (1u << 30)) != 0 && (ecx & (1u << 1)) != 0 && (ecx & (1u << 11)) != 0;
 #else
     return false;
 #endif
