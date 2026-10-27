@@ -86,6 +86,10 @@ public:
     // overwrites the slot it replays from. rollback then only changes how many rows get replayed.
     bool    gdn_deferred = false;
     bool    gdn_inplace  = false; // update the base states in place
+
+    // the graph takes ragged ubatches (llama_batch_allocr::split_ragged): the conv and gated delta net ops
+    // get per-sequence token ranges, so one ubatch can mix sequences of different lengths
+    bool    rs_ragged    = false;
     int64_t gdn_rec_size = 0; // floats per record slot
 
     int64_t gdn_conv_channels() const { return hparams.ssm_d_inner + 2*hparams.ssm_n_group*hparams.ssm_d_state; }

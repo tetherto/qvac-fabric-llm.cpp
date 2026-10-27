@@ -305,6 +305,9 @@ public:
     ggml_tensor * rec_idx           = nullptr; // I32 [3, n_seqs] {pending, read_row, write_row}
     bool          s_base_inplace    = false;   // the base states are read and written in place (s_copy_moved)
 
+    // ragged ubatches (llama_ubatch::seq_off), else null
+    ggml_tensor * seq_off = nullptr; // I32 [n_seqs + 1]
+
     const llama_memory_recurrent_context * mctx;
 
     // used in view offsets, need to match for valid graph reuse
