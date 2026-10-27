@@ -61,7 +61,7 @@ per-op path for a model the fused design does cover.
 | `SSM_CONV`, from 64 tokens | `kernels/conv.py` | opt-in, `GGML_XDNA_CONV=1`; the host is cheaper and is what runs otherwise |
 | the prefill GDN's conv input | `kernels/gdn_conv.py` | opt-in, `GGML_XDNA_GDN_CONV=1`; the host is faster (pp512 1900 against 1680 t/s on the 0.8B) and is what runs otherwise |
 | `GATED_DELTA_NET` | `kernels/gdn_mm.py` | on, `GGML_XDNA_GDN_MM=0` for the host |
-| `FLASH_ATTN_EXT` | `kernels/attn_mm.py` | on, `GGML_XDNA_FA_MM=0` for the host |
+| `FLASH_ATTN_EXT`, above 512 x 512 (token, key) pairs a call | `kernels/attn_mm.py` | on, `GGML_XDNA_FA_MM=0` for the host; up to that the host is quicker at no more energy a token |
 
 ### Everything else
 
@@ -325,7 +325,7 @@ For users - a trade-off, a size or a location:
 
 For bisecting a regression - each `0` turns off the NPU route it names, and the
 host (or a less fused path) runs it instead. They are for narrowing down a bug
-report, not for tuning: every one is slower than the default.
+report, not for tuning: every one costs more time or energy than the default.
 
 | variable | `0` turns off |
 | :-- | :-- |
