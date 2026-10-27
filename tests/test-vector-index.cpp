@@ -4821,6 +4821,53 @@ void check_turbovec_1x_dims() {
     }
 }
 
+// A v8 file is read only as far as its geometry and a CRC-checked header
+// declare, so a sparse file with a huge apparent size costs no memory,
+// whether its metadata is valid or not.
+void check_turbovec_1x_sparse_load() {
+    constexpr int dim = 32;
+    const std::vector<float> rows = tv1x_rows(kTv1xSeedDb, 64, dim);
+    const std::vector<uint64_t> ids = tv1x_ids(64);
+    const std::string path = (std::filesystem::temp_directory_path() / "ggml-vector-index-tv1x-sparse.tvim").string();
+    std::filesystem::remove(path);
+    auto * tv = ggml_vec_index_create_turbovec(dim, 2);
+    CHECK(ggml_vec_index_add(tv, rows.data(), 64, ids.data()) == GGML_VEC_INDEX_OK);
+    CHECK(ggml_vec_index_write(tv, path.c_str()) == GGML_VEC_INDEX_OK);
+    ggml_vec_index_free(tv);
+    const std::vector<uint8_t> image = read_file_bytes(path);
+    auto write_sparse = [&](const std::vector<uint8_t> & bytes) {
+        write_file_bytes(path, bytes);
+        std::error_code ec;
+        std::filesystem::resize_file(path, uintmax_t{ 1 } << 40, ec);
+        return !ec;
+    };
+    if (!write_sparse(image)) {
+        std::printf("SKIP TurboVec sparse load: no sparse files here\n");
+        std::filesystem::remove(path);
+        return;
+    }
+    auto * loaded = ggml_vec_index_load(path.c_str());
+    CHECK(loaded != nullptr);
+    CHECK(ggml_vec_index_len(loaded) == 64);
+    ggml_vec_index_free(loaded);
+
+    // An invalid dimension.
+    std::vector<uint8_t> bad = image;
+    put_u32_le(bad, 8, 7);
+    CHECK(write_sparse(bad));
+    ggml_vec_index_t * out = nullptr;
+    CHECK(ggml_vec_index_load_ex(path.c_str(), &out) == GGML_VEC_INDEX_E_IO);
+    CHECK(out == nullptr);
+    // A huge row count in the only header, whose CRC then fails.
+    bad = image;
+    const size_t sb_len = 24 + 3 * 4 + 4 * 4 + 4 + 4;
+    write_u64_le_at(bad, sb_len + 8, uint64_t{ 1 } << 34);
+    CHECK(write_sparse(bad));
+    CHECK(ggml_vec_index_load_ex(path.c_str(), &out) == GGML_VEC_INDEX_E_IO);
+    CHECK(out == nullptr);
+    std::filesystem::remove(path);
+}
+
 void check_turbovec_1x() {
     for (const Tv1xIndexCase & c : kTv1xIndexCases) {
         check_turbovec_1x_golden_case(c);
@@ -4828,6 +4875,7 @@ void check_turbovec_1x() {
     check_turbovec_1x_snapshot_interop();
     check_turbovec_1x_calibrate_api();
     check_turbovec_1x_dims();
+    check_turbovec_1x_sparse_load();
 }
 
 }  // namespace
