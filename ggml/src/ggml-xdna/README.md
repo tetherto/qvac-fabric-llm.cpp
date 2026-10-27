@@ -46,13 +46,24 @@ to requantize `ssm_out` (see Build). `GGML_XDNA_FUSED_LAYER=0` is a bisection
 switch, not a way to run a model this layer refuses.
 
 The designs are also built for one residual width (1024, `XDNA_RES_D`). A model
-whose residual stream is wider - Qwen3.5-2B is 2048 - cannot be handed a
-recurrent layer at all: its decode falls back by itself and stays on the array
-as far as the width allows. The recurrent bodies (conv, GDN, norms, GLU) run on
-the host, while the projections keep the decode GEMV on the same array, the
-decode attention stays on the pool and the head stays on the array. One warning
-names the width when it happens. `GGML_XDNA_FUSED_LAYER=0` still forces the
-per-op path for a model the fused design does cover.
+whose residual stream is wider - Qwen3.5-2B is 2048, the 4B 2560, the 9B 4096 -
+cannot be handed a recurrent layer at all, and one warning names the width when
+it happens. Its prefill keeps the array as far as the kernels take its shapes.
+Its decode (one token a sequence) runs whole on the host instead, because the
+decode GEMV streams weights at ~31 GB/s, less than the host's cores draw.
+`GGML_XDNA_HOST_DECODE_THREADS` (8) threads compute it, pinned one a core and
+filling one L3 domain before the next, so the other domain idles. Spreading
+them over both domains decodes faster but costs more energy a token. Against
+the array's per-op decode on a Ryzen AI MAX+ 395, the 4B Q4_K_M goes from 8.9
+to 17.6 t/s at 2.5 instead of 3.0 J a token, the 9B Q4_K_M from 6.0 to 10.4
+t/s at 4.0 instead of 4.7 J, and the 9B Q8_0 from 6.3 to 6.6 t/s at 6.1
+instead of 10.2 J.
+
+`GGML_XDNA_HOST_DECODE_THREADS=0` keeps that decode on the array per op: the
+recurrent bodies (conv, GDN, norms, GLU) run on the host, the projections on
+the decode GEMV, the decode attention on the pool, and the head goes where
+`GGML_XDNA_HEAD` puts it. `GGML_XDNA_FUSED_LAYER=0` still forces the per-op
+path for a model the fused design does cover.
 
 ### Prefill ops
 
@@ -60,8 +71,8 @@ per-op path for a model the fused design does cover.
 | :-- | :-- | :-- |
 | `SSM_CONV`, from 64 tokens | `kernels/conv.py` | opt-in, `GGML_XDNA_CONV=1`; the host is cheaper and is what runs otherwise |
 | the prefill GDN's conv input | `kernels/gdn_conv.py` | opt-in, `GGML_XDNA_GDN_CONV=1`; the host is faster (pp512 1900 against 1680 t/s on the 0.8B) and is what runs otherwise |
-| `GATED_DELTA_NET` | `kernels/gdn_mm.py` | on, `GGML_XDNA_GDN_MM=0` for the host |
-| `FLASH_ATTN_EXT` | `kernels/attn_mm.py` | on, `GGML_XDNA_FA_MM=0` for the host |
+| `GATED_DELTA_NET`, from 144 tokens a sequence | `kernels/gdn_mm.py` | on, `GGML_XDNA_GDN_MM=0` for the host; below 144 the host is quicker at less energy a token |
+| `FLASH_ATTN_EXT`, above 512 x 512 (token, key) pairs a call | `kernels/attn_mm.py` | on, `GGML_XDNA_FA_MM=0` for the host; up to that the host is quicker at no more energy a token |
 
 ### Everything else
 
@@ -73,7 +84,8 @@ between NPU dispatches. `GGML_XDNA_GLUE=0` claims only the native NPU ops.
 
 The glue runs on its own CPU backend with its own pool: `GGML_XDNA_GLUE_THREADS`
 (4) for decode-sized chunks, `GGML_XDNA_GLUE_THREADS_BIG` (16) once a chunk has
-32 tokens or more. `-t` does not size it.
+32 tokens or more, and 12 (at most `GGML_XDNA_GLUE_THREADS_BIG`) for a decode's
+vocabulary projection. `-t` does not size it.
 
 ## How it works
 
@@ -147,7 +159,7 @@ lifetime, keyed by the tensor's data pointer and shape.
 
 #### 4-bit decode weights (on by default)
 
-Two steps are lossy, and both are on by default by design. The first: for the single-token
+One step is lossy, and it is on by default by design: for the single-token
 decode, every `Q5_K` or `Q6_K` weight named `attn_qkv` or `attn_v` is
 re-quantized to `Q4_K` from its dequantized values when it is packed, and the
 decode GEMV streams it at 4 bits (q4g32) instead of the exact 8-bit form. That
@@ -171,13 +183,15 @@ It does not touch:
 - a comma-separated list (`GGML_XDNA_W4=attn_v`): the `Q5_K`/`Q6_K` weights it
   applies to, by the last part of their name (`blk.N.<name>.weight`).
 
-The decode head (the vocabulary projection on the array) is the other lossy
-default, on the same terms: its first 65536 vocabulary rows - a byte-pair
-vocabulary's most frequent tokens - stay at 8 bits and the rest are 4-bit.
-Against the CPU's `Q6_K` head on the 0.8B that is a head KLD of 0.0052, where
-every row at 4 bits would be 0.0165. `GGML_XDNA_HEAD_EXACT_ROWS` sets the
-number of exact rows (`0`: all 4-bit); `GGML_XDNA_HEAD=0` takes the head off
-the array altogether.
+The decode head (the vocabulary projection) runs on the host by default, on
+12 glue threads, in the model's own format: exact, and quicker than the array
+on the 0.8B (tg256 57.8 against 51.4 t/s, at 0.454 against 0.437 J a token
+of package energy). `GGML_XDNA_HEAD=1` puts it on the array, where it is
+lossy: its first 65536 vocabulary rows - a byte-pair vocabulary's most
+frequent tokens - stay at 8 bits and the rest are 4-bit. Against the CPU's
+`Q6_K` head on the 0.8B that is a head KLD of 0.0052, where every row at 4 bits
+would be 0.0165. `GGML_XDNA_HEAD_EXACT_ROWS` sets the number of exact rows
+(`0`: all 4-bit).
 
 ### One decode token
 
@@ -313,11 +327,14 @@ For users - a trade-off, a size or a location:
 | variable | default | effect |
 | :-- | :-- | :-- |
 | `GGML_XDNA_W4` | `attn_qkv,attn_v` | the `Q5_K`/`Q6_K` weights the decode GEMV takes at 4 bits, a lossy default (see [4-bit decode weights](#4-bit-decode-weights-on-by-default)); empty keeps them at 8 bits |
-| `GGML_XDNA_HEAD_EXACT_ROWS` | 65536 | the vocabulary rows the decode head keeps at 8 bits, from row 0 (a byte-pair vocabulary's most frequent tokens); the rest are 4-bit. Head KLD against the CPU's Q6_K head on the 0.8B: 0.0052 at 65536, 0.0165 with `0` (all 4-bit) |
+| `GGML_XDNA_HEAD` | 0 | `1` runs the decode's vocabulary projection on the array instead of the host: lossy (see `GGML_XDNA_HEAD_EXACT_ROWS`) and slower on the 0.8B, with fewer host threads busy |
+| `GGML_XDNA_HEAD_EXACT_ROWS` | 65536 | with `GGML_XDNA_HEAD=1`, the vocabulary rows the decode head keeps at 8 bits, from row 0 (a byte-pair vocabulary's most frequent tokens); the rest are 4-bit. Head KLD against the CPU's Q6_K head on the 0.8B: 0.0052 at 65536, 0.0165 with `0` (all 4-bit) |
 | `GGML_XDNA_TOKEN` | 1 | how a token's queued runs go to the device: `1` as one joined command, `t > 1` at most `t` runs a command, `0` a command each - slightly faster decode at a higher package power (24.0 W at 50.9 t/s against 18.0 W at ~48 t/s with the default, 1k context) |
 | `GGML_XDNA_SPIN_US` | 0 | poll this many microseconds for completion before blocking; `-1` polls until it completes |
-| `GGML_XDNA_GLUE_THREADS` | 4 | host threads for the ops the backend runs on the host in a decode-sized chunk |
+| `GGML_XDNA_GLUE_THREADS` | 4 | host threads for the ops the backend runs on the host in a decode-sized chunk, except the vocabulary projection, which takes 12 (at most `GGML_XDNA_GLUE_THREADS_BIG`) |
 | `GGML_XDNA_GLUE_THREADS_BIG` | 16 | the same, for a chunk of 32 tokens or more |
+| `GGML_XDNA_HOST_DECODE_THREADS` | 8 | host threads for the decode of a model wider than the fused layers (see [The fused decode recurrent layer](#the-fused-decode-recurrent-layer)); `0` runs that decode per op on the array, slower at more energy a token |
+| `GGML_XDNA_HOST_DECODE_PIN` | 1 | in an OpenMP build, pins those threads one a core, filling one L3 domain before the next, and hands every borrowed thread its CPU mask back after each decode; `0` leaves their placement to the OS, at more energy a token (2.75 against 2.45 J on the 4B) |
 | `GGML_XDNA_ARENA_MB` | 256 | size of each chunk of the device-buffer arena, in MiB |
 | `GGML_XDNA_CONV` | 0 | `1` runs the standalone prefill `SSM_CONV` on the array; the host is cheaper, which is why it is off |
 | `GGML_XDNA_GDN_CONV` | 0 | `1` computes the prefill GDN's conv input on the array; the host is faster, which is why it is off |
@@ -325,14 +342,13 @@ For users - a trade-off, a size or a location:
 
 For bisecting a regression - each `0` turns off the NPU route it names, and the
 host (or a less fused path) runs it instead. They are for narrowing down a bug
-report, not for tuning: every one is slower than the default.
+report, not for tuning: every one costs more time or energy than the default.
 
 | variable | `0` turns off |
 | :-- | :-- |
 | `GGML_XDNA_FUSED_LAYER` | the fused decode layers (the per-op path runs). It does not run a model the fused layer refuses |
 | `GGML_XDNA_GEMV_GROUP` | the decode projections outside the fused layer, on the array |
 | `GGML_XDNA_GEMV_PROMOTE` | merging a decode GEMV group of mixed weight formats into one dispatch |
-| `GGML_XDNA_HEAD` | the decode's vocabulary projection on the array |
 | `GGML_XDNA_QUEUE` | queuing the fused layers: each one is waited for |
 | `GGML_XDNA_ATTN` | the decode attention on the array |
 | `GGML_XDNA_ATTN_LAYER` | a whole attention layer, the q/k/v projections to `l_out`, in one dispatch (the tail and the decode attention still run) |

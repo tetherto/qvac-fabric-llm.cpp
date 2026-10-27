@@ -24,6 +24,8 @@
 #    include "xdna-design-tag.h"
 #endif
 
+#include <pthread.h>
+#include <sched.h>
 #include <algorithm>
 #include <climits>
 #include <cmath>
@@ -225,7 +227,8 @@ static bool xdna_concat_fast(struct ggml_tensor * dst) {
 // this backend, so the small pool is what limits prefill. The size comes from
 // the chunk's tokens per sequence (xdna_glue_set_n_tokens), not from its rows:
 // the rows grow with the sequences sharing the graph, and what a request is
-// computed as must not depend on them.
+// computed as must not depend on them. The one decode exception is the
+// vocabulary projection on the host (XDNA_HEAD_THREADS).
 // SSM_CONV on the host (GGML_XDNA_CONV=0), in place of ggml's. ggml walks a
 // token at a time across every channel, and the conv input is channel-major,
 // n_t + 3 floats a channel: each of the 6144 channels of each token is a
@@ -381,6 +384,17 @@ static int xdna_glue_threads(bool prompt) {
     return prompt ? n_big : n_small;
 }
 
+// A decode's vocabulary projection on the host: on the 0.8B, 12 threads ran
+// 0.4% slower than 16 at 2.6% less energy a token.
+static constexpr int XDNA_HEAD_THREADS = 12;
+
+static int xdna_glue_n_threads(bool prompt, bool vocab) {
+    if (prompt || !vocab) {
+        return xdna_glue_threads(prompt);
+    }
+    return std::min(XDNA_HEAD_THREADS, xdna_glue_threads(true));
+}
+
 // Total activation rows of the chunk being computed (sequences x tokens per
 // sequence), read off the projections: every MUL_MAT activation is M rows of
 // K, and every decoder layer has at least one. This is the ubatch size, and
@@ -449,6 +463,24 @@ static ggml_cgraph * xdna_glue_cgraph(void) {
     return cg;
 }
 
+// A MUL_MAT against the vocabulary: the tied embedding or the output weight.
+static bool xdna_vocab_mm(const ggml_tensor * n) {
+    if (n->op != GGML_OP_MUL_MAT || !n->src[0] || !n->src[1] || n->src[0]->op != GGML_OP_NONE) {
+        return false;
+    }
+    const char * nm = ggml_get_name(n->src[0]);
+    return strcmp(nm, "token_embd.weight") == 0 || strcmp(nm, "output.weight") == 0;
+}
+
+static bool xdna_glue_has_vocab_mm(const std::vector<struct ggml_tensor *> & batch) {
+    for (const ggml_tensor * t : batch) {
+        if (xdna_vocab_mm(t)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 // Run `node` on the host from within the XDNA chunk. Flushes (waits) all
 // pending NPU submissions first, so the op sees the results of the NPU ops it
 // depends on. Returns false on failure or when the op is not glue-claimed.
@@ -469,7 +501,7 @@ static bool xdna_glue_host_run(xdna_ops * ops, const struct ggml_tensor * node) 
     if (!xdna_ops_finalize(ops)) {
         return false;
     }
-    ggml_backend_cpu_set_n_threads(cpu, xdna_glue_threads(g_glue_n_seq_tokens >= 32));
+    ggml_backend_cpu_set_n_threads(cpu, xdna_glue_n_threads(g_glue_n_seq_tokens >= 32, xdna_vocab_mm(node)));
     cg->n_nodes  = 1;
     cg->n_leafs  = 0;
     cg->nodes[0] = const_cast<struct ggml_tensor *>(node);
@@ -503,7 +535,7 @@ static bool xdna_glue_flush(xdna_ops * ops, std::vector<struct ggml_tensor *> & 
         batch.clear();
         return false;
     }
-    ggml_backend_cpu_set_n_threads(cpu, xdna_glue_threads(g_glue_n_seq_tokens >= 32));
+    ggml_backend_cpu_set_n_threads(cpu, xdna_glue_n_threads(g_glue_n_seq_tokens >= 32, xdna_glue_has_vocab_mm(batch)));
     size_t off = 0;
     while (off < batch.size()) {
         // a prompt's ops this backend runs faster itself go on their own, in
@@ -673,6 +705,9 @@ struct ggml_backend_xdna_context {
     std::map<const void *, xdna_model_objs> parked;
     // Models already told their buffers did not fit (one warning each).
     std::set<const void *>                 warned_mem;
+    // Whether each model's residual stream is wider than the fused designs'
+    // (xdna_wants_host_decode), once a chunk with a layer norm said so.
+    std::map<const void *, bool>           model_misfit;
     // The node the dispatch loop is on, so the exception boundary in
     // ggml_backend_xdna_graph_compute can name it. Null outside a graph.
     const struct ggml_tensor * cur_node   = nullptr;
@@ -733,25 +768,24 @@ static bool xdna_pending_wait(ggml_backend_xdna_context * ctx) {
     return !ctx->pending_failed;
 }
 
-// The decode's vocabulary projection on the NPU (GGML_XDNA_HEAD=0: host).
+// The decode's vocabulary projection on the NPU (GGML_XDNA_HEAD=1). Off by
+// default: the host runs it quicker, and exact.
 static bool xdna_head_on(void) {
     static const bool v = [] {
-        return xdna_env_int("GGML_XDNA_HEAD", 1) != 0;
+        return xdna_env_int("GGML_XDNA_HEAD", 0) != 0;
     }();
     return v;
 }
 
-// The head's MUL_MAT: the tied embedding (or the output weight) against one
-// normed row.
+// The head's MUL_MAT: the vocabulary against one normed row.
 static bool xdna_head_node(const ggml_tensor * n) {
-    if (n->op != GGML_OP_MUL_MAT || !n->src[0] || !n->src[1] || n->src[0]->op != GGML_OP_NONE) {
+    if (!xdna_vocab_mm(n)) {
         return false;
     }
-    const char *        nm = ggml_get_name(n->src[0]);
-    const ggml_tensor * x  = n->src[1];
-    return (strcmp(nm, "token_embd.weight") == 0 || strcmp(nm, "output.weight") == 0) && x->type == GGML_TYPE_F32 &&
-           ggml_nelements(x) == x->ne[0] && ggml_is_contiguous(x) && x->ne[0] == n->src[0]->ne[0] &&
-           n->type == GGML_TYPE_F32 && ggml_is_contiguous(n) && ggml_nelements(n) == n->src[0]->ne[1];
+    const ggml_tensor * x = n->src[1];
+    return x->type == GGML_TYPE_F32 && ggml_nelements(x) == x->ne[0] && ggml_is_contiguous(x) &&
+           x->ne[0] == n->src[0]->ne[0] && n->type == GGML_TYPE_F32 && ggml_is_contiguous(n) &&
+           ggml_nelements(n) == n->src[0]->ne[1];
 }
 
 namespace {
@@ -1692,14 +1726,9 @@ static bool xdna_attl_try(ggml_backend_xdna_context *               ctx,
     return true;
 }
 
-// Whether the fused designs can serve this graph at all. They are built for
-// one residual width (XDNA_RES_D): the rows the recurrent layers hand each
-// other, the transition tile and the tail's FFN pair all close on it, so a
-// model with a wider residual stream (a 2B Qwen3.5, say) cannot be handed a
-// layer. Its decode keeps the array - the projections through the GEMV groups,
-// the attention pool and the head - and leaves the recurrent bodies to the
-// host. Decided from the layer norms, the width every other shape follows.
-static bool xdna_rec_fits(const ggml_cgraph * cgraph) {
+// The residual width of this chunk's layers, read from a blk.N layer norm (every
+// other shape follows it); 0 when the chunk has none.
+static int64_t xdna_rec_width(const ggml_cgraph * cgraph) {
     for (int i = 0; i < cgraph->n_nodes; i++) {
         const ggml_tensor * n = cgraph->nodes[i];
         for (int s = 0; s < GGML_MAX_SRC && n->src[s]; s++) {
@@ -1712,26 +1741,204 @@ static bool xdna_rec_fits(const ggml_cgraph * cgraph) {
             if (!xdna_rec_blk(ggml_get_name(w), &il, &rest)) {
                 continue;
             }
-            if (strcmp(rest, "post_attention_norm.weight") != 0 && strcmp(rest, "attn_norm.weight") != 0) {
-                continue;
+            if (strcmp(rest, "post_attention_norm.weight") == 0 || strcmp(rest, "attn_norm.weight") == 0) {
+                return w->ne[0];
             }
-            if (w->ne[0] == XDNA_RES_D) {
-                return true;
-            }
-            static bool said = false;
-            if (!said) {
-                said = true;
-                GGML_LOG_WARN(
-                    "%s: the fused decode layers are built for a %d-wide residual stream, this model's "
-                    "is %d: the recurrent layers run on the host, the projections, the attention pool "
-                    "and the head keep the NPU\n",
-                    "ggml-xdna", XDNA_RES_D, (int) w->ne[0]);
-            }
-            return false;
         }
     }
-    // No layer norm of this chunk: leave the choice to the chunk that has one.
-    return true;
+    return 0;
+}
+
+// Host threads for the decode of a model the fused designs do not cover; 0
+// keeps that decode on the per-op NPU route.
+static constexpr int XDNA_HOST_DECODE_THREADS = 8;
+
+static int xdna_host_decode_threads(void) {
+    static const int n = std::max(0, xdna_env_int("GGML_XDNA_HOST_DECODE_THREADS", XDNA_HOST_DECODE_THREADS));
+    return n;
+}
+
+// Whether those threads are pinned (xdna_decode_cpus); 0 leaves them to the OS.
+// Only under OpenMP: a plain ggml threadpool keeps its pinned workers polling.
+static bool xdna_host_decode_pin(void) {
+#ifdef GGML_USE_OPENMP
+    static const bool on = xdna_env_int("GGML_XDNA_HOST_DECODE_PIN", 1) != 0;
+    return on;
+#else
+    return false;
+#endif
+}
+
+// The fused designs close on one residual width (XDNA_RES_D); a chunk without a
+// layer norm (d == 0) leaves the choice to one that has it.
+static bool xdna_width_fits(int64_t d) {
+    if (d == 0 || d == XDNA_RES_D) {
+        return true;
+    }
+    static bool said = false;
+    if (!said) {
+        said = true;
+        GGML_LOG_WARN("%s: the fused decode layers are built for a %d-wide residual stream, this model's is %d: %s\n",
+                      "ggml-xdna", XDNA_RES_D, (int) d,
+                      xdna_host_decode_threads() > 0 ?
+                          "its decode runs on the host" :
+                          "the recurrent layers run on the host, the projections and the attention pool keep the NPU");
+    }
+    return false;
+}
+
+static bool xdna_rec_fits(const ggml_cgraph * cgraph) {
+    return xdna_width_fits(xdna_rec_width(cgraph));
+}
+
+// A decode (one token a sequence) of a model the fused designs do not cover runs whole
+// on the host; the verdict is kept per model, as a chunk without a layer norm cannot tell.
+static bool xdna_wants_host_decode(ggml_backend_xdna_context * ctx, const ggml_cgraph * cgraph) {
+    if (g_glue_n_seq_tokens != 1 || xdna_host_decode_threads() == 0) {
+        return false;
+    }
+    const int64_t d = xdna_rec_width(cgraph);
+    if (d != 0) {
+        ctx->model_misfit[ctx->cur_model] = !xdna_width_fits(d);
+    }
+    const auto it = ctx->model_misfit.find(ctx->cur_model);
+    return it != ctx->model_misfit.end() && it->second;
+}
+
+static constexpr char XDNA_SYSFS_CPU[]      = "/sys/devices/system/cpu/cpu";
+static constexpr char XDNA_SYSFS_SIBLINGS[] = "/topology/thread_siblings_list";
+static constexpr char XDNA_SYSFS_L3_ID[]    = "/cache/index3/id";
+
+// The first integer in a sysfs file ("0,16" reads 0), or -1.
+static int xdna_sysfs_int(const std::string & path) {
+    FILE * f = fopen(path.c_str(), "r");
+    if (!f) {
+        return -1;
+    }
+    int v = -1;
+    if (fscanf(f, "%d", &v) != 1) {
+        v = -1;
+    }
+    fclose(f);
+    return v;
+}
+
+// A core by its first allowed hardware thread and its L3 domain.
+struct xdna_core {
+    int cpu;
+    int l3;
+};
+
+// Each core's first allowed CPU; empty when the topology cannot be read.
+static std::vector<xdna_core> xdna_allowed_cores(const cpu_set_t & allowed) {
+    std::vector<xdna_core> cores;
+    std::set<int>          seen;
+    for (int cpu = 0; cpu < std::min(CPU_SETSIZE, GGML_MAX_N_THREADS); cpu++) {
+        if (!CPU_ISSET(cpu, &allowed)) {
+            continue;
+        }
+        const std::string dir   = XDNA_SYSFS_CPU + std::to_string(cpu);
+        const int         first = xdna_sysfs_int(dir + XDNA_SYSFS_SIBLINGS);
+        const int         l3    = xdna_sysfs_int(dir + XDNA_SYSFS_L3_ID);
+        if (first < 0 || l3 < 0) {
+            return {};
+        }
+        if (seen.insert(first).second) {
+            cores.push_back({ cpu, l3 });
+        }
+    }
+    return cores;
+}
+
+// n allowed CPUs, one a core, filling one L3 domain before the next; empty when
+// there are fewer cores or no topology.
+static std::vector<int> xdna_decode_cpus(int n) {
+    cpu_set_t allowed;
+    if (sched_getaffinity(0, sizeof(allowed), &allowed) != 0) {
+        return {};
+    }
+    std::vector<xdna_core> cores = xdna_allowed_cores(allowed);
+    if ((int) cores.size() < n) {
+        return {};
+    }
+    std::stable_sort(cores.begin(), cores.end(), [](const xdna_core & a, const xdna_core & b) { return a.l3 < b.l3; });
+    std::vector<int> cpus(n);
+    std::transform(cores.begin(), cores.begin() + n, cpus.begin(), [](const xdna_core & c) { return c.cpu; });
+    return cpus;
+}
+
+static ggml_threadpool_t xdna_pinned_threadpool(const std::vector<int> & cpus) {
+    ggml_threadpool_params p = ggml_threadpool_params_default((int) cpus.size());
+    p.strict_cpu             = true;
+    std::for_each(cpus.begin(), cpus.end(), [&p](int c) { p.cpumask[c] = true; });
+    return ggml_threadpool_new(&p);
+}
+
+struct xdna_host_cpu {
+    ggml_backend_t backend = nullptr;
+    bool           pinned  = false;
+};
+
+// The host decode's CPU backend, its threads pinned one a core within one L3
+// domain while the others idle: less energy a token than spreading them.
+static const xdna_host_cpu & xdna_host_decode_cpu(void) {
+    static const xdna_host_cpu cpu = [] {
+        xdna_host_cpu h;
+        h.backend = ggml_backend_cpu_init();
+        if (h.backend == nullptr) {
+            return h;
+        }
+        const int n = xdna_host_decode_threads();
+        ggml_backend_cpu_set_n_threads(h.backend, n);
+        const std::vector<int> cpus = xdna_host_decode_pin() ? xdna_decode_cpus(n) : std::vector<int>();
+        if (!cpus.empty()) {
+            ggml_backend_cpu_set_threadpool(h.backend, xdna_pinned_threadpool(cpus));
+            h.pinned = true;
+        } else if (xdna_host_decode_pin()) {
+            GGML_LOG_WARN("%s: host decode threads left unpinned: fewer than %d cores or no CPU topology\n",
+                          "ggml-xdna", n);
+        }
+        return h;
+    }();
+    return cpu;
+}
+
+// Each thread's CPU mask by OpenMP thread number: the pinned decode borrows the
+// caller's OpenMP team and hands it back as it found it.
+static std::vector<cpu_set_t> xdna_affinity_save(int n) {
+    std::vector<cpu_set_t> masks(n);
+#ifdef GGML_USE_OPENMP
+#    pragma omp parallel num_threads(n)
+#endif
+    pthread_getaffinity_np(pthread_self(), sizeof(cpu_set_t), &masks[xdna_omp_thread()]);
+    return masks;
+}
+
+static void xdna_affinity_restore(const std::vector<cpu_set_t> & masks) {
+#ifdef GGML_USE_OPENMP
+#    pragma omp parallel num_threads((int) masks.size())
+#endif
+    pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &masks[xdna_omp_thread()]);
+}
+
+static enum ggml_status xdna_host_decode_run(ggml_backend_xdna_context * ctx, struct ggml_cgraph * cgraph) {
+    if (!xdna_ops_finalize(&ctx->ops) || !xdna_pending_wait(ctx)) {
+        ctx->pending_failed = false;
+        return GGML_STATUS_FAILED;
+    }
+    // the host rewrites cache rows the decode attention pool may hold
+    ctx->att_flushed.clear();
+    const std::vector<cpu_set_t> saved =
+        xdna_host_decode_pin() ? xdna_affinity_save(xdna_host_decode_threads()) : std::vector<cpu_set_t>();
+    const xdna_host_cpu & cpu = xdna_host_decode_cpu();
+    if (cpu.backend == nullptr) {
+        return GGML_STATUS_FAILED;
+    }
+    const enum ggml_status status = ggml_backend_graph_compute(cpu.backend, cgraph);
+    if (cpu.pinned) {
+        xdna_affinity_restore(saved);
+    }
+    return status;
 }
 
 // One pre-scan pass over a graph_compute node list; fills plans for every
@@ -2750,6 +2957,7 @@ static void xdna_model_use(ggml_backend_xdna_context * ctx, const void * model) 
 // releases it.
 static void xdna_model_drop(ggml_backend_xdna_context * ctx, const void * model) {
     std::lock_guard<std::recursive_mutex> compute(ctx->compute_mutex);
+    ctx->model_misfit.erase(model);
     if (model == ctx->cur_model) {
         xdna_model_objs_free(ctx);
         return;
@@ -2810,6 +3018,7 @@ static void xdna_release_model_state(ggml_backend_xdna_context * ctx) {
     }
     ctx->parked.clear();
     ctx->cur_model = nullptr;
+    ctx->model_misfit.clear();
     xdna_att_free(ctx->att);
     ctx->att = nullptr;
     ctx->att_flushed.clear();
@@ -3044,6 +3253,9 @@ static enum ggml_status xdna_graph_compute_impl(ggml_backend_xdna_context * ctx,
     // and steady/warm-up classification it sets. It wraps the entire rest of
     // this function via RAII (destructor fires on every return path).
     xdna_prof::call_timer xdna_prof_call(g_glue_n_tokens == 1);
+    if (xdna_wants_host_decode(ctx, cgraph)) {
+        return xdna_host_decode_run(ctx, cgraph);
+    }
 
     // Per-op NPU kernels are suppressed while the fused layer path is active
     // (default when the fused xclbins are present): the fused run owns the
