@@ -1002,7 +1002,12 @@ ggml_tensor * llama_model_glm5_next::graph::build_kpool_select(
             ggml_tensor * tail = hparams.indexer_kpool_select_tail ? inp_kpool->tail_idxs : nullptr;
             GGML_ASSERT(kpool*n_top_pool + (tail ? tail->ne[0] : 0) == (int64_t) inp_kpool->n_sel);
 
-            ggml_tensor * sel = build_fused_top_k_mask(kq_mask, top_k, score, inp_kpool->pool_idxs, tail, nullptr, il);
+            // fabric keeps the kq_mask values: the selection folds the causal mask before the shared layers reuse it
+            auto rows = [&](ggml_tensor * t) {
+                return t ? ggml_reshape_4d(ctx0, t, t->ne[0], kq_mask->ne[1], kq_mask->ne[2], kq_mask->ne[3]) : nullptr;
+            };
+            ggml_tensor * sel = ggml_top_k_mask(ctx0, kq_mask, rows(top_k), rows(score), inp_kpool->pool_idxs, rows(tail));
+            res->add_fused_node({LLM_FUSED_OP_TOP_K_MASK, sel, il});
             cb(sel, "indexer_sel", il);
 
             return sel;
