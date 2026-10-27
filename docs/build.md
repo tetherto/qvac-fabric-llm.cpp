@@ -160,7 +160,7 @@ When built with Metal support, you can explicitly disable GPU inference with the
 
 ## Core ML embeddings
 
-On macOS 15 / iOS 18, enable EmbeddingGemma 2 Core ML support with `-DLLAMA_COREML_EMBEDDING=ON`. The runtime is part of the `llama` library and can use CPU + Neural Engine; it requires a matching exported sidecar with raw pooled output. The embedding CLI and server select it with `--coreml-model DIR` and retain ggml fallback. See the [Core ML guide](../examples/embedding-coreml/README.md) for export, public API configuration, and validation.
+On macOS 15 / iOS 18, enable EmbeddingGemma 2 Core ML support with `-DLLAMA_COREML=ON`. The runtime is part of the `llama` library and can use CPU + Neural Engine; it requires a matching exported sidecar with raw pooled output. The embedding CLI and server select it with `--coreml-model DIR` and retain ggml fallback. See the [Core ML guide](../examples/embedding-coreml/README.md) for export, public API configuration, and validation.
 
 ## SYCL
 

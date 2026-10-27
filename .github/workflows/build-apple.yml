@@ -17,6 +17,7 @@ on:
       '**/*.cpp',
       '**/*.swift',
       '**/*.m',
+      '**/*.mm',
       '**/*.metal',
       'scripts/vector-index-package-smoke.sh'
     ]
@@ -35,6 +36,7 @@ on:
       '**/*.cpp',
       '**/*.swift',
       '**/*.m',
+      '**/*.mm',
       '**/*.metal',
       'scripts/vector-index-package-smoke.sh'
     ]
@@ -60,6 +62,23 @@ env:
   LLAMA_ARG_LOG_TIMESTAMPS: 1
 
 jobs:
+  macos-coreml-compile:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Configure Core ML
+        run: >-
+          cmake -S . -B build-coreml
+          -DLLAMA_COREML=ON
+          -DLLAMA_FATAL_WARNINGS=ON
+          -DLLAMA_BUILD_TESTS=OFF
+          -DLLAMA_BUILD_TOOLS=OFF
+          -DLLAMA_BUILD_APP=OFF
+          -DLLAMA_OPENSSL=OFF
+          -DCMAKE_OSX_DEPLOYMENT_TARGET=13.3
+      - name: Compile Core ML runtime and tools
+        run: cmake --build build-coreml --target llama llama-embedding llama-coreml-embedding-bench llama-coreml-embedding-plan -j 3
+
   macos-latest-arm64:
     runs-on: macos-latest
 

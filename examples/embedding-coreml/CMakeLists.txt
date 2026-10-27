@@ -1,5 +1,5 @@
 if (NOT APPLE)
-    message(FATAL_ERROR "Core ML embedding requires macOS 15 or iOS 18")
+    message(FATAL_ERROR "LLAMA_COREML requires macOS 15 or iOS 18")
 endif()
 find_library(COREML_FRAMEWORK CoreML REQUIRED)
 find_library(FOUNDATION_FRAMEWORK Foundation REQUIRED)

@@ -78,7 +78,7 @@ target_compile_features   (llama PRIVATE cxx_std_17) # don't bump
 
 target_link_libraries(llama PUBLIC ggml)
 
-if (LLAMA_COREML_EMBEDDING)
+if (LLAMA_COREML)
     find_library(COREML_FRAMEWORK CoreML REQUIRED)
     find_library(FOUNDATION_FRAMEWORK Foundation REQUIRED)
     target_sources(llama PRIVATE llama-coreml.mm)

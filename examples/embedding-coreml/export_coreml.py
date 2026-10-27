@@ -223,6 +223,7 @@ def export_wrapper(model, packed: bool):
                 else:
                     cos, sin = cos[:length], sin[:length]
                 rotations[kind] = (cos.unsqueeze(0), sin.unsqueeze(0))
+            # The sliding-window radius covers every token at these fixed lengths.
             per_layer = self.ple(inputs_embeds)
             hidden = inputs_embeds
             for i, layer in enumerate(self.layers):
