@@ -505,12 +505,16 @@ if (GGML_XDNA_BUILD_KERNELS)
 endif()
 
 # Host-only tests of what a device cannot check for itself: which weight
-# conversions the repacker accepts. They compile the backend sources they test
-# directly and open no device. tests/CMakeLists.txt adds them to ctest: testing
-# is enabled there, after this directory is configured.
+# conversions the repacker accepts, and how many head rows stay exact. They
+# compile the backend sources they test directly and open no device.
+# tests/CMakeLists.txt adds them to ctest: testing is enabled there, after this
+# directory is configured.
 option(GGML_XDNA_BUILD_TESTS "ggml-xdna: build the host-only backend tests" ON)
 if (GGML_XDNA_BUILD_TESTS)
     add_executable(test-xdna-repack tests/test-xdna-repack.cpp xdna-quant.cpp)
     target_include_directories(test-xdna-repack PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/..)
     target_link_libraries(test-xdna-repack PRIVATE ggml-base)
+    # xdna-head.h includes the XRT kernel header
+    add_executable(test-xdna-head-rows tests/test-xdna-head-rows.cpp)
+    target_link_libraries(test-xdna-head-rows PRIVATE XRT::xrt_coreutil)
 endif()
