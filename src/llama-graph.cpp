@@ -472,6 +472,11 @@ void llm_graph_input_cls::set_input(const llama_ubatch * ubatch) {
 static void llm_graph_set_input_rs(llm_graph_input_rs * inp, const llama_memory_recurrent_context * mctx, const llama_ubatch * ubatch) {
     const int64_t n_rs = mctx->get_n_rs();
 
+    if (inp->seq_off) {
+        GGML_ASSERT(ubatch->is_ragged() && ggml_nelements(inp->seq_off) == ubatch->n_seqs + 1);
+        ggml_backend_tensor_set(inp->seq_off, ubatch->seq_off, 0, ggml_nbytes(inp->seq_off));
+    }
+
     // the deferred gdn inputs read the pending rollback, which s_copy() below consumes
     if (inp->rec_idx) {
         GGML_ASSERT(ggml_backend_buffer_is_host(inp->s_copy_base->buffer));
@@ -524,6 +529,7 @@ bool llm_graph_input_rs::can_reuse(const llm_graph_params & params) {
     res &= rs_z == mctx->get_rs_z();
     res &= llm_graph_rs_moved_match(this, mctx, params.ubatch.n_seqs);
     res &= s_base_inplace == mctx->get_s_base_inplace(params.ubatch.n_seqs);
+    res &= (seq_off != nullptr) == params.ubatch.is_ragged();
 
     return res;
 }
@@ -1293,6 +1299,7 @@ bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
     res &= inp_rs->rs_z == mctx->get_recr()->get_rs_z();
     res &= llm_graph_rs_moved_match(inp_rs.get(), mctx->get_recr(), params.ubatch.n_seqs);
     res &= inp_rs->s_base_inplace == mctx->get_recr()->get_s_base_inplace(params.ubatch.n_seqs);
+    res &= (inp_rs->seq_off != nullptr) == params.ubatch.is_ragged();
 
     return res;
 }
@@ -1327,6 +1334,7 @@ bool llm_graph_input_mem_hybrid_k::can_reuse(const llm_graph_params & params) {
     res &= inp_rs->rs_z == mctx->get_recr()->get_rs_z();
     res &= llm_graph_rs_moved_match(inp_rs.get(), mctx->get_recr(), params.ubatch.n_seqs);
     res &= inp_rs->s_base_inplace == mctx->get_recr()->get_s_base_inplace(params.ubatch.n_seqs);
+    res &= (inp_rs->seq_off != nullptr) == params.ubatch.is_ragged();
 
     return res;
 }
@@ -1406,6 +1414,7 @@ bool llm_graph_input_mem_hybrid_iswa::can_reuse(const llm_graph_params & params)
     res &= inp_rs->rs_z == mctx->get_recr()->get_rs_z();
     res &= llm_graph_rs_moved_match(inp_rs.get(), mctx->get_recr(), params.ubatch.n_seqs);
     res &= inp_rs->s_base_inplace == mctx->get_recr()->get_s_base_inplace(params.ubatch.n_seqs);
+    res &= (inp_rs->seq_off != nullptr) == params.ubatch.is_ragged();
 
     return res;
 }
@@ -4072,6 +4081,12 @@ static std::unique_ptr<llm_graph_input_rs> build_rs_inp_impl(
         ggml_set_input(inp->rec_idx);
 
         inp->s_base_inplace = mctx_cur->get_s_base_inplace(n_seqs);
+    }
+
+    if (ubatch.is_ragged()) {
+        inp->seq_off = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_seqs + 1);
+        ggml_set_input(inp->seq_off);
+        ggml_set_name(inp->seq_off, "rs_seq_off");
     }
 
     inp->head = mctx_cur->get_head();
