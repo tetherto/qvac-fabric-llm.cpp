@@ -3347,6 +3347,12 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context &          ctx,
         case GGML_OP_GDN_CONV_DEFERRED:
             ggml_cuda_op_gdn_conv_deferred(ctx, dst);
             break;
+        case GGML_OP_SSM_CONV_RAGGED:
+            ggml_cuda_op_ssm_conv_ragged(ctx, dst);
+            break;
+        case GGML_OP_GATED_DELTA_NET_RAGGED:
+            ggml_cuda_op_gated_delta_net_ragged(ctx, dst);
+            break;
         case GGML_OP_DSV4_HC_COMB:
             ggml_cuda_op_dsv4_hc_comb(ctx, dst);
             break;
@@ -7885,6 +7891,14 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     head_dim % WARP_SIZE == 0 && head_dim <= 1024 && op->src[0]->ne[0] % head_dim == 0 &&
                     ggml_backend_dev_supports_inplace_src(dev, op->src[2]);
 #endif // GGML_USE_MUSA
+            }
+        case GGML_OP_SSM_CONV_RAGGED: {
+                const int64_t d_conv = op->src[2]->ne[0];
+                return d_conv >= 2 && d_conv <= 5;
+            }
+        case GGML_OP_GATED_DELTA_NET_RAGGED: {
+                const int64_t S_v = op->src[2]->ne[0];
+                return S_v == 16 || S_v == 32 || S_v == 64 || S_v == 128;
             }
         case GGML_OP_GATED_DELTA_NET_BACK: {
                 //TODO: shares the forward op's MUSA compiler issue, see GGML_OP_GATED_DELTA_NET above
