@@ -225,7 +225,8 @@ static bool xdna_concat_fast(struct ggml_tensor * dst) {
 // this backend, so the small pool is what limits prefill. The size comes from
 // the chunk's tokens per sequence (xdna_glue_set_n_tokens), not from its rows:
 // the rows grow with the sequences sharing the graph, and what a request is
-// computed as must not depend on them.
+// computed as must not depend on them. The one decode exception is the
+// vocabulary projection on the host (XDNA_HEAD_THREADS).
 // SSM_CONV on the host (GGML_XDNA_CONV=0), in place of ggml's. ggml walks a
 // token at a time across every channel, and the conv input is channel-major,
 // n_t + 3 floats a channel: each of the 6144 channels of each token is a
@@ -381,6 +382,17 @@ static int xdna_glue_threads(bool prompt) {
     return prompt ? n_big : n_small;
 }
 
+// A decode's vocabulary projection on the host: on the 0.8B, 12 threads ran
+// 0.4% slower than 16 at 2.6% less energy a token.
+static constexpr int XDNA_HEAD_THREADS = 12;
+
+static int xdna_glue_n_threads(bool prompt, bool vocab) {
+    if (prompt || !vocab) {
+        return xdna_glue_threads(prompt);
+    }
+    return std::min(XDNA_HEAD_THREADS, xdna_glue_threads(true));
+}
+
 // Total activation rows of the chunk being computed (sequences x tokens per
 // sequence), read off the projections: every MUL_MAT activation is M rows of
 // K, and every decoder layer has at least one. This is the ubatch size, and
@@ -449,6 +461,24 @@ static ggml_cgraph * xdna_glue_cgraph(void) {
     return cg;
 }
 
+// A MUL_MAT against the vocabulary: the tied embedding or the output weight.
+static bool xdna_vocab_mm(const ggml_tensor * n) {
+    if (n->op != GGML_OP_MUL_MAT || !n->src[0] || !n->src[1] || n->src[0]->op != GGML_OP_NONE) {
+        return false;
+    }
+    const char * nm = ggml_get_name(n->src[0]);
+    return strcmp(nm, "token_embd.weight") == 0 || strcmp(nm, "output.weight") == 0;
+}
+
+static bool xdna_glue_has_vocab_mm(const std::vector<struct ggml_tensor *> & batch) {
+    for (const ggml_tensor * t : batch) {
+        if (xdna_vocab_mm(t)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 // Run `node` on the host from within the XDNA chunk. Flushes (waits) all
 // pending NPU submissions first, so the op sees the results of the NPU ops it
 // depends on. Returns false on failure or when the op is not glue-claimed.
@@ -469,7 +499,7 @@ static bool xdna_glue_host_run(xdna_ops * ops, const struct ggml_tensor * node) 
     if (!xdna_ops_finalize(ops)) {
         return false;
     }
-    ggml_backend_cpu_set_n_threads(cpu, xdna_glue_threads(g_glue_n_seq_tokens >= 32));
+    ggml_backend_cpu_set_n_threads(cpu, xdna_glue_n_threads(g_glue_n_seq_tokens >= 32, xdna_vocab_mm(node)));
     cg->n_nodes  = 1;
     cg->n_leafs  = 0;
     cg->nodes[0] = const_cast<struct ggml_tensor *>(node);
@@ -503,7 +533,7 @@ static bool xdna_glue_flush(xdna_ops * ops, std::vector<struct ggml_tensor *> & 
         batch.clear();
         return false;
     }
-    ggml_backend_cpu_set_n_threads(cpu, xdna_glue_threads(g_glue_n_seq_tokens >= 32));
+    ggml_backend_cpu_set_n_threads(cpu, xdna_glue_n_threads(g_glue_n_seq_tokens >= 32, xdna_glue_has_vocab_mm(batch)));
     size_t off = 0;
     while (off < batch.size()) {
         // a prompt's ops this backend runs faster itself go on their own, in
@@ -733,25 +763,24 @@ static bool xdna_pending_wait(ggml_backend_xdna_context * ctx) {
     return !ctx->pending_failed;
 }
 
-// The decode's vocabulary projection on the NPU (GGML_XDNA_HEAD=0: host).
+// The decode's vocabulary projection on the NPU (GGML_XDNA_HEAD=1). Off by
+// default: the host runs it quicker, and exact.
 static bool xdna_head_on(void) {
     static const bool v = [] {
-        return xdna_env_int("GGML_XDNA_HEAD", 1) != 0;
+        return xdna_env_int("GGML_XDNA_HEAD", 0) != 0;
     }();
     return v;
 }
 
-// The head's MUL_MAT: the tied embedding (or the output weight) against one
-// normed row.
+// The head's MUL_MAT: the vocabulary against one normed row.
 static bool xdna_head_node(const ggml_tensor * n) {
-    if (n->op != GGML_OP_MUL_MAT || !n->src[0] || !n->src[1] || n->src[0]->op != GGML_OP_NONE) {
+    if (!xdna_vocab_mm(n)) {
         return false;
     }
-    const char *        nm = ggml_get_name(n->src[0]);
-    const ggml_tensor * x  = n->src[1];
-    return (strcmp(nm, "token_embd.weight") == 0 || strcmp(nm, "output.weight") == 0) && x->type == GGML_TYPE_F32 &&
-           ggml_nelements(x) == x->ne[0] && ggml_is_contiguous(x) && x->ne[0] == n->src[0]->ne[0] &&
-           n->type == GGML_TYPE_F32 && ggml_is_contiguous(n) && ggml_nelements(n) == n->src[0]->ne[1];
+    const ggml_tensor * x = n->src[1];
+    return x->type == GGML_TYPE_F32 && ggml_nelements(x) == x->ne[0] && ggml_is_contiguous(x) &&
+           x->ne[0] == n->src[0]->ne[0] && n->type == GGML_TYPE_F32 && ggml_is_contiguous(n) &&
+           ggml_nelements(n) == n->src[0]->ne[1];
 }
 
 namespace {
