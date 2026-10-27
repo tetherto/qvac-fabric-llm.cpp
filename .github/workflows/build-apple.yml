@@ -78,6 +78,8 @@ jobs:
           -DCMAKE_OSX_DEPLOYMENT_TARGET=13.3
       - name: Compile Core ML runtime and tools
         run: cmake --build build-coreml --target llama llama-embedding llama-coreml-embedding-bench llama-coreml-embedding-plan -j 3
+      - name: Core ML contract tests without model assets
+        run: ctest --test-dir build-coreml -R '^coreml-contract$' --output-on-failure
 
   macos-latest-arm64:
     runs-on: macos-latest

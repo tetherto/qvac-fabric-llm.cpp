@@ -44,6 +44,8 @@ jobs:
         uses: actions/setup-python@v6
         with:
           python-version: "3.11"
+      - name: Core ML exporter contract tests
+        run: python -m unittest discover -s examples/embedding-coreml -p 'test_export_coreml.py'
       - name: flake8 Lint
         uses: py-actions/flake8@84ec6726560b6d5bd68f2a5bed83d62b52bb50ba # v2
         with:

@@ -1448,7 +1448,7 @@ common_init_result_ptr common_init_from_model_and_params(llama_model* model, com
     if (!params.coreml_model.empty()) {
         if (!llama_supports_coreml()) {
             COM_WRN("%s", "Core ML is unavailable in this build; enable -DLLAMA_COREML=ON; using ggml\n");
-        } else if (!llama_set_coreml_model(lctx, params.coreml_model.c_str(), 8)) {
+        } else if (!llama_set_coreml_model(lctx, params.coreml_model.c_str(), params.coreml_max_inflight)) {
             COM_WRN("%s", "Core ML embedding sidecar could not be configured; using ggml\n");
         }
     }

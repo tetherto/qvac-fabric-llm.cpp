@@ -7,6 +7,7 @@
 #include "ggml-opt.h"
 #include "ggml.h"
 #include "llama.h"
+#include "llama-coreml.h"
 
 #include <array>
 #include <list>
@@ -638,6 +639,7 @@ struct common_params {
     float val_split = 0.05f; // fraction of the data used for the validation set
 
     // embedding
+    int32_t coreml_max_inflight = LLAMA_COREML_DEFAULT_INFLIGHT;
     std::string coreml_model;       // optional Core ML embedding sidecar directory
     bool embedding         = false; // get only sentence embedding
     int32_t embd_normalize = 2;     // normalisation for embeddings (-1=none, 0=max absolute int16, 1=taxicab, 2=euclidean, >2=p-norm)

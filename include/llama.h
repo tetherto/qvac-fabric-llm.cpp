@@ -1141,7 +1141,7 @@ extern "C" {
     LLAMA_API bool llama_supports_coreml(void);
 
     // Configure an optional EmbeddingGemma 2 text embedding sidecar (macOS 15 / iOS 18). NULL disables it.
-    // Requires matching weights and embedding_raw outputs. Unsupported batches use ggml.
+    // Requires matching weights, default RoPE, mean pooling, and embedding_raw outputs. Unsupported batches use ggml.
     // max_inflight is 1..8. Returns false on failure and leaves the current configuration unchanged.
     LLAMA_API bool llama_set_coreml_model(struct llama_context * ctx, const char * directory, int32_t max_inflight);
 
