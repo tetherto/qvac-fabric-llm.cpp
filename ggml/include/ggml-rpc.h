@@ -28,10 +28,12 @@ extern "C" {
 //     and the TBQ/PQ type ids move up by one (b11739 fork: 113).
 // 115 moves the TBQ/PQ types to 52-59. temp-11739's 114 keeps b11739's op ids,
 //     so it is not wire compatible with this line's 114 or 115.
+// 116 adds SSM_CONV_RAGGED and GATED_DELTA_NET_RAGGED to the ggml_op enum
+//     (temp-11739: 115).
 // A minor bump is additive: the client still accepts a server with an older
 // minor and must gate every command introduced by a later minor on the minor
 // the server announces at HELLO.
-#define RPC_PROTO_MAJOR_VERSION    115
+#define RPC_PROTO_MAJOR_VERSION    116
 #define RPC_PROTO_MINOR_VERSION    0
 #define RPC_PROTO_PATCH_VERSION    0
 
@@ -40,7 +42,7 @@ extern "C" {
 // below it; the TBQ/PQ family can move without changing the count, so check
 // its first id instead.
 #ifdef  __cplusplus
-static_assert(GGML_OP_COUNT == 128, "GGML_OP_COUNT has changed - update RPC_PROTO_MAJOR_VERSION");
+static_assert(GGML_OP_COUNT == 130, "GGML_OP_COUNT has changed - update RPC_PROTO_MAJOR_VERSION");
 static_assert(GGML_TYPE_TBQ3_0 == 52, "GGML_TYPE_TBQ3_0 has moved - update RPC_PROTO_MAJOR_VERSION");
 #endif
 
