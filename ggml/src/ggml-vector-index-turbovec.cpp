@@ -2155,11 +2155,14 @@ void build_turbovec_permute_dot(const float * query, int dim, TurboVecPermuteDot
 }
 
 #if GGML_VEC_INDEX_USE_NEON && (defined(__clang__) || defined(__GNUC__))
-// Clang spells the AArch64 extension "dotprod"; GCC needs "+dotprod".
+// Clang spells the AArch64 extension "dotprod". GCC must match the target
+// its arm_neon.h declares the intrinsic under, "arch=armv8.2-a+dotprod":
+// GCC 12 rejects a bare "+dotprod" on an armv8-a baseline as a target
+// mismatch when it inlines vdotq_s32.
 #if defined(__clang__)
 #define GGML_VEC_INDEX_TARGET_DOTPROD __attribute__((target("dotprod")))
 #else
-#define GGML_VEC_INDEX_TARGET_DOTPROD __attribute__((target("+dotprod")))
+#define GGML_VEC_INDEX_TARGET_DOTPROD __attribute__((target("arch=armv8.2-a+dotprod")))
 #endif
 
 // SDOT over the sequential blocked layout: four byte groups of sixteen
