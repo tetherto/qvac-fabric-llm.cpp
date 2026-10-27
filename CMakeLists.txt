@@ -250,6 +250,7 @@ else()
 add_subdirectory(src)
 
 if (LLAMA_COREML)
+    enable_testing()
     add_subdirectory(examples/embedding-coreml)
 endif()
 
