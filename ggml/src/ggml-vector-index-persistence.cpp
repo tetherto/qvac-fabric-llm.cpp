@@ -3367,11 +3367,13 @@ ggml_vec_index_t * ggml_vec_index_load(const char * path) {
                 static_cast<uint64_t>(file_size) > std::numeric_limits<size_t>::max()) {
                 return load_fail(GGML_VEC_INDEX_E_IO);
             }
+            const uint64_t want = turbovec_v8_declared_size(f, static_cast<uint64_t>(file_size));
             test_maybe_throw_bad_alloc();
-            std::vector<uint8_t> raw(static_cast<size_t>(file_size));
+            std::vector<uint8_t> raw(static_cast<size_t>(want));
+            f.clear();
             f.seekg(0, std::ios::beg);
-            f.read(reinterpret_cast<char *>(raw.data()), file_size);
-            if (!f || f.gcount() != file_size) {
+            f.read(reinterpret_cast<char *>(raw.data()), static_cast<std::streamsize>(want));
+            if (!f || f.gcount() != static_cast<std::streamsize>(want)) {
                 return load_fail(GGML_VEC_INDEX_E_IO);
             }
             int error = GGML_VEC_INDEX_E_IO;

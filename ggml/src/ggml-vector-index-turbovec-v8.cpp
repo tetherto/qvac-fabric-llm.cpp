@@ -309,7 +309,10 @@ struct ParsedHeader {
     uint32_t delta_crc = 0;
 };
 
-bool parse_header(const std::vector<uint8_t> & raw, const Geo & geo, size_t slot, ParsedHeader & out) {
+// raw holds at least the superblock and both header slots; file_len is the
+// whole file's size, which bounds the row count's units.
+bool parse_header(const std::vector<uint8_t> & raw, const Geo & geo, size_t slot, size_t file_len,
+                  ParsedHeader & out) {
     const size_t at = geo.hdr_at(slot);
     const size_t hdr_len = geo.hdr_len();
     if (at > raw.size() || raw.size() - at < hdr_len) {
@@ -331,7 +334,7 @@ bool parse_header(const std::vector<uint8_t> & raw, const Geo & geo, size_t slot
     out.n = static_cast<size_t>(n64);
     const size_t n_blocks = out.n / kBlock;
     if (n_blocks > (std::numeric_limits<size_t>::max() - geo.unit_at(0)) / geo.unit_len() ||
-        geo.unit_at(0) + n_blocks * geo.unit_len() > raw.size()) {
+        geo.unit_at(0) + n_blocks * geo.unit_len() > file_len) {
         return false;
     }
     size_t p = 16 + (out.n % kBlock) * tail_row;
@@ -432,6 +435,68 @@ bool delta_verified(const std::vector<uint8_t> & raw, const Geo & geo, const Par
 }
 
 }  // namespace
+
+uint64_t turbovec_v8_declared_size(std::istream & f, uint64_t file_size) {
+    // The image size follows from the geometry and the row count, so a
+    // padded or sparse file never costs more memory than its image
+    // (upstream io_v7 `declared_len`). Only a header whose CRC holds may
+    // declare the row count. A file whose geometry is invalid yields just
+    // the fixed superblock prefix, enough for the loader to name its error,
+    // never the whole file.
+    const uint64_t probe = std::min<uint64_t>(file_size, 24);
+    auto read_at = [&](uint64_t offset, uint8_t * out, size_t size) {
+        if (offset > file_size || file_size - offset < size) {
+            return false;
+        }
+        f.clear();
+        f.seekg(static_cast<std::streamoff>(offset), std::ios::beg);
+        f.read(reinterpret_cast<char *>(out), static_cast<std::streamsize>(size));
+        return static_cast<bool>(f) && f.gcount() == static_cast<std::streamsize>(size);
+    };
+    uint8_t head[24];
+    if (!read_at(0, head, sizeof(head)) || !turbovec_v8_magic(head, sizeof(head))) {
+        return probe;
+    }
+    Geo geo;
+    const bool v8 = std::memcmp(head, kV8Magic, 4) == 0;
+    geo.version = v8 ? 8 : 7;
+    geo.bits = head[5];
+    geo.kind = head[6];
+    geo.layout = v8 ? head[7] : kLayoutSeq;
+    if (geo.bits < 2 || geo.bits > 4 || geo.kind > 1 || geo.layout > kLayoutPlanes) {
+        return probe;
+    }
+    geo.dim = get_u32_le(head + geo.sb_fixed() - 16);
+    if (geo.dim == 0 || geo.dim % 8 != 0 || geo.dim > static_cast<size_t>(kTurboVecMaxDim)) {
+        return probe;
+    }
+    uint8_t n_calib_bytes[4];
+    if (!read_at(geo.sb_fixed() + (2 * geo.n_levels() - 1) * 4, n_calib_bytes, 4)) {
+        return probe;
+    }
+    geo.n_calib = get_u32_le(n_calib_bytes);
+    if (geo.n_calib != 0 && geo.n_calib != geo.dim) {
+        return probe;
+    }
+    // The superblock and both header slots: bounded by the geometry.
+    const uint64_t fixed = std::min<uint64_t>(file_size, geo.unit_at(0));
+    if (file_size > std::numeric_limits<size_t>::max()) {
+        return fixed;
+    }
+    std::vector<uint8_t> prefix(static_cast<size_t>(fixed));
+    if (!read_at(0, prefix.data(), prefix.size())) {
+        return fixed;
+    }
+    uint64_t n = 0;
+    for (size_t slot = 0; slot < 2; ++slot) {
+        ParsedHeader h;
+        if (parse_header(prefix, geo, slot, static_cast<size_t>(file_size), h)) {
+            n = std::max<uint64_t>(n, h.n);
+        }
+    }
+    // parse_header already bounds the row count's units by the file.
+    return std::min<uint64_t>(file_size, geo.unit_at(0) + n / kBlock * geo.unit_len());
+}
 
 ggml_vec_index_t * turbovec_v8_load_image(std::vector<uint8_t> raw, int & error) {
     error = GGML_VEC_INDEX_E_IO;
@@ -535,8 +600,8 @@ ggml_vec_index_t * turbovec_v8_load_image(std::vector<uint8_t> raw, int & error)
     // Adopt the newest header whose delta verifies.
     ParsedHeader headers[2];
     bool valid[2] = {
-        parse_header(raw, geo, 0, headers[0]),
-        parse_header(raw, geo, 1, headers[1]),
+        parse_header(raw, geo, 0, raw.size(), headers[0]),
+        parse_header(raw, geo, 1, raw.size(), headers[1]),
     };
     int order[2] = { 0, 1 };
     if (valid[0] && valid[1] && headers[1].gen > headers[0].gen) {
