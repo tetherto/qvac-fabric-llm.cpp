@@ -17963,6 +17963,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gated_delta_net_ragged(16, 128, 3, {200, 1, 33, 300}));
     test_cases.emplace_back(new test_gated_delta_net_ragged(16, 128, 2, {64, 64}));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 1, 1));
+    // one token per seq: the CUDA decode kernel (S_v 64 / 128), with k-head broadcast, snapshots, a q shared by the seqs
+    // and non-contiguous q/k/v
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 1, 5, 3));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 1, 3, 3, false, false, 4));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32,  8,  64, 1, 4, 2));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32,  8, 128, 1, 4, 1, true));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32,  8, 128, 1, 3, 2, false, false, 1, false, true));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32,  8, 128, 1, 3, 2, false, false, 1, false, false, true));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 16, 1, 1));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 16, 1, 1, 1, true, true));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 16, 1, 1, 1, false, true));
